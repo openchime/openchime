@@ -53,6 +53,10 @@ and the end-to-end run are CI's**, on the pull request, and staging will not mer
 until they pass; running them locally as well repeats the gate and costs the
 time the gate exists to save. `make test-ci` refuses to run outside CI.
 
+**A push that touches the GUI runs `scripts/gui/smoke.sh` first** (TESTING.md
+"Reading the GUI smoke"): about ten seconds, and the only check of the Windows
+client CI cannot run.
+
 ## Commits
 
 - `OC-<issue>: Capitalised imperative summary` — **no trailing punctuation**, at
@@ -89,7 +93,7 @@ time the gate exists to save. `make test-ci` refuses to run outside CI.
 ## Adding a setting
 
 A daemon setting is one row in `daemon/config_table.c`: its name, kind, range
-or values, default, class (operator, tuning, or demo-only) and one line of
+or values, default, class (operator, managed, or development) and one line of
 meaning. Nothing else: the loader reads it from the row, CONFIG.md's reference
 and `packaging/openchimed.env` are regenerated from it
 (`scripts/check/config.sh --write`), `openchimed --check-config` reports it, and
@@ -113,13 +117,16 @@ machines at once:
   it and drives it over TLS with the e2e client; compiles every Linux
   translation unit with the release's clang under `-Werror`
   (`check-release-cc`); runs the suites that start no threads
-  (`make test-ci PART=plain`, which runs the opcode and issue-reference checks first).
+  (`make test-ci PART=plain`, which runs the source checks first:
+  `scripts/check/opcodes.sh`, `refs.sh`, `make_targets.sh`, `config.sh` and
+  `release_lint.sh`).
 - **`thread-sanitizer`** — the suites that start threads, under
   ThreadSanitizer (`make test-ci PART=threads`); their only run in CI.
 - **`windows`** — cross-compiles the Windows TUI + GUI with the pinned
   llvm-mingw (make fetches it).
-- **`pr policy`** and **`guard`** — the pull request's title and body, and the
-  attribution guard ([`attribution-guard`](../.github/workflows/attribution-guard.yml)).
+- **`pr policy`** and **`guard`** — the pull request's title and body (and that the
+  title names an open issue), and the attribution guard
+  ([`attribution-guard`](../.github/workflows/attribution-guard.yml)).
   The guard has **no `paths-ignore`**, so it runs on every push including
   docs-only ones, since what it rejects lives in commit messages and author
   lines. A promotion refuses a staging commit it has not passed on.
@@ -128,6 +135,10 @@ machines at once:
 jobs (`paths-ignore: ['**.md', ...]`), which is why docs go straight to
 `staging` rather than through a pull request that would wait on checks that
 never run.
+
+**Read the run's result before asking for a merge**: the `build` job's TLS run
+of the shipped `main()` and the thread-sanitizer suites are checks a local
+`make test` does not make.
 
 See [TESTING.md](./TESTING.md) for the full test strategy.
 

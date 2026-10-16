@@ -88,16 +88,14 @@ order" belongs in integration.
 
 - Built and run by `make test`, compiled `-O0 -g` (debuggable). A non-zero exit
   fails the build and CI. One rule builds the single binary from every
-  `tests/*.c` plus the daemon and app-core objects it links:
+  `tests/*.c` plus the daemon and app-core objects it links (`mk/tests.mk`):
 
   ```makefile
   test: $(TEST_BIN)
-  	./$(TEST_BIN)
-
-  $(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(HDRS) $(MBEDTLS_A) | build
-  	$(CC) $(CFLAGS) -O0 -g $(INC) $(CORE_INC) -Itests \
-  	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MBEDTLS_LIBS) \
-  	    -lsqlite3 -lresolv -lpthread -o $@
+  	@$(SOURCE_CHECKS)
+  	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" ./$(TEST_BIN)
+  $(TEST_BIN): $(TEST_DEPS) | build
+  	$(CC) $(CFLAGS) -O0 -g $(TEST_INC) $(TEST_ALL_SRC) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
   ```
 
   Adding a suite is therefore two steps: drop in `tests/test_<subject>.c`
@@ -286,7 +284,7 @@ paying for unrelated suites per attempt:
   than passing empty;
 - `OC_TEST_REPEAT=20` runs the selection that many times.
 
-Unset, nothing changes. A repeated suite runs **in one process**, so a suite that
+Unset, nothing changes. With `OC_TEST_JOBS` unset or 1 (§2.4), a repeated suite runs **in one process**, so a suite that
 leaves a fixture switched must put it back or the second round fails somewhere
 that has nothing to do with the cause: a suite that swaps the loop's call relay
 socket, as `itest_netloop`'s routed-call test does, must hand it back, or the next
@@ -381,7 +379,7 @@ runs threads (CI runs the halves in parallel jobs, `PART=threads` and
   threads, the writer and readers, the worker pools, the client, the recorder and
   player — under ThreadSanitizer (address randomization off, `tests/tsan.supp`
   for the one test-only reconfiguration). The list is the Makefile's
-  `TSAN_SUITES`; a suite that starts a thread belongs on it. The sanitizer run
+  `TSAN_SUITES` (`mk/tests.mk`); a suite that starts a thread belongs on it. The sanitizer run
   judges races, never speed: a limit on how fast code runs — wall-clock time, or
   one timing against another — is a `CHECK_SPEED` (`tests/check.h`), asserted in
   the ordinary build and not under the sanitizer, which slows code five to
@@ -685,7 +683,7 @@ developer's box today; a CI job once the runner has one; make fetches
 Emscripten itself). The daemon it starts, and the page `scripts/web/serve.py`
 serves, run in development mode: the check signs in by password and
 bootstraps its user.
-`make web-test` runs the first two:
+`make web-test` runs the first three:
 
 - **The gfx pixel test** — `client/gui/gfx/gfx_test_win.c` compiled to wasm
   over the SDL3 built for it (`build/web/gfx-test.js`), run under Node with
@@ -705,7 +703,10 @@ bootstraps its user.
   the file taken (`take_bytes`) and the console that the audio ran on the
   worklet (`oc-web: audio worklet`, not the fallback), and the client's
   `sttest` verb must pass: the text layer's right-to-left order, cluster
-  hit-testing and line breaking through the API the views use. Last, a Japanese
+  hit-testing and line breaking through the API the views use; and the
+  client's `about` verb must answer both builds on one line (`OpenChime client
+  <build> (web), server <build>, protocol <n>`, the daemon's from
+  `SERVER_BUILD`). Last, a Japanese
   composition is played into the page's hidden input for the input method
   (`?ime=1`) and the composer must hold its result.
 - **`scripts/web/pages.sh`** — the daemon's sign-in pages from a real browser.
@@ -734,7 +735,7 @@ bootstraps its user.
 - **`scripts/gui/run.sh --web all`** — the Windows feature scripts against the browser
   ("Driving the web client" below): the smoke, voice input, screen recording,
   uploads, files, the two call scripts and the search boxes, each on its own
-  fixture daemon, each printing its `OK — N checks` line. The checks are the
+  fixture daemon, each printing its `gui_<name>:` result line. The checks are the
   Windows scripts' own; what is the Windows platform's alone (UI Automation,
   its windows, the clipboard set from PowerShell) is skipped there.
 
@@ -757,8 +758,8 @@ clang compile is both the release-compiler and the second-compiler check, and
 what the release checks itself is not repeated.
 
 **Caching.** Every vendored library is cached by the script that builds it —
-mbedTLS, libvpx, Opus and speexdsp, their Windows builds and SDL3, zig, and the
-speech engine and models. Each build script builds only what is missing, so a
+mbedTLS, libvpx, Opus, speexdsp and llama.cpp, their Windows and wasm builds and
+SDL3, zig, Emscripten and llvm-mingw, and the speech engine and models. Each build script builds only what is missing, so a
 hit skips its download and build. A pull request restores the caches its base
 branch's runs saved, which is why the push to `staging` runs too.
 
@@ -773,7 +774,8 @@ Jobs, on three machines at once:
   unit through the release's own compiler under `-Werror`
   (`make check-release-cc`: zig's clang against the release's glibc — the
   daemon's, the client's and the tests' sources); and `make test-ci PART=plain`,
-  which runs the opcode and issue-reference source checks first.
+  which runs the source checks first (`scripts/check/`: opcodes, issue
+  references, make targets, the configuration registry, the release lint).
 - **`thread-sanitizer`** — `make test-ci PART=threads` (§2.4).
 - **`windows`** — the Windows cross-compile of the TUI, the GUI and the two
   Windows test programs with the pinned llvm-mingw, so the ported client stays
@@ -795,12 +797,12 @@ silence sweep. Echo cancellation is measured by the ERLE harness in
 impulse response over a far-end signal, near-end speech mixed in, clock drift
 injected by resampling one side, and ERLE in dB asserted.
 
-**Speech.** The release renders a sentence with read-aloud and requires
+**Speech.** The candidate build (`candidate.yml`) renders a sentence with read-aloud and requires
 `openchimed --stt-hear` to hear its words, on the stripped binary and on the
 installed `.deb`, so each speech feature checks the other by content; the
 speech suites (`tts_worker`, `stt`, `ttskit`) run in CI.
 
-A new suite is one `SUITE(run_<name>_tests)` line in `tests/main.c`; if its code starts a thread it also goes on `TSAN_SUITES` in the Makefile, and CI runs it with no change here.
+A new suite is its declaration and one `S(run_<name>_tests)` line in `tests/main.c`; if its code starts a thread it also goes on `TSAN_LIST` in `mk/tests.mk`, and CI runs it with no change here.
 
 ---
 
@@ -915,10 +917,9 @@ download 16 KB at a time with a 120 ms delay between pieces, then measures one
 client's message round-trips while another client's download crawls through it.
 
 ```
-bob round-trip: idle median 57ms | during slow-download median 52ms, max 62ms
-backend 120 ms/op, 3 slow segment(s) served DURING the measurement
-  (= 360 ms of backend stall the loop did not absorb)
-blob operations on the loop thread during the transfer: 0
+  bob round-trip: idle median 57ms | during slow-download median 52ms, max 62ms
+  backend 120 ms/op, 3 slow segment(s) served DURING the measurement (= 360 ms of backend stall the loop did not absorb)
+  blob operations on the loop thread during the transfer: 0
 ```
 
 **The claim is checked by count, not by timing.** The loop marks its own thread
@@ -1234,7 +1235,7 @@ mismatched pair is the thing under test, such as the version-reject path.
 `scripts/gui/lib.sh` (the feature scripts), `scripts/gui/drive.sh` and
 `scripts/web/drive.sh` (one client) and the two `pair.sh` (two clients); an older
 prefix in the environment (`OC_DEV_`, `OC_PAIR_`, `OC_GUI_`, `OC_DRIVE_`,
-`OC_WEB_`) is refused by name. The daemon and the clients they start run in
+`OC_WEB_`, `OC_SMOKE_`) is refused by name. The daemon and the clients they start run in
 development mode (`scripts/gui/lib.sh` exports `OPENCHIME_MODE=development`,
 CONFIG.md "Mode"), and any build will do.
 
@@ -1253,8 +1254,8 @@ CONFIG.md "Mode"), and any build will do.
 | `OC_TEST_WHO`, `OC_TEST_DEBUG_PORT` | `a`, unset | The web driver's client letter; Chromium's remote-debugging port. |
 | `OC_TEST_KEEP_DB`, `OC_TEST_WAIT_MS` | 0, the script's | The smoke keeps the database; a longer wait for a slow machine. |
 
-The suite's own (`tests/main.c`) share the prefix: `OC_TEST_ONLY`, `OC_TEST_EXCEPT`,
-`OC_TEST_REPEAT`, `OC_TEST_JOBS`, `OC_TEST_FULL`.
+The suite's own share the prefix: `OC_TEST_ONLY`, `OC_TEST_EXCEPT`,
+`OC_TEST_REPEAT`, `OC_TEST_JOBS` (`tests/main.c`) and `OC_TEST_FULL` (`test_ttskit`).
 
 **The client is pointed at the address Windows reaches the daemon at.** Under
 WSL2 that is the WSL machine's own address (eth0's), not 127.0.0.1, which reaches
@@ -1383,6 +1384,14 @@ It drives the client through the test hook (`OPENCHIME_DEV_DIR`) and stands up
 its own fixture daemon on its own port. It is the pre-push gate; it is not a
 feature suite and does not aspire to be one.
 
+What it checks is the whole of it, deliberately: the client launches, connects
+and authenticates against the fixture; paints the Home shell (the
+`sidebar_kind` / `main_is_conversation` / `window_is_covered` predicates);
+takes the keyboard; types a message and gets it back from the daemon; opens and
+closes the command palette from the composer; and is still answering at the
+end. A new view or overlay is added to the predicates in `app.c`; it does not
+get a line here.
+
 **Assertions wait on state, never on a clock.** `expect_eventually`, `wait_grep`
 and `settle` poll for the state being asserted, so a true assertion returns on
 the first poll and only a real failure pays the timeout; the palette is asserted
@@ -1407,6 +1416,10 @@ assertions that runs for minutes is skipped, and so
 catches nothing — the failure mode of a slow gate is not that it is slow, it is
 that it stops being run. Verify a feature by driving it, through
 `scripts/gui/drive.sh` or a harness scoped to that feature. Do not add it here.
+
+It is not in CI: the daemon is epoll-based so it is Linux-only, and GitHub's
+Windows runners cannot host it (no Linux containers). A hosted run needs a
+self-hosted Windows box.
 
 *One caveat when reading a failure message:* the dump's `comp=` field is the
 **IME composition length**, not the autocomplete popover — the dump exposes no
@@ -1691,6 +1704,35 @@ there are no controls at all. It reads the dump's `dictate` line — `avail=
 offered= on= mode= hold= sent= answered= words= err=` and the button rects — and
 its `toast[n]` lines. Not in CI, for the smoke's reason. Run it when a change
 touches voice input, the composer's controls or the device layer.
+
+## Seeing the whole window
+
+`scripts/gui/drive.sh shot <name>` produces one image of the entire
+application: `test_shot` renders the scene through the window's own renderer
+and reads it back (`gfx_readback`), on every platform the same way. Every field
+is drawn now, so what the renderer holds is the whole application, cached
+images included; there is no second route to composite and no control a
+capture cannot see. (The native children that needed `PrintWindow` and
+`WM_PRINTCLIENT` composited on top are gone with the children; that history is
+in git.) Only the image *fetch* is suppressed during a capture, so driving the
+harness cannot generate transfer traffic.
+
+**A capture is a picture, and a picture is not the only evidence.** The scene
+also keeps a **paint ledger** when the harness is driving — every primitive the
+frame drew, in order, with its rect, its clip, its colour and a tag
+(`gfx_ledger_dump`). It exists because a screenshot answers "what does this look
+like" and nothing else: a label clipped to nothing, ink the colour of the
+surface behind it, and two strings drawn over each other all produce a picture
+that looks right to a comparison and wrong to a person. `scripts/gui/audit.sh`
+reads it (the visual audit, below).
+
+Two rules for anything drawing text through it. A text raster carries its colour
+in its pixels, so the ledger cannot read one back — the call site declares it
+with `gfx_ink`, which also carries the rasterizer's transparent padding so the
+recorded rect is the ink and not the bitmap. And a colour that is **content**
+rather than a theme choice — an avatar disc derived from a user id, a swatch for
+a colour scheme you have not picked — says so with a `content:` tag, or the
+palette check reports it as a surface that will not follow the theme.
 
 ## The visual audit — checking a render with no render to compare it to
 

@@ -94,7 +94,7 @@ static void *l_open(void *vctx, char *err, size_t errcap) {
     cp.n_threads_batch = 1;
     cp.no_perf = 1;
     /* The context cache at 8 bits: about half the memory of 16, which is what
-     * keeps a model and its context inside the budget (SUMMARIES.md §6). A
+     * keeps a model and its context inside the budget (SUMMARIES.md §7). A
      * quantized V cache needs flash attention. */
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.type_k = GGML_TYPE_Q8_0;

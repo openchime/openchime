@@ -85,7 +85,7 @@ Before writing anything, read what the issue touches:
   docs/ARCHITECTURE.md that the issue names or implies;
 - the subsystem doc that owns the area (PROTOCOL.md for wire changes,
   SCHEMA.md for migrations, CLIENT.md for frontend work, TESTING.md for what
-  must be proven, AUTH.md, AUDIO.md, VIDEO.md as applicable);
+  must be proven, AUTH.md, AUDIO.md, CALLS.md §6 as applicable);
 - the code the change will land in.
 
 Two standing traps to load now rather than trip later:

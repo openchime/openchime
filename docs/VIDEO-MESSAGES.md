@@ -9,7 +9,7 @@ REQ-162–166), PROTOCOL.md (§5.14), SCHEMA.md (migration 0041) and
 
 A video message is **a file, not a stream.** Nothing here involves a call, the
 audio relay or any real-time path; screenshare in a call is a different design
-([VIDEO.md](./VIDEO.md)), and a recorded screen is a video message like any other. Camera video *calling* stays excluded (REQ-160), and so
+([CALLS.md](./CALLS.md) §6), and a recorded screen is a video message like any other. Camera video *calling* stays excluded (REQ-160), and so
 does an audio-only clip (REQ-273).
 
 ---
@@ -194,7 +194,7 @@ minutes of video is at most 155 MB.
 |---|---|
 | Deadline | `VPX_DL_REALTIME` |
 | `VP8E_SET_CPUUSED` | 8 |
-| Row multithreading | on; `g_threads` = logical cores − 1 |
+| Row multithreading | on; `g_threads` = logical cores − 1, from 1 to 8 |
 | `g_lag_in_frames` | 0 |
 | Rate control | CBR, target per §2 |
 | `kf_max_dist` | 2 s of frames |
@@ -294,8 +294,9 @@ not refuse the post, and a failure at any step cancels the rest and reports why.
 
 ### 6.2 What the daemon checks
 
-`ATTACH_MEDIA_SET` is refused with `MEDIA_INVALID` unless the video attachment was
-uploaded by the caller, is finalized and not yet posted, has `mime = video/mp4`,
+`ATTACH_MEDIA_SET` is refused with `UNKNOWN_ATTACHMENT` unless the video attachment
+was uploaded by the caller and is finalized, and with `MEDIA_INVALID` unless it is
+not yet posted, has `mime = video/mp4`,
 a `duration_ms` no longer than five minutes, and even dimensions no larger than
 1920×1080 — and unless the poster is the same caller's finalized `image/jpeg` in the
 same channel, no larger than 1 MiB. A video larger than 160 MiB
@@ -376,8 +377,8 @@ player is the one place bytes reach a file, and only one the user chose.
 - **Recording bar:** while a screen counts down, records or finishes, the card and
   its backdrop step aside and an always-on-top tool window stands in for them —
   "Recording in 3…" and Cancel, then "● Recording m:ss / 5:00" with Stop, and
-  Discard throughout. Its controls are real Win32 ones, which a screen reader finds
-  as they are. It asks to be left out of the capture
+  Discard throughout. Its controls are drawn with the app's own primitives, as the
+  share bar's are. It asks to be left out of the capture
   (`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`, Windows 10 2004 and later);
   where Windows cannot, it appears in the recording. Closing it is Stop.
 - **Conversation card:** poster, play mark, duration badge and caption; clicking
@@ -391,7 +392,7 @@ player is the one place bytes reach a file, and only one the user chose.
 - **Harness:** `scripts/gui/drive.sh vm open|record|stop|discard|retake|send|play|mute|close|seek <ms>`,
   `vm source camera|<id>`, `vm corner br|bl|tr|tl`, `vm sound on|off`, `vm nocam on|off`;
   a `vm=` line with the phase, the take, the player and the buttons in `dump`, a
-  `vmsrc=` line with the choices, whether the card is aside, the bar and its
+  `vmsrc` line with the choices, whether the card is aside, the bar and its
   exclusion, and the video area, and a `vmscreen[n]` line per screen or window.
 
 ## 10. Consent and privacy

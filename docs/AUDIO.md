@@ -7,7 +7,7 @@ cross-referenced from ARCHITECTURE.md (ARCH-18, ARCH-28, ARCH-31, ARCH-73,
 ARCH-113), REQUIREMENTS.md (§6.2, REQ-150–152, REQ-301–306), PROTOCOL.md (§5.17),
 and CLIENT.md.
 
-**This document is audio only.** **Screenshare is [VIDEO.md](./VIDEO.md)**
+**This document is audio only.** **Screenshare is [CALLS.md](./CALLS.md) §6**
 (REQ-161, ARCH-86/87) — it rides this same call, relay, and UDP path, and
 builds on the media transport, jitter buffer and device layer of §§2–4. Camera
 video remains out of scope (REQ-160).
@@ -47,7 +47,7 @@ relay  → client :  sender_user_id(u64 BE) ‖ seq(u16 BE) ‖ payload
 
 The payload is an SFrame ciphertext (CALLS.md §5.4) — a typed plaintext: the
 Opus frame and its frame number, a mute state, or a shared screen's fragments and
-its viewers' requests (VIDEO.md §5), encrypted under the sender's key for the
+its viewers' requests (CALLS.md §6.5), encrypted under the sender's key for the
 epoch — or empty, a keep-alive. The relay sees neither the audio nor who is
 speaking.
 
@@ -238,6 +238,7 @@ of `oc_blob_backend` (ARCH-70):
 
 ```c
 typedef struct {
+    const char *name;
     void *(*open)(int sample_rate, int frame_samples);
     void  (*close)(void *p);
     /* Both directions, same frame, so a canceller can align them. */
@@ -318,7 +319,7 @@ all carries the call's audio over its TCP connection instead of leaving.
 Behind a front door that forwards UDP for many workspaces from one address, the
 relay is reached at the door's port rather than its own, and the door has to
 tell workspaces apart by the packet alone. That is the hosted platform's
-topology, so both are the control plane's to set (MANAGED.md):
+topology, so both are the control plane's to set (CONFIG.md "A managed box"):
 `OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT` names the port `CALL_JOINED` gives out,
 and `OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX` puts up to 16 fixed bytes in front of
 every token's 16 random ones, for the door to route by. Both are off by
@@ -350,7 +351,7 @@ over UDP, and on an ordinary one the same.
 **Receive.** Demultiplex on `sender_user_id`; drop a packet whose SFrame KID is
 not a key that sender gave, that fails authentication, or that the replay window
 has seen; route audio to that sender's jitter buffer by frame number, and a
-shared screen's packets to the share's reassembly (VIDEO.md §5). Loss is
+shared screen's packets to the share's reassembly (CALLS.md §6.5). Loss is
 counted from gaps in the authenticated SFrame counter — a gap in frame numbers
 alone may be DTX.
 
@@ -379,13 +380,14 @@ heard: the server cannot know, since it never decodes.
 ## 5. Call signaling in the app-core
 
 Signaling is ordinary protocol work on the network thread (`client/core/callsig.c`):
-`OC_CMD_CALL_JOIN/INVITE/LEAVE/DECLINE/END` out, and `CALL_JOINED`, `CALL_ROSTER`,
-`CALL_STATE` and `CALL_KEY_FOR` in. It keeps the device key, makes and seals the
+`OC_CMD_CALL_JOIN/INVITE/LEAVE/DECLINE/END/SHARE` out, and `CALL_JOINED`, `CALL_ROSTER`,
+`CALL_STATE`, `CALL_KEY_FOR` and `CALL_MEDIA` in. It keeps the device key, makes and seals the
 media key on every epoch and opens the others' (CALLS.md §5), and folds the call
 into the model as `OC_EV_CALL_*`: the Calls section's list, the call this client
 is in, a refusal. The media endpoint, the token and every key go to the engine
 through the **`oc_call_media` seam** — start, roster, the key to send with, a
-sender's key, stop — and never reach a frontend. The seam is why the core links
+sender's key, stop, who is sharing, the connection transport, a lost path — and
+never reach a frontend. The seam is why the core links
 no codec: the TUI builds without the engine, and a frontend that does calls plugs
 it in with `oc_client_set_call_media`.
 

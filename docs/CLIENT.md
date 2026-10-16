@@ -55,8 +55,8 @@ stubs (the web directory is the model) and earns each capability. What the
 platform has to say asynchronously (a URL handed over by a second launch, a
 tray click, an accessibility invoke) arrives as one SDL user event, so the
 application has one inbox. The accessibility tree is published through
-`client/gui/platform/a11y.h` the same way: UIA on Windows, nothing yet on the
-web.
+`client/gui/platform/a11y.h` the same way: UIA on Windows, an ARIA mirror on
+the web (`a11y_web.c`).
 
 The **app-core is the one shared asset.** It holds *all* logic and state; a
 frontend is pure view + input — it renders the view-model and emits intents. Get
@@ -466,10 +466,11 @@ model; translate input to intents }, stop.
     you (the daemon fans a `PROFILE_UPDATED` so every roster — and your own header
     — updates live); "Change password" opens the workspace's password page in the
     browser (AUTH.md §8.10), where the old password is checked and the new one set;
-    every device, this one included, then signs in again. "Active sessions" lists
-    each device signed in, with "Sign out" on every one but this
-    (`REVOKE_SESSION`, REQ-182). "Change email address" sets a local account's
-    own address (`SET_EMAIL`; it signs nobody in). "Two-step sign-in" opens
+    every device, this one included, then signs in again. "Active sessions"
+    (each device signed in, with "Sign out" on every one but this;
+    `REVOKE_SESSION`, REQ-182) and "Change email address" (a local account's
+    own address, `SET_EMAIL`; it signs nobody in) are the Win32 client's; the
+    TUI has neither. "Two-step sign-in" opens
     the workspace's page for setting up or turning off a TOTP second step the same
     way (AUTH.md §8.6); the terminal client's launcher has it too.
   - **admin / user management** — a member menu's "Reset password…" (or with
@@ -645,10 +646,19 @@ model; translate input to intents }, stop.
   a shim for what the browser provides: text drawn through the canvas, an ARIA tree
   mirroring the accessibility tree, the credential store, notifications, file
   pickers and media capture. Nothing is installed: the browser loads it from the
-  workspace. The transport, the core in a browser, the drawing layer, a canvas
-  text backend and the Windows client compiled for the browser against a Win32
-  shim exist (`make web`, `make web-test`); the platform interface, images,
-  persistence and sign-in by redirect are the steps after, in [WEB.md](./WEB.md).
+  workspace. The application is the same sources as Windows over
+  `client/gui/platform/web/` (`make web`, `make web-test`); the design is
+  [WEB.md](./WEB.md).
+
+**Across the graphical frontends.** Win32 is the reference client (ARCH-82): it
+surfaces every engine feature, and a feature is surfaced there first.
+Accessibility (REQ-269) is a UIA provider over the self-drawn UI, a real system
+caret and UIA events (**ARCH-99**), with an `AutomationId` and an
+`InvokePattern` on every actionable element (**REQ-290**), verified from outside
+the process by `scripts/gui/uia_probe.ps1`. Rich text and its toolbar
+(**REQ-220**, ARCH-100) are a shared parser in `shared/richtext.c` plus sdltext
+byte ranges. Each platform has its own screen capture for sharing in calls; the
+codec and the transport are in the core (REQ-161, [CALLS.md](./CALLS.md) §6).
 
 ## 4. The wire layer (reused, already tested)
 
@@ -865,21 +875,16 @@ the time left; it also opens the page where there is a desktop to open it on,
 and Esc cancels. A `host port user:pw` command line still signs in by password,
 against a daemon in development mode. The dialog resolves the workspace on submit
 (inline "not found"), then connects; an auth failure keeps the box up with the
-reason and refocuses the password to retry. *Remember me* gates whether the
+reason to retry. *Remember me* gates whether the
 session token persists (the store) or stays session-only. A returning user with a
 stored token skips the box entirely (silent reconnect). Cross-cutting: the model
 gained a sticky `last_error` (not overwritten by "disconnected") so the flow can
 tell auth-failure from unreachable.
 
-**Still to build:** **OIDC** via the system browser to central's authorize URL
-with a loopback `127.0.0.1` redirect catching the ES256 JWT
-(`ASWebAuthenticationSession` on iOS/macOS) — its client half only, since the
-central relay is out of repo.
-
 ## 7. Build
 
 The core + TUI build on the host (a `make linux` target linking `client/core/*.c` +
-`client/tui/*.c` + `shared/*` + `third_party/utf8proc/utf8proc.c`, with
+`client/tui/*.c` + `tuikit/*.c` + `shared/*` + `third_party/utf8proc/utf8proc.c`, with
 `termbox2.h` compiled `TB_IMPL` in one TU), like the daemon — no cross-compile,
 no container, no external build system. termbox2 and utf8proc are **vendored as
 committed single-file source** in `third_party/` (like jsmn, pinned to termbox2
@@ -891,9 +896,17 @@ and the SDL3 and mbedTLS built for Windows; a Linux or macOS build is the same
 sources over their own platform directory once it exists. Release artifacts
 come from CI/CD, never a dev machine.
 The web build (`make web`, [WEB.md](./WEB.md)) fetches its pinned Emscripten and
-builds mbedTLS and SDL3 for wasm once into `build/wasm/`, beside the native trees.
+builds mbedTLS, SDL3 and the codecs for wasm once into `build/wasm/`, beside the
+native trees.
 
-## The text fields are drawn (every platform)
+## 8. The graphical client
+
+The rules and the surfaces of the portable GUI (§3, Windows and the web) that a
+change to it has to keep. How it is driven and checked is
+[TESTING.md](./TESTING.md) ("Driving the Win32 GUI", "Seeing the whole window",
+"Reading the GUI smoke").
+
+### The text fields are drawn (every platform)
 
 The find, search, files-search and people boxes, the palette, the emoji
 search, the sign-in fields, the status card's field, the summary range's two
@@ -973,23 +986,16 @@ model) is gated on the view it belongs to -- never on a predicate that merely
 happens to be true there -- and checked across all views from the dump before it
 is shown to anybody.
 
-## Check CI after pushing
-
-`ci` runs on the pull request, and staging will not merge it until every job
-passes. Its `build` job starts the daemon binary it built and drives it over TLS
-with the e2e client — the one check of the shipped `main()` — and its
-thread-sanitizer job runs the threaded suites instrumented, which a local `make
-test` does not. Read the run's result before asking for a merge.
-
-## Shortcuts belong in the message loop, not a window proc
+### Shortcuts belong in the message loop, not a window proc
 
 `SHORTCUTS[]` in app.c drives **both** the sheet (Ctrl+/) and the keys, and
 `accel_dispatch()` runs from the message loop before any window sees the message.
 
-This is not tidiness. The main window almost never has focus — a native child
-usually does — and a native child consumes what it does not recognise, so a
-chord handled in a window proc is dead whenever the caret sits in any EDIT box,
-while the shortcut sheet advertises it anyway. Dispatching from the message
+This is not tidiness. When the text fields were native children, the main
+window almost never had focus, and a native child consumed what it did not
+recognise, so a chord handled in a window proc was dead whenever the caret sat
+in any EDIT box, while the shortcut sheet advertised it anyway. A drawn field
+(`g_focus`) is no different: it answers the keys it knows. Dispatching from the message
 loop, before any window sees the message, is what makes a chord work from every
 focus.
 
@@ -1001,10 +1007,11 @@ focus.
   opening a second surface behind it would leave two things claiming the screen.
   Esc and Enter reach it through `modal_key`.
 - Test with `scripts/gui/drive.sh key ctrl+k` (also `alt+shift+up`, `ctrl+slash`, `esc`).
-  The verb really holds the modifiers via `SetKeyboardState`, because
-  `accel_dispatch` reads `GetKeyState`; posting a bare key proves nothing.
+  The verb says which modifiers it holds (`g_synth_mods`, which `mod_down` reads
+  in place of the keyboard's state), because the shortcuts read the modifiers;
+  posting a bare key proves nothing.
 
-## Modals: one frame, explicit commit
+### Modals: one frame, explicit commit
 
 Every modal is drawn by `modal_frame()` (app.c) from an `oc_modal_spec`. The
 frame owns the scrim, the card, the title bar with its close button, the footer
@@ -1017,7 +1024,7 @@ One frame, four callers:
   middle column and the rest of the app stays live beside it,
 - a typed form is `form_dialog()` **on the frame** (below),
 - and a confirmation is `confirm()`. Exactly one native message box exists, in
-  `WM_CLOSE`: quit has to be answered before the window goes away, and our own
+  `on_close_request`: quit has to be answered before the window goes away, and our own
   frame needs a message loop that is about to end.
 
 **Explicit commit, never live-apply.** A form modal declares `snapshot`/`restore`
@@ -1055,7 +1062,7 @@ button. Where the setting lives on the SERVER — per-channel notification level
 `restore` re-sends the snapshot rather than writing a local, and only for rows
 that actually changed.
 
-### `form_dialog()` — our frame, the platform's fields
+#### `form_dialog()` — our frame, our fields
 
 `form_dialog(owner, title, fields, n)` is the generic typed form (`FF_TEXT`,
 `FF_PASSWORD`, `FF_CHECK`, `FF_CHOICE`, `FF_SELECT`) behind every typed form in
@@ -1064,8 +1071,8 @@ topics, renames, webhooks, invites, sign-up, keywords, priority people, the
 custom pause time, profile fields, sections and more. It splits the work
 deliberately:
 
-- the **text fields are native `EDIT`s** and always will be, so caret, selection,
-  IME, clipboard and undo remain the platform's problem, not ours;
+- the **text fields are drawn fields** (`field`, "The text fields are drawn"),
+  like every other text field in the client;
 - the **chrome is ours**, because sixteen grey Windows-95 boxes in the middle of a
   themed app were never worth it — and none of them was dismissible the way every
   other sheet is, screenshot-comparable, or reachable by the harness.
@@ -1102,17 +1109,14 @@ same way for both:
   what the strip is for. Six chips over one row was twelve reported collisions
   for a pointer resting on a message.
 
-**Prose gets `FF_MULTILINE`.** A native EDIT still — the same reason as every
-text field — with `ES_MULTILINE`, and the one rule that changes is Enter: in a
-multi-line field it is a new line, so saving moves to **Ctrl+Enter**, as it does
-in every editor that has both; Esc still cancels from anywhere. A native EDIT
-keeps its lines as CRLF, so the value is converted on the way in and back to LF
-on the way out. There is no scrollbar: native scrollbars are non-client paint
-the drawn scene cannot supply, and came out as a solid black bar — the field
-follows the caret instead, and the wheel and the arrows reach every line. The
+**Prose gets `FF_MULTILINE`.** A drawn field in its multi-line mode, and the one
+rule that changes is Enter: in a multi-line field it is a new line, so saving
+moves to **Ctrl+Enter**, as it does in every editor that has both; Esc still
+cancels from anywhere. There is no scrollbar — the field follows the caret
+instead, and the wheel and the arrows reach every line. The
 box is five lines at least and grows to the value it opens with, up to sixteen
-(`form_multi_h`): the EDIT counts the lines it wraps that value into once it has
-its width, and the form is painted and placed again at that height, so a text
+(`form_multi_h`): the field counts the lines it wraps that value into once it has
+its width (`field_line_count`), and the form is painted and placed again at that height, so a text
 shown to be read and sent — an invitation, a reset with its code — is all on
 screen, since nothing about the field says that it scrolls. A channel's description is its first user.
 
@@ -1163,24 +1167,20 @@ is no room below, rather than floating over the card the way the emoji picker
 does — the body is clipped to itself, so a panel drawn past its bottom edge is
 simply cut off, and keeping it inside the clip makes the geometry the whole fix.
 
-**Its native `EDIT`s are hidden while the list is open**, and that is not
-tidiness: a native child composites *above* the drawn scene, so an open list is
-punched through by every field it overlaps — three fields' worth of text
-floating on top of the list, which reads as corruption rather than as a z-order
-rule. There is no z-order to win; the children are simply not shown. This is the
-`layout_natives()` predicate rule above, and a new native child has to name
-itself there too.
+**Its fields are hidden while the list is open**: the list is drawn over
+them, and a hidden field takes no click and gives up the keyboard. This is the
+`layout_natives()` predicate rule above, and a new field has to name itself
+there too.
 
-The fields are children of the **main** window, positioned by `layout_natives()`
-from rects the painter recorded — the arrangement the sign-in card already uses.
-Two consequences worth knowing before touching it:
+The fields are shown by `layout_natives()` from rects the painter recorded —
+the arrangement the sign-in card already uses. Two consequences worth knowing
+before touching it:
 
-- **The form's EDITs do not consult `window_is_covered()`.** They are part of the
+- **The form's fields do not consult `window_is_covered()`.** They are part of the
   modal; the modal is what covers the window.
-- **Esc and Enter are answered by the field**, in `form_edit_proc`. A single-line
-  EDIT eats both, and a key sent straight to the focused child never reaches the
-  message loop — so handling them in the loop would leave the frame's
-  Enter-commits/Esc-cancels dead in the one modal where you are always typing.
+- **Esc and Enter are answered by the field**, in its key hook (`form_key`), so
+  the frame's Enter-commits/Esc-cancels work in the one modal where you are
+  always typing.
 
 It stays **synchronous**, by a nested message loop, because every caller reads
 the answer on the next line. The loop runs from inside `on_click`; that
@@ -1197,7 +1197,7 @@ re-entrancy is a known, accepted property.
   fall through to the shell underneath means a stray click in a modal's empty
   space can change channel behind the dimmed card.
 
-### The status dialog is bespoke, and its emoji is picked
+#### The status dialog is bespoke, and its emoji is picked
 
 Set a status (the profile menu) is not a `form_dialog`: its card is a
 content-measured bespoke body. The emoji slot is a button that opens the real
@@ -1213,7 +1213,7 @@ tree, which is what lets `chromefit` prove the card holds its own content — th
 defect that motivated the rebuild was a chip row clipped at the card's edge,
 invisible to any check that never saw its rects.
 
-## Preferences is two-paned, and appearance applies live
+### Preferences is two-paned, and appearance applies live
 
 Categories left (**Appearance / Messages / Notifications / System**), one pane's
 rows right. **System** is where the app behaves as an application rather than as a
@@ -1246,10 +1246,9 @@ and follows the account. Zoom (Ctrl+`=` / Ctrl+`-` / Ctrl+`0`) is this window on
 and is deliberately **not** persisted — a temporary magnification following you to
 another machine is not what you asked for. DPI belongs to the display. `g_text_scale`
 is the product of the first two, so nothing downstream has to know there are two
-inputs; anything that caches a font size of its own (the form fields' HFONT among
-them) is rebuilt by `scale_apply`.
+inputs; anything that caches a font size of its own is rebuilt by `scale_apply`.
 
-## About OpenChime: both builds on one screen
+### About OpenChime: both builds on one screen
 
 The workspace menu's **About OpenChime** (and the palette's) is a small dialog
 with three rows: the client's build id and platform (`dev (web)`,
@@ -1264,7 +1263,7 @@ is what is shown. **Copy** puts the whole as one line on the clipboard --
 into a report; the harness's `about` verb opens the dialog and answers that
 line, which `make web-test` checks.
 
-## What the window says, and where (REQ-263)
+### What the window says, and where (REQ-263)
 
 Each kind of message has one surface, decided by what it is
 (`client/shared/feedback.{h,c}`, which holds the state with time passed in; the
@@ -1302,7 +1301,7 @@ click before anything under them, so one can always be closed. Every
 toast, banner and hint is spoken — politely, or assertively for a failure — and
 each toast's action and close are published for UI Automation.
 
-## Badges, and notifications that leave when read (REQ-138)
+### Badges, and notifications that leave when read (REQ-138)
 
 **Two tiers, everywhere a conversation is counted** (`oc_model_badge`): a
 **count** for what is about you — a mention, a keyword, a priority person, and
@@ -1321,7 +1320,7 @@ and the app agree. A busy conversation's notifications chime at most once every
 five seconds; the rest arrive silently. A notification is raised for any
 conversation but the one being read in a focused window.
 
-## Two standing UI rules
+### Two standing UI rules
 
 **No "…" on a command.** Not in menus, not on buttons, not in cue banners. The
 convention means "this opens something", but the app is affordance-driven — nearly
@@ -1369,7 +1368,7 @@ ordinary text. And a `#` inside a URL belongs to the URL: `https://example.com/#
 is one address that opens a browser, and the word-boundary rule cannot see it,
 because the byte before the `#` is a `/`.
 
-## The composer is ours (ARCH-98)
+### The composer is ours (ARCH-98)
 
 There is no RichEdit and **no child window**. The field is drawn into the
 scene by `ed_draw()`, and the **main window** owns the keyboard while `g_ed_focus` is
@@ -1421,82 +1420,7 @@ set. Consequences worth knowing before touching it:
   [MARKDOWN.md](./MARKDOWN.md) §6, since it is a property of how the editor
   keeps markup out of sight rather than of this window plumbing.
 
-## Screenshots can see images
-
-`test_shot` renders the scene into its own DC render target, and a D2D bitmap
-belongs to the target that created it — so the decoded PBGRA pixels are kept
-beside each cached bitmap, and a capture creates its own bitmaps from them for
-its own target (released when the shot ends). Without that, every screenshot
-would be a picture with the pictures missing. Only the *fetch* is suppressed
-during a capture, so driving the harness cannot generate transfer traffic.
-
-**A capture is a picture, and a picture is not the only evidence.** The scene
-also keeps a **paint ledger** when the harness is driving — every primitive the
-frame drew, in order, with its rect, its clip, its colour and a tag
-(`gfx_ledger_dump`). It exists because a screenshot answers "what does this look
-like" and nothing else: a label clipped to nothing, ink the colour of the
-surface behind it, and two strings drawn over each other all produce a picture
-that looks right to a comparison and wrong to a person. `scripts/gui/audit.sh`
-reads it; [TESTING.md](./TESTING.md) explains what it can and cannot be asked.
-
-Two rules for anything drawing text through it. A text raster carries its colour
-in its pixels, so the ledger cannot read one back — the call site declares it
-with `gfx_ink`, which also carries the rasterizer's transparent padding so the
-recorded rect is the ink and not the bitmap. And a colour that is **content**
-rather than a theme choice — an avatar disc derived from a user id, a swatch for
-a colour scheme you have not picked — says so with a `content:` tag, or the
-palette check reports it as a surface that will not follow the theme.
-
-**If you add another cached GPU resource, keep the bytes too.** Anything that lives
-only as a render-target-owned object is invisible to every screenshot, and therefore
-unverifiable.
-
-## Run the GUI smoke before pushing Win32 chrome
-
-`scripts/gui/smoke.sh` asks one question — **does the client boot and run?** —
-and answers it in about ten seconds across fourteen checks: it launches,
-connects and authenticates against its own fixture daemon; paints the Home shell
-(the `sidebar_kind` / `main_is_conversation` / `window_is_covered` predicates);
-takes the keyboard; types a message and gets it back from the daemon; opens and
-closes the command palette from the composer; and is still answering at the end.
-That is the whole of it, deliberately.
-
-**Run it before every push.** It is cheap enough that there is no excuse to skip
-it, and narrow enough that a failure means the client is broken rather than that
-one assertion among hundreds moved.
-
-Two properties keep it honest. It checks the **exit status of every verb**, so a
-command the client never acked is reported where it happens instead of surfacing
-as the next assertion failing for an unrelated reason — that confusion is what
-made a larger suite's failures need interpretation. And the message it sends
-carries a **per-run unique string**, so no assertion can be satisfied by
-something an earlier run left in the database.
-
-**It is not a feature suite, and it must not grow into one.** A few hundred
-assertions covering the composer's editing rules, the modal frame, the schedule
-card and a DPI × zoom × text-size matrix lived here once; it took seven minutes,
-which meant it was skipped, which meant it caught nothing. Verifying a feature
-is done by driving it — by hand through `scripts/gui/drive.sh`, or with a
-harness scoped to that feature — not by making the boot check longer. A new view
-or overlay is added to the predicates in `app.c`; it does not get a line
-here.
-
-It is not in CI: the daemon is epoll-based so it is
-Linux-only, and GitHub's Windows runners cannot host it (no Linux containers). A
-hosted run needs a self-hosted Windows box. Run it and read it — the
-same discipline as reading CI.
-
-## Seeing the whole window (the harness)
-
-`scripts/gui/drive.sh shot <name>` produces one image of the entire
-application: the scene is rendered and read back from the renderer
-(`gfx_readback`), on every platform the same way. Every field is drawn now,
-so what the renderer holds is the whole application; there is no second
-route to composite and no control a capture cannot see. (The native children
-that needed `PrintWindow` and `WM_PRINTCLIENT` composited on top are gone with
-the children; that history is in git.)
-
-## Typography (graphical clients) — ARCH-97
+### Typography (graphical clients) — ARCH-97
 
 The platform owns the **family**, we own the **scale**. Full reasoning is in
 ARCH-97; what a frontend author needs is the table and two rules.
@@ -1527,19 +1451,3 @@ formats are built (`fonts_build`); system DPI and window zoom are applied
 separately, for the reasons ARCH-97 gives. Rebuilding the formats is the only way
 to change a format's size, so any preference that moves the scale must call
 `fonts_build` and then force a relayout.
-
-## 8. Frontends
-
-- **Win32 is the reference client** (ARCH-82): it surfaces every engine feature,
-  and a feature is surfaced there first. Accessibility (REQ-269) is a UIA
-  provider over the self-drawn UI, a real system caret and UIA events
-  (**ARCH-99**), with an `AutomationId` and an `InvokePattern` on every
-  actionable element (**REQ-290**), verified from outside the process by
-  `scripts/gui/uia_probe.ps1`. Rich text and its toolbar (**REQ-220**, ARCH-100) are
-  a shared parser in `client/core/` plus sdltext byte ranges.
-- **The TUI** sits on the same core and is text-only (§3).
-- **Further desktops are ports of the portable layer** (ARCH-80): the portable
-  GUI on Linux, macOS and the web is a text backend + native shim each. Mobile
-  (Android, iOS) has its own frontends. Each platform has its own screen capture for
-  sharing in calls; the codec and the transport are in the core (REQ-161,
-  [VIDEO.md](./VIDEO.md)).

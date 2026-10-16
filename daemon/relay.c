@@ -121,7 +121,7 @@ oc_relay *oc_relay_open(int udp_fd, const oc_relay_hooks *hooks, void *ctx) {
     int fl = fcntl(udp_fd, F_GETFL, 0);
     if (fl >= 0) fcntl(udp_fd, F_SETFL, fl | O_NONBLOCK);
     /* A shared screen's keyframe arrives as a burst of a hundred packets or more
-     * (VIDEO.md §5): room for several, both ways. The FORCE forms pass the
+     * (CALLS.md §6.5): room for several, both ways. The FORCE forms pass the
      * system's ceiling where the daemon may; elsewhere the plain request gets
      * what the ceiling allows. */
     int bufsz = 4 << 20;

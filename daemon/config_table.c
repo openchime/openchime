@@ -46,7 +46,7 @@ const cfg_row OC_CFG[] = {
     PATHR("OPENCHIME_DATA_DIR", CFG_OPERATOR, G_SET, "/data", "Where the daemon keeps everything: `openchime.db`, `blobs/`, `cert.pem`, `key.pem`, `factor.key`, `summary/`. The packages set `/var/lib/openchime`.", F(data_dir), NULL, 0, 0),
     INT("OPENCHIME_PORT", CFG_OPERATOR, G_SET, "8443", 1, 65535, "The TLS port the protocol, the web client and the sign-in pages are served on, and the UDP port calls use (443 for a real deployment, ARCH-54).", proto_port),
     INT("OPENCHIME_HEALTH_PORT", CFG_OPERATOR, G_SET, "8080", 0, 65535, "The plaintext port for `/healthz` and the landing page (ARCH-25); 0 opens none.", health_port),
-    STR("OPENCHIME_JOIN", CFG_OPERATOR, G_SET, NULL, "Who may join by signing in through a provider: `domain:`, `tenant:`, `subject:` and `owner:` rules, comma-separated (AUTH.md §3). Unset: only by invitation.", F(oidc.allow), NULL, 0, 0),
+    STR("OPENCHIME_JOIN", CFG_OPERATOR, G_SET, NULL, "Who may join by signing in through a provider: `domain:`, `tenant:`, `subject:` and `owner:` rules, comma-separated (AUTH.md §8.4). Unset: only by invitation.", F(oidc.allow), NULL, 0, 0),
     { "OPENCHIME_OIDC_CONNECT_%d", CFG_CUSTOM, CFG_OPERATOR, G_SET, NULL,
       "A direct connection to your own provider, 1 to 4 (SSO.md): `label=…;issuer=https://…;client_id=…;secret_file=…;subject=sub|oid;redirect=127.0.0.1|localhost`.",
       0, 0, NULL, 0, cfg_parse_connect, CFG_PATTERN, OC_OIDC_MAX_CONNECT },
@@ -76,10 +76,10 @@ const cfg_row OC_CFG[] = {
     STR("OPENCHIME_PUSH_URL", CFG_OPERATOR, G_FLAG, NULL, "The mobile push relay (ARCH-16/85), contentless; needs an enrollment. https, or http to loopback for a test.", F(push.url), NULL, 0, 0),
     ENUM("OPENCHIME_INVITE_MAIL", CFG_OPERATOR, G_FLAG, "off", "off|on", "Whether invitations bound to an address are reported to central for it to mail (REQ-280); needs an active enrollment.", invite_mail),
 
-    /* --- Managed: the control plane's, at provision time (MANAGED.md) ---------- */
+    /* --- Managed: the control plane's, at provision time (CONFIG.md "A managed box") */
     STR("OPENCHIME_MANAGED_TICKET", CFG_MANAGED, G_MAN, NULL, "The one-time claim ticket; with it the box is managed and the other rows here may be set.", F(enroll.ticket), NULL, CFG_SECRET, 0),
     STR("OPENCHIME_MANAGED_AUDIENCE", CFG_MANAGED, G_MAN, NULL, "The audience central minted for this workspace; the relay's tokens carry it.", F(oidc.audience), NULL, 0, 0),
-    STR("OPENCHIME_MANAGED_RELAY_KEY", CFG_MANAGED, G_MAN, NULL, "A relay public key, PEM, pinned beneath the keys the relay publishes (AUTH.md §3.3).", F(oidc.pubkey), NULL, 0, 0),
+    STR("OPENCHIME_MANAGED_RELAY_KEY", CFG_MANAGED, G_MAN, NULL, "A relay public key, PEM, pinned beneath the keys the relay publishes (AUTH.md §8.3).", F(oidc.pubkey), NULL, 0, 0),
     INT("OPENCHIME_MANAGED_MAX_USERS", CFG_MANAGED, G_MAN, "0", 0, 1000000, "The most registered users (CP-7); 0 is unlimited.", max_users),
     STR("OPENCHIME_MANAGED_ADDRESS", CFG_MANAGED, G_MAN, "", "The workspace's canonical address, when it moved and still answers at the old one; clients re-file it under this.", F(workspace_address), NULL, 0, 0),
     INT("OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT", CFG_MANAGED, G_MAN, "0", 0, 65535, "The UDP port clients are told, where a front door maps it (AUDIO.md §4); 0 is the bound one.", audio_advertise_port),

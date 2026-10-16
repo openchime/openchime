@@ -18,7 +18,7 @@
 /* The model this daemon summarizes with: open-licensed (Apache-2.0), a 4-bit
  * GGUF file. A development build may pin another, all five together, by a
  * header given to the compiler with -include (the summary trials,
- * docs/MODELS.md). */
+ * docs/SUMMARIES.md §7.1). */
 #ifndef OC_SUM_MODEL_NAME
 #define OC_SUM_MODEL_NAME   "qwen3.5-2b-q4_k_m"
 #define OC_SUM_MODEL_FILE   "Qwen3.5-2B-Q4_K_M.gguf"

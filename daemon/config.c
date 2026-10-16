@@ -618,7 +618,7 @@ int oc_config_load(char *err, size_t errcap) {
                 if (r->cls == CFG_MANAGED && strcmp(name, "OPENCHIME_MANAGED_TICKET") != 0 && c->mode != OC_MODE_DEVELOPMENT) {
                     const char *t = getenv("OPENCHIME_MANAGED_TICKET");
                     if (!t || !*t) {
-                        snprintf(err, errcap, "%s is the control plane's, set at provision time with OPENCHIME_MANAGED_TICKET (MANAGED.md)", name);
+                        snprintf(err, errcap, "%s is the control plane's, set at provision time with OPENCHIME_MANAGED_TICKET (CONFIG.md \"A managed box\")", name);
                         return -1;
                     }
                 }
@@ -754,7 +754,7 @@ void oc_config_print_reference(void *out_) {
         seen[n_seen++] = r->group;
     }
     for (int i = 0; i < n_seen; i++) print_group(out, seen[i], CFG_OPERATOR);
-    fprintf(out, "\n## Managed\n\nWritten by the control plane when it provisions a managed box (MANAGED.md), with `OPENCHIME_MANAGED_TICKET`; set without the ticket, each refuses the start.\n");
+    fprintf(out, "\n## Managed\n\nWritten by the control plane when it provisions a managed box (\"A managed box\", below), with `OPENCHIME_MANAGED_TICKET`; set without the ticket, each refuses the start.\n");
     for (int i = 0; i < n_seen; i++) print_group(out, seen[i], CFG_MANAGED);
     fprintf(out, "\n## Development mode only\n\nRead by the daemon or a client only when `OPENCHIME_MODE=development` (TESTING.md): the tests, the harnesses and the scripts. In any other mode each refuses the daemon's start, and a client ignores it.\n");
     for (int i = 0; i < n_seen; i++) print_group(out, seen[i], CFG_DEV);

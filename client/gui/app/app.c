@@ -4462,7 +4462,7 @@ typedef struct { rectf r; int cmd; char aid[40]; char name[96]; } call_btn;
 static call_btn        g_call_btns[CC_MAX_PICK + 48];
 static int             g_n_call_btns;
 
-/* Screen sharing (REQ-161, VIDEO.md): what this device shares, and the picture of
+/* Screen sharing (REQ-161, CALLS.md §6): what this device shares, and the picture of
  * what someone else does. */
 #define CC_MAX_SRC 24
 static oc_capture_device g_share_srcs[CC_MAX_SRC];   /* the picker's screens and windows */
@@ -23631,7 +23631,7 @@ static int permalink_parse(const char *text, char *host, size_t hostcap,
 }
 
 /* Send `mid` on to another conversation as a structured reference (REQ-057,
- * ARCH-108) — the ids only; see the note in the body below. */
+ * ARCH-117) — the ids only; see the note in the body below. */
 static void forward_send(oc_win *hwnd, uint64_t to_cid) {
     (void)hwnd;
     const oc_model *m = model();
@@ -27698,7 +27698,7 @@ static int call_ptt(oc_win *hwnd, int down) {
     return 1;
 }
 
-/* ---- sharing a screen (REQ-161, VIDEO.md) ----------------------------------------
+/* ---- sharing a screen (REQ-161, CALLS.md §6) ----------------------------------------
  *
  * Share screen opens the recorder's list of screens and windows; picking one
  * starts the engine's capture and tells the daemon, whose CALL_STATE names this

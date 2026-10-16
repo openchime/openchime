@@ -4,8 +4,8 @@ The markup a message body may contain, how it is parsed, and where. This is the
 contract every client renders against; it is not "some Markdown".
 
 **Summary.** A **Slack-compatible subset** for inline emphasis, extended with
-real list syntax, parsed **client-side in `client/core/`** and never by the
-daemon. The stored body stays **plain UTF-8** (REQ-054) with the markup in band —
+real list syntax, parsed **client-side in `shared/richtext.c`** and never
+rendered by the daemon. The stored body stays **plain UTF-8** (REQ-054) with the markup in band —
 no schema change, no second representation, and a client that cannot render a
 construct shows its source legibly.
 
@@ -189,14 +189,15 @@ and an underline is indistinguishable from a link in most renderings.
 Each frontend maps spans to its own facilities, and the mapping is the frontend's
 business:
 
-- **Win32** — DirectWrite ranges on the existing
-  layout, the same mechanism `@mention` highlighting already uses
+- **GUI** (Windows and the web) — sdltext ranges (DirectWrite's on Windows) on
+  the existing layout, the same mechanism `@mention` highlighting already uses
   (`body_layout`), so formatting composes with mentions and custom emoji rather
   than fighting them. **Both the transcript and the composer remove the inline
   delimiters**, so a body is drawn the same way wherever it appears —
-  you see formatting, never markup, as in Slack. Removing one takes a
-  transparent brush *and* a 0.1 DIP size, because the layout still covers the
-  raw body and a transparent asterisk keeps its width — two gaps around every
+  you see formatting, never markup, as in Slack. Removing one collapses
+  it (`st_range_hide`, a 0.1 DIP size under DirectWrite) rather than making it
+  transparent, because the layout still covers the raw body and a transparent
+  asterisk keeps its width — two gaps around every
   bold word, which read as typos. Block markers (`- `, `1. `, `> `) stay visible
   but faint: in a range-only treatment they *are* the rendering of a list or a
   quote.
@@ -232,8 +233,8 @@ business:
   happens on **release over the same address the press landed on**, not on press,
   so dragging a selection that starts inside a URL still selects rather than
   launching a browser; sliding off before letting go cancels, as everywhere else.
-  `ShellExecuteW` re-checks the scheme even though the parser already guaranteed
-  it, because that call is the dangerous end. **A labelled link** wears the same
+  `link_open` re-checks the scheme before `SDL_OpenURL` even though the parser
+  already guaranteed it, because that call is the dangerous end. **A labelled link** wears the same
   accent and underline over its label, with the `](address)` hidden in the
   transcript but shown faint in the composer, so its author sees where it goes.
   Hovering one shows its real address in a tip beside the pointer, and a click

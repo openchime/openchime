@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Migrations.** The daemon applies migrations 0001–0045 (`daemon/migrate.c`,
+**Migrations.** The daemon applies migrations 0001–0062 (`daemon/migrate.c`,
 `OC_MIGRATIONS`). 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
@@ -26,18 +26,27 @@ replaces the DND window, and keywords + priority people; **0036** (§3ab) thread
 follows and per-thread read cursors; **0037** the attachment idempotency token;
 **0038** (§3ac) link unfurls; **0039** (§3ad) the rest of the profile;
 **0040** (§3ae) what a forward points at; **0041** (§3af) a video message's media row;
+**0042** (§3ag) the author's voice and the rendered-audio cache; **0043** (§3ah)
+a message's kind; **0044** (§3ai) OIDC identities; **0045** (§3aj) invites bound
+to an address; **0046** (§3ak) a channel's description; **0047** (§3al) a
+credential's version;
 **0048** (§3am) user groups, and membership through them; **0049** (§3an) a
 CA-issued TLS certificate and the ACME account behind it; **0050** (§3ao) the
-daemon's issuer for its local accounts; **0056** (§3au) actions.
+daemon's issuer for its local accounts; **0051** (§3ap) alerts; **0052** (§3aq)
+delete holds; **0053** (§3ar) TOTP and recovery codes; **0054** (§3as)
+credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
+**0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
+no schema change, a mention-index point; **0061** (§3az) multi-use invites;
+**0062** (§3ba) Argon2id credentials.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
 (ARCH-67/68) — and will never get a table.*
 
-Section ordering note: §3 onward is numbered by the migration's *documentation*
-section rather than strictly by migration number, so the attachment-tombstone
-entries (0014/0015) appear before §3's 0002. The list above is the authoritative
-order.
+Section ordering note: sections run in migration order, but columns a later
+migration adds to a table are sometimes documented with that table's section
+(0033–0035 in §3j, 0037 in §3g, 0047 and 0062 in §3), and 0014–0015 have no
+letter. The list above is the authoritative order.
 
 ---
 
@@ -163,32 +172,6 @@ window at runtime (target 24h, ARCH-44) — pruning is a delete job, not schema.
 
 ---
 
-
-### Migration 0014 — attachment tombstones
-
-`attachments.reclaimed_at_ms` (0 = the blob is present) plus an index on
-`(reclaimed_at_ms, created_at_ms)` for the maintenance pass's oldest-first scan
-(REQ-215/217, ARCH-77/78).
-
-When storage pressure evicts a blob or it ages past the configured maximum, the
-**bytes** go but the **row stays**, stamped with when it was reclaimed. A
-client then renders "no longer available" instead of failing an opaque
-download, and message history (REQ-053) is untouched — only attachment bytes
-are ever removed, never messages.
-
-Migration 0015 adds `reclaim_reason` (1 orphan, 2 aged out, 3 evicted under
-pressure). The table already recorded *when* a blob went; this records *which
-tier took it*, which makes REQ-215's audit trail a query against a table we
-already keep rather than a second, ever-growing log — and eviction is
-default-on and destroys data nobody approved individually, so being able to ask
-exactly what it took matters.
-
-Ordering note: the row is tombstoned by the writer *before* the transfer pool
-deletes the bytes. A crash between the two leaves an orphaned blob, which the
-next orphan sweep collects. That asymmetry is deliberate — dangling metadata
-pointing at bytes that are gone is a visible bug, whereas a stray blob is
-merely wasted space.
-
 ## 3. Migration 0002 — authentication, sessions, roles
 
 Adds the tables the real auth design ([AUTH.md](./AUTH.md), ARCH-55–60) needs,
@@ -226,8 +209,8 @@ session token, so a DB leak does not expose live sessions.
 | `last_seen_ms` | INTEGER | updated on use.                                        |
 | `device_label` | TEXT    | optional, for "log out other devices" (REQ-182).       |
 
-Reconnect hashes the presented token and looks it up here; logout/revoke deletes
-the row(s) (REQ-182).
+Index `idx_sessions_user (user_id)`. Reconnect hashes the presented token and
+looks it up here; logout/revoke deletes the row(s) (REQ-182).
 
 ### `local_credentials`  — local-mode passwords (ARCH-59)
 Only local users have a row. Argon2id (AUTH.md §2); never a plaintext password.
@@ -250,7 +233,9 @@ An owner/admin issues an invite; the invitee sets a password by presenting it.
 | `created_by`  | INTEGER | → `users(id)`.                                          |
 | `role`        | TEXT    | role the invitee will receive.                          |
 | `expires_at_ms`| INTEGER |                                                        |
-| `consumed_at_ms`| INTEGER | null until used; single-use.                          |
+| `consumed_at_ms`| INTEGER | null until the last use is taken.                     |
+| `email`       | TEXT    | null for a bearer invite (migration 0045, §3aj).        |
+| `uses`, `used`| INTEGER | how many may redeem it, and how many have (migration 0061, §3az). |
 
 The `invites` and `local_credentials` tables are exercised by the tenant-admin
 wire ops (PROTOCOL.md §5.8): `INVITE_USER` inserts an `invites` row and the
@@ -461,7 +446,7 @@ Server-authoritative notification settings, synced across a user's devices.
   in which notifications are **allowed**, the complement of the quiet window it
   replaced. Existing values were swapped as they were carried forward. Suppresses
   push, not in-app unread.
-- `tz_offset_min` (INTEGER) — minutes east of UTC. A per-weekday window is only
+- `tz_offset_min` (INTEGER, migration 0034) — minutes east of UTC. A per-weekday window is only
   meaningful on the user's local calendar day, and the daemon cannot resolve an
   IANA zone per push (ARCH-103). **The app-core refreshes it on every connect**
   (`SET_TZ_OFFSET`, sent straight after `AUTH_OK` so no frontend has to
@@ -533,6 +518,31 @@ A `SET` returns a fresh bucket snapshot, which the daemon fans to **all** of the
 user's live connections; each client folds only the snapshot whose `client_type`
 matches its own, so a change on one device reaches the user's other same-type
 devices.
+
+## Migrations 0014–0015 — attachment tombstones
+
+`attachments.reclaimed_at_ms` (0 = the blob is present) plus an index on
+`(reclaimed_at_ms, created_at_ms)` for the maintenance pass's oldest-first scan
+(REQ-215/217, ARCH-77/78).
+
+When storage pressure evicts a blob or it ages past the configured maximum, the
+**bytes** go but the **row stays**, stamped with when it was reclaimed. A
+client then renders "no longer available" instead of failing an opaque
+download, and message history (REQ-053) is untouched — only attachment bytes
+are ever removed, never messages.
+
+Migration 0015 adds `reclaim_reason` (1 orphan, 2 aged out, 3 evicted under
+pressure). The table already recorded *when* a blob went; this records *which
+tier took it*, which makes REQ-215's audit trail a query against a table we
+already keep rather than a second, ever-growing log — and eviction is
+default-on and destroys data nobody approved individually, so being able to ask
+exactly what it took matters.
+
+Ordering note: the row is tombstoned by the writer *before* the transfer pool
+deletes the bytes. A crash between the two leaves an orphaned blob, which the
+next orphan sweep collects. That asymmetry is deliberate — dangling metadata
+pointing at bytes that are gone is a visible bug, whereas a stray blob is
+merely wasted space.
 
 ## 3l. Migration 0016 — audit log (REQ-251, ARCH-79)
 
@@ -746,59 +756,6 @@ I can see that are **not** archived".
 
 ---
 
-## 3z. Migrations 0030–0031 — drafts, addressed and unaddressed (REQ-223/229, ARCH-101)
-
-0030 created the table keyed on the conversation. **0031 rebuilt it** so a draft
-may exist before it has a recipient (REQ-229's New Message pane autosaves before
-you choose one), which the original primary key could not express:
-
-```sql
-CREATE TABLE drafts (
-  id          INTEGER PRIMARY KEY,
-  user_id     INTEGER NOT NULL REFERENCES users(id),
-  channel_id  INTEGER REFERENCES channels(id),   -- NULL = unaddressed
-  thread_root INTEGER NOT NULL DEFAULT 0,
-  recipients  TEXT,
-  body        TEXT    NOT NULL,
-  updated_ms  INTEGER NOT NULL);
-CREATE UNIQUE INDEX idx_drafts_conv ON drafts(user_id, channel_id, thread_root)
-  WHERE channel_id IS NOT NULL;
-CREATE INDEX idx_drafts_user ON drafts(user_id, updated_ms DESC);
-```
-
-The addressed case keeps exactly its old shape through the **partial unique
-index** rather than through the primary key, so one conversation still holds at
-most one draft while an unaddressed draft — `channel_id` NULL, its `recipients`
-beside it — is representable and repeatable. The surrogate `id` is what the wire
-returns so a client can address a specific unaddressed draft.
-
-*Its own table, not the `client_settings` bucket.* That bucket was the cheap
-answer and is wrong twice: it is keyed `(user, client_type, key)` and
-**partitioned per frontend by design**, so a draft written in the GUI would be
-invisible in the TUI — the opposite of REQ-223's "synced across that user's
-devices" — and its own notes here describe its contents as low-contention
-*prefs*, while a draft is the one thing we would put there that the user typed as
-a **message**.
-
-*Two indexes, each with a job.* `idx_drafts_conv` enforces one draft per
-conversation (and only for addressed drafts, which is what the `WHERE` clause
-buys); `idx_drafts_user` orders "all my drafts, newest first", which is what the
-Drafts pane asks for.
-
-*`thread_root` is in the key from the start*, 0 meaning the channel itself. The
-thread pane shares the one composer, so clients write 0, but the costs are
-asymmetric: one column, against a migration on a table of
-**user content** plus a change to two wire ops that shipped clients already
-speak.
-
-*Deleted only when the thing it belongs to is gone*: on send (in the send's own
-transaction), and with the user on removal. **Not** on archive and not on
-leaving, both of which are reversible (REQ-035) — discarding typed content for an
-undoable act is a permanent consequence of a temporary one. A draft for a channel
-you are not in is simply not listed until you return.
-
----
-
 ## 3u. Migration 0025 — saved items, and the activity watermark (REQ-231/139, ARCH-95)
 
 ```sql
@@ -903,6 +860,57 @@ refer to. The image is an attachment id for the same reason an avatar is (§3w).
 Any member may add one; deleting is the creator or an admin, because deletion
 breaks every message that used the shortcode.
 
+## 3z. Migrations 0030–0031 — drafts, addressed and unaddressed (REQ-223/229, ARCH-101)
+
+0030 created the table keyed on the conversation. **0031 rebuilt it** so a draft
+may exist before it has a recipient (REQ-229's New Message pane autosaves before
+you choose one), which the original primary key could not express:
+
+```sql
+CREATE TABLE drafts (
+  id          INTEGER PRIMARY KEY,
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  channel_id  INTEGER REFERENCES channels(id),   -- NULL = unaddressed
+  thread_root INTEGER NOT NULL DEFAULT 0,
+  recipients  TEXT    NOT NULL DEFAULT '',
+  body        TEXT    NOT NULL,
+  updated_ms  INTEGER NOT NULL);
+CREATE UNIQUE INDEX idx_drafts_conv ON drafts(user_id, channel_id, thread_root)
+  WHERE channel_id IS NOT NULL;
+CREATE INDEX idx_drafts_user ON drafts(user_id, updated_ms DESC);
+```
+
+The addressed case keeps exactly its old shape through the **partial unique
+index** rather than through the primary key, so one conversation still holds at
+most one draft while an unaddressed draft — `channel_id` NULL, its `recipients`
+beside it — is representable and repeatable. The surrogate `id` is what the wire
+returns so a client can address a specific unaddressed draft.
+
+*Its own table, not the `client_settings` bucket.* That bucket was the cheap
+answer and is wrong twice: it is keyed `(user, client_type, key)` and
+**partitioned per frontend by design**, so a draft written in the GUI would be
+invisible in the TUI — the opposite of REQ-223's "synced across that user's
+devices" — and its own notes here describe its contents as low-contention
+*prefs*, while a draft is the one thing we would put there that the user typed as
+a **message**.
+
+*Two indexes, each with a job.* `idx_drafts_conv` enforces one draft per
+conversation (and only for addressed drafts, which is what the `WHERE` clause
+buys); `idx_drafts_user` orders "all my drafts, newest first", which is what the
+Drafts pane asks for.
+
+*`thread_root` is in the key from the start*, 0 meaning the channel itself. The
+thread pane shares the one composer, so clients write 0, but the costs are
+asymmetric: one column, against a migration on a table of
+**user content** plus a change to two wire ops that shipped clients already
+speak.
+
+*Deleted only when the thing it belongs to is gone*: on send (in the send's own
+transaction), and with the user on removal. **Not** on archive and not on
+leaving, both of which are reversible (REQ-035) — discarding typed content for an
+undoable act is a permanent consequence of a temporary one. A draft for a channel
+you are not in is simply not listed until you return.
+
 ## 3aa. Migration 0032 — scheduled messages (REQ-224, ARCH-102)
 
 ```sql
@@ -911,7 +919,7 @@ CREATE TABLE scheduled_messages (
   user_id     INTEGER NOT NULL REFERENCES users(id),
   channel_id  INTEGER REFERENCES channels(id),
   thread_root INTEGER NOT NULL DEFAULT 0,
-  recipients  TEXT,
+  recipients  TEXT NOT NULL DEFAULT '',
   body        TEXT NOT NULL,
   send_at_ms  INTEGER NOT NULL,
   created_ms  INTEGER NOT NULL,
@@ -932,6 +940,10 @@ first one that forgot would leak unsent text into somebody else's transcript.
 The partial `idx_sched_due` is what the ~15 s firing sweep reads; `state` carries the outcome, and `fail_reason` is
 shown to the author, because a message promised and not sent is the one case
 where silence is indefensible.
+
+## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
+
+Documented with the notification tables in §3j, since they arrived together.
 
 ## 3ac. Migration 0038 — link unfurls (REQ-222, ARCH-105)
 
@@ -991,7 +1003,7 @@ the profile. Quiet hours run on `users.tz_offset_min`, which the client
 refreshes from the OS on every connect (ARCH-103); a zone chosen on the profile
 screen says where somebody is, not when to stop notifying them.
 
-## 3ae. Migration 0040 — what a forward points at (REQ-057, ARCH-108)
+## 3ae. Migration 0040 — what a forward points at (REQ-057, ARCH-117)
 
 ```sql
 CREATE TABLE forwards (
@@ -1136,6 +1148,8 @@ delivered them, so the same person arriving by two ways in is one account.
 | `email`, `email_verified` | TEXT, INTEGER 0/1 | As the provider gave them at the last sign-in. |
 | `first_seen_ms`, `last_login_ms` | INTEGER NOT NULL | |
 
+Index `user_identities_user (user_id)`.
+
 A person has one row per way they sign in: a new identity whose verified
 address is verified on exactly one active member's identity is filed under that
 member (AUTH.md §8.4). A sign-in updates this row only: `users.display_name` and `users.email` are set
@@ -1145,7 +1159,8 @@ an account whose string has no second bar gets its row at its next sign-in.
 
 ## 3aj. Migration 0045 — invites bound to an address (AUTH.md §8.4)
 
-`invites.email` (TEXT, NULL, lowercased). NULL is a bearer invite, redeemed for a
+`invites.email` (TEXT, NULL, lowercased), with a partial index `invites_email`
+`WHERE email IS NOT NULL`. NULL is a bearer invite, redeemed for a
 local account. Set, the invite names who may join where a provider signs people
 in: it is spent by that address's first verified sign-in, which takes the role the
 invite names, and the sign-up page never matches it.
@@ -1186,8 +1201,10 @@ CREATE TABLE user_groups (id INTEGER PRIMARY KEY, handle TEXT NOT NULL, name TEX
                           description TEXT, created_by INTEGER, created_at_ms INTEGER NOT NULL);
 CREATE UNIQUE INDEX idx_user_groups_handle ON user_groups(lower(handle));
 CREATE TABLE user_group_members (group_id, user_id, added_at_ms, PRIMARY KEY (group_id, user_id));
+CREATE INDEX idx_user_group_members_user ON user_group_members(user_id);
 CREATE TABLE channel_groups (channel_id, group_id, added_by, added_at_ms, PRIMARY KEY (channel_id, group_id));
-ALTER TABLE mentions ADD COLUMN group_id INTEGER;
+CREATE INDEX idx_channel_groups_group ON channel_groups(group_id);
+ALTER TABLE mentions ADD COLUMN group_id INTEGER REFERENCES user_groups(id);
 ```
 
 A group in a channel is a **reference**. The channel records the group
@@ -1402,6 +1419,7 @@ A passkey that answers a local account's second step: the credential's id, its
 COSE public key, the signature counter it last gave, and the relying party —
 the workspace name — it was made for, which it answers on and nowhere else.
 Public keys only; nothing here signs anything.
+
 ---
 
 ## 3au. Migration 0056 — actions (REQ-058, ARCH-115)
@@ -1566,7 +1584,34 @@ it is told on every sign-in; seen, it is deleted a day later
 (`SUM_NOTICE_KEEP_MS`, by the storage sweep). The involved Activity feed lists a
 person's notices as kind 4.
 
-## 3ay. Migration 0062 — Argon2id credentials (AUTH.md §2)
+## 3ay. Migration 0060 — indexing mentions once
+
+```sql
+SELECT 1;
+```
+
+No schema change. The step marks the point from which the writer, at start,
+writes `mentions` rows (§3q) for messages that have none (`index_mentions` in
+`daemon/dbwriter.c`): a workspace loaded from a Slack export holds its messages
+but no `mentions` rows, so the server's unread count, which reads that table,
+said 0 where the client, which reads the text, counted the mentions. A database
+already past this step has had its messages scanned once.
+
+## 3az. Migration 0061 — an invite more than one person may redeem (REQ-026)
+
+```sql
+ALTER TABLE invites ADD COLUMN uses INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE invites ADD COLUMN used INTEGER NOT NULL DEFAULT 0;
+```
+
+`uses` is how many may redeem it: 1 as every invite was, N, or 0 for no limit
+until it expires; `used` counts the redemptions taken. `consumed_at_ms` is still
+set when the last use is taken, so the outstanding list and a revoke keep their
+meaning. An address-bound invite (§3aj) is always one use, and an invite of any
+other count makes members only. Every existing row is a single-use invite,
+which the defaults say.
+
+## 3ba. Migration 0062 — Argon2id credentials (AUTH.md §2)
 
 ```sql
 DELETE FROM local_credentials;
@@ -1579,7 +1624,3 @@ in place of a PBKDF2 count, so the memory, passes and lanes can be raised
 later without a format change. The PBKDF2 rows are deleted rather than carried:
 there were no deployments to keep. An account that had one sets a password
 again by a reset link (`RESET_CREDENTIAL`).
-
-## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
-
-Documented with the notification tables in §3j, since they arrived together.

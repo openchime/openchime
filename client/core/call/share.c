@@ -1,4 +1,4 @@
-/* Screen sharing's packet logic — see oc_share.h and docs/VIDEO.md §4-§6. */
+/* Screen sharing's packet logic — see oc_share.h and docs/CALLS.md §6.4-§6.6. */
 #include "oc_share.h"
 
 #include <stdlib.h>

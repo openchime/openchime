@@ -15,11 +15,11 @@ clip (REQ-273) and not a call (REQ-150).
 
 ## 1. What a listener can do
 
-- **Listen from a message onward.** "Listen" on a channel starts at the first unread
-  message (or the newest if none are unread); "Listen from here" on a message starts
-  there. Each message with something to say plays in order, in its author's voice.
-- **Play, pause, skip, stop.** Skip moves to the next message. New messages that arrive
-  while listening join the end of the queue.
+- **Listen to a conversation as it happens.** Turned on for the conversation on screen,
+  each message that arrives from then on and has something to say plays in order, in its
+  author's voice, until it is turned off or the listener goes elsewhere. It reads forward,
+  not back: there is no starting from an earlier message, no pause and no skip, and a
+  listener's own messages are not read to them.
 - **One speaking rate.** Every rendering is at 1.2× the model's native rate, chosen by ear.
   There is no speed control.
 - **A voice of their own.** Each user's voice is on their profile, previewable and
@@ -107,8 +107,10 @@ and nothing to fetch.
   pattern of the transfer pool.
 - **Inside a render.** ttskit turns each sentence into phonemes; the phonemes become Kitten's
   token ids (`daemon/tts_kitten_tokens.c`, the model's own symbol table); ONNX Runtime runs
-  the model with the voice's style vector at speed 1.2, one intra-op thread, arena on; the
-  model's trailing 5,000 samples of silence are cut, leaving a natural pause; libopus encodes
+  the model with the voice's style vector at speed 1.2, one intra-op thread, arena on; a
+  20 Hz high pass takes out the model's offset, and the noise it appends after the words is
+  cut at the first quiet moment no earlier than its last 5,000 samples, with a 10 ms fade so
+  the cut cannot click; libopus encodes
   24 kHz mono at 24 kbps; the audio-only MP4 writer from ARCH-110 wraps it; the worker writes
   the file to the blob store and hands back the key, size and duration. The key is the
   handle's 64 hex digits and 16 of a hash of the model version (`daemon/tts_worker.c`), so
@@ -189,27 +191,26 @@ Protocol version 16; full layouts in PROTOCOL.md §5.14b.
 
 - **Playback.** `oc_mp4` reads an audio-only file and `player.c` plays it with no video
   decoder; the audio clock drives it as for a video message.
-- **The listen queue** in the client core: from a starting message, fetch and play each
-  message in order, skipping `NOT_RENDERABLE`, pausing on `TTS_UNAVAILABLE` with a notice,
-  and appending messages that arrive while it plays.
-- **Win32:** "Listen" in the channel header and "Listen from here" on a message; a
-  mini-player bar with play/pause, skip, stop and the current author; the voice picker in
+- **The listen queue** in the client core: messages that arrive in the listened-to
+  conversation, other than one's own, are queued (at most 64, dropping the oldest) and
+  fetched and played in order, skipping any answered `NOT_RENDERABLE` or `TTS_UNAVAILABLE`.
+- **GUI:** a read-aloud toggle in the conversation header, showing how many messages are
+  queued, turned off when the listener leaves the conversation; the message being spoken
+  is banded in the transcript; the voice picker in
   Edit profile, with a **Play** button beside it that says the audition sentence in the
   chosen voice. Play, not pick-to-play: walking down a list of eight voices with the
   keyboard would otherwise fire eight requests, and a sample that starts on its own is a
   surprise. While one is playing the button reads "Playing…" and does not take a second
   press; it comes back on its own if the daemon never answers.
-- **TUI:** `/listen` and `/listen stop`, playing through the same queue (ARCH-75 exempts
-  a terminal from graphics, not from audio).
 
 ## 8. Tests
 
 | Where | What it proves |
 |---|---|
-| `make test` — ttskit | pronunciation, the data files, the guesser against its reference (TTSKIT.md §8) |
+| `make test` — ttskit | pronunciation, the data files, the guesser against its reference (TTSKIT.md §9) |
 | `make test` — speakable | code blocks, links, mentions, markdown, emoji, quotes, not-renderable |
 | `make test` — render worker | with a stub synthesizer: queue order, a full queue, eventfd wake-up, idle release; Kitten's token ids against its own tokenizer |
 | `make test` — daemon | cache hit and miss, in-flight de-duplication, handle stability and edit → new handle, reclaim first with no tombstone, the rate limit, protocol v13 round trips, a two-client vertical |
 | `make test` — client core | an audio-only MP4 round trip; the listen queue in order, skipping not-renderable |
-| Build job | the real daemon: links statically (only glibc and SQLite dynamic), renders a reference sentence with the expected duration and level; manual listening on model changes |
+| Build job | the real daemon: links statically (only the C runtime dynamic); the release binary renders a sentence (`--tts-say`) that voice input hears back (`--stt-hear`); manual listening on model changes |
 | Win32 harness | Listen plays a channel in order with voice changes; pause, skip, stop; absent with read-aloud off |

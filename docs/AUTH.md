@@ -31,8 +31,8 @@ the other two sources need nothing from the project.
 | **Self-hosted federated** | Any of the three. Opting in to the federated OIDC function is what adds the relay; a federated deployment may equally decline it and federate only push, directory, SCIM, DNS, or packages. |
 | **Hosted** | The **relay**, operated by the project alongside the daemons. |
 
-The relay keeps the daemon lean on that path (it never fetches JWKS or handles
-multiple providers — it verifies one JWT from one pinned key, §3.3) and means a
+The relay keeps the daemon lean on that path (it never handles multiple
+providers — it verifies one ES256 JWT against the relay's own keys, §3.3) and means a
 self-hoster never registers provider apps or holds provider credentials; its
 price is a login-time dependency on the project, and the project seeing who
 signs in where (§3.4). A direct connection is for the operator who would rather
@@ -170,10 +170,10 @@ each operator registering provider apps.
 The **central service** (maintainer-controlled) is the OIDC Relying Party: it
 holds the Google and Microsoft client credentials, runs the login flow, and
 **re-issues** an OpenChime **ES256 JWT** (§3.3) that the daemon trusts. For this
-source all the OIDC machinery — JWKS fetching, provider quirks, key rotation,
+source the providers' OIDC machinery — their discovery and keys, provider quirks,
 multi-provider handling — lives in that service (a higher-level web service),
-**not in the C daemon**. The daemon only verifies one JWT signature against one
-configured, pinned public key (plus a tiny vendored JSON reader for the claims).
+**not in the C daemon**. The daemon only verifies one JWT signature against the
+keys the relay publishes (plus a tiny vendored JSON reader for the claims).
 
 ### 3.2 The flow — the client is the courier
 
@@ -212,7 +212,7 @@ it over on.
       │
       │  6. AUTH{method=oidc, token}
       ▼
-  ┌────────────────┐  verifies signature vs central's pinned key,
+  ┌────────────────┐  verifies signature vs central's published keys,
   │ daemon         │  checks audience==self + not expired,
   │ (acme.example) │  provisions/looks-up user, mints a session (§4)
   └────────────────┘
@@ -274,7 +274,7 @@ out of scope for this doc.)
 
 **The issuer above is illustrative, not normative.** It is a string the daemon
 compares with `strcmp` and never dereferences — there is no discovery document,
-because the keys are pinned in configuration (§3.4). Any
+because the keys are read from the relay's origin (§3.4). Any
 value both sides agree on works, and an implementer should not read the example
 as a URL that has to resolve, or as requiring a particular subdomain.
 
@@ -287,8 +287,8 @@ The daemon validates it by **pinning both the keys and the algorithm**
   supports directly; EdDSA/Ed25519 is not supported, so ES256 is the choice);
 - it chooses the key by the header's `kid` — the signing key's RFC 7638
   thumbprint, which it computes for each key it holds — and refuses a token whose
-  `kid` is absent or names none of them (§8.3). The keys it holds are the pinned
-  ones and, on an enrolled box, the ones the relay publishes (§3.4);
+  `kid` is absent or names none of them (§8.3). The keys it holds are the ones
+  the relay publishes (§3.4) and, on a managed box, one pinned beneath them;
 - it checks `iss` (central) and `aud` (== this workspace's configured opaque id —
   not its hostname — so a token minted for one workspace cannot be replayed at
   another);
@@ -309,19 +309,21 @@ targets the high-frequency message path, not the auth bootstrap.)
 
 ### 3.4 Trust setup and dependency
 
-- The daemon config (ARCH-26) carries **central's public key** (bundled/pinned
-  in the OpenChime distribution — central is maintainer-controlled and stable)
-  and this workspace's **`audience` id** — the opaque registered id described in
-  §3.3. A self-hoster enabling relay-OIDC enrolls their workspace with central
+- The relay is the control plane the box is enrolled with
+  (`OPENCHIME_ENROLL_URL`, §8.3): its keys are the ones it publishes, and this
+  workspace's **`audience` id** — the opaque registered id described in §3.3 —
+  is the enrollment's (§3.6; on a managed box `OPENCHIME_MANAGED_AUDIENCE`,
+  §8.7). A self-hoster enabling relay-OIDC enrolls their workspace with central
   once, after which central will mint tokens for that audience.
 - **An enrolled box follows a rotation by itself.** It reads
   `<relay origin>/oidc/jwks` at boot and daily — every minute while it gets no
   good answer — over HTTPS verified with the built-in roots, and trusts the ES256
-  P-256 signing keys there beside the pinned ones. Each answer replaces the last;
+  P-256 signing keys there, beside a managed box's pinned one
+  (`OPENCHIME_MANAGED_RELAY_KEY`). Each answer replaces the last;
   none removes a pinned key, which is the floor whatever central publishes. So
   central rotates by publishing the next key, signing with it a day later, and
   dropping the old one after that, and no box's operator does anything. A box
-  that is not enrolled — no `OPENCHIME_ENROLL_URL` — has only its pinned keys.
+  that is not enrolled — no `OPENCHIME_ENROLL_URL` — has no relay at all.
 - **Dependency is login-time only.** Once the daemon issues a session (§4), it
   never contacts central again; existing sessions survive a central outage. Only
   *new logins* need central up, and the message path never does. Local mode has
@@ -357,8 +359,8 @@ The central service + relay are a **separate system** — a web service, not the
 daemon. Its contract with the daemon is narrow:
 
 - run the Authorization-Code-+-PKCE flow against the configured providers;
-- mint ES256 JWTs (§3.3) signed by the key the daemon pins, audience-scoped to
-  the requesting workspace;
+- mint ES256 JWTs (§3.3) signed by a key it publishes at `/oidc/jwks`,
+  audience-scoped to the requesting workspace;
 - maintain the workspace registry (which `audience` ids are valid), binding each
   workspace's opaque id at enrollment (§3.3) and minting a token only for a
   registered audience. This registry is part of the OIDC function and is never
@@ -438,7 +440,8 @@ token on reconnect), the daemon then does the same thing:
 
 After `WELCOME` and before `AUTH`, the daemon sends **`AUTH_CHALLENGE`**
 (PROTOCOL.md §4) listing the sources this deployment signs people in with
-(`OPENCHIME_AUTH`: `local`, `relay`, or both). The client draws one control
+(`OPENCHIME_AUTH`: `local`, `relay`, or both; and each direct connection,
+§8.5). The client draws one control
 per source and replies with `AUTH`, whose `method` discriminator selects the path:
 
 - `local` — the method's number is kept for the challenge's listing; an `AUTH`
@@ -446,7 +449,8 @@ per source and replies with `AUTH`, whose `method` discriminator selects the pat
   a frame, and local accounts sign in in the browser (§8.10).
 - `oidc` — a browser sign-in. `AUTH_BEGIN` gets the authorize URL from the daemon;
   `AUTH` then carries an ES256 JWT and the verifier (§8.2): the central-issued one
-  (§3.3) for the relay, or, with source `local`, the daemon's own (§8.10).
+  (§3.3) for the relay, or, with source `local`, the daemon's own (§8.10); with
+  a direct connection's source, the provider's code instead (§8.5).
 - `session` — a previously issued session token (reconnect).
 
 The daemon answers with `AUTH_OK` (session established) or an `ERROR`
@@ -489,8 +493,6 @@ Deliberate omissions from this design:
 
 - **Email magic-link** local login: it needs outbound email and is not
   air-gapped-safe.
-- **Argon2** password hashing: mbedTLS has none, so it would add a vendored
-  dependency (§2).
 - **Cert-vs-restore interaction** (a self-signed daemon's certificate changing
   when a database is restored onto a new box): handled by persisting the TLS
   identity in the database (ARCH-66b); orthogonal to auth.
@@ -589,7 +591,7 @@ tenant's own stable id for the person — so it would be the same identity from 
 other relying party of that tenant.
 
 **Keys.** The relay's keys are the ones it publishes at `<origin>/oidc/jwks`,
-read at boot and daily (§3.3, `daemon/relaykeys.c`); a managed box may hold one
+read at boot and daily (§3.4, `daemon/relaykeys.c`); a managed box may hold one
 more, pinned beneath them, in `OPENCHIME_MANAGED_RELAY_KEY`. A token's `kid` is
 the signing key's RFC 7638 thumbprint; the daemon computes the same thumbprint
 for each key it holds and verifies with the one that matches, refusing an unknown
@@ -749,8 +751,8 @@ changes and no frame carries it.
   password, and what the page was doing: a sign-in's callback and challenge, a
   device code, a password change's new key, already derived — is kept in the
   event loop's memory against a random ticket the step page carries. Only its
-  hash is kept; it lives five minutes and five wrong codes; a source holds a
-  few at once; a restart drops them.
+  hash is kept; it lives five minutes and five wrong codes; a source holds up
+  to 32 at once; a restart drops them.
 - **The code.** `POST /signin/verify` with the ticket and a code: six digits are
   a TOTP code (RFC 6238, HMAC-SHA1, thirty-second steps, one step either side,
   never a step already used); anything else is tried as a recovery code, which
@@ -783,7 +785,8 @@ bind to `127.0.0.1`. The relying party is that name and the origin
 `https://<name>`; attestation is `none`; ES256 and RS256 keys are taken; a
 signature counter that is not zero must rise. The page's script,
 `/webauthn.js`, is served by the daemon and named by its SRI hash. Scripts
-(`script-src 'self'`) are allowed only on a page that offers a passkey and on
+(`script-src 'self'`) are allowed only on a page that offers a passkey, on
+a page with a password field, whose "Show password" toggle is `/showpw.js`, and on
 the recovery codes, whose copy button is `/codes.js`, served and named the same
 way, and carried by the tunnel. A passkey is
 bound to its name, so one made before a rename does not answer after it; the
@@ -803,11 +806,12 @@ step.
 Exactly one party mints a workspace's audience. **Self-hosted:** the daemon, as
 §3.6 — an operator couriers the code. **Managed:** central, which starts the box
 with `OPENCHIME_MANAGED_AUDIENCE` and a one-time `OPENCHIME_MANAGED_TICKET`
-([MANAGED.md](./MANAGED.md)). The daemon
+([CONFIG.md](./CONFIG.md) "A managed box"). The daemon
 adopts that audience, generates its own key as it always does, and claims the
 binding: the ticket, its public key, and a signature over
 `openchime-claim-v1|<aud>|<base64url(SHA-256(ticket))>|<base64url(SHA-256(public key))>`,
-the key hashed as its SubjectPublicKeyInfo DER, posted to `<enroll url>/claim` as
+the key hashed as its SubjectPublicKeyInfo DER, posted to
+`/api/machine/enroll/claim` at the enrollment origin as
 `{audienceId, ticket, publicKey, signature}` — the ticket base64url, the key and the
 DER signature base64. The claim is made once the daemon is serving — its protocol
 listener bound and its loop about to serve — because central reads an activated
@@ -830,8 +834,8 @@ ECDSA P-256 over the SHA-256 of that string, base64. The request carries it in
 four headers — `X-OpenChime-Audience`, `X-OpenChime-Timestamp` (unix seconds),
 `X-OpenChime-Signature` and `X-OpenChime-Signature-Version: 2`. Central verifies it against the stored public key,
 refuses a timestamp more than 300 seconds from its own clock, and requires the
-binding to be active. The string names neither the method nor the path, so the
-freshness window is what bounds a replay.
+binding to be active. At the one endpoint a signature names, the freshness
+window is what bounds a replay.
 
 ### 8.8 Configuration
 
@@ -841,7 +845,7 @@ freshness window is what bounds a replay.
 | `OPENCHIME_MFA` | Local accounts' second step: `optional`, `required`, `off` (§8.6). |
 | `OPENCHIME_JOIN` | Who may join (§8.4). |
 | `OPENCHIME_OIDC_CONNECT_<n>` | A direct connection, `n` 1 to 4 (§8.5): `label=…;issuer=https://…;client_id=…;secret_file=…;subject=sub\|oid;redirect=127.0.0.1\|localhost`. Any error in one stops the boot. |
-| `OPENCHIME_MANAGED_TICKET`, `_AUDIENCE`, `_RELAY_KEY` | Managed workspaces only (§8.7, MANAGED.md). |
+| `OPENCHIME_MANAGED_TICKET`, `_AUDIENCE`, `_RELAY_KEY` | Managed workspaces only (§8.7, CONFIG.md "A managed box"). |
 
 ### 8.9 Certificates through central
 
@@ -897,7 +901,7 @@ same loopback and challenge checks as §8.1, is answered with a **path**:
   that did not open, or is not the one wanted, is a paste away; the terminal
   client shows its URL and a device code instead (§8.11).
   The tunnel carries only `/signin`, `/signin/verify`, `/signup`,
-  `/account/password` and `/account/security`; only a
+  `/account/password`, `/account/security`, `/account/reset` and `/codes.js`; only a
   request whose `Host` is the listener's own (DNS rebinding); and only to the
   certificate the client's own connection accepted — over TLS with ALPN
   `http/1.1`, as the daemon's origin: its `Host`, and for a post from the
@@ -937,11 +941,12 @@ from `daemon/webpages.c`:
   change revokes every session the account has and closes each connection on
   one: a device signed in with the old password signs in again (REQ-182).
 
-Every page is self-contained HTML with its output escaped, no script, no
-cookies and no state kept between requests, with
+Every page is self-contained HTML with its output escaped, no script but the
+daemon's own (§8.6), no cookies and no state kept between requests, with
 `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline';
 frame-ancestors 'none'; base-uri 'none'; form-action 'self' <the callback's
-origin>` (browsers hold a form's redirect to `form-action`),
+origin>` (browsers hold a form's redirect to `form-action`; a page that runs a
+script adds `script-src 'self'`),
 `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
 `Cache-Control: no-store` and `Referrer-Policy: same-origin` — no other site is
 told a page's URL, and the page's own posts carry its origin (under
