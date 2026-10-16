@@ -364,6 +364,64 @@ static void build_rows(rows_t *r, const oc_model *m, const oc_channel *ch, uint6
     }
 }
 
+/* Encrypted DMs (PRIVATE-DM.md): an ordinary DM marked e2e, whose messages are
+ * the channel's as in any DM; what this device holds of its session is
+ * oc_model_pdm. A line the TUI says about them on the status row; the invitation
+ * the launcher offers to accept or decline (0: none); and what was last said of
+ * each session, so each change is said once. */
+static char     g_e2e_note[200];
+static uint64_t g_e2e_invite;
+static uint32_t g_e2e_refused_seen;
+static struct { uint64_t id; uint8_t state; } g_e2e_said[OC_PDM_VIEW_MAX];
+static char     g_e2e_invite_who[80];
+/* A DM just asked for: with whom, and whether encrypted, so it is selected as it
+ * arrives; and a channel to select once it is in the list (one accepted). */
+static uint64_t g_dm_asked, g_select_cid;
+static int      g_dm_asked_e2e;
+
+/* Why an encrypted DM ended, in words. */
+static const char *e2e_end_text(uint8_t reason) {
+    switch (reason) {
+    case OC_PDM_END_CLOSED:   return "closed";
+    case OC_PDM_END_TAKEN:    return "accepted on another of your devices";
+    case OC_PDM_END_GONE:     return "the other device went away";
+    case OC_PDM_END_LOST:     return "a device no longer holds it";
+    case OC_PDM_END_REFUSED:  return "it could not be opened";
+    case OC_PDM_END_DECLINED: return "declined";
+    default:                  return "ended";
+    }
+}
+
+static const char *peer_name(const oc_model *m, uint64_t uid) {
+    const char *who = oc_model_user_name(m, uid);
+    return who[0] ? who : "someone";
+}
+
+/* The one line an encrypted DM in focus shows over its messages: its state on
+ * this device, and where to act on it (Ctrl+K). */
+static void e2e_status(oc_model *m, const oc_channel *c, char *out, size_t cap, uintattr_t *fg) {
+    const oc_pdm_view *v = c->forgotten ? NULL : oc_model_pdm(m, c->channel_id);
+    const char *who = peer_name(m, c->peer_id);
+    *fg = tk_theme_active()->accent;
+    if (!v)
+        snprintf(out, cap, "Encrypted conversation: not readable on this device.");
+    else if (v->state == OC_PDM_EV_OPENING)
+        snprintf(out, cap, "Encrypted: waiting for %s to accept on their device.", who);
+    else if (v->state == OC_PDM_EV_OPEN)
+        snprintf(out, cap, "Encrypted end to end on this device; gone when it ends or OpenChime closes. "
+                 "Safety number: %s", v->safety);
+    else if (v->state == OC_PDM_EV_KEY_CHANGED) {
+        snprintf(out, cap, "%s's device key changed. Compare the safety number %s, then trust it to go on "
+                 "(Ctrl+K).", who, v->safety);
+        *fg = TB_RED | TB_BOLD;
+    } else if (v->state == OC_PDM_EV_ENDED) {
+        snprintf(out, cap, "Ended (%s). Ctrl+K to forget it.", e2e_end_text(v->reason));
+        *fg = TB_YELLOW;
+    } else
+        snprintf(out, cap, "%s asks for an end-to-end encrypted conversation: accept on this device or "
+                 "decline (Ctrl+K).", who);
+}
+
 /* Build the rows for the open thread: the parent (found in `ch`) then replies. */
 static void build_thread_rows(rows_t *r, const oc_model *m, const oc_channel *ch,
                               uint64_t me, int width) {
@@ -706,6 +764,8 @@ static void draw_help(int W, int H) {
         { NULL, "Lists   ↑/↓ move · Enter opens or acts" },
         { "Channels",   "n  new channel" },
         { "Members",    "n  new DM · Enter for message / role / remove" },
+        { "New DM",     "type to find a person · Space end-to-end encrypted · Enter opens" },
+        { "Encrypted",  "Ctrl+K: accept or decline, trust a new key, end or forget it" },
         { "Messages",   "t thread · r react · e edit · x delete" },
         { NULL, NULL },
         { NULL, "Everything else" },
@@ -811,6 +871,8 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_STORAGE, ACT_AUDIT, ACT_ALERTS, ACT_WORKSPACES, ACT_HELP, ACT_LOGOUT, ACT_SECURITY,
        /* summaries (REQ-310): ask, pick the span, or go back to the open one */
        ACT_SUMMARIZE, ACT_SUM_UNREAD, ACT_SUM_TODAY, ACT_SUM_WEEK, ACT_SUM_DAILY, ACT_SUM_RANGE, ACT_SUM_BACK,
+       /* encrypted DMs (PRIVATE-DM.md): an invitation, and the one in focus */
+       ACT_PDM_ACCEPT, ACT_PDM_DECLINE, ACT_PDM_TRUST, ACT_PDM_CLOSE, ACT_PDM_FORGET,
        /* summaries made while you were away: the list, then one of them */
        ACT_SUM_NOTICES, ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
@@ -841,11 +903,35 @@ static void menu_build_member(int is_self) {
     g_menu[g_nmenu++] = (menuitem){ "Make member", ACT_ROLE_MEMBER };
     if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Remove",      ACT_REMOVE };
 }
-static void menu_build_channel(int joined, int summarize) {
+/* What can be done about an encrypted DM, by its session's state on this device
+ * (0: none here): trust a changed key, end it while it lives, or forget it once
+ * it cannot be read. Into the menu, or the launcher with `section`. */
+static int e2e_items(uint8_t state, tk_pal_item *out, const char *section) {
+    int n = 0;
+    if (state == OC_PDM_EV_KEY_CHANGED)
+        out[n++] = (tk_pal_item){ section, "Trust the new key", NULL, NULL, ACT_PDM_TRUST };
+    if (state == OC_PDM_EV_OPENING || state == OC_PDM_EV_OPEN || state == OC_PDM_EV_KEY_CHANGED)
+        out[n++] = (tk_pal_item){ section, "End encrypted conversation", NULL, NULL, ACT_PDM_CLOSE };
+    if (!state || state == OC_PDM_EV_ENDED)
+        out[n++] = (tk_pal_item){ section, "Forget it", NULL, NULL, ACT_PDM_FORGET };
+    return n;
+}
+/* The session state an e2e channel shows (0: none on this device). */
+static uint8_t e2e_state(const oc_model *m, const oc_channel *c) {
+    const oc_pdm_view *v = c && !c->forgotten ? oc_model_pdm((oc_model *)m, c->channel_id) : NULL;
+    return v ? v->state : 0;
+}
+/* `e2e`: the channel is an encrypted DM, whose session is in `state`. */
+static void menu_build_channel(int joined, int summarize, int e2e, uint8_t state) {
     g_nmenu = 0;
     if (!joined) g_menu[g_nmenu++] = (menuitem){ "Join",              ACT_JOIN };
     g_menu[g_nmenu++] = (menuitem){ "Open",                ACT_OPEN };
-    if (summarize) g_menu[g_nmenu++] = (menuitem){ "Summarize",   ACT_SUMMARIZE };
+    if (e2e) {
+        tk_pal_item it[3];
+        int k = e2e_items(state, it, NULL);
+        for (int i = 0; i < k; i++) g_menu[g_nmenu++] = (menuitem){ it[i].label, it[i].id };
+    }
+    if (summarize && !e2e) g_menu[g_nmenu++] = (menuitem){ "Summarize",   ACT_SUMMARIZE };
     g_menu[g_nmenu++] = (menuitem){ "Notify: all",         ACT_NOTIFY_ALL };
     g_menu[g_nmenu++] = (menuitem){ "Notify: mentions",    ACT_NOTIFY_MENTIONS };
     g_menu[g_nmenu++] = (menuitem){ "Notify: none",        ACT_NOTIFY_NONE };
@@ -881,12 +967,17 @@ static const tk_pal_item g_launcher_items[] = {
 };
 /* The launcher as it is now: summaries only where the daemon makes them
  * (REQ-313), and a way back to the open one for this conversation. */
-static tk_pal_item g_launcher_now[sizeof g_launcher_items / sizeof *g_launcher_items + 2];
+static tk_pal_item g_launcher_now[sizeof g_launcher_items / sizeof *g_launcher_items + 2 + 2 + 3];
 static char g_sum_ready_label[48];
+
 static int launcher_build(const oc_model *m, uint64_t cid) {
     int n = 0;
+    /* An encrypted DM has no uploads and no summaries (PRIVATE-DM.md). */
+    const oc_channel *c = cid ? oc_model_channel((oc_model *)m, cid) : NULL;
+    int e2e = c && c->e2e;
     for (size_t i = 0; i < sizeof g_launcher_items / sizeof *g_launcher_items; i++) {
-        if (g_launcher_items[i].id == ACT_SUMMARIZE && !oc_model_summarize_available(m)) continue;
+        if (g_launcher_items[i].id == ACT_SUMMARIZE && (!oc_model_summarize_available(m) || e2e)) continue;
+        if (g_launcher_items[i].id == ACT_UPLOAD && e2e) continue;
         g_launcher_now[n++] = g_launcher_items[i];
     }
     if (m->summary_open && cid && m->summary_channel == cid)
@@ -895,6 +986,15 @@ static int launcher_build(const oc_model *m, uint64_t cid) {
         snprintf(g_sum_ready_label, sizeof g_sum_ready_label, "Summaries ready (%zu)", m->n_sum_notices);
         g_launcher_now[n++] = (tk_pal_item){ "You", g_sum_ready_label, NULL, NULL, ACT_SUM_NOTICES };
     }
+    /* An invitation to an encrypted DM waiting for an answer, then what can be
+     * done about the encrypted DM in focus. */
+    const oc_pdm_view *iv = g_e2e_invite ? oc_model_pdm((oc_model *)m, g_e2e_invite) : NULL;
+    if (iv && iv->state == OC_PDM_EV_INVITED) {
+        snprintf(g_e2e_invite_who, sizeof g_e2e_invite_who, "from %s", peer_name(m, iv->peer));
+        g_launcher_now[n++] = (tk_pal_item){ "Encrypted", "Accept on this device", g_e2e_invite_who, NULL, ACT_PDM_ACCEPT };
+        g_launcher_now[n++] = (tk_pal_item){ "Encrypted", "Decline", g_e2e_invite_who, NULL, ACT_PDM_DECLINE };
+    }
+    if (e2e) n += e2e_items(e2e_state(m, c), &g_launcher_now[n], "Encrypted");
     return n;
 }
 /* The summaries made while you were away, newest first, as many as the menu
@@ -989,8 +1089,10 @@ static void sidebar_label(const oc_model *m, const oc_channel *c, char *buf, siz
         const char *dot = pr == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f"       /* ● */
                         : pr == OC_PRESENCE_AWAY   ? "\xe2\x97\x91"       /* ◑ */
                                                    : "\xe2\x97\x8b";      /* ○ */
-        if (c->peer_id == m->user_id && pn[0]) snprintf(buf, cap, "%s %s  you", dot, pn);
-        else snprintf(buf, cap, "%s %s", dot, pn[0] ? pn : "dm");
+        /* An encrypted DM is marked with a lock after the presence glyph. */
+        const char *lock = c->e2e ? "\xf0\x9f\x94\x92 " : "";   /* 🔒 */
+        if (c->peer_id == m->user_id && pn[0]) snprintf(buf, cap, "%s %s%s  you", dot, lock, pn);
+        else snprintf(buf, cap, "%s %s%s", dot, lock, pn[0] ? pn : "dm");
     } else if (c->is_public) {
         snprintf(buf, cap, "# %s", c->name ? c->name : "…");
     } else {
@@ -1011,6 +1113,119 @@ static int sidebar_cursor(const sb_row *rows, int n, size_t focus) {
 static void sidebar_select(const sb_row *rows, int i, size_t *focus) {
     if (rows[i].header) g_sb_hdr = rows[i].group;
     else { g_sb_hdr = -1; *focus = rows[i].idx; }
+}
+
+/* What changed in the encrypted DMs since the last frame, said once on the
+ * status row; and the DM just asked for, or accepted, selected as it arrives.
+ * The invitation the launcher offers is the first still waiting. */
+static void e2e_watch(oc_model *m, size_t *focus) {
+    if (m->pdm_refused_seq != g_e2e_refused_seen) {
+        g_e2e_refused_seen = m->pdm_refused_seq;
+        snprintf(g_e2e_note, sizeof g_e2e_note, "An encrypted conversation with %s could not be opened "
+                 "(they may not be signed in).", peer_name(m, m->pdm_refused_peer));
+        if (g_dm_asked_e2e && g_dm_asked == m->pdm_refused_peer) g_dm_asked = 0;
+    }
+    g_e2e_invite = 0;
+    for (size_t i = 0; i < m->n_pdms; i++) {
+        const oc_pdm_view *v = &m->pdms[i];
+        if (v->state == OC_PDM_EV_INVITED && !g_e2e_invite) g_e2e_invite = v->id;
+        if (g_dm_asked && g_dm_asked_e2e && v->peer == g_dm_asked && v->state == OC_PDM_EV_OPENING) {
+            g_select_cid = v->id;
+            g_dm_asked = 0;
+        }
+        int k = -1, freek = -1;
+        for (int j = 0; j < OC_PDM_VIEW_MAX; j++) {
+            if (g_e2e_said[j].id == v->id) k = j;
+            if (!g_e2e_said[j].id && freek < 0) freek = j;
+        }
+        if (k < 0 && freek >= 0) { k = freek; g_e2e_said[k].id = v->id; g_e2e_said[k].state = 0; }
+        if (k < 0 || g_e2e_said[k].state == v->state) continue;
+        g_e2e_said[k].state = v->state;
+        const char *who = peer_name(m, v->peer);
+        if (v->state == OC_PDM_EV_INVITED)
+            snprintf(g_e2e_note, sizeof g_e2e_note, "%s asks for an end-to-end encrypted conversation: accept on "
+                     "this device or decline (Ctrl+K).", who);
+        else if (v->state == OC_PDM_EV_KEY_CHANGED)
+            snprintf(g_e2e_note, sizeof g_e2e_note, "%s's device key changed: compare the safety number.", who);
+        else if (v->state == OC_PDM_EV_ENDED)
+            snprintf(g_e2e_note, sizeof g_e2e_note, "The encrypted conversation with %s ended (%s).", who,
+                     e2e_end_text(v->reason));
+    }
+    for (int j = 0; j < OC_PDM_VIEW_MAX; j++)
+        if (g_e2e_said[j].id && !oc_model_pdm(m, g_e2e_said[j].id)) g_e2e_said[j].id = 0;
+    /* An ordinary DM is the 1:1 one with that person that is not encrypted. */
+    for (size_t i = 0; g_dm_asked && !g_dm_asked_e2e && i < m->n_channels; i++) {
+        const oc_channel *c = &m->channels[i];
+        if (c->kind == OC_CHANNEL_KIND_DM && !c->e2e && !c->n_peers && c->peer_id == g_dm_asked) {
+            g_select_cid = c->channel_id;
+            g_dm_asked = 0;
+        }
+    }
+    for (size_t i = 0; g_select_cid && i < m->n_channels; i++)
+        if (m->channels[i].channel_id == g_select_cid && !m->channels[i].forgotten) {
+            *focus = i;
+            g_sb_hdr = -1;
+            g_select_cid = 0;
+        }
+}
+
+/* Forget the ended (or unreadable) encrypted DM `cid`: its texts are wiped and
+ * its row leaves the sidebar, so the focus moves to the first row left. */
+static void e2e_forget(oc_model *m, uint64_t cid, size_t *focus) {
+    oc_model_pdm_forget(m, cid);
+    if (*focus >= m->n_channels || m->channels[*focus].channel_id != cid) return;
+    sb_row rows[256];
+    int nrows = sidebar_build(m, rows, 256);
+    for (int i = 0; i < nrows; i++)
+        if (!rows[i].header) { *focus = rows[i].idx; g_sb_hdr = -1; return; }
+}
+
+/* Do the encrypted-DM action `id` (accept or decline the invitation offered, or
+ * an action on the channel `cid`); 0 when `id` is not one. */
+static int e2e_act(oc_client *cl, int id, uint64_t cid, size_t *focus) {
+    if (id == ACT_PDM_ACCEPT && g_e2e_invite) {
+        oc_client_pdm_accept(cl, g_e2e_invite);
+        g_select_cid = g_e2e_invite;   /* its channel comes as any channel does */
+        g_e2e_note[0] = '\0';
+    } else if (id == ACT_PDM_DECLINE && g_e2e_invite) {
+        oc_client_pdm_decline(cl, g_e2e_invite);
+        g_e2e_note[0] = '\0';
+    }
+    else if (id == ACT_PDM_TRUST && cid)  oc_client_pdm_trust(cl, cid);
+    else if (id == ACT_PDM_CLOSE && cid)  oc_client_pdm_close(cl, cid);
+    else if (id == ACT_PDM_FORGET && cid) e2e_forget((oc_model *)oc_client_model(cl), cid, focus);
+    else return id == ACT_PDM_ACCEPT || id == ACT_PDM_DECLINE;
+    return 1;
+}
+
+/* "New direct message": a people picker, the launcher's filtered list over the
+ * roster (not yourself, not anyone disabled), with an "End-to-end encrypted"
+ * box in its title that Space ticks. An item's id is its place in g_dmp_uid. */
+#define DMP_MAX 512
+static tk_pal_item g_dmp_items[DMP_MAX];
+static uint64_t    g_dmp_uid[DMP_MAX];
+static char        g_dmp_name[DMP_MAX][64];
+static int         g_dmp_e2e;
+static char        g_dmp_title[64];
+
+static void dmp_title(void) {
+    snprintf(g_dmp_title, sizeof g_dmp_title, "New direct message  [%s] End-to-end encrypted",
+             g_dmp_e2e ? "x" : " ");
+}
+static void dmp_open(tk_palette *p, const oc_model *m) {
+    int n = 0;
+    for (size_t i = 0; i < m->n_users && n < DMP_MAX; i++) {
+        const oc_member *u = &m->users[i];
+        if (u->user_id == m->user_id || u->disabled || !u->name[0]) continue;
+        snprintf(g_dmp_name[n], sizeof g_dmp_name[n], "%s", u->name);
+        g_dmp_uid[n] = u->user_id;
+        g_dmp_items[n] = (tk_pal_item){ "People  \xc2\xb7  Space: encrypted", g_dmp_name[n], NULL, NULL, n };
+        n++;
+    }
+    g_dmp_e2e = 0;
+    dmp_title();
+    p->title = g_dmp_title;
+    tk_palette_set(p, g_dmp_items, n);
 }
 
 /* Where the title's Summarize was drawn (x1 0: not drawn). */
@@ -1138,8 +1353,9 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     else if (m->weblist_open)    snprintf(mt, sizeof mt, "webhooks");
     else if (m->thread_open)     snprintf(mt, sizeof mt, "thread · #%s", fc && fc->name ? fc->name : "…");
     else if (fc && fc->kind == OC_CHANNEL_KIND_DM) {
+        /* An encrypted DM is the same title behind a lock. */
         const char *pn = oc_model_user_name(m, fc->peer_id);
-        snprintf(mt, sizeof mt, "@%s", pn[0] ? pn : "dm");
+        snprintf(mt, sizeof mt, "%s@%s", fc->e2e ? "\xf0\x9f\x94\x92 " : "", pn[0] ? pn : "dm");
     } else if (fc && !fc->is_public)
         snprintf(mt, sizeof mt, "\xf0\x9f\x94\x92 %s", fc->name ? fc->name : "…");  /* 🔒 private */
     else if (fc)                 snprintf(mt, sizeof mt, "#%s", fc->name ? fc->name : "…");
@@ -1148,7 +1364,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     /* Summarize, at the right of the conversation's title (REQ-310): a click
      * offers the spans, as the launcher's "Summarize" does. */
     g_sumbtn_x0 = g_sumbtn_x1 = 0;
-    if (fc && oc_model_summarize_available(m) &&
+    if (fc && !fc->e2e && oc_model_summarize_available(m) &&
         !(m->thread_open || m->search_open || m->roster_open || m->reactlist_open || m->prefs_open || m->weblist_open)) {
         static const char LABEL[] = " Summarize \xe2\x96\xbe ";
         int lw = tk_str_width(LABEL), lx = msg_x + msg_w - 2 - lw;
@@ -1161,6 +1377,18 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     {
         int ix = msg_x + 1, iy = panels_top + 1, iw = msg_w - 2, ih = panels_h - 2;
         int normal = !(m->thread_open || m->search_open || m->roster_open || m->reactlist_open || m->prefs_open || m->weblist_open);
+        /* An encrypted DM's state on this device, on the rows above its messages. */
+        if (ih > 1 && fc && fc->e2e &&
+            !(m->search_open || m->roster_open || m->reactlist_open || m->prefs_open || m->weblist_open)) {
+            char line[400];
+            uintattr_t efg;
+            rows_t er = {0};
+            e2e_status((oc_model *)m, fc, line, sizeof line, &efg);
+            wrap_words_push(&er, line, efg, iw, 2);
+            for (size_t i = 0; i < er.n && ih > 1; i++, iy++, ih--)
+                tk_text(ix, iy, ix + iw, er.v[i].s, er.v[i].fg, th->bg);
+            rows_free(&er);
+        }
         if (ih > 0 && (fc || !normal)) {
             rows_t rows = {0};
             if (m->roster_open)         build_roster_rows(&rows, m, iw);
@@ -1242,6 +1470,11 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         snprintf(st, sizeof st, " %s%s%s", m->status[0] ? m->status : "", retry,
                  scroll > 0 ? "   [scrolled]" : "");
         int sx = tk_text(0, H - 3, W, st, th->muted, TB_DEFAULT);
+        if (g_e2e_note[0]) {
+            char pl[220];
+            snprintf(pl, sizeof pl, "   \xf0\x9f\x94\x92 %s", g_e2e_note);
+            sx = tk_text(sx, H - 3, W, pl, th->accent, TB_DEFAULT);
+        }
         if (m->n_sum_notices) {
             /* The newest summary made while you were away, until it is opened. */
             const oc_summary_notice *sn = &m->sum_notices[m->n_sum_notices - 1];
@@ -2727,7 +2960,7 @@ int main(int argc, char **argv) {
 
     /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
      * /nick with a discoverable text prompt. */
-    enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_DM, PROMPT_NICK, PROMPT_UPLOAD,
+    enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_NICK, PROMPT_UPLOAD,
            PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE };
     int await_invite = 0;   /* open the roster on the invitation once it is made */
     /* The invite prompt's explanation, which names the provider, and what was
@@ -2739,6 +2972,9 @@ int main(int argc, char **argv) {
     /* Global action launcher (tuikit tk_palette, Ctrl-K / ':'). */
     int launcher_open = 0;
     tk_palette launcher; tk_palette_init(&launcher, "Commands");
+    /* "New direct message": the people picker (a tk_palette, as the launcher). */
+    int dmpick_open = 0;
+    tk_palette dmpick; tk_palette_init(&dmpick, "New direct message");
 
     while (running) {
         /* Tick EVERY workspace, not just the visible one: a background session
@@ -2811,6 +3047,8 @@ int main(int argc, char **argv) {
             g_sb_loaded = 1;
         }
         if (focus >= m->n_channels) focus = m->n_channels ? m->n_channels - 1 : 0;
+        /* Encrypted DMs: say what changed, and select the DM just asked for. */
+        e2e_watch((oc_model *)m, &focus);
         /* Layer the active workspace's synced settings over the file defaults,
          * re-arming mouse input if that pref flipped. */
         if (apply_synced_settings(&cfg, &file_cfg, m))
@@ -2890,6 +3128,7 @@ int main(int argc, char **argv) {
             tk_input_draw(&prompt_input, (tk_rect){ in.x, in.y, in.w, 1 }, 1);
         }
         if (launcher_open) tk_palette_draw(&launcher, tb_width(), tb_height());
+        if (dmpick_open) tk_palette_draw(&dmpick, tb_width(), tb_height());
         if (picker_open) draw_picker(eq, esel);
         if (profile_open) draw_profile(oc_client_model(cl), tb_width(), tb_height());
         if (switcher_open) draw_switcher(wsel);
@@ -2908,6 +3147,7 @@ int main(int argc, char **argv) {
             if (ev.key == TB_KEY_MOUSE_WHEEL_UP) scroll += 3;
             else if (ev.key == TB_KEY_MOUSE_WHEEL_DOWN) { scroll -= 3; if (scroll < 0) scroll = 0; }
             else if (ev.key == TB_KEY_MOUSE_LEFT && !help_open && !action_open && !prompt_kind && !launcher_open && !picker_open &&
+                     !dmpick_open &&
                      !alerts_open && !summary_ui && !g_cal_open) {
                 int Wm = tb_width(); int chw, memw, msgx, msgw;
                 layout(Wm, &chw, &memw, &msgx, &msgw);
@@ -2932,7 +3172,10 @@ int main(int argc, char **argv) {
                         } else { g_sb_hdr = -1; focus = rows[prow].idx; panel = 0; }
                     }
                 } else if (memw && prow >= 0 && ev.x >= msgx + msgw) {   /* Members */
-                    if ((size_t)prow < mm->n_users) oc_client_open_dm(cl, mm->users[prow].user_id);
+                    if ((size_t)prow < mm->n_users) {
+                        oc_client_open_dm(cl, mm->users[prow].user_id, 0);
+                        g_dm_asked = mm->users[prow].user_id; g_dm_asked_e2e = 0;
+                    }
                 }
             }
             continue;
@@ -2946,7 +3189,7 @@ int main(int argc, char **argv) {
          * webhooks/roster). Without this the old /close is gone and you get stuck. */
         {
             const oc_model *om = oc_client_model(cl);
-            if (ev.key == TB_KEY_ESC && !switcher_open && !action_open && !launcher_open &&
+            if (ev.key == TB_KEY_ESC && !switcher_open && !action_open && !launcher_open && !dmpick_open &&
                 !prompt_kind && !picker_open && !help_open && !profile_open &&
                 (om->thread_open || om->search_open || om->reactlist_open ||
                  om->prefs_open || om->weblist_open || om->roster_open)) {
@@ -3120,13 +3363,10 @@ int main(int argc, char **argv) {
                         await_invite = 1;
                     }
                 }
-                else if (k == PROMPT_UPLOAD && *v) {
+                else if (k == PROMPT_UPLOAD && *v) {   /* never into an encrypted DM */
                     const oc_model *pm = oc_client_model(cl);
-                    if (focus < pm->n_channels) oc_client_upload(cl, pm->channels[focus].channel_id, v);
-                }
-                else if (k == PROMPT_DM && *v) {
-                    uint64_t u = oc_model_user_id(oc_client_model(cl), v);
-                    if (u) oc_client_open_dm(cl, u);
+                    if (focus < pm->n_channels && !pm->channels[focus].e2e)
+                        oc_client_upload(cl, pm->channels[focus].channel_id, v);
                 }
                 else if (k == PROMPT_DND) {
                     /* Two times = the hours notifications are ALLOWED (REQ-136).
@@ -3147,6 +3387,25 @@ int main(int argc, char **argv) {
             }
             continue;
         }
+        if (dmpick_open) {                     /* new DM: pick a person, Space for encrypted */
+            if (ev.key == TB_KEY_SPACE || (ev.type == TB_EVENT_KEY && !ev.key && ev.ch == ' ')) {
+                g_dmp_e2e = !g_dmp_e2e;
+                dmp_title();
+                continue;
+            }
+            tk_result dr = tk_palette_handle(&dmpick, &ev);
+            if (dr == TK_CANCEL) dmpick_open = 0;
+            else if (dr == TK_SELECT) {
+                int k = tk_palette_selected_id(&dmpick);
+                dmpick_open = 0;
+                if (k >= 0 && k < DMP_MAX) {
+                    oc_client_open_dm(cl, g_dmp_uid[k], g_dmp_e2e);
+                    g_dm_asked = g_dmp_uid[k]; g_dm_asked_e2e = g_dmp_e2e;
+                    panel = 0;
+                }
+            }
+            continue;
+        }
         if (launcher_open) {                   /* global action launcher (tk_palette) */
             tk_result lr = tk_palette_handle(&launcher, &ev);
             if (lr == TK_CANCEL) launcher_open = 0;
@@ -3154,7 +3413,8 @@ int main(int argc, char **argv) {
                 int id = tk_palette_selected_id(&launcher);
                 launcher_open = 0;
                 if      (id == ACT_NEWCHAN) { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
-                else if (id == ACT_NEWDM)   { prompt_kind = PROMPT_DM; prompt_title = "New direct message"; tk_input_init(&prompt_input, 0, "username"); }
+                else if (id == ACT_NEWDM)   { dmp_open(&dmpick, oc_client_model(cl)); dmpick_open = 1; }
+                else if (e2e_act(cl, id, act_cid, &focus)) {}
                 else if (id == ACT_SEARCH)  { prompt_kind = PROMPT_SEARCH; prompt_title = "Search messages"; tk_input_init(&prompt_input, 0, "query"); }
                 else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
                 else if (id == ACT_UPLOAD)  { prompt_kind = PROMPT_UPLOAD; prompt_title = "Upload a file"; tk_input_init(&prompt_input, 0, "path"); }
@@ -3239,7 +3499,11 @@ int main(int argc, char **argv) {
                         g_hold_unread = act_cid;
                     }
                     else if (id == ACT_DELETE)      oc_client_delete(cl, act_cid, act_mid);
-                    else if (id == ACT_DM)          { oc_client_open_dm(cl, act_uid); panel = 0; }
+                    else if (id == ACT_DM) {
+                        oc_client_open_dm(cl, act_uid, 0);
+                        g_dm_asked = act_uid; g_dm_asked_e2e = 0;
+                        panel = 0;
+                    }
                     else if (id == ACT_ROLE_ADMIN)  oc_client_set_role(cl, act_uid, OC_ROLE_ADMIN);
                     else if (id == ACT_ROLE_MEMBER) oc_client_set_role(cl, act_uid, OC_ROLE_MEMBER);
                     else if (id == ACT_REMOVE)      oc_client_remove_user(cl, act_uid);
@@ -3274,7 +3538,8 @@ int main(int argc, char **argv) {
                     else if (id == ACT_NOTIFY_NONE)     oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_NONE);
                     /* global launcher actions */
                     else if (id == ACT_NEWCHAN) { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
-                    else if (id == ACT_NEWDM)   { prompt_kind = PROMPT_DM; prompt_title = "New direct message"; tk_input_init(&prompt_input, 0, "username"); }
+                    else if (id == ACT_NEWDM)   { dmp_open(&dmpick, oc_client_model(cl)); dmpick_open = 1; }
+                    else if (e2e_act(cl, id, act_cid, &focus)) panel = 0;
                     else if (id == ACT_SEARCH)  { prompt_kind = PROMPT_SEARCH; prompt_title = "Search messages"; tk_input_init(&prompt_input, 0, "query"); }
                     else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
                     else if (id == ACT_AWAY)    oc_client_set_presence(cl, OC_PRESENCE_AWAY);
@@ -3427,7 +3692,8 @@ int main(int argc, char **argv) {
                         oc_sb_set_collapsed(&g_sb, g_sb_hdr, (uint8_t)!oc_sb_collapsed_of(&g_sb, g_sb_hdr));
                         sidebar_opts_save(cl);
                     } else if (focus < mm->n_channels) {                     /* channel action menu */
-                        menu_build_channel(mm->channels[focus].joined, oc_model_summarize_available(mm));
+                        const oc_channel *mc = &mm->channels[focus];
+                        menu_build_channel(mc->joined, oc_model_summarize_available(mm), mc->e2e, e2e_state(mm, mc));
                         act_cid = mm->channels[focus].channel_id; act_uid = 0; act_mid = 0; act_title = "Channel";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
@@ -3436,7 +3702,7 @@ int main(int argc, char **argv) {
             else if (panel == 3) {                                          /* members */
                 if (up && mem_sel > 0) mem_sel--;
                 else if (down && mem_sel + 1 < (int)mm->n_users) mem_sel++;
-                else if (ev.ch == 'n') { prompt_kind = PROMPT_DM; prompt_title = "New direct message"; tk_input_init(&prompt_input, 0, "username"); }
+                else if (ev.ch == 'n') { dmp_open(&dmpick, mm); dmpick_open = 1; }
                 else if (ev.key == TB_KEY_ENTER && mem_sel < (int)mm->n_users) {
                     /* discoverable member action menu (Message / role / remove) */
                     uint64_t uid = mm->users[mem_sel].user_id;
@@ -3452,19 +3718,23 @@ int main(int argc, char **argv) {
                 else if (msg_sel >= 0 && msg_sel < n) {
                     const oc_msg *sel = &ch->msgs[msg_sel];
                     uint64_t mid = sel->message_id;
-                    int own = (sel->author_id == mm->user_id) && !sel->deleted;
+                    /* An encrypted DM that has ended, or is not on this device,
+                     * stands as it is: no reply, reaction, edit or delete. */
+                    const oc_pdm_view *lv = ch->e2e ? oc_model_pdm((oc_model *)mm, cid) : NULL;
+                    int locked = ch->e2e && (!lv || lv->state == OC_PDM_EV_ENDED);
+                    int own = (sel->author_id == mm->user_id) && !sel->deleted && !locked;
                     int has_attach = 0;
                     for (uint8_t ak = 0; ak < sel->n_attach; ak++)
                         if (!sel->attach[ak].reclaimed) { has_attach = 1; break; }
                     if (ev.key == TB_KEY_ENTER) {   /* open the discoverable action menu */
-                        menu_build_msg(own, sel->deleted, has_attach);
+                        menu_build_msg(own, sel->deleted || locked, has_attach && !ch->e2e);   /* no files in an encrypted DM */
                         act_cid = cid; act_mid = mid; act_uid = 0; act_title = "Message";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
-                    else if (ev.ch == 't') oc_client_open_thread(cl, cid, mid);
+                    else if (ev.ch == 't' && !locked) oc_client_open_thread(cl, cid, mid);
                     else if (ev.ch == 'w') oc_client_list_reactions(cl, cid, mid);
                     else if ((ev.ch == 'x' || ev.ch == 'd') && own) oc_client_delete(cl, cid, mid);
-                    else if (ev.ch == 'r' && !sel->deleted) {   /* open the emoji picker */
+                    else if (ev.ch == 'r' && !sel->deleted && !locked) {   /* open the emoji picker */
                         picker_open = 1; eq[0] = '\0'; eqlen = 0; esel = 0;
                         picker_cid = cid; picker_mid = mid;
                     }
@@ -3553,6 +3823,7 @@ int main(int argc, char **argv) {
     tb_shutdown();
     tk_list_free(&action_menu);
     tk_palette_free(&launcher);
+    tk_palette_free(&dmpick);
     for (int i = 0; i < g_nws; i++) oc_client_stop(g_ws[i].cl);
     g_nws = 0;
     oc_secret_free(secret);

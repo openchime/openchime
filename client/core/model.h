@@ -158,6 +158,17 @@ typedef struct {
     uint64_t starter;
 } oc_call_notice;
 
+/* An encrypted DM's session on this device, as the UI shows it (PRIVATE-DM.md).
+ * `id` is its channel, whose messages are the conversation; `state` is the last
+ * OC_PDM_EV_* that changed it (INVITED, OPENING, OPEN, KEY_CHANGED or ENDED). An
+ * invitation has a view and no channel until it is accepted. */
+#define OC_PDM_VIEW_MAX   16
+typedef struct {
+    uint64_t     id, peer;
+    uint8_t      state, reason;
+    char         safety[72];
+} oc_pdm_view;
+
 /* A summary made while its asker was not watching (REQ-310, SUMMARY_READY):
  * made (`status` OC_SUM_OK) or not, over the span asked for. */
 typedef struct {
@@ -177,6 +188,10 @@ typedef struct {
     char    *description;  /* heap; NULL = none, or not yet known */
     uint8_t  description_known;
     uint8_t  archived;     /* read-only; hidden from the default list (REQ-035) */
+    /* An encrypted DM (PRIVATE-DM.md): its session is oc_model_pdm(id). Its
+     * texts are wiped from memory when it is forgotten, which also takes it out
+     * of the sidebar. */
+    uint8_t  e2e, forgotten;
     uint32_t info_seq;     /* bumped by every CHANNEL_INFO for it: a roster on screen
                             * asks again when it moves, since an invite or a removal
                             * is answered with one and nothing else says so */
@@ -752,7 +767,21 @@ typedef struct {
     uint32_t     call_error_seq;
     oc_call_notice call_notices[OC_MAX_CALL_NOTICES];
     size_t       n_call_notices;
+    /* Private DMs (PRIVATE-DM.md): each this device is in or invited to, with
+     * what was said, in memory only. `pdm_seq` bumps on any change. */
+    oc_pdm_view  pdms[OC_PDM_VIEW_MAX];
+    size_t       n_pdms;
+    uint32_t     pdm_seq;
+    /* An open that ended before it had an id (refused): with whom, and a count
+     * a frontend watches to say so. */
+    uint64_t     pdm_refused_peer;
+    uint32_t     pdm_refused_seq;
 } oc_model;
+
+/* The private DM `id`, or NULL. */
+oc_pdm_view *oc_model_pdm(oc_model *m, uint64_t id);
+/* Forget a private DM that has ended: its messages are wiped. */
+void oc_model_pdm_forget(oc_model *m, uint64_t id);
 
 void oc_model_init(oc_model *m);
 void oc_model_free(oc_model *m);

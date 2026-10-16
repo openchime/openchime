@@ -29,6 +29,10 @@ int oc_e2e_random(void *buf, size_t n);
 int oc_x25519_keypair(uint8_t sk[OC_X25519_LEN], uint8_t pk[OC_X25519_LEN]);
 /* The public key of `sk`; 0 on success. */
 int oc_x25519_public(const uint8_t sk[OC_X25519_LEN], uint8_t pk[OC_X25519_LEN]);
+/* The shared secret X25519(sk, pk); 0 on success. A small-order `pk`, whose
+ * secret would be all zeros, fails (the private DM's Noise handshake and ratchet,
+ * PRIVATE-DM.md, as well as HPKE). */
+int oc_x25519(const uint8_t sk[OC_X25519_LEN], const uint8_t pk[OC_X25519_LEN], uint8_t out[OC_X25519_LEN]);
 
 /* Seal `pt` to the receiver `pk_r`, authenticated as the holder of `sk_s`.
  * Writes the 32-byte encapsulated key to `enc` and pt_len + OC_HPKE_TAG_LEN bytes

@@ -339,6 +339,21 @@ void oc_client_delete(oc_client *c, uint64_t channel_id, uint64_t message_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+/* ---- encrypted DMs (PRIVATE-DM.md) ------------------------------------------- */
+
+static void pdm_cmd(oc_client *c, int type, uint64_t id) {
+    if (!c || !id) return;
+    oc_cmd *cmd = oc_cmd_new(type);
+    if (!cmd) return;
+    cmd->channel_id = id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_pdm_accept(oc_client *c, uint64_t pdm_id)       { pdm_cmd(c, OC_CMD_PDM_ACCEPT, pdm_id); }
+void oc_client_pdm_decline(oc_client *c, uint64_t pdm_id)      { pdm_cmd(c, OC_CMD_PDM_DECLINE, pdm_id); }
+void oc_client_pdm_close(oc_client *c, uint64_t pdm_id)        { pdm_cmd(c, OC_CMD_PDM_CLOSE, pdm_id); }
+void oc_client_pdm_trust(oc_client *c, uint64_t pdm_id)        { pdm_cmd(c, OC_CMD_PDM_TRUST, pdm_id); }
+
 /* ---- calls (REQ-150, REQ-301-305) ------------------------------------------ */
 
 static void call_cmd(oc_client *c, int type, uint64_t channel_id, const uint64_t *uids, int n) {
@@ -544,9 +559,9 @@ void oc_client_toggle_roster(oc_client *c, int open) {
     if (open) oc_client_list_users(c);   /* refresh on open */
 }
 
-void oc_client_open_dm(oc_client *c, uint64_t user_id) {
+void oc_client_open_dm(oc_client *c, uint64_t user_id, int e2e) {
     if (!c || !user_id) return;
-    oc_cmd *cmd = oc_cmd_new(OC_CMD_OPEN_DM);
+    oc_cmd *cmd = oc_cmd_new(e2e ? OC_CMD_PDM_OPEN : OC_CMD_OPEN_DM);
     if (!cmd) return;
     cmd->channel_id = user_id;   /* reused as the target user id */
     oc_queue_push(&c->cmds, cmd);

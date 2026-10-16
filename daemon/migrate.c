@@ -1323,6 +1323,30 @@ static const char MIGRATION_0062[] =
     "ALTER TABLE local_credentials ADD COLUMN kdf TEXT NOT NULL DEFAULT '';"
     "ALTER TABLE local_credentials DROP COLUMN iterations;";
 
+/* 0063: a DM encrypted end to end (PRIVATE-DM.md). `e2e` marks it; its
+ * message bodies are ciphertext the daemon cannot read, so full-text search
+ * leaves them out: the triggers index, and unindex, only rows of a channel
+ * without the mark. The mark never changes on a channel, so the two always
+ * agree about which rows the index holds. */
+static const char MIGRATION_0063[] =
+    "ALTER TABLE channels ADD COLUMN e2e INTEGER NOT NULL DEFAULT 0;"
+    "DROP TRIGGER messages_fts_ai;"
+    "DROP TRIGGER messages_fts_ad;"
+    "DROP TRIGGER messages_fts_au;"
+    "CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages"
+    "  WHEN (SELECT e2e FROM channels WHERE id=new.channel_id) IS NOT 1 BEGIN"
+    "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);"
+    "END;"
+    "CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages"
+    "  WHEN (SELECT e2e FROM channels WHERE id=old.channel_id) IS NOT 1 BEGIN"
+    "  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body);"
+    "END;"
+    "CREATE TRIGGER messages_fts_au AFTER UPDATE ON messages"
+    "  WHEN (SELECT e2e FROM channels WHERE id=new.channel_id) IS NOT 1 BEGIN"
+    "  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body);"
+    "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);"
+    "END;";
+
 static const char MIGRATION_0059[] =
     /* A summary is its asker's, not their connection's (REQ-311, SUMMARIES.md
      * §5). The queue is made again -- its rows were only ever a run's -- with
@@ -1430,6 +1454,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 60, MIGRATION_0060 },
     { 61, MIGRATION_0061 },
     { 62, MIGRATION_0062 },
+    { 63, MIGRATION_0063 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

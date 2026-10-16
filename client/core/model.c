@@ -40,7 +40,14 @@ static void msg_free(oc_msg *m) {
     msg_clear_unfurls(m);
 }
 
+/* An encrypted DM's texts are wiped, not only freed: once it is forgotten or the
+ * app closes, nothing of what was said is left behind (PRIVATE-DM.md). */
+static void text_wipe(char *t) {
+    if (t) { volatile char *v = t; for (size_t k = 0; v[k]; k++) v[k] = 0; }
+}
+
 static void channel_free(oc_channel *c) {
+    if (c->e2e) for (size_t i = 0; i < c->n_msgs; i++) text_wipe(c->msgs[i].body);
     for (size_t i = 0; i < c->n_msgs; i++) msg_free(&c->msgs[i]);
     free(c->msgs);
     free(c->name);
@@ -209,7 +216,37 @@ void oc_model_msg_preview(const oc_model *m, const oc_msg *msg, char *out, size_
     }
 }
 
+oc_pdm_view *oc_model_pdm(oc_model *m, uint64_t id) {
+    for (size_t i = 0; id && i < m->n_pdms; i++) if (m->pdms[i].id == id) return &m->pdms[i];
+    return NULL;
+}
+
+void oc_model_pdm_forget(oc_model *m, uint64_t id) {
+    oc_channel *c = oc_model_channel(m, id);
+    if (c && c->e2e) {   /* what was said goes, wiped; the row goes from the sidebar */
+        for (size_t i = 0; i < c->n_msgs; i++) { text_wipe(c->msgs[i].body); msg_free(&c->msgs[i]); }
+        free(c->msgs);
+        c->msgs = NULL;
+        c->n_msgs = c->cap_msgs = 0;
+        c->preview[0] = '\0';
+        c->unread = 0;
+        c->forgotten = 1;
+        c->info_seq++;
+    }
+    for (size_t i = 0; id && i < m->n_pdms; i++)
+        if (m->pdms[i].id == id) {
+            memset(&m->pdms[i], 0, sizeof m->pdms[0]);
+            memmove(&m->pdms[i], &m->pdms[i + 1], (m->n_pdms - i - 1) * sizeof m->pdms[0]);
+            m->n_pdms--;
+            memset(&m->pdms[m->n_pdms], 0, sizeof m->pdms[0]);
+            m->pdm_seq++;
+            return;
+        }
+}
+
 void oc_model_free(oc_model *m) {
+    memset(m->pdms, 0, sizeof m->pdms);
+    m->n_pdms = 0;
     free(m->sum_notices);
     free(m->chanmem_via);
     for (size_t i = 0; i < m->n_groups; i++) free(m->groups[i]);
@@ -1693,6 +1730,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
              * topic change and an archive all arrive as CHANNEL_INFO, so this
              * one arm keeps the sidebar and the header honest for all three. */
             c->archived = e->archived;
+            if (e->e2e) c->e2e = 1;
             if (e->created_at) c->created_at = e->created_at;
             if (e->preview) {
                 snprintf(c->preview, sizeof c->preview, "%s", e->preview);
@@ -2166,6 +2204,25 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         } else {
             m->summary_error = strdup(e->body && *e->body ? e->body : "No summary.");
         }
+        break;
+    }
+    case OC_EV_PDM: {
+        oc_pdm_view *v = oc_model_pdm(m, e->channel_id);
+        if (!v && e->channel_id && e->pdm_kind != OC_PDM_EV_ENDED && m->n_pdms < OC_PDM_VIEW_MAX) {
+            v = &m->pdms[m->n_pdms++];
+            memset(v, 0, sizeof *v);
+            v->id = e->channel_id;
+            v->peer = e->user_id;
+        }
+        m->pdm_seq++;
+        if (!v && e->pdm_kind == OC_PDM_EV_ENDED && !e->channel_id) {
+            m->pdm_refused_peer = e->user_id;
+            m->pdm_refused_seq++;
+        }
+        if (!v) break;
+        v->state = e->pdm_kind;
+        if (e->pdm_kind == OC_PDM_EV_ENDED) v->reason = e->pdm_reason;
+        if (e->pdm_safety[0]) snprintf(v->safety, sizeof v->safety, "%s", e->pdm_safety);
         break;
     }
     case OC_EV_SUMMARY_READY: {
@@ -3167,6 +3224,7 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
         size_t tn = 0, total = 0;
         for (size_t i = 0; tmp && i < m->n_channels; i++) {
             const oc_channel *c = &m->channels[i];
+            if (c->e2e && c->forgotten) continue;   /* an encrypted DM put away (PRIVATE-DM.md) */
             int is_dm = (c->kind == OC_CHANNEL_KIND_DM);
             int starred = oc_sidebar_is_starred(o, c->channel_id);
             int inbox = oc_sidebar_section_of(o, c->channel_id);   /* custom, or -1 */

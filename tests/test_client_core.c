@@ -2340,7 +2340,7 @@ static void test_store_legacy_entry(void) {
 
     /* The next write of anything upgrades the entry in place, keeping the rest. */
     oc_store_save_pin(s, "acme:443", pin);
-    CHECK(mock_len_of("acme:443") > (size_t)V1_BLOB && mock_ver_of("acme:443") == 3);
+    CHECK(mock_len_of("acme:443") > (size_t)V1_BLOB && mock_ver_of("acme:443") == 4);
     CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1 && tok[0] == 1);
     memset(&b, 0, sizeof b);
     oc_store_workspace_each(s, book_cb, &b);
@@ -3158,6 +3158,89 @@ static int host_has_ipv6(void) {
     return ok;
 }
 
+/* An encrypted DM between two clients through the real daemon (PRIVATE-DM.md):
+ * opened, accepted, the same safety number on both; then an ordinary DM channel,
+ * marked e2e, in which text, an edit, a reaction and a delete work as in any DM;
+ * and closed, and forgotten with its text. */
+static const oc_pdm_view *pdm_of(const oc_model *m, uint64_t peer) {
+    for (size_t i = 0; i < m->n_pdms; i++) if (m->pdms[i].peer == peer) return &m->pdms[i];
+    return NULL;
+}
+
+static oc_channel *chan_of(const oc_model *m, uint64_t id) { return oc_model_channel((oc_model *)m, id); }
+
+static void test_pdm_e2e(oc_client *a, oc_client *b) {
+    oc_client *c = NULL;   /* CALL_WAIT ticks a third when there is one */
+    const oc_model *ma = oc_client_model(a), *mb = oc_client_model(b);
+    uint64_t ua = ma->user_id, ub = mb->user_id;
+
+    /* To oneself: refused, and said so. */
+    uint32_t refused = ma->pdm_refused_seq;
+    oc_client_open_dm(a, ua, 1);
+    CHECK(CALL_WAIT(3000, ma->pdm_refused_seq != refused));
+
+    /* dana asks erik; erik is asked, and accepts on this device. */
+    oc_client_open_dm(a, ub, 1);
+    CHECK(CALL_WAIT(3000, pdm_of(ma, ub) && pdm_of(ma, ub)->state == OC_PDM_EV_OPENING));
+    CHECK(CALL_WAIT(3000, pdm_of(mb, ua) && pdm_of(mb, ua)->state == OC_PDM_EV_INVITED));
+    uint64_t id = pdm_of(mb, ua)->id;
+    CHECK(id != 0 && id == pdm_of(ma, ub)->id);
+    CHECK(chan_of(mb, id) == NULL);              /* nothing until it is accepted */
+    oc_client_pdm_accept(b, id);
+    CHECK(CALL_WAIT(5000, pdm_of(ma, ub)->state == OC_PDM_EV_OPEN && pdm_of(mb, ua)->state == OC_PDM_EV_OPEN));
+
+    /* The same safety number, twelve groups of five digits, on both. */
+    CHECK(strlen(pdm_of(ma, ub)->safety) == 71);
+    CHECK(strcmp(pdm_of(ma, ub)->safety, pdm_of(mb, ua)->safety) == 0);
+
+    /* Its channel: a DM with the other, marked e2e, on both. */
+    CHECK(CALL_WAIT(3000, chan_of(ma, id) && chan_of(mb, id)));
+    CHECK(chan_of(ma, id)->e2e && chan_of(mb, id)->e2e);
+    CHECK(chan_of(ma, id)->kind == OC_CHANNEL_KIND_DM && chan_of(ma, id)->peer_id == ub);
+
+    /* Both ways, as in any DM: the sender reads its own (kept, not opened). */
+    oc_client_send(a, id, "the **private** words");
+    CHECK(CALL_WAIT(3000, channel_has_body(mb, id, "the **private** words")));
+    CHECK(CALL_WAIT(3000, channel_has_body(ma, id, "the **private** words")));
+    oc_client_send(b, id, "and a private answer");
+    CHECK(CALL_WAIT(3000, channel_has_body(ma, id, "and a private answer")));
+    CHECK(CALL_WAIT(3000, channel_has_body(mb, id, "and a private answer")));
+
+    /* An edit, a reaction, a delete. */
+    uint64_t m1 = body_id(ma, id, "the **private** words");
+    CHECK(m1 != 0);
+    oc_client_edit(a, id, m1, "the private words, edited");
+    CHECK(CALL_WAIT(3000, find_msg(mb, id, m1) && find_msg(mb, id, m1)->edited &&
+                          strcmp(find_msg(mb, id, m1)->body, "the private words, edited") == 0));
+    CHECK(CALL_WAIT(3000, strcmp(find_msg(ma, id, m1)->body, "the private words, edited") == 0));
+    oc_client_react(b, id, m1, "\xF0\x9F\x91\x8D", 1);
+    CHECK(CALL_WAIT(3000, find_msg(ma, id, m1)->n_reactions == 1));
+    uint64_t m2 = body_id(mb, id, "and a private answer");
+    oc_client_delete(b, id, m2);
+    CHECK(CALL_WAIT(3000, find_msg(ma, id, m2) && find_msg(ma, id, m2)->deleted));
+
+    /* dana closes it: erik is told; both forget it, and its text with it. */
+    oc_client_pdm_close(a, id);
+    CHECK(CALL_WAIT(3000, pdm_of(mb, ua) && pdm_of(mb, ua)->state == OC_PDM_EV_ENDED &&
+                          pdm_of(mb, ua)->reason == OC_PDM_END_CLOSED));
+    oc_client_send(b, id, "too late");                 /* nothing is sent: the session is gone */
+    usleep(300000);
+    CHECK(!channel_has_body(ma, id, "too late"));
+    oc_model_pdm_forget((oc_model *)mb, id);
+    oc_model_pdm_forget((oc_model *)ma, id);
+    CHECK(pdm_of(mb, ua) == NULL && pdm_of(ma, ub) == NULL);
+    CHECK(chan_of(mb, id)->forgotten && chan_of(mb, id)->n_msgs == 0);
+
+    /* A declined invitation: dana is told why. */
+    oc_client_open_dm(a, ub, 1);
+    CHECK(CALL_WAIT(3000, pdm_of(mb, ua) && pdm_of(mb, ua)->state == OC_PDM_EV_INVITED));
+    oc_client_pdm_decline(b, pdm_of(mb, ua)->id);
+    CHECK(CALL_WAIT(3000, pdm_of(ma, ub) && pdm_of(ma, ub)->state == OC_PDM_EV_ENDED &&
+                          pdm_of(ma, ub)->reason == OC_PDM_END_DECLINED));
+    oc_model_pdm_forget((oc_model *)ma, pdm_of(ma, ub)->id);
+    if (pdm_of(mb, ua)) oc_model_pdm_forget((oc_model *)mb, pdm_of(mb, ua)->id);
+}
+
 static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     tone_io ta = { 440, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
     tone_io tb = { 660, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
@@ -3564,7 +3647,24 @@ static void test_device_key(void) {
     CHECK(oc_x25519_public(sk, pkc) == 0 && memcmp(pkc, pk, 32) == 0);
     CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1);
     CHECK(memcmp(sk, sk2, 32) == 0 && memcmp(pk, pk2, 32) == 0);
-    CHECK(mock_ver_of("acme:443") == 3);
+    CHECK(mock_ver_of("acme:443") == 4);
+
+    /* The people of private DMs (PRIVATE-DM.md §5): the first key is remembered,
+     * the same is known, a different one is reported and changes nothing until
+     * accepted; sixteen are kept, the oldest dropped; a logout forgets them. */
+    uint8_t f1[OC_STORE_PEER_FP], f2[OC_STORE_PEER_FP];
+    memset(f1, 1, sizeof f1); memset(f2, 2, sizeof f2);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, f1) == 0);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, f1) == 1);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, f2) == 2);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, f1) == 1);
+    oc_store_peer_accept(s, "acme:443", 77, f2);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, f2) == 1);
+    for (uint64_t u = 100; u < 116; u++) oc_store_peer_accept(s, "acme:443", u, f1);
+    CHECK(oc_store_peer_check(s, "acme:443", 100, f1) == 1);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, f2) == 0);     /* the oldest went: first again */
+    CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1 && memcmp(sk, sk2, 32) == 0);   /* untouched */
+    CHECK(oc_store_peer_check(NULL, "acme:443", 77, f1) == -1);
     /* Another workspace, another key. */
     CHECK(oc_store_device_key(s, "other:443", sk2, pk2) == 1 && memcmp(pk, pk2, 32) != 0);
     /* Signing out forgets it: the next one is new. */
@@ -3572,6 +3672,7 @@ static void test_device_key(void) {
     oc_store_save_session(s, "acme:443", tok, 0, "dana");
     oc_store_clear_session(s, "acme:443");
     CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1 && memcmp(pk, pk2, 32) != 0);
+    CHECK(oc_store_peer_check(s, "acme:443", 100, f2) == 0);   /* and the peers went with the account */
     /* No credential store: a key for this session only. */
     oc_store *none = oc_store_open("ignored");
     CHECK(oc_store_device_key(none, "acme:443", sk2, pk2) == 0);
@@ -5369,7 +5470,7 @@ int run_client_core_tests(void) {
          * peer (the daemon now reports the DM peer in CHANNEL_INFO). */
         uint64_t erikid = oc_model_user_id(oc_client_model(a), "erik");
         CHECK(erikid != 0);
-        oc_client_open_dm(a, erikid);
+        oc_client_open_dm(a, erikid, 0);
         CHECK(WAIT_FOR(a, dm_with_peer(m, erikid) != 0));
 
         /* Marking channel 1 read clears erik's unread. */
@@ -5883,6 +5984,7 @@ int run_client_core_tests(void) {
         test_calls_e2e(a, b, arg.port);
         test_calls_tcp(a, b);
         test_calls_rejoin(a, b, arg.port);
+        test_pdm_e2e(a, b);
 
         oc_client_set_role(a, erikid, OC_ROLE_ADMIN);
         CHECK(WAIT_FOR(a, member_role(m, erikid) == OC_ROLE_ADMIN));

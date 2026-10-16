@@ -114,6 +114,12 @@ static void decode_all(const uint8_t *buf, size_t len) {
     { oc_call_key ck; oc_call_key_entry ke[4]; oc_rbuf_init(&p, buf, len);
       rc = oc_decode_call_key(&p, &ck, ke, 4); CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
     oc_call_key_for ckf; D(oc_decode_call_key_for(&p, &ckf));
+    oc_pdm_open po; D(oc_decode_pdm_open(&p, &po));
+    oc_pdm_opened pod; D(oc_decode_pdm_opened(&p, &pod));
+    oc_pdm_invite pin; D(oc_decode_pdm_invite(&p, &pin));
+    oc_pdm_hs phs; D(oc_decode_pdm_hs(&p, &phs));
+    oc_pdm_msg pmsg; D(oc_decode_pdm_msg(&p, &pmsg));
+    oc_pdm_end pend; D(oc_decode_pdm_end(&p, &pend));
     oc_call_share csh; D(oc_decode_call_share(&p, &csh));
     oc_call_media_pkt cmu; D(oc_decode_call_media_up(&p, &cmu));
     oc_call_media_pkt cmd; D(oc_decode_call_media_down(&p, &cmd));

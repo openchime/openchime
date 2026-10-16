@@ -1149,6 +1149,7 @@ static void fill_load(oc_sum_worker *w) {
     if (sqlite3_prepare_v2(w->db,
             "SELECT channel_id, MIN(created_at_ms), MAX(created_at_ms) FROM messages "
             "WHERE deleted_at_ms IS NULL AND kind=0 AND created_at_ms>=?1 "
+            "  AND (SELECT e2e FROM channels WHERE id=channel_id) IS NOT 1 "
             "GROUP BY channel_id ORDER BY 3 DESC;", -1, &st, NULL) != SQLITE_OK)
         return;
     sqlite3_bind_int64(st, 1, wall_ms() - (int64_t)SUM_BACKGROUND_DAYS * DAY_MS);

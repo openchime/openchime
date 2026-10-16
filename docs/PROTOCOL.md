@@ -12,11 +12,11 @@ direct messages (§5.12), channel management (§5.7), tenant administration (§5
 reconnect backfill and the error frame — plus presence and
 typing (§5.13, REQ-120/121), attachments (§5.14), incoming webhooks (§5.15),
 notification preferences (§5.16), synced client settings (§5.16a), self-service
-profile (§5.16b), call signaling and screen sharing (§5.17, REQ-150–152, REQ-161), and push device
-tokens (§5.18).
+profile (§5.16b), call signaling and screen sharing (§5.17, REQ-150–152, REQ-161), push device
+tokens (§5.18), and encrypted DMs (§5.19).
 
 **§9 is the complete list; §5's prose is not.** The registry is kept in step with
-`shared/protocol.h` and carries all 225 message types. The narrative sections
+`shared/protocol.h` and carries all 233 message types. The narrative sections
 below specify the payload layouts for the families they name, and a number of
 later families — drafts, scheduled send, the notification schedule and pause,
 keywords, custom emoji, group DMs, invite and session management, webhook
@@ -208,8 +208,10 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 25** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
-> which is the authority; the per-version change notes live beside it). Since the
+> **The current version is 26** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> which is the authority; the per-version change notes live beside it). Version
+> 26 appended the `e2e` byte to `CHANNEL_INFO` and to each `CHANNEL_LIST` entry
+> (§5.7, §5.19). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
 > change moves the number even when it adds one byte.
@@ -738,6 +740,7 @@ msg_type `0x0051`** describing the channel and the caller's membership:
 | `topic`      | str  | Empty when unset (REQ-034). |
 | `archived`   | u8   | `1` when the channel is archived and read-only (REQ-035). |
 | `n_peers`    | u16  | Participant count, then that many `u64` ids — a group DM's people (REQ-056). `0` for a named channel. |
+| `e2e`        | u8   | `1` for an encrypted DM (§5.19, PRIVATE-DM.md), whose message bodies the daemon cannot read; `0` otherwise. |
 
 Failures are non-fatal `ERROR` frames carrying the `channel_id` (8 bytes,
 big-endian) in `context`: `UNKNOWN_CHANNEL`, `NOT_A_MEMBER`, `FORBIDDEN`, or
@@ -780,13 +783,15 @@ Each entry, in wire order:
 `kind` (u8 — `0` channel, `1` DM) · `last_message_at` (u64) · `unread` (u32) ·
 `peer_id` (u64) · `topic` (str) · `archived` (u8) · `created_at` (u64) ·
 `preview` (str) · `preview_author` (u64) · `preview_action` (u8) · `n_peers` (u16)
-followed by `n_peers` × `u64` participant ids. `preview_action` is `1` when the
+followed by `n_peers` × `u64` participant ids · `e2e` (u8, as `CHANNEL_INFO`'s).
+`preview_action` is `1` when the
 newest message is an action (REQ-058, §5.16l): `preview` is then its action
-text, read beside `preview_author`.
+text, read beside `preview_author`. An encrypted DM's `preview` is always empty
+and its `preview_action` `0`: its bodies are ciphertext.
 
 Nothing here is optional: every field is written for every entry, so a decoder
 that stops early desynchronises the whole repeated list rather than losing one
-row. The trailing participant list carries a group DM's people (REQ-056) and is
+row. The participant list carries a group DM's people (REQ-056) and is
 `0`-length for anything else.
 
 The list includes the caller's DMs (§5.12) alongside channels; DM entries have
@@ -2707,6 +2712,73 @@ registered tokens via the emitter (ARCH-85), gated by each recipient's level + D
 
 ---
 
+### 5.19 Encrypted DMs (PRIVATE-DM.md)
+
+An encrypted DM is a DM channel marked `e2e` (`CHANNEL_INFO` and `CHANNEL_LIST`,
+§5.7) that joins two devices, end to end. The `PDM_*` frames carry its handshake,
+a Noise XX exchange the daemon routes and cannot read, and the opener's first
+ratchet message; everything said in it then goes as ordinary frames (§5.1–5.13)
+whose bodies are ciphertext. The `pdm` field of these frames is the channel id.
+A client sends none of these to a daemon whose `CAPABILITIES` lack `pdm`, since
+an unknown frame closes the connection. Limits: a handshake message is 1–256
+bytes, a header exactly 40, a ciphertext 16–16,400; a frame outside them is
+malformed.
+
+| Frame | Payload |
+|---|---|
+| `PDM_OPEN` | `peer u64`, `hs bytes` |
+| `PDM_OPENED` | `pdm u64`, `peer u64` |
+| `PDM_INVITE` | `pdm u64`, `from u64`, `hs bytes` |
+| `PDM_HS`, `PDM_HS_FOR` | `pdm u64`, `hs bytes` |
+| `PDM_SEND`, `PDM_MSG` | `pdm u64`, `header bytes`, `ct bytes` |
+| `PDM_END` | `pdm u64`, `reason u8` |
+
+- **Opening.** `PDM_OPEN` to someone else who is signed in makes a new DM channel
+  between the two (`e2e=1`, never the pair's ordinary DM or an earlier encrypted
+  one). The opener is sent `PDM_OPENED` with its id, then its `CHANNEL_INFO`
+  (`e2e=1`); each of the peer's connections gets `PDM_INVITE`. Anything else
+  (oneself, nobody signed in, 16 encrypted DMs already open for either person, a
+  channel that could not be made) is `PDM_END` with id 0 and reason 5.
+- **Answering.** The first of the peer's devices to send `PDM_HS` for it takes it;
+  the daemon binds that device's session, sends it the channel's `CHANNEL_INFO`
+  (`e2e=1`), tells the peer's other devices `PDM_END` reason 2, and relays the
+  message to the opener as `PDM_HS_FOR`. The opener's `PDM_HS` (handshake 3)
+  goes the other way. `PDM_END` from a device still holding the invitation
+  declines it (reason 6 to the opener).
+- **The first ratchet message.** `PDM_SEND` from a bound device reaches the other
+  as `PDM_MSG`. Clients use it once, for the opener's first, empty ratchet
+  message, which lets the other side's ratchet send. It counts against the
+  message rate and, in demo mode, the daily message limit.
+- **Messages.** `SEND`, `SEND_REPLY`, `EDIT`, `DELETE`, `REACT`, `TYPING` and read
+  cursors work as in any DM. A body is `oc-e2e:1:` followed by the base64 of the
+  40-byte ratchet header and the AES-GCM ciphertext; reaction emoji are not
+  encrypted. While the conversation is live, what is said in it goes only to its
+  two bound connections, and a `SEND`, `SEND_REPLY`, `EDIT`, `DELETE` or `REACT`
+  from any other connection is refused with `FORBIDDEN` (a `TYPING` is dropped).
+  The daemon reads no body in it: no search, mentions, keyword hits, actions,
+  unfurls, summaries (`SUMMARY` answers unavailable), read-aloud, voice input or
+  forwards, and every excerpt (list preview, activity, threads, pins, saved) is
+  empty. A `SEND` or `SEND_REPLY` with attachments or a forward, `UPLOAD_BEGIN`,
+  `CREATE_WEBHOOK`, `SCHEDULE_MESSAGE`, `SET_DRAFT`, `PIN` and `SAVE_ITEM` are refused
+  with `FORBIDDEN`.
+- **Away and back.** A bound device whose connection drops keeps its place for its
+  session: its `PDM_*` frames wait (at most 64) and are delivered when a
+  connection signs in with the same session, which catches up on the channel as
+  any client does. A side away 24 hours, an invitation unanswered for 24 hours,
+  or a full queue ends the DM (reason 3). A fresh sign-in is another session and
+  is given nothing of it.
+- **Ending.** `PDM_END` from a bound device ends it for both; the other device is
+  told reason 1, or 4 when the sender says it no longer holds the session (a
+  restarted app answers frames for a DM it does not know with reason 4). A frame
+  naming a DM that is gone, or one the sender is not bound to, is answered with
+  `PDM_END` reason 5.
+
+Reasons: 1 closed, 2 taken by another device, 3 gone, 4 lost, 5 refused, 6 declined.
+The session is held in memory only. When it ends its channel is closed
+(`archived_at_ms` set), so a later write is `CHANNEL_ARCHIVED`; a daemon restart
+closes every encrypted DM; and the storage maintenance pass deletes one closed
+more than 24 hours ago, with every row about it (PRIVATE-DM.md §2).
+
 ## 6. Reconnect backfill (resolves REQ-101)
 
 A client that reconnects (REQ-100) requests everything it missed since its
@@ -2937,7 +3009,7 @@ frames (§4.2a, §4.2c).
 ## 9. Message type registry
 
 **Kept by hand in step with `shared/protocol.h`** — every `OC_MSG_*` the codec
-defines, in opcode order, 225 of them. The sections above specify the payload layouts; this
+defines, in opcode order, 233 of them. The sections above specify the payload layouts; this
 table is the index and the authority on which values are taken.
 
 **Every opcode carries exactly one message type.** `scripts/check/opcodes.sh`
@@ -3173,6 +3245,14 @@ this table cannot silently gain a shared value.
 | `0x0104` | `SUMMARY_OPEN` | C → S | a notice's summary, as it was made |
 | `0x0105` | `SUMMARY_DISMISS` | C → S | a notice seen, unopened |
 | `0x0106` | `SERVER_BUILD` | S → C | after `WORKSPACE_INFO`: the daemon's build id |
+| `0x0107` | `PDM_OPEN` | C → S | start an encrypted DM with a person, with handshake 1 (§5.19) |
+| `0x0108` | `PDM_OPENED` | S → C | to the opener: the encrypted DM's id (its channel) |
+| `0x0109` | `PDM_INVITE` | S → C | to the peer's devices: the invitation, with handshake 1 |
+| `0x010A` | `PDM_HS` | C → S | handshake 2 (the peer's device) or 3 (the opener) |
+| `0x010B` | `PDM_HS_FOR` | S → C | that handshake message, to the other device |
+| `0x010C` | `PDM_SEND` | C → S | one ratchet message: header and ciphertext (the opener's first, empty one) |
+| `0x010D` | `PDM_MSG` | S → C | that message, to the other device |
+| `0x010E` | `PDM_END` | both | the encrypted DM ended, and why |
 
 ## 10. Connection state machine
 

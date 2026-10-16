@@ -93,6 +93,10 @@ int oc_x25519_public(const uint8_t sk[OC_X25519_LEN], uint8_t pk[OC_X25519_LEN])
     return x25519(sk, NULL, pk);
 }
 
+int oc_x25519(const uint8_t sk[OC_X25519_LEN], const uint8_t pk[OC_X25519_LEN], uint8_t out[OC_X25519_LEN]) {
+    return x25519(sk, pk, out);
+}
+
 int oc_x25519_keypair(uint8_t sk[OC_X25519_LEN], uint8_t pk[OC_X25519_LEN]) {
     if (oc_e2e_random(sk, OC_X25519_LEN) != 0) return -1;
     if (oc_x25519_public(sk, pk) != 0) { oc_e2e_wipe(sk, OC_X25519_LEN); return -1; }

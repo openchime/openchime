@@ -4502,6 +4502,191 @@ static void test_call_leave_while_joining(int port, const uint8_t *pin, oc_dbwri
  * joining, the roster with slots, keys and epochs, sealed keys forwarded only
  * between participants for the current epoch, the cap, declining, ending, the
  * missed-call line, one call per connection, and a non-member refused. */
+/* Private DMs (PRIVATE-DM.md) through the daemon: opened to a person, shown to
+ * their devices, taken by the first that answers, carried byte for byte both
+ * ways, closed to anyone else, queued while a side is away, and ended. The bytes
+ * here stand in for the handshake and the ciphertext: the daemon cannot tell. */
+static void set_read_timeout(client *c, int ms);
+static int pdm_frame_send(client *c, uint16_t type, uint64_t id, uint8_t fill, size_t len) {
+    uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    uint8_t bytes[OC_PDM_MAX_HS], hdr[OC_PDM_HEADER_LEN];
+    memset(bytes, fill, sizeof bytes); memset(hdr, fill ^ 0x55, sizeof hdr);
+    oc_result rc = OC_E_MALFORMED;
+    if (type == OC_MSG_PDM_OPEN) { oc_pdm_open m = { id, { bytes, len } }; rc = oc_encode_pdm_open(&w, OC_PROTOCOL_VERSION, &m); }
+    if (type == OC_MSG_PDM_HS)   { oc_pdm_hs m = { id, { bytes, len } };   rc = oc_encode_pdm_hs(&w, OC_PROTOCOL_VERSION, type, &m); }
+    if (type == OC_MSG_PDM_SEND) { oc_pdm_msg m = { id, { hdr, sizeof hdr }, { bytes, len } };
+                                   rc = oc_encode_pdm_msg(&w, OC_PROTOCOL_VERSION, type, &m); }
+    if (type == OC_MSG_PDM_END)  { oc_pdm_end m = { id, (uint8_t)len }; rc = oc_encode_pdm_end(&w, OC_PROTOCOL_VERSION, &m); }
+    return rc == OC_OK ? send_frame(c, buf, w.len) : -1;
+}
+
+static int bytes_are(oc_slice s, uint8_t fill, size_t len) {
+    if (s.len != len) return 0;
+    for (size_t i = 0; i < len; i++) if (s.ptr[i] != fill) return 0;
+    return 1;
+}
+
+/* A SEND of `body` into `ch` from `c`. */
+static int pdm_say(client *c, uint64_t ch, const char *body, uint8_t idem_fill) {
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0};
+    s.channel_id = ch;
+    memset(s.idem, idem_fill, sizeof s.idem);
+    s.body = oc_slice_str(body);
+    return oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK ? send_frame(c, buf, w.len) : -1;
+}
+
+/* The next BROADCAST `c` is sent, its body in `out`. */
+static int pdm_heard(client *c, char *out, size_t cap) {
+    oc_header hdr; oc_rbuf p; oc_broadcast b;
+    if (read_type(c, OC_MSG_BROADCAST, &hdr, &p) != 0 || oc_decode_broadcast(&p, &b) != OC_OK) return -1;
+    size_t n = b.body.len < cap - 1 ? b.body.len : cap - 1;
+    memcpy(out, b.body.ptr, n); out[n] = '\0';
+    return 0;
+}
+
+/* Encrypted DMs through the daemon (PRIVATE-DM.md): the handshake relayed
+ * byte for byte; the conversation an ordinary DM channel marked e2e, whose
+ * messages reach its two devices only and whose bodies the daemon keeps as
+ * given and reads for nothing; no file in it; and closed when it ends. */
+static void test_pdm_relay(int port, const uint8_t *pin) {
+    client a, b1, b2, c;
+    CHECK(client_open(&a, port, pin) == 0);  CHECK(do_handshake(&a) == 0);
+    CHECK(client_open(&b1, port, pin) == 0); CHECK(do_handshake(&b1) == 0);
+    CHECK(client_open(&b2, port, pin) == 0); CHECK(do_handshake(&b2) == 0);
+    CHECK(client_open(&c, port, pin) == 0);  CHECK(do_handshake(&c) == 0);
+    uint64_t ua = 0, ub = 0, ub2 = 0, uc = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b1, "bob", "pw-bob", &ub) == 0);
+    CHECK(do_auth(&b2, "bob", "pw-bob", &ub2) == 0);   /* bob's second device */
+    CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
+    oc_header hdr; oc_rbuf p;
+    uint16_t code = 0;
+    char said[256];
+
+    /* Not to oneself: refused, with no DM made. */
+    CHECK(pdm_frame_send(&a, OC_MSG_PDM_OPEN, ua, 0x11, 32) == 0);
+    CHECK(read_type(&a, OC_MSG_PDM_END, &hdr, &p) == 0);
+    { oc_pdm_end e; CHECK(oc_decode_pdm_end(&p, &e) == OC_OK && e.pdm_id == 0 && e.reason == OC_PDM_END_REFUSED); }
+
+    /* alice opens one to bob: she learns its id, then is given its channel, a
+     * DM with bob marked e2e; both of bob's devices are invited. */
+    CHECK(pdm_frame_send(&a, OC_MSG_PDM_OPEN, ub, 0x11, 32) == 0);
+    CHECK(read_type(&a, OC_MSG_PDM_OPENED, &hdr, &p) == 0);
+    oc_pdm_opened op; CHECK(oc_decode_pdm_opened(&p, &op) == OC_OK && op.peer == ub && op.pdm_id != 0);
+    uint64_t id = op.pdm_id;
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    { oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+      CHECK(ci.channel_id == id && ci.kind == OC_CHANNEL_KIND_DM && ci.e2e == 1 && ci.peer_id == ub && !ci.archived); }
+    for (int i = 0; i < 2; i++) {
+        client *b = i ? &b2 : &b1;
+        CHECK(read_type(b, OC_MSG_PDM_INVITE, &hdr, &p) == 0);
+        oc_pdm_invite inv; CHECK(oc_decode_pdm_invite(&p, &inv) == OC_OK);
+        CHECK(inv.pdm_id == id && inv.from == ua && bytes_are(inv.hs, 0x11, 32));
+    }
+
+    /* bob's first device answers: it takes the DM and is given the channel,
+     * the other is told it was taken, and alice gets the answer as sent. */
+    CHECK(pdm_frame_send(&b1, OC_MSG_PDM_HS, id, 0x22, 96) == 0);
+    CHECK(read_type(&b1, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    { oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+      CHECK(ci.channel_id == id && ci.e2e == 1 && ci.peer_id == ua); }
+    CHECK(read_type(&b2, OC_MSG_PDM_END, &hdr, &p) == 0);
+    { oc_pdm_end e; CHECK(oc_decode_pdm_end(&p, &e) == OC_OK && e.pdm_id == id && e.reason == OC_PDM_END_TAKEN); }
+    CHECK(read_type(&a, OC_MSG_PDM_HS_FOR, &hdr, &p) == 0);
+    { oc_pdm_hs h; CHECK(oc_decode_pdm_hs(&p, &h) == OC_OK && h.pdm_id == id && bytes_are(h.hs, 0x22, 96)); }
+    CHECK(pdm_frame_send(&a, OC_MSG_PDM_HS, id, 0x33, 64) == 0);
+    CHECK(read_type(&b1, OC_MSG_PDM_HS_FOR, &hdr, &p) == 0);
+    { oc_pdm_hs h; CHECK(oc_decode_pdm_hs(&p, &h) == OC_OK && bytes_are(h.hs, 0x33, 64)); }
+    /* The opener's first ratchet message goes the handshake's way. */
+    CHECK(pdm_frame_send(&a, OC_MSG_PDM_SEND, id, 0x44, 16) == 0);
+    CHECK(read_type(&b1, OC_MSG_PDM_MSG, &hdr, &p) == 0);
+    { oc_pdm_msg m; CHECK(oc_decode_pdm_msg(&p, &m) == OC_OK && m.pdm_id == id && bytes_are(m.ct, 0x44, 16)); }
+
+    /* Messages as in any DM, kept and sent on as given (here a stand-in for
+     * ciphertext), to the two devices only. */
+    CHECK(pdm_say(&a, id, "oc-e2e:1:c2VhbGVkIHplYnJhZmlzaCBodHRwOi8vZXhhbXBsZS5jb20=", 0x51) == 0);
+    CHECK(pdm_heard(&b1, said, sizeof said) == 0);
+    CHECK(strcmp(said, "oc-e2e:1:c2VhbGVkIHplYnJhZmlzaCBodHRwOi8vZXhhbXBsZS5jb20=") == 0);
+    CHECK(pdm_heard(&a, said, sizeof said) == 0);
+    CHECK(pdm_say(&b1, id, "oc-e2e:1:YW5zd2Vy", 0x52) == 0);
+    CHECK(pdm_heard(&a, said, sizeof said) == 0 && strcmp(said, "oc-e2e:1:YW5zd2Vy") == 0);
+
+    /* Nobody else gets in: bob's other device is refused and sent nothing,
+     * carol is not a member. */
+    CHECK(pdm_say(&b2, id, "plain text from elsewhere", 0x53) == 0);
+    CHECK(read_error(&b2, &code) == 0 && code == OC_ERR_FORBIDDEN);
+    set_read_timeout(&b2, 300);
+    CHECK(read_type(&b2, OC_MSG_BROADCAST, &hdr, &p) != 0);
+    set_read_timeout(&b2, 20000);
+    CHECK(pdm_say(&c, id, "carol", 0x54) == 0);
+    CHECK(read_error(&c, &code) == 0 && code != 0);
+
+    /* No file in it. */
+    {
+        uint8_t fbuf[256]; oc_wbuf w; oc_wbuf_init(&w, fbuf, sizeof fbuf);
+        oc_upload_begin ub = { id, {0}, oc_slice_str("x.bin"), oc_slice_str("application/octet-stream"), 10 };
+        memset(ub.idem, 0x55, OC_IDEM_SIZE);
+        CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
+        CHECK(read_error(&a, &code) == 0 && code == OC_ERR_FORBIDDEN);
+    }
+
+    /* Its body is read for nothing: no preview in the list. */
+    {
+        uint8_t lbuf[64]; oc_wbuf w; oc_wbuf_init(&w, lbuf, sizeof lbuf);
+        CHECK(oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK && send_frame(&a, lbuf, w.len) == 0);
+        CHECK(read_type(&a, OC_MSG_CHANNEL_LIST, &hdr, &p) == 0);
+        static oc_channel_list_entry ents[OC_CHANNEL_LIST_PAGE]; uint16_t n = 0;
+        CHECK(oc_decode_channel_list(&p, ents, OC_CHANNEL_LIST_PAGE, &n) == OC_OK);
+        int found = 0;
+        for (uint16_t i = 0; i < n && i < OC_CHANNEL_LIST_PAGE; i++)
+            if (ents[i].channel_id == id) { found = 1; CHECK(ents[i].e2e == 1 && ents[i].preview.len == 0); }
+        CHECK(found);
+    }
+
+    /* alice ends it: bob's device hears; the channel is closed, so nothing
+     * more is taken in it. */
+    CHECK(pdm_frame_send(&a, OC_MSG_PDM_END, id, 0, OC_PDM_END_CLOSED) == 0);
+    CHECK(read_type(&b1, OC_MSG_PDM_END, &hdr, &p) == 0);
+    { oc_pdm_end e; CHECK(oc_decode_pdm_end(&p, &e) == OC_OK && e.pdm_id == id && e.reason == OC_PDM_END_CLOSED); }
+    usleep(200 * 1000);
+    CHECK(pdm_say(&a, id, "oc-e2e:1:bGF0ZQ==", 0x56) == 0);
+    CHECK(read_error(&a, &code) == 0 && code == OC_ERR_CHANNEL_ARCHIVED);
+
+    /* A declined invitation: alice hears it, bob's other device stops showing it. */
+    CHECK(pdm_frame_send(&a, OC_MSG_PDM_OPEN, ub, 0x12, 32) == 0);
+    CHECK(read_type(&a, OC_MSG_PDM_OPENED, &hdr, &p) == 0);
+    CHECK(oc_decode_pdm_opened(&p, &op) == OC_OK);
+    CHECK(op.pdm_id != id);                             /* a new conversation each time */
+    CHECK(read_type(&b1, OC_MSG_PDM_INVITE, &hdr, &p) == 0);
+    CHECK(read_type(&b2, OC_MSG_PDM_INVITE, &hdr, &p) == 0);
+    CHECK(pdm_frame_send(&b2, OC_MSG_PDM_END, op.pdm_id, 0, OC_PDM_END_DECLINED) == 0);
+    CHECK(read_type(&a, OC_MSG_PDM_END, &hdr, &p) == 0);
+    { oc_pdm_end e; CHECK(oc_decode_pdm_end(&p, &e) == OC_OK && e.pdm_id == op.pdm_id && e.reason == OC_PDM_END_DECLINED); }
+    CHECK(read_type(&b1, OC_MSG_PDM_END, &hdr, &p) == 0);
+    { oc_pdm_end e; CHECK(oc_decode_pdm_end(&p, &e) == OC_OK && e.pdm_id == op.pdm_id); }
+
+    /* A side away: what is said reaches neither its other sessions nor
+     * anyone else. bob's device goes; alice speaks; a fresh sign-in by bob is
+     * another session and is sent nothing of it. */
+    CHECK(pdm_frame_send(&a, OC_MSG_PDM_OPEN, ub, 0x13, 32) == 0);
+    CHECK(read_type(&a, OC_MSG_PDM_OPENED, &hdr, &p) == 0);
+    CHECK(oc_decode_pdm_opened(&p, &op) == OC_OK);
+    CHECK(read_type(&b1, OC_MSG_PDM_INVITE, &hdr, &p) == 0);
+    CHECK(pdm_frame_send(&b1, OC_MSG_PDM_HS, op.pdm_id, 0x23, 96) == 0);
+    CHECK(read_type(&a, OC_MSG_PDM_HS_FOR, &hdr, &p) == 0);
+    client_close(&b1);
+    usleep(100 * 1000);
+    CHECK(pdm_say(&a, op.pdm_id, "oc-e2e:1:YXdheQ==", 0x57) == 0);
+    client b3;
+    CHECK(client_open(&b3, port, pin) == 0); CHECK(do_handshake(&b3) == 0);
+    uint64_t ub3 = 0; CHECK(do_auth(&b3, "bob", "pw-bob", &ub3) == 0);
+    set_read_timeout(&b3, 300);
+    CHECK(read_type(&b3, OC_MSG_BROADCAST, &hdr, &p) != 0);
+
+    client_close(&a); client_close(&b2); client_close(&b3); client_close(&c);
+}
+
 static void test_call_vertical(int port, const uint8_t *pin) {
     client a, b, c, d;
     CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
@@ -7029,6 +7214,7 @@ int run_netloop_tests(void) {
         test_notify_prefs_vertical(arg.port, pin);
         oc_netloop_set_call_grace_ms(300);   /* the call tests see a held seat go quickly */
         test_call_vertical(arg.port, pin);
+    test_pdm_relay(arg.port, pin);
         test_call_leave_while_joining(arg.port, pin, dbw);
         test_alerts_wire(arg.port, pin, dbw);
         test_restore_wire(arg.port, pin);

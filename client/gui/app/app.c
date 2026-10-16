@@ -472,7 +472,10 @@ enum { VIEW_HOME = 0, VIEW_DMS, VIEW_ACTIVITY, VIEW_FILES, VIEW_LATER,
        VIEW_DRAFTS, VIEW_NEWMSG, VIEW_ADMIN, VIEW_THREADS, VIEW_DIRECTORY,
        /* Not a rail item either: a call, reached from the Calls section, the
         * header's call button, the in-call strip or an invitation (REQ-303). */
-       VIEW_CALL, VIEW_COUNT,
+       VIEW_CALL,
+       /* Not a rail item: a private DM (PRIVATE-DM.md), reached from its row in the
+        * Home sidebar, a person's profile or an invitation. */
+       VIEW_COUNT,
        /* Not a rail destination: the sign-in screen, which owns the whole window
         * (no rail, no sidebar, no composer) until there is a session. */
        VIEW_SIGNIN = 100 };
@@ -1884,7 +1887,8 @@ static uint64_t g_confirm_root;     /* CONF_DRAFT_DELETE: the draft's thread roo
 enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVOKE,
        CONF_CHANNEL_ARCHIVE, CONF_WS_FORGET,
        CONF_CHANNEL_PRIVATE, CONF_CHANNEL_PUBLIC, CONF_MENTION_ADD, CONF_DRAFT_DELETE,
-       CONF_GROUP_DELETE, CONF_CHANNEL_GROUP_REMOVE, CONF_LINK_OPEN, CONF_CERT_TRUST };
+       CONF_GROUP_DELETE, CONF_CHANNEL_GROUP_REMOVE, CONF_LINK_OPEN, CONF_CERT_TRUST,
+       CONF_PDM_TRUST, CONF_PDM_SAFETY };
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 
@@ -2073,9 +2077,14 @@ static float g_about_scroll, g_about_h, g_about_max;
  * has no name to rename, no topic worth setting"), so that button's only possible
  * outcome was an error. Only the admin block was gated on kind; the topic row was
  * missed. A DM's "about" is the person, and a person is right-side coded already. */
+static int conv_is_e2e(void);   /* fwd: the conversation shown is an encrypted DM */
+static int conv_e2e_locked(void);   /* fwd: ...that has ended, or is not on this device */
 static int tab_applies(const oc_channel *c, int tab) {
     if (!c) return 0;
     if (tab == TAB_ABOUT && c->kind == OC_CHANNEL_KIND_DM) return 0;
+    /* An encrypted DM has no files, and its pins would be the server's excerpts
+     * of ciphertext (PRIVATE-DM.md). */
+    if ((tab == TAB_FILES || tab == TAB_PINS) && c->e2e) return 0;
     return 1;
 }
 static int g_tab;                       /* the selected channel tab */
@@ -4462,6 +4471,24 @@ typedef struct { rectf r; int cmd; char aid[40]; char name[96]; } call_btn;
 static call_btn        g_call_btns[CC_MAX_PICK + 48];
 static int             g_n_call_btns;
 
+/* Encrypted DMs (PRIVATE-DM.md): an ordinary DM, shown as one, whose session's
+ * controls (accept, decline, trust, the safety number, end, put away) are call
+ * buttons (call_btn_add) in a command range of their own, so they are clicked,
+ * spoken and scripted as a call's are. Accept and decline name an invitation by
+ * its index in m->pdms; the rest act on the conversation shown. One asked for
+ * from New message is `g_pdm_ask_peer` until it opens, when it is shown and
+ * `g_pdm_ask_text` is sent into it. */
+#define PD_FIRST   2550
+#define PD_TRUST   2552
+#define PD_SAFETY  2553
+#define PD_CLOSE   2554
+#define PD_FORGET  2555
+#define PD_ACCEPT0 2560   /* + index into m->pdms */
+#define PD_DECLINE0 (PD_ACCEPT0 + OC_PDM_VIEW_MAX)
+#define PD_LAST    (PD_DECLINE0 + OC_PDM_VIEW_MAX - 1)
+static uint64_t g_pdm_ask_peer;
+static char    *g_pdm_ask_text;
+
 /* Screen sharing (REQ-161, CALLS.md §6): what this device shares, and the picture of
  * what someone else does. */
 #define CC_MAX_SRC 24
@@ -5029,8 +5056,14 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
             uint32_t fg = muted ? OC_INK_ON(TH_FAINT, row_surface)
                         : (selected || unread) ? OC_COL_TEXT
                         : OC_INK_ON(TH_MUTED, row_surface);
-            draw_text(rt, r->label, unread ? g_ui_b : g_ui,
-                      rf(sx0 + 34, ry, sx1 - UIS(44), ry + ROW_H), fg);
+            {   /* An encrypted DM's row carries its lock (PRIVATE-DM.md). */
+                const oc_channel *rc = oc_model_channel((oc_model *)m, r->channel_id);
+                char locked[112];
+                const char *lab = r->label;
+                if (rc && rc->e2e) { snprintf(locked, sizeof locked, "\xF0\x9F\x94\x92 %s", r->label); lab = locked; }
+                draw_text(rt, lab, unread ? g_ui_b : g_ui,
+                          rf(sx0 + 34, ry, sx1 - UIS(44), ry + ROW_H), fg);
+            }
             if (r->is_self) {
                 /* "you" sits right after the name, dimmed — so the self-DM is
                  * still addressed by account name (Slack's treatment). */
@@ -6143,7 +6176,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
              * the message menu offers and the same toggle, so a strip and a menu
              * cannot disagree about what a press does. Not on a deleted message,
              * which has nothing to react to. */
-            if (row_hot && !msgs[first + i].deleted && g_n_quick > 0 && !pointer_blocked()) {
+            if (row_hot && !msgs[first + i].deleted && g_n_quick > 0 && !pointer_blocked() && !conv_e2e_locked()) {
                 float cell = UIS(26.0f), pad = UIS(3.0f);
                 float sw = (cell + pad) * (float)g_n_quick + pad;
                 /* Straddling the row's top edge, as every chat client places
@@ -8911,7 +8944,7 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
         g_ui->align = ST_ALIGN_CENTER;
         draw_text(rt, "Message", g_ui, g_prof_dm_btn, 0xFFFFFF);
         g_ui->align = ST_ALIGN_LEFT;
-        y += 44;
+        y += 40;
     } else {
         g_prof_dm_btn = rf(0, 0, 0, 0);
         /* Your own card is where the profile-shaped ACTIONS live — the popover
@@ -9215,6 +9248,15 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
     const oc_channel *c = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
     char title[160] = "OpenChime";
     if (c) channel_label(m, c, title, sizeof title);
+    /* An encrypted DM (PRIVATE-DM.md): a lock before its name, its safety number
+     * and End on the right, and nothing that reads its text on the server. */
+    const oc_pdm_view *pv = c && c->e2e ? oc_model_pdm((oc_model *)m, c->channel_id) : NULL;
+    int e2e = c && c->e2e;
+    if (e2e) {
+        char t2[200];
+        snprintf(t2, sizeof t2, "\xF0\x9F\x94\x92 %s", title);
+        snprintf(title, sizeof title, "%s", t2);
+    }
 
     /* Someone typing in this channel? -> a subtitle under the title. */
     char typing[192] = "";
@@ -9256,8 +9298,10 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
     }
     if (c && oc_model_calls_available(m)) right_used += UIS(58);     /* the call button */
     if (c && c->kind != OC_CHANNEL_KIND_DM) right_used += UIS(42);  /* Add people */
-    if (c && oc_model_summarize_available(m))                       /* Summarize */
+    if (c && !e2e && oc_model_summarize_available(m))               /* Summarize */
         right_used += UIS(38) + text_width("Summarize", g_meta) + UIS(12);
+    if (pv && pv->safety[0]) right_used += call_button_w("Safety number", OC_ICON_SHIELD) + UIS(8);
+    if (pv && pv->state != OC_PDM_EV_ENDED) right_used += call_button_w("End", -1) + UIS(8);
     float title_r = x0 + w - right_used - UIS(12);
     if (title_r < x0 + UIS(80)) title_r = x0 + UIS(80);   /* never nothing at all */
 
@@ -9326,7 +9370,7 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
     } else {
         g_call_hdr_btn = rf(0, 0, 0, 0);
     }
-    if (m && oc_model_tts_available(m) && c) {
+    if (m && oc_model_tts_available(m) && c && !e2e) {
         int on = oc_model_listening_channel(m) == g_sel;
         char lq[8] = "";
         if (on && oc_model_listen_queued(m)) snprintf(lq, sizeof lq, "%u", (unsigned)oc_model_listen_queued(m));
@@ -9348,7 +9392,7 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
     /* Summarize (REQ-310): the spans, in a menu under it -- only where the
      * daemon summarizes, so a client against one that does not has no dead
      * control. Lit while its menu is open. */
-    if (m && c && oc_model_summarize_available(m)) {
+    if (m && c && !e2e && oc_model_summarize_available(m)) {
         float sw = UIS(38) + text_width("Summarize", g_meta);
         g_sum_hdr_btn = rf(statr - sw, 13, statr, HEADER_H - 13);
         int hot = in_rect(g_sum_hdr_btn, g_mouse_x, g_mouse_y) || g_menu == MENU_SUMMARIZE;
@@ -9362,6 +9406,22 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         statr = g_sum_hdr_btn.left - 12;
     } else {
         g_sum_hdr_btn = rf(0, 0, 0, 0);
+    }
+
+    /* An encrypted DM's own two: End while it is going, and its safety number. */
+    if (pv && pv->state != OC_PDM_EV_ENDED) {
+        float bh = UIS(30), by = (HEADER_H - bh) / 2;
+        rectf b = rf(statr - call_button_w("End", -1), by, statr, by + bh);
+        call_button(rt, b, -1, "End", 0, 2);
+        call_btn_add(b, PD_CLOSE, "pdm.end", "End the encrypted conversation");
+        statr = b.left - UIS(8);
+    }
+    if (pv && pv->safety[0]) {
+        float bh = UIS(30), by = (HEADER_H - bh) / 2;
+        rectf b = rf(statr - call_button_w("Safety number", OC_ICON_SHIELD), by, statr, by + bh);
+        call_button(rt, b, OC_ICON_SHIELD, "Safety number", 0, 0);
+        call_btn_add(b, PD_SAFETY, "pdm.safety", "Safety number");
+        statr = b.left - UIS(8);
     }
 
     if (ulbl[0]) {
@@ -12232,6 +12292,12 @@ static void ftray_changed(oc_win *hwnd) {
 /* Add a local file (UTF-8 path) to the tray of the open conversation. */
 static void ftray_add(oc_win *hwnd, const char *path) {
     if (!g_client || !g_sel || !path || !path[0]) return;
+    /* Every way a file comes in (attach, drop, paste) ends here: none goes into
+     * an encrypted DM (PRIVATE-DM.md). */
+    if (conv_is_e2e()) {
+        composer_hint("Files cannot be sent in an encrypted conversation.", 1);
+        return;
+    }
     if (g_n_ftray == FTRAY_MAX) {
         char t[80];
         snprintf(t, sizeof t, "A message can carry %u files at most.", (unsigned)FTRAY_MAX);
@@ -12681,6 +12747,14 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
         g_mic_btn = ACT_AT(3 + vk);
         if (dict_free_offered()) g_freetalk_btn = ACT_AT(4 + vk);
     }
+    /* An encrypted DM takes no file, no video and no voice input (the server
+     * would hear it): emoji and @ only. */
+    if (conv_is_e2e()) {
+        g_attach_btn = g_video_btn = g_mic_btn = g_freetalk_btn = rf(0, 0, 0, 0);
+        g_emoji_btn = ACT_AT(0);
+        g_at_btn = ACT_AT(1);
+        if (g_at_btn.right > left_limit) g_at_btn = rf(0, 0, 0, 0);
+    }
 #undef ACT_AT
     if (g_freetalk_btn.right > left_limit) g_freetalk_btn = rf(0, 0, 0, 0);
     if (g_mic_btn.right > left_limit) g_mic_btn = rf(0, 0, 0, 0);
@@ -12760,7 +12834,9 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
      * Shrinking is the only move left. The optional left icons already drop off
      * for this reason and Send cannot: it is the one control that must always be
      * there, so when there is nothing else to give it gives its own size. */
-    float ssq = sq, chev = UIS(22);           /* the dropdown half */
+    /* Send later is not for an encrypted DM: the server would hold its text. */
+    int no_sched = conv_is_e2e();
+    float ssq = sq, chev = no_sched ? 0 : UIS(22);   /* the dropdown half */
     float gx1 = bx1 - COMPOSER_GUTTER;
     float inner = gx1 - (bx0 + COMPOSER_GUTTER);
     if (inner < 0) inner = 0;
@@ -12796,16 +12872,19 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
          * disabled it is the same border the body is outlined in, or it would
          * be the one bright mark on a grey control. */
         rectf seam = rf(gx0 + sq - 0.5f, cy + 5, gx0 + sq + 0.5f, cy + sq - 5);
-        if (has_text) gfx_fill(rt, gr(seam), 0xFFFFFF, 0.35f);
-        else          fill(rt, seam, OC_COL_BORDER);
+        if (no_sched)      g_sched_btn = rf(0, 0, 0, 0);
+        else if (has_text) gfx_fill(rt, gr(seam), 0xFFFFFF, 0.35f);
+        else               fill(rt, seam, OC_COL_BORDER);
         /* Two strokes, not the "\u25BE" glyph: the glyph is a solid triangle
          * that sits off the optical centre of its em box, and next to a line
          * icon it reads as a different family. */
         uint32_t cc2 = has_text ? 0xFFFFFF : OC_COL_FAINT;
         float ccx = (g_sched_btn.left + g_sched_btn.right) / 2 + 0.5f;
         float ccy = (cy + cy + sq) / 2, d = 3.2f;
-        gfx_line(rt, ccx - d, ccy - d / 2, ccx, ccy + d / 2, 1.6f, cc2, 1.0f);
-        gfx_line(rt, ccx, ccy + d / 2, ccx + d, ccy - d / 2, 1.6f, cc2, 1.0f);
+        if (!no_sched) {
+            gfx_line(rt, ccx - d, ccy - d / 2, ccx, ccy + d / 2, 1.6f, cc2, 1.0f);
+            gfx_line(rt, ccx, ccy + d / 2, ccx + d, ccy - d / 2, 1.6f, cc2, 1.0f);
+        }
     }
     /* Proportional, not a raw 8: against a shrunken square a fixed inset
      * eventually inverts the icon's own rect. */
@@ -12873,6 +12952,8 @@ static void confirm_run(oc_win *hwnd) {
                               g_await_webhook = 1; break;
     case CONF_INVITE_REVOKE:  oc_client_revoke_invite(g_client, g_confirm_id); break;
     case CONF_CERT_TRUST: cert_trust_run(g_main); break;
+    case CONF_PDM_TRUST:  oc_client_pdm_trust(g_client, g_confirm_id); break;
+    case CONF_PDM_SAFETY: break;   /* shown, nothing to do */
     case CONF_LINK_OPEN: {
         char u[sizeof g_confirm_url];
         memcpy(u, g_confirm_url, sizeof u);
@@ -14324,6 +14405,12 @@ static const oc_modal_spec *modal_current(void) {
         sp.buttons[0] = (oc_mbtn){ "Cancel",     MB_NORMAL,         MODAL_CANCEL };
         sp.buttons[1] = (oc_mbtn){ g_confirm_ok, MB_DANGER_PRIMARY, MODAL_OK };
         sp.n_buttons = 2;
+        if (g_confirm_act == CONF_PDM_SAFETY) {
+            sp.buttons[0] = (oc_mbtn){ "Done", MB_PRIMARY, MODAL_OK };
+            sp.n_buttons = 1;
+        } else if (g_confirm_act == CONF_PDM_TRUST) {
+            sp.buttons[1] = (oc_mbtn){ g_confirm_ok, MB_PRIMARY, MODAL_OK };
+        }
         if (g_confirm_act == CONF_CERT_TRUST) {
             /* The safe answer is the primary, on the right, and Enter's; trusting
              * is the danger button, alone on the far left (ask_trust_cert). */
@@ -15202,7 +15289,7 @@ static void open_dm_go(uint64_t uid) {
     if (!g_client || !uid) return;
     g_view = VIEW_HOME;
     g_dm_pending = uid;
-    oc_client_open_dm(g_client, uid);
+    oc_client_open_dm(g_client, uid, 0);
 }
 
 static const oc_channel *dm_with(const oc_model *m, uint64_t uid) {
@@ -16880,6 +16967,16 @@ static void members_open(oc_win *hwnd, uint64_t cid, int adding) {
  * is drawn into, so this pane borrows the same editor, undo stack, IME handling
  * and formatting toolbar rather than growing a second one that would drift. */
 static int         g_nm_to_focus = 1;      /* the To: field owns the keys first */
+/* End-to-end encrypted (PRIVATE-DM.md): a box offered when the message is for
+ * one person; ticked, the send starts an encrypted DM with them instead. */
+static int         g_nm_e2e;
+static rectf       g_nm_e2e_r;
+static void pdm_start(uint64_t uid, const char *text);   /* fwd */
+static int nm_e2e_offered(void) {
+    const oc_model *m = model();
+    return g_n_tgt_chip == 1 && !g_tgt_chip[0].is_channel && m && g_tgt_chip[0].id != m->user_id;
+}
+static int nm_e2e_on(void) { return g_nm_e2e && nm_e2e_offered(); }
 static oc_wch       g_nm_saved[DRAFT_TEXT_MAX];  /* the text the draft holds */
 static uint64_t    g_nm_wait_uid;          /* a DM we asked for, to send into */
 static char       *g_nm_pending;
@@ -16899,7 +16996,9 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
         int n = ed_get(now, DRAFT_TEXT_MAX);
         if (n < 0) now[0] = 0;
         const char *stored = oc_model_draft(m, 0, 0);
-        if (stored && stored[0] && wcmp(now, g_nm_saved) == 0)
+        if (nm_e2e_on())   /* an encrypted DM's words are not left as a draft */
+            snprintf(sub, sizeof sub, "Not saved as a draft: encrypted");
+        else if (stored && stored[0] && wcmp(now, g_nm_saved) == 0)
             snprintf(sub, sizeof sub, "Saved");
         else if (now[0])
             snprintf(sub, sizeof sub, "Saving\u2026");
@@ -16911,6 +17010,28 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
     const float pad = UIS(20), gap = UIS(16);
     rectf tobox = rf(body.left + pad, body.top + gap, body.right - pad, body.top + gap + UIS(38));
     float toh = tgt_draw(rt, tobox, g_nm_to_focus);
+
+    /* End-to-end encrypted, for one person: the same drawn checkbox the forms
+     * use, and what it means beside it. */
+    g_nm_e2e_r = rf(0, 0, 0, 0);
+    if (nm_e2e_offered()) {
+        float cy0 = tobox.top + toh + UIS(10);
+        rectf chk = rf(tobox.left, cy0 + UIS(3), tobox.left + UIS(20), cy0 + UIS(23));
+        fill_round(rt, chk, OC_R_CONTROL, g_nm_e2e ? OC_COL_ACCENT : OC_COL_INPUT);
+        if (!g_nm_e2e) stroke_round(rt, chk, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        if (g_nm_e2e) {
+            g_meta->align = ST_ALIGN_CENTER;
+            draw_text(rt, "\u2713", g_meta, chk, 0xFFFFFF);
+            g_meta->align = ST_ALIGN_LEFT;
+        }
+        const char *lab = "End-to-end encrypted";
+        float lw = text_width(lab, g_ui);
+        draw_text(rt, lab, g_ui, rf(chk.right + UIS(8), cy0, chk.right + UIS(8) + lw + 2, cy0 + UIS(26)), OC_COL_TEXT);
+        g_nm_e2e_r = rf(chk.left, cy0, chk.right + UIS(8) + lw, cy0 + UIS(26));
+        draw_text(rt, "Only your device and the one of theirs that accepts can read it.", g_meta,
+                  rf(g_nm_e2e_r.right + UIS(14), cy0, tobox.right, cy0 + UIS(26)), OC_COL_MUTED);
+        toh += UIS(36);
+    }
 
     /* The composer GROWS with what is in it, up to a limit, exactly as the
      * conversation's does: a box whose text area shrank as the text size rose
@@ -16954,8 +17075,10 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
          * send resolves. Drawn disabled only when the pane cannot honour them. */
         static const int IC[3] = { OC_ICON_PLUS, OC_ICON_SMILE, OC_ICON_AT };
         rectf *HIT[3] = { &g_nm_attach, &g_nm_emoji, &g_nm_at };
-        for (int i = 0; i < 3; i++) {
-            float rx = composer_row_x(edbox.left) + COMPOSER_PITCH * (float)i;
+        g_nm_attach = rf(0, 0, 0, 0);
+        int e2e = nm_e2e_on();   /* no file goes into an encrypted DM */
+        for (int i = e2e ? 1 : 0; i < 3; i++) {
+            float rx = composer_row_x(edbox.left) + COMPOSER_PITCH * (float)(e2e ? i - 1 : i);
             rectf b = rf(rx, cy, rx + sq, cy + sq);
             *HIT[i] = b;
             int hot = in_rect(b, g_mouse_x, g_mouse_y);
@@ -16966,7 +17089,8 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
         /* Send and Send later, the same split button the conversation has — drawn
          * whether or not it can act, because a control that appears only when it
          * is usable is a feature nobody finds (REQ-224). */
-        float chev = sq * 0.62f;
+        /* Send later is not for an encrypted DM: the server would hold its text. */
+        float chev = e2e ? 0 : sq * 0.62f;
         g_nm_sched = rf(edbox.right - COMPOSER_GUTTER - chev, cy, edbox.right - COMPOSER_GUTTER, cy + sq);
         g_nm_send  = rf(g_nm_sched.left - sq, cy, g_nm_sched.left, cy + sq);
         int hot  = ready && in_rect(g_nm_send, g_mouse_x, g_mouse_y);
@@ -16977,11 +17101,13 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
             fill_round(rt, hot ? g_nm_send : g_nm_sched, OC_R_CONTROL, OC_COL_ACCENT_DIM);
         if (!ready) stroke_round(rt, whole, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
         /* One hairline seam, so the two halves read as two buttons. */
-        fill(rt, rf(g_nm_sched.left, cy + UIS(6), g_nm_sched.left + 1.0f, cy + sq - UIS(6)),
-             ready ? 0xFFFFFF : OC_COL_BORDER);
+        if (!e2e)
+            fill(rt, rf(g_nm_sched.left, cy + UIS(6), g_nm_sched.left + 1.0f, cy + sq - UIS(6)),
+                 ready ? 0xFFFFFF : OC_COL_BORDER);
         draw_lucide(rt, OC_ICON_SEND, composer_glyph(g_nm_send),
                     ready ? 0xFFFFFF : OC_INK_ON(TH_FAINT, TH_INPUT));
-        {   /* The same two strokes the conversation's chevron is drawn with, for
+        if (e2e) g_nm_sched = rf(0, 0, 0, 0);
+        else {   /* The same two strokes the conversation's chevron is drawn with, for
              * the reason given there: the glyph reads as a different family. */
             uint32_t cc = ready ? 0xFFFFFF : OC_INK_ON(TH_FAINT, TH_INPUT);
             float ccx = (g_nm_sched.left + g_nm_sched.right) / 2 + 0.5f;
@@ -17012,6 +17138,9 @@ static void newmsg_flush(void) {
         if (!g_tgt_chip[i].is_channel)
             used += (size_t)snprintf(rcpt + used, sizeof rcpt - used, "%s%llu",
                                      used ? "," : "", (unsigned long long)g_tgt_chip[i].id);
+    /* Meant for an encrypted DM: the text is not left with the server as a
+     * draft, and one it was left with before the box was ticked is emptied. */
+    if (nm_e2e_on()) n = 0, w[0] = 0;
     int blen = (wlen(w) * 3 + 1);
     char *b = (char *)malloc((size_t)(blen > 0 ? blen : 1));
     if (!b) return;
@@ -17087,6 +17216,7 @@ static void newmsg_restore(void) {
 static void open_new_message(oc_win *hwnd) {
     nm_editor_take();
     g_view = VIEW_NEWMSG; g_nm_to_focus = 1; tgt_clear();
+    g_nm_e2e = 0;
     newmsg_restore(); layout_composer(hwnd);
 }
 
@@ -17165,6 +17295,18 @@ static void newmsg_send_at(oc_win *hwnd, uint64_t at) {
     newmsg_flush();
     g_ed_is_newmsg = 0;
     g_nm_pending_when = at;
+    if (nm_e2e_on() && !at) {
+        /* An encrypted DM, new: asked for now, shown when its channel comes, and
+         * this message sent into it once it is open (pdm_tick). */
+        pdm_start(g_tgt_chip[0].id, b);
+        free(b);
+        g_nm_e2e = 0;
+        g_view = VIEW_HOME;
+        tgt_clear();
+        layout_composer(hwnd);
+        invalidate();
+        return;
+    }
     if (g_tgt_chip[0].is_channel) {
         newmsg_deliver(g_tgt_chip[0].id, b, at);
         if (!at) { select_channel(g_tgt_chip[0].id); g_view = VIEW_HOME; }
@@ -17178,7 +17320,7 @@ static void newmsg_send_at(oc_win *hwnd, uint64_t at) {
             free(g_nm_pending); g_nm_pending = strdup(b);
             g_nm_wait_uid = g_tgt_chip[0].id;
             g_nm_pending_at = now_ms();
-            oc_client_open_dm(g_client, g_tgt_chip[0].id);
+            oc_client_open_dm(g_client, g_tgt_chip[0].id, 0);
         }
     } else {
         uint64_t ids[OC_MAX_GROUP_DM]; int k = 0;
@@ -17453,6 +17595,131 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
 
 static void draw_call_picker(gfx *rt, const oc_model *m, rectf body);   /* below */
 static void draw_share_full(gfx *rt, const oc_model *m, float W, float H);   /* below */
+
+/* ---- encrypted DMs (PRIVATE-DM.md) ------------------------------------------------- */
+
+static const char *pdm_end_words(uint8_t reason) {
+    switch (reason) {
+    case OC_PDM_END_CLOSED:   return "This encrypted conversation was ended.";
+    case OC_PDM_END_TAKEN:    return "You accepted it on another device.";
+    case OC_PDM_END_GONE:     return "The other device went away, so this encrypted conversation ended.";
+    case OC_PDM_END_LOST:     return "One of the devices no longer holds this conversation, so it ended.";
+    case OC_PDM_END_REFUSED:  return "This encrypted conversation could not be started.";
+    case OC_PDM_END_DECLINED: return "The invitation was declined.";
+    default:                  return "This encrypted conversation ended.";
+    }
+}
+
+/* The conversation shown is an encrypted DM: what reads its text on the server
+ * (search, previews, summaries, read-aloud, voice input) and what sends a file
+ * or quotes it elsewhere is not offered in it. */
+static int conv_is_e2e(void) {
+    const oc_channel *c = g_sel ? oc_model_channel((oc_model *)model(), g_sel) : NULL;
+    return c && c->e2e;
+}
+
+/* The conversation shown is an encrypted DM that has ended, or whose session is
+ * not on this device: what was said in it stands as it is, with no reply,
+ * reaction, edit or delete offered (the daemon refuses them too). */
+static int conv_e2e_locked(void) {
+    const oc_channel *c = g_sel ? oc_model_channel((oc_model *)model(), g_sel) : NULL;
+    if (!c || !c->e2e) return 0;
+    const oc_pdm_view *v = oc_model_pdm((oc_model *)model(), c->channel_id);
+    return !v || v->state == OC_PDM_EV_ENDED;
+}
+
+/* One notice across the conversation, under the header: an accent edge, a line
+ * in bold and one under it, and up to two buttons on the right (call buttons, so
+ * clicked, spoken and scripted as a call's are). Returns its height. */
+static float e2e_notice(gfx *rt, float x0, float w, float y, uint32_t edge, const char *head, const char *sub,
+                        const char *b1, int c1, const char *aid1, const char *b2, int c2, const char *aid2) {
+    float bh = UIS(30), bw = 0;
+    if (b1) bw += call_button_w(b1, -1) + UIS(8);
+    if (b2) bw += call_button_w(b2, -1) + UIS(8);
+    float tw = w - UIS(28) - bw - UIS(8);
+    if (tw < UIS(120)) tw = UIS(120);
+    float h = UIS(28) + (sub ? text_height(sub, g_meta_w, tw) : 0) + UIS(8);
+    if (h < bh + UIS(14)) h = bh + UIS(14);
+    rectf r = rf(x0, y, x0 + w, y + h);
+    fill(rt, r, OC_COL_SIDEBAR);
+    fill(rt, rf(x0, r.top, x0 + 3, r.bottom), edge);
+    fill(rt, rf(x0, r.bottom - 1, x0 + w, r.bottom), OC_COL_BORDER);
+    draw_text(rt, head, g_ui_b, rf(x0 + UIS(14), y + UIS(6), x0 + UIS(14) + tw, y + UIS(28)), OC_COL_TEXT);
+    if (sub) draw_text(rt, sub, g_meta_w, rf(x0 + UIS(14), y + UIS(28), x0 + UIS(14) + tw, r.bottom - 4), OC_COL_MUTED);
+    float bx = x0 + w - UIS(14), by = y + (h - bh) / 2;
+    if (b2) {
+        rectf b = rf(bx - call_button_w(b2, -1), by, bx, by + bh);
+        call_button(rt, b, -1, b2, 0, 0);
+        call_btn_add(b, c2, aid2, b2);
+        bx = b.left - UIS(8);
+    }
+    if (b1) {
+        rectf b = rf(bx - call_button_w(b1, -1), by, bx, by + bh);
+        call_button(rt, b, -1, b1, 1, 0);
+        call_btn_add(b, c1, aid1, b1);
+    }
+    return h;
+}
+
+/* Under the header: each invitation to an encrypted conversation, wherever you
+ * are; and, in an encrypted DM, where its session stands on this device. The
+ * transcript starts under it. Returns its height. */
+static float draw_e2e_strip(gfx *rt, const oc_model *m, float x0, float w, float top) {
+    if (!m) return 0;
+    float y = top;
+    int shown = 0;
+    for (size_t i = 0; i < m->n_pdms && shown < 2; i++) {
+        const oc_pdm_view *v = &m->pdms[i];
+        if (v->state != OC_PDM_EV_INVITED) continue;
+        const char *who = oc_model_user_name(m, v->peer);
+        char head[200], a1[32], a2[32];
+        snprintf(head, sizeof head, "%s asks for an end-to-end encrypted conversation", who && who[0] ? who : "Someone");
+        snprintf(a1, sizeof a1, "pdm.accept.%zu", i);
+        snprintf(a2, sizeof a2, "pdm.decline.%zu", i);
+        y += e2e_notice(rt, x0, w, y, OC_COL_ACCENT, head,
+                        "Only the device that accepts it, and theirs, can read it. It is gone when it ends "
+                        "or either of you closes OpenChime.",
+                        "Accept on this device", PD_ACCEPT0 + (int)i, a1, "Decline", PD_DECLINE0 + (int)i, a2);
+        shown++;
+    }
+    const oc_channel *c = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+    if (!c || !c->e2e || dm_index_view()) return y - top;
+    const oc_pdm_view *v = oc_model_pdm((oc_model *)m, c->channel_id);
+    const char *who = oc_model_user_name(m, c->peer_id);
+    if (!who || !who[0]) who = "them";
+    char head[200];
+    if (!v) {
+        y += e2e_notice(rt, x0, w, y, OC_COL_FAINT, "Encrypted end to end on another device",
+                        "Its messages can be read only on the device that took part in it.",
+                        NULL, 0, NULL, NULL, 0, NULL);
+    } else if (v->state == OC_PDM_EV_OPENING) {
+        snprintf(head, sizeof head, "Waiting for %s to accept on their device…", who);
+        y += e2e_notice(rt, x0, w, y, OC_COL_ACCENT, head, NULL, NULL, 0, NULL, NULL, 0, NULL);
+    } else if (v->state == OC_PDM_EV_KEY_CHANGED) {
+        snprintf(head, sizeof head, "%s's device key has changed", who);
+        y += e2e_notice(rt, x0, w, y, OC_COL_DANGER, head,
+                        "This can mean they signed in again, or that someone is in the middle. Compare the "
+                        "safety number with them in person or on a call before you trust it. Nothing you "
+                        "type is sent until then.",
+                        "Compare and trust", PD_TRUST, "pdm.trust", NULL, 0, NULL);
+    } else if (v->state == OC_PDM_EV_ENDED) {
+        y += e2e_notice(rt, x0, w, y, OC_COL_FAINT, pdm_end_words(v->reason),
+                        "What was said is still here until you put it away or close OpenChime; then it is gone.",
+                        "Put away", PD_FORGET, "pdm.forget", NULL, 0, NULL);
+    } else {
+#ifdef __EMSCRIPTEN__
+        y += e2e_notice(rt, x0, w, y, OC_COL_AWAY, "Encrypted end to end, only on this device, while OpenChime is open",
+                        "In a browser, this page's code comes from your workspace's server: a server that was "
+                        "broken into could serve code that reads it. Its content is still kept from the "
+                        "database, the backups and the storage.",
+                        NULL, 0, NULL, NULL, 0, NULL);
+#else
+        y += e2e_notice(rt, x0, w, y, OC_COL_ACCENT, "Encrypted end to end, only on this device, while OpenChime is open",
+                        NULL, NULL, 0, NULL, NULL, 0, NULL);
+#endif
+    }
+    return y - top;
+}
 
 static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     g_n_call_btns = 0;
@@ -18306,6 +18573,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
         if (!dm_index0) draw_header(rt, m, main_x, main_w);
         float th = dm_index0 ? 0 : draw_tabbar(rt, m, main_x, main_w);
         float bh = draw_banner(rt, m, main_x, main_w, th);  /* pushes the transcript down */
+        bh += draw_e2e_strip(rt, m, main_x, main_w, (dm_index0 ? 0 : HEADER_H) + th + bh);   /* and so does this */
         g_toast_area_l = main_x; g_toast_area_r = main_x + main_w;
         g_toast_area_t = (dm_index0 ? 0 : HEADER_H) + th + bh;
         {
@@ -21165,6 +21433,18 @@ static void composer_send(void) {
             composer_hint("This channel is archived, so it is read-only.", 1);
             return;
         }
+        /* An encrypted DM takes text only while its session is open here; the
+         * text stays in the box otherwise (PRIVATE-DM.md). */
+        if (c && c->e2e) {
+            const oc_pdm_view *v = oc_model_pdm((oc_model *)m, c->channel_id);
+            if (!v || v->state != OC_PDM_EV_OPEN) {
+                composer_hint(!v ? "This encrypted conversation is not on this device."
+                              : v->state == OC_PDM_EV_KEY_CHANGED ? "Compare the safety number and trust the new key first."
+                              : v->state == OC_PDM_EV_ENDED ? "This encrypted conversation has ended."
+                              : "Waiting for the other device.", 1);
+                return;
+            }
+        }
     }
     /* Files waiting in the tray go with the text, as one message; the text may
      * then be empty. An edit changes text only, so the tray waits it out. */
@@ -23239,7 +23519,8 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
     if (!msg) return;
 
     g_n_mi = 0;
-    if (g_n_quick > 0) { mi_emojirow(); mi_item(7, "More reactions"); mi_sep(); }
+    int locked = conv_e2e_locked();   /* an ended encrypted DM stands as it is */
+    if (g_n_quick > 0 && !locked) { mi_emojirow(); mi_item(7, "More reactions"); mi_sep(); }
     for (int i = 0; i < msg->n_attach; i++) {
         char lbl[200];
         snprintf(lbl, sizeof lbl, "Download %s", msg->attach[i].filename);
@@ -23251,25 +23532,30 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
     }
     if (msg->n_attach) mi_sep();
     /* No nested threads (REQ-060), so a reply offers no thread item. */
-    if (!msg->deleted && !is_reply)
+    if (!msg->deleted && !is_reply && !(locked && !msg->reply_count))
         mi_item(100, msg->reply_count ? "Open thread" : "Reply in thread");
     if (msg->n_reactions) mi_item(102, "Who reacted");
     /* A pin belongs to the channel, so this reads the same for everyone — anyone
      * may unpin, including someone else's pin (ARCH-90). */
-    if (!msg->deleted) mi_item(103, msg->pinned ? "Unpin from channel" : "Pin to channel");
+    /* An encrypted DM's text is for its two devices: it is not pinned, saved or
+     * forwarded through the server, nor linked to (PRIVATE-DM.md). */
+    int e2e = c && c->e2e;
+    if (!msg->deleted && !e2e) mi_item(103, msg->pinned ? "Unpin from channel" : "Pin to channel");
     /* "Unread from here" rather than "mark unread": it names what actually happens —
      * the read cursor moves to just BEFORE this message, so this one and everything
      * after it are unread (REQ-235). */
     mi_item(107, "Unread from here");
-    mi_item(106, "Forward");
-    mi_item(105, "Copy link");
-    mi_item(104, "Save for later");
+    if (!e2e) {
+        mi_item(106, "Forward");
+        mi_item(105, "Copy link");
+        mi_item(104, "Save for later");
+    }
     mi_item(20,  "Copy text");
     int own = (msg->author_id == m->user_id);
     int canmod = own || self_role(m) >= OC_ROLE_ADMIN;
-    if ((own || canmod) && !msg->deleted) mi_sep();
-    if (own && !msg->deleted)    mi_item(21, "Edit");
-    if (canmod && !msg->deleted) mi_item_d(22, "Delete");
+    if ((own || canmod) && !msg->deleted && !locked) mi_sep();
+    if (own && !msg->deleted && !locked)    mi_item(21, "Edit");
+    if (canmod && !msg->deleted && !locked) mi_item_d(22, "Delete");
 
     g_menu = MENU_MSG; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 248;
     g_menu_target = mid; g_menu_target2 = chan;
@@ -23862,6 +24148,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
             tgt_rebuild();
             return 1;
         }
+        if (in_rect(g_nm_e2e_r, x, y)) { g_nm_e2e = !g_nm_e2e; newmsg_flush(); invalidate(); return 1; }
         if (in_rect(g_nm_send, x, y)) { newmsg_send_at(hwnd, 0); return 1; }
         if (in_rect(g_nm_sched, x, y)) {
             if (g_n_tgt_chip && ed_len()) sched_menu_open(x, y);
@@ -24837,7 +25124,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
         }
     /* A reaction chip: +1 it, or undo it if it is already yours (REQ-070).
      * Tested before the message rows, which cover the same pixels. */
-    for (int i = 0; i < g_n_chips; i++)
+    for (int i = 0; i < g_n_chips && !conv_e2e_locked(); i++)
         if (in_rect(g_chips[i].r, x, y)) {
             /* A reply's chips belong to the thread's channel, not the selected
              * one — the same lookup the message menu does. */
@@ -27539,7 +27826,130 @@ static void call_open_conv_menu(oc_win *hwnd) {
 static void call_prefs_changed(void) { prefs_save(); }
 
 /* Every call control, whichever way it was reached. */
+/* ---- encrypted DMs: their commands, and watching them --------------------------------- */
+
+static void pdm_cmd(oc_win *hwnd, int cmd) {
+    oc_model *m = (oc_model *)model();
+    if (!m || !g_client) return;
+    if (cmd >= PD_ACCEPT0 && cmd < PD_DECLINE0 + OC_PDM_VIEW_MAX) {
+        int dec = cmd >= PD_DECLINE0;
+        size_t i = (size_t)(cmd - (dec ? PD_DECLINE0 : PD_ACCEPT0));
+        if (i < m->n_pdms && m->pdms[i].state == OC_PDM_EV_INVITED) {
+            if (dec) oc_client_pdm_decline(g_client, m->pdms[i].id);
+            else { oc_client_pdm_accept(g_client, m->pdms[i].id); g_pdm_ask_peer = m->pdms[i].peer; }
+        }
+        invalidate();
+        return;
+    }
+    const oc_channel *c = g_sel ? oc_model_channel(m, g_sel) : NULL;
+    oc_pdm_view *v = c && c->e2e ? oc_model_pdm(m, c->channel_id) : NULL;
+    if (!v) return;
+    char body[400], rows[80];
+    /* The twelve groups as three rows of four, as they are compared aloud. */
+    {
+        size_t o = 0; int g = 0;
+        for (const char *p = v->safety; *p && o + 2 < sizeof rows; p++) {
+            if (*p == ' ') { rows[o++] = (++g % 4 == 0) ? '\n' : ' '; continue; }
+            rows[o++] = *p;
+        }
+        rows[o] = '\0';
+    }
+    switch (cmd) {
+    case PD_CLOSE: oc_client_pdm_close(g_client, v->id); break;
+    case PD_FORGET:
+        oc_model_pdm_forget(m, v->id);
+        g_sel = 0;
+        ensure_selection(m);
+        layout_composer(hwnd);
+        break;
+    case PD_SAFETY:
+        snprintf(body, sizeof body, "%s\n\nThe same twelve groups should show on %s's device. Compare them in "
+                 "person or on a call: if they match, no one is in the middle.", rows,
+                 oc_model_user_name(m, v->peer));
+        confirm_open(hwnd, CONF_PDM_SAFETY, v->id, "Safety number", body, "Done");
+        break;
+    case PD_TRUST:
+        snprintf(body, sizeof body, "%s\n\nTrust this key only if %s's device shows the same number.",
+                 rows, oc_model_user_name(m, v->peer));
+        confirm_open(hwnd, CONF_PDM_TRUST, v->id, "Compare the safety number", body, "They match: trust");
+        break;
+    }
+    invalidate();
+}
+
+/* Ask `uid` for an encrypted DM (New message, with its box ticked), and send
+ * `text` into it once it is open. */
+static void pdm_start(uint64_t uid, const char *text) {
+    if (!g_client || !uid) return;
+    free(g_pdm_ask_text);
+    g_pdm_ask_text = text && text[0] ? strdup(text) : NULL;
+    g_pdm_ask_peer = uid;
+    oc_client_open_dm(g_client, uid, 1);
+}
+
+/* What changed: an invitation said once (its words only); the one this device
+ * asked for, or accepted, shown when it is open, with what was waiting to be
+ * sent; a refusal or an end said. */
+static void pdm_tick(oc_win *hwnd) {
+    static const oc_model *seq_m;
+    static uint32_t seen_seq, refused_seq;
+    static struct { uint64_t id; uint8_t state; } said[OC_PDM_VIEW_MAX];
+    const oc_model *cm = model();
+    oc_model *m = (oc_model *)cm;
+    if (!m) return;
+    if (m != seq_m) { seq_m = m; seen_seq = m->pdm_seq; refused_seq = m->pdm_refused_seq; memset(said, 0, sizeof said); }
+    if (m->pdm_refused_seq != refused_seq) {
+        refused_seq = m->pdm_refused_seq;
+        char t[200];
+        snprintf(t, sizeof t, "Couldn't start an encrypted conversation with %s: they need to be signed in.",
+                 oc_model_user_name(m, m->pdm_refused_peer));
+        fb_failed(t);
+        g_pdm_ask_peer = 0;
+        free(g_pdm_ask_text); g_pdm_ask_text = NULL;
+    }
+    /* Asked for (or accepted) here: shown as soon as its channel is. */
+    static uint64_t shown;
+    for (size_t i = 0; g_pdm_ask_peer && i < m->n_pdms; i++) {
+        const oc_pdm_view *v = &m->pdms[i];
+        if (v->peer != g_pdm_ask_peer || v->id == shown || v->state == OC_PDM_EV_INVITED ||
+            v->state == OC_PDM_EV_ENDED || !oc_model_channel(m, v->id)) continue;
+        shown = v->id;
+        select_channel(v->id);
+        g_view = VIEW_HOME;
+        layout_composer(hwnd);
+        invalidate();
+    }
+    if (m->pdm_seq == seen_seq) return;
+    seen_seq = m->pdm_seq;
+    for (size_t i = 0; i < m->n_pdms; i++) {
+        oc_pdm_view *v = &m->pdms[i];
+        int k = -1, fk = -1;
+        for (int j = 0; j < OC_PDM_VIEW_MAX; j++) { if (said[j].id == v->id) k = j; if (!said[j].id && fk < 0) fk = j; }
+        if (k < 0 && fk >= 0) { k = fk; said[k].id = v->id; said[k].state = 0; }
+        if (k < 0 || said[k].state == v->state) continue;
+        said[k].state = v->state;
+        if (v->state == OC_PDM_EV_INVITED) {
+            char t[200];
+            snprintf(t, sizeof t, "%s asks for an end-to-end encrypted conversation.", oc_model_user_name(m, v->peer));
+            /* The words of the request only, never of a message. */
+            if (g_pref_notify != NOTIFY_OFF) notify_plain("Encrypted conversation", t);
+        }
+        /* Open: what was typed in New message goes into it. */
+        if (v->state == OC_PDM_EV_OPEN && g_pdm_ask_peer == v->peer) {
+            if (g_pdm_ask_text) oc_client_send(g_client, v->id, g_pdm_ask_text);
+            free(g_pdm_ask_text); g_pdm_ask_text = NULL;
+            g_pdm_ask_peer = 0;
+        }
+        if (v->state == OC_PDM_EV_ENDED && g_pdm_ask_peer == v->peer) {
+            g_pdm_ask_peer = 0;
+            free(g_pdm_ask_text); g_pdm_ask_text = NULL;
+        }
+    }
+    invalidate();
+}
+
 static void call_cmd(oc_win *hwnd, int cmd) {
+    if (cmd >= PD_FIRST && cmd <= PD_LAST) { pdm_cmd(hwnd, cmd); return; }
     const oc_model *m = model();
     if (!m) return;
     int in = call_here(m);
@@ -27924,6 +28334,7 @@ static void notify_call(const char *title, const char *body, const char *source,
 static void menu_dispatch(oc_win *hwnd, int cmd) {
     const oc_model *m = model();
     if (cmd >= CC_MUTE && cmd <= CC_LAST) { call_cmd(hwnd, cmd); return; }
+    if (cmd >= PD_FIRST && cmd <= PD_LAST) { pdm_cmd(hwnd, cmd); return; }
     switch (cmd) {
     case 88:     /* REQ-310: the header's Summarize menu, from the palette too */
         if (g_sel) {
@@ -28855,6 +29266,26 @@ static void test_dump(const char *path) {
             for (int i = 0; i < g_cpick_n; i++)
                 fprintf(f, "%s%llu:%d", i ? "," : "", (unsigned long long)g_cpick_uid[i], g_cpick_on[i]);
             fprintf(f, "\n");
+        }
+        {   /* Encrypted DMs (PRIVATE-DM.md): the sessions; New message's box; and,
+             * for the conversation shown, whether it is one, what of the composer
+             * it offers, and its newest message as this device reads it. */
+            const oc_channel *ec = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+            const oc_msg *el = ec && ec->n_msgs ? &ec->msgs[ec->n_msgs - 1] : NULL;
+            fprintf(f, "pdms n=%zu seq=%u refused_seq=%u ask=%llu nm_box=%d nm_on=%d sel_e2e=%d attach=%d sched=%d "
+                       "files_tab=%d last=\"%.80s\"\n", m->n_pdms,
+                    m->pdm_seq, m->pdm_refused_seq, (unsigned long long)g_pdm_ask_peer,
+                    g_nm_e2e_r.right > g_nm_e2e_r.left, g_nm_e2e, ec && ec->e2e,
+                    g_attach_btn.right > g_attach_btn.left, g_sched_btn.right > g_sched_btn.left,
+                    g_tab_r[TAB_FILES].right > g_tab_r[TAB_FILES].left,
+                    el && el->body && !el->deleted ? el->body : "");
+            for (size_t i = 0; i < m->n_pdms; i++) {
+                const oc_pdm_view *pv = &m->pdms[i];
+                const oc_channel *pc = oc_model_channel((oc_model *)m, pv->id);
+                fprintf(f, "pdm id=%llu peer=%llu state=%u reason=%u chan=%d safety=\"%s\"\n",
+                        (unsigned long long)pv->id, (unsigned long long)pv->peer, pv->state, pv->reason,
+                        pc && pc->e2e && !pc->forgotten, pv->safety);
+            }
         }
         fprintf(f, "calls n=%zu rows=%d\n", m->n_calls, g_n_call_rows);
         for (size_t i = 0; i < m->n_calls; i++) {
@@ -30025,6 +30456,32 @@ static void test_poll(oc_win *hwnd) {
         oc_wch w[512]; int n = to_w(arg, w, 512);
         for (int i = 0; i < n; i++) synth_char(hwnd, w[i]);
         test_ack("ok");
+    } else if (!strcmp(verb, "pdm")) {
+        /* Encrypted DMs (PRIVATE-DM.md), through the commands the controls send:
+         * `pdm box` (New message's checkbox, as a click), `pdm accept|decline` (the
+         * first invitation), `pdm close|trust|safety|forget` (the conversation
+         * shown). Starting one is New message with the box ticked. */
+        char sc[32] = "";
+        sscanf(arg, "%31s", sc);
+        oc_model *pm = (oc_model *)model();
+        int ok = pm != NULL;
+        int inv = -1;
+        for (size_t i = 0; ok && i < pm->n_pdms && inv < 0; i++)
+            if (pm->pdms[i].state == OC_PDM_EV_INVITED) inv = (int)i;
+        if (ok && !strcmp(sc, "box")) {
+            ok = nm_e2e_offered();
+            if (ok) { g_nm_e2e = !g_nm_e2e; newmsg_flush(); }
+        } else if (ok && (!strcmp(sc, "accept") || !strcmp(sc, "decline"))) {
+            ok = inv >= 0;
+            if (ok) pdm_cmd(hwnd, (!strcmp(sc, "accept") ? PD_ACCEPT0 : PD_DECLINE0) + inv);
+        } else if (ok && (!strcmp(sc, "close") || !strcmp(sc, "trust") || !strcmp(sc, "safety") ||
+                          !strcmp(sc, "forget"))) {
+            ok = conv_is_e2e();
+            if (ok) pdm_cmd(hwnd, !strcmp(sc, "close") ? PD_CLOSE : !strcmp(sc, "safety") ? PD_SAFETY
+                                : !strcmp(sc, "forget") ? PD_FORGET : PD_TRUST);
+        } else ok = 0;
+        invalidate();
+        test_ack(ok ? "ok" : "err");
     } else if (!strcmp(verb, "call")) {
         /* Calls through the calls the controls make (REQ-150, REQ-301-305):
          *   call start [ch] | join [ch] | open [ch] | leave | end | decline [ch]
@@ -31051,6 +31508,7 @@ static int on_tick(oc_win *hwnd) {
             ftray_tick(hwnd);        /* uploads in the composer's tray */
             nt_tick();               /* the notification window expires on this tick too */
             call_tick(hwnd);         /* a start waiting on a member list */
+            pdm_tick(hwnd);          /* private DMs: invitations, arrivals, endings */
             /* The call view's duration, levels and speaking rings move without
              * any event to repaint on. */
             if (g_view == VIEW_CALL || call_here(model())) invalidate();

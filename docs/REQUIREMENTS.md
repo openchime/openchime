@@ -1443,6 +1443,17 @@ where one exists.
   be fetched or loaded, or a CPU that cannot run it, has left summaries off, said why
   in the log, and left the rest of the server running. Where summaries are off, no
   client has shown them (ARCH-116).
+- **REQ-314.** Two people have been able to talk in an **encrypted DM**, end to end
+  encrypted between one device of each (PRIVATE-DM.md, ARCH-118), started from New
+  message with "End-to-end encrypted" ticked and shown as a DM marked with a lock:
+  the daemon has carried and stored its messages as ciphertext and never been able to
+  read them, every message has had its own key, nothing readable of it has been kept
+  once either app closed or it ended, its channel has been closed when it ended and
+  deleted a day later, and each side has been shown a safety number and warned when
+  the other device's key changed. In an encrypted DM, the server's features that read
+  messages (search, mentions, keywords, previews and excerpts, link previews,
+  summaries, read-aloud, voice input, forwards) have not applied, and files,
+  webhooks, scheduled messages, drafts, pins and saves have been refused.
 
 ---
 

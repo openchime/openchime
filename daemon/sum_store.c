@@ -23,8 +23,8 @@ static int cmp_msg(const void *a, const void *b) {
 }
 
 /* The messages summarized: people's and integrations' posts, not a deleted
- * one or a call event. */
-#define SUMMARIZED " deleted_at_ms IS NULL AND kind=0 "
+ * one or a call event, nor one in an encrypted DM, whose body is ciphertext. */
+#define SUMMARIZED " deleted_at_ms IS NULL AND kind=0 AND (SELECT e2e FROM channels WHERE id=channel_id) IS NOT 1 "
 /* Who wrote a message (m, joined to its author u): an integration's post signs
  * with its own name, anyone else's with theirs. */
 #define AUTHOR_NAME " COALESCE(NULLIF(m.author_name,''), u.display_name, '') "

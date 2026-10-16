@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Migrations.** The daemon applies migrations 0001–0062 (`daemon/migrate.c`,
+**Migrations.** The daemon applies migrations 0001–0063 (`daemon/migrate.c`,
 `OC_MIGRATIONS`). 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
@@ -37,7 +37,7 @@ delete holds; **0053** (§3ar) TOTP and recovery codes; **0054** (§3as)
 credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
-**0062** (§3ba) Argon2id credentials.
+**0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -45,7 +45,7 @@ schema-less — ephemeral in-memory net-thread state by design
 
 Section ordering note: sections run in migration order, but columns a later
 migration adds to a table are sometimes documented with that table's section
-(0033–0035 in §3j, 0037 in §3g, 0047 and 0062 in §3), and 0014–0015 have no
+(0033–0035 in §3j, 0037 in §3g, 0047 and 0062 in §3, 0063's `channels.e2e` in §2), and 0014–0015 have no
 letter. The list above is the authoritative order.
 
 ---
@@ -116,6 +116,7 @@ no migration and no second membership path were needed. The channel-management o
 | `name`          | TEXT    | null for DMs.                                     |
 | `is_public`     | INTEGER | `0`/`1`; private channels are members-only.       |
 | `created_at_ms` | INTEGER |                                                  |
+| `e2e`           | INTEGER | `0`/`1`, added by migration 0063 (§3bb): `1` for an encrypted DM (PRIVATE-DM.md), whose message bodies are ciphertext. Never changes on a row. |
 
 ### `channel_members`  — resolves REQ-031
 Membership is independent of any tenant role. Only members may read/post in a
@@ -304,6 +305,8 @@ bodies. Three triggers keep it in sync:
 - `messages_fts_au` (after update) re-indexes on edit and drops the text on
   tombstone (body → NULL);
 - `messages_fts_ad` (after delete) removes the entry.
+
+Since migration 0063 (§3bb) all three skip a message in an encrypted DM.
 
 The migration seeds the index from existing rows. `SEARCH` (PROTOCOL.md §5.11)
 joins `messages_fts MATCH ?` back to `messages`/`channels`, filters tombstones
@@ -1628,3 +1631,40 @@ in place of a PBKDF2 count, so the memory, passes and lanes can be raised
 later without a format change. The PBKDF2 rows are deleted rather than carried:
 there were no deployments to keep. An account that had one sets a password
 again by a reset link (`RESET_CREDENTIAL`).
+
+## 3bb. Migration 0063: encrypted DMs (PRIVATE-DM.md, ARCH-118)
+
+```sql
+ALTER TABLE channels ADD COLUMN e2e INTEGER NOT NULL DEFAULT 0;
+DROP TRIGGER messages_fts_ai;
+DROP TRIGGER messages_fts_ad;
+DROP TRIGGER messages_fts_au;
+CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages
+  WHEN (SELECT e2e FROM channels WHERE id=new.channel_id) IS NOT 1 BEGIN
+  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
+END;
+CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages
+  WHEN (SELECT e2e FROM channels WHERE id=old.channel_id) IS NOT 1 BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body);
+END;
+CREATE TRIGGER messages_fts_au AFTER UPDATE ON messages
+  WHEN (SELECT e2e FROM channels WHERE id=new.channel_id) IS NOT 1 BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body);
+  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
+END;
+```
+
+An encrypted DM is a `kind='dm'` row with `e2e=1`, made new for each conversation:
+its `dm_key` is `e:<lo>,<hi>:<ms>.<seq>` (the two user ids, the time and a counter),
+so it never meets the pair's ordinary DM or an earlier encrypted one under the
+unique index (§3o). Its message bodies are ciphertext the daemon cannot read, so
+the full-text triggers index, and unindex, only rows of a channel without the
+mark. The mark never changes on a channel, so the two always agree about which
+rows the index holds.
+
+When the conversation ends the channel is closed (`archived_at_ms` set), and at
+daemon start every open one is. The storage maintenance pass deletes an `e2e`
+channel closed more than 24 hours ago, with every row of every table that has a
+`channel_id` naming it or a `message_id` naming one of its messages, then its
+messages and the channel row; the tables are found from the schema, so one added
+later is covered.

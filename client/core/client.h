@@ -192,8 +192,11 @@ void oc_client_set_presence(oc_client *c, uint8_t status);
 void oc_client_toggle_roster(oc_client *c, int open);
 
 /* Open (or get) a 1:1 DM with `user_id`; the server answers with a CHANNEL_INFO
- * that carries the peer, so the DM titles itself from the roster. */
-void oc_client_open_dm(oc_client *c, uint64_t user_id);
+ * that carries the peer, so the DM titles itself from the roster. With `e2e`, a
+ * new DM encrypted end to end between this device and the one of theirs that
+ * accepts (PRIVATE-DM.md): its session is told as OC_EV_PDM, its channel comes
+ * when the daemon has made it. */
+void oc_client_open_dm(oc_client *c, uint64_t user_id, int e2e);
 
 /* Inspect who reacted to a message (REQ-071): the reactors stream into the
  * model's reactor list (a "who reacted" overlay) / close that overlay. */
@@ -477,6 +480,16 @@ uint32_t oc_client_stt_send(oc_client *c, uint8_t mode, uint64_t channel_id, uin
  * in, `call_error` for a refusal. */
 void oc_client_call_start(oc_client *c, uint64_t channel_id, const uint64_t *invite, int n);
 void oc_client_call_join(oc_client *c, uint64_t channel_id);
+
+/* Encrypted DMs (PRIVATE-DM.md, client/core/pdm.h), opened with
+ * oc_client_open_dm(.., 1). What comes of each session is told as OC_EV_PDM and
+ * kept in the model (oc_model_pdm); what is said goes as in any DM. Accept or
+ * decline an invitation on this device; end one; and trust the other device's
+ * changed key (after comparing the safety number). */
+void oc_client_pdm_accept(oc_client *c, uint64_t pdm_id);
+void oc_client_pdm_decline(oc_client *c, uint64_t pdm_id);
+void oc_client_pdm_close(oc_client *c, uint64_t pdm_id);
+void oc_client_pdm_trust(oc_client *c, uint64_t pdm_id);
 void oc_client_call_leave(oc_client *c, uint64_t channel_id);
 void oc_client_call_decline(oc_client *c, uint64_t channel_id);
 void oc_client_call_end(oc_client *c, uint64_t channel_id);
