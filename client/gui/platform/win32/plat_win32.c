@@ -883,3 +883,4 @@ void oc_plat_quit(void) {
 }
 
 const char *oc_plat_name(void) { return "win32"; }
+void oc_plat_frame_shown(void) {}   /* nothing loads ahead of the window here */

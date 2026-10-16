@@ -343,6 +343,23 @@ static void http_answer_ex(io_thread *t, io_conn *c, int status, const char *cty
     c->close_after = 1;
     flush(t, c);
 }
+/* A static route's answer: 304 to a request that already holds it, the gzip
+ * copy to one that takes it, else the body (oc_http_static_choose). */
+static void static_answer(io_thread *t, io_conn *c, const oc_http_route *rt, const oc_http_req *req) {
+    oc_http_static_pick p;
+    oc_http_static_choose(rt, req, &p);
+    c->http_done = 1;
+    c->deadline = 0;
+    char head[OC_HTTP_HEAD_MAX];
+    size_t hl = oc_http_static_head(head, sizeof head, rt, &p);
+    /* Before the request's buffer goes: `req` points into it. */
+    free(c->hin); c->hin = NULL; c->hlen = c->hcap = 0;
+    if (!hl || queue_raw(c, (const uint8_t *)head, hl, (const uint8_t *)p.body, p.len, 0) != 0) {
+        finish(t, c); return;
+    }
+    c->close_after = 1;
+    flush(t, c);
+}
 static void http_answer(io_thread *t, io_conn *c, int status, const char *ctype,
                         const char *body, size_t blen) {
     http_answer_ex(t, c, status, ctype, body, blen, NULL);
@@ -500,7 +517,7 @@ static void http_bytes(io_thread *t, io_conn *c, const uint8_t *chunk, size_t n)
     const oc_http_route *rt = c->route;
     if (oc_http_parse(c->hin, c->hlen, rt->max_body, &req) != 1) { http_refuse(t, c, 400); return; }
     if (rt->kind == OC_HTTP_WS) { ws_open(t, c, &req); return; }
-    if (rt->kind == OC_HTTP_STATIC) { http_answer_ex(t, c, 200, rt->ctype, rt->body, rt->body_len, rt->extra); return; }
+    if (rt->kind == OC_HTTP_STATIC) { static_answer(t, c, rt, &req); return; }
     if (rt->kind == OC_HTTP_REDIRECT) {
         char loc[OC_HTTP_HEAD_MAX / 2];
         snprintf(loc, sizeof loc, "Location: %s\r\nCache-Control: no-store\r\n", rt->body);

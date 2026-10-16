@@ -5,12 +5,13 @@
 # its page and signs in with the new one; the token that last sign-in ends
 # with is then presented on AUTH by build/signin, which proves the page's
 # answer is one the daemon takes. Then an invitation link, opened cold in a
-# second browser, ends signed in to the web client (scripts/web/invite.mjs). What a browser sends -- its Origin under the
-# pages' referrer policy, its handling of the 303 -- is what is exercised,
-# which the suites' scripted posts cannot show. Needs ./openchimed (a demo
-# build) with the web client beside it (make web), build/signin,
-# build/demo_client, node with playwright-core, and a Chromium (CHROME, else
-# Playwright's download).
+# second browser, ends signed in to the web client (scripts/web/invite.mjs),
+# and the client's load is watched cold and warm (scripts/web/load.mjs). What
+# a browser sends -- its Origin under the pages' referrer policy, its handling
+# of the 303, its cache -- is what is exercised, which the suites' scripted
+# posts cannot show. Needs ./openchimed (a demo build) with the web client
+# beside it (make web), build/signin, build/demo_client, node with
+# playwright-core, openssl, and a Chromium (CHROME, else Playwright's download).
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 CHROME="${CHROME:-$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome 2>/dev/null | sort | tail -1)}"
@@ -73,4 +74,13 @@ OUT2="$(node scripts/web/invite.mjs "https://127.0.0.1:$PORT" "$INVITE" "$CHROME
 rc=$?
 printf '%s\n' "$OUT2"
 [ $rc = 0 ] || { echo "pages: FAIL (see $W/pages.err)"; tail -5 "$W/pages.err"; exit 1; }
-echo "pages: OK: the sign-in pages and an invitation link from a real browser"
+# The web client's load (WEB.md, "Loading"): the load screen's stages, gzip on
+# the wire, and a second load that downloads nothing again. The certificate is
+# trusted by its key, since a browser caches nothing from one it overlooks.
+SPKI="$(echo | openssl s_client -connect 127.0.0.1:$PORT 2>/dev/null | openssl x509 -pubkey -noout |
+        openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64)"
+OUT3="$(node scripts/web/load.mjs "https://127.0.0.1:$PORT" "$SPKI" "$CHROME" 2>>"$W/pages.err")"
+rc=$?
+printf '%s\n' "$OUT3"
+[ $rc = 0 ] || { echo "pages: FAIL (see $W/pages.err)"; tail -5 "$W/pages.err"; exit 1; }
+echo "pages: OK: the sign-in pages, an invitation link and the client's load from a real browser"

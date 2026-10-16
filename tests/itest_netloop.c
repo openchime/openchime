@@ -6505,6 +6505,16 @@ static void test_http_stack(int port, int hport) {
         oc_mkdir("build/itest_webapp/web");
         FILE *f;
         f = fopen("build/itest_webapp/web/openchime.wasm", "wb"); CHECK(f); if (f) { fwrite("\0asm", 1, 4, f); fclose(f); }
+        /* Its gzip copy, as `make web` writes it: sent to a browser that takes
+         * gzip, when its trailer says it is of this wasm and no other. */
+        static const unsigned char GZ[] = { 0x1f,0x8b,0x08,0x00,0x00,0x00,0x00,0x00,0x02,0x03,0x63,0x48,
+                                            0x2c,0xce,0x05,0x00,0xdb,0x49,0x40,0x5f,0x04,0x00,0x00,0x00 };
+        CHECK(oc_webapp_gzip_matches(GZ, sizeof GZ, "\0asm", 4));
+        CHECK(!oc_webapp_gzip_matches(GZ, sizeof GZ, "\0asn", 4));     /* another wasm's copy */
+        CHECK(!oc_webapp_gzip_matches(GZ, sizeof GZ, "\0asm!", 5));
+        CHECK(!oc_webapp_gzip_matches(GZ + 1, sizeof GZ - 1, "\0asm", 4));   /* not gzip */
+        CHECK(!oc_webapp_gzip_matches(GZ, 10, "\0asm", 4));
+        f = fopen("build/itest_webapp/web/openchime.wasm.gz", "wb"); CHECK(f); if (f) { fwrite(GZ, 1, sizeof GZ, f); fclose(f); }
         /* A daemon built without the client (WEB=0) refuses to serve it and
          * says why; one built with it loads. The route assertions below
          * follow the same split. */
@@ -6576,7 +6586,39 @@ static void test_http_stack(int port, int hport) {
         const char *rw = "GET /app/openchime.wasm HTTP/1.1\r\nHost: x\r\n\r\n";
         CHECK(write_all(&h.conn, (const uint8_t *)rw, strlen(rw)) == 0);
         http_read_response(&h, resp, sizeof resp);
-        CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "Content-Type: application/wasm\r\n"));
+        CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "Content-Type: application/wasm\r\n") &&
+              strstr(resp, "X-OC-Size: 4\r\n") && strstr(resp, "Content-Length: 4\r\n") &&
+              !strstr(resp, "Content-Encoding"));
+        /* A browser that takes gzip gets the copy, its size beside it, and an
+         * ETag; asking again with that ETag downloads nothing. */
+        client_close(&h);
+        CHECK(http_client_open(&h, port, pin2) == 0);
+        const char *rg = "GET /app/openchime.wasm HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip, br\r\n\r\n";
+        CHECK(write_all(&h.conn, (const uint8_t *)rg, strlen(rg)) == 0);
+        http_read_response(&h, resp, sizeof resp);
+        char etag[64] = "";
+        const char *et = strstr(resp, "ETag: ");
+        if (et) sscanf(et + 6, "%63[^\r]", etag);
+        CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "Content-Encoding: gzip\r\n") &&
+              strstr(resp, "Content-Length: 24\r\n") && strstr(resp, "X-OC-Size: 4\r\n") &&
+              strstr(resp, "Vary: Accept-Encoding\r\n") && strstr(etag, "-gz\""));
+        client_close(&h);
+        CHECK(http_client_open(&h, port, pin2) == 0);
+        char rn[256];
+        snprintf(rn, sizeof rn, "GET /app/openchime.wasm HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n"
+                                "If-None-Match: %s\r\n\r\n", etag);
+        CHECK(write_all(&h.conn, (const uint8_t *)rn, strlen(rn)) == 0);
+        http_read_response(&h, resp, sizeof resp);
+        CHECK(strncmp(resp, "HTTP/1.1 304 Not Modified\r\n", 27) == 0 && strstr(resp, etag) &&
+              !strstr(resp, "Content-Length"));
+        /* The loader, compiled in gzipped as well. */
+        client_close(&h);
+        CHECK(http_client_open(&h, port, pin2) == 0);
+        const char *rj = "GET /app/openchime.js HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n";
+        CHECK(write_all(&h.conn, (const uint8_t *)rj, strlen(rj)) == 0);
+        http_read_response(&h, resp, sizeof resp);
+        CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "Content-Encoding: gzip\r\n") &&
+              strstr(resp, "ETag: \""));
     } else {
         /* No client in this daemon: the TLS port has no front door, and
          * refuses "/" as it does anything else it does not serve. */

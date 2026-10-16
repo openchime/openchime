@@ -125,6 +125,15 @@ int   oc_plat_signin_result(char *out, size_t cap) {
 }
 void  oc_plat_quit(void) { }
 const char *oc_plat_name(void) { return "web"; }
+
+/* The page's load screen comes down when the client has drawn itself
+ * (openchime.html), not on a timer: until then it is what the person sees. */
+void oc_plat_frame_shown(void) {
+    static int shown;
+    if (shown) return;
+    shown = 1;
+    EM_ASM({ if (window.ocLoaded) window.ocLoaded(); });
+}
 const char *oc_plat_mic_settings_name(void) { return "the browser's site settings"; }
 void oc_plat_share_limits(int *max_w, int *max_h) { *max_w = 960; *max_h = 540; }
 const char *oc_plat_privacy_name(void) { return "The browser"; }
