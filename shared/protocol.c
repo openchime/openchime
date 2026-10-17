@@ -930,6 +930,7 @@ oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_
         oc_w_u16(w, np);
         for (uint16_t i = 0; i < np; i++) oc_w_u64(w, m->peers[i]);
     }
+    oc_w_u8(w, m->e2e);
     return oc_frame_end(w, off);
 }
 
@@ -967,6 +968,7 @@ oc_result oc_encode_channel_list(oc_wbuf *w, uint16_t version, const oc_channel_
             oc_w_u16(w, np);
             for (uint16_t k = 0; k < np; k++) oc_w_u64(w, m->entries[i].peers[k]);
         }
+        oc_w_u8(w, m->entries[i].e2e);
     }
     return oc_frame_end(w, off);
 }
@@ -1861,6 +1863,44 @@ oc_result oc_encode_call_key_for(oc_wbuf *w, uint16_t version, const oc_call_key
     return oc_frame_end(w, off);
 }
 
+/* --- private DMs (PRIVATE-DM.md) -------------------------------------------- */
+
+oc_result oc_encode_pdm_open(oc_wbuf *w, uint16_t version, const oc_pdm_open *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PDM_OPEN);
+    oc_w_u64(w, m->peer); oc_w_bytes(w, m->hs);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_pdm_opened(oc_wbuf *w, uint16_t version, const oc_pdm_opened *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PDM_OPENED);
+    oc_w_u64(w, m->pdm_id); oc_w_u64(w, m->peer);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_pdm_invite(oc_wbuf *w, uint16_t version, const oc_pdm_invite *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PDM_INVITE);
+    oc_w_u64(w, m->pdm_id); oc_w_u64(w, m->from); oc_w_bytes(w, m->hs);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_pdm_hs(oc_wbuf *w, uint16_t version, uint16_t type, const oc_pdm_hs *m) {
+    size_t off = oc_frame_begin(w, version, type);
+    oc_w_u64(w, m->pdm_id); oc_w_bytes(w, m->hs);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_pdm_msg(oc_wbuf *w, uint16_t version, uint16_t type, const oc_pdm_msg *m) {
+    size_t off = oc_frame_begin(w, version, type);
+    oc_w_u64(w, m->pdm_id); oc_w_bytes(w, m->header); oc_w_bytes(w, m->ct);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_pdm_end(oc_wbuf *w, uint16_t version, const oc_pdm_end *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PDM_END);
+    oc_w_u64(w, m->pdm_id); oc_w_u8(w, m->reason);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_call_share(oc_wbuf *w, uint16_t version, const oc_call_share *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_SHARE);
     oc_w_u64(w, m->channel_id);
@@ -1979,6 +2019,50 @@ oc_result oc_decode_call_key_for(oc_rbuf *p, oc_call_key_for *m) {
     m->epoch = oc_r_u32(p);
     m->sender = oc_r_u64(p);
     m->sealed = oc_r_bytes(p);
+    return r_done(p);
+}
+
+/* The handshake and the ciphertext are opaque, but their sizes are not: a frame
+ * outside them is malformed, so neither end has to guard against a giant one. */
+oc_result oc_decode_pdm_open(oc_rbuf *p, oc_pdm_open *m) {
+    m->peer = oc_r_u64(p);
+    m->hs = oc_r_bytes(p);
+    if (m->hs.len == 0 || m->hs.len > OC_PDM_MAX_HS) p->underflow = 1;
+    return r_done(p);
+}
+
+oc_result oc_decode_pdm_opened(oc_rbuf *p, oc_pdm_opened *m) {
+    m->pdm_id = oc_r_u64(p);
+    m->peer = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_pdm_invite(oc_rbuf *p, oc_pdm_invite *m) {
+    m->pdm_id = oc_r_u64(p);
+    m->from = oc_r_u64(p);
+    m->hs = oc_r_bytes(p);
+    if (m->hs.len == 0 || m->hs.len > OC_PDM_MAX_HS) p->underflow = 1;
+    return r_done(p);
+}
+
+oc_result oc_decode_pdm_hs(oc_rbuf *p, oc_pdm_hs *m) {
+    m->pdm_id = oc_r_u64(p);
+    m->hs = oc_r_bytes(p);
+    if (m->hs.len == 0 || m->hs.len > OC_PDM_MAX_HS) p->underflow = 1;
+    return r_done(p);
+}
+
+oc_result oc_decode_pdm_msg(oc_rbuf *p, oc_pdm_msg *m) {
+    m->pdm_id = oc_r_u64(p);
+    m->header = oc_r_bytes(p);
+    m->ct = oc_r_bytes(p);
+    if (m->header.len != OC_PDM_HEADER_LEN || m->ct.len < 16 || m->ct.len > OC_PDM_MAX_CT) p->underflow = 1;
+    return r_done(p);
+}
+
+oc_result oc_decode_pdm_end(oc_rbuf *p, oc_pdm_end *m) {
+    m->pdm_id = oc_r_u64(p);
+    m->reason = oc_r_u8(p);
     return r_done(p);
 }
 
@@ -2972,6 +3056,7 @@ oc_result oc_decode_channel_info(oc_rbuf *p, oc_channel_info *m) {
     m->n_peers  = oc_r_u16(p);
     if (m->n_peers > OC_MAX_GROUP_DM + 1) return OC_E_MALFORMED;
     for (uint16_t i = 0; i < m->n_peers; i++) m->peers[i] = oc_r_u64(p);
+    m->e2e = oc_r_u8(p);
     return r_done(p);
 }
 
@@ -3002,7 +3087,9 @@ oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries,
         if (np > OC_MAX_GROUP_DM + 1) return OC_E_MALFORMED;
         uint64_t peers[OC_MAX_GROUP_DM + 1];
         for (uint16_t k = 0; k < np; k++) peers[k] = oc_r_u64(p);
+        uint8_t e2e = oc_r_u8(p);
         if (i < cap) {
+            entries[i].e2e = e2e;
             entries[i].n_peers = np;
             for (uint16_t k = 0; k < np; k++) entries[i].peers[k] = peers[k];
             entries[i].channel_id = id;

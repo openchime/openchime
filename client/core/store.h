@@ -80,6 +80,18 @@ void oc_store_clear_pin(oc_store *s, const char *workspace);
 int  oc_store_device_key(oc_store *s, const char *workspace,
                          uint8_t sk[32], uint8_t pk[32]);
 
+/* The device key a person used in a private DM with this account (PRIVATE-DM.md
+ * §5), remembered by a 16-byte fingerprint so the next handshake can be held to
+ * it. oc_store_peer_check: 0 the first time (it is now remembered), 1 the same
+ * key as before, 2 a different one (nothing is changed: the person decides),
+ * -1 with no credential store. oc_store_peer_accept remembers `fp` for `user`,
+ * the oldest of 16 dropped to make room. A logout forgets them all. */
+#define OC_STORE_PEER_FP 16
+int  oc_store_peer_check(oc_store *s, const char *workspace, uint64_t user,
+                         const uint8_t fp[OC_STORE_PEER_FP]);
+void oc_store_peer_accept(oc_store *s, const char *workspace, uint64_t user,
+                          const uint8_t fp[OC_STORE_PEER_FP]);
+
 /* Move what is filed under `legacy` — an entry keyed by the address resolution
  * once produced — to `key`, the workspace as named (oc_workspace_key). Token with
  * its owner and expiry, pin, device key and book fields each move only where

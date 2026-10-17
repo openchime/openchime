@@ -2359,9 +2359,18 @@ static void test_index_mentions(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    /* Back to before step 60; the columns of steps 61 and 62 go too, so that
-     * they can run again. */
+    /* Back to before step 60; the columns of steps 61 to 63 go too (with 63's
+     * triggers, back to step 6's), so that they can run again. */
     CHECK(sqlite3_exec(db, "DELETE FROM mentions; DELETE FROM schema_version WHERE version >= 60;"
+                           "DROP TRIGGER messages_fts_ai; DROP TRIGGER messages_fts_ad; DROP TRIGGER messages_fts_au;"
+                           "CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN"
+                           "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body); END;"
+                           "CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN"
+                           "  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body); END;"
+                           "CREATE TRIGGER messages_fts_au AFTER UPDATE ON messages BEGIN"
+                           "  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body);"
+                           "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body); END;"
+                           "ALTER TABLE channels DROP COLUMN e2e;"
                            "ALTER TABLE invites DROP COLUMN used; ALTER TABLE invites DROP COLUMN uses;"
                            "ALTER TABLE local_credentials DROP COLUMN kdf;"
                            "ALTER TABLE local_credentials ADD COLUMN iterations INTEGER NOT NULL DEFAULT 0;",
@@ -8031,6 +8040,144 @@ static int demo_count(sqlite3 *db, const char *sql) {
     return n;
 }
 
+/* An encrypted DM's channel (PRIVATE-DM.md): made new for each conversation,
+ * marked e2e; its bodies kept but not indexed; no file in it; closed when it
+ * ends, closed at start if it was open, and gone, every row of it, a day after
+ * it closed. */
+static int64_t e2e_scalar(const char *path, const char *sql, uint64_t arg) {
+    sqlite3 *db = NULL; sqlite3_stmt *st = NULL; int64_t v = -1;
+    if (sqlite3_open(path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_bind_parameter_count(st) > 0) sqlite3_bind_int64(st, 1, (sqlite3_int64)arg);
+        if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return v;
+}
+
+static oc_dbres *e2e_open(oc_dbwriter *w, uint64_t actor, uint64_t target) {
+    oc_job *j = oc_job_new(OC_JOB_OPEN_DM, 56);
+    j->user_id = actor; j->target_user_id = target; j->e2e = 1;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *e2e_send(oc_dbwriter *w, uint64_t user, uint64_t ch, const char *body, uint8_t idem, int attach) {
+    oc_job *j = oc_job_new(OC_JOB_SEND, 57);
+    j->user_id = user; j->channel_id = ch;
+    memset(j->idem, idem, OC_IDEM_LEN);
+    oc_job_set_body(j, body, strlen(body));
+    if (attach) { j->attach_ids[0] = 1; j->n_attach = 1; }
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_e2e_dms(void) {
+    const char *path = "build/test_dbwriter_e2e.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "e2-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "e2-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    /* Made, marked, and new each time: never the pair's ordinary DM. */
+    oc_dbres *r = e2e_open(w, alice, bob);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->pdm_open && r->channel_id && r->ch_e2e);
+    CHECK(r && r->ch_kind == OC_CHANNEL_KIND_DM && r->ch_peer == bob);
+    uint64_t ch = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    r = e2e_open(w, alice, bob);
+    uint64_t ch2 = r ? r->channel_id : 0;
+    CHECK(ch2 && ch2 != ch);
+    oc_dbres_free(r);
+    r = open_dm(w, alice, bob);
+    CHECK(r && r->channel_id && r->channel_id != ch && r->channel_id != ch2 && !r->ch_e2e);
+    oc_dbres_free(r);
+    r = e2e_open(w, alice, alice);                 /* not to oneself */
+    CHECK(r && r->pdm_open && r->channel_id == 0);
+    oc_dbres_free(r);
+
+    /* Its body is kept as given, and full-text search does not hold it. */
+    r = e2e_send(w, alice, ch, "oc-e2e:1:zebrafish", 0x31, 0);
+    CHECK(r && r->type == OC_RES_SEND_OK && r->ch_e2e);
+    uint64_t mid = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM messages WHERE channel_id=?1 AND CAST(body AS TEXT)='oc-e2e:1:zebrafish';", ch) == 1);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'zebrafish';", 0) == 0);
+    /* No file goes into it. */
+    r = e2e_send(w, alice, ch, "oc-e2e:1:ZmlsZQ==", 0x32, 1);
+    CHECK(r && r->type == OC_RES_SEND_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    oc_job *j = oc_job_new(OC_JOB_ATTACH_CREATE, 58);
+    j->user_id = alice; j->channel_id = ch; j->att_size = 10;
+    memset(j->idem, 0x33, OC_IDEM_LEN);
+    j->filename = strdup("x.bin"); j->mime = strdup("application/octet-stream");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* Ended: closed, so nothing more is taken in it. */
+    j = oc_job_new(OC_JOB_E2E_CLOSE, 0);
+    j->channel_id = ch;
+    oc_dbwriter_submit(w, j);
+    r = e2e_send(w, bob, ch, "oc-e2e:1:bGF0ZQ==", 0x34, 0);
+    CHECK(r && r->type == OC_RES_SEND_ERR && r->err_code == OC_ERR_CHANNEL_ARCHIVED);
+    oc_dbres_free(r);
+    /* And what was said stands as it is: no edit, reaction or delete. */
+    j = oc_job_new(OC_JOB_EDIT, 59);
+    j->user_id = alice; j->channel_id = ch; j->message_id = mid;
+    oc_job_set_body(j, "oc-e2e:1:ZWRpdA==", 17);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_EDIT_ERR && r->err_code == OC_ERR_CHANNEL_ARCHIVED);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_REACT, 59);
+    j->user_id = bob; j->channel_id = ch; j->message_id = mid; j->emoji = strdup("\xF0\x9F\x91\x8D"); j->react_op = OC_REACT_ADD;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_REACTION_ERR && r->err_code == OC_ERR_CHANNEL_ARCHIVED);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_DELETE, 59);
+    j->user_id = alice; j->channel_id = ch; j->message_id = mid;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_DELETE_ERR && r->err_code == OC_ERR_CHANNEL_ARCHIVED);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+
+    /* A day on (the close moved back 25 hours), and a restart: the one still
+     * open is closed at start; the maintenance pass removes the old one and
+     * every row of it, and keeps the one closed just now. */
+    {
+        sqlite3 *db = NULL;
+        CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+        char sql[160];
+        snprintf(sql, sizeof sql, "UPDATE channels SET archived_at_ms = archived_at_ms - 90000000 WHERE id=%llu;",
+                 (unsigned long long)ch);
+        CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(db);
+    }
+    w = start_db(path);
+    CHECK(w != NULL);
+    CHECK(e2e_scalar(path, "SELECT archived_at_ms IS NOT NULL FROM channels WHERE id=?1;", ch2) == 1);
+    j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);
+    j->maint_grace_ms = 3600000;
+    j->maint_batch = 8;
+    oc_dbwriter_submit(w, j);
+    r = NULL;
+    for (int i = 0; i < 400 && !r; i++) { r = oc_dbwriter_next_result(w); if (!r) usleep(5000); }
+    CHECK(r != NULL);
+    oc_dbres_free(r);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM channels WHERE id=?1;", ch) == 0);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM messages WHERE channel_id=?1;", ch) == 0);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM channel_members WHERE channel_id=?1;", ch) == 0);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM channels WHERE id=?1;", ch2) == 1);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_demo_mode(void) {
     const char *path = "build/test_dbwriter_demo.db";
     cleanup_db(path);
@@ -8119,6 +8266,7 @@ int run_dbwriter_tests(void) {
     test_auth_and_send();
     test_oidc_auth();
     test_demo_mode();
+    test_e2e_dms();
     test_oidc_join_rules();
     test_direct_identities();
     test_relay_published_keys();

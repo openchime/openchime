@@ -40,7 +40,7 @@ static uint64_t get_u64(const uint8_t *p) {
  * but it is integrity-sensitive — rewriting a pin is how a MITM gets accepted
  * (ARCH-10) — so it belongs beside the credential, not in a file anyone can
  * edit. The book fields ride along so the credential IS the book entry. */
-#define SEC_VER    3
+#define SEC_VER    4
 #define SEC_LABEL  128
 #define SEC_USER   128
 #define SEC_OWNER  128
@@ -68,11 +68,20 @@ static uint64_t get_u64(const uint8_t *p) {
  * Version 3 appends the DEVICE KEY -- this device's X25519 private key for calls
  * in this workspace (ARCH-113, CALLS.md §5.2) -- by the same rule. It is the most
  * secret thing here and sits beside the token for the reason the token does: the
- * credential store is the one place this client keeps anything. */
+ * credential store is the one place this client keeps anything.
+ *
+ * Version 4 appends the PEERS of private DMs (PRIVATE-DM.md §5): for each person
+ * this account has had one with, their user id and a 16-byte fingerprint of the
+ * device key they used, so a later handshake with another key is noticed. 16 of
+ * them, oldest dropped first; a user id of 0 is an empty slot. */
+#define SEC_PEER_N   16
+#define SEC_PEER_LEN (8 + OC_STORE_PEER_FP)
 #define SEC_BLOB_V1 (2 + 8 + OC_SESSION_TOKEN_LEN + OC_TLS_FINGERPRINT_LEN + 8 + SEC_LABEL + SEC_USER)
 #define SEC_BLOB_V2 (SEC_BLOB_V1 + SEC_OWNER)
-#define SEC_BLOB    (SEC_BLOB_V2 + OC_X25519_LEN)
-enum { SEC_HAS_TOKEN = 1, SEC_HAS_PIN = 2, SEC_HAS_BOOK = 4, SEC_HAS_OWNER = 8, SEC_HAS_DEVKEY = 16 };
+#define SEC_BLOB_V3 (SEC_BLOB_V2 + OC_X25519_LEN)
+#define SEC_BLOB    (SEC_BLOB_V3 + SEC_PEER_N * SEC_PEER_LEN)
+enum { SEC_HAS_TOKEN = 1, SEC_HAS_PIN = 2, SEC_HAS_BOOK = 4, SEC_HAS_OWNER = 8, SEC_HAS_DEVKEY = 16,
+       SEC_HAS_PEERS = 32 };
 #define SEC_EXPIRY(b) ((b) + 2)
 #define SEC_TOKEN(b)  ((b) + 10)
 #define SEC_PIN(b)    ((b) + 10 + OC_SESSION_TOKEN_LEN)
@@ -81,6 +90,7 @@ enum { SEC_HAS_TOKEN = 1, SEC_HAS_PIN = 2, SEC_HAS_BOOK = 4, SEC_HAS_OWNER = 8, 
 #define SEC_USR(b)    (SEC_LBL(b) + SEC_LABEL)
 #define SEC_OWN(b)    (SEC_USR(b) + SEC_USER)
 #define SEC_DEVKEY(b) ((uint8_t *)SEC_OWN(b) + SEC_OWNER)
+#define SEC_PEER(b, i) (SEC_DEVKEY(b) + OC_X25519_LEN + (size_t)(i) * SEC_PEER_LEN)
 
 static int sec_load(oc_store *s, const char *ws, uint8_t *blob) {
     size_t got = 0;
@@ -95,9 +105,11 @@ static int sec_load(oc_store *s, const char *ws, uint8_t *blob) {
      * the current version. */
     int v1 = (got == SEC_BLOB_V1 && blob[0] == 1);
     int v2 = (got == SEC_BLOB_V2 && blob[0] == 2);
-    if (!v1 && !v2 && (got != SEC_BLOB || blob[0] != SEC_VER)) { memset(blob, 0, SEC_BLOB); return 0; }
+    int v3 = (got == SEC_BLOB_V3 && blob[0] == 3);
+    if (!v1 && !v2 && !v3 && (got != SEC_BLOB || blob[0] != SEC_VER)) { memset(blob, 0, SEC_BLOB); return 0; }
     if (v1) blob[1] &= (uint8_t)~SEC_HAS_OWNER;   /* bits that did not exist then */
     if (v1 || v2) blob[1] &= (uint8_t)~SEC_HAS_DEVKEY;
+    if (v1 || v2 || v3) blob[1] &= (uint8_t)~SEC_HAS_PEERS;
     SEC_LBL(blob)[SEC_LABEL - 1] = '\0';   /* fixed-width fields; never trust the tail */
     SEC_USR(blob)[SEC_USER - 1]  = '\0';
     SEC_OWN(blob)[SEC_OWNER - 1] = '\0';
@@ -109,7 +121,7 @@ static int sec_load(oc_store *s, const char *ws, uint8_t *blob) {
  * though today's callers have nothing better to do than log it. */
 static int sec_store(oc_store *s, const char *ws, uint8_t *blob) {
     blob[0] = SEC_VER;
-    if (!(blob[1] & (SEC_HAS_TOKEN | SEC_HAS_PIN | SEC_HAS_BOOK | SEC_HAS_OWNER | SEC_HAS_DEVKEY))) {
+    if (!(blob[1] & (SEC_HAS_TOKEN | SEC_HAS_PIN | SEC_HAS_BOOK | SEC_HAS_OWNER | SEC_HAS_DEVKEY | SEC_HAS_PEERS))) {
         oc_secret_del(s->secret, ws);
         return 1;
     }
@@ -225,8 +237,10 @@ void oc_store_clear_session(oc_store *s, const char *workspace) {
     if (!s || !workspace || !s->secret) return;
     uint8_t b[SEC_BLOB];
     if (!sec_load(s, workspace, b)) { oc_secret_del(s->secret, workspace); return; }
-    b[1] &= (uint8_t)~(SEC_HAS_TOKEN | SEC_HAS_OWNER | SEC_HAS_DEVKEY);
+    b[1] &= (uint8_t)~(SEC_HAS_TOKEN | SEC_HAS_OWNER | SEC_HAS_DEVKEY | SEC_HAS_PEERS);
     memset(SEC_TOKEN(b), 0, OC_SESSION_TOKEN_LEN);
+    /* The people this account had private DMs with are its own to know. */
+    memset(SEC_PEER(b, 0), 0, (size_t)SEC_PEER_N * SEC_PEER_LEN);
     memset(SEC_OWN(b), 0, SEC_OWNER);               /* the owner goes with the token */
     /* And the device key with them: it was this account's on this machine, and
      * whoever signs in next makes their own (CALLS.md §5.2). */
@@ -304,6 +318,44 @@ int oc_store_device_key(oc_store *s, const char *workspace,
  * No file: one credential per workspace, so listing the credentials IS listing
  * the book. The address/account/last-used ride in the same blob as the token and
  * pin, which is what makes "forget" a single delete with nothing left behind. */
+
+int oc_store_peer_check(oc_store *s, const char *workspace, uint64_t user,
+                        const uint8_t fp[OC_STORE_PEER_FP]) {
+    uint8_t b[SEC_BLOB];
+    if (!s || !workspace || !s->secret || !user) return -1;
+    sec_load(s, workspace, b);
+    for (int i = 0; i < SEC_PEER_N; i++) {
+        if (get_u64(SEC_PEER(b, i)) != user) continue;
+        int same = memcmp(SEC_PEER(b, i) + 8, fp, OC_STORE_PEER_FP) == 0;
+        oc_e2e_wipe(b, sizeof b);
+        return same ? 1 : 2;
+    }
+    oc_e2e_wipe(b, sizeof b);
+    oc_store_peer_accept(s, workspace, user, fp);
+    return 0;
+}
+
+void oc_store_peer_accept(oc_store *s, const char *workspace, uint64_t user,
+                          const uint8_t fp[OC_STORE_PEER_FP]) {
+    uint8_t b[SEC_BLOB];
+    if (!s || !workspace || !s->secret || !user) return;
+    sec_load(s, workspace, b);
+    int at = -1;
+    for (int i = 0; i < SEC_PEER_N && at < 0; i++) if (get_u64(SEC_PEER(b, i)) == user) at = i;
+    if (at < 0) {
+        /* The newest goes last; with every slot taken the oldest makes room. */
+        for (int i = 0; i < SEC_PEER_N && at < 0; i++) if (get_u64(SEC_PEER(b, i)) == 0) at = i;
+        if (at < 0) {
+            memmove(SEC_PEER(b, 0), SEC_PEER(b, 1), (size_t)(SEC_PEER_N - 1) * SEC_PEER_LEN);
+            at = SEC_PEER_N - 1;
+        }
+    }
+    put_u64(SEC_PEER(b, at), user);
+    memcpy(SEC_PEER(b, at) + 8, fp, OC_STORE_PEER_FP);
+    b[1] |= SEC_HAS_PEERS;
+    sec_store(s, workspace, b);
+    oc_e2e_wipe(b, sizeof b);
+}
 
 void oc_store_workspace_remember(oc_store *s, const char *workspace,
                                  const char *label, const char *username,

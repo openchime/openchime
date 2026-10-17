@@ -14,8 +14,8 @@
 # whose checks are the Windows platform's alone are skipped by name.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ALL="smoke startup composer drafts links keymenu members newmsg shortcuts reactions groups files uploads voice screenrec search_boxes calls calls_tcp balloon"
-WEB_OK="smoke voice screenrec uploads files calls calls_tcp search_boxes"
+ALL="smoke startup composer drafts links keymenu members newmsg shortcuts reactions groups files uploads voice screenrec search_boxes calls calls_tcp balloon pdm"
+WEB_OK="smoke voice screenrec uploads files calls calls_tcp search_boxes pdm"
 plat=win32
 case "${1:-}" in --win32) plat=win32; shift ;; --web) plat=web; shift ;; esac
 [ $# -gt 0 ] || { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }

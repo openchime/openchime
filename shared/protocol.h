@@ -160,8 +160,12 @@
  *
  * 25: WORKSPACE_INFO carries the workspace's `mode` (OPENCHIME_MODE: normal,
  * development, demo), so a client can say it is in a public demo (AUTH.md
- * §8.12). A byte appended to a layout. */
-#define OC_PROTOCOL_VERSION 25u
+ * §8.12). A byte appended to a layout.
+ *
+ * 26: CHANNEL_INFO and each CHANNEL_LIST entry carry `e2e`: 1 for a DM whose
+ * messages are encrypted end to end (PRIVATE-DM.md), whose bodies the daemon
+ * cannot read. A byte appended to two layouts. */
+#define OC_PROTOCOL_VERSION 26u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -535,6 +539,17 @@ typedef enum {
      * (a person reporting a problem reads both off one screen). After
      * WORKSPACE_INFO, signed in only: an address does not learn a build. */
     OC_MSG_SERVER_BUILD         = 0x0106, /* S->C { build } */
+    /* Private DMs (PRIVATE-DM.md): a Noise handshake and then ratchet messages
+     * between two devices, relayed as bytes the daemon cannot read. Sent only to
+     * a daemon that offers OC_CAP_PDM. */
+    OC_MSG_PDM_OPEN             = 0x0107, /* C->S { peer, handshake 1 } */
+    OC_MSG_PDM_OPENED           = 0x0108, /* S->C { pdm, peer }, to the opener */
+    OC_MSG_PDM_INVITE           = 0x0109, /* S->C { pdm, from, handshake 1 }, to the peer's devices */
+    OC_MSG_PDM_HS               = 0x010A, /* C->S { pdm, handshake 2 or 3 } */
+    OC_MSG_PDM_HS_FOR           = 0x010B, /* S->C { pdm, handshake 2 or 3 }, to the other device */
+    OC_MSG_PDM_SEND             = 0x010C, /* C->S { pdm, header, ciphertext } */
+    OC_MSG_PDM_MSG              = 0x010D, /* S->C { pdm, header, ciphertext }, to the other device */
+    OC_MSG_PDM_END              = 0x010E, /* C->S and S->C { pdm, reason } */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -1174,7 +1189,8 @@ typedef struct { uint32_t count; uint64_t seen_at; } oc_activity;
  * channel and for a 1:1 DM, whose single other participant is `peer_id`. */
 typedef struct { uint64_t channel_id; uint8_t kind; oc_slice name; uint8_t is_public; uint8_t joined; uint64_t created_at;
                  uint64_t peer_id; oc_slice topic; uint8_t archived;
-                 uint16_t n_peers; uint64_t peers[OC_MAX_GROUP_DM + 1]; } oc_channel_info;
+                 uint16_t n_peers; uint64_t peers[OC_MAX_GROUP_DM + 1];
+                 uint8_t e2e; } oc_channel_info;   /* 1: an end-to-end encrypted DM (PRIVATE-DM.md) */
 typedef struct { uint64_t channel_id; } oc_channel_ref;                       /* JOIN / LEAVE */
 typedef struct { uint64_t channel_id; uint64_t user_id; } oc_channel_member_op; /* INVITE / REMOVE */
 /* CHANNEL_LIST entry. `last_message_at`/`unread` were added 2026-07-27 so a
@@ -1192,7 +1208,8 @@ typedef struct { uint64_t channel_id; oc_slice name; uint8_t is_public; uint8_t 
                  /* 1 when that message is an action (REQ-058): preview is then
                   * its action text, read "<preview_author> <preview>". */
                  uint8_t preview_action;
-                 uint16_t n_peers; uint64_t peers[OC_MAX_GROUP_DM + 1]; } oc_channel_list_entry;
+                 uint16_t n_peers; uint64_t peers[OC_MAX_GROUP_DM + 1];
+                 uint8_t e2e; } oc_channel_list_entry;   /* as CHANNEL_INFO's */
 typedef struct { uint64_t user_id; } oc_open_dm;
 /* Incoming-webhook management (REQ-170). CREATE_WEBHOOK asks for a token scoped
  * to a channel; WEBHOOK_INFO returns the id + the raw 32-byte token (shown once,
@@ -1498,6 +1515,27 @@ typedef struct { uint64_t channel_id; uint64_t call_id; uint32_t epoch;
                  uint16_t count; const oc_call_key_entry *entries; } oc_call_key;
 typedef struct { uint64_t channel_id; uint64_t call_id; uint32_t epoch; uint64_t sender;
                  oc_slice sealed; } oc_call_key_for;
+/* Private DMs (PRIVATE-DM.md). The handshake and the ciphertext are opaque to the
+ * daemon; it only routes them between the two devices bound to a private DM. */
+#define OC_PDM_MAX_HS     256u     /* one Noise XX message with a short payload */
+#define OC_PDM_HEADER_LEN 40u      /* the ratchet's header (shared/ratchet.h) */
+#define OC_PDM_MAX_CT     16400u   /* 16 KB of text and the AEAD tag */
+/* Why a private DM ended. */
+enum {
+    OC_PDM_END_CLOSED   = 1,   /* the other side closed it */
+    OC_PDM_END_TAKEN    = 2,   /* accepted on another of this person's devices */
+    OC_PDM_END_GONE     = 3,   /* the other device signed out, or stayed away 24 hours */
+    OC_PDM_END_LOST     = 4,   /* a device no longer holds the session (it restarted) */
+    OC_PDM_END_REFUSED  = 5,   /* the daemon would not open or carry it */
+    OC_PDM_END_DECLINED = 6,   /* the invited person declined */
+};
+typedef struct { uint64_t peer; oc_slice hs; } oc_pdm_open;
+typedef struct { uint64_t pdm_id; uint64_t peer; } oc_pdm_opened;
+typedef struct { uint64_t pdm_id; uint64_t from; oc_slice hs; } oc_pdm_invite;
+typedef struct { uint64_t pdm_id; oc_slice hs; } oc_pdm_hs;               /* PDM_HS and PDM_HS_FOR */
+typedef struct { uint64_t pdm_id; oc_slice header; oc_slice ct; } oc_pdm_msg; /* PDM_SEND and PDM_MSG */
+typedef struct { uint64_t pdm_id; uint8_t reason; } oc_pdm_end;
+
 /* Attachment transfer (REQ-140/141, ARCH-69). `data` chunks are zero-copy views.
  * sha256 is a 32-byte digest carried as `bytes`. */
 typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice filename; oc_slice mime; uint64_t total_size; } oc_upload_begin;
@@ -1532,6 +1570,7 @@ typedef struct { oc_slice model_version; uint8_t count;
 #define OC_CAP_CALLS "calls" /* talk in a call (REQ-150, REQ-301) */
 #define OC_CAP_CALLS_TCP "calls-tcp" /* call media over the connection (CALL_MEDIA) */
 #define OC_CAP_SUMMARIZE "summarize" /* summaries of a channel or DM (REQ-310) */
+#define OC_CAP_PDM "pdm" /* private DMs, end to end between two devices (PRIVATE-DM.md) */
 typedef struct { uint8_t count; oc_slice names[OC_CAP_MAX]; } oc_capabilities;
 typedef struct { uint64_t message_id; } oc_audio_get;
 /* Hear voice `voice_id` (an id TTS_INFO listed) say TTS_INFO's preview sentence.
@@ -1885,6 +1924,14 @@ oc_result oc_encode_call_end(oc_wbuf *w, uint16_t version, const oc_call_end *m)
 oc_result oc_encode_call_state(oc_wbuf *w, uint16_t version, const oc_call_state *m);
 oc_result oc_encode_call_key(oc_wbuf *w, uint16_t version, const oc_call_key *m);
 oc_result oc_encode_call_key_for(oc_wbuf *w, uint16_t version, const oc_call_key_for *m);
+oc_result oc_encode_pdm_open(oc_wbuf *w, uint16_t version, const oc_pdm_open *m);
+oc_result oc_encode_pdm_opened(oc_wbuf *w, uint16_t version, const oc_pdm_opened *m);
+oc_result oc_encode_pdm_invite(oc_wbuf *w, uint16_t version, const oc_pdm_invite *m);
+/* `type` is OC_MSG_PDM_HS or OC_MSG_PDM_HS_FOR: one layout, two directions. */
+oc_result oc_encode_pdm_hs(oc_wbuf *w, uint16_t version, uint16_t type, const oc_pdm_hs *m);
+/* `type` is OC_MSG_PDM_SEND or OC_MSG_PDM_MSG. */
+oc_result oc_encode_pdm_msg(oc_wbuf *w, uint16_t version, uint16_t type, const oc_pdm_msg *m);
+oc_result oc_encode_pdm_end(oc_wbuf *w, uint16_t version, const oc_pdm_end *m);
 oc_result oc_encode_call_share(oc_wbuf *w, uint16_t version, const oc_call_share *m);
 oc_result oc_encode_call_media_up(oc_wbuf *w, uint16_t version, const oc_call_media_pkt *m);
 oc_result oc_encode_call_media_down(oc_wbuf *w, uint16_t version, const oc_call_media_pkt *m);
@@ -2085,6 +2132,12 @@ oc_result oc_decode_call_state(oc_rbuf *p, oc_call_state *m, uint64_t *parts, ui
                                uint64_t *invited, uint16_t icap);
 oc_result oc_decode_call_key(oc_rbuf *p, oc_call_key *m, oc_call_key_entry *entries, uint16_t cap);
 oc_result oc_decode_call_key_for(oc_rbuf *p, oc_call_key_for *m);
+oc_result oc_decode_pdm_open(oc_rbuf *p, oc_pdm_open *m);
+oc_result oc_decode_pdm_opened(oc_rbuf *p, oc_pdm_opened *m);
+oc_result oc_decode_pdm_invite(oc_rbuf *p, oc_pdm_invite *m);
+oc_result oc_decode_pdm_hs(oc_rbuf *p, oc_pdm_hs *m);
+oc_result oc_decode_pdm_msg(oc_rbuf *p, oc_pdm_msg *m);
+oc_result oc_decode_pdm_end(oc_rbuf *p, oc_pdm_end *m);
 oc_result oc_decode_call_share(oc_rbuf *p, oc_call_share *m);
 oc_result oc_decode_call_media_up(oc_rbuf *p, oc_call_media_pkt *m);
 oc_result oc_decode_call_media_down(oc_rbuf *p, oc_call_media_pkt *m);

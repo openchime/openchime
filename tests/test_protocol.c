@@ -1478,6 +1478,48 @@ static void test_profile_frames(void) {
     }
 }
 
+/* Private DMs (PRIVATE-DM.md): every frame round trips, and the sizes the daemon
+ * relies on are enforced by the decoders. */
+static void test_pdm_frames(void) {
+    uint8_t hs[48], hdr[OC_PDM_HEADER_LEN], ct[64];
+    memset(hs, 1, sizeof hs); memset(hdr, 2, sizeof hdr); memset(ct, 3, sizeof ct);
+
+    { oc_pdm_open in = { 42, { hs, 32 } };
+      ROUNDTRIP(oc_encode_pdm_open(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PDM_OPEN, h, p);
+      oc_pdm_open out; CHECK(oc_decode_pdm_open(&p, &out) == OC_OK && out.peer == 42 && out.hs.len == 32); }
+    { oc_pdm_opened in = { 7, 42 };
+      ROUNDTRIP(oc_encode_pdm_opened(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PDM_OPENED, h, p);
+      oc_pdm_opened out; CHECK(oc_decode_pdm_opened(&p, &out) == OC_OK && out.pdm_id == 7 && out.peer == 42); }
+    { oc_pdm_invite in = { 7, 3, { hs, 32 } };
+      ROUNDTRIP(oc_encode_pdm_invite(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PDM_INVITE, h, p);
+      oc_pdm_invite out; CHECK(oc_decode_pdm_invite(&p, &out) == OC_OK && out.from == 3 && memcmp(out.hs.ptr, hs, 32) == 0); }
+    { oc_pdm_hs in = { 7, { hs, sizeof hs } };
+      ROUNDTRIP(oc_encode_pdm_hs(&w, OC_PROTOCOL_VERSION, OC_MSG_PDM_HS_FOR, &in), OC_MSG_PDM_HS_FOR, h, p);
+      oc_pdm_hs out; CHECK(oc_decode_pdm_hs(&p, &out) == OC_OK && out.pdm_id == 7 && out.hs.len == sizeof hs); }
+    { oc_pdm_msg in = { 7, { hdr, sizeof hdr }, { ct, sizeof ct } };
+      ROUNDTRIP(oc_encode_pdm_msg(&w, OC_PROTOCOL_VERSION, OC_MSG_PDM_SEND, &in), OC_MSG_PDM_SEND, h, p);
+      oc_pdm_msg out; CHECK(oc_decode_pdm_msg(&p, &out) == OC_OK && out.ct.len == sizeof ct && memcmp(out.header.ptr, hdr, sizeof hdr) == 0); }
+    { oc_pdm_end in = { 7, OC_PDM_END_TAKEN };
+      ROUNDTRIP(oc_encode_pdm_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PDM_END, h, p);
+      oc_pdm_end out; CHECK(oc_decode_pdm_end(&p, &out) == OC_OK && out.reason == OC_PDM_END_TAKEN); }
+
+    /* Out of size: an empty or oversized handshake, a header of the wrong length,
+     * a ciphertext shorter than its tag. */
+    static uint8_t big[OC_PDM_MAX_HS + 1];
+    { oc_pdm_hs in = { 7, { big, sizeof big } };
+      ROUNDTRIP(oc_encode_pdm_hs(&w, OC_PROTOCOL_VERSION, OC_MSG_PDM_HS, &in), OC_MSG_PDM_HS, h, p);
+      oc_pdm_hs out; CHECK(oc_decode_pdm_hs(&p, &out) == OC_E_MALFORMED); }
+    { oc_pdm_open in = { 42, { hs, 0 } };
+      ROUNDTRIP(oc_encode_pdm_open(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PDM_OPEN, h, p);
+      oc_pdm_open out; CHECK(oc_decode_pdm_open(&p, &out) == OC_E_MALFORMED); }
+    { oc_pdm_msg in = { 7, { hdr, sizeof hdr - 1 }, { ct, sizeof ct } };
+      ROUNDTRIP(oc_encode_pdm_msg(&w, OC_PROTOCOL_VERSION, OC_MSG_PDM_MSG, &in), OC_MSG_PDM_MSG, h, p);
+      oc_pdm_msg out; CHECK(oc_decode_pdm_msg(&p, &out) == OC_E_MALFORMED); }
+    { oc_pdm_msg in = { 7, { hdr, sizeof hdr }, { ct, 15 } };
+      ROUNDTRIP(oc_encode_pdm_msg(&w, OC_PROTOCOL_VERSION, OC_MSG_PDM_MSG, &in), OC_MSG_PDM_MSG, h, p);
+      oc_pdm_msg out; CHECK(oc_decode_pdm_msg(&p, &out) == OC_E_MALFORMED); }
+}
+
 static void test_call_frames(void) {
     oc_call_part pa[2];
     memset(pa, 0, sizeof pa);
@@ -2396,6 +2438,7 @@ int run_protocol_tests(void) {
     test_primitives();
     test_device_token_ok();
     test_handshake_frames();
+    test_pdm_frames();
     test_auth_frames();
     test_messaging_frames();
     test_reaction_frames();

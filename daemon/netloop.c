@@ -220,7 +220,7 @@ typedef struct conn_s {
     uint32_t     events;    /* current epoll interest */
     uint64_t     send_win_start; /* fixed-window start for the send rate limit */
     uint32_t     send_count;     /* sends counted in the current window */
-    struct rate_win { uint64_t start; uint32_t count; } presence_rl, typing_rl, react_rl, call_rl;
+    struct rate_win { uint64_t start; uint32_t count; } presence_rl, typing_rl, react_rl, call_rl, pdm_rl;
     /* CALL_JOIN is answered after the reader's check, so a leave can arrive
      * first. Each join advances the counter and carries it (oc_job.gen), a leave
      * of the conversation the latest join named advances it again, and a join's
@@ -826,6 +826,9 @@ static void presence_offline_if_gone(int ep, conn **conns, uint64_t user_id);
  * below; declared here for conn_close. */
 static void call_conn_closed(int ep, conn **conns, uint64_t conn_id);
 static void sum_conn_closed(uint64_t conn_id);
+/* A closed connection's private DMs wait for its session to come back
+ * (PRIVATE-DM.md). Defined below; declared here for conn_close. */
+static void pdm_conn_closed(int ep, conn **conns, uint64_t conn_id, uint64_t user_id);
 /* Append + flush to a connection (closes it on error). Defined below; declared
  * here for the call roster helpers. */
 static void send_bytes(int ep, conn **conns, int fd, const uint8_t *buf, size_t len);
@@ -834,6 +837,12 @@ static void send_bytes(int ep, conn **conns, int fd, const uint8_t *buf, size_t 
  * (0: nobody excepted), each connection once however often its user is listed.
  * A write that fails closes that connection; the walk takes its successor first,
  * and a close frees only the connection it closes. */
+/* A live encrypted DM's two devices, while a result about it is delivered
+ * (deliver_result): its fan-out reaches them only (PRIVATE-DM.md). */
+struct pdm_s;
+static __thread const struct pdm_s *g_fan_only;
+static int pdm_conn_bound(const struct pdm_s *d, uint64_t conn_id);
+
 static void fanout_members(int ep, conn **conns, const uint64_t *m, size_t n,
                            uint64_t except_uid, const uint8_t *buf, size_t len) {
     uint64_t gen = ++g_fan_gen;
@@ -842,6 +851,7 @@ static void fanout_members(int ep, conn **conns, const uint64_t *m, size_t n,
         for (conn *c = user_head(m[i]), *next; c; c = next) {
             next = c->u_next;
             if (c->fan_gen == gen) continue;
+            if (g_fan_only && !pdm_conn_bound(g_fan_only, c->conn_id)) continue;
             c->fan_gen = gen;
             send_bytes(ep, conns, c->fd, buf, len);
         }
@@ -910,6 +920,7 @@ static void conn_close(int ep, conn **conns, int fd) {
     if (was_authed) presence_offline_if_gone(ep, conns, uid);
     call_conn_closed(ep, conns, cid);   /* leave any call; roster remaining (REQ-152) */
     if (was_authed) sum_conn_closed(cid);
+    if (was_authed) pdm_conn_closed(ep, conns, cid, uid);
 }
 
 static conn *find_by_id(conn **conns, uint64_t id) {
@@ -1372,6 +1383,243 @@ static call_t *call_new(uint64_t channel_id, uint64_t starter) {
             return c;
         }
     return NULL;   /* every call slot busy */
+}
+
+/* --- encrypted DMs (PRIVATE-DM.md) ----------------------------------------- *
+ *
+ * An encrypted DM is a DM channel marked e2e, joining two devices: the opener's
+ * connection, and whichever of the peer's devices answers the invitation first.
+ * Its id is the channel's. The daemon carries their handshake as bytes it
+ * cannot read, then their messages as ordinary frames whose bodies are
+ * ciphertext; those frames go to the two devices only. What is held here is in
+ * memory: a side whose connection drops keeps its place for its session (a
+ * reconnect with the same session token comes back to it, and catches up as any
+ * client does), and handshake frames wait, at most OC_PDM_QUEUE_MAX of them, for
+ * at most OC_PDM_HOLD_MS. A device that restarted has no session to come back
+ * with; it answers what arrives with PDM_END, and the other side is told. When
+ * it ends the channel is closed, for the maintenance pass to remove. */
+#define OC_PDM_MAX        256
+#define OC_PDM_PER_USER   16
+#define OC_PDM_QUEUE_MAX  64
+#define OC_PDM_HOLD_MS    (24ull * 60 * 60 * 1000)
+#define OC_PDM_RATE_MAX   30u      /* opens and handshakes, per window */
+#define OC_PDM_RATE_MS    10000u
+
+typedef struct pdm_frame { struct pdm_frame *next; size_t len; uint8_t bytes[]; } pdm_frame;
+typedef struct pdm_s {
+    int        used;               /* 0: a free slot */
+    uint64_t   id;                 /* the channel; 0 while it is being made */
+    int        accepted;           /* the peer's device answered (handshake 2 seen) */
+    uint64_t   user[2];            /* [0] the opener, [1] the peer */
+    uint64_t   session[2];         /* the sessions bound to it; [1] is 0 until accepted */
+    uint64_t   conn[2];            /* the live connection of each side, or 0 */
+    uint64_t   away_since[2];      /* when that side's connection went, 0 while there */
+    pdm_frame *q[2], *q_tail[2];   /* frames waiting for each side */
+    int        qn[2];
+    uint8_t    hs1[OC_PDM_MAX_HS]; /* the invitation, for a peer device that signs in later */
+    size_t     hs1_len;
+    uint8_t   *peer_info;          /* the channel's CHANNEL_INFO as the peer sees it, for its device that accepts */
+    size_t     peer_info_len;
+    uint64_t   created;
+} pdm_t;
+static __thread pdm_t *g_pdms;
+
+static pdm_t *pdm_find(uint64_t id) {
+    if (!id) return NULL;
+    for (int i = 0; g_pdms && i < OC_PDM_MAX; i++) if (g_pdms[i].used && g_pdms[i].id == id) return &g_pdms[i];
+    return NULL;
+}
+
+static int pdm_count_of(uint64_t uid) {
+    int n = 0;
+    for (int i = 0; i < OC_PDM_MAX; i++)
+        if (g_pdms[i].used && (g_pdms[i].user[0] == uid || g_pdms[i].user[1] == uid)) n++;
+    return n;
+}
+
+/* Which side a connection is: 0 the opener, 1 the peer, -1 neither. */
+static int pdm_side_of(const pdm_t *d, uint64_t conn_id) {
+    if (conn_id && d->conn[0] == conn_id) return 0;
+    if (conn_id && d->conn[1] == conn_id) return 1;
+    return -1;
+}
+
+static void pdm_free(pdm_t *d) {
+    for (int s = 0; s < 2; s++)
+        for (pdm_frame *f = d->q[s], *n; f; f = n) { n = f->next; oc_e2e_wipe(f->bytes, f->len); free(f); }
+    free(d->peer_info);
+    /* Its channel is closed: nothing more can be posted, and the maintenance
+     * pass removes it a day later. */
+    if (d->id && g_call_dbw) {
+        oc_job *j = oc_job_new(OC_JOB_E2E_CLOSE, 0);
+        if (j) { j->channel_id = d->id; oc_dbwriter_submit(g_call_dbw, j); }
+    }
+    oc_e2e_wipe(d, sizeof *d);
+}
+
+/* Deliver a frame to one side: at once when its connection is there, else into
+ * its queue. 0 if delivered or kept; -1 when the queue is full (the DM ends). */
+static int pdm_deliver(int ep, conn **conns, pdm_t *d, int side, const uint8_t *buf, size_t len) {
+    conn *t = d->conn[side] ? find_by_id(conns, d->conn[side]) : NULL;
+    if (t) { call_send(ep, t, buf, len); return 0; }
+    if (d->qn[side] >= OC_PDM_QUEUE_MAX) return -1;
+    pdm_frame *f = malloc(sizeof *f + len);
+    if (!f) return -1;
+    f->next = NULL; f->len = len; memcpy(f->bytes, buf, len);
+    if (d->q_tail[side]) d->q_tail[side]->next = f; else d->q[side] = f;
+    d->q_tail[side] = f;
+    d->qn[side]++;
+    return 0;
+}
+
+static size_t pdm_end_frame(uint64_t id, uint8_t reason, uint8_t *buf, size_t cap) {
+    oc_wbuf w; oc_wbuf_init(&w, buf, cap);
+    oc_pdm_end e = { id, reason };
+    return oc_encode_pdm_end(&w, OC_PROTOCOL_VERSION, &e) == OC_OK ? w.len : 0;
+}
+
+/* Tell a live connection that a DM ended. */
+static void pdm_send_end(int ep, conn *t, uint64_t id, uint8_t reason) {
+    uint8_t buf[64];
+    size_t n = pdm_end_frame(id, reason, buf, sizeof buf);
+    if (t && n) call_send(ep, t, buf, n);
+}
+
+/* The peer's devices that were shown the invitation and did not take it. */
+static void pdm_withdraw_invite(int ep, pdm_t *d, uint64_t except_conn, uint8_t reason) {
+    for (conn *t = user_head(d->user[1]); t; t = t->u_next)
+        if (t->conn_id != except_conn) pdm_send_end(ep, t, d->id, reason);
+}
+
+/* End a DM: tell the side that is still there (live only: a queued end would
+ * outlive the DM it names), and forget it. */
+static void pdm_end(int ep, conn **conns, pdm_t *d, int ended_by, uint8_t reason) {
+    if (!d->accepted) {
+        /* Every device still showing the invitation stops showing it, the one
+         * that declined included; the opener hears why. */
+        pdm_withdraw_invite(ep, d, 0, reason == OC_PDM_END_CLOSED ? OC_PDM_END_GONE : reason);
+        if (ended_by != 0 && d->conn[0]) pdm_send_end(ep, find_by_id(conns, d->conn[0]), d->id, reason);
+    } else {
+        for (int s = 0; s < 2; s++)
+            if (s != ended_by && d->conn[s]) pdm_send_end(ep, find_by_id(conns, d->conn[s]), d->id, reason);
+    }
+    pdm_free(d);
+}
+
+static void pdm_conn_closed(int ep, conn **conns, uint64_t conn_id, uint64_t user_id) {
+    (void)user_id; (void)ep; (void)conns;
+    if (!g_pdms) return;
+    for (int i = 0; i < OC_PDM_MAX; i++) {
+        pdm_t *d = &g_pdms[i];
+        int side = d->used ? pdm_side_of(d, conn_id) : -1;
+        if (side < 0) continue;
+        d->conn[side] = 0;
+        d->away_since[side] = now_ms();
+    }
+}
+
+/* A connection signed in: give it back the DMs its session holds, with what
+ * waited for it, and show it the invitations to it still open. */
+static void pdm_attach(int ep, conn **conns, conn *c) {
+    if (!g_pdms) return;
+    for (int i = 0; i < OC_PDM_MAX; i++) {
+        pdm_t *d = &g_pdms[i];
+        if (!d->used || !d->id) continue;
+        for (int s = 0; s < 2; s++) {
+            if (d->user[s] != c->user_id || d->session[s] != c->session_id || !d->session[s] || d->conn[s]) continue;
+            d->conn[s] = c->conn_id;
+            d->away_since[s] = 0;
+            for (pdm_frame *f = d->q[s], *n; f; f = n) {
+                n = f->next;
+                call_send(ep, c, f->bytes, f->len);
+                oc_e2e_wipe(f->bytes, f->len);
+                free(f);
+            }
+            d->q[s] = d->q_tail[s] = NULL;
+            d->qn[s] = 0;
+        }
+        if (!d->accepted && d->user[1] == c->user_id) {
+            oc_wbuf w; oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            oc_pdm_invite inv = { d->id, d->user[0], { d->hs1, d->hs1_len } };
+            if (oc_encode_pdm_invite(&w, OC_PROTOCOL_VERSION, &inv) == OC_OK) call_send(ep, c, g_enc, w.len);
+        }
+    }
+    (void)conns;
+}
+
+/* A side away longer than OC_PDM_HOLD_MS is not coming back. */
+static void pdm_expire(int ep, conn **conns) {
+    if (!g_pdms) return;
+    uint64_t t = now_ms();
+    for (int i = 0; i < OC_PDM_MAX; i++) {
+        pdm_t *d = &g_pdms[i];
+        if (!d->used) continue;
+        if (!d->accepted && t - d->created >= OC_PDM_HOLD_MS) { pdm_end(ep, conns, d, -1, OC_PDM_END_GONE); continue; }
+        for (int s = 0; s < 2 && d->used; s++)
+            if (d->away_since[s] && t - d->away_since[s] >= OC_PDM_HOLD_MS) pdm_end(ep, conns, d, s, OC_PDM_END_GONE);
+    }
+}
+
+/* An encrypted DM's channel was made (or not): the opener is given the
+ * conversation and told its id, and the peer's devices are invited. The peer's
+ * view of the channel is kept for whichever device accepts. */
+static void pdm_opened(int ep, conn **conns, const oc_dbres *r) {
+    pdm_t *d = NULL;
+    for (int i = 0; g_pdms && i < OC_PDM_MAX && !d; i++)
+        if (g_pdms[i].used && !g_pdms[i].id && g_pdms[i].conn[0] == r->conn_id && g_pdms[i].user[1] == r->ch_peer)
+            d = &g_pdms[i];
+    conn *c = d ? find_by_id(conns, d->conn[0]) : NULL;
+    if (!d || !c || !r->channel_id) {
+        if (c) pdm_send_end(ep, c, 0, OC_PDM_END_REFUSED);
+        if (d) pdm_free(d);
+        if (!d && r->channel_id && g_call_dbw) {   /* nobody is waiting for it */
+            oc_job *j = oc_job_new(OC_JOB_E2E_CLOSE, 0);
+            if (j) { j->channel_id = r->channel_id; oc_dbwriter_submit(g_call_dbw, j); }
+        }
+        return;
+    }
+    d->id = r->channel_id;
+    oc_channel_info ci;
+    memset(&ci, 0, sizeof ci);
+    ci.channel_id = r->channel_id;
+    ci.kind = OC_CHANNEL_KIND_DM;
+    ci.name = oc_slice_str("");
+    ci.topic = oc_slice_str("");
+    ci.joined = 1;
+    ci.created_at = r->ch_created_at;
+    ci.e2e = 1;
+    oc_wbuf w;
+    ci.peer_id = d->user[0];                       /* as the peer sees it */
+    oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+    if (oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci) == OC_OK && (d->peer_info = malloc(w.len)) != NULL) {
+        memcpy(d->peer_info, g_enc, w.len);
+        d->peer_info_len = w.len;
+    }
+    /* Named first, then described: a client keeps an encrypted DM's channel
+     * only once it knows it has the session for it. */
+    oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+    oc_pdm_opened op = { d->id, d->user[1] };
+    if (oc_encode_pdm_opened(&w, OC_PROTOCOL_VERSION, &op) == OC_OK) call_send(ep, c, g_enc, w.len);
+    ci.peer_id = d->user[1];                       /* as the opener does */
+    oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+    if (oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci) == OC_OK) call_send(ep, c, g_enc, w.len);
+    oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+    oc_pdm_invite inv = { d->id, d->user[0], { d->hs1, d->hs1_len } };
+    if (oc_encode_pdm_invite(&w, OC_PROTOCOL_VERSION, &inv) == OC_OK)
+        for (conn *t = user_head(d->user[1]); t; t = t->u_next) call_send(ep, t, g_enc, w.len);
+}
+
+/* The two devices of a live encrypted DM: what is said in it goes to them
+ * only (fanout_members asks), and only they may say anything. NULL when the
+ * channel is not one. */
+static int pdm_conn_bound(const pdm_t *d, uint64_t conn_id) {
+    return d && conn_id && (d->conn[0] == conn_id || (d->accepted && d->conn[1] == conn_id));
+}
+/* 1 when `c` may not write to channel `cid`: it is a live encrypted DM and this
+ * is not one of its two devices. */
+static int pdm_refuses(const conn *c, uint64_t cid) {
+    const pdm_t *d = pdm_find(cid);
+    return d && !pdm_conn_bound(d, c->conn_id);
 }
 
 /* The call a connection is in, and where in it; one at most (CALLS.md §1). */
@@ -2144,6 +2392,16 @@ static int demo_refuse(conn *c, const uint8_t *ctx, size_t ctx_len, oc_dl_kind k
     return out_append(c, tmp, w.len);
 }
 
+/* A write to a live encrypted DM from a device that is not one of its two
+ * (PRIVATE-DM.md): it could only be read as plain text, so it is not taken. */
+static int pdm_forbid(conn *c, const uint8_t *ctx, size_t ctx_len) {
+    uint8_t tmp[160]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
+    oc_error e = { OC_ERR_FORBIDDEN, 0, { ctx, ctx_len },
+                   oc_slice_str("this encrypted conversation is on another device") };
+    if (oc_encode_error(&w, OC_PROTOCOL_VERSION, &e) != OC_OK) return -1;
+    return out_append(c, tmp, w.len);
+}
+
 static int reject_send_rate(conn *c, const uint8_t idem[OC_IDEM_LEN]) {
     uint8_t tmp[96]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
     oc_slice ctx = { idem, OC_IDEM_LEN };
@@ -2493,6 +2751,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_SEND) {
             oc_send s = {0};
             if (oc_decode_send(&p, &s) != OC_OK) return -1;
+            if (pdm_refuses(c, s.channel_id)) { if (pdm_forbid(c, s.idem, OC_IDEM_LEN) != 0) return -1; continue; }
             if (!send_rate_ok(c)) { if (reject_send_rate(c, s.idem) != 0) return -1; continue; }
             if (!demo_ok(OC_DL_MESSAGE, c->user_id)) {
                 if (demo_refuse(c, s.idem, OC_IDEM_LEN, OC_DL_MESSAGE) != 0) return -1;
@@ -2520,6 +2779,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_EDIT) {
             oc_edit e;
             if (oc_decode_edit(&p, &e) != OC_OK) return -1;
+            if (pdm_refuses(c, e.channel_id)) { if (pdm_forbid(c, NULL, 0) != 0) return -1; continue; }
             oc_job *j = oc_job_new(OC_JOB_EDIT, c->conn_id);
             if (!j) return -1;
             j->user_id = c->user_id;
@@ -2534,6 +2794,11 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
              * span; the worker builds what is missing (OC_RES_SUMMARY_NEED). */
             oc_summarize sm;
             if (oc_decode_summarize(&p, &sm) != OC_OK) return -1;
+            if (pdm_find(sm.channel_id)) {   /* ciphertext: nothing to summarize */
+                send_summary(ep, conns, c, sm.req_id, OC_SUM_UNAVAILABLE, sm.channel_id, 0, 0, 0, "",
+                             "An encrypted conversation cannot be summarized.");
+                continue;
+            }
             oc_sum_worker *sw = sum_worker();
             if (!sum_offered()) {
                 send_summary(ep, conns, c, sm.req_id, OC_SUM_UNAVAILABLE, sm.channel_id, 0, 0, 0, "",
@@ -2607,6 +2872,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_DELETE) {
             oc_delete d;
             if (oc_decode_delete(&p, &d) != OC_OK) return -1;
+            if (pdm_refuses(c, d.channel_id)) { if (pdm_forbid(c, NULL, 0) != 0) return -1; continue; }
             oc_job *j = oc_job_new(OC_JOB_DELETE, c->conn_id);
             if (!j) return -1;
             j->user_id = c->user_id;
@@ -2760,6 +3026,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_REACT) {
             oc_react rc;
             if (oc_decode_react(&p, &rc) != OC_OK) return -1;
+            if (pdm_refuses(c, rc.channel_id)) { if (pdm_forbid(c, NULL, 0) != 0) return -1; continue; }
             if (!win_ok(&c->react_rl, OC_REACT_RATE_MAX, OC_REACT_RATE_MS)) {
                 if (reject_rate(c, rc.message_id, "reaction rate exceeded") != 0) return -1;
                 continue;
@@ -2890,6 +3157,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_SEND_REPLY) {
             oc_send_reply sr = {0};
             if (oc_decode_send_reply(&p, &sr) != OC_OK) return -1;
+            if (pdm_refuses(c, sr.channel_id)) { if (pdm_forbid(c, sr.idem, OC_IDEM_LEN) != 0) return -1; continue; }
             if (!send_rate_ok(c)) { if (reject_send_rate(c, sr.idem) != 0) return -1; continue; }
             if (!demo_ok(OC_DL_MESSAGE, c->user_id)) {
                 if (demo_refuse(c, sr.idem, OC_IDEM_LEN, OC_DL_MESSAGE) != 0) return -1;
@@ -2954,6 +3222,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_TYPING) {
             oc_typing t;
             if (oc_decode_typing(&p, &t) != OC_OK) return -1;
+            if (pdm_refuses(c, t.channel_id)) continue;
             if (!win_ok(&c->typing_rl, OC_TYPING_RATE_MAX, OC_TYPING_RATE_MS)) continue;
             oc_job *j = oc_job_new(OC_JOB_TYPING, c->conn_id);   /* read job -> members */
             if (!j) return -1;
@@ -3580,6 +3849,110 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_PDM_OPEN || hdr.msg_type == OC_MSG_PDM_HS ||
+            hdr.msg_type == OC_MSG_PDM_SEND || hdr.msg_type == OC_MSG_PDM_END) {
+            uint8_t eb[64];
+            if (hdr.msg_type == OC_MSG_PDM_OPEN) {
+                oc_pdm_open po;
+                if (oc_decode_pdm_open(&p, &po) != OC_OK) return -1;
+                if (!win_ok(&c->pdm_rl, OC_PDM_RATE_MAX, OC_PDM_RATE_MS)) {
+                    if (reject_rate(c, 0, "private DM rate exceeded") != 0) return -1;
+                    continue;
+                }
+                /* To someone else, signed in now (the invitation goes to their
+                 * devices), within the limits; otherwise refused with id 0. */
+                pdm_t *d = NULL;
+                if (po.peer && po.peer != c->user_id && user_head(po.peer) &&
+                    pdm_count_of(c->user_id) < OC_PDM_PER_USER && pdm_count_of(po.peer) < OC_PDM_PER_USER)
+                    for (int i = 0; i < OC_PDM_MAX && !d; i++) if (!g_pdms[i].used) d = &g_pdms[i];
+                oc_job *j = d ? oc_job_new(OC_JOB_OPEN_DM, c->conn_id) : NULL;
+                if (!j) {
+                    size_t n = pdm_end_frame(0, OC_PDM_END_REFUSED, eb, sizeof eb);
+                    if (n && out_append(c, eb, n) != 0) return -1;
+                    continue;
+                }
+                /* Its channel first; the invitation goes when it is made
+                 * (pdm_opened). */
+                memset(d, 0, sizeof *d);
+                d->used = 1;
+                d->user[0] = c->user_id; d->user[1] = po.peer;
+                d->created = now_ms();
+                d->session[0] = c->session_id;
+                d->conn[0] = c->conn_id;
+                memcpy(d->hs1, po.hs.ptr, po.hs.len); d->hs1_len = po.hs.len;
+                j->user_id = c->user_id;
+                j->target_user_id = po.peer;
+                j->e2e = 1;
+                oc_dbwriter_submit(dbw, j);
+                continue;
+            }
+            if (hdr.msg_type == OC_MSG_PDM_HS) {
+                oc_pdm_hs ph;
+                if (oc_decode_pdm_hs(&p, &ph) != OC_OK) return -1;
+                if (!win_ok(&c->pdm_rl, OC_PDM_RATE_MAX, OC_PDM_RATE_MS)) {
+                    if (reject_rate(c, 0, "private DM rate exceeded") != 0) return -1;
+                    continue;
+                }
+                pdm_t *d = pdm_find(ph.pdm_id);
+                int side = d ? pdm_side_of(d, c->conn_id) : -1;
+                if (d && side < 0 && !d->accepted && d->user[1] == c->user_id) {
+                    /* The first of the peer's devices to answer takes it; the
+                     * others are told it was taken. */
+                    side = 1;
+                    d->accepted = 1;
+                    d->session[1] = c->session_id;
+                    d->conn[1] = c->conn_id;
+                    pdm_withdraw_invite(ep, d, c->conn_id, OC_PDM_END_TAKEN);
+                    /* The conversation, on the device that took it. */
+                    if (d->peer_info && out_append(c, d->peer_info, d->peer_info_len) != 0) return -1;
+                }
+                if (side < 0) {
+                    size_t n = pdm_end_frame(ph.pdm_id, OC_PDM_END_REFUSED, eb, sizeof eb);
+                    if (n && out_append(c, eb, n) != 0) return -1;
+                    continue;
+                }
+                oc_wbuf w; oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+                if (oc_encode_pdm_hs(&w, OC_PROTOCOL_VERSION, OC_MSG_PDM_HS_FOR, &ph) == OC_OK &&
+                    pdm_deliver(ep, conns, d, 1 - side, g_enc, w.len) != 0)
+                    pdm_end(ep, conns, d, -1, OC_PDM_END_GONE);
+                continue;
+            }
+            if (hdr.msg_type == OC_MSG_PDM_SEND) {
+                oc_pdm_msg pm;
+                if (oc_decode_pdm_msg(&p, &pm) != OC_OK) return -1;
+                if (!send_rate_ok(c)) { if (reject_send_rate(c, NULL) != 0) return -1; continue; }
+                if (!demo_ok(OC_DL_MESSAGE, c->user_id)) {
+                    if (demo_refuse(c, NULL, 0, OC_DL_MESSAGE) != 0) return -1;
+                    continue;
+                }
+                pdm_t *d = pdm_find(pm.pdm_id);
+                int side = d && d->accepted ? pdm_side_of(d, c->conn_id) : -1;
+                if (side < 0) {
+                    size_t n = pdm_end_frame(pm.pdm_id, OC_PDM_END_REFUSED, eb, sizeof eb);
+                    if (n && out_append(c, eb, n) != 0) return -1;
+                    continue;
+                }
+                oc_wbuf w; oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+                if (oc_encode_pdm_msg(&w, OC_PROTOCOL_VERSION, OC_MSG_PDM_MSG, &pm) == OC_OK &&
+                    pdm_deliver(ep, conns, d, 1 - side, g_enc, w.len) != 0)
+                    pdm_end(ep, conns, d, -1, OC_PDM_END_GONE);
+                continue;
+            }
+            /* PDM_END: a side closing, a peer device declining, or a device that
+             * no longer holds the session saying so. */
+            oc_pdm_end pe;
+            if (oc_decode_pdm_end(&p, &pe) != OC_OK) return -1;
+            pdm_t *d = pdm_find(pe.pdm_id);
+            if (!d) continue;
+            int side = pdm_side_of(d, c->conn_id);
+            if (side < 0 && !d->accepted && d->user[1] == c->user_id) {
+                pdm_end(ep, conns, d, 1, OC_PDM_END_DECLINED);
+                continue;
+            }
+            if (side < 0) continue;
+            pdm_end(ep, conns, d, side, pe.reason == OC_PDM_END_LOST ? OC_PDM_END_LOST : OC_PDM_END_CLOSED);
+            continue;
+        }
         if ((hdr.msg_type == OC_MSG_CALL_JOIN || hdr.msg_type == OC_MSG_CALL_INVITE ||
              hdr.msg_type == OC_MSG_CALL_SHARE || hdr.msg_type == OC_MSG_CALL_KEY) &&
             !win_ok(&c->call_rl, OC_CALL_RATE_MAX, OC_CALL_RATE_MS)) {
@@ -3894,6 +4267,9 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             }
             else if (sb.sample_count > (uint32_t)OC_STT_MAX_SECS * OC_STT_RATE) {
                 refuse = OC_ERR_SEGMENT_TOO_LONG; why = "segment too long";
+            }
+            else if (sb.channel_id && pdm_find(sb.channel_id)) {
+                refuse = OC_ERR_FORBIDDEN; why = "voice input is not offered in an encrypted conversation";
             }
             else if (stt_waiting(c->conn_id) >= OC_STT_WAIT_MAX || !stt_rate_ok(c)) {
                 refuse = OC_ERR_STT_UNAVAILABLE; why = "too many segments";
@@ -5454,7 +5830,14 @@ static size_t encode_user_list(const oc_dbres *r) {
     return w.len;
 }
 
+static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r);
+/* A result about a live encrypted DM goes to its two devices only. */
 static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) {
+    g_fan_only = r->channel_id ? pdm_find(r->channel_id) : NULL;
+    deliver_result_to(ep, conns, dbw, r);
+    g_fan_only = NULL;
+}
+static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) {
     (void)dbw;
     oc_wbuf w;
     /* Somebody joined -- by invitation, a first sign-in, an account made on the
@@ -5548,6 +5931,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                 caps.names[caps.count++] = oc_slice_str(OC_CAP_CALLS);
                 caps.names[caps.count++] = oc_slice_str(OC_CAP_CALLS_TCP);
             }
+            caps.names[caps.count++] = oc_slice_str(OC_CAP_PDM);
             oc_encode_capabilities(&w, OC_PROTOCOL_VERSION, &caps);
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (!conns[fd]) break;   /* dropped on the CAPABILITIES write */
@@ -5642,6 +6026,10 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             size_t clen = call_encode_state(cl, 0, cbuf, sizeof cbuf);
             if (clen) send_bytes(ep, conns, fd, cbuf, clen);
         }
+        if (!conns[fd]) break;
+
+        /* Its private DMs, and the invitations still open to it (PRIVATE-DM.md). */
+        pdm_attach(ep, conns, conns[fd]);
         if (!conns[fd]) break;
 
         /* Presence (REQ-120): send the new client a snapshot of who is currently
@@ -5749,7 +6137,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             /* Link previews (REQ-222): queue this body's URLs for fetching.
              * Off the hot path — the fetch completes as an UNFURL_STORED
              * result later, or never. */
-            unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
+            if (!r->ch_e2e) unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
         }
 #ifdef OC_STT
         stt_posted(ep, conns, r);
@@ -5794,7 +6182,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         /* The writer dropped the old body's unfurls; re-fetch for the new one
          * (REQ-222). The store step re-validates presence, so a URL the edit
          * removed cannot come back. */
-        unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
+        if (!r->ch_e2e) unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
         break;
     }
     case OC_RES_DELETE_OK: {
@@ -5834,6 +6222,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         break;
     }
     case OC_RES_CHANNEL_INFO: {
+        if (r->pdm_open) { pdm_opened(ep, conns, r); break; }
         /* One filler for all three sends below. Designated, not positional: adding
          * `n_peers`/`peers` for group DMs (REQ-056) to the middle of a positional
          * initializer is how the notify-prefs frame silently sent its entry count as
@@ -5850,6 +6239,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             (dst).topic      = oc_slice_str(r->ch_topic ? r->ch_topic : "");         \
             (dst).archived   = r->ch_archived;                                       \
             (dst).n_peers    = r->n_ch_peers;                                        \
+            (dst).e2e        = r->ch_e2e;                                            \
             for (uint16_t pi = 0; pi < r->n_ch_peers; pi++)                          \
                 (dst).peers[pi] = r->ch_peers[pi];                                   \
         } while (0)
@@ -5964,6 +6354,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                 e->preview = oc_slice_str(cr->preview ? cr->preview : "");
                 e->preview_author = cr->preview_author;
                 e->preview_action = cr->preview_action;
+                e->e2e = cr->e2e;
                 e->n_peers = cr->n_peers;                     /* REQ-056 */
                 for (uint16_t q = 0; q < cr->n_peers; q++) e->peers[q] = cr->peers[q];
             }
@@ -6382,7 +6773,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             if (demo_ok(OC_DL_PUSH, 0)) oc_push_notify(cur_push(), r->channel_id, r->author_id, r->message_id,
                            r->parent_id);
             /* A reply's URLs unfurl like any other body's (REQ-222). */
-            unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
+            if (!r->ch_e2e) unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
         }
 #ifdef OC_STT
         stt_posted(ep, conns, r);
@@ -8161,6 +8552,8 @@ static void loop_state_free(conn **conns) {
     free(g_enc); g_enc = NULL;
     free(g_enc_participant); g_enc_participant = NULL;
     free(g_calls); g_calls = NULL;
+    if (g_pdms) { for (int i = 0; i < OC_PDM_MAX; i++) if (g_pdms[i].id) pdm_free(&g_pdms[i]); }
+    free(g_pdms); g_pdms = NULL;
 }
 
 int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
@@ -8171,6 +8564,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     g_enc = malloc(OC_MAX_FRAME_SIZE);
     g_enc_participant = malloc(OC_MAX_FRAME_SIZE);
     g_calls = calloc(OC_MAX_CALLS, sizeof *g_calls);
+    g_pdms = calloc(OC_PDM_MAX, sizeof *g_pdms);
     g_sched_tick_ms = oc_config_get()->sched_tick_ms;
     g_last_sched_ms = 0; g_sched_more = 0; g_next_conn_id = 1; g_next_call_id = 0;
     g_last_maint_ms = 0; g_dnd_dirty = 0;
@@ -8180,10 +8574,10 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
 #ifdef OC_STT
     g_stt_pend = NULL;
 #endif
-    if (!conns || !g_enc || !g_enc_participant || !g_calls) {
+    if (!conns || !g_enc || !g_enc_participant || !g_calls || !g_pdms) {
         NETLOOP_FAIL("allocating the connection table");
-        free(conns); free(g_enc); free(g_enc_participant); free(g_calls);
-        g_enc = g_enc_participant = NULL; g_calls = NULL;
+        free(conns); free(g_enc); free(g_enc_participant); free(g_calls); free(g_pdms);
+        g_enc = g_enc_participant = NULL; g_calls = NULL; g_pdms = NULL;
         return -1;
     }
 
@@ -8466,6 +8860,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         maybe_run_maintenance(dbw);
         maybe_fire_scheduled(dbw);
         expire_snoozes(ep, conns);
+        pdm_expire(ep, conns);
         if (__atomic_exchange_n(&g_sum_failed_pending, 0, __ATOMIC_ACQ_REL)) {
             oc_job *j = oc_job_new(OC_JOB_SUMMARY_FAIL, 0);
             if (j) oc_dbwriter_submit(dbw, j);

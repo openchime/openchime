@@ -180,6 +180,38 @@ framework, and OpenChime follows suit.
   `test_client_core` shows free talk arriving as `BROADCAST`s with no client
   `SEND`, push to talk returning words and sending nothing, and one microphone
   owner.
+- **Encrypted DMs** (PRIVATE-DM.md), `tests/test_pdm_crypto.c`: the Noise XX handshake
+  against the published `Noise_XX_25519_AESGCM_SHA256` vectors (every handshake and
+  transport message, the handshake hash), then what vectors do not cover: each altered
+  message and a disagreeing prologue fail, turns are enforced; the Double Ratchet, which
+  has no published vectors, by its rules: a key per message, a new ratchet key per turn,
+  out of order within 256 skipped and refused beyond, replays and used keys refused, an
+  altered body or header refused with the session unchanged, another session's message
+  refused, and a wiped state all zeros.
+  `tests/test_protocol.c` round-trips every `PDM_*` frame and refuses one out of
+  size; `test_migrate` expects schema version 63 (migration 0063, `channels.e2e`).
+  `itest_netloop`'s `test_pdm_relay` drives the daemon with raw frames: refused to
+  oneself; the opener given `PDM_OPENED` and then the channel's `CHANNEL_INFO`, a DM
+  with the peer marked `e2e`; an invitation to each of the peer's devices, taken by
+  the first that answers (which is given the channel too) and refused to the others;
+  the opener's first ratchet message relayed as `PDM_MSG`; then `SEND`s as in any DM,
+  their bodies kept and sent on as given, to the two devices only; a `SEND` from the
+  peer's other device refused with `FORBIDDEN` and nothing sent to it, and a third
+  person refused; an upload refused with `FORBIDDEN`; the channel list's entry
+  flagged `e2e` with no preview; ended, after which a `SEND` is `CHANNEL_ARCHIVED`;
+  declined; a new channel each time; and kept for its session while a side is away,
+  a fresh sign-in sent nothing of it. `test_client_core`'s `test_pdm_e2e` opens one
+  between two clients through the real daemon: refused to oneself; nothing on the
+  peer until it accepts; the same safety number on both; the channel a DM marked
+  `e2e` on both; text both ways, the sender reading its own; an edit, a reaction and
+  a delete as in any DM; closed, nothing sent after it, and forgotten with its text;
+  and a declined invitation. It also checks the credential store's remembered peer
+  keys. `scripts/gui/pdm.sh` (on Win32, and in the browser with
+  `scripts/gui/run.sh --web pdm`) drives two GUI clients: New message with
+  "End-to-end encrypted" ticked, bob accepting on his device, the same safety number
+  and no file, Send later or Files tab in the conversation, what alice wrote in New
+  message arriving once it is open and bob's answer from the normal composer reaching
+  her, ended and put away, and a second one declined.
 - **Calls** (REQ-150–152, REQ-301–306, ARCH-73/113) — `tests/test_e2e.c`: SFrame
   against RFC 9605's vectors (every header encoding, suite 0x0004's key, salt and
   ciphertext), HPKE Auth mode against RFC 9180 A.1.3 (the ephemeral, receiver and

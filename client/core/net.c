@@ -7,6 +7,8 @@
 #include "event.h"
 #include "model.h"        /* oc_model_now_ms: one clock for the backoff deadline */
 #include "store.h"
+#include "pdm.h"
+#include "e2e_hpke.h"   /* oc_e2e_wipe */
 #include "signin.h"
 #include "resolve.h"     /* oc_sni_name */
 
@@ -123,6 +125,7 @@ struct oc_net {
     oc_xqueue     xq;
     oc_stt_sent   stt;           /* voice-input segments awaiting an answer */
     oc_callsig    calls;         /* the call this device is in, and its keys (ARCH-113) */
+    oc_pdm        pdm;           /* its private DMs and their keys (PRIVATE-DM.md) */
     oc_tls_session resume;       /* the daemon's last ticket: a reconnect resumes (ARCH-22) */
 };
 
@@ -400,6 +403,7 @@ typedef struct {
     oc_queue    *held;
     uint64_t     held_id;
     int          holding;
+    oc_pdm      *pdm;         /* private DMs (PRIVATE-DM.md) */
 } disp_ctx;
 
 /* Hand on whatever is held, in the order it arrived. */
@@ -873,6 +877,20 @@ static void xq_requeue_active(oc_xqueue *q) {
 
 /* Dispatch every buffered server frame into UI events. Returns 0 to keep the
  * connection, -1 to drop it. */
+/* A message body for the UI: an encrypted DM's opened here first (PRIVATE-DM.md). */
+static char *body_for_ui(disp_ctx *ctx, uint64_t channel_id, oc_slice b) {
+    if (ctx->pdm && oc_pdm_is_e2e(ctx->pdm, channel_id)) return oc_pdm_unseal(ctx->pdm, channel_id, b.ptr, b.len);
+    char *s = malloc(b.len + 1);
+    if (s) { if (b.len) memcpy(s, b.ptr, b.len); s[b.len] = '\0'; }
+    return s;
+}
+
+/* An encrypted DM whose session is on another of this person's devices: not
+ * shown here, as nothing in it can be read here. */
+static int e2e_elsewhere(disp_ctx *ctx, uint64_t channel_id) {
+    return ctx->pdm && oc_pdm_is_e2e(ctx->pdm, channel_id) && !oc_pdm_holds(ctx->pdm, channel_id);
+}
+
 static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
     for (;;) {
         const uint8_t *frame; size_t flen;
@@ -897,6 +915,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             int cr = oc_callsig_frame(ctx->calls, hdr.msg_type, &p, ctx->host, ctx_write, ctx, to_ui);
             if (cr < 0) return -1;
             if (cr > 0) continue;
+        }
+        /* Private DMs (PRIVATE-DM.md): likewise. */
+        if (ctx->pdm) {
+            int pr = oc_pdm_frame(ctx->pdm, hdr.msg_type, &p, ctx_write, ctx, to_ui);
+            if (pr < 0) return -1;
+            if (pr > 0) continue;
         }
 
         /* A held message waits only for its own ACTION, with its forward
@@ -926,6 +950,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
         } else if (hdr.msg_type == OC_MSG_BROADCAST) {
             oc_broadcast b;
             if (oc_decode_broadcast(&p, &b) != OC_OK) return -1;
+            if (e2e_elsewhere(ctx, b.channel_id)) continue;
             oc_queue *out = held_begin(ctx, to_ui, b.message_id);
             oc_ev *e = oc_ev_new(OC_EV_MESSAGE);
             if (e) {
@@ -940,8 +965,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     memcpy(e->author_name, b.author_name.ptr, an);
                     e->author_name[an] = '\0';
                 }
-                e->body = malloc(b.body.len + 1);
-                if (e->body) { memcpy(e->body, b.body.ptr, b.body.len); e->body[b.body.len] = '\0'; }
+                e->body = body_for_ui(ctx, b.channel_id, b.body);
                 oc_queue_push(out, e);
                 /* Trailing attachment metadata (REQ-140): fold each onto the message. */
                 push_attachments(out, b.channel_id, b.message_id, b.attach, b.n_attach);
@@ -962,6 +986,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
              * tombstone, then its files folded on as a BROADCAST's are. */
             oc_broadcast b;
             if (oc_decode_broadcast(&p, &b) != OC_OK) return -1;
+            if (e2e_elsewhere(ctx, b.channel_id)) continue;
             oc_queue *out = held_begin(ctx, to_ui, b.message_id);
             oc_ev *e = oc_ev_new(OC_EV_RESTORE);
             if (e) {
@@ -969,8 +994,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->author_id = b.author_id;
                 e->message_id = b.message_id;
                 e->server_time = b.server_time;
-                e->body = malloc(b.body.len + 1);
-                if (e->body) { memcpy(e->body, b.body.ptr, b.body.len); e->body[b.body.len] = '\0'; }
+                e->body = body_for_ui(ctx, b.channel_id, b.body);
                 oc_queue_push(out, e);
                 push_attachments(out, b.channel_id, b.message_id, b.attach, b.n_attach);
             }
@@ -979,9 +1003,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (oc_decode_channel_list(&p, ents, OC_CHANNEL_LIST_PAGE, &count) != OC_OK) return -1;
             if (count > OC_CHANNEL_LIST_PAGE) count = OC_CHANNEL_LIST_PAGE;
             for (uint16_t i = 0; i < count; i++) {
+                if (ctx->pdm) oc_pdm_channel(ctx->pdm, ents[i].channel_id, ents[i].e2e);
+                if (e2e_elsewhere(ctx, ents[i].channel_id)) continue;
                 oc_ev *e = oc_ev_new(OC_EV_CHANNEL);
                 if (!e) continue;
                 e->channel_id = ents[i].channel_id;
+                e->e2e = ents[i].e2e;
                 e->status = ents[i].joined;
                 e->op = ents[i].kind;
                 e->is_public = ents[i].is_public;
@@ -1048,9 +1075,11 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
         } else if (hdr.msg_type == OC_MSG_CHANNEL_INFO) {
             oc_channel_info ci;
             if (oc_decode_channel_info(&p, &ci) == OC_OK) {
-                oc_ev *e = oc_ev_new(OC_EV_CHANNEL);   /* add/update the channel */
+                if (ctx->pdm) oc_pdm_channel(ctx->pdm, ci.channel_id, ci.e2e);
+                oc_ev *e = e2e_elsewhere(ctx, ci.channel_id) ? NULL : oc_ev_new(OC_EV_CHANNEL);   /* add/update the channel */
                 if (e) {
                     e->channel_id = ci.channel_id;
+                    e->e2e = ci.e2e;
                     e->status = ci.joined;
                     e->op = ci.kind;
                     e->is_public = ci.is_public;
@@ -1487,12 +1516,11 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             oc_msg_edited me;
             if (oc_decode_msg_edited(&p, &me) == OC_OK) {
                 oc_queue *out = held_begin(ctx, to_ui, me.message_id);
-                oc_ev *e = oc_ev_new(OC_EV_EDIT);
+                oc_ev *e = e2e_elsewhere(ctx, me.channel_id) ? NULL : oc_ev_new(OC_EV_EDIT);
                 if (e) {
                     e->channel_id = me.channel_id;
                     e->message_id = me.message_id;
-                    e->body = malloc(me.body.len + 1);
-                    if (e->body) { memcpy(e->body, me.body.ptr, me.body.len); e->body[me.body.len] = '\0'; }
+                    e->body = body_for_ui(ctx, me.channel_id, me.body);
                     oc_queue_push(out, e);
                 }
             }
@@ -1506,7 +1534,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             oc_thread_reply tr;
             if (oc_decode_thread_reply(&p, &tr) == OC_OK) {
                 oc_queue *out = held_begin(ctx, to_ui, tr.message_id);
-                oc_ev *e = oc_ev_new(OC_EV_THREAD_REPLY);
+                oc_ev *e = e2e_elsewhere(ctx, tr.channel_id) ? NULL : oc_ev_new(OC_EV_THREAD_REPLY);
                 if (e) {
                     e->channel_id = tr.channel_id;
                     e->parent_id = tr.parent_id;
@@ -1515,8 +1543,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->server_time = tr.server_time;
                     e->count = tr.reply_count;
                     e->participant = tr.participant;
-                    e->body = malloc(tr.body.len + 1);
-                    if (e->body) { memcpy(e->body, tr.body.ptr, tr.body.len); e->body[tr.body.len] = '\0'; }
+                    e->body = body_for_ui(ctx, tr.channel_id, tr.body);
                     oc_queue_push(out, e);
                     push_attachments(out, tr.channel_id, tr.message_id, tr.attach, tr.n_attach);
                 }
@@ -2146,6 +2173,13 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
         } else if (hdr.msg_type == OC_MSG_CAPABILITIES) {
             oc_capabilities caps;
             if (oc_decode_capabilities(&p, &caps) != OC_OK) return -1;
+            if (ctx->pdm) {
+                ctx->pdm->enabled = 0;
+                for (uint8_t i = 0; i < caps.count; i++)
+                    if (caps.names[i].len == strlen(OC_CAP_PDM) &&
+                        memcmp(caps.names[i].ptr, OC_CAP_PDM, caps.names[i].len) == 0)
+                        ctx->pdm->enabled = 1;
+            }
             if (ctx->calls) {
                 ctx->calls->tcp_ok = 0;
                 for (uint8_t i = 0; i < caps.count; i++)
@@ -3084,6 +3118,7 @@ static int run_connection(oc_net *n, int reconnecting,
         push_simple(n->to_ui, OC_EV_CONNECTED, ok.user_id);
         push_simple(n->to_ui, OC_EV_AUTH_OK, ok.user_id);
         oc_callsig_authed(&n->calls, oc_model_now_ms());   /* a call to get back into is rejoined */
+        oc_pdm_authed(&n->pdm, ok.user_id, cs ? cs->store : NULL, cs ? cs->workspace : NULL);
 
         /* Refresh the stored UTC offset on every connect (ARCH-103). It was only
          * ever written as a field on SET_SCHEDULE, so it was captured when the
@@ -3170,7 +3205,7 @@ static int run_connection(oc_net *n, int reconnecting,
                      cs ? cs->store : NULL, cs ? cs->obox : NULL,
                      cs ? cs->workspace : NULL, n->client_type, negotiated, &n->xq, &n->stt,
                      &n->calls, n->host, cs ? cs->workspace : NULL, n->ws_key[0] ? n->ws_key : NULL,
-                     &heldq, 0, 0 };
+                     &heldq, 0, 0, &n->pdm };
     /* Call media on the connection (PROTOCOL.md §5.17) is queued by the call
      * engine's threads, which wake this one to write it rather than leave it
      * for the next 50 ms poll. Without a wake it still goes, at that pace. */
@@ -3180,13 +3215,41 @@ static int run_connection(oc_net *n, int reconnecting,
          * segment: it is the one thing here that is late if it waits. */
         oc_callsig_pump(&n->calls, ctx_write, &ctx);
         oc_callsig_tick(&n->calls, oc_model_now_ms(), ctx_write, &ctx, n->to_ui);
+        oc_pdm_tick(&n->pdm, oc_model_now_ms(), ctx_write, &ctx, n->to_ui);
         oc_cmd *c;
         while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
             if (c->type == OC_CMD_QUIT) {
                 /* Going on purpose: out of any call now, so the daemon holds no
                  * seat for a rejoin that will not come. */
                 oc_callsig_quit(&n->calls, ctx_write, &ctx, n->to_ui);
+                oc_pdm_quit(&n->pdm, ctx_write, &ctx);   /* and out of every private DM */
                 oc_cmd_free(c); rc = RC_STOP; goto served_end;
+            }
+            if (c->type >= OC_CMD_PDM_OPEN && c->type <= OC_CMD_PDM_TRUST) {
+                oc_pdm_command(&n->pdm, c, ctx_write, &ctx, n->to_ui);
+                oc_cmd_free(c);
+                continue;
+            }
+            /* An encrypted DM (PRIVATE-DM.md): what is said is sealed here, and
+             * nothing that would carry its text in the clear leaves (a draft, a
+             * scheduled message); nothing is quoted out of it either. */
+            if (c->type == OC_CMD_SEND && oc_pdm_is_e2e(&n->pdm, c->src_channel)) c->src_channel = c->src_message = 0;
+            if (oc_pdm_is_e2e(&n->pdm, c->channel_id)) {
+                if ((c->type == OC_CMD_SEND || c->type == OC_CMD_REPLY || c->type == OC_CMD_EDIT) && c->body) {
+                    char *sealed = oc_pdm_seal(&n->pdm, c->channel_id, c->body);
+                    oc_e2e_wipe(c->body, strlen(c->body));
+                    free(c->body);
+                    c->body = sealed;
+                    c->src_channel = c->src_message = 0;
+                    if (!sealed) {
+                        push_err(n->to_ui, "This encrypted conversation is not open on this device.");
+                        oc_cmd_free(c);
+                        continue;
+                    }
+                } else if (c->type == OC_CMD_SET_DRAFT || c->type == OC_CMD_SCHEDULE) {
+                    oc_cmd_free(c);
+                    continue;
+                }
             }
             if (c->type >= OC_CMD_CALL_JOIN && c->type <= OC_CMD_CALL_SHARE) {
                 (void)oc_callsig_command(&n->calls, c, cs ? cs->store : NULL, cs ? cs->workspace : NULL,
@@ -4295,6 +4358,7 @@ void oc_net_stop(oc_net *n) {
     for (size_t i = 0; i < n->xq.n; i++) oc_cmd_free(n->xq.q[i]);
     free(n->xq.q);
     oc_callsig_destroy(&n->calls);
+    oc_pdm_free(&n->pdm);   /* every private DM's keys wiped */
     oc_tls_session_free(&n->resume);
     signin_forget(n);
     device_forget(n);

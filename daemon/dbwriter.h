@@ -278,7 +278,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_SUMMARY_SEEN = 141,
        /* A demo workspace's first start (AUTH.md §8.12): its sample channels
         * and messages, by an author nobody signs in as. Write, setup-time. */
-       OC_JOB_SEED_DEMO = 142 };
+       OC_JOB_SEED_DEMO = 142,
+       /* An encrypted DM ended (PRIVATE-DM.md): it is closed, archived like any
+        * channel, for the maintenance pass to remove. Write, no answer. */
+       OC_JOB_E2E_CLOSE = 143 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -323,6 +326,9 @@ typedef struct oc_job {
      * cancelled, or a join since left, is then known for what it is, and never
      * taken for the one after it (REQ-140, REQ-301). */
     uint32_t       gen;
+
+    /* OPEN_DM: an encrypted DM (PRIVATE-DM.md), a new conversation each time. */
+    uint8_t        e2e;
 
     /* AUTH */
     uint8_t        method;    /* OC_AUTH_LOCAL / OC_AUTH_OIDC / OC_AUTH_SESSION */
@@ -836,6 +842,7 @@ typedef struct {
     uint8_t  preview_action;   /* preview is the action text (REQ-058) */
     uint64_t groups[OC_MAX_CHANNEL_GROUPS];   /* the channel's groups (REQ-309) */
     uint16_t n_groups;
+    uint8_t  e2e;              /* an encrypted DM (PRIVATE-DM.md) */
 } oc_channel_row;
 
 /* One row in a NOTIFY_PREFS result (REQ-130): a channel and its level. */
@@ -1079,6 +1086,12 @@ typedef struct oc_dbres {
     uint64_t       ch_peers[9];
     uint16_t       n_ch_peers;
     uint64_t       push_user_id;    /* INVITE: also push CHANNEL_INFO to this user (0 = none) */
+    /* CHANNEL_INFO: the channel is an encrypted DM. SEND_OK, REPLY, EDIT_OK: the
+     * message is in one (its body is ciphertext: no previews, no transcripts). */
+    uint8_t        ch_e2e;
+    /* CHANNEL_INFO answering an encrypted DM's opening (PDM_OPEN); channel_id 0
+     * when it could not be made. */
+    uint8_t        pdm_open;
     /* CHANNEL_INFO: the channel's groups (REQ-309), sent beside it. */
     uint64_t       ch_groups[OC_MAX_CHANNEL_GROUPS];
     uint16_t       n_ch_groups;

@@ -282,7 +282,23 @@ enum {
     /* SUMMARY_READY: a summary made while its asker was not watching.
      * `summary_id` is the notice, `channel_id`, `sum_scope`, `span_start`/
      * `span_end` what was asked, `status` whether it was made, `made_at` when. */
-    OC_EV_SUMMARY_READY
+    OC_EV_SUMMARY_READY,
+    /* PDM: an encrypted DM's session (PRIVATE-DM.md, client/core/pdm.h).
+     * `channel_id` is the DM's channel, `user_id` the other person, `pdm_kind`
+     * what happened, `pdm_safety` the safety number, `pdm_reason` why it ended.
+     * What is said in it comes as in any DM (OC_EV_MESSAGE and the rest). */
+    OC_EV_PDM
+};
+
+/* What OC_EV_PDM reports, in its pdm_kind. The DM's id is `channel_id`, the other
+ * person `user_id`. */
+enum {
+    OC_PDM_EV_INVITED = 1,   /* someone asks for one; accept or decline */
+    OC_PDM_EV_OPENING,       /* this device asked; waiting for the other device */
+    OC_PDM_EV_OPEN,          /* the handshake is done: `pdm_safety` is the safety number */
+    OC_PDM_EV_KEY_CHANGED,   /* done, but the other device's key is not the one remembered;
+                                nothing is sent until the person trusts it (OC_CMD_PDM_TRUST) */
+    OC_PDM_EV_ENDED = 7,     /* ended, `pdm_reason` an OC_PDM_END_* */
 };
 
 typedef struct {
@@ -311,6 +327,7 @@ typedef struct {
                               Derived server-side (ARCH-104) because the client
                               holds a thread's replies only while it is open. */
     uint8_t  archived;     /* CHANNEL: the channel is archived (REQ-035) */
+    uint8_t  e2e;          /* CHANNEL: an encrypted DM (PRIVATE-DM.md) */
     uint8_t  ws_mode;      /* WORKSPACE_INFO: OC_WS_MODE_* (a public demo, AUTH.md §8.12) */
     uint64_t created_at;   /* CHANNEL (from CHANNEL_INFO): when it was created */
     char    *preview;      /* heap; CHANNEL: newest message text (REQ-050 sidebar) */
@@ -390,6 +407,8 @@ typedef struct {
     uint64_t summary_id, span_start, span_end;   /* SUMMARY */
     uint8_t  sum_scope;   /* SUMMARY_READY */
     uint64_t made_at;     /* SUMMARY_READY */
+    uint8_t  pdm_kind, pdm_reason;   /* PDM */
+    char     pdm_safety[72];         /* PDM: OPEN, KEY_CHANGED */
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);
@@ -544,6 +563,13 @@ enum {
     OC_CMD_SUMMARY_CANCEL, /* cancel request `req_id` */
     OC_CMD_SUMMARY_OPEN,   /* open notice `message_id`, answered as SUMMARY to `req_id` */
     OC_CMD_SUMMARY_DISMISS, /* notice `message_id` seen, unopened */
+    /* Encrypted DMs (client/core/pdm.h), a range of their own; what is said in
+     * one goes as in any DM (OC_CMD_SEND and the rest). */
+    OC_CMD_PDM_OPEN,       /* to the person `channel_id` */
+    OC_CMD_PDM_ACCEPT,     /* the invitation `channel_id`, on this device */
+    OC_CMD_PDM_DECLINE,
+    OC_CMD_PDM_CLOSE,
+    OC_CMD_PDM_TRUST,      /* go on with the other device's changed key */
     OC_CMD_QUIT
 };
 

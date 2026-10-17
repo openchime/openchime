@@ -453,12 +453,25 @@ static void fill_replay_forwards(sqlite3 *db, oc_dbres *r) {
  * call this one function and an edit that adds or removes "/me" needs nothing
  * of its own. The caller holds the transaction. A call event is never an
  * action, and a tombstone has no body to be one. */
+static int channel_is_e2e(sqlite3 *db, uint64_t channel_id);
+static int e2e_closed(sqlite3 *db, uint64_t channel_id);
+
 static void store_action(sqlite3 *db, uint64_t mid) {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, "DELETE FROM actions WHERE message_id=?1;", -1, &st, NULL) != SQLITE_OK) return;
     sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
     sqlite3_step(st);
     sqlite3_finalize(st);
+    {   /* An encrypted DM's body is ciphertext: no action to find in it. */
+        uint64_t cid = 0;
+        if (sqlite3_prepare_v2(db, "SELECT channel_id FROM messages WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+            if (sqlite3_step(st) == SQLITE_ROW) cid = (uint64_t)sqlite3_column_int64(st, 0);
+        }
+        sqlite3_finalize(st);
+        st = NULL;
+        if (cid && channel_is_e2e(db, cid)) return;
+    }
     if (sqlite3_prepare_v2(db,
             "INSERT INTO actions(message_id, channel_id, actor_id, actor_name, text_start, text_len, created_at_ms) "
             "SELECT id, channel_id, author_id, NULLIF(author_name, ''), ?2, ?3, created_at_ms "
@@ -4019,7 +4032,7 @@ static void index_mentions(sqlite3 *db) {
 static void store_keyword_hits(sqlite3 *db, uint64_t mid, uint64_t channel_id,
                                uint64_t author_id, const void *body, size_t body_len,
                                uint64_t ts) {
-    if (!body || !body_len) return;
+    if (!body || !body_len || channel_is_e2e(db, channel_id)) return;
     sqlite3_stmt *q = NULL;
     if (sqlite3_prepare_v2(db,
             "SELECT k.user_id, k.term FROM notify_keywords k "
@@ -4097,7 +4110,7 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
                            const void *body, size_t body_len, uint64_t ts,
                            oc_mention_unresolved *unres, uint16_t *unres_total) {
     unreached_set unreached = { NULL, 0, 0 };
-    if (!body || !body_len) return;
+    if (!body || !body_len || channel_is_e2e(db, channel_id)) return;
     oc_mention m[OC_MENTION_MAX];
     size_t n = oc_mention_scan((const char *)body, body_len, m, OC_MENTION_MAX);
     if (n > OC_MENTION_MAX) n = OC_MENTION_MAX;   /* the rest are ignored, not an error */
@@ -4337,6 +4350,9 @@ static void drop_draft(sqlite3 *db, uint64_t user_id, uint64_t channel_id, uint6
 #define OC_FORWARD_EXCERPT_MAX 240
 static void store_forward(sqlite3 *db, uint64_t mid, const oc_job *j) {
     if (!j->src_channel || !j->src_message) return;
+    /* Nothing goes into or out of an encrypted DM this way: its text is
+     * ciphertext, and an excerpt of it here would be one in plain view. */
+    if (channel_is_e2e(db, j->src_channel) || channel_is_e2e(db, j->channel_id)) return;
     if (!channel_read_access(db, j->src_channel, j->user_id)) return;
 
     sqlite3_stmt *st = NULL;
@@ -4431,6 +4447,9 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     if (acc == CH_UNKNOWN) { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
     if (acc == CH_DENIED)  { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
     if (acc == CH_ARCHIVED){ r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
+    /* An encrypted DM carries text only: no files, no forwards (PRIVATE-DM.md). */
+    r->ch_e2e = (uint8_t)channel_is_e2e(db, j->channel_id);
+    if (r->ch_e2e && (j->n_attach || j->src_message)) { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
 
     uint64_t ts = dbw_now_ms();
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
@@ -4542,6 +4561,7 @@ static oc_dbres *process_edit(sqlite3 *db, const oc_job *j) {
     if (author != j->user_id) {   /* no moderator edit — author only (REQ-032) */
         r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
+    if (e2e_closed(db, j->channel_id)) { r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
 
     uint64_t ts = dbw_now_ms();
     sqlite3_stmt *st = NULL;
@@ -4573,6 +4593,7 @@ static oc_dbres *process_edit(sqlite3 *db, const oc_job *j) {
     sum_purge_msg(db, j->message_id);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
+    r->ch_e2e = (uint8_t)channel_is_e2e(db, j->channel_id);
     r->type = OC_RES_EDIT_OK;
     r->author_id = author;
     r->server_time = ts;   /* edited_at_ms */
@@ -4664,6 +4685,16 @@ static void holds_purge(sqlite3 *db, uint64_t now, uint64_t window) {
  * the files' ids, the reactions. */
 static void hold_deleted(sqlite3 *db, uint64_t message_id, uint64_t by, uint64_t at) {
     sqlite3_stmt *st = NULL;
+    {   /* An encrypted DM's message is not kept for an undo: its key is gone. */
+        uint64_t cid = 0;
+        if (sqlite3_prepare_v2(db, "SELECT channel_id FROM messages WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)message_id);
+            if (sqlite3_step(st) == SQLITE_ROW) cid = (uint64_t)sqlite3_column_int64(st, 0);
+        }
+        sqlite3_finalize(st);
+        st = NULL;
+        if (cid && channel_is_e2e(db, cid)) return;
+    }
     char ids[OC_MAX_ATTACH * 21 + 1] = "";
     size_t n = 0;
     sqlite3_prepare_v2(db, "SELECT id FROM attachments WHERE message_id=? ORDER BY id;", -1, &st, NULL);
@@ -4791,6 +4822,7 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
     if (author != j->user_id && !oc_role_can_moderate(get_role(db, j->user_id))) {
         r->type = OC_RES_DELETE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
+    if (e2e_closed(db, j->channel_id)) { r->type = OC_RES_DELETE_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
 
     uint64_t ts = dbw_now_ms();
     holds_purge(db, ts, w->restore_window_ms);
@@ -4858,7 +4890,7 @@ static int load_channel_info(sqlite3 *db, uint64_t channel_id, uint64_t actor, o
     sqlite3_stmt *st = NULL;
     int found = 0;
     sqlite3_prepare_v2(db,
-        "SELECT kind, name, is_public, created_at_ms, topic, archived_at_ms "
+        "SELECT kind, name, is_public, created_at_ms, topic, archived_at_ms, e2e "
         "  FROM channels WHERE id=?;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
@@ -4872,6 +4904,7 @@ static int load_channel_info(sqlite3 *db, uint64_t channel_id, uint64_t actor, o
         const unsigned char *tp = sqlite3_column_text(st, 4);
         r->ch_topic      = (tp && tp[0]) ? strdup((const char *)tp) : NULL;
         r->ch_archived   = (uint8_t)(sqlite3_column_type(st, 5) != SQLITE_NULL);
+        r->ch_e2e        = (uint8_t)(sqlite3_column_int(st, 6) != 0);
         r->channel_id    = channel_id;
         found = 1;
     }
@@ -5153,7 +5186,7 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
          * skipped: "(deleted)" is not a useful thing to show as the latest
          * activity, and the row below it usually is. An action's preview is its
          * action text, flagged, so the client reads "<author> <text>" (REQ-058). */
-        "  (SELECT substr(COALESCE(x.body,''),1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=x.id),0),?2) FROM messages x "
+        "  (SELECT substr(CASE WHEN (SELECT e2e FROM channels WHERE id=x.channel_id)=1 THEN '' ELSE COALESCE(x.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=x.id),0),?2) FROM messages x "
         "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.deleted_at_ms IS NULL "
         "     ORDER BY x.id DESC LIMIT 1), "
         "  COALESCE((SELECT x.author_id FROM messages x "
@@ -5161,7 +5194,8 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         "     ORDER BY x.id DESC LIMIT 1),0), "
         "  COALESCE((SELECT EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=x.id) FROM messages x "
         "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.deleted_at_ms IS NULL "
-        "     ORDER BY x.id DESC LIMIT 1),0) "
+        "     ORDER BY x.id DESC LIMIT 1),0), "
+        "  c.e2e "
         "FROM channels c WHERE "
         "  (c.kind='channel' AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1))) "
         "  OR (c.kind='dm' AND EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1)) "
@@ -5200,6 +5234,9 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         arr[n].preview         = (pv && pv[0]) ? strdup((const char *)pv) : NULL;
         arr[n].preview_author  = (uint64_t)sqlite3_column_int64(st, 12);
         arr[n].preview_action  = (uint8_t)(sqlite3_column_int(st, 13) != 0);
+        arr[n].e2e             = (uint8_t)(sqlite3_column_int(st, 14) != 0);
+        /* An encrypted DM's latest body is ciphertext: no preview of it. */
+        if (arr[n].e2e) { free(arr[n].preview); arr[n].preview = NULL; arr[n].preview_action = 0; }
         arr[n].n_peers         = 0;
         n++;
     }
@@ -5344,7 +5381,9 @@ static oc_dbres *process_remove_channel(sqlite3 *db, const oc_job *j) {
  * Idempotent — an existing DM is returned rather than a duplicate created.
  * Replies CHANNEL_INFO (kind=DM), pushed to the peer (not for a self-DM).
  * Messaging/backfill/search then work through the normal membership path. */
+static oc_dbres *process_open_e2e_dm(sqlite3 *db, const oc_job *j);
 static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
+    if (j->e2e) return process_open_e2e_dm(db, j);
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
@@ -5406,6 +5445,145 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
     r->ch_peer = other;                      /* the DM's other participant (self for a self-DM) */
     r->push_user_id = self_dm ? 0 : other;   /* no peer to push a self-DM to */
     return r;
+}
+
+/* An encrypted DM's channel (PRIVATE-DM.md): a DM like any other, marked
+ * `e2e`, made new for each conversation -- its `dm_key` carries the time and a
+ * counter, so it never meets the pair's ordinary DM or an earlier encrypted one
+ * under the unique index. Answered as CHANNEL_INFO with `pdm_open` set, and
+ * channel_id 0 when it could not be made; the net loop goes on with the
+ * invitation, and pushes it to nobody until it is accepted. */
+static oc_dbres *process_open_e2e_dm(sqlite3 *db, const oc_job *j) {
+    static uint64_t seq;
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_CHANNEL_INFO;
+    r->pdm_open = 1;
+    r->ch_peer = j->target_user_id;
+    uint64_t self = j->user_id, other = j->target_user_id;
+    uint8_t trole = OC_ROLE_MEMBER;
+    if (!other || other == self || !user_role(db, other, &trole)) return r;
+    char key[96];
+    snprintf(key, sizeof key, "e:%llu,%llu:%llu.%llu",
+             (unsigned long long)(self < other ? self : other), (unsigned long long)(self < other ? other : self),
+             (unsigned long long)dbw_now_ms(), (unsigned long long)++seq);
+    sqlite3_stmt *st = NULL;
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_prepare_v2(db,
+        "INSERT INTO channels(kind,name,is_public,created_at_ms,dm_key,e2e) VALUES('dm',NULL,0,?1,?2,1);",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+    sqlite3_bind_text(st, 2, key, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL); return r; }
+    uint64_t cid = (uint64_t)sqlite3_last_insert_rowid(db);
+    add_membership(db, cid, self);
+    add_membership(db, cid, other);
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    load_channel_info(db, cid, self, r);
+    r->ch_peer = other;
+    return r;
+}
+
+/* An encrypted DM ended: closed, as an archived channel is, so nothing more is
+ * posted to it; the maintenance pass removes it a day later. */
+static oc_dbres *process_e2e_close(sqlite3 *db, const oc_job *j) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE channels SET archived_at_ms=?1 WHERE id=?2 AND e2e=1 AND archived_at_ms IS NULL;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    return NULL;
+}
+
+/* 1 when the channel is an encrypted DM: its bodies are ciphertext, and what
+ * reads a body (previews, mentions, actions, transcripts, forwards) leaves it be. */
+static int channel_is_e2e(sqlite3 *db, uint64_t channel_id) {
+    sqlite3_stmt *st = NULL;
+    int e2e = 0;
+    if (sqlite3_prepare_v2(db, "SELECT e2e FROM channels WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        if (sqlite3_step(st) == SQLITE_ROW) e2e = sqlite3_column_int(st, 0) != 0;
+    }
+    sqlite3_finalize(st);
+    return e2e;
+}
+
+/* 1 when the channel is an encrypted DM that has ended: closed for good, so
+ * what was said in it is not edited, deleted or reacted to either. */
+static int e2e_closed(sqlite3 *db, uint64_t channel_id) {
+    sqlite3_stmt *st = NULL;
+    int closed = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM channels WHERE id=?1 AND e2e=1 AND archived_at_ms IS NOT NULL;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        closed = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return closed;
+}
+
+/* Remove a channel and every row about it: those naming it (channel_id), and
+ * those naming one of its messages (message_id), whatever table they are in --
+ * found from the schema, so a table added later is not missed. */
+static void purge_channel(sqlite3 *db, uint64_t cid) {
+    sqlite3_stmt *t = NULL;
+    char names[64][64]; int is_msg[64]; int n = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT m.name, p.name FROM sqlite_master m JOIN pragma_table_info(m.name) p "
+            " WHERE m.type='table' AND m.name NOT IN ('messages','channels') AND m.name NOT LIKE 'messages_fts%' "
+            "   AND p.name IN ('channel_id','message_id');", -1, &t, NULL) == SQLITE_OK) {
+        while (sqlite3_step(t) == SQLITE_ROW && n < 64) {
+            snprintf(names[n], sizeof names[n], "%s", (const char *)sqlite3_column_text(t, 0));
+            is_msg[n] = strcmp((const char *)sqlite3_column_text(t, 1), "message_id") == 0;
+            n++;
+        }
+    }
+    sqlite3_finalize(t);
+    for (int i = 0; i < n; i++) {
+        char sql[256];
+        if (is_msg[i])
+            snprintf(sql, sizeof sql, "DELETE FROM \"%.63s\" WHERE message_id IN (SELECT id FROM messages WHERE channel_id=?1);", names[i]);
+        else
+            snprintf(sql, sizeof sql, "DELETE FROM \"%.63s\" WHERE channel_id=?1;", names[i]);
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)cid);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    }
+    const char *last[] = { "DELETE FROM messages WHERE channel_id=?1;", "DELETE FROM channels WHERE id=?1;" };
+    for (int i = 0; i < 2; i++) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, last[i], -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)cid);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    }
+}
+
+/* Encrypted DMs a day after they closed go, every row of them. */
+#define E2E_KEEP_MS (24ull * 60 * 60 * 1000)
+static void purge_closed_e2e(sqlite3 *db, uint64_t now) {
+    uint64_t ids[256]; int n = 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT id FROM channels WHERE e2e=1 AND archived_at_ms IS NOT NULL AND archived_at_ms < ?1 LIMIT 256;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)(now > E2E_KEEP_MS ? now - E2E_KEEP_MS : 0));
+        while (sqlite3_step(st) == SQLITE_ROW && n < 256) ids[n++] = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (!n) return;
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    for (int i = 0; i < n; i++) purge_channel(db, ids[i]);
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 }
 
 /* Custom emoji (REQ-072).
@@ -5904,6 +6082,7 @@ static oc_dbres *process_save_item(sqlite3 *db, const oc_job *j) {
     uint64_t cid = (sqlite3_step(st) == SQLITE_ROW) ? (uint64_t)sqlite3_column_int64(st, 0) : 0;
     sqlite3_finalize(st);
     if (!cid) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r; }
+    if (channel_is_e2e(db, cid)) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
     if (!is_member(db, cid, j->user_id)) {
         r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
     }
@@ -6020,7 +6199,7 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
     if (j->act_filter != OC_ACTF_INVOLVED) {
         static const char *USQL =
             "SELECT ?5 AS kind, m.id, m.channel_id, m.author_id, m.created_at_ms, "
-            "       substr(COALESCE(m.body,''),1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0),?2) AS text, EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) AS act "
+            "       substr(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0),?2) AS text, EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) AS act "
             "  FROM messages m "
             "  JOIN channel_members cm ON cm.channel_id = m.channel_id AND cm.user_id = ?1 "
             "  JOIN channels c ON c.id = m.channel_id "
@@ -6067,7 +6246,7 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
         /* --- mentions of me --- */
         "  SELECT 0 AS kind, mn.message_id AS message_id, mn.channel_id AS channel_id, "
         "         m.author_id AS actor_id, m.created_at_ms AS at, "
-        "         substr(COALESCE(m.body,''),1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0),?2) AS text, EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) AS act "
+        "         substr(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0),?2) AS text, EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) AS act "
         "    FROM mentions mn JOIN messages m ON m.id = mn.message_id "
         /* Mine -- by name, keyword or group (0, 4, 5) -- or a broadcast
          * (1, 2, 3), named as push.c names them: `kind <> 0` also let in
@@ -6096,7 +6275,7 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
         "  UNION ALL "
         /* --- replies under something I wrote --- */
         "  SELECT 2, c.id, c.channel_id, c.author_id, c.created_at_ms, "
-        "         substr(COALESCE(c.body,''),1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=c.id),0),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=c.id) "
+        "         substr(CASE WHEN (SELECT e2e FROM channels WHERE id=c.channel_id)=1 THEN '' ELSE COALESCE(c.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=c.id),0),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=c.id) "
         "    FROM messages c JOIN messages p ON p.id = c.parent_id "
         "   WHERE p.author_id = ?1 AND c.author_id <> ?1 AND c.deleted_at_ms IS NULL "
         "     AND EXISTS(SELECT 1 FROM channel_members cm "
@@ -6174,6 +6353,7 @@ static oc_dbres *process_pin(sqlite3 *db, const oc_job *j) {
     if (!is_member(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_PIN_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
     }
+    if (channel_is_e2e(db, j->channel_id)) { r->type = OC_RES_PIN_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
 
     uint64_t now = dbw_now_ms();
     if (j->pin_op == OC_PIN_ADD) {
@@ -6300,6 +6480,7 @@ static oc_dbres *process_react(sqlite3 *db, const oc_job *j) {
     if (!channel_read_access(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_REACTION_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
     }
+    if (e2e_closed(db, j->channel_id)) { r->type = OC_RES_REACTION_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
 
     sqlite3_stmt *st = NULL;
     if (j->react_op == OC_REACT_ADD) {
@@ -6434,6 +6615,8 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     if (acc == CH_UNKNOWN) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
     if (acc == CH_DENIED)  { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
     if (acc == CH_ARCHIVED){ r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
+    r->ch_e2e = (uint8_t)channel_is_e2e(db, j->channel_id);
+    if (r->ch_e2e && (j->n_attach || j->src_message)) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
 
     uint64_t ts = dbw_now_ms();
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
@@ -6618,10 +6801,10 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
         "JOIN channels c ON c.id = m.channel_id "
         "WHERE m.deleted_at_ms IS NULL "
         /* A call event (REQ-304) is history, not something anyone said. */
-        "  AND m.kind = 0 "
+        "  AND m.kind = 0 AND c.e2e = 0 "
         "  AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members cm "
         "       WHERE cm.channel_id=m.channel_id AND cm.user_id=?2)) ",
-        have_text ? "snippet(messages_fts, 0, '', '', ' ... ', 12)" : "substr(COALESCE(m.body,''),1,160)",
+        have_text ? "snippet(messages_fts, 0, '', '', ' ... ', 12)" : "substr(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,1,160)",
         have_text ? "messages_fts JOIN" : "",
         have_text ? "ON m.id = messages_fts.rowid" : "");
     if (have_text) k += snprintf(sql + k, sizeof sql - (size_t)k, " AND messages_fts MATCH ?1 ");
@@ -7289,6 +7472,7 @@ static oc_dbres *process_attach_create(sqlite3 *db, const oc_job *j) {
     if (acc == CH_UNKNOWN) { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
     if (acc == CH_DENIED)  { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
     if (acc == CH_ARCHIVED){ r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
+    if (channel_is_e2e(db, j->channel_id)) { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
 
     /* Idempotent replay, the same contract SEND honours: a known
      * (channel, token) hands back the row the first attempt minted rather than
@@ -7559,6 +7743,7 @@ static oc_dbres *process_create_webhook(sqlite3 *db, const oc_job *j) {
     if (acc == CH_UNKNOWN) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
     if (acc == CH_DENIED)  { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
     if (acc == CH_ARCHIVED){ r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
+    if (channel_is_e2e(db, j->channel_id)) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
 
     uint8_t token[OC_SESSION_TOKEN_LEN], hash[OC_SHA256_LEN];
     if (oc_rand_bytes(token, sizeof token) != 0 || oc_sha256(token, sizeof token, hash) != 0) {
@@ -8198,7 +8383,7 @@ static oc_dbres *process_list_threads(sqlite3 *db, const oc_job *j) {
         "       COALESCE((SELECT tf.state FROM thread_follows tf "
         "                  WHERE tf.user_id = ?1 AND tf.root_id = r.id), 1) AS following, "
         /* An action root previews as its action text, flagged (REQ-058). */
-        "       substr(COALESCE(r.body,''),1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=r.id),0),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=r.id) "
+        "       substr(CASE WHEN (SELECT e2e FROM channels WHERE id=r.channel_id)=1 THEN '' ELSE COALESCE(r.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=r.id),0),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=r.id) "
         "  FROM messages r "
         "  JOIN channel_members cm ON cm.channel_id = r.channel_id AND cm.user_id = ?1 "
         " WHERE r.parent_id IS NULL AND r.deleted_at_ms IS NULL "
@@ -8245,7 +8430,7 @@ static void build_thread_one(sqlite3 *db, uint64_t uid, uint64_t root_id, oc_dbr
         "       COALESCE((SELECT tf.state FROM thread_follows tf "
         "                  WHERE tf.user_id = ?1 AND tf.root_id = r.id), 1), "
         /* An action root previews as its action text, flagged (REQ-058). */
-        "       substr(COALESCE(r.body,''),1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=r.id),0),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=r.id) "
+        "       substr(CASE WHEN (SELECT e2e FROM channels WHERE id=r.channel_id)=1 THEN '' ELSE COALESCE(r.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=r.id),0),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=r.id) "
         "  FROM messages r WHERE r.id = ?3;";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, SQL, -1, &st, NULL) != SQLITE_OK) return;
@@ -8710,6 +8895,7 @@ static oc_dbres *process_set_draft(sqlite3 *db, const oc_job *j) {
     if (j->channel_id && !channel_read_access(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
     }
+    if (channel_is_e2e(db, j->channel_id) && j->channel_id) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
     size_t blen = j->body_len > OC_DRAFT_BODY_MAX ? OC_DRAFT_BODY_MAX : j->body_len;
     /* One reading, used for the stored row and the echoed one: two calls can
      * straddle a millisecond, and a device that compares them would think the
@@ -8871,6 +9057,7 @@ static oc_dbres *process_schedule(sqlite3 *db, const oc_job *j) {
     if (!j->channel_id || !is_member(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
     }
+    if (channel_is_e2e(db, j->channel_id)) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
     /* An empty scheduled message is refused rather than stored: there is nothing
      * to deliver, and a row that fires into nothing at 09:00 is worse than a
      * refusal now. BODY_TOO_LARGE would be a lie about which end of the range
@@ -9392,8 +9579,9 @@ static oc_dbres *process_tts_lookup(sqlite3 *db, const oc_job *j) {
     if (body_copy) memcpy(body_copy, body, body_len);
     sqlite3_finalize(st);
 
-    /* The same gate as reading the message: speech is the message (REQ-291). */
-    if (!channel_read_access(db, cid, j->user_id)) {
+    /* The same gate as reading the message: speech is the message (REQ-291).
+     * An encrypted DM's is ciphertext, nothing to say (PRIVATE-DM.md). */
+    if (!channel_read_access(db, cid, j->user_id) || channel_is_e2e(db, cid)) {
         free(body_copy);
         r->err_code = OC_ERR_FORBIDDEN;
         return r;
@@ -10131,6 +10319,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_INVITE_CHANNEL) return process_invite_channel(w->db, j);
     if (j->type == OC_JOB_REMOVE_CHANNEL) return process_remove_channel(w->db, j);
     if (j->type == OC_JOB_OPEN_DM)        return process_open_dm(w->db, j);
+    if (j->type == OC_JOB_E2E_CLOSE)      return process_e2e_close(w->db, j);
     if (j->type == OC_JOB_OPEN_GROUP_DM) return process_open_group_dm(w->db, j);
     if (j->type == OC_JOB_ADD_EMOJI)      return process_add_emoji(w->db, j);
     if (j->type == OC_JOB_DELETE_EMOJI)   return process_delete_emoji(w->db, j);
@@ -10400,6 +10589,8 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
 
     /* Age out the audit log alongside the blobs (REQ-251a), per family. */
     prune_audit(db, j->audit_max_age_ms);
+    /* Encrypted DMs closed a day ago (PRIVATE-DM.md). */
+    purge_closed_e2e(db, now);
     /* Summary notices a day after they were seen; unseen ones stay. */
     if (sqlite3_prepare_v2(db, "DELETE FROM summary_notices WHERE seen_at_ms IS NOT NULL AND seen_at_ms < ?1;", -1,
                            &st, NULL) == SQLITE_OK) {
@@ -11236,6 +11427,18 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
         sqlite3_free(err); goto fail;
     }
     if (schema_before < 60) index_mentions(w->db);
+    /* An encrypted DM's keys were on its two devices, joined through the daemon
+     * that stopped: none still open can go on, so each is closed now, and the
+     * maintenance pass removes it a day later (PRIVATE-DM.md). */
+    {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(w->db, "UPDATE channels SET archived_at_ms=?1 WHERE e2e=1 AND archived_at_ms IS NULL;",
+                               -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    }
     /* The summary queue outlives the daemon, its connections do not: every
      * request waits again, watched by nobody, and is made and told as a notice
      * (migration 0059). */
