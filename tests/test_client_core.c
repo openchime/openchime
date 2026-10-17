@@ -1066,6 +1066,25 @@ static void test_groups_model(void) {
     oc_model_free(&m);
 }
 
+/* A roster asked for twice before either answer came lists each member once
+ * (two clears, then both answers): the second answer updates, it does not add. */
+static void test_chanmem_overlap(void) {
+    oc_model m; oc_model_init(&m);
+    oc_model_chanmem_begin(&m, 10);
+    oc_model_chanmem_begin(&m, 10);          /* opened, then refreshed */
+    for (int pass = 0; pass < 2; pass++)     /* both answers arrive */
+        for (uint64_t uid = 1; uid <= 2; uid++) {
+            oc_ev e; memset(&e, 0, sizeof e);
+            e.type = OC_EV_CHAN_MEMBER; e.channel_id = 10; e.user_id = uid;
+            e.status = (uint8_t)(pass ? OC_ROLE_ADMIN : OC_ROLE_MEMBER); e.server_time = 100 + (uint64_t)pass;
+            oc_model_apply(&m, &e);
+        }
+    CHECK(m.n_chanmem == 2);
+    CHECK(m.chanmem[0].user_id == 1 && m.chanmem[1].user_id == 2);
+    CHECK(m.chanmem[0].role == OC_ROLE_ADMIN && m.chanmem[0].joined_at == 101);   /* the later answer */
+    oc_model_free(&m);
+}
+
 static void test_group_dm_title(void) {
     oc_model m; oc_model_init(&m);
     m.user_id = 1;                                  /* signed in as alice */
@@ -4882,6 +4901,7 @@ int run_client_core_tests(void) {
     test_group_dm_title();
     test_action_pairing();
     test_groups_model();
+    test_chanmem_overlap();
     test_sidebar();
     test_new_channel_takes_the_default_level();
     test_channel_info_seq();
