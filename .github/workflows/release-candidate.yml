@@ -107,6 +107,11 @@ jobs:
     needs: branch
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    # Reading the commit's runs needs `actions: read`: the workflow grants only
+    # `contents: read`, and the runs API is refused without it.
+    permissions:
+      contents: read
+      actions: read
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
