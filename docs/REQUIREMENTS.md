@@ -190,7 +190,7 @@ where one exists.
   **SAML 2.0**, and that is a deliberate exclusion — so an organization whose
   procurement mandates SAML is unserved. The ARCH-55-consistent path, were it
   ever wanted, is central terminating SAML and re-issuing the same ES256 JWT (a
-  control-plane concern in `openchime-saas`, not a daemon one).
+  control-plane concern, not a daemon one).
 
   **The exact position, stated so it is never inferred from a tick in a table:**
 
@@ -594,7 +594,7 @@ where one exists.
   durability, and therefore the deployment's recovery point objective, has been
   a property of the deployment rather than of the daemon** (ARCH-3): in the
   hosted model the operator of the box has provided continuous replication and
-  stated an RPO (implemented in the `openchime-saas` repo, not this one); in the
+  stated an RPO (implemented in the control plane, not this repo); in the
   self-hosted models the operator has backed up the SQLite file by their own
   means, and their RPO has been whatever that backup schedule gives them. The
   daemon has neither required nor assumed any particular backup mechanism.

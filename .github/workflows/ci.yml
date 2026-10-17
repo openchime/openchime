@@ -1,9 +1,9 @@
 name: ci
 
 # Runs on every pull request into staging and every push to staging -- the
-# checks staging's branch protection requires before a merge -- and is called by
-# promote.yml as its gate (release.yml does not run it again). Three jobs, on
-# three machines at once, and nothing checked twice:
+# checks staging's branch protection requires before a merge. The push's run is
+# the gate release-candidate.yml waits for (release.yml does not run it again).
+# Three jobs, on three machines at once, and nothing checked twice:
 #   - build:       the daemon built and started for real (health check plus the
 #                  protocol vertical over TLS), static linking, every Linux
 #                  translation unit through the release's clang (the second
@@ -34,9 +34,8 @@ on:
   # A pull request into staging, where its results are the required checks; and
   # the push that lands on staging, whose run saves the caches every pull request
   # then restores (a cache is visible to a pull request from its base branch, not
-  # from another feature branch). Not main: it reaches CI through release.yml's
-  # workflow_call, and nothing merges to main but a promotion of staging, which
-  # CI already ran.
+  # from another feature branch). Not main: nothing reaches main but a release
+  # of a staging commit, which CI already ran.
   pull_request:
     branches: [staging]
     paths-ignore:
@@ -66,7 +65,7 @@ jobs:
   build:
     name: build + unit tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90   # a cold cache builds the vendored libraries: ~44 min
     steps:
       - uses: actions/checkout@v7
       - name: Install build deps

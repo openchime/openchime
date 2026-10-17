@@ -40,7 +40,7 @@ The codebase splits cleanly by testability:
   that is unreachable from a unit test — the deployed image, TLS termination,
   and the protocol vertical end to end — is proven. Off-box backup is **not**
   exercised here: it is a deployment concern (ARCH-3), and in the hosted model
-  it lives in the `openchime-saas` repo.
+  it lives with the control plane.
 
 A behavior is tested at the lowest tier that can actually observe it. Codec
 edge cases belong in unit tests; "two clients see each other's messages in
@@ -528,7 +528,7 @@ Integration tests run **against the daemon binary CI just built**, started
 directly on the runner and driven by `build/e2e_client`.
 
 **No test anywhere exercises the published container image.** The
-release builds it with buildah and pushes it to GHCR; nothing pulls it, starts
+release builds it with buildah and pushes it to Fly's registry; nothing pulls it, starts
 it or asserts anything about it. A fault confined to the `Dockerfile`, the
 entrypoint (ARCH-39) or the Alpine/musl build would not be caught before it
 reached users. The daemon's own behaviour is covered by the assertions
@@ -780,12 +780,12 @@ answer in frames, a ping's pong, and an unmasked frame ending the connection.
 ## 4. Continuous integration
 
 CI is GitHub Actions (`.github/workflows/ci.yml`). It runs on every **pull
-request into `staging`** and every **push to `staging`**; `candidate.yml` waits
-for that push's run before it builds a candidate, and `promote.yml` (on the
-staging commit being promoted) runs it through `workflow_call`, so a release is
-gated on exactly these jobs and a docs-only staging tip is still tested before
-it is released (RELEASING.md). Doc-only changes skip it
-(`paths-ignore`). Nothing is checked twice: each suite runs once (§2.4), one
+request into `staging`** and every **push to `staging`**; `release-candidate.yml`
+waits for that push's run before it builds a release-candidate, so a release is
+gated on exactly these jobs (RELEASING.md). Doc-only changes skip it
+(`paths-ignore`), so a staging tip whose push was docs-only has no run to wait
+for and is not built into a release-candidate until a change that runs CI lands
+on top of it. Nothing is checked twice: each suite runs once (§2.4), one
 clang compile is both the release-compiler and the second-compiler check, and
 what the release checks itself is not repeated.
 
@@ -829,7 +829,7 @@ silence sweep. Echo cancellation is measured by the ERLE harness in
 impulse response over a far-end signal, near-end speech mixed in, clock drift
 injected by resampling one side, and ERLE in dB asserted.
 
-**Speech.** The candidate build (`candidate.yml`) renders a sentence with read-aloud and requires
+**Speech.** The release-candidate build (`release-candidate.yml`) renders a sentence with read-aloud and requires
 `openchimed --stt-hear` to hear its words, on the stripped binary and on the
 installed `.deb`, so each speech feature checks the other by content; the
 speech suites (`tts_worker`, `stt`, `ttskit`) run in CI.
@@ -1078,7 +1078,7 @@ password sign-ins at a few per second.
 ## 6. Running the federated stack by hand
 
 Runs the whole federated system on one machine — the C daemon enrolled against the
-.NET control plane (`openchime-saas`), with a client driving the two daemon→central
+.NET control plane, with a client driving the two daemon→central
 outbound wires (enrollment, ARCH-84; push, ARCH-85). Verified end to end.
 
 ### What it proves

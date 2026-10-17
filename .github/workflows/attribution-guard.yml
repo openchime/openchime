@@ -14,8 +14,8 @@ name: attribution-guard
 # $others` cancelled out the pushed commit and a tag pointing at a commit reachable
 # from no branch was never scanned. The fork never got that fix, which is why it was
 # replaced by a call. Inlining re-creates that risk deliberately -- the hub is going
-# away -- so a fix made here must be made in every other copy: the six game repos and
-# bronzeventure. There is no shared copy left to be the source of truth.
+# away -- so a fix made here must be made in every other copy. There is no shared copy
+# left to be the source of truth.
 #
 on:
   push:
@@ -115,14 +115,14 @@ jobs:
 
       # The default branch is remediated by a HUMAN, not by this step.
       #
-      # main takes no update but a promotion: a ruleset refuses every push, force or not,
+      # main takes no update but a release: a ruleset refuses every push, force or not,
       # except from the release deploy key, so the force-reset this step used to attempt
       # (PATCH .../git/refs/heads/main with force=true) is refused. It never worked, while
       # the header comment promised the branch was reset "within seconds".
       #
       # What actually protects main is upstream of it. This job is a REQUIRED status check
-      # on pull requests into staging, so a violating commit cannot merge; and promote.yml
-      # refuses to fast-forward main to a staging commit this guard did not pass on. If one
+      # on pull requests into staging, so a violating commit cannot merge; and no
+      # release-candidate is built from a staging commit this guard did not pass on. If one
       # reaches main anyway (an admin override on the ruleset) it STAYS there until removed
       # by hand -- that is the real behaviour, and it is the documented one.
       #
@@ -140,7 +140,9 @@ jobs:
           case "$REF" in
             refs/heads/*)
               branch="${REF#refs/heads/}"
-              if [ "$branch" = "$DEFAULT" ]; then
+              # staging is protected like the default branch: a release
+              # candidate is cut from it, and deleting it would lose its place.
+              if [ "$branch" = "$DEFAULT" ] || [ "$branch" = staging ]; then
                 echo "::warning::$branch is protected and cannot be reset automatically. \
           The offending commit is still on $branch and must be removed by hand \
           (git rebase -i / git reset, then a force push by an admin with protection \

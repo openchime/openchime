@@ -1,13 +1,19 @@
-# Build a candidate from a staging commit (ARCH-20, docs/RELEASING.md).
+# Build a release-candidate from a staging commit (ARCH-20, docs/RELEASING.md).
 #
-# Every merge to staging builds everything a release ships -- both daemons
-# with their data, the container images, the Windows clients -- stamped with
-# the BUILD ID, the short commit, and stores the result by that id: the trees
-# and binaries in the staging bucket under candidates/<id>/ with a signed
-# manifest, the images in GHCR as :build-<id>. A release (release.yml, on
-# main) takes exactly that candidate, assigns it a release number, packages
-# and publishes it: no compiler runs on main, and what was verified here is
-# what ships.
+# Dispatched on staging, it builds everything a release ships from the staging
+# tip -- both daemons with their data, the container images, the Windows
+# clients -- stamped with the BUILD ID, the short commit, and stores the result
+# by that id: the trees and binaries in the staging bucket under
+# candidates/<id>/ with a signed manifest, the images in Fly's registry as
+# registry.fly.io/openchime-daemon-staging:build-<id>. It then publishes the
+# release-candidate in this repository: the commit is tagged release-N-rcK (N
+# the number the next release would take, K counting the release-candidates
+# for it), and a prerelease of that tag carries the built files. Last, the
+# commit, the tag and the prerelease are copied to openchime/openchime
+# (sync-public), a convenience nothing here depends on. A release (release.yml)
+# takes exactly one release-candidate, assigns it release-N, packages and
+# publishes it: no compiler runs at release time, and what was verified here
+# is what ships.
 #
 # ONE BINARY PER ARCHITECTURE feeds the .deb, the .rpm, the tarball and the
 # image. It is built with `zig cc` targeting glibc 2.34, the oldest supported
@@ -17,17 +23,17 @@
 # compile inside, so no emulation); the Windows clients cross-compile with
 # llvm-mingw. NOTHING HERE USES DOCKER. The packaging scripts run under a
 # placeholder version so a package that cannot be built or installed stops
-# the candidate; the packages themselves are made again by the release under
-# its number.
-name: candidate
+# the release-candidate; the packages themselves are made again by the release
+# under its number.
+#
+# Start it on staging:  gh workflow run release-candidate.yml --ref staging
+name: release-candidate
 
 on:
-  push:
-    branches: [staging]
   workflow_dispatch:
 
-# One candidate per commit; two runs of one commit would write the same
-# place, so the later waits.
+# One build per commit; two runs of one commit would write the same place, so
+# the later waits.
 concurrency:
   group: candidate-${{ github.sha }}
   cancel-in-progress: false
@@ -35,21 +41,36 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # The build's images, in Fly's registry (basic auth: user x, a Fly deploy
+  # token as the password).
+  STAGING_IMAGE: registry.fly.io/openchime-daemon-staging
+
 jobs:
+  # A release-candidate is a staging commit and nothing else: dispatched on
+  # another ref, the SHA below would be a feature branch. And
+  # openchime/openchime only receives copies; nothing is built there.
   branch:
     name: running on staging
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
-      - name: Refuse any other ref
+      - name: Refuse any other ref or repository
         env:
           REF: ${{ github.ref }}
+          REPO: ${{ github.repository }}
         run: |
+          [ "$REPO" != "openchime/openchime" ] || {
+            echo "::error::release-candidates are not built here"; exit 1; }
           [ "$REF" = "refs/heads/staging" ] || {
-            echo "::error::a candidate is built from staging only (this run is on $REF)"; exit 1; }
+            echo "::error::a release-candidate is built from staging only (this run is on $REF). Use: gh workflow run release-candidate.yml --ref staging"; exit 1; }
 
   # The build id, and the run number the Windows file version carries (the
-  # one numeric, growing field Windows compares; docs/RELEASING.md).
+  # one numeric, growing field Windows compares; docs/RELEASING.md). The run
+  # number is this workflow's plus RUN_NUMBER_OFFSET, a repository variable
+  # (0 when unset): run numbers count from 1 again when the workflow is
+  # renamed or moved, and the file version must keep growing past every
+  # build already shipped.
   id:
     name: build id
     needs: branch
@@ -57,16 +78,30 @@ jobs:
     timeout-minutes: 2
     outputs:
       build_id: ${{ steps.id.outputs.build_id }}
-      run_number: ${{ github.run_number }}
+      run_number: ${{ steps.id.outputs.run_number }}
     steps:
       - id: id
+        env:
+          OFFSET: ${{ vars.RUN_NUMBER_OFFSET }}
         run: |
+          set -euo pipefail
+          offset="${OFFSET:-0}"
+          printf '%s' "$offset" | grep -qE '^[0-9]+$' || {
+            echo "::error::RUN_NUMBER_OFFSET is '${offset}', not a whole number"; exit 1; }
+          run=$(( GITHUB_RUN_NUMBER + offset ))
           echo "build_id=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
-          echo "build ${GITHUB_SHA:0:7} (${GITHUB_SHA}), run ${GITHUB_RUN_NUMBER}"
+          echo "run_number=${run}" >> "$GITHUB_OUTPUT"
+          echo "build ${GITHUB_SHA:0:7} (${GITHUB_SHA}), run ${run} (${GITHUB_RUN_NUMBER} + ${offset})"
 
-  # The push that lands on staging also starts ci.yml, attribution-guard and
-  # commit-policy on this commit. Waited for rather than run again: the same
-  # jobs twice would double every merge's cost. Anything but success refuses.
+  # The push that landed this commit on staging started ci.yml,
+  # attribution-guard and commit-policy on it. Waited for (or found finished)
+  # rather than run again: the same jobs twice would double the cost.
+  # Anything but success refuses.
+  #
+  # A commit that changes only what ci.yml's paths-ignore lists (*.md,
+  # .gitignore) starts no CI run, so waiting for one would time out: such a
+  # commit counts as passed for ci. attribution-guard and commit-policy run on
+  # every push and are still required.
   gate:
     name: gate on CI
     needs: branch
@@ -75,9 +110,28 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
       - run: |
           set -euo pipefail
+          docs_only=1
+          if ! changed=$(git diff --name-only "${GITHUB_SHA}^" "$GITHUB_SHA"); then
+            docs_only=0
+          fi
+          [ -n "$changed" ] || docs_only=0
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in
+              *.md|.gitignore) ;;
+              *) docs_only=0 ;;
+            esac
+          done <<<"$changed"
           for wf in ci attribution-guard commit-policy; do
+            if [ "$wf" = ci ] && [ "$docs_only" = 1 ]; then
+              echo "ci: docs-only commit: CI skips it; treated as passed"
+              continue
+            fi
             for i in $(seq 1 110); do
               state=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${GITHUB_SHA}&event=push&branch=staging" \
                         --jq "[.workflow_runs[] | select(.name == \"${wf}\") | .conclusion] | first // \"pending\"")
@@ -85,7 +139,7 @@ jobs:
               sleep 30
             done
             [ "$state" = "success" ] || {
-              echo "::error::${wf} has not passed on ${GITHUB_SHA:0:7} (state: ${state}); no candidate is built from it"; exit 1; }
+              echo "::error::${wf} has not passed on ${GITHUB_SHA:0:7} (state: ${state}); no release-candidate is built from it"; exit 1; }
             echo "${wf}: success on ${GITHUB_SHA:0:7}"
           done
 
@@ -548,24 +602,24 @@ jobs:
   # with no compile and no RUN step inside it, so an arm64 image comes off the
   # x86 runner with `--arch arm64` and no emulation. The per-arch images and
   # the manifest list that indexes them are two jobs; the per-arch tags are an
-  # implementation detail, nothing is documented as pullable until a release
-  # re-tags the manifest list as :N (release.yml). Pushed under the build id
-  # every time: a candidate is complete only with its image in the registry.
+  # implementation detail, nothing is tagged as a release until a release
+  # copies the manifest list to :N (release.yml). Pushed under the build id to
+  # the staging registry, registry.fly.io/openchime-daemon-staging, every time:
+  # a build is complete only with its image there. Fly's registry takes basic
+  # auth, user x and a deploy token, FLY_REGISTRY_TOKEN_STAGING in the
+  # `release` environment.
   image:
     name: ${{ matrix.arch }} image
     needs: [id, packages]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: write
+    environment: release
     strategy:
       fail-fast: false
       matrix:
         arch: [amd64, arm64]
     env:
       BUILD_ID: ${{ needs.id.outputs.build_id }}
-      IMAGE: ghcr.io/${{ github.repository_owner }}/openchime
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -586,13 +640,13 @@ jobs:
           packaging/image-context.sh "candidate/linux-${{ matrix.arch }}/openchimed-build-${BUILD_ID}-linux-${{ matrix.arch }}.tar.gz" image
           buildah build --arch "${{ matrix.arch }}" \
             -f Dockerfile \
-            -t "${IMAGE}:build-${BUILD_ID}-${{ matrix.arch }}" \
+            -t "${STAGING_IMAGE}:build-${BUILD_ID}-${{ matrix.arch }}" \
             image
       # The image as it ships, started as the hosted model starts it (ARCH-76):
       # podman is daemonless and reads buildah's store, so no Docker comes back
       # (ARCH-36). /healthz answering proves the entrypoint, the data directory,
       # the binary on this base and the data beside it hold together; before
-      # this a fault in any of them reached GHCR unchallenged, since nothing
+      # this a fault in any of them reached the registry unchallenged, since nothing
       # pulled or ran the image. The arm64 image is build-only here, as its
       # binary is: the runner cannot run it without emulation.
       - name: Start the image and ask it /healthz
@@ -600,7 +654,7 @@ jobs:
         run: |
           set -euo pipefail
           podman run -d --name oc -p 127.0.0.1:18080:8080 \
-            -e OPENCHIME_WORKSPACE_NAME=Image "${IMAGE}:build-${BUILD_ID}-${{ matrix.arch }}"
+            -e OPENCHIME_WORKSPACE_NAME=Image "${STAGING_IMAGE}:build-${BUILD_ID}-${{ matrix.arch }}"
           ok=0
           for i in $(seq 1 60); do
             if curl -fsS http://127.0.0.1:18080/healthz 2>/dev/null | grep -qx OK; then
@@ -612,24 +666,25 @@ jobs:
           podman rm -f oc >/dev/null
           [ "$ok" = 1 ] || { echo "::error::the image did not answer /healthz within 60 s"; exit 1; }
       - name: Push the per-architecture image
+        env:
+          TOKEN: ${{ secrets.FLY_REGISTRY_TOKEN_STAGING }}
         run: |
           set -euo pipefail
-          buildah login -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" ghcr.io
-          buildah push "${IMAGE}:build-${BUILD_ID}-${{ matrix.arch }}"
+          [ -n "$TOKEN" ] || { echo "::error::FLY_REGISTRY_TOKEN_STAGING is not set in the release environment"; exit 1; }
+          printf '%s' "$TOKEN" | buildah login -u x --password-stdin registry.fly.io
+          buildah push "${STAGING_IMAGE}:build-${BUILD_ID}-${{ matrix.arch }}"
 
-  # :build-<id> only. A release re-tags it as :N and moves :latest
-  # (release.yml), so nothing an operator is told to pull exists until then.
+  # :build-<id> only. A release copies it to :N and moves :latest, in the
+  # staging and the production registries (release.yml), so nothing deployed
+  # from :latest exists until then.
   image-manifest:
     name: container image manifest
     needs: [id, image]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    permissions:
-      contents: read
-      packages: write
+    environment: release
     env:
       BUILD_ID: ${{ needs.id.outputs.build_id }}
-      IMAGE: ghcr.io/${{ github.repository_owner }}/openchime
     steps:
       - uses: actions/checkout@v7   # for scripts/build/apt.sh
       - name: Install buildah
@@ -638,14 +693,17 @@ jobs:
           set -euo pipefail
           scripts/build/apt.sh buildah
       - name: Publish the manifest list
+        env:
+          TOKEN: ${{ secrets.FLY_REGISTRY_TOKEN_STAGING }}
         run: |
           set -euo pipefail
-          buildah login -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" ghcr.io
-          buildah manifest create "${IMAGE}:build-${BUILD_ID}"
+          [ -n "$TOKEN" ] || { echo "::error::FLY_REGISTRY_TOKEN_STAGING is not set in the release environment"; exit 1; }
+          printf '%s' "$TOKEN" | buildah login -u x --password-stdin registry.fly.io
+          buildah manifest create "${STAGING_IMAGE}:build-${BUILD_ID}"
           for a in amd64 arm64; do
-            buildah manifest add "${IMAGE}:build-${BUILD_ID}" "docker://${IMAGE}:build-${BUILD_ID}-${a}"
+            buildah manifest add "${STAGING_IMAGE}:build-${BUILD_ID}" "docker://${STAGING_IMAGE}:build-${BUILD_ID}-${a}"
           done
-          buildah manifest push --all "${IMAGE}:build-${BUILD_ID}" "docker://${IMAGE}:build-${BUILD_ID}"
+          buildah manifest push --all "${STAGING_IMAGE}:build-${BUILD_ID}" "docker://${STAGING_IMAGE}:build-${BUILD_ID}"
 
   # The Windows client (ARCH-80/81). It carries the same build id as the
   # daemon even though it is a separate program, so a support question only
@@ -816,9 +874,14 @@ jobs:
     needs: [id, packages, image-manifest, windows-build, windows-package]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # The `release` environment for FLY_REGISTRY_TOKEN_STAGING: the digests
+    # below are read from the staging registry, which needs a login.
+    environment: release
     env:
       BUILD_ID: ${{ needs.id.outputs.build_id }}
-      IMAGE: ghcr.io/${{ github.repository_owner }}/openchime
+      # The offset run number from `id`, which the Windows binaries carry and
+      # the release checks them against; not GITHUB_RUN_NUMBER.
+      RUN_NUMBER: ${{ needs.id.outputs.run_number }}
       DIST_S3_ENDPOINT:           ${{ vars.DIST_S3_ENDPOINT }}
       DIST_S3_STAGING_ACCESS_KEY: ${{ secrets.DIST_S3_STAGING_ACCESS_KEY }}
       DIST_S3_STAGING_SECRET_KEY: ${{ secrets.DIST_S3_STAGING_SECRET_KEY }}
@@ -860,15 +923,19 @@ jobs:
           region = auto
           EOF
       - name: Write and sign the manifest
+        env:
+          FLY_REGISTRY_TOKEN_STAGING: ${{ secrets.FLY_REGISTRY_TOKEN_STAGING }}
         run: |
           set -euo pipefail
+          [ -n "$FLY_REGISTRY_TOKEN_STAGING" ] || { echo "::error::FLY_REGISTRY_TOKEN_STAGING is not set in the release environment"; exit 1; }
           find candidate -type f | sort
           images=""
           for t in "build-${BUILD_ID}-amd64" "build-${BUILD_ID}-arm64" "build-${BUILD_ID}"; do
-            d=$(skopeo inspect --raw "docker://${IMAGE}:${t}" | sha256sum | cut -d' ' -f1)
+            d=$(skopeo inspect --raw --creds "x:${FLY_REGISTRY_TOKEN_STAGING}" \
+                  "docker://${STAGING_IMAGE}:${t}" | sha256sum | cut -d' ' -f1)
             images="$images ${t}=sha256:${d}"
           done
-          scripts/release/candidate_manifest.sh write candidate "$BUILD_ID" "$GITHUB_SHA" "$GITHUB_RUN_NUMBER" "$GITHUB_RUN_ID" $images
+          scripts/release/candidate_manifest.sh write candidate "$BUILD_ID" "$GITHUB_SHA" "$RUN_NUMBER" "$GITHUB_RUN_ID" $images
           scripts/release/candidate_manifest.sh sign candidate
           scripts/release/candidate_manifest.sh verify candidate "$BUILD_ID"
       - name: Store the candidate
@@ -877,12 +944,11 @@ jobs:
           rclone copy candidate "dist-staging:${DIST_STAGING_BUCKET}/candidates/${BUILD_ID}" --fast-list
           echo "stored candidates/${BUILD_ID} in ${DIST_STAGING_BUCKET}"
           {
-            echo "### Candidate \`${BUILD_ID}\`"
+            echo "### Build \`${BUILD_ID}\`"
             echo
-            echo "- commit \`${GITHUB_SHA}\`, run ${GITHUB_RUN_NUMBER}"
+            echo "- commit \`${GITHUB_SHA}\`, run ${RUN_NUMBER}"
             echo "- \`candidates/${BUILD_ID}/\` in \`${DIST_STAGING_BUCKET}\`"
-            echo "- image \`${IMAGE}:build-${BUILD_ID}\`"
-            echo "- to release it: \`gh workflow run promote.yml --ref staging\`"
+            echo "- image \`${STAGING_IMAGE}:build-${BUILD_ID}\`"
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
@@ -890,8 +956,9 @@ jobs:
           path: candidate
           if-no-files-found: error
 
-  # Candidates older than thirty days that no release names are deleted; the
-  # tags say which build ids were released, and those stay.
+  # Builds older than thirty days that no tag names are deleted; the tags say
+  # which build ids were released, or are standing release-candidates, and
+  # those stay.
   prune:
     name: prune old candidates
     needs: store
@@ -936,3 +1003,200 @@ jobs:
                 rclone purge "dist-staging:${DIST_STAGING_BUCKET}/candidates/${id}"
               done
           echo "pruned"
+
+  # The release-candidate, published in this repository: the commit is tagged
+  # release-N-rcK, and a prerelease of that tag carries the built files: the
+  # Linux trees, the Windows binaries and the GUI's debug symbols, exactly as
+  # stored above. N is the number the next release would take
+  # (scripts/release/version.sh, which counts release-N tags only); K is one
+  # past the highest release-candidate already tagged for N. The tag is pushed
+  # and the prerelease made with the job's own token.
+  #
+  # Serialised with release.yml, whose runs share the `release` group: a
+  # release removes the release-candidates of its number when it finishes, so
+  # one tagged for that number while it ran would go with them; and two
+  # release-candidates numbered at once would both take the same K.
+  publish:
+    name: publish the release-candidate
+    needs: [id, store]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      number: ${{ steps.tag.outputs.number }}
+      k: ${{ steps.tag.outputs.k }}
+    env:
+      BUILD_ID: ${{ needs.id.outputs.build_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # A release-candidate tag already on this commit is reused, so re-running
+      # this job after a failure finishes that release-candidate instead of
+      # numbering the same commit twice.
+      - name: Number the release-candidate
+        id: tag
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet
+          N=$(scripts/release/version.sh next)
+          rcs=$( { git tag -l "release-${N}-rc*" | grep -E "^release-${N}-rc[0-9]+$" || true; } \
+                 | sed "s/^release-${N}-rc//" | sort -n)
+          K=""
+          for k in $rcs; do
+            if [ "$(git rev-parse "release-${N}-rc${k}^{commit}")" = "$GITHUB_SHA" ]; then K="$k"; fi
+          done
+          if [ -n "$K" ]; then
+            echo "release-${N}-rc${K} is already on ${GITHUB_SHA:0:7}; finishing it"
+          else
+            K=$(( $(printf '%s\n' $rcs | tail -1 | grep -E '^[0-9]+$' || echo 0) + 1 ))
+          fi
+          TAG="release-${N}-rc${K}"
+          echo "number=$N" >> "$GITHUB_OUTPUT"
+          echo "k=$K" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "this release-candidate is ${TAG}: build ${BUILD_ID} (${GITHUB_SHA})"
+
+      - name: Tag the commit
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then
+            echo "${TAG} is already tagged"
+          else
+            git tag -f "$TAG" "$GITHUB_SHA"
+            git push origin "refs/tags/${TAG}"
+          fi
+          echo "${TAG} is ${GITHUB_SHA:0:7}"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: candidate-${{ env.BUILD_ID }}
+          path: rc
+
+      - name: Publish the release-candidate's files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          N: ${{ steps.tag.outputs.number }}
+          K: ${{ steps.tag.outputs.k }}
+        run: |
+          set -euo pipefail
+          find rc -type f | sort
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "${TAG} is already published"
+          else
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --prerelease \
+              --title "$TAG" \
+              --notes "Release-candidate ${K} for release-${N}: build ${BUILD_ID}, commit ${GITHUB_SHA}. If it is released, release-${N} carries these same files." \
+              rc/linux-*/*.tar.gz rc/windows-x64/*.exe rc/windows-x64/openchime.debug
+          fi
+          # The earlier release-candidates for this number stay, named as
+          # superseded, until release-N removes them all.
+          for t in $( { git tag -l "release-${N}-rc*" | grep -E "^release-${N}-rc[0-9]+$" || true; } | grep -vx "$TAG" || true); do
+            gh release edit "$t" -R "$GITHUB_REPOSITORY" --title "$t (superseded by $TAG)" >/dev/null \
+              || echo "::warning::could not mark ${t} superseded"
+          done
+
+      - name: Summary
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          {
+            echo "### Release-candidate \`${TAG}\`"
+            echo
+            echo "- build \`${BUILD_ID}\`, commit \`${GITHUB_SHA}\`"
+            echo "- to release it: \`gh workflow run release.yml --ref staging -f release_candidate=${TAG}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The release-candidate, copied to openchime/openchime: the commit to its
+  # staging, the tag, and a prerelease with the same files, title and notes.
+  # A copy and nothing more: nothing here or in release.yml reads it back, so a
+  # failure is a warning, never a failed run (continue-on-error). It reads
+  # nothing from openchime/openchime but whether the tag and the release are
+  # already there, so a re-run completes it. The staging push is plain, never
+  # forced: a push that is not a fast-forward is refused. Pushes use
+  # PUBLIC_DEPLOY_KEY, a write deploy key on openchime/openchime; the release is
+  # made with PUBLIC_TOKEN (contents write there). Both are in the `release`
+  # environment.
+  sync-public:
+    name: copy to openchime/openchime
+    needs: [id, publish]
+    if: ${{ success() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: true
+    environment: release
+    permissions:
+      contents: read
+    env:
+      PUBLIC_REPO: openchime/openchime
+      BUILD_ID: ${{ needs.id.outputs.build_id }}
+      TAG: ${{ needs.publish.outputs.tag }}
+      N: ${{ needs.publish.outputs.number }}
+      K: ${{ needs.publish.outputs.k }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up the deploy key
+        env:
+          KEY: ${{ secrets.PUBLIC_DEPLOY_KEY }}
+          TOKEN: ${{ secrets.PUBLIC_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$KEY" ] || { echo "::warning::PUBLIC_DEPLOY_KEY is not set in the release environment; nothing copied to ${PUBLIC_REPO}"; exit 1; }
+          [ -n "$TOKEN" ] || { echo "::warning::PUBLIC_TOKEN is not set in the release environment; nothing copied to ${PUBLIC_REPO}"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/public_key
+          chmod 600 ~/.ssh/public_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/public_key -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
+
+      - name: Push the commit to staging and the tag
+        run: |
+          set -euo pipefail
+          remote="git@github.com:${PUBLIC_REPO}.git"
+          git push "$remote" "${GITHUB_SHA}:refs/heads/staging" || {
+            echo "::warning::could not push ${GITHUB_SHA:0:7} to staging on ${PUBLIC_REPO} (not a fast-forward?)"; exit 1; }
+          if git ls-remote --exit-code --tags "$remote" "refs/tags/${TAG}" >/dev/null; then
+            echo "${TAG} is already there"
+          else
+            git fetch --force --quiet origin "refs/tags/${TAG}:refs/tags/${TAG}"
+            git push "$remote" "refs/tags/${TAG}" || {
+              echo "::warning::could not push ${TAG} to ${PUBLIC_REPO}"; exit 1; }
+          fi
+          echo "${PUBLIC_REPO}: staging and ${TAG} are ${GITHUB_SHA:0:7}"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: candidate-${{ env.BUILD_ID }}
+          path: rc
+
+      - name: Copy the prerelease
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" -R "$PUBLIC_REPO" >/dev/null 2>&1; then
+            echo "${TAG} is already published on ${PUBLIC_REPO}"
+            exit 0
+          fi
+          gh release create "$TAG" -R "$PUBLIC_REPO" --verify-tag --prerelease \
+            --title "$TAG" \
+            --notes "Release-candidate ${K} for release-${N}: build ${BUILD_ID}, commit ${GITHUB_SHA}. If it is released, release-${N} carries these same files." \
+            rc/linux-*/*.tar.gz rc/windows-x64/*.exe rc/windows-x64/openchime.debug || {
+            echo "::warning::could not publish ${TAG} on ${PUBLIC_REPO}"; exit 1; }
+          echo "${TAG} published on ${PUBLIC_REPO}"
+
+      - name: Report a failed copy
+        if: ${{ failure() }}
+        run: echo "::warning::the copy to ${PUBLIC_REPO} did not complete; ${TAG} is published here regardless. Re-run this job to finish it."

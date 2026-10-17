@@ -2,14 +2,14 @@
 # Local federated demo (ARCH-84 enrollment + ARCH-85 push), end to end.
 #
 # Stands up a daemon in the FEDERATED model against an already-running control
-# plane (the openchime-saas repo), enrolls it, then drives a client: one user
+# plane, enrolls it, then drives a client: one user
 # registers a push device token, another sends a message, and the control-plane
 # push gateway relays a contentless notification. Proves the two daemon->central
 # outbound wires (enrollment, push) interoperate — the C daemon signs with mbedTLS,
 # the .NET control plane verifies (CP-12).
 #
 # Prereqs:
-#   - The control plane running with the dev log push provider, e.g. from openchime-saas:
+#   - The control plane running with the dev log push provider, e.g. from its checkout:
 #       ConnectionStrings__ControlPlane=... Database__MigrateOnStartup=true \
 #       Push__Log__Enabled=true ASPNETCORE_URLS=http://localhost:5176 \
 #       dotnet run --project src/OpenChime.ControlPlane.Web

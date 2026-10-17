@@ -1,20 +1,30 @@
 # OpenChime — Contributing & Workflow
 
-The branch, commit, and CI policy for this repo. The private control-plane repo
-(`openchime-saas`) follows the same rules, tailored to its .NET CI.
+The branch, commit, and CI policy for this repo.
+
+**Contributions from outside** are pull requests against `staging`. Each is
+reviewed; one that is taken is included in the next release candidate, with its
+author kept and their `Signed-off-by` beside the maintainer's, and its pull
+request is then closed, since its change reaches `staging` with that candidate.
 
 ## Branches & merging
 
 - **`staging` is the integration branch.** All feature work lands on `staging`
   through a pull request.
-- **`main` is what was released, and nothing else.** It moves only when
-  `staging` is **promoted**: `gh workflow run promote.yml --ref staging` runs CI
-  on the staging tip, confirms its attribution guard and commit policy passed,
-  and fast-forwards `main` to that exact commit with the repository's deploy key.
-  That push is the release (`release.yml`; see [RELEASING.md](./RELEASING.md)).
-  A ruleset refuses every other update to `main`, from anyone — so `main` is
-  always an ancestor of `staging`, and never takes a direct push or a pull
-  request.
+- **`main` is what was released, and nothing else.** A **release-candidate**
+  is cut from `staging` (`gh workflow run release-candidate.yml --ref staging`):
+  the staging tip, once its CI, attribution guard and commit policy have
+  passed, is built, tagged `release-N-rcK` and published as a prerelease. A
+  **release** is made from a release-candidate (`gh workflow run release.yml
+  --ref staging -f release_candidate=release-N-rcK`): it fast-forwards `main`
+  to that exact commit, tags it `release-N` and publishes the same files (see
+  [RELEASING.md](./RELEASING.md)). Both are tagged and published in this
+  repository, their images in Fly's registry
+  (`registry.fly.io/openchime-daemon-<environment>`), and each is copied to
+  `openchime/openchime` at the end; the copy is a convenience, and nothing
+  depends on it. A ruleset refuses every update to `main` except the release's
+  own, made with the repository's deploy key, so `main` is always an ancestor
+  of `staging`, and never takes a direct push or a pull request.
 - **Every feature has exactly one GitHub issue**, and its branch is named for
   it: `feature/oc-<issue number>-<short-kebab-description>`, cut from a clean,
   current `staging`. The repo's `/oc-feature-start` command runs the preflight
@@ -32,8 +42,10 @@ The branch, commit, and CI policy for this repo. The private control-plane repo
   with a **squash merge** — no merge commits, history stays linear. Delete the
   branch, local and remote, after.
 - **Docs-only changes go straight to `staging`**, without a pull request, and
-  reach `main` with the next promotion (they skip the build jobs via
-  `paths-ignore`; the attribution guard runs on every push regardless).
+  reach `main` with the next release (they skip the build jobs via
+  `paths-ignore`; the attribution guard and commit policy run on every push
+  regardless). A release-candidate cut from a docs-only commit counts CI as
+  passed, since CI never ran on it, and still requires the other two.
 - **Sign off every commit** (`git commit -s`) — the DCO applies to every path
   into the tree, including a cherry-pick.
 - **One logical change per branch.**
@@ -87,8 +99,8 @@ client CI cannot run.
   Anthropic. The [`attribution-guard`](../.github/workflows/attribution-guard.yml)
   workflow scans author, committer, and message on every push and **rejects**
   matches (it deletes an offending branch or tag; a violation can only reach
-  `main` through a promotion, and promotion refuses a commit the guard did not
-  pass).
+  `main` through a release, and a release-candidate is refused for a commit
+  the guard did not pass).
 
 ## Adding a setting
 
@@ -106,7 +118,7 @@ does nothing unless `OPENCHIME_MODE=development` (CONFIG.md "Mode").
 ## CI
 
 `ci.yml` runs on every pull request into `staging` and every push to `staging`,
-and is the gate `promote.yml` calls and `candidate.yml` waits for. It checks nothing twice:
+and the push's run is the gate `release-candidate.yml` waits for. It checks nothing twice:
 each test suite runs once, one clang compile serves as both the release-compiler
 and the second-compiler check, and what the release checks itself is left to the
 release. Every vendored library is cached by the script that builds it, and
@@ -129,7 +141,8 @@ machines at once:
   ([`attribution-guard`](../.github/workflows/attribution-guard.yml)).
   The guard has **no `paths-ignore`**, so it runs on every push including
   docs-only ones, since what it rejects lives in commit messages and author
-  lines. A promotion refuses a staging commit it has not passed on.
+  lines. A release-candidate is refused for a staging commit it has not passed
+  on.
 
 **All five are required checks on `staging`.** Docs-only pushes skip the build
 jobs (`paths-ignore: ['**.md', ...]`), which is why docs go straight to
@@ -146,9 +159,8 @@ See [TESTING.md](./TESTING.md) for the full test strategy.
 
 - This public repo holds the daemon, the client app-core, the wire protocol, and
   the shared **requirements/specs** (`REQ-N`) + architecture (`ARCH-N`). The
-  hosted control plane and federated-service **implementation** live in the
-  separate **private** `openchime-saas` repo — **share the contract, keep the
-  implementation**.
+  hosted control plane and federated-service **implementation** live elsewhere:
+  **share the contract, keep the implementation**.
 - Control-plane work sometimes creates daemon-side dependencies here; they land as
   ordinary `ARCH-N` / `REQ-N` items (e.g. a max-registered-users config cap, and
   the daemon's first outbound federated-services client for enrollment/push).

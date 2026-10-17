@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Local OIDC-relay verification: the last cross-repo wire (ARCH-56/57).
 #
-# Proves that the control plane (openchime-saas) mints an ES256 identity token and
+# Proves that the control plane mints an ES256 identity token and
 # a daemon in relay mode VERIFIES it with the keys central publishes — end to end,
 # credential-free (no real Google). It generates an ES256 keypair, gives the
 # private half to the control plane (the signing key, which it publishes at
@@ -11,7 +11,7 @@
 # upstream-IdP + browser flow is bypassed on purpose: this exercises the daemon's
 # verification, which is the untested half; mint<->verify is unit-tested too.
 #
-# Prereqs: the sibling ../openchime-saas, dotnet, curl, openssl, and a Postgres
+# Prereqs: a control-plane checkout in $OC_CONTROL_PLANE_DIR, dotnet, curl, openssl, and a Postgres
 # already listening on localhost:5432 with the openchime role/database below.
 # This script used to start that Postgres itself via the sibling repo's compose
 # stack; the project no longer uses Docker anywhere, so bringing the database up
@@ -23,7 +23,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 export OPENCHIME_MODE=development   # a box of your own (CONFIG.md "Mode")
-SAAS="$ROOT/../openchime-saas"
+SAAS="${OC_CONTROL_PLANE_DIR:?set OC_CONTROL_PLANE_DIR to a control-plane checkout}"
 WORK="$(mktemp -d)"
 CP=http://localhost:5176
 ISS="$CP"   # the relay's issuer is the enroll URL's origin

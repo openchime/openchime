@@ -55,7 +55,7 @@ or broken is not a document — it is the
 | [TUIKIT.md](docs/TUIKIT.md) | The in-tree TUI widget toolbox the terminal client is built on — deliberately generic, and knowing nothing about chat. |
 | [VENDORS.md](docs/VENDORS.md) | Every third-party dependency, how it enters the build, and its licence. |
 | [CONTRIBUTING.md](docs/CONTRIBUTING.md) | Branch, commit and CI policy, including the attribution guard that runs on every push. |
-| [RELEASING.md](docs/RELEASING.md) | How a staging commit becomes a candidate and a candidate becomes a release on apt, dnf, GHCR and the GitHub release — build ids and release numbers, the pool guard that stops an index delisting prior releases, and the archive signing key's properties. |
+| [RELEASING.md](docs/RELEASING.md) | How a staging commit becomes a candidate and a candidate becomes a release on apt, dnf, Fly's registry and the GitHub release — build ids and release numbers, the pool guard that stops an index delisting prior releases, and the archive signing key's properties. |
 
 The daemon is the **chat core**. On the foundations — the
 wire-protocol frame codec (PROTOCOL.md), the two-thread model (ARCH-5: an epoll
@@ -106,14 +106,18 @@ the unit and the config with an `install.sh`. Nothing is fetched at install
 time — TLS is statically linked — so this is the channel for an air-gapped box.
 Verify the `.sha256` beside it.
 
-**Container** — for any OCI runtime (Podman, Docker, containerd, Fly):
+**Container** — for any OCI runtime (Podman, Docker, containerd, Fly), built
+from a release tarball with the `Dockerfile` in this repository:
 
 ```sh
-podman run ghcr.io/openchime/openchime:latest --version
+packaging/image-context.sh openchimed-<N>-linux-amd64.tar.gz image
+buildah build --arch amd64 -f Dockerfile -t openchime:<N> image
+podman run openchime:<N> --version
 ```
 
-The image is published for deployment — it is what the hosted model feeds to Fly
-Machines, which ingest an image and cannot install a package. OpenChime itself
+The release's own image is for deployment: it is kept in Fly's registry
+(`registry.fly.io/openchime-daemon-<environment>`) and is what the hosted model
+feeds to Fly Machines, which ingest an image and cannot install a package. OpenChime itself
 does not use containers to build or test anything; the image is an output, not a
 tool. There is no Compose stack in this repository.
 

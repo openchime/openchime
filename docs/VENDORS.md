@@ -278,7 +278,7 @@ and that machine then persists no credential at all (headless / no D-Bus). They 
 | **Debian** | `bookworm-slim` | Runtime base of the published image (glibc 2.36, above the binary's 2.34 floor) | mixed (base OS) | https://www.debian.org |
 
 One image, and it is an **output** rather than a tool: the OCI image published to
-GHCR for the hosted model (ARCH-20/76). Nothing is compiled in it: the Dockerfile
+Fly's registry (`registry.fly.io/openchime-daemon-<environment>`) for the hosted model (ARCH-20/76). Nothing is compiled in it: the Dockerfile
 lays the release tarball's daemon, speech data and web client onto the base
 (`packaging/image-context.sh`), so the image carries the same binary as the
 packages, and the arm64 image is built on the x86 runner with no emulation. It
@@ -302,12 +302,12 @@ is the upstream's own stability contract for a base OS.
 - **zig, Emscripten, llvm-mingw** — fetched by make, pinned (§2, "Toolchains").
   zig is the release's compiler and CI's second compiler; a plain `make` of the
   host's daemon uses the system cc.
-- **buildah / podman / skopeo** — **candidate and release only**. Build, start and
-  push the OCI image (the candidate), re-tag it and move the `:latest` tag (the
-  release), daemonlessly.
+- **buildah / podman / skopeo** — **release-candidate and release only**. Build,
+  start and push the OCI image (the release-candidate), copy it to its released
+  tags and move the `:latest` tag (the release), daemonlessly.
 - **Docker and Docker Compose are NOT used**, anywhere, by anything — not to
   build, not to test, not locally, not in CI. This is a standing constraint;
-  see ARCH-36 and the header of `.github/workflows/candidate.yml`.
+  see ARCH-36 and the header of `.github/workflows/release-candidate.yml`.
 
 ## 6. Windows cross-compile artifacts
 
