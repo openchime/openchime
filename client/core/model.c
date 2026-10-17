@@ -1915,6 +1915,17 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         /* Only for the roster currently being loaded — a late frame from a
          * previous channel must not land in this one's list. */
         if (m->chanmem_channel != e->channel_id) break;
+        /* Someone already listed is updated, not listed again: two requests for
+         * the same roster in flight (opening it, then a refresh) both clear the
+         * list before either answer comes, and then both answers arrive. */
+        oc_chan_member *had = NULL;
+        for (size_t i = 0; i < m->n_chanmem && !had; i++)
+            if (m->chanmem[i].user_id == e->user_id) had = &m->chanmem[i];
+        if (had) {
+            had->role      = e->status;
+            had->joined_at = e->server_time;
+            break;
+        }
         if (m->n_chanmem == m->cap_chanmem) {
             size_t nc = m->cap_chanmem ? m->cap_chanmem * 2 : 16;
             oc_chan_member *g = realloc(m->chanmem, nc * sizeof *g);
