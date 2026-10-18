@@ -28,7 +28,9 @@ name: ci
 # vars.GUI_SMOKE and, with that variable never set, ran zero times while the release
 # inherited its skip as a pass. It stays as the pre-push gate docs/CLIENT.md
 # already makes it.
-# Doc-only pull requests skip CI; every push to staging runs it. See docs/TESTING.md for the full strategy.
+# CI runs on every pull request and push, so its required checks always report.
+# A change that touches only documentation (*.md, .gitignore, .claude/) skips
+# the three jobs below, which GitHub counts as passed. See docs/TESTING.md for the full strategy.
 
 on:
   # A pull request into staging, where its results are the required checks; and
@@ -36,13 +38,12 @@ on:
   # then restores (a cache is visible to a pull request from its base branch, not
   # from another feature branch). Not main: nothing reaches main but a release
   # of a staging commit, which CI already ran.
+  #
+  # No path filter on either: a filtered-out pull request never reports the
+  # checks its merge requires, and on a force-push the filter skipped the one
+  # run a release-candidate waits on. `changes` decides instead.
   pull_request:
     branches: [staging]
-    paths-ignore:
-      - '**.md'
-      - '.gitignore'
-  # Every push, with no path filter: on a force-push the filter skipped the one
-  # run a release-candidate waits on.
   push:
     branches: [staging]
   # Lets the release workflow gate on these exact jobs rather than re-implement
@@ -61,8 +62,56 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Documentation only, or code? Everything else in this workflow runs only for
+  # code. Compared against the pull request's base, or the push's previous tip;
+  # a push with no previous tip here (a new branch, a force-push to a new root)
+  # and a call from another workflow count as code.
+  changes:
+    name: classify the change
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -uo pipefail
+          code=true
+          files=""
+          case "$EVENT" in
+            # What the branch changed since it left its base (three dots).
+            pull_request) files=$(git diff --name-only "${BASE}...${HEAD}") || files="" ;;
+            push)
+              if [ "$BEFORE" != 0000000000000000000000000000000000000000 ] \
+                 && git cat-file -e "$BEFORE" 2>/dev/null \
+                 && git merge-base --is-ancestor "$BEFORE" "$GITHUB_SHA"; then
+                files=$(git diff --name-only "$BEFORE" "$GITHUB_SHA") || files=""
+              fi ;;
+          esac
+          if [ -n "$files" ]; then
+            code=false
+            while IFS= read -r f; do
+              case "$f" in
+                *.md|.gitignore|.claude/*) ;;
+                *) code=true; echo "code: $f"; break ;;
+              esac
+            done <<<"$files"
+          fi
+          [ "$code" = false ] && echo "documentation only: the build and test jobs are skipped"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
   build:
     name: build + unit tests
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90   # a cold cache builds the vendored libraries: ~44 min
     steps:
@@ -186,6 +235,8 @@ jobs:
 
   thread-sanitizer:
     name: thread sanitizer
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     # The daemon is threads -- the event loop, its I/O threads, the writer, the
     # readers and the auth pool, the worker pools -- and so are the client, its
     # call engine and its recorder. `make test-ci PART=threads` runs the suites whose code
@@ -223,6 +274,8 @@ jobs:
 
   windows:
     name: windows cross-compile (TUI + GUI)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

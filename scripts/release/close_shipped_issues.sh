@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# Close the issues a release shipped.
+# Close the issues a release shipped, or a promotion of main published.
 #
 #   scripts/release/close_shipped_issues.sh <release-tag> [--dry-run]
+#   scripts/release/close_shipped_issues.sh --range <from>..<to> [--dry-run]
+#
+# --range is promote.yml's: main moved to <to> without a release, carrying only
+# documentation and workflows, and those commits' issues are done once main
+# has them.
 #
 # An issue closes when its work SHIPS, not when it merges: a merge lands on
 # staging, and staging is not a release. Nor can the merge do it -- the squash
@@ -19,31 +24,49 @@
 # an API hiccup must not brand a good release failed -- every path warns and exits 0.
 set -uo pipefail
 
+warn() { echo "::warning::$*"; }
+usage() {
+  echo "usage: scripts/release/close_shipped_issues.sh <release-tag> [--dry-run]" >&2
+  echo "       scripts/release/close_shipped_issues.sh --range <from>..<to> [--dry-run]" >&2
+  exit 2
+}
+
+range=""
+if [ "${1:-}" = "--range" ]; then
+  range="${2:-}"
+  [ -n "$range" ] || usage
+  shift
+fi
 tag="${1:-}"
+[ -n "$tag" ] || usage
 dry=0
 [ "${2:-}" = "--dry-run" ] && dry=1
-if [ -z "$tag" ]; then
-  echo "usage: scripts/release/close_shipped_issues.sh <release-tag> [--dry-run]" >&2
-  exit 2
-fi
 
-warn() { echo "::warning::$*"; }
-
-n="${tag#release-}"
-if ! printf '%s' "$n" | grep -qE '^[0-9]+$' || ! sha=$(git rev-parse -q --verify "${tag}^{commit}"); then
-  warn "$tag is not a release tag in this checkout; closed nothing"
-  exit 0
-fi
-
-# The newest release below this one, by NUMBER (the same ordering scripts/release/version.sh
-# uses) -- not by date, and not by ancestry.
-prev=$(git tag -l 'release-*' | sed 's/^release-//' | grep -E '^[0-9]+$' \
-       | awk -v n="$n" '$1 < n' | sort -n | tail -1 || true)
-if [ -n "$prev" ]; then
-  range="release-${prev}..${sha}"
+if [ -n "$range" ]; then
+  if ! sha=$(git rev-parse -q --verify "${range##*..}^{commit}"); then
+    warn "$range does not end at a commit in this checkout; closed nothing"
+    exit 0
+  fi
+  what="main at ${sha:0:7}"
+  note="Published on main (\`${sha}\`)."
 else
-  range="${sha}~1..${sha}"
-  git rev-parse -q --verify "${sha}~1" >/dev/null || range="$sha"
+  n="${tag#release-}"
+  if ! printf '%s' "$n" | grep -qE '^[0-9]+$' || ! sha=$(git rev-parse -q --verify "${tag}^{commit}"); then
+    warn "$tag is not a release tag in this checkout; closed nothing"
+    exit 0
+  fi
+  # The newest release below this one, by NUMBER (the same ordering
+  # scripts/release/version.sh uses) -- not by date, and not by ancestry.
+  prev=$(git tag -l 'release-*' | sed 's/^release-//' | grep -E '^[0-9]+$' \
+         | awk -v n="$n" '$1 < n' | sort -n | tail -1 || true)
+  if [ -n "$prev" ]; then
+    range="release-${prev}..${sha}"
+  else
+    range="${sha}~1..${sha}"
+    git rev-parse -q --verify "${sha}~1" >/dev/null || range="$sha"
+  fi
+  what="$tag"
+  note="Shipped in ${tag} (\`${sha}\`)."
 fi
 
 # Resolved ONCE, and a failure to resolve is reported rather than read as "no
@@ -56,7 +79,7 @@ fi
 
 repo="${ISSUES_REPO:-openchime/openchime}"
 
-echo "closing issues shipped in $tag ($range, $(printf '%s\n' "$commits" | wc -l) commits)"
+echo "closing issues shipped in $what ($range, $(printf '%s\n' "$commits" | wc -l) commits)"
 seen=" "
 while read -r c; do
   [ -z "$c" ] && continue
@@ -88,7 +111,7 @@ while read -r c; do
     continue
   fi
   if gh issue close "$num" --repo "$repo" --reason completed \
-       --comment "Shipped in ${tag} (\`${sha}\`)." >/dev/null 2>&1; then
+       --comment "$note" >/dev/null 2>&1; then
     echo "closed OC-${num}"
   else
     warn "OC-${num}: close failed; left open"

@@ -782,10 +782,10 @@ answer in frames, a ping's pong, and an unmasked frame ending the connection.
 CI is GitHub Actions (`.github/workflows/ci.yml`). It runs on every **pull
 request into `staging`** and every **push to `staging`**; `release-candidate.yml`
 waits for that push's run before it builds a release-candidate, so a release is
-gated on exactly these jobs (RELEASING.md). Doc-only changes skip it
-(`paths-ignore`), so a staging tip whose push was docs-only has no run to wait
-for and is not built into a release-candidate until a change that runs CI lands
-on top of it. Nothing is checked twice: each suite runs once (§2.4), one
+gated on exactly these jobs (RELEASING.md). There is no path filter: the first
+job, `classify the change`, skips the other three when only documentation
+changed (`*.md`, `.gitignore`, `.claude/`), so every pull request and push
+reports every required check. Nothing is checked twice: each suite runs once (§2.4), one
 clang compile is both the release-compiler and the second-compiler check, and
 what the release checks itself is not repeated.
 

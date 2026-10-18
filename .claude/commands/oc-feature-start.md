@@ -6,8 +6,8 @@ argument-hint: <issue number | short description of the work>
 Begin a feature on this repo. The argument is either an existing issue number
 or a short description of new work: $ARGUMENTS
 
-This command is for feature work. Docs-only changes go straight to `staging`
-and do not use it.
+Documentation and workflow changes use it too: they take the same branch and
+pull request, and reach `main` without a release (docs/RELEASING.md "Promotion").
 
 ## 1. Preflight — refuse, do not repair
 

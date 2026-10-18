@@ -41,11 +41,13 @@ request is then closed, since its change reaches `staging` with that candidate.
   the two policy checks to pass on the pull request before it can merge. Merge
   with a **squash merge** — no merge commits, history stays linear. Delete the
   branch, local and remote, after.
-- **Docs-only changes go straight to `staging`**, without a pull request, and
-  reach `main` with the next release (they skip the build jobs via
-  `paths-ignore`; the attribution guard and commit policy run on every push
-  regardless). A release-candidate cut from a docs-only commit counts CI as
-  passed, since CI never ran on it, and still requires the other two.
+- **Documentation and workflow changes take the same path**: a branch, a pull
+  request into `staging`, the same checks. CI's build and test jobs skip when
+  only documentation changed (`*.md`, `.gitignore`, `.claude/`), and a skipped
+  job counts as passed, so the pull request can merge in a minute. Once merged,
+  `promote` moves `main` to it with no release, when everything waiting on
+  `staging` is documentation or workflows (RELEASING.md "Promotion"); when code
+  is waiting, it goes out with the next release.
 - **Sign off every commit** (`git commit -s`) — the DCO applies to every path
   into the tree, including a cherry-pick.
 - **One logical change per branch.**
@@ -140,15 +142,14 @@ machines at once:
 - **`pr policy`** and **`guard`** — the pull request's title and body (and that the
   title names an open issue), and the attribution guard
   ([`attribution-guard`](../.github/workflows/attribution-guard.yml)).
-  The guard has **no `paths-ignore`**, so it runs on every push including
-  docs-only ones, since what it rejects lives in commit messages and author
-  lines. A release-candidate is refused for a staging commit it has not passed
+  The guard runs on every push including documentation-only ones, since what
+  it rejects lives in commit messages and author lines. A release-candidate is refused for a staging commit it has not passed
   on.
 
-**All five are required checks on `staging`.** Docs-only pushes skip the build
-jobs (`paths-ignore: ['**.md', ...]`), which is why docs go straight to
-`staging` rather than through a pull request that would wait on checks that
-never run.
+**All five are required checks on `staging`.** CI runs on every pull request
+and push; its first job, `classify the change`, skips the three build jobs when
+only documentation changed, and GitHub counts a skipped job as passed, so a
+documentation pull request reports every required check.
 
 **Read the run's result before asking for a merge**: the `build` job's TLS run
 of the shipped `main()` and the thread-sanitizer suites are checks a local

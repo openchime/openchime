@@ -56,10 +56,9 @@ The packaging scripts run under a placeholder version so a package that cannot
 be built, installed or made identical across channels stops the
 release-candidate; the packages themselves are not kept.
 
-A commit that changes only `*.md` files or `.gitignore` starts no CI run (CI's
-`paths-ignore`), so the gate reports "docs-only commit: CI skips it; treated as
-passed" for CI and goes on. The attribution guard and commit policy run on
-every push and are still required.
+CI runs on every push to `staging`, a documentation-only one included (its
+build and test jobs skip), so the gate waits for CI, the attribution guard and
+the commit policy on every commit (`scripts/release/wait_checks.sh`).
 
 What is kept, under `candidates/<build-id>/` in the staging bucket
 (`DIST_STAGING_BUCKET`, via the `dist-staging` rclone remote):
@@ -127,6 +126,29 @@ refuses every update except from the repository's deploy key
 
 A release-candidate whose number has since been released cannot be released;
 cut a new one from `staging`.
+
+## Promotion: main without a release
+
+A release moves `main` and takes a number. Documentation and workflows change
+nothing in the packages, so `promote.yml` moves `main` without one. It runs
+after every push to `staging` (a merged pull request) and:
+
+1. lists `main..staging`. When every commit touches only `*.md`, `.gitignore`,
+   `.github/` or `.claude/`, it goes on; when any touches code, it stops and
+   says which: `main` moves with the next release, which carries the
+   documentation with it.
+2. waits for CI, the attribution guard and the commit policy on the `staging`
+   tip, as a release-candidate does;
+3. fast-forwards `main` with `RELEASE_SSH_KEY`;
+4. copies `main` and `staging` to `openchime/openchime` with `PUBLIC_DEPLOY_KEY`
+   (a failure there is a warning);
+5. closes the OC issues the promoted commits name, with `PUBLIC_TOKEN`
+   (`close_shipped_issues.sh --range`).
+
+No tag, no number, no packages, no images. `main` only fast-forwards, so the
+hashes are the same in both repositories, and the next release's range starts
+at the previous `release-N` as before: issues a promotion already closed are
+reported as closed.
 
 ## Shape
 

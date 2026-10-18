@@ -98,10 +98,8 @@ jobs:
   # rather than run again: the same jobs twice would double the cost.
   # Anything but success refuses.
   #
-  # A commit that changes only what ci.yml's paths-ignore lists (*.md,
-  # .gitignore) starts no CI run, so waiting for one would time out: such a
-  # commit counts as passed for ci. attribution-guard and commit-policy run on
-  # every push and are still required.
+  # ci runs on every push to staging, a documentation-only one included (its
+  # build and test jobs skip), so all three always have a run to wait for.
   gate:
     name: gate on CI
     needs: branch
@@ -116,37 +114,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 2
       - run: |
-          set -euo pipefail
-          docs_only=1
-          if ! changed=$(git diff --name-only "${GITHUB_SHA}^" "$GITHUB_SHA"); then
-            docs_only=0
-          fi
-          [ -n "$changed" ] || docs_only=0
-          while IFS= read -r f; do
-            [ -n "$f" ] || continue
-            case "$f" in
-              *.md|.gitignore) ;;
-              *) docs_only=0 ;;
-            esac
-          done <<<"$changed"
-          for wf in ci attribution-guard commit-policy; do
-            if [ "$wf" = ci ] && [ "$docs_only" = 1 ]; then
-              echo "ci: docs-only commit: CI skips it; treated as passed"
-              continue
-            fi
-            for i in $(seq 1 110); do
-              state=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${GITHUB_SHA}&event=push&branch=staging" \
-                        --jq "[.workflow_runs[] | select(.name == \"${wf}\") | .conclusion] | first // \"pending\"")
-              [ "$state" = "pending" ] || [ "$state" = "null" ] || break
-              sleep 30
-            done
-            [ "$state" = "success" ] || {
-              echo "::error::${wf} has not passed on ${GITHUB_SHA:0:7} (state: ${state}); no release-candidate is built from it"; exit 1; }
-            echo "${wf}: success on ${GITHUB_SHA:0:7}"
-          done
+          scripts/release/wait_checks.sh "$GITHUB_SHA" || {
+            echo "::error::no release-candidate is built from ${GITHUB_SHA:0:7}"; exit 1; }
 
   # Assert the credentials EXIST before anything expensive runs.
   #
