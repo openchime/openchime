@@ -26,7 +26,6 @@ jobs:
           TITLE: ${{ github.event.pull_request.title }}
           BODY: ${{ github.event.pull_request.body }}
           NUMBER: ${{ github.event.pull_request.number }}
-          AUTHOR: ${{ github.event.pull_request.user.login }}
           # The issue tracker OC-N numbers, wherever this runs. It is public,
           # so the workflow token reads it.
           ISSUES_REPO: openchime/openchime
@@ -38,18 +37,6 @@ jobs:
           # squashes, so the committed subject is longer than the title.
           # Check what will actually be committed.
           SUBJECT="${TITLE} (#${NUMBER})"
-
-          # dependabot has no issue to reference, and inventing one would put
-          # a fabricated record in the tracker. The exemption is paired with
-          # the author so a human cannot use the prefix to skip issue tracking.
-          if printf '%s' "$TITLE" | grep -q '^deps: '; then
-            if [ "$AUTHOR" = 'dependabot[bot]' ]; then
-              echo "dependency bump by dependabot, exempt"
-              exit 0
-            fi
-            echo "::error::'deps:' is dependabot's prefix but this was opened by '${AUTHOR}'. Use 'OC-<issue>: ...'."
-            exit 1
-          fi
 
           if ! printf '%s' "$TITLE" \
              | grep -qE '^OC-[0-9]+: [A-Z]([^[:cntrl:]]*[^.,;:!?[:space:]])?$'; then

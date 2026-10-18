@@ -67,23 +67,9 @@ jobs:
           fail=0
           for c in "${COMMITS[@]}"; do
             subject=$(git log -1 --format=%s "$c")
-            author=$(git log -1 --format=%an "$c")
 
             # A root commit predates any issue to scope it to.
             [ -z "$(git log -1 --format=%P "$c")" ] && { echo "  ${c:0:8} root, exempt"; continue; }
-
-            # dependabot's own commits carry deps: and have no issue. The
-            # author pairing is what stops a human using the prefix to skip
-            # tracking.
-            if printf '%s' "$subject" | grep -q '^deps: '; then
-              if [ "$author" = 'dependabot[bot]' ]; then
-                echo "  ${c:0:8} dependency bump, exempt"
-              else
-                echo "::error::${c:0:8} uses 'deps:' but was written by '${author}'"
-                fail=1
-              fi
-              continue
-            fi
 
             # GitHub appends the pull request number in parentheses on squash;
             # strip it before matching so a trailing full stop before the
