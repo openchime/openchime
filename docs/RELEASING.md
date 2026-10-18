@@ -186,7 +186,9 @@ staging.
 
 `close-issues` closes the issues the release shipped: every commit on `main`
 names its issue in the subject, and `scripts/release/close_shipped_issues.sh` reads the
-commits between the previous `release-N` and this one. The issues are on
+commits between the previous `release-N` and this one. The first release has
+no previous one and covers only its own commit: the issues named by the
+commits below it are not closed, and are closed by hand. The issues are on
 `openchime/openchime`, closed with `PUBLIC_TOKEN`. An issue closes when it
 ships, not when it merges. The job only ever warns — the release is already live.
 
