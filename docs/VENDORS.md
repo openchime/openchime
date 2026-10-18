@@ -43,6 +43,13 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **libfvad** | commit `532ab666` (2024-02-07; upstream has no release tags) | Voice-activity detection: where an utterance ends (the WebRTC detector as a standalone C library) | Voice input in the Win32 client (`client/core/voice/fvad_unit.c`, ARCH-112); never the daemon | https://github.com/dpirch/libfvad | BSD-3-Clause |
 | **Mozilla CA roots** | curl's extract, dated (see `scripts/gen/ca_roots.sh`) | The roots every outbound HTTPS client verifies against (ARCH-10): S3, the control plane, unfurls, the client's `.well-known` fetch | Daemon + every client (`third_party/ca-roots/ca_roots.c`, generated) | https://curl.se/docs/caextract.html | MPL-2.0 (the certificate data) |
 | **SQLite** (amalgamation) | 3.53.4 | The daemon's database (ARCH-2), compiled in with `SQLITE_ENABLE_FTS5`. **Not linked by any client** (ARCH-88) | Daemon + tests (`third_party/sqlite-3.53.4/sqlite3.c`) | https://sqlite.org | Public Domain |
+| **speexdsp** | 1.2.1 | The acoustic echo canceller (`speex_echo_state`), behind the processor seam (AUDIO.md §3.3) | Client media library (`client/core/media/processor.c`) — voice input (ARCH-112) and the audio client; never the daemon | https://www.speex.org | BSD-3-Clause |
+
+**speexdsp** is committed in `third_party/speexdsp/` as Xiph's 1.2.1 release
+tarball, unmodified, its `COPYING` with it. `scripts/build/speexdsp.sh` builds
+it out of tree, static and floating point, `native` for `make test` and
+`windows` for the Win32 client, into `third_party/speexdsp-1.2.1[-win]/`
+(gitignored); nothing is downloaded. The daemon links none of it.
 
 **Why the daemon compiles SQLite in rather than linking the host's (ARCH-20; no
 client links SQLite at all, ARCH-88).**
@@ -102,7 +109,7 @@ verbatim from the notice in `jsmn.h`, which is where upstream keeps it), and the
 its header). miniaudio's implementation is compiled in exactly one translation
 unit, `audio_dev.c`, with only device I/O enabled. `.gitignore` ignores
 `third_party/*` and whitelists the committed paths: `jsmn/`, `termbox2/`,
-`picohttpparser/`, `utf8proc/`, `argon2/`, `pwlist/`, `qrcodegen/`, `miniaudio/`, `stb/`, `sqlite-3.53.4/`, `libfvad/`, `ca-roots/` and `lucide/`
+`picohttpparser/`, `utf8proc/`, `argon2/`, `pwlist/`, `qrcodegen/`, `miniaudio/`, `stb/`, `sqlite-3.53.4/`, `libfvad/`, `ca-roots/`, `speexdsp/` and `lucide/`
 (see below). Everything else under
 `third_party/` — the fetched mbedTLS trees among it — stays ignored.
 
@@ -134,7 +141,6 @@ has moved (`scripts/check/toolchains.sh`).
 | **llama.cpp** (with ggml) | 0.5.0 | Running the summary model, built from source **CPU only and static** (no OpenMP, no tools, no network code) | Daemon (summaries ARCH-116) | https://github.com/ggml-org/llama.cpp | MIT |
 | **Kitten TTS mini** | 0.8 | The read-aloud voice model: `kitten_tts_mini_v0_8.onnx` and `voices.npz`, converted to `.ort` and **shipped beside the daemon** as data | Daemon (read-aloud, ARCH-111) | https://huggingface.co/KittenML/kitten-tts-mini-0.8 | Apache-2.0 |
 | **Moonshine Tiny Streaming (English)** | CDN directory `quantized_26_08_21` | The voice-input recognizer: nine files — the frontend (model and weights), encoder, adapter, cross-attention and decoder graphs as int8 `.ort`, `tokenizer.bin`, `streaming_config.json` and the licence, about 45 MB — **shipped beside the daemon** as data in `stt/` | Daemon (voice input, ARCH-112) | https://github.com/moonshine-ai/moonshine | MIT (English models; the legacy non-streaming models for other languages are under a non-commercial licence and are not used) |
-| **speexdsp** | 1.2.1 | The acoustic echo canceller (`speex_echo_state`), behind the processor seam (AUDIO.md §3.3) | Client media library (`client/core/media/processor.c`) — voice input (ARCH-112) and the audio client; never the daemon | https://www.speex.org | BSD-3-Clause |
 | **Phonetisaurus** (+ OpenFst, MITLM in its wheel) | 0.3.0 | Trains ttskit's guesser. **Build tool for maintainers only**: never linked, never shipped, not needed to build OpenChime | `scripts/build/ttskit_data.sh` | https://github.com/AdolfVonKleist/Phonetisaurus | BSD-3-Clause (OpenFst Apache-2.0, MITLM MIT) |
 | **CMUdict** | commit `74790861` | Source of ttskit's pronunciation data, which is generated from it and **committed** (`ttskit/data/en-US/`, with its notice beside it) | Daemon (read-aloud) | https://github.com/cmusphinx/cmudict | BSD-style (two clauses) |
 
@@ -235,16 +241,11 @@ dependency, built the same way:
 
 llama.cpp's MIT notice travels with every package through `packaging/licenses.sh`.
 
-**speexdsp** is fetched by `scripts/build/speexdsp.sh` — `native` for `make test`,
-`windows` for the Win32 client — SHA-256-verified and refusing an unpinned bump,
-built static and floating point into `third_party/speexdsp-1.2.1[-win]/`
-(gitignored). The daemon links none of it.
-
 **The web client** (`make web`) builds its own copies with Emscripten into
 `build/wasm/` (gitignored): `scripts/build/mbedtls_wasm.sh` from the fetched
 mbedTLS tree, `scripts/build/sdl3_wasm.sh` from the same pinned, SHA-256-verified
-SDL3 release, and `scripts/build/media_wasm.sh` for libvpx, libopus and speexdsp
-from the sources their native scripts fetch and verify.
+SDL3 release, and `scripts/build/media_wasm.sh` for libvpx and libopus from the sources their
+native scripts fetch and verify, and for speexdsp from `third_party/speexdsp/`.
 
 ## 3. System / OS packages (linked at build)
 
@@ -370,7 +371,7 @@ paths ship; nothing is fetched at runtime.
 | **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 41 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
 | **BSD-3-Clause** | libvpx (VP9), libopus | Fetched at build and static-linked: both into the Win32 client (ARCH-110), and libopus into the daemon to encode read-aloud renders (ARCH-111). Permissive, within this repo's posture (mbedTLS is already Apache-2.0, not MIT) |
-| **BSD-3-Clause** | speexdsp, libfvad | Voice input in the Win32 client (ARCH-112): speexdsp fetched and static-linked, libfvad vendored and compiled in; **client only** |
+| **BSD-3-Clause** | speexdsp, libfvad | Voice input in the Win32 client (ARCH-112): speexdsp committed and static-linked, libfvad vendored and compiled in; **client only** |
 | **Public Domain** | SQLite | Compiled in, **daemon only** — no client links it (ARCH-88) |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
 | **Unicode license** | utf8proc bundled data tables | Alongside utf8proc's MIT code |

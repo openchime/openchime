@@ -27,6 +27,7 @@ dist/
 !/third_party/sqlite-3.53.4/
 !/third_party/libfvad/
 !/third_party/ca-roots/
+!/third_party/speexdsp/
 *.o
 *.db
 *.db-shm
