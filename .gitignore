@@ -1,0 +1,43 @@
+openchimed
+# Read-aloud's data directory, assembled by `make` beside the binary.
+/tts/
+# The web client the daemon serves, placed beside the binary by `make web`.
+/web/
+/build/
+# Release artefacts (.deb/.rpm/.tar.gz and the stripped binary they share),
+# produced by packaging/build-*.sh and by the release workflow. Built, never
+# committed — the published copies live in the repository on R2 (ARCH-20).
+dist/
+# Ignore vendored third_party contents (mbedTLS is fetched by scripts/build/*.sh)
+# — but keep the single-file libraries that have no fetch script and so must live
+# in the repo: jsmn (JSON), termbox2 + utf8proc (the TUI cell grid + Unicode
+# width, ARCH-75). (Ignore the *contents* with /* rather than the directory, so
+# re-inclusion below is possible.)
+/third_party/*
+!/third_party/jsmn/
+!/third_party/picohttpparser/
+!/third_party/termbox2/
+!/third_party/utf8proc/
+!/third_party/argon2/
+!/third_party/pwlist/
+!/third_party/lucide/
+!/third_party/qrcodegen/
+!/third_party/miniaudio/
+!/third_party/stb/
+!/third_party/sqlite-3.53.4/
+!/third_party/libfvad/
+!/third_party/ca-roots/
+*.o
+*.db
+*.db-shm
+*.db-wal
+.env
+.playwright-mcp/
+__pycache__/
+/stt/
+# The web harness's Playwright library (package.json), installed by scripts/web/drive.sh.
+node_modules/
+package-lock.json
+
+# The container image's build context (packaging/image-context.sh).
+image/

@@ -1,0 +1,604 @@
+/*
+ * OpenChime client — the app-core facade (ARCH-74). A frontend uses ONLY this:
+ * start a client, tick it once per frame (drains net events into the model),
+ * read the model to render, send messages, and stop. The facade owns the two
+ * UI↔net queues, the network thread, and the view-model; a frontend never
+ * touches a socket or a queue directly.
+ */
+
+#ifndef OC_CLIENT_H
+#define OC_CLIENT_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "callsig.h"
+#include "model.h"
+#include "secret.h"
+
+/* A browser sign-in's result (net.h), for oc_client_start_signin_result. */
+#ifndef OC_SIGNIN_RESULT_DEFINED
+#define OC_SIGNIN_RESULT_DEFINED
+typedef struct {
+    const char *source_id, *verifier, *token, *state;
+} oc_signin_result;
+#endif
+
+typedef struct oc_client oc_client;
+
+/* Start the core: spawn the network thread and connect to host:port. `cred` is
+ * "": a stored session reconnects silently, else the first browser source the
+ * workspace offers signs the person in (AUTH.md §8.1). A password is never
+ * given to the core -- local accounts sign in on the daemon's own pages
+ * (§8.10). Returns NULL if the thread could not be spawned. */
+oc_client *oc_client_start(const char *host, int port, const char *cred);
+
+/* As oc_client_start, plus a local SQLite store at `store_path` (NULL = none)
+ * that persists the session token + trusted fingerprint, so a relaunch reconnects silently
+ * with the token instead of the password (REQ-100, ARCH-58). The parent
+ * directory must exist; an unusable path just disables persistence. */
+oc_client *oc_client_start_stored(const char *host, int port, const char *cred,
+                                  const char *store_path);
+
+/* As oc_client_start_stored, plus an OS secret store (borrowed; NULL = none) that
+ * holds the session token in the platform keyring instead of the SQLite file
+ * (ARCH-74). The caller owns `secret` and frees it after oc_client_stop. */
+oc_client *oc_client_start_secure(const char *host, int port, const char *cred,
+                                  const char *store_path, oc_secret *secret);
+
+/* As oc_client_start_secure, filing the workspace's session, pin and book entry
+ * under `workspace_key` — oc_workspace_key of what the person typed — rather than
+ * under the address it resolved to. What a frontend should call. */
+oc_client *oc_client_start_named(const char *workspace_key, const char *host, int port,
+                                 const char *cred, const char *store_path, oc_secret *secret);
+
+/* As oc_client_start_named, with the sign-in screen's Remember-me as `remember`.
+ * Off, the session leaves nothing behind — no token, account, device key or
+ * switcher entry — but the workspace's certificate pin is still kept, so the next
+ * connection is checked against this one rather than trusting whatever it meets.
+ * Pass the store and the secret either way. */
+oc_client *oc_client_start_opts(const char *workspace_key, const char *host, int port,
+                                const char *cred, const char *store_path, oc_secret *secret,
+                                int remember);
+
+/* As oc_client_start_opts, with the fingerprint the workspace published in its
+ * `.well-known` metadata (ARCH-10) -- `oc_endpoint.fingerprint` from oc_resolve,
+ * or NULL/"" when it published none. It closes the trust-on-first-use window:
+ * with no pin stored yet, the daemon's certificate must be the published one or
+ * the connection is refused. Unreadable text is treated as no fingerprint. */
+oc_client *oc_client_start_verified(const char *workspace_key, const char *host, int port,
+                                    const char *cred, const char *store_path, oc_secret *secret,
+                                    int remember, const char *published_fingerprint);
+/* As oc_client_start_verified, for a browser sign-in with no password (`cred`
+ * ""): with the source `source_id` ("local", "relay", ...; NULL the first
+ * browser source offered, else local accounts), and for local accounts with
+ * the invitation `invite` (hex, or NULL), which opens the sign-up page. Local
+ * accounts sign in on the daemon's own pages (AUTH.md §8.10). */
+oc_client *oc_client_start_signin(const char *workspace_key, const char *host, int port,
+                                  const char *cred, const char *source_id, const char *invite,
+                                  const char *store_path, oc_secret *secret,
+                                  int remember, const char *published_fingerprint);
+/* As oc_client_start_signin to a local account, for a person an administrator
+ * reset (AUTH.md §2): the browser opens first on the page that sets a new
+ * password with the reset's code `reset` (hex), then goes on to the sign-in. */
+oc_client *oc_client_start_reset(const char *workspace_key, const char *host, int port, const char *reset,
+                                 const char *store_path, oc_secret *secret,
+                                 int remember, const char *published_fingerprint);
+/* As oc_client_start_signin, resuming a browser sign-in whose result this
+ * process did not wait for (oc_signin_result, net.h): the web client, after
+ * the browser comes back to it with the token. */
+oc_client *oc_client_start_signin_result(const char *workspace_key, const char *host, int port,
+                                         const oc_signin_result *result,
+                                         const char *store_path, oc_secret *secret,
+                                         int remember, const char *published_fingerprint);
+/* A local account, signed in to with a device code (AUTH.md §8.11), for a
+ * client with no browser of its own: model->device_url and device_code say
+ * where to enter which code, from any device; device_fp is the daemon's
+ * fingerprint where a browser will warn about its certificate. The client polls
+ * until the code is approved there, refused, or runs out; oc_client_cancel_signin
+ * stops it. */
+oc_client *oc_client_start_device(const char *workspace_key, const char *host, int port,
+                                  const char *store_path, oc_secret *secret,
+                                  int remember, const char *published_fingerprint);
+
+/* Drain all queued net events into the model. Call once per frame/tick. */
+void oc_client_tick(oc_client *c);
+
+/* The current view-model (owned by the client; valid until oc_client_stop). */
+const oc_model *oc_client_model(oc_client *c);
+
+/* Drain the live thread replies worth interrupting for (REQ-061). The model is
+ * handed out const, and taking the queue necessarily empties it — considering a
+ * reply twice would toast it twice — so it goes through the client like every
+ * other mutation. See oc_model_thread_notify_take. */
+size_t oc_client_thread_notify_take(oc_client *c, int quiet, int paused,
+                                    oc_thread_notice *out, size_t max);
+
+/* Queue a message to `channel_id` for the network thread to send. */
+void oc_client_send(oc_client *c, uint64_t channel_id, const char *body);
+/* Forward `src_message` into `to_channel` with an optional note (REQ-057).
+ * The reference is structured, not prose: the daemon resolves the source
+ * author, excerpt and attachment count from the ids. */
+void oc_client_forward(oc_client *c, uint64_t to_channel, const char *note,
+                       uint64_t src_channel, uint64_t src_message);
+
+/* Request history for `channel_id` (once per channel — a frontend calls this the
+ * first time a channel is opened). Replayed messages fold into the model. */
+void oc_client_backfill(oc_client *c, uint64_t channel_id);
+/* Page BACKWARDS through a channel: the newest page strictly older
+ * than `before_message_id`. Replies arrive as ordinary messages, so the model
+ * folds them in exactly like a forward replay. */
+void oc_client_history(oc_client *c, uint64_t channel_id, uint64_t before_message_id);
+
+/* Channel membership (REQ-033). Both frames have always existed on the
+ * wire; nothing exposed them. */
+void oc_client_channel_invite(oc_client *c, uint64_t channel_id, uint64_t user_id);
+void oc_client_channel_kick(oc_client *c, uint64_t channel_id, uint64_t user_id);
+
+
+/* Mark `channel_id` read (clear its unread count). A frontend calls this for the
+ * focused channel. */
+void oc_client_mark_read(oc_client *c, uint64_t channel_id);
+
+/* Catch up on everything in ONE round trip. Marks every channel read in the
+ * local model and sends a single MARK_ALL_READ, where the loop over
+ * oc_client_mark_read sent one frame per unread conversation. The daemon
+ * advances each membership to that channel's newest message as IT sees it, so
+ * anything that arrived while the request was in flight is included -- which is
+ * what "mark everything read" means to the person who chose it. */
+void oc_client_mark_all_read(oc_client *c);
+
+/* React to a message: `op` is 1 (add) or 0 (remove). The server fans back a
+ * REACTION_UPDATED that folds into the message's aggregates. */
+void oc_client_react(oc_client *c, uint64_t channel_id, uint64_t message_id,
+                     const char *emoji, uint8_t op);
+
+/* Edit / delete a message (your own, or as a moderator). The server fans back a
+ * MSG_EDITED / MSG_DELETED that updates the model. */
+void oc_client_edit(oc_client *c, uint64_t channel_id, uint64_t message_id, const char *body);
+void oc_client_delete(oc_client *c, uint64_t channel_id, uint64_t message_id);
+
+/* Signal "I am typing" in `channel_id`. The frontend calls this (throttled) as
+ * the user composes; the server relays a TYPING_UPDATE to other members. */
+void oc_client_typing(oc_client *c, uint64_t channel_id);
+
+/* Open a thread on `parent_id` (requests its replies), post a reply to it, or
+ * close the thread view. Replies stream into the model's thread buffer. */
+void oc_client_open_thread(oc_client *c, uint64_t channel_id, uint64_t parent_id);
+void oc_client_reply(oc_client *c, uint64_t channel_id, uint64_t parent_id, const char *body);
+void oc_client_close_thread(oc_client *c);
+
+/* Run a full-text search (results stream into the model's search buffer) / close
+ * the search view. */
+void oc_client_open_search(oc_client *c);
+void oc_client_search(oc_client *c, const char *query);
+/* Next page of the current search: `before_id` is the oldest id shown. */
+void oc_client_search_more(oc_client *c, uint64_t before_id);
+void oc_client_close_search(oc_client *c);
+
+/* Channel management: create a public channel, join / leave one. The server
+ * answers with a CHANNEL_INFO that folds into the channel list. */
+void oc_client_create_channel(oc_client *c, const char *name);          /* public */
+void oc_client_create_channel_ex(oc_client *c, const char *name, int is_public);
+void oc_client_join_channel(oc_client *c, uint64_t channel_id);
+void oc_client_leave_channel(oc_client *c, uint64_t channel_id);
+/* Refresh the channel list (to discover channels created since login). */
+void oc_client_list_channels(oc_client *c);
+
+/* Refresh the tenant roster; set your own presence (OC_PRESENCE_ONLINE/_AWAY);
+ * toggle the roster overlay (frontend view state). */
+void oc_client_list_users(oc_client *c);
+void oc_client_set_presence(oc_client *c, uint8_t status);
+void oc_client_toggle_roster(oc_client *c, int open);
+
+/* Open (or get) a 1:1 DM with `user_id`; the server answers with a CHANNEL_INFO
+ * that carries the peer, so the DM titles itself from the roster. With `e2e`, a
+ * new DM encrypted end to end between this device and the one of theirs that
+ * accepts (PRIVATE-DM.md): its session is told as OC_EV_PDM, its channel comes
+ * when the daemon has made it. */
+void oc_client_open_dm(oc_client *c, uint64_t user_id, int e2e);
+
+/* Inspect who reacted to a message (REQ-071): the reactors stream into the
+ * model's reactor list (a "who reacted" overlay) / close that overlay. */
+/* Pin or unpin a message (REQ-230, ARCH-90). Any member may do either, so a
+ * frontend does not need to check who placed the pin. op is OC_PIN_ADD/REMOVE;
+ * the resulting PIN_UPDATED reaches every member and folds into the model. */
+void oc_client_pin(oc_client *c, uint64_t channel_id, uint64_t message_id, uint8_t op);
+
+/* Open / close a channel's pins list. The entries carry their bodies, so the
+ * list renders without those messages being in loaded history. */
+void oc_client_list_pins(oc_client *c, uint64_t channel_id);
+void oc_client_close_pins(oc_client *c);
+
+/* Summarize a channel or DM (REQ-310) over `scope`: OC_SUM_UNREAD, OC_SUM_TODAY,
+ * OC_SUM_DAILY, OC_SUM_WEEK, or OC_SUM_RANGE over [start_ms, end_ms). The
+ * model's summary view opens, loading, and the answer fills it; on a small
+ * server a summary not yet made may take minutes. A connection lost while it
+ * waits asks again once signed in. Shown only to the asker and kept nowhere.
+ * Returns the request's id, or 0 when nothing was asked. Close forgets it; an
+ * answer arriving after that is dropped, and the daemon, still making it,
+ * tells this person when it is made. Offer it only where
+ * oc_model_summarize_available. */
+uint32_t oc_client_summarize(oc_client *c, uint64_t channel_id, uint8_t scope, uint64_t start_ms, uint64_t end_ms);
+void     oc_client_close_summary(oc_client *c);
+/* Ask again for the open summary that was not made, over the same span: the new
+ * request id, or 0 when there is nothing to retry (none open, still waiting,
+ * made, or refused for want of access). */
+uint32_t oc_client_summary_retry(oc_client *c);
+/* While the open summary is being made: stop watching it (it goes on, and the
+ * daemon tells this person when it is made: a notice), or cancel it. Either
+ * closes it here. Closing it while it is made (oc_client_close_summary) is the
+ * same as detaching. */
+void     oc_client_summary_detach(oc_client *c);
+void     oc_client_summary_cancel(oc_client *c);
+/* Open a notice (the model's, or one Activity lists, with its channel and
+ * scope): the summary as it was made fills the open summary, as asked by the
+ * returned request id (0: nothing asked). The notice is seen. */
+uint32_t oc_client_summary_open_notice(oc_client *c, uint64_t notice_id, uint64_t channel_id, uint8_t scope);
+/* A notice seen without opening it. */
+void     oc_client_summary_dismiss(oc_client *c, uint64_t notice_id);
+
+/* A channel's OWN member roster (REQ-031) — not the tenant roster, which is
+ * oc_client_list_users. Showing the latter beside a channel name was wrong the
+ * moment a workspace held more people than one channel did. */
+/* Change a channel (REQ-034/035/036, ARCH-93): op is OC_CHUP_TOPIC / _RENAME /
+ * _ARCHIVE / _UNARCHIVE, `value` the new topic or name (ignored for archive).
+ * Any member may set a topic; rename and archive are owner/admin and the daemon
+ * enforces that — a frontend may hide the item, but must not rely on hiding it.
+ * The result arrives as a CHANNEL_INFO fanned to every member. */
+void oc_client_update_channel(oc_client *c, uint64_t channel_id, uint8_t op, const char *value);
+
+/* Ask for a channel's long-form description (REQ-034). It is not on the channel
+ * list, so a surface that shows it asks when it opens; the answer lands in the
+ * model's `description`, with `description_known` set. Setting one is
+ * oc_client_update_channel with OC_CHUP_DESCRIPTION, and every member is told. */
+void oc_client_get_channel_description(oc_client *c, uint64_t channel_id);
+
+/* Save/unsave a message (REQ-231, ARCH-95). Private: only you ever sees it, so
+ * nothing is fanned out and the ack comes back to you alone. */
+/* Fetch the messages AROUND one (REQ-232, ARCH-96) — what a permalink, a pin, a
+ * file or an activity item needs to reach something outside the loaded window.
+ * Arrives as an ordinary backfill replay. */
+void oc_client_history_around(oc_client *c, uint64_t channel_id, uint64_t message_id, uint16_t limit);
+
+void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op);
+void oc_client_list_saved(oc_client *c);
+void oc_client_close_saved(oc_client *c);
+
+/* What involved you — mentions, reactions to your messages, replies under them
+ * (REQ-139). Opening it stamps the seen watermark server-side. */
+/* `filter` is an OC_ACTF_*: the original feed, or one of the three unread views. */
+void oc_client_list_activity(oc_client *c, uint8_t filter);
+void oc_client_close_activity(oc_client *c);
+
+void oc_client_list_members(oc_client *c, uint64_t channel_id);
+
+/* Files shared in a channel, or (channel_id 0) across every channel the user
+ * can read (REQ-143, ARCH-91). */
+void oc_client_list_files(oc_client *c, uint64_t channel_id);
+/* The next page of the open list, from where it left off (REQ-143). A no-op
+ * unless the daemon said more remain and no page is already in flight; the rows
+ * are appended to `files`. */
+void oc_client_list_files_more(oc_client *c);
+void oc_client_close_files(oc_client *c);
+
+void oc_client_list_reactions(oc_client *c, uint64_t channel_id, uint64_t message_id);
+void oc_client_close_reactions(oc_client *c);
+
+/* Notification preferences (REQ-130/131). Set a channel's level
+ * (OC_NOTIFY_ALL/_MENTIONS/_NONE) or the do-not-disturb window (minutes since
+ * local midnight; enabled=0 clears it) — the server answers with a NOTIFY_PREFS
+ * sync that folds into the channels + the model DND fields. Toggle the prefs
+ * overlay (frontend view state; opening refreshes the sync). */
+void oc_client_set_notify_pref(oc_client *c, uint64_t channel_id, uint8_t level);
+/* REQ-136: the recurring schedule, stating the hours notifications are ALLOWED. */
+void oc_client_set_schedule(oc_client *c, uint8_t mode, int16_t tz_offset_min,
+                            uint16_t start_min, uint16_t end_min,
+                            const oc_schedule_day *days, uint8_t n_days);
+/* REQ-135: replace my keyword list / my priority people, wholesale. */
+void oc_client_set_keywords(oc_client *c, const char terms[][OC_KEYWORD_MAX], uint8_t n);
+void oc_client_set_priority(oc_client *c, const uint64_t *people, uint8_t n);
+/* REQ-278: pause notifications for `minutes` from now; 0 ends the pause. */
+void oc_client_set_snooze(oc_client *c, uint32_t minutes);
+/* REQ-062: threads I am in, and the two acts the view offers. */
+void oc_client_list_threads(oc_client *c, uint8_t filter);
+void oc_client_thread_follow(oc_client *c, uint64_t channel_id, uint64_t root_id, uint8_t on);
+void oc_client_mark_thread_read(oc_client *c, uint64_t root_id, uint64_t up_to);
+void oc_client_list_notify_prefs(oc_client *c);
+void oc_client_toggle_prefs(oc_client *c, int open);
+
+/* Synced client settings (the daemon-side config bucket). Identify this
+ * frontend's bucket (default "tui"; call once at startup before listing), then
+ * upsert a key (empty value deletes) or request the whole bucket — the server
+ * answers with a CLIENT_SETTINGS snapshot that folds into the model (read with
+ * oc_model_setting) and syncs to the user's other same-type devices. */
+void oc_client_set_client_type(oc_client *c, const char *client_type);
+void oc_client_set_setting(oc_client *c, const char *key, const char *value);
+/* Drafts (REQ-223, ARCH-101). `thread_root` is 0 for the channel itself; an
+ * empty or NULL body deletes the draft. */
+void oc_client_set_draft(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                         const char *body);
+void oc_client_list_drafts(oc_client *c);
+/* An UNADDRESSED draft (REQ-229): no channel yet, `recipients` a comma-separated
+ * user-id list (possibly empty). An empty body deletes it, as ever. */
+void oc_client_set_draft_to(oc_client *c, const char *recipients, const char *body);
+/* Scheduled messages (REQ-224, ARCH-102). `send_at_ms` is absolute. */
+void oc_client_schedule(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                        uint64_t send_at_ms, const char *body);
+void oc_client_list_scheduled(oc_client *c);
+void oc_client_cancel_scheduled(oc_client *c, uint64_t id);
+void oc_client_update_scheduled(oc_client *c, uint64_t id, uint64_t send_at_ms,
+                                const char *body);
+void oc_client_list_settings(oc_client *c);
+
+/* Storage usage report (REQ-214; owner/admin only — the daemon refuses it for a
+ * member). The answer folds into the model as `storage`/`storage_have`. Toggle
+ * the overlay is frontend view state. */
+void oc_client_storage_status(oc_client *c);
+/* The daemon's critical failures (REQ-263), owner/admin only: ask for the list
+ * (into the model's `srvalerts`), or acknowledge one -- `id` 0 for every one --
+ * after which the list is asked for again. */
+void oc_client_srvalerts_list(oc_client *c);
+/* Take back a delete this user made, for the short while the daemon holds it
+ * (REQ-052); every member is told it is back (MSG_RESTORED). */
+void oc_client_restore_message(oc_client *c, uint64_t channel_id, uint64_t message_id);
+void oc_client_srvalert_ack(oc_client *c, uint64_t id);
+void oc_client_toggle_storage(oc_client *c, int open);
+
+/* Audit log (REQ-251; owner/admin only). Request a page ending before
+ * `before_ms` (0 = newest); entries fold into the model, newest first. */
+void oc_client_audit_query(oc_client *c, uint64_t before_ms);
+void oc_client_toggle_audit(oc_client *c, int open);
+
+/* Self-service profile (REQ-020). Change your own display name (fans to every
+ * roster); a PROFILE_UPDATED folds into the model on success. A password is
+ * changed on the daemon's own page (oc_client_open_page, "account/password"). */
+void oc_client_set_display_name(oc_client *c, const char *name);
+/* A local account's own email address ("" clears it); answered with your profile. */
+void oc_client_set_email(oc_client *c, const char *email);
+
+/* Admin / user management (REQ-030/033; owner/admin only, enforced server-side).
+ * Set a user's tenant role (OC_ROLE_MEMBER/_ADMIN/_OWNER), mint a tenant invite
+ * token for a role (the server answers with an INVITE_CREATED, shown once in the
+ * model), or remove/disable a user. Each folds a USER_UPDATED into the roster. */
+void oc_client_set_role(oc_client *c, uint64_t user_id, uint8_t role);
+void oc_client_invite_user(oc_client *c, uint8_t role);
+/* Invite someone: bound to `email` when it is given -- spent by that address's
+ * first verified sign-in through the workspace's provider, no token to hand over
+ * -- or, with NULL/"", a bearer token for a new local account. `uses` is how
+ * many may redeem a token (REQ-026): 1 for one person; N, or 0 for no limit
+ * until it expires, for a link to pass around, which the daemon makes
+ * member-role only. The answer is an INVITE_CREATED; oc_model_invitation_text
+ * then words what to send the invited person. Offer an address where
+ * oc_model_offers_browser holds and a token where oc_model_offers_local does:
+ * a workspace refuses the other. */
+void oc_client_invite(oc_client *c, uint8_t role, const char *email, uint16_t uses);
+void oc_client_remove_user(oc_client *c, uint64_t user_id);
+/* An owner's or admin's reset link for a local account (AUTH.md §2), with its
+ * second step cleared too when `clear_step`; the model's reset_token is it. */
+void oc_client_reset_credential(oc_client *c, uint64_t user_id, int clear_step);
+/* Bring a removed member back (owner/admin). A local account's reset link comes
+ * with it, as the model's reset_token. */
+void oc_client_enable_user(oc_client *c, uint64_t user_id);
+
+/* Incoming-webhook management (REQ-170). Open the webhook overlay for a channel
+ * (refreshes the list), close it, mint a webhook (the server answers with a
+ * WEBHOOK_INFO whose token is shown once in the model), or delete one by id. */
+void oc_client_webhooks(oc_client *c, uint64_t channel_id);
+void oc_client_close_webhooks(oc_client *c);
+void oc_client_create_webhook(oc_client *c, uint64_t channel_id, const char *label);
+void oc_client_delete_webhook(oc_client *c, uint64_t webhook_id);
+/* Invite management (REQ-026) and webhook lifecycle. A webhook's
+ * token can be ROTATED but never revealed: only its hash is stored. */
+void oc_client_list_invites(oc_client *c);
+void oc_client_revoke_invite(oc_client *c, uint64_t invite_id);
+void oc_client_set_webhook_state(oc_client *c, uint64_t webhook_id, int disabled);
+void oc_client_rotate_webhook(oc_client *c, uint64_t webhook_id);
+/* Mute a conversation (REQ-137) and mark it unread from a message (REQ-235). */
+void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted);
+
+/* The global notification default (REQ-134): the level for every channel without a
+ * per-channel override. The daemon answers with a full NOTIFY_PREFS sync. */
+void oc_client_set_notify_default(oc_client *c, uint8_t level);
+
+/* Set (or clear, with 0) my avatar. The image must already have been uploaded as an
+ * attachment BY ME — the daemon refuses anything else, since an avatar is readable
+ * workspace-wide. */
+void oc_client_set_avatar(oc_client *c, uint64_t attachment_id);
+void oc_client_upload_avatar(oc_client *c, uint64_t channel_id, const char *path);
+
+/* Open (or reopen) a GROUP DM with `n` other people (REQ-056). Reopening the same
+ * set returns the same conversation. n must be >= 2 — two participants in total is a
+ * 1:1 DM and belongs to oc_client_open_dm. */
+void oc_client_open_group_dm(oc_client *c, const uint64_t *user_ids, int n);
+
+/* Custom emoji (REQ-072). `add` claims an image the caller already uploaded, as an
+ * avatar does; the daemon answers with the whole catalogue and fans it to everyone,
+ * because an emoji only half the workspace knows about is one they cannot use. */
+/* User groups (REQ-307-309). Owners and admins create, change and delete groups
+ * and change who is in them; the daemon refuses anyone else, and pushes every
+ * change to everyone. Any member of a channel may give it a group, or take one
+ * away: its members are then in the channel through it. */
+void oc_client_list_groups(oc_client *c);
+void oc_client_create_group(oc_client *c, const char *handle, const char *name, const char *description);
+void oc_client_update_group(oc_client *c, uint64_t group_id, const char *handle, const char *name,
+                            const char *description);
+void oc_client_delete_group(oc_client *c, uint64_t group_id);
+void oc_client_group_members(oc_client *c, uint64_t group_id, int add, const uint64_t *user_ids, int n);
+void oc_client_channel_group(oc_client *c, uint64_t channel_id, uint64_t group_id, int add);
+
+void oc_client_list_emoji(oc_client *c);
+void oc_client_add_emoji(oc_client *c, const char *name, uint64_t attachment_id);
+void oc_client_delete_emoji(oc_client *c, const char *name);
+/* Upload an image and register it as `name` in one step. */
+void oc_client_upload_emoji(oc_client *c, uint64_t channel_id, const char *name, const char *path);
+/* Custom status (REQ-241/122) and profile fields (REQ-240). Empty status text clears
+ * it; expiry 0 means "until changed", and the DAEMON enforces the lapse. */
+void oc_client_list_file_channels(oc_client *c);   /* */
+void oc_client_list_sessions(oc_client *c);        /* REQ-182 */
+/* Sign one of your own devices out (REQ-182); the list comes back without it. */
+void oc_client_revoke_session(oc_client *c, uint64_t session_id);
+void oc_client_set_status(oc_client *c, const char *emoji, const char *text,
+                          uint64_t expires_at);
+void oc_client_set_profile(oc_client *c, const char *full_name, const char *title,
+                           const char *pronouns, const char *phone,
+                           const char *timezone, const char *voice_id);
+void oc_client_set_read_cursor(oc_client *c, uint64_t channel_id, uint64_t message_id);
+
+/* Talking mode (REQ-291, ARCH-111): read this conversation aloud from now on.
+ * `on` 0 stops. Every message that arrives while it is on is queued and spoken
+ * in order, in its author's voice; the backlog is not read, and the queue
+ * running dry simply waits for the next message. Turning it on for another
+ * conversation replaces it, and a frontend turns it off when the user leaves the
+ * conversation -- nothing plays from a conversation that is not on screen.
+ *
+ * The core fetches; the FRONTEND plays: take the bytes with
+ * oc_model_listen_take_audio, play them (oc_player over an audio-only MP4), and
+ * call oc_client_listen_done when they finish or the user skips, which is what
+ * moves the queue on. */
+void oc_client_listen(oc_client *c, uint64_t channel_id, int on);
+void oc_client_listen_done(oc_client *c);
+/* Hear voice `voice_id` (one TTS_INFO listed) say the audition sentence (REQ-292).
+ * The sample arrives in the model for oc_model_preview_take_audio; nothing
+ * arrives if it cannot be had. Queued behind any transfer already running. */
+void oc_client_voice_preview(oc_client *c, const char *voice_id);
+
+/* Voice input (REQ-296-300, ARCH-112): send one segment of 16 kHz mono speech
+ * for `mode` (OC_STT_MODE_PTT / _FREE) spoken into (channel_id, thread_root).
+ * Safe to call from a capture thread. In free talk the daemon posts the words
+ * as a message; in push to talk they come back for the composer
+ * (oc_model_stt_take_words). Returns the segment id, 0 if it could not be
+ * queued. The audio is copied; nothing is written to disk. */
+uint32_t oc_client_stt_send(oc_client *c, uint8_t mode, uint64_t channel_id, uint64_t thread_root,
+                            const int16_t *pcm, size_t samples);
+
+/* Calls (REQ-150, REQ-301-305, docs/CALLS.md). Start a call in a conversation,
+ * inviting `invite` (the members, up to the cap, or the starter's pick); join the
+ * call already there; leave it; decline an invitation; end it for everyone (the
+ * starter only); invite more people. The daemon's answers fold into the model:
+ * `calls` for the Calls section, `call` / `in_call` for the one this client is
+ * in, `call_error` for a refusal. */
+void oc_client_call_start(oc_client *c, uint64_t channel_id, const uint64_t *invite, int n);
+void oc_client_call_join(oc_client *c, uint64_t channel_id);
+
+/* Encrypted DMs (PRIVATE-DM.md, client/core/pdm.h), opened with
+ * oc_client_open_dm(.., 1). What comes of each session is told as OC_EV_PDM and
+ * kept in the model (oc_model_pdm); what is said goes as in any DM. Accept or
+ * decline an invitation on this device; end one; and trust the other device's
+ * changed key (after comparing the safety number). */
+void oc_client_pdm_accept(oc_client *c, uint64_t pdm_id);
+void oc_client_pdm_decline(oc_client *c, uint64_t pdm_id);
+void oc_client_pdm_close(oc_client *c, uint64_t pdm_id);
+void oc_client_pdm_trust(oc_client *c, uint64_t pdm_id);
+void oc_client_call_leave(oc_client *c, uint64_t channel_id);
+void oc_client_call_decline(oc_client *c, uint64_t channel_id);
+void oc_client_call_end(oc_client *c, uint64_t channel_id);
+void oc_client_call_invite(oc_client *c, uint64_t channel_id, const uint64_t *uids, int n);
+/* Start (on) or stop sharing a screen in the call this client is in (REQ-161).
+ * The daemon's CALL_STATE names the sharer; the media engine sends once it is
+ * this device. */
+void oc_client_call_share(oc_client *c, uint64_t channel_id, int on);
+/* Where the audio goes (callsig.h): a frontend that does calls plugs in its
+ * media engine before offering them. NULL removes it; on return nothing is
+ * calling into the old one. */
+void oc_client_set_call_media(oc_client *c, const oc_call_media *media, void *ctx);
+/* Drain the invitations worth a toast (oc_model_call_notify_take). */
+size_t oc_client_call_notify_take(oc_client *c, int quiet, int paused,
+                                  oc_call_notice *out, size_t max);
+
+/* Attachments (REQ-140/141). Upload a local file and post it to `channel_id`
+ * (the core streams it, then links it into a message); download an attachment by
+ * id to `dest_path`. Progress + completion arrive as OC_EV_XFER status lines.
+ * The upload returns its tag, or 0 if nothing was queued. */
+uint64_t oc_client_upload(oc_client *c, uint64_t channel_id, const char *path);
+/* Post up to OC_MAX_ATTACH local files and `text` (may be empty) as ONE
+ * message, to `channel_id` or, with a `thread_root`, into that thread. The files
+ * upload in order, then the message goes; progress names the file moving
+ * (oc_model_xfer's `file`), and one failure or a cancel posts nothing. Returns
+ * the tag, or 0 if nothing was queued. */
+uint64_t oc_client_post_files(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                              const char *const *paths, size_t n_paths, const char *text);
+/* One file of a post: a local file (`path`), or bytes held in memory (`data`,
+ * `len`) uploaded under `name` -- an image pasted from the clipboard, which is
+ * never written to disk (ARCH-88). The core copies the bytes. */
+typedef struct {
+    const char    *path;
+    const uint8_t *data;
+    size_t         len;
+    const char    *name;
+} oc_post_item;
+/* oc_client_post_files, for files and in-memory items alike. */
+uint64_t oc_client_post_items(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                              const oc_post_item *items, size_t n_items, const char *text);
+void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_path);
+
+/* Fetch an attachment INTO MEMORY: the bytes arrive as an
+ * OC_EV_ATTACHMENT_DATA the frontend consumes, with no file written anywhere
+ * (ARCH-88). For inline images; anything over the core's inline cap is dropped
+ * rather than buffered, so a caller should fall back to a real download. */
+void oc_client_fetch_attachment(oc_client *c, uint64_t attachment_id);
+
+/* Transfers wait their turn in a queue rather than being refused while another
+ * runs; each carries a tag that its OC_EV_XFER progress and completion events
+ * repeat. A download's or fetch's tag is the attachment id. */
+
+/* Post a video message (REQ-162): the recorder's MP4 and poster JPEG, which the
+ * core takes ownership of (both are freed whatever happens), its measured length
+ * and size, and a caption (may be empty). `thread_root` 0 posts to the channel,
+ * otherwise into that thread. The core uploads the poster and the video,
+ * reports the media facts and sends the message; OC_EV_MEDIA_POSTED says it
+ * went. Returns the job's tag, or 0 if nothing was queued. */
+uint64_t oc_client_post_video(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                              uint8_t *video, size_t video_len, uint8_t *poster, size_t poster_len,
+                              uint32_t duration_ms, uint16_t width, uint16_t height,
+                              const char *caption);
+/* Fetch a video message into memory for playing (REQ-165): like
+ * oc_client_fetch_attachment, under the attachment ceiling rather than the
+ * inline one, with progress. Returns the tag (the attachment id). */
+uint64_t oc_client_fetch_media(oc_client *c, uint64_t attachment_id);
+/* Drop a queued transfer, or abort it if it is running. */
+void oc_client_cancel_transfer(oc_client *c, uint64_t tag);
+
+/* Log out: revoke this session (scope OC_LOGOUT_THIS) or all of the user's
+ * (OC_LOGOUT_ALL); the server closes the connection. */
+void oc_client_logout(oc_client *c, uint8_t scope);
+
+/* Force an immediate reconnect if the client is currently backing off after a
+ * dropped connection (otherwise a no-op). */
+void oc_client_reconnect(oc_client *c);
+
+/* One of the daemon's own pages for the browser to open (AUTH.md §8.10) --
+ * `page` "account/password", `query` its query or NULL: directly on a daemon a
+ * trusted authority vouches for, else through a loopback tunnel held open ten
+ * minutes. Its URL into `url`. 0, or -1 before the client has connected. */
+int oc_client_open_page(oc_client *c, const char *page, const char *query, char *url, size_t cap);
+/* 1 when those pages open directly -- a link to one works from any browser,
+ * not only through this client's tunnel -- else 0. */
+int oc_client_pages_direct(oc_client *c);
+
+/* Stop waiting for a browser sign-in (model->signin_url is set while one waits).
+ * The model then carries "sign-in cancelled" as its last error. */
+void oc_client_cancel_signin(oc_client *c);
+
+/* Trust the certificate the person was shown (model->cert_fp, ARCH-10): kept
+ * for this workspace and presented on a new attempt, made at once. Its
+ * fingerprint in hex, as the model carries it. Returns 0, or -1 if `fp_hex` is
+ * not one. */
+int oc_client_trust_cert(oc_client *c, const char *fp_hex);
+/* 64 hex digits into 32 bytes. Returns 0. */
+int oc_fingerprint_from_hex(const char *hex, unsigned char fp[32]);
+
+/* A fingerprint as a person reads it and an administrator's tools print it:
+ * upper-case byte pairs joined by colons, `per_line` bytes to a line (0: one
+ * line). Returns 0, or -1 if `hex` is not a fingerprint. */
+int oc_fingerprint_format(const char *hex, int per_line, char *out, size_t cap);
+
+/* How many sends are queued but unacknowledged (REQ-102). The outbox lives in
+ * memory only (ARCH-88), so a frontend should warn before quitting while this is
+ * non-zero — otherwise the user silently loses what they typed. */
+int oc_client_outbox_pending(oc_client *c);
+
+/* Stop the network thread, drain remaining events, and free everything. */
+void oc_client_stop(oc_client *c);
+
+#endif /* OC_CLIENT_H */

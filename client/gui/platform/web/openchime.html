@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OpenChime</title>
+<style>
+/* The canvas is sized by SDL to the browser window (fill-document); a size
+   here would take that over. The background is the client's own, so nothing
+   white shows while it loads or around it. */
+html,body{margin:0;height:100%;background:#162238;overflow:hidden}
+canvas{display:block;outline:none}
+/* The load screen: over the canvas until the client draws its first frame. */
+#load{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:14px;background:#162238;color:#e6ebf4;font:14px system-ui,sans-serif}
+#load .mark{font-size:24px;font-weight:600;letter-spacing:.2px}
+#load .track{width:min(320px,70vw);height:6px;border-radius:3px;background:#24324d;overflow:hidden}
+#load .fill{height:100%;width:0;background:#3b82f6;border-radius:3px;transition:width .15s linear}
+#load .fill.busy{width:30%;animation:oc-busy 1.2s ease-in-out infinite}
+@keyframes oc-busy{from{transform:translateX(-100%)}to{transform:translateX(340%)}}
+#load .stage{color:#a6b0c3;min-height:1.4em;text-align:center;max-width:min(480px,86vw)}
+#load.failed .fill{background:#ef4444;width:100%;animation:none}
+#load button{font:inherit;color:#fff;background:#3b82f6;border:0;border-radius:6px;padding:7px 16px;cursor:pointer}
+@media (prefers-reduced-motion:reduce){#load .fill{transition:none}#load .fill.busy{animation:none;width:100%;opacity:.5}}
+</style>
+</head>
+<body>
+<canvas id="canvas" tabindex="0"></canvas>
+<div id="load">
+  <div class="mark">OpenChime</div>
+  <div class="track" role="progressbar" aria-label="Loading OpenChime" aria-valuemin="0" aria-valuemax="100"><div class="fill busy"></div></div>
+  <div class="stage" aria-live="polite">Loading…</div>
+  <button type="button" hidden>Try again</button>
+</div>
+<script>
+{ // A block: this script's names stay its own. The loader is a classic
+  // script in the same global scope, and with its worker and worklet
+  // bootstraps inside it (WASM_WORKERS) it declares names of its own there.
+  // The client: ?host=…&port=…&user=…&pass=… signs in straight away; without them
+  // the sign-in view opens. The core dials host:port; Emscripten turns that into
+  // one WebSocket at ws(s)://host:port/ws, the daemon's transport.
+  const q = new URLSearchParams(location.search);
+  // The mode (CONFIG.md "Mode"): `normal` as built, rewritten by the daemon
+  // that serves this page when it runs in development mode (daemon/webapp.c),
+  // and by scripts/web/serve.py. Never read from the address: only on a page
+  // from a development daemon do the harness's inputs below (?hook=, ?shot=,
+  // ?cmd=, ?env=, ?mic=) do anything, so a link cannot turn them on.
+  const mode = /*OC_MODE*/'normal';
+  const dev = mode === 'development';
+  const host = q.get('host') || location.hostname;
+  const port = q.get('port') || location.port || (location.protocol === 'https:' ? '443' : '80');
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  // The load screen (WEB.md, "Loading"): what the page is doing until the
+  // client draws its first frame -- the download by bytes, then each stage by
+  // name -- or, when it cannot go on, why, with a way to try again. It never
+  // sits at one word with nothing moving.
+  const load = document.getElementById('load');
+  const track = load.querySelector('.track'), fill = load.querySelector('.fill');
+  const stageEl = load.querySelector('.stage'), retry = load.querySelector('button');
+  let failed = false, downloading = false, lastByte = 0;
+  const stage = (text, frac) => {
+    if (failed || !load.isConnected) return;
+    if (stageEl.textContent !== text) stageEl.textContent = text;
+    if (frac == null) { fill.classList.add('busy'); fill.style.width = ''; track.removeAttribute('aria-valuenow'); }
+    else {
+      const pct = Math.max(0, Math.min(100, Math.round(frac * 100)));
+      fill.classList.remove('busy'); fill.style.width = pct + '%'; track.setAttribute('aria-valuenow', String(pct));
+    }
+  };
+  const fail = (why) => {
+    if (failed || !load.isConnected) return;
+    failed = true; downloading = false;
+    load.classList.add('failed'); track.removeAttribute('aria-valuenow');
+    stageEl.textContent = why; retry.hidden = false; retry.focus();
+  };
+  retry.addEventListener('click', () => location.reload());
+  window.ocLoaded = () => { if (!failed) load.remove(); };
+  const mb = (n) => (n / 1048576).toFixed(1);
+  // A download that stops arriving says so rather than waiting forever.
+  setInterval(() => { if (downloading && Date.now() - lastByte > 30000) fail('The download stopped. Check the connection and try again.'); }, 2000);
+  // A script error before the first frame is a start that failed (fail() does
+  // nothing once the screen is down).
+  window.addEventListener('error', (ev) => fail('OpenChime could not start: ' + (ev.message || 'a script failed')));
+  // The test hook (OPENCHIME_DEV_DIR, TESTING.md), on the page's filesystem,
+  // when the page is opened with ?hook=1: ocHook('verb args') answers the ack,
+  // and ?shot=<ms> logs the client's own screenshot as SHOT:<base64 BMP> after
+  // that many milliseconds -- what scripts/web/test.sh reads.
+  // ?hook=1 is kept for the tab: the sign-in leaves the page and comes back
+  // to /app/ without the query, and the harness still wants the hook there.
+  if (dev && q.get('hook') === '1') { try { sessionStorage.setItem('oc.hook', '1'); } catch (e) {} }
+  let hookKept = false; try { hookKept = dev && sessionStorage.getItem('oc.hook') === '1'; } catch (e) {}
+  // The development inputs (?env=, ?mic=) are kept for the tab the same way: the
+  // sign-in leaves for the daemon's page and comes back without the query.
+  // OPENCHIME_MODE itself is the page's, never an ?env=.
+  let envs = dev ? q.getAll('env').filter((kv) => !kv.startsWith('OPENCHIME_MODE=')) : [], micUrl = dev ? q.get('mic') : '';
+  if (dev) try {
+    if (envs.length) sessionStorage.setItem('oc.env', JSON.stringify(envs));
+    else envs = JSON.parse(sessionStorage.getItem('oc.env') || '[]');
+    if (micUrl) sessionStorage.setItem('oc.mic', micUrl);
+    else micUrl = sessionStorage.getItem('oc.mic') || '';
+  } catch (e) {}
+  const hookOn = dev && (q.get('hook') === '1' || hookKept || q.has('shot') || q.has('cmd'));
+  // The verb goes in, and the FRESH ack comes back: the old one is removed
+  // first and the answer polled for, up to `wait` ms (a slow verb answers
+  // late; a stale ack would be the previous verb's).
+  window.ocHook = (cmd, wait) => new Promise((res) => {
+    try { FS.unlink('/t\\ack'); } catch (e) {}
+    FS.writeFile('/t\\cmd', cmd);
+    const t0 = Date.now(), limit = wait || 10000;
+    const poll = () => { let a = null; try { a = FS.readFile('/t\\ack', { encoding: 'utf8' }); } catch (e) {}
+      if (a !== null) res(a); else if (Date.now() - t0 > limit) res('(no ack)'); else setTimeout(poll, 20); };
+    setTimeout(poll, 20);
+  });
+  window.ocShot = async () => { await ocHook('shot /shot.bmp', 1500); const b = FS.readFile('/shot.bmp'); let s = ''; for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(s); };
+  // The command line. Served by the daemon (WEB.md) the page is
+  // `openchime --signin <host:port>`: the workspace is the page's own origin
+  // (or ?ws=, or ?host=&port=, for a page served from elsewhere), and the
+  // client signs in on the daemon's pages and comes back here with the token
+  // (?token=, which the client takes off the address).
+  // `/app/?invite=<hex>` is an invitation link (REQ-026): the client begins
+  // the sign-in with it, so the daemon's page opens on the sign-up form.
+  const args = [];
+  { let ws = q.get('ws') || q.get('host') || '';
+    if (q.get('host') && q.get('port')) ws = q.get('host') + ':' + q.get('port');
+    args.push('--signin', ws || `${host}:${port}`);
+    // An invitation: a token's hex, or a demo workspace's signed invite
+    // (three base64url segments, AUTH.md §8.12), which the daemon checks.
+    const inv = q.get('invite') || '';
+    if (/^[0-9a-f]{64}$/.test(inv) || (inv.length <= 1000 && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(inv)))
+      args.push('--invite', inv); }
+  var Module = {
+    arguments: args,
+    // The test knobs the native harness sets in the environment (TESTING.md)
+    // are the page's ?env=NAME=value (repeatable); ?mic=<url> puts a WAV on the
+    // page's filesystem at /mic.wav for OPENCHIME_DEV_MIC.
+    preRun: [() => {
+      ENV.OPENCHIME_MODE = mode;
+      if (q.has('stats')) ENV.OC_WEB_STATS = '1';
+      if (hookOn) { ENV.OPENCHIME_DEV_DIR = '/t'; try { FS.mkdir('/t'); } catch (e) {} }
+      for (const kv of envs) { const i = kv.indexOf('='); if (i > 0) ENV[kv.slice(0, i)] = kv.slice(i + 1); }
+      if (micUrl) {
+        addRunDependency('mic');
+        fetch(micUrl).then((r) => r.arrayBuffer()).then((b) => { FS.writeFile('/mic.wav', new Uint8Array(b)); removeRunDependency('mic'); })
+          .catch((e) => { console.error('mic: ' + e); removeRunDependency('mic'); });
+      }
+    }],
+    canvas: document.getElementById('canvas'),
+    // The wasm is fetched here rather than by the loader, so its bytes can be
+    // counted as they arrive; it still compiles while it streams. The size is
+    // the daemon's X-OC-Size (with gzip, Content-Length is the compressed
+    // size), else Content-Length, else unknown and the bar just moves.
+    instantiateWasm: (imports, done) => {
+      (async () => {
+        stage('Downloading…');
+        const r = await fetch('openchime.wasm', { credentials: 'same-origin' });
+        if (!r.ok) throw new Error('the server answered ' + r.status);
+        const total = Number(r.headers.get('X-OC-Size')) ||
+                      (r.headers.get('Content-Encoding') ? 0 : Number(r.headers.get('Content-Length'))) || 0;
+        let got = 0;
+        downloading = true; lastByte = Date.now();
+        const counted = r.body.pipeThrough(new TransformStream({
+          transform(chunk, c) {
+            got += chunk.byteLength; lastByte = Date.now();
+            if (total) stage(`Downloading ${mb(Math.min(got, total))} of ${mb(total)} MB`, got / total);
+            else stage(`Downloading ${mb(got)} MB`);
+            c.enqueue(chunk);
+          },
+          flush() { downloading = false; stage('Compiling…'); },
+        }));
+        const res = new Response(counted, { headers: { 'Content-Type': 'application/wasm' } });
+        const out = await WebAssembly.instantiateStreaming(res, imports);
+        stage('Starting…');
+        done(out.instance, out.module);
+      })().catch((e) => fail('OpenChime could not be downloaded: ' + (e && e.message ? e.message : e)));
+      return {};
+    },
+    onAbort: (what) => fail('OpenChime stopped: ' + what),
+    websocket: { url: q.get('ws') || `${scheme}://${host}:${port}/ws`, subprotocol: 'binary' },
+    print: (t) => console.log(t),
+    printErr: (t) => console.error(t),
+    onRuntimeInitialized: () => {
+      stage('Opening…');
+      // ?open=openchime://... : a permalink for the running client, as a second
+      // launch hands one over on a desktop.
+      if (q.get('open')) setTimeout(() => Module.ccall('oc_web_handoff', null, ['string', 'string'], ['url', q.get('open')]), 4000);
+    },
+  };
+  if (hookOn && q.has('cmd')) setTimeout(async () => console.log('ACK:' + (await ocHook(q.get('cmd')))), parseInt(q.get('at') || '6000', 10));
+  // ?ime=1: once signed in, a composition is played into the hidden input the
+  // platform keeps for the input method (plat_web.c) -- what a Japanese IME
+  // sends -- and the composer's text is logged as IME: for the web test.
+  if (hookOn && q.get('ime') === '1') (async () => {
+    const t0 = Date.now(); let line = '';
+    while (Date.now() - t0 < 60000) {
+      await new Promise((r) => setTimeout(r, 1500));
+      try { await ocHook('dump /dump.txt', 1200); line = FS.readFile('/dump.txt', { encoding: 'utf8' }).split('\n')[0]; } catch (e) { line = ''; }
+      if (line.includes('authed=1')) break;
+    }
+    await ocHook('channel general', 1500);
+    await new Promise((r) => setTimeout(r, 1500));
+    const ime = document.getElementById('oc-ime');
+    ime.focus();
+    ime.dispatchEvent(new CompositionEvent('compositionstart', { data: '' }));
+    ime.dispatchEvent(new CompositionEvent('compositionupdate', { data: 'にほ' }));
+    await new Promise((r) => setTimeout(r, 400));
+    await ocHook('dump /dump.txt', 1200);
+    let mid = ''; try { mid = FS.readFile('/dump.txt', { encoding: 'utf8' }).split('\n').find((l) => l.startsWith('ed ')) || ''; } catch (e) {}
+    ime.dispatchEvent(new CompositionEvent('compositionend', { data: '日本' }));
+    await new Promise((r) => setTimeout(r, 600));
+    await ocHook('dump /dump.txt', 1200);
+    let after = ''; try { after = FS.readFile('/dump.txt', { encoding: 'utf8' }).split('\n').find((l) => l.startsWith('ed ')) || ''; } catch (e) {}
+    console.log('IME-COMPOSING:' + mid);
+    console.log('IME:' + after);
+  })();
+  // ?script=verb@ms|verb@ms…: each verb at its time after the client is signed
+  // in, its ACK logged; then, after the last, DUMP: of the model -- the web
+  // test's way of recording a video message end to end.
+  if (hookOn && q.has('script')) (async () => {
+    const t0 = Date.now(); let line = '';
+    while (Date.now() - t0 < 60000) {
+      await new Promise((r) => setTimeout(r, 1500));
+      try { await ocHook('dump /dump.txt', 1200); line = FS.readFile('/dump.txt', { encoding: 'utf8' }).split('\n')[0]; } catch (e) { line = ''; }
+      if (line.includes('authed=1')) break;
+    }
+    const start = Date.now();
+    for (const step of q.get('script').split('|')) {
+      const [verb, at] = step.split('@');
+      const wait = start + parseInt(at || '0', 10) - Date.now();
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      console.log('ACK ' + verb + ': ' + (await ocHook(verb, 1200)));
+    }
+    await ocHook('dump /dump.txt', 1500);
+    try { console.log('DUMPALL:' + btoa(unescape(encodeURIComponent(FS.readFile('/dump.txt', { encoding: 'utf8' }))))); } catch (e) { console.log('DUMP-ERR:' + e); }
+  })();
+  if (hookOn && q.has('dumpat')) setTimeout(async () => { await ocHook('dump /dump.txt', 1200); try { console.log('DUMP:' + FS.readFile('/dump.txt', { encoding: 'utf8' }).split('\n')[0]); } catch (e) { console.log('DUMP-ERR:' + e); } }, parseInt(q.get('dumpat'), 10));
+  // ?wait=authed&shot=1: poll the model until it is signed in (or 60 s pass),
+  // log that line as DUMP:, then the screenshot -- the test's whole exchange.
+  if (hookOn && q.get('wait') === 'authed') (async () => {
+    const t0 = Date.now(); let line = '';
+    while (Date.now() - t0 < 60000) {
+      await new Promise((r) => setTimeout(r, 1500));
+      try { await ocHook('dump /dump.txt', 1200); line = FS.readFile('/dump.txt', { encoding: 'utf8' }).split('\n')[0]; } catch (e) { line = ''; }
+      if (line.includes('authed=1')) break;
+    }
+    console.log('DUMP:' + line);
+    if (q.has('shot')) { try { console.log('SHOT:' + (await ocShot())); } catch (e) { console.log('SHOT-ERR:' + e); } }
+  })();
+  else if (hookOn && q.has('shot')) setTimeout(async () => { try { console.log('SHOT:' + (await ocShot())); } catch (e) { console.log('SHOT-ERR:' + e); } }, parseInt(q.get('shot'), 10));
+}
+</script>
+<script>
+// Threads need the page cross-origin isolated (the daemon's headers say so);
+// without it the loader cannot start, so say that instead of loading it.
+if (!window.crossOriginIsolated) {
+  document.querySelector('#load .stage').textContent =
+    'This page was not served with the isolation OpenChime needs (Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy). Open it from the workspace\'s own address.';
+  document.getElementById('load').classList.add('failed');
+} else {
+  const s = document.createElement('script');
+  s.src = 'openchime.js';
+  s.onerror = () => { const l = document.getElementById('load'); if (!l) return;
+    l.classList.add('failed'); l.querySelector('.stage').textContent = 'OpenChime could not be downloaded. Check the connection and try again.';
+    const b = l.querySelector('button'); b.hidden = false; };
+  document.body.appendChild(s);
+}
+</script>
+</body>
+</html>

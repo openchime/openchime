@@ -1,0 +1,1610 @@
+/*
+ * OpenChime client — the app-core facade (ARCH-74). See client.h.
+ */
+
+#include "client.h"
+
+#include "wellknown.h"   /* the published fingerprint, as bytes (ARCH-10) */
+
+#include "event.h"
+#include "net.h"
+#include "queue.h"
+#include "protocol.h"   /* the OC_NOTIFY_* levels are wire constants */
+
+#include "oc_port.h"    /* oc_localtime_r */
+
+#include <ctype.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+/* A tag for a transfer that has no attachment id yet. The high bit keeps it
+ * apart from every attachment id, which is what a download's tag is. */
+static uint64_t next_xfer_tag(void) {
+    static uint64_t n;
+    return (1ull << 63) | ++n;   /* the UI thread is the only caller */
+}
+
+
+struct oc_client {
+    oc_net  *net;
+    oc_queue events;   /* net -> UI (oc_ev) */
+    oc_queue cmds;     /* UI -> net (oc_cmd) */
+    oc_model model;
+    uint32_t next_req; /* SUMMARIZE's request ids; the UI thread's alone */
+};
+
+oc_client *oc_client_start(const char *host, int port, const char *cred) {
+    return oc_client_start_secure(host, port, cred, NULL, NULL);
+}
+
+oc_client *oc_client_start_stored(const char *host, int port, const char *cred,
+                                  const char *store_path) {
+    return oc_client_start_secure(host, port, cred, store_path, NULL);
+}
+
+oc_client *oc_client_start_secure(const char *host, int port, const char *cred,
+                                  const char *store_path, oc_secret *secret) {
+    return oc_client_start_named(NULL, host, port, cred, store_path, secret);
+}
+
+oc_client *oc_client_start_named(const char *workspace_key, const char *host, int port,
+                                 const char *cred, const char *store_path, oc_secret *secret) {
+    return oc_client_start_opts(workspace_key, host, port, cred, store_path, secret, 1);
+}
+
+oc_client *oc_client_start_opts(const char *workspace_key, const char *host, int port,
+                                const char *cred, const char *store_path, oc_secret *secret,
+                                int remember) {
+    return oc_client_start_verified(workspace_key, host, port, cred, store_path, secret,
+                                    remember, NULL);
+}
+
+oc_client *oc_client_start_verified(const char *workspace_key, const char *host, int port,
+                                    const char *cred, const char *store_path, oc_secret *secret,
+                                    int remember, const char *published_fingerprint) {
+    return oc_client_start_signin(workspace_key, host, port, cred, NULL, NULL, store_path, secret,
+                                  remember, published_fingerprint);
+}
+
+static oc_client *client_start(const char *workspace_key, const char *host, int port,
+                               const char *cred, const char *source_id, const char *invite, int device,
+                               int reset, const oc_signin_result *result,
+                               const char *store_path, oc_secret *secret,
+                               int remember, const char *published_fingerprint);
+
+oc_client *oc_client_start_device(const char *workspace_key, const char *host, int port,
+                                  const char *store_path, oc_secret *secret,
+                                  int remember, const char *published_fingerprint) {
+    return client_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, NULL, 1, 0, NULL, store_path, secret,
+                        remember, published_fingerprint);
+}
+
+oc_client *oc_client_start_signin(const char *workspace_key, const char *host, int port,
+                                  const char *cred, const char *source_id, const char *invite,
+                                  const char *store_path, oc_secret *secret,
+                                  int remember, const char *published_fingerprint) {
+    return client_start(workspace_key, host, port, cred, source_id, invite, 0, 0, NULL, store_path, secret,
+                        remember, published_fingerprint);
+}
+
+oc_client *oc_client_start_signin_result(const char *workspace_key, const char *host, int port,
+                                         const oc_signin_result *result,
+                                         const char *store_path, oc_secret *secret,
+                                         int remember, const char *published_fingerprint) {
+    return client_start(workspace_key, host, port, "", result ? result->source_id : NULL, NULL, 0, 0, result,
+                        store_path, secret, remember, published_fingerprint);
+}
+
+oc_client *oc_client_start_reset(const char *workspace_key, const char *host, int port, const char *reset,
+                                 const char *store_path, oc_secret *secret,
+                                 int remember, const char *published_fingerprint) {
+    return client_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, reset, 0, 1, NULL, store_path, secret,
+                        remember, published_fingerprint);
+}
+
+static oc_client *client_start(const char *workspace_key, const char *host, int port,
+                               const char *cred, const char *source_id, const char *invite, int device,
+                               int reset, const oc_signin_result *result,
+                               const char *store_path, oc_secret *secret,
+                               int remember, const char *published_fingerprint) {
+    oc_client *c = calloc(1, sizeof *c);
+    if (!c) return NULL;
+    oc_queue_init(&c->events);
+    oc_queue_init(&c->cmds);
+    oc_model_init(&c->model);
+    /* Text that is not a fingerprint is treated as none: a pin half-read is not
+     * a weaker check, it is a different one (oc_wellknown_fingerprint_bytes). */
+    unsigned char pin[OC_TLS_FINGERPRINT_LEN];
+    int have = published_fingerprint && published_fingerprint[0] &&
+               oc_wellknown_fingerprint_bytes(published_fingerprint, pin) == 0;
+    c->net = device ? oc_net_start_device(workspace_key, host, port, store_path, secret, !remember,
+                                          have ? pin : NULL, &c->events, &c->cmds)
+           : reset  ? oc_net_start_reset(workspace_key, host, port, invite, store_path, secret, !remember,
+                                         have ? pin : NULL, &c->events, &c->cmds)
+           : result  ? oc_net_start_signin_result(workspace_key, host, port, result, store_path, secret,
+                                                 !remember, have ? pin : NULL, &c->events, &c->cmds)
+                    : oc_net_start_signin(workspace_key, host, port, cred, source_id, invite, store_path, secret,
+                                          !remember, have ? pin : NULL, &c->events, &c->cmds);
+    if (!c->net) {
+        oc_queue_destroy(&c->events);
+        oc_queue_destroy(&c->cmds);
+        oc_model_free(&c->model);
+        free(c);
+        return NULL;
+    }
+    return c;
+}
+
+/* Keep talking mode fed (ARCH-111): with nothing in hand and nothing on its way,
+ * ask for the next queued message's speech. One at a time, so the rendering the
+ * listener is about to hear is the one the daemon is working on. */
+static void listen_pump(oc_client *c) {
+    oc_model *m = &c->model;
+    if (!m->listen_channel || m->listen_fetching || m->listen_ready || m->listen_playing) return;
+    if (m->n_listen_queue == 0) return;
+    uint64_t id = m->listen_queue[0];
+    memmove(m->listen_queue, m->listen_queue + 1, (m->n_listen_queue - 1) * sizeof *m->listen_queue);
+    m->n_listen_queue--;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LISTEN_FETCH);
+    if (!cmd) return;
+    cmd->message_id = id;
+    m->listen_fetching = id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+static int summary_send(oc_client *c);
+
+void oc_client_tick(oc_client *c) {
+    if (!c) return;
+    oc_ev *e;
+    while ((e = oc_queue_try_pop(&c->events)) != NULL) {
+        oc_model_apply(&c->model, e);
+        oc_ev_free(e);
+    }
+    if (c->model.summary_resend && c->model.authed) {
+        c->model.summary_resend = 0;
+        if (c->model.summary_open && c->model.summary_loading) summary_send(c);
+    }
+    listen_pump(c);
+}
+
+void oc_client_listen(oc_client *c, uint64_t channel_id, int on) {
+    if (!c) return;
+    oc_model *m = &c->model;
+    /* Starting, stopping and moving to another conversation all begin from
+     * silence: whatever was fetched or queued belonged to the old one. */
+    free(m->listen_ready);
+    m->listen_ready = NULL;
+    m->listen_ready_len = 0;
+    m->listen_ready_id = 0;
+    m->listen_fetching = 0;
+    m->listen_playing = 0;
+    m->n_listen_queue = 0;
+    m->listen_skipped = 0;
+    m->listen_channel = (on && channel_id) ? channel_id : 0;
+}
+
+uint32_t oc_client_stt_send(oc_client *c, uint8_t mode, uint64_t channel_id, uint64_t thread_root,
+                            const int16_t *pcm, size_t samples) {
+    static _Atomic uint32_t next_id;
+    if (!c || !pcm || !samples) return 0;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_STT_SEGMENT);
+    if (!cmd) return 0;
+    cmd->blob = malloc(samples * 2);
+    if (!cmd->blob) { oc_cmd_free(cmd); return 0; }
+    for (size_t i = 0; i < samples; i++) {          /* little-endian on the wire */
+        uint16_t v = (uint16_t)pcm[i];
+        cmd->blob[2 * i] = (uint8_t)v;
+        cmd->blob[2 * i + 1] = (uint8_t)(v >> 8);
+    }
+    cmd->blob_len = samples * 2;
+    uint32_t id = atomic_fetch_add(&next_id, 1) + 1;
+    cmd->xfer_tag = id;
+    cmd->op = mode;
+    cmd->channel_id = channel_id;
+    cmd->message_id = thread_root;
+    oc_queue_push(&c->cmds, cmd);
+    return id;
+}
+
+void oc_client_voice_preview(oc_client *c, const char *voice_id) {
+    if (!c || !voice_id || !*voice_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_VOICE_PREVIEW);
+    if (!cmd) return;
+    cmd->body = strdup(voice_id);
+    if (!cmd->body) { oc_cmd_free(cmd); return; }
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_listen_done(oc_client *c) {
+    if (!c) return;
+    c->model.listen_playing = 0;
+    listen_pump(c);
+}
+
+const oc_model *oc_client_model(oc_client *c) {
+    return c ? &c->model : NULL;
+}
+
+size_t oc_client_thread_notify_take(oc_client *c, int quiet, int paused,
+                                    oc_thread_notice *out, size_t max) {
+    if (!c) return 0;
+    return oc_model_thread_notify_take(&c->model, quiet, paused, out, max);
+}
+
+void oc_client_send(oc_client *c, uint64_t channel_id, const char *body) {
+    if (!c || !body) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SEND);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->body = strdup(body);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* Forward a message into another conversation (REQ-057). `note` is the
+ * forwarder's own words and may be empty; the attribution is NOT prose in the
+ * body — the two source ids travel with the send and the daemon resolves the
+ * rest, so the recipient's client renders a card it can recognise rather than
+ * string-matching a sentence someone could equally have typed by hand. */
+void oc_client_forward(oc_client *c, uint64_t to_channel, const char *note,
+                       uint64_t src_channel, uint64_t src_message) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SEND);
+    if (!cmd) return;
+    cmd->channel_id = to_channel;
+    cmd->body = strdup(note ? note : "");
+    cmd->src_channel = src_channel;
+    cmd->src_message = src_message;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_backfill(oc_client *c, uint64_t channel_id) {
+    if (!c) return;
+    /* Ask at most once per channel; a known channel gets its flag set, an
+     * unknown one is requested anyway (the reducer will create it on reply). */
+    oc_channel *ch = oc_model_channel(&c->model, channel_id);
+    if (ch) {
+        if (ch->history_requested) return;
+        ch->history_requested = 1;
+    }
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_BACKFILL);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_mark_read(oc_client *c, uint64_t channel_id) {
+    if (!c) return;
+    oc_channel *ch = oc_model_channel(&c->model, channel_id);
+    uint64_t before = ch ? ch->read_marker : 0;
+    oc_model_mark_read(&c->model, channel_id);
+    ch = oc_model_channel(&c->model, channel_id);
+    if (ch && ch->read_marker > before) {   /* advanced: ack the server (drives seen-by, REQ-090) */
+        oc_cmd *cmd = oc_cmd_new(OC_CMD_MARK_READ);
+        if (cmd) { cmd->channel_id = channel_id; cmd->message_id = ch->read_marker; oc_queue_push(&c->cmds, cmd); }
+    }
+}
+
+void oc_client_get_channel_description(oc_client *c, uint64_t channel_id) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_GET_CHANNEL_DESCRIPTION);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_mark_all_read(oc_client *c) {
+    if (!c) return;
+    /* Locally first, so the sidebar clears on the click rather than on the
+     * reply -- the same order oc_client_mark_read uses. The daemon's own sweep
+     * may reach further (a message that landed in between); the next cursor it
+     * sends back settles it. */
+    for (size_t i = 0; i < c->model.n_channels; i++)
+        oc_model_mark_read(&c->model, c->model.channels[i].channel_id);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_MARK_ALL_READ);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_react(oc_client *c, uint64_t channel_id, uint64_t message_id,
+                     const char *emoji, uint8_t op) {
+    if (!c || !emoji || !emoji[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_REACT);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = message_id;
+    cmd->op = op;
+    cmd->body = strdup(emoji);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_edit(oc_client *c, uint64_t channel_id, uint64_t message_id, const char *body) {
+    if (!c || !body || !body[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_EDIT);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = message_id;
+    cmd->body = strdup(body);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_delete(oc_client *c, uint64_t channel_id, uint64_t message_id) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_DELETE);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = message_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* ---- encrypted DMs (PRIVATE-DM.md) ------------------------------------------- */
+
+static void pdm_cmd(oc_client *c, int type, uint64_t id) {
+    if (!c || !id) return;
+    oc_cmd *cmd = oc_cmd_new(type);
+    if (!cmd) return;
+    cmd->channel_id = id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_pdm_accept(oc_client *c, uint64_t pdm_id)       { pdm_cmd(c, OC_CMD_PDM_ACCEPT, pdm_id); }
+void oc_client_pdm_decline(oc_client *c, uint64_t pdm_id)      { pdm_cmd(c, OC_CMD_PDM_DECLINE, pdm_id); }
+void oc_client_pdm_close(oc_client *c, uint64_t pdm_id)        { pdm_cmd(c, OC_CMD_PDM_CLOSE, pdm_id); }
+void oc_client_pdm_trust(oc_client *c, uint64_t pdm_id)        { pdm_cmd(c, OC_CMD_PDM_TRUST, pdm_id); }
+
+/* ---- calls (REQ-150, REQ-301-305) ------------------------------------------ */
+
+static void call_cmd(oc_client *c, int type, uint64_t channel_id, const uint64_t *uids, int n) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(type);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    if (n > (int)OC_MAX_CALL_INVITES) n = (int)OC_MAX_CALL_INVITES;
+    for (int i = 0; uids && i < n; i++) cmd->uids[cmd->n_uids++] = uids[i];
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_call_start(oc_client *c, uint64_t channel_id, const uint64_t *invite, int n) {
+    if (!c) return;
+    c->model.call_pending = channel_id;
+    call_cmd(c, OC_CMD_CALL_JOIN, channel_id, invite, n);
+}
+
+void oc_client_call_join(oc_client *c, uint64_t channel_id) {
+    oc_client_call_start(c, channel_id, NULL, 0);
+}
+
+void oc_client_call_leave(oc_client *c, uint64_t channel_id) {
+    if (!c) return;
+    /* Leaving while getting back in is over here at once, connected or not:
+     * the command waits for a connection, the window does not. */
+    if (c->model.call_rejoining && c->model.call_rejoining == channel_id) {
+        c->model.call_rejoining = 0;
+        memset(&c->model.call, 0, sizeof c->model.call);
+    }
+    call_cmd(c, OC_CMD_CALL_LEAVE, channel_id, NULL, 0);
+}
+void oc_client_call_decline(oc_client *c, uint64_t channel_id) { call_cmd(c, OC_CMD_CALL_DECLINE, channel_id, NULL, 0); }
+void oc_client_call_end(oc_client *c, uint64_t channel_id)     { call_cmd(c, OC_CMD_CALL_END, channel_id, NULL, 0); }
+
+void oc_client_call_share(oc_client *c, uint64_t channel_id, int on) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_SHARE);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->op = (uint8_t)(on ? 1 : 0);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_call_invite(oc_client *c, uint64_t channel_id, const uint64_t *uids, int n) {
+    if (n > 0) call_cmd(c, OC_CMD_CALL_INVITE, channel_id, uids, n);
+}
+
+void oc_client_set_call_media(oc_client *c, const oc_call_media *media, void *ctx) {
+    if (c) oc_net_set_call_media(c->net, media, ctx);
+}
+
+size_t oc_client_call_notify_take(oc_client *c, int quiet, int paused,
+                                  oc_call_notice *out, size_t max) {
+    return c ? oc_model_call_notify_take(&c->model, quiet, paused, out, max) : 0;
+}
+
+void oc_client_typing(oc_client *c, uint64_t channel_id) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_TYPING);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_open_thread(oc_client *c, uint64_t channel_id, uint64_t parent_id) {
+    if (!c) return;
+    oc_model_open_thread(&c->model, channel_id, parent_id);   /* frontend view state */
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_OPEN_THREAD);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = parent_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_reply(oc_client *c, uint64_t channel_id, uint64_t parent_id, const char *body) {
+    if (!c || !body || !body[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_REPLY);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = parent_id;
+    cmd->body = strdup(body);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_close_thread(oc_client *c) {
+    if (!c) return;
+    oc_model_close_thread(&c->model);
+}
+
+/* Open the search view with no query. The overlay owns the input box,
+ * so it needs the pane on screen before there is anything to search for. */
+void oc_client_open_search(oc_client *c) {
+    if (!c) return;
+    oc_model_search_begin(&c->model, "");
+}
+
+void oc_client_search(oc_client *c, const char *query) {
+    if (!c || !query || !query[0]) return;
+    oc_model_search_begin(&c->model, query);      /* clears prior hits + records it */
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SEARCH);
+    if (!cmd) return;
+    cmd->body = strdup(query);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* the next page of the CURRENT search. `before_id` is the oldest id already
+ * shown — a keyset cursor, so a message posted while you page cannot make a row
+ * repeat or vanish the way an OFFSET would. The query is re-sent verbatim because the
+ * server holds no search state; that is deliberate (a stateless server cannot leak a
+ * stale cursor).
+ *
+ * Appends rather than replacing: oc_model_search_begin is NOT called here. */
+void oc_client_search_more(oc_client *c, uint64_t before_id) {
+    if (!c || !before_id || !c->model.search_query[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SEARCH);
+    if (!cmd) return;
+    cmd->body = strdup(c->model.search_query);
+    cmd->message_id = before_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_close_search(oc_client *c) {
+    if (!c) return;
+    oc_model_close_search(&c->model);
+}
+
+void oc_client_create_channel_ex(oc_client *c, const char *name, int is_public) {
+    if (!c || !name || !name[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CREATE_CHANNEL);
+    if (!cmd) return;
+    cmd->body = strdup(name);
+    cmd->op = (uint8_t)(is_public ? 1 : 0);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* CREATE_CHANNEL has always carried is_public on the wire; this facade dropped
+ * it and hardcoded public. Kept as the public-channel shorthand. */
+void oc_client_create_channel(oc_client *c, const char *name) {
+    oc_client_create_channel_ex(c, name, 1);
+}
+
+void oc_client_history(oc_client *c, uint64_t channel_id, uint64_t before_message_id) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_HISTORY);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = before_message_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+static void chan_member_op(oc_client *c, int type, uint64_t channel_id, uint64_t user_id) {
+    if (!c || !channel_id || !user_id) return;
+    oc_cmd *cmd = oc_cmd_new(type);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = user_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_channel_invite(oc_client *c, uint64_t channel_id, uint64_t user_id) {
+    chan_member_op(c, OC_CMD_CHANNEL_INVITE, channel_id, user_id);
+}
+
+void oc_client_channel_kick(oc_client *c, uint64_t channel_id, uint64_t user_id) {
+    chan_member_op(c, OC_CMD_CHANNEL_KICK, channel_id, user_id);
+}
+
+static void channel_op(oc_client *c, int type, uint64_t channel_id) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(type);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_join_channel(oc_client *c, uint64_t channel_id)  { channel_op(c, OC_CMD_JOIN_CHANNEL, channel_id); }
+void oc_client_leave_channel(oc_client *c, uint64_t channel_id) { channel_op(c, OC_CMD_LEAVE_CHANNEL, channel_id); }
+
+void oc_client_list_channels(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_CHANNELS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_users(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_USERS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_presence(oc_client *c, uint8_t status) {
+    if (!c) return;
+    oc_model_note_presence(&c->model, c->model.user_id, status);   /* reflect locally */
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PRESENCE);
+    if (!cmd) return;
+    cmd->op = status;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_toggle_roster(oc_client *c, int open) {
+    if (!c) return;
+    c->model.roster_open = open ? 1 : 0;
+    if (open) oc_client_list_users(c);   /* refresh on open */
+}
+
+void oc_client_open_dm(oc_client *c, uint64_t user_id, int e2e) {
+    if (!c || !user_id) return;
+    oc_cmd *cmd = oc_cmd_new(e2e ? OC_CMD_PDM_OPEN : OC_CMD_OPEN_DM);
+    if (!cmd) return;
+    cmd->channel_id = user_id;   /* reused as the target user id */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_pin(oc_client *c, uint64_t channel_id, uint64_t message_id, uint8_t op) {
+    if (!c || !message_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_PIN);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = message_id;
+    cmd->op = op;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_pins(oc_client *c, uint64_t channel_id) {
+    if (!c || !channel_id) return;
+    oc_model_pinlist_begin(&c->model, channel_id);   /* clears prior + marks loading */
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_PINS);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_update_channel(oc_client *c, uint64_t channel_id, uint8_t op, const char *value) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_UPDATE_CHANNEL);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->op = op;
+    cmd->body = strdup(value ? value : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_history_around(oc_client *c, uint64_t channel_id, uint64_t message_id, uint16_t limit) {
+    if (!c || !channel_id || !message_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_HISTORY_AROUND);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = message_id;
+    cmd->op = (uint8_t)(limit > 255 ? 255 : limit);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op) {
+    if (!c || !message_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SAVE_ITEM);
+    if (!cmd) return;
+    cmd->message_id = message_id; cmd->op = op;
+    oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_list_saved(oc_client *c) {
+    if (!c) return;
+    oc_model_saved_begin(&c->model);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_SAVED);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_close_saved(oc_client *c) { if (c) oc_model_close_saved(&c->model); }
+void oc_client_list_activity(oc_client *c, uint8_t filter) {
+    if (!c) return;
+    /* Open the list BEFORE asking, as every other list command does: the fold
+     * drops an entry that arrives while the list is closed, so without this the
+     * feed was silently empty however many rows the server sent. */
+    oc_model_activity_begin(&c->model);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_ACTIVITY);
+    if (!cmd) return;
+    cmd->op = filter;
+    oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_close_activity(oc_client *c) { if (c) oc_model_close_activity(&c->model); }
+
+void oc_client_list_members(oc_client *c, uint64_t channel_id) {
+    if (!c || !channel_id) return;
+    oc_model_chanmem_begin(&c->model, channel_id);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_MEMBERS);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_files(oc_client *c, uint64_t channel_id) {
+    if (!c) return;
+    oc_model_filelist_begin(&c->model, channel_id);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_FILES);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;      /* 0 = every channel I can read */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* The next page of the open files list (REQ-143). The cursor is the last row the
+ * model holds -- its created-at and id -- so a file uploaded meanwhile cannot
+ * make a row repeat or vanish, and the entries that arrive are APPENDED to the
+ * ones already listed rather than replacing them. Nothing happens when the
+ * daemon said there are no more, or while a page is already on its way. */
+void oc_client_list_files_more(oc_client *c) {
+    if (!c) return;
+    oc_model *m = &c->model;
+    if (!m->filelist_open || m->filelist_loading || !m->files_more || m->n_files == 0) return;
+    const oc_file_view *last = &m->files[m->n_files - 1];
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_FILES);
+    if (!cmd) return;
+    cmd->channel_id = m->filelist_channel;
+    cmd->server_time = last->created_at;
+    cmd->message_id = last->id;
+    m->filelist_loading = 1;           /* the entries append; the list stays */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_close_files(oc_client *c) {
+    if (c) oc_model_close_filelist(&c->model);
+}
+
+void oc_client_close_pins(oc_client *c) {
+    if (c) oc_model_close_pinlist(&c->model);
+}
+
+/* The open summary's request, as asked: sent when it is asked for, and again
+ * on a new connection while it is still waiting, since the daemon drops what a
+ * closed connection was waiting for. */
+static void summary_leave(oc_client *c, int type);
+
+static int summary_send(oc_client *c) {
+    oc_model *m = &c->model;
+    if (m->summary_notice) {
+        /* Opened from a notice: asked for that again. */
+        oc_cmd *cmd = oc_cmd_new(OC_CMD_SUMMARY_OPEN);
+        if (!cmd) return -1;
+        cmd->req_id = m->summary_req;
+        cmd->message_id = m->summary_notice;
+        oc_queue_push(&c->cmds, cmd);
+        return 0;
+    }
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SUMMARIZE);
+    if (!cmd) return -1;
+    cmd->channel_id = m->summary_channel;
+    cmd->req_id = m->summary_req;
+    cmd->scope = m->summary_scope;
+    cmd->start_ms = m->summary_scope == OC_SUM_RANGE ? m->summary_start : 0;
+    cmd->end_ms = m->summary_scope == OC_SUM_RANGE ? m->summary_end : 0;
+    oc_queue_push(&c->cmds, cmd);
+    return 0;
+}
+
+uint32_t oc_client_summarize(oc_client *c, uint64_t channel_id, uint8_t scope, uint64_t start_ms, uint64_t end_ms) {
+    if (!c || !channel_id || scope > OC_SUM_TODAY) return 0;
+    /* One still being made goes on unwatched: its person is told when it is. */
+    summary_leave(c, OC_CMD_SUMMARY_DETACH);
+    if (++c->next_req == 0) c->next_req = 1;
+    uint32_t req = c->next_req;
+    if (scope != OC_SUM_RANGE) start_ms = end_ms = 0;
+    oc_model_summary_begin(&c->model, channel_id, scope, start_ms, end_ms, req);
+    if (summary_send(c) != 0) { oc_model_close_summary(&c->model); return 0; }
+    return req;
+}
+
+uint32_t oc_client_summary_retry(oc_client *c) {
+    if (!c) return 0;
+    const oc_model *m = &c->model;
+    if (!m->summary_open || m->summary_loading || m->summary_status == OC_SUM_OK ||
+        m->summary_status == OC_SUM_FORBIDDEN)
+        return 0;
+    return oc_client_summarize(c, m->summary_channel, m->summary_scope, m->summary_start, m->summary_end);
+}
+
+/* The open summary's request, told to the daemon by `type` (DETACH or
+ * CANCEL) while it is still being made, and the pane closed. */
+static void summary_leave(oc_client *c, int type) {
+    oc_model *m = &c->model;
+    if (m->summary_open && m->summary_loading && !m->summary_notice && m->summary_req) {
+        oc_cmd *cmd = oc_cmd_new(type);
+        if (cmd) { cmd->req_id = m->summary_req; oc_queue_push(&c->cmds, cmd); }
+    }
+    oc_model_close_summary(m);
+}
+
+/* Closing a summary still being made stops watching it: it goes on, and the
+ * daemon tells its person when it is made (SUMMARY_READY). */
+void oc_client_close_summary(oc_client *c) {
+    if (c) summary_leave(c, OC_CMD_SUMMARY_DETACH);
+}
+
+void oc_client_summary_detach(oc_client *c) {
+    if (c) summary_leave(c, OC_CMD_SUMMARY_DETACH);
+}
+
+void oc_client_summary_cancel(oc_client *c) {
+    if (c) summary_leave(c, OC_CMD_SUMMARY_CANCEL);
+}
+
+uint32_t oc_client_summary_open_notice(oc_client *c, uint64_t notice_id, uint64_t channel_id, uint8_t scope) {
+    if (!c || !notice_id) return 0;
+    oc_model *m = &c->model;
+    const oc_summary_notice *n = oc_model_summary_notice(m, notice_id);
+    uint64_t ch = n ? n->channel_id : channel_id, start = n ? n->start_ms : 0, end = n ? n->end_ms : 0;
+    uint8_t sc = n ? n->scope : scope;
+    if (!ch) return 0;
+    summary_leave(c, OC_CMD_SUMMARY_DETACH);
+    if (++c->next_req == 0) c->next_req = 1;
+    uint32_t req = c->next_req;
+    oc_model_summary_begin(m, ch, sc, start, end, req);
+    m->summary_notice = notice_id;
+    oc_model_summary_notice_drop(m, notice_id);
+    if (summary_send(c) != 0) { oc_model_close_summary(m); return 0; }
+    return req;
+}
+
+void oc_client_summary_dismiss(oc_client *c, uint64_t notice_id) {
+    if (!c || !notice_id) return;
+    oc_model_summary_notice_drop(&c->model, notice_id);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SUMMARY_DISMISS);
+    if (cmd) { cmd->message_id = notice_id; oc_queue_push(&c->cmds, cmd); }
+}
+
+void oc_client_list_reactions(oc_client *c, uint64_t channel_id, uint64_t message_id) {
+    if (!c || !message_id) return;
+    oc_model_reactlist_begin(&c->model, message_id);   /* clears prior + records it */
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_REACTIONS);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = message_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_close_reactions(oc_client *c) {
+    if (!c) return;
+    oc_model_close_reactlist(&c->model);
+}
+
+void oc_client_set_notify_pref(oc_client *c, uint64_t channel_id, uint8_t level) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_NOTIFY_PREF);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->op = level;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* The recurring schedule (REQ-136). `start_min`/`end_min` are the hours
+ * notifications are ALLOWED; `days` applies only to OC_DND_CUSTOM. The timezone
+ * offset rides along because only this side knows it — the daemon would have to
+ * carry tzdata into the thread that answers every push (ARCH-103). */
+void oc_client_set_schedule(oc_client *c, uint8_t mode, int16_t tz_offset_min,
+                            uint16_t start_min, uint16_t end_min,
+                            const oc_schedule_day *days, uint8_t n_days) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_SCHEDULE);
+    if (!cmd) return;
+    cmd->sched_mode = mode;
+    cmd->tz_offset_min = tz_offset_min;
+    cmd->sched_start_min = start_min;
+    cmd->sched_end_min = end_min;
+    if (n_days > OC_SCHEDULE_DAYS) n_days = OC_SCHEDULE_DAYS;
+    for (uint8_t i = 0; i < n_days && days; i++) cmd->sched_days[i] = days[i];
+    cmd->n_sched_days = days ? n_days : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* Both lists are REPLACEMENTS (REQ-135): short, edited whole, and their terms
+ * are their own identity, so there is nothing an add/remove pair could name. */
+void oc_client_set_keywords(oc_client *c, const char terms[][OC_KEYWORD_MAX], uint8_t n) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_KEYWORDS);
+    if (!cmd) return;
+    if (n > OC_MAX_KEYWORDS) n = OC_MAX_KEYWORDS;
+    for (uint8_t i = 0; i < n && terms; i++)
+        snprintf(cmd->kw_terms[i], OC_KEYWORD_MAX, "%s", terms[i]);
+    cmd->n_kw_terms = terms ? n : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_priority(oc_client *c, const uint64_t *people, uint8_t n) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PRIORITY);
+    if (!cmd) return;
+    if (n > OC_MAX_PRIORITY) n = OC_MAX_PRIORITY;
+    for (uint8_t i = 0; i < n && people; i++) cmd->pri_people[i] = people[i];
+    cmd->n_pri_people = people ? n : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* Pause notifications for `minutes` from now; 0 ends a pause early (REQ-278).
+ * Minutes rather than an instant because that is what the presets ARE, and the
+ * daemon resolving them once is what keeps a pause off everybody's clock. */
+void oc_client_set_snooze(oc_client *c, uint32_t minutes) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_SNOOZE);
+    if (!cmd) return;
+    cmd->message_id = minutes;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* Threads I am in, across channels (REQ-062). `filter` is OC_THREADF_*. Opens
+ * the list first, as every other list command does — the fold drops entries that
+ * arrive while it is closed, which is the bug that made the activity feed look
+ * permanently empty. */
+void oc_client_list_threads(oc_client *c, uint8_t filter) {
+    if (!c) return;
+    oc_model_threads_begin(&c->model);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_THREADS);
+    if (!cmd) return;
+    cmd->op = filter;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_thread_follow(oc_client *c, uint64_t channel_id, uint64_t root_id, uint8_t on) {
+    if (!c || !root_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_THREAD_FOLLOW);
+    if (!cmd) return;
+    cmd->channel_id = channel_id; cmd->message_id = root_id; cmd->op = on;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* `up_to` 0 means every reply in it, which is what opening one means. */
+void oc_client_mark_thread_read(oc_client *c, uint64_t root_id, uint64_t up_to) {
+    if (!c || !root_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_MARK_THREAD_READ);
+    if (!cmd) return;
+    cmd->message_id = root_id; cmd->server_time = up_to;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_notify_prefs(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_NOTIFY_PREFS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_toggle_prefs(oc_client *c, int open) {
+    if (!c) return;
+    oc_model_set_prefs_open(&c->model, open);
+    if (open) oc_client_list_notify_prefs(c);   /* refresh on open */
+}
+
+void oc_client_set_client_type(oc_client *c, const char *client_type) {
+    if (c) oc_net_set_client_type(c->net, client_type);
+}
+
+void oc_client_set_setting(oc_client *c, const char *key, const char *value) {
+    if (!c || !key || !key[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_SETTING);
+    if (!cmd) return;
+    cmd->body  = strdup(key);
+    cmd->body2 = strdup(value ? value : "");   /* empty value deletes the key */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_draft(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                         const char *body) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_DRAFT);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = thread_root;
+    cmd->body = strdup(body ? body : "");   /* empty deletes */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_schedule(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                        uint64_t send_at_ms, const char *body) {
+    if (!c || !channel_id || !body || !body[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SCHEDULE);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = thread_root;
+    cmd->server_time = send_at_ms;
+    cmd->body = strdup(body);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_scheduled(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_SCHEDULED);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_cancel_scheduled(oc_client *c, uint64_t id) {
+    if (!c || !id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CANCEL_SCHEDULED);
+    if (!cmd) return;
+    cmd->message_id = id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_update_scheduled(oc_client *c, uint64_t id, uint64_t send_at_ms,
+                                const char *body) {
+    if (!c || !id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_UPDATE_SCHEDULED);
+    if (!cmd) return;
+    cmd->message_id = id;
+    cmd->server_time = send_at_ms;
+    cmd->body = strdup(body ? body : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_draft_to(oc_client *c, const char *recipients, const char *body) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_DRAFT);
+    if (!cmd) return;
+    cmd->channel_id = 0;                  /* not addressed yet */
+    cmd->message_id = 0;
+    cmd->body  = strdup(body ? body : "");
+    cmd->body2 = strdup(recipients ? recipients : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_drafts(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_DRAFTS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_settings(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_SETTINGS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_restore_message(oc_client *c, uint64_t channel_id, uint64_t message_id) {
+    if (!c || !channel_id || !message_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_RESTORE);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = message_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_srvalerts_list(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SRVALERTS_LIST);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_srvalert_ack(oc_client *c, uint64_t id) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SRVALERT_ACK);
+    if (!cmd) return;
+    cmd->message_id = id;
+    oc_queue_push(&c->cmds, cmd);
+    oc_client_srvalerts_list(c);
+}
+
+void oc_client_storage_status(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_STORAGE_STATUS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_toggle_storage(oc_client *c, int open) {
+    if (c) c->model.storage_open = open ? 1 : 0;
+}
+
+void oc_client_audit_query(oc_client *c, uint64_t before_ms) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_AUDIT_QUERY);
+    if (cmd) { cmd->message_id = before_ms; oc_queue_push(&c->cmds, cmd); }
+}
+
+void oc_client_toggle_audit(oc_client *c, int open) {
+    if (c) c->model.audit_open = open ? 1 : 0;
+}
+
+void oc_client_set_display_name(oc_client *c, const char *name) {
+    if (!c || !name || !name[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_DISPLAY_NAME);
+    if (!cmd) return;
+    cmd->body = strdup(name);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_email(oc_client *c, const char *email) {
+    if (!c || !email) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_EMAIL);
+    if (!cmd) return;
+    cmd->body = strdup(email);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_role(oc_client *c, uint64_t user_id, uint8_t role) {
+    if (!c || !user_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_ROLE);
+    if (!cmd) return;
+    cmd->channel_id = user_id;   /* reused as the target user id */
+    cmd->op = role;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_invite_user(oc_client *c, uint8_t role) {
+    oc_client_invite(c, role, NULL, 1);
+}
+
+void oc_client_invite(oc_client *c, uint8_t role, const char *email, uint16_t uses) {
+    if (!c) return;
+    /* An address is sent as typed, trimmed of the spaces a paste brings along;
+     * the daemon lower-cases and checks it. */
+    char addr[256] = "";
+    if (email) {
+        while (*email == ' ' || *email == '\t') email++;
+        size_t n = strlen(email);
+        while (n && (email[n - 1] == ' ' || email[n - 1] == '\t' ||
+                     email[n - 1] == '\r' || email[n - 1] == '\n')) n--;
+        if (n >= sizeof addr) return;   /* longer than any address */
+        memcpy(addr, email, n);
+        addr[n] = '\0';
+    }
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_INVITE_USER);
+    if (!cmd) return;
+    cmd->op = role;
+    cmd->uses = uses;
+    if (addr[0]) {
+        cmd->body = strdup(addr);
+        if (!cmd->body) { oc_cmd_free(cmd); return; }
+    }
+    oc_model_invite_asked(&c->model, addr);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_remove_user(oc_client *c, uint64_t user_id) {
+    if (!c || !user_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_REMOVE_USER);
+    if (!cmd) return;
+    cmd->channel_id = user_id;   /* reused as the target user id */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_reset_credential(oc_client *c, uint64_t user_id, int clear_step) {
+    if (!c || !user_id) return;
+    c->model.reset_token[0] = '\0';
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_RESET_CREDENTIAL);
+    if (!cmd) return;
+    cmd->channel_id = user_id;   /* reused as the target user id */
+    cmd->op = clear_step ? 1 : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_enable_user(oc_client *c, uint64_t user_id) {
+    if (!c || !user_id) return;
+    c->model.reset_token[0] = '\0';
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_ENABLE_USER);
+    if (!cmd) return;
+    cmd->channel_id = user_id;   /* reused as the target user id */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_webhooks(oc_client *c, uint64_t channel_id) {
+    if (!c || !channel_id) return;
+    oc_model_weblist_begin(&c->model, channel_id);   /* open overlay + clear prior */
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_WEBHOOKS);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_close_webhooks(oc_client *c) {
+    if (!c) return;
+    oc_model_close_weblist(&c->model);
+}
+
+void oc_client_create_webhook(oc_client *c, uint64_t channel_id, const char *label) {
+    if (!c || !channel_id || !label || !label[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CREATE_WEBHOOK);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->body = strdup(label);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_delete_webhook(oc_client *c, uint64_t webhook_id) {
+    if (!c || !webhook_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_DELETE_WEBHOOK);
+    if (!cmd) return;
+    cmd->message_id = webhook_id;   /* reused as the webhook id */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* outstanding invites. No arguments — the server decides what "outstanding"
+ * means (not consumed, not expired) so two clients cannot disagree about it. */
+void oc_client_list_invites(oc_client *c) {
+    if (!c) return;
+    oc_model_invites_begin(&c->model);   /* clears any prior list, marks it loading */
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_INVITES);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_revoke_invite(oc_client *c, uint64_t invite_id) {
+    if (!c || !invite_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_REVOKE_INVITE);
+    if (!cmd) return;
+    cmd->message_id = invite_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* Disable is reversible and rotate is not — the old token dies the moment
+ * the new one is minted, which is the point of rotating a leaked one. */
+void oc_client_set_webhook_state(oc_client *c, uint64_t webhook_id, int disabled) {
+    if (!c || !webhook_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_WEBHOOK_STATE);
+    if (!cmd) return;
+    cmd->message_id = webhook_id;
+    cmd->op = disabled ? 1 : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_rotate_webhook(oc_client *c, uint64_t webhook_id) {
+    if (!c || !webhook_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_ROTATE_WEBHOOK);
+    if (!cmd) return;
+    cmd->message_id = webhook_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* Mute (REQ-137). Independent of the notification level: the daemon keeps
+ * them in separate columns for the same reason. */
+void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_MUTE);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->op = muted ? 1 : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* The global notification default (REQ-134). */
+void oc_client_set_notify_default(oc_client *c, uint8_t level) {
+    if (!c || level > OC_NOTIFY_NONE) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_NOTIFY_DEFAULT);
+    if (!cmd) return;
+    cmd->op = level;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* Upload an image and make it my avatar. Same transfer machinery as any
+ * upload — chunking, window, size cap — but the finished attachment is claimed with
+ * SET_AVATAR rather than posted. `channel_id` is where the bytes are uploaded (the
+ * wire requires one); nothing is posted there. */
+void oc_client_upload_avatar(oc_client *c, uint64_t channel_id, const char *path) {
+    if (!c || !path || !path[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_UPLOAD);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->op = 1;                       /* purpose: avatar */
+    cmd->xfer_tag = next_xfer_tag();
+    cmd->body = strdup(path);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* User groups (REQ-307-309). */
+void oc_client_list_groups(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_GROUPS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+static void group_text_cmd(oc_client *c, int type, uint64_t group_id, const char *handle,
+                           const char *name, const char *description) {
+    if (!c || !handle || !handle[0]) return;
+    oc_cmd *cmd = oc_cmd_new(type);
+    if (!cmd) return;
+    cmd->message_id = group_id;
+    cmd->body = strdup(handle);
+    cmd->body2 = strdup(name && name[0] ? name : handle);
+    cmd->body3 = strdup(description ? description : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_create_group(oc_client *c, const char *handle, const char *name, const char *description) {
+    group_text_cmd(c, OC_CMD_CREATE_GROUP, 0, handle, name, description);
+}
+
+void oc_client_update_group(oc_client *c, uint64_t group_id, const char *handle, const char *name,
+                            const char *description) {
+    if (!group_id) return;
+    group_text_cmd(c, OC_CMD_UPDATE_GROUP, group_id, handle, name, description);
+}
+
+void oc_client_delete_group(oc_client *c, uint64_t group_id) {
+    if (!c || !group_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_DELETE_GROUP);
+    if (!cmd) return;
+    cmd->message_id = group_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* More than a command holds goes as several. */
+void oc_client_group_members(oc_client *c, uint64_t group_id, int add, const uint64_t *user_ids, int n) {
+    if (!c || !group_id || !user_ids) return;
+    for (int at = 0; at < n; ) {
+        oc_cmd *cmd = oc_cmd_new(add ? OC_CMD_GROUP_ADD_MEMBERS : OC_CMD_GROUP_REMOVE_MEMBERS);
+        if (!cmd) return;
+        cmd->message_id = group_id;
+        while (at < n && cmd->n_uids < OC_MAX_CALL_INVITES) cmd->uids[cmd->n_uids++] = user_ids[at++];
+        oc_queue_push(&c->cmds, cmd);
+    }
+}
+
+void oc_client_channel_group(oc_client *c, uint64_t channel_id, uint64_t group_id, int add) {
+    if (!c || !channel_id || !group_id) return;
+    oc_cmd *cmd = oc_cmd_new(add ? OC_CMD_CHANNEL_ADD_GROUP : OC_CMD_CHANNEL_REMOVE_GROUP);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = group_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* Custom emoji (REQ-072). */
+void oc_client_list_emoji(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_EMOJI);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_add_emoji(oc_client *c, const char *name, uint64_t attachment_id) {
+    if (!c || !name || !name[0] || !attachment_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_ADD_EMOJI);
+    if (!cmd) return;
+    cmd->body = strdup(name);
+    cmd->message_id = attachment_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_delete_emoji(oc_client *c, const char *name) {
+    if (!c || !name || !name[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_DELETE_EMOJI);
+    if (!cmd) return;
+    cmd->body = strdup(name);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_upload_emoji(oc_client *c, uint64_t channel_id, const char *name, const char *path) {
+    if (!c || !name || !name[0] || !path || !path[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_UPLOAD);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->op = 2;                       /* purpose: custom emoji */
+    cmd->xfer_tag = next_xfer_tag();
+    cmd->body = strdup(path);
+    cmd->body2 = strdup(name);         /* claimed with this name when it lands */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* A group DM (REQ-056). */
+void oc_client_open_group_dm(oc_client *c, const uint64_t *user_ids, int n) {
+    if (!c || !user_ids || n < 2) return;
+    if (n > 8) n = 8;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_OPEN_GROUP_DM);
+    if (!cmd) return;
+    for (int i = 0; i < n; i++) cmd->gids[i] = user_ids[i];
+    cmd->n_gids = n;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* The avatar. */
+void oc_client_set_avatar(oc_client *c, uint64_t attachment_id) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_AVATAR);
+    if (!cmd) return;
+    cmd->message_id = attachment_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* Mark unread (REQ-235). `message_id` is where reading resumes; 0 marks the
+ * whole conversation unread. Deliberately not oc_client_mark_read's path, which may
+ * only ever advance the cursor. */
+void oc_client_set_read_cursor(oc_client *c, uint64_t channel_id, uint64_t message_id) {
+    if (!c || !channel_id) return;
+    /* At once here, so the badge and the divider need not wait for the round
+     * trip; the daemon's READ_CURSOR repeats it on every device of this user. */
+    oc_model_set_read_marker(&c->model, channel_id, message_id);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_READ_CURSOR);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = message_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* Custom status (REQ-241/122). Empty text clears it; `expires_at` 0 means
+ * "until I change it". The DAEMON enforces expiry — a client that is not running
+ * cannot clear its own status, so it must not be the thing that decides. */
+/* REQ-182: my own live sessions. */
+void oc_client_list_sessions(oc_client *c) {
+    if (!c) return;
+    oc_model_sessions_begin(&c->model);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_SESSIONS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+/* REQ-182: sign one of them out. */
+void oc_client_revoke_session(oc_client *c, uint64_t session_id) {
+    if (!c || !session_id) return;
+    oc_model_sessions_begin(&c->model);   /* the answer is the list again */
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_REVOKE_SESSION);
+    if (!cmd) return;
+    cmd->message_id = session_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* the exact channel census for the Files view. */
+void oc_client_list_file_channels(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_FILE_CHANNELS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_status(oc_client *c, const char *emoji, const char *text,
+                          uint64_t expires_at) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_STATUS);
+    if (!cmd) return;
+    cmd->body  = strdup(emoji ? emoji : "");
+    cmd->body2 = strdup(text ? text : "");
+    cmd->message_id = expires_at;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* Profile fields (REQ-240). One call for the whole screen, because they are
+ * edited and committed together — a field-at-a-time API would let Cancel mean
+ * "some of it stuck".
+ *
+ * The five are packed \x1f-separated into `body` rather than given five slots on
+ * oc_cmd: the envelope is shared by every command type, and PROFILE_INFO
+ * already packs the same way in the other direction (net.c). Unpacked where it
+ * is encoded, so the two halves are read together. */
+void oc_client_set_profile(oc_client *c, const char *full_name, const char *title,
+                           const char *pronouns, const char *phone,
+                           const char *timezone, const char *voice_id) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PROFILE);
+    if (!cmd) return;
+    char packed[512];
+    /* An empty voice keeps the one in place (REQ-292), which is what a frontend
+     * without a voice picker sends -- unlike the other fields, where empty is
+     * the user clearing them. */
+    snprintf(packed, sizeof packed, "%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s",
+             full_name ? full_name : "", title ? title : "",
+             pronouns ? pronouns : "", phone ? phone : "",
+             timezone ? timezone : "", voice_id ? voice_id : "");
+    cmd->body = strdup(packed);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+uint64_t oc_client_upload(oc_client *c, uint64_t channel_id, const char *path) {
+    if (!c || !channel_id || !path || !path[0]) return 0;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_UPLOAD);
+    if (!cmd) return 0;
+    cmd->xfer_tag = next_xfer_tag();
+    cmd->channel_id = channel_id;
+    cmd->body = strdup(path);
+    uint64_t tag = cmd->xfer_tag;
+    oc_queue_push(&c->cmds, cmd);
+    return tag;
+}
+
+uint64_t oc_client_post_files(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                              const char *const *paths, size_t n_paths, const char *text) {
+    if (!paths || n_paths == 0 || n_paths > OC_MAX_ATTACH) return 0;
+    oc_post_item items[OC_MAX_ATTACH];
+    memset(items, 0, sizeof items);
+    for (size_t i = 0; i < n_paths; i++) items[i].path = paths[i];
+    return oc_client_post_items(c, channel_id, thread_root, items, n_paths, text);
+}
+
+uint64_t oc_client_post_items(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                              const oc_post_item *items, size_t n_items, const char *text) {
+    if (!c || !channel_id || !items || n_items == 0 || n_items > OC_MAX_ATTACH) return 0;
+    for (size_t i = 0; i < n_items; i++) {
+        const oc_post_item *it = &items[i];
+        int file = it->path && it->path[0];
+        int mem = it->data && it->len && it->name && it->name[0];
+        if (file == mem) return 0;                   /* exactly one of the two */
+        if (mem && it->len > OC_MAX_ATTACHMENT_SIZE) return 0;
+    }
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_POST_FILES);
+    if (!cmd) return 0;
+    cmd->xfer_tag = next_xfer_tag();
+    cmd->channel_id = channel_id;
+    cmd->message_id = thread_root;
+    cmd->body = strdup(text ? text : "");
+    if (!cmd->body) { oc_cmd_free(cmd); return 0; }
+    for (size_t i = 0; i < n_items; i++) {
+        const oc_post_item *it = &items[i];
+        if (it->data) {
+            cmd->paths[i] = strdup(it->name);
+            cmd->mem[i] = malloc(it->len);
+            if (cmd->mem[i]) { memcpy(cmd->mem[i], it->data, it->len); cmd->mem_len[i] = it->len; }
+            cmd->n_paths++;
+            if (!cmd->paths[i] || !cmd->mem[i]) { oc_cmd_free(cmd); return 0; }
+        } else {
+            cmd->paths[i] = strdup(it->path);
+            cmd->n_paths++;
+            if (!cmd->paths[i]) { oc_cmd_free(cmd); return 0; }
+        }
+    }
+    uint64_t tag = cmd->xfer_tag;
+    oc_queue_push(&c->cmds, cmd);
+    return tag;
+}
+
+void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_path) {
+    if (!c || !attachment_id || !dest_path || !dest_path[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_DOWNLOAD);
+    if (!cmd) return;
+    cmd->message_id = attachment_id;   /* reused as the attachment id */
+    cmd->xfer_tag = attachment_id;
+    cmd->body = strdup(dest_path);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_fetch_attachment(oc_client *c, uint64_t attachment_id) {
+    if (!c || !attachment_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_FETCH);
+    if (!cmd) return;
+    cmd->message_id = attachment_id;
+    cmd->xfer_tag = attachment_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+uint64_t oc_client_post_video(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                              uint8_t *video, size_t video_len, uint8_t *poster, size_t poster_len,
+                              uint32_t duration_ms, uint16_t width, uint16_t height,
+                              const char *caption) {
+    oc_cmd *cmd = (c && channel_id && video && video_len && poster && poster_len)
+                ? oc_cmd_new(OC_CMD_POST_VIDEO) : NULL;
+    if (!cmd) { free(video); free(poster); return 0; }
+    cmd->xfer_tag = next_xfer_tag();
+    cmd->channel_id = channel_id;
+    cmd->message_id = thread_root;
+    cmd->body = strdup(caption ? caption : "");
+    /* A name that says whose and when, unique per recording, so a saved copy
+     * does not overwrite the last one: "<DisplayName>-video-<YYYYMMDDHHMMSS>".
+     * The name keeps letters, digits, '-' and '_'; anything else becomes '-'. */
+    {
+        const char *who = oc_model_user_name(&c->model, c->model.user_id);
+        char safe[64]; size_t k = 0;
+        for (const char *p = who ? who : ""; *p && k + 1 < sizeof safe; p++) {
+            unsigned char ch = (unsigned char)*p;
+            safe[k++] = (isalnum(ch) || ch == '-' || ch == '_') ? (char)ch : '-';
+        }
+        safe[k] = '\0';
+        char stamp[16] = "";
+        time_t now = time(NULL); struct tm lt;
+        if (oc_localtime_r(&now, &lt)) strftime(stamp, sizeof stamp, "%Y%m%d%H%M%S", &lt);
+        char base[96];
+        snprintf(base, sizeof base, "%s-video-%s", safe[0] ? safe : "video-message", stamp);
+        cmd->body2 = strdup(base);             /* the uploads add .mp4 and .jpg */
+    }
+    cmd->blob = video;   cmd->blob_len = video_len;
+    cmd->blob2 = poster; cmd->blob2_len = poster_len;
+    cmd->duration_ms = duration_ms;
+    cmd->media_w = width; cmd->media_h = height;
+    uint64_t tag = cmd->xfer_tag;
+    oc_queue_push(&c->cmds, cmd);
+    return tag;
+}
+
+uint64_t oc_client_fetch_media(oc_client *c, uint64_t attachment_id) {
+    if (!c || !attachment_id) return 0;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_FETCH);
+    if (!cmd) return 0;
+    cmd->message_id = attachment_id;
+    cmd->op = 1;                       /* a video: the attachment ceiling, not the inline one */
+    cmd->xfer_tag = attachment_id;
+    oc_queue_push(&c->cmds, cmd);
+    return attachment_id;
+}
+
+void oc_client_cancel_transfer(oc_client *c, uint64_t tag) {
+    if (!c || !tag) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CANCEL_TRANSFER);
+    if (!cmd) return;
+    cmd->xfer_tag = tag;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_logout(oc_client *c, uint8_t scope) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LOGOUT);
+    if (!cmd) return;
+    cmd->op = scope;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+int oc_client_outbox_pending(oc_client *c) {
+    return c ? oc_net_outbox_pending(c->net) : 0;
+}
+
+int oc_client_pages_direct(oc_client *c) {
+    return c ? oc_net_pages_direct(c->net) : 0;
+}
+
+int oc_client_open_page(oc_client *c, const char *page, const char *query, char *url, size_t cap) {
+    return c ? oc_net_open_page(c->net, page, query, url, cap) : -1;
+}
+
+void oc_client_cancel_signin(oc_client *c) {
+    if (c && c->net) oc_net_cancel_signin(c->net);
+}
+
+int oc_fingerprint_from_hex(const char *hex, unsigned char fp[32]) {
+    if (!hex || strlen(hex) != 64) return -1;
+    for (int i = 0; i < 32; i++) {
+        unsigned v = 0;
+        if (sscanf(hex + 2 * i, "%2x", &v) != 1) return -1;
+        fp[i] = (unsigned char)v;
+    }
+    return 0;
+}
+
+int oc_fingerprint_format(const char *hex, int per_line, char *out, size_t cap) {
+    unsigned char fp[32];
+    if (oc_fingerprint_from_hex(hex, fp) != 0 || cap < 32 * 3) return -1;
+    size_t o = 0;
+    for (int i = 0; i < 32; i++) {
+        if (i) out[o++] = (per_line > 0 && i % per_line == 0) ? '\n' : ':';
+        o += (size_t)snprintf(out + o, cap - o, "%02X", fp[i]);
+    }
+    out[o] = '\0';
+    return 0;
+}
+
+int oc_client_trust_cert(oc_client *c, const char *fp_hex) {
+    unsigned char fp[32];
+    if (!c || !c->net || oc_fingerprint_from_hex(fp_hex, fp) != 0) return -1;
+    oc_net_trust_cert(c->net, fp);
+    oc_net_reconnect(c->net);               /* try again now, not after the back-off */
+    return 0;
+}
+
+void oc_client_reconnect(oc_client *c) {
+    if (c) oc_net_reconnect(c->net);
+}
+
+void oc_client_stop(oc_client *c) {
+    if (!c) return;
+    oc_net_stop(c->net);   /* signals QUIT, joins the thread */
+
+    /* Drain and free any events the thread left in the queue. */
+    oc_ev *e;
+    while ((e = oc_queue_try_pop(&c->events)) != NULL) oc_ev_free(e);
+    /* Free any unsent commands still queued. */
+    oc_cmd *cmd;
+    while ((cmd = oc_queue_try_pop(&c->cmds)) != NULL) oc_cmd_free(cmd);
+
+    oc_queue_destroy(&c->events);
+    oc_queue_destroy(&c->cmds);
+    oc_model_free(&c->model);
+    free(c);
+}

@@ -1,0 +1,8 @@
+# ThreadSanitizer suppressions for `make test-tsan`.
+#
+# oc_config_load: a few suites start a second event loop with different
+# settings (a trusted forwarder, a token prefix, no voice input) while the
+# suite's main loop still runs, and that loop reloads the configuration the
+# first one reads. Only the tests reconfigure a running process; the daemon
+# loads its configuration once, before any thread starts (config.h).
+race:oc_config_load

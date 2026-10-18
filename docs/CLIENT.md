@@ -1,0 +1,1453 @@
+# OpenChime — Client
+
+The client's architecture and how it's built. Cross-referenced from
+ARCHITECTURE.md (ARCH-11, **ARCH-74**) and
+PROTOCOL.md (the wire flow the core drives).
+
+**Direction (ARCH-74, ARCH-80).** The client is **one shared C app-core** —
+the *tdlib* model's core-and-view split — under **one portable, self-rendered
+desktop GUI** (SDL3 + the portable text layer, per-platform text backends and
+native shims) plus the TUI. Text shaping and the accessibility anchor stay
+native per platform; everything else in the view is written once. The Win32
+client is the reference implementation and runs on the portable stack: an SDL3
+renderer on its own native window, primitives through oc_gfx, text through
+sdltext's DirectWrite backend.
+
+**Frontends.** The app-core carries the **TUI** and the **portable GUI**, whose
+reference implementation is the Win32 client. The same GUI on Linux, macOS and the
+web (compiled to WebAssembly and served by the daemon) is a port of that one
+program, not a further frontend; mobile (Android, iOS) has its own frontends over
+the same core (§8).
+
+---
+
+## 1. Layers
+
+```
+shared/        wire contract: protocol, tls, framebuf, sock   (daemon + client)
+client/core/   the app-core — frontend-agnostic, headless-testable C:
+               net thread + session + credential store + the view-model
+               (channels, messages, roster, presence, unread) + reducers
+client/tui/    terminal frontend over the core
+client/gui/app/       the graphical application, portable: SDL3 for the window and
+                      input, oc_gfx for drawing, sdltext for text (ARCH-80)
+client/gui/gfx/       oc_gfx, the primitives over the SDL renderer (ARCH-107)
+client/gui/platform/  platform.h -- what a platform supplies -- and one directory
+                      implementing it per platform: win32/ (the reference), web/;
+                      linux/ and mac/ are the next two
+client/shared/ assets and services shared by the TUI and the GUI: icons, the
+               OS notification backends, the credential store backends
+sdltext/       portable text layout and hit-testing, one backend per platform
+               (DirectWrite, the browser's canvas; FreeType and Core Text next)
+```
+
+**The platform contract** (`client/gui/platform/platform.h`) is the whole of
+what the application asks of an operating system beyond SDL: crash reports
+and the breadcrumb ring, the single-instance handoff, the window's caption,
+corners and capture exclusion, the taskbar badge and progress, the tray, the
+file pickers, the certificate viewer, autostart and the URL scheme, the
+notification sound, idle time, the clipboard's images and files, image
+decoding, and the text backend. Everything else -- the window, its events,
+timers, the cursor, clipboard text, the drawn text fields -- is SDL and the
+application's own. A platform that cannot do one of them answers "not
+available" and the application carries on, so a new platform starts from
+stubs (the web directory is the model) and earns each capability. What the
+platform has to say asynchronously (a URL handed over by a second launch, a
+tray click, an accessibility invoke) arrives as one SDL user event, so the
+application has one inbox. The accessibility tree is published through
+`client/gui/platform/a11y.h` the same way: UIA on Windows, an ARIA mirror on
+the web (`a11y_web.c`).
+
+The **app-core is the one shared asset.** It holds *all* logic and state; a
+frontend is pure view + input — it renders the view-model and emits intents. Get
+this boundary right and each new frontend is small; get it wrong and you rewrite
+the client per platform. The core lives in the same repo and links the daemon's
+exact `shared/` wire source, so client and server can't drift (the same reason
+`tests/e2e_client.c` reuses `shared/protocol.c`).
+
+## 2. The app-core (`client/core/`)
+
+- **`signin.c` — a browser sign-in's client half** (AUTH.md §8.1–§8.2). The
+  per-attempt verifier and its challenge, from the operating system's random
+  source with no weaker fallback, and the **loopback listener**: `127.0.0.1` on a
+  kernel-chosen port, one `GET` accepted on a path carrying a per-attempt secret,
+  everything else answered 404 and ignored. For a direct connection's provider
+  (AUTH.md §8.5), which matches its registered redirect, the redirect has no
+  path and the callback is `/`, with the daemon's `state` in the secret's place;
+  that listener takes `[::1]` at the same port as well, so a redirect the daemon
+  writes as `localhost` arrives whichever address the browser resolves it to. Given no password, the network thread
+  takes the source asked for (`oc_client_start_signin`), else the first browser
+  source the challenge offers, else local accounts, sends `AUTH_BEGIN`, checks
+  the daemon's URL is `https` (or `http` to loopback), publishes it as
+  `model->signin_url` for the frontend to open, and closes the connection. For
+  local accounts the daemon answers with a **path** on its own sign-in pages
+  (AUTH.md §8.10), and the client picks the origin from how its connection
+  accepted the certificate: the daemon's own `https` origin when a trusted
+  authority vouched for it, else the listener's **tunnel**, `/p/<secret>/…`,
+  which carries `/signin`, `/signup`, the `/account/` pages and the recovery
+  codes' script — only those, only
+  for a request naming the listener as its `Host`, and only to the certificate
+  the connection accepted — to the daemon over TLS as its own origin. An
+  invitation rides along (`&invite=`) and opens the sign-up page;
+  `oc_client_start_reset` opens instead the page that sets a reset account's
+  new password (`/account/reset?t=…`), carrying the sign-in it goes on to.
+  `oc_client_open_page` opens `account/password` the same way, on a tunnel of its
+  own held ten minutes. `oc_client_start_device` signs in with a **device code**
+  instead (AUTH.md §8.11): the thread asks for one, publishes
+  `model->device_url`, `device_code`, `device_fp` (the accepted fingerprint,
+  where no authority vouches for the daemon) and `device_expires_ms`, polls at the
+  daemon's interval — longer on `AUTH_SLOW_DOWN` — and presents the token when it
+  comes; a dropped connection keeps the code and polls on. When the
+  browser comes back it connects again and presents the token with the verifier,
+  then wipes both. The browser's request is held unanswered meanwhile
+  (`oc_loopback_answer`): its page says "You are signed in" once the daemon has
+  accepted the token, "You are not signed in" with the client's own words for a
+  refusal or a connection that never got that far, and only "Go back to
+  OpenChime" when the client stops first — never a success it does not know of. `oc_client_cancel_signin` and a five-minute timeout end the
+  wait; a refused sign-in reaches `last_error` worded by its code — as does
+  every other refusal, in the client's own words for the reason code
+  (`oc_error_text`), never the server's free text.
+  Every connection — the probe too — names the workspace's domain in its
+  handshake (TLS.md), which is its store key minus any port. `oc_net_probe` is the step before any of it: connect, read the sources the
+  workspace offers, leave — so a frontend draws the controls it offers before
+  asking for anything. The TUI's sign-in dialog probes
+  once the workspace is named, offers the browser on Ctrl+B, goes straight to it
+  where the workspace takes no passwords, and while the browser is open shows the
+  URL in full beside trying the platform's opener.
+  The Win32 sign-in card asks at the same point — when step 1 resolves the
+  workspace — and **collects no password**: step 2's heading names the
+  workspace, the line under it gives the address only where the heading does
+  not already say it, and the card says the username and password
+  go into the workspace's own page, and its Sign in opens the browser for local
+  accounts, beside a button in the daemon's words for each browser source — the
+  relay, and each of the operator's own providers; a workspace with no local
+  accounts and one browser source goes straight to it. "Have an
+  invite? Create an account" asks only for the invitation, to fill in the sign-up
+  page; "Have a reset code? Set a new password", where the workspace has local
+  accounts, asks for the code an administrator sent and opens the reset page
+  through this client's own connection; and Change password opens the password
+  page. The workspace book takes the
+  account's name from the roster once it lists the signed-in user. While the browser is open the card says so, with
+  **Copy sign-in link** (Ctrl+C) beside Cancel (Esc): the link the browser was
+  given, for one of the person's own choosing, and the way in where no browser
+  opened at all (none installed, a locked-down or remote desktop), which the
+  card says plainly when the platform's opener fails. Under the automation hook
+  the URL is written to `signin_url.txt` in the test directory instead of
+  being opened, so a harness can play the browser; its `sicopy` verb is the
+  link's button.
+- **`net.c` — the network thread.** A blocking-socket TLS connection (the client
+  is one connection on its own thread, so no epoll): `dial` → `oc_tls_handshake`
+  → `HELLO`/`WELCOME` → `AUTH_CHALLENGE` → `AUTH` → `AUTH_OK`, then a serve loop
+  that interleaves sending queued intents with reading + dispatching server
+  frames. Lifted from `tests/e2e_client.c`. A process normally has one oc_client
+  (one net thread), but a multi-client harness (the headless test) spins several
+  concurrently; that is safe because the vendored mbedTLS is built with
+  **`MBEDTLS_THREADING`** (`scripts/build/mbedtls.sh`), so its internal shared
+  state is mutex-protected.
+- **`queue.c` — two thread-safe queues** (mutex+condvar FIFO, the daemon's
+  net↔dbwriter shape): **intents in** (send, backfill, react, edit, delete,
+  typing) and **events out** (connected, auth-ok, message, channel, presence,
+  reaction, edit, delete, typing, disconnected, error).
+- **`event.h` — the core's wire-agnostic vocabulary:** the `oc_ev` (net→UI) and
+  `oc_cmd` (UI→net) types crossing the queues.
+- **`model.c` — the view-model + reducers.** `oc_model` holds the connection
+  state, the channel/DM list, a per-channel message buffer (with the ARCH-45
+  high-water dedup mark) carrying per-message reaction aggregates and
+  edited/deleted flags, roster/presence, an ephemeral (expiring) typing table,
+  and per-channel unread + read-marker counts. The read marker only advances on
+  reading, and moves back only by marking unread (`oc_client_set_read_cursor`,
+  REQ-235), which sets it at once and recounts the badge by the notify rule, and
+  again when the daemon's `READ_CURSOR` naming this user arrives -- so another
+  device's mark-unread lands here too. `oc_model_apply` folds one `oc_ev`
+  into that state. A frontend owns an `oc_model`, drains events each tick, applies
+  them, and renders — the "read events at frame start" shape, fed by the net
+  thread. Single-threaded on the frontend, so no locking.
+- **`client.c` — the facade.** The lifecycle is `oc_client_start` /
+  `start_secure` / `start_stored`, then `oc_client_tick()` (drain + apply),
+  `oc_client_model()` and `oc_client_stop()`; the messaging core is
+  `send` / `backfill` / `history` / `history_around` / `mark_read` / `react` /
+  `edit` / `delete` / `typing`. **`client/core/client.h` is the authoritative
+  list** — it declares over a hundred entry points, covering threads, pins, saved
+  items, activity, search with operators and paging, channel and member
+  management, files, drafts, scheduling, custom emoji, profile and status,
+  notification settings, admin and storage. This document does not enumerate
+  them; read the header. A frontend uses only this facade.
+- **Summaries (REQ-310–313).** `oc_client_summarize(channel, scope, start, end)`
+  asks for one, over the five scopes of `SUMMARIZE` (unread, today, since
+  yesterday, the last 7 days, or a range of days), and returns the request's id
+  — the first request in the core that carries one. The model holds one open
+  summary: loading, with its place in the daemon's queue, until its `SUMMARY`
+  arrives, then its status and, when it is one, the body read by
+  `client/core/summary.c` into the overview; topics (a title, who was in it, how
+  many messages it rests on, what happened, and details each with the message
+  ids it came from); what needs attention; the titles of further topics; who
+  posted and how many messages the span holds; and the cited messages
+  themselves. An answer to anything but the open
+  request is dropped, and closing forgets it: a summary is shown to the person
+  who asked and kept nowhere, as Slack's are. The same file has what both
+  frontends draw from: each span's name, the dates a span covers ("Sep 28 - Oct
+  5"), the waiting lines, the posters as their hover reads, a citation's "Today
+  at 11:22 AM", the posters' names in a text (drawn as mentions), and the custom
+  range picker (`oc_sumcal`: two months, the first day then the last, nothing
+  after today). Frontends offer it only where `oc_model_summarize_available`
+  (the `summarize` capability), and close it when the conversation changes.
+  A connection lost while it waits asks again once signed in (the daemon drops
+  what a closed connection waited for). One that was not made has a headline
+  for why (`oc_summary_fail_title`: unavailable, refused, or failed) over the
+  daemon's own sentence, and, unless it was refused, `oc_client_summary_retry`
+  asks again for the same span. Closing one still being made, or
+  `oc_client_summary_detach`, stops watching it: it goes on, and the daemon
+  tells this person when it is made (`SUMMARY_READY`), as a notice the model
+  keeps (`sum_notices`, each once however often told) until it is opened
+  (`oc_client_summary_open_notice`: the summary as it was made fills the open
+  summary) or dismissed; `oc_model_summary_notice_take` gives each new one to
+  the frontend once, for a toast, and `oc_summary_notice_title` words it.
+  `oc_client_summary_cancel` cancels one being made. Activity lists notices as
+  kind 4.
+
+- **Transfers queue** (REQ-140/162). A connection runs one transfer at a time,
+  as the daemon requires, so the net thread keeps a FIFO of transfer commands —
+  uploads, downloads, in-memory fetches and video posts — instead of refusing a
+  second one as busy. Each carries a tag its `OC_EV_XFER` progress (at most ten
+  a second) and completion events repeat, and `oc_client_cancel_transfer` drops a
+  queued one or aborts the running one. A fetch already queued for the same
+  attachment is not queued twice. The queue outlives a connection: the job
+  running when the link drops goes back to the front and starts over.
+  `oc_client_post_files` is one job for up to `OC_MAX_ATTACH` files and a line of
+  text, and `oc_client_post_items` the same job whose files may also be bytes in
+  memory under a name -- an image pasted from the clipboard, which the core copies
+  and uploads without writing anything to disk (ARCH-88): it uploads the files in order and then sends ONE message carrying the
+  text and all of them, to a channel or into a thread; a file that cannot be
+  read, an upload the daemon refuses, or a cancel posts nothing, and a restart
+  after a lost link starts from the first file (what an earlier connection
+  finished was never posted, and the daemon reclaims it). Its progress names
+  the file moving. An upload's progress counts what the daemon has
+  acknowledged — it acknowledges a chunk once it is written (ARCH-69) — not
+  what has merely been sent. The model keeps each recent transfer's latest
+  notice by tag (`oc_model_xfer`), because a frame drains every event before it
+  draws: a small file that finished between two frames would otherwise never be
+  seen to finish.
+- **Video messages** (`client/core/media/`, ARCH-110). The media library —
+  capture, the audio device layer, VP9 and Opus, the restricted MP4 writer and
+  reader, the recorder and the player — is kept out of `CORE_SRC`, so a frontend
+  that records nothing (the TUI) links no codec. `oc_client_post_video` takes the
+  recorder's MP4 and poster (in memory: ARCH-88) and runs one queued job: upload
+  the poster, upload the video, `ATTACH_MEDIA_SET`, then `SEND` or `SEND_REPLY`;
+  `OC_EV_MEDIA_POSTED` says it went. `oc_client_fetch_media` fetches a video into
+  memory under the attachment ceiling rather than the 8 MiB inline one.
+  `oc_model_msg_preview` is the one-line summary of a message — its text, or
+  "🎥 Video message (m:ss)" — for sidebars and notifications. See
+  [VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md).
+- **Voice input** (`client/core/voice/`, ARCH-112). The dictation
+  session, the libfvad segmenter and the speexdsp echo canceller, over the media
+  library's device layer — linked by the Win32 client. Segments go to the daemon
+  beside, not behind, the transfer queue. See [VOICE-INPUT.md](./VOICE-INPUT.md).
+- **Calls** (ARCH-73/113). Signaling, the device key and the media keys are the
+  core's, on the network thread (`client/core/callsig.c`): `oc_client_call_start`,
+  `_join`, `_leave`, `_decline`, `_end` and `_invite`, answered in the model as
+  `calls` (the Calls section), `call`/`in_call` and `call_error`, with invitations
+  worth a toast drained by `oc_client_call_notify_take`. A call the device was put
+  out of by its connection, a sweep or a moved media path is rejoined by the core
+  (CALLS.md §4): `call_rejoining` names it meanwhile, `call` still describing it,
+  and `call_back_seq` / `call_lost_seq` count how such attempts ended. The Win32
+  client keeps the in-call strip and the call view up, reading "Reconnecting to
+  the call…", the tiles greyed and Leave the one control; it says "Back in the
+  call." when that works and "Lost the call. Join it again from the channel." when
+  it does not. Someone else whose connection went (`call.away`, from the roster's
+  `AWAY` flag) has a greyed tile reading "Reconnecting…" until they are back or
+  their seat goes. In the call view, toasts stand above the call's controls and
+  the line of who is invited, not on them. The audio is the
+  engine's (`client/core/call/`, linked by the Win32 client and the tests),
+  plugged in with `oc_client_set_call_media` behind the `oc_call_media` seam, so
+  the TUI links no codec. See [CALLS.md](./CALLS.md) and [AUDIO.md](./AUDIO.md).
+
+**Headless-testable.** `tests/test_client_core.c` starts the daemon's netloop
+in-process (like the itest) and drives real `oc_client`s against it — connect +
+auth, channel-list populate, send round-trip, unread + mark-read, history
+backfill, display names, reaction aggregates, edit/delete, and typing — so the
+whole reducer set is CI-covered with no UI.
+
+## 3. Frontends
+
+Each frontend is thin: create a client, loop { `oc_client_tick`; render the
+model; translate input to intents }, stop.
+
+- **TUI (`client/tui/`, first):** a terminal cell grid — a channel sidebar (with
+  unread counts and presence dots), a scrolling wrapped message pane, and an
+  input line — built on
+  **termbox2** (the cell grid + input) and **utf8proc** (Unicode width +
+  grapheme breaking), both **MIT**, both vendored as committed single-file source
+  (ARCH-75). The one property that matters to a chat client is **correct
+  wide-character / emoji width**, so emoji reactions (REQ-070/071) and wrapped
+  messages don't corrupt the layout — utf8proc's `utf8proc_charwidth` + UAX #29
+  segmentation (with bundled UCD tables) gives us that without hand-rolling.
+  **notcurses is rejected on licensing** — it hard-depends on libunistring
+  (LGPL); termbox2 + utf8proc keep the whole client permissive. **The TUI is
+  text-only and never renders graphics — no images, ever.** Built on the host
+  like the daemon (`make linux`), zero transitive dependencies. The widget/
+  formatting layer above termbox2 is the in-tree **`tuikit`** toolbox (ARCH-83,
+  [TUIKIT.md](./TUIKIT.md)): panels, modal lists, a command palette, text
+  prompts, and a 256-color theme.
+
+  **Interaction model — modeless and menu-driven, not slash-command-driven.**
+  The input line is always ready to type a message (Enter sends only); every
+  action is reached through discoverable UI — pane action menus (Enter on a
+  selected message/member/channel), modal prompt dialogs, and a global action
+  launcher (Ctrl+K or `:`). Navigation is Esc/Tab between the composer and the
+  panels plus a few Ctrl chords (Ctrl+F search, Ctrl+W workspaces, Ctrl+R
+  reconnect, Ctrl+Q quit). There are no slash commands. A chat app's
+  reflex is "type and hit Enter"; a modal/vim scheme taxes every message with an
+  `i` first, so it's rejected. **Loop:** termbox2 on the main thread, draining
+  `oc_client` events each iteration and polling input with a short timeout
+  (`tb_peek_event`, the "read events at frame start" shape); a wakeup fd on the
+  client queue is a later optimization if idle cost ever matters. **Layout (v2,
+  the lazygit/k9s idiom):** a header bar (workspace · you · presence · connection ·
+  unread), three **bordered, titled panels** — Channels │ Messages │ Members
+  (the active one drawn in a bright border) — a status line, the always-ready
+  composer, and a **context keybinding hint bar**; `?` opens a full
+  help overlay. Read-only overlays (thread, search, roster, who-reacted,
+  notification prefs, webhooks) render inside the Messages panel. Everything is
+  drawn cell-by-cell, re-laid-out on resize, measuring glyph width with utf8proc.
+  **Navigation mode** (Esc from the composer, or Tab on an empty composer): a
+  panel is focused (bright border); Tab cycles Channels / Messages / Members,
+  the arrow keys move a highlighted selection (there are no `j`/`k`
+  bindings), Esc returns to the composer. On the Messages
+  panel, Enter opens an action menu (Reply in thread / Add reaction / Download /
+  Edit / Delete / Who reacted / Mark unread from here -- which holds off the
+  keep-the-open-conversation-read step until focus moves, or the next frame
+  would read it again); single-key accelerators act directly: `t`
+  thread, `r` react (opens a filterable emoji picker), `e` edit (prefills the
+  composer), `x` (or `d`) delete, `w` who-reacted. On Members, Enter opens a
+  member menu (Message / Make admin / Make member / Remove); `n` starts a new
+  DM. **Action launcher** (`:` on an empty composer, or Ctrl+K): a
+  fuzzy-filtered, sectioned list of every action — New channel, Leave,
+  Notifications, Webhooks, Upload, Search, New DM, Set away/online, Change
+  display name/password, DND, Profile, Invite, Storage usage, Audit log, Daemon alerts, Switch
+  workspace, Help, Log out. Enter runs a parameterless action immediately, or
+  opens a modal prompt dialog for one needing an argument.
+  **Emoji picker:** `r` on a selected message opens a filterable emoji popup
+  (type a shortcode name, Enter reacts with the real Unicode emoji, toggling).
+  This completes the v2 redesign — panels + focus, navigation mode, autocomplete,
+  command palette, and the picker — all frontend-only over the unchanged app-core.
+  **Mouse + config:** the TUI enables mouse input (click a channel/member to
+  select, wheel to scroll) and reads machine-local prefs from a
+  hand-edited config file (`client/tui/config.c`, created with commented defaults
+  on first run): `$XDG_CONFIG_HOME/openchime/config` — else
+  `~/.config/openchime/config` — on Linux/macOS, and
+  `%LOCALAPPDATA%\openchime\config` on Windows, so each platform uses its own
+  convention and the two TUI builds share one code path: `mouse`, `members_panel` (off/on/auto), panel widths,
+  `time` (12/24h), and a default `workspace`. **Layered config:** the portable
+  prefs (everything but `workspace`) also sync through the daemon's per-`(user,
+  client_type)` settings bucket (a `client_settings` key/value table; wire
+  `SET_CLIENT_SETTING` / `LIST_CLIENT_SETTINGS` / `CLIENT_SETTINGS`), layered
+  *over* the machine-local file — a value in the daemon bucket wins, else the
+  file default stands. The core exposes it as `oc_client_set_setting` /
+  `oc_client_list_settings`, folding each snapshot into the model
+  (`oc_model_setting`); the `tui` bucket is separate from the `gui` one the
+  Win32 client identifies as, so
+  frontends never step on each other. The TUI pulls the daemon bucket on connect
+  and layers it over the machine-local `~/.config/openchime/config` file. Most
+  display prefs are read-only there — editing the file is how they change — but
+  the TUI **does** write one thing back: its sidebar sort, filter and collapse state, persisted
+  through `oc_client_set_setting`. Which server you connect to
+  (`workspace`) is deliberately machine-local and never synced.
+  **Storage report (REQ-214):** the launcher's "Storage usage" opens an admin overlay showing free
+  space, live attachment usage, the active retention/eviction policy, and how
+  much maintenance has reclaimed by reason — with pressure and any evictions
+  called out in red, since an operator should not have to read carefully to
+  notice the daemon deleted files nobody approved individually. Owner/admin
+  only; the daemon refuses a member's request rather than sending zeros. An
+  attachment reclaimed by age or pressure returns `OC_ERR_ATTACHMENT_GONE`,
+  which the core renders as "no longer available" rather than a generic
+  transfer error (REQ-215). The message list shows the same thing **in place**:
+  the attachment metadata carries a `reclaimed` flag, so a tombstoned file
+  renders dimmed as `📎 name — no longer available` with no download id, instead
+  of offering a fetch that is guaranteed to fail.
+  **Audit log (REQ-251):** the launcher's "Audit log" opens an admin overlay of
+  administrative/security actions, newest first, with denials/failures in red;
+  owner/admin only.
+  **Daemon alerts (REQ-263):** for an owner or admin, the header shows a warning
+  sign — "⚠ 2 alerts" in red while any of the daemon's critical failures is
+  unacknowledged, "⚠ 1 ongoing" in yellow while an acknowledged one still holds —
+  left of the unread count; members never see it. The launcher's "Daemon alerts"
+  lists them, newest first, each with its state, count and message; `a`
+  acknowledges the one selected, `A` all of them.
+  **Summaries (REQ-310):** where the daemon makes them, "Summarize ▾" at the
+  right of the conversation's title (a click, with the mouse on), the launcher's
+  "Summarize" and the channel menu's offer the span — Unread, Today, Since
+  yesterday, Last 7 days, Custom date range. The custom range is a card: Start
+  and End fields that take a typed date, and two months side by side, the
+  arrows moving the day, Enter picking the first day and then the last, PgUp/PgDn
+  changing month, Tab going round the fields and buttons, and Summarize doing
+  nothing until both days are picked. The summary opens over the conversation:
+  while the daemon makes it (minutes, on a small server, for one not made yet)
+  what it is summarizing and its place in the daemon's queue; then the dates,
+  how many messages and who posted, the overview, and each topic — its title,
+  who was in it and how many messages, what happened, and under "More details"
+  its details, each ending in its citations, [n] — then "Needs attention"
+  (actions and questions, cited the same way) and "More topics". ↑/↓ selects a
+  topic, a detail or an item that needs attention; the selected detail shows
+  the message it cites under it (who, where, its first lines, when); Space, or
+  Enter on a topic, shows or hides its details; Enter on a detail or an item
+  goes to its message, selecting it in
+  the conversation and fetching the history around it when it is not loaded.
+  Posters' names are drawn in the mention colour. The launcher's "Back to the
+  summary" reopens it while you stay in the conversation. While it is made, n
+  asks to be told when it is ready and c cancels it; Esc closes it and it goes
+  on. A summary made while you were away is shown in the header (✦ n ready)
+  and on the status line, and the launcher's "Summaries ready (n)" lists them:
+  Enter opens one in its conversation, d dismisses it. One not made says why,
+  and r asks again. Esc, or moving to another conversation, forgets it.
+  **Multiple workspaces (REQ-012–015):** the TUI holds **one `oc_client` per
+  signed-in workspace** (`g_ws`, capped at `MAX_WS`) and ticks *all* of them every
+  frame, rendering only the active one — so a workspace you aren't looking at
+  keeps receiving and counting unread, and the header shows an "N elsewhere"
+  badge. `Ctrl+W` (or launcher "Switch workspace") opens the **switcher**: each remembered
+  workspace with its connection dot, account, and unread count, plus an
+  always-present **"+ Log in to new workspace"** row; `d` forgets a closed one.
+  The list comes from the store's **workspace book** (§5) unioned with the open
+  sessions, so a workspace with no running client is still offered — selecting it
+  reconnects silently on its stored session token, falling back to the login box
+  pre-filled from the book. Each session carries its own focused channel, scroll,
+  and half-typed message, restored on switch-back, and nothing crosses between
+  workspaces: separate connection, credentials, model, and cached history.
+  **Composer autocomplete:** as you type, a live suggestion strip offers
+  context-aware completions — `#channel` names, `@user` names, and `:emoji:`
+  shortcodes (inserting the real Unicode emoji). Tab accepts the first and
+  cycles; on an empty composer Tab enters navigation mode.
+  **Feature surface**, over the lean core loop (sidebar, focus/switch, history
+  backfill on open, live messages + display names, send, unread, scrollback,
+  reflow, per-nick colors) — each of the following surfaces one engine feature
+  on the wire —
+  - **reactions** — emoji aggregates with a `[n]` "you reacted" marker; `r` on a
+    selected message (the emoji picker) or the message menu's "Add reaction"
+    toggles a reaction (exercising the wide-char/emoji correctness that justified
+    the toolkit).
+  - **edit/delete** — the message menu (or `e`/`x` on a selected message); an
+    `(edited)` marker + `[message deleted]` tombstone.
+  - **typing indicators** — throttled `TYPING` while composing; `✎ X is typing…`
+    on the status line.
+  - **threads** — the message menu's "Reply in thread" (or `t`) opens a message's
+    thread in place of the channel (Enter then posts a reply), with a `↳ N
+    replies` marker on the parent; Esc exits.
+  - **search** — Ctrl+F (or the launcher's "Search messages") overlays matching
+    messages (channel, author, snippet).
+  - **channel management** — `n` in the Channels pane creates a channel; the
+    channel menu's Join/Open/Leave manage membership; non-joined public channels
+    show dimmed with a `+`.
+  - **roster + presence** — the Members panel lists the channel's own members
+    (REQ-031) with online/away/offline dots + roles; the launcher's "Set
+    away/online" sets your own presence. The pane **scrolls under the wheel**,
+    with a thumb when there is more below: a channel roster runs to 500 and the
+    pane holds about twenty, so without an offset everybody past the fold would be
+    out of reach from here. The offset is clamped to the content on every paint, since the roster
+    arrives after the pane opens, and it returns to the top when the channel
+    changes.
+  - **direct messages** — `n` in the Members pane (or a member menu's "Message")
+    opens a 1:1 DM, titled `@peer` in the sidebar (the daemon reports the DM peer
+    in `CHANNEL_INFO`).
+  - **logout** — the launcher's "Log out" revokes this session server-side and
+    quits once the connection drops.
+  - **who-reacted** — `w` on a selected message (or the message menu's "Who
+    reacted") overlays the full reactor list, each reactor paired with the emoji
+    they used (REQ-071).
+  - **notification prefs + DND** — the launcher's "Notifications" overlays the DND
+    window + per-channel levels; the channel menu's "Notify: all|mentions|none"
+    sets the focused channel; the launcher's "Do not disturb" sets the
+    do-not-disturb window (REQ-130/131; each SET returns a full sync that the
+    model folds in).
+  - **read receipts / seen-by (REQ-090)** — the core sends a `CLIENT_ACK`
+    whenever the focused channel's read marker advances; the daemon fans each
+    member's read cursor to the others as `READ_CURSOR`, and the TUI renders a
+    dim "✓ seen by …" footer under the last message naming everyone (bar you)
+    who has read up to it.
+  - **self-service profile (REQ-240)** — the launcher's "Your profile" opens a
+    modal with your name, role, id, and presence; "Change display name" renames
+    you (the daemon fans a `PROFILE_UPDATED` so every roster — and your own header
+    — updates live); "Change password" opens the workspace's password page in the
+    browser (AUTH.md §8.10), where the old password is checked and the new one set;
+    every device, this one included, then signs in again. "Active sessions"
+    (each device signed in, with "Sign out" on every one but this;
+    `REVOKE_SESSION`, REQ-182) and "Change email address" (a local account's
+    own address, `SET_EMAIL`; it signs nobody in) are the Win32 client's; the
+    TUI has neither. "Two-step sign-in" opens
+    the workspace's page for setting up or turning off a TOTP second step the same
+    way (AUTH.md §8.6); the terminal client's launcher has it too.
+  - **admin / user management** — a member menu's "Reset password…" (or with
+    their two-step sign-in too; the menu widens to its longest item, measured
+    in the text it is drawn in, so neither is cut) shows the reset to send them, copied to the
+    clipboard (`oc_model_reset_text`: the workspace, the code to enter on the
+    sign-in card, and the page's link only where a CA vouches for the
+    certificate, since a tunnel's works on this computer alone; AUTH.md §2);
+    an owner's or admin's People pane lists removed members too, and right-click
+    on one brings them back, with the reset to set a password (`ENABLE_USER`);
+    "Make admin/Make member/Remove"
+    and the launcher's "Invite a user" manage users (REQ-030/033, owner/admin
+    only; a `USER_UPDATED` folds each change into the roster, and someone who
+    joins meanwhile arrives in an unasked `USER_LIST` and is listed at once). "Invite a user"
+    asks for an email address where the workspace offers a browser sign-in — the
+    invitation is bound to it, and the prompt says the address must be able to
+    sign in with the workspace's provider, by name where the workspace's browser
+    sources say which (`oc_model_signin_provider`: a source id `google` is
+    Google, `microsoft` Microsoft) — and, where it also has password accounts, a
+    blank address mints a one-time token instead, and a number is how many may
+    join by one shared link (`0` for no limit; REQ-026); a workspace with
+    password accounts only asks the same without the address. Anything that is
+    not an address or a number (`oc_email_plausible`) keeps the prompt open and
+    says so. The invitation text
+    (`oc_model_invitation_text`: the workspace, how to sign in, the expiry, and
+    the link to the daemon's web client where its pages open directly) is
+    printed atop the roster, which opens on it.
+  - **webhook management** — the channel menu's "Webhooks" overlays the focused
+    channel's incoming webhooks; "Create webhook" mints one (the 32-byte token is
+    shown once atop the overlay, like an invite) — REQ-170, CREATE/LIST_WEBHOOK.
+    **Deleting a webhook is not surfaced**: the core exposes
+    `oc_client_delete_webhook` and the daemon handles `DELETE_WEBHOOK`, but the
+    overlay is read-only, and its header shows a `/webhook` hint that
+    corresponds to no command (both are known gaps, and tracked).
+  - **attachments** — the launcher's "Upload a file" streams a local file through
+    the daemon (UPLOAD_BEGIN → CHUNKs within the advertised window → END → OK) and
+    links it into a message; the message menu's "Download file" saves an
+    attachment by id. The net thread runs one transfer at a time as a state
+    machine over the frame stream; received messages carry attachment metadata
+    (id, filename, mime, size), rendered as a `📎 name (size) #id` line.
+    Text-only, so files are never rendered inline (REQ-140/141).
+
+  `oc_client_set_setting` **is called by both frontends** — the TUI persists
+  its sidebar sort/filter/collapse through it and the Win32 client its
+  preferences.
+
+  `INVITE_TO_CHANNEL` and
+  `REMOVE_FROM_CHANNEL` are core entry points (`oc_client_channel_invite` /
+  `_channel_kick`), and redeeming a workspace invitation is the sign-up page
+  (`oc_client_start_signin` with the invitation); the Win32 client surfaces all
+  three.
+- **Windows (`client/gui/app/` over `client/gui/platform/win32/`):** the
+  portable application (ARCH-80) for every surface (message transcript,
+  sidebar, rails, **the composer**, every text field and every menu): an
+  **SDL3 window and renderer**, primitives through **oc_gfx** (ARCH-107),
+  text shaped by **DirectWrite through sdltext** (ARCH-106), inline images
+  decoded by **WIC** behind the platform contract -- and the platform's own
+  where it still earns its keep: the file picker, the certificate viewer, the
+  taskbar, the tray, UIA. The text fields were native `EDIT` boxes once and are
+  drawn now (see "The text fields are drawn"); nothing in the application
+  names a Win32 call. No WinUI, no .NET, no C++. The composer and every menu are
+  drawn into the scene (ARCH-98), so **`RichEdit`,
+  `TrackPopupMenu`, `CreatePopupMenu` and `AppendMenuW` appear nowhere in the
+  client**. The **Windows TUI** (ARCH-81) validates the core port —
+  pthreads, DNS SRV, sockets — via a termbox2-API layer over the Windows Console
+  API, so a GUI bug is unambiguously a GUI bug. **The GUI is
+  affordance-driven — buttons/menus/dialogs/drag-drop, never slash commands**
+  (those do not exist anywhere; the TUI is menu-driven too, ARCH-83).
+
+  **Shell layout.** A **global left-nav rail** (Lucide icons stroke-tessellated
+  by oc_gfx) holds the workspace avatar → switcher, six primary views (Home, DMs,
+  Activity, Files, Later, Admin — the last owner/admin-gated, with a "More"
+  overflow flyout), and a bottom cluster of New (+) / profile avatar.
+  Three custom D2D dropdowns hang off the rail and the channel header —
+  **workspace** (invites, notifications, mark all read, shortcuts, storage/audit,
+  reconnect, sign out everywhere), **profile** (status, away, pause
+  notifications, Profile, Preferences, sign out), and **New** (channel, DM,
+  group message, upload, search, jump to, browse, section, custom emoji).
+  **Invite people** (as member or as admin) asks for an email address where the
+  workspace offers a browser sign-in, saying the address must be able to sign in
+  with the workspace's provider — by name where the workspace's sources say which,
+  as the TUI does — and refusing anything that is not an address at the field, in
+  red, with the form asked again;
+  where it also has password accounts the address
+  may be left empty for a token, and **Who can use it** says how many may:
+  one person, up to 5, up to 25, or anyone with the link until it expires
+  (REQ-026; a shared one is member-role only, so an invitation as admin is not
+  asked). Where it has password accounts only, that is the one question. The
+  answer opens the invitation — the workspace address as typed, how to sign in
+  (the provider and the invited address, or the link to the daemon's web client
+  where its pages open directly, and the token) and the expiry — in a
+  selectable field, already on the clipboard, as a one-time secret is shown.
+  Admin > Invites shows a shared one as "Invite link, 2 of 5 used". **Each
+  destination has one door in the visible chrome**: an item is not repeated in a
+  second menu a click away, and an icon does not open a menu something beside it
+  already opens. Right of the rail sits the channel column (header with the
+  workspace name, which opens the workspace menu, and a compose button, which
+  starts a new message; a "Find a conversation" filter with an **Unreads** chip
+  beside it, which narrows every section to what has something unread and always
+  keeps the open conversation; then the channel list), the transcript, the
+  self-drawn composer, and an optional members pane. **Home, DMs and Activity** render that chat shell
+  (`shell_visible()`), and Home and DMs are not the same: the second column holds
+  channels in one and conversations in the other (`sidebar_kind()`), and DMs shows
+  an index until a conversation is picked. **Activity, Files, Later, Drafts,
+  Threads, People, Admin and Preferences are full surfaces**,
+  answering REQ-139, REQ-143, REQ-231, REQ-223/224/228, REQ-062,
+  REQ-289 and REQ-261.
+
+  **User groups (REQ-307–309)** appear in these places:
+  - **Admin → Alerts (REQ-263)** lists the daemon's critical failures, newest first — what failed, whether it still holds, how often and when, and its message — with **Acknowledge** on each unacknowledged one and **Acknowledge all** above. The Admin rail item carries a warning-sign badge, red while any is unacknowledged and amber while an acknowledged one still holds (on **More** when Admin is folded into it); a glyph, so it is not read as unread messages, with the count in its accessible name. Entering Admin while any is unacknowledged opens this tab.
+  - **Admin → Groups** lists every group with its handle, name and size. New, Edit and Delete (confirmed) act on a group, and **People** opens its members, with Remove on each. Add people above them is the target picker New message uses (REQ-229), limited to people, yourself included, and to those not yet in the group. Up to 32 can be chosen, and Add (or Enter on an empty query) adds them in one go. The two uses share one picker, which belongs to one of them at a time: opening a group's people takes it, and New message's recipients stay in its draft.
+  - A channel's menu gains **Add a group** and **Remove a group**, each a pick from the groups it lacks or has. In the members pane, groups sit under a quiet **GROUPS** subheading whose **+** (tooltip "Add a group") adds one; there are no rows of buttons — every action is beside what it acts on.
+  - **Add someone** (the channel menu) and **Add people** — a person-with-a-plus icon in the channel header beside the member count, tooltip "Add people", not in DMs — open the people picker in the members pane — the target picker New message uses (REQ-229), limited to people not already in the channel, directly or through a group. Several can be chosen, and Add (or Enter on an empty query) invites them all; Escape on an empty query, or Cancel under it, closes it. A click anywhere else gives the keys back, so typing in the composer never lands in the picker. A narrow window, where the pane yields to the conversation, says so. The roster on screen asks for the channel's members again whenever a `CHANNEL_INFO` for the channel arrives (the model's `info_seq`), as it does when the channel's groups change: an invite and a removal are each answered with one and nothing else, and the pane kept showing the channel as it was.
+  - **Remove someone** opens the members pane on the roster: a person's Remove is on their row when hovered, dimmed with the reason for anyone a group keeps in. Both icons are named on hover after the toolbar's dwell, below the button, and have accessible names.
+  - The members pane heads the roster with the channel's groups. Each group row has a Remove, which asks first, since everyone in the channel only through that group leaves with it; the menu's Remove a group asks the same way.
+  - A hovered member row offers Remove, and the member menu offers Remove from channel. Someone in only through a group is marked "via @handle"; their Remove is dimmed and says why when clicked, and the member menu shows the reason in its place.
+  - For a user in the open channel only through a group, the channel menu replaces Leave with the reason, and Mute is the way to quiet it. Remove for someone who is in only through a group says why instead of sending. For a channel whose roster is not loaded, Leave is offered, and the daemon's refusal says why.
+  - The notice for a message that could not reach everyone it named adds "and N more" when a group named more than it lists.
+  - The composer offers groups beside people after `@`, and colours a group's handle as it does a name.
+  - A message naming a group I am in tints and toasts as one naming me.
+  - People lists the groups above the roster, and a profile card lists a person's groups.
+
+  **Summaries (REQ-310)**, where the daemon makes them: **Summarize** in the
+  conversation's header opens a menu of the spans — Unread, Today, Since
+  yesterday, Last 7 days, Custom date range — and the channel menu's
+  **Summarize** and the palette's "Summarize this conversation" open the same
+  menu. Custom date range is a card, "Summarize custom date range": Start and
+  End fields that take a typed date, and two months side by side with ‹ ›, today
+  ringed, days after today faint and not taken, the first click the first day
+  and the second the last, the range between tinted; Summarize stays grey until
+  both days are picked. The summary opens in the context pane, beside the
+  conversation, under a **SUMMARY** header. While the daemon makes it: what it is
+  summarizing ("Summarizing unreads in #pf-alerts"), its place in the daemon's
+  queue, and three placeholder lines. Then, as Slack's: "Summary of #channel",
+  the dates, and on the right the message count and the posters' faces (each
+  named on hover); the overview; each topic's title, with a chevron that shows
+  or hides its details ("Less detail"/"More detail"), who was in it and how many
+  messages, what happened, and under "More details" its details, each ending in
+  its citations, [n], numbered through the summary; "Needs attention", its
+  actions and questions cited the same way; and "More topics", the titles that
+  did not fit. Hovering a citation shows the message as a card — face, who, where,
+  its first four lines, when; clicking it goes to the message in the
+  transcript, which scrolls to it and flashes it, as a pin does; the pane stays.
+  Posters' names are drawn as mentions. Under the summary: "AI-generated
+  summarization may be inaccurate." One not made keeps the header and says why,
+  with **Try again** unless it was refused. While it is made, **Notify me when
+  ready** closes the pane and lets it go on, and **Cancel** stops it; closing
+  the pane is the same as Notify me. When one made while you were not watching
+  is ready, a toast says so ("Your summary of #kudos (Today) is ready") with
+  **View**, and stays until it is opened or closed (`OC_FB_NOTICE`), which opens it beside its conversation; one not made says so with
+  **Try again**. Activity lists them with the sparkles icon; clicking one opens
+  it. The pane scrolls; its back arrow or close
+  forgets the summary, and so does moving to another conversation. The header's
+  Summarize (`header.summarize`), each topic's chevron (`summary.topic.<t>`),
+  each citation (`summary.cite.<n>`) and each pickable day of the range card
+  (`sumrange.day.<yyyymmdd>`, with `sumrange.prev`/`.next`) are buttons in the
+  accessibility tree, invoked as a click. Harness verbs: `summenu` opens the
+  menu, `summary <scope>` asks without it and `summary close` closes it,
+  `sumrange [<first> <last>]` opens the range card (and picks those days),
+  `sumtoggle <t>` shows or hides a topic's details, and `sumcite <n>` goes to a
+  citation's message (`sumcite <n> hover` shows its card).
+- **Linux GUI:** the **same portable client** (ARCH-80) — the shared
+  app layer over SDL3, with a FreeType/fontconfig text backend and a small
+  native shim (tray, AT-SPI accessibility, libsecret). Not a GTK app: the client self-draws everything a toolkit
+  would supply.
+- **macOS/iOS:** the portable client over SDL3 on macOS, with a
+  CoreText backend and an Obj-C native shim where Apple leaves no C surface;
+  UIKit on iOS is its own effort over the core.
+- **Android:** Android views (Kotlin) over the core.
+- **Web:** the portable client compiled to WebAssembly — the core and the GUI,
+  SDL3 under Emscripten — served by the daemon over HTTPS from its own origin, with
+  the protocol carried inside WebSocket frames (a browser opens no raw socket) and
+  a shim for what the browser provides: text drawn through the canvas, an ARIA tree
+  mirroring the accessibility tree, the credential store, notifications, file
+  pickers and media capture. Nothing is installed: the browser loads it from the
+  workspace. The application is the same sources as Windows over
+  `client/gui/platform/web/` (`make web`, `make web-test`); the design is
+  [WEB.md](./WEB.md).
+
+**Across the graphical frontends.** Win32 is the reference client (ARCH-82): it
+surfaces every engine feature, and a feature is surfaced there first.
+Accessibility (REQ-269) is a UIA provider over the self-drawn UI, a real system
+caret and UIA events (**ARCH-99**), with an `AutomationId` and an
+`InvokePattern` on every actionable element (**REQ-290**), verified from outside
+the process by `scripts/gui/uia_probe.ps1`. Rich text and its toolbar
+(**REQ-220**, ARCH-100) are a shared parser in `shared/richtext.c` plus sdltext
+byte ranges. Each platform has its own screen capture for sharing in calls; the
+codec and the transport are in the core (REQ-161, [CALLS.md](./CALLS.md) §6).
+
+## 4. The wire layer (reused, already tested)
+
+The core links `shared/protocol.c` (every `oc_encode_*`/`oc_decode_*` for both
+directions exists), `shared/tls.c` (client TLS and verification), `shared/framebuf.c`
+(reassembly), and `shared/sock.h` (POSIX/Winsock shim). The wire sequence is
+PROTOCOL.md §3–§6 and the §10 state machine. **Trust (ARCH-10,
+[TLS.md](./TLS.md)):** a daemon's certificate must chain to a trusted root —
+built in, `OPENCHIME_EXTRA_CA`, or the operating system's — and name the
+workspace. One that does not is accepted only if the workspace's `.well-known`
+publishes its fingerprint, if the person has trusted it, or if the daemon is on
+loopback (`client/core/net.c:cert_judge`). Otherwise the attempt ends with
+`OC_EV_CERT_UNTRUSTED` carrying its fingerprint (`model->cert_fp`, `cert_changed`,
+`cert_seq`), and the net thread waits: `oc_client_trust_cert` keeps it with the
+workspace's credential (`oc_store_save_pin`, §5) and connects again at once; a
+retry (`oc_client_reconnect`) connects again and asks again, the way back for
+someone who declined. The sign-in probe judges the same way before anything is
+typed (`oc_net_probe_ex`, `OC_PROBE_UNTRUSTED`); both carry the certificate
+itself as well as its fingerprint (`oc_cert_seen`, `model->cert_der`). The
+question takes the shape security prompts share — the Remote Desktop and browser
+warnings, and the research behind Chrome's: a title saying what is wrong ("Can't
+verify this server's identity", or "This server's identity has changed" with a
+stronger icon), the fingerprint as an administrator's tools print it (upper case,
+colons: `oc_fingerprint_format`), and the safe answer as the default — Enter
+declines. The Win32 client asks in a `confirm()` on the modal frame, over the
+sign-in card too: **Don't connect** is the primary, **Trust and connect** the
+danger button on the far left, with **Copy fingerprint** and **View certificate**
+(Windows' own viewer, its "Install Certificate" disabled: that would trust the
+certificate as a root for everything). Trusting a probe's certificate runs that
+sign-in step again. The TUI asks on a full screen, `[y/N]`, at sign-in and for
+the workspace on screen after it. Both
+ask about a question that came before they first looked, as one does for a
+workspace connected at start-up. A trusted certificate that
+is replaced is shown as a change, not taken on the old trust; a CA-issued one
+replaces the trust, which is forgotten (`oc_store_clear_pin`).
+
+## 5. Local store
+
+The core **stores nothing locally beyond credentials** (ARCH-88/REQ-201). There is
+no database and no file: `client/core/store.c` is a thin front for the OS
+credential store, holding one entry per workspace with the session token, the
+trusted certificate (if any), and the book fields (typed address, account,
+last-used). Because there
+is one credential per workspace, **enumerating the credential store is the
+workspace book** (`oc_secret_each`), and "forget" is a single delete. **The
+entry is keyed by the workspace as named** (`oc_workspace_key`: its domain,
+lowercased, with the port only if one was typed; an IPv6 address in its
+canonical spelling, bracketed) — not by the address resolution
+produced, which is an answer and can change: an SRV record moves, two names share a
+front door, and the trust and the session belong to the name a person trusted. An
+entry an earlier client filed under `host:port`, or under whatever was typed, is
+moved to the key the first time it is found (`oc_store_adopt`) — token with its
+owner, trust, device key and book fields together, never overwriting what the
+name already holds. **Remember me** governs the session, not the trust: off
+(`oc_client_start_opts`), no token, account, device key or switcher entry is kept,
+and a certificate the person trusted still is — it is not a secret, and without it
+they would be asked about the same certificate every time (ARCH-10).
+
+**A workspace that moved is re-filed.** A hosted workspace can change its address,
+and answers at the former one for a while. Its daemon says where it is now
+(`WORKSPACE_ADDRESS`); when that is another key, the net thread moves what is kept
+to it (`oc_workspace_move`, which adopts as above), shows the new address in the
+book, and names it on the next connection. `OC_EV_WORKSPACE_MOVED` carries the new
+key, and the model says so in the status line.
+
+**A refused session is `signed_out`, not an error.** When a stored or reconnecting
+session is refused and there is no credential to fall back on, the core drops the
+dead token, raises `OC_EV_SIGNED_OUT` and stops; the model's `signed_out` is set
+until the next successful sign-in. Both frontends answer it by opening that
+workspace's sign-in with the workspace filled in — over another live workspace
+where there is one — and neither starts a browser sign-in unasked. Cached
+history is gone and the offline outbox lives in memory on the net thread. With no
+OS credential store, nothing persists at all.
+
+  **There is no plaintext fallback.** Where no store exists — headless, no D-Bus,
+  a locked keychain — `oc_store_save_session`/`load_session` simply do nothing, so
+  that machine keeps no session and the user signs in again next launch. Opening a
+  store also **erases any `state.db` an older build left behind**, so upgrading
+  costs one re-sign-in (and a self-signed daemon's certificate asked about again)
+rather than leaving a plaintext credential
+  on disk. macOS Keychain slots behind the same vtable.
+
+**One credential per workspace holds five things**, in a flat versioned blob
+(`SEC_VER`) rather than a schema:
+
+- the **session token**, which is what makes silent reconnect across a restart
+  work (REQ-100);
+- **whose token it is** — the account it authenticated as. A workspace holds one
+  credential, so without this a client told to sign in as somebody else rode in
+  on whoever signed in last: the credential it was handed was never consulted,
+  and the second person on a machine simply *was* the first. It is written only
+  by `oc_store_save_session`, in the same write as the token, and cleared with
+  it. It is deliberately **not** the book's account below, which any frontend
+  writes before it knows whether the sign-in worked — reading that one instead is
+  exactly the bug, and it looks like a fix until two people share a machine;
+- a **trusted certificate** (REQ-183): the fingerprint of a self-signed daemon's
+  certificate the person accepted. Not secret but integrity-sensitive — rewriting
+  it is how a man-in-the-middle is accepted — so it lives where the token does
+  rather than in a file anyone can edit;
+- the **workspace book** fields (REQ-012) — the address the user typed, the
+  account, and a last-used stamp. Because there is one credential per workspace,
+  **enumerating the credential store is the book** (`oc_secret_each`), and
+  "forget" is a single delete that leaves nothing behind;
+- the **device key** (ARCH-113) — this device's X25519 private key for calls in
+  the workspace, made on the first call and forgotten with the session on sign
+  out. It is the most secret thing here, and here for the token's reason: this is
+  the one place the client keeps anything.
+
+**Migrations read rather than convert.** Version 3 appended the device key and
+version 2 the token's account, each at the end, so an older entry is a byte-exact
+prefix of a newer one. Version 2 appended
+the token's account to the end of the blob, so a version 1 entry is a byte-exact
+prefix of one: it is read as it stands with the account unknown, and the next
+write of anything upgrades it in place. Refusing it would have dropped that
+workspace's trusted certificate along with its token, and the person would be
+asked about it again. The rule this pays for: a token whose account is unknown is not
+reused when a caller names an account — one password sign-in, once, rather than a
+client that is quietly the wrong person. **Downgrading costs more**: an older
+client cannot read a version 2 entry and its next write drops the entry, so going
+back a release is one re-sign-in (and a self-signed daemon's certificate asked
+about again).
+
+**A token belongs to one account, but a workspace has room for one token.** So a
+launch that names an account gets that account, and a launch that names nobody —
+a silent reconnect — gets whoever signed in last at that address. Two accounts on
+one machine therefore means naming the account each time.
+
+**Cached history does not exist**, and the **offline outbox is in memory** on the
+net thread for the life of the process (ARCH-88). Every send is recorded there
+with its idempotency token before it goes out and cleared on its `SEND_ACK`, so a
+message composed while disconnected, or in flight when the connection dropped, is
+resent on reconnect and deduped by the daemon — but **a message still queued when
+the process exits is lost**, which is why a frontend warns on quit while the
+outbox is non-empty.
+
+The store is owned by the net thread. An unusable store just disables persistence
+and the client runs in memory. The TUI resolves
+`$HOME/.local/state/openchime/state`, purely as an on/off flag — nothing is
+written at that path, and resolving it deletes a pre-ARCH-88 `state.db` if one is
+there.
+
+**Reconnect and offline (REQ-100/101/102) are complete**, at the stated cost:
+no offline reading of history, and a queued message dies with the process.
+
+## 6. Auth + reconnect/offline
+
+**In-session auto-reconnect (REQ-100/101).** The net thread runs one
+connection after another in a loop: it captures the `session_token` from
+`AUTH_OK`, and on an unexpected drop it silently re-authenticates with that token
+(`OC_AUTH_SESSION` — no password) under exponential backoff, then
+`BACKFILL_REQUEST`s each known channel from its last-seen message id to recover
+anything missed while offline. The in-memory model is preserved across the blip
+(replays dedup on the high-water mark), so a reconnect is invisible beyond a
+brief status line. A graceful logout (the launcher's "Log out") or a fatal
+reject (bad version, expired session) ends the loop instead of retrying. The net thread tracks its own
+per-channel high-water for the reconnect cursors; a headless test bounces the
+daemon and asserts the client re-auths, keeps its history, and can send again.
+While backing off, the status line counts the wait down (`connection lost —
+reconnecting in Ns…`; the TUI appends its own `(Ctrl+R to retry now)`, since a
+keybinding belongs to a frontend and not the shared core), and
+`oc_client_reconnect` (bound to
+`Ctrl+R` in the TUI) cuts the current sleep short to retry immediately.
+
+**Cross-restart reconnect (via the §5 store).** The net thread
+pre-loads a still-valid stored token and any certificate the person trusted, so the
+*first* connect after a relaunch already uses `OC_AUTH_SESSION` — no password
+prompt. A rejected token (expired/revoked) is dropped and, if a password is
+still held, retried once with it; logging out clears the stored token.
+
+**The offline outbox (REQ-102)** (see §5): the net thread records each
+send in the outbox before delivery, resends the outbox on reconnect, and clears a
+row on its `SEND_ACK` — so an offline-composed send goes out on the next
+connection, deduped by the daemon. **One outbox per connection**, and so one count
+per connection: `oc_net_outbox_pending` answers for the `oc_net` it is given, and
+a frontend with several workspaces signed in adds them up (the Win32 quit prompt
+does). A single global written by every net thread would make the answer
+whichever thread published last — a workspace holding unsent messages reporting
+none, which is exactly the case the prompt exists for.
+
+**Workspace resolution (REQ-010/011,** `client/core/resolve.c`**).** A
+user-typed workspace — a full domain (`chat.acme.com`) or a bare
+name (`acme`, which gets the service suffix — or, in development mode,
+`$OPENCHIME_DEV_SUFFIX` — appended) — resolves by plain DNS: SRV (`_openchime._tcp.<domain>`) first, then
+the domain's A record at 443. A resolution failure is a distinct status, so the
+TUI tells "workspace not found" apart from "could not reach the server" (connect)
+and "auth failed" (login). The TUI accepts `<workspace>` (resolved) or a raw
+`<host> <port>` (dev/local); an explicit `:port` on the workspace
+(`chat.acme.com:9000`) pins the port and skips SRV. **An IP address is dialled
+as typed** — `192.0.2.7`, `192.0.2.7:8443`, `[2001:db8::7]`,
+`[2001:db8::7]:8443`, or a bare `2001:db8::7` — at the port given or 443, with
+no SRV query, no DNS lookup and no `.well-known` request, so a client on an
+air-gapped network contacts its daemon and nothing else. The address is kept in
+one spelling (`inet_ntop`'s), which is also its credential-store key, and text
+that shows a host and port (`oc_hostport`) brackets an IPv6 one. Loopback
+(`oc_addr_is_loopback`) is `127.0.0.0/8`, `::1` in any spelling, an
+IPv4-mapped `127.x` and `localhost`. The Win32 sign-in form's advanced mode
+takes a bracketed IPv6 address as an address, as it does an IPv4 one. Outside
+advanced mode the form shows the suffix beside its workspace field only while
+what is typed would get it — nothing yet, or a bare name — and never beside an
+address, a `:port`, a dotted name or `localhost`
+(`oc_workspace_takes_suffix`).
+
+**The local login box (REQ-020 local mode).** With no credential and no
+stored session token, the TUI shows a modal **Sign in** dialog — the workspace
+and *Remember me*, **no password** (AUTH.md §8.10). Enter signs in to local
+accounts with a **device code** (§8.11); Ctrl+B takes the workspace's browser
+source where it has one. A direct connection's provider needs a browser on the
+same machine, since its answer comes back to this machine's loopback; a terminal
+without one signs in to a local account by device code. The code's screen shows where to go and the code, the
+URL as a QR code (`tuikit/tk_qr.c`, qrcodegen, half blocks, light modules white
+on black so any terminal's colours read the same) where the terminal has room,
+the daemon's fingerprint where the browser will warn about its certificate, and
+the time left; it also opens the page where there is a desktop to open it on,
+and Esc cancels. A `host port user:pw` command line still signs in by password,
+against a daemon in development mode. The dialog resolves the workspace on submit
+(inline "not found"), then connects; an auth failure keeps the box up with the
+reason to retry. *Remember me* gates whether the
+session token persists (the store) or stays session-only. A returning user with a
+stored token skips the box entirely (silent reconnect). Cross-cutting: the model
+gained a sticky `last_error` (not overwritten by "disconnected") so the flow can
+tell auth-failure from unreachable.
+
+## 7. Build
+
+The core + TUI build on the host (a `make linux` target linking `client/core/*.c` +
+`client/tui/*.c` + `tuikit/*.c` + `shared/*` + `third_party/utf8proc/utf8proc.c`, with
+`termbox2.h` compiled `TB_IMPL` in one TU), like the daemon — no cross-compile,
+no container, no external build system. termbox2 and utf8proc are **vendored as
+committed single-file source** in `third_party/` (like jsmn, pinned to termbox2
+v2.5.0 / utf8proc v2.11.3), both MIT, so local and CI share identical sources with
+zero transitive dependencies (ARCH-75). The GUI is one application
+(`client/gui/app/`) compiled over a platform directory: `make windows`
+cross-compiles it with the pinned llvm-mingw over `client/gui/platform/win32/`
+and the SDL3 and mbedTLS built for Windows; a Linux or macOS build is the same
+sources over their own platform directory once it exists. Release artifacts
+come from CI/CD, never a dev machine.
+The web build (`make web`, [WEB.md](./WEB.md)) fetches its pinned Emscripten and
+builds mbedTLS, SDL3 and the codecs for wasm once into `build/wasm/`, beside the
+native trees.
+
+## 8. The graphical client
+
+The rules and the surfaces of the portable GUI (§3, Windows and the web) that a
+change to it has to keep. How it is driven and checked is
+[TESTING.md](./TESTING.md) ("Driving the Win32 GUI", "Seeing the whole window",
+"Reading the GUI smoke").
+
+### The text fields are drawn (every platform)
+
+The find, search, files-search and people boxes, the palette, the emoji
+search, the sign-in fields, the status card's field, the summary range's two
+dates and a form's fields are **drawn fields** (`field` in `app.c`): a UTF-8
+buffer with a caret and a selection, measured and hit-tested through sdltext,
+drawn into the rect the view hands it, with a placeholder, a password mode,
+a multi-line mode for a form's description, an IME composition shown inline,
+and the keys every field has (the arrows, Home and End, word steps, Ctrl+A,
+copy, cut and paste through SDL's clipboard). Each owner adds its own keys
+through a hook -- Enter submits the search, Esc closes the picker, Tab moves
+between the sign-in fields -- and a change hook, which is what the native
+`EN_CHANGE` was. The composer is the same idea with its own, richer editor
+(ARCH-98).
+
+They were native `EDIT` children once. A child window composited **above**
+the rendered scene, so a control left visible while its surface was not drawn
+floated over whatever was -- the recurring failure class the rule below was
+written for -- and a native control is the one thing a second platform
+cannot reuse. Drawn, a field is part of the scene: z-order is paint order,
+the harness's screenshot sees it, and the web client draws it the same way.
+
+**Every field's visibility is still decided in one place, `layout_natives()`**
+(the name kept so the rule's history reads), from three shared predicates --
+
+- `sidebar_kind()` -- what the second column currently holds (channels · DMs ·
+  activity). Anything that depends on the column's *content* asks this, not
+  `view_has_sidebar()`, which only says whether a column exists.
+- `main_is_conversation()` -- whether the middle column is something you can type
+  into. The DMs view has a sidebar but shows an index until you pick someone.
+- `window_is_covered()` -- whether a modal, the palette, the lightbox, a menu or
+  the sign-in card owns the whole window.
+
+A hidden field is not drawn, takes no click and gives up the keyboard. **And
+the drawing must ask the same question as the field**: a box painted around a
+field that is hidden is a field you cannot type into. A new view or overlay
+has to name itself in one of those predicates. It cannot silently inherit
+another surface's fields.
+
+*A predicate whose default is a real answer* is the trap this fix walked into
+itself: `sidebar_kind()` returns `NONE` for a view with no second column, and
+`NONE` is the enum's zero -- a fallback that is a real answer (`CHANNELS`, say)
+hands that answer to every view its author has not thought about.
+
+**The keyboard has one owner.** `g_focus` is the drawn field with the
+keyboard, or NULL for the window itself (the composer, the menus, the
+shortcuts) -- what `SetFocus`/`GetFocus` did for the native children, as one
+variable. A press outside every field returns the keyboard to the window, as
+clicking a native window did; the shortcuts (`accel_dispatch`) run before any
+field sees a key, as they always have.
+
+The dump reports each field's visibility beside the three predicates, because
+a boolean is a better assertion than an image when what you want to know is
+*whether* a control is shown. Read `re=` with the composer in mind: it reports
+whether the composer's **rect is non-empty**; every other flag is a field's
+`visible`:
+
+```
+natives re=1 find=1 ffind=0 srch=0 pick=0 pal=0 si_ws=0 sbkind=1 conv=1 covered=0
+```
+
+**The six search boxes are one control.** Find a conversation, search messages,
+search files, search people, Jump to (Ctrl+K) and search emoji are each a
+field over chrome the client draws, and all six are built the same way:
+`search_box_draw()` draws the chrome -- `SEARCH_BOX_H` tall, following the text
+scale, with the glyph centred -- and `search_text_box()` is where the field's
+text goes, after the glyph, up to the right inset. The field wears the UI
+token (`g_ui`), so it follows the text size and the DPI as everything else
+does. The dump reports each box so this is checked rather than looked at, in
+device pixels:
+
+```
+searchbox find made=1 vis=1 ... edit=112,67,224,86 box=80,62,234,92 text=""
+```
+
+A new gated field (the Files view's "Search files" box, `g_ffind`, is the
+model) is gated on the view it belongs to -- never on a predicate that merely
+happens to be true there -- and checked across all views from the dump before it
+is shown to anybody.
+
+### Shortcuts belong in the message loop, not a window proc
+
+`SHORTCUTS[]` in app.c drives **both** the sheet (Ctrl+/) and the keys, and
+`accel_dispatch()` runs from the message loop before any window sees the message.
+
+This is not tidiness. When the text fields were native children, the main
+window almost never had focus, and a native child consumed what it did not
+recognise, so a chord handled in a window proc was dead whenever the caret sat
+in any EDIT box, while the shortcut sheet advertised it anyway. A drawn field
+(`g_focus`) is no different: it answers the keys it knows. Dispatching from the message
+loop, before any window sees the message, is what makes a chord work from every
+focus.
+
+- **A new global shortcut goes in `SHORTCUTS[]`** with an `ACC_*` action. It then
+  works from every focus and appears in the sheet, because they read the same rows.
+- **Focus-specific keys stay in their procs** and are `ACC_NONE` rows in the table:
+  Enter sends only in the composer; Esc means something different in every surface.
+- **Shortcuts are suppressed while a modal is open** — a modal owns the window, and
+  opening a second surface behind it would leave two things claiming the screen.
+  Esc and Enter reach it through `modal_key`.
+- Test with `scripts/gui/drive.sh key ctrl+k` (also `alt+shift+up`, `ctrl+slash`, `esc`).
+  The verb says which modifiers it holds (`g_synth_mods`, which `mod_down` reads
+  in place of the keyboard's state), because the shortcuts read the modifiers;
+  posting a bare key proves nothing.
+
+### Modals: one frame, explicit commit
+
+Every modal is drawn by `modal_frame()` (app.c) from an `oc_modal_spec`. The
+frame owns the scrim, the card, the title bar with its close button, the footer
+rule and the button row; a caller draws only content and decides none of that.
+One frame, four callers:
+
+- a dialog card is an `oc_modal_spec`,
+- a middle-column pane uses **`pane_header()`** instead — its own header with a
+  real ✕ and no modal furniture, because a pane is not a modal: it fills the
+  middle column and the rest of the app stays live beside it,
+- a typed form is `form_dialog()` **on the frame** (below),
+- and a confirmation is `confirm()`. Exactly one native message box exists, in
+  `on_close_request`: quit has to be answered before the window goes away, and our own
+  frame needs a message loop that is about to end.
+
+**Explicit commit, never live-apply.** A form modal declares `snapshot`/`restore`
+and the frame copies its values on open, so `Save` commits and `Cancel`/`✕`/`Esc`
+put them back — all three meaning the same thing. Live-apply makes Cancel a lie:
+it either does nothing, or has to undo changes nobody recorded.
+
+**Dialogs stack.** A dialog opened from another returns to it when it closes,
+whichever way it closes — Remove in Workspaces asks its question and the list is
+still there afterwards, a row shorter and scrolled where it was, so several can
+go in a row. `modal_enter()` remembers the opener's flag and `modal_finish()`
+hands it back without re-taking its snapshot: the dialog on top was a detour, not
+a second opening. Only the list dialogs are resumable; a form, the status card
+and the schedule card hold half-typed input that is collected as they close.
+Leaving is not closing: anything that calls `close_overlays()` — switching
+workspace, signing out — empties the stack, so removing the workspace you are in
+does not hand the dialog back on top of the sign-in.
+
+**A dialog keeps the view it was opened over only where the view is the
+point.** The your-account dialogs move the window to Home; a confirmation and
+the schedule card keep the view they are about; and the sign-in card is kept
+under any dialog opened over it. The attempt "Have an invite?" or "Have a reset
+code?" starts is watched only while the card is the view, so a dialog that
+moved to Home would leave that attempt running with nobody watching it.
+
+**The Workspaces list scrolls** between a fixed header and footer, on the shared
+overlay offset the wheel already drives for a modal. The arrows, Page Up/Down,
+Home and End move a row focus the paint keeps in view, and Delete asks to remove
+that row. A row's buttons are published as `wsmgr.<remove|signout|go>.<address>`,
+clipped to the list, and a hit-box scrolled under the footer takes no click.
+
+Not every modal is a form. Workspaces performs immediate irreversible actions and
+Shortcuts is a reference sheet, so neither snapshots and both carry one dismissing
+button. Where the setting lives on the SERVER — per-channel notification levels —
+`restore` re-sends the snapshot rather than writing a local, and only for rows
+that actually changed.
+
+#### `form_dialog()` — our frame, our fields
+
+`form_dialog(owner, title, fields, n)` is the generic typed form (`FF_TEXT`,
+`FF_PASSWORD`, `FF_CHECK`, `FF_CHOICE`, `FF_SELECT`) behind every typed form in
+the client —
+topics, renames, webhooks, invites, sign-up, keywords, priority people, the
+custom pause time, profile fields, sections and more. It splits the work
+deliberately:
+
+- the **text fields are drawn fields** (`field`, "The text fields are drawn"),
+  like every other text field in the client;
+- the **chrome is ours**, because sixteen grey Windows-95 boxes in the middle of a
+  themed app were never worth it — and none of them was dismissible the way every
+  other sheet is, screenshot-comparable, or reachable by the harness.
+
+**The tree publishes what is REACHABLE, not what was laid out.** Two rules, both
+about rects that describe space an element is clipped away from — which reads as
+a collision to `chromefit` and as bounds to a screen reader, and is wrong in the
+same way for both:
+
+- **A scrolling surface's rows are clipped to it.** A row's rect is in the list's
+  own coordinates, so the topmost one routinely starts above the list and the
+  last ends below it. It is published as the part that lands on the surface, and
+  a row scrolled out entirely is not published. `acc_push` does this for anything
+  drawn while `g_acc_surface` is set; the transcript's rows do it by hand,
+  because they are published with a name and an id rather than through it. Before
+  this, the first transcript row claimed 80 device pixels of the channel header
+  and paired with both its buttons.
+- **A surface that did not draw this frame publishes nothing.** The transcript's
+  rows outlive the frame that made them, so a view drawing no transcript — Files,
+  Threads, People — published the last one's rows over its own. `g_msglist_drawn`
+  is set by `draw_msglist` and cleared each paint, the way `g_caret_placed` is.
+  The hover reaction strip is the same story with a shorter fix: `draw_msglist`
+  already refills it whenever it runs, so clearing it each paint is enough to
+  make it empty unless this frame drew it.
+- **A RECT is a hit-box as much as a row is.** The conversation header's listen
+  button and member chip are set where they are drawn, so the Files view — which
+  draws its own header with an Upload button in that corner — inherited the
+  listen button's rect and the fit check paired a button nobody could see with
+  the one really there. They are cleared in `render_scene`'s reset block beside
+  the row arrays, where the call header's own button already was.
+- **A popup declares its layer.** The quick reactions float over the row they
+  belong to, so they are published with `g_acc_layer` raised, as the new-message
+  matches are; the overlap half compares within a layer, and covering the row is
+  what the strip is for. Six chips over one row was twelve reported collisions
+  for a pointer resting on a message.
+
+**Prose gets `FF_MULTILINE`.** A drawn field in its multi-line mode, and the one
+rule that changes is Enter: in a multi-line field it is a new line, so saving
+moves to **Ctrl+Enter**, as it does in every editor that has both; Esc still
+cancels from anywhere. There is no scrollbar — the field follows the caret
+instead, and the wheel and the arrows reach every line. The
+box is five lines at least and grows to the value it opens with, up to sixteen
+(`form_multi_h`): the field counts the lines it wraps that value into once it has
+its width (`field_line_count`), and the form is painted and placed again at that height, so a text
+shown to be read and sent — an invitation, a reset with its code — is all on
+screen, since nothing about the field says that it scrolls. A channel's description is its first user.
+
+**Text gets the height its glyphs need, not a round number.** A rect written as
+`y + 80` is three lines at 100% and not two at the largest text size on a scaled
+display, and the difference is a sentence losing its last word inside a box every
+rect-based check calls correct — which is what `clipped=` (TESTING.md) exists to
+catch. `text_rect()` measures instead. A field that must stay ONE line, like the
+composer's cue, takes a non-wrapping format so it ends in an ellipsis rather than
+wrapping into a second line there is no room for, and its rect is the format's
+pinned line box.
+
+**A choice of emoji is never typed.** The quick reactions are six slots in
+Preferences → Messages, each opening the emoji picker for that slot: the same
+picker the status dialog uses, floating over the card that owns it
+(`picker_floats()`). A pick already in another slot swaps with it, so the set
+never offers one reaction twice, and the last emoji left cannot be cleared.
+The set is still stored as catalogue shortcodes. A skin-toned pick resolves to
+its base, and the workspace's own emoji are not offered.
+
+**A time is never typed either.** Pause notifications' custom end time is a
+select of the day's half-hour slots, in the user's 12- or 24-hour format. The
+composer's send-later menu — in a channel, or in a thread, where what it
+schedules is a reply — offers
+three presets (*In 30 minutes*, *In 1 hour*, *Tomorrow, 9:00*) and **Custom date and
+time**, which opens the *Schedule message* card: a month calendar and the chosen
+day's half-hour slots, both drawn inside the card, with a line saying exactly when
+the message will go (REQ-224). Past days and slots are faint and take no click,
+and Schedule checks the time again when pressed, so a slot that passed while the
+card was open is refused with the reason rather than sent at once. A menu row runs
+by its menu's own dispatcher (`menu_run_kind()`) whether it was clicked or invoked
+through automation, because a context menu's command numbers are its own.
+
+**`FF_CHOICE` and `FF_SELECT` are the same question at two sizes.** Choice is a
+chip row — right for a handful of options you want to see at once. Select is a
+closed field opening a scrolling list, for a set you scan rather than survey
+(the timezone list, REQ-240). Both carry their options in `hint` as `"a|b|c"`
+and both write the chosen **index** into `value`, so a caller reads them alike.
+
+**A form with a select is measured with the list open.** The card reserves the
+list's full eight rows below its fields, because the list is sized to the space
+the body has: measured only to its closed fields, a one-field time picker opened
+a two-row list. (And a card that wants little height stays that size: the frame's
+"window too small to inset" rule is asked of the window, not of the card.)
+
+The list is drawn **inside the card body**, flipping above the field when there
+is no room below, rather than floating over the card the way the emoji picker
+does — the body is clipped to itself, so a panel drawn past its bottom edge is
+simply cut off, and keeping it inside the clip makes the geometry the whole fix.
+
+**Its fields are hidden while the list is open**: the list is drawn over
+them, and a hidden field takes no click and gives up the keyboard. This is the
+`layout_natives()` predicate rule above, and a new field has to name itself
+there too.
+
+The fields are shown by `layout_natives()` from rects the painter recorded —
+the arrangement the sign-in card already uses. Two consequences worth knowing
+before touching it:
+
+- **The form's fields do not consult `window_is_covered()`.** They are part of the
+  modal; the modal is what covers the window.
+- **Esc and Enter are answered by the field**, in its key hook (`form_key`), so
+  the frame's Enter-commits/Esc-cancels work in the one modal where you are
+  always typing.
+
+It stays **synchronous**, by a nested message loop, because every caller reads
+the answer on the next line. The loop runs from inside `on_click`; that
+re-entrancy is a known, accepted property.
+
+**Two rules the frame cannot enforce for you:**
+
+- **Open through `modal_enter()`**, so the snapshot is always taken and the
+  transient overlays are closed. The command palette and emoji picker each claim
+  *every* click while open, and `layout_natives` hides their boxes whenever
+  something covers the window — so a palette left open behind a modal is invisible
+  and eats every click meant for the card.
+- **A click inside the card that matches no control stops there.** Letting it
+  fall through to the shell underneath means a stray click in a modal's empty
+  space can change channel behind the dimmed card.
+
+#### The status dialog is bespoke, and its emoji is picked
+
+Set a status (the profile menu) is not a `form_dialog`: its card is a
+content-measured bespoke body. The emoji slot is a button that opens the real
+emoji picker floating *over* the card — the time-dropdown rule: drawn after
+`draw_modal`, clicks claimed ahead of the frame's scrim-cancel, Esc closes it
+before it closes the card, and `modal_finish` closes it with the card. The text
+field offers suggested statuses (five defaults plus recent ones, kept under the
+`status.recents` settings key); choosing one fills emoji, text and its default
+clear time in one click. The "Clear after" chips are prefilled by bucketing the
+member's live `status_expires`, so the dialog reopens showing what is actually
+set. The card publishes its buttons, suggestion rows and chips to the a11y
+tree, which is what lets `chromefit` prove the card holds its own content — the
+defect that motivated the rebuild was a chip row clipped at the card's edge,
+invisible to any check that never saw its rects.
+
+### Preferences is two-paned, and appearance applies live
+
+Categories left (**Appearance / Messages / Notifications / System**), one pane's
+rows right. **System** is where the app behaves as an application rather than as a
+chat surface — what the close button does, whether it starts with Windows — and it
+ends with Reset. There is no *Advanced*: it held Reset and a DPI override, the
+override was a harness affordance rather than a setting (the app takes its scale
+from what Windows reports, ARCH-97), and one button is not a category.
+
+A row's hit-boxes exist only while its category is showing — the click
+router and the painter share `g_pref_cat` so they cannot disagree — and the sheet
+reopens on the pane you left it on.
+
+**Appearance applies live and reverts on Cancel.** A colour, a text size and a
+density are their own preview; you cannot judge any of them from a label. The
+snapshot therefore covers the accent, the text size, the density and the DPI, and
+`prefs_restore` re-applies each through the one path that knows what it
+costs (`scale_apply` rebuilds every text format and drops the raster caches;
+`dpi_set` lets the next paint's scale pass rebuild them lazily).
+
+**A colour scheme is a PAIR** — the nav rail and the accent — because they are seen
+together: an accent chosen against a fixed rail could fight it, and that looked like a
+bug rather than a choice. Each scheme carries both colours for both modes, and the
+selected-row tint is derived from the accent rather than being a palette constant, so
+a plum scheme does not leave a blue selection behind. Every rail is dark in both
+modes on purpose: rail icons and labels are near-white, so a light rail would need its
+own foreground set and a second contrast problem to keep solved.
+
+**The three scale multipliers stay separate (ARCH-97).** Text size is a preference
+and follows the account. Zoom (Ctrl+`=` / Ctrl+`-` / Ctrl+`0`) is this window only
+and is deliberately **not** persisted — a temporary magnification following you to
+another machine is not what you asked for. DPI belongs to the display. `g_text_scale`
+is the product of the first two, so nothing downstream has to know there are two
+inputs; anything that caches a font size of its own is rebuilt by `scale_apply`.
+
+### About OpenChime: both builds on one screen
+
+The workspace menu's **About OpenChime** (and the palette's) is a small dialog
+with three rows: the client's build id and platform (`dev (web)`,
+`74359c0 (Windows)`), the daemon's build id, and the protocol version. The
+daemon's comes from `SERVER_BUILD` at sign-in (PROTOCOL.md §4.3c), held in the
+model as `server_build`; it reads "not connected" when signed out and "not
+reported (an older daemon)" from a daemon that predates the frame. A build is
+the short commit it was compiled from (`shared/build_id.h`, RELEASING.md); a
+release number is a label on a build and is not in either binary, so the build
+is what is shown. **Copy** puts the whole as one line on the clipboard --
+`OpenChime client 74359c0 (win32), server 74359c0, protocol 25` -- for pasting
+into a report; the harness's `about` verb opens the dialog and answers that
+line, which `make web-test` checks.
+
+### What the window says, and where (REQ-263)
+
+Each kind of message has one surface, decided by what it is
+(`client/shared/feedback.{h,c}`, which holds the state with time passed in; the
+GUI only draws it):
+
+- **A confirmation** the screen does not already show (copied, saved, marked
+  read): a toast that leaves by itself — four seconds, longer for a longer
+  sentence. Nothing for what the screen shows anyway: joining a channel opens it.
+- **Something undoable** (a deleted draft or message): a toast with **Undo**, ten
+  seconds, instead of a question before every delete. A message's Undo asks the
+  daemon to restore it (`RESTORE`), so it comes back for everyone.
+- **Progress** (sending a video message): one toast, updated in place, ending as a
+  confirmation or a failure.
+- **A failure with nothing to mark**: a toast that stays until dismissed, said
+  assertively — one that leaves by itself is one nobody saw.
+- **An ongoing state** (the connection): a banner under the tabs, the most severe
+  first, said once as it starts and gone when it ends. While it is down, what was
+  loaded stays readable under it; nobody, you included, reads as present (the
+  model's presence is stale until the connection says otherwise); and a message
+  written meanwhile waits in the composer, said there, until it can be sent.
+- **A hint about a field or the composer** ("Who is this for?", a file too large):
+  inline at that field or composer — above the conversation's composer, under the
+  New message pane's — until the next edit; a form's field turns red and the form
+  asks again.
+
+A toast is a card sized to what it says: an icon by kind, the text wrapped, its
+one action, and a close button. The pointer on one holds it; Esc dismisses the
+newest; Ctrl+Shift+Z does what the newest offers. At most three show, where the
+**Notices** preference puts them (bottom centre, bottom right, top right — under
+the tab strip and any banner, never over them). While a dialog is open they go
+to the window's bottom edge, centred under its card, whatever the preference;
+where there is no room for even one, the newest overlaps the footer's empty
+middle. Toasts are painted above everything, a dialog included, and take a
+click before anything under them, so one can always be closed. Every
+toast, banner and hint is spoken — politely, or assertively for a failure — and
+each toast's action and close are published for UI Automation.
+
+### Badges, and notifications that leave when read (REQ-138)
+
+**Two tiers, everywhere a conversation is counted** (`oc_model_badge`): a
+**count** for what is about you — a mention, a keyword, a priority person, and
+in a direct message every message, since all of it is to you — and for any other
+unread only the conversation's name in bold (the dot every chat client uses).
+Muted shows neither. The sidebar's pill, the workspace badge on the rail (a small
+dot when only plain unread waits elsewhere), the taskbar overlay (a disc with no
+number for the same) and the TUI's sidebar all follow it, and each accessible
+name says "N for you" or "unread".
+
+**A notification leaves when its conversation is read.** Every conversation the
+OS is showing a notification for is withdrawn from the Notification Center
+(`oc_osn_withdraw`) once its unread is gone — read here, or on another device,
+since that read reaches this model too — so the Notification Center, the badge
+and the app agree. A busy conversation's notifications chime at most once every
+five seconds; the rest arrive silently. A notification is raised for any
+conversation but the one being read in a focused window.
+
+### Two standing UI rules
+
+**No "…" on a command.** Not in menus, not on buttons, not in cue banners. The
+convention means "this opens something", but the app is affordance-driven — nearly
+every command opens something — so it decorated almost everything and distinguished
+nothing. Ellipses survive only where they mean *continuation*: "Loading…",
+"Reconnecting…", "alice is typing…", and the `:…:` placeholder for an emoji whose
+image has not arrived.
+
+**A marker on a tile is sized and seated BY the tile.** The presence dot is the
+one that taught this: every call site passed its own centre and its own radius,
+the radius was 4.5 at all six of them, and it had been tuned for the 18 DIP
+sidebar tile. On that tile the marker covered better than a third of the picture
+and put a grey donut through the initial; on the 40 DIP menu avatar the same
+marker at a constant inset floated clear off the disc, because a fixed inset
+from a bounding box is not a point on a circle. `draw_avatar_presence()` takes
+the tile and nothing else — size is a fraction of it, the ring scales with the
+dot, and the seat is where the bottom-right diagonal crosses the edge. A call
+site cannot pass an inset, so no call site can get one wrong, and a new avatar
+size is right on the day it is added.
+
+**A person is a rounded square, everywhere.** The reference product draws every
+person that way — message authors, DM rows, the profile pane, the popover and the
+rail's You button alone — and a circle in one place beside a square in another
+reads as two products. `draw_user_avatar()` takes no shape: the corner is a fixed
+fraction of the tile (`avatar_corner()`), so a 20 DIP row avatar and a 128 DIP
+profile photo are the same shape, and the presence seat derives from the same
+corner.
+
+**An expanded section that is empty says so**, in italics — the app's only italic
+(ARCH-97 names weights, not styles) precisely so it cannot be read as a conversation
+called "Empty". It says "No matches" instead when a find filter is what emptied it,
+because "you have none of these" and "none of yours match" are different answers and
+an empty list gives the same silence to both.
+
+**A `#channel` in a message is a link.** The completer inserts `#name`
+(`client/core/complete.c`); `oc_chanref_scan` in `shared/mention.c` reads it back
+— beside the `@` scanner, because the two are one text rule and the way a rule
+drifts is by being written down twice. The transcript styles a reference like a
+mention and opens the conversation on release, the way a URL opens a browser.
+
+Two exclusions, both of them "what looks like a link is one". A reference is
+styled **only when it resolves** against the channels this client holds, so a
+private channel you are not in, and any `#word` that was never a channel, stay
+ordinary text. And a `#` inside a URL belongs to the URL: `https://example.com/#general`
+is one address that opens a browser, and the word-boundary rule cannot see it,
+because the byte before the `#` is a `/`.
+
+### The composer is ours (ARCH-98)
+
+There is no RichEdit and **no child window**. The field is drawn into the
+scene by `ed_draw()`, and the **main window** owns the keyboard while `g_ed_focus` is
+set. Consequences worth knowing before touching it:
+
+- **`layout_composer()` computes a rect, it does not move a control.** `g_ed_box` is
+  both what `ed_draw` paints into and what `ed_hit` tests against, so what you click
+  is what you see. When the middle column is not a conversation the rect is emptied
+  **and focus is dropped** — keys must not go to a field nobody can see.
+- **Every mutation goes through `ed_begin_edit()`**, which pushes an undo snapshot.
+  Undo is whole-text snapshots rather than a journal: a message is at most 4000 UTF-16
+  units, so a snapshot is 8KB, and it cannot get out of step with the buffer.
+- **`ed_changed()` is the one post-edit path** — it re-measures the box, fires the
+  typing indicator, refreshes the completion popover
+  and resets the caret blink. A key handler that mutates text and skips it will look
+  almost right.
+- **The IME composition string is spliced into the layout at the caret**, not appended
+  to the buffer: that is what makes it wrap and measure like real text, and therefore
+  what makes the candidate window land in the right place. Hit-testing subtracts its
+  length again, because it is in the layout and not in the text.
+- **Anything that replaces `g_body` must call `ed_invalidate_layout()`** (see
+  `scale_apply`). A stale layout is not visibly broken, which is worse than broken.
+- **Files wait in the box until Send** (REQ-140). The attach button, the file
+  picker (several at once), dropping files on the window, pasting, and the Files
+  view's Upload all put chips in a tray at the top of the box — an image shows itself,
+  anything else the Files view's type badge — and nothing moves until Send,
+  which posts them with the text as one message (`oc_client_post_files`) into
+  the conversation, or the thread, it is sent in. A chip's × removes it; once
+  sending, it cancels that whole post, since a message goes whole or not at all,
+  and the rest of its files wait again. Each chip then shows its file's
+  progress, read by tag every tick, as a bar that eases toward the real figure
+  with a light sweeping along it; the taskbar button fills with the total. A
+  failure puts the files back, the one it stopped at marked, and the text back
+  in the box — or, if you have moved on, into that conversation's draft. The
+  tray height is part of `composer_chrome()`, so the box and the field agree
+  about it, and a chip belongs to its workspace's client as well as its
+  conversation. An edit changes text only; the tray waits it out.
+- **Pasting attaches what is not text** (REQ-140). Ctrl+V in the message box
+  checks the clipboard before it pastes: copied files become chips as they are,
+  so a GIF keeps its animation; clipboard content that carries text pastes as
+  text, since a copy out of a document puts a picture of it beside the words;
+  otherwise an image becomes a chip named `pasted-image-<date>-<time>` -- a GIF's
+  own bytes where the source put the `GIF` format on the clipboard, else its `PNG`,
+  else the bitmap re-encoded as PNG through WIC, so a screenshot travels at PNG
+  size. The bytes stay in memory until Send (`oc_client_post_items`). The New
+  message pane pastes text only: the tray belongs to a conversation.
+- **Rich mode carries a typing-intent layer** — pending styles and continuation
+  across whitespace — described with the dialect in
+  [MARKDOWN.md](./MARKDOWN.md) §6, since it is a property of how the editor
+  keeps markup out of sight rather than of this window plumbing.
+
+### Typography (graphical clients) — ARCH-97
+
+The platform owns the **family**, we own the **scale**. Full reasoning is in
+ARCH-97; what a frontend author needs is the table and two rules.
+
+| Token | DIP | Weight | Used for |
+|---|---|---|---|
+| `display` | 17 | 600 | view + workspace titles |
+| `title` | 15 | 600 | channel header, author names |
+| `body` | 15 | 400 | message text **and** the composer |
+| `ui` | 14 | 400 / 600 | controls, list rows, buttons |
+| `meta` | 12.5 | 400 | timestamps, sublabels, chips, counts |
+| `micro` | 10 | 600 | rail labels |
+
+**Rule one: name the role, never the size.** The Win32 client's formats are
+`g_display`, `g_title`, `g_body`,
+`g_ui`/`g_ui_b`, `g_meta`/`g_meta_w`/`g_meta_r`, `g_avatar`, `g_micro` — the same
+tokens the other graphical clients will declare, so a reviewer moving between
+them reads one vocabulary. A size-named format (a `g_small`) accumulates uses
+across unrelated roles — timestamps, chips, counts, hints, section headers —
+until none of them can change without changing all of them.
+
+**Rule two: two weights.** Regular 400 and Semibold 600 in all chrome. Bold 700
+belongs to markdown `**strong**` in message bodies and nowhere else, so weight
+carries one meaning in the UI and a different, deliberate one in content.
+
+Sizes are DIPs and are multiplied by the user's **text size** factor when the
+formats are built (`fonts_build`); system DPI and window zoom are applied
+separately, for the reasons ARCH-97 gives. Rebuilding the formats is the only way
+to change a format's size, so any preference that moves the scale must call
+`fonts_build` and then force a relayout.

@@ -1,0 +1,3333 @@
+/*
+ * OpenChime client — the view-model + reducers (ARCH-74). See model.h.
+ */
+
+#include "model.h"
+#include "mention.h"   /* oc_keyword_match — the client half of ARCH-103 */
+#include "notify.h"    /* oc_notify_decide — the one notify rule (ARCH-103) */
+
+#include "protocol.h"   /* OC_PRESENCE_OFFLINE */
+
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#endif
+
+#define OC_TYPING_TIMEOUT 6   /* seconds a typing mark stays live without refresh */
+
+void oc_model_init(oc_model *m) {
+    memset(m, 0, sizeof *m);
+}
+
+static void msg_clear_unfurls(oc_msg *m) {
+    for (uint8_t i = 0; i < m->n_unfurls; i++) {
+        free(m->unfurls[i].url); free(m->unfurls[i].title); free(m->unfurls[i].descr);
+    }
+    free(m->unfurls);
+    m->unfurls = NULL;
+    m->n_unfurls = m->cap_unfurls = 0;
+}
+
+static void msg_free(oc_msg *m) {
+    if (m->forward) { free(m->forward->excerpt); free(m->forward->attach_name);
+                      free(m->forward); m->forward = NULL; }
+    free(m->body); free(m->reactions); free(m->attach);
+    msg_clear_unfurls(m);
+}
+
+/* An encrypted DM's texts are wiped, not only freed: once it is forgotten or the
+ * app closes, nothing of what was said is left behind (PRIVATE-DM.md). */
+static void text_wipe(char *t) {
+    if (t) { volatile char *v = t; for (size_t k = 0; v[k]; k++) v[k] = 0; }
+}
+
+static void channel_free(oc_channel *c) {
+    if (c->e2e) for (size_t i = 0; i < c->n_msgs; i++) text_wipe(c->msgs[i].body);
+    for (size_t i = 0; i < c->n_msgs; i++) msg_free(&c->msgs[i]);
+    free(c->msgs);
+    free(c->name);
+    free(c->topic);
+    free(c->description);
+    free(c->readers);
+}
+
+/* Turn a message into a tombstone (REQ-052). The body is not the only thing that
+ * goes: reactions, attachments and any pin hung off a body that no longer
+ * exists. The daemon drops the same state server-side, so leaving it here left
+ * the client showing rows the server had already deleted — a live view that
+ * disagreed with what a reload would produce. */
+static void msg_tombstone(oc_msg *msg) {
+    msg->deleted = 1;
+    free(msg->reactions);
+    msg->reactions = NULL;
+    msg->n_reactions = msg->cap_reactions = 0;
+    free(msg->attach);
+    msg->attach = NULL;
+    msg->n_attach = msg->cap_attach = 0;
+    msg_clear_unfurls(msg);
+    msg->pinned = 0;
+    msg->pinned_by = msg->pinned_at = 0;
+    msg->saved = 0;
+    msg->saved_at = 0;
+    memset(&msg->action, 0, sizeof msg->action);   /* no body, no action (REQ-058) */
+}
+
+/* Set a message's action from what the daemon sent (REQ-058, ARCH-115): an
+ * ACTION frame, or the one the net thread paired with a live message. An event
+ * that carries no answer leaves the message as it was. The span is checked
+ * against the body the model holds, so a frame that disagreed with it can only
+ * clear an action, never point outside the text. */
+static void msg_set_action(oc_msg *msg, const oc_ev *e) {
+    if (!e->action_known) return;
+    memset(&msg->action, 0, sizeof msg->action);
+    if (!e->action || msg->deleted || !msg->body) return;
+    size_t blen = strlen(msg->body);
+    if (e->action_len == 0 || e->action_start > blen || e->action_len > blen - e->action_start) return;
+    msg->action.present = 1;
+    msg->action.start   = e->action_start;
+    msg->action.len     = e->action_len;
+    snprintf(msg->action.actor_name, sizeof msg->action.actor_name, "%s", e->actor_name);
+}
+
+/* A tombstone that was taken back (REQ-052): the body again. Whatever the
+ * tombstone dropped -- files, reactions -- is told again separately. */
+static void msg_untombstone(oc_msg *msg, const char *body) {
+    if (!msg->deleted) return;
+    msg->deleted = 0;
+    free(msg->body);
+    msg->body = body ? strdup(body) : NULL;
+}
+
+/* Apply a PIN event to one message, wherever it lives (REQ-230). */
+/* Both message lists, always — the channel's and any open thread's. Keeping this
+ * beside msg_set_pinned because it is the same shape and the same trap: applying
+ * a pin to only c->msgs left a pinned REPLY looking unpinned in the thread pane. */
+static void msg_set_saved(oc_msg *msg, const oc_ev *e) {
+    msg->saved    = (e->op == 1);
+    msg->saved_at = (e->op == 1) ? e->pinned_at : 0;   /* the ev's timestamp slot */
+}
+
+static void msg_set_pinned(oc_msg *msg, const oc_ev *e) {
+    msg->pinned    = (e->op == 1);
+    msg->pinned_by = (e->op == 1) ? e->user_id : 0;
+    msg->pinned_at = (e->op == 1) ? e->server_time : 0;
+}
+
+/* Fold a reaction aggregate (emoji now has `count` reactors) into a message. */
+static void msg_apply_reaction(oc_msg *msg, const char *emoji, uint32_t count,
+                               uint8_t op, int is_me) {
+    if (!emoji || !emoji[0]) return;
+    uint8_t idx = msg->n_reactions;
+    for (uint8_t i = 0; i < msg->n_reactions; i++)
+        if (strcmp(msg->reactions[i].emoji, emoji) == 0) { idx = i; break; }
+
+    if (count == 0) {                         /* emoji fully removed: drop the row */
+        if (idx < msg->n_reactions) {
+            msg->reactions[idx] = msg->reactions[msg->n_reactions - 1];
+            msg->n_reactions--;
+        }
+        return;
+    }
+    if (idx == msg->n_reactions) {            /* new emoji: append (grow if needed) */
+        if (msg->n_reactions == msg->cap_reactions) {
+            uint8_t cap = msg->cap_reactions ? (uint8_t)(msg->cap_reactions * 2) : 4;
+            oc_reaction *nr = realloc(msg->reactions, (size_t)cap * sizeof *nr);
+            if (!nr) return;
+            msg->reactions = nr; msg->cap_reactions = cap;
+        }
+        oc_reaction *r = &msg->reactions[idx];
+        memset(r, 0, sizeof *r);
+        snprintf(r->emoji, sizeof r->emoji, "%s", emoji);
+        msg->n_reactions++;
+    }
+    msg->reactions[idx].count = count;
+    if (is_me) msg->reactions[idx].mine = (op == 1 /* OC_REACT_ADD */) ? 1 : 0;
+}
+
+/* One monotonic millisecond clock, owned by the core so a frontend and the net
+ * thread cannot read different ones. mingw has no clock_gettime without linking
+ * winpthread, and GetTickCount64 is the platform's monotonic tick anyway. */
+uint64_t oc_model_now_ms(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+    return (uint64_t)time(NULL) * 1000u;
+#endif
+}
+
+uint64_t oc_model_reconnect_in(const oc_model *m, uint64_t now_ms) {
+    if (!m || !m->reconnect_at_ms || m->reconnect_at_ms <= now_ms) return 0;
+    return m->reconnect_at_ms - now_ms;
+}
+
+uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *len) {
+    if (!m || !m->n_fetched) return NULL;
+    uint8_t *d = m->fetched[0].data;
+    if (attachment_id) *attachment_id = m->fetched[0].id;
+    if (len) *len = m->fetched[0].len;
+    memmove(m->fetched, m->fetched + 1, (m->n_fetched - 1) * sizeof m->fetched[0]);
+    m->n_fetched--;
+    return d;
+}
+
+void oc_model_format_duration(uint32_t ms, char *out, size_t cap) {
+    uint32_t s = (ms + 500) / 1000;
+    if (s >= 3600) snprintf(out, cap, "%u:%02u:%02u", s / 3600, (s / 60) % 60, s % 60);
+    else           snprintf(out, cap, "%u:%02u", s / 60, s % 60);
+}
+
+void oc_model_line(const oc_model *m, uint64_t author_id, const char *name, int action,
+                   const char *text, char *out, size_t cap) {
+    if (!out || !cap) return;
+    out[0] = '\0';
+    if (!text) text = "";
+    if (!action) { snprintf(out, cap, "%s", text); return; }
+    const char *who = (name && name[0]) ? name : oc_model_user_name(m, author_id);
+    snprintf(out, cap, "%s %s", who ? who : "", text);
+}
+
+void oc_model_msg_preview(const oc_model *m, const oc_msg *msg, char *out, size_t cap) {
+    if (!out || !cap) return;
+    out[0] = '\0';
+    if (!msg) return;
+    if (msg->action.present && msg->body) {
+        oc_model_line(m, msg->author_id,
+                      msg->action.actor_name[0] ? msg->action.actor_name : msg->author_name,
+                      1, msg->body + msg->action.start, out, cap);
+        return;
+    }
+    if (msg->body && msg->body[0]) { snprintf(out, cap, "%s", msg->body); return; }
+    if (!msg->n_attach) return;
+    const oc_attachment *a = &msg->attach[0];
+    if (a->media_kind == OC_MEDIA_VIDEO_MESSAGE) {
+        char d[16];
+        oc_model_format_duration(a->duration_ms, d, sizeof d);
+        snprintf(out, cap, "\xF0\x9F\x8E\xA5 Video message (%s)", d);
+    } else {
+        snprintf(out, cap, "\xF0\x9F\x93\x8E %s", a->filename);
+    }
+}
+
+oc_pdm_view *oc_model_pdm(oc_model *m, uint64_t id) {
+    for (size_t i = 0; id && i < m->n_pdms; i++) if (m->pdms[i].id == id) return &m->pdms[i];
+    return NULL;
+}
+
+void oc_model_pdm_forget(oc_model *m, uint64_t id) {
+    oc_channel *c = oc_model_channel(m, id);
+    if (c && c->e2e) {   /* what was said goes, wiped; the row goes from the sidebar */
+        for (size_t i = 0; i < c->n_msgs; i++) { text_wipe(c->msgs[i].body); msg_free(&c->msgs[i]); }
+        free(c->msgs);
+        c->msgs = NULL;
+        c->n_msgs = c->cap_msgs = 0;
+        c->preview[0] = '\0';
+        c->unread = 0;
+        c->forgotten = 1;
+        c->info_seq++;
+    }
+    for (size_t i = 0; id && i < m->n_pdms; i++)
+        if (m->pdms[i].id == id) {
+            memset(&m->pdms[i], 0, sizeof m->pdms[0]);
+            memmove(&m->pdms[i], &m->pdms[i + 1], (m->n_pdms - i - 1) * sizeof m->pdms[0]);
+            m->n_pdms--;
+            memset(&m->pdms[m->n_pdms], 0, sizeof m->pdms[0]);
+            m->pdm_seq++;
+            return;
+        }
+}
+
+void oc_model_free(oc_model *m) {
+    memset(m->pdms, 0, sizeof m->pdms);
+    m->n_pdms = 0;
+    free(m->sum_notices);
+    free(m->chanmem_via);
+    for (size_t i = 0; i < m->n_groups; i++) free(m->groups[i]);
+    free(m->groups);
+    free(m->group_gen);
+    free(m->listen_ready);
+    free(m->preview_ready);
+    for (uint8_t i = 0; i < m->n_stt_words; i++) free(m->stt_words[i].text);
+    m->n_stt_words = 0;
+    for (uint8_t i = 0; i < m->n_fetched; i++) free(m->fetched[i].data);
+    for (size_t i = 0; i < m->n_channels; i++) channel_free(&m->channels[i]);
+    free(m->channels);
+    free(m->presence);
+    free(m->typing);
+    for (size_t i = 0; i < m->n_thread_msgs; i++) msg_free(&m->thread_msgs[i]);
+    free(m->thread_msgs);
+    for (size_t i = 0; i < m->n_search; i++) free(m->search_results[i].snippet);
+    free(m->search_results);
+    free(m->reactors);
+    oc_model_close_summary(m);
+    for (size_t i = 0; i < m->n_pins; i++) free(m->pins[i].body);
+    free(m->pins);
+    free(m->chanmem);
+    for (size_t i = 0; i < m->n_saved; i++) free(m->saved[i].body);
+    free(m->saved);
+    for (size_t i = 0; i < m->n_drafts; i++) { free(m->drafts[i].body); free(m->drafts[i].recipients); }
+    free(m->drafts);
+    for (size_t i = 0; i < m->n_scheds; i++) free(m->scheds[i].body);
+    free(m->scheds);
+    for (size_t i = 0; i < m->n_activity; i++) free(m->activity[i].text);
+    free(m->activity);
+    for (size_t i = 0; i < m->n_threads; i++) free(m->threads[i].preview);
+    free(m->threads);
+    free(m->files);
+    free(m->users);
+    free(m->webhooks);
+    free(m->settings);
+    free(m->audit);
+    free(m->srvalerts);
+    memset(m, 0, sizeof *m);
+}
+
+/* Upsert a synced setting keyed on `key` (grow the bucket as needed). */
+static void setting_upsert(oc_model *m, const char *key, const char *value) {
+    if (!key || !key[0]) return;
+    for (size_t i = 0; i < m->n_settings; i++)
+        if (strcmp(m->settings[i].key, key) == 0) {
+            snprintf(m->settings[i].value, sizeof m->settings[i].value, "%s", value ? value : "");
+            return;
+        }
+    if (m->n_settings == m->cap_settings) {
+        size_t cap = m->cap_settings ? m->cap_settings * 2 : 8;
+        oc_setting *ns = realloc(m->settings, cap * sizeof *ns);
+        if (!ns) return;
+        m->settings = ns; m->cap_settings = cap;
+    }
+    oc_setting *s = &m->settings[m->n_settings++];
+    snprintf(s->key, sizeof s->key, "%s", key);
+    snprintf(s->value, sizeof s->value, "%s", value ? value : "");
+}
+
+/* --- drafts (REQ-223, ARCH-101) ------------------------------------------ */
+
+static oc_draft_view *draft_find(oc_model *m, uint64_t cid, uint64_t root) {
+    for (size_t i = 0; i < m->n_drafts; i++)
+        if (m->drafts[i].channel_id == cid && m->drafts[i].thread_root == root)
+            return &m->drafts[i];
+    return NULL;
+}
+
+/* Upsert, or remove when the body is empty — the daemon reports a deletion as a
+ * draft with no text, so both directions arrive through the one frame. */
+static void draft_apply(oc_model *m, uint64_t cid, uint64_t root,
+                        uint64_t updated_ms, const char *body, const char *recipients) {
+    oc_draft_view *d = draft_find(m, cid, root);
+    if (!body || !body[0]) {
+        if (!d) return;
+        free(d->body);
+        free(d->recipients);
+        *d = m->drafts[--m->n_drafts];            /* dense; order is not meaningful */
+        return;
+    }
+    if (!d) {
+        if (m->n_drafts == m->cap_drafts) {
+            size_t nc = m->cap_drafts ? m->cap_drafts * 2 : 8;
+            oc_draft_view *g = realloc(m->drafts, nc * sizeof *g);
+            if (!g) return;
+            m->drafts = g; m->cap_drafts = nc;
+        }
+        d = &m->drafts[m->n_drafts++];
+        d->channel_id = cid; d->thread_root = root; d->body = NULL; d->recipients = NULL;
+    }
+    free(d->body);
+    d->body = strdup(body);
+    /* Recipients travel with the body, and NULL means "not stated" rather than
+     * "nobody": a device-sync push that omits them must not wipe the ones this
+     * client just chose. */
+    if (recipients) { free(d->recipients); d->recipients = strdup(recipients); }
+    d->updated_ms = updated_ms;
+    d->gen = m->draft_gen;
+}
+
+const char *oc_model_draft(const oc_model *m, uint64_t channel_id, uint64_t thread_root) {
+    oc_draft_view *d = draft_find((oc_model *)m, channel_id, thread_root);
+    return d ? d->body : NULL;
+}
+
+int oc_model_has_draft(const oc_model *m, uint64_t channel_id) {
+    for (size_t i = 0; i < m->n_drafts; i++)
+        if (m->drafts[i].channel_id == channel_id) return 1;
+    return 0;
+}
+
+void oc_model_drafts_begin(oc_model *m) { if (m) m->draft_gen++; }
+
+/* --- scheduled messages (REQ-224, ARCH-102) ------------------------------ */
+
+static void sched_apply(oc_model *m, uint64_t id, uint64_t cid, uint64_t at,
+                        uint8_t state, const char *body, const char *fail) {
+    oc_sched_view *d = NULL;
+    for (size_t i = 0; i < m->n_scheds; i++) if (m->scheds[i].id == id) { d = &m->scheds[i]; break; }
+    /* GONE is a cancellation, and SENT means it is a message now — either way it
+     * stops being something waiting to happen. */
+    if (state == OC_SCHED_GONE || state == OC_SCHED_SENT) {
+        if (!d) return;
+        free(d->body);
+        *d = m->scheds[--m->n_scheds];
+        return;
+    }
+    if (!d) {
+        if (m->n_scheds == m->cap_scheds) {
+            size_t nc = m->cap_scheds ? m->cap_scheds * 2 : 8;
+            oc_sched_view *g = realloc(m->scheds, nc * sizeof *g);
+            if (!g) return;
+            m->scheds = g; m->cap_scheds = nc;
+        }
+        d = &m->scheds[m->n_scheds++];
+        d->body = NULL;
+    }
+    free(d->body);
+    d->id = id; d->channel_id = cid; d->send_at_ms = at; d->state = state;
+    d->body = strdup(body ? body : "");
+    snprintf(d->fail, sizeof d->fail, "%s", fail ? fail : "");
+    d->gen = m->sched_gen;
+}
+
+size_t oc_model_scheduled_pending(const oc_model *m) {
+    size_t n = 0;
+    for (size_t i = 0; m && i < m->n_scheds; i++)
+        if (m->scheds[i].state == OC_SCHED_PENDING) n++;
+    return n;
+}
+size_t oc_model_scheduled_failed(const oc_model *m) {
+    size_t n = 0;
+    for (size_t i = 0; m && i < m->n_scheds; i++)
+        if (m->scheds[i].state == OC_SCHED_FAILED) n++;
+    return n;
+}
+
+void oc_model_draft_local(oc_model *m, uint64_t channel_id, uint64_t thread_root,
+                          const char *body) {
+    /* Channel 0 is the New message pane's unaddressed draft (REQ-229) and is a
+     * real key here: refusing it meant the pane's own "Saved" could only ever
+     * come from another device, because the daemon does not echo a draft to the
+     * connection that wrote it. */
+    if (m) draft_apply(m, channel_id, thread_root, 0, body, NULL);
+}
+
+void oc_model_draft_local_to(oc_model *m, const char *recipients, const char *body) {
+    if (m) draft_apply(m, 0, 0, 0, body, recipients ? recipients : "");
+}
+
+const char *oc_model_draft_recipients(const oc_model *m) {
+    const oc_draft_view *d = m ? draft_find((oc_model *)m, 0, 0) : NULL;
+    return d ? d->recipients : NULL;
+}
+
+const char *oc_model_setting(const oc_model *m, const char *key) {
+    if (!key) return NULL;
+    for (size_t i = 0; i < m->n_settings; i++)
+        if (strcmp(m->settings[i].key, key) == 0) return m->settings[i].value;
+    return NULL;
+}
+
+/* Advance a member's read cursor in a channel (grow the list as needed). */
+static void reader_advance(oc_channel *c, uint64_t user_id, uint64_t message_id) {
+    for (size_t i = 0; i < c->n_readers; i++)
+        if (c->readers[i].user_id == user_id) {
+            if (message_id > c->readers[i].message_id) c->readers[i].message_id = message_id;
+            return;
+        }
+    if (c->n_readers == c->cap_readers) {
+        size_t cap = c->cap_readers ? c->cap_readers * 2 : 8;
+        oc_read_cursor_view *nr = realloc(c->readers, cap * sizeof *nr);
+        if (!nr) return;
+        c->readers = nr; c->cap_readers = cap;
+    }
+    c->readers[c->n_readers].user_id = user_id;
+    c->readers[c->n_readers].message_id = message_id;
+    c->n_readers++;
+}
+
+size_t oc_model_seen_by(const oc_model *m, uint64_t channel_id, uint64_t message_id,
+                        uint64_t exclude, uint64_t *out, size_t cap) {
+    oc_channel *c = oc_model_channel((oc_model *)m, channel_id);
+    if (!c || message_id == 0) return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < c->n_readers && n < cap; i++)
+        if (c->readers[i].user_id != exclude && c->readers[i].message_id >= message_id)
+            out[n++] = c->readers[i].user_id;
+    return n;
+}
+
+/* Upsert a roster entry keyed on user_id. */
+static void user_upsert(oc_model *m, uint64_t user_id, const char *name, uint8_t role,
+                        uint8_t disabled, uint64_t avatar_id) {
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == user_id) {
+            snprintf(m->users[i].name, sizeof m->users[i].name, "%s", name ? name : "");
+            m->users[i].role = role; m->users[i].disabled = disabled;
+            m->users[i].avatar_id = avatar_id;                    /* */
+            return;
+        }
+    if (m->n_users == m->cap_users) {
+        size_t cap = m->cap_users ? m->cap_users * 2 : 16;
+        oc_member *nu = realloc(m->users, cap * sizeof *nu);
+        if (!nu) return;
+        m->users = nu; m->cap_users = cap;
+    }
+    oc_member *u = &m->users[m->n_users++];
+    memset(u, 0, sizeof *u);
+    u->user_id = user_id; u->role = role; u->disabled = disabled;
+    u->avatar_id = avatar_id;
+    snprintf(u->name, sizeof u->name, "%s", name ? name : "");
+}
+
+/* Update a roster member's role/disabled without disturbing its name (a
+ * USER_UPDATED carries no name); upsert with an empty name if unseen. */
+static void user_update_role(oc_model *m, uint64_t user_id, uint8_t role, uint8_t disabled) {
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == user_id) {
+            m->users[i].role = role; m->users[i].disabled = disabled; return;
+        }
+    user_upsert(m, user_id, "", role, disabled, 0);
+}
+
+const char *oc_model_user_name(const oc_model *m, uint64_t user_id) {
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == user_id) return m->users[i].name;
+    return "";
+}
+
+uint8_t     oc_model_deployment_mode(const oc_model *m) { return m->deployment_mode; }
+uint32_t    oc_model_max_users(const oc_model *m)       { return m->max_users; }
+const char *oc_model_workspace_name(const oc_model *m)  { return m->workspace_name; }
+const char *oc_model_server_build(const oc_model *m)    { return m->server_build; }
+
+/* ---- read-aloud (ARCH-111) ---------------------------------------------- */
+
+int oc_model_has_capability(const oc_model *m, const char *name) {
+    if (!m || !name || !*name) return 0;
+    size_t n = strlen(name);
+    for (const char *p = m->capabilities; *p;) {
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        if (len == n && strncmp(p, name, n) == 0) return 1;   /* whole names only */
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return 0;
+}
+uint8_t     oc_model_tts_available(const oc_model *m)   { return (uint8_t)oc_model_has_capability(m, OC_CAP_TTS); }
+uint8_t     oc_model_stt_available(const oc_model *m)   { return (uint8_t)oc_model_has_capability(m, OC_CAP_STT); }
+uint8_t     oc_model_calls_available(const oc_model *m) { return (uint8_t)oc_model_has_capability(m, OC_CAP_CALLS); }
+uint8_t     oc_model_summarize_available(const oc_model *m) {
+    return (uint8_t)oc_model_has_capability(m, OC_CAP_SUMMARIZE);
+}
+
+int oc_model_stt_take_words(oc_model *m, uint64_t channel_id, uint64_t thread_root, char **text) {
+    for (uint8_t i = 0; i < m->n_stt_words; i++) {
+        if (m->stt_words[i].channel_id != channel_id || m->stt_words[i].thread_root != thread_root) continue;
+        *text = m->stt_words[i].text;
+        memmove(&m->stt_words[i], &m->stt_words[i + 1], (size_t)(m->n_stt_words - i - 1) * sizeof m->stt_words[0]);
+        m->n_stt_words--;
+        return 1;
+    }
+    return 0;
+}
+uint8_t     oc_model_tts_voice_count(const oc_model *m) { return m->n_voices; }
+const char *oc_model_tts_preview(const oc_model *m)     { return m->tts_preview; }
+
+const oc_voice *oc_model_tts_voice(const oc_model *m, uint8_t i) {
+    return i < m->n_voices ? &m->voices[i] : NULL;
+}
+
+const char *oc_model_tts_voice_label(const oc_model *m, const char *voice_id) {
+    for (uint8_t i = 0; voice_id && i < m->n_voices; i++)
+        if (strcmp(m->voices[i].id, voice_id) == 0) return m->voices[i].label;
+    return "";
+}
+
+uint64_t oc_model_listening_channel(const oc_model *m) { return m->listen_channel; }
+uint8_t  oc_model_listen_queued(const oc_model *m)     { return m->n_listen_queue; }
+uint64_t oc_model_listen_playing(const oc_model *m)    { return m->listen_playing; }
+uint32_t oc_model_listen_skipped(const oc_model *m)    { return m->listen_skipped; }
+
+int oc_model_preview_take_audio(oc_model *m, uint8_t **mp4, size_t *len) {
+    if (!m || !m->preview_ready) return 0;
+    *mp4 = m->preview_ready;
+    *len = m->preview_ready_len;
+    m->preview_ready = NULL;
+    m->preview_ready_len = 0;
+    return 1;
+}
+
+uint64_t oc_model_listen_take_audio(oc_model *m, uint8_t **mp4, size_t *len) {
+    if (!m->listen_ready) return 0;
+    *mp4 = m->listen_ready;
+    *len = m->listen_ready_len;
+    uint64_t id = m->listen_ready_id;
+    m->listen_ready = NULL;
+    m->listen_ready_len = 0;
+    m->listen_ready_id = 0;
+    m->listen_playing = id;
+    return id;
+}
+const char *oc_model_deployment_name(const oc_model *m) {
+    switch (m->deployment_mode) {
+        case 1:  return "federated";
+        case 2:  return "managed";
+        default: return "standalone";
+    }
+}
+
+uint64_t oc_model_user_id(const oc_model *m, const char *name) {
+    if (!name) return 0;
+    for (size_t i = 0; i < m->n_users; i++)
+        if (strcmp(m->users[i].name, name) == 0) return m->users[i].user_id;
+    return 0;
+}
+
+void oc_model_close_search(oc_model *m) {
+    for (size_t i = 0; i < m->n_search; i++) free(m->search_results[i].snippet);
+    free(m->search_results);
+    m->search_results = NULL;
+    m->n_search = m->cap_search = 0;
+    m->search_open = 0;
+    m->search_truncated = 0;
+    m->search_query[0] = '\0';
+}
+
+void oc_model_search_begin(oc_model *m, const char *query) {
+    oc_model_close_search(m);      /* drop any prior hits */
+    m->search_open = 1;
+    snprintf(m->search_query, sizeof m->search_query, "%s", query ? query : "");
+}
+
+void oc_model_close_reactlist(oc_model *m) {
+    free(m->reactors);
+    m->reactors = NULL;
+    m->n_reactors = m->cap_reactors = 0;
+    m->reactlist_open = 0;
+    m->reactlist_message = 0;
+}
+
+void oc_model_reactlist_begin(oc_model *m, uint64_t message_id) {
+    oc_model_close_reactlist(m);   /* drop any prior reactors */
+    m->reactlist_open = 1;
+    m->reactlist_message = message_id;
+}
+
+void oc_model_close_pinlist(oc_model *m) {
+    for (size_t i = 0; i < m->n_pins; i++) free(m->pins[i].body);
+    free(m->pins);
+    m->pins = NULL;
+    m->n_pins = m->cap_pins = 0;
+    m->pinlist_open = 0;
+    m->pinlist_loading = 0;
+    m->pinlist_channel = 0;
+}
+
+void oc_model_close_summary(oc_model *m) {
+    oc_summary_view_free(&m->summary);
+    free(m->summary_error);
+    m->summary_error = NULL;
+    m->summary_open = m->summary_loading = m->summary_scope = m->summary_status = 0;
+    m->summary_req = 0;
+    m->summary_position = -1;
+    m->summary_resend = 0;
+    m->summary_notice = 0;
+    m->summary_channel = m->summary_start = m->summary_end = 0;
+}
+
+int oc_model_summary_notice_take(oc_model *m, oc_summary_notice *out) {
+    for (size_t i = 0; m && i < m->n_sum_notices; i++)
+        if (!m->sum_notices[i].toasted) {
+            m->sum_notices[i].toasted = 1;
+            *out = m->sum_notices[i];
+            return 1;
+        }
+    return 0;
+}
+
+const oc_summary_notice *oc_model_summary_notice(const oc_model *m, uint64_t id) {
+    for (size_t i = 0; m && i < m->n_sum_notices; i++)
+        if (m->sum_notices[i].id == id) return &m->sum_notices[i];
+    return NULL;
+}
+
+void oc_model_summary_notice_drop(oc_model *m, uint64_t id) {
+    for (size_t i = 0; m && i < m->n_sum_notices; i++)
+        if (m->sum_notices[i].id == id) {
+            memmove(&m->sum_notices[i], &m->sum_notices[i + 1], (m->n_sum_notices - i - 1) * sizeof *m->sum_notices);
+            m->n_sum_notices--;
+            return;
+        }
+}
+
+void oc_model_summary_begin(oc_model *m, uint64_t channel_id, uint8_t scope, uint64_t start_ms,
+                            uint64_t end_ms, uint32_t req_id) {
+    oc_model_close_summary(m);
+    m->summary_open = 1;
+    m->summary_loading = 1;
+    m->summary_channel = channel_id;
+    m->summary_scope = scope;
+    m->summary_start = start_ms;
+    m->summary_end = end_ms;
+    m->summary_req = req_id;
+    m->summary_position = -1;
+}
+
+void oc_model_pinlist_begin(oc_model *m, uint64_t channel_id) {
+    oc_model_close_pinlist(m);     /* drop any prior list */
+    m->pinlist_open = 1;
+    m->pinlist_loading = 1;
+    m->pinlist_channel = channel_id;
+}
+
+void oc_model_chanmem_begin(oc_model *m, uint64_t channel_id) {
+    m->n_chanmem = 0;                 /* keep the allocation, drop the rows */
+    m->n_chanmem_via = 0;
+    m->chanmem_channel = channel_id;
+    m->chanmem_loading = 1;
+}
+
+void oc_model_close_filelist(oc_model *m) {
+    free(m->files);
+    m->files = NULL;
+    m->n_files = m->cap_files = 0;
+    m->files_more = 0;
+    m->filelist_open = m->filelist_loading = 0;
+    m->filelist_channel = 0;
+}
+
+void oc_model_filelist_begin(oc_model *m, uint64_t channel_id) {
+    oc_model_close_filelist(m);
+    m->filelist_open = 1;
+    m->filelist_loading = 1;
+    m->filelist_channel = channel_id;
+}
+
+void oc_model_close_saved(oc_model *m) {
+    for (size_t i = 0; i < m->n_saved; i++) free(m->saved[i].body);
+    free(m->saved);
+    m->saved = NULL; m->n_saved = m->cap_saved = 0;
+    m->saved_open = m->saved_loading = 0;
+}
+void oc_model_saved_begin(oc_model *m) {
+    oc_model_close_saved(m);
+    m->saved_open = 1; m->saved_loading = 1;
+}
+/* One thread from the server: a list entry and the follow/read push are the same
+ * frame, so this both inserts and replaces (the shape draft_apply uses). */
+static void thread_apply(oc_model *m, const oc_ev *e) {
+    oc_thread_view *t = NULL;
+    for (size_t i = 0; i < m->n_threads; i++)
+        if (m->threads[i].root_id == e->message_id) { t = &m->threads[i]; break; }
+    if (!t) {
+        if (m->n_threads == m->cap_threads) {
+            size_t nc = m->cap_threads ? m->cap_threads * 2 : 16;
+            oc_thread_view *g = realloc(m->threads, nc * sizeof *g);
+            if (!g) return;
+            m->threads = g; m->cap_threads = nc;
+        }
+        t = &m->threads[m->n_threads++];
+        memset(t, 0, sizeof *t);
+    }
+    free(t->preview);
+    t->root_id       = e->message_id;
+    t->channel_id    = e->channel_id;
+    t->root_author   = e->author_id;
+    t->root_at       = e->server_time;
+    t->last_reply_at = e->pinned_at;
+    t->reply_count   = e->reply_count;
+    t->unread        = e->unread_count;
+    t->following     = e->following;
+    t->preview       = e->body ? strdup(e->body) : NULL;
+    t->action        = e->action;   /* REQ-058 */
+    t->gen           = m->thread_gen;
+    /* An unfollowed thread leaves the list the moment it is unfollowed: the view
+     * is "threads I am in", and staying visible would make the button look
+     * broken. The server agrees — the next list will not carry it. */
+    if (!t->following) {
+        free(t->preview);
+        *t = m->threads[--m->n_threads];
+    }
+}
+
+void oc_model_threads_begin(oc_model *m) {
+    if (!m) return;
+    m->thread_gen++;
+    m->threads_loading = 1;
+}
+
+uint32_t oc_model_thread_unread(const oc_model *m) {
+    uint32_t n = 0;
+    if (!m) return 0;
+    for (size_t i = 0; i < m->n_threads; i++) n += m->threads[i].unread;
+    return n;
+}
+
+void oc_model_close_activity(oc_model *m) {
+    for (size_t i = 0; i < m->n_activity; i++) free(m->activity[i].text);
+    free(m->activity);
+    m->activity = NULL; m->n_activity = m->cap_activity = 0;
+    m->activity_open = m->activity_loading = 0;
+}
+void oc_model_activity_begin(oc_model *m) {
+    oc_model_close_activity(m);
+    m->activity_open = 1; m->activity_loading = 1;
+}
+
+void oc_model_close_weblist(oc_model *m) {
+    free(m->webhooks);
+    m->webhooks = NULL;
+    m->n_webhooks = m->cap_webhooks = 0;
+    m->weblist_open = 0;
+    m->weblist_channel = 0;
+}
+
+void oc_model_close_invites(oc_model *m) {
+    free(m->invites);
+    m->invites = NULL;
+    m->n_invites = m->cap_invites = 0;
+    m->invites_open = m->invites_loading = 0;
+}
+
+void oc_model_close_sessions(oc_model *m) {
+    free(m->sessions);
+    m->sessions = NULL;
+    m->n_sessions = m->cap_sessions = 0;
+    m->sessions_open = m->sessions_loading = 0;
+}
+
+void oc_model_sessions_begin(oc_model *m) {
+    oc_model_close_sessions(m);
+    m->sessions_open = 1;
+    m->sessions_loading = 1;
+}
+
+int oc_model_offers_local(const oc_model *m) {
+    return !m->signin_kinds || (m->signin_kinds & (1u << OC_SOURCE_LOCAL)) != 0;
+}
+
+int oc_model_offers_browser(const oc_model *m) {
+    return !m->signin_kinds ||
+           (m->signin_kinds & ((1u << OC_SOURCE_RELAY) | (1u << OC_SOURCE_OIDC))) != 0;
+}
+
+const char *oc_signin_provider_name(const char *id, size_t len) {
+    static const struct { const char *id, *name; } KNOWN[] = {
+        { "google", "Google" }, { "microsoft", "Microsoft" },
+    };
+    if (!id) return NULL;
+    for (size_t k = 0; k < sizeof KNOWN / sizeof KNOWN[0]; k++) {
+        size_t kl = strlen(KNOWN[k].id);
+        if (len != kl) continue;
+        size_t i = 0;
+        while (i < kl && tolower((unsigned char)id[i]) == KNOWN[k].id[i]) i++;
+        if (i == kl) return KNOWN[k].name;
+    }
+    return NULL;
+}
+
+const char *oc_model_signin_provider(const oc_model *m) {
+    return m->signin_provider;
+}
+
+/* Name the provider only when every browser source names one: a source that
+ * does not (the relay, which offers several) leaves the choice unknown. */
+static void set_signin_provider(oc_model *m, const char *ids) {
+    char out[sizeof m->signin_provider] = "";
+    size_t n = 0;
+    for (const char *p = ids ? ids : ""; *p; ) {
+        const char *e = strchr(p, '\n');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len) {
+            const char *name = oc_signin_provider_name(p, len);
+            if (!name) { out[0] = '\0'; n = 0; break; }
+            if (!strstr(out, name)) {
+                int w = snprintf(out + n, sizeof out - n, "%s%s", n ? " or " : "", name);
+                if (w < 0 || (size_t)w >= sizeof out - n) { out[0] = '\0'; n = 0; break; }
+                n += (size_t)w;
+            }
+        }
+        p += len;
+        if (*p == '\n') p++;
+    }
+    snprintf(m->signin_provider, sizeof m->signin_provider, "%s", out);
+}
+
+void oc_model_invite_asked(oc_model *m, const char *email) {
+    snprintf(m->invite_asked_email, sizeof m->invite_asked_email, "%s", email ? email : "");
+    /* The last invitation is spent the moment another is asked for: a frontend
+     * waiting for the answer must not take the old one for it. */
+    m->invite_token[0] = '\0';
+    m->invite_email[0] = '\0';
+}
+
+/* How many may use a token, as a sentence: the "It works once." of a single
+ * invitation, or the count a shared link is good for. */
+static const char *invite_uses_text(uint16_t uses, char *buf, size_t cap) {
+    if (uses == 1) return "It works once.";
+    if (uses == 0) return "Anyone with it can join until it expires.";
+    snprintf(buf, cap, "It works for up to %u people.", (unsigned)uses);
+    return buf;
+}
+
+size_t oc_model_invitation_text(const oc_model *m, const char *address, const char *link,
+                                char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    if (!m->invite_token[0]) return 0;
+    const char *name = m->workspace_name[0] ? m->workspace_name : NULL;
+    const char *addr = address && address[0] ? address : NULL;
+    char expires[40] = "";
+    if (m->invite_expires) {
+        time_t t = (time_t)(m->invite_expires / 1000u);
+        struct tm tv;
+#ifdef _WIN32
+        int ok = gmtime_s(&tv, &t) == 0;
+#else
+        int ok = gmtime_r(&t, &tv) != NULL;
+#endif
+        if (ok) strftime(expires, sizeof expires, "%Y-%m-%d %H:%M UTC", &tv);
+    }
+    const char *role = m->invite_role == OC_ROLE_OWNER ? "owner"
+                     : m->invite_role == OC_ROLE_ADMIN ? "admin" : "member";
+    int n;
+    if (m->invite_email[0]) {
+        n = snprintf(out, cap,
+            "You are invited to join %s%s%s on OpenChime, as %s %s.\n"
+            "\n"
+            "Workspace: %s\n"
+            "Sign in: open the workspace in the OpenChime app, continue in your browser, and "
+            "sign in as %s. That address must be able to sign in with %s.\n"
+            "%s%s%s",
+            name ? "the " : "", name ? name : "this workspace", name ? " workspace" : "",
+            m->invite_role == OC_ROLE_MEMBER ? "a" : "an", role,
+            addr ? addr : "(the address you were given)",
+            m->invite_email,
+            m->signin_provider[0] ? m->signin_provider : "this workspace's sign-in provider",
+            expires[0] ? "Expires: " : "", expires, expires[0] ? "\n" : "");
+    } else if (link && link[0]) {
+        /* The link first: it needs nothing installed. The token after, for a
+         * person who has the app and would rather sign in there. */
+        char uses[64];
+        n = snprintf(out, cap,
+            "You are invited to join %s%s%s on OpenChime, as %s %s.\n"
+            "\n"
+            "Workspace: %s\n"
+            "Join: open this link in your browser and choose a username and password.\n"
+            "%s\n"
+            "In the OpenChime app instead: open the workspace, choose to create an account "
+            "with an invite, and enter this invite token.\n"
+            "Invite token: %s\n"
+            "%s\n"
+            "%s%s%s",
+            name ? "the " : "", name ? name : "this workspace", name ? " workspace" : "",
+            m->invite_role == OC_ROLE_MEMBER ? "a" : "an", role,
+            addr ? addr : "(the address you were given)",
+            link,
+            m->invite_token,
+            invite_uses_text(m->invite_uses, uses, sizeof uses),
+            expires[0] ? "Expires: " : "", expires, expires[0] ? "\n" : "");
+    } else {
+        char uses[64];
+        n = snprintf(out, cap,
+            "You are invited to join %s%s%s on OpenChime, as %s %s.\n"
+            "\n"
+            "Workspace: %s\n"
+            "Sign in: open the workspace in the OpenChime app, choose to create an account "
+            "with an invite, and enter this invite token with the username and password you "
+            "want. %s\n"
+            "Invite token: %s\n"
+            "%s%s%s",
+            name ? "the " : "", name ? name : "this workspace", name ? " workspace" : "",
+            m->invite_role == OC_ROLE_MEMBER ? "a" : "an", role,
+            addr ? addr : "(the address you were given)",
+            invite_uses_text(m->invite_uses, uses, sizeof uses),
+            m->invite_token,
+            expires[0] ? "Expires: " : "", expires, expires[0] ? "\n" : "");
+    }
+    if (n < 0) { out[0] = '\0'; return 0; }
+    return (size_t)n < cap ? (size_t)n : cap - 1;
+}
+
+size_t oc_model_reset_text(const oc_model *m, const char *address, const char *link, char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    if (!m->reset_token[0]) return 0;
+    const char *name = m->workspace_name[0] ? m->workspace_name : NULL;
+    int n = snprintf(out, cap,
+        "Your OpenChime password for %s%s%s was reset.\n"
+        "\n"
+        "Workspace: %s\n"
+        "Set a new one: in the OpenChime app, open the workspace, choose \"Have a reset code?\" "
+        "and enter this code.\n"
+        "Reset code: %s\n"
+        "%s%s%s"
+        "It works once, for a day. Setting a new password signs you out everywhere.\n",
+        name ? "the " : "", name ? name : "this workspace", name ? " workspace" : "",
+        address && address[0] ? address : "(the address you were given)",
+        m->reset_token,
+        link && link[0] ? "Or open this link in a browser: " : "", link && link[0] ? link : "",
+        link && link[0] ? "\n" : "");
+    if (n < 0) { out[0] = '\0'; return 0; }
+    return (size_t)n < cap ? (size_t)n : cap - 1;
+}
+
+void oc_model_invites_begin(oc_model *m) {
+    oc_model_close_invites(m);
+    m->invites_open = 1;
+    m->invites_loading = 1;
+}
+
+void oc_model_weblist_begin(oc_model *m, uint64_t channel_id) {
+    oc_model_close_weblist(m);     /* drop any prior list */
+    m->weblist_open = 1;
+    m->weblist_channel = channel_id;
+    m->webhook_token[0] = '\0';    /* clear any prior shown-once token */
+    m->webhook_new_id = 0;
+}
+
+void oc_model_set_prefs_open(oc_model *m, int open) {
+    m->prefs_open = open ? 1 : 0;
+}
+
+void oc_model_close_thread(oc_model *m) {
+    for (size_t i = 0; i < m->n_thread_msgs; i++) msg_free(&m->thread_msgs[i]);
+    free(m->thread_msgs);
+    m->thread_msgs = NULL;
+    m->n_thread_msgs = m->cap_thread_msgs = 0;
+    m->thread_open = 0;
+    m->thread_parent = m->thread_channel = 0;
+    /* Cleared here as well as by the terminator, because a thread can be closed
+     * before its replay arrives — or instead of it, if the request failed. A
+     * flag that only ever cleared on success would silence every later toast. */
+    m->thread_replay = 0;
+}
+
+void oc_model_open_thread(oc_model *m, uint64_t channel_id, uint64_t parent_id) {
+    oc_model_close_thread(m);      /* drop any prior thread's replies */
+    m->thread_open = 1;
+    m->thread_channel = channel_id;
+    m->thread_parent = parent_id;
+    /* A LIST_THREAD goes out with this, and its replies come back as ordinary
+     * THREAD_REPLY frames. They are history, and history does not toast. */
+    m->thread_replay = 1;
+}
+
+/* Append a thread reply, stealing ownership of `*body` (NULL on success). */
+static void thread_append(oc_model *m, uint64_t message_id, uint64_t author_id,
+                          uint64_t server_time, char **body) {
+    for (size_t i = 0; i < m->n_thread_msgs; i++)
+        if (m->thread_msgs[i].message_id == message_id) return;   /* dedup */
+    if (m->n_thread_msgs == m->cap_thread_msgs) {
+        size_t cap = m->cap_thread_msgs ? m->cap_thread_msgs * 2 : 16;
+        oc_msg *nm = realloc(m->thread_msgs, cap * sizeof *nm);
+        if (!nm) return;
+        m->thread_msgs = nm; m->cap_thread_msgs = cap;
+    }
+    oc_msg *msg = &m->thread_msgs[m->n_thread_msgs++];
+    memset(msg, 0, sizeof *msg);
+    msg->body = *body;
+    msg->author_id = author_id;
+    msg->message_id = message_id;
+    msg->server_time = server_time;
+    *body = NULL;
+}
+
+/* Append a search hit, stealing ownership of `*snippet` (NULL on success). */
+static void search_append(oc_model *m, uint64_t message_id, uint64_t channel_id,
+                          uint64_t author_id, uint64_t server_time, uint8_t action, char **snippet) {
+    for (size_t i = 0; i < m->n_search; i++)
+        if (m->search_results[i].message_id == message_id) return;   /* dedup */
+    if (m->n_search == m->cap_search) {
+        size_t cap = m->cap_search ? m->cap_search * 2 : 16;
+        oc_search_result *ns = realloc(m->search_results, cap * sizeof *ns);
+        if (!ns) return;
+        m->search_results = ns; m->cap_search = cap;
+    }
+    oc_search_result *sr = &m->search_results[m->n_search++];
+    sr->message_id = message_id; sr->channel_id = channel_id;
+    sr->author_id = author_id; sr->server_time = server_time;
+    sr->action = action;
+    sr->snippet = *snippet; *snippet = NULL;
+}
+
+/* Append one reactor (user_id + emoji) to the open who-reacted list. */
+static void reactor_append(oc_model *m, uint64_t user_id, const char *emoji) {
+    if (m->n_reactors == m->cap_reactors) {
+        size_t cap = m->cap_reactors ? m->cap_reactors * 2 : 16;
+        oc_reactor_row *nr = realloc(m->reactors, cap * sizeof *nr);
+        if (!nr) return;
+        m->reactors = nr; m->cap_reactors = cap;
+    }
+    oc_reactor_row *r = &m->reactors[m->n_reactors++];
+    r->user_id = user_id;
+    snprintf(r->emoji, sizeof r->emoji, "%s", emoji ? emoji : "");
+}
+
+/* Upsert one webhook (id + label + disabled) into the open webhook list. */
+static void webhook_upsert(oc_model *m, uint64_t webhook_id, const char *label, uint8_t disabled) {
+    for (size_t i = 0; i < m->n_webhooks; i++)
+        if (m->webhooks[i].webhook_id == webhook_id) {
+            snprintf(m->webhooks[i].label, sizeof m->webhooks[i].label, "%s", label ? label : "");
+            m->webhooks[i].disabled = disabled; return;
+        }
+    if (m->n_webhooks == m->cap_webhooks) {
+        size_t cap = m->cap_webhooks ? m->cap_webhooks * 2 : 16;
+        oc_webhook_view *nw = realloc(m->webhooks, cap * sizeof *nw);
+        if (!nw) return;
+        m->webhooks = nw; m->cap_webhooks = cap;
+    }
+    oc_webhook_view *w = &m->webhooks[m->n_webhooks++];
+    w->webhook_id = webhook_id;
+    w->disabled = disabled;
+    snprintf(w->label, sizeof w->label, "%s", label ? label : "");
+}
+
+/* Drop a webhook from the open list by id (a WEBHOOK_DELETED ack). */
+static void webhook_remove(oc_model *m, uint64_t webhook_id) {
+    for (size_t i = 0; i < m->n_webhooks; i++)
+        if (m->webhooks[i].webhook_id == webhook_id) {
+            m->webhooks[i] = m->webhooks[--m->n_webhooks];
+            return;
+        }
+}
+
+/* Raise a message's thread reply count, finding it in any channel (message ids
+ * are globally unique, and THREAD_META carries no channel_id). */
+static void bump_reply_count(oc_model *m, uint64_t message_id, uint32_t count) {
+    for (size_t ci = 0; ci < m->n_channels; ci++)
+        for (size_t i = 0; i < m->channels[ci].n_msgs; i++)
+            if (m->channels[ci].msgs[i].message_id == message_id) {
+                if (count > m->channels[ci].msgs[i].reply_count)
+                    m->channels[ci].msgs[i].reply_count = count;
+                return;
+            }
+}
+
+/* Append an attachment to a message, deduped by id. Frees nothing; the caller
+ * owns the source strings (copied in). */
+static void msg_add_attach(oc_msg *msg, const oc_ev *e) {
+    uint64_t id = e->parent_id;
+    for (uint8_t i = 0; i < msg->n_attach; i++)
+        if (msg->attach[i].id == id) return;   /* dedup (backfill re-delivery) */
+    if (msg->n_attach >= OC_MAX_ATTACH) return;
+    if (msg->n_attach == msg->cap_attach) {
+        uint8_t cap = msg->cap_attach ? (uint8_t)(msg->cap_attach * 2) : 2;
+        oc_attachment *na = realloc(msg->attach, (size_t)cap * sizeof *na);
+        if (!na) return;
+        msg->attach = na; msg->cap_attach = cap;
+    }
+    oc_attachment *a = &msg->attach[msg->n_attach++];
+    a->id = id; a->size = e->server_time; a->reclaimed = e->status;
+    snprintf(a->filename, sizeof a->filename, "%s", e->body ? e->body : "");
+    snprintf(a->mime, sizeof a->mime, "%s", e->author_name);
+    a->media_kind = e->media_kind;
+    a->duration_ms = e->duration_ms;
+    a->width = e->media_w; a->height = e->media_h;
+    a->poster_id = e->poster_id;
+}
+
+/* Attach an attachment to the message with `message_id`, searching every channel
+ * buffer and the open thread's replies (message ids are globally unique). */
+/* Keep a transfer's latest notice under its tag. Slots are in order of first
+ * notice, so a full table gives up its oldest finished transfer, and only when
+ * every one is still running, its oldest. */
+static void note_xfer(oc_model *m, const oc_ev *e) {
+    if (!e->xfer_tag) return;
+    size_t n = sizeof m->xfers / sizeof m->xfers[0], i;
+    for (i = 0; i < n && m->xfers[i].tag && m->xfers[i].tag != e->xfer_tag; i++) {}
+    if (i == n) {
+        size_t gone = 0;
+        while (gone < n && m->xfers[gone].phase == 0) gone++;
+        if (gone == n) gone = 0;
+        memmove(&m->xfers[gone], &m->xfers[gone + 1], (n - gone - 1) * sizeof m->xfers[0]);
+        i = n - 1;
+    }
+    oc_xfer_state *x = &m->xfers[i];
+    x->tag = e->xfer_tag;
+    x->done = e->xfer_done;
+    x->total = e->xfer_total;
+    x->phase = e->op;
+    x->file = e->xfer_file;
+}
+
+const oc_xfer_state *oc_model_xfer(const oc_model *m, uint64_t tag) {
+    if (!m || !tag) return NULL;
+    for (size_t i = 0; i < sizeof m->xfers / sizeof m->xfers[0] && m->xfers[i].tag; i++)
+        if (m->xfers[i].tag == tag) return &m->xfers[i];
+    return NULL;
+}
+
+static void attach_to_msg(oc_model *m, const oc_ev *e) {
+    uint64_t message_id = e->message_id;
+    for (size_t ci = 0; ci < m->n_channels; ci++)
+        for (size_t i = 0; i < m->channels[ci].n_msgs; i++)
+            if (m->channels[ci].msgs[i].message_id == message_id) {
+                msg_add_attach(&m->channels[ci].msgs[i], e);
+                /* A message that is only a file previews as the file: without
+                 * this a video message sent with no caption left the sidebar
+                 * row blank (REQ-165). */
+                oc_channel *c = &m->channels[ci];
+                const oc_msg *msg = &c->msgs[i];
+                if ((!msg->body || !msg->body[0]) && msg->n_attach == 1 &&
+                    msg->message_id >= c->high_water && c->preview_author == msg->author_id)
+                    oc_model_msg_preview(m, msg, c->preview, sizeof c->preview);
+                return;
+            }
+    for (size_t i = 0; i < m->n_thread_msgs; i++)
+        if (m->thread_msgs[i].message_id == message_id) {
+            msg_add_attach(&m->thread_msgs[i], e);
+            return;
+        }
+}
+
+/* Record that `user_id` is typing in `channel_id` now, pruning stale marks. */
+static void typing_touch(oc_model *m, uint64_t channel_id, uint64_t user_id) {
+    long long now = (long long)time(NULL);
+    size_t w = 0, found = (size_t)-1;
+    for (size_t i = 0; i < m->n_typing; i++) {
+        if (now - m->typing[i].seen > OC_TYPING_TIMEOUT) continue;   /* drop expired */
+        if (m->typing[i].channel_id == channel_id && m->typing[i].user_id == user_id) found = w;
+        m->typing[w++] = m->typing[i];
+    }
+    m->n_typing = w;
+    if (found != (size_t)-1) { m->typing[found].seen = now; return; }
+    if (m->n_typing == m->cap_typing) {
+        size_t cap = m->cap_typing ? m->cap_typing * 2 : 8;
+        oc_typing_row *nt = realloc(m->typing, cap * sizeof *nt);
+        if (!nt) return;
+        m->typing = nt; m->cap_typing = cap;
+    }
+    m->typing[m->n_typing].channel_id = channel_id;
+    m->typing[m->n_typing].user_id = user_id;
+    m->typing[m->n_typing].seen = now;
+    m->n_typing++;
+}
+
+size_t oc_model_typing(const oc_model *m, uint64_t channel_id, uint64_t exclude,
+                       uint64_t *out, size_t cap) {
+    long long now = (long long)time(NULL);
+    size_t n = 0;
+    for (size_t i = 0; i < m->n_typing && n < cap; i++) {
+        if (m->typing[i].channel_id != channel_id) continue;
+        if (m->typing[i].user_id == exclude) continue;
+        if (now - m->typing[i].seen > OC_TYPING_TIMEOUT) continue;
+        out[n++] = m->typing[i].user_id;
+    }
+    return n;
+}
+
+/* --- user groups (REQ-307-309) --------------------------------------------- */
+
+const oc_group_view *oc_model_group(const oc_model *m, uint64_t group_id) {
+    for (size_t i = 0; m && i < m->n_groups; i++) if (m->groups[i]->id == group_id) return m->groups[i];
+    return NULL;
+}
+
+/* ASCII without case: a handle is ASCII (REQ-307). */
+static int handle_eq(const char *a, const char *b) {
+    for (; *a && *b; a++, b++)
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+    return *a == *b;
+}
+
+const oc_group_view *oc_model_group_by_handle(const oc_model *m, const char *handle) {
+    for (size_t i = 0; m && handle && i < m->n_groups; i++)
+        if (handle_eq(m->groups[i]->handle, handle)) return m->groups[i];
+    return NULL;
+}
+
+int oc_model_in_group(const oc_group_view *g, uint64_t user_id) {
+    for (uint16_t i = 0; g && i < g->n_members; i++) if (g->members[i] == user_id) return 1;
+    return 0;
+}
+
+int oc_model_only_via_group(const oc_model *m, uint64_t channel_id, uint64_t user_id) {
+    if (!m || channel_id != m->chanmem_channel) return 0;
+    for (size_t i = 0; i < m->n_chanmem_via; i++) if (m->chanmem_via[i] == user_id) return 1;
+    return 0;
+}
+
+uint64_t oc_model_via_group(const oc_model *m, uint64_t channel_id, uint64_t user_id) {
+    if (!oc_model_only_via_group(m, channel_id, user_id)) return 0;
+    const oc_channel *c = oc_model_channel((oc_model *)m, channel_id);
+    for (uint16_t i = 0; c && i < c->n_groups; i++)
+        if (oc_model_in_group(oc_model_group(m, c->groups[i]), user_id)) return c->groups[i];
+    return 0;
+}
+
+int oc_model_mentions_me(const oc_model *m, const char *body, size_t len) {
+    if (!m || !body) return 0;
+    if (oc_mention_targets(body, len, oc_model_user_name(m, m->user_id))) return 1;
+    for (size_t i = 0; i < m->n_groups; i++)
+        if (oc_model_in_group(m->groups[i], m->user_id) && oc_mention_targets(body, len, m->groups[i]->handle))
+            return 1;
+    return 0;
+}
+
+/* Take a GROUP event's group into the model, replacing the one with its id. */
+static void group_upsert(oc_model *m, oc_ev *e) {
+    oc_group_view *g = e->group;
+    if (!g) return;
+    for (size_t i = 0; i < m->n_groups; i++)
+        if (m->groups[i]->id == g->id) {
+            free(m->groups[i]);
+            m->groups[i] = g; m->group_gen[i] = m->groups_gen;
+            e->group = NULL;
+            return;
+        }
+    if (m->n_groups == m->cap_groups) {
+        size_t cap = m->cap_groups ? m->cap_groups * 2 : 16;
+        oc_group_view **ng = realloc(m->groups, cap * sizeof *ng);
+        if (!ng) return;
+        m->groups = ng;
+        uint64_t *gg = realloc(m->group_gen, cap * sizeof *gg);
+        if (!gg) return;
+        m->group_gen = gg;
+        m->cap_groups = cap;
+    }
+    m->groups[m->n_groups] = g;
+    m->group_gen[m->n_groups++] = m->groups_gen;
+    e->group = NULL;
+}
+
+/* A group is gone: out of the list, and out of every channel that had it. */
+static void group_drop(oc_model *m, uint64_t group_id) {
+    for (size_t i = 0; i < m->n_groups; i++)
+        if (m->groups[i]->id == group_id) {
+            free(m->groups[i]);
+            m->groups[i] = m->groups[m->n_groups - 1];
+            m->group_gen[i] = m->group_gen[m->n_groups - 1];
+            m->n_groups--;
+            break;
+        }
+    for (size_t c = 0; c < m->n_channels; c++) {
+        oc_channel *ch = &m->channels[c];
+        for (uint16_t k = 0; k < ch->n_groups; k++)
+            if (ch->groups[k] == group_id) { ch->groups[k] = ch->groups[--ch->n_groups]; break; }
+    }
+}
+
+oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id) {
+    for (size_t i = 0; i < m->n_channels; i++)
+        if (m->channels[i].channel_id == channel_id) return &m->channels[i];
+    return NULL;
+}
+
+void oc_model_mark_read(oc_model *m, uint64_t channel_id) {
+    oc_channel *c = oc_model_channel(m, channel_id);
+    if (!c) return;
+    c->read_marker = c->high_water;
+    c->unread = 0;
+    c->priority_unread = 0;
+}
+
+void oc_model_badge(const oc_model *m, const oc_channel *c, int *count, int *dot) {
+    (void)m;
+    int n = 0, d = 0;
+    if (c && !c->muted && c->unread > 0) {
+        n = c->kind == OC_CHANNEL_KIND_DM ? c->unread : c->priority_unread;
+        d = n == 0;
+    }
+    if (count) *count = n;
+    if (dot) *dot = d;
+}
+
+/* Mark unread (REQ-235): put this user's position in `channel_id` at
+ * `message_id`, backwards as readily as forwards, and count again what lies past
+ * it -- the loaded messages from others that would have notified, by the rule
+ * the live count and the daemon's use. History is loaded newest-first and
+ * contiguous, so everything after a message on screen is in hand. */
+void oc_model_set_read_marker(oc_model *m, uint64_t channel_id, uint64_t message_id) {
+    oc_channel *c = oc_model_channel(m, channel_id);
+    if (!c) return;
+    c->read_marker = message_id;
+    int n = 0, pri = 0;
+    for (size_t i = 0; i < c->n_msgs; i++) {
+        const oc_msg *msg = &c->msgs[i];
+        if (msg->message_id <= message_id || msg->deleted) continue;
+        int men = 0, kw = 0;
+        if (msg->body) {
+            size_t blen = strlen(msg->body);
+            men = oc_model_mentions_me(m, msg->body, blen);
+            kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
+        }
+        int vip = oc_model_is_priority(m, msg->author_id);
+        if (oc_notify_decide(msg->author_id == m->user_id, c->muted, vip,
+                             c->notify_level, men, kw, 0, 0, 0)) {
+            n++;
+            if (men || kw || vip) pri++;
+        }
+    }
+    c->unread = n;
+    c->priority_unread = pri;
+    c->srv_unread = (uint32_t)n;
+}
+
+static oc_channel *channel_ensure(oc_model *m, uint64_t channel_id) {
+    oc_channel *c = oc_model_channel(m, channel_id);
+    if (c) return c;
+    if (m->n_channels == m->cap_channels) {
+        size_t cap = m->cap_channels ? m->cap_channels * 2 : 8;
+        oc_channel *nc = realloc(m->channels, cap * sizeof *nc);
+        if (!nc) return NULL;
+        m->channels = nc;
+        m->cap_channels = cap;
+    }
+    c = &m->channels[m->n_channels++];
+    memset(c, 0, sizeof *c);
+    c->channel_id = channel_id;
+    /* A channel that appears mid-session starts at the user's GLOBAL default
+     * (REQ-134), not at the zero memset leaves — which is OC_NOTIFY_ALL, the
+     * one level the user may have explicitly turned off everywhere. The
+     * NOTIFY_PREFS sync seeds every channel it knows about; a channel created
+     * after it arrived was getting ALL, so "only when mentioned" held until
+     * somebody made a new channel and then stopped holding there. */
+    c->notify_level = m->notify_default;
+    return c;
+}
+
+/* Append a message, stealing ownership of `*body` (set to NULL on success).
+ * Returns 1 if a message was appended, 0 if it was a dedup/alloc no-op. */
+static int channel_append(oc_channel *c, uint64_t author_id, const char *author_name,
+                          uint64_t message_id, uint64_t server_time, uint8_t kind, char **body) {
+    /* Dedup on the per-channel high-water mark (ARCH-45). message_id 0 means the
+     * server did not assign one (shouldn't happen for a BROADCAST) — keep it.
+     *
+     * An id at or below the mark is USUALLY a redelivery, but it is also what a
+     * backwards history page looks like. So instead of rejecting it
+     * outright, check whether we actually hold it: if not, it is older history
+     * and belongs at its sorted position. Rejecting on the mark alone silently
+     * discarded every paged-in message. */
+    int older = (message_id && message_id <= c->high_water);
+    if (older) {
+        for (size_t i = 0; i < c->n_msgs; i++)
+            if (c->msgs[i].message_id == message_id) return 0;   /* genuine redelivery */
+    }
+    if (c->n_msgs == c->cap_msgs) {
+        size_t cap = c->cap_msgs ? c->cap_msgs * 2 : 32;
+        oc_msg *nm = realloc(c->msgs, cap * sizeof *nm);
+        if (!nm) return 0;
+        c->msgs = nm;
+        c->cap_msgs = cap;
+    }
+    /* Keep the array ordered by id: the renderer walks it as the transcript, and
+     * grouping/date dividers assume ascending time. */
+    size_t at = c->n_msgs;
+    if (older) {
+        while (at > 0 && c->msgs[at - 1].message_id > message_id) at--;
+        memmove(&c->msgs[at + 1], &c->msgs[at], (c->n_msgs - at) * sizeof *c->msgs);
+    }
+    c->n_msgs++;
+    oc_msg *msg = &c->msgs[at];
+    memset(msg, 0, sizeof *msg);   /* clear reactions et al. before we populate */
+    msg->body = *body;
+    snprintf(msg->author_name, sizeof msg->author_name, "%s", author_name ? author_name : "");
+    msg->author_id = author_id;
+    msg->message_id = message_id;
+    msg->server_time = server_time;
+    msg->kind = kind;
+    *body = NULL;
+    if (message_id > c->high_water) c->high_water = message_id;
+    return 1;
+}
+
+static void presence_set(oc_model *m, uint64_t user_id, uint8_t status, int dnd) {
+    for (size_t i = 0; i < m->n_presence; i++) {
+        if (m->presence[i].user_id == user_id) {
+            m->presence[i].status = status;
+            m->presence[i].dnd = (uint8_t)(dnd ? 1 : 0);
+            return;
+        }
+    }
+    if (m->n_presence == m->cap_presence) {
+        size_t cap = m->cap_presence ? m->cap_presence * 2 : 16;
+        oc_presence_row *np = realloc(m->presence, cap * sizeof *np);
+        if (!np) return;
+        m->presence = np;
+        m->cap_presence = cap;
+    }
+    m->presence[m->n_presence].user_id = user_id;
+    m->presence[m->n_presence].status = status;
+    m->presence[m->n_presence].dnd = (uint8_t)(dnd ? 1 : 0);
+    m->n_presence++;
+}
+
+void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status) {
+    /* Our own presence, which the server does not echo — it says nothing about
+     * a pause, so the flag we already hold is kept rather than cleared. */
+    presence_set(m, user_id, status, oc_model_dnd_of(m, user_id));
+}
+
+int oc_model_dnd_of(const oc_model *m, uint64_t user_id) {
+    for (size_t i = 0; i < m->n_presence; i++)
+        if (m->presence[i].user_id == user_id) return m->presence[i].dnd ? 1 : 0;
+    return 0;
+}
+
+int oc_model_snoozed(const oc_model *m) {
+    return m && m->snooze_until_ms != 0;
+}
+
+int oc_model_keyword_hit(const oc_model *m, const char *body, size_t len,
+                         size_t *span_start, size_t *span_len) {
+    if (!m || !body || !len) return 0;
+    for (uint8_t i = 0; i < m->n_kw_terms; i++)
+        if (oc_keyword_match(body, len, m->kw_terms[i], span_start, span_len)) return 1;
+    return 0;
+}
+
+int oc_model_is_priority(const oc_model *m, uint64_t user_id) {
+    if (!m || !user_id) return 0;
+    for (uint8_t i = 0; i < m->n_pri_people; i++)
+        if (m->pri_people[i] == user_id) return 1;
+    return 0;
+}
+
+const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
+                                   uint64_t since_id, int quiet, int paused,
+                                   int *mentioned, int *keyword_hit, int *vip) {
+    if (mentioned)   *mentioned   = 0;
+    if (keyword_hit) *keyword_hit = 0;
+    if (vip)         *vip         = 0;
+    if (!m || !c) return NULL;
+
+    const oc_msg *pick = NULL;
+    for (size_t i = 0; i < c->n_msgs; i++) {
+        const oc_msg *msg = &c->msgs[i];
+        if (msg->message_id <= since_id) continue;   /* already accounted for */
+        if (msg->deleted) continue;
+        /* Your own words are not news. The evaluator would answer the same
+         * way; it is a filter here because a message of yours must not become
+         * the subject of somebody else's notification either. */
+        if (msg->author_id == m->user_id) continue;
+        /* A missed call (REQ-304) never notifies: the invitation already did. */
+        if (msg->kind != OC_MSG_KIND_MESSAGE) continue;
+
+        int men = 0, kw = 0;
+        if (msg->body) {
+            size_t blen = strlen(msg->body);
+            men = oc_model_mentions_me(m, msg->body, blen);
+            kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
+        }
+        int is_vip = oc_model_is_priority(m, msg->author_id);
+        /* thread_reply is 0: this watches a channel's main scroll, and a thread
+         * reply is deliberately not in it (REQ-060), so it never sees one.
+         * Replies are answered by oc_model_thread_notify_take instead. */
+        if (!oc_notify_decide(0, c->muted, is_vip, c->notify_level,
+                              men, kw, 0, quiet, paused)) continue;
+
+        pick = msg;                      /* ascending ids: the newest wins */
+        if (mentioned)   *mentioned   |= men;
+        if (keyword_hit) *keyword_hit |= kw;
+        if (vip)         *vip         |= is_vip;
+    }
+    return pick;
+}
+
+/* Remember a live reply that might deserve a toast. Called as the reply
+ * arrives, because this is the only moment its body exists: unless its thread
+ * happens to be open, the model keeps nothing of a reply but a count on the
+ * parent. The mention and keyword scans therefore run here, against the whole
+ * body, and only the excerpt is kept. */
+static void notice_push(oc_model *m, const oc_ev *e) {
+    if (m->n_notices == OC_MAX_THREAD_NOTICES) {
+        /* Full: drop the oldest. A toast for something that just happened is
+         * worth more than one for the message before it. */
+        memmove(&m->notices[0], &m->notices[1],
+                (OC_MAX_THREAD_NOTICES - 1) * sizeof m->notices[0]);
+        m->n_notices--;
+    }
+    oc_thread_notice *n = &m->notices[m->n_notices++];
+    memset(n, 0, sizeof *n);
+    n->channel_id = e->channel_id;
+    n->message_id = e->message_id;
+    n->parent_id  = e->parent_id;
+    n->author_id  = e->author_id;
+    if (e->body) {
+        size_t blen = strlen(e->body);
+        n->mentioned   = (uint8_t)(oc_model_mentions_me(m, e->body, blen) != 0);
+        n->keyword_hit = (uint8_t)(oc_model_keyword_hit(m, e->body, blen, NULL, NULL) != 0);
+        /* An action keeps its action text, flagged, for "<name> <text>"
+         * (REQ-058); the net thread paired it with the reply before this. */
+        int act = e->action_known && e->action && e->action_len &&
+                  e->action_start <= blen && e->action_len <= blen - e->action_start;
+        n->action = (uint8_t)act;
+        snprintf(n->body, sizeof n->body, "%s", act ? e->body + e->action_start : e->body);
+    }
+}
+
+size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
+                                   oc_thread_notice *out, size_t max) {
+    if (!m) return 0;
+    size_t kept = 0;
+    for (size_t i = 0; i < m->n_notices; i++) {
+        oc_thread_notice *n = &m->notices[i];
+        const oc_channel *c = NULL;
+        for (size_t k = 0; k < m->n_channels; k++)
+            if (m->channels[k].channel_id == n->channel_id) { c = &m->channels[k]; break; }
+        if (!c) continue;          /* a channel we no longer hold */
+        int is_vip = oc_model_is_priority(m, n->author_id);
+        /* thread_reply is 1 by construction: the daemon told us this reply is
+         * one of ours (ARCH-104), and only such replies are queued. Everything
+         * else is ours to supply, and mute, the schedule and the pause still
+         * silence it — participation satisfies the mentions LEVEL, it does not
+         * step around it. */
+        if (!oc_notify_decide(0, c->muted, is_vip, c->notify_level,
+                              n->mentioned, n->keyword_hit, 1, quiet, paused)) continue;
+        if (out && kept < max) out[kept++] = *n;
+    }
+    m->n_notices = 0;              /* considered once, whatever the verdict */
+    return kept;
+}
+
+const oc_call_view *oc_model_call_in(const oc_model *m, uint64_t channel_id) {
+    for (size_t i = 0; i < m->n_calls; i++)
+        if (m->calls[i].channel_id == channel_id) return &m->calls[i];
+    return NULL;
+}
+
+int oc_model_call_invited(const oc_call_view *v, uint64_t user_id) {
+    if (!v) return 0;
+    for (uint16_t i = 0; i < v->n_invited; i++) if (v->invited[i] == user_id) return 1;
+    return 0;
+}
+
+size_t oc_model_call_notify_take(oc_model *m, int quiet, int paused,
+                                 oc_call_notice *out, size_t max) {
+    if (!m) return 0;
+    size_t kept = 0;
+    for (size_t i = 0; i < m->n_call_notices; i++) {
+        oc_call_notice *n = &m->call_notices[i];
+        const oc_channel *c = oc_model_channel(m, n->channel_id);
+        const oc_call_view *v = oc_model_call_in(m, n->channel_id);
+        /* Still standing: not taken, declined or ended since it arrived. */
+        if (!v || v->call_id != n->call_id || !oc_model_call_invited(v, m->user_id)) continue;
+        int muted = c ? c->muted : 0;
+        unsigned level = c ? c->notify_level : OC_NOTIFY_ALL;
+        if (!oc_notify_decide(0, muted, oc_model_is_priority(m, n->starter), level,
+                              1, 0, 0, quiet, paused)) continue;
+        if (out && kept < max) out[kept++] = *n;
+    }
+    m->n_call_notices = 0;
+    return kept;
+}
+
+/* CALL_STATE (REQ-303): upsert the conversation's entry, or drop it when the
+ * call is over. An invitation this user did not hold before is queued for the
+ * toast pass. */
+static void call_state_fold(oc_model *m, const oc_call_view *v) {
+    size_t i = 0;
+    while (i < m->n_calls && m->calls[i].channel_id != v->channel_id) i++;
+    int had_invite = i < m->n_calls && m->calls[i].call_id == v->call_id &&
+                     oc_model_call_invited(&m->calls[i], m->user_id);
+    if (v->ended) {
+        if (i < m->n_calls) m->calls[i] = m->calls[--m->n_calls];
+        return;
+    }
+    if (i == m->n_calls) {
+        if (m->n_calls == OC_MAX_CALLS_LISTED) return;
+        m->n_calls++;
+    }
+    m->calls[i] = *v;
+    if (!had_invite && oc_model_call_invited(v, m->user_id)) {
+        if (m->n_call_notices == OC_MAX_CALL_NOTICES) {
+            memmove(m->call_notices, m->call_notices + 1,
+                    (OC_MAX_CALL_NOTICES - 1) * sizeof *m->call_notices);
+            m->n_call_notices--;
+        }
+        oc_call_notice *n = &m->call_notices[m->n_call_notices++];
+        n->channel_id = v->channel_id;
+        n->call_id = v->call_id;
+        n->starter = v->starter;
+    }
+}
+
+uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id) {
+    /* Disconnected, every presence is what it was when the line dropped -- stale,
+     * and yours is simply untrue: nobody can reach you. So nobody reads as
+     * present until the connection is back and says so again. */
+    if (!m->authed) return OC_PRESENCE_OFFLINE;
+    for (size_t i = 0; i < m->n_presence; i++)
+        if (m->presence[i].user_id == user_id) return m->presence[i].status;
+    return OC_PRESENCE_OFFLINE;
+}
+
+static void set_status(oc_model *m, const char *s) {
+    snprintf(m->status, sizeof m->status, "%s", s ? s : "");
+}
+
+void oc_model_apply(oc_model *m, oc_ev *e) {
+    switch (e->type) {
+    case OC_EV_CONNECTED:
+        m->connected = true;
+        m->user_id = e->user_id;
+        m->last_error[0] = '\0';        /* a live connection clears any prior error */
+        set_status(m, "connected");
+        break;
+    case OC_EV_AUTH_OK:
+        m->authed = true;
+        m->user_id = e->user_id;
+        /* A new session says afresh whether there is anything to show: only an
+         * owner's or admin's sign-in is followed by a summary. */
+        m->srvalerts_have = 0; m->srvalerts_unacked = m->srvalerts_current = 0; m->n_srvalerts = 0;
+        m->srvalerts_seq++;
+        m->last_error[0] = '\0';
+        m->signin_url[0] = '\0';
+        m->device_url[0] = m->device_code[0] = m->device_fp[0] = '\0';
+        m->signed_out = false;
+        /* Self: the server won't tell us. A pause survives a reconnect, and the
+         * SNOOZE frame that follows AUTH_OK is what sets it — this only seeds
+         * the row. */
+        presence_set(m, e->user_id, OC_PRESENCE_ONLINE, m->snooze_until_ms != 0);
+        set_status(m, "authenticated");
+        /* The net thread asks for this user's drafts on every (re)connect, so
+         * bump the sync generation HERE — the reply's terminator then sweeps
+         * anything the server did not mention, which is how a draft deleted on
+         * another device while we were offline stops being ours. */
+        oc_model_drafts_begin(m);
+        m->sched_gen++;          /* the same sweep, for what is waiting to send */
+        break;
+    case OC_EV_WORKSPACE_INFO:
+        m->deployment_mode = e->status;
+        m->max_users = e->count;
+        m->call_max = e->op;
+        m->workspace_mode = e->ws_mode;
+        snprintf(m->workspace_name, sizeof m->workspace_name, "%s", e->body ? e->body : "");
+        /* SERVER_BUILD follows on this connection; a daemon too old to send it
+         * leaves the field empty rather than showing the last daemon's build. */
+        m->server_build[0] = '\0';
+        break;
+    case OC_EV_SERVER_BUILD:
+        snprintf(m->server_build, sizeof m->server_build, "%s", e->body ? e->body : "");
+        break;
+    case OC_EV_CHANNEL: {
+        oc_channel *c = channel_ensure(m, e->channel_id);
+        if (c) {
+            c->info_seq++;
+            c->joined = e->status;
+            c->kind = e->op;                     /* channel vs DM */
+            c->is_public = e->is_public;         /* public vs private (REQ-031) */
+            if (e->user_id) c->peer_id = e->user_id;   /* DM peer (CHANNEL_INFO only) */
+            /* A group DM's participants (REQ-056). Assigned, not merged: the server's
+             * set is the truth, and a group can lose a member. */
+            c->n_peers = e->n_peers > 9 ? 9 : e->n_peers;
+            for (uint16_t k = 0; k < c->n_peers; k++) c->peers[k] = e->peers[k];
+            if (e->server_time) c->last_message_at = e->server_time;
+            if (e->count) {
+                c->srv_unread = e->count;
+                /* Before any backfill the server's count is all we know, so let
+                 * it seed the badge; live BROADCASTs take over from there. */
+                if (c->unread == 0) c->unread = (int)e->count;
+            }
+            if (e->body) { free(c->name); c->name = e->body; e->body = NULL; }
+            /* Topic and archived ride on the same frame (ARCH-93): a rename, a
+             * topic change and an archive all arrive as CHANNEL_INFO, so this
+             * one arm keeps the sidebar and the header honest for all three. */
+            c->archived = e->archived;
+            if (e->e2e) c->e2e = 1;
+            if (e->created_at) c->created_at = e->created_at;
+            if (e->preview) {
+                snprintf(c->preview, sizeof c->preview, "%s", e->preview);
+                c->preview_author = e->preview_author;
+                c->preview_action = e->action;   /* REQ-058 */
+            }
+            free(c->topic);
+            c->topic = (e->topic && e->topic[0]) ? strdup(e->topic) : NULL;
+        }
+        break;
+    }
+    case OC_EV_CHANNEL_DESCRIPTION: {
+        /* Both the answer to a fetch and the announcement of a change arrive as
+         * this one frame, so one arm serves the About on open and live. */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (c) {
+            free(c->description);
+            c->description = (e->body && e->body[0]) ? e->body : NULL;
+            if (c->description) e->body = NULL;     /* taken */
+            c->description_known = 1;
+        }
+        break;
+    }
+    case OC_EV_MESSAGE: {
+        oc_channel *c = channel_ensure(m, e->channel_id);
+        /* Keep the list preview live. Taken BEFORE channel_append, which takes
+         * ownership of the body — after it, e->body is gone. Only for messages
+         * newer than what we last previewed, so a backfill replaying older
+         * history cannot rewind the sidebar to an old line. */
+        if (c && e->body && e->message_id >= c->high_water) {
+            /* An action previews as its action text, flagged, read beside its
+             * author (REQ-058); the net thread paired the two before this. */
+            size_t blen = strlen(e->body);
+            int act = e->action_known && e->action && e->action_len &&
+                      e->action_start <= blen && e->action_len <= blen - e->action_start;
+            snprintf(c->preview, sizeof c->preview, "%s", act ? e->body + e->action_start : e->body);
+            c->preview_author = e->author_id;
+            c->preview_action = (uint8_t)act;
+        }
+        if (c && channel_append(c, e->author_id, e->author_name, e->message_id, e->server_time,
+                                e->msg_kind, &e->body)) {
+            msg_set_action(&c->msgs[c->n_msgs - 1], e);
+            /* A badge counts what WOULD HAVE NOTIFIED, with the schedule and
+             * the pause left out — they say when to interrupt you, not whether
+             * a message mattered, and a badge that emptied itself overnight
+             * would hide the morning's backlog. The daemon counts the same
+             * thing the same way, which is what makes the seeded count and this
+             * one the same number rather than two plausible ones.
+             *
+             * Asked of the evaluator rather than restated: the message is in
+             * hand, so there is no reason to guess at what it would have said.
+             * Own messages are excluded by `own`, not by a second test. */
+            const oc_msg *msg = &c->msgs[c->n_msgs - 1];
+            int men = 0, kw = 0;
+            if (msg->body) {
+                size_t blen = strlen(msg->body);
+                men = oc_model_mentions_me(m, msg->body, blen);
+                kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
+            }
+            int vip = oc_model_is_priority(m, e->author_id);
+            if (e->message_id > c->read_marker &&
+                oc_notify_decide(e->author_id == m->user_id, c->muted, vip,
+                                 c->notify_level, men, kw, 0, 0, 0)) {
+                c->unread++;
+                if (men || kw || vip) c->priority_unread++;   /* the badge's count, not its dot */
+            }
+            /* Talking mode speaks what arrives from now on (ARCH-111), except
+             * one's own messages: you know what you just typed, and hearing it
+             * read back -- over the next person's reply, since the queue plays
+             * end to end -- is only in the way. A listener too far behind loses
+             * the oldest rather than the newest: what is being said now matters
+             * more than what was said while the queue was backing up. */
+            if (m->listen_channel == e->channel_id && e->author_id != m->user_id &&
+                e->msg_kind == OC_MSG_KIND_MESSAGE) {
+                if (m->n_listen_queue == OC_LISTEN_QUEUE_MAX) {
+                    memmove(m->listen_queue, m->listen_queue + 1,
+                            (OC_LISTEN_QUEUE_MAX - 1) * sizeof *m->listen_queue);
+                    m->n_listen_queue--;
+                    m->listen_skipped++;
+                }
+                m->listen_queue[m->n_listen_queue++] = e->message_id;
+            }
+        }
+        break;
+    }
+    case OC_EV_CAPABILITIES:
+        snprintf(m->capabilities, sizeof m->capabilities, "%s", e->body ? e->body : "");
+        break;
+    case OC_EV_TTS_BEGIN:
+        /* Replaces what we knew: the daemon says this again on every reconnect,
+         * and it may have been rebuilt without read-aloud in between. */
+        m->n_voices = 0;
+        snprintf(m->tts_model_version, sizeof m->tts_model_version, "%s", e->body ? e->body : "");
+        snprintf(m->tts_preview, sizeof m->tts_preview, "%s", e->topic ? e->topic : "");
+        break;
+    case OC_EV_TTS_VOICE:
+        if (m->n_voices < OC_VOICE_MAX) {
+            oc_voice *v = &m->voices[m->n_voices++];
+            snprintf(v->id, sizeof v->id, "%s", e->body ? e->body : "");
+            snprintf(v->label, sizeof v->label, "%s", e->topic ? e->topic : "");
+            snprintf(v->lang, sizeof v->lang, "%s", e->preview ? e->preview : "");
+        }
+        break;
+    case OC_EV_VOICE_PREVIEW:
+        free(m->preview_ready);
+        m->preview_ready = (uint8_t *)e->body;      /* taken from the event */
+        m->preview_ready_len = e->count;
+        e->body = NULL;
+        break;
+    case OC_EV_LISTEN_AUDIO:
+        if (m->listen_channel && e->message_id == m->listen_fetching) {
+            free(m->listen_ready);
+            m->listen_ready = (uint8_t *)e->body;
+            m->listen_ready_len = e->count;
+            m->listen_ready_id = e->message_id;
+            e->body = NULL;                       /* the model owns the bytes now */
+            m->listen_fetching = 0;
+        }
+        break;
+    case OC_EV_STT_INFO:
+        snprintf(m->stt_model_version, sizeof m->stt_model_version, "%s", e->body ? e->body : "");
+        snprintf(m->stt_lang, sizeof m->stt_lang, "%s", e->topic ? e->topic : "");
+        m->stt_max_ms = e->count;
+        break;
+    case OC_EV_STT_TEXT:
+        m->stt_answered++;
+        /* Free talk's words are already a message, arriving as a BROADCAST like
+         * any other; only push to talk's are the composer's to take. */
+        if (e->op == OC_STT_MODE_PTT && e->body && e->body[0]) {
+            if (m->n_stt_words == OC_STT_WORDS_MAX) {      /* nobody is taking them: drop the oldest */
+                free(m->stt_words[0].text);
+                memmove(&m->stt_words[0], &m->stt_words[1], (OC_STT_WORDS_MAX - 1) * sizeof m->stt_words[0]);
+                m->n_stt_words--;
+            }
+            m->stt_words[m->n_stt_words].text = e->body;
+            m->stt_words[m->n_stt_words].channel_id = e->channel_id;
+            m->stt_words[m->n_stt_words].thread_root = e->parent_id;
+            m->n_stt_words++;
+            e->body = NULL;                               /* the model owns it now */
+        }
+        break;
+    case OC_EV_STT_ERROR:
+        m->stt_answered++;
+        m->stt_error_code = (uint16_t)e->size;
+        m->stt_error_seq++;
+        break;
+    case OC_EV_LISTEN_SKIP:
+        if (e->message_id == m->listen_fetching) {
+            m->listen_fetching = 0;
+            m->listen_skipped++;
+        }
+        break;
+    case OC_EV_PRESENCE:
+        presence_set(m, e->user_id, e->status, e->op);
+        break;
+    case OC_EV_SCHEDULE:
+        m->dnd_mode        = e->sched_mode;
+        m->tz_offset_min   = e->tz_offset_min;
+        m->allow_start_min = e->sched_start_min;
+        m->allow_end_min   = e->sched_end_min;
+        m->n_sched_days    = e->n_sched_days;
+        for (uint8_t i = 0; i < e->n_sched_days; i++) m->sched_days[i] = e->sched_days[i];
+        break;
+    case OC_EV_ALERT_PREFS:
+        m->n_kw_terms = e->n_kw_terms;
+        for (uint8_t i = 0; i < e->n_kw_terms; i++)
+            snprintf(m->kw_terms[i], sizeof m->kw_terms[i], "%s", e->kw_terms[i]);
+        m->n_pri_people = e->n_pri_people;
+        for (uint8_t i = 0; i < e->n_pri_people; i++) m->pri_people[i] = e->pri_people[i];
+        break;
+    case OC_EV_SNOOZE:
+        /* MY pause (REQ-278). The end instant is self-only, so this is the one
+         * place a time appears at all; everybody else's is just a flag. */
+        m->snooze_until_ms = e->server_time;
+        presence_set(m, m->user_id, oc_model_presence_of(m, m->user_id),
+                     e->server_time != 0);
+        break;
+    case OC_EV_TYPING:
+        typing_touch(m, e->channel_id, e->user_id);
+        break;
+    case OC_EV_CHAN_MEMBER: {
+        /* Only for the roster currently being loaded — a late frame from a
+         * previous channel must not land in this one's list. */
+        if (m->chanmem_channel != e->channel_id) break;
+        /* Someone already listed is updated, not listed again: two requests for
+         * the same roster in flight (opening it, then a refresh) both clear the
+         * list before either answer comes, and then both answers arrive. */
+        oc_chan_member *had = NULL;
+        for (size_t i = 0; i < m->n_chanmem && !had; i++)
+            if (m->chanmem[i].user_id == e->user_id) had = &m->chanmem[i];
+        if (had) {
+            had->role      = e->status;
+            had->joined_at = e->server_time;
+            break;
+        }
+        if (m->n_chanmem == m->cap_chanmem) {
+            size_t nc = m->cap_chanmem ? m->cap_chanmem * 2 : 16;
+            oc_chan_member *g = realloc(m->chanmem, nc * sizeof *g);
+            if (!g) break;
+            m->chanmem = g; m->cap_chanmem = nc;
+        }
+        oc_chan_member *cm = &m->chanmem[m->n_chanmem++];
+        cm->user_id   = e->user_id;
+        cm->role      = e->status;
+        cm->joined_at = e->server_time;
+        break;
+    }
+    case OC_EV_CHAN_MEMBERS_END:
+        if (m->chanmem_channel == e->channel_id) m->chanmem_loading = 0;
+        break;
+    case OC_EV_FILE: {
+        /* Matched on "a list is in flight", not on the channel: in the
+         * workspace-wide view (channel 0) each entry names its OWN channel, so
+         * comparing against the requested one would drop every row. The
+         * terminator clears `loading`, which is what fences a late frame from a
+         * previous request. */
+        if (!m->filelist_open || !m->filelist_loading) break;
+        if (m->n_files == m->cap_files) {
+            size_t nc = m->cap_files ? m->cap_files * 2 : 32;
+            oc_file_view *g = realloc(m->files, nc * sizeof *g);
+            if (!g) break;
+            m->files = g; m->cap_files = nc;
+        }
+        oc_file_view *f = &m->files[m->n_files++];
+        f->id          = e->attach_id;
+        f->channel_id  = e->channel_id;      /* the file's own channel */
+        f->message_id  = e->message_id;
+        f->uploader_id = e->author_id;
+        f->size        = e->size;
+        f->created_at  = e->server_time;
+        f->reclaimed   = e->reclaimed;
+        f->media_kind  = e->media_kind;
+        f->duration_ms = e->duration_ms;
+        snprintf(f->filename, sizeof f->filename, "%s", e->body ? e->body : "");
+        snprintf(f->mime, sizeof f->mime, "%s", e->emoji);
+        break;
+    }
+    case OC_EV_FILES_END:
+        if (m->filelist_open && m->filelist_channel == e->channel_id) {
+            m->filelist_loading = 0;
+            m->files_more = (uint8_t)(e->status ? 1 : 0);
+        }
+        break;
+    case OC_EV_SAVED_MSG: {
+        if (!m->saved_open || !m->saved_loading) break;
+        if (m->n_saved == m->cap_saved) {
+            size_t nc = m->cap_saved ? m->cap_saved * 2 : 16;
+            oc_saved_view *g = realloc(m->saved, nc * sizeof *g);
+            if (!g) break;
+            m->saved = g; m->cap_saved = nc;
+        }
+        oc_saved_view *sv = &m->saved[m->n_saved++];
+        sv->message_id = e->message_id; sv->channel_id = e->channel_id;
+        sv->author_id  = e->author_id;  sv->server_time = e->server_time;
+        sv->saved_at   = e->pinned_at;
+        sv->body = e->body ? strdup(e->body) : NULL;
+        sv->action = e->action;   /* REQ-058 */
+        snprintf(sv->attach_name, sizeof sv->attach_name, "%s", e->author_name);
+        break;
+    }
+    case OC_EV_SAVED_END:
+        if (m->saved_open) m->saved_loading = 0;
+        break;
+    case OC_EV_SESSION_ROW: {
+        if (!m->sessions_open) break;
+        if (m->n_sessions == m->cap_sessions) {
+            size_t nc = m->cap_sessions ? m->cap_sessions * 2 : 8;
+            oc_session_row *g = realloc(m->sessions, nc * sizeof *g);
+            if (!g) break;
+            m->sessions = g; m->cap_sessions = nc;
+        }
+        oc_session_row *sr = &m->sessions[m->n_sessions++];
+        sr->session_id = e->message_id;
+        sr->created_at = e->server_time;
+        sr->last_seen  = e->pinned_at;      /* the ev's spare timestamp slot */
+        sr->expires_at = e->channel_id;    /* 64-bit slot; see net.c */
+        sr->current    = e->op;
+        snprintf(sr->device, sizeof sr->device, "%s", e->body ? e->body : "");
+        break;
+    }
+    case OC_EV_SESSIONS_END:
+        if (m->sessions_open) m->sessions_loading = 0;
+        break;
+    case OC_EV_FILE_CHANNELS_BEGIN:
+        m->n_fchans = 0;
+        break;
+    case OC_EV_FILE_CHANNEL: {
+        if (m->n_fchans == m->cap_fchans) {
+            size_t nc = m->cap_fchans ? m->cap_fchans * 2 : 16;
+            oc_chan_count *g = realloc(m->fchans, nc * sizeof *g);
+            if (!g) break;
+            m->fchans = g; m->cap_fchans = nc;
+        }
+        m->fchans[m->n_fchans].channel_id = e->channel_id;
+        m->fchans[m->n_fchans].count      = (uint32_t)e->count;
+        m->n_fchans++;
+        break;
+    }
+    case OC_EV_PROFILE_INFO: {
+        /* Unpack the \x1f-separated fields packed in net.c — kept beside the struct
+         * being filled, so the two halves are read together. */
+        oc_member *mem = NULL;
+        for (size_t i = 0; i < m->n_users; i++)
+            if (m->users[i].user_id == e->user_id) { mem = &m->users[i]; break; }
+        if (!mem) break;                 /* not in the roster: nothing to attach to */
+        const char *f[9] = { "", "", "", "", "", "", "", "", "" };
+        char buf[800];
+        snprintf(buf, sizeof buf, "%s", e->body ? e->body : "");
+        int nf = 0;
+        f[nf++] = buf;
+        for (char *q = buf; *q && nf < 9; q++)
+            if (*q == '\x1f') { *q = '\0'; f[nf++] = q + 1; }
+        /* Each field is a bounded copy out of the 768-byte split buffer above,
+         * so the precision states the destination's own bound rather than
+         * leaving a compiler to work out that a pointer into `buf` could carry
+         * 767 bytes into a 64-byte field. It is the same fact snprintf already
+         * enforces, said where a reader and a compiler can both see it -- and
+         * which of the two notices depends on the compiler's version, which is
+         * not a thing worth having an opinion vary on. */
+#define FOLD_FIELD(dst, src) \
+        snprintf((dst), sizeof (dst), "%.*s", (int)(sizeof (dst) - 1), (src))
+        if (f[0][0]) FOLD_FIELD(mem->name, f[0]);
+        FOLD_FIELD(mem->status_emoji, f[1]);
+        FOLD_FIELD(mem->status_text,  f[2]);
+        FOLD_FIELD(mem->title,        f[3]);
+        FOLD_FIELD(mem->timezone,     f[4]);
+        FOLD_FIELD(mem->full_name,    f[5]);
+        FOLD_FIELD(mem->pronouns,     f[6]);
+        FOLD_FIELD(mem->phone,        f[7]);
+        FOLD_FIELD(mem->voice_id,     f[8]);
+#undef FOLD_FIELD
+        mem->status_expires = e->server_time;
+        mem->avatar_id      = e->message_id;
+        if (e->op) mem->role = e->op;
+        break;
+    }
+    case OC_EV_INVITE_ROW: {
+        if (!m->invites_open) break;
+        if (m->n_invites == m->cap_invites) {
+            size_t nc = m->cap_invites ? m->cap_invites * 2 : 16;
+            oc_invite_row *g = realloc(m->invites, nc * sizeof *g);
+            if (!g) break;
+            m->invites = g; m->cap_invites = nc;
+        }
+        oc_invite_row *iv = &m->invites[m->n_invites++];
+        iv->invite_id  = e->message_id;
+        iv->role       = e->op;
+        iv->expires_at = e->server_time;
+        iv->created_by = e->user_id;
+        iv->uses       = e->uses;
+        iv->used       = e->used;
+        break;
+    }
+    case OC_EV_INVITE_END:
+        if (m->invites_open) m->invites_loading = 0;
+        break;
+    case OC_EV_INVITE_REVOKED:
+        /* Drop the row locally so the list does not need a second round trip. */
+        for (size_t i = 0; i < m->n_invites; i++)
+            if (m->invites[i].invite_id == e->message_id) {
+                memmove(&m->invites[i], &m->invites[i + 1],
+                        (m->n_invites - i - 1) * sizeof *m->invites);
+                m->n_invites--;
+                break;
+            }
+        break;
+    case OC_EV_SAVED_UPDATED:
+        /* Mark the message itself, in every list that can hold it, so the
+         * transcript can show a bookmark without the Later view ever being
+         * opened. Both lists for the reason msg_set_saved states. */
+        for (size_t ci = 0; ci < m->n_channels; ci++) {
+            oc_channel *c = &m->channels[ci];
+            for (size_t i = 0; i < c->n_msgs; i++)
+                if (c->msgs[i].message_id == e->message_id) { msg_set_saved(&c->msgs[i], e); break; }
+        }
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id) {
+                msg_set_saved(&m->thread_msgs[i], e);
+                break;
+            }
+        /* Drop it from an open list on unsave, so the view cannot show a row
+         * the server no longer has. */
+        if (m->saved_open && e->op == 0)
+            for (size_t i = 0; i < m->n_saved; i++)
+                if (m->saved[i].message_id == e->message_id) {
+                    free(m->saved[i].body);
+                    memmove(&m->saved[i], &m->saved[i + 1],
+                            (m->n_saved - i - 1) * sizeof *m->saved);
+                    m->n_saved--;
+                    break;
+                }
+        break;
+    case OC_EV_ACTIVITY: {
+        if (!m->activity_open || !m->activity_loading) break;
+        if (m->n_activity == m->cap_activity) {
+            size_t nc = m->cap_activity ? m->cap_activity * 2 : 32;
+            oc_activity_view *g = realloc(m->activity, nc * sizeof *g);
+            if (!g) break;
+            m->activity = g; m->cap_activity = nc;
+        }
+        oc_activity_view *av = &m->activity[m->n_activity++];
+        av->kind = e->status; av->message_id = e->message_id;
+        av->channel_id = e->channel_id; av->actor_id = e->user_id;
+        av->at = e->server_time;
+        av->text = e->body ? strdup(e->body) : NULL;
+        av->action = e->action;   /* REQ-058 */
+        break;
+    }
+    case OC_EV_ACTIVITY_END:
+        if (m->activity_open) { m->activity_loading = 0; m->activity_seen = e->pinned_at; }
+        break;
+    case OC_EV_PIN: {
+        /* Mark the message in the transcript. Arriving for a message we have not
+         * loaded is normal (backfill order, or another client's pin far up the
+         * scroll) and is simply dropped — the flag rides along when that message
+         * is eventually replayed. */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (c)
+            for (size_t i = 0; i < c->n_msgs; i++)
+                if (c->msgs[i].message_id == e->message_id) {
+                    msg_set_pinned(&c->msgs[i], e);
+                    break;
+                }
+        /* A thread reply is NOT in the channel's message list, so marking only
+         * that list left a pinned reply looking unpinned in the thread pane —
+         * and its menu still offering "Pin", which made unpinning it from there
+         * impossible (a re-pin is a no-op). The same omission, twice. */
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id) {
+                msg_set_pinned(&m->thread_msgs[i], e);
+                break;
+            }
+        /* Keep an open pins overlay honest: an unpin from anywhere removes the
+         * row rather than leaving a stale entry that 404s when clicked. */
+        if (m->pinlist_open && m->pinlist_channel == e->channel_id && e->op != 1) {
+            for (size_t i = 0; i < m->n_pins; i++) {
+                if (m->pins[i].message_id == e->message_id) {
+                    free(m->pins[i].body);
+                    memmove(&m->pins[i], &m->pins[i + 1],
+                            (m->n_pins - i - 1) * sizeof *m->pins);
+                    m->n_pins--;
+                    break;
+                }
+            }
+        }
+        break;
+    }
+    case OC_EV_PINNED_MSG: {
+        if (!m->pinlist_open || m->pinlist_channel != e->channel_id) break;
+        if (m->n_pins == m->cap_pins) {
+            size_t nc = m->cap_pins ? m->cap_pins * 2 : 16;
+            oc_pinned_row *g = realloc(m->pins, nc * sizeof *g);
+            if (!g) break;
+            m->pins = g; m->cap_pins = nc;
+        }
+        oc_pinned_row *pr = &m->pins[m->n_pins++];
+        pr->message_id  = e->message_id;
+        pr->author_id   = e->author_id;
+        pr->server_time = e->server_time;
+        pr->pinned_by   = e->user_id;
+        pr->pinned_at   = e->pinned_at;
+        pr->body        = e->body ? strdup(e->body) : NULL;
+        pr->action      = e->action;   /* REQ-058 */
+        snprintf(pr->attach_name, sizeof pr->attach_name, "%s", e->author_name);
+        break;
+    }
+    case OC_EV_SUMMARY: {
+        /* Only the answer to the open request: an abandoned or replaced one is
+         * dropped, as the daemon still makes it and keeps it for next time. */
+        if (!m->summary_open || !m->summary_loading || e->req_id != m->summary_req) break;
+        m->summary_loading = 0;
+        m->summary_status = e->status;
+        if (e->status == OC_SUM_OK) {
+            const char *b = e->body ? e->body : "";
+            if (oc_summary_view_parse(b, strlen(b), &m->summary) == 0) {
+                m->summary_start = e->span_start;
+                m->summary_end = e->span_end;
+                break;
+            }
+            m->summary_status = OC_SUM_FAILED;
+            m->summary_error = strdup("The summary could not be read.");
+        } else {
+            m->summary_error = strdup(e->body && *e->body ? e->body : "No summary.");
+        }
+        break;
+    }
+    case OC_EV_PDM: {
+        oc_pdm_view *v = oc_model_pdm(m, e->channel_id);
+        if (!v && e->channel_id && e->pdm_kind != OC_PDM_EV_ENDED && m->n_pdms < OC_PDM_VIEW_MAX) {
+            v = &m->pdms[m->n_pdms++];
+            memset(v, 0, sizeof *v);
+            v->id = e->channel_id;
+            v->peer = e->user_id;
+        }
+        m->pdm_seq++;
+        if (!v && e->pdm_kind == OC_PDM_EV_ENDED && !e->channel_id) {
+            m->pdm_refused_peer = e->user_id;
+            m->pdm_refused_seq++;
+        }
+        if (!v) break;
+        v->state = e->pdm_kind;
+        if (e->pdm_kind == OC_PDM_EV_ENDED) v->reason = e->pdm_reason;
+        if (e->pdm_safety[0]) snprintf(v->safety, sizeof v->safety, "%s", e->pdm_safety);
+        break;
+    }
+    case OC_EV_SUMMARY_READY: {
+        /* Told again at every sign-in until seen: kept once. */
+        if (oc_model_summary_notice(m, e->summary_id)) break;
+        if (m->n_sum_notices == m->cap_sum_notices) {
+            size_t nc = m->cap_sum_notices ? m->cap_sum_notices * 2 : 8;
+            oc_summary_notice *nv = realloc(m->sum_notices, nc * sizeof *nv);
+            if (!nv) break;
+            m->sum_notices = nv;
+            m->cap_sum_notices = nc;
+        }
+        oc_summary_notice *n = &m->sum_notices[m->n_sum_notices++];
+        memset(n, 0, sizeof *n);
+        n->id = e->summary_id;
+        n->channel_id = e->channel_id;
+        n->start_ms = e->span_start;
+        n->end_ms = e->span_end;
+        n->made_at_ms = e->made_at;
+        n->scope = e->sum_scope;
+        n->status = (uint8_t)e->status;
+        break;
+    }
+    case OC_EV_SUMMARY_QUEUED:
+        if (m->summary_open && m->summary_loading && e->req_id == m->summary_req)
+            m->summary_position = (int32_t)e->count;
+        break;
+    case OC_EV_PINS_END:
+        if (m->pinlist_open && m->pinlist_channel == e->channel_id)
+            m->pinlist_loading = 0;
+        break;
+    case OC_EV_REACTION: {
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (c) {
+            for (size_t i = 0; i < c->n_msgs; i++) {
+                if (c->msgs[i].message_id == e->message_id) {
+                    msg_apply_reaction(&c->msgs[i], e->emoji, e->count, e->op,
+                                       e->user_id == m->user_id);
+                    break;
+                }
+            }
+        }
+        break;
+    }
+    case OC_EV_ACTION: {
+        /* An action on its own frame (REQ-058): a replay's, or one for a
+         * message the net thread was not holding. Applied wherever the message
+         * is -- the channel's list and an open thread -- and, when it is the
+         * channel's newest, to the preview the sidebar reads. */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        for (size_t i = 0; c && i < c->n_msgs; i++)
+            if (c->msgs[i].message_id == e->message_id) {
+                oc_msg *msg = &c->msgs[i];
+                msg_set_action(msg, e);
+                if (i + 1 == c->n_msgs && msg->body && c->preview_author == msg->author_id) {
+                    snprintf(c->preview, sizeof c->preview, "%s",
+                             msg->action.present ? msg->body + msg->action.start : msg->body);
+                    c->preview_action = msg->action.present;
+                }
+                break;
+            }
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id) { msg_set_action(&m->thread_msgs[i], e); break; }
+        break;
+    }
+    case OC_EV_FORWARD: {
+        /* What a forwarded message points at (REQ-057). Replace rather than
+         * append: a message forwards exactly one thing, so the replay after a
+         * reconnect must overwrite what the live frame already set rather than
+         * accumulate a second copy of it. */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (!c) break;
+        oc_msg *msg = NULL;
+        for (size_t i = 0; i < c->n_msgs; i++)
+            if (c->msgs[i].message_id == e->message_id) { msg = &c->msgs[i]; break; }
+        if (!msg || msg->deleted) break;
+        if (!msg->forward) {
+            msg->forward = calloc(1, sizeof *msg->forward);
+            if (!msg->forward) break;
+        }
+        free(msg->forward->excerpt);
+        free(msg->forward->attach_name);
+        msg->forward->attach_name = strdup(e->src_attach_name);
+        msg->forward->src_channel = e->src_channel;
+        msg->forward->src_message = e->src_message;
+        msg->forward->src_author  = e->author_id;
+        msg->forward->n_attach    = e->src_n_attach;
+        msg->forward->src_action  = e->action;   /* REQ-058 */
+        msg->forward->excerpt     = e->body;   /* steal, like an edit does */
+        e->body = NULL;
+        break;
+    }
+    case OC_EV_UNFURL: {
+        /* Upsert by url: a re-fetch (after an edit re-added the address, or a
+         * replay after reconnect) replaces rather than duplicates (REQ-222). */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (!c || !e->body || !e->topic) break;
+        oc_msg *msg = NULL;
+        for (size_t i = 0; i < c->n_msgs; i++)
+            if (c->msgs[i].message_id == e->message_id) { msg = &c->msgs[i]; break; }
+        if (!msg || msg->deleted) break;
+        oc_msg_unfurl *slot = NULL;
+        for (uint8_t i = 0; i < msg->n_unfurls; i++)
+            if (strcmp(msg->unfurls[i].url, e->body) == 0) { slot = &msg->unfurls[i]; break; }
+        if (!slot) {
+            if (msg->n_unfurls >= 3) break;   /* the daemon caps at 3 per message */
+            if (msg->n_unfurls == msg->cap_unfurls) {
+                uint8_t cap = msg->cap_unfurls ? (uint8_t)(msg->cap_unfurls * 2) : 2;
+                oc_msg_unfurl *g = realloc(msg->unfurls, cap * sizeof *g);
+                if (!g) break;
+                msg->unfurls = g;
+                msg->cap_unfurls = cap;
+            }
+            slot = &msg->unfurls[msg->n_unfurls++];
+            memset(slot, 0, sizeof *slot);
+        }
+        free(slot->url); free(slot->title); free(slot->descr);
+        slot->url   = e->body;    e->body = NULL;     /* steal, like an edit does */
+        slot->title = e->topic;   e->topic = NULL;
+        slot->descr = e->preview; e->preview = NULL;
+        break;
+    }
+    case OC_EV_EDIT: {
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (c) {
+            for (size_t i = 0; i < c->n_msgs; i++) {
+                if (c->msgs[i].message_id == e->message_id) {
+                    free(c->msgs[i].body);
+                    c->msgs[i].body = e->body;   /* steal the new text */
+                    e->body = NULL;
+                    c->msgs[i].edited = 1;
+                    /* The previews described the OLD body; the daemon dropped
+                     * its rows and re-fetches, so the model matches (REQ-222). */
+                    msg_clear_unfurls(&c->msgs[i]);
+                    /* And the action it may now be, or no longer is (REQ-058). */
+                    msg_set_action(&c->msgs[i], e);
+                    break;
+                }
+            }
+        }
+        break;
+    }
+    case OC_EV_DELETE: {
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (c) {
+            for (size_t i = 0; i < c->n_msgs; i++) {
+                if (c->msgs[i].message_id == e->message_id) { msg_tombstone(&c->msgs[i]); break; }
+            }
+        }
+        /* A deleted thread reply lives in the open thread, not the channel list
+         * — the same omission that hid a pinned reply (the same lesson, twice). */
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id) {
+                msg_tombstone(&m->thread_msgs[i]);
+                break;
+            }
+        break;
+    }
+    case OC_EV_RESTORE: {
+        /* Back over its tombstone, in both lists it may be in; its files follow
+         * as ATTACH events and fold on as for any message. */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        for (size_t i = 0; c && i < c->n_msgs; i++)
+            if (c->msgs[i].message_id == e->message_id) {
+                msg_untombstone(&c->msgs[i], e->body);
+                msg_set_action(&c->msgs[i], e);   /* back with its body (REQ-058) */
+                break;
+            }
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id) {
+                msg_untombstone(&m->thread_msgs[i], e->body);
+                msg_set_action(&m->thread_msgs[i], e);
+                break;
+            }
+        break;
+    }
+    case OC_EV_THREAD_REPLY:
+        bump_reply_count(m, e->parent_id, e->count);   /* mark the parent in scroll */
+        /* Worth interrupting for? Only if the daemon says this thread is one of
+         * mine (REQ-061), only if I did not write it, and only if this is news
+         * rather than the history I just asked for — a replay's frames are
+         * these same frames, and its participation byte is just as true. */
+        if (e->participant && e->author_id != m->user_id && !m->thread_replay) {
+            notice_push(m, e);
+            /* The Threads view's unread is server-supplied and refreshed only by
+             * a list (REQ-062), so move it here too: the badge should follow the
+             * toast, not wait for the next LIST_THREADS. */
+            for (size_t i = 0; i < m->n_threads; i++)
+                if (m->threads[i].root_id == e->parent_id) { m->threads[i].unread++; break; }
+        }
+        if (m->thread_open && e->parent_id == m->thread_parent) {
+            size_t before = m->n_thread_msgs;
+            thread_append(m, e->message_id, e->author_id, e->server_time, &e->body);
+            if (m->n_thread_msgs > before) msg_set_action(&m->thread_msgs[m->n_thread_msgs - 1], e);
+        }
+        break;
+    case OC_EV_THREAD_END:
+        /* The replay is done; anything arriving from here is live. */
+        if (e->parent_id == m->thread_parent) m->thread_replay = 0;
+        break;
+    case OC_EV_THREAD_META:
+        bump_reply_count(m, e->message_id, e->count);
+        break;
+    case OC_EV_SEARCH_RESULT:
+        if (m->search_open) {
+            search_append(m, e->message_id, e->channel_id, e->author_id, e->server_time, e->action, &e->body);
+            if (e->status) m->search_truncated = 1;
+        }
+        break;
+    case OC_EV_REACTIONS:
+        if (m->reactlist_open && e->message_id == m->reactlist_message)
+            reactor_append(m, e->user_id, e->emoji);
+        break;
+    case OC_EV_DND:
+        /* A NOTIFY_PREFS frame's header: it always precedes the per-channel
+         * entries, so treat it as the sync boundary and reset every channel to
+         * the default level; the following OC_EV_NOTIFY_PREF events set the
+         * non-default ones. Works for both solicited and pushed syncs. */
+        m->notify_default = e->op;                 /* REQ-134 */
+        for (size_t i = 0; i < m->n_channels; i++)
+            m->channels[i].notify_level = m->notify_default;
+        /* The DND window left this frame with REQ-136: the schedule arrives in
+         * its own OC_EV_SCHEDULE, right behind this one. */
+        break;
+    case OC_EV_NOTIFY_PREF: {
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (c) { c->notify_level = e->op; c->muted = e->status; }
+        break;
+    }
+    case OC_EV_GROUP:
+        group_upsert(m, e);
+        break;
+    case OC_EV_GROUP_DELETED:
+        group_drop(m, e->message_id);
+        break;
+    case OC_EV_GROUPS_END:
+        /* A list is the whole truth: a group it did not mention was deleted
+         * while this client was away. */
+        for (size_t i = 0; i < m->n_groups; )
+            if (m->group_gen[i] != m->groups_gen) group_drop(m, m->groups[i]->id);
+            else i++;
+        m->groups_gen++;
+        break;
+    case OC_EV_CHANNEL_VIA_GROUP:
+        if (e->channel_id != m->chanmem_channel) break;   /* a list since replaced */
+        free(m->chanmem_via);
+        m->chanmem_via = e->ids;
+        m->n_chanmem_via = e->n_ids;
+        e->ids = NULL;
+        break;
+    case OC_EV_MENTION_UNRESOLVED_MORE:
+        if (e->message_id != m->unresolved.message_id) break;
+        m->unresolved.total = (uint16_t)e->count;
+        m->unresolved.total_seq++;
+        break;
+    case OC_EV_CHANNEL_GROUPS: {
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (!c) break;
+        c->n_groups = e->n_groups > OC_MAX_CHANNEL_GROUPS ? OC_MAX_CHANNEL_GROUPS : e->n_groups;
+        memcpy(c->groups, e->groups, c->n_groups * sizeof c->groups[0]);
+        break;
+    }
+    case OC_EV_EMOJI_BEGIN:
+        m->n_cemoji = 0;                      /* the server's catalogue is the truth */
+        break;
+    case OC_EV_EMOJI: {
+        if (m->n_cemoji == m->cap_cemoji) {
+            size_t cap = m->cap_cemoji ? m->cap_cemoji * 2 : 32;
+            oc_custom_emoji *ne = realloc(m->cemoji, cap * sizeof *ne);
+            if (!ne) break;
+            m->cemoji = ne; m->cap_cemoji = cap;
+        }
+        oc_custom_emoji *ce = &m->cemoji[m->n_cemoji++];
+        memset(ce, 0, sizeof *ce);
+        snprintf(ce->name, sizeof ce->name, "%s", e->body ? e->body : "");
+        ce->attachment_id = e->message_id;
+        ce->created_by = e->user_id;
+        break;
+    }
+    case OC_EV_SETTINGS_BEGIN:
+        /* A CLIENT_SETTINGS frame start (solicited or a device-sync push): the
+         * snapshot replaces the bucket wholesale, so clear it before the entries. */
+        m->n_settings = 0;
+        m->settings_synced = 1;
+        break;
+    case OC_EV_SETTING:
+        setting_upsert(m, e->author_name, e->body ? e->body : "");
+        break;
+    case OC_EV_DRAFT:
+        draft_apply(m, e->channel_id, e->message_id, e->server_time, e->body, e->topic);
+        break;
+    case OC_EV_THREAD_SUMMARY:
+        thread_apply(m, e);
+        break;
+    case OC_EV_THREADS_END:
+        m->threads_loading = 0;
+        for (size_t i = m->n_threads; i-- > 0; )
+            if (m->threads[i].gen != m->thread_gen) {
+                free(m->threads[i].preview);
+                m->threads[i] = m->threads[--m->n_threads];
+            }
+        break;
+    case OC_EV_SCHEDULED:
+        sched_apply(m, e->message_id, e->channel_id, e->server_time, e->op,
+                    e->body, e->author_name);
+        break;
+    case OC_EV_SCHEDULED_END:
+        for (size_t i = m->n_scheds; i-- > 0; )
+            if (m->scheds[i].gen != m->sched_gen) {
+                free(m->scheds[i].body);
+                m->scheds[i] = m->scheds[--m->n_scheds];
+            }
+        break;
+    case OC_EV_DRAFTS_END:
+        /* Everything the server just listed carries the current generation.
+         * Anything older is a draft it did not mention — deleted elsewhere,
+         * possibly while this client was not connected — so it goes. */
+        for (size_t i = m->n_drafts; i-- > 0; )
+            if (m->drafts[i].gen != m->draft_gen) {
+                free(m->drafts[i].body);
+                free(m->drafts[i].recipients);
+                m->drafts[i] = m->drafts[--m->n_drafts];
+            }
+        break;
+    case OC_EV_AUDIT_BEGIN:
+        m->n_audit = 0;              /* a page replaces whatever was shown */
+        break;
+    case OC_EV_AUDIT:
+        if (m->n_audit == m->cap_audit) {
+            size_t nc = m->cap_audit ? m->cap_audit * 2 : 64;
+            oc_audit_view *na = realloc(m->audit, nc * sizeof *na);
+            if (!na) break;
+            m->audit = na; m->cap_audit = nc;
+        }
+        m->audit[m->n_audit++] = e->audit;
+        break;
+    case OC_EV_SRVALERTS:
+        m->srvalerts_have = 1;
+        m->srvalerts_unacked = e->count;
+        m->srvalerts_current = e->srvalert_current;
+        m->srvalerts_seq++;
+        break;
+    case OC_EV_SRVALERT_BEGIN:
+        m->n_srvalerts = 0;          /* an answer replaces the list */
+        m->srvalerts_seq++;
+        break;
+    case OC_EV_SRVALERT:
+        if (!e->srvalert) break;
+        if (m->n_srvalerts == m->cap_srvalerts) {
+            size_t nc = m->cap_srvalerts ? m->cap_srvalerts * 2 : 16;
+            oc_srvalert_view *na = realloc(m->srvalerts, nc * sizeof *na);
+            if (!na) break;
+            m->srvalerts = na; m->cap_srvalerts = nc;
+        }
+        m->srvalerts[m->n_srvalerts++] = *e->srvalert;
+        m->srvalerts_seq++;
+        break;
+    case OC_EV_STORAGE:
+        m->storage = e->storage;
+        m->storage_have = 1;
+        set_status(m, "storage report updated");
+        break;
+    case OC_EV_PROFILE:
+        /* A display-name change (REQ-020): update the roster entry's name in place
+         * (role/disabled untouched). For our own id it doubles as the change ack. */
+        for (size_t i = 0; i < m->n_users; i++)
+            if (m->users[i].user_id == e->user_id) {
+                snprintf(m->users[i].name, sizeof m->users[i].name, "%s", e->body ? e->body : "");
+                break;
+            }
+        if (e->user_id == m->user_id) set_status(m, "profile updated");
+        break;
+    case OC_EV_READ_CURSOR: {
+        /* Seen-by (REQ-090): a member read `channel_id` up to `message_id`. Our
+         * own name on it is the daemon moving THIS user's position (REQ-235, mark
+         * unread, from this device or another): it goes where it says, backwards
+         * included, and the count follows. */
+        if (e->user_id == m->user_id) { oc_model_set_read_marker(m, e->channel_id, e->message_id); break; }
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (c) reader_advance(c, e->user_id, e->message_id);
+        break;
+    }
+    case OC_EV_USER_UPDATED: {
+        user_update_role(m, e->user_id, e->status, e->op);
+        const char *nm = oc_model_user_name(m, e->user_id);
+        const char *what = e->op ? "removed"
+                         : e->status == OC_ROLE_OWNER ? "now owner"
+                         : e->status == OC_ROLE_ADMIN ? "now admin" : "now member";
+        char buf[160];
+        snprintf(buf, sizeof buf, "%s %s", nm[0] ? nm : "user", what);
+        set_status(m, buf);
+        break;
+    }
+    case OC_EV_CREDENTIAL_RESET:
+        m->reset_user_id = e->user_id;
+        snprintf(m->reset_token, sizeof m->reset_token, "%s", e->body ? e->body : "");
+        break;
+    case OC_EV_INVITE:
+        snprintf(m->invite_token, sizeof m->invite_token, "%s", e->body ? e->body : "");
+        m->invite_role = e->op;
+        m->invite_expires = e->server_time;
+        m->invite_uses = e->uses;
+        /* INVITE_CREATED answers the invite asked for last; one bound to an
+         * address comes back with a token of zeros, which is nothing to share. */
+        snprintf(m->invite_email, sizeof m->invite_email, "%s", m->invite_asked_email);
+        m->invite_asked_email[0] = '\0';
+        {
+            char buf[sizeof m->status];
+            if (m->invite_email[0])
+                snprintf(buf, sizeof buf, "invitation for %.100s (%s) created", m->invite_email,
+                         e->op == OC_ROLE_ADMIN ? "admin" : "member");
+            else
+                snprintf(buf, sizeof buf, "invite (%s): %s",
+                         e->op == OC_ROLE_ADMIN ? "admin" : "member", m->invite_token);
+            set_status(m, buf);
+        }
+        break;
+    case OC_EV_SIGNIN_SOURCES:
+        m->signin_kinds = e->count;
+        set_signin_provider(m, e->body);
+        break;
+    case OC_EV_WORKSPACE_MOVED:
+        /* Formatted straight into the status line, which is the one bound that
+         * matters: a larger scratch buffer copied into it only moves the cut. */
+        if (e->body)
+            snprintf(m->status, sizeof m->status, "This workspace has moved to %s; it is used from now on.", e->body);
+        break;
+    case OC_EV_USER:
+        user_upsert(m, e->user_id, e->body ? e->body : "", e->status, e->op, e->message_id);
+        /* The roster carries the profile fields now (REQ-289), so every surface
+         * that shows a person can show them — the profile card included, which
+         * used to say they "are not built" because only PROFILE_INFO had them and
+         * it never left the person who edited them. */
+        for (size_t i = 0; i < m->n_users; i++)
+            if (m->users[i].user_id == e->user_id) {
+                snprintf(m->users[i].title, sizeof m->users[i].title, "%s", e->pf_title);
+                snprintf(m->users[i].timezone, sizeof m->users[i].timezone, "%s", e->pf_tz);
+                snprintf(m->users[i].status_emoji, sizeof m->users[i].status_emoji, "%s", e->emoji);
+                snprintf(m->users[i].status_text, sizeof m->users[i].status_text, "%s", e->author_name);
+                snprintf(m->users[i].full_name, sizeof m->users[i].full_name, "%s", e->pf_full_name);
+                snprintf(m->users[i].pronouns, sizeof m->users[i].pronouns, "%s", e->pf_pronouns);
+                snprintf(m->users[i].voice_id, sizeof m->users[i].voice_id, "%s", e->pf_voice);
+                break;
+            }
+        break;
+    case OC_EV_WEBHOOK_INFO:
+        /* A freshly-minted webhook: the token is shown once. Record it and, if the
+         * list overlay is open for this channel, add the new row (label unknown
+         * until the next list refresh). */
+        snprintf(m->webhook_token, sizeof m->webhook_token, "%s", e->body ? e->body : "");
+        m->webhook_new_id = e->message_id;
+        if (m->weblist_open && e->channel_id == m->weblist_channel)
+            webhook_upsert(m, e->message_id, "", 0);
+        {
+            char buf[160];
+            snprintf(buf, sizeof buf, "webhook #%llu token: %s",
+                     (unsigned long long)e->message_id, m->webhook_token);
+            set_status(m, buf);
+        }
+        break;
+    case OC_EV_WEBHOOK:
+        if (m->weblist_open && e->channel_id == m->weblist_channel)
+            webhook_upsert(m, e->message_id, e->body ? e->body : "", e->op);
+        break;
+    case OC_EV_WEBHOOK_DELETED:
+        webhook_remove(m, e->message_id);
+        if (m->webhook_new_id == e->message_id) { m->webhook_token[0] = '\0'; m->webhook_new_id = 0; }
+        set_status(m, "webhook deleted");
+        break;
+    case OC_EV_ATTACHMENT_DATA:
+        /* Held until a frontend takes it. Full means nobody is taking them, and
+         * then the oldest goes: a frontend asks again for what it still wants. */
+        if (m->n_fetched == sizeof m->fetched / sizeof m->fetched[0]) {
+            free(m->fetched[0].data);
+            memmove(m->fetched, m->fetched + 1, (m->n_fetched - 1) * sizeof m->fetched[0]);
+            m->n_fetched--;
+        }
+        m->fetched[m->n_fetched].id = e->message_id;
+        m->fetched[m->n_fetched].data = (uint8_t *)e->body;
+        m->fetched[m->n_fetched].len = e->count;
+        m->n_fetched++;
+        e->body = NULL;                      /* the model owns the bytes now */
+        break;
+    case OC_EV_ATTACHMENT:
+        /* parent_id = attachment id, server_time = size, body = filename,
+         * author_name = mime, media_* for a video message. Arrives right after
+         * its OC_EV_MESSAGE. */
+        attach_to_msg(m, e);
+        break;
+    case OC_EV_XFER:
+        if (e->body) set_status(m, e->body);
+        m->xfer_tag = e->xfer_tag;
+        m->xfer_done = e->xfer_done;
+        m->xfer_total = e->xfer_total;
+        m->xfer_phase = e->op;
+        note_xfer(m, e);
+        break;
+    case OC_EV_MEDIA_POSTED:
+        m->media_posted_tag = e->xfer_tag;
+        break;
+    case OC_EV_READ_STATE:
+        /* Cached history restored at startup is not "new": mark it read so a
+         * relaunch doesn't show every replayed message as unread. Genuinely new
+         * messages (backfilled past this mark) still count. */
+        oc_model_mark_read(m, e->channel_id);
+        break;
+    case OC_EV_BACKOFF:
+        m->reconnect_at_ms = e->server_time;
+        break;
+    case OC_EV_DISCONNECTED:
+        m->connected = false;
+        m->authed = false;
+        set_status(m, "disconnected");
+        /* The daemon tells a new connection every call there is; what was
+         * listed here may have ended meanwhile. */
+        m->n_calls = 0;
+        m->call_pending = 0;
+        /* The daemon drops a closed connection's waiting summary: it is asked
+         * for again once signed in (oc_client_tick), and waits from the start. */
+        if (m->summary_open && m->summary_loading) {
+            m->summary_resend = 1;
+            m->summary_position = -1;
+        }
+        break;
+    case OC_EV_CALL_STATE:
+        if (e->call) call_state_fold(m, e->call);
+        if (e->call && m->in_call && m->call.call_id == e->call->call_id && !e->call->ended) {
+            m->call.starter = e->call->starter;
+            m->call.started_at = e->call->started_at;
+            m->call.n_invited = e->call->n_invited;
+            m->call.sharer = e->call->sharer;
+            memcpy(m->call.invited, e->call->invited, e->call->n_invited * sizeof e->call->invited[0]);
+        }
+        break;
+    case OC_EV_CALL_JOINED:
+        if (!e->call) break;
+        if (m->call_rejoining) {
+            if (m->call_rejoining == e->call->channel_id) m->call_back_seq++;
+            m->call_rejoining = 0;
+        }
+        m->in_call = 1;
+        m->call = *e->call;
+        if (m->call_pending == e->call->channel_id) m->call_pending = 0;
+        break;
+    case OC_EV_CALL_REJOINING:
+        /* Out, for now: the view of the call is kept, to say what is coming back. */
+        m->in_call = 0;
+        m->call_rejoining = e->channel_id;
+        break;
+    case OC_EV_CALL_LOST:
+        if (m->call_rejoining == e->channel_id) {
+            m->call_rejoining = 0;
+            memset(&m->call, 0, sizeof m->call);
+            m->call_lost_seq++;
+        }
+        break;
+    case OC_EV_CALL_ROSTER:
+        if (!e->call || !m->in_call || e->call->call_id != m->call.call_id) break;
+        m->call.epoch = e->call->epoch;
+        m->call.n_parts = e->call->n_parts;
+        memcpy(m->call.parts, e->call->parts, e->call->n_parts * sizeof e->call->parts[0]);
+        memcpy(m->call.slots, e->call->slots, e->call->n_parts * sizeof e->call->slots[0]);
+        memcpy(m->call.away, e->call->away, e->call->n_parts * sizeof e->call->away[0]);
+        break;
+    case OC_EV_CALL_LEFT:
+        if ((m->in_call || m->call_rejoining) && m->call.channel_id == e->channel_id) {
+            m->in_call = 0;
+            m->call_rejoining = 0;
+            memset(&m->call, 0, sizeof m->call);
+        }
+        break;
+    case OC_EV_CALL_ERROR:
+        m->call_pending = 0;
+        m->call_error = (uint16_t)e->size;
+        m->call_error_seq++;
+        break;
+    case OC_EV_MENTION_UNRESOLVED:
+        /* REQ-287. Stored rather than shown: the model does not know what a
+         * notice looks like, and the remedy differs per frontend (a confirmation
+         * in the GUI, a line in the TUI). `seq` bumps per occurrence for the same
+         * reason error_seq does — naming the same absent colleague in a second
+         * message must not be swallowed as a repeat of the first. */
+        m->unresolved.channel_id = e->channel_id;
+        m->unresolved.message_id = e->message_id;
+        m->unresolved.total      = 0;
+        m->unresolved.can_add    = (uint8_t)(e->status & 1);
+        m->unresolved.is_private = (uint8_t)((e->status & 2) ? 1 : 0);
+        m->unresolved.n_peers    = e->n_peers > 9 ? 9 : e->n_peers;
+        for (uint16_t i = 0; i < m->unresolved.n_peers; i++)
+            m->unresolved.peers[i] = e->peers[i];
+        snprintf(m->unresolved.names, sizeof m->unresolved.names, "%s",
+                 e->body ? e->body : "");
+        m->unresolved.seq++;
+        break;
+    case OC_EV_SIGNED_OUT:
+        m->signed_out = true;
+        m->authed = false;
+        break;
+    case OC_EV_CERT_UNTRUSTED:
+        if (e->body && strlen(e->body) < sizeof m->cert_fp) {
+            snprintf(m->cert_fp, sizeof m->cert_fp, "%s", e->body);
+            m->cert_der_len = e->der && e->der_len <= sizeof m->cert_der ? e->der_len : 0;
+            if (m->cert_der_len) memcpy(m->cert_der, e->der, m->cert_der_len);
+            m->cert_changed = e->status != 0;
+            m->cert_seq++;
+        }
+        break;
+    case OC_EV_AUTH_BROWSER:
+        if (e->body && strlen(e->body) < sizeof m->signin_url) {
+            snprintf(m->signin_url, sizeof m->signin_url, "%s", e->body);
+            m->signin_seq++;
+            set_status(m, "Waiting for your browser…");
+        }
+        break;
+    case OC_EV_AUTH_DEVICE:
+        if (e->body && strlen(e->body) < sizeof m->device_url && e->topic && strlen(e->topic) < sizeof m->device_code) {
+            snprintf(m->device_url, sizeof m->device_url, "%s", e->body);
+            snprintf(m->device_code, sizeof m->device_code, "%s", e->topic);
+            snprintf(m->device_fp, sizeof m->device_fp, "%s", e->preview && strlen(e->preview) == 64 ? e->preview : "");
+            m->device_expires_ms = oc_model_now_ms() + (uint64_t)e->count * 1000u;
+            m->device_seq++;
+            set_status(m, "Waiting for the code to be entered…");
+        }
+        break;
+    case OC_EV_ERROR:
+        m->signin_url[0] = '\0';
+        m->device_url[0] = m->device_code[0] = m->device_fp[0] = '\0';
+        if (e->body) {
+            set_status(m, e->body);
+            snprintf(m->last_error, sizeof m->last_error, "%s", e->body);
+            m->error_seq++;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* ---- the sidebar (6, see model.h) ------------------------------------ */
+
+void oc_sidebar_opts_defaults(oc_sidebar_opts *o) {
+    memset(o, 0, sizeof *o);
+    for (int i = 0; i < OC_SB_SECTIONS; i++) {
+        o->sort[i] = OC_SB_SORT_AZ;
+        o->filter[i] = OC_SB_FILTER_ALL;
+        o->collapsed[i] = 0;
+    }
+}
+
+void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap) {
+    /* Appended, not inserted: an older client parses the "c:...;d:..." prefix with
+     * sscanf and ignores the rest, so it keeps working against a bucket written by
+     * this one. The starred section's own sort/filter/collapsed ride the same
+     * scheme once anyone needs them; today only its collapse matters and it
+     * defaults open. */
+    int used = snprintf(out, cap, "c:%u,%u,%u;d:%u,%u,%u",
+             o->sort[OC_SB_CHANNELS], o->filter[OC_SB_CHANNELS], o->collapsed[OC_SB_CHANNELS],
+             o->sort[OC_SB_DMS],      o->filter[OC_SB_DMS],      o->collapsed[OC_SB_DMS]);
+    if (used < 0 || (size_t)used >= cap) return;
+    if (o->n_starred) {
+        size_t at = (size_t)used;
+        at += (size_t)snprintf(out + at, cap - at, ";s:");
+        for (uint8_t i = 0; i < o->n_starred && at + 24 < cap; i++)
+            at += (size_t)snprintf(out + at, cap - at, "%s%llu", i ? "," : "",
+                                   (unsigned long long)o->starred[i]);
+    }
+    if ((size_t)used < cap) {
+        size_t at2 = strlen(out);
+        if (at2 + 8 < cap) snprintf(out + at2, cap - at2, ";sc:%u", o->collapsed[OC_SB_STARRED]);
+    }
+    /* Before the custom-section runs, whose names are free text: a ";ro:" inside a
+     * name must not be mistaken for this key, so the parser reads it from the part
+     * of the string ahead of the first ";u:". */
+    if (o->unreads_only) {
+        size_t at3 = strlen(out);
+        if (at3 + 8 < cap) snprintf(out + at3, cap - at3, ";ro:1");
+    }
+    /* Custom sections, one ";u:" run each: name|sort,filter,collapsed|ids.
+     * Appended for the same reason as everything above — an older client parses the
+     * prefix it knows and ignores this. */
+    for (int i = 0; i < o->n_custom; i++) {
+        size_t at = strlen(out);
+        if (at + strlen(o->custom[i].name) + 24 >= cap) break;
+        at += (size_t)snprintf(out + at, cap - at, ";u:%s|%u,%u,%u|", o->custom[i].name,
+                               o->custom[i].sort, o->custom[i].filter, o->custom[i].collapsed);
+        for (uint8_t k = 0; k < o->custom[i].n_ids && at + 24 < cap; k++)
+            at += (size_t)snprintf(out + at, cap - at, "%s%llu", k ? "," : "",
+                                   (unsigned long long)o->custom[i].ids[k]);
+    }
+}
+
+void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s) {
+    unsigned cs, cf, cc, ds, df, dc;
+    if (!s || !*s) return;
+    if (sscanf(s, "c:%u,%u,%u;d:%u,%u,%u", &cs, &cf, &cc, &ds, &df, &dc) != 6) return;
+    /* The starred list and its collapse are optional suffixes, so a bucket written
+     * by an older client parses fine and simply has none. */
+    o->n_starred = 0;
+    const char *sp = strstr(s, ";s:");
+    if (sp) {
+        sp += 3;
+        while (*sp && o->n_starred < OC_SB_STARRED_MAX) {
+            char *end = NULL;
+            unsigned long long v = strtoull(sp, &end, 10);
+            if (!end || end == sp) break;
+            if (v) o->starred[o->n_starred++] = (uint64_t)v;
+            if (*end != ',') break;
+            sp = end + 1;
+        }
+    }
+    const char *cp = strstr(s, ";sc:");
+    if (cp) o->collapsed[OC_SB_STARRED] = (uint8_t)(atoi(cp + 4) ? 1 : 0);
+    {   /* Unreads only, looked for only AHEAD of the custom sections (see encode). */
+        const char *ro = strstr(s, ";ro:"), *u0 = strstr(s, ";u:");
+        o->unreads_only = (uint8_t)(ro && (!u0 || ro < u0) && atoi(ro + 4) ? 1 : 0);
+    }
+    /* Custom sections. Parsed positionally within each ";u:" run; a malformed run is
+     * skipped rather than aborting the whole setting, so one bad section cannot cost
+     * the user their sort and filter choices as well. */
+    o->n_custom = 0;
+    for (const char *up = strstr(s, ";u:"); up; up = strstr(up, ";u:")) {
+        up += 3;
+        if (o->n_custom >= OC_SB_CUSTOM_MAX) break;
+        const char *bar = strchr(up, '|');
+        if (!bar) break;
+        int ci = o->n_custom;
+        memset(&o->custom[ci], 0, sizeof o->custom[ci]);
+        size_t nl = (size_t)(bar - up);
+        if (nl >= sizeof o->custom[ci].name) nl = sizeof o->custom[ci].name - 1;
+        memcpy(o->custom[ci].name, up, nl);
+        o->custom[ci].name[nl] = '\0';
+        unsigned cso = 0, cfl = 0, ccl = 0;
+        if (sscanf(bar + 1, "%u,%u,%u", &cso, &cfl, &ccl) != 3) { up = bar + 1; continue; }
+        o->custom[ci].sort      = (uint8_t)(cso <= OC_SB_SORT_UNREAD ? cso : OC_SB_SORT_AZ);
+        o->custom[ci].filter    = (uint8_t)(cfl <= OC_SB_FILTER_ACTIVE ? cfl : OC_SB_FILTER_ALL);
+        o->custom[ci].collapsed = (uint8_t)(ccl ? 1 : 0);
+        const char *ids = strchr(bar + 1, '|');
+        if (ids) {
+            ids++;
+            while (*ids && *ids != ';' && o->custom[ci].n_ids < OC_SB_CUSTOM_IDS) {
+                char *end = NULL;
+                unsigned long long v = strtoull(ids, &end, 10);
+                if (!end || end == ids) break;
+                if (v) o->custom[ci].ids[o->custom[ci].n_ids++] = (uint64_t)v;
+                if (*end != ',') break;
+                ids = end + 1;
+            }
+        }
+        if (o->custom[ci].name[0]) o->n_custom++;
+        up = bar + 1;
+    }
+    /* Clamp: a bucket value can come from a newer client that knows more modes. */
+    o->sort[OC_SB_CHANNELS]      = (uint8_t)(cs <= OC_SB_SORT_UNREAD ? cs : OC_SB_SORT_AZ);
+    o->filter[OC_SB_CHANNELS]    = (uint8_t)(cf <= OC_SB_FILTER_ACTIVE ? cf : OC_SB_FILTER_ALL);
+    o->collapsed[OC_SB_CHANNELS] = (uint8_t)(cc ? 1 : 0);
+    o->sort[OC_SB_DMS]           = (uint8_t)(ds <= OC_SB_SORT_UNREAD ? ds : OC_SB_SORT_AZ);
+    o->filter[OC_SB_DMS]         = (uint8_t)(df <= OC_SB_FILTER_ACTIVE ? df : OC_SB_FILTER_ALL);
+    o->collapsed[OC_SB_DMS]      = (uint8_t)(dc ? 1 : 0);
+}
+
+/* Render a channel's sidebar label. A DM has no name on the wire, so it is
+ * titled by its peer — which is exactly why the old Win32 sidebar, which skipped
+ * unnamed channels, showed no DMs at all. */
+static void sb_label(const oc_model *m, const oc_channel *c, char *out, size_t cap) {
+    /* A GROUP DM is titled by its people (REQ-056), the way Slack does it: names
+     * rather than a made-up name, because nobody named it. EVERY participant is
+     * listed, yourself included: the title states who is in the conversation, and
+     * a roster that silently omits the reader disagrees with the member pane and
+     * with the participant count beside it. Alphabetical, so the same group reads
+     * the same way in every client and does not reshuffle when somebody posts. */
+    if (c->kind == OC_CHANNEL_KIND_DM && c->n_peers > 2) {
+        const char *names[9]; int nn = 0;
+        for (uint16_t i = 0; i < c->n_peers && nn < 9; i++) {
+            const char *nm = oc_model_user_name(m, c->peers[i]);
+            names[nn++] = (nm && nm[0]) ? nm : "someone";
+        }
+        for (int a = 0; a < nn; a++)
+            for (int b = a + 1; b < nn; b++)
+                if (strcmp(names[b], names[a]) < 0) { const char *t = names[a]; names[a] = names[b]; names[b] = t; }
+        size_t at = 0;
+        int shown = 0;
+        for (int i = 0; i < nn; i++) {
+            size_t need = strlen(names[i]) + (at ? 2 : 0);
+            /* Leave room for ", +N" rather than truncating a name mid-word: a
+             * half-written name reads as a different person. */
+            if (at && at + need + 6 >= cap) break;
+            at += (size_t)snprintf(out + at, cap - at, "%s%s", at ? ", " : "", names[i]);
+            shown++;
+        }
+        if (shown < nn && at + 8 < cap) snprintf(out + at, cap - at, ", +%d", nn - shown);
+        if (!at) snprintf(out, cap, "group message");
+        return;
+    }
+    if (c->kind == OC_CHANNEL_KIND_DM) {
+        /* Always the account name, never "you": a self-DM's peer_id IS the user's
+         * own id, so the ordinary lookup already yields the right name and the
+         * special case only served to hide it. */
+        const char *pn = oc_model_user_name(m, c->peer_id);
+        snprintf(out, cap, "%s", (pn && pn[0]) ? pn : "direct message");
+    } else {
+        snprintf(out, cap, "%s", (c->name && c->name[0]) ? c->name : "channel");
+    }
+}
+
+static void sb_lower(const char *in, char *out, size_t cap) {
+    size_t i = 0;
+    for (; in[i] && i < cap - 1; i++)
+        out[i] = (char)(in[i] >= 'A' && in[i] <= 'Z' ? in[i] + 32 : in[i]);
+    out[i] = '\0';
+}
+
+/* Sorting works over (timestamp, row) pairs so Recency has the field it needs;
+ * the active mode is file-static because C99 qsort passes no context. */
+typedef struct { uint64_t at; oc_sidebar_row row; } sb_tmp;
+static uint8_t g_sb_sort;
+static int sb_cmp(const void *va, const void *vb) {
+    const sb_tmp *a = va, *b = vb;
+    if (g_sb_sort == OC_SB_SORT_RECENT) {
+        /* Newest first; a channel the server reports no activity for (0) sinks to
+         * the bottom rather than jumbling in with the rest. */
+        if (a->at != b->at) return a->at > b->at ? -1 : 1;
+    } else if (g_sb_sort == OC_SB_SORT_UNREAD) {
+        int au = a->row.unread > 0, bu = b->row.unread > 0;
+        if (au != bu) return bu - au;
+    }
+    return strcmp(a->row.label, b->row.label);   /* A-Z, and the tiebreak for both */
+}
+
+int oc_sidebar_is_starred(const oc_sidebar_opts *o, uint64_t channel_id) {
+    if (!o || !channel_id) return 0;
+    for (uint8_t i = 0; i < o->n_starred; i++)
+        if (o->starred[i] == channel_id) return 1;
+    return 0;
+}
+
+int oc_sidebar_toggle_star(oc_sidebar_opts *o, uint64_t channel_id) {
+    if (!o || !channel_id) return 0;
+    for (uint8_t i = 0; i < o->n_starred; i++)
+        if (o->starred[i] == channel_id) {
+            memmove(&o->starred[i], &o->starred[i + 1],
+                    (size_t)(o->n_starred - i - 1) * sizeof o->starred[0]);
+            o->n_starred--;
+            return 1;
+        }
+    if (o->n_starred >= OC_SB_STARRED_MAX) return 0;   /* full: refuse, do not evict */
+    o->starred[o->n_starred++] = channel_id;
+    return 1;
+}
+
+int oc_sb_custom_index(int section) {
+    if (section < OC_SB_CUSTOM_BASE) return -1;
+    int i = section - OC_SB_CUSTOM_BASE;
+    return (i < (int)OC_SB_CUSTOM_MAX) ? i : -1;
+}
+
+uint8_t oc_sb_sort_of(const oc_sidebar_opts *o, int section) {
+    if (!o) return OC_SB_SORT_AZ;
+    int ci = oc_sb_custom_index(section);
+    if (ci >= 0) return o->custom[ci].sort;
+    return (section >= 0 && section < OC_SB_SECTIONS) ? o->sort[section] : OC_SB_SORT_AZ;
+}
+uint8_t oc_sb_filter_of(const oc_sidebar_opts *o, int section) {
+    if (!o) return OC_SB_FILTER_ALL;
+    int ci = oc_sb_custom_index(section);
+    if (ci >= 0) return o->custom[ci].filter;
+    return (section >= 0 && section < OC_SB_SECTIONS) ? o->filter[section] : OC_SB_FILTER_ALL;
+}
+uint8_t oc_sb_collapsed_of(const oc_sidebar_opts *o, int section) {
+    if (!o) return 0;
+    int ci = oc_sb_custom_index(section);
+    if (ci >= 0) return o->custom[ci].collapsed;
+    return (section >= 0 && section < OC_SB_SECTIONS) ? o->collapsed[section] : 0;
+}
+void oc_sb_set_sort(oc_sidebar_opts *o, int section, uint8_t v) {
+    if (!o || v > OC_SB_SORT_UNREAD) return;
+    int ci = oc_sb_custom_index(section);
+    if (ci >= 0) { if (ci < o->n_custom) o->custom[ci].sort = v; return; }
+    if (section >= 0 && section < OC_SB_SECTIONS) o->sort[section] = v;
+}
+void oc_sb_set_filter(oc_sidebar_opts *o, int section, uint8_t v) {
+    if (!o || v > OC_SB_FILTER_ACTIVE) return;
+    int ci = oc_sb_custom_index(section);
+    if (ci >= 0) { if (ci < o->n_custom) o->custom[ci].filter = v; return; }
+    if (section >= 0 && section < OC_SB_SECTIONS) o->filter[section] = v;
+}
+void oc_sb_set_collapsed(oc_sidebar_opts *o, int section, uint8_t v) {
+    if (!o) return;
+    v = v ? 1 : 0;
+    int ci = oc_sb_custom_index(section);
+    if (ci >= 0) { if (ci < o->n_custom) o->custom[ci].collapsed = v; return; }
+    if (section >= 0 && section < OC_SB_SECTIONS) o->collapsed[section] = v;
+}
+
+/* Names round-trip through ONE flat setting string, so the separators that string
+ * uses cannot survive inside a name. Stripped rather than rejected: the user asked
+ * for a section called "Work; urgent" and should get one, not an error dialog about
+ * an encoding they cannot see. */
+static void sb_clean_name(const char *in, char *out, size_t cap) {
+    size_t n = 0;
+    for (; in && *in && n + 1 < cap; in++) {
+        unsigned char c = (unsigned char)*in;
+        if (c < 0x20 || c == ';' || c == ':' || c == ',' || c == '|') continue;
+        out[n++] = (char)c;
+    }
+    /* Trailing spaces would make two sections look identical. */
+    while (n && out[n - 1] == ' ') n--;
+    out[n] = '\0';
+}
+
+int oc_sidebar_section_add(oc_sidebar_opts *o, const char *name) {
+    if (!o || o->n_custom >= OC_SB_CUSTOM_MAX) return -1;
+    char clean[OC_SB_NAME_MAX];
+    sb_clean_name(name, clean, sizeof clean);
+    if (!clean[0]) return -1;
+    int i = o->n_custom++;
+    memset(&o->custom[i], 0, sizeof o->custom[i]);
+    snprintf(o->custom[i].name, sizeof o->custom[i].name, "%s", clean);
+    return i;
+}
+
+void oc_sidebar_section_rename(oc_sidebar_opts *o, int idx, const char *name) {
+    if (!o || idx < 0 || idx >= o->n_custom) return;
+    char clean[OC_SB_NAME_MAX];
+    sb_clean_name(name, clean, sizeof clean);
+    if (!clean[0]) return;                 /* a nameless section is unclickable */
+    snprintf(o->custom[idx].name, sizeof o->custom[idx].name, "%s", clean);
+}
+
+void oc_sidebar_section_remove(oc_sidebar_opts *o, int idx) {
+    if (!o || idx < 0 || idx >= o->n_custom) return;
+    for (int i = idx; i + 1 < o->n_custom; i++) o->custom[i] = o->custom[i + 1];
+    o->n_custom--;
+    memset(&o->custom[o->n_custom], 0, sizeof o->custom[0]);
+}
+
+int oc_sidebar_section_of(const oc_sidebar_opts *o, uint64_t channel_id) {
+    if (!o || !channel_id) return -1;
+    for (int i = 0; i < o->n_custom; i++)
+        for (uint8_t k = 0; k < o->custom[i].n_ids; k++)
+            if (o->custom[i].ids[k] == channel_id) return i;
+    return -1;
+}
+
+int oc_sidebar_assign(oc_sidebar_opts *o, uint64_t channel_id, int idx) {
+    if (!o || !channel_id) return 0;
+    int changed = 0, cur = oc_sidebar_section_of(o, channel_id);
+    if (cur == idx) return 0;
+    if (cur >= 0) {                        /* out of the old one first: at most one */
+        for (uint8_t k = 0; k < o->custom[cur].n_ids; k++)
+            if (o->custom[cur].ids[k] == channel_id) {
+                memmove(&o->custom[cur].ids[k], &o->custom[cur].ids[k + 1],
+                        (size_t)(o->custom[cur].n_ids - k - 1) * sizeof o->custom[cur].ids[0]);
+                o->custom[cur].n_ids--;
+                changed = 1;
+                break;
+            }
+    }
+    if (idx < 0 || idx >= o->n_custom) return changed;
+    if (o->custom[idx].n_ids >= OC_SB_CUSTOM_IDS) return changed;   /* full: refuse */
+    o->custom[idx].ids[o->custom[idx].n_ids++] = channel_id;
+    return 1;
+}
+
+uint64_t oc_model_custom_emoji(const oc_model *m, const char *name) {
+    if (!m || !name || !name[0]) return 0;
+    for (size_t i = 0; i < m->n_cemoji; i++)
+        if (strcmp(m->cemoji[i].name, name) == 0) return m->cemoji[i].attachment_id;
+    return 0;
+}
+
+void oc_model_dm_title(const oc_model *m, const oc_channel *c, char *out, size_t cap) {
+    if (!m || !c || !out || !cap) return;
+    sb_label(m, c, out, cap);
+}
+
+size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
+                        oc_sidebar_row *out, size_t cap) {
+    if (!m || !o || !out || cap == 0) return 0;
+    size_t n = 0;
+
+    /* STARRED first on screen, then Channels, then DMs — Slack's order. The enum
+     * numbers the sections for storage; this array decides what the eye sees, so
+     * adding a section does not renumber anyone's saved preferences. */
+    /* Starred, then the user's own sections in their order, then Channels, then
+     * DMs. Built as a list rather than a fixed array because the middle is now
+     * variable-length. */
+    int order[OC_SB_SECTIONS + OC_SB_CUSTOM_MAX];
+    int n_order = 0;
+    order[n_order++] = OC_SB_STARRED;
+    for (int i = 0; i < o->n_custom; i++) order[n_order++] = OC_SB_CUSTOM_BASE + i;
+    order[n_order++] = OC_SB_CHANNELS;
+    order[n_order++] = OC_SB_DMS;
+
+    for (int oi = 0; oi < n_order; oi++) {
+        int sec = order[oi];
+        int cidx = oc_sb_custom_index(sec);
+        /* Collect this section's rows, with the timestamp alongside for sorting. */
+        sb_tmp *tmp = calloc(m->n_channels + 1, sizeof *tmp);
+        size_t tn = 0, total = 0;
+        for (size_t i = 0; tmp && i < m->n_channels; i++) {
+            const oc_channel *c = &m->channels[i];
+            if (c->e2e && c->forgotten) continue;   /* an encrypted DM put away (PRIVATE-DM.md) */
+            int is_dm = (c->kind == OC_CHANNEL_KIND_DM);
+            int starred = oc_sidebar_is_starred(o, c->channel_id);
+            int inbox = oc_sidebar_section_of(o, c->channel_id);   /* custom, or -1 */
+            /* A conversation appears ONCE. Starred lifts it out of everything; a
+             * custom section lifts it out of Channels/DMs. Starred wins when it is
+             * in both, because two lift-it-out rules need a precedence. */
+            if (sec == OC_SB_STARRED) {
+                if (!starred) continue;
+            } else if (cidx >= 0) {
+                if (starred || inbox != cidx) continue;
+            } else {
+                if (starred || inbox >= 0) continue;
+                if ((sec == OC_SB_DMS) != is_dm) continue;
+            }
+            /* A named channel the user has not joined is browsable, not listed. */
+            if (!is_dm && (!c->name || !c->name[0])) continue;
+            total++;
+
+            char label[96];
+            sb_label(m, c, label, sizeof label);
+
+            if (o->find[0]) {                     /* match the LABEL, not the name */
+                char low[96]; sb_lower(label, low, sizeof low);
+                if (!strstr(low, o->find)) continue;
+            }
+            if (oc_sb_filter_of(o, sec) == OC_SB_FILTER_UNREAD && c->unread <= 0) continue;
+            if (o->unreads_only && c->unread <= 0 && c->channel_id != o->keep_id) continue;
+            if (oc_sb_filter_of(o, sec) == OC_SB_FILTER_ACTIVE) {
+                /* Channels: joined ones. DMs: a peer who is not offline.
+                 *
+                 * A GROUP DM (REQ-056) has no single peer — peer_id is 0 — so the
+                 * 1:1 test read it as "offline" and the filter hid every group
+                 * conversation. "Active" means somebody in it is around, so for a
+                 * group that is ANY participant but you. */
+                if (is_dm && c->n_peers > 2) {
+                    int any = 0;
+                    for (uint16_t k = 0; k < c->n_peers && !any; k++) {
+                        if (c->peers[k] == m->user_id) continue;
+                        if (oc_model_presence_of(m, c->peers[k]) != OC_PRESENCE_OFFLINE) any = 1;
+                    }
+                    if (!any) continue;
+                } else if (is_dm) {
+                    if (oc_model_presence_of(m, c->peer_id) == OC_PRESENCE_OFFLINE) continue;
+                } else if (!c->joined) continue;
+            }
+
+            tmp[tn].at = c->last_message_at;
+            tmp[tn].row.is_header  = 0;
+            tmp[tn].row.section    = (uint8_t)sec;
+            tmp[tn].row.channel_id = c->channel_id;
+            snprintf(tmp[tn].row.label, sizeof tmp[tn].row.label, "%s", label);
+            tmp[tn].row.is_private = (uint8_t)(!is_dm && !c->is_public);
+            /* Slack renders the self-DM as "Danny Heskett  you" — the account
+             * name, with a dimmed tag after it. The core flags it; each frontend
+             * draws the tag in its own dim style. */
+            tmp[tn].row.is_self    = (uint8_t)(is_dm && c->peer_id == m->user_id);
+            tmp[tn].row.peer_id    = is_dm ? c->peer_id : 0;
+            tmp[tn].row.joined     = c->joined;
+            tmp[tn].row.unread     = c->unread;
+            tn++;
+        }
+
+        if (tn > 1) { g_sb_sort = oc_sb_sort_of(o, sec); qsort(tmp, tn, sizeof *tmp, sb_cmp); }
+
+        /* Starred vanishes entirely when nothing is starred. It is the one
+         * section that is purely DERIVED — it exists because you starred
+         * something — so with nothing in it there is nothing to open and no
+         * reason to spend a row saying so. The others earn their empty state: a
+         * custom section was created deliberately and has to stay visible to be
+         * managed or removed, and an empty Channels or Direct messages is
+         * information about the workspace rather than clutter.
+         *
+         * `total` and not `tn`: tn is what survived the find box and the
+         * unread/active filter, and a section disappearing because you typed in
+         * the filter would be a different behaviour — and a confusing one. */
+        if (sec == OC_SB_STARRED && total == 0) { free(tmp); continue; }
+
+        /* Header first — a collapsed or empty section must stay openable. */
+        if (n < cap) {
+            oc_sidebar_row *h = &out[n++];
+            memset(h, 0, sizeof *h);
+            h->is_header = 1;
+            h->section = (uint8_t)sec;
+            snprintf(h->label, sizeof h->label, "%s",
+                     cidx >= 0             ? o->custom[cidx].name :
+                     sec == OC_SB_STARRED  ? "Starred" :
+                     sec == OC_SB_CHANNELS ? "Channels" : "Direct messages");
+            h->section_total = (int)total;
+        }
+        if (!oc_sb_collapsed_of(o, sec))
+            for (size_t i = 0; i < tn && n < cap; i++) out[n++] = tmp[i].row;
+        free(tmp);
+    }
+    return n;
+}

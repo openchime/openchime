@@ -1,0 +1,1595 @@
+# Publish a release of the daemon (ARCH-20, docs/RELEASING.md).
+#
+# A release is a RELEASE-CANDIDATE given a number. release-candidate.yml builds
+# everything from a staging commit, stores it by its build id, the short
+# commit, and publishes it in this repository as release-N-rcK; this
+# workflow takes one release-candidate by its tag, fetches what it stored,
+# verifies the signed manifest, fast-forwards main to its commit, tags
+# release-N there, packages the same binaries under N and publishes. No
+# compiler runs here: what was built and verified for the release-candidate is
+# what ships, and a release takes minutes. Five channels come out of one run,
+# all carrying the same number:
+#
+#   apt      Debian/Ubuntu, GPG-signed repository in object storage
+#   dnf/yum  RHEL family, GPG-signed repository in object storage
+#   tarball  everyone else, and the offline case -- attached to the GitHub release
+#   image    Fly's registry, for the hosted model: the build's image, copied
+#            to :N and :latest in registry.fly.io/openchime-daemon-staging
+#            and registry.fly.io/openchime-daemon-production
+#   windows  the client, not the daemon: a signed installer attached to the
+#            GitHub release, and an MSIX for the Store
+#
+# ONE BINARY PER ARCHITECTURE feeds the .deb, the .rpm, the tarball and the
+# image, so all four ship a byte-identical artifact: the one the build's
+# manifest names. NOTHING IN THIS WORKFLOW USES DOCKER (skopeo copies, buildah
+# built); only signing the Windows installer needs a Windows machine.
+#
+# Everything happens in this repository: the release-N tag and the GitHub
+# release are made with the job's own token, and main is fast-forwarded with
+# the deploy key (RELEASE_SSH_KEY, in the `release` environment), the one actor
+# main's ruleset lets through. The shipped issues are closed on
+# openchime/openchime, the OC tracker, with PUBLIC_TOKEN. Last, sync-public
+# copies main, staging, the tag and the release to openchime/openchime, a
+# convenience nothing here depends on.
+name: release
+
+# Dispatched on staging with the release-candidate to release:
+#
+#   gh workflow run release.yml --ref staging -f release_candidate=release-1-rc1
+#
+# A dry run takes the same release-candidate, fetches, packages and verifies
+# everything, and publishes, tags and moves nothing.
+on:
+  workflow_dispatch:
+    inputs:
+      release_candidate:
+        description: 'The release-candidate to release, as tagged in this repository (e.g. release-1-rc1)'
+        type: string
+        required: true
+      dry_run:
+        description: 'Fetch the release-candidate, package and verify everything, publish nothing, tag nothing'
+        type: boolean
+        default: false
+      skip_repo_smoke:
+        description: 'Skip the published-repository smoke test (use only while the control plane is not yet serving DIST_BASE_URL)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # The build's image is in the staging registry; a release copies it to :N
+  # and :latest there and in the production registry. Fly's registry takes
+  # basic auth: user x, a Fly deploy token as the password.
+  STAGING_IMAGE: registry.fly.io/openchime-daemon-staging
+  PRODUCTION_IMAGE: registry.fly.io/openchime-daemon-production
+
+jobs:
+  # Dispatched on staging only, and never on openchime/openchime, which only
+  # receives copies and runs nothing. The commit released is the
+  # release-candidate's, resolved below, not the ref this run is on.
+  branch:
+    name: running on staging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Refuse any other ref or repository
+        env:
+          REF: ${{ github.ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          [ "$REPO" != "openchime/openchime" ] || {
+            echo "::error::releases are not made here"; exit 1; }
+          [ "$REF" = "refs/heads/staging" ] || {
+            echo "::error::release is dispatched on staging only (this run is on $REF). Use: gh workflow run release.yml --ref staging -f release_candidate=release-N-rcK"; exit 1; }
+
+  # The release-candidate, resolved to the commit it names and the number it
+  # was built for. Refused unless the tag is release-N-rcK, exists in this
+  # repository, and has a published prerelease here: a
+  # release-candidate is the tag AND its files, and a tag without them was
+  # never finished. Every later job takes the commit from here, never from
+  # GITHUB_SHA, which is only the staging tip this run was dispatched on.
+  resolve:
+    name: resolve the release-candidate
+    needs: branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.rc.outputs.sha }}
+      number: ${{ steps.rc.outputs.number }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - id: rc
+        env:
+          RC: ${{ inputs.release_candidate }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$RC" =~ ^release-([0-9]+)-rc[0-9]+$ ]] || {
+            echo "::error::'${RC}' is not a release-candidate tag (release-N-rcK)"; exit 1; }
+          N="${BASH_REMATCH[1]}"
+          git fetch --quiet --no-tags --depth=1 origin "+refs/tags/${RC}:refs/tags/${RC}" || {
+            echo "::error::${RC} is not a tag in ${GITHUB_REPOSITORY}"; exit 1; }
+          sha=$(git rev-parse "${RC}^{commit}")
+          pre=$(gh release view "$RC" -R "$GITHUB_REPOSITORY" --json isPrerelease --jq .isPrerelease 2>/dev/null) || {
+            echo "::error::${RC} has no release in ${GITHUB_REPOSITORY}; its files were never published"; exit 1; }
+          [ "$pre" = "true" ] || {
+            echo "::error::the release ${RC} is not a prerelease"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "number=$N" >> "$GITHUB_OUTPUT"
+          echo "${RC} is ${sha} (build ${sha:0:7}), for release-${N}"
+          echo "### Releasing \`${RC}\` (\`${sha}\`) as release-${N}" >> "$GITHUB_STEP_SUMMARY"
+
+  # CI is not run again here: the release-candidate exists only because
+  # ci.yml, attribution-guard and commit-policy passed on its commit on staging
+  # (release-candidate.yml's gate). The attribution guard is cheap and is kept
+  # as a last word; called from a dispatch it has no pushed range to scan.
+  guard:
+    name: attribution guard
+    needs: branch
+    uses: ./.github/workflows/attribution-guard.yml
+    permissions:
+      contents: write
+
+  # Assert the credentials EXIST before anything expensive runs.
+  #
+  # Every credential used to be read only at its point of use, and every step
+  # that reads one is skipped on a dry run -- so the first time a missing value
+  # could surface was a real release, after the CI gate, both package builds,
+  # the image and the Windows binaries had all run. Twenty-five minutes to learn
+  # a secret was unset. This job runs in parallel with the CI gate and takes
+  # seconds.
+  #
+  # It gates `version` deliberately, not just the publish. The release NUMBER is
+  # reserved before anything is built and only returned when nothing was
+  # published, so letting a run that cannot possibly publish reserve one burns a
+  # number for no reason.
+  preflight:
+    name: check release credentials
+    needs: branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    # The signing key and the registry tokens are the release environment's
+    # secrets: a job outside it sees them as unset.
+    environment: release
+    env:
+      # Mapped in rather than read inline: a secret cannot be tested in an `if:`
+      # at job level, and mapping makes the required set one readable list.
+      DIST_S3_ACCESS_KEY: ${{ secrets.DIST_S3_ACCESS_KEY }}
+      DIST_S3_SECRET_KEY: ${{ secrets.DIST_S3_SECRET_KEY }}
+      DIST_S3_ENDPOINT:   ${{ vars.DIST_S3_ENDPOINT }}
+      DIST_BUCKET:        ${{ vars.DIST_BUCKET }}
+      DIST_S3_STAGING_ACCESS_KEY: ${{ secrets.DIST_S3_STAGING_ACCESS_KEY }}
+      DIST_S3_STAGING_SECRET_KEY: ${{ secrets.DIST_S3_STAGING_SECRET_KEY }}
+      DIST_STAGING_BUCKET:        ${{ vars.DIST_STAGING_BUCKET }}
+      REPO_SIGNING_KEY:   ${{ secrets.REPO_SIGNING_KEY }}
+      TS_ENDPOINT:        ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+      TS_ACCOUNT:         ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+      TS_PROFILE:         ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+      DRY: ${{ inputs.dry_run }}
+      # As in `publish`, which is where these values are defined and explained.
+      DIST_BASE_URL: https://openchime.io/dist
+      DIST_VERIFY_URL: https://staging.openchime.io/dist
+    steps:
+      - name: required credentials
+        run: |
+          set -u
+          missing=""
+          for v in DIST_S3_ACCESS_KEY DIST_S3_SECRET_KEY DIST_S3_ENDPOINT \
+                   DIST_BUCKET DIST_S3_STAGING_ACCESS_KEY DIST_S3_STAGING_SECRET_KEY \
+                   DIST_STAGING_BUCKET REPO_SIGNING_KEY; do
+            eval "val=\${$v:-}"
+            [ -n "$val" ] || missing="$missing $v"
+          done
+
+          # Authenticode signing is OPTIONAL by design (RELEASING.md): without it
+          # the release ships an unsigned installer and says so. But the three
+          # values are all-or-nothing -- `SIGN` requires all three -- so a
+          # PARTIAL set is the dangerous state: it reads as configured and
+          # silently ships unsigned. Named separately for that reason.
+          ts_set=0
+          for v in TS_ENDPOINT TS_ACCOUNT TS_PROFILE; do
+            eval "val=\${$v:-}"
+            [ -n "$val" ] && ts_set=$((ts_set + 1))
+          done
+
+          {
+            echo "### Release credentials"
+            echo
+            if [ -n "$missing" ]; then
+              echo "**Missing (required):**"
+              for m in $missing; do echo "- \`$m\`"; done
+            else
+              echo "All required credentials are present."
+            fi
+            echo
+            case "$ts_set" in
+              3) echo "Authenticode signing: configured." ;;
+              0) echo "Authenticode signing: not configured — the installer ships unsigned, as designed." ;;
+              *) echo "Authenticode signing: **PARTIALLY configured ($ts_set of 3)** — signing will be skipped and the installer will ship unsigned. Set all three or none." ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ts_set" != 0 ] && [ "$ts_set" != 3 ]; then
+            echo "::warning::Authenticode signing is partially configured ($ts_set of 3); the installer will ship unsigned."
+          fi
+
+          if [ -z "$missing" ]; then
+            echo "all required release credentials present"
+            exit 0
+          fi
+
+          # A dry run REPORTS and continues: its job is to prove the build, and
+          # failing it would stop anyone verifying a build on a fork with no
+          # secrets. Reporting is still the fix -- surfacing the gap in a dry run
+          # is exactly what was impossible before.
+          if [ "$DRY" = "true" ]; then
+            echo "::warning::missing release credentials:$missing (dry run — not failing)"
+            exit 0
+          fi
+          echo "::error::missing release credentials:$missing"
+          exit 1
+
+      # The release closes the OC issues it shipped on openchime/openchime with
+      # PUBLIC_TOKEN. A token that cannot is found out here, not as a warning
+      # after the packages are live: an empty update of an issue changes nothing
+      # and adds nothing to its timeline, but is refused without Issues write.
+      - name: public tracker
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_TOKEN }}
+        run: |
+          set -uo pipefail
+          r=openchime/openchime
+          if [ -n "$GH_TOKEN" ] && n=$(gh api "repos/${r}/issues?state=all&per_page=1" --jq '.[0].number' 2>&1) \
+             && out=$(echo '{}' | gh api -X PATCH "repos/${r}/issues/${n}" --input - --jq .number 2>&1); then
+            echo "PUBLIC_TOKEN can write issues on openchime/openchime"
+            exit 0
+          fi
+          msg="PUBLIC_TOKEN cannot write issues on openchime/openchime: ${out:-${n:-not set}}"
+          if [ "$DRY" = "true" ]; then echo "::warning::${msg} (dry run — not failing)"; exit 0; fi
+          echo "::error::${msg}"
+          exit 1
+
+      # The repository is verified at DIST_VERIFY_URL, a URL somebody else
+      # serves: the control plane reads the bucket and exposes it there. Nothing in this
+      # repository can make that true, and it has not been true for three
+      # releases -- so this REPORTS and never fails.
+      #
+      # It exists for the reason the credential check above does. That check was
+      # added because a missing value first surfaced during a real release,
+      # after the CI gate and every build had run; this one surfaced later still,
+      # after apt and dnf were already live. Knowing at minute one what you would
+      # otherwise learn at minute nine costs one HEAD request.
+      #
+      # Failing here was considered and rejected: it would make releases
+      # impossible until an external dependency lands, and the release is
+      # perfectly publishable without it -- only unreachable at the public URL.
+      - name: probe the published base URL
+        if: ${{ !inputs.skip_repo_smoke }}
+        run: |
+          set -u
+          if curl -fsI --max-time 20 "$DIST_VERIFY_URL/openchime-archive-keyring.gpg" >/dev/null 2>&1; then
+            echo "verification URL serves: $DIST_VERIFY_URL"
+            echo "Verification URL (\`$DIST_VERIFY_URL\`): serving." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::$DIST_VERIFY_URL does not serve the archive keyring -- \
+          the repositories will publish, and the terminal smoke job will fail. \
+          The release itself still completes."
+            {
+              echo
+              echo "**Verification URL (\`$DIST_VERIFY_URL\`): NOT serving.**"
+              echo
+              echo "The repositories will publish and the release will complete;"
+              echo "the terminal \`smoke\` job will fail. Serving \`/dist\` is the"
+              echo "control plane's job, and it is not in this repository."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # The release-candidate's build, fetched from the staging bucket and
+  # verified: the manifest's signature, every file's sha256, the commit it
+  # records being the release-candidate's, the build id the binary itself
+  # reports, and the image the manifest names being in the registry with the
+  # digest it recorded. A release-candidate whose build is gone (pruned, or
+  # never stored) is refused here, before any number is reserved. The
+  # verified files go on as one artifact every later job reads.
+  #
+  # The image is read from the staging registry, where the build pushed it,
+  # with FLY_REGISTRY_TOKEN_STAGING from the `release` environment.
+  candidate:
+    name: fetch the candidate
+    needs: [branch, preflight, resolve]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    outputs:
+      build_id: ${{ steps.id.outputs.build_id }}
+      run_number: ${{ steps.id.outputs.run_number }}
+    env:
+      SHA: ${{ needs.resolve.outputs.sha }}
+      DIST_S3_ENDPOINT:           ${{ vars.DIST_S3_ENDPOINT }}
+      DIST_S3_STAGING_ACCESS_KEY: ${{ secrets.DIST_S3_STAGING_ACCESS_KEY }}
+      DIST_S3_STAGING_SECRET_KEY: ${{ secrets.DIST_S3_STAGING_SECRET_KEY }}
+      DIST_STAGING_BUCKET:        ${{ vars.DIST_STAGING_BUCKET }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+      - name: Install tooling
+        timeout-minutes: 20
+        run: scripts/build/apt.sh rclone gnupg skopeo
+      - name: Import the signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.REPO_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$GPG_PRIVATE_KEY" ] || { echo "::error::REPO_SIGNING_KEY is not set; the candidate cannot be verified"; exit 1; }
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+      - name: Configure rclone for the staging bucket
+        run: |
+          set -euo pipefail
+          for v in DIST_S3_ENDPOINT DIST_S3_STAGING_ACCESS_KEY DIST_S3_STAGING_SECRET_KEY DIST_STAGING_BUCKET; do
+            [ -n "${!v}" ] || { echo "::error::$v is not set"; exit 1; }
+          done
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [dist-staging]
+          type = s3
+          provider = Other
+          access_key_id = ${DIST_S3_STAGING_ACCESS_KEY}
+          secret_access_key = ${DIST_S3_STAGING_SECRET_KEY}
+          endpoint = ${DIST_S3_ENDPOINT}
+          region = auto
+          EOF
+      - name: Fetch and verify the candidate
+        id: id
+        env:
+          FLY_REGISTRY_TOKEN_STAGING: ${{ secrets.FLY_REGISTRY_TOKEN_STAGING }}
+        run: |
+          set -euo pipefail
+          [ -n "$FLY_REGISTRY_TOKEN_STAGING" ] || { echo "::error::FLY_REGISTRY_TOKEN_STAGING is not set in the release environment"; exit 1; }
+          id="${SHA:0:7}"
+          scripts/release/candidate_fetch.sh "$id" candidate
+          run=$(python3 -c 'import json; print(json.load(open("candidate/manifest.json"))["run_number"])')
+          sha=$(python3 -c 'import json; print(json.load(open("candidate/manifest.json"))["sha"])')
+          [ "$sha" = "$SHA" ] || { echo "::error::the build is for ${sha}, not the release-candidate's ${SHA}"; exit 1; }
+          echo "build_id=$id" >> "$GITHUB_OUTPUT"
+          echo "run_number=$run" >> "$GITHUB_OUTPUT"
+          # The binary says what it is: unpacked and asked, so the id in the
+          # manifest is the id the code carries, not merely the directory's name.
+          mkdir -p check && tar xzf "candidate/linux-amd64/openchimed-build-${id}-linux-amd64.tar.gz" -C check
+          got=$("check/openchimed-build-${id}-linux-amd64/openchimed" --version)
+          echo "$got"
+          printf '%s' "$got" | grep -q "^openchimed ${id} " || { echo "::error::the candidate's daemon reports '$got', not build ${id}"; exit 1; }
+          # And the image the release will re-tag exists, with the digest the
+          # manifest recorded.
+          want=$(python3 -c 'import json,sys; print(json.load(open("candidate/manifest.json"))["images"]["build-'"$id"'"])')
+          have="sha256:$(skopeo inspect --raw --creds "x:${FLY_REGISTRY_TOKEN_STAGING}" \
+                           "docker://${STAGING_IMAGE}:build-${id}" | sha256sum | cut -d' ' -f1)"
+          [ "$have" = "$want" ] || { echo "::error::${STAGING_IMAGE}:build-${id} is ${have}, the manifest says ${want}"; exit 1; }
+          echo "image ${STAGING_IMAGE}:build-${id} matches the manifest"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: candidate
+          path: candidate
+          if-no-files-found: error
+
+  # The number is a label on the release-candidate's build id, and it is the
+  # number the release-candidate was built for: release-N-rcK becomes
+  # release-N and nothing else. Checked against this repository's tags, and
+  # reserved here before anything is packaged, so that a failure between here and publishing burns
+  # a number rather than duplicating one. A release-candidate for a number
+  # that has since been released is refused; cut a new one from staging.
+  version:
+    name: allocate the release number
+    needs: [guard, candidate, resolve]
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 5
+    permissions:
+      contents: write          # the tag that reserves the number
+    outputs:
+      number: ${{ steps.n.outputs.number }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+      # Tags are pushed with the deploy key: the workflow's own token may not
+      # create a ref on a commit that changes workflow files.
+      - name: Push with the deploy key
+        env:
+          KEY: ${{ secrets.RELEASE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$KEY" ] || { echo "::error::RELEASE_SSH_KEY is not set in the release environment"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/release_key
+          chmod 600 ~/.ssh/release_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git remote set-url --push origin "git@github.com:${GITHUB_REPOSITORY}.git"
+          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/release_key -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
+      - id: n
+        env:
+          N: ${{ needs.resolve.outputs.number }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet
+          if git ls-remote --exit-code --tags origin "refs/tags/release-${N}" >/dev/null; then
+            echo "::error::release-${N} already exists; this release-candidate's number is taken. Cut a new release-candidate from staging."
+            exit 1
+          fi
+          next=$(scripts/release/version.sh next)
+          [ "$next" = "$N" ] || {
+            echo "::error::the release-candidate is for release-${N}, but the next release is ${next}"; exit 1; }
+          echo "number=$N" >> "$GITHUB_OUTPUT"
+          echo "this release is $N (previous: $(scripts/release/version.sh current)), build ${{ needs.candidate.outputs.build_id }}"
+
+      # Reserve the number NOW, not after publishing.
+      #
+      # The tag push used to be the last step of `publish`, by which point apt, dnf
+      # and the image registry had already been written. scripts/release/version.sh derives the next number purely
+      # from tags, so a refused push -- tag protection, a ruleset, a transient 500 --
+      # left release N live and untagged, and the next dispatch computed N again,
+      # built different content, and published it under the same version. scripts/release/version.sh
+      # says it itself: two .debs sharing a version is the one thing apt cannot
+      # recover from. It guards the branch-scoping route to that outcome and left
+      # this one open.
+      #
+      # Reserving instead means the failure mode is a burnt number, which costs
+      # nothing, rather than a duplicated one. The unreserve job at the bottom hands
+      # it back when publish did not succeed. The tag goes on the
+      # release-candidate's commit, pushed with the job's token: a plain push,
+      # which is refused if release-N appeared in the meantime.
+      - name: Reserve the release number
+        if: ${{ !inputs.dry_run }}
+        env:
+          N: ${{ steps.n.outputs.number }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git tag -f "release-${N}" "$SHA"
+          git push origin "refs/tags/release-${N}"
+          echo "reserved release-${N} on ${SHA:0:7}"
+
+  # The candidate's tree, packaged under the release number: the .deb, the
+  # .rpm and the tarball from the one binary, with the checks that the
+  # candidate build ran on its placeholder packages run again on the real
+  # ones. Seconds, not the hour a build took.
+  package:
+    name: ${{ matrix.arch }} packages
+    needs: [version, candidate, resolve]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+      BUILD_ID: ${{ needs.candidate.outputs.build_id }}
+      OC_BUILD_ID: ${{ needs.candidate.outputs.build_id }}   # for the tarball's README
+      PLATFORM: linux-${{ matrix.arch }}
+      DIST: dist/linux-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: candidate
+          path: candidate
+      - name: Install packaging tools
+        timeout-minutes: 20
+        run: scripts/build/apt.sh rpm
+      - name: Unpack the candidate's tree
+        run: |
+          set -euo pipefail
+          mkdir -p "$DIST" tree
+          tar xzf "candidate/linux-${{ matrix.arch }}/openchimed-build-${BUILD_ID}-linux-${{ matrix.arch }}.tar.gz" -C tree
+          cp -r "tree/openchimed-build-${BUILD_ID}-linux-${{ matrix.arch }}/." "$DIST/"
+          ls "$DIST"
+      - name: Build the packages
+        run: |
+          set -euo pipefail
+          packaging/build-rpm.sh     "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST" >/dev/null
+          packaging/build-deb.sh     "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST"
+          packaging/build-tarball.sh "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST"
+          # Each package is named for ITS architecture: the publish job pools
+          # both architectures' files under one prefix, and two named alike
+          # collide there.
+          rpm_arch=$([ "${{ matrix.arch }}" = arm64 ] && echo aarch64 || echo x86_64)
+          for want in "openchimed_${VERSION}_${{ matrix.arch }}.deb" \
+                      "openchimed-${VERSION}-1.${rpm_arch}.rpm" \
+                      "openchimed-${VERSION}-linux-${{ matrix.arch }}.tar.gz"; do
+            [ -f "$DIST/$want" ] || { echo "::error::$DIST has no $want"; ls "$DIST"; exit 1; }
+          done
+      # Proves the three channels carry the same file, and that it is the one
+      # the candidate's manifest names: the sha256 of the binary in each
+      # package equals the sha256 of the binary the candidate build made.
+      - name: Verify all channels ship the candidate's binary
+        run: |
+          set -euo pipefail
+          want=$(sha256sum "$DIST/openchimed" | cut -d' ' -f1)
+          mkdir -p v/deb v/rpm v/tar
+          dpkg-deb -x "$DIST/openchimed_${VERSION}_${{ matrix.arch }}.deb" v/deb
+          ( cd v/rpm && rpm2cpio ../../"$DIST"/openchimed-${VERSION}-1.*.rpm | cpio -idm --quiet )
+          tar xzf "$DIST/openchimed-${VERSION}-linux-${{ matrix.arch }}.tar.gz" -C v/tar
+          for f in v/deb/usr/bin/openchimed v/rpm/usr/bin/openchimed \
+                   v/tar/openchimed-${VERSION}-linux-${{ matrix.arch }}/openchimed; do
+            got=$(sha256sum "$f" | cut -d' ' -f1)
+            [ "$got" = "$want" ] || { echo "::error::$f differs from the candidate's binary"; exit 1; }
+          done
+          echo "all three channels ship $want (build ${BUILD_ID})"
+      - name: Install the package and run it
+        if: matrix.arch == 'amd64'
+        run: |
+          set -euo pipefail
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            "./$DIST/openchimed_${VERSION}_${{ matrix.arch }}.deb"
+          /usr/bin/openchimed --version | grep -q "^openchimed ${BUILD_ID} " || {
+            echo "::error::the installed daemon does not report build ${BUILD_ID}"; exit 1; }
+      # The artifact is NAMED for the platform, and the publish job downloads
+      # without merge-multiple. That combination is what rebuilds dist/<platform>/
+      # on the other side: upload-artifact strips the common path prefix, so the
+      # directory only survives the round-trip by being the artifact's name.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PLATFORM }}
+          path: |
+            ${{ env.DIST }}/*.deb
+            ${{ env.DIST }}/*.rpm
+            ${{ env.DIST }}/*.tar.gz
+            ${{ env.DIST }}/*.sha256
+          if-no-files-found: error
+
+
+  # The Windows client, from the candidate's binaries: signed here, since only
+  # a real release signs and the installer embeds the signed files, then
+  # wrapped in the installer and the MSIX under the release number.
+  windows:
+    name: windows installers
+    needs: [version, candidate, resolve]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+      BUILD_ID: ${{ needs.candidate.outputs.build_id }}
+      BUILD_NUM: ${{ needs.candidate.outputs.run_number }}
+      # Signing is gated on a real release AND on the credentials existing. A dry
+      # run produces the same artifacts unsigned and never reads them, which is
+      # what makes this job safe to run from a fork.
+      #
+      # The second half of that condition is what stops an absent certificate
+      # taking down the whole release. SIGN used to be `dry_run == false` alone,
+      # so a real release ran azure/trusted-signing-action against an empty
+      # endpoint, windows-package failed, and publish -- which needs it -- was
+      # skipped. The Linux packages were never the problem and never shipped
+      # either. Same shape the game repos use for absent Play signing secrets: an
+      # incomplete config degrades the artifact, it does not fail the release.
+      #
+      # Nothing needs editing when Artifact Signing is provisioned; setting the
+      # six secrets below turns signing back on by itself. All six are required:
+      # the first three name the signing profile, the last three are the service
+      # principal that proves the caller may use it -- the action authenticates
+      # via DefaultAzureCredential and has nothing to authenticate with otherwise.
+      SIGN: ${{ !inputs.dry_run && secrets.TRUSTED_SIGNING_ENDPOINT != '' && secrets.TRUSTED_SIGNING_ACCOUNT != '' && secrets.TRUSTED_SIGNING_PROFILE != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' }}
+      # Same convention as the packages job: artifacts land in dist/<platform>/
+      # and the artifact is named for that platform. build/ stays the staging
+      # area -- the unpackaged binaries and the MSIX layout are inputs to a
+      # package, not outputs of one, and the .iss reads them from there.
+      PLATFORM: windows-x64
+      DIST: dist/windows-x64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: candidate
+          path: candidate
+      - name: Take the candidate's binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          Copy-Item candidate\windows-x64\openchime.exe, candidate\windows-x64\openchime-tui.exe, candidate\windows-x64\openchime.debug build\
+          Get-ChildItem build
+
+      # Both binaries carry a VERSIONINFO resource (client/shared/res): the
+      # file version is the candidate build's run number, the product version
+      # names the build id. Asserted rather than assumed because the failure
+      # is silent: a missing or misbuilt resource still produces a working
+      # .exe, and the installer wrapping it carries its own version.
+      - name: Check the embedded version
+        shell: pwsh
+        run: |
+          $want = "1.0.$env:BUILD_NUM.0"
+          foreach ($f in 'build\openchime.exe','build\openchime-tui.exe') {
+            $vi = (Get-Item $f).VersionInfo
+            if ($vi.FileVersion -ne $want) { throw "$f reports FileVersion '$($vi.FileVersion)', expected '$want'" }
+            if ($vi.ProductVersion -ne "build $env:BUILD_ID") { throw "$f reports ProductVersion '$($vi.ProductVersion)', expected 'build $env:BUILD_ID'" }
+            Write-Host "$f $($vi.FileVersion) $($vi.ProductVersion)"
+          }
+
+      # The SDK ships on the runner image but is not on PATH, and its versioned
+      # directory moves with each image update, so it is discovered rather than
+      # pinned to a build number that would silently rot.
+      - name: Locate the Windows SDK
+        shell: pwsh
+        run: |
+          $bin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $sdk = Get-ChildItem $bin -Directory -ErrorAction Stop |
+                 Where-Object Name -match '^10\.' | Sort-Object Name | Select-Object -Last 1
+          if (-not $sdk) { throw "no Windows 10 SDK under $bin" }
+          Write-Host "using SDK $($sdk.Name)"
+          "$($sdk.FullName)\x64" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+
+      # Signed before packaging, not after: both the installer and the MSIX
+      # embed these files, so signing them afterwards would leave the copies
+      # inside the packages unsigned.
+      - name: Sign the binaries
+        if: env.SIGN == 'true'
+        uses: Azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+          files-folder: build
+          files-folder-filter: exe
+          file-digest: SHA256
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          # DIST is written with forward slashes because upload-artifact's globs
+          # require them; ISCC is given the backslash form rather than trusting
+          # it to normalise a path handed to /O.
+          $out = $env:DIST -replace '/','\'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+              "/DVersion=$env:VERSION" "/O$out" packaging\windows\openchime.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      # An unsigned installer is a real cost, not a footnote: Windows SmartScreen
+      # will warn on it and some users will not click through. Said here so the
+      # run itself records why, rather than leaving it to be rediscovered.
+      - name: Note the missing signature
+        if: ${{ !inputs.dry_run && env.SIGN != 'true' }}
+        shell: bash
+        run: |
+          echo "::warning::Artifact Signing credentials are not set; the Windows installer and binaries in this release are UNSIGNED. Users will see a SmartScreen warning."
+          echo "### Windows artifacts are unsigned" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "TRUSTED_SIGNING_ENDPOINT / _ACCOUNT / _PROFILE and AZURE_TENANT_ID / _CLIENT_ID / _CLIENT_SECRET are unset, so signing was skipped. Set all six to turn it back on; nothing else needs changing." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sign the installer
+        if: env.SIGN == 'true'
+        uses: Azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+          files-folder: ${{ env.DIST }}
+          files-folder-filter: exe
+          file-digest: SHA256
+
+      # Left unsigned on purpose: a Store submission is re-signed by Microsoft,
+      # and signing it here with our own certificate would be discarded. A
+      # sideloadable .msix is a different artifact and would need one.
+      - name: Build the MSIX
+        shell: pwsh
+        run: |
+          $stage = 'build\msix'
+          New-Item -ItemType Directory -Force "$stage\bin" | Out-Null
+          Copy-Item packaging\windows\msix\* $stage -Recurse -Force
+          Copy-Item build\*.exe "$stage\bin"
+
+          # scripts/release/version.sh hands out a bare integer; MSIX requires a.b.c.d with the
+          # fourth field reserved for the Store, so the release number lands in
+          # the third. Monotonic, which is all the Store checks.
+          $m = "$stage\AppxManifest.xml"
+          (Get-Content $m -Raw).Replace('Version="1.0.0.0"', "Version=`"1.0.$env:VERSION.0`"") |
+            Set-Content $m -Encoding utf8
+
+          # Without a resources.pri the scale-N asset variants are inert and
+          # the tile renders from the scale-100 file at every DPI.
+          makepri.exe createconfig /cf "$stage\priconfig.xml" /dq en-US /o
+          makepri.exe new /pr $stage /cf "$stage\priconfig.xml" /of "$stage\resources.pri" /o
+          Remove-Item "$stage\priconfig.xml"
+
+          $out = $env:DIST -replace '/','\'
+          makeappx.exe pack /d $stage /p "$out\openchime-$env:VERSION.msix" /o
+          if ($LASTEXITCODE -ne 0) { throw "makeappx failed" }
+
+      # The GUI's DWARF, split out by the Makefile and referenced by a
+      # .gnu_debuglink in the shipped .exe. It has to travel in THIS artifact:
+      # publish downloads linux-* and windows-* only, deliberately excluding the
+      # intermediate mingw-binaries, so anything left there never reaches the
+      # release.
+      - name: Stage the GUI debug symbols beside the installer
+        shell: pwsh
+        run: |
+          $out = $env:DIST -replace '/','\'
+          Copy-Item build\openchime.debug "$out\openchime.debug"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PLATFORM }}
+          path: ${{ env.DIST }}/*
+          if-no-files-found: error
+
+  # main moves here, and only here: fast-forwarded to the release-candidate's
+  # commit once the number is reserved and everything is packaged, before
+  # anything is published. main's ruleset refuses every update but the
+  # repository's deploy key, so the push is made with it (RELEASE_SSH_KEY, in
+  # the `release` environment). A plain push, never forced: if main is not an
+  # ancestor of the commit the push is refused and nothing is published
+  # (unreserve returns the number). Already there, it is a no-op, which is what
+  # a re-run finds.
+  main:
+    name: fast-forward main
+    needs: [resolve, version, package, windows]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+      - name: Fast-forward main to the release-candidate
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+          KEY: ${{ secrets.RELEASE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$KEY" ] || { echo "::error::RELEASE_SSH_KEY is not set in the release environment"; exit 1; }
+          git fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main"
+          if [ "$(git rev-parse origin/main)" = "$SHA" ]; then
+            echo "main already is ${SHA:0:7}"
+            exit 0
+          fi
+          git merge-base --is-ancestor origin/main "$SHA" || {
+            echo "::error::main ($(git rev-parse --short origin/main)) is not an ancestor of ${SHA:0:7}; a fast-forward is impossible. Reconcile by hand."
+            exit 1; }
+          echo "releasing $(git rev-list --count origin/main.."$SHA") commit(s):"
+          git log --format='  %h %s' origin/main.."$SHA"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/release_key
+          chmod 600 ~/.ssh/release_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          GIT_SSH_COMMAND="ssh -i $HOME/.ssh/release_key -o IdentitiesOnly=yes" \
+            git push "git@github.com:${GITHUB_REPOSITORY}.git" "${SHA}:refs/heads/main"
+          echo "main fast-forwarded to ${SHA:0:7}"
+
+  publish:
+    name: publish repositories
+    needs: [resolve, version, candidate, package, windows, main]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # The tag and the GitHub release are made here with the job's token; the
+    # images are copied with the Fly registry tokens of the `release`
+    # environment.
+    environment: release
+    permissions:
+      contents: write
+    outputs:
+      # Set the moment the apt index is in the bucket. From then on the number is
+      # SPENT whether or not the rest of the job succeeds, and unreserve must not
+      # hand it back -- see the note on that job.
+      published: ${{ steps.apt.outputs.published }}
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+      BUILD_ID: ${{ needs.candidate.outputs.build_id }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+      # Object storage is Tigris, provisioned through Fly (`fly storage create`)
+      # and billed on the Fly account, so it is not a separate vendor
+      # relationship. It speaks the S3 API; rclone is configured from these.
+      #
+      # Named for the role rather than the provider. Nothing outside this job
+      # knows where the bytes live -- the control plane serves DIST_BASE_URL and
+      # reads from the bucket -- so moving to another S3 endpoint is a change to
+      # these four values and nothing else. That indirection is the reason the
+      # public URL can be permanent while the storage behind it is not.
+      DIST_S3_ACCESS_KEY: ${{ secrets.DIST_S3_ACCESS_KEY }}
+      DIST_S3_SECRET_KEY: ${{ secrets.DIST_S3_SECRET_KEY }}
+      DIST_S3_ENDPOINT:   ${{ vars.DIST_S3_ENDPOINT }}
+      DIST_BUCKET:        ${{ vars.DIST_BUCKET }}
+      # Every release is published to both of the control plane's environments:
+      # the bucket above is production's, this one staging's, and the repository
+      # is verified through staging's /dist (DIST_VERIFY_URL). Both are built from
+      # the one pool read from production's bucket, so the two stay identical.
+      DIST_S3_STAGING_ACCESS_KEY: ${{ secrets.DIST_S3_STAGING_ACCESS_KEY }}
+      DIST_S3_STAGING_SECRET_KEY: ${{ secrets.DIST_S3_STAGING_SECRET_KEY }}
+      DIST_STAGING_BUCKET:        ${{ vars.DIST_STAGING_BUCKET }}
+      # Endpoint and bucket are variables, not secrets: neither is confidential,
+      # and a masked bucket name turns every rclone log line into asterisks.
+      #
+      # The published base. Baked into every operator's sources.list, so it is
+      # permanent in a way nothing else here is (ARCH-20).
+      DIST_BASE_URL: https://openchime.io/dist
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+      # Tags are pushed with the deploy key: the workflow's own token may not
+      # create a ref on a commit that changes workflow files.
+      - name: Push with the deploy key
+        env:
+          KEY: ${{ secrets.RELEASE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$KEY" ] || { echo "::error::RELEASE_SSH_KEY is not set in the release environment"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/release_key
+          chmod 600 ~/.ssh/release_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git remote set-url --push origin "git@github.com:${GITHUB_REPOSITORY}.git"
+          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/release_key -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
+
+      - name: Check the registry credentials
+        env:
+          STAGING_TOKEN: ${{ secrets.FLY_REGISTRY_TOKEN_STAGING }}
+          PRODUCTION_TOKEN: ${{ secrets.FLY_REGISTRY_TOKEN_PRODUCTION }}
+        run: |
+          set -euo pipefail
+          [ -n "$STAGING_TOKEN" ] || { echo "::error::FLY_REGISTRY_TOKEN_STAGING is not set in the release environment"; exit 1; }
+          [ -n "$PRODUCTION_TOKEN" ] || { echo "::error::FLY_REGISTRY_TOKEN_PRODUCTION is not set in the release environment"; exit 1; }
+
+      # Hold the number BEFORE anything is written, not at the tagging step.
+      #
+      # `version` reserves the tag and `unreserve` deletes it when a run fails
+      # having published nothing. Re-running only the failed jobs then skips
+      # `version` -- it succeeded -- so this job arrives with a number whose tag
+      # is gone. Checked only at the tagging step, that was found out after apt
+      # and dnf had been written: the repositories live and nothing naming them.
+      #
+      # So the question is asked here, where every answer is still harmless. The
+      # tag on this commit: held. The tag absent and the number still exactly
+      # the next one: nobody took it, so reserve it again. Anything else -- the
+      # tag on another commit, or a later release already tagged -- is a number
+      # this run no longer owns, and it stops with nothing published.
+      - name: Hold the release number
+        run: |
+          set -euo pipefail
+          git tag -d "release-${VERSION}" >/dev/null 2>&1 || true
+          git fetch --force --quiet origin 'refs/tags/release-*:refs/tags/release-*'
+          if at=$(git rev-parse -q --verify "refs/tags/release-${VERSION}^{commit}"); then
+            [ "$at" = "$SHA" ] || {
+              echo "::error::release-${VERSION} is on ${at}, not this commit; refusing to publish"
+              exit 1
+            }
+            echo "release-${VERSION} is held"
+            exit 0
+          fi
+          next=$(scripts/release/version.sh next)
+          [ "$next" = "$VERSION" ] || {
+            echo "::error::release-${VERSION} is not reserved and the next number is ${next}; refusing to publish"
+            exit 1
+          }
+          git tag -f "release-${VERSION}" "$SHA"
+          git push origin "refs/tags/release-${VERSION}"
+          echo "reserved release-${VERSION} again"
+
+      # merge-multiple is deliberately absent: without it each artifact unpacks
+      # into a directory named after itself, and since every producing job names
+      # its artifact for its platform, that reconstitutes dist/<platform>/ here.
+      # Turning it on would flatten all three platforms into one directory,
+      # which is what put a Windows .exe within reach of the Debian pool glob
+      # below.
+      #
+      # Two patterns rather than a bare `*`, so the intermediate mingw-binaries
+      # artifact -- unpackaged compiler output, not a release artifact -- is not
+      # dragged in as a fourth platform.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: linux-*
+          path: dist
+      # Named explicitly, not `pattern: windows-*`, and the path is spelled out.
+      # With a pattern, download-artifact nests each match in a directory named
+      # after it -- which is what rebuilds dist/<platform>/ for the two linux
+      # artifacts -- but the windows pattern matches exactly ONE artifact and it
+      # unpacked FLAT into dist/, so `dist/windows-x64/*-setup.exe` matched nothing
+      # and the release step failed after apt and dnf had already published.
+      # An explicit name and path does not depend on that behaviour either way, and
+      # it also makes the mingw-binaries exclusion structural rather than a glob.
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-x64
+          path: dist/windows-x64
+
+      - name: Show what will be published
+        run: find dist -type f | sort
+
+      - name: Install repository tooling
+        run: |
+          # `rpm` is not optional and not implied: createrepo-c pulls librpm's
+          # shared libraries but not the rpm binary, and an Ubuntu runner has
+          # neither rpm nor rpmsign preinstalled. Without it the rpm repository
+          # step fails at `rpm --addsign` with command-not-found -- in a job the
+          # dry run skips, so it would only ever surface on a real release.
+          scripts/build/apt.sh apt-utils createrepo-c rclone gnupg rpm
+
+      - name: Import the signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.REPO_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$GPG_PRIVATE_KEY" ] || { echo "::error::REPO_SIGNING_KEY is not set"; exit 1; }
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "GPG_KEY_ID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')" >> "$GITHUB_ENV"
+
+      - name: Configure rclone for object storage
+        run: |
+          set -euo pipefail
+          for v in DIST_S3_ACCESS_KEY DIST_S3_SECRET_KEY DIST_S3_ENDPOINT DIST_BUCKET \
+                   DIST_S3_STAGING_ACCESS_KEY DIST_S3_STAGING_SECRET_KEY DIST_STAGING_BUCKET; do
+            [ -n "${!v}" ] || { echo "::error::$v is not set"; exit 1; }
+          done
+          mkdir -p ~/.config/rclone
+          # provider = Other rather than a named one: rclone has no Tigris
+          # profile, and the generic S3 path is what Tigris documents. region is
+          # required by the S3 signature even though Tigris routes globally.
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [dist]
+          type = s3
+          provider = Other
+          access_key_id = ${DIST_S3_ACCESS_KEY}
+          secret_access_key = ${DIST_S3_SECRET_KEY}
+          endpoint = ${DIST_S3_ENDPOINT}
+          region = auto
+
+          [dist-staging]
+          type = s3
+          provider = Other
+          access_key_id = ${DIST_S3_STAGING_ACCESS_KEY}
+          secret_access_key = ${DIST_S3_STAGING_SECRET_KEY}
+          endpoint = ${DIST_S3_ENDPOINT}
+          region = auto
+          EOF
+
+      # Both repositories are regenerated from the FULL pool, not from this
+      # release's packages alone. An index built from the new package only would
+      # silently drop every previous release the moment it was published.
+      - name: Publish the apt repository
+        id: apt
+        run: |
+          set -euo pipefail
+          mkdir -p repo/apt
+          # `|| true` used to sit here, and it could not tell "the prefix does not
+          # exist yet" from "credentials rejected" or "endpoint returned 503". On any
+          # fetch failure the pool stayed empty, the index below was built from this
+          # release alone, and the upload replaced Release/InRelease in the bucket --
+          # so every existing installation's `apt-get update` saw a repository
+          # containing one version. The old objects survive; the index naming them
+          # does not.
+          # COUNTED, not probed. A listing exits 0 on a prefix that does not
+          # exist -- it reports an empty listing rather than an error -- so testing
+          # its exit status called every bucket "existing" and the guard below then
+          # refused a genuinely first publish.
+          existing=$( { rclone ls "dist:${DIST_BUCKET}/apt" 2>/dev/null || true; } | wc -l )
+          if [ "$existing" -gt 0 ]; then
+            had_prefix=1
+            rclone copy "dist:${DIST_BUCKET}/apt" repo/apt --fast-list
+          else
+            had_prefix=0
+            echo "::notice::no existing apt objects in ${DIST_BUCKET}; treating as first publish"
+          fi
+
+          # A listing proves the prefix is reachable, not that the copy completed, so
+          # this is a second and independent witness: the tag count is what the pool
+          # SHOULD contain. Free -- publish already checks out with fetch-depth: 0.
+          pool_count=$(find repo/apt -name '*.deb' | wc -l)
+          # PRIOR releases -- this one's tag is excluded, because `version` reserved
+          # it before anything was built (P3-OC-02). Counting it made the first ever
+          # release refuse itself: pool empty, prior=1, which is exactly the shape
+          # this guard treats as "an index that would delist history". The two fixes
+          # were correct separately and wrong together.
+          # `|| true` inside the braces, and it is not cosmetic. Once this release's
+          # own tag is filtered out, a FIRST release leaves grep with no match, so it
+          # exits 1; pipefail propagates that and set -e kills the assignment. The
+          # step died in under a second with no output at all -- the same shape as
+          # a dead error path in an earlier packaging script, reintroduced here.
+          # release-N only: the release-candidates' release-N-rcK tags fetched
+          # beside them name no package in the pool.
+          prior=$( { git tag -l 'release-*' | grep -E '^release-[0-9]+$' | grep -vx "release-${VERSION}" || true; } | wc -l )
+          # `had_prefix` is what separates the two ways to arrive at an empty pool,
+          # and only one of them is a fault. A prefix that EXISTS and yields no
+          # .deb means the copy above silently did not complete -- publishing then
+          # writes an index that delists every prior release, which is the case
+          # this guard was built for. No prefix at all means a bucket nothing has
+          # published into yet, which the branch above already recognises and
+          # announces as a first publish; refusing it made the guard contradict
+          # that notice and made moving to a new bucket impossible.
+          if [ "$had_prefix" = 1 ] && [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
+            echo "::error::apt pool is empty but ${prior} release tag(s) exist -- refusing to publish an index that would delist them"
+            exit 1
+          fi
+
+          mkdir -p repo/apt/pool/main/o/openchimed
+          cp dist/linux-*/*.deb repo/apt/pool/main/o/openchimed/
+
+          cd repo/apt
+          for arch in amd64 arm64; do
+            mkdir -p "dists/stable/main/binary-${arch}"
+            apt-ftparchive --arch "$arch" packages pool \
+              > "dists/stable/main/binary-${arch}/Packages"
+            gzip -9kf "dists/stable/main/binary-${arch}/Packages"
+          done
+
+          cat > /tmp/apt-release.conf <<'EOF'
+          APT::FTPArchive::Release::Origin "OpenChime";
+          APT::FTPArchive::Release::Label "OpenChime";
+          APT::FTPArchive::Release::Suite "stable";
+          APT::FTPArchive::Release::Codename "stable";
+          APT::FTPArchive::Release::Architectures "amd64 arm64";
+          APT::FTPArchive::Release::Components "main";
+          EOF
+          apt-ftparchive -c /tmp/apt-release.conf release dists/stable > dists/stable/Release
+
+          rm -f dists/stable/Release.gpg dists/stable/InRelease
+          gpg --batch --yes --local-user "$GPG_KEY_ID" -abs \
+              -o dists/stable/Release.gpg dists/stable/Release
+          gpg --batch --yes --local-user "$GPG_KEY_ID" --clearsign \
+              -o dists/stable/InRelease dists/stable/Release
+
+          cd ../..
+          rclone copy repo/apt "dist:${DIST_BUCKET}/apt" --fast-list
+          # Past this line the number is spent: an apt client can see release N.
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the rpm repository
+        run: |
+          set -euo pipefail
+          mkdir -p repo/rpm
+          # `|| true` used to sit here, and it could not tell "the prefix does not
+          # exist yet" from "credentials rejected" or "endpoint returned 503". On any
+          # fetch failure the pool stayed empty, the index below was built from this
+          # release alone, and the upload replaced Release/InRelease in the bucket --
+          # so every existing installation's `apt-get update` saw a repository
+          # containing one version. The old objects survive; the index naming them
+          # does not.
+          # COUNTED, not probed -- the same correction the apt step carries, and
+          # for the same reason: a listing exits 0 on a prefix that does
+          # not exist, reporting an empty listing rather than an error. Testing
+          # its exit status called every bucket "existing", so the guard below
+          # refused a genuinely first publish. Fixing one of the two copies and
+          # not the other is how the rpm half stayed broken after the apt half
+          # was proved working.
+          existing=$( { rclone ls "dist:${DIST_BUCKET}/rpm" 2>/dev/null || true; } | wc -l )
+          if [ "$existing" -gt 0 ]; then
+            had_prefix=1
+            rclone copy "dist:${DIST_BUCKET}/rpm" repo/rpm --fast-list
+          else
+            had_prefix=0
+            echo "::notice::no existing rpm objects in ${DIST_BUCKET}; treating as first publish"
+          fi
+
+          # A listing proves the prefix is reachable, not that the copy completed, so
+          # this is a second and independent witness: the tag count is what the pool
+          # SHOULD contain. Free -- publish already checks out with fetch-depth: 0.
+          pool_count=$(find repo/rpm -name '*.rpm' | wc -l)
+          # PRIOR releases -- this one's tag is excluded, because `version` reserved
+          # it before anything was built (P3-OC-02). Counting it made the first ever
+          # release refuse itself: pool empty, prior=1, which is exactly the shape
+          # this guard treats as "an index that would delist history". The two fixes
+          # were correct separately and wrong together.
+          # `|| true` inside the braces, and it is not cosmetic. Once this release's
+          # own tag is filtered out, a FIRST release leaves grep with no match, so it
+          # exits 1; pipefail propagates that and set -e kills the assignment. The
+          # step died in under a second with no output at all -- the same shape as
+          # a dead error path in an earlier packaging script, reintroduced here.
+          # release-N only: the release-candidates' release-N-rcK tags fetched
+          # beside them name no package in the pool.
+          prior=$( { git tag -l 'release-*' | grep -E '^release-[0-9]+$' | grep -vx "release-${VERSION}" || true; } | wc -l )
+          # `had_prefix` separates the two ways to reach an empty pool. A prefix
+          # that EXISTS and yields no .rpm means the copy above did not complete,
+          # and an index published from it delists every prior release -- the case
+          # this guard was built for. No objects at all is a bucket nothing has
+          # published into, which the branch above already announces.
+          if [ "$had_prefix" = 1 ] && [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
+            echo "::error::rpm pool is empty but ${prior} release tag(s) exist -- refusing to publish an index that would delist them"
+            exit 1
+          fi
+          cp dist/linux-*/*.rpm repo/rpm/
+
+          # Each package is signed individually -- rpm verifies package
+          # signatures, unlike apt which verifies the index.
+          cat > /tmp/rpmmacros <<EOF
+          %_gpg_name ${GPG_KEY_ID}
+          %__gpg_sign_cmd %{__gpg} gpg --batch --no-armor --no-secmem-warning -u "%{_gpg_name}" -sbo %{__signature_filename} %{__plaintext_filename}
+          EOF
+          # rpm reads ~/.rpmmacros for the invoking user, so this must land in the
+          # home directory of whoever runs the next line -- not root's.
+          cp /tmp/rpmmacros ~/.rpmmacros
+          rpm --addsign repo/rpm/*.rpm
+
+          createrepo_c --update repo/rpm
+          gpg --batch --yes --local-user "$GPG_KEY_ID" --detach-sign --armor \
+              -o repo/rpm/repodata/repomd.xml.asc repo/rpm/repodata/repomd.xml
+
+          rclone copy repo/rpm "dist:${DIST_BUCKET}/rpm" --fast-list
+
+      - name: Publish the public key and repo definitions
+        run: |
+          set -euo pipefail
+          mkdir -p repo/meta
+          gpg --export --armor "$GPG_KEY_ID" > repo/meta/openchime-archive-keyring.asc
+          gpg --export "$GPG_KEY_ID"         > repo/meta/openchime-archive-keyring.gpg
+          cat > repo/meta/openchime.repo <<EOF
+          [openchime]
+          name=OpenChime
+          baseurl=${DIST_BASE_URL}/rpm
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=${DIST_BASE_URL}/openchime-archive-keyring.asc
+          EOF
+          rclone copy repo/meta "dist:${DIST_BUCKET}/" --fast-list
+
+      - name: Publish the same repositories to staging's bucket
+        run: |
+          set -euo pipefail
+          rclone copy repo/apt  "dist-staging:${DIST_STAGING_BUCKET}/apt" --fast-list
+          rclone copy repo/rpm  "dist-staging:${DIST_STAGING_BUCKET}/rpm" --fast-list
+          rclone copy repo/meta "dist-staging:${DIST_STAGING_BUCKET}/" --fast-list
+
+      - name: Tag the release and attach the tarballs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The tag already exists: `version` reserved it before anything was
+          # built (P3-OC-02), and the first step of this job held it. Assert
+          # rather than create, so a mismatch is loud instead of silently
+          # tagging a second commit with the same number.
+          git ls-remote --exit-code --tags origin "refs/tags/release-${VERSION}" >/dev/null || {
+            echo "::error::release-${VERSION} was not reserved; refusing to publish"
+            exit 1
+          }
+          # The .msix is deliberately NOT attached. It is unsigned, because the
+          # Store re-signs on submission, so a downloaded copy will not install
+          # -- it is a build artifact for Partner Center, not a release asset.
+          #
+          # openchime.debug IS attached. The Makefile splits the GUI's DWARF into
+          # it and records a .gnu_debuglink in the shipped .exe, so without this
+          # the link points at a file that exists nowhere downloadable and
+          # scripts/release/crash_resolve.sh reports "built without -g?" for every released
+          # build. Build artifacts expire; a crash report does not.
+          # The note tells the truth about the installer's signing status, because
+          # the person who meets SmartScreen is the one who needs to know.
+          notes="Release ${VERSION} is build \`${BUILD_ID}\` (${SHA}), which is what \`openchimed --version\` and the Windows clients report. The daemon installs via apt and dnf (see README); the tarballs below are the offline install. The Windows client installer is attached."
+          if [ -z "${{ secrets.TRUSTED_SIGNING_ENDPOINT }}" ]; then
+            unsigned="**The Windows installer in this release is not code-signed.** Windows SmartScreen will warn that the publisher is unrecognised; the download is still the artifact this workflow built, and its checksum is in the release assets."
+            notes="${notes}"$'\n\n'"${unsigned}"
+          fi
+          gh release create "release-${VERSION}" -R "$GITHUB_REPOSITORY" --verify-tag \
+            --title "release-${VERSION}" \
+            --notes "$notes" \
+            dist/linux-*/*.tar.gz dist/linux-*/*.sha256 dist/windows-x64/*-setup.exe \
+            dist/windows-x64/openchime.debug
+
+      # The build's image becomes the release's: `skopeo copy` copies the
+      # manifest list :build-<id> from the staging registry, where the build
+      # pushed it, to :N, registry to registry, without pulling or rebuilding,
+      # first in the staging registry and then in the production one.
+      # --preserve-digests keeps every manifest digest exactly -- the property
+      # the control plane's deploy relies on -- and --all copies the whole
+      # manifest list, not just the host architecture. In each registry the
+      # digest of :N is checked against the build's and only then is :N copied
+      # to :latest, so nothing pulls :latest before :N exists and is right.
+      # Fly's registry takes basic auth: user x, the registry's deploy token.
+      - name: Tag the image as the release and move :latest
+        env:
+          STAGING_CREDS: x:${{ secrets.FLY_REGISTRY_TOKEN_STAGING }}
+          PRODUCTION_CREDS: x:${{ secrets.FLY_REGISTRY_TOKEN_PRODUCTION }}
+        run: |
+          set -euo pipefail
+          scripts/build/apt.sh skopeo
+          src="docker://${STAGING_IMAGE}:build-${BUILD_ID}"
+          want=$(skopeo inspect --raw --creds "$STAGING_CREDS" "$src" | sha256sum | cut -d' ' -f1)
+          release_image() {   # <image> <creds>
+            local image="$1" creds="$2" have
+            skopeo copy --all --preserve-digests --src-creds "$STAGING_CREDS" --dest-creds "$creds" \
+              "$src" "docker://${image}:${VERSION}"
+            have=$(skopeo inspect --raw --creds "$creds" "docker://${image}:${VERSION}" | sha256sum | cut -d' ' -f1)
+            [ "$have" = "$want" ] || {
+              echo "::error::${image}:${VERSION} is sha256:${have}, the build is sha256:${want}"; exit 1; }
+            skopeo copy --all --preserve-digests --src-creds "$creds" --dest-creds "$creds" \
+              "docker://${image}:${VERSION}" "docker://${image}:latest"
+            echo "${image}: ${VERSION} and latest -> build-${BUILD_ID} (sha256:${want})"
+          }
+          release_image "$STAGING_IMAGE" "$STAGING_CREDS"
+          release_image "$PRODUCTION_IMAGE" "$PRODUCTION_CREDS"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Released \`${VERSION}\` (build \`${BUILD_ID}\`)"
+            echo
+            echo "| Channel | Where |"
+            echo "|---|---|"
+            echo "| apt | \`${DIST_BASE_URL}/apt stable main\` |"
+            echo "| dnf | \`${DIST_BASE_URL}/rpm\` |"
+            echo "| image | \`${STAGING_IMAGE}:${VERSION}\`, \`${PRODUCTION_IMAGE}:${VERSION}\` |"
+            echo "| tarball | attached to \`release-${VERSION}\` |"
+            echo "| windows | installer attached to \`release-${VERSION}\`; \`.msix\` in the \`windows-x64\` artifact |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # VERIFICATION IS TERMINAL, and that is the whole point of this job.
+  #
+  # These steps used to sit inside `publish`, between writing the repositories
+  # and finishing the release. Being a postcondition in the middle of an
+  # irreversible sequence made a failure here truncate everything after it: the
+  # GitHub release, the tarballs and :latest were all
+  # skipped, while apt and dnf were already live. That is the worst reachable
+  # state -- packages published with nothing naming them -- and it cost a manual
+  # repair twice (release 2 in ea7201c, release 3).
+  #
+  # Once the apt index is written the release is irreversible, so completing it
+  # is strictly better than stopping half way. A red run saying "released, and
+  # the public URL does not serve it" is true, actionable, and leaves nothing to
+  # repair by hand.
+  smoke:
+    name: smoke the published repository
+    needs: [version, publish]
+    # Gated on publish having SUCCEEDED because there is nothing to smoke if
+    # nothing was published. always() so a skipped or failed sibling job cannot
+    # skip the verification with it.
+    if: ${{ always() && !inputs.dry_run && needs.publish.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release     # FLY_REGISTRY_TOKEN_STAGING, to pull the image
+    env:
+      # The published base, as in `publish` -- which is where this value is
+      # defined and explained. Repeated rather than shared because a job cannot
+      # read another job's env. The repository is installed from DIST_VERIFY_URL,
+      # which serves the same packages as DIST_BASE_URL.
+      DIST_BASE_URL: https://openchime.io/dist
+      DIST_VERIFY_URL: https://staging.openchime.io/dist
+      VERSION: ${{ needs.version.outputs.number }}
+    steps:
+      - uses: actions/checkout@v7   # for scripts/build/apt.sh
+      - name: Smoke the published apt repository
+        # Skipped only when explicitly asked. The default stays a hard failure:
+        # this step existing to fail while DIST_BASE_URL is unserved is a
+        # recorded decision, not an oversight, and auto-detecting the outage
+        # would silently mask a genuinely broken repository later.
+        if: ${{ !inputs.skip_repo_smoke }}
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL "$DIST_VERIFY_URL/openchime-archive-keyring.gpg" \
+            -o /usr/share/keyrings/openchime-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] $DIST_VERIFY_URL/apt stable main" \
+            | sudo tee /etc/apt/sources.list.d/openchime.list >/dev/null
+          # Through apt.sh: the index fetched first (release 21's smoke ran
+          # install alone and found nothing), bounded and retried.
+          scripts/build/apt.sh openchimed
+          openchimed --version
+
+      # The dnf half, and it is not decoration. The apt check above proved one of
+      # the two channels and the .rpm went out with nothing having attempted to
+      # install it -- the gap OC issue 142 records, left when the rockylinux:9
+      # container step went with the project's Docker usage.
+      #
+      # podman, not docker: this pipeline is daemon-free by standing constraint,
+      # which is why the image is built with buildah rather than a daemon. podman
+      # is that same family and needs no daemon either, so the rule is kept
+      # rather than bent. rockylinux:9 is the floor the glibc 2.34 target exists
+      # to support, so this also exercises the oldest supported RHEL.
+      #
+      # The whole point is to consume the repository the way an operator does:
+      # over HTTPS, with the published key and the published .repo file, on a
+      # machine that has never seen this project.
+      - name: Smoke the published dnf repository
+        if: ${{ !inputs.skip_repo_smoke }}
+        run: |
+          set -euo pipefail
+          command -v podman >/dev/null || scripts/build/apt.sh podman
+          podman run --rm rockylinux:9 bash -euo pipefail -c "
+            curl -fsSL '${DIST_VERIFY_URL}/openchime-archive-keyring.asc' -o /tmp/oc.asc
+            rpm --import /tmp/oc.asc
+            curl -fsSL '${DIST_VERIFY_URL}/openchime.repo' -o /etc/yum.repos.d/openchime.repo
+            # The published file names DIST_BASE_URL; read it from where it is verified.
+            sed -i 's|${DIST_BASE_URL}|${DIST_VERIFY_URL}|g' /etc/yum.repos.d/openchime.repo
+            dnf install -y openchimed
+            openchimed --version
+          "
+
+      # The third channel: the image, pulled by its released tag from the
+      # staging registry, logged in as the hosted model's deploy is, and run.
+      # A tag that did not land, or an image that does not start on this base,
+      # is found here rather than by the next deploy.
+      #
+      # Not behind skip_repo_smoke: that switch exists for DIST_BASE_URL being
+      # unserved, and the registry does not depend on it. And !cancelled(), so
+      # a repository step failing above cannot hide what this one would say.
+      - name: Smoke the released container image
+        if: ${{ !cancelled() }}
+        env:
+          TOKEN: ${{ secrets.FLY_REGISTRY_TOKEN_STAGING }}
+        run: |
+          set -euo pipefail
+          command -v podman >/dev/null || scripts/build/apt.sh podman
+          [ -n "$TOKEN" ] || { echo "::error::FLY_REGISTRY_TOKEN_STAGING is not set in the release environment"; exit 1; }
+          printf '%s' "$TOKEN" | podman login -u x --password-stdin registry.fly.io
+          IMAGE="${STAGING_IMAGE}:${VERSION}"
+          podman pull "$IMAGE"
+          podman run --rm "$IMAGE" --version
+
+      - name: Note the skipped smoke test
+        if: ${{ inputs.skip_repo_smoke }}
+        run: |
+          echo "::warning::published-repository smoke test SKIPPED by request -- "\
+            "nothing has verified that the apt or dnf repositories install"
+          echo '> :warning: The published-repository smoke test was skipped.' >> "$GITHUB_STEP_SUMMARY"
+
+
+  unreserve:
+    name: return the release number
+    needs: [version, publish]
+    # NOT on any publish failure -- only on one that published nothing.
+    #
+    # Learned by running it: the first successful publish failed at the very last
+    # step, `gh release create`, AFTER apt and dnf were written and smoked. This job
+    # then dutifully deleted the tag, leaving release 1 live in the apt index with
+    # no tag naming it -- which is precisely the state reserving the number early
+    # exists to prevent. Returning a number is only safe while nothing has been
+    # published under it.
+    if: ${{ always() && !inputs.dry_run && needs.version.result == 'success' && needs.publish.result != 'success' && needs.publish.outputs.published != 'true' }}
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 5
+    permissions:
+      contents: write          # deletes the tag
+    steps:
+      - uses: actions/checkout@v7
+      # Tags are pushed with the deploy key: the workflow's own token may not
+      # create a ref on a commit that changes workflow files.
+      - name: Push with the deploy key
+        env:
+          KEY: ${{ secrets.RELEASE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$KEY" ] || { echo "::error::RELEASE_SSH_KEY is not set in the release environment"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/release_key
+          chmod 600 ~/.ssh/release_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git remote set-url --push origin "git@github.com:${GITHUB_REPOSITORY}.git"
+          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/release_key -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
+      - env:
+          N: ${{ needs.version.outputs.number }}
+        run: |
+          set -euo pipefail
+          git push origin ":refs/tags/release-${N}" || true
+          echo "::warning::release ${N} did not publish; the number has been returned"
+
+  # Close the issues this release shipped. Here, not on merge: a merge lands on
+  # staging, and merged is not shipped. The squash also carries no body, so a
+  # `Closes` line never reaches main -- the commit SUBJECT names the issue instead
+  # (commit-policy enforces it), and scripts/release/close_shipped_issues.sh reads the
+  # subjects between the previous release-N and this one. It never fails: by now
+  # the packages are live, and a failed close must not brand a good release failed.
+  # The issues are on openchime/openchime, closed with PUBLIC_TOKEN (issues
+  # write there), so the job is in the `release` environment.
+  close-issues:
+    name: close shipped issues
+    needs: [resolve, version, publish]
+    if: ${{ always() && !inputs.dry_run && needs.publish.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+      - env:
+          N: ${{ needs.version.outputs.number }}
+          GH_TOKEN: ${{ secrets.PUBLIC_TOKEN }}
+        run: |
+          git fetch --tags --force --quiet || true
+          [ -n "$GH_TOKEN" ] || { echo "::warning::PUBLIC_TOKEN is not set in the release environment; closed nothing"; exit 0; }
+          scripts/release/close_shipped_issues.sh "release-${N}"
+
+  # The release-candidates for this number, done with: once release-N is
+  # published, every release-N-rcK prerelease and its tag is deleted, the one
+  # released included -- release-N carries the same files on the same commit.
+  # A tag with no release left (a publish that stopped half way) is deleted on
+  # its own. Never fails the release: by now it has shipped, and a
+  # release-candidate left behind is only clutter.
+  release-candidate-cleanup:
+    name: remove the release-candidates
+    needs: [resolve, version, publish]
+    if: ${{ always() && !inputs.dry_run && needs.publish.result == 'success' }}
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      # Tags are pushed with the deploy key: the workflow's own token may not
+      # create a ref on a commit that changes workflow files.
+      - name: Push with the deploy key
+        env:
+          KEY: ${{ secrets.RELEASE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$KEY" ] || { echo "::error::RELEASE_SSH_KEY is not set in the release environment"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/release_key
+          chmod 600 ~/.ssh/release_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git remote set-url --push origin "git@github.com:${GITHUB_REPOSITORY}.git"
+          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/release_key -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
+      - env:
+          N: ${{ needs.version.outputs.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          tags=$(git ls-remote --tags --refs origin "release-${N}-rc*" \
+                 | sed 's|.*refs/tags/||' | grep -E "^release-${N}-rc[0-9]+$" || true)
+          [ -n "$tags" ] || { echo "no release-candidates for release-${N}"; exit 0; }
+          for t in $tags; do
+            if gh release delete "$t" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes; then
+              echo "removed ${t}"
+            elif git push origin ":refs/tags/${t}"; then
+              echo "removed the tag ${t} (it had no release)"
+            else
+              echo "::warning::could not remove ${t}"
+            fi
+          done
+          exit 0
+
+  # The release, copied to openchime/openchime: the commit to its main and its
+  # staging, the release-N tag, and a release with the same files, title and
+  # notes as release-N here; then its release-candidates of N are deleted
+  # there too. A copy and nothing more: nothing reads it back, so a failure is
+  # a warning, never a failed run (continue-on-error). It reads nothing from
+  # openchime/openchime but whether a ref, the tag or a release is already
+  # there, so a re-run completes it. Pushes are plain, never forced. Pushes use
+  # PUBLIC_DEPLOY_KEY, a write deploy key on openchime/openchime; releases are
+  # made and deleted with PUBLIC_TOKEN (contents and issues write there; the
+  # issues for close-issues). Both are in the
+  # `release` environment. Last of all, after every other job.
+  sync-public:
+    name: copy to openchime/openchime
+    needs: [resolve, version, publish, smoke, close-issues, release-candidate-cleanup]
+    if: ${{ always() && !inputs.dry_run && needs.publish.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: true
+    environment: release
+    permissions:
+      contents: read
+    env:
+      PUBLIC_REPO: openchime/openchime
+      SHA: ${{ needs.resolve.outputs.sha }}
+      N: ${{ needs.version.outputs.number }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Set up the deploy key
+        env:
+          KEY: ${{ secrets.PUBLIC_DEPLOY_KEY }}
+          TOKEN: ${{ secrets.PUBLIC_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$KEY" ] || { echo "::warning::PUBLIC_DEPLOY_KEY is not set in the release environment; nothing copied to ${PUBLIC_REPO}"; exit 1; }
+          [ -n "$TOKEN" ] || { echo "::warning::PUBLIC_TOKEN is not set in the release environment; nothing copied to ${PUBLIC_REPO}"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/public_key
+          chmod 600 ~/.ssh/public_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/public_key -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
+
+      # staging there already holds this commit, or a later one, when the
+      # release-candidates after it were copied: a refused push is then only
+      # reported, once ls-remote shows staging there contains the commit.
+      - name: Push the commit to main and staging, and the tag
+        run: |
+          set -euo pipefail
+          remote="git@github.com:${PUBLIC_REPO}.git"
+          git push "$remote" "${SHA}:refs/heads/main" || {
+            echo "::warning::could not fast-forward main on ${PUBLIC_REPO} to ${SHA:0:7}"; exit 1; }
+          if ! git push "$remote" "${SHA}:refs/heads/staging"; then
+            there=$(git ls-remote "$remote" refs/heads/staging | cut -f1)
+            if [ -n "$there" ] && git merge-base --is-ancestor "$SHA" "$there" 2>/dev/null; then
+              echo "staging on ${PUBLIC_REPO} already contains ${SHA:0:7}"
+            else
+              echo "::warning::could not push ${SHA:0:7} to staging on ${PUBLIC_REPO}"; exit 1
+            fi
+          fi
+          if git ls-remote --exit-code --tags "$remote" "refs/tags/release-${N}" >/dev/null; then
+            echo "release-${N} is already there"
+          else
+            git fetch --force --quiet origin "refs/tags/release-${N}:refs/tags/release-${N}"
+            git push "$remote" "refs/tags/release-${N}" || {
+              echo "::warning::could not push release-${N} to ${PUBLIC_REPO}"; exit 1; }
+          fi
+          echo "${PUBLIC_REPO}: main and release-${N} are ${SHA:0:7}"
+
+      - name: Copy the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLIC_TOKEN: ${{ secrets.PUBLIC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if GH_TOKEN="$PUBLIC_TOKEN" gh release view "release-${N}" -R "$PUBLIC_REPO" >/dev/null 2>&1; then
+            echo "release-${N} is already published on ${PUBLIC_REPO}"
+            exit 0
+          fi
+          # The files, title and notes of release-N here, exactly.
+          gh release download "release-${N}" -R "$GITHUB_REPOSITORY" -D files
+          gh release view "release-${N}" -R "$GITHUB_REPOSITORY" --json name --jq .name > title.txt
+          gh release view "release-${N}" -R "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
+          ls -l files
+          GH_TOKEN="$PUBLIC_TOKEN" gh release create "release-${N}" -R "$PUBLIC_REPO" --verify-tag \
+            --title "$(cat title.txt)" --notes-file notes.md files/* || {
+            echo "::warning::could not publish release-${N} on ${PUBLIC_REPO}"; exit 1; }
+          echo "release-${N} published on ${PUBLIC_REPO}"
+
+      - name: Remove the release-candidates there
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_TOKEN }}
+        run: |
+          set -uo pipefail
+          tags=$(git ls-remote --tags --refs "git@github.com:${PUBLIC_REPO}.git" "release-${N}-rc*" \
+                 | sed 's|.*refs/tags/||' | grep -E "^release-${N}-rc[0-9]+$" || true)
+          [ -n "$tags" ] || { echo "no release-candidates for release-${N} on ${PUBLIC_REPO}"; exit 0; }
+          bad=0
+          for t in $tags; do
+            if gh release delete "$t" -R "$PUBLIC_REPO" --cleanup-tag --yes; then
+              echo "removed ${t} on ${PUBLIC_REPO}"
+            elif git push "git@github.com:${PUBLIC_REPO}.git" ":refs/tags/${t}"; then
+              echo "removed the tag ${t} on ${PUBLIC_REPO} (it had no release)"
+            else
+              echo "::warning::could not remove ${t} on ${PUBLIC_REPO}"; bad=1
+            fi
+          done
+          exit "$bad"
+
+      - name: Report a failed copy
+        if: ${{ failure() }}
+        run: echo "::warning::the copy to ${PUBLIC_REPO} did not complete; release-${N} is published here regardless. Re-run this job to finish it."

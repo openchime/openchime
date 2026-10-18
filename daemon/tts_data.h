@@ -1,0 +1,53 @@
+/*
+ * OpenChime — where read-aloud's data lives, and whether it is the data this
+ * daemon was built for (REQ-295, ARCH-111, READ-ALOUD.md §4).
+ *
+ * The voice model, its voices and ttskit's pronunciation data are files beside
+ * the daemon rather than bytes inside it. Nothing here needs ONNX Runtime, so the
+ * tests link it directly.
+ */
+#ifndef OC_TTS_DATA_H
+#define OC_TTS_DATA_H
+
+#include <stddef.h>
+
+/* The default for a packaged install: read-only content, which does not belong
+ * in /data, the writable volume every other daemon path defaults into. */
+#define OC_TTS_DATA_SYSTEM_DIR "/usr/share/openchime/tts"
+#define OC_TTS_DATA_MANIFEST   "manifest"
+
+/* Choose the data directory: `system_dir` when it exists, else `tts/` beside
+ * the executable. 1 with `out` set, or 0 with `err` saying why not. */
+int oc_tts_data_dir(const char *system_dir, const char *exe_dir,
+                    char *out, size_t cap, char *err, size_t errcap);
+
+/* The same choice for any speech feature's data: `beside` is the directory name
+ * looked for next to the executable ("tts" for read-aloud, "stt" for voice input). */
+int oc_data_dir_find(const char *system_dir, const char *exe_dir,
+                     const char *beside, char *out, size_t cap, char *err, size_t errcap);
+
+/* The directory holding the running executable, from /proc/self/exe. 1 or 0. */
+int oc_tts_exe_dir(char *out, size_t cap);
+
+/* Whether `dir` holds the data for `version`. Its manifest must name `version`
+ * exactly and list every one of `required` (relative paths) with a SHA-256 that
+ * the file on disk matches. 0 when it does; -1 with a reason otherwise. A data
+ * directory from another build, a partial copy or an altered file fails here, at
+ * startup, rather than producing wrong speech -- the loose files can disagree
+ * with the code in a way embedded bytes never could. */
+int oc_tts_data_verify(const char *dir, const char *version, const char *const *required,
+                       char *err, size_t errcap);
+
+/* Write `dir`'s manifest for `version` over `files`, hashing each. 0 or -1. */
+int oc_tts_data_write_manifest(const char *dir, const char *version, const char *const *files,
+                               char *err, size_t errcap);
+/* The same from the command line (`openchimed --tts-manifest <dir>`, the
+ * packaging step): says what it wrote or why not on stderr; the exit code. */
+int oc_tts_data_write_manifest_cli(const char *dir, const char *version, const char *const *files);
+
+/* A file mapped read-only, as the engine consumes it in place. */
+typedef struct { const unsigned char *p; size_t n; } oc_tts_map;
+int  oc_tts_map_open(const char *path, oc_tts_map *m);
+void oc_tts_map_close(oc_tts_map *m);
+
+#endif

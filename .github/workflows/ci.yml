@@ -1,0 +1,260 @@
+name: ci
+
+# Runs on every pull request into staging and every push to staging -- the
+# checks staging's branch protection requires before a merge. The push's run is
+# the gate release-candidate.yml waits for (release.yml does not run it again).
+# Three jobs, on three machines at once, and nothing checked twice:
+#   - build:       the daemon built and started for real (health check plus the
+#                  protocol vertical over TLS), static linking, every Linux
+#                  translation unit through the release's clang (the second
+#                  compiler), and the suites that run no threads.
+#   - thread-sanitizer: the suites whose code runs threads, under
+#                  ThreadSanitizer -- their one run in CI.
+#   - windows:     the Windows front-ends (TUI + the SDL3/sdltext GUI,
+#                  ARCH-80/106/107) cross-compiled with the pinned llvm-mingw.
+#                  Build breaks only.
+#
+# Each suite runs once: the threaded ones under the sanitizer, the rest plainly
+# (the Makefile's TSAN_SUITES). Every vendored library and toolchain is fetched
+# pinned by the script that builds it (mk/toolchains.mk) and cached by that
+# script's hash; nothing is installed from a package the day decides. One
+# runner image everywhere, ubuntu-24.04, the same one the release builds on.
+# What the release checks itself -- read-aloud and voice input on the stripped
+# binary and the installed package -- is not repeated here.
+#
+# There is deliberately no GUI job. scripts/gui/smoke.sh needs a Windows host for
+# the client and a Linux one for the epoll-based daemon at the same time, which no
+# hosted runner provides; a job was carried here for a self-hosted box gated on
+# vars.GUI_SMOKE and, with that variable never set, ran zero times while the release
+# inherited its skip as a pass. It stays as the pre-push gate docs/CLIENT.md
+# already makes it.
+# Doc-only pull requests skip CI; every push to staging runs it. See docs/TESTING.md for the full strategy.
+
+on:
+  # A pull request into staging, where its results are the required checks; and
+  # the push that lands on staging, whose run saves the caches every pull request
+  # then restores (a cache is visible to a pull request from its base branch, not
+  # from another feature branch). Not main: nothing reaches main but a release
+  # of a staging commit, which CI already ran.
+  pull_request:
+    branches: [staging]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+  # Every push, with no path filter: on a force-push the filter skipped the one
+  # run a release-candidate waits on.
+  push:
+    branches: [staging]
+  # Lets the release workflow gate on these exact jobs rather than re-implement
+  # them. A release that ran a weaker suite than CI would be worse than no gate,
+  # because it would look like one. Same arrangement the control-plane repo's
+  # deploys use.
+  workflow_call:
+
+# Grouped by the calling workflow as well as the ref: when release.yml calls
+# this one, github.workflow is "release", so a push to staging (its own CI run)
+# no longer cancels the gate of a dry run rehearsing on staging, which it did
+# the first time one ran alongside a merge. Two runs of one workflow on one
+# ref still cancel the older, which is the point.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build + unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90   # a cold cache builds the vendored libraries: ~44 min
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build deps
+        timeout-minutes: 20
+        run: |
+          # scripts/build/apt.sh: the mirror rewritten, each apt-get bounded
+          # and retried, so a stall fails the step instead of holding the job.
+          # bzip2 for the vendored mbedTLS tarball that `make` builds via
+          # scripts/build/mbedtls.sh; nasm for libvpx's assembly
+          # (scripts/build/libvpx.sh); xz-utils for the toolchain tarballs. gdb
+          # so that a test binary that crashes prints every thread's stack
+          # (tests/main.c). cmake, curl, git and python3 are on the image.
+          scripts/build/apt.sh bzip2 nasm gdb xz-utils
+      # The toolchains make fetches pinned (mk/toolchains.mk): zig for the
+      # release-compiler pass, Emscripten for the web client the daemon embeds.
+      # Keyed by the scripts, which pin the versions and the checksums.
+      - name: Restore the toolchains
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/zig-0.13.0
+            third_party/emsdk-6.0.8
+          key: toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
+      # Read-aloud's engine and model (ARCH-111): ONNX Runtime built minimal and
+      # static from source (about 20 minutes), the converted voice model, and
+      # voice input's recognizer files (ARCH-112). All are pure functions of the
+      # files in the key, so a hit skips the build and a change to any of them
+      # rebuilds. The timeout allows for a miss.
+      - name: Restore the speech engine and models
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/onnxruntime-1.30.0
+            build/kitten
+            build/moonshine
+          key: tts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build/onnxruntime.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+      # The vendored native libraries: each script builds only what is missing,
+      # so a hit skips the download and the build. Keyed by the scripts, which pin
+      # the versions and checksums, and by the compiler that builds them.
+      - name: Restore the vendored libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/mbedtls-3.6.2
+            third_party/libvpx-1.17.0
+            third_party/opus-1.6.1
+            third_party/speexdsp-1.2.1
+            third_party/llamacpp-0.5.0
+          key: vendor-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh', 'scripts/build/llamacpp.sh') }}
+      # The web client's libraries (docs/WEB.md): the release daemon carries the
+      # client (WEB=1), so this job builds it too. Built once by their scripts
+      # and cached, keyed by the scripts and the pinned Emscripten.
+      - name: Restore the wasm libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/wasm/mbedtls
+            build/wasm/sdl3
+            build/wasm/libvpx
+            build/wasm/opus
+            build/wasm/speexdsp
+          key: wasm-emsdk6.0.8-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/sdl3_wasm.sh', 'scripts/build/media_wasm.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
+      # The daemon as the release builds it (every feature, the web client in),
+      # the e2e client the step below drives, and the Linux terminal client.
+      - name: Build the daemon, the e2e client and the terminal client
+        run: make TTS=1 STT=1 SUM=1 WEB=1 && make build/e2e_client linux
+      # Only the C runtime may be dynamic. ONNX Runtime, llama.cpp, their C++
+      # runtime, mbedTLS, libopus and SQLite are all inside the binary, so anything else
+      # appearing here is a dependency that crept back in.
+      - name: The daemon links statically
+        run: |
+          ldd openchimed
+          if ldd openchimed | grep -vE 'linux-vdso|libc\.so|libm\.so|ld-linux'; then
+            echo "::error::openchimed has a dynamic dependency beyond libc and libm"; exit 1
+          fi
+      # The built binary, started from its environment as a deployment starts
+      # it: the one thing the in-process suites cannot show, since they link the
+      # daemon's code without its main(). Start, assert, stop in ONE step -- a
+      # backgrounded daemon does not outlive the step that launched it.
+      - name: End-to-end (healthz, then the protocol vertical over TLS)
+        env:
+          OPENCHIME_DATA_DIR: ${{ runner.temp }}/itest
+          OPENCHIME_HEALTH_PORT: '8080'
+          OPENCHIME_PORT: '8443'
+          # Development mode: the step bootstraps its users, which only that
+          # mode reads (CONFIG.md "Mode"). The e2e client signs in on the
+          # daemon's page, as a person does (AUTH.md §8.10, tests/testsignin.h).
+          OPENCHIME_MODE: development
+          OPENCHIME_DEV_USERS: 'e2e-alice:e2e-pw:owner,e2e-bob:e2e-pw:member'
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ runner.temp }}/itest"
+          log="${{ runner.temp }}/daemon.log"
+          ./openchimed >"$log" 2>&1 &
+          dpid=$!
+          trap 'kill "$dpid" 2>/dev/null || true' EXIT
+          ok=
+          for _ in $(seq 1 60); do
+            if curl -sf http://localhost:8080/healthz >/dev/null 2>&1; then ok=1; break; fi
+            kill -0 "$dpid" 2>/dev/null || break
+            sleep 1
+          done
+          if [ -z "$ok" ]; then echo "::error::daemon did not become healthy"; cat "$log"; exit 1; fi
+          ./build/e2e_client 127.0.0.1 8443
+      # The release compiles with zig's clang against glibc 2.34, and a newer
+      # clang refuses things gcc accepts: a C11 typedef repetition and a
+      # declaration after a label each passed gcc and broke a release. Every
+      # Linux translation unit -- the daemon's, the client's and the tests' --
+      # goes through that exact compiler under -Werror, which is the tree's
+      # second-compiler check too. make fetches the pinned zig.
+      - name: Everything compiles with the release's compiler
+        run: make check-release-cc
+      # The suites that run no threads; the others run under the sanitizer in
+      # its own job. Its recipe runs the five source checks first (mk/tests.mk's
+      # SOURCE_CHECKS: opcodes, issue references, make targets, the configuration
+      # registry, release lint).
+      - name: Run the suites the sanitizer does not
+        run: make test-ci PART=plain
+
+  thread-sanitizer:
+    name: thread sanitizer
+    # The daemon is threads -- the event loop, its I/O threads, the writer, the
+    # readers and the auth pool, the worker pools -- and so are the client, its
+    # call engine and its recorder. `make test-ci PART=threads` runs the suites whose code
+    # runs threads (the Makefile's TSAN_SUITES) under ThreadSanitizer, and a data
+    # race between our threads fails it (tests/tsan.supp). This is those
+    # suites' only run in CI.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build deps
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          # ffmpeg only for ffprobe, which the media suite runs over a recorded
+          # file as an independent validator -- nothing links it. gdb so that a
+          # crash prints every thread's stack (tests/main.c).
+          scripts/build/apt.sh bzip2 nasm ffmpeg gdb
+      # The vendored native libraries: each script builds only what is missing,
+      # so a hit skips the download and the build. Keyed by the scripts, which pin
+      # the versions and checksums, and by the compiler that builds them.
+      - name: Restore the vendored libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/mbedtls-3.6.2
+            third_party/libvpx-1.17.0
+            third_party/opus-1.6.1
+            third_party/speexdsp-1.2.1
+          key: vendor-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
+      # The test binary needs no Emscripten: the web client's page is embedded
+      # from source and its loader only into a daemon built with WEB=1.
+      - name: Test under ThreadSanitizer
+        run: make test-ci PART=threads
+
+  windows:
+    name: windows cross-compile (TUI + GUI)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build deps
+        timeout-minutes: 20
+        run: |
+          # bzip2 for the mbedTLS tarball, nasm for libvpx's assembly, xz-utils
+          # for the toolchain tarball. The compiler is not a package: make
+          # fetches the pinned llvm-mingw (scripts/build/llvm_mingw.sh).
+          scripts/build/apt.sh bzip2 nasm xz-utils
+      - name: Restore the toolchain
+        uses: actions/cache@v6
+        with:
+          path: third_party/llvm-mingw-20261006
+          key: toolchain-mingw-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh') }}
+      # The cross-built libraries and SDL3, cached like the native ones: each
+      # script builds only what is missing, and make runs each from its rule.
+      - name: Restore the vendored Windows libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/mbedtls-3.6.2-win
+            third_party/libvpx-1.17.0-win
+            third_party/opus-1.6.1-win
+            third_party/speexdsp-1.2.1-win
+            third_party/sdl3-3.4.14-win
+            third_party/mbedtls-3.6.2
+          key: vendor-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh', 'scripts/build/mbedtls.sh', 'scripts/build/mbedtls_windows.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh', 'scripts/build/sdl3_windows.sh') }}
+      # Both Windows front-ends share the app-core + shared wire code; a clean
+      # link proves the pure-C Win32 (incl. Direct2D/DirectWrite-from-C, ARCH-82)
+      # builds under clang's mingw. The two Windows test programs are built
+      # too (a Windows host runs them, docs/TESTING.md).
+      - name: Compile the Windows front-ends and test programs
+        run: make windows build/sdltext_test.exe build/gfx_test.exe
