@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # The media libraries for the web client (docs/WEB.md): libvpx, libopus and
 # speexdsp built with Emscripten into build/wasm/{libvpx,opus,speexdsp}, from
-# the same sources as natively: libvpx and libopus fetched and verified by
-# scripts/build/libvpx.sh and scripts/build/opus.sh (run first for the sources
-# when they are not there yet), speexdsp committed in third_party/speexdsp.
+# the same sources as natively: libvpx fetched and verified by
+# scripts/build/libvpx.sh (run first for the sources when they are not there
+# yet), libopus and speexdsp committed in third_party/opus and third_party/speexdsp.
 # Needs emcc on PATH.
 #
 # libvpx is VP9 only and real-time only, as natively; its x86 assembly is
@@ -13,20 +13,18 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 command -v emcc >/dev/null || { echo "build_media_wasm: emcc not on PATH (make fetches it: mk/toolchains.mk)" >&2; exit 1; }
 LIBVPX_VERSION="${LIBVPX_VERSION:-1.17.0}"
-OPUS_VERSION="${OPUS_VERSION:-1.6.1}"
 mkdir -p build/wasm
 J="$(nproc)"
 
-# The fetched sources, verified by the native scripts.
+# The fetched sources, verified by the native script.
 [ -d "third_party/libvpx-${LIBVPX_VERSION}/src" ]     || scripts/build/libvpx.sh fetch
-[ -d "third_party/opus-${OPUS_VERSION}/src" ]         || scripts/build/opus.sh fetch
 
 OUT=build/wasm/opus
 if [ ! -f "$OUT/lib/libopus.a" ]; then
   echo "build_media_wasm: opus"
   rm -rf "$OUT"; mkdir -p "$OUT/build"
   ( cd "$OUT/build"
-    emconfigure "$OLDPWD/third_party/opus-${OPUS_VERSION}/src/configure" --host=wasm32-unknown-emscripten \
+    emconfigure "$OLDPWD/third_party/opus/configure" --host=wasm32-unknown-emscripten \
       --prefix="$(cd .. && pwd)" --disable-shared --enable-static --disable-doc --disable-extra-programs \
       --disable-intrinsics --disable-rtcd --disable-stack-protector CFLAGS="-O2 -pthread" >/dev/null
     emmake make -j"$J" >/dev/null && emmake make install >/dev/null )

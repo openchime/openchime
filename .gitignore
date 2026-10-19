@@ -28,6 +28,7 @@ dist/
 !/third_party/libfvad/
 !/third_party/ca-roots/
 !/third_party/speexdsp/
+!/third_party/opus/
 *.o
 *.db
 *.db-shm

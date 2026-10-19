@@ -44,12 +44,22 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **Mozilla CA roots** | curl's extract, dated (see `scripts/gen/ca_roots.sh`) | The roots every outbound HTTPS client verifies against (ARCH-10): S3, the control plane, unfurls, the client's `.well-known` fetch | Daemon + every client (`third_party/ca-roots/ca_roots.c`, generated) | https://curl.se/docs/caextract.html | MPL-2.0 (the certificate data) |
 | **SQLite** (amalgamation) | 3.53.4 | The daemon's database (ARCH-2), compiled in with `SQLITE_ENABLE_FTS5`. **Not linked by any client** (ARCH-88) | Daemon + tests (`third_party/sqlite-3.53.4/sqlite3.c`) | https://sqlite.org | Public Domain |
 | **speexdsp** | 1.2.1 | The acoustic echo canceller (`speex_echo_state`), behind the processor seam (AUDIO.md §3.3) | Client media library (`client/core/media/processor.c`) — voice input (ARCH-112) and the audio client; never the daemon | https://www.speex.org | BSD-3-Clause |
+| **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) and the audio client (ARCH-73) | https://opus-codec.org | BSD-3-Clause |
 
 **speexdsp** is committed in `third_party/speexdsp/` as Xiph's 1.2.1 release
 tarball, unmodified, its `COPYING` with it. `scripts/build/speexdsp.sh` builds
 it out of tree, static and floating point, `native` for `make test` and
 `windows` for the Win32 client, into `third_party/speexdsp-1.2.1[-win]/`
 (gitignored); nothing is downloaded. The daemon links none of it.
+
+**libopus** is committed in `third_party/opus/` as Xiph's 1.6.1 release
+tarball, unmodified, its `COPYING` with it. `scripts/build/opus.sh` builds it
+out of tree, static, `native` for `make test` (with `OC_ARCH`, another
+architecture's) and `windows` for the Win32 client, into
+`third_party/opus-1.6.1[-win]/` (gitignored); nothing is downloaded. The daemon
+links it only to encode read-aloud renders (ARCH-111); it relays Opus without
+decoding it (ARCH-73). BSD-3-Clause, whose binary-redistribution clause wants
+the notice carried with a shipped client.
 
 **Why the daemon compiles SQLite in rather than linking the host's (ARCH-20; no
 client links SQLite at all, ARCH-88).**
@@ -109,7 +119,7 @@ verbatim from the notice in `jsmn.h`, which is where upstream keeps it), and the
 its header). miniaudio's implementation is compiled in exactly one translation
 unit, `audio_dev.c`, with only device I/O enabled. `.gitignore` ignores
 `third_party/*` and whitelists the committed paths: `jsmn/`, `termbox2/`,
-`picohttpparser/`, `utf8proc/`, `argon2/`, `pwlist/`, `qrcodegen/`, `miniaudio/`, `stb/`, `sqlite-3.53.4/`, `libfvad/`, `ca-roots/`, `speexdsp/` and `lucide/`
+`picohttpparser/`, `utf8proc/`, `argon2/`, `pwlist/`, `qrcodegen/`, `miniaudio/`, `stb/`, `sqlite-3.53.4/`, `libfvad/`, `ca-roots/`, `speexdsp/`, `opus/` and `lucide/`
 (see below). Everything else under
 `third_party/` — the fetched mbedTLS trees among it — stays ignored.
 
@@ -136,7 +146,6 @@ has moved (`scripts/check/toolchains.sh`).
 | **Mbed TLS** | 3.6.2 | TLS transport (client + daemon), certificate verification, ACME's JWS, CSRs and challenge certificates, SHA-256, ES256 verify; calls' end-to-end encryption — X25519, HKDF, AES-GCM, CTR-DRBG for HPKE and SFrame (ARCH-113) | Daemon + client (`shared/tls.c`, `shared/e2e_*.c`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 **OR** GPL-2.0-or-later (dual; we use it under Apache-2.0) |
 | **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx) | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
 | **libvpx** | 1.17.0 | VP9 encode and decode | Client media library — video messages (ARCH-110) and screenshare (ARCH-87) | https://chromium.googlesource.com/webm/libvpx | BSD-3-Clause (with a separate patent grant) |
-| **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) and the audio client (ARCH-73) | https://opus-codec.org | BSD-3-Clause |
 | **ONNX Runtime** | 1.30.0 | Neural network inference for the read-aloud voice model and the voice-input recognizer, built from source **minimal and static** (only the models' operators and types, `.ort` format only, no exceptions) | Daemon (read-aloud ARCH-111, voice input ARCH-112) | https://github.com/microsoft/onnxruntime | MIT (its compiled-in components — abseil, flatbuffers, protobuf-lite, ONNX, cpuinfo, Eigen — are permissive and listed in its ThirdPartyNotices) |
 | **llama.cpp** (with ggml) | 0.5.0 | Running the summary model, built from source **CPU only and static** (no OpenMP, no tools, no network code) | Daemon (summaries ARCH-116) | https://github.com/ggml-org/llama.cpp | MIT |
 | **Kitten TTS mini** | 0.8 | The read-aloud voice model: `kitten_tts_mini_v0_8.onnx` and `voices.npz`, converted to `.ort` and **shipped beside the daemon** as data | Daemon (read-aloud, ARCH-111) | https://huggingface.co/KittenML/kitten-tts-mini-0.8 | Apache-2.0 |
@@ -170,19 +179,18 @@ class and not the committed-single-file one (the reasoning §7 records for
 libvpx). zlib-licensed: no notice needs to travel with a shipped
 binary, so `packaging/licenses.sh` (daemon-only regardless) is untouched.
 
-**libvpx and libopus** are the codecs (ARCH-110), fetched the same way:
-`scripts/build/libvpx.sh` and `scripts/build/opus.sh`, each taking `native` (the
-Linux build `make test` links; with `OC_ARCH`, another architecture's, as `make
-ARCH=aarch64` asks) or `windows` (cross-built with llvm-mingw for the Win32
-client), each refusing an unverified tarball and an unpinned bump exactly as above.
-Both build **static-only**. libvpx is configured VP9-only and real-time-only, with
+**libvpx** is the video codec (ARCH-110), fetched the same way:
+`scripts/build/libvpx.sh`, taking `native` (the Linux build `make test` links;
+with `OC_ARCH`, another architecture's, as `make ARCH=aarch64` asks) or
+`windows` (cross-built with llvm-mingw for the Win32 client), refusing an
+unverified tarball and an unpinned bump exactly as above. It builds
+**static-only**, configured VP9-only and real-time-only, with
 no examples, tools, docs or unit tests, and needs **nasm** for its assembly; its
 mingw build threads through winpthreads, which the Win32 link therefore pulls in
-statically. Output goes to `third_party/libvpx-1.17.0[-win]/` and
-`third_party/opus-1.6.1[-win]/` (gitignored). **The daemon links no libvpx** — it
-relays Opus without decoding it (ARCH-73) and stores a video message as opaque
-bytes (ARCH-110) — and links libopus only to encode read-aloud renders (ARCH-111). Both are BSD-3-Clause, whose binary-redistribution clause wants
-the notice carried with a shipped client.
+statically. Output goes to `third_party/libvpx-1.17.0[-win]/` (gitignored).
+**The daemon links no libvpx**: it stores a video message as opaque bytes
+(ARCH-110). BSD-3-Clause, whose binary-redistribution clause wants the notice
+carried with a shipped client.
 
 **Read-aloud's engine and model** (ARCH-111) come the same way, with more to
 say because ONNX Runtime is the one C++ dependency and the model is large:
@@ -244,8 +252,9 @@ llama.cpp's MIT notice travels with every package through `packaging/licenses.sh
 **The web client** (`make web`) builds its own copies with Emscripten into
 `build/wasm/` (gitignored): `scripts/build/mbedtls_wasm.sh` from the fetched
 mbedTLS tree, `scripts/build/sdl3_wasm.sh` from the same pinned, SHA-256-verified
-SDL3 release, and `scripts/build/media_wasm.sh` for libvpx and libopus from the sources their
-native scripts fetch and verify, and for speexdsp from `third_party/speexdsp/`.
+SDL3 release, and `scripts/build/media_wasm.sh` for libvpx from the sources its native script
+fetches and verifies, and for libopus and speexdsp from `third_party/opus/` and
+`third_party/speexdsp/`.
 
 ## 3. System / OS packages (linked at build)
 
@@ -370,7 +379,7 @@ paths ship; nothing is fetched at runtime.
 | **MIT / Public Domain** | stb_image_write, stb_image | Vendored, committed; client only |
 | **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 41 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
-| **BSD-3-Clause** | libvpx (VP9), libopus | Fetched at build and static-linked: both into the Win32 client (ARCH-110), and libopus into the daemon to encode read-aloud renders (ARCH-111). Permissive, within this repo's posture (mbedTLS is already Apache-2.0, not MIT) |
+| **BSD-3-Clause** | libvpx (VP9), libopus | libvpx fetched at build, libopus committed; both static-linked into the Win32 client (ARCH-110), and libopus into the daemon to encode read-aloud renders (ARCH-111). Permissive, within this repo's posture (mbedTLS is already Apache-2.0, not MIT) |
 | **BSD-3-Clause** | speexdsp, libfvad | Voice input in the Win32 client (ARCH-112): speexdsp committed and static-linked, libfvad vendored and compiled in; **client only** |
 | **Public Domain** | SQLite | Compiled in, **daemon only** — no client links it (ARCH-88) |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
