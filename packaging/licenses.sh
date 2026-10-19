@@ -7,8 +7,9 @@
 # copied into this script, so they cannot drift from what was linked.
 #
 # Only what the DAEMON links is listed. termbox2 is TUI-only and lucide is
-# client artwork; utf8proc is in both, the daemon normalizing passwords with it; none is in openchimed, and claiming otherwise would
-# be its own kind of wrong. Read-aloud (ARCH-111) is built into the daemon by
+# client artwork: neither is in openchimed, and claiming otherwise would be its
+# own kind of wrong. utf8proc and qrcodegen are in both, the daemon normalizing
+# passwords with one and drawing the setup page's QR code with the other. Read-aloud (ARCH-111) is built into the daemon by
 # default, and with it ONNX Runtime, the Kitten voice model and data derived from
 # CMUdict; voice input (ARCH-112) likewise, with ONNX Runtime and Moonshine. A
 # daemon built with `make TTS=0`, `STT=0` or `SUM=0` is described with the same here.
@@ -72,6 +73,8 @@ in full here, as those licences require.
                                 as data
   jsmn             MIT          JSON tokenizer (OIDC and webhook payloads)
   picohttpparser   MIT          HTTP request parser (webhooks, /healthz)
+  QR Code          MIT          the QR code on the second-step setup page
+    generator 1.8.0
   Mozilla CA roots MPL-2.0      the root certificates outbound HTTPS verifies
                                 against, embedded as data; the source form is
                                 third_party/ca-roots in the repository above
@@ -90,6 +93,7 @@ fi
 if [ "$TTS" = 1 ]; then
   cat <<'HEADER'
   Kitten TTS mini 0.8  Apache-2.0   the voice model, embedded
+  Opus 1.6.1           BSD-3-Clause encoding read-aloud's audio
   CMUdict              BSD-style    source of the embedded pronunciation data
 HEADER
 fi
@@ -111,6 +115,7 @@ emit "utf8proc -- MIT License, with the Unicode data licence" "${root}/third_par
 emit "SecLists (the common-password list) -- MIT License" "${root}/third_party/pwlist/LICENSE"
 emit "jsmn -- MIT License" "${root}/third_party/jsmn/LICENSE"
 emit "picohttpparser -- MIT License" "${root}/third_party/picohttpparser/LICENSE"
+emit "QR Code generator 1.8.0 -- MIT License" "${root}/third_party/qrcodegen/LICENSE"
 emit "Mozilla CA roots -- Mozilla Public License 2.0" "${root}/third_party/ca-roots/LICENSE"
 emit "SQLite 3.53.4 -- Public Domain" "${root}/third_party/sqlite-3.53.4/LICENSE"
 
@@ -122,6 +127,7 @@ if [ "$TTS" = 1 ] || [ "$STT" = 1 ]; then
 fi
 if [ "$TTS" = 1 ]; then
   emit "Kitten TTS mini 0.8 -- Apache License 2.0" "${root}/build/kitten/LICENSE"
+  emit "Opus 1.6.1 -- BSD 3-Clause License" "${root}/third_party/opus/COPYING"
   emit "CMU Pronouncing Dictionary -- BSD-style licence" "${root}/ttskit/data/CMUDICT-LICENSE"
 fi
 if [ "$STT" = 1 ]; then

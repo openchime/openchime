@@ -112,9 +112,11 @@ texts in full — `/usr/share/doc/openchimed/copyright` on Debian,
 `/usr/share/licenses/openchimed/copyright` on RHEL, `COPYRIGHT` in the tarball.
 `packaging/licenses.sh` reads them out of the trees the build actually used, so
 the notice cannot drift from what was linked, and it **fails the build** if a
-licence file is missing rather than shipping a binary without one. termbox2,
-qrcodegen and lucide are deliberately absent from that file: they are TUI and
-client components. utf8proc is in it: the daemon normalizes passwords with it.
+licence file is missing rather than shipping a binary without one. termbox2 and
+lucide are deliberately absent from that file: they are TUI and client
+components. utf8proc, qrcodegen and libopus are in it: the daemon normalizes
+passwords with utf8proc, draws the second-step setup page's QR code with
+qrcodegen, and encodes read-aloud's audio with libopus.
 
 Since **ARCH-83**, `tuikit/` is the in-tree toolbox wrapping termbox2 + utf8proc
 (terminal layer + width handling), which the TUI builds on. `client/tui/main.c`
