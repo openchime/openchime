@@ -164,8 +164,12 @@
  *
  * 26: CHANNEL_INFO and each CHANNEL_LIST entry carry `e2e`: 1 for a DM whose
  * messages are encrypted end to end (PRIVATE-DM.md), whose bodies the daemon
- * cannot read. A byte appended to two layouts. */
-#define OC_PROTOCOL_VERSION 26u
+ * cannot read. A byte appended to two layouts.
+ *
+ * 27: WORKSPACE_INFO carries `max_video_size`, the daemon's cap on a video
+ * message (OPENCHIME_MAX_VIDEO_SIZE), which a client's recorder stays within
+ * (REQ-164). A u64 appended to a layout. */
+#define OC_PROTOCOL_VERSION 27u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -633,7 +637,7 @@ typedef enum {
     OC_ERR_CHANNEL_ARCHIVED    = 3019, /* channel is archived: read-only (REQ-035) */
     OC_ERR_INVALID_MESSAGE     = 3020, /* nothing to send: an empty body (REQ-224) */
     OC_ERR_MEDIA_INVALID       = 3021, /* ATTACH_MEDIA_SET refused: kind, bounds, type or poster (REQ-164) */
-    OC_ERR_MEDIA_TOO_LARGE     = 3022, /* the video exceeds MAX_VIDEO_MESSAGE_SIZE (REQ-164) */
+    OC_ERR_MEDIA_TOO_LARGE     = 3022, /* the video exceeds WORKSPACE_INFO's max_video_size (REQ-164) */
     OC_ERR_NOT_RENDERABLE      = 3023, /* the message has nothing to say aloud (REQ-294) */
     OC_ERR_TTS_UNAVAILABLE     = 3024, /* read-aloud is off, busy or the render failed (REQ-295) */
     OC_ERR_CALL_UNAVAILABLE    = 3025, /* the audio relay is down and could not be restarted (REQ-150) */
@@ -932,10 +936,6 @@ typedef struct {
 #define OC_MEDIA_MAX_WIDTH        1920u
 #define OC_MEDIA_MAX_HEIGHT       1080u
 #define OC_MEDIA_MAX_POSTER_SIZE  (1024u * 1024u)
-/* A video message's byte cap, five minutes at 1080p: what the recorder sizes a
- * take to, and the daemon's initial value only -- at startup it enforces
- * OC_MAX_VIDEO_SIZE (daemon/config.h), the same 160 MiB. */
-#define OC_MAX_VIDEO_MESSAGE_SIZE (160ull * 1024 * 1024)
 
 typedef struct { uint64_t attachment_id; uint8_t media_kind; uint32_t duration_ms;
                  uint16_t width, height; uint64_t poster_id; } oc_attach_media_set;
@@ -979,12 +979,14 @@ typedef struct { uint8_t scope; oc_slice session_token; } oc_logout;
 /* call_max is the most people in one call (OC_CALL_MAX, REQ-305), so a
  * client starting one in a large channel knows when the starter has to pick.
  * mode is OPENCHIME_MODE: 0 normal, 1 development, 2 demo -- a public demo,
- * which a client says it is in (AUTH.md §8.12). */
+ * which a client says it is in (AUTH.md §8.12). max_video_size is the most
+ * bytes a video message may hold (OPENCHIME_MAX_VIDEO_SIZE, REQ-164): a
+ * client's recorder stops short of it, and the daemon refuses more. */
 #define OC_WS_MODE_NORMAL      0
 #define OC_WS_MODE_DEVELOPMENT 1
 #define OC_WS_MODE_DEMO        2
 typedef struct { uint8_t deployment_mode; uint32_t max_users; oc_slice workspace_name;
-                 uint8_t call_max; uint8_t mode; } oc_workspace_info;
+                 uint8_t call_max; uint8_t mode; uint64_t max_video_size; } oc_workspace_info;
 /* Pushed after WORKSPACE_INFO, only where the deployment names the workspace's
  * canonical address (OPENCHIME_MANAGED_ADDRESS): a workspace moved to a new
  * address still answers at the old one for a while, and a client that connected

@@ -492,6 +492,8 @@ oc_recorder *oc_recorder_open(const oc_recorder_opts *opts, int *err) {
     int dummy;
     if (!err) err = &dummy;
     oc_recorder_opts o = opts ? *opts : (oc_recorder_opts){0};
+    /* No budget is no daemon cap known: nothing is recorded that could be refused. */
+    if (!o.max_bytes) { *err = OC_REC_FAILED; return NULL; }
     int want_h = o.height > 0 ? o.height : 720;
     int want_w = o.width > 0 ? o.width : (want_h * 16 / 9) & ~1;
     int fps = o.fps > 0 ? o.fps : 30;
@@ -503,7 +505,7 @@ oc_recorder *oc_recorder_open(const oc_recorder_opts *opts, int *err) {
     r->cap_ms = cap_from_env(o.cap_ms ? o.cap_ms : OC_RECORDER_CAP_MS);
     r->fps = fps;
     r->want_h = want_h;
-    r->max_bytes = o.max_bytes ? o.max_bytes : OC_RECORDER_MAX_BYTES;
+    r->max_bytes = o.max_bytes;
 
     int cerr;
     r->screen = o.screen_id && *o.screen_id;

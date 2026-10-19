@@ -22504,6 +22504,8 @@ static void rec_open_devices(oc_win *hwnd) {
     if (g_vm_ncams) o.camera_id = g_vm_cams[g_vm_cam].id;
     if (g_vm_nmics) o.mic_id = g_vm_mics[g_vm_mic].id;
     o.height = g_vm_quality;
+    /* Within the workspace's own cap, which WORKSPACE_INFO told us (REQ-164). */
+    o.max_bytes = oc_recorder_budget(model()->max_video_size);
     g_vm_gone = 0;
     const oc_capture_device *src = vm_source();
     if (src) {

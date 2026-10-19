@@ -1302,7 +1302,8 @@ where one exists.
   codec and treats the file as an ordinary attachment (REQ-140) with media
   metadata beside it — duration, dimensions and a poster image. Because the daemon
   cannot measure a duration, the reported one is advisory and the enforced bound
-  is a **byte cap** for video messages (`OC_MAX_VIDEO_SIZE`, 160 MiB).
+  is a **byte cap** for video messages (`OPENCHIME_MAX_VIDEO_SIZE`, 160 MiB by
+  default), which the daemon tells clients and enforces.
 - **REQ-165.** A video message has **played back in the client**: a
   card in the conversation with its poster, a play mark and its duration, opening
   a player with play and pause, seeking, volume and download. Previews name it

@@ -109,6 +109,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 |---|---|---|
 | `OPENCHIME_MODE` | `normal` | What the box is for: `normal` (a deployment), `development` (the tests and harnesses; the only mode that reads the Development rows) or `demo` (the public demo workspace). One of `normal`, `development`, `demo`. |
 | `OPENCHIME_WORKSPACE_NAME` | *(empty)* | The workspace's display name, shown to clients; unset, a client derives one from the host. |
+| `OPENCHIME_MAX_VIDEO_SIZE` | `167772160` | The most bytes one video message may hold (REQ-164), at most the attachment cap of 209715200; clients learn it at sign-in and record within it. 160 MiB by default. Integer 1048576..209715200. |
 | `OPENCHIME_DATA_DIR` | `/data` | Where the daemon keeps everything: `openchime.db`, `blobs/`, `cert.pem`, `key.pem`, `factor.key`, `summary/`. The packages set `/var/lib/openchime`. |
 | `OPENCHIME_PORT` | `8443` | The TLS port the protocol, the web client and the sign-in pages are served on, and the UDP port calls use (443 for a real deployment, ARCH-54). Integer 1..65535. |
 | `OPENCHIME_HEALTH_PORT` | `8080` | The plaintext port for `/healthz` and the landing page (ARCH-25); 0 opens none. Integer 0..65535. |
@@ -209,7 +210,7 @@ A name that was a setting once. Set, it stops the daemon with the line below; th
 | `OPENCHIME_ACME_DIRECTORY` | OPENCHIME_TLS=acme:<names>;directory=<url> |
 | `OPENCHIME_ACME_EMAIL` | OPENCHIME_TLS=acme:<names>;email=<address> |
 | `OPENCHIME_MAX_ATTACHMENT_SIZE` | a constant: the wire's cap, 200 MiB |
-| `OPENCHIME_MAX_VIDEO_MESSAGE_SIZE` | a constant, 160 MiB |
+| `OPENCHIME_MAX_VIDEO_MESSAGE_SIZE` | renamed OPENCHIME_MAX_VIDEO_SIZE |
 | `OPENCHIME_S3_ENDPOINT` | OPENCHIME_S3=s3://KEY:SECRET@host[:port]/bucket[?region=…] |
 | `OPENCHIME_S3_BUCKET` | OPENCHIME_S3=s3://KEY:SECRET@host[:port]/bucket[?region=…] |
 | `OPENCHIME_S3_ACCESS_KEY` | OPENCHIME_S3=s3://KEY:SECRET@host[:port]/bucket[?region=…] |

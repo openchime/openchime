@@ -1071,7 +1071,7 @@ the video is sent, and fixed once it is.
 
 *`duration_ms`, `width` and `height` are the client's measurements.* The daemon
 links no codec and cannot check them; they are display facts, and the byte cap
-(`OC_MAX_VIDEO_SIZE`) is what bounds a video message.
+(`OPENCHIME_MAX_VIDEO_SIZE`) is what bounds a video message.
 
 *`poster_id` is an attachment of its own* — the same uploader's JPEG in the same
 channel — that no message references, so the storage sweep (§3g) would take it for

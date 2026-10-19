@@ -1043,6 +1043,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->count  = wi.max_users;
                 e->op     = wi.call_max;
                 e->ws_mode = wi.mode;
+                e->size    = wi.max_video_size;
                 e->body = malloc(wi.workspace_name.len + 1);
                 if (e->body) { memcpy(e->body, wi.workspace_name.ptr, wi.workspace_name.len); e->body[wi.workspace_name.len] = '\0'; }
                 oc_queue_push(to_ui, e);

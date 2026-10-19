@@ -248,7 +248,22 @@ static void test_constants(void) {
     CHECK(c->storage.audit_max_age_ms == 365ull * 24 * 3600 * 1000);
     CHECK(c->sched_tick_ms == 15000);
     CHECK(c->call_max == OC_CALL_MAX && c->file_page == 200 && c->max_conns_per_ip == OC_MAX_CONNS_PER_IP);
-    CHECK(OC_MAX_VIDEO_SIZE < OC_MAX_ATTACHMENT_SIZE);
+}
+
+static void test_max_video_size(void) {
+    /* A video message's cap: 160 MiB unless set, never above the attachment
+     * cap, and what WORKSPACE_INFO tells clients (REQ-164). */
+    accepts("OPENCHIME_WORKSPACE_NAME", "x");
+    CHECK(oc_config_get()->max_video_size == 160ull * 1024 * 1024);
+    accepts("OPENCHIME_MAX_VIDEO_SIZE", "104857600");
+    CHECK(oc_config_get()->max_video_size == 100ull * 1024 * 1024);
+    accepts("OPENCHIME_MAX_VIDEO_SIZE", "209715200");
+    CHECK(oc_config_get()->max_video_size == OC_MAX_ATTACHMENT_SIZE);
+    refuses("OPENCHIME_MAX_VIDEO_SIZE", "209715201", "1048576..209715200");
+    refuses("OPENCHIME_MAX_VIDEO_SIZE", "0", "1048576..209715200");
+    refuses("OPENCHIME_MAX_VIDEO_SIZE", "160MiB", "must be an integer");
+    /* Its old name is refused, and the refusal names the new one. */
+    refuses("OPENCHIME_MAX_VIDEO_MESSAGE_SIZE", "167772160", "OPENCHIME_MAX_VIDEO_SIZE");
 }
 
 /* Load with `mode` as OPENCHIME_MODE and `name=value` set. */
@@ -348,7 +363,7 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 20);     /* OPENCHIME_MODE among them */
+    CHECK(operator_rows == 21);     /* OPENCHIME_MODE among them */
     CHECK(managed_rows == 7);
     CHECK(dev_rows == 4 + 12);      /* the daemon's four, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);
@@ -404,6 +419,7 @@ int run_config_tests(void) {
     test_cross_rules();
     test_data_dir();
     test_constants();
+    test_max_video_size();
     test_mode();
     test_reload_and_registry();
     test_env_file();

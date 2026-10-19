@@ -91,7 +91,7 @@ enum {
                             * replaced one trusted before */
     OC_EV_SIGNED_OUT,      /* the session was refused and there is nothing to fall back on:
                             * the person has to sign in again, and the thread has stopped */
-    OC_EV_WORKSPACE_INFO,  /* a WORKSPACE_INFO: status=deployment_mode, count=max_users, body=name, ws_mode */
+    OC_EV_WORKSPACE_INFO,  /* a WORKSPACE_INFO: status=deployment_mode, count=max_users, body=name, ws_mode, size=max_video_size */
     OC_EV_MESSAGE,         /* a BROADCAST: channel/author/message_id/time + body */
     OC_EV_CHANNEL,         /* a CHANNEL_LIST entry / CHANNEL_INFO: channel_id + name(body)
                               + status, plus topic (author_name) and archived (REQ-034/035) */

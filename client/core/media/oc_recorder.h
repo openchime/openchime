@@ -12,9 +12,15 @@
 #include <stdint.h>
 
 #define OC_RECORDER_CAP_MS 300000u          /* five minutes (REQ-162) */
-/* Stop before the file could outgrow the daemon's default video cap
- * (OC_MAX_VIDEO_MESSAGE_SIZE, 160 MiB): the moov and the last packets still fit. */
-#define OC_RECORDER_MAX_BYTES (155u * 1024u * 1024u)
+/* A recording stops this far short of the daemon's video cap (WORKSPACE_INFO's
+ * max_video_size, REQ-164), so the moov and the last packets still fit. */
+#define OC_RECORDER_HEADROOM (5u * 1024u * 1024u)
+
+/* The byte budget for a daemon's cap: the headroom below it, or a thirty-second
+ * of it for a cap too small to spare 5 MiB twice. 0 for 0: no cap known. */
+static inline uint64_t oc_recorder_budget(uint64_t cap) {
+    return cap > 2ull * OC_RECORDER_HEADROOM ? cap - OC_RECORDER_HEADROOM : cap - cap / 32;
+}
 
 /* The quality a user picks: the height recorded at, 16:9. A camera that cannot
  * deliver it gives the nearest it has, and anything larger is scaled down. */
@@ -49,7 +55,7 @@ typedef struct {
     const char *mic_id;
     uint32_t    cap_ms;      /* 0 for OC_RECORDER_CAP_MS; OPENCHIME_DEV_VIDEO_CAP_MS overrides */
     int         width, height, fps;   /* 0 for 1280×720 at 30; a screen fits inside the size */
-    uint64_t    max_bytes;   /* 0 for OC_RECORDER_MAX_BYTES */
+    uint64_t    max_bytes;   /* the byte budget, oc_recorder_budget(the daemon's cap); required */
     /* A screen recording: a screen or window from oc_capture_list_screens, NULL
      * or "" to record the camera. With `with_camera`, camera_id's camera is
      * boxed into `corner` (OC_CORNER_*). `computer_sound` adds what the

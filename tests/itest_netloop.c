@@ -358,6 +358,12 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
      * presence snapshot). Consume it here so both read_frame and the raw
      * presence/typing test start from a clean stream. */
     if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_WORKSPACE_INFO) return -1;
+    {
+        /* It tells the client the video cap its recorder stays within: the
+         * default here, as nothing sets OPENCHIME_MAX_VIDEO_SIZE (REQ-164). */
+        oc_workspace_info wi;
+        if (oc_decode_workspace_info(&p, &wi) != OC_OK || wi.max_video_size != 160ull * 1024 * 1024) return -1;
+    }
     /* Then which build the daemon is (About in a client): always, and never empty. */
     if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_SERVER_BUILD) return -1;
     {

@@ -208,10 +208,9 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 26** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 27** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
-> 26 appended the `e2e` byte to `CHANNEL_INFO` and to each `CHANNEL_LIST` entry
-> (§5.7, §5.19). Since the
+> 27 appended `max_video_size` to `WORKSPACE_INFO` (§4.3a). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
 > change moves the number even when it adds one byte.
@@ -449,6 +448,7 @@ a bare host address. Clients that don't recognize the frame ignore it.
 | `workspace_name`  | str  | Admin-set display name; **empty** ⇒ the client falls back to the connection host's subdomain (e.g. `acme.openchime.io` → "acme"). |
 | `call_max`        | u8   | The most people in one call, ten (`OC_CALL_MAX`, REQ-305) — so a client starting one in a large channel knows when the starter must pick (§5.17). |
 | `mode`            | u8   | `OPENCHIME_MODE`: `0` normal, `1` development, `2` demo. A client in a public demo (`2`) says so for as long as it is open (AUTH.md §8.12). Appended in version 25. |
+| `max_video_size`  | u64  | The most bytes a video message may hold (`OPENCHIME_MAX_VIDEO_SIZE`, 160 MiB by default, at most `MAX_ATTACHMENT_SIZE`; REQ-164). A client's recorder stops 5 MiB short of it, and `ATTACH_MEDIA_SET` refuses a larger video with `MEDIA_TOO_LARGE` (§5.14a). Appended in version 27. |
 
 ### 4.3b `WORKSPACE_ADDRESS` (server → client), msg_type `0x001C`
 
@@ -1571,8 +1571,9 @@ poster. Posting it is four steps, all on frames that already exist but one:
 
 The daemon refuses with `UNKNOWN_ATTACHMENT` 3011 when the video is not the
 caller's finalized, unreclaimed upload, `MEDIA_TOO_LARGE` 3022 when it exceeds
-`MAX_VIDEO_MESSAGE_SIZE` (`OC_MAX_VIDEO_SIZE`, 160 MiB, under
-`MAX_ATTACHMENT_SIZE`), and `MEDIA_INVALID` 3021 when: the kind is not
+the workspace's video cap (`OPENCHIME_MAX_VIDEO_SIZE`, 160 MiB by default, at
+most `MAX_ATTACHMENT_SIZE`, and sent to clients as `WORKSPACE_INFO`'s
+`max_video_size`), and `MEDIA_INVALID` 3021 when: the kind is not
 `1`; the duration is `0` or over 300 000 ms; either dimension is odd, under 2, or
 over 1920×1080; the video is not `video/mp4` or has already been sent; or the
 poster is not a finalized, unsent `image/jpeg` of at most 1 MiB uploaded by the
@@ -2980,7 +2981,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3019` | `CHANNEL_ARCHIVED`    | channel    | no    | The channel is archived and read-only (REQ-035). Returned by `SEND`, `SEND_REPLY` and `UPLOAD_BEGIN`; **not** by the webhook post path. |
 | `3020` | `INVALID_MESSAGE`     | messaging  | no    | Nothing to send — an empty body on a scheduled message (REQ-224). |
 | `3021` | `MEDIA_INVALID`       | attachment | no    | `ATTACH_MEDIA_SET` refused: kind, bounds, type, already sent, or poster (§5.14a). |
-| `3022` | `MEDIA_TOO_LARGE`     | attachment | no    | The video exceeds `MAX_VIDEO_MESSAGE_SIZE` (§5.14a). |
+| `3022` | `MEDIA_TOO_LARGE`     | attachment | no    | The video exceeds the workspace's video cap, `WORKSPACE_INFO`'s `max_video_size` (§5.14a). |
 | `3023` | `NOT_RENDERABLE`      | read-aloud | no    | The message has nothing to say aloud (§5.14b, REQ-294). |
 | `3024` | `TTS_UNAVAILABLE`     | read-aloud | no    | Read-aloud is off, its queue is full, or the render failed (§5.14b). |
 | `3025` | `CALL_UNAVAILABLE`    | calls      | no    | The audio relay exited and could not be restarted, so a `CALL_JOIN` is refused rather than answered with a media port nothing listens on (§5.17). |

@@ -430,7 +430,7 @@ static __thread oc_storage_stats  g_sstat;
 static __thread uint64_t          g_last_maint_ms;
 static __thread char              g_blob_dir[1024];
 static __thread uint64_t      g_max_attach = OC_MAX_ATTACHMENT_SIZE;
-static __thread uint64_t      g_max_video  = OC_MAX_VIDEO_MESSAGE_SIZE;   /* REQ-164 */
+static __thread uint64_t      g_max_video  = 0;   /* OPENCHIME_MAX_VIDEO_SIZE, set at startup (REQ-164) */
 
 /* Per-webhook-token rate limit for the incoming-webhook endpoint (REQ-170). A
  * fixed window keyed by the token, so one noisy integration can't flood a
@@ -5883,7 +5883,8 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                                      (uint8_t)cfg->call_max,
                                      (uint8_t)(cfg->mode == OC_MODE_DEMO ? OC_WS_MODE_DEMO
                                                : cfg->mode == OC_MODE_DEVELOPMENT ? OC_WS_MODE_DEVELOPMENT
-                                               : OC_WS_MODE_NORMAL) };
+                                               : OC_WS_MODE_NORMAL),
+                                     cfg->max_video_size };
             oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &wi);
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (!conns[fd]) break;   /* dropped on the WORKSPACE_INFO write */
@@ -8624,7 +8625,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
             close(ep); close(lfd); loop_state_free(conns); return -1;
         }
         g_max_attach = OC_MAX_ATTACHMENT_SIZE;
-        g_max_video  = OC_MAX_VIDEO_SIZE;
+        g_max_video  = cfg->max_video_size;
 
         /* Blob I/O runs here, off the net thread (ARCH-69): each in-flight
          * transfer holds a TLS session plus a chunk buffer, which has to stay

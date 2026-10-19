@@ -18,6 +18,10 @@
 #include <string.h>
 #include <time.h>
 
+/* What the GUI records within against a daemon on its default cap
+ * (OPENCHIME_MAX_VIDEO_SIZE, 160 MiB). */
+#define TEST_VIDEO_BUDGET oc_recorder_budget(160ull * 1024 * 1024)
+
 static void msleep(int ms) {
     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
     nanosleep(&ts, NULL);
@@ -398,7 +402,7 @@ static void test_recorder(void) {
     setenv("OPENCHIME_DEV_CAPTURE", "synthetic", 1);
     setenv("OPENCHIME_DEV_AUDIO", "synthetic", 1);
     setenv("OPENCHIME_DEV_VIDEO_CAP_MS", "2500", 1);   /* past the 2 s keyframe: the poster and the slow decoder need it */
-    oc_recorder_opts o = { .width = 640, .height = 360, .fps = 30 };
+    oc_recorder_opts o = { .width = 640, .height = 360, .fps = 30, .max_bytes = TEST_VIDEO_BUDGET };
     int err;
     oc_recorder *r = oc_recorder_open(&o, &err);
     CHECK(r != NULL && err == OC_REC_OK);
@@ -466,6 +470,17 @@ static void test_recorder(void) {
         CHECK(oc_recorder_take(r, &res) != 0 || (oc_rec_result_free(&res), 0));
         oc_rec_result_free(&res);
         oc_recorder_close(r);
+    }
+    /* The budget comes from the daemon's cap: 5 MiB short of it, a
+     * thirty-second short of a small one, and no recording at all with none. */
+    CHECK(oc_recorder_budget(160ull * 1024 * 1024) == 155ull * 1024 * 1024);
+    CHECK(oc_recorder_budget(3200) == 3100);
+    CHECK(oc_recorder_budget(0) == 0);
+    {
+        oc_recorder_opts on = o;
+        on.max_bytes = 0;
+        int e0 = 0;
+        CHECK(oc_recorder_open(&on, &e0) == NULL && e0 == OC_REC_FAILED);
     }
     /* The byte budget stops a recording before the length cap does, so a take
      * can never outgrow the daemon's video cap. */
@@ -781,7 +796,7 @@ static void test_screen_recording(void) {
      * each corner's box goes is test_i420_view's (oc_inset_rect, all four); what
      * this adds is that the recorder draws it where it was asked to. */
     for (int corner = OC_CORNER_TL; corner <= OC_CORNER_TL; corner++) {
-        oc_recorder_opts o = { .height = 720, .fps = 30, .screen_id = "screen:synthetic",
+        oc_recorder_opts o = { .max_bytes = TEST_VIDEO_BUDGET, .height = 720, .fps = 30, .screen_id = "screen:synthetic",
                                .with_camera = 1, .corner = corner, .computer_sound = 1 };
         int err;
         oc_recorder *r = oc_recorder_open(&o, &err);
@@ -885,7 +900,7 @@ static void test_screen_recording(void) {
 
     /* A window, no camera, no computer sound: no box anywhere, the microphone only. */
     {
-        oc_recorder_opts o = { .height = 720, .fps = 30, .screen_id = "window:synthetic" };
+        oc_recorder_opts o = { .max_bytes = TEST_VIDEO_BUDGET, .height = 720, .fps = 30, .screen_id = "window:synthetic" };
         int err;
         oc_recorder *r = oc_recorder_open(&o, &err);
         CHECK(r != NULL);
@@ -925,7 +940,7 @@ static void test_screen_recording(void) {
     setenv("OPENCHIME_DEV_VIDEO_CAP_MS", "300000", 1);
     setenv("OPENCHIME_DEV_SCREEN_GONE_MS", "500", 1);
     {
-        oc_recorder_opts o = { .height = 720, .fps = 30, .screen_id = "window:synthetic" };
+        oc_recorder_opts o = { .max_bytes = TEST_VIDEO_BUDGET, .height = 720, .fps = 30, .screen_id = "window:synthetic" };
         int err;
         oc_recorder *r = oc_recorder_open(&o, &err);
         CHECK(r != NULL);
@@ -946,7 +961,7 @@ static void test_screen_recording(void) {
     /* Gone before anything was captured: refused as that. */
     setenv("OPENCHIME_DEV_SCREEN_GONE_MS", "0", 1);
     {
-        oc_recorder_opts o = { .height = 720, .screen_id = "window:synthetic" };
+        oc_recorder_opts o = { .max_bytes = TEST_VIDEO_BUDGET, .height = 720, .screen_id = "window:synthetic" };
         int err;
         oc_recorder *r = oc_recorder_open(&o, &err);
         CHECK(r == NULL && err == OC_REC_SCREEN_GONE);
@@ -956,7 +971,7 @@ static void test_screen_recording(void) {
     /* The system refuses the capture. */
     setenv("OPENCHIME_DEV_CAPTURE", "denied", 1);
     {
-        oc_recorder_opts o = { .height = 720, .screen_id = "screen:synthetic" };
+        oc_recorder_opts o = { .max_bytes = TEST_VIDEO_BUDGET, .height = 720, .screen_id = "screen:synthetic" };
         int err;
         oc_recorder *r = oc_recorder_open(&o, &err);
         CHECK(r == NULL && err == OC_REC_SCREEN_DENIED);

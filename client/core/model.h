@@ -752,6 +752,7 @@ typedef struct {
     oc_call_view calls[OC_MAX_CALLS_LISTED];
     size_t       n_calls;
     uint8_t      call_max;              /* the daemon's cap on a call (REQ-305) */
+    uint64_t     max_video_size;        /* the daemon's cap on a video message (REQ-164); 0 until WORKSPACE_INFO */
     uint8_t      in_call;
     oc_call_view call;
     uint64_t     call_pending;          /* the channel a join is on its way to, 0 = none */

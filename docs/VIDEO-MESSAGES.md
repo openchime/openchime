@@ -49,7 +49,7 @@ plays media (ARCH-75).
 | Audio | Opus (libopus), 48 kHz mono, 20 ms frames, 48 kbps, VOIP application; on a screen recording with computer sound, the microphone and the computer's sound mixed (§4.2) |
 | Poster | JPEG, the first keyframe at or after 1 s, at the video's own dimensions |
 | Length cap | 5 minutes, stopped by the recorder |
-| Size cap | 160 MiB (`OC_MAX_VIDEO_SIZE`), enforced by the daemon; the recorder stops at 155 MiB so a take always fits |
+| Size cap | `OPENCHIME_MAX_VIDEO_SIZE`, 160 MiB by default, enforced by the daemon and sent to clients in `WORKSPACE_INFO`; the recorder stops 5 MiB short of it so a take always fits |
 | File name | `<display name>-video-<YYYYMMDDHHMMSS>.mp4`, and the poster the same with `.jpg` |
 
 Five minutes is about 30 MB at 360p, 95 MB at 720p and 150 MB at 1080p. The daemon
@@ -170,8 +170,10 @@ minutes of video is at most 155 MB.
   frame is a keyframe carrying the new size, which VP9 decoders follow. The track
   and the media row keep the size the recording started at, which has the same
   shape.
-- **The byte budget.** The recorder also stops when the samples reach 155 MiB, so a
-  take cannot outgrow the daemon's default video cap and fail at upload.
+- **The byte budget.** The recorder also stops 5 MiB short of the workspace's
+  video cap, which the daemon sends at sign-in (`WORKSPACE_INFO`'s
+  `max_video_size`; `oc_recorder_budget`), so a take cannot outgrow it and fail
+  at upload. With no cap known it records nothing.
 - **The cap.** The recorder stops when the recorded duration reaches the cap. Tests
   shorten it with `OPENCHIME_DEV_VIDEO_CAP_MS`.
 - **Poster.** The first keyframe at or after 1 s is decoded back and written as JPEG
@@ -299,8 +301,8 @@ was uploaded by the caller and is finalized, and with `MEDIA_INVALID` unless it 
 not yet posted, has `mime = video/mp4`,
 a `duration_ms` no longer than five minutes, and even dimensions no larger than
 1920×1080 — and unless the poster is the same caller's finalized `image/jpeg` in the
-same channel, no larger than 1 MiB. A video larger than 160 MiB
-(`OC_MAX_VIDEO_SIZE`) is refused with `MEDIA_TOO_LARGE`.
+same channel, no larger than 1 MiB. A video larger than the workspace's
+cap (`OPENCHIME_MAX_VIDEO_SIZE`, 160 MiB by default) is refused with `MEDIA_TOO_LARGE`.
 
 **The duration is advisory.** The daemon links no codec (ARCH-110), so it cannot
 measure one; a modified client could report thirty seconds for a longer file. The

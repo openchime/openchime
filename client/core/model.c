@@ -1698,6 +1698,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->max_users = e->count;
         m->call_max = e->op;
         m->workspace_mode = e->ws_mode;
+        m->max_video_size = e->size;
         snprintf(m->workspace_name, sizeof m->workspace_name, "%s", e->body ? e->body : "");
         /* SERVER_BUILD follows on this connection; a daemon too old to send it
          * leaves the field empty rather than showing the last daemon's build. */

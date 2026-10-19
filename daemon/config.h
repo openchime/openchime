@@ -55,7 +55,6 @@ typedef enum {
 #define OC_XFER_WORKERS        2       /* threads moving attachment bytes (ARCH-69); each holds a TLS session */
 #define OC_MAX_CONNS_PER_IP    1024    /* connections one address may hold: a large office behind one NAT */
 #define OC_CALL_MAX            10      /* the most people in one call (REQ-305, CALLS.md) */
-#define OC_MAX_VIDEO_SIZE      (160ull * 1024 * 1024)   /* a video message, under the attachment cap (REQ-164) */
 #define OC_TTS_QUEUE           256     /* renders that may wait */
 #define OC_TTS_IDLE_SECS       300     /* the voice model stays loaded this long with nothing to do */
 #define OC_TTS_GETS_PER_MIN    60      /* AUDIO_GETs one connection may make a minute */
@@ -162,6 +161,7 @@ typedef struct {
     /* Summaries (REQ-310, ARCH-116): OPENCHIME_SUMMARY is off, local or
      * cloud:<url>,<model>; OPENCHIME_SUMMARY_API_KEY is the hosted API's key. */
     struct { int mode; const char *url, *model, *api_key; } summary;
+    uint64_t max_video_size;            /* OPENCHIME_MAX_VIDEO_SIZE: a video message's cap, sent to clients (REQ-164) */
 
     /* Development mode only (OPENCHIME_DEV_*). In any other mode these are the
      * constants and the variables refuse the start. */
