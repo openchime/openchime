@@ -8150,6 +8150,7 @@ static oc_dbres *process_set_email(sqlite3 *db, const oc_job *j) {
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     build_profile(db, j->user_id, r);
+    r->pf_fanout = 1;
     return r;
 }
 
@@ -8177,6 +8178,7 @@ static oc_dbres *process_set_profile(sqlite3 *db, const oc_job *j) {
     sqlite3_step(st);
     sqlite3_finalize(st);
     build_profile(db, j->user_id, r);
+    r->pf_fanout = 1;
     return r;
 }
 

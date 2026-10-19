@@ -5205,6 +5205,16 @@ int run_client_core_tests(void) {
                 oc_client_backfill(b2, 1);
                 CHECK(WAIT_FOR(b2, ({ const oc_channel *bc = oc_model_channel((oc_model *)m, 1);
                                       bc && bc->n_msgs > 0; })));
+                /* A profile saved on one device shows on the other (REQ-240). */
+                oc_client_set_profile(b, "Erik Lund", "Engineer", "he/him", "", "Europe/Oslo", "");
+                CHECK(WAIT_FOR(b2, ({ int ok = 0;
+                                      for (size_t i = 0; i < m->n_users; i++)
+                                          if (m->users[i].user_id == m->user_id)
+                                              ok = !strcmp(m->users[i].full_name, "Erik Lund") &&
+                                                   !strcmp(m->users[i].title, "Engineer") &&
+                                                   !strcmp(m->users[i].pronouns, "he/him") &&
+                                                   !strcmp(m->users[i].timezone, "Europe/Oslo");
+                                      ok; })));
                 oc_client_mark_read(b2, 1);
                 CHECK(channel_unread(oc_client_model(b2), 1) == 0);
                 oc_client_set_read_cursor(b, 1, 0);

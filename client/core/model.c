@@ -2081,6 +2081,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         mem->status_expires = e->server_time;
         mem->avatar_id      = e->message_id;
         if (e->op) mem->role = e->op;
+        user_relabel(mem);
         break;
     }
     case OC_EV_INVITE_ROW: {

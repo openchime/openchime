@@ -2064,7 +2064,7 @@ thing they did, and is a different fact from never having set it.
 
     attachment_id (u64)
 
-**`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to a profile read and to any of SET_STATUS / SET_PROFILE / SET_AVATAR. (REQ-240, REQ-241)
+**`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to a profile read and to any of SET_STATUS / SET_PROFILE / SET_AVATAR. The reply to SET_PROFILE and SET_EMAIL goes to every connection of the person who saved it, so their other devices show the change at once. (REQ-240, REQ-241)
 
     user_id (u64), display_name (str), email (str), status_emoji (str), status_text (str), status_expires (u64), title (str), timezone (str), avatar_id (u64), role (u8), full_name (str), pronouns (str), phone (str), voice_id (str)
 

@@ -1249,6 +1249,10 @@ typedef struct oc_dbres {
      * the pairing a reader relies on. */
     char                   *st_emoji, *st_text, *pf_title, *pf_tz;
     char                   *pf_full_name, *pf_pronouns, *pf_phone, *pf_voice_id;
+    /* The profile was just changed by its owner (SET_PROFILE, SET_EMAIL): it
+     * goes to every one of their connections, not only the one that saved it,
+     * so their other devices show it too (REQ-240). */
+    uint8_t                 pf_fanout;
     /* OC_RES_TTS_META (ARCH-111): `tts_cached` says the rendering is stored
      * already, in which case tts_blob_key/tts_bytes/tts_duration_ms describe it;
      * otherwise tts_text is what to render, in voice `tts_voice`. `tts_persist`

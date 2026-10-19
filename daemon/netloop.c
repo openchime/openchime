@@ -7462,7 +7462,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
     }
     case OC_RES_PROFILE_INFO: {
         conn *c = find_by_id(conns, r->conn_id);
-        if (!c) break;
+        if (!c && !r->pf_fanout) break;
         oc_profile_info pi;
         memset(&pi, 0, sizeof pi);
         pi.user_id        = r->user_id;
@@ -7481,7 +7481,17 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         pi.phone          = oc_slice_str(r->pf_phone ? r->pf_phone : "");
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_profile_info(&w, OC_PROTOCOL_VERSION, &pi);
-        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        if (r->pf_fanout) {
+            /* Their own change: every device they are signed in on, the one
+             * that saved it among them, shows it now (REQ-240). */
+            size_t len = w.len;
+            for (conn *t = user_head(r->user_id), *next; t; t = next) {
+                next = t->u_next;
+                send_bytes(ep, conns, t->fd, g_enc, len);
+            }
+        } else {
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
         break;
     }
     case OC_RES_INVITE_LIST: {
