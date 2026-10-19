@@ -482,8 +482,9 @@ unit-tested in `daemon/roles.c`.
 - **Invite/remove (REQ-033):** only owner/admin may invite or remove
   tenant members (`oc_role_can_manage_members`), and only an owner may invite at
   or remove an admin/owner. Invite mints a single-use token (`invites`);
-  `REMOVE_USER` locks the member out via `users.disabled` (migration 0003) and
-  revokes their sessions/credentials rather than deleting the row. Channel-level
+  `REMOVE_USER` deactivates the member via `users.disabled` (migration 0003) and
+  revokes their sessions/credentials rather than deleting the row; nothing they
+  said goes, their DMs included (PROTOCOL.md §5.8). Channel-level
   invite/remove for private channels is any member of that channel (PROTOCOL.md
   §5.7). Wire frames: PROTOCOL.md §5.8.
 

@@ -1021,8 +1021,6 @@ static uint8_t get_role(sqlite3 *db, uint64_t uid) {
     return role;
 }
 
-/* Has this user been removed from the tenant (REQ-033)? A removed member is
- * locked out of every auth path but their row survives for message authorship. */
 /* --- Critical failures (REQ-263) -------------------------------------------- */
 
 #define OC_ALERTS_KEEP 100   /* rows kept; the oldest that no longer hold go first */
@@ -1212,6 +1210,8 @@ static oc_dbres *process_alert_ack(sqlite3 *db, const oc_job *j) {
     return alerts_summary(db);
 }
 
+/* Has this user been removed from the tenant (REQ-033)? A removed member is
+ * locked out of every auth path but their row survives for message authorship. */
 static int user_disabled(sqlite3 *db, uint64_t uid) {
     sqlite3_stmt *st = NULL;
     int disabled = 0;
@@ -3170,10 +3170,6 @@ static oc_dbres *process_store_enrollment(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-/* Remove a member from the tenant (REQ-033): lock them out (disabled=1) and
- * revoke access — sessions, channel memberships, and local password. The row
- * survives so their authored messages keep a valid author. Owner/admin only; an
- * admin cannot remove an admin/owner, and the last owner cannot be removed. */
 /* A message changed (sent, edited, deleted, restored): every summary built on
  * it, or on its thread, or covering its moment, goes (REQ-310, ARCH-116). In
  * the transaction that changed it, so a summary never outlives what it says. */
@@ -3189,6 +3185,14 @@ static void sum_purge_msg(sqlite3 *db, uint64_t message_id) {
     sqlite3_finalize(st);
 }
 
+/* Remove a member from the tenant (REQ-033): deactivate them. What goes is the
+ * account's reach -- sign-in, sessions, the local password, channel and group
+ * memberships, pushes, webhooks, drafts and scheduled messages. What stays is
+ * everything anyone said: every message, file, reaction and pin, and every DM
+ * and group DM they were in, whole, with them still in it, so the others keep
+ * the conversation and opening a DM with them again finds it. The row survives,
+ * `disabled`, which clients show as deactivated. Owner/admin only; an admin
+ * cannot remove an admin/owner, and the last owner cannot be removed. */
 static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -3215,51 +3219,20 @@ static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_prepare_v2(db, "DELETE FROM sessions WHERE user_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    /* Their DM conversations go entirely — messages, membership and the channel
-     * itself. Deleting only the membership row (what this used to do) left a
-     * half-membered DM that no OPEN_DM could match, so the next attempt created a
-     * DUPLICATE conversation; migration 0019's unique dm_key now forbids that
-     * state, which makes removing the channel the only coherent option. */
-    sqlite3_prepare_v2(db,
-        "DELETE FROM pins WHERE channel_id IN (SELECT channel_id FROM channel_members "
-        "  WHERE user_id=?1 AND channel_id IN (SELECT id FROM channels WHERE kind='dm'));",
-        -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    sqlite3_prepare_v2(db,
-        "DELETE FROM mentions WHERE channel_id IN (SELECT channel_id FROM channel_members "
-        "  WHERE user_id=?1 AND channel_id IN (SELECT id FROM channels WHERE kind='dm'));",
-        -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    sqlite3_prepare_v2(db,
-        "DELETE FROM actions WHERE channel_id IN (SELECT channel_id FROM channel_members "
-        "  WHERE user_id=?1 AND channel_id IN (SELECT id FROM channels WHERE kind='dm'));",
-        -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    sqlite3_prepare_v2(db,
-        "DELETE FROM messages WHERE channel_id IN (SELECT channel_id FROM channel_members "
-        "  WHERE user_id=?1 AND channel_id IN (SELECT id FROM channels WHERE kind='dm'));",
-        -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    sqlite3_prepare_v2(db,
-        "DELETE FROM channels WHERE kind='dm' AND id IN "
-        "  (SELECT channel_id FROM channel_members WHERE user_id=?1);", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    /* Now the ordinary channel memberships (the DM rows went with their channels,
-     * but any stragglers are swept here too): out of every group first, so the
-     * rule leaves them in no channel at all. */
+    /* Out of every group first, so the rule leaves them in no channel; then out
+     * of every channel but the DMs and group DMs, which keep them as a member so
+     * the conversation stays whole for everyone else in it. */
     sqlite3_prepare_v2(db, "DELETE FROM user_group_members WHERE user_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
     {
         size_t nch = 0;
-        uint64_t *chans = ids_of(db, "SELECT channel_id FROM channel_members WHERE user_id=?1;",
-                                 j->target_user_id, &nch);
+        uint64_t *chans = ids_of(db,
+            "SELECT cm.channel_id FROM channel_members cm JOIN channels c ON c.id = cm.channel_id "
+            " WHERE cm.user_id=?1 AND c.kind <> 'dm';",
+            j->target_user_id, &nch);
         for (size_t c = 0; c < nch; c++) membership_sync(db, chans[c], j->target_user_id, 0);
         free(chans);
     }
-    sqlite3_prepare_v2(db,
-        "DELETE FROM channel_members WHERE channel_id NOT IN (SELECT id FROM channels);",
-        -1, &st, NULL);
-    sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_prepare_v2(db, "DELETE FROM local_credentials WHERE user_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
     /* What acts for them when they are not there stops too: their webhooks post
@@ -3268,29 +3241,13 @@ static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_prepare_v2(db, "DELETE FROM device_tokens WHERE user_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    /* Their drafts go with them (REQ-223, ARCH-101) — user content, and the
-     * account is gone. The second sweep catches OTHER people's drafts for the
-     * DM channels just deleted above: those channels no longer exist, so a row
-     * pointing at one is unreachable and would sit there forever. There is no
-     * channel-delete op in the product, so this is the only path by which a
-     * channel dies and the only place that sweep can live. */
+    /* Their drafts go with them (REQ-223, ARCH-101): unsent, so nobody else's. */
     sqlite3_prepare_v2(db, "DELETE FROM drafts WHERE user_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
     /* And anything they had scheduled (REQ-224): the account is gone, so the
      * promise cannot be kept and there is nobody left to tell. */
     sqlite3_prepare_v2(db, "DELETE FROM scheduled_messages WHERE user_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    sqlite3_prepare_v2(db,
-        "DELETE FROM scheduled_messages WHERE channel_id NOT IN (SELECT id FROM channels);",
-        -1, &st, NULL);
-    sqlite3_step(st); sqlite3_finalize(st);
-    sqlite3_prepare_v2(db,
-        "DELETE FROM drafts WHERE channel_id NOT IN (SELECT id FROM channels);", -1, &st, NULL);
-    sqlite3_step(st); sqlite3_finalize(st);
-    /* Summaries of the DMs that went with them (REQ-310). */
-    sqlite3_prepare_v2(db,
-        "DELETE FROM summary_nodes WHERE channel_id NOT IN (SELECT id FROM channels);", -1, &st, NULL);
-    sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
     audit_actor(db, OC_AUDIT_ADMIN, "user.remove", j->user_id,
@@ -5332,7 +5289,8 @@ static oc_dbres *process_invite_channel(sqlite3 *db, const oc_job *j) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
     }
     uint8_t trole = OC_ROLE_MEMBER;
-    if (!user_role(db, j->target_user_id, &trole)) {   /* unknown target: no disclosure */
+    if (!user_role(db, j->target_user_id, &trole) || user_disabled(db, j->target_user_id)) {
+        /* unknown or removed target: no disclosure */
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
     add_membership(db, j->channel_id, j->target_user_id);
@@ -5421,6 +5379,12 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
         if (!self_dm) add_membership(db, cid, other);
     }
 
+    /* A removed member's DM is still there and is found above; a new one with
+     * them is refused, as an unknown user is. */
+    if (cid == 0 && !self_dm && user_disabled(db, other)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+
     if (cid == 0) {
         sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
         sqlite3_prepare_v2(db,
@@ -5463,7 +5427,7 @@ static oc_dbres *process_open_e2e_dm(sqlite3 *db, const oc_job *j) {
     r->ch_peer = j->target_user_id;
     uint64_t self = j->user_id, other = j->target_user_id;
     uint8_t trole = OC_ROLE_MEMBER;
-    if (!other || other == self || !user_role(db, other, &trole)) return r;
+    if (!other || other == self || !user_role(db, other, &trole) || user_disabled(db, other)) return r;
     char key[96];
     snprintf(key, sizeof key, "e:%llu,%llu:%llu.%llu",
              (unsigned long long)(self < other ? self : other), (unsigned long long)(self < other ? other : self),
@@ -5746,7 +5710,7 @@ static oc_dbres *process_open_group_dm(sqlite3 *db, const oc_job *j) {
         uint8_t role = OC_ROLE_MEMBER;
         /* An unknown or disabled user is refused without saying which — the same
          * no-disclosure rule OPEN_DM follows. */
-        if (!user_role(db, u, &role)) {
+        if (!user_role(db, u, &role) || user_disabled(db, u)) {
             r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
         }
         ids[n++] = u;
@@ -5872,7 +5836,8 @@ static oc_dbres *process_list_members(sqlite3 *db, const oc_job *j) {
         "           WHERE cg.channel_id = cm.channel_id AND gm.user_id = cm.user_id) "
         "  FROM channel_members cm "
         "  JOIN users u ON u.id = cm.user_id "
-        " WHERE cm.channel_id=? AND u.disabled=0 "
+        " WHERE cm.channel_id=? AND (u.disabled=0 OR EXISTS(SELECT 1 FROM channels c "
+        "       WHERE c.id = cm.channel_id AND c.kind='dm')) "
         " ORDER BY cm.joined_at_ms LIMIT ?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)OC_MAX_MEMBER_LIST);

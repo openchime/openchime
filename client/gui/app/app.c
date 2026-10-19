@@ -3878,6 +3878,18 @@ static void draw_user_avatar(gfx *rt, const oc_model *m, uint64_t uid,
     uint32_t tint = avatar_tint(uid);
     uint64_t aid = avatar_of(m, uid);
     float radius = avatar_corner(box);
+    /* Removed from the workspace (REQ-033): shown disabled, a plain grey tile
+     * with the initial in place of the photo and the colour. */
+    if (oc_model_user_disabled(m, uid)) {
+        fill_round(rt, box, radius, OC_COL_INPUT);
+        const char *dn = (name && name[0]) ? name : "user";
+        char di[2] = { (char)(dn[0] >= 'a' && dn[0] <= 'z' ? dn[0] - 32 : dn[0]), 0 };
+        int was = fmt->align;
+        fmt->align = ST_ALIGN_CENTER;
+        draw_text(rt, di, fmt, box, OC_COL_MUTED);
+        fmt->align = was;
+        return;
+    }
     if (aid) {
         if (draw_avatar_image(rt, aid, box, radius, 1)) return;
         avatar_want(aid);        /* not here yet: fall through to the initial */

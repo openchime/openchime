@@ -929,8 +929,9 @@ change roles, only an owner may grant/revoke owner, an admin may only
 promote/keep members; demoting the last owner is refused (`LAST_OWNER`, REQ-030).
 On success the actor is acked with **`USER_UPDATED` (server → client), msg_type
 `0x0045`** `{ user_id: u64, role: u8, disabled: u8 }`, and the same frame is
-pushed to the affected user's live connections so their client updates its
-capabilities immediately.
+pushed to every signed-in connection, the affected user's among them, so their
+client updates its capabilities immediately and every roster shows the person as
+they now are.
 
 **`INVITE_USER` (client → server), msg_type `0x0043`** `{ role: u8, email: str, uses: u16 }` — owner/admin
 only (only an owner may invite at admin/owner role). With `email` empty it mints an
@@ -981,18 +982,25 @@ is used. Answered with **`CREDENTIAL_RESET` (server → client), msg_type
 removed member back (REQ-033): who may do it is who may remove them, and only a
 removed member, and they take a seat as a new member would (`USER_LIMIT` at the
 cap). Nothing removal dropped comes back — channels, groups, drafts — but the
-default channel at their next sign-in. Answered with `USER_UPDATED`
+default channel at their next sign-in; their DMs and group DMs never went. Answered with `USER_UPDATED`
 (`disabled=0`) and, for a local account, whose password removal took, a
 `CREDENTIAL_RESET` with the link that sets one; or a non-fatal `ERROR`.
 
 **`REMOVE_USER` (client → server), msg_type `0x0044`** `{ user_id: u64 }` —
 owner/admin only; an admin cannot remove an admin/owner, and the last owner
-cannot be removed (`LAST_OWNER`). The member is **locked out** (their sessions,
-channel memberships, local password and push device tokens are dropped, their
-webhooks are turned off and post nothing while they are removed, and a
-`disabled` flag bars every future login) rather than deleted, so their authored messages keep a valid
-author. The actor is acked with `USER_UPDATED` (`disabled=1`); the removed user's
-live connections receive the same notice and are then dropped.
+cannot be removed (`LAST_OWNER`). The member is **deactivated**, not deleted.
+What goes is the account's reach: their sessions, local password, push device
+tokens, drafts and scheduled messages are dropped, they leave every channel and
+group, their webhooks are turned off and post nothing while they are removed,
+and a `disabled` flag bars every future login. What stays is everything anyone
+said: every message, file, reaction and pin, and every DM and group DM they were
+in, whole, with them still a member, so the others keep the conversation and
+`OPEN_DM` with them finds it again. Nobody can start a new DM or group DM with a
+removed member or add them to a channel (`FORBIDDEN`, as for an unknown user).
+Clients show them as **(deactivated)**, from `USER_LIST`'s and `USER_UPDATED`'s
+`disabled`. Every signed-in connection receives `USER_UPDATED` (`disabled=1`),
+the actor's as its ack; the removed user's live connections receive it and are
+then dropped.
 
 `SET_ROLE`/`INVITE_USER`/`REMOVE_USER` failures are non-fatal `ERROR` frames
 (`FORBIDDEN`, `LAST_OWNER`, `INVITE_UNREDEEMABLE`, `INTERNAL`).

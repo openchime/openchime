@@ -247,6 +247,9 @@ typedef struct { uint64_t user_id; uint8_t status; uint8_t dnd; } oc_presence_ro
 typedef struct {
     uint64_t user_id;
     char     name[64];
+    /* What a client shows for them: the name, with " (deactivated)" once they
+     * have been removed (REQ-033). oc_model_user_name returns it. */
+    char     label[80];
     uint8_t  role;
     uint8_t  disabled;
     /* Custom status (REQ-241) and profile fields (REQ-240). Kept on
@@ -1154,6 +1157,9 @@ void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status);
 
 /* Roster lookups: a user's display name ("" if unknown), or an id by name (0). */
 const char *oc_model_user_name(const oc_model *m, uint64_t user_id);
+/* 1 when the user has been removed from the workspace (REQ-033): shown as
+ * deactivated, their avatar dimmed. */
+int         oc_model_user_disabled(const oc_model *m, uint64_t user_id);
 uint64_t    oc_model_user_id(const oc_model *m, const char *name);
 
 /* Invitations (REQ-033). Whether the workspace offers a local account source

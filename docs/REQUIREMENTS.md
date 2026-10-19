@@ -244,6 +244,13 @@ where one exists.
   member from the tenant. Channel-level invite/remove for private channels
   has been available to any existing member of that channel, not gated to
   admins. Both gates have been enforced in the DB-writer handlers (ARCH-60).
+  Removal has deactivated a member and deleted nothing anyone said: every
+  message, file, reaction and pin, and every DM and group DM they were in, has
+  stayed readable by everyone who could read it, with the removed member shown
+  **(deactivated)** and their avatar dimmed; opening a DM with them again has
+  found the same conversation. What removal has taken is the account's reach:
+  sign-in, sessions, devices and pushes, webhooks, scheduled messages, and any
+  new conversation or channel with them.
   An invitation has been by **email address** where the workspace signs people in
   through a provider — bound to the address and spent by its first verified
   sign-in — and by **one-time token** where it has local accounts; the client has

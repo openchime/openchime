@@ -6449,22 +6449,24 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         break;
     }
     case OC_RES_USER_UPDATED: {
-        /* Removal (disabled=1): ack the actor, notify the removed user's live
-         * connections, then drop them (they cannot re-authenticate). */
+        /* A role change, a removal (disabled=1) or a return: the removed user's
+         * live connections hear it and are dropped (they cannot re-authenticate),
+         * then every connection is told, the actor's ack among them, so every
+         * roster shows the person as they now are -- deactivated, for a removal. */
         oc_user_updated m = { r->user_id, r->role, r->disabled };
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_user_updated(&w, OC_PROTOCOL_VERSION, &m);
         size_t len = w.len;
-        conn *actor = find_by_id(conns, r->conn_id);
-        if (actor) send_bytes(ep, conns, actor->fd, g_enc, len);
-        for (conn *t = user_head(r->user_id), *next; t; t = next) {
-            next = t->u_next;
-            int tfd = t->fd;
-            send_bytes(ep, conns, tfd, g_enc, len);
-            if (r->disabled && conns[tfd]) conn_close(ep, conns, tfd);
-        }
+        if (r->disabled)
+            for (conn *t = user_head(r->user_id), *next; t; t = next) {
+                next = t->u_next;
+                int tfd = t->fd;
+                send_bytes(ep, conns, tfd, g_enc, len);
+                if (conns[tfd]) conn_close(ep, conns, tfd);
+            }
+        send_to_all_authed(ep, conns, g_enc, len);
         /* Brought back: the actor gets the link that gives them a password. */
-        actor = find_by_id(conns, r->conn_id);
+        conn *actor = find_by_id(conns, r->conn_id);
         if (actor && !r->disabled && r->body && r->body_len) {
             oc_credential_reset cr = { r->user_id, { r->body, r->body_len } };
             oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);

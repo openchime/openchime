@@ -460,6 +460,11 @@ size_t oc_model_seen_by(const oc_model *m, uint64_t channel_id, uint64_t message
     return n;
 }
 
+/* The roster entry's shown name: its name, marked once they are removed. */
+static void user_relabel(oc_member *u) {
+    snprintf(u->label, sizeof u->label, "%s%s", u->name, u->disabled ? " (deactivated)" : "");
+}
+
 /* Upsert a roster entry keyed on user_id. */
 static void user_upsert(oc_model *m, uint64_t user_id, const char *name, uint8_t role,
                         uint8_t disabled, uint64_t avatar_id) {
@@ -468,6 +473,7 @@ static void user_upsert(oc_model *m, uint64_t user_id, const char *name, uint8_t
             snprintf(m->users[i].name, sizeof m->users[i].name, "%s", name ? name : "");
             m->users[i].role = role; m->users[i].disabled = disabled;
             m->users[i].avatar_id = avatar_id;                    /* */
+            user_relabel(&m->users[i]);
             return;
         }
     if (m->n_users == m->cap_users) {
@@ -481,6 +487,7 @@ static void user_upsert(oc_model *m, uint64_t user_id, const char *name, uint8_t
     u->user_id = user_id; u->role = role; u->disabled = disabled;
     u->avatar_id = avatar_id;
     snprintf(u->name, sizeof u->name, "%s", name ? name : "");
+    user_relabel(u);
 }
 
 /* Update a roster member's role/disabled without disturbing its name (a
@@ -488,15 +495,23 @@ static void user_upsert(oc_model *m, uint64_t user_id, const char *name, uint8_t
 static void user_update_role(oc_model *m, uint64_t user_id, uint8_t role, uint8_t disabled) {
     for (size_t i = 0; i < m->n_users; i++)
         if (m->users[i].user_id == user_id) {
-            m->users[i].role = role; m->users[i].disabled = disabled; return;
+            m->users[i].role = role; m->users[i].disabled = disabled;
+            user_relabel(&m->users[i]);
+            return;
         }
     user_upsert(m, user_id, "", role, disabled, 0);
 }
 
 const char *oc_model_user_name(const oc_model *m, uint64_t user_id) {
     for (size_t i = 0; i < m->n_users; i++)
-        if (m->users[i].user_id == user_id) return m->users[i].name;
+        if (m->users[i].user_id == user_id) return m->users[i].label;
     return "";
+}
+
+int oc_model_user_disabled(const oc_model *m, uint64_t user_id) {
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == user_id) return m->users[i].disabled;
+    return 0;
 }
 
 uint8_t     oc_model_deployment_mode(const oc_model *m) { return m->deployment_mode; }
@@ -2603,6 +2618,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         for (size_t i = 0; i < m->n_users; i++)
             if (m->users[i].user_id == e->user_id) {
                 snprintf(m->users[i].name, sizeof m->users[i].name, "%s", e->body ? e->body : "");
+                user_relabel(&m->users[i]);
                 break;
             }
         if (e->user_id == m->user_id) set_status(m, "profile updated");
@@ -2618,8 +2634,16 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     }
     case OC_EV_USER_UPDATED: {
+        /* Every connection is told now, so everyone's roster marks them; the
+         * status line is the ack of whoever made the change, an owner or admin. */
         user_update_role(m, e->user_id, e->status, e->op);
-        const char *nm = oc_model_user_name(m, e->user_id);
+        uint8_t mine = OC_ROLE_MEMBER;
+        const char *nm = "";
+        for (size_t i = 0; i < m->n_users; i++) {
+            if (m->users[i].user_id == m->user_id) mine = m->users[i].role;
+            if (m->users[i].user_id == e->user_id) nm = m->users[i].name;
+        }
+        if (mine != OC_ROLE_OWNER && mine != OC_ROLE_ADMIN && e->user_id != m->user_id) break;
         const char *what = e->op ? "removed"
                          : e->status == OC_ROLE_OWNER ? "now owner"
                          : e->status == OC_ROLE_ADMIN ? "now admin" : "now member";

@@ -504,7 +504,7 @@ static void build_roster_rows(rows_t *r, const oc_model *m, int width) {
         const char *role = u->role == OC_ROLE_OWNER ? "  (owner)"
                          : u->role == OC_ROLE_ADMIN ? "  (admin)" : "";
         snprintf(line, sizeof line, "%s %s%s%s", dot, u->name[0] ? u->name : "?",
-                 role, u->disabled ? "  (disabled)" : "");
+                 role, u->disabled ? "  (deactivated)" : "");
         uintattr_t col = pr == OC_PRESENCE_ONLINE ? TB_GREEN
                        : pr == OC_PRESENCE_AWAY   ? TB_YELLOW : TB_DEFAULT;
         char *rr = malloc(strlen(line) + 1);

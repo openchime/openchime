@@ -5654,6 +5654,95 @@ static void test_session_policy(void) {
 /* Removing a member stops what acts for them (REQ-033, REQ-170): their webhooks
  * post no more -- not even once an admin turns one back on -- and their devices
  * are no longer woken. */
+/* Removing a member deactivates them and deletes nothing anyone said (REQ-033):
+ * their DMs and group DMs stay whole for everyone else, with them still in, and
+ * opening a DM with them again finds the same one; but nobody can start a new
+ * conversation with them or add them anywhere, and they are out of channels. */
+static int64_t rm_count(const char *path, const char *sql, uint64_t a) {
+    sqlite3 *raw = NULL;
+    int64_t n = -1;
+    if (sqlite3_open(path, &raw) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(raw, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)a);
+        if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(raw);
+    return n;
+}
+
+static void test_remove_keeps_history(void) {
+    const char *path = "build/test_dbwriter_rm_history.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t owner = reg(w, "rh-owner", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "rh-bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "rh-carol", "pw", OC_ROLE_MEMBER);
+    uint64_t dave  = reg(w, "rh-dave",  "pw", OC_ROLE_MEMBER);
+    CHECK(owner && bob && carol && dave);
+
+    /* bob talks to carol in a DM, to carol and dave in a group DM, and in a channel. */
+    oc_dbres *r = open_dm(w, carol, bob);
+    uint64_t dm = (r && r->type == OC_RES_CHANNEL_INFO) ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(dm != 0);
+    CHECK(send_id(w, carol, dm, "hi bob") != 0);
+    CHECK(send_id(w, bob, dm, "hi carol") != 0);
+    oc_job *j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 1);
+    j->user_id = carol;
+    j->group_uids[0] = bob; j->group_uids[1] = dave; j->n_group_uids = 2;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    uint64_t gdm = (r && r->type == OC_RES_CHANNEL_INFO) ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(gdm != 0);
+    CHECK(send_id(w, bob, gdm, "group hello") != 0);
+    CHECK(send_id(w, dave, gdm, "group reply") != 0);
+    CHECK(send_id(w, bob, OC_DEFAULT_CHANNEL, "channel hello") != 0);
+
+    CHECK(remove_user(w, owner, bob) == 0);
+
+    /* Every message stays, in every kind of conversation. */
+    CHECK(rm_count(path, "SELECT COUNT(*) FROM messages WHERE channel_id=?1;", dm) == 2);
+    CHECK(rm_count(path, "SELECT COUNT(*) FROM messages WHERE channel_id=?1;", gdm) == 2);
+    CHECK(rm_count(path, "SELECT COUNT(*) FROM messages WHERE author_id=?1;", bob) == 3);
+    /* bob is still in the DM and the group DM, deactivated; out of the channel. */
+    CHECK(rm_count(path, "SELECT COUNT(*) FROM channel_members WHERE user_id=?1;", bob) == 2);
+    CHECK(rm_count(path, "SELECT disabled FROM users WHERE id=?1;", bob) == 1);
+
+    /* carol opening a DM with bob again finds the same conversation. */
+    r = open_dm(w, carol, bob);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->channel_id == dm);
+    oc_dbres_free(r);
+    /* Its members still list bob, so a client can show him as deactivated. */
+    r = list_members(w, carol, dm);
+    CHECK(r && r->type == OC_RES_MEMBER_LIST && r->n_cmlist == 2);
+    int saw_bob = 0;
+    for (size_t i = 0; r && i < r->n_cmlist; i++) if (r->cmlist[i].user_id == bob) saw_bob = 1;
+    CHECK(saw_bob);
+    oc_dbres_free(r);
+
+    /* But nobody starts anything new with him: no new DM, no new group DM, no channel. */
+    r = open_dm(w, dave, bob);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 2);
+    j->user_id = owner;
+    j->group_uids[0] = bob; j->group_uids[1] = dave; j->n_group_uids = 2;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    r = chan_member(w, OC_JOB_INVITE_CHANNEL, owner, OC_DEFAULT_CHANNEL, bob);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_remove_user_integrations(void) {
     const char *path = "build/test_dbwriter_rm_integrations.db";
     cleanup_db(path);
@@ -8303,6 +8392,7 @@ int run_dbwriter_tests(void) {
     test_search_filters_and_paging();
     test_setup_invite();
     test_remove_user_integrations();
+    test_remove_keeps_history();
     test_reset_credential();
     test_enable_user();
     test_session_policy();

@@ -6034,6 +6034,11 @@ int run_client_core_tests(void) {
         }
         oc_client_remove_user(a, erikid);
         CHECK(WAIT_FOR(a, member_disabled(m, erikid) == 1));
+        /* Shown as deactivated wherever a name is shown, and the DM with him is
+         * still there (REQ-033). */
+        CHECK(strcmp(oc_model_user_name(oc_client_model(a), erikid), "erik (deactivated)") == 0);
+        CHECK(oc_model_user_disabled(oc_client_model(a), erikid) == 1);
+        CHECK(dm_with_peer(oc_client_model(a), erikid) != 0);
 
         oc_client_stop(a);
         oc_client_stop(b);

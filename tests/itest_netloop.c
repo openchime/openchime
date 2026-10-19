@@ -5717,6 +5717,16 @@ static void test_admin_vertical(int port, const uint8_t *pin) {
         if (read_frame(&bob, &hdr, &p) != 0) { bob_closed = 1; break; }
     }
     CHECK(bob_closed == 1);
+    /* And everyone else is told, so every roster shows bob as deactivated: nh,
+     * a member who did nothing, hears the same USER_UPDATED. */
+    int nh_heard = 0;
+    for (int i = 0; i < 40 && !nh_heard; i++) {
+        if (read_frame(&nh, &hdr, &p) != 0) break;
+        if (hdr.msg_type == OC_MSG_USER_UPDATED && oc_decode_user_updated(&p, &uu) == OC_OK &&
+            uu.user_id == ub && uu.disabled == 1)
+            nh_heard = 1;
+    }
+    CHECK(nh_heard == 1);
 
     client_close(&owner);
     client_close(&nh);

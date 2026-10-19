@@ -247,7 +247,7 @@ their row (which authored messages/tombstones still reference). Appended as
 
 | column     | type    | notes                                                        |
 |------------|---------|--------------------------------------------------------------|
-| `disabled` | INTEGER | `NOT NULL DEFAULT 0 CHECK (disabled IN (0,1))` — `1` once removed; every auth path (local/session/oidc) refuses a disabled user. Removal also deletes the user's `sessions`, `channel_members`, and `local_credentials`. |
+| `disabled` | INTEGER | `NOT NULL DEFAULT 0 CHECK (disabled IN (0,1))` — `1` once removed (deactivated); every auth path (local/session/oidc) refuses a disabled user. Removal also deletes the user's `sessions`, `local_credentials`, `device_tokens`, `drafts`, `scheduled_messages` and `user_group_members`, and their `channel_members` rows except in DMs and group DMs, which keep them. No message, pin, mention, action or channel is deleted. |
 
 ---
 
@@ -670,8 +670,8 @@ the channel's membership, which is already a table.
 *Rows are written by the daemon at send time*, resolving each name
 case-insensitively against `users JOIN channel_members` for that channel — a name
 that is not a member of the channel is not a mention, so nobody is notified about
-a message they cannot open. `remove_user` (REQ-033) deletes a departing user's
-mention rows before their messages, in the dependency order §3p established.
+a message they cannot open. `remove_user` (REQ-033) deletes no mention: a
+removed member's messages, and the conversations they were in, all stay.
 
 ---
 
@@ -695,9 +695,8 @@ schema.
 
 *`pinned_by` is nullable* for the same reason: it is attribution, not ownership,
 and the pin must survive the account that placed it. Removing a user (REQ-033)
-disables rather than deletes the row (§3), so this does not dangle in practice —
-but a DM's pins are deleted along with its messages, in the dependency order
-§3p established.
+disables rather than deletes the row (§3), so this does not dangle in practice,
+and their DMs keep their pins, as they keep their messages.
 
 *`channel_id` is denormalised* from the message exactly as in §3q: listing a
 channel's pins is the hot path and should not need a join to know what it can
