@@ -29,6 +29,7 @@ dist/
 !/third_party/ca-roots/
 !/third_party/speexdsp/
 !/third_party/opus/
+!/third_party/libvpx/
 *.o
 *.db
 *.db-shm

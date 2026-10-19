@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # The media libraries for the web client (docs/WEB.md): libvpx, libopus and
 # speexdsp built with Emscripten into build/wasm/{libvpx,opus,speexdsp}, from
-# the same sources as natively: libvpx fetched and verified by
-# scripts/build/libvpx.sh (run first for the sources when they are not there
-# yet), libopus and speexdsp committed in third_party/opus and third_party/speexdsp.
+# the same sources as natively, committed in third_party/libvpx,
+# third_party/opus and third_party/speexdsp.
 # Needs emcc on PATH.
 #
 # libvpx is VP9 only and real-time only, as natively; its x86 assembly is
@@ -12,12 +11,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 command -v emcc >/dev/null || { echo "build_media_wasm: emcc not on PATH (make fetches it: mk/toolchains.mk)" >&2; exit 1; }
-LIBVPX_VERSION="${LIBVPX_VERSION:-1.17.0}"
 mkdir -p build/wasm
 J="$(nproc)"
-
-# The fetched sources, verified by the native script.
-[ -d "third_party/libvpx-${LIBVPX_VERSION}/src" ]     || scripts/build/libvpx.sh fetch
 
 OUT=build/wasm/opus
 if [ ! -f "$OUT/lib/libopus.a" ]; then
@@ -47,7 +42,7 @@ if [ ! -f "$OUT/lib/libvpx.a" ]; then
   rm -rf "$OUT"; mkdir -p "$OUT/build"
   ( cd "$OUT/build"
     # generic-gnu: no target assembly; emconfigure supplies emcc as the compiler.
-    emconfigure "$OLDPWD/third_party/libvpx-${LIBVPX_VERSION}/src/configure" --target=generic-gnu \
+    emconfigure "$OLDPWD/third_party/libvpx/configure" --target=generic-gnu \
       --prefix="$(cd .. && pwd)" \
       --disable-vp8 --enable-vp9 --enable-realtime-only \
       --disable-examples --disable-tools --disable-docs --disable-unit-tests \

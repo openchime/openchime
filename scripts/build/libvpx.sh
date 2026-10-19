@@ -1,48 +1,20 @@
 #!/usr/bin/env bash
-# Fetch and build a pinned libvpx (VP9 only, static) into third_party/ — the
-# "fetched at build" vendoring class (docs/VENDORS.md §2), same shape as
-# scripts/build/mbedtls.sh: SHA-256-pinned tarball, gitignored output, reproduced here.
+# Build the committed libvpx (VP9 only, static) from third_party/libvpx -- the
+# release tarball as WebM published it, committed (docs/VENDORS.md §1) -- into
+# third_party/libvpx-<version>[-arch|-win]. Nothing is downloaded.
 #
 #   scripts/build/libvpx.sh            native (Linux; `make test` links it)
 #   scripts/build/libvpx.sh windows    cross-built with mingw-w64 for the Win32 client
 #
 # The codec is the client's alone (ARCH-87, ARCH-110): the daemon never links it.
+# scripts/build/media_wasm.sh builds the same sources for the web.
 set -euo pipefail
 
 TARGET="${1:-native}"
-FETCH_ONLY=0
-LIBVPX_VERSION="${LIBVPX_VERSION:-1.17.0}"
+# The version committed in third_party/libvpx; the build directories carry it.
+LIBVPX_VERSION=1.17.0
 
-# Known-good SHA-256 of the release tarball. WebM publishes a detached GPG
-# signature (.asc) rather than a sum: the tarball was verified against the "WebM
-# release signing key" (fingerprint 8DA7 0C3B 2338 B012 BAB3 0EE5 1C1C 1A9A 2A45
-# D4D4) and this is the sum of that verified file. Override both together when
-# bumping LIBVPX_VERSION -- a version without a matching sum is refused rather
-# than fetched unverified.
-LIBVPX_SHA256_1_17_0="7f98aae5c52c46e85b7b26feabcab9b1554605e771bd1df1d6e6a00ee22fa8ed"
-_sum_var="LIBVPX_SHA256_${LIBVPX_VERSION//./_}"
-LIBVPX_SHA256="${LIBVPX_SHA256:-${!_sum_var:-}}"
-if [ -z "${LIBVPX_SHA256}" ]; then
-  echo "build_libvpx: no known SHA-256 for libvpx ${LIBVPX_VERSION}." >&2
-  echo "  Verify the release's .asc signature, then pass its sum explicitly:" >&2
-  echo "  LIBVPX_SHA256=<sum> $0 ${TARGET}" >&2
-  exit 1
-fi
-
-verify_tarball() {
-  local f="$1" got
-  got="$(sha256sum "$f" | cut -d" " -f1)"
-  if [ "$got" != "${LIBVPX_SHA256}" ]; then
-    echo "build_libvpx: SHA-256 MISMATCH for $f" >&2
-    echo "  expected ${LIBVPX_SHA256}" >&2
-    echo "  got      ${got}" >&2
-    rm -f "$f"
-    exit 1
-  fi
-  echo "build_libvpx: sha256 ok (${got})"
-}
-
-[ "${TARGET}" = fetch ] || [ "${OC_ARCH:-}" = aarch64 ] || command -v nasm >/dev/null || command -v yasm >/dev/null || {
+[ "${OC_ARCH:-}" = aarch64 ] || command -v nasm >/dev/null || command -v yasm >/dev/null || {
   echo "build_libvpx: nasm (or yasm) is required for libvpx's x86 assembly." >&2
   exit 1
 }
@@ -51,34 +23,25 @@ cd "$(dirname "$0")/../.."
 mkdir -p third_party
 cd third_party
 
+SRC="$(pwd)/libvpx"
+[ -x "${SRC}/configure" ] || { echo "build_libvpx: third_party/libvpx is missing" >&2; exit 1; }
+
 case "${TARGET}" in
-  fetch)   DEST="libvpx-${LIBVPX_VERSION}"; FETCH_ONLY=1 ;;   # the sources alone, for another toolchain (scripts/build/media_wasm.sh)
   native)  DEST="libvpx-${LIBVPX_VERSION}${OC_ARCH:+-$OC_ARCH}"; VPX_TARGET="${OC_ARCH:+--target=${OC_ARCH/aarch64/arm64}-linux-gcc}" ;;   # OC_ARCH: another architecture, with make's CC
   windows) DEST="libvpx-${LIBVPX_VERSION}-win"; VPX_TARGET="--target=x86_64-win64-gcc" ;;
-  *) echo "build_libvpx: target is native, windows or fetch, not ${TARGET}" >&2; exit 2 ;;
+  *) echo "build_libvpx: target is native or windows, not ${TARGET}" >&2; exit 2 ;;
 esac
 
-TARBALL="libvpx-${LIBVPX_VERSION}.tar.gz"
-URL="https://storage.googleapis.com/downloads.webmproject.org/releases/webm/${TARBALL}"
-
 if [ ! -f "${DEST}/lib/libvpx.a" ]; then
-  if [ ! -d "${DEST}/src" ]; then
-    echo "build_libvpx: downloading ${URL}"
-    curl -fsSL -o "${TARBALL}" "${URL}"
-    verify_tarball "${TARBALL}"
-    mkdir -p "${DEST}/src"
-    tar -xzf "${TARBALL}" -C "${DEST}/src" --strip-components=1
-    rm -f "${TARBALL}"
-  fi
-  if [ "${FETCH_ONLY}" = 1 ]; then echo "build_libvpx: sources in third_party/${DEST}/src"; exit 0; fi
   echo "build_libvpx: building ${DEST} (VP9 only, real-time, static)"
   mkdir -p "${DEST}/build"
   (
     cd "${DEST}/build"
     [ "${TARGET}" = windows ] && export CROSS=x86_64-w64-mingw32-
-    # VP9 only: VP8 is not used anywhere (ARCH-87 ships VP9 alone). Real-time
-    # only: nothing here encodes offline, and it drops the two-pass paths.
-    ../src/configure ${VPX_TARGET} --prefix="$(cd .. && pwd)" \
+    # Out of tree: the committed sources are only read. VP9 only: VP8 is not
+    # used anywhere (ARCH-87 ships VP9 alone). Real-time only: nothing here
+    # encodes offline, and it drops the two-pass paths.
+    "${SRC}/configure" ${VPX_TARGET} --prefix="$(cd .. && pwd)" \
       --disable-vp8 --enable-vp9 --enable-realtime-only \
       --disable-examples --disable-tools --disable-docs --disable-unit-tests \
       --disable-shared --enable-static --enable-pic ${OC_ARCH:+--disable-runtime-cpu-detect} $([ "${OC_ARCH:-}" = aarch64 ] || echo --as=nasm) >/dev/null
