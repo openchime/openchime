@@ -905,7 +905,8 @@ same loopback and challenge checks as §8.1, is answered with a **path**:
   that did not open, or is not the one wanted, is a paste away; the terminal
   client shows its URL and a device code instead (§8.11).
   The tunnel carries only `/signin`, `/signin/verify`, `/signup`,
-  `/account/password`, `/account/security`, `/account/reset` and `/codes.js`; only a
+  `/account/password`, `/account/security`, `/account/reset`, `/codes.js` and
+  `/showpw.js` (Show password, §2); only a
   request whose `Host` is the listener's own (DNS rebinding); and only to the
   certificate the client's own connection accepted — over TLS with ALPN
   `http/1.1`, as the daemon's origin: its `Host`, and for a post from the

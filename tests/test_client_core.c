@@ -4324,6 +4324,11 @@ static void test_local_browser(int port) {
             snprintf(js, sizeof js, "%.*s/codes.js", (int)(strstr(purl, "/account/password") - purl), purl);
             CHECK(web_fetch(js, "GET", NULL, NULL, resp, sizeof resp) == 200);
             CHECK(strstr(resp, "navigator.clipboard") != NULL);
+            /* And Show password's, which every password page runs (AUTH.md §2):
+             * without it the toggle stays hidden. */
+            snprintf(js, sizeof js, "%.*s/showpw.js", (int)(strstr(purl, "/account/password") - purl), purl);
+            CHECK(web_fetch(js, "GET", NULL, NULL, resp, sizeof resp) == 200);
+            CHECK(strstr(resp, "showpw") != NULL);
         }
         oc_client_stop(c);
 
