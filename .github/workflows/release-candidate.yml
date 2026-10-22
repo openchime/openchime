@@ -47,14 +47,24 @@ env:
   STAGING_IMAGE: registry.fly.io/openchime-daemon-staging
 
 jobs:
-  # A release-candidate is a staging commit and nothing else: dispatched on
-  # another ref, the SHA below would be a feature branch. And
-  # openchime/openchime only receives copies; nothing is built there.
-  branch:
-    name: running on staging
+  # One job for what is seconds of work each, billed by the minute it starts:
+  # the ref, the build id, and the push's checks.
+  gate:
+    name: gate on CI
     runs-on: ubuntu-24.04
-    timeout-minutes: 2
+    timeout-minutes: 5
+    # Reading the commit's runs needs `actions: read`: the workflow grants only
+    # `contents: read`, and the runs API is refused without it.
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      build_id: ${{ steps.id.outputs.build_id }}
+      run_number: ${{ steps.id.outputs.run_number }}
     steps:
+      # A release-candidate is a staging commit and nothing else: dispatched on
+      # another ref, the SHA below would be a feature branch. And
+      # openchime/openchime only receives copies; nothing is built there.
       - name: Refuse any other ref or repository
         env:
           REF: ${{ github.ref }}
@@ -64,23 +74,14 @@ jobs:
             echo "::error::release-candidates are not built here"; exit 1; }
           [ "$REF" = "refs/heads/staging" ] || {
             echo "::error::a release-candidate is built from staging only (this run is on $REF). Use: gh workflow run release-candidate.yml --ref staging"; exit 1; }
-
-  # The build id, and the run number the Windows file version carries (the
-  # one numeric, growing field Windows compares; docs/RELEASING.md). The run
-  # number is this workflow's plus RUN_NUMBER_OFFSET, a repository variable
-  # (0 when unset): run numbers count from 1 again when the workflow is
-  # renamed or moved, and the file version must keep growing past every
-  # build already shipped.
-  id:
-    name: build id
-    needs: branch
-    runs-on: ubuntu-24.04
-    timeout-minutes: 2
-    outputs:
-      build_id: ${{ steps.id.outputs.build_id }}
-      run_number: ${{ steps.id.outputs.run_number }}
-    steps:
+      # The build id, and the run number the Windows file version carries (the
+      # one numeric, growing field Windows compares; docs/RELEASING.md). The run
+      # number is this workflow's plus RUN_NUMBER_OFFSET, a repository variable
+      # (0 when unset): run numbers count from 1 again when the workflow is
+      # renamed or moved, and the file version must keep growing past every
+      # build already shipped.
       - id: id
+        name: build id
         env:
           OFFSET: ${{ vars.RUN_NUMBER_OFFSET }}
         run: |
@@ -92,30 +93,17 @@ jobs:
           echo "build_id=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
           echo "run_number=${run}" >> "$GITHUB_OUTPUT"
           echo "build ${GITHUB_SHA:0:7} (${GITHUB_SHA}), run ${run} (${GITHUB_RUN_NUMBER} + ${offset})"
-
-  # The push that landed this commit on staging started ci.yml,
-  # attribution-guard and commit-policy on it. Waited for (or found finished)
-  # rather than run again: the same jobs twice would double the cost.
-  # Anything but success refuses.
-  #
-  # ci runs on every push to staging, a documentation-only one included (its
-  # build and test jobs skip), so all three always have a run to wait for.
-  gate:
-    name: gate on CI
-    needs: branch
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    # Reading the commit's runs needs `actions: read`: the workflow grants only
-    # `contents: read`, and the runs API is refused without it.
-    permissions:
-      contents: read
-      actions: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
       - uses: actions/checkout@v7
-      - run: |
-          scripts/release/wait_checks.sh "$GITHUB_SHA" || {
+      # The push that landed this commit on staging ran ci on it (the commit
+      # policy and the attribution scan among its steps). Checked once, never
+      # waited for: dispatched before ci finished, this refuses at once, and is
+      # dispatched again once ci has passed. The same jobs twice would double
+      # the cost, so nothing of ci's is run again here.
+      - name: ci passed on the commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/release/wait_checks.sh "$GITHUB_SHA" ci || {
             echo "::error::no release-candidate is built from ${GITHUB_SHA:0:7}"; exit 1; }
 
   # Assert the credentials EXIST before anything expensive runs.
@@ -131,7 +119,7 @@ jobs:
   # or not a release could follow, and the gap is what the summary says.
   preflight:
     name: check release credentials
-    needs: branch
+    needs: gate
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     # The signing key and the registry tokens are the release environment's
@@ -249,7 +237,6 @@ jobs:
       # impossible until an external dependency lands, and the release is
       # perfectly publishable without it -- only unreachable at the public URL.
       - name: probe the published base URL
-        if: ${{ !inputs.skip_repo_smoke }}
         run: |
           set -u
           if curl -fsI --max-time 20 "$DIST_VERIFY_URL/openchime-archive-keyring.gpg" >/dev/null 2>&1; then
@@ -271,7 +258,7 @@ jobs:
 
   packages:
     name: ${{ matrix.arch }} daemon
-    needs: [gate, id]
+    needs: gate
     runs-on: ubuntu-24.04
     # A cache miss compiles ONNX Runtime for read-aloud (below) before the daemon.
     timeout-minutes: 120
@@ -291,8 +278,8 @@ jobs:
             oc_arch: aarch64
             bin: build/aarch64/openchimed
     env:
-      BUILD_ID: ${{ needs.id.outputs.build_id }}
-      OC_BUILD_ID: ${{ needs.id.outputs.build_id }}
+      BUILD_ID: ${{ needs.gate.outputs.build_id }}
+      OC_BUILD_ID: ${{ needs.gate.outputs.build_id }}
       # The packaging scripts are exercised here with a placeholder version so
       # that a package that cannot be built or installed stops the candidate;
       # the packages themselves are not kept. A release packages the same
@@ -638,7 +625,7 @@ jobs:
   # `release` environment.
   image:
     name: ${{ matrix.arch }} image
-    needs: [id, packages]
+    needs: [gate, packages]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: release
@@ -647,7 +634,7 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     env:
-      BUILD_ID: ${{ needs.id.outputs.build_id }}
+      BUILD_ID: ${{ needs.gate.outputs.build_id }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -888,12 +875,12 @@ jobs:
   # from :latest exists until then.
   image-manifest:
     name: container image manifest
-    needs: [id, image]
+    needs: [gate, image]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: release
     env:
-      BUILD_ID: ${{ needs.id.outputs.build_id }}
+      BUILD_ID: ${{ needs.gate.outputs.build_id }}
     steps:
       - uses: actions/checkout@v7   # for scripts/build/apt.sh
       - name: Install buildah
@@ -926,12 +913,12 @@ jobs:
   # otherwise-unused toolchain for the same source.
   windows-build:
     name: windows binaries
-    needs: [gate, id]
+    needs: gate
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      BUILD_ID: ${{ needs.id.outputs.build_id }}
-      BUILD_NUM: ${{ needs.id.outputs.run_number }}
+      BUILD_ID: ${{ needs.gate.outputs.build_id }}
+      BUILD_NUM: ${{ needs.gate.outputs.run_number }}
     steps:
       # Every CPU the runner has, for every make below and the makes they
       # start (the Makefile is safe under -j; locally nothing changes).
@@ -994,11 +981,11 @@ jobs:
   # (release.yml), since the installer embeds the signed files.
   windows-package:
     name: windows installers build
-    needs: [id, windows-build]
+    needs: [gate, windows-build]
     runs-on: windows-latest
     timeout-minutes: 30
     env:
-      BUILD_NUM: ${{ needs.id.outputs.run_number }}
+      BUILD_NUM: ${{ needs.gate.outputs.run_number }}
       VERSION: "0"
       DIST: dist/windows-x64
     steps:
@@ -1085,17 +1072,17 @@ jobs:
   # workflow artifact for anyone who wants to look.
   store:
     name: store the candidate
-    needs: [id, packages, image-manifest, windows-build, windows-package]
+    needs: [gate, packages, image-manifest, windows-build, windows-package]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     # The `release` environment for FLY_REGISTRY_TOKEN_STAGING: the digests
     # below are read from the staging registry, which needs a login.
     environment: release
     env:
-      BUILD_ID: ${{ needs.id.outputs.build_id }}
+      BUILD_ID: ${{ needs.gate.outputs.build_id }}
       # The offset run number from `id`, which the Windows binaries carry and
       # the release checks them against; not GITHUB_RUN_NUMBER.
-      RUN_NUMBER: ${{ needs.id.outputs.run_number }}
+      RUN_NUMBER: ${{ needs.gate.outputs.run_number }}
       DIST_S3_ENDPOINT:           ${{ vars.DIST_S3_ENDPOINT }}
       DIST_S3_STAGING_ACCESS_KEY: ${{ secrets.DIST_S3_STAGING_ACCESS_KEY }}
       DIST_S3_STAGING_SECRET_KEY: ${{ secrets.DIST_S3_STAGING_SECRET_KEY }}
@@ -1232,7 +1219,7 @@ jobs:
   # release-candidates numbered at once would both take the same K.
   publish:
     name: publish the release-candidate
-    needs: [id, store]
+    needs: [gate, store]
     runs-on: ubuntu-24.04
     environment: release
     timeout-minutes: 15
@@ -1246,7 +1233,7 @@ jobs:
       number: ${{ steps.tag.outputs.number }}
       k: ${{ steps.tag.outputs.k }}
     env:
-      BUILD_ID: ${{ needs.id.outputs.build_id }}
+      BUILD_ID: ${{ needs.gate.outputs.build_id }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1357,7 +1344,7 @@ jobs:
   # environment.
   sync-public:
     name: copy to openchime/openchime
-    needs: [id, publish]
+    needs: [gate, publish]
     if: ${{ success() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -1367,7 +1354,7 @@ jobs:
       contents: read
     env:
       PUBLIC_REPO: openchime/openchime
-      BUILD_ID: ${{ needs.id.outputs.build_id }}
+      BUILD_ID: ${{ needs.gate.outputs.build_id }}
       TAG: ${{ needs.publish.outputs.tag }}
       N: ${{ needs.publish.outputs.number }}
       K: ${{ needs.publish.outputs.k }}

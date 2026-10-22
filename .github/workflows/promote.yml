@@ -10,14 +10,13 @@
 # When code is waiting on staging it does nothing: main moves with the next
 # release, which carries the documentation with it. Nothing is rewritten:
 # main only fast-forwards, so the hashes stay the same everywhere.
-#
-# Runs after every push to staging, a merged pull request; dispatching it on
-# staging runs it again.
 name: promote
 
+# Dispatched by ci once it passed on a push to staging that changed only
+# documentation and workflows; a push of code starts nothing here. Dispatched
+# by hand on staging, it checks once that ci passed on the tip:
+#   gh workflow run promote.yml --ref staging
 on:
-  push:
-    branches: [staging]
   workflow_dispatch:
 
 # One at a time, and never cancelled half way: a later push waits, then finds
@@ -30,17 +29,22 @@ permissions:
   contents: read
 
 jobs:
-  classify:
-    name: documentation and workflows only
+  # One job: classifying is seconds of work, and a job of its own would bill a
+  # whole minute for it.
+  promote:
+    name: fast-forward main
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      promote: ${{ steps.classify.outputs.promote }}
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: classify
+        name: Documentation and workflows only?
         run: |
           set -euo pipefail
           [ "$GITHUB_REF" = "refs/heads/staging" ] || {
@@ -71,30 +75,16 @@ jobs:
           fi
           echo "promote=$promote" >> "$GITHUB_OUTPUT"
 
-  promote:
-    name: fast-forward main
-    needs: classify
-    if: needs.classify.outputs.promote == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    environment: release
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
-      # The same three checks a release-candidate waits for.
-      - name: Wait for the push checks
+      # ci dispatches this once it passed on the push. By hand it is checked
+      # once, never waited for.
+      - name: ci passed on the tip
+        if: steps.classify.outputs.promote == 'true' && github.actor != 'github-actions[bot]'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: scripts/release/wait_checks.sh "$GITHUB_SHA"
-
-      # RELEASE_SSH_KEY is the one actor main's ruleset lets through. A plain
-      # push: if main moved meanwhile, it is refused and nothing else happens.
+        run: scripts/release/wait_checks.sh "$GITHUB_SHA" ci
       - name: Fast-forward main
+        if: steps.classify.outputs.promote == 'true'
         env:
           KEY: ${{ secrets.RELEASE_SSH_KEY }}
         run: |
@@ -113,6 +103,7 @@ jobs:
       # As a release's copy: plain pushes with PUBLIC_DEPLOY_KEY. A failure is
       # a warning; main here has moved, and a re-run completes the copy.
       - name: Copy main and staging to openchime/openchime
+        if: steps.classify.outputs.promote == 'true'
         continue-on-error: true
         env:
           KEY: ${{ secrets.PUBLIC_DEPLOY_KEY }}
@@ -130,6 +121,7 @@ jobs:
           echo "openchime/openchime: main and staging are ${GITHUB_SHA:0:7}"
 
       - name: Close the issues main now has
+        if: steps.classify.outputs.promote == 'true'
         env:
           GH_TOKEN: ${{ secrets.PUBLIC_TOKEN }}
         run: |

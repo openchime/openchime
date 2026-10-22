@@ -18,16 +18,22 @@ merge (docs/CONTRIBUTING.md). Duplicating them here only spends time.
 - The current branch must be `feature/oc-<number>-…`. Anything else: refuse.
 - `git fetch origin --prune`.
 
-## 2. Build and test — once
+## 2. Build and test locally — required, before the commit
 
 ```
-make && make test
+scripts/check/test.sh
 ```
 
+It runs `make && make test` and on a pass records the tree it passed on; the
+pre-push hook (`.githooks/pre-push`) refuses to push a tree it did not record.
 Read the full output, not the exit code. Zero warnings (the tree builds
 `-Werror`), zero failed checks, and the last line `OK: all suites passed`.
-`make test` takes about a minute and a half. Anything else: refuse, quote the
-failing output, stop.
+Anything else: refuse, quote the failing output, fix it, and run this again —
+**never push to find out.** CI is the confirmation, not where a failure is
+found: every CI run is billed by the minute, and a local run costs nothing. A
+change after this step means running it again before the commit. Only a
+change to documentation alone (`*.md`, `.gitignore`, `.claude/`) may skip it;
+CI does not build one either.
 
 ## 3. The title
 
@@ -54,6 +60,11 @@ The body is the `Signed-off-by:` trailer and nothing else: no description, no
 ## 5. Clean and pushed
 
 - `git status --porcelain` prints nothing.
+- No run for the branch is still going: a push would cancel it part way, billed
+  for what it did. The pre-push hook refuses it; wait, and put every fix in one
+  push.
+- After a CI failure: reproduce it locally, fix it, run step 2 again, then push
+  once. Never push a guess.
 - Push. `git push --force-with-lease` only if step 4 rewrote history already
   pushed — the one case, and the one branch class, where a force-push is
   acceptable; `staging` and `main` are never force-pushed.

@@ -10,6 +10,10 @@ on:
     types: [opened, synchronize, reopened, edited]
     branches: [staging, main]
 
+concurrency:
+  group: pr-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   policy:
     name: pr policy
@@ -17,7 +21,39 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      # The required check `guard`, posted from here: the attribution scan is a
+      # step of this job rather than a job of its own, which would bill a whole
+      # minute for seconds of work.
+      checks: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Attribution scan
+        id: scan
+        continue-on-error: true
+        env:
+          EVENT: pull_request
+          BASE_REF: ${{ github.base_ref }}
+          REF: ${{ github.ref }}
+          BEFORE: ""
+          AFTER: ""
+        run: scripts/release/attribution_scan.sh
+      - name: Report the guard
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OUTCOME: ${{ steps.scan.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$OUTCOME" = success ]; then c=success; t="no banned reference in the new commits"
+          else c=failure; t="a banned reference, or the scan could not run"; fi
+          gh api "repos/${GITHUB_REPOSITORY}/check-runs" -f name=guard -f head_sha="$HEAD_SHA" \
+            -f status=completed -f conclusion="$c" -f details_url="$RUN_URL" \
+            -f "output[title]=$t" -f "output[summary]=$t: a step of pr policy, in ${RUN_URL}" >/dev/null
+          echo "guard: $c"
       - name: Title and body
         env:
           GH_TOKEN: ${{ github.token }}

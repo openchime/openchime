@@ -99,8 +99,10 @@ client CI cannot run.
   applies to this file too, which is why the patterns above are described rather
   than written out.
 - **Never** add a `Co-Authored-By:` or any attribution trailer naming Claude /
-  Anthropic. The [`attribution-guard`](../.github/workflows/attribution-guard.yml)
-  workflow scans author, committer, and message on every push and **rejects**
+  Anthropic. The attribution scan (`scripts/release/attribution_scan.sh`)
+  checks author, committer, and message on every pull request (a step of
+  `pr-policy`, which posts the required check `guard`), every push to `staging`
+  (a step of CI) and every push to `main` (`attribution-guard`), and **rejects**
   matches (it deletes an offending branch or tag; a violation can only reach
   `main` through a release, and a release-candidate is refused for a commit
   the guard did not pass).
@@ -118,10 +120,23 @@ anywhere the registry does not know. A client setting goes through
 `CFG_DEV` row named `OPENCHIME_DEV_*`, read through `oc_env_dev` on a client: it
 does nothing unless `OPENCHIME_MODE=development` (CONFIG.md "Mode").
 
+## Billed minutes
+
+Every CI job is billed by the minute it starts, so the cheap checks are steps of
+a job an event already has, never jobs of their own; no job waits on another
+workflow (a gate checks once and fails fast); every job has a timeout, and a
+newer run on the same branch cancels an older one. A failure is found locally,
+not in CI: `/oc-feature-finish` runs `scripts/check/test.sh` (`make && make test`)
+before the commit, and `.githooks/pre-push` refuses a tree it did not pass on
+(documentation alone excepted), a push while the branch's run is still going,
+and workflows `actionlint` rejects. The hooks are on once per clone:
+`git config core.hooksPath .githooks`, which `/oc-feature-start` checks.
+
 ## CI
 
 `ci.yml` runs on every pull request into `staging` and every push to `staging`,
-and the push's run is the gate `release-candidate.yml` waits for. It checks nothing twice:
+and the push's run is what `release-candidate.yml` checks, once. On a push its
+first job also runs the commit policy and the attribution scan. It checks nothing twice:
 each test suite runs once, one clang compile serves as both the release-compiler
 and the second-compiler check, and what the release checks itself is left to the
 release. Every vendored library is cached by the script that builds it, and
@@ -140,11 +155,10 @@ machines at once:
 - **`windows`** — cross-compiles the Windows TUI + GUI with the pinned
   llvm-mingw (make fetches it).
 - **`pr policy`** and **`guard`** — the pull request's title and body (and that the
-  title names an open issue), and the attribution guard
-  ([`attribution-guard`](../.github/workflows/attribution-guard.yml)).
-  The guard runs on every pull request, and on every push to `staging`,
-  `main` and any tag, documentation-only ones included, since what it rejects
-  lives in commit messages and author lines; a push to a feature branch is
+  title names an open issue), and the attribution scan, a step of `pr-policy`
+  that posts `guard`. The scan also runs on every push to `staging` (a step of
+  CI) and `main` (`attribution-guard`), documentation-only ones included, since
+  what it rejects lives in commit messages and author lines; a push to a feature branch is
   scanned once, by its pull request's run. A release-candidate is refused for
   a staging commit it has not passed on.
 

@@ -109,6 +109,7 @@ jobs:
       pull-requests: read    # the pull request a commit merged
     outputs:
       code: ${{ steps.classify.outputs.code }}
+      promotable: ${{ steps.classify.outputs.promotable }}
       tree: ${{ steps.classify.outputs.tree }}
       skip_build: ${{ steps.decide.outputs.skip_build }}
       skip_tsan: ${{ steps.decide.outputs.skip_tsan }}
@@ -117,6 +118,28 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      # On this workflow's own push to staging, the checks of what the squash
+      # committed, as steps of this job rather than workflows of their own (each
+      # would bill a whole minute for seconds of work): the commit policy and the
+      # attribution scan. Either failing fails ci.
+      - name: Commit policy
+        if: >-
+          github.event_name == 'push' && github.ref == 'refs/heads/staging'
+          && startsWith(github.workflow_ref, format('{0}/.github/workflows/ci.yml@', github.repository))
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: scripts/release/commit_policy.sh
+      - name: Attribution scan
+        if: >-
+          github.event_name == 'push' && github.ref == 'refs/heads/staging'
+          && startsWith(github.workflow_ref, format('{0}/.github/workflows/ci.yml@', github.repository))
+        env:
+          EVENT: push
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          BASE_REF: ""
+        run: scripts/release/attribution_scan.sh
       - id: classify
         env:
           EVENT: ${{ github.event_name }}
@@ -137,17 +160,26 @@ jobs:
                 files=$(git diff --name-only "$BEFORE" "$GITHUB_SHA") || files=""
               fi ;;
           esac
+          # A workflow but this one builds nothing these jobs test, so a change
+          # to one alone runs none of them; a change to this file tests itself.
+          # Promotable: documentation and workflows only, what promote.yml moves
+          # main for without a release.
+          promotable=false
           if [ -n "$files" ]; then
             code=false
+            promotable=true
             while IFS= read -r f; do
               case "$f" in
                 *.md|.gitignore|.claude/*) ;;
-                *) code=true; echo "code: $f"; break ;;
+                .github/workflows/ci.yml) code=true; echo "code: $f" ;;
+                .github/*) ;;
+                *) code=true; promotable=false; echo "code: $f"; break ;;
               esac
             done <<<"$files"
           fi
-          [ "$code" = false ] && echo "documentation only: the build and test jobs are skipped"
+          [ "$code" = false ] && echo "documentation and other workflows only: the build and test jobs are skipped"
           echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "promotable=$promotable" >> "$GITHUB_OUTPUT"
           # The tree the jobs test: on a pull request, that of its merge
           # into staging (refs/pull/N/merge), which the records are named for.
           echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
@@ -552,3 +584,27 @@ jobs:
       # The record that this job passed on this tree (see the build job).
       - *record_write
       - *record_upload
+
+  # promote, started once this push's checks passed, when it changed only
+  # documentation and workflows: a dispatch, so no runner waits on this run,
+  # and on a push of code this job does not start at all. Its own job, so no
+  # step that runs the repository's code holds `actions: write`.
+  promote:
+    name: hand off to promote
+    needs: [changes, build, thread-sanitizer, windows]
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/staging' && !cancelled()
+      && startsWith(github.workflow_ref, format('{0}/.github/workflows/ci.yml@', github.repository))
+      && needs.changes.result == 'success' && needs.changes.outputs.promotable == 'true'
+      && (needs.build.result == 'success' || needs.build.result == 'skipped')
+      && (needs.thread-sanitizer.result == 'success' || needs.thread-sanitizer.result == 'skipped')
+      && (needs.windows.result == 'success' || needs.windows.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch promote
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run promote.yml -R "$GITHUB_REPOSITORY" --ref staging

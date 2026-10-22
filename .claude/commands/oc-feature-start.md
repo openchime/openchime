@@ -15,6 +15,9 @@ Every check below that fails means **stop, report exactly what was found, and
 do nothing else**. This command never stashes, resets, force-updates, or works
 around a dirty state.
 
+- **The hooks are on.** `git config core.hooksPath` must print `.githooks`;
+  if it does not, refuse and give the command: `git config core.hooksPath .githooks`.
+  The pre-push hook is what holds a push to a tree tested locally.
 - `git fetch origin --prune` first, so every judgement below is against
   current remote state.
 - **Local must be clean.** `git status --porcelain` must print nothing —

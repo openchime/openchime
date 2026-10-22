@@ -47,9 +47,9 @@ A release-candidate is cut from the tip of `staging`:
 
     gh workflow run release-candidate.yml --ref staging
 
-`release-candidate.yml` refuses any other ref, waits for (or finds finished) the
-CI, attribution-guard and commit-policy runs of the push that put the commit on
-`staging`, and then builds everything a release ships: both daemons with their
+`release-candidate.yml` refuses any other ref, checks once that CI passed on the
+push that put the commit on `staging` (the commit policy and the attribution
+scan are steps of it), and then builds everything a release ships: both daemons with their
 data (zig against glibc 2.34, the arm64 one cross-built), the images (buildah,
 started with podman and asked `/healthz`), the Windows clients (llvm-mingw).
 The packaging scripts run under a placeholder version so a package that cannot
@@ -57,8 +57,9 @@ be built, installed or made identical across channels stops the
 release-candidate; the packages themselves are not kept.
 
 CI runs on every push to `staging`, a documentation-only one included (its
-build and test jobs skip), so the gate waits for CI, the attribution guard and
-the commit policy on every commit (`scripts/release/wait_checks.sh`).
+build and test jobs skip), so every commit has a run for the gate to check
+(`scripts/release/wait_checks.sh`). The gate never waits: dispatched before CI
+finished, it refuses at once, and is dispatched again once CI has passed.
 
 What is kept, under `candidates/<build-id>/` in the staging bucket
 (`DIST_STAGING_BUCKET`, via the `dist-staging` rclone remote):
@@ -137,8 +138,8 @@ after every push to `staging` (a merged pull request) and:
    `.github/` or `.claude/`, it goes on; when any touches code, it stops and
    says which: `main` moves with the next release, which carries the
    documentation with it.
-2. waits for CI, the attribution guard and the commit policy on the `staging`
-   tip, as a release-candidate does;
+2. is dispatched by CI once it passed on a push of documentation and workflows
+   only (dispatched by hand, it checks once that CI passed on the tip);
 3. fast-forwards `main` with `RELEASE_SSH_KEY`;
 4. copies `main` and `staging` to `openchime/openchime` with `PUBLIC_DEPLOY_KEY`
    (a failure there is a warning);
