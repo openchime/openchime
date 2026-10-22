@@ -142,14 +142,34 @@ machines at once:
 - **`pr policy`** and **`guard`** — the pull request's title and body (and that the
   title names an open issue), and the attribution guard
   ([`attribution-guard`](../.github/workflows/attribution-guard.yml)).
-  The guard runs on every push including documentation-only ones, since what
-  it rejects lives in commit messages and author lines. A release-candidate is refused for a staging commit it has not passed
-  on.
+  The guard runs on every pull request, and on every push to `staging`,
+  `main` and any tag, documentation-only ones included, since what it rejects
+  lives in commit messages and author lines; a push to a feature branch is
+  scanned once, by its pull request's run. A release-candidate is refused for
+  a staging commit it has not passed on.
 
 **All five are required checks on `staging`.** CI runs on every pull request
 and push; its first job, `classify the change`, skips the three build jobs when
 only documentation changed, and GitHub counts a skipped job as passed, so a
 documentation pull request reports every required check.
+
+**A change is built and tested once, on its pull request.** Each of the three
+jobs, as its last step and only when it passed, records the tree it tested (an
+artifact `tested-<tree>-build`, `-tsan` or `-windows`, kept 7 days; the tree is
+that of the pull request's merge into `staging`). On the push that lands it,
+`classify the change` runs `scripts/release/tested_tree.sh`, which finds the
+pull request that commit merged and looks for a successful run of that pull
+request's own head holding all three records for the pushed tree; it never
+fails, and any doubt is a no. A job is skipped on the push only when its tree
+was tested **and** every cache it saves already exists on `staging` (looked up,
+not downloaded), so the caches pull requests restore stay fresh. A squash merge
+onto an unmoved `staging` produces exactly the tested tree and the push runs only
+`classify the change`, whose summary names the run it reused; if `staging` moved
+in between, a record expired or a cache is missing, the job runs in full. The
+skip happens only on the push, where no check is required, and the run still
+concludes success for the release gate. A call of `ci.yml` from another workflow
+never looks anything up, and must grant `actions: read` and
+`pull-requests: read` besides `contents: read`.
 
 **Read the run's result before asking for a merge**: the `build` job's TLS run
 of the shipped `main()` and the thread-sanitizer suites are checks a local

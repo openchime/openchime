@@ -914,7 +914,10 @@ what the release checks itself is not repeated.
 mbedTLS, libvpx, Opus, speexdsp and llama.cpp, their Windows and wasm builds and
 SDL3, zig, Emscripten and llvm-mingw, and the speech engine and models. Each build script builds only what is missing, so a
 hit skips its download and build. A pull request restores the caches its base
-branch's runs saved, which is why the push to `staging` runs too.
+branch's runs saved, which is why the push to `staging` runs too. That push
+skips a job only when the merged pull request's own run already passed it on
+the identical tree **and** the job's caches all exist on `staging`; otherwise
+the job runs in full (CONTRIBUTING.md "CI").
 
 Jobs, on three machines at once:
 

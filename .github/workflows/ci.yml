@@ -31,13 +31,33 @@ name: ci
 # CI runs on every pull request and push, so its required checks always report.
 # A change that touches only documentation (*.md, .gitignore, .claude/) skips
 # the three jobs below, which GitHub counts as passed. See docs/TESTING.md for the full strategy.
+#
+# Each change is tested once, not once on its pull request and again when it
+# lands. Each job of a pull request's run, as its last step and only when
+# everything before it passed, uploads a record named for the tree it tested
+# (tested-<tree>-build, -tsan, -windows; the tree of refs/pull/N/merge). On
+# the push that lands on staging, `changes` asks scripts/release/tested_tree.sh
+# whether the merged pull request's own head has a successful run holding all
+# three records for the pushed tree; a squash merge onto an unmoved staging
+# yields exactly that tree. A job is then skipped only if, in addition, every
+# cache it saves already exists on staging (looked up, not restored), since
+# the push's run is the one that saves the caches pull requests restore. If
+# staging moved, a record expired, a lookup failed or a cache is missing, the
+# job runs in full. The checks staging requires are the pull request's, which
+# are never skipped this way; the push's run still concludes success for
+# wait_checks.sh. The lookup never runs on a call from another workflow.
+#
+# Each cache's path and key is written once, as a YAML anchor on its lookup in
+# `changes`, and the job that restores and saves it uses the alias, so the
+# lookup cannot drift from the save.
 
 on:
   # A pull request into staging, where its results are the required checks; and
   # the push that lands on staging, whose run saves the caches every pull request
   # then restores (a cache is visible to a pull request from its base branch, not
-  # from another feature branch). Not main: nothing reaches main but a release
-  # of a staging commit, which CI already ran.
+  # from another feature branch) and skips what its pull request already tested
+  # (the header). Not main: nothing reaches main but a release of a staging
+  # commit, which CI already ran.
   #
   # No path filter on either: a filtered-out pull request never reports the
   # checks its merge requires, and on a force-push the filter skipped the one
@@ -61,17 +81,38 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: the jobs read the tree and nothing else. `changes` also reads
+# the runs, artifacts and pull requests its lookup needs. A workflow calling
+# this one must grant at least that much, or GitHub refuses to start the call.
+permissions:
+  contents: read
+
 jobs:
   # Documentation only, or code? Everything else in this workflow runs only for
   # code. Compared against the pull request's base, or the push's previous tip;
   # a push with no previous tip here (a new branch, a force-push to a new root)
   # and a call from another workflow count as code.
+  #
+  # On a push to staging that is code, it also decides which jobs the merged
+  # pull request already ran on this tree (the header): skip_build, skip_tsan
+  # and skip_windows are 'true' only for a job whose tree was tested and whose
+  # caches all exist. On a pull request, and on a call from another workflow
+  # (whose github context is the caller's, so its event may be a push too),
+  # nothing is looked up and nothing is skipped.
   changes:
     name: classify the change
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read          # the runs and their artifacts
+      pull-requests: read    # the pull request a commit merged
     outputs:
       code: ${{ steps.classify.outputs.code }}
+      tree: ${{ steps.classify.outputs.tree }}
+      skip_build: ${{ steps.decide.outputs.skip_build }}
+      skip_tsan: ${{ steps.decide.outputs.skip_tsan }}
+      skip_windows: ${{ steps.decide.outputs.skip_windows }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -107,12 +148,185 @@ jobs:
           fi
           [ "$code" = false ] && echo "documentation only: the build and test jobs are skipped"
           echo "code=$code" >> "$GITHUB_OUTPUT"
+          # The tree the jobs test: on a pull request, that of its merge
+          # into staging (refs/pull/N/merge), which the records are named for.
+          echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+      # Only on this workflow's own push run to staging, never on a call from
+      # another workflow (github.workflow_ref is then the caller's). It never
+      # fails: any doubt reads as untested.
+      - name: Did the merged pull request test this tree?
+        id: tested
+        if: >-
+          steps.classify.outputs.code == 'true'
+          && github.event_name == 'push' && github.ref == 'refs/heads/staging'
+          && startsWith(github.workflow_ref, format('{0}/.github/workflows/ci.yml@', github.repository))
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TREE: ${{ steps.classify.outputs.tree }}
+        run: |
+          scripts/release/tested_tree.sh "$TREE" "$GITHUB_SHA" \
+            >>"$GITHUB_OUTPUT" 2>"$RUNNER_TEMP/tested_tree.log" || true
+          cat "$RUNNER_TEMP/tested_tree.log"
+      # Whether each cache the job would save already exists, looked up
+      # without downloading. Each path and key is anchored here and aliased
+      # where the job restores and saves it, so the two cannot differ. Asked
+      # only for a job whose tree was tested.
+      - name: Look up the toolchains cache
+        id: cache_toolchains
+        if: steps.tested.outputs.build == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          lookup-only: true
+          path: &toolchains_path |
+            third_party/zig-0.13.0
+            third_party/emsdk-6.0.8
+          key: &toolchains_key toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
+      - name: Look up the speech engine and models cache
+        id: cache_tts
+        if: steps.tested.outputs.build == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          lookup-only: true
+          path: &tts_path |
+            third_party/onnxruntime-1.30.0
+            build/kitten
+            build/moonshine
+          key: &tts_key tts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build/onnxruntime.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+      - name: Look up the vendored libraries cache
+        id: cache_vendor
+        if: steps.tested.outputs.build == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          lookup-only: true
+          path: &vendor_path |
+            third_party/mbedtls-3.6.2
+            third_party/libvpx-1.17.0
+            third_party/opus-1.6.1
+            third_party/speexdsp-1.2.1
+            third_party/llamacpp-0.5.0
+          key: &vendor_key vendor-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh', 'scripts/build/llamacpp.sh') }}
+      - name: Look up the wasm libraries cache
+        id: cache_wasm
+        if: steps.tested.outputs.build == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          lookup-only: true
+          path: &wasm_path |
+            build/wasm/mbedtls
+            build/wasm/sdl3
+            build/wasm/libvpx
+            build/wasm/opus
+            build/wasm/speexdsp
+          key: &wasm_key wasm-emsdk6.0.8-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/sdl3_wasm.sh', 'scripts/build/media_wasm.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
+      - name: Look up the sanitizer's vendored libraries cache
+        id: cache_vendor_tsan
+        if: steps.tested.outputs.tsan == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          lookup-only: true
+          path: &vendor_tsan_path |
+            third_party/mbedtls-3.6.2
+            third_party/libvpx-1.17.0
+            third_party/opus-1.6.1
+            third_party/speexdsp-1.2.1
+          key: &vendor_tsan_key vendor-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
+      - name: Look up the mingw toolchain cache
+        id: cache_mingw
+        if: steps.tested.outputs.windows == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          lookup-only: true
+          path: &mingw_path third_party/llvm-mingw-20261006
+          key: &mingw_key toolchain-mingw-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh') }}
+      - name: Look up the vendored Windows libraries cache
+        id: cache_vendor_win
+        if: steps.tested.outputs.windows == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          lookup-only: true
+          path: &vendor_win_path |
+            third_party/mbedtls-3.6.2-win
+            third_party/libvpx-1.17.0-win
+            third_party/opus-1.6.1-win
+            third_party/speexdsp-1.2.1-win
+            third_party/sdl3-3.4.14-win
+            third_party/mbedtls-3.6.2
+          key: &vendor_win_key vendor-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh', 'scripts/build/mbedtls.sh', 'scripts/build/mbedtls_windows.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh', 'scripts/build/sdl3_windows.sh') }}
+      # A job is skipped only when its tree was tested AND every cache it
+      # saves hit; anything else, including a step above that did not run,
+      # leaves it to run in full.
+      - name: Decide what runs
+        id: decide
+        env:
+          LOOKED: ${{ steps.tested.conclusion == 'success' }}
+          RUN: ${{ steps.tested.outputs.run }}
+          T_BUILD: ${{ steps.tested.outputs.build }}
+          T_TSAN: ${{ steps.tested.outputs.tsan }}
+          T_WINDOWS: ${{ steps.tested.outputs.windows }}
+          HIT_TOOLCHAINS: ${{ steps.cache_toolchains.outputs.cache-hit }}
+          HIT_TTS: ${{ steps.cache_tts.outputs.cache-hit }}
+          HIT_VENDOR: ${{ steps.cache_vendor.outputs.cache-hit }}
+          HIT_WASM: ${{ steps.cache_wasm.outputs.cache-hit }}
+          HIT_VENDOR_TSAN: ${{ steps.cache_vendor_tsan.outputs.cache-hit }}
+          HIT_MINGW: ${{ steps.cache_mingw.outputs.cache-hit }}
+          HIT_VENDOR_WIN: ${{ steps.cache_vendor_win.outputs.cache-hit }}
+        run: |
+          set -uo pipefail
+          if [ "$LOOKED" != true ]; then
+            printf 'skip_%s=false\n' build tsan windows >> "$GITHUB_OUTPUT"
+            echo "nothing looked up (not this workflow's own push of code to staging): nothing is skipped"
+            exit 0
+          fi
+          # decide <job> <tested> <cache-name=hit>...: prints the line and
+          # writes skip_<job>.
+          decide() {
+            local job="$1" tested="$2" skip=true why="" c; shift 2
+            if [ "$tested" != true ]; then
+              skip=false; why="its tree was not tested by the merged pull request"
+            else
+              for c in "$@"; do
+                [ "${c#*=}" = true ] || { skip=false; why="${why:+$why, }the ${c%%=*} cache is missing"; }
+              done
+            fi
+            echo "skip_${job}=${skip}" >> "$GITHUB_OUTPUT"
+            if [ "$skip" = true ]; then
+              echo "- **${job}**: skipped, tested by the merged pull request and its caches all exist"
+            else
+              echo "- **${job}**: runs (${why})"
+            fi
+          }
+          {
+            decide build "$T_BUILD" toolchains="$HIT_TOOLCHAINS" tts="$HIT_TTS" vendor="$HIT_VENDOR" wasm="$HIT_WASM"
+            decide tsan "$T_TSAN" vendor-tsan="$HIT_VENDOR_TSAN"
+            decide windows "$T_WINDOWS" mingw="$HIT_MINGW" vendor-win="$HIT_VENDOR_WIN"
+          } > "$RUNNER_TEMP/decision.md"
+          cat "$RUNNER_TEMP/decision.md"
+          {
+            echo "## What this push runs"
+            if [ -n "$RUN" ]; then
+              echo "Tree tested by run [${RUN}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${RUN}) of the merged pull request."
+            else
+              echo "Nothing reused: $(tail -n 1 "$RUNNER_TEMP/tested_tree.log" 2>/dev/null | sed 's/^tested_tree: //')."
+            fi
+            echo
+            cat "$RUNNER_TEMP/decision.md"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: build + unit tests
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.skip_build != 'true'
     runs-on: ubuntu-24.04
+    env:
+      TESTED_AS: build   # the record's suffix (its last two steps)
     timeout-minutes: 90   # a cold cache builds the vendored libraries: ~44 min
     steps:
       - uses: actions/checkout@v7
@@ -133,10 +347,8 @@ jobs:
       - name: Restore the toolchains
         uses: actions/cache@v6
         with:
-          path: |
-            third_party/zig-0.13.0
-            third_party/emsdk-6.0.8
-          key: toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
+          path: *toolchains_path
+          key: *toolchains_key
       # Read-aloud's engine and model (ARCH-111): ONNX Runtime built minimal and
       # static from source (about 20 minutes), the converted voice model, and
       # voice input's recognizer files (ARCH-112). All are pure functions of the
@@ -145,37 +357,24 @@ jobs:
       - name: Restore the speech engine and models
         uses: actions/cache@v6
         with:
-          path: |
-            third_party/onnxruntime-1.30.0
-            build/kitten
-            build/moonshine
-          key: tts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build/onnxruntime.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+          path: *tts_path
+          key: *tts_key
       # The vendored native libraries: each script builds only what is missing,
       # so a hit skips the download and the build. Keyed by the scripts, which pin
       # the versions and checksums, and by the compiler that builds them.
       - name: Restore the vendored libraries
         uses: actions/cache@v6
         with:
-          path: |
-            third_party/mbedtls-3.6.2
-            third_party/libvpx-1.17.0
-            third_party/opus-1.6.1
-            third_party/speexdsp-1.2.1
-            third_party/llamacpp-0.5.0
-          key: vendor-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh', 'scripts/build/llamacpp.sh') }}
+          path: *vendor_path
+          key: *vendor_key
       # The web client's libraries (docs/WEB.md): the release daemon carries the
       # client (WEB=1), so this job builds it too. Built once by their scripts
       # and cached, keyed by the scripts and the pinned Emscripten.
       - name: Restore the wasm libraries
         uses: actions/cache@v6
         with:
-          path: |
-            build/wasm/mbedtls
-            build/wasm/sdl3
-            build/wasm/libvpx
-            build/wasm/opus
-            build/wasm/speexdsp
-          key: wasm-emsdk6.0.8-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/sdl3_wasm.sh', 'scripts/build/media_wasm.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
+          path: *wasm_path
+          key: *wasm_key
       # The daemon as the release builds it (every feature, the web client in),
       # the e2e client the step below drives, and the Linux terminal client.
       - name: Build the daemon, the e2e client and the terminal client
@@ -232,11 +431,40 @@ jobs:
       # registry, release lint).
       - name: Run the suites the sanitizer does not
         run: make test-ci PART=plain
+      # The record that this job passed on this tree, read by the push that
+      # lands it (the header, scripts/release/tested_tree.sh). Last, so it
+      # exists only if every step above passed; only on this workflow's own
+      # pull-request run. Written once here and aliased by the other jobs.
+      - &record_write
+        name: Write the record of the tested tree
+        if: >-
+          success() && github.event_name == 'pull_request'
+          && startsWith(github.workflow_ref, format('{0}/.github/workflows/ci.yml@', github.repository))
+        env:
+          TREE: ${{ needs.changes.outputs.tree }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf '{"tree":"%s","sha":"%s","merge":"%s","run_id":"%s","run_attempt":"%s"}\n' \
+            "$TREE" "$HEAD_SHA" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            > "$RUNNER_TEMP/tested.json"
+          cat "$RUNNER_TEMP/tested.json"
+      - &record_upload
+        name: Upload the record of the tested tree
+        if: >-
+          success() && github.event_name == 'pull_request'
+          && startsWith(github.workflow_ref, format('{0}/.github/workflows/ci.yml@', github.repository))
+        uses: actions/upload-artifact@v7
+        with:
+          name: tested-${{ needs.changes.outputs.tree }}-${{ env.TESTED_AS }}
+          path: ${{ runner.temp }}/tested.json
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: error
 
   thread-sanitizer:
     name: thread sanitizer
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.skip_tsan != 'true'
     # The daemon is threads -- the event loop, its I/O threads, the writer, the
     # readers and the auth pool, the worker pools -- and so are the client, its
     # call engine and its recorder. `make test-ci PART=threads` runs the suites whose code
@@ -245,6 +473,8 @@ jobs:
     # suites' only run in CI.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      TESTED_AS: tsan
     steps:
       - uses: actions/checkout@v7
       - name: Install build deps
@@ -261,23 +491,24 @@ jobs:
       - name: Restore the vendored libraries
         uses: actions/cache@v6
         with:
-          path: |
-            third_party/mbedtls-3.6.2
-            third_party/libvpx-1.17.0
-            third_party/opus-1.6.1
-            third_party/speexdsp-1.2.1
-          key: vendor-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
+          path: *vendor_tsan_path
+          key: *vendor_tsan_key
       # The test binary needs no Emscripten: the web client's page is embedded
       # from source and its loader only into a daemon built with WEB=1.
       - name: Test under ThreadSanitizer
         run: make test-ci PART=threads
+      # The record that this job passed on this tree (see the build job).
+      - *record_write
+      - *record_upload
 
   windows:
     name: windows cross-compile (TUI + GUI)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.skip_windows != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      TESTED_AS: windows
     steps:
       - uses: actions/checkout@v7
       - name: Install build deps
@@ -290,24 +521,21 @@ jobs:
       - name: Restore the toolchain
         uses: actions/cache@v6
         with:
-          path: third_party/llvm-mingw-20261006
-          key: toolchain-mingw-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh') }}
+          path: *mingw_path
+          key: *mingw_key
       # The cross-built libraries and SDL3, cached like the native ones: each
       # script builds only what is missing, and make runs each from its rule.
       - name: Restore the vendored Windows libraries
         uses: actions/cache@v6
         with:
-          path: |
-            third_party/mbedtls-3.6.2-win
-            third_party/libvpx-1.17.0-win
-            third_party/opus-1.6.1-win
-            third_party/speexdsp-1.2.1-win
-            third_party/sdl3-3.4.14-win
-            third_party/mbedtls-3.6.2
-          key: vendor-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh', 'scripts/build/mbedtls.sh', 'scripts/build/mbedtls_windows.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh', 'scripts/build/sdl3_windows.sh') }}
+          path: *vendor_win_path
+          key: *vendor_win_key
       # Both Windows front-ends share the app-core + shared wire code; a clean
       # link proves the pure-C Win32 (incl. Direct2D/DirectWrite-from-C, ARCH-82)
       # builds under clang's mingw. The two Windows test programs are built
       # too (a Windows host runs them, docs/TESTING.md).
       - name: Compile the Windows front-ends and test programs
         run: make windows build/sdltext_test.exe build/gfx_test.exe
+      # The record that this job passed on this tree (see the build job).
+      - *record_write
+      - *record_upload

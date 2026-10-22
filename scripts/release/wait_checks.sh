@@ -4,8 +4,9 @@
 #   GH_TOKEN=... scripts/release/wait_checks.sh <sha>
 #
 # ci, attribution-guard and commit-policy run on every push to staging (ci with
-# its build and test jobs skipped when only documentation changed), so each has
-# a run to wait for. release-candidate.yml waits before it builds anything, and
+# its build and test jobs skipped when only documentation changed, or when the
+# merged pull request already passed them on the same tree), so each has a run
+# to wait for. release-candidate.yml waits before it builds anything, and
 # promote.yml before it moves main. Up to 55 minutes each: ci from a cold cache
 # takes most of that. The token needs `actions: read`.
 set -euo pipefail
