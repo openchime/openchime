@@ -749,8 +749,11 @@ jobs:
           # A: the files, an empty volume, an empty bucket.
           start oc-a "$W/data-a" -v "$W/creds:/etc/openchime:ro"
           healthz oc-a
-          podman logs oc-a 2>&1 | grep -q 'the replica holds no copy yet' \
-            || { podman logs oc-a 2>&1 | tail -40; echo "::error::A did not report an empty replica on its first boot"; exit 1; }
+          # The log goes to a file first: under pipefail, grep -q stops reading at
+          # its first match and `podman logs` then fails on the closed pipe.
+          podman logs oc-a > "$W/a-boot.log" 2>&1
+          grep -q 'the replica holds no copy yet' "$W/a-boot.log" \
+            || { tail -40 "$W/a-boot.log"; echo "::error::A did not report an empty replica on its first boot"; exit 1; }
           # Litestream syncs every 60 s (the configuration entrypoint.sh writes).
           ok=0
           for i in $(seq 1 150); do
@@ -770,8 +773,9 @@ jobs:
           # B: the same files, onto an empty volume.
           start oc-b "$W/data-b" -v "$W/creds:/etc/openchime:ro"
           healthz oc-b
-          podman logs oc-b 2>&1 | grep -q 'entrypoint: restored /data/openchime.db from the replica' \
-            || { podman logs oc-b 2>&1 | tail -40; echo "::error::B did not restore the database"; exit 1; }
+          podman logs oc-b > "$W/b-boot.log" 2>&1
+          grep -q 'entrypoint: restored /data/openchime.db from the replica' "$W/b-boot.log" \
+            || { tail -40 "$W/b-boot.log"; echo "::error::B did not restore the database"; exit 1; }
           cmp -s "$W/data-a/cert.pem" "$W/data-b/cert.pem" \
             || { echo "::error::B presents a different certificate from A: the restored database did not carry its identity"; exit 1; }
           echo "B: restored, and presents A's certificate"
