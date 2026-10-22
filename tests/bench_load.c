@@ -208,12 +208,12 @@ static void *run_worker(void *arg) {
         }
         if (got != 1) break;
         W->lat[W->nlat++] = now_ms() - t0;
-        usleep(150000);   /* pace under the per-connection send-rate limit */
+        usleep(150000);   /* slow-on-purpose: the load's pace, under the per-connection send-rate limit */
     }
 
     /* Hold the connection open (idle) until the run's deadline. */
     double left = g_deadline_ms - now_ms();
-    if (left > 0) usleep((useconds_t)(left * 1000.0));
+    if (left > 0) usleep((useconds_t)(left * 1000.0));   /* slow-on-purpose: the load holds idle connections */
     client_close(&c);
     return NULL;
 }
@@ -238,7 +238,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n; i++) {
         ws[i].idx = i; ws[i].host = host; ws[i].port = port; ws[i].sends = sends; ws[i].nusers = nusers;
         pthread_create(&th[i], NULL, run_worker, &ws[i]);
-        usleep(2000);   /* stagger setup: real clients don't all connect at once */
+        usleep(2000);   /* slow-on-purpose: stagger setup, as real clients don't all connect at once */
     }
     for (int i = 0; i < n; i++) pthread_join(th[i], NULL);
 

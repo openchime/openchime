@@ -5,6 +5,7 @@
  * with the real-time test sink. */
 #define _POSIX_C_SOURCE 200809L
 #include "check.h"
+#include "testenv.h"
 #include "oc_capture.h"
 #include "oc_codec.h"
 #include "oc_mp4.h"
@@ -22,10 +23,8 @@
  * (OPENCHIME_MAX_VIDEO_SIZE, 160 MiB). */
 #define TEST_VIDEO_BUDGET oc_recorder_budget(160ull * 1024 * 1024)
 
-static void msleep(int ms) {
-    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
-    nanosleep(&ts, NULL);
-}
+/* The player's status, fresh: for WAIT_UNTIL. */
+static oc_player_status pstat(oc_player *p) { oc_player_status st; oc_player_status_get(p, &st); return st; }
 
 /* ---- MP4 --------------------------------------------------------------------------- */
 
@@ -173,12 +172,7 @@ static void test_player_audio_only(void) {
          * which is silent to every other assertion here -- and to a listener it
          * is a channel that reads one message aloud and then nothing, ever
          * (REQ-291). Two seconds for 300 ms of audio. */
-        int ended = 0;
-        for (int i = 0; i < 200 && !ended; i++) {
-            oc_player_status_get(p, &st);
-            if (st.state == OC_PLAYER_ENDED) ended = 1;
-            else msleep(10);
-        }
+        int ended = WAIT_UNTIL(pstat(p).state == OC_PLAYER_ENDED, 2000);
         oc_player_status_get(p, &st);
         CHECK(ended && st.has_audio && st.duration_ms == dur);
         CHECK(st.position_ms == dur);
@@ -361,33 +355,35 @@ static void test_opus_roundtrip(void) {
 
 /* ---- recorder ----------------------------------------------------------------------- */
 
+/* Until the recorder is in `want` (or has failed): whether it got there. */
 static int wait_state(oc_recorder *r, oc_rec_state want, int timeout_ms, oc_rec_status *st) {
-    for (int t = 0; t < timeout_ms; t += 20) {
-        oc_recorder_status(r, st);
-        if (st->state == want || st->state == OC_REC_ERROR) return st->state == want;
-        msleep(20);
-    }
-    return 0;
+    WAIT_UNTIL((oc_recorder_status(r, st), st->state == want || st->state == OC_REC_ERROR), (uint64_t)timeout_ms);
+    return st->state == want;
 }
 
+/* An independent reader's view of the file. Without ffprobe the check cannot
+ * run: a SKIP, counted, and a failure in CI, whose runner has it. */
 static int ffprobe_ok(const uint8_t *mp4, size_t len, uint32_t duration_ms) {
     if (system("command -v ffprobe >/dev/null 2>&1") != 0) {
-        printf("  SKIP ffprobe not installed\n");
+        SKIP("ffprobe not installed: the recording is not checked by an independent reader");
         return 1;
     }
-    const char *path = "build/test_media_rec.mp4";
+    char dir[512], path[600], cmd[900];
+    if (oc_test_mkdtemp("media", dir, sizeof dir) != 0) return 0;
+    oc_test_path(path, sizeof path, dir, "rec.mp4");
     FILE *f = fopen(path, "wb");
-    if (!f) return 0;
+    if (!f) { oc_test_rmtree(dir); return 0; }
     fwrite(mp4, 1, len, f);
     fclose(f);
-    FILE *p = popen("ffprobe -v error -show_entries stream=codec_name,width,height:format=duration "
-                    "-of default=nw=1 build/test_media_rec.mp4 2>&1", "r");
-    if (!p) return 0;
+    snprintf(cmd, sizeof cmd, "ffprobe -v error -show_entries stream=codec_name,width,height:format=duration "
+                              "-of default=nw=1 '%s' 2>&1", path);
+    FILE *p = popen(cmd, "r");
+    if (!p) { oc_test_rmtree(dir); return 0; }
     char out[1024] = {0};
     size_t n = fread(out, 1, sizeof out - 1, p);
     out[n] = 0;
     int rc = pclose(p);
-    remove(path);
+    oc_test_rmtree(dir);
     const char *d = strstr(out, "duration=");
     double secs = d ? atof(d + 9) : -1;
     int ok = rc == 0 && strstr(out, "codec_name=vp9") && strstr(out, "codec_name=opus") &&
@@ -413,10 +409,7 @@ static void test_recorder(void) {
     CHECK(st.state == OC_REC_PREVIEW && st.cap_ms == 2500 && st.has_audio);
     static uint8_t bgra[640 * 360 * 4];                     /* preview only: nothing recorded */
     int w, h; uint64_t seq = 0, pv = 0;
-    for (int t = 0; t < 100 && pv != 1; t++) {
-        pv = (uint64_t)oc_recorder_preview(r, bgra, sizeof bgra, &w, &h, &seq);
-        if (pv != 1) msleep(10);
-    }
+    WAIT_UNTIL((pv = (uint64_t)oc_recorder_preview(r, bgra, sizeof bgra, &w, &h, &seq)) == 1, 1000);
     CHECK(pv == 1 && w == 640 && h == 360);
     CHECK(oc_recorder_preview(r, bgra, 16, &w, &h, &(uint64_t){0}) == -1);
 
@@ -460,13 +453,16 @@ static void test_recorder(void) {
     CHECK(r != NULL);
     if (r) {
         CHECK(oc_recorder_start(r) == 0);
-        msleep(500);
+        /* Stopped once half a second is recorded: what is kept is about that,
+         * not the five-minute cap. */
+        CHECK(WAIT_UNTIL((oc_recorder_status(r, &st), st.elapsed_ms >= 500), 5000));
         oc_recorder_stop(r);
+        uint32_t at_stop = st.elapsed_ms;
         CHECK(wait_state(r, OC_REC_DONE, 5000, &st));
         oc_rec_result res;
         CHECK(oc_recorder_take(r, &res) == 0);
         CHECK(res.duration_ms >= 300);
-        CHECK_SPEED(res.duration_ms <= 800);
+        CHECK_SPEED(res.duration_ms <= at_stop + 300);
         CHECK(oc_recorder_take(r, &res) != 0 || (oc_rec_result_free(&res), 0));
         oc_rec_result_free(&res);
         oc_recorder_close(r);
@@ -502,7 +498,11 @@ static void test_recorder(void) {
     }
     /* Closing mid-recording leaves nothing behind (ASan checks the leak). */
     r = oc_recorder_open(&o, &err);
-    if (r) { oc_recorder_start(r); msleep(50); oc_recorder_close(r); }
+    if (r) {
+        CHECK(oc_recorder_start(r) == 0 && wait_state(r, OC_REC_RECORDING, 2000, &st));
+        WAIT_UNTIL((oc_recorder_status(r, &st), st.elapsed_ms > 0), 2000);   /* something encoded */
+        oc_recorder_close(r);
+    }
 
     /* The OS blocks the camera. */
     setenv("OPENCHIME_DEV_CAPTURE", "denied", 1);
@@ -521,7 +521,7 @@ static void test_player(void) {
     CHECK(p != NULL);
     if (!p) return;
     oc_player_status st;
-    msleep(100);
+    CHECK(WAIT_UNTIL(pstat(p).presented >= 1, 2000));           /* opened: the first frame shown */
     oc_player_status_get(p, &st);
     CHECK(st.state == OC_PLAYER_PAUSED && st.duration_ms == g_rec.duration_ms && st.has_audio);
     CHECK(st.presented == 1);                               /* the first frame, shown paused */
@@ -534,12 +534,8 @@ static void test_player(void) {
     if (oc_mp4_parse(g_rec.video, g_rec.video_len, &info) == 0) { n_frames = info.video.n_samples; }
 
     oc_player_play(p);
-    for (int t = 0; t < 6000; t += 50) {
-        oc_player_status_get(p, &st);
-        if (st.state == OC_PLAYER_ENDED) break;
-        msleep(50);
-    }
-    CHECK(st.state == OC_PLAYER_ENDED);
+    CHECK(WAIT_UNTIL(pstat(p).state == OC_PLAYER_ENDED, 6000));
+    oc_player_status_get(p, &st);
     printf("  played: presented %llu, dropped %llu of %u\n", (unsigned long long)st.presented,
            (unsigned long long)st.dropped, n_frames);
     CHECK(st.presented + st.dropped == n_frames);
@@ -549,8 +545,9 @@ static void test_player(void) {
     CHECK(st.position_ms == st.duration_ms);
 
     /* A seek lands on the keyframe at or before the target. */
+    uint64_t seeks = st.seeks;
     oc_player_seek(p, 2200);
-    msleep(200);
+    CHECK(WAIT_UNTIL(pstat(p).seeks > seeks, 2000));
     oc_player_status_get(p, &st);
     int k = oc_mp4_keyframe_before(&info, 2200 * 90);
     CHECK(k >= 0 && st.position_ms == (uint32_t)(info.video.samples[k].dts / 90));
@@ -558,22 +555,25 @@ static void test_player(void) {
 
     /* A decoder slower than the frame rate drops frames rather than falling
      * behind: once the clock passes the next keyframe, the frames shown jump to it. */
-    oc_player_seek(p, 0);
+    seeks = st.seeks;
     oc_player_test_decode_delay(p, 60);
-    msleep(200);
+    oc_player_seek(p, 0);
+    CHECK(WAIT_UNTIL(pstat(p).seeks > seeks, 2000));
     oc_player_status_get(p, &st);
     uint64_t before_p = st.presented, before_d = st.dropped;
     int k2 = oc_mp4_keyframe_before(&info, 2300 * 90);
     uint32_t k2_ms = k2 >= 0 ? (uint32_t)(info.video.samples[k2].dts / 90) : 0;
     oc_player_play(p);
-    msleep(2300);
-    oc_player_status_get(p, &st);
+    /* Until the picture reaches the second keyframe (or the file ends): with
+     * the decoder this slow, it can get there only by dropping frames. */
+    WAIT_UNTIL((oc_player_status_get(p, &st), (k2_ms > 0 && st.frame_ms >= k2_ms) || st.state == OC_PLAYER_ENDED),
+               6000);
     printf("  slow decoder: clock %u ms, frame %u ms, keyframe %u ms, dropped %llu\n", st.position_ms,
            st.frame_ms, k2_ms, (unsigned long long)(st.dropped - before_d));
     CHECK(st.dropped > before_d);
     CHECK(st.presented > before_p);
     CHECK_SPEED(k2_ms > 0);                                 /* a second keyframe: as many frames as real time made */
-    CHECK_SPEED(st.position_ms >= 2100);                    /* the clock follows the audio */
+    CHECK(st.position_ms >= st.frame_ms);                   /* the clock follows the audio, ahead of the picture */
     CHECK_SPEED(st.frame_ms >= k2_ms);                      /* and the picture caught up */
     oc_player_close(p);
     oc_mp4_info_free(&info);

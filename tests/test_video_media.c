@@ -6,6 +6,7 @@
  * reclaimed together with a video the age tier takes. */
 #define _POSIX_C_SOURCE 200809L
 #include "check.h"
+#include "testenv.h"
 #include "dbwriter.h"
 #include "protocol.h"
 #include "searchq.h"
@@ -16,16 +17,20 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#define DBPATH "build/test_video_media.db"
+/* The suite's database, in a directory of its own under $TMPDIR. */
+static char g_dir[512], g_db[700];
+static const char *db_path(void) {
+    if (!g_db[0] && oc_test_mkdtemp("video-media", g_dir, sizeof g_dir) == 0)
+        oc_test_path(g_db, sizeof g_db, g_dir, "video_media.db");
+    return g_db;
+}
+#define DBPATH db_path()
 #define DAY (24ull * 60 * 60 * 1000)
 
 static oc_dbres *wait_result(oc_dbwriter *w) {
-    for (int i = 0; i < 500; i++) {
-        oc_dbres *r = oc_dbwriter_next_result(w);
-        if (r) return r;
-        usleep(2000);
-    }
-    return NULL;
+    oc_dbres *r = NULL;
+    (void)WAIT_UNTIL((r = oc_dbwriter_next_result(w)) != NULL, 5000);
+    return r;
 }
 
 static uint64_t now_ms(void) {
@@ -194,7 +199,7 @@ static void run_maint(oc_dbwriter *w, uint64_t grace_ms, uint64_t max_age_ms, in
 }
 
 static void test_daemon(void) {
-    unlink(DBPATH); unlink(DBPATH "-wal"); unlink(DBPATH "-shm");
+    oc_test_rmtree(g_dir); g_db[0] = '\0';
     oc_dbwriter *w = oc_dbwriter_start(DBPATH);
     if (w) oc_dbwriter_set_pw_mem(w, 2048);   /* a cheap Argon2id for tests */
     CHECK(w != NULL);
@@ -345,7 +350,7 @@ static void test_daemon(void) {
 
     sqlite3_close(db);
     oc_dbwriter_stop(w);
-    unlink(DBPATH); unlink(DBPATH "-wal"); unlink(DBPATH "-shm");
+    oc_test_rmtree(g_dir); g_db[0] = '\0';
 }
 
 int run_video_media_tests(void) {
@@ -353,5 +358,6 @@ int run_video_media_tests(void) {
            "the media row on SEND/backfill/files, has:video, the poster's lifetime in the storage sweep\n");
     test_wire();
     test_daemon();
+    oc_test_rmtree(g_dir);
     return failures;
 }

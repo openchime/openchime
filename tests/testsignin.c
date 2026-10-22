@@ -1,4 +1,5 @@
 /* A test's sign-in through the daemon's own pages (signin.h). */
+#include "check.h"        /* oc_test_deadline, oc_test_pause: waits on the monotonic clock */
 #include "testsignin.h"
 
 #include "protocol.h"   /* OC_ALPN_HTTP11 */
@@ -58,7 +59,9 @@ static int dial(const char *host, int port) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, host && *host ? host : "127.0.0.1", &addr.sin_addr) != 1) return -1;
-    for (int i = 0; i < 200; i++) {
+    /* Until the daemon listens, or four seconds on the monotonic clock. */
+    uint64_t end = oc_test_deadline(4000);
+    do {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) return -1;
         if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) {
@@ -67,8 +70,7 @@ static int dial(const char *host, int port) {
             return fd;
         }
         close(fd);
-        usleep(20000);
-    }
+    } while (oc_test_pause(end));
     return -1;
 }
 
@@ -137,12 +139,12 @@ static void pct(const char *in, char *out, size_t cap) {
     out[o] = '\0';
 }
 
-/* The page's message, for a refusal's reason. */
+/* The page's refusal, for a diagnosis: its kind (data-oc-error), or the
+ * status line where it gave none. */
 static void page_said(const char *resp, char *why, size_t wcap) {
-    const char *m = strstr(resp, "class=\"msg\" role=\"alert\">");
-    if (!m) { snprintf(why, wcap, "%.*s", (int)strcspn(resp, "\r\n"), resp); return; }
-    m += strlen("class=\"msg\" role=\"alert\">");
-    snprintf(why, wcap, "%.*s", (int)strcspn(m, "<"), m);
+    char code[64];
+    if (oc_test_page_error_code(resp, code, sizeof code)[0]) { snprintf(why, wcap, "%s", code); return; }
+    snprintf(why, wcap, "%.*s", (int)strcspn(resp, "\r\n"), resp);
 }
 
 /* A sign-in or sign-up: the form, the 303, the token. */
@@ -200,7 +202,7 @@ int oc_test_change_password(const char *host, int port, const uint8_t *pin,
     pct(user, u, sizeof u); pct(current, c, sizeof c); pct(next, n, sizeof n);
     snprintf(body, sizeof body, "username=%s&current=%s&password=%s&confirm=%s", u, c, n, n);
     int st = oc_test_web_call(host, port, pin, "POST", "/account/password", ORIGIN, FORM, body, resp, sizeof resp);
-    if (st == 200 && strstr(resp, "Password changed")) return 0;
+    if (st == 200 && oc_test_page_result(resp, "password-changed")) return 0;
     char said[256] = "";
     if (st == 200) page_said(resp, said, sizeof said);
     snprintf(why, wcap, "/account/password: HTTP %d%s%s", st, said[0] ? ": " : "", said);

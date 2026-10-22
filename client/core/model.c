@@ -1683,6 +1683,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->connected = true;
         m->user_id = e->user_id;
         m->last_error[0] = '\0';        /* a live connection clears any prior error */
+        m->last_error_kind = OC_CERR_OTHER; m->last_error_code = 0;
         set_status(m, "connected");
         break;
     case OC_EV_AUTH_OK:
@@ -1693,6 +1694,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->srvalerts_have = 0; m->srvalerts_unacked = m->srvalerts_current = 0; m->n_srvalerts = 0;
         m->srvalerts_seq++;
         m->last_error[0] = '\0';
+        m->last_error_kind = OC_CERR_OTHER; m->last_error_code = 0;
         m->signin_url[0] = '\0';
         m->device_url[0] = m->device_code[0] = m->device_fp[0] = '\0';
         m->signed_out = false;
@@ -2890,6 +2892,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (e->body) {
             set_status(m, e->body);
             snprintf(m->last_error, sizeof m->last_error, "%s", e->body);
+            m->last_error_kind = e->err_kind;
+            m->last_error_code = e->err_code;
             m->error_seq++;
         }
         break;

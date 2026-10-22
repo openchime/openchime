@@ -14,6 +14,7 @@
 
 #include "xferpool.h"
 #include "check.h"
+#include "testenv.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,17 +23,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#define TMPDIR "build/oc-xferpool-test"
 
-/* Collect exactly one result, spinning briefly since workers are async. */
+/* Collect exactly one result: the workers are async, so until one is there,
+ * or ten seconds on the monotonic clock. */
 static oc_xfer_job *await_result(oc_xferpool *p) {
-    for (int i = 0; i < 2000; i++) {          /* ~10s worst case */
-        oc_xfer_job *j = oc_xferpool_next_result(p);
-        if (j) return j;
-        struct timespec ts = { 0, 5 * 1000 * 1000 };
-        nanosleep(&ts, NULL);
-    }
-    return NULL;
+    oc_xfer_job *j = NULL;
+    (void)WAIT_UNTIL((j = oc_xferpool_next_result(p)) != NULL, 10000);
+    return j;
 }
 
 static void fill_pattern(uint8_t *b, size_t n, uint32_t seed) {
@@ -120,16 +117,15 @@ int run_xferpool_tests(void) {
     printf("test_xferpool: worker round-trip, chunk ordering, concurrent transfers, "
            "fire-and-forget cleanup, stop-with-queued-jobs\n");
 
-    mkdir("build", 0755);
-    mkdir(TMPDIR, 0700);
-
-    oc_blobstore *bs = oc_blobstore_open(TMPDIR, NULL);
+    char dir[512];   /* the store, in a directory of its own under $TMPDIR */
+    CHECK(oc_test_mkdtemp("xferpool", dir, sizeof dir) == 0);
+    oc_blobstore *bs = oc_blobstore_open(dir, NULL);
     CHECK(bs != NULL);
-    if (!bs) return failures;
+    if (!bs) { oc_test_rmtree(dir); return failures; }
 
     oc_xferpool *p = oc_xferpool_start(bs, 4);
     CHECK(p != NULL);
-    if (!p) { oc_blobstore_close(bs); return failures; }
+    if (!p) { oc_blobstore_close(bs); oc_test_rmtree(dir); return failures; }
     CHECK(oc_xferpool_eventfd(p) >= 0);
 
     /* --- ordering: many small chunks must land in submission order --------- */
@@ -203,35 +199,48 @@ int run_xferpool_tests(void) {
     }
 
     /* --- fire-and-forget: conn_id 0 runs but yields no result -------------- */
+    /* On a pool of one worker, which takes jobs in the order submitted (FIFO
+     * in, FIFO out): a job submitted after the abort is a fence, and when its
+     * result arrives the abort has run, so a result it wrongly pushed would
+     * already be ahead of the fence's. No timeout is sat out to say so. */
     {
-        oc_xfer_job *j = oc_xfer_job_new(OC_XFER_OPEN_W, 1);
+        oc_xferpool *p1 = oc_xferpool_start(bs, 1);
+        CHECK(p1 != NULL);
+        oc_xfer_job *j = p1 ? oc_xfer_job_new(OC_XFER_OPEN_W, 1) : NULL;
         CHECK(j != NULL);
         if (j) {
             j->key = strdup("ccc00001");
             j->size_hint = 4;
-            oc_xferpool_submit(p, j);
-            j = await_result(p);
+            oc_xferpool_submit(p1, j);
+            j = await_result(p1);
             CHECK(j != NULL && j->bw != NULL);
             if (j && j->bw) {
                 /* Abandon it the way a closing connection would: hand the
                  * handle to a conn_id-0 abort and expect no completion back. */
                 oc_xfer_job *ab = oc_xfer_job_new(OC_XFER_ABORT, 0);
                 CHECK(ab != NULL);
-                if (ab) { ab->bw = j->bw; oc_xferpool_submit(p, ab); }
+                if (ab) { ab->bw = j->bw; oc_xferpool_submit(p1, ab); }
             }
             oc_xfer_job_free(j);
-            /* Nothing should arrive; a short wait is enough to catch a wrong
-             * implementation that pushes results for conn_id 0. */
-            struct timespec ts = { 0, 200 * 1000 * 1000 };
-            nanosleep(&ts, NULL);
-            oc_xfer_job *stray = oc_xferpool_next_result(p);
-            CHECK(stray == NULL);
-            oc_xfer_job_free(stray);
+            oc_xfer_job *fence = oc_xfer_job_new(OC_XFER_OPEN_R, 7);
+            CHECK(fence != NULL);
+            if (fence) {
+                fence->key = strdup("ccc00001");
+                oc_xferpool_submit(p1, fence);
+                oc_xfer_job *first = await_result(p1);
+                /* The positive: the fence came back. The negative: it came first. */
+                CHECK(first != NULL && first->conn_id == 7);
+                /* And, uncommitted then aborted, there was nothing to open. */
+                CHECK(first != NULL && first->rc != 0 && first->br == NULL);
+                oc_xfer_job_free(first);
+            }
+            CHECK(oc_xferpool_next_result(p1) == NULL);
             /* The aborted upload left no object behind. */
             oc_blob_reader *r = oc_blob_get_begin(bs, "ccc00001", NULL);
             CHECK(r == NULL);
             if (r) oc_blob_get_close(r);
         }
+        if (p1) oc_xferpool_stop(p1);
     }
 
     oc_xferpool_stop(p);
@@ -257,5 +266,6 @@ int run_xferpool_tests(void) {
     }
 
     oc_blobstore_close(bs);
+    oc_test_rmtree(dir);
     return failures;
 }

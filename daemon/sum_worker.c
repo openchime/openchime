@@ -263,7 +263,7 @@ static char *ask(build *b, const char *stage, const char *prompt, const char *gr
     /* An answer that ran away -- reached its rail without ending, which a
      * well-formed answer never does -- is asked for once more, the same
      * request: a provider's or a sampler's bad moment, not the prompt's. */
-    if (rc != 0 && strstr(err, "without ending") && !*b->stopping) {
+    if (rc != 0 && st.fail == OC_SUM_FAIL_RUNAWAY && !*b->stopping) {
         fprintf(stderr, "summary: the %s answer ran away (%s); asking once more\n", stage, err);
         if (raw && *raw) fprintf(stderr, "summary: the answer as far as it got:\n%s\n", raw);
         b->reasks++;
@@ -509,8 +509,7 @@ static int merge(build *b, const ref *kids, int n, int kind, const oc_sum_new *p
     oc_sum_lines l = {0};
     if (kid_lines(b, kids, n, &l) != 0) { oc_sum_lines_free(&l); return -1; }
     char intro[384];
-    snprintf(intro, sizeof intro, "Notes on consecutive parts of %s, oldest first. Each is: (kind) topic: what "
-             "happened.", b->where);
+    snprintf(intro, sizeof intro, SUM_INTRO_NOTES, b->where);
     uint32_t tok = 0, cpu = 0;
     char *body = take_notes(b, "merge", intro, &l, &tok, &cpu);
     oc_sum_lines_free(&l);
@@ -626,7 +625,7 @@ static int big_message(build *b, const oc_sum_msg *m, const oc_sum_chunk *c, con
         oc_sum_buf t = {0};
         oc_sum_buf_printf(&t, "%s (part %d of %d): %s", who, k + 1, np, parts[k]);
         char intro[256];
-        snprintf(intro, sizeof intro, "One long message in %s, part %d of %d.", b->where, k + 1, np);
+        snprintf(intro, sizeof intro, SUM_INTRO_PART, b->where, k + 1, np);
         uint32_t tok = 0, cpu = 0;
         char *body = NULL;
         if (!t.oom && oc_sum_lines_add_full(&l, t.p, 0, NULL, &m->id, 1, &m->id, 1, who, 0) == 0)
@@ -690,7 +689,7 @@ static int build_chunk(build *b, const oc_sum_window *w, const oc_sum_chunk *c, 
     }
     oc_sum_lines l = {0};
     char intro[256];
-    snprintf(intro, sizeof intro, "Messages from %s, oldest first. Indented lines are replies in a thread.", b->where);
+    snprintf(intro, sizeof intro, SUM_INTRO_MESSAGES, b->where);
     uint32_t tok = 0, cpu = 0;
     char *body = NULL;
     if (oc_sum_chunk_lines(w->msgs, c, &l) == 0) body = take_notes(b, "chunk", intro, &l, &tok, &cpu);
@@ -818,7 +817,7 @@ static int build_period(build *b, int64_t start, int64_t end, int tz, ref *out) 
         if (!body || !in) goto done;
     } else if (oc_sum_lines_tokens(&all) <= SUM_INPUT_TOKENS) {
         char intro[256];
-        snprintf(intro, sizeof intro, "Messages from %s, oldest first. Indented lines are replies in a thread.", b->where);
+        snprintf(intro, sizeof intro, SUM_INTRO_MESSAGES, b->where);
         if (!(body = write_summary(b, intro, &all, words, &tok, &cpu))) goto done;
         for (int i = 0; i < all.n; i++) n_in += all.v[i].n_all;
         if (!(in = malloc((size_t)(n_in ? n_in : 1) * sizeof *in))) goto done;

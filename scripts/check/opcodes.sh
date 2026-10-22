@@ -31,6 +31,22 @@ KNOWN_SHARED=""
 awk -v known="$KNOWN_SHARED" '
     BEGIN { split(known, k, /[ \t]+/); for (i in k) allowed[k[i]] = 1 }
 
+    # A line that defines an OC_MSG_ name -- it starts with one, or assigns one
+    # -- must be exactly one enum line, OC_MSG_<NAME> = 0x<hex>, or the check
+    # cannot vouch for it: a decimal value, an implicit one, or two on a line
+    # would otherwise be skipped and their opcodes never compared.
+    /^[ \t]*OC_MSG_[A-Z0-9_]+/ || /OC_MSG_[A-Z0-9_]+[ \t]*=/ {
+        line = $0
+        sub(/\/\*.*$/, "", line); sub(/\/\/.*$/, "", line)
+        defs = gsub(/OC_MSG_[A-Z0-9_]+[ \t]*=/, "&", line)
+        if (line !~ /^[ \t]*#[ \t]*define[ \t]/ &&
+            (defs != 1 || line !~ /^[ \t]*OC_MSG_[A-Z0-9_]+[ \t]*=[ \t]*0[xX][0-9A-Fa-f]+[ \t]*,?[ \t]*$/)) {
+            printf "check_opcodes: %s:%d: cannot parse this OC_MSG_ line: %s\n", FILENAME, FNR, $0 > "/dev/stderr"
+            unparsed++
+            next
+        }
+    }
+
     # The enum lines only: OC_MSG_<NAME> = 0x<hex>
     match($0, /OC_MSG_[A-Z0-9_]+[ \t]*=[ \t]*0x[0-9A-Fa-f]+/) {
         split(substr($0, RSTART, RLENGTH), part, /[ \t]*=[ \t]*/)
@@ -69,6 +85,10 @@ awk -v known="$KNOWN_SHARED" '
         if (n == 0) {
             print "check_opcodes: no OC_MSG_* definitions found: wrong file?" > "/dev/stderr"
             exit 2
+        }
+        if (unparsed) {
+            print "check_opcodes: an OC_MSG_ line is not one `OC_MSG_<NAME> = 0x<hex>,` definition." > "/dev/stderr"
+            exit 1
         }
         if (bad) {
             print "check_opcodes: a message type'\''s opcode is not unique. One value, one meaning." > "/dev/stderr"

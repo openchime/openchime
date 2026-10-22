@@ -14,6 +14,7 @@
 #include "push.h"
 #include "tls.h"
 #include "check.h"
+#include "testenv.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -33,14 +34,15 @@
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/ecdsa.h>
 #include <mbedtls/entropy.h>
+#include <mbedtls/net_sockets.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/ssl.h>
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/x509_csr.h>
 
 #define JSMN_HEADER
 #include "jsmn.h"
 
-static void msleep(int ms) { struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L }; nanosleep(&ts, NULL); }
 
 static int listen_loopback(int *port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -79,8 +81,11 @@ static struct {
     mbedtls_ctr_drbg_context rng;
     mbedtls_pk_context       key;
     char                     pem[4096];
-    char                     path[128];
+    char                     path[600];
 } g_ca;
+
+/* The suite's own directory, for the root and the listener's files. */
+static char g_dir[512], g_cert_path[600], g_key_path[600];
 
 static int ca_init(void) {
     mbedtls_entropy_init(&g_ca.ent); mbedtls_ctr_drbg_init(&g_ca.rng); mbedtls_pk_init(&g_ca.key);
@@ -99,7 +104,7 @@ static int ca_init(void) {
              mbedtls_x509write_crt_set_key_usage(&w, MBEDTLS_X509_KU_KEY_CERT_SIGN) ||
              mbedtls_x509write_crt_pem(&w, (unsigned char *)g_ca.pem, sizeof g_ca.pem, mbedtls_ctr_drbg_random, &g_ca.rng) ? -1 : 0;
     mbedtls_x509write_crt_free(&w);
-    snprintf(g_ca.path, sizeof g_ca.path, "build/test_acme_ca.pem");
+    oc_test_path(g_ca.path, sizeof g_ca.path, g_dir, "ca.pem");
     FILE *f = fopen(g_ca.path, "w");
     if (!f) return -1;
     fputs(g_ca.pem, f); fclose(f);
@@ -155,6 +160,8 @@ static oc_tls_server g_srv;
 static int g_srv_fd = -1, g_srv_port;
 static int g_srv_stop;
 
+static int g_serving;   /* connection threads running */
+
 static void *serve_one(void *p) {
     int fd = (int)(intptr_t)p;
     oc_tls_conn c;
@@ -173,6 +180,7 @@ static void *serve_one(void *p) {
     }
     oc_tls_conn_free(&c);
     close(fd);
+    __atomic_sub_fetch(&g_serving, 1, __ATOMIC_ACQ_REL);
     return NULL;
 }
 
@@ -185,8 +193,9 @@ static void *srv_thread(void *p) {
         struct timeval tv = { 5, 0 };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         pthread_t th;
+        __atomic_add_fetch(&g_serving, 1, __ATOMIC_ACQ_REL);
         if (pthread_create(&th, NULL, serve_one, (void *)(intptr_t)fd) == 0) pthread_detach(th);
-        else close(fd);
+        else { __atomic_sub_fetch(&g_serving, 1, __ATOMIC_ACQ_REL); close(fd); }
     }
     return NULL;
 }
@@ -245,26 +254,116 @@ static int names_raw(const unsigned char *der, size_t len, const char *name) {
     return 0;
 }
 
-/* What the listener shows an ACME validation for `name`, as a CA sees it: by an
- * independent TLS client (OpenSSL's), since mbedTLS's refuses the critical
- * acmeIdentifier extension before anything can look at it -- as it should for
- * any certificate but this one. 0 with the DER in `der`, -1 if refused. */
-static int acme_view(const char *name, unsigned char *der, size_t cap, size_t *len) {
-    char cmd[512];
-    snprintf(cmd, sizeof cmd, "openssl s_client -connect 127.0.0.1:%d -servername %s -alpn acme-tls/1 "
-                              "</dev/null 2>/dev/null", g_srv_port, name);
-    FILE *f = popen(cmd, "r");
-    if (!f) return -1;
-    static char out[65536]; size_t n = fread(out, 1, sizeof out - 1, f); out[n] = '\0';
-    pclose(f);
-    if (!strstr(out, "ALPN protocol: acme-tls/1")) return -1;
-    return der_of(out, der, cap, len);
+/* What the listener shows an ACME validation for `name`, as a CA sees it.
+ * mbedTLS's client refuses the critical acmeIdentifier extension before
+ * anything can look at the certificate -- as it should for any certificate but
+ * this one -- so the validation is a TLS 1.2 handshake, offering acme-tls/1
+ * alone and naming `name`, whose bytes from the listener are kept as they
+ * arrive: in TLS 1.2 the ServerHello (with the ALPN chosen) and the
+ * Certificate travel in the clear, and are read from those bytes once the
+ * client has given up. In process, so no tool is needed and none can be
+ * missing. */
+enum { ACME_SHOWN = 0, ACME_REFUSED = 1, ACME_BROKEN = -1 };
+
+typedef struct { int fd; unsigned char in[32768]; size_t n; } acme_tee;
+
+static int tee_send(void *ctx, const unsigned char *b, size_t len) {
+    ssize_t n = send(((acme_tee *)ctx)->fd, b, len, MSG_NOSIGNAL);
+    return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : (int)n;
 }
 
-/* An ACME validation for `name` is refused by the listener. */
+static int tee_recv(void *ctx, unsigned char *b, size_t len) {
+    acme_tee *t = ctx;
+    ssize_t n = recv(t->fd, b, len, 0);
+    if (n < 0) return MBEDTLS_ERR_NET_RECV_FAILED;
+    if (n == 0) return MBEDTLS_ERR_NET_CONN_RESET;
+    size_t k = (size_t)n < sizeof t->in - t->n ? (size_t)n : sizeof t->in - t->n;
+    memcpy(t->in + t->n, b, k); t->n += k;
+    return (int)n;
+}
+
+static uint32_t be(const unsigned char *p, int n) { uint32_t v = 0; while (n--) v = v << 8 | *p++; return v; }
+
+/* The listener's handshake messages, from its records up to the first that
+ * is not a handshake (a ChangeCipherSpec, or an alert): ALPN chosen in the
+ * ServerHello into `alpn`, and the first certificate's DER into `der`. */
+static void read_flight(const acme_tee *t, char *alpn, size_t acap, unsigned char *der, size_t cap, size_t *len) {
+    static unsigned char hs[32768]; size_t hn = 0;
+    for (size_t o = 0; o + 5 <= t->n; ) {
+        unsigned type = t->in[o]; size_t rl = be(t->in + o + 3, 2);
+        if (o + 5 + rl > t->n) break;
+        if (type != 22) break;
+        if (hn + rl <= sizeof hs) { memcpy(hs + hn, t->in + o + 5, rl); hn += rl; }
+        o += 5 + rl;
+    }
+    for (size_t o = 0; o + 4 <= hn; ) {
+        unsigned mt = hs[o]; size_t ml = be(hs + o + 1, 3);
+        const unsigned char *m = hs + o + 4;
+        if (o + 4 + ml > hn) break;
+        if (mt == 2 && ml >= 38) {                                   /* ServerHello */
+            size_t p = 2 + 32; p += 1 + m[p]; p += 2 + 1;            /* version, random, session id, suite, compression */
+            if (p + 2 <= ml) {
+                size_t end = p + 2 + be(m + p, 2); p += 2;
+                while (p + 4 <= end && end <= ml) {
+                    unsigned et = be(m + p, 2); size_t el = be(m + p + 2, 2);
+                    if (et == 16 && el >= 3 && m[p + 6] + 3u <= el)  /* ALPN: list length, one name */
+                        snprintf(alpn, acap, "%.*s", (int)m[p + 6], (const char *)m + p + 7);
+                    p += 4 + el;
+                }
+            }
+        } else if (mt == 11 && ml >= 6) {                            /* Certificate: the first of the list */
+            size_t cl = be(m + 3, 3);
+            if (6 + cl <= ml && cl <= cap) { memcpy(der, m + 6, cl); *len = cl; }
+        }
+        o += 4 + ml;
+    }
+}
+
+/* ACME_SHOWN with the certificate in `der` when the listener chose acme-tls/1
+ * and presented one; ACME_REFUSED when it answered and did not (a refusal, an
+ * alert, a close, another protocol); ACME_BROKEN when there was no listener
+ * to ask -- which a check never reads as either. */
+static int acme_view(const char *name, unsigned char *der, size_t cap, size_t *len) {
+    static const char *alpn_list[] = { OC_TLS_ALPN_ACME, NULL };
+    acme_tee *t = calloc(1, sizeof *t);
+    if (!t) return ACME_BROKEN;
+    t->fd = connect_loopback(g_srv_port);
+    if (t->fd < 0) { free(t); return ACME_BROKEN; }
+    mbedtls_entropy_context ent; mbedtls_ctr_drbg_context rng; mbedtls_ssl_config conf; mbedtls_ssl_context ssl;
+    mbedtls_entropy_init(&ent); mbedtls_ctr_drbg_init(&rng); mbedtls_ssl_config_init(&conf); mbedtls_ssl_init(&ssl);
+    int rc = ACME_BROKEN;
+    if (mbedtls_ctr_drbg_seed(&rng, mbedtls_entropy_func, &ent, NULL, 0) == 0 &&
+        mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM,
+                                    MBEDTLS_SSL_PRESET_DEFAULT) == 0) {
+        mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &rng);
+        mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);   /* what is shown is judged below */
+        mbedtls_ssl_conf_min_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_2);
+        mbedtls_ssl_conf_max_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_2);
+        if (mbedtls_ssl_conf_alpn_protocols(&conf, alpn_list) == 0 && mbedtls_ssl_setup(&ssl, &conf) == 0 &&
+            mbedtls_ssl_set_hostname(&ssl, name) == 0) {
+            mbedtls_ssl_set_bio(&ssl, t, tee_send, tee_recv, NULL);
+            int h;
+            do h = mbedtls_ssl_handshake(&ssl);
+            while (h == MBEDTLS_ERR_SSL_WANT_READ || h == MBEDTLS_ERR_SSL_WANT_WRITE);
+            char alpn[32] = ""; size_t dl = 0;
+            read_flight(t, alpn, sizeof alpn, der, cap, &dl);
+            /* Connected, so the listener was there to answer: anything but the
+             * challenge certificate under acme-tls/1 -- an alert, a close,
+             * another protocol -- is its refusal. */
+            if (!strcmp(alpn, OC_TLS_ALPN_ACME) && dl) { *len = dl; rc = ACME_SHOWN; }
+            else rc = ACME_REFUSED;
+        }
+    }
+    mbedtls_ssl_free(&ssl); mbedtls_ssl_config_free(&conf); mbedtls_ctr_drbg_free(&rng); mbedtls_entropy_free(&ent);
+    close(t->fd); free(t);
+    return rc;
+}
+
+/* An ACME validation for `name` is refused by the listener -- and the listener
+ * did answer: a probe that could not connect is not a refusal. */
 static int acme_refused(const char *name) {
     unsigned char der[4096]; size_t dl = 0;
-    return acme_view(name, der, sizeof der, &dl) != 0;
+    return acme_view(name, der, sizeof der, &dl) == ACME_REFUSED;
 }
 
 /* --- a fake CA and central, over plain HTTP on loopback -------------------- */
@@ -302,9 +401,13 @@ static struct {
     char     ari_last_id[200], order_replaces[200];
     /* Orders: fail every one; and when each came. */
     int      order_fail, n_orders;
-    uint64_t order_ms[32];
+    uint64_t order_ms[32];                  /* wall clock: the domain ARI's window is in */
+    uint64_t order_mono[32];                /* monotonic: for the intervals between them */
 } g_fake;
 
+/* The wall clock: the one a certificate's validity and ARI's window are
+ * written in, by the CA and read by the daemon alike. Never for measuring an
+ * interval (order_mono is). */
 static uint64_t wall_ms(void) {
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
@@ -420,7 +523,7 @@ static int check_jws(const char *body, const char *url, char *pay, size_t paycap
 /* The TLS-ALPN-01 validation: connect as a CA does and look at what is shown. */
 static int validate(const char *name) {
     unsigned char der[4096]; size_t dl = 0;
-    if (acme_view(name, der, sizeof der, &dl) != 0) return 0;
+    if (acme_view(name, der, sizeof der, &dl) != ACME_SHOWN) return 0;
     char thumb[64];
     mbedtls_pk_context pk;
     if (pk_of_jwk(g_fake.jwk, &pk) != 0) return 0;
@@ -435,11 +538,11 @@ static void central_request(int fd, const char *path, const char *head, const ch
     /* The machine signature (AUTH.md §8.7). */
     char aud[128] = "", ts[32] = "", sig64[256] = "";
     const char *h;
-    if ((h = strcasestr(head, "X-OpenChime-Audience: "))) sscanf(h + 22, "%127[^\r]", aud);
-    if ((h = strcasestr(head, "X-OpenChime-Timestamp: "))) sscanf(h + 23, "%31[^\r]", ts);
-    if ((h = strcasestr(head, "X-OpenChime-Signature: "))) sscanf(h + 23, "%255[^\r]", sig64);
+    if ((h = strcasestr(head, "X-OpenChime-Audience: "))) sscanf(h + 22, "%127[^\r]", aud);   /* contract: AUTH.md §8.7 header */
+    if ((h = strcasestr(head, "X-OpenChime-Timestamp: "))) sscanf(h + 23, "%31[^\r]", ts);   /* contract: AUTH.md §8.7 header */
+    if ((h = strcasestr(head, "X-OpenChime-Signature: "))) sscanf(h + 23, "%255[^\r]", sig64);   /* contract: AUTH.md §8.7 header */
     char ver[8] = "";
-    if ((h = strcasestr(head, "X-OpenChime-Signature-Version: "))) sscanf(h + 31, "%7[^\r]", ver);
+    if ((h = strcasestr(head, "X-OpenChime-Signature-Version: "))) sscanf(h + 31, "%7[^\r]", ver);   /* contract: AUTH.md §8.7 header */
     uint8_t bh[32]; mbedtls_sha256((const unsigned char *)body, strlen(body), bh, 0);
     char hex[65]; for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", bh[i]);
     char canon[900]; int cn = snprintf(canon, sizeof canon, "openchime-machine-v2|POST|%s|%s|%s|%s", path, aud, ts, hex);
@@ -519,7 +622,10 @@ static void acme_request(int fd, const char *method, const char *path, const cha
     }
     if (!strcmp(path, "/order")) {
         pthread_mutex_lock(&g_fake.mu);
-        if (g_fake.n_orders < 32) g_fake.order_ms[g_fake.n_orders] = wall_ms();
+        if (g_fake.n_orders < 32) {
+            g_fake.order_ms[g_fake.n_orders] = wall_ms();
+            g_fake.order_mono[g_fake.n_orders] = oc_test_mono_ms();
+        }
         g_fake.n_orders++;
         /* What it replaces (RFC 9773 §5), if anything. */
         g_fake.order_replaces[0] = '\0';
@@ -728,8 +834,8 @@ static void test_listener_choice(void) {
     CHECK(oc_acme_challenge_cert(NAME, "t.k", &cp, &kp) == 0);
     CHECK(oc_tls_server_set_challenge(&g_srv, NAME, cp, strlen(cp), kp, strlen(kp)) == 0);
     unsigned char der[4096]; size_t dl = 0;
-    CHECK(acme_view(NAME, der, sizeof der, &dl) == 0 && has_acme_id(der, dl, "t.k"));
-    CHECK(acme_view("other.acme.test", der, sizeof der, &dl) != 0);          /* only the name asked */
+    CHECK(acme_view(NAME, der, sizeof der, &dl) == ACME_SHOWN && names_raw(der, dl, NAME) && has_acme_id(der, dl, "t.k"));
+    CHECK(acme_refused("other.acme.test"));                                  /* only the name asked */
     dl = 0;
     CHECK(probe(OC_ALPN_PROTO, NAME, 0, der, &dl) == 0 && dl && !has_acme_id(der, dl, "t.k"));
     CHECK(oc_tls_server_set_challenge(&g_srv, NAME, NULL, 0, NULL, 0) == 0);
@@ -750,9 +856,11 @@ static void test_issue(void) {
     o.directory = dir; o.names = NAME; o.tls = &g_srv; o.store_account = keep_account; o.poll_ms = 20;
     g_fake.life_s = 3600; g_fake.bad_nonce_once = 1;
     oc_cert_issued got; char err[512] = "";
+    oc_acme_fail why = OC_ACME_FAIL_OTHER;
+    o.fail = &why;
     int rc = oc_acme_issue(&o, &got, err, sizeof err);
     if (rc) printf("  acme: %s\n", err);
-    CHECK(rc == 0);
+    CHECK(rc == 0 && why == OC_ACME_FAIL_NONE);
     CHECK(g_kept_accounts == 1 && g_kept_url[0]);                  /* kept, once, through a badNonce */
     CHECK(g_fake.bad_sigs == 0 && g_fake.wrong_urls == 0 && g_fake.reused_nonces == 0);
     if (rc != 0) return;
@@ -776,7 +884,7 @@ static void test_issue(void) {
     g_fake.validate_wrong = 1;
     err[0] = '\0';
     CHECK(oc_acme_issue(&o, &got, err, sizeof err) != 0);
-    CHECK(strstr(err, "validation failed") != NULL);
+    CHECK(why == OC_ACME_FAIL_VALIDATION && err[0]);              /* said, and said why */
     CHECK(acme_refused(NAME));      /* and the challenge was taken down */
     g_fake.validate_wrong = 0;
 }
@@ -786,7 +894,7 @@ static void test_issue(void) {
 static int g_cert_stores;
 static char g_stored_chain[8192];
 static void keep_cert(void *ctx, const oc_cert_issued *c) {
-    (void)ctx; g_cert_stores++;
+    (void)ctx; __atomic_add_fetch(&g_cert_stores, 1, __ATOMIC_ACQ_REL);
     snprintf(g_stored_chain, sizeof g_stored_chain, "%s", c->chain_pem);
 }
 
@@ -803,8 +911,8 @@ static void test_worker(void) {
     CHECK(w != NULL);
     if (!w) return;
     int got = 0;
-    for (int i = 0; i < 100 && !got; i++) { oc_certs_status(w, &got, NULL, NULL, 0); if (!got) msleep(50); }
-    CHECK(got >= 1 && g_cert_stores >= 1);
+    CHECK(WAIT_UNTIL((oc_certs_status(w, &got, NULL, NULL, 0), got >= 1), 10000));
+    CHECK(got >= 1 && __atomic_load_n(&g_cert_stores, __ATOMIC_ACQUIRE) >= 1);
     /* A connection up before a renewal, and the certificate it was given. The
      * worker swaps a certificate in and only then counts it, so the count read
      * after the handshake may lag a swap already made: two more are waited for,
@@ -819,13 +927,13 @@ static void test_worker(void) {
     int base = 0;
     oc_certs_status(w, &base, NULL, NULL, 0);
     got = base;
-    for (int i = 0; i < 600 && got < base + 2; i++) { oc_certs_status(w, &got, NULL, NULL, 0); if (got < base + 2) msleep(50); }
+    CHECK(WAIT_UNTIL((oc_certs_status(w, &got, NULL, NULL, 0), got >= base + 2), 30000));
     CHECK(got >= base + 2);                                        /* renewed since the connection */
     unsigned char after[32];
     CHECK(oc_tls_server_fingerprint(&g_srv, after) == 0 && memcmp(before, after, 32) != 0);
     size_t n = 0; char echo[8] = "";
     CHECK(oc_tls_write(&c, "ping", 4, &n) == OC_TLS_OK && n == 4);
-    for (int i = 0; i < 100; i++) {
+    for (uint64_t end = oc_test_deadline(5000); oc_test_mono_ms() < end; ) {
         oc_tls_status st = oc_tls_read(&c, echo, sizeof echo, &n);
         if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) continue;
         break;
@@ -854,13 +962,14 @@ static void record_alert(void *ctx, const char *key, const char *message) {
     pthread_mutex_unlock(&g_alerts_mu);
 }
 static void alerts_reset(void) { pthread_mutex_lock(&g_alerts_mu); g_n_alerts = 0; pthread_mutex_unlock(&g_alerts_mu); }
-/* The index of the first raise (1) or clear (0) of `key` at or after `from` whose
- * message holds `has` (a raise), or -1. */
-static int alert_at(const char *key, int raise, const char *has, int from) {
+/* The index of the first raise (1) or clear (0) of `key` at or after `from`, or
+ * -1. The key is the alert's kind; a raise always says something, in words for
+ * a person, which are not read here. */
+static int alert_at(const char *key, int raise, int from) {
     int at = -1;
     pthread_mutex_lock(&g_alerts_mu);
     for (int i = from < 0 ? 0 : from; i < g_n_alerts && at < 0; i++)
-        if (!strcmp(g_alerts[i].key, key) && g_alerts[i].raise == raise && (!has || strstr(g_alerts[i].msg, has)))
+        if (!strcmp(g_alerts[i].key, key) && g_alerts[i].raise == raise && (!raise || g_alerts[i].msg[0]))
             at = i;
     pthread_mutex_unlock(&g_alerts_mu);
     return at;
@@ -884,12 +993,16 @@ static oc_certs *worker_on(const char *dir, int life_s) {
     o.store_cert = keep_first; o.retry_ms = 200; o.poll_ms = 20; o.check_ms = 100; o.ari_check_ms = 100;
     o.alert = record_alert;
     alerts_reset();
+    pthread_mutex_lock(&g_fake.mu);
+    g_fake.n_orders = 0;                                          /* this worker's orders, from the first */
+    pthread_mutex_unlock(&g_fake.mu);
     g_fake.life_s = life_s;
     __atomic_store_n(&g_first_kept, 0, __ATOMIC_RELEASE);
     return oc_certs_start(&o);
 }
 
 static int obtained(oc_certs *w) { int n = 0; oc_certs_status(w, &n, NULL, NULL, 0); return n; }
+static int fake_int(const int *v) { pthread_mutex_lock(&g_fake.mu); int n = *v; pthread_mutex_unlock(&g_fake.mu); return n; }
 
 /* ARI (RFC 9773): the CA's window rules. One already open means now -- a
  * certificate with an hour to run is replaced at once, the replacement naming
@@ -904,9 +1017,7 @@ static void test_worker_ari(void) {
     oc_certs *w = worker_on(dir, 3600);
     CHECK(w != NULL);
     if (!w) return;
-    int i;
-    for (i = 0; i < 200 && obtained(w) < 2; i++) msleep(50);
-    CHECK(obtained(w) >= 2);
+    CHECK(WAIT_UNTIL(obtained(w) >= 2, 10000));
     char id[OC_ACME_CERT_ID_MAX];
     CHECK(__atomic_load_n(&g_first_kept, __ATOMIC_ACQUIRE) && oc_acme_cert_id(g_first_chain, id, sizeof id) == 0);
     pthread_mutex_lock(&g_fake.mu);                               /* the fake is still answering ARI checks */
@@ -923,35 +1034,46 @@ static void test_worker_ari(void) {
                                   sizeof want) == 0 && strcmp(want, id) == 0);
         mbedtls_x509_crt_free(&crt);
     }
-    msleep(600);
-    CHECK(obtained(w) == 2);                                      /* and the replacement is not due */
+    /* The replacement is not due: the worker asks the CA about it twice more
+     * (every 100 ms here), each answer a window an hour off, and after those
+     * it has decided -- so a third certificate would have been ordered by
+     * then. */
+    int asks = fake_int(&g_fake.ari_asked);
+    CHECK(WAIT_UNTIL(fake_int(&g_fake.ari_asked) >= asks + 2, 10000));
+    CHECK(obtained(w) == 2 && fake_int(&g_fake.n_orders) == 2);
     oc_certs_stop(w);
     /* An owner or admin was told the CA asked (REQ-263), and told again when
      * the replacement answered it. */
-    int asked = alert_at(OC_CERTS_ALERT_REPLACE, 1, "replaced now", 0);
-    CHECK(asked >= 0 && alert_at(OC_CERTS_ALERT_REPLACE, 0, NULL, asked) > asked);
+    int asked = alert_at(OC_CERTS_ALERT_REPLACE, 1, 0);
+    CHECK(asked >= 0 && alert_at(OC_CERTS_ALERT_REPLACE, 0, asked) > asked);
 
     /* Later: a two-second life would renew within 1.3 s; the CA's window,
-     * three seconds on, holds it. */
+     * three seconds on, holds it -- the second order comes inside the window
+     * the CA gave, which is the clock ARI's times are in. */
+    pthread_mutex_lock(&g_fake.mu);
     g_fake.ari_open_once = 0; g_fake.ari_asked = 0;
-    g_fake.ari_start_ms = wall_ms() + 3000; g_fake.ari_end_ms = wall_ms() + 3400;
+    g_fake.ari_start_ms = wall_ms() + 3000; g_fake.ari_end_ms = g_fake.ari_start_ms + 400;
+    pthread_mutex_unlock(&g_fake.mu);
     w = worker_on(dir, 2);
     CHECK(w != NULL);
     if (!w) return;
-    for (i = 0; i < 100 && obtained(w) < 1; i++) msleep(50);
-    CHECK(obtained(w) == 1);
-    uint64_t first_at = wall_ms();
-    while (wall_ms() < g_fake.ari_start_ms - 300) { CHECK(obtained(w) == 1); msleep(100); }
-    for (i = 0; i < 100 && obtained(w) < 2; i++) msleep(50);
-    CHECK(obtained(w) >= 2 && wall_ms() - first_at >= 1500);
+    CHECK(WAIT_UNTIL(obtained(w) >= 1, 10000));
+    CHECK(WAIT_UNTIL(obtained(w) >= 2, 20000));
     oc_certs_stop(w);
-    CHECK(g_fake.ari_asked >= 1);
+    pthread_mutex_lock(&g_fake.mu);
+    int orders = g_fake.n_orders;
+    uint64_t second = g_fake.order_ms[1], start = g_fake.ari_start_ms, end = g_fake.ari_end_ms;
+    int ari_asked = g_fake.ari_asked;
+    pthread_mutex_unlock(&g_fake.mu);
+    CHECK(orders >= 2 && second >= start);                        /* held until the window opened */
+    CHECK_SPEED(orders >= 2 && second <= end + 2000);             /* and renewed in it, not long after */
+    CHECK(ari_asked >= 1);
     /* A certificate within a week of expiry, not renewed, is raised -- once for
      * its day, not at every look -- and its renewal clears it. */
-    int near = alert_at(OC_CERTS_ALERT_EXPIRING, 1, "has not been renewed", 0);
-    int cleared = alert_at(OC_CERTS_ALERT_EXPIRING, 0, NULL, near);
+    int near = alert_at(OC_CERTS_ALERT_EXPIRING, 1, 0);
+    int cleared = alert_at(OC_CERTS_ALERT_EXPIRING, 0, near);
     CHECK(near >= 0 && cleared > near);
-    int again = alert_at(OC_CERTS_ALERT_EXPIRING, 1, NULL, near + 1);
+    int again = alert_at(OC_CERTS_ALERT_EXPIRING, 1, near + 1);
     CHECK(again < 0 || again > cleared);
     g_fake.ari = 0;
     g_ca_backdate_s = 60;
@@ -973,23 +1095,19 @@ static void test_worker_retries(void) {
     oc_certs *w = oc_certs_start(&o);
     CHECK(w != NULL);
     if (!w) return;
-    for (int i = 0; i < 100; i++) {
-        pthread_mutex_lock(&g_fake.mu); int n = g_fake.n_orders; pthread_mutex_unlock(&g_fake.mu);
-        if (n >= 5) break;
-        msleep(50);
-    }
+    CHECK(WAIT_UNTIL(fake_int(&g_fake.n_orders) >= 5, 10000));
     oc_certs_stop(w);
     pthread_mutex_lock(&g_fake.mu);
     int n = g_fake.n_orders;
-    uint64_t t[5]; for (int i = 0; i < 5 && i < n; i++) t[i] = g_fake.order_ms[i];
+    uint64_t t[5]; for (int i = 0; i < 5 && i < n; i++) t[i] = g_fake.order_mono[i];
     g_fake.order_fail = 0;
     pthread_mutex_unlock(&g_fake.mu);
     CHECK(n >= 5);
     /* Each failure is raised, in words a person can act on, under one key --
      * one entry, however many times (REQ-263). Never obtained, never cleared. */
-    int f1 = alert_at(OC_CERTS_ALERT_OBTAIN, 1, "could not be obtained", 0);
-    CHECK(f1 >= 0 && alert_at(OC_CERTS_ALERT_OBTAIN, 1, NULL, f1 + 1) > f1);
-    CHECK(alert_at(OC_CERTS_ALERT_OBTAIN, 0, NULL, 0) < 0);
+    int f1 = alert_at(OC_CERTS_ALERT_OBTAIN, 1, 0);
+    CHECK(f1 >= 0 && alert_at(OC_CERTS_ALERT_OBTAIN, 1, f1 + 1) > f1);
+    CHECK(alert_at(OC_CERTS_ALERT_OBTAIN, 0, 0) < 0);
     if (n < 5) return;
     printf("  retries after a failed order: %llu, %llu, %llu, %llu ms\n", (unsigned long long)(t[1] - t[0]),
            (unsigned long long)(t[2] - t[1]), (unsigned long long)(t[3] - t[2]), (unsigned long long)(t[4] - t[3]));
@@ -1036,10 +1154,12 @@ int run_acme_tests(void) {
     g_kept_key[0] = g_kept_url[0] = '\0'; g_kept_accounts = 0;
     g_cert_stores = 0; g_stored_chain[0] = '\0';
     g_first_chain[0] = '\0'; g_first_kept = 0;
+    CHECK(oc_test_mkdtemp("acme", g_dir, sizeof g_dir) == 0);
     CHECK(ca_init() == 0);
     CHECK(oc_tls_set_extra_ca(g_ca.path) == 0);
-    unlink("build/test_acme_cert.pem"); unlink("build/test_acme_key.pem");
-    CHECK(oc_tls_server_init(&g_srv, "build/test_acme_cert.pem", "build/test_acme_key.pem") == 0);
+    oc_test_path(g_cert_path, sizeof g_cert_path, g_dir, "cert.pem");
+    oc_test_path(g_key_path, sizeof g_key_path, g_dir, "key.pem");
+    CHECK(oc_tls_server_init(&g_srv, g_cert_path, g_key_path) == 0);
     g_srv_fd = listen_loopback(&g_srv_port);
     pthread_mutex_init(&g_fake.mu, NULL);
     g_fake.fd = listen_loopback(&g_fake.port);
@@ -1060,12 +1180,13 @@ int run_acme_tests(void) {
     close(connect_loopback(g_srv_port)); close(connect_loopback(g_fake.port));
     pthread_join(st, NULL); pthread_join(ft, NULL);
     close(g_srv_fd); close(g_fake.fd);
-    msleep(100);                                                  /* the detached echo threads */
+    /* The detached connection threads hold the listener's configuration. */
+    CHECK(WAIT_UNTIL(__atomic_load_n(&g_serving, __ATOMIC_ACQUIRE) == 0, 10000));
     oc_tls_server_free(&g_srv);
     oc_tls_set_extra_ca(NULL);
     if (g_fake.have_acct) mbedtls_pk_free(&g_fake.acct);
     pthread_mutex_destroy(&g_fake.mu);
     mbedtls_pk_free(&g_ca.key); mbedtls_ctr_drbg_free(&g_ca.rng); mbedtls_entropy_free(&g_ca.ent);
-    unlink(g_ca.path); unlink("build/test_acme_cert.pem"); unlink("build/test_acme_key.pem");
+    oc_test_rmtree(g_dir);
     return failures;
 }

@@ -183,12 +183,14 @@ static int generate(llama_handle *h, const char *grammar, int max_out, oc_sum_ga
     for (;;) {
         if (produced >= max_out) {
             snprintf(err, errcap, "the answer reached its %d tokens without ending", max_out);
+            if (st) st->fail = OC_SUM_FAIL_RUNAWAY;
             *out = o;           /* as far as it got, for the log */
             o = NULL;
             goto done;
         }
         if (gate && produced % SUM_CHECK_TOKENS == 0 && gate(gate_ctx) != 0) {
             snprintf(err, errcap, "stopped");
+            if (st) st->fail = OC_SUM_FAIL_STOPPED;
             goto done;
         }
         llama_token t = llama_sampler_sample(smpl, h->ctx, -1);

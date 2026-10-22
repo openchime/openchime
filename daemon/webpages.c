@@ -103,16 +103,122 @@ static const char STYLE[] =
     "@media (prefers-color-scheme:dark){body{background:#1a1d21;color:#e8e9ea}"
     "main{background:#222529;border-color:#3a3d42}p{color:#a6a9ad}input{border-color:#4a4e54}"
     ".msg{background:#3b1f1d;color:#f2b8b5}a{color:#6cb3f0}}\n"
-    "</style>\n</head>\n<body>\n<main>\n";
+    "</style>\n</head>\n<body>\n";
 static const char TAIL[] = "</main>\n</body>\n</html>\n";
 
-static void open_page(pg *p, const char *title) {
-    raw(p, HEAD); esc(p, title); raw(p, STYLE);
+/* Why a form is back: the code a client or a test reads, and the sentence a
+ * person does. */
+static const struct { const char *code, *text; } PERR[OC_PERR_COUNT] = {
+    [OC_PERR_NONE]            = { "", "" },
+    [OC_PERR_PW_MISMATCH]     = { "pw-mismatch", "The two passwords don't match." },
+    [OC_PERR_PW_EMPTY]        = { "pw-empty", "Choose a password." },
+    [OC_PERR_PW_CHARS]        = { "pw-chars", NULL },      /* NULL: pwpolicy.h's sentence */
+    [OC_PERR_PW_SHORT]        = { "pw-short", NULL },
+    [OC_PERR_PW_LONG]         = { "pw-long", NULL },
+    [OC_PERR_PW_COMMON]       = { "pw-common", NULL },
+    [OC_PERR_PW_PERSONAL]     = { "pw-personal", NULL },
+    [OC_PERR_INVITE_INVALID]  = { "invite-invalid", "That invitation isn't valid." },
+    [OC_PERR_SIGNUP_REFUSED]  = { "signup-refused", "That invitation isn't valid, or the username is taken." },
+    [OC_PERR_CRED_TOO_LONG]   = { "credential-too-long", "The username or password is too long." },
+    [OC_PERR_BAD_CREDENTIALS] = { "bad-credentials", "The username or password isn't right." },
+    [OC_PERR_BAD_CURRENT]     = { "bad-current-password", "The username or current password isn't right." },
+    [OC_PERR_RATE_LIMITED]    = { "rate-limited", "Too many attempts. Wait a minute and try again." },
+    [OC_PERR_SIGNUP_LIMITED]  = { "signup-limited", "Too many accounts were made from your address. Try again in an hour." },
+    [OC_PERR_WORKSPACE_FULL]  = { "workspace-full", "This workspace is full." },
+    [OC_PERR_STEP_REQUIRED]   = { "step-required", "This workspace requires two-step sign-in. Set it up on the "
+                                                   "Two-step sign-in page (below), then sign in." },
+    [OC_PERR_STEPS_BUSY]      = { "steps-busy", "Too many sign-ins are under way. Wait a minute and try again." },
+    [OC_PERR_CODE_WRONG]      = { "code-wrong", "That code isn't right." },
+    [OC_PERR_CODE_LIMITED]    = { "code-limited", "Too many wrong codes. Wait a few minutes and try again." },
+    [OC_PERR_DEVICE_LIMITED]  = { "device-limited", "Too many codes tried. Wait a minute and try again." },
+    [OC_PERR_DEVICE_UNKNOWN]  = { "device-unknown", "That code isn't one we're waiting for. Check it, or start "
+                                                    "again in your terminal." },
+    [OC_PERR_DEVICE_EXPIRED]  = { "device-expired", "That code has expired. Start again in your terminal." },
+    [OC_PERR_RESET_SPENT]     = { "reset-spent", "This reset isn't good any more: it was used, or a day has "
+                                                 "passed. Ask for another." },
+    [OC_PERR_INTERNAL]        = { "internal", "Something went wrong. Try again." },
+};
+
+const char *oc_page_err_code(oc_page_err e) {
+    return e > OC_PERR_NONE && e < OC_PERR_COUNT ? PERR[e].code : "";
 }
 
-static void message(pg *p, const char *m) {
-    if (!m || !m[0]) return;
-    raw(p, "<p class=\"msg\" role=\"alert\">"); esc(p, m); raw(p, "</p>\n");
+const char *oc_page_err_text(oc_page_err e) {
+    if (e <= OC_PERR_NONE || e >= OC_PERR_COUNT) return "";
+    if (PERR[e].text) return PERR[e].text;
+    switch (e) {
+    case OC_PERR_PW_CHARS:    return oc_pw_verdict_text(OC_PW_BAD_CHARS);
+    case OC_PERR_PW_SHORT:    return oc_pw_verdict_text(OC_PW_TOO_SHORT);
+    case OC_PERR_PW_LONG:     return oc_pw_verdict_text(OC_PW_TOO_LONG);
+    case OC_PERR_PW_COMMON:   return oc_pw_verdict_text(OC_PW_COMMON);
+    case OC_PERR_PW_PERSONAL: return oc_pw_verdict_text(OC_PW_PERSONAL);
+    default:                  return "";
+    }
+}
+
+oc_page_err oc_page_err_pw(int v) {
+    switch ((oc_pw_verdict)v) {
+    case OC_PW_OK:        return OC_PERR_NONE;
+    case OC_PW_BAD_CHARS: return OC_PERR_PW_CHARS;
+    case OC_PW_TOO_SHORT: return OC_PERR_PW_SHORT;
+    case OC_PW_TOO_LONG:  return OC_PERR_PW_LONG;
+    case OC_PW_COMMON:    return OC_PERR_PW_COMMON;
+    case OC_PW_PERSONAL:  return OC_PERR_PW_PERSONAL;
+    }
+    return OC_PERR_PW_CHARS;
+}
+
+const char *oc_page_screen(const oc_page *pp) {
+    switch (pp->kind) {
+    case OC_PAGE_SIGNIN:   return "signin";
+    case OC_PAGE_SIGNUP:   return "signup";
+    case OC_PAGE_DEVICE:
+        if (pp->done || pp->denied) return "device-done";
+        return pp->user_code && pp->user_code[0] ? "device-confirm" : "device-code";
+    case OC_PAGE_STEP:     return "step";
+    case OC_PAGE_SECURITY:
+        switch (pp->sec) {
+        case OC_SEC_SIGNIN:       return "security-signin";
+        case OC_SEC_SETUP:        return "security-setup";
+        case OC_SEC_CONFIRM:      return "security-confirm";
+        case OC_SEC_CODES:        return "security-codes";
+        case OC_SEC_ON:           return "security-on";
+        case OC_SEC_OFF:          return "security-off";
+        case OC_SEC_PASSKEY:      return "security-passkey";
+        case OC_SEC_PASSKEY_DONE: return "security-passkey-done";
+        }
+        return "security";
+    case OC_PAGE_RESET:    return pp->done ? "reset-done" : "reset";
+    case OC_PAGE_PASSWORD: return pp->done ? "password-done" : "password";
+    }
+    return "";
+}
+
+const char *oc_page_result(const oc_page *pp) {
+    switch (pp->kind) {
+    case OC_PAGE_SIGNIN:   return pp->done ? "password-set" : "";
+    case OC_PAGE_DEVICE:   return pp->done ? "approved" : pp->denied ? "denied" : "";
+    case OC_PAGE_RESET:    return pp->done ? "password-set" : "";
+    case OC_PAGE_PASSWORD: return pp->done ? "password-changed" : "";
+    case OC_PAGE_SECURITY:
+        return pp->sec == OC_SEC_CODES ? "step-on" : pp->sec == OC_SEC_OFF ? "step-off" :
+               pp->sec == OC_SEC_PASSKEY_DONE ? "passkey-added" : "";
+    default:               return "";
+    }
+}
+
+static void open_page(pg *p, const char *title, const oc_page *pp) {
+    raw(p, HEAD); esc(p, title); raw(p, STYLE);
+    raw(p, "<main data-oc-page=\""); raw(p, oc_page_screen(pp)); raw(p, "\"");
+    const char *res = oc_page_result(pp);
+    if (res[0]) { raw(p, " data-oc-result=\""); raw(p, res); raw(p, "\""); }
+    raw(p, ">\n");
+}
+
+static void message(pg *p, oc_page_err e) {
+    if (e <= OC_PERR_NONE || e >= OC_PERR_COUNT) return;
+    raw(p, "<p class=\"msg\" role=\"alert\" data-oc-error=\""); raw(p, oc_page_err_code(e)); raw(p, "\">");
+    esc(p, oc_page_err_text(e)); raw(p, "</p>\n");
 }
 
 static void hidden(pg *p, const char *name, const char *value) {
@@ -304,12 +410,12 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
     const char *user = pp->username ? pp->username : "";
     switch (pp->kind) {
     case OC_PAGE_SIGNIN:
-        open_page(&p, "Sign in \xC2\xB7 OpenChime");
+        open_page(&p, "Sign in \xC2\xB7 OpenChime", pp);
         raw(&p, "<h1>Sign in</h1>\n<p>to ");
         if (pp->workspace && pp->workspace[0]) esc(&p, pp->workspace); else raw(&p, "your OpenChime workspace");
         raw(&p, "</p>\n");
         if (pp->done) raw(&p, "<p>Your new password is set. Sign in with it.</p>\n");
-        message(&p, pp->message);
+        message(&p, pp->err);
         raw(&p, "<form method=\"post\" action=\"signin\">\n");
         hidden(&p, "redirect_uri", pp->redirect_uri);
         hidden(&p, "nonce", pp->nonce);
@@ -324,12 +430,12 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
                 "<a href=\"account/security\">Two-step sign-in</a></p>\n");
         break;
     case OC_PAGE_SIGNUP:
-        open_page(&p, "Create an account \xC2\xB7 OpenChime");
+        open_page(&p, "Create an account \xC2\xB7 OpenChime", pp);
         raw(&p, "<h1>Create an account</h1>\n<p>");
         if (pp->workspace && pp->workspace[0]) { raw(&p, "to join "); esc(&p, pp->workspace); }
         else raw(&p, "with the invitation you were given");
         raw(&p, "</p>\n");
-        message(&p, pp->message);
+        message(&p, pp->err);
         raw(&p, "<form method=\"post\" action=\"signup\">\n");
         hidden(&p, "redirect_uri", pp->redirect_uri);
         hidden(&p, "nonce", pp->nonce);
@@ -348,7 +454,7 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
         raw(&p, "\">Sign in</a></p>\n");
         break;
     case OC_PAGE_DEVICE:
-        open_page(&p, "Sign in a device \xC2\xB7 OpenChime");
+        open_page(&p, "Sign in a device \xC2\xB7 OpenChime", pp);
         if (pp->done) {
             raw(&p, "<h1>Signed in</h1>\n<p>Go back to your terminal: it is signing in now. "
                     "You can close this tab.</p>\n");
@@ -362,7 +468,7 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
         if (!pp->user_code || !pp->user_code[0]) {
             /* Step one: the code the terminal shows. */
             raw(&p, "<h1>Sign in a device</h1>\n<p>Enter the code your terminal shows.</p>\n");
-            message(&p, pp->message);
+            message(&p, pp->err);
             raw(&p, "<form method=\"get\" action=\"device\">\n");
             field(&p, "code", "Code", "text", "off", "", 1);
             raw(&p, "<button type=\"submit\">Continue</button>\n</form>\n");
@@ -380,7 +486,7 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
             raw(&p, ago);
         }
         raw(&p, " Only go on if that was you.</p>\n");
-        message(&p, pp->message);
+        message(&p, pp->err);
         raw(&p, "<form method=\"post\" action=\"device\">\n");
         hidden(&p, "code", pp->user_code);
         field(&p, "username", "Username", "text", "username", user, !user[0]);
@@ -391,10 +497,10 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
                 "That wasn't me</button>\n</form>\n");
         break;
     case OC_PAGE_STEP:
-        open_page(&p, "Two-step sign-in \xC2\xB7 OpenChime");
+        open_page(&p, "Two-step sign-in \xC2\xB7 OpenChime", pp);
         raw(&p, "<h1>Two-step sign-in</h1>\n<p>Enter the code your authenticator app shows, "
                 "or one of your recovery codes.</p>\n");
-        message(&p, pp->message);
+        message(&p, pp->err);
         raw(&p, "<form method=\"post\" action=\"");
         esc(&p, pp->action && pp->action[0] ? pp->action : "signin/verify");
         raw(&p, "\">\n");
@@ -406,13 +512,13 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
         if (pp->pk_mode == 1) passkey_script(&p);
         break;
     case OC_PAGE_SECURITY:
-        open_page(&p, "Two-step sign-in \xC2\xB7 OpenChime");
+        open_page(&p, "Two-step sign-in \xC2\xB7 OpenChime", pp);
         raw(&p, "<h1>Two-step sign-in</h1>\n");
         switch (pp->sec) {
         case OC_SEC_SIGNIN:
             raw(&p, "<p>After your password, signing in will also ask for a code from an authenticator "
                     "app on your phone.</p>\n");
-            message(&p, pp->message);
+            message(&p, pp->err);
             raw(&p, "<form method=\"post\" action=\"security\">\n");
             field(&p, "username", "Username", "text", "username", user, !user[0]);
             field(&p, "password", "Password", "password", "current-password", "", user[0] != 0);
@@ -426,7 +532,7 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
                 raw(&p, "<p>Key: <code>"); esc(&p, pp->secret); raw(&p, "</code></p>\n");
             }
             raw(&p, "<p>Then enter the code it shows, to turn two-step sign-in on.</p>\n");
-            message(&p, pp->message);
+            message(&p, pp->err);
             raw(&p, "<form method=\"post\" action=\"security\">\n");
             hidden(&p, "ticket", pp->ticket);
             hidden(&p, "action", "confirm");
@@ -453,7 +559,7 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
             raw(&p, "<p>Two-step sign-in is on. Enter a code from your authenticator app or a recovery code "
                     "to turn it off");
             raw(&p, pp->pk_rp && pp->pk_rp[0] ? ", or to add a passkey.</p>\n" : ".</p>\n");
-            message(&p, pp->message);
+            message(&p, pp->err);
             raw(&p, "<form method=\"post\" action=\"security\">\n");
             hidden(&p, "ticket", pp->ticket);
             field(&p, "code", "Code", "text", "one-time-code", "", 1);
@@ -464,7 +570,7 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
         case OC_SEC_PASSKEY:
             raw(&p, "<p>Add a passkey for this workspace: your device asks you to confirm. A passkey works here, "
                     "at this address; after the workspace is renamed, add it again.</p>\n");
-            message(&p, pp->message);
+            message(&p, pp->err);
             raw(&p, "<form method=\"post\" action=\"security\">\n");
             hidden(&p, "ticket", pp->ticket);
             hidden(&p, "action", "passkey_add");
@@ -481,14 +587,14 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
         }
         break;
     case OC_PAGE_RESET:
-        open_page(&p, "Set a new password \xC2\xB7 OpenChime");
+        open_page(&p, "Set a new password \xC2\xB7 OpenChime", pp);
         if (pp->done) {
             raw(&p, "<h1>Password set</h1>\n<p>Sign in with your new password. You can close this tab.</p>\n");
             break;
         }
         raw(&p, "<h1>Set a new password</h1>\n<p>An administrator sent you this reset. It works once, for a "
                     "day.</p>\n");
-        message(&p, pp->message);
+        message(&p, pp->err);
         raw(&p, "<form method=\"post\" action=\"reset\">\n");
         hidden(&p, "t", pp->reset);
         if (pp->redirect_uri && pp->redirect_uri[0]) {   /* a sign-in to go on to */
@@ -502,14 +608,14 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
         raw(&p, "<button type=\"submit\">Set password</button>\n</form>\n");
         break;
     case OC_PAGE_PASSWORD:
-        open_page(&p, "Change your password \xC2\xB7 OpenChime");
+        open_page(&p, "Change your password \xC2\xB7 OpenChime", pp);
         if (pp->done) {
             raw(&p, "<h1>Password changed</h1>\n<p>Sign in with your new password from now on. "
                     "You can close this tab.</p>\n");
             break;
         }
         raw(&p, "<h1>Change your password</h1>\n");
-        message(&p, pp->message);
+        message(&p, pp->err);
         raw(&p, "<form method=\"post\" action=\"password\">\n");
         field(&p, "username", "Username", "text", "username", user, !user[0]);
         pw_field(&p, "current", "Current password", "current-password", user[0] != 0);
@@ -526,17 +632,17 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
     return p.b;
 }
 
-#define STATIC_PAGE(name, title, h1, body)                                              \
+#define STATIC_PAGE(name, screen, title, h1, body)                                              \
     static const char name[] = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"           \
         "<meta charset=\"utf-8\">\n<meta name=\"viewport\" "                             \
         "content=\"width=device-width,initial-scale=1\">\n<title>" title "</title>\n"    \
         "<style>body{font:16px/1.5 system-ui,sans-serif;max-width:28rem;margin:4rem auto;" \
-        "padding:0 1rem}</style>\n</head>\n<body>\n<h1>" h1 "</h1>\n<p>" body "</p>\n"   \
+        "padding:0 1rem}</style>\n</head>\n<body data-oc-page=\"" screen "\">\n<h1>" h1 "</h1>\n<p>" body "</p>\n"   \
         "</body>\n</html>\n"
 
-STATIC_PAGE(INVALID, "OpenChime", "This sign-in link isn&#39;t valid",
+STATIC_PAGE(INVALID, "invalid", "OpenChime", "This sign-in link isn&#39;t valid",
             "Go back to OpenChime and start signing in again.");
-STATIC_PAGE(UNAVAILABLE, "OpenChime", "This workspace doesn&#39;t use passwords",
+STATIC_PAGE(UNAVAILABLE, "unavailable", "OpenChime", "This workspace doesn&#39;t use passwords",
             "Go back to OpenChime and sign in the way it offers.");
 
 const char *oc_page_invalid(size_t *len) { *len = sizeof INVALID - 1; return INVALID; }

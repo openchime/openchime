@@ -215,10 +215,14 @@ static void slice_to_buf(oc_slice sl, char *out, size_t cap) {
     out[n] = '\0';
 }
 
-static void push_err(oc_queue *to_ui, const char *msg) {
+/* An error for the frontend: its sentence, what it is about (oc_client_err)
+ * and the daemon's code it answers (0 if none). */
+static void push_err_ex(oc_queue *to_ui, oc_client_err kind, uint16_t code, const char *msg) {
     oc_ev *e = oc_ev_new(OC_EV_ERROR);
-    if (e) { e->body = strdup(msg); oc_queue_push(to_ui, e); }
+    if (e) { e->body = strdup(msg); e->err_kind = (uint8_t)kind; e->err_code = code; oc_queue_push(to_ui, e); }
 }
+
+static void push_err(oc_queue *to_ui, const char *msg) { push_err_ex(to_ui, OC_CERR_OTHER, 0, msg); }
 
 static void push_simple(oc_queue *to_ui, int type, uint64_t user_id) {
     oc_ev *e = oc_ev_new(type);
@@ -906,7 +910,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
          * decoding it anyway is what turns a version disagreement into a
          * mystery "connection lost" further down. */
         if (hdr.version != ctx->version) {
-            push_err(ctx->to_ui, "server sent a frame with an unnegotiated protocol version");
+            push_err_ex(ctx->to_ui, OC_CERR_PROTOCOL, 0, "server sent a frame with an unnegotiated protocol version");
             return -1;
         }
 
@@ -2411,7 +2415,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                  * read as what they are -- "this file was reclaimed", "the
                  * server is out of space" -- not as a bug (REQ-215/216). */
                 const char *t = oc_error_text(err.code);
-                push_err(to_ui, t ? t : "the workspace refused that");
+                push_err_ex(to_ui, OC_CERR_REFUSED, err.code, t ? t : "the workspace refused that");
                 /* An error ABOUT THE TRANSFER aborts it; abandon the local file.
                  *
                  * It used to abort on *any* error that happened to arrive while a
@@ -2540,7 +2544,7 @@ static int device_flow(oc_net *n, oc_tls_conn *conn, int fd, oc_framebuf *fb, ui
     if (!n->device_secret[0]) {
         char challenge[OC_SIGNIN_CHALLENGE_LEN + 1];
         if (oc_signin_verifier(n->verifier, challenge) != 0) {
-            push_err(n->to_ui, "could not start a sign-in on this computer");
+            push_err_ex(n->to_ui, OC_CERR_LOCAL, 0, "could not start a sign-in on this computer");
             return RC_FATAL;
         }
         uint8_t bb[256]; oc_wbuf bw; oc_wbuf_init(&bw, bb, sizeof bb);
@@ -2551,7 +2555,7 @@ static int device_flow(oc_net *n, oc_tls_conn *conn, int fd, oc_framebuf *fb, ui
         if (hdr.msg_type != OC_MSG_AUTH_DEVICE) {
             oc_error er0; uint16_t code = 0;
             if (hdr.msg_type == OC_MSG_ERROR && oc_decode_error(&p, &er0) == OC_OK) code = er0.code;
-            push_err(n->to_ui, code == OC_ERR_AUTH_RATE_LIMITED ? "too many sign-in codes waiting: try again later"
+            push_err_ex(n->to_ui, OC_CERR_AUTH, code, code == OC_ERR_AUTH_RATE_LIMITED ? "too many sign-in codes waiting: try again later"
                                                                : auth_error_text(code, 0));
             return RC_FATAL;
         }
@@ -2595,7 +2599,7 @@ static int device_flow(oc_net *n, oc_tls_conn *conn, int fd, oc_framebuf *fb, ui
             if (n->stop) return RC_STOP;
             if (n->signin_cancel) {
                 device_forget(n);
-                push_err(n->to_ui, "sign-in cancelled");
+                push_err_ex(n->to_ui, OC_CERR_SIGNIN_CANCELLED, 0, "sign-in cancelled");
                 return RC_FATAL;
             }
             oc_nanosleep(100 * 1000 * 1000);
@@ -2620,7 +2624,7 @@ static int device_flow(oc_net *n, oc_tls_conn *conn, int fd, oc_framebuf *fb, ui
         if (code == OC_ERR_AUTH_PENDING) continue;
         if (code == OC_ERR_AUTH_SLOW_DOWN) { n->device_interval += 5; continue; }
         device_forget(n);
-        push_err(n->to_ui, code == OC_ERR_AUTH_DENIED  ? "the sign-in was refused on the sign-in page" :
+        push_err_ex(n->to_ui, OC_CERR_AUTH, code, code == OC_ERR_AUTH_DENIED  ? "the sign-in was refused on the sign-in page" :
                            code == OC_ERR_AUTH_EXPIRED ? "the sign-in code expired: start again" :
                                                          auth_error_text(code, 0));
         return RC_FATAL;
@@ -2907,7 +2911,7 @@ static int run_connection(oc_net *n, int reconnecting,
         if (oc_encode_hello(&w, &h) != OC_OK || write_all(&conn, fd, buf, w.len, &n->stop) != 0) goto drop;
         oc_header hdr; oc_rbuf p;
         if (read_one(&conn, fd, &fb, &hdr, &p, &n->stop) != 0) goto drop;
-        if (hdr.msg_type == OC_MSG_REJECT) { push_err(n->to_ui, "version rejected"); rc = RC_FATAL; goto drop; }
+        if (hdr.msg_type == OC_MSG_REJECT) { push_err_ex(n->to_ui, OC_CERR_PROTOCOL, 0, "version rejected"); rc = RC_FATAL; goto drop; }
         if (hdr.msg_type != OC_MSG_WELCOME) goto drop;
         /* WELCOME's payload was previously never decoded — the frame's presence
          * was the whole handshake. The chosen version is what every later frame
@@ -2917,7 +2921,7 @@ static int run_connection(oc_net *n, int reconnecting,
         if (wel.chosen_version != OC_PROTOCOL_VERSION) {
             /* We send min == max, so the server cannot legitimately choose
              * anything else; if it did, we could not speak what it picked. */
-            push_err(n->to_ui, "server chose a protocol version we did not offer");
+            push_err_ex(n->to_ui, OC_CERR_PROTOCOL, 0, "server chose a protocol version we did not offer");
             rc = RC_FATAL; goto drop;
         }
         negotiated = wel.chosen_version;
@@ -2973,7 +2977,7 @@ static int run_connection(oc_net *n, int reconnecting,
             int local = 0;
             for (uint8_t i = 0; i < ch.n_sources; i++) if (ch.sources[i].kind == OC_SOURCE_LOCAL) local = 1;
             if (!local) {
-                push_err(n->to_ui, "this workspace has no accounts of its own to sign in to with a code");
+                push_err_ex(n->to_ui, OC_CERR_AUTH, 0, "this workspace has no accounts of its own to sign in to with a code");
                 rc = RC_FATAL; goto drop;
             }
             int dr = device_flow(n, &conn, fd, &fb, negotiated);
@@ -2993,7 +2997,7 @@ static int run_connection(oc_net *n, int reconnecting,
             for (uint8_t i = 0; i < ch.n_sources && !src && !n->signin_pref[0]; i++)
                 if (ch.sources[i].kind == OC_SOURCE_LOCAL) src = &ch.sources[i];
             if (!src || src->id.len >= sizeof n->source_id) {
-                push_err(n->to_ui, "this workspace doesn't offer that way of signing in");
+                push_err_ex(n->to_ui, OC_CERR_AUTH, 0, "this workspace doesn't offer that way of signing in");
                 rc = RC_FATAL; goto drop;
             }
             memcpy(n->source_id, src->id.ptr, src->id.len);
@@ -3005,7 +3009,7 @@ static int run_connection(oc_net *n, int reconnecting,
                                                       : oc_loopback_open(redirect, sizeof redirect);
             if (!n->loopback || oc_signin_verifier(n->verifier, challenge) != 0) {
                 signin_forget(n);
-                push_err(n->to_ui, "could not start a browser sign-in on this computer");
+                push_err_ex(n->to_ui, OC_CERR_LOCAL, 0, "could not start a browser sign-in on this computer");
                 rc = RC_FATAL; goto drop;
             }
 #ifdef __EMSCRIPTEN__
@@ -3025,7 +3029,7 @@ static int run_connection(oc_net *n, int reconnecting,
                 oc_error er0; uint16_t code = 0;
                 if (hdr.msg_type == OC_MSG_ERROR && oc_decode_error(&p, &er0) == OC_OK) code = er0.code;
                 signin_forget(n);
-                push_err(n->to_ui, auth_error_text(code, 0));
+                push_err_ex(n->to_ui, OC_CERR_AUTH, code, auth_error_text(code, 0));
                 rc = RC_FATAL; goto drop;
             }
             oc_auth_redirect ar;
@@ -3050,7 +3054,7 @@ static int run_connection(oc_net *n, int reconnecting,
                                   n->invite && n->invite[0] ? n->invite : "");
                 if (pw < 0 || (size_t)pw >= sizeof path || page_url(n, n->loopback, path, url, sizeof url) != 0) {
                     signin_forget(n);
-                    push_err(n->to_ui, "could not start a browser sign-in on this computer");
+                    push_err_ex(n->to_ui, OC_CERR_LOCAL, 0, "could not start a browser sign-in on this computer");
                     rc = RC_FATAL; goto drop;
                 }
             }
@@ -3103,7 +3107,7 @@ static int run_connection(oc_net *n, int reconnecting,
             oc_error er0; uint16_t code = 0;
             if (hdr.msg_type == OC_MSG_ERROR && oc_decode_error(&p, &er0) == OC_OK) code = er0.code;
             const char *why = auth_error_text(code, reconnecting);
-            push_err(n->to_ui, why);
+            push_err_ex(n->to_ui, OC_CERR_AUTH, code, why);
             signin_answer(n, OC_LOOPBACK_REFUSED, why);   /* the browser hears it too */
             rc = RC_FATAL; goto drop;
         }
@@ -3243,7 +3247,7 @@ static int run_connection(oc_net *n, int reconnecting,
                     c->body = sealed;
                     c->src_channel = c->src_message = 0;
                     if (!sealed) {
-                        push_err(n->to_ui, "This encrypted conversation is not open on this device.");
+                        push_err_ex(n->to_ui, OC_CERR_PDM_CLOSED, 0, "This encrypted conversation is not open on this device.");
                         oc_cmd_free(c);
                         continue;
                     }
@@ -4032,7 +4036,7 @@ static void *net_thread(void *arg) {
          * ever serving, without a fatal auth reject, is a connectivity problem. */
         if (served) reach_notified = 0;
         else if (rc == RC_CERT_UNPUBLISHED && !reach_notified) {
-            push_err(n->to_ui, "this workspace publishes the certificate its server should "
+            push_err_ex(n->to_ui, OC_CERR_CERT, 0, "this workspace publishes the certificate its server should "
                                "present, and the server presented a different one: the "
                                "connection was refused");
             reach_notified = 1;
@@ -4050,7 +4054,7 @@ static void *net_thread(void *arg) {
                 e->status = rc == RC_CERT_CHANGED;
                 oc_queue_push(n->to_ui, e);
             }
-            push_err(n->to_ui, rc == RC_CERT_CHANGED
+            push_err_ex(n->to_ui, OC_CERR_CERT, 0, rc == RC_CERT_CHANGED
                 ? "the server's certificate has changed since you trusted it: if you did not "
                   "expect that, someone may be in the way; check its fingerprint before trusting it"
                 : "the server's certificate is not from an authority this computer trusts: check "
@@ -4058,7 +4062,7 @@ static void *net_thread(void *arg) {
             reach_notified = 1;
         }
         else if (rc == RC_LOST && !reach_notified) {
-            push_err(n->to_ui, "could not reach the server");
+            push_err_ex(n->to_ui, OC_CERR_UNREACHABLE, 0, "could not reach the server");
             reach_notified = 1;
         }
         if (rc == RC_STOP || n->stop) break;
@@ -4092,7 +4096,9 @@ static void *net_thread(void *arg) {
                              : lr == OC_LOOPBACK_TIMEOUT   ? "sign-in timed out: try again"
                              : why[0] ? why : "the browser sign-in did not finish";
             signin_answer(n, OC_LOOPBACK_REFUSED, said);
-            push_err(n->to_ui, said);
+            push_err_ex(n->to_ui, lr == OC_LOOPBACK_CANCELLED ? OC_CERR_SIGNIN_CANCELLED :
+                                  lr == OC_LOOPBACK_TIMEOUT   ? OC_CERR_SIGNIN_TIMEOUT : OC_CERR_SIGNIN_UNFINISHED,
+                        0, said);
             break;
         }
         if (rc == RC_FATAL) {
@@ -4136,7 +4142,7 @@ static void *net_thread(void *arg) {
              * what this used to do. */
             snprintf(msg, sizeof msg, "Connection lost: reconnecting in %ds…",
                      (backoff_ms + 999) / 1000);
-            push_err(n->to_ui, msg);
+            push_err_ex(n->to_ui, OC_CERR_RECONNECTING, 0, msg);
         }
         /* Publish the deadline so a frontend can tick it down. The
          * error string can only say the delay once, which is why the GUI banner

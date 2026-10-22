@@ -56,6 +56,7 @@ typedef struct {
     const char *extra;    /* a field every request carries, once learned; "" */
     int  probed;          /* open has asked its one-line prompt */
     int  tried;           /* the fields were tried on a real request */
+    int  open_fail;       /* why the last open failed (oc_sum_fail) */
 } cloud_engine;
 
 /* The fields APIs read to answer without reasoning first, tried in this order. */
@@ -113,10 +114,13 @@ static int pause_for(int secs, oc_sum_gate_fn gate, void *gctx) {
     return 0;
 }
 
+/* `*fail` (oc_sum_fail) and `*status` say why, for the caller to act on. */
 static int request(cloud_engine *e, const char *system, const char *user, int max_out, const char *extra,
                    oc_sum_gate_fn gate, void *gctx, char **out, uint32_t *reasoning, char *fin, size_t fincap,
-                   oc_sum_run_stats *st, char *err, size_t errcap) {
+                   oc_sum_run_stats *st, int *fail, int *status, char *err, size_t errcap) {
     *out = NULL;
+    *fail = OC_SUM_FAIL_NONE;
+    *status = 0;
     *reasoning = 0;
     fin[0] = '\0';
     oc_sum_buf b = {0};
@@ -130,7 +134,7 @@ static int request(cloud_engine *e, const char *system, const char *user, int ma
     if (max_out > 0) oc_sum_buf_printf(&b, ",\"max_tokens\":%d", max_out);
     if (extra && *extra) oc_sum_buf_printf(&b, ",%s", extra);
     oc_sum_buf_puts(&b, "}");
-    if (b.oom) { oc_sum_buf_free(&b); snprintf(err, errcap, "out of memory"); return -1; }
+    if (b.oom) { oc_sum_buf_free(&b); snprintf(err, errcap, "out of memory"); *fail = OC_SUM_FAIL_OOM; return -1; }
 
     oc_https_resp r;
     memset(&r, 0, sizeof r);
@@ -146,6 +150,8 @@ static int request(cloud_engine *e, const char *system, const char *user, int ma
         if (sent && r.status == 200) break;
         if (sent) snprintf(err, errcap, "the model server answered %d: %.200s", r.status, r.body ? r.body : "");
         else snprintf(err, errcap, "the model server could not be reached: %s", herr);
+        *fail = sent ? OC_SUM_FAIL_STATUS : OC_SUM_FAIL_UNREACHABLE;
+        *status = sent ? r.status : 0;
         if (try >= SUM_CLOUD_RETRIES || (sent && !again_later(r.status))) goto done;
         /* The server's own wait when it names one in seconds; else doubling. */
         int wait = 2 << try;
@@ -162,21 +168,25 @@ static int request(cloud_engine *e, const char *system, const char *user, int ma
             fprintf(stderr, "summary: the model server could not be reached (%s); waiting %d s, then try %d of %d\n",
                     herr, wait, try + 2, SUM_CLOUD_RETRIES + 1);
         if (st) { st->retries++; st->wait_ms += (uint32_t)wait * 1000u; }
-        if (pause_for(wait, gate, gctx) != 0) { snprintf(err, errcap, "stopped"); goto done; }
+        if (pause_for(wait, gate, gctx) != 0) { snprintf(err, errcap, "stopped"); *fail = OC_SUM_FAIL_STOPPED; goto done; }
     }
+    *fail = OC_SUM_FAIL_NONE;
+    *status = 200;
     if (oc_json_parse(&d, r.body, r.body_len) != 0 || d.n < 1 || d.t[0].type != JSMN_OBJECT) {
         snprintf(err, errcap, "the model server's answer is not JSON");
+        *fail = OC_SUM_FAIL_NOT_JSON;
         goto done;
     }
     int ch = oc_json_get(&d, 0, "choices");
     if (ch < 0 || d.t[ch].type != JSMN_ARRAY || d.t[ch].size < 1 || d.t[ch + 1].type != JSMN_OBJECT) {
         snprintf(err, errcap, "the model server's answer has no choices");
+        *fail = OC_SUM_FAIL_NO_CHOICES;
         goto done;
     }
     int c0 = ch + 1;
     int msg = oc_json_get(&d, c0, "message");
     char *text = msg >= 0 ? str_dup(&d, oc_json_get(&d, msg, "content")) : NULL;
-    if (!text && !(text = strdup(""))) { snprintf(err, errcap, "out of memory"); goto done; }
+    if (!text && !(text = strdup(""))) { snprintf(err, errcap, "out of memory"); *fail = OC_SUM_FAIL_OOM; goto done; }
     /* A thinking model may open with its reasoning; the answer is what follows. */
     if (!strncmp(text, "<think>", 7)) {
         const char *end = strstr(text, "</think>");
@@ -221,12 +231,12 @@ static int c_run(void *vh, const char *system, const char *user, const char *gra
     *out = NULL;
     if (st) memset(st, 0, sizeof *st);
     (void)grammar;
-    int rc = -1;
-    if (gate && gate(gate_ctx) != 0) { snprintf(err, errcap, "stopped"); goto done; }
+    int rc = -1, fail = OC_SUM_FAIL_NONE, status = 0;
+    if (gate && gate(gate_ctx) != 0) { snprintf(err, errcap, "stopped"); fail = OC_SUM_FAIL_STOPPED; goto done; }
     uint32_t reasoning = 0;
     char fin[32];
-    if (request(e, system, user, max_out, e->extra, gate, gate_ctx, out, &reasoning, fin, sizeof fin, st, err,
-                errcap) != 0)
+    if (request(e, system, user, max_out, e->extra, gate, gate_ctx, out, &reasoning, fin, sizeof fin, st, &fail,
+                &status, err, errcap) != 0)
         goto done;
     /* A model that reasons only when it finds a prompt worth it passed the
      * one-line prompt at open; the first request it reasons on is asked again
@@ -236,10 +246,11 @@ static int c_run(void *vh, const char *system, const char *user, const char *gra
         for (int i = 0; i < N_QUIET; i++) {
             char *again = NULL, qfin[32], qerr[300];
             uint32_t r = 0;
+            int qfail, qstatus;
             oc_sum_run_stats qst;
             memset(&qst, 0, sizeof qst);
-            if (request(e, system, user, max_out, QUIET[i], gate, gate_ctx, &again, &r, qfin, sizeof qfin, &qst, qerr,
-                        sizeof qerr) == 0 &&
+            if (request(e, system, user, max_out, QUIET[i], gate, gate_ctx, &again, &r, qfin, sizeof qfin, &qst, &qfail,
+                        &qstatus, qerr, sizeof qerr) == 0 &&
                 r == 0 && *again) {
                 free(*out);
                 *out = again;
@@ -259,12 +270,15 @@ static int c_run(void *vh, const char *system, const char *user, const char *gra
     if (!strcmp(fin, "length")) {
         /* As the local engine reports it; the text is left for the log. */
         snprintf(err, errcap, "the answer reached its %d tokens without ending", max_out);
+        fail = OC_SUM_FAIL_RUNAWAY;
         goto done;
     }
-    if (!**out) { snprintf(err, errcap, "the model server's answer has no text"); goto done; }
+    if (!**out) { snprintf(err, errcap, "the model server's answer has no text"); fail = OC_SUM_FAIL_NO_TEXT; goto done; }
     rc = 0;
 done:
     if (st) {
+        st->fail = rc == 0 ? OC_SUM_FAIL_NONE : fail;
+        st->status = status;
         st->wall_ms = now_ms(CLOCK_MONOTONIC) - t0;
         st->cpu_ms = now_ms(CLOCK_THREAD_CPUTIME_ID) - cpu0;
     }
@@ -272,11 +286,12 @@ done:
 }
 
 /* The one-line prompt: answered with text and without reasoning, or not. */
-static int probe(cloud_engine *e, const char *extra, uint32_t *reasoning, char *err, size_t errcap) {
+static int probe(cloud_engine *e, const char *extra, uint32_t *reasoning, int *fail, char *err, size_t errcap) {
     char *ans = NULL, fin[32];
+    int status;
     int rc = request(e, "Answer in one word.", "Say OK.", 16, extra, NULL, NULL, &ans, reasoning, fin, sizeof fin, NULL,
-                     err, errcap);
-    if (rc == 0 && !*ans) { snprintf(err, errcap, "the model server's answer has no text"); rc = -1; }
+                     fail, &status, err, errcap);
+    if (rc == 0 && !*ans) { snprintf(err, errcap, "the model server's answer has no text"); *fail = OC_SUM_FAIL_NO_TEXT; rc = -1; }
     free(ans);
     return rc;
 }
@@ -287,16 +302,19 @@ static void *c_open(void *ctx, char *err, size_t errcap) {
     cloud_engine *e = ctx;
     char local[300];
     if (!err) { err = local; errcap = sizeof local; }
+    e->open_fail = OC_SUM_FAIL_NONE;
     if (e->probed) return e;
     uint32_t reasoning = 0;
-    int plain = probe(e, "", &reasoning, err, errcap);
+    int pfail = OC_SUM_FAIL_NONE;
+    int plain = probe(e, "", &reasoning, &pfail, err, errcap);
     if (plain == 0 && reasoning == 0) { e->probed = 1; return e; }
     char first[300];
     snprintf(first, sizeof first, "%s", err);
     for (int i = 0; i < N_QUIET; i++) {
         uint32_t r = 0;
+        int qfail;
         char qerr[300];
-        if (probe(e, QUIET[i], &r, qerr, sizeof qerr) == 0 && r == 0) {
+        if (probe(e, QUIET[i], &r, &qfail, qerr, sizeof qerr) == 0 && r == 0) {
             e->extra = QUIET[i];
             e->probed = 1;
             fprintf(stderr, "summary: the hosted model reasons before answering; every request now carries %s\n",
@@ -313,7 +331,13 @@ static void *c_open(void *ctx, char *err, size_t errcap) {
         return e;
     }
     snprintf(err, errcap, "the hosted model reasons before answering and cannot be told not to (%s)", first);
+    /* Answering nothing is the model reasoning; anything else is its own reason. */
+    e->open_fail = pfail == OC_SUM_FAIL_NO_TEXT ? OC_SUM_FAIL_REASONS : pfail;
     return NULL;
+}
+
+int oc_sum_cloud_open_fail(const oc_sum_engine *e) {
+    return e ? ((const cloud_engine *)e->ctx)->open_fail : OC_SUM_FAIL_NONE;
 }
 
 const oc_sum_engine *oc_sum_cloud_engine(const char *url, const char *model, const char *api_key) {
@@ -327,6 +351,7 @@ const oc_sum_engine *oc_sum_cloud_engine(const char *url, const char *model, con
     e.extra = "";
     e.probed = 0;
     e.tried = 0;
+    e.open_fail = OC_SUM_FAIL_NONE;
     e.eng.ctx = &e;
     e.eng.version = e.model;
     e.eng.remote = 1;

@@ -75,8 +75,7 @@ jobs:
             # strip it before matching so a trailing full stop before the
             # suffix is still caught.
             core=$(printf '%s' "$subject" | sed -E 's/ \(#[0-9]+\)$//')
-            printf '%s' "$core" \
-              | grep -qE '^OC-[0-9]+: [A-Z]([^[:cntrl:]]*[^.,;:!?[:space:]])?$' \
+            grep -qE '^OC-[0-9]+: [A-Z]([^[:cntrl:]]*[^.,;:!?[:space:]])?$' <<<"$core" \
               || { echo "::error::${c:0:8} subject must read 'OC-<issue>: Capitalised description' — got: ${subject}"; fail=1; }
 
             if [ "${#subject}" -gt 72 ]; then

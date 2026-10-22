@@ -222,6 +222,7 @@ typedef struct {
     char                new_nonce[512], new_account[512], new_order[512];
     char               *err; size_t errcap;
     const int          *stop;
+    int                 invalid;             /* a challenge came back not valid */
 } acme;
 
 /* The request body for `url`: `payload` NULL is POST-as-GET (an empty
@@ -376,6 +377,7 @@ static int authorize(acme *a, const oc_acme_opts *o, const char *authz_url) {
                 char both[640];
                 snprintf(both, sizeof both, "%s is %s%s%s", name, status, detail[0] ? ": " : "", detail);
                 fail(a->err, a->errcap, "validation failed", both);
+                a->invalid = 1;
             }
             jfree(&d); oc_https_resp_free(&r);
         }
@@ -387,7 +389,7 @@ static int authorize(acme *a, const oc_acme_opts *o, const char *authz_url) {
 int oc_acme_issue(const oc_acme_opts *o, oc_cert_issued *out, char *err, size_t errcap) {
     memset(out, 0, sizeof *out);
     acme *a = calloc(1, sizeof *a);
-    if (!a) { fail(err, errcap, "out of memory", NULL); return -1; }
+    if (!a) { fail(err, errcap, "out of memory", NULL); if (o->fail) *o->fail = OC_ACME_FAIL_OTHER; return -1; }
     a->err = err; a->errcap = errcap; a->stop = o->stop;
     mbedtls_pk_init(&a->key);
     int rc = -1;
@@ -504,6 +506,7 @@ int oc_acme_issue(const oc_acme_opts *o, oc_cert_issued *out, char *err, size_t 
     }
     rc = 0;
 out:
+    if (o->fail) *o->fail = rc == 0 ? OC_ACME_FAIL_NONE : a->invalid ? OC_ACME_FAIL_VALIDATION : OC_ACME_FAIL_OTHER;
     free(payload);
     mbedtls_pk_free(&a->key);
     rng_free(&a->r);

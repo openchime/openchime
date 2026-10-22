@@ -697,6 +697,10 @@ typedef struct {
     uint64_t reconnect_at_ms;
 
     char     last_error[160];
+    /* What the last error is about (event.h oc_client_err) and, for a refusal,
+     * the daemon's OC_ERR_* code: what a frontend decides by, never the text. */
+    uint8_t  last_error_kind;
+    uint16_t last_error_code;
     /* A browser sign-in is waiting (AUTH.md §8.1): the URL to open, and a counter
      * that moves each time one starts, so a frontend opens each URL once. Empty
      * again once the sign-in ends either way. */

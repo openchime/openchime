@@ -15,6 +15,7 @@
 
 #include "blobstore.h"
 #include "check.h"
+#include "testenv.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -273,11 +274,16 @@ int run_blob_s3_tests(void) {
     CHECK(fake_start(f, 0) == 0);
     if (f->port == 0) return failures;
     set_env_for(f);
+    /* The suite's own directory: the S3 backend ignores it, the local one
+     * stores under it. */
+    char dir[512], fsdir[700];
+    CHECK(oc_test_mkdtemp("blob-s3", dir, sizeof dir) == 0);
+    oc_test_path(fsdir, sizeof fsdir, dir, "fs");
 
-    oc_blobstore *bs = oc_blobstore_open("/tmp/oc-blob-s3-unused", &g_s3cfg);
+    oc_blobstore *bs = oc_blobstore_open(dir, &g_s3cfg);
     CHECK(bs != NULL);
     CHECK(!oc_blobstore_is_local(bs));
-    if (!bs) { fake_stop(f); clear_env(); return failures; }
+    if (!bs) { fake_stop(f); clear_env(); oc_test_rmtree(dir); return failures; }
 
     /* Single-chunk, multi-chunk, and a chunk size that leaves a partial final
      * write — the last is what catches off-by-one errors in the body loop. */
@@ -311,7 +317,7 @@ int run_blob_s3_tests(void) {
     clear_env();
     /* No S3 credentials -> the local-filesystem backend, which works against a
      * real directory rather than the fake endpoint. */
-    oc_blobstore *local = oc_blobstore_open("build/oc-blob-fs-test", NULL);
+    oc_blobstore *local = oc_blobstore_open(fsdir, NULL);
     CHECK(oc_blobstore_is_local(local));
     CHECK(local != NULL);
     if (local) {
@@ -337,7 +343,7 @@ int run_blob_s3_tests(void) {
      * never reaching the store; a backend configuration with no keys does not
      * open either, rather than falling back to local disk. */
     { oc_s3_config part = { "http://127.0.0.1:1", "testbucket", NULL, NULL, NULL };
-      CHECK(oc_blobstore_open("build/oc-blob-fs-test", &part) == NULL); }
+      CHECK(oc_blobstore_open(fsdir, &part) == NULL); }
     clear_env();
 
     fake_stop(f);
@@ -345,11 +351,12 @@ int run_blob_s3_tests(void) {
     /* An endpoint at an IPv6 address, in brackets: split into host and
      * port, reached over IPv6, and signed and sent with its brackets. */
     if (fake_start(f, 1) != 0) {
-        printf("  (no IPv6 loopback on this host: the [::1] endpoint is skipped)\n");
+        SKIP("no IPv6 loopback on this host: the [::1] endpoint");
+        oc_test_rmtree(dir);
         return failures;
     }
     set_env_for(f);
-    oc_blobstore *bs6 = oc_blobstore_open("/tmp/oc-blob-s3-unused", &g_s3cfg);
+    oc_blobstore *bs6 = oc_blobstore_open(dir, &g_s3cfg);
     CHECK(bs6 != NULL);
     if (bs6) {
         round_trip(bs6, f, "cccc0001", 5000, 4096);
@@ -358,5 +365,6 @@ int run_blob_s3_tests(void) {
     }
     clear_env();
     fake_stop(f);
+    oc_test_rmtree(dir);
     return failures;
 }

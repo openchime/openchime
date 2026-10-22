@@ -33,6 +33,11 @@ void tts_map_close(tts_map *m);
 
 typedef struct { tts_map map; uint32_t count; const uint8_t *index; const char *pool; uint32_t pool_size;
                  char lang[TTS_LANG_MAX]; } tts_lexicon;
+/* The two opens' results: 0 opened; TTS_OPEN_ABSENT the file could not be mapped
+ * (not there: tolerated on the disk path); any other negative value the data is
+ * there and wrong. Callers branch on the value, never on the message. */
+#define TTS_OPEN_ABSENT (-2)
+
 /* `mem`, if not NULL, supplies the bytes instead of mapping `path` (which then only
  * names them in messages). */
 int         tts_lexicon_open(const char *path, const tts_map *mem, tts_lexicon *lx, char *err, size_t errcap);

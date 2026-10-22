@@ -19,11 +19,23 @@
  * UTF-8, holds a control character, or does not fit. */
 int oc_pw_normalize(const char *pw, char *out, size_t cap);
 
+/* Why a password is refused: a stable kind a page and a test can name, and
+ * the form's sentence for it (oc_pw_verdict_text). */
+typedef enum {
+    OC_PW_OK = 0,
+    OC_PW_BAD_CHARS,   /* not valid UTF-8, a control character, or too big to normalize */
+    OC_PW_TOO_SHORT,   /* under OC_PW_MIN_CHARS */
+    OC_PW_TOO_LONG,    /* over OC_PW_MAX_CHARS */
+    OC_PW_COMMON,      /* on the common-password list, or one character repeated */
+    OC_PW_PERSONAL     /* built on the username, the workspace's name or the product's */
+} oc_pw_verdict;
+
 /* Whether `pw` may become a password for `username` in `workspace` (either may
- * be NULL). 0 with its normalized form in `out`; -1 with `*why` set to a
- * sentence for the form. */
-int oc_pw_acceptable(const char *pw, const char *username, const char *workspace,
-                     char *out, size_t cap, const char **why);
+ * be NULL): OC_PW_OK with its normalized form in `out`, or why not. */
+oc_pw_verdict oc_pw_check(const char *pw, const char *username, const char *workspace,
+                          char *out, size_t cap);
+/* The form's sentence for a refusal; "" for OC_PW_OK. */
+const char *oc_pw_verdict_text(oc_pw_verdict v);
 
 /* The form's own words for the rule, shown beside the field. */
 #define OC_PW_RULE_TEXT "At least 15 characters. Spaces and any characters are fine; a long phrase is easiest."

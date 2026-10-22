@@ -846,17 +846,7 @@ int oc_sum_notes_prompt(const char *intro, const oc_sum_lines *l, int notes_max,
     if (notes_max < 1) notes_max = 1;
     oc_sum_buf_printf(prompt, "%s\n\n", intro);
     lines_text(l, prompt);
-    oc_sum_buf_printf(prompt,
-        "\nWrite notes on these lines: at most %d, the most important first. Each note is one line in "
-        "exactly this form:\n"
-        "- [line number] kind | topic | what happened\n"
-        "\n"
-        "kind is event, decision, action or question. topic names what the note is about in 2 to 5 "
-        "words, and notes about the same thing share it. what happened is one or two sentences saying who "
-        "did what, with the particulars the lines give. Put what is about the same thing into one note, citing the lines "
-        "it comes from (at most %d), each line number in square brackets, as [12] or [12][15]. Leave out "
-        "greetings and small talk.\n",
-        notes_max, SUM_CITES_MAX);
+    oc_sum_buf_printf(prompt, SUM_NOTES_ASK, notes_max, SUM_CITES_MAX);
     oc_sum_buf_printf(grammar,
         "root ::= note{1,%d}\n"
         "note ::= \"- \" cites \" \" kind \" | \" tag \" | \" fact \"\\n\"\n"
@@ -1016,29 +1006,11 @@ int oc_sum_final_prompt(const char *intro, const oc_sum_lines *l, const oc_sum_c
                         oc_sum_buf *grammar) {
     oc_sum_buf_printf(prompt, "%s\n\n", intro);
     lines_text(l, prompt);
-    oc_sum_buf_puts(prompt,
-        "\nSummarize these lines for someone catching up, in exactly this form:\n"
-        "\n"
-        "Overview: [line number] <the most important outcome or change>\n"
-        "## <what a topic is about>\n"
-        "[line number] <what happened in it, and where it stands now>\n"
-        "- [line number] <one detail: who did or said what>\n"
-        "Needs attention:\n"
-        "- [line number] action: <who has to do what, and by when if it was said>\n"
-        "- [line number] question: <a question that was asked and not answered>\n");
-    if (c->more) oc_sum_buf_puts(prompt, "More topics: <topic>; <topic>\n");
-    oc_sum_buf_printf(prompt,
-        "\nWrite %d to %d topics, the most important first, each titled in 2 to 6 words, with what happened "
-        "in it in one to three sentences and %d to %d details of one sentence each. The overview is one "
-        "sentence. Write \"Needs attention\" only for actions and unanswered questions, at most %d, one "
-        "sentence each, and leave it out when there are none.",
-        c->topics_min, c->topics, c->details_min, c->details, c->attention);
-    if (c->more) oc_sum_buf_printf(prompt, " Name any further topics, at most %d, after \"More topics\".", c->more);
-    oc_sum_buf_printf(prompt,
-        " Every line starts with the numbers of the lines it comes from, at most %d, "
-        "each in square brackets, as [12] or [12][15]. Write only what the lines say, with their particulars, "
-        "and name a person only for what their own lines say. Do not comment on, interpret or characterize "
-        "what happened.\n", SUM_CITES_MAX);
+    oc_sum_buf_puts(prompt, SUM_FINAL_FORM);
+    if (c->more) oc_sum_buf_puts(prompt, SUM_FINAL_FORM_MORE);
+    oc_sum_buf_printf(prompt, SUM_FINAL_ASK, c->topics_min, c->topics, c->details_min, c->details, c->attention);
+    if (c->more) oc_sum_buf_printf(prompt, SUM_FINAL_ASK_MORE, c->more);
+    oc_sum_buf_printf(prompt, SUM_FINAL_CITE, SUM_CITES_MAX);
 
     /* The shape, bounded: how many of each part, and how long each line can be
      * in characters (about 8 to a word). The words are free. */
@@ -1442,9 +1414,7 @@ int oc_sum_final_json(const oc_sum_final *f, oc_sum_buf *out) {
 }
 
 int oc_sum_rewrite_prompt(const char *text, int cap, oc_sum_buf *prompt, oc_sum_buf *grammar) {
-    oc_sum_buf_printf(prompt,
-        "This is %zu words:\n\n%s\n\nRewrite it in at most %d words. Keep every name, number and fact "
-        "that fits, and add nothing.\n", oc_sum_words(text), text, cap);
+    oc_sum_buf_printf(prompt, SUM_REWRITE_ASK, oc_sum_words(text), text, cap);
     oc_sum_buf_printf(grammar, "root ::= [^\\n]{3,%d} \"\\n\"\n", cap * 8);
     return prompt->oom || grammar->oom ? -1 : 0;
 }
@@ -1492,12 +1462,9 @@ int oc_sum_final_text(const oc_sum_final *f, oc_sum_buf *out) {
 }
 
 int oc_sum_shorten_prompt(const oc_sum_final *f, const oc_sum_caps *c, oc_sum_buf *prompt) {
-    oc_sum_buf_printf(prompt, "This summary is %d words:\n\n", oc_sum_final_words(f));
+    oc_sum_buf_printf(prompt, SUM_SHORTEN_HEAD, oc_sum_final_words(f));
     if (oc_sum_final_text(f, prompt) != 0) return -1;
-    oc_sum_buf_printf(prompt,
-        "\nWrite it again in at most %d words, in exactly the same form, each line keeping the line numbers it "
-        "starts with. Keep every name, number and fact that fits, the most important first, and add nothing.\n",
-        c->total);
+    oc_sum_buf_printf(prompt, SUM_SHORTEN_ASK, c->total);
     return prompt->oom ? -1 : 0;
 }
 

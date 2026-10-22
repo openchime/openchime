@@ -52,6 +52,18 @@ const char *oc_deploy_mode_name(oc_deploy_mode m) {
 
 const oc_config *oc_config_get(void) { return &g_cfg; }
 
+static oc_cfg_fault g_fault;
+
+const oc_cfg_fault *oc_config_fault(void) { return &g_fault; }
+
+/* Record why the load stops; -1, for the caller to return. */
+static int fault(oc_cfg_fault_kind kind, const char *name, const char *other) {
+    g_fault.kind = kind;
+    snprintf(g_fault.name, sizeof g_fault.name, "%s", name ? name : "");
+    snprintf(g_fault.other, sizeof g_fault.other, "%s", other ? other : "");
+    return -1;
+}
+
 /* --- strict parsers ---------------------------------------------------------- */
 
 static int fail(char *err, size_t errcap, const char *name, const char *v, const char *want) {
@@ -461,7 +473,7 @@ static int row_matches(const cfg_row *r, const char *name) {
 static int scan_unknown(char *err, size_t errcap) {
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) {
         const char *v = getenv(x->name);
-        if (v && *v) { snprintf(err, errcap, "%s is no longer read: %s", x->name, x->instead); return -1; }
+        if (v && *v) { snprintf(err, errcap, "%s is no longer read: %s", x->name, x->instead); return fault(OC_CFGF_REMOVED, x->name, NULL); }
     }
     for (char **e = environ; e && *e; e++) {
         if (strncmp(*e, "OPENCHIME_", 10) != 0) continue;
@@ -478,7 +490,7 @@ static int scan_unknown(char *err, size_t errcap) {
             const char *near = nearest(name);
             if (near) snprintf(err, errcap, "%s is not a setting (did you mean %s?)", name, near);
             else      snprintf(err, errcap, "%s is not a setting (CONFIG.md lists them)", name);
-            return -1;
+            return fault(OC_CFGF_UNKNOWN, name, near);
         }
     }
     return 0;
@@ -491,17 +503,17 @@ static int validate(oc_config *c, char *err, size_t errcap) {
     c->deployment_mode = ticket ? OC_DEPLOY_MANAGED : c->enroll.url ? OC_DEPLOY_FEDERATED : OC_DEPLOY_STANDALONE;
     if (ticket && !c->enroll.url) {
         snprintf(err, errcap, "OPENCHIME_MANAGED_TICKET: a managed box is started with OPENCHIME_ENROLL_URL as well");
-        return -1;
+        return fault(OC_CFGF_NEEDS, "OPENCHIME_MANAGED_TICKET", "OPENCHIME_ENROLL_URL");
     }
     if (ticket && !c->oidc.audience) {
         snprintf(err, errcap, "OPENCHIME_MANAGED_TICKET: a managed box is started with OPENCHIME_MANAGED_AUDIENCE as well");
-        return -1;
+        return fault(OC_CFGF_NEEDS, "OPENCHIME_MANAGED_TICKET", "OPENCHIME_MANAGED_AUDIENCE");
     }
 
     /* The data directory's layout. */
     size_t dl = strlen(c->data_dir);
     while (dl > 1 && c->data_dir[dl - 1] == '/') dl--;
-    if (dl + 16 >= sizeof c->db_path) { snprintf(err, errcap, "OPENCHIME_DATA_DIR: too long"); return -1; }
+    if (dl + 16 >= sizeof c->db_path) { snprintf(err, errcap, "OPENCHIME_DATA_DIR: too long"); return fault(OC_CFGF_BAD_VALUE, "OPENCHIME_DATA_DIR", NULL); }
     snprintf(c->db_path, sizeof c->db_path, "%.*s/openchime.db", (int)dl, c->data_dir);
     snprintf(c->blob_dir, sizeof c->blob_dir, "%.*s/blobs", (int)dl, c->data_dir);
     snprintf(c->tls_cert, sizeof c->tls_cert, "%.*s/cert.pem", (int)dl, c->data_dir);
@@ -536,25 +548,25 @@ static int validate(oc_config *c, char *err, size_t errcap) {
      * that does not parse stops the boot instead of failing each connection. */
     if (oc_tls_set_extra_ca(c->extra_ca) != 0) {
         snprintf(err, errcap, "OPENCHIME_EXTRA_CA=%s: must be a readable file of PEM certificates", c->extra_ca);
-        return -1;
+        return fault(OC_CFGF_BAD_VALUE, "OPENCHIME_EXTRA_CA", NULL);
     }
 
     /* The relay is the control plane this box is enrolled with (AUTH.md §3):
      * its issuer is that origin and its keys are the ones it publishes. */
     if (c->auth_relay && !c->enroll.url) {
         snprintf(err, errcap, "OPENCHIME_AUTH=relay: the relay is the control plane; needs OPENCHIME_ENROLL_URL");
-        return -1;
+        return fault(OC_CFGF_NEEDS, "OPENCHIME_AUTH", "OPENCHIME_ENROLL_URL");
     }
     if (!c->oidc.pubkey) c->oidc.pubkey = "";
 
     /* Both carry signed requests: https, or plain http to loopback for a test. */
     if (c->enroll.url && !oc_url_transport_ok(c->enroll.url)) {
         snprintf(err, errcap, "OPENCHIME_ENROLL_URL=%s: must be https (plain http is for loopback only)", c->enroll.url);
-        return -1;
+        return fault(OC_CFGF_BAD_VALUE, "OPENCHIME_ENROLL_URL", NULL);
     }
     if (c->push.url && !oc_url_transport_ok(c->push.url)) {
         snprintf(err, errcap, "OPENCHIME_PUSH_URL=%s: must be https (plain http is for loopback only)", c->push.url);
-        return -1;
+        return fault(OC_CFGF_BAD_VALUE, "OPENCHIME_PUSH_URL", NULL);
     }
 
     /* The certificate's source: central on a managed box, else self, unless
@@ -564,11 +576,11 @@ static int validate(oc_config *c, char *err, size_t errcap) {
     if (!c->tls_src.given && c->deployment_mode == OC_DEPLOY_MANAGED) c->tls_src.source = OC_TLS_SRC_CENTRAL;
     if (c->tls_src.source == OC_TLS_SRC_CENTRAL && !c->enroll.url) {
         snprintf(err, errcap, "OPENCHIME_TLS=central: a certificate through central needs an enrollment (OPENCHIME_ENROLL_URL)");
-        return -1;
+        return fault(OC_CFGF_NEEDS, "OPENCHIME_TLS", "OPENCHIME_ENROLL_URL");
     }
     if (c->tls_src.source == OC_TLS_SRC_FILE && (access(c->tls_cert, R_OK) != 0 || access(c->tls_key, R_OK) != 0)) {
         snprintf(err, errcap, "OPENCHIME_TLS=file: needs %s and %s to be readable", c->tls_cert, c->tls_key);
-        return -1;
+        return fault(OC_CFGF_BAD_VALUE, "OPENCHIME_TLS", NULL);
     }
 
     /* A demo admits visitors by the control plane's signed invite, checked
@@ -576,13 +588,13 @@ static int validate(oc_config *c, char *err, size_t errcap) {
     if (c->mode == OC_MODE_DEMO && !(c->auth_local && c->auth_relay)) {
         snprintf(err, errcap, "OPENCHIME_MODE=demo: a demo's visitors make local accounts with the control plane's "
                               "invite, so it needs OPENCHIME_AUTH=local,relay");
-        return -1;
+        return fault(OC_CFGF_NEEDS, "OPENCHIME_MODE", "OPENCHIME_AUTH");
     }
     /* Development is for a box of one's own: it may call itself managed (the
      * fixtures do, to exercise that mode), but it never enrols anywhere real. */
     if (c->mode == OC_MODE_DEVELOPMENT && c->enroll.url && strncmp(c->enroll.url, "http://", 7) != 0) {
         snprintf(err, errcap, "OPENCHIME_ENROLL_URL=%s: development mode enrols with a loopback test service only", c->enroll.url);
-        return -1;
+        return fault(OC_CFGF_BAD_VALUE, "OPENCHIME_ENROLL_URL", NULL);
     }
     return 0;
 }
@@ -593,6 +605,7 @@ int oc_config_load(char *err, size_t errcap) {
     oc_config *c = &g_cfg;
     memset(c, 0, sizeof *c);
     memset(g_src, 0, sizeof g_src);
+    memset(&g_fault, 0, sizeof g_fault);
 
     if (scan_unknown(err, errcap) != 0) return -1;
 
@@ -610,7 +623,7 @@ int oc_config_load(char *err, size_t errcap) {
                 /* OPENCHIME_MODE is the first row, so c->mode is known here. */
                 if (r->cls == CFG_DEV && c->mode != OC_MODE_DEVELOPMENT) {
                     snprintf(err, errcap, "%s is read in development mode only, and OPENCHIME_MODE is %s", name, oc_mode_name(c->mode));
-                    return -1;
+                    return fault(OC_CFGF_DEV_ONLY, name, "OPENCHIME_MODE");
                 }
                 /* The control plane's rows come with its ticket; a self-hoster
                  * setting one by hand is told so. Development, which stands
@@ -619,7 +632,7 @@ int oc_config_load(char *err, size_t errcap) {
                     const char *t = getenv("OPENCHIME_MANAGED_TICKET");
                     if (!t || !*t) {
                         snprintf(err, errcap, "%s is the control plane's, set at provision time with OPENCHIME_MANAGED_TICKET (CONFIG.md \"A managed box\")", name);
-                        return -1;
+                        return fault(OC_CFGF_MANAGED_ONLY, name, "OPENCHIME_MANAGED_TICKET");
                     }
                 }
                 if (!strcmp(name, "OPENCHIME_TLS")) c->tls_src.given = 1;
@@ -627,7 +640,7 @@ int oc_config_load(char *err, size_t errcap) {
             } else {
                 v = r->dflt; is_default = 1;
             }
-            if (store(c, r, name, v, is_default, err, errcap) != 0) return -1;
+            if (store(c, r, name, v, is_default, err, errcap) != 0) return fault(OC_CFGF_BAD_VALUE, name, NULL);
         }
     }
     return validate(c, err, errcap);

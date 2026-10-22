@@ -66,7 +66,7 @@ static int tclient_open(tclient *c, uint16_t port, const char **alpn) {
 }
 
 static int tclient_handshake(tclient *c) {
-    for (int i = 0; i < 100000; i++) {
+    for (uint64_t end = oc_test_deadline(5000); oc_test_mono_ms() < end; ) {
         oc_tls_status st = oc_tls_handshake(&c->conn);
         if (st == OC_TLS_OK) return 0;
         if (st != OC_TLS_WANT_READ && st != OC_TLS_WANT_WRITE) return -1;
@@ -175,12 +175,11 @@ static const oc_http_site P_SITE = { P_ROUTES, 1, &P_FALLBACK };
  * hanging the suite. */
 static size_t tread_all(tclient *c, char *buf, size_t cap) {
     size_t got = 0;
-    struct timeval t0, t; gettimeofday(&t0, NULL);
+    uint64_t end = oc_test_deadline(5000);
     while (got + 1 < cap) {
         size_t n = 0;
         oc_tls_status st = oc_tls_read(&c->conn, (uint8_t *)buf + got, cap - 1 - got, &n);
-        gettimeofday(&t, NULL);
-        if ((t.tv_sec - t0.tv_sec) * 1000 + (t.tv_usec - t0.tv_usec) / 1000 > 5000) break;
+        if (oc_test_mono_ms() > end) break;
         if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) continue;
         if (st != OC_TLS_OK || !n) break;
         got += n;
@@ -311,9 +310,15 @@ int run_ioloop_tests(void) {
     /* Paused, nothing is delivered; resumed, it all is, in order. */
     {
         oc_ioloop_pause(io, 11, fd, 1);
-        usleep(20000);
-        uint8_t f[64]; size_t fl;
+        /* Commands are taken in order: once a send queued after the pause has
+         * reached the client, the pause has taken hold. */
+        uint8_t f[64]; size_t fl = mk_frame(f, sizeof f, 499, 0);
+        CHECK(oc_ioloop_send(io, 11, fd, f, fl, 0) == 0);
+        CHECK(tread_u32(&c) == 499);
         for (uint32_t i = 0; i < 5; i++) { fl = mk_frame(f, sizeof f, 500 + i, 0); CHECK(twrite(&c, f, fl) == 0); }
+        /* Nothing to order against while paused: the loop reads nothing, so
+         * there is no event to wait for. A short look; resuming below is the
+         * positive control, every frame then arriving in order. */
         oc_io_event *e = wait_kind(io, OC_IO_FRAME, 100);
         CHECK(e == NULL);
         oc_io_event_free(e);
@@ -342,7 +347,7 @@ int run_ioloop_tests(void) {
         for (uint32_t i = 0; i < 40; i++) if (tread_u32(&c) != (long)(1000 + i)) { bad = 1; break; }
         CHECK(!bad);
         uint64_t written = 0;
-        for (int k = 0; k < 50 && written < total; k++) {
+        for (uint64_t end = oc_test_deadline(10000); written < total && oc_test_mono_ms() < end; ) {
             oc_io_event *e = wait_kind(io, OC_IO_WRITTEN, 200);
             if (e && e->conn_id == 11) written = e->written;
             oc_io_event_free(e);
@@ -397,7 +402,9 @@ int run_ioloop_tests(void) {
         e = wait_event(io, 200);
         CHECK(e == NULL || e->kind == OC_IO_WRITTEN);
         oc_io_event_free(e);
-        usleep(50000);
+        /* The loop has closed the socket before the next connection is
+         * accepted, so the descriptor's number cannot be reused under it. */
+        CHECK(WAIT_UNTIL(fcntl(fd, F_GETFD) == -1, 3000));
     }
 
     /* HTTP, parsed on the I/O thread (ARCH-32): a POST for the loop's route, sent
@@ -412,7 +419,10 @@ int run_ioloop_tests(void) {
         for (size_t off = 0; off < rl; off += 7) {
             size_t n = rl - off < 7 ? rl - off : 7;
             CHECK(twrite(&w, (const uint8_t *)req + off, n) == 0);
-            usleep(2000);
+            /* A moment between pieces, so that each tends to arrive alone, as
+             * a slow sender's do: what is checked is the whole request,
+             * reported once, however the pieces fell. */
+            oc_test_let_time_pass(2);
         }
         oc_io_event *e = wait_kind(io, OC_IO_HTTP_REQ, 3000);
         CHECK(e && e->conn_id == 21 && e->is_json);
@@ -441,7 +451,7 @@ int run_ioloop_tests(void) {
         const char *r200 = "GET /static?x=1 HTTP/1.1\r\nHost: x\r\n\r\n";
         CHECK(http_exchange(io, lfd, port, 30, r200, strlen(r200), resp, sizeof resp) == 0);
         CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "\r\n\r\nhello") &&
-              strstr(resp, "Connection: close\r\n") && strstr(resp, "Content-Length: 5\r\n"));
+              strstr(resp, "Connection: close\r\n") && strstr(resp, "Content-Length: 5\r\n"));   /* contract: HTTP/1.1 headers */
 
         const char *r404 = "GET /nope HTTP/1.1\r\n\r\n";
         CHECK(http_exchange(io, lfd, port, 31, r404, strlen(r404), resp, sizeof resp) == 0);
@@ -483,11 +493,10 @@ int run_ioloop_tests(void) {
         tclient w; int wfd = -1, whttp = -1;
         CHECK(open_conn(io, lfd, port, 40, &w, http_alpn, &wfd, &whttp) == 0);
         CHECK(twrite(&w, (const uint8_t *)"GET /sta", 8) == 0);
-        struct timeval t0, t1; gettimeofday(&t0, NULL);
+        uint64_t t0 = oc_test_mono_ms();
         CHECK(finished(io, 40, wfd, 3000));
-        gettimeofday(&t1, NULL);
-        long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_usec - t0.tv_usec) / 1000;
-        CHECK(ms < 2000);
+        /* The timeout set, not the default, ended it: the mechanism, not a speed. */
+        CHECK(oc_test_mono_ms() - t0 < OC_HTTP_REQUEST_TIMEOUT_MS);
         tread_all(&w, resp, sizeof resp);
         CHECK(strncmp(resp, "HTTP/1.1 408 ", 13) == 0);
         tclient_close(&w);

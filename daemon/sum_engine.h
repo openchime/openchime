@@ -16,6 +16,22 @@
  * system is busy -- the generation keeps its place), non-zero to abandon it. */
 typedef int (*oc_sum_gate_fn)(void *ctx);
 
+/* Why an engine's open or run failed. */
+typedef enum {
+    OC_SUM_FAIL_NONE = 0,
+    OC_SUM_FAIL_STOPPED,       /* the gate said to stop */
+    OC_SUM_FAIL_RUNAWAY,       /* the answer reached `max_out` without ending */
+    OC_SUM_FAIL_UNREACHABLE,   /* a hosted model's server could not be reached */
+    OC_SUM_FAIL_STATUS,        /* it answered a status other than 200 (in `status`) */
+    OC_SUM_FAIL_NOT_JSON,      /* its answer was not JSON */
+    OC_SUM_FAIL_NO_CHOICES,    /* its answer carried no choice: a refusal */
+    OC_SUM_FAIL_NO_TEXT,       /* the answer was empty */
+    OC_SUM_FAIL_REASONS,       /* the model reasons first and cannot be told not to */
+    OC_SUM_FAIL_PROMPT,        /* the prompt or grammar could not be read, or is too long */
+    OC_SUM_FAIL_MODEL,         /* the model failed (could not load, stopped mid-answer) */
+    OC_SUM_FAIL_OOM
+} oc_sum_fail;
+
 typedef struct {
     uint32_t prompt_tokens, output_tokens;
     uint32_t cpu_ms;            /* the worker thread's CPU time for this answer */
@@ -27,6 +43,11 @@ typedef struct {
     /* A hosted model's server asked for a pause (429) or failed (5xx): how
      * many times the request was sent again, and how long was waited in all. */
     uint32_t retries, wait_ms;
+    /* Why a run failed (oc_sum_fail), which the worker acts on, and for a
+     * hosted model the HTTP status of its last answer: the reason at `err` is
+     * the log's sentence, never read back. */
+    int      fail;
+    int      status;
 } oc_sum_run_stats;
 
 typedef struct oc_sum_engine {
@@ -55,5 +76,8 @@ const oc_sum_engine *oc_sum_llama_engine(const char *path, const char *version, 
  * address), asking for `model`, with `api_key` (may be empty) as its bearer
  * token, in the fields every such API reads. All three are borrowed. */
 const oc_sum_engine *oc_sum_cloud_engine(const char *url, const char *model, const char *api_key);
+/* Why the hosted engine's last open returned NULL (oc_sum_fail), or
+ * OC_SUM_FAIL_NONE. */
+int oc_sum_cloud_open_fail(const oc_sum_engine *e);
 
 #endif

@@ -50,14 +50,14 @@ static void test_tokens(void) {
 
     char out[512];
     int64_t ids[] = { 1, 3, 4, 5, 6, 2 };
-    CHECK(moonshine_detok(&t, ids, 6, out, sizeof out) == (long)strlen("Send the report."));
-    CHECK(strcmp(out, "Send the report.") == 0);        /* specials skipped, marker is a space, trimmed */
+    CHECK(moonshine_detok(&t, ids, 6, out, sizeof out) == (long)strlen("Send the report."));   /* contract: the decoded length */
+    CHECK(strcmp(out, "Send the report.") == 0);        /* contract: the text as decoded; specials skipped, marker is a space, trimmed */
     int64_t odd[] = { 3, 7, 999, -1, 8 };
     moonshine_detok(&t, odd, 5, out, sizeof out);
-    CHECK(strcmp(out, "Send caf\xC3\xA9") == 0);        /* unused and out-of-range ids skipped */
+    CHECK(strcmp(out, "Send caf\xC3\xA9") == 0);        /* contract: the text as decoded; unused and out-of-range ids skipped */
     /* A cap that splits a character never leaves half of it. */
     moonshine_detok(&t, odd, 5, out, 10);
-    CHECK(strcmp(out, "Send caf") == 0);
+    CHECK(strcmp(out, "Send caf") == 0);   /* contract: the text as decoded, exact */
 
     /* A truncated table is refused, not read past. */
     moonshine_tokens bad;
@@ -78,21 +78,21 @@ static void test_mentions(void) {
     const char *names[] = { "dana", "Bob", "jo.smith", "Sam Lee", "twin", "Twin" };
     char out[256];
     oc_stt_mentions("Send the report to at Dana.", names, 6, out, sizeof out);
-    CHECK(strcmp(out, "Send the report to @dana.") == 0);
+    CHECK(strcmp(out, "Send the report to @dana.") == 0);   /* contract: the transcript as rewritten, exact */
     oc_stt_mentions("At bob, look at this.", names, 6, out, sizeof out);
-    CHECK(strcmp(out, "@Bob, look at this.") == 0);                /* "at this" is nobody */
+    CHECK(strcmp(out, "@Bob, look at this.") == 0);                /* contract: the transcript as rewritten; "at this" is nobody */
     oc_stt_mentions("ping at jo.smith now", names, 6, out, sizeof out);
-    CHECK(strcmp(out, "ping @jo.smith now") == 0);
+    CHECK(strcmp(out, "ping @jo.smith now") == 0);   /* contract: the transcript as rewritten, exact */
     oc_stt_mentions("ask at Sam about it", names, 6, out, sizeof out);
-    CHECK(strcmp(out, "ask at Sam about it") == 0);                /* "Sam Lee" cannot be a mention */
+    CHECK(strcmp(out, "ask at Sam about it") == 0);                /* contract: the transcript as rewritten; "Sam Lee" cannot be a mention */
     oc_stt_mentions("tell at twin", names, 6, out, sizeof out);
-    CHECK(strcmp(out, "tell at twin") == 0);                       /* two people: stays words */
+    CHECK(strcmp(out, "tell at twin") == 0);                       /* contract: the transcript as rewritten; two people: stays words */
     oc_stt_mentions("meet at noon", names, 6, out, sizeof out);
-    CHECK(strcmp(out, "meet at noon") == 0);
+    CHECK(strcmp(out, "meet at noon") == 0);   /* contract: the transcript as rewritten, exact */
     oc_stt_mentions("that danasaur", names, 6, out, sizeof out);
-    CHECK(strcmp(out, "that danasaur") == 0);
+    CHECK(strcmp(out, "that danasaur") == 0);   /* contract: the transcript as rewritten, exact */
     oc_stt_mentions("chat at dana", NULL, 0, out, sizeof out);
-    CHECK(strcmp(out, "chat at dana") == 0);
+    CHECK(strcmp(out, "chat at dana") == 0);   /* contract: the transcript as rewritten, exact */
     if (failures == failures_before) printf("  spoken mentions ok\n");
 }
 
@@ -112,7 +112,9 @@ static void stub_close(void *e) {
     (void)e;
     pthread_mutex_lock(&stub_mu); stub_closes++; pthread_mutex_unlock(&stub_mu);
 }
-/* The text is the first sample as a number; a first sample of -1 fails. */
+/* The text is the first sample as a number; a first sample of -1 fails, with
+ * this reason: a token of the test's own, which the result must carry. */
+#define STUB_REASON "stub-refusal-7f3a"
 static int stub_hear(void *e, const int16_t *pcm, size_t n, char **text, char *err, size_t cap) {
     (void)e;
     pthread_mutex_lock(&stub_mu);
@@ -122,7 +124,7 @@ static int stub_hear(void *e, const int16_t *pcm, size_t n, char **text, char *e
     }
     stub_held = 0;
     pthread_mutex_unlock(&stub_mu);
-    if (n && pcm[0] == -1) { snprintf(err, cap, "stub says no"); return -1; }
+    if (n && pcm[0] == -1) { snprintf(err, cap, "%s", STUB_REASON); return -1; }
     char buf[32];
     snprintf(buf, sizeof buf, "%d", n ? pcm[0] : 0);
     *text = strdup(buf);
@@ -143,15 +145,19 @@ static int16_t *seg(int16_t first) {
     return p;
 }
 
+/* The next result, waited for on the worker's eventfd until a deadline on the
+ * monotonic clock. */
 static int wait_result(oc_stt_worker *w, oc_stt_result *r) {
     struct pollfd pf = { oc_stt_worker_eventfd(w), POLLIN, 0 };
-    for (int i = 0; i < 200; i++) {
+    uint64_t end = oc_test_deadline(4000);
+    for (;;) {
         if (oc_stt_worker_next_result(w, r)) return 1;
-        poll(&pf, 1, 20);
+        uint64_t now = oc_test_mono_ms();
+        if (now >= end) return oc_stt_worker_next_result(w, r);
+        poll(&pf, 1, (int)(end - now < 50 ? end - now : 50));
         uint64_t cnt;
         while (read(pf.fd, &cnt, sizeof cnt) > 0) {}
     }
-    return 0;
 }
 
 static void test_worker(void) {
@@ -169,18 +175,20 @@ static void test_worker(void) {
     free(r.text);
     CHECK(wait_result(w, &r) && r.req_id == 2 && r.ok && strcmp(r.text, "22") == 0);
     free(r.text);
+    pthread_mutex_lock(&stub_mu);
     CHECK(stub_opens == 1);
+    pthread_mutex_unlock(&stub_mu);
 
     /* A failure is a result, with a reason. */
     CHECK(oc_stt_worker_submit(w, 3, seg(-1), 160) == 0);
-    CHECK(wait_result(w, &r) && r.req_id == 3 && !r.ok && r.text == NULL && strstr(r.reason, "stub says no"));
+    CHECK(wait_result(w, &r) && r.req_id == 3 && !r.ok && r.text == NULL && strstr(r.reason, STUB_REASON));
 
     /* A full queue refuses rather than grows; the audio is freed either way. */
     pthread_mutex_lock(&stub_mu); stub_hold = 1; pthread_mutex_unlock(&stub_mu);
     CHECK(oc_stt_worker_submit(w, 4, seg(4), 160) == 0);   /* taken by the worker, held: */
     pthread_mutex_lock(&stub_mu);                            /* ...waited for, not slept on */
-    for (int i = 0; i < 200 && !stub_held; i++) {
-        struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
+    for (uint64_t end = oc_test_deadline(4000); !stub_held && oc_test_mono_ms() < end; ) {
+        struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);   /* the condition variable's own clock */
         dl.tv_nsec += 10 * 1000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
         pthread_cond_timedwait(&stub_cv, &stub_mu, &dl);
     }
@@ -196,15 +204,16 @@ static void test_worker(void) {
     }
 
     /* Idle: the engine closes, and opens again for the next segment. */
-    for (int i = 0; i < 100 && oc_stt_worker_engine_open(w); i++) {
-        struct timespec t = { 0, 20 * 1000000L };
-        nanosleep(&t, NULL);
-    }
-    CHECK(!oc_stt_worker_engine_open(w) && stub_closes == 1);
+    CHECK(WAIT_UNTIL(!oc_stt_worker_engine_open(w), 4000));
+    pthread_mutex_lock(&stub_mu);
+    CHECK(stub_closes == 1);
+    pthread_mutex_unlock(&stub_mu);
     CHECK(oc_stt_worker_submit(w, 8, seg(8), 160) == 0);
     CHECK(wait_result(w, &r) && r.req_id == 8 && r.ok);
     free(r.text);
+    pthread_mutex_lock(&stub_mu);
     CHECK(stub_opens == 2);
+    pthread_mutex_unlock(&stub_mu);
     oc_stt_worker_stop(w);
     if (failures == failures_before) printf("  recognition worker ok\n");
 }

@@ -78,7 +78,9 @@ typedef enum {
 
 /* Answer the browser tab whose callback oc_loopback_wait returned, and close it.
  * Nothing once it has been answered; oc_loopback_close answers one still
- * waiting with OC_LOOPBACK_UNKNOWN, so no tab is left hanging or told a guess. */
+ * waiting with OC_LOOPBACK_UNKNOWN, so no tab is left hanging or told a guess.
+ * The page's heading carries the outcome as data-oc-result: "signed-in",
+ * "refused" or "pending", the stable marker a test or a harness reads. */
 void oc_loopback_answer(oc_loopback *lb, oc_loopback_outcome outcome, const char *why);
 
 void oc_loopback_close(oc_loopback *lb);

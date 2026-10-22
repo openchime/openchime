@@ -23,6 +23,18 @@ if [ "$#" -gt 0 ]; then
 fi
 
 # --- Replication (ARCH-3, ARCH-39) --------------------------------------------
+# What the boot did with the replica is said on one line of stable tokens,
+# "entrypoint: <key>=<value>", beside the sentence for a person: a harness, a
+# log query or the release-candidate's image check reads the tokens, never the
+# words. They are:
+#   entrypoint: replica=off            no replication files; the daemon as before
+#   entrypoint: replica=misconfigured  files there but wrong; not started (exit 1)
+#   entrypoint: replica=on             replicating
+#   entrypoint: restore=ok             no database; the replica's copy restored
+#   entrypoint: restore=empty          no database; the replica holds no copy yet
+#   entrypoint: restore=failed         no database; the restore failed (exit 3)
+# An existing database is left alone and says no restore= token.
+#
 # On only when the deployment provides it, as files the hosted deployment
 # writes under /etc/openchime (mode 0600): replica-bucket, replica-prefix (the
 # workspace's area in the bucket), replica-accesskey and replica-secretkey, all
@@ -38,6 +50,7 @@ for f in replica-bucket replica-prefix replica-accesskey replica-secretkey; do
 done
 
 if [ -z "$present" ]; then
+  echo "entrypoint: replica=off"
   echo "entrypoint: starting openchimed"
   exec /usr/local/bin/openchimed
 fi
@@ -45,6 +58,7 @@ fi
 # Some of the four but not all is a deployment that meant to replicate and got
 # it wrong: starting unreplicated would hide that until the box was lost.
 fail() {
+  echo "entrypoint: replica=misconfigured" >&2
   echo "entrypoint: $1, so the daemon is not started" >&2
   exit 1
 }
@@ -130,12 +144,15 @@ if [ ! -e "$DB" ]; then
   if ! LITESTREAM_ACCESS_KEY_ID="$access_key" LITESTREAM_SECRET_ACCESS_KEY="$secret_key" \
       /usr/local/bin/litestream restore -config "$CONFIG" -if-db-not-exists -if-replica-exists \
       -integrity-check full "$DB"; then
+    echo "entrypoint: restore=failed" >&2
     echo "entrypoint: the restore from the replica failed, so the daemon is not started: a daemon started on an empty database would replace this workspace's identity and enrollment rather than recover them, and its enrollment ticket cannot be used twice. Fix the bucket, the key or the endpoint and start the box again." >&2
-    exit 1
+    exit 3
   fi
   if [ -e "$DB" ]; then
+    echo "entrypoint: restore=ok"
     echo "entrypoint: restored $DB from the replica"
   else
+    echo "entrypoint: restore=empty"
     echo "entrypoint: the replica holds no copy yet; the daemon creates a new database"
   fi
 fi
@@ -147,6 +164,7 @@ fi
 # for it, and a process that serves the network should not hold a credential it
 # never needs. (Litestream copies the key to the AWS_* names for its SDK, so
 # those go too.)
+echo "entrypoint: replica=on"
 echo "entrypoint: starting openchimed, replicated to the bucket by Litestream"
 export LITESTREAM_ACCESS_KEY_ID="$access_key" LITESTREAM_SECRET_ACCESS_KEY="$secret_key"
 exec /usr/local/bin/litestream replicate -config "$CONFIG" -exec "/usr/bin/env -u LITESTREAM_ACCESS_KEY_ID -u LITESTREAM_SECRET_ACCESS_KEY -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY /usr/local/bin/openchimed"

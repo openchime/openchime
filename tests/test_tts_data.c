@@ -5,6 +5,7 @@
  * another build, an altered or missing file, a required file left unlisted, a
  * malformed line and a path that would leave the directory. */
 #include "check.h"
+#include "testenv.h"
 #include "tts_data.h"
 
 #include <stdio.h>
@@ -23,8 +24,8 @@ static int contains(const char *s, const char *needle) { return s && strstr(s, n
 int run_tts_data_tests(void) {
     printf("test_tts_data: data directory precedence, explicit directory refused not replaced, manifest version, hashes, required files, malformed and escaping names\n");
 
-    char root[] = "/tmp/oc-ttsdata-XXXXXX";
-    CHECK(mkdtemp(root) != NULL);
+    char root[160];
+    CHECK(oc_test_mkdtemp("ttsdata", root, sizeof root) == 0);
     char sys[256], exe[256], exev[256], out[512], err[256];
     snprintf(sys, sizeof sys, "%s/system", root);
     snprintf(exe, sizeof exe, "%s/bin", root);
@@ -102,8 +103,7 @@ int run_tts_data_tests(void) {
     char gone[256]; snprintf(gone, sizeof gone, "%s/nope", root);
     CHECK(oc_tts_map_open(gone, &m) == -1);
 
-    char cmd[512];
-    snprintf(cmd, sizeof cmd, "rm -rf %s", root);
-    CHECK(system(cmd) == 0);
+    oc_test_rmtree(root);
+    CHECK(access(root, F_OK) != 0);
     return failures;
 }

@@ -75,6 +75,10 @@ void oc_relay_sweep(oc_relay *r);
 /* The silence interval: OC_AUDIO_SILENCE_MS unless a test shortens it (0 restores). */
 void oc_relay_set_silence_ms(oc_relay *r, uint64_t ms);
 
+/* How many datagrams have been taken off the socket, relayed or dropped; the
+ * loop's thread. */
+uint64_t oc_relay_received(const oc_relay *r);
+
 /* How many participants are registered; for tests. */
 size_t oc_relay_count(const oc_relay *r);
 

@@ -50,12 +50,29 @@ fail=0
 # Vendored code is excluded because it is not ours to rewrite: mbedTLS ships a
 # ChangeLog full of upstream issue numbers, and editing them would fork a pinned
 # dependency to satisfy a house rule. NOTHING ELSE is excluded — not this file.
-files=$(git ls-files | grep -v '^third_party/' || true)
-[ -n "$files" ] || { echo "check_refs: no tracked files to scan" >&2; exit 2; }
+#
+# The list is NUL-separated, so a path with a space in it is one path. In a git
+# checkout it is the tracked files; outside one (an unpacked tarball) it is
+# every file under the tree but what .gitignore keeps out of a checkout.
+list=$(mktemp)
+trap 'rm -f "$list"' EXIT
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git ls-files -z --cached --others --exclude-standard -- ':!:third_party/*' > "$list"
+else
+    # What .gitignore keeps out of a checkout: build output, fetched libraries
+    # and the harness's installed packages.
+    find . \( -path ./.git -o -path ./third_party -o -path ./build -o -path ./dist -o -path ./tts \
+               -o -path ./stt -o -path ./web -o -path ./image -o -name node_modules -o -name __pycache__ \
+               -o -name .playwright-mcp \) -prune \
+        -o -type f ! -name '*.o' ! -name '*.db' ! -name '*.db-*' ! -path ./openchimed -print0 \
+        | sed -z 's|^\./||' > "$list"
+fi
+n=$(tr -cd '\0' < "$list" | wc -c | tr -d ' ')
+[ "$n" -gt 0 ] || { echo "check_refs: no tracked files to scan" >&2; exit 2; }
 
 for pat in "$pat_num" "$pat_url" "$pat_win" "$pat_bl"; do
     # UAX #NN is the one legitimate "#number" in the tree; drop it before judging.
-    hits=$(printf '%s\n' "$files" | xargs grep -nE "$pat" 2>/dev/null | grep -v 'UAX #' || true)
+    hits=$(xargs -0 grep -nIE -- "$pat" < "$list" 2>/dev/null | grep -v 'UAX #' || true)
     if [ -n "$hits" ]; then
         fail=1
         printf '%s\n' "$hits" | while IFS= read -r line; do
@@ -68,18 +85,21 @@ done
 # "it is a backlog\nitem" hid in a document through the first version of this
 # check. Second pass: fold each file to one line and look again. Reported per
 # file, since a folded file has no line numbers left to report.
-for f in $files; do
-    folded=$(tr '\n' ' ' < "$f" | tr -s ' ')
-    if printf '%s' "$folded" | grep -qE "$(printf 'back%sog (item|entry|entries)' 'l')"; then
-        fail=1
+wrapped=$(xargs -0 sh -c '
+    pat=$1; shift
+    for f; do
+        if tr "\n" " " < "$f" | tr -s " " | grep -qIE -- "$pat"; then echo "$f"; fi
+    done' sh "$(printf 'back%sog (item|entry|entries)' 'l')" < "$list" || true)
+if [ -n "$wrapped" ]; then
+    fail=1
+    printf '%s\n' "$wrapped" | while IFS= read -r f; do
         echo "check_refs: issue reference wrapped across lines: $f" >&2
-    fi
-done
+    done
+fi
 
 if [ "$fail" -ne 0 ]; then
     echo "check_refs: files cite no issue numbers: say the thing, or cite REQ-N / ARCH-N." >&2
     exit 1
 fi
 
-n=$(printf '%s\n' "$files" | wc -l | tr -d ' ')
 echo "check_refs: $n tracked files, no issue references"

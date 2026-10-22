@@ -235,7 +235,7 @@ static void test_claim_answers(void) {
     struct canned c;
 
     CHECK(claim_against(200, &c, pk, aud) == OC_ENROLL_ACTIVE);
-    CHECK(strstr(c.seen, "POST /api/machine/enroll/claim ") == c.seen);
+    CHECK(strstr(c.seen, "POST /api/machine/enroll/claim ") == c.seen);   /* contract: central's HTTP route */
     CHECK(strstr(c.seen, "\"audienceId\":\"ws_") != NULL);
     CHECK(strstr(c.seen, "\"ticket\":\"BwcHBwcH") != NULL);
     CHECK(strstr(c.seen, "\"publicKey\":\"") != NULL && strstr(c.seen, "\"signature\":\"") != NULL);
@@ -248,10 +248,10 @@ static void test_claim_answers(void) {
      * a bracketed Host header. */
     oc_enroll_result r6 = claim_at(200, &c, pk, aud, 1);
     if (r6 == (oc_enroll_result)-1) {
-        printf("  (no IPv6 loopback on this host: central at [::1] is skipped)\n");
+        SKIP("no IPv6 loopback on this host: central at [::1] is not checked");
     } else {
         CHECK(r6 == OC_ENROLL_ACTIVE);
-        CHECK(strstr(c.seen, "Host: [::1]:") != NULL);
+        CHECK(strstr(c.seen, "Host: [::1]:") != NULL);              /* contract: HTTP's Host header */
     }
     /* Nobody there at all. */
     CHECK(oc_enroll_claim("http://127.0.0.1:1/api/machine/enroll", aud, pk,
@@ -303,9 +303,20 @@ static void test_plain_http_refused(void) {
     CHECK(oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0);
     CHECK(oc_enroll_activate(url, aud, pk) == OC_ENROLL_FAILED);
     CHECK(oc_enroll_claim(url, aud, pk, "AAAA") == OC_ENROLL_FAILED);
-    struct timeval tv = { 0, 200000 };
+    /* Both calls have returned, so a connection either made would already be
+     * waiting to be accepted: none is. */
+    struct timeval tv = { 0, 0 };
     fd_set rf; FD_ZERO(&rf); FD_SET(lfd, &rf);
     CHECK(select(lfd + 1, &rf, NULL, NULL, &tv) == 0);   /* nobody connected */
+    /* The control: a connection to that address does arrive there. */
+    int cfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in to = sa;
+    to.sin_addr.s_addr = htonl(0x7f000002);
+    CHECK(cfd >= 0 && connect(cfd, (struct sockaddr *)&to, sizeof to) == 0);
+    tv.tv_sec = 5; tv.tv_usec = 0;
+    FD_ZERO(&rf); FD_SET(lfd, &rf);
+    CHECK(select(lfd + 1, &rf, NULL, NULL, &tv) == 1);
+    if (cfd >= 0) close(cfd);
     close(lfd);
 }
 

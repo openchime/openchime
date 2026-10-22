@@ -5,6 +5,7 @@
  * notify->relay->prune round-trip against a fake HTTP gateway. */
 
 #include "check.h"
+#include "testenv.h"
 #include "push.h"
 #include "notify.h"
 #include "dbwriter.h"
@@ -32,6 +33,17 @@
 
 /* --- helpers --------------------------------------------------------------- */
 
+/* The suite's own directory under $TMPDIR (tests/testenv.h), made on first
+ * use and removed at the end: nothing shared with another suite or run. */
+static char g_dir[512];
+static const char *tpath(const char *name) {
+    static char ring[4][700];
+    static int at;
+    if (!g_dir[0] && oc_test_mkdtemp("push", g_dir, sizeof g_dir) != 0) g_dir[0] = '\0';
+    char *out = ring[at++ & 3];
+    return oc_test_path(out, sizeof ring[0], g_dir[0] ? g_dir : ".", name);
+}
+
 static void cleanup_db(const char *path) {
     unlink(path);
     char wal[256], shm[256];
@@ -41,12 +53,9 @@ static void cleanup_db(const char *path) {
 }
 
 static oc_dbres *wait_result(oc_dbwriter *w) {
-    for (int i = 0; i < 500; i++) {
-        oc_dbres *r = oc_dbwriter_next_result(w);
-        if (r) return r;
-        usleep(2000);
-    }
-    return NULL;
+    oc_dbres *r = NULL;
+    (void)WAIT_UNTIL((r = oc_dbwriter_next_result(w)) != NULL, 5000);
+    return r;
 }
 
 /* Set a user's per-channel notification level via the writer's SET_NOTIFY_PREF
@@ -199,7 +208,7 @@ static void test_sign_verify(void) {
 /* --- recipient collector + register/prune ---------------------------------- */
 
 static void test_collect(void) {
-    const char *path = "build/test_push_collect.db";
+    const char *path = tpath("collect.db");
     cleanup_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
     if (w) oc_dbwriter_set_pw_mem(w, 2048);   /* a cheap Argon2id for tests */
@@ -613,7 +622,7 @@ static void test_collect(void) {
  * applied to nothing but the channels you had touched individually, and a muted
  * channel at level ALL still pushed. */
 static void test_default_and_mute(void) {
-    const char *path = "build/test_push_default.db";
+    const char *path = tpath("default.db");
     cleanup_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
     if (w) oc_dbwriter_set_pw_mem(w, 2048);   /* a cheap Argon2id for tests */
@@ -743,7 +752,7 @@ static void *fake_gw_thread(void *arg) {
 
 /* `v6`: the gateway at [::1], named in brackets in the URL. */
 static void test_notify_roundtrip(int v6) {
-    const char *path = v6 ? "build/test_push_rt6.db" : "build/test_push_rt.db";
+    const char *path = tpath(v6 ? "rt6.db" : "rt.db");
     if (v6) {
         int probe = socket(AF_INET6, SOCK_STREAM, 0);
         struct sockaddr_in6 p6; memset(&p6, 0, sizeof p6);
@@ -832,7 +841,7 @@ static void test_notify_roundtrip(int v6) {
  * Nothing in the tree could see it. The row is real, the level is real, and the
  * query is self-consistent — it just answers a question nobody asked. */
 static void test_keyword_is_not_a_broadcast(void) {
-    const char *path = "build/test_push_keyword.db";
+    const char *path = tpath("keyword.db");
     cleanup_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
     if (w) oc_dbwriter_set_pw_mem(w, 2048);   /* a cheap Argon2id for tests */
@@ -977,7 +986,7 @@ static int client_would_toast(uint64_t me, uint64_t author,
 }
 
 static void test_collect_matches_evaluator(void) {
-    const char *path = "build/test_push_parity.db";
+    const char *path = tpath("parity.db");
     cleanup_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
     if (w) oc_dbwriter_set_pw_mem(w, 2048);   /* a cheap Argon2id for tests */
@@ -1136,7 +1145,7 @@ static void test_collect_matches_evaluator(void) {
  * mention of them -- so the MENTIONS level lets it through, mute and quiet hours
  * silence it -- and a body that says it is a call and still names nothing. */
 static void test_call_invite(void) {
-    const char *path = "build/test_push_call.db";
+    const char *path = tpath("call.db");
     cleanup_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
     if (w) oc_dbwriter_set_pw_mem(w, 2048);   /* a cheap Argon2id for tests */
@@ -1225,5 +1234,6 @@ int run_push_tests(void) {
     test_notify_roundtrip(1);
     test_call_invite();
     test_transport_config();
+    oc_test_rmtree(g_dir);
     return failures;
 }

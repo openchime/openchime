@@ -30,6 +30,17 @@ typedef struct tts tts;
  * NULL to accept whatever the files say, which is for tools, not for a program
  * that is going to speak the result. */
 tts *tts_load(const char *dir, const char *lang, char *err, size_t errcap);
+/* Why a load returned NULL, for a caller that acts on it (or a test): the data is
+ * present and damaged, or is for another language than asked, or the two files
+ * disagree. An absent file is not a refusal (above). */
+typedef enum {
+    TTS_LOADED = 0,
+    TTS_REFUSED_DAMAGED,   /* a file is there and does not read as ttskit data */
+    TTS_REFUSED_LANG,      /* the files are for another language than `lang`, or for two */
+    TTS_REFUSED_NOMEM
+} tts_status;
+/* tts_load, with why in `*st` (may be NULL). */
+tts *tts_load_ex(const char *dir, const char *lang, tts_status *st, char *err, size_t errcap);
 /* The same, over the two files' bytes already in memory -- embedded in the
  * program, say. Nothing is copied: the bytes must outlive the handle. Both must be
  * given and valid. */

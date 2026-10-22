@@ -22,6 +22,8 @@ typedef struct {
     int      width, height;          /* the track's declared size */
     int      has_audio;              /* audio is going to a device */
     uint64_t presented, dropped;     /* video frames */
+    uint64_t seeks;                  /* seeks finished: oc_player_seek's effect is in this status once
+                                      * this has passed its value at the call */
 } oc_player_status;
 
 typedef struct oc_player oc_player;

@@ -27,6 +27,31 @@
 int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                    volatile sig_atomic_t *stop);
 
+/* What one running loop shows of itself, for a caller that started it on a
+ * port the kernel picks (0) or must wait on its connections rather than
+ * sleep: written by the loop with atomic stores, read with atomic loads
+ * (__atomic_load_n) from any thread. */
+typedef struct {
+    int proto_port;    /* the protocol port, once bound and listening; 0 before */
+    int health_port;   /* the health port, once listening; 0 when it has none */
+    int open_conns;    /* connections the loop holds now: counted at accept, out
+                        * at close, as the per-address cap counts them */
+    int ended;         /* 1 once the loop has returned (or failed to start) */
+    uint64_t relay_received;   /* call-media datagrams the relay has taken in */
+} oc_netloop_view;
+
+/* oc_netloop_run, keeping `view` (may be NULL) up to date while it serves.
+ * `port` 0 binds whatever port the kernel picks; view->proto_port says which,
+ * before the ready hook (oc_netloop_set_ready) runs. The health port
+ * (oc_netloop_set_health_port) may be 0 likewise. */
+int oc_netloop_run_ex(int port, oc_tls_server *tls, oc_dbwriter *dbw,
+                      volatile sig_atomic_t *stop, oc_netloop_view *view);
+
+/* The body of the missed-call line a call that nobody took leaves in its
+ * conversation (REQ-304): a message of kind OC_MSG_KIND_CALL, which is what a
+ * client goes by; the words are for whatever ignores the kind. */
+#define OC_CALL_MISSED_TEXT "Missed call"
+
 /* Serve the plaintext health port (ARCH-25) beside the TLS port: `/healthz`
  * and the landing page, through the same HTTP stack. -1 (the default) serves
  * none. Call before oc_netloop_run. */

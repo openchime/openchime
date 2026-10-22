@@ -13,6 +13,8 @@
 #include <sys/socket.h>
 
 #include "check.h"
+#include "testenv.h"
+#include "json.h"
 #include "dbwriter.h"
 #include "migrate.h"
 #include "sum_core.h"
@@ -23,6 +25,99 @@
 #include "sum_worker.h"
 
 #define MIN 60000ll
+
+/* The suite's own directory (tests/testenv.h): every database is made there. */
+static char g_dir[256];
+static const char *db_at(const char *name, char *out, size_t cap) { return oc_test_path(out, cap, g_dir, name); }
+
+/* --- reading what is built: its structure and fields, not its words ---------- */
+
+static int starts_with(const char *s, const char *pre) { return s && !strncmp(s, pre, strlen(pre)); }
+static int ends_with(const char *s, const char *suf) {
+    size_t n = s ? strlen(s) : 0, m = strlen(suf);
+    return n >= m && !strcmp(s + n - m, suf);
+}
+/* `user` opens with the stage's intro: the format's words before its first
+ * conversion. */
+static int opens_with_fmt(const char *user, const char *fmt) {
+    return user && !strncmp(user, fmt, strcspn(fmt, "%"));
+}
+/* Every line of `l` is in the prompt as the model reads it: numbered, a reply
+ * indented. */
+static int shows_lines(const char *prompt, const oc_sum_lines *l) {
+    for (int i = 0; i < l->n; i++) {
+        char want[2048];
+        snprintf(want, sizeof want, "%s[%d] %s\n", l->v[i].indent ? "  " : "", i + 1, l->v[i].text);
+        if (!strstr(prompt, want)) return 0;
+    }
+    return 1;
+}
+
+/* JSON by path ("a.b[2].c") over the daemon's reader (daemon/json.h). */
+static int jparse(oc_json *d, const char *js) {
+    memset(d, 0, sizeof *d);
+    return js ? oc_json_parse(d, js, strlen(js)) : -1;
+}
+static int jtok(const oc_json *d, const char *path) {
+    int i = 0;
+    const char *p = path;
+    while (*p && i >= 0) {
+        if (*p == '.') p++;
+        if (*p == '[') {
+            char *end = NULL;
+            long k = strtol(p + 1, &end, 10);
+            if (!end || *end != ']' || d->t[i].type != JSMN_ARRAY || k < 0 || k >= d->t[i].size) return -1;
+            p = end + 1;
+            int c = i + 1;
+            for (long j = 0; j < k; j++) c = oc_json_skip(d, c);
+            i = c;
+        } else {
+            char key[64];
+            size_t n = strcspn(p, ".[");
+            if (!n || n >= sizeof key || d->t[i].type != JSMN_OBJECT) return -1;
+            memcpy(key, p, n);
+            key[n] = '\0';
+            p += n;
+            i = oc_json_get(d, i, key);
+        }
+    }
+    return i;
+}
+/* The string at `path` is `want`. */
+static int jis(const oc_json *d, const char *path, const char *want) {
+    char got[1024];
+    int i = jtok(d, path);
+    return i >= 0 && oc_json_str(d, i, got, sizeof got) == 0 && !strcmp(got, want);
+}
+/* The primitive (number, true, false, null) at `path`, as written, is `want`. */
+static int jprim(const oc_json *d, const char *path, const char *want) {
+    int i = jtok(d, path);
+    if (i < 0 || d->t[i].type != JSMN_PRIMITIVE) return 0;
+    size_t n = (size_t)(d->t[i].end - d->t[i].start);
+    return n == strlen(want) && !memcmp(d->js + d->t[i].start, want, n);
+}
+/* How many members the array or object at `path` has, or -1. */
+static int jlen(const oc_json *d, const char *path) {
+    int i = jtok(d, path);
+    return i < 0 || (d->t[i].type != JSMN_ARRAY && d->t[i].type != JSMN_OBJECT) ? -1 : d->t[i].size;
+}
+/* The array at `path` holds exactly the integers `want`. */
+static int jints(const oc_json *d, const char *path, const long long *want, int n) {
+    if (jlen(d, path) != n) return 0;
+    for (int k = 0; k < n; k++) {
+        char sub[160], v[32];
+        snprintf(sub, sizeof sub, "%s[%d]", path, k);
+        snprintf(v, sizeof v, "%lld", want[k]);
+        if (!jprim(d, sub, v)) return 0;
+    }
+    return 1;
+}
+/* A stored body read back: its summary, wrapped for a client or not. */
+static const char *spath(const oc_json *d, const char *path, char *out, size_t cap) {
+    snprintf(out, cap, "summary.%s", path);
+    if (jtok(d, out) < 0) snprintf(out, cap, "%s", path);
+    return out;
+}
 
 /* --- cutting ------------------------------------------------------------------ */
 
@@ -89,8 +184,10 @@ static void test_parse(void) {
     CHECK(c.n == 1 && oc_sum_chunk_lines(m, &c.pieces[0].chunks[0], &l) == 0);
     CHECK(l.n == 3);
     if (l.n == 3) {
+        /* contract: the line as the model reads it -- its author, then the message as written */
         CHECK(!strcmp(l.v[0].text, "Ann: Ticket 6701 is open; Bob please look.") && !strcmp(l.v[0].by, "Ann"));
         CHECK(l.v[1].indent == 1 && l.v[1].n_all == 1 && l.v[1].all[0] == 101);
+        /* contract: a run of four, as the model reads it */
         CHECK(!strcmp(l.v[2].text, "Bot: Order 55 cancelled. (x4)") && l.v[2].n_all == 4 && l.v[2].n_refs == 3 &&
               l.v[2].refs[2] == 104 && !strcmp(l.v[2].by, "Bot\nCara"));
     }
@@ -109,16 +206,26 @@ static void test_parse(void) {
     /* Notes: the lines numbered, at most as many as asked, held to a grammar
      * of notes citing lines that exist. */
     oc_sum_buf prompt = {0}, g = {0}, out = {0};
-    CHECK(oc_sum_notes_prompt("Messages from #support.", &l, 8, &prompt, &g) == 0);
-    CHECK(strstr(prompt.p, "[1] Ann: Ticket") && strstr(prompt.p, "  [2] Bob: On it.") &&
-          strstr(prompt.p, "- [line number] kind | topic | what happened") && strstr(prompt.p, "at most 8,"));
+    const char *intro = "Messages from #support.";
+    CHECK(oc_sum_notes_prompt(intro, &l, 8, &prompt, &g) == 0);
+    {
+        /* The intro, every line numbered, and the ask for at most 8 -- built
+         * from the prompt's own constants (sum_core.h), not quoted. */
+        char ask[2048];
+        snprintf(ask, sizeof ask, SUM_NOTES_ASK, 8, SUM_CITES_MAX);
+        CHECK(starts_with(prompt.p, intro) && shows_lines(prompt.p, &l) && ends_with(prompt.p, ask));
+        CHECK(strstr(ask, SUM_NOTES_FORM) != NULL);
+    }
+    /* contract: the answer's grammar (GBNF), which the model is held to */
     CHECK(strstr(g.p, "root ::= note{1,8}\n") && strstr(g.p, "id ::= \"1\" | \"2\" | \"3\"\n"));
     oc_sum_buf_free(&prompt);
     oc_sum_buf_free(&g);
+#define FACT_TICKET "Ann asked Bob to look at ticket 6701, and he took it."
+#define FACT_ORDERS "Four orders were cancelled."
     const char *notes =
-        "- [1][2] action | Ticket 6701 | Ann asked Bob to look at ticket 6701, and he took it.\n"
+        "- [1][2] action | Ticket 6701 | " FACT_TICKET "\n"
         "- [1] action | ticket | ann asked bob to look at ticket 6701.\n"
-        "- [3] event | Orders | Four orders were cancelled. Order 9999 was refunded.\n"
+        "- [3] event | Orders | " FACT_ORDERS " Order 9999 was refunded.\n"
         "- [2] decision | Ticket | Cara closed the ticket.\n"
         "- [3] event | Orders | None\n";
     int dropped = 0;
@@ -126,17 +233,30 @@ static void test_parse(void) {
     /* Dropped: the repeat, the sentence with a number no line has, the note
      * naming someone its line does not, and the one saying nothing. */
     CHECK(dropped == 3);
-    CHECK(out.p && !strcmp(out.p,
-        "{\"notes\":[{\"kind\":\"action\",\"topic\":\"Ticket 6701\","
-        "\"text\":\"Ann asked Bob to look at ticket 6701, and he took it.\",\"refs\":[100,101],\"all\":[100,101],"
-        "\"by\":[\"Ann\",\"Bob\"]},"
-        "{\"kind\":\"event\",\"topic\":\"Orders\",\"text\":\"Four orders were cancelled.\",\"refs\":[102,103,104],"
-        "\"all\":[102,103,104,105],\"by\":[\"Bot\",\"Cara\"]}]}"));
+    {
+        /* The body, read as JSON: the two notes kept, each its kind, topic,
+         * text (the sentence the number was not in kept), the lines cited and
+         * covered, and who. */
+        oc_json d;
+        CHECK(out.p && jparse(&d, out.p) == 0);
+        static const long long r0[] = { 100, 101 }, r1[] = { 102, 103, 104 }, a1[] = { 102, 103, 104, 105 };
+        CHECK(jlen(&d, "notes") == 2);
+        CHECK(jis(&d, "notes[0].kind", "action") && jis(&d, "notes[0].topic", "Ticket 6701") &&
+              jis(&d, "notes[0].text", FACT_TICKET) && jints(&d, "notes[0].refs", r0, 2) &&
+              jints(&d, "notes[0].all", r0, 2) && jlen(&d, "notes[0].by") == 2 &&
+              jis(&d, "notes[0].by[0]", "Ann") && jis(&d, "notes[0].by[1]", "Bob"));
+        CHECK(jis(&d, "notes[1].kind", "event") && jis(&d, "notes[1].topic", "Orders") &&
+              jis(&d, "notes[1].text", FACT_ORDERS) && jints(&d, "notes[1].refs", r1, 3) &&
+              jints(&d, "notes[1].all", a1, 4) && jlen(&d, "notes[1].by") == 2 &&
+              jis(&d, "notes[1].by[0]", "Bot") && jis(&d, "notes[1].by[1]", "Cara"));
+        oc_json_free(&d);
+    }
     /* Read back as lines for the next level: each stands for what its note does. */
     oc_sum_lines up = {0};
     CHECK(oc_sum_notes_lines(out.p, "On Fri 04 Sep:", &up) == 0 && up.n == 2);
     if (up.n == 2) {
-        CHECK(!strcmp(up.v[0].text, "(action) Ticket 6701: Ann asked Bob to look at ticket 6701, and he took it.") &&
+        /* contract: a note as the next level's line -- (kind) topic: text */
+        CHECK(!strcmp(up.v[0].text, "(action) Ticket 6701: " FACT_TICKET) &&
               up.v[0].kind == 'a' && up.v[0].label && up.v[0].n_all == 2 && !strcmp(up.v[0].by, "Ann\nBob"));
         CHECK(up.v[1].kind == 'e' && up.v[1].n_all == 4 && up.v[1].n_refs == 3 && !up.v[1].label);
     }
@@ -150,7 +270,12 @@ static void test_parse(void) {
     CHECK(oc_sum_parse_notes("- [1] action | Ticket | Ann asked Bob to look at the ticket.\n"
                              "- [3] event | Orders | Four orders were cancelled.\n"
                              "- [2] decision | Ticket | Cara closed the ticket.\n", &l, &out, &dropped, 2) == 2);
-    CHECK(strstr(out.p, "Four orders") && !strstr(out.p, "Cara closed"));
+    {
+        oc_json d;   /* the first two kept, in order; the third, a decision, not */
+        CHECK(jparse(&d, out.p) == 0 && jlen(&d, "notes") == 2 && jis(&d, "notes[0].kind", "action") &&
+              jis(&d, "notes[1].kind", "event"));
+        oc_json_free(&d);
+    }
     oc_sum_buf_free(&out);
 
     /* The summary: sized to its span -- a word to every ten, between the floor
@@ -161,7 +286,8 @@ static void test_parse(void) {
     oc_sum_caps_for(12, &tiny);
     oc_sum_caps_for(20000, &huge);
     CHECK(cs.total == SUM_MIN_WORDS && cs.topics == 2 && cs.topics_min == 0 && cs.details_min == 0 && cs.more == 0);
-    CHECK(cf.total == 400 && cf.topics == 4 && cf.topics_min == 2 && cf.details_min == 2 && cf.more == SUM_MORE_TOPICS);
+    CHECK(cf.total == 400 && cf.topics == 4 && cf.topics_min == 2 && cf.details_min == 2 && cf.details == 3 &&
+          cf.more == SUM_MORE_TOPICS);
     CHECK(tiny.total == 12);
     CHECK(huge.total == SUM_MAX_WORDS && huge.topics == SUM_MAX_TOPICS && huge.topics_min == 4);
     /* The room: what the shape holds at most, well above the total; the
@@ -169,16 +295,29 @@ static void test_parse(void) {
     CHECK(cs.room == 60 + 2 * (6 + 80 + 3 * 40) + 5 * 40 && cs.room > 6 * cs.total);
     CHECK(cf.room == 60 + 4 * (6 + 80 + 3 * 40) + 5 * 40 + 10 * 6 && cf.room > cf.total);
     /* The length is asked for in sentences a part and a ceiling on the whole. */
-    CHECK(oc_sum_final_prompt("Notes on #support.", &up, &cf, &prompt, &g) == 0);
-    CHECK(strstr(prompt.p, "Overview: [line number]") && strstr(prompt.p, "More topics: <topic>; <topic>") &&
-          strstr(prompt.p, "Write 2 to 4 topics") && strstr(prompt.p, "2 to 3 details of one sentence each") &&
-          strstr(prompt.p, "one to three sentences") && strstr(prompt.p, "The overview is one sentence") &&
-          !strstr(prompt.p, "words in all") && strstr(prompt.p, "Do not comment on"));
+    const char *intro2 = "Notes on #support.";
+    CHECK(oc_sum_final_prompt(intro2, &up, &cf, &prompt, &g) == 0);
+    {
+        /* The intro, the lines, the form with its "more" line, the ask with
+         * the caps' numbers, the more's ask and the citation rule: each built
+         * from the prompt's constants (sum_core.h). */
+        char ask[2048], more[256], cite[1024];
+        snprintf(ask, sizeof ask, SUM_FINAL_ASK, cf.topics_min, cf.topics, cf.details_min, cf.details, cf.attention);
+        snprintf(more, sizeof more, SUM_FINAL_ASK_MORE, cf.more);
+        snprintf(cite, sizeof cite, SUM_FINAL_CITE, SUM_CITES_MAX);
+        CHECK(starts_with(prompt.p, intro2) && shows_lines(prompt.p, &up));
+        CHECK(strstr(prompt.p, SUM_FINAL_FORM) && strstr(prompt.p, SUM_FINAL_FORM_MORE));
+        CHECK(strstr(prompt.p, ask) && strstr(prompt.p, more) && ends_with(prompt.p, cite));
+    }
+    /* contract: the answer's grammar (GBNF) */
     CHECK(strstr(g.p, "root ::= ov topic{2,4} attn? more?\n") && strstr(g.p, "aitem ::=") && strstr(g.p, "det{2,3}"));
     oc_sum_buf_free(&prompt);
     oc_sum_buf_free(&g);
     CHECK(oc_sum_final_prompt("Messages.", &l, &cs, &prompt, &g) == 0);
-    CHECK(strstr(g.p, "root ::= ov topic{0,2} attn?\n") && !strstr(prompt.p, "More topics"));
+    /* No more topics at this size: neither the line nor its rule. */
+    CHECK(cs.more == 0 && strstr(prompt.p, SUM_FINAL_FORM) && !strstr(prompt.p, SUM_FINAL_FORM_MORE));
+    /* contract: the answer's grammar (GBNF) */
+    CHECK(strstr(g.p, "root ::= ov topic{0,2} attn?\n") && !strstr(g.p, "more ::="));
     oc_sum_buf_free(&prompt);
     oc_sum_buf_free(&g);
 
@@ -189,8 +328,9 @@ static void test_parse(void) {
                              "cancelled.\",\"refs\":[102],\"all\":[102,103,104,105],\"by\":[\"Bot\"]},"
                              "{\"kind\":\"decision\",\"topic\":\"Ticket\",\"text\":\"Bob took ticket 6701.\","
                              "\"refs\":[101],\"all\":[100,101],\"by\":[\"Ann\",\"Bob\"]}]}", NULL, &both) == 0);
+#define OV_TEXT "Bob took ticket 6701, and four orders were cancelled."
     const char *ans =
-        "Overview: [2] Bob took ticket 6701, and four orders were cancelled.\n"
+        "Overview: [2] " OV_TEXT "\n"
         "## Orders\n"
         "[1] Four orders were cancelled.\n"
         "- [1] Four orders were cancelled.\n"
@@ -205,24 +345,38 @@ static void test_parse(void) {
     oc_sum_final f;
     CHECK(oc_sum_parse_final(ans, &both, &cf, &f, &dropped) == 0);
     oc_sum_final_rank(&f);
-    CHECK(f.ov.text && !strcmp(f.ov.text, "Bob took ticket 6701, and four orders were cancelled.") && f.ov.refs[0] == 101);
+    CHECK(f.ov.text && !strcmp(f.ov.text, OV_TEXT) && f.ov.refs[0] == 101);
     CHECK(f.nt == 2);
     if (f.nt == 2) {
+        /* contract: data in, data out -- the topic as titled */
         CHECK(!strcmp(f.top[0].title, "Ticket 6701") && f.top[0].weight == 3 && f.top[0].n_all == 2);
         CHECK(!strcmp(f.top[1].title, "Orders") && f.top[1].nd == 0 && f.top[1].n_all == 4);   /* repeat, invented number */
     }
     /* Bot wrote none of the lines the question cites, nor is named in them. */
-    CHECK(f.na == 1 && f.att_kind[0] == 'a' && !strcmp(f.att[0].text, "Bob to fix ticket 6701"));
+    CHECK(f.na == 1 && f.att_kind[0] == 'a' && !strcmp(f.att[0].text, "Bob to fix ticket 6701"));   /* contract: as written */
     CHECK(f.nm == 2 && !strcmp(f.more[1], "Parking"));
     CHECK(dropped == 3);
     oc_sum_buf_free(&out);
     CHECK(oc_sum_final_json(&f, &out) == 0);
-    CHECK(out.p && strstr(out.p, "{\"overview\":{\"text\":\"Bob took ticket 6701, and four orders were cancelled.\","
-                                 "\"refs\":[101]},\"topics\":[{\"title\":\"Ticket 6701\",\"text\":\"Bob took the ticket.\","
-                                 "\"refs\":[101],\"count\":2,\"people\":[\"Ann\",\"Bob\"],\"details\":[{\"text\":\"Ann "
-                                 "asked; Bob took it.\",\"refs\":[101]}]}") &&
-          strstr(out.p, "\"attention\":[{\"kind\":\"action\",\"text\":\"Bob to fix ticket 6701\",\"refs\":[101]}],"
-                        "\"more\":[\"Lunch\",\"Parking\"],\"words\":0}"));
+    {
+        /* The stored body (sum_core.h), read as JSON. */
+        oc_json d;
+        static const long long r101[] = { 101 };
+        CHECK(out.p && jparse(&d, out.p) == 0);
+        CHECK(jis(&d, "overview.text", OV_TEXT) && jints(&d, "overview.refs", r101, 1));
+        CHECK(jlen(&d, "topics") == 2 && jis(&d, "topics[0].title", "Ticket 6701") &&
+              jis(&d, "topics[0].text", "Bob took the ticket.") && jints(&d, "topics[0].refs", r101, 1) &&
+              jprim(&d, "topics[0].count", "2") && jlen(&d, "topics[0].people") == 2 &&
+              jis(&d, "topics[0].people[0]", "Ann") && jis(&d, "topics[0].people[1]", "Bob") &&
+              jlen(&d, "topics[0].details") == 1 && jis(&d, "topics[0].details[0].text", "Ann asked; Bob took it.") &&
+              jints(&d, "topics[0].details[0].refs", r101, 1));
+        CHECK(jis(&d, "topics[1].title", "Orders"));
+        CHECK(jlen(&d, "attention") == 1 && jis(&d, "attention[0].kind", "action") &&
+              jis(&d, "attention[0].text", "Bob to fix ticket 6701") && jints(&d, "attention[0].refs", r101, 1));
+        CHECK(jlen(&d, "more") == 2 && jis(&d, "more[0]", "Lunch") && jis(&d, "more[1]", "Parking"));
+        CHECK(jprim(&d, "words", "0"));
+        oc_json_free(&d);
+    }
     CHECK(oc_sum_body_readable(out.p) && !oc_sum_body_readable("{\"refs\":[],\"topics\":[]}"));
     oc_sum_buf_free(&out);
     /* Held to a whole of 12 words: the lowest topic goes to "More topics", then
@@ -244,8 +398,10 @@ static void test_parse(void) {
                              "- 2 Bob took it at noon.\n"
                              "Needs attention:\n"
                              "- 2 action: Bob to fix ticket 6701\n", &both, &cf, &f, &dropped) == 0);
+    /* contract: data in, data out -- the text as given, as far as it is kept */
     CHECK(f.ov.text && !strcmp(f.ov.text, "Bob took the ticket.") && f.ov.n_cited == 2);
     CHECK(f.nt == 1 && f.top[0].para.n_cited == 1 && f.top[0].para.cited[0] == 1);
+    /* contract: data in, data out -- the text as given, as far as it is kept */
     CHECK(f.nt == 1 && f.top[0].nd == 2 && f.top[0].det[0].n_cited == 2 && !strcmp(f.top[0].det[1].text, "Bob took it at noon."));
     CHECK(f.na == 1 && f.att_kind[0] == 'a');
     oc_sum_final_free(&f);
@@ -258,7 +414,9 @@ static void test_parse(void) {
                              "[1] Orders\n"
                              "[1] Four orders were cancelled.\n", &both, &cf, &f, &dropped) == 0);
     CHECK(f.ov.text && f.ov.n_cited == 2);
+    /* contract: data in, data out -- the topics as titled */
     CHECK(f.nt == 2 && !strcmp(f.top[0].title, "Ticket 6701") && f.top[0].nd == 1 && !strcmp(f.top[1].title, "Orders"));
+    /* contract: data in, data out -- the text as given, as far as it is kept */
     CHECK(f.nt == 2 && f.top[1].para.text && !strcmp(f.top[1].para.text, "Four orders were cancelled."));
     oc_sum_final_free(&f);
 
@@ -269,18 +427,28 @@ static void test_parse(void) {
                              "## Needs attention\n"
                              "- [2] question: Ann asked who has the ticket.\n"
                              "## More topics: Orders; Returns\n", &both, &cf, &f, &dropped) == 0);
+    /* contract: data in, data out -- the topic as titled */
     CHECK(f.nt == 1 && !strcmp(f.top[0].title, "Ticket 6701"));
     CHECK(f.na == 1 && f.nm == 2 && !strcmp(f.more[1], "Returns"));
     oc_sum_final_free(&f);
 
     /* Cutting a part: at the last whole sentence that fits, else at a word. */
     char t1[] = "One two three. Four five six seven.";
+    /* contract: data in, data out -- the text as given, as far as it is kept */
     CHECK(oc_sum_cut_words(t1, 5) == 1 && !strcmp(t1, "One two three."));
     char t2[] = "One two three four five six.";
+    /* contract: data in, data out -- the text as given, as far as it is kept */
     CHECK(oc_sum_cut_words(t2, 3) == 1 && !strcmp(t2, "One two three"));
     CHECK(oc_sum_cut_words(t2, 9) == 0);
-    CHECK(oc_sum_rewrite_prompt("Too long a part.", 3, &prompt, &g) == 0);
-    CHECK(strstr(prompt.p, "This is 4 words:") && strstr(prompt.p, "at most 3 words") && strstr(g.p, "{3,24}"));
+    {
+        /* The whole prompt is the rewrite's constant over the part, its words and the cap. */
+        const char *part = "Too long a part.";
+        char want[512];
+        snprintf(want, sizeof want, SUM_REWRITE_ASK, (size_t)4, part, 3);
+        CHECK(oc_sum_words(part) == 4);
+        CHECK(oc_sum_rewrite_prompt(part, 3, &prompt, &g) == 0);
+        CHECK(prompt.p && !strcmp(prompt.p, want) && strstr(g.p, "{3,24}"));
+    }
     oc_sum_buf_free(&prompt);
     oc_sum_buf_free(&g);
 
@@ -378,7 +546,8 @@ static int count_nodes(sqlite3 *db) {
 }
 
 static void test_store(void) {
-    const char *path = "/tmp/oc_test_summary_store.db";
+    char pathb[320];
+    const char *path = db_at("store.db", pathb, sizeof pathb);
     sqlite3 *db = fresh_db(path);
     CHECK(db != NULL);
     if (!db) return;
@@ -388,6 +557,7 @@ static void test_store(void) {
 
     oc_sum_window w;
     CHECK(oc_sum_load_window(db, 1, 0, 86400000, &w) == 0);
+    /* contract: data in, data out -- the channel and author as stored */
     CHECK(w.n == 2 && !strcmp(w.channel, "support") && !strcmp(w.msgs[1].author, "Bob"));
     oc_sum_window_free(&w);
 
@@ -497,6 +667,14 @@ typedef struct {
     int fail_finals;   /* the first this many summary calls fail outright */
     int runaway_finals; /* the first this many summary calls run away (hit their rail) */
 } stub;
+/* The stub's own words, which a test finds again where they are passed on:
+ * tokens of its own, not sentences. A long answer's detail, forty times over. */
+#define STUB_DOWN    "stub-model-down"
+#define STUB_RUNAWAY "stub-ran-away"
+/* The long answer's detail, and a phrase from it to find in a stored summary:
+ * test data the stub writes, so finding it is finding the stub's own words. */
+#define LONG_MARK    "after the usual discussion"
+#define LONG_DETAIL  "- [1] They agreed to ship it on the day they had planned, " LONG_MARK ".\n"
 static void *s_open(void *ctx, char *err, size_t cap) { (void)err; (void)cap; return ctx; }
 static void s_close(void *h) { (void)h; }
 static int s_run(void *h, const char *system, const char *user, const char *grammar, int max_out,
@@ -508,10 +686,12 @@ static int s_run(void *h, const char *system, const char *user, const char *gram
     s->calls++;
     if (system != OC_SUM_SYSTEM) s->other_system++;
     oc_sum_buf b = {0};
+    /* contract: the grammar's rules (GBNF) say which answer is asked for */
     if (grammar && strstr(grammar, "note ::=")) {
-        if (strstr(user, "Messages from")) s->leaf++;
-        else if (strstr(user, "Notes on consecutive parts")) s->merge++;
-        else if (strstr(user, "One long message")) s->part++;
+        /* Which stage, by the intro it opens with (sum_core.h). */
+        if (opens_with_fmt(user, SUM_INTRO_MESSAGES)) s->leaf++;
+        else if (opens_with_fmt(user, SUM_INTRO_NOTES)) s->merge++;
+        else if (opens_with_fmt(user, SUM_INTRO_PART)) s->part++;
         /* As many notes as the grammar allows ("note{1,N}"), when fat. */
         const char *brace = strstr(grammar, "note{1,");
         int n = s->fat && brace ? atoi(brace + 7) : 1;
@@ -520,32 +700,38 @@ static int s_run(void *h, const char *system, const char *user, const char *gram
                                   "as discussed at length by everyone involved in the thread, after the usual "
                                   "back and forth about what was ready and what was not and who would do it.\n",
                               'a' + i, 'a' + i);
-    } else if (grammar && strstr(grammar, "ov ::=") && strstr(user, "This summary is")) {
+    /* contract: the grammar's rules (GBNF) say which answer is asked for */
+    } else if (grammar && strstr(grammar, "ov ::=") && opens_with_fmt(user, SUM_SHORTEN_HEAD)) {
         /* Asked to write it again shorter: shorter it is, unless still told
          * to write long. */
         s->shorten++;
         if (s->long_finals > 0) {
             s->long_finals--;
             oc_sum_buf_puts(&b, "Overview: [1] They agreed to ship.\n## Plan\n[1] They agreed to ship.\n");
-            for (int i = 0; i < 40; i++)
-                oc_sum_buf_puts(&b, "- [1] They agreed to ship it on the day they had planned, after the usual discussion.\n");
+            for (int i = 0; i < 40; i++) oc_sum_buf_puts(&b, LONG_DETAIL);
         } else {
             oc_sum_buf_puts(&b, "Overview: [1] They agreed to ship.\n## Plan\n[1] They agreed to ship.\n- [1] agreed\n");
         }
+    /* contract: the grammar's rules (GBNF) */
     } else if (grammar && strstr(grammar, "ov ::=")) {
         s->final++;
-        if (s->fail_finals > 0) { s->fail_finals--; snprintf(err, cap, "the server is down"); return -1; }
+        if (s->fail_finals > 0) {
+            s->fail_finals--;
+            snprintf(err, cap, "%s", STUB_DOWN);
+            if (st) st->fail = OC_SUM_FAIL_MODEL;
+            return -1;
+        }
         if (s->runaway_finals > 0) {
             s->runaway_finals--;
             *out = strdup("!!!!!!!!!!!!");
-            snprintf(err, cap, "the answer reached its %d tokens without ending", max_out);
+            snprintf(err, cap, "%s %d", STUB_RUNAWAY, max_out);
+            if (st) st->fail = OC_SUM_FAIL_RUNAWAY;
             return -1;
         }
         if (s->long_finals > 0) {
             s->long_finals--;
             oc_sum_buf_puts(&b, "Overview: [1] They agreed to ship.\n## Plan\n[1] They agreed to ship.\n");
-            for (int i = 0; i < 40; i++)
-                oc_sum_buf_puts(&b, "- [1] They agreed to ship it on the day they had planned, after the usual discussion.\n");
+            for (int i = 0; i < 40; i++) oc_sum_buf_puts(&b, LONG_DETAIL);
         } else {
             oc_sum_buf_puts(&b, "Overview: [1] They agreed to ship.\n## Plan\n[1] They agreed to ship.\n- [1] agreed\n");
         }
@@ -587,7 +773,7 @@ static int count_where(sqlite3 *db, const char *sql) {
 }
 
 static void drop_db(const char *path) {
-    char p[160];
+    char p[400];
     unlink(path);
     snprintf(p, sizeof p, "%s-wal", path);
     unlink(p);
@@ -596,7 +782,8 @@ static void drop_db(const char *path) {
 }
 
 static void test_build(void) {
-    const char *path = "/tmp/oc_test_summary_build.db";
+    char pathb[320];
+    const char *path = db_at("build.db", pathb, sizeof pathb);
     sqlite3 *db = fresh_db(path);
     CHECK(db != NULL);
     if (!db) return;
@@ -614,8 +801,17 @@ static void test_build(void) {
     /* A span that fits one prompt is summarized from its messages, in one call. */
     CHECK(oc_sum_build_now(&cfg, 1, 0, 2 * 86400000ll, 0, err, sizeof err) == 0);
     CHECK(s.calls == 1 && s.final == 1 && s.leaf == 0 && s.other_system == 0);
-    CHECK(strstr(k.last, "{\"summary\":{\"overview\":{\"text\":\"They agreed to ship.\",\"refs\":[1]}") != NULL);
-    CHECK(strstr(k.last, "\"count\":1,\"people\":[\"Ann\"]") != NULL);
+    {
+        /* What the client is sent: the stub's overview, citing message 1; the
+         * topic covers one message, by Ann. */
+        oc_json d;
+        static const long long r1[] = { 1 };
+        CHECK(jparse(&d, k.last) == 0 && jis(&d, "summary.overview.text", "They agreed to ship.") &&
+              jints(&d, "summary.overview.refs", r1, 1));
+        CHECK(jprim(&d, "summary.topics[0].count", "1") && jlen(&d, "summary.topics[0].people") == 1 &&
+              jis(&d, "summary.topics[0].people[0]", "Ann"));
+        oc_json_free(&d);
+    }
     /* Again: found, nothing asked. */
     int before = s.calls;
     CHECK(oc_sum_build_now(&cfg, 1, 0, 2 * 86400000ll, 0, err, sizeof err) == 0);
@@ -639,7 +835,12 @@ static void test_build(void) {
     /* An empty span: no call, an empty summary. */
     before = s.calls;
     CHECK(oc_sum_build_now(&cfg, 1, 10 * 86400000ll, 11 * 86400000ll, 0, err, sizeof err) == 0);
-    CHECK(s.calls == before && strstr(k.last, "\"topics\":[]") != NULL);
+    {
+        oc_json d;
+        char sp[64];
+        CHECK(s.calls == before && jparse(&d, k.last) == 0 && jlen(&d, spath(&d, "topics", sp, sizeof sp)) == 0);
+        oc_json_free(&d);
+    }
 
     /* A summary far over its total is handed back once to be written shorter;
      * the shorter answer is the one stored, and the call is counted. */
@@ -648,7 +849,12 @@ static void test_build(void) {
     before = s.calls;
     CHECK(oc_sum_build_now(&cfg, 1, 2 * 86400000ll + 12 * 3600000, 3 * 86400000ll, 0, err, sizeof err) == 0);
     CHECK(s.calls == before + 2 && s.shorten == 1 && k.rewrites == 1);
-    CHECK(strstr(k.last, "after the usual discussion") == NULL);
+    {
+        /* The shorter answer is the one stored: something was stored, and none
+         * of the long answer's details are in it. */
+        CHECK(k.last[0] != '\0');
+        CHECK(strstr(k.last, LONG_MARK) == NULL);
+    }
     /* Written again no shorter: the first answer stands, trimmed to its
      * total, and there is still only the one extra call. */
     add_msg(db, 8, 0, 11, 61 * 3600000, "Noted.");
@@ -677,7 +883,7 @@ static void test_build(void) {
     s.runaway_finals = 2;
     before = s.calls;
     CHECK(oc_sum_build_now(&cfg, 1, 2 * 86400000ll + 12 * 3600000, 3 * 86400000ll + 3, 0, err, sizeof err) == -1);
-    CHECK(s.calls == before + 2 && strstr(err, "without ending") != NULL);
+    CHECK(s.calls == before + 2 && strstr(err, STUB_RUNAWAY) != NULL);   /* the engine's reason, passed on */
     s.runaway_finals = 0;
 
     /* A build whose final call fails keeps the chunk notes it made: the next
@@ -693,7 +899,7 @@ static void test_build(void) {
     before = s.calls;
     int leaf_before = s.leaf;
     CHECK(oc_sum_build_now(&cfg, 1, 6 * 86400000ll, 7 * 86400000ll, 0, err, sizeof err) == -1);
-    CHECK(strstr(err, "the server is down") != NULL);
+    CHECK(strstr(err, STUB_DOWN) != NULL);   /* the engine's reason, passed on */
     int made = s.leaf - leaf_before;
     CHECK(made >= 2);
     CHECK(count_where(db, "SELECT COUNT(*) FROM summary_nodes WHERE kind=0 AND start_ms>=518400000 AND start_ms<604800000;") == made);
@@ -711,7 +917,8 @@ static void test_build(void) {
  * is, it ends. A thread and a message too big for a chunk are merged to one
  * node the same way. */
 static void test_recursion(void) {
-    const char *path = "/tmp/oc_test_summary_recursion.db";
+    char pathb[320];
+    const char *path = db_at("recursion.db", pathb, sizeof pathb);
     sqlite3 *db = fresh_db(path);
     CHECK(db != NULL);
     if (!db) return;
@@ -791,9 +998,9 @@ static int q_run(void *h, const char *system, const char *user, const char *gram
             snprintf(err, cap, "stopped");
             return -1;
         }
-        struct timespec ts = { 0, 2 * 1000000L };
-        nanosleep(&ts, NULL);
+        oc_test_let_time_pass(2);   /* a model at work: each step takes a moment */
     }
+    /* contract: the grammar's rules (GBNF) say which answer is asked for */
     *out = strdup(grammar && strstr(grammar, "note ::=") ? "- [1] decision | plans | They agreed.\n"
                                                          : "Overview: [1] They agreed.\n## Plans\n[1] They agreed.\n");
     return 0;
@@ -832,20 +1039,17 @@ static int64_t now_ms(void) {
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* `*v` reaches `want_at_least` before a deadline on the monotonic clock. */
 static int wait_for(volatile int *v, int want_at_least, int seconds) {
-    for (int i = 0; i < seconds * 100; i++) {
-        if (__atomic_load_n(v, __ATOMIC_ACQUIRE) >= want_at_least) return 1;
-        struct timespec ts = { 0, 10 * 1000000L };
-        nanosleep(&ts, NULL);
-    }
-    return 0;
+    return WAIT_UNTIL(__atomic_load_n(v, __ATOMIC_ACQUIRE) >= want_at_least, (uint64_t)seconds * 1000u);
 }
 
 /* Idle work summarizes what is recent and leaves the old for when someone asks;
  * a request in the queue (summary_requests) stops idle work mid-answer and is
  * made, and the idle work is done after. */
 static void test_queue(void) {
-    const char *path = "/tmp/oc_test_summary_queue.db";
+    char pathb[320];
+    const char *path = db_at("queue.db", pathb, sizeof pathb);
     drop_db(path);
     sqlite3 *db = fresh_db(path);
     CHECK(db != NULL);
@@ -867,6 +1071,8 @@ static void test_queue(void) {
     cfg.sink.take = q_take;
     cfg.sink.ctx = &k;
     cfg.background = 1;
+    __atomic_store_n(&g_q_stopped, 0, __ATOMIC_RELEASE);   /* this test's own counts */
+    __atomic_store_n(&g_q_calls, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_q_hold, 1, __ATOMIC_RELEASE);
     char err[256] = "";
     oc_sum_worker *w = oc_sum_worker_start(&cfg, err, sizeof err);
@@ -900,7 +1106,8 @@ static void test_queue(void) {
  * made when it stopped waits again at the next start, watched by nobody, and a
  * notice left unseen is still there. */
 static void test_requeue_at_start(void) {
-    const char *path = "/tmp/oc_test_summary_requeue.db";
+    char pathb[320];
+    const char *path = db_at("requeue.db", pathb, sizeof pathb);
     drop_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
     if (w) oc_dbwriter_set_pw_mem(w, 2048);   /* a cheap Argon2id for tests */
@@ -930,7 +1137,8 @@ static void test_requeue_at_start(void) {
 /* A notice seen more than a day ago is deleted by the storage sweep; one seen
  * within the day, and one never seen however old, stay (SUMMARIES.md §5). */
 static void test_notice_prune(void) {
-    const char *path = "/tmp/oc_test_summary_prune.db";
+    char pathb[320];
+    const char *path = db_at("prune.db", pathb, sizeof pathb);
     drop_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
     if (w) oc_dbwriter_set_pw_mem(w, 2048);   /* a cheap Argon2id for tests */
@@ -953,7 +1161,7 @@ static void test_notice_prune(void) {
         j->maint_batch = 8;
         oc_dbwriter_submit(w, j);
         oc_dbres *r = NULL;
-        for (int i = 0; i < 400 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        CHECK(WAIT_UNTIL((r = oc_dbwriter_next_result(w)) != NULL, 5000));
         CHECK(r != NULL);
         if (r) oc_dbres_free(r);
     }
@@ -976,7 +1184,8 @@ static int r_run(void *h, const char *system, const char *user, const char *gram
 }
 
 static void test_remote_ungated(void) {
-    const char *path = "/tmp/oc_test_summary_remote.db";
+    char pathb[320];
+    const char *path = db_at("remote.db", pathb, sizeof pathb);
     drop_db(path);
     sqlite3 *db = fresh_db(path);
     CHECK(db != NULL);
@@ -1018,7 +1227,8 @@ static void test_remote_ungated(void) {
  * id 0) and the messages the details cite. Call events and deleted messages are
  * neither summarized nor counted. */
 static void test_client_body(void) {
-    const char *path = "/tmp/oc_test_summary_client.db";
+    char pathb[320];
+    const char *path = db_at("client.db", pathb, sizeof pathb);
     sqlite3 *db = fresh_db(path);
     CHECK(db != NULL);
     if (!db) return;
@@ -1034,6 +1244,7 @@ static void test_client_body(void) {
     oc_sum_window w;
     CHECK(oc_sum_load_window(db, 1, 0, 10000, &w) == 0);
     CHECK(w.n == 4);
+    /* contract: data in, data out -- the text as given, as far as it is kept */
     if (w.n == 4) CHECK(!strcmp(w.msgs[2].author, "PartsFisher") && !strcmp(w.msgs[2].text, "Order 56 cancelled."));
     oc_sum_window_free(&w);
     const char *body =
@@ -1044,13 +1255,23 @@ static void test_client_body(void) {
     char *cb = oc_sum_client_body(db, body, 1, 0, 10000);
     CHECK(cb != NULL);
     if (cb) {
-        CHECK(!strncmp(cb, "{\"summary\":{\"overview\":", 23));
-        CHECK(strstr(cb, ",\"posters\":[{\"id\":0,\"name\":\"PartsFisher\"},{\"id\":10,\"name\":\"Ann\"},"
-                         "{\"id\":11,\"name\":\"Bob\"}],\"count\":4,") != NULL);
-        CHECK(strstr(cb, "\"sources\":{\"1\":{\"author\":\"Ann\",\"author_id\":10,\"at\":1000,\"parent\":0,"
-                         "\"text\":\"Order 55 is in.\"},\"3\":{\"author\":\"PartsFisher\",\"author_id\":0,\"at\":3000,"
-                         "\"parent\":0,\"text\":\"Order 56 cancelled.\"},\"4\":") != NULL);
-        CHECK(strstr(cb, "\"6\":") == NULL);   /* deleted: not a source */
+        /* Read as JSON: the summary; who posted, most first, the
+         * integration as id 0; the count; and the cited messages. */
+        oc_json d;
+        CHECK(jparse(&d, cb) == 0 && jtok(&d, "summary.overview") >= 0);
+        CHECK(jlen(&d, "posters") == 3 &&
+              jprim(&d, "posters[0].id", "0") && jis(&d, "posters[0].name", "PartsFisher") &&
+              jprim(&d, "posters[1].id", "10") && jis(&d, "posters[1].name", "Ann") &&
+              jprim(&d, "posters[2].id", "11") && jis(&d, "posters[2].name", "Bob"));
+        CHECK(jprim(&d, "count", "4"));
+        CHECK(jis(&d, "sources.1.author", "Ann") && jprim(&d, "sources.1.author_id", "10") &&
+              jprim(&d, "sources.1.at", "1000") && jprim(&d, "sources.1.parent", "0") &&
+              jis(&d, "sources.1.text", "Order 55 is in."));
+        CHECK(jis(&d, "sources.3.author", "PartsFisher") && jprim(&d, "sources.3.author_id", "0") &&
+              jprim(&d, "sources.3.at", "3000") && jprim(&d, "sources.3.parent", "0") &&
+              jis(&d, "sources.3.text", "Order 56 cancelled."));
+        CHECK(jtok(&d, "sources.4") >= 0 && jtok(&d, "sources.6") < 0);   /* cited; deleted: not a source */
+        oc_json_free(&d);
     }
     free(cb);
     sqlite3_close(db);
@@ -1060,10 +1281,11 @@ static void test_client_body(void) {
 /* --- the hosted engine --------------------------------------------------------- */
 
 /* One HTTP exchange on loopback: the request kept, a canned answer sent. */
-/* `hold`: seconds the connection stays open after the answer, as a proxy may
- * keep it. */
+/* `hold`: the connection stays open after the answer, as a proxy may keep it,
+ * until the test sets `released` (or a deadline passes); `closed` once it is
+ * closed. */
 typedef struct {
-    int fd; int hold; const char *answer; char req[16384];
+    int fd; int hold; volatile int released, closed; const char *answer; char req[16384];
     const char *answers[8]; int n;   /* a sequence, for fake_api_serve_n */
     int status;                      /* the status sent: 0 for 200 */
     int statuses[8];                 /* one a step of the sequence; 0 for 200 */
@@ -1082,6 +1304,7 @@ static void *fake_api_serve(void *arg) {
         n += (size_t)r;
         f->req[n] = '\0';
         char *h = strstr(f->req, "\r\n\r\n");
+        /* contract: HTTP framing */
         char *cl = strstr(f->req, "Content-Length: ");
         if (h && cl && (size_t)(h + 4 - f->req) + (size_t)atoi(cl + 16) <= n) break;
     }
@@ -1092,8 +1315,9 @@ static void *fake_api_serve(void *arg) {
                       strlen(f->answer), ra);
     f->served++;
     if (write(c, head, (size_t)hn) < 0 || write(c, f->answer, strlen(f->answer)) < 0) {}
-    if (f->hold) sleep((unsigned)f->hold);
+    if (f->hold) WAIT_UNTIL(__atomic_load_n(&f->released, __ATOMIC_ACQUIRE), 10000);
     close(c);
+    __atomic_store_n(&f->closed, 1, __ATOMIC_RELEASE);
     return NULL;
 }
 
@@ -1124,6 +1348,26 @@ static void *fake_api_serve_n(void *arg) {
     return NULL;
 }
 
+/* The JSON body of the request the fake API kept, parsed into `d`. */
+static int req_json(const fake_api *f, oc_json *d) {
+    const char *b = strstr(f->req, "\r\n\r\n");
+    return b ? jparse(d, b + 4) : -1;
+}
+/* Every field of the request is one a standard chat-completions API reads. */
+static int only_standard(const oc_json *d) {
+    static const char *const STD[] = { "model", "messages", "stream", "temperature", "max_tokens" };
+    if (d->n < 1 || d->t[0].type != JSMN_OBJECT) return 0;
+    for (int k = 0, i = 1; k < d->t[0].size; k++) {
+        char key[64];
+        int known = 0;
+        if (oc_json_str(d, i, key, sizeof key) != 0) return 0;
+        for (size_t j = 0; j < sizeof STD / sizeof *STD; j++) known |= !strcmp(key, STD[j]);
+        if (!known) return 0;
+        i = oc_json_skip(d, i + 1);   /* past the key's value */
+    }
+    return 1;
+}
+
 #define PLAIN_OK "{\"choices\":[{\"message\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]," \
                  "\"usage\":{\"completion_tokens\":1,\"completion_tokens_details\":{\"reasoning_tokens\":0}}}"
 #define REASONED "{\"choices\":[{\"message\":{\"content\":\"\"},\"finish_reason\":\"length\"}]," \
@@ -1147,39 +1391,51 @@ static void test_cloud(void) {
     void *h = e->open(e->ctx, err, sizeof err);
     pthread_join(t, NULL);
     CHECK(h != NULL);
-    CHECK(strstr(f.req, "\"content\":\"Say OK.\"") && strstr(f.req, "\"max_tokens\":16}"));
-    CHECK(strstr(f.req, "reasoning") == NULL);
+    {
+        oc_json d;
+        CHECK(req_json(&f, &d) == 0 && jlen(&d, "messages") == 2 && jprim(&d, "max_tokens", "16") && only_standard(&d));
+        oc_json_free(&d);
+    }
     CHECK(e->open(e->ctx, err, sizeof err) == h);
 
     /* An answer: its text, tokens and the server's own timings. */
     f.answer = "{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"- [1] a | b\\nc\"},"
                "\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":7},"
                "\"timings\":{\"prompt_n\":120,\"prompt_ms\":35.5,\"predicted_n\":7,\"predicted_ms\":410.25}}";
-    f.hold = 3;
+    f.hold = 1;
+    f.released = 0;
+    f.closed = 0;
     pthread_create(&t, NULL, fake_api_serve, &f);
     char *out = NULL;
     oc_sum_run_stats st;
     int rc = e->run(h, "sys \"q\"", "line one\nline two", "root ::= \"x\"", 300, NULL, NULL, &out, &st, err, sizeof err);
-    /* The whole answer is in hand before the server lets go of the connection. */
-    CHECK(st.wall_ms < 2000);
+    /* The whole answer is in hand before the server lets go of the
+     * connection: the run returned while it still holds it. */
+    CHECK(!__atomic_load_n(&f.closed, __ATOMIC_ACQUIRE));
+    __atomic_store_n(&f.released, 1, __ATOMIC_RELEASE);
     pthread_join(t, NULL);
     f.hold = 0;
     CHECK(rc == 0);
-    CHECK(out && !strcmp(out, "- [1] a | b\nc"));
+    CHECK(out && !strcmp(out, "- [1] a | b\nc"));   /* contract: the fake API's answer, data in, data out */
     CHECK(st.prompt_tokens == 120 && st.output_tokens == 7 && st.read_ms == 35 && st.write_ms == 410);
     free(out);
     /* What was sent: the endpoint, the key, both prompts, the answer cap and
      * greedy decoding; nothing a standard API would not read, and no grammar. */
+    /* contract: the request line and the bearer header, HTTP's own bytes */
     CHECK(!strncmp(f.req, "POST /v1/chat/completions HTTP/1.1\r\n", 36));
-    CHECK(strstr(f.req, "Authorization: Bearer k-2\r\n") != NULL);
-    CHECK(strstr(f.req, "\"model\":\"m-1\"") != NULL);
-    CHECK(strstr(f.req, "{\"role\":\"system\",\"content\":\"sys \\\"q\\\"\"}") != NULL);
-    CHECK(strstr(f.req, "{\"role\":\"user\",\"content\":\"line one\\nline two\"}") != NULL);
-    CHECK(strstr(f.req, "\"stream\":false,\"temperature\":0,\"max_tokens\":300}") != NULL);
-    CHECK(strstr(f.req, "\"grammar\"") == NULL);
-    CHECK(strstr(f.req, "dry_") == NULL && strstr(f.req, "samplers") == NULL);
-    CHECK(strstr(f.req, "chat_template_kwargs") == NULL);
-    CHECK(strstr(f.req, "\"reasoning\"") == NULL);
+    CHECK(strstr(f.req, "Authorization: Bearer k-2\r\n") != NULL);   /* contract: HTTP header */
+    {
+        /* The body, read as JSON: the chat-completions fields and no others. */
+        oc_json d;
+        CHECK(req_json(&f, &d) == 0);
+        CHECK(jis(&d, "model", "m-1"));
+        CHECK(jlen(&d, "messages") == 2 && jis(&d, "messages[0].role", "system") &&
+              jis(&d, "messages[0].content", "sys \"q\"") && jis(&d, "messages[1].role", "user") &&
+              jis(&d, "messages[1].content", "line one\nline two"));
+        CHECK(jprim(&d, "stream", "false") && jprim(&d, "temperature", "0") && jprim(&d, "max_tokens", "300"));
+        CHECK(jlen(&d, "") == 5 && only_standard(&d));   /* model, messages, stream, temperature, max_tokens */
+        oc_json_free(&d);
+    }
 
     /* A thinking model's reasoning is dropped; the answer is what follows it. */
     f.answer = "{\"choices\":[{\"message\":{\"content\":\"<think>\\nhmm\\n</think>\\n\\n- [1] a | b\"},"
@@ -1199,10 +1455,13 @@ static void test_cloud(void) {
     out = NULL;
     rc = e->run(h, "s", "u", NULL, 5, NULL, NULL, &out, &st, err, sizeof err);
     pthread_join(t, NULL);
-    CHECK(rc == -1);
-    CHECK(strstr(err, "reached its 5 tokens") != NULL);
+    CHECK(rc == -1 && st.fail == OC_SUM_FAIL_RUNAWAY);
     CHECK(out && !strcmp(out, "- [1] a | b"));
-    CHECK(strstr(f.req, "\"grammar\"") == NULL);
+    {
+        oc_json d;
+        CHECK(req_json(&f, &d) == 0 && jprim(&d, "max_tokens", "5") && jtok(&d, "grammar") < 0);
+        oc_json_free(&d);
+    }
     free(out);
 
     /* A refusal is a reason, not an answer. */
@@ -1211,8 +1470,7 @@ static void test_cloud(void) {
     out = NULL;
     rc = e->run(h, "s", "u", NULL, 5, NULL, NULL, &out, &st, err, sizeof err);
     pthread_join(t, NULL);
-    CHECK(rc == -1 && out == NULL);
-    CHECK(strstr(err, "no choices") != NULL);
+    CHECK(rc == -1 && out == NULL && st.fail == OC_SUM_FAIL_NO_CHOICES);
     e->close(h);
 
     /* A model that reasons first: the one-line prompt comes back empty with
@@ -1227,14 +1485,22 @@ static void test_cloud(void) {
     h = e->open(e->ctx, err, sizeof err);
     pthread_join(t, NULL);
     CHECK(h != NULL);
-    CHECK(strstr(f.req, ",\"reasoning\":{\"enabled\":false}}") != NULL);
+    {
+        oc_json d;   /* the second field tried, honoured */
+        CHECK(req_json(&f, &d) == 0 && jprim(&d, "reasoning.enabled", "false") && jtok(&d, "reasoning_effort") < 0);
+        oc_json_free(&d);
+    }
     f.answer = "{\"choices\":[{\"message\":{\"content\":\"- [1] a | b\"},\"finish_reason\":\"stop\"}]}";
     pthread_create(&t, NULL, fake_api_serve, &f);
     out = NULL;
     rc = e->run(h, "s", "u", NULL, 40, NULL, NULL, &out, &st, err, sizeof err);
     pthread_join(t, NULL);
     CHECK(rc == 0 && out && !strcmp(out, "- [1] a | b"));
-    CHECK(strstr(f.req, "\"max_tokens\":40,\"reasoning\":{\"enabled\":false}}") != NULL);
+    {
+        oc_json d;   /* and carried by every request from then on */
+        CHECK(req_json(&f, &d) == 0 && jprim(&d, "max_tokens", "40") && jprim(&d, "reasoning.enabled", "false"));
+        oc_json_free(&d);
+    }
     free(out);
     e->close(h);
 
@@ -1258,14 +1524,22 @@ static void test_cloud(void) {
     pthread_join(t, NULL);
     CHECK(rc == 0 && out && !strcmp(out, "- [1] a | b"));
     CHECK(st.output_tokens == 6);
-    CHECK(strstr(f.req, "\"max_tokens\":40,\"reasoning_effort\":\"none\"}") != NULL);
+    {
+        oc_json d;
+        CHECK(req_json(&f, &d) == 0 && jprim(&d, "max_tokens", "40") && jis(&d, "reasoning_effort", "none"));
+        oc_json_free(&d);
+    }
     free(out);
     f.answer = "{\"choices\":[{\"message\":{\"content\":\"- [2] c | d\"},\"finish_reason\":\"stop\"}]}";
     pthread_create(&t, NULL, fake_api_serve, &f);
     out = NULL;
     rc = e->run(h, "s", "u", NULL, 40, NULL, NULL, &out, &st, err, sizeof err);
     pthread_join(t, NULL);
-    CHECK(rc == 0 && strstr(f.req, "\"reasoning_effort\":\"none\"}") != NULL);
+    {
+        oc_json d;
+        CHECK(rc == 0 && req_json(&f, &d) == 0 && jis(&d, "reasoning_effort", "none"));
+        oc_json_free(&d);
+    }
     free(out);
     e->close(h);
 
@@ -1276,8 +1550,7 @@ static void test_cloud(void) {
     pthread_create(&t, NULL, fake_api_serve_n, &f);
     h = e->open(e->ctx, err, sizeof err);
     pthread_join(t, NULL);
-    CHECK(h == NULL);
-    CHECK(strstr(err, "reasons before answering and cannot be told not to") != NULL);
+    CHECK(h == NULL && oc_sum_cloud_open_fail(e) == OC_SUM_FAIL_REASONS && err[0]);
 
     /* A server that asks for a pause: the same request is sent again after
      * the wait it names, and the retry is counted. */
@@ -1297,12 +1570,12 @@ static void test_cloud(void) {
     f.served = 0;
     pthread_create(&t, NULL, fake_api_serve_n, &f);
     out = NULL;
-    uint32_t t0 = (uint32_t)time(NULL);
+    uint64_t t0 = oc_test_mono_ms();
     rc = e->run(h, "s", "u", NULL, 40, NULL, NULL, &out, &st, err, sizeof err);
     pthread_join(t, NULL);
     CHECK(rc == 0 && out && !strcmp(out, "- [1] a | b"));
     CHECK(st.retries == 1 && st.wait_ms == 1000 && f.served == 2);
-    CHECK((uint32_t)time(NULL) - t0 >= 1);
+    CHECK(oc_test_mono_ms() - t0 >= 990);   /* the wait named was waited (a floor, not a speed) */
     free(out);
     /* A 503 the same way. */
     f.statuses[0] = 503;
@@ -1323,7 +1596,7 @@ static void test_cloud(void) {
     out = NULL;
     rc = e->run(h, "s", "u", NULL, 40, NULL, NULL, &out, &st, err, sizeof err);
     pthread_join(t, NULL);
-    CHECK(rc == -1 && strstr(err, "answered 429") != NULL);
+    CHECK(rc == -1 && st.fail == OC_SUM_FAIL_STATUS && st.status == 429);
     CHECK(st.retries == 5 && f.served == 6);
     /* A 400 is not tried again. */
     f.answers[0] = "{\"error\":{\"message\":\"bad request\"}}";
@@ -1334,7 +1607,7 @@ static void test_cloud(void) {
     out = NULL;
     rc = e->run(h, "s", "u", NULL, 40, NULL, NULL, &out, &st, err, sizeof err);
     pthread_join(t, NULL);
-    CHECK(rc == -1 && strstr(err, "answered 400") != NULL && st.retries == 0 && f.served == 1);
+    CHECK(rc == -1 && st.fail == OC_SUM_FAIL_STATUS && st.status == 400 && st.retries == 0 && f.served == 1);
     f.retry_after = NULL;
     e->close(h);
 
@@ -1349,13 +1622,14 @@ static void test_cloud(void) {
     out = NULL;
     rc = e->run(h, "s", "u", NULL, 40, NULL, NULL, &out, &st, err, sizeof err);
     pthread_join(t, NULL);
-    CHECK(rc == -1 && strstr(err, "no text") != NULL);
+    CHECK(rc == -1 && st.fail == OC_SUM_FAIL_NO_TEXT);
     free(out);
     e->close(h);
     close(f.fd);
 }
 
 int run_summary_tests(void) {
+    CHECK(oc_test_mkdtemp("summary", g_dir, sizeof g_dir) == 0);
     test_cut();
     test_parse();
     test_split();
@@ -1370,5 +1644,6 @@ int run_summary_tests(void) {
     test_notice_prune();
     test_client_body();
     test_cloud();
+    oc_test_rmtree(g_dir);
     return failures;
 }

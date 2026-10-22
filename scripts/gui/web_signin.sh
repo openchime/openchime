@@ -197,7 +197,7 @@ grep -q '^signin .*copied=1' <<<"$(state w1-copied)" || fail "the card does not 
 echo "ok: the sign-in link copies from the card"
 R="$(qget "$URL" redirect_uri)"; N="$(qget "$URL" nonce)"
 OUTP="$(browser "$URL" signup "invite=$TOKEN&username=owen&password=lantern-orchard-copper&confirm=lantern-orchard-copper&redirect_uri=$(enc "$R")&nonce=$N")"
-grep -q 'You are signed in' <<<"$OUTP" || fail "sign-up did not reach the callback: $OUTP"
+grep -qF 'data-oc-result="signed-in"' <<<"$OUTP" || fail "sign-up did not reach the callback: $OUTP"
 for _ in $(seq 1 50); do S="$(state w2)"; grep -q '^authed=1' <<<"$S" && break; sleep 0.2; done
 grep -q '^authed=1' <<<"$S" || fail "not signed in after sign-up"
 drive shotfull web-2-signed-in
@@ -209,7 +209,7 @@ drive menu 31
 URL="$(await_url)" || fail "no password page URL"
 case "$URL" in http://127.0.0.1:*/p/*/account/password*) ;; *) fail "not a tunnel password URL: $URL" ;; esac
 OUTP="$(browser "$URL" password "username=owen&current=lantern-orchard-copper&password=granite-harbor-violet&confirm=granite-harbor-violet")"
-grep -q 'Password changed' <<<"$OUTP" || fail "the password was not changed: $OUTP"
+grep -qF 'data-oc-result="password-changed"' <<<"$OUTP" || fail "the password was not changed: $OUTP"
 # The change signs every device out, this one too: the client goes to the
 # sign-in card and says why.
 for _ in $(seq 1 50); do S="$(state w2s)"; grep -q '^view=100 ' <<<"$S" && break; sleep 0.2; done
@@ -243,9 +243,9 @@ case "$URL" in http://127.0.0.1:*/p/*/signin\?*) ;; *) fail "not a tunnel sign-i
 drive shotfull web-3-waiting
 R="$(qget "$URL" redirect_uri)"; N="$(qget "$URL" nonce)"
 OUTP="$(browser "$URL" signin "username=owen&password=lantern-orchard-copper&redirect_uri=$(enc "$R")&nonce=$N")"
-grep -q 'isn&#39;t right' <<<"$OUTP" || fail "the old password was not refused: $OUTP"
+grep -qF 'data-oc-error="bad-credentials"' <<<"$OUTP" || fail "the old password was not refused: $OUTP"
 OUTP="$(browser "$URL" signin "username=owen&password=granite-harbor-violet&redirect_uri=$(enc "$R")&nonce=$N")"
-grep -q 'You are signed in' <<<"$OUTP" || fail "the new password did not sign in: $OUTP"
+grep -qF 'data-oc-result="signed-in"' <<<"$OUTP" || fail "the new password did not sign in: $OUTP"
 for _ in $(seq 1 50); do S="$(state w3)"; grep -q '^authed=1' <<<"$S" && break; sleep 0.2; done
 grep -q '^authed=1' <<<"$S" || fail "not signed in with the new password"
 echo "ok: old password refused on the page, new one signed in"
@@ -313,7 +313,7 @@ OUTP="$(browser "$URL" reset "t=$RESET&password=pw-reset&confirm=pw-reset&redire
 grep -q 'Your new password is set' <<<"$OUTP" || fail "the reset did not go on to the sign-in: $OUTP"
 SIGNIN="${URL%%/account/reset*}/signin?redirect_uri=$(enc "$R")&nonce=$N"
 OUTP="$(browser "$SIGNIN" signin "username=owen&password=pw-reset&redirect_uri=$(enc "$R")&nonce=$N")"
-grep -q 'You are signed in' <<<"$OUTP" || fail "the new password did not sign in: $OUTP"
+grep -qF 'data-oc-result="signed-in"' <<<"$OUTP" || fail "the new password did not sign in: $OUTP"
 for _ in $(seq 1 50); do S="$(state w5)"; grep -q '^authed=1' <<<"$S" && break; sleep 0.2; done
 grep -q '^authed=1' <<<"$S" || fail "not signed in after the reset"
 echo "ok: reset code entered, password set on the page, signed in"

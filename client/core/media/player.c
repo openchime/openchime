@@ -48,6 +48,7 @@ struct oc_player {
     size_t         bgra_cap;
     uint64_t       frame_seq;
     uint64_t       presented, dropped;
+    uint64_t       seeks;              /* seeks finished */
     uint32_t       position_ms;
     uint32_t       frame_ms;
 
@@ -221,6 +222,7 @@ static void *player_main(void *arg) {
             w.running = was;
             oc_mutex_lock(&p->mu);
             if (p->state == OC_PLAYER_ENDED) p->state = OC_PLAYER_PAUSED;
+            p->seeks++;
             oc_mutex_unlock(&p->mu);
         }
         if (want && !w.running) {
@@ -341,6 +343,7 @@ void oc_player_status_get(oc_player *p, oc_player_status *st) {
     st->has_audio = p->speaker != NULL;
     st->presented = p->presented;
     st->dropped = p->dropped;
+    st->seeks = p->seeks;
     oc_mutex_unlock(&p->mu);
 }
 

@@ -2625,7 +2625,7 @@ static int await_auth(oc_client *cl, const char *host, char *why, size_t whycap)
         }
         if (m->last_error[0] && !m->connected && !(cert_err && m->error_seq == cert_err)) {
             snprintf(why, whycap, "%s", m->last_error);
-            return strstr(m->last_error, "reach") ? AUTH_R_UNREACHABLE : AUTH_R_FAILED;
+            return m->last_error_kind == OC_CERR_UNREACHABLE ? AUTH_R_UNREACHABLE : AUTH_R_FAILED;
         }
         if (m->device_code[0]) {
             /* A device code: the core polls for ten minutes, so this waits too.

@@ -548,17 +548,17 @@ void oc_loopback_answer(oc_loopback *lb, oc_loopback_outcome outcome, const char
     lb->held = -1;
     send_all(fd, PAGE_HEAD, sizeof PAGE_HEAD - 1);
     if (outcome == OC_LOOPBACK_SIGNED_IN) {
-        static const char B[] = "<h1 style=\"font-size:1.3em\">You are signed in</h1>"
+        static const char B[] = "<h1 style=\"font-size:1.3em\" data-oc-result=\"signed-in\">You are signed in</h1>"
                                 "<p>You can close this tab and go back to OpenChime.</p>";
         send_all(fd, B, sizeof B - 1);
     } else if (outcome == OC_LOOPBACK_REFUSED) {
-        static const char H[] = "<h1 style=\"font-size:1.3em\">You are not signed in</h1><p>";
+        static const char H[] = "<h1 style=\"font-size:1.3em\" data-oc-result=\"refused\">You are not signed in</h1><p>";
         static const char T[] = "</p><p>You can close this tab and go back to OpenChime.</p>";
         send_all(fd, H, sizeof H - 1);
         send_text(fd, why && why[0] ? why : "The workspace did not accept this sign-in.");
         send_all(fd, T, sizeof T - 1);
     } else {
-        static const char B[] = "<h1 style=\"font-size:1.3em\">Go back to OpenChime</h1>"
+        static const char B[] = "<h1 style=\"font-size:1.3em\" data-oc-result=\"pending\">Go back to OpenChime</h1>"
                                 "<p>You can close this tab. OpenChime shows how the sign-in went.</p>";
         send_all(fd, B, sizeof B - 1);
     }

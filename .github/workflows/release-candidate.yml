@@ -86,7 +86,7 @@ jobs:
         run: |
           set -euo pipefail
           offset="${OFFSET:-0}"
-          printf '%s' "$offset" | grep -qE '^[0-9]+$' || {
+          grep -qE '^[0-9]+$' <<<"$offset" || {
             echo "::error::RUN_NUMBER_OFFSET is '${offset}', not a whole number"; exit 1; }
           run=$(( GITHUB_RUN_NUMBER + offset ))
           echo "build_id=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
@@ -427,15 +427,18 @@ jobs:
         if: matrix.arch == 'amd64'
         run: |
           set -euo pipefail
-          "./$DIST/openchimed" --version | grep -q "^openchimed ${BUILD_ID} " || {
+          ver="$("./$DIST/openchimed" --version)"
+          grep -q "^openchimed ${BUILD_ID} " <<<"$ver" || {
             echo "::error::the binary does not report build ${BUILD_ID}"; exit 1; }
           # Read-aloud works from what ships: a render from the stripped file,
           # finding its voice data beside it and verifying it.
-          "./$DIST/openchimed" --tts-say expr-voice-2-f "This release speaks." /tmp/release-check.wav
+          said="This release speaks."
+          "./$DIST/openchimed" --tts-say expr-voice-2-f "$said" /tmp/release-check.wav
           # And voice input hears it, from the stt/ data beside the stripped file.
           heard="$("./$DIST/openchimed" --stt-hear /tmp/release-check.wav)"
           echo "heard: $heard"
-          printf '%s' "$heard" | tr 'A-Z' 'a-z' | grep -q 'this release speaks' || {
+          # Judged on words, with a tolerance, not on the exact string.
+          scripts/release/heard_matches.sh "$said" "$heard" || {
             echo "::error::the release binary did not hear what it said"; exit 1; }
 
       # The floor is a shipped promise (README: "glibc 2.34+", RHEL 9+), and it
@@ -518,11 +521,12 @@ jobs:
           /usr/bin/openchimed --version
           # The package put read-aloud's data where an installed daemon looks, and it
           # verifies: a render by the installed binary, from the installed data.
-          /usr/bin/openchimed --tts-say expr-voice-2-f "The package speaks." /tmp/installed-check.wav
+          said="The package speaks."
+          /usr/bin/openchimed --tts-say expr-voice-2-f "$said" /tmp/installed-check.wav
           # And the recognizer's data, the same way.
           heard="$(/usr/bin/openchimed --stt-hear /tmp/installed-check.wav)"
           echo "heard: $heard"
-          printf '%s' "$heard" | tr 'A-Z' 'a-z' | grep -q 'the package speaks' || {
+          scripts/release/heard_matches.sh "$said" "$heard" || {
             echo "::error::the installed daemon did not hear what it said"; exit 1; }
 
       # The install above does not touch the unit file: both maintainer scripts
@@ -657,7 +661,7 @@ jobs:
             -e OPENCHIME_WORKSPACE_NAME=Image "${STAGING_IMAGE}:build-${BUILD_ID}-${{ matrix.arch }}"
           ok=0
           for i in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:18080/healthz 2>/dev/null | grep -qx OK; then
+            if [ "$(curl -fsS http://127.0.0.1:18080/healthz 2>/dev/null || true)" = OK ]; then
               echo "healthz: OK after ${i} s"; ok=1; break
             fi
             sleep 1
@@ -721,7 +725,7 @@ jobs:
           }
           healthz() {
             for i in $(seq 1 60); do
-              if curl -fsS http://127.0.0.1:18081/healthz 2>/dev/null | grep -qx OK; then
+              if [ "$(curl -fsS http://127.0.0.1:18081/healthz 2>/dev/null || true)" = OK ]; then
                 echo "$1: healthz OK after ${i} s"; return 0
               fi
               sleep 1
@@ -752,8 +756,11 @@ jobs:
           # The log goes to a file first: under pipefail, grep -q stops reading at
           # its first match and `podman logs` then fails on the closed pipe.
           podman logs oc-a > "$W/a-boot.log" 2>&1
-          grep -q 'the replica holds no copy yet' "$W/a-boot.log" \
+          # The entrypoint's stable tokens (entrypoint.sh), never its sentences.
+          grep -qxF 'entrypoint: restore=empty' "$W/a-boot.log" \
             || { tail -40 "$W/a-boot.log"; echo "::error::A did not report an empty replica on its first boot"; exit 1; }
+          grep -qxF 'entrypoint: replica=on' "$W/a-boot.log" \
+            || { tail -40 "$W/a-boot.log"; echo "::error::A did not start replicating"; exit 1; }
           # Litestream syncs every 60 s (the configuration entrypoint.sh writes).
           ok=0
           for i in $(seq 1 150); do
@@ -774,7 +781,7 @@ jobs:
           start oc-b "$W/data-b" -v "$W/creds:/etc/openchime:ro"
           healthz oc-b
           podman logs oc-b > "$W/b-boot.log" 2>&1
-          grep -q 'entrypoint: restored /data/openchime.db from the replica' "$W/b-boot.log" \
+          grep -qxF 'entrypoint: restore=ok' "$W/b-boot.log" \
             || { tail -40 "$W/b-boot.log"; echo "::error::B did not restore the database"; exit 1; }
           cmp -s "$W/data-a/cert.pem" "$W/data-b/cert.pem" \
             || { echo "::error::B presents a different certificate from A: the restored database did not carry its identity"; exit 1; }
@@ -791,8 +798,9 @@ jobs:
             "$IMAGE" > "$W/c.log" 2>&1 || rc=$?
           echo "--- C's log"; tail -20 "$W/c.log"
           [ "$rc" -ne 0 ] || { echo "::error::a boot that could not read its bucket exited 0"; exit 1; }
-          grep -q 'the restore from the replica failed' "$W/c.log" \
-            || { echo "::error::C failed, but not at the restore"; exit 1; }
+          # podman run passes the entrypoint's status through: 3 is the restore's.
+          [ "$rc" -eq 3 ] && grep -qxF 'entrypoint: restore=failed' "$W/c.log" \
+            || { echo "::error::C failed (exit ${rc}), but not at the restore"; exit 1; }
           [ ! -e "$W/data-c/openchime.db" ] || { echo "::error::C created a database after its restore failed"; exit 1; }
           echo "C: exited ${rc} at the restore, with no database created"
       - name: Push the per-architecture image
@@ -888,7 +896,8 @@ jobs:
           # still build and the app will fail to start on a clean machine, so
           # it is asserted here rather than discovered there.
           for f in build/openchime.exe build/openchime-tui.exe; do
-            file "$f" | grep -q 'PE32+' || { echo "::error::$f is not a PE32+ binary"; exit 1; }
+            kind="$(file "$f")"
+            grep -q 'PE32+' <<<"$kind" || { echo "::error::$f is not a PE32+ binary"; exit 1; }
           done
 
       # Named for the toolchain, not the platform: these are the unpackaged
@@ -1128,7 +1137,7 @@ jobs:
               t = datetime.datetime.fromisoformat(d["ModTime"].replace("Z", "+00:00"))
               if (now - t).days > 30: print(d["Name"])' \
             | while read -r id; do
-                if printf '%s\n' "$released" | grep -qx "$id"; then echo "keeping released $id"; continue; fi
+                if grep -qxF -- "$id" <<<"$released"; then echo "keeping released $id"; continue; fi
                 echo "pruning candidate $id"
                 rclone purge "dist-staging:${DIST_STAGING_BUCKET}/candidates/${id}"
               done

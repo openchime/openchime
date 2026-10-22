@@ -198,7 +198,7 @@ static const char *tok_phon(const tts_guesser *g, uint32_t id)  { return g->pool
 
 int tts_guesser_open(const char *path, const tts_map *mem, tts_guesser *g, char *err, size_t errcap) {
     memset(g, 0, sizeof *g);
-    if (mem ? (g->map = *mem, g->map.owned = 0, !mem->p) : tts_map_open(path, &g->map) != 0) { tts_seterr(err, errcap, "cannot map %s", path); return -1; }
+    if (mem ? (g->map = *mem, g->map.owned = 0, !mem->p) : tts_map_open(path, &g->map) != 0) { tts_seterr(err, errcap, "cannot map %s", path); return TTS_OPEN_ABSENT; }
     const uint8_t *p = g->map.p;
     size_t n = g->map.n;
     if (n < TTS_GS_HEADER || memcmp(p, TTS_GS_MAGIC, 8) != 0 || tts_rd32(p + 8) != TTS_GS_VERSION) {

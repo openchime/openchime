@@ -211,6 +211,7 @@ int run_jwt_tests(void) {
                           NOW + 290, "\"name\":\"Zo\\u00eb \\\"Z\\\" \\ud83d\\ude00\"");
         CHECK(verify_payload(&iss, pem, pl, &c) == OC_JWT_OK);
         CHECK(strcmp(c.sub, "https://idp.example|abc") == 0);
+        /* contract: the claim's JSON escapes above, decoded to their UTF-8 */
         CHECK(strcmp(c.name, "Zo\xc3\xab \"Z\" \xf0\x9f\x98\x80") == 0);
         /* A lone surrogate, an unknown escape and an embedded NUL are refused. */
         oc_issuer_payload(pl, sizeof pl, ISS, AUD, "a\\ud83dz", "j", NOW - 10, NOW + 290, "");

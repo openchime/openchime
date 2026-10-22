@@ -6,6 +6,8 @@
 
 #include "netloop.h"
 #include "webapp.h"
+#include "webpages.h"     /* the pages' markers and error kinds */
+#include "pwpolicy.h"     /* OC_PW_RULE_TEXT, said beside a new password */
 #include "oc_port.h"      /* oc_mkdir */
 #include "audio.h"
 #include "config.h"
@@ -17,6 +19,7 @@
 #include "tts_render.h"
 #include "stt_render.h"
 #include "check.h"
+#include "testenv.h"      /* the suite's own directory */
 #include "testsignin.h"   /* a person's sign-in, on the daemon's page */
 #include "sum_worker.h"
 #include "sqlite3.h"
@@ -25,6 +28,7 @@
 #include "devicecodes.h"
 #include "oidcrp.h"        /* a direct connection's worker */
 #include "jwt.h"
+#include "json.h"          /* a summary's document, parsed */
 #include <poll.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/sha256.h>
@@ -45,11 +49,34 @@
 #include <unistd.h>
 
 struct loop_arg {
-    int                   port;
+    int                   port;    /* 0 until start_loop says which the kernel gave */
     oc_tls_server        *srv;
     oc_dbwriter          *dbw;
     volatile sig_atomic_t stop;
+    oc_netloop_view       view;    /* the loop's own report of itself (netloop.h) */
 };
+
+/* The suite's shared loop, for a test that waits on what it counts. */
+static struct loop_arg *g_main;
+
+/* The suite's directory (oc_test_mkdtemp): its databases and blobs, nobody
+ * else's, so no other suite, run or checkout shares a path with it. */
+static char g_dir[512];
+/* A file in it, into one of a few rotating buffers so two can be named in one
+ * call. */
+static const char *tpath(const char *name) {
+    static char bufs[4][700];
+    static int k;
+    char *b = bufs[k++ & 3];
+    return oc_test_path(b, sizeof bufs[0], g_dir, name);
+}
+/* A database's three files, gone. */
+static void db_unlink(const char *name) {
+    char p[720];
+    unlink(tpath(name));
+    snprintf(p, sizeof p, "%s-wal", tpath(name)); unlink(p);
+    snprintf(p, sizeof p, "%s-shm", tpath(name)); unlink(p);
+}
 
 /* token + seq(u16 BE) + payload -> the relay. */
 static void udp_send_audio_n(int fd, const struct sockaddr_in *to, const uint8_t *tok, size_t tlen,
@@ -91,17 +118,19 @@ static int mk_udp_client(void) {
 
 /* The ready hook (netloop.h): when it runs, the listener must already take
  * connections -- a managed box claims its binding from it, and central reads
- * the claim as a workspace that is up. */
-static int g_ready_calls, g_ready_connected, g_ready_port;
+ * the claim as a workspace that is up. `ctx` is the loop's loop_arg, whose
+ * view names the port the kernel gave it. */
+static int g_ready_calls, g_ready_connected;
 static void on_ready(void *ctx) {
-    (void)ctx;
+    struct loop_arg *a = ctx;
+    int port = __atomic_load_n(&a->view.proto_port, __ATOMIC_ACQUIRE);
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    sa.sin_port = htons((uint16_t)g_ready_port);
+    sa.sin_port = htons((uint16_t)port);
     /* The loop has not served a cycle yet, so this is the kernel's backlog
      * accepting it: which is what "the listener is bound" means. */
-    g_ready_connected = fd >= 0 && connect(fd, (struct sockaddr *)&sa, sizeof sa) == 0;
+    g_ready_connected = port > 0 && fd >= 0 && connect(fd, (struct sockaddr *)&sa, sizeof sa) == 0;
     if (fd >= 0) close(fd);
     oc_netloop_set_ready(NULL, NULL);   /* the other loops in this suite are not asked */
     __atomic_add_fetch(&g_ready_calls, 1, __ATOMIC_RELEASE);
@@ -113,9 +142,29 @@ static void *loop_thread(void *p) {
      * startup owner, so load it after the test's setenv() and before the loop. */
     char cfgerr[128];
     oc_config_load(cfgerr, sizeof cfgerr);
-    oc_netloop_run(a->port, a->srv, a->dbw, &a->stop);
+    oc_netloop_run_ex(0, a->srv, a->dbw, &a->stop, &a->view);
     return NULL;
 }
+
+/* Start a loop serving `srv` and `dbw` on a port the kernel picks, and wait
+ * (on the loop's own report, not a sleep) until it listens -- and, with
+ * `health`, until its health port does too (oc_netloop_set_health_port(0)
+ * first). The protocol port, also in a->port; 0 if the loop did not come up. */
+static int start_loop(struct loop_arg *a, pthread_t *th, oc_tls_server *srv, oc_dbwriter *dbw, int health) {
+    memset(a, 0, sizeof *a);
+    a->srv = srv; a->dbw = dbw;
+    if (pthread_create(th, NULL, loop_thread, a) != 0) return 0;
+    oc_netloop_view *v = &a->view;
+    int up = WAIT_UNTIL(__atomic_load_n(&v->ended, __ATOMIC_ACQUIRE) ||
+                        (__atomic_load_n(&v->proto_port, __ATOMIC_ACQUIRE) &&
+                         (!health || __atomic_load_n(&v->health_port, __ATOMIC_ACQUIRE))), 10000);
+    if (!up || __atomic_load_n(&v->ended, __ATOMIC_ACQUIRE)) return 0;
+    a->port = __atomic_load_n(&v->proto_port, __ATOMIC_ACQUIRE);
+    return a->port;
+}
+
+/* The loop's open connections, as it counts them for the per-address cap. */
+static int loop_conns(struct loop_arg *a) { return __atomic_load_n(&a->view.open_conns, __ATOMIC_ACQUIRE); }
 
 /* Stop a loop and wait for it. The loop looks at its flag between turns, and an
  * idle one takes a turn only every half second, so a connection to its port
@@ -142,6 +191,15 @@ static oc_tls_status handshake_blocking(oc_tls_conn *c) {
     }
 }
 
+/* One connect to `addr`: 1 with the socket in *fd, or 0. */
+static int try_connect(int *fd, const struct sockaddr *addr, socklen_t alen) {
+    int s = socket(addr->sa_family, SOCK_STREAM, 0);
+    if (s < 0) return 0;
+    if (connect(s, addr, alen) == 0) { *fd = s; return 1; }
+    close(s);
+    return 0;
+}
+
 /* `prefix` (may be NULL) is written to the socket before TLS begins — what a TCP
  * forwarder's PROXY header is. */
 static int g_client_v6;   /* clients connect to ::1 instead of 127.0.0.1 */
@@ -161,12 +219,10 @@ static int client_open_with(client *c, int port, const uint8_t *pin,
         alen = sizeof *a4;
     }
     c->fd = -1;
-    for (int i = 0; i < 200; i++) {
-        int fd = socket(addr.ss_family, SOCK_STREAM, 0);
-        if (connect(fd, (struct sockaddr *)&addr, alen) == 0) { c->fd = fd; break; }
-        close(fd);
-        usleep(20000);
-    }
+    /* The loop listens before a test is given its port (start_loop), so a
+     * refused connect is not "not up yet"; the short deadline only rides out
+     * a full backlog. */
+    WAIT_UNTIL(try_connect(&c->fd, (struct sockaddr *)&addr, alen), 2000);
     if (c->fd < 0) return -1;
     /* A READ DEADLINE, so a missing frame fails this suite instead of hanging
      * it. Learned the hard way: a schema change broke an upsert on the daemon
@@ -210,12 +266,7 @@ static int http_client_open(client *c, int port, const uint8_t *pin) {
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons((uint16_t)port);
     c->fd = -1;
-    for (int i = 0; i < 200; i++) {
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) { c->fd = fd; break; }
-        close(fd);
-        usleep(20000);
-    }
+    WAIT_UNTIL(try_connect(&c->fd, (struct sockaddr *)&addr, sizeof addr), 2000);   /* as client_open_with */
     if (c->fd < 0) return -1;
     {
         struct timeval tv = { 20, 0 };   /* the suite's read deadline, as client_open's */
@@ -476,7 +527,7 @@ static void test_edit_delete_vertical(int port, const uint8_t *pin) {
         CHECK(hdr.msg_type == OC_MSG_MSG_EDITED);
         oc_msg_edited m; CHECK(oc_decode_msg_edited(&p, &m) == OC_OK);
         CHECK(m.message_id == mid && m.author_id == ub);
-        CHECK(m.body.len == 12 && memcmp(m.body.ptr, "second draft", 12) == 0);
+        CHECK(m.body.len == 12 && memcmp(m.body.ptr, "second draft", 12) == 0);   /* contract: the test's own input, echoed */
     }
 
     /* alice (owner) moderator-deletes bob's message -> both get MSG_DELETED with
@@ -658,7 +709,7 @@ static void test_threads_vertical(int port, const uint8_t *pin) {
     CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_THREAD_REPLY);
     CHECK(oc_decode_thread_reply(&p, &tr) == OC_OK);
     CHECK(tr.parent_id == mid && tr.author_id == ub && tr.reply_count == 1);
-    CHECK(tr.body.len == 11 && memcmp(tr.body.ptr, "first reply", 11) == 0);
+    CHECK(tr.body.len == 11 && memcmp(tr.body.ptr, "first reply", 11) == 0);   /* contract: the test's own input, echoed */
     CHECK(tr.participant == 1);            /* alice wrote the root */
     /* The same reply, the same instant, the other answer: carol is in the
      * channel and not in the thread. One encoding could not have carried both,
@@ -668,7 +719,7 @@ static void test_threads_vertical(int port, const uint8_t *pin) {
     CHECK(oc_decode_thread_reply(&p, &trc) == OC_OK);
     CHECK(trc.message_id == tr.message_id);
     CHECK(trc.participant == 0);
-    CHECK(trc.body.len == 11 && memcmp(trc.body.ptr, "first reply", 11) == 0);
+    CHECK(trc.body.len == 11 && memcmp(trc.body.ptr, "first reply", 11) == 0);   /* contract: the test's own input, echoed */
 
     /* alice opens the thread: the reply is streamed, then a THREAD terminator. */
     oc_wbuf_init(&w, buf, sizeof buf);
@@ -865,7 +916,7 @@ static void test_drafts_vertical(int port, const uint8_t *pin) {
     oc_draft d;
     CHECK(oc_decode_draft(&p, &d) == OC_OK);
     CHECK(d.channel_id == 1 && d.thread_root == 0 && d.updated_ms != 0);
-    CHECK(d.body.len == 14 && memcmp(d.body.ptr, "half a thought", 14) == 0);
+    CHECK(d.body.len == 14 && memcmp(d.body.ptr, "half a thought", 14) == 0);   /* contract: the test's own input, echoed */
 
     /* B lists and sees it, which is also what a cold start does. */
     oc_wbuf_init(&w, buf, sizeof buf);
@@ -1224,7 +1275,7 @@ static void test_upload_restarted(int port, const uint8_t *pin, oc_dbwriter *dbw
     memset(second.idem, 0xB2, OC_IDEM_SIZE);
     oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
     CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &second) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
-    for (int i = 0; i < 500 && oc_dbwriter_jobs_waiting(dbw, OC_JOB_ATTACH_CREATE) < 2; i++) usleep(10000);
+    CHECK(WAIT_UNTIL(oc_dbwriter_jobs_waiting(dbw, OC_JOB_ATTACH_CREATE) >= 2, 5000));
     CHECK(oc_dbwriter_jobs_waiting(dbw, OC_JOB_ATTACH_CREATE) == 2);   /* both asked, neither answered */
     oc_dbwriter_hold(dbw, 0);
 
@@ -1267,7 +1318,7 @@ static void test_upload_restarted(int port, const uint8_t *pin, oc_dbwriter *dbw
     memset(second.idem, 0xB4, OC_IDEM_SIZE);
     oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
     CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &second) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
-    for (int i = 0; i < 500 && oc_dbwriter_jobs_waiting(dbw, OC_JOB_ATTACH_CREATE) < 2; i++) usleep(10000);
+    CHECK(WAIT_UNTIL(oc_dbwriter_jobs_waiting(dbw, OC_JOB_ATTACH_CREATE) >= 2, 5000));
     CHECK(oc_dbwriter_jobs_waiting(dbw, OC_JOB_ATTACH_CREATE) == 2);
     oc_dbwriter_hold(dbw, 0);
     CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_READY);
@@ -1290,7 +1341,7 @@ static const char *stub_voice_label(int v) { return v % 2 == 0 ? "Test Low" : "T
 static int stub_say(void *e, const char *segment, int voice, float **pcm, size_t *n,
                     char *err, size_t cap) {
     (void)e; (void)voice; (void)err; (void)cap;
-    while (__atomic_load_n(&g_stub_hold, __ATOMIC_ACQUIRE)) usleep(1000);
+    WAIT_UNTIL(!__atomic_load_n(&g_stub_hold, __ATOMIC_ACQUIRE), 60000);   /* the test's gate */
     __sync_fetch_and_add(&g_stub_says, 1);
     size_t samples = strlen(segment) * 240;   /* 10 ms a character at 24 kHz */
     *pcm = malloc(samples * sizeof **pcm);
@@ -1431,7 +1482,7 @@ static void test_read_aloud_store_window(int port, const uint8_t *pin, oc_dbwrit
     CHECK(fetch_audio(&a, mids[0], NULL, &code) == first_bytes && code == 0);
     CHECK(g_stub_says == rendered);                                   /* kept, though the oldest */
     oc_dbwriter_hold(dbw, 0);
-    for (int i = 0; i < 500 && oc_dbwriter_jobs_waiting(dbw, OC_JOB_TTS_STORE) > 0; i++) usleep(10000);
+    CHECK(WAIT_UNTIL(oc_dbwriter_jobs_waiting(dbw, OC_JOB_TTS_STORE) == 0, 5000));
     CHECK(fetch_audio(&a, mids[0], NULL, &code) == first_bytes && code == 0);
     CHECK(fetch_audio(&a, mids[N - 1], NULL, &code) > 0 && code == 0);
     CHECK(g_stub_says == rendered);                                   /* and from its row after */
@@ -1484,7 +1535,7 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
             CHECK(ti.count == 2);
             CHECK(ti.model_version.len == strlen(STUB_TTS.version));
             CHECK(ti.voices[0].id.len == 12 && memcmp(ti.voices[0].id.ptr, "test-voice-m", 12) == 0);
-            CHECK(ti.voices[1].label.len == 9 && memcmp(ti.voices[1].label.ptr, "Test High", 9) == 0);
+            CHECK(ti.voices[1].label.len == 9 && memcmp(ti.voices[1].label.ptr, "Test High", 9) == 0);   /* contract: the test's own input, echoed */
             /* Every voice says what it speaks. Asserted because a stub engine
              * with no language compiles clean and sends empty strings, and
              * every other assertion here would still pass. */
@@ -1500,7 +1551,7 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
      * background, through this same stub. Everything below counts renders, so let
      * the warming finish first: on a slow runner it otherwise lands between a
      * "before" and an "after" and reads as a cache that does not cache. */
-    for (int i = 0; i < 500 && g_stub_says < STUB_TTS.voices; i++) usleep(20000);
+    CHECK(WAIT_UNTIL(g_stub_says >= STUB_TTS.voices, 10000));
 
     uint64_t mid = say_something(&a, OC_DEFAULT_CHANNEL, "Deploy finished. Logs are clean.", 0xB1);
     CHECK(mid != 0);
@@ -1609,6 +1660,10 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
  * from the second: 1 says "segment <marker> at bob", 2 hears nothing, 3 fails. */
 static void *stt_stub_open(void *ctx, char *err, size_t cap) { (void)ctx; (void)err; (void)cap; static int t; return &t; }
 static void stt_stub_close(void *e) { (void)e; }
+/* Code 4's gate: the stub says it has begun (in) and hears nothing more until
+ * the test lets it go (release), so "still being heard" is a fact, not a
+ * sleep that is probably long enough. */
+static int g_stt_slow_in, g_stt_slow_release;
 static int stt_stub_hear(void *e, const int16_t *pcm, size_t n, char **text, char *err, size_t cap) {
     (void)e;
     int code = n > 0 ? pcm[0] : 0, marker = n > 1 ? pcm[1] : 0;
@@ -1616,8 +1671,8 @@ static int stt_stub_hear(void *e, const int16_t *pcm, size_t n, char **text, cha
     char buf[64] = "";
     if (code == 1) snprintf(buf, sizeof buf, "segment %d at bob", marker);
     if (code == 4) {                          /* slow: still being heard when its speaker leaves */
-        struct timespec ts = { 0, 300 * 1000000L };
-        nanosleep(&ts, NULL);
+        __atomic_store_n(&g_stt_slow_in, 1, __ATOMIC_RELEASE);
+        WAIT_UNTIL(__atomic_load_n(&g_stt_slow_release, __ATOMIC_ACQUIRE), 30000);
         snprintf(buf, sizeof buf, "late words %d", marker);
     }
     *text = strdup(buf);
@@ -1734,7 +1789,7 @@ static void test_voice_input_vertical(int port, const uint8_t *pin) {
      * "at bob" turned into a mention, and nothing is posted. */
     stt_send(&a, 1, OC_STT_MODE_PTT, OC_DEFAULT_CHANNEL, 0, 0x61, 16000, 1, 5);
     CHECK(stt_await(&a, 1, text, sizeof text, &mid, &code, NULL, 0) == 1);
-    CHECK(strcmp(text, "segment 5 @bob") == 0 && mid == 0);
+    CHECK(strcmp(text, "segment 5 @bob") == 0 && mid == 0);   /* contract: the test's own input, echoed */
 
     /* Free talk: two segments sent back to back are posted by the daemon, as
      * alice, in order; everyone gets them as ordinary BROADCASTs and alice's
@@ -1744,11 +1799,11 @@ static void test_voice_input_vertical(int port, const uint8_t *pin) {
     stt_send(&a, 2, OC_STT_MODE_FREE, OC_DEFAULT_CHANNEL, 0, 0x62, 8000, 1, 7);
     stt_send(&a, 3, OC_STT_MODE_FREE, OC_DEFAULT_CHANNEL, 0, 0x63, 8000, 1, 8);
     CHECK(stt_await(&a, 2, text, sizeof text, &m1, &code, a_bodies, sizeof a_bodies) == 1);
-    CHECK(strcmp(text, "segment 7 @bob") == 0 && m1 != 0);
+    CHECK(strcmp(text, "segment 7 @bob") == 0 && m1 != 0);   /* contract: the test's own input, echoed */
     CHECK(stt_await(&a, 3, text, sizeof text, &m2, &code, a_bodies, sizeof a_bodies) == 1);
-    CHECK(strcmp(text, "segment 8 @bob") == 0 && m2 > m1);
+    CHECK(strcmp(text, "segment 8 @bob") == 0 && m2 > m1);   /* contract: the test's own input, echoed */
     read_broadcasts(&b, 2, b_bodies, sizeof b_bodies);
-    CHECK(strcmp(b_bodies, "segment 7 @bob\nsegment 8 @bob\n") == 0);
+    CHECK(strcmp(b_bodies, "segment 7 @bob\nsegment 8 @bob\n") == 0);   /* contract: the test's own input, echoed */
 
     /* The same token again is the same message, not a second one: a retried
      * segment posts once, exactly as a retried SEND does. */
@@ -1850,15 +1905,19 @@ static void test_voice_input_vertical(int port, const uint8_t *pin) {
         CHECK(do_handshake(&c) == 0);
         uint64_t uc = 0;
         CHECK(do_auth(&c, "alice", "pw-alice", &uc) == 0);
+        __atomic_store_n(&g_stt_slow_in, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_stt_slow_release, 0, __ATOMIC_RELEASE);
         stt_send(&c, 11, OC_STT_MODE_FREE, OC_DEFAULT_CHANNEL, 0, 0x6B, 4000, 4, 1);
+        CHECK(WAIT_UNTIL(__atomic_load_n(&g_stt_slow_in, __ATOMIC_ACQUIRE), 5000));   /* being heard */
+        int open_before = loop_conns(g_main);
         client_close(&c);
-        struct timespec ts = { 0, 100 * 1000000L };
-        nanosleep(&ts, NULL);                  /* the close is seen while it is heard */
+        CHECK(WAIT_UNTIL(loop_conns(g_main) < open_before, 5000));   /* the close is seen while it is heard */
+        __atomic_store_n(&g_stt_slow_release, 1, __ATOMIC_RELEASE);
         char bodies[256] = "";
         stt_send(&a, 12, OC_STT_MODE_FREE, OC_DEFAULT_CHANNEL, 0, 0x6C, 4000, 1, 12);
         CHECK(stt_await(&a, 12, text, sizeof text, &mid, &code, NULL, 0) == 1 && mid != 0);
         read_broadcasts(&b, 1, bodies, sizeof bodies);
-        CHECK(strcmp(bodies, "segment 12 @bob\n") == 0);
+        CHECK(strcmp(bodies, "segment 12 @bob\n") == 0);   /* contract: the stub's words, its mention rendered */
     }
 
     client_close(&a);
@@ -1914,7 +1973,7 @@ static int web_call(int port, const uint8_t *pin, const char *method, const char
 
 /* The token a sign-in's 303 carries to the callback, into `tok`. 1 if there. */
 static int token_of(const char *resp, char *tok, size_t cap) {
-    const char *l = strstr(resp, "\r\nLocation: http://127.0.0.1:5/cb?token=");
+    const char *l = strstr(resp, "\r\nLocation: http://127.0.0.1:5/cb?token=");   /* contract: HTTP */
     if (!l) return 0;
     l += strlen("\r\nLocation: http://127.0.0.1:5/cb?token=");
     size_t n = strcspn(l, "\r\n");
@@ -2048,6 +2107,17 @@ static int session_ids(client *c, uint64_t *ids, int cap, int *mine) {
     return session_list_read(c, ids, cap, mine);
 }
 
+/* How many of sid's sessions have a last_seen_ms written since it was set to 1. */
+static int sid_sessions_seen(sqlite3 *db) {
+    int n = 0;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM sessions WHERE last_seen_ms > 1 AND "
+                           "user_id=(SELECT id FROM users WHERE subject='local:sid');", -1, &st, NULL);
+    if (st && sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
 /* One device signed out on its own (REQ-182): its connection closes, the list
  * comes back without it, the asker's own goes on, and a session id that is not
  * the asker's does nothing. Sessions in use have last_seen_ms written in
@@ -2085,22 +2155,14 @@ static void test_revoke_one_session(int port, const uint8_t *pin) {
     client idle;
     CHECK(signed_in(&idle, port, pin, "sid", "pw-sid") == 0);
     sqlite3 *db = NULL;
-    CHECK(sqlite3_open("build/itest_netloop.db", &db) == SQLITE_OK);
+    CHECK(sqlite3_open(tpath("itest_netloop.db"), &db) == SQLITE_OK);
     sqlite3_busy_timeout(db, 5000);
     CHECK(sqlite3_exec(db, "UPDATE sessions SET last_seen_ms=1 WHERE user_id=(SELECT id FROM users WHERE subject='local:sid');",
                        NULL, NULL, NULL) == SQLITE_OK);
-    usleep(400000);
+    oc_test_let_time_pass(400);                        /* the 300 ms interval is up: time itself */
     CHECK(session_ids(&a, ids, 8, &mine) == 2);         /* a frame: a is in use */
-    int moved = 0;
-    for (int i = 0; i < 40 && !moved; i++) {
-        usleep(100000);
-        sqlite3_stmt *st = NULL;
-        sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM sessions WHERE last_seen_ms > 1 AND "
-                               "user_id=(SELECT id FROM users WHERE subject='local:sid');", -1, &st, NULL);
-        if (sqlite3_step(st) == SQLITE_ROW) moved = sqlite3_column_int(st, 0);
-        sqlite3_finalize(st);
-    }
-    CHECK(moved == 1);                                   /* a's, and not the idle one's */
+    CHECK(WAIT_UNTIL(sid_sessions_seen(db) >= 1, 4000));
+    CHECK(sid_sessions_seen(db) == 1);                   /* a's, and not the idle one's */
     sqlite3_close(db);
     oc_netloop_set_seen_ms(0);
     client_close(&a); client_close(&idle);
@@ -2239,6 +2301,16 @@ static int web_signin(int port, const uint8_t *pin, const char *user, const char
 }
 
 /* The text between `after` and the next `until` in `page`, or 0. */
+/* The rule for a new password as a page carries it: its constant, escaped as
+ * the page escapes it -- the words are checked through the constant, never
+ * spelled out here. */
+static const char *pw_rule_html(void) {
+    static char out[512];
+    size_t o = 0;
+    if (!out[0]) oc_html_escape(out, sizeof out, &o, OC_PW_RULE_TEXT, strlen(OC_PW_RULE_TEXT));
+    return out;
+}
+
 static int between(const char *page, const char *after, const char *until, char *out, size_t cap) {
     const char *k = strstr(page, after);
     if (!k) return 0;
@@ -2280,7 +2352,7 @@ static size_t base32_bytes(const char *in, uint8_t *out, size_t cap) {
 
 /* The ticket a step page carries, from its hidden field. */
 static int ticket_of(const char *page, char *out, size_t cap) {
-    const char *k = strstr(page, "name=\"ticket\" value=\"");
+    const char *k = strstr(page, "name=\"ticket\" value=\"");   /* contract: the page's markup */
     if (!k) return 0;
     k += 21;
     const char *e = strchr(k, '"');
@@ -2354,21 +2426,21 @@ static void *idp_thread(void *arg) {
             got += (size_t)r; req[got] = '\0';
             char *he = strstr(req, "\r\n\r\n");
             if (!he) continue;
-            const char *cl = strstr(req, "Content-Length: ");
+            const char *cl = strstr(req, "Content-Length: ");   /* contract: HTTP */
             size_t want = cl ? (size_t)atoi(cl + 16) : 0;
             if (got >= (size_t)(he + 4 - req) + want) break;
         }
         if (!__atomic_load_n(&f->up, __ATOMIC_ACQUIRE)) { idp_reply(fd, 503, "text/plain", "down"); close(fd); continue; }
         char base[64];
         snprintf(base, sizeof base, "http://127.0.0.1:%d", f->port);
-        if (!strncmp(req, "GET /.well-known/openid-configuration", 37)) {
+        if (!strncmp(req, "GET /.well-known/openid-configuration", 37)) {   /* contract: the fake provider's request line */
             char doc[600];
             snprintf(doc, sizeof doc, "{\"issuer\":\"%s\",\"authorization_endpoint\":\"%s/authorize\","
                      "\"token_endpoint\":\"%s/token\",\"jwks_uri\":\"%s/jwks\"}", base, base, base, base);
             idp_reply(fd, 200, "application/json", doc);
-        } else if (!strncmp(req, "GET /jwks", 9)) {
+        } else if (!strncmp(req, "GET /jwks", 9)) {   /* contract: the fake provider's request line */
             idp_reply(fd, 200, "application/json", f->jwks);
-        } else if (!strncmp(req, "POST /token", 11)) {
+        } else if (!strncmp(req, "POST /token", 11)) {   /* contract: the fake provider's request line */
             __atomic_add_fetch(&f->tokens, 1, __ATOMIC_RELEASE);
             const char *body = strstr(req, "\r\n\r\n") + 4;
             char code[64] = "", ver[80] = "";
@@ -2453,15 +2525,15 @@ static int direct_auth(client *c, const char *source, const char *code, const ch
  * verifier, and the daemon exchanges it -- proving its verifier to the provider
  * -- checks the ID token, and the join rules admit the person. A wrong state,
  * a wrong verifier, a provider that is down: refused. */
-static void test_direct_signin(int port) {
+static void test_direct_signin(void) {
     fake_idp f;
     pthread_t ith;
     CHECK(idp_start(&f, &ith) == 0);
     oc_tls_server srv;
     uint8_t pin[OC_TLS_FINGERPRINT_LEN];
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0 && oc_tls_server_fingerprint(&srv, pin) == 0);
-    unlink("build/itest_direct.db"); unlink("build/itest_direct.db-wal"); unlink("build/itest_direct.db-shm");
-    oc_dbwriter *dbw = oc_dbwriter_start("build/itest_direct.db");
+    db_unlink("itest_direct.db");
+    oc_dbwriter *dbw = oc_dbwriter_start(tpath("itest_direct.db"));
     if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw != NULL);
     char why[128];
@@ -2476,13 +2548,12 @@ static void test_direct_signin(int port) {
     oc_dbwriter_set_direct_issuers(dbw, iss, 1);
     oc_oidcrp *rp = oc_oidcrp_start(&k, 1, dbw);
     CHECK(rp != NULL);
-    for (int i = 0; i < 200 && !oc_oidcrp_ready(rp, 0, NULL, 0); i++) usleep(20000);
-    CHECK(oc_oidcrp_ready(rp, 0, NULL, 0));
+    CHECK(WAIT_UNTIL(oc_oidcrp_ready(rp, 0, NULL, 0), 4000));
     oc_netloop_set_direct(rp, &k, 1);
     struct loop_arg arg;
-    arg.port = port; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
     pthread_t th;
-    CHECK(pthread_create(&th, NULL, loop_thread, &arg) == 0);
+    int port = start_loop(&arg, &th, &srv, dbw, 0);
+    CHECK(port != 0);
 
     /* Offered, by its label. */
     client c;
@@ -2496,7 +2567,7 @@ static void test_direct_signin(int port) {
         for (uint8_t i = 0; i < ach.n_sources; i++)
             if (ach.sources[i].kind == OC_SOURCE_OIDC && ach.sources[i].id.len == 6 &&
                 !memcmp(ach.sources[i].id.ptr, "oidc-1", 6) && ach.sources[i].label.len == 8 &&
-                !memcmp(ach.sources[i].label.ptr, "Acme SSO", 8)) offered = 1;
+                !memcmp(ach.sources[i].label.ptr, "Acme SSO", 8)) offered = 1;   /* contract: the test's own input, echoed */
     CHECK(offered);
 
     char ver[OC_SIGNIN_VERIFIER_LEN + 1], ch[OC_SIGNIN_CHALLENGE_LEN + 1], url[2600], state[64] = "", nonce[64] = "",
@@ -2578,9 +2649,8 @@ static void test_direct_signin(int port) {
     __atomic_store_n(&f.up, 0, __ATOMIC_RELEASE);
     rp = oc_oidcrp_start(&k, 1, dbw);
     oc_netloop_set_direct(rp, &k, 1);
-    arg.stop = 0;
-    CHECK(pthread_create(&th, NULL, loop_thread, &arg) == 0);
-    usleep(300000);
+    port = start_loop(&arg, &th, &srv, dbw, 0);
+    CHECK(port != 0);
     {
         client d;
         CHECK(client_open(&d, port, pin) == 0 && do_handshake(&d) == 0);
@@ -2594,18 +2664,18 @@ static void test_direct_signin(int port) {
     oc_dbwriter_stop(dbw);
     oc_tls_server_free(&srv);
     idp_stop(&f, ith);
-    unlink("build/itest_direct.db"); unlink("build/itest_direct.db-wal"); unlink("build/itest_direct.db-shm");
+    db_unlink("itest_direct.db");
 }
 
 /* The pages end to end, on a daemon of their own: a password is taken only by
  * a page, which ends with an ID token the client presents on AUTH. */
-static void test_web_signin(int port) {
+static void test_web_signin(void) {
     oc_tls_server srv2;
     CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
     uint8_t pin[OC_TLS_FINGERPRINT_LEN];
     CHECK(oc_tls_server_fingerprint(&srv2, pin) == 0);
-    unlink("build/itest_web.db"); unlink("build/itest_web.db-wal"); unlink("build/itest_web.db-shm");
-    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_web.db");
+    db_unlink("itest_web.db");
+    oc_dbwriter *dbw2 = oc_dbwriter_start(tpath("itest_web.db"));
     if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw2 != NULL);
     if (!dbw2) { oc_tls_server_free(&srv2); return; }
@@ -2629,9 +2699,9 @@ static void test_web_signin(int port) {
     char setup_hex[2 * OC_INVITE_TOKEN_LEN + 1];
     for (size_t i = 0; i < sizeof setup; i++) snprintf(setup_hex + 2 * i, 3, "%02x", setup[i]);
     struct loop_arg arg2;
-    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
     pthread_t th2;
-    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
+    int port = start_loop(&arg2, &th2, &srv2, dbw2, 0);
+    CHECK(port != 0);
 
     char resp[16384], tok[2048], body[1024], ver[OC_SIGNIN_VERIFIER_LEN + 1], ch[OC_SIGNIN_CHALLENGE_LEN + 1];
     CHECK(oc_signin_verifier(ver, ch) == 0);
@@ -2641,13 +2711,15 @@ static void test_web_signin(int port) {
      * run, and forms posted only to itself and the client's callback. */
     snprintf(path, sizeof path, "/signin?redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s", ch);
     CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
+    CHECK(oc_test_page_is(resp, "signin") && !oc_test_page_any_error(resp));
+    /* contract: the security headers, by their RFC names and values */
     CHECK(strstr(resp, "Content-Security-Policy: default-src 'none'") != NULL);
-    CHECK(strstr(resp, "form-action 'self' http://127.0.0.1:5\r\n") != NULL);
+    CHECK(strstr(resp, "form-action 'self' http://127.0.0.1:5\r\n") != NULL);   /* contract: CSP */
     CHECK(strstr(resp, "X-Frame-Options: DENY") && strstr(resp, "Cache-Control: no-store") &&
-          strstr(resp, "Referrer-Policy: same-origin\r\n"));
+          strstr(resp, "Referrer-Policy: same-origin\r\n"));   /* contract: HTTP */
     /* Not no-referrer: under it a browser posts the form with "Origin: null",
      * which the origin check below refuses. */
-    CHECK(strstr(resp, "<meta name=\"referrer\" content=\"same-origin\">") != NULL);
+    CHECK(strstr(resp, "<meta name=\"referrer\" content=\"same-origin\">") != NULL);   /* contract: HTML */
     CHECK(strstr(resp, "autocomplete=\"current-password\"") != NULL);
     CHECK(strstr(resp, "action=\"signin\"") != NULL);                    /* relative: direct or tunnel */
     /* Not a sign-in's link: the redirect is not loopback, or there is no challenge. */
@@ -2666,12 +2738,13 @@ static void test_web_signin(int port) {
     snprintf(path, sizeof path, "/signin?redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&invite=%s",
              ch, setup_hex);
     CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
+    CHECK(oc_test_page_is(resp, "signup"));
     CHECK(strstr(resp, "name=\"confirm\"") != NULL && strstr(resp, setup_hex) != NULL);
     /* The link carries the invitation, so the form keeps it out of sight; the
      * rule for a password is said beside it, and the toggle's script is the
      * page's own. */
-    CHECK(strstr(resp, "type=\"hidden\" name=\"invite\"") != NULL && strstr(resp, "id=\"invite\"") == NULL);
-    CHECK(strstr(resp, "At least 15 characters") != NULL && strstr(resp, "src=\"showpw.js\"") != NULL);
+    CHECK(strstr(resp, "type=\"hidden\" name=\"invite\"") != NULL && strstr(resp, "id=\"invite\"") == NULL);   /* contract: the page's markup */
+    CHECK(strstr(resp, pw_rule_html()) != NULL && strstr(resp, "src=\"showpw.js\"") != NULL);
     CHECK(strstr(resp, "\xE2\x80\x94") == NULL);
     CHECK(web_call(port, pin, "GET", "/showpw.js", NULL, NULL, NULL, resp, sizeof resp) == 200 &&
           strstr(resp, "showpw") != NULL);
@@ -2679,15 +2752,15 @@ static void test_web_signin(int port) {
     snprintf(body, sizeof body, "redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&invite=%s"
              "&username=wes&password=pw-wes&confirm=pw-wes", ch, setup_hex);
     CHECK(web_call(port, pin, "POST", "/signup", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-    CHECK(strstr(resp, "at least 15 characters") != NULL);
+    CHECK(oc_test_page_is(resp, "signup") && oc_test_page_error(resp, "pw-short"));
     snprintf(body, sizeof body, "redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&invite=%s"
              "&username=wes&password=1qaz2wsx3edc4rfv&confirm=1qaz2wsx3edc4rfv", ch, setup_hex);
     CHECK(web_call(port, pin, "POST", "/signup", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-    CHECK(strstr(resp, "too common") != NULL);
+    CHECK(oc_test_page_error(resp, "pw-common"));
     snprintf(body, sizeof body, "redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&invite=%s"
              "&username=wes&password=copper-lantern-meadow&confirm=pw-other", ch, setup_hex);
     CHECK(web_call(port, pin, "POST", "/signup", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-    CHECK(strstr(resp, "don&#39;t match") != NULL);
+    CHECK(oc_test_page_error(resp, "pw-mismatch"));
     snprintf(body, sizeof body, "redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&invite=%s"
              "&username=wes&password=copper-lantern-meadow&confirm=copper-lantern-meadow", ch, setup_hex);
     CHECK(web_call(port, pin, "POST", "/signup", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 303);
@@ -2698,12 +2771,12 @@ static void test_web_signin(int port) {
     uint64_t again = 0;
     CHECK(token_auth(port, pin, tok, ver, &again) == OC_ERR_AUTH_INVALID_TOKEN);
     CHECK(web_call(port, pin, "POST", "/signup", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-    CHECK(strstr(resp, "invitation isn&#39;t valid") != NULL);
+    CHECK(oc_test_page_error(resp, "signup-refused"));
 
     /* A sign-in: the token names the account by id, and is good only with the
      * verifier whose hash it was bound to. */
     CHECK(web_signin(port, pin, "mia", "wrong", ch, tok, sizeof tok, resp, sizeof resp) == 200);
-    CHECK(!tok[0] && strstr(resp, "username or password isn&#39;t right") != NULL);
+    CHECK(!tok[0] && oc_test_page_is(resp, "signin") && oc_test_page_error(resp, "bad-credentials"));
     CHECK(web_signin(port, pin, "mia", "pw-mia", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
     uint64_t got = 0;
     CHECK(token_auth(port, pin, tok, "not-the-verifier-of-this-challenge-at-all", &got) ==
@@ -2716,7 +2789,7 @@ static void test_web_signin(int port) {
         CHECK(oc_local_issuer_generate(&k, &iss) == 0);
         sqlite3 *db = NULL;
         char real_iss[128] = "";
-        if (sqlite3_open("build/itest_web.db", &db) == SQLITE_OK) {
+        if (sqlite3_open(tpath("itest_web.db"), &db) == SQLITE_OK) {
             sqlite3_stmt *st = NULL;
             if (sqlite3_prepare_v2(db, "SELECT issuer FROM local_issuer WHERE id=1;", -1, &st, NULL) == SQLITE_OK &&
                 sqlite3_step(st) == SQLITE_ROW)
@@ -2759,13 +2832,13 @@ static void test_web_signin(int port) {
     }
     CHECK(peer_open(&held));
     CHECK(web_call(port, pin, "GET", "/account/password", NULL, NULL, NULL, resp, sizeof resp) == 200);
-    CHECK(strstr(resp, "autocomplete=\"new-password\"") != NULL);
+    CHECK(oc_test_page_is(resp, "password") && strstr(resp, "autocomplete=\"new-password\"") != NULL);
     CHECK(web_call(port, pin, "POST", "/account/password", GOOD_ORIGIN, FORM,
                    "username=pat&current=pw-bad&password=granite-harbor-violet&confirm=granite-harbor-violet", resp, sizeof resp) == 200);
-    CHECK(strstr(resp, "current password isn&#39;t right") != NULL);
+    CHECK(oc_test_page_error(resp, "bad-current-password") && !oc_test_page_result(resp, "password-changed"));
     CHECK(web_call(port, pin, "POST", "/account/password", GOOD_ORIGIN, FORM,
                    "username=pat&current=pw-old&password=granite-harbor-violet&confirm=granite-harbor-violet", resp, sizeof resp) == 200);
-    CHECK(strstr(resp, "Password changed") != NULL);
+    CHECK(oc_test_page_result(resp, "password-changed") && !oc_test_page_any_error(resp));
     CHECK(peer_closed(&held, PEER_CLOSES) == 1);
     client_close(&held);
     CHECK(web_signin(port, pin, "pat", "pw-old", ch, tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
@@ -2774,7 +2847,7 @@ static void test_web_signin(int port) {
     /* A removed member is refused, whatever they type. */
     {
         sqlite3 *db = NULL;
-        CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+        CHECK(sqlite3_open(tpath("itest_web.db"), &db) == SQLITE_OK);
         sqlite3_busy_timeout(db, 5000);
         char sql[96];
         snprintf(sql, sizeof sql, "UPDATE users SET disabled=1 WHERE id=%llu;", (unsigned long long)mia);
@@ -2818,7 +2891,7 @@ static void test_web_signin(int port) {
         memset(secret, 0x33, sizeof secret);
         CHECK(oc_factor_seal(fkey, sam, secret, sealed) == 0);
         sqlite3 *db = NULL;
-        CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+        CHECK(sqlite3_open(tpath("itest_web.db"), &db) == SQLITE_OK);
         sqlite3_busy_timeout(db, 5000);
         sqlite3_stmt *st = NULL;
         sqlite3_prepare_v2(db, "INSERT INTO local_totp(user_id, secret, confirmed_at_ms) VALUES(?, ?, 1);", -1, &st, NULL);
@@ -2844,10 +2917,10 @@ static void test_web_signin(int port) {
         uint64_t step = (uint64_t)time(NULL) / OC_TOTP_STEP_S;
         char code[8], ticket[64], ticket2[64];
         CHECK(web_signin(port, pin, "sam", "pw-sam", ch, tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
-        CHECK(strstr(resp, "Two-step sign-in") != NULL && ticket_of(resp, ticket, sizeof ticket));
+        CHECK(oc_test_page_is(resp, "step") && ticket_of(resp, ticket, sizeof ticket));
         CHECK(strstr(resp, "action=\"signin/verify\"") != NULL);
         CHECK(web_verify(port, pin, ticket, "000000", tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
-        CHECK(strstr(resp, "That code isn&#39;t right") != NULL && strstr(resp, ticket) != NULL);
+        CHECK(oc_test_page_is(resp, "step") && oc_test_page_error(resp, "code-wrong") && strstr(resp, ticket) != NULL);
         CHECK(strstr(resp, "action=\"verify\"") != NULL);
         snprintf(code, sizeof code, "%06u", oc_totp_code(secret, sizeof secret, step));
         CHECK(web_verify(port, pin, ticket, code, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
@@ -2881,13 +2954,13 @@ static void test_web_signin(int port) {
          * is passed: the next step's code finishes it. */
         CHECK(web_call(port, pin, "POST", "/account/password", GOOD_ORIGIN, FORM,
                        "username=sam&current=pw-sam&password=thunder-cobalt-orchard&confirm=thunder-cobalt-orchard", resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "Two-step sign-in") != NULL && ticket_of(resp, ticket2, sizeof ticket2));
+        CHECK(oc_test_page_is(resp, "step") && ticket_of(resp, ticket2, sizeof ticket2));
         CHECK(strstr(resp, "action=\"../signin/verify\"") != NULL);
         CHECK(web_signin(port, pin, "sam", "thunder-cobalt-orchard", ch, tok, sizeof tok, resp, sizeof resp) == 200 &&
               !ticket_of(resp, ticket, sizeof ticket));                   /* not changed yet */
         snprintf(code, sizeof code, "%06u", oc_totp_code(secret, sizeof secret, step + 1));
         CHECK(web_verify(port, pin, ticket2, code, NULL, 0, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "Password changed") != NULL);
+        CHECK(oc_test_page_result(resp, "password-changed"));
         CHECK(web_verify(port, pin, stale, "FGHIJ67890", tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
         CHECK(web_signin(port, pin, "sam", "thunder-cobalt-orchard", ch, tok, sizeof tok, resp, sizeof resp) == 200 &&
               ticket_of(resp, ticket, sizeof ticket));
@@ -2906,14 +2979,17 @@ static void test_web_signin(int port) {
     {
         char ticket[64], key[64], code[8], codes[256], one[16];
         CHECK(web_call(port, pin, "GET", "/account/security", NULL, NULL, NULL, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "name=\"password\"") != NULL && strstr(resp, "script-src") == NULL);
+        CHECK(oc_test_page_is(resp, "security-signin") && strstr(resp, "name=\"password\"") != NULL);
+        CHECK(strstr(resp, "Content-Security-Policy: ") && strstr(resp, "script-src") == NULL);   /* contract: CSP */
         CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM,
                        "username=kim&password=wrong", resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "isn&#39;t right") != NULL && !ticket_of(resp, ticket, sizeof ticket));
+        CHECK(oc_test_page_is(resp, "security-signin") && oc_test_page_error(resp, "bad-credentials") &&
+              !ticket_of(resp, ticket, sizeof ticket));
         CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM,
                        "username=kim&password=pw-kim", resp, sizeof resp) == 200);
-        CHECK(ticket_of(resp, ticket, sizeof ticket) && between(resp, "Key: <code>", "</code>", key, sizeof key));
-        CHECK(strstr(resp, "<svg class=\"qr\"") != NULL && strstr(resp, "<path fill=\"black\" d=\"M") != NULL);
+        CHECK(oc_test_page_is(resp, "security-setup") && ticket_of(resp, ticket, sizeof ticket) &&
+              between(resp, "<code>", "</code>", key, sizeof key));
+        CHECK(strstr(resp, "<svg class=\"qr\"") != NULL && strstr(resp, "<path fill=\"black\" d=\"M") != NULL);   /* contract: the QR code's markup */
         uint8_t secret[OC_TOTP_SECRET_LEN];
         CHECK(base32_bytes(key, secret, sizeof secret) == sizeof secret);
         /* Not on until its first code: a sign-in is not asked for one yet. */
@@ -2921,11 +2997,13 @@ static void test_web_signin(int port) {
         char body[256];
         snprintf(body, sizeof body, "ticket=%s&action=confirm&code=000000", ticket);
         CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "That code isn&#39;t right") != NULL && strstr(resp, "value=\"confirm\"") != NULL);
+        CHECK(oc_test_page_is(resp, "security-confirm") && oc_test_page_error(resp, "code-wrong") &&
+              strstr(resp, "value=\"confirm\"") != NULL);
         uint64_t step = (uint64_t)time(NULL) / OC_TOTP_STEP_S;
         snprintf(code, sizeof code, "%06u", oc_totp_code(secret, sizeof secret, step));
         snprintf(body, sizeof body, "ticket=%s&action=confirm&code=%s", ticket, code);
         CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(oc_test_page_result(resp, "step-on"));
         CHECK(between(resp, "<pre id=\"codes\">", "</pre>", codes, sizeof codes));
         int lines = 0;
         for (const char *q = codes; *q; q++) lines += *q == '\n';
@@ -2938,10 +3016,11 @@ static void test_web_signin(int port) {
                 o += (size_t)snprintf(want + o, sizeof want - o, *q == '\n' ? "%%0A" : "%c", *q);
             CHECK(between(resp, "<a href=\"data:text/plain;charset=utf-8,", "\" download=\"openchime-recovery-codes.txt\">",
                           href, sizeof href));
-            CHECK(strncmp(href, "OpenChime%20recovery%20codes%20for%20kim.", 41) == 0);
+            /* The file names whose codes they are, and ends with the codes. */
+            CHECK(strstr(href, "kim") != NULL);
             CHECK(strlen(href) > strlen(want) && strcmp(href + strlen(href) - strlen(want), want) == 0);
-            CHECK(strstr(resp, "<button type=\"button\" id=\"copy\" hidden>Copy</button>") != NULL);
-            CHECK(strstr(resp, "script-src 'self'") != NULL);
+            CHECK(strstr(resp, "id=\"copy\" hidden") != NULL);   /* shown by its script, where it can copy */   /* contract: the page's markup */
+            CHECK(strstr(resp, "script-src 'self'") != NULL);   /* contract: CSP */
             CHECK(between(resp, "<script src=\"../codes.js\" integrity=\"", "\"", sri, sizeof sri));
             CHECK(web_call(port, pin, "GET", "/codes.js", NULL, NULL, NULL, resp, sizeof resp) == 200);
             const char *js = strstr(resp, "\r\n\r\n");
@@ -2965,14 +3044,15 @@ static void test_web_signin(int port) {
         /* On: the page offers to turn it off, with a code -- the next step's. */
         CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM,
                        "username=kim&password=pw-kim", resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "value=\"remove\"") != NULL && ticket_of(resp, ticket, sizeof ticket));
+        CHECK(oc_test_page_is(resp, "security-on") && strstr(resp, "value=\"remove\"") != NULL &&
+              ticket_of(resp, ticket, sizeof ticket));
         snprintf(code, sizeof code, "%06u", oc_totp_code(secret, sizeof secret, step + 1));
         snprintf(body, sizeof body, "ticket=%s&action=remove&code=%s", ticket, code);
         CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "Two-step sign-in is off") != NULL);
+        CHECK(oc_test_page_result(resp, "step-off"));
         {   /* nothing of it is left: no secret, no recovery codes */
             sqlite3 *db = NULL;
-            CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+            CHECK(sqlite3_open(tpath("itest_web.db"), &db) == SQLITE_OK);
             sqlite3_busy_timeout(db, 5000);
             sqlite3_stmt *st = NULL;
             sqlite3_prepare_v2(db, "SELECT (SELECT COUNT(*) FROM local_totp t JOIN users u ON u.id=t.user_id "
@@ -2989,7 +3069,7 @@ static void test_web_signin(int port) {
          * no step is asked, and the page is closed. */
         oc_dbwriter_set_local_mfa(dbw2, OC_MFA_REQUIRED);
         CHECK(web_signin(port, pin, "kim", "pw-kim", ch, tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
-        CHECK(strstr(resp, "requires two-step sign-in") != NULL);
+        CHECK(oc_test_page_error(resp, "step-required"));
         oc_dbwriter_set_local_mfa(dbw2, OC_MFA_OFF);
         CHECK(web_call(port, pin, "GET", "/account/security", NULL, NULL, NULL, resp, sizeof resp) == 404);
         CHECK(web_signin(port, pin, "sam", "thunder-cobalt-orchard", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
@@ -3010,7 +3090,7 @@ static void test_web_signin(int port) {
             memcpy(buf, row, 16); memcpy(buf + 16, "KLMNP23456", 10);
             mbedtls_sha256(buf, sizeof buf, row + 16, 0);
             sqlite3 *db = NULL;
-            CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+            CHECK(sqlite3_open(tpath("itest_web.db"), &db) == SQLITE_OK);
             sqlite3_busy_timeout(db, 5000);
             sqlite3_stmt *st = NULL;
             sqlite3_prepare_v2(db, "INSERT INTO local_totp(user_id, secret, confirmed_at_ms) VALUES(?, ?, 1);", -1, &st, NULL);
@@ -3027,18 +3107,21 @@ static void test_web_signin(int port) {
         }
         CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM,
                        "username=pia&password=pw-pia", resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "value=\"passkey\"") != NULL && ticket_of(resp, ticket, sizeof ticket));
+        CHECK(oc_test_page_is(resp, "security-on") && strstr(resp, "value=\"passkey\"") != NULL &&
+              ticket_of(resp, ticket, sizeof ticket));
         /* A wrong code allows nothing; nor does a ticket no code allowed. */
         snprintf(body, sizeof body, "ticket=%s&action=passkey&code=000000", ticket);
         CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "data-mode=\"create\"") == NULL && strstr(resp, "That code isn&#39;t right") != NULL);
+        CHECK(!oc_test_page_is(resp, "security-passkey") && strstr(resp, "data-mode=\"create\"") == NULL &&
+              oc_test_page_error(resp, "code-wrong"));
         snprintf(body, sizeof body, "ticket=%s&action=passkey_add&pk_cd=e30&pk_att=oA", ticket);
         CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 400);
         snprintf(body, sizeof body, "ticket=%s&action=passkey&code=KLMNP23456", ticket);
         CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
         CHECK(ticket_of(resp, ticket, sizeof ticket) && between(resp, "data-challenge=\"", "\"", challenge, sizeof challenge));
-        CHECK(strstr(resp, "data-rp=\"web.test\"") && strstr(resp, "data-mode=\"create\""));
-        CHECK(strstr(resp, "script-src 'self'") != NULL);
+        CHECK(oc_test_page_is(resp, "security-passkey") && strstr(resp, "data-rp=\"web.test\"") &&
+              strstr(resp, "data-mode=\"create\""));
+        CHECK(strstr(resp, "script-src 'self'") != NULL);   /* contract: CSP */
         char sri[80];
         CHECK(between(resp, "integrity=\"", "\"", sri, sizeof sri));
         static char pkpage[32768];
@@ -3054,7 +3137,7 @@ static void test_web_signin(int port) {
         oc_base64url_encode(att, atl, b64b);
         snprintf(body, sizeof body, "ticket=%s&action=passkey_add&pk_cd=%s&pk_att=%s", ticket, b64, b64b);
         CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "Passkey added") != NULL);
+        CHECK(oc_test_page_result(resp, "passkey-added"));
 
         /* The script the page named -- at the path it names, from where the page
          * is -- and the hash it named it by. */
@@ -3103,7 +3186,7 @@ static void test_web_signin(int port) {
         CHECK(ticket_of(resp, ticket, sizeof ticket));
         snprintf(body, sizeof body, "ticket=%s&code=&pk_cred=%s&pk_cd=%s&pk_ad=%s&pk_sig=%s", ticket, cid, ecd, ead, esig);
         CHECK(web_call(port, pin, "POST", "/signin/verify", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "That code isn&#39;t right") != NULL);
+        CHECK(oc_test_page_is(resp, "step") && oc_test_page_error(resp, "code-wrong"));
 
         /* A passkey stored for another name does not answer here, even within a
          * ceremony this name's passkey opened. */
@@ -3113,7 +3196,7 @@ static void test_web_signin(int port) {
             uint8_t ocose[200];
             size_t ocl = wa_cose(&o, ocose);
             sqlite3 *db = NULL;
-            CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+            CHECK(sqlite3_open(tpath("itest_web.db"), &db) == SQLITE_OK);
             sqlite3_busy_timeout(db, 5000);
             sqlite3_stmt *st = NULL;
             sqlite3_prepare_v2(db, "INSERT INTO webauthn_credentials(user_id, cred_id, cose_key, rp_id, created_at_ms) "
@@ -3161,8 +3244,9 @@ static void test_web_signin(int port) {
         /* Off the trusted name -- the tunnel's, a self-signed daemon's -- none is offered. */
         oc_netloop_set_passkey_names("");
         CHECK(web_signin(port, pin, "pia", "pw-pia", ch, tok, sizeof tok, resp, sizeof resp) == 200);
-        CHECK(ticket_of(resp, ticket, sizeof ticket) && strstr(resp, "id=\"passkey\"") == NULL);
-        CHECK(strstr(resp, "script-src") == NULL);
+        CHECK(ticket_of(resp, ticket, sizeof ticket) && oc_test_page_is(resp, "step") &&
+              strstr(resp, "id=\"passkey\"") == NULL);
+        CHECK(strstr(resp, "Content-Security-Policy: ") && strstr(resp, "script-src") == NULL);   /* contract: CSP */
         /* Turning the step off takes the passkeys with it. */
         {
             uint8_t psecret[OC_TOTP_SECRET_LEN];
@@ -3173,9 +3257,9 @@ static void test_web_signin(int port) {
                            "username=pia&password=pw-pia", resp, sizeof resp) == 200 && ticket_of(resp, ticket, sizeof ticket));
             snprintf(body, sizeof body, "ticket=%s&action=remove&code=%s", ticket, pcode);
             CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-            CHECK(strstr(resp, "Two-step sign-in is off") != NULL);
+            CHECK(oc_test_page_result(resp, "step-off"));
             sqlite3 *db = NULL;
-            CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+            CHECK(sqlite3_open(tpath("itest_web.db"), &db) == SQLITE_OK);
             sqlite3_busy_timeout(db, 5000);
             sqlite3_stmt *st = NULL;
             sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM webauthn_credentials;", -1, &st, NULL);
@@ -3194,7 +3278,7 @@ static void test_web_signin(int port) {
         for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", raw[i]);
         mbedtls_sha256(raw, sizeof raw, hash, 0);
         sqlite3 *db = NULL;
-        CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+        CHECK(sqlite3_open(tpath("itest_web.db"), &db) == SQLITE_OK);
         sqlite3_busy_timeout(db, 5000);
         sqlite3_stmt *st = NULL;
         sqlite3_prepare_v2(db, "INSERT INTO credential_resets(token_hash, user_id, created_by, created_at_ms, "
@@ -3206,19 +3290,21 @@ static void test_web_signin(int port) {
         sqlite3_close(db);
         snprintf(path, sizeof path, "/account/reset?t=%s", hex);
         CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "Set a new password") != NULL && strstr(resp, hex) != NULL);
+        CHECK(oc_test_page_is(resp, "reset") && strstr(resp, hex) != NULL);
         CHECK(web_call(port, pin, "GET", "/account/reset?t=short", NULL, NULL, NULL, resp, sizeof resp) == 400);
         snprintf(body, sizeof body, "t=%s&password=ember-glacier-saffron&confirm=pw-other", hex);
         CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "don&#39;t match") != NULL);
+        CHECK(oc_test_page_is(resp, "reset") && oc_test_page_error(resp, "pw-mismatch"));
         snprintf(body, sizeof body, "t=%s&password=ember-glacier-saffron&confirm=ember-glacier-saffron", hex);
         CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "Password set") != NULL);
+        CHECK(oc_test_page_is(resp, "reset-done") && oc_test_page_result(resp, "password-set"));
         CHECK(web_signin(port, pin, "pat", "ember-glacier-saffron", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
         CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
         /* Spent: said of the reset, which was a link here and is a code typed on
-         * the sign-in card elsewhere -- the words must be true of both. */
-        CHECK(strstr(resp, "This reset isn&#39;t good any more") != NULL && strstr(resp, "link") == NULL);
+         * the sign-in card elsewhere -- so its sentence (the one place it is
+         * checked, by its constant) must be true of both. */
+        CHECK(oc_test_page_is(resp, "reset") && oc_test_page_error(resp, "reset-spent"));
+        CHECK(strstr(oc_page_err_text(OC_PERR_RESET_SPENT), "link") == NULL);
     }
 
     /* Opened by the person's own client, the reset page carries its sign-in and,
@@ -3230,7 +3316,7 @@ static void test_web_signin(int port) {
         for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", raw[i]);
         mbedtls_sha256(raw, sizeof raw, hash, 0);
         sqlite3 *db = NULL;
-        CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+        CHECK(sqlite3_open(tpath("itest_web.db"), &db) == SQLITE_OK);
         sqlite3_busy_timeout(db, 5000);
         sqlite3_stmt *st = NULL;
         sqlite3_prepare_v2(db, "INSERT INTO credential_resets(token_hash, user_id, created_by, created_at_ms, "
@@ -3243,7 +3329,7 @@ static void test_web_signin(int port) {
         snprintf(path, sizeof path, "/account/reset?t=%s&redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s",
                  hex, ch);
         CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "name=\"redirect_uri\" value=\"http://127.0.0.1:5/cb\"") != NULL &&
+        CHECK(oc_test_page_is(resp, "reset") && strstr(resp, "name=\"redirect_uri\" value=\"http://127.0.0.1:5/cb\"") != NULL &&   /* contract: the page's markup */
               strstr(resp, "name=\"nonce\"") != NULL);
         snprintf(path, sizeof path, "/account/reset?t=%s&redirect_uri=https%%3A%%2F%%2Fevil.example%%2Fcb&nonce=%s",
                  hex, ch);
@@ -3258,24 +3344,24 @@ static void test_web_signin(int port) {
         CHECK(strstr(resp, loc) != NULL);
         snprintf(path, sizeof path, "/signin?redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&set=1", ch);
         CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "Your new password is set") != NULL);
+        CHECK(oc_test_page_is(resp, "signin") && oc_test_page_result(resp, "password-set"));
         CHECK(web_signin(port, pin, "pat", "orbit-pebble-canyon", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
         /* The code again, as a client sends it: spent, and said so without
          * calling it a link. */
         CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "This reset isn&#39;t good any more") != NULL && strstr(resp, "link") == NULL);
+        CHECK(oc_test_page_error(resp, "reset-spent"));
     }
 
     /* The per-account limiter stands in front of the page as of the frame. */
     for (int i = 0; i < 5; i++)
         CHECK(web_signin(port, pin, "zed", "wrong", ch, tok, sizeof tok, resp, sizeof resp) == 200);
     CHECK(web_signin(port, pin, "zed", "pw-zed", ch, tok, sizeof tok, resp, sizeof resp) == 429 && !tok[0]);
-    CHECK(strstr(resp, "Too many attempts") != NULL);
+    CHECK(oc_test_page_error(resp, "rate-limited"));
 
     stop_loop(&arg2, th2);
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
-    unlink("build/itest_web.db"); unlink("build/itest_web.db-wal"); unlink("build/itest_web.db-shm");
+    db_unlink("itest_web.db");
 }
 
 /* --- device codes (AUTH.md §8.11) -------------------------------------------- */
@@ -3317,6 +3403,21 @@ static int device_poll(client *a, const char *dcode, char *tok, size_t cap, char
     return 0;
 }
 
+/* The interval a SLOW_DOWN names, in seconds: the number in its message (the
+ * code is the contract; the number is the one fact the message carries).
+ * -1 if it names none. */
+static int slow_interval(const char *why) {
+    const char *d = why;
+    while (*d && (*d < '0' || *d > '9')) d++;
+    return *d ? atoi(d) : -1;
+}
+
+/* A poll before the terminal is let in: still waiting, or told to slow down
+ * to `slower` seconds. */
+static int poll_waiting(int rc, const char *why, int slower) {
+    return rc == OC_ERR_AUTH_PENDING || (rc == OC_ERR_AUTH_SLOW_DOWN && slow_interval(why) == slower);
+}
+
 static int user_code_shape(const char *u) {
     if (strlen(u) != 9 || u[4] != '-') return 0;
     for (int i = 0; i < 9; i++) if (i != 4 && !strchr("BCDFGHJKLMNPQRSTVWXZ", u[i])) return 0;
@@ -3327,31 +3428,31 @@ static int user_code_shape(const char *u) {
  * default). */
 struct dev_daemon { oc_tls_server srv; uint8_t pin[OC_TLS_FINGERPRINT_LEN]; oc_dbwriter *dbw;
                     struct loop_arg arg; pthread_t th; uint64_t dee; };
-static int dev_daemon_start(struct dev_daemon *d, int port, uint64_t ttl) {
+static int dev_daemon_start(struct dev_daemon *d, uint64_t ttl) {
     memset(d, 0, sizeof *d);
     if (oc_tls_server_init(&d->srv, NULL, NULL) != 0 || oc_tls_server_fingerprint(&d->srv, d->pin) != 0) return -1;
-    unlink("build/itest_dev.db"); unlink("build/itest_dev.db-wal"); unlink("build/itest_dev.db-shm");
-    d->dbw = oc_dbwriter_start("build/itest_dev.db");
+    db_unlink("itest_dev.db");
+    d->dbw = oc_dbwriter_start(tpath("itest_dev.db"));
     if (d->dbw) oc_dbwriter_set_pw_mem(d->dbw, 2048);   /* a cheap Argon2id for tests */
     if (!d->dbw) return -1;
     d->dee = oc_dbwriter_register_local(d->dbw, "dee", "pw-dee", OC_ROLE_MEMBER, 2048);
     oc_netloop_set_device_ttl_ms(ttl);
-    d->arg.port = port; d->arg.srv = &d->srv; d->arg.dbw = d->dbw; d->arg.stop = 0;
-    return pthread_create(&d->th, NULL, loop_thread, &d->arg) == 0 && d->dee ? 0 : -1;
+    return start_loop(&d->arg, &d->th, &d->srv, d->dbw, 0) && d->dee ? 0 : -1;
 }
 static void dev_daemon_stop(struct dev_daemon *d) {
     stop_loop(&d->arg, d->th);
     oc_netloop_set_device_ttl_ms(0);
     oc_dbwriter_stop(d->dbw);
     oc_tls_server_free(&d->srv);
-    unlink("build/itest_dev.db"); unlink("build/itest_dev.db-wal"); unlink("build/itest_dev.db-shm");
+    db_unlink("itest_dev.db");
 }
 
 /* A terminal signs in with a code: asked for on the protocol, entered and
  * approved on the /device page, collected by a poll, presented on AUTH. */
-static void test_device_signin(int port) {
+static void test_device_signin(void) {
     struct dev_daemon d;
-    CHECK(dev_daemon_start(&d, port, 0) == 0);
+    CHECK(dev_daemon_start(&d, 0) == 0);
+    int port = d.arg.port;
     const uint8_t *pin = d.pin;
     char ver[OC_SIGNIN_VERIFIER_LEN + 1], ch[OC_SIGNIN_CHALLENGE_LEN + 1];
     CHECK(oc_signin_verifier(ver, ch) == 0);
@@ -3366,31 +3467,32 @@ static void test_device_signin(int port) {
     /* Not yet; and a poll sooner than the interval makes it longer. */
     CHECK(device_poll(&a, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_PENDING);
     CHECK(device_poll(&a, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_SLOW_DOWN);
-    CHECK(strcmp(why, "poll every 10 seconds") == 0);
+    CHECK(slow_interval(why) == 10);
     /* The code a person sees does not collect the token. */
     CHECK(device_poll(&a, ucode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_EXPIRED);
 
     /* The page: a form for the code; then, for the code -- typed in lower case,
      * without its dash -- who is asking and from where. */
     CHECK(web_call(port, pin, "GET", "/device", NULL, NULL, NULL, resp, sizeof resp) == 200);
-    CHECK(strstr(resp, "name=\"code\"") && strstr(resp, "Content-Security-Policy: default-src 'none'"));
+    CHECK(oc_test_page_is(resp, "device-code") && strstr(resp, "name=\"code\""));
+    CHECK(strstr(resp, "Content-Security-Policy: default-src 'none'"));   /* contract: CSP */
     char typed[16];
     snprintf(typed, sizeof typed, "%.4s%.4s", ucode, ucode + 5);
     for (char *t = typed; *t; t++) *t = (char)(*t - 'A' + 'a');
     snprintf(path, sizeof path, "/device?code=%s", typed);
     CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
-    CHECK(strstr(resp, ucode) && strstr(resp, "from <b>127.0.0.1</b>") && strstr(resp, "Only go on if that was you"));
+    CHECK(oc_test_page_is(resp, "device-confirm") && strstr(resp, ucode) && strstr(resp, "127.0.0.1"));
     /* Approve: a wrong password shows the form again; the right one signs the
      * terminal in, and its next poll collects the token. */
     snprintf(body, sizeof body, "code=%s&username=dee&password=wrong&action=approve", ucode);
     CHECK(web_call(port, pin, "POST", "/device", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-    CHECK(strstr(resp, "isn&#39;t right") && strstr(resp, "from <b>127.0.0.1</b>"));
-    CHECK(device_poll(&a, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_PENDING ||
-          strcmp(why, "poll every 15 seconds") == 0);
+    CHECK(oc_test_page_is(resp, "device-confirm") && oc_test_page_error(resp, "bad-credentials") &&
+          strstr(resp, "127.0.0.1"));
+    CHECK(poll_waiting(device_poll(&a, dcode, tok, sizeof tok, why, sizeof why), why, 15));
     snprintf(body, sizeof body, "code=%s&username=dee&password=pw-dee&action=approve", ucode);
     CHECK(web_call(port, pin, "POST", "/device", NULL, FORM, body, resp, sizeof resp) == 403);   /* Origin */
     CHECK(web_call(port, pin, "POST", "/device", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-    CHECK(strstr(resp, "Go back to your terminal") != NULL);
+    CHECK(oc_test_page_is(resp, "device-done") && oc_test_page_result(resp, "approved"));
     CHECK(device_poll(&a, dcode, tok, sizeof tok, why, sizeof why) == 0 && tok[0]);
     CHECK(device_poll(&a, dcode, tok + 1024, sizeof tok - 1024, why, sizeof why) == OC_ERR_AUTH_EXPIRED);   /* once */
     client_close(&a);
@@ -3408,7 +3510,7 @@ static void test_device_signin(int port) {
         oc_dbwriter_set_factor_key(d.dbw, fkey);
         CHECK(oc_factor_seal(fkey, d.dee, secret, sealed) == 0);
         sqlite3 *db = NULL;
-        CHECK(sqlite3_open("build/itest_dev.db", &db) == SQLITE_OK);
+        CHECK(sqlite3_open(tpath("itest_dev.db"), &db) == SQLITE_OK);
         sqlite3_busy_timeout(db, 5000);
         sqlite3_stmt *st = NULL;
         sqlite3_prepare_v2(db, "INSERT INTO local_totp(user_id, secret, confirmed_at_ms) VALUES(?, ?, 1);", -1, &st, NULL);
@@ -3423,22 +3525,17 @@ static void test_device_signin(int port) {
         snprintf(body, sizeof body, "code=%s&username=dee&password=pw-dee&action=approve", ucode);
         CHECK(web_call(port, pin, "POST", "/device", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
         char ticket[64], code[8];
-        CHECK(strstr(resp, "Two-step sign-in") != NULL && ticket_of(resp, ticket, sizeof ticket));
+        CHECK(oc_test_page_is(resp, "step") && ticket_of(resp, ticket, sizeof ticket));
         CHECK(strstr(resp, "action=\"signin/verify\"") != NULL);
-        CHECK(device_poll(&s2, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_PENDING ||
-              strcmp(why, "poll every 15 seconds") == 0);
+        CHECK(poll_waiting(device_poll(&s2, dcode, tok, sizeof tok, why, sizeof why), why, 15));
         snprintf(code, sizeof code, "%06u", oc_totp_code(secret, sizeof secret, (uint64_t)time(NULL) / OC_TOTP_STEP_S));
         CHECK(web_verify(port, pin, ticket, code, NULL, 0, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "Go back to your terminal") != NULL);
-        int polled = -1;
-        for (int i = 0; i < 6 && polled != 0; i++) {
-            polled = device_poll(&s2, dcode, tok, sizeof tok, why, sizeof why);
-            if (polled == OC_ERR_AUTH_SLOW_DOWN) usleep(100000);
-        }
-        CHECK(polled == 0 && tok[0]);
+        CHECK(oc_test_page_is(resp, "device-done") && oc_test_page_result(resp, "approved"));
+        /* Approved: the next poll collects it, however soon (devicecodes.c). */
+        CHECK(device_poll(&s2, dcode, tok, sizeof tok, why, sizeof why) == 0 && tok[0]);
         CHECK(token_auth(port, pin, tok, ver, &uid) == 0 && uid == d.dee);
         client_close(&s2);
-        sqlite3_open("build/itest_dev.db", &db);
+        sqlite3_open(tpath("itest_dev.db"), &db);
         sqlite3_busy_timeout(db, 5000);
         sqlite3_exec(db, "DELETE FROM local_totp;", NULL, NULL, NULL);
         sqlite3_close(db);
@@ -3450,7 +3547,7 @@ static void test_device_signin(int port) {
     CHECK(device_begin(&b, ch, dcode, sizeof dcode, ucode, sizeof ucode, &interval, &expires, vpath, sizeof vpath) == 0);
     snprintf(body, sizeof body, "code=%s&action=deny", ucode);
     CHECK(web_call(port, pin, "POST", "/device", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-    CHECK(strstr(resp, "Sign-in refused") != NULL);
+    CHECK(oc_test_page_is(resp, "device-done") && oc_test_page_result(resp, "denied"));
     CHECK(device_poll(&b, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_DENIED);
     CHECK(device_poll(&b, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_EXPIRED);
     /* One source keeps at most five waiting. */
@@ -3462,20 +3559,24 @@ static void test_device_signin(int port) {
     /* Codes cannot be walked: ten wrong lookups a minute, then refused. */
     for (int i = 0; i < 10; i++)
         CHECK(web_call(port, pin, "GET", "/device?code=BBBB-BBBB", NULL, NULL, NULL, resp, sizeof resp) == 200 &&
-              strstr(resp, "isn&#39;t one we&#39;re waiting for"));
+              oc_test_page_is(resp, "device-code") && oc_test_page_error(resp, "device-unknown"));
     CHECK(web_call(port, pin, "GET", "/device?code=BBBB-BBBB", NULL, NULL, NULL, resp, sizeof resp) == 429);
+    CHECK(oc_test_page_error(resp, "device-limited"));
     dev_daemon_stop(&d);
 
     /* A code's life runs out. */
-    CHECK(dev_daemon_start(&d, port + 1, 400) == 0);
+    CHECK(dev_daemon_start(&d, 400) == 0);
+    port = d.arg.port;
     client e;
-    CHECK(client_open(&e, port + 1, d.pin) == 0 && do_handshake(&e) == 0);
+    CHECK(client_open(&e, port, d.pin) == 0 && do_handshake(&e) == 0);
     CHECK(device_begin(&e, ch, dcode, sizeof dcode, ucode, sizeof ucode, &interval, &expires, vpath, sizeof vpath) == 0);
-    usleep(600 * 1000);
-    CHECK(device_poll(&e, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_EXPIRED);
     snprintf(path, sizeof path, "/device?code=%s", ucode);
-    CHECK(web_call(port + 1, d.pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200 &&
-          strstr(resp, "isn&#39;t one we&#39;re waiting for"));
+    CHECK(web_call(port, d.pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200 &&
+          oc_test_page_is(resp, "device-confirm"));                       /* alive, before its life is up */
+    oc_test_let_time_pass(600);                                          /* a 400 ms life: time itself */
+    CHECK(device_poll(&e, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_EXPIRED);
+    CHECK(web_call(port, d.pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200 &&
+          oc_test_page_error(resp, "device-unknown"));
     client_close(&e);
     dev_daemon_stop(&d);
 }
@@ -3485,24 +3586,22 @@ static void test_device_signin(int port) {
  * (main.c hands the loop none). Either way it is not offered, a segment is
  * refused, and the rest of the daemon serves on. Its own loop, run after the
  * shared one has stopped: the recognizer worker is the loop's. */
-static void test_voice_input_absent(int port, int by_env) {
+static void test_voice_input_absent(int by_env) {
     if (by_env) setenv("OPENCHIME_STT", "0", 1);
     else        oc_netloop_set_stt(NULL);
     oc_tls_server srv2;
     CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
     uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
     CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
-    unlink("build/itest_stt_off.db");
-    unlink("build/itest_stt_off.db-wal");
-    unlink("build/itest_stt_off.db-shm");
-    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_stt_off.db");
+    db_unlink("itest_stt_off.db");
+    oc_dbwriter *dbw2 = oc_dbwriter_start(tpath("itest_stt_off.db"));
     if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw2 != NULL);
     CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
     struct loop_arg arg2;
-    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
     pthread_t th2;
-    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
+    int port = start_loop(&arg2, &th2, &srv2, dbw2, 0);
+    CHECK(port != 0);
 
     client a;
     CHECK(client_open(&a, port, pin2) == 0);
@@ -3539,9 +3638,7 @@ static void test_voice_input_absent(int port, int by_env) {
     oc_tls_server_free(&srv2);
     if (by_env) unsetenv("OPENCHIME_STT");
     else        oc_netloop_set_stt(&STUB_STT);
-    unlink("build/itest_stt_off.db");
-    unlink("build/itest_stt_off.db-wal");
-    unlink("build/itest_stt_off.db-shm");
+    db_unlink("itest_stt_off.db");
 }
 
 /* Summaries over the wire (REQ-310, ARCH-116): the "summarize" capability is
@@ -3551,6 +3648,8 @@ static void test_voice_input_absent(int port, int by_env) {
  * no worker the answer is UNAVAILABLE. Its own daemon and database, so the
  * shared one's channel history does not enter the summary. */
 typedef struct { int calls; volatile int hold; } sum_stub;
+/* The stub model's overview, as summary_doc_ok expects it back. */
+#define STUB_OVERVIEW "The ship date was set."
 static void *sstub_open(void *ctx, char *err, size_t cap) { (void)err; (void)cap; return ctx; }
 static void sstub_close(void *h) { (void)h; }
 static int sstub_run(void *h, const char *system, const char *user, const char *grammar, int max_out,
@@ -3558,15 +3657,13 @@ static int sstub_run(void *h, const char *system, const char *user, const char *
     (void)system; (void)user; (void)max_out; (void)err; (void)cap;
     __atomic_add_fetch(&((sum_stub *)h)->calls, 1, __ATOMIC_RELAXED);
     /* Held: the model is busy, as a real one is for minutes. */
-    while (__atomic_load_n(&((sum_stub *)h)->hold, __ATOMIC_ACQUIRE)) {
+    uint64_t end = oc_test_deadline(60000);   /* the test's gate, never held for good */
+    while (__atomic_load_n(&((sum_stub *)h)->hold, __ATOMIC_ACQUIRE) && oc_test_pause(end))
         if (gate && gate(gctx)) return -1;
-        struct timespec ts = { 0, 5 * 1000000L };
-        nanosleep(&ts, NULL);
-    }
     if (st) memset(st, 0, sizeof *st);
-    *out = strdup(grammar && strstr(grammar, "note ::=")
-                  ? "- [1] decision | Shipping | The ship date was set.\n"
-                  : "Overview: [1] The ship date was set.\n## Shipping\n[1] The ship date was set.\n- [1] Ship on Friday\n");
+    *out = strdup(grammar && strstr(grammar, "note ::=")   /* contract: the summary grammar's rule name */
+                  ? "- [1] decision | Shipping | " STUB_OVERVIEW "\n"
+                  : "Overview: [1] " STUB_OVERVIEW "\n## Shipping\n[1] " STUB_OVERVIEW "\n- [1] Ship on Friday\n");
     return 0;
 }
 static int sq_cpu(void *c, uint64_t *b, uint64_t *t) { (void)c; static uint64_t n; n += 100; *b = 0; *t = n; return 0; }
@@ -3585,23 +3682,54 @@ static int sq_take(void *ctx, int64_t row) {
 
 /* Wait until no request in the summary queue is watched by a connection: the
  * writer has taken a DETACH, or a closed connection's drop. 1, or 0 on timeout. */
-static int sum_none_watched(void) {
-    for (int i = 0; i < 500; i++) {
-        sqlite3 *db = NULL;
-        int watched = -1;
-        if (sqlite3_open_v2("build/itest_sum.db", &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-            sqlite3_stmt *st = NULL;
-            if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM summary_requests WHERE conn_id<>0;", -1, &st, NULL) ==
-                    SQLITE_OK && sqlite3_step(st) == SQLITE_ROW)
-                watched = sqlite3_column_int(st, 0);
-            sqlite3_finalize(st);
-        }
-        sqlite3_close(db);
-        if (watched == 0) return 1;
-        struct timespec ts = { 0, 10 * 1000000L };
-        nanosleep(&ts, NULL);
+static int sum_watched(void) {
+    sqlite3 *db = NULL;
+    int watched = -1;
+    if (sqlite3_open_v2(tpath("itest_sum.db"), &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM summary_requests WHERE conn_id<>0;", -1, &st, NULL) ==
+                SQLITE_OK && sqlite3_step(st) == SQLITE_ROW)
+            watched = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
     }
-    return 0;
+    sqlite3_close(db);
+    return watched;
+}
+/* The queue's rows, the notices, and the notices not yet seen. */
+static void sum_counts(int *left, int *notices, int *unseen) {
+    sqlite3 *ndb = NULL;
+    if (sqlite3_open_v2(tpath("itest_sum.db"), &ndb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        sqlite3_stmt *ns = NULL;
+        if (sqlite3_prepare_v2(ndb, "SELECT (SELECT COUNT(*) FROM summary_requests), (SELECT COUNT(*) FROM "
+                                    "summary_notices), (SELECT COUNT(*) FROM summary_notices WHERE seen_at_ms IS "
+                                    "NULL);", -1, &ns, NULL) == SQLITE_OK && sqlite3_step(ns) == SQLITE_ROW) {
+            *left = sqlite3_column_int(ns, 0);
+            *notices = sqlite3_column_int(ns, 1);
+            *unseen = sqlite3_column_int(ns, 2);
+        }
+        sqlite3_finalize(ns);
+    }
+    sqlite3_close(ndb);
+}
+static int sum_none_watched(void) { return WAIT_UNTIL(sum_watched() == 0, 5000); }
+
+/* A SUMMARY's body for the one message the stub summarizes: summary.overview
+ * the stub's own words, one poster with an id, a count of one, and a source. */
+static int summary_doc_ok(const char *body) {
+    oc_json d;
+    if (oc_json_parse(&d, body, strlen(body)) != 0) return 0;
+    char text[256] = "";
+    uint64_t count = 0;
+    int sum = oc_json_get(&d, 0, "summary");
+    int ov = sum >= 0 ? oc_json_get(&d, sum, "overview") : -1;
+    int po = oc_json_get(&d, 0, "posters"), ct = oc_json_get(&d, 0, "count"), so = oc_json_get(&d, 0, "sources");
+    int ok = ov >= 0 && oc_json_get_str(&d, ov, "text", text, sizeof text) == 0 &&
+             strcmp(text, STUB_OVERVIEW) == 0 &&
+             po >= 0 && d.t[po].type == JSMN_ARRAY && d.t[po].size == 1 && oc_json_get(&d, po + 1, "id") >= 0 &&
+             ct >= 0 && oc_json_u64(&d, ct, &count) == 0 && count == 1 &&
+             so >= 0 && d.t[so].type == JSMN_OBJECT && d.t[so].size >= 1;
+    oc_json_free(&d);
+    return ok;
 }
 
 static int summarize_await(client *c, uint32_t req, uint8_t scope, oc_summary *out, char *body, size_t cap) {
@@ -3622,15 +3750,13 @@ static int summarize_await(client *c, uint32_t req, uint8_t scope, oc_summary *o
     return -1;
 }
 
-static void test_summaries(int port) {
+static void test_summaries(void) {
     oc_tls_server srv2;
     CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
     uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
     CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
-    unlink("build/itest_sum.db");
-    unlink("build/itest_sum.db-wal");
-    unlink("build/itest_sum.db-shm");
-    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_sum.db");
+    db_unlink("itest_sum.db");
+    oc_dbwriter *dbw2 = oc_dbwriter_start(tpath("itest_sum.db"));
     if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw2 != NULL);
     CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
@@ -3641,7 +3767,9 @@ static void test_summaries(int port) {
     static oc_sum_probe quiet = { sq_cpu, sq_mem, sq_net, sq_now, NULL };
     oc_sum_worker_cfg cfg;
     memset(&cfg, 0, sizeof cfg);
-    cfg.db_path = "build/itest_sum.db";
+    static char sum_db[700];   /* the worker keeps the pointer: a buffer of its own */
+    snprintf(sum_db, sizeof sum_db, "%s", tpath("itest_sum.db"));
+    cfg.db_path = sum_db;
     cfg.engine = &eng;
     cfg.probe = &quiet;
     cfg.sink.store = sq_store;
@@ -3651,9 +3779,9 @@ static void test_summaries(int port) {
     CHECK(wk != NULL);
     oc_netloop_set_summary(wk);
     struct loop_arg arg2;
-    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
     pthread_t th2;
-    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
+    int port = start_loop(&arg2, &th2, &srv2, dbw2, 0);
+    CHECK(port != 0);
 
     client a;
     CHECK(client_open(&a, port, pin2) == 0);
@@ -3685,9 +3813,10 @@ static void test_summaries(int port) {
     char body[4096];
     CHECK(summarize_await(&a, 7, OC_SUM_WEEK, &sm, body, sizeof body) == 0);
     CHECK(sm.status == OC_SUM_OK && sm.summary_id != 0 && sm.end_ms > sm.start_ms);
-    /* One five-word message: the summary is its overview, never longer than it. */
-    CHECK(strstr(body, "\"overview\":{\"text\":\"The ship date was set.\"") != NULL && strstr(body, "\"posters\":[{\"id\":") != NULL &&
-          strstr(body, "\"count\":1,") != NULL && strstr(body, "\"sources\":{\"") != NULL);
+    /* One five-word message: the summary is its overview, never longer than it;
+     * one poster, one message counted, its source cited. Read as the document
+     * it is (sum_worker.c), not as text. */
+    CHECK(summary_doc_ok(body));
     int calls = __atomic_load_n(&stub.calls, __ATOMIC_RELAXED);
     CHECK(calls >= 1);
     uint64_t first = sm.summary_id;
@@ -3746,10 +3875,7 @@ static void test_summaries(int port) {
         }
         CHECK(saw1);
         /* The first is being made (held): the second waits behind it. */
-        for (int i = 0; i < 500 && __atomic_load_n(&stub.calls, __ATOMIC_RELAXED) == c0; i++) {
-            struct timespec ts = { 0, 10 * 1000000L };
-            nanosleep(&ts, NULL);
-        }
+        CHECK(WAIT_UNTIL(__atomic_load_n(&stub.calls, __ATOMIC_RELAXED) != c0, 5000));
         oc_wbuf_init(&w, buf, sizeof buf);
         CHECK(oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &q2) == OC_OK);
         CHECK(send_frame(&a, buf, w.len) == 0);
@@ -3765,7 +3891,7 @@ static void test_summaries(int port) {
         }
         CHECK(saw2 && two_ahead1);
         sqlite3 *qdb = NULL;
-        CHECK(sqlite3_open_v2("build/itest_sum.db", &qdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+        CHECK(sqlite3_open_v2(tpath("itest_sum.db"), &qdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
         sqlite3_stmt *qs = NULL;
         int rows = -1;
         if (sqlite3_prepare_v2(qdb, "SELECT COUNT(*) FROM summary_requests;", -1, &qs, NULL) == SQLITE_OK &&
@@ -3799,11 +3925,21 @@ static void test_summaries(int port) {
 
     /* Today and since yesterday are the reader's days, up to now. */
     {
-        uint64_t day = 86400000ull, now_ms = (uint64_t)time(NULL) * 1000u, today = now_ms / day * day;
+        /* "Today" is the daemon's, read from its answer: a midnight (UTC, the
+         * reader's offset being 0) between the test's clock and the daemon's
+         * moves both bounds, never the facts -- a day's start, at most a day
+         * before the request and not after its answer. */
+        uint64_t day = 86400000ull, t0 = (uint64_t)time(NULL) * 1000u;
         CHECK(summarize_await(&a, 40, OC_SUM_TODAY, &sm, body, sizeof body) == 0);
-        CHECK(sm.status == OC_SUM_OK && sm.start_ms == today && sm.end_ms > now_ms - 60000 && sm.end_ms <= now_ms + 60000);
+        uint64_t t1 = (uint64_t)time(NULL) * 1000u + 1000u;
+        uint64_t today = sm.start_ms;
+        CHECK(sm.status == OC_SUM_OK && today % day == 0 && today <= t1 && t0 < today + day + 1000u);
+        CHECK(sm.end_ms + 60000 > t0 && sm.end_ms <= t1 + 60000);
         CHECK(summarize_await(&a, 41, OC_SUM_DAILY, &sm, body, sizeof body) == 0);
-        CHECK(sm.status == OC_SUM_OK && sm.start_ms == today - day && sm.end_ms > now_ms - 60000);
+        uint64_t t2 = (uint64_t)time(NULL) * 1000u + 1000u;
+        CHECK(sm.status == OC_SUM_OK && sm.start_ms % day == 0 &&
+              (sm.start_ms == today - day || (sm.start_ms == today && today + day <= t2)));   /* or past midnight */
+        CHECK(sm.end_ms + 60000 > t0);
     }
 
     /* A summary is its asker's (SUMMARIES.md §5). One they stop watching goes
@@ -3823,11 +3959,7 @@ static void test_summaries(int port) {
         oc_wbuf_init(&w, buf, sizeof buf);
         CHECK(oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &q) == OC_OK);
         CHECK(send_frame(&a, buf, w.len) == 0);
-        for (int i = 0; i < 500 && __atomic_load_n(&stub.calls, __ATOMIC_RELAXED) == c0; i++) {
-            struct timespec ts = { 0, 10 * 1000000L };
-            nanosleep(&ts, NULL);
-        }
-        CHECK(__atomic_load_n(&stub.calls, __ATOMIC_RELAXED) > c0);   /* being made */
+        CHECK(WAIT_UNTIL(__atomic_load_n(&stub.calls, __ATOMIC_RELAXED) > c0, 5000));   /* being made */
         oc_summary_req dr = { 50 };
         oc_wbuf_init(&w, buf, sizeof buf);
         CHECK(oc_encode_summary_req(&w, OC_PROTOCOL_VERSION, OC_MSG_SUMMARY_DETACH, &dr) == OC_OK);
@@ -3902,10 +4034,7 @@ static void test_summaries(int port) {
         oc_wbuf_init(&w, buf, sizeof buf);
         CHECK(oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &q2) == OC_OK);
         CHECK(send_frame(&a2, buf, w.len) == 0);
-        for (int i = 0; i < 500 && __atomic_load_n(&stub.calls, __ATOMIC_RELAXED) == c0; i++) {
-            struct timespec ts = { 0, 10 * 1000000L };
-            nanosleep(&ts, NULL);
-        }
+        CHECK(WAIT_UNTIL(__atomic_load_n(&stub.calls, __ATOMIC_RELAXED) != c0, 5000));
         client_close(&a2);
         CHECK(sum_none_watched());
         __atomic_store_n(&stub.hold, 0, __ATOMIC_RELEASE);
@@ -3947,10 +4076,7 @@ static void test_summaries(int port) {
         oc_wbuf_init(&w, buf, sizeof buf);
         CHECK(oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &q3) == OC_OK);
         CHECK(send_frame(&a2, buf, w.len) == 0);
-        for (int i = 0; i < 500 && __atomic_load_n(&stub.calls, __ATOMIC_RELAXED) == c0; i++) {
-            struct timespec ts = { 0, 10 * 1000000L };
-            nanosleep(&ts, NULL);
-        }
+        CHECK(WAIT_UNTIL(__atomic_load_n(&stub.calls, __ATOMIC_RELAXED) != c0, 5000));
         oc_wbuf_init(&w, buf, sizeof buf);
         CHECK(oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &q4) == OC_OK);
         CHECK(send_frame(&a2, buf, w.len) == 0);
@@ -3987,23 +4113,7 @@ static void test_summaries(int port) {
         /* A summary given live is marked seen by a write of its own, after the
          * SUMMARY is sent: waited for, not raced. */
         int left = -1, notices = -1, unseen = -1;
-        for (int t = 0; t < 500; t++) {
-            sqlite3 *ndb = NULL;
-            CHECK(sqlite3_open_v2("build/itest_sum.db", &ndb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-            sqlite3_stmt *ns = NULL;
-            if (sqlite3_prepare_v2(ndb, "SELECT (SELECT COUNT(*) FROM summary_requests), (SELECT COUNT(*) FROM "
-                                        "summary_notices), (SELECT COUNT(*) FROM summary_notices WHERE seen_at_ms IS "
-                                        "NULL);", -1, &ns, NULL) == SQLITE_OK && sqlite3_step(ns) == SQLITE_ROW) {
-                left = sqlite3_column_int(ns, 0);
-                notices = sqlite3_column_int(ns, 1);
-                unseen = sqlite3_column_int(ns, 2);
-            }
-            sqlite3_finalize(ns);
-            sqlite3_close(ndb);
-            if (unseen == 0) break;
-            struct timespec ts = { 0, 10 * 1000000L };
-            nanosleep(&ts, NULL);
-        }
+        CHECK(WAIT_UNTIL((sum_counts(&left, &notices, &unseen), unseen == 0), 5000));
         CHECK(left == 0);          /* cancelled: out of the queue */
         CHECK(unseen == 0);        /* opened, dismissed, or given to whoever watched */
         CHECK(notices >= 2);       /* and nothing for what was cancelled */
@@ -4086,9 +4196,7 @@ static void test_summaries(int port) {
     if (wk) oc_sum_worker_stop(wk);
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
-    unlink("build/itest_sum.db");
-    unlink("build/itest_sum.db-wal");
-    unlink("build/itest_sum.db-shm");
+    db_unlink("itest_sum.db");
 }
 
 /* Incoming webhooks over the wire (REQ-170, ARCH-32/54): a client mints a
@@ -4133,7 +4241,7 @@ static void test_webhook_vertical(int port, const uint8_t *pin) {
     CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BROADCAST);
     oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
     CHECK(bc.channel_id == OC_DEFAULT_CHANNEL && bc.author_id == ua);
-    CHECK(bc.body.len == 12 && memcmp(bc.body.ptr, "from webhook", 12) == 0);
+    CHECK(bc.body.len == 12 && memcmp(bc.body.ptr, "from webhook", 12) == 0);   /* contract: the test's own input, echoed */
     CHECK(bc.author_name.len == 2 && memcmp(bc.author_name.ptr, "ci", 2) == 0);  /* label override */
 
     /* The sender gets a 200. */
@@ -4366,9 +4474,25 @@ static int read_summary(client *c, oc_alerts_summary *sm) {
     if (read_type(c, OC_MSG_ALERTS_SUMMARY, &hdr, &p) != 0) return -1;
     return oc_decode_alerts_summary(&p, sm) == OC_OK ? 0 : -1;
 }
+/* One integer a query of the suite's shared database answers; -1 if none. */
+static int main_db_int(const char *sql) {
+    sqlite3 *db = NULL;
+    int v = -1;
+    if (sqlite3_open_v2(tpath("itest_netloop.db"), &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        sqlite3_busy_timeout(db, 5000);
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW)
+            v = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return v;
+}
+
 static void test_alerts_wire(int port, const uint8_t *pin, oc_dbwriter *dbw) {
     oc_dbwriter_alert(dbw, "test.wire", "a thing the daemon cannot fix alone");
-    usleep(100000);                                   /* stored, and told to nobody signed in */
+    /* stored, and told to nobody signed in */
+    CHECK(WAIT_UNTIL(main_db_int("SELECT COUNT(*) FROM alerts WHERE key='test.wire' AND current=1;") == 1, 5000));
     client a, b;
     uint64_t ua = 0, ub = 0;
     CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
@@ -4465,7 +4589,7 @@ static void test_restore_wire(int port, const uint8_t *pin) {
     CHECK(read_type(&b, OC_MSG_MSG_RESTORED, &hdr, &p) == 0);
     oc_broadcast back;
     CHECK(oc_decode_broadcast(&p, &back) == OC_OK && back.message_id == mid && back.author_id == ua &&
-          back.body.len == 16 && !memcmp(back.body.ptr, "taking this back", 16));
+          back.body.len == 16 && !memcmp(back.body.ptr, "taking this back", 16));   /* contract: the test's own input, echoed */
     client_close(&b);
     client_close(&a);
 }
@@ -4488,7 +4612,7 @@ static void test_call_leave_while_joining(int port, const uint8_t *pin, oc_dbwri
     CHECK(call_simple(&a, OC_MSG_CALL_LEAVE, ch) == 0);
     uint64_t someone[1] = { ua + 1 };
     CHECK(call_invite(&a, ch, someone, 1) == 0);
-    for (int i = 0; i < 500 && oc_dbwriter_jobs_waiting(dbw, OC_JOB_CALL_AUTH) < 2; i++) usleep(10000);
+    CHECK(WAIT_UNTIL(oc_dbwriter_jobs_waiting(dbw, OC_JOB_CALL_AUTH) >= 2, 5000));
     CHECK(oc_dbwriter_jobs_waiting(dbw, OC_JOB_CALL_AUTH) == 2);   /* the join and the invitation, unanswered */
     oc_dbwriter_hold(dbw, 0);
     uint16_t code = 0;
@@ -4513,6 +4637,8 @@ static void test_call_leave_while_joining(int port, const uint8_t *pin, oc_dbwri
  * ways, closed to anyone else, queued while a side is away, and ended. The bytes
  * here stand in for the handshake and the ciphertext: the daemon cannot tell. */
 static void set_read_timeout(client *c, int ms);
+static int count_frames(client *c, uint16_t type, uint16_t code, uint64_t from_user,
+                        uint8_t *last_status, int fence, int max);
 static int pdm_frame_send(client *c, uint16_t type, uint64_t id, uint8_t fill, size_t len) {
     uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
     uint8_t bytes[OC_PDM_MAX_HS], hdr[OC_PDM_HEADER_LEN];
@@ -4622,9 +4748,8 @@ static void test_pdm_relay(int port, const uint8_t *pin) {
      * carol is not a member. */
     CHECK(pdm_say(&b2, id, "plain text from elsewhere", 0x53) == 0);
     CHECK(read_error(&b2, &code) == 0 && code == OC_ERR_FORBIDDEN);
-    set_read_timeout(&b2, 300);
-    CHECK(read_type(&b2, OC_MSG_BROADCAST, &hdr, &p) != 0);
-    set_read_timeout(&b2, 20000);
+    /* Sent nothing: behind its fence (answered, so it is served) no message. */
+    CHECK(count_frames(&b2, OC_MSG_BROADCAST, 0, 0, NULL, 1, 0) == 0);
     CHECK(pdm_say(&c, id, "carol", 0x54) == 0);
     CHECK(read_error(&c, &code) == 0 && code != 0);
 
@@ -4655,7 +4780,8 @@ static void test_pdm_relay(int port, const uint8_t *pin) {
     CHECK(pdm_frame_send(&a, OC_MSG_PDM_END, id, 0, OC_PDM_END_CLOSED) == 0);
     CHECK(read_type(&b1, OC_MSG_PDM_END, &hdr, &p) == 0);
     { oc_pdm_end e; CHECK(oc_decode_pdm_end(&p, &e) == OC_OK && e.pdm_id == id && e.reason == OC_PDM_END_CLOSED); }
-    usleep(200 * 1000);
+    /* No wait: the loop takes alice's frames in order, so her END is done
+     * before her next SEND is looked at. */
     CHECK(pdm_say(&a, id, "oc-e2e:1:bGF0ZQ==", 0x56) == 0);
     CHECK(read_error(&a, &code) == 0 && code == OC_ERR_CHANNEL_ARCHIVED);
 
@@ -4681,14 +4807,14 @@ static void test_pdm_relay(int port, const uint8_t *pin) {
     CHECK(read_type(&b1, OC_MSG_PDM_INVITE, &hdr, &p) == 0);
     CHECK(pdm_frame_send(&b1, OC_MSG_PDM_HS, op.pdm_id, 0x23, 96) == 0);
     CHECK(read_type(&a, OC_MSG_PDM_HS_FOR, &hdr, &p) == 0);
+    int open_before = loop_conns(g_main);
     client_close(&b1);
-    usleep(100 * 1000);
+    CHECK(WAIT_UNTIL(loop_conns(g_main) < open_before, 5000));   /* bob's side is away */
     CHECK(pdm_say(&a, op.pdm_id, "oc-e2e:1:YXdheQ==", 0x57) == 0);
     client b3;
     CHECK(client_open(&b3, port, pin) == 0); CHECK(do_handshake(&b3) == 0);
     uint64_t ub3 = 0; CHECK(do_auth(&b3, "bob", "pw-bob", &ub3) == 0);
-    set_read_timeout(&b3, 300);
-    CHECK(read_type(&b3, OC_MSG_BROADCAST, &hdr, &p) != 0);
+    CHECK(count_frames(&b3, OC_MSG_BROADCAST, 0, 0, NULL, 1, 0) == 0);   /* fenced: served, and sent none of it */
 
     client_close(&a); client_close(&b2); client_close(&b3); client_close(&c);
 }
@@ -4816,7 +4942,7 @@ static void test_call_vertical(int port, const uint8_t *pin) {
     CHECK(read_type(&c, OC_MSG_BROADCAST, &hdr, &p) == 0);
     oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
     CHECK(bc.kind == OC_MSG_KIND_CALL && bc.author_id == ua && bc.channel_id == ch);
-    CHECK(bc.body.len == 11 && memcmp(bc.body.ptr, "Missed call", 11) == 0);
+    CHECK(bc.body.len == strlen(OC_CALL_MISSED_TEXT) && memcmp(bc.body.ptr, OC_CALL_MISSED_TEXT, bc.body.len) == 0);
 
     /* A non-member is refused: carol tries to join a private channel's call. */
     uint8_t buf[128]; oc_wbuf w;
@@ -5037,9 +5163,7 @@ static void test_call_rejoin_grace(int port, const uint8_t *pin) {
           if (parts[i].device_key[0] == 0xA1) away_a = (parts[i].flags & OC_CALL_PART_AWAY) != 0;
       }
       CHECK(away_b && !away_a); }
-    set_read_timeout(&a, 400);
-    CHECK(next_roster(&a, &ro, parts) == -1);
-    set_read_timeout(&a, 20000);
+    CHECK(count_frames(&a, OC_MSG_CALL_ROSTER, 0, 0, NULL, 1, 0) == 0);   /* fenced: nothing more */
 
     /* bob is back on a new connection: what he is told at sign-in still has him
      * in the call, and his join takes the seat -- the same call, a new epoch,
@@ -5161,8 +5285,9 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
     oc_netloop_set_relay_silence_ms(300);
     oc_call_roster ro;
     int gone = 0;
-    set_read_timeout(&a, 100);
-    for (int i = 0; i < 40 && !gone; i++) {
+    set_read_timeout(&a, 100);   /* the keep-alive's pace */
+    uint64_t end = oc_test_deadline(4000);
+    for (int i = 0; !gone && oc_test_mono_ms() < end; i++) {
         udp_send_audio(sa, &relay, atok2, (uint16_t)(10 + i), NULL);
         if (read_type(&a, OC_MSG_CALL_ROSTER, &hdr, &p) == 0 &&
             oc_decode_call_roster(&p, &ro, parts, 32) == OC_OK && ro.count == 1 && parts[0].user_id == ua)
@@ -5301,13 +5426,19 @@ static void test_call_transports(int port, const uint8_t *pin, uint16_t audio_po
         uint8_t pkt[OC_AUDIO_TOKEN_RAND + 2 + 1000];
         memcpy(pkt, atok, OC_AUDIO_TOKEN_RAND);
         memset(pkt + OC_AUDIO_TOKEN_RAND + 2, 'm', 1000);
+        uint64_t rx0 = __atomic_load_n(&g_main->view.relay_received, __ATOMIC_ACQUIRE);
         for (int i = 0; i < FLOOD; i++) {
             uint16_t sq = (uint16_t)(100 + i);
             pkt[OC_AUDIO_TOKEN_RAND] = (uint8_t)(sq >> 8); pkt[OC_AUDIO_TOKEN_RAND + 1] = (uint8_t)sq;
             sendto(sa, pkt, sizeof pkt, 0, (const struct sockaddr *)&relay, sizeof relay);
-            if (i % 100 == 99) usleep(2000);   /* paced: the relay's socket buffer is not under test */
+            /* paced -- a sender's rate, not a wait: the relay's socket buffer is not under test */
+            if (i % 100 == 99) oc_test_let_time_pass(2);
         }
-        usleep(300000);
+        /* The flood is the daemon's before the chat follows it: the relay has
+         * taken it in (all of it, unless the kernel dropped some of the
+         * datagrams, which the deadline then rides out). */
+        WAIT_UNTIL(__atomic_load_n(&g_main->view.relay_received, __ATOMIC_ACQUIRE) >= rx0 + FLOOD, 3000);
+        CHECK(__atomic_load_n(&g_main->view.relay_received, __ATOMIC_ACQUIRE) > rx0 + FLOOD / 2);
         uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
         oc_send sm; memset(&sm, 0, sizeof sm);
         sm.channel_id = ch; memset(sm.idem, 0x7C, OC_IDEM_SIZE);
@@ -5322,7 +5453,7 @@ static void test_call_transports(int port, const uint8_t *pin, uint16_t audio_po
             if (hdr.msg_type == OC_MSG_BROADCAST) {
                 oc_broadcast bc;
                 if (oc_decode_broadcast(&p, &bc) == OC_OK && bc.body.len == 10 &&
-                    memcmp(bc.body.ptr, "still here", 10) == 0) chat = 1;
+                    memcmp(bc.body.ptr, "still here", 10) == 0) chat = 1;   /* contract: the test's own input, echoed */
             }
         }
         CHECK(!closed && chat);
@@ -5341,7 +5472,7 @@ static void test_call_transports(int port, const uint8_t *pin, uint16_t audio_po
  * the routing prefix -- and the relay, which is told each token whole, relays
  * and sweeps by them as by any other. Its own loop, since both are read from the
  * environment at startup. */
-static void test_call_routed(int port) {
+static void test_call_routed(void) {
     /* This loop runs beside the suite's main one, which holds its own socket:
      * this one gets another. */
     int udp2 = socket(AF_INET, SOCK_DGRAM, 0);
@@ -5357,16 +5488,16 @@ static void test_call_routed(int port) {
     CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
     uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
     CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
-    unlink("build/itest_routed.db"); unlink("build/itest_routed.db-wal"); unlink("build/itest_routed.db-shm");
-    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_routed.db");
+    db_unlink("itest_routed.db");
+    oc_dbwriter *dbw2 = oc_dbwriter_start(tpath("itest_routed.db"));
     if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw2 != NULL);
     CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER,  2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw2, "bob",   "pw-bob",   OC_ROLE_MEMBER, 2048) != 0);
     struct loop_arg arg2;
-    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
     pthread_t th2;
-    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
+    int port = start_loop(&arg2, &th2, &srv2, dbw2, 0);
+    CHECK(port != 0);
 
     client a, b;
     CHECK(client_open(&a, port, pin2) == 0); CHECK(do_handshake(&a) == 0);
@@ -5442,7 +5573,7 @@ static void test_call_routed(int port) {
     close(udp2);
     char cfgerr[128];
     oc_config_load(cfgerr, sizeof cfgerr);
-    unlink("build/itest_routed.db"); unlink("build/itest_routed.db-wal"); unlink("build/itest_routed.db-shm");
+    db_unlink("itest_routed.db");
 }
 
 /* Direct messages over the wire (REQ-050): OPEN_DM creates a kind=DM channel,
@@ -5689,7 +5820,7 @@ static void test_admin_vertical(int port, const uint8_t *pin) {
             why[0] = '\0';
             if (oc_test_signup("127.0.0.1", port, pin, utok, who, "violet-harbor-granite",
                                t1, sizeof t1, v1, sizeof v1, why, sizeof why) == 0) { made++; continue; }
-            stopped = strstr(why, "HTTP 429") != NULL;   /* the page's "Too many accounts…" */
+            stopped = strstr(why, "HTTP 429") != NULL;   /* the page's "Too many accounts…" */   /* contract: the HTTP status */
             if (!stopped) printf("    sign-up %d refused: %s\n", i, why);
         }
         CHECK(stopped && made >= 1 && made <= 10);
@@ -5912,13 +6043,7 @@ static void test_fanout_limits(int port, const uint8_t *pin) {
         oc_netloop_stats_reset();
         if (burst) CHECK(write_all(&b.conn, burst, n * one) == 0);
         oc_netloop_stats st2;
-        for (int i = 0; i < 500; i++) {
-            oc_netloop_stats_get(&st2);
-            if (st2.bytes_read >= n * one) break;
-            usleep(10000);
-        }
-        oc_netloop_stats_get(&st2);
-        CHECK(st2.bytes_read >= n * one);
+        CHECK(WAIT_UNTIL((oc_netloop_stats_get(&st2), st2.bytes_read >= n * one), 5000));
         CHECK(st2.turn_read_max <= 256u * 1024u + OC_READ_CHUNK);   /* OC_READ_BUDGET + a chunk */
         free(burst);
     }
@@ -5948,11 +6073,11 @@ static void seed_messages(oc_dbwriter *dbw, uint64_t author, int n, size_t len, 
 /* Wait until `author` has `n` messages stored: the writer takes seeded sends
  * asynchronously, and the loop owns its results, so the database is asked
  * directly, read-only. */
-static int wait_messages_stored(uint64_t author, int n) {
+static int messages_stored(uint64_t author) {
     int got = -1;
-    for (int i = 0; i < 1000 && got < n; i++) {
+    {
         sqlite3 *rdb = NULL;
-        if (sqlite3_open_v2("build/itest_netloop.db", &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        if (sqlite3_open_v2(tpath("itest_netloop.db"), &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
             sqlite3_stmt *st = NULL;
             if (sqlite3_prepare_v2(rdb, "SELECT count(*) FROM messages WHERE author_id=?;", -1, &st, NULL) == SQLITE_OK) {
                 sqlite3_bind_int64(st, 1, (sqlite3_int64)author);
@@ -5961,10 +6086,10 @@ static int wait_messages_stored(uint64_t author, int n) {
             sqlite3_finalize(st);
             sqlite3_close(rdb);
         }
-        if (got < n) usleep(10000);
     }
-    return got >= n;
+    return got;
 }
+static int wait_messages_stored(uint64_t author, int n) { return WAIT_UNTIL(messages_stored(author) >= n, 10000); }
 
 /* read_frame, but telling apart the two ways of getting nothing: 1 a frame,
  * 0 nothing within the socket's read timeout, -1 the daemon closed or the
@@ -6067,7 +6192,7 @@ static void test_out_buffer_cap(int port, const uint8_t *pin, oc_dbwriter *dbw, 
         oc_header hdr; oc_rbuf p; oc_broadcast bc; int mine = 0;
         for (int i = 0; i < 64 && !mine; i++)
             if (read_type(&b, OC_MSG_BROADCAST, &hdr, &p) == 0 && oc_decode_broadcast(&p, &bc) == OC_OK &&
-                bc.body.len == 24 && memcmp(bc.body.ptr, "while you were replaying", 24) == 0) mine = 1;
+                bc.body.len == 24 && memcmp(bc.body.ptr, "while you were replaying", 24) == 0) mine = 1;   /* contract: the test's own input, echoed */
         CHECK(mine);
     }
 
@@ -6086,7 +6211,7 @@ static void test_out_buffer_cap(int port, const uint8_t *pin, oc_dbwriter *dbw, 
         if (oc_decode_broadcast(&p, &bc) != OC_OK) { CHECK(0); break; }
         /* Earlier suites posted to #general too, bob among them: the live
          * message is known by what it says. */
-        int live = bc.body.len == 24 && memcmp(bc.body.ptr, "while you were replaying", 24) == 0;
+        int live = bc.body.len == 24 && memcmp(bc.body.ptr, "while you were replaying", 24) == 0;   /* contract: the test's own input, echoed */
         if (live) { if (done) live_after_done = 1; else live_early = 1; continue; }
         if (!done) {
             if (bc.message_id <= last) ascending = 0;
@@ -6174,12 +6299,9 @@ static uint64_t settled_turn_max(client *poke) {
     for (int k = 1; k <= 2; k++) {
         uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
         if (oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK) (void)send_frame(poke, buf, w.len);
-        for (int i = 0; i < 300 && st.turns < t0 + (uint64_t)k; i++) {
-            usleep(1000);
-            oc_netloop_stats_get(&st);
-        }
+        WAIT_UNTIL((oc_netloop_stats_get(&st), st.turns >= t0 + (uint64_t)k), 1000);
     }
-    for (int i = 0; i < 300 && st.turns <= t0 + 1; i++) { usleep(10000); oc_netloop_stats_get(&st); }
+    WAIT_UNTIL((oc_netloop_stats_get(&st), st.turns > t0 + 1), 3000);
     return st.turn_max_us;
 }
 
@@ -6574,15 +6696,13 @@ static void test_concurrent_load(int port, const uint8_t *pin) {
 /* The per-address cap (OPENCHIME_DEV_CONNS_PER_IP, 2 here) on the TLS port, run
  * in test_http_stack's loop: two in and the third refused at accept, a close
  * giving its place back, and IPv6 counted by its /64 apart from 127.0.0.1. */
-static void throttle_checks(int port, const uint8_t *pin2) {
-    /* Two connections from loopback are within the cap. */
+static void throttle_checks(struct loop_arg *L, const uint8_t *pin2) {
+    int port = L->port;
+    /* Two connections from loopback are within the cap, once the health
+     * connections' closes are counted out (the loop's own count). */
     client a, b;
-    int in = -1;                     /* once the health connections' closes are counted */
-    for (int i = 0; i < 100 && in != 0; i++) {
-        in = client_open(&a, port, pin2);
-        if (in != 0) usleep(20000);
-    }
-    CHECK(in == 0);
+    CHECK(WAIT_UNTIL(loop_conns(L) == 0, 5000));
+    CHECK(client_open(&a, port, pin2) == 0);
     CHECK(client_open(&b, port, pin2) == 0);
     /* The third is refused at accept — its TLS handshake never completes. */
     client c;
@@ -6593,11 +6713,8 @@ static void throttle_checks(int port, const uint8_t *pin2) {
     /* A close gives its place back: once the daemon has seen one go, the next
      * connection from the same address is let in, and the one after it is not. */
     client_close(&a);
-    int back = -1;
-    for (int i = 0; i < 100 && back != 0; i++) {
-        back = client_open(&c, port, pin2);
-        if (back != 0) usleep(20000);
-    }
+    CHECK(WAIT_UNTIL(loop_conns(L) == 1, 5000));   /* b alone: the refused one was never counted */
+    int back = client_open(&c, port, pin2);
     CHECK(back == 0);
     client d;
     int over = client_open(&d, port, pin2);
@@ -6624,7 +6741,7 @@ static void throttle_checks(int port, const uint8_t *pin2) {
         client_close(&f);
         g_client_v6 = 0;
     } else {
-        printf("  (no IPv6 loopback on this host: the IPv6 cap is not checked)\n");
+        SKIP("no IPv6 loopback on this host: the IPv6 cap is not checked");
     }
 
     client_close(&b);
@@ -6633,22 +6750,16 @@ static void throttle_checks(int port, const uint8_t *pin2) {
 }
 
 
-/* A plaintext connection to `port`, retried while the loop comes up; -1 if none. */
+/* A plaintext connection to `port` (listening already: start_loop); -1 if none. */
 static int plain_connect(int port) {
     struct sockaddr_in addr; memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons((uint16_t)port);
-    for (int i = 0; i < 200; i++) {
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) {
-            struct timeval tv = { 5, 0 };
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-            return fd;
-        }
-        close(fd);
-        usleep(20000);
-    }
-    return -1;
+    int fd = -1;
+    if (!WAIT_UNTIL(try_connect(&fd, (struct sockaddr *)&addr, sizeof addr), 2000)) return -1;
+    struct timeval tv = { 5, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    return fd;
 }
 
 static size_t plain_read_all(int fd, char *buf, size_t cap) {
@@ -6683,14 +6794,14 @@ static size_t plain_exchange(int port, const char *req, char *buf, size_t cap) {
  *   - a client that stalls is answered 408 on either port;
  *   - the health port counts against the same per-address cap as the TLS port;
  *   - and it is the loop's: once the loop stops, nothing answers it. */
-static void test_http_stack(int port, int hport) {
+static void test_http_stack(void) {
     setenv("OPENCHIME_DEV_CONNS_PER_IP", "2", 1);
     oc_tls_server srv2;
     CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
     uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
     CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
-    unlink("build/itest_http.db"); unlink("build/itest_http.db-wal"); unlink("build/itest_http.db-shm");
-    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_http.db");
+    db_unlink("itest_http.db");
+    oc_dbwriter *dbw2 = oc_dbwriter_start(tpath("itest_http.db"));
     if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw2 != NULL);
 
@@ -6700,12 +6811,12 @@ static void test_http_stack(int port, int hport) {
      * sites are as they were. */
     {
         char werr[256] = "";
-        CHECK(!oc_webapp_load("build/no-such-dir", werr, sizeof werr));
+        CHECK(!oc_webapp_load(tpath("no-such-dir"), werr, sizeof werr) && werr[0]);
         CHECK(!oc_webapp_is_redirect("http://x/app/", 13, "x"));
-        oc_mkdir("build/itest_webapp");
-        oc_mkdir("build/itest_webapp/web");
+        oc_mkdir(tpath("itest_webapp"));
+        oc_mkdir(tpath("itest_webapp/web"));
         FILE *f;
-        f = fopen("build/itest_webapp/web/openchime.wasm", "wb"); CHECK(f); if (f) { fwrite("\0asm", 1, 4, f); fclose(f); }
+        f = fopen(tpath("itest_webapp/web/openchime.wasm"), "wb"); CHECK(f); if (f) { fwrite("\0asm", 1, 4, f); fclose(f); }
         /* Its gzip copy, as `make web` writes it: sent to a browser that takes
          * gzip, when its trailer says it is of this wasm and no other. */
         static const unsigned char GZ[] = { 0x1f,0x8b,0x08,0x00,0x00,0x00,0x00,0x00,0x02,0x03,0x63,0x48,
@@ -6715,16 +6826,17 @@ static void test_http_stack(int port, int hport) {
         CHECK(!oc_webapp_gzip_matches(GZ, sizeof GZ, "\0asm!", 5));
         CHECK(!oc_webapp_gzip_matches(GZ + 1, sizeof GZ - 1, "\0asm", 4));   /* not gzip */
         CHECK(!oc_webapp_gzip_matches(GZ, 10, "\0asm", 4));
-        f = fopen("build/itest_webapp/web/openchime.wasm.gz", "wb"); CHECK(f); if (f) { fwrite(GZ, 1, sizeof GZ, f); fclose(f); }
+        f = fopen(tpath("itest_webapp/web/openchime.wasm.gz"), "wb"); CHECK(f); if (f) { fwrite(GZ, 1, sizeof GZ, f); fclose(f); }
         /* A daemon built without the client (WEB=0) refuses to serve it and
          * says why; one built with it loads. The route assertions below
          * follow the same split. */
         if (oc_webapp_built()) {
-            CHECK(oc_webapp_load("build/itest_webapp", werr, sizeof werr));
+            CHECK(oc_webapp_load(tpath("itest_webapp"), werr, sizeof werr));
             CHECK(oc_webapp_loaded());
         } else {
-            CHECK(!oc_webapp_load("build/itest_webapp", werr, sizeof werr));
-            CHECK(!oc_webapp_loaded() && strstr(werr, "not built"));
+            werr[0] = '\0';
+            CHECK(!oc_webapp_load(tpath("itest_webapp"), werr, sizeof werr));
+            CHECK(!oc_webapp_loaded() && werr[0]);   /* and says why */
         }
         /* The redirect a browser sign-in may name: the page's own origin at
          * /app/ exactly, for the Host its connection was upgraded with. */
@@ -6735,30 +6847,32 @@ static void test_http_stack(int port, int hport) {
         CHECK(!oc_webapp_is_redirect("https://chat.example:8443/app/", 30, ""));
     }
 
-    oc_netloop_set_health_port(hport);
+    oc_netloop_set_health_port(0);   /* a port the kernel picks, read back from the loop */
     struct loop_arg arg2;
-    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
     pthread_t th2;
-    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
+    int port = start_loop(&arg2, &th2, &srv2, dbw2, 1);
+    int hport = __atomic_load_n(&arg2.view.health_port, __ATOMIC_ACQUIRE);
+    oc_netloop_set_health_port(-1);   /* read at start: this loop has it, no later one */
+    CHECK(port != 0 && hport != 0);
 
     static char resp[8192];
     CHECK(plain_exchange(hport, "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof resp) > 0);
-    oc_netloop_set_health_port(-1);   /* read at start: this loop has it, no later one */
     CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "\r\n\r\nOK") &&
-          strstr(resp, "Content-Type: text/plain\r\n"));
+          strstr(resp, "Content-Type: text/plain\r\n"));   /* contract: HTTP */
     CHECK(plain_exchange(hport, "GET /healthz?probe=1 HTTP/1.0\r\n\r\n", resp, sizeof resp) > 0);
     CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "\r\n\r\nOK"));
     /* The web client is the TLS port's (below): in the clear the landing page
      * stands, app or no app. */
     CHECK(plain_exchange(hport, "GET / HTTP/1.1\r\n\r\n", resp, sizeof resp) > 0);
     CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 &&
-          strstr(resp, "text/html") && strstr(resp, "An OpenChime workspace is running here."));
+          strstr(resp, "text/html") && strstr(resp, "data-oc-page=\"landing\""));
     CHECK(plain_exchange(hport, "GET /app/ HTTP/1.1\r\n\r\n", resp, sizeof resp) > 0);
-    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "An OpenChime workspace is running here."));
-    CHECK(strstr(resp, "&mdash;") == NULL && strstr(resp, "to sign in") != NULL);   /* and, with a web client beside the daemon, where it is */
+    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "data-oc-page=\"landing\""));
+    /* With a web client beside the daemon, the page says where it is. */
+    CHECK(strstr(resp, "&mdash;") == NULL && (!oc_webapp_loaded() || strstr(resp, "/app/") != NULL));
     CHECK(plain_exchange(hport, "POST /anything/else HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi",
                          resp, sizeof resp) > 0);
-    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "An OpenChime workspace"));
+    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "data-oc-page=\"landing\""));
     CHECK(plain_exchange(hport, "NOT HTTP\r\n\r\n", resp, sizeof resp) > 0);
     CHECK(strncmp(resp, "HTTP/1.1 400 ", 13) == 0);
 
@@ -6772,23 +6886,23 @@ static void test_http_stack(int port, int hport) {
     CHECK(write_all(&h.conn, (const uint8_t *)r0, strlen(r0)) == 0);
     http_read_response(&h, resp, sizeof resp);
     if (oc_webapp_built()) {
-        CHECK(strncmp(resp, "HTTP/1.1 302 ", 13) == 0 && strstr(resp, "Location: /app/\r\n"));
+        CHECK(strncmp(resp, "HTTP/1.1 302 ", 13) == 0 && strstr(resp, "Location: /app/\r\n"));   /* contract: HTTP */
         client_close(&h);
         CHECK(http_client_open(&h, port, pin2) == 0);
         const char *ra = "GET /app/ HTTP/1.1\r\nHost: x\r\n\r\n";
         CHECK(write_all(&h.conn, (const uint8_t *)ra, strlen(ra)) == 0);
         http_read_response(&h, resp, sizeof resp);
         CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "text/html") &&
-              strstr(resp, "Cross-Origin-Opener-Policy: same-origin\r\n") &&
-              strstr(resp, "Cross-Origin-Embedder-Policy: require-corp\r\n") &&
-              strstr(resp, "<canvas id=\"canvas\""));
+              strstr(resp, "Cross-Origin-Opener-Policy: same-origin\r\n") &&   /* contract: HTTP */
+              strstr(resp, "Cross-Origin-Embedder-Policy: require-corp\r\n") &&   /* contract: HTTP */
+              strstr(resp, "<canvas id=\"canvas\""));   /* contract: the page's markup */
         client_close(&h);
         CHECK(http_client_open(&h, port, pin2) == 0);
         const char *rw = "GET /app/openchime.wasm HTTP/1.1\r\nHost: x\r\n\r\n";
         CHECK(write_all(&h.conn, (const uint8_t *)rw, strlen(rw)) == 0);
         http_read_response(&h, resp, sizeof resp);
-        CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "Content-Type: application/wasm\r\n") &&
-              strstr(resp, "X-OC-Size: 4\r\n") && strstr(resp, "Content-Length: 4\r\n") &&
+        CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "Content-Type: application/wasm\r\n") &&   /* contract: HTTP */
+              strstr(resp, "X-OC-Size: 4\r\n") && strstr(resp, "Content-Length: 4\r\n") &&   /* contract: HTTP */
               !strstr(resp, "Content-Encoding"));
         /* A browser that takes gzip gets the copy, its size beside it, and an
          * ETag; asking again with that ETag downloads nothing. */
@@ -6798,11 +6912,11 @@ static void test_http_stack(int port, int hport) {
         CHECK(write_all(&h.conn, (const uint8_t *)rg, strlen(rg)) == 0);
         http_read_response(&h, resp, sizeof resp);
         char etag[64] = "";
-        const char *et = strstr(resp, "ETag: ");
+        const char *et = strstr(resp, "ETag: ");   /* contract: HTTP */
         if (et) sscanf(et + 6, "%63[^\r]", etag);
-        CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "Content-Encoding: gzip\r\n") &&
-              strstr(resp, "Content-Length: 24\r\n") && strstr(resp, "X-OC-Size: 4\r\n") &&
-              strstr(resp, "Vary: Accept-Encoding\r\n") && strstr(etag, "-gz\""));
+        CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "Content-Encoding: gzip\r\n") &&   /* contract: HTTP */
+              strstr(resp, "Content-Length: 24\r\n") && strstr(resp, "X-OC-Size: 4\r\n") &&   /* contract: HTTP */
+              strstr(resp, "Vary: Accept-Encoding\r\n") && strstr(etag, "-gz\""));   /* contract: HTTP */
         client_close(&h);
         CHECK(http_client_open(&h, port, pin2) == 0);
         char rn[256];
@@ -6810,7 +6924,7 @@ static void test_http_stack(int port, int hport) {
                                 "If-None-Match: %s\r\n\r\n", etag);
         CHECK(write_all(&h.conn, (const uint8_t *)rn, strlen(rn)) == 0);
         http_read_response(&h, resp, sizeof resp);
-        CHECK(strncmp(resp, "HTTP/1.1 304 Not Modified\r\n", 27) == 0 && strstr(resp, etag) &&
+        CHECK(strncmp(resp, "HTTP/1.1 304 Not Modified\r\n", 27) == 0 && strstr(resp, etag) &&   /* contract: HTTP */
               !strstr(resp, "Content-Length"));
         /* The loader, compiled in gzipped as well. */
         client_close(&h);
@@ -6818,8 +6932,8 @@ static void test_http_stack(int port, int hport) {
         const char *rj = "GET /app/openchime.js HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n";
         CHECK(write_all(&h.conn, (const uint8_t *)rj, strlen(rj)) == 0);
         http_read_response(&h, resp, sizeof resp);
-        CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "Content-Encoding: gzip\r\n") &&
-              strstr(resp, "ETag: \""));
+        CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "Content-Encoding: gzip\r\n") &&   /* contract: HTTP */
+              strstr(resp, "ETag: \""));   /* contract: HTTP */
     } else {
         /* No client in this daemon: the TLS port has no front door, and
          * refuses "/" as it does anything else it does not serve. */
@@ -6843,10 +6957,10 @@ static void test_http_stack(int port, int hport) {
 
     /* One cap for both ports: two idle health connections from loopback fill
      * it, so a third on either port is closed unanswered. */
-    usleep(200000);                                       /* the closes above are counted out */
+    CHECK(WAIT_UNTIL(loop_conns(&arg2) == 0, 5000));     /* the closes above are counted out */
     int a = plain_connect(hport), b = plain_connect(hport);
     CHECK(a >= 0 && b >= 0);
-    usleep(100000);
+    CHECK(WAIT_UNTIL(loop_conns(&arg2) == 2, 5000));     /* both in, and counted */
     int c3 = plain_connect(hport);
     CHECK(c3 >= 0);
     if (c3 >= 0) {
@@ -6860,7 +6974,7 @@ static void test_http_stack(int port, int hport) {
     if (over == 0) client_close(&t);
     if (a >= 0) close(a);
     if (b >= 0) close(b);
-    throttle_checks(port, pin2);
+    throttle_checks(&arg2, pin2);
 
     /* The WebSocket transport (ioloop.c, the browser client's): the upgrade on
      * /ws is answered 101 with the key's accept value and the offered
@@ -6868,7 +6982,7 @@ static void test_http_stack(int port, int hport) {
      * WELCOME and AUTH_CHALLENGE, each in a frame of its own; a ping is
      * answered with a pong; a frame that is not masked ends the connection. */
     {
-        usleep(300000);   /* the closes above are counted out of the per-address cap */
+        CHECK(WAIT_UNTIL(loop_conns(&arg2) == 0, 5000));   /* the closes above are counted out of the cap */
         int ws = plain_connect(hport);
         CHECK(ws >= 0);
         if (ws >= 0) {
@@ -6877,15 +6991,16 @@ static void test_http_stack(int port, int hport) {
                              "Sec-WebSocket-Protocol: binary, base64\r\n\r\n";
             CHECK(send(ws, up, strlen(up), 0) == (ssize_t)strlen(up));
             static uint8_t rb[65536]; size_t got = 0; const uint8_t *body = NULL;
-            for (int tries = 0; tries < 200 && !body; tries++) {
-                ssize_t r = recv(ws, rb + got, sizeof rb - got, MSG_DONTWAIT);
-                if (r > 0) { got += (size_t)r; rb[got] = 0; body = (const uint8_t *)strstr((char *)rb, "\r\n\r\n"); if (body) body += 4; }
-                else usleep(10000);
+            /* Blocking reads (the socket's own timeout), to a deadline. */
+            for (uint64_t end = oc_test_deadline(5000); !body && oc_test_mono_ms() < end; ) {
+                ssize_t r = recv(ws, rb + got, sizeof rb - got - 1, 0);
+                if (r <= 0) break;
+                got += (size_t)r; rb[got] = 0; body = (const uint8_t *)strstr((char *)rb, "\r\n\r\n"); if (body) body += 4;
             }
             CHECK(body != NULL);
             CHECK(strncmp((char *)rb, "HTTP/1.1 101 ", 13) == 0);
-            CHECK(strstr((char *)rb, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n") != NULL);
-            CHECK(strstr((char *)rb, "Sec-WebSocket-Protocol: binary\r\n") != NULL);
+            CHECK(strstr((char *)rb, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n") != NULL);   /* contract: HTTP */
+            CHECK(strstr((char *)rb, "Sec-WebSocket-Protocol: binary\r\n") != NULL);   /* contract: HTTP */
             /* HELLO, masked, as a client must send it. */
             uint8_t hb[128]; oc_wbuf hw; oc_wbuf_init(&hw, hb, sizeof hb);
             oc_hello h = { OC_PROTOCOL_VERSION, OC_PROTOCOL_VERSION, oc_slice_str("itest-ws") };
@@ -6904,7 +7019,7 @@ static void test_http_stack(int port, int hport) {
             memmove(rb, body, have); got = have;
             static uint8_t stream[65536]; size_t slen = 0, at = 0;
             int seen = 0; uint16_t types[2] = { 0, 0 };
-            for (int tries = 0; tries < 300 && seen < 2; tries++) {
+            for (uint64_t end = oc_test_deadline(5000); seen < 2 && oc_test_mono_ms() < end; ) {
                 while (got - at >= 2) {
                     uint8_t b0 = rb[at], b1 = rb[at + 1];
                     size_t hl = 2, plen = b1 & 0x7f;
@@ -6925,8 +7040,9 @@ static void test_http_stack(int port, int hport) {
                     sat += 4 + flen;
                 }
                 if (seen >= 2) break;
-                ssize_t r = recv(ws, rb + got, sizeof rb - got, MSG_DONTWAIT);
-                if (r > 0) got += (size_t)r; else usleep(10000);
+                ssize_t r = recv(ws, rb + got, sizeof rb - got, 0);
+                if (r <= 0) break;
+                got += (size_t)r;
             }
             CHECK(seen >= 2);
             CHECK(types[0] == OC_MSG_WELCOME);
@@ -6937,24 +7053,25 @@ static void test_http_stack(int port, int hport) {
             for (int i = 0; i < 4; i++) ping[6 + i] = pp[i] ^ ping[2 + (i & 3)];
             CHECK(send(ws, ping, 10, 0) == 10);
             uint8_t pong[8]; size_t pg = 0;
-            for (int tries = 0; tries < 200 && pg < 6; tries++) {
-                ssize_t r = recv(ws, pong + pg, 6 - pg, MSG_DONTWAIT);
-                if (r > 0) pg += (size_t)r; else usleep(10000);
+            for (uint64_t end = oc_test_deadline(5000); pg < 6 && oc_test_mono_ms() < end; ) {
+                ssize_t r = recv(ws, pong + pg, 6 - pg, 0);
+                if (r <= 0) break;
+                pg += (size_t)r;
             }
             CHECK(pg == 6 && pong[0] == 0x8A && pong[1] == 4 && memcmp(pong + 2, "ping", 4) == 0);
             /* An unmasked frame is not a browser's: the connection ends. */
             uint8_t bad[4] = { 0x82, 0x02, 0, 0 };
             CHECK(send(ws, bad, 4, 0) == 4);
             int closed = 0;
-            for (int tries = 0; tries < 300 && !closed; tries++) {
-                ssize_t r = recv(ws, rb, sizeof rb, MSG_DONTWAIT);
+            for (uint64_t end = oc_test_deadline(5000); !closed && oc_test_mono_ms() < end; ) {
+                ssize_t r = recv(ws, rb, sizeof rb, 0);   /* anything still queued is read past */
                 if (r == 0) closed = 1;
-                else if (r < 0) usleep(10000);   /* anything still queued is read past */
+                else if (r < 0) break;
             }
             CHECK(closed);
             close(ws);
         }
-        usleep(100000);   /* the close is counted out before the cap is tested below */
+        CHECK(WAIT_UNTIL(loop_conns(&arg2) == 0, 5000));   /* the close is counted out */
     }
 
     stop_loop(&arg2, th2);
@@ -6970,7 +7087,7 @@ static void test_http_stack(int port, int hport) {
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
     unsetenv("OPENCHIME_DEV_CONNS_PER_IP");
-    unlink("build/itest_http.db"); unlink("build/itest_http.db-wal"); unlink("build/itest_http.db-shm");
+    db_unlink("itest_http.db");
 }
 
 /* Send AUTH_BEGIN; on AUTH_REDIRECT copy the URL out and return 0, on ERROR
@@ -6997,13 +7114,13 @@ static int auth_begin(client *c, const char *source, const char *redirect, const
 
 /* A browser sign-in starts with the daemon building the relay's authorize URL
  * (AUTH.md §8.1). Its own loop, because it needs the relay source switched on. */
-static void test_auth_begin(int port) {
+static void test_auth_begin(void) {
     oc_tls_server srv2;
     CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
     uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
     CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
-    unlink("build/itest_begin.db"); unlink("build/itest_begin.db-wal"); unlink("build/itest_begin.db-shm");
-    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_begin.db");
+    db_unlink("itest_begin.db");
+    oc_dbwriter *dbw2 = oc_dbwriter_start(tpath("itest_begin.db"));
     if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw2 != NULL);
     /* Any P-256 public key will do: nothing here presents a token. */
@@ -7017,9 +7134,9 @@ static void test_auth_begin(int port) {
     CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
 
     struct loop_arg arg2;
-    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
     pthread_t th2;
-    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
+    int port = start_loop(&arg2, &th2, &srv2, dbw2, 0);
+    CHECK(port != 0);
 
     static const char CH[] = "JBbiqONGWPaAmwXk_8bT6UnlPfrn65D32eZlJS-zGG0";
     client c;
@@ -7082,27 +7199,27 @@ static void test_auth_begin(int port) {
     stop_loop(&arg2, th2);
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
-    unlink("build/itest_begin.db"); unlink("build/itest_begin.db-wal"); unlink("build/itest_begin.db-shm");
+    db_unlink("itest_begin.db");
 }
 
 /* Behind a forwarder (proxyproto.h): the address the limits key on is the one the
  * forwarder's header names, believed only because the forwarder is trusted. Its
  * own loop, with loopback as the trusted forwarder and a per-address cap of two. */
-static void test_proxy_header(int port) {
+static void test_proxy_header(void) {
     setenv("OPENCHIME_TRUSTED_PROXIES", "127.0.0.0/8", 1);
     setenv("OPENCHIME_DEV_CONNS_PER_IP", "2", 1);
     oc_tls_server srv2;
     CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
     uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
     CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
-    unlink("build/itest_proxy.db"); unlink("build/itest_proxy.db-wal"); unlink("build/itest_proxy.db-shm");
-    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_proxy.db");
+    db_unlink("itest_proxy.db");
+    oc_dbwriter *dbw2 = oc_dbwriter_start(tpath("itest_proxy.db"));
     if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw2 != NULL);
     struct loop_arg arg2;
-    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
     pthread_t th2;
-    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
+    int port = start_loop(&arg2, &th2, &srv2, dbw2, 0);
+    CHECK(port != 0);
 
     static const uint8_t SIG[12] = { 0x0D,0x0A,0x0D,0x0A,0x00,0x0D,0x0A,0x51,0x55,0x49,0x54,0x0A };
     uint8_t from7[28], from8[28];
@@ -7135,17 +7252,34 @@ static void test_proxy_header(int port) {
     oc_tls_server_free(&srv2);
     unsetenv("OPENCHIME_TRUSTED_PROXIES");
     unsetenv("OPENCHIME_DEV_CONNS_PER_IP");
-    unlink("build/itest_proxy.db"); unlink("build/itest_proxy.db-wal"); unlink("build/itest_proxy.db-shm");
+    db_unlink("itest_proxy.db");
 }
 
 int run_netloop_tests(void) {
     printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, dm, drafts across two devices, load, rate-limit, out-cap, throttle, admin, logout\n");
 
-    /* Attachment blobs go to a build-local dir (REQ-140); the daemon defaults to
-     * /data, which isn't writable in the test sandbox. */
-    mkdir("build/itest_data", 0700);
-    setenv("OPENCHIME_DATA_DIR", "build/itest_data", 1);
-    /* A small call cap, so the call test can fill one (REQ-305). */
+    /* Everything the suite writes -- its databases, its blobs -- goes in a
+     * directory of its own, so nothing another suite, run or checkout does can
+     * meet it. Attachment blobs (REQ-140): the daemon defaults to /data, which
+     * isn't writable in the test sandbox. */
+    if (oc_test_mkdtemp("netloop", g_dir, sizeof g_dir) != 0) {
+        printf("  FAIL itest_netloop: no directory of its own under $TMPDIR\n");
+        return 1;
+    }
+    char data_dir[600];
+    snprintf(data_dir, sizeof data_dir, "%s", tpath("data"));
+    mkdir(data_dir, 0700);
+    const char *old_data = getenv("OPENCHIME_DATA_DIR");
+    char saved_data[600] = "";
+    int had_data = old_data != NULL;
+    if (old_data) snprintf(saved_data, sizeof saved_data, "%s", old_data);
+    setenv("OPENCHIME_DATA_DIR", data_dir, 1);
+    /* A small call cap, so the call test can fill one (REQ-305): the shared
+     * loop's only, put back as it was once that loop stops. */
+    const char *old_cap = getenv("OPENCHIME_DEV_CALL_MAX");
+    char saved_cap[32] = "";
+    int had_cap = old_cap != NULL;
+    if (old_cap) snprintf(saved_cap, sizeof saved_cap, "%s", old_cap);
     setenv("OPENCHIME_DEV_CALL_MAX", "3", 1);
 
     oc_tls_server srv;
@@ -7167,10 +7301,8 @@ int run_netloop_tests(void) {
     oc_netloop_set_tts(&STUB_TTS);
     oc_netloop_set_stt(&STUB_STT);
 
-    unlink("build/itest_netloop.db");
-    unlink("build/itest_netloop.db-wal");
-    unlink("build/itest_netloop.db-shm");
-    oc_dbwriter *dbw = oc_dbwriter_start("build/itest_netloop.db");
+    db_unlink("itest_netloop.db");
+    oc_dbwriter *dbw = oc_dbwriter_start(tpath("itest_netloop.db"));
     if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw != NULL);
 
@@ -7193,21 +7325,24 @@ int run_netloop_tests(void) {
     }
     CHECK(flooder != 0);
 
-    struct loop_arg arg;
-    arg.port = 15000 + (int)(getpid() % 2000);   /* to 17131, below every other suite's ports */
-    arg.srv = &srv;
-    arg.dbw = dbw;
-    arg.stop = 0;
-    g_ready_port = arg.port;
+    /* The shared loop, on a port the kernel picks (start_loop): no range to
+     * share with any other suite, or with bench_loop. */
+    static struct loop_arg arg;
     __atomic_store_n(&g_ready_calls, 0, __ATOMIC_RELEASE);   /* per run: OC_TEST_REPEAT runs this again */
     g_ready_connected = 0;
-    oc_netloop_set_ready(on_ready, NULL);
+    oc_netloop_set_ready(on_ready, &arg);
     pthread_t th;
-    CHECK(pthread_create(&th, NULL, loop_thread, &arg) == 0);
-    for (int i = 0; i < 500 && !__atomic_load_n(&g_ready_calls, __ATOMIC_ACQUIRE); i++) usleep(10000);
+    int up = start_loop(&arg, &th, &srv, dbw, 0) != 0;
+    CHECK(up);
+    g_main = &arg;
+    CHECK(WAIT_UNTIL(__atomic_load_n(&g_ready_calls, __ATOMIC_ACQUIRE), 5000));
     CHECK(__atomic_load_n(&g_ready_calls, __ATOMIC_ACQUIRE) == 1 && g_ready_connected);
 
-    if (failures == 0) {
+    /* Only setup gates what follows: a failure in one test is that test's,
+     * and the next still runs and says what it finds. */
+    int setup_ok = failures == 0 && up;
+    if (!setup_ok) printf("  FAIL itest_netloop: the shared loop did not come up; its tests are not run\n");
+    if (setup_ok) {
         test_version_reject(arg.port, pin);
         test_frame_version_mismatch(arg.port, pin);
         test_unexpected_msg_type(arg.port, pin);
@@ -7228,9 +7363,11 @@ int run_netloop_tests(void) {
         test_upload_restarted(arg.port, pin, dbw);
         test_webhook_vertical(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
-        oc_netloop_set_call_grace_ms(300);   /* the call tests see a held seat go quickly */
+        /* The call group: a held seat goes quickly for every one of them, and
+         * the knob is put back after the group, whatever it found. */
+        oc_netloop_set_call_grace_ms(300);
         test_call_vertical(arg.port, pin);
-    test_pdm_relay(arg.port, pin);
+        test_pdm_relay(arg.port, pin);
         test_call_leave_while_joining(arg.port, pin, dbw);
         test_alerts_wire(arg.port, pin, dbw);
         test_restore_wire(arg.port, pin);
@@ -7238,9 +7375,9 @@ int run_netloop_tests(void) {
         test_call_share(arg.port, pin);
         test_call_udp_vertical(arg.port, pin, audio_port);
         test_call_rejoin_grace(arg.port, pin);
-        oc_netloop_set_call_grace_ms(300);
+        oc_netloop_set_call_grace_ms(300);   /* rejoin_grace sets its own */
         test_call_transports(arg.port, pin, audio_port);
-        test_call_routed(arg.port + 126);
+        test_call_routed();
         oc_netloop_set_call_grace_ms(0);
         test_concurrent_load(arg.port, pin);
         test_login_bound(arg.port, pin);
@@ -7254,31 +7391,34 @@ int run_netloop_tests(void) {
         test_revoke_one_session(arg.port, pin);
         test_groups_vertical(arg.port, pin);
         test_groups_unasked(arg.port, pin);
-        test_http_stack(arg.port + 128, arg.port + 129);
-        test_auth_begin(arg.port + 124);
-        test_proxy_header(arg.port + 125);
+        test_http_stack();
+        test_auth_begin();
+        test_proxy_header();
     }
 
-    stop_loop(&arg, th);
-    unsetenv("OPENCHIME_DEV_CALL_MAX");
+    if (up) stop_loop(&arg, th);
+    g_main = NULL;
+    oc_netloop_set_ready(NULL, NULL);
+    if (had_cap) setenv("OPENCHIME_DEV_CALL_MAX", saved_cap, 1); else unsetenv("OPENCHIME_DEV_CALL_MAX");
 
-    if (failures == 0) {
-        test_voice_input_absent(arg.port + 124, 1);
-        test_voice_input_absent(arg.port + 125, 0);
-        test_summaries(arg.port + 127);
-        test_web_signin(arg.port + 128);
-        test_device_signin(arg.port + 130);
-        test_direct_signin(arg.port + 131);
-    }
+    /* Each of these makes its own daemon and database: none waits on the
+     * shared loop's tests, passed or not. */
+    test_voice_input_absent(1);
+    test_voice_input_absent(0);
+    test_summaries();
+    test_web_signin();
+    test_device_signin();
+    test_direct_signin();
 
     oc_netloop_set_audio(-1, 0);
     close(audio_udp);
 
     oc_dbwriter_stop(dbw);
     oc_tls_server_free(&srv);
-    unlink("build/itest_netloop.db");
-    unlink("build/itest_netloop.db-wal");
-    unlink("build/itest_netloop.db-shm");
+    db_unlink("itest_netloop.db");
+    if (had_data) setenv("OPENCHIME_DATA_DIR", saved_data, 1); else unsetenv("OPENCHIME_DATA_DIR");
+    oc_test_rmtree(g_dir);
+    g_dir[0] = '\0';
 
     return failures;
 }

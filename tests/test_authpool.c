@@ -37,7 +37,7 @@ static int returned(void) {
 }
 
 static void wait_returned(int n) {
-    for (int i = 0; i < 500 && returned() < n; i++) usleep(10000);
+    (void)WAIT_UNTIL(returned() >= n, 5000);
 }
 
 /* A check of `pw` against a stored "right" at a low count. */
@@ -87,8 +87,10 @@ int run_authpool_tests(void) {
     oc_authpool_hold(p, 1);
     oc_auth_check *h[3];
     for (int i = 0; i < 3; i++) { h[i] = mk(i, "right"); oc_authpool_submit(p, h[i]); }
-    usleep(100000);
-    CHECK(oc_authpool_waiting(p) == 3 && returned() == before);
+    /* The positive: all three were taken in and are counted as waiting; then
+     * the negative, that none came back while held. */
+    CHECK(WAIT_UNTIL(oc_authpool_waiting(p) == 3, 2000));
+    CHECK(returned() == before);
     oc_authpool_hold(p, 0);
     wait_returned(before + 3);
     CHECK(returned() == before + 3 && oc_authpool_waiting(p) == 0);

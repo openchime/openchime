@@ -6,6 +6,7 @@
  * handle's key, wakes the net loop through its eventfd, refuses when its queue is
  * full, opens the engine only when needed and closes it when idle. */
 #include "check.h"
+#include "testenv.h"
 #include "oc_mp4.h"
 #include "tts_worker.h"
 
@@ -19,7 +20,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define TMPDIR "build/oc-tts-worker-test"
 
 /* ---- the stub engine ---- */
 
@@ -82,10 +82,8 @@ static int count(int *v) {
     return n;
 }
 
-static void msleep(int ms) {
-    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
-    nanosleep(&ts, NULL);
-}
+/* Until a render is inside the stub engine (held there by stub_hold). */
+static int wait_saying(void) { return WAIT_UNTIL(count(&stub_saying), 5000); }
 
 /* ---- rendering ---- */
 
@@ -130,24 +128,20 @@ static void test_render(void) {
 /* ---- the worker ---- */
 
 static int wait_result(oc_tts_worker *w, oc_tts_result *r, int timeout_ms) {
-    for (int t = 0; t < timeout_ms; t += 10) {
-        if (oc_tts_worker_next_result(w, r)) return 1;
-        msleep(10);
-    }
-    return 0;
+    return WAIT_UNTIL(oc_tts_worker_next_result(w, r), (uint64_t)timeout_ms);
 }
 
 static void test_worker(void) {
-    mkdir("build", 0755);
-    mkdir(TMPDIR, 0700);
-    oc_blobstore *bs = oc_blobstore_open(TMPDIR, NULL);
+    char dir[512];
+    CHECK(oc_test_mkdtemp("tts-worker", dir, sizeof dir) == 0);
+    oc_blobstore *bs = oc_blobstore_open(dir, NULL);
     CHECK(bs != NULL);
-    if (!bs) return;
+    if (!bs) { oc_test_rmtree(dir); return; }
     stub_opens = stub_closes = 0;
 
     oc_tts_worker *w = oc_tts_worker_start(&STUB, bs, 2, 100);
     CHECK(w != NULL);
-    if (!w) { oc_blobstore_close(bs); return; }
+    if (!w) { oc_blobstore_close(bs); oc_test_rmtree(dir); return; }
     CHECK(!oc_tts_worker_engine_open(w) && count(&stub_opens) == 0);   /* nothing loaded until needed */
 
     /* In order, stored under the handle's key, readable back as the file. */
@@ -189,14 +183,7 @@ static void test_worker(void) {
     stub_hold = 1;
     pthread_mutex_unlock(&stub_mu);
     CHECK(oc_tts_worker_submit(w, 21, h1, 0, "Held.") == 0);
-    pthread_mutex_lock(&stub_mu);
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += 5;
-    while (!stub_saying && pthread_cond_timedwait(&stub_cv, &stub_mu, &deadline) == 0) {}
-    int saying = stub_saying;
-    pthread_mutex_unlock(&stub_mu);
-    CHECK(saying);
+    CHECK(wait_saying());
     CHECK(oc_tts_worker_submit(w, 22, h2, 0, "Waiting one.") == 0);
     CHECK(oc_tts_worker_submit(w, 23, h3, 0, "Waiting two.") == 0);
     CHECK(oc_tts_worker_submit(w, 24, h3, 0, "No room.") == -1);
@@ -212,8 +199,7 @@ static void test_worker(void) {
     CHECK(count(&stub_opens) == 1);                        /* opened once for all of it */
 
     /* Idle: the engine is closed, and the next render opens it again. */
-    int closed = 0;
-    for (int t = 0; t < 3000 && !closed; t += 20) { closed = !oc_tts_worker_engine_open(w); if (!closed) msleep(20); }
+    int closed = WAIT_UNTIL(!oc_tts_worker_engine_open(w), 3000);
     CHECK(closed && count(&stub_closes) == 1);
     CHECK(oc_tts_worker_submit(w, 31, h1, 1, "Back again.") == 0);
     CHECK(wait_result(w, &r, 5000) && r.req_id == 31 && r.status == OC_TTS_OK);
@@ -228,8 +214,8 @@ static void test_worker(void) {
     stub_hold = 1;
     pthread_mutex_unlock(&stub_mu);
     CHECK(oc_tts_worker_submit(w, 51, h1, 0, "Held at stop.") == 0);
+    CHECK(wait_saying());                                  /* 51 in the engine, 52 behind it */
     CHECK(oc_tts_worker_submit(w, 52, h2, 0, "Dropped at stop.") == 0);
-    msleep(50);
     pthread_mutex_lock(&stub_mu);
     stub_hold = 0;
     pthread_cond_broadcast(&stub_cv);
@@ -245,6 +231,7 @@ static void test_worker(void) {
         oc_blob_delete(bs, key);
     }
     oc_blobstore_close(bs);
+    oc_test_rmtree(dir);
 }
 
 int run_tts_worker_tests(void) {

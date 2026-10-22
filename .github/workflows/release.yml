@@ -366,7 +366,7 @@ jobs:
           mkdir -p check && tar xzf "candidate/linux-amd64/openchimed-build-${id}-linux-amd64.tar.gz" -C check
           got=$("check/openchimed-build-${id}-linux-amd64/openchimed" --version)
           echo "$got"
-          printf '%s' "$got" | grep -q "^openchimed ${id} " || { echo "::error::the candidate's daemon reports '$got', not build ${id}"; exit 1; }
+          grep -q "^openchimed ${id} " <<<"$got" || { echo "::error::the candidate's daemon reports '$got', not build ${id}"; exit 1; }
           # And the image the release will re-tag exists, with the digest the
           # manifest recorded.
           want=$(python3 -c 'import json,sys; print(json.load(open("candidate/manifest.json"))["images"]["build-'"$id"'"])')
@@ -533,7 +533,8 @@ jobs:
           set -euo pipefail
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             "./$DIST/openchimed_${VERSION}_${{ matrix.arch }}.deb"
-          /usr/bin/openchimed --version | grep -q "^openchimed ${BUILD_ID} " || {
+          ver="$(/usr/bin/openchimed --version)"
+          grep -q "^openchimed ${BUILD_ID} " <<<"$ver" || {
             echo "::error::the installed daemon does not report build ${BUILD_ID}"; exit 1; }
       # The artifact is NAMED for the platform, and the publish job downloads
       # without merge-multiple. That combination is what rebuilds dist/<platform>/

@@ -16,6 +16,7 @@
 #include "dbwriter.h"
 #include "migrate.h"
 #include "check.h"
+#include "testenv.h"
 
 #include <sqlite3.h>
 #include <stdio.h>
@@ -24,7 +25,24 @@
 #include <unistd.h>
 #include <sys/time.h>
 
-#define DBPATH "build/oc-storage-test.db"
+/* The suite's own directory (tests/testenv.h), and its database there. */
+static char g_dir[256], g_db[320];
+#define DBPATH g_db
+
+/* The writer's next result, waited for until a deadline -- not polled a fixed
+ * number of times. */
+static oc_dbres *await_result(oc_dbwriter *w) {
+    oc_dbres *r = NULL;
+    WAIT_UNTIL((r = oc_dbwriter_next_result(w)) != NULL, 5000);
+    return r;
+}
+
+static void rm_db(void) {
+    char p[400];
+    unlink(g_db);
+    snprintf(p, sizeof p, "%s-wal", g_db); unlink(p);
+    snprintf(p, sizeof p, "%s-shm", g_db); unlink(p);
+}
 
 /* The policy itself (its defaults, ranges and the watermark order) is read
  * by the configuration loader and tested in test_config.c. */
@@ -61,8 +79,8 @@ static void test_thresholds(void) {
 
 static void test_sample(void) {
     oc_storage_stats s;
-    oc_storage_sample("build", 12345, &s);
-    CHECK(s.valid == 1);                       /* build/ exists */
+    oc_storage_sample(g_dir, 12345, &s);
+    CHECK(s.valid == 1);                       /* the suite's directory exists */
     CHECK(s.total_bytes > 0);
     CHECK(s.sampled_ms == 12345);
 
@@ -174,7 +192,7 @@ static void test_audit_partitioned_cap(oc_dbwriter *w, sqlite3 *db, uint64_t now
     j->audit_max_age_ms = 30 * DAYms;
     oc_dbwriter_submit(w, j);
     oc_dbres *r = NULL;
-    for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+    r = await_result(w);
     CHECK(r != NULL);
     if (r) oc_dbres_free(r);
 
@@ -195,7 +213,7 @@ static void test_audit_query(oc_dbwriter *w, sqlite3 *db, uint64_t now, uint64_t
     j->audit_limit = 10;
     oc_dbwriter_submit(w, j);
     oc_dbres *r = NULL;
-    for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+    r = await_result(w);
     CHECK(r != NULL);
     if (r) {
         CHECK(r->type == OC_RES_AUDIT_PAGE);
@@ -217,7 +235,7 @@ static void test_audit_query(oc_dbwriter *w, sqlite3 *db, uint64_t now, uint64_t
     j->audit_limit = 10;
     oc_dbwriter_submit(w, j);
     r = NULL;
-    for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+    r = await_result(w);
     CHECK(r != NULL);
     if (r) {
         CHECK(r->type == OC_RES_AUDIT_ERR);
@@ -233,15 +251,17 @@ int run_storage_tests(void) {
            "plus the usage report and its owner/admin gate, and the audit log "
            "(per-family cap defeating the flood attack, paging, admin gate)\n");
 
+    CHECK(oc_test_mkdtemp("storage", g_dir, sizeof g_dir) == 0);
+    oc_test_path(g_db, sizeof g_db, g_dir, "storage.db");
     test_thresholds();
     test_sample();
 
     /* --- the pass, against a real database --------------------------------- */
-    unlink(DBPATH); unlink(DBPATH "-wal"); unlink(DBPATH "-shm");
+    rm_db();
     oc_dbwriter *w = oc_dbwriter_start(DBPATH);
     if (w) oc_dbwriter_set_pw_mem(w, 2048);   /* a cheap Argon2id for tests */
     CHECK(w != NULL);
-    if (!w) return failures;
+    if (!w) { oc_test_rmtree(g_dir); return failures; }
 
     /* A user and a message for the linked rows to reference. */
     CHECK(oc_dbwriter_register_local(w, "sa", "pw-sa", OC_ROLE_OWNER, 1000) != 0);
@@ -281,7 +301,7 @@ int run_storage_tests(void) {
         j->maint_evict = 0;
         oc_dbwriter_submit(w, j);
         oc_dbres *r = NULL;
-        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        r = await_result(w);
         CHECK(r != NULL);
         if (r) {
             CHECK(r->type == OC_RES_STORAGE_MAINT);
@@ -310,7 +330,7 @@ int run_storage_tests(void) {
         j->maint_evict = 0;
         oc_dbwriter_submit(w, j);
         oc_dbres *r = NULL;
-        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        r = await_result(w);
         CHECK(r != NULL);
         if (r) {
             CHECK(r->maint_expired == 1);      /* id 12 */
@@ -333,7 +353,7 @@ int run_storage_tests(void) {
         j->maint_evict = 1;
         oc_dbwriter_submit(w, j);
         oc_dbres *r = NULL;
-        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        r = await_result(w);
         CHECK(r != NULL);
         if (r) {
             CHECK(r->maint_evicted == 1);      /* id 13 */
@@ -367,7 +387,7 @@ int run_storage_tests(void) {
         j->maint_evict = 1;                 /* under pressure */
         oc_dbwriter_submit(w, j);
         oc_dbres *r = NULL;
-        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        r = await_result(w);
         CHECK(r != NULL);
         if (r) {
             CHECK(r->maint_renders == 2 && r->n_reclaim == 2);
@@ -391,7 +411,7 @@ int run_storage_tests(void) {
         j->maint_evict = 1;
         oc_dbwriter_submit(w, j);
         r = NULL;
-        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        r = await_result(w);
         CHECK(r != NULL);
         if (r) {
             CHECK(r->maint_renders == 1);
@@ -416,7 +436,7 @@ int run_storage_tests(void) {
         j->maint_evict = 1;                 /* and tier 2b on pressure */
         oc_dbwriter_submit(w, j);
         oc_dbres *r = NULL;
-        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        r = await_result(w);
         CHECK(r != NULL);
         if (r) oc_dbres_free(r);
         CHECK(reclaimed(db, 200) == 0);
@@ -431,7 +451,7 @@ int run_storage_tests(void) {
         j->maint_evict = 0;
         oc_dbwriter_submit(w, j);
         r = NULL;
-        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        r = await_result(w);
         CHECK(r != NULL);
         if (r) oc_dbres_free(r);
         CHECK(reclaimed(db, 200) == 1);
@@ -448,7 +468,7 @@ int run_storage_tests(void) {
         j2->maint_evict = 1;
         oc_dbwriter_submit(w, j2);
         r = NULL;
-        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        r = await_result(w);
         CHECK(r != NULL);
         if (r) oc_dbres_free(r);
         CHECK(reclaimed(db, 201) == 0);
@@ -466,7 +486,7 @@ int run_storage_tests(void) {
         j->maint_evict = 1;
         oc_dbwriter_submit(w, j);
         oc_dbres *r = NULL;
-        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        r = await_result(w);
         CHECK(r != NULL);
         if (r) { CHECK(r->n_reclaim == 0); oc_dbres_free(r); }
     }
@@ -482,7 +502,7 @@ int run_storage_tests(void) {
         j->maint_evict = 0;
         oc_dbwriter_submit(w, j);
         oc_dbres *r = NULL;
-        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        r = await_result(w);
         CHECK(r != NULL);
         if (r) { CHECK(r->n_reclaim == 5); oc_dbres_free(r); }
     }
@@ -502,7 +522,7 @@ int run_storage_tests(void) {
         j->user_id = 1;                       /* "sa", registered as owner above */
         oc_dbwriter_submit(w, j);
         oc_dbres *r = NULL;
-        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        r = await_result(w);
         CHECK(r != NULL);
         if (r) {
             CHECK(r->type == OC_RES_STORAGE_STATUS);
@@ -528,7 +548,7 @@ int run_storage_tests(void) {
         j->user_id = member;
         oc_dbwriter_submit(w, j);
         r = NULL;
-        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        r = await_result(w);
         CHECK(r != NULL);
         if (r) {
             CHECK(r->type == OC_RES_STORAGE_ERR);
@@ -548,6 +568,6 @@ int run_storage_tests(void) {
 
     sqlite3_close(db);
     oc_dbwriter_stop(w);
-    unlink(DBPATH); unlink(DBPATH "-wal"); unlink(DBPATH "-shm");
+    oc_test_rmtree(g_dir);
     return failures;
 }

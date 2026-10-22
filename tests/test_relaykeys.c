@@ -2,6 +2,7 @@
  * that reads it from the relay and hands it to the writer. */
 
 #include "check.h"
+#include "testenv.h"
 #include "issuer.h"
 #include "../daemon/dbwriter.h"
 #include "../daemon/relaykeys.h"
@@ -133,8 +134,9 @@ int run_relaykeys_tests(void) {
     pthread_t th;
     CHECK(pthread_create(&th, NULL, relay_thread, &f) == 0);
 
-    const char *path = "build/test_relaykeys.db";
-    unlink(path);
+    char dir[512], path[700];
+    CHECK(oc_test_mkdtemp("relaykeys", dir, sizeof dir) == 0);
+    oc_test_path(path, sizeof path, dir, "relaykeys.db");
     oc_dbwriter *w = oc_dbwriter_start(path);
     if (w) oc_dbwriter_set_pw_mem(w, 2048);   /* a cheap Argon2id for tests */
     CHECK(w != NULL);
@@ -144,15 +146,14 @@ int run_relaykeys_tests(void) {
     oc_relaykeys *rk = oc_relaykeys_start(url, w);
     CHECK(rk != NULL);
     /* Waits bound a hang, not a speed: each event is asserted after. */
-    for (int i = 0; i < 1500 && relay_hits(&f) < 1; i++) usleep(20000);
+    CHECK(WAIT_UNTIL(relay_hits(&f) >= 1, 30000));
     CHECK(relay_hits(&f) == 1 && !oc_relaykeys_fetched(rk));
     oc_relaykeys_stop(rk);
 
     /* Answering: the writer has the published key. */
     pthread_mutex_lock(&f.mu); f.status = 200; pthread_mutex_unlock(&f.mu);
     rk = oc_relaykeys_start(url, w);
-    for (int i = 0; i < 1500 && !oc_relaykeys_fetched(rk); i++) usleep(20000);
-    CHECK(oc_relaykeys_fetched(rk));
+    CHECK(WAIT_UNTIL(oc_relaykeys_fetched(rk), 30000));
     oc_relaykeys_stop(rk);
     /* A URL too long to hold is refused at start, not cut. */
     {
@@ -170,5 +171,6 @@ int run_relaykeys_tests(void) {
     close(f.fd);
     pthread_mutex_destroy(&f.mu);
     oc_issuer_free(&a); oc_issuer_free(&b);
+    oc_test_rmtree(dir);
     return failures;
 }

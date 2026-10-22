@@ -247,12 +247,18 @@ int run_audio_tests(void) {
      * whole, A is not. */
     oc_relay_set_silence_ms(r, 60);
     g_gone.n = 0;
-    for (int i = 0; i < 40 && !g_gone.n; i++) {
-        udp_send(cA, &relay_addr, tA, (uint16_t)(80 + i), NULL);
-        udp_send(cD, &relay_addr, tD, (uint16_t)(80 + i), NULL);
-        pump(r, udp);
-        usleep(20000);
-        oc_relay_sweep(r);
+    {   /* Silence is time passing, so time passes here: a third of the window
+         * between sweeps, until B is dropped or a deadline long past it. */
+        uint64_t end = oc_test_deadline(800);
+        uint16_t seq = 80;
+        do {
+            udp_send(cA, &relay_addr, tA, seq, NULL);
+            udp_send(cD, &relay_addr, tD, seq, NULL);
+            seq++;
+            pump(r, udp);
+            oc_test_let_time_pass(20);
+            oc_relay_sweep(r);
+        } while (!g_gone.n && oc_test_pause(end));
     }
     CHECK(g_gone.n == 1 && g_gone.len == 16 && memcmp(g_gone.t, tB, 16) == 0);
     CHECK(oc_relay_count(r) == 2);

@@ -14,6 +14,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 
 #define OC_TEST_TOKEN_CAP    4096
 #define OC_TEST_VERIFIER_CAP 48
@@ -33,8 +35,8 @@ int oc_test_signup(const char *host, int port, const uint8_t *pin,
                    char *why, size_t wcap);
 
 /* POST /account/password: `user`'s password from `current` to `next`. 0 when
- * the page said "Password changed" (every session of the account is then
- * revoked, the page's rule); -1 with `why`. */
+ * the page reports data-oc-result="password-changed" (every session of the
+ * account is then revoked, the page's rule); -1 with `why`. */
 int oc_test_change_password(const char *host, int port, const uint8_t *pin,
                             const char *user, const char *current, const char *next,
                             char *why, size_t wcap);
@@ -49,5 +51,42 @@ int oc_test_web_call(const char *host, int port, const uint8_t *pin,
 /* A fresh PKCE pair: the verifier (43 base64url characters) and the challenge
  * over it, which goes to the page as `nonce`. 0 or -1. */
 int oc_test_pkce(char verifier[OC_TEST_VERIFIER_CAP], char challenge[OC_TEST_VERIFIER_CAP]);
+
+/* ---- reading a page by its markers (daemon/webpages.h) -----------------------
+ *
+ * A page names its screen in data-oc-page, an outcome in data-oc-result and a
+ * refusal's kind in data-oc-error. A test reads those, never the page's words,
+ * which are for a person and may be reworded without anything breaking. */
+
+/* Whether `resp` carries `attr`="`value`" (attr e.g. "data-oc-page"). */
+static inline int oc_test_page_attr(const char *resp, const char *attr, const char *value) {
+    char want[160];
+    int n = snprintf(want, sizeof want, "%s=\"%s\"", attr, value);
+    return resp && n > 0 && (size_t)n < sizeof want && strstr(resp, want) != NULL;
+}
+/* The page is this screen ("signin", "security-on", ...). */
+static inline int oc_test_page_is(const char *resp, const char *screen) {
+    return oc_test_page_attr(resp, "data-oc-page", screen);
+}
+/* The page reports this outcome ("password-changed", "approved", ...). */
+static inline int oc_test_page_result(const char *resp, const char *result) {
+    return oc_test_page_attr(resp, "data-oc-result", result);
+}
+/* The page refused for this reason ("pw-mismatch", "code-wrong", ...). */
+static inline int oc_test_page_error(const char *resp, const char *code) {
+    return oc_test_page_attr(resp, "data-oc-error", code);
+}
+/* The page refused for any reason. */
+static inline int oc_test_page_any_error(const char *resp) {
+    return resp && strstr(resp, "data-oc-error=\"") != NULL;
+}
+/* The refusal's code into `out` ("" when the page refused nothing). */
+static inline const char *oc_test_page_error_code(const char *resp, char *out, size_t cap) {
+    const char *m = resp ? strstr(resp, "data-oc-error=\"") : NULL;
+    if (!m) { if (cap) out[0] = '\0'; return out; }
+    m += strlen("data-oc-error=\"");
+    snprintf(out, cap, "%.*s", (int)strcspn(m, "\""), m);
+    return out;
+}
 
 #endif /* OC_TEST_SIGNIN_H */

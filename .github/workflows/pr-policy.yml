@@ -38,8 +38,7 @@ jobs:
           # Check what will actually be committed.
           SUBJECT="${TITLE} (#${NUMBER})"
 
-          if ! printf '%s' "$TITLE" \
-             | grep -qE '^OC-[0-9]+: [A-Z]([^[:cntrl:]]*[^.,;:!?[:space:]])?$'; then
+          if ! grep -qE '^OC-[0-9]+: [A-Z]([^[:cntrl:]]*[^.,;:!?[:space:]])?$' <<<"$TITLE"; then
             echo "::error::Title must read 'OC-<issue>: Capitalised description' with no trailing punctuation. Got: ${TITLE}"
             fail=1
           fi
@@ -60,7 +59,7 @@ jobs:
           N=$(printf '%s' "$TITLE" | sed -nE 's/^OC-([0-9]+):.*/\1/p')
           if [ -n "$N" ]; then
             if ! J=$(gh api "repos/${ISSUES_REPO}/issues/${N}" 2>/tmp/e); then
-              grep -qi 'not found' /tmp/e \
+              grep -qF '(HTTP 404)' /tmp/e \
                 && echo "::error::OC-${N} is not an issue on ${ISSUES_REPO}." \
                 || echo "::error::Could not check OC-${N}: $(head -1 /tmp/e)"
               fail=1

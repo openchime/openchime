@@ -186,6 +186,64 @@ void oc_sum_parts_free(char **parts, int n);
 /* The system prompt: the same for every call. */
 extern const char *const OC_SUM_SYSTEM;
 
+/* --- the prompts' words ---------------------------------------------------------
+ * Each prompt is built from these, so the words are in one place and a test
+ * checks a prompt by building its parts from the same constants rather than
+ * by quoting them. The labels are also what the answer's grammar fixes and
+ * what reading an answer looks for. */
+#define SUM_LBL_OVERVIEW  "Overview:"
+#define SUM_LBL_ATTENTION "Needs attention:"
+#define SUM_LBL_MORE      "More topics:"
+/* What each stage's prompt opens with (the intro), by the worker. */
+#define SUM_INTRO_MESSAGES "Messages from %s, oldest first. Indented lines are replies in a thread."
+#define SUM_INTRO_NOTES    "Notes on consecutive parts of %s, oldest first. Each is: (kind) topic: what happened."
+#define SUM_INTRO_PART     "One long message in %s, part %d of %d."
+/* Notes: the ask, after the lines; its %d are notes_max and SUM_CITES_MAX. */
+#define SUM_NOTES_FORM "- [line number] kind | topic | what happened"
+#define SUM_NOTES_ASK                                                                                   \
+    "\nWrite notes on these lines: at most %d, the most important first. Each note is one line in "      \
+    "exactly this form:\n" SUM_NOTES_FORM "\n"                                                          \
+    "\n"                                                                                                \
+    "kind is event, decision, action or question. topic names what the note is about in 2 to 5 "        \
+    "words, and notes about the same thing share it. what happened is one or two sentences saying who " \
+    "did what, with the particulars the lines give. Put what is about the same thing into one note, "   \
+    "citing the lines it comes from (at most %d), each line number in square brackets, as [12] or "     \
+    "[12][15]. Leave out greetings and small talk.\n"
+/* The summary: the form, after the lines; the "More topics" line of it when
+ * there may be more; the ask (%d: topics_min, topics, details_min, details,
+ * attention); the more's ask (%d: more); the citation rule (%d: SUM_CITES_MAX). */
+#define SUM_FINAL_FORM                                                                     \
+    "\nSummarize these lines for someone catching up, in exactly this form:\n"             \
+    "\n"                                                                                   \
+    SUM_LBL_OVERVIEW " [line number] <the most important outcome or change>\n"             \
+    "## <what a topic is about>\n"                                                         \
+    "[line number] <what happened in it, and where it stands now>\n"                       \
+    "- [line number] <one detail: who did or said what>\n"                                 \
+    SUM_LBL_ATTENTION "\n"                                                                 \
+    "- [line number] action: <who has to do what, and by when if it was said>\n"           \
+    "- [line number] question: <a question that was asked and not answered>\n"
+#define SUM_FINAL_FORM_MORE SUM_LBL_MORE " <topic>; <topic>\n"
+#define SUM_FINAL_ASK                                                                                     \
+    "\nWrite %d to %d topics, the most important first, each titled in 2 to 6 words, with what happened "  \
+    "in it in one to three sentences and %d to %d details of one sentence each. The overview is one "      \
+    "sentence. Write \"Needs attention\" only for actions and unanswered questions, at most %d, one "      \
+    "sentence each, and leave it out when there are none."
+#define SUM_FINAL_ASK_MORE " Name any further topics, at most %d, after \"More topics\"."
+#define SUM_FINAL_CITE                                                                                     \
+    " Every line starts with the numbers of the lines it comes from, at most %d, "                         \
+    "each in square brackets, as [12] or [12][15]. Write only what the lines say, with their particulars, " \
+    "and name a person only for what their own lines say. Do not comment on, interpret or characterize "   \
+    "what happened.\n"
+/* A part's rewrite (%zu: its words, %s: it, %d: the cap), and a whole
+ * summary's (the head's %d its words; the ask's %d the total). */
+#define SUM_REWRITE_ASK                                                                                  \
+    "This is %zu words:\n\n%s\n\nRewrite it in at most %d words. Keep every name, number and fact "       \
+    "that fits, and add nothing.\n"
+#define SUM_SHORTEN_HEAD "This summary is %d words:\n\n"
+#define SUM_SHORTEN_ASK                                                                                     \
+    "\nWrite it again in at most %d words, in exactly the same form, each line keeping the line numbers it " \
+    "starts with. Keep every name, number and fact that fits, the most important first, and add nothing.\n"
+
 /* --- notes --- */
 /* How many notes one call may write on `input_tokens` of `input_lines` lines. */
 int oc_sum_notes_for(size_t input_tokens, int input_lines);

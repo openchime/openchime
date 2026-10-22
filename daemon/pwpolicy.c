@@ -49,28 +49,29 @@ static int contains(const char *pw, const char *word) {
     return strstr(pw, w) != NULL;
 }
 
-int oc_pw_acceptable(const char *pw, const char *username, const char *workspace,
-                     char *out, size_t cap, const char **why) {
-    static const char *dummy;
-    if (!why) why = &dummy;
-    if (oc_pw_normalize(pw, out, cap) != 0) {
-        *why = "That password has characters it can't hold. Use letters, numbers, spaces and symbols.";
-        return -1;
+const char *oc_pw_verdict_text(oc_pw_verdict v) {
+    switch (v) {
+    case OC_PW_OK:        return "";
+    case OC_PW_BAD_CHARS: return "That password has characters it can't hold. Use letters, numbers, spaces and symbols.";
+    case OC_PW_TOO_SHORT: return "Use at least 15 characters. A short phrase works well.";
+    case OC_PW_TOO_LONG:  return "Use at most 128 characters.";
+    case OC_PW_COMMON:    return "That password is too common. Choose one that isn't in lists of leaked passwords.";
+    case OC_PW_PERSONAL:  return "Don't build the password on your username, the workspace's name or OpenChime.";
     }
+    return "";
+}
+
+oc_pw_verdict oc_pw_check(const char *pw, const char *username, const char *workspace,
+                          char *out, size_t cap) {
+    if (oc_pw_normalize(pw, out, cap) != 0) return OC_PW_BAD_CHARS;
     size_t n = chars(out);
-    if (n < OC_PW_MIN_CHARS) { *why = "Use at least 15 characters. A short phrase works well."; return -1; }
-    if (n > OC_PW_MAX_CHARS) { *why = "Use at most 128 characters."; return -1; }
+    if (n < OC_PW_MIN_CHARS) return OC_PW_TOO_SHORT;
+    if (n > OC_PW_MAX_CHARS) return OC_PW_TOO_LONG;
     char lw[OC_PW_NORM_MAX];
     lower(out, lw, sizeof lw);
     int same = 1;
     for (size_t i = 1; lw[i]; i++) if (lw[i] != lw[0]) { same = 0; break; }
-    if (same || bsearch(lw, oc_pw_common, oc_pw_common_n, sizeof *oc_pw_common, cmp)) {
-        *why = "That password is too common. Choose one that isn't in lists of leaked passwords.";
-        return -1;
-    }
-    if (contains(lw, username) || contains(lw, workspace) || strstr(lw, "openchime")) {
-        *why = "Don't build the password on your username, the workspace's name or OpenChime.";
-        return -1;
-    }
-    return 0;
+    if (same || bsearch(lw, oc_pw_common, oc_pw_common_n, sizeof *oc_pw_common, cmp)) return OC_PW_COMMON;
+    if (contains(lw, username) || contains(lw, workspace) || strstr(lw, "openchime")) return OC_PW_PERSONAL;
+    return OC_PW_OK;
 }

@@ -35,7 +35,11 @@ static void http_get(int port, const char *request, char *status, size_t cap) {
             buf[n] = '\0';
             char *eol = strstr(buf, "\r\n");
             if (eol) *eol = '\0';
-            snprintf(status, cap, "%s", buf);
+            /* The status line only, cut to fit: the caller compares its start. */
+            size_t len = strlen(buf);
+            if (len >= cap) len = cap - 1;
+            memcpy(status, buf, len);
+            status[len] = '\0';
         }
     }
     close(fd);
@@ -47,7 +51,8 @@ struct browser { int port; char path[96]; char first[64], second[64], third[64];
 static void *browser_thread(void *arg) {
     struct browser *b = arg;
     char req[512];
-    usleep(50000);
+    /* The listener is open before this thread starts, so the requests queue
+     * in its backlog and oc_loopback_wait answers them in order. */
     http_get(b->port, "POST /cb/whatever HTTP/1.1\r\nHost: x\r\n\r\n", b->first, sizeof b->first);
     http_get(b->port, "GET /cb/not-the-secret?token=evil HTTP/1.1\r\nHost: x\r\n\r\n",
              b->second, sizeof b->second);
@@ -57,7 +62,9 @@ static void *browser_thread(void *arg) {
 }
 
 static atomic_int g_cancel;
-static void *cancel_thread(void *arg) { (void)arg; usleep(150000); g_cancel = 1; return NULL; }
+/* The person presses cancel a moment into the wait: time passing is what is
+ * modelled; the outcome asserted is the wait's answer, CANCELLED, either way. */
+static void *cancel_thread(void *arg) { (void)arg; oc_test_let_time_pass(150); g_cancel = 1; return NULL; }
 
 /* --- the tunnel ------------------------------------------------------------ */
 
@@ -100,7 +107,7 @@ static void *fake_daemon(void *arg) {
                 if (n == 0 && rs2 == OC_TLS_OK) break;
             }
             if (st == OC_TLS_OK && strncmp(req, "POST /account/password ", 23) == 0)
-                usleep((useconds_t)atomic_load(&g_fd_slow_ms) * 1000u);
+                usleep((useconds_t)atomic_load(&g_fd_slow_ms) * 1000u);   /* slow-on-purpose: a slow daemon, which the tunnel must outwait */
             if (st == OC_TLS_OK) {
                 char resp[9000];
                 int n = snprintf(resp, sizeof resp, "HTTP/1.1 303 See Other\r\nLocation: /signup?x=1\r\n"

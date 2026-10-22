@@ -142,6 +142,7 @@ static int test_html_extract(void) {
     /* Case-blind tags, single quotes, attribute order, self-closing. */
     CHECK(extract("<META CONTENT='X marks &amp; spots' PROPERTY='og:title'/>",
                   t, sizeof t, d, sizeof d) == 0);
+    /* contract: the input's title, its &amp; decoded */
     CHECK(strcmp(t, "X marks & spots") == 0 && d[0] == '\0');
 
     /* Entities and whitespace collapse inside <title>. */

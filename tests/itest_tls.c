@@ -9,6 +9,7 @@
 #include "protocol.h"
 #include "config.h"
 #include "check.h"
+#include "testenv.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -434,7 +435,7 @@ static void test_tls_builtin_roots_parse(void) {
 
 /* A private CA and a server certificate it issued, as PEM files in `dir`. */
 struct private_pki {
-    char ca[128], cert[128], key[128];
+    char ca[400], cert[400], key[400];
 };
 
 static int write_file(const char *path, const char *text) {
@@ -568,8 +569,8 @@ static oc_tls_status ca_handshake(const struct private_pki *pki, const char *hos
 }
 
 static void test_tls_extra_ca(void) {
-    char dir[] = "/tmp/oc-extra-ca-XXXXXX";
-    CHECK(mkdtemp(dir) != NULL);
+    char dir[256];
+    CHECK(oc_test_mkdtemp("extra-ca", dir, sizeof dir) == 0);
     struct private_pki pki;
     CHECK(make_private_pki(dir, &pki) == 0);
 
@@ -585,7 +586,7 @@ static void test_tls_extra_ca(void) {
 
     /* A file that is missing, or is not certificates, is refused -- and a
      * refusal leaves no extra roots behind, rather than the previous ones. */
-    char missing[160], junk[160], half[160];
+    char missing[300], junk[300], half[300];
     snprintf(missing, sizeof missing, "%s/absent.pem", dir);
     snprintf(junk, sizeof junk, "%s/junk.pem", dir);
     snprintf(half, sizeof half, "%s/half.pem", dir);
@@ -629,10 +630,10 @@ static void test_tls_extra_ca(void) {
  * and the certificate must name it as an iPAddress SAN -- mbedTLS would have
  * sent the address as SNI as given. */
 static void test_tls_ip_literal(void) {
-    char dir[] = "/tmp/oc-ip-san-XXXXXX";
-    CHECK(mkdtemp(dir) != NULL);
+    char dir[256];
+    CHECK(oc_test_mkdtemp("ip-san", dir, sizeof dir) == 0);
     struct private_pki named, plain;
-    char d2[200];
+    char d2[300];
     snprintf(d2, sizeof d2, "%s/plain", dir);
     CHECK(mkdir(d2, 0700) == 0);
     CHECK(make_private_pki_ip(dir, &named, 1) == 0);

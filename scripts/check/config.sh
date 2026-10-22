@@ -15,7 +15,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 BIN=./openchimed
-[ -x "$BIN" ] || { echo "config: ./openchimed is not built (make)" >&2; exit 2; }
+[ -x "$BIN" ] || { echo "config: ./openchimed is not built (make; \`make test\` builds it first)" >&2; exit 2; }
 fail=0
 say() { echo "config: $*" >&2; }
 
@@ -29,8 +29,18 @@ if [ -n "$bad" ]; then say "getenv outside the loader:"; echo "$bad" | sed 's/^/
 rows=$("$BIN" --config-reference | grep -oE '`OPENCHIME_[A-Za-z0-9_<>]+`' | tr -d '`' | sed 's/<n>/N/' | sort -u)
 pattern_prefixes=$(echo "$rows" | grep '_N$' | sed 's/N$//')
 # tests/test_config.c names wrong settings on purpose (the unknown-name check).
-used=$(git ls-files -- daemon client shared tests scripts packaging docs README.md Dockerfile entrypoint.sh .github mk Makefile \
-       | grep -vE '\.(png|ico|bin|ort|npz|wav|bmp)$|^tests/test_config\.c$' | xargs grep -ohE 'OPENCHIME_[A-Z0-9_]+' 2>/dev/null \
+# NUL-separated, so a path with a space in it is one path; outside a git
+# checkout, the same places found on disk.
+scan=(daemon client shared tests scripts packaging docs README.md Dockerfile entrypoint.sh .github mk Makefile)
+list_files() {
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        git ls-files -z --cached --others --exclude-standard -- "${scan[@]}"
+    else
+        find "${scan[@]}" \( -name node_modules -o -name __pycache__ \) -prune -o -type f -print0 2>/dev/null
+    fi
+}
+used=$(list_files | grep -zvE '\.(png|ico|bin|ort|npz|wav|bmp)$|^tests/test_config\.c$' \
+       | xargs -0 grep -ohIE 'OPENCHIME_[A-Z0-9_]+' 2>/dev/null \
        | grep -vE '_H$|^OPENCHIME_DEV_$|^OPENCHIME_$|_$' | sort -u)
 missing=""
 for n in $used; do

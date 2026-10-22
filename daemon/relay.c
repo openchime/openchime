@@ -51,6 +51,7 @@ struct oc_relay {
     oc_idmap       by_call;          /* call id -> first participant */
     oc_idmap       by_conn;          /* connection id -> participant */
     size_t         n;
+    uint64_t       received;         /* datagrams taken off the socket, relayed or not */
     participant    parts[OC_RELAY_MAX_PARTS];
 };
 
@@ -296,6 +297,7 @@ static int relay_one(oc_relay *r) {
     mh.msg_control = ctl.b; mh.msg_controllen = sizeof ctl.b;
     ssize_t n = recvmsg(r->fd, &mh, 0);
     if (n < 0) return 0;
+    r->received++;
     socklen_t sl = mh.msg_namelen;
 
     if (!r->token_len || (size_t)n < r->token_len + 2) return 1;
@@ -341,6 +343,8 @@ int oc_relay_on_readable(oc_relay *r, int max_packets) {
         if (!relay_one(r)) return 0;
     return 1;
 }
+
+uint64_t oc_relay_received(const oc_relay *r) { return r ? r->received : 0; }
 
 void oc_relay_sweep(oc_relay *r) {
     if (!r || !r->n) return;

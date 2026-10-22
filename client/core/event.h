@@ -21,6 +21,24 @@
  * judged by its fingerprint alone. */
 #define OC_CERT_DER_MAX 8192
 
+/* What an OC_EV_ERROR is about, beside its sentence: the stable kind a frontend
+ * (or a test) acts on, since the words are for a person and may change. A
+ * refusal from the daemon also carries its OC_ERR_* code. */
+typedef enum {
+    OC_CERR_OTHER = 0,          /* anything not named below */
+    OC_CERR_REFUSED,            /* the daemon refused a request (err_code says which) */
+    OC_CERR_AUTH,               /* the daemon refused a sign-in (err_code says which) */
+    OC_CERR_SIGNIN_CANCELLED,   /* the person stopped a sign-in */
+    OC_CERR_SIGNIN_TIMEOUT,     /* a browser sign-in was not finished in time */
+    OC_CERR_SIGNIN_UNFINISHED,  /* the browser came back without a sign-in */
+    OC_CERR_LOCAL,              /* this computer could not start what was asked */
+    OC_CERR_UNREACHABLE,        /* the server could not be reached */
+    OC_CERR_CERT,               /* the server's certificate is not the one expected */
+    OC_CERR_RECONNECTING,       /* the connection was lost; a reconnect is due */
+    OC_CERR_PROTOCOL,           /* the server spoke a protocol this client does not */
+    OC_CERR_PDM_CLOSED          /* an encrypted conversation is not open here: nothing was sent */
+} oc_client_err;
+
 typedef struct {
     uint64_t total_bytes, avail_bytes, attach_bytes, attach_count;
     uint64_t rec_orphan, rec_expired, rec_evicted, last_reclaim_ms;
@@ -185,7 +203,8 @@ enum {
     OC_EV_ACTIVITY_END,    /* the feed is complete: count + pinned_at = seen watermark */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_BACKOFF,         /* next reconnect attempt: server_time = deadline (ms), 0 = clear */
-    OC_EV_ERROR,           /* protocol/transport error; body = human message */
+    OC_EV_ERROR,           /* protocol/transport error; body = human message,
+                            * err_kind = OC_CERR_*, err_code = the daemon's OC_ERR_* */
     /* REQ-287: people you named who are not in this channel. body = their names,
      * comma-joined for display; `peers`/`n_peers` carry their ids so the client
      * can offer to add them; status packs can_add|is_private. */
@@ -409,6 +428,8 @@ typedef struct {
     uint64_t made_at;     /* SUMMARY_READY */
     uint8_t  pdm_kind, pdm_reason;   /* PDM */
     char     pdm_safety[72];         /* PDM: OPEN, KEY_CHANGED */
+    uint8_t  err_kind;               /* ERROR: OC_CERR_* */
+    uint16_t err_code;               /* ERROR: the daemon's OC_ERR_* it answers, 0 if none */
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);

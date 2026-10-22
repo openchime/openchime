@@ -98,7 +98,7 @@ out:
 
 int tts_lexicon_open(const char *path, const tts_map *mem, tts_lexicon *lx, char *err, size_t errcap) {
     memset(lx, 0, sizeof *lx);
-    if (mem ? (lx->map = *mem, lx->map.owned = 0, !mem->p) : tts_map_open(path, &lx->map) != 0) { tts_seterr(err, errcap, "cannot map %s", path); return -1; }
+    if (mem ? (lx->map = *mem, lx->map.owned = 0, !mem->p) : tts_map_open(path, &lx->map) != 0) { tts_seterr(err, errcap, "cannot map %s", path); return TTS_OPEN_ABSENT; }
     const uint8_t *p = lx->map.p;
     size_t n = lx->map.n;
     if (n < TTS_LEX_HEADER || memcmp(p, TTS_LEX_MAGIC, 8) != 0 || tts_rd32(p + 8) != TTS_LEX_VERSION) {

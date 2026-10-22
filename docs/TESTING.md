@@ -374,11 +374,110 @@ Unit tests must be reproducible and independent of wall-clock or environment:
   defect, stopping a little late is a busy machine.
 - Unit tests touch no network. **Several suites use real files on disk**, not
   `:memory:` — `test_dbwriter`, `test_push`, `test_client_core`, `itest_netloop`
-  and `itest_slow_blob` each open a database under `build/`, because they
-  exercise migration-on-boot, WAL behaviour and multi-connection paths that an
-  in-memory database does not reproduce. They clean up after themselves; the
+  and `itest_slow_blob` each open a database, because they exercise
+  migration-on-boot, WAL behaviour and multi-connection paths that an in-memory
+  database does not reproduce. Each suite's files live in **a directory of its
+  own**, made under `$TMPDIR` by `oc_test_mkdtemp` (`tests/testenv.h`) and
+  removed at its end — never a fixed name under `build/` or `/tmp/`, which two
+  runs of the same checkout, or two checkouts, would share. The
   purely-logical suites (codec, framebuf, mention, richtext, searchq) touch
   nothing.
+
+### 2.3a Brittle tests
+
+**A test is brittle if its result can change without a change in behaviour a
+person, an operator or an integrator could see — or if it can stay green while
+that behaviour regresses.** Both are defects in the test: the first fails a
+run in which nothing broke and teaches everyone to re-run; the second passes
+one in which something did. Every rule below follows from that one.
+
+**What is compared exactly, and what is not.** Exact matching is kept for
+machine contracts only: wire and protocol bytes and opcodes, error codes and
+HTTP statuses, configuration names (`OPENCHIME_*`), the version line, JSON
+field names, and the hashes of committed data. **No test matches a person's
+words** — a page's sentence, an error's text, an e-mail's or an invitation's
+wording, a prompt — not even where the words are part of a contract: text that
+is registered or legal is checked through the constant that holds it, or its
+hash, in one place. Everything else is asserted as an outcome (the account
+exists, the token works, the message arrived), as parsed structure (JSON
+through jsmn, a page through its markers), or as a stable identifier. Where a
+test needs to know a state the code only said in words, the code gains a
+**stable machine marker** and the test reads that:
+
+- The daemon's pages (`daemon/webpages.h`) name their screen on
+  `<main data-oc-page="…">` (`signin`, `security-on`, `device-confirm`, …),
+  report an outcome as `data-oc-result="…"` (`password-changed`,
+  `password-set`, `approved`, `denied`, `step-on`, `step-off`,
+  `passkey-added`) and a refusal's kind as `data-oc-error="…"` on its message
+  (`pw-mismatch`, `pw-short`, `bad-credentials`, `code-wrong`, `rate-limited`,
+  … — `oc_page_err`, one code per kind, its sentence beside it in one table).
+  The static pages carry `data-oc-page="invalid"` and `"unavailable"` on
+  `<body>`. `tests/testsignin.h` reads them: `oc_test_page_is`,
+  `oc_test_page_result`, `oc_test_page_error`, `oc_test_page_any_error`.
+- The password policy (`daemon/pwpolicy.h`) returns a verdict
+  (`OC_PW_TOO_SHORT`, `OC_PW_COMMON`, …), not a sentence;
+  `oc_pw_verdict_text` words it.
+- The client's loopback page (`client/core/signin.h`) carries
+  `data-oc-result="signed-in"`, `"refused"` or `"pending"`.
+- The image's entrypoint says what its boot did as `entrypoint: <key>=<value>`
+  lines (§3.2), and the workflows read those.
+
+A literal that is the test's own data — given to the code and looked for again
+— is an identity, not the code's words, and is compared exactly. A machine
+contract whose shape is not obvious says so, on the line or the line before:
+`/* contract: <why> */` (an HTTP header, a signature, a decoded claim).
+
+**Waiting.** A test waits for an outcome it can observe — a callback's
+counter, a model's field, a stat — until a deadline on `CLOCK_MONOTONIC`, and
+never sleeps a fixed time before asserting, nor counts loop iterations as a
+measure of time. `tests/check.h` holds the one way to wait and is the one file
+in `tests/` that sleeps:
+
+- `WAIT_UNTIL(cond, ms)` polls `cond` until it holds or `WAIT_MS(ms)` pass,
+  and is whether it held; `WAIT_UNTIL_DO(step, cond, ms)` runs `step` (tick a
+  client, pump a relay) before each look.
+- `oc_test_deadline(ms)` and `oc_test_pause(deadline)` are the pieces, for a
+  loop with more to do than one condition; `oc_test_mono_ms()` measures.
+- `oc_test_let_time_pass(ms)` is for when elapsed time is itself the behaviour
+  under test — a silence that must outlast a window, a timestamp that must move
+  on — never a stand-in for waiting on work.
+- A fake that models a slow peer on purpose says so:
+  `/* slow-on-purpose: <why> */`.
+
+**Negatives.** Every check that something did not happen is paired with a
+positive control that shows the check could have seen it: a fence that must
+come after the thing ruled out (§2.3), or the positive half asserted first
+(the three jobs were taken in and are counted as waiting; then none came
+back). An absence on its own passes as readily when the code is broken.
+
+**Speed.** A limit on how fast code runs is a `CHECK_SPEED` (§2.4), never a
+`CHECK`; better still, the test asserts the mechanism (the work was batched,
+the cache was hit) rather than the clock.
+
+**Isolation.** Each test has its own data, paths and ports (§2.3, §2.4):
+`tests/testenv.h`'s `oc_test_mkdtemp` and `oc_test_rmtree` for files,
+`oc_test_free_port` or a port-0 bind for sockets, `oc_test_tree_path` for the
+tree's own files, found from the test binary rather than the working
+directory. A test that changes a process-wide knob (a call grace, a dev limit)
+restores it, and a test that fails does not stop the ones after it from running
+unless what failed was their setup.
+
+**Skips.** A check that cannot run here — a tool not installed, no IPv6 —
+calls `SKIP("why")` (`tests/check.h`): it prints a `SKIP` line and is counted,
+and `build/tests` prints the total at the end. **Where `CI` is set, a skip is a
+failure**: the runner is meant to have everything, and a check that silently
+stops running is a check that passes while what it covered regresses.
+
+**Enforced.** `scripts/check/tests_lint.sh` runs with the other source checks
+before the suite (`make test`, CI's `build` job) and fails on: a sleep call in
+`tests/` outside `tests/check.h` (or a `slow-on-purpose` line); a comparison
+(`strstr`, `strcmp`, `memcmp`, …) whose literal argument has a space and
+lowercase words, unless it is the test's own data or marked
+`/* contract: … */`; a `"/tmp/` literal in `tests/`; and, in the workflows,
+`| grep -q` in a step under `pipefail` — `grep -q` exits at its first match,
+the writer dies on the closed pipe, and pipefail turns the match into a
+failure, so the output is captured first (`grep -q … <<<"$out"`, or a file).
+`tests/manual/`, which a person runs by hand, is not held to it.
 
 ### 2.4 Which suites run where
 
@@ -392,10 +491,14 @@ machine, with `client_core` about 49 s, `netloop` 37 s, `media` 16 s, `summary`
 them one after another in one process, as before.
 
 Side by side, suites must not share anything outside their process: each
-suite's databases under `build/` have their own names, and the suites that
-listen use port ranges no other suite uses (`itest_netloop` from 15000,
-`itest_slow_blob` from 18100, `test_client_core` from 19000). A new suite that
-listens takes a port from the kernel (bind port 0) or a range of its own.
+suite's files are in its own `oc_test_mkdtemp` directory, and a suite that
+listens takes its port from the kernel — it binds port 0 and reads the port
+back (`getsockname`; for the in-process daemon, `oc_netloop_run_ex` on port 0
+and the port its `oc_netloop_view` reports), or, where the listener is not its
+own to bind, takes one from `oc_test_free_port` and retries on `EADDRINUSE` —
+never a number derived
+from a process id or a fixed range, which another suite, another run or
+`bench_loop` can be holding.
 
 Password hashing in the tests is at test strength: every test writer is given
 2 MiB of Argon2id memory (`oc_dbwriter_set_pw_mem`), including the check an
@@ -541,7 +644,12 @@ image with podman twice over (`.github/workflows/release-candidate.yml`):
   `<prefix>/db/`, and nothing outside it; after it is stopped, a box given the
   same files on an empty volume restores before the daemon starts and presents the first box's certificate — the identity in the
   database (ARCH-66b) came back with it; and a box given the files with a wrong secret exits
-  non-zero at the restore without creating a database.
+  non-zero at the restore without creating a database. What the boot did is
+  read from `entrypoint.sh`'s stable tokens, one per line
+  (`entrypoint: replica=on`, `restore=empty`, `restore=ok`, `restore=failed`,
+  with exit status 3 for the last), never from its sentences; the outcomes are
+  checked as well — replica files in the bucket, `cert.pem` byte-identical, no
+  database after the refused boot.
 
 What it cannot show: the arm64 image is build-only, and Tigris itself is not
 reached (the S3 backend's Tigris round-trip is ARCH-70's). The daemon's own

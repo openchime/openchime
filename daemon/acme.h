@@ -17,6 +17,14 @@
 
 #include "tls.h"
 
+/* Why an issuance failed, as a kind a caller or a test can branch on; the
+ * words for a person are in `err`. */
+typedef enum {
+    OC_ACME_FAIL_NONE = 0,
+    OC_ACME_FAIL_VALIDATION,         /* the CA tried a name's challenge and it was not valid */
+    OC_ACME_FAIL_OTHER               /* anything else: the directory, the account, the order, ... */
+} oc_acme_fail;
+
 typedef struct {
     const char    *directory;        /* the CA's directory URL */
     const char    *names;            /* the DNS names, comma-separated */
@@ -33,6 +41,7 @@ typedef struct {
      * or NULL: the CA links the two, and may favour a replacement it asked for. */
     const char    *replaces;
     const int     *stop;             /* nonzero: give up at the next poll (shutdown) */
+    oc_acme_fail  *fail;             /* if not NULL: set to why oc_acme_issue failed, or NONE */
 } oc_acme_opts;
 
 /* A certificate, as issued: the chain and its key in PEM, and its validity. */

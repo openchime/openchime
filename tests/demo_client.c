@@ -19,6 +19,7 @@
 #include "protocol.h"
 #include "framebuf.h"
 #include "tls.h"
+#include "check.h"        /* oc_test_deadline, oc_test_pause: waits on the monotonic clock */
 #include "testsignin.h"   /* the sign-in page: how a person, and so this client, signs in */
 
 #include <arpa/inet.h>
@@ -47,12 +48,13 @@ static int dial(const char *host, int port) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) return -1;
-    for (int i = 0; i < 100; i++) {
+    /* Until the daemon listens, or five seconds on the monotonic clock. */
+    uint64_t end = oc_test_deadline(5000);
+    do {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) return fd;
-        close(fd);
-        usleep(50000);
-    }
+        if (fd >= 0 && connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) return fd;
+        if (fd >= 0) close(fd);
+    } while (oc_test_pause(end));
     return -1;
 }
 

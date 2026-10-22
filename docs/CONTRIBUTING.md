@@ -133,8 +133,8 @@ machines at once:
   translation unit with the release's clang under `-Werror`
   (`check-release-cc`); runs the suites that start no threads
   (`make test-ci PART=plain`, which runs the source checks first:
-  `scripts/check/opcodes.sh`, `refs.sh`, `make_targets.sh`, `config.sh` and
-  `release_lint.sh`).
+  `scripts/check/opcodes.sh`, `refs.sh`, `make_targets.sh`, `config.sh`,
+  `release_lint.sh` and `tests_lint.sh`).
 - **`thread-sanitizer`** — the suites that start threads, under
   ThreadSanitizer (`make test-ci PART=threads`); their only run in CI.
 - **`windows`** — cross-compiles the Windows TUI + GUI with the pinned

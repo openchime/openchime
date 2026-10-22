@@ -100,7 +100,7 @@ PS
   local wps; wps="$(wslpath -w "$ps" 2>/dev/null || printf '%s' "$ps")"
   local out; out="$(powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$wps" \
       -Get "$url" -Post "$base/signin" -Origin "$origin" -Body "$body" 2>&1 | tr -d '\r' || true)"
-  grep -q 'You are signed in' <<<"$out" || { echo "play_browser: the page did not sign $user in: $(grep -o 'class="msg"[^<]*' <<<"$out" | head -1)" >&2; return 1; }
+  grep -qF 'data-oc-result="signed-in"' <<<"$out" || { echo "play_browser: the page did not sign $user in: $(grep -o 'class="msg"[^<]*' <<<"$out" | head -1)" >&2; return 1; }
   return 0
 }
 

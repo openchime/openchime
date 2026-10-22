@@ -8,9 +8,12 @@
 # number in a comment rots silently the moment the issue does); and the
 # Makefile's typed targets are the ones its header names; the configuration
 # registry is the one source of every OPENCHIME_* name, CONFIG.md's reference
-# and the packaged environment file (config.sh); and nothing that ships is a
-# box in development mode (release_lint.sh).
-SOURCE_CHECKS := scripts/check/opcodes.sh shared/protocol.h && scripts/check/refs.sh && scripts/check/make_targets.sh && scripts/check/config.sh && scripts/check/release_lint.sh
+# and the packaged environment file (config.sh, which asks the daemon, so
+# `test` builds it first); nothing that ships is a box in development mode
+# (release_lint.sh); and the tests wait on outcomes, compare markers rather
+# than a person's words, share no paths, and the workflows pipe nothing into
+# grep -q under pipefail (tests_lint.sh, docs/TESTING.md "Brittle tests").
+SOURCE_CHECKS := scripts/check/opcodes.sh shared/protocol.h && scripts/check/refs.sh && scripts/check/make_targets.sh && scripts/check/config.sh && scripts/check/release_lint.sh && scripts/check/tests_lint.sh
 
 # Unit + in-process integration tests, one binary (docs/TESTING.md §2). Built
 # -O0 -g; a non-zero exit fails the build and CI. The suites run side by side,
@@ -27,7 +30,7 @@ TEST_ALL_SRC := $(sort $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_S
 TEST_DEPS := $(TEST_ALL_SRC) $(VOICE_HDRS) $(CALL_HDRS) $(HDRS) $(MEDIA_HDRS) \
              $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/app/theme.h) \
              $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP)
-test: $(TEST_BIN)
+test: $(TEST_BIN) $(BIN)
 	@$(SOURCE_CHECKS)
 	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" ./$(TEST_BIN)
 $(TEST_BIN): $(TEST_DEPS) | build
@@ -57,7 +60,7 @@ ci-only:
 	@if [ -z "$$CI" ]; then echo "make test-ci runs in CI only; locally, run make test"; exit 1; fi
 test-ci: ci-only
 	@$(MAKE) --no-print-directory $(if $(filter plain,$(PART)),test-ci-plain,$(if $(filter threads,$(PART)),test-ci-threads,test-ci-plain test-ci-threads))
-test-ci-plain: ci-only $(TEST_BIN)
+test-ci-plain: ci-only $(TEST_BIN) $(BIN)
 	@$(SOURCE_CHECKS)
 	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" OC_TEST_EXCEPT="$(TSAN_SUITES)" ./$(TEST_BIN)
 test-ci-threads: ci-only $(TSAN_BIN)

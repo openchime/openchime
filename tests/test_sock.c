@@ -12,12 +12,7 @@
 #include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/time.h>
-
-static long ms_since(const struct timeval *t0) {
-    struct timeval t; gettimeofday(&t, NULL);
-    return (t.tv_sec - t0->tv_sec) * 1000 + (t.tv_usec - t0->tv_usec) / 1000;
-}
+#include <unistd.h>
 
 /* A listener on `family`'s loopback; its port in *port. -1 if the family has none. */
 static int loopback_listener(int family, int backlog, int *port) {
@@ -59,15 +54,18 @@ static void test_bound(void) {
         if (oc_poll(s, 1, 200) == 0) pending = 1;      /* not answered: the queue is full */
     }
     if (!pending) {
-        printf("  (this kernel answered every SYN: the bound is not observable here)\n");
+        SKIP("this kernel answered every SYN: the connect bound is not observable here");
     } else {
-        struct timeval t0; gettimeofday(&t0, NULL);
+        uint64_t t0 = oc_test_mono_ms();
         int fd = oc_connect_any("127.0.0.1", port, 300);
-        long took = ms_since(&t0);
+        uint64_t took = oc_test_mono_ms() - t0;
         if (fd >= 0) close(fd);
         CHECK(fd < 0);
-        if (took >= 1500) printf("  connect to a full queue took %ld ms\n", took);
-        CHECK(took < 1500);                            /* one address, a 300 ms bound */
+        printf("  connect to a full queue took %llu ms (bound 300)\n", (unsigned long long)took);
+        /* The mechanism: the bound ended it, not the kernel, whose own retries
+         * of a dropped SYN run to minutes. How close to the bound is speed. */
+        CHECK(took < 30000);
+        CHECK_SPEED(took < 1500);                      /* one address, a 300 ms bound */
     }
     for (int i = 0; i < nfill; i++) close(fill[i]);
     close(lfd);
@@ -91,6 +89,8 @@ static void test_moves_on(void) {
         CHECK(fd >= 0);
         if (fd >= 0) close(fd);
         close(lfd);
+    } else {
+        SKIP("no IPv6 loopback here: the IPv6-only connect is not checked");
     }
     /* Nothing listening anywhere: -1, promptly. */
     CHECK(oc_connect_any("127.0.0.1", 1, 1000) < 0);

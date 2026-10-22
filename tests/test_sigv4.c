@@ -30,6 +30,7 @@ static void test_authorization(void) {
         "PUT", "/openchime-dev/00000000000000ab", "minio:9000",
         "UNSIGNED-PAYLOAD", "20250101T000000Z", "20250101",
         "us-east-1", "s3", "minioadmin", "minioadmin", out, sizeof out) == 0);
+    /* contract: AWS Signature Version 4's Authorization header, byte for byte */
     CHECK(strcmp(out,
         "AWS4-HMAC-SHA256 Credential=minioadmin/20250101/us-east-1/s3/aws4_request, "
         "SignedHeaders=host;x-amz-content-sha256;x-amz-date, "

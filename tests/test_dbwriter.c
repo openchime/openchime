@@ -13,6 +13,7 @@
 #include "issuer.h"
 #include "jwt.h"
 #include "check.h"
+#include "testenv.h"
 #include <time.h>
 #include "mention.h"
 
@@ -47,7 +48,21 @@ static oc_dbres *wait_result(oc_dbwriter *w) {
  * work done, which the writer still does as it would on a new file. Only a
  * path with no database yet is filled: a test that restarts the writer on its
  * own database keeps what it wrote. */
-static const char *TEMPLATE_DB = "build/test_dbwriter_template.db";
+/* Every database is in the suite's own directory (tests/testenv.h), so nothing
+ * another suite, run or checkout does can meet it. `tdb` names one there; the
+ * names live as long as the suite. */
+static char g_dir[256];
+static char *g_names[256];
+static int g_n_names;
+static const char *tdb(const char *name) {
+    for (int i = 0; i < g_n_names; i++)
+        if (!strcmp(strrchr(g_names[i], '/') + 1, name)) return g_names[i];
+    char p[512];
+    oc_test_path(p, sizeof p, g_dir, name);
+    if (g_n_names == (int)(sizeof g_names / sizeof *g_names)) return "";
+    return g_names[g_n_names++] = strdup(p);
+}
+#define TEMPLATE_DB tdb("template.db")
 
 /* Little Argon2id memory keeps the tests fast; production uses 19 MiB. */
 #define TEST_PW_MEM 2048
@@ -83,7 +98,7 @@ static int stored_member(const char *path, uint64_t ch, uint64_t uid);
 static void cleanup_db(const char *path) {
     stored_member(NULL, 0, 0);   /* its kept connection is to a file about to go */
     unlink(path);
-    char wal[256], shm[256];
+    char wal[600], shm[600];
     snprintf(wal, sizeof wal, "%s-wal", path);
     snprintf(shm, sizeof shm, "%s-shm", path);
     unlink(wal); unlink(shm);
@@ -208,7 +223,7 @@ static uint64_t auth_session(oc_dbwriter *w, uint64_t conn_id, const uint8_t tok
 }
 
 static void test_auth_and_send(void) {
-    const char *path = "build/test_dbwriter2.db";
+    const char *path = tdb("2.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -248,6 +263,7 @@ static void test_auth_and_send(void) {
     CHECK(r && r->type == OC_RES_SEND_OK);
     CHECK(r->message_id > 0);
     CHECK(r->duplicate == 0);
+    /* contract: data in, data out -- stored as given */
     CHECK(r->body_len == 9 && memcmp(r->body, "hello all", 9) == 0);
     int saw_a = 0, saw_b = 0;
     for (size_t i = 0; i < r->n_members; i++) {
@@ -321,7 +337,7 @@ static oc_dbres *backfill(oc_dbwriter *w, uint64_t uid, uint64_t channel, uint64
 static void client_ack(oc_dbwriter *w, uint64_t uid, uint64_t channel, uint64_t mid, int advances);
 
 static void test_backfill(void) {
-    const char *path = "build/test_dbwriter3.db";
+    const char *path = tdb("3.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -418,7 +434,7 @@ static oc_dbres *history(oc_dbwriter *w, uint64_t uid, uint64_t ch,
 }
 
 static void test_history_paging(void) {
-    const char *path = "build/test_dbwriter_history.db";
+    const char *path = tdb("history.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -563,7 +579,7 @@ static oc_dbres *list_pins(oc_dbwriter *w, uint64_t uid, uint64_t ch) {
 }
 
 static void test_pins(void) {
-    const char *path = "build/test_dbwriter_pins.db";
+    const char *path = tdb("pins.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -599,6 +615,7 @@ static void test_pins(void) {
     CHECK(r->plist[0].message_id == m1 && r->plist[0].pinned_by == alice);
     /* The body travels with the pin, so opening the list is one round trip
      * even when the message is far out of the loaded history. */
+    /* contract: data in, data out -- stored as given */
     CHECK(r->plist[0].body && strcmp(r->plist[0].body, "the deploy runbook") == 0);
     oc_dbres_free(r);
 
@@ -714,7 +731,7 @@ static oc_dbres *create_channel(oc_dbwriter *w, uint64_t uid, const char *name,
                                 uint8_t is_public);   /* fwd */
 
 static void test_mentions_stored(void) {
-    const char *path = "build/test_dbwriter_mentions.db";
+    const char *path = tdb("mentions.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -768,6 +785,7 @@ static void test_mentions_stored(void) {
         const void *b = sqlite3_column_blob(st, 0);
         int bl = sqlite3_column_bytes(st, 0);
         CHECK(bl == (int)strlen("hey @bob can you look"));
+        /* contract: data in, data out -- stored as given */
         CHECK(b && memcmp(b, "hey @bob can you look", (size_t)bl) == 0);
         sqlite3_finalize(st);
         sqlite3_close(raw);
@@ -828,7 +846,7 @@ static void test_mentions_stored(void) {
  * §3.6). Proves the wiring — configure -> JWT verify -> JIT-provision -> session
  * -> reconnect — on top of the crypto that test_jwt covers in isolation. */
 static void test_oidc_auth(void) {
-    const char *path = "build/test_dbwriter_oidc.db";
+    const char *path = tdb("oidc.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -980,7 +998,7 @@ static uint64_t oidc_signin(oc_dbwriter *w, oc_issuer *is, uint64_t conn, const 
  * proves only the mailbox, so it does not sign into someone who signs in here
  * with a provider, unless the workspace allows it. The other way links. */
 static void test_oidc_no_downgrade(void) {
-    const char *path = "build/test_dbwriter_downgrade.db";
+    const char *path = tdb("downgrade.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -1032,7 +1050,7 @@ static oc_dbres *set_email(oc_dbwriter *w, uint64_t uid, const char *e) {
  * verified one, so a provider's sign-in with the same address is somebody else.
  * A provider's account keeps its provider's address. */
 static void test_set_email(void) {
-    const char *path = "build/test_dbwriter_email.db";
+    const char *path = tdb("email.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -1070,7 +1088,7 @@ static void test_set_email(void) {
  * trusted beside the pinned ones, each fetch replaces the last, and no fetch
  * removes a pinned key. */
 static void test_relay_published_keys(void) {
-    const char *path = "build/test_dbwriter_relaykeys.db";
+    const char *path = tdb("relaykeys.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -1135,7 +1153,7 @@ static uint64_t direct_signin(oc_dbwriter *w, uint64_t conn, const char *iss, co
  * issuer is not delivered by the relay; a direct sign-in links nobody by
  * address, and a relay sign-in links nobody a direct connection knows. */
 static void test_direct_identities(void) {
-    const char *path = "build/test_dbwriter_direct.db";
+    const char *path = tdb("direct.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -1183,7 +1201,7 @@ static void test_direct_identities(void) {
 /* Who may join by OIDC (AUTH.md §8.4): default deny, the rules speak only to a
  * new identity, the owner rule creates an owner and restores one. */
 static void test_oidc_join_rules(void) {
-    const char *path = "build/test_dbwriter_join.db";
+    const char *path = tdb("join.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -1361,7 +1379,7 @@ static void test_oidc_join_rules(void) {
  * code onto a provider (test_oidc_no_downgrade); a link is audited and costs no
  * seat. */
 static void test_oidc_link(void) {
-    const char *path = "build/test_dbwriter_link.db";
+    const char *path = tdb("link.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -1471,7 +1489,7 @@ static uint16_t auth_token_from(oc_dbwriter *w, uint64_t conn, uint8_t method,
 /* Every source answers to the per-source limiter, and a refused OIDC sign-in is
  * written down as a wrong password is (REQ-191, REQ-251). */
 static void test_oidc_limits_and_audit(void) {
-    const char *path = "build/test_dbwriter_oidc_rl.db";
+    const char *path = tdb("oidc_rl.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -1525,7 +1543,7 @@ static void test_oidc_limits_and_audit(void) {
  * configured number of failures the account is AUTH_RATE_LIMITED — even with
  * the correct password — while other accounts stay unaffected. */
 static void test_auth_rate_limit(void) {
-    const char *path = "build/test_dbwriter_rl.db";
+    const char *path = tdb("rl.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -1550,7 +1568,7 @@ static void test_auth_rate_limit(void) {
 /* Per-source throttling: an account-spray from one IP is stopped even though no
  * single account trips the per-account limit (REQ-191). */
 static void test_source_rate_limit(void) {
-    const char *path = "build/test_dbwriter_srcrl.db";
+    const char *path = tdb("srcrl.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -1616,7 +1634,7 @@ static uint16_t do_logout(oc_dbwriter *w, uint64_t uid, uint8_t scope, const uin
 /* Session revocation (REQ-182): LOGOUT scope THIS drops one session, scope ALL
  * drops them all, and a user cannot revoke another user's session. */
 static void test_logout(void) {
-    const char *path = "build/test_dbwriter_logout.db";
+    const char *path = tdb("logout.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -1652,7 +1670,7 @@ static void test_logout(void) {
 
 /* Role enforcement (ARCH-60): the policy matrix and the ≥1-owner invariant. */
 static void test_role_enforcement(void) {
-    const char *path = "build/test_dbwriter_roles.db";
+    const char *path = tdb("roles.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -1710,7 +1728,7 @@ static oc_dbres *do_delete(oc_dbwriter *w, uint64_t uid, uint64_t channel, uint6
 /* Message management (REQ-032/051/052): author-only edit, self- and
  * moderator-delete tombstones, and the not-found / forbidden gates. */
 static void test_edit_delete(void) {
-    const char *path = "build/test_dbwriter_msgmgmt.db";
+    const char *path = tdb("msgmgmt.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -1740,6 +1758,7 @@ static void test_edit_delete(void) {
     CHECK(r && r->type == OC_RES_EDIT_OK);
     CHECK(r->message_id == mid && r->author_id == author);
     CHECK(r->server_time != 0);   /* edited_at_ms stamped */
+    /* contract: data in, data out -- stored as given */
     CHECK(r->body_len == 11 && memcmp(r->body, "edited body", 11) == 0);
     CHECK(r->n_members == 3);
     oc_dbres_free(r);
@@ -1748,6 +1767,7 @@ static void test_edit_delete(void) {
     r = backfill(w, author, OC_DEFAULT_CHANNEL, mid - 1);
     CHECK(r && r->n_replay >= 1);
     CHECK(r->replay[0].message_id == mid);
+    /* contract: data in, data out -- stored as given */
     CHECK(r->replay[0].body_len == 11 && memcmp(r->replay[0].body, "edited body", 11) == 0);
     oc_dbres_free(r);
 
@@ -1872,7 +1892,7 @@ static oc_dbres *list_files_before(oc_dbwriter *w, uint64_t uid, uint64_t ch,
 }
 
 static void test_channel_details(void) {
-    const char *path = "build/test_dbwriter_details.db";
+    const char *path = tdb("details.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -2028,7 +2048,7 @@ static oc_dbres *chan_update(oc_dbwriter *w, uint64_t uid, uint64_t ch, uint8_t 
  * per deleted message and left clients rendering a file the message no longer
  * had. */
 static void test_delete_clears_message_extras(void) {
-    const char *path = "build/test_dbwriter_tomb.db";
+    const char *path = tdb("tomb.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -2151,7 +2171,7 @@ static oc_dbres *history_around(oc_dbwriter *w, uint64_t uid, uint64_t ch,
 }
 
 static void test_history_around(void) {
-    const char *path = "build/test_dbwriter_around.db";
+    const char *path = tdb("around.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -2207,7 +2227,7 @@ static void test_history_around(void) {
 }
 
 static void test_saved_and_activity(void) {
-    const char *path = "build/test_dbwriter_saved.db";
+    const char *path = tdb("saved.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -2238,6 +2258,7 @@ static void test_saved_and_activity(void) {
     r = list_saved(w, alice);
     CHECK(r && r->type == OC_RES_SAVED_LIST && r->n_slist == 1);
     CHECK(r->slist[0].message_id == bm);
+    /* contract: data in, data out -- stored as given */
     CHECK(r->slist[0].body && strcmp(r->slist[0].body, "hey @alice look at this") == 0);
     oc_dbres_free(r);
 
@@ -2341,7 +2362,7 @@ static oc_dbres *list_drafts(oc_dbwriter *w, uint64_t uid) {
  * scanner a send uses. Made here by sending, wiping the rows and the step, and
  * starting again. */
 static void test_index_mentions(void) {
-    const char *path = "build/test_dbwriter_index_mentions.db";
+    const char *path = tdb("index_mentions.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -2401,7 +2422,7 @@ static void test_index_mentions(void) {
 }
 
 static void test_drafts(void) {
-    const char *path = "build/test_dbwriter_drafts.db";
+    const char *path = tdb("drafts.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -2412,6 +2433,7 @@ static void test_drafts(void) {
 
     oc_dbres *r = set_draft(w, alice, OC_DEFAULT_CHANNEL, 0, "half a thought");
     CHECK(r && r->type == OC_RES_DRAFT);
+    /* contract: data in, data out -- stored as given */
     CHECK(r->draft.body && strcmp(r->draft.body, "half a thought") == 0);
     CHECK(r->draft.updated_ms != 0);
     oc_dbres_free(r);
@@ -2419,6 +2441,7 @@ static void test_drafts(void) {
     r = list_drafts(w, alice);
     CHECK(r && r->type == OC_RES_DRAFTS && r->n_drafts == 1);
     CHECK(r->drafts[0].channel_id == OC_DEFAULT_CHANNEL && r->drafts[0].thread_root == 0);
+    /* contract: data in, data out -- stored as given */
     CHECK(r->drafts[0].body && strcmp(r->drafts[0].body, "half a thought") == 0);
     oc_dbres_free(r);
 
@@ -2427,6 +2450,7 @@ static void test_drafts(void) {
     r = set_draft(w, alice, OC_DEFAULT_CHANNEL, 0, "a whole one"); oc_dbres_free(r);
     r = list_drafts(w, alice);
     CHECK(r && r->n_drafts == 1);
+    /* contract: data in, data out -- stored as given */
     CHECK(r->drafts[0].body && strcmp(r->drafts[0].body, "a whole one") == 0);
     oc_dbres_free(r);
 
@@ -2546,7 +2570,7 @@ static oc_dbres *sched_fire(oc_dbwriter *w) {
 }
 
 static void test_scheduled(void) {
-    const char *path = "build/test_dbwriter_sched.db";
+    const char *path = tdb("sched.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -2565,6 +2589,7 @@ static void test_scheduled(void) {
     r = sched_list(w, alice);
     CHECK(r && r->type == OC_RES_SCHEDULED_LIST && r->n_scheds == 1);
     CHECK(r->scheds[0].id == sid);
+    /* contract: data in, data out -- stored as given */
     CHECK(r->scheds[0].body && strcmp(r->scheds[0].body, "later today") == 0);
     oc_dbres_free(r);
     r = sched_list(w, bob); CHECK(r && r->n_scheds == 0); oc_dbres_free(r);   /* private */
@@ -2604,6 +2629,7 @@ static void test_scheduled(void) {
     oc_dbres_free(r);
     r = sched_fire(w);
     CHECK(r && r->type == OC_RES_SEND_OK && r->message_id != 0);
+    /* contract: data in, data out -- stored as given */
     CHECK(r->body_len == 17 && memcmp(r->body, "sent by the clock", 17) == 0);
     uint64_t root_msg = r ? r->message_id : 0;
     CHECK(r && r->parent_id == 0);                 /* a channel message, not a reply */
@@ -2620,6 +2646,7 @@ static void test_scheduled(void) {
     r = sched_fire(w);
     CHECK(r && r->type == OC_RES_REPLY_OK && r->message_id != 0);   /* fanned into the thread */
     CHECK(r && r->parent_id == root_msg);
+    /* contract: data in, data out -- stored as given */
     CHECK(r && r->body_len == 18 && memcmp(r->body, "reply by the clock", 18) == 0);
     oc_dbres_free(r);
     r = sched_list(w, alice); CHECK(r && r->n_scheds == 0); oc_dbres_free(r);
@@ -2687,7 +2714,7 @@ static oc_dbres *activity(oc_dbwriter *w, uint64_t uid, uint8_t filter) {
  * makes it notify, appear in the activity feed and highlight without any of the
  * three learning about keywords at all. */
 static void test_keyword_alerts(void) {
-    const char *path = "build/test_dbwriter_keywords.db";
+    const char *path = tdb("keywords.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -2794,7 +2821,7 @@ static void test_keyword_alerts(void) {
 }
 
 static void test_activity_unreads(void) {
-    const char *path = "build/test_dbwriter_unread.db";
+    const char *path = tdb("unread.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -2919,7 +2946,7 @@ static int desc_is(const oc_dbres *r, const char *want) {
 }
 
 static void test_channel_description(void) {
-    const char *path = "build/test_dbwriter_chandesc.db";
+    const char *path = tdb("chandesc.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -2950,6 +2977,7 @@ static void test_channel_description(void) {
 
     /* It is its own column: the topic is untouched by it. */
     r = chan_update(w, bob, pub, OC_CHUP_TOPIC, "one line");
+    /* contract: data in, data out -- stored as given */
     CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_topic && strcmp(r->ch_topic, "one line") == 0);
     oc_dbres_free(r);
     r = get_desc(w, bob, pub);
@@ -3026,7 +3054,7 @@ static void test_channel_description(void) {
 }
 
 static void test_channel_mutability(void) {
-    const char *path = "build/test_dbwriter_chanmut.db";
+    const char *path = tdb("chanmut.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -3045,6 +3073,7 @@ static void test_channel_mutability(void) {
      * wrong one is corrected in seconds. */
     r = chan_update(w, bob, ch, OC_CHUP_TOPIC, "ship on friday");
     CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    /* contract: data in, data out -- stored as given */
     CHECK(r->ch_topic && strcmp(r->ch_topic, "ship on friday") == 0);
     /* The change fans out to everyone, not just the actor. */
     CHECK(r->ch_fanout == 1 && r->n_members >= 2);
@@ -3281,7 +3310,7 @@ static int list_has(oc_dbres *r, uint64_t cid, int *joined_out) {
 }
 
 static void test_channels(void) {
-    const char *path = "build/test_dbwriter_channels.db";
+    const char *path = tdb("channels.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -3467,7 +3496,7 @@ static uint16_t remove_user(oc_dbwriter *w, uint64_t actor, uint64_t target) {
 }
 
 static void test_admin_ops(void) {
-    const char *path = "build/test_dbwriter_admin.db";
+    const char *path = tdb("admin.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -3625,7 +3654,7 @@ static uint64_t send_id(oc_dbwriter *w, uint64_t uid, uint64_t ch, const char *b
 }
 
 static void test_reactions(void) {
-    const char *path = "build/test_dbwriter_react.db";
+    const char *path = tdb("react.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -3805,7 +3834,7 @@ static const oc_thread_row *row_for(const oc_dbres *r, uint64_t root) {
  * callers ask, so a test here defends the push audience and THREAD_REPLY's
  * per-recipient byte as well as this view. */
 static void test_thread_list(void) {
-    const char *path = "build/test_dbwriter_threadlist.db";
+    const char *path = tdb("threadlist.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -3844,6 +3873,7 @@ static void test_thread_list(void) {
         CHECK(row->reply_count == 1);
         CHECK(row->unread == 1);            /* bob's reply, and she has read none */
         CHECK(row->following == 1);
+        /* contract: data in, data out -- stored as given */
         CHECK(row->preview && strstr(row->preview, "alice's root") != NULL);
     }
     oc_dbres_free(r);
@@ -4001,7 +4031,7 @@ static void test_thread_list(void) {
  * so the evaluator is asked with both false and a quiet-hours arrival still
  * counts. */
 static void test_badge_matches_evaluator(void) {
-    const char *path = "build/test_dbwriter_badge.db";
+    const char *path = tdb("badge.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -4081,7 +4111,7 @@ static void test_badge_matches_evaluator(void) {
 }
 
 static void test_threads(void) {
-    const char *path = "build/test_dbwriter_threads.db";
+    const char *path = tdb("threads.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -4116,6 +4146,7 @@ static void test_threads(void) {
     r = list_thread_r(w, alice, OC_DEFAULT_CHANNEL, mid);
     CHECK(r && r->type == OC_RES_THREAD && r->err_code == 0 && r->n_thread == 3);
     CHECK(r->thread[0].message_id == reply1);
+    /* contract: data in, data out -- stored as given */
     CHECK(r->thread[0].body_len == 9 && memcmp(r->thread[0].body, "reply one", 9) == 0);
     oc_dbres_free(r);
 
@@ -4192,7 +4223,7 @@ static oc_dbres *search_f(oc_dbwriter *w, uint64_t uid, const char *text,
 }
 
 static void test_search_filters_and_paging(void) {
-    const char *path = "build/test_dbwriter_searchf.db";
+    const char *path = tdb("searchf.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -4318,7 +4349,7 @@ static void test_search_filters_and_paging(void) {
 }
 
 static void test_search(void) {
-    const char *path = "build/test_dbwriter_search.db";
+    const char *path = tdb("search.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -4399,7 +4430,7 @@ static void test_search(void) {
 /* Persisted TLS identity (ARCH-66b): store + load round-trips through the DB so
  * a database restored onto a new box keeps the same trusted certificate. */
 static void test_tls_identity(void) {
-    const char *path = "build/test_dbwriter_identity.db";
+    const char *path = tdb("identity.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -4412,6 +4443,7 @@ static void test_tls_identity(void) {
     /* Store, then load returns the same PEMs. */
     CHECK(oc_dbwriter_store_identity(w, "CERT-PEM-DATA", "KEY-PEM-DATA") == 1);
     CHECK(oc_dbwriter_load_identity(w, &c, &k) == 1);
+    /* contract: data in, data out -- stored as given */
     CHECK(c && k && strcmp(c, "CERT-PEM-DATA") == 0 && strcmp(k, "KEY-PEM-DATA") == 0);
     free(c); free(k);
 
@@ -4428,7 +4460,7 @@ static void test_tls_identity(void) {
  * invite; redeeming it creates the owner; afterward none is minted, and none
  * minted before works. Only owners who can sign in count. */
 static void test_setup_invite(void) {
-    const char *path = "build/test_dbwriter_setup.db";
+    const char *path = tdb("setup.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -4501,7 +4533,7 @@ static void test_setup_invite(void) {
  * retention window is dropped, so a much-later retry of the same token is no
  * longer deduplicated, while a recent token still is. */
 static void test_idem_pruning(void) {
-    const char *path = "build/test_dbwriter_prune.db";
+    const char *path = tdb("prune.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -4523,7 +4555,7 @@ static void test_idem_pruning(void) {
     /* Fresh token is still deduplicated. */
     CHECK(send_msg(w, uid, tokA, "first-again") == m1);
 
-    usleep(50000);    /* tokA is now at least 50 ms old */
+    oc_test_let_time_pass(50);    /* tokA is now at least 50 ms old */
 
     /* A write under a 20 ms window prunes tokA's aged mapping. */
     oc_dbwriter_set_idem_retention(w, 20, 0);
@@ -4578,7 +4610,7 @@ static oc_dbres *backfill0(oc_dbwriter *w, uint64_t uid) {
 }
 
 static void test_delivery_cursor(void) {
-    const char *path = "build/test_dbwriter_delivery.db";
+    const char *path = tdb("delivery.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -4651,7 +4683,7 @@ static void test_delivery_cursor(void) {
  * The barrier sends into a channel bob is NOT in, so it cannot disturb the
  * cursors under test. */
 static void test_mark_all_read(void) {
-    const char *path = "build/test_dbwriter_markall.db";
+    const char *path = tdb("markall.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -4774,7 +4806,7 @@ static oc_dbres *open_dm(oc_dbwriter *w, uint64_t actor, uint64_t target) {
  * the dbwriter — these jobs mint/finalize the pointer row and authorize a
  * download by the ordinary channel-read gate. */
 static void test_attachments(void) {
-    const char *path = "build/test_dbwriter_attach.db";
+    const char *path = tdb("attach.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -5058,7 +5090,7 @@ static void test_attachments(void) {
  * uses taken, the third refused; no limit; a shared one is member-role only;
  * the list says how many have used it and how many may. */
 static void test_shared_invite(void) {
-    const char *path = "build/test_dbwriter_shared_invite.db";
+    const char *path = tdb("shared_invite.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -5144,7 +5176,7 @@ static void test_shared_invite(void) {
 }
 
 static void test_invites_and_webhook_lifecycle(void) {
-    const char *path = "build/test_dbwriter_invites.db";
+    const char *path = tdb("invites.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -5363,7 +5395,7 @@ static void test_invites_and_webhook_lifecycle(void) {
  * The interesting rule is EXPIRY: the daemon must stop reporting a status once it
  * lapses, whether or not the client that set it is still running. */
 static void test_status_and_profile(void) {
-    const char *path = "build/test_dbwriter_status.db";
+    const char *path = tdb("status.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -5389,6 +5421,7 @@ static void test_status_and_profile(void) {
     oc_dbwriter_submit(w, j);
     r = wait_result(w);
     CHECK(r && r->type == OC_RES_PROFILE_INFO);
+    /* contract: data in, data out -- stored as given */
     CHECK(r->st_text && strcmp(r->st_text, "out for lunch") == 0);
     CHECK(r->st_expires != 0);
     oc_dbres_free(r);
@@ -5428,8 +5461,10 @@ static void test_status_and_profile(void) {
     j->pf_timezone  = strdup("America/New_York");
     oc_dbwriter_submit(w, j);
     r = wait_result(w);
+    /* contract: data in, data out -- stored as given */
     CHECK(r && r->pf_title && strcmp(r->pf_title, "Principal Engineer") == 0);
     CHECK(r->pf_tz && strcmp(r->pf_tz, "America/New_York") == 0);
+    /* contract: data in, data out -- stored as given */
     CHECK(r->pf_full_name && strcmp(r->pf_full_name, "Alice Liddell") == 0);
     CHECK(r->pf_pronouns && strcmp(r->pf_pronouns, "she/her") == 0);
     CHECK(r->pf_phone && strcmp(r->pf_phone, "+1 555 0100") == 0);
@@ -5489,7 +5524,7 @@ static oc_dbres *reset_redeem(oc_dbwriter *w, const char *token, const char *pw)
  * is who may remove whom; the link sets a new password once, within its day,
  * signs the account out everywhere and, if asked, clears its second step. */
 static void test_reset_credential(void) {
-    const char *path = "build/test_dbwriter_reset.db";
+    const char *path = tdb("reset.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -5563,7 +5598,7 @@ static void test_reset_credential(void) {
  * removed, taking a seat; with a reset link for the password removal took, on
  * which they sign in again. */
 static void test_enable_user(void) {
-    const char *path = "build/test_dbwriter_enable.db";
+    const char *path = tdb("enable.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -5615,7 +5650,7 @@ static void test_enable_user(void) {
  * and one unused past the idle limit is refused -- and gone -- at its next use,
  * while one marked in use goes on. */
 static void test_session_policy(void) {
-    const char *path = "build/test_dbwriter_sessions.db";
+    const char *path = tdb("sessions.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -5673,7 +5708,7 @@ static int64_t rm_count(const char *path, const char *sql, uint64_t a) {
 }
 
 static void test_remove_keeps_history(void) {
-    const char *path = "build/test_dbwriter_rm_history.db";
+    const char *path = tdb("rm_history.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -5744,7 +5779,7 @@ static void test_remove_keeps_history(void) {
 }
 
 static void test_remove_user_integrations(void) {
-    const char *path = "build/test_dbwriter_rm_integrations.db";
+    const char *path = tdb("rm_integrations.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -5802,7 +5837,7 @@ static void test_remove_user_integrations(void) {
 }
 
 static void test_webhooks(void) {
-    const char *path = "build/test_dbwriter_webhook.db";
+    const char *path = tdb("webhook.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -5830,6 +5865,7 @@ static void test_webhooks(void) {
     r = wait_result(w);
     CHECK(r && r->type == OC_RES_WEBHOOK_POSTED);
     CHECK(r->channel_id == OC_DEFAULT_CHANNEL && r->author_id == alice && r->message_id > 0);
+    /* contract: data in, data out -- stored as given */
     CHECK(r->body_len == 7 && memcmp(r->body, "from ci", 7) == 0);
     CHECK(r->author_name && strcmp(r->author_name, "ci") == 0);   /* display-name override */
     int saw_alice = 0;
@@ -5912,7 +5948,7 @@ static void test_webhooks(void) {
  * duplicate is refused rather than silently replacing what every existing message
  * containing that shortcode means, and only the creator or an admin can delete one. */
 static void test_custom_emoji(void) {
-    const char *path = "build/test_dbwriter_emoji.db";
+    const char *path = tdb("emoji.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -6037,7 +6073,7 @@ static void test_custom_emoji(void) {
  * refused (that is a 1:1 and must reuse OPEN_DM or the pair ends up with two
  * conversations), and everyone in it is a member. */
 static void test_group_dm(void) {
-    const char *path = "build/test_dbwriter_groupdm.db";
+    const char *path = tdb("groupdm.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -6169,7 +6205,7 @@ static void test_group_dm(void) {
  * security: an avatar is readable WORKSPACE-WIDE, so the id has to be one the setter
  * was entitled to in the first place. */
 static void test_avatar(void) {
-    const char *path = "build/test_dbwriter_avatar.db";
+    const char *path = tdb("avatar.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -6289,7 +6325,7 @@ static void test_avatar(void) {
 }
 
 static void test_notify_prefs(void) {
-    const char *path = "build/test_dbwriter_notify.db";
+    const char *path = tdb("notify.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -6407,7 +6443,7 @@ static void test_notify_prefs(void) {
 }
 
 static void test_dm(void) {
-    const char *path = "build/test_dbwriter_dm.db";
+    const char *path = tdb("dm.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -6525,7 +6561,7 @@ static void test_dm(void) {
  * refuses a URL the body no longer carries, and the stored row rides the
  * backfill replay; an edit drops the old body's rows. */
 static void test_unfurl_store(void) {
-    const char *path = "build/test_dbwriter_unfurl.db";
+    const char *path = tdb("unfurl.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -6548,6 +6584,7 @@ static void test_unfurl_store(void) {
     CHECK(r && r->type == OC_RES_UNFURL_STORED);
     CHECK(r->message_id == mid && r->channel_id == OC_DEFAULT_CHANNEL);
     CHECK(r->unf_url && strcmp(r->unf_url, "https://example.com/x") == 0);
+    /* contract: data in, data out -- stored as given */
     CHECK(r->unf_title && strcmp(r->unf_title, "Example X") == 0);
     CHECK(r->n_members >= 1);
     oc_dbres_free(r);
@@ -6571,7 +6608,9 @@ static void test_unfurl_store(void) {
     if (r->n_runfurl == 1) {
         CHECK(r->runfurl[0].message_id == mid);
         CHECK(strcmp(r->runfurl[0].url, "https://example.com/x") == 0);
+        /* contract: data in, data out -- stored as given */
         CHECK(strcmp(r->runfurl[0].title, "Example X") == 0);
+        /* contract: data in, data out -- stored as given */
         CHECK(strcmp(r->runfurl[0].descr, "About X") == 0);
     }
     oc_dbres_free(r);
@@ -6624,7 +6663,7 @@ static uint64_t forward_msg(oc_dbwriter *w, uint64_t uid, uint64_t to_channel,
 }
 
 static void test_forward(void) {
-    const char *path = "build/test_dbwriter_forward.db";
+    const char *path = tdb("forward.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -6660,6 +6699,7 @@ static void test_forward(void) {
         CHECK(r->rfwd[0].src_channel == OC_DEFAULT_CHANNEL);
         CHECK(r->rfwd[0].src_message == src);
         CHECK(r->rfwd[0].src_author == alice);          /* resolved, not asserted */
+        /* contract: data in, data out -- stored as given */
         CHECK(r->rfwd[0].excerpt && strcmp(r->rfwd[0].excerpt, "the original text") == 0);
         CHECK(r->rfwd[0].n_attach == 0);
         CHECK(r->rfwd[0].attach_name && r->rfwd[0].attach_name[0] == '\0');
@@ -6803,6 +6843,7 @@ static void test_forward(void) {
     /* The excerpt is a SNAPSHOT: deleting (or editing) the original afterwards
      * does not rewrite what was forwarded. */
     if (r && r->n_rfwd == 2)
+        /* contract: data in, data out -- stored as given */
         CHECK(strcmp(r->rfwd[0].excerpt, "the original text") == 0);
     oc_dbres_free(r);
 
@@ -6811,7 +6852,7 @@ static void test_forward(void) {
 }
 
 static void test_max_users(void) {
-    const char *path = "build/test_dbwriter_cap.db";
+    const char *path = tdb("cap.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -6855,7 +6896,7 @@ static int is_lower_hex32(const char *s) {
 }
 
 static void test_invite_by_address(void) {
-    const char *path = "build/test_dbwriter_invite_addr.db";
+    const char *path = tdb("invite_addr.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -6940,7 +6981,7 @@ static int general_text(const char *path, char *topic, size_t tcap, char *descr,
 }
 
 static void test_welcome_general(void) {
-    const char *path = "build/test_dbwriter_welcome.db";
+    const char *path = tdb("welcome.db");
     char topic[512], descr[2048];
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
@@ -6954,7 +6995,7 @@ static void test_welcome_general(void) {
     CHECK(oc_dbwriter_welcome_general(w, OC_DEPLOY_MANAGED, "Acme") == 1);
     CHECK(general_text(path, topic, sizeof topic, descr, sizeof descr) == 1);
     CHECK(strstr(topic, "Acme") != NULL && strlen(topic) <= OC_MAX_TOPIC);
-    CHECK(strstr(descr, "Welcome to Acme") != NULL && strlen(descr) <= OC_MAX_DESCRIPTION);
+    CHECK(strstr(descr, "Acme") != NULL && strlen(descr) <= OC_MAX_DESCRIPTION);   /* the welcome names the workspace */
     /* Every later boot leaves it alone, including a topic someone has cleared. */
     {
         sqlite3 *db = NULL;
@@ -6987,7 +7028,7 @@ static void test_welcome_general(void) {
     if (!w) return;
     CHECK(oc_dbwriter_welcome_general(w, OC_DEPLOY_MANAGED, "") == 1);
     CHECK(general_text(path, topic, sizeof topic, descr, sizeof descr) == 1 &&
-          strstr(descr, "Welcome.") == descr);
+          descr[0] != '\0' && strlen(descr) <= OC_MAX_DESCRIPTION && !strchr(descr, '%'));
     oc_dbwriter_stop(w);
     cleanup_db(path);
 }
@@ -6999,13 +7040,11 @@ static uint64_t pool_mono_us(void) {
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
 }
 
+/* The next result before a deadline on the monotonic clock, or NULL. */
 static oc_dbres *wait_result_ms(oc_dbwriter *w, int ms) {
-    for (int i = 0; i < ms / 2; i++) {
-        oc_dbres *r = oc_dbwriter_next_result(w);
-        if (r) return r;
-        usleep(2000);
-    }
-    return NULL;
+    oc_dbres *r = NULL;
+    WAIT_UNTIL((r = oc_dbwriter_next_result(w)) != NULL, (uint64_t)ms);
+    return r;
 }
 
 /* The sign-in page's password check for `user`, submitted and not waited for. */
@@ -7101,7 +7140,7 @@ static int has_change(const oc_dbres *r, uint64_t ch, uint64_t uid, int joined) 
  * can name, and one namespace with people and the broadcast words, without
  * case); a rename cannot take a group's handle; everything is audited. */
 static void test_groups_manage(void) {
-    const char *path = "build/test_dbwriter_groups.db";
+    const char *path = tdb("groups.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -7141,6 +7180,7 @@ static void test_groups_manage(void) {
     uint64_t g2 = grp_create(w, own, "ops");
     r = grp_job(w, OC_JOB_UPDATE_GROUP, own, g, "design", "The design team", "pixels");
     CHECK(r && r->type == OC_RES_GROUP_CHANGED && r->n_groups == 1 &&
+          /* contract: data in, data out -- stored as given */
           strcmp(r->groups[0].name, "The design team") == 0);
     oc_dbres_free(r);
     r = grp_job(w, OC_JOB_UPDATE_GROUP, own, g, "Ops", "x", "");
@@ -7186,7 +7226,7 @@ static void test_groups_manage(void) {
  * added directly too. Leave and remove refuse someone a group keeps in. Every
  * change says who gained or lost the channel. */
 static void test_groups_membership(void) {
-    const char *path = "build/test_dbwriter_gmemb.db";
+    const char *path = tdb("gmemb.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -7280,7 +7320,7 @@ static void test_groups_membership(void) {
  * the channel has", with `direct` matching -- checked against a reference model
  * through a long random run over three channels, six people and three groups. */
 static void test_groups_invariant(void) {
-    const char *path = "build/test_dbwriter_ginv.db";
+    const char *path = tdb("ginv.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -7337,7 +7377,7 @@ static void test_groups_invariant(void) {
  * shows it to its members and to nobody else; a handle wins a clash with a
  * person's name. */
 static void test_groups_mentions(void) {
-    const char *path = "build/test_dbwriter_gment.db";
+    const char *path = tdb("gment.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -7439,7 +7479,7 @@ static void submit_change(oc_dbwriter *w, uint64_t conn, const char *user, const
  * commits meanwhile; and of two changes checked against the same credential,
  * the one stored second finds it changed and is refused. */
 static void test_change_password(void) {
-    const char *path = "build/test_dbwriter_chpw.db";
+    const char *path = tdb("chpw.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -7464,11 +7504,7 @@ static void test_change_password(void) {
      * password, so the time to answer says nothing of which names exist. */
     oc_dbwriter_hold_auth(w, 1);
     submit_local_auth(w, 30, "nobody-here", "pw-one");
-    queued = 0;
-    for (int i = 0; i < 500 && !queued; i++) {
-        queued = oc_dbwriter_auth_waiting(w) == 1;
-        if (!queued) usleep(10000);
-    }
+    queued = WAIT_UNTIL(oc_dbwriter_auth_waiting(w) == 1, 5000);
     CHECK(queued);
     oc_dbwriter_hold_auth(w, 0);
     r = wait_result_ms(w, 60000);
@@ -7508,11 +7544,7 @@ static void test_change_password(void) {
     /* Held on the pool, the change leaves the writer free. */
     oc_dbwriter_hold_auth(w, 1);
     submit_change(w, 15, "chg", "pw-two", "pw-three");
-    queued = 0;
-    for (int i = 0; i < 500 && !queued; i++) {
-        queued = oc_dbwriter_auth_waiting(w) == 1;
-        if (!queued) usleep(10000);
-    }
+    queued = WAIT_UNTIL(oc_dbwriter_auth_waiting(w) == 1, 5000);
     CHECK(queued);
     oc_job *sj = oc_job_new(OC_JOB_SEND, 16);
     sj->user_id = u; sj->channel_id = 1;
@@ -7532,11 +7564,7 @@ static void test_change_password(void) {
     oc_dbwriter_hold_auth(w, 1);
     submit_change(w, 17, "chg", "pw-three", "pw-four");
     submit_change(w, 18, "chg", "pw-three", "pw-five");
-    queued = 0;
-    for (int i = 0; i < 500 && !queued; i++) {
-        queued = oc_dbwriter_auth_waiting(w) == 2;
-        if (!queued) usleep(10000);
-    }
+    queued = WAIT_UNTIL(oc_dbwriter_auth_waiting(w) == 2, 5000);
     CHECK(queued);
     oc_dbwriter_hold_auth(w, 0);
     int won = 0, lost = 0; uint64_t winner = 0;
@@ -7563,7 +7591,7 @@ static void test_change_password(void) {
  * one only if the credential that was checked is still, by its version, the
  * stored one. */
 static void test_auth_pool(void) {
-    const char *path = "build/test_dbwriter_pool.db";
+    const char *path = tdb("pool.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -7609,11 +7637,7 @@ static void test_auth_pool(void) {
         uint64_t conn = 300 + (uint64_t)change;
         oc_dbwriter_hold_auth(w, 1);
         submit_local_auth(w, conn, "fast", "pw-fast");
-        int queued = 0;
-        for (int i = 0; i < 500 && !queued; i++) {
-            queued = oc_dbwriter_auth_waiting(w) == 1;
-            if (!queued) usleep(10000);
-        }
+        int queued = WAIT_UNTIL(oc_dbwriter_auth_waiting(w) == 1, 5000);
         CHECK(queued);
         if (change) {
             sqlite3 *db = NULL;
@@ -7673,7 +7697,7 @@ static oc_dbres *alerts_job(oc_dbwriter *w, int type, uint64_t conn, uint64_t us
     return wait_result(w);
 }
 static void test_alerts(void) {
-    const char *path = "build/test_dbwriter_alerts.db";
+    const char *path = tdb("alerts.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -7695,6 +7719,7 @@ static void test_alerts(void) {
     CHECK(r && r->type == OC_RES_ALERTS && r->n_alert_rows == 1);
     if (r && r->n_alert_rows == 1) {
         CHECK(r->alert_rows[0].count == 2 && r->alert_rows[0].current && !r->alert_rows[0].acked);
+        /* contract: data in, data out -- stored as given */
         CHECK(!strcmp(r->alert_rows[0].key, "tls.obtain") && !strcmp(r->alert_rows[0].message, "the CA is unreachable"));
         CHECK(r->alert_rows[0].last_ms >= r->alert_rows[0].first_ms);
     }
@@ -7805,7 +7830,7 @@ static oc_dbres *del_or_restore(oc_dbwriter *w, int type, uint64_t uid, uint64_t
     return wait_result(w);
 }
 static void test_restore(void) {
-    const char *path = "build/test_dbwriter_restore.db";
+    const char *path = tdb("restore.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -7832,6 +7857,7 @@ static void test_restore(void) {
     /* Alice's: the message whole, for every member. */
     r = del_or_restore(w, OC_JOB_RESTORE, alice, mid);
     CHECK(r && r->type == OC_RES_RESTORE_OK && r->author_id == alice && r->message_id == mid);
+    /* contract: data in, data out -- stored as given */
     CHECK(r && r->body_len == 31 && !memcmp(r->body, "the rollback plan is in the doc", 31) && r->n_members >= 3);
     oc_dbres_free(r);
     {   /* ...with bob's reaction, and searchable again. */
@@ -7859,7 +7885,7 @@ static void test_restore(void) {
     /* Past the window: gone for good, and nothing of it is kept. */
     oc_dbwriter_set_restore_window_ms(w, 50);
     oc_dbres_free(del_or_restore(w, OC_JOB_DELETE, alice, mid));
-    usleep(120000);
+    oc_test_let_time_pass(120);   /* the window closing is what is tested */
     r = del_or_restore(w, OC_JOB_RESTORE, alice, mid);
     CHECK(r && r->type == OC_RES_RESTORE_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
     oc_dbres_free(r);
@@ -7916,7 +7942,7 @@ static int replay_has_action(const oc_dbres *r, uint64_t mid, uint32_t start, ui
 }
 
 static void test_actions(void) {
-    const char *path = "build/test_dbwriter_actions.db";
+    const char *path = tdb("actions.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -7987,8 +8013,10 @@ static void test_actions(void) {
     r = wait_result(w);
     CHECK(r && r->type == OC_RES_WEBHOOK_POSTED);
     uint64_t hook = r ? r->message_id : 0;
+    /* contract: data in, data out -- stored as given */
     CHECK(live_action(r, hook, 4, 8) && r->ract[0].actor_name && strcmp(r->ract[0].actor_name, "Deploy Bot") == 0);
     oc_dbres_free(r);
+    /* contract: data in, data out -- stored as given */
     CHECK(action_row(path, hook, NULL, NULL, nm, sizeof nm) && strcmp(nm, "Deploy Bot") == 0);
 
     /* SCHEDULED: fires through the send path, so it is recorded there too. */
@@ -8025,12 +8053,14 @@ static void test_actions(void) {
     int pinned = 0;
     for (size_t i = 0; r && i < r->n_plist; i++)
         if (r->plist[i].message_id == act)
+            /* contract: data in, data out -- stored as given */
             pinned = r->plist[i].action == 1 && r->plist[i].body && strcmp(r->plist[i].body, "is away") == 0;
     CHECK(pinned);
     oc_dbres_free(r);
     r = save_item(w, bob, act, OC_SAVE_ADD); oc_dbres_free(r);
     r = list_saved(w, bob);
     CHECK(r && r->n_slist == 1 && r->slist[0].action == 1 && r->slist[0].body &&
+          /* contract: data in, data out -- stored as given */
           strcmp(r->slist[0].body, "is away") == 0);
     oc_dbres_free(r);
     r = search(w, bob, "away", 10);
@@ -8038,6 +8068,7 @@ static void test_actions(void) {
     for (size_t i = 0; r && i < r->n_search; i++)
         if (r->search[i].message_id == act)
             found = r->search[i].action == 1 && r->search[i].body_len == 7 &&
+                    /* contract: data in, data out -- stored as given */
                     memcmp(r->search[i].body, "is away", 7) == 0;
     CHECK(found);
     oc_dbres_free(r);
@@ -8045,6 +8076,7 @@ static void test_actions(void) {
     int th = 0;
     for (size_t i = 0; r && i < r->n_threads; i++)
         if (r->threads[i].root_id == act)
+            /* contract: data in, data out -- stored as given */
             th = r->threads[i].action == 1 && r->threads[i].preview && strcmp(r->threads[i].preview, "is away") == 0;
     CHECK(th);
     oc_dbres_free(r);
@@ -8055,6 +8087,7 @@ static void test_actions(void) {
     for (size_t i = 0; r && i < r->n_chlist; i++)
         if (r->chlist[i].channel_id == OC_DEFAULT_CHANNEL)
             prev = r->chlist[i].preview_action == 1 && r->chlist[i].preview &&
+                   /* contract: data in, data out -- stored as given */
                    strcmp(r->chlist[i].preview, "is late") == 0;
     CHECK(prev);
     oc_dbres_free(r);
@@ -8077,6 +8110,7 @@ static void test_actions(void) {
         oc_dbwriter_submit(w, j);
         r = wait_result(w);
         CHECK(r && r->n_rfwd == 1 && r->rfwd[0].src_action == 1 && r->rfwd[0].excerpt &&
+              /* contract: data in, data out -- stored as given */
               strcmp(r->rfwd[0].excerpt, "is away") == 0);
         oc_dbres_free(r);
     }
@@ -8095,8 +8129,9 @@ static void test_actions(void) {
         j->tts_lang = strdup("en-US");
         oc_dbwriter_submit(w, j);
         r = wait_result(w);
+        /* contract: what is read aloud -- the actor's name as it is now, then the action as stored */
         CHECK(r && r->type == OC_RES_TTS_META && r->tts_text && strcmp(r->tts_text, "Ada Starr is away") == 0);
-        if (r && r->tts_text && strcmp(r->tts_text, "Ada Starr is away") != 0) printf("    said \"%s\"\n", r->tts_text);
+        if (r && r->tts_text && strcmp(r->tts_text, "Ada Starr is away") != 0) printf("    said \"%s\"\n", r->tts_text);   /* contract: as above */
         oc_dbres_free(r);
     }
 
@@ -8105,9 +8140,15 @@ static void test_actions(void) {
     CHECK(r && r->type == OC_RES_DELETE_OK);
     oc_dbres_free(r);
     CHECK(!action_row(path, act, NULL, NULL, NULL, 0));
-    /* Longer than the window an earlier test gave its own writer: this writer
-     * still has the full one. */
-    usleep(120000);
+    /* A window given to another writer is that writer's: this one still has
+     * the full one, longer than the other's. */
+    {
+        oc_dbwriter *other = start_db(tdb("actions_other.db"));
+        CHECK(other != NULL);
+        if (other) { oc_dbwriter_set_restore_window_ms(other, 50); oc_dbwriter_stop(other); }
+        cleanup_db(tdb("actions_other.db"));
+    }
+    oc_test_let_time_pass(120);
     r = del_or_restore(w, OC_JOB_RESTORE, alice, act);
     CHECK(r && r->type == OC_RES_RESTORE_OK && live_action(r, act, 6, 7));
     oc_dbres_free(r);
@@ -8162,7 +8203,7 @@ static oc_dbres *e2e_send(oc_dbwriter *w, uint64_t user, uint64_t ch, const char
 }
 
 static void test_e2e_dms(void) {
-    const char *path = "build/test_dbwriter_e2e.db";
+    const char *path = tdb("e2e.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -8256,7 +8297,7 @@ static void test_e2e_dms(void) {
     j->maint_batch = 8;
     oc_dbwriter_submit(w, j);
     r = NULL;
-    for (int i = 0; i < 400 && !r; i++) { r = oc_dbwriter_next_result(w); if (!r) usleep(5000); }
+    WAIT_UNTIL((r = oc_dbwriter_next_result(w)) != NULL, 5000);
     CHECK(r != NULL);
     oc_dbres_free(r);
     CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM channels WHERE id=?1;", ch) == 0);
@@ -8268,7 +8309,7 @@ static void test_e2e_dms(void) {
 }
 
 static void test_demo_mode(void) {
-    const char *path = "build/test_dbwriter_demo.db";
+    const char *path = tdb("demo.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
@@ -8343,6 +8384,7 @@ static void test_demo_mode(void) {
 }
 
 int run_dbwriter_tests(void) {
+    CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_auth_pool();
     test_change_password();
@@ -8418,5 +8460,8 @@ int run_dbwriter_tests(void) {
     test_unfurl_store();
     test_forward();
     cleanup_db(TEMPLATE_DB);
+    oc_test_rmtree(g_dir);
+    for (int i = 0; i < g_n_names; i++) free(g_names[i]);
+    g_n_names = 0;
     return failures;
 }

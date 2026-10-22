@@ -29,6 +29,7 @@
 #include "protocol.h"
 #include "tls.h"
 #include "check.h"
+#include "testenv.h"
 #include "testsignin.h"
 
 #include <arpa/inet.h>
@@ -64,16 +65,15 @@ typedef struct {
 
 static slow_s3 g_s3;
 
-static void ms_sleep(int ms) {
-    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
-    nanosleep(&ts, NULL);
-}
+/* The fake backend's latency is what it models: time passing, not a wait. */
+static void ms_sleep(int ms) { oc_test_let_time_pass((uint64_t)ms); }
 
-static uint64_t now_ms_local(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000ull + (uint64_t)(tv.tv_usec / 1000);
-}
+/* Round-trips are measured on the monotonic clock. */
+static uint64_t now_ms_local(void) { return oc_test_mono_ms(); }
+
+/* The suite's own directory (oc_test_mkdtemp), and `name` under it. */
+static char g_sbdir[512];
+static const char *sbpath(char *out, size_t cap, const char *name) { return oc_test_path(out, cap, g_sbdir, name); }
 
 static void send_all_fd(int fd, const char *s, size_t n) {
     size_t sent = 0;
@@ -210,6 +210,8 @@ struct sb_loop_arg {
     oc_tls_server        *srv;
     oc_dbwriter          *dbw;
     volatile sig_atomic_t stop;
+    int                   exited;   /* the loop returned (atomic): its bind was refused */
+    oc_netloop_view       view;     /* the loop's own account: the port it bound */
 };
 
 /* A client signed in as a person is (AUTH.md §8.10): the page, then its token. */
@@ -227,22 +229,22 @@ static void *sb_loop_thread(void *p) {
     struct sb_loop_arg *a = p;
     char cfgerr[128];
     oc_config_load(cfgerr, sizeof cfgerr);   /* load after the test's setenv() */
-    oc_netloop_run(a->port, a->srv, a->dbw, &a->stop);
+    oc_netloop_run_ex(0, a->srv, a->dbw, &a->stop, &a->view);   /* the kernel picks the port */
+    __atomic_store_n(&a->exited, 1, __ATOMIC_RELEASE);
     return NULL;
 }
 
-static void sb_wait_port(int port) {
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons((uint16_t)port);
-    for (int i = 0; i < 500; i++) {
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd >= 0 && connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) { close(fd); return; }
-        if (fd >= 0) close(fd);
-        ms_sleep(10);
-    }
+/* The loop on a port the kernel picks (bound as 0), up and listening, its
+ * port read back from the loop itself. 0 or -1. */
+static int sb_loop_start(struct sb_loop_arg *a, pthread_t *th) {
+    memset(&a->view, 0, sizeof a->view);
+    __atomic_store_n(&a->exited, 0, __ATOMIC_RELEASE);
+    if (pthread_create(th, NULL, sb_loop_thread, a) != 0) return -1;
+    if (!WAIT_UNTIL(__atomic_load_n(&a->view.proto_port, __ATOMIC_ACQUIRE) > 0 ||
+                    __atomic_load_n(&a->exited, __ATOMIC_ACQUIRE), 10000)) return -1;
+    if (__atomic_load_n(&a->exited, __ATOMIC_ACQUIRE)) { pthread_join(*th, NULL); return -1; }
+    a->port = __atomic_load_n(&a->view.proto_port, __ATOMIC_ACQUIRE);
+    return 0;
 }
 
 /* Alice runs on her own thread so her upload streams continuously through the
@@ -258,18 +260,11 @@ static void *alice_thread(void *unused) {
     return NULL;
 }
 
-/* Tick a client until `cond` holds or the budget runs out. */
+/* Tick a client until `cond` holds of its model `m`, or `ms` pass on the
+ * monotonic clock (tests/check.h). */
 #define SB_WAIT(cl, cond, ms)                                                  \
-    ({                                                                         \
-        int _ok = 0;                                                           \
-        for (int _i = 0; _i < (ms) / 5; _i++) {                                \
-            oc_client_tick((cl));                                              \
-            const oc_model *m = oc_client_model((cl)); (void)m;                         \
-            if (cond) { _ok = 1; break; }                                      \
-            ms_sleep(5);                                                       \
-        }                                                                      \
-        _ok;                                                                   \
-    })
+    WAIT_UNTIL_DO(oc_client_tick((cl)),                                        \
+                  ({ const oc_model *m = oc_client_model((cl)); (void)m; (cond); }), (ms))
 
 static int has_body(const oc_model *m, const char *body) {
     for (size_t i = 0; i < m->n_channels; i++)
@@ -288,8 +283,16 @@ int run_slow_blob_tests(void) {
     printf("itest_slow_blob: message latency while a %d ms/op blob backend streams "
            "an upload (the ARCH-69 claim)\n", SLOW_MS);
 
+    if (oc_test_mkdtemp("slow_blob", g_sbdir, sizeof g_sbdir) != 0) {
+        printf("  FAIL itest_slow_blob: no directory of its own under $TMPDIR\n");
+        return failures + 1;
+    }
+    char dbp[600], upath_b[600], dlpath[600];
+    sbpath(dbp, sizeof dbp, "itest_slowblob.db");
+    sbpath(upath_b, sizeof upath_b, "itest_slowblob_payload.bin");
+    sbpath(dlpath, sizeof dlpath, "itest_slowblob_dl.bin");
     CHECK(slow_s3_start(&g_s3) == 0);
-    if (g_s3.port == 0) return failures;
+    if (g_s3.port == 0) { oc_test_rmtree(g_sbdir); return failures; }
 
     /* OPENCHIME_S3 selects the S3 backend (ARCH-70); http+s3:// keeps the fake
      * endpoint plaintext. */
@@ -302,25 +305,24 @@ int run_slow_blob_tests(void) {
     uint8_t pin[OC_TLS_FINGERPRINT_LEN];
     CHECK(oc_tls_server_fingerprint(&srv, pin) == 0);
 
-    unlink("build/itest_slowblob.db");
-    unlink("build/itest_slowblob.db-wal");
-    unlink("build/itest_slowblob.db-shm");
-    oc_dbwriter *dbw = oc_dbwriter_start("build/itest_slowblob.db");
+    oc_dbwriter *dbw = oc_dbwriter_start(dbp);
     if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw != NULL);
-    if (!dbw) { slow_s3_stop(&g_s3); return failures; }
+    if (!dbw) { slow_s3_stop(&g_s3); oc_test_rmtree(g_sbdir); return failures; }
     CHECK(oc_dbwriter_register_local(dbw, "sb-alice", "pw", OC_ROLE_OWNER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw, "sb-bob",   "pw", OC_ROLE_MEMBER, 2048) != 0);
 
     struct sb_loop_arg arg;
-    arg.port = 18100 + (int)(getpid() % 800);    /* between netloop's ports and client_core's */
+    arg.port = 0;                                 /* the kernel picks (sb_loop_start) */
     arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
     pthread_t th;
-    CHECK(pthread_create(&th, NULL, sb_loop_thread, &arg) == 0);
-    sb_wait_port(arg.port);
+    int loop_up = sb_loop_start(&arg, &th) == 0;
+    CHECK(loop_up);
+    oc_client *alice = NULL, *bob = NULL;
+    if (!loop_up) goto done;
 
-    oc_client *alice = sb_start(arg.port, "sb-alice", "pw");
-    oc_client *bob   = sb_start(arg.port, "sb-bob", "pw");
+    alice = sb_start(arg.port, "sb-alice", "pw");
+    bob   = sb_start(arg.port, "sb-bob", "pw");
     CHECK(alice && bob);
     if (!alice || !bob) goto done;
     CHECK(SB_WAIT(alice, m->authed, 8000));
@@ -352,8 +354,7 @@ int run_slow_blob_tests(void) {
     uint64_t base_median = base[2];
 
     /* --- now: bob sends while alice pushes an upload through the slow S3 --- */
-    mkdir("build", 0755);
-    const char *upath = "build/itest_slowblob_payload.bin";
+    const char *upath = upath_b;
     {
         FILE *f = fopen(upath, "wb");
         CHECK(f != NULL);
@@ -380,17 +381,13 @@ int run_slow_blob_tests(void) {
     oc_client_upload(alice, ch, upath);
     CHECK(SB_WAIT(alice, g_s3.obj_len > 0, 20000));
     uint64_t aid = 0;
-    for (int i = 0; i < 400 && !aid; i++) {
-        oc_client_tick(alice);
-        const oc_model *am = oc_client_model(alice);
-        for (size_t c2 = 0; c2 < am->n_channels && !aid; c2++)
-            for (size_t j = 0; j < am->channels[c2].n_msgs && !aid; j++)
-                if (am->channels[c2].msgs[j].n_attach)
-                    aid = am->channels[c2].msgs[j].attach[0].id;
-        ms_sleep(10);
-    }
-    CHECK(aid != 0);
-    if (aid) oc_client_download(alice, aid, "build/itest_slowblob_dl.bin");
+    CHECK(SB_WAIT(alice, ({
+              for (size_t c2 = 0; c2 < m->n_channels && !aid; c2++)
+                  for (size_t j = 0; j < m->channels[c2].n_msgs && !aid; j++)
+                      if (m->channels[c2].msgs[j].n_attach)
+                          aid = m->channels[c2].msgs[j].attach[0].id;
+              aid != 0; }), 4000));
+    if (aid) oc_client_download(alice, aid, dlpath);
 
     g_alice = alice;
     g_alice_run = 1;
@@ -440,7 +437,7 @@ int run_slow_blob_tests(void) {
      * check on the median, never on single samples: one sample is at the mercy
      * of the runner's scheduler, which is how a spike count here failed a
      * sanitizer run whose median had FALLEN during the transfer. */
-    CHECK(during_median < base_median + (uint64_t)SLOW_MS / 2);
+    CHECK_SPEED(during_median < base_median + (uint64_t)SLOW_MS / 2);
 
     /* The upload must have been genuinely in flight while bob was measured, or
      * the comparison proved nothing. Several slow segments inside the window
@@ -458,8 +455,10 @@ int run_slow_blob_tests(void) {
      * either of the others had it gone. */
     {
         CHECK(SB_WAIT(alice, ({ const oc_xfer_state *d = oc_model_xfer(m, aid); d && d->phase != 0; }), 30000));
-        const char *pa = "build/itest_slowblob_post_a.txt", *pb = "build/itest_slowblob_post_b.txt",
-                   *pc = "build/itest_slowblob_post_c.txt";
+        char pa_b[600], pb_b[600], pc_b[600];
+        const char *pa = sbpath(pa_b, sizeof pa_b, "itest_slowblob_post_a.txt"),
+                   *pb = sbpath(pb_b, sizeof pb_b, "itest_slowblob_post_b.txt"),
+                   *pc = sbpath(pc_b, sizeof pc_b, "itest_slowblob_post_c.txt");
         const char *files[3] = { pa, pb, pc };
         for (int i = 0; i < 3; i++) {
             FILE *f = fopen(files[i], "wb");
@@ -490,16 +489,15 @@ int run_slow_blob_tests(void) {
 done:
     if (alice) oc_client_stop(alice);
     if (bob) oc_client_stop(bob);
-    __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
-    pthread_join(th, NULL);
+    if (loop_up) {
+        __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+        pthread_join(th, NULL);
+    }
     oc_dbwriter_stop(dbw);
     oc_tls_server_free(&srv);
     slow_s3_stop(&g_s3);
 
     unsetenv("OPENCHIME_S3");
-    unlink("build/itest_slowblob.db");
-    unlink("build/itest_slowblob.db-wal");
-    unlink("build/itest_slowblob.db-shm");
-    unlink("build/itest_slowblob_payload.bin");
+    oc_test_rmtree(g_sbdir);
     return failures;
 }

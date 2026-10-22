@@ -19,7 +19,8 @@ int run_demolimits_tests(void) {
     for (unsigned i = 0; i < pu; i++) CHECK(oc_dl_take(d, OC_DL_SUMMARY, 7, day + i) == 1);
     CHECK(oc_dl_take(d, OC_DL_SUMMARY, 7, day + 10) == 0);
     CHECK(oc_dl_take(d, OC_DL_SUMMARY, 8, day + 10) == 1);
-    CHECK(strstr(oc_dl_why(OC_DL_SUMMARY), "public demo") != NULL);
+    /* A refusal carries a reason for the person (the error's text); its words are theirs to change. */
+    CHECK(oc_dl_why(OC_DL_SUMMARY)[0] != '\0');
     /* Other kinds count apart. */
     CHECK(oc_dl_take(d, OC_DL_MESSAGE, 7, day + 11) == 1);
     /* The workspace's limit stops everyone, and a refusal counts nothing. */

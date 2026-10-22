@@ -96,6 +96,10 @@ int run_share_media_tests(void);
 #include <unistd.h>
 
 static const char *volatile g_suite = "(before the first suite)";
+
+/* Checks that could not run here (tests/check.h SKIP), summed over the suites. */
+int oc_test_skips;
+static int g_skips;
 static struct timespec g_start;
 
 static double elapsed_s(void) {
@@ -333,9 +337,11 @@ static int job_start(job *j, const struct suite *su) {
         printf("--- %s\n", su->name);
         int failed = run_here(su);
         double t = g_ntimes ? g_times[0].s : 0;
+        int skipped = oc_test_skips;
         fflush(NULL);
         if (write(fds[1], &failed, sizeof failed) != (ssize_t)sizeof failed ||
-            write(fds[1], &t, sizeof t) != (ssize_t)sizeof t) _exit(3);
+            write(fds[1], &t, sizeof t) != (ssize_t)sizeof t ||
+            write(fds[1], &skipped, sizeof skipped) != (ssize_t)sizeof skipped) _exit(3);
         exit(0);
     }
     close(fds[1]);
@@ -354,8 +360,11 @@ static int job_reap(job *jobs, int *n) {
     if (k == *n) return 0;
     job *j = &jobs[k];
     int failed = -1; double t = elapsed_s() - j->t0;
-    if (read(j->rd, &failed, sizeof failed) != (ssize_t)sizeof failed || read(j->rd, &t, sizeof t) != (ssize_t)sizeof t)
+    int skipped = 0;
+    if (read(j->rd, &failed, sizeof failed) != (ssize_t)sizeof failed || read(j->rd, &t, sizeof t) != (ssize_t)sizeof t ||
+        read(j->rd, &skipped, sizeof skipped) != (ssize_t)sizeof skipped)
         failed = -1;
+    else g_skips += skipped;
     close(j->rd);
     fflush(stdout);
     rewind(j->out);
@@ -413,6 +422,8 @@ int main(void) {
     }
     if (g_ran == 0) { printf("\nFAILED: the selection names no suite\n"); return 1; }
     print_times();
+    g_skips += oc_test_skips;   /* the suites run in this process */
+    if (g_skips) printf("\n%d check(s) skipped: see the SKIP lines above (in CI each is a failure)\n", g_skips);
     if (total == 0) { printf("\nOK: all suites passed\n"); return 0; }
     printf("\nFAILED: %d check(s) across all suites\n", total);
     return 1;

@@ -173,6 +173,27 @@ typedef struct {
     } dev;
 } oc_config;
 
+/* Why a load stopped, as a kind and the names involved -- what a test or a
+ * tool reads, where `err` is the operator's sentence and may be reworded. */
+typedef enum {
+    OC_CFGF_OK = 0,
+    OC_CFGF_BAD_VALUE,      /* `name`'s value does not parse, is out of range, or is unusable */
+    OC_CFGF_UNKNOWN,        /* `name` is no row; `other` the nearest row's name, or "" */
+    OC_CFGF_REMOVED,        /* `name` was a setting and is no longer read */
+    OC_CFGF_DEV_ONLY,       /* `name` is a development row and the mode is not development */
+    OC_CFGF_MANAGED_ONLY,   /* `name` is the control plane's, and there is no ticket */
+    OC_CFGF_NEEDS,          /* `name`'s value needs `other` set (or set otherwise) as well */
+} oc_cfg_fault_kind;
+
+typedef struct {
+    oc_cfg_fault_kind kind;
+    char name[64];         /* the variable at fault */
+    char other[64];        /* the related variable, or "" */
+} oc_cfg_fault;
+
+/* The last oc_config_load's fault: kind OC_CFGF_OK after a load that succeeded. */
+const oc_cfg_fault *oc_config_fault(void);
+
 /* Load the daemon config from the environment into the process-global singleton.
  * Returns 0 on success; on any misconfiguration returns -1 and writes the
  * reason into `err` (up to `errcap`): the variable, the value and what is

@@ -24,6 +24,8 @@
 #include "protocol.h"
 #include "tls.h"
 #include "testsignin.h"   /* the sign-in page, as a person signs in */
+#include "testenv.h"      /* a directory of its own */
+#include "check.h"        /* WAIT_UNTIL: deadlines on the monotonic clock */
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -214,7 +216,7 @@ static void *chat_client(void *vp) {
     bclient c;
     if (bc_open(&c, 50) != 0 || bc_login(&c, a->idx) != 0) { bc_close(&c); return NULL; }
     __atomic_add_fetch(&g_ready_n, 1, __ATOMIC_ACQ_REL);
-    while (!__atomic_load_n(&g_gate, __ATOMIC_ACQUIRE)) usleep(1000);
+    (void)WAIT_UNTIL(__atomic_load_n(&g_gate, __ATOMIC_ACQUIRE), 600000);
 
     int sender = a->idx < a->senders;
     uint64_t period = (uint64_t)(1000000.0 / a->rate);
@@ -265,8 +267,8 @@ static void run_chat(const char *name, int clients, int senders, double rate, in
         args[i] = (chat_arg){ i, senders, secs, rate, &ack, &del, 0 };
         pthread_create(&th[i], NULL, chat_client, &args[i]);
     }
-    for (int i = 0; i < 3000 && __atomic_load_n(&g_ready_n, __ATOMIC_ACQUIRE) < clients; i++) usleep(10000);
-    usleep(300000);   /* let the sign-in presence fan-out settle before measuring */
+    (void)WAIT_UNTIL(__atomic_load_n(&g_ready_n, __ATOMIC_ACQUIRE) >= clients, 30000);
+    oc_test_let_time_pass(300);   /* settle: the sign-in presence fan-out, before measuring */
     oc_netloop_stats_reset();
     __atomic_store_n(&g_gate, 1, __ATOMIC_RELEASE);
     int ok = 0;
@@ -284,14 +286,14 @@ typedef struct { int idx; samples *s; int ok; } storm_arg;
 
 static void *storm_client(void *vp) {
     storm_arg *a = vp;
-    while (!__atomic_load_n(&g_gate, __ATOMIC_ACQUIRE)) usleep(200);
+    (void)WAIT_UNTIL(__atomic_load_n(&g_gate, __ATOMIC_ACQUIRE), 600000);
     uint64_t t0 = mono_us();
     bclient c;
     if (bc_open(&c, 1000) == 0 && bc_login(&c, a->idx) == 0) {
         samples_add(a->s, mono_us() - t0);
         a->ok = 1;
     }
-    usleep(500000);
+    oc_test_let_time_pass(500);   /* settle before measuring: a benchmark's pause, not a wait on work */
     bc_close(&c);
     return NULL;
 }
@@ -303,7 +305,7 @@ static void run_storm(int clients) {
     pthread_t *th = calloc((size_t)clients, sizeof *th);
     g_gate = 0;
     for (int i = 0; i < clients; i++) { args[i] = (storm_arg){ i, &s, 0 }; pthread_create(&th[i], NULL, storm_client, &args[i]); }
-    usleep(200000);
+    oc_test_let_time_pass(200);   /* settle before measuring: a benchmark's pause, not a wait on work */
     oc_netloop_stats_reset();
     __atomic_store_n(&g_gate, 1, __ATOMIC_RELEASE);
     int ok = 0;
@@ -323,7 +325,7 @@ static void *bf_client(void *vp) {
     bclient c;
     if (bc_open(&c, 100) != 0 || bc_login(&c, a->idx) != 0) { bc_close(&c); return NULL; }
     __atomic_add_fetch(&g_ready_n, 1, __ATOMIC_ACQ_REL);
-    while (!__atomic_load_n(&g_gate, __ATOMIC_ACQUIRE)) usleep(1000);
+    (void)WAIT_UNTIL(__atomic_load_n(&g_gate, __ATOMIC_ACQUIRE), 600000);
     uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
     oc_cursor cur = { OC_DEFAULT_CHANNEL, 1 };
     oc_backfill_request req = { 1, &cur };
@@ -361,15 +363,15 @@ static void run_backfill(oc_dbwriter *dbw, int clients, int msgs, size_t body) {
         }
         free(big);
         seeded = 1;
-        usleep(2000000);   /* the writer commits them; nothing is waiting on the results */
+        oc_test_let_time_pass(2000);   /* the writer commits them; nothing is waiting on the results */
     }
     samples s; samples_init(&s);
     bf_arg *args = calloc((size_t)clients, sizeof *args);
     pthread_t *th = calloc((size_t)clients, sizeof *th);
     g_gate = 0; g_ready_n = 0;
     for (int i = 0; i < clients; i++) { args[i] = (bf_arg){ 20 + i, &s, 0, 0, 0 }; pthread_create(&th[i], NULL, bf_client, &args[i]); }
-    for (int i = 0; i < 3000 && __atomic_load_n(&g_ready_n, __ATOMIC_ACQUIRE) < clients; i++) usleep(10000);
-    usleep(200000);
+    (void)WAIT_UNTIL(__atomic_load_n(&g_ready_n, __ATOMIC_ACQUIRE) >= clients, 30000);
+    oc_test_let_time_pass(200);   /* settle before measuring: a benchmark's pause, not a wait on work */
     oc_netloop_stats_reset();
     __atomic_store_n(&g_gate, 1, __ATOMIC_RELEASE);
     int ok = 0, closed = 0, frames = 0;
@@ -433,8 +435,8 @@ static void *call_tx(void *vp) {
     /* The relay learns the address from the first packet. */
     pkt[a->tlen] = 0; pkt[a->tlen + 1] = 0;
     sendto(a->udp, pkt, a->tlen + 2, 0, (struct sockaddr *)&relay, sizeof relay);
-    usleep(200000);
-    while (!__atomic_load_n(&g_gate, __ATOMIC_ACQUIRE)) usleep(1000);
+    oc_test_let_time_pass(200);   /* settle before measuring: a benchmark's pause, not a wait on work */
+    (void)WAIT_UNTIL(__atomic_load_n(&g_gate, __ATOMIC_ACQUIRE), 600000);
     uint64_t start = mono_us(), end = start + (uint64_t)a->secs * 1000000u;
     uint64_t next_a = start, next_v = start;
     while (mono_us() < end) {
@@ -453,7 +455,7 @@ static void *call_tx(void *vp) {
         }
         uint64_t nx = a->sharer && next_v < next_a ? next_v : next_a;
         uint64_t t = mono_us();
-        if (nx > t) usleep((useconds_t)(nx - t));
+        if (nx > t) usleep((useconds_t)(nx - t));   /* slow-on-purpose: the send rate a benchmark paces, in microseconds */
     }
     a->ok = 1;
     return NULL;
@@ -472,7 +474,7 @@ static void *call_tcp_main(void *vp) {
     oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
     oc_call_media_pkt ka = { 0, seq++, { NULL, 0 } };
     if (oc_encode_call_media_up(&w, OC_PROTOCOL_VERSION, &ka) == OC_OK) write_all(&a->c, frame, w.len);
-    while (!__atomic_load_n(&g_gate, __ATOMIC_ACQUIRE)) usleep(1000);
+    (void)WAIT_UNTIL(__atomic_load_n(&g_gate, __ATOMIC_ACQUIRE), 600000);
     uint64_t start = mono_us(), end = start + (uint64_t)a->secs * 1000000u;
     uint64_t next_a = start;
     while (mono_us() < end + 1000000u) {
@@ -530,8 +532,8 @@ static void run_call(int secs, int n_tcp) {
         pthread_create(&rx[i], NULL, call_rx, &ca[i]);
         pthread_create(&tx[i], NULL, call_tx, &ca[i]);
     }
-    for (int i = 0; i < 3000 && __atomic_load_n(&g_ready_n, __ATOMIC_ACQUIRE) < clients; i++) usleep(10000);
-    usleep(300000);
+    (void)WAIT_UNTIL(__atomic_load_n(&g_ready_n, __ATOMIC_ACQUIRE) >= clients, 30000);
+    oc_test_let_time_pass(300);   /* settle before measuring: a benchmark's pause, not a wait on work */
     oc_netloop_stats_reset();
     __atomic_store_n(&g_gate, 1, __ATOMIC_RELEASE);
     for (int i = 0; i < N_CALL; i++) if (ca[i].udp >= 0) { pthread_join(tx[i], NULL); if (!ca[i].tcp) pthread_join(rx[i], NULL); }
@@ -547,19 +549,29 @@ static void run_call(int secs, int n_tcp) {
 
 /* --- the daemon, in this process ------------------------------------------- */
 
-struct loop_arg { oc_tls_server *srv; oc_dbwriter *dbw; volatile sig_atomic_t stop; };
+struct loop_arg { oc_tls_server *srv; oc_dbwriter *dbw; volatile sig_atomic_t stop; oc_netloop_view view; };
 static volatile int g_up;
-static void on_ready(void *ctx) { (void)ctx; __atomic_store_n(&g_up, 1, __ATOMIC_RELEASE); }
+/* Ready: the listener is bound, on the port the kernel gave it (the view says
+ * which) -- so no range of ports is shared with the suites, or another run. */
+static void on_ready(void *ctx) {
+    struct loop_arg *a = ctx;
+    g_port = __atomic_load_n(&a->view.proto_port, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&g_up, 1, __ATOMIC_RELEASE);
+}
 static void *loop_thread(void *p) {
     struct loop_arg *a = p;
-    oc_netloop_run(g_port, a->srv, a->dbw, &a->stop);
+    oc_netloop_run_ex(0, a->srv, a->dbw, &a->stop, &a->view);
     return NULL;
 }
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
-    mkdir("build/bench_data", 0700);
-    setenv("OPENCHIME_DATA_DIR", "build/bench_data", 1);
+    char dir[512], data[600], db[600];
+    if (oc_test_mkdtemp("bench-loop", dir, sizeof dir) != 0) { fprintf(stderr, "no directory under $TMPDIR\n"); return 1; }
+    oc_test_path(data, sizeof data, dir, "data");
+    oc_test_path(db, sizeof db, dir, "bench_loop.db");
+    mkdir(data, 0700);
+    setenv("OPENCHIME_DATA_DIR", data, 1);
     setenv("OPENCHIME_DEV_CONNS_PER_IP", "0", 1);
     char cfgerr[128];
     if (oc_config_load(cfgerr, sizeof cfgerr) != 0) { fprintf(stderr, "config: %s\n", cfgerr); return 1; }
@@ -575,8 +587,6 @@ int main(int argc, char **argv) {
     g_audio_port = ntohs(ua.sin_port);
     oc_netloop_set_audio(udp, g_audio_port);   /* the loop's relay runs on it */
 
-    const char *db = "build/bench_loop.db";
-    unlink(db); unlink("build/bench_loop.db-wal"); unlink("build/bench_loop.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start(db);
     if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
     if (!dbw) { fprintf(stderr, "db start failed\n"); return 1; }
@@ -587,11 +597,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    g_port = 17000 + (int)(getpid() % 900);
-    struct loop_arg la = { &srv, dbw, 0 };
-    oc_netloop_set_ready(on_ready, NULL);
+    static struct loop_arg la;
+    la.srv = &srv; la.dbw = dbw;
+    oc_netloop_set_ready(on_ready, &la);
     pthread_t lth; pthread_create(&lth, NULL, loop_thread, &la);
-    for (int i = 0; i < 500 && !__atomic_load_n(&g_up, __ATOMIC_ACQUIRE); i++) usleep(10000);
+    (void)WAIT_UNTIL(__atomic_load_n(&g_up, __ATOMIC_ACQUIRE), 5000);
     if (!g_up) { fprintf(stderr, "the loop did not come up\n"); return 1; }
 
     const char *all[] = { "chat", "fanout", "storm", "backfill", "call", "call-tcp" };
@@ -613,5 +623,6 @@ int main(int argc, char **argv) {
     close(udp);
     oc_dbwriter_stop(dbw);
     oc_tls_server_free(&srv);
+    oc_test_rmtree(dir);
     return 0;
 }

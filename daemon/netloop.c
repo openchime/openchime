@@ -745,12 +745,15 @@ static void live_compact(void) {
 /* Called only from accept, never inside a walk, which is what makes compacting
  * here safe. There are at most OC_NETLOOP_MAX_FD connections, so a compacted
  * list always has room. */
+static __thread oc_netloop_view *g_view;   /* this loop's, or NULL (netloop.h) */
+
 static int index_add(conn *c) {
     if (g_nlive == OC_LIVE_CAP) live_compact();
     if (g_nlive == OC_LIVE_CAP || oc_idmap_put(&g_by_id, c->conn_id, c) != 0) return -1;
     c->live_idx = g_nlive;
     g_live[g_nlive++] = c;
     src_count_add(c);
+    if (g_view) __atomic_add_fetch(&g_view->open_conns, 1, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -781,6 +784,7 @@ static void user_link(conn *c) {
 }
 
 static void index_remove(conn *c) {
+    if (g_view) __atomic_sub_fetch(&g_view->open_conns, 1, __ATOMIC_RELEASE);
     src_count_del(c);
     user_unlink(c);
     oc_idmap_del(&g_by_id, c->conn_id);
@@ -1777,7 +1781,7 @@ static void call_finish(int ep, conn **conns, call_t *c) {
     for (int k = 0; k < done.n; k++) audio_revoke(done.parts[k].token);
     call_send_state(ep, conns, &done, 1);
     if (!done.others_joined && done.invited_any && g_call_dbw) {
-        static const char text[] = "Missed call";
+        static const char text[] = OC_CALL_MISSED_TEXT;
         uint8_t *body = malloc(sizeof text - 1);
         oc_job *j = body ? oc_job_new(OC_JOB_CALL_EVENT, 0) : NULL;
         if (j) {
@@ -4577,7 +4581,7 @@ static const char LANDING_BODY[] =
     "</style>\n"
     "</head>\n"
     "<body>\n"
-    "<main>\n"
+    "<main data-oc-page=\"landing\">\n"
     "<h1>OpenChime</h1>\n"
     "<p>An OpenChime workspace is running here.</p>\n"
     "<p>This address speaks the OpenChime protocol. Open it in an OpenChime client "
@@ -4898,7 +4902,7 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     if (!post && kind == OC_PAGE_SIGNIN && w->invite[0]) kind = w->kind = OC_PAGE_SIGNUP;
     const char *wsname = oc_config_get()->workspace_name;
     oc_page pg = { .kind = kind, .redirect_uri = w->redirect_uri, .nonce = w->nonce,
-                   .username = w->username, .invite = w->invite, .message = "", .done = w->done,
+                   .username = w->username, .invite = w->invite, .done = w->done,
                    .workspace = wsname };
     if (!post) { web_page(c, 200, &pg); free(w); return -1; }
 
@@ -4906,13 +4910,14 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     oc_job *j = NULL;
     char norm[OC_PW_NORM_MAX];
     if (kind == OC_PAGE_SIGNUP || kind == OC_PAGE_PASSWORD) {
-        const char *np = pass, *why = NULL;
-        if (strcmp(np, confirm) != 0) { pg.message = "The two passwords don't match."; goto show; }
-        if (!np[0]) { pg.message = "Choose a password."; goto show; }
+        const char *np = pass;
+        if (strcmp(np, confirm) != 0) { pg.err = OC_PERR_PW_MISMATCH; goto show; }
+        if (!np[0]) { pg.err = OC_PERR_PW_EMPTY; goto show; }
         /* What a new password must be (pwpolicy.h); what is hashed is its
          * normalized form. */
-        if (oc_pw_acceptable(np, w->username, wsname, norm, sizeof norm, &why) != 0) { pg.message = why; goto show; }
-        if (strlen(norm) >= sizeof pass) { pg.message = "Use at most 128 characters."; goto show; }
+        oc_pw_verdict pv = oc_pw_check(np, w->username, wsname, norm, sizeof norm);
+        if (pv != OC_PW_OK) { pg.err = oc_page_err_pw(pv); goto show; }
+        if (strlen(norm) >= sizeof pass) { pg.err = OC_PERR_PW_LONG; goto show; }
         memcpy(pass, norm, strlen(norm) + 1);
     }
     /* A password presented to sign in is normalized the same way; one that
@@ -4929,7 +4934,7 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
         int demo = 0;
         if (hex_decode(w->invite, strlen(w->invite), raw, sizeof raw) != (int)sizeof raw) {
             demo = oc_config_get()->mode == OC_MODE_DEMO && is_compact_jws(w->invite);
-            if (!demo) { pg.message = "That invitation isn't valid."; goto show; }
+            if (!demo) { pg.err = OC_PERR_INVITE_INVALID; goto show; }
         }
         j = oc_job_new(OC_JOB_REDEEM, c->conn_id);
         if (!j || oc_job_set_register(j, w->username, pass, 0, 0) != 0 ||
@@ -4941,7 +4946,7 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
         const char *pw = kind == OC_PAGE_PASSWORD ? current : pass;
         uint8_t cbuf[1200]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
         if (oc_encode_local_credential(&cw, oc_slice_str(w->username), oc_slice_str(pw)) != OC_OK) {
-            pg.message = "The username or password is too long."; goto show;
+            pg.err = OC_PERR_CRED_TOO_LONG; goto show;
         }
         j = oc_job_new(OC_JOB_AUTH, c->conn_id);
         if (!j || oc_job_set_token(j, cbuf, cw.len) != 0) { oc_e2e_wipe(cbuf, sizeof cbuf); goto fail; }
@@ -4980,7 +4985,7 @@ out:
 static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
     char typed[64] = "", user[128] = "", pass[512] = "", action[16] = "";
     oc_page pg = { .kind = OC_PAGE_DEVICE, .redirect_uri = "", .nonce = "", .username = user,
-                   .invite = "", .message = "", .user_code = "" };
+                   .invite = "", .user_code = "" };
     if (field_get(q, "code", typed, sizeof typed) || field_get(q, "username", user, sizeof user) ||
         field_get(q, "password", pass, sizeof pass) || field_get(q, "action", action, sizeof action)) {
         size_t len; const char *b = oc_page_invalid(&len);
@@ -4993,14 +4998,14 @@ static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
     oc_source_key(c->source, key, sizeof key);
     uint64_t now = now_ms();
     if (g_device_rl && oc_ratelimit_blocked(g_device_rl, key, now)) {
-        pg.message = "Too many codes tried. Wait a minute and try again.";
+        pg.err = OC_PERR_DEVICE_LIMITED;
         web_page(c, 429, &pg);
         goto out;
     }
     oc_dev_info info;
     if (!g_devcodes || !oc_devcodes_find(g_devcodes, typed, now, &info)) {
         if (g_device_rl) oc_ratelimit_record(g_device_rl, key, now);
-        pg.message = "That code isn't one we're waiting for. Check it, or start again in your terminal.";
+        pg.err = OC_PERR_DEVICE_UNKNOWN;
         web_page(c, 200, &pg);
         goto out;
     }
@@ -5023,7 +5028,7 @@ static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
         oc_e2e_wipe(norm, sizeof norm);
     }
     if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass)) != OC_OK) {
-        pg.message = "The username or password is too long.";
+        pg.err = OC_PERR_CRED_TOO_LONG;
         web_page(c, 200, &pg);
         goto out;
     }
@@ -5127,7 +5132,7 @@ static int on_security_page(conn *c, int post, const char *q, oc_dbwriter *dbw) 
     char user[128] = "", pass[512] = "", ticket[OC_STEP_TICKET_LEN + 8] = "", code[64] = "", action[16] = "";
     static __thread char pk_cd[2800], pk_att[5600];
     oc_page pg = { .kind = OC_PAGE_SECURITY, .redirect_uri = "", .nonce = "", .username = user,
-                   .invite = "", .message = "", .user_code = "", .sec = OC_SEC_SIGNIN };
+                   .invite = "", .user_code = "", .sec = OC_SEC_SIGNIN };
     size_t len;
     int rc = -1;
     if (oc_dbwriter_local_mfa(dbw) == OC_MFA_OFF) {
@@ -5184,7 +5189,7 @@ static int on_security_page(conn *c, int post, const char *q, oc_dbwriter *dbw) 
         uint8_t cbuf[1200]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
         if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass)) != OC_OK) {
             free(w);
-            pg.message = "The username or password is too long.";
+            pg.err = OC_PERR_CRED_TOO_LONG;
             web_page(c, 200, &pg);
             goto out;
         }
@@ -5214,7 +5219,7 @@ out:
 static int on_reset_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
     char t[80] = "", pass[512] = "", confirm[512] = "", redirect[512] = "", nonce[48] = "";
     oc_page pg = { .kind = OC_PAGE_RESET, .redirect_uri = redirect, .nonce = nonce, .username = "",
-                   .invite = "", .message = "", .user_code = "", .reset = t };
+                   .invite = "", .user_code = "", .reset = t };
     size_t len;
     int rc = -1;
     /* Opened by the member's own client, the page carries that client's sign-in
@@ -5231,15 +5236,15 @@ static int on_reset_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
         goto out;
     }
     if (!post) { web_page(c, 200, &pg); goto out; }
-    if (strcmp(pass, confirm) != 0) { pg.message = "The two passwords don't match."; web_page(c, 200, &pg); goto out; }
-    if (!pass[0]) { pg.message = "Choose a password."; web_page(c, 200, &pg); goto out; }
+    if (strcmp(pass, confirm) != 0) { pg.err = OC_PERR_PW_MISMATCH; web_page(c, 200, &pg); goto out; }
+    if (!pass[0]) { pg.err = OC_PERR_PW_EMPTY; web_page(c, 200, &pg); goto out; }
     {
-        char norm[OC_PW_NORM_MAX]; const char *why = NULL;
-        int ok = oc_pw_acceptable(pass, NULL, oc_config_get()->workspace_name, norm, sizeof norm, &why) == 0 &&
-                 strlen(norm) < sizeof pass;
+        char norm[OC_PW_NORM_MAX];
+        oc_pw_verdict pv = oc_pw_check(pass, NULL, oc_config_get()->workspace_name, norm, sizeof norm);
+        int ok = pv == OC_PW_OK && strlen(norm) < sizeof pass;
         if (ok) memcpy(pass, norm, strlen(norm) + 1);
         oc_e2e_wipe(norm, sizeof norm);
-        if (!ok) { pg.message = why ? why : "Use at most 128 characters."; web_page(c, 200, &pg); goto out; }
+        if (!ok) { pg.err = pv != OC_PW_OK ? oc_page_err_pw(pv) : OC_PERR_PW_LONG; web_page(c, 200, &pg); goto out; }
     }
     web_req *w = calloc(1, sizeof *w);
     oc_job *j = w ? oc_job_new(OC_JOB_RESET_REDEEM, c->conn_id) : NULL;
@@ -5266,7 +5271,7 @@ out:
 /* The second step's page, answered (AUTH.md §8.6). */
 static void security_result(conn *c, web_req *w, const oc_dbres *r) {
     oc_page pg = { .kind = OC_PAGE_SECURITY, .redirect_uri = "", .nonce = "", .username = w->username,
-                   .invite = "", .message = "", .user_code = "", .ticket = w->step };
+                   .invite = "", .user_code = "", .ticket = w->step };
     if (r->type == OC_RES_WEB_SECURITY) {
         /* Past the password: a ticket for the code that comes next. */
         oc_step_ticket t;
@@ -5281,7 +5286,7 @@ static void security_result(conn *c, web_req *w, const oc_dbres *r) {
         oc_source_key(c->source, key, sizeof key);
         int put = g_websteps ? oc_websteps_put(g_websteps, key, &t, now_ms(), w->step) : -1;
         if (put != 0) {
-            pg.message = "Too many sign-ins are under way. Wait a minute and try again.";
+            pg.err = OC_PERR_STEPS_BUSY;
             web_page(c, 429, &pg);
             return;
         }
@@ -5352,16 +5357,16 @@ static void security_result(conn *c, web_req *w, const oc_dbres *r) {
     if (!w->step[0]) {
         /* The password, refused. */
         int status = r->err_code == OC_ERR_AUTH_RATE_LIMITED ? 429 : r->err_code == OC_ERR_INTERNAL ? 500 : 200;
-        pg.message = status == 429 ? "Too many attempts. Wait a minute and try again." :
-                     status == 500 ? "Something went wrong. Try again." :
-                                     "The username or password isn't right.";
+        pg.err = status == 429 ? OC_PERR_RATE_LIMITED :
+                     status == 500 ? OC_PERR_INTERNAL :
+                                     OC_PERR_BAD_CREDENTIALS;
         web_page(c, status, &pg);
         return;
     }
     int status = 200, left = 1;
-    pg.message = "That code isn't right.";
-    if (r->err_code == OC_ERR_AUTH_RATE_LIMITED) { status = 429; pg.message = "Too many wrong codes. Wait a few minutes and try again."; }
-    else if (r->err_code == OC_ERR_INTERNAL) { status = 500; pg.message = "Something went wrong. Try again."; }
+    pg.err = OC_PERR_CODE_WRONG;
+    if (r->err_code == OC_ERR_AUTH_RATE_LIMITED) { status = 429; pg.err = OC_PERR_CODE_LIMITED; }
+    else if (r->err_code == OC_ERR_INTERNAL) { status = 500; pg.err = OC_PERR_INTERNAL; }
     else left = g_websteps ? oc_websteps_fail(g_websteps, w->step, now_ms()) : 0;
     if (left <= 0) { size_t len; const char *b = oc_page_invalid(&len); web_reply(c, 400, b, len, NULL, NULL); return; }
     if (w->redirect_uri[0] == 'a') {
@@ -5375,10 +5380,10 @@ static void security_result(conn *c, web_req *w, const oc_dbres *r) {
     web_page(c, status, &pg);
 }
 
-/* The step page for `w`'s ticket, posting back to `action`, saying `msg`. */
-static void step_page(conn *c, int status, const web_req *w, const char *action, const char *msg) {
+/* The step page for `w`'s ticket, posting back to `action`, saying why (`err`). */
+static void step_page(conn *c, int status, const web_req *w, const char *action, oc_page_err err) {
     oc_page pg = { .kind = OC_PAGE_STEP, .redirect_uri = w->redirect_uri, .nonce = "", .username = "",
-                   .invite = "", .message = msg, .user_code = "", .ticket = w->step, .action = action };
+                   .invite = "", .err = err, .user_code = "", .ticket = w->step, .action = action };
     /* A passkey too, where the ticket was earned on a trusted name and the
      * account has one there (AUTH.md §8.6). */
     oc_step_ticket t;
@@ -5421,7 +5426,7 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
         return;
     }
     oc_page pg = { .kind = w->kind, .redirect_uri = w->redirect_uri, .nonce = w->nonce,
-                   .username = w->username, .invite = w->invite, .message = "", .user_code = w->user_code };
+                   .username = w->username, .invite = w->invite, .user_code = w->user_code };
     if (r->type == OC_RES_WEB_STEP2) {
         /* What the password proved, kept against a ticket for the step page --
          * which posts from the page it replaces, at that page's depth. */
@@ -5450,18 +5455,18 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
         oc_source_key(c->source, key, sizeof key);
         int put = g_websteps ? oc_websteps_put(g_websteps, key, &t, now_ms(), w->step) : -1;
         oc_e2e_wipe(&t, sizeof t);
-        if (put == 0) step_page(c, 200, w, w->kind == OC_PAGE_PASSWORD ? "../signin/verify" : "signin/verify", "");
-        else { pg.message = "Too many sign-ins are under way. Wait a minute and try again."; web_page(c, 429, &pg); }
+        if (put == 0) step_page(c, 200, w, w->kind == OC_PAGE_PASSWORD ? "../signin/verify" : "signin/verify", OC_PERR_NONE);
+        else { pg.err = OC_PERR_STEPS_BUSY; web_page(c, 429, &pg); }
         flush_out(c);
         conn_close(ep, conns, c->fd);
         return;
     }
     if (w->step[0] && r->type == OC_RES_WEB_ERR) {
         /* A wrong code: the step again while its ticket has tries left. */
-        const char *msg = "That code isn't right.";
+        oc_page_err msg = OC_PERR_CODE_WRONG;
         int status = 200, left = 1;
-        if (r->err_code == OC_ERR_AUTH_RATE_LIMITED) { status = 429; msg = "Too many wrong codes. Wait a few minutes and try again."; }
-        else if (r->err_code == OC_ERR_INTERNAL) { status = 500; msg = "Something went wrong. Try again."; }
+        if (r->err_code == OC_ERR_AUTH_RATE_LIMITED) { status = 429; msg = OC_PERR_CODE_LIMITED; }
+        else if (r->err_code == OC_ERR_INTERNAL) { status = 500; msg = OC_PERR_INTERNAL; }
         else left = g_websteps ? oc_websteps_fail(g_websteps, w->step, now_ms()) : 0;
         if (left > 0) step_page(c, status, w, "verify", msg);
         else { size_t len; const char *b = oc_page_invalid(&len); web_reply(c, 400, b, len, NULL, NULL); }
@@ -5494,9 +5499,9 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
             return;
         }
         if (r->type == OC_RES_WEB_OK) pg.done = 1;
-        else pg.message = r->err_code == OC_ERR_AUTH_INVALID_TOKEN
-                        ? "This reset isn't good any more: it was used, or a day has passed. Ask for another."
-                        : "Something went wrong. Try again.";
+        else pg.err = r->err_code == OC_ERR_AUTH_INVALID_TOKEN
+                        ? OC_PERR_RESET_SPENT
+                        : OC_PERR_INTERNAL;
         web_page(c, r->type == OC_RES_WEB_OK ? 200 : r->err_code == OC_ERR_INTERNAL ? 500 : 200, &pg);
         flush_out(c);
         conn_close(ep, conns, c->fd);
@@ -5511,7 +5516,7 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
         char tok[4096];
         snprintf(tok, sizeof tok, "%.*s", (int)r->body_len, r->body ? (const char *)r->body : "");
         if (oc_devcodes_approve(g_devcodes, w->user_code, tok, now_ms()) == 0) pg.done = 1;
-        else { pg.user_code = ""; pg.message = "That code has expired. Start again in your terminal."; }
+        else { pg.user_code = ""; pg.err = OC_PERR_DEVICE_EXPIRED; }
         oc_e2e_wipe(tok, sizeof tok);
         web_page(c, 200, &pg);
     } else if (r->type == OC_RES_WEB_OK && r->body && r->body_len) {
@@ -5534,19 +5539,18 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
             }
         }
         switch (r->err_code) {
-        case OC_ERR_AUTH_RATE_LIMITED: status = 429; pg.message = "Too many attempts. Wait a minute and try again."; break;
-        case OC_ERR_USER_LIMIT:        pg.message = "This workspace is full."; break;
+        case OC_ERR_AUTH_RATE_LIMITED: status = 429; pg.err = OC_PERR_RATE_LIMITED; break;
+        case OC_ERR_USER_LIMIT:        pg.err = OC_PERR_WORKSPACE_FULL; break;
         case OC_ERR_SIGNUP_LIMITED:
-            status = 429; pg.message = "Too many accounts were made from your address. Try again in an hour."; break;
+            status = 429; pg.err = OC_PERR_SIGNUP_LIMITED; break;
         case OC_ERR_AUTH_SETUP_REQUIRED:
-            pg.message = "This workspace requires two-step sign-in. Set it up on the Two-step sign-in page "
-                         "(below), then sign in.";
+            pg.err = OC_PERR_STEP_REQUIRED;
             break;
-        case OC_ERR_INTERNAL:          status = 500; pg.message = "Something went wrong. Try again."; break;
+        case OC_ERR_INTERNAL:          status = 500; pg.err = OC_PERR_INTERNAL; break;
         default:
-            pg.message = w->kind == OC_PAGE_SIGNUP   ? "That invitation isn't valid, or the username is taken." :
-                         w->kind == OC_PAGE_PASSWORD ? "The username or current password isn't right." :
-                                                       "The username or password isn't right.";
+            pg.err = w->kind == OC_PAGE_SIGNUP   ? OC_PERR_SIGNUP_REFUSED :
+                         w->kind == OC_PAGE_PASSWORD ? OC_PERR_BAD_CURRENT :
+                                                       OC_PERR_BAD_CREDENTIALS;
             break;
         }
         web_page(c, status, &pg);
@@ -8569,8 +8573,34 @@ static void loop_state_free(conn **conns) {
     free(g_pdms); g_pdms = NULL;
 }
 
+/* The port `fd` is bound to, or 0. */
+static int bound_port(int fd) {
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof ss;
+    if (getsockname(fd, (struct sockaddr *)&ss, &sl) != 0) return 0;
+    if (ss.ss_family == AF_INET6) return ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+    if (ss.ss_family == AF_INET) return ntohs(((struct sockaddr_in *)&ss)->sin_port);
+    return 0;
+}
+
+static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw, volatile sig_atomic_t *stop);
+
 int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                    volatile sig_atomic_t *stop) {
+    return oc_netloop_run_ex(port, tls, dbw, stop, NULL);
+}
+
+int oc_netloop_run_ex(int port, oc_tls_server *tls, oc_dbwriter *dbw,
+                      volatile sig_atomic_t *stop, oc_netloop_view *view) {
+    g_view = view;
+    int rc = netloop_serve(port, tls, dbw, stop);
+    g_view = NULL;
+    if (view) __atomic_store_n(&view->ended, 1, __ATOMIC_RELEASE);
+    return rc;
+}
+
+static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
+                         volatile sig_atomic_t *stop) {
     conn **conns = calloc(OC_NETLOOP_MAX_FD, sizeof *conns);
     /* The loop's own state (ARCH-22): a process may run more than one loop --
      * the test suites do -- and each has its own calls, encoders and timers. */
@@ -8615,6 +8645,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         NETLOOP_FAIL("setting the listening socket non-blocking");
         close(lfd); loop_state_free(conns); return -1;
     }
+    if (g_view) __atomic_store_n(&g_view->proto_port, bound_port(lfd), __ATOMIC_RELEASE);
 
     int ep = epoll_create1(0);
     if (ep < 0) { NETLOOP_FAIL("epoll_create1"); close(lfd); loop_state_free(conns); return -1; }
@@ -8785,6 +8816,8 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
             if (hfd >= 0) close(hfd);
             hfd = -1;
         } else {
+            if (hport == 0) hport = bound_port(hfd);
+            if (g_view) __atomic_store_n(&g_view->health_port, hport, __ATOMIC_RELEASE);
             fprintf(stderr, "openchimed: healthz listening on :%d\n", hport);
         }
     }
@@ -8958,7 +8991,10 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
 
         /* Call media, bounded like everything else, so a burst of it cannot keep
          * the turn from ending: what is left is relayed next turn, first. */
-        if (relay_more) relay_more = oc_relay_on_readable(g_relay, OC_RELAY_BUDGET);
+        if (relay_more) {
+            relay_more = oc_relay_on_readable(g_relay, OC_RELAY_BUDGET);
+            if (g_view) __atomic_store_n(&g_view->relay_received, oc_relay_received(g_relay), __ATOMIC_RELEASE);
+        }
 
         /* Results, bounded: what is left waits for the next turn, which then does
          * not sleep (db_more / xfer_more). */

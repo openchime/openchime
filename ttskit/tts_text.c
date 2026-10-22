@@ -18,15 +18,23 @@ struct tts {
  * present but unreadable is an error, not an absence: silently guessing every word
  * would sound wrong with nothing saying why. */
 static tts *load(const char *lex_name, const tts_map *lex_mem, const char *guess_name, const tts_map *guess_mem,
-                 const char *want, char *err, size_t errcap) {
+                 const char *want, tts_status *st, char *err, size_t errcap) {
+    tts_status dummy;
+    if (!st) st = &dummy;
+    *st = TTS_LOADED;
     tts *t = calloc(1, sizeof *t);
-    if (!t) { tts_seterr(err, errcap, "out of memory"); return NULL; }
+    if (!t) { *st = TTS_REFUSED_NOMEM; tts_seterr(err, errcap, "out of memory"); return NULL; }
     char why[256] = "";
-    t->have_lex = tts_lexicon_open(lex_name, lex_mem, &t->lex, why, sizeof why) == 0;
-    if (!t->have_lex && (lex_mem || strstr(why, "cannot map") == NULL)) { tts_seterr(err, errcap, "%s", why); free(t); return NULL; }
+    int rc = tts_lexicon_open(lex_name, lex_mem, &t->lex, why, sizeof why);
+    t->have_lex = rc == 0;
+    if (!t->have_lex && (lex_mem || rc != TTS_OPEN_ABSENT)) {
+        *st = TTS_REFUSED_DAMAGED; tts_seterr(err, errcap, "%s", why); free(t); return NULL;
+    }
     why[0] = '\0';
-    t->have_guess = tts_guesser_open(guess_name, guess_mem, &t->guess, why, sizeof why) == 0;
-    if (!t->have_guess && (guess_mem || strstr(why, "cannot map") == NULL)) {
+    rc = tts_guesser_open(guess_name, guess_mem, &t->guess, why, sizeof why);
+    t->have_guess = rc == 0;
+    if (!t->have_guess && (guess_mem || rc != TTS_OPEN_ABSENT)) {
+        *st = TTS_REFUSED_DAMAGED;
         tts_seterr(err, errcap, "%s", why);
         if (t->have_lex) tts_lexicon_close(&t->lex);
         free(t);
@@ -36,17 +44,14 @@ static tts *load(const char *lex_name, const tts_map *lex_mem, const char *guess
     /* The language gate. Two files that disagree, or that are not the language
      * asked for, are refused here rather than mixed: a lexicon from one language
      * and a guesser from another do not fail as they are used -- they pronounce
-     * fluent nonsense, and nothing downstream can tell.
-     *
-     * The wording matters. A message containing "cannot map" is read above as
-     * "this file is simply absent", which is tolerated on the disk path, so a
-     * mismatch worded that way would load as half a kit and say nothing. */
+     * fluent nonsense, and nothing downstream can tell. */
     const char *lex_lang = t->have_lex ? t->lex.lang : NULL;
     const char *gs_lang  = t->have_guess ? t->guess.lang : NULL;
     const char *got = lex_lang ? lex_lang : gs_lang;
     int bad = (lex_lang && gs_lang && strcmp(lex_lang, gs_lang) != 0) ||
               (want && *want && got && strcmp(got, want) != 0);
     if (bad) {
+        *st = TTS_REFUSED_LANG;
         if (lex_lang && gs_lang && strcmp(lex_lang, gs_lang) != 0)
             tts_seterr(err, errcap, "%s is for %s but %s is for %s", lex_name, lex_lang, guess_name, gs_lang);
         else
@@ -60,17 +65,21 @@ static tts *load(const char *lex_name, const tts_map *lex_mem, const char *guess
     return t;
 }
 
-tts *tts_load(const char *dir, const char *lang, char *err, size_t errcap) {
+tts *tts_load_ex(const char *dir, const char *lang, tts_status *st, char *err, size_t errcap) {
     char lex[1024], guess[1024];
     snprintf(lex, sizeof lex, "%s/lexicon.bin", dir ? dir : ".");
     snprintf(guess, sizeof guess, "%s/guesses.bin", dir ? dir : ".");
-    return load(lex, NULL, guess, NULL, lang, err, errcap);
+    return load(lex, NULL, guess, NULL, lang, st, err, errcap);
+}
+
+tts *tts_load(const char *dir, const char *lang, char *err, size_t errcap) {
+    return tts_load_ex(dir, lang, NULL, err, errcap);
 }
 
 tts *tts_load_mem(const void *lexicon, size_t lexicon_len, const void *guesses, size_t guesses_len,
                   const char *lang, char *err, size_t errcap) {
     tts_map lm = { lexicon, lexicon_len, 0 }, gm = { guesses, guesses_len, 0 };
-    return load("lexicon.bin", &lm, "guesses.bin", &gm, lang, err, errcap);
+    return load("lexicon.bin", &lm, "guesses.bin", &gm, lang, NULL, err, errcap);
 }
 
 const char *tts_lang(const tts *t) { return t ? t->lang : ""; }

@@ -4,6 +4,7 @@
  * guesser against Phonetisaurus's own decoder, damaged data refused, and the
  * IPA turned into the voice model's token ids (daemon/tts_kitten_tokens.c). */
 #include "check.h"
+#include "testenv.h"
 #include "ttskit.h"
 #include "tts_priv.h"
 #include "tts_kitten.h"
@@ -15,8 +16,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define DATA "ttskit/data/en-US"
 #define LANG "en-US"
+
+/* The tree's data, found from the binary (tests/testenv.h), so the suite runs
+ * from any working directory. */
+static char g_data[1024];
+#define DATA g_data
+static const char *data_file(const char *name, char *out, size_t cap) {
+    snprintf(out, cap, "%s/%s", g_data, name);
+    return out;
+}
 
 /* The committed data files. Regenerating them (scripts/build/ttskit_data.sh)
  * changes these, the reference output below and TTSKIT.md §8 together. */
@@ -79,8 +88,9 @@ static int guess_agreement(int step, int *total) {
     tts_guesser g;
     char err[256];
     *total = 0;
-    if (tts_guesser_open(DATA "/guesses.bin", NULL, &g, err, sizeof err) != 0) { printf("    %s\n", err); return 0; }
-    FILE *f = fopen("tests/data/ttskit_guess_ref.txt", "r");
+    char gp[1100], ref[1024];
+    if (tts_guesser_open(data_file("guesses.bin", gp, sizeof gp), NULL, &g, err, sizeof err) != 0) { printf("    %s\n", err); return 0; }
+    FILE *f = fopen(oc_test_tree_path("tests/data/ttskit_guess_ref.txt", ref, sizeof ref), "r");
     if (!f) { tts_guesser_close(&g); return 0; }
     char line[512], out[256];
     int same = 0, k = 0;
@@ -120,23 +130,25 @@ static unsigned char *slurp(const char *path, size_t *n) {
 }
 
 /* Damaged data: a file that is present but wrong refuses to load, so a bad
- * install fails loudly instead of guessing every word. */
+ * install fails loudly instead of guessing every word -- refused for what it
+ * is (`want`), never taken for a file that is simply absent, which the disk
+ * path tolerates and would load as half a kit in silence. */
 static int refused(const char *dir, const char *name, const unsigned char *p, size_t n,
-                   const char *lang) {
+                   const char *lang, tts_status want) {
     char path[512], err[256] = "";
     snprintf(path, sizeof path, "%s/%s", dir, name);
     put(path, p, n);
-    tts *t = tts_load(dir, lang, err, sizeof err);
+    tts_status st = TTS_LOADED;
+    tts *t = tts_load_ex(dir, lang, &st, err, sizeof err);
     unlink(path);
     if (t) { tts_free(t); return 0; }
-    /* The reason must be said. A refusal whose message reads as "the file is
-     * simply absent" is tolerated on the disk path (ttskit/tts_text.c), which
-     * would load half a kit in silence. */
-    return err[0] != '\0' && strstr(err, "cannot map") == NULL;
+    if (st != want) printf("    %s: refused as %d, wanted %d (%s)\n", name, (int)st, (int)want, err);
+    return st == want && err[0] != '\0';
 }
 
 int run_ttskit_tests(void) {
     printf("test_ttskit: IPA table, normalization, lexicon, guesser, spelling, sentences, pins, agreement, damaged data\n");
+    oc_test_tree_path("ttskit/data/en-US", g_data, sizeof g_data);
 
     /* The ARPAbet->IPA table and its context rules (TTSKIT.md §3). */
     CHECK(ipa_is("M AY0 G R EY1 SH AH0 N", 0, "maɪɡɹˈeɪʃən"));
@@ -212,8 +224,9 @@ int run_ttskit_tests(void) {
     tts_free(t);
 
     /* The committed data is the data that was measured. */
-    CHECK(sha256_is(DATA "/lexicon.bin", LEXICON_SHA256));
-    CHECK(sha256_is(DATA "/guesses.bin", GUESSES_SHA256));
+    char lp0[1100], gp0[1100];
+    CHECK(sha256_is(data_file("lexicon.bin", lp0, sizeof lp0), LEXICON_SHA256));
+    CHECK(sha256_is(data_file("guesses.bin", gp0, sizeof gp0), GUESSES_SHA256));
 
     /* The C decoder finds Phonetisaurus's best path. One word in the reference
      * ("doman") has two paths within rounding of each other; allow one in 1,000. */
@@ -225,23 +238,23 @@ int run_ttskit_tests(void) {
     if (same != total) printf("    guesser agrees on %d of %d words\n", same, total);
 
     /* Damaged files are refused, each in a directory of its own. */
-    char dir[] = "/tmp/oc-ttskit-XXXXXX";
-    CHECK(mkdtemp(dir) != NULL);
+    char dir[256];
+    CHECK(oc_test_mkdtemp("ttskit", dir, sizeof dir) == 0);
     size_t ln = 0, gn = 0;
-    unsigned char *lex = slurp(DATA "/lexicon.bin", &ln), *gs = slurp(DATA "/guesses.bin", &gn);
+    unsigned char *lex = slurp(data_file("lexicon.bin", lp0, sizeof lp0), &ln), *gs = slurp(data_file("guesses.bin", gp0, sizeof gp0), &gn);
     CHECK(lex && gs && ln > 64 && gn > 64);
     if (lex && gs && ln > 64 && gn > 64) {
-        CHECK(refused(dir, "lexicon.bin", lex, ln / 2, LANG));                 /* truncated */
-        CHECK(refused(dir, "guesses.bin", gs, gn / 2, LANG));
-        CHECK(refused(dir, "lexicon.bin", (const unsigned char *)"short", 5, LANG));
+        CHECK(refused(dir, "lexicon.bin", lex, ln / 2, LANG, TTS_REFUSED_DAMAGED));                 /* truncated */
+        CHECK(refused(dir, "guesses.bin", gs, gn / 2, LANG, TTS_REFUSED_DAMAGED));
+        CHECK(refused(dir, "lexicon.bin", (const unsigned char *)"short", 5, LANG, TTS_REFUSED_DAMAGED));
         memcpy(lex, "OCTTSGS1", 8);                                             /* wrong magic */
-        CHECK(refused(dir, "lexicon.bin", lex, ln, LANG));
+        CHECK(refused(dir, "lexicon.bin", lex, ln, LANG, TTS_REFUSED_DAMAGED));
         memcpy(lex, TTS_LEX_MAGIC, 8);
         lex[8] = TTS_LEX_VERSION + 1;                                           /* a later version */
-        CHECK(refused(dir, "lexicon.bin", lex, ln, LANG));
+        CHECK(refused(dir, "lexicon.bin", lex, ln, LANG, TTS_REFUSED_DAMAGED));
         lex[8] = TTS_LEX_VERSION;
         gs[8] = TTS_GS_VERSION + 1;
-        CHECK(refused(dir, "guesses.bin", gs, gn, LANG));
+        CHECK(refused(dir, "guesses.bin", gs, gn, LANG, TTS_REFUSED_DAMAGED));
         gs[8] = TTS_GS_VERSION;
 
         /* A pair that is not the language asked for, and a pair that disagrees
@@ -249,7 +262,7 @@ int run_ttskit_tests(void) {
          * fails as it is used: a lexicon of one language with a guesser of
          * another pronounces fluent nonsense and nothing downstream can tell. */
         memcpy(lex + 32, "de-DE", 6);
-        CHECK(refused(dir, "lexicon.bin", lex, ln, LANG));          /* wrong language */
+        CHECK(refused(dir, "lexicon.bin", lex, ln, LANG, TTS_REFUSED_LANG));          /* wrong language */
         {
             /* A pair that disagrees with ITSELF, which needs both files present:
              * refused() places one at a time, and one file alone has nothing to
@@ -260,19 +273,20 @@ int run_ttskit_tests(void) {
             snprintf(gp, sizeof gp, "%s/guesses.bin", dir);
             put(lp, lex, ln);                                        /* de-DE */
             put(gp, gs, gn);                                         /* en-US */
-            tts *mixed = tts_load(dir, NULL, err2, sizeof err2);
-            CHECK(mixed == NULL && err2[0] && strstr(err2, "cannot map") == NULL);
+            tts_status st = TTS_LOADED;
+            tts *mixed = tts_load_ex(dir, NULL, &st, err2, sizeof err2);
+            CHECK(mixed == NULL && st == TTS_REFUSED_LANG && err2[0]);
             tts_free(mixed);
             unlink(lp);
             unlink(gp);
         }
         memcpy(lex + 32, LANG, strlen(LANG) + 1);
         memcpy(gs + 64, "de-DE", 6);
-        CHECK(refused(dir, "guesses.bin", gs, gn, LANG));
+        CHECK(refused(dir, "guesses.bin", gs, gn, LANG, TTS_REFUSED_LANG));
         memcpy(gs + 64, LANG, strlen(LANG) + 1);
         /* An unterminated tag is corruption, not a very long name. */
         memset(lex + 32, 'x', 16);
-        CHECK(refused(dir, "lexicon.bin", lex, ln, NULL));
+        CHECK(refused(dir, "lexicon.bin", lex, ln, NULL, TTS_REFUSED_DAMAGED));
         memcpy(lex + 32, LANG, strlen(LANG) + 1);
         memset(lex + 32 + strlen(LANG) + 1, 0, 16 - strlen(LANG) - 1);
     }
@@ -295,6 +309,6 @@ int run_ttskit_tests(void) {
     }
     free(lex);
     free(gs);
-    rmdir(dir);
+    oc_test_rmtree(dir);
     return failures;
 }

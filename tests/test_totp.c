@@ -3,6 +3,7 @@
  * without the factor key and to any other account. */
 
 #include "check.h"
+#include "testenv.h"
 #include "../daemon/totp.h"
 
 #include <stdio.h>
@@ -68,8 +69,10 @@ int run_totp_tests(void) {
     /* The factor key file: made once, mode 0600, then read back the same; a file
      * that is not a key is refused rather than used. */
     {
-        const char *path = "build/test_totp_factor.key";
-        unlink(path);
+        char dir[512], path[700], absent[700];
+        CHECK(oc_test_mkdtemp("totp", dir, sizeof dir) == 0);
+        oc_test_path(path, sizeof path, dir, "factor.key");
+        oc_test_path(absent, sizeof absent, dir, "no-such-dir/factor.key");
         char why[256];
         uint8_t k1[OC_FACTOR_KEY_LEN], k2[OC_FACTOR_KEY_LEN];
         CHECK(oc_factor_key_load(path, k1, why, sizeof why) == 1);
@@ -80,7 +83,8 @@ int run_totp_tests(void) {
         if (f) { fputc('x', f); fclose(f); }
         CHECK(oc_factor_key_load(path, k2, why, sizeof why) == -1 && why[0]);
         unlink(path);
-        CHECK(oc_factor_key_load("build/no-such-dir/factor.key", k2, why, sizeof why) == -1);
+        CHECK(oc_factor_key_load(absent, k2, why, sizeof why) == -1);
+        oc_test_rmtree(dir);
     }
     return failures;
 }

@@ -28,6 +28,49 @@ typedef enum {
     OC_SEC_PASSKEY_DONE  /* a passkey added */
 } oc_sec_screen;
 
+/* Why a form is back: a stable kind, rendered as the message's
+ * data-oc-error="<code>" beside its sentence, so a client or a test reads the
+ * outcome from the attribute and never from the words, which may be reworded. */
+typedef enum {
+    OC_PERR_NONE = 0,
+    OC_PERR_PW_MISMATCH,        /* the two new passwords differ */
+    OC_PERR_PW_EMPTY,
+    OC_PERR_PW_CHARS,           /* pwpolicy.h's refusals, one each */
+    OC_PERR_PW_SHORT,
+    OC_PERR_PW_LONG,
+    OC_PERR_PW_COMMON,
+    OC_PERR_PW_PERSONAL,
+    OC_PERR_INVITE_INVALID,     /* not an invitation's shape */
+    OC_PERR_SIGNUP_REFUSED,     /* the invitation, or the username taken: never which */
+    OC_PERR_CRED_TOO_LONG,
+    OC_PERR_BAD_CREDENTIALS,    /* username or password: never which */
+    OC_PERR_BAD_CURRENT,        /* username or current password: never which */
+    OC_PERR_RATE_LIMITED,       /* too many attempts from here */
+    OC_PERR_SIGNUP_LIMITED,     /* too many accounts from here */
+    OC_PERR_WORKSPACE_FULL,
+    OC_PERR_STEP_REQUIRED,      /* the workspace requires two-step sign-in */
+    OC_PERR_STEPS_BUSY,         /* too many sign-ins under way */
+    OC_PERR_CODE_WRONG,         /* a second step's code */
+    OC_PERR_CODE_LIMITED,       /* too many wrong codes */
+    OC_PERR_DEVICE_LIMITED,     /* too many device codes tried */
+    OC_PERR_DEVICE_UNKNOWN,     /* a device code not pending */
+    OC_PERR_DEVICE_EXPIRED,
+    OC_PERR_RESET_SPENT,        /* a reset used, or a day old */
+    OC_PERR_INTERNAL,
+    OC_PERR_COUNT
+} oc_page_err;
+
+/* The kind's code ("pw-mismatch", ...), stable; "" for OC_PERR_NONE. */
+const char *oc_page_err_code(oc_page_err e);
+/* The sentence the form shows for it; "" for OC_PERR_NONE. */
+const char *oc_page_err_text(oc_page_err e);
+/* pwpolicy.h's refusal as the page's kind. */
+oc_page_err oc_page_err_pw(int pw_verdict);
+
+/* Every rendered page names itself in <main data-oc-page="<screen>">, and one
+ * that reports an outcome adds data-oc-result="<outcome>": the stable markers
+ * a client or a test reads a state by. The codes are oc_page_screen's. */
+
 typedef struct {
     oc_page_kind kind;
     const char  *redirect_uri;   /* SIGNIN/SIGNUP: where the token goes; "" otherwise */
@@ -35,7 +78,7 @@ typedef struct {
     const char  *username;       /* prefilled, or "" */
     const char  *invite;         /* SIGNUP: the invitation, prefilled, or "" */
     const char  *workspace;      /* SIGNIN/SIGNUP: the workspace's name, or NULL/"" */
-    const char  *message;        /* why the form is back, or "" */
+    oc_page_err  err;            /* why the form is back, or OC_PERR_NONE */
     int          done;           /* PASSWORD: it was changed. DEVICE: approved.
                                   * SIGNIN: a new password was just set */
     /* DEVICE (AUTH.md §8.11): the code, once one is found -- "" asks for it --
@@ -67,11 +110,17 @@ typedef struct {
     const char  *pk_challenge, *pk_rp, *pk_creds, *pk_user, *pk_name;
 } oc_page;
 
+/* The page's data-oc-page and data-oc-result values (the latter "" when the
+ * page reports no outcome). */
+const char *oc_page_screen(const oc_page *p);
+const char *oc_page_result(const oc_page *p);
+
 /* The page, malloc'd, its length in *len. NULL on no memory. */
 char *oc_page_render(const oc_page *p, size_t *len);
 
 /* The page for a link that is not a sign-in's (no loopback redirect, no
- * challenge), or for a workspace whose accounts are not local. Static. */
+ * challenge), or for a workspace whose accounts are not local. Static; their
+ * <body> carries data-oc-page="invalid" and data-oc-page="unavailable". */
 const char *oc_page_invalid(size_t *len);
 const char *oc_page_unavailable(size_t *len);
 
