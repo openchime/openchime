@@ -2787,16 +2787,9 @@ static void test_web_signin(void) {
     {
         char *k = NULL, *iss = NULL;
         CHECK(oc_local_issuer_generate(&k, &iss) == 0);
-        sqlite3 *db = NULL;
         char real_iss[128] = "";
-        if (sqlite3_open(tpath("itest_web.db"), &db) == SQLITE_OK) {
-            sqlite3_stmt *st = NULL;
-            if (sqlite3_prepare_v2(db, "SELECT issuer FROM local_issuer WHERE id=1;", -1, &st, NULL) == SQLITE_OK &&
-                sqlite3_step(st) == SQLITE_ROW)
-                snprintf(real_iss, sizeof real_iss, "%s", (const char *)sqlite3_column_text(st, 0));
-            sqlite3_finalize(st);
-        }
-        sqlite3_close(db);
+        const char *li = oc_dbwriter_local_issuer_name(dbw2);
+        if (li) snprintf(real_iss, sizeof real_iss, "%s", li);
         CHECK(real_iss[0] != '\0');
         oc_local_issuer *other = oc_local_issuer_open(k, real_iss);
         CHECK(other != NULL);

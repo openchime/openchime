@@ -303,6 +303,35 @@ int run_blob_s3_tests(void) {
     CHECK(strstr(f->last_auth, "Signature=") != NULL);
     CHECK(strcmp(f->last_sha_hdr, "UNSIGNED-PAYLOAD") == 0);
 
+    /* With a prefix, the keys go under it, and still round-trip. */
+    {
+        g_s3cfg.prefix = "ws-1/data/2";
+        oc_blobstore *pb = oc_blobstore_open(fsdir, &g_s3cfg);
+        CHECK(pb != NULL);
+        if (pb) {
+            round_trip(pb, f, "cccc0001", 1000, 4096);
+            CHECK(strncmp(f->last_uri, "/testbucket/ws-1/data/2/cccc0001", 32) == 0);
+
+            /* Blobs a local store left behind move into it once, and go. */
+            char local[800];
+            mkdir(fsdir, 0700);
+            snprintf(local, sizeof local, "%s/dddd0001", fsdir);
+            FILE *lf = fopen(local, "wb");
+            CHECK(lf != NULL);
+            if (lf) { fputs("kept on disk before", lf); fclose(lf); }
+            int moved = -1, failed = -1;
+            CHECK(oc_blobstore_take_local(pb, fsdir, &moved, &failed) == 0);
+            CHECK(moved == 1 && failed == 0);
+            CHECK(access(local, F_OK) != 0);
+            uint64_t sz = 0;
+            oc_blob_reader *r = oc_blob_get_begin(pb, "dddd0001", &sz);
+            CHECK(r != NULL && sz == 19);
+            if (r) oc_blob_get_close(r);
+            oc_blobstore_close(pb);
+        }
+        g_s3cfg.prefix = NULL;
+    }
+
     /* Delete, then confirm the object is really gone (the fake 404s). */
     CHECK(oc_blob_delete(bs, "aaaa0003") == 0);
     oc_blob_reader *gone = oc_blob_get_begin(bs, "aaaa0003", NULL);
@@ -342,7 +371,7 @@ int run_blob_s3_tests(void) {
     /* A partial S3 configuration is refused by the loader (test_config.c),
      * never reaching the store; a backend configuration with no keys does not
      * open either, rather than falling back to local disk. */
-    { oc_s3_config part = { "http://127.0.0.1:1", "testbucket", NULL, NULL, NULL };
+    { oc_s3_config part = { "http://127.0.0.1:1", "testbucket", NULL, NULL, NULL, NULL };
       CHECK(oc_blobstore_open(fsdir, &part) == NULL); }
     clear_env();
 

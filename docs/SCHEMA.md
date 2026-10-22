@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Migrations.** The daemon applies migrations 0001–0063 (`daemon/migrate.c`,
+**Migrations.** The daemon applies migrations 0001–0064 (`daemon/migrate.c`,
 `OC_MIGRATIONS`). 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
@@ -37,7 +37,8 @@ delete holds; **0053** (§3ar) TOTP and recovery codes; **0054** (§3as)
 credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
-**0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs.
+**0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
+(§3bc) the identity in a database of its own.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -54,7 +55,10 @@ letter. The list above is the authoritative order.
 
 - Migrations are an ordered, embedded C array (`OC_MIGRATIONS` in
   `daemon/migrate.c`): `{ version, sql }`, versions strictly increasing from 1.
-- On startup the daemon calls `oc_migrate_default(db, …)`, which:
+- On startup the daemon attaches its identity database (§3bc) and calls
+  `oc_migrate_default(db, …)`, which:
+  0. refuses a database whose highest applied version is above the newest
+     migration it has: one a newer daemon wrote (below);
   1. ensures a `schema_version` table exists;
   2. reads the highest applied version;
   3. for each embedded migration newer than that, runs it **in its own
@@ -66,6 +70,12 @@ letter. The list above is the authoritative order.
 - **Forward-only:** there are no down-migrations. Recovery from a bad migration
   is roll-forward (a new migration) or restore from the operator's own backup
   (ARCH-3), consistent with the island model (ARCH-4).
+- **A newer database is refused.** An older daemon started on a database a newer
+  one migrated would meet tables it does not know, or knows in an older shape,
+  and could lose what the newer one kept. It writes nothing, says which version
+  it found and which it knows, and exits with status 4, so whatever started it
+  can tell "go back to the newer image, or to a copy this one wrote" from a
+  failure.
 
 `schema_version`:
 
@@ -1667,3 +1677,47 @@ channel closed more than 24 hours ago, with every row of every table that has a
 `channel_id` naming it or a `message_id` naming one of its messages, then its
 messages and the channel row; the tables are found from the schema, so one added
 later is covered.
+
+---
+
+## 3bc. Migration 0064: the identity in a database of its own (ARCH-66b)
+
+The box's identity leaves the data for `identity/identity.db` beside it,
+attached to the daemon's connection as `ident` before migrating:
+`server_identity` (§3f), `enrollment` (§3m), `acme_account` and
+`tls_certificate` (0049), `local_issuer` (0050), and a new `factor_key`. Each is
+created `IF NOT EXISTS` in `ident` with its columns unchanged, its rows copied
+from `main` only when the `ident` table is empty, and the `main` table dropped:
+
+```sql
+CREATE TABLE IF NOT EXISTS ident.server_identity (...);   -- as 0008
+CREATE TABLE IF NOT EXISTS ident.enrollment (...);        -- as 0017
+CREATE TABLE IF NOT EXISTS ident.acme_account (...);      -- as 0049
+CREATE TABLE IF NOT EXISTS ident.tls_certificate (...);   -- as 0049
+CREATE TABLE IF NOT EXISTS ident.local_issuer (...);      -- as 0050
+CREATE TABLE IF NOT EXISTS ident.factor_key (
+  id            INTEGER PRIMARY KEY CHECK (id = 1),
+  key           BLOB NOT NULL CHECK (length(key) = 32),
+  created_at_ms INTEGER NOT NULL
+);
+INSERT INTO ident.server_identity SELECT * FROM main.server_identity
+  WHERE NOT EXISTS (SELECT 1 FROM ident.server_identity);
+-- likewise enrollment, acme_account, tls_certificate, local_issuer
+DROP TABLE main.server_identity;
+-- likewise the other four
+```
+
+Copying only into an empty identity is what lets the data begin again beside
+an identity kept from before: a fresh database's migrations create the old
+tables empty, 0064 finds the restored identity already there and keeps it.
+
+`factor_key` holds the key second-step secrets are sealed under (AUTH.md §8.6),
+which was a `factor.key` file beside the database. The daemon fills it at
+startup, not this migration: from the file if one is there (then removed), or a
+new key, but never a new key while `local_totp` holds sealed secrets, which a
+new key could never open.
+
+The identity is in WAL like the data and is replicated on its own (ARCH-3), so
+the data can be begun again or restored to an earlier time while the identity
+stays, and a copy of the data alone still gives away no second step. A database
+opened without an identity file (the tests) gets one in memory.

@@ -30,10 +30,22 @@ int oc_schema_version(sqlite3 *db);
  * Returns SQLITE_OK on success. On failure returns the SQLite error code, sets
  * *errmsg (caller frees with sqlite3_free) if non-NULL, and leaves the database
  * at the last successfully-applied version — the partially-applied migration is
- * rolled back, so a restart resumes cleanly from that point. */
+ * rolled back, so a restart resumes cleanly from that point. Attaches an
+ * in-memory `ident` (oc_migrate_attach_identity) if none is attached yet. */
 int oc_migrate(sqlite3 *db, const oc_migration *set, int n, char **errmsg);
 
-/* Apply the daemon's embedded OC_MIGRATIONS. */
+/* Returned by oc_migrate_default for a database whose schema version is above
+ * the newest migration this daemon has: written by a newer daemon, so refused
+ * rather than run on. Not an SQLite result code. */
+#define OC_MIGRATE_TOO_NEW 1000
+
+/* Attach the box's identity database (`path`, ARCH-66b) as schema `ident`.
+ * NULL or "" attaches one in memory, for a database with no identity file of
+ * its own (the tests). */
+int oc_migrate_attach_identity(sqlite3 *db, const char *path, char **errmsg);
+
+/* Apply the daemon's embedded OC_MIGRATIONS, after refusing a database newer
+ * than them (OC_MIGRATE_TOO_NEW). */
 int oc_migrate_default(sqlite3 *db, char **errmsg);
 
 #endif /* OPENCHIME_MIGRATE_H */

@@ -708,13 +708,17 @@ jobs:
       #
       #   A  the replica-* files as the hosted deployment writes them under
       #      /etc/openchime, an empty volume and an empty bucket: it starts,
-      #      and its database appears in the bucket under <prefix>/db/.
-      #   B  the same files, a new empty volume: it restores before the daemon
-      #      starts, and presents the same certificate as A -- the identity
-      #      kept in the database (ARCH-66b) came back with it.
+      #      its database appears in the bucket under <prefix>/db/ and its
+      #      identity under <identity prefix>/db/.
+      #   B  the same files, a new empty volume: it restores both before the
+      #      daemon starts, and presents the same certificate as A -- the
+      #      identity (ARCH-66b) came back.
+      #   D  the same identity prefix with a data prefix never used, a new
+      #      empty volume: the data begins again and the identity is restored,
+      #      so it presents A's certificate on an empty database.
       #   C  the same files with a wrong secret, a new empty volume: the
-      #      restore fails, the boot exits non-zero, and no database is
-      #      created.
+      #      restore fails, the boot exits non-zero, and no database or
+      #      identity is created.
       - name: Replicate the database off the image and restore it onto a new volume
         if: matrix.arch == 'amd64'
         run: |
@@ -724,8 +728,9 @@ jobs:
           RCLONE_SHA256=349ac8fba6ff65d6247043f1750cdcb518ec5d500ef91463a10d37c0ccdf3702
           W="$RUNNER_TEMP/replica"
           BUCKET=oc-replica
-          PREFIX=ci-workspace
-          mkdir -p "$W/s3/$BUCKET" "$W/creds" "$W/creds-c"
+          PREFIX=ci-workspace/data/1
+          IDPREFIX=ci-workspace/identity/1
+          mkdir -p "$W/s3/$BUCKET" "$W/creds" "$W/creds-c" "$W/creds-d"
 
           curl -fsSL --retry 3 -o "$W/rclone.zip" \
             "https://github.com/rclone/rclone/releases/download/${RCLONE}/rclone-${RCLONE}-linux-amd64.zip"
@@ -735,7 +740,7 @@ jobs:
           # one accepted, so a wrong secret is refused as a real provider would.
           "$W/rclone" serve s3 --addr 127.0.0.1:19000 --auth-key ci-key,ci-secret "$W/s3" > "$W/rclone.log" 2>&1 &
           RCLONE_PID=$!
-          trap 'podman rm -f oc-a oc-b >/dev/null 2>&1 || true; kill "$RCLONE_PID" 2>/dev/null || true' EXIT
+          trap 'podman rm -f oc-a oc-b oc-d >/dev/null 2>&1 || true; kill "$RCLONE_PID" 2>/dev/null || true' EXIT
           for i in $(seq 1 30); do
             curl -s -o /dev/null http://127.0.0.1:19000/ && break
             sleep 1
@@ -760,15 +765,16 @@ jobs:
             echo "--- $1's log"; podman logs "$1" 2>&1 | tail -40
             echo "::error::$1 did not answer /healthz within 60 s"; return 1
           }
-          # Only what lands under the workspace's area counts, and anything
-          # outside it is an error: the area is the prefix, the database db/.
-          replicas() { find "$W/s3/$BUCKET/$PREFIX/db" -type f -name '*.ltx' 2>/dev/null | wc -l; }
-          stray() { find "$W/s3/$BUCKET" -type f ! -path "$W/s3/$BUCKET/$PREFIX/db/*" | head -5; }
-          # The deployment's five files, 0600 as the control plane writes them.
+          # Only what lands under the two prefixes counts, and anything outside
+          # them is an error: each database is db/ under its own prefix.
+          replicas() { find "$W/s3/$BUCKET/${1:-$PREFIX}/db" -type f -name '*.ltx' 2>/dev/null | wc -l; }
+          stray() { find "$W/s3/$BUCKET" -type f ! -path "$W/s3/$BUCKET/$PREFIX/db/*" ! -path "$W/s3/$BUCKET/$IDPREFIX/db/*" | head -5; }
+          # The deployment's files, 0600 as the control plane writes them.
           creds() {
-            local dir="$1" secret="$2"
+            local dir="$1" secret="$2" data="${3:-$PREFIX}"
             printf '%s' "$BUCKET" > "$dir/replica-bucket"
-            printf '%s' "$PREFIX" > "$dir/replica-prefix"
+            printf '%s' "$data" > "$dir/replica-prefix"
+            printf '%s' "$IDPREFIX" > "$dir/replica-identity-prefix"
             printf '%s' ci-key > "$dir/replica-accesskey"
             printf '%s' "$secret" > "$dir/replica-secretkey"
             printf '%s' http://127.0.0.1:19000 > "$dir/replica-endpoint"
@@ -776,6 +782,7 @@ jobs:
           }
           creds "$W/creds" ci-secret
           creds "$W/creds-c" not-the-secret
+          creds "$W/creds-d" ci-secret ci-workspace/data/2
 
           # A: the files, an empty volume, an empty bucket.
           start oc-a "$W/data-a" -v "$W/creds:/etc/openchime:ro"
@@ -791,10 +798,10 @@ jobs:
           # Litestream syncs every 60 s (the configuration entrypoint.sh writes).
           ok=0
           for i in $(seq 1 150); do
-            if [ "$(replicas)" -gt 0 ]; then echo "A: replicated after ${i} s"; ok=1; break; fi
+            if [ "$(replicas)" -gt 0 ] && [ "$(replicas "$IDPREFIX")" -gt 0 ]; then echo "A: replicated after ${i} s"; ok=1; break; fi
             sleep 1
           done
-          [ "$ok" = 1 ] || { podman logs oc-a 2>&1 | tail -40; tail -20 "$W/rclone.log"; find "$W/s3" -type f | head -20; echo "::error::nothing reached $PREFIX/db/ in the bucket within 150 s"; exit 1; }
+          [ "$ok" = 1 ] || { podman logs oc-a 2>&1 | tail -40; tail -20 "$W/rclone.log"; find "$W/s3" -type f | head -20; echo "::error::nothing reached $PREFIX/db/ and $IDPREFIX/db/ in the bucket within 150 s"; exit 1; }
           # A stop is SIGTERM to Litestream, which passes it to the daemon and
           # syncs once more after the daemon has exited.
           podman stop -t 30 oc-a >/dev/null
@@ -802,7 +809,7 @@ jobs:
           echo "--- A's log"; podman logs oc-a 2>&1 | tail -20
           podman rm oc-a >/dev/null
           [ -s "$W/data-a/cert.pem" ] || { echo "::error::A left no cert.pem"; exit 1; }
-          [ -z "$(stray)" ] || { stray; echo "::error::A wrote to the bucket outside $PREFIX/db/"; exit 1; }
+          [ -z "$(stray)" ] || { stray; echo "::error::A wrote to the bucket outside $PREFIX/db/ and $IDPREFIX/db/"; exit 1; }
 
           # B: the same files, onto an empty volume.
           start oc-b "$W/data-b" -v "$W/creds:/etc/openchime:ro"
@@ -810,10 +817,25 @@ jobs:
           podman logs oc-b > "$W/b-boot.log" 2>&1
           grep -qxF 'entrypoint: restore=ok' "$W/b-boot.log" \
             || { tail -40 "$W/b-boot.log"; echo "::error::B did not restore the database"; exit 1; }
+          grep -qxF 'entrypoint: identity-restore=ok' "$W/b-boot.log" \
+            || { tail -40 "$W/b-boot.log"; echo "::error::B did not restore the identity"; exit 1; }
           cmp -s "$W/data-a/cert.pem" "$W/data-b/cert.pem" \
             || { echo "::error::B presents a different certificate from A: the restored database did not carry its identity"; exit 1; }
           echo "B: restored, and presents A's certificate"
           podman rm -f oc-b >/dev/null
+
+          # D: the identity kept, the data begun again in a new place.
+          start oc-d "$W/data-d" -v "$W/creds-d:/etc/openchime:ro"
+          healthz oc-d
+          podman logs oc-d > "$W/d-boot.log" 2>&1
+          grep -qxF 'entrypoint: identity-restore=ok' "$W/d-boot.log" \
+            || { tail -40 "$W/d-boot.log"; echo "::error::D did not restore the identity"; exit 1; }
+          grep -qxF 'entrypoint: restore=empty' "$W/d-boot.log" \
+            || { tail -40 "$W/d-boot.log"; echo "::error::D did not begin its data again"; exit 1; }
+          cmp -s "$W/data-a/cert.pem" "$W/data-d/cert.pem" \
+            || { echo "::error::D presents a different certificate from A: the kept identity was not used"; exit 1; }
+          echo "D: data begun again, and presents A's certificate"
+          podman rm -f oc-d >/dev/null
 
           # C: the same files with a wrong secret. The boot must fail, before
           # the daemon starts.
@@ -826,9 +848,11 @@ jobs:
           echo "--- C's log"; tail -20 "$W/c.log"
           [ "$rc" -ne 0 ] || { echo "::error::a boot that could not read its bucket exited 0"; exit 1; }
           # podman run passes the entrypoint's status through: 3 is the restore's.
-          [ "$rc" -eq 3 ] && grep -qxF 'entrypoint: restore=failed' "$W/c.log" \
+          # The identity is restored first, so that is where it stops.
+          [ "$rc" -eq 3 ] && grep -qxF 'entrypoint: identity-restore=failed' "$W/c.log" \
             || { echo "::error::C failed (exit ${rc}), but not at the restore"; exit 1; }
-          [ ! -e "$W/data-c/openchime.db" ] || { echo "::error::C created a database after its restore failed"; exit 1; }
+          [ ! -e "$W/data-c/openchime.db" ] && [ ! -e "$W/data-c/identity/identity.db" ] \
+            || { echo "::error::C created a database after its restore failed"; exit 1; }
           echo "C: exited ${rc} at the restore, with no database created"
       - name: Push the per-architecture image
         env:

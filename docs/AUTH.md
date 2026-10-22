@@ -764,8 +764,10 @@ changes and no frame carries it.
   code, then does what the page was doing. Wrong codes have a limiter of their
   own — five per account in five minutes — apart from the password's, and are
   audited (`auth.failed`, `step=code`); a recovery code spent is audited too.
-- **The secret is sealed** under the factor key, outside the database (SCHEMA.md
-  migration 0053). Without the key, or with the wrong one, the step cannot be
+- **The secret is sealed** under the factor key, kept in the box's identity
+  apart from the data (SCHEMA.md migrations 0053 and 0064), so a copy of the
+  data alone gives away no second step; a box never makes a new key while
+  secrets sealed under a lost one are kept. Without the key, or with the wrong one, the step cannot be
   passed: the sign-in is refused and the log says why, rather than letting the
   person in without it.
 

@@ -102,12 +102,12 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 63);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms */
+    CHECK(oc_schema_version(db) == 64);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms */
 
     const char *tables[] = { "drafts", "scheduled_messages", "users", "channels", "channel_members",
                              "messages", "sent_messages",
                              "sessions", "local_credentials", "invites", "reactions",
-                             "messages_fts", "delivery_cursors", "server_identity",
+                             "messages_fts", "delivery_cursors",
                              "attachments", "webhooks", "notification_prefs",
                              "client_settings", "audit_log", "rendered_audio",
                              "user_identities", "actions" };
@@ -258,6 +258,58 @@ static void test_action_backfill(void) {
     sqlite3_close(db);
 }
 
+/* 0064 moves the identity into a database of its own (ARCH-66b): the rows an
+ * upgraded box had go with it, and the copies in the data are gone. */
+static void test_identity_moves_out(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 63, &err) == SQLITE_OK);
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO server_identity VALUES(1,'CERT','KEY',1);"
+        "INSERT INTO enrollment VALUES(1,'PK','aud-1','active',2,1);"
+        "INSERT INTO local_issuer VALUES(1,'IKEY','iss-1',1);", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM ident.server_identity WHERE cert_pem='CERT';") == 1);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM ident.enrollment WHERE audience='aud-1' AND state='active';") == 1);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM ident.local_issuer WHERE issuer='iss-1';") == 1);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM ident.factor_key;") == 0);
+    const char *moved[] = { "server_identity", "enrollment", "acme_account", "tls_certificate", "local_issuer" };
+    for (size_t i = 0; i < sizeof moved / sizeof moved[0]; i++) CHECK(!table_exists(db, moved[i]));
+    sqlite3_close(db);
+}
+
+/* A database begun again beside an identity kept from before takes the kept
+ * one: the new database's own first identity is not copied over it. */
+static void test_kept_identity_wins(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate_attach_identity(db, NULL, &err) == SQLITE_OK);
+    CHECK(sqlite3_exec(db,
+        "CREATE TABLE ident.server_identity (id INTEGER PRIMARY KEY CHECK (id = 1), cert_pem TEXT NOT NULL,"
+        "  key_pem TEXT NOT NULL, created_at_ms INTEGER NOT NULL);"
+        "INSERT INTO ident.server_identity VALUES(1,'KEPT','KEPTKEY',1);", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 63, &err) == SQLITE_OK);
+    CHECK(sqlite3_exec(db, "INSERT INTO main.server_identity VALUES(1,'NEW','NEWKEY',2);", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM ident.server_identity WHERE cert_pem='KEPT';") == 1);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM ident.server_identity;") == 1);
+    sqlite3_close(db);
+}
+
+/* A database a newer daemon wrote is refused before anything is written. */
+static void test_newer_database_refused(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
+    int newest = OC_MIGRATIONS[OC_MIGRATIONS_COUNT - 1].version;
+    char *sql = sqlite3_mprintf("INSERT INTO schema_version(version) VALUES(%d);", newest + 1);
+    CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_free(sql);
+    CHECK(oc_migrate_default(db, &err) == OC_MIGRATE_TOO_NEW);
+    CHECK(oc_schema_version(db) == newest + 1);
+    sqlite3_close(db);
+}
+
 int run_migrate_tests(void) {
     printf("test_migrate: fresh apply, idempotent rerun, resume, rollback,\n");
     printf("              embedded core schema\n");
@@ -268,5 +320,8 @@ int run_migrate_tests(void) {
     test_embedded_schema();
     test_identity_backfill();
     test_action_backfill();
+    test_identity_moves_out();
+    test_kept_identity_wins();
+    test_newer_database_refused();
     return failures;
 }

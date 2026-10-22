@@ -8667,6 +8667,17 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                             "at \"%s\": %s\n", bd ? bd : "(unset)", strerror(errno));
             close(ep); close(lfd); loop_state_free(conns); return -1;
         }
+        /* Attachments kept on disk before S3 was turned on go to S3 once, here,
+         * before serving: the store is one place or the other, never both. */
+        if (!oc_blobstore_is_local(g_blobs)) {
+            int moved = 0, failed = 0;
+            if (oc_blobstore_take_local(g_blobs, bd, &moved, &failed) != 0)
+                fprintf(stderr, "openchimed: could not read %s to move its attachments into S3: %s\n",
+                        bd, strerror(errno));
+            else if (moved || failed)
+                fprintf(stderr, "openchimed: moved %d attachment%s from %s into S3%s\n", moved,
+                        moved == 1 ? "" : "s", bd, failed ? "; some could not be, and stay for the next start" : "");
+        }
         g_max_attach = OC_MAX_ATTACHMENT_SIZE;
         g_max_video  = cfg->max_video_size;
 

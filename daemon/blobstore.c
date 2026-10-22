@@ -8,6 +8,7 @@
 #include "blobstore.h"
 #include "blob_backend.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -261,4 +262,43 @@ void oc_blob_get_close(oc_blob_reader *r) {
 int oc_blob_delete(oc_blobstore *bs, const char *key) {
     note_op();
     return (bs && bs->be) ? bs->be->del(bs->store, key) : -1;
+}
+
+/* --- Moving local blobs into a remote store ------------------------------- */
+
+int oc_blobstore_take_local(oc_blobstore *bs, const char *dir, int *moved, int *failed) {
+    *moved = *failed = 0;
+    if (!bs || oc_blobstore_is_local(bs) || !dir || !*dir) return 0;
+    DIR *d = opendir(dir);
+    if (!d) return errno == ENOENT ? 0 : -1;
+    struct dirent *de;
+    char path[1200], buf[64 * 1024];
+    while ((de = readdir(d)) != NULL) {
+        /* Only what the local backend itself would have published: a staged
+         * `.tmp` was never a blob, and anything else is not ours. */
+        if (!key_ok(de->d_name)) continue;
+        if (snprintf(path, sizeof path, "%s/%s", dir, de->d_name) >= (int)sizeof path) { (*failed)++; continue; }
+        struct stat sb;
+        FILE *fp = fopen(path, "rb");
+        if (!fp || fstat(fileno(fp), &sb) != 0 || !S_ISREG(sb.st_mode)) {
+            if (fp) fclose(fp);
+            continue;
+        }
+        oc_blob_writer *w = oc_blob_put_begin(bs, de->d_name, (uint64_t)sb.st_size);
+        int ok = w != NULL;
+        size_t n;
+        while (ok && (n = fread(buf, 1, sizeof buf, fp)) > 0) ok = oc_blob_put_chunk(w, buf, n) == 0;
+        ok = ok && !ferror(fp);
+        fclose(fp);
+        if (w) {
+            if (ok) ok = oc_blob_put_commit(w) == 0;
+            else oc_blob_put_abort(w);
+        }
+        /* Removed only once the store has it: a failure leaves the file to be
+         * taken on the next start. */
+        if (ok && unlink(path) == 0) (*moved)++;
+        else (*failed)++;
+    }
+    closedir(d);
+    return 0;
 }

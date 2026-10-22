@@ -17,6 +17,7 @@
 int cfg_parse_auth(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_tls(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_s3(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
+int cfg_parse_s3_file(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_summary(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_connect(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_token_prefix(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
@@ -44,7 +45,7 @@ const cfg_row OC_CFG[] = {
     ENUM("OPENCHIME_MODE", CFG_OPERATOR, G_SET, "normal", "normal|development|demo", "What the box is for: `normal` (a deployment), `development` (the tests and harnesses; the only mode that reads the Development rows) or `demo` (the public demo workspace).", mode),
     STR("OPENCHIME_WORKSPACE_NAME", CFG_OPERATOR, G_SET, "", "The workspace's display name, shown to clients; unset, a client derives one from the host.", F(workspace_name), NULL, 0, 0),
     U64("OPENCHIME_MAX_VIDEO_SIZE", CFG_OPERATOR, G_SET, "167772160", 1048576, (int64_t)OC_MAX_ATTACHMENT_SIZE, "The most bytes one video message may hold (REQ-164), at most the attachment cap of 209715200; clients learn it at sign-in and record within it. 160 MiB by default.", max_video_size),
-    PATHR("OPENCHIME_DATA_DIR", CFG_OPERATOR, G_SET, "/data", "Where the daemon keeps everything: `openchime.db`, `blobs/`, `cert.pem`, `key.pem`, `factor.key`, `summary/`. The packages set `/var/lib/openchime`.", F(data_dir), NULL, 0, 0),
+    PATHR("OPENCHIME_DATA_DIR", CFG_OPERATOR, G_SET, "/data", "Where the daemon keeps everything: `openchime.db`, `identity/`, `blobs/`, `cert.pem`, `key.pem`, `summary/`. The packages set `/var/lib/openchime`.", F(data_dir), NULL, 0, 0),
     INT("OPENCHIME_PORT", CFG_OPERATOR, G_SET, "8443", 1, 65535, "The TLS port the protocol, the web client and the sign-in pages are served on, and the UDP port calls use (443 for a real deployment, ARCH-54).", proto_port),
     INT("OPENCHIME_HEALTH_PORT", CFG_OPERATOR, G_SET, "8080", 0, 65535, "The plaintext port for `/healthz` and the landing page (ARCH-25); 0 opens none.", health_port),
     STR("OPENCHIME_JOIN", CFG_OPERATOR, G_SET, NULL, "Who may join by signing in through a provider: `domain:`, `tenant:`, `subject:` and `owner:` rules, comma-separated (AUTH.md §8.4). Unset: only by invitation.", F(oidc.allow), NULL, 0, 0),
@@ -65,8 +66,11 @@ const cfg_row OC_CFG[] = {
            cfg_parse_auth, 0),
     ENUM("OPENCHIME_MFA", CFG_OPERATOR, G_FLAG, "optional", "off|optional|required", "Whether local accounts are asked for a second step (AUTH.md §8.6).", local_mfa),
     CUSTOM("OPENCHIME_S3", CFG_OPERATOR, G_FLAG, NULL,
-           "Attachments in S3 instead of under the data directory (ARCH-70): `s3://KEY:SECRET@host[:port]/bucket[?region=…]`, or `http+s3://` for a plaintext endpoint; percent-encode `/`, `+` and `@` in the key and secret. Unset: local disk.",
+           "Attachments in S3 instead of under the data directory (ARCH-70): `s3://KEY:SECRET@host[:port]/bucket[/prefix][?region=…]`, or `http+s3://` for a plaintext endpoint; percent-encode `/`, `+` and `@` in the key and secret. A prefix puts the keys under it, so several daemons can share a bucket. Unset: local disk.",
            cfg_parse_s3, CFG_SECRET),
+    CUSTOM("OPENCHIME_S3_FILE", CFG_OPERATOR, G_FLAG, NULL,
+           "`OPENCHIME_S3`'s value, read from this file instead (mode 0600; a trailing newline is ignored), so the key and secret are not in the environment. Set one or the other, not both.",
+           cfg_parse_s3_file, 0),
     BOOL("OPENCHIME_TTS", CFG_OPERATOR, G_FLAG, "on", "Read-aloud (ARCH-111), in a build that carries it; off saves the voice model's memory.", tts.enabled),
     BOOL("OPENCHIME_STT", CFG_OPERATOR, G_FLAG, "on", "Voice input (ARCH-112), in a build that carries it.", stt.enabled),
     CUSTOM("OPENCHIME_SUMMARY", CFG_OPERATOR, G_FLAG, "off",

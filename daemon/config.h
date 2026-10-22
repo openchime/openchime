@@ -98,6 +98,7 @@ typedef enum {
  * local disk. */
 typedef struct {
     const char *endpoint, *bucket, *access_key, *secret_key, *region;
+    const char *prefix;   /* keys go under <prefix>/ in the bucket; NULL: at its root */
 } oc_s3_config;
 
 typedef struct {

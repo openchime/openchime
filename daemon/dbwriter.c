@@ -3033,7 +3033,7 @@ static oc_dbres *process_load_identity(sqlite3 *db, const oc_job *j) {
     r->conn_id = j->conn_id;
     r->type = OC_RES_IDENTITY;
     sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db, "SELECT cert_pem, key_pem FROM server_identity WHERE id=1;", -1, &st, NULL);
+    sqlite3_prepare_v2(db, "SELECT cert_pem, key_pem FROM ident.server_identity WHERE id=1;", -1, &st, NULL);
     if (sqlite3_step(st) == SQLITE_ROW) {
         r->cert_pem = strdup((const char *)sqlite3_column_text(st, 0));
         r->key_pem  = strdup((const char *)sqlite3_column_text(st, 1));
@@ -3064,13 +3064,13 @@ static oc_dbres *process_load_tls_state(sqlite3 *db, const oc_job *j) {
     oc_tls_state *s = r->tls_state = calloc(1, sizeof *s);
     if (!s) return r;
     sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db, "SELECT directory_url, account_key_pem, account_url FROM acme_account WHERE id=1;", -1, &st, NULL);
+    sqlite3_prepare_v2(db, "SELECT directory_url, account_key_pem, account_url FROM ident.acme_account WHERE id=1;", -1, &st, NULL);
     if (sqlite3_step(st) == SQLITE_ROW) {
         s->acme_directory = col_dup(st, 0); s->acme_key_pem = col_dup(st, 1); s->acme_url = col_dup(st, 2);
     }
     sqlite3_finalize(st); st = NULL;
     sqlite3_prepare_v2(db, "SELECT source, names, chain_pem, key_pem, issued_at_ms, not_after_ms "
-                           "FROM tls_certificate WHERE id=1;", -1, &st, NULL);
+                           "FROM ident.tls_certificate WHERE id=1;", -1, &st, NULL);
     if (sqlite3_step(st) == SQLITE_ROW) {
         s->source = col_dup(st, 0); s->names = col_dup(st, 1); s->chain_pem = col_dup(st, 2); s->key_pem = col_dup(st, 3);
         s->issued_ms = (uint64_t)sqlite3_column_int64(st, 4); s->not_after_ms = (uint64_t)sqlite3_column_int64(st, 5);
@@ -3085,14 +3085,14 @@ static oc_dbres *process_store_tls(sqlite3 *db, const oc_job *j) {
     if (!s) return NULL;
     sqlite3_stmt *st = NULL;
     if (j->type == OC_JOB_STORE_ACME_ACCOUNT) {
-        sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO acme_account(id,directory_url,account_key_pem,account_url,created_at_ms) "
+        sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO ident.acme_account(id,directory_url,account_key_pem,account_url,created_at_ms) "
                                "VALUES(1,?,?,?,?);", -1, &st, NULL);
         sqlite3_bind_text(st, 1, s->acme_directory ? s->acme_directory : "", -1, SQLITE_STATIC);
         sqlite3_bind_text(st, 2, s->acme_key_pem ? s->acme_key_pem : "", -1, SQLITE_STATIC);
         sqlite3_bind_text(st, 3, s->acme_url ? s->acme_url : "", -1, SQLITE_STATIC);
         sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
     } else {
-        sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO tls_certificate(id,source,names,chain_pem,key_pem,issued_at_ms,not_after_ms) "
+        sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO ident.tls_certificate(id,source,names,chain_pem,key_pem,issued_at_ms,not_after_ms) "
                                "VALUES(1,?,?,?,?,?,?);", -1, &st, NULL);
         sqlite3_bind_text(st, 1, s->source ? s->source : "", -1, SQLITE_STATIC);
         sqlite3_bind_text(st, 2, s->names ? s->names : "", -1, SQLITE_STATIC);
@@ -3115,7 +3115,7 @@ static oc_dbres *process_store_identity(sqlite3 *db, const oc_job *j) {
     r->conn_id = j->conn_id;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "INSERT OR REPLACE INTO server_identity(id,cert_pem,key_pem,created_at_ms) "
+        "INSERT OR REPLACE INTO ident.server_identity(id,cert_pem,key_pem,created_at_ms) "
         "VALUES(1,?,?,?);", -1, &st, NULL);
     sqlite3_bind_text(st, 1, j->cert_pem ? j->cert_pem : "", -1, SQLITE_STATIC);
     sqlite3_bind_text(st, 2, j->key_pem ? j->key_pem : "", -1, SQLITE_STATIC);
@@ -3135,7 +3135,7 @@ static oc_dbres *process_load_enrollment(sqlite3 *db, const oc_job *j) {
     r->conn_id = j->conn_id;
     r->type = OC_RES_ENROLLMENT;
     sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db, "SELECT privkey_pem, audience, state FROM enrollment WHERE id=1;", -1, &st, NULL);
+    sqlite3_prepare_v2(db, "SELECT privkey_pem, audience, state FROM ident.enrollment WHERE id=1;", -1, &st, NULL);
     if (sqlite3_step(st) == SQLITE_ROW) {
         r->enroll_privkey  = strdup((const char *)sqlite3_column_text(st, 0));
         r->enroll_audience = strdup((const char *)sqlite3_column_text(st, 1));
@@ -3154,7 +3154,7 @@ static oc_dbres *process_store_enrollment(sqlite3 *db, const oc_job *j) {
     r->conn_id = j->conn_id;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "INSERT OR REPLACE INTO enrollment(id,privkey_pem,audience,state,activated_at_ms,created_at_ms) "
+        "INSERT OR REPLACE INTO ident.enrollment(id,privkey_pem,audience,state,activated_at_ms,created_at_ms) "
         "VALUES(1,?,?,?,?,?);", -1, &st, NULL);
     sqlite3_bind_text(st, 1, j->enroll_privkey  ? j->enroll_privkey  : "", -1, SQLITE_STATIC);
     sqlite3_bind_text(st, 2, j->enroll_audience ? j->enroll_audience : "", -1, SQLITE_STATIC);
@@ -11328,10 +11328,72 @@ int oc_dbwriter_seed_demo(oc_dbwriter *w, const char *workspace_name) {
 
 /* This daemon's issuer for its local accounts (AUTH.md §8.10): the one kept, or
  * a new one, made and kept now. Setup, before any thread runs. */
+/* The factor key (AUTH.md §8.6), kept in the identity (migration 0064). Its
+ * row; else the file it was kept in before, taken in once; else a new one --
+ * unless second steps are sealed here, which a new key could never open: then
+ * none, and the reason. 0 kept, 2 taken in, 1 made, -1 none. Runs before the
+ * threads start, on the writer's connection. */
+static int factor_key_settle(oc_dbwriter *w, const char *file, char *why, size_t cap) {
+    sqlite3_stmt *st = NULL;
+    int got = 0;
+    if (sqlite3_prepare_v2(w->db, "SELECT key FROM ident.factor_key WHERE id=1;", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW && sqlite3_column_bytes(st, 0) == OC_FACTOR_KEY_LEN) {
+        memcpy(w->factor_key, sqlite3_column_blob(st, 0), OC_FACTOR_KEY_LEN);
+        got = 1;
+    }
+    sqlite3_finalize(st);
+    if (got) return 0;
+
+    int made = 0;
+    char ferr[256] = "";
+    if (access(file, F_OK) == 0) {
+        if (oc_factor_key_load(file, w->factor_key, ferr, sizeof ferr) != 0) {
+            snprintf(why, cap, "%s", ferr);
+            return -1;
+        }
+    } else {
+        int sealed = 0;
+        if (sqlite3_prepare_v2(w->db, "SELECT 1 FROM local_totp LIMIT 1;", -1, &st, NULL) == SQLITE_OK)
+            sealed = sqlite3_step(st) == SQLITE_ROW;
+        sqlite3_finalize(st);
+        if (sealed) {
+            snprintf(why, cap, "it is missing, and second steps sealed under it are kept: a new key could not "
+                               "open them -- restore the identity it was kept in");
+            return -1;
+        }
+        if (oc_rand_bytes(w->factor_key, OC_FACTOR_KEY_LEN) != 0) {
+            snprintf(why, cap, "no random bytes for a new one");
+            return -1;
+        }
+        made = 1;
+    }
+    int ok = sqlite3_prepare_v2(w->db, "INSERT INTO ident.factor_key(id, key, created_at_ms) VALUES (1,?,?);",
+                                -1, &st, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_blob(st, 1, w->factor_key, OC_FACTOR_KEY_LEN, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+        ok = sqlite3_step(st) == SQLITE_DONE;
+    }
+    sqlite3_finalize(st);
+    if (!ok) {
+        memset(w->factor_key, 0, sizeof w->factor_key);
+        snprintf(why, cap, "it could not be kept: %s", sqlite3_errmsg(w->db));
+        return -1;
+    }
+    /* Taken in: the identity is where it is kept now, and a copy left beside
+     * the database would be one more place to lose it from. */
+    if (!made) unlink(file);
+    return made ? 1 : 2;
+}
+
+const char *oc_dbwriter_local_issuer_name(oc_dbwriter *w) {
+    return w && w->local_iss ? oc_local_issuer_name(w->local_iss) : NULL;
+}
+
 static int local_issuer_load(oc_dbwriter *w) {
     char *key = NULL, *iss = NULL;
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(w->db, "SELECT key_pem, issuer FROM local_issuer WHERE id=1;", -1, &st, NULL) != SQLITE_OK)
+    if (sqlite3_prepare_v2(w->db, "SELECT key_pem, issuer FROM ident.local_issuer WHERE id=1;", -1, &st, NULL) != SQLITE_OK)
         return -1;
     if (sqlite3_step(st) == SQLITE_ROW) {
         key = strdup((const char *)sqlite3_column_text(st, 0));
@@ -11341,7 +11403,7 @@ static int local_issuer_load(oc_dbwriter *w) {
     if (!key || !iss) {
         free(key); free(iss);
         if (oc_local_issuer_generate(&key, &iss) != 0) return -1;
-        sqlite3_prepare_v2(w->db, "INSERT INTO local_issuer(id, key_pem, issuer, created_at_ms) VALUES (1,?,?,?);",
+        sqlite3_prepare_v2(w->db, "INSERT INTO ident.local_issuer(id, key_pem, issuer, created_at_ms) VALUES (1,?,?,?);",
                            -1, &st, NULL);
         sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, iss, -1, SQLITE_TRANSIENT);
@@ -11358,6 +11420,12 @@ static int local_issuer_load(oc_dbwriter *w) {
 }
 
 oc_dbwriter *oc_dbwriter_start(const char *path) {
+    return oc_dbwriter_start_boot(path, NULL);
+}
+
+oc_dbwriter *oc_dbwriter_start_boot(const char *path, oc_dbwriter_boot *b) {
+    const char *identity_path = b ? b->identity_path : NULL;
+    if (b) { b->too_new = 0; b->factor = -1; b->factor_why[0] = '\0'; }
     oc_dbwriter *w = calloc(1, sizeof *w);
     if (!w) return NULL;
     pthread_mutex_init(&w->keys_mu, NULL);
@@ -11392,8 +11460,25 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
         fprintf(stderr, "dbwriter: pragma failed: %s\n", err ? err : "?");
         sqlite3_free(err); goto fail;
     }
+    /* The box's identity (ARCH-66b): its own file beside the database, attached
+     * before migrating so 0064 can move it there, and in WAL so the replicator
+     * streams it as it does the database. Without a path, one in memory. */
+    if (oc_migrate_attach_identity(w->db, identity_path, &err) != SQLITE_OK ||
+        (identity_path && *identity_path &&
+         sqlite3_exec(w->db, "PRAGMA ident.journal_mode=WAL;", NULL, NULL, &err) != SQLITE_OK)) {
+        fprintf(stderr, "dbwriter: the identity %s could not be opened: %s\n",
+                identity_path && *identity_path ? identity_path : "(memory)", err ? err : "?");
+        sqlite3_free(err); goto fail;
+    }
     int schema_before = oc_schema_version(w->db);
-    if (oc_migrate_default(w->db, &err) != SQLITE_OK) {
+    int mrc = oc_migrate_default(w->db, &err);
+    if (mrc == OC_MIGRATE_TOO_NEW) {
+        fprintf(stderr, "dbwriter: %s was written by a newer daemon (schema %d; this one knows up to %d): "
+                "refusing to run on it\n", path, schema_before, OC_MIGRATIONS[OC_MIGRATIONS_COUNT - 1].version);
+        if (b) b->too_new = 1;
+        goto fail;
+    }
+    if (mrc != SQLITE_OK) {
         fprintf(stderr, "dbwriter: migration failed: %s\n", err ? err : "?");
         sqlite3_free(err); goto fail;
     }
@@ -11417,6 +11502,10 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
     if (local_issuer_load(w) != 0) {
         fprintf(stderr, "dbwriter: the local issuer could not be made\n");
         goto fail;
+    }
+    if (b && b->factor_key_file) {
+        b->factor = factor_key_settle(w, b->factor_key_file, b->factor_why, sizeof b->factor_why);
+        if (b->factor >= 0) w->have_factor_key = 1;
     }
     w->evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (w->evfd < 0) { fprintf(stderr, "dbwriter: eventfd failed\n"); goto fail; }

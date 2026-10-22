@@ -772,6 +772,12 @@ works. The shipped *image* is the release-candidate's to prove (§3.2).
   waiting at its step when the password changes is refused; the password page
   changes nothing until the step; five wrong codes end the ticket; no factor key
   refuses the step; a device approval waits for its code (AUTH.md §8.6).
+- **The identity apart from the data (`test_migrate`, `test_dbwriter`):**
+  migration 0064 moves the identity's rows into its own database and drops them
+  from the data; a fresh database beside a kept identity takes the kept one;
+  the factor key is made once and kept in the identity, taken in from an older
+  daemon's file (which goes), and not made anew while sealed second steps are
+  kept; a database a newer daemon wrote is refused, before anything is written.
 - **Setting the step up (`itest_netloop` `test_web_signin`):** the page takes the
   password, then shows a key and a QR code; a wrong first code is refused, the
   right one turns the step on and shows ten recovery codes once, with a download

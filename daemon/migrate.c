@@ -1347,6 +1347,80 @@ static const char MIGRATION_0063[] =
     "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);"
     "END;";
 
+/* The identity's tables (ARCH-66b), each IF NOT EXISTS: made by 0064, and made
+ * again at every start (oc_migrate) for an identity that is new or was lost
+ * while its database was already past 0064, so the identity is always there to
+ * fill. */
+#define IDENTITY_TABLES \
+    "CREATE TABLE IF NOT EXISTS ident.server_identity (" \
+    "  id            INTEGER PRIMARY KEY CHECK (id = 1)," \
+    "  cert_pem      TEXT NOT NULL," \
+    "  key_pem       TEXT NOT NULL," \
+    "  created_at_ms INTEGER NOT NULL" \
+    ");" \
+    "CREATE TABLE IF NOT EXISTS ident.enrollment (" \
+    "  id              INTEGER PRIMARY KEY CHECK (id = 1)," \
+    "  privkey_pem     TEXT NOT NULL," \
+    "  audience        TEXT NOT NULL," \
+    "  state           TEXT NOT NULL," \
+    "  activated_at_ms INTEGER," \
+    "  created_at_ms   INTEGER NOT NULL" \
+    ");" \
+    "CREATE TABLE IF NOT EXISTS ident.acme_account (" \
+    "  id              INTEGER PRIMARY KEY CHECK (id = 1)," \
+    "  directory_url   TEXT NOT NULL," \
+    "  account_key_pem TEXT NOT NULL," \
+    "  account_url     TEXT NOT NULL," \
+    "  created_at_ms   INTEGER NOT NULL" \
+    ");" \
+    "CREATE TABLE IF NOT EXISTS ident.tls_certificate (" \
+    "  id            INTEGER PRIMARY KEY CHECK (id = 1)," \
+    "  source        TEXT NOT NULL," \
+    "  names         TEXT NOT NULL," \
+    "  chain_pem     TEXT NOT NULL," \
+    "  key_pem       TEXT NOT NULL," \
+    "  issued_at_ms  INTEGER NOT NULL," \
+    "  not_after_ms  INTEGER NOT NULL" \
+    ");" \
+    "CREATE TABLE IF NOT EXISTS ident.local_issuer (" \
+    "  id            INTEGER PRIMARY KEY CHECK (id = 1)," \
+    "  key_pem       TEXT NOT NULL," \
+    "  issuer        TEXT NOT NULL," \
+    "  created_at_ms INTEGER NOT NULL" \
+    ");" \
+    "CREATE TABLE IF NOT EXISTS ident.factor_key (" \
+    "  id            INTEGER PRIMARY KEY CHECK (id = 1)," \
+    "  key           BLOB NOT NULL CHECK (length(key) = 32)," \
+    "  created_at_ms INTEGER NOT NULL" \
+    ");"
+
+static const char MIGRATION_0064[] =
+    /* The box's identity leaves the database for one of its own (ARCH-66b): the
+     * self-signed certificate, the CA-issued certificate and its ACME account,
+     * the enrollment with central, the local issuer, and the factor key that
+     * seals second steps (AUTH.md §8.6). `ident` is identity/identity.db beside
+     * the database, attached before migrating, and replicated on its own
+     * (ARCH-3), so the data can be reset or restored while the identity stays.
+     * Rows are copied only into an empty identity: a database begun again
+     * beside an identity kept from before takes that identity, not its own new
+     * one. */
+    IDENTITY_TABLES
+    "INSERT INTO ident.server_identity SELECT * FROM main.server_identity"
+    "  WHERE NOT EXISTS (SELECT 1 FROM ident.server_identity);"
+    "INSERT INTO ident.enrollment SELECT * FROM main.enrollment"
+    "  WHERE NOT EXISTS (SELECT 1 FROM ident.enrollment);"
+    "INSERT INTO ident.acme_account SELECT * FROM main.acme_account"
+    "  WHERE NOT EXISTS (SELECT 1 FROM ident.acme_account);"
+    "INSERT INTO ident.tls_certificate SELECT * FROM main.tls_certificate"
+    "  WHERE NOT EXISTS (SELECT 1 FROM ident.tls_certificate);"
+    "INSERT INTO ident.local_issuer SELECT * FROM main.local_issuer"
+    "  WHERE NOT EXISTS (SELECT 1 FROM ident.local_issuer);"
+    "DROP TABLE main.server_identity;"
+    "DROP TABLE main.enrollment;"
+    "DROP TABLE main.acme_account;"
+    "DROP TABLE main.tls_certificate;"
+    "DROP TABLE main.local_issuer;";
+
 static const char MIGRATION_0059[] =
     /* A summary is its asker's, not their connection's (REQ-311, SUMMARIES.md
      * §5). The queue is made again -- its rows were only ever a run's -- with
@@ -1455,6 +1529,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 61, MIGRATION_0061 },
     { 62, MIGRATION_0062 },
     { 63, MIGRATION_0063 },
+    { 64, MIGRATION_0064 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 
@@ -1474,6 +1549,24 @@ int oc_schema_version(sqlite3 *db) {
     return ver;
 }
 
+int oc_migrate_attach_identity(sqlite3 *db, const char *path, char **errmsg) {
+    if (errmsg) *errmsg = NULL;
+    char *sql = sqlite3_mprintf("ATTACH DATABASE %Q AS ident;", path && *path ? path : ":memory:");
+    if (!sql) return SQLITE_NOMEM;
+    int rc = sqlite3_exec(db, sql, NULL, NULL, errmsg);
+    sqlite3_free(sql);
+    return rc;
+}
+
+static int identity_attached(sqlite3 *db) {
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_database_list WHERE name='ident';", -1, &st, NULL) == SQLITE_OK)
+        found = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return found;
+}
+
 int oc_migrate(sqlite3 *db, const oc_migration *set, int n, char **errmsg) {
     if (errmsg) *errmsg = NULL;
 
@@ -1483,6 +1576,9 @@ int oc_migrate(sqlite3 *db, const oc_migration *set, int n, char **errmsg) {
         "  applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
         ");", NULL, NULL, errmsg);
     if (rc != SQLITE_OK) return rc;
+    /* Migrations from 0064 on write the identity's tables (ARCH-66b): a
+     * database opened without its identity file (the tests) gets one in memory. */
+    if (!identity_attached(db) && (rc = oc_migrate_attach_identity(db, NULL, errmsg)) != SQLITE_OK) return rc;
 
     int cur = oc_schema_version(db);
 
@@ -1509,9 +1605,18 @@ int oc_migrate(sqlite3 *db, const oc_migration *set, int n, char **errmsg) {
         if (rc != SQLITE_OK) return rc;
         cur = set[i].version;
     }
+    /* Past 0064 the identity's tables are made whenever they are not there: an
+     * identity new beside data that already moved its rows out, or lost, is
+     * begun empty rather than leaving the daemon nothing to read. */
+    if (cur >= 64) return sqlite3_exec(db, IDENTITY_TABLES, NULL, NULL, errmsg);
     return SQLITE_OK;
 }
 
 int oc_migrate_default(sqlite3 *db, char **errmsg) {
+    if (errmsg) *errmsg = NULL;
+    /* A database written by a newer daemon has tables this one does not know,
+     * or knows in an older shape: running on it could lose what the newer one
+     * kept. Refused before anything is written. */
+    if (oc_schema_version(db) > OC_MIGRATIONS[OC_MIGRATIONS_COUNT - 1].version) return OC_MIGRATE_TOO_NEW;
     return oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, errmsg);
 }

@@ -55,6 +55,12 @@
 #include <time.h>
 #include <unistd.h>
 
+/* The exit status of a daemon refused a database a newer one wrote (SCHEMA.md
+ * "Migrations"): distinct from 1, so what started it can tell a box that must
+ * go back to its newer image, or to an older copy of its data, from one that
+ * failed. 3 is the image's entrypoint's: a failed restore. */
+#define OC_EXIT_DATA_TOO_NEW 4
+
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
@@ -496,7 +502,24 @@ int main(int argc, char **argv) {
 
     /* DB-writer thread: opens the connection and applies migrations before we
      * serve any traffic (ARCH-27). Fatal if it can't. */
-    oc_dbwriter *db = oc_dbwriter_start(db_path);
+    /* The identity (ARCH-66b) is a database of its own in identity/ beside the
+     * data: replicated apart from it, so the data can be begun again or
+     * restored while the certificate, the enrollment and the keys stay. */
+    char identity_dir[1100], identity_path[1200];
+    snprintf(identity_dir, sizeof identity_dir, "%s/identity", cfg->data_dir);
+    snprintf(identity_path, sizeof identity_path, "%s/identity.db", identity_dir);
+    if (mkdir(identity_dir, 0700) != 0 && errno != EEXIST) {
+        fprintf(stderr, "openchimed: %s: cannot create: %s\n", identity_dir, strerror(errno));
+        return 1;
+    }
+    oc_dbwriter_boot boot = { .identity_path = identity_path,
+                              .factor_key_file = cfg->auth_local ? cfg->factor_key_file : NULL };
+    oc_dbwriter *db = oc_dbwriter_start_boot(db_path, &boot);
+    if (!db && boot.too_new) {
+        fprintf(stderr, "openchimed: the database was written by a newer daemon; run that one, or restore a "
+                        "copy this one wrote\n");
+        return OC_EXIT_DATA_TOO_NEW;
+    }
     if (!db) { fprintf(stderr, "openchimed: DB init failed\n"); return 1; }
 
     /* Registered-user cap (CP-7, hosted plan CP-4): 0/unset = unlimited
@@ -606,23 +629,19 @@ int main(int argc, char **argv) {
     oc_dbwriter_set_session_policy(db, cfg->mode == OC_MODE_DEMO ? OC_DEMO_SESSION_TTL_MS : OC_SESSION_TTL_MS,
                                    OC_SESSION_IDLE_MS);
 
-    /* The factor key (AUTH.md §8.6), kept outside the database: without it a
-     * stolen database gives away no second step. Made at first start; if it
-     * cannot be had, the daemon serves on and no second step can be passed --
-     * refusing those sign-ins rather than passing them without it. */
+    /* The factor key (AUTH.md §8.6), settled as the store started: kept in the
+     * identity, apart from the data, so a copy of the data alone gives away no
+     * second step. If it cannot be had, the daemon serves on and no second step
+     * can be passed -- refusing those sign-ins rather than passing them. */
     if (want_local) {
-        uint8_t fkey[OC_FACTOR_KEY_LEN];
-        char why[256];
-        int got = oc_factor_key_load(cfg->factor_key_file, fkey, why, sizeof why);
-        if (got >= 0) {
-            oc_dbwriter_set_factor_key(db, fkey);
-            if (got == 1) fprintf(stderr, "openchimed: made the factor key %s -- back it up with the database\n",
-                                  cfg->factor_key_file);
-        } else {
+        if (boot.factor == 1) fprintf(stderr, "openchimed: made the factor key, kept in %s\n", identity_path);
+        else if (boot.factor == 2) fprintf(stderr, "openchimed: took the factor key %s into %s\n",
+                                           cfg->factor_key_file, identity_path);
+        else if (boot.factor < 0) {
             oc_dbwriter_set_factor_key(db, NULL);
-            fprintf(stderr, "openchimed: no factor key (%s): local accounts with a second step cannot sign in\n", why);
+            fprintf(stderr, "openchimed: no factor key (%s): local accounts with a second step cannot sign in\n",
+                    boot.factor_why);
         }
-        memset(fkey, 0, sizeof fkey);
     }
 
     /* The relay source (AUTH.md §3): the control plane this box is enrolled

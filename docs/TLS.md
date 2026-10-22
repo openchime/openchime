@@ -144,8 +144,8 @@ which would otherwise spin its input loop forever.
 comes from:
 
 - **`self`** (the default): a P-256 self-signed certificate made on first run,
-  kept in the database (ARCH-66b) and as `cert.pem` / `key.pem` in the data
-  directory.
+  kept in the identity database (ARCH-66b, `identity/identity.db`) and as
+  `cert.pem` / `key.pem` in the data directory.
 - **`file`**: the operator's own `cert.pem` and `key.pem` in the data directory
   (`OPENCHIME_DATA_DIR`), as given; refused at start if either is unreadable.
 - **`acme:<names>[;email=<address>][;directory=<url>]`**: ACME (RFC 8555) for
@@ -156,8 +156,11 @@ comes from:
   §8.9) — the default on a managed box, and refused without an enrollment.
 
 Until a CA-issued certificate is obtained the daemon presents its self-signed
-one; once one is, it is kept (migration 0049) and presented at once on every
-restart that still has the same source and names and has not run out.
+one; once one is, it is kept (migration 0049, in the identity since 0064) and
+presented at once on every restart that still has the same source and names and
+has not run out. The identity is replicated apart from the data (ARCH-3), so a
+box whose data is begun again or restored keeps its certificate rather than
+asking a CA for another.
 
 **ACME, with TLS-ALPN-01 (RFC 8737).** A worker thread (`daemon/certs.c`), started
 once the listener accepts, runs `oc_acme_issue` (`daemon/acme.c`): the directory

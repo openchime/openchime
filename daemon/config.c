@@ -299,12 +299,12 @@ static int pct_decode(const char *src, size_t n, char *dst, size_t cap) {
     return (int)o;
 }
 
-/* OPENCHIME_S3: s3://KEY:SECRET@host[:port]/bucket[?region=…], or http+s3://
- * for a plaintext endpoint (a fake in a test). Everything the backend needs is
+/* OPENCHIME_S3: s3://KEY:SECRET@host[:port]/bucket[/prefix][?region=…], or
+ * http+s3:// for a plaintext endpoint (a fake in a test). Everything the backend needs is
  * in the one value, so there is no partial set to mistake for local disk. */
 int cfg_parse_s3(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap) {
     (void)r;
-    static const char want[] = "must be s3://KEY:SECRET@host[:port]/bucket[?region=…] (http+s3:// for plaintext)";
+    static const char want[] = "must be s3://KEY:SECRET@host[:port]/bucket[/prefix][?region=…] (http+s3:// for plaintext)";
     const char *shown = "(set)";
     const char *p, *scheme;
     if (!strncmp(v, "s3://", 5)) { p = v + 5; scheme = "https://"; }
@@ -322,7 +322,22 @@ int cfg_parse_s3(oc_config *c, const cfg_row *r, const char *name, const char *v
     const char *bucket = slash + 1;
     const char *qm = strchr(bucket, '?');
     size_t bl = qm ? (size_t)(qm - bucket) : strlen(bucket);
-    if (!bl || memchr(bucket, '/', bl)) return fail(err, errcap, name, shown, "needs /bucket, one path segment");
+    /* /bucket, then optionally /prefix: the keys go under it, so several
+     * daemons can share a bucket, each in its own place (ARCH-70). */
+    const char *pslash = bl ? memchr(bucket, '/', bl) : NULL;
+    size_t pl = pslash ? bl - (size_t)(pslash + 1 - bucket) : 0;
+    if (pslash) bl = (size_t)(pslash - bucket);
+    if (!bl) return fail(err, errcap, name, shown, "needs /bucket");
+    if (pslash) {
+        const char *pp = pslash + 1;
+        if (!pl || pp[0] == '/' || pp[pl - 1] == '/') return fail(err, errcap, name, shown, "the prefix after /bucket/ must not be empty, or begin or end with /");
+        for (size_t k = 0; k < pl; k++) {
+            char c = pp[k];
+            int good = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                       c == '-' || c == '_' || c == '.' || (c == '/' && pp[k + 1] != '/');
+            if (!good) return fail(err, errcap, name, shown, "the prefix may hold letters, digits, - _ . and single /");
+        }
+    }
     const char *region = "us-east-1"; size_t rl = strlen(region);
     if (qm) {
         if (strncmp(qm + 1, "region=", 7) != 0 || !qm[8] || strchr(qm + 8, '&'))
@@ -348,7 +363,28 @@ int cfg_parse_s3(oc_config *c, const cfg_row *r, const char *name, const char *v
     c->s3.region = b;
     if (rl + 1 > cap) return fail(err, errcap, name, shown, "too long");
     memcpy(b, region, rl + 1);
+    b += rl + 1; cap -= rl + 1;
+    c->s3.prefix = NULL;
+    if (pslash) {
+        if (pl + 1 > cap) return fail(err, errcap, name, shown, "too long");
+        memcpy(b, pslash + 1, pl); b[pl] = '\0';
+        c->s3.prefix = b;
+    }
     return 0;
+}
+
+/* OPENCHIME_S3_FILE: OPENCHIME_S3's value from a file, so the key and secret
+ * are not in the environment (the image's entrypoint writes it, ARCH-3). */
+int cfg_parse_s3_file(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap) {
+    if (c->s3.endpoint) return fail(err, errcap, name, v, "set OPENCHIME_S3 or OPENCHIME_S3_FILE, not both");
+    char *text = read_file(v);
+    if (!text) { snprintf(err, errcap, "%s: cannot read %s", name, v); return -1; }
+    size_t n = strlen(text);
+    while (n && (text[n - 1] == '\n' || text[n - 1] == '\r')) text[--n] = '\0';
+    int rc = cfg_parse_s3(c, r, name, text, err, errcap);
+    memset(text, 0, n);
+    free(text);
+    return rc;
 }
 
 /* OPENCHIME_SUMMARY: off | local | cloud:<url>,<model>. */

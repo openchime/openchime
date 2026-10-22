@@ -54,18 +54,21 @@ container image and exists nowhere else.
 
 **The data directory's layout** is fixed: `openchime.db` (the database, which
 the daemon creates and migrates), `blobs/` (attachments on local disk, unless
-`OPENCHIME_S3`), `cert.pem` and `key.pem` (the certificate presented, written
-by the daemon or, with `OPENCHIME_TLS=file`, yours), `factor.key` (the key
-local accounts' second-step secrets are sealed under: back it up with the
-database) and `summary/` (the local summary model, fetched at the first start with
-`OPENCHIME_SUMMARY=local`). The
+`OPENCHIME_S3`), `identity/identity.db` (the box's identity, a database of its
+own: the certificates and their keys, the enrollment, the local issuer and the
+key local accounts' second-step secrets are sealed under; back it up with the
+database), `cert.pem` and `key.pem` (the certificate presented, written by the
+daemon or, with `OPENCHIME_TLS=file`, yours) and `summary/` (the local summary
+model, fetched at the first start with `OPENCHIME_SUMMARY=local`). A
+`factor.key` an older daemon left is taken into the identity at the first start
+and removed. The
 daemon makes the directory if it is absent (not its parents), and everything
 inside it. The speech features'
 data and the web client are not configuration: they are found at
 `/usr/share/openchime/{tts,stt,web}`, else beside the executable.
 
-**Replication, for the image only.** The image replicates `openchime.db` and
-restores it onto a box that has none when its deployment writes these files
+**Replication, for the image only.** The image replicates `openchime.db` and the
+identity, and restores each onto a box that has none, when its deployment writes these files
 under `/etc/openchime`, mode 0600 (ARCH-3, ARCH-39). They are the deployment's,
 not settings: the daemon never reads them, and no environment variable stands
 in for them.
@@ -73,10 +76,14 @@ in for them.
 | File | Holds |
 |---|---|
 | `replica-bucket` | The S3 bucket. |
-| `replica-prefix` | The workspace's area in the bucket, one path segment (`[a-z0-9-]+`); the database goes to `<prefix>/db`. |
-| `replica-accesskey` | The access key id for that area. |
+| `replica-prefix` | Where the data goes in the bucket, path segments of `[a-z0-9-]`; the database goes to `<prefix>/db`. |
+| `replica-accesskey` | The access key id for that place. |
 | `replica-secretkey` | Its secret. |
 | `replica-endpoint` | Optional: the S3 endpoint, `https://fly.storage.tigris.dev` when absent. |
+| `replica-identity-prefix` | Optional: where the identity goes, apart from the data (`<prefix>/db`). Without it the identity is not replicated. |
+| `replica-restore-at` | Optional: a time (RFC 3339). A database restored at this boot is the copy as it was then, not the latest; the identity is always the latest. |
+| `replica-restore-from` | Optional: where a database restored at this boot is read from, when not `replica-prefix`. An earlier copy is read from its own place while the box replicates to a new one, never on top of the old history. |
+| `replica-blob-prefix` | Optional: attachments in the bucket under it, with the same key, instead of under `blobs/` (written for the daemon as `OPENCHIME_S3_FILE`). Attachments already on the disk move there at the next start. |
 
 The first four come together or not at all: none is a box that is not
 replicated, some is a boot that stops. The entrypoint writes Litestream's
@@ -85,16 +92,18 @@ the key through Litestream's own variables, which the daemon's environment
 does not carry.
 
 **What a restore brings back.** The database holds the workspace: its people,
-channels and messages, and the identities kept beside them — the certificate and key
-(`server_identity`, rewritten to `cert.pem` and `key.pem` on boot, so the
-fingerprint people trusted survives, ARCH-66b), the enrollment with central
-(ARCH-84) and the local issuer. It is not the rest of the directory:
-attachments under `blobs/` are not replicated (with `OPENCHIME_S3` they were
-never on the box); nor is `factor.key`, deliberately, since a copy of the
-database must not give away the second step: a restored box makes a new one,
-and the second-step secrets sealed under the old one can no longer be opened,
-so local accounts that use one cannot pass it unless the old `factor.key` is
-put back; and `summary/` is fetched again.
+channels and messages. The identity, replicated on its own, holds what makes
+the box itself — the certificate and key (`server_identity`, rewritten to
+`cert.pem` and `key.pem` on boot, so the fingerprint people trusted survives,
+ARCH-66b), the CA-issued certificate, the enrollment with central (ARCH-84),
+the local issuer, and the factor key the second steps are sealed under. Kept
+apart, the data can be begun again or restored to an earlier time while the
+identity stays, and a copy of the data alone still gives away no second step.
+Attachments are kept with the replica under `replica-blob-prefix` when it is
+given, and otherwise are not replicated; `summary/` is fetched again. A box
+whose identity is lost while second-step secrets are kept does not make a new
+factor key that could never open them: it says so, and those accounts cannot
+pass their second step until the identity is restored.
 
 **No aliases.** A name that was a setting once is not read; a daemon started
 with one says what replaced it, or the constant it became, and stops (the
@@ -142,7 +151,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_MODE` | `normal` | What the box is for: `normal` (a deployment), `development` (the tests and harnesses; the only mode that reads the Development rows) or `demo` (the public demo workspace). One of `normal`, `development`, `demo`. |
 | `OPENCHIME_WORKSPACE_NAME` | *(empty)* | The workspace's display name, shown to clients; unset, a client derives one from the host. |
 | `OPENCHIME_MAX_VIDEO_SIZE` | `167772160` | The most bytes one video message may hold (REQ-164), at most the attachment cap of 209715200; clients learn it at sign-in and record within it. 160 MiB by default. Integer 1048576..209715200. |
-| `OPENCHIME_DATA_DIR` | `/data` | Where the daemon keeps everything: `openchime.db`, `blobs/`, `cert.pem`, `key.pem`, `factor.key`, `summary/`. The packages set `/var/lib/openchime`. |
+| `OPENCHIME_DATA_DIR` | `/data` | Where the daemon keeps everything: `openchime.db`, `identity/`, `blobs/`, `cert.pem`, `key.pem`, `summary/`. The packages set `/var/lib/openchime`. |
 | `OPENCHIME_PORT` | `8443` | The TLS port the protocol, the web client and the sign-in pages are served on, and the UDP port calls use (443 for a real deployment, ARCH-54). Integer 1..65535. |
 | `OPENCHIME_HEALTH_PORT` | `8080` | The plaintext port for `/healthz` and the landing page (ARCH-25); 0 opens none. Integer 0..65535. |
 | `OPENCHIME_JOIN` | *(unset)* | Who may join by signing in through a provider: `domain:`, `tenant:`, `subject:` and `owner:` rules, comma-separated (AUTH.md §8.4). Unset: only by invitation. |
@@ -157,7 +166,8 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_TLS` | `self` | The certificate the daemon presents (TLS.md): `self` (its own, made at first run), `file` (`cert.pem` and `key.pem` in the data directory), `acme:<names>[;email=…][;directory=…]` (RFC 8555 for the comma-separated names), or `central` (through the control plane; the default on a managed box). |
 | `OPENCHIME_AUTH` | `local` | Where accounts come from: `local` (passwords held here), `relay` (sign-in through the control plane this box is enrolled with, ARCH-56), or `local,relay`. |
 | `OPENCHIME_MFA` | `optional` | Whether local accounts are asked for a second step (AUTH.md §8.6). One of `off`, `optional`, `required`. |
-| `OPENCHIME_S3` | *(unset)* | Attachments in S3 instead of under the data directory (ARCH-70): `s3://KEY:SECRET@host[:port]/bucket[?region=…]`, or `http+s3://` for a plaintext endpoint; percent-encode `/`, `+` and `@` in the key and secret. Unset: local disk. |
+| `OPENCHIME_S3` | *(unset)* | Attachments in S3 instead of under the data directory (ARCH-70): `s3://KEY:SECRET@host[:port]/bucket[/prefix][?region=…]`, or `http+s3://` for a plaintext endpoint; percent-encode `/`, `+` and `@` in the key and secret. A prefix puts the keys under it, so several daemons can share a bucket. Unset: local disk. |
+| `OPENCHIME_S3_FILE` | *(unset)* | `OPENCHIME_S3`'s value, read from this file instead (mode 0600; a trailing newline is ignored), so the key and secret are not in the environment. Set one or the other, not both. |
 | `OPENCHIME_TTS` | `on` | Read-aloud (ARCH-111), in a build that carries it; off saves the voice model's memory. `on` or `off`. |
 | `OPENCHIME_STT` | `on` | Voice input (ARCH-112), in a build that carries it. `on` or `off`. |
 | `OPENCHIME_SUMMARY` | `off` | Summaries (REQ-310): `off`, `local` (the model runs inside the daemon, fetched on first start), or `cloud:<url>,<model>` (a hosted API's base URL and the model there). |
@@ -369,11 +379,17 @@ fail, bounded and silent.
 
 None of this is set by an operator directly; the daemon writes it and reads it
 back at startup, and it outranks the environment where the two overlap. Full
-column detail is in [SCHEMA.md](./SCHEMA.md).
+column detail is in [SCHEMA.md](./SCHEMA.md). The identity's rows —
+`server_identity`, `local_issuer`, `acme_account`, `tls_certificate`,
+`enrollment` and `factor_key` — are in `identity/identity.db`, attached as
+`ident` (migration 0064); the rest are in `openchime.db`. A database written
+by a newer daemon is refused at startup, before anything is written, with exit
+status 4.
 
 | Where | Written | What it controls |
 |---|---|---|
 | `schema_version` | By the migrator, one row per applied migration | Which migrations have run. At each boot every migration above the highest row is applied in its own transaction; a failure rolls that one back and stops the boot (ARCH-27). |
+| `ident.factor_key` (one row) | At first start with local accounts, or taken in from an older daemon's `factor.key` | The 32-byte key local accounts' second-step secrets are sealed under (AUTH.md §8.6). Never made anew while sealed secrets are kept. |
 | `server_identity` (one row) | On the first run that generates a TLS identity | The daemon's certificate and private key. When present it is written over `cert.pem` / `key.pem` in the data directory at startup, so a restored database keeps the fingerprint clients pinned (ARCH-10/66b). |
 | `local_issuer` (one row) | At first start | The key and issuer name that sign the ID token a browser sign-in on the daemon's own pages ends with (AUTH.md §8.10, migration 0050): a restored database still verifies what it signed. A private key. |
 | `acme_account`, `tls_certificate` (one row each) | When a CA-issued certificate is first obtained | The ACME account (with its CA's directory) and the certificate presented, with its source, names and expiry; presented at once on a restart that still has that source and those names (migration 0049). |

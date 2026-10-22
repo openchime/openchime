@@ -1351,8 +1351,30 @@ typedef struct oc_dbres {
 
 typedef struct oc_dbwriter oc_dbwriter;
 
-/* Open `path`, WAL + foreign_keys, migrate, start the thread. NULL on failure. */
+/* Open `path`, WAL + foreign_keys, migrate, start the thread. NULL on failure.
+ * The identity (ARCH-66b) is kept in memory: for tests and tools. */
 oc_dbwriter *oc_dbwriter_start(const char *path);
+
+/* What the daemon's own start asks of the store beyond oc_dbwriter_start, and
+ * what it learns. */
+typedef struct {
+    const char *identity_path;   /* the identity's own file (ARCH-66b, migration 0064); NULL: in memory */
+    const char *factor_key_file; /* where the factor key was kept before 0064; NULL: no factor key */
+    int  too_new;                /* out: the database was written by a newer daemon */
+    int  factor;                 /* out: 0 kept, 1 made, 2 taken in from the file, -1 none */
+    char factor_why[256];        /* out: why there is none */
+} oc_dbwriter_boot;
+
+/* As oc_dbwriter_start, with the identity in its own file and the factor key
+ * (AUTH.md §8.6) settled before the threads start: the identity's row, or the
+ * old file taken in once, or a new key -- but never a new key while second
+ * steps sealed under a lost one are kept, which would leave them unopenable
+ * without a word. NULL on failure; b->too_new says if that was the reason. */
+oc_dbwriter *oc_dbwriter_start_boot(const char *path, oc_dbwriter_boot *b);
+
+/* The issuer name this daemon's local accounts' tokens carry (AUTH.md §8.10),
+ * or NULL before it is loaded. */
+const char *oc_dbwriter_local_issuer_name(oc_dbwriter *w);
 void         oc_dbwriter_stop(oc_dbwriter *w);
 
 /* The eventfd the net thread registers in epoll; readable when results wait. */

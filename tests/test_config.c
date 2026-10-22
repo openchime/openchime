@@ -146,7 +146,9 @@ static void test_structured(void) {
     refuses("OPENCHIME_S3", "https://k:s@h/b");
     refuses("OPENCHIME_S3", "s3://k:s@h");                 /* no bucket */
     refuses("OPENCHIME_S3", "s3://k:s@h/");
-    refuses("OPENCHIME_S3", "s3://k:s@h/b/c");
+    refuses("OPENCHIME_S3", "s3://k:s@h/b/");               /* a prefix, if given, is not empty */
+    refuses("OPENCHIME_S3", "s3://k:s@h/b//c");
+    refuses("OPENCHIME_S3", "s3://k:s@h/b/c d");
     refuses("OPENCHIME_S3", "s3://k:s@/b");
     refuses("OPENCHIME_S3", "s3://k:@h/b");
     refuses("OPENCHIME_S3", "s3://k:s@h/b?colour=blue");
@@ -160,8 +162,32 @@ static void test_structured(void) {
     accepts("OPENCHIME_S3", "http+s3://k:s@127.0.0.1:9000/b");
     CHECK(!strcmp(oc_config_get()->s3.endpoint, "http://127.0.0.1:9000"));
     CHECK(!strcmp(oc_config_get()->s3.region, "us-east-1"));       /* the default */
+    /* A prefix after the bucket: the keys go under it (ARCH-70). */
+    accepts("OPENCHIME_S3", "s3://k:s@h/b/ws-1/data/2?region=auto");
+    CHECK(!strcmp(oc_config_get()->s3.bucket, "b"));
+    CHECK(oc_config_get()->s3.prefix && !strcmp(oc_config_get()->s3.prefix, "ws-1/data/2"));
+    CHECK(!strcmp(oc_config_get()->s3.region, "auto"));
+    accepts("OPENCHIME_S3", "s3://k:s@h/b");
+    CHECK(oc_config_get()->s3.prefix == NULL);
     accepts("OPENCHIME_S3", "");
     CHECK(oc_config_get()->s3.endpoint == NULL);                   /* local disk */
+
+    /* OPENCHIME_S3_FILE: the same URL from a file, a trailing newline ignored. */
+    {
+        char dir[512], path[600];
+        CHECK(oc_test_mkdtemp("s3file", dir, sizeof dir) == 0);
+        snprintf(path, sizeof path, "%s/s3", dir);
+        FILE *f = fopen(path, "w");
+        CHECK(f != NULL);
+        if (f) { fputs("s3://AK:S%2FK@h:9000/b/ws-1/data/1?region=auto\n", f); fclose(f); }
+        accepts("OPENCHIME_S3_FILE", path);
+        CHECK(oc_config_get()->s3.endpoint && !strcmp(oc_config_get()->s3.endpoint, "https://h:9000"));
+        CHECK(!strcmp(oc_config_get()->s3.secret_key, "S/K"));
+        CHECK(oc_config_get()->s3.prefix && !strcmp(oc_config_get()->s3.prefix, "ws-1/data/1"));
+        unlink(path);
+        refuses("OPENCHIME_S3_FILE", path);                     /* not there */
+        oc_test_rmtree(dir);
+    }
 
     /* OPENCHIME_SUMMARY. */
     refuses("OPENCHIME_SUMMARY", "cloud");
@@ -383,7 +409,7 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 21);     /* OPENCHIME_MODE among them */
+    CHECK(operator_rows == 22);     /* OPENCHIME_MODE among them */
     CHECK(managed_rows == 7);
     CHECK(dev_rows == 4 + 12);      /* the daemon's four, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);

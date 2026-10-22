@@ -2394,7 +2394,16 @@ static void test_index_mentions(void) {
                            "ALTER TABLE channels DROP COLUMN e2e;"
                            "ALTER TABLE invites DROP COLUMN used; ALTER TABLE invites DROP COLUMN uses;"
                            "ALTER TABLE local_credentials DROP COLUMN kdf;"
-                           "ALTER TABLE local_credentials ADD COLUMN iterations INTEGER NOT NULL DEFAULT 0;",
+                           "ALTER TABLE local_credentials ADD COLUMN iterations INTEGER NOT NULL DEFAULT 0;"
+                           /* Before 0064 the identity's tables were the data's. */
+                           "CREATE TABLE server_identity (id INTEGER PRIMARY KEY, cert_pem TEXT, key_pem TEXT, created_at_ms INTEGER);"
+                           "CREATE TABLE enrollment (id INTEGER PRIMARY KEY, privkey_pem TEXT, audience TEXT, state TEXT,"
+                           "  activated_at_ms INTEGER, created_at_ms INTEGER);"
+                           "CREATE TABLE acme_account (id INTEGER PRIMARY KEY, directory_url TEXT, account_key_pem TEXT,"
+                           "  account_url TEXT, created_at_ms INTEGER);"
+                           "CREATE TABLE tls_certificate (id INTEGER PRIMARY KEY, source TEXT, names TEXT, chain_pem TEXT,"
+                           "  key_pem TEXT, issued_at_ms INTEGER, not_after_ms INTEGER);"
+                           "CREATE TABLE local_issuer (id INTEGER PRIMARY KEY, key_pem TEXT, issuer TEXT, created_at_ms INTEGER);",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -4454,6 +4463,85 @@ static void test_tls_identity(void) {
 
     oc_dbwriter_stop(w);
     cleanup_db(path);
+}
+
+/* The factor key (AUTH.md §8.6) is kept in the identity (migration 0064): made
+ * once, kept across restarts, taken in from the file it used to be kept in, and
+ * never made anew while second steps sealed under a lost one are kept. */
+static void test_factor_key_in_identity(void) {
+    char dir[512];
+    CHECK(oc_test_mkdtemp("factor", dir, sizeof dir) == 0);
+    char db[600], ident[600], file[600];
+    snprintf(db, sizeof db, "%s/a.db", dir);
+    snprintf(ident, sizeof ident, "%s/a-identity.db", dir);
+    snprintf(file, sizeof file, "%s/factor.key", dir);
+
+    oc_dbwriter_boot b = { .identity_path = ident, .factor_key_file = file };
+    oc_dbwriter *w = oc_dbwriter_start_boot(db, &b);
+    CHECK(w != NULL && b.factor == 1 && !b.too_new);
+    CHECK(access(file, F_OK) != 0);   /* kept in the identity, not a file */
+    if (w) oc_dbwriter_stop(w);
+
+    w = oc_dbwriter_start_boot(db, &b);
+    CHECK(w != NULL && b.factor == 0);
+    if (w) oc_dbwriter_stop(w);
+
+    /* A box that kept it in the file before: taken in, and the file gone. */
+    char db2[600], ident2[600], file2[600];
+    snprintf(db2, sizeof db2, "%s/b.db", dir);
+    snprintf(ident2, sizeof ident2, "%s/b-identity.db", dir);
+    snprintf(file2, sizeof file2, "%s/b-factor.key", dir);
+    FILE *f = fopen(file2, "wb");
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)i;
+    CHECK(f && fwrite(key, 1, sizeof key, f) == sizeof key);
+    if (f) fclose(f);
+    chmod(file2, 0600);
+    oc_dbwriter_boot b2 = { .identity_path = ident2, .factor_key_file = file2 };
+    w = oc_dbwriter_start_boot(db2, &b2);
+    CHECK(w != NULL && b2.factor == 2);
+    CHECK(access(file2, F_OK) != 0);
+    if (w) oc_dbwriter_stop(w);
+    w = oc_dbwriter_start_boot(db2, &b2);
+    CHECK(w != NULL && b2.factor == 0);
+    if (w) oc_dbwriter_stop(w);
+
+    /* Second steps sealed in the data, and the identity lost: no new key. */
+    sqlite3 *raw = NULL;
+    CHECK(sqlite3_open(db, &raw) == SQLITE_OK);
+    CHECK(sqlite3_exec(raw,
+        "INSERT INTO users(id,subject,created_at_ms) VALUES(77,'local|sealed',0);"
+        "INSERT INTO local_totp(user_id,secret) VALUES(77,x'00');", NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(raw);
+    char p[640];
+    unlink(ident);
+    snprintf(p, sizeof p, "%s-wal", ident); unlink(p);
+    snprintf(p, sizeof p, "%s-shm", ident); unlink(p);
+    w = oc_dbwriter_start_boot(db, &b);
+    CHECK(w != NULL && b.factor == -1 && b.factor_why[0] != '\0');
+    if (w) oc_dbwriter_stop(w);
+    oc_test_rmtree(dir);
+}
+
+/* A database written by a newer daemon is refused, and said to be. */
+static void test_newer_database_refused_at_start(void) {
+    char dir[512];
+    CHECK(oc_test_mkdtemp("newer", dir, sizeof dir) == 0);
+    char db[600], ident[600];
+    snprintf(db, sizeof db, "%s/n.db", dir);
+    snprintf(ident, sizeof ident, "%s/n-identity.db", dir);
+    oc_dbwriter_boot b = { .identity_path = ident };
+    oc_dbwriter *w = oc_dbwriter_start_boot(db, &b);
+    CHECK(w != NULL);
+    if (w) oc_dbwriter_stop(w);
+    sqlite3 *raw = NULL;
+    CHECK(sqlite3_open(db, &raw) == SQLITE_OK);
+    CHECK(sqlite3_exec(raw, "INSERT INTO schema_version(version) VALUES(100000);", NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(raw);
+    w = oc_dbwriter_start_boot(db, &b);
+    CHECK(w == NULL && b.too_new == 1);
+    if (w) oc_dbwriter_stop(w);
+    oc_test_rmtree(dir);
 }
 
 /* First-owner setup token (REQ-024): a fresh tenant mints a one-time owner
@@ -8439,6 +8527,8 @@ int run_dbwriter_tests(void) {
     test_enable_user();
     test_session_policy();
     test_tls_identity();
+    test_factor_key_in_identity();
+    test_newer_database_refused_at_start();
     test_delivery_cursor();
     test_mark_all_read();
     test_idem_pruning();

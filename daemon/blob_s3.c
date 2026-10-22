@@ -1,5 +1,5 @@
 /* S3 backend for the oc_blobstore seam (ARCH-70). Speaks the S3 REST API
- * (path-style `/<bucket>/<key>`), signing each request with SigV4
+ * (path-style `/<bucket>/[<prefix>/]<key>`), signing each request with SigV4
  * (daemon/sigv4.c) and streaming the body with
  * `x-amz-content-sha256: UNSIGNED-PAYLOAD` so an upload/download need not be
  * buffered whole. Selected by the presence of S3 credentials (blobstore.c);
@@ -44,6 +44,7 @@ typedef struct {
     char host[256];       /* host only, for connect() + SNI/cert check */
     char port[16];
     char bucket[256];
+    char prefix[256];     /* keys go under it; "" for the bucket's root */
     char region[64];
     char ak[256];
     char sk[256];
@@ -114,6 +115,10 @@ static void *s3_open(const char *base_dir, const void *backend_cfg) {
         return NULL;
     }
     snprintf(s->bucket, sizeof s->bucket, "%s", bucket);
+    if (c3->prefix && snprintf(s->prefix, sizeof s->prefix, "%s", c3->prefix) >= (int)sizeof s->prefix) {
+        if (s->use_tls) oc_tls_client_free(&s->tls);
+        free(s); return NULL;
+    }
     snprintf(s->region, sizeof s->region, "%s", c3->region && *c3->region ? c3->region : "us-east-1");
     snprintf(s->ak, sizeof s->ak, "%s", ak);
     snprintf(s->sk, sizeof s->sk, "%s", sk);
@@ -227,7 +232,8 @@ static void iso8601(char amzdate[20], char datestamp[12]) {
 static int send_request(const s3_store *s, s3_conn *c, const char *method,
                         const char *key, long long content_length) {
     char uri[600];
-    if (snprintf(uri, sizeof uri, "/%s/%s", s->bucket, key) >= (int)sizeof uri) return -1;
+    if (snprintf(uri, sizeof uri, "/%s/%s%s%s", s->bucket, s->prefix, s->prefix[0] ? "/" : "", key)
+        >= (int)sizeof uri) return -1;
     char amzdate[20], datestamp[12];
     iso8601(amzdate, datestamp);
     char auth[600];

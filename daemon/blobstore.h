@@ -46,6 +46,14 @@ void oc_blob_get_close(oc_blob_reader *r);
 /* Remove a blob. Returns 0 on success or if it was already absent, <0 on error. */
 int oc_blob_delete(oc_blobstore *bs, const char *key);
 
+/* Move every blob the local backend left under `dir` into `bs`, a remote store
+ * (OPENCHIME_S3 turned on for a daemon that kept its attachments on disk):
+ * each is uploaded under its own key, then removed. Counts what moved and what
+ * failed (left in place, for the next start). 0, or -1 if `dir` could not be
+ * read; nothing to do for a local store. Blocking: before serving, not on the
+ * loop. */
+int oc_blobstore_take_local(oc_blobstore *bs, const char *dir, int *moved, int *failed);
+
 /* ARCH-69, checked rather than inferred: blob I/O never runs on the event loop.
  * A loop marks its own thread (on at start, off at exit); every operation above
  * that runs on a marked thread is counted, process-wide. The loop only opens
