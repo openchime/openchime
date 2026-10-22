@@ -329,6 +329,10 @@ jobs:
       TESTED_AS: build   # the record's suffix (its last two steps)
     timeout-minutes: 90   # a cold cache builds the vendored libraries: ~44 min
     steps:
+      # Every CPU the runner has, for every make below and the makes they
+      # start (the Makefile is safe under -j; locally nothing changes).
+      - name: Use every CPU for make
+        run: echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - name: Install build deps
         timeout-minutes: 20
@@ -376,9 +380,10 @@ jobs:
           path: *wasm_path
           key: *wasm_key
       # The daemon as the release builds it (every feature, the web client in),
-      # the e2e client the step below drives, and the Linux terminal client.
+      # the e2e client the step below drives, and the Linux terminal client: one
+      # make, so the web client's link overlaps the other compiles.
       - name: Build the daemon, the e2e client and the terminal client
-        run: make TTS=1 STT=1 SUM=1 WEB=1 && make build/e2e_client linux
+        run: make TTS=1 STT=1 SUM=1 WEB=1 all build/e2e_client linux
       # Only the C runtime may be dynamic. ONNX Runtime, llama.cpp, their C++
       # runtime, mbedTLS, libopus and SQLite are all inside the binary, so anything else
       # appearing here is a dependency that crept back in.
@@ -476,6 +481,10 @@ jobs:
     env:
       TESTED_AS: tsan
     steps:
+      # Every CPU the runner has, for every make below and the makes they
+      # start (the Makefile is safe under -j; locally nothing changes).
+      - name: Use every CPU for make
+        run: echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - name: Install build deps
         timeout-minutes: 20
@@ -510,6 +519,10 @@ jobs:
     env:
       TESTED_AS: windows
     steps:
+      # Every CPU the runner has, for every make below and the makes they
+      # start (the Makefile is safe under -j; locally nothing changes).
+      - name: Use every CPU for make
+        run: echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - name: Install build deps
         timeout-minutes: 20

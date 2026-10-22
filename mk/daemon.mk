@@ -62,9 +62,19 @@ ifneq ($(filter 1,$(TTS) $(STT)),)
 ORT_LIBS := $(ORT_A) $(TTS_CXXLIB) -lm -Wl,--gc-sections -Wl,-z,noexecstack
 endif
 
-$(BIN): $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP) $(FEATURES) $(BUILD_ID_STAMP) $(TOOLCHAIN_DEPS)
+# One object per source (mk/sources.mk, "Objects"), compiled with exactly the
+# flags the daemon always had, and linked in the sources' order. Every object
+# is recompiled when the compiler, the features (which change the flags) or the
+# build id (compiled into every object, as it always was) change; the vendored
+# libraries only have to exist first, their headers being tracked by the .d
+# files like ours.
+DAEMON_CC   = $(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS)
+DAEMON_OBJS := $(call oc_objs,$(OBJ_DIR)/daemon,$(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC))
+$(eval $(call oc_obj_rules,$(OBJ_DIR)/daemon,DAEMON_CC,$(CC_STAMP) $(FEATURES) $(BUILD_ID_STAMP) $(TOOLCHAIN_DEPS),$(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS)))
+-include $(DAEMON_OBJS:.o=.d)
+$(BIN): $(DAEMON_OBJS) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP) $(FEATURES) $(TOOLCHAIN_DEPS)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS) -o $@ $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(SUM_LIBS) $(ORT_LIBS) $(SUM_CXX) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(DAEMON_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(SUM_LIBS) $(ORT_LIBS) $(SUM_CXX) $(LDFLAGS)
 
 # The data directories, and their manifests written by the daemon just built --
 # so the version they name is exactly the version compiled in. Rebuilt whenever
@@ -75,15 +85,22 @@ $(BIN): $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS)
 # needs an engine linked in -- so the arm64 build no longer compiles the host's
 # ONNX Runtime and llama.cpp for a binary that only writes two files. Its own
 # features file and binary path, so a developer's remembered features and host
-# daemon are left as they were.
+# daemon are left as they were; and its own generated sources, objects,
+# compiler stamp, build-id stamp and SQLite and Argon2 objects, because under
+# `make -j` it runs while this build does: sharing $(GEN_DIR) it would rewrite
+# webapp_res.c without the web client, and the cross-built daemon would link
+# that copy and ship without its client.
 ifeq ($(ARCH_SUFFIX),)
 MANIFEST_BIN := $(BIN)
 else
-MANIFEST_BIN := build/manifest-host/openchimed
+MANIFEST_DIR := build/manifest-host
+MANIFEST_BIN := $(MANIFEST_DIR)/openchimed
 $(MANIFEST_BIN): FORCE
 	@mkdir -p $(dir $@)
 	@$(MAKE) --no-print-directory ARCH=$(HOST_ARCH) RELEASE=0 CC=cc CXX=c++ OC_ARCH= \
-	    TTS=0 STT=0 SUM=0 WEB=0 FEATURES=build/manifest-host/.features BIN=$@ $@
+	    TTS=0 STT=0 SUM=0 WEB=0 FEATURES=$(MANIFEST_DIR)/.features BIN=$@ \
+	    GEN_DIR=$(MANIFEST_DIR)/gen OBJ_DIR=$(MANIFEST_DIR)/obj CC_STAMP=$(MANIFEST_DIR)/.cc \
+	    BUILD_ID_STAMP=$(MANIFEST_DIR)/.build_id SQLITE_O=$(MANIFEST_DIR)/sqlite3.o ARGON2_O=$(MANIFEST_DIR)/argon2.o $@
 endif
 tts/manifest: $(MANIFEST_BIN) $(KITTEN) build/kitten/voices.npz ttskit/data/en-US/lexicon.bin ttskit/data/en-US/guesses.bin
 	mkdir -p tts/en-US

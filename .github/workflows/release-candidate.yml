@@ -311,6 +311,10 @@ jobs:
       PLATFORM: linux-${{ matrix.arch }}
       DIST: dist/linux-${{ matrix.arch }}
     steps:
+      # Every CPU the runner has, for every make below and the makes they
+      # start (the Makefile is safe under -j; locally nothing changes).
+      - name: Use every CPU for make
+        run: echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
 
       # The toolchains make fetches pinned (mk/toolchains.mk): zig, whose
@@ -862,6 +866,10 @@ jobs:
       BUILD_ID: ${{ needs.id.outputs.build_id }}
       BUILD_NUM: ${{ needs.id.outputs.run_number }}
     steps:
+      # Every CPU the runner has, for every make below and the makes they
+      # start (the Makefile is safe under -j; locally nothing changes).
+      - name: Use every CPU for make
+        run: echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - name: Install build dependencies
         timeout-minutes: 20

@@ -59,7 +59,9 @@ $(ORT_A): daemon/ort.ops.config $(TOOLCHAIN_DEPS)
 # A cross build runs the host's protoc, which the script builds on its own
 # when the host has none: protoc alone, from the same pinned sources, a few
 # minutes rather than the host's whole archive (scripts/build/onnxruntime.sh).
-$(KITTEN) build/kitten/voices.npz: scripts/build/kitten.sh scripts/build/tts_convert.c
+# One run of the script makes both files (grouped, &:), so `make -j` never runs
+# two downloads into the same files at once.
+$(KITTEN) build/kitten/voices.npz &: scripts/build/kitten.sh scripts/build/tts_convert.c
 	@echo "openchime: fetching the Kitten voice model (once)"
 	scripts/build/kitten.sh
 	@touch -c $(KITTEN) build/kitten/voices.npz   # the script leaves a current model alone
@@ -77,6 +79,12 @@ $(LLAMA_A): scripts/build/llamacpp.sh $(TOOLCHAIN_DEPS)
 	@echo "openchime: building llama.cpp for summaries (a few minutes, once; make SUM=0 skips it)"
 	scripts/build/llamacpp.sh
 	@touch -c $@   # the script leaves a current build alone
+# Never at the same time as ONNX Runtime, when both are built: each is a large
+# C++ build using every CPU, and together, on a cold cache, they can run a
+# small machine (2 CPUs, 7 GB) out of memory.
+ifneq ($(filter 1,$(TTS) $(STT)),)
+$(LLAMA_A): | $(ORT_A)
+endif
 
 # The common-password list (third_party/pwlist), compiled in (daemon/pwpolicy.c).
 $(PWLIST_RES): third_party/pwlist/common.txt scripts/build/pw_common.py

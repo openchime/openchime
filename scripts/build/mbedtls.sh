@@ -50,16 +50,30 @@ SRC="mbedtls-${MBEDTLS_VERSION}${OC_ARCH:+-$OC_ARCH}"
 TARBALL="mbedtls-${MBEDTLS_VERSION}.tar.bz2"
 URL="https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBEDTLS_VERSION}/${TARBALL}"
 
+# One run at a time over the tree: under `make -j` the host's build, a cross
+# build's and the wasm copy (scripts/build/mbedtls_wasm.sh, which holds this
+# lock while it copies and sets OC_MBEDTLS_LOCKED for the run it makes) can
+# start together, and each must see the tree fetched, configured and built
+# whole, not half-way. Held from the check to the end of the build.
+if [ -z "${OC_MBEDTLS_LOCKED:-}" ] && command -v flock >/dev/null; then
+  exec {lock_fd}>".mbedtls-${MBEDTLS_VERSION}.lock"
+  flock "${lock_fd}"
+fi
+
 if [ ! -f "${SRC}/library/libmbedtls.a" ]; then
   if [ ! -d "${SRC}" ]; then
     echo "build_mbedtls: downloading ${URL}"
-    curl -fsSL -o "${TARBALL}" "${URL}"
-    verify_tarball "${TARBALL}"
+    # A name of this run's own, so no other fetch of the same release (the
+    # host's and a cross build's share one) can write into it.
+    tmp="$(mktemp "${TARBALL}.XXXXXX")"
+    trap 'rm -f "${tmp}"' EXIT
+    curl -fsSL -o "${tmp}" "${URL}"
+    verify_tarball "${tmp}"
     # Into its own directory, never over the host's build beside it.
     rm -rf "${SRC}.new" && mkdir -p "${SRC}.new"
-    tar -xjf "${TARBALL}" -C "${SRC}.new" --strip-components=1
+    tar -xjf "${tmp}" -C "${SRC}.new" --strip-components=1
     mv "${SRC}.new" "${SRC}"
-    rm -f "${TARBALL}"
+    rm -f "${tmp}"
   fi
   # Thread safety: OpenChime uses mbedTLS from multiple threads — the client
   # app-core runs a network thread per connection, and the test suite drives

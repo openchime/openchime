@@ -27,14 +27,20 @@ TEST_INC  := $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_I
 # Sorted: the daemon and the text layout both carry utf8proc, compiled once.
 TEST_ALL_SRC := $(sort $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) \
                 $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC))
-TEST_DEPS := $(TEST_ALL_SRC) $(VOICE_HDRS) $(CALL_HDRS) $(HDRS) $(MEDIA_HDRS) \
-             $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/app/theme.h) \
-             $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP)
+# One object per source, in a tree of its own (mk/sources.mk, "Objects"),
+# compiled with the flags the binary always had; the link takes them in the
+# sorted order above, then SQLite and Argon2 (the daemon's own objects) and the
+# vendored libraries, which only have to exist before anything compiles.
+TEST_CC     = $(CC) $(CFLAGS) -O0 -g $(TEST_INC)
+TEST_OBJS   := $(call oc_objs,$(OBJ_DIR)/test,$(TEST_ALL_SRC))
+TEST_VENDOR := $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A)
+$(eval $(call oc_obj_rules,$(OBJ_DIR)/test,TEST_CC,$(CC_STAMP),$(TEST_VENDOR)))
+-include $(TEST_OBJS:.o=.d)
 test: $(TEST_BIN) $(BIN)
 	@$(SOURCE_CHECKS)
 	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" ./$(TEST_BIN)
-$(TEST_BIN): $(TEST_DEPS) | build
-	$(CC) $(CFLAGS) -O0 -g $(TEST_INC) $(TEST_ALL_SRC) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
+$(TEST_BIN): $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build
+	$(CC) $(CFLAGS) -O0 -g $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
 
 # --- CI's split (docs/TESTING.md §2.4) ----------------------------------------
 # The suites whose code runs threads -- the loop and its I/O threads, the
@@ -42,7 +48,9 @@ $(TEST_BIN): $(TEST_DEPS) | build
 # run under ThreadSanitizer and the rest plainly, so every suite runs once
 # there, never twice. A suite with no thread cannot race, and instrumenting it
 # only makes it slower. test-ci refuses outside CI, before its long build. CI
-# runs its halves in parallel jobs: PART=plain or PART=threads; unset, both.
+# runs its halves in parallel jobs: PART=plain or PART=threads; unset, both,
+# one after the other: each binary already runs as many suites at once as
+# there are CPUs, and under -j the two would otherwise run together.
 comma := ,
 TSAN_LIST := run_netloop_tests run_client_core_tests run_dbwriter_tests run_ioloop_tests \
              run_authpool_tests run_xferpool_tests run_slow_blob_tests run_storage_tests \
@@ -58,23 +66,30 @@ TSAN_SUITES := $(subst $(eval) ,$(comma),$(strip $(TSAN_LIST)))
 TSAN_BIN := build/tests-tsan
 ci-only:
 	@if [ -z "$$CI" ]; then echo "make test-ci runs in CI only; locally, run make test"; exit 1; fi
+TEST_CI_PARTS := $(if $(filter plain,$(PART)),test-ci-plain,$(if $(filter threads,$(PART)),test-ci-threads,test-ci-plain test-ci-threads))
 test-ci: ci-only
-	@$(MAKE) --no-print-directory $(if $(filter plain,$(PART)),test-ci-plain,$(if $(filter threads,$(PART)),test-ci-threads,test-ci-plain test-ci-threads))
+	@$(foreach t,$(TEST_CI_PARTS),$(MAKE) --no-print-directory $(t) &&) true
 test-ci-plain: ci-only $(TEST_BIN) $(BIN)
 	@$(SOURCE_CHECKS)
 	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" OC_TEST_EXCEPT="$(TSAN_SUITES)" ./$(TEST_BIN)
 test-ci-threads: ci-only $(TSAN_BIN)
 	OC_TEST_ONLY="$${OC_TEST_ONLY:-$(TSAN_SUITES)}" \
 	TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 suppressions=$(CURDIR)/tests/tsan.supp" setarch $$(uname -m) -R ./$(TSAN_BIN)
-$(TSAN_BIN): $(TEST_DEPS) | build
-	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TEST_INC) $(TEST_ALL_SRC) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
+TSAN_CC   = $(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TEST_INC)
+TSAN_OBJS := $(call oc_objs,$(OBJ_DIR)/tsan,$(TEST_ALL_SRC))
+$(eval $(call oc_obj_rules,$(OBJ_DIR)/tsan,TSAN_CC,$(CC_STAMP),$(TEST_VENDOR)))
+-include $(TSAN_OBJS:.o=.d)
+$(TSAN_BIN): $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
 
 # --- The release's compiler (CI) ----------------------------------------------
 # The daemon's sources through the RELEASE's compiler, with the release's flags,
 # stopping short of the link (the release links an ONNX Runtime built by the same
-# compiler, which CI does not build). A newer clang refuses things CI's accepts --
-# a declaration after a label, a C23 extension, broke a release this way -- and
-# the release is the wrong place to learn it. `RELEASE_CC` is what release.yml
+# compiler, which CI does not build): real objects, under build/relcc, since
+# some warnings are raised only while generating code, one rule per object so
+# that `make -j` compiles them all at once. A newer clang refuses things CI's
+# accepts -- a declaration after a label, a C23 extension, broke a release this
+# way -- and the release is the wrong place to learn it. `RELEASE_CC` is what release.yml
 # compiles with. The same compiler then goes over everything else CI builds for
 # Linux -- the client app-core, its media, voice and call code, and the tests --
 # so this one clang pass is the tree's second-compiler check as well: -Werror
@@ -82,13 +97,22 @@ $(TSAN_BIN): $(TEST_DEPS) | build
 RELEASE_CC ?= $(ZIG) cc -target x86_64-linux-gnu.2.34
 RELEASE_CC_TEST_SRC := $(TEST_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) \
                        $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC)
-check-release-cc: $(ZIG) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(WEBAPP_RES) $(PWLIST_RES)
-	@for f in $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC); do \
-	  $(RELEASE_CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS) -c -o /dev/null $$f || exit 1; \
-	done
-	@for f in $(RELEASE_CC_TEST_SRC); do \
-	  $(RELEASE_CC) $(CFLAGS) $(TEST_INC) -c -o /dev/null $$f || exit 1; \
-	done; echo "check-release-cc: $(words $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(RELEASE_CC_TEST_SRC)) sources clean"
+# The release compiler as a file, like $(CC_STAMP): a different one recompiles.
+RELCC_DIR   := build/relcc
+RELCC_STAMP := $(RELCC_DIR)/.cc
+$(RELCC_STAMP): FORCE | build
+	@mkdir -p $(dir $@)
+	@echo '$(RELEASE_CC)' | cmp -s - $@ || echo '$(RELEASE_CC)' > $@
+RELCC_DAEMON_CC   = $(RELEASE_CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS)
+RELCC_TEST_CC     = $(RELEASE_CC) $(CFLAGS) $(TEST_INC)
+RELCC_DAEMON_OBJS := $(call oc_objs,$(RELCC_DIR)/daemon,$(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC))
+RELCC_TEST_OBJS   := $(call oc_objs,$(RELCC_DIR)/test,$(RELEASE_CC_TEST_SRC))
+RELCC_VENDOR      := $(ZIG) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A)
+$(eval $(call oc_obj_rules,$(RELCC_DIR)/daemon,RELCC_DAEMON_CC,$(RELCC_STAMP) $(FEATURES) $(BUILD_ID_STAMP),$(RELCC_VENDOR),@))
+$(eval $(call oc_obj_rules,$(RELCC_DIR)/test,RELCC_TEST_CC,$(RELCC_STAMP),$(RELCC_VENDOR),@))
+-include $(RELCC_DAEMON_OBJS:.o=.d) $(RELCC_TEST_OBJS:.o=.d)
+check-release-cc: $(RELCC_DAEMON_OBJS) $(RELCC_TEST_OBJS)
+	@echo "check-release-cc: $(words $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(RELEASE_CC_TEST_SRC)) sources clean"
 
 # --- Tool binaries, built by path ---------------------------------------------
 # The e2e client CI's build job drives against a natively-run daemon (docs/
