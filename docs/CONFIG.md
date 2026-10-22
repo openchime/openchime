@@ -64,6 +64,38 @@ inside it. The speech features'
 data and the web client are not configuration: they are found at
 `/usr/share/openchime/{tts,stt,web}`, else beside the executable.
 
+**Replication, for the image only.** The image replicates `openchime.db` and
+restores it onto a box that has none when its deployment writes these files
+under `/etc/openchime`, mode 0600 (ARCH-3, ARCH-39). They are the deployment's,
+not settings: the daemon never reads them, and no environment variable stands
+in for them.
+
+| File | Holds |
+|---|---|
+| `replica-bucket` | The S3 bucket. |
+| `replica-prefix` | The workspace's area in the bucket, one path segment (`[a-z0-9-]+`); the database goes to `<prefix>/db`. |
+| `replica-accesskey` | The access key id for that area. |
+| `replica-secretkey` | Its secret. |
+| `replica-endpoint` | Optional: the S3 endpoint, `https://fly.storage.tigris.dev` when absent. |
+
+The first four come together or not at all: none is a box that is not
+replicated, some is a boot that stops. The entrypoint writes Litestream's
+configuration from them to `/run/litestream.yml` at boot and hands Litestream
+the key through Litestream's own variables, which the daemon's environment
+does not carry.
+
+**What a restore brings back.** The database holds the workspace: its people,
+channels and messages, and the identities kept beside them — the certificate and key
+(`server_identity`, rewritten to `cert.pem` and `key.pem` on boot, so the
+fingerprint people trusted survives, ARCH-66b), the enrollment with central
+(ARCH-84) and the local issuer. It is not the rest of the directory:
+attachments under `blobs/` are not replicated (with `OPENCHIME_S3` they were
+never on the box); nor is `factor.key`, deliberately, since a copy of the
+database must not give away the second step: a restored box makes a new one,
+and the second-step secrets sealed under the old one can no longer be opened,
+so local accounts that use one cannot pass it unless the old `factor.key` is
+put back; and `summary/` is fetched again.
+
 **No aliases.** A name that was a setting once is not read; a daemon started
 with one says what replaced it, or the constant it became, and stops (the
 table at the end lists them).
@@ -362,14 +394,15 @@ level, schedule, pause and time zone (`users.notify_default`, `dnd_mode`,
 
 ## SQLite settings
 
-Fixed in code (`daemon/dbwriter.c`); nothing in the environment changes them.
+Fixed in code (`daemon/dbwriter.c`, and `daemon/push.c` for the push emitter's
+read-only connection); nothing in the environment changes them.
 
 | Setting | Value | Why |
 |---|---|---|
 | `journal_mode` | `WAL` | Readers run beside the single writer without blocking it (ARCH-2/66). |
 | `foreign_keys` | `ON` | The schema's references and cascades are enforced. |
 | `query_only` (read connections) | `1` | Queries go through three further connections that cannot write (ARCH-66). |
-| `busy_timeout` (read connections) | 5000 ms | How long a read waits on a lock before failing. |
+| `busy_timeout` (every connection) | 5000 ms | How long a read or a commit waits on a lock before failing. The writer needs it too because a replicator beside the daemon (the image's Litestream, ARCH-3) holds the write lock for a moment at each checkpoint. |
 
 ## Command line
 

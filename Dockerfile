@@ -15,6 +15,11 @@
 # bookworm's glibc is 2.36, above the 2.34 the binary is linked against. No
 # packages are added: the CA roots the daemon's outbound TLS verifies against
 # are compiled in (ARCH-10), and it creates and migrates its own database.
+#
+# Litestream (static, fetched and checksummed by image-context.sh) is the
+# replicator a hosted deployment turns on by writing its replica-* files under
+# /etc/openchime; the entrypoint writes Litestream's configuration from them at
+# boot, and without them never starts it (ARCH-3, ARCH-39).
 FROM debian:bookworm-slim
 
 COPY --chmod=755 openchimed /usr/local/bin/openchimed
@@ -22,6 +27,11 @@ COPY --chmod=755 openchimed /usr/local/bin/openchimed
 COPY tts /usr/share/openchime/tts
 COPY stt /usr/share/openchime/stt
 COPY web /usr/share/openchime/web
+COPY --chmod=755 litestream /usr/local/bin/litestream
+COPY litestream-LICENSE /usr/share/doc/litestream/LICENSE
+# The daemon's own roots (third_party/ca-roots) as PEM, for Litestream alone:
+# the entrypoint names it to Litestream, and the base has no other bundle.
+COPY ca-roots.pem /usr/share/openchime/ca-roots.pem
 COPY --chmod=755 entrypoint.sh /entrypoint.sh
 
 ENV OPENCHIME_DATA_DIR=/data

@@ -14,6 +14,11 @@
 # CMUdict; voice input (ARCH-112) likewise, with ONNX Runtime and Moonshine. A
 # daemon built with `make TTS=0`, `STT=0` or `SUM=0` is described with the same here.
 #
+# Litestream (Apache-2.0) is not here for the same reason: it is a separate
+# program, in the container image only, never linked into openchimed nor in
+# the tarball this file describes. Its own LICENSE travels beside it in the
+# image (packaging/image-context.sh, /usr/share/doc/litestream/LICENSE).
+#
 #   [TTS=0] [STT=0] [SUM=0] licenses.sh <mbedtls-dir>
 set -euo pipefail
 

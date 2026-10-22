@@ -601,10 +601,13 @@ where one exists.
   durability, and therefore the deployment's recovery point objective, has been
   a property of the deployment rather than of the daemon** (ARCH-3): in the
   hosted model the operator of the box has provided continuous replication and
-  stated an RPO (implemented in the control plane, not this repo); in the
-  self-hosted models the operator has backed up the SQLite file by their own
-  means, and their RPO has been whatever that backup schedule gives them. The
-  daemon has neither required nor assumed any particular backup mechanism.
+  stated an RPO — the control plane provides the bucket and the key, and the
+  image's replicator, which only they turn on, has streamed the database to it
+  at least once a minute and restored it onto a box that found none, refusing
+  to start when it could not; in the self-hosted models the operator has backed
+  up the SQLite file by their own means, and their RPO has been whatever that
+  backup schedule gives them. The daemon has neither required nor assumed any
+  particular backup mechanism.
 - **REQ-095.** The system has optionally surfaced **read state** — for a direct
   message, whether the other participant has seen a message; for a channel, an
   aggregate "seen by" on inspection — derived from the per-(user, channel)

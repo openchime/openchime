@@ -288,6 +288,7 @@ and that machine then persists no credential at all (headless / no D-Bus). They 
 | Image / tool | Version | Purpose | License | Source |
 |--------------|---------|---------|---------|--------|
 | **Debian** | `bookworm-slim` | Runtime base of the published image (glibc 2.36, above the binary's 2.34 floor) | mixed (base OS) | https://www.debian.org |
+| **Litestream** | 0.5.17 | In the image only: streams `openchime.db` to the deployment's bucket and restores it onto a box that has none, to `<prefix>/db` when the deployment writes its `replica-*` files (ARCH-3, ARCH-39; CONFIG.md); a separate program, not linked into the daemon | Apache-2.0 (its `LICENSE` ships in the image at `/usr/share/doc/litestream/LICENSE`) | https://github.com/benbjohnson/litestream |
 
 One image, and it is an **output** rather than a tool: the OCI image published to
 Fly's registry (`registry.fly.io/openchime-daemon-<environment>`) for the hosted model (ARCH-20/76). Nothing is compiled in it: the Dockerfile
@@ -296,8 +297,27 @@ lays the release tarball's daemon, speech data and web client onto the base
 packages, and the arm64 image is built on the x86 runner with no emulation. It
 adds no packages: the daemon links everything it needs, CA roots included.
 
+Litestream is the one other program in it. `packaging/image-context.sh` fetches
+the release's static `litestream-0.5.17-linux-{x86_64,arm64}.tar.gz` for the
+image's architecture and checks it against the SHA-256 the release publishes
+(`checksums.txt`) before unpacking it; the two digests are pinned in the
+script, and a version bump changes the version and both digests together. It
+is the release the control plane runs for its own database. The base has no CA
+bundle, so the context also carries the daemon's own Mozilla roots
+(`third_party/ca-roots`) written back out as PEM, which Litestream alone is
+pointed at. The image carries no Litestream configuration: the entrypoint
+writes it at boot from the deployment's `replica-*` files and passes the key in
+Litestream's own `LITESTREAM_ACCESS_KEY_ID`/`LITESTREAM_SECRET_ACCESS_KEY`.
+Litestream is not in the packages or the tarball: only the image can be told
+to replicate.
+
+The release-candidate's image check fetches one more tool, never shipped:
+**rclone** v1.75.2 (MIT, https://github.com/rclone/rclone), checked against its
+published SHA-256, whose `serve s3` is the bucket the image replicates to and
+restores from on the runner (TESTING.md §3.2).
+
 The project runs no containers for development or testing (ARCH-36), so this
-table holds exactly one row. The sole image the repo builds on is the
+table holds exactly one image. The sole image the repo builds on is the
 `FROM debian:bookworm-slim` in `Dockerfile` (the only other image named is
 `rockylinux:9`, which the release's dnf smoke runs under podman) — a tag rather than a digest, which
 is the upstream's own stability contract for a base OS.

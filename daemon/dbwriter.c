@@ -11382,6 +11382,10 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
         fprintf(stderr, "dbwriter: open %s failed: %s\n", path, sqlite3_errmsg(w->db));
         goto fail;
     }
+    /* A replicator beside the daemon (the image's Litestream, ARCH-3) takes the
+     * write lock for a moment at each checkpoint: the writer waits it out, as
+     * the readers do, rather than failing a commit with SQLITE_BUSY. */
+    sqlite3_busy_timeout(w->db, 5000);
     char *err = NULL;
     if (sqlite3_exec(w->db, "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;",
                      NULL, NULL, &err) != SQLITE_OK) {

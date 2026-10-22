@@ -38,9 +38,11 @@ The codebase splits cleanly by testability:
 - **Integration tier** — the whole daemon running as a process, exercised over
   its real wire protocol against its real SQLite path. This is where behavior
   that is unreachable from a unit test — the deployed image, TLS termination,
-  and the protocol vertical end to end — is proven. Off-box backup is **not**
-  exercised here: it is a deployment concern (ARCH-3), and in the hosted model
-  it lives with the control plane.
+  and the protocol vertical end to end — is proven. Off-box backup is a
+  deployment concern (ARCH-3), but the replicator the image carries for it is
+  exercised by the release-candidate's image check (§3.2): replication to a
+  bucket, a restore onto an empty volume, and a boot that stops when the bucket
+  cannot be read.
 
 A behavior is tested at the lowest tier that can actually observe it. Codec
 edge cases belong in unit tests; "two clients see each other's messages in
@@ -527,12 +529,23 @@ approves on the page; the TUI reaches the workspace.
 Integration tests run **against the daemon binary CI just built**, started
 directly on the runner and driven by `build/e2e_client`.
 
-**No test anywhere exercises the published container image.** The
-release builds it with buildah and pushes it to Fly's registry; nothing pulls it, starts
-it or asserts anything about it. A fault confined to the `Dockerfile`, the
-entrypoint (ARCH-39) or the Alpine/musl build would not be caught before it
-reached users. The daemon's own behaviour is covered by the assertions
-below and by the in-process suites.
+**The container image is exercised by the release-candidate, not here.** Its
+`image` job builds it with buildah and, before pushing it, starts the amd64
+image with podman twice over (`.github/workflows/release-candidate.yml`):
+
+- **Self-hosted:** no bucket and no key, so no replicator; `/healthz` answers.
+- **Hosted (ARCH-3, ARCH-39):** a bucket served as S3 on the runner by a pinned
+  `rclone serve s3`, a process rather than a container (ARCH-38). A box given
+  the deployment's five `replica-*` files under `/etc/openchime` (CONFIG.md)
+  starts on an empty bucket and its database reaches the bucket under
+  `<prefix>/db/`, and nothing outside it; after it is stopped, a box given the
+  same files on an empty volume restores before the daemon starts and presents the first box's certificate — the identity in the
+  database (ARCH-66b) came back with it; and a box given the files with a wrong secret exits
+  non-zero at the restore without creating a database.
+
+What it cannot show: the arm64 image is build-only, and Tigris itself is not
+reached (the S3 backend's Tigris round-trip is ARCH-70's). The daemon's own
+behaviour is covered by the assertions below and by the in-process suites.
 
 **There is no local runner.** The two assertions live inline in
 the `build` job of `.github/workflows/ci.yml`.
@@ -547,7 +560,7 @@ tier drives the daemon over a real socket from a separate process, and the
 in-process suites reach states a black-box client cannot drive.
 
 Note the scope of the claim: the black-box tier proves that the built *binary*
-works. Nothing proves the shipped *image* works (§3.2).
+works. The shipped *image* is the release-candidate's to prove (§3.2).
 
 **Black-box, against a natively-run daemon (the `build` job in
 `.github/workflows/ci.yml`) — two checks:**
@@ -802,7 +815,7 @@ Jobs, on three machines at once:
   dynamic); the built daemon started from its environment, `/healthz`, then the
   protocol vertical over TLS with the e2e client (§3.2 — the one thing the
   in-process suites cannot show, since they link the daemon's code without its
-  `main()`; the published image is tested by nothing); every Linux translation
+  `main()`; the image is the release-candidate's to start); every Linux translation
   unit through the release's own compiler under `-Werror`
   (`make check-release-cc`: zig's clang against the release's glibc — the
   daemon's, the client's and the tests' sources); and `make test-ci PART=plain`,

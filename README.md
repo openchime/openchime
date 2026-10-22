@@ -115,7 +115,10 @@ buildah build --arch amd64 -f Dockerfile -t openchime:<N> image
 podman run openchime:<N> --version
 ```
 
-The release's own image is for deployment: it is kept in Fly's registry
+`image-context.sh` also fetches the pinned Litestream the image carries; it
+runs only when the deployment writes the `replica-*` files under
+`/etc/openchime` that name a bucket, an area in it and a key (docs/CONFIG.md,
+ARCH-3), and without them the image starts the daemon alone. The release's own image is for deployment: it is kept in Fly's registry
 (`registry.fly.io/openchime-daemon-<environment>`) and is what the hosted model
 feeds to Fly Machines, which ingest an image and cannot install a package. OpenChime itself
 does not use containers to build or test anything; the image is an output, not a

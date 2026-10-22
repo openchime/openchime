@@ -683,6 +683,9 @@ oc_push *oc_push_start(const char *db_path, oc_dbwriter *dbw,
     if (p->ctx.use_tls && oc_tls_client_init_ca(&p->ctx.tls) != 0) goto fail;
 
     if (sqlite3_open_v2(db_path, &p->rdb, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) goto fail_tls;
+    /* A replicator's checkpoint holds the database for a moment (ARCH-3): a
+     * read waits for it rather than failing. */
+    sqlite3_busy_timeout(p->rdb, 5000);
 
     if (pthread_mutex_init(&p->mu, NULL) != 0) goto fail_db;
     if (pthread_cond_init(&p->cv, NULL) != 0) { pthread_mutex_destroy(&p->mu); goto fail_db; }

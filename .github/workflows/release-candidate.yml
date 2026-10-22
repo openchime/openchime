@@ -629,8 +629,11 @@ jobs:
           set -euo pipefail
           scripts/build/apt.sh buildah
           buildah version
-      # The build context is the extracted tarball plus the entrypoint: exactly
-      # what an operator extracting the release would have.
+      # The build context is the extracted tarball plus the entrypoint -- exactly
+      # what an operator extracting the release would have -- and the pinned
+      # Litestream for this architecture, checked against its published digest
+      # (packaging/image-context.sh, ARCH-3); the entrypoint writes its
+      # configuration at boot.
       - name: Build the image
         run: |
           set -euo pipefail
@@ -662,6 +665,132 @@ jobs:
           echo "--- the daemon's log"; podman logs oc 2>&1 | tail -30
           podman rm -f oc >/dev/null
           [ "$ok" = 1 ] || { echo "::error::the image did not answer /healthz within 60 s"; exit 1; }
+      # The step above is the self-hosted start: no bucket, no key, and so no
+      # replicator. This one is the hosted start (ARCH-3, ARCH-39): the image
+      # given its replica-* files streams its database off the box, a box that
+      # finds no database takes it back, and one that cannot read the bucket
+      # does not start. The bucket is a directory on this runner served as S3
+      # by rclone -- a pinned release checked against its published digest, a
+      # process rather than a container (ARCH-38) -- so what was replicated is
+      # read straight off disk. The daemon containers share the runner's
+      # network to reach it on loopback.
+      #
+      #   A  the replica-* files as the hosted deployment writes them under
+      #      /etc/openchime, an empty volume and an empty bucket: it starts,
+      #      and its database appears in the bucket under <prefix>/db/.
+      #   B  the same files, a new empty volume: it restores before the daemon
+      #      starts, and presents the same certificate as A -- the identity
+      #      kept in the database (ARCH-66b) came back with it.
+      #   C  the same files with a wrong secret, a new empty volume: the
+      #      restore fails, the boot exits non-zero, and no database is
+      #      created.
+      - name: Replicate the database off the image and restore it onto a new volume
+        if: matrix.arch == 'amd64'
+        run: |
+          set -euo pipefail
+          IMAGE="${STAGING_IMAGE}:build-${BUILD_ID}-${{ matrix.arch }}"
+          RCLONE=v1.75.2
+          RCLONE_SHA256=349ac8fba6ff65d6247043f1750cdcb518ec5d500ef91463a10d37c0ccdf3702
+          W="$RUNNER_TEMP/replica"
+          BUCKET=oc-replica
+          PREFIX=ci-workspace
+          mkdir -p "$W/s3/$BUCKET" "$W/creds" "$W/creds-c"
+
+          curl -fsSL --retry 3 -o "$W/rclone.zip" \
+            "https://github.com/rclone/rclone/releases/download/${RCLONE}/rclone-${RCLONE}-linux-amd64.zip"
+          echo "${RCLONE_SHA256}  $W/rclone.zip" | sha256sum -c -
+          unzip -q -j "$W/rclone.zip" "rclone-${RCLONE}-linux-amd64/rclone" -d "$W"
+          # Buckets are the directories under s3/; the one key pair is the only
+          # one accepted, so a wrong secret is refused as a real provider would.
+          "$W/rclone" serve s3 --addr 127.0.0.1:19000 --auth-key ci-key,ci-secret "$W/s3" > "$W/rclone.log" 2>&1 &
+          RCLONE_PID=$!
+          trap 'podman rm -f oc-a oc-b >/dev/null 2>&1 || true; kill "$RCLONE_PID" 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null http://127.0.0.1:19000/ && break
+            sleep 1
+          done
+
+          # One box: host network, its own data directory, ports clear of the
+          # step above. Arguments after the data directory go to podman.
+          start() {
+            local name="$1" data="$2"; shift 2
+            mkdir -p "$data"
+            podman run -d --name "$name" --network host -v "$data:/data" \
+              -e OPENCHIME_WORKSPACE_NAME=Image -e OPENCHIME_HEALTH_PORT=18081 -e OPENCHIME_PORT=18443 \
+              "$@" "$IMAGE" >/dev/null
+          }
+          healthz() {
+            for i in $(seq 1 60); do
+              if curl -fsS http://127.0.0.1:18081/healthz 2>/dev/null | grep -qx OK; then
+                echo "$1: healthz OK after ${i} s"; return 0
+              fi
+              sleep 1
+            done
+            echo "--- $1's log"; podman logs "$1" 2>&1 | tail -40
+            echo "::error::$1 did not answer /healthz within 60 s"; return 1
+          }
+          # Only what lands under the workspace's area counts, and anything
+          # outside it is an error: the area is the prefix, the database db/.
+          replicas() { find "$W/s3/$BUCKET/$PREFIX/db" -type f -name '*.ltx' 2>/dev/null | wc -l; }
+          stray() { find "$W/s3/$BUCKET" -type f ! -path "$W/s3/$BUCKET/$PREFIX/db/*" | head -5; }
+          # The deployment's five files, 0600 as the control plane writes them.
+          creds() {
+            local dir="$1" secret="$2"
+            printf '%s' "$BUCKET" > "$dir/replica-bucket"
+            printf '%s' "$PREFIX" > "$dir/replica-prefix"
+            printf '%s' ci-key > "$dir/replica-accesskey"
+            printf '%s' "$secret" > "$dir/replica-secretkey"
+            printf '%s' http://127.0.0.1:19000 > "$dir/replica-endpoint"
+            chmod 600 "$dir"/replica-*
+          }
+          creds "$W/creds" ci-secret
+          creds "$W/creds-c" not-the-secret
+
+          # A: the files, an empty volume, an empty bucket.
+          start oc-a "$W/data-a" -v "$W/creds:/etc/openchime:ro"
+          healthz oc-a
+          podman logs oc-a 2>&1 | grep -q 'the replica holds no copy yet' \
+            || { podman logs oc-a 2>&1 | tail -40; echo "::error::A did not report an empty replica on its first boot"; exit 1; }
+          # Litestream syncs every 60 s (the configuration entrypoint.sh writes).
+          ok=0
+          for i in $(seq 1 150); do
+            if [ "$(replicas)" -gt 0 ]; then echo "A: replicated after ${i} s"; ok=1; break; fi
+            sleep 1
+          done
+          [ "$ok" = 1 ] || { podman logs oc-a 2>&1 | tail -40; tail -20 "$W/rclone.log"; find "$W/s3" -type f | head -20; echo "::error::nothing reached $PREFIX/db/ in the bucket within 150 s"; exit 1; }
+          # A stop is SIGTERM to Litestream, which passes it to the daemon and
+          # syncs once more after the daemon has exited.
+          podman stop -t 30 oc-a >/dev/null
+          echo "A: exited $(podman inspect -f '{{.State.ExitCode}}' oc-a) on SIGTERM; $(replicas) LTX files in the bucket"
+          echo "--- A's log"; podman logs oc-a 2>&1 | tail -20
+          podman rm oc-a >/dev/null
+          [ -s "$W/data-a/cert.pem" ] || { echo "::error::A left no cert.pem"; exit 1; }
+          [ -z "$(stray)" ] || { stray; echo "::error::A wrote to the bucket outside $PREFIX/db/"; exit 1; }
+
+          # B: the same files, onto an empty volume.
+          start oc-b "$W/data-b" -v "$W/creds:/etc/openchime:ro"
+          healthz oc-b
+          podman logs oc-b 2>&1 | grep -q 'entrypoint: restored /data/openchime.db from the replica' \
+            || { podman logs oc-b 2>&1 | tail -40; echo "::error::B did not restore the database"; exit 1; }
+          cmp -s "$W/data-a/cert.pem" "$W/data-b/cert.pem" \
+            || { echo "::error::B presents a different certificate from A: the restored database did not carry its identity"; exit 1; }
+          echo "B: restored, and presents A's certificate"
+          podman rm -f oc-b >/dev/null
+
+          # C: the same files with a wrong secret. The boot must fail, before
+          # the daemon starts.
+          rc=0
+          mkdir -p "$W/data-c"
+          podman run --rm --name oc-c --network host -v "$W/data-c:/data" \
+            -e OPENCHIME_WORKSPACE_NAME=Image -e OPENCHIME_HEALTH_PORT=18081 -e OPENCHIME_PORT=18443 \
+            -v "$W/creds-c:/etc/openchime:ro" \
+            "$IMAGE" > "$W/c.log" 2>&1 || rc=$?
+          echo "--- C's log"; tail -20 "$W/c.log"
+          [ "$rc" -ne 0 ] || { echo "::error::a boot that could not read its bucket exited 0"; exit 1; }
+          grep -q 'the restore from the replica failed' "$W/c.log" \
+            || { echo "::error::C failed, but not at the restore"; exit 1; }
+          [ ! -e "$W/data-c/openchime.db" ] || { echo "::error::C created a database after its restore failed"; exit 1; }
+          echo "C: exited ${rc} at the restore, with no database created"
       - name: Push the per-architecture image
         env:
           TOKEN: ${{ secrets.FLY_REGISTRY_TOKEN_STAGING }}

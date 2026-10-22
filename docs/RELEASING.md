@@ -305,8 +305,12 @@ reservation mid-job.
 The release-candidate build's `image` job lays each architecture's tree onto a glibc
 base with **buildah** (`Dockerfile`, `packaging/image-context.sh`; no compile,
 no `RUN`, so the arm64 image is built on the x86 runner with `--arch arm64` and
-no emulation), starts the amd64 one with **podman** (daemonless, reading
-buildah's store) and asks it `/healthz`, so a fault in the `Dockerfile`, the
+no emulation), together with the pinned, checksummed Litestream for that
+architecture (ARCH-3; VENDORS.md §4), starts the amd64 one with **podman** (daemonless, reading
+buildah's store) and asks it `/healthz`, then starts it again given the
+`replica-*` files for a bucket on the runner and proves it replicates under
+`<prefix>/db/`, restores onto an empty volume and refuses to boot on a bucket
+it cannot read (TESTING.md §3.2), so a fault in the `Dockerfile`, the
 entrypoint or the binary on that base stops the release-candidate rather than reaching
 the registry (the arm64 image is build-only, as its binary is), and pushes
 `:build-<id>-<arch>` to the staging registry,
