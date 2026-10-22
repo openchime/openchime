@@ -81,7 +81,7 @@ in for them.
 | `replica-secretkey` | Its secret. |
 | `replica-endpoint` | Optional: the S3 endpoint, `https://fly.storage.tigris.dev` when absent. |
 | `replica-identity-prefix` | Optional: where the identity goes, apart from the data (`<prefix>/db`). Without it the identity is not replicated. |
-| `replica-restore-at` | Optional: a time (RFC 3339). A database restored at this boot is the copy as it was then, not the latest; the identity is always the latest. |
+| `replica-restore-at` | Optional: a time (RFC 3339). A database restored at this boot is the copy as it was then, not the latest; the identity is always the latest. A restore asked for this way, or with `replica-restore-from`, must find a copy: with none, the boot stops rather than starting empty. |
 | `replica-restore-from` | Optional: where a database restored at this boot is read from, when not `replica-prefix`. An earlier copy is read from its own place while the box replicates to a new one, never on top of the old history. |
 | `replica-blob-prefix` | Optional: attachments in the bucket under it, with the same key, instead of under `blobs/` (written for the daemon as `OPENCHIME_S3_FILE`). Attachments already on the disk move there at the next start. |
 

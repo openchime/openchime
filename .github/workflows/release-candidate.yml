@@ -716,6 +716,9 @@ jobs:
       #   D  the same identity prefix with a data prefix never used, a new
       #      empty volume: the data begins again and the identity is restored,
       #      so it presents A's certificate on an empty database.
+      #   E  the same files with a restore time before any copy: the restore
+      #      asked for finds nothing, and the boot stops (exit 3) rather than
+      #      starting the workspace empty.
       #   C  the same files with a wrong secret, a new empty volume: the
       #      restore fails, the boot exits non-zero, and no database or
       #      identity is created.
@@ -836,6 +839,23 @@ jobs:
             || { echo "::error::D presents a different certificate from A: the kept identity was not used"; exit 1; }
           echo "D: data begun again, and presents A's certificate"
           podman rm -f oc-d >/dev/null
+
+          # E: a restore asked for -- to a time before any copy -- finds none.
+          # It must stop the boot, not start the workspace empty.
+          mkdir -p "$W/creds-e" "$W/data-e"
+          creds "$W/creds-e" ci-secret
+          printf '%s' 2000-01-01T00:00:00Z > "$W/creds-e/replica-restore-at"
+          chmod 600 "$W/creds-e"/replica-*
+          rc=0
+          podman run --rm --name oc-e --network host -v "$W/data-e:/data" \
+            -e OPENCHIME_WORKSPACE_NAME=Image -e OPENCHIME_HEALTH_PORT=18081 -e OPENCHIME_PORT=18443 \
+            -v "$W/creds-e:/etc/openchime:ro" \
+            "$IMAGE" > "$W/e.log" 2>&1 || rc=$?
+          echo "--- E's log"; tail -12 "$W/e.log"
+          [ "$rc" -eq 3 ] && grep -qxF 'entrypoint: restore=failed' "$W/e.log" \
+            || { echo "::error::E (a restore to a time with no copy) exited ${rc}, not 3 at the restore"; exit 1; }
+          [ ! -e "$W/data-e/openchime.db" ] || { echo "::error::E started a database after its asked-for restore found nothing"; exit 1; }
+          echo "E: a restore with nothing to restore stopped the boot"
 
           # C: the same files with a wrong secret. The boot must fail, before
           # the daemon starts.

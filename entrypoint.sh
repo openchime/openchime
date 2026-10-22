@@ -196,17 +196,24 @@ export SSL_CERT_FILE=/usr/share/openchime/ca-roots.pem
 # enrollment, and a managed box's one-time enrollment ticket cannot claim it a
 # second time, so the workspace would be lost rather than recovered. What
 # exists is left alone. The identity is always the latest copy; the data is
-# the copy as of replica-restore-at when that is given.
+# the copy as of replica-restore-at when that is given. A restore that was
+# asked for -- a time, or a place to read from -- is required: with no copy
+# there, starting empty would put an empty workspace where a restored one was
+# wanted, so it stops the boot like any other failure.
 restore() {
   # $1 the database, $2 the configuration it is restored by, $3 the token's
-  # name, $4 what it is; then extra flags.
-  db=$1 config=$2 token=$3 what=$4
-  shift 4
+  # name, $4 what it is, $5 "required" or "if-any"; then extra flags.
+  db=$1 config=$2 token=$3 what=$4 need=$5
+  shift 5
   [ ! -e "$db" ] || return 0
   echo "entrypoint: no $what at $db; restoring it from the replica, if a copy exists"
+  if_any=-if-replica-exists
+  [ "$need" != required ] || if_any=
+  # $if_any is one flag or none, so it is left unquoted on purpose.
+  # shellcheck disable=SC2086
   if ! LITESTREAM_ACCESS_KEY_ID="$access_key" LITESTREAM_SECRET_ACCESS_KEY="$secret_key" \
-      /usr/local/bin/litestream restore -config "$config" -if-db-not-exists -if-replica-exists \
-      -integrity-check full "$@" "$db"; then
+      /usr/local/bin/litestream restore -config "$config" -if-db-not-exists $if_any \
+      -integrity-check full "$@" "$db" || { [ "$need" = required ] && [ ! -e "$db" ]; }; then
     echo "entrypoint: $token=failed" >&2
     echo "entrypoint: the restore of the $what from the replica failed, so the daemon is not started: a daemon started without it would replace this workspace's identity and enrollment rather than recover them, and its enrollment ticket cannot be used twice. Fix the bucket, the key, the endpoint or the restore time and start the box again." >&2
     exit 3
@@ -219,11 +226,13 @@ restore() {
     echo "entrypoint: the replica holds no copy of the $what yet; the daemon creates it"
   fi
 }
-if [ -n "$identity_prefix" ]; then restore "$IDENTITY_DB" "$CONFIG" identity-restore identity; fi
+if [ -n "$identity_prefix" ]; then restore "$IDENTITY_DB" "$CONFIG" identity-restore identity if-any; fi
 if [ -n "$restore_at" ]; then
-  restore "$DB" "$RESTORE_CONFIG" restore database -timestamp "$restore_at"
+  restore "$DB" "$RESTORE_CONFIG" restore database required -timestamp "$restore_at"
+elif [ -n "$restore_from" ]; then
+  restore "$DB" "$RESTORE_CONFIG" restore database required
 else
-  restore "$DB" "$RESTORE_CONFIG" restore database
+  restore "$DB" "$RESTORE_CONFIG" restore database if-any
 fi
 rm -f /run/litestream-restore.yml
 
