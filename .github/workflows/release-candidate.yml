@@ -364,6 +364,29 @@ jobs:
             build/moonshine
           key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
 
+      # mbedTLS and libopus as this job builds them: with zig's clang against
+      # glibc 2.34 for the binary that ships (the arm64 job also builds the
+      # host's mbedTLS, for the featureless host daemon that writes its data
+      # manifests, mk/daemon.mk). CI's copies are gcc-built for the host and
+      # cannot stand in, so these have a cache of their own, per architecture,
+      # keyed by the scripts that build them and the compiler wrapper and
+      # toolchain they build with. A hit is a no-op build: each script returns
+      # at once when its archive already exists. A path a job never builds is
+      # simply absent from what it saves.
+      #
+      # A step of its own, NOT more paths in tts-release-*: a cache's path
+      # list is part of its version, so adding to that one would miss it and
+      # pay the ONNX Runtime build from cold.
+      - name: Restore the release's vendored libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/mbedtls-3.6.2
+            third_party/mbedtls-3.6.2-aarch64
+            third_party/opus-1.6.1
+            third_party/opus-1.6.1-aarch64
+          key: vendor-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/opus.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
+
       # One binary, built against the oldest glibc we support, then stripped
       # once. Everything downstream consumes this exact file.
       #

@@ -173,7 +173,10 @@ fetches `candidates/<id>/` for that commit, verifies the manifest's signature
 and every file against it, checks the manifest names the same commit, unpacks
 the amd64 daemon and asks it `--version` (the id in the manifest is the id the
 code carries), and checks the image `:build-<id>` is in the staging registry
-with the digest the manifest recorded. `version` reserves the number. `package` runs the
+with the digest the manifest recorded. It passes the verified files on as one
+artifact per platform (`candidate-linux-amd64`, `candidate-linux-arm64`,
+`candidate-windows-x64`), and `package` and `windows` each download only their
+own. `version` reserves the number. `package` runs the
 packaging scripts under it and proves the deb, the rpm and the tarball carry
 the build's binary. `windows` signs the build's exes and wraps them in the
 installer and the MSIX. `main` fast-forwards `main`. `publish` writes the
@@ -338,22 +341,66 @@ manifest list rather than just the runner's architecture.
 
 ## The apt/dnf pool guard
 
-Both repositories are regenerated from the **full** pool, not from this release's
-packages alone, or the index silently drops every prior release.
+Each release **adds** its packages to both repositories; the index must go on
+naming every prior release, or it silently drops them.
+`scripts/release/repo_update.sh` does it without downloading the pool, so the
+time a release takes does not grow with the number of releases:
 
-The pool is fetched with `rclone`, and the fetch must not swallow failure: a
-`|| true` cannot distinguish "prefix does not exist yet" from "credentials
-rejected" or "endpoint returned 503" — on any failure the pool reads as empty,
-the index is built from one release, and the upload replaces
-`Release`/`InRelease` in the bucket. The old objects survive; the index naming
-them does not.
+- **apt:** fetch `dists/` only; generate stanzas for the new debs alone
+  (`apt-ftparchive packages` over a scratch tree of the pool's layout), append
+  them, regenerate `Release` and sign it.
+- **rpm:** fetch `repodata/` only; sign only the new rpms, then
+  `createrepo_c --update --skip-stat --error-exit-val --pkglist` over the
+  listed and the new packages, so the listed ones, absent on the runner, are
+  taken from the old index by their path; sign `repomd.xml`.
 
-So it is two independent checks: counting the objects under the prefix proves it
-is reachable, and the **tag count** is a second witness of what the pool should
-contain. An
-empty pool with prior release tags is a hard stop.
+Both are prepared, checked and signed before either is written. The upload is
+`rclone copy`, never `sync`: the packages, then the index, then its signed top
+file, so no client reads an index naming a package not yet there.
 
-Verified against a real Tigris endpoint, four cases:
+The pool is **listed**, and the listing must not swallow failure: a `|| true`
+cannot distinguish "prefix does not exist yet" from "credentials rejected" or
+"endpoint returned 503" — on any failure the pool reads as empty, the index is
+built from one release, and the upload replaces `Release`/`InRelease` in the
+bucket. The old objects survive; the index naming them does not. Only rclone's
+"directory not found" (a local path; an object store lists an absent prefix as
+empty) reads as empty.
+
+Then the witnesses, any of which stops the release with nothing published:
+
+- **The old index names exactly what the pool lists**, per architecture. The
+  one difference allowed is this release's own packages listed but not
+  indexed: an earlier attempt that uploaded them and failed before the index.
+- **The tag count**: a prefix that exists but holds no package, with prior
+  release tags, is a hard stop. No objects at all is a first publish.
+- **No version twice**: a new package already in the index must be the same
+  file (a re-run, which leaves it as it is: by sha256 for a deb, by header
+  digest for an rpm, which signing does not change); its version under
+  another file is refused.
+- **The new index** lists every old entry and this release exactly once per
+  architecture.
+
+Every release publishes to both buckets from production's index. Staging's
+pool is reconciled to production's before anything is written: what it lacks
+is copied across, file by file, and what it has beyond production's is
+reported and left. Afterwards `smoke` reads each index back from each bucket
+and checks it lists the previous count + 1 versions per architecture, every
+package it names present, and the signed top matching the files it names.
+
+**The full method is the fallback**: fetch the whole prefix, re-sign every rpm
+and regenerate both indexes from the whole pool, as every release did before.
+The rpm half takes it by itself when `createrepo_c` lacks the flags (noble's
+0.17.3 has them) or its incremental index fails the checks; setting
+`REPO_UPDATE_MODE=full` in the step's environment asks for it, and is also the
+repair for an index that has drifted from its pool, which the witness refuses.
+
+**Offline parity**, worth running after any change to the script: build tiny
+packages of versions 1, 2 and 3; publish 1 and 2 the full way into a local
+rclone remote (an `alias` of a directory); add 3 both ways, into two copies;
+diff the sorted `primary.xml` package sets and the sorted `Packages` stanzas,
+which must be identical; and run `verify` on both.
+
+The guard was verified against a real Tigris endpoint, four cases:
 
 | case | result |
 |---|---|
@@ -370,8 +417,9 @@ one-version index.
 Tigris, provisioned through Fly and billed on the Fly account, so it is not a
 separate vendor relationship. Each environment of the control plane has its own
 package bucket in its own Fly organisation, and **every release publishes to
-both**: the repositories are built once, from the pool read from production's
-bucket, and uploaded to each, so the two stay identical.
+both**: the indexes are built once, from production's, staging's pool is
+reconciled to production's, and the same files are uploaded to each, so the
+two stay identical.
 
 | name | kind | value |
 |---|---|---|

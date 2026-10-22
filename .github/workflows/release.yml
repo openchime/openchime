@@ -298,7 +298,9 @@ jobs:
   # reports, and the image the manifest names being in the registry with the
   # digest it recorded. A release-candidate whose build is gone (pruned, or
   # never stored) is refused here, before any number is reserved. The
-  # verified files go on as one artifact every later job reads.
+  # verified files go on as one artifact per platform, and each later job
+  # downloads only its own: an amd64 package job has no use for the arm64
+  # tree or the Windows binaries.
   #
   # The image is read from the staging registry, where the build pushed it,
   # with FLY_REGISTRY_TOKEN_STAGING from the `release` environment.
@@ -374,10 +376,26 @@ jobs:
                            "docker://${STAGING_IMAGE}:build-${id}" | sha256sum | cut -d' ' -f1)"
           [ "$have" = "$want" ] || { echo "::error::${STAGING_IMAGE}:build-${id} is ${have}, the manifest says ${want}"; exit 1; }
           echo "image ${STAGING_IMAGE}:build-${id} matches the manifest"
+      # One artifact per platform, named candidate-<platform>, never
+      # `linux-*` or `windows-*`: those names are the packaged files publish
+      # downloads, and a candidate tree among them would be published. A
+      # single directory as the path uploads its contents, so each job
+      # downloads its own back to candidate/<platform>/, where the steps below
+      # read it. The manifest has done its work by now and is not carried on.
       - uses: actions/upload-artifact@v7
         with:
-          name: candidate
-          path: candidate
+          name: candidate-linux-amd64
+          path: candidate/linux-amd64
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: candidate-linux-arm64
+          path: candidate/linux-arm64
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: candidate-windows-x64
+          path: candidate/windows-x64
           if-no-files-found: error
 
   # The number is a label on the release-candidate's build id, and it is the
@@ -483,8 +501,8 @@ jobs:
           ref: ${{ needs.resolve.outputs.sha }}
       - uses: actions/download-artifact@v8
         with:
-          name: candidate
-          path: candidate
+          name: candidate-linux-${{ matrix.arch }}
+          path: candidate/linux-${{ matrix.arch }}
       - name: Install packaging tools
         timeout-minutes: 20
         run: scripts/build/apt.sh rpm
@@ -593,8 +611,8 @@ jobs:
           ref: ${{ needs.resolve.outputs.sha }}
       - uses: actions/download-artifact@v8
         with:
-          name: candidate
-          path: candidate
+          name: candidate-windows-x64
+          path: candidate/windows-x64
       - name: Take the candidate's binaries
         shell: pwsh
         run: |
@@ -811,6 +829,10 @@ jobs:
       # SPENT whether or not the rest of the job succeeds, and unreserve must not
       # hand it back -- see the note on that job.
       published: ${{ steps.apt.outputs.published }}
+      # How many versions each architecture's index lists once this release
+      # is in it ("amd64=4 arm64=4"), which smoke reads back from both buckets.
+      apt_expect: ${{ steps.prepare.outputs.apt }}
+      rpm_expect: ${{ steps.prepare.outputs.rpm }}
     env:
       VERSION: ${{ needs.version.outputs.number }}
       BUILD_ID: ${{ needs.candidate.outputs.build_id }}
@@ -940,7 +962,7 @@ jobs:
           # `rpm` is not optional and not implied: createrepo-c pulls librpm's
           # shared libraries but not the rpm binary, and an Ubuntu runner has
           # neither rpm nor rpmsign preinstalled. Without it the rpm repository
-          # step fails at `rpm --addsign` with command-not-found -- in a job the
+          # step fails at `rpmsign --addsign` with command-not-found -- in a job the
           # dry run skips, so it would only ever surface on a real release.
           scripts/build/apt.sh apt-utils createrepo-c rclone gnupg rpm
 
@@ -982,167 +1004,54 @@ jobs:
           region = auto
           EOF
 
-      # Both repositories are regenerated from the FULL pool, not from this
-      # release's packages alone. An index built from the new package only would
-      # silently drop every previous release the moment it was published.
+      # Both repositories are extended by this release's packages, and every
+      # earlier release stays in the index: an index built from the new
+      # packages alone would silently drop every previous release the moment
+      # it was published. scripts/release/repo_update.sh fetches only the
+      # indexes, never the pool, and refuses unless the old index names exactly
+      # what the pool lists (docs/RELEASING.md "The apt/dnf pool guard").
+      #
+      # Both are prepared, checked and signed before either is written, and
+      # staging's bucket is reconciled to production's pool first, so a
+      # refusal anywhere here stops the release with nothing published.
+      - name: Prepare the apt and rpm repositories
+        id: prepare
+        run: |
+          set -euo pipefail
+          # The tag guard's second witness: PRIOR releases -- this one's tag
+          # is excluded, because `version` reserved it before anything was
+          # built. Counting it made the first ever release refuse itself:
+          # pool empty, prior=1, which is exactly the shape the guard treats
+          # as "an index that would delist history".
+          # `|| true` inside the braces, and it is not cosmetic. Once this
+          # release's own tag is filtered out, a FIRST release leaves grep with
+          # no match, so it exits 1; pipefail propagates that and set -e kills
+          # the assignment, with no output at all.
+          # release-N only: the release-candidates' release-N-rcK tags fetched
+          # beside them name no package in the pool.
+          PRIOR=$( { git tag -l 'release-*' | grep -E '^release-[0-9]+$' | grep -vx "release-${VERSION}" || true; } | wc -l )
+          export PRIOR
+          scripts/release/repo_update.sh prepare apt repo/apt \
+            "dist:${DIST_BUCKET}/apt" "dist-staging:${DIST_STAGING_BUCKET}/apt" dist/linux-*/*.deb
+          scripts/release/repo_update.sh prepare rpm repo/rpm \
+            "dist:${DIST_BUCKET}/rpm" "dist-staging:${DIST_STAGING_BUCKET}/rpm" dist/linux-*/*.rpm
+          # What each index lists once published, for the smoke job's check.
+          echo "apt=$(cat repo/apt/expect)" >> "$GITHUB_OUTPUT"
+          echo "rpm=$(cat repo/rpm/expect)" >> "$GITHUB_OUTPUT"
+          echo "apt $(cat repo/apt/mode): $(cat repo/apt/expect); rpm $(cat repo/rpm/mode): $(cat repo/rpm/expect)"
+
+      # Packages first, the index after, its signed top last; `rclone copy`,
+      # never sync, so nothing in the bucket is ever deleted.
       - name: Publish the apt repository
         id: apt
         run: |
           set -euo pipefail
-          mkdir -p repo/apt
-          # `|| true` used to sit here, and it could not tell "the prefix does not
-          # exist yet" from "credentials rejected" or "endpoint returned 503". On any
-          # fetch failure the pool stayed empty, the index below was built from this
-          # release alone, and the upload replaced Release/InRelease in the bucket --
-          # so every existing installation's `apt-get update` saw a repository
-          # containing one version. The old objects survive; the index naming them
-          # does not.
-          # COUNTED, not probed. A listing exits 0 on a prefix that does not
-          # exist -- it reports an empty listing rather than an error -- so testing
-          # its exit status called every bucket "existing" and the guard below then
-          # refused a genuinely first publish.
-          existing=$( { rclone ls "dist:${DIST_BUCKET}/apt" 2>/dev/null || true; } | wc -l )
-          if [ "$existing" -gt 0 ]; then
-            had_prefix=1
-            rclone copy "dist:${DIST_BUCKET}/apt" repo/apt --fast-list
-          else
-            had_prefix=0
-            echo "::notice::no existing apt objects in ${DIST_BUCKET}; treating as first publish"
-          fi
-
-          # A listing proves the prefix is reachable, not that the copy completed, so
-          # this is a second and independent witness: the tag count is what the pool
-          # SHOULD contain. Free -- publish already checks out with fetch-depth: 0.
-          pool_count=$(find repo/apt -name '*.deb' | wc -l)
-          # PRIOR releases -- this one's tag is excluded, because `version` reserved
-          # it before anything was built (P3-OC-02). Counting it made the first ever
-          # release refuse itself: pool empty, prior=1, which is exactly the shape
-          # this guard treats as "an index that would delist history". The two fixes
-          # were correct separately and wrong together.
-          # `|| true` inside the braces, and it is not cosmetic. Once this release's
-          # own tag is filtered out, a FIRST release leaves grep with no match, so it
-          # exits 1; pipefail propagates that and set -e kills the assignment. The
-          # step died in under a second with no output at all -- the same shape as
-          # a dead error path in an earlier packaging script, reintroduced here.
-          # release-N only: the release-candidates' release-N-rcK tags fetched
-          # beside them name no package in the pool.
-          prior=$( { git tag -l 'release-*' | grep -E '^release-[0-9]+$' | grep -vx "release-${VERSION}" || true; } | wc -l )
-          # `had_prefix` is what separates the two ways to arrive at an empty pool,
-          # and only one of them is a fault. A prefix that EXISTS and yields no
-          # .deb means the copy above silently did not complete -- publishing then
-          # writes an index that delists every prior release, which is the case
-          # this guard was built for. No prefix at all means a bucket nothing has
-          # published into yet, which the branch above already recognises and
-          # announces as a first publish; refusing it made the guard contradict
-          # that notice and made moving to a new bucket impossible.
-          if [ "$had_prefix" = 1 ] && [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
-            echo "::error::apt pool is empty but ${prior} release tag(s) exist -- refusing to publish an index that would delist them"
-            exit 1
-          fi
-
-          mkdir -p repo/apt/pool/main/o/openchimed
-          cp dist/linux-*/*.deb repo/apt/pool/main/o/openchimed/
-
-          cd repo/apt
-          for arch in amd64 arm64; do
-            mkdir -p "dists/stable/main/binary-${arch}"
-            apt-ftparchive --arch "$arch" packages pool \
-              > "dists/stable/main/binary-${arch}/Packages"
-            gzip -9kf "dists/stable/main/binary-${arch}/Packages"
-          done
-
-          cat > /tmp/apt-release.conf <<'EOF'
-          APT::FTPArchive::Release::Origin "OpenChime";
-          APT::FTPArchive::Release::Label "OpenChime";
-          APT::FTPArchive::Release::Suite "stable";
-          APT::FTPArchive::Release::Codename "stable";
-          APT::FTPArchive::Release::Architectures "amd64 arm64";
-          APT::FTPArchive::Release::Components "main";
-          EOF
-          apt-ftparchive -c /tmp/apt-release.conf release dists/stable > dists/stable/Release
-
-          rm -f dists/stable/Release.gpg dists/stable/InRelease
-          gpg --batch --yes --local-user "$GPG_KEY_ID" -abs \
-              -o dists/stable/Release.gpg dists/stable/Release
-          gpg --batch --yes --local-user "$GPG_KEY_ID" --clearsign \
-              -o dists/stable/InRelease dists/stable/Release
-
-          cd ../..
-          rclone copy repo/apt "dist:${DIST_BUCKET}/apt" --fast-list
+          scripts/release/repo_update.sh upload apt repo/apt "dist:${DIST_BUCKET}/apt"
           # Past this line the number is spent: an apt client can see release N.
           echo "published=true" >> "$GITHUB_OUTPUT"
 
       - name: Publish the rpm repository
-        run: |
-          set -euo pipefail
-          mkdir -p repo/rpm
-          # `|| true` used to sit here, and it could not tell "the prefix does not
-          # exist yet" from "credentials rejected" or "endpoint returned 503". On any
-          # fetch failure the pool stayed empty, the index below was built from this
-          # release alone, and the upload replaced Release/InRelease in the bucket --
-          # so every existing installation's `apt-get update` saw a repository
-          # containing one version. The old objects survive; the index naming them
-          # does not.
-          # COUNTED, not probed -- the same correction the apt step carries, and
-          # for the same reason: a listing exits 0 on a prefix that does
-          # not exist, reporting an empty listing rather than an error. Testing
-          # its exit status called every bucket "existing", so the guard below
-          # refused a genuinely first publish. Fixing one of the two copies and
-          # not the other is how the rpm half stayed broken after the apt half
-          # was proved working.
-          existing=$( { rclone ls "dist:${DIST_BUCKET}/rpm" 2>/dev/null || true; } | wc -l )
-          if [ "$existing" -gt 0 ]; then
-            had_prefix=1
-            rclone copy "dist:${DIST_BUCKET}/rpm" repo/rpm --fast-list
-          else
-            had_prefix=0
-            echo "::notice::no existing rpm objects in ${DIST_BUCKET}; treating as first publish"
-          fi
-
-          # A listing proves the prefix is reachable, not that the copy completed, so
-          # this is a second and independent witness: the tag count is what the pool
-          # SHOULD contain. Free -- publish already checks out with fetch-depth: 0.
-          pool_count=$(find repo/rpm -name '*.rpm' | wc -l)
-          # PRIOR releases -- this one's tag is excluded, because `version` reserved
-          # it before anything was built (P3-OC-02). Counting it made the first ever
-          # release refuse itself: pool empty, prior=1, which is exactly the shape
-          # this guard treats as "an index that would delist history". The two fixes
-          # were correct separately and wrong together.
-          # `|| true` inside the braces, and it is not cosmetic. Once this release's
-          # own tag is filtered out, a FIRST release leaves grep with no match, so it
-          # exits 1; pipefail propagates that and set -e kills the assignment. The
-          # step died in under a second with no output at all -- the same shape as
-          # a dead error path in an earlier packaging script, reintroduced here.
-          # release-N only: the release-candidates' release-N-rcK tags fetched
-          # beside them name no package in the pool.
-          prior=$( { git tag -l 'release-*' | grep -E '^release-[0-9]+$' | grep -vx "release-${VERSION}" || true; } | wc -l )
-          # `had_prefix` separates the two ways to reach an empty pool. A prefix
-          # that EXISTS and yields no .rpm means the copy above did not complete,
-          # and an index published from it delists every prior release -- the case
-          # this guard was built for. No objects at all is a bucket nothing has
-          # published into, which the branch above already announces.
-          if [ "$had_prefix" = 1 ] && [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
-            echo "::error::rpm pool is empty but ${prior} release tag(s) exist -- refusing to publish an index that would delist them"
-            exit 1
-          fi
-          cp dist/linux-*/*.rpm repo/rpm/
-
-          # Each package is signed individually -- rpm verifies package
-          # signatures, unlike apt which verifies the index.
-          cat > /tmp/rpmmacros <<EOF
-          %_gpg_name ${GPG_KEY_ID}
-          %__gpg_sign_cmd %{__gpg} gpg --batch --no-armor --no-secmem-warning -u "%{_gpg_name}" -sbo %{__signature_filename} %{__plaintext_filename}
-          EOF
-          # rpm reads ~/.rpmmacros for the invoking user, so this must land in the
-          # home directory of whoever runs the next line -- not root's.
-          cp /tmp/rpmmacros ~/.rpmmacros
-          rpm --addsign repo/rpm/*.rpm
-
-          createrepo_c --update repo/rpm
-          gpg --batch --yes --local-user "$GPG_KEY_ID" --detach-sign --armor \
-              -o repo/rpm/repodata/repomd.xml.asc repo/rpm/repodata/repomd.xml
-
-          rclone copy repo/rpm "dist:${DIST_BUCKET}/rpm" --fast-list
+        run: scripts/release/repo_update.sh upload rpm repo/rpm "dist:${DIST_BUCKET}/rpm"
 
       - name: Publish the public key and repo definitions
         run: |
@@ -1161,11 +1070,13 @@ jobs:
           EOF
           rclone copy repo/meta "dist:${DIST_BUCKET}/" --fast-list
 
+      # The same indexes and packages; prepare already made staging's pool
+      # production's, so the index names nothing this bucket lacks.
       - name: Publish the same repositories to staging's bucket
         run: |
           set -euo pipefail
-          rclone copy repo/apt  "dist-staging:${DIST_STAGING_BUCKET}/apt" --fast-list
-          rclone copy repo/rpm  "dist-staging:${DIST_STAGING_BUCKET}/rpm" --fast-list
+          scripts/release/repo_update.sh upload apt repo/apt "dist-staging:${DIST_STAGING_BUCKET}/apt"
+          scripts/release/repo_update.sh upload rpm repo/rpm "dist-staging:${DIST_STAGING_BUCKET}/rpm"
           rclone copy repo/meta "dist-staging:${DIST_STAGING_BUCKET}/" --fast-list
 
       - name: Tag the release and attach the tarballs
@@ -1274,7 +1185,7 @@ jobs:
     if: ${{ always() && !inputs.dry_run && needs.publish.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    environment: release     # FLY_REGISTRY_TOKEN_STAGING, to pull the image
+    environment: release     # FLY_REGISTRY_TOKEN_STAGING, to pull the image; the bucket keys, to read the indexes
     env:
       # The published base, as in `publish` -- which is where this value is
       # defined and explained. Repeated rather than shared because a job cannot
@@ -1330,6 +1241,56 @@ jobs:
             dnf install -y openchimed
             openchimed --version
           "
+
+      # Each index, read back from each bucket, lists one version more per
+      # architecture than before this release: the count publish recorded
+      # before writing, plus this release exactly once, every package it names
+      # present, and the signed top matching the files it names. Read from the
+      # buckets, not DIST_VERIFY_URL, so not behind skip_repo_smoke; and
+      # !cancelled(), so a failed install above cannot hide what this says.
+      - name: Check each index lists one version more
+        if: ${{ !cancelled() }}
+        env:
+          APT_EXPECT: ${{ needs.publish.outputs.apt_expect }}
+          RPM_EXPECT: ${{ needs.publish.outputs.rpm_expect }}
+          DIST_S3_ACCESS_KEY: ${{ secrets.DIST_S3_ACCESS_KEY }}
+          DIST_S3_SECRET_KEY: ${{ secrets.DIST_S3_SECRET_KEY }}
+          DIST_S3_ENDPOINT:   ${{ vars.DIST_S3_ENDPOINT }}
+          DIST_BUCKET:        ${{ vars.DIST_BUCKET }}
+          DIST_S3_STAGING_ACCESS_KEY: ${{ secrets.DIST_S3_STAGING_ACCESS_KEY }}
+          DIST_S3_STAGING_SECRET_KEY: ${{ secrets.DIST_S3_STAGING_SECRET_KEY }}
+          DIST_STAGING_BUCKET:        ${{ vars.DIST_STAGING_BUCKET }}
+        run: |
+          set -euo pipefail
+          [ -n "$APT_EXPECT" ] && [ -n "$RPM_EXPECT" ] || { echo "::error::publish recorded no counts to check"; exit 1; }
+          for v in DIST_S3_ACCESS_KEY DIST_S3_SECRET_KEY DIST_S3_ENDPOINT DIST_BUCKET \
+                   DIST_S3_STAGING_ACCESS_KEY DIST_S3_STAGING_SECRET_KEY DIST_STAGING_BUCKET; do
+            [ -n "${!v}" ] || { echo "::error::$v is not set"; exit 1; }
+          done
+          command -v rclone >/dev/null || scripts/build/apt.sh rclone
+          # As publish configures it; a job cannot read another's files.
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [dist]
+          type = s3
+          provider = Other
+          access_key_id = ${DIST_S3_ACCESS_KEY}
+          secret_access_key = ${DIST_S3_SECRET_KEY}
+          endpoint = ${DIST_S3_ENDPOINT}
+          region = auto
+
+          [dist-staging]
+          type = s3
+          provider = Other
+          access_key_id = ${DIST_S3_STAGING_ACCESS_KEY}
+          secret_access_key = ${DIST_S3_STAGING_SECRET_KEY}
+          endpoint = ${DIST_S3_ENDPOINT}
+          region = auto
+          EOF
+          for bucket in "dist:${DIST_BUCKET}" "dist-staging:${DIST_STAGING_BUCKET}"; do
+            scripts/release/repo_update.sh verify apt "${bucket}/apt" "$APT_EXPECT"
+            scripts/release/repo_update.sh verify rpm "${bucket}/rpm" "$RPM_EXPECT"
+          done
 
       # The third channel: the image, pulled by its released tag from the
       # staging registry, logged in as the hosted model's deploy is, and run.
