@@ -89,7 +89,7 @@ static void run_job(oc_blobstore *bs, oc_xfer_job *j) {
         uint64_t size = 0;
         j->br = oc_blob_get_begin(bs, j->key, &size);
         j->blob_size = size;
-        j->rc = j->br ? 0 : -1;
+        j->rc = j->br ? 0 : errno == ENOENT ? OC_XFER_GONE : -1;
         break;
     }
     case OC_XFER_READ: {

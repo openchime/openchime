@@ -1628,8 +1628,9 @@ where one exists.
 watching a dashboard, and nobody will intervene before the disk fills. The
 daemon has therefore had to keep itself alive on a finite disk without operator
 action (ARCH-77). These requirements apply to the **local** blob backend; where
-attachments live in external S3 (REQ-140) only database growth is local, and
-only REQ-212/213/214 apply.*
+attachments live in external S3 (REQ-140) the disk holds their cache, which
+keeps to its own share of the free space and gives it back under pressure
+(ARCH-70), so only database growth is local, and only REQ-212/213/214 apply.*
 
 - **REQ-212.** **Text messaging has survived attachment-storage exhaustion.**
   No amount of attachment data has been able to prevent the daemon from

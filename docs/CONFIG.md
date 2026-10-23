@@ -53,8 +53,8 @@ a packaged install must: `OPENCHIME_DATA_DIR=/var/lib/openchime`, the unit's
 container image and exists nowhere else.
 
 **The data directory's layout** is fixed: `openchime.db` (the database, which
-the daemon creates and migrates), `blobs/` (attachments on local disk, unless
-`OPENCHIME_S3`), `identity/identity.db` (the box's identity, a database of its
+the daemon creates and migrates), `blobs/` (attachments on local disk; with
+`OPENCHIME_S3`, their disk cache), `identity/identity.db` (the box's identity, a database of its
 own: the certificates and their keys, the enrollment, the local issuer and the
 key local accounts' second-step secrets are sealed under; back it up with the
 database), `cert.pem` and `key.pem` (the certificate presented, written by the
@@ -83,7 +83,7 @@ in for them.
 | `replica-identity-prefix` | Optional: where the identity goes, apart from the data (`<prefix>/db`). Without it the identity is not replicated. |
 | `replica-restore-at` | Optional: a time (RFC 3339). A database restored at this boot is the copy as it was then, not the latest; the identity is always the latest. A restore asked for this way, or with `replica-restore-from`, must find a copy: with none, the boot stops rather than starting empty. |
 | `replica-restore-from` | Optional: where a database restored at this boot is read from, when not `replica-prefix`. An earlier copy is read from its own place while the box replicates to a new one, never on top of the old history. |
-| `replica-blob-prefix` | Optional: attachments in the bucket under it, with the same key, instead of under `blobs/` (written for the daemon as `OPENCHIME_S3_FILE`). Attachments already on the disk move there at the next start. |
+| `replica-blob-prefix` | Optional: attachments in the bucket under it, with the same key, with `blobs/` as their disk cache (written for the daemon as `OPENCHIME_S3_FILE`). Attachments already on the disk are sent there in the background, and stay as cache. |
 
 The first four come together or not at all: none is a box that is not
 replicated, some is a boot that stops. The entrypoint writes Litestream's
@@ -166,7 +166,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_TLS` | `self` | The certificate the daemon presents (TLS.md): `self` (its own, made at first run), `file` (`cert.pem` and `key.pem` in the data directory), `acme:<names>[;email=…][;directory=…]` (RFC 8555 for the comma-separated names), or `central` (through the control plane; the default on a managed box). |
 | `OPENCHIME_AUTH` | `local` | Where accounts come from: `local` (passwords held here), `relay` (sign-in through the control plane this box is enrolled with, ARCH-56), or `local,relay`. |
 | `OPENCHIME_MFA` | `optional` | Whether local accounts are asked for a second step (AUTH.md §8.6). One of `off`, `optional`, `required`. |
-| `OPENCHIME_S3` | *(unset)* | Attachments in S3 instead of under the data directory (ARCH-70): `s3://KEY:SECRET@host[:port]/bucket[/prefix][?region=…]`, or `http+s3://` for a plaintext endpoint; percent-encode `/`, `+` and `@` in the key and secret. A prefix puts the keys under it, so several daemons can share a bucket. Unset: local disk. |
+| `OPENCHIME_S3` | *(unset)* | Attachments in S3, with `blobs/` under the data directory as their disk cache (ARCH-70): `s3://KEY:SECRET@host[:port]/bucket[/prefix][?region=…]`, or `http+s3://` for a plaintext endpoint; percent-encode `/`, `+` and `@` in the key and secret. Uploads are accepted onto the disk and sent to S3 in the background, retried until it takes them; the cache keeps to half the free space above the low-space point. A prefix puts the keys under it, so several daemons can share a bucket. Unset: local disk. |
 | `OPENCHIME_S3_FILE` | *(unset)* | `OPENCHIME_S3`'s value, read from this file instead (mode 0600; a trailing newline is ignored), so the key and secret are not in the environment. Set one or the other, not both. |
 | `OPENCHIME_TTS` | `on` | Read-aloud (ARCH-111), in a build that carries it; off saves the voice model's memory. `on` or `off`. |
 | `OPENCHIME_STT` | `on` | Voice input (ARCH-112), in a build that carries it. `on` or `off`. |
@@ -314,6 +314,33 @@ A name that was a setting once. Set, it stops the daemon with the line below; th
 | `OPENCHIME_BLOB_BACKEND` | OPENCHIME_S3 set is S3; unset is local disk |
 | `OPENCHIME_STATE` | the TUI keeps its state in the credential store (ARCH-88) |
 <!-- /config-reference -->
+
+## Attachments in S3
+
+With `OPENCHIME_S3` (or `OPENCHIME_S3_FILE`) the store is the real copy and
+`blobs/` under the data directory is its disk cache, which nobody has to tend:
+
+- An upload is accepted once it is on the disk, and sent to the store in the
+  background. A store that is down or slow does not hold the upload up: the
+  daemon retries, waiting longer after each failure (up to 15 minutes between
+  tries), for as long as it takes. Attachments not yet sent are never evicted.
+- A download is served from the disk when the attachment is there, and
+  otherwise fetched from the store into it.
+- The cache uses at most half of the free space above the low-space point
+  (512 MB), measured on every pass, and gives space back, least recently read
+  first, as soon as something else needs it. With too little room to stage an
+  upload, it goes straight to the store.
+- Attachments already in `blobs/` when a store is first given, or a different
+  one, are sent to it the same way, and stay as cache.
+- The journal says how many attachments are not yet in the store, how much
+  they hold and how long the oldest has waited, with the cache's size, budget,
+  hits, misses and evictions: on every maintenance pass while anything waits
+  or the store is failing, hourly otherwise.
+
+On a managed box, whose prefix is its own, the daemon also deletes from the
+store what no database row has named for 30 days, beyond what a restore of the
+database could bring back. Nowhere else does it delete anything it did not
+write and then reclaim.
 
 ## A managed box
 

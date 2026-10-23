@@ -36,6 +36,7 @@ int run_dbwriter_tests(void);
 int run_http_tests(void);
 int run_sigv4_tests(void);
 int run_blob_s3_tests(void);
+int run_blob_cache_tests(void);
 int run_xferpool_tests(void);
 int run_storage_tests(void);
 int run_config_tests(void);
@@ -255,6 +256,7 @@ static const struct suite { const char *name; int (*fn)(void); } SUITES[] = {
     S(run_http_tests),
     S(run_sigv4_tests),
     S(run_blob_s3_tests),
+    S(run_blob_cache_tests),
     S(run_xferpool_tests),
     S(run_config_tests),
     S(run_storage_tests),

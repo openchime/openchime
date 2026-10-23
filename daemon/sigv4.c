@@ -44,13 +44,25 @@ int oc_sigv4_authorization(const char *method, const char *uri,
                            const char *region, const char *service,
                            const char *access_key, const char *secret_key,
                            char *out, size_t out_cap) {
-    /* Canonical request — the fixed 3-header set, no query string. */
-    char creq[2048];
+    return oc_sigv4_authorization_query(method, uri, "", host, payload_sha256_hex,
+                                        amzdate, datestamp, region, service,
+                                        access_key, secret_key, out, out_cap);
+}
+
+int oc_sigv4_authorization_query(const char *method, const char *uri, const char *query,
+                                 const char *host, const char *payload_sha256_hex,
+                                 const char *amzdate, const char *datestamp,
+                                 const char *region, const char *service,
+                                 const char *access_key, const char *secret_key,
+                                 char *out, size_t out_cap) {
+    /* Canonical request — the fixed 3-header set, and the query string as the
+     * caller canonicalized it ("" for none). */
+    char creq[3072];
     int n = snprintf(creq, sizeof creq,
-        "%s\n%s\n\n"
+        "%s\n%s\n%s\n"
         "host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n\n"
         "host;x-amz-content-sha256;x-amz-date\n%s",
-        method, uri, host, payload_sha256_hex, amzdate, payload_sha256_hex);
+        method, uri, query ? query : "", host, payload_sha256_hex, amzdate, payload_sha256_hex);
     if (n < 0 || n >= (int)sizeof creq) return -1;
 
     char creq_hex[65];

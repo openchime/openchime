@@ -4920,6 +4920,14 @@ static void test_attachments(void) {
     char key_copy[64];
     snprintf(key_copy, sizeof key_copy, "%s", first_key ? first_key : "");
     oc_dbres_free(r);
+    /* 128 random bits in hex, not the row id: a restored database hands row
+     * ids out again, and a key must always name the same bytes. */
+    CHECK(strlen(key_copy) == 32 && strspn(key_copy, "0123456789abcdef") == 32);
+    {
+        char rowkey[32];
+        snprintf(rowkey, sizeof rowkey, "%016llx", (unsigned long long)aid);
+        CHECK(strcmp(key_copy, rowkey) != 0);
+    }
 
     /* Retrying the SAME (channel, token) hands back the SAME row, rather than
      * minting a second pending one. This is what a client does after a dropped

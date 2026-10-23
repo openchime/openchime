@@ -295,10 +295,17 @@ int run_slow_blob_tests(void) {
     if (g_s3.port == 0) { oc_test_rmtree(g_sbdir); return failures; }
 
     /* OPENCHIME_S3 selects the S3 backend (ARCH-70); http+s3:// keeps the fake
-     * endpoint plaintext. */
+     * endpoint plaintext. The blob directory in front of it, the cache, is
+     * given no room at all, so every upload and download below goes to the
+     * slow store itself, which is the regime under test. */
     char s3url[128];
     snprintf(s3url, sizeof s3url, "http+s3://AKIDEXAMPLE:SECRETEXAMPLEKEY@127.0.0.1:%d/slowbucket", g_s3.port);
     setenv("OPENCHIME_S3", s3url, 1);
+    char datadir[600];
+    sbpath(datadir, sizeof datadir, "data");
+    mkdir(datadir, 0700);
+    setenv("OPENCHIME_DATA_DIR", datadir, 1);
+    oc_netloop_set_blob_cache_floor(UINT64_MAX / 4);
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -498,6 +505,8 @@ done:
     slow_s3_stop(&g_s3);
 
     unsetenv("OPENCHIME_S3");
+    unsetenv("OPENCHIME_DATA_DIR");
+    oc_netloop_set_blob_cache_floor(0);
     oc_test_rmtree(g_sbdir);
     return failures;
 }

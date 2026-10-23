@@ -54,7 +54,7 @@ $(TEST_BIN): $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | b
 comma := ,
 TSAN_LIST := run_netloop_tests run_client_core_tests run_dbwriter_tests run_ioloop_tests \
              run_authpool_tests run_xferpool_tests run_slow_blob_tests run_storage_tests \
-             run_blob_s3_tests run_media_tests run_video_media_tests run_tts_worker_tests \
+             run_blob_s3_tests run_blob_cache_tests run_media_tests run_video_media_tests run_tts_worker_tests \
              run_stt_tests run_push_tests run_invite_mail_tests run_enroll_tests \
              run_tls_tests run_signin_tests run_acme_tests
 TSAN_SUITES := $(subst $(eval) ,$(comma),$(strip $(TSAN_LIST)))
@@ -144,8 +144,8 @@ build/signin: tests/testsignin_main.c tests/testsignin.c $(SHARED_SRC) $(wildcar
 	    tests/testsignin_main.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
 # Manual S3 smoke test (tests/manual/s3_smoke.c) -- NOT part of `make test`.
 # Needs live S3 credentials in the environment; see the header of that file.
-build/s3_smoke: tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_s3.c daemon/sigv4.c daemon/config.c daemon/config_table.c daemon/proxyproto.c shared/url.c shared/tls.c third_party/ca-roots/ca_roots.c $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) $(INC) tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_s3.c daemon/sigv4.c \
+build/s3_smoke: tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/sigv4.c daemon/config.c daemon/config_table.c daemon/proxyproto.c shared/url.c shared/tls.c third_party/ca-roots/ca_roots.c $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) $(INC) tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/sigv4.c \
 	    daemon/config.c daemon/config_table.c daemon/proxyproto.c shared/url.c shared/tls.c \
 	    third_party/ca-roots/ca_roots.c $(MBEDTLS_LIBS) -lpthread -o $@
 	@echo "built $@ -- needs OPENCHIME_S3 to run"

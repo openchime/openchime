@@ -1125,6 +1125,12 @@ void oc_netloop_set_audio(int udp_fd, uint16_t udp_port) {
 /* The plaintext health port (ARCH-25), -1 for none. Read when a loop starts. */
 static int g_health_port = -1;
 
+static uint64_t g_cache_floor;   /* 0: the pressure point (oc_netloop_set_blob_cache_floor) */
+
+void oc_netloop_set_blob_cache_floor(uint64_t bytes) {
+    __atomic_store_n(&g_cache_floor, bytes, __ATOMIC_RELAXED);
+}
+
 void oc_netloop_set_health_port(int port) {
     __atomic_store_n(&g_health_port, port, __ATOMIC_RELAXED);
 }
@@ -8251,6 +8257,32 @@ static void expire_snoozes(int ep, conn **conns) {
     }
 }
 
+/* The cache in front of S3, in the journal: on every pass while anything is
+ * waiting for the store or the store is failing, and hourly otherwise. Nobody
+ * has to act on it -- the uploader retries by itself -- but it is how anyone
+ * looking can see that attachments are, or are not yet, off the box. */
+static void log_blob_cache(uint64_t now) {
+    static uint64_t last_ms;
+    oc_blob_cache_stats cs;
+    if (oc_blobstore_cache_stats(g_blobs, &cs) != 0) return;
+    int waiting = cs.pending_count || cs.queued || cs.failures;
+    if (!waiting && last_ms && now - last_ms < 3600ull * 1000) return;
+    last_ms = now;
+    char oldest[48] = "";
+    if (cs.oldest_queued_ms && cs.oldest_queued_ms < now)
+        snprintf(oldest, sizeof oldest, ", oldest %llus", (unsigned long long)((now - cs.oldest_queued_ms) / 1000));
+    char budget[32];
+    if (cs.budget_bytes == UINT64_MAX) snprintf(budget, sizeof budget, "unmeasured");
+    else snprintf(budget, sizeof budget, "%llu MB", (unsigned long long)(cs.budget_bytes / (1024 * 1024)));
+    fprintf(stderr, "openchimed: blob store: %llu not yet uploaded (%llu KB%s), %llu queued; "
+                    "cache %llu MB of %s; %llu hits, %llu misses, %llu evicted, %llu uploaded, %llu swept%s%s\n",
+            (unsigned long long)cs.pending_count, (unsigned long long)(cs.pending_bytes / 1024), oldest,
+            (unsigned long long)cs.queued, (unsigned long long)(cs.cached_bytes / (1024 * 1024)), budget,
+            (unsigned long long)cs.hits, (unsigned long long)cs.misses, (unsigned long long)cs.evictions,
+            (unsigned long long)cs.uploaded, (unsigned long long)cs.swept,
+            cs.failures ? "; last error: " : "", cs.failures ? cs.last_error : "");
+}
+
 static void maybe_run_maintenance(oc_dbwriter *dbw) {
     uint64_t now = now_ms();
     if (g_last_maint_ms && now - g_last_maint_ms < g_spol.interval_ms) return;
@@ -8261,6 +8293,7 @@ static void maybe_run_maintenance(oc_dbwriter *dbw) {
      * uploads that would never have used it. Unmeasured, nothing is under
      * pressure and nothing is refused (storage.c); the sweeps below still run. */
     if (oc_blobstore_is_local(g_blobs)) oc_storage_sample(g_blob_dir, now, &g_sstat);
+    else log_blob_cache(now);
 
     /* Eviction is the destructive tier, so it is requested only when free space
      * is genuinely below the watermark AND the operator left it enabled. The
@@ -8450,7 +8483,8 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
                 oc_xfer_job *cl = oc_xfer_job_new(OC_XFER_CLOSE, 0);
                 if (cl) { cl->br = j->br; oc_xferpool_submit(g_xfers, cl); }
             }
-            send_transfer_error(c, j->attachment_id, OC_ERR_INTERNAL);
+            send_transfer_error(c, j->attachment_id,
+                                j->rc == OC_XFER_GONE ? OC_ERR_ATTACHMENT_GONE : OC_ERR_INTERNAL);
             break;
         }
         x->br = j->br;
@@ -8667,16 +8701,23 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                             "at \"%s\": %s\n", bd ? bd : "(unset)", strerror(errno));
             close(ep); close(lfd); loop_state_free(conns); return -1;
         }
-        /* Attachments kept on disk before S3 was turned on go to S3 once, here,
-         * before serving: the store is one place or the other, never both. */
+        /* With S3 the blob directory is its cache (blob_cache.c): it keeps to
+         * a share of the room above the pressure point, and attachments kept
+         * on disk before S3 was turned on are queued for it, in the
+         * background. A managed box's prefix is its own, so only there does
+         * the store get swept of what no row names. */
         if (!oc_blobstore_is_local(g_blobs)) {
-            int moved = 0, failed = 0;
-            if (oc_blobstore_take_local(g_blobs, bd, &moved, &failed) != 0)
-                fprintf(stderr, "openchimed: could not read %s to move its attachments into S3: %s\n",
-                        bd, strerror(errno));
-            else if (moved || failed)
-                fprintf(stderr, "openchimed: moved %d attachment%s from %s into S3%s\n", moved,
-                        moved == 1 ? "" : "s", bd, failed ? "; some could not be, and stay for the next start" : "");
+            oc_blob_cache_policy cp;
+            memset(&cp, 0, sizeof cp);
+            uint64_t floor = __atomic_load_n(&g_cache_floor, __ATOMIC_RELAXED);
+            cp.floor_bytes = floor ? floor : cfg->storage.pressure_bytes;
+            cp.share_pct = OC_BLOB_CACHE_SHARE_PCT;
+            if (cfg->deployment_mode == OC_DEPLOY_MANAGED && cfg->s3.prefix && *cfg->s3.prefix) {
+                cp.referenced = oc_db_blob_referenced;
+                cp.ref_ctx = (void *)cfg->db_path;
+                cp.sweep_age_ms = OC_BLOB_SWEEP_AGE_MS;
+            }
+            oc_blobstore_cache_policy(g_blobs, &cp);
         }
         g_max_attach = OC_MAX_ATTACHMENT_SIZE;
         g_max_video  = cfg->max_video_size;
@@ -8698,9 +8739,11 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                     (unsigned long long)(g_sstat.avail_bytes / (1024 * 1024)));
         } else {
             fprintf(stderr, "openchimed: storage maintenance every %llus, "
-                            "max attachment age %llud; storage pressure: not measured (attachments in S3)\n",
+                            "max attachment age %llud; attachments in S3, the blob directory "
+                            "its cache (%d%% of the free space above the pressure point)\n",
                     (unsigned long long)(g_spol.interval_ms / 1000),
-                    (unsigned long long)(g_spol.max_age_ms / (24ull * 3600 * 1000)));
+                    (unsigned long long)(g_spol.max_age_ms / (24ull * 3600 * 1000)),
+                    OC_BLOB_CACHE_SHARE_PCT);
         }
 
         g_xfers = oc_xferpool_start(g_blobs, nw);

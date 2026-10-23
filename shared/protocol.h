@@ -628,7 +628,7 @@ typedef enum {
     OC_ERR_ATTACHMENT_TOO_LARGE = 3010, /* upload exceeds MAX_ATTACHMENT_SIZE (REQ-140) */
     OC_ERR_UNKNOWN_ATTACHMENT  = 3011, /* no such attachment, or not finalized (REQ-141) */
     OC_ERR_STORAGE_FULL        = 3012, /* upload refused: below the DB reserve (REQ-216) */
-    OC_ERR_ATTACHMENT_GONE     = 3013, /* reclaimed by age or storage pressure (REQ-215/217) */
+    OC_ERR_ATTACHMENT_GONE     = 3013, /* reclaimed by age or storage pressure (REQ-215/217), or not in the object store */
     OC_ERR_INVALID_DEVICE_TOKEN = 3014, /* empty token or unknown platform on REGISTER_DEVICE_TOKEN */
     OC_ERR_TRANSFER_PROTOCOL   = 3015, /* out-of-order/oversized chunk or bad transfer state */
     OC_ERR_UNKNOWN_WEBHOOK     = 3016, /* no such (or disabled) incoming webhook token (REQ-170) */

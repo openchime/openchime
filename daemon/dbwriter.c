@@ -7487,9 +7487,15 @@ static oc_dbres *process_attach_create(sqlite3 *db, const oc_job *j) {
     if (rc != SQLITE_DONE) { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
 
     uint64_t aid = (uint64_t)sqlite3_last_insert_rowid(db);
-    /* The storage key is the row id in hex — unique, opaque, never on the wire. */
-    char key[32];
-    snprintf(key, sizeof key, "%016llx", (unsigned long long)aid);
+    /* The storage key is 128 random bits in hex — opaque, never on the wire, and
+     * never handed out twice. Not the row id: a database restored to an earlier
+     * time hands its row ids out again, and a key must always name the same
+     * bytes, in the store and in the cache in front of it (blob_cache.c). Keys
+     * made before this were the row id in hex, and stay as they are. */
+    uint8_t rnd[16];
+    if (oc_rand_bytes(rnd, sizeof rnd) != 0) { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    char key[33];
+    for (size_t i = 0; i < sizeof rnd; i++) snprintf(key + 2 * i, 3, "%02x", rnd[i]);
     sqlite3_prepare_v2(db, "UPDATE attachments SET storage_key=? WHERE id=?;", -1, &st, NULL);
     sqlite3_bind_text (st, 1, key, -1, SQLITE_STATIC);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)aid);
@@ -11605,4 +11611,30 @@ void oc_dbwriter_stop(oc_dbwriter *w) {
     sqlite3_close(w->db);
     pthread_mutex_destroy(&w->keys_mu);
     free(w);
+}
+
+int oc_db_blob_referenced(void *db_path, const char *const *keys, size_t n, uint8_t *ref) {
+    sqlite3 *db = NULL;
+    if (!db_path || sqlite3_open_v2((const char *)db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_busy_timeout(db, 5000);
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+    if (sqlite3_prepare_v2(db,
+            "SELECT EXISTS(SELECT 1 FROM attachments WHERE storage_key=?1)"
+            "    OR EXISTS(SELECT 1 FROM rendered_audio WHERE blob_key=?1);",
+            -1, &st, NULL) == SQLITE_OK) {
+        rc = 0;
+        for (size_t i = 0; i < n && rc == 0; i++) {
+            sqlite3_reset(st);
+            sqlite3_bind_text(st, 1, keys[i], -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) ref[i] = (uint8_t)(sqlite3_column_int(st, 0) != 0);
+            else rc = -1;
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return rc;
 }

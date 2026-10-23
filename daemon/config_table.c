@@ -66,7 +66,7 @@ const cfg_row OC_CFG[] = {
            cfg_parse_auth, 0),
     ENUM("OPENCHIME_MFA", CFG_OPERATOR, G_FLAG, "optional", "off|optional|required", "Whether local accounts are asked for a second step (AUTH.md §8.6).", local_mfa),
     CUSTOM("OPENCHIME_S3", CFG_OPERATOR, G_FLAG, NULL,
-           "Attachments in S3 instead of under the data directory (ARCH-70): `s3://KEY:SECRET@host[:port]/bucket[/prefix][?region=…]`, or `http+s3://` for a plaintext endpoint; percent-encode `/`, `+` and `@` in the key and secret. A prefix puts the keys under it, so several daemons can share a bucket. Unset: local disk.",
+           "Attachments in S3, with `blobs/` under the data directory as their disk cache (ARCH-70): `s3://KEY:SECRET@host[:port]/bucket[/prefix][?region=…]`, or `http+s3://` for a plaintext endpoint; percent-encode `/`, `+` and `@` in the key and secret. Uploads are accepted onto the disk and sent to S3 in the background, retried until it takes them; the cache keeps to half the free space above the low-space point. A prefix puts the keys under it, so several daemons can share a bucket. Unset: local disk.",
            cfg_parse_s3, CFG_SECRET),
     CUSTOM("OPENCHIME_S3_FILE", CFG_OPERATOR, G_FLAG, NULL,
            "`OPENCHIME_S3`'s value, read from this file instead (mode 0600; a trailing newline is ignored), so the key and secret are not in the environment. Set one or the other, not both.",

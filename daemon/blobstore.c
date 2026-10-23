@@ -2,13 +2,13 @@
  * local-filesystem backend. Each blob is a file `<base>/<key>`; writes stage to
  * `<base>/<key>.tmp` and atomically rename into place on commit, so a reader
  * never sees a partial blob and an aborted upload leaves nothing behind. The
- * S3/MinIO backend (blob_s3.c) implements the same vtable and is selected with
- * OPENCHIME_S3 (config.h). */
+ * S3/MinIO backend (blob_s3.c) implements the same vtable; with OPENCHIME_S3
+ * (config.h) the daemon uses it through the cache (blob_cache.c), which keeps
+ * the local backend's directory in front of it. */
 
 #include "blobstore.h"
 #include "blob_backend.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,9 +35,9 @@ typedef struct {
 
 typedef struct { FILE *fp; } fs_reader;
 
-/* Reject a key that could escape the base directory. Keys are daemon-minted (hex
- * of the attachment id), so this is defense-in-depth, not the primary guard. */
-static int key_ok(const char *key) {
+/* Reject a key that could escape the base directory. Keys are daemon-minted
+ * (random hex), so this is defense-in-depth, not the primary guard. */
+int oc_blob_key_ok(const char *key) {
     if (!key || !*key) return 0;
     for (const char *p = key; *p; p++) {
         char c = *p;
@@ -65,7 +65,7 @@ static void fs_close(void *store) { free(store); }
 static void *fs_put_begin(void *store, const char *key, uint64_t size_hint) {
     (void)size_hint;
     fs_store *s = store;
-    if (!s || !key_ok(key)) return NULL;
+    if (!s || !oc_blob_key_ok(key)) return NULL;
     fs_writer *w = calloc(1, sizeof *w);
     if (!w) return NULL;
     if (snprintf(w->final_path, sizeof w->final_path, "%s/%s", s->base, key)
@@ -117,7 +117,7 @@ static void fs_put_abort(void *wv) {
 
 static void *fs_get_begin(void *store, const char *key, uint64_t *size_out) {
     fs_store *s = store;
-    if (!s || !key_ok(key)) return NULL;
+    if (!s || !oc_blob_key_ok(key)) return NULL;
     char path[1200];
     if (snprintf(path, sizeof path, "%s/%s", s->base, key) >= (int)sizeof path)
         return NULL;
@@ -151,7 +151,7 @@ static void fs_get_close(void *rv) {
 
 static int fs_del(void *store, const char *key) {
     fs_store *s = store;
-    if (!s || !key_ok(key)) return -1;
+    if (!s || !oc_blob_key_ok(key)) return -1;
     char path[1200];
     if (snprintf(path, sizeof path, "%s/%s", s->base, key) >= (int)sizeof path)
         return -1;
@@ -166,14 +166,8 @@ const oc_blob_backend oc_blob_backend_fs = {
 
 /* --- Public dispatch ------------------------------------------------------- */
 
-/* Selection is by configuration, not a mode flag (ARCH-70): an operator who
- * supplies the four S3 values gets the S3 backend, one who supplies none gets
- * local disk; a partial set never reaches here (config.c refuses it). */
-oc_blobstore *oc_blobstore_open(const char *base_dir, const oc_s3_config *s3) {
-    int use_s3 = s3 && s3->endpoint && *s3->endpoint;
-    const oc_blob_backend *be = use_s3 ? &oc_blob_backend_s3 : &oc_blob_backend_fs;
-    fprintf(stderr, "openchimed: blob storage = %s\n",
-            use_s3 ? "s3 (operator-supplied endpoint)" : "local disk");
+static oc_blobstore *open_with(const oc_blob_backend *be, const char *base_dir,
+                               const oc_s3_config *s3) {
     void *store = be->open(base_dir, s3);
     if (!store) return NULL;
     oc_blobstore *bs = calloc(1, sizeof *bs);
@@ -181,6 +175,36 @@ oc_blobstore *oc_blobstore_open(const char *base_dir, const oc_s3_config *s3) {
     bs->be = be;
     bs->store = store;
     return bs;
+}
+
+/* Selection is by configuration, not a mode flag (ARCH-70): an operator who
+ * supplies the four S3 values gets the S3 store with the blob directory as its
+ * cache, one who supplies none gets local disk; a partial set never reaches
+ * here (config.c refuses it). */
+oc_blobstore *oc_blobstore_open(const char *base_dir, const oc_s3_config *s3) {
+    int use_s3 = s3 && s3->endpoint && *s3->endpoint;
+    fprintf(stderr, "openchimed: blob storage = %s\n",
+            use_s3 ? "s3 (operator-supplied endpoint), cached on local disk" : "local disk");
+    return open_with(use_s3 ? &oc_blob_backend_cache : &oc_blob_backend_fs, base_dir, s3);
+}
+
+oc_blobstore *oc_blobstore_open_remote(const oc_s3_config *s3) {
+    if (!s3 || !s3->endpoint || !*s3->endpoint) return NULL;
+    return open_with(&oc_blob_backend_s3, NULL, s3);
+}
+
+void oc_blobstore_cache_policy(oc_blobstore *bs, const oc_blob_cache_policy *p) {
+    if (bs && bs->be == &oc_blob_backend_cache) oc_blob_cache_set_policy(bs->store, p);
+}
+
+void oc_blobstore_cache_kick(oc_blobstore *bs) {
+    if (bs && bs->be == &oc_blob_backend_cache) oc_blob_cache_kick(bs->store);
+}
+
+int oc_blobstore_cache_stats(oc_blobstore *bs, oc_blob_cache_stats *out) {
+    if (!bs || bs->be != &oc_blob_backend_cache || !out) return -1;
+    oc_blob_cache_get_stats(bs->store, out);
+    return 0;
 }
 
 int oc_blobstore_is_local(const oc_blobstore *bs) { return bs && bs->be == &oc_blob_backend_fs; }
@@ -262,43 +286,4 @@ void oc_blob_get_close(oc_blob_reader *r) {
 int oc_blob_delete(oc_blobstore *bs, const char *key) {
     note_op();
     return (bs && bs->be) ? bs->be->del(bs->store, key) : -1;
-}
-
-/* --- Moving local blobs into a remote store ------------------------------- */
-
-int oc_blobstore_take_local(oc_blobstore *bs, const char *dir, int *moved, int *failed) {
-    *moved = *failed = 0;
-    if (!bs || oc_blobstore_is_local(bs) || !dir || !*dir) return 0;
-    DIR *d = opendir(dir);
-    if (!d) return errno == ENOENT ? 0 : -1;
-    struct dirent *de;
-    char path[1200], buf[64 * 1024];
-    while ((de = readdir(d)) != NULL) {
-        /* Only what the local backend itself would have published: a staged
-         * `.tmp` was never a blob, and anything else is not ours. */
-        if (!key_ok(de->d_name)) continue;
-        if (snprintf(path, sizeof path, "%s/%s", dir, de->d_name) >= (int)sizeof path) { (*failed)++; continue; }
-        struct stat sb;
-        FILE *fp = fopen(path, "rb");
-        if (!fp || fstat(fileno(fp), &sb) != 0 || !S_ISREG(sb.st_mode)) {
-            if (fp) fclose(fp);
-            continue;
-        }
-        oc_blob_writer *w = oc_blob_put_begin(bs, de->d_name, (uint64_t)sb.st_size);
-        int ok = w != NULL;
-        size_t n;
-        while (ok && (n = fread(buf, 1, sizeof buf, fp)) > 0) ok = oc_blob_put_chunk(w, buf, n) == 0;
-        ok = ok && !ferror(fp);
-        fclose(fp);
-        if (w) {
-            if (ok) ok = oc_blob_put_commit(w) == 0;
-            else oc_blob_put_abort(w);
-        }
-        /* Removed only once the store has it: a failure leaves the file to be
-         * taken on the next start. */
-        if (ok && unlink(path) == 0) (*moved)++;
-        else (*failed)++;
-    }
-    closedir(d);
-    return 0;
 }

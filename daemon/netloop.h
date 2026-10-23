@@ -52,6 +52,12 @@ int oc_netloop_run_ex(int port, oc_tls_server *tls, oc_dbwriter *dbw,
  * client goes by; the words are for whatever ignores the kind. */
 #define OC_CALL_MISSED_TEXT "Missed call"
 
+/* The free space the blob cache in front of S3 leaves alone (blob_cache.c); 0,
+ * the default, is the storage-pressure point. A test that has to see every
+ * write and read reach a slow store sets it past any disk, so nothing is
+ * staged or kept. Call before oc_netloop_run. */
+void oc_netloop_set_blob_cache_floor(uint64_t bytes);
+
 /* Serve the plaintext health port (ARCH-25) beside the TLS port: `/healthz`
  * and the landing page, through the same HTTP stack. -1 (the default) serves
  * none. Call before oc_netloop_run. */

@@ -37,6 +37,22 @@ static void test_authorization(void) {
         "Signature=da40886b041d92ee72438f5aeb73e13638207122387ffb5d0397a836362af4e4") == 0);
 }
 
+/* AWS's documented "GET Bucket (List Objects)" example: the same three signed
+ * headers, with a query string, which a listing (the sweep) sends. */
+static void test_authorization_query(void) {
+    char out[512];
+    CHECK(oc_sigv4_authorization_query(
+        "GET", "/", "max-keys=2&prefix=J", "examplebucket.s3.amazonaws.com",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "20130524T000000Z", "20130524", "us-east-1", "s3",
+        "AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", out, sizeof out) == 0);
+    /* contract: AWS Signature Version 4's Authorization header, byte for byte */
+    CHECK(strcmp(out,
+        "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, "
+        "SignedHeaders=host;x-amz-content-sha256;x-amz-date, "
+        "Signature=34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7") == 0);
+}
+
 /* A too-small output buffer is reported, not overrun. */
 static void test_small_buffer(void) {
     char out[16];
@@ -46,9 +62,10 @@ static void test_small_buffer(void) {
 }
 
 int run_sigv4_tests(void) {
-    printf("test_sigv4: signing-key derivation, full authorization header, buffer bound\n");
+    printf("test_sigv4: signing-key derivation, full authorization header, with a query, buffer bound\n");
     test_signing_key();
     test_authorization();
+    test_authorization_query();
     test_small_buffer();
     return failures;
 }

@@ -64,6 +64,10 @@ typedef enum {
     OC_XFER_DELETE,      /* oc_blob_delete(key) — storage reclamation (ARCH-78) */
 } oc_xfer_op;
 
+/* An OPEN_R whose blob the store does not have, as against one it could not
+ * read: the client is told the attachment is gone, not that the server failed. */
+#define OC_XFER_GONE (-2)
+
 typedef struct oc_xfer_job {
     oc_xfer_op op;
     uint64_t   conn_id;        /* 0 = fire-and-forget cleanup, no result wanted */
@@ -88,7 +92,8 @@ typedef struct oc_xfer_job {
     oc_blob_reader *br;
 
     /* Filled by the worker. */
-    int        rc;             /* 0 on success, <0 on failure                   */
+    int        rc;             /* 0 on success, <0 on failure; OPEN_R gives
+                                * OC_XFER_GONE when the store has no such blob */
     uint64_t   blob_size;      /* OPEN_R: total object size                     */
 
     struct oc_xfer_job *next;  /* queue linkage; not for callers                */

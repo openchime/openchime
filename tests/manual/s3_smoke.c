@@ -97,9 +97,9 @@ int main(void) {
     printf("endpoint: %s  bucket: %s  region: %s\n",
            oc_config_get()->s3.endpoint, oc_config_get()->s3.bucket, oc_config_get()->s3.region);
 
-    /* base_dir is ignored by the S3 backend; OPENCHIME_S3 selects it (blobstore.c). */
-    oc_blobstore *bs = oc_blobstore_open("/tmp/unused-s3-smoke", &oc_config_get()->s3);
-    CHECK(bs != NULL, "oc_blobstore_open selected + connected the S3 backend");
+    /* The S3 store alone, uncached: every call below is a request to it. */
+    oc_blobstore *bs = oc_blobstore_open_remote(&oc_config_get()->s3);
+    CHECK(bs != NULL, "oc_blobstore_open_remote connected the S3 backend");
     if (!bs) { printf("\nFAILED: could not open the store\n"); return 1; }
 
     /* Small: single chunk. */

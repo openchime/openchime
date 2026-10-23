@@ -2980,7 +2980,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3010` | `ATTACHMENT_TOO_LARGE`| messaging  | no    | Upload exceeds `MAX_ATTACHMENT_SIZE` (REQ-140). |
 | `3011` | `UNKNOWN_ATTACHMENT`  | messaging  | no    | No such attachment, or not finalized (REQ-141). |
 | `3012` | `STORAGE_FULL`        | messaging  | no    | Upload refused: below the DB reserve (REQ-216). |
-| `3013` | `ATTACHMENT_GONE`     | messaging  | no    | Reclaimed by age or storage pressure (REQ-215/217). |
+| `3013` | `ATTACHMENT_GONE`     | messaging  | no    | Reclaimed by age or storage pressure (REQ-215/217), or not in the object store. |
 | `3014` | `INVALID_DEVICE_TOKEN`| messaging  | no    | `REGISTER_DEVICE_TOKEN` had a token no device issues (empty, over 511 bytes, or a character outside letters, digits, `_`, `-`, `:`, `.`) or an unknown platform (REQ-132). |
 | `3015` | `TRANSFER_PROTOCOL`   | messaging  | no    | Out-of-order/oversized chunk or bad transfer state. |
 | `3016` | `UNKNOWN_WEBHOOK`     | webhook    | no    | No such (or disabled) incoming webhook token (REQ-170). |

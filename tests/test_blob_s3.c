@@ -18,6 +18,7 @@
 #include "testenv.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -280,7 +281,9 @@ int run_blob_s3_tests(void) {
     CHECK(oc_test_mkdtemp("blob-s3", dir, sizeof dir) == 0);
     oc_test_path(fsdir, sizeof fsdir, dir, "fs");
 
-    oc_blobstore *bs = oc_blobstore_open(dir, &g_s3cfg);
+    /* The backend itself, uncached: every call is a request the fake sees.
+     * The cache in front of it has its own suite (test_blob_cache.c). */
+    oc_blobstore *bs = oc_blobstore_open_remote(&g_s3cfg);
     CHECK(bs != NULL);
     CHECK(!oc_blobstore_is_local(bs));
     if (!bs) { fake_stop(f); clear_env(); oc_test_rmtree(dir); return failures; }
@@ -306,36 +309,23 @@ int run_blob_s3_tests(void) {
     /* With a prefix, the keys go under it, and still round-trip. */
     {
         g_s3cfg.prefix = "ws-1/data/2";
-        oc_blobstore *pb = oc_blobstore_open(fsdir, &g_s3cfg);
+        oc_blobstore *pb = oc_blobstore_open_remote(&g_s3cfg);
         CHECK(pb != NULL);
         if (pb) {
             round_trip(pb, f, "cccc0001", 1000, 4096);
             CHECK(strncmp(f->last_uri, "/testbucket/ws-1/data/2/cccc0001", 32) == 0);
-
-            /* Blobs a local store left behind move into it once, and go. */
-            char local[800];
-            mkdir(fsdir, 0700);
-            snprintf(local, sizeof local, "%s/dddd0001", fsdir);
-            FILE *lf = fopen(local, "wb");
-            CHECK(lf != NULL);
-            if (lf) { fputs("kept on disk before", lf); fclose(lf); }
-            int moved = -1, failed = -1;
-            CHECK(oc_blobstore_take_local(pb, fsdir, &moved, &failed) == 0);
-            CHECK(moved == 1 && failed == 0);
-            CHECK(access(local, F_OK) != 0);
-            uint64_t sz = 0;
-            oc_blob_reader *r = oc_blob_get_begin(pb, "dddd0001", &sz);
-            CHECK(r != NULL && sz == 19);
-            if (r) oc_blob_get_close(r);
             oc_blobstore_close(pb);
         }
         g_s3cfg.prefix = NULL;
     }
 
-    /* Delete, then confirm the object is really gone (the fake 404s). */
+    /* Delete, then confirm the object is really gone (the fake 404s), and
+     * that the caller can tell gone from unreachable. */
     CHECK(oc_blob_delete(bs, "aaaa0003") == 0);
+    errno = 0;
     oc_blob_reader *gone = oc_blob_get_begin(bs, "aaaa0003", NULL);
     CHECK(gone == NULL);
+    CHECK(errno == ENOENT);
     if (gone) oc_blob_get_close(gone);
     /* Deleting an absent key is documented as success, not an error. */
     CHECK(oc_blob_delete(bs, "aaaa0009") == 0);
@@ -385,7 +375,7 @@ int run_blob_s3_tests(void) {
         return failures;
     }
     set_env_for(f);
-    oc_blobstore *bs6 = oc_blobstore_open(dir, &g_s3cfg);
+    oc_blobstore *bs6 = oc_blobstore_open_remote(&g_s3cfg);
     CHECK(bs6 != NULL);
     if (bs6) {
         round_trip(bs6, f, "cccc0001", 5000, 4096);

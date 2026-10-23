@@ -1552,6 +1552,13 @@ int oc_dbwriter_register_device_token(oc_dbwriter *w, uint64_t user_id, uint8_t 
  * worker from its own thread when central reports the token stale. */
 void oc_dbwriter_prune_device_token(oc_dbwriter *w, const char *token);
 
+/* Whether any row names each of `n` blob keys: an attachment (avatars, emoji
+ * and video posters are attachments) or a read-aloud render. The blob store's
+ * sweep asks, from its own thread, on a read-only connection of its own to the
+ * database at `db_path` (an oc_blob_ref_fn, blobstore.h). 0, or -1 when the
+ * database could not be read. */
+int oc_db_blob_referenced(void *db_path, const char *const *keys, size_t n, uint8_t *ref);
+
 /* Hand a job to the writer (transfers ownership; the writer frees it). */
 void       oc_dbwriter_submit(oc_dbwriter *w, oc_job *j);
 /* Store a summary batch through the writer and wait for it (the summary

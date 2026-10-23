@@ -123,6 +123,18 @@ framework, and OpenChime follows suit.
   - version-negotiation math (§3): overlapping ranges pick
     `min(server_max, client_max)`; disjoint ranges yield the correct
     `VERSION_TOO_OLD` vs `VERSION_TOO_NEW` outcome.
+- **The blob cache in front of S3** (`test_blob_cache`, ARCH-70) — against a
+  fake S3 endpoint that holds many objects, lists them a page at a time and
+  fails every request on command: an upload accepted while the store is down,
+  readable from disk, and sent once it is back; failures counted and retried
+  with a wait that grows; a read fetched into the cache on a miss and served
+  from it after; a missing object told apart from an unreachable store; a
+  delete made while the store is down reaching it later; eviction down to a
+  budget that never takes a blob the store does not have; a read and a write
+  with no room on the disk going to the store directly; blobs already on disk
+  sent once to a newly given store and not again; the queue surviving a
+  restart; and the sweep deleting only old objects no row names, under the
+  store's own prefix, across several listing pages.
 - **Frame reassembler** (`framebuf`, ARCH-9) — feeding a frame one byte at a
   time yields nothing until complete; two frames in one push come out in order;
   a frame split across pushes reassembles; bad/oversized lengths error rather
@@ -1077,7 +1089,9 @@ so without this one, the ~100 ms/op regime the pool exists for would go
 unexercised.
 
 The test points the daemon's S3 backend at a loopback endpoint that dribbles a
-download 16 KB at a time with a 120 ms delay between pieces, then measures one
+download 16 KB at a time with a 120 ms delay between pieces, with the blob
+cache in front of it given no room (`oc_netloop_set_blob_cache_floor`), so
+every write and read goes to the slow store itself; it then measures one
 client's message round-trips while another client's download crawls through it.
 
 ```

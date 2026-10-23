@@ -53,6 +53,11 @@ typedef enum {
 #define OC_SESSION_TTL_MS      (30ull * 24 * 60 * 60 * 1000)   /* a session lives 30 days (REQ-181) */
 #define OC_SESSION_IDLE_MS     0ull                            /* and may go unused as long as it lives */
 #define OC_XFER_WORKERS        2       /* threads moving attachment bytes (ARCH-69); each holds a TLS session */
+/* How old an object in a managed box's store must be before the sweep may
+ * delete it for want of a row naming it: past the replica's 14-day restore
+ * window (entrypoint.sh) with room to spare, so no database a restore could
+ * bring back still names it. */
+#define OC_BLOB_SWEEP_AGE_MS   (30ull * 24 * 3600 * 1000)
 #define OC_MAX_CONNS_PER_IP    1024    /* connections one address may hold: a large office behind one NAT */
 #define OC_CALL_MAX            10      /* the most people in one call (REQ-305, CALLS.md) */
 #define OC_TTS_QUEUE           256     /* renders that may wait */
