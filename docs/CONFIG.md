@@ -339,7 +339,8 @@ With `OPENCHIME_S3` (or `OPENCHIME_S3_FILE`) the store is the real copy and
 
 On a managed box, whose prefix is its own, the daemon also deletes from the
 store what no database row has named for 30 days, beyond what a restore of the
-database could bring back. Nowhere else does it delete anything it did not
+database could bring back, once a day, and says in the journal how many it
+deleted or that it could not. Nowhere else does it delete anything it did not
 write and then reclaim.
 
 ## A managed box

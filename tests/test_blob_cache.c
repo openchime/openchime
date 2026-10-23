@@ -504,16 +504,20 @@ static void blobs_on_disk_are_adopted(fake *f, const char *dir) {
     CHECK(put(local, "d2", "and another") == 0);
     oc_blobstore_close(local);
 
-    /* ...is given a store: both go to it, in the background, and stay. */
+    /* ...is given a store: both go to it, in the background, and stay. A blob
+     * written the moment the store opens goes too, once, like the others. */
     cfg_for(f, "other");
+    unsigned puts_before = fk_puts(f);
     oc_blobstore *bs = oc_blobstore_open(dir, &g_cfg);
     CHECK(bs != NULL);
     if (!bs) return;
+    CHECK(put(bs, "d3", "written as it opened") == 0);
     oc_blob_cache_policy p = quick();
     oc_blobstore_cache_policy(bs, &p);
-    CHECK(WAIT_UNTIL(fk_has(f, "other/d1") && fk_has(f, "other/d2") && settled(bs), 5000));
+    CHECK(WAIT_UNTIL(fk_has(f, "other/d1") && fk_has(f, "other/d2") && fk_has(f, "other/d3") && settled(bs), 5000));
     CHECK(fk_body_is(f, "other/d1", "kept on disk before"));
     CHECK(on_disk(dir, "d1") && on_disk(dir, "d2"));
+    CHECK(fk_puts(f) - puts_before == 3);
     oc_blobstore_close(bs);
 
     /* The same store again: nothing is sent twice. */

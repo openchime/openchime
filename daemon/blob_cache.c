@@ -73,7 +73,7 @@ typedef struct cache {
     unsigned             seq;    /* fetch staging names */
 } cache;
 
-typedef struct { const oc_blob_backend *be; void *h; cache *c; char key[256]; } cache_writer;
+typedef struct { const oc_blob_backend *be; void *h; cache *c; char key[256]; uint64_t bytes; } cache_writer;
 typedef struct { const oc_blob_backend *be; void *h; } cache_reader;
 
 static uint64_t now_ms(void) {
@@ -171,7 +171,20 @@ static void *cache_put_begin(void *store, const char *key, uint64_t size_hint) {
 
 static int cache_put_chunk(void *wv, const void *data, size_t len) {
     cache_writer *w = wv;
-    return w ? w->be->put_chunk(w->h, data, len) : -1;
+    if (!w) return -1;
+    int rc = w->be->put_chunk(w->h, data, len);
+    if (rc == 0) w->bytes += len;
+    return rc;
+}
+
+/* Counted the moment it is queued, so the figures never read nothing waiting
+ * while something is; each pass of the uploader counts them afresh. */
+static void count_queued(cache *c, uint64_t bytes, int pending) {
+    pthread_mutex_lock(&c->mu);
+    c->st.queued++;
+    if (pending) { c->st.pending_count++; c->st.pending_bytes += bytes; }
+    if (!c->st.oldest_queued_ms) c->st.oldest_queued_ms = now_ms();
+    pthread_mutex_unlock(&c->mu);
 }
 
 static int cache_put_commit(void *wv) {
@@ -187,6 +200,7 @@ static int cache_put_commit(void *wv) {
         if (rc != 0) queue_drop(w->c, w->key, "put");
         else {
             queue_drop(w->c, w->key, "del");
+            count_queued(w->c, w->bytes, 1);
             wake(w->c);
         }
     } else {
@@ -303,6 +317,7 @@ static int cache_del(void *store, const char *key) {
     if (queue_add(c, key, "del") != 0) return -1;
     queue_drop(c, key, "put");
     int rc = oc_blob_backend_fs.del(c->fs, key);
+    count_queued(c, 0, 0);
     wake(c);
     return rc;
 }
@@ -594,12 +609,26 @@ static void sweep(cache *c) {
     s->c = c;
     s->older_than = now_ms() > age ? now_ms() - age : 0;
     char token[3000] = "", next[3000];
+    pthread_mutex_lock(&c->mu);
+    uint64_t before = c->st.swept;
+    pthread_mutex_unlock(&c->mu);
+    int listed = 1;
     do {
-        if (oc_blob_s3_list(c->s3, token, sweep_one, s, next, sizeof next) != 0) { s->failed = 1; break; }
+        if (oc_blob_s3_list(c->s3, token, sweep_one, s, next, sizeof next) != 0) { s->failed = 1; listed = 0; break; }
         sweep_flush(s);
         snprintf(token, sizeof token, "%s", next);
     } while (token[0] && !s->failed && !stopping(c));
     if (!s->failed) sweep_flush(s);
+    pthread_mutex_lock(&c->mu);
+    uint64_t took = c->st.swept - before;
+    pthread_mutex_unlock(&c->mu);
+    /* Once a day at most, so always said: what it took, or that it could not. */
+    if (s->failed && !stopping(c))
+        fprintf(stderr, "openchimed: blob store: the sweep stopped: %s; it tries again tomorrow\n",
+                listed ? "the database or the store did not answer" : "the store could not be listed");
+    else if (!stopping(c))
+        fprintf(stderr, "openchimed: blob store: the sweep deleted %llu object%s no row names\n",
+                (unsigned long long)took, took == 1 ? "" : "s");
     free(s);
 }
 
@@ -639,7 +668,6 @@ static void adopt(cache *c) {
 
 static void *uploader(void *arg) {
     cache *c = arg;
-    adopt(c);
     for (;;) {
         uint64_t mnow = mono_ms();
         uint64_t rnow = now_ms();
@@ -722,6 +750,11 @@ static void *cache_open(const char *base_dir, const void *backend_cfg) {
     pthread_cond_init(&c->cv, NULL);
     c->pol.share_pct = OC_BLOB_CACHE_SHARE_PCT;
     c->st.budget_bytes = UINT64_MAX;
+    /* Before the uploader starts and before anything can be written: a blob
+     * written after the scan is queued by its own write, and only once. Then
+     * the figures, so what a restart found waiting reads so at once. */
+    adopt(c);
+    tend(c);
     if (pthread_create(&c->th, NULL, uploader, c) != 0) {
         pthread_cond_destroy(&c->cv); pthread_mutex_destroy(&c->mu);
         oc_blob_backend_s3.close(c->s3); oc_blob_backend_fs.close(c->fs); free(c); return NULL;
