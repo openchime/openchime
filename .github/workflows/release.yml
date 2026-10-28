@@ -18,8 +18,9 @@
 #   tarball  everyone else, and the offline case -- attached to the GitHub release
 #   image    the build's image, copied to :N and :latest in the build
 #            repository (IMAGE_REPO_BUILD) and, when set, IMAGE_REPO_EXTRA
-#   windows  the client, not the daemon: a signed installer attached to the
-#            GitHub release, and an MSIX for the Store
+#   windows  the client, not the daemon: an installer attached to the GitHub
+#            release (signed when Artifact Signing is configured), and an
+#            MSIX for the Store
 #
 # ONE BINARY PER ARCHITECTURE feeds the .deb, the .rpm, the tarball and the
 # image, so all four ship a byte-identical artifact: the one the build's
@@ -390,8 +391,9 @@ jobs:
   # The number is a label on the release-candidate's build id, and it is the
   # number the release-candidate was built for: release-N-rcK becomes
   # release-N and nothing else. Checked against this repository's tags, and
-  # reserved here before anything is packaged, so that a failure between here and publishing burns
-  # a number rather than duplicating one. A release-candidate for a number
+  # reserved here before anything is packaged, so that a failure can never
+  # duplicate a number: one before the apt index is written returns it
+  # (`unreserve`), one after spends it. A release-candidate for a number
   # that has since been released is refused; make a new one. So is one that
   # would go back -- that does not descend from the last release's candidate
   # and the newest release-N -- and one the documentation promoted to main
@@ -412,8 +414,8 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.sha }}
           fetch-depth: 0
-      # Tags are pushed with the deploy key: the workflow's own token may not
-      # create a ref on a commit that changes workflow files.
+      # Tags are pushed with the deploy key: a tag ruleset lets only the deploy
+      # key create, move or delete a release-* tag.
       - name: Push with the deploy key
         env:
           KEY: ${{ secrets.RELEASE_SSH_KEY }}
@@ -452,10 +454,10 @@ jobs:
           echo "number=$N" >> "$GITHUB_OUTPUT"
           echo "this release is $N (previous: $(scripts/release/version.sh current)), build ${{ needs.candidate.outputs.build_id }}"
 
-      # Reserved now, as a tag, so a failure later burns a number rather than
-      # duplicating one (scripts/release/version.sh derives the next number from
-      # tags, and two .debs sharing a version is the one thing apt cannot
-      # recover from); `unreserve` returns it if nothing was published. The tag
+      # Reserved now, as a tag, so a failure later never duplicates a number
+      # (scripts/release/version.sh derives the next number from tags, and two
+      # .debs sharing a version is the one thing apt cannot recover from);
+      # `unreserve` returns it if nothing was published. The tag
       # goes on the release-candidate's commit, pushed with the deploy key: a
       # plain push, which is refused if release-N appeared in the meantime.
       - name: Reserve the release number
@@ -470,9 +472,10 @@ jobs:
           echo "reserved release-${N} on ${SHA:0:7}"
 
   # The candidate's tree, packaged under the release number: the .deb, the
-  # .rpm and the tarball from the one binary, with the checks that the
-  # candidate build ran on its placeholder packages run again on the real
-  # ones. Seconds, not the hour a build took.
+  # .rpm and the tarball from the one binary, with the identical-binary and
+  # install checks run again on the real ones (the staging build's other
+  # package checks -- glibc floor, unit file, speech -- are not repeated).
+  # Seconds, not the hour a build took.
   package:
     name: ${{ matrix.arch }} packages
     needs: [version, candidate, resolve]
@@ -858,8 +861,8 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.sha }}
           fetch-depth: 0
-      # Tags are pushed with the deploy key: the workflow's own token may not
-      # create a ref on a commit that changes workflow files.
+      # Tags are pushed with the deploy key: a tag ruleset lets only the deploy
+      # key create, move or delete a release-* tag.
       - name: Push with the deploy key
         env:
           KEY: ${{ secrets.RELEASE_SSH_KEY }}
@@ -1308,8 +1311,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve.outputs.sha }}
-      # Tags are pushed with the deploy key: the workflow's own token may not
-      # create a ref on a commit that changes workflow files.
+      # Tags are pushed with the deploy key: a tag ruleset lets only the deploy
+      # key create, move or delete a release-* tag.
       - name: Push with the deploy key
         env:
           KEY: ${{ secrets.RELEASE_SSH_KEY }}
@@ -1378,8 +1381,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve.outputs.sha }}
-      # Tags are pushed with the deploy key: the workflow's own token may not
-      # create a ref on a commit that changes workflow files.
+      # Tags are pushed with the deploy key: a tag ruleset lets only the deploy
+      # key create, move or delete a release-* tag.
       - name: Push with the deploy key
         env:
           KEY: ${{ secrets.RELEASE_SSH_KEY }}

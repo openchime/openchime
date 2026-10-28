@@ -18,9 +18,10 @@ name: ci
 #
 # Each suite runs once: the threaded ones under the sanitizer, the rest plainly
 # (the Makefile's TSAN_SUITES). Every vendored library and toolchain is fetched
-# pinned by the script that builds it (mk/toolchains.mk) and cached by that
-# script's hash; nothing is installed from a package the day decides. One
-# runner image everywhere, ubuntu-24.04, the same one the release builds on.
+# pinned, or built from the committed sources, by the script that builds it
+# (mk/toolchains.mk) and cached by that script's hash; nothing is installed
+# from a package the day decides. One runner image everywhere, ubuntu-24.04,
+# the same one the release builds on.
 # What the release build checks itself -- read-aloud and voice input on the
 # stripped binary and the installed package -- is not repeated here.
 #
@@ -172,9 +173,10 @@ jobs:
           grep -q "registered fcm token" <<<"$out" || { echo "::error::demo_client did not register a push token"; exit 1; }
       # The release compiles with zig's clang against glibc 2.34, and a newer
       # clang refuses things gcc accepts: a C11 typedef repetition and a
-      # declaration after a label each passed gcc and broke a release. Every
-      # Linux translation unit -- the daemon's, the client's and the tests' --
-      # goes through that exact compiler under -Werror, which is the tree's
+      # declaration after a label each passed gcc and broke a release. The
+      # daemon's, the client app-core's and the tests' translation units (not
+      # the terminal client, tuikit or the tool programs) go through that
+      # exact compiler under -Werror, which is the tree's
       # second-compiler check too. make fetches the pinned zig.
       - name: Everything compiles with the release's compiler
         run: make check-release-cc

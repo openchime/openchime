@@ -31,7 +31,7 @@ await() {   # a regex the screen must come to show
     return 1
 }
 
-# --- the daemon, as shipped ---------------------------------------------------
+# --- the shipped binary, in development mode for its fixture user -------------
 env OPENCHIME_MODE=development OPENCHIME_DATA_DIR="$D/data" OPENCHIME_PORT="$PORT" \
     OPENCHIME_HEALTH_PORT=0 OPENCHIME_WORKSPACE_NAME="Device Code" OPENCHIME_DEV_USERS="dee:pw-dee:owner" \
     setsid "$HERE/openchimed" > "$D/daemon.log" 2>&1 < /dev/null &

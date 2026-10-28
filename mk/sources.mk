@@ -166,8 +166,9 @@ QRCODEGEN  := third_party/qrcodegen/qrcodegen.c
 TUIKIT_SRC := $(filter-out tuikit/demo.c,$(wildcard tuikit/*.c)) $(QRCODEGEN)
 TUIKIT_INC := -Ituikit -Ithird_party/qrcodegen
 # The core's local store (client/core/store.c) embeds NO database engine
-# (ARCH-88/REQ-201): the credential store holds the token + pin, and the cache,
-# outbox and workspace book are plain files. So a client links no sqlite.
+# (ARCH-88/REQ-201): the credential store holds the token + pin and the workspace
+# book; there is no history cache, and the outbox is in RAM. So a client links
+# no sqlite.
 # The platform credential backend (client/shared/secret_*.c, one entry point in
 # secret_os.h): libsecret on Linux when the dev package is present, Windows
 # Credential Manager on the Windows builds. Without libsecret it compiles a stub

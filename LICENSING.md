@@ -56,7 +56,7 @@ the speech and summary builds' components):
 | speexdsp 1.2.1 | BSD-3-Clause | the clients' echo canceller; never the daemon |
 | libfvad | BSD-3-Clause | voice-activity detection for voice input in the graphical clients (Win32 and web); never the daemon |
 | miniaudio 0.11.25 | public domain or MIT-0 | audio device capture and playback in the clients; never the daemon |
-| stb_image, stb_image_write | public domain or MIT | image decode and video-message posters in the clients; never the daemon |
+| stb_image, stb_image_write | public domain or MIT | image encode (video-message posters, PNG) in the clients, through stb_image_write; stb_image is committed but nothing compiles it; never the daemon |
 | ONNX Runtime 1.30.0 | MIT | neural-network inference for read-aloud and voice input, in the daemon's speech builds |
 | llama.cpp 0.5.0 (with ggml) | MIT | the summary model, in the daemon's summary build |
 | Kitten TTS mini 0.8 | Apache-2.0 | the read-aloud voice model, as data |

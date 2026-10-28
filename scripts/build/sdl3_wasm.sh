@@ -11,7 +11,7 @@ SDL3_SHA256="${SDL3_SHA256:-${!_sum_var:-}}"
 cd "$(dirname "$0")/../.."
 OUT="$PWD/build/wasm/sdl3"
 if [ -f "$OUT/lib/libSDL3.a" ]; then echo "build_sdl3_wasm: already built -- $OUT"; exit 0; fi
-command -v emcc >/dev/null || { echo "build_sdl3_wasm: emcc not on PATH (source ~/emsdk/emsdk_env.sh)" >&2; exit 1; }
+command -v emcc >/dev/null || { echo "build_sdl3_wasm: emcc not on PATH (make fetches it: mk/toolchains.mk)" >&2; exit 1; }
 mkdir -p build/wasm/sdl3-src
 cd build/wasm/sdl3-src
 TARBALL="SDL3-${SDL3_VERSION}.tar.gz"

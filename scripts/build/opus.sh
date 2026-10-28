@@ -6,8 +6,9 @@
 #   scripts/build/opus.sh            native (Linux; `make test` links it)
 #   scripts/build/opus.sh windows    cross-built with mingw-w64 for the Win32 client
 #
-# Client-side only: the daemon relays Opus without decoding it (ARCH-73) and
-# links no codec. scripts/build/media_wasm.sh builds the same sources for the web.
+# The client's codec: the daemon relays call audio without decoding it
+# (ARCH-73), and links libopus only for read-aloud (TTS=1, mk/daemon.mk).
+# scripts/build/media_wasm.sh builds the same sources for the web.
 set -euo pipefail
 
 TARGET="${1:-native}"

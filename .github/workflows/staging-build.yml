@@ -9,9 +9,9 @@
 #      per commit and never replaced, since its images, its run number and its
 #      manifest are what a release-candidate names;
 #   2. the tests (ci.yml, called): the daemon built, started and driven over
-#      TLS, the release compiler over every Linux translation unit, the suites,
-#      the web client in a headless Chrome, and the threaded suites under
-#      ThreadSanitizer;
+#      TLS, the release compiler over the daemon, client app-core and tests,
+#      the suites, the web client in a headless Chrome, and the threaded
+#      suites under ThreadSanitizer;
 #   3. only when they pass, everything a release ships -- both daemons with
 #      their data, the container images, the Windows clients -- stamped with the
 #      BUILD ID, the short commit, and stored by that id: the trees and
@@ -372,7 +372,7 @@ jobs:
       MAKE_ARCH: ${{ matrix.make_arch }}
       # What the vendored-library scripts call the architecture, for the
       # licence file assembled outside make (packaging/licenses.sh): the
-      # arm64 runner has only its own copies of the vendored texts.
+      # arm64 job has only its own copies of the vendored texts.
       OC_ARCH: ${{ matrix.oc_arch }}
       BIN: ${{ matrix.bin }}
       # Every artifact this job produces lands under dist/<platform>/, which is
@@ -419,7 +419,7 @@ jobs:
       # (ARCH-112). Functions of the files in the key, so a hit skips about 25
       # minutes and a change rebuilds. The arm64 archive is cross-built with
       # the host's protoc, which the script builds on its own, protoc alone,
-      # when the cache has none (it is in this cache too); the arm64 runner
+      # when the cache has none (it is in this cache too); the arm64 job
       # never builds the host's archive.
       - name: Restore the speech engine and models
         uses: actions/cache@v6
@@ -606,9 +606,9 @@ jobs:
             echo "::error::the installed daemon did not hear what it said"; exit 1; }
 
       # The install above does not touch the unit file: both maintainer scripts
-      # gate the enable/start path on `[ -d /run/systemd/system ]`. So the 60
-      # lines of ProtectSystem, DynamicUser and RestrictAddressFamilies that CI
-      # produces need something to actually parse them.
+      # gate the enable/start path on `[ -d /run/systemd/system ]`. So the
+      # packaged unit's ProtectSystem, DynamicUser and RestrictAddressFamilies
+      # lines need something to actually parse them.
       #
       # The runner boots systemd for real, so the check runs directly.
       #

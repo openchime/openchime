@@ -440,12 +440,14 @@ level, schedule, pause and time zone (`users.notify_default`, `dnd_mode`,
 
 Fixed in code (`daemon/dbwriter.c`, and `daemon/push.c` and
 `daemon/sum_worker.c` for their read-only connections); nothing in the environment changes them.
+`daemon/push.c` opens its connection read-only (`SQLITE_OPEN_READONLY`) rather
+than setting `query_only`.
 
 | Setting | Value | Why |
 |---|---|---|
 | `journal_mode` | `WAL` | Readers run beside the single writer without blocking it (ARCH-2/66). |
 | `foreign_keys` | `ON` | The schema's references and cascades are enforced. |
-| `query_only` (read connections) | `1` | Queries go through three further connections that cannot write (ARCH-66). |
+| `query_only` (the writer's readers and the summary worker's) | `1` | Queries go through the writer's three reader connections, which cannot write (ARCH-66); the summary worker's is read-only the same way. |
 | `busy_timeout` (every connection) | 5000 ms | How long a read or a commit waits on a lock before failing. The writer needs it too because a replicator beside the daemon (the image's Litestream, ARCH-3) holds the write lock for a moment at each checkpoint. |
 
 ## Command line
