@@ -124,7 +124,7 @@ the public demo by this setting alone. The daemon and every client read it.
 | Mode | For | What it changes |
 |---|---|---|
 | `normal` (the default) | every deployment, self-hosted or managed | Nothing: the constants hold, and a development input refuses the daemon's start (a client ignores one). |
-| `development` | the tests, CI, the GUI and web harnesses, the scripts, a box of your own | The development inputs below are read: fixture accounts, a smaller call or file page, no per-address connection cap, and the clients' synthetic devices, test hook and sign-in typing. Enrolment and certificates through central reach a loopback test service only; the managed rows are taken without the ticket, so a fixture can stand in for a managed box. The startup log says so in capitals. |
+| `development` | the tests, CI, the GUI and web harnesses, the scripts, a box of your own | The development inputs below are read: fixture accounts, a smaller call or file page, a per-address connection cap that can be lifted, and the clients' synthetic devices, test hook and sign-in typing. Enrolment and certificates through central reach a loopback test service only; the managed rows are taken without the ticket, so a fixture can stand in for a managed box. The startup log says so in capitals. |
 | `demo` | the public demo workspace | A development input refuses the start, as in `normal`. Needs `OPENCHIME_AUTH=local,relay`. Visitors sign up with central's signed invite; daily limits per person and per workspace; one-day sessions; sample content at first start; every client says it is a public demo (AUTH.md §8.12). |
 
 Nothing that ships sets `development`: `make test` checks that no release
@@ -432,8 +432,8 @@ status 4.
 Each person's preferences are also stored here and steer what the daemon sends
 them: notification level and mute per channel (`notification_prefs`), the default
 level, schedule, pause and time zone (`users.notify_default`, `dnd_mode`,
-`allow_start_min` / `allow_end_min`, `dnd_until_ms`, `tz_offset_min`,
-`notify_schedule`), keywords and priority people (`notify_keywords`,
+`allow_start_min` / `allow_end_min`, `dnd_until_ms`, `tz_offset_min`, and the
+`notify_schedule` table), keywords and priority people (`notify_keywords`,
 `priority_people`), thread follows (`thread_follows`), the voice they are read in
 (`users.voice_id`) and each client's synced settings (`client_settings`).
 
@@ -470,7 +470,7 @@ accepts, and any other stops it with exit status 2.
 
 ## Build switches
 
-`make` variables, fixed into the binary (the Makefile's header lists them). A
+`make` variables, fixed into the binary (the Makefile lists them). A
 first `make` leaves the features out; the feature switches are remembered in
 `build/.features` until changed or `make distclean`.
 

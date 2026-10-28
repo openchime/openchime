@@ -3,7 +3,7 @@ name: ci
 # The tests, called by the staging build (staging-build.yml) and by nothing
 # else; the pipeline and what each job covers are docs/CONTRIBUTING.md "CI".
 # Each suite runs once: the threaded ones under the sanitizer, the rest plainly
-# (the Makefile's TSAN_SUITES). Every vendored library and toolchain is fetched
+# (mk/tests.mk's TSAN_SUITES). Every vendored library and toolchain is fetched
 # pinned, or built from the committed sources, by the script that builds it
 # (mk/toolchains.mk) and cached by that script's hash. One runner image
 # everywhere, ubuntu-24.04, the same one the release builds on.
@@ -187,7 +187,7 @@ jobs:
     # The daemon is threads -- the event loop, its I/O threads, the writer, the
     # readers and the auth pool, the worker pools -- and so are the client, its
     # call engine and its recorder. `make test-ci PART=threads` runs the suites whose code
-    # runs threads (the Makefile's TSAN_SUITES) under ThreadSanitizer, and a data
+    # runs threads (mk/tests.mk's TSAN_SUITES) under ThreadSanitizer, and a data
     # race between our threads fails it (tests/tsan.supp). This is those
     # suites' only run in CI.
     runs-on: ubuntu-24.04
