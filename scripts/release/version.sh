@@ -9,9 +9,12 @@
 #   scripts/release/version.sh next     -> the number a new release would take
 #   scripts/release/version.sh current  -> the newest released number (0 if none)
 #
-# A gap in the sequence is not an error: a failed release leaves its number
-# unused, and reusing it would mean two different artifacts sharing a version.
-# So `next` is always "highest + 1", never "lowest unused".
+# A failed release that published nothing has its tag deleted by release.yml's
+# `unreserve`, so its number is used again; one that wrote the apt index keeps
+# it as a live release. A gap is left only when that returning push itself
+# fails, and is not an error: reusing a number some artifact may carry would
+# mean two different artifacts sharing a version. So `next` is always
+# "highest + 1", never "lowest unused".
 set -euo pipefail
 
 mode="${1:-next}"

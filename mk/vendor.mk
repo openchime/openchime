@@ -13,8 +13,9 @@
 # Its own rule, with its own flags: 9 MB of generated C does not survive
 # -Wall -Wextra -Werror, the same accommodation audio_dev.c makes for miniaudio.
 # FTS5 is required, not tuning. THREADSAFE=1 is the system library's own default,
-# so vendoring changes no concurrency semantics -- three threads hold their own
-# connections (dbwriter's writer and reader, and push). The omissions are things
+# so vendoring changes no concurrency semantics -- several threads hold their
+# own connections (the dbwriter's writer and its three readers, push, the
+# summary worker and the blob sweep's reference check). The omissions are things
 # this daemon provably does not use: no extension loading, no deprecated calls,
 # no shared cache, and no double-quoted string literals in any of its SQL.
 SQLITE_DEFS := -DSQLITE_ENABLE_FTS5 -DSQLITE_THREADSAFE=1 -DHAVE_USLEEP=1 \

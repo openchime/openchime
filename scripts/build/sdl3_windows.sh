@@ -64,8 +64,8 @@ if [ ! -f "${DEST}/lib/libSDL3.a" ]; then
   # this script fully describe the build. C++ is not optional: SDL's Windows
   # branch does enable_language(CXX) unconditionally, and a toolchain without
   # a cross g++ makes CMake fall back to the HOST c++ — which links exactly
-  # one broken try-compile before failing. CI installs g++-mingw-w64-x86-64
-  # for this script alone.
+  # one broken try-compile before failing. The pinned llvm-mingw
+  # (mk/toolchains.mk) supplies the cross g++.
   cat > "${DEST}/toolchain.cmake" <<'EOF'
 set(CMAKE_SYSTEM_NAME Windows)
 set(CMAKE_SYSTEM_PROCESSOR x86_64)

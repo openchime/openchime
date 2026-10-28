@@ -3391,7 +3391,7 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
             tmp[tn].row.channel_id = c->channel_id;
             snprintf(tmp[tn].row.label, sizeof tmp[tn].row.label, "%s", label);
             tmp[tn].row.is_private = (uint8_t)(!is_dm && !c->is_public);
-            /* Slack renders the self-DM as "Danny Heskett  you" — the account
+            /* Slack renders the self-DM as "Dana Example  you" — the account
              * name, with a dimmed tag after it. The core flags it; each frontend
              * draws the tag in its own dim style. */
             tmp[tn].row.is_self    = (uint8_t)(is_dm && c->peer_id == m->user_id);

@@ -36,11 +36,15 @@ Version:        %{_version}
 Release:        1%{?dist}
 Summary:        OpenChime chat daemon
 
-# The daemon's own code and the components it links. RPM expects one field, so
-# all are named: mbedTLS and the Kitten voice model (Apache-2.0), jsmn, QR Code
-# generator and ONNX Runtime (MIT), the CMUdict-derived pronunciation data (BSD,
-# two clauses), Opus (BSD, three clauses), and Mozilla's CA roots (MPL-2.0).
-License:        AGPL-3.0-or-later AND Apache-2.0 AND MIT AND BSD-2-Clause AND BSD-3-Clause AND MPL-2.0
+# The daemon's own code and the components it links; the notice the package
+# installs (packaging/licenses.sh) is the full list. RPM expects one field, so
+# every licence is named: mbedTLS, Argon2 (CC0-1.0 or Apache-2.0, taken as
+# Apache-2.0) and the Kitten voice model (Apache-2.0); jsmn, QR Code generator,
+# utf8proc, SecLists, picohttpparser, ONNX Runtime, Moonshine and llama.cpp
+# (MIT); the CMUdict-derived pronunciation data (BSD, two clauses); Opus (BSD,
+# three clauses); Mozilla's CA roots (MPL-2.0); and SQLite (public domain,
+# SPDX "blessing").
+License:        AGPL-3.0-or-later AND Apache-2.0 AND MIT AND BSD-2-Clause AND BSD-3-Clause AND MPL-2.0 AND blessing
 URL:            https://openchime.io
 # No BuildArch: that tag is for noarch packages, and set to the target it made
 # rpmbuild refuse a cross target ("No compatible architectures found for

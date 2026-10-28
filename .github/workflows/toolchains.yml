@@ -1,9 +1,9 @@
 # Once a month: are the pinned toolchains (zig, Emscripten, llvm-mingw;
 # mk/toolchains.mk) behind upstream? scripts/check/toolchains.sh asks, and when
 # one is, this files or refreshes one issue with the table and the new
-# checksum. Nothing is bumped by itself: a bump is a pull request, built and
-# tested by the next staging build after it merges (staging-build.yml), which
-# is what pinning is for.
+# checksum where the toolchain has one. Nothing is bumped by itself: a bump is
+# a pull request, built and tested by the next staging build after it merges
+# (staging-build.yml), which is what pinning is for.
 name: toolchains
 
 on:

@@ -54,7 +54,8 @@ URL="https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBEDTLS_VER
 # stated reason is its TEST SUITE, which drives several TLS clients concurrently;
 # that suite is a Linux binary and never runs here. The Windows front-ends run the
 # same app-core, but nothing in it shares an mbedTLS context between threads:
-# client/core/net.c has the only oc_thread_create in the core, and shared/tls.h
+# the core starts threads (net.c, the call engine, the recorder, the player,
+# dictation), but each TLS context is used by one thread only, and shared/tls.h
 # keeps mbedtls_entropy_context and mbedtls_ctr_drbg_context as per-struct
 # members, so every TLS context owns its own RNG.
 #

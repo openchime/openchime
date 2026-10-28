@@ -84,6 +84,8 @@ in full here, as those licences require.
   Mozilla CA roots MPL-2.0      the root certificates outbound HTTPS verifies
                                 against, embedded as data; the source form is
                                 third_party/ca-roots in the repository above
+  SQLite 3.53.4    Public       the message database
+                   domain
 HEADER
 
 if [ "$TTS" = 1 ] || [ "$STT" = 1 ]; then
@@ -107,6 +109,16 @@ if [ "$STT" = 1 ]; then
   cat <<'HEADER'
   Moonshine Tiny       MIT          the speech recognizer's model and tokenizer,
     Streaming (en)                  shipped as data in stt/
+HEADER
+fi
+
+if [ "$SUM" = 1 ]; then
+  cat <<'HEADER'
+
+and, for summaries (built into the binary):
+
+  llama.cpp 0.5.0      MIT          the summary model's inference engine
+    (with ggml)                     (the model is fetched on first use)
 HEADER
 fi
 

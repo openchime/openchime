@@ -8,10 +8,10 @@
 #   scripts/gui/audit.sh --keep       # leave the client running afterwards
 #
 # THIS IS NOT THE SMOKE, AND MUST NOT BECOME IT. `scripts/gui/smoke.sh` answers "does
-# the client boot" in ten seconds and runs before every push; this walks a few
-# hundred states and takes minutes. Both exist because a check nobody runs and a
-# check that finds nothing are different failures. Run this when GUI chrome
-# changes, and read it; run the smoke always.
+# the client boot" in ten seconds and is run by hand before pushing a client
+# change; this walks a few hundred states and takes minutes. Both exist
+# because a check nobody runs and a check that finds nothing are different
+# failures. Run this when GUI chrome changes, and read it; run the smoke always.
 #
 # WHY THERE IS NO REFERENCE IMAGE. The audit this replaces diffed the SDL render
 # against the Direct2D binary it was ported from, and finished the job a diff can

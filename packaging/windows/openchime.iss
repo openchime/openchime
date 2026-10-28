@@ -108,9 +108,10 @@ Filename: "{app}\openchime.exe"; Description: "Launch OpenChime"; \
     Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; The install directory only ever holds what [Files] put there; user data
-; lives under {userappdata}\OpenChime and is deliberately left behind, so a
-; reinstall does not lose the message store or the saved account.
+; The install directory only ever holds what [Files] put there. The client
+; keeps no message store: the saved account is in Windows Credential Manager
+; and the preferences are under %LOCALAPPDATA%\openchime, and the uninstaller
+; touches neither, so a reinstall keeps both.
 Type: dirifempty; Name: "{app}"
 
 [Code]

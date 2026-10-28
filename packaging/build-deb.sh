@@ -103,8 +103,9 @@ Description: OpenChime chat daemon
  with certificate pinning.
  .
  Runs stand-alone with no dependency on any external service, or federated,
- opting in per function to OIDC login, mobile push delivery and the app
- directory. In both cases the daemon holds all message data locally.
+ opting in per function to sign-in through central, mobile push delivery,
+ invitation mail and certificates through central. In both cases the daemon
+ holds all message data locally.
  .
  Configuration is entirely by environment variable; the package ships an
  EnvironmentFile at /etc/openchime/openchimed.env.

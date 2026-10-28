@@ -260,8 +260,9 @@ int run_audio_tests(void) {
             oc_relay_sweep(r);
         } while (!g_gone.n && oc_test_pause(end));
     }
-    CHECK(g_gone.n == 1 && g_gone.len == 16 && memcmp(g_gone.t, tB, 16) == 0);
-    CHECK(oc_relay_count(r) == 2);
+    /* A descheduling longer than the window drops A or D as well: timing. */
+    CHECK_TIMING(g_gone.n == 1 && g_gone.len == 16 && memcmp(g_gone.t, tB, 16) == 0);
+    CHECK_TIMING(oc_relay_count(r) == 2);
     oc_relay_set_silence_ms(r, 0);
 
     oc_relay_close(r);

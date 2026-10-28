@@ -1,7 +1,7 @@
 # What a person types here:
 #   make              the daemon (openchimed), quickly: no speech, no summaries, no web client
 #   make full         everything: the daemon with every feature and its data, and every client
-#   make run          a dev daemon on 127.0.0.1:8443 with alice/bob
+#   make run          a dev daemon on port 8443, every interface, alice/bob
 #   make test         the host test suite
 #   make clients      every client below
 #   make linux        the Linux client (the TUI today; the GUI when it exists)
@@ -22,14 +22,15 @@
 #
 # Every toolchain the clients need -- Emscripten, llvm-mingw for Windows, zig
 # for the release's compiler -- is fetched pinned on first use (mk/toolchains.mk),
-# so `make full` needs only cc, cmake, python3, git, curl and xz installed.
+# so `make full` needs only cc, cmake, python3, git, curl, xz, bzip2 and nasm
+# installed.
 #
 # CI's own: make test-ci, make check-release-cc. Tool binaries are built by
 # their path (make build/demo_client, build/bench_load, build/bench_loop,
 # build/tuikit-demo, build/tts_pack, build/s3_smoke, build/e2e_client,
-# build/sdltext_test.exe, build/gfx_test.exe). The rules live in mk/, one
-# file per concern; scripts/check/make_targets.sh keeps this list and the
-# targets in step.
+# build/signin, build/sdltext_test.exe, build/gfx_test.exe). The rules live in
+# mk/, one file per concern; scripts/check/make_targets.sh keeps the typed
+# targets (the list above and PUBLIC/INTERNAL) in step, not this tool list.
 PUBLIC   := all full run test clients linux windows web web-test clean distclean
 INTERNAL := test-ci check-release-cc ci-only test-ci-plain test-ci-threads FORCE
 .PHONY: $(PUBLIC) $(INTERNAL)
@@ -134,11 +135,14 @@ full:
 	@$(MAKE) --no-print-directory TTS=1 STT=1 SUM=1 WEB=1 all clients
 
 # One-shot local dev server: builds the daemon + TUI and runs the daemon on
-# 127.0.0.1:8443 with sane paths + bootstrap users (alice/pw, bob/pw). Connect
-# from another terminal: build/openchime-tui 127.0.0.1 8443, then sign in as alice/pw
+# port 8443 (health 8080) with sane paths + bootstrap users (alice/pw, bob/pw).
+# The daemon binds every interface (0.0.0.0 and [::]), not loopback: anyone
+# who can reach this machine can sign in with those passwords. Run it only on
+# a trusted network or behind a firewall. Connect from another terminal:
+# build/openchime-tui 127.0.0.1 8443, then sign in as alice/pw
 run: $(BIN) $(TUI_BIN)
 	@mkdir -p /tmp/openchime-dev
-	@echo "openchime dev daemon -> 127.0.0.1:8443  (users: alice/pw, bob/pw)"
+	@echo "openchime dev daemon -> port 8443 on EVERY interface, not just loopback  (users: alice/pw, bob/pw)"
 	@echo "connect: build/openchime-tui 127.0.0.1 8443  (sign in as alice/pw)"
 	@OPENCHIME_MODE=development OPENCHIME_DATA_DIR=/tmp/openchime-dev OPENCHIME_PORT=8443 OPENCHIME_HEALTH_PORT=8080 \
 	 OPENCHIME_DEV_USERS="alice:pw:owner,bob:pw:member" ./$(BIN)

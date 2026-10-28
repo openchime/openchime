@@ -554,6 +554,17 @@ back). An absence on its own passes as readily when the code is broken.
 `CHECK`; better still, the test asserts the mechanism (the work was batched,
 the cache was hit) rather than the clock.
 
+**Timing.** A verdict that races the wall clock — work that must land inside a
+short real-time window, or a count that depends on where a window's edge falls
+— is a `CHECK_TIMING` (`tests/check.h`), and so is every `CHECK_SPEED`. The
+build pipeline sets `OC_TEST_TIMING=0` (`make test-ci`, and the web step in
+`ci.yml`), which leaves them unjudged so that a busy runner cannot fail a build
+with nothing wrong; `make test` and `make web-test` run by hand judge them.
+The code around them still runs everywhere, ThreadSanitizer included. Each is
+a debt: the fix is an injected clock, an explicit sweep or a wait on the
+outcome, after which it is a `CHECK` again. A new test is written that way
+from the start.
+
 **Isolation.** Each test has its own data, paths and ports (§2.3, §2.4):
 `tests/testenv.h`'s `oc_test_mkdtemp` and `oc_test_rmtree` for files,
 `oc_test_free_port` or a port-0 bind for sockets, `oc_test_tree_path` for the
@@ -961,9 +972,11 @@ works. The shipped *image* is the staging build's release jobs' to prove (§3.2)
 ### 3.4 The web client (`make web-test`)
 
 The browser build (WEB.md) is checked where a Chromium is present: a
-developer's box, and CI's `build` job, which runs `make web-test` and the quick
-GUI scripts on the web platform (`smoke`, `chords`) in the runner's Chrome (§4;
-make fetches Emscripten itself). The daemon it starts runs in development mode,
+developer's box, and CI's `build` job, which runs `make web-test` and the GUI
+smoke on the web platform in the runner's Chrome (§4; make fetches Emscripten
+itself). CI sets `OC_TEST_TIMING=0` (§2), so there `test.sh` stops after the
+sign-in and drawing check: the recording and input-method checks run on a
+wall-clock script and fixed sleeps, and are judged only when run by hand. The daemon it starts runs in development mode,
 and so serves its own `/app/` page that way: the check signs in by password on
 the daemon's page and bootstraps its user.
 `make web-test` runs the first three:
@@ -1076,8 +1089,9 @@ The test jobs, on two machines at once:
   which runs the source checks first (`scripts/check/`: opcodes, issue
   references, make targets, the configuration registry, the release lint, the tests lint);
   and the web client in the runner's headless Chrome (§3.4): `make web-test`,
-  then `scripts/gui/run.sh --web smoke chords`. The longer web scripts
-  (uploads, voice, calls, …) take minutes each and stay local.
+  then `scripts/gui/run.sh --web smoke`. The longer web scripts (uploads,
+  voice, calls, …) take minutes each and stay local, and so does `chords`,
+  which reads its result after a fixed sleep.
 - **`thread sanitizer`** — `make test-ci PART=threads` (§2.4).
 
 The staging build's `windows binaries` job, which builds the shipped Windows
@@ -1493,7 +1507,8 @@ CONFIG.md "Mode"), and any build will do.
 | `OC_PARITY_OUT` | `/tmp/oc-parity` | `parity.sh`'s report and side-by-side images. |
 
 The suite's own share the prefix: `OC_TEST_ONLY`, `OC_TEST_EXCEPT`,
-`OC_TEST_REPEAT`, `OC_TEST_JOBS` (`tests/main.c`) and `OC_TEST_FULL` (`test_ttskit`).
+`OC_TEST_REPEAT`, `OC_TEST_JOBS` (`tests/main.c`), `OC_TEST_TIMING` (`tests/check.h`)
+and `OC_TEST_FULL` (`test_ttskit`).
 
 **The client is pointed at the address Windows reaches the daemon at.** Under
 WSL2 that is the WSL machine's own address (eth0's), not 127.0.0.1, which reaches
@@ -1658,7 +1673,7 @@ that it stops being run. Verify a feature by driving it, through
 
 Its Win32 run is not in CI: the daemon is epoll-based so it is Linux-only, and
 GitHub's Windows runners cannot host it (no Linux containers). CI runs it on the
-web platform (`scripts/gui/run.sh --web smoke chords`, §4).
+web platform (`scripts/gui/run.sh --web smoke`, §4).
 
 *One caveat when reading a failure message:* the dump's `comp=` field is the
 **IME composition length**, not the autocomplete popover — the dump exposes no

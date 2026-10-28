@@ -50,7 +50,9 @@ $(TEST_BIN): $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | b
 # only makes it slower. test-ci refuses outside CI, before its long build. CI
 # runs its halves in parallel jobs: PART=plain or PART=threads; unset, both,
 # one after the other: each binary already runs as many suites at once as
-# there are CPUs, and under -j the two would otherwise run together.
+# there are CPUs, and under -j the two would otherwise run together. Both set
+# OC_TEST_TIMING=0: a verdict that races the wall clock (CHECK_TIMING,
+# tests/check.h) is not judged in the pipeline; `make test` judges it.
 comma := ,
 TSAN_LIST := run_netloop_tests run_client_core_tests run_dbwriter_tests run_ioloop_tests \
              run_authpool_tests run_xferpool_tests run_slow_blob_tests run_storage_tests \
@@ -71,9 +73,9 @@ test-ci: ci-only
 	@$(foreach t,$(TEST_CI_PARTS),$(MAKE) --no-print-directory $(t) &&) true
 test-ci-plain: ci-only $(TEST_BIN) $(BIN)
 	@$(SOURCE_CHECKS)
-	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" OC_TEST_EXCEPT="$(TSAN_SUITES)" ./$(TEST_BIN)
+	OC_TEST_TIMING=0 OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" OC_TEST_EXCEPT="$(TSAN_SUITES)" ./$(TEST_BIN)
 test-ci-threads: ci-only $(TSAN_BIN)
-	OC_TEST_ONLY="$${OC_TEST_ONLY:-$(TSAN_SUITES)}" \
+	OC_TEST_TIMING=0 OC_TEST_ONLY="$${OC_TEST_ONLY:-$(TSAN_SUITES)}" \
 	TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 suppressions=$(CURDIR)/tests/tsan.supp" setarch $$(uname -m) -R ./$(TSAN_BIN)
 TSAN_CC   = $(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TEST_INC)
 TSAN_OBJS := $(call oc_objs,$(OBJ_DIR)/tsan,$(TEST_ALL_SRC))
