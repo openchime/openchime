@@ -120,9 +120,8 @@ daemon holds 0.1 MB more with voice input built in than without it.
   the little-endian samples in host order before hearing them.
 - **Its own data directory and manifest** — `/usr/share/openchime/stt`, else
   `stt/` beside the executable — so missing data
-  turns voice input off without touching read-aloud. `make full` (or `make STT=1`) builds
-  it in; a first `make` leaves it out (the switches are remembered in `build/.features`
-  until changed or `make distclean`).
+  turns voice input off without touching read-aloud. `make STT=1` builds it in
+  (CONFIG.md "Build switches").
 - **Spoken mentions:** before posting or returning, "at" followed by a name becomes
   `@name` when it names exactly one member of the channel; the daemon holds the
   roster (ARCH-89).

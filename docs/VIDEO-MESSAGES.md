@@ -86,11 +86,9 @@ Errors are typed so the UI can say the right thing: `OC_CAP_DENIED` (the operati
 system blocks the camera), `OC_CAP_NODEVICE`, `OC_CAP_BUSY` (another application
 holds it), `OC_CAP_FAILED`.
 
-**The frame format is fixed here, before any backend.** Cameras deliver NV12, YUY2,
-biplanar YUV, BGRA or MJPEG depending on the platform and the device. Every backend
-converts to planar I420 so the encoder — whose own input is I420 — and the preview
-see exactly one thing. Retrofitting a common format across six backends later would
-be expensive; choosing it first is free.
+**One frame format.** Sources deliver NV12, BGRA or RGBA depending on the backend.
+Every backend converts to planar I420 so the encoder — whose own input is I420 — and
+the preview see exactly one thing.
 
 **One clock.** Video frames and microphone buffers are stamped from
 `oc_media_clock_us()`, a monotonic clock, so the recorder can interleave and sync
@@ -102,10 +100,6 @@ them without trusting either device's own timestamps.
 |---|---|---|---|
 | Windows | Media Foundation `IMFSourceReader`, video processing enabled, asynchronous | NV12 (the reader converts YUY2 and MJPEG) | `cap_mf.c` |
 | Windows, screens and windows | Windows.Graphics.Capture, a free-threaded frame pool polled from a worker | BGRA through a staging texture | `cap_wgc.c` |
-| Linux | V4L2, mmap streaming | YUYV, or MJPEG decoded with stb_image | — |
-| macOS | AVFoundation `AVCaptureVideoDataOutput` | 420YpCbCr8BiPlanar | — |
-| iOS | AVCaptureSession, the same output plus orientation | 420YpCbCr8BiPlanar | — |
-| Android | Camera2 through the NDK, `AImageReader` | YUV_420_888 with row and pixel strides | — |
 | Web | `getUserMedia` into a `<video>`, each decoded frame (`requestVideoFrameCallback`) drawn to a canvas and read back; screens and windows through `getDisplayMedia`, the browser's own picker, fitted as WGC's are | RGBA | `client/gui/platform/web/cap_web.c` |
 | Tests | a synthetic source: moving bars, a frame counter, a denied mode; and a synthetic 2560×1600 screen of text that changes five times a second | I420 | `capture.c` |
 
@@ -113,10 +107,6 @@ them without trusting either device's own timestamps.
 that stops delivering never returns and cannot be cancelled, so closing the
 camera would hang; with a callback, closing stops asking for frames, flushes, and
 waits a bounded time for the callback to go quiet.
-
-**Apple platforms use a thin Objective-C file** exposing a flat C header, compiled
-with clang beside the C sources, rather than driving the Objective-C runtime through
-`objc_msgSend` by hand.
 
 **Screens and windows are a second list** (`oc_capture_list_screens`) and a second
 open (`oc_capture_open_screen`), behind the same interface and frame format. The
@@ -304,7 +294,7 @@ unreadable by anyone but its uploader. So:
 
 - the **orphan sweep skips** an attachment named as a poster, as it skips avatars
   and custom emoji;
-- **age expiry and eviction reclaim the poster with its video**;
+- **eviction reclaims the poster with its video**;
 - **reading a poster is allowed exactly when reading its video is** — the same
   channel-read check, applied through the media row.
 

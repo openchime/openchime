@@ -200,7 +200,8 @@ context another rate (Safari for a microphone), a speexdsp resampler runs in
 the callback. A browser that cannot start the worklet falls back to a
 `ScriptProcessorNode` on the page's thread (1024 frames of latency), and the
 console says which ran (`oc-web: audio worklet`); `make web-test` requires
-the worklet. The device lists come from a cache the page keeps
+the worklet when run by hand. Under `OC_TEST_TIMING=0` (CI) it skips this, the
+`sttest` check and the input method below (TESTING.md §3.4). The device lists come from a cache the page keeps
 (`devices_web.c`), so any thread can ask; the labels appear once a device
 has been allowed, as the browser decides.
 
@@ -216,7 +217,7 @@ with each right-to-left run measured and drawn with the canvas's direction
 set and a line's runs placed in visual order, and alignment following the
 paragraph's reading direction as DirectWrite's does. Tested on the host
 (`tests/test_sdltext_unicode.c`) and in the browser through the client's
-`sttest` verb, which `make web-test` runs.
+`sttest` verb, which `make web-test` runs by hand.
 
 **The input method.** A browser's IME composes into an element, so the
 platform keeps a hidden `<input>` at the caret (`oc_plat_text_input_area`,
@@ -224,7 +225,7 @@ the contract's one line for it; Win32 answers with SDL's text input area)
 and hands its composition to SDL's own events -- `SDL_EVENT_TEXT_EDITING`
 while composing, `SDL_EVENT_TEXT_INPUT` at the commit -- so the composer
 shows the composition underlined and takes the result as it does from a
-desktop IME. `make web-test` plays a Japanese composition into it.
+desktop IME. `make web-test`, run by hand, plays a Japanese composition into it.
 
 Rough edges: fonts are the browser's, so layouts are near-identical to
 Windows, not pixel-identical, and the harness compares state, not pixels. The picker and the clipboard need a

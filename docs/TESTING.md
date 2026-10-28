@@ -974,7 +974,7 @@ works. The shipped *image* is the staging build's release jobs' to prove (§3.2)
 The browser build (WEB.md) is checked where a Chromium is present: a
 developer's box, and CI's `build` job, which runs `make web-test` and the GUI
 smoke on the web platform in the runner's Chrome (§4; make fetches Emscripten
-itself). CI sets `OC_TEST_TIMING=0` (§2), so there `test.sh` stops after the
+itself). CI sets `OC_TEST_TIMING=0` (§2.3a), so there `test.sh` stops after the
 sign-in and drawing check: the recording and input-method checks run on a
 wall-clock script and fixed sleeps, and are judged only when run by hand. The daemon it starts runs in development mode,
 and so serves its own `/app/` page that way: the check signs in by password on
@@ -1045,58 +1045,17 @@ answer in frames, a ping's pong, and an unmasked frame ending the connection.
 
 ## 4. Continuous integration
 
-CI is GitHub Actions, and nothing in it runs on its own but the pull request's
-policy check and the monthly toolchain check (`toolchains.yml`, which only files
-an issue). A pull request into `staging` runs `pr-policy` (its title, body
-and open issue, the tree's issue-reference check, `scripts/check/refs.sh` from
-the base branch, and the attribution scan that posts `guard`), the two required
-checks; nothing builds or tests it, and nothing runs on a push. The local
-`make test` (`scripts/check/test.sh`, which the pre-push hook requires) is the
-test a change gets before it merges. The hook is on once per clone, `git config core.hooksPath
-.githooks`; it refuses a push whose tree `scripts/check/test.sh` did not pass on
-(unless it changes only `*.md`, `.gitignore` or `.claude/`) and workflows
-`actionlint` rejects.
-
-The tests run in the **staging build** (`.github/workflows/staging-build.yml`),
-dispatched by hand on `staging` for its tip, over everything merged since the
-last one. After its gate (the attribution scan over the
-commits since the last release, the commit policy as a warning, and no stored
-build for the commit), it calls `.github/workflows/ci.yml`, which holds
-the two test jobs and is triggered by nothing else, and only when both pass
-does it build, check and store what a release ships, so a release is gated on
-exactly these jobs. Nothing is checked twice: each suite runs once (§2.4), one
-clang compile is both the release-compiler and the second-compiler check, and
-what the release jobs check themselves is not repeated.
-
-**Caching.** Every vendored library is cached by the script that builds it —
-mbedTLS, libvpx, Opus, speexdsp and llama.cpp, their Windows and wasm builds and
-SDL3, zig, Emscripten and llvm-mingw, and the speech engine and models. Each build script builds only what is missing, so a
-hit skips its download and build. The staging build's runs, on `staging`, save
-the caches the next one restores; a cache unused for seven days is evicted, so
-a staging build after a quiet spell builds its libraries from cold.
-
-The test jobs, on two machines at once:
-
-- **`build + unit tests`** — `make` with every feature, the e2e client and the Linux
-  terminal client; `ldd` (only libc and libm are
-  dynamic); the built daemon started from its environment, `/healthz`, then the
-  protocol vertical over TLS with the e2e client (§3.2 — the one thing the
-  in-process suites cannot show, since they link the daemon's code without its
-  `main()`; the image is the release jobs' to start); every Linux translation
-  unit through the release's own compiler under `-Werror`
-  (`make check-release-cc`: zig's clang against the release's glibc — the
-  daemon's, the client's and the tests' sources); `make test-ci PART=plain`,
-  which runs the source checks first (`scripts/check/`: opcodes, issue
-  references, make targets, the configuration registry, the release lint, the tests lint);
-  and the web client in the runner's headless Chrome (§3.4): `make web-test`,
-  then `scripts/gui/run.sh --web smoke`. The longer web scripts (uploads,
-  voice, calls, …) take minutes each and stay local, and so does `chords`,
-  which reads its result after a fixed sleep.
-- **`thread sanitizer`** — `make test-ci PART=threads` (§2.4).
-
-The staging build's `windows binaries` job, which builds the shipped Windows
-clients, cross-compiles the two Windows test programs with them, with the
-pinned llvm-mingw, so the ported client and its tests stay building.
+The pipeline — what runs on a pull request, the staging build and the two test
+jobs it calls in `.github/workflows/ci.yml` — is CONTRIBUTING.md "CI". The
+local `make test` (`scripts/check/test.sh`, which the pre-push hook requires)
+is the test a change gets before it merges. Nothing is checked twice: each
+suite runs once (§2.4), one clang compile is both the release-compiler and the
+second-compiler check, and what the release jobs check themselves is not
+repeated. The end-to-end step (§3.2) is the one thing the in-process suites
+cannot show, since they link the daemon's code without its `main()`. Of the
+GUI scripts only the smoke runs, on the web platform (§3.4); the longer web
+scripts (uploads, voice, calls, …) take minutes each and stay local, and so
+does `chords`, which reads its result after a fixed sleep.
 
 All run on `ubuntu-24.04`, the image the release builds on too. The native
 build and the tests use the runner's gcc; zig (the release's clang), Emscripten
