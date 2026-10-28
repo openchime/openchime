@@ -8,10 +8,7 @@
 #      refusal when the commit already has a stored build: a build is made once
 #      per commit and never replaced, since its images, its run number and its
 #      manifest are what a release-candidate names;
-#   2. the tests (ci.yml, called): the daemon built, started and driven over
-#      TLS, the release compiler over the daemon, client app-core and tests,
-#      the suites, the web client in a headless Chrome, and the threaded
-#      suites under ThreadSanitizer;
+#   2. the tests (ci.yml, called; docs/CONTRIBUTING.md "CI");
 #   3. only when they pass, everything a release ships -- both daemons with
 #      their data, the container images, the Windows clients -- stamped with the
 #      BUILD ID, the short commit, and stored by that id: the trees and

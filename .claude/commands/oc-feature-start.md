@@ -70,7 +70,7 @@ git checkout -b feature/oc-<number>-<short-kebab-description> staging
 `oc` is this issue board's prefix and is always present, lowercase. The
 description is a few kebab-case words naming the **change**, usually distilled
 from the issue title — for the issue "The daemon exits 0, silently, when it
-cannot start", the branch is `feature/oc-144-daemon-exit-nonzero`. One logical
+cannot start", the branch is `feature/oc-<n>-daemon-exit-nonzero`. One logical
 change per branch.
 
 Then one fresh build on the new branch, so nothing left over from other work is
@@ -92,7 +92,7 @@ Before writing anything, read what the issue touches:
   docs/ARCHITECTURE.md that the issue names or implies;
 - the subsystem doc that owns the area (PROTOCOL.md for wire changes,
   SCHEMA.md for migrations, CLIENT.md for frontend work, TESTING.md for what
-  must be proven, AUTH.md, AUDIO.md, CALLS.md §6 as applicable);
+  must be proven, AUTH.md, AUDIO.md, CALLS.md as applicable);
 - the code the change will land in.
 
 Two standing traps to load now rather than trip later:

@@ -105,7 +105,8 @@ $(WEBAPP_RES): client/gui/platform/web/openchime.html $(WEBAPP_JS) scripts/build
 
 # The client's checks: the gfx pixel test under Node, then the client signing
 # in, drawing, recording and composing in a headless Chromium
-# (scripts/web/test.sh), against a daemon built with the client in it.
+# (scripts/web/test.sh), against a daemon built with the client in it. Under
+# OC_TEST_TIMING=0 the recording and composing parts are skipped.
 web-test: $(WEB_DIR)/gfx-test.js $(WEB_DIR)/openchime.js
 	@$(MAKE) --no-print-directory WEB=1 $(BIN)
 	$(NODE) $(WEB_DIR)/gfx-test.js

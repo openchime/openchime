@@ -68,9 +68,8 @@ BEGIN
             VALUE "OriginalFilename", OC_RES_ORIG
             VALUE "ProductName",      "OpenChime"
             VALUE "ProductVersion",   OC_BUILD_ID_STR
-            /* No LegalCopyright: the licence is an open decision and this is
-               not the place to assert one. Add it when the tree gets a
-               LICENSE file. */
+            /* No LegalCopyright: the licence is AGPL-3.0-or-later
+               (LICENSING.md); the copyright line is the owner's to add. */
         END
     END
     BLOCK "VarFileInfo"

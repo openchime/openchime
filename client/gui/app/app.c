@@ -19953,7 +19953,7 @@ static void draw_drafts(gfx *rt, const oc_model *m, rectf reg) {
         return;
     }
 
-    /* SENT. No new server work: REQ-104's search already answers "everything I
+    /* SENT. No new server work: REQ-080's search already answers "everything I
      * sent" as a filters-only query, access-scoped, newest first and paged
      * (REQ-228). The results land in the ordinary search model. */
     /* `search_open` is the model's "a query is in flight or its results are
@@ -20567,7 +20567,7 @@ static int ed_canon(int pos) {
  *
  * The delimiters live in the buffer, so an edit somewhere else can stop a
  * construct parsing and make them visible again. Delete the space in "a *x* b"
- * and `*x*` no longer sits at a word boundary (MARKDOWN.md §2.1) — the emphasis
+ * and `*x*` no longer sits at a word boundary (MARKDOWN.md §2, rule 1) — the emphasis
  * is gone, and two asterisks nobody typed take its place on screen. That is the
  * exact failure this change exists to remove, arriving by the back door.
  *
@@ -21048,7 +21048,7 @@ static void ed_fmt_inline(const oc_wch *d) {
     size_t db = (size_t)dl * sizeof(oc_wch);
 
     /* Trim to the non-space core. A delimiter next to a space is not a
-     * delimiter (MARKDOWN.md §2.1), so wrapping the trailing space a
+     * delimiter (MARKDOWN.md §2, rule 1), so wrapping the trailing space a
      * double-click includes would produce markup that cannot parse. */
     while (a < b && ed_is_space(g_ed[a])) a++;
     while (b > a && ed_is_space(g_ed[b - 1])) b--;
@@ -21214,7 +21214,7 @@ static void ed_fmt_inline(const oc_wch *d) {
     }
 
     /* Wrap — one line's segment at a time, because a run cannot cross a line
-     * break (MARKDOWN.md §2.2): wrapping a multi-line selection whole would
+     * break (MARKDOWN.md §2, rule 2): wrapping a multi-line selection whole would
      * produce a pair that never parses and immediately repairs itself away,
      * a button that visibly does nothing. */
     {
@@ -21336,7 +21336,7 @@ static void ed_fmt_block(int kind) {
  */
 static void ed_newline(void) {
     /* Enter at the back edge of a formatted run: the newline goes OUTSIDE the
-     * closer — a run cannot cross a line (MARKDOWN.md §2.2), and inserting it
+     * closer — a run cannot cross a line (MARKDOWN.md §2, rule 2), and inserting it
      * inside stopped the closer parsing and un-formatted the line above. */
     if (!ed_has_sel() && g_pref_richtext) {
         int cr = ed_closer_run_at(g_ed_caret);

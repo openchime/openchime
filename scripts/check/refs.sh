@@ -46,10 +46,11 @@ win_tag=$(printf 'W%sN' 'I')
 old_list=$(printf 'BACK%sOG' 'L')
 pat_num='(^|[^&[:alnum:]_])#[0-9]{1,4}([^0-9A-Za-z-]|$)'
 pat_url='issues/[0-9]+'
-# The prefix, as a bracket expression so this line is not one; not
-# after a letter, digit or dash (a release tag's own segment is not a
-# reference), and not before another dash and digits.
-pat_pre="(^|[^-[:alnum:]_])(O[C])-[0-9]+([^0-9-]|\$)"
+# The prefix, in either case (a branch name is lower-case), as bracket
+# expressions so this line is not one; not after a letter, digit or dash (a
+# release tag's own segment is not a reference), and not before another dash
+# and digits.
+pat_pre="(^|[^-[:alnum:]_])([Oo][Cc])-[0-9]+([^0-9-]|-([^0-9]|\$)|\$)"
 pat_win="$win_tag-[0-9]+"
 pat_bl="$old_list|$(printf 'back%sog item' 'l')|$(printf 'back%sog #' 'l')"
 

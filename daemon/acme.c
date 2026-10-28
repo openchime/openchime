@@ -431,7 +431,7 @@ int oc_acme_issue(const oc_acme_opts *o, oc_cert_issued *out, char *err, size_t 
     } else {
         /* newAccount with the key (it returns the existing account for a known
          * key). Agreeing to the CA's terms is the operator's, by turning ACME
-         * on (CONFIG.md, "Certificates"). */
+         * on (TLS.md "Certificates"). */
         char acct[512];
         if (o->email && *o->email) snprintf(acct, sizeof acct, "{\"termsOfServiceAgreed\":true,\"contact\":[\"mailto:%s\"]}", o->email);
         else snprintf(acct, sizeof acct, "{\"termsOfServiceAgreed\":true}");

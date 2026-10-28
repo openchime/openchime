@@ -34,34 +34,8 @@ GPL-3.0: modify and distribute a client, and the source travels with it.
 ## Third-party code
 
 Other people's work under their own licences, unchanged: committed under
-`third_party/`, or fetched pinned by `scripts/build/` (Mbed TLS, SDL3, and
-the speech and summary builds' components):
-
-| Component | Licence | Used by |
-|---|---|---|
-| Mbed TLS 3.6.2 | Apache-2.0 | TLS, SHA-256, ES256 |
-| Argon2 (reference, 20190702) | CC0-1.0 or Apache-2.0 | password hashing |
-| SecLists' common passwords | MIT | the passwords a new one may not be, as data |
-| SDL3 | zlib | GUI windowing, input, 2D renderer |
-| jsmn | MIT | JSON tokenizer |
-| picohttpparser | MIT | the daemon's HTTP request parsing |
-| QR Code generator 1.8.0 | MIT | QR codes: the daemon's second-step setup page, and the TUI's device-code sign-in |
-| Mozilla CA roots | MPL-2.0 | the roots outbound HTTPS verifies against, as data |
-| termbox2 | MIT | TUI terminal layer |
-| utf8proc | MIT-like | Unicode handling; password normalization in the daemon |
-| lucide | ISC | icons |
-| SQLite | public domain | the database, compiled in |
-| Opus 1.6.1 | BSD-3-Clause | audio encode and decode in the clients; in the daemon only to encode read-aloud |
-| libvpx 1.17.0 | BSD-3-Clause, with a separate patent grant | VP9 video in the clients; never the daemon |
-| speexdsp 1.2.1 | BSD-3-Clause | the clients' echo canceller; never the daemon |
-| libfvad | BSD-3-Clause | voice-activity detection for voice input in the graphical clients (Win32 and web); never the daemon |
-| miniaudio 0.11.25 | public domain or MIT-0 | audio device capture and playback in the clients; never the daemon |
-| stb_image, stb_image_write | public domain or MIT | image encode (video-message posters, PNG) in the clients, through stb_image_write; stb_image is committed but nothing compiles it; never the daemon |
-| ONNX Runtime 1.30.0 | MIT | neural-network inference for read-aloud and voice input, in the daemon's speech builds |
-| llama.cpp 0.5.0 (with ggml) | MIT | the summary model, in the daemon's summary build |
-| Kitten TTS mini 0.8 | Apache-2.0 | the read-aloud voice model, as data |
-| Moonshine Tiny Streaming | MIT | the voice-input recognizer's model, as data |
-| CMUdict | BSD-style | the source of ttskit's pronunciation data |
+`third_party/`, or fetched pinned by `scripts/build/`. Each component, its
+version, its licence and what uses it are [VENDORS.md](docs/VENDORS.md).
 
 All are compatible with AGPL-3.0-or-later, so none of them
 constrains the choice above. All are permissive but one: Mozilla's CA roots are

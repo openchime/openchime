@@ -19,8 +19,9 @@ where there is anything to configure (`OPENCHIME_TLS=acme:chat.example.com`,
 directory, the ports, who may join, the mode). Twenty-two in all. Every path is under one
 `OPENCHIME_DATA_DIR` at a fixed name, the deployment model is derived from
 what the box was started with rather than declared, and everything nobody
-varies — session life, worker counts, queue depths, storage watermarks, rate
-limits, the call cap — is a constant in `daemon/config.h`, not a row. Seven
+varies — session life, worker counts, queue depths, rate limits, the call
+cap — is a constant in `daemon/config.h`, and the storage policy's watermarks
+are set in `daemon/config.c`; none is a row. Seven
 more are a managed box's rows ("A managed box", below), set only with
 `OPENCHIME_MANAGED_TICKET`; without it they refuse the start.
 Four more, and twelve the clients read, are development inputs, which only
@@ -462,15 +463,16 @@ accepts, and any other stops it with exit status 2.
 | `--check-data PATH` | Opens the database at PATH read-only and exits 4 when a newer daemon wrote it (SCHEMA.md §1), 0 when this one would run on it or there is none, 1 when it cannot be opened. Writes nothing. The image's entrypoint asks it before Litestream starts, since Litestream exits 1 for any failure of the daemon it runs. |
 | `--config-reference` | Prints the settings reference above, as markdown, from the registry. |
 | `--config-env` | Prints the packaged environment file (`packaging/openchimed.env`), from the registry. |
-| `--tts-say VOICE TEXT OUT` | Renders TEXT in VOICE to an MP4 at OUT with the built-in model, then exits. Only in a build with read-aloud. |
+| `--tts-say VOICE TEXT OUT` | Renders TEXT in VOICE to OUT with the built-in model — a WAV when OUT ends `.wav`, otherwise an MP4 — then exits. Only in a build with read-aloud. |
 | `--tts-manifest DIR` | Writes the manifest for the read-aloud data in DIR, then exits. In every build, with read-aloud or not. |
 | `--stt-hear IN.wav` | Prints the text recognized in a 16-bit mono WAV, then exits. Only in a build with voice input. |
 | `--stt-manifest DIR` | Writes the manifest for the recognizer data in DIR, then exits. In every build, with voice input or not. |
 
 ## Build switches
 
-`make` variables, fixed into the binary (the Makefile's header lists them; the
-feature switches are remembered in `build/.features`).
+`make` variables, fixed into the binary (the Makefile's header lists them). A
+first `make` leaves the features out; the feature switches are remembered in
+`build/.features` until changed or `make distclean`.
 
 | Variable | Default | What it controls |
 |---|---|---|
