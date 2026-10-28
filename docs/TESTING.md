@@ -77,12 +77,12 @@ its Node), a Chromium (`CHROME=/path`, else Playwright's download under
 
 **The Win32 GUI harness** (`scripts/gui/*.sh`): WSL2 on a Windows host with an
 interactive desktop session (`powershell.exe` and `/mnt/c` reachable); make
-fetches llvm-mingw for `make windows`. `screenrec.sh` and `voice.sh` also need
-`ffmpeg`.
+fetches llvm-mingw for `make windows`. `screenrec.sh` also needs `ffmpeg`, and
+`voice.sh` a daemon built with `TTS=1 STT=1`.
 
 **TUI scripts** (`scripts/demo/tui.sh`, `scripts/tui_device.sh`): `tmux` and
-`curl`; python3 with OpenCV (`cv2`, numpy) for `tui_device.sh`'s QR decode,
-skipped without it.
+`curl`; `openssl` for `tui_device.sh`'s fingerprint check, and python3 with
+OpenCV (`cv2`, numpy) for its QR decode, skipped without it.
 
 ---
 
@@ -1084,9 +1084,9 @@ A new suite is its declaration and one `S(run_<name>_tests)` line in `tests/main
 
 Measured answers to "how much memory does the daemon use, and how many
 concurrent connections does it hold" — measured, not assumed. Reproduced by
-`scripts/bench.sh`, which drives the
-running daemon with the `tests/bench_load.c` load client and samples the
-daemon's resident memory (`/proc/<pid>/status` `VmRSS`) while the load runs.
+`scripts/bench.sh`, which starts a daemon, drives it with the
+`tests/bench_load.c` load client and samples the daemon's resident memory
+(`/proc/<pid>/status` `VmRSS`) while the load runs.
 
 **Environment.** Localhost, single box, one daemon process (single-threaded net
 loop + one DB-writer thread), mbedTLS, glibc. These are therefore an *upper
@@ -1298,8 +1298,8 @@ The loop's own turn is the figure to compare.
 
 ## 6. Running the daemon by hand
 
-`make run` starts a development daemon on `127.0.0.1:8443` (health `8080`, data
-`/tmp/openchime-dev`, users alice/pw and bob/pw).
+`make run` starts a development daemon on port 8443 of every interface (health
+`8080`, data `/tmp/openchime-dev`, users alice/pw and bob/pw).
 
 The federation wires — enrollment (ARCH-84), push (ARCH-85) and the OIDC relay
 (ARCH-56/57) — are proven in-process by `test_enroll`, `test_push` and
@@ -1309,7 +1309,7 @@ The federation wires — enrollment (ARCH-84), push (ARCH-85) and the OIDC relay
 
 `scripts/demo/tui.sh` runtime-verifies the **TUI** (ARCH-75) against a live daemon — the
 headless check the project lacked (it was only ever build-verified). It drives the real
-interactive client in a **tmux** pane: connect and sign in as alice (the TUI's device-code sign-in, approved by the script), send a message from
+interactive client in a **tmux** pane: connect and sign in as alice (the TUI's device-code sign-in, which a person approves while the script waits), send a message from
 the composer, receive a broadcast from bob (via `demo_client`), and assert both render in
 the transcript. Requires `tmux`. To connect the TUI by hand instead:
 

@@ -272,7 +272,7 @@ The client advertises the inclusive range of protocol versions it can speak.
 |---------------|------|----------------------------------------------|
 | `min_version` | u16  | Lowest protocol version the client supports. |
 | `max_version` | u16  | Highest protocol version the client supports. `min_version <= max_version`. |
-| `client_info` | str  | Free-form build/platform string, for logging only (e.g. `openchime-desktop/0.1 linux`). |
+| `client_info` | str  | Free-form build/platform string, for logging only (e.g. `openchime-client/0.1`). |
 
 (`str` is the u16-length-prefixed UTF-8 encoding defined in §7.)
 
@@ -1408,11 +1408,11 @@ first:
 | Field       | Type            | Notes                                                |
 |-------------|-----------------|------------------------------------------------------|
 | `count`     | u16             | Number of entries.                                   |
-| `entries[]` | `count` × entry | Each: `message_id` (u64), `channel_id` (u64), `author_id` (u64), `server_time` (u64), `snippet` (str — an FTS5 excerpt around the match), `action` (u8 — `1` when the message is an action and the snippet is cut from its text, REQ-058). |
+| `entries[]` | `count` × entry | Each: `message_id` (u64), `channel_id` (u64), `author_id` (u64), `server_time` (u64), `snippet` (str — an FTS5 excerpt around the match, or the body's first 160 bytes for a search with no text), `action` (u8 — `1` when the message is an action and the snippet is cut from its text, REQ-058). |
 | `truncated` | u8              | 1 if more matches exist past the cap (`limit`).      |
 
 Tombstoned messages (§5.6) are excluded, and an edit (§5.5) re-indexes the
-message. An empty or all-punctuation query returns zero results (never an error).
+message. An empty or all-punctuation query with no filters returns zero results (never an error).
 
 ### 5.12 Direct messages (REQ-050)
 
@@ -2815,7 +2815,7 @@ A participant is on whichever transport its latest packet came by — a
 relay forwards each packet to each other participant by that participant's own
 transport, so one call can hold both. An empty `ct` is a keepalive, answered to
 its sender alone, on the transport it came by. Media never costs a connection: a
-`CALL_MEDIA` for a connection with more than 256 KiB already waiting to be written
+`CALL_MEDIA` for a connection with 256 KiB or more already waiting to be written
 is dropped, and the loss is recovered as UDP loss is (FEC and concealment for
 audio, resends and keyframes for a share). A client probes UDP first, and falls
 back when the relay does not answer (AUDIO.md §4).
@@ -3128,7 +3128,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3027` | `STT_UNAVAILABLE`     | voice input | no   | Voice input is off, too many segments are waiting or more than 60 arrived in a minute, the queue is full, or recognition failed (§5.14c, REQ-300). |
 | `3028` | `CALL_FULL`           | calls      | no    | A join, a start's invitations or a `CALL_INVITE` would put the call past the cap (§5.17, REQ-305). |
 | `3029` | `NOT_CALL_STARTER`    | calls      | no    | `CALL_END` from someone other than the call's starter (§5.17). |
-| `3030` | `NOT_IN_CALL`         | calls      | no    | No call in that conversation, or the sender is not in it (`CALL_INVITE`, `CALL_END`, `CALL_KEY`). |
+| `3030` | `NOT_IN_CALL`         | calls      | no    | No call in that conversation, or the sender is not in it (`CALL_INVITE`, `CALL_END`, `CALL_KEY`, `CALL_SHARE`). |
 | `3031` | `INVITE_UNREDEEMABLE` | admin      | no    | `INVITE_USER` carried an email where no sign-in source could ever spend an invite bound to one: the deployment offers no provider sign-in (§5.8). |
 | `3032` | `GROUP_HANDLE_TAKEN`  | groups     | no    | A group, a person or a broadcast word already answers to that `@name`: a create, an update, or a rename (`SET_DISPLAY_NAME`) (§5.16k). |
 | `3033` | `UNKNOWN_GROUP`       | groups     | no    | No such group. |
@@ -3220,11 +3220,11 @@ this table cannot silently gain a shared value.
 | `0x0045` | `USER_UPDATED` | S → C | ack/push for SET_ROLE, REMOVE_USER and ENABLE_USER |
 | `0x0046` | `INVITE_CREATED` | S → C | the minted invite token |
 | `0x0047` | *(retired)* | — | was `REDEEM_INVITE`, a password in a frame; sign-up is a page (AUTH.md §8.10). Never reused. |
-| `0x0048` | `SET_DISPLAY_NAME` | C → S | change your own display name (REQ-020) |
+| `0x0048` | `SET_DISPLAY_NAME` | C → S | change your own display name (REQ-240) |
 | `0x0049` | *(retired)* | — | was `CHANGE_PASSWORD`; the password page. Never reused. |
 | `0x004A` | `PROFILE_UPDATED` | S → C | a user's display name changed (also the self ack) |
 | `0x004B` | `LIST_INVITES` | C → S | outstanding invites (owner/admin) |
-| `0x004C` | `INVITE_LIST` | S → C | the list (token HASHES only, never tokens) |
+| `0x004C` | `INVITE_LIST` | S → C | the list, by server-side id (never tokens) |
 | `0x004D` | `REVOKE_INVITE` | C → S | revoke one by id |
 | `0x004E` | `INVITE_REVOKED` | S → C | ack |
 | `0x004F` | `SET_EMAIL` | C → S | a local account's own address, unverified; answered with `PROFILE_INFO` |
@@ -3294,7 +3294,7 @@ this table cannot silently gain a shared value.
 | `0x0090` | `SET_NOTIFY_PREF` | C → S | set a channel's notification level (REQ-130) |
 | `0x0091` | *(retired)* | — | was `SET_DND`, a single quiet window; replaced by `SET_SCHEDULE` (`0x00CC`, §5.16). Never reused. |
 | `0x0092` | `LIST_NOTIFY_PREFS` | C → S | request all notification settings |
-| `0x0093` | `NOTIFY_PREFS` | S → C | DND + per-channel levels (also a sync push) |
+| `0x0093` | `NOTIFY_PREFS` | S → C | the notify default + per-channel levels and mutes (also a sync push) |
 | `0x0094` | `SET_CLIENT_SETTING` | C → S | upsert a synced client setting (empty value = delete) |
 | `0x0095` | `LIST_CLIENT_SETTINGS` | C → S | request a client_type bucket's settings |
 | `0x0096` | `CLIENT_SETTINGS` | S → C | a bucket snapshot (also a device-sync push) |

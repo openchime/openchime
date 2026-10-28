@@ -285,8 +285,8 @@ model; translate input to intents }, stop.
   **notcurses is rejected on licensing** — it hard-depends on libunistring
   (LGPL); termbox2 + utf8proc keep the whole client permissive. **The TUI is
   text-only and never renders graphics — no images, ever.** Built on the host
-  like the daemon (`make linux`), with no dependency beyond termbox2 and
-  utf8proc except an optional link to libsecret-1 (and its glib stack) where
+  like the daemon (`make linux`), with no dependency beyond termbox2, utf8proc
+  and the vendored mbedTLS except an optional link to libsecret-1 (and its glib stack) where
   `pkg-config` finds it, for the keyring. The widget/
   formatting layer above termbox2 is the in-tree **`tuikit`** toolbox (ARCH-83,
   [TUIKIT.md](./TUIKIT.md)): panels, modal lists, a command palette, text
@@ -336,8 +336,8 @@ model; translate input to intents }, stop.
   opens a modal prompt dialog for one needing an argument.
   **Emoji picker:** `r` on a selected message opens a filterable emoji popup
   (type a shortcode name, Enter reacts with the real Unicode emoji, toggling).
-  **Mouse + config:** the TUI enables mouse input (click a channel/member to
-  select, wheel to scroll) and reads machine-local prefs from a
+  **Mouse + config:** the TUI enables mouse input (click a channel to open it or a
+  member to message them, wheel to scroll the messages) and reads machine-local prefs from a
   hand-edited config file (`client/tui/config.c`, created with commented defaults
   on first run): `$XDG_CONFIG_HOME/openchime/config` — else
   `~/.config/openchime/config` — on Linux/macOS, and
@@ -444,12 +444,8 @@ model; translate input to intents }, stop.
     show dimmed with a `+`.
   - **roster + presence** — the Members panel lists the channel's own members
     (REQ-031) with online/away/offline dots + roles; the launcher's "Set
-    away/online" sets your own presence. The pane **scrolls under the wheel**,
-    with a thumb when there is more below: a channel roster runs to 500 and the
-    pane holds about twenty, so without an offset everybody past the fold would be
-    out of reach from here. The offset is clamped to the content on every paint, since the roster
-    arrives after the pane opens, and it returns to the top when the channel
-    changes.
+    away/online" sets your own presence. The pane does not scroll: it lists the
+    roster from the top, as many as fit (a channel roster runs to 500).
   - **direct messages** — `n` in the Members pane (or a member menu's "Message")
     opens a 1:1 DM, titled `@peer` in the sidebar (the daemon reports the DM peer
     in `CHANNEL_INFO`).
@@ -830,7 +826,7 @@ brief status line. A graceful logout (the launcher's "Log out") or a fatal
 reject (bad version, expired session) ends the loop instead of retrying. The net thread tracks its own
 per-channel high-water for the reconnect cursors; a headless test bounces the
 daemon and asserts the client re-auths, keeps its history, and can send again.
-While backing off, the status line counts the wait down (`connection lost —
+While backing off, the status line counts the wait down (`Connection lost:
 reconnecting in Ns…`; the TUI appends its own `(Ctrl+R to retry now)`, since a
 keybinding belongs to a frontend and not the shared core), and
 `oc_client_reconnect` (bound to

@@ -57,7 +57,7 @@ authority.
   floor: 19 MiB of memory, two passes, one lane, a per-user random salt. Only
   the derived hash, the salt and the settings it was made with
   (`argon2id$v=19$m=19456,t=2,p=1`) are stored (`local_credentials`, migration
-  0002, in this form since 0062), so the settings can be raised without a format change; a hash with
+  0002, in this form since 0062), so the memory cost can be raised without a format change; a hash with
   settings this daemon does not make matches no password. **No OpenChime client
   collects a password.**
   It is typed only into the daemon's own sign-in page, in the system browser, and

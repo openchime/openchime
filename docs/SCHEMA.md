@@ -138,7 +138,7 @@ sender. Public channels are readable/postable by any tenant user; private
 channels are members-only, reachable only via `INVITE_TO_CHANNEL` (REQ-033) or
 through a user group the channel has (`CHANNEL_ADD_GROUP`, §3am).
 `membership_sync` in `daemon/dbwriter.c` is the only code that writes or
-deletes a row.
+deletes a row, but for the purge of a closed encrypted DM (§3bb).
 
 | column         | type    | notes                                    |
 |----------------|---------|------------------------------------------|
@@ -1244,8 +1244,9 @@ long as both hold.
 `channel_members` stays the **effective** membership, which every access check,
 fan-out, push and badge query reads. A row exists exactly when the person was
 added directly (`direct = 1`), or is in a group the channel has. One function in
-the writer, `membership_sync`, is the only code that writes or deletes a row, and
-it writes that rule. So no sequence of joins, leaves, group edits and attachments
+the writer, `membership_sync`, is the only code that writes or deletes a row
+(but for the purge of a closed encrypted DM, §3bb, which removes the channel
+whole), and it writes that rule. So no sequence of joins, leaves, group edits and attachments
 can leave a row the rule would not. A row that stays keeps its `joined_at_ms`.
 Every row before this migration was added directly.
 

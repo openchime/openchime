@@ -48,7 +48,7 @@ or broken is not a document — it is the
 | [MARKDOWN.md](docs/MARKDOWN.md) | The message-formatting dialect — a Slack-compatible subset plus real lists — where it is parsed, and the places it deliberately differs. |
 | [CALLS.md](docs/CALLS.md) | Calls: the Calls section, starting, inviting, ending and missed calls, the call view, and the end-to-end encryption — device keys, per-sender keys sealed with HPKE, packets in SFrame — with what it does and does not guarantee; and screen sharing in calls — the codec as a wire contract, fragments, NACKs and keyframe requests inside the encryption, rate control, and the Windows surfaces. |
 | [AUDIO.md](docs/AUDIO.md) | A call's audio: the relay that never decodes, the client engine — echo cancellation, noise suppression, Opus with FEC and DTX, the adaptive jitter buffer, the mixer — and the ERLE harness that measures the canceller. |
-| [VIDEO-MESSAGES.md](docs/VIDEO-MESSAGES.md) | Recorded video messages: the capture interface and its six platform backends, VP9 and Opus in a restricted MP4, the recorder and player, how a message travels as an attachment, consent, and the tests that prove it. |
+| [VIDEO-MESSAGES.md](docs/VIDEO-MESSAGES.md) | Recorded video messages: the capture interface and its platform backends, VP9 and Opus in a restricted MP4, the recorder and player, how a message travels as an attachment, consent, and the tests that prove it. |
 | [READ-ALOUD.md](docs/READ-ALOUD.md) | Read-aloud: a channel spoken in each author's voice — rendered once by the daemon from a voice model installed beside it, cached, and played by the clients. |
 | [VOICE-INPUT.md](docs/VOICE-INPUT.md) | Voice input for the graphical clients: push to talk into the composer, or free talk the daemon posts as you speak — cut at pauses in the client, echo-cancelled, recognized by the daemon with Moonshine Tiny Streaming. |
 | [TTSKIT.md](docs/TTSKIT.md) | ttskit, the GPL-free pronunciation library: text to the phonemes a voice model reads, its data files, and how to rebuild them from CMUdict. |
@@ -353,8 +353,8 @@ for other people, and those users are entitled to your modified source. The
 clients carry the same terms rather than a permissive licence, so the strategy is
 not half-applied and the daemon/client link raises no questions.
 
-`third_party/` is other people's work under their own permissive licences and is
-unaffected.
+`third_party/` is other people's work under their own licences — permissive, but
+for the MPL-2.0 CA roots — and is unaffected.
 
 Contributions are taken under the Developer Certificate of Origin (`DCO.txt`);
 sign off with `git commit -s`. There is no CLA and copyright is not assigned.
