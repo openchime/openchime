@@ -38,6 +38,7 @@ AppVersion={#Version}
 AppVerName=OpenChime {#Version}
 VersionInfoVersion={#FileVersion}
 AppPublisher=OpenChime
+AppCopyright=Copyright (c) OpenChime LLC
 AppPublisherURL=https://openchime.io
 AppSupportURL=https://openchime.io
 DefaultDirName={autopf}\OpenChime

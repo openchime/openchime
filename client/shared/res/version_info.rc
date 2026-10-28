@@ -68,8 +68,7 @@ BEGIN
             VALUE "OriginalFilename", OC_RES_ORIG
             VALUE "ProductName",      "OpenChime"
             VALUE "ProductVersion",   OC_BUILD_ID_STR
-            /* No LegalCopyright: the licence is AGPL-3.0-or-later
-               (LICENSING.md); the copyright line is the owner's to add. */
+            VALUE "LegalCopyright",   "Copyright (c) OpenChime LLC"
         END
     END
     BLOCK "VarFileInfo"
