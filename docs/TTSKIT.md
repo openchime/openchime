@@ -311,10 +311,12 @@ The build is deterministic: a rerun from a clean `build/ttskit-data` reproduces 
 sums above, which are also in `tests/test_ttskit.c`. `sha256sum ttskit/data/en-US/*.bin` checks
 by hand.
 
-**After `install`:** update the two sums in `tests/test_ttskit.c` and in this section, run
-`make test` (the agreement test reads the new reference), and listen to rendered speech
-before committing — a changed table changes how every message sounds. Changing the data
-changes read-aloud's model version, so existing renders are made again rather than mixed.
+**After `install`:** update the two sums in `tests/test_ttskit.c` and in this section,
+update `OC_TTS_MODEL_VERSION` in `daemon/tts.h` (its `ttskit-<lexicon 8>.<guesses 8>` part,
+the first eight hex digits of each new sum), run `make test` (the agreement test reads the
+new reference), and listen to rendered speech before committing — a changed table changes
+how every message sounds. The model version is what renders are cached under, so changing
+it makes existing renders again rather than mixing them; it does not change by itself.
 
 ## 9. Tests
 
@@ -326,8 +328,9 @@ changes read-aloud's model version, so existing renders are made again rather th
 - sentences, with weak forms, capitals and pause marks;
 - loading without data (everything spelled);
 - both data files against their SHA-256 pins;
-- the C guesser against Phonetisaurus's decoder on the 3,010 reference words (at least 999 in
-  1,000 identical);
+- the C guesser against Phonetisaurus's decoder on the reference words: every tenth of the
+  3,010 in `make test` (all but one identical), all 3,010 with `OC_TEST_FULL=1` (at least
+  999 in 1,000 identical);
 - truncated files, a wrong magic and a newer version, each refused on load with a reason.
 
 ## 10. Limits

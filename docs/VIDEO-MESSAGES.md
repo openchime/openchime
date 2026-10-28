@@ -161,7 +161,8 @@ sample on the media clock.
 
 `client/core/media/recorder.c` turns a capture device and a microphone into an MP4
 and a poster, both **held in memory**: a client writes no files (ARCH-88), and five
-minutes of video is at most 155 MB.
+minutes of video is at most 155 MiB at the default size cap (160 MiB, less 5 MiB
+of headroom).
 
 - **Threads.** The capture thread pulls frames; the audio callback fills a ring; one
   encode thread takes both, encodes, and hands samples to the muxer. Queues are
@@ -224,14 +225,15 @@ run at 16 kHz, where voice input proved it, on the microphone and the loopback
 band-limited to 7 kHz, and the echo it finds there — up-sampled — taken out of the
 full-band microphone, delayed 1 ms to meet it. The narration keeps everything
 above 8 kHz. Run at 48 kHz directly, speexdsp models the echo path with three
-times the taps and keeps less of a voice talking over it; measured in the ERLE
-harness on the same room:
+times the taps and keeps less of a voice talking over it. On the ERLE
+harness's room (the band column is what `make test` prints; the direct 48 kHz
+column is a one-off run of the same room, which the harness does not measure):
 
 | | speexdsp at 48 kHz | the 16 kHz band, 48 kHz out |
 |---|---|---|
 | Echo removed, converged | 23.2 dB | 22.1 dB |
-| Echo removed, double-talk | 11.0 dB | 13.2 dB |
-| Voice kept (correlation) | 0.88 | 0.93 |
+| Echo removed, double-talk | 15.1 dB | 16.6 dB |
+| Voice kept (correlation) | 0.87 | 0.91 |
 
 **What it does not do.** Echo above 7 kHz is left in. And a talker who never
 pauses, over sound that never stops, is any canceller's worst case: with a steady

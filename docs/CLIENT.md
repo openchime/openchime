@@ -241,7 +241,7 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   [VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md).
 - **Voice input** (`client/core/voice/`, ARCH-112). The dictation
   session, the libfvad segmenter and the speexdsp echo canceller, over the media
-  library's device layer — linked by the Win32 client. Segments go to the daemon
+  library's device layer — linked by the GUI (Win32 and web) and the tests. Segments go to the daemon
   beside, not behind, the transfer queue. See [VOICE-INPUT.md](./VOICE-INPUT.md).
 - **Calls** (ARCH-73/113). Signaling, the device key and the media keys are the
   core's, on the network thread (`client/core/callsig.c`): `oc_client_call_start`,
@@ -258,7 +258,7 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   `AWAY` flag) has a greyed tile reading "Reconnecting…" until they are back or
   their seat goes. In the call view, toasts stand above the call's controls and
   the line of who is invited, not on them. The audio is the
-  engine's (`client/core/call/`, linked by the Win32 client and the tests),
+  engine's (`client/core/call/`, linked by the GUI (Win32 and web) and the tests),
   plugged in with `oc_client_set_call_media` behind the `oc_call_media` seam, so
   the TUI links no codec. See [CALLS.md](./CALLS.md) and [AUDIO.md](./AUDIO.md).
 
@@ -285,7 +285,9 @@ model; translate input to intents }, stop.
   **notcurses is rejected on licensing** — it hard-depends on libunistring
   (LGPL); termbox2 + utf8proc keep the whole client permissive. **The TUI is
   text-only and never renders graphics — no images, ever.** Built on the host
-  like the daemon (`make linux`), zero transitive dependencies. The widget/
+  like the daemon (`make linux`), with no dependency beyond termbox2 and
+  utf8proc except an optional link to libsecret-1 (and its glib stack) where
+  `pkg-config` finds it, for the keyring. The widget/
   formatting layer above termbox2 is the in-tree **`tuikit`** toolbox (ARCH-83,
   [TUIKIT.md](./TUIKIT.md)): panels, modal lists, a command palette, text
   prompts, and a 256-color theme.
@@ -478,14 +480,15 @@ model; translate input to intents }, stop.
     TUI has neither. "Two-step sign-in" opens
     the workspace's page for setting up or turning off a TOTP second step the same
     way (AUTH.md §8.6); the terminal client's launcher has it too.
-  - **admin / user management** — a member menu's "Reset password…" (or with
+  - **admin / user management** — in the Win32 client only, a member menu's "Reset password…" (or with
     their two-step sign-in too; the menu widens to its longest item, measured
     in the text it is drawn in, so neither is cut) shows the reset to send them, copied to the
     clipboard (`oc_model_reset_text`: the workspace, the code to enter on the
     sign-in card, and the page's link only where a CA vouches for the
     certificate, since a tunnel's works on this computer alone; AUTH.md §2);
     an owner's or admin's People pane lists removed members too, and right-click
-    on one brings them back, with the reset to set a password (`ENABLE_USER`);
+    on one brings them back, with the reset to set a password (`ENABLE_USER`;
+    the TUI has neither the reset nor the removed list); in both clients,
     "Make admin/Make member/Remove"
     and the launcher's "Invite a user" manage users (REQ-030/033, owner/admin
     only; a `USER_UPDATED` folds each change into the roster, and someone who
@@ -677,7 +680,8 @@ directions exists), `shared/tls.c` (client TLS and verification), `shared/frameb
 (reassembly), and `shared/sock.h` (POSIX/Winsock shim). The wire sequence is
 PROTOCOL.md §3–§6 and the §10 state machine. **Trust (ARCH-10,
 [TLS.md](./TLS.md)):** a daemon's certificate must chain to a trusted root —
-built in, `OPENCHIME_EXTRA_CA`, or the operating system's — and name the
+built in, or the operating system's (`OPENCHIME_EXTRA_CA` is a daemon setting,
+for its own outbound TLS; no client reads it) — and name the
 workspace. One that does not is accepted only if the workspace's `.well-known`
 publishes its fingerprint, if the person has trusted it, or if the daemon is on
 loopback (`client/core/net.c:cert_judge`). Otherwise the attempt ends with
@@ -709,7 +713,8 @@ replaces the trust, which is forgotten (`oc_store_clear_pin`).
 
 The core **stores nothing locally beyond credentials** (ARCH-88/REQ-201). There is
 no database and no file: `client/core/store.c` is a thin front for the OS
-credential store, holding one entry per workspace with the session token, the
+credential store (in the web client, the origin's `localStorage`, unencrypted:
+`client/gui/platform/web/secret_mem.c`), holding one entry per workspace with the session token, the
 trusted certificate (if any), and the book fields (typed address, account,
 last-used). Because there
 is one credential per workspace, **enumerating the credential store is the
@@ -741,7 +746,8 @@ until the next successful sign-in. Both frontends answer it by opening that
 workspace's sign-in with the workspace filled in — over another live workspace
 where there is one — and neither starts a browser sign-in unasked.
 
-  **There is no plaintext fallback.** Where no store exists — headless, no D-Bus,
+  **There is no plaintext fallback** on a native client (the web client's store
+  is `localStorage` itself, base64 and not encrypted). Where no store exists — headless, no D-Bus,
   a locked keychain — `oc_store_save_session`/`load_session` simply do nothing, so
   that machine keeps no session and the user signs in again next launch. Opening a
   store also **erases any `state.db` an older build left behind**, so upgrading
@@ -895,7 +901,8 @@ The core + TUI build on the host (a `make linux` target linking `client/core/*.c
 no container, no external build system. termbox2 and utf8proc are **vendored as
 committed single-file source** in `third_party/` (like jsmn, pinned to termbox2
 v2.5.0 / utf8proc v2.11.3), both MIT, so local and CI share identical sources with
-zero transitive dependencies (ARCH-75). The GUI is one application
+no transitive dependencies of their own (ARCH-75); the TUI's one optional
+system link is libsecret-1, for the keyring, where `pkg-config` finds it. The GUI is one application
 (`client/gui/app/`) compiled over a platform directory: `make windows`
 cross-compiles it with the pinned llvm-mingw over `client/gui/platform/win32/`
 and the SDL3 and mbedTLS built for Windows; a Linux or macOS build is the same

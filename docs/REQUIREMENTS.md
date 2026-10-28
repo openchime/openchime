@@ -28,9 +28,11 @@ where one exists.
 
 **Conventions.**
 - Each requirement carries a stable identifier of the form `REQ-NNN`.
-  Identifiers are assigned in increments of 10 at the start of each
-  subsection and increment by 1 within it, leaving room to insert later
-  requirements into a subsection without renumbering anything else.
+  Identifiers were first assigned in increments of 10 at the start of each
+  subsection and by 1 within it. A requirement added later takes the next free
+  number (or, rarely, a letter suffix such as `REQ-036a`) and is placed in the
+  subsection it belongs to, so numbers are not in order across the document
+  and nothing is ever renumbered.
 - Requirements are written in present-perfect tense, as a factual statement
   of what the finished system does — not as a to-do or a design rationale.
   Rationale, when it matters, is a separate sentence after the requirement.
@@ -149,8 +151,10 @@ where one exists.
   (AUTH.md §8.11). The daemon has advertised its
   enabled sources to the client before authentication.
 - **REQ-021.** The system has supported OIDC login against Microsoft Entra
-  ID and Google Workspace as identity providers. Provider integration has lived
-  in the central service (ARCH-56), not the daemon.
+  ID and Google Workspace as identity providers. For relay sign-ins, provider
+  integration has lived in the central service (ARCH-56); a direct connection
+  (REQ-027) to Google or Entra is handled by the daemon itself, which knows
+  their issuers and claims (`tid`, `hd`, `oid`, Entra's `xms_edov`).
 - **REQ-022.** The system has supported Apple Sign-In, required for iOS App
   Store compliance for any app offering third-party login. The system has
   not supported Facebook login. (Also brokered by the central service.)
@@ -203,7 +207,7 @@ where one exists.
   | SAML 2.0 | from Business+ | top tier only | **not supported** — a deliberate exclusion |
   | OIDC / social login | yes | OAuth2, top tier | **yes**, brokered by the central relay (ARCH-56/57) |
   | Bring-your-own IdP, direct to the server | yes | yes | **yes** (ARCH-55) — the daemon as relying party to the operator's own OIDC provider |
-  | Providers reachable | any IdP | any IdP | Google, Entra and Apple through the relay (REQ-021/022); any other OIDC provider through a direct connection |
+  | Providers reachable | any IdP | any IdP | Google, Entra and Apple through the relay (REQ-021/022); any OIDC provider (Google and Entra included) through a direct connection |
 
   Two consequences follow. An RFP requiring SAML 2.0 disqualifies this system
   outright. And the relay is not equivalent to their SSO: it costs a self-hoster
@@ -212,8 +216,9 @@ where one exists.
   removes both.
 - **REQ-028.** In a deployment using OIDC — brokered or direct — an identity the
   workspace has not seen has joined only when its operator allowed it: by a
-  configured rule naming an owner's address, an organization's tenant at the
-  provider, or a verified email domain, or by an invitation an owner or admin
+  configured rule naming an owner's address, an owner's exact provider subject,
+  an organization's tenant at the provider, or a verified email domain, or by an
+  invitation an owner or admin
   bound to that address. Every rule on an address has required the provider to
   have verified it, and the default has been to refuse. The decision has been the
   daemon's, which owns the `users` table; the central service has held no member
@@ -342,17 +347,23 @@ where one exists.
   tenant's message history, whether the deployment was stand-alone, federated,
   or hosted. With nothing configured, no shared, always-on runtime component has
   sat in the message/data path and message content has left the daemon only
-  toward that workspace's own members. Workspace resolution has
+  toward that workspace's own members (apart from the URLs unfurling fetches,
+  below). Workspace resolution has
   been plain DNS (REQ-010, ARCH-14), so the name-to-daemon-address mapping has
   lived in static DNS records rather than in a resolution service, and no lookup
   traffic has reached the project.
 
   **Content has left the daemon for a third party only where the tenant
-  configured it to.** Compliance capture (REQ-276) and send-time DLP (REQ-277)
-  both hand message content to an endpoint the tenant named. That has been the tenant's decision, made per workspace, visible in its
-  configuration and off until made; it has never been a property of the
-  deployment model, and the daemon has remained where the message is stored
-  whatever inspected it on the way in. The guarantee is therefore about
+  configured it to.** Cloud summaries (REQ-313, `OPENCHIME_SUMMARY=cloud:…`)
+  send the messages being summarised to the hosted model the operator named, and
+  compliance capture (REQ-276) and send-time DLP (REQ-277) hand message content
+  to an endpoint the tenant named. That has been the tenant's decision, made per
+  workspace, visible in its configuration and off until made; it has never been
+  a property of the deployment model, and the daemon has remained where the
+  message is stored whatever inspected it on the way in. One thing does leave by
+  default: unfurling (REQ-222) is always on, so the daemon fetches each URL a
+  message contains from the host it names — the URL, not the rest of the
+  message's text. The guarantee is therefore about
   **storage and default behaviour**: where messages live, and that nothing reads
   them unless the tenant said so — not that content can never be inspected.
 
@@ -828,7 +839,7 @@ where one exists.
   until 5pm" unbuildable.
 
   **The storage shape is already proven in-tree.** Custom status expiry
-  (REQ-122/240, migration 0027) solved exactly this problem: an absolute expiry
+  (REQ-122/241, migration 0027) solved exactly this problem: an absolute expiry
   stamp, **enforced by the daemon on read** — because a client that is not
   running cannot clear its own state, and an expired value that simply *reads* as
   absent needs no clock on the reader's side and no sweep. A `dnd_until_ms`
@@ -927,6 +938,10 @@ where one exists.
   a server surface — the daemon decides *whether* to notify, never how it sounds.
   Sounds are the system's own, asked for by name (`ms-winsoundevent:` for the
   toast, `PlaySound`/`SND_ALIAS` for the client's window); nothing is bundled.
+  *As built (Win32)*, the sounds are four fixed system sounds the user cannot
+  yet choose — a message; a mention, keyword hit or priority person; a direct
+  message (any notified DM); and a call — and only the mute-all switch is
+  stored, as a client preference.
 - **REQ-139.** A client has offered an **activity feed / notification inbox** — an
   aggregated, filterable view of @mentions (REQ-221), reactions to the user's
   messages (REQ-070), and thread replies (REQ-060/061) across all channels — so a

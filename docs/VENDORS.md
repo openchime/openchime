@@ -193,10 +193,8 @@ exits. Override for a new version with `MBEDTLS_SHA256=<sum>`.
 `libSDL3.a` with llvm-mingw into `third_party/sdl3-3.4.14-win/` (gitignored), and
 `make build/gfx_test.exe` links it. SDL's own build is CMake; the script invoking
 it is the same arrangement as invoking mbedTLS's make — the dependency's build
-system stays its own business, and this tree's stays make. It is the first
-genuinely large dependency in the tree, which is exactly why it sits in this
-class and not the committed-single-file one (the reasoning §7 records for
-libvpx). zlib-licensed: no notice needs to travel with a shipped
+system stays its own business, and this tree's stays make. It is a
+large dependency, fetched pinned rather than committed. zlib-licensed: no notice needs to travel with a shipped
 binary, so `packaging/licenses.sh` (daemon-only regardless) is untouched.
 
 **Read-aloud's engine and model** (ARCH-111) come the same way, with more to
@@ -298,8 +296,8 @@ and that machine then persists no credential at all (headless / no D-Bus). They 
 | **Debian** | `bookworm-slim` | Runtime base of the container image (glibc 2.36, above the binary's 2.34 floor) | mixed (base OS) | https://www.debian.org |
 | **Litestream** | 0.5.17 | In the image only: streams `openchime.db` to the deployment's bucket and restores it onto a box that has none, to `<prefix>/db` when the deployment writes its `replica-*` files (ARCH-3, ARCH-39; CONFIG.md); a separate program, not linked into the daemon | Apache-2.0 (its `LICENSE` ships in the image at `/usr/share/doc/litestream/LICENSE`) | https://github.com/benbjohnson/litestream |
 
-One image, and it is an **output** rather than a tool: the OCI image the release
-builds (ARCH-20/76), and anyone can build from a release tarball. Nothing is compiled in it: the Dockerfile
+One image, and it is an **output** rather than a tool: the OCI image the staging
+build builds and the release tags (ARCH-20/76), and anyone can build from a release tarball. Nothing is compiled in it: the Dockerfile
 lays the release tarball's daemon, speech data and web client onto the base
 (`packaging/image-context.sh`), so the image carries the same binary as the
 packages, and the arm64 image is built on the x86 runner with no emulation. It

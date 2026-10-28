@@ -9,7 +9,7 @@ and native frontends.
 | Model | Who runs the daemon | Depends on OpenChime-operated services |
 |---|---|---|
 | **Self-hosted stand-alone** | you | **none** — fully independent, and air-gappable. Federated-only features are absent, most visibly mobile push. |
-| **Self-hosted federated** | you | opt-in, per function: OIDC login, push delivery, invitation mail, the app directory, SCIM, an optional DNS name, package distribution. You still run the daemon and own **all message data**. |
+| **Self-hosted federated** | you | opt-in, per function: OIDC login, push delivery, invitation mail, an optional DNS name, package distribution. (An app directory and SCIM are specified, REQ-175 and REQ-253, and not built.) You still run the daemon and own **all message data**. |
 | **Hosted** | OpenChime | all of the above, operated for you. |
 
 In every model, **no OpenChime-operated service is ever in the message path** —
@@ -19,7 +19,7 @@ availability independence for capability, never message confidentiality
 (REQ-040/041).
 
 **Where this differs from the reference products.** Per-message read receipts
-("seen by", REQ-090) exist here and in neither Slack nor Pumble, which both
+("seen by", REQ-095) exist here and in neither Slack nor Pumble, which both
 decline them deliberately. Self-hosting, data residency and the three deployment
 models are ours alone — both references are single-cloud and SaaS-only. The
 clients are native C rather than Electron or web-tech. One thing is **not** a
@@ -85,6 +85,10 @@ participants' devices ([docs/CALLS.md](docs/CALLS.md), [docs/AUDIO.md](docs/AUDI
 
 Three published channels and a container image you build, one binary, one build id (ARCH-20): `openchimed --version` names the commit it was built from, and the release number is the label the packages carry. Packages are signed; the daemon
 runs under systemd as a transient user with its state in `/var/lib/openchime`.
+
+Release 1 published no packages and no release assets: the apt and dnf
+repositories, the tarballs and the Windows installer below start with release
+2. Until then, build from source ("Local build", below).
 
 **Debian / Ubuntu** — bookworm or 22.04 and newer:
 
@@ -205,17 +209,21 @@ make          # the daemon alone, in a minute or two: no speech, no summaries, n
 make full     # everything: read-aloud, voice input, summaries, the web client, and every client
 ```
 
-Requires a C toolchain, and curl with network access on the first build:
-SQLite is in `third_party/`, and mbedTLS is fetched pinned and checksummed by
-`scripts/build/mbedtls.sh`; both are built once.
-`make full` also needs CMake, a C++17 compiler, Python 3, git, curl and xz; it
-fetches its own pinned Emscripten, llvm-mingw and zig (`mk/toolchains.mk`), and
-its first run compiles ONNX Runtime (about 20 minutes). The switches it turns
+Requires a C toolchain, Python 3, bzip2, and curl with network access on the
+first build: SQLite is in `third_party/`, and mbedTLS is fetched pinned and
+checksummed by `scripts/build/mbedtls.sh` (a `.tar.bz2`); both are built once.
+Python 3 generates the sources the daemon embeds (its web page and password
+list).
+`make full` also needs CMake, a C++17 compiler, git, xz and nasm (libvpx's x86
+assembly); it fetches its own pinned Emscripten and llvm-mingw
+(`mk/toolchains.mk`), and its first run compiles ONNX Runtime (about 20
+minutes). The switches it turns
 on (`TTS`, `STT`, `SUM`, `WEB`) are remembered in `build/.features`, so a later
 `make` rebuilds the same daemon; one at a time works too (`make SUM=1`), and
 `make distclean` forgets them. `make ARCH=aarch64` cross-builds the daemon for
 arm64 into `build/aarch64/` (build only), and `make RELEASE=1` builds the host's
-as the release does, with zig against glibc 2.34.
+as the release does, with zig against glibc 2.34; zig is fetched only for
+these two and for `make check-release-cc`.
 `make OC_BUILD_ID=<commit>` stamps the build id into `openchimed --version`;
 an unstamped build reports `dev`. There is one build: the tests, the GUI and
 web harness and the demo scripts run it with `OPENCHIME_MODE=development`,
@@ -315,9 +323,13 @@ directly:
 make run
 ```
 
-This builds the daemon and the TUI, then starts a dev daemon on
-`127.0.0.1:8443` with its database and blobs under `/tmp/openchime-dev` and two
-bootstrap users (`alice/pw`, `bob/pw`). Connect with the TUI it just built,
+This builds the daemon and the TUI, then starts a dev daemon on port 8443
+(health on 8080) with its database and blobs under `/tmp/openchime-dev` and two
+bootstrap users (`alice/pw`, `bob/pw`). **It listens on every interface
+(`0.0.0.0` and `[::]`), not only on loopback**: the daemon has no bind-address
+setting, so anyone who can reach this machine on port 8443 can sign in with
+those passwords. Run it only on a trusted network, or behind a host firewall
+that blocks 8443 and 8080 from outside. Connect with the TUI it just built,
 and sign in as `alice` / `pw` (in the browser or with a device code):
 
 ```

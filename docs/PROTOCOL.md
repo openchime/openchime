@@ -63,6 +63,10 @@ hardcode: a client resolves the port with this precedence —
 2. a **`port` field in `.well-known` metadata**, if present;
 3. otherwise **`OC_DEFAULT_PORT` = 443**.
 
+A port typed with the workspace name (`chat.example.com:8443`) outranks all
+three: the client connects to that host and port and looks up neither SRV nor
+`.well-known`.
+
 **An address is not discovered.** A workspace typed as an IP address — IPv4
 (`192.0.2.7`, `192.0.2.7:8443`) or IPv6 in brackets (`[2001:db8::7]`,
 `[2001:db8::7]:8443`; a bare `2001:db8::7` is accepted too, without a port) —
@@ -378,7 +382,7 @@ new one.
 | Field          | Type | Notes                                                       |
 |----------------|------|-------------------------------------------------------------|
 | `source`       | str  | The challenge entry's `id`.                                 |
-| `redirect_uri` | str  | Where the browser is sent back. **Loopback only** (RFC 8252): `http://127.0.0.1`, `http://localhost` or `http://[::1]`, an optional port, an optional path. Anything else is refused. |
+| `redirect_uri` | str  | Where the browser is sent back. **Loopback** (RFC 8252): `http://127.0.0.1`, `http://localhost` or `http://[::1]`, an optional port, an optional path; or, where the daemon serves the web client, that client's own `https://<host>/app/` on the host the page was loaded from. Anything else is refused. |
 | `challenge`    | str  | `base64url(SHA-256(verifier))`, 43 characters, of a random verifier the client keeps. |
 
 The daemon answers `AUTH_REDIRECT`:
@@ -389,7 +393,9 @@ The daemon answers `AUTH_REDIRECT`:
 
 or a non-fatal `ERROR`: `AUTH_SOURCE_UNAVAILABLE` (no such source, or the box is
 enrolled nowhere to send a browser), `AUTH_INVALID_TOKEN` (a `redirect_uri` that is
-not loopback, or a `challenge` of the wrong shape).
+neither loopback nor the web client's, or a `challenge` of the wrong shape), or,
+for a direct connection, `AUTH_RATE_LIMITED` (16 sign-ins already under way from
+this address, or 256 in all).
 
 ### 4.2b `AUTH_CONTINUE` (server → client), msg_type `0x0017`
 
@@ -534,9 +540,15 @@ the daemon returns the original `SEND_ACK` (same `message_id`). A dropped
 connection before the first ack is therefore safely retryable with the same
 token.
 
-Errors: `BODY_TOO_LARGE`, `UNKNOWN_CHANNEL`, `NOT_A_MEMBER` (REQ-031),
+Errors: `UNKNOWN_CHANNEL`, `NOT_A_MEMBER` (REQ-031),
 `SEND_RATE_LIMITED` (REQ-190) — all non-fatal `ERROR` frames carrying the
 offending `idempotency_token` in `context` (§8) so the client can correlate.
+
+**The body's size is not checked on `SEND` today.** `BODY_TOO_LARGE` (3001) is
+defined but the daemon does not send it: a body longer than `MAX_BODY_SIZE` that
+still fits in a frame is stored and answered with `SEND_ACK`, and the
+`BROADCAST` encoder then refuses it, so the message reaches no other member. A
+client must not send a body over `MAX_BODY_SIZE`.
 
 ### 5.2 `SEND_ACK` (server → client), msg_type `0x0021`
 
@@ -707,15 +719,17 @@ owner, and not after the window (the hold is then purged). Every connected
 member is sent **`MSG_RESTORED` (server → client), msg_type `0x00FB`**, which is
 `BROADCAST`'s layout — the message whole, with its original time and its files —
 and replaces the tombstone in place. Its reactions return too, seen at the next
-history load; a pin and link previews do not come back. Refusals are the same
-non-fatal `ERROR`s as below: `FORBIDDEN` for someone else's delete,
-`UNKNOWN_MESSAGE` once the hold is gone.
+history load; a pin, link previews and a poll do not come back (a delete drops
+the poll). The deleter must still be a member of the channel. Refusals are the
+same non-fatal `ERROR`s as below: `FORBIDDEN` for someone else's delete or a
+deleter who has left the channel, `UNKNOWN_MESSAGE` once the hold is gone.
 
 Errors for both `EDIT` and `DELETE` are non-fatal `ERROR` frames carrying the
 offending `message_id` (8 bytes, big-endian) in `context` so the client can
 correlate: `UNKNOWN_MESSAGE` (no such message in the channel, or it is already
-tombstoned) or `FORBIDDEN` (not the author — and, for delete, neither the author
-nor a channel moderator who belongs to the channel).
+tombstoned), `FORBIDDEN` (not the author — and, for delete, not a member of the
+channel, or neither the author nor a moderator), or `CHANNEL_ARCHIVED` (a closed
+encrypted DM).
 
 ### 5.7 Channel management (REQ-050, REQ-031, REQ-033)
 
@@ -726,11 +740,14 @@ and the read/post gate:
 
 - **Read** (backfill, §6) a channel: allowed if it is public **or** the user is
   a member (REQ-031). Private channels reveal nothing to non-members.
-- **Post** (`SEND`/`EDIT`/`DELETE`): a member may always post; posting to a
-  **public** channel the user has not joined **auto-joins** them (so subsequent
-  broadcasts reach them); a **private** channel the user does not belong to
-  rejects with `NOT_A_MEMBER`. A `channel_id` that does not exist rejects with
-  `UNKNOWN_CHANNEL`.
+- **Post** (`SEND`/`SEND_REPLY`/`UPLOAD_BEGIN`, and minting a webhook): a member
+  may always post; posting to a **public** channel the user has not joined
+  **auto-joins** them (so subsequent broadcasts reach them); a **private**
+  channel the user does not belong to rejects with `NOT_A_MEMBER`. A
+  `channel_id` that does not exist rejects with `UNKNOWN_CHANNEL`.
+- **Edit and delete** do not use that rule and never auto-join: `EDIT` is the
+  author's alone, and `DELETE` answers anyone who is not a member of the channel
+  with `FORBIDDEN` (§5.5/5.6).
 
 Each operation below is acknowledged with a **`CHANNEL_INFO` (server → client),
 msg_type `0x0051`** describing the channel and the caller's membership:
@@ -871,8 +888,12 @@ skim — and it is per *channel*, not per DM, so the ordinary sidebar can use it
 > reason a client that caches nothing (ARCH-88) must be able to render the
 > sidebar and the channel's About surface from the list alone.
 
-**An archived channel is read-only** for every writer. `SEND`, `SEND_REPLY` and
-`UPLOAD_BEGIN` share one access check and all return `CHANNEL_ARCHIVED` (3019).
+**An archived channel takes no new posts.** `SEND`, `SEND_REPLY`,
+`UPLOAD_BEGIN`, `CREATE_WEBHOOK` and `EDIT_POLL` share one access check and all
+return `CHANNEL_ARCHIVED` (3019), as does free-talk voice input. Changes to what
+is already there are not refused: `EDIT`, `DELETE`, `REACT`, a vote and `PIN`
+still work in an archived channel (the first four return `CHANNEL_ARCHIVED` only
+in a closed encrypted DM).
 The incoming-webhook post cannot use that check — it is the one writer with no
 user behind it, and going through it would also re-test the creator's
 membership — so it tests the same archived helper directly and answers
@@ -902,7 +923,7 @@ authenticated user.
 
 | Field       | Type            | Notes                                                        |
 |-------------|-----------------|--------------------------------------------------------------|
-| `count`     | u16             | Number of entries.                                           |
+| `count`     | u16             | Number of entries: at most 512 (`OC_USER_LIST_MAX`), with no paging; a workspace with more users gets the first 512. |
 | `entries[]` | `count` × entry | See below. |
 
 Each entry, in wire order:
@@ -939,9 +960,10 @@ change roles, only an owner may grant/revoke owner, an admin may only
 promote/keep members; demoting the last owner is refused (`LAST_OWNER`, REQ-030).
 On success the actor is acked with **`USER_UPDATED` (server → client), msg_type
 `0x0045`** `{ user_id: u64, role: u8, disabled: u8 }`, and the same frame is
-pushed to every signed-in connection, the affected user's among them, so their
-client updates its capabilities immediately and every roster shows the person as
-they now are.
+pushed to the affected user's connections, so their client updates its
+capabilities immediately. Nobody else is told: other clients see the new role
+at their next `LIST_USERS`. (Removing a user and bringing one back, below, are
+pushed to every signed-in connection.)
 
 **`INVITE_USER` (client → server), msg_type `0x0043`** `{ role: u8, email: str, uses: u16 }` — owner/admin
 only (only an owner may invite at admin/owner role). With `email` empty it mints an
@@ -1049,7 +1071,8 @@ On success the daemon fans a **`REACTION_UPDATED` (server → client), msg_type
 
 **`LIST_REACTIONS` (client → server), msg_type `0x002A`**
 `{ channel_id: u64, message_id: u64 }` — replies **`REACTIONS` (server → client),
-msg_type `0x002B`** with the full reactor list for inspection (REQ-071):
+msg_type `0x002B`** with the reactor list for inspection (REQ-071), at most
+1024 entries (`OC_REACTION_LIST_MAX`):
 
 | Field        | Type            | Notes                                             |
 |--------------|-----------------|---------------------------------------------------|
@@ -1058,8 +1081,9 @@ msg_type `0x002B`** with the full reactor list for inspection (REQ-071):
 | `entries[]`  | `count` × entry | Each: `emoji` (str) + `user_id` (u64), ordered by emoji then user. |
 
 Failures are non-fatal `ERROR` frames carrying the `message_id` (8 bytes,
-big-endian) in `context`: `UNKNOWN_MESSAGE` (no such message, or it is
-tombstoned — a tombstone's reactions are cleared, §5.6), `NOT_A_MEMBER` (cannot
+big-endian) in `context`: `UNKNOWN_MESSAGE` (no such message, or, for
+`REACT`, it is tombstoned — a tombstone's reactions are cleared, §5.6, so
+`LIST_REACTIONS` on one answers an empty `REACTIONS`), `NOT_A_MEMBER` (cannot
 read the channel), or `INVALID_REACTION` (empty/oversized emoji).
 
 ### 5.9a Pins (REQ-230, ARCH-90)
@@ -1172,7 +1196,7 @@ not sending it. Search pages the same way (§5.11).
 | `media_kind`    | u8   | `1` for a video message (§5.14a), else `0` — so the view can list it as video. |
 | `duration_ms`   | u32  | A video message's length; `0` otherwise.              |
 
-**`channel_id` 0 means "every channel I can read"** — the same query with a
+**`channel_id` 0 means "every channel I am a member of"** — the same query with a
 membership filter instead of a channel filter, which is what makes a
 workspace-wide files view free rather than a second op.
 
@@ -1187,8 +1211,9 @@ disk (ARCH-88), and both change from other clients.
 Both are **per-user** surfaces, and neither fans out to anyone else.
 
 **`SAVE_ITEM` (client → server), msg_type `0x0062`** `{ message_id: u64, op: u8 }`
-(`1` save, `0` unsave). You may save anything you can read; a tombstone cannot be
-saved. Replies **`SAVED_UPDATED` (`0x0063`)** `{ message_id, op, saved_at }` **to
+(`1` save, `0` unsave). You may save anything in a channel you are a member of
+(`NOT_A_MEMBER` otherwise, even for a public channel you can read; `FORBIDDEN`
+in an encrypted DM); a tombstone cannot be saved. Replies **`SAVED_UPDATED` (`0x0063`)** `{ message_id, op, saved_at }` **to
 the actor only** — a personal bookmark has no one to announce it to. Saving twice
 is a no-op and reports the **original** `saved_at`, so a list ordered by when you
 saved does not reshuffle when you click again.
@@ -1220,9 +1245,10 @@ read as `0`, so a client that sends no filter keeps working.
 
 The feed is a **union of four queries** over existing rows (the fourth, the
 person's summary notices), not a maintained
-list (ARCH-95). `seen_at` is the watermark **as it was before this call** — the
-server stamps the current time as part of answering, so a client compares each
-`at` against it to mark what is new. That is deliberately coarser than per-item
+list (ARCH-95). `seen_at` is the watermark **as it was before this call** — on the
+involved-me filter (`0`) the server stamps the current time as part of answering;
+filters `1`–`3` read it without stamping — so a client compares each `at`
+against it to mark what is new. That is deliberately coarser than per-item
 read state, which would require the table ARCH-95 argues against.
 
 ### 5.9d Fetch-around, for permalinks (REQ-232, ARCH-96)
@@ -1339,7 +1365,8 @@ thread:
 | `last_reply_at`| u64  | Timestamp of the most recent reply, ms UTC. |
 
 `SEND_REPLY`/`LIST_THREAD` failures are non-fatal `ERROR` frames:
-`UNKNOWN_MESSAGE` (no such parent, or it is tombstoned), `NOT_A_MEMBER` /
+`UNKNOWN_MESSAGE` (no such parent, or, for `SEND_REPLY`, it is tombstoned —
+`LIST_THREAD` still lists the replies under a deleted root), `NOT_A_MEMBER` /
 `UNKNOWN_CHANNEL` (cannot post to / read the channel).
 
 A `THREAD_REPLY` also drives a notify decision (REQ-061): the reply's root goes
@@ -1425,7 +1452,8 @@ self-correcting and never fatal.
 client marks *this connection* online (`1`) or away (`2`); `offline` is not
 settable (it is implied by disconnect). The server recomputes the user's
 aggregate status — **online** if any of their connections is active, **away** if
-all are away, **offline** once the last closes — and, if it changed, broadcasts.
+all are away, **offline** once the last closes — and announces it on every
+`SET_PRESENCE`, changed or not.
 A connection's broadcasts are limited to 5 per 10 seconds. The change itself is
 always recorded; a broadcast past the limit is sent once the window allows,
 carrying the status as it stands by then, so the last one always reaches
@@ -1495,14 +1523,18 @@ with `TRANSFER_CANCEL`. Chunk `data` is bounded so each frame stays
    upload targeting a channel/DM it can post to. The server authorizes
    membership, checks `total_size <= MAX_ATTACHMENT_SIZE`, allocates an
    `attachment_id` + opaque storage key, and opens a streaming write to object
-   storage. **Idempotent on `(channel_id, idempotency_token)`**, as `SEND` is: a
+   storage. **Idempotent on `(channel_id, uploader, idempotency_token)`** — as `SEND` is,
+   but keyed on the uploader too, so one member is never handed another's row: a
    retry after a dropped connection returns the *same* `attachment_id` and the
    same storage key rather than allocating a second attachment, because the
    client that retries is one that never heard the first answer and whose next
    move is to stream the bytes. The token is held on the attachment row
    (migration 0037) rather than in a side map, so it is reclaimed with the row —
    a map would outlive a storage-swept attachment and hand back a dead id. On
-   failure → `ERROR` (`FORBIDDEN`, `ATTACHMENT_TOO_LARGE`, …).
+   failure → `ERROR`: `UNKNOWN_CHANNEL`, `NOT_A_MEMBER` or `CHANNEL_ARCHIVED`
+   (post access, §5.7), `FORBIDDEN` (an encrypted DM), `ATTACHMENT_TOO_LARGE`,
+   `STORAGE_FULL`, `DEMO_LIMIT`, or `TRANSFER_PROTOCOL` (another transfer in
+   flight, which the refusal also aborts).
 2. **`UPLOAD_READY` (S → C), `0x0081`** `{ attachment_id: u64, chunk_size: u32,
    window_bytes: u32 }` — the server advertises the max `data` per chunk and the
    **in-flight window**: the client may have at most `window_bytes` of un-acked
@@ -1677,7 +1709,9 @@ A first request **renders**, which takes about six tenths of the spoken duration
 and the answer arrives when it is done; later requests for the same text in the
 same voice are served from the cache. Two listeners asking at once cost one
 render. One transfer at a time per connection, as for an attachment: a second
-`AUDIO_GET` mid-stream is `TRANSFER_PROTOCOL`.
+`AUDIO_GET` mid-stream is refused with `TRANSFER_PROTOCOL`, and the refusal also
+aborts the transfer that was running (as a second `UPLOAD_BEGIN` or
+`DOWNLOAD_BEGIN` does).
 
 Refusals are `ERROR` frames carrying the message id in `context`:
 `NOT_RENDERABLE` 3023 when the message has nothing to say — a bare attachment,
@@ -1697,6 +1731,12 @@ one at a time per connection. Refusals carry `context` 0: `TTS_UNAVAILABLE` 3024
 when read-aloud is off, the queue is full, the connection is past 60 renderings
 a minute, or `voice_id` is not one `TTS_INFO` listed, and `TRANSFER_PROTOCOL` when another transfer is in flight.
 
+The `TTS_UNAVAILABLE` refusals above come from a daemon built with read-aloud. A
+daemon built without it (`TTS=0`, the plain build's default) has no handler for
+`AUDIO_GET` or `VOICE_PREVIEW_GET`: either frame is answered with a fatal
+`UNEXPECTED_MSG_TYPE` and the connection is closed. A client sends them only when
+`CAPABILITIES` lists `tts`.
+
 ### 5.14c Voice input (REQ-296–300, ARCH-112)
 
 The client sends a segment of speech it has already cut at a pause. In **push to
@@ -1714,7 +1754,8 @@ input is not offered, which is the `stt` capability's to say.
 1. **`STT_BEGIN` (C → S), `0x00E4`** `{ segment_id: u32, mode: u8, channel_id: u64,
    thread_root: u64, idempotency_token: 16B, sample_count: u32 }` — `mode` `0` push
    to talk, `1` free talk; `thread_root` `0` for the channel itself. In free talk the
-   target is checked with the post access `SEND` uses, before any audio is accepted.
+   target is checked with the post access `SEND` uses once `STT_END` arrives, before
+   recognition; `STT_BEGIN` itself checks no access.
    16 kHz mono signed 16-bit little-endian PCM follows.
 2. **`STT_CHUNK` (C → S), `0x00E5`** `{ segment_id: u32, seq: u32, data: bytes }` —
    sequential from `seq` 0, each frame `<= MAX_FRAME_SIZE`.
@@ -1751,7 +1792,8 @@ endpoint** the third party posts to.
 **`CREATE_WEBHOOK` (C → S), `0x0059`** `{ channel_id: u64, label: str }` — an
 authenticated member of `channel_id` mints a webhook (same post access as
 sending). `label` is a human note. Fails (`ERROR`) with `UNKNOWN_CHANNEL` /
-`NOT_A_MEMBER` if the caller can't post there.
+`NOT_A_MEMBER` if the caller can't post there, `CHANNEL_ARCHIVED` for an
+archived channel, or `FORBIDDEN` for an encrypted DM.
 
 **`WEBHOOK_INFO` (S → C), `0x005A`** `{ webhook_id: u64, channel_id: u64, token:
 bytes }` — the minted **32-byte token, shown once**. Only its SHA-256 is stored
@@ -2060,7 +2102,8 @@ notified on. Priority people pierce a level and a pause but never a mute
 
 The whole profile in one frame, because it is edited on one screen and
 committed by one button — a field-at-a-time wire would let Cancel mean "some of
-it stuck". An empty field CLEARS that column: the user deleted it, which is a
+it stuck". An empty field CLEARS that column (except `voice_id`, where empty keeps the
+stored voice, so a client that knows nothing of read-aloud cannot clear it): the user deleted it, which is a
 thing they did, and is a different fact from never having set it.
 
 **`SET_AVATAR` (C → S), `0x0078`** — Point my avatar at an already-uploaded attachment, or clear it. (REQ-240; the image travels via the REQ-140 upload path)
@@ -2079,7 +2122,8 @@ a client that is not running cannot clear its own status.
 
 `SET_AVATAR` takes an **attachment id, never bytes**, so the upload path's dedup,
 size cap and reclamation all keep working. The id is validated rather than
-trusted: it must exist, be finalized, carry an `image/*` MIME type, **and have
+trusted: it must exist, have a non-zero size (the size declared at `UPLOAD_BEGIN`; the
+daemon does not check that the upload finished), carry an `image/*` MIME type, **and have
 been uploaded by the caller**. That last check is load-bearing — avatars are
 readable workspace-wide, so without it a member could point their avatar at
 somebody else's private-channel attachment.
@@ -2217,6 +2261,7 @@ client never offers an action that would fail.
 
     count (u16), then count x { invite_id (u64), role (u8), created_at (u64), expires_at (u64), created_by (u64), uses (u16), used (u16) }
 
+`created_at` is always `0`: the daemon does not store when an invite was made.
 `uses` is how many may redeem it (`0`: no limit) and `used` how many have (REQ-026);
 an invite leaves the list when its last use is taken.
 
@@ -2909,7 +2954,9 @@ caller's *member* channels and sends each its newest page.
 ### 6.2 Replay and `BACKFILL_DONE` (server → client), msg_type `0x0031`
 
 In response, the server streams ordinary `BROADCAST` frames (§5.3) for every
-message with `message_id > after_message_id` in each requested channel, in
+top-level message with `message_id > after_message_id` in each requested channel
+(thread replies are not replayed: they come with `LIST_THREAD`, and their parents
+carry `THREAD_META`), in
 ascending `message_id` order per channel, then sends a single `BACKFILL_DONE`
 to mark the catch-up complete.
 
@@ -3004,8 +3051,8 @@ and field-by-field; no struct is `memcpy`'d onto the wire.
 | `u16`   | 2 bytes, big-endian.                                                      |
 | `u32`   | 4 bytes, big-endian.                                                      |
 | `u64`   | 8 bytes, big-endian.                                                      |
-| `str`   | `u16` byte-length `n`, then `n` bytes of UTF-8 (no NUL terminator). `n <= 65535`. Used for short strings (client info, error messages, JWT). |
-| `lstr`  | `u32` byte-length `n`, then `n` bytes of UTF-8. Used for message bodies, which may exceed a `u16` length. `n <= MAX_BODY_SIZE`. |
+| `str`   | `u16` byte-length `n`, then `n` bytes of UTF-8 (no NUL terminator). `n <= 65535`. Used for short strings (client info, error messages). |
+| `lstr`  | `u32` byte-length `n`, then `n` bytes of UTF-8. Used for message bodies, which may exceed a `u16` length (a body's `n <= MAX_BODY_SIZE`), and for tokens (the JWT in `AUTH`, the device token). |
 | `bytes` | `u32` byte-length `n`, then `n` raw bytes.                                |
 | `idem`  | Exactly 16 raw bytes (a 128-bit client-generated idempotency token); no length prefix, since the width is fixed. |
 
@@ -3042,8 +3089,8 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `1006` | `VERSION_MISMATCH`    | post-hello | yes   | A post-handshake frame carried a `version` other than the negotiated one. Distinct from `1001`/`1002`, which answer a `HELLO` and precede a session: this says the peer agreed and then sent something else. The `ERROR` itself is stamped with the negotiated version, so it is readable by the peer being disconnected. |
 | `2001` | `AUTH_REQUIRED`       | post-hello | yes   | A messaging frame arrived before successful `AUTH`.            |
 | `2002` | `AUTH_INVALID_TOKEN`  | auth       | on `AUTH` | JWT failed signature/audience/expiry validation (REQ-023).     |
-| `2003` | `AUTH_RATE_LIMITED`   | auth       | on `AUTH` | Too many auth attempts for this tenant (REQ-191).              |
-| `2004` | `USER_LIMIT`          | auth       | yes   | Workspace at its registered-user cap (`OPENCHIME_MANAGED_MAX_USERS`); a new user cannot be created. An existing user still logs in. |
+| `2003` | `AUTH_RATE_LIMITED`   | auth       | on `AUTH` | Too many attempts from this address (or, for a password on the sign-in page, for this account), or too many direct sign-ins under way from this address (REQ-191). |
+| `2004` | `USER_LIMIT`          | auth       | yes   | Workspace at its registered-user cap (`OPENCHIME_MANAGED_MAX_USERS`); a new user cannot be created. An existing user still logs in. Also sent, non-fatal, to an owner or admin whose `ENABLE_USER` would take a seat past the cap. |
 | `2005` | `AUTH_NOT_ALLOWED`    | auth       | yes   | A valid identity that no join rule or invite admits (AUTH.md §8.4). An identity the workspace already knows still signs in. |
 | `2006` | `AUTH_SOURCE_UNAVAILABLE` | auth   | on `AUTH` | `AUTH_BEGIN` named a source this deployment does not offer, or one it cannot reach; or a password came in a frame, where the daemon takes one only on its pages (AUTH.md §8.10). |
 | `2007` | `AUTH_PENDING` | auth   | no    | A device code not approved yet (§4.2c). |
@@ -3052,10 +3099,10 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `2010` | `AUTH_DENIED` | auth   | no    | A device code refused on the page. |
 | `2011` | `AUTH_USE_PROVIDER` | auth | yes | A sign-in by emailed code for a person who signs in here with a provider; they sign in with that provider instead (AUTH.md §8.4). |
 | `2012` | `AUTH_SETUP_REQUIRED` | auth | — | Pages only: a local account with no second step where `OPENCHIME_MFA=required` (AUTH.md §8.6). |
-| `3001` | `BODY_TOO_LARGE`      | messaging  | no    | `SEND` body exceeded `MAX_BODY_SIZE`.                           |
+| `3001` | `BODY_TOO_LARGE`      | messaging  | no    | Defined for a `SEND` body over `MAX_BODY_SIZE`, but not sent by the daemon today: such a body is stored and acked, and not broadcast (§5.1). |
 | `3002` | `NOT_A_MEMBER`        | messaging  | no    | Sender is not a member of the target channel (REQ-031).        |
 | `3003` | `UNKNOWN_CHANNEL`     | messaging  | no    | `channel_id` does not exist in this tenant.                    |
-| `3004` | `SEND_RATE_LIMITED`   | messaging  | no    | Per-connection rate exceeded (REQ-190): sends; also reactions (§5.9) and call signalling (§5.17). |
+| `3004` | `SEND_RATE_LIMITED`   | messaging  | no    | Per-connection rate exceeded (REQ-190): sends; also reactions (§5.9), poll votes, encrypted-DM (`PDM_*`) frames, voice-input segments and call signalling (§5.17). |
 | `3005` | `FORBIDDEN`           | admin/msg  | no    | The actor may not perform the action — role (ARCH-60, §6) or not the message's author (§5.5/5.6). |
 | `3006` | `LAST_OWNER`          | admin      | no    | Would remove or demote the tenant's last owner (REQ-030).      |
 | `3007` | `UNKNOWN_MESSAGE`     | messaging  | no    | `EDIT`/`DELETE` names a message not in the channel, or already tombstoned (§5.5/5.6). |
@@ -3070,7 +3117,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3016` | `UNKNOWN_WEBHOOK`     | webhook    | no    | No such (or disabled) incoming webhook token (REQ-170). |
 | `3017` | `CHANNEL_EXISTS`      | channel    | no    | `CREATE_CHANNEL` name already taken, compared case-insensitively (REQ-040). |
 | `3018` | `TOO_MANY_PINS`       | channel    | no    | The channel already holds 100 pins (REQ-230, ARCH-90). |
-| `3019` | `CHANNEL_ARCHIVED`    | channel    | no    | The channel is archived and read-only (REQ-035). Returned by `SEND`, `SEND_REPLY` and `UPLOAD_BEGIN`; **not** by the webhook post path. |
+| `3019` | `CHANNEL_ARCHIVED`    | channel    | no    | The channel is archived and read-only (REQ-035). Returned by `SEND`, `SEND_REPLY`, `UPLOAD_BEGIN`, `CREATE_WEBHOOK`, `EDIT_POLL` and free-talk voice input, and by `EDIT`, `DELETE`, `REACT` and a vote in a closed encrypted DM. A webhook post into an archived channel is refused with HTTP `403`, not an `ERROR` frame. |
 | `3020` | `INVALID_MESSAGE`     | messaging  | no    | Nothing to send — an empty body on a scheduled message (REQ-224). |
 | `3021` | `MEDIA_INVALID`       | attachment | no    | `ATTACH_MEDIA_SET` refused: kind, bounds, type, already sent, or poster (§5.14a). |
 | `3022` | `MEDIA_TOO_LARGE`     | attachment | no    | The video exceeds the workspace's video cap, `WORKSPACE_INFO`'s `max_video_size` (§5.14a). |

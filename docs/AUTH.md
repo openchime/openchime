@@ -70,7 +70,9 @@ authority.
   the common passwords of that length in SecLists' list of a million
   (`third_party/pwlist`, compiled in, compared without regard to case), not one
   character repeated, and not containing the username or the workspace's name
-  (when four characters or more) or "openchime". Nothing else: spaces and every
+  (when four characters or more) or "openchime" (a reset on `/account/reset`
+  checks every rule but the username one: it does not pass the account's
+  username to the check, which sign-up and a change do). Nothing else: spaces and every
   printable character are allowed, there are no composition rules, and a
   password never expires. The page says the rule beside the field, and why a
   password was refused. Every password, set or presented, is normalized the
@@ -162,7 +164,7 @@ authority.
 
 ## 3. OIDC via the central service and relay (ARCH-56)
 
-For social login (Google and Microsoft Entra, per REQ-021/022, and a code
+For social login (Google and Microsoft Entra, per REQ-021, and a code
 mailed to the address) without
 each operator registering provider apps.
 
@@ -392,7 +394,9 @@ active.
 `OPENCHIME_PUSH_URL` (central's push gateway) delivers
 mobile push (REQ-132/133). The daemon owns a device-token registry
 (`REGISTER_DEVICE_TOKEN`); a committed SEND drives an off-hot-path worker that selects
-recipients (members − author, level=ALL, not in DND, holding a token), signs a
+recipients (members − author, past their notification level — ALL, or
+MENTIONS when the message mentions them; a priority person pierces it — not
+muted, not in DND, holding a token), signs a
 **contentless** batch with the enrollment key — the same request-signature scheme
 central verifies (§8.7) — and POSTs it to
 the gateway, which relays to APNs/FCM and returns stale tokens to prune. Absent in
@@ -424,7 +428,8 @@ token on reconnect), the daemon then does the same thing:
   without a full re-auth. The session lifetime is the daemon's to set (REQ-181) —
   it is not tied to a provider token's expiry.
 - **Lifetime (REQ-181):** a session lives 30 days from its sign-in
-  (`OC_SESSION_TTL_MS`, a constant: nothing varies it); the writer can also
+  (`OC_SESSION_TTL_MS`), or a day in demo mode (`OC_DEMO_SESSION_TTL_MS`,
+  §8.12); no setting varies it. The writer can also
   refuse — and delete — one unused for a given time at its next use, which the
   daemon sets to no limit. "Unused" is measured: a session's
   `last_seen_ms` is written at its sign-in and then, while its connection sends
@@ -501,7 +506,8 @@ Deliberate omissions from this design:
   air-gapped-safe.
 - **Cert-vs-restore interaction** (a self-signed daemon's certificate changing
   when a database is restored onto a new box): handled by persisting the TLS
-  identity in the database (ARCH-66b); orthogonal to auth.
+  identity in the box's identity database, kept and replicated apart from the
+  data (ARCH-66b); orthogonal to auth.
 
 ---
 
@@ -896,9 +902,9 @@ OpenChime client collects a password, and the sign-in ends, as the relay's does,
 with the client holding an ID token.
 
 **The daemon as an issuer.** At first start the daemon makes a P-256 key and an
-issuer name (`openchime-local:<random>`) and keeps them in the database
-(`local_issuer`, SCHEMA.md migration 0050), so a restored database still verifies
-what it signed. Its token has the relay token's shape (§8.3): `iss` its name,
+issuer name (`openchime-local:<random>`) and keeps them in the box's identity
+(`local_issuer`, SCHEMA.md migrations 0050 and 0064), apart from the data, so it
+survives the data being restored. Its token has the relay token's shape (§8.3): `iss` its name,
 `aud` `openchime-client`, `sub` `local|<user id>`, `nonce` the client's PKCE
 challenge, a fresh `jti`, and a life of 120 seconds; ES256, `kid` the key's
 thumbprint.
@@ -1068,7 +1074,8 @@ and the relay's keys are what vouch for them.
   joined (30, 500; each ends after 20 minutes), invitations (10, 50),
   summaries (5, 100), and for the workspace alone push notifications (5,000)
   and invitations mailed (20). Past one, the thing is refused with `ERROR
-  DEMO_LIMIT` (3037) and a sentence saying which limit -- a refusal is the
+  DEMO_LIMIT` (3037) (a summary: a `SUMMARY` marked unavailable) and a
+  sentence saying which limit -- a refusal is the
   product too -- or, for push and mail, quietly not sent. The counts are held
   in memory; a restart forgets the day.
 - **Sessions** last a day rather than thirty.

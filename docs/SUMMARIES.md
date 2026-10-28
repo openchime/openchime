@@ -392,9 +392,9 @@ could not be started on this server.") and they are offered no more.
 
 **A hosted model** (`OPENCHIME_SUMMARY=cloud:<url>,<model>`, `daemon/sum_cloud.c`). The same
 pipeline, with each call sent to an OpenAI-style chat-completions API instead of
-the model in the daemon: the same system and user prompt, `temperature` 0 and
-the call's answer cap (`max_tokens`), and nothing else, so any such API answers
-it. The grammar is not sent: the shape is asked for in the prompt and held by the
+the model in the daemon: the same system and user prompt, `stream` false, `temperature` 0 and
+the call's answer cap (`max_tokens`), and nothing else (bar the reasoning-off
+field below, once one was needed), so any such API answers it. The grammar is not sent: the shape is asked for in the prompt and held by the
 parser, as for every answer. The prompt is the same for every model: nothing in
 it is written for one. A server's context per request must hold `SUM_CTX_TOKENS`.
 The prompt and the span's messages leave the box.
@@ -417,8 +417,10 @@ A `<think>` block a model opens its answer with anyway is dropped.
 A server that asks for a pause (429) or fails (500, 502, 503, 504), or cannot
 be reached, is sent the same request again after a wait: the seconds its
 `Retry-After` names, else 2, 4, 8, 16 and 32, never more than
-`SUM_CLOUD_WAIT_MAX_S` (60), at most `SUM_CLOUD_RETRIES` (5) times, so under
-three minutes in all; one log line a wait, and the gate is asked through it.
+`SUM_CLOUD_WAIT_MAX_S` (60), at most `SUM_CLOUD_RETRIES` (5) times: about a
+minute of waiting in all when the server names no pause (2 + 4 + 8 + 16 + 32
+seconds), up to five minutes when it names long ones, besides the time each
+try itself may take (up to `SUM_CLOUD_TIMEOUT_MS`); one log line a wait, and the gate is asked through it.
 Still failing after the last, the server's answer is the error. Anything else
 the server answers is not tried again. A request someone is waiting on waits
 the same way. A provider's rate limit therefore slows a large span rather than
@@ -527,7 +529,8 @@ the form is §7.2.
 **What to tell a user choosing a hosted model.**
 
 - Any OpenAI-style chat-completions API works; the request is `model`,
-  `messages`, `temperature` 0 and `max_tokens`, nothing else.
+  `messages`, `stream` false, `temperature` 0 and `max_tokens`, plus the
+  reasoning-off field when one was needed, nothing else.
 - The model is named by its provider's name, exactly (the `<model>` in `OPENCHIME_SUMMARY=cloud:<url>,<model>`).
   Changing it remakes every summary.
 - A model that reasons before answering is told not to at startup, through
@@ -541,7 +544,8 @@ the form is §7.2.
   some of the time, the larger commercial ones most.
 - A provider's rate limit (429) or outage (5xx) is waited out: the same
   request is sent again after the pause the server names or a doubling one,
-  up to five times and under three minutes in all, one log line a wait. A span
+  up to five times: about a minute of waiting by default, up to five
+  minutes when the server names longer pauses, one log line a wait. A span
   that still fails keeps the pieces it finished for the next try.
 - A large span's final call takes 15 to 40 s on a 70B-class API model; the
   chunk calls before it are made ahead of time for the last 7 days (§4, §5) and on demand for older ranges.

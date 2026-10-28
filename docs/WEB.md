@@ -31,7 +31,7 @@ and judges no certificate -- the browser judged the origin's. mbedTLS still
 links, for the sign-in hashing and the call keys, built for wasm once beside
 the native build (`scripts/build/mbedtls_wasm.sh`). The core's own Emscripten
 branches are few: the connection's setup (`net.c`), SRV lookup (`resolve.c`, a
-browser has no resolver), `poll` (`sock.h`, Emscripten's reports and never
+browser has no resolver), `poll` (`shared/sock.h`, Emscripten's reports and never
 waits, so a timeout is a loop of short sleeps on the network thread), the call
 engine starting on the connection (`call/call_engine.c`, no UDP), the VP9
 encoder's thread count (`media/vp9.c`) and the camera backend, which the page

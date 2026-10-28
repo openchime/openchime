@@ -30,8 +30,8 @@ conversation may join its call. There is no ringing and no answering: a call is
   within the cap.
 - **Ending.** A call ends when the last person leaves, or when its **starter ends it** for
   everyone.
-- **Missed calls.** A call that ends with nobody but its starter ever having joined leaves
-  a **"Missed call"** line in the conversation's history, authored by the starter (§4).
+- **Missed calls.** A call that invited someone and ends with nobody but its starter ever
+  having joined leaves a **"Missed call"** line in the conversation's history, authored by the starter (§4).
 - **The cap.** At most ten people in a call (`OC_CALL_MAX`; development mode may set
   `OPENCHIME_DEV_CALL_MAX`, 2 to 32). A join or an invitation past it is refused with `CALL_FULL`. In a public demo a call ends after twenty minutes, and each person may join thirty a day (AUTH.md §8.12).
 - **One call at a time.** A connection is in at most one call; joining another leaves the
