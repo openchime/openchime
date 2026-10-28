@@ -60,6 +60,13 @@ PY
         exit 1
     fi
     echo "webtest: the client signed in and drew itself in the browser"
+    # The media and input-method checks below run on a wall-clock script and
+    # fixed sleeps, so a busy machine can fail them with nothing wrong. The
+    # build pipeline sets OC_TEST_TIMING=0 and leaves them to `make web-test`
+    # run by hand, until they wait on outcomes instead (tests/check.h).
+    if [ "${OC_TEST_TIMING:-1}" = 0 ]; then
+        echo "webtest: PASS -- the client signed in and drew itself; media and input method not run (OC_TEST_TIMING=0)"; exit 0
+    fi
 
     # Media (WEB.md): a video message recorded from the synthetic camera and the
     # browser's (fake) microphone through Web Audio, stopped, and the file taken

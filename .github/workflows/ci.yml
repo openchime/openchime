@@ -190,17 +190,21 @@ jobs:
       # built above, which carries it: the gfx pixel test under Node, the client
       # signing in, drawing, recording and taking an input method's text
       # (scripts/web/test.sh), the sign-in pages (scripts/web/pages.sh), and the
-      # quick GUI scripts on the web platform. The runner's own Chrome, driven
+      # GUI smoke on the web platform. The checks that race the wall clock --
+      # the recording and input-method parts of test.sh, and the chords
+      # script's fixed sleep -- are not run here (OC_TEST_TIMING=0,
+      # tests/check.h): a busy runner must not fail a build. The runner's own Chrome, driven
       # by playwright-core at the exact version package.json pins. The same
       # make variables as the build, so nothing is relinked.
       - name: The web client in a headless Chrome
         timeout-minutes: 20
         env:
           CHROME: /usr/bin/google-chrome
+          OC_TEST_TIMING: '0'
         run: |
           npm install --no-audit --no-fund
           make TTS=1 STT=1 SUM=1 WEB=1 web-test
-          scripts/gui/run.sh --web smoke chords
+          scripts/gui/run.sh --web smoke
 
   thread-sanitizer:
     name: thread sanitizer

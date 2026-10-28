@@ -428,6 +428,8 @@ int main(void) {
     if (g_ran == 0) { printf("\nFAILED: the selection names no suite\n"); return 1; }
     print_times();
     g_skips += oc_test_skips;   /* the suites run in this process */
+    const char *timing = getenv("OC_TEST_TIMING");
+    if (timing && strcmp(timing, "0") == 0) printf("\ntiming-dependent checks not judged (OC_TEST_TIMING=0): make test judges them\n");
     if (g_skips) printf("\n%d check(s) skipped: see the SKIP lines above (in CI each is a failure)\n", g_skips);
     if (total == 0) { printf("\nOK: all suites passed\n"); return 0; }
     printf("\nFAILED: %d check(s) across all suites\n", total);

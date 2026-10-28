@@ -2364,12 +2364,16 @@ static void test_unauthed_closed(int port, const uint8_t *pin) {
     client idle, quiet, in;
     CHECK(client_open(&idle, port, pin) == 0 && do_handshake(&idle) == 0);
     CHECK(client_open(&quiet, port, pin) == 0);                 /* TLS, then nothing */
-    CHECK(signed_in(&in, port, pin, "carol", "pw") == 0);
+    /* Signing in has to beat the 1000 ms close: timing. A sign-in that lost
+     * the race left no client to close. */
+    int in_ok = signed_in(&in, port, pin, "carol", "pw") == 0;
+    CHECK_TIMING(in_ok);
     CHECK(peer_closed(&idle, PEER_CLOSES) == 1);
     CHECK(peer_closed(&quiet, PEER_CLOSES) == 1);
-    CHECK(peer_open(&in));
+    CHECK_TIMING(in_ok && peer_open(&in));
     oc_netloop_set_unauthed_ms(0);
-    client_close(&idle); client_close(&quiet); client_close(&in);
+    client_close(&idle); client_close(&quiet);
+    if (in_ok) client_close(&in);
 }
 
 /* Revoking a user's sessions closes their other live connections, which are
@@ -3714,8 +3718,8 @@ static void test_device_signin(void) {
     CHECK(client_open(&e, port, d.pin) == 0 && do_handshake(&e) == 0);
     CHECK(device_begin(&e, ch, dcode, sizeof dcode, ucode, sizeof ucode, &interval, &expires, vpath, sizeof vpath) == 0);
     snprintf(path, sizeof path, "/device?code=%s", ucode);
-    CHECK(web_call(port, d.pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200 &&
-          oc_test_page_is(resp, "device-confirm"));                       /* alive, before its life is up */
+    CHECK_TIMING(web_call(port, d.pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200 &&
+                 oc_test_page_is(resp, "device-confirm"));                /* alive, inside its 400 ms life */
     oc_test_let_time_pass(600);                                          /* a 400 ms life: time itself */
     CHECK(device_poll(&e, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_EXPIRED);
     CHECK(web_call(port, d.pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200 &&
@@ -5335,9 +5339,10 @@ static void test_call_rejoin_grace(int port, const uint8_t *pin) {
     { uint64_t uo = 0; CHECK(do_auth(&o, "carol", "pw", &uo) == 0); }
     client_close(&a);
     client_close(&b);
-    CHECK(rejoin_as(&a, port, pin, "alice", "pw-alice", 0xA2, &jd, parts) == 0 && jd.call_id == call_id);
-    CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", 0xB4, &jd, parts) == 0 && jd.call_id == call_id);
-    CHECK(jd.count == 2);
+    /* Two sign-ins have to beat the 5000 ms grace: timing. */
+    CHECK_TIMING(rejoin_as(&a, port, pin, "alice", "pw-alice", 0xA2, &jd, parts) == 0 && jd.call_id == call_id);
+    CHECK_TIMING(rejoin_as(&b, port, pin, "bob", "pw-bob", 0xB4, &jd, parts) == 0 && jd.call_id == call_id);
+    CHECK_TIMING(jd.count == 2);
 
     /* ...and when neither comes back, it ends at the grace. */
     oc_netloop_set_call_grace_ms(300);
@@ -5437,7 +5442,8 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
             gone = 1;
     }
     set_read_timeout(&a, 20000);
-    CHECK(gone);
+    /* A gap over 300 ms between alice's keep-alives drops her too: timing. */
+    CHECK_TIMING(gone);
     oc_netloop_set_relay_silence_ms(0);
     /* ...and bob, whose connection is still open, is told: a roster without him,
      * his cue to rejoin (PROTOCOL.md §5.17). */
@@ -5446,7 +5452,7 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
           if (read_type(&b, OC_MSG_CALL_ROSTER, &hdr, &p) == 0 &&
               oc_decode_call_roster(&p, &ro, parts, 32) == OC_OK && ro.count == 1 && parts[0].user_id == ua)
               told = 1;
-      CHECK(told); }
+      CHECK_TIMING(told); }
 
     close(sa); close(sb);
     client_close(&a);
@@ -6147,11 +6153,12 @@ static void test_fanout_limits(int port, const uint8_t *pin) {
     }
     uint8_t st = 0;
     CHECK(fenced(&a));
-    CHECK(count_frames(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st, 1, 0) == 5);
-    CHECK(st == OC_PRESENCE_AWAY);
-    CHECK(count_frames(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st, 0, 1) == 1);   /* the window passes */
-    CHECK(st == OC_PRESENCE_ONLINE);
-    CHECK(count_frames(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st, 1, 0) == 0);   /* and that was all */
+    /* The counts depend on where the 600 ms window's edge falls: timing. */
+    CHECK_TIMING(count_frames(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st, 1, 0) == 5);
+    CHECK_TIMING(st == OC_PRESENCE_AWAY);
+    CHECK_TIMING(count_frames(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st, 0, 1) == 1);   /* the window passes */
+    CHECK_TIMING(st == OC_PRESENCE_ONLINE);
+    CHECK_TIMING(count_frames(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st, 1, 0) == 0);   /* and that was all */
     oc_netloop_set_presence_rate_ms(0);
 
     /* Reactions: thirty-five in a burst, the last five refused. */

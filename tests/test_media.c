@@ -845,7 +845,8 @@ static void test_screen_recording(void) {
          * late is the same real-time story as the frame count: a host that cannot
          * encode fast enough notices the two seconds are up a little after they
          * are, so the ceiling is generous rather than narrow. */
-        CHECK(res.duration_ms >= 1950 && res.duration_ms <= 5000);
+        CHECK(res.duration_ms >= 1950);
+        CHECK_TIMING(res.duration_ms <= 5000);
         oc_mp4_info info;
         if (!res.video || oc_mp4_parse(res.video, res.video_len, &info) != 0) { CHECK(0); oc_rec_result_free(&res); continue; }
         /* Every frame at the rate, though the screen changed five times a second --

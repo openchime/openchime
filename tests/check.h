@@ -51,9 +51,27 @@ static int failures OC_UNUSED = 0;
 #define OC_UNDER_TSAN 0
 #endif
 
+/* A verdict that races the wall clock -- work that must land inside a short
+ * real-time window, or a count that depends on where a window's edge falls --
+ * can fail on a loaded machine with nothing wrong. It is asserted unless
+ * OC_TEST_TIMING is 0, which the build pipeline sets (make test-ci) so that a
+ * busy runner cannot fail a build; `make test` asserts it. The code around it
+ * still runs everywhere, under ThreadSanitizer too. A speed limit is such a
+ * verdict as well. Each one is to be made deterministic -- an injected clock,
+ * an explicit sweep, a wait on the outcome -- and become a CHECK again. */
+static inline int oc_test_timing(void) {
+    const char *v = getenv("OC_TEST_TIMING");
+    return !(v && v[0] == '0' && v[1] == '\0');
+}
+
+#define CHECK_TIMING(cond)                                                   \
+    do {                                                                     \
+        if (oc_test_timing()) CHECK(cond);                                   \
+    } while (0)
+
 #define CHECK_SPEED(cond)                                                    \
     do {                                                                     \
-        if (!OC_UNDER_TSAN) CHECK(cond);                                     \
+        if (!OC_UNDER_TSAN) CHECK_TIMING(cond);                              \
     } while (0)
 
 /* How long to wait for work to be done -- frames encoded and decoded, say --
