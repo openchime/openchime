@@ -753,7 +753,7 @@ where there is one — and neither starts a browser sign-in unasked.
   store also **erases any `state.db` an older build left behind**, so upgrading
   costs one re-sign-in (and a self-signed daemon's certificate asked about again)
 rather than leaving a plaintext credential
-  on disk. macOS Keychain slots behind the same vtable.
+  on disk. No macOS Keychain backend is written.
 
 **One credential per workspace holds six things**, in a flat versioned blob
 (`SEC_VER`) rather than a schema:

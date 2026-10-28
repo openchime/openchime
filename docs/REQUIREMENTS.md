@@ -44,8 +44,7 @@ where one exists.
 - "Deployment model" means one of the three shapes defined in ARCH-76:
   **self-hosted stand-alone** (no dependency on any OpenChime-operated
   service), **self-hosted federated** (operator runs the daemon and owns all
-  message data, opting in to OpenChime-operated services for OIDC, push, invitation
-  mail, the app directory, SCIM, an optional DNS name, and packages), and **hosted**
+  message data, opting in to the OpenChime-operated services ARCH-76 lists), and **hosted**
   (OpenChime operates the daemon and those services). A requirement that
   applies to only some models says so.
 - Cross-references cite the implementing decision as `(ARCH-N)`.
@@ -120,7 +119,7 @@ where one exists.
   that activity in a workspace the user is not currently looking at has still
   arrived and been counted as unread — the switcher has therefore shown live
   unread state rather than state as of the last visit. Each workspace's
-  connection, credentials, model, and cached history have stayed isolated from
+  connection, credentials and model have stayed isolated from
   every other's; nothing has crossed between them (REQ-040).
 - **REQ-015.** Per-workspace view state — the focused channel, scroll position,
   and a partly-typed message — has survived switching away and back, so that a
@@ -270,33 +269,21 @@ where one exists.
   address, or the token) and when it expires.
 - **REQ-034.** Each channel has carried an optional human-set **topic/
   description** — a short line shown in the channel header — set by a channel
-  member. It is metadata on the channel, distinct from the channel name.
-  **Mechanism (ARCH-93, migration 0024):** a `topic` column, set with
-  `UPDATE_CHANNEL`; **any member may set it** — it is already visible to the
-  channel and a wrong one is corrected in seconds. An empty value clears it.
-  Capped at 250 bytes and shown on the channel header's second line.
+  member. It is metadata on the channel, distinct from the channel name
+  (ARCH-93, PROTOCOL.md §5.7a).
 
   Beside the topic, a channel has also carried a **long-form description** — its
   purpose, its norms, the links it keeps coming back to — which the one header
   line cannot hold. Any member may set it, on the same reasoning; it is up to
-  1,000 bytes, may run to several lines, and is shown in the channel's About.
-  **Mechanism (ARCH-93, migration 0046):** a `description` column, set with
-  `UPDATE_CHANNEL`'s `OC_CHUP_DESCRIPTION` and fetched on its own frame rather
-  than carried on the channel list. It is readable by exactly the people who may
-  read the channel.
+  1,000 bytes, may run to several lines, and is shown in the channel's About. It
+  is readable by exactly the people who may read the channel (ARCH-93).
 - **REQ-035.** A channel has been **archivable** by an owner or admin: an
   archived channel has become read-only and hidden from the default channel list
   while its history remained searchable and retrievable (REQ-031/080), and it has
   been restorable. Archiving (reversible) is distinct from deletion, which is not
-  offered for channels holding history. **Mechanism (ARCH-93, migration 0024):**
-  `archived_at_ms` non-NULL *is* the flag, so "when" is free and unarchive is one
-  NULL write. Read-only holds for **every** writer. Send, threaded reply
-  and attachment upload inherit it from `channel_post_access` and return
-  `CHANNEL_ARCHIVED`; the incoming webhook is the one writer with no user behind
-  it, so it cannot use that check — going through it would also re-test the
-  creator's membership — and tests the same archived helper directly, answering
-  `403`. The webhook itself is untouched, so unarchiving restores it. Hidden from the channel list for non-members; a
-  member keeps it (and the way back). Owner/admin only.
+  offered for channels holding history. Read-only has held for **every** writer,
+  the incoming webhook included; a member has kept an archived channel in their
+  list, and the way back (ARCH-93, PROTOCOL.md §5.7a).
 - **REQ-036a.** A channel's **visibility has been changeable** by an owner/admin —
   public to private and back — without touching its membership or its history.
   **Mechanism (ARCH-93):** two ops (`OC_CHUP_PRIVATE` / `OC_CHUP_PUBLIC`)
@@ -312,14 +299,8 @@ where one exists.
   which way it went without opening the row.
 - **REQ-036.** A channel has been **renamable** by an owner/admin, the rename applying everywhere the
   channel is shown without breaking membership, history, or permalinks (REQ-232).
-  The name is distinct from the topic (REQ-034). **Mechanism (ARCH-93):** owner/admin
-  only, and the channel **id is untouched**, so membership, history and delivery
-  cursors follow the rename with no work (tests/test_dbwriter.c pins it: same id,
-  history replayed after the rename).
-  Migration 0020's unique-name index applies exactly as it does to a create, so a
-  collision returns `CHANNEL_EXISTS`. **Deliberately no name-history table** — a
-  permalink (REQ-232) must key on the id, not on a name that was always mutable
-  (ARCH-93).
+  The name is distinct from the topic (REQ-034). A rename keeps the channel id
+  and is refused on a name already taken (ARCH-93).
 - **REQ-037.** A deployment has been able to admit **guest accounts** — users
   restricted to one channel (single-channel guest) or an explicit set
   (multi-channel guest) rather than the whole tenant — created and scoped by an
@@ -367,11 +348,8 @@ where one exists.
   **storage and default behaviour**: where messages live, and that nothing reads
   them unless the tenant said so — not that content can never be inspected.
 
-  A **self-hosted federated** deployment (ARCH-76) has additionally depended on
-  OpenChime-operated services for functions it opted into — OIDC login
-  (ARCH-56), push delivery (ARCH-16), invitation mail (ARCH-85), the app directory (REQ-175), SCIM
-  (REQ-253), an optional DNS name and the workspace/audience registry (ARCH-14),
-  and package distribution (ARCH-20). Each of these has brokered only
+  A **self-hosted federated** deployment has additionally depended on the
+  OpenChime-operated services it opted into (ARCH-76). Each of these has brokered only
   **identity, notification, discovery, or provisioning metadata**: which user
   signed in to which workspace, that a notification is due and for whom, which
   integrations exist, which accounts to provision. **None has carried message
@@ -423,13 +401,9 @@ where one exists.
   A tombstone has also dropped everything that hung off the body — its
   reactions, its pins, and **its attachments**. For two minutes the person who
   deleted a message has been able to **restore** it, body, files and reactions
-  back in place (files the storage sweep has already reclaimed excepted).
-  **Mechanism:** what the tombstone gives up — body, attachment
-  ids, reactions — is held for two minutes in `deleted_holds` (migration 0052),
-  during which the deleter may take it back (`RESTORE`); pins and link previews
-  are not restored, and an encrypted DM's message is not held. Its attachments
-  are detached (`message_id` NULL), the orphan state the storage sweep (ARCH-78)
-  reclaims.
+  back in place (files the storage sweep has already reclaimed excepted;
+  PROTOCOL.md `RESTORE`, SCHEMA.md migration 0052, PRIVATE-DM.md for an
+  encrypted DM, ARCH-78).
 
 - **REQ-053.** Full message history has had no retention cutoff or paid-tier
   history cap of the kind Slack's free tier imposes.
@@ -725,10 +699,8 @@ where one exists.
 ## 5. Notifications
 
 - **REQ-130.** Each user has been able to independently set a notification
-  level — all messages, mentions only, or none — per channel they belong to.
-  Mechanism (ARCH-72): `SET_NOTIFY_PREF` stores the level in `notification_prefs`
-  (server-authoritative), and a `NOTIFY_PREFS` snapshot syncs it to all the
-  user's devices.
+  level — all messages, mentions only, or none — per channel they belong to,
+  the same on all their devices (ARCH-72).
 - **REQ-131.** Absorbed by **REQ-136**, the single recurring quiet-hours
   mechanism: a daily do-not-disturb window is REQ-136's *Every day* mode with one
   start and end. What this requirement contributes survives there — quiet hours
@@ -760,12 +732,8 @@ where one exists.
 - **REQ-134.** Each user has had a **global (workspace-default) notification
   level** — all / mentions / none — applying to every channel lacking an explicit
   per-channel override (REQ-130), so a user has not had to set each channel
-  individually. Where a per-channel level was set, it has won. Mechanism:
-  `users.notify_default` (migration 0028), `SET_NOTIFY_DEFAULT` (0x0077), carried on
-  every `NOTIFY_PREFS` snapshot so no client infers it, and honoured by the push
-  decision as `COALESCE(np.level, u.notify_default)`. Storage is on `users` rather
-  than a sentinel row in `notification_prefs`: a default is a property of the person,
-  and a channel_id of 0 in a table keyed by channel is a trap for every later query.
+  individually. Where a per-channel level was set, it has won (ARCH-72, SCHEMA.md
+  migration 0028).
 - **REQ-135.** A user has been able to define **keyword (highlight-word)
   notifications** — terms that notify them regardless of a channel's level
   (REQ-130/134) — and to designate **priority people** whose messages always
@@ -838,33 +806,6 @@ where one exists.
   why both exist in every product that ships this and why REQ-131 alone left "DND
   until 5pm" unbuildable.
 
-  **The storage shape is already proven in-tree.** Custom status expiry
-  (REQ-122/241, migration 0027) solved exactly this problem: an absolute expiry
-  stamp, **enforced by the daemon on read** — because a client that is not
-  running cannot clear its own state, and an expired value that simply *reads* as
-  absent needs no clock on the reader's side and no sweep. A `dnd_until_ms`
-  column applied the same way costs the push worker one comparison it already
-  makes for the window. The client has computed the absolute instant (only it
-  knows the user's timezone, so "until tomorrow morning" is a different moment
-  per user), exactly as custom status does.
-
-  **Settled: match Slack's model, which its API states exactly.**
-  `dnd.info` exposes two independent mechanisms, and naming them apart is the
-  whole design:
-
-  | Slack | What it is | Ours |
-  |---|---|---|
-  | `dnd_enabled`, `next_dnd_start_ts`, `next_dnd_end_ts` | the **schedule** — recurring, planned | REQ-131 + REQ-136 |
-  | `snooze_enabled`, `snooze_endtime`, `snooze_remaining` | the **pause** — manual, one-shot | this requirement |
-
-  `dnd.setSnooze` takes **minutes from now**, so every preset is a duration and
-  the absolute instant is derived — 30 minutes, 1 hour, 2 hours, until tomorrow,
-  or a custom end time. `dnd.endSnooze` ends the pause early and is a distinct
-  act from `dnd.endDnd`, which ends the *current scheduled* period: two
-  mechanisms, two ways to cancel, and cancelling one has never cancelled the
-  other. Slack also carries `snooze_is_indefinite`, which its own reference says
-  cannot be set to true; we do not implement it.
-
   **A pause only ever ADDS silence.** It cannot un-silence someone inside their
   scheduled quiet hours — there is no "notify me anyway until 17:00" in Slack or
   in this requirement — so a pause and a schedule never disagree in a way needing
@@ -886,10 +827,7 @@ where one exists.
   do-not-disturb any sender can pierce is a weaker promise than the words
   suggest, and the legitimate need behind it is already served from the right
   side by the VIP list. Recorded here so the difference from Slack is a choice
-  rather than an omission.
-
-  **The storage** is `dnd_until_ms` on `users` beside the ARCH-72 window, the
-  proven pattern above. Ending early sets it to 0; there is no second op.
+  rather than an omission (ARCH-72; SCHEMA.md `dnd_until_ms`).
 - **REQ-279.** A workspace **owner or admin has been able to set default
   do-not-disturb hours** for the workspace, applying to members who have not
   configured their own, and **any member has been able to override them** with
@@ -945,14 +883,9 @@ where one exists.
 - **REQ-139.** A client has offered an **activity feed / notification inbox** — an
   aggregated, filterable view of @mentions (REQ-221), reactions to the user's
   messages (REQ-070), and thread replies (REQ-060/061) across all channels — so a
-  user has caught up on what involved them without scanning every channel.
-  **Mechanism (ARCH-95):** neither a client-side fold nor a maintained list — a
-  client-side fold is impossible for a client that stores nothing (ARCH-88), and a
-  maintained list would duplicate rows already indexed and add three write paths
-  that can drift. It is a **union of bounded queries** over `mentions`,
-  `reactions`, threaded `messages` and `summary_notices` (REQ-310), excluding your own actions and gated on
-  current membership. `users.activity_seen_ms` is a watermark — enough to mark
-  what is new, deliberately not per-item read state.
+  user has caught up on what involved them without scanning every channel; it has
+  also listed summary notices (REQ-310), left out the user's own actions and
+  marked what is new (ARCH-95).
 
   **The filter set is Slack's.** Mentions, reactions and thread replies answer
   "what involved me". Slack's Activity also answers "what have I not read",
@@ -1116,14 +1049,7 @@ where one exists.
   its eviction (REQ-215) or an operator's retention policy aged it out
   (REQ-250)**. In both exceptions the attachment's metadata has survived as a
   tombstone so the message stays intelligible; the *authorization* rule below is
-  unconditional and has never been relaxed for any reason. Mechanism (ARCH-69):
-  because every byte
-  is proxied through the daemon, access control is a **single in-daemon check on
-  the same membership path as reading the message** (`channel_read_access`) —
-  there is no signed-URL scheme, TTL, or object-store ACL. Proxying (not
-  presigned URLs) is forced by the island model (ARCH-4/26: the tenant's object
-  store stays private, and the daemon is the one endpoint a client trusts,
-  ARCH-10).
+  unconditional and has never been relaxed for any reason (ARCH-69).
 - **REQ-142.** A graphical client has **rendered image attachments inline** — a
   thumbnail in the transcript, expandable to a preview — rather than showing only
   a filename line, for the common image types. This is a graphical-frontend
@@ -1134,15 +1060,8 @@ where one exists.
 - **REQ-143.** A user has been able to browse a channel's **files** — a view
   listing the attachments shared in a channel (and, per-user, files they shared or
   that were shared with them) — building on the attachment metadata already
-  stored (REQ-140, SCHEMA.md migration 0009). **Mechanism (ARCH-91):** `LIST_FILES`
-  streams a channel's shared files newest-first, or (channel 0) every channel the
-  caller can read; migration 0023 adds the one index that access pattern needed.
-  Pending uploads are excluded, reclaimed rows are listed and flagged. Filtering
-  by type is client-side over the returned `mime`. The answer comes a page at a
-  time (200 rows) and says whether more remain; the client
-  asks for the next page with the keyset cursor the last row it holds gives it,
-  and the Win32 files view offers "Load more" while there are more, so a channel
-  with thousands of files can be browsed past the first page.
+  stored (REQ-140, SCHEMA.md migration 0009). A channel with thousands of files
+  has been browsable past the first page (ARCH-91, PROTOCOL.md `LIST_FILES`).
 
 ### 6.2 Audio Conferencing
 
@@ -1417,14 +1336,7 @@ where one exists.
 - **REQ-170.** A third-party service has been able to post a message into a
   channel via an incoming webhook URL scoped to that channel, without that
   service holding a user session or JWT, over the embedded HTTP listener
-  (ARCH-32). Mechanism (ARCH-71): the URL is `POST /webhook/<token>` where the
-  token is 32 random bytes (hex), stored **hashed** (SHA-256) like a session and
-  minted per-channel by a member via `CREATE_WEBHOOK` (shown once). The payload
-  is `application/json {"text": "..."}` or a raw `text/plain` body, capped at
-  `OC_MAX_BODY_SIZE` (64 KiB); the message is posted as the webhook's creator. A per-token
-  fixed-window rate limit (60/min) bounds abuse. The endpoint is ALPN-demuxed on
-  the daemon's one TLS port (`OPENCHIME_PORT`, ARCH-54): the daemon advertises `oc/1` and `http/1.1`, and a
-  connection that doesn't negotiate `oc/1` is routed to the HTTP handler.
+  (ARCH-32, ARCH-71).
 - **REQ-171.** A tenant that takes webhooks has been able to present a
   CA-issued certificate on that endpoint, since third-party webhook senders
   validate against a standard CA trust store and can be told to trust nothing
@@ -1681,11 +1593,7 @@ keeps to its own share of the free space and gives it back under pressure
   stable reference (user id) that survives display-name changes, has highlighted
   for the mentioned party, and has driven notification delivery under the
   recipient's per-channel level (REQ-130) — the "mentions" notification level
-  *depends* on this feature. **Mechanism (ARCH-89):** the body stays plain UTF-8 with
-  the literal `@name`; migration 0021's `mentions` table carries the resolved id,
-  kind and byte span; `shared/mention.c` is the one scanner both sides link, so
-  highlight and notify cannot disagree. Known limitation: `@here` is treated as a
-  broadcast for *push*, because presence is not visible to the push worker.
+  *depends* on this feature (ARCH-89).
 - **REQ-287.** Mentioning someone who is **not in the channel** has
   never been silent. The sender has been told — privately, in a notice only they see, since
   it concerns their action and not the conversation — that the mention reached
@@ -1767,13 +1675,7 @@ keeps to its own share of the free space and gives it back under pressure
   arbitrary client-side fetches — consistent with the island model. **Unfurling
   is simply on — no switch, no per-tenant disable.** The safety this feature
   needs lives in the fetch itself (the SSRF gate and its caps), not in an off
-  button. **Mechanism (ARCH-105):** an in-daemon fetch worker behind
-  an SSRF gate, always on, the URL boundary rules shared (`shared/url.c`) so the
-  daemon unfurls exactly what a client links, the `UNFURL` frame fanned on fetch
-  completion and replayed on backfill/history, edits dropping stale previews.
-  The app-core folds the frame into the message model, and the **Win32 client
-  renders the card** — title and description under the message, the way Slack
-  lays them.
+  button (ARCH-105).
 - **REQ-223.** An unsent composer's contents (per channel/thread/DM) have been
   preserved as a **draft** across app restarts and, for a signed-in identity,
   synced across that user's devices, so a half-written message has not been lost.
@@ -1847,8 +1749,8 @@ keeps to its own share of the free space and gives it back under pressure
 
 - **REQ-225.** A user has been able to post a **poll** — a question with options
   other members vote on, results tallied and shown live — as a first-class message
-  type rather than via an external app. **Mechanism (ARCH-119, migration 0065):** a
-  poll is a message whose body is its question, posted anywhere a message goes —
+  type rather than via an external app (ARCH-119). A poll is posted anywhere a
+  message goes —
   a channel, a DM, a group DM or a thread — except an encrypted DM. It has two to
   ten options; its maker chooses whether several may be picked, whether it is
   anonymous, and an optional deadline, any date and time in their own time zone,
@@ -1871,30 +1773,15 @@ keeps to its own share of the free space and gives it back under pressure
 
 - **REQ-230.** Any channel member has been able to **pin** a message to its
   channel; pinned messages have been listed for the channel, visible to all
-  members, and unpinnable by a member or an admin. **Mechanism (ARCH-90):** migration
-  0022's `pins` table is keyed on the message, so a pin is channel state rather
-  than per-user; any member may pin or unpin (including someone else's pin), a
-  channel holds at most 100, and the list streams each pinned message with its
-  body. Pin state is replayed on backfill, so it survives a reconnect.
+  members, and unpinnable by any member, someone else's pin included; a channel
+  has held at most 100, and pin state has survived a reconnect (ARCH-90).
 - **REQ-231.** A user has been able to **save (bookmark)** any message they can
   read into a private, personal list for later retrieval, visible only to them.
-  **Mechanism (ARCH-95, migration 0025):** `saved_items` keyed `(user_id, message_id)`
-  — the deliberate mirror of a pin (ARCH-90), which is keyed on the message alone
-  because it belongs to the channel. Two people may save the same message and
-  neither sees the other's list; nothing is fanned out. Saving twice keeps the
-  original time, and leaving a channel stops its messages appearing in the list.
+  Leaving a channel has removed its messages from the list (ARCH-95).
 - **REQ-232.** Every message has had a stable **permalink** — an addressable
   reference resolving to the message in its channel/thread — that a client could
   follow to **jump to that message** in context, loading surrounding history as
-  needed. **Mechanism (ARCH-96):** the link is `openchime://<host>/c/<channel>/m/<id>`
-  — **ids, not names**, because a channel can be renamed (REQ-036) and a link
-  built from a name would rot the moment it was. The half that matters is
-  `HISTORY_AROUND`, a second mode on the history read that returns the messages
-  surrounding an id: every surface that points at a message (pins, files,
-  activity, saved items, search) otherwise dead-ends with "that message is
-  older than the loaded history". Registering the `openchime://` scheme with the
-  OS is an install-time act — a machine-wide registry write is not something a
-  chat client should do as a side effect.
+  needed, and has survived a channel rename (REQ-036; ARCH-96).
 - **REQ-233.** Folded into **REQ-283**, the single reminder requirement — one
   mechanism, one delivery path (the activity feed and the notify path, never a
   bot DM, per REQ-275).
@@ -1978,11 +1865,9 @@ messages (author name, ARCH-74).*
   `PROFILE_INFO` when a card is opened.
 - **REQ-241.** A user has been able to set a transient **custom status** — a
   short text plus an emoji, with an optional expiry — shown alongside their name
-  and presence (Section 4). **Mechanism** (migration 0027): `status_emoji` /
-  `status_text` / `status_expires_ms` on `users`, set with `SET_STATUS`, expiry
-  **enforced by the daemon on read** (a client that is not running cannot clear
-  its own state), carried on `PROFILE_INFO` and `USER_LIST`, and shown beside
-  names in the member pane and profile (REQ-122/240).
+  and presence (Section 4), beside names in the member pane and profile
+  (REQ-122/240); it has expired even while the user's client was not running
+  (SCHEMA.md migration 0027, PROTOCOL.md §5.16e).
 
 ---
 

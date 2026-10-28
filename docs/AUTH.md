@@ -57,14 +57,14 @@ authority.
   floor: 19 MiB of memory, two passes, one lane, a per-user random salt. Only
   the derived hash, the salt and the settings it was made with
   (`argon2id$v=19$m=19456,t=2,p=1`) are stored (`local_credentials`, migration
-  0062), so the settings can be raised without a format change; a hash with
+  0002, in this form since 0062), so the settings can be raised without a format change; a hash with
   settings this daemon does not make matches no password. **No OpenChime client
   collects a password.**
   It is typed only into the daemon's own sign-in page, in the system browser, and
   reaches the daemon only inside TLS — directly, or through the client's loopback
   tunnel (§8.10). It is never stored. A password in a frame is refused, in every
-  build: the protocol has no frame that carries one, and the test suites sign in
-  through the page as a person does (TESTING.md).
+  build: the protocol has no frame that carries one, and `AUTH{local}` is refused
+  with `AUTH_SOURCE_UNAVAILABLE` (§5).
 - **What a password must be** (NIST SP 800-63B rev 4, `daemon/pwpolicy.c`):
   15 to 128 characters, counted after Unicode NFKC normalization; not one of
   the common passwords of that length in SecLists' list of a million
@@ -111,9 +111,10 @@ authority.
   = unlimited). Creating a *new* user past the cap — by signing up with an invite or
   the setup token, by a first-time provider sign-in, or by bringing a removed
   member back — is refused with `ERROR USER_LIMIT`; an existing user still logs in, and a removed member
-  (`disabled=1`) frees a seat (the count is active users only). It is a cap a
-  host may set; only the daemon can enforce it
-  since only it holds the users table.
+  (`disabled=1`) frees a seat (the count is active users only). It is a managed
+  box's setting, refused without `OPENCHIME_MANAGED_TICKET` outside development
+  (CONFIG.md "A managed box"); only the daemon can enforce it, since only it
+  holds the users table.
 - **Brute-force protection (REQ-191):** the daemon rate-limits failed local-auth
   attempts per account **and** per source IP (`daemon/ratelimit.c`, fixed-window
   counters checked before the hash so a flood can't burn CPU), answering excess
@@ -291,9 +292,8 @@ keys**
 - it verifies the signature with mbedTLS (ES256 = ECDSA-P256, which mbedTLS
   supports directly; EdDSA/Ed25519 is not supported, so ES256 is the choice);
 - it chooses the key by the header's `kid` — the signing key's RFC 7638
-  thumbprint, which it computes for each key it holds — and refuses a token whose
-  `kid` is absent or names none of them (§8.3). The keys it holds are the ones
-  the relay publishes (§3.4) and, on a managed box, one pinned beneath them;
+  thumbprint, which it computes for each key it holds (§3.4) — and refuses a
+  token whose `kid` is absent or names none of them;
 - it checks `iss` (central's origin) and `aud` (== this workspace's enrolled opaque id —
   not its hostname — so a token minted for one workspace cannot be replayed at
   another);
@@ -454,8 +454,8 @@ After `WELCOME` and before `AUTH`, the daemon sends **`AUTH_CHALLENGE`**
 per source and replies with `AUTH`, whose `method` discriminator selects the path:
 
 - `local` — the method's number is kept for the challenge's listing; an `AUTH`
-  with it is refused (`AUTH_SOURCE_UNAVAILABLE`, fatal): a password is never in
-  a frame, and local accounts sign in in the browser (§8.10).
+  with it is refused (`AUTH_SOURCE_UNAVAILABLE`, fatal; §2), and local accounts
+  sign in in the browser (§8.10).
 - `oidc` — a browser sign-in. `AUTH_BEGIN` gets the authorize URL from the daemon;
   `AUTH` then carries an ES256 JWT and the verifier (§8.2): the central-issued one
   (§3.3) for the relay, or, with source `local`, the daemon's own (§8.10); with
@@ -604,13 +604,7 @@ whichever way they arrive.** A Microsoft identity is `<issuer>|<oid>` — the
 tenant's own stable id for the person — so it would be the same identity from any
 other relying party of that tenant.
 
-**Keys.** The relay's keys are the ones it publishes at `<origin>/oidc/jwks`,
-read at boot and daily (§3.4, `daemon/relaykeys.c`); a managed box may hold one
-more, pinned beneath them, in `OPENCHIME_MANAGED_RELAY_KEY`. A token's `kid` is
-the signing key's RFC 7638 thumbprint; the daemon computes the same thumbprint
-for each key it holds and verifies with the one that matches, refusing an unknown
-`kid`. Rotation is an overlap — publish the new key beside the old, switch the
-signer, retire the old — and reaches every enrolled daemon by itself.
+**Keys** and their rotation are §3.4; the key is chosen by `kid` (§3.3).
 
 **Which provider.** `/oidc/authorize` takes `workspace`, `redirect_uri` and
 `nonce`. Central sends the person straight to the workspace's provider when it has
@@ -999,10 +993,8 @@ may be reworded. The client's loopback answer page carries the same on its
 heading: `data-oc-result` `signed-in`, `refused` or `pending`
 (`client/core/signin.h`).
 
-**No password in a frame.** `AUTH{local}` is refused with
-`AUTH_SOURCE_UNAVAILABLE`, and the frames that once carried a password to sign
-up or change one (`0x0047`, `0x0049`) are retired, unknown to the daemon. The
-test suites and the GUI harness sign in as a person does: a helper plays the
+**No password in a frame** (§2). The test suites and the GUI harness sign in
+as a person does: a helper plays the
 browser against the page (`tests/testsignin.h`; `play_browser` in
 `scripts/gui/lib.sh`; `OPENCHIME_DEV_SIGNIN` for the web client) and the client
 presents the token the page ends with (TESTING.md).

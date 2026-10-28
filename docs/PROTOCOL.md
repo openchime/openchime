@@ -2333,7 +2333,7 @@ thread inside it, and threads are deliberately outside the main scroll (REQ-060)
 The follow and read acks return the one row that changed rather than a fresh
 list, so opening a thread does not cost the whole view.
 
-### 5.16j Forwards and link unfurls (REQ-057, REQ-222, ARCH-105)
+### 5.16j Forwards and link unfurls (REQ-057, REQ-222, ARCH-105, ARCH-117)
 
 **`FORWARD` (S → C), `0x00D9`** — what a forwarded message points at (REQ-057),
 fanned to the channel's members immediately behind the `BROADCAST` it describes.

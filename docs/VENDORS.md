@@ -110,8 +110,9 @@ daemon provably does not use.
 **Attribution when shipping binaries.** Building from source never triggered the
 vendored licences' notice requirements; distributing packages does. `openchimed`
 links **mbedTLS** (Apache-2.0), **Argon2**, **jsmn**, **picohttpparser**,
-utf8proc, SecLists' list, SQLite and the CA roots, and every channel ships their
-texts in full — `/usr/share/doc/openchimed/copyright` on Debian,
+utf8proc, qrcodegen, SecLists' list, SQLite and the CA roots, and, built with
+read-aloud, voice input or summaries, ONNX Runtime, libopus and llama.cpp
+beside the models' data; every channel ships their texts in full — `/usr/share/doc/openchimed/copyright` on Debian,
 `/usr/share/licenses/openchimed/copyright` on RHEL, `COPYRIGHT` in the tarball.
 `packaging/licenses.sh` reads them out of the trees the build actually used, so
 the notice cannot drift from what was linked, and it **fails the build** if a
@@ -171,7 +172,7 @@ has moved (`scripts/check/toolchains.sh`).
 | **Moonshine Tiny Streaming (English)** | CDN directory `quantized_26_08_21` | The voice-input recognizer: nine files — the frontend (model and weights), encoder, adapter, cross-attention and decoder graphs as int8 `.ort`, `tokenizer.bin`, `streaming_config.json` and the licence, about 45 MB — **shipped beside the daemon** as data in `stt/` | Daemon (voice input, ARCH-112) | https://github.com/moonshine-ai/moonshine | MIT (English models; the legacy non-streaming models for other languages are under a non-commercial licence and are not used) |
 | **Phonetisaurus** (+ OpenFst, MITLM in its wheel) | 0.3.0 | Trains ttskit's guesser. **Build tool for maintainers only**: never linked, never shipped, not needed to build OpenChime | `scripts/build/ttskit_data.sh` | https://github.com/AdolfVonKleist/Phonetisaurus | BSD-3-Clause (OpenFst Apache-2.0, MITLM MIT) |
 | **libc++** (LLVM, zig's bundled copy) | zig 0.13.0's | The C++ runtime ONNX Runtime and llama.cpp are compiled against in a release build, linked statically | Daemon (release build, with read-aloud, voice input or summaries) | https://github.com/llvm/llvm-project | Apache-2.0 WITH LLVM-exception (no notice required in binary form) |
-| **CMUdict** | commit `74790861` | Source of ttskit's pronunciation data, which is generated from it and **committed** (`ttskit/data/en-US/`, with its notice beside it) | Daemon (read-aloud) | https://github.com/cmusphinx/cmudict | BSD-style (two clauses) |
+| **CMUdict** | commit `74790861` | Source of ttskit's pronunciation data, which is generated from it and **committed** (`ttskit/data/en-US/`, its notice in `ttskit/data/CMUDICT-LICENSE`) | Daemon (read-aloud) | https://github.com/cmusphinx/cmudict | BSD-style (two clauses) |
 
 Fetched + built by `scripts/build/mbedtls.sh` from the official GitHub release
 tarball into `third_party/mbedtls-3.6.2/` (gitignored). Version pinned by
@@ -218,9 +219,8 @@ say because ONNX Runtime is the one C++ dependency and the model is large:
   linked against ONNX Runtime's **prebuilt** full release (also pinned; a build tool
   on the build machine only, `scripts/build/onnxruntime.sh converter`). The converted file is
   not byte-reproducible, so its input and the converter are what is pinned.
-- `make full` (or `make TTS=1`) assembles the converted model, the voices and ttskit's
-  data into `tts/` beside `openchimed`. A first `make` builds a daemon without any of it
-  (the switches are remembered in `build/.features` until changed or `make distclean`).
+- `make TTS=1` assembles the converted model, the voices and ttskit's data into
+  `tts/` beside `openchimed` (CONFIG.md "Build switches").
 
 ONNX Runtime (MIT, with its ThirdPartyNotices), Kitten (Apache-2.0) and CMUdict
 notices travel with every package through `packaging/licenses.sh`.
@@ -232,9 +232,8 @@ operator config (`daemon/ort.ops.config`) is the union of both models':
   dated CDN directory, and its licence from GitHub at a pinned commit, at pinned
   SHA-256s, refusing a mismatch. They load in ONNX
   Runtime 1.30.0 as published, so nothing is converted.
-- `make full` (or `make STT=1`) assembles them into `stt/` beside `openchimed` with a
-  manifest the daemon checks at startup. A first `make` builds a daemon without voice
-  input (the switches are remembered in `build/.features`).
+- `make STT=1` assembles them into `stt/` beside `openchimed` with a manifest the
+  daemon checks at startup.
 
 Moonshine's MIT notice travels with every package through `packaging/licenses.sh`.
 
@@ -248,8 +247,8 @@ dependency, built the same way:
   baseline. The archives are merged into one
   `third_party/llamacpp-0.5.0/lib/libllamacpp.a` beside `llama.h` and the ggml
   headers. It needs CMake 3.14+ and a C++17 compiler, and takes a few minutes. The
-  daemon links it with the same static C++ runtime as ONNX Runtime. `make full` (or
-  `make SUM=1`) builds it in; a first `make` leaves it out (the switches are remembered).
+  daemon links it with the same static C++ runtime as ONNX Runtime. `make SUM=1`
+  builds it in.
 - **The model is never shipped**: the daemon fetches it at the first start with
   summaries on, from its Hugging Face address, and checks a pinned SHA-256
   (SUMMARIES.md §6). The address names a branch (`resolve/main`), not a revision,
@@ -365,14 +364,8 @@ The Windows GUI is the portable application (`client/gui/app/`, ARCH-80) over
 
 ## 7. Why libvpx
 
-- **libvpx for screenshare** — the same library §1 commits for video messages,
-  additionally configured with screen-content tuning (`VP9E_SET_TUNE_CONTENT`)
-  for screenshare (REQ-161, ARCH-87). **Patent note:** it is preferred
-  to the alternatives as much for patents as for copyright — **openh264** is
-  BSD-licensed but Cisco's royalty arrangement covers only the binaries *Cisco
-  itself distributes*, so building from source leaves us exposed; **x264/x265**
-  are GPL; **AV1** (SVT-AV1 + dav1d, BSD) has the right licence, but its
-  real-time software encode costs too much.
+libvpx is the video codec for video messages and screenshare; why, and
+the alternatives rejected, are CALLS.md §6.4 (ARCH-87).
 
 ---
 

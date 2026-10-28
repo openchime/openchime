@@ -6,11 +6,9 @@ The branch, commit, and CI policy for this repo.
 reviewed; one that is taken is included in the next release candidate, with its
 author kept and their `Signed-off-by` beside the maintainer's, and its pull
 request is then closed, since its change reaches `staging` with that candidate.
-No automated check runs on a pull request on `openchime/openchime`: the
-checks, protections and builds this document describes (`pr policy`, `guard`,
-the staging build) run where the maintainers integrate a change, not on an
-outside pull request, so run the local checks below yourself before opening
-one.
+No automated check runs on a pull request on `openchime/openchime`: the checks
+under "CI" run where the maintainers integrate a change, so run the local
+checks below yourself before opening one.
 Most of this document is the maintainers' own workflow; an outside contributor
 needs "Before a pull request" and "Commits" (and "Adding a setting" for a new
 setting).
@@ -38,13 +36,10 @@ setting).
   naming the release. A merge does not close it — merged
   is not shipped. The PR body stays **empty**: the issue and the commit already
   say everything. `/oc-feature-finish` runs the sequence (below).
-- **The policy checks gate the merge, and nothing builds a pull request.**
-  Staging's branch protection requires the two policy checks, `pr policy` and
-  `guard`, and does not require the branch to be up to date with `staging`.
-  The build and the tests run in the next staging build, over everything
-  merged since; what stands between a change and `staging` is the local test
-  (below). Merge with a **squash merge** — no merge commits, history stays
-  linear. Delete the branch, local and remote, after.
+- **Merge with a squash merge** once the required checks pass ("CI") — no
+  merge commits, history stays linear. What stands between a change and
+  `staging` is the local test (below). Delete the branch, local and remote,
+  after.
 - **Documentation and workflow changes take the same path**: a branch, a pull
   request into `staging`, the same checks. Once merged, a documentation-only
   commit (`*.md` and `docs/`, except `docs/CONFIG.md`, which follows the
@@ -66,8 +61,7 @@ Locally, and in about 2 minutes, a pull request needs exactly this, which
    `staging` with an empty body.
 
 That is all. **The thread sanitizer, the release compiler, the Windows builds
-and the end-to-end run are the staging build's**, run by hand on `staging` after
-the merge, over every change merged since the last one; running them locally as
+and the end-to-end run are the staging build's** ("CI"); running them locally as
 well repeats that and costs the time it exists to save. `make test-ci` refuses
 to run outside CI. A change that risks them (threads, a new compiler idiom,
 Windows code) may run `make check-release-cc` or `make windows` locally first,
@@ -75,9 +69,7 @@ by choice: a failure in the staging build holds back everything merged with
 the change.
 
 **Before pushing a GUI change, run `scripts/gui/smoke.sh`** (TESTING.md
-"Reading the GUI smoke"): about ten seconds. The hook does not enforce it, and
-it is the only check of the Windows client; CI runs the same smoke on the web
-client only.
+"Reading the GUI smoke").
 
 ## Commits
 
@@ -141,8 +133,7 @@ does nothing unless `OPENCHIME_MODE=development` (CONFIG.md "Mode").
 
 ## Keeping CI small
 
-Nothing runs on its own but what must: a pull request runs one job,
-`pr policy`, and nothing at all runs on a push. The cheap checks are steps of a job a workflow already has, never jobs
+Nothing runs on its own but what must ("CI"). The cheap checks are steps of a job a workflow already has, never jobs
 of their own; no job waits on another workflow (a gate checks once and fails
 fast); every job has a timeout. A failure is found locally, not in CI:
 `/oc-feature-finish` runs `scripts/check/test.sh` (`make && make test`) before
@@ -152,25 +143,12 @@ change to `*.md`, `.gitignore` or `.claude/` alone excepted) and workflows
 are on once per clone: `git config core.hooksPath .githooks`, which
 `/oc-feature-start` checks.
 
-## From pull request to release
-
-A pull request into `staging` runs only `pr policy` and `guard` (the title,
-the empty body, an open `OC` issue, no issue number in the tree, the
-attribution scan) and is squash-merged.
-A maintainer then dispatches the staging build on `staging`: its gate checks
-the commits since the last release, `ci.yml` builds and tests the tip, and
-what a release ships is built and stored by build id. `release-candidate.yml`
-tags a stored build `release-N-rcK` and publishes it as a prerelease;
-`release.yml`, dispatched on that tag, publishes the same binaries as release
-N, appends a `Release N` snapshot to `main` (fast-forward only) and closes the
-issues it shipped. Between releases, `promote.yml` appends `Documentation`
-snapshots to `main`. Each step is below.
-
 ## CI
 
 Nothing runs on a pull request but **`pr policy`**, and nothing runs on a push.
-`pr-policy.yml` checks the pull request's title and body, and that the title
-names an open issue; the attribution scan is a step of it that posts
+`pr-policy.yml` checks the pull request's title and body, that the title
+names an open issue, and the tree's issue references (`scripts/check/refs.sh`,
+from the base branch); the attribution scan is a step of it that posts
 **`guard`**. These two are the required checks on `staging`, and the branch
 need not be up to date to merge.
 
@@ -188,10 +166,8 @@ calling `ci.yml`, two jobs on two machines at once:
   libm; starts it and drives it over TLS with the e2e client; compiles every
   Linux translation unit with the release's clang under `-Werror`
   (`check-release-cc`); runs the suites that start no threads
-  (`make test-ci PART=plain`, which runs the source checks first:
-  `scripts/check/opcodes.sh`, `refs.sh`, `make_targets.sh`, `config.sh`,
-  `release_lint.sh` and `tests_lint.sh`); and the web client in a headless
-  Chrome.
+  (`make test-ci PART=plain`, which runs `mk/tests.mk`'s `SOURCE_CHECKS`
+  first); and the web client in a headless Chrome (TESTING.md §3.4).
 - **`thread sanitizer`** — the suites that start threads, under
   ThreadSanitizer (`make test-ci PART=threads`); their only run in CI.
 
@@ -200,9 +176,11 @@ their data, the images, and the Windows clients (with the two Windows test
 programs) — and store the daemon trees, the Windows binaries and the images by
 commit; a stored build is what a release-candidate is made from. The packages
 and installers are built too, under a placeholder version, only to prove they
-build; a release makes them again under its number. Every vendored library is cached
-by the script that builds it, and the staging build's runs save the caches the
-next one restores.
+build; a release makes them again under its number. Every vendored library and
+toolchain is cached by the script that builds it, and the staging build's runs
+save the caches the next one restores; a cache unused for seven days is
+evicted. Once a month `toolchains.yml` files an issue when a pinned toolchain
+is behind upstream.
 
 **A failure there is everyone's.** It holds back every change merged since the
 last staging build: find the commit, fix it on a branch like any other change,

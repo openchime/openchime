@@ -86,10 +86,6 @@ participants' devices ([docs/CALLS.md](docs/CALLS.md), [docs/AUDIO.md](docs/AUDI
 Three published channels and a container image you build, one binary, one build id (ARCH-20): `openchimed --version` names the commit it was built from, and the release number is the label the packages carry. Packages are signed; the daemon
 runs under systemd as a transient user with its state in `/var/lib/openchime`.
 
-Release 1 published no packages and no release assets: the apt and dnf
-repositories, the tarballs and the Windows installer below start with release
-2. Until then, build from source ("Local build", below).
-
 **Debian / Ubuntu** — bookworm or 22.04 and newer:
 
 ```sh
@@ -161,9 +157,7 @@ runs only when the deployment writes the `replica-*` files under
 and a key
 (docs/CONFIG.md, ARCH-3), and without them the image starts the daemon alone.
 Releases publish no public image: build one from the tarball as above.
-Nothing is built in a container. Containers appear only in tests: the staging
-build runs the image it built, and the release's smoke installs from the dnf
-repository in a Rocky Linux 9 container. There is no Compose stack in this
+Nothing is built in a container, and there is no Compose stack in this
 repository.
 
 Upgrading, and what an upgrade changes: [docs/UPGRADING.md](docs/UPGRADING.md).
@@ -299,9 +293,8 @@ with keywords and priority people, cross-channel threads, the People directory
 and link-unfurl cards all run end to end with their daemon halves.
 
 **Two harnesses, and they answer different questions.** `scripts/gui/smoke.sh`
-asks whether the client boots and runs — fourteen assertions in about ten
-seconds, run by hand before pushing a client change, and deliberately kept that size: a suite that
-takes minutes is a suite that gets skipped. `scripts/gui/audit.sh` is the long one, walking every surface across
+asks whether the client boots and runs, in about ten seconds, by hand before
+pushing a client change (TESTING.md "Reading the GUI smoke"). `scripts/gui/audit.sh` is the long one, walking every surface across
 themes, DPI settings and text sizes and checking each captured scene against
 properties it must hold on its own — a string that fits its box, ink that can be
 read against what is behind it, one label not drawn over another, nothing drawn
