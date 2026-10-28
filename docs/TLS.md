@@ -35,7 +35,7 @@ share only the read-only configuration and the thread-safe RNG (below). The fina
 ships 3.6.x, whose APIs are not source-compatible. Pinning one version from
 source gives local, CI, and the container image an identical library and avoids
 `#ifdef` version shims. The client's TUI libraries (termbox2, utf8proc) are
-likewise vendored — as committed single-file source, both MIT (ARCH-75).
+likewise vendored — as committed source, both MIT (ARCH-75).
 
 ## Trust model (ARCH-10)
 

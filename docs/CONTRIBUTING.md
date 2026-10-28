@@ -25,17 +25,14 @@ setting).
   real commits. `main` never takes a pull request.
 - **Every feature has exactly one GitHub issue**, and its branch is named for
   it: `feature/oc-<issue number>-<short-kebab-description>`, cut from a clean,
-  current `staging`. The repo's `/oc-feature-start` command runs the preflight
-  (clean tree, `staging` in sync with origin, no branch already carrying the
-  issue), refuses rather than repairs, and makes one fresh build on the new
-  branch.
+  current `staging` ("Starting a feature").
 - **Land by pull request to `staging`,** squashed to a **single** house-format
   commit whose subject names the issue. The issue **closes when its release
   ships**: the release reads the issue from each shipped commit's subject, and
   from the documentation it carries onto `main`, and closes it with a comment
   naming the release. A merge does not close it — merged
   is not shipped. The PR body stays **empty**: the issue and the commit already
-  say everything. `/oc-feature-finish` runs the sequence (below).
+  say everything ("Before a pull request").
 - **Merge with a squash merge** once the required checks pass ("CI") — no
   merge commits, history stays linear. What stands between a change and
   `staging` is the local test (below). Delete the branch, local and remote,
@@ -44,21 +41,69 @@ setting).
   request into `staging`, the same checks. Once merged, a documentation-only
   commit (`*.md` and `docs/`, except `docs/CONFIG.md`, which follows the
   daemon's settings, and `LICENSING.md`) can be put on `main` by the
-  maintainers without a release (`promote.yml`); anything else, workflows and
-  `.claude/` included, goes out with the next release.
+  maintainers without a release (`promote.yml`); anything else, workflows
+  included, goes out with the next release.
 - **Sign off every commit** (`git commit -s`) — the DCO applies to every path
   into the tree, including a cherry-pick.
 - **One logical change per branch.**
 
+## Starting a feature
+
+Stop at the first check that fails and fix the cause; nothing here stashes,
+resets or works around a dirty state.
+
+1. `git config core.hooksPath` prints `.githooks` (if not, run
+   `git config core.hooksPath .githooks`: the pre-push hook is what holds a
+   push to a tree tested locally).
+2. `git fetch origin --prune`; `git status --porcelain` prints nothing.
+3. Local `staging` is not ahead of or diverged from `origin/staging`; bring it
+   current with `git checkout staging && git pull --ff-only origin staging`.
+4. The issue, on `openchime/openchime`: `gh issue view <n> -R openchime/openchime`
+   for an existing one (not closed). For new work, search first —
+   `gh issue list -R openchime/openchime --state open --search "<words>"` —
+   and only then create one: a title stating what is wrong or missing as a
+   fact, a body saying what it costs and citing `REQ-N` / `ARCH-N`, and an
+   existing label pair where one fits (`win32`, `daemon`, `testing`,
+   `packaging-release` × `missing-feature`, `defect`, `verification-gap`).
+   `gh issue list` shows 30 by default and the tracker holds more:
+   `gh issue list -R openchime/openchime --state open --limit 500` lists them
+   all (add `--label <name>` or `--search "<words>"` to filter).
+5. No branch already carries the issue:
+   `git branch -a --list '*feature/oc-<n>-*'` prints nothing.
+6. `git checkout -b feature/oc-<n>-<short-kebab-description> staging` — `oc`
+   lowercase, the description a few words naming the change (the issue "The
+   daemon exits 0, silently, when it cannot start" becomes
+   `feature/oc-<n>-daemon-exit-nonzero`).
+7. `make clean && make`, so nothing built for other work is linked in
+   (`clean` keeps the downloaded speech models).
+
+Before writing code, read the `REQ-N` / `ARCH-N` entries the issue names and
+the doc that owns the area. A frame layout change or a reassigned opcode bumps
+`OC_PROTOCOL_VERSION` (PROTOCOL.md §2); a schema change is a new numbered
+migration, never an edit to an existing one (SCHEMA.md §1).
+
 ## Before a pull request — the minimal set
 
-Locally, and in about 2 minutes, a pull request needs exactly this, which
-`/oc-feature-finish` runs:
+Locally, and in about 2 minutes, a pull request needs exactly this:
 
-1. `make && make test` — zero warnings, every suite passing.
-2. `scripts/check/pr.sh "<title>"` — the title's format and length.
-3. One commit, signed off, no body; pushed; the pull request raised into
-   `staging` with an empty body.
+1. `scripts/check/test.sh` — `make && make test`, then it records the tree it
+   passed on for the pre-push hook. Zero warnings, every suite passing
+   (`OK: all suites passed`), then `tested: tree … recorded`. Any change after
+   it means running it again; a change to `*.md`, `.gitignore` or `.claude/`
+   alone may skip it.
+2. `scripts/check/pr.sh "OC-<n>: <Capitalised imperative summary>"` — the
+   title's format and length, and that the issue is open.
+3. One commit ahead of `origin/staging`, signed off, no body. To squash:
+
+       git reset --soft $(git merge-base origin/staging HEAD)
+       git commit -s -m "OC-<n>: <the title from step 2>"
+
+4. `git status --porcelain` prints nothing; push. `git push --force-with-lease`
+   only when step 3 rewrote a branch already pushed.
+5. `gh pr create --base staging --title "<the commit's subject>" --body ""`.
+
+After a policy failure on the pull request (`pr policy`, `guard`), fix it, run
+step 1 again if anything but the title changed, and push once.
 
 That is all. **The thread sanitizer, the release compiler, the Windows builds
 and the end-to-end run are the staging build's** ("CI"); running them locally as
@@ -136,12 +181,11 @@ does nothing unless `OPENCHIME_MODE=development` (CONFIG.md "Mode").
 Nothing runs on its own but what must ("CI"). The cheap checks are steps of a job a workflow already has, never jobs
 of their own; no job waits on another workflow (a gate checks once and fails
 fast); every job has a timeout. A failure is found locally, not in CI:
-`/oc-feature-finish` runs `scripts/check/test.sh` (`make && make test`) before
-the commit, and `.githooks/pre-push` refuses a tree it did not pass on (a
-change to `*.md`, `.gitignore` or `.claude/` alone excepted) and workflows
-`actionlint` rejects. The hooks
-are on once per clone: `git config core.hooksPath .githooks`, which
-`/oc-feature-start` checks.
+`scripts/check/test.sh` (`make && make test`) runs before the commit, and
+`.githooks/pre-push` refuses a tree it did not pass on (a change to `*.md`,
+`.gitignore` or `.claude/` alone excepted) and workflows `actionlint` rejects.
+The hooks are on once per clone: `git config core.hooksPath .githooks`
+("Starting a feature").
 
 ## CI
 

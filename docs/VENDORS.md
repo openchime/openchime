@@ -34,11 +34,11 @@ CI builds share byte-identical sources with zero transitive dependencies
 | Package | Version | Purpose | Used by | Source | License |
 |---------|---------|---------|---------|--------|---------|
 | **termbox2** | v2.5.0 | Terminal cell grid + input | tuikit (→ TUI) | https://github.com/termbox/termbox2 | MIT |
-| **utf8proc** | v2.11.3 | Unicode width + grapheme segmentation (correct emoji/CJK width); NFKC normalization of passwords | tuikit (→ TUI); the daemon (AUTH.md §2) | https://github.com/JuliaStrings/utf8proc | MIT (bundled Unicode data under the Unicode license) |
+| **utf8proc** | v2.11.3 | Unicode width + grapheme segmentation (correct emoji/CJK width); NFKC normalization of passwords | tuikit (→ TUI); sdltext (→ graphical clients); the daemon (AUTH.md §2) | https://github.com/JuliaStrings/utf8proc | MIT (bundled Unicode data under the Unicode license) |
 | **qrcodegen** | v1.8.0 | QR codes: the device-code sign-in's URL, for a phone's camera (AUTH.md §8.11); a second step's setup key, for an authenticator app (AUTH.md §8.6) | tuikit `tk_qr` (→ TUI); the daemon's setup page | https://github.com/nayuki/QR-Code-generator | MIT |
 | **Argon2** | 20190702 (the reference implementation) | Password hashing, Argon2id (AUTH.md §2): `argon2.c`, `core.c`, `encoding.c`, `ref.c`, `thread.c`, `blake2/`, as released, compiled as one unit (`argon2_all.c`) with its own flags | Daemon | https://github.com/P-H-C/phc-winner-argon2 | CC0-1.0 or Apache-2.0 |
 | **Common passwords** | SecLists, `xato-net-10-million-passwords-1000000.txt` | The passwords of 15 characters or more a new one may not be, lowercased (`third_party/pwlist/common.txt`, compiled in by `scripts/build/pw_common.py`) | Daemon | https://github.com/danielmiessler/SecLists | MIT |
-| **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON) | https://github.com/zserge/jsmn | MIT |
+| **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON); client app-core (`client/core/summary.c`) | https://github.com/zserge/jsmn | MIT |
 | **picohttpparser** | commit-pinned | HTTP/1.1 request line and header parsing for the daemon's one HTTP stack (ARCH-32) | Daemon (`daemon/http.c`) | https://github.com/h2o/picohttpparser | MIT (or the Perl licence; we use it under MIT) |
 | **miniaudio** | 0.11.25 | Audio device I/O — capture and playback over WASAPI, CoreAudio, ALSA/PulseAudio/PipeWire on the desktops (the browser's is `client/gui/platform/web/audio_web.c`, not miniaudio) | Client media library (`client/core/media/audio_ma.c`, the desktop backend under `audio_dev.c`): video messages and the audio client (AUDIO.md §3.2) | https://github.com/mackron/miniaudio | Public Domain (Unlicense) **or** MIT-0, at our choice |
 | **stb_image_write**, **stb_image** | commit-pinned | JPEG encode of a video message's poster, and PNG encode in the app (stb_image_write); stb_image.h is committed but nothing compiles it | Client media library (`client/core/media/recorder.c`) and `client/gui/app/app.c` | https://github.com/nothings/stb | Public Domain **or** MIT, at our choice |
@@ -46,7 +46,7 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **Mozilla CA roots** | curl's extract, dated (see `scripts/gen/ca_roots.sh`) | The roots every outbound HTTPS client verifies against (ARCH-10): S3, central, unfurls, the client's `.well-known` fetch | Daemon + every client (`third_party/ca-roots/ca_roots.c`, generated) | https://curl.se/docs/caextract.html | MPL-2.0 (the certificate data) |
 | **SQLite** (amalgamation) | 3.53.4 | The daemon's database (ARCH-2), compiled in with `SQLITE_ENABLE_FTS5`. **Not linked by any client** (ARCH-88) | Daemon + tests (`third_party/sqlite-3.53.4/sqlite3.c`) | https://sqlite.org | Public Domain |
 | **speexdsp** | 1.2.1 | The acoustic echo canceller (`speex_echo_state`), behind the processor seam (AUDIO.md §3.3) | Client media library (`client/core/media/processor.c`) — voice input (ARCH-112) and the audio client; never the daemon | https://www.speex.org | BSD-3-Clause |
-| **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) and the audio client (ARCH-73) | https://opus-codec.org | BSD-3-Clause |
+| **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) and the audio client (ARCH-73); the daemon, to encode read-aloud (ARCH-111) | https://opus-codec.org | BSD-3-Clause |
 | **libvpx** | 1.17.0 | VP9 encode and decode | Client media library — video messages (ARCH-110) and screenshare (ARCH-87) | https://chromium.googlesource.com/webm/libvpx | BSD-3-Clause (with a separate patent grant) |
 
 **speexdsp** is committed in `third_party/speexdsp/` as Xiph's 1.2.1 release
@@ -283,8 +283,8 @@ and that machine then persists no credential at all (headless / no D-Bus). They 
 - **Local build headers:** `libsecret-1-dev` for the keyring backend. SQLite needs
   none — it is compiled from the committed amalgamation.
 - **CI installs:** `bzip2`, `nasm` and `xz-utils` (and `gdb`, and `ffmpeg` for
-  `ffprobe`, neither linked); every compiler is fetched by
-  make (the toolchains above). The Windows TUI and GUI (`make windows`) need
+  `ffprobe`, neither linked); every compiler but the runner's own gcc is
+  fetched by make (the toolchains above). The Windows TUI and GUI (`make windows`) need
   neither libsecret nor libresolv: the mingw build reaches DNS through
   `DnsQuery` and the credential store through Credential Manager.
 
@@ -293,7 +293,7 @@ and that machine then persists no credential at all (headless / no D-Bus). They 
 | Image / tool | Version | Purpose | License | Source |
 |--------------|---------|---------|---------|--------|
 | **Debian** | `bookworm-slim` | Runtime base of the container image (glibc 2.36, above the binary's 2.34 floor) | mixed (base OS) | https://www.debian.org |
-| **Litestream** | 0.5.17 | In the image only: streams `openchime.db` to the deployment's bucket and restores it onto a box that has none, to `<prefix>/db` when the deployment writes its `replica-*` files (ARCH-3, ARCH-39; CONFIG.md); a separate program, not linked into the daemon | Apache-2.0 (its `LICENSE` ships in the image at `/usr/share/doc/litestream/LICENSE`) | https://github.com/benbjohnson/litestream |
+| **Litestream** | 0.5.17 | In the image only: streams `openchime.db` and the identity to the deployment's bucket, each to `<prefix>/db` under its own prefix, and restores each onto a box that has none, when the deployment writes its `replica-*` files (ARCH-3, ARCH-39; CONFIG.md); a separate program, not linked into the daemon | Apache-2.0 (its `LICENSE` ships in the image at `/usr/share/doc/litestream/LICENSE`) | https://github.com/benbjohnson/litestream |
 
 One image, and it is an **output** rather than a tool: the OCI image the staging
 build builds and the release tags (ARCH-20/76), and anyone can build from a release tarball. Nothing is compiled in it: the Dockerfile

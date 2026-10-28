@@ -38,6 +38,7 @@ listener gets the same text.
 | In the body | Said |
 |---|---|
 | A fenced code block | "Code block, 12 lines." — the contents are skipped |
+| A table | "Table, 3 rows." — the cells are skipped |
 | `inline code` | the contents, as written |
 | A URL | its host, without `www.` — "github.com" |
 | `@someone` | their display name |
@@ -208,9 +209,9 @@ Full layouts in PROTOCOL.md §5.14b.
 
 | Where | What it proves |
 |---|---|
-| `make test` — ttskit | pronunciation, the data files, the guesser against its reference (TTSKIT.md §9) |
+| `make test` — ttskit | pronunciation, the data files, the guesser against its reference (TTSKIT.md §9); Kitten's token ids against its own tokenizer |
 | `make test` — speakable | code blocks, links, mentions, markdown, emoji, quotes, not-renderable |
-| `make test` — render worker | with a stub synthesizer: queue order, a full queue, eventfd wake-up, idle release; Kitten's token ids against its own tokenizer |
+| `make test` — render worker | with a stub synthesizer: queue order, a full queue, eventfd wake-up, idle release |
 | `make test` — daemon | cache hit and miss, in-flight de-duplication, handle stability and edit → new handle, reclaim first with no tombstone, the rate limit, round trips of the read-aloud frames at the current protocol version, a two-client vertical |
 | `make test` — client core | an audio-only MP4 round trip; the listen queue in order, skipping not-renderable |
 | Staging build (`staging-build.yml`) | the real daemon: links statically (only the C runtime dynamic); the release binary renders a sentence (`--tts-say`) that voice input hears back (`--stt-hear`); manual listening on model changes |

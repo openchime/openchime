@@ -35,7 +35,7 @@ Absent where the operator turned it off or the recognizer's data is missing (REQ
   ends both; in a call, the talk key is the call's push to talk.
 - Opened only while in use — press to release, or free talk on to off — with a
   live-microphone mark on the composer. A microphone the OS blocks is reported as
-  blocked by Windows' privacy settings (REQ-166).
+  blocked by Windows' privacy settings, or in the browser by its site settings (REQ-166).
 - The device is the microphone chosen for video messages, else the default. Captured
   through the device layer (`client/core/media/audio_dev.c`) at **16 kHz mono,
   16-bit**, the recognizer's input format. Nothing is written to disk (ARCH-88).

@@ -56,7 +56,8 @@ wherever the secret is mounted.
 
 Up to four connections may be named, `_1` to `_4`, and each is its own button in the client, with its label. Who may join is the join rules
 of AUTH.md §8.4, the same as for the relay: with `OPENCHIME_JOIN` unset, only
-those invited. The first owner through the provider comes from an `owner:` or
+those invited, and an invite bound to an address is made only where the relay
+is on, so with a direct connection alone that is nobody. The first owner through the provider comes from an `owner:` or
 `subject:` rule. Local accounts stay on beside a direct connection (only an
 enrolled box's `OPENCHIME_AUTH=relay` turns them off), so a first start with no
 owner still prints a setup token.
@@ -100,8 +101,9 @@ owner still prints a setup token.
   (`https://<org>.okta.com/oauth2/default`, or the org's own for the org
   server); for Keycloak `https://<host>/realms/<realm>`.
 - Such a provider has no tenant the join rules can name, so people are admitted by
-  `domain:` on an address the provider marks `email_verified`, by invite, or
-  named one at a time with `subject:<issuer>|<sub>`.
+  `domain:` on an address the provider marks `email_verified`, by invite where
+  the relay is on too, or named one at a time, as owner, with
+  `subject:<issuer>|<sub>`.
 
 ## What it cannot do
 

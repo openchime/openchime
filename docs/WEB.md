@@ -112,7 +112,7 @@ without the wasm beside it the daemon says so once and the landing page stands.
   goes with `Content-Encoding: gzip` to a browser that takes it. A gzip copy
   whose trailer (CRC-32 and length) is not of the wasm beside it is passed
   over, with a line saying so, so one left from another build cannot send
-  the wrong client. The page itself is about 16 KB and goes as it is.
+  the wrong client. The page itself is about 17 KB and goes as it is.
 - *Once.* Every route under `/app/` has an ETag, a hash of what it serves (the
   gzip copy's ends `-gz`), and keeps `Cache-Control: no-cache`: a browser
   revalidates on every load, a daemon serving the same client answers `304`
