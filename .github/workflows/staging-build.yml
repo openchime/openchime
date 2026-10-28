@@ -1,0 +1,1330 @@
+# The staging build (ARCH-20): the staging tip, tested and
+# then built as a release ships it, and stored by commit.
+#
+# Dispatched by hand on staging, it builds the tip, in this order:
+#   1. the gate: the commit checks over <last release>..tip -- the attribution scan,
+#      which refuses the build, and the commit policy, which only warns, so one
+#      bad subject already on staging does not stop every later build -- and a
+#      refusal when the commit already has a stored build: a build is made once
+#      per commit and never replaced, since its images, its run number and its
+#      manifest are what a release-candidate names;
+#   2. the tests (ci.yml, called): the daemon built, started and driven over
+#      TLS, the release compiler over every Linux translation unit, the suites,
+#      the web client in a headless Chrome, and the threaded suites under
+#      ThreadSanitizer;
+#   3. only when they pass, everything a release ships -- both daemons with
+#      their data, the container images, the Windows clients -- stamped with the
+#      BUILD ID, the short commit, and stored by that id: the trees and
+#      binaries in the mirror bucket (DIST_MIRROR_BUCKET, which holds the
+#      apt/dnf mirror and the stored builds) under candidates/<id>/ with a
+#      signed manifest, the images in the build repository (IMAGE_REPO_BUILD)
+#      as :build-<id>.
+# Nothing is tagged, published or copied here. A stored build is promoted to a
+# release-candidate by release-candidate.yml, which reads it back from the
+# store and rebuilds and retests nothing, and a release-candidate to a release
+# by release.yml: no compiler runs after this workflow, and what was verified
+# here is what ships.
+#
+# ONE BINARY PER ARCHITECTURE feeds the .deb, the .rpm, the tarball and the
+# image. It is built with `zig cc` targeting glibc 2.34, the oldest supported
+# target, on a bare ubuntu-24.04 runner with toolchains make fetches pinned
+# (mk/toolchains.mk); the arm64 daemon is cross-built on the same runner;
+# the images are the packaged tree laid onto a glibc base with buildah (no
+# compile inside, so no emulation); the Windows clients cross-compile with
+# llvm-mingw. NOTHING HERE USES DOCKER. The packaging scripts run under a
+# placeholder version so a package that cannot be built or installed stops
+# the build; the packages themselves are made again by the release under its
+# number.
+#
+# Start it on staging:  gh workflow run staging-build.yml --ref staging
+name: staging-build
+
+on:
+  workflow_dispatch:
+
+# One build per commit, never cancelled half way: a second dispatch of the same
+# commit waits, then is refused by the gate, since the first stored it. Builds
+# of different commits run side by side; each writes only its own id.
+concurrency:
+  group: staging-build-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# Every deployment-specific value is a repository variable or secret.
+env:
+  # The build's images: the repository they are pushed to, and the registry's
+  # login (basic auth: the user below, IMAGE_REGISTRY_TOKEN_BUILD as password).
+  # The registry is the repository's first path segment (${BUILD_IMAGE%%/*}).
+  BUILD_IMAGE: ${{ vars.IMAGE_REPO_BUILD }}
+  IMAGE_REGISTRY_USER: ${{ vars.IMAGE_REGISTRY_USER }}
+  DIST_S3_REGION: ${{ vars.DIST_S3_REGION || 'auto' }}
+
+jobs:
+  # One job for what is seconds of work each, since a job costs a runner start:
+  # the ref, the build id, the commit checks and the stored-build check. The
+  # mirror bucket's key and its variables are the repository's, not the
+  # `release` environment's, so this job needs no environment.
+  gate:
+    name: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      build_id: ${{ steps.id.outputs.build_id }}
+      run_number: ${{ steps.id.outputs.run_number }}
+    env:
+      DIST_S3_ENDPOINT:          ${{ vars.DIST_S3_ENDPOINT }}
+      DIST_S3_MIRROR_ACCESS_KEY: ${{ secrets.DIST_S3_MIRROR_ACCESS_KEY }}
+      DIST_S3_MIRROR_SECRET_KEY: ${{ secrets.DIST_S3_MIRROR_SECRET_KEY }}
+      DIST_MIRROR_BUCKET:        ${{ vars.DIST_MIRROR_BUCKET }}
+    steps:
+      # A staging build is a staging commit and nothing else: dispatched on
+      # another ref, the SHA below would be a feature branch. And it is made
+      # only in the repository the RELEASE_REPO variable names; a copy of this
+      # repository without it builds nothing.
+      - name: Refuse any other ref or repository
+        env:
+          REF: ${{ github.ref }}
+          REPO: ${{ github.repository }}
+          RELEASE_REPO: ${{ vars.RELEASE_REPO }}
+        run: |
+          [ -n "$RELEASE_REPO" ] && [ "$REPO" = "$RELEASE_REPO" ] || {
+            echo "::error::staging builds are made only in the repository the RELEASE_REPO variable names"; exit 1; }
+          [ "$REF" = "refs/heads/staging" ] || {
+            echo "::error::a staging build is made from staging only (this run is on $REF). Use: gh workflow run staging-build.yml --ref staging"; exit 1; }
+      # The build id, and the run number the Windows file version carries (the
+      # one numeric, growing field Windows compares). The run
+      # number is this workflow's plus RUN_NUMBER_OFFSET, a repository variable
+      # (0 when unset): run numbers count from 1 again when the workflow is
+      # renamed or moved, and the file version must keep growing past every
+      # build already shipped.
+      - id: id
+        name: build id
+        env:
+          OFFSET: ${{ vars.RUN_NUMBER_OFFSET }}
+        run: |
+          set -euo pipefail
+          offset="${OFFSET:-0}"
+          grep -qE '^[0-9]+$' <<<"$offset" || {
+            echo "::error::RUN_NUMBER_OFFSET is '${offset}', not a whole number"; exit 1; }
+          run=$(( GITHUB_RUN_NUMBER + offset ))
+          echo "build_id=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "run_number=${run}" >> "$GITHUB_OUTPUT"
+          echo "build ${GITHUB_SHA:0:7} (${GITHUB_SHA}), run ${run} (${GITHUB_RUN_NUMBER} + ${offset})"
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # The commits since the last release: everything a release of this commit
+      # would bring to main. Nothing checks them on the push that lands them, so
+      # this is where they are checked, before main can move to them.
+      - name: The commits since the last release
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main"
+          # main holds snapshots, not staging's commits: what a release of this
+          # commit brings starts at the last release's candidate
+          # (scripts/release/main_next.sh base).
+          base=$(scripts/release/main_next.sh base "$GITHUB_SHA")
+          echo "MAIN=${base}" >> "$GITHUB_ENV"
+          echo "${base:0:7}..${GITHUB_SHA:0:7}:"
+          git log --format='  %h %s' "${base}..${GITHUB_SHA}"
+      # The attribution scan refuses the build: a commit naming the banned
+      # pattern must not be built, stored or released, and is removed from
+      # staging by hand (CONTRIBUTING.md). Scanned as a push of <last release>..tip,
+      # since the script judges only a push's or a pull request's commits.
+      - name: Attribution scan
+        env:
+          EVENT: push
+          AFTER: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          BASE_REF: ""
+        run: BEFORE="$MAIN" scripts/release/attribution_scan.sh
+      # The commit policy warns and never refuses: a squash's subject or body is
+      # fixed only by rewriting staging, and a build refused for it would refuse
+      # every later commit's build too, since <last release>..tip still holds it.
+      - name: Commit policy (warns)
+        run: |
+          set -uo pipefail
+          if ! BEFORE="$MAIN" scripts/release/commit_policy.sh 2>&1 | sed -u 's/^::error::/::warning::/'; then
+            echo "::warning::the commits since the last release do not all meet the commit policy; reported, not enforced"
+          fi
+      # A build is made once per commit and never replaced: a second build of
+      # the same commit would push new images under the same tags (buildah
+      # images are not byte-identical between builds), take a new run number,
+      # and leave a release-candidate, or anything pinned to :build-<id>,
+      # naming files that are no longer the ones it was made from. A listing
+      # that fails refuses too: an unreadable bucket is not an empty one.
+      - name: Install rclone
+        timeout-minutes: 20
+        run: scripts/build/apt.sh rclone
+      - name: No build is stored for this commit
+        env:
+          BUILD_ID: ${{ steps.id.outputs.build_id }}
+        run: |
+          set -euo pipefail
+          for v in DIST_S3_ENDPOINT DIST_S3_MIRROR_ACCESS_KEY DIST_S3_MIRROR_SECRET_KEY DIST_MIRROR_BUCKET; do
+            [ -n "${!v}" ] || { echo "::error::$v is not set"; exit 1; }
+          done
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [dist-mirror]
+          type = s3
+          provider = Other
+          access_key_id = ${DIST_S3_MIRROR_ACCESS_KEY}
+          secret_access_key = ${DIST_S3_MIRROR_SECRET_KEY}
+          endpoint = ${DIST_S3_ENDPOINT}
+          region = ${DIST_S3_REGION}
+          EOF
+          # An object store lists an absent prefix as empty; rclone's exit 3,
+          # "directory not found", is read as empty too, and nothing else is.
+          rc=0
+          files=$(rclone lsf "dist-mirror:${DIST_MIRROR_BUCKET}/candidates/${BUILD_ID}/" --files-only) || rc=$?
+          [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || {
+            echo "::error::could not list candidates/${BUILD_ID}/ in ${DIST_MIRROR_BUCKET} (rclone exit ${rc})"; exit 1; }
+          if grep -qxF manifest.json <<<"$files"; then
+            echo "::error::${BUILD_ID} already has a stored build (candidates/${BUILD_ID}/manifest.json in ${DIST_MIRROR_BUCKET}); a commit is built once. Promote it: gh workflow run release-candidate.yml --ref staging -f build=${BUILD_ID}"
+            exit 1
+          fi
+          echo "no stored build for ${BUILD_ID}: building it"
+
+  # Reported here, in seconds, so a staging build says whether a release of it
+  # could publish.
+  #
+  # It REPORTS and never fails: a build is made and stored whether or not
+  # a release could follow, and the gap is what the summary says. It runs
+  # beside the tests, so the gap is known before the build jobs start.
+  preflight:
+    name: check release credentials
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    # The signing key and the registry tokens are the release environment's
+    # secrets: a job outside it sees them as unset.
+    environment: release
+    env:
+      # Mapped in rather than read inline: a secret cannot be tested in an `if:`
+      # at job level, and mapping makes the required set one readable list.
+      DIST_S3_ACCESS_KEY: ${{ secrets.DIST_S3_ACCESS_KEY }}
+      DIST_S3_SECRET_KEY: ${{ secrets.DIST_S3_SECRET_KEY }}
+      DIST_S3_ENDPOINT:   ${{ vars.DIST_S3_ENDPOINT }}
+      DIST_BUCKET:        ${{ vars.DIST_BUCKET }}
+      DIST_S3_MIRROR_ACCESS_KEY: ${{ secrets.DIST_S3_MIRROR_ACCESS_KEY }}
+      DIST_S3_MIRROR_SECRET_KEY: ${{ secrets.DIST_S3_MIRROR_SECRET_KEY }}
+      DIST_MIRROR_BUCKET:        ${{ vars.DIST_MIRROR_BUCKET }}
+      REPO_SIGNING_KEY:   ${{ secrets.REPO_SIGNING_KEY }}
+      IMAGE_REPO_BUILD:   ${{ vars.IMAGE_REPO_BUILD }}
+      IMAGE_REGISTRY_TOKEN_BUILD: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
+      TS_ENDPOINT:        ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+      TS_ACCOUNT:         ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+      TS_PROFILE:         ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+      AZ_TENANT:          ${{ secrets.AZURE_TENANT_ID }}
+      AZ_CLIENT:          ${{ secrets.AZURE_CLIENT_ID }}
+      AZ_SECRET:          ${{ secrets.AZURE_CLIENT_SECRET }}
+      DRY: "true"   # a staging build reports a missing credential and goes on
+      # As in `publish`, which is where these values are defined and explained.
+      DIST_BASE_URL: ${{ vars.DIST_BASE_URL }}
+      DIST_VERIFY_URL: ${{ vars.DIST_VERIFY_URL }}
+    steps:
+      - name: required credentials
+        run: |
+          set -u
+          missing=""
+          for v in DIST_S3_ACCESS_KEY DIST_S3_SECRET_KEY DIST_S3_ENDPOINT \
+                   DIST_BUCKET DIST_S3_MIRROR_ACCESS_KEY DIST_S3_MIRROR_SECRET_KEY \
+                   DIST_MIRROR_BUCKET REPO_SIGNING_KEY DIST_BASE_URL DIST_VERIFY_URL \
+                   IMAGE_REGISTRY_USER IMAGE_REPO_BUILD IMAGE_REGISTRY_TOKEN_BUILD; do
+            eval "val=\${$v:-}"
+            [ -n "$val" ] || missing="$missing $v"
+          done
+
+          # Authenticode signing is OPTIONAL by design: without it
+          # the release ships an unsigned installer and says so. But the six
+          # values -- the three naming the signing profile and the three Azure
+          # values proving the caller may use it -- are all-or-nothing, since
+          # `SIGN` requires all six, so a PARTIAL set is the dangerous state: it
+          # reads as configured and silently ships unsigned. Named separately
+          # for that reason.
+          ts_set=0
+          for v in TS_ENDPOINT TS_ACCOUNT TS_PROFILE AZ_TENANT AZ_CLIENT AZ_SECRET; do
+            eval "val=\${$v:-}"
+            [ -n "$val" ] && ts_set=$((ts_set + 1))
+          done
+
+          {
+            echo "### Release credentials"
+            echo
+            if [ -n "$missing" ]; then
+              echo "**Missing (required):**"
+              for m in $missing; do echo "- \`$m\`"; done
+            else
+              echo "All required credentials are present."
+            fi
+            echo
+            case "$ts_set" in
+              6) echo "Authenticode signing: configured." ;;
+              0) echo "Authenticode signing: not configured — the installer ships unsigned, as designed." ;;
+              *) echo "Authenticode signing: **PARTIALLY configured ($ts_set of 6)** — signing will be skipped and the installer will ship unsigned. Set all six or none." ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ts_set" != 0 ] && [ "$ts_set" != 6 ]; then
+            echo "::warning::Authenticode signing is partially configured ($ts_set of 6); the installer will ship unsigned."
+          fi
+
+          if [ -z "$missing" ]; then
+            echo "all required release credentials present"
+            exit 0
+          fi
+
+          # A staging build REPORTS and continues: a build is stored whether or
+          # not a release could follow.
+          if [ "$DRY" = "true" ]; then
+            echo "::warning::missing release credentials:$missing (dry run — not failing)"
+            exit 0
+          fi
+          echo "::error::missing release credentials:$missing"
+          exit 1
+
+      # The release closes the OC issues it shipped on openchime/openchime with
+      # PUBLIC_TOKEN. A token that cannot is found out here, not as a warning
+      # after the packages are live: an empty update of an issue changes nothing
+      # and adds nothing to its timeline, but is refused without Issues write.
+      - name: public tracker
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_TOKEN }}
+        run: |
+          set -uo pipefail
+          r=openchime/openchime
+          if [ -n "$GH_TOKEN" ] && n=$(gh api "repos/${r}/issues?state=all&per_page=1" --jq '.[0].number' 2>&1) \
+             && out=$(echo '{}' | gh api -X PATCH "repos/${r}/issues/${n}" --input - --jq .number 2>&1); then
+            echo "PUBLIC_TOKEN can write issues on openchime/openchime"
+            exit 0
+          fi
+          msg="PUBLIC_TOKEN cannot write issues on openchime/openchime: ${out:-${n:-not set}}"
+          # A staging build closes nothing: reported, and it goes on.
+          echo "::warning::${msg}"
+
+      # The repository is verified at DIST_VERIFY_URL, which is served from the
+      # bucket outside this workflow. Nothing in this repository can make that
+      # true -- so this REPORTS and never fails: a release is publishable
+      # without it, only unreachable at the public URL.
+      - name: probe the published base URL
+        run: |
+          set -u
+          if curl -fsI --max-time 20 "$DIST_VERIFY_URL/openchime-archive-keyring.gpg" >/dev/null 2>&1; then
+            echo "verification URL serves: $DIST_VERIFY_URL"
+            echo "Verification URL (\`$DIST_VERIFY_URL\`): serving." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::$DIST_VERIFY_URL does not serve the archive keyring -- \
+          a release would publish, and its smoke job would fail."
+            {
+              echo
+              echo "**Verification URL (\`$DIST_VERIFY_URL\`): NOT serving.**"
+              echo
+              echo "A release would publish, and its \`smoke\` job would fail."
+              echo "The URL is served outside this workflow."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # The tests, before anything a release ships is built: a failure here costs
+  # the tests' minutes, not the build's. ci.yml is called rather than copied,
+  # so the staging build runs exactly the suite CI defines; its end-to-end step
+  # runs the daemon in development mode, which keeps it out of this file
+  # (scripts/check/release_lint.sh).
+  tests:
+    name: tests
+    needs: gate
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  packages:
+    name: ${{ matrix.arch }} daemon
+    needs: [gate, tests]
+    runs-on: ubuntu-24.04
+    # Only once the tests passed. A cache miss compiles ONNX Runtime for
+    # read-aloud (below) before the daemon.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            make_arch: x86_64
+            oc_arch: ""
+            bin: openchimed
+          # Cross-built with zig on the same x86 runner (make ARCH=aarch64).
+          # Build only: the binary is packaged and shipped, never run here;
+          # what runs below (the render, the install) runs for amd64 alone.
+          - arch: arm64
+            make_arch: aarch64
+            oc_arch: aarch64
+            bin: build/aarch64/openchimed
+    env:
+      BUILD_ID: ${{ needs.gate.outputs.build_id }}
+      OC_BUILD_ID: ${{ needs.gate.outputs.build_id }}
+      # The packaging scripts are exercised here with a placeholder version so
+      # that a package that cannot be built or installed stops the build;
+      # the packages themselves are not kept. A release packages the same
+      # binary under the number it assigns (release.yml).
+      VERSION: "0"
+      MAKE_ARCH: ${{ matrix.make_arch }}
+      # What the vendored-library scripts call the architecture, for the
+      # licence file assembled outside make (packaging/licenses.sh): the
+      # arm64 runner has only its own copies of the vendored texts.
+      OC_ARCH: ${{ matrix.oc_arch }}
+      BIN: ${{ matrix.bin }}
+      # Every artifact this job produces lands under dist/<platform>/, which is
+      # also the artifact's name -- see the upload at the end of the job for why
+      # those two being the same string is what keeps the layout intact across
+      # the artifact round-trip.
+      PLATFORM: linux-${{ matrix.arch }}
+      DIST: dist/linux-${{ matrix.arch }}
+    steps:
+      # Every CPU the runner has, for every make below and the makes they
+      # start (the Makefile is safe under -j; locally nothing changes).
+      - name: Use every CPU for make
+        run: echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+
+      # The toolchains make fetches pinned (mk/toolchains.mk): zig, whose
+      # bundled clang ships glibc stub libraries for every version back to 2.17
+      # and links against whichever one it is asked for, regardless of the
+      # host's own glibc -- so a 2.34 binary comes off a runner carrying 2.39
+      # with no container in the picture, and an arm64 one off an x86 runner;
+      # and Emscripten for the web client the daemon embeds. Keyed by the
+      # scripts, which pin the versions and the checksums.
+      - name: Restore the toolchains
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/zig-0.13.0
+            third_party/emsdk-6.0.8
+          key: toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
+
+      - name: Install build dependencies
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          # scripts/build/apt.sh: the mirror rewritten, each apt-get bounded
+          # and retried, so a stall fails the step instead of holding the job.
+          # rpm supplies rpmbuild; bzip2 for the mbedTLS tarball; nasm for libvpx's assembly; xz-utils for the toolchain tarballs.
+          scripts/build/apt.sh bzip2 rpm nasm xz-utils
+
+      # Read-aloud's engine and model (ARCH-111), built by make with the same
+      # toolchain and glibc target as the daemon: ONNX Runtime compiled from
+      # source as one minimal static archive, per architecture; the voice model
+      # converted; and voice input's recognizer files, fetched as published
+      # (ARCH-112). Functions of the files in the key, so a hit skips about 25
+      # minutes and a change rebuilds. The arm64 archive is cross-built with
+      # the host's protoc, which the script builds on its own, protoc alone,
+      # when the cache has none (it is in this cache too); the arm64 runner
+      # never builds the host's archive.
+      - name: Restore the speech engine and models
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/onnxruntime-1.30.0
+            third_party/onnxruntime-1.30.0-aarch64
+            third_party/onnxruntime-1.30.0-build/out/MinSizeRel/_deps/protobuf-build/protoc*
+            third_party/llamacpp-0.5.0
+            third_party/llamacpp-0.5.0-aarch64
+            build/kitten
+            build/moonshine
+          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+
+      # mbedTLS and libopus as this job builds them: with zig's clang against
+      # glibc 2.34 for the binary that ships (the arm64 job also builds the
+      # host's mbedTLS, for the featureless host daemon that writes its data
+      # manifests, mk/daemon.mk). CI's copies are gcc-built for the host and
+      # cannot stand in, so these have a cache of their own, per architecture,
+      # keyed by the scripts that build them and the compiler wrapper and
+      # toolchain they build with. A hit is a no-op build: each script returns
+      # at once when its archive already exists. A path a job never builds is
+      # simply absent from what it saves.
+      #
+      # A step of its own, NOT more paths in tts-release-*: a cache's path
+      # list is part of its version, so adding to that one would miss it and
+      # pay the ONNX Runtime build from cold.
+      - name: Restore the release's vendored libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/mbedtls-3.6.2
+            third_party/mbedtls-3.6.2-aarch64
+            third_party/opus-1.6.1
+            third_party/opus-1.6.1-aarch64
+          key: vendor-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/opus.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
+
+      # The web client's libraries (docs/WEB.md): the daemon is never built
+      # without the client it serves -- the page and loader are compiled into it
+      # (daemon/webapp.h). Built once by their scripts and cached, keyed by the
+      # scripts and the pinned Emscripten.
+      - name: Restore the wasm libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/wasm/mbedtls
+            build/wasm/sdl3
+            build/wasm/libvpx
+            build/wasm/opus
+            build/wasm/speexdsp
+          key: wasm-emsdk6.0.8-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/sdl3_wasm.sh', 'scripts/build/media_wasm.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
+      # RELEASE=1 ARCH=...: zig's clang against glibc 2.34 for the architecture
+      # asked for, every vendored library cross-built the same way (OC_ARCH to
+      # the scripts), the binary stripped at the link. No header comes from the
+      # host: libc's are zig's (the runner's glibc 2.39 headers would redirect
+      # strtol to __isoc23_strtol, a 2.38 symbol the 2.34 stubs do not have),
+      # and SQLite is vendored. One binary per architecture; everything
+      # downstream consumes this exact file. An arm64 build writes its data manifests with the host's
+      # daemon, built from the same sources (mk/daemon.mk).
+      - name: Build the daemon (glibc 2.34)
+        run: |
+          set -euo pipefail
+          mkdir -p "$DIST"
+          make RELEASE=1 ARCH="$MAKE_ARCH" TTS=1 STT=1 SUM=1 WEB=1 OC_BUILD_ID="$BUILD_ID"
+          cp "$BIN" "$DIST/openchimed"
+          # Read-aloud's and voice input's data travel beside the binary, where
+          # `make` assembled them and wrote their manifests; every package takes
+          # them from there.
+          cp -r tts "$DIST/tts"
+          cp -r stt "$DIST/stt"
+          # And the web client's wasm (docs/WEB.md): the page and loader are
+          # inside the binary; this is the one file it serves from beside itself.
+          cp -r web "$DIST/web"
+          packaging/build-rpm.sh "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST" >/dev/null
+      # Saved as soon as the build has run, whether or not the job goes on to
+      # pass: actions/cache saves only after a successful job, so every run
+      # that failed downstream of the engine build paid the twenty minutes
+      # again. The scripts leave a half-made archive or model in a .new
+      # directory, never under these paths, so what is saved is whole.
+      - name: Save the speech engine and models
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            third_party/onnxruntime-1.30.0
+            third_party/onnxruntime-1.30.0-aarch64
+            third_party/onnxruntime-1.30.0-build/out/MinSizeRel/_deps/protobuf-build/protoc*
+            third_party/llamacpp-0.5.0
+            third_party/llamacpp-0.5.0-aarch64
+            build/kitten
+            build/moonshine
+          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+      # The host's binary runs here; the arm64 one is build-only.
+      - name: Speak and hear with the release binary
+        if: matrix.arch == 'amd64'
+        run: |
+          set -euo pipefail
+          ver="$("./$DIST/openchimed" --version)"
+          grep -q "^openchimed ${BUILD_ID} " <<<"$ver" || {
+            echo "::error::the binary does not report build ${BUILD_ID}"; exit 1; }
+          # Read-aloud works from what ships: a render from the stripped file,
+          # finding its voice data beside it and verifying it.
+          said="This release speaks."
+          "./$DIST/openchimed" --tts-say expr-voice-2-f "$said" /tmp/release-check.wav
+          # And voice input hears it, from the stt/ data beside the stripped file.
+          heard="$("./$DIST/openchimed" --stt-hear /tmp/release-check.wav)"
+          echo "heard: $heard"
+          # Judged on words, with a tolerance, not on the exact string.
+          scripts/release/heard_matches.sh "$said" "$heard" || {
+            echo "::error::the release binary did not hear what it said"; exit 1; }
+
+      # The floor is a shipped promise (README: "glibc 2.34+", RHEL 9+), and it
+      # is invisible in a passing build -- a binary needing 2.38 links and runs
+      # perfectly here, then fails to start on the distro it was built for. This
+      # assertion is what enforces it.
+      - name: Assert the glibc floor
+        run: |
+          set -euo pipefail
+          # readelf reads any ELF, whichever architecture the runner is.
+          max=$(readelf --dyn-syms --wide "$DIST/openchimed" \
+                | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)
+          echo "highest glibc symbol required: $max"
+          [ "$max" = "GLIBC_2.34" ] || {
+            echo "::error::binary requires $max, above the supported floor GLIBC_2.34"
+            exit 1
+          }
+
+      # The build-*.sh scripts take an output directory and default to a bare
+      # dist/. They are deliberately left knowing nothing about the per-platform
+      # layout: the release pipeline owns where artifacts go, so one caller
+      # decides it rather than three scripts agreeing by coincidence.
+      - name: Build the .deb and the tarball
+        run: |
+          set -euo pipefail
+          packaging/build-deb.sh     "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST"
+          packaging/build-tarball.sh "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST"
+          # Each package is named for ITS architecture: a release pools both
+          # architectures' files under one prefix, and two named alike collide
+          # there.
+          rpm_arch=$([ "${{ matrix.arch }}" = arm64 ] && echo aarch64 || echo x86_64)
+          for want in "openchimed_${VERSION}_${{ matrix.arch }}.deb" \
+                      "openchimed-${VERSION}-1.${rpm_arch}.rpm" \
+                      "openchimed-${VERSION}-linux-${{ matrix.arch }}.tar.gz"; do
+            [ -f "$DIST/$want" ] || { echo "::error::$DIST has no $want"; ls "$DIST"; exit 1; }
+          done
+
+      # Proves the three channels carry the same file. If this ever fails, the
+      # "one binary, packaged three ways" claim in the docs is false and should
+      # not be published.
+      - name: Verify all channels ship one identical binary
+        run: |
+          set -euo pipefail
+          want=$(sha256sum "$DIST/openchimed" | cut -d' ' -f1)
+          mkdir -p v/deb v/rpm v/tar
+          dpkg-deb -x "$DIST/openchimed_${VERSION}_${{ matrix.arch }}.deb" v/deb
+          ( cd v/rpm && rpm2cpio ../../"$DIST"/openchimed-${VERSION}-1.*.rpm | cpio -idm --quiet )
+          tar xzf "$DIST/openchimed-${VERSION}-linux-${{ matrix.arch }}.tar.gz" -C v/tar
+          for f in v/deb/usr/bin/openchimed v/rpm/usr/bin/openchimed \
+                   v/tar/openchimed-${VERSION}-linux-${{ matrix.arch }}/openchimed; do
+            got=$(sha256sum "$f" | cut -d' ' -f1)
+            [ "$got" = "$want" ] || { echo "::error::$f differs from the built binary"; exit 1; }
+          done
+          echo "all three channels ship $want"
+
+      # Install the real .deb and run what it put on disk (Ubuntu, not a pristine
+      # Debian): the package unpacks, its dependencies resolve, and the binary it
+      # lays down executes. The .rpm is covered only by the identical-binary
+      # check above and the release's dnf smoke.
+      - name: Install the package and run it
+        if: matrix.arch == 'amd64'
+        run: |
+          set -euo pipefail
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            "./$DIST/openchimed_${VERSION}_${{ matrix.arch }}.deb"
+          /usr/bin/openchimed --version
+          # The package put read-aloud's data where an installed daemon looks, and it
+          # verifies: a render by the installed binary, from the installed data.
+          said="The package speaks."
+          /usr/bin/openchimed --tts-say expr-voice-2-f "$said" /tmp/installed-check.wav
+          # And the recognizer's data, the same way.
+          heard="$(/usr/bin/openchimed --stt-hear /tmp/installed-check.wav)"
+          echo "heard: $heard"
+          scripts/release/heard_matches.sh "$said" "$heard" || {
+            echo "::error::the installed daemon did not hear what it said"; exit 1; }
+
+      # The install above does not touch the unit file: both maintainer scripts
+      # gate the enable/start path on `[ -d /run/systemd/system ]`. So the 60
+      # lines of ProtectSystem, DynamicUser and RestrictAddressFamilies that CI
+      # produces need something to actually parse them.
+      #
+      # The runner boots systemd for real, so the check runs directly.
+      #
+      # Not a real boot: that would need the service to start. `verify` resolves
+      # every directive against the installed systemd, which is the failure class
+      # that would otherwise ship unchecked.
+      - name: Validate the unit file
+        if: matrix.arch == 'amd64'
+        run: |
+          set -euo pipefail
+          # systemd-analyze exits 0 even for a directive it does not recognise, so
+          # its status is worthless here -- measured, not assumed. Grep the output.
+          #
+          # The pattern is "Unknown key", NOT "Unknown key name": systemd words it
+          # "Unknown key 'ProtectSystm' in section [Service], ignoring."
+          out=$(systemd-analyze verify /lib/systemd/system/openchimed.service 2>&1 || true)
+          printf "%s\n" "$out"
+          # Scope to OUR unit before matching. `verify` walks the dependency
+          # graph and reports on everything it loads, including whatever systemd
+          # units the runner ships (a snapd.service with an unknown key, say).
+          # Every message about openchimed is
+          # prefixed either with the unit name or with its path and line number,
+          # so filtering on the name first is what keeps this check about us.
+          if printf "%s\n" "$out" | grep "openchimed" | grep -v "is not executable" \
+               | grep -E "Unknown key|Unknown lvalue|Unknown section|Failed to |Invalid "; then
+            echo "::error::openchimed.service has a directive this systemd rejects"
+            exit 1
+          fi
+          echo "unit parses clean"
+
+      # What the build keeps: the binary and the data beside it, as one
+      # tree under a directory named for the build, which is what the image
+      # is laid from (packaging/image-context.sh) and what a release packages
+      # under its number. The placeholder packages above are not kept.
+      - name: Keep the built tree
+        run: |
+          set -euo pipefail
+          name="openchimed-build-${BUILD_ID}-linux-${{ matrix.arch }}"
+          mkdir -p "tree/$name"
+          cp -r "$DIST/openchimed" "$DIST/tts" "$DIST/stt" "$DIST/web" "tree/$name/"
+          # The licence file, assembled here where the vendored texts are
+          # (packaging/licenses.sh); the release packages from this tree on a
+          # runner that has none.
+          packaging/licenses.sh third_party/mbedtls-3.6.2 > "tree/$name/copyright"
+          mkdir -p "candidate/$PLATFORM"
+          tar -C tree --sort=name --owner=0 --group=0 --numeric-owner --mtime="@0" \
+            -czf "candidate/$PLATFORM/$name.tar.gz" "$name"
+          ls -l "candidate/$PLATFORM"
+      # Named for the platform: the store job downloads without merge-multiple,
+      # which rebuilds candidate/<platform>/ on the other side. A hand-off to
+      # the jobs below and nothing more, so it is kept three days: what is kept
+      # is in the bucket.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PLATFORM }}
+          path: candidate/${{ env.PLATFORM }}/*.tar.gz
+          retention-days: 3
+          if-no-files-found: error
+
+  # Built with buildah, not docker, from the packages job's tarball: the image
+  # is the released binary and its data laid onto a glibc base (Dockerfile),
+  # with no compile and no RUN step inside it, so an arm64 image comes off the
+  # x86 runner with `--arch arm64` and no emulation. The per-arch images and
+  # the manifest list that indexes them are two jobs; the per-arch tags are an
+  # implementation detail, nothing is tagged as a release until a release
+  # copies the manifest list to :N (release.yml). Pushed under the build id to
+  # the build repository, IMAGE_REPO_BUILD, every time: a build is complete
+  # only with its image there. The registry takes basic auth, the
+  # IMAGE_REGISTRY_USER variable and IMAGE_REGISTRY_TOKEN_BUILD in the
+  # `release` environment.
+  image:
+    name: ${{ matrix.arch }} image
+    needs: [gate, packages]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    env:
+      BUILD_ID: ${{ needs.gate.outputs.build_id }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-${{ matrix.arch }}
+          path: candidate/linux-${{ matrix.arch }}
+      - name: Install buildah
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          scripts/build/apt.sh buildah
+          buildah version
+      # The build context is the extracted tarball plus the entrypoint -- exactly
+      # what an operator extracting the release would have -- and the pinned
+      # Litestream for this architecture, checked against its published digest
+      # (packaging/image-context.sh, ARCH-3); the entrypoint writes its
+      # configuration at boot.
+      - name: Build the image
+        run: |
+          set -euo pipefail
+          [ -n "$BUILD_IMAGE" ] || { echo "::error::the IMAGE_REPO_BUILD variable is not set"; exit 1; }
+          packaging/image-context.sh "candidate/linux-${{ matrix.arch }}/openchimed-build-${BUILD_ID}-linux-${{ matrix.arch }}.tar.gz" image
+          buildah build --arch "${{ matrix.arch }}" \
+            -f Dockerfile \
+            -t "${BUILD_IMAGE}:build-${BUILD_ID}-${{ matrix.arch }}" \
+            image
+      # The image as it ships, started as a container deployment starts it:
+      # podman is daemonless and reads buildah's store, so no Docker comes back
+      # (ARCH-36). /healthz answering proves the entrypoint, the data directory,
+      # the binary on this base and the data beside it hold together; before
+      # this a fault in any of them reached the registry unchallenged, since nothing
+      # pulled or ran the image. The arm64 image is build-only here, as its
+      # binary is: the runner cannot run it without emulation.
+      - name: Start the image and ask it /healthz
+        if: matrix.arch == 'amd64'
+        run: |
+          set -euo pipefail
+          podman run -d --name oc -p 127.0.0.1:18080:8080 \
+            -e OPENCHIME_WORKSPACE_NAME=Image "${BUILD_IMAGE}:build-${BUILD_ID}-${{ matrix.arch }}"
+          ok=0
+          for i in $(seq 1 60); do
+            if [ "$(curl -fsS http://127.0.0.1:18080/healthz 2>/dev/null || true)" = OK ]; then
+              echo "healthz: OK after ${i} s"; ok=1; break
+            fi
+            sleep 1
+          done
+          echo "--- the daemon's log"; podman logs oc 2>&1 | tail -30
+          podman rm -f oc >/dev/null
+          [ "$ok" = 1 ] || { echo "::error::the image did not answer /healthz within 60 s"; exit 1; }
+      # The step above is the plain start: no bucket, no key, and so no
+      # replicator. This one is the replicated start (ARCH-3, ARCH-39): the image
+      # given its replica-* files streams its database off the box, a box that
+      # finds no database takes it back, and one that cannot read the bucket
+      # does not start. The bucket is a directory on this runner served as S3
+      # by rclone -- a pinned release checked against its published digest, a
+      # process rather than a container (ARCH-38) -- so what was replicated is
+      # read straight off disk. The daemon containers share the runner's
+      # network to reach it on loopback.
+      #
+      #   A  the replica-* files as a deployment writes them under
+      #      /etc/openchime, an empty volume and an empty bucket: it starts,
+      #      its database appears in the bucket under <prefix>/db/ and its
+      #      identity under <identity prefix>/db/.
+      #   B  the same files, a new empty volume: it restores both before the
+      #      daemon starts, and presents the same certificate as A -- the
+      #      identity (ARCH-66b) came back.
+      #   D  the same identity prefix with a data prefix never used, a new
+      #      empty volume: the data begins again and the identity is restored,
+      #      so it presents A's certificate on an empty database.
+      #   E  the same files with a restore time before any copy: the restore
+      #      asked for finds nothing, and the boot stops (exit 3) rather than
+      #      starting the workspace empty.
+      #   C  the same files with a wrong secret, a new empty volume: the
+      #      restore fails, the boot exits non-zero, and no database or
+      #      identity is created.
+      #   F  the files without replica-identity-prefix: the boot stops as
+      #      misconfigured (exit 1), since the data would be replicated and
+      #      the identity not; and the files without replica-endpoint, which
+      #      has no default: misconfigured too.
+      #   G  A's volume with its schema version raised past this daemon's:
+      #      the boot stops with the refusal's own status (exit 4) and token,
+      #      before Litestream starts.
+      - name: Replicate the database off the image and restore it onto a new volume
+        if: matrix.arch == 'amd64'
+        run: |
+          set -euo pipefail
+          IMAGE="${BUILD_IMAGE}:build-${BUILD_ID}-${{ matrix.arch }}"
+          RCLONE=v1.75.2
+          RCLONE_SHA256=349ac8fba6ff65d6247043f1750cdcb518ec5d500ef91463a10d37c0ccdf3702
+          W="$RUNNER_TEMP/replica"
+          BUCKET=oc-replica
+          PREFIX=p/data/1
+          IDPREFIX=p/identity/1
+          mkdir -p "$W/s3/$BUCKET" "$W/creds" "$W/creds-c" "$W/creds-d"
+
+          curl -fsSL --retry 3 -o "$W/rclone.zip" \
+            "https://github.com/rclone/rclone/releases/download/${RCLONE}/rclone-${RCLONE}-linux-amd64.zip"
+          echo "${RCLONE_SHA256}  $W/rclone.zip" | sha256sum -c -
+          unzip -q -j "$W/rclone.zip" "rclone-${RCLONE}-linux-amd64/rclone" -d "$W"
+          # Buckets are the directories under s3/; the one key pair is the only
+          # one accepted, so a wrong secret is refused as a real provider would.
+          "$W/rclone" serve s3 --addr 127.0.0.1:19000 --auth-key ci-key,ci-secret "$W/s3" > "$W/rclone.log" 2>&1 &
+          RCLONE_PID=$!
+          trap 'podman rm -f oc-a oc-b oc-d >/dev/null 2>&1 || true; kill "$RCLONE_PID" 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null http://127.0.0.1:19000/ && break
+            sleep 1
+          done
+
+          # One box: host network, its own data directory, ports clear of the
+          # step above. Arguments after the data directory go to podman.
+          start() {
+            local name="$1" data="$2"; shift 2
+            mkdir -p "$data"
+            podman run -d --name "$name" --network host -v "$data:/data" \
+              -e OPENCHIME_WORKSPACE_NAME=Image -e OPENCHIME_HEALTH_PORT=18081 -e OPENCHIME_PORT=18443 \
+              "$@" "$IMAGE" >/dev/null
+          }
+          healthz() {
+            for i in $(seq 1 60); do
+              if [ "$(curl -fsS http://127.0.0.1:18081/healthz 2>/dev/null || true)" = OK ]; then
+                echo "$1: healthz OK after ${i} s"; return 0
+              fi
+              sleep 1
+            done
+            echo "--- $1's log"; podman logs "$1" 2>&1 | tail -40
+            echo "::error::$1 did not answer /healthz within 60 s"; return 1
+          }
+          # Only what lands under the two prefixes counts, and anything outside
+          # them is an error: each database is db/ under its own prefix.
+          replicas() { find "$W/s3/$BUCKET/${1:-$PREFIX}/db" -type f -name '*.ltx' 2>/dev/null | wc -l; }
+          stray() { find "$W/s3/$BUCKET" -type f ! -path "$W/s3/$BUCKET/$PREFIX/db/*" ! -path "$W/s3/$BUCKET/$IDPREFIX/db/*" | head -5; }
+          # The deployment's files, 0600 as a deployment writes them.
+          creds() {
+            local dir="$1" secret="$2" data="${3:-$PREFIX}"
+            printf '%s' "$BUCKET" > "$dir/replica-bucket"
+            printf '%s' "$data" > "$dir/replica-prefix"
+            printf '%s' "$IDPREFIX" > "$dir/replica-identity-prefix"
+            printf '%s' ci-key > "$dir/replica-accesskey"
+            printf '%s' "$secret" > "$dir/replica-secretkey"
+            printf '%s' http://127.0.0.1:19000 > "$dir/replica-endpoint"
+            chmod 600 "$dir"/replica-*
+          }
+          creds "$W/creds" ci-secret
+          creds "$W/creds-c" not-the-secret
+          creds "$W/creds-d" ci-secret p/data/2
+
+          # A: the files, an empty volume, an empty bucket.
+          start oc-a "$W/data-a" -v "$W/creds:/etc/openchime:ro"
+          healthz oc-a
+          # The log goes to a file first: under pipefail, grep -q stops reading at
+          # its first match and `podman logs` then fails on the closed pipe.
+          podman logs oc-a > "$W/a-boot.log" 2>&1
+          # The entrypoint's stable tokens (entrypoint.sh), never its sentences.
+          grep -qxF 'entrypoint: restore=empty' "$W/a-boot.log" \
+            || { tail -40 "$W/a-boot.log"; echo "::error::A did not report an empty replica on its first boot"; exit 1; }
+          grep -qxF 'entrypoint: replica=on' "$W/a-boot.log" \
+            || { tail -40 "$W/a-boot.log"; echo "::error::A did not start replicating"; exit 1; }
+          # Litestream syncs every 60 s (the configuration entrypoint.sh writes).
+          ok=0
+          for i in $(seq 1 150); do
+            if [ "$(replicas)" -gt 0 ] && [ "$(replicas "$IDPREFIX")" -gt 0 ]; then echo "A: replicated after ${i} s"; ok=1; break; fi
+            sleep 1
+          done
+          [ "$ok" = 1 ] || { podman logs oc-a 2>&1 | tail -40; tail -20 "$W/rclone.log"; find "$W/s3" -type f | head -20; echo "::error::nothing reached $PREFIX/db/ and $IDPREFIX/db/ in the bucket within 150 s"; exit 1; }
+          # A stop is SIGTERM to Litestream, which passes it to the daemon and
+          # syncs once more after the daemon has exited.
+          podman stop -t 30 oc-a >/dev/null
+          echo "A: exited $(podman inspect -f '{{.State.ExitCode}}' oc-a) on SIGTERM; $(replicas) LTX files in the bucket"
+          echo "--- A's log"; podman logs oc-a 2>&1 | tail -20
+          podman rm oc-a >/dev/null
+          [ -s "$W/data-a/cert.pem" ] || { echo "::error::A left no cert.pem"; exit 1; }
+          [ -z "$(stray)" ] || { stray; echo "::error::A wrote to the bucket outside $PREFIX/db/ and $IDPREFIX/db/"; exit 1; }
+
+          # B: the same files, onto an empty volume.
+          start oc-b "$W/data-b" -v "$W/creds:/etc/openchime:ro"
+          healthz oc-b
+          podman logs oc-b > "$W/b-boot.log" 2>&1
+          grep -qxF 'entrypoint: restore=ok' "$W/b-boot.log" \
+            || { tail -40 "$W/b-boot.log"; echo "::error::B did not restore the database"; exit 1; }
+          grep -qxF 'entrypoint: identity-restore=ok' "$W/b-boot.log" \
+            || { tail -40 "$W/b-boot.log"; echo "::error::B did not restore the identity"; exit 1; }
+          cmp -s "$W/data-a/cert.pem" "$W/data-b/cert.pem" \
+            || { echo "::error::B presents a different certificate from A: the restored database did not carry its identity"; exit 1; }
+          echo "B: restored, and presents A's certificate"
+          podman rm -f oc-b >/dev/null
+
+          # D: the identity kept, the data begun again in a new place.
+          start oc-d "$W/data-d" -v "$W/creds-d:/etc/openchime:ro"
+          healthz oc-d
+          podman logs oc-d > "$W/d-boot.log" 2>&1
+          grep -qxF 'entrypoint: identity-restore=ok' "$W/d-boot.log" \
+            || { tail -40 "$W/d-boot.log"; echo "::error::D did not restore the identity"; exit 1; }
+          grep -qxF 'entrypoint: restore=empty' "$W/d-boot.log" \
+            || { tail -40 "$W/d-boot.log"; echo "::error::D did not begin its data again"; exit 1; }
+          cmp -s "$W/data-a/cert.pem" "$W/data-d/cert.pem" \
+            || { echo "::error::D presents a different certificate from A: the kept identity was not used"; exit 1; }
+          echo "D: data begun again, and presents A's certificate"
+          podman rm -f oc-d >/dev/null
+
+          # E: a restore asked for -- to a time before any copy -- finds none.
+          # It must stop the boot, not start the workspace empty.
+          mkdir -p "$W/creds-e" "$W/data-e"
+          creds "$W/creds-e" ci-secret
+          printf '%s' 2000-01-01T00:00:00Z > "$W/creds-e/replica-restore-at"
+          chmod 600 "$W/creds-e"/replica-*
+          rc=0
+          podman run --rm --name oc-e --network host -v "$W/data-e:/data" \
+            -e OPENCHIME_WORKSPACE_NAME=Image -e OPENCHIME_HEALTH_PORT=18081 -e OPENCHIME_PORT=18443 \
+            -v "$W/creds-e:/etc/openchime:ro" \
+            "$IMAGE" > "$W/e.log" 2>&1 || rc=$?
+          echo "--- E's log"; tail -12 "$W/e.log"
+          [ "$rc" -eq 3 ] && grep -qxF 'entrypoint: restore=failed' "$W/e.log" \
+            || { echo "::error::E (a restore to a time with no copy) exited ${rc}, not 3 at the restore"; exit 1; }
+          [ ! -e "$W/data-e/openchime.db" ] || { echo "::error::E started a database after its asked-for restore found nothing"; exit 1; }
+          echo "E: a restore with nothing to restore stopped the boot"
+
+          # C: the same files with a wrong secret. The boot must fail, before
+          # the daemon starts.
+          rc=0
+          mkdir -p "$W/data-c"
+          podman run --rm --name oc-c --network host -v "$W/data-c:/data" \
+            -e OPENCHIME_WORKSPACE_NAME=Image -e OPENCHIME_HEALTH_PORT=18081 -e OPENCHIME_PORT=18443 \
+            -v "$W/creds-c:/etc/openchime:ro" \
+            "$IMAGE" > "$W/c.log" 2>&1 || rc=$?
+          echo "--- C's log"; tail -20 "$W/c.log"
+          [ "$rc" -ne 0 ] || { echo "::error::a boot that could not read its bucket exited 0"; exit 1; }
+          # podman run passes the entrypoint's status through: 3 is the restore's.
+          # The identity is restored first, so that is where it stops.
+          [ "$rc" -eq 3 ] && grep -qxF 'entrypoint: identity-restore=failed' "$W/c.log" \
+            || { echo "::error::C failed (exit ${rc}), but not at the restore"; exit 1; }
+          [ ! -e "$W/data-c/openchime.db" ] && [ ! -e "$W/data-c/identity/identity.db" ] \
+            || { echo "::error::C created a database after its restore failed"; exit 1; }
+          echo "C: exited ${rc} at the restore, with no database created"
+
+          # F: replication asked for with no place for the identity, and with
+          # no endpoint.
+          for missing in replica-identity-prefix replica-endpoint; do
+            rm -rf "$W/creds-f" "$W/data-f"
+            mkdir -p "$W/creds-f" "$W/data-f"
+            creds "$W/creds-f" ci-secret
+            rm "$W/creds-f/$missing"
+            rc=0
+            podman run --rm --name oc-f --network host -v "$W/data-f:/data" \
+              -e OPENCHIME_WORKSPACE_NAME=Image -e OPENCHIME_HEALTH_PORT=18081 -e OPENCHIME_PORT=18443 \
+              -v "$W/creds-f:/etc/openchime:ro" \
+              "$IMAGE" > "$W/f.log" 2>&1 || rc=$?
+            echo "--- F's log, without $missing"; tail -6 "$W/f.log"
+            [ "$rc" -eq 1 ] && grep -qxF 'entrypoint: replica=misconfigured' "$W/f.log" \
+              || { echo "::error::F (replication without $missing) exited ${rc}, not 1 as misconfigured"; exit 1; }
+            [ ! -e "$W/data-f/openchime.db" ] || { echo "::error::F started a database without $missing"; exit 1; }
+            echo "F: replication without $missing refused"
+          done
+
+          # G: data a newer daemon wrote. A's volume, copied, its schema
+          # version raised past the newest this daemon has.
+          cp -a "$W/data-a" "$W/data-g"
+          python3 -I -c 'import sqlite3, sys
+          c = sqlite3.connect(sys.argv[1])
+          c.execute("INSERT INTO schema_version(version) VALUES((SELECT MAX(version) FROM schema_version) + 1000)")
+          c.commit()' "$W/data-g/openchime.db"
+          rc=0
+          podman run --rm --name oc-g --network host -v "$W/data-g:/data" \
+            -e OPENCHIME_WORKSPACE_NAME=Image -e OPENCHIME_HEALTH_PORT=18081 -e OPENCHIME_PORT=18443 \
+            -v "$W/creds:/etc/openchime:ro" \
+            "$IMAGE" > "$W/g.log" 2>&1 || rc=$?
+          echo "--- G's log"; tail -6 "$W/g.log"
+          [ "$rc" -eq 4 ] && grep -qxF 'entrypoint: data=too-new' "$W/g.log" \
+            || { echo "::error::G (data a newer daemon wrote) exited ${rc}, not 4 with its token"; exit 1; }
+          ! grep -qF 'entrypoint: replica=on' "$W/g.log" \
+            || { echo "::error::G started replicating data it refused"; exit 1; }
+          echo "G: newer data refused with exit 4, before replication"
+      - name: Push the per-architecture image
+        env:
+          TOKEN: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
+        run: |
+          set -euo pipefail
+          [ -n "$TOKEN" ] || { echo "::error::IMAGE_REGISTRY_TOKEN_BUILD is not set in the release environment"; exit 1; }
+          printf '%s' "$TOKEN" | buildah login -u "$IMAGE_REGISTRY_USER" --password-stdin "${BUILD_IMAGE%%/*}"
+          buildah push "${BUILD_IMAGE}:build-${BUILD_ID}-${{ matrix.arch }}"
+
+  # :build-<id> only; a release copies it to :N and moves :latest, in the
+  # build repository and the optional second one (release.yml).
+  image-manifest:
+    name: container image manifest
+    needs: [gate, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    env:
+      BUILD_ID: ${{ needs.gate.outputs.build_id }}
+    steps:
+      - uses: actions/checkout@v7   # for scripts/build/apt.sh
+      - name: Install buildah
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          scripts/build/apt.sh buildah
+      - name: Publish the manifest list
+        env:
+          TOKEN: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
+        run: |
+          set -euo pipefail
+          [ -n "$TOKEN" ] || { echo "::error::IMAGE_REGISTRY_TOKEN_BUILD is not set in the release environment"; exit 1; }
+          printf '%s' "$TOKEN" | buildah login -u "$IMAGE_REGISTRY_USER" --password-stdin "${BUILD_IMAGE%%/*}"
+          buildah manifest create "${BUILD_IMAGE}:build-${BUILD_ID}"
+          for a in amd64 arm64; do
+            buildah manifest add "${BUILD_IMAGE}:build-${BUILD_ID}" "docker://${BUILD_IMAGE}:build-${BUILD_ID}-${a}"
+          done
+          buildah manifest push --all "${BUILD_IMAGE}:build-${BUILD_ID}" "docker://${BUILD_IMAGE}:build-${BUILD_ID}"
+
+  # The Windows client (ARCH-80/81). It carries the same build id as the
+  # daemon even though it is a separate program, so a support question only
+  # ever needs one identifier.
+  #
+  # Split across two runners for one reason: the binaries cross-compile on
+  # Linux, exactly as `make windows` does locally, with the pinned
+  # llvm-mingw make fetches (mk/toolchains.mk); Authenticode signing and MSIX
+  # packaging (makeappx.exe) exist only on Windows, so the next job does those.
+  # Compiling on windows-latest instead would mean maintaining a second,
+  # otherwise-unused toolchain for the same source.
+  windows-build:
+    name: windows binaries
+    needs: [gate, tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      BUILD_ID: ${{ needs.gate.outputs.build_id }}
+      BUILD_NUM: ${{ needs.gate.outputs.run_number }}
+    steps:
+      # Every CPU the runner has, for every make below and the makes they
+      # start (the Makefile is safe under -j; locally nothing changes).
+      - name: Use every CPU for make
+        run: echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+      - name: Install build dependencies
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          # bzip2 for the mbedTLS tarball, nasm for libvpx's assembly, xz-utils
+          # for the toolchain tarball.
+          scripts/build/apt.sh bzip2 nasm xz-utils
+      - name: Restore the toolchain
+        uses: actions/cache@v6
+        with:
+          path: third_party/llvm-mingw-20261006
+          key: toolchain-mingw-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh') }}
+      - name: Restore the vendored Windows libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/mbedtls-3.6.2-win
+            third_party/libvpx-1.17.0-win
+            third_party/opus-1.6.1-win
+            third_party/speexdsp-1.2.1-win
+            third_party/sdl3-3.4.14-win
+            third_party/mbedtls-3.6.2
+          key: vendor-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh', 'scripts/build/mbedtls.sh', 'scripts/build/mbedtls_windows.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh', 'scripts/build/sdl3_windows.sh') }}
+
+      # The two Windows test programs are built too, from the same toolchain
+      # and libraries (a Windows host runs them, docs/TESTING.md): their one
+      # build in CI. Built, not kept.
+      - name: Build the GUI, the TUI and the test programs
+        run: |
+          set -euo pipefail
+          make OC_BUILD_ID="$BUILD_ID" OC_BUILD_NUM="$BUILD_NUM" windows build/sdltext_test.exe build/gfx_test.exe
+          # Both are statically linked, so nothing downstream has to chain a
+          # redistributable. If that ever stops being true the installer will
+          # still build and the app will fail to start on a clean machine, so
+          # it is asserted here rather than discovered there.
+          for f in build/openchime.exe build/openchime-tui.exe; do
+            kind="$(file "$f")"
+            grep -q 'PE32+' <<<"$kind" || { echo "::error::$f is not a PE32+ binary"; exit 1; }
+          done
+
+      # Named for the toolchain, not the platform: unpackaged compiler outputs
+      # handed to the next job and to the store, never a release artifact.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mingw-binaries
+          path: |
+            build/openchime.exe
+            build/openchime-tui.exe
+            build/openchime.debug
+          retention-days: 3
+          if-no-files-found: error
+
+  # The installer and the MSIX are built here only to prove they build from
+  # these binaries: unsigned, under a placeholder version, and not kept. A
+  # release signs the same binaries and wraps them under its number
+  # (release.yml), since the installer embeds the signed files.
+  windows-package:
+    name: windows installers build
+    needs: [gate, windows-build]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      BUILD_NUM: ${{ needs.gate.outputs.run_number }}
+      VERSION: "0"
+      DIST: dist/windows-x64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: mingw-binaries
+          path: build
+
+      # Both binaries carry a VERSIONINFO resource (client/shared/res). It is
+      # asserted rather than assumed because the failure is silent: a missing
+      # or misbuilt resource still produces a working .exe, and the installer
+      # wrapping it carries its own version, so nothing downstream notices that
+      # the shipped files report none. Before that resource existed this step
+      # read back empty for both.
+      - name: Check the embedded version
+        shell: pwsh
+        run: |
+          $want = "1.0.$env:BUILD_NUM.0"
+          foreach ($f in 'build\openchime.exe','build\openchime-tui.exe') {
+            $got = (Get-Item $f).VersionInfo.FileVersion
+            if ($got -ne $want) { throw "$f reports FileVersion '$got', expected '$want'" }
+            Write-Host "$f $got"
+          }
+
+      # The SDK ships on the runner image but is not on PATH, and its versioned
+      # directory moves with each image update, so it is discovered rather than
+      # pinned to a build number that would silently rot.
+      - name: Locate the Windows SDK
+        shell: pwsh
+        run: |
+          $bin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $sdk = Get-ChildItem $bin -Directory -ErrorAction Stop |
+                 Where-Object Name -match '^10\.' | Sort-Object Name | Select-Object -Last 1
+          if (-not $sdk) { throw "no Windows 10 SDK under $bin" }
+          Write-Host "using SDK $($sdk.Name)"
+          "$($sdk.FullName)\x64" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          # DIST is written with forward slashes because upload-artifact's globs
+          # require them; ISCC is given the backslash form rather than trusting
+          # it to normalise a path handed to /O.
+          $out = $env:DIST -replace '/','\'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+              "/DVersion=$env:VERSION" "/O$out" packaging\windows\openchime.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      # Left unsigned on purpose: a Store submission is re-signed by Microsoft,
+      # and signing it here with our own certificate would be discarded. A
+      # sideloadable .msix is a different artifact and would need one.
+      - name: Build the MSIX
+        shell: pwsh
+        run: |
+          $stage = 'build\msix'
+          New-Item -ItemType Directory -Force "$stage\bin" | Out-Null
+          Copy-Item packaging\windows\msix\* $stage -Recurse -Force
+          Copy-Item build\*.exe "$stage\bin"
+
+          # scripts/release/version.sh hands out a bare integer; MSIX requires a.b.c.d with the
+          # fourth field reserved for the Store, so the release number lands in
+          # the third. Monotonic, which is all the Store checks.
+          $m = "$stage\AppxManifest.xml"
+          (Get-Content $m -Raw).Replace('Version="1.0.0.0"', "Version=`"1.0.$env:VERSION.0`"") |
+            Set-Content $m -Encoding utf8
+
+          # Without a resources.pri the scale-N asset variants are inert and
+          # the tile renders from the scale-100 file at every DPI.
+          makepri.exe createconfig /cf "$stage\priconfig.xml" /dq en-US /o
+          makepri.exe new /pr $stage /cf "$stage\priconfig.xml" /of "$stage\resources.pri" /o
+          Remove-Item "$stage\priconfig.xml"
+
+          $out = $env:DIST -replace '/','\'
+          makeappx.exe pack /d $stage /p "$out\openchime-$env:VERSION.msix" /o
+          if ($LASTEXITCODE -ne 0) { throw "makeappx failed" }
+
+  # The build, stored by its build id: every tree and binary under
+  # candidates/<id>/ in the mirror bucket, with a manifest naming each file's
+  # sha256 and the images' digests, signed with the repository signing key.
+  # The manifest exists only once every job above passed, so a stored manifest
+  # is what "a passed staging build" means: release-candidate.yml promotes
+  # from it, and a release fetches this directory and verifies it before it
+  # packages anything (scripts/release/candidate_fetch.sh). The bucket is the
+  # one copy; no workflow artifact of it is kept, so nothing about a build
+  # expires with a run.
+  store:
+    name: store the build
+    needs: [gate, packages, image-manifest, windows-build, windows-package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # The `release` environment for IMAGE_REGISTRY_TOKEN_BUILD: the digests
+    # below are read from the build repository, which needs a login.
+    environment: release
+    permissions:
+      contents: read
+      statuses: write   # the commit status staging-build, set once stored
+    env:
+      BUILD_ID: ${{ needs.gate.outputs.build_id }}
+      # The offset run number from `id`, which the Windows binaries carry and
+      # the release checks them against; not GITHUB_RUN_NUMBER.
+      RUN_NUMBER: ${{ needs.gate.outputs.run_number }}
+      DIST_S3_ENDPOINT:           ${{ vars.DIST_S3_ENDPOINT }}
+      DIST_S3_MIRROR_ACCESS_KEY: ${{ secrets.DIST_S3_MIRROR_ACCESS_KEY }}
+      DIST_S3_MIRROR_SECRET_KEY: ${{ secrets.DIST_S3_MIRROR_SECRET_KEY }}
+      DIST_MIRROR_BUCKET:        ${{ vars.DIST_MIRROR_BUCKET }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # the release-* tags, for the prune below
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: linux-*
+          path: candidate
+      - uses: actions/download-artifact@v8
+        with:
+          name: mingw-binaries
+          path: candidate/windows-x64
+      - name: Install tooling
+        timeout-minutes: 20
+        run: scripts/build/apt.sh rclone gnupg skopeo
+      - name: Import the signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.REPO_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$GPG_PRIVATE_KEY" ] || { echo "::error::REPO_SIGNING_KEY is not set; a build cannot be signed"; exit 1; }
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+      - name: Configure rclone for the mirror bucket
+        run: |
+          set -euo pipefail
+          for v in DIST_S3_ENDPOINT DIST_S3_MIRROR_ACCESS_KEY DIST_S3_MIRROR_SECRET_KEY DIST_MIRROR_BUCKET; do
+            [ -n "${!v}" ] || { echo "::error::$v is not set"; exit 1; }
+          done
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [dist-mirror]
+          type = s3
+          provider = Other
+          access_key_id = ${DIST_S3_MIRROR_ACCESS_KEY}
+          secret_access_key = ${DIST_S3_MIRROR_SECRET_KEY}
+          endpoint = ${DIST_S3_ENDPOINT}
+          region = ${DIST_S3_REGION}
+          EOF
+      - name: Write and sign the manifest
+        env:
+          IMAGE_REGISTRY_TOKEN_BUILD: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
+        run: |
+          set -euo pipefail
+          [ -n "$IMAGE_REGISTRY_TOKEN_BUILD" ] || { echo "::error::IMAGE_REGISTRY_TOKEN_BUILD is not set in the release environment"; exit 1; }
+          find candidate -type f | sort
+          images=""
+          for t in "build-${BUILD_ID}-amd64" "build-${BUILD_ID}-arm64" "build-${BUILD_ID}"; do
+            d=$(skopeo inspect --raw --creds "${IMAGE_REGISTRY_USER}:${IMAGE_REGISTRY_TOKEN_BUILD}" \
+                  "docker://${BUILD_IMAGE}:${t}" | sha256sum | cut -d' ' -f1)
+            images="$images ${t}=sha256:${d}"
+          done
+          scripts/release/candidate_manifest.sh write candidate "$BUILD_ID" "$GITHUB_SHA" "$RUN_NUMBER" "$GITHUB_RUN_ID" $images
+          scripts/release/candidate_manifest.sh sign candidate
+          scripts/release/candidate_manifest.sh verify candidate "$BUILD_ID"
+      - name: Store the build
+        run: |
+          set -euo pipefail
+          dest="dist-mirror:${DIST_MIRROR_BUCKET}/candidates/${BUILD_ID}"
+          # The manifest last, its signature just before it: a store cut off
+          # part way leaves files and no manifest, which nothing reads as a
+          # build (the gate builds the commit again, release-candidate.yml
+          # skips it), never a manifest naming files that are not there.
+          rclone copy candidate "$dest" --fast-list --exclude '/manifest.json*'
+          rclone copyto candidate/manifest.json.asc "${dest}/manifest.json.asc"
+          rclone copyto candidate/manifest.json "${dest}/manifest.json"
+          echo "stored candidates/${BUILD_ID} in ${DIST_MIRROR_BUCKET}"
+          {
+            echo "### Build \`${BUILD_ID}\`"
+            echo
+            echo "- commit \`${GITHUB_SHA}\`, run ${RUN_NUMBER}"
+            echo "- \`candidates/${BUILD_ID}/\` in \`${DIST_MIRROR_BUCKET}\`"
+            echo "- image \`${BUILD_IMAGE}:build-${BUILD_ID}\`"
+            echo "- to make it a release-candidate: \`gh workflow run release-candidate.yml --ref staging -f build=${BUILD_ID}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      # The passed build, shown on the commit: a status named staging-build,
+      # linking this run. Informational; release-candidate.yml reads the
+      # bucket, not this.
+      - name: Mark the commit built
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state=success -f context=staging-build \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            -f description="stored as candidates/${BUILD_ID}" >/dev/null
+          echo "status staging-build set on ${GITHUB_SHA:0:7}"
+      # Builds stored more than thirty days ago that no release-* tag names are
+      # deleted; the tags say which build ids were released, or are standing
+      # release-candidates, and those stay. The age is the manifest's own
+      # `created`, never the bucket's idea of a directory's time, which an
+      # object store does not keep. The build this run stored is never pruned,
+      # and a directory with no manifest (a store still running, or one that
+      # stopped half way) is left alone. A failure here is a warning: the
+      # build is stored either way.
+      - name: Prune old builds
+        id: prune
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet
+          released=$(git tag -l 'release-*' | while read -r t; do git rev-parse "${t}^{commit}" | cut -c1-7; done | sort -u)
+          rm -rf "$RUNNER_TEMP/manifests"
+          rclone copy "dist-mirror:${DIST_MIRROR_BUCKET}/candidates" "$RUNNER_TEMP/manifests" \
+            --include '/*/manifest.json' --fast-list
+          python3 -I - "$RUNNER_TEMP/manifests" "$BUILD_ID" > "$RUNNER_TEMP/old.txt" <<'PY'
+          import datetime, json, os, sys
+          root, current = sys.argv[1:]
+          now = datetime.datetime.now(datetime.timezone.utc)
+          for name in sorted(os.listdir(root)):
+              if name == current:
+                  continue
+              try:
+                  m = json.load(open(os.path.join(root, name, "manifest.json")))
+                  t = datetime.datetime.strptime(m["created"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+              except (OSError, ValueError, KeyError) as e:
+                  print(f"prune: {name}: unreadable manifest ({e}); left alone", file=sys.stderr)
+                  continue
+              if (now - t).days > 30:
+                  print(name)
+          PY
+          while read -r id; do
+            [ -n "$id" ] || continue
+            if grep -qxF -- "$id" <<<"$released"; then echo "keeping released $id"; continue; fi
+            echo "pruning build $id"
+            rclone purge "dist-mirror:${DIST_MIRROR_BUCKET}/candidates/${id}"
+          done < "$RUNNER_TEMP/old.txt"
+          echo "pruned"
+      - name: Report a failed prune
+        if: steps.prune.outcome == 'failure'
+        run: echo "::warning::old builds were not pruned; the build is stored. The next staging build prunes again."

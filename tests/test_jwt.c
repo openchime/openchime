@@ -1,0 +1,337 @@
+/* Unit tests for ES256 JWT verification (daemon/jwt.c + vendored jsmn).
+ *
+ * A test issuer stands in for the central service (AUTH.md §3.6): the test
+ * generates an ECDSA P-256 keypair, mints central-style ES256 JWTs, and pins
+ * the daemon to the test public key — the same faking approach the TLS/netloop
+ * integration tests use. Covers the happy path plus the rejections the pin is
+ * meant to guarantee: wrong key, tampering, wrong audience/issuer, expiry, and
+ * a non-ES256 alg. base64url encoding + DER->raw signature conversion live here
+ * (the daemon only ever decodes/verifies). */
+
+#include "jwt.h"
+#include "issuer.h"
+#include "localissuer.h"
+#include <stdlib.h>
+#include <time.h>
+#include "check.h"
+
+#include <string.h>
+
+static const char *ISS = "https://auth.openchime.io";
+static const char *AUD = "acme.example";
+static const uint64_t NOW = 1700000000ull;     /* fixed "now" for exp checks */
+
+/* A key and its RFC 7638 thumbprint as ANOTHER implementation computed it (the
+ * central service's signer), so the two sides are checked against each
+ * other rather than this one against itself. */
+static const char VECTOR_PEM[] =
+    "-----BEGIN PUBLIC KEY-----\n"
+    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEDqHKx+q7OAQmDqj5y9NaFRRyMFoH\n"
+    "tdCjHSfxAGUIA9+4UU024HTVfwxlAyEJ/AZuJbyJG5DrtbEcEXSVdX1U1A==\n"
+    "-----END PUBLIC KEY-----\n";
+static const char VECTOR_KID[] = "lQcjs5PMWtfx7_V-dHADA3euhG-Jiopb92C5hPrTmYM";
+
+static oc_jwt_result verify_payload(oc_issuer *is, const char *pems, const char *payload,
+                                    oc_jwt_claims *c) {
+    char hdr[160], token[4096];
+    oc_issuer_header(is, hdr, sizeof hdr);
+    size_t tlen = oc_issuer_mint(is, hdr, payload, token);
+    return oc_jwt_verify(token, tlen, pems, strlen(pems) + 1, ISS, AUD, NOW, c);
+}
+
+/* A demo invitation (AUTH.md §8.12): central's signed word for one
+ * member account, told from a sign-in token by its typ and its claims. */
+static void test_demo_invite(oc_issuer *is, const char *pem) {
+    size_t pl = strlen(pem) + 1;
+    char kid[OC_JWT_THUMBPRINT_LEN + 1];
+    CHECK(oc_jwt_key_thumbprint(pem, pl, kid) == 0);
+    char hdr[200], bad_hdr[200], pay[512], tok[2048];
+    snprintf(hdr, sizeof hdr, "{\"alg\":\"ES256\",\"typ\":\"" OC_JWT_DEMO_INVITE_TYP "\",\"kid\":\"%s\"}", kid);
+    #define DEMO_PAY(iat, exp, role, aud) snprintf(pay, sizeof pay, \
+        "{\"iss\":\"%s\",\"aud\":\"%s\",\"iat\":%llu,\"exp\":%llu,\"jti\":\"inv-1\",\"role\":\"%s\"}", \
+        ISS, aud, (unsigned long long)(iat), (unsigned long long)(exp), role)
+    oc_jwt_invite inv;
+    DEMO_PAY(NOW - 5, NOW + 895, "member", AUD);
+    size_t n = oc_issuer_mint(is, hdr, pay, tok);
+    CHECK(oc_jwt_verify_demo_invite(tok, n, pem, pl, ISS, AUD, NOW, &inv) == OC_JWT_OK);
+    CHECK(strcmp(inv.jti, "inv-1") == 0 && strcmp(inv.role, "member") == 0 && inv.exp == NOW + 895);
+    /* It is not a sign-in token. */
+    oc_jwt_claims c;
+    CHECK(oc_jwt_verify(tok, n, pem, pl, ISS, AUD, NOW, &c) != OC_JWT_OK);
+    /* Fifteen minutes at most; a member only; this workspace; not yet expired. */
+    DEMO_PAY(NOW - 5, NOW + 1000, "member", AUD);
+    n = oc_issuer_mint(is, hdr, pay, tok);
+    CHECK(oc_jwt_verify_demo_invite(tok, n, pem, pl, ISS, AUD, NOW, &inv) == OC_JWT_E_CLAIMS);
+    DEMO_PAY(NOW - 5, NOW + 600, "admin", AUD);
+    n = oc_issuer_mint(is, hdr, pay, tok);
+    CHECK(oc_jwt_verify_demo_invite(tok, n, pem, pl, ISS, AUD, NOW, &inv) == OC_JWT_E_CLAIMS);
+    DEMO_PAY(NOW - 5, NOW + 600, "member", "other.example");
+    n = oc_issuer_mint(is, hdr, pay, tok);
+    CHECK(oc_jwt_verify_demo_invite(tok, n, pem, pl, ISS, AUD, NOW, &inv) == OC_JWT_E_CLAIMS);
+    DEMO_PAY(NOW - 900, NOW - 100, "member", AUD);
+    n = oc_issuer_mint(is, hdr, pay, tok);
+    CHECK(oc_jwt_verify_demo_invite(tok, n, pem, pl, ISS, AUD, NOW, &inv) == OC_JWT_E_EXPIRED);
+    /* The right claims under another typ, or none, are no invitation. */
+    DEMO_PAY(NOW - 5, NOW + 600, "member", AUD);
+    snprintf(bad_hdr, sizeof bad_hdr, "{\"alg\":\"ES256\",\"typ\":\"JWT\",\"kid\":\"%s\"}", kid);
+    n = oc_issuer_mint(is, bad_hdr, pay, tok);
+    CHECK(oc_jwt_verify_demo_invite(tok, n, pem, pl, ISS, AUD, NOW, &inv) == OC_JWT_E_CLAIMS);
+    snprintf(bad_hdr, sizeof bad_hdr, "{\"alg\":\"ES256\",\"kid\":\"%s\"}", kid);
+    n = oc_issuer_mint(is, bad_hdr, pay, tok);
+    CHECK(oc_jwt_verify_demo_invite(tok, n, pem, pl, ISS, AUD, NOW, &inv) == OC_JWT_E_CLAIMS);
+    #undef DEMO_PAY
+}
+
+int run_jwt_tests(void) {
+    printf("test_jwt: ES256 verify to the contract: key set by kid, required claims, "
+           "lifetime, unescape, over-long refused, nonce, base64url\n");
+
+    /* The test issuer's keypair, and a second (attacker) issuer. */
+    oc_issuer iss, other;
+    CHECK(oc_issuer_init(&iss, "oc-jwt-test") == 0);
+    CHECK(oc_issuer_init(&other, "oc-jwt-attacker") == 0);
+    const char *pem = iss.pem, *pem_other = other.pem;
+    size_t pem_len = strlen(pem) + 1;            /* mbedTLS PEM parse wants the NUL */
+    size_t pem_other_len = strlen(pem_other) + 1;
+
+    char HDR[160];
+    oc_issuer_header(&iss, HDR, sizeof HDR);
+    char payload[1024];
+    oc_issuer_payload(payload, sizeof payload, ISS, AUD, "https://accounts.google.com|1234567890",
+                      "jti-1", NOW - 10, NOW + 290,
+                      "\"email\":\"alice@acme.example\",\"email_verified\":true,"
+                      "\"name\":\"Alice\",\"idp\":\"google\",\"tenant\":\"acme.example\"");
+
+    char token[4096];
+    size_t tlen = oc_issuer_mint(&iss, HDR, payload, token);
+
+    /* Happy path: every claim of the contract comes back. */
+    oc_jwt_claims c;
+    CHECK(oc_jwt_verify(token, tlen, pem, pem_len, ISS, AUD, NOW, &c) == OC_JWT_OK);
+    CHECK(strcmp(c.sub, "https://accounts.google.com|1234567890") == 0);
+    CHECK(strcmp(c.iss, ISS) == 0);
+    CHECK(strcmp(c.aud, AUD) == 0);
+    CHECK(strcmp(c.email, "alice@acme.example") == 0);
+    CHECK(c.email_verified == 1);
+    CHECK(strcmp(c.name, "Alice") == 0);
+    CHECK(strcmp(c.idp, "google") == 0);
+    CHECK(strcmp(c.tenant, "acme.example") == 0);
+    CHECK(strcmp(c.jti, "jti-1") == 0);
+    CHECK(strlen(c.nonce) == 43);
+    CHECK(c.exp == NOW + 290 && c.iat == NOW - 10 && c.nbf == NOW - 10);
+
+    /* The thumbprint agrees with another implementation's. */
+    {
+        char tp[OC_JWT_THUMBPRINT_LEN + 1];
+        CHECK(oc_jwt_key_thumbprint(VECTOR_PEM, sizeof VECTOR_PEM, tp) == 0);
+        CHECK(strcmp(tp, VECTOR_KID) == 0);
+        CHECK(oc_jwt_key_thumbprint("not a key", 10, tp) == -1);
+    }
+
+    /* A key SET: the kid picks the right key wherever it sits, and a block that
+     * is not a key at all does not lock out the good one beside it. */
+    {
+        char set[2048];
+        snprintf(set, sizeof set, "%s%s-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n%s",
+                 pem_other, VECTOR_PEM, pem);
+        CHECK(oc_jwt_verify(token, tlen, set, strlen(set) + 1, ISS, AUD, NOW, &c) == OC_JWT_OK);
+        snprintf(set, sizeof set, "%s%s", pem, pem_other);
+        CHECK(oc_jwt_verify(token, tlen, set, strlen(set) + 1, ISS, AUD, NOW, &c) == OC_JWT_OK);
+    }
+
+    /* Signed by a key that is not pinned: its kid names nothing here. */
+    CHECK(oc_jwt_verify(token, tlen, pem_other, pem_other_len, ISS, AUD, NOW, &c) == OC_JWT_E_KEY);
+
+    /* A pinned key's kid on another key's signature: the signature decides. */
+    {
+        char t2[4096];
+        size_t l2 = oc_issuer_mint(&other, HDR, payload, t2);
+        CHECK(oc_jwt_verify(t2, l2, pem, pem_len, ISS, AUD, NOW, &c) == OC_JWT_E_SIGNATURE);
+    }
+
+    /* No kid at all is refused, even with one key pinned. */
+    {
+        char t2[4096];
+        size_t l2 = oc_issuer_mint(&iss, "{\"alg\":\"ES256\",\"typ\":\"JWT\"}", payload, t2);
+        CHECK(oc_jwt_verify(t2, l2, pem, pem_len, ISS, AUD, NOW, &c) == OC_JWT_E_KEY);
+    }
+
+    /* Tamper with the payload (flip one char): the signature no longer verifies. */
+    {
+        char bad[4096];
+        memcpy(bad, token, tlen + 1);
+        const char *d1 = strchr(bad, '.');
+        bad[(d1 - bad) + 5] = (bad[(d1 - bad) + 5] == 'A') ? 'B' : 'A';
+        oc_jwt_result r = oc_jwt_verify(bad, tlen, pem, pem_len, ISS, AUD, NOW, &c);
+        CHECK(r == OC_JWT_E_SIGNATURE || r == OC_JWT_E_FORMAT);
+    }
+
+    /* Wrong audience / issuer. */
+    CHECK(oc_jwt_verify(token, tlen, pem, pem_len, ISS, "other.example", NOW, &c)
+          == OC_JWT_E_CLAIMS);
+    CHECK(oc_jwt_verify(token, tlen, pem, pem_len, "https://evil", AUD, NOW, &c)
+          == OC_JWT_E_CLAIMS);
+
+    /* Each required claim, missing, refuses the token. */
+    {
+        static const char *const MISSING[] = {
+            /* no exp */  "{\"iss\":\"%s\",\"aud\":\"%s\",\"sub\":\"s\",\"jti\":\"j\",\"nonce\":\"n\",\"iat\":1699999990}",
+            /* no iat */  "{\"iss\":\"%s\",\"aud\":\"%s\",\"sub\":\"s\",\"jti\":\"j\",\"nonce\":\"n\",\"exp\":1700000290}",
+            /* no sub */  "{\"iss\":\"%s\",\"aud\":\"%s\",\"jti\":\"j\",\"nonce\":\"n\",\"iat\":1699999990,\"exp\":1700000290}",
+            /* no jti */  "{\"iss\":\"%s\",\"aud\":\"%s\",\"sub\":\"s\",\"nonce\":\"n\",\"iat\":1699999990,\"exp\":1700000290}",
+            /* no nonce */"{\"iss\":\"%s\",\"aud\":\"%s\",\"sub\":\"s\",\"jti\":\"j\",\"iat\":1699999990,\"exp\":1700000290}",
+            /* empty sub */"{\"iss\":\"%s\",\"aud\":\"%s\",\"sub\":\"\",\"jti\":\"j\",\"nonce\":\"n\",\"iat\":1699999990,\"exp\":1700000290}",
+            /* exp a string */"{\"iss\":\"%s\",\"aud\":\"%s\",\"sub\":\"s\",\"jti\":\"j\",\"nonce\":\"n\",\"iat\":1699999990,\"exp\":\"1700000290\"}",
+        };
+        for (size_t i = 0; i < sizeof MISSING / sizeof MISSING[0]; i++) {
+            char pl[512];
+            snprintf(pl, sizeof pl, MISSING[i], ISS, AUD);
+            CHECK(verify_payload(&iss, pem, pl, &c) == OC_JWT_E_CLAIMS);
+        }
+    }
+
+    /* Expired; not yet valid; issued in the future; a life over the ceiling. */
+    {
+        char pl[1024];
+        oc_issuer_payload(pl, sizeof pl, ISS, AUD, "s", "j", NOW - 3600, NOW - 3400, "");
+        CHECK(verify_payload(&iss, pem, pl, &c) == OC_JWT_E_EXPIRED);
+        oc_issuer_payload(pl, sizeof pl, ISS, AUD, "s", "j", NOW + 600, NOW + 800, "");
+        CHECK(verify_payload(&iss, pem, pl, &c) == OC_JWT_E_EXPIRED);
+        oc_issuer_payload(pl, sizeof pl, ISS, AUD, "s", "j", NOW - 10, NOW + 3600, "");
+        CHECK(verify_payload(&iss, pem, pl, &c) == OC_JWT_E_CLAIMS);
+        oc_issuer_payload(pl, sizeof pl, ISS, AUD, "s", "j", NOW - 10, NOW + 290, "");
+        CHECK(verify_payload(&iss, pem, pl, &c) == OC_JWT_OK);
+    }
+
+    /* Claims are JSON-unescaped: an escaped and a literal spelling of one subject
+     * are one subject, and a name keeps its quotes and its accents. */
+    {
+        char pl[1024];
+        oc_issuer_payload(pl, sizeof pl, ISS, AUD, "https:\\/\\/idp.example|\\u0061bc", "j", NOW - 10,
+                          NOW + 290, "\"name\":\"Zo\\u00eb \\\"Z\\\" \\ud83d\\ude00\"");
+        CHECK(verify_payload(&iss, pem, pl, &c) == OC_JWT_OK);
+        CHECK(strcmp(c.sub, "https://idp.example|abc") == 0);
+        /* contract: the claim's JSON escapes above, decoded to their UTF-8 */
+        CHECK(strcmp(c.name, "Zo\xc3\xab \"Z\" \xf0\x9f\x98\x80") == 0);
+        /* A lone surrogate, an unknown escape and an embedded NUL are refused. */
+        oc_issuer_payload(pl, sizeof pl, ISS, AUD, "a\\ud83dz", "j", NOW - 10, NOW + 290, "");
+        CHECK(verify_payload(&iss, pem, pl, &c) == OC_JWT_E_CLAIMS);
+        oc_issuer_payload(pl, sizeof pl, ISS, AUD, "a\\qz", "j", NOW - 10, NOW + 290, "");
+        CHECK(verify_payload(&iss, pem, pl, &c) != OC_JWT_OK);   /* the parser's or ours */
+        oc_issuer_payload(pl, sizeof pl, ISS, AUD, "a\\u0000z", "j", NOW - 10, NOW + 290, "");
+        CHECK(verify_payload(&iss, pem, pl, &c) == OC_JWT_E_CLAIMS);
+    }
+
+    /* An over-long claim is refused, never truncated: 255 bytes fit, 256 do not. */
+    {
+        char sub[300], pl[1024];
+        memset(sub, 'a', 255); sub[255] = '\0';
+        oc_issuer_payload(pl, sizeof pl, ISS, AUD, sub, "j", NOW - 10, NOW + 290, "");
+        CHECK(verify_payload(&iss, pem, pl, &c) == OC_JWT_OK);
+        CHECK(strlen(c.sub) == 255);
+        memset(sub, 'a', 256); sub[256] = '\0';
+        oc_issuer_payload(pl, sizeof pl, ISS, AUD, sub, "j", NOW - 10, NOW + 290, "");
+        CHECK(verify_payload(&iss, pem, pl, &c) == OC_JWT_E_CLAIMS);
+        /* An optional claim too: a long name does not quietly become a short one. */
+        char extra[400] = "\"name\":\"";
+        memset(extra + 8, 'n', 300); strcpy(extra + 308, "\"");
+        oc_issuer_payload(pl, sizeof pl, ISS, AUD, "s", "j", NOW - 10, NOW + 290, extra);
+        CHECK(verify_payload(&iss, pem, pl, &c) == OC_JWT_E_CLAIMS);
+    }
+
+    /* email_verified is true only for the JSON literal. */
+    {
+        char pl[1024];
+        oc_issuer_payload(pl, sizeof pl, ISS, AUD, "s", "j", NOW - 10, NOW + 290,
+                          "\"email\":\"a@b.example\",\"email_verified\":\"true\"");
+        CHECK(verify_payload(&iss, pem, pl, &c) == OC_JWT_OK);
+        CHECK(c.email_verified == 0);
+        oc_issuer_payload(pl, sizeof pl, ISS, AUD, "s", "j", NOW - 10, NOW + 290,
+                          "\"email\":\"a@b.example\"");
+        CHECK(verify_payload(&iss, pem, pl, &c) == OC_JWT_OK);
+        CHECK(c.email_verified == 0 && c.tenant[0] == '\0' && c.idp[0] == '\0');
+    }
+
+    /* A provider's extra claims, nested ones included, fit and are skipped. */
+    {
+        char pl[2048];
+        oc_issuer_payload(pl, sizeof pl, ISS, AUD, "s", "j", NOW - 10, NOW + 290,
+            "\"amr\":[\"pwd\",\"mfa\",\"hwk\"],\"x\":{\"sub\":\"inner\",\"a\":[1,2,3,4,5,6,7,8]},"
+            "\"c1\":1,\"c2\":2,\"c3\":3,\"c4\":4,\"c5\":5,\"c6\":6,\"c7\":7,\"c8\":8,\"c9\":9,"
+            "\"d1\":\"v\",\"d2\":\"v\",\"d3\":\"v\",\"d4\":\"v\",\"d5\":\"v\",\"d6\":\"v\",\"d7\":\"v\"");
+        CHECK(verify_payload(&iss, pem, pl, &c) == OC_JWT_OK);
+        CHECK(strcmp(c.sub, "s") == 0);   /* the nested "sub" is not the subject */
+    }
+
+    /* The nonce is the hash of the verifier the client kept (RFC 7636's shape). */
+    {
+        const char *v = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";   /* RFC 7636 appendix B */
+        CHECK(oc_jwt_nonce_matches("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                                   (const uint8_t *)v, strlen(v)) == 1);
+        CHECK(oc_jwt_nonce_matches("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cN",
+                                   (const uint8_t *)v, strlen(v)) == 0);
+        CHECK(oc_jwt_nonce_matches("short", (const uint8_t *)v, strlen(v)) == 0);
+        CHECK(oc_jwt_nonce_matches(NULL, (const uint8_t *)v, strlen(v)) == 0);
+    }
+
+    /* Non-ES256 alg is refused before any signature work. */
+    {
+        char t3[4096];
+        size_t l3 = oc_issuer_mint(&iss, "{\"alg\":\"none\"}", payload, t3);
+        CHECK(oc_jwt_verify(t3, l3, pem, pem_len, ISS, AUD, NOW, &c) == OC_JWT_E_ALG);
+    }
+
+    /* Malformed (not three segments). */
+    CHECK(oc_jwt_verify("abc.def", 7, pem, pem_len, ISS, AUD, NOW, &c) == OC_JWT_E_FORMAT);
+
+    /* The daemon's own issuer (AUTH.md §8.10): what it mints verifies against its
+     * key, name and audience; with a byte changed, for another audience, from
+     * another key, or past its time, it does not. */
+    {
+        char *k = NULL, *name = NULL;
+        CHECK(oc_local_issuer_generate(&k, &name) == 0);
+        oc_local_issuer *li = oc_local_issuer_open(k, name);
+        CHECK(li != NULL);
+        const char *nonce = "JBbiqONGWPaAmwXk_8bT6UnlPfrn65D32eZlJS-zGG0";
+        uint64_t now = (uint64_t)time(NULL);
+        char *t = li ? oc_local_issuer_mint(li, 42, nonce, now) : NULL;
+        CHECK(t != NULL);
+        if (li && t) {
+            const char *pub = oc_local_issuer_pubkey_pem(li);
+            size_t pl = strlen(pub) + 1;
+            oc_jwt_claims lc;
+            CHECK(oc_jwt_verify(t, strlen(t), pub, pl, name, OC_LOCAL_AUDIENCE, now, &lc) == OC_JWT_OK);
+            CHECK(oc_local_subject_uid(lc.sub) == 42 && strcmp(lc.nonce, nonce) == 0);
+            CHECK(lc.exp - lc.iat == OC_LOCAL_TOKEN_SECS && lc.jti[0]);
+            CHECK(oc_jwt_nonce_matches(lc.nonce, (const uint8_t *)OC_ISSUER_VERIFIER,
+                                       strlen(OC_ISSUER_VERIFIER)));
+            CHECK(oc_jwt_verify(t, strlen(t), pub, pl, name, "someone-else", now, &lc) == OC_JWT_E_CLAIMS);
+            CHECK(oc_jwt_verify(t, strlen(t), pub, pl, name, OC_LOCAL_AUDIENCE,
+                                now + OC_LOCAL_TOKEN_SECS + 600, &lc) == OC_JWT_E_EXPIRED);
+            CHECK(oc_jwt_verify(t, strlen(t), pem, pem_len, name, OC_LOCAL_AUDIENCE, now, &lc) == OC_JWT_E_KEY);
+            char *bad = strdup(t);
+            size_t dot = strcspn(bad, ".") + 5;
+            bad[dot] = bad[dot] == 'A' ? 'B' : 'A';                  /* a claim changed */
+            CHECK(oc_jwt_verify(bad, strlen(bad), pub, pl, name, OC_LOCAL_AUDIENCE, now, &lc) != OC_JWT_OK);
+            free(bad);
+            char *two = oc_local_issuer_mint(li, 42, nonce, now);     /* a fresh jti each time */
+            oc_jwt_claims c2;
+            CHECK(two && oc_jwt_verify(two, strlen(two), pub, pl, name, OC_LOCAL_AUDIENCE, now, &c2) == OC_JWT_OK &&
+                  strcmp(c2.jti, lc.jti) != 0);
+            free(two);
+        }
+        CHECK(oc_local_subject_uid("local|7") == 7 && oc_local_subject_uid("local|0") == 0 &&
+              oc_local_subject_uid("local|7x") == 0 && oc_local_subject_uid("oidc:x|7") == 0 &&
+              oc_local_subject_uid("relay|42") == 0 && oc_local_subject_uid("LOCAL|42") == 0 &&
+              oc_local_subject_uid("local|99999999999999999999") == 0);
+        CHECK(oc_local_issuer_open("not a key", name) == NULL);
+        free(t);
+        oc_local_issuer_close(li);
+        free(k); free(name);
+    }
+
+    test_demo_invite(&iss, pem);
+    oc_issuer_free(&iss);
+    oc_issuer_free(&other);
+    return failures;
+}

@@ -1,0 +1,3928 @@
+/*
+ * OpenChime TUI — the first frontend over the app-core (ARCH-74/75). termbox2
+ * gives the cell grid + input; utf8proc gives correct display width so emoji and
+ * CJK don't corrupt the layout. A modern paneled layout (the lazygit/k9s idiom):
+ * a header bar (workspace · you · presence · connection · unread), three bordered
+ * panels — Channels │ Messages │ Members — a status line, an always-ready
+ * composer, and a context keybinding hint bar; `?` opens a full help overlay.
+ * All state/logic lives in oc_client; this file is pure view + input. Mouse
+ * (click a channel/member, wheel to scroll) and machine-local prefs — panel
+ * widths, Members visibility, 12/24h time, a default workspace — come from
+ * ~/.config/openchime/config (config.c), created with defaults on first run.
+ *
+ * **Multiple workspaces (REQ-012/013/014/015).** The TUI holds one oc_client per
+ * signed-in workspace (g_ws, up to MAX_WS), ticks them all every frame so a
+ * background workspace keeps receiving and counting unread, and renders only the
+ * active one. Ctrl+W opens the switcher: remembered workspaces with their unread +
+ * connection state, and an always-present "Log in to new workspace" row. Each
+ * session carries its own focused channel, scroll, and half-typed message, so
+ * switching away and back doesn't lose work.
+ *
+ * Usage: openchime-tui [<workspace>]      (login box if omitted)
+ *        openchime-tui <host> <port>      (dev/local direct connect)
+ *
+ * Keys: everything is menus, dialogs, and screens — no commands to type. The
+ *       composer only sends: Enter posts your message (or, inside a thread, posts
+ *       a reply). Tab completes only the trailing token — @mentions, #channels,
+ *       :emoji: — or, on an empty composer, enters navigation mode; ↑/↓ + PgUp/PgDn
+ *       scroll; ? help. Navigation is Esc/Tab plus Ctrl chords: Ctrl+F search ·
+ *       Ctrl+W workspaces · Ctrl+R reconnect · Ctrl+Q quit. **Navigation mode**
+ *       (Esc from the composer): a panel is focused — Tab cycles Channels /
+ *       Messages / Members, ↑/↓ select, Esc returns to the composer. Every action
+ *       lives on a pane action menu: Enter on the selected message, member, or
+ *       channel opens the menu of things you can do to it (react via a filterable
+ *       emoji picker, edit, delete, open a thread, who-reacted, open a DM, and so
+ *       on); anything needing input opens a modal prompt dialog. **Command
+ *       launcher** (Ctrl+K anywhere, or `:` on an empty composer): fuzzy-filter
+ *       every action + jump to any channel/DM; Enter runs it (or opens its dialog).
+ *       On-screen key hints are written in "Ctrl+X" form.
+ */
+
+#include "tuikit.h"      /* terminal layer + width-correct draw/style primitives (tuikit) */
+#include "tk_qr.h"        /* the device code's URL, for a phone's camera (AUTH.md §8.11) */
+#include "oc_port.h"
+
+#include "utf8proc.h"
+
+#include "client.h"
+#include "model.h"
+#include "complete.h"
+#include "resolve.h"    /* workspace -> host:port (REQ-010/011) */
+#include "store.h"      /* peek a stored session token (skip the login box) */
+#include "secret_os.h" /* OS keyring for the session token */
+#include "config.h"     /* machine-local prefs (mouse, panels, time) */
+#include "env.h"        /* the development inputs */
+#include "protocol.h"   /* OC_PRESENCE_*, OC_SESSION_TOKEN_LEN */
+#include "net.h"        /* oc_net_probe: how a workspace signs people in */
+#include "build_id.h"   /* OC_BUILD_ID: --version */
+
+#include <ctype.h>
+#include <locale.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#ifdef _WIN32
+#include <shellapi.h>
+#else
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
+#define SIDEBAR_W 22
+#define COMPOSER_CAP 1024
+
+/* Machine-local prefs, loaded once in main() (see config.h). */
+static const oc_tui_prefs *g_cfg = NULL;
+
+/* Keys of the portable prefs mirrored into the daemon's synced settings bucket
+ * (the daemon-side config layer). Machine-local-only fields (e.g. workspace) are
+ * deliberately absent — which server you connect to should not sync. */
+#define OC_SYNC_KEY_MOUSE     "mouse"
+#define OC_SYNC_KEY_MEMBERS   "members_panel"
+#define OC_SYNC_KEY_TIME24    "time_24h"
+#define OC_SYNC_KEY_CHWIDTH   "channels_width"
+#define OC_SYNC_KEY_MEMWIDTH  "members_width"
+
+/* A synced setting's integer value, or `fallback` when the bucket lacks the key. */
+static int synced_int(const oc_model *m, const char *key, int fallback) {
+    const char *v = oc_model_setting(m, key);
+    if (!v || !v[0]) return fallback;
+    return atoi(v);
+}
+
+/* Layer the daemon's synced bucket over the machine-local file defaults (`base`):
+ * a key present in the bucket wins, else the file/default value stands. Returns 1
+ * if the effective mouse setting changed, so the caller re-arms termbox input. */
+static int apply_synced_settings(oc_tui_prefs *cfg, const oc_tui_prefs *base, const oc_model *m) {
+    int old_mouse = cfg->mouse;
+    cfg->mouse          = synced_int(m, OC_SYNC_KEY_MOUSE,    base->mouse) ? 1 : 0;
+    cfg->members_panel  = synced_int(m, OC_SYNC_KEY_MEMBERS,  base->members_panel);
+    cfg->time_24h       = synced_int(m, OC_SYNC_KEY_TIME24,   base->time_24h) ? 1 : 0;
+    cfg->channels_width = synced_int(m, OC_SYNC_KEY_CHWIDTH,  base->channels_width);
+    cfg->members_width  = synced_int(m, OC_SYNC_KEY_MEMWIDTH, base->members_width);
+    if (cfg->members_panel < 0 || cfg->members_panel > 2) cfg->members_panel = base->members_panel;
+    if (cfg->channels_width < 10 || cfg->channels_width > 60) cfg->channels_width = base->channels_width;
+    if (cfg->members_width  < 10 || cfg->members_width  > 60) cfg->members_width  = base->members_width;
+    return cfg->mouse != old_mouse;
+}
+
+/* Distinct-ish colors for author nicks, picked by hashing the user id. */
+static const uintattr_t NICK_COLORS[] = {
+    TB_RED, TB_GREEN, TB_YELLOW, TB_BLUE, TB_MAGENTA, TB_CYAN, TB_WHITE
+};
+static uintattr_t nick_color(uint64_t uid) {
+    return NICK_COLORS[uid % (sizeof NICK_COLORS / sizeof NICK_COLORS[0])];
+}
+
+/* The width-correct draw primitives (tk_cp_width/tk_text/tk_fill) now live in
+ * tuikit as tk_cp_width/tk_text/tk_fill; panels/frames as tk_panel/tk_box. */
+
+/* ---- a rebuilt-each-frame list of wrapped display rows for the message pane -- */
+
+typedef struct { char *s; uintattr_t fg; int mi; } row_t;   /* mi = message index (-1 = none) */
+typedef struct { row_t *v; size_t n, cap; } rows_t;
+
+static void rows_push(rows_t *r, char *s, uintattr_t fg) {
+    if (r->n == r->cap) {
+        size_t cap = r->cap ? r->cap * 2 : 64;
+        row_t *nv = realloc(r->v, cap * sizeof *nv);
+        if (!nv) { free(s); return; }
+        r->v = nv; r->cap = cap;
+    }
+    r->v[r->n].s = s; r->v[r->n].fg = fg; r->v[r->n].mi = -1; r->n++;
+}
+static void rows_free(rows_t *r) {
+    for (size_t i = 0; i < r->n; i++) free(r->v[i].s);
+    free(r->v);
+    r->v = NULL; r->n = r->cap = 0;
+}
+
+/* Wrap `text` to `width` display columns, pushing each row (with `fg`). A
+ * continuation row is prefixed with `indent` spaces. */
+static void wrap_push(rows_t *r, const char *text, uintattr_t fg, int width, int indent) {
+    if (width < 4) width = 4;
+    utf8proc_ssize_t len = (utf8proc_ssize_t)strlen(text), off = 0;
+    int first = 1;
+    do {
+        int avail = width - (first ? 0 : indent);
+        if (avail < 1) avail = 1;
+        int used = 0;
+        utf8proc_ssize_t start = off;
+        while (off < len) {
+            int32_t cp;
+            utf8proc_ssize_t n = utf8proc_iterate((const utf8proc_uint8_t *)text + off, len - off, &cp);
+            if (n <= 0) { off = len; break; }
+            int w = tk_cp_width(cp);
+            if (used + w > avail) break;
+            used += w; off += n;
+        }
+        size_t blen = (size_t)(off - start);
+        char *row = malloc((size_t)indent + blen + 1);
+        if (!row) return;
+        size_t p = 0;
+        if (!first) for (int i = 0; i < indent; i++) row[p++] = ' ';
+        memcpy(row + p, text + start, blen); p += blen;
+        row[p] = '\0';
+        rows_push(r, row, fg);
+        first = 0;
+        if (off == start) break;              /* no progress (avail too small) — stop */
+    } while (off < len);
+}
+
+/* wrap_push, breaking between words: for prose a person reads and copies out,
+ * where a word cut in two is a word mistyped. A word longer than a row is cut. */
+static void wrap_words_push(rows_t *r, const char *text, uintattr_t fg, int width, int indent) {
+    const char *p = text;
+    int first = 1;
+    while (*p) {
+        /* A word that fits a row only without the indent (a token, an address)
+         * gets the row whole, rather than being cut in two. */
+        int wlen = 0;
+        for (const char *q = p; *q && *q != ' '; ) {
+            int32_t cp;
+            utf8proc_ssize_t n = utf8proc_iterate((const utf8proc_uint8_t *)q, -1, &cp);
+            if (n <= 0) break;
+            wlen += tk_cp_width(cp); q += n;
+        }
+        int ind = (!first && wlen > width - indent && wlen <= width) ? 0 : (first ? 0 : indent);
+        int avail = width - ind;
+        if (avail < 8) avail = 8;
+        /* The longest run of whole words that fits `avail` columns. */
+        const char *q = p, *fit = NULL;
+        int used = 0;
+        while (*q) {
+            int32_t cp;
+            utf8proc_ssize_t n = utf8proc_iterate((const utf8proc_uint8_t *)q, -1, &cp);
+            if (n <= 0) break;
+            int w = tk_cp_width(cp);
+            if (used + w > avail) break;
+            used += w; q += n;
+            if (*q == ' ' || *q == '\0') fit = q;
+        }
+        const char *end = (*q && fit) ? fit : q;
+        if (end == p) break;                  /* no progress — stop */
+        size_t blen = (size_t)(end - p);
+        char *row = malloc((size_t)ind + blen + 1);
+        if (!row) return;
+        size_t o = 0;
+        for (int i = 0; i < ind; i++) row[o++] = ' ';
+        memcpy(row + o, p, blen); o += blen;
+        row[o] = '\0';
+        rows_push(r, row, fg);
+        first = 0;
+        p = end;
+        while (*p == ' ') p++;
+    }
+}
+
+/* Forward decl: resolve a display name for a message's author. */
+static const char *name_for(const oc_channel *ch, uint64_t uid);
+
+/* Fill `out` with the nick to show for message `m`: the name the daemon stamped,
+ * "you" for self, a name resolved from the channel (thread replies carry no
+ * name), else "user<id>". */
+static void msg_nick(char *out, size_t cap, const oc_msg *m, uint64_t me, const oc_channel *ch) {
+    if (m->author_name[0]) { snprintf(out, cap, "%s", m->author_name); return; }
+    if (m->author_id == me) { snprintf(out, cap, "you"); return; }
+    const char *nm = ch ? name_for(ch, m->author_id) : "someone";
+    if (strcmp(nm, "someone") != 0) { snprintf(out, cap, "%s", nm); return; }
+    snprintf(out, cap, "user%llu", (unsigned long long)m->author_id);
+}
+
+/* Append the wrapped rows for one message: header, body (or tombstone),
+ * reactions, and — when `show_replies` — a thread reply-count marker. `ch` is
+ * used only to resolve author names. */
+static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
+                            const oc_channel *ch, int show_replies, int mi) {
+    size_t rstart = r->n;
+    char line[256], nick[80];
+    char stamp[12] = "--:--";
+    if (m->server_time) {
+        time_t t = (time_t)(m->server_time / 1000);
+        struct tm tmv;
+        if (oc_localtime_r(&t, &tmv))
+            strftime(stamp, sizeof stamp, (g_cfg && !g_cfg->time_24h) ? "%I:%M%p" : "%H:%M", &tmv);
+    }
+    /* An action (REQ-058) is one line, "HH:MM  * Ada is away", in place of a
+     * header and a body. Its actor is named, never "you": "you is away" is
+     * not a sentence. */
+    if (m->action.present && !m->deleted && m->body) {
+        char who[80];
+        if (m->action.actor_name[0])  snprintf(who, sizeof who, "%s", m->action.actor_name);
+        else if (m->author_name[0])   snprintf(who, sizeof who, "%s", m->author_name);
+        else {
+            const char *nm = ch ? name_for(ch, m->author_id) : "someone";
+            if (strcmp(nm, "someone") != 0) snprintf(who, sizeof who, "%s", nm);
+            else snprintf(who, sizeof who, "user%llu", (unsigned long long)m->author_id);
+        }
+        char said[1024];
+        oc_model_line(NULL, m->author_id, who, 1, m->body + m->action.start, said, sizeof said);
+        char *al = malloc(strlen(stamp) + strlen(said) + 16);
+        if (al) {
+            sprintf(al, "%s  * %s%s", stamp, said, m->edited ? " (edited)" : "");
+            wrap_push(r, al, nick_color(m->author_id), width, 4);
+            free(al);
+        }
+    } else {
+        msg_nick(nick, sizeof nick, m, me, ch);
+        snprintf(line, sizeof line, "%s  %s", stamp, nick);
+        if (m->edited && !m->deleted) {
+            size_t l = strlen(line);
+            snprintf(line + l, sizeof line - l, " (edited)");
+        }
+        char *hdr = malloc(strlen(line) + 1);
+        if (hdr) { strcpy(hdr, line); rows_push(r, hdr, nick_color(m->author_id) | TB_BOLD); }
+        if (m->deleted) {                     /* tombstone: no body, no reactions */
+            char *d = malloc(sizeof "    [message deleted]");
+            if (d) { strcpy(d, "    [message deleted]"); rows_push(r, d, TB_DEFAULT); }
+            for (size_t k = rstart; k < r->n; k++) r->v[k].mi = mi;
+            return;
+        }
+        wrap_push(r, m->body ? m->body : "", TB_DEFAULT, width, 4);
+    }
+    for (uint8_t k = 0; k < m->n_attach; k++) {           /* attachments (REQ-140) */
+        const oc_attachment *a = &m->attach[k];
+        char al[256];
+        uintattr_t acol = TB_CYAN | TB_BOLD;
+        if (a->reclaimed) {
+            /* The server removed the bytes by age or storage pressure
+             * (REQ-215/217) and kept the row so the conversation still reads.
+             * Say so in place, dimmed and without an id: offering a download
+             * that is guaranteed to fail would look like a broken client. */
+            snprintf(al, sizeof al, "    \xf0\x9f\x93\x8e %s (no longer available)",
+                     a->filename[0] ? a->filename : "file");
+            acol = TB_BLACK | TB_BOLD;
+        } else if (a->media_kind == OC_MEDIA_VIDEO_MESSAGE) {
+            /* A video message (REQ-165). A terminal plays nothing (ARCH-75): say
+             * what it is and how long, and keep the download. */
+            char d[16];
+            oc_model_format_duration(a->duration_ms, d, sizeof d);
+            snprintf(al, sizeof al, "    [video message %s, open in the desktop client] #%llu",
+                     d, (unsigned long long)a->id);
+        } else {
+            /* 📎 filename (12.3 KB) #id — download with /download <id> */
+            double kb = (double)a->size / 1024.0;
+            if (a->size >= 1024ull * 1024)
+                snprintf(al, sizeof al, "    \xf0\x9f\x93\x8e %s (%.1f MB) #%llu",
+                         a->filename[0] ? a->filename : "file", kb / 1024.0, (unsigned long long)a->id);
+            else
+                snprintf(al, sizeof al, "    \xf0\x9f\x93\x8e %s (%.1f KB) #%llu",
+                         a->filename[0] ? a->filename : "file", kb, (unsigned long long)a->id);
+        }
+        char *ar = malloc(strlen(al) + 1);
+        if (ar) { strcpy(ar, al); rows_push(r, ar, acol); }
+    }
+    /* A poll (REQ-225): an option to a line -- "(*)" or "[x]" when it is
+     * yours, its count and share -- then how many voted and how it works. */
+    if (m->poll && !m->deleted) {
+        const oc_poll_view *pv = m->poll;
+        int multi = (pv->flags & OC_POLL_MULTI) != 0;
+        for (uint8_t k = 0; k < pv->n_options; k++) {
+            char pl[OC_POLL_OPTION_MAX + 48];
+            int mine = (pv->mine >> k) & 1;
+            unsigned pct = pv->voters ? (unsigned)((uint64_t)pv->counts[k] * 100u / pv->voters) : 0u;
+            snprintf(pl, sizeof pl, "    %s %s  %u (%u%%)",
+                     multi ? (mine ? "[x]" : "[ ]") : (mine ? "(*)" : "( )"),
+                     pv->labels[k], (unsigned)pv->counts[k], pct);
+            char *pr = malloc(strlen(pl) + 1);
+            if (pr) { strcpy(pr, pl); rows_push(r, pr, mine ? (TB_CYAN | TB_BOLD) : TB_CYAN); }
+        }
+        char fl[160];
+        size_t fp = (size_t)snprintf(fl, sizeof fl, "    %u vote%s", (unsigned)pv->voters, pv->voters == 1 ? "" : "s");
+        if (fp < sizeof fl && multi) fp += (size_t)snprintf(fl + fp, sizeof fl - fp, " \xc2\xb7 multiple choice");
+        if (fp < sizeof fl && (pv->flags & OC_POLL_ANONYMOUS)) fp += (size_t)snprintf(fl + fp, sizeof fl - fp, " \xc2\xb7 anonymous");
+        if (fp < sizeof fl && pv->close_at_ms) {
+            if ((uint64_t)time(NULL) * 1000u >= pv->close_at_ms) snprintf(fl + fp, sizeof fl - fp, " \xc2\xb7 closed");
+            else {
+                time_t t = (time_t)(pv->close_at_ms / 1000);
+                struct tm tmv; char when[32] = "";
+                if (oc_localtime_r(&t, &tmv))
+                    strftime(when, sizeof when, (g_cfg && !g_cfg->time_24h) ? "%a %I:%M%p" : "%a %H:%M", &tmv);
+                snprintf(fl + fp, sizeof fl - fp, " \xc2\xb7 closes %s", when);
+            }
+        }
+        char *fr = malloc(strlen(fl) + 1);
+        if (fr) { strcpy(fr, fl); rows_push(r, fr, TB_DEFAULT); }
+    }
+    if (m->n_reactions) {
+        char rl[256]; size_t p = 0;
+        p += (size_t)snprintf(rl, sizeof rl, "    ");
+        for (uint8_t k = 0; k < m->n_reactions && p < sizeof rl - 1; k++) {
+            const oc_reaction *rx = &m->reactions[k];
+            int w = rx->mine
+                ? snprintf(rl + p, sizeof rl - p, "%s [%u]  ", rx->emoji, rx->count)
+                : snprintf(rl + p, sizeof rl - p, "%s %u  ", rx->emoji, rx->count);
+            if (w < 0 || (size_t)w >= sizeof rl - p) break;
+            p += (size_t)w;
+        }
+        char *rr = malloc(p + 1);
+        if (rr) { memcpy(rr, rl, p); rr[p] = '\0'; rows_push(r, rr, TB_MAGENTA); }
+    }
+    if (show_replies && m->reply_count > 0) {
+        char rl[64];
+        snprintf(rl, sizeof rl, "    \xe2\x86\xb3 %u %s", m->reply_count,
+                 m->reply_count == 1 ? "reply" : "replies");
+        char *rr = malloc(strlen(rl) + 1);
+        if (rr) { strcpy(rr, rl); rows_push(r, rr, TB_CYAN); }
+    }
+    for (size_t k = rstart; k < r->n; k++) r->v[k].mi = mi;   /* tag rows with the message */
+}
+
+/* Build the wrapped rows for a channel's messages (oldest→newest), then a
+ * "seen by …" footer (REQ-090) naming the other members whose read cursor has
+ * reached the last message. */
+static void build_rows(rows_t *r, const oc_model *m, const oc_channel *ch, uint64_t me, int width) {
+    for (size_t i = 0; i < ch->n_msgs; i++)
+        append_msg_rows(r, &ch->msgs[i], me, width, ch, 1, (int)i);
+    if (ch->n_msgs == 0) return;
+    uint64_t last = ch->msgs[ch->n_msgs - 1].message_id;
+    char names[192]; size_t p = 0; int shown = 0;
+    for (size_t i = 0; i < ch->n_readers; i++) {
+        if (ch->readers[i].user_id == me || ch->readers[i].message_id < last) continue;
+        const char *nm = oc_model_user_name(m, ch->readers[i].user_id);   /* roster first */
+        if (!nm || !nm[0]) nm = name_for(ch, ch->readers[i].user_id);     /* else a message author */
+        int w = snprintf(names + p, sizeof names - p, "%s%s", shown ? ", " : "", nm);
+        if (w < 0 || (size_t)w >= sizeof names - p) break;
+        p += (size_t)w; shown++;
+    }
+    if (shown) {
+        char line[224];
+        snprintf(line, sizeof line, "    \xe2\x9c\x93 seen by %s", names);   /* ✓ */
+        wrap_push(r, line, TB_GREEN, width, 6);
+    }
+}
+
+/* Encrypted DMs (PRIVATE-DM.md): an ordinary DM marked e2e, whose messages are
+ * the channel's as in any DM; what this device holds of its session is
+ * oc_model_pdm. A line the TUI says about them on the status row; the invitation
+ * the launcher offers to accept or decline (0: none); and what was last said of
+ * each session, so each change is said once. */
+static char     g_e2e_note[200];
+static uint64_t g_e2e_invite;
+static uint32_t g_e2e_refused_seen;
+static struct { uint64_t id; uint8_t state; } g_e2e_said[OC_PDM_VIEW_MAX];
+static char     g_e2e_invite_who[80];
+/* A DM just asked for: with whom, and whether encrypted, so it is selected as it
+ * arrives; and a channel to select once it is in the list (one accepted). */
+static uint64_t g_dm_asked, g_select_cid;
+static int      g_dm_asked_e2e;
+
+/* Why an encrypted DM ended, in words. */
+static const char *e2e_end_text(uint8_t reason) {
+    switch (reason) {
+    case OC_PDM_END_CLOSED:   return "closed";
+    case OC_PDM_END_TAKEN:    return "accepted on another of your devices";
+    case OC_PDM_END_GONE:     return "the other device went away";
+    case OC_PDM_END_LOST:     return "a device no longer holds it";
+    case OC_PDM_END_REFUSED:  return "it could not be opened";
+    case OC_PDM_END_DECLINED: return "declined";
+    default:                  return "ended";
+    }
+}
+
+static const char *peer_name(const oc_model *m, uint64_t uid) {
+    const char *who = oc_model_user_name(m, uid);
+    return who[0] ? who : "someone";
+}
+
+/* The one line an encrypted DM in focus shows over its messages: its state on
+ * this device, and where to act on it (Ctrl+K). */
+static void e2e_status(oc_model *m, const oc_channel *c, char *out, size_t cap, uintattr_t *fg) {
+    const oc_pdm_view *v = c->forgotten ? NULL : oc_model_pdm(m, c->channel_id);
+    const char *who = peer_name(m, c->peer_id);
+    *fg = tk_theme_active()->accent;
+    if (!v)
+        snprintf(out, cap, "Encrypted conversation: not readable on this device.");
+    else if (v->state == OC_PDM_EV_OPENING)
+        snprintf(out, cap, "Encrypted: waiting for %s to accept on their device.", who);
+    else if (v->state == OC_PDM_EV_OPEN)
+        snprintf(out, cap, "Encrypted end to end on this device; gone when it ends or OpenChime closes. "
+                 "Safety number: %s", v->safety);
+    else if (v->state == OC_PDM_EV_KEY_CHANGED) {
+        snprintf(out, cap, "%s's device key changed. Compare the safety number %s, then trust it to go on "
+                 "(Ctrl+K).", who, v->safety);
+        *fg = TB_RED | TB_BOLD;
+    } else if (v->state == OC_PDM_EV_ENDED) {
+        snprintf(out, cap, "Ended (%s). Ctrl+K to forget it.", e2e_end_text(v->reason));
+        *fg = TB_YELLOW;
+    } else
+        snprintf(out, cap, "%s asks for an end-to-end encrypted conversation: accept on this device or "
+                 "decline (Ctrl+K).", who);
+}
+
+/* Build the rows for the open thread: the parent (found in `ch`) then replies. */
+static void build_thread_rows(rows_t *r, const oc_model *m, const oc_channel *ch,
+                              uint64_t me, int width) {
+    if (ch) for (size_t i = 0; i < ch->n_msgs; i++)
+        if (ch->msgs[i].message_id == m->thread_parent) {
+            append_msg_rows(r, &ch->msgs[i], me, width, ch, 0, -1);
+            break;
+        }
+    for (size_t i = 0; i < m->n_thread_msgs; i++)
+        append_msg_rows(r, &m->thread_msgs[i], me, width, ch, 0, -1);
+}
+
+/* ---- rendering ------------------------------------------------------------- */
+
+/* A display name for `uid`, taken from that user's most recent named message in
+ * the channel; "someone" if we've never seen them post. */
+static const char *name_for(const oc_channel *ch, uint64_t uid) {
+    for (size_t i = ch->n_msgs; i > 0; i--)
+        if (ch->msgs[i - 1].author_id == uid && ch->msgs[i - 1].author_name[0])
+            return ch->msgs[i - 1].author_name;
+    return "someone";
+}
+
+/* Build the rows for the open search view: a header + each hit (channel, time,
+ * author, snippet). */
+static void build_search_rows(rows_t *r, const oc_model *m, int width) {
+    char line[200];
+    snprintf(line, sizeof line, "%zu result%s for \"%s\"", m->n_search,
+             m->n_search == 1 ? "" : "s", m->search_query);
+    char *h = malloc(strlen(line) + 1);
+    if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+    for (size_t i = 0; i < m->n_search; i++) {
+        const oc_search_result *s = &m->search_results[i];
+        const char *cn = "?";
+        for (size_t j = 0; j < m->n_channels; j++)
+            if (m->channels[j].channel_id == s->channel_id) { cn = m->channels[j].name ? m->channels[j].name : "…"; break; }
+        char stamp[8] = "--:--";
+        if (s->server_time) { time_t t = (time_t)(s->server_time / 1000); struct tm tv;
+            if (oc_localtime_r(&t, &tv)) strftime(stamp, sizeof stamp, "%H:%M", &tv); }
+        snprintf(line, sizeof line, "#%s  %s  user%llu:", cn, stamp, (unsigned long long)s->author_id);
+        char *hd = malloc(strlen(line) + 1);
+        if (hd) { strcpy(hd, line); rows_push(r, hd, TB_CYAN); }
+        char said[1024];   /* an action reads "<name> <text>" (REQ-058) */
+        oc_model_line(m, s->author_id, NULL, s->action, s->snippet ? s->snippet : "", said, sizeof said);
+        wrap_push(r, said, TB_DEFAULT, width, 4);
+    }
+}
+
+static const char *active_address(void);   /* the workspace as the person typed it */
+static const char *invite_link(void);      /* the last invite as a link, where one works anywhere */
+
+/* Build the rows for the roster overlay: each member with a presence dot,
+ * colored by presence, plus a role tag. */
+static void build_roster_rows(rows_t *r, const oc_model *m, int width) {
+    char line[200];
+    snprintf(line, sizeof line, "%zu member%s", m->n_users, m->n_users == 1 ? "" : "s");
+    char *h = malloc(strlen(line) + 1);
+    if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+    /* The last invitation made (shown this session only), whole, at the top of
+     * the roster: the text to send the invited person, line by line. */
+    if (m->invite_token[0]) {
+        char text[1024];
+        if (oc_model_invitation_text(m, active_address(), invite_link(), text, sizeof text)) {
+            for (char *ln = text; ln && *ln; ) {
+                char *nl = strchr(ln, '\n');
+                if (nl) *nl = '\0';
+                if (*ln) wrap_words_push(r, ln, TB_MAGENTA | TB_BOLD, width, 2);
+                ln = nl ? nl + 1 : NULL;
+            }
+            char *blank = malloc(1);
+            if (blank) { blank[0] = '\0'; rows_push(r, blank, TB_DEFAULT); }
+        }
+    }
+    for (size_t i = 0; i < m->n_users; i++) {
+        const oc_member *u = &m->users[i];
+        uint8_t pr = oc_model_presence_of(m, u->user_id);
+        const char *dot = pr == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f"    /* ● */
+                        : pr == OC_PRESENCE_AWAY   ? "\xe2\x97\x90"    /* ◐ */
+                                                   : "\xe2\x97\x8b";   /* ○ */
+        const char *role = u->role == OC_ROLE_OWNER ? "  (owner)"
+                         : u->role == OC_ROLE_ADMIN ? "  (admin)" : "";
+        snprintf(line, sizeof line, "%s %s%s%s", dot, u->name[0] ? u->name : "?",
+                 role, u->disabled ? "  (deactivated)" : "");
+        uintattr_t col = pr == OC_PRESENCE_ONLINE ? TB_GREEN
+                       : pr == OC_PRESENCE_AWAY   ? TB_YELLOW : TB_DEFAULT;
+        char *rr = malloc(strlen(line) + 1);
+        if (rr) { strcpy(rr, line); rows_push(r, rr, col); }
+    }
+}
+
+/* Build the rows for the "who reacted" overlay: each reactor as "<emoji> name",
+ * grouped in the emoji-then-user order the server returns. */
+static void build_reactlist_rows(rows_t *r, const oc_model *m, int width) {
+    (void)width;
+    char line[160];
+    snprintf(line, sizeof line, "%zu reaction%s", m->n_reactors,
+             m->n_reactors == 1 ? "" : "s");
+    char *h = malloc(strlen(line) + 1);
+    if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+    for (size_t i = 0; i < m->n_reactors; i++) {
+        const oc_reactor_row *rr = &m->reactors[i];
+        const char *nm = oc_model_user_name(m, rr->user_id);
+        if (nm[0]) snprintf(line, sizeof line, "%s  %s", rr->emoji, nm);
+        else       snprintf(line, sizeof line, "%s  user%llu", rr->emoji,
+                            (unsigned long long)rr->user_id);
+        char *rw = malloc(strlen(line) + 1);
+        if (rw) { strcpy(rw, line); rows_push(r, rw, TB_DEFAULT); }
+    }
+}
+
+/* The "who voted" overlay (REQ-225): each option, then the people who picked
+ * it, in the option-then-person order the daemon returns. */
+static void build_voterlist_rows(rows_t *r, const oc_model *m, int width) {
+    (void)width;
+    char line[OC_POLL_OPTION_MAX + 96];
+    const oc_poll_view *pv = NULL;
+    for (size_t i = 0; i < m->n_channels && !pv; i++)
+        pv = oc_model_poll(m, m->channels[i].channel_id, m->voterlist_message);
+    snprintf(line, sizeof line, "%zu vote%s", m->n_voters, m->n_voters == 1 ? "" : "s");
+    char *h = malloc(strlen(line) + 1);
+    if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+    for (size_t i = 0; i < m->n_voters; i++) {
+        const oc_voter_row *vr = &m->voters[i];
+        const char *nm = oc_model_user_name(m, vr->user_id);
+        const char *opt = pv && vr->option < pv->n_options ? pv->labels[vr->option] : "?";
+        if (nm[0]) snprintf(line, sizeof line, "%s  %s", opt, nm);
+        else       snprintf(line, sizeof line, "%s  user%llu", opt, (unsigned long long)vr->user_id);
+        char *rw = malloc(strlen(line) + 1);
+        if (rw) { strcpy(rw, line); rows_push(r, rw, TB_DEFAULT); }
+    }
+}
+
+/* Human label for a per-channel notification level. */
+static const char *notify_label(uint8_t level) {
+    return level == OC_NOTIFY_NONE     ? "none"
+         : level == OC_NOTIFY_MENTIONS ? "mentions" : "all";
+}
+
+/* Build the rows for the notification-prefs overlay: the DND window, then each
+ * channel with a non-default level (default = all, elided to keep it short). */
+static void build_prefs_rows(rows_t *r, const oc_model *m, int width) {
+    (void)width;
+    char line[160];
+    /* The schedule states the ALLOWED hours now (REQ-136), so it is described
+     * that way — the sentence should be the setting. */
+    if (m->dnd_mode == OC_DND_CUSTOM)
+        snprintf(line, sizeof line, "notifications: custom schedule");
+    else if (m->dnd_mode != OC_DND_OFF)
+        snprintf(line, sizeof line, "notifications: %s %02u:%02u\xe2\x80\x93%02u:%02u",
+                 m->dnd_mode == OC_DND_WEEKDAYS ? "weekdays" : "daily",
+                 m->allow_start_min / 60, m->allow_start_min % 60,
+                 m->allow_end_min / 60, m->allow_end_min % 60);
+    else
+        snprintf(line, sizeof line, "notifications: any time");
+    char *h = malloc(strlen(line) + 1);
+    if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+
+    int any = 0;
+    for (size_t i = 0; i < m->n_channels; i++) {
+        const oc_channel *c = &m->channels[i];
+        if (c->notify_level == OC_NOTIFY_ALL) continue;   /* default — elide */
+        any = 1;
+        const char *nm = c->name ? c->name : "…";
+        if (c->kind == OC_CHANNEL_KIND_DM) {
+            const char *pn = oc_model_user_name(m, c->peer_id);
+            snprintf(line, sizeof line, "@%s  %s", pn[0] ? pn : "dm", notify_label(c->notify_level));
+        } else {
+            snprintf(line, sizeof line, "#%s  %s", nm, notify_label(c->notify_level));
+        }
+        uintattr_t col = c->notify_level == OC_NOTIFY_NONE ? TB_BLACK | TB_BOLD : TB_DEFAULT;
+        char *rw = malloc(strlen(line) + 1);
+        if (rw) { strcpy(rw, line); rows_push(r, rw, col); }
+    }
+    if (!any) {
+        const char *msg = "all channels: all";
+        char *rw = malloc(strlen(msg) + 1);
+        if (rw) { strcpy(rw, msg); rows_push(r, rw, TB_DEFAULT); }
+    }
+}
+
+/* Build the rows for the incoming-webhook overlay (REQ-170): a header, the
+ * last-minted token (shown once), then each webhook as "#id  label". */
+static void build_webhooks_rows(rows_t *r, const oc_model *m, int width) {
+    (void)width;
+    char line[200];
+    snprintf(line, sizeof line, "%zu webhook%s  (/webhook create <label>, /webhook rm <id>)",
+             m->n_webhooks, m->n_webhooks == 1 ? "" : "s");
+    char *h = malloc(strlen(line) + 1);
+    if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+    /* Surface the last-minted token (shown once) below the header. */
+    if (m->webhook_token[0]) {
+        snprintf(line, sizeof line, "new #%llu token: %s",
+                 (unsigned long long)m->webhook_new_id, m->webhook_token);
+        char *tk = malloc(strlen(line) + 1);
+        if (tk) { strcpy(tk, line); rows_push(r, tk, TB_MAGENTA | TB_BOLD); }
+    }
+    for (size_t i = 0; i < m->n_webhooks; i++) {
+        const oc_webhook_view *w = &m->webhooks[i];
+        snprintf(line, sizeof line, "#%llu  %s%s", (unsigned long long)w->webhook_id,
+                 w->label[0] ? w->label : "(webhook)", w->disabled ? "  (disabled)" : "");
+        uintattr_t col = w->disabled ? TB_BLACK | TB_BOLD : TB_DEFAULT;
+        char *rw = malloc(strlen(line) + 1);
+        if (rw) { strcpy(rw, line); rows_push(r, rw, col); }
+    }
+}
+
+/* ---- workspace sessions (REQ-013/014) ---------------------------------------
+ * The TUI holds one oc_client per signed-in workspace, all ticking every frame,
+ * so a workspace the user isn't looking at still receives messages and counts
+ * unread (REQ-014). Only the active one is rendered. Each session also carries
+ * its own view state — focused channel, scroll, half-typed message — so
+ * switching away and back doesn't discard work in progress (REQ-015).
+ *
+ * The cap is a fixed array rather than a grown list: a human signs into a
+ * handful of workspaces, and every session costs a thread + a TLS connection. */
+#define MAX_WS 8
+
+typedef struct {
+    oc_client *cl;
+    char       key[288];              /* "host:port" — the store/book key */
+    char       label[256];            /* what the user typed, e.g. acme.example.com */
+    char       user[128];             /* the account signed in as */
+    /* Per-workspace view state, saved on switch-away and restored on return. */
+    char       composer[COMPOSER_CAP];
+    size_t     clen;
+    size_t     focus;
+    int        scroll;
+    uint64_t   last_focus_cid;
+    int        settings_req;          /* pulled the synced bucket this session */
+    uint32_t   cert_seen;             /* the certificate question last asked (cert_seq) */
+} ws_session;
+
+static ws_session g_ws[MAX_WS];
+static int        g_nws = 0;          /* live sessions */
+static int        g_active = 0;       /* index into g_ws */
+
+/* The workspace label shown in the header (the active session's). */
+static const char *active_label(void) {
+    return (g_nws && g_active < g_nws && g_ws[g_active].label[0])
+         ? g_ws[g_active].label : "-";
+}
+
+static const char *active_address(void) {
+    return (g_nws && g_active < g_nws) ? g_ws[g_active].label : "";
+}
+
+/* The last invite as the daemon's web client opened with it (REQ-026): a link
+ * a browser anywhere can follow, so only where the pages open directly; NULL
+ * where they open through this client's tunnel, which works here alone. */
+static const char *invite_link(void) {
+    static char link[1200];
+    link[0] = '\0';
+    if (!g_nws || g_active >= g_nws || !g_ws[g_active].cl) return NULL;
+    oc_client *cl = g_ws[g_active].cl;
+    const oc_model *m = oc_client_model(cl);
+    if (!m->invite_token[0] || m->invite_email[0] || !oc_client_pages_direct(cl)) return NULL;
+    char q[160];
+    snprintf(q, sizeof q, "invite=%s", m->invite_token);
+    if (oc_client_open_page(cl, "app/", q, link, sizeof link) != 0) return NULL;
+    return link;
+}
+
+/* The address as typed, without the spaces a paste brings along. */
+static void invite_trim(const char *v, char *out, size_t cap) {
+    while (*v == ' ' || *v == '\t') v++;
+    size_t n = strlen(v);
+    while (n && (v[n - 1] == ' ' || v[n - 1] == '\t' || v[n - 1] == '\r' || v[n - 1] == '\n')) n--;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, v, n);
+    out[n] = '\0';
+}
+
+/* "Invite a user": the prompt's two lines of explanation. Where the workspace
+ * signs people in through a provider, an address -- which provider, when the
+ * workspace says -- and, where it also has password accounts, a blank for a
+ * one-time token or a number for a link that many may use (REQ-026); where it
+ * has password accounts only, the token or the number. Answers 1 to open the
+ * prompt. */
+static int invite_prompt(oc_client *cl, char *note, size_t cap, const char **note2) {
+    const oc_model *im = oc_client_model(cl);
+    if (!oc_model_offers_browser(im)) {
+        snprintf(note, cap, "Leave it blank for a one-time invite token.");
+        *note2 = "Or a number: how many may join by one shared link (0 for no limit).";
+        return 1;
+    }
+    const char *prov = oc_model_signin_provider(im);
+    snprintf(note, cap, "It must be able to sign in with %s.",
+             prov[0] ? prov : "this workspace's provider");
+    *note2 = oc_model_offers_local(im)
+             ? "Blank for a one-time invite token; a number for a shared link that many may use."
+             : "";
+    return 1;
+}
+
+/* Total unread across a workspace's channels — what the switcher badges. */
+static int ws_unread(const ws_session *w) {
+    if (!w->cl) return 0;
+    const oc_model *m = oc_client_model(w->cl);
+    int n = 0;
+    for (size_t i = 0; i < m->n_channels; i++) n += m->channels[i].unread;
+    return n;
+}
+
+/* Index of the open session for `key`, or -1. */
+static int ws_find(const char *key) {
+    for (int i = 0; i < g_nws; i++)
+        if (strcmp(g_ws[i].key, key) == 0) return i;
+    return -1;
+}
+
+/* Compute panel columns from the terminal width + config (shared by render and
+ * the mouse handler so clicks map to what's drawn). */
+static void layout(int W, int *ch_w, int *mem_w, int *msg_x, int *msg_w) {
+    int cw = g_cfg ? g_cfg->channels_width : 22;
+    if (cw < 8) cw = 8;
+    if (cw > W / 3) cw = W / 3;
+    int want = g_cfg ? g_cfg->members_width : 22;
+    int mode = g_cfg ? g_cfg->members_panel : 2;
+    int mw = (mode == 0) ? 0 : (mode == 1) ? want : (W >= 74 ? want : 0);
+    if (mw > W / 3) mw = W / 3;
+    if (W - cw - mw < 24) mw = 0;             /* keep the message pane usable */
+    *ch_w = cw; *mem_w = mw; *msg_x = cw; *msg_w = W - cw - mw;
+}
+
+/* A bordered, titled panel; content is drawn inside by the caller. An active
+ * panel gets a bright (cyan) border, matching the lazygit/k9s idiom. */
+/* Center a modal sized to `cw` content columns × `rows` content lines, fill and
+ * frame it with a consistent title, and return the inner content region. Every
+ * overlay uses this so padding, sizing, and the title style stay uniform, and the
+ * box grows to fit its content (no truncation). */
+static tk_rect modal_frame(int W, int H, int cw, int rows, const char *title) {
+    int bw = cw + 6;                     /* 2-col padding inside the border */
+    if (bw > W - 4) bw = W - 4;
+    if (bw < 24) bw = 24;
+    int bh = rows + 4;                   /* border + a blank pad top & bottom */
+    if (bh > H - 2) bh = H - 2;
+    if (bh < 5) bh = 5;
+    int x = (W - bw) / 2, y = (H - bh) / 2;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    const tk_theme *th = tk_theme_active();
+    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, th->bg);
+    tk_panel(x, y, bw, bh, title, 1);
+    return (tk_rect){ x + 3, y + 2, bw - 6, bh - 4 };
+}
+
+/* The ? help overlay: a clean, centered two-column key reference. A row with a
+ * NULL key is a section heading; a row with both fields NULL is a blank spacer.
+ * The box is sized to its content so nothing is ever truncated. */
+static void draw_help(int W, int H) {
+    typedef struct { const char *key, *desc; } hrow;
+    static const hrow R[] = {
+        { NULL, "Basics" },
+        { "Enter",      "send the typed message" },
+        { "Tab · Esc",  "move between the panes and the composer" },
+        { "Ctrl+K · :", "action menu: reach everything" },
+        { "Ctrl+F",     "search messages" },
+        { "Ctrl+W",     "switch workspace" },
+        { "Ctrl+R",     "reconnect" },
+        { "Ctrl+Q",     "quit" },
+        { NULL, NULL },
+        { NULL, "Lists   ↑/↓ move · Enter opens or acts" },
+        { "Channels",   "n  new channel" },
+        { "Members",    "n  new DM · Enter for message / role / remove" },
+        { "New DM",     "type to find a person · Space end-to-end encrypted · Enter opens" },
+        { "Encrypted",  "Ctrl+K: accept or decline, trust a new key, end or forget it" },
+        { "Messages",   "t thread · r react · e edit · x delete" },
+        { NULL, NULL },
+        { NULL, "Everything else" },
+        { "Ctrl+K",     "notifications, invites, webhooks, profile, upload, logout…" },
+        { "Summaries",  "Summarize ▾ in the title, Ctrl+K, or Enter on a channel" },
+        { "",           "↑/↓ select · Space details · Enter goes to the message" },
+    };
+    int n = (int)(sizeof R / sizeof R[0]);
+    const tk_theme *th = tk_theme_active();
+
+    /* Column widths, and the widest rendered row — size the box to fit them. */
+    int keyw = 0, bodyw = 0;
+    for (int i = 0; i < n; i++)
+        if (R[i].key) { int kw = tk_str_width(R[i].key); if (kw > keyw) keyw = kw; }
+    for (int i = 0; i < n; i++) {
+        int w = R[i].key ? keyw + 2 + tk_str_width(R[i].desc)
+              : R[i].desc ? tk_str_width(R[i].desc) : 0;
+        if (w > bodyw) bodyw = w;
+    }
+
+    int bw = bodyw + 6;                       /* 2-col padding inside the border */
+    if (bw > W - 4) bw = W - 4;
+    int bh = n + 4;                           /* border + a blank pad top & bottom */
+    if (bh > H - 2) bh = H - 2;
+    int x = (W - bw) / 2, y = (H - bh) / 2;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+
+    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, th->bg);
+    tk_panel(x, y, bw, bh, "Help  ·  Esc closes", 1);
+
+    int cx = x + 3, xmax = x + bw - 3, ry = y + 2;
+    for (int i = 0; i < n && ry < y + bh - 1; i++, ry++) {
+        if (!R[i].key && !R[i].desc) continue;                 /* spacer */
+        if (!R[i].key) {                                       /* section heading */
+            tk_text(cx, ry, xmax, R[i].desc, th->accent2 | TB_BOLD, th->bg);
+        } else {
+            tk_text(cx, ry, xmax, R[i].key, th->accent | TB_BOLD, th->bg);
+            tk_text(cx + keyw + 2, ry, xmax, R[i].desc, th->fg, th->bg);
+        }
+    }
+}
+
+/* The /profile modal (REQ-020): your identity + how to change it. Drawn over the
+ * presented frame like the palette/picker, so it self-presents. */
+static void draw_profile(const oc_model *m, int W, int H) {
+    const char *me = m->user_id ? oc_model_user_name(m, m->user_id) : "";
+    uint8_t role = OC_ROLE_MEMBER;
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == m->user_id) { role = m->users[i].role; break; }
+    uint8_t pr = oc_model_presence_of(m, m->user_id);
+    const char *rn = role == OC_ROLE_OWNER ? "owner" : role == OC_ROLE_ADMIN ? "admin" : "member";
+    const char *pn = pr == OC_PRESENCE_ONLINE ? "online" : pr == OC_PRESENCE_AWAY ? "away" : "offline";
+    const tk_theme *th = tk_theme_active();
+    char idbuf[32];
+    snprintf(idbuf, sizeof idbuf, "%llu", (unsigned long long)m->user_id);
+    struct { const char *label, *value; } R[] = {
+        { "Name",     me[0] ? me : "(unknown)" },
+        { "User ID",  idbuf },
+        { "Role",     rn },
+        { "Presence", pn },
+    };
+    int n = (int)(sizeof R / sizeof R[0]);
+    const char *hint = "Change your name or password from the action menu (Ctrl+K).";
+
+    int labelw = 0, cw = tk_str_width(hint);
+    for (int i = 0; i < n; i++) { int w = tk_str_width(R[i].label); if (w > labelw) labelw = w; }
+    for (int i = 0; i < n; i++) {
+        int w = labelw + 2 + tk_str_width(R[i].value);
+        if (w > cw) cw = w;
+    }
+    tk_rect r = modal_frame(W, H, cw, n + 2, "Profile  ·  Esc closes");
+    for (int i = 0; i < n; i++) {
+        tk_text(r.x, r.y + i, r.x + r.w, R[i].label, th->muted, th->bg);
+        tk_text(r.x + labelw + 2, r.y + i, r.x + r.w, R[i].value, th->fg | TB_BOLD, th->bg);
+    }
+    tk_text(r.x, r.y + n + 1, r.x + r.w, hint, th->faint, th->bg);
+    tb_present();
+}
+
+/* ---- composer autocomplete (commands, channels, @users, :emoji:) ----------- */
+
+/* ac_cand is oc_completion from the core; keep the short local spelling. */
+typedef oc_completion ac_cand;
+
+
+
+/* The emoji catalogue and the completion rules live in the core
+ * (client/core/complete.[ch]) so the TUI and the Win32 GUI complete a token
+ * identically — same shortcodes, same match order (ARCH-74). */
+
+/* ---- action menus (menu-driven; ARCH-83) ---------------------------------- *
+ * A discoverable tk_list-in-a-modal that replaces cryptic nav keys and slash
+ * commands. One generic menu holds {label,id} items; the SELECT handler
+ * dispatches on the ACT_* id. Enter on a selected message/member opens it. */
+enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLOAD, ACT_UNREAD,
+       ACT_DM, ACT_ROLE_ADMIN, ACT_ROLE_MEMBER, ACT_REMOVE,
+       /* channel menu */
+       ACT_OPEN, ACT_JOIN, ACT_NOTIFY_ALL, ACT_NOTIFY_MENTIONS, ACT_NOTIFY_NONE, ACT_WEBHOOK_CREATE,
+       /* global action launcher (Ctrl-K) — replaces the remaining slash commands */
+       ACT_NEWCHAN, ACT_NEWDM, ACT_SEARCH, ACT_NICK, ACT_AWAY, ACT_ONLINE, ACT_DND, ACT_PASSWD,
+       ACT_PREFS, ACT_WEBHOOKS, ACT_LEAVE, ACT_INVITE, ACT_PROFILE, ACT_UPLOAD,
+       ACT_STORAGE, ACT_AUDIT, ACT_ALERTS, ACT_WORKSPACES, ACT_HELP, ACT_LOGOUT, ACT_SECURITY,
+       /* summaries (REQ-310): ask, pick the span, or go back to the open one */
+       ACT_SUMMARIZE, ACT_SUM_UNREAD, ACT_SUM_TODAY, ACT_SUM_WEEK, ACT_SUM_DAILY, ACT_SUM_RANGE, ACT_SUM_BACK,
+       /* encrypted DMs (PRIVATE-DM.md): an invitation, and the one in focus */
+       ACT_PDM_ACCEPT, ACT_PDM_DECLINE, ACT_PDM_TRUST, ACT_PDM_CLOSE, ACT_PDM_FORGET,
+       /* polls (REQ-225): who voted, and an option pressed */
+       ACT_VOTERS, ACT_POLL_CLOSE, ACT_VOTE0, ACT_VOTE_LAST = ACT_VOTE0 + OC_POLL_MAX_OPTIONS - 1,
+       /* summaries made while you were away: the list, then one of them */
+       ACT_SUM_NOTICES, ACT_SUM_NOTICE0 };
+typedef struct { const char *label; int id; } menuitem;
+static menuitem g_menu[28];
+static int      g_nmenu;
+static int  menu_count(void *ud) { (void)ud; return g_nmenu; }
+static void menu_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
+    (void)ud; *fg = TB_DEFAULT; snprintf(buf, cap, "%s", g_menu[i].label);
+}
+/* A poll's options as menu items (REQ-225): "Vote: Tacos", or "Take back
+ * your vote: Tacos" when it is yours. The labels live here, not in the
+ * model, which may move while the menu is open. */
+static char g_vote_labels[OC_POLL_MAX_OPTIONS][OC_POLL_OPTION_MAX + 32];
+static void menu_build_msg(int own, int deleted, int has_attach, const oc_poll_view *poll) {
+    g_nmenu = 0;
+    if (!deleted) g_menu[g_nmenu++] = (menuitem){ "Reply in thread", ACT_THREAD };
+    if (!deleted) g_menu[g_nmenu++] = (menuitem){ "Add reaction",    ACT_REACT };
+    if (poll && !deleted && !(poll->close_at_ms && (uint64_t)time(NULL) * 1000u >= poll->close_at_ms))
+        for (uint8_t k = 0; k < poll->n_options; k++) {
+            snprintf(g_vote_labels[k], sizeof g_vote_labels[k], "%s%s",
+                     ((poll->mine >> k) & 1) ? "Take back your vote: " : "Vote: ", poll->labels[k]);
+            g_menu[g_nmenu++] = (menuitem){ g_vote_labels[k], ACT_VOTE0 + k };
+        }
+    if (poll && !(poll->flags & OC_POLL_ANONYMOUS))
+        g_menu[g_nmenu++] = (menuitem){ "Who voted", ACT_VOTERS };
+    if (poll && own && !(poll->close_at_ms && (uint64_t)time(NULL) * 1000u >= poll->close_at_ms))
+        g_menu[g_nmenu++] = (menuitem){ "Close poll now", ACT_POLL_CLOSE };
+    if (has_attach) g_menu[g_nmenu++] = (menuitem){ "Download file", ACT_DOWNLOAD };
+    if (own)      g_menu[g_nmenu++] = (menuitem){ "Edit",            ACT_EDIT };
+    if (own)      g_menu[g_nmenu++] = (menuitem){ "Delete",          ACT_DELETE };
+    g_menu[g_nmenu++] = (menuitem){ "Who reacted", ACT_REACTORS };
+    g_menu[g_nmenu++] = (menuitem){ "Mark unread from here", ACT_UNREAD };
+}
+/* The conversation marked unread (REQ-235) and still in focus: the loop's
+ * keep-it-read step leaves it alone until focus moves, or it would read it again
+ * on the next frame. */
+static uint64_t g_hold_unread;
+static void menu_build_member(int is_self) {
+    g_nmenu = 0;
+    if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Message",     ACT_DM };
+    g_menu[g_nmenu++] = (menuitem){ "Make admin",  ACT_ROLE_ADMIN };
+    g_menu[g_nmenu++] = (menuitem){ "Make member", ACT_ROLE_MEMBER };
+    if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Remove",      ACT_REMOVE };
+}
+/* What can be done about an encrypted DM, by its session's state on this device
+ * (0: none here): trust a changed key, end it while it lives, or forget it once
+ * it cannot be read. Into the menu, or the launcher with `section`. */
+static int e2e_items(uint8_t state, tk_pal_item *out, const char *section) {
+    int n = 0;
+    if (state == OC_PDM_EV_KEY_CHANGED)
+        out[n++] = (tk_pal_item){ section, "Trust the new key", NULL, NULL, ACT_PDM_TRUST };
+    if (state == OC_PDM_EV_OPENING || state == OC_PDM_EV_OPEN || state == OC_PDM_EV_KEY_CHANGED)
+        out[n++] = (tk_pal_item){ section, "End encrypted conversation", NULL, NULL, ACT_PDM_CLOSE };
+    if (!state || state == OC_PDM_EV_ENDED)
+        out[n++] = (tk_pal_item){ section, "Forget it", NULL, NULL, ACT_PDM_FORGET };
+    return n;
+}
+/* The session state an e2e channel shows (0: none on this device). */
+static uint8_t e2e_state(const oc_model *m, const oc_channel *c) {
+    const oc_pdm_view *v = c && !c->forgotten ? oc_model_pdm((oc_model *)m, c->channel_id) : NULL;
+    return v ? v->state : 0;
+}
+/* `e2e`: the channel is an encrypted DM, whose session is in `state`. */
+static void menu_build_channel(int joined, int summarize, int e2e, uint8_t state) {
+    g_nmenu = 0;
+    if (!joined) g_menu[g_nmenu++] = (menuitem){ "Join",              ACT_JOIN };
+    g_menu[g_nmenu++] = (menuitem){ "Open",                ACT_OPEN };
+    if (e2e) {
+        tk_pal_item it[3];
+        int k = e2e_items(state, it, NULL);
+        for (int i = 0; i < k; i++) g_menu[g_nmenu++] = (menuitem){ it[i].label, it[i].id };
+    }
+    if (summarize && !e2e) g_menu[g_nmenu++] = (menuitem){ "Summarize",   ACT_SUMMARIZE };
+    g_menu[g_nmenu++] = (menuitem){ "Notify: all",         ACT_NOTIFY_ALL };
+    g_menu[g_nmenu++] = (menuitem){ "Notify: mentions",    ACT_NOTIFY_MENTIONS };
+    g_menu[g_nmenu++] = (menuitem){ "Notify: none",        ACT_NOTIFY_NONE };
+    g_menu[g_nmenu++] = (menuitem){ "Webhooks",            ACT_WEBHOOKS };
+    g_menu[g_nmenu++] = (menuitem){ "Create webhook",      ACT_WEBHOOK_CREATE };
+    if (joined)  g_menu[g_nmenu++] = (menuitem){ "Leave",  ACT_LEAVE };
+}
+/* The global action launcher (Ctrl-K / ':') — a tk_palette: incremental search,
+ * sections, right-aligned key hints. Every action reachable without a command. */
+static const tk_pal_item g_launcher_items[] = {
+    { "Channel", "New channel",         NULL, "n",  ACT_NEWCHAN },
+    { "Channel", "Leave this channel",  NULL, NULL, ACT_LEAVE },
+    { "Channel", "Notifications",       NULL, NULL, ACT_PREFS },
+    { "Channel", "Channel webhooks",    NULL, NULL, ACT_WEBHOOKS },
+    { "Channel", "Upload a file",       NULL, NULL, ACT_UPLOAD },
+    { "Messages","Search messages",     NULL, "Ctrl+F", ACT_SEARCH },
+    { "You",     "New direct message",  NULL, NULL, ACT_NEWDM },
+    { "You",     "Set away",            NULL, NULL, ACT_AWAY },
+    { "You",     "Set online",          NULL, NULL, ACT_ONLINE },
+    { "You",     "Change display name", NULL, NULL, ACT_NICK },
+    { "You",     "Change password",     NULL, NULL, ACT_PASSWD },
+    { "You",     "Two-step sign-in",    NULL, NULL, ACT_SECURITY },
+    { "You",     "Do not disturb",      NULL, NULL, ACT_DND },
+    { "You",     "Your profile",        NULL, NULL, ACT_PROFILE },
+    { "Admin",   "Invite a user",       NULL, NULL, ACT_INVITE },
+    { "Admin",   "Storage usage",       NULL, NULL, ACT_STORAGE },
+    { "Admin",   "Audit log",           NULL, NULL, ACT_AUDIT },
+    { "Admin",   "Daemon alerts",       NULL, NULL, ACT_ALERTS },
+    { "Workspace","Switch workspace",   NULL, "Ctrl+W", ACT_WORKSPACES },
+    { "Session", "Help",                NULL, "?",  ACT_HELP },
+    { "Session", "Log out",             NULL, NULL, ACT_LOGOUT },
+    { "Channel", "Summarize",           NULL, NULL, ACT_SUMMARIZE },
+};
+/* The launcher as it is now: summaries only where the daemon makes them
+ * (REQ-313), and a way back to the open one for this conversation. */
+static tk_pal_item g_launcher_now[sizeof g_launcher_items / sizeof *g_launcher_items + 2 + 2 + 3];
+static char g_sum_ready_label[48];
+
+static int launcher_build(const oc_model *m, uint64_t cid) {
+    int n = 0;
+    /* An encrypted DM has no uploads and no summaries (PRIVATE-DM.md). */
+    const oc_channel *c = cid ? oc_model_channel((oc_model *)m, cid) : NULL;
+    int e2e = c && c->e2e;
+    for (size_t i = 0; i < sizeof g_launcher_items / sizeof *g_launcher_items; i++) {
+        if (g_launcher_items[i].id == ACT_SUMMARIZE && (!oc_model_summarize_available(m) || e2e)) continue;
+        if (g_launcher_items[i].id == ACT_UPLOAD && e2e) continue;
+        g_launcher_now[n++] = g_launcher_items[i];
+    }
+    if (m->summary_open && cid && m->summary_channel == cid)
+        g_launcher_now[n++] = (tk_pal_item){ "Channel", "Back to the summary", NULL, NULL, ACT_SUM_BACK };
+    if (m->n_sum_notices) {
+        snprintf(g_sum_ready_label, sizeof g_sum_ready_label, "Summaries ready (%zu)", m->n_sum_notices);
+        g_launcher_now[n++] = (tk_pal_item){ "You", g_sum_ready_label, NULL, NULL, ACT_SUM_NOTICES };
+    }
+    /* An invitation to an encrypted DM waiting for an answer, then what can be
+     * done about the encrypted DM in focus. */
+    const oc_pdm_view *iv = g_e2e_invite ? oc_model_pdm((oc_model *)m, g_e2e_invite) : NULL;
+    if (iv && iv->state == OC_PDM_EV_INVITED) {
+        snprintf(g_e2e_invite_who, sizeof g_e2e_invite_who, "from %s", peer_name(m, iv->peer));
+        g_launcher_now[n++] = (tk_pal_item){ "Encrypted", "Accept on this device", g_e2e_invite_who, NULL, ACT_PDM_ACCEPT };
+        g_launcher_now[n++] = (tk_pal_item){ "Encrypted", "Decline", g_e2e_invite_who, NULL, ACT_PDM_DECLINE };
+    }
+    if (e2e) n += e2e_items(e2e_state(m, c), &g_launcher_now[n], "Encrypted");
+    return n;
+}
+/* The summaries made while you were away, newest first, as many as the menu
+ * holds: Enter opens one, d dismisses it. Each item's id is ACT_SUM_NOTICE0
+ * plus its place in the model's list. */
+static void conv_where(const oc_model *m, uint64_t cid, char *out, size_t cap);
+static char g_notice_labels[sizeof g_menu / sizeof *g_menu][160];
+static void menu_build_sum_notices(const oc_model *m) {
+    g_nmenu = 0;
+    for (size_t k = m->n_sum_notices; k > 0 && g_nmenu < (int)(sizeof g_menu / sizeof *g_menu); k--) {
+        const oc_summary_notice *sn = &m->sum_notices[k - 1];
+        char where[96];
+        conv_where(m, sn->channel_id, where, sizeof where);
+        oc_summary_notice_title(sn->status, sn->scope, sn->start_ms, sn->end_ms, where, g_notice_labels[g_nmenu],
+                                sizeof g_notice_labels[g_nmenu]);
+        g_menu[g_nmenu] = (menuitem){ g_notice_labels[g_nmenu], ACT_SUM_NOTICE0 + (int)(k - 1) };
+        g_nmenu++;
+    }
+}
+/* The spans a summary can cover (PROTOCOL.md SUMMARIZE). */
+static void menu_build_summary_span(void) {
+    g_nmenu = 0;
+    g_menu[g_nmenu++] = (menuitem){ "Unread",            ACT_SUM_UNREAD };
+    g_menu[g_nmenu++] = (menuitem){ "Today",             ACT_SUM_TODAY };
+    g_menu[g_nmenu++] = (menuitem){ "Since yesterday",   ACT_SUM_DAILY };
+    g_menu[g_nmenu++] = (menuitem){ "Last 7 days",       ACT_SUM_WEEK };
+    g_menu[g_nmenu++] = (menuitem){ "Custom date range", ACT_SUM_RANGE };
+}
+
+/* ---- sidebar (shared with the GUI via the core) ----------------------------
+ * Grouping, filtering, sorting and collapse come from oc_model_sidebar so this
+ * frontend and the Win32 one cannot disagree about what belongs where (ARCH-74).
+ * Two sections, matching Slack and the GUI: Channels (public and private, the
+ * private ones marked) then Direct messages. */
+#define SBG_N OC_SB_SECTIONS
+static const char *SBG_LABEL[SBG_N] = { "Channels", "Direct messages" };
+static oc_sidebar_opts g_sb;             /* per-section sort/filter/collapse */
+static int g_sb_hdr = -1;                /* if >=0, a section header is the selection */
+static int g_sb_loaded;                  /* synced prefs folded in once */
+#define SB_SETTING_KEY "sidebar"
+
+/* Sidebar prefs ride the daemon's per-(user, client_type) settings bucket, the
+ * same mechanism the GUI uses — separate buckets by design, so a terminal and a
+ * window can keep different sidebar shapes (CLIENT.md §3). */
+static void sidebar_opts_save(oc_client *cl) {
+    if (!cl) return;
+    char enc[64];
+    oc_sidebar_opts_encode(&g_sb, enc, sizeof enc);
+    oc_client_set_setting(cl, SB_SETTING_KEY, enc);
+}
+static void sidebar_opts_load(const oc_model *m) {
+    const char *v = m ? oc_model_setting(m, SB_SETTING_KEY) : NULL;
+    if (v && v[0]) oc_sidebar_opts_parse(&g_sb, v);
+}
+
+static int chan_group(const oc_channel *c) {
+    return c->kind == OC_CHANNEL_KIND_DM ? OC_SB_DMS : OC_SB_CHANNELS;
+}
+
+/* One visible sidebar row: a section header, or a channel (idx into m->channels). */
+typedef struct { uint8_t header; uint8_t group; size_t idx; } sb_row;
+
+/* Ask the core for the ordered rows, then map each back to its model index so
+ * the rest of this file keeps working in terms of `idx`. */
+static int sidebar_build(const oc_model *m, sb_row *out, int cap) {
+    oc_sidebar_row core[256];
+    size_t n = oc_model_sidebar(m, &g_sb, core, 256);
+    int k = 0;
+    for (size_t i = 0; i < n && k < cap; i++) {
+        if (core[i].is_header) {
+            out[k++] = (sb_row){ 1, core[i].section, 0 };
+            continue;
+        }
+        for (size_t j = 0; j < m->n_channels; j++)
+            if (m->channels[j].channel_id == core[i].channel_id) {
+                out[k++] = (sb_row){ 0, core[i].section, j };
+                break;
+            }
+    }
+    return k;
+}
+
+/* Marker + name for a channel row, e.g. "# general", "@alice", "\U0001F512 secret". */
+static void sidebar_label(const oc_model *m, const oc_channel *c, char *buf, size_t cap) {
+    if (c->kind == OC_CHANNEL_KIND_DM) {
+        const char *pn = oc_model_user_name(m, c->peer_id);
+        /* The self-DM keeps the account name and gains a dim "you" tag, as the
+         * GUI does — never "you" in place of the name. */
+        /* A presence glyph, not an "@": the marker for a person is the person's
+         * state, matching the GUI's avatar + presence dot. */
+        uint8_t pr = oc_model_presence_of(m, c->peer_id);
+        const char *dot = pr == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f"       /* ● */
+                        : pr == OC_PRESENCE_AWAY   ? "\xe2\x97\x91"       /* ◑ */
+                                                   : "\xe2\x97\x8b";      /* ○ */
+        /* An encrypted DM is marked with a lock after the presence glyph. */
+        const char *lock = c->e2e ? "\xf0\x9f\x94\x92 " : "";   /* 🔒 */
+        if (c->peer_id == m->user_id && pn[0]) snprintf(buf, cap, "%s %s%s  you", dot, lock, pn);
+        else snprintf(buf, cap, "%s %s%s", dot, lock, pn[0] ? pn : "dm");
+    } else if (c->is_public) {
+        snprintf(buf, cap, "# %s", c->name ? c->name : "…");
+    } else {
+        snprintf(buf, cap, "\xf0\x9f\x94\x92 %s", c->name ? c->name : "…");  /* 🔒 */
+    }
+}
+
+/* Locate the current selection's display-row index (header or channel==focus). */
+static int sidebar_cursor(const sb_row *rows, int n, size_t focus) {
+    for (int i = 0; i < n; i++) {
+        if (g_sb_hdr >= 0) { if (rows[i].header && rows[i].group == g_sb_hdr) return i; }
+        else if (!rows[i].header && rows[i].idx == focus) return i;
+    }
+    return 0;
+}
+
+/* Move the selection to display row i, updating focus / g_sb_hdr accordingly. */
+static void sidebar_select(const sb_row *rows, int i, size_t *focus) {
+    if (rows[i].header) g_sb_hdr = rows[i].group;
+    else { g_sb_hdr = -1; *focus = rows[i].idx; }
+}
+
+/* What changed in the encrypted DMs since the last frame, said once on the
+ * status row; and the DM just asked for, or accepted, selected as it arrives.
+ * The invitation the launcher offers is the first still waiting. */
+static void e2e_watch(oc_model *m, size_t *focus) {
+    if (m->pdm_refused_seq != g_e2e_refused_seen) {
+        g_e2e_refused_seen = m->pdm_refused_seq;
+        snprintf(g_e2e_note, sizeof g_e2e_note, "An encrypted conversation with %s could not be opened "
+                 "(they may not be signed in).", peer_name(m, m->pdm_refused_peer));
+        if (g_dm_asked_e2e && g_dm_asked == m->pdm_refused_peer) g_dm_asked = 0;
+    }
+    g_e2e_invite = 0;
+    for (size_t i = 0; i < m->n_pdms; i++) {
+        const oc_pdm_view *v = &m->pdms[i];
+        if (v->state == OC_PDM_EV_INVITED && !g_e2e_invite) g_e2e_invite = v->id;
+        if (g_dm_asked && g_dm_asked_e2e && v->peer == g_dm_asked && v->state == OC_PDM_EV_OPENING) {
+            g_select_cid = v->id;
+            g_dm_asked = 0;
+        }
+        int k = -1, freek = -1;
+        for (int j = 0; j < OC_PDM_VIEW_MAX; j++) {
+            if (g_e2e_said[j].id == v->id) k = j;
+            if (!g_e2e_said[j].id && freek < 0) freek = j;
+        }
+        if (k < 0 && freek >= 0) { k = freek; g_e2e_said[k].id = v->id; g_e2e_said[k].state = 0; }
+        if (k < 0 || g_e2e_said[k].state == v->state) continue;
+        g_e2e_said[k].state = v->state;
+        const char *who = peer_name(m, v->peer);
+        if (v->state == OC_PDM_EV_INVITED)
+            snprintf(g_e2e_note, sizeof g_e2e_note, "%s asks for an end-to-end encrypted conversation: accept on "
+                     "this device or decline (Ctrl+K).", who);
+        else if (v->state == OC_PDM_EV_KEY_CHANGED)
+            snprintf(g_e2e_note, sizeof g_e2e_note, "%s's device key changed: compare the safety number.", who);
+        else if (v->state == OC_PDM_EV_ENDED)
+            snprintf(g_e2e_note, sizeof g_e2e_note, "The encrypted conversation with %s ended (%s).", who,
+                     e2e_end_text(v->reason));
+    }
+    for (int j = 0; j < OC_PDM_VIEW_MAX; j++)
+        if (g_e2e_said[j].id && !oc_model_pdm(m, g_e2e_said[j].id)) g_e2e_said[j].id = 0;
+    /* An ordinary DM is the 1:1 one with that person that is not encrypted. */
+    for (size_t i = 0; g_dm_asked && !g_dm_asked_e2e && i < m->n_channels; i++) {
+        const oc_channel *c = &m->channels[i];
+        if (c->kind == OC_CHANNEL_KIND_DM && !c->e2e && !c->n_peers && c->peer_id == g_dm_asked) {
+            g_select_cid = c->channel_id;
+            g_dm_asked = 0;
+        }
+    }
+    for (size_t i = 0; g_select_cid && i < m->n_channels; i++)
+        if (m->channels[i].channel_id == g_select_cid && !m->channels[i].forgotten) {
+            *focus = i;
+            g_sb_hdr = -1;
+            g_select_cid = 0;
+        }
+}
+
+/* Forget the ended (or unreadable) encrypted DM `cid`: its texts are wiped and
+ * its row leaves the sidebar, so the focus moves to the first row left. */
+static void e2e_forget(oc_model *m, uint64_t cid, size_t *focus) {
+    oc_model_pdm_forget(m, cid);
+    if (*focus >= m->n_channels || m->channels[*focus].channel_id != cid) return;
+    sb_row rows[256];
+    int nrows = sidebar_build(m, rows, 256);
+    for (int i = 0; i < nrows; i++)
+        if (!rows[i].header) { *focus = rows[i].idx; g_sb_hdr = -1; return; }
+}
+
+/* Do the encrypted-DM action `id` (accept or decline the invitation offered, or
+ * an action on the channel `cid`); 0 when `id` is not one. */
+static int e2e_act(oc_client *cl, int id, uint64_t cid, size_t *focus) {
+    if (id == ACT_PDM_ACCEPT && g_e2e_invite) {
+        oc_client_pdm_accept(cl, g_e2e_invite);
+        g_select_cid = g_e2e_invite;   /* its channel comes as any channel does */
+        g_e2e_note[0] = '\0';
+    } else if (id == ACT_PDM_DECLINE && g_e2e_invite) {
+        oc_client_pdm_decline(cl, g_e2e_invite);
+        g_e2e_note[0] = '\0';
+    }
+    else if (id == ACT_PDM_TRUST && cid)  oc_client_pdm_trust(cl, cid);
+    else if (id == ACT_PDM_CLOSE && cid)  oc_client_pdm_close(cl, cid);
+    else if (id == ACT_PDM_FORGET && cid) e2e_forget((oc_model *)oc_client_model(cl), cid, focus);
+    else return id == ACT_PDM_ACCEPT || id == ACT_PDM_DECLINE;
+    return 1;
+}
+
+/* "New direct message": a people picker, the launcher's filtered list over the
+ * roster (not yourself, not anyone disabled), with an "End-to-end encrypted"
+ * box in its title that Space ticks. An item's id is its place in g_dmp_uid. */
+#define DMP_MAX 512
+static tk_pal_item g_dmp_items[DMP_MAX];
+static uint64_t    g_dmp_uid[DMP_MAX];
+static char        g_dmp_name[DMP_MAX][64];
+static int         g_dmp_e2e;
+static char        g_dmp_title[64];
+
+static void dmp_title(void) {
+    snprintf(g_dmp_title, sizeof g_dmp_title, "New direct message  [%s] End-to-end encrypted",
+             g_dmp_e2e ? "x" : " ");
+}
+static void dmp_open(tk_palette *p, const oc_model *m) {
+    int n = 0;
+    for (size_t i = 0; i < m->n_users && n < DMP_MAX; i++) {
+        const oc_member *u = &m->users[i];
+        if (u->user_id == m->user_id || u->disabled || !u->name[0]) continue;
+        snprintf(g_dmp_name[n], sizeof g_dmp_name[n], "%s", u->name);
+        g_dmp_uid[n] = u->user_id;
+        g_dmp_items[n] = (tk_pal_item){ "People  \xc2\xb7  Space: encrypted", g_dmp_name[n], NULL, NULL, n };
+        n++;
+    }
+    g_dmp_e2e = 0;
+    dmp_title();
+    p->title = g_dmp_title;
+    tk_palette_set(p, g_dmp_items, n);
+}
+
+/* Where the title's Summarize was drawn (x1 0: not drawn). */
+static int g_sumbtn_x0, g_sumbtn_x1, g_sumbtn_y;
+
+static void render(oc_client *cl, size_t focus, const char *composer,
+                   size_t clen, int scroll, int help_open, int ac_idx,
+                   int panel, int msg_sel, int mem_sel, uint64_t editing) {
+    const oc_model *m = oc_client_model(cl);
+    const tk_theme *th = tk_theme_active();
+    int ch_act = (panel == 1), msg_act = (panel == 0 || panel == 2), mem_act = (panel == 3);
+    int W = tb_width(), H = tb_height();
+    tb_clear();
+    if (W < 24 || H < 8) { tk_text(0, 0, W, " terminal too small ", TB_RED | TB_BOLD, TB_DEFAULT); tb_present(); return; }
+
+    const oc_channel *fc = (focus < m->n_channels) ? &m->channels[focus] : NULL;
+    const char *conn = m->authed ? "connected" : (m->connected ? "connecting…" : "offline");
+
+    /* Header bar (row 0): workspace · you · presence · connection · unread. */
+    int unread = 0;
+    for (size_t i = 0; i < m->n_channels; i++) if (m->channels[i].unread > 0) unread += m->channels[i].unread;
+    const char *me = m->user_id ? oc_model_user_name(m, m->user_id) : "";
+    uint8_t pr = oc_model_presence_of(m, m->user_id);
+    const char *dot = pr == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f" : pr == OC_PRESENCE_AWAY ? "\xe2\x97\x90" : "\xe2\x97\x8b";
+    char hdr[256];
+    snprintf(hdr, sizeof hdr, " OpenChime · %.120s%s · %.48s %s · %s",
+             active_label(), m->workspace_mode == OC_WS_MODE_DEMO ? " (public demo, erased nightly)" : "",
+             me[0] ? me : "…", dot, conn);
+    tk_fill(0, 0, W, th->header_bg);
+    tk_text(0, 0, W, hdr, th->fg | TB_BOLD, th->header_bg);
+    /* Unread here, and — so a background workspace isn't invisible — a count of
+     * what's waiting in the others (REQ-014). */
+    int other = 0;
+    for (int i = 0; i < g_nws; i++) if (i != g_active) other += ws_unread(&g_ws[i]);
+    char u[64];
+    if (unread && other)   snprintf(u, sizeof u, "%d unread · %d elsewhere ", unread, other);
+    else if (unread)       snprintf(u, sizeof u, "%d unread ", unread);
+    else if (other)        snprintf(u, sizeof u, "%d elsewhere ", other);
+    else                   u[0] = '\0';
+    if (u[0]) tk_text(W - (int)strlen(u) - 1, 0, W, u, th->accent2 | TB_BOLD, th->header_bg);
+    /* The daemon's critical failures, to an owner or admin only (REQ-263): a
+     * warning sign and how many nobody has acknowledged -- red -- or, all
+     * acknowledged, how many still hold -- yellow. Left of the unread count. */
+    int right = W - (u[0] ? (int)strlen(u) + 1 : 0);
+    if (m->srvalerts_have && (m->srvalerts_unacked || m->srvalerts_current)) {
+        char a[48];
+        if (m->srvalerts_unacked) snprintf(a, sizeof a, "\xe2\x9a\xa0 %u alert%s ", m->srvalerts_unacked,
+                                           m->srvalerts_unacked == 1 ? "" : "s");
+        else snprintf(a, sizeof a, "\xe2\x9a\xa0 %u ongoing ", m->srvalerts_current);
+        int aw = tk_str_width(a);
+        int at = right - aw - 1;
+        if (at > 0) tk_text(at, 0, W, a, (m->srvalerts_unacked ? TB_RED : TB_YELLOW) | TB_BOLD, th->header_bg);
+        right = at;
+    }
+    /* Summaries made while you were away (REQ-310), left of those. */
+    if (m->n_sum_notices) {
+        char sb[48];
+        snprintf(sb, sizeof sb, "\xe2\x9c\xa6 %zu ready ", m->n_sum_notices);
+        int at = right - tk_str_width(sb) - 1;
+        if (at > 0) tk_text(at, 0, W, sb, th->accent | TB_BOLD, th->header_bg);
+    }
+
+    /* Rows: header=0; panels=[1, H-3); status=H-3; composer=H-2; hint=H-1. */
+    int panels_top = 1, panels_h = H - 4;
+    if (panels_h < 3) panels_h = 3;
+    int ch_w, mem_w, msg_x, msg_w;
+    layout(W, &ch_w, &mem_w, &msg_x, &msg_w);
+
+    /* Channels panel — grouped (public / DMs / private), each group foldable,
+     * channels indented under their header. */
+    tk_panel(0, panels_top, ch_w, panels_h, "Channels", ch_act);
+    {
+        sb_row rows[256];
+        int nrows = sidebar_build(m, rows, 256);
+        for (int r = 0, iy = panels_top + 1;
+             r < nrows && iy < panels_top + panels_h - 1; r++, iy++) {
+            int hdr_sel = rows[r].header && g_sb_hdr == rows[r].group;
+            int chn_sel = !rows[r].header && g_sb_hdr < 0 && rows[r].idx == focus;
+            int sel = hdr_sel || chn_sel;
+            uintattr_t bg = sel ? th->sel_bg : th->bg;
+            tk_fill(iy, 1, ch_w - 1, bg);
+            char label[160];
+            if (rows[r].header) {
+                /* count of this group's unread, so a collapsed group still speaks up */
+                int gu = 0;
+                for (size_t i = 0; i < m->n_channels; i++)
+                    if (chan_group(&m->channels[i]) == rows[r].group) gu += m->channels[i].unread;
+                const char *tri = oc_sb_collapsed_of(&g_sb, rows[r].group) ? "\xe2\x96\xb8" : "\xe2\x96\xbe"; /* ▸ / ▾ */
+                static const char *SORTC[3] = { "az", "recent", "unread" };
+                static const char *FILTC[3] = { "", " \xc2\xb7 unread", " \xc2\xb7 active" };
+                int gsel = (g_sb_hdr == rows[r].group);
+                /* The header shows its sort/filter only while selected, so the
+                 * modes are discoverable without cluttering every frame. */
+                if (gsel)
+                    snprintf(label, sizeof label, "%s %s  [%s%s]", tri, SBG_LABEL[rows[r].group],
+                             SORTC[oc_sb_sort_of(&g_sb, rows[r].group)],
+                             FILTC[oc_sb_filter_of(&g_sb, rows[r].group)]);
+                else if (gu) snprintf(label, sizeof label, "%s %s (%d)", tri, SBG_LABEL[rows[r].group], gu);
+                else    snprintf(label, sizeof label, "%s %s", tri, SBG_LABEL[rows[r].group]);
+                uintattr_t hfg = sel ? (th->sel_fg | TB_BOLD) : (th->accent | TB_BOLD);
+                tk_text(1, iy, ch_w - 1, label, hfg, bg);
+            } else {
+                const oc_channel *c = &m->channels[rows[r].idx];
+                uintattr_t fg = sel ? (th->sel_fg | TB_BOLD) : c->joined ? th->fg : th->muted;
+                char title[96];
+                sidebar_label(m, c, title, sizeof title);
+                /* Two tiers, as the GUI draws them (oc_model_badge): a count for
+                 * what is about you, bold for any other unread. */
+                int bn = 0, bdot = 0;
+                oc_model_badge(m, c, &bn, &bdot);
+                if (bn > 0) snprintf(label, sizeof label, "  %s (%d)", title, bn);
+                else        snprintf(label, sizeof label, "  %s", title);
+                if ((bn > 0 || bdot) && !sel) fg |= TB_BOLD;
+                tk_text(1, iy, ch_w - 1, label, fg, bg);
+            }
+        }
+    }
+
+    /* Messages panel (title = channel, or the open overlay). */
+    char mt[120];
+    if (m->roster_open)          snprintf(mt, sizeof mt, "members");
+    else if (m->search_open)     snprintf(mt, sizeof mt, "search");
+    else if (m->reactlist_open)  snprintf(mt, sizeof mt, "reactions");
+    else if (m->voterlist_open)  snprintf(mt, sizeof mt, "votes");
+    else if (m->prefs_open)      snprintf(mt, sizeof mt, "notifications");
+    else if (m->weblist_open)    snprintf(mt, sizeof mt, "webhooks");
+    else if (m->thread_open)     snprintf(mt, sizeof mt, "thread · #%s", fc && fc->name ? fc->name : "…");
+    else if (fc && fc->kind == OC_CHANNEL_KIND_DM) {
+        /* An encrypted DM is the same title behind a lock. */
+        const char *pn = oc_model_user_name(m, fc->peer_id);
+        snprintf(mt, sizeof mt, "%s@%s", fc->e2e ? "\xf0\x9f\x94\x92 " : "", pn[0] ? pn : "dm");
+    } else if (fc && !fc->is_public)
+        snprintf(mt, sizeof mt, "\xf0\x9f\x94\x92 %s", fc->name ? fc->name : "…");  /* 🔒 private */
+    else if (fc)                 snprintf(mt, sizeof mt, "#%s", fc->name ? fc->name : "…");
+    else                         snprintf(mt, sizeof mt, "no channel");
+    tk_panel(msg_x, panels_top, msg_w, panels_h, mt, msg_act);
+    /* Summarize, at the right of the conversation's title (REQ-310): a click
+     * offers the spans, as the launcher's "Summarize" does. */
+    g_sumbtn_x0 = g_sumbtn_x1 = 0;
+    if (fc && !fc->e2e && oc_model_summarize_available(m) &&
+        !(m->thread_open || m->search_open || m->roster_open || m->reactlist_open || m->voterlist_open || m->prefs_open || m->weblist_open)) {
+        static const char LABEL[] = " Summarize \xe2\x96\xbe ";
+        int lw = tk_str_width(LABEL), lx = msg_x + msg_w - 2 - lw;
+        if (lx > msg_x + tk_str_width(mt) + 6) {
+            const tk_theme *bth = tk_theme_active();
+            tk_text(lx, panels_top, lx + lw, LABEL, bth->accent, bth->bg);
+            g_sumbtn_x0 = lx; g_sumbtn_x1 = lx + lw; g_sumbtn_y = panels_top;
+        }
+    }
+    {
+        int ix = msg_x + 1, iy = panels_top + 1, iw = msg_w - 2, ih = panels_h - 2;
+        int normal = !(m->thread_open || m->search_open || m->roster_open || m->reactlist_open || m->voterlist_open || m->prefs_open || m->weblist_open);
+        /* An encrypted DM's state on this device, on the rows above its messages. */
+        if (ih > 1 && fc && fc->e2e &&
+            !(m->search_open || m->roster_open || m->reactlist_open || m->voterlist_open || m->prefs_open || m->weblist_open)) {
+            char line[400];
+            uintattr_t efg;
+            rows_t er = {0};
+            e2e_status((oc_model *)m, fc, line, sizeof line, &efg);
+            wrap_words_push(&er, line, efg, iw, 2);
+            for (size_t i = 0; i < er.n && ih > 1; i++, iy++, ih--)
+                tk_text(ix, iy, ix + iw, er.v[i].s, er.v[i].fg, th->bg);
+            rows_free(&er);
+        }
+        if (ih > 0 && (fc || !normal)) {
+            rows_t rows = {0};
+            if (m->roster_open)         build_roster_rows(&rows, m, iw);
+            else if (m->search_open)    build_search_rows(&rows, m, iw);
+            else if (m->reactlist_open) build_reactlist_rows(&rows, m, iw);
+            else if (m->voterlist_open) build_voterlist_rows(&rows, m, iw);
+            else if (m->prefs_open)     build_prefs_rows(&rows, m, iw);
+            else if (m->weblist_open)   build_webhooks_rows(&rows, m, iw);
+            else if (m->thread_open)    build_thread_rows(&rows, m, fc, m->user_id, iw);
+            else                        build_rows(&rows, m, fc, m->user_id, iw);
+            int total = (int)rows.n, end;
+            if (panel == 2 && normal && msg_sel >= 0) {   /* keep the selection visible */
+                int last = -1;
+                for (int i = 0; i < total; i++) if (rows.v[i].mi == msg_sel) last = i;
+                end = (last < 0) ? total : last + 1;
+                if (end < ih) end = ih;
+                if (end > total) end = total;
+            } else {
+                end = total - scroll;
+                if (end > total) end = total;
+                if (end < 0) end = 0;
+            }
+            int start = end - ih;
+            if (start < 0) start = 0;
+            int y = iy + (ih - (end - start));
+            for (int i = start; i < end; i++, y++) {
+                int selrow = (panel == 2 && normal && rows.v[i].mi >= 0 && rows.v[i].mi == msg_sel);
+                uintattr_t bg = selrow ? th->sel_bg : th->bg;
+                if (selrow) tk_fill(y, ix, ix + iw, bg);
+                tk_text(ix, y, ix + iw, rows.v[i].s, selrow ? (th->sel_fg | TB_BOLD) : rows.v[i].fg, bg);
+            }
+            rows_free(&rows);
+        }
+    }
+
+    /* Members panel (roster + presence), on wide terminals. */
+    if (mem_w) {
+        int mx = msg_x + msg_w;
+        tk_panel(mx, panels_top, mem_w, panels_h, "Members", mem_act);
+        for (size_t i = 0, iy = panels_top + 1; i < m->n_users && (int)iy < panels_top + panels_h - 1; i++, iy++) {
+            const oc_member *u = &m->users[i];
+            uint8_t p = oc_model_presence_of(m, u->user_id);
+            const char *d = p == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f" : p == OC_PRESENCE_AWAY ? "\xe2\x97\x90" : "\xe2\x97\x8b";
+            int sel = (mem_act && (int)i == mem_sel);
+            uintattr_t bg = sel ? th->sel_bg : th->bg;
+            uintattr_t col = sel ? (th->sel_fg | TB_BOLD)
+                           : u->disabled ? th->muted
+                           : p == OC_PRESENCE_ONLINE ? th->presence_on : p == OC_PRESENCE_AWAY ? th->presence_away : th->fg;
+            const char *role = u->role == OC_ROLE_OWNER ? " *" : u->role == OC_ROLE_ADMIN ? " +" : "";
+            char line[80]; snprintf(line, sizeof line, "%s %s%s", d, u->name[0] ? u->name : "?", role);
+            if (sel) tk_fill((int)iy, mx + 1, mx + mem_w - 1, bg);
+            tk_text(mx + 1, (int)iy, mx + mem_w - 1, line, col, bg);
+        }
+    }
+
+    /* Row H-3: the autocomplete suggestion strip when completing, else the status
+     * line (last status/error + typing indicator). */
+    tk_fill(H - 3, 0, W, TB_DEFAULT);
+    ac_cand cands[16]; int rs, nc = 0;
+    if (clen > 0) nc = (int)oc_complete(m, composer, cands, 16, &rs, NULL);
+    if (nc > 0) {
+        int active = ((ac_idx % nc) + nc) % nc;
+        int cx = tk_text(0, H - 3, W, " \xe2\x96\xb8 ", TB_CYAN | TB_BOLD, TB_DEFAULT);   /* ▸ */
+        for (int i = 0; i < nc && cx < W - 2; i++) {
+            char item[110]; snprintf(item, sizeof item, "%s", cands[i].disp);
+            uintattr_t fg = (i == active) ? TB_BLACK : TB_WHITE | TB_BOLD;
+            uintattr_t bg = (i == active) ? TB_CYAN : TB_DEFAULT;
+            if (i == active) tb_set_cell(cx - 1, H - 3, ' ', fg, bg);
+            cx = tk_text(cx, H - 3, W, item, fg, bg);
+            if (i == active && cx < W) tb_set_cell(cx, H - 3, ' ', fg, bg);
+            cx = tk_text(cx, H - 3, W, "  ", TB_DEFAULT, TB_DEFAULT);
+        }
+        tk_text(cx, H - 3, W, nc > 1 ? "(Tab cycles)" : "(Tab)", TB_BLACK | TB_BOLD, TB_DEFAULT);
+    } else {
+        /* The core reports the state; the TUI appends its own retry chord, since
+         * the binding belongs to this frontend and not to the shared core. */
+        const char *retry = (!m->connected && strstr(m->status, "reconnecting"))
+                            ? "  (Ctrl+R to retry now)" : "";
+        char st[260];
+        snprintf(st, sizeof st, " %s%s%s", m->status[0] ? m->status : "", retry,
+                 scroll > 0 ? "   [scrolled]" : "");
+        int sx = tk_text(0, H - 3, W, st, th->muted, TB_DEFAULT);
+        if (g_e2e_note[0]) {
+            char pl[220];
+            snprintf(pl, sizeof pl, "   \xf0\x9f\x94\x92 %s", g_e2e_note);
+            sx = tk_text(sx, H - 3, W, pl, th->accent, TB_DEFAULT);
+        }
+        if (m->n_sum_notices) {
+            /* The newest summary made while you were away, until it is opened. */
+            const oc_summary_notice *sn = &m->sum_notices[m->n_sum_notices - 1];
+            char where[96], t[200], line[260];
+            conv_where(m, sn->channel_id, where, sizeof where);
+            oc_summary_notice_title(sn->status, sn->scope, sn->start_ms, sn->end_ms, where, t, sizeof t);
+            snprintf(line, sizeof line, "   \xe2\x9c\xa6 %s \xc2\xb7 Ctrl+K to open", t);
+            sx = tk_text(sx, H - 3, W, line, th->accent, TB_DEFAULT);
+        }
+        if (fc) {
+            uint64_t tp[8]; size_t nt = oc_model_typing(m, fc->channel_id, m->user_id, tp, 8);
+            if (nt) {
+                char tl[140];
+                if (nt == 1) snprintf(tl, sizeof tl, "  ✎ %s is typing…", name_for(fc, tp[0]));
+                else         snprintf(tl, sizeof tl, "  ✎ %zu people are typing…", nt);
+                tk_text(sx, H - 3, W, tl, th->accent, TB_DEFAULT);
+            }
+        }
+    }
+
+    /* Composer (row H-2). Editing an existing message shows a distinct prompt. */
+    tk_fill(H - 2, 0, W, TB_DEFAULT);
+    int cx = editing ? tk_text(0, H - 2, W, "\xe2\x9c\x8e edit \xe2\x80\xba ", TB_YELLOW | TB_BOLD, TB_DEFAULT)
+                     : tk_text(0, H - 2, W, "\xe2\x80\xba ", TB_GREEN | TB_BOLD, TB_DEFAULT);   /* › */
+    cx = tk_text(cx, H - 2, W, composer, TB_DEFAULT, TB_DEFAULT);
+    if (cx < W) tb_set_cell(cx, H - 2, ' ', TB_DEFAULT, TB_REVERSE);   /* cursor */
+
+    /* Context keybinding hint bar (row H-1), per focused panel — generated from
+     * tuikit tk_binding tables (tk_help_footer) so the hints can't drift from the
+     * keys. Phase 4 wires input matching to these same tables. */
+    static const tk_binding KB_COMPOSER[] = {
+        { TB_KEY_ENTER, 0, "Enter", "send", 1 }, { TB_KEY_ESC, 0, "Esc", "navigate", 1 },
+        { TB_KEY_CTRL_F, 0, "Ctrl+F", "search", 1 }, { TB_KEY_CTRL_K, 0, "Ctrl+K", "actions", 1 },
+        { 0, '?', "?", "help", 1 }, { TB_KEY_CTRL_Q, 0, "Ctrl+Q", "quit", 1 },
+    };
+    static const tk_binding KB_CHANNELS[] = {
+        { TB_KEY_ARROW_DOWN, 0, "↑↓", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "open", 1 },
+        { 0, 's', "s", "sort", 1 }, { 0, 'f', "f", "filter", 1 },
+        { 0, 'n', "n", "new", 1 }, { TB_KEY_TAB, 0, "Tab", "panel", 1 },
+        { TB_KEY_ESC, 0, "Esc", "composer", 1 },
+    };
+    static const tk_binding KB_MESSAGES[] = {
+        { TB_KEY_ARROW_DOWN, 0, "↑↓", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "actions", 1 },
+        { 0, 't', "t", "thread", 1 }, { 0, 'r', "r", "react", 1 }, { 0, 'e', "e", "edit", 1 },
+        { TB_KEY_TAB, 0, "Tab", "panel", 1 }, { TB_KEY_ESC, 0, "Esc", "composer", 1 },
+    };
+    static const tk_binding KB_MEMBERS[] = {
+        { TB_KEY_ARROW_DOWN, 0, "↑↓", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "actions", 1 },
+        { 0, 'n', "n", "new DM", 1 }, { TB_KEY_TAB, 0, "Tab", "panel", 1 },
+        { TB_KEY_ESC, 0, "Esc", "composer", 1 },
+    };
+    tk_fill(H - 1, 0, W, th->footer_bg);
+    if (help_open) {
+        tk_text(0, H - 1, W, " press ? or Esc to close help ", th->fg, th->footer_bg);
+    } else {
+        const char *label; const tk_binding *kb; int kn;
+        if      (panel == 1) { label = " Channels"; kb = KB_CHANNELS; kn = (int)(sizeof KB_CHANNELS / sizeof *KB_CHANNELS); }
+        else if (panel == 2) { label = " Messages"; kb = KB_MESSAGES; kn = (int)(sizeof KB_MESSAGES / sizeof *KB_MESSAGES); }
+        else if (panel == 3) { label = " Members";  kb = KB_MEMBERS;  kn = (int)(sizeof KB_MEMBERS  / sizeof *KB_MEMBERS);  }
+        else                 { label = "";          kb = KB_COMPOSER; kn = (int)(sizeof KB_COMPOSER / sizeof *KB_COMPOSER); }
+        int hx = label[0] ? tk_text(0, H - 1, W, label, th->accent | TB_BOLD, th->footer_bg) : 0;
+        tk_help_footer(H - 1, hx, W, kb, kn, th->muted, th->footer_bg);
+    }
+
+    if (help_open) draw_help(W, H);
+}
+
+
+
+
+
+/* The /storage overlay (REQ-214): usage, the active policy, and what
+ * maintenance has reclaimed. Owner/admin only — a member's request is refused
+ * server-side, which surfaces as an error line rather than an empty panel. */
+static void draw_storage(const oc_model *m, int W, int H) {
+    const tk_theme *th = tk_theme_active();
+    if (!m->storage_have) {
+        const char *e = "No report yet: owner/admin only.";
+        tk_rect r = modal_frame(W, H, tk_str_width(e), 1, "Storage  ·  Esc closes");
+        tk_text(r.x, r.y, r.x + r.w, e, th->muted, th->bg);
+        tb_present();
+        return;
+    }
+    const oc_storage_view *s = &m->storage;
+    const uint64_t MBv = 1024 * 1024;
+
+    struct { char t[128]; uintattr_t c; } L[16];
+    int n = 0;
+#define SROW(col, ...) do { snprintf(L[n].t, sizeof L[n].t, __VA_ARGS__); L[n].c = (col); n++; } while (0)
+    if (s->total_bytes == 0)   /* attachments in S3: no filesystem measured (CONFIG.md) */
+        SROW(th->fg, "Disk         not measured (attachments in S3)");
+    else
+    SROW(s->under_pressure ? (TB_RED | TB_BOLD) : th->fg, "Disk         %llu MB free of %llu MB",
+         (unsigned long long)(s->avail_bytes / MBv), (unsigned long long)(s->total_bytes / MBv));
+    SROW(th->fg, "Attachments  %llu file(s), %llu MB",
+         (unsigned long long)s->attach_count, (unsigned long long)(s->attach_bytes / MBv));
+    if (s->under_pressure) SROW(TB_RED | TB_BOLD, "under pressure: reclaiming storage");
+    SROW(th->bg, "%s", "");
+    SROW(th->accent2 | TB_BOLD, "%s", "Policy");
+    if (s->max_age_days) SROW(th->fg, "  attachments expire after %llu day(s)", (unsigned long long)s->max_age_days);
+    else                 SROW(th->fg, "%s", "  attachments kept indefinitely");
+    SROW(th->fg, "  eviction under pressure: %s", s->evict_enabled ? "on (oldest first)" : "off");
+    SROW(th->fg, "  database reserve: %llu MB", (unsigned long long)(s->reserve_bytes / MBv));
+    SROW(th->bg, "%s", "");
+    SROW(th->accent2 | TB_BOLD, "%s", "Reclaimed so far");
+    /* Evictions are the destructive reclaims; flag them in red once any happen. */
+    SROW(s->rec_evicted ? (TB_RED | TB_BOLD) : th->fg, "  %llu abandoned   %llu expired   %llu evicted",
+         (unsigned long long)s->rec_orphan, (unsigned long long)s->rec_expired, (unsigned long long)s->rec_evicted);
+#undef SROW
+
+    int cw = 0;
+    for (int i = 0; i < n; i++) { int w = tk_str_width(L[i].t); if (w > cw) cw = w; }
+    tk_rect r = modal_frame(W, H, cw, n, "Storage  ·  Esc closes");
+    for (int i = 0; i < n && i < r.h; i++)
+        tk_text(r.x, r.y + i, r.x + r.w, L[i].t, L[i].c, th->bg);
+    tb_present();
+}
+
+
+/* The /audit overlay (REQ-251): administrative and security-relevant actions,
+ * newest first. Owner/admin only — a member's request is refused server-side.
+ * Denied and failed entries are drawn in red, since those are what an operator
+ * is usually scanning for. */
+static void draw_audit(const oc_model *m, int W, int H) {
+    const tk_theme *th = tk_theme_active();
+    if (!m->n_audit) {
+        const char *e = m->audit_open ? "No entries, or you are not an admin." : "";
+        tk_rect r = modal_frame(W, H, tk_str_width("No entries, or you are not an admin."),
+                                1, "Audit log  ·  Esc closes");
+        tk_text(r.x, r.y, r.x + r.w, e, th->muted, th->bg);
+        tb_present();
+        return;
+    }
+    static const char *FAM[] = { "?", "admin", "account", "security", "moder" };
+    int want = (int)m->n_audit + 1;                       /* + a header row */
+    tk_rect r = modal_frame(W, H, W, want > 22 ? 22 : want,
+                            "Audit log  ·  newest first  ·  Esc closes");
+
+    char hdr[256];
+    snprintf(hdr, sizeof hdr, "%-12s %-8s %-22s %-14s %-16s %s",
+             "when", "family", "action", "actor", "target", "detail");
+    tk_text(r.x, r.y, r.x + r.w, hdr, th->accent2 | TB_BOLD, th->bg);
+
+    int rows = r.h - 1;
+    for (int i = 0; i < rows && (size_t)i < m->n_audit; i++) {
+        const oc_audit_view *a = &m->audit[i];
+        char when[32];
+        time_t t = (time_t)(a->at_ms / 1000);
+        struct tm tmv;
+        oc_localtime_r(&t, &tmv);
+        strftime(when, sizeof when, g_cfg && g_cfg->time_24h ? "%m-%d %H:%M" : "%m-%d %I:%M%p", &tmv);
+
+        char line[256];
+        const char *fam = (a->family <= 4) ? FAM[a->family] : "?";
+        snprintf(line, sizeof line, "%-12s %-8s %-22.22s %-14.14s %-16.16s %s",
+                 when, fam, a->action,
+                 a->actor_name[0] ? a->actor_name : "-",
+                 a->target[0] ? a->target : "-",
+                 a->detail);
+        /* A denial or failure is what an operator scans for — make it findable. */
+        tk_text(r.x, r.y + 1 + i, r.x + r.w, line,
+                a->outcome ? th->fg : (TB_RED | TB_BOLD), th->bg);
+    }
+    tb_present();
+}
+
+/* The daemon's critical failures (REQ-263): newest first, those still holding
+ * marked, the unacknowledged in red. Up/down selects; a acknowledges the one
+ * selected, A every one; Esc closes. */
+static void draw_alerts(const oc_model *m, int W, int H, int sel) {
+    const tk_theme *th = tk_theme_active();
+    const char *title = "Daemon alerts  ·  a acknowledge · A all · Esc closes";
+    if (!m->n_srvalerts) {
+        const char *e = m->srvalerts_have ? "Nothing has failed." : "Nothing to show, or you are not an admin.";
+        tk_rect r = modal_frame(W, H, tk_str_width(title), 1, title);
+        tk_text(r.x, r.y, r.x + r.w, e, th->muted, th->bg);
+        return;
+    }
+    int want = (int)m->n_srvalerts * 2 + 1;
+    tk_rect r = modal_frame(W, H, W, want > 22 ? 22 : want, title);
+    char hdr[160];
+    snprintf(hdr, sizeof hdr, "  %-12s %-9s %-6s %s", "last", "state", "times", "what");
+    tk_text(r.x, r.y, r.x + r.w, hdr, th->accent2 | TB_BOLD, th->bg);
+    int per = 2, shown = (r.h - 1) / per;
+    int first = sel >= shown ? sel - shown + 1 : 0;
+    for (int i = 0; i < shown && (size_t)(first + i) < m->n_srvalerts; i++) {
+        const oc_srvalert_view *a = &m->srvalerts[first + i];
+        char when[32];
+        time_t t = (time_t)(a->last_ms / 1000);
+        struct tm tmv;
+        oc_localtime_r(&t, &tmv);
+        strftime(when, sizeof when, g_cfg && g_cfg->time_24h ? "%m-%d %H:%M" : "%m-%d %I:%M%p", &tmv);
+        char line[256];
+        snprintf(line, sizeof line, "%s %-12s %-9s %-6u %s%s", first + i == sel ? "\xe2\x96\xb8" : " ", when,
+                 a->current ? "ongoing" : "stopped", a->count, a->key, a->acked ? "" : "  · not acknowledged");
+        uintattr_t fg = !a->acked ? (TB_RED | TB_BOLD) : a->current ? (TB_YELLOW | TB_BOLD) : th->fg;
+        int y = r.y + 1 + i * per;
+        tk_text(r.x, y, r.x + r.w, line, fg, th->bg);
+        char msg[OC_MAX_ALERT_MESSAGE + 8];
+        snprintf(msg, sizeof msg, "    %s", a->message);
+        tk_text(r.x, y + 1, r.x + r.w, msg, a->acked ? th->muted : th->fg, th->bg);
+    }
+}
+
+/* Which topics of the open summary have their details closed. Kept for the
+ * request it was shown for; a new summary starts with every topic open. */
+static unsigned char *g_sum_closed;
+static size_t        g_sum_closed_n;
+static uint32_t      g_sum_closed_req;
+
+static int sum_closed(const oc_model *m, size_t t) {
+    if (g_sum_closed_req != m->summary_req || g_sum_closed_n != m->summary.n_topics) {
+        free(g_sum_closed);
+        g_sum_closed = calloc(m->summary.n_topics ? m->summary.n_topics : 1, 1);
+        g_sum_closed_n = g_sum_closed ? m->summary.n_topics : 0;
+        g_sum_closed_req = m->summary_req;
+    }
+    return t < g_sum_closed_n && g_sum_closed[t];
+}
+
+/* What can be selected in the summary, in order: each topic's heading, the
+ * details of an open topic, then each item that needs attention. Entry `e` as
+ * its topic and detail (-1 for the heading), or topic -1 and the item: 1, or 0
+ * past the end. */
+static int sum_entry(const oc_model *m, int e, int *topic, int *detail) {
+    if (!m->summary_open || m->summary_loading || m->summary_status != OC_SUM_OK || e < 0) return 0;
+    for (size_t t = 0; t < m->summary.n_topics; t++) {
+        if (e-- == 0) { *topic = (int)t; *detail = -1; return 1; }
+        if (sum_closed(m, t)) continue;
+        size_t nd = m->summary.topics[t].n_details;
+        if ((size_t)e < nd) { *topic = (int)t; *detail = e; return 1; }
+        e -= (int)nd;
+    }
+    if ((size_t)e < m->summary.n_attention) { *topic = -1; *detail = e; return 1; }
+    return 0;
+}
+
+/* The messages entry (`t`, `d`) cites, and how many. */
+static const uint64_t *sum_entry_refs(const oc_model *m, int t, int d, size_t *n) {
+    *n = 0;
+    if (t < 0) { if (d >= 0 && (size_t)d < m->summary.n_attention) { *n = m->summary.attention[d].n_refs; return m->summary.attention[d].refs; } return NULL; }
+    if (d < 0) { *n = m->summary.topics[t].n_refs; return m->summary.topics[t].refs; }
+    *n = m->summary.topics[t].details[d].n_refs;
+    return m->summary.topics[t].details[d].refs;
+}
+
+/* A topic's people and size: "Ann, Bob, Cara +2 · 14 messages". */
+static void topic_meta(const oc_summary_topic *tp, char *out, size_t cap) {
+    size_t w = 0;
+    out[0] = '\0';
+    for (size_t k = 0; k < tp->n_people && k < 3 && w < cap; k++)
+        w += (size_t)snprintf(out + w, cap - w, "%s%s", k ? ", " : "", tp->people[k]);
+    if (tp->n_people > 3 && w < cap) w += (size_t)snprintf(out + w, cap - w, " +%zu", tp->n_people - 3);
+    if (tp->count && w < cap)
+        snprintf(out + w, cap - w, "%s%llu message%s", w ? " \xc2\xb7 " : "", (unsigned long long)tp->count,
+                 tp->count == 1 ? "" : "s");
+}
+
+/* The conversation a summary is of: "#name" or "@name". */
+static void conv_where(const oc_model *m, uint64_t cid, char *out, size_t cap) {
+    const oc_channel *ch = oc_model_channel((oc_model *)m, cid);
+    if (ch && ch->kind == OC_CHANNEL_KIND_DM) {
+        const char *pn = oc_model_user_name(m, ch->peer_id);
+        snprintf(out, cap, "@%s", pn[0] ? pn : "dm");
+    } else snprintf(out, cap, "#%s", ch && ch->name ? ch->name : "…");
+}
+
+static void sum_where(const oc_model *m, char *out, size_t cap) { conv_where(m, m->summary_channel, out, cap); }
+
+/* `s` centred in `width` columns, on the heap. */
+static char *centred(const char *s, int width) {
+    int w = tk_str_width(s), pad = w < width ? (width - w) / 2 : 0;
+    char *o = malloc((size_t)pad + strlen(s) + 1);
+    if (!o) return NULL;
+    memset(o, ' ', (size_t)pad);
+    strcpy(o + pad, s);
+    return o;
+}
+
+/* The open summary (REQ-310), as Slack lays one out: what it covers (the dates,
+ * how many messages, who posted), then each topic -- its title, what happened,
+ * and its details, each citing its messages as [n]. Up/down selects a topic or
+ * a detail; the selected detail shows the message it cites under it; Space (or
+ * Enter on a topic) opens and closes a topic's details; Enter on a detail goes
+ * to its message; Esc closes and forgets it. While the daemon makes it, says
+ * what it is summarizing and where the request stands; one not made says why,
+ * and r asks again. */
+static void draw_summary(const oc_model *m, int W, int H, int sel) {
+    const tk_theme *th = tk_theme_active();
+    char where[96], title[200];
+    sum_where(m, where, sizeof where);
+    if (m->summary_loading)
+        snprintf(title, sizeof title, "Summarizing %s  ·  n notify me when ready · c cancel · Esc closes", where);
+    else
+        snprintf(title, sizeof title, "Summary of %s  ·  ↑↓ select · Space details · Enter go to message · Esc closes", where);
+    int cw = W - 10 > 96 ? 96 : W - 10;
+    if (cw < 20) cw = 20;
+    rows_t r = {0};
+    if (m->summary_loading) {
+        char t1[200], t2[96];
+        oc_summary_wait_title(m->summary_scope, m->summary_start, m->summary_end, where, t1, sizeof t1);
+        oc_summary_wait_text(m->summary_position, t2, sizeof t2);
+        rows_push(&r, strdup(""), th->fg);
+        rows_push(&r, centred(t1, cw), th->fg | TB_BOLD);
+        rows_push(&r, centred(t2, cw), th->muted);
+        rows_push(&r, strdup(""), th->fg);
+    } else if (m->summary_status != OC_SUM_OK) {
+        /* What went wrong, the daemon's reason, and, unless it was refused,
+         * how to ask again. */
+        wrap_words_push(&r, oc_summary_fail_title(m->summary_status), TB_RED | TB_BOLD, cw, 0);
+        if (m->summary_error && *m->summary_error) wrap_words_push(&r, m->summary_error, th->muted, cw, 0);
+        if (m->summary_status != OC_SUM_FORBIDDEN) {
+            rows_push(&r, strdup(""), th->fg);
+            rows_push(&r, strdup("Press r to try again."), th->fg);
+        }
+    } else if (!m->summary.n_topics && !m->summary.overview[0]) {
+        wrap_words_push(&r, m->summary.count ? "Nothing to summarize in this span: its threads go on past it."
+                                             : "No messages in this span.", th->muted, cw, 0);
+    } else {
+        const oc_summary_view *v = &m->summary;
+        char dates[48], who[512], line[700];
+        oc_summary_dates(m->summary_start, m->summary_end, dates, sizeof dates);
+        oc_summary_posters_text(v, who, sizeof who);
+        snprintf(line, sizeof line, "%s · %llu message%s%s%s", dates, (unsigned long long)v->count,
+                 v->count == 1 ? "" : "s", who[0] ? " · " : "", who);
+        wrap_words_push(&r, line, th->muted, cw, 2);
+        int e = 0;
+        unsigned num = 0;
+        if (v->overview[0]) {
+            /* Numbered with everything else, as the GUI numbers it. */
+            size_t cap = strlen(v->overview) + 16 + v->n_refs * 8;
+            char *ol = malloc(cap);
+            if (ol) {
+                size_t w = (size_t)snprintf(ol, cap, "%s", v->overview);
+                for (size_t k = 0; k < v->n_refs && w < cap; k++) w += (size_t)snprintf(ol + w, cap - w, " [%u]", ++num);
+                rows_push(&r, strdup(""), th->fg);
+                wrap_words_push(&r, ol, th->fg | TB_BOLD, cw, 0);
+                free(ol);
+            }
+        }
+        uint64_t now_ms = (uint64_t)time(NULL) * 1000u;
+        for (size_t t = 0; t < v->n_topics; t++) {
+            const oc_summary_topic *tp = &v->topics[t];
+            int closed = sum_closed(m, t);
+            rows_push(&r, strdup(""), th->fg);
+            snprintf(line, sizeof line, "%s %s", closed ? "\xe2\x96\xb8" : "\xe2\x96\xbe", tp->title[0] ? tp->title : where);
+            size_t first = r.n;
+            wrap_words_push(&r, line, e == sel ? (th->accent | TB_BOLD) : (th->fg | TB_BOLD), cw, 2);
+            for (size_t j = first; j < r.n; j++) r.v[j].mi = e;
+            e++;
+            char meta[160];
+            topic_meta(tp, meta, sizeof meta);
+            if (meta[0]) { snprintf(line, sizeof line, "  %s", meta); wrap_words_push(&r, line, th->faint, cw, 2); }
+            if (tp->text[0]) {
+                snprintf(line, sizeof line, "  %s", tp->text);
+                wrap_words_push(&r, line, th->fg, cw, 2);
+            }
+            if (closed) {
+                for (size_t d = 0; d < tp->n_details; d++) num += (unsigned)tp->details[d].n_refs;
+                continue;
+            }
+            if (tp->n_details) rows_push(&r, strdup("  More details"), th->muted);
+            for (size_t d = 0; d < tp->n_details; d++) {
+                const oc_summary_detail *dt = &tp->details[d];
+                size_t cap = strlen(dt->text) + 16 + dt->n_refs * 8;
+                char *dl = malloc(cap);
+                if (!dl) continue;
+                size_t w = (size_t)snprintf(dl, cap, "  \xe2\x80\xa2 %s", dt->text);
+                for (size_t k = 0; k < dt->n_refs && w < cap; k++)
+                    w += (size_t)snprintf(dl + w, cap - w, " [%u]", ++num);
+                first = r.n;
+                wrap_words_push(&r, dl, e == sel ? (th->accent | TB_BOLD) : th->fg, cw, 4);
+                free(dl);
+                for (size_t j = first; j < r.n; j++) r.v[j].mi = e;
+                /* The selected detail: every message it cites, in order, each
+                 * as a citation's preview shows it, under its [n]. */
+                for (size_t k = 0; e == sel && k < dt->n_refs; k++) {
+                    const oc_summary_source *src = oc_summary_source_of(v, dt->refs[k]);
+                    if (!src) continue;
+                    size_t pfirst = r.n;
+                    char when[48];
+                    oc_summary_when(src->at, now_ms, g_cfg && g_cfg->time_24h, when, sizeof when);
+                    snprintf(line, sizeof line, "      [%u] %s · %s%s · %s", num - (unsigned)dt->n_refs + 1 + (unsigned)k,
+                             src->author, src->parent ? "Thread in " : "", where, when);
+                    wrap_words_push(&r, line, th->muted, cw, 6);
+                    rows_t body = {0};
+                    wrap_words_push(&body, src->text, th->muted, cw - 6, 0);
+                    for (size_t j = 0; j < body.n && j < 4; j++) {
+                        int more = j == 3 && body.n > 4;
+                        snprintf(line, sizeof line, "      %s%s", body.v[j].s, more ? "\xe2\x80\xa6" : "");
+                        rows_push(&r, strdup(line), th->muted);
+                    }
+                    rows_free(&body);
+                    for (size_t j = pfirst; j < r.n; j++) r.v[j].mi = e;
+                }
+                e++;
+            }
+        }
+        if (v->n_attention) {
+            rows_push(&r, strdup(""), th->fg);
+            rows_push(&r, strdup("Needs attention"), th->fg | TB_BOLD);
+            for (size_t a = 0; a < v->n_attention; a++) {
+                const oc_summary_attention *at = &v->attention[a];
+                size_t cap = strlen(at->text) + 40 + at->n_refs * 8;
+                char *al = malloc(cap);
+                if (!al) continue;
+                size_t w = (size_t)snprintf(al, cap, "  \xe2\x80\xa2 %s: %s", at->question ? "Question" : "Action", at->text);
+                for (size_t k = 0; k < at->n_refs && w < cap; k++) w += (size_t)snprintf(al + w, cap - w, " [%u]", ++num);
+                size_t first = r.n;
+                wrap_words_push(&r, al, e == sel ? (th->accent | TB_BOLD) : th->fg, cw, 4);
+                free(al);
+                for (size_t j = first; j < r.n; j++) r.v[j].mi = e;
+                e++;
+            }
+        }
+        if (v->n_more) {
+            size_t w = 0;
+            char more[700];
+            w = (size_t)snprintf(more, sizeof more, "More topics: ");
+            for (size_t k = 0; k < v->n_more && w < sizeof more; k++)
+                w += (size_t)snprintf(more + w, sizeof more - w, "%s%s", k ? ", " : "", v->more[k]);
+            rows_push(&r, strdup(""), th->fg);
+            wrap_words_push(&r, more, th->muted, cw, 2);
+        }
+        rows_push(&r, strdup(""), th->fg);
+        rows_push(&r, strdup("AI-generated summarization may be inaccurate."), th->faint);
+    }
+    int rows = (int)r.n;
+    if (rows > H - 8) rows = H - 8;
+    if (rows < 1) rows = 1;
+    tk_rect box = modal_frame(W, H, cw, rows, title);
+    /* Keep the selected entry, and what shows under it, in view. */
+    int start = 0, last = -1;
+    for (int i = 0; i < (int)r.n; i++) if (r.v[i].mi == sel && sel >= 0) last = i;
+    if (last >= box.h) start = last - box.h + 1;
+    for (int i = 0; i < box.h && start + i < (int)r.n; i++) {
+        const row_t *rw = &r.v[start + i];
+        tk_text(box.x, box.y + i, box.x + box.w, rw->s, rw->fg, th->bg);
+        /* People named in it, in the mention colour. */
+        if (m->summary_loading || m->summary_status != OC_SUM_OK) continue;
+        oc_summary_mention mn[16];
+        size_t nm = oc_summary_mentions(&m->summary, rw->s, mn, 16);
+        for (size_t k = 0; k < nm; k++) {
+            char pre[700], name[256];
+            snprintf(pre, sizeof pre, "%.*s", (int)mn[k].start, rw->s);
+            snprintf(name, sizeof name, "%.*s", (int)mn[k].len, rw->s + mn[k].start);
+            int x = box.x + tk_str_width(pre);
+            if (x < box.x + box.w) tk_text(x, box.y + i, box.x + box.w, name, th->accent2 | (rw->fg & TB_BOLD), th->bg);
+        }
+    }
+    rows_free(&r);
+}
+
+/* ---- the custom range picker (REQ-310) ---------------------------------------
+ * "Summarize custom date range": the first and last day typed into two fields
+ * or picked on two months side by side. Arrows move the day, Enter picks it
+ * (first day, then last), PgUp/PgDn change month, Tab goes round the fields and
+ * buttons; Summarize does nothing until both days are picked. */
+enum { CAL_GRID, CAL_START, CAL_END, CAL_GO, CAL_CANCEL, CAL_N };
+static int        g_cal_open, g_cal_focus;
+static oc_sumcal  g_cal;
+static uint64_t   g_cal_cur, g_cal_cid;
+static tk_input   g_cal_in[2];
+static const char *g_cal_err;
+
+/* `day` moved `n` days, by the calendar. */
+static uint64_t day_add(uint64_t day, int n) {
+    time_t t = (time_t)(day / 1000);
+    struct tm tm;
+    if (!oc_localtime_r(&t, &tm)) return day;
+    tm.tm_mday += n;
+    tm.tm_hour = tm.tm_min = tm.tm_sec = 0;
+    tm.tm_isdst = -1;
+    time_t r = mktime(&tm);
+    return r == (time_t)-1 ? day : (uint64_t)r * 1000u;
+}
+
+static void cal_fields(void) {
+    char a[16], b[16];
+    oc_summary_day_text(g_cal.start, a, sizeof a);
+    oc_summary_day_text(g_cal.end, b, sizeof b);
+    tk_input_set(&g_cal_in[0], a);
+    tk_input_set(&g_cal_in[1], b);
+}
+
+static void cal_open(uint64_t cid) {
+    oc_sumcal_init(&g_cal, (uint64_t)time(NULL) * 1000u);
+    g_cal_cur = g_cal.today;
+    oc_sumcal_shift(&g_cal, -1);              /* this month on the right, as Slack's */
+    tk_input_init(&g_cal_in[0], 0, "Start YYYY-MM-DD");
+    tk_input_init(&g_cal_in[1], 0, "End YYYY-MM-DD");
+    g_cal_focus = CAL_GRID;
+    g_cal_err = NULL;
+    g_cal_cid = cid;
+    g_cal_open = 1;
+}
+
+/* Keep the day the cursor is on in one of the two months shown. */
+static void cal_follow(void) {
+    int y, m;
+    uint64_t cells[42];
+    for (int guard = 0; guard < 240; guard++) {
+        oc_sumcal_month(&g_cal, 0, &y, &m, cells);
+        uint64_t first = 0, last = 0;
+        for (int i = 0; i < 42; i++) if (cells[i]) { if (!first) first = cells[i]; }
+        oc_sumcal_month(&g_cal, 1, &y, &m, cells);
+        for (int i = 0; i < 42; i++) if (cells[i]) last = cells[i];
+        if (g_cal_cur < first) oc_sumcal_shift(&g_cal, -1);
+        else if (g_cal_cur > last) oc_sumcal_shift(&g_cal, 1);
+        else break;
+    }
+}
+
+/* A field typed in: the day it names, when it is one that can be picked. */
+static int cal_take(int which) {
+    uint64_t d;
+    if (oc_summary_date_parse(tk_input_value(&g_cal_in[which]), &d) != 0) { g_cal_err = "A date is YYYY-MM-DD."; return -1; }
+    if (d > g_cal.today) { g_cal_err = "That day has not happened yet."; return -1; }
+    if (which == 0) { g_cal.start = d; if (g_cal.end && g_cal.end < d) g_cal.end = 0; }
+    else if (!g_cal.start || d < g_cal.start) { g_cal_err = "The end date is before the start date."; return -1; }
+    else g_cal.end = d;
+    g_cal_cur = d;
+    cal_follow();
+    g_cal_err = NULL;
+    return 0;
+}
+
+static void draw_sumcal(int W, int H) {
+    const tk_theme *th = tk_theme_active();
+    tk_rect b = modal_frame(W, H, 46, 13, "Summarize custom date range");
+    tk_input_draw(&g_cal_in[0], (tk_rect){ b.x, b.y, 21, 1 }, g_cal_focus == CAL_START);
+    tk_input_draw(&g_cal_in[1], (tk_rect){ b.x + 24, b.y, 21, 1 }, g_cal_focus == CAL_END);
+    static const char *const MONTHS[12] = { "January", "February", "March", "April", "May", "June", "July",
+                                            "August", "September", "October", "November", "December" };
+    for (int which = 0; which < 2; which++) {
+        int y, mo, gx = b.x + which * 24;
+        uint64_t cells[42];
+        oc_sumcal_month(&g_cal, which, &y, &mo, cells);
+        char head[32];
+        snprintf(head, sizeof head, "%s %d", MONTHS[mo - 1], y);
+        int hw = tk_str_width(head);
+        tk_text(gx + (20 - hw) / 2, b.y + 2, gx + 20, head, th->fg | TB_BOLD, th->bg);
+        tk_text(gx, b.y + 3, gx + 20, "Su Mo Tu We Th Fr Sa", th->muted, th->bg);
+        for (int i = 0; i < 42; i++) {
+            if (!cells[i]) continue;
+            uint64_t d = cells[i];
+            time_t t = (time_t)(d / 1000);
+            struct tm tm;
+            if (!oc_localtime_r(&t, &tm)) continue;
+            char num[4];
+            snprintf(num, sizeof num, "%2d", tm.tm_mday);
+            uintattr_t fg = d > g_cal.today ? th->faint : th->fg;
+            if (g_cal.start && d >= g_cal.start && d <= (g_cal.end ? g_cal.end : g_cal.start)) fg = th->accent | TB_BOLD;
+            if (d == g_cal.today) fg |= TB_BOLD;
+            if (d == g_cal_cur && g_cal_focus == CAL_GRID) fg |= TB_REVERSE;
+            tk_text(gx + (i % 7) * 3, b.y + 4 + i / 7, gx + 20, num, fg, th->bg);
+        }
+    }
+    tk_text(b.x, b.y + 2, b.x + 2, "\xe2\x80\xb9", th->muted, th->bg);
+    tk_text(b.x + 44, b.y + 2, b.x + 46, "\xe2\x80\xba", th->muted, th->bg);
+    if (g_cal_err) tk_text(b.x, b.y + 11, b.x + b.w, g_cal_err, TB_RED | TB_BOLD, th->bg);
+    else tk_text(b.x, b.y + 11, b.x + b.w, "Arrows · Enter picks · PgUp/PgDn · Tab next", th->faint, th->bg);
+    uint64_t rs, re;
+    int ready = oc_sumcal_range(&g_cal, &rs, &re) == 0;
+    tk_text(b.x + b.w - 26, b.y + 12, b.x + b.w, "[ Cancel ]", g_cal_focus == CAL_CANCEL ? (th->fg | TB_REVERSE) : th->fg, th->bg);
+    tk_text(b.x + b.w - 13, b.y + 12, b.x + b.w, "[ Summarize ]",
+            !ready ? th->faint : g_cal_focus == CAL_GO ? (th->accent | TB_BOLD | TB_REVERSE) : (th->accent | TB_BOLD), th->bg);
+}
+
+/* A key in the range picker. 1 when it asked for the summary. */
+static int sumcal_key(oc_client *cl, const struct tb_event *ev) {
+    if (ev->key == TB_KEY_ESC) { g_cal_open = 0; return 0; }
+    if (ev->key == TB_KEY_TAB) {
+        if (g_cal_focus == CAL_START || g_cal_focus == CAL_END) {
+            if (tk_input_value(&g_cal_in[g_cal_focus - CAL_START])[0]) cal_take(g_cal_focus - CAL_START);
+        }
+        g_cal_focus = (g_cal_focus + 1) % CAL_N;
+        if (g_cal_focus == CAL_START || g_cal_focus == CAL_END) cal_fields();
+        return 0;
+    }
+    if (g_cal_focus == CAL_START || g_cal_focus == CAL_END) {
+        tk_result r = tk_input_handle(&g_cal_in[g_cal_focus - CAL_START], ev);
+        if (r == TK_CANCEL) g_cal_open = 0;
+        else if (r == TK_SELECT && cal_take(g_cal_focus - CAL_START) == 0) g_cal_focus++;
+        return 0;
+    }
+    if (g_cal_focus == CAL_GRID) {
+        int step = ev->key == TB_KEY_ARROW_LEFT ? -1 : ev->key == TB_KEY_ARROW_RIGHT ? 1
+                 : ev->key == TB_KEY_ARROW_UP ? -7 : ev->key == TB_KEY_ARROW_DOWN ? 7 : 0;
+        if (step) {
+            uint64_t d = day_add(g_cal_cur, step);
+            if (d <= g_cal.today) { g_cal_cur = d; cal_follow(); }
+        } else if (ev->key == TB_KEY_PGUP || ev->key == TB_KEY_PGDN) {
+            oc_sumcal_shift(&g_cal, ev->key == TB_KEY_PGUP ? -1 : 1);
+            int y, m;
+            uint64_t cells[42];
+            oc_sumcal_month(&g_cal, 0, &y, &m, cells);
+            for (int i = 0; i < 42; i++) if (cells[i]) { if (cells[i] <= g_cal.today) g_cal_cur = cells[i]; break; }
+        } else if (ev->key == TB_KEY_ENTER) {
+            oc_sumcal_pick(&g_cal, g_cal_cur);
+            cal_fields();
+            g_cal_err = NULL;
+            if (g_cal.end) g_cal_focus = CAL_GO;
+        }
+        return 0;
+    }
+    if (ev->key != TB_KEY_ENTER) return 0;
+    if (g_cal_focus == CAL_CANCEL) { g_cal_open = 0; return 0; }
+    uint64_t rs, re;
+    if (oc_sumcal_range(&g_cal, &rs, &re) != 0) { g_cal_err = "Pick the first and last day."; return 0; }
+    g_cal_open = 0;
+    return oc_client_summarize(cl, g_cal_cid, OC_SUM_RANGE, rs, re) != 0;
+}
+
+/* ---- workspace switcher (REQ-013) -------------------------------------------
+ * One list, the same on every platform: the workspaces this device remembers,
+ * each with its unread + connection state, and an always-present "Log in to new
+ * workspace" row at the bottom. Open sessions come first (they have live state
+ * to show), then remembered-but-closed workspaces from the book. */
+
+static const char *g_store_path = NULL;   /* set in main(); the book lives here */
+static oc_secret  *g_secret = NULL;
+
+typedef struct {
+    char key[288];
+    char label[256];
+    char user[128];
+    int  session;                 /* index into g_ws, or -1 when not open */
+} sw_entry;
+
+static sw_entry g_sw[MAX_WS + 16];
+static int      g_nsw = 0;
+
+static void sw_book_cb(void *ctx, const char *key, const char *label,
+                       const char *user, uint64_t last_used) {
+    (void)ctx; (void)last_used;
+    if (g_nsw >= (int)(sizeof g_sw / sizeof g_sw[0])) return;
+    if (!key || !key[0]) return;
+    for (int i = 0; i < g_nsw; i++)                  /* already listed as open */
+        if (strcmp(g_sw[i].key, key) == 0) return;
+    sw_entry *e = &g_sw[g_nsw++];
+    snprintf(e->key,   sizeof e->key,   "%s", key);
+    snprintf(e->label, sizeof e->label, "%s", (label && label[0]) ? label : key);
+    snprintf(e->user,  sizeof e->user,  "%s", user ? user : "");
+    e->session = -1;
+}
+
+/* Rebuild the switcher list. Called when the switcher opens (not per frame) —
+ * it touches the book's SQLite file. */
+static void sw_build(void) {
+    g_nsw = 0;
+    for (int i = 0; i < g_nws && g_nsw < (int)(sizeof g_sw / sizeof g_sw[0]); i++) {
+        sw_entry *e = &g_sw[g_nsw++];
+        snprintf(e->key,   sizeof e->key,   "%s", g_ws[i].key);
+        snprintf(e->label, sizeof e->label, "%s", g_ws[i].label[0] ? g_ws[i].label : g_ws[i].key);
+        snprintf(e->user,  sizeof e->user,  "%s", g_ws[i].user);
+        e->session = i;
+    }
+    oc_store *s = g_store_path ? oc_store_open(g_store_path) : NULL;
+    if (s) { oc_store_workspace_each(s, sw_book_cb, NULL); oc_store_close(s); }
+}
+
+static void draw_switcher(int sel) {
+    int W = tb_width(), H = tb_height();
+    int rows = g_nsw + 1;                       /* + the "log in" row */
+    int show = rows > 12 ? 12 : rows;
+    int bw = 60; if (bw > W - 4) bw = W - 4; if (bw < 28) bw = 28;
+    int bh = show + 4; if (bh > H - 2) bh = H - 2;
+    int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
+    const tk_theme *th = tk_theme_active();
+    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, th->bg);
+    tk_box(x, y, bw, bh);
+    tk_text(x + 2, y, x + bw - 1, " Workspaces ", th->accent | TB_BOLD, th->bg);
+    tk_text_right(y, x + 2, x + bw - 2, "esc", th->faint, th->bg);
+
+    int top = (sel >= show) ? sel - show + 1 : 0;
+    for (int i = 0; i < show && top + i < rows; i++) {
+        int idx = top + i, is_sel = (idx == sel);
+        uintattr_t bg = is_sel ? th->sel_bg : th->bg;
+        uintattr_t fg = is_sel ? (th->sel_fg | TB_BOLD) : th->fg;
+        if (is_sel) tk_fill(y + 1 + i, x + 1, x + bw - 1, bg);
+
+        char line[320];
+        if (idx == g_nsw) {                      /* the always-present last row */
+            snprintf(line, sizeof line, "+ Log in to new workspace");
+            tk_text(x + 2, y + 1 + i, x + bw - 1, line,
+                      is_sel ? fg : (th->ok | TB_BOLD), bg);
+            continue;
+        }
+        const sw_entry *e = &g_sw[idx];
+        const char *mark = (e->session == g_active) ? "\xe2\x96\xb8" : " ";   /* ▸ active */
+        if (e->session >= 0) {
+            const oc_model *m = oc_client_model(g_ws[e->session].cl);
+            int un = ws_unread(&g_ws[e->session]);
+            /* ● connected · ◌ reconnecting — a dropped background workspace
+             * should be visible here, not a silent gap. */
+            const char *dot = m->authed ? "\xe2\x97\x8f" : "\xe2\x97\x8c";
+            if (un) snprintf(line, sizeof line, "%s %s %-28.28s %-14.14s %d unread",
+                             mark, dot, e->label, e->user, un);
+            else    snprintf(line, sizeof line, "%s %s %-28.28s %-14.14s",
+                             mark, dot, e->label, e->user);
+        } else {
+            snprintf(line, sizeof line, "%s   %-28.28s %-14.14s signed out",
+                     mark, e->label, e->user);
+        }
+        tk_text(x + 2, y + 1 + i, x + bw - 1, line,
+                  is_sel ? fg : (e->session >= 0 ? th->fg : th->muted), bg);
+    }
+    tk_text(x + 2, y + bh - 1, x + bw - 1,
+              " Ctrl+W switch \xc2\xb7 d forget \xc2\xb7 Esc close ", th->muted, th->bg);
+    tb_present();
+}
+
+/* ---- emoji picker (r on a selected message) ------------------------------- */
+
+static int picker_build(const char *q, const char **emoji, const char **name, int max) {
+    const oc_emoji *hits[128];
+    size_t nh = oc_emoji_search(q, hits, (size_t)max < 128 ? (size_t)max : 128);
+    for (size_t i = 0; i < nh; i++) { emoji[i] = hits[i]->emoji; name[i] = hits[i]->name; }
+    return (int)nh;
+}
+
+static void draw_picker(const char *q, int esel) {
+    int W = tb_width(), H = tb_height();
+    const char *em[64], *nm[64]; int n = picker_build(q, em, nm, 64);
+    int show = n > 12 ? 12 : (n < 1 ? 1 : n);
+    int bw = 40; if (bw > W - 4) bw = W - 4; if (bw < 20) bw = 20;
+    int bh = show + 4; if (bh > H - 2) bh = H - 2;
+    int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
+    const tk_theme *th = tk_theme_active();
+    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, th->bg);
+    tk_box(x, y, bw, bh);
+    tk_text(x + 2, y, x + bw - 1, " React ", th->accent | TB_BOLD, th->bg);
+    tk_text_right(y, x + 2, x + bw - 2, "esc", th->faint, th->bg);
+    tk_text(x + 2, y + 1, x + bw - 1, q, th->fg, th->bg);
+    if (!q[0]) tk_text(x + 2, y + 1, x + bw - 2, "Search", th->muted, th->bg);
+    else { int cxq = x + 2 + (int)strlen(q); if (cxq < x + bw - 1) tb_set_cell(cxq, y + 1, ' ', TB_DEFAULT, TB_REVERSE); }
+    int top = (esel >= show) ? esel - show + 1 : 0;
+    for (int i = 0; i < show && top + i < n; i++) {
+        int idx = top + i, sel = (idx == esel);
+        uintattr_t bg = sel ? th->sel_bg : th->bg, fg = sel ? (th->sel_fg | TB_BOLD) : th->fg;
+        char line[64]; snprintf(line, sizeof line, "%s  :%s:", em[idx], nm[idx]);
+        if (sel) tk_fill(y + 2 + i, x + 1, x + bw - 1, bg);
+        tk_text(x + 2, y + 2 + i, x + bw - 1, line, fg, bg);
+    }
+    if (n == 0) tk_text(x + 2, y + 2, x + bw - 1, "(no matches)", th->muted, th->bg);
+    tb_present();
+}
+
+/* Whether `mid` in the focused channel already carries `emoji` as our reaction —
+ * so the picker can toggle it off. */
+static int my_reaction(const oc_model *m, uint64_t channel_id, uint64_t mid, const char *emoji) {
+    const oc_channel *c = oc_model_channel((oc_model *)m, channel_id);
+    if (!c) return 0;
+    for (size_t i = 0; i < c->n_msgs; i++)
+        if (c->msgs[i].message_id == mid)
+            for (uint8_t k = 0; k < c->msgs[i].n_reactions; k++)
+                if (strcmp(c->msgs[i].reactions[k].emoji, emoji) == 0) return c->msgs[i].reactions[k].mine;
+    return 0;
+}
+
+/* ---- input helpers --------------------------------------------------------- */
+
+/* Remove the last full UTF-8 character from `buf` (length *len). */
+static void backspace_utf8(char *buf, size_t *len) {
+    size_t n = *len;
+    if (n == 0) return;
+    n--;
+    while (n > 0 && (buf[n] & 0xC0) == 0x80) n--;   /* back over continuation bytes */
+    buf[n] = '\0';
+    *len = n;
+}
+
+/* The focused channel in the model, or NULL. */
+static const oc_channel *focused_channel(const oc_model *m, uint64_t cid) {
+    for (size_t i = 0; i < m->n_channels; i++)
+        if (m->channels[i].channel_id == cid) return &m->channels[i];
+    return NULL;
+}
+
+/* Parse "HH:MM" into minutes-since-midnight, or -1 if malformed. */
+static int parse_hhmm(const char *s) {
+    int h = 0, mi = 0;
+    if (sscanf(s, "%d:%d", &h, &mi) != 2) return -1;
+    if (h < 0 || h > 23 || mi < 0 || mi > 59) return -1;
+    return h * 60 + mi;
+}
+
+/* Handle a "/command" typed in the composer:
+ *   /react <emoji>  toggle a reaction on the last message in the channel
+ *   /edit  <text>   replace the text of your last message
+ *   /delete         tombstone your last message
+ */
+/* Resolve the local store path (session token + trusted fingerprint persistence): the
+ * $HOME/.local/state/openchime/state
+ * (creating the dirs). This is a DIRECTORY now, not a database file (ARCH-88).
+ * Returns NULL when there is nowhere to put it (persistence then disabled — the
+ * client still runs, just in-memory). */
+static const char *resolve_store_path(void) {
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return NULL;
+    static char path[1200];
+    char dir[1024];
+    /* Not created: the client writes nothing to disk (ARCH-88). */
+    snprintf(dir, sizeof dir, "%s/.local/state/openchime", home);
+    /* An orphaned state.db from a pre-ARCH-88 build has no reader left; delete it
+     * rather than leave a stale cache — and a stale token — on disk. */
+    char old[1200];
+    snprintf(old, sizeof old, "%s/state.db", dir);     remove(old);
+    snprintf(old, sizeof old, "%s/state.db-wal", dir); remove(old);
+    snprintf(old, sizeof old, "%s/state.db-shm", dir); remove(old);
+    /* Vestigial: nothing is written here any more (ARCH-88). */
+    snprintf(path, sizeof path, "%s/state", dir);
+    return path;
+}
+
+static int all_digits(const char *s) {
+    if (!s || !*s) return 0;
+    for (; *s; s++) if (*s < '0' || *s > '9') return 0;
+    return 1;
+}
+
+/* ---- connect / login dialog (REQ-020 local sign-in) --------------------------
+ * A modal box collecting workspace + username + password (+ remember-me), shown
+ * when no credential and no stored session token are available. The workspace is
+ * resolved on submit (inline "not found"); the caller starts the client and, on
+ * an auth/connect failure, comes back here with the reason. */
+
+enum { LOGIN_SUBMIT, LOGIN_QUIT };
+enum { AUTH_R_OK, AUTH_R_FAILED, AUTH_R_UNREACHABLE, AUTH_R_CANCELLED };
+
+typedef struct {
+    char workspace[256];
+    char user[128];
+    char pass[128];
+    int  remember;
+    oc_endpoint ep;                       /* filled by oc_resolve on submit */
+    /* How the workspace signs people in (AUTH.md §8.1), asked of it once the
+     * workspace is known: a password form, a browser, or both. */
+    oc_signin_source src[8];
+    int  nsrc;
+    char probed[256];                     /* the workspace `src` was read from */
+    int  browser;                         /* submit means: sign in with the browser */
+    int  device;                          /* ...or with a device code (AUTH.md §8.11) */
+} login_form;
+
+static const oc_signin_source *form_browser_source(const login_form *f) {
+    for (int i = 0; i < f->nsrc; i++)
+        if (f->src[i].kind != OC_SOURCE_LOCAL) return &f->src[i];
+    return NULL;
+}
+
+static int form_has_local(const login_form *f) {
+    for (int i = 0; i < f->nsrc; i++)
+        if (f->src[i].kind == OC_SOURCE_LOCAL) return 1;
+    return 0;
+}
+
+/* `s` word-wrapped into columns [x, xmax) from row y; the rows it took. Breaks
+ * at spaces, and hard where a word is longer than the line. */
+static int tui_wrap(int x, int y, int xmax, const char *s, uintattr_t fg, uintattr_t bg) {
+    int w = xmax - x, rows = 0;
+    if (w < 8) w = 8;
+    while (*s) {
+        size_t n = strlen(s), take = n;
+        if ((int)n > w) {
+            take = (size_t)w;
+            while (take > 0 && s[take] != ' ') take--;
+            if (take == 0) take = (size_t)w;
+        }
+        char line[512];
+        snprintf(line, sizeof line, "%.*s", (int)take, s);
+        tk_text(x, y + rows++, xmax, line, fg, bg);
+        s += take;
+        while (*s == ' ') s++;
+    }
+    return rows;
+}
+
+/* A certificate the person must judge (ARCH-10): what is wrong, its fingerprint,
+ * and whether to trust it. The wording is the Win32 client's; the answer
+ * defaults to no -- Enter declines -- as security prompts do. 1 if they say yes. */
+static int tui_ask_trust(const char *ws, const char *fp_hex, int changed) {
+    char fp[128];
+    if (oc_fingerprint_format(fp_hex, 16, fp, sizeof fp) != 0) return 0;
+    char *fp2 = strchr(fp, '\n');
+    if (fp2) *fp2++ = '\0';
+    const char *who = ws && ws[0] ? ws : "this workspace";
+    char p1[400];
+    if (changed)
+        snprintf(p1, sizeof p1, "The server for %s is showing a different certificate from the one you "
+                 "trusted before. Someone may be intercepting the connection: if your administrator "
+                 "didn't tell you it was changing, don't connect.", who);
+    else
+        snprintf(p1, sizeof p1, "The certificate for %s isn't from an authority this computer trusts. "
+                 "That's normal for a server your organisation runs itself -- and also what an "
+                 "impostor's server would look like.", who);
+    for (;;) {
+        int W = tb_width(), H = tb_height(), xmax = W - 2;
+        int y = H / 2 - 8;
+        if (y < 0) y = 0;
+        tb_clear();
+        tk_text(2, y, xmax, changed ? "This server's identity has changed" : "Can't verify this server's identity",
+                (changed ? TB_RED : TB_YELLOW) | TB_BOLD, TB_DEFAULT);
+        y += 2;
+        y += tui_wrap(2, y, xmax, p1, TB_DEFAULT, TB_DEFAULT) + 1;
+        y += tui_wrap(2, y, xmax, "Check this fingerprint (SHA-256) with your workspace's administrator:",
+                      TB_DEFAULT, TB_DEFAULT) + 1;
+        tk_text(4, y++, xmax, fp, TB_CYAN, TB_DEFAULT);
+        if (fp2) tk_text(4, y++, xmax, fp2, TB_CYAN, TB_DEFAULT);
+        y++;
+        y += tui_wrap(2, y, xmax, "OpenChime will remember this server if you trust it.", TB_DEFAULT, TB_DEFAULT) + 1;
+        tk_text(2, y, xmax, "Trust and connect? [y/N]", TB_WHITE | TB_BOLD, TB_DEFAULT);
+        tb_present();
+        struct tb_event ev;
+        if (tb_poll_event(&ev) != TB_OK || ev.type != TB_EVENT_KEY) continue;
+        if (ev.ch == 'y' || ev.ch == 'Y') return 1;
+        if (ev.ch == 'n' || ev.ch == 'N' || ev.key == TB_KEY_ESC || ev.key == TB_KEY_ENTER) return 0;
+    }
+}
+
+static int tui_trust_load(const char *key, unsigned char fp[32]) {
+    oc_store *s = g_store_path ? oc_store_open(g_store_path) : NULL;
+    if (!s) return 0;
+    oc_store_set_secret(s, g_secret);
+    int have = oc_store_load_pin(s, key, fp);
+    oc_store_close(s);
+    return have;
+}
+
+static void tui_trust_save(const char *key, const unsigned char fp[32]) {
+    oc_store *s = g_store_path ? oc_store_open(g_store_path) : NULL;
+    if (!s) return;
+    oc_store_set_secret(s, g_secret);
+    oc_store_save_pin(s, key, fp);
+    oc_store_close(s);
+}
+
+/* Resolve the workspace and ask it how it signs people in. 1 on success; 0 with
+ * the reason in `inl`. Asked once per workspace name. */
+static int form_probe(login_form *f, char *inl, size_t cap) {
+    if (f->nsrc > 0 && strcmp(f->probed, f->workspace) == 0) return 1;
+    f->nsrc = 0; f->probed[0] = '\0';
+    oc_resolve_status st = oc_resolve(f->workspace, oc_default_suffix(), &f->ep);
+    if (st == OC_RESOLVE_BAD_WORKSPACE) { snprintf(inl, cap, "invalid workspace '%s'", f->workspace); return 0; }
+    if (st == OC_RESOLVE_NOT_FOUND)    { snprintf(inl, cap, "'%s' not found: does not resolve in DNS", f->workspace); return 0; }
+    if (st == OC_RESOLVE_BAD_METADATA) { snprintf(inl, cap, "'%s' publishes discovery metadata that is not valid", f->workspace); return 0; }
+    /* The certificate is judged first (ARCH-10): one nobody vouches for is shown
+     * to the person, and asked about again trusted if they say so. */
+    char key[256];
+    if (oc_workspace_key(f->workspace, oc_default_suffix(), key, sizeof key) != 0) snprintf(key, sizeof key, "%s", f->workspace);
+    unsigned char fp[32];
+    static oc_cert_seen seen;   /* large; the form is the UI thread's alone */
+    int have = tui_trust_load(key, fp);
+    int n = oc_net_probe_ex(f->ep.domain, f->ep.host, f->ep.port, have ? fp : NULL, f->src,
+                            (int)(sizeof f->src / sizeof f->src[0]), &seen);
+    if (n == OC_PROBE_UNTRUSTED && tui_ask_trust(f->workspace, seen.fp_hex, have) &&
+        oc_fingerprint_from_hex(seen.fp_hex, fp) == 0) {
+        tui_trust_save(key, fp);
+        n = oc_net_probe_ex(f->ep.domain, f->ep.host, f->ep.port, fp, f->src,
+                            (int)(sizeof f->src / sizeof f->src[0]), &seen);
+    }
+    if (n == OC_PROBE_UNTRUSTED) { snprintf(inl, cap, "the server's certificate was not trusted"); return 0; }
+    if (n == OC_PROBE_VERSION) { snprintf(inl, cap, "this app and that server are different versions"); return 0; }
+    if (n <= 0)                { snprintf(inl, cap, "could not reach %.120s", f->ep.host); return 0; }
+    f->nsrc = n;
+    snprintf(f->probed, sizeof f->probed, "%s", f->workspace);
+    return 1;
+}
+
+
+/* A labeled input row; `focused` highlights the field, `mask` renders dots. */
+static void draw_field(int x, int y, int w, const char *label, const char *val,
+                       int focused, int mask) {
+    tk_text(x, y, x + 11, label, TB_DEFAULT, TB_DEFAULT);
+    int fx = x + 11, fw = w - 11;
+    uintattr_t bg = focused ? TB_BLUE : (TB_BLACK | TB_BOLD);
+    tk_fill(y, fx, fx + fw, bg);
+    if (mask) {
+        char dots[130]; size_t n = strlen(val);
+        if (n > sizeof dots - 1) n = sizeof dots - 1;
+        memset(dots, '*', n); dots[n] = '\0';
+        tk_text(fx + 1, y, fx + fw, dots, TB_WHITE, bg);
+    } else {
+        tk_text(fx + 1, y, fx + fw, val, TB_WHITE | (focused ? TB_BOLD : 0), bg);
+    }
+}
+
+/* Run the login box until the user submits (fields filled, workspace resolved into
+ * `f->ep`) or quits. `err` is an optional message to show (e.g. a prior auth
+ * failure). Returns LOGIN_SUBMIT or LOGIN_QUIT. */
+static int login_dialog(login_form *f, const char *err) {
+    /* Past a pre-filled workspace -- unless a retry says it is what needs fixing. */
+    int focus = f->workspace[0] && !err ? 1 : 0;
+    char inl[160]; inl[0] = '\0';
+    for (;;) {
+        int W = tb_width(), H = tb_height();
+        tb_clear();
+        int bw = 56; if (bw > W - 2) bw = W - 2; if (bw < 24) bw = 24;
+        int bh = 10;
+        int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
+        tk_box(x, y, bw, bh);
+        tk_text(x + 2, y, x + bw - 1, " Sign in to OpenChime ", TB_CYAN | TB_BOLD, TB_DEFAULT);
+        int ix = x + 2, iw = bw - 4;
+        /* No password is typed here (AUTH.md §8.10): a local account signs in
+         * with a code entered on the workspace's page, from any device (§8.11). */
+        draw_field(ix, y + 2, iw, "Workspace", f->workspace, focus == 0, 0);
+        char rem[40]; snprintf(rem, sizeof rem, "[%c] Remember me", f->remember ? 'x' : ' ');
+        tk_text(ix, y + 4, ix + iw, rem, focus == 1 ? TB_CYAN | TB_BOLD : TB_DEFAULT, TB_DEFAULT);
+        /* Once the workspace has said how it signs people in, offer the browser
+         * beside the code where it has a browser source. */
+        const oc_signin_source *bs =
+            strcmp(f->probed, f->workspace) == 0 ? form_browser_source(f) : NULL;
+        if (bs) {
+            char hint[160];
+            snprintf(hint, sizeof hint, "Ctrl+B  %s", bs->label);
+            tk_text(ix, y + 5, ix + iw, hint, TB_GREEN | TB_BOLD, TB_DEFAULT);
+        }
+        const char *e = inl[0] ? inl : err;
+        if (e) tk_text(ix, y + 7, ix + iw, e, TB_RED | TB_BOLD, TB_DEFAULT);
+        tk_text(ix, y + bh - 1, ix + iw, " Enter connect · Tab next · Esc quit ",
+                  TB_BLACK | TB_BOLD, TB_DEFAULT);
+        tb_present();
+
+        struct tb_event ev;
+        if (tb_poll_event(&ev) != TB_OK) continue;
+        if (ev.type != TB_EVENT_KEY) continue;
+        if (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C || ev.key == TB_KEY_CTRL_Q)
+            return LOGIN_QUIT;
+        if (ev.key == TB_KEY_TAB || ev.key == TB_KEY_ARROW_DOWN || ev.key == TB_KEY_ARROW_UP) {
+            focus = !focus;
+            continue;
+        }
+        int is_space = (ev.ch == ' ' || ev.key == TB_KEY_SPACE);
+        if (ev.key == TB_KEY_ENTER || ev.key == TB_KEY_CTRL_B) {
+            int want_browser = ev.key == TB_KEY_CTRL_B;
+            if (!f->workspace[0]) { snprintf(inl, sizeof inl, "enter a workspace (domain or name)"); focus = 0; continue; }
+            if (!form_probe(f, inl, sizeof inl)) { focus = 0; continue; }
+            const oc_signin_source *browser = form_browser_source(f);
+            if (want_browser && !browser) { snprintf(inl, sizeof inl, "this workspace has no browser sign-in"); continue; }
+            /* Local accounts: a code. The browser where asked for, or where it is
+             * the only way in. */
+            f->browser = f->device = 0;
+            if (browser && (want_browser || !form_has_local(f))) f->browser = 1;
+            else if (form_has_local(f)) f->device = 1;
+            else { snprintf(inl, sizeof inl, "this workspace offers no way to sign in here"); continue; }
+            return LOGIN_SUBMIT;
+        }
+        if (focus == 1) { if (is_space) f->remember = !f->remember; continue; }
+        char *buf = f->workspace; size_t cap = sizeof f->workspace;
+        if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {
+            size_t n = strlen(buf); if (n) { buf[n - 1] = '\0'; inl[0] = '\0'; }
+        } else if (is_space) {
+            size_t n = strlen(buf); if (n + 1 < cap) { buf[n] = ' '; buf[n + 1] = '\0'; inl[0] = '\0'; }
+        } else if (ev.ch >= 0x21 && ev.ch <= 0x7e) {   /* printable ASCII (credentials) */
+            size_t n = strlen(buf); if (n + 1 < cap) { buf[n] = (char)ev.ch; buf[n + 1] = '\0'; inl[0] = '\0'; }
+        }
+    }
+}
+
+/* Hand a URL to the desktop's browser, if there is one. No shell is involved: the
+ * URL is one argument to the platform's opener, whatever it contains. */
+static void open_in_browser(const char *url) {
+#ifdef _WIN32
+    ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL);
+#else
+    pid_t pid = fork();
+    if (pid != 0) { if (pid > 0) waitpid(pid, NULL, 0); return; }
+    if (fork() != 0) _exit(0);              /* the grandchild is nobody's zombie */
+    int nul = open("/dev/null", O_RDWR);
+    if (nul >= 0) { dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); }   /* keep the terminal ours */
+#ifdef __APPLE__
+    execlp("open", "open", url, (char *)NULL);
+#else
+    execlp("xdg-open", "xdg-open", url, (char *)NULL);
+#endif
+    _exit(127);
+#endif
+}
+
+/* Tick a freshly-started client until it authenticates, fails, or is cancelled,
+ * drawing a "connecting…" screen. Distinguishes auth-fail from unreachable via
+ * the model's sticky last_error. */
+/* The device code's screen (AUTH.md §8.11): where to go and what to enter --
+ * large, since it is read across a room or copied onto a phone -- the URL as a
+ * QR code where the terminal has room, the daemon's fingerprint where a browser
+ * will warn about its certificate, and the time left. */
+static void draw_device(const oc_model *m, int W, int H) {
+    char qr[16384]; int qc = 0, qrow = 0;
+    int have_qr = tk_qr_render(m->device_url, qr, sizeof qr, &qc, &qrow) == 0;
+    int need = 10 + (m->device_fp[0] ? 3 : 0);
+    int show_qr = have_qr && qc + 4 <= W && qrow + need <= H;
+    int y = (H - (need + (show_qr ? qrow + 1 : 0))) / 2;
+    if (y < 0) y = 0;
+    int xm = W - 2;
+    tk_text(2, y, xm, "Sign in from any device", TB_WHITE | TB_BOLD, TB_DEFAULT);
+    tk_text(2, y + 2, xm, "Go to:", TB_DEFAULT, TB_DEFAULT);
+    y += 3;
+    y += tui_wrap(4, y, xm, m->device_url, TB_CYAN | TB_BOLD, TB_DEFAULT);
+    char code[48];
+    snprintf(code, sizeof code, "and enter the code   %s", m->device_code);
+    tk_text(2, y + 1, xm, code, TB_YELLOW | TB_BOLD, TB_DEFAULT);
+    y += 3;
+    if (show_qr) {
+        /* Light modules as white on black, whatever the terminal's colours. */
+        const char *r = qr;
+        for (int row = 0; row < qrow && *r; row++) {
+            const char *e = strchr(r, '\n');
+            char line[4096];
+            size_t n = e ? (size_t)(e - r) : strlen(r);
+            if (n >= sizeof line) n = sizeof line - 1;
+            memcpy(line, r, n); line[n] = '\0';
+            tk_text(4, y + row, W, line, TB_WHITE, TB_BLACK);
+            r = e ? e + 1 : r + n;
+        }
+        y += qrow + 1;
+    }
+    if (m->device_fp[0]) {
+        char fp[128];
+        if (oc_fingerprint_format(m->device_fp, 0, fp, sizeof fp) == 0) {
+            y += tui_wrap(2, y, xm, "Your browser will warn about this server's certificate. Go on only if its "
+                                    "SHA-256 fingerprint is:", TB_DEFAULT, TB_DEFAULT);
+            y += tui_wrap(4, y, xm, fp, TB_CYAN, TB_DEFAULT) + 1;
+        }
+    }
+    uint64_t now = oc_model_now_ms();
+    unsigned left = m->device_expires_ms > now ? (unsigned)((m->device_expires_ms - now) / 1000u) : 0;
+    char t[80];
+    snprintf(t, sizeof t, "Waiting …  %u:%02u left   (Esc to cancel)", left / 60, left % 60);
+    tk_text(2, y, xm, t, TB_DEFAULT, TB_DEFAULT);
+}
+
+static int await_auth(oc_client *cl, const char *host, char *why, size_t whycap) {
+    uint32_t opened = 0;                      /* the signin_seq whose URL was opened */
+    uint32_t dev_opened = 0;                  /* ...and the device_seq */
+    uint32_t cert_seen = 0, cert_err = 0;     /* a certificate judged, and its refusal */
+    for (int i = 0; i < 1200; i++) {          /* ~18s at 15ms per tick */
+        oc_client_tick(cl);
+        const oc_model *m = oc_client_model(cl);
+        if (m->authed) return AUTH_R_OK;
+        if (m->cert_seq != cert_seen) {
+            cert_seen = m->cert_seq;
+            if (tui_ask_trust(host, m->cert_fp, m->cert_changed)) {
+                cert_err = m->error_seq;
+                oc_client_trust_cert(cl, m->cert_fp);
+                i = 0;
+            }
+        }
+        if (m->last_error[0] && !m->connected && !(cert_err && m->error_seq == cert_err)) {
+            snprintf(why, whycap, "%s", m->last_error);
+            return m->last_error_kind == OC_CERR_UNREACHABLE ? AUTH_R_UNREACHABLE : AUTH_R_FAILED;
+        }
+        if (m->device_code[0]) {
+            /* A device code: the core polls for ten minutes, so this waits too.
+             * The page is opened here as well, where there is a desktop to open
+             * it on; the code is shown for everywhere else. */
+            i = 0;
+            if (dev_opened != m->device_seq) { dev_opened = m->device_seq; open_in_browser(m->device_url); }
+            int W = tb_width(), H = tb_height();
+            tb_clear();
+            draw_device(m, W, H);
+            tb_present();
+            struct tb_event ev;
+            if (tb_peek_event(&ev, 15) == TB_OK && ev.type == TB_EVENT_KEY &&
+                (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C || ev.key == TB_KEY_CTRL_Q)) {
+                oc_client_cancel_signin(cl);
+                return AUTH_R_CANCELLED;
+            }
+            continue;
+        }
+        int waiting = m->signin_url[0] != '\0';
+        if (waiting) {
+            /* The person is in their browser: the core waits five minutes, so this
+             * does too. The URL is opened once and always shown — a terminal has no
+             * promise of a desktop behind it. */
+            i = 0;
+            if (opened != m->signin_seq) { opened = m->signin_seq; open_in_browser(m->signin_url); }
+        }
+        int W = tb_width(), H = tb_height();
+        tb_clear();
+        char msg[320];
+        if (waiting) snprintf(msg, sizeof msg, "Finish signing in in your browser …   (Esc to cancel)");
+        else         snprintf(msg, sizeof msg, "Connecting to %s …   (Esc to cancel)", host);
+        tk_text((W - (int)strlen(msg)) / 2, H / 2, W, msg, TB_WHITE | TB_BOLD, TB_DEFAULT);
+        if (waiting) {
+            const char *lead = "If it did not open, go to:";
+            tk_text((W - (int)strlen(lead)) / 2, H / 2 + 2, W, lead, TB_DEFAULT, TB_DEFAULT);
+            /* Wrapped, not truncated: half a URL signs nobody in. */
+            int uw = W - 4; if (uw < 20) uw = 20;
+            size_t ul = strlen(m->signin_url);
+            for (size_t off = 0, row = 0; off < ul && (int)row < H / 2 - 4; off += (size_t)uw, row++) {
+                char line[512];
+                size_t n = ul - off < (size_t)uw ? ul - off : (size_t)uw;
+                if (n >= sizeof line) n = sizeof line - 1;
+                memcpy(line, m->signin_url + off, n); line[n] = '\0';
+                tk_text(2, H / 2 + 3 + (int)row, W, line, TB_CYAN, TB_DEFAULT);
+            }
+        }
+        tb_present();
+        struct tb_event ev;
+        if (tb_peek_event(&ev, 15) == TB_OK && ev.type == TB_EVENT_KEY &&
+            (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C || ev.key == TB_KEY_CTRL_Q)) {
+            oc_client_cancel_signin(cl);
+            return AUTH_R_CANCELLED;
+        }
+    }
+    return AUTH_R_UNREACHABLE;
+}
+
+static int have_stored_token(const char *store_path, const char *key, const char *host, int port,
+                             oc_secret *secret);
+
+/* Record a workspace in the book so the switcher can offer it later (REQ-012).
+ * Best-effort: a store we can't open just means no switcher entry. */
+static void remember_workspace(const char *key, const char *label, const char *user) {
+    if (!g_store_path) return;
+    oc_store *s = oc_store_open(g_store_path);
+    if (!s) return;
+    oc_store_set_secret(s, g_secret);
+    oc_store_workspace_remember(s, key, label, user, (uint64_t)time(NULL) * 1000);
+    oc_store_close(s);
+}
+
+/* Drive the login box + connect, retrying on failure, until authenticated or the
+ * user quits. On success fills `w` (client + key/label/user) and returns 1.
+ * `initial_user` pre-fills the username when re-signing into a known workspace. */
+static int run_login(const char *initial_workspace, const char *initial_user,
+                     const char *store_path, oc_secret *secret, ws_session *w) {
+    login_form f; memset(&f, 0, sizeof f);
+    snprintf(f.workspace, sizeof f.workspace, "%s", initial_workspace ? initial_workspace : "");
+    snprintf(f.user, sizeof f.user, "%s", initial_user ? initial_user : "");
+    f.remember = 1;
+    char err[320]; err[0] = '\0';
+    for (;;) {
+        if (login_dialog(&f, err[0] ? err : NULL) == LOGIN_QUIT) return 0;
+        const char *cred = "";   /* the core signs in through the browser or a code */
+        /* Filed under the workspace as the person named it, not the address it
+         * resolved to this time. */
+        char key[288];
+        if (oc_workspace_key(f.workspace, oc_default_suffix(), key, sizeof key) != 0)
+            oc_hostport(f.ep.host, f.ep.port, key, sizeof key);
+        /* With the fingerprint the workspace published, if it did (ARCH-10): the
+         * first connection is checked against it instead of trusted blind. */
+        oc_client *cl = f.device
+            ? oc_client_start_device(key, f.ep.host, f.ep.port, store_path, secret, f.remember, f.ep.fingerprint)
+            : oc_client_start_verified(key, f.ep.host, f.ep.port, cred, store_path, secret, f.remember,
+                                       f.ep.fingerprint);
+        if (!cl) { snprintf(err, sizeof err, "could not start the client"); continue; }
+        char why[200] = "";
+        int res = await_auth(cl, f.ep.host, why, sizeof why);
+        if (res == AUTH_R_OK) {
+            memset(w, 0, sizeof *w);
+            w->cl = cl;
+            snprintf(w->key,   sizeof w->key,   "%s", key);
+            snprintf(w->label, sizeof w->label, "%s", f.workspace[0] ? f.workspace : f.ep.host);
+            snprintf(w->user,  sizeof w->user,  "%s", f.user);
+            /* Only remember it if the user asked us to keep the credential —
+             * "remember me" off means leave no trace of this workspace. */
+            if (f.remember) remember_workspace(w->key, w->label, w->user);
+            return 1;
+        }
+        oc_client_stop(cl);
+        if (res == AUTH_R_CANCELLED) return 0;
+        if (res == AUTH_R_UNREACHABLE) snprintf(err, sizeof err, "could not reach %s", f.ep.host);
+        else if (why[0] && strcmp(why, "auth failed") != 0)
+                                      snprintf(err, sizeof err, "%s", why);
+        else                          snprintf(err, sizeof err, "sign-in failed");
+    }
+}
+
+/* Open (or re-focus) a workspace from the switcher. A stored session token
+ * reconnects silently; without one we fall back to the login box pre-filled with
+ * what the book knows. Returns the session index, or -1 if it didn't open. */
+static int open_workspace(const char *key, const char *label, const char *user) {
+    int existing = ws_find(key);
+    if (existing >= 0) return existing;                  /* already open */
+    if (g_nws >= MAX_WS) return -1;
+
+    /* The book remembers what the person typed; resolve that again rather than
+         * trust an address from last time. An entry from when the key WAS the
+         * address resolves as itself. */
+    const char *named = (label && label[0]) ? label : key;
+    oc_endpoint ep;
+    ws_session *w = &g_ws[g_nws];
+    if (oc_resolve(named, oc_default_suffix(), &ep) != OC_RESOLVE_OK) {
+        if (!run_login(named, user, g_store_path, g_secret, w)) return -1;
+        return g_nws++;
+    }
+    const char *host = ep.host; int port = ep.port;
+    char nkey[288];
+    if (oc_workspace_key(named, oc_default_suffix(), nkey, sizeof nkey) != 0)
+        snprintf(nkey, sizeof nkey, "%s", key);
+    if (strcmp(nkey, key) != 0) {
+        /* The book's entry is under the old key: move it, so the switcher does not
+         * show the workspace twice. */
+        oc_store *st = g_store_path ? oc_store_open(g_store_path) : NULL;
+        if (st) { oc_store_set_secret(st, g_secret); oc_store_adopt(st, nkey, key); oc_store_close(st); }
+        if (ws_find(nkey) >= 0) return ws_find(nkey);
+        key = nkey;
+    }
+
+    if (have_stored_token(g_store_path, key, host, port, g_secret)) {
+        oc_client *cl = oc_client_start_verified(key, host, port, "", g_store_path, g_secret,
+                                                 1, ep.fingerprint);
+        if (!cl) return -1;
+        char why[200] = "";
+        if (await_auth(cl, host, why, sizeof why) != AUTH_R_OK) {         /* token stale/rejected */
+            oc_client_stop(cl);
+        } else {
+            memset(w, 0, sizeof *w);
+            w->cl = cl;
+            snprintf(w->key,   sizeof w->key,   "%s", key);
+            snprintf(w->label, sizeof w->label, "%.255s", (label && label[0]) ? label : key);
+            snprintf(w->user,  sizeof w->user,  "%s", user ? user : "");
+            remember_workspace(w->key, w->label, w->user);
+            return g_nws++;
+        }
+    }
+    if (!run_login(label, user, g_store_path, g_secret, w)) return -1;
+    return g_nws++;
+}
+
+/* Is a still-valid session token stored for this workspace? If so we skip the
+ * login box and let the net thread reconnect silently. */
+static int have_stored_token(const char *store_path, const char *key, const char *host, int port,
+                             oc_secret *secret) {
+    oc_store *s = store_path ? oc_store_open(store_path) : NULL;
+    if (!s && !secret) return 0;
+    if (s) oc_store_set_secret(s, secret);   /* look in the keyring too */
+    /* Under the workspace as named — and, for an entry from when the key was the
+     * address, under that: the net thread moves it across on first use. */
+    char inst[288]; oc_hostport(host, port, inst, sizeof inst);
+    uint8_t tok[OC_SESSION_TOKEN_LEN];
+    uint64_t now = (uint64_t)time(NULL) * 1000;
+    int has = s ? (oc_store_load_session(s, key, tok, NULL, now) ||
+                   oc_store_load_session(s, inst, tok, NULL, now)) : 0;
+    oc_store_close(s);
+    return has;
+}
+
+int main(int argc, char **argv) {
+    if (argc >= 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
+        printf("openchime-tui %s (protocol %u)\n", OC_BUILD_ID, (unsigned)OC_PROTOCOL_VERSION);
+        return 0;
+    }
+    if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
+        fprintf(stderr, "usage: %s [<workspace>]\n"
+                        "       %s <host> <port>\n"
+                        "  With no workspace a login box is shown; local accounts sign in\n"
+                        "  in the browser or with a device code (AUTH.md).\n",
+                        argv[0], argv[0]);
+        return 0;
+    }
+    /* Adopt the environment's locale so termbox2's iswprint() check recognizes
+     * non-ASCII codepoints as printable — without this it renders every emoji /
+     * wide glyph as U+FFFD, defeating the whole point of utf8proc. */
+    setlocale(LC_ALL, "");
+
+    static oc_tui_prefs cfg, file_cfg;
+    oc_tui_prefs_load(&cfg);
+    file_cfg = cfg;          /* the machine-local base; synced settings layer over it */
+    g_cfg = &cfg;
+
+    const char *store_path = resolve_store_path();
+    /* Prefer the OS keyring for the session token; NULL (headless / no keyring)
+     * falls back to the SQLite store. Owned here, freed after the client stops. */
+    oc_secret *secret = oc_secret_open_os("openchime");
+    oc_sidebar_opts_defaults(&g_sb);
+    g_store_path = store_path;    /* the switcher reads the book from here */
+    g_secret = secret;
+
+    /* Decide how to connect. Three shapes:
+     *   <host> <port> : dev/local direct connect (argv[2] is a port);
+     *   <workspace>   : resolve by DNS (REQ-010), then connect;
+     *   (nothing)     : show the login box (REQ-020).
+     * Connect directly when a session token is
+     * already stored; otherwise prompt. A resolution failure is reported
+     * distinctly from connect/auth failure (REQ-011). */
+    char host[256] = ""; int port = 0; const char *cred = NULL;
+    char key0[288] = "";                       /* the first workspace's store key */
+    char published_fp[96] = "";                /* what `.well-known` named, if anything */
+    int direct = 0;
+    const char *prefill = "";
+
+    if (argc >= 3 && all_digits(argv[2])) {          /* dev host:port */
+        snprintf(host, sizeof host, "%s", argv[1]);
+        port = atoi(argv[2]);
+        oc_hostport(host, port, key0, sizeof key0);   /* an address IS its name here */
+        direct = 1;
+    } else if (argc >= 2 || cfg.workspace[0]) {       /* workspace mode (arg or config default) */
+        const char *inst = (argc >= 2) ? argv[1] : cfg.workspace;
+        oc_endpoint ep;
+        oc_resolve_status st = oc_resolve(inst, oc_default_suffix(), &ep);
+        if (st == OC_RESOLVE_BAD_WORKSPACE) { fprintf(stderr, "openchime: invalid workspace '%s'\n", inst); return 2; }
+        if (st == OC_RESOLVE_NOT_FOUND)    { fprintf(stderr, "openchime: workspace '%s' not found: it does not resolve in DNS\n", inst); return 3; }
+        if (st == OC_RESOLVE_BAD_METADATA) { fprintf(stderr, "openchime: workspace '%s' publishes discovery metadata that is not valid\n", inst); return 3; }
+        snprintf(host, sizeof host, "%s", ep.host);
+        port = ep.port;
+        /* Out of the block with the address it belongs to: the connection is
+         * opened further down, and the published fingerprint (ARCH-10) has to
+         * reach it. */
+        snprintf(published_fp, sizeof published_fp, "%s", ep.fingerprint);
+        if (oc_workspace_key(inst, oc_default_suffix(), key0, sizeof key0) != 0)
+            oc_hostport(host, port, key0, sizeof key0);
+        if (have_stored_token(store_path, key0, host, port, secret)) { cred = ""; direct = 1; }  /* silent reconnect */
+        else                                                       { prefill = inst; direct = 0; }  /* prompt */
+    }                                                /* else: no args -> login box */
+    if (!cred) cred = "";
+
+    if (tb_init() != TB_OK) {
+        fprintf(stderr, "failed to init terminal (need a tty)\n");
+        return 1;
+    }
+    tb_set_input_mode(TB_INPUT_ESC | (cfg.mouse ? TB_INPUT_MOUSE : 0));
+    tb_set_output_mode(TB_OUTPUT_256);   /* 256-color theme (tuikit tk_theme) */
+
+    /* The first session. Everything after this point works through g_ws, so the
+     * command line is just one more way to open a workspace. */
+    if (direct) {
+        oc_client *c0 = oc_client_start_verified(key0, host, port, cred, store_path, secret,
+                                                 1, published_fp);
+        if (!c0) { tb_shutdown(); oc_secret_free(secret); fprintf(stderr, "failed to start client\n"); return 1; }
+        ws_session *w = &g_ws[0];
+        memset(w, 0, sizeof *w);
+        w->cl = c0;
+        snprintf(w->key,   sizeof w->key,   "%s", key0);
+        /* Fall back to the full "host:port", not the bare host — two dev
+         * workspaces on the same host would otherwise be indistinguishable
+         * in the switcher. */
+        snprintf(w->label, sizeof w->label, "%.255s", prefill[0] ? prefill : w->key);
+        /* `cred` is "" (a stored-token reconnect, or the browser). */
+        const char *colon = strchr(cred, ':');
+        if (colon && colon > cred) {
+            size_t ul = (size_t)(colon - cred);
+            if (ul >= sizeof w->user) ul = sizeof w->user - 1;
+            memcpy(w->user, cred, ul); w->user[ul] = '\0';
+        }
+        g_nws = 1;
+        remember_workspace(w->key, w->label, w->user);
+    } else if (run_login(prefill, NULL, store_path, secret, &g_ws[0])) {
+        g_nws = 1;
+    } else {
+        tb_shutdown();       /* user quit the login box */
+        oc_secret_free(secret);
+        return 0;
+    }
+    g_active = 0;
+    oc_client *cl = g_ws[0].cl;
+
+    char composer[COMPOSER_CAP];
+    size_t clen = 0;
+    composer[0] = '\0';
+    size_t focus = 0;
+    int scroll = 0;
+    int switcher_open = 0, wsel = 0;          /* workspace switcher (Ctrl+W) */
+    int storage_open = 0;                     /* /storage overlay (REQ-214) */
+    int audit_open = 0;                       /* /audit overlay (REQ-251) */
+    int alerts_open = 0, asel = 0;            /* the daemon's critical failures (REQ-263) */
+    int summary_ui = 0, ssel = 0;             /* the open summary's overlay (REQ-310) */
+    uint64_t jump_mid = 0;                    /* a summary item's message, being found */
+    time_t jump_since = 0;
+    int jump_asked = 0;
+    int help_open = 0;
+    int profile_open = 0;                     /* /profile identity modal */
+    int ac_idx = 0;                           /* autocomplete cycle index */
+    int panel = 0;                            /* 0 composer · 1 channels · 2 messages · 3 members */
+    int msg_sel = -1, mem_sel = 0;            /* selection within the messages / members panel */
+    uint64_t editing = 0;                     /* message id being edited (0 = none) */
+    int picker_open = 0, esel = 0;            /* emoji picker (r on a message) */
+    char eq[32] = ""; size_t eqlen = 0;       /* picker query */
+    uint64_t picker_cid = 0, picker_mid = 0;  /* message being reacted to */
+    uint64_t last_focus_cid = 0;
+    time_t last_typing = 0;                   /* throttle outbound TYPING signals */
+    int running = 1, logging_out = 0;
+
+    /* Action menu (tuikit, menu-driven) — messages, members, and the global
+     * launcher (Ctrl-K). Filterable so the launcher is a fuzzy action finder. */
+    int action_open = 0; uint64_t act_cid = 0, act_mid = 0, act_uid = 0;
+    const char *act_title = "Actions";
+    tk_list action_menu;
+    tk_list_opts action_opts = { NULL, menu_count, menu_text, NULL, 1 };
+    tk_list_init(&action_menu, &action_opts);
+
+    /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
+     * /nick with a discoverable text prompt. */
+    enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_NICK, PROMPT_UPLOAD,
+           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE };
+    int await_invite = 0;   /* open the roster on the invitation once it is made */
+    /* The invite prompt's explanation, which names the provider, and what was
+     * wrong with the last answer ("" when nothing was). */
+    char invite_note[128] = ""; const char *invite_note2 = ""; const char *invite_err = "";
+    int prompt_kind = PROMPT_NONE; const char *prompt_title = "";
+    tk_input prompt_input; tk_input_init(&prompt_input, 0, "");
+
+    /* Global action launcher (tuikit tk_palette, Ctrl-K / ':'). */
+    int launcher_open = 0;
+    tk_palette launcher; tk_palette_init(&launcher, "Commands");
+    /* "New direct message": the people picker (a tk_palette, as the launcher). */
+    int dmpick_open = 0;
+    tk_palette dmpick; tk_palette_init(&dmpick, "New direct message");
+
+    while (running) {
+        /* Tick EVERY workspace, not just the visible one: a background session
+         * has to keep receiving so its unread count is live in the switcher
+         * (REQ-014). Only the active session is rendered, below. */
+        /* The invitation just made: show it where it is printed, the roster. */
+        if (await_invite && g_nws && g_active < g_nws &&
+            oc_client_model(g_ws[g_active].cl)->invite_token[0]) {
+            await_invite = 0;
+            oc_client_toggle_roster(g_ws[g_active].cl, 1);
+        }
+        for (int i = 0; i < g_nws; i++) {
+            oc_client_tick(g_ws[i].cl);
+            /* Each session pulls its own synced settings bucket once per
+             * authenticated connection (a reconnect re-pulls). */
+            const oc_model *wm = oc_client_model(g_ws[i].cl);
+            if (!wm->connected) g_ws[i].settings_req = 0;
+            else if (wm->authed && !g_ws[i].settings_req) {
+                oc_client_list_settings(g_ws[i].cl);
+                g_ws[i].settings_req = 1;
+            }
+        }
+        /* The active workspace's connection met a certificate to judge (ARCH-10),
+         * after sign-in -- a certificate that changed under a live session: asked
+         * as at sign-in. Declined, it stays refused, and a retry (Ctrl+R) asks
+         * again. A connection that is up has had its answer. */
+        {
+            ws_session *a = &g_ws[g_active];
+            const oc_model *am = oc_client_model(a->cl);
+            if (am->connected) a->cert_seen = am->cert_seq;
+            else if (am->cert_seq != a->cert_seen) {
+                a->cert_seen = am->cert_seq;
+                if (tui_ask_trust(a->label, am->cert_fp, am->cert_changed))
+                    oc_client_trust_cert(a->cl, am->cert_fp);
+            }
+        }
+        /* The active workspace's session was refused and its connection has given
+         * up: open its sign-in, with what the book knows filled in, rather than
+         * leave an error line over a workspace that will never come back. */
+        if (oc_client_model(g_ws[g_active].cl)->signed_out) {
+            ws_session again;
+            char label[256], user[128];
+            snprintf(label, sizeof label, "%s", g_ws[g_active].label);
+            snprintf(user,  sizeof user,  "%s", g_ws[g_active].user);
+            oc_client_stop(g_ws[g_active].cl);
+            if (run_login(label, user, g_store_path, g_secret, &again)) {
+                g_ws[g_active] = again;
+            } else if (g_nws > 1) {
+                /* They declined: close this workspace and show another. */
+                for (int i = g_active; i < g_nws - 1; i++) g_ws[i] = g_ws[i + 1];
+                g_nws--;
+                g_active = 0;
+            } else {
+                /* The only workspace, and it is already stopped: nothing is left for
+                 * the teardown below to stop a second time. */
+                g_nws = 0;
+                running = 0;
+                break;
+            }
+            g_sb_loaded = 0;
+        }
+        cl = g_ws[g_active].cl;
+
+        const oc_model *m = oc_client_model(cl);
+        /* Fold the active workspace's synced sidebar prefs in once they land, so
+         * collapse/sort/filter survive a restart without the client storing
+         * anything locally (ARCH-88). */
+        if (!g_sb_loaded && oc_model_setting(m, SB_SETTING_KEY)) {
+            sidebar_opts_load(m);
+            g_sb_loaded = 1;
+        }
+        if (focus >= m->n_channels) focus = m->n_channels ? m->n_channels - 1 : 0;
+        /* Encrypted DMs: say what changed, and select the DM just asked for. */
+        e2e_watch((oc_model *)m, &focus);
+        /* Layer the active workspace's synced settings over the file defaults,
+         * re-arming mouse input if that pref flipped. */
+        if (apply_synced_settings(&cfg, &file_cfg, m))
+            tb_set_input_mode(TB_INPUT_ESC | (cfg.mouse ? TB_INPUT_MOUSE : 0));
+        /* After /logout, close that workspace once the server has dropped it —
+         * and only quit when it was the last one open. */
+        if (logging_out && !m->connected) {
+            oc_client_stop(cl);
+            for (int i = g_active; i + 1 < g_nws; i++) g_ws[i] = g_ws[i + 1];
+            g_nws--;
+            logging_out = 0;
+            if (g_nws == 0) { running = 0; continue; }
+            if (g_active >= g_nws) g_active = g_nws - 1;
+            /* Adopt the newly-active workspace's saved view state. */
+            cl = g_ws[g_active].cl;
+            focus = g_ws[g_active].focus; scroll = g_ws[g_active].scroll;
+            snprintf(composer, sizeof composer, "%s", g_ws[g_active].composer);
+            clen = strlen(composer);
+            last_focus_cid = g_ws[g_active].last_focus_cid;
+            msg_sel = -1;
+            m = oc_client_model(cl);
+            if (focus >= m->n_channels) focus = m->n_channels ? m->n_channels - 1 : 0;
+        }
+
+        /* Lazy backfill + keep the focused channel marked read. */
+        if (focus < m->n_channels) {
+            uint64_t cid = m->channels[focus].channel_id;
+            oc_client_backfill(cl, cid);
+            if (cid != last_focus_cid) {
+                scroll = 0; msg_sel = -1; last_focus_cid = cid; g_hold_unread = 0;
+                /* A summary is of the conversation it was asked in, and only while
+                 * you stay there (as Slack's are). */
+                if (m->summary_open && m->summary_channel != cid) { oc_client_close_summary(cl); summary_ui = 0; }
+                jump_mid = 0;
+            }
+            /* Going to a summary item's message: select it once it is loaded,
+             * asking for the history around it if it is not. */
+            if (jump_mid) {
+                const oc_channel *jc = &m->channels[focus];
+                int found = -1;
+                for (size_t k = 0; k < jc->n_msgs && found < 0; k++) if (jc->msgs[k].message_id == jump_mid) found = (int)k;
+                if (found >= 0) { panel = 2; msg_sel = found; jump_mid = 0; }
+                else if (!jump_asked) { oc_client_history_around(cl, cid, jump_mid, 40); jump_asked = 1; }
+                else if (time(NULL) - jump_since > 5) jump_mid = 0;   /* not in this conversation's history */
+            }
+            if (cid != g_hold_unread) oc_client_mark_read(cl, cid);
+        }
+
+        /* One present per frame: render() and the overlays all draw into the back
+         * buffer, then a single tb_present() below diffs it to the screen. (Two
+         * presents per frame — base then overlay — flicker the overlay.) */
+        render(cl, focus, composer, clen, scroll, help_open, ac_idx, panel, msg_sel, mem_sel, editing);
+        if (action_open) {
+            int mh = g_nmenu + 3; if (mh > tb_height() - 2) mh = tb_height() - 2;
+            /* As wide as its longest item (a summary's line is long), within
+             * the screen; never narrower than the usual 34. */
+            int mw = 34;
+            for (int k = 0; k < g_nmenu; k++) {
+                int lw = tk_str_width(g_menu[k].label) + 4;
+                if (lw > mw) mw = lw;
+            }
+            if (mw > tb_width() - 4) mw = tb_width() - 4;
+            tk_rect in = tk_modal_begin(tb_width(), tb_height(), mw, mh, act_title);
+            tk_list_draw(&action_menu, in);
+        }
+        if (prompt_kind == PROMPT_INVITE) {
+            /* The input, what was wrong with the last answer, and the two lines
+             * that say what the address has to be. */
+            const tk_theme *pth = tk_theme_active();
+            tk_rect in = tk_modal_begin(tb_width(), tb_height(), 66, 6, prompt_title);
+            tk_input_draw(&prompt_input, (tk_rect){ in.x, in.y, in.w, 1 }, 1);
+            if (invite_err[0]) tk_text(in.x, in.y + 1, in.x + in.w, invite_err, TB_RED | TB_BOLD, pth->bg);
+            tk_text(in.x, in.y + 2, in.x + in.w, invite_note, pth->muted, pth->bg);
+            tk_text(in.x, in.y + 3, in.x + in.w, invite_note2, pth->muted, pth->bg);
+        } else if (prompt_kind) {
+            tk_rect in = tk_modal_begin(tb_width(), tb_height(), 46, 3, prompt_title);
+            tk_input_draw(&prompt_input, (tk_rect){ in.x, in.y, in.w, 1 }, 1);
+        }
+        if (launcher_open) tk_palette_draw(&launcher, tb_width(), tb_height());
+        if (dmpick_open) tk_palette_draw(&dmpick, tb_width(), tb_height());
+        if (picker_open) draw_picker(eq, esel);
+        if (profile_open) draw_profile(oc_client_model(cl), tb_width(), tb_height());
+        if (switcher_open) draw_switcher(wsel);
+        if (storage_open) draw_storage(oc_client_model(cl), tb_width(), tb_height());
+        if (audit_open) draw_audit(oc_client_model(cl), tb_width(), tb_height());
+        if (alerts_open) draw_alerts(oc_client_model(cl), tb_width(), tb_height(), asel);
+        if (summary_ui && oc_client_model(cl)->summary_open) draw_summary(oc_client_model(cl), tb_width(), tb_height(), ssel);
+        if (g_cal_open) draw_sumcal(tb_width(), tb_height());
+        tb_present();
+
+        struct tb_event ev;
+        int rc = tb_peek_event(&ev, 30);
+        if (rc != TB_OK) continue;               /* timeout: loop to re-tick + redraw */
+        if (ev.type == TB_EVENT_RESIZE) continue;
+        if (ev.type == TB_EVENT_MOUSE) {       /* wheel scrolls; click focuses a channel/member */
+            if (ev.key == TB_KEY_MOUSE_WHEEL_UP) scroll += 3;
+            else if (ev.key == TB_KEY_MOUSE_WHEEL_DOWN) { scroll -= 3; if (scroll < 0) scroll = 0; }
+            else if (ev.key == TB_KEY_MOUSE_LEFT && !help_open && !action_open && !prompt_kind && !launcher_open && !picker_open &&
+                     !dmpick_open &&
+                     !alerts_open && !summary_ui && !g_cal_open) {
+                int Wm = tb_width(); int chw, memw, msgx, msgw;
+                layout(Wm, &chw, &memw, &msgx, &msgw);
+                int prow = ev.y - 2;           /* first panel content row */
+                const oc_model *mm = oc_client_model(cl);
+                if (g_sumbtn_x1 && ev.y == g_sumbtn_y && ev.x >= g_sumbtn_x0 && ev.x < g_sumbtn_x1 &&
+                    focus < mm->n_channels) {                       /* the title's Summarize */
+                    act_cid = mm->channels[focus].channel_id;
+                    menu_build_summary_span();
+                    action_menu.sel = action_menu.top = 0;   /* the spans start at the first */
+                    act_title = "Summarize";
+                    action_open = 1; tk_list_reset_filter(&action_menu);
+                } else if (prow >= 0 && ev.x < chw) {                      /* Channels */
+                    sb_row rows[256];
+                    int nrows = sidebar_build(mm, rows, 256);
+                    if (prow < nrows) {
+                        if (rows[prow].header) {   /* click a header → fold/unfold */
+                            oc_sb_set_collapsed(&g_sb, rows[prow].group,
+                                                (uint8_t)!oc_sb_collapsed_of(&g_sb, rows[prow].group));
+                            sidebar_opts_save(cl);
+                            g_sb_hdr = rows[prow].group;
+                        } else { g_sb_hdr = -1; focus = rows[prow].idx; panel = 0; }
+                    }
+                } else if (memw && prow >= 0 && ev.x >= msgx + msgw) {   /* Members */
+                    if ((size_t)prow < mm->n_users) {
+                        oc_client_open_dm(cl, mm->users[prow].user_id, 0);
+                        g_dm_asked = mm->users[prow].user_id; g_dm_asked_e2e = 0;
+                    }
+                }
+            }
+            continue;
+        }
+        if (ev.type != TB_EVENT_KEY) continue;
+
+        /* Global quit — works from any context (was re-implemented per-overlay). */
+        if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) { running = 0; continue; }
+
+        /* Esc closes an open read-only overlay (thread/search/reactions/prefs/
+         * webhooks/roster). Without this the old /close is gone and you get stuck. */
+        {
+            const oc_model *om = oc_client_model(cl);
+            if (ev.key == TB_KEY_ESC && !switcher_open && !action_open && !launcher_open && !dmpick_open &&
+                !prompt_kind && !picker_open && !help_open && !profile_open &&
+                (om->thread_open || om->search_open || om->reactlist_open || om->voterlist_open ||
+                 om->prefs_open || om->weblist_open || om->roster_open)) {
+                oc_client_close_thread(cl);  oc_client_close_search(cl);
+                oc_client_close_reactions(cl); oc_client_close_poll_voters(cl); oc_client_toggle_prefs(cl, 0);
+                oc_client_close_webhooks(cl); oc_client_toggle_roster(cl, 0);
+                continue;
+            }
+        }
+
+        size_t nch = oc_client_model(cl)->n_channels;
+        if (switcher_open) {                   /* workspace switcher (REQ-013) */
+            int rows = g_nsw + 1;              /* + the "log in to new" row */
+            if (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C) switcher_open = 0;
+            else if (ev.key == TB_KEY_CTRL_Q) running = 0;
+            else if (ev.key == TB_KEY_ARROW_DOWN) { if (wsel + 1 < rows) wsel++; }
+            else if (ev.key == TB_KEY_ARROW_UP)   { if (wsel > 0) wsel--; }
+            else if (ev.ch == 'd' && wsel < g_nsw && g_sw[wsel].session < 0) {
+                /* Forget a closed workspace — credentials + cache go with it.
+                 * Only offered for closed ones; forgetting a live session would
+                 * pull the store out from under its running net thread. */
+                oc_store *s = g_store_path ? oc_store_open(g_store_path) : NULL;
+                if (s) {
+                    oc_store_set_secret(s, g_secret);
+                    oc_store_workspace_forget(s, g_sw[wsel].key);
+                    oc_store_close(s);
+                }
+                sw_build();
+                if (wsel > g_nsw) wsel = g_nsw;
+            } else if (ev.key == TB_KEY_ENTER) {
+                /* Save the active workspace's view state before leaving it. */
+                snprintf(g_ws[g_active].composer, sizeof g_ws[g_active].composer, "%s", composer);
+                g_ws[g_active].clen = clen;
+                g_ws[g_active].focus = focus;
+                g_ws[g_active].scroll = scroll;
+                g_ws[g_active].last_focus_cid = last_focus_cid;
+
+                int target;
+                if (wsel >= g_nsw) {           /* "+ Log in to new workspace" */
+                    if (g_nws >= MAX_WS) { switcher_open = 0; continue; }
+                    target = run_login(NULL, NULL, store_path, secret, &g_ws[g_nws])
+                           ? g_nws++ : -1;
+                } else if (g_sw[wsel].session >= 0) {
+                    target = g_sw[wsel].session;
+                } else {
+                    target = open_workspace(g_sw[wsel].key, g_sw[wsel].label, g_sw[wsel].user);
+                }
+                switcher_open = 0;
+                if (target < 0) continue;      /* cancelled / failed: stay put */
+                g_active = target;
+                /* Restore the target's view state (REQ-015). */
+                cl = g_ws[g_active].cl;
+                focus = g_ws[g_active].focus;
+                scroll = g_ws[g_active].scroll;
+                snprintf(composer, sizeof composer, "%s", g_ws[g_active].composer);
+                clen = strlen(composer);
+                last_focus_cid = g_ws[g_active].last_focus_cid;
+                msg_sel = -1; panel = 0; editing = 0;
+                remember_workspace(g_ws[g_active].key, NULL, NULL);   /* bump last-used */
+            }
+            continue;
+        }
+        if (g_cal_open) {                      /* the custom range picker */
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else if (sumcal_key(cl, &ev)) { summary_ui = 1; ssel = 0; }
+            continue;
+        }
+        if (summary_ui) {                      /* the summary: select, open a topic, go to a message, close */
+            const oc_model *sm = oc_client_model(cl);
+            int t = -1, d = -1;
+            int have = sum_entry(sm, ssel, &t, &d);
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else if (ev.key == TB_KEY_ESC || !sm->summary_open) { summary_ui = 0; oc_client_close_summary(cl); }
+            else if ((ev.ch == 'n' || ev.ch == 'c') && sm->summary_loading) {
+                /* Told when it is ready instead (n), or not made at all (c). */
+                if (ev.ch == 'n') oc_client_summary_detach(cl);
+                else oc_client_summary_cancel(cl);
+                summary_ui = 0;
+            }
+            else if (ev.ch == 'r' && !sm->summary_loading && sm->summary_status != OC_SUM_OK) {
+                if (oc_client_summary_retry(cl)) ssel = 0;
+            }
+            else if (ev.key == TB_KEY_ARROW_DOWN) { int a, b; if (sum_entry(sm, ssel + 1, &a, &b)) ssel++; }
+            else if (ev.key == TB_KEY_ARROW_UP)   { if (ssel > 0) ssel--; }
+            else if (have && t >= 0 && (ev.ch == ' ' || ev.key == TB_KEY_SPACE || (ev.key == TB_KEY_ENTER && d < 0))) {
+                /* Open or close the topic's details, keeping its heading selected. */
+                sum_closed(sm, (size_t)t);
+                if ((size_t)t < g_sum_closed_n) g_sum_closed[t] ^= 1;
+                for (int e = 0, a, b; sum_entry(sm, e, &a, &b); e++) if (a == t && b < 0) { ssel = e; break; }
+            }
+            else if (have && ev.key == TB_KEY_ENTER) {
+                /* A detail, or what needs attention: its first message. */
+                size_t nr = 0;
+                const uint64_t *rr = sum_entry_refs(sm, t, d, &nr);
+                if (!nr) continue;
+                /* Kept while you stay in the conversation: Ctrl+K goes back to it. */
+                jump_mid = rr[0];
+                jump_since = time(NULL);
+                jump_asked = 0;
+                summary_ui = 0;
+            }
+            continue;
+        }
+        if (alerts_open) {                     /* daemon alerts: select, acknowledge, close */
+            const oc_model *am = oc_client_model(cl);
+            int n = (int)am->n_srvalerts;
+            if (asel >= n) asel = n ? n - 1 : 0;
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else if (ev.key == TB_KEY_ESC) alerts_open = 0;
+            else if (ev.key == TB_KEY_ARROW_DOWN) { if (asel + 1 < n) asel++; }
+            else if (ev.key == TB_KEY_ARROW_UP)   { if (asel > 0) asel--; }
+            else if (ev.ch == 'a' && asel < n && !am->srvalerts[asel].acked) oc_client_srvalert_ack(cl, am->srvalerts[asel].id);
+            else if (ev.ch == 'A') oc_client_srvalert_ack(cl, 0);
+            continue;
+        }
+        if (audit_open) {                      /* audit overlay: any key closes */
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else audit_open = 0;
+            continue;
+        }
+        if (storage_open) {                    /* storage overlay: any key closes */
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else storage_open = 0;
+            continue;
+        }
+        if (help_open) {                       /* help overlay: any key closes it */
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else help_open = 0;
+            continue;
+        }
+        if (profile_open) {                    /* profile modal: any key closes it */
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else profile_open = 0;
+            continue;
+        }
+        if (prompt_kind) {                     /* text prompt dialog (tuikit) */
+            tk_result pr = tk_input_handle(&prompt_input, &ev);
+            if (pr == TK_CANCEL) prompt_kind = PROMPT_NONE;
+            else if (pr == TK_SELECT) {
+                const char *v = tk_input_value(&prompt_input);
+                int k = prompt_kind;
+                prompt_kind = PROMPT_NONE;
+                if      (k == PROMPT_NEWCHAN && *v) oc_client_create_channel(cl, v);
+                else if (k == PROMPT_SEARCH  && *v) oc_client_search(cl, v);
+                else if (k == PROMPT_NICK    && *v) oc_client_set_display_name(cl, v);
+                else if (k == PROMPT_WEBHOOK && *v) oc_client_create_webhook(cl, act_cid, v);
+                else if (k == PROMPT_INVITE) {
+                    /* An address where the workspace signs people in through a
+                     * provider; blank for a token, where it has password accounts.
+                     * Anything else keeps the prompt open and says why. */
+                    const oc_model *im = oc_client_model(cl);
+                    char addr[256];
+                    invite_trim(v, addr, sizeof addr);
+                    int digits = addr[0] != '\0';
+                    for (const char *d = addr; *d; d++) if (*d < '0' || *d > '9') digits = 0;
+                    if ((!addr[0] || digits) && !oc_model_offers_local(im)) {
+                        prompt_kind = PROMPT_INVITE;
+                        invite_err = "An email address is needed to invite someone here.";
+                    } else if (digits && strlen(addr) > 5) {
+                        prompt_kind = PROMPT_INVITE;
+                        invite_err = "That is too many people for one link.";
+                    } else if (addr[0] && !digits && !oc_email_plausible(addr)) {
+                        prompt_kind = PROMPT_INVITE;
+                        invite_err = "That does not look like an email address.";
+                    } else {
+                        /* A number is how many may use one shared link (0 for no
+                         * limit); blank is a one-time token; else an address. */
+                        long n = digits ? atol(addr) : 1;
+                        oc_client_invite(cl, OC_ROLE_MEMBER, digits ? NULL : addr,
+                                         (uint16_t)(n > 65535 ? 65535 : n));
+                        await_invite = 1;
+                    }
+                }
+                else if (k == PROMPT_UPLOAD && *v) {   /* never into an encrypted DM */
+                    const oc_model *pm = oc_client_model(cl);
+                    if (focus < pm->n_channels && !pm->channels[focus].e2e)
+                        oc_client_upload(cl, pm->channels[focus].channel_id, v);
+                }
+                else if (k == PROMPT_DND) {
+                    /* Two times = the hours notifications are ALLOWED (REQ-136).
+                     * The full per-weekday schedule is a Win32-first feature; the
+                     * TUI keeps the everyday case working rather than pretending
+                     * the old quiet-hours meaning still holds. */
+                    if (strcmp(v, "off") == 0 || !*v)
+                        oc_client_set_schedule(cl, OC_DND_OFF, 0, 0, 0, NULL, 0);
+                    else {
+                        char s1[16] = "", s2[16] = "";
+                        int a = parse_hhmm((sscanf(v, "%15s %15s", s1, s2) == 2) ? s1 : "");
+                        int b = parse_hhmm(s2);
+                        if (a >= 0 && b >= 0)
+                            oc_client_set_schedule(cl, OC_DND_EVERY_DAY, 0,
+                                                   (uint16_t)a, (uint16_t)b, NULL, 0);
+                    }
+                }
+            }
+            continue;
+        }
+        if (dmpick_open) {                     /* new DM: pick a person, Space for encrypted */
+            if (ev.key == TB_KEY_SPACE || (ev.type == TB_EVENT_KEY && !ev.key && ev.ch == ' ')) {
+                g_dmp_e2e = !g_dmp_e2e;
+                dmp_title();
+                continue;
+            }
+            tk_result dr = tk_palette_handle(&dmpick, &ev);
+            if (dr == TK_CANCEL) dmpick_open = 0;
+            else if (dr == TK_SELECT) {
+                int k = tk_palette_selected_id(&dmpick);
+                dmpick_open = 0;
+                if (k >= 0 && k < DMP_MAX) {
+                    oc_client_open_dm(cl, g_dmp_uid[k], g_dmp_e2e);
+                    g_dm_asked = g_dmp_uid[k]; g_dm_asked_e2e = g_dmp_e2e;
+                    panel = 0;
+                }
+            }
+            continue;
+        }
+        if (launcher_open) {                   /* global action launcher (tk_palette) */
+            tk_result lr = tk_palette_handle(&launcher, &ev);
+            if (lr == TK_CANCEL) launcher_open = 0;
+            else if (lr == TK_SELECT) {
+                int id = tk_palette_selected_id(&launcher);
+                launcher_open = 0;
+                if      (id == ACT_NEWCHAN) { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
+                else if (id == ACT_NEWDM)   { dmp_open(&dmpick, oc_client_model(cl)); dmpick_open = 1; }
+                else if (e2e_act(cl, id, act_cid, &focus)) {}
+                else if (id == ACT_SEARCH)  { prompt_kind = PROMPT_SEARCH; prompt_title = "Search messages"; tk_input_init(&prompt_input, 0, "query"); }
+                else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
+                else if (id == ACT_UPLOAD)  { prompt_kind = PROMPT_UPLOAD; prompt_title = "Upload a file"; tk_input_init(&prompt_input, 0, "path"); }
+                else if (id == ACT_DND)     { prompt_kind = PROMPT_DND; prompt_title = "Do not disturb (HH:MM HH:MM, or 'off')"; tk_input_init(&prompt_input, 0, "e.g. 22:00 08:00"); }
+                else if (id == ACT_PASSWD)  {   /* the workspace's own page (AUTH.md §8.10) */
+                    char url[1200];
+                    if (oc_client_open_page(cl, "account/password", NULL, url, sizeof url) == 0) open_in_browser(url);
+                }
+                else if (id == ACT_AWAY)    oc_client_set_presence(cl, OC_PRESENCE_AWAY);
+                else if (id == ACT_ONLINE)  oc_client_set_presence(cl, OC_PRESENCE_ONLINE);
+                else if (id == ACT_SECURITY){   /* the workspace's own page (AUTH.md §8.6) */
+                    char url[1200];
+                    if (oc_client_open_page(cl, "account/security", NULL, url, sizeof url) == 0) open_in_browser(url);
+                }
+                else if (id == ACT_PREFS)   oc_client_toggle_prefs(cl, 1);
+                else if (id == ACT_LEAVE)   { if (act_cid) oc_client_leave_channel(cl, act_cid); }
+                else if (id == ACT_WEBHOOKS){ if (act_cid) oc_client_webhooks(cl, act_cid); }
+                else if (id == ACT_INVITE)  {
+                    if (invite_prompt(cl, invite_note, sizeof invite_note, &invite_note2)) {
+                        prompt_kind = PROMPT_INVITE;
+                        prompt_title = oc_model_offers_browser(oc_client_model(cl)) ? "Invite by email" : "Invite people";
+                        invite_err = "";
+                        tk_input_init(&prompt_input, 0, oc_model_offers_browser(oc_client_model(cl)) ? "name@example.com" : "");
+                    } else await_invite = 1;
+                }
+                else if (id == ACT_PROFILE) profile_open = 1;
+                else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
+                else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
+                else if (id == ACT_ALERTS)  { oc_client_srvalerts_list(cl); alerts_open = 1; asel = 0; }
+                else if (id == ACT_WORKSPACES) { sw_build(); wsel = (g_active < g_nsw) ? g_active : 0; switcher_open = 1; }
+                else if (id == ACT_HELP)    help_open = 1;
+                else if (id == ACT_LOGOUT)  { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
+                else if (id == ACT_SUMMARIZE && act_cid) {
+                    menu_build_summary_span();
+                    action_menu.sel = action_menu.top = 0;   /* the spans start at the first */
+                    act_title = "Summarize";
+                    action_open = 1; tk_list_reset_filter(&action_menu);
+                }
+                else if (id == ACT_SUM_BACK) { summary_ui = 1; ssel = 0; }
+                else if (id == ACT_SUM_NOTICES) {
+                    menu_build_sum_notices(oc_client_model(cl));
+                    action_menu.sel = action_menu.top = 0;
+                    act_title = "Summaries ready";
+                    action_open = 1; tk_list_reset_filter(&action_menu);
+                }
+            }
+            continue;
+        }
+        if (action_open && act_title && !strcmp(act_title, "Summaries ready") && ev.ch == 'd') {
+            /* Dismiss the selected summary without opening it. */
+            const oc_model *nm = oc_client_model(cl);
+            int k = action_menu.sel;
+            if (k >= 0 && k < g_nmenu) {
+                size_t at = (size_t)(g_menu[k].id - ACT_SUM_NOTICE0);
+                if (at < nm->n_sum_notices) oc_client_summary_dismiss(cl, nm->sum_notices[at].id);
+            }
+            menu_build_sum_notices(oc_client_model(cl));
+            if (!g_nmenu) action_open = 0;
+            else if (action_menu.sel >= g_nmenu) action_menu.sel = g_nmenu - 1;
+            continue;
+        }
+        if (action_open) {                     /* message action menu (tuikit) */
+            tk_result ar = tk_list_handle(&action_menu, &ev);
+            if (ar == TK_CANCEL) action_open = 0;
+            else if (ar == TK_SELECT) {
+                int ai = tk_list_selected(&action_menu);
+                action_open = 0;
+                if (ai >= 0) {
+                    int id = g_menu[ai].id;
+                    if      (id == ACT_THREAD)      oc_client_open_thread(cl, act_cid, act_mid);
+                    else if (id == ACT_REACTORS)    oc_client_list_reactions(cl, act_cid, act_mid);
+                    else if (id == ACT_VOTERS)      oc_client_list_poll_voters(cl, act_cid, act_mid);
+                    else if (id == ACT_POLL_CLOSE) {
+                        /* Everything as it is, the deadline now (REQ-225). */
+                        const oc_poll_view *pv = oc_model_poll(oc_client_model(cl), act_cid, act_mid);
+                        if (pv) {
+                            const char *ov[OC_POLL_MAX_OPTIONS];
+                            for (uint8_t o = 0; o < pv->n_options; o++) ov[o] = pv->labels[o];
+                            oc_client_edit_poll(cl, act_cid, act_mid, ov, pv->n_options, pv->flags,
+                                                (uint64_t)time(NULL) * 1000u);
+                        }
+                    }
+                    else if (id >= ACT_VOTE0 && id <= ACT_VOTE_LAST) {
+                        /* One choice moves to it, or is taken back; several
+                         * toggle it. The whole selection goes (REQ-225). */
+                        const oc_poll_view *pv = oc_model_poll(oc_client_model(cl), act_cid, act_mid);
+                        uint8_t k = (uint8_t)(id - ACT_VOTE0);
+                        if (pv && k < pv->n_options) {
+                            uint16_t bit = (uint16_t)(1u << k);
+                            uint16_t sel = (pv->flags & OC_POLL_MULTI) ? (uint16_t)(pv->mine ^ bit)
+                                                                       : (pv->mine == bit ? 0 : bit);
+                            uint8_t picks[OC_POLL_MAX_OPTIONS], np = 0;
+                            for (uint8_t o = 0; o < pv->n_options; o++) if (sel & (1u << o)) picks[np++] = o;
+                            oc_client_vote(cl, act_cid, act_mid, picks, np);
+                        }
+                    }
+                    else if (id == ACT_UNREAD) {
+                        /* The cursor names the last message READ, so this one is
+                         * unread from the one before it; 0 when it is the first. */
+                        const oc_channel *uc = oc_model_channel((oc_model *)oc_client_model(cl), act_cid);
+                        uint64_t prev = 0;
+                        if (uc) for (size_t k = 0; k < uc->n_msgs; k++) {
+                            if (uc->msgs[k].message_id == act_mid) break;
+                            prev = uc->msgs[k].message_id;
+                        }
+                        oc_client_set_read_cursor(cl, act_cid, prev);
+                        g_hold_unread = act_cid;
+                    }
+                    else if (id == ACT_DELETE)      oc_client_delete(cl, act_cid, act_mid);
+                    else if (id == ACT_DM) {
+                        oc_client_open_dm(cl, act_uid, 0);
+                        g_dm_asked = act_uid; g_dm_asked_e2e = 0;
+                        panel = 0;
+                    }
+                    else if (id == ACT_ROLE_ADMIN)  oc_client_set_role(cl, act_uid, OC_ROLE_ADMIN);
+                    else if (id == ACT_ROLE_MEMBER) oc_client_set_role(cl, act_uid, OC_ROLE_MEMBER);
+                    else if (id == ACT_REMOVE)      oc_client_remove_user(cl, act_uid);
+                    else if (id == ACT_REACT)       { picker_open = 1; eq[0] = '\0'; eqlen = 0; esel = 0; picker_cid = act_cid; picker_mid = act_mid; }
+                    else if (id == ACT_EDIT) {
+                        const oc_channel *ec = focused_channel(oc_client_model(cl), act_cid);
+                        if (ec) for (size_t k = 0; k < ec->n_msgs; k++)
+                            if (ec->msgs[k].message_id == act_mid) {
+                                editing = act_mid;
+                                snprintf(composer, sizeof composer, "%s", ec->msgs[k].body ? ec->msgs[k].body : "");
+                                clen = strlen(composer); panel = 0; break;
+                            }
+                    }
+                    else if (id == ACT_DOWNLOAD) {   /* first live attachment -> its filename in cwd */
+                        const oc_channel *ec = focused_channel(oc_client_model(cl), act_cid);
+                        if (ec) for (size_t k = 0; k < ec->n_msgs; k++)
+                            if (ec->msgs[k].message_id == act_mid) {
+                                for (uint8_t ak = 0; ak < ec->msgs[k].n_attach; ak++)
+                                    if (!ec->msgs[k].attach[ak].reclaimed) {
+                                        oc_client_download(cl, ec->msgs[k].attach[ak].id, ec->msgs[k].attach[ak].filename);
+                                        break;
+                                    }
+                                break;
+                            }
+                    }
+                    /* channel menu actions */
+                    else if (id == ACT_OPEN)  panel = 0;
+                    else if (id == ACT_JOIN)  { oc_client_join_channel(cl, act_cid); panel = 0; }
+                    else if (id == ACT_WEBHOOK_CREATE) { prompt_kind = PROMPT_WEBHOOK; prompt_title = "Create webhook (label)"; tk_input_init(&prompt_input, 0, "label"); }
+                    else if (id == ACT_NOTIFY_ALL)      oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_ALL);
+                    else if (id == ACT_NOTIFY_MENTIONS) oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_MENTIONS);
+                    else if (id == ACT_NOTIFY_NONE)     oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_NONE);
+                    /* global launcher actions */
+                    else if (id == ACT_NEWCHAN) { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
+                    else if (id == ACT_NEWDM)   { dmp_open(&dmpick, oc_client_model(cl)); dmpick_open = 1; }
+                    else if (e2e_act(cl, id, act_cid, &focus)) panel = 0;
+                    else if (id == ACT_SEARCH)  { prompt_kind = PROMPT_SEARCH; prompt_title = "Search messages"; tk_input_init(&prompt_input, 0, "query"); }
+                    else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
+                    else if (id == ACT_AWAY)    oc_client_set_presence(cl, OC_PRESENCE_AWAY);
+                    else if (id == ACT_ONLINE)  oc_client_set_presence(cl, OC_PRESENCE_ONLINE);
+                    else if (id == ACT_PREFS)   { oc_client_toggle_prefs(cl, 1); }
+                    else if (id == ACT_LEAVE)   { if (act_cid) oc_client_leave_channel(cl, act_cid); }
+                    else if (id == ACT_WEBHOOKS){ if (act_cid) oc_client_webhooks(cl, act_cid); }
+                    else if (id == ACT_INVITE)  {
+                        if (invite_prompt(cl, invite_note, sizeof invite_note, &invite_note2)) {
+                            prompt_kind = PROMPT_INVITE;
+                            prompt_title = oc_model_offers_browser(oc_client_model(cl)) ? "Invite by email" : "Invite people";
+                            invite_err = "";
+                            tk_input_init(&prompt_input, 0, oc_model_offers_browser(oc_client_model(cl)) ? "name@example.com" : "");
+                        } else await_invite = 1;
+                    }
+                    else if (id == ACT_PROFILE) profile_open = 1;
+                    else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
+                    else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
+                    else if (id == ACT_ALERTS)  { oc_client_srvalerts_list(cl); alerts_open = 1; asel = 0; }
+                    else if (id == ACT_WORKSPACES) { sw_build(); wsel = (g_active < g_nsw) ? g_active : 0; switcher_open = 1; }
+                    else if (id == ACT_HELP)    help_open = 1;
+                    else if (id == ACT_LOGOUT)  { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
+                    /* summaries: the span, then the summary */
+                    else if (id == ACT_SUMMARIZE) {
+                        menu_build_summary_span();
+                        action_menu.sel = action_menu.top = 0;   /* the spans start at the first */
+                        act_title = "Summarize";
+                        action_open = 1; tk_list_reset_filter(&action_menu);
+                    }
+                    else if (id == ACT_SUM_UNREAD || id == ACT_SUM_TODAY || id == ACT_SUM_WEEK || id == ACT_SUM_DAILY) {
+                        uint8_t sc = id == ACT_SUM_UNREAD ? OC_SUM_UNREAD : id == ACT_SUM_TODAY ? OC_SUM_TODAY
+                                   : id == ACT_SUM_WEEK ? OC_SUM_WEEK : OC_SUM_DAILY;
+                        if (oc_client_summarize(cl, act_cid, sc, 0, 0)) { summary_ui = 1; ssel = 0; }
+                    }
+                    else if (id == ACT_SUM_RANGE) cal_open(act_cid);
+                    else if (id >= ACT_SUM_NOTICE0) {
+                        /* A summary made while you were away: opened in its own
+                         * conversation, which is selected first. */
+                        const oc_model *nm = oc_client_model(cl);
+                        size_t at = (size_t)(id - ACT_SUM_NOTICE0);
+                        if (at < nm->n_sum_notices) {
+                            oc_summary_notice sn = nm->sum_notices[at];
+                            for (size_t k = 0; k < nm->n_channels; k++)
+                                if (nm->channels[k].channel_id == sn.channel_id) {
+                                    focus = k;
+                                    if (last_focus_cid != sn.channel_id) {
+                                        scroll = 0; msg_sel = -1; last_focus_cid = sn.channel_id; g_hold_unread = 0;
+                                        jump_mid = 0;
+                                    }
+                                    break;
+                                }
+                            if (oc_client_summary_open_notice(cl, sn.id, sn.channel_id, sn.scope)) {
+                                summary_ui = 1; ssel = 0;
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if (picker_open) {                     /* emoji picker: type to filter, Enter reacts */
+            const char *em[64], *nm[64]; int n = picker_build(eq, em, nm, 64);
+            if (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C || ev.key == TB_KEY_CTRL_Q) {
+                picker_open = 0;
+            } else if (ev.key == TB_KEY_ARROW_DOWN) { if (esel + 1 < n) esel++; }
+            else if (ev.key == TB_KEY_ARROW_UP)     { if (esel > 0) esel--; }
+            else if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {
+                if (eqlen) eq[--eqlen] = '\0';
+                esel = 0;
+            } else if (ev.key == TB_KEY_ENTER) {
+                if (n > 0 && esel < n) {
+                    int op = my_reaction(oc_client_model(cl), picker_cid, picker_mid, em[esel]) ? 0 : 1;
+                    oc_client_react(cl, picker_cid, picker_mid, em[esel], op);   /* toggle */
+                }
+                picker_open = 0;
+            } else if (ev.ch >= 0x20 && ev.ch <= 0x7e && eqlen + 1 < sizeof eq) {
+                eq[eqlen++] = (char)ev.ch; eq[eqlen] = '\0'; esel = 0;
+            }
+            continue;
+        }
+        if (ev.key == TB_KEY_CTRL_K) {         /* global action launcher (tuikit tk_palette) */
+            const oc_model *mm = oc_client_model(cl);
+            act_cid = focus < mm->n_channels ? mm->channels[focus].channel_id : 0;
+            tk_palette_set(&launcher, g_launcher_now, launcher_build(mm, act_cid));
+            launcher_open = 1;
+            continue;
+        }
+        if (ev.key == TB_KEY_CTRL_F) {         /* search dialog (tuikit) — replaces /search */
+            prompt_kind = PROMPT_SEARCH; prompt_title = "Search messages";
+            tk_input_init(&prompt_input, 0, "query");
+            continue;
+        }
+        if (ev.key == TB_KEY_CTRL_R) {         /* force an immediate reconnect */
+            oc_client_reconnect(cl);
+            continue;
+        }
+        if (ev.key == TB_KEY_CTRL_W) {         /* workspace switcher (REQ-013) */
+            sw_build();
+            wsel = (g_active < g_nsw) ? g_active : 0;
+            switcher_open = 1;
+            continue;
+        }
+        if (ev.key != TB_KEY_TAB) ac_idx = 0;  /* any non-Tab key restarts cycling */
+
+        /* ---- navigation mode (a panel is focused; single keys act) ---- */
+        if (panel != 0) {
+            const oc_model *mm = oc_client_model(cl);
+            const oc_channel *ch = (focus < mm->n_channels) ? &mm->channels[focus] : NULL;
+            uint64_t cid = ch ? ch->channel_id : 0;
+            int up   = (ev.key == TB_KEY_ARROW_UP);
+            int down = (ev.key == TB_KEY_ARROW_DOWN);
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) { running = 0; }
+            else if (ev.key == TB_KEY_ESC) { panel = 0; }   /* back to composing */
+            else if (ev.key == TB_KEY_TAB) {                                /* cycle panels 1→2→3 */
+                panel = (panel == 1) ? 2 : (panel == 2) ? 3 : 1;
+                if (panel == 2 && ch && (msg_sel < 0 || msg_sel >= (int)ch->n_msgs))
+                    msg_sel = ch->n_msgs ? (int)ch->n_msgs - 1 : -1;
+                if (panel == 3 && mem_sel >= (int)mm->n_users)
+                    mem_sel = mm->n_users ? (int)mm->n_users - 1 : 0;
+            }
+            else if (panel == 1) {                                          /* channels */
+                sb_row rows[256];
+                int nrows = sidebar_build(mm, rows, 256);
+                int cur = sidebar_cursor(rows, nrows, focus);
+                if (up && cur > 0) sidebar_select(rows, cur - 1, &focus);
+                else if (down && cur + 1 < nrows) sidebar_select(rows, cur + 1, &focus);
+                else if (ev.key == TB_KEY_ARROW_LEFT) {                      /* collapse / go to header */
+                    int g = g_sb_hdr >= 0 ? g_sb_hdr
+                          : (focus < mm->n_channels ? chan_group(&mm->channels[focus]) : -1);
+                    if (g >= 0) { oc_sb_set_collapsed(&g_sb, g, 1); g_sb_hdr = g; sidebar_opts_save(cl); }
+                }
+                else if (ev.key == TB_KEY_ARROW_RIGHT) {                     /* expand a folded group */
+                    if (g_sb_hdr >= 0 && oc_sb_collapsed_of(&g_sb, g_sb_hdr)) { oc_sb_set_collapsed(&g_sb, g_sb_hdr, 0); sidebar_opts_save(cl); }
+                }
+                else if (ev.ch == 's' || ev.ch == 'f') {
+                    /* Sort / filter the section under the cursor — the TUI's
+                     * equivalent of the GUI's per-section kebab menu. Cycles, so
+                     * one key covers all three modes without a submenu. */
+                    int g = g_sb_hdr >= 0 ? g_sb_hdr
+                          : (focus < mm->n_channels ? chan_group(&mm->channels[focus]) : -1);
+                    if (g >= 0) {
+                        if (ev.ch == 's') oc_sb_set_sort(&g_sb, g, (uint8_t)((oc_sb_sort_of(&g_sb, g) + 1) % 3));
+                        else              oc_sb_set_filter(&g_sb, g, (uint8_t)((oc_sb_filter_of(&g_sb, g) + 1) % 3));
+                        sidebar_opts_save(cl);
+                    }
+                }
+                else if (ev.ch == 'n') { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
+                else if (ev.key == TB_KEY_ENTER) {
+                    if (g_sb_hdr >= 0) {                                      /* toggle the group's fold */
+                        oc_sb_set_collapsed(&g_sb, g_sb_hdr, (uint8_t)!oc_sb_collapsed_of(&g_sb, g_sb_hdr));
+                        sidebar_opts_save(cl);
+                    } else if (focus < mm->n_channels) {                     /* channel action menu */
+                        const oc_channel *mc = &mm->channels[focus];
+                        menu_build_channel(mc->joined, oc_model_summarize_available(mm), mc->e2e, e2e_state(mm, mc));
+                        act_cid = mm->channels[focus].channel_id; act_uid = 0; act_mid = 0; act_title = "Channel";
+                        action_open = 1; tk_list_reset_filter(&action_menu);
+                    }
+                }
+            }
+            else if (panel == 3) {                                          /* members */
+                if (up && mem_sel > 0) mem_sel--;
+                else if (down && mem_sel + 1 < (int)mm->n_users) mem_sel++;
+                else if (ev.ch == 'n') { dmp_open(&dmpick, mm); dmpick_open = 1; }
+                else if (ev.key == TB_KEY_ENTER && mem_sel < (int)mm->n_users) {
+                    /* discoverable member action menu (Message / role / remove) */
+                    uint64_t uid = mm->users[mem_sel].user_id;
+                    menu_build_member(uid == mm->user_id);
+                    act_uid = uid; act_cid = 0; act_mid = 0; act_title = "Member";
+                    action_open = 1; tk_list_reset_filter(&action_menu);
+                }
+            }
+            else if (panel == 2 && ch) {                                    /* messages */
+                int n = (int)ch->n_msgs;
+                if (up)        { if (msg_sel > 0) msg_sel--; }
+                else if (down) { if (msg_sel + 1 < n) msg_sel++; }
+                else if (msg_sel >= 0 && msg_sel < n) {
+                    const oc_msg *sel = &ch->msgs[msg_sel];
+                    uint64_t mid = sel->message_id;
+                    /* An encrypted DM that has ended, or is not on this device,
+                     * stands as it is: no reply, reaction, edit or delete. */
+                    const oc_pdm_view *lv = ch->e2e ? oc_model_pdm((oc_model *)mm, cid) : NULL;
+                    int locked = ch->e2e && (!lv || lv->state == OC_PDM_EV_ENDED);
+                    int own = (sel->author_id == mm->user_id) && !sel->deleted && !locked;
+                    int has_attach = 0;
+                    for (uint8_t ak = 0; ak < sel->n_attach; ak++)
+                        if (!sel->attach[ak].reclaimed) { has_attach = 1; break; }
+                    if (ev.key == TB_KEY_ENTER) {   /* open the discoverable action menu */
+                        menu_build_msg(own, sel->deleted || locked, has_attach && !ch->e2e, sel->poll);   /* no files in an encrypted DM */
+                        act_cid = cid; act_mid = mid; act_uid = 0; act_title = "Message";
+                        action_open = 1; tk_list_reset_filter(&action_menu);
+                    }
+                    else if (ev.ch == 't' && !locked) oc_client_open_thread(cl, cid, mid);
+                    else if (ev.ch == 'w') oc_client_list_reactions(cl, cid, mid);
+                    else if ((ev.ch == 'x' || ev.ch == 'd') && own) oc_client_delete(cl, cid, mid);
+                    else if (ev.ch == 'r' && !sel->deleted && !locked) {   /* open the emoji picker */
+                        picker_open = 1; eq[0] = '\0'; eqlen = 0; esel = 0;
+                        picker_cid = cid; picker_mid = mid;
+                    }
+                    else if (ev.ch == 'e' && own) {             /* edit: prefill + drop to composer */
+                        editing = mid;
+                        snprintf(composer, sizeof composer, "%s", sel->body ? sel->body : "");
+                        clen = strlen(composer);
+                        panel = 0;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) {
+            running = 0;
+        } else if (ev.key == TB_KEY_ESC) {    /* composer → navigation mode */
+            if (editing) { editing = 0; composer[0] = '\0'; clen = 0; }
+            else { panel = 2; if (focus < nch) msg_sel = m->channels[focus].n_msgs ? (int)m->channels[focus].n_msgs - 1 : -1; }
+        } else if (ev.key == TB_KEY_ENTER) {
+            if (editing) {                     /* apply the edit (or cancel if emptied) */
+                if (clen > 0 && focus < nch) oc_client_edit(cl, m->channels[focus].channel_id, editing, composer);
+                editing = 0; clen = 0; composer[0] = '\0'; scroll = 0;
+            } else if (clen > 0 && focus < nch) {
+                /* Menu-driven: the composer only SENDS (or replies in a thread) —
+                 * it no longer parses slash commands. All actions are reachable
+                 * via the pane action menus, the dialogs, and the Ctrl-K launcher. */
+                const oc_model *mm = oc_client_model(cl);
+                uint64_t cid = mm->channels[focus].channel_id;
+                if (mm->search_open || mm->roster_open || mm->reactlist_open || mm->voterlist_open || mm->prefs_open || mm->weblist_open) { /* read-only overlay: ignore */ }
+                else if (mm->thread_open) oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
+                else                      oc_client_send(cl, cid, composer);
+                clen = 0; composer[0] = '\0'; scroll = 0;
+            }
+        } else if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {
+            backspace_utf8(composer, &clen);
+        } else if (ev.key == TB_KEY_TAB) {
+            if (clen > 0) {                    /* autocomplete the trailing token */
+                ac_cand cands[16]; int rs;
+                int n = (int)oc_complete(oc_client_model(cl), composer, cands, 16, &rs, NULL);
+                if (n > 0) {
+                    const char *repl = cands[((ac_idx % n) + n) % n].repl;
+                    char nb[COMPOSER_CAP];
+                    int k = snprintf(nb, sizeof nb, "%.*s%s", rs, composer, repl);
+                    if (k > 0 && k < (int)sizeof nb) { memcpy(composer, nb, (size_t)k + 1); clen = (size_t)k; }
+                    ac_idx++;
+                }
+            } else {                           /* empty composer: enter navigation mode */
+                panel = 2;
+                if (focus < nch) msg_sel = m->channels[focus].n_msgs ? (int)m->channels[focus].n_msgs - 1 : -1;
+            }
+        } else if (ev.key == TB_KEY_ARROW_UP) {
+            scroll += 1;
+        } else if (ev.key == TB_KEY_ARROW_DOWN) {
+            if (scroll > 0) scroll -= 1;
+        } else if (ev.key == TB_KEY_PGUP) {
+            scroll += (tb_height() - 3) / 2;
+        } else if (ev.key == TB_KEY_PGDN) {
+            scroll -= (tb_height() - 3) / 2;
+            if (scroll < 0) scroll = 0;
+        } else if (ev.ch == '?' && clen == 0) {
+            help_open = 1;                     /* ? on an empty composer opens help */
+        } else if (ev.ch == ':' && clen == 0) {   /* : opens the action launcher */
+            const oc_model *mm = oc_client_model(cl);
+            act_cid = focus < mm->n_channels ? mm->channels[focus].channel_id : 0;
+            tk_palette_set(&launcher, g_launcher_now, launcher_build(mm, act_cid));
+            launcher_open = 1;
+        } else if (ev.ch != 0) {
+            /* A typed codepoint: append its UTF-8 encoding to the composer. */
+            utf8proc_uint8_t enc[4];
+            utf8proc_ssize_t k = utf8proc_encode_char((utf8proc_int32_t)ev.ch, enc);
+            if (k > 0 && clen + (size_t)k + 1 < sizeof composer) {
+                memcpy(composer + clen, enc, (size_t)k);
+                clen += (size_t)k;
+                composer[clen] = '\0';
+            }
+            /* Signal typing while composing a message (not a /command), throttled. */
+            time_t now = time(NULL);
+            if (focus < nch && composer[0] != '/' && now - last_typing >= 3) {
+                oc_client_typing(cl, oc_client_model(cl)->channels[focus].channel_id);
+                last_typing = now;
+            }
+        }
+    }
+
+    tb_shutdown();
+    tk_list_free(&action_menu);
+    tk_palette_free(&launcher);
+    tk_palette_free(&dmpick);
+    for (int i = 0; i < g_nws; i++) oc_client_stop(g_ws[i].cl);
+    g_nws = 0;
+    oc_secret_free(secret);
+    return 0;
+}

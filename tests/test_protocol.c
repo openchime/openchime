@@ -1,0 +1,2575 @@
+/* Unit tests for the OpenChime v1 frame codec (docs/PROTOCOL.md, TESTING.md
+ * §2.2). Links the codec's object and exercises its public API (TESTING.md
+ * §2.1), and a single CHECK macro counts failures. Built and run by `make test`; non-zero exit means failure. */
+
+#include "protocol.h"
+#include "check.h"
+
+#include <string.h>
+
+/* Scratch buffers sized for a full frame plus a max body. */
+static uint8_t frame[OC_MAX_FRAME_SIZE];
+static uint8_t big[OC_MAX_BODY_SIZE + 8];
+
+static int slice_eq_str(oc_slice s, const char *str) {
+    size_t n = strlen(str);
+    return s.len == n && (n == 0 || memcmp(s.ptr, str, n) == 0);
+}
+
+/* --- Primitive encodings (§7) ------------------------------------------- */
+/* A push device token is what APNs and FCM issue, and nothing that could break
+ * the JSON it is sent in (ARCH-85). */
+static void test_device_token_ok(void) {
+    CHECK(oc_device_token_ok((const uint8_t *)"0a1B", 4));
+    CHECK(oc_device_token_ok((const uint8_t *)"fcm:APA91b-x_y.z", 16));
+    CHECK(!oc_device_token_ok((const uint8_t *)"", 0));
+    CHECK(!oc_device_token_ok(NULL, 3));
+    CHECK(!oc_device_token_ok((const uint8_t *)"a\"b", 3));
+    CHECK(!oc_device_token_ok((const uint8_t *)"a\\b", 3));
+    CHECK(!oc_device_token_ok((const uint8_t *)"a b", 3));
+    CHECK(!oc_device_token_ok((const uint8_t *)"a\0b", 3));
+    uint8_t big[OC_DEVICE_TOKEN_MAX];
+    memset(big, 'a', sizeof big);
+    CHECK(oc_device_token_ok(big, OC_DEVICE_TOKEN_MAX - 1));
+    CHECK(!oc_device_token_ok(big, OC_DEVICE_TOKEN_MAX));   /* refused, never cut short */
+}
+
+static void test_primitives(void) {
+    oc_wbuf w;
+    oc_wbuf_init(&w, frame, sizeof frame);
+    oc_w_u8(&w, 0x12);
+    oc_w_u16(&w, 0x1234);
+    oc_w_u32(&w, 0x12345678u);
+    oc_w_u64(&w, 0x1122334455667788ull);
+    oc_w_str(&w, oc_slice_str("hi"));
+    oc_w_str(&w, oc_slice_str(""));            /* empty string is legal */
+    oc_w_lstr(&w, oc_slice_str("longer body"));
+    uint8_t idem[OC_IDEM_SIZE];
+    for (int i = 0; i < (int)OC_IDEM_SIZE; i++) idem[i] = (uint8_t)(i + 1);
+    oc_w_idem(&w, idem);
+    CHECK(!w.overflow);
+
+    /* Big-endian on the wire: first byte of the u16 is the high byte. */
+    CHECK(frame[0] == 0x12);
+    CHECK(frame[1] == 0x12 && frame[2] == 0x34);
+
+    oc_rbuf r;
+    oc_rbuf_init(&r, frame, w.len);
+    CHECK(oc_r_u8(&r) == 0x12);
+    CHECK(oc_r_u16(&r) == 0x1234);
+    CHECK(oc_r_u32(&r) == 0x12345678u);
+    CHECK(oc_r_u64(&r) == 0x1122334455667788ull);
+    CHECK(slice_eq_str(oc_r_str(&r), "hi"));
+    CHECK(slice_eq_str(oc_r_str(&r), ""));
+    CHECK(slice_eq_str(oc_r_lstr(&r), "longer body"));
+    uint8_t got[OC_IDEM_SIZE];
+    oc_r_idem(&r, got);
+    CHECK(memcmp(got, idem, OC_IDEM_SIZE) == 0);
+    CHECK(!r.underflow && r.pos == r.len);
+
+    /* A str longer than its u16 prefix can hold overflows the frame. */
+    oc_wbuf w2;
+    oc_wbuf_init(&w2, frame, sizeof frame);
+    oc_slice toolong = { frame, 70000 };       /* ptr never read: length check fires first */
+    oc_w_str(&w2, toolong);
+    CHECK(w2.overflow);
+}
+
+/* --- Full-frame round trips (§9) ---------------------------------------- */
+
+/* Encode with `enc`, parse the frame, assert header, hand payload to caller. */
+#define ROUNDTRIP(enc, expect_type, hdrvar, payloadvar)                      \
+    oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);                        \
+    CHECK((enc) == OC_OK);                                                   \
+    oc_header hdrvar; oc_rbuf payloadvar;                                     \
+    CHECK(oc_parse_frame(frame, w.len, &hdrvar, &payloadvar) == OC_OK);      \
+    CHECK(hdrvar.msg_type == (expect_type));                                 \
+    CHECK((size_t)hdrvar.length + 4u == w.len)
+
+static void test_handshake_frames(void) {
+    {
+        oc_hello in = { 1, 3, oc_slice_str("openchime-desktop/0.1 linux") };
+        ROUNDTRIP(oc_encode_hello(&w, &in), OC_MSG_HELLO, h, p);
+        /* Frozen at 1, asserted as the literal rather than via the constant:
+         * the point is that this value does NOT track OC_PROTOCOL_VERSION, and
+         * an assertion written in terms of the constant would follow it. */
+        CHECK(h.version == 1);
+        CHECK(OC_HANDSHAKE_VERSION == 1);
+        oc_hello out;
+        CHECK(oc_decode_hello(&p, &out) == OC_OK);
+        CHECK(out.min_version == 1 && out.max_version == 3);
+        CHECK(slice_eq_str(out.client_info, "openchime-desktop/0.1 linux"));
+    }
+    {
+        oc_welcome in = { 2, 1751200000000ull };
+        ROUNDTRIP(oc_encode_welcome(&w, &in), OC_MSG_WELCOME, h, p);
+        CHECK(h.version == 1);   /* frozen, and independent of chosen_version */
+        oc_welcome out;
+        CHECK(oc_decode_welcome(&p, &out) == OC_OK);
+        CHECK(out.chosen_version == 2 && out.server_time == 1751200000000ull);
+    }
+    {
+        oc_reject in = { OC_ERR_VERSION_TOO_OLD, oc_slice_str("please update") };
+        ROUNDTRIP(oc_encode_reject(&w, &in), OC_MSG_REJECT, h, p);
+        /* REJECT matters most: it is the frame sent TO a peer whose version we
+         * have just refused, so it is the one that must be decodable by a peer
+         * that agrees with us about nothing else. */
+        CHECK(h.version == 1);
+        oc_reject out;
+        CHECK(oc_decode_reject(&p, &out) == OC_OK);
+        CHECK(out.code == OC_ERR_VERSION_TOO_OLD);
+        CHECK(slice_eq_str(out.message, "please update"));
+    }
+}
+
+static void test_auth_frames(void) {
+    {
+        /* AUTH_CHALLENGE — the sources this deployment signs people in with. */
+        oc_auth_challenge in;
+        memset(&in, 0, sizeof in);
+        in.n_sources = 2;
+        in.sources[0] = (oc_auth_source){ oc_slice_str("local"), OC_SOURCE_LOCAL, oc_slice_str("Password") };
+        in.sources[1] = (oc_auth_source){ oc_slice_str("relay"), OC_SOURCE_RELAY, oc_slice_str("Continue in your browser") };
+        ROUNDTRIP(oc_encode_auth_challenge(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_CHALLENGE, h, p);
+        oc_auth_challenge out;
+        CHECK(oc_decode_auth_challenge(&p, &out) == OC_OK);
+        CHECK(out.n_sources == 2);
+        CHECK(slice_eq_str(out.sources[0].id, "local") && out.sources[0].kind == OC_SOURCE_LOCAL);
+        CHECK(slice_eq_str(out.sources[1].id, "relay") && out.sources[1].kind == OC_SOURCE_RELAY);
+        CHECK(slice_eq_str(out.sources[1].label, "Continue in your browser"));
+    }
+    {
+        /* A count past the ceiling is a malformed frame, not a truncated list. */
+        oc_auth_challenge in;
+        memset(&in, 0, sizeof in);
+        in.n_sources = 1;
+        in.sources[0] = (oc_auth_source){ oc_slice_str("local"), OC_SOURCE_LOCAL, oc_slice_str("Password") };
+        ROUNDTRIP(oc_encode_auth_challenge(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_CHALLENGE, h, p);
+        frame[OC_HEADER_SIZE] = OC_MAX_SOURCES + 1;
+        CHECK(oc_parse_frame(frame, w.len, &h, &p) == OC_OK);
+        oc_auth_challenge out;
+        CHECK(oc_decode_auth_challenge(&p, &out) != OC_OK);
+    }
+    {
+        /* AUTH_BEGIN / AUTH_REDIRECT / AUTH_CONTINUE — a browser sign-in (AUTH.md §8.1). */
+        oc_auth_begin in = { oc_slice_str("relay"), oc_slice_str("http://127.0.0.1:53111/cb"),
+                             oc_slice_str("47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU") };
+        ROUNDTRIP(oc_encode_auth_begin(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_BEGIN, h, p);
+        oc_auth_begin out;
+        CHECK(oc_decode_auth_begin(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.source, "relay"));
+        CHECK(slice_eq_str(out.redirect_uri, "http://127.0.0.1:53111/cb"));
+        CHECK(out.challenge.len == 43);
+    }
+    {
+        oc_auth_redirect in = { oc_slice_str("https://central.example/oidc/authorize?workspace=ws_1") };
+        ROUNDTRIP(oc_encode_auth_redirect(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_REDIRECT, h, p);
+        oc_auth_redirect out;
+        CHECK(oc_decode_auth_redirect(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.authorize_url, "https://central.example/oidc/authorize?workspace=ws_1"));
+    }
+    {   /* A device code's four frames (AUTH.md §8.11). */
+        oc_auth_device_begin in = { oc_slice_str("local"), oc_slice_str("47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU") };
+        ROUNDTRIP(oc_encode_auth_device_begin(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_DEVICE_BEGIN, h, p);
+        oc_auth_device_begin out;
+        CHECK(oc_decode_auth_device_begin(&p, &out) == OC_OK && slice_eq_str(out.source, "local") &&
+              out.challenge.len == 43);
+    }
+    {
+        oc_auth_device in = { oc_slice_str("dc-secret"), oc_slice_str("WDJB-MJHT"), oc_slice_str("/device"), 5, 600 };
+        ROUNDTRIP(oc_encode_auth_device(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_DEVICE, h, p);
+        oc_auth_device out;
+        CHECK(oc_decode_auth_device(&p, &out) == OC_OK && slice_eq_str(out.device_code, "dc-secret") &&
+              slice_eq_str(out.user_code, "WDJB-MJHT") && slice_eq_str(out.verification_path, "/device") &&
+              out.interval_s == 5 && out.expires_in_s == 600);
+    }
+    {
+        oc_auth_device_poll in = { oc_slice_str("dc-secret") };
+        ROUNDTRIP(oc_encode_auth_device_poll(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_DEVICE_POLL, h, p);
+        oc_auth_device_poll out;
+        CHECK(oc_decode_auth_device_poll(&p, &out) == OC_OK && slice_eq_str(out.device_code, "dc-secret"));
+    }
+    {
+        oc_auth_device_token in = { oc_slice_str("aaa.bbb.ccc") };
+        ROUNDTRIP(oc_encode_auth_device_token(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_DEVICE_TOKEN, h, p);
+        oc_auth_device_token out;
+        CHECK(oc_decode_auth_device_token(&p, &out) == OC_OK && slice_eq_str(out.token, "aaa.bbb.ccc"));
+    }
+    {
+        oc_auth_continue in = { OC_AUTH_STEP_TOTP };
+        ROUNDTRIP(oc_encode_auth_continue(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_CONTINUE, h, p);
+        oc_auth_continue out;
+        CHECK(oc_decode_auth_continue(&p, &out) == OC_OK && out.step == OC_AUTH_STEP_TOTP);
+    }
+    {
+        /* AUTH: method-discriminated credential (here a page's token). */
+        oc_auth in = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str("eyJ.the.token"),
+                       oc_slice_str("the-verifier"), oc_slice_str("the-state") };
+        ROUNDTRIP(oc_encode_auth(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH, h, p);
+        oc_auth out;
+        CHECK(oc_decode_auth(&p, &out) == OC_OK);
+        CHECK(out.state.len == 9 && memcmp(out.state.ptr, "the-state", 9) == 0);   /* protocol 22 */
+        CHECK(out.method == OC_AUTH_OIDC);
+        CHECK(slice_eq_str(out.credential, "eyJ.the.token"));
+    }
+    {
+        /* AUTH_OK — carries the tenant role and a fresh 32-byte session token. */
+        uint8_t token[OC_SESSION_TOKEN_LEN];
+        memset(token, 0xA5, sizeof token);
+        oc_auth_ok in = { 42, OC_ROLE_OWNER, 1751200999000ull,
+                          { token, sizeof token } };
+        ROUNDTRIP(oc_encode_auth_ok(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_OK, h, p);
+        oc_auth_ok out;
+        CHECK(oc_decode_auth_ok(&p, &out) == OC_OK);
+        CHECK(out.user_id == 42 && out.role == OC_ROLE_OWNER);
+        CHECK(out.session_expiry == 1751200999000ull);
+        CHECK(out.session_token.len == OC_SESSION_TOKEN_LEN);
+        CHECK(memcmp(out.session_token.ptr, token, sizeof token) == 0);
+    }
+    {
+        /* WORKSPACE_INFO — deployment mode + user cap + (optional) name. */
+        oc_workspace_info in = { 2 /* managed */, 500, oc_slice_str("Acme HQ"), 10, OC_WS_MODE_DEMO,
+                                 160ull * 1024 * 1024 };
+        ROUNDTRIP(oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WORKSPACE_INFO, h, p);
+        oc_workspace_info out;
+        CHECK(oc_decode_workspace_info(&p, &out) == OC_OK);
+        CHECK(out.deployment_mode == 2 && out.max_users == 500 && out.call_max == 10 && out.mode == OC_WS_MODE_DEMO);
+        CHECK(out.max_video_size == 160ull * 1024 * 1024);
+        CHECK(slice_eq_str(out.workspace_name, "Acme HQ"));
+    }
+    {
+        /* WORKSPACE_INFO — empty name (client derives from the host subdomain). */
+        oc_workspace_info in = { 0, 0, oc_slice_str(""), 0, 0, 0 };
+        ROUNDTRIP(oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WORKSPACE_INFO, h, p);
+        oc_workspace_info out;
+        CHECK(oc_decode_workspace_info(&p, &out) == OC_OK);
+        CHECK(out.deployment_mode == 0 && out.max_users == 0);
+        CHECK(slice_eq_str(out.workspace_name, ""));
+    }
+    {
+        /* WORKSPACE_ADDRESS — where a workspace that moved is now. */
+        oc_workspace_address in = { oc_slice_str("acme-new.workspace.openchime.io") };
+        ROUNDTRIP(oc_encode_workspace_address(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WORKSPACE_ADDRESS, h, p);
+        oc_workspace_address out;
+        CHECK(oc_decode_workspace_address(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.address, "acme-new.workspace.openchime.io"));
+    }
+    {
+        /* SERVER_BUILD — the daemon's build id. */
+        oc_server_build in = { oc_slice_str("74359c0") };
+        ROUNDTRIP(oc_encode_server_build(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SERVER_BUILD, h, p);
+        oc_server_build out;
+        CHECK(oc_decode_server_build(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.build, "74359c0"));
+    }
+    {
+        /* LOGOUT — scope + the session token to revoke. */
+        uint8_t token[OC_SESSION_TOKEN_LEN];
+        memset(token, 0x3C, sizeof token);
+        oc_logout in = { OC_LOGOUT_THIS, { token, sizeof token } };
+        ROUNDTRIP(oc_encode_logout(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LOGOUT, h, p);
+        oc_logout out;
+        CHECK(oc_decode_logout(&p, &out) == OC_OK);
+        CHECK(out.scope == OC_LOGOUT_THIS);
+        CHECK(out.session_token.len == OC_SESSION_TOKEN_LEN);
+        CHECK(memcmp(out.session_token.ptr, token, sizeof token) == 0);
+    }
+}
+
+static void test_messaging_frames(void) {
+    uint8_t idem[OC_IDEM_SIZE];
+    for (int i = 0; i < (int)OC_IDEM_SIZE; i++) idem[i] = (uint8_t)(0xA0 + i);
+    {
+        oc_send in = {0}; in.channel_id = 7; memcpy(in.idem, idem, OC_IDEM_SIZE);
+        in.body = oc_slice_str("hello channel");
+        ROUNDTRIP(oc_encode_send(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEND, h, p);
+        oc_send out = {0};
+        CHECK(oc_decode_send(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7);
+        CHECK(memcmp(out.idem, idem, OC_IDEM_SIZE) == 0);
+        CHECK(slice_eq_str(out.body, "hello channel"));
+        CHECK(out.src_channel == 0 && out.src_message == 0);   /* not a forward */
+    }
+    {
+        /* SEND carrying a forward source (REQ-057), with and without the
+         * optional attachment tail behind it — the tail is what the two new
+         * fixed fields sit in front of, so both orders have to decode. */
+        oc_send in = {0}; in.channel_id = 7; memcpy(in.idem, idem, OC_IDEM_SIZE);
+        in.body = oc_slice_str("worth reading");
+        in.src_channel = 3; in.src_message = 909;
+        ROUNDTRIP(oc_encode_send(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEND, h, p);
+        oc_send out = {0};
+        CHECK(oc_decode_send(&p, &out) == OC_OK);
+        CHECK(out.src_channel == 3 && out.src_message == 909);
+        CHECK(slice_eq_str(out.body, "worth reading"));
+        CHECK(out.n_attach == 0);
+    }
+    {
+        oc_send in = {0}; in.channel_id = 7; memcpy(in.idem, idem, OC_IDEM_SIZE);
+        in.body = oc_slice_str("with a file");
+        in.src_channel = 3; in.src_message = 909;
+        in.n_attach = 1; in.attach_ids[0] = 555;
+        ROUNDTRIP(oc_encode_send(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEND, h, p);
+        oc_send out = {0};
+        CHECK(oc_decode_send(&p, &out) == OC_OK);
+        CHECK(out.src_channel == 3 && out.src_message == 909);
+        CHECK(out.n_attach == 1 && out.attach_ids[0] == 555);
+    }
+    {
+        oc_send_ack in; memcpy(in.idem, idem, OC_IDEM_SIZE);
+        in.channel_id = 7; in.message_id = 1001; in.server_time = 1751200500000ull;
+        ROUNDTRIP(oc_encode_send_ack(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEND_ACK, h, p);
+        oc_send_ack out;
+        CHECK(oc_decode_send_ack(&p, &out) == OC_OK);
+        CHECK(memcmp(out.idem, idem, OC_IDEM_SIZE) == 0);
+        CHECK(out.channel_id == 7 && out.message_id == 1001);
+        CHECK(out.server_time == 1751200500000ull);
+    }
+    {
+        oc_broadcast in = { 1001, 7, 42, 1751200500000ull, 0, oc_slice_str("hello channel"), 0, {{0}}, {0} };
+        ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
+        oc_broadcast out;
+        CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1001 && out.channel_id == 7 && out.author_id == 42);
+        CHECK(slice_eq_str(out.body, "hello channel"));
+    }
+    {
+        oc_client_ack in = { 7, 1001 };
+        ROUNDTRIP(oc_encode_client_ack(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CLIENT_ACK, h, p);
+        oc_client_ack out;
+        CHECK(oc_decode_client_ack(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.message_id == 1001);
+    }
+    {
+        oc_edit in = { 7, 1001, oc_slice_str("edited body") };
+        ROUNDTRIP(oc_encode_edit(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_EDIT, h, p);
+        oc_edit out;
+        CHECK(oc_decode_edit(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.message_id == 1001);
+        CHECK(slice_eq_str(out.body, "edited body"));
+    }
+    {
+        oc_delete in = { 7, 1001 };
+        ROUNDTRIP(oc_encode_delete(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DELETE, h, p);
+        oc_delete out;
+        CHECK(oc_decode_delete(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.message_id == 1001);
+    }
+    {
+        oc_msg_edited in = { 1001, 7, 42, 1751200500000ull, oc_slice_str("edited body") };
+        ROUNDTRIP(oc_encode_msg_edited(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MSG_EDITED, h, p);
+        oc_msg_edited out;
+        CHECK(oc_decode_msg_edited(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1001 && out.channel_id == 7 && out.author_id == 42);
+        CHECK(out.edited_at == 1751200500000ull);
+        CHECK(slice_eq_str(out.body, "edited body"));
+    }
+    {
+        oc_msg_deleted in = { 1001, 7, 42, 9, 1751200500000ull };
+        ROUNDTRIP(oc_encode_msg_deleted(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MSG_DELETED, h, p);
+        oc_msg_deleted out;
+        CHECK(oc_decode_msg_deleted(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1001 && out.channel_id == 7 && out.author_id == 42);
+        CHECK(out.deleted_by == 9 && out.deleted_at == 1751200500000ull);
+    }
+}
+
+static void test_thread_frames(void) {
+    uint8_t idem[OC_IDEM_SIZE];
+    for (int i = 0; i < (int)OC_IDEM_SIZE; i++) idem[i] = (uint8_t)(0xC0 + i);
+    {
+        oc_send_reply in = {0}; in.channel_id = 7; memcpy(in.idem, idem, OC_IDEM_SIZE);
+        in.parent_id = 500; in.body = oc_slice_str("a reply");
+        in.n_attach = 1; in.attach_ids[0] = 321;   /* REQ-140 thread attachment */
+        ROUNDTRIP(oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEND_REPLY, h, p);
+        oc_send_reply out = {0};
+        CHECK(oc_decode_send_reply(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.parent_id == 500);
+        CHECK(memcmp(out.idem, idem, OC_IDEM_SIZE) == 0);
+        CHECK(slice_eq_str(out.body, "a reply"));
+        CHECK(out.n_attach == 1 && out.attach_ids[0] == 321);
+    }
+    /* THREAD_REPLY, participant set, WITH the optional attachment tail behind
+     * it. `participant` is a fixed field sitting in front of that tail, so both
+     * orders have to decode — the tail is exactly what a misplaced fixed field
+     * runs into. */
+    {
+        oc_thread_reply in = { .message_id = 1002, .channel_id = 7, .parent_id = 500,
+                               .author_id = 42, .server_time = 1751200500000ull,
+                               .reply_count = 3, .participant = 1,
+                               .body = oc_slice_str("a reply") };
+        in.n_attach = 1; in.attach[0].id = 321; in.attach[0].filename = oc_slice_str("t.pdf");
+        in.attach[0].mime = oc_slice_str("application/pdf"); in.attach[0].size = 88;
+        ROUNDTRIP(oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_REPLY, h, p);
+        oc_thread_reply out = {0};
+        CHECK(oc_decode_thread_reply(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1002 && out.channel_id == 7 && out.parent_id == 500);
+        CHECK(out.author_id == 42 && out.server_time == 1751200500000ull && out.reply_count == 3);
+        CHECK(out.participant == 1);
+        CHECK(slice_eq_str(out.body, "a reply"));
+        CHECK(out.n_attach == 1 && out.attach[0].id == 321 && out.attach[0].size == 88);
+        CHECK(slice_eq_str(out.attach[0].filename, "t.pdf"));
+    }
+    /* The same frame with participant clear and NO tail — the common case, and
+     * the one where a stray byte would be read as the start of an attachment
+     * count rather than simply shifting a field. */
+    {
+        oc_thread_reply in = { .message_id = 1003, .channel_id = 7, .parent_id = 500,
+                               .author_id = 42, .server_time = 1751200500001ull,
+                               .reply_count = 4, .participant = 0,
+                               .body = oc_slice_str("not yours") };
+        ROUNDTRIP(oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_REPLY, h, p);
+        oc_thread_reply out = {0};
+        CHECK(oc_decode_thread_reply(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1003 && out.reply_count == 4);
+        CHECK(out.participant == 0);
+        CHECK(slice_eq_str(out.body, "not yours"));
+        CHECK(out.n_attach == 0);
+    }
+    /* Participant set, no tail: the byte must not be mistaken for one. */
+    {
+        oc_thread_reply in = { .message_id = 1004, .channel_id = 7, .parent_id = 500,
+                               .author_id = 42, .server_time = 1751200500002ull,
+                               .reply_count = 5, .participant = 1,
+                               .body = oc_slice_str("") };
+        ROUNDTRIP(oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_REPLY, h, p);
+        oc_thread_reply out = {0};
+        CHECK(oc_decode_thread_reply(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1004 && out.participant == 1 && out.n_attach == 0);
+        CHECK(out.body.len == 0);
+    }
+    {
+        oc_list_thread in = { 7, 500 };
+        ROUNDTRIP(oc_encode_list_thread(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_THREAD, h, p);
+        oc_list_thread out;
+        CHECK(oc_decode_list_thread(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.parent_id == 500);
+    }
+    {
+        oc_thread in = { 500, 3, 1 };
+        ROUNDTRIP(oc_encode_thread(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD, h, p);
+        oc_thread out;
+        CHECK(oc_decode_thread(&p, &out) == OC_OK);
+        CHECK(out.truncated == 1);
+        CHECK(out.parent_id == 500 && out.count == 3);
+    }
+    {
+        oc_thread_meta in = { 500, 3, 1751200500000ull };
+        ROUNDTRIP(oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_META, h, p);
+        oc_thread_meta out;
+        CHECK(oc_decode_thread_meta(&p, &out) == OC_OK);
+        CHECK(out.message_id == 500 && out.reply_count == 3 && out.last_reply_at == 1751200500000ull);
+    }
+}
+
+/* The CROSS-CHANNEL thread view's frames (REQ-062, ARCH-104) — a different set
+ * from the ones above, which open one thread in one channel.
+ *
+ * THREAD_SUMMARY is the one that earns the care: it is a repeated list, streamed
+ * one frame per thread, and a repeated list is the shape where an added or
+ * misplaced field shifts every entry after the first rather than corrupting the
+ * one it is in. That is the failure the protocol version exists to make loud,
+ * and it has moved for exactly this reason before (USER_LIST, twice). */
+/* A frame that fails to encode is taken back OUT of the buffer (oc_frame_end),
+ * so `w.len` only ever ends on a whole frame. Pinned from all three sides,
+ * because the callers that never check the result -- most of them -- are exactly
+ * the ones this protects: they send `w.len`, and it must not include half a frame
+ * with an unwritten length. */
+static void test_failed_frame_rolls_back(void) {
+    static uint8_t big[2 * OC_MAX_FRAME_SIZE];
+    static oc_channel_list_entry ents[300];
+    static char topic[OC_MAX_TOPIC + 1];
+    memset(topic, 'T', OC_MAX_TOPIC); topic[OC_MAX_TOPIC] = '\0';
+    for (int i = 0; i < 300; i++) {
+        memset(&ents[i], 0, sizeof ents[i]);
+        ents[i].channel_id = (uint64_t)(i + 1);
+        ents[i].name = oc_slice_str("a-channel");
+        ents[i].topic = oc_slice_str(topic);
+        ents[i].kind = OC_CHANNEL_KIND;
+    }
+    oc_channel_list huge = { 300, ents };   /* ~110 KB: past the frame limit */
+
+    /* 1. It does not fit the BUFFER: overflow, and nothing is left behind. */
+    {
+        uint8_t small[512]; oc_wbuf w; oc_wbuf_init(&w, small, sizeof small);
+        CHECK(oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &huge) == OC_E_OVERFLOW);
+        CHECK(w.len == 0);
+    }
+    /* 2. It fits the buffer but not the WIRE: too large, and nothing left behind. */
+    {
+        oc_wbuf w; oc_wbuf_init(&w, big, sizeof big);
+        CHECK(oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &huge) == OC_E_TOO_LARGE);
+        CHECK(w.len == 0);
+    }
+    /* 3. After a good frame: the good one survives whole, the bad one is gone,
+     *    and what is in the buffer still parses as exactly that good frame. */
+    {
+        uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_mark_all_read(&w, OC_PROTOCOL_VERSION) == OC_OK);
+        size_t good = w.len;
+        CHECK(oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &huge) == OC_E_OVERFLOW);
+        CHECK(w.len == good);
+        oc_header h; oc_rbuf pl;
+        CHECK(oc_parse_frame(buf, w.len, &h, &pl) == OC_OK);
+        CHECK(h.msg_type == OC_MSG_MARK_ALL_READ && (size_t)h.length + 4u == good);
+    }
+}
+
+/* MARK_ALL_READ has no body: the frame's presence is the whole message. Pinned,
+ * because "no body" is a layout -- a field added later is a version bump, and a
+ * payload that grew without one is what this catches. */
+/* The two description frames (REQ-034), including an empty description -- the
+ * daemon's answer when none is set, which must round-trip as empty and not as
+ * a decode error. */
+static void test_channel_description_frames(void) {
+    {
+        oc_get_channel_description in = { 4242 };
+        ROUNDTRIP(oc_encode_get_channel_description(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_GET_CHANNEL_DESCRIPTION, h, p);
+        oc_get_channel_description out;
+        CHECK(oc_decode_get_channel_description(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 4242);
+    }
+    {
+        oc_channel_description in = { 4242, oc_slice_str("Purpose, norms, links.") };
+        ROUNDTRIP(oc_encode_channel_description(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_CHANNEL_DESCRIPTION, h, p);
+        oc_channel_description out;
+        CHECK(oc_decode_channel_description(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 4242);
+        CHECK(out.description.len == strlen("Purpose, norms, links.") &&
+              memcmp(out.description.ptr, "Purpose, norms, links.", out.description.len) == 0);
+    }
+    {
+        oc_channel_description in = { 7, oc_slice_str("") };
+        ROUNDTRIP(oc_encode_channel_description(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_CHANNEL_DESCRIPTION, h, p);
+        oc_channel_description out;
+        CHECK(oc_decode_channel_description(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.description.len == 0);
+    }
+}
+
+static void test_mark_all_read_frame(void) {
+    ROUNDTRIP(oc_encode_mark_all_read(&w, OC_PROTOCOL_VERSION), OC_MSG_MARK_ALL_READ, h, p);
+    CHECK(h.version == OC_PROTOCOL_VERSION);
+    CHECK(p.len == 0);
+}
+
+static void test_thread_list_frames(void) {
+    {
+        oc_list_threads in = { OC_THREADF_UNREAD };
+        ROUNDTRIP(oc_encode_list_threads(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_THREADS, h, p);
+        oc_list_threads out;
+        CHECK(oc_decode_list_threads(&p, &out) == OC_OK);
+        CHECK(out.filter == OC_THREADF_UNREAD);
+    }
+    {
+        oc_list_threads in = { OC_THREADF_ALL };
+        ROUNDTRIP(oc_encode_list_threads(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_THREADS, h, p);
+        oc_list_threads out;
+        CHECK(oc_decode_list_threads(&p, &out) == OC_OK);
+        CHECK(out.filter == OC_THREADF_ALL);
+    }
+    /* Every field distinct, and none of them a value another field could hold —
+     * a round-trip whose fields all read 0 or 1 passes just as happily when two
+     * of them are swapped. */
+    {
+        oc_thread_summary in = { 0 };
+        in.root_id = 0x1122334455667788ull;
+        in.channel_id = 77;
+        in.root_author = 4242;
+        in.root_at = 1751200500000ull;
+        in.last_reply_at = 1751200999000ull;
+        in.reply_count = 17;
+        in.unread = 5;
+        in.following = 1;
+        in.preview = oc_slice_str("the root's first line");
+        ROUNDTRIP(oc_encode_thread_summary(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_SUMMARY, h, p);
+        oc_thread_summary out = { 0 };
+        CHECK(oc_decode_thread_summary(&p, &out) == OC_OK);
+        CHECK(out.root_id == 0x1122334455667788ull);
+        CHECK(out.channel_id == 77 && out.root_author == 4242);
+        CHECK(out.root_at == 1751200500000ull && out.last_reply_at == 1751200999000ull);
+        /* reply_count and unread are adjacent u32s of the same width: the one
+         * pair a shifted field would swap without any decode error at all. */
+        CHECK(out.reply_count == 17 && out.unread == 5);
+        CHECK(out.following == 1);
+        CHECK(slice_eq_str(out.preview, "the root's first line"));
+    }
+    /* An unfollowed thread with nothing unread and no preview. `following` is
+     * the flag the client drops a row on, so the false case has to decode as
+     * false rather than as whatever the last frame left behind. */
+    {
+        oc_thread_summary in = { 0 };
+        in.root_id = 900; in.channel_id = 1; in.root_author = 2;
+        in.reply_count = 0; in.unread = 0; in.following = 0;
+        in.preview = oc_slice_str("");
+        ROUNDTRIP(oc_encode_thread_summary(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_SUMMARY, h, p);
+        oc_thread_summary out = { 0 };
+        out.following = 1;                       /* poison: must be overwritten */
+        CHECK(oc_decode_thread_summary(&p, &out) == OC_OK);
+        CHECK(out.root_id == 900 && out.following == 0);
+        CHECK(out.reply_count == 0 && out.unread == 0 && out.preview.len == 0);
+    }
+    /* Two summaries back to back in ONE buffer, decoded in sequence. This is how
+     * they actually arrive, and it is the only arrangement that catches an
+     * encoder writing a field the decoder does not read: a single frame is
+     * bounded by its own length and hides the drift. */
+    {
+        oc_thread_summary a = { 0 }, b = { 0 };
+        a.root_id = 11; a.channel_id = 1; a.root_author = 2; a.root_at = 100;
+        a.last_reply_at = 200; a.reply_count = 3; a.unread = 1; a.following = 1;
+        a.preview = oc_slice_str("first");
+        b.root_id = 22; b.channel_id = 2; b.root_author = 3; b.root_at = 300;
+        b.last_reply_at = 400; b.reply_count = 9; b.unread = 4; b.following = 0;
+        b.preview = oc_slice_str("second");
+        oc_wbuf w2; oc_wbuf_init(&w2, frame, sizeof frame);
+        CHECK(oc_encode_thread_summary(&w2, OC_PROTOCOL_VERSION, &a) == OC_OK);
+        CHECK(oc_encode_thread_summary(&w2, OC_PROTOCOL_VERSION, &b) == OC_OK);
+        size_t pos = 0;
+        oc_thread_summary got[2] = {{0}};
+        for (int i = 0; i < 2; i++) {
+            oc_header hh; oc_rbuf pp;
+            CHECK(oc_parse_frame(frame + pos, w2.len - pos, &hh, &pp) == OC_OK);
+            CHECK(hh.msg_type == OC_MSG_THREAD_SUMMARY);
+            CHECK(oc_decode_thread_summary(&pp, &got[i]) == OC_OK);
+            pos += (size_t)hh.length + 4u;
+        }
+        CHECK(pos == w2.len);                    /* nothing left over, nothing short */
+        CHECK(got[0].root_id == 11 && got[0].unread == 1 && got[0].following == 1);
+        CHECK(slice_eq_str(got[0].preview, "first"));
+        CHECK(got[1].root_id == 22 && got[1].unread == 4 && got[1].following == 0);
+        CHECK(slice_eq_str(got[1].preview, "second"));
+    }
+    {
+        oc_threads in = { 42 };
+        ROUNDTRIP(oc_encode_threads(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREADS, h, p);
+        oc_threads out;
+        CHECK(oc_decode_threads(&p, &out) == OC_OK);
+        CHECK(out.count == 42);
+    }
+    {
+        oc_set_thread_follow in = { 500, 7, 1 };
+        ROUNDTRIP(oc_encode_set_thread_follow(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_THREAD_FOLLOW, h, p);
+        oc_set_thread_follow out = { 0, 0, 0 };
+        CHECK(oc_decode_set_thread_follow(&p, &out) == OC_OK);
+        CHECK(out.root_id == 500 && out.channel_id == 7 && out.on == 1);
+    }
+    {   /* The unfollow, which outranks having replied — so it must survive the
+         * wire as 0 and not as "field absent". */
+        oc_set_thread_follow in = { 501, 8, 0 };
+        ROUNDTRIP(oc_encode_set_thread_follow(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_THREAD_FOLLOW, h, p);
+        oc_set_thread_follow out = { 0, 0, 1 };  /* poison */
+        CHECK(oc_decode_set_thread_follow(&p, &out) == OC_OK);
+        CHECK(out.root_id == 501 && out.channel_id == 8 && out.on == 0);
+    }
+    {
+        oc_mark_thread_read in = { 500, 1234 };
+        ROUNDTRIP(oc_encode_mark_thread_read(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MARK_THREAD_READ, h, p);
+        oc_mark_thread_read out;
+        CHECK(oc_decode_mark_thread_read(&p, &out) == OC_OK);
+        CHECK(out.root_id == 500 && out.up_to == 1234);
+    }
+    {   /* up_to 0 means "everything in it", which is what opening a thread
+         * means — a documented value, not an unset field. */
+        oc_mark_thread_read in = { 500, 0 };
+        ROUNDTRIP(oc_encode_mark_thread_read(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MARK_THREAD_READ, h, p);
+        oc_mark_thread_read out = { 0, 999 };    /* poison */
+        CHECK(oc_decode_mark_thread_read(&p, &out) == OC_OK);
+        CHECK(out.root_id == 500 && out.up_to == 0);
+    }
+}
+
+static void test_unfurl_frame(void) {
+    /* UNFURL (REQ-222, ARCH-105): the async preview fan-out + backfill replay. */
+    oc_unfurl in = { 1001, 7, oc_slice_str("https://example.com/a"),
+                     oc_slice_str("Example Title"), oc_slice_str("A description.") };
+    ROUNDTRIP(oc_encode_unfurl(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UNFURL, h, p);
+    oc_unfurl out;
+    CHECK(oc_decode_unfurl(&p, &out) == OC_OK);
+    CHECK(out.message_id == 1001 && out.channel_id == 7);
+    CHECK(slice_eq_str(out.url, "https://example.com/a"));
+    CHECK(slice_eq_str(out.title, "Example Title"));
+    CHECK(slice_eq_str(out.descr, "A description."));
+}
+
+static void test_forward_frame(void) {
+    /* FORWARD (REQ-057): the resolved reference, fanned after the BROADCAST and
+     * replayed on backfill. Populated and empty, per TESTING.md 2.2. */
+    {
+        oc_forward in = { 1001, 7, 3, 909, 42, oc_slice_str("the original text"), 2,
+                          oc_slice_str("report.txt"), 0 };
+        ROUNDTRIP(oc_encode_forward(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FORWARD, h, p);
+        oc_forward out;
+        CHECK(oc_decode_forward(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1001 && out.channel_id == 7);
+        CHECK(out.src_channel == 3 && out.src_message == 909 && out.src_author == 42);
+        CHECK(slice_eq_str(out.src_excerpt, "the original text"));
+        CHECK(out.n_attach == 2);
+        CHECK(slice_eq_str(out.src_attach_name, "report.txt"));
+        CHECK(out.src_action == 0);
+    }
+    {
+        /* An empty excerpt is ordinary: a message can be nothing but a file. */
+        oc_forward in = { 1002, 7, 3, 910, 42, oc_slice_str(""), 0, oc_slice_str(""), 0 };
+        ROUNDTRIP(oc_encode_forward(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FORWARD, h, p);
+        oc_forward out;
+        CHECK(oc_decode_forward(&p, &out) == OC_OK);
+        CHECK(out.src_excerpt.len == 0 && out.n_attach == 0);
+        CHECK(out.src_attach_name.len == 0);
+        CHECK(out.src_message == 910);
+    }
+    {
+        /* A forward of an action (REQ-058): the excerpt is its text, and the
+         * flag is the last byte, so a dropped one fails the decode. */
+        oc_forward in = { 1003, 7, 3, 911, 42, oc_slice_str("is away"), 0, oc_slice_str(""), 1 };
+        ROUNDTRIP(oc_encode_forward(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FORWARD, h, p);
+        oc_forward out;
+        CHECK(oc_decode_forward(&p, &out) == OC_OK);
+        CHECK(out.src_action == 1 && slice_eq_str(out.src_excerpt, "is away"));
+    }
+}
+
+/* Polls (REQ-225): each frame both ways, and an option count past the cap
+ * refused rather than read into a fixed array. */
+static void test_poll_frames(void) {
+    {
+        oc_post_poll in;
+        memset(&in, 0, sizeof in);
+        in.channel_id = 7; in.parent_id = 900; memset(in.idem, 0xAB, OC_IDEM_SIZE);
+        in.question = oc_slice_str("Lunch?"); in.flags = OC_POLL_MULTI | OC_POLL_ANONYMOUS;
+        in.close_at_ms = 1700000000000ull; in.n_options = 3;
+        in.options[0] = oc_slice_str("Tacos"); in.options[1] = oc_slice_str("Soup");
+        in.options[2] = oc_slice_str("");
+        ROUNDTRIP(oc_encode_post_poll(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_POST_POLL, h, p);
+        oc_post_poll out;
+        CHECK(oc_decode_post_poll(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.parent_id == 900 && out.idem[0] == 0xAB && out.idem[OC_IDEM_SIZE - 1] == 0xAB);
+        CHECK(slice_eq_str(out.question, "Lunch?"));
+        CHECK(out.flags == (OC_POLL_MULTI | OC_POLL_ANONYMOUS) && out.close_at_ms == 1700000000000ull);
+        CHECK(out.n_options == 3 && slice_eq_str(out.options[1], "Soup") && out.options[2].len == 0);
+    }
+    {
+        oc_vote in = { 7, 1001, 2, { 0, 2 } };
+        ROUNDTRIP(oc_encode_vote(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_VOTE, h, p);
+        oc_vote out;
+        CHECK(oc_decode_vote(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.message_id == 1001 && out.count == 2);
+        CHECK(out.picks[0] == 0 && out.picks[1] == 2);
+    }
+    {
+        /* No picks: the vote withdrawn. */
+        oc_vote in = { 7, 1001, 0, { 0 } };
+        ROUNDTRIP(oc_encode_vote(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_VOTE, h, p);
+        oc_vote out;
+        CHECK(oc_decode_vote(&p, &out) == OC_OK);
+        CHECK(out.count == 0);
+    }
+    {
+        oc_poll_msg in;
+        memset(&in, 0, sizeof in);
+        in.message_id = 1001; in.channel_id = 7; in.flags = OC_POLL_MULTI | OC_POLL_HAS_MINE;
+        in.close_at_ms = 5; in.voters = 4; in.mine = 0x5; in.n_options = 3;
+        in.options[0] = (oc_poll_option){ oc_slice_str("Tacos"), 3 };
+        in.options[1] = (oc_poll_option){ oc_slice_str("Soup"), 0 };
+        in.options[2] = (oc_poll_option){ oc_slice_str("Salad"), 2 };
+        ROUNDTRIP(oc_encode_poll(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_POLL, h, p);
+        oc_poll_msg out;
+        CHECK(oc_decode_poll(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1001 && out.channel_id == 7 && out.close_at_ms == 5);
+        CHECK(out.flags == (OC_POLL_MULTI | OC_POLL_HAS_MINE) && out.voters == 4 && out.mine == 0x5);
+        CHECK(out.n_options == 3 && slice_eq_str(out.options[2].label, "Salad") && out.options[2].count == 2);
+        CHECK(out.options[1].count == 0);
+    }
+    {
+        oc_list_poll_voters in = { 7, 1001 };
+        ROUNDTRIP(oc_encode_list_poll_voters(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_POLL_VOTERS, h, p);
+        oc_list_poll_voters out;
+        CHECK(oc_decode_list_poll_voters(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.message_id == 1001);
+    }
+    {
+        oc_poll_voter in[3] = { { 0, 42 }, { 2, 42 }, { 1, 43 } };
+        ROUNDTRIP(oc_encode_poll_voters(&w, OC_PROTOCOL_VERSION, 1001, in, 3), OC_MSG_POLL_VOTERS, h, p);
+        oc_poll_voter out[2]; uint16_t n = 0; uint64_t mid = 0;
+        CHECK(oc_decode_poll_voters(&p, out, 2, &n, &mid) == OC_OK);
+        CHECK(mid == 1001 && n == 3);
+        CHECK(out[0].option == 0 && out[0].user_id == 42 && out[1].option == 2);
+    }
+    {
+        oc_edit_poll in;
+        memset(&in, 0, sizeof in);
+        in.channel_id = 7; in.message_id = 1001; in.flags = OC_POLL_MULTI; in.close_at_ms = 99;
+        in.n_options = 2; in.options[0] = oc_slice_str("Yes"); in.options[1] = oc_slice_str("No");
+        ROUNDTRIP(oc_encode_edit_poll(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_EDIT_POLL, h, p);
+        oc_edit_poll out;
+        CHECK(oc_decode_edit_poll(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.message_id == 1001 && out.flags == OC_POLL_MULTI && out.close_at_ms == 99);
+        CHECK(out.n_options == 2 && slice_eq_str(out.options[1], "No"));
+    }
+    {
+        /* Eleven options: the encoder clamps to the cap... */
+        oc_post_poll in;
+        memset(&in, 0, sizeof in);
+        in.question = oc_slice_str("q"); in.n_options = OC_POLL_MAX_OPTIONS + 1;
+        for (int i = 0; i < OC_POLL_MAX_OPTIONS; i++) in.options[i] = oc_slice_str("x");
+        ROUNDTRIP(oc_encode_post_poll(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_POST_POLL, h, p);
+        oc_post_poll out;
+        CHECK(oc_decode_post_poll(&p, &out) == OC_OK);
+        CHECK(out.n_options == OC_POLL_MAX_OPTIONS);
+    }
+    {
+        /* ...and a frame that claims more is refused. */
+        uint8_t raw[64]; oc_wbuf w; oc_wbuf_init(&w, raw, sizeof raw);
+        oc_w_u64(&w, 7); oc_w_u64(&w, 1001); oc_w_u8(&w, OC_POLL_MAX_OPTIONS + 1);
+        for (int i = 0; i <= OC_POLL_MAX_OPTIONS; i++) oc_w_u8(&w, 0);
+        oc_rbuf p; oc_rbuf_init(&p, raw, w.len);
+        oc_vote out;
+        CHECK(oc_decode_vote(&p, &out) == OC_E_MALFORMED);
+    }
+}
+
+/* ACTION (REQ-058, ARCH-115), and the action byte every excerpt frame carries.
+ * Each excerpt's flag is the LAST field it writes, so the cases set it to 1:
+ * a decoder that forgot it would read short and fail rather than pass on a 0
+ * it never read. */
+static void test_action_frames(void) {
+    {
+        oc_action in = { 1001, 7, 42, oc_slice_str("GitHub CI"), 4, 7 };
+        ROUNDTRIP(oc_encode_action(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ACTION, h, p);
+        oc_action out;
+        CHECK(oc_decode_action(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1001 && out.channel_id == 7 && out.actor_id == 42);
+        CHECK(slice_eq_str(out.actor_name, "GitHub CI"));
+        CHECK(out.text_start == 4 && out.text_len == 7);
+    }
+    {
+        /* Not (or no longer) an action: text_len 0, and no name. */
+        oc_action in = { 1002, 7, 0, oc_slice_str(""), 0, 0 };
+        ROUNDTRIP(oc_encode_action(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ACTION, h, p);
+        oc_action out;
+        CHECK(oc_decode_action(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1002 && out.text_len == 0 && out.actor_name.len == 0);
+    }
+    {
+        oc_pinned_msg in = { 1001, 7, 42, 5, 43, 6, oc_slice_str("is away"), oc_slice_str(""), 1 };
+        ROUNDTRIP(oc_encode_pinned_msg(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PINNED_MSG, h, p);
+        oc_pinned_msg out;
+        CHECK(oc_decode_pinned_msg(&p, &out) == OC_OK);
+        CHECK(out.action == 1 && slice_eq_str(out.body, "is away") && out.pinned_by == 43);
+    }
+    {
+        oc_saved_msg in = { 1001, 7, 42, 5, 6, oc_slice_str("is away"), oc_slice_str("a.txt"), 1 };
+        ROUNDTRIP(oc_encode_saved_msg(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SAVED_MSG, h, p);
+        oc_saved_msg out;
+        CHECK(oc_decode_saved_msg(&p, &out) == OC_OK);
+        CHECK(out.action == 1 && slice_eq_str(out.body, "is away") && slice_eq_str(out.attach_name, "a.txt"));
+    }
+    {
+        oc_activity_entry in = { 1, 1001, 7, 42, 5, oc_slice_str("waves at @dana"), 1 };
+        ROUNDTRIP(oc_encode_activity_entry(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ACTIVITY_ENTRY, h, p);
+        oc_activity_entry out;
+        CHECK(oc_decode_activity_entry(&p, &out) == OC_OK);
+        CHECK(out.action == 1 && out.actor_id == 42 && slice_eq_str(out.text, "waves at @dana"));
+    }
+    {
+        oc_thread_summary in = { 0 };
+        in.root_id = 900; in.channel_id = 1; in.root_author = 2;
+        in.preview = oc_slice_str("is away"); in.action = 1;
+        ROUNDTRIP(oc_encode_thread_summary(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_SUMMARY, h, p);
+        oc_thread_summary out = { 0 };
+        CHECK(oc_decode_thread_summary(&p, &out) == OC_OK);
+        CHECK(out.action == 1 && slice_eq_str(out.preview, "is away"));
+    }
+    {
+        oc_channel_list_entry ents[2] = {
+            { .channel_id = 1, .name = oc_slice_str("general"), .kind = OC_CHANNEL_KIND,
+              .preview = oc_slice_str("is away"), .preview_author = 42, .preview_action = 1 },
+            { .channel_id = 2, .name = oc_slice_str("random"), .kind = OC_CHANNEL_KIND,
+              .preview = oc_slice_str("/me"), .preview_author = 43, .preview_action = 0 },
+        };
+        oc_channel_list in = { 2, ents };
+        ROUNDTRIP(oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_LIST, h, p);
+        oc_channel_list_entry out[2]; uint16_t n = 0;
+        CHECK(oc_decode_channel_list(&p, out, 2, &n) == OC_OK);
+        CHECK(n == 2 && out[0].preview_action == 1 && out[0].preview_author == 42);
+        CHECK(out[1].preview_action == 0 && slice_eq_str(out[1].preview, "/me"));
+    }
+    {
+        oc_search_result_entry ents[1] = { { 1001, 7, 42, 5, oc_slice_str("is away"), 1 } };
+        oc_search_results in = { 1, ents, 0 };
+        ROUNDTRIP(oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH_RESULTS, h, p);
+        oc_search_result_entry out[1]; uint16_t n = 0; uint8_t trunc = 9;
+        CHECK(oc_decode_search_results(&p, out, 1, &n, &trunc) == OC_OK);
+        CHECK(n == 1 && out[0].action == 1 && trunc == 0);
+    }
+}
+
+static void test_reaction_frames(void) {
+    {
+        oc_react in = { 7, 1001, oc_slice_str("\xF0\x9F\x91\x8D"), OC_REACT_ADD };
+        ROUNDTRIP(oc_encode_react(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REACT, h, p);
+        oc_react out;
+        CHECK(oc_decode_react(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.message_id == 1001 && out.op == OC_REACT_ADD);
+        CHECK(slice_eq_str(out.emoji, "\xF0\x9F\x91\x8D"));
+    }
+    {
+        oc_reaction_updated in = { 1001, 7, 42, oc_slice_str(":tada:"), OC_REACT_ADD, 3 };
+        ROUNDTRIP(oc_encode_reaction_updated(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REACTION_UPDATED, h, p);
+        oc_reaction_updated out;
+        CHECK(oc_decode_reaction_updated(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1001 && out.channel_id == 7 && out.user_id == 42);
+        CHECK(slice_eq_str(out.emoji, ":tada:") && out.op == OC_REACT_ADD && out.count == 3);
+    }
+    {
+        oc_list_reactions in = { 7, 1001 };
+        ROUNDTRIP(oc_encode_list_reactions(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_REACTIONS, h, p);
+        oc_list_reactions out;
+        CHECK(oc_decode_list_reactions(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.message_id == 1001);
+    }
+    {
+        oc_reaction_entry ents[2] = {
+            { oc_slice_str(":+1:"),   5 },
+            { oc_slice_str(":tada:"), 9 },
+        };
+        oc_reactions in = { 1001, 2, ents };
+        ROUNDTRIP(oc_encode_reactions(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REACTIONS, h, p);
+        oc_reaction_entry out[2]; uint16_t n = 0; uint64_t mid = 0;
+        CHECK(oc_decode_reactions(&p, out, 2, &n, &mid) == OC_OK);
+        CHECK(mid == 1001 && n == 2);
+        CHECK(slice_eq_str(out[0].emoji, ":+1:") && out[0].user_id == 5);
+        CHECK(slice_eq_str(out[1].emoji, ":tada:") && out[1].user_id == 9);
+    }
+}
+
+static void test_channel_frames(void) {
+    {
+        oc_create_channel in = { oc_slice_str("engineering"), 0 };
+        ROUNDTRIP(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CREATE_CHANNEL, h, p);
+        oc_create_channel out;
+        CHECK(oc_decode_create_channel(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.name, "engineering") && out.is_public == 0);
+    }
+    {
+        oc_channel_info in = { .channel_id = 5, .kind = OC_CHANNEL_KIND,
+                               .name = oc_slice_str("engineering"),
+                               .is_public = 0, .joined = 1,
+                               .created_at = 1751200500000ull, .peer_id = 0 };
+        ROUNDTRIP(oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_INFO, h, p);
+        oc_channel_info out;
+        CHECK(oc_decode_channel_info(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 5 && out.kind == OC_CHANNEL_KIND);
+        CHECK(slice_eq_str(out.name, "engineering"));
+        CHECK(out.is_public == 0 && out.joined == 1 && out.created_at == 1751200500000ull);
+    }
+    {
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        CHECK(oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK);
+        oc_header h; oc_rbuf p;
+        CHECK(oc_parse_frame(frame, w.len, &h, &p) == OC_OK);
+        CHECK(h.msg_type == OC_MSG_LIST_CHANNELS);
+        CHECK(oc_decode_list_channels(&p) == OC_OK);
+    }
+    {
+        oc_channel_list_entry ents[2] = {
+            { .channel_id = 1, .name = oc_slice_str("general"),
+              .is_public = 1, .joined = 1, .kind = OC_CHANNEL_KIND },
+            { .channel_id = 9, .name = oc_slice_str(""),
+              .is_public = 0, .joined = 1, .kind = OC_CHANNEL_KIND_DM },
+        };
+        oc_channel_list in = { 2, ents };
+        ROUNDTRIP(oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_LIST, h, p);
+        oc_channel_list_entry out[2]; uint16_t n = 0;
+        CHECK(oc_decode_channel_list(&p, out, 2, &n) == OC_OK);
+        CHECK(n == 2);
+        CHECK(out[0].channel_id == 1 && slice_eq_str(out[0].name, "general") && out[0].kind == OC_CHANNEL_KIND);
+        CHECK(out[1].channel_id == 9 && out[1].joined == 1 && out[1].kind == OC_CHANNEL_KIND_DM);
+    }
+    {
+        oc_open_dm in = { 42 };
+        ROUNDTRIP(oc_encode_open_dm(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_OPEN_DM, h, p);
+        oc_open_dm out;
+        CHECK(oc_decode_open_dm(&p, &out) == OC_OK);
+        CHECK(out.user_id == 42);
+    }
+    {
+        oc_channel_ref in = { 5 };
+        ROUNDTRIP(oc_encode_join_channel(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_JOIN_CHANNEL, h, p);
+        oc_channel_ref out;
+        CHECK(oc_decode_join_channel(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 5);
+    }
+    {
+        oc_channel_ref in = { 5 };
+        ROUNDTRIP(oc_encode_leave_channel(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LEAVE_CHANNEL, h, p);
+        oc_channel_ref out;
+        CHECK(oc_decode_leave_channel(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 5);
+    }
+    {
+        oc_channel_member_op in = { 5, 42 };
+        ROUNDTRIP(oc_encode_invite_to_channel(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_INVITE_TO_CHANNEL, h, p);
+        oc_channel_member_op out;
+        CHECK(oc_decode_invite_to_channel(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 5 && out.user_id == 42);
+    }
+    {
+        oc_channel_member_op in = { 5, 42 };
+        ROUNDTRIP(oc_encode_remove_from_channel(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REMOVE_FROM_CHANNEL, h, p);
+        oc_channel_member_op out;
+        CHECK(oc_decode_remove_from_channel(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 5 && out.user_id == 42);
+    }
+}
+
+static void test_admin_frames(void) {
+    {
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        CHECK(oc_encode_list_users(&w, OC_PROTOCOL_VERSION) == OC_OK);
+        oc_header h; oc_rbuf p;
+        CHECK(oc_parse_frame(frame, w.len, &h, &p) == OC_OK);
+        CHECK(h.msg_type == OC_MSG_LIST_USERS);
+        CHECK(oc_decode_list_users(&p) == OC_OK);
+    }
+    {
+        oc_user_list_entry ents[2] = {
+            { .user_id = 1, .role = OC_ROLE_OWNER,  .disabled = 0,
+              .email = oc_slice_str("a@x.io"), .display_name = oc_slice_str("Alice") },
+            { .user_id = 2, .role = OC_ROLE_MEMBER, .disabled = 1,
+              .email = oc_slice_str(""),       .display_name = oc_slice_str("Bob") },
+        };
+        oc_user_list in = { 2, ents };
+        ROUNDTRIP(oc_encode_user_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_USER_LIST, h, p);
+        oc_user_list_entry out[2]; uint16_t n = 0;
+        CHECK(oc_decode_user_list(&p, out, 2, &n) == OC_OK);
+        CHECK(n == 2);
+        CHECK(out[0].user_id == 1 && out[0].role == OC_ROLE_OWNER && out[0].disabled == 0);
+        CHECK(slice_eq_str(out[0].email, "a@x.io") && slice_eq_str(out[0].display_name, "Alice"));
+        CHECK(out[1].user_id == 2 && out[1].disabled == 1 && slice_eq_str(out[1].display_name, "Bob"));
+    }
+    {
+        /* The roster's profile fields (REQ-240/289), on a REPEATED list — so the
+         * second entry is the one that matters: a field added to the entry
+         * shifts everything after the first, and only reading entry [1] back
+         * proves the encoder and decoder agree about the stride. */
+        oc_user_list_entry ents[2] = {
+            { 1, OC_ROLE_OWNER,  0, oc_slice_str("a@x.io"), oc_slice_str("Alice"), 9,
+              oc_slice_str("Principal Engineer"), oc_slice_str("America/New_York"),
+              oc_slice_str("\xf0\x9f\x8c\xb4"), oc_slice_str("On holiday"),
+              oc_slice_str("Alice Liddell"), oc_slice_str("she/her"), oc_slice_str("expr-voice-2-f") },
+            /* Every string empty, which is the common case and the one where an
+             * off-by-one in the stride is easiest to miss. */
+            { 2, OC_ROLE_MEMBER, 0, oc_slice_str(""), oc_slice_str("Bob"), 0,
+              oc_slice_str(""), oc_slice_str(""), oc_slice_str(""), oc_slice_str(""),
+              oc_slice_str(""), oc_slice_str(""), oc_slice_str("") },
+        };
+        oc_user_list in = { 2, ents };
+        ROUNDTRIP(oc_encode_user_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_USER_LIST, h, p);
+        oc_user_list_entry out[2]; uint16_t n = 0;
+        CHECK(oc_decode_user_list(&p, out, 2, &n) == OC_OK);
+        CHECK(n == 2);
+        CHECK(slice_eq_str(out[0].full_name, "Alice Liddell"));
+        CHECK(slice_eq_str(out[0].pronouns, "she/her"));
+        CHECK(slice_eq_str(out[0].title, "Principal Engineer"));
+        CHECK(out[1].user_id == 2 && slice_eq_str(out[1].display_name, "Bob"));
+        CHECK(slice_eq_str(out[0].voice_id, "expr-voice-2-f"));
+        CHECK(out[1].full_name.len == 0 && out[1].pronouns.len == 0 && out[1].voice_id.len == 0);
+    }
+    {
+        /* SET_PROFILE — the whole screen in one frame, at its own opcode. It
+         * shared 0x0070 with SET_PRESENCE, where the dispatch chain reached
+         * presence first and this frame could not be delivered at all. */
+        oc_set_profile in = { oc_slice_str("Alice Liddell"), oc_slice_str("Principal Engineer"),
+                              oc_slice_str("she/her"), oc_slice_str("+1 555 0100"),
+                              oc_slice_str("America/New_York"), oc_slice_str("expr-voice-3-m") };
+        ROUNDTRIP(oc_encode_set_profile(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_PROFILE, h, p);
+        CHECK(h.msg_type != OC_MSG_SET_PRESENCE);
+        oc_set_profile out;
+        CHECK(oc_decode_set_profile(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.full_name, "Alice Liddell"));
+        CHECK(slice_eq_str(out.title, "Principal Engineer"));
+        CHECK(slice_eq_str(out.pronouns, "she/her"));
+        CHECK(slice_eq_str(out.phone, "+1 555 0100"));
+        CHECK(slice_eq_str(out.timezone, "America/New_York"));
+        CHECK(slice_eq_str(out.voice_id, "expr-voice-3-m"));
+    }
+    {
+        /* Every field empty: clearing the profile is a thing a user does, and
+         * an all-empty frame must survive the round trip rather than truncate. */
+        oc_set_profile in = { oc_slice_str(""), oc_slice_str(""), oc_slice_str(""),
+                              oc_slice_str(""), oc_slice_str(""), oc_slice_str("") };
+        ROUNDTRIP(oc_encode_set_profile(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_PROFILE, h, p);
+        oc_set_profile out;
+        CHECK(oc_decode_set_profile(&p, &out) == OC_OK);
+        CHECK(out.full_name.len == 0 && out.title.len == 0 && out.pronouns.len == 0);
+        CHECK(out.phone.len == 0 && out.timezone.len == 0 && out.voice_id.len == 0);
+    }
+    {
+        /* PROFILE_INFO carries phone, which USER_LIST deliberately does not. */
+        oc_profile_info in;
+        memset(&in, 0, sizeof in);
+        in.user_id = 4; in.display_name = oc_slice_str("Alice");
+        in.email = oc_slice_str("a@x.io");
+        in.status_emoji = oc_slice_str(""); in.status_text = oc_slice_str("");
+        in.title = oc_slice_str("Principal Engineer");
+        in.timezone = oc_slice_str("America/New_York");
+        in.avatar_id = 11; in.role = OC_ROLE_ADMIN;
+        in.full_name = oc_slice_str("Alice Liddell");
+        in.pronouns = oc_slice_str("she/her");
+        in.phone = oc_slice_str("+1 555 0100");
+        in.voice_id = oc_slice_str("expr-voice-5-f");
+        ROUNDTRIP(oc_encode_profile_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PROFILE_INFO, h, p);
+        oc_profile_info out;
+        CHECK(oc_decode_profile_info(&p, &out) == OC_OK);
+        CHECK(out.user_id == 4 && out.avatar_id == 11 && out.role == OC_ROLE_ADMIN);
+        CHECK(slice_eq_str(out.full_name, "Alice Liddell"));
+        CHECK(slice_eq_str(out.pronouns, "she/her"));
+        CHECK(slice_eq_str(out.phone, "+1 555 0100"));
+        CHECK(slice_eq_str(out.voice_id, "expr-voice-5-f"));
+    }
+    {
+        oc_set_role in = { 7, OC_ROLE_ADMIN };
+        ROUNDTRIP(oc_encode_set_role(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_ROLE, h, p);
+        oc_set_role out;
+        CHECK(oc_decode_set_role(&p, &out) == OC_OK);
+        CHECK(out.user_id == 7 && out.role == OC_ROLE_ADMIN);
+    }
+    {
+        oc_invite_user in = { OC_ROLE_ADMIN, oc_slice_str("pat@acme.example"), 1 };
+        ROUNDTRIP(oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_INVITE_USER, h, p);
+        oc_invite_user out;
+        CHECK(oc_decode_invite_user(&p, &out) == OC_OK);
+        CHECK(out.role == OC_ROLE_ADMIN);
+        CHECK(slice_eq_str(out.email, "pat@acme.example"));
+        CHECK(out.uses == 1);
+    }
+    {
+        /* A link to share: how many may use it travels, 0 for no limit. */
+        oc_invite_user shared = { OC_ROLE_MEMBER, { NULL, 0 }, 0 }, out;
+        ROUNDTRIP(oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &shared), OC_MSG_INVITE_USER, h, p);
+        CHECK(oc_decode_invite_user(&p, &out) == OC_OK && out.uses == 0 && out.email.len == 0);
+    }
+    {
+        /* What an invite can be bound to: the daemon refuses anything else, and
+         * a client asks the same question before it sends. */
+        static const char *const GOOD[] = { "pat@acme.example", "Pat.O+x@mail.acme.co.uk",
+                                            "a@b.io", "l\xc3\xa9" "a@caf\xc3\xa9" ".example" };
+        static const char *const BAD[] = { "", "bad@", "@acme.example", "pat", "pat@acme",
+                                           "pat@@acme.example", "pat@acme..example",
+                                           "pat@.acme.example", "pat@acme.example.",
+                                           "p at@acme.example", "pat@acme example.com",
+                                           "<pat@acme.example>", "a,b@acme.example",
+                                           "pat@acme_example.com" };
+        for (size_t i = 0; i < sizeof GOOD / sizeof GOOD[0]; i++) CHECK(oc_email_plausible(GOOD[i]));
+        for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) CHECK(!oc_email_plausible(BAD[i]));
+        CHECK(!oc_email_plausible(NULL));
+        char longest[300];
+        memset(longest, 'a', 64); longest[64] = '@';
+        memset(longest + 65, 'b', 185); memcpy(longest + 250, ".com", 5);  /* 254 bytes */
+        CHECK(strlen(longest) == 254 && oc_email_plausible(longest));
+        memcpy(longest + 250, ".comm", 6);
+        CHECK(!oc_email_plausible(longest));                              /* 255 */
+        char local65[80];
+        memset(local65, 'a', 65); memcpy(local65 + 65, "@acme.example", 14);
+        CHECK(!oc_email_plausible(local65));
+    }
+    {
+        oc_remove_user in = { 42 };
+        ROUNDTRIP(oc_encode_remove_user(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REMOVE_USER, h, p);
+        oc_remove_user out;
+        CHECK(oc_decode_remove_user(&p, &out) == OC_OK);
+        CHECK(out.user_id == 42);
+    }
+    {   /* A local account's own address. */
+        oc_set_email in = { oc_slice_str("kim@acme.example") };
+        ROUNDTRIP(oc_encode_set_email(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_EMAIL, h, p);
+        oc_set_email out;
+        CHECK(oc_decode_set_email(&p, &out) == OC_OK && out.email.len == 16 &&
+              memcmp(out.email.ptr, "kim@acme.example", 16) == 0);
+    }
+    {   /* One of your sessions signed out (REQ-182). */
+        oc_revoke_session in = { 77 };
+        ROUNDTRIP(oc_encode_revoke_session(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REVOKE_SESSION, h, p);
+        oc_revoke_session out;
+        CHECK(oc_decode_revoke_session(&p, &out) == OC_OK && out.session_id == 77);
+    }
+    {   /* A removed member brought back (REQ-033). */
+        oc_enable_user in = { 43 };
+        ROUNDTRIP(oc_encode_enable_user(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ENABLE_USER, h, p);
+        oc_enable_user out;
+        CHECK(oc_decode_enable_user(&p, &out) == OC_OK && out.user_id == 43);
+    }
+    {   /* An administrator's reset of a local account, and its link's token (AUTH.md §2). */
+        oc_reset_credential in = { 42, 1 };
+        ROUNDTRIP(oc_encode_reset_credential(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_RESET_CREDENTIAL, h, p);
+        oc_reset_credential out;
+        CHECK(oc_decode_reset_credential(&p, &out) == OC_OK && out.user_id == 42 && out.clear_factors == 1);
+    }
+    {
+        oc_credential_reset cin = { 42, oc_slice_str("abcdef0123") };
+        ROUNDTRIP(oc_encode_credential_reset(&w, OC_PROTOCOL_VERSION, &cin), OC_MSG_CREDENTIAL_RESET, h, p);
+        oc_credential_reset cout;
+        CHECK(oc_decode_credential_reset(&p, &cout) == OC_OK && cout.user_id == 42 &&
+              cout.token.len == 10 && memcmp(cout.token.ptr, "abcdef0123", 10) == 0);
+    }
+    {
+        oc_user_updated in = { 42, OC_ROLE_MEMBER, 1 };
+        ROUNDTRIP(oc_encode_user_updated(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_USER_UPDATED, h, p);
+        oc_user_updated out;
+        CHECK(oc_decode_user_updated(&p, &out) == OC_OK);
+        CHECK(out.user_id == 42 && out.role == OC_ROLE_MEMBER && out.disabled == 1);
+    }
+    {
+        uint8_t tok[OC_INVITE_TOKEN_LEN];
+        for (int i = 0; i < (int)OC_INVITE_TOKEN_LEN; i++) tok[i] = (uint8_t)(i + 3);
+        oc_invite_created in = { { tok, OC_INVITE_TOKEN_LEN }, OC_ROLE_MEMBER, 1751200500000ull, 25 };
+        ROUNDTRIP(oc_encode_invite_created(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_INVITE_CREATED, h, p);
+        oc_invite_created out;
+        CHECK(oc_decode_invite_created(&p, &out) == OC_OK);
+        CHECK(out.token.len == OC_INVITE_TOKEN_LEN && out.token.ptr[0] == 3);
+        CHECK(out.role == OC_ROLE_MEMBER && out.expires_at == 1751200500000ull && out.uses == 25);
+    }
+    {
+        /* INVITE_LIST entries carry how many may use each and how many have. */
+        oc_invite_entry in[2] = { { 7, OC_ROLE_MEMBER, 0, 1751200500000ull, 1, 1, 0 },
+                                  { 8, OC_ROLE_MEMBER, 0, 1751200600000ull, 1, 0, 3 } };
+        oc_invite_list l = { 2, in };
+        ROUNDTRIP(oc_encode_invite_list(&w, OC_PROTOCOL_VERSION, &l), OC_MSG_INVITE_LIST, h, p);
+        oc_invite_entry out[2]; uint16_t n = 0;
+        CHECK(oc_decode_invite_list(&p, out, 2, &n) == OC_OK && n == 2);
+        CHECK(out[0].invite_id == 7 && out[0].uses == 1 && out[0].used == 0);
+        CHECK(out[1].invite_id == 8 && out[1].uses == 0 && out[1].used == 3 &&
+              out[1].expires_at == 1751200600000ull && out[1].created_by == 1);
+    }
+}
+
+static void test_search_frames(void) {
+    {
+        oc_search in = { .query = oc_slice_str("deploy pipeline"), .limit = 25 };
+        ROUNDTRIP(oc_encode_search(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH, h, p);
+        oc_search out;
+        CHECK(oc_decode_search(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.query, "deploy pipeline") && out.limit == 25);
+    }
+    {
+        oc_search_result_entry ents[2] = {
+            { 1001, 7, 42, 1751200500000ull, oc_slice_str("... the deploy ..."), 0 },
+            { 990,  7, 43, 1751200400000ull, oc_slice_str("deploy again"), 0 },
+        };
+        oc_search_results in = { 2, ents, 1 };
+        ROUNDTRIP(oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH_RESULTS, h, p);
+        oc_search_result_entry out[2]; uint16_t n = 0; uint8_t trunc = 0;
+        CHECK(oc_decode_search_results(&p, out, 2, &n, &trunc) == OC_OK);
+        CHECK(n == 2 && trunc == 1);
+        CHECK(out[0].message_id == 1001 && out[0].channel_id == 7 && out[0].author_id == 42);
+        CHECK(out[0].server_time == 1751200500000ull && slice_eq_str(out[0].snippet, "... the deploy ..."));
+        CHECK(out[1].message_id == 990 && slice_eq_str(out[1].snippet, "deploy again"));
+    }
+}
+
+static void test_presence_frames(void) {
+    {
+        oc_set_presence in = { OC_PRESENCE_AWAY };
+        ROUNDTRIP(oc_encode_set_presence(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_PRESENCE, h, p);
+        oc_set_presence out;
+        CHECK(oc_decode_set_presence(&p, &out) == OC_OK && out.status == OC_PRESENCE_AWAY);
+    }
+    {
+        oc_presence_update in = { 42, OC_PRESENCE_ONLINE, 0 };
+        ROUNDTRIP(oc_encode_presence_update(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PRESENCE_UPDATE, h, p);
+        oc_presence_update out;
+        CHECK(oc_decode_presence_update(&p, &out) == OC_OK);
+        CHECK(out.user_id == 42 && out.status == OC_PRESENCE_ONLINE && out.dnd == 0);
+    }
+    {   /* The do-not-disturb FACT rides beside presence (REQ-122/278) — and it
+         * is a fact, never an instant: there is nowhere in this frame to put a
+         * time, which is the design rather than an omission. */
+        oc_presence_update in = { 42, OC_PRESENCE_AWAY, 1 };
+        ROUNDTRIP(oc_encode_presence_update(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PRESENCE_UPDATE, h, p);
+        oc_presence_update out;
+        CHECK(oc_decode_presence_update(&p, &out) == OC_OK);
+        CHECK(out.user_id == 42 && out.status == OC_PRESENCE_AWAY && out.dnd == 1);
+    }
+    {   /* The connect-time UTC offset (ARCH-103). Signed and not always a whole
+         * hour: the negative case is the one that breaks if the field is ever
+         * widened or read unsigned, since west of Greenwich is most of the
+         * Americas. */
+        oc_set_tz_offset in = { -330 };
+        ROUNDTRIP(oc_encode_set_tz_offset(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_SET_TZ_OFFSET, h, p);
+        oc_set_tz_offset out;
+        CHECK(oc_decode_set_tz_offset(&p, &out) == OC_OK && out.tz_offset_min == -330);
+    }
+    {
+        oc_set_tz_offset in = { 840 };            /* UTC+14, the eastmost real one */
+        ROUNDTRIP(oc_encode_set_tz_offset(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_SET_TZ_OFFSET, h, p);
+        oc_set_tz_offset out;
+        CHECK(oc_decode_set_tz_offset(&p, &out) == OC_OK && out.tz_offset_min == 840);
+    }
+    {   /* Pausing (REQ-278): minutes from now on the way in, an absolute instant
+         * on the way back, and 0 in either direction means "not paused". */
+        oc_set_snooze in = { 30 };
+        ROUNDTRIP(oc_encode_set_snooze(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_SNOOZE, h, p);
+        oc_set_snooze out;
+        CHECK(oc_decode_set_snooze(&p, &out) == OC_OK && out.minutes == 30);
+    }
+    {
+        oc_set_snooze in = { 0 };
+        ROUNDTRIP(oc_encode_set_snooze(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_SNOOZE, h, p);
+        oc_set_snooze out;
+        CHECK(oc_decode_set_snooze(&p, &out) == OC_OK && out.minutes == 0);
+    }
+    {
+        oc_snooze in = { 1785620669000ull };
+        ROUNDTRIP(oc_encode_snooze(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SNOOZE, h, p);
+        oc_snooze out;
+        CHECK(oc_decode_snooze(&p, &out) == OC_OK && out.until_ms == 1785620669000ull);
+    }
+    {
+        oc_typing in = { 7 };
+        ROUNDTRIP(oc_encode_typing(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TYPING, h, p);
+        oc_typing out;
+        CHECK(oc_decode_typing(&p, &out) == OC_OK && out.channel_id == 7);
+    }
+    {
+        oc_typing_update in = { 7, 42 };
+        ROUNDTRIP(oc_encode_typing_update(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TYPING_UPDATE, h, p);
+        oc_typing_update out;
+        CHECK(oc_decode_typing_update(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.user_id == 42);
+    }
+}
+
+static void test_notify_frames(void) {
+    {
+        oc_set_notify_pref in = { 7, OC_NOTIFY_MENTIONS };
+        ROUNDTRIP(oc_encode_set_notify_pref(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_NOTIFY_PREF, h, p);
+        oc_set_notify_pref out;
+        CHECK(oc_decode_set_notify_pref(&p, &out) == OC_OK && out.channel_id == 7 && out.level == OC_NOTIFY_MENTIONS);
+    }
+    {   /* The SCHEDULE (REQ-136), which replaced the single window. Its range is
+         * the ALLOWED hours, and the offset rides with it because a per-weekday
+         * window without one is a window on the wrong day for half the world. */
+        oc_schedule_day days_in[3] = { { 1, 1, 540, 1020 }, { 3, 0, 0, 0 }, { 6, 1, 600, 720 } };
+        oc_schedule in = { OC_DND_CUSTOM, -480, 480, 1320, 3, days_in };
+        ROUNDTRIP(oc_encode_set_schedule(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_SCHEDULE, h, p);
+        oc_schedule out; oc_schedule_day days[OC_SCHEDULE_DAYS];
+        CHECK(oc_decode_schedule(&p, &out, days) == OC_OK);
+        CHECK(out.mode == OC_DND_CUSTOM && out.tz_offset_min == -480);
+        CHECK(out.start_min == 480 && out.end_min == 1320 && out.count == 3);
+        CHECK(days[0].weekday == 1 && days[0].start_min == 540 && days[0].end_min == 1020);
+        CHECK(days[1].weekday == 3 && days[1].enabled == 0);
+        CHECK(days[2].weekday == 6 && days[2].enabled == 1 && days[2].end_min == 720);
+    }
+    {   /* A NEGATIVE offset is the common case west of Greenwich, so it is the
+         * one worth pinning: it travels as two's complement in a u16. */
+        oc_schedule in = { OC_DND_EVERY_DAY, -330, 480, 1320, 0, NULL };
+        ROUNDTRIP(oc_encode_schedule(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SCHEDULE, h, p);
+        oc_schedule out; oc_schedule_day days[OC_SCHEDULE_DAYS];
+        CHECK(oc_decode_schedule(&p, &out, days) == OC_OK);
+        CHECK(out.tz_offset_min == -330 && out.count == 0 && out.mode == OC_DND_EVERY_DAY);
+    }
+    {   /* Keywords and priority people (REQ-135), both wholesale replacements. */
+        oc_slice terms_in[2] = { oc_slice_str("deploy"), oc_slice_str("release train") };
+        oc_set_keywords in = { 2, terms_in };
+        ROUNDTRIP(oc_encode_set_keywords(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_KEYWORDS, h, p);
+        oc_slice out[8]; uint8_t n = 0;
+        CHECK(oc_decode_set_keywords(&p, out, 8, &n) == OC_OK && n == 2);
+        CHECK(out[0].len == 6 && memcmp(out[0].ptr, "deploy", 6) == 0);
+        CHECK(out[1].len == 13 && memcmp(out[1].ptr, "release train", 13) == 0);
+    }
+    {
+        uint64_t people_in[2] = { 7, 9 };
+        oc_set_priority in = { 2, people_in };
+        ROUNDTRIP(oc_encode_set_priority(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_PRIORITY, h, p);
+        uint64_t out[8]; uint8_t n = 0;
+        CHECK(oc_decode_set_priority(&p, out, 8, &n) == OC_OK && n == 2);
+        CHECK(out[0] == 7 && out[1] == 9);
+    }
+    {
+        oc_slice terms_in[1] = { oc_slice_str("outage") };
+        uint64_t people_in[1] = { 42 };
+        oc_alert_prefs in = { 1, terms_in, 1, people_in };
+        ROUNDTRIP(oc_encode_alert_prefs(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ALERT_PREFS, h, p);
+        oc_slice t[4]; uint8_t nt = 0; uint64_t pe[4]; uint8_t np = 0;
+        CHECK(oc_decode_alert_prefs(&p, t, 4, &nt, pe, 4, &np) == OC_OK);
+        CHECK(nt == 1 && np == 1 && pe[0] == 42);
+        CHECK(t[0].len == 6 && memcmp(t[0].ptr, "outage", 6) == 0);
+    }
+    {
+        ROUNDTRIP(oc_encode_list_notify_prefs(&w, OC_PROTOCOL_VERSION), OC_MSG_LIST_NOTIFY_PREFS, h, p);
+        CHECK(oc_decode_list_notify_prefs(&p) == OC_OK);
+    }
+    {
+        /* REQ-056: a group DM's participant list, and the cap being a REFUSAL rather
+         * than a silent clamp — clamping would read the ids from whatever followed
+         * and open a conversation with the wrong people in it. */
+        oc_open_group_dm in; memset(&in, 0, sizeof in);
+        in.count = 3; in.user_ids[0] = 7; in.user_ids[1] = 9; in.user_ids[2] = 11;
+        ROUNDTRIP(oc_encode_open_group_dm(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_OPEN_GROUP_DM, h, p);
+        oc_open_group_dm out;
+        CHECK(oc_decode_open_group_dm(&p, &out) == OC_OK && out.count == 3);
+        CHECK(out.user_ids[0] == 7 && out.user_ids[1] == 9 && out.user_ids[2] == 11);
+    }
+    {
+        /* The same frame with its COUNT overwritten past the cap. Patched rather than
+         * hand-built because oc_frame_begin/end are internal to protocol.c — and the
+         * point is the decoder, not the encoder. */
+        oc_open_group_dm in; memset(&in, 0, sizeof in);
+        in.count = 1; in.user_ids[0] = 5;
+        oc_wbuf w2; oc_wbuf_init(&w2, frame, sizeof frame);
+        CHECK(oc_encode_open_group_dm(&w2, OC_PROTOCOL_VERSION, &in) == OC_OK);
+        oc_header h2; oc_rbuf p2;
+        CHECK(oc_parse_frame(frame, w2.len, &h2, &p2) == OC_OK);
+        /* The count is the first payload field; find it by decoding once, then move
+         * the read cursor back is not possible — so patch the buffer and re-parse. */
+        /* The payload starts after the 8-byte header (length 4, version 2, type 2);
+         * the count is its first field, big-endian. */
+        frame[8] = 0; frame[9] = 99;
+        oc_header h3; oc_rbuf p3;
+        CHECK(oc_parse_frame(frame, w2.len, &h3, &p3) == OC_OK);
+        oc_open_group_dm bad;
+        CHECK(oc_decode_open_group_dm(&p3, &bad) != OC_OK);
+    }
+    {
+        oc_set_notify_default in = { OC_NOTIFY_NONE };            /* REQ-134 */
+        ROUNDTRIP(oc_encode_set_notify_default(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_SET_NOTIFY_DEFAULT, h, p);
+        oc_set_notify_default out;
+        CHECK(oc_decode_set_notify_default(&p, &out) == OC_OK && out.level == OC_NOTIFY_NONE);
+    }
+    {
+        oc_notify_pref_entry ents[2] = {
+            { .channel_id = 7, .level = OC_NOTIFY_MENTIONS },
+            { .channel_id = 9, .level = OC_NOTIFY_NONE },
+        };
+        oc_notify_prefs in;
+        in.notify_default = OC_NOTIFY_MENTIONS;   /* REQ-134 */
+        in.count = 2; in.entries = ents;
+        ROUNDTRIP(oc_encode_notify_prefs(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_NOTIFY_PREFS, h, p);
+        oc_notify_pref_entry got[4]; uint16_t n = 0; uint8_t dflt = 0xFF;
+        CHECK(oc_decode_notify_prefs(&p, got, 4, &n, &dflt) == OC_OK && n == 2);
+        CHECK(dflt == OC_NOTIFY_MENTIONS);
+        CHECK(got[0].channel_id == 7 && got[0].level == OC_NOTIFY_MENTIONS);
+        CHECK(got[1].channel_id == 9 && got[1].level == OC_NOTIFY_NONE);
+    }
+}
+
+/* Drafts (REQ-223, ARCH-101). The empty body is the DELETE form and has to
+ * survive the round trip as an empty string rather than a missing field, and a
+ * body at the cap has to survive intact — a draft silently truncated on the
+ * wire is worse than one refused. */
+static void test_draft_frames(void) {
+    {
+        oc_set_draft in = { 7, 0, oc_slice_str(""), oc_slice_str("half a thought") };
+        ROUNDTRIP(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_DRAFT, h, p);
+        oc_set_draft out;
+        CHECK(oc_decode_set_draft(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.thread_root == 0);
+        CHECK(out.body.len == 14 && memcmp(out.body.ptr, "half a thought", 14) == 0);
+    }
+    {   /* the delete form */
+        oc_set_draft in = { 7, 0, oc_slice_str(""), oc_slice_str("") };
+        ROUNDTRIP(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_DRAFT, h, p);
+        oc_set_draft out;
+        CHECK(oc_decode_set_draft(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.body.len == 0);
+    }
+    {   /* thread_root carried, though no client writes one yet (ARCH-101) */
+        oc_set_draft in = { 7, 4242, oc_slice_str(""), oc_slice_str("x") };
+        ROUNDTRIP(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_DRAFT, h, p);
+        oc_set_draft out;
+        CHECK(oc_decode_set_draft(&p, &out) == OC_OK);
+        CHECK(out.thread_root == 4242);
+    }
+    {
+        ROUNDTRIP(oc_encode_list_drafts(&w, OC_PROTOCOL_VERSION), OC_MSG_LIST_DRAFTS, h, p);
+        (void)p;
+    }
+    {   /* a body at the cap, byte for byte */
+        static char big[OC_DRAFT_BODY_MAX];
+        memset(big, 'x', sizeof big);
+        oc_slice bs = { (const uint8_t *)big, sizeof big };
+        oc_draft in = { 5, 9, 0, 1234567890123ULL, oc_slice_str(""), bs };
+        ROUNDTRIP(oc_encode_draft(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DRAFT, h, p);
+        oc_draft out;
+        CHECK(oc_decode_draft(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 9 && out.updated_ms == 1234567890123ULL);
+        CHECK(out.body.len == OC_DRAFT_BODY_MAX);
+        CHECK(memcmp(out.body.ptr, big, OC_DRAFT_BODY_MAX) == 0);
+    }
+    {   /* UNADDRESSED (REQ-229): no channel, a recipient list instead, and an
+         * id that is the only thing telling two of them apart. */
+        oc_set_draft in = { 0, 0, oc_slice_str("2,3"), oc_slice_str("to nobody yet") };
+        ROUNDTRIP(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_DRAFT, h, p);
+        oc_set_draft out;
+        CHECK(oc_decode_set_draft(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 0);
+        CHECK(out.recipients.len == 3 && memcmp(out.recipients.ptr, "2,3", 3) == 0);
+    }
+    {
+        oc_drafts in = { 3 };
+        ROUNDTRIP(oc_encode_drafts(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DRAFTS, h, p);
+        oc_drafts out;
+        CHECK(oc_decode_drafts(&p, &out) == OC_OK && out.count == 3);
+    }
+}
+
+static void test_client_settings_frames(void) {
+    {
+        oc_set_client_setting in = { oc_slice_str("tui"), oc_slice_str("mouse"), oc_slice_str("1") };
+        ROUNDTRIP(oc_encode_set_client_setting(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_CLIENT_SETTING, h, p);
+        oc_set_client_setting out;
+        CHECK(oc_decode_set_client_setting(&p, &out) == OC_OK);
+        CHECK(out.client_type.len == 3 && memcmp(out.client_type.ptr, "tui", 3) == 0);
+        CHECK(out.key.len == 5 && memcmp(out.key.ptr, "mouse", 5) == 0);
+        CHECK(out.value.len == 1 && out.value.ptr[0] == '1');
+    }
+    {
+        oc_list_client_settings in = { oc_slice_str("tui") };
+        ROUNDTRIP(oc_encode_list_client_settings(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_CLIENT_SETTINGS, h, p);
+        oc_list_client_settings out;
+        CHECK(oc_decode_list_client_settings(&p, &out) == OC_OK);
+        CHECK(out.client_type.len == 3 && memcmp(out.client_type.ptr, "tui", 3) == 0);
+    }
+    {
+        oc_client_setting_entry ents[2] = {
+            { oc_slice_str("mouse"), oc_slice_str("1") },
+            { oc_slice_str("time_24h"), oc_slice_str("0") },
+        };
+        oc_client_settings in = { oc_slice_str("tui"), 2, ents };
+        ROUNDTRIP(oc_encode_client_settings(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CLIENT_SETTINGS, h, p);
+        oc_client_setting_entry got[4]; oc_client_settings out;
+        CHECK(oc_decode_client_settings(&p, &out, got, 4) == OC_OK && out.count == 2);
+        CHECK(out.client_type.len == 3 && memcmp(out.client_type.ptr, "tui", 3) == 0);
+        CHECK(got[0].key.len == 5 && memcmp(got[0].key.ptr, "mouse", 5) == 0);
+        CHECK(got[0].value.len == 1 && got[0].value.ptr[0] == '1');
+        CHECK(got[1].key.len == 8 && memcmp(got[1].key.ptr, "time_24h", 8) == 0);
+    }
+}
+
+static void test_read_cursor_frames(void) {
+    oc_read_cursor in = { 7, 42, 100 };
+    ROUNDTRIP(oc_encode_read_cursor(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_READ_CURSOR, h, p);
+    oc_read_cursor out;
+    CHECK(oc_decode_read_cursor(&p, &out) == OC_OK);
+    CHECK(out.channel_id == 7 && out.user_id == 42 && out.message_id == 100);
+}
+
+static void test_profile_frames(void) {
+    {
+        oc_set_display_name in = { oc_slice_str("Dana Q") };
+        ROUNDTRIP(oc_encode_set_display_name(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_DISPLAY_NAME, h, p);
+        oc_set_display_name out;
+        CHECK(oc_decode_set_display_name(&p, &out) == OC_OK);
+        CHECK(out.name.len == 6 && memcmp(out.name.ptr, "Dana Q", 6) == 0);
+    }
+    {
+        oc_profile_updated in = { 42, oc_slice_str("Dana Q") };
+        ROUNDTRIP(oc_encode_profile_updated(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PROFILE_UPDATED, h, p);
+        oc_profile_updated out;
+        CHECK(oc_decode_profile_updated(&p, &out) == OC_OK && out.user_id == 42);
+        CHECK(out.display_name.len == 6 && memcmp(out.display_name.ptr, "Dana Q", 6) == 0);
+    }
+}
+
+/* Private DMs (PRIVATE-DM.md): every frame round trips, and the sizes the daemon
+ * relies on are enforced by the decoders. */
+static void test_pdm_frames(void) {
+    uint8_t hs[48], hdr[OC_PDM_HEADER_LEN], ct[64];
+    memset(hs, 1, sizeof hs); memset(hdr, 2, sizeof hdr); memset(ct, 3, sizeof ct);
+
+    { oc_pdm_open in = { 42, { hs, 32 } };
+      ROUNDTRIP(oc_encode_pdm_open(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PDM_OPEN, h, p);
+      oc_pdm_open out; CHECK(oc_decode_pdm_open(&p, &out) == OC_OK && out.peer == 42 && out.hs.len == 32); }
+    { oc_pdm_opened in = { 7, 42 };
+      ROUNDTRIP(oc_encode_pdm_opened(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PDM_OPENED, h, p);
+      oc_pdm_opened out; CHECK(oc_decode_pdm_opened(&p, &out) == OC_OK && out.pdm_id == 7 && out.peer == 42); }
+    { oc_pdm_invite in = { 7, 3, { hs, 32 } };
+      ROUNDTRIP(oc_encode_pdm_invite(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PDM_INVITE, h, p);
+      oc_pdm_invite out; CHECK(oc_decode_pdm_invite(&p, &out) == OC_OK && out.from == 3 && memcmp(out.hs.ptr, hs, 32) == 0); }
+    { oc_pdm_hs in = { 7, { hs, sizeof hs } };
+      ROUNDTRIP(oc_encode_pdm_hs(&w, OC_PROTOCOL_VERSION, OC_MSG_PDM_HS_FOR, &in), OC_MSG_PDM_HS_FOR, h, p);
+      oc_pdm_hs out; CHECK(oc_decode_pdm_hs(&p, &out) == OC_OK && out.pdm_id == 7 && out.hs.len == sizeof hs); }
+    { oc_pdm_msg in = { 7, { hdr, sizeof hdr }, { ct, sizeof ct } };
+      ROUNDTRIP(oc_encode_pdm_msg(&w, OC_PROTOCOL_VERSION, OC_MSG_PDM_SEND, &in), OC_MSG_PDM_SEND, h, p);
+      oc_pdm_msg out; CHECK(oc_decode_pdm_msg(&p, &out) == OC_OK && out.ct.len == sizeof ct && memcmp(out.header.ptr, hdr, sizeof hdr) == 0); }
+    { oc_pdm_end in = { 7, OC_PDM_END_TAKEN };
+      ROUNDTRIP(oc_encode_pdm_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PDM_END, h, p);
+      oc_pdm_end out; CHECK(oc_decode_pdm_end(&p, &out) == OC_OK && out.reason == OC_PDM_END_TAKEN); }
+
+    /* Out of size: an empty or oversized handshake, a header of the wrong length,
+     * a ciphertext shorter than its tag. */
+    static uint8_t big[OC_PDM_MAX_HS + 1];
+    { oc_pdm_hs in = { 7, { big, sizeof big } };
+      ROUNDTRIP(oc_encode_pdm_hs(&w, OC_PROTOCOL_VERSION, OC_MSG_PDM_HS, &in), OC_MSG_PDM_HS, h, p);
+      oc_pdm_hs out; CHECK(oc_decode_pdm_hs(&p, &out) == OC_E_MALFORMED); }
+    { oc_pdm_open in = { 42, { hs, 0 } };
+      ROUNDTRIP(oc_encode_pdm_open(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PDM_OPEN, h, p);
+      oc_pdm_open out; CHECK(oc_decode_pdm_open(&p, &out) == OC_E_MALFORMED); }
+    { oc_pdm_msg in = { 7, { hdr, sizeof hdr - 1 }, { ct, sizeof ct } };
+      ROUNDTRIP(oc_encode_pdm_msg(&w, OC_PROTOCOL_VERSION, OC_MSG_PDM_MSG, &in), OC_MSG_PDM_MSG, h, p);
+      oc_pdm_msg out; CHECK(oc_decode_pdm_msg(&p, &out) == OC_E_MALFORMED); }
+    { oc_pdm_msg in = { 7, { hdr, sizeof hdr }, { ct, 15 } };
+      ROUNDTRIP(oc_encode_pdm_msg(&w, OC_PROTOCOL_VERSION, OC_MSG_PDM_MSG, &in), OC_MSG_PDM_MSG, h, p);
+      oc_pdm_msg out; CHECK(oc_decode_pdm_msg(&p, &out) == OC_E_MALFORMED); }
+}
+
+static void test_call_frames(void) {
+    oc_call_part pa[2];
+    memset(pa, 0, sizeof pa);
+    pa[0].user_id = 10; pa[0].slot = 0; memset(pa[0].device_key, 0xAA, OC_CALL_DEVICE_KEY_LEN);
+    pa[1].user_id = 20; pa[1].slot = 3; memset(pa[1].device_key, 0xBB, OC_CALL_DEVICE_KEY_LEN);
+    pa[0].codecs = OC_CALL_CODEC_VP9; pa[1].codecs = 0x03;
+    pa[1].flags = OC_CALL_PART_AWAY;   /* the second's connection went: its seat is held */
+    {
+        uint64_t inv[3] = { 20, 30, 40 };
+        oc_call_join in = { 7, {0}, 3, inv, OC_CALL_CODEC_VP9 };
+        memset(in.device_key, 0x5C, OC_CALL_DEVICE_KEY_LEN);
+        ROUNDTRIP(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_JOIN, h, p);
+        oc_call_join out; uint64_t got[4];
+        CHECK(oc_decode_call_join(&p, &out, got, 4) == OC_OK && out.channel_id == 7);
+        CHECK(out.device_key[0] == 0x5C && out.device_key[31] == 0x5C);
+        CHECK(out.n_invite == 3 && got[0] == 20 && got[2] == 40 && out.codecs == OC_CALL_CODEC_VP9);
+        /* A list longer than the caller's room is malformed, not cut short. */
+        oc_rbuf_init(&p, w.data + OC_HEADER_SIZE, w.len - OC_HEADER_SIZE);
+        CHECK(oc_decode_call_join(&p, &out, got, 2) == OC_E_MALFORMED);
+    }
+    {
+        oc_call_leave in = { 7 };
+        ROUNDTRIP(oc_encode_call_leave(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_LEAVE, h, p);
+        oc_call_leave out; CHECK(oc_decode_call_leave(&p, &out) == OC_OK && out.channel_id == 7);
+    }
+    {
+        uint8_t tok[16]; for (int i = 0; i < 16; i++) tok[i] = (uint8_t)(i + 1);
+        oc_call_joined in = { 7, 99, 41234, { tok, 16 }, 3, 5, 10, 1751200500000ull, 2, pa };
+        ROUNDTRIP(oc_encode_call_joined(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_JOINED, h, p);
+        oc_call_joined out; oc_call_part got[8];
+        CHECK(oc_decode_call_joined(&p, &out, got, 8) == OC_OK);
+        CHECK(out.channel_id == 7 && out.call_id == 99 && out.udp_port == 41234);
+        CHECK(out.token.len == 16 && out.slot == 3 && out.epoch == 5 && out.starter == 10);
+        CHECK(out.started_at == 1751200500000ull && out.count == 2);
+        CHECK(got[0].user_id == 10 && got[1].user_id == 20 && got[1].slot == 3);
+        CHECK(got[0].device_key[0] == 0xAA && got[1].device_key[31] == 0xBB);
+        CHECK(got[0].codecs == OC_CALL_CODEC_VP9 && got[1].codecs == 0x03);
+        CHECK(got[0].flags == 0 && got[1].flags == OC_CALL_PART_AWAY);
+    }
+    {
+        oc_call_roster in = { 7, 99, 6, 2, pa };
+        ROUNDTRIP(oc_encode_call_roster(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_ROSTER, h, p);
+        oc_call_roster out; oc_call_part got[8];
+        CHECK(oc_decode_call_roster(&p, &out, got, 8) == OC_OK && out.count == 2 && out.epoch == 6);
+        CHECK(out.call_id == 99 && got[1].user_id == 20 && got[1].device_key[0] == 0xBB);
+        CHECK(got[1].codecs == 0x03 && got[0].flags == 0 && got[1].flags == OC_CALL_PART_AWAY);
+    }
+    {
+        uint64_t users[2] = { 30, 40 };
+        oc_call_invite in = { 7, 2, users };
+        ROUNDTRIP(oc_encode_call_invite(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_INVITE, h, p);
+        oc_call_invite out; uint64_t got[4];
+        CHECK(oc_decode_call_invite(&p, &out, got, 4) == OC_OK && out.count == 2 && got[1] == 40);
+    }
+    {
+        oc_call_decline in = { 7 };
+        ROUNDTRIP(oc_encode_call_decline(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_DECLINE, h, p);
+        oc_call_decline out; CHECK(oc_decode_call_decline(&p, &out) == OC_OK && out.channel_id == 7);
+    }
+    {
+        oc_call_end in = { 7 };
+        ROUNDTRIP(oc_encode_call_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_END, h, p);
+        oc_call_end out; CHECK(oc_decode_call_end(&p, &out) == OC_OK && out.channel_id == 7);
+    }
+    {
+        uint64_t parts[2] = { 10, 20 }, inv[1] = { 30 };
+        oc_call_state in = { 7, 99, 10, 1751200500000ull, 1, 2, parts, 1, inv, 20 };
+        ROUNDTRIP(oc_encode_call_state(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_STATE, h, p);
+        oc_call_state out; uint64_t gp[4], gi[4];
+        CHECK(oc_decode_call_state(&p, &out, gp, 4, gi, 4) == OC_OK);
+        CHECK(out.call_id == 99 && out.starter == 10 && out.ended == 1);
+        CHECK(out.n_parts == 2 && gp[1] == 20 && out.n_invited == 1 && gi[0] == 30);
+        CHECK(out.sharer == 20);
+    }
+    {
+        uint8_t s1[OC_CALL_SEALED_LEN], s2[OC_CALL_SEALED_LEN];
+        memset(s1, 1, sizeof s1); memset(s2, 2, sizeof s2);
+        oc_call_key_entry e[2] = { { 20, { s1, sizeof s1 } }, { 30, { s2, sizeof s2 } } };
+        oc_call_key in = { 7, 99, 6, 2, e };
+        ROUNDTRIP(oc_encode_call_key(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_KEY, h, p);
+        oc_call_key out; oc_call_key_entry got[4];
+        CHECK(oc_decode_call_key(&p, &out, got, 4) == OC_OK && out.count == 2 && out.epoch == 6);
+        CHECK(got[1].recipient == 30 && got[1].sealed.len == OC_CALL_SEALED_LEN && got[1].sealed.ptr[0] == 2);
+    }
+    {
+        uint8_t s1[OC_CALL_SEALED_LEN]; memset(s1, 9, sizeof s1);
+        oc_call_key_for in = { 7, 99, 6, 10, { s1, sizeof s1 } };
+        ROUNDTRIP(oc_encode_call_key_for(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_KEY_FOR, h, p);
+        oc_call_key_for out;
+        CHECK(oc_decode_call_key_for(&p, &out) == OC_OK && out.sender == 10 && out.epoch == 6);
+        CHECK(out.call_id == 99 && out.sealed.len == OC_CALL_SEALED_LEN && out.sealed.ptr[5] == 9);
+    }
+    {
+        oc_call_share in = { 7, 1 };
+        ROUNDTRIP(oc_encode_call_share(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_SHARE, h, p);
+        oc_call_share out;
+        CHECK(oc_decode_call_share(&p, &out) == OC_OK && out.channel_id == 7 && out.on == 1);
+    }
+    {
+        /* CALL_MEDIA both ways: up carries no sender, down carries the relay's. */
+        static const uint8_t ct[] = { 1, 2, 3, 4, 5, 6, 7 };
+        oc_call_media_pkt in = { 0, 0xBEEF, { ct, sizeof ct } };
+        ROUNDTRIP(oc_encode_call_media_up(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_MEDIA, h, p);
+        oc_call_media_pkt out;
+        CHECK(oc_decode_call_media_up(&p, &out) == OC_OK && out.sender == 0 && out.seq == 0xBEEF);
+        CHECK(out.ct.len == sizeof ct && memcmp(out.ct.ptr, ct, sizeof ct) == 0);
+    }
+    {
+        oc_call_media_pkt in = { 42, 7, { NULL, 0 } };   /* a keepalive */
+        ROUNDTRIP(oc_encode_call_media_down(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_MEDIA, h, p);
+        oc_call_media_pkt out;
+        CHECK(oc_decode_call_media_down(&p, &out) == OC_OK && out.sender == 42 && out.seq == 7 && out.ct.len == 0);
+    }
+}
+
+/* User groups (REQ-307-309): every frame round-trips, and a list longer than
+ * its cap is malformed rather than truncated. */
+static void test_group_frames(void) {
+    {
+        ROUNDTRIP(oc_encode_list_groups(&w, OC_PROTOCOL_VERSION), OC_MSG_LIST_GROUPS, h, p);
+        CHECK(oc_decode_list_groups(&p) == OC_OK);
+    }
+    {
+        oc_create_group in = { oc_slice_str("design"), oc_slice_str("Design"), oc_slice_str("the pixel people") };
+        ROUNDTRIP(oc_encode_create_group(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CREATE_GROUP, h, p);
+        oc_create_group out;
+        CHECK(oc_decode_create_group(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.handle, "design") && slice_eq_str(out.name, "Design") &&
+              slice_eq_str(out.description, "the pixel people"));
+    }
+    {
+        oc_update_group in = { 7, oc_slice_str("ux"), oc_slice_str("UX"), oc_slice_str("") };
+        ROUNDTRIP(oc_encode_update_group(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UPDATE_GROUP, h, p);
+        oc_update_group out;
+        CHECK(oc_decode_update_group(&p, &out) == OC_OK);
+        CHECK(out.group_id == 7 && slice_eq_str(out.handle, "ux") && out.description.len == 0);
+    }
+    {
+        oc_group_ref in = { 7 };
+        ROUNDTRIP(oc_encode_delete_group(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DELETE_GROUP, h, p);
+        oc_group_ref out;
+        CHECK(oc_decode_group_ref(&p, &out) == OC_OK && out.group_id == 7);
+    }
+    {
+        oc_group_ref in = { 8 };
+        ROUNDTRIP(oc_encode_group_deleted(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_GROUP_DELETED, h, p);
+        oc_group_ref out;
+        CHECK(oc_decode_group_ref(&p, &out) == OC_OK && out.group_id == 8);
+    }
+    {
+        static oc_group_members_op in, out;
+        in.group_id = 7; in.count = 3; in.user_ids[0] = 1; in.user_ids[1] = 2; in.user_ids[2] = 99;
+        ROUNDTRIP(oc_encode_group_members_op(&w, OC_PROTOCOL_VERSION, OC_MSG_GROUP_REMOVE_MEMBERS, &in),
+                  OC_MSG_GROUP_REMOVE_MEMBERS, h, p);
+        CHECK(oc_decode_group_members_op(&p, &out) == OC_OK);
+        CHECK(out.group_id == 7 && out.count == 3 && out.user_ids[2] == 99);
+    }
+    {
+        uint64_t mem[3] = { 4, 5, 6 };
+        oc_group_info in = { 7, oc_slice_str("design"), oc_slice_str("Design"), oc_slice_str("d"), 1, 3, mem };
+        ROUNDTRIP(oc_encode_group_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_GROUP_INFO, h, p);
+        uint64_t got[4]; oc_group_info out;
+        CHECK(oc_decode_group_info(&p, &out, got, 4) == OC_OK);
+        CHECK(out.group_id == 7 && out.created_by == 1 && out.count == 3 && out.members[1] == 5 &&
+              slice_eq_str(out.handle, "design"));
+        /* More members than the reader holds: refused, not cut short. */
+        oc_rbuf p2; oc_header h2;
+        CHECK(oc_parse_frame(frame, w.len, &h2, &p2) == OC_OK);
+        CHECK(oc_decode_group_info(&p2, &out, got, 2) == OC_E_MALFORMED);
+    }
+    {
+        oc_groups_end in = { 12 };
+        ROUNDTRIP(oc_encode_groups_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_GROUPS_END, h, p);
+        oc_groups_end out;
+        CHECK(oc_decode_groups_end(&p, &out) == OC_OK && out.count == 12);
+    }
+    {
+        oc_channel_group_op in = { 3, 7 };
+        ROUNDTRIP(oc_encode_channel_group_op(&w, OC_PROTOCOL_VERSION, OC_MSG_CHANNEL_ADD_GROUP, &in),
+                  OC_MSG_CHANNEL_ADD_GROUP, h, p);
+        oc_channel_group_op out;
+        CHECK(oc_decode_channel_group_op(&p, &out) == OC_OK && out.channel_id == 3 && out.group_id == 7);
+    }
+    {
+        uint64_t ids[2] = { 7, 9 };
+        oc_channel_groups in = { 3, 2, ids };
+        ROUNDTRIP(oc_encode_channel_groups(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_GROUPS, h, p);
+        uint64_t got[OC_MAX_CHANNEL_GROUPS]; oc_channel_groups out;
+        CHECK(oc_decode_channel_groups(&p, &out, got, OC_MAX_CHANNEL_GROUPS) == OC_OK);
+        CHECK(out.channel_id == 3 && out.count == 2 && out.group_ids[1] == 9);
+    }
+    {
+        uint64_t ids[2] = { 4, 6 };
+        oc_channel_via_group in = { 3, 2, ids };
+        ROUNDTRIP(oc_encode_channel_via_group(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_VIA_GROUP, h, p);
+        uint64_t got[4]; oc_channel_via_group out;
+        CHECK(oc_decode_channel_via_group(&p, &out, got, 4) == OC_OK);
+        CHECK(out.channel_id == 3 && out.count == 2 && out.user_ids[1] == 6);
+        oc_rbuf p2; oc_header h2;
+        CHECK(oc_parse_frame(frame, w.len, &h2, &p2) == OC_OK);
+        CHECK(oc_decode_channel_via_group(&p2, &out, got, 1) == OC_E_MALFORMED);
+    }
+    {
+        oc_mention_unresolved_more in = { 3, 99, 10 };
+        ROUNDTRIP(oc_encode_mention_unresolved_more(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MENTION_UNRESOLVED_MORE, h, p);
+        oc_mention_unresolved_more out;
+        CHECK(oc_decode_mention_unresolved_more(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 3 && out.message_id == 99 && out.total == 10);
+    }
+    {   /* A delete taken back (REQ-052): the request, and the message whole again. */
+        oc_restore in = { 7, 42 };
+        ROUNDTRIP(oc_encode_restore(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_RESTORE, h, p);
+        oc_restore out;
+        CHECK(oc_decode_restore(&p, &out) == OC_OK && out.channel_id == 7 && out.message_id == 42);
+    }
+    {
+        oc_broadcast in = { 42, 7, 3, 1000, 0, oc_slice_str("back again"), 0, {{0}}, {0} };
+        ROUNDTRIP(oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MSG_RESTORED, h, p);
+        oc_broadcast out;
+        CHECK(oc_decode_broadcast(&p, &out) == OC_OK && out.message_id == 42 && out.channel_id == 7 &&
+              out.body.len == 10 && !memcmp(out.body.ptr, "back again", 10));
+    }
+    {   /* Critical failures (REQ-263): the summary, the entries, an acknowledgement. */
+        oc_alerts_summary in = { 3, 1 };
+        ROUNDTRIP(oc_encode_alerts_summary(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ALERTS_SUMMARY, h, p);
+        oc_alerts_summary out;
+        CHECK(oc_decode_alerts_summary(&p, &out) == OC_OK && out.unacked == 3 && out.current == 1);
+    }
+    {
+        ROUNDTRIP(oc_encode_alerts_list(&w, OC_PROTOCOL_VERSION), OC_MSG_ALERTS_LIST, h, p);
+        CHECK(p.len == p.pos);
+    }
+    {
+        oc_alert_ack ain = { 42 };
+        ROUNDTRIP(oc_encode_alert_ack(&w, OC_PROTOCOL_VERSION, &ain), OC_MSG_ALERT_ACK, h, p);
+        oc_alert_ack aout;
+        CHECK(oc_decode_alert_ack(&p, &aout) == OC_OK && aout.alert_id == 42);
+    }
+    {
+        oc_alert two[2] = {
+            { 7, 1000, 5000, 4, 1, 0, oc_slice_str("tls.obtain"), oc_slice_str("the CA refused the order") },
+            { 6, 900, 900, 1, 0, 1, oc_slice_str("tls.expiring"), oc_slice_str("") } };
+        oc_alerts lin = { 2, two };
+        ROUNDTRIP(oc_encode_alerts(&w, OC_PROTOCOL_VERSION, &lin), OC_MSG_ALERTS, h, p);
+        oc_alert got[2]; oc_alerts lout;
+        CHECK(oc_decode_alerts(&p, &lout, got, 2) == OC_OK && lout.count == 2);
+        CHECK(got[0].id == 7 && got[0].first_ms == 1000 && got[0].last_ms == 5000 && got[0].count == 4 &&
+              got[0].current == 1 && got[0].acked == 0 && got[0].key.len == 10 &&
+              !memcmp(got[0].message.ptr, "the CA refused the order", 24));
+        CHECK(got[1].id == 6 && got[1].acked == 1 && got[1].message.len == 0);
+        oc_rbuf p2; oc_header h2;
+        CHECK(oc_parse_frame(frame, w.len, &h2, &p2) == OC_OK);
+        CHECK(oc_decode_alerts(&p2, &lout, got, 1) == OC_E_MALFORMED);           /* more than room for */
+        char big[OC_MAX_ALERT_MESSAGE + 1]; memset(big, 'x', sizeof big);
+        two[0].message = (oc_slice){ (const uint8_t *)big, sizeof big };
+        CHECK(oc_encode_alerts(&w, OC_PROTOCOL_VERSION, &lin) == OC_E_MALFORMED);  /* over the cap */
+    }
+    {   /* The encoders refuse a type that is not theirs. */
+        uint8_t buf[64]; oc_wbuf w2; oc_wbuf_init(&w2, buf, sizeof buf);
+        oc_channel_group_op op = { 1, 2 };
+        CHECK(oc_encode_channel_group_op(&w2, OC_PROTOCOL_VERSION, OC_MSG_SEND, &op) == OC_E_MALFORMED);
+    }
+}
+
+static void test_webhook_frames(void) {
+    {
+        oc_create_webhook in = { 9, oc_slice_str("github") };
+        ROUNDTRIP(oc_encode_create_webhook(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CREATE_WEBHOOK, h, p);
+        oc_create_webhook out;
+        CHECK(oc_decode_create_webhook(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 9 && slice_eq_str(out.label, "github"));
+    }
+    {
+        uint8_t tok[OC_SESSION_TOKEN_LEN];
+        for (int i = 0; i < (int)OC_SESSION_TOKEN_LEN; i++) tok[i] = (uint8_t)(i * 7 + 1);
+        oc_webhook_info in = { 5, 9, { tok, sizeof tok } };
+        ROUNDTRIP(oc_encode_webhook_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WEBHOOK_INFO, h, p);
+        oc_webhook_info out;
+        CHECK(oc_decode_webhook_info(&p, &out) == OC_OK);
+        CHECK(out.webhook_id == 5 && out.channel_id == 9 && out.token.len == OC_SESSION_TOKEN_LEN);
+        CHECK(memcmp(out.token.ptr, tok, sizeof tok) == 0);
+    }
+    {
+        oc_list_webhooks in = { 9 };
+        ROUNDTRIP(oc_encode_list_webhooks(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_WEBHOOKS, h, p);
+        oc_list_webhooks out;
+        CHECK(oc_decode_list_webhooks(&p, &out) == OC_OK && out.channel_id == 9);
+    }
+    {
+        oc_webhook_list_entry ents[2] = { { 1, 9, oc_slice_str("ci"), 0 },
+                                          { 2, 9, oc_slice_str("bot"), 1 } };
+        oc_webhook_list in = { 2, ents };
+        ROUNDTRIP(oc_encode_webhook_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WEBHOOK_LIST, h, p);
+        oc_webhook_list_entry got[4]; uint16_t n = 0;
+        CHECK(oc_decode_webhook_list(&p, got, 4, &n) == OC_OK && n == 2);
+        CHECK(got[0].webhook_id == 1 && slice_eq_str(got[0].label, "ci") && got[0].disabled == 0);
+        CHECK(got[1].webhook_id == 2 && got[1].disabled == 1);
+    }
+    {
+        oc_delete_webhook in = { 5 };
+        ROUNDTRIP(oc_encode_delete_webhook(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DELETE_WEBHOOK, h, p);
+        oc_delete_webhook out;
+        CHECK(oc_decode_delete_webhook(&p, &out) == OC_OK && out.webhook_id == 5);
+    }
+    {
+        oc_webhook_deleted in = { 5 };
+        ROUNDTRIP(oc_encode_webhook_deleted(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WEBHOOK_DELETED, h, p);
+        oc_webhook_deleted out;
+        CHECK(oc_decode_webhook_deleted(&p, &out) == OC_OK && out.webhook_id == 5);
+    }
+}
+
+static void test_attachment_frames(void) {
+    uint8_t idem[OC_IDEM_SIZE];
+    for (int i = 0; i < (int)OC_IDEM_SIZE; i++) idem[i] = (uint8_t)(0x30 + i);
+    uint8_t digest[32];
+    for (int i = 0; i < 32; i++) digest[i] = (uint8_t)(0xC0 + i);
+    {
+        oc_upload_begin in; in.channel_id = 5; memcpy(in.idem, idem, OC_IDEM_SIZE);
+        in.filename = oc_slice_str("report.pdf"); in.mime = oc_slice_str("application/pdf");
+        in.total_size = 1048576;
+        ROUNDTRIP(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UPLOAD_BEGIN, h, p);
+        oc_upload_begin out;
+        CHECK(oc_decode_upload_begin(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 5 && memcmp(out.idem, idem, OC_IDEM_SIZE) == 0);
+        CHECK(slice_eq_str(out.filename, "report.pdf") && slice_eq_str(out.mime, "application/pdf"));
+        CHECK(out.total_size == 1048576);
+    }
+    {
+        oc_upload_ready in = { 99, OC_ATTACH_CHUNK_SIZE, 262144 };
+        ROUNDTRIP(oc_encode_upload_ready(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UPLOAD_READY, h, p);
+        oc_upload_ready out;
+        CHECK(oc_decode_upload_ready(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 99 && out.chunk_size == OC_ATTACH_CHUNK_SIZE && out.window_bytes == 262144);
+    }
+    {
+        oc_upload_chunk in; in.attachment_id = 99; in.seq = 3;
+        in.data = (oc_slice){ (const uint8_t *)"blobbytes", 9 };
+        ROUNDTRIP(oc_encode_upload_chunk(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UPLOAD_CHUNK, h, p);
+        oc_upload_chunk out;
+        CHECK(oc_decode_upload_chunk(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 99 && out.seq == 3 && out.data.len == 9);
+        CHECK(memcmp(out.data.ptr, "blobbytes", 9) == 0);
+    }
+    {
+        oc_upload_ack in = { 99, 4 };
+        ROUNDTRIP(oc_encode_upload_ack(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UPLOAD_ACK, h, p);
+        oc_upload_ack out;
+        CHECK(oc_decode_upload_ack(&p, &out) == OC_OK && out.attachment_id == 99 && out.acked_through == 4);
+    }
+    {
+        oc_upload_end in = { 99 };
+        ROUNDTRIP(oc_encode_upload_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UPLOAD_END, h, p);
+        oc_upload_end out;
+        CHECK(oc_decode_upload_end(&p, &out) == OC_OK && out.attachment_id == 99);
+    }
+    {
+        oc_upload_ok in; in.attachment_id = 99; in.size = 1048576;
+        in.sha256 = (oc_slice){ digest, 32 };
+        ROUNDTRIP(oc_encode_upload_ok(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UPLOAD_OK, h, p);
+        oc_upload_ok out;
+        CHECK(oc_decode_upload_ok(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 99 && out.size == 1048576 && out.sha256.len == 32);
+        CHECK(memcmp(out.sha256.ptr, digest, 32) == 0);
+    }
+    {
+        oc_download_begin in = { 99 };
+        ROUNDTRIP(oc_encode_download_begin(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DOWNLOAD_BEGIN, h, p);
+        oc_download_begin out;
+        CHECK(oc_decode_download_begin(&p, &out) == OC_OK && out.attachment_id == 99);
+    }
+    {
+        oc_download_info in; in.attachment_id = 99;
+        in.filename = oc_slice_str("report.pdf"); in.mime = oc_slice_str("application/pdf");
+        in.total_size = 1048576; in.sha256 = (oc_slice){ digest, 32 };
+        ROUNDTRIP(oc_encode_download_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DOWNLOAD_INFO, h, p);
+        oc_download_info out;
+        CHECK(oc_decode_download_info(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 99 && out.total_size == 1048576);
+        CHECK(slice_eq_str(out.filename, "report.pdf") && out.sha256.len == 32);
+    }
+    {
+        oc_download_chunk in; in.attachment_id = 99; in.seq = 0;
+        in.data = (oc_slice){ (const uint8_t *)"xyz", 3 };
+        ROUNDTRIP(oc_encode_download_chunk(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DOWNLOAD_CHUNK, h, p);
+        oc_download_chunk out;
+        CHECK(oc_decode_download_chunk(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 99 && out.seq == 0 && out.data.len == 3);
+    }
+    {
+        oc_download_end in = { 99 };
+        ROUNDTRIP(oc_encode_download_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DOWNLOAD_END, h, p);
+        oc_download_end out;
+        CHECK(oc_decode_download_end(&p, &out) == OC_OK && out.attachment_id == 99);
+    }
+    {
+        oc_transfer_cancel in = { 99 };
+        ROUNDTRIP(oc_encode_transfer_cancel(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TRANSFER_CANCEL, h, p);
+        oc_transfer_cancel out;
+        CHECK(oc_decode_transfer_cancel(&p, &out) == OC_OK && out.attachment_id == 99);
+    }
+    /* SEND with a trailing attachment-id list (REQ-140 linking). */
+    {
+        oc_send in = {0}; in.channel_id = 3; memset(in.idem, 0x11, OC_IDEM_SIZE);
+        in.body = oc_slice_str("see file");
+        in.n_attach = 2; in.attach_ids[0] = 100; in.attach_ids[1] = 200;
+        ROUNDTRIP(oc_encode_send(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEND, h, p);
+        oc_send out = {0};
+        CHECK(oc_decode_send(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 3 && out.n_attach == 2);
+        CHECK(out.attach_ids[0] == 100 && out.attach_ids[1] == 200);
+        CHECK(slice_eq_str(out.body, "see file"));
+    }
+    /* Zero attachments -> the list is omitted; decode yields n_attach 0. */
+    {
+        oc_send in = {0}; in.channel_id = 3; in.body = oc_slice_str("plain");
+        ROUNDTRIP(oc_encode_send(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEND, h, p);
+        oc_send out = {0};
+        CHECK(oc_decode_send(&p, &out) == OC_OK && out.n_attach == 0);
+        CHECK(slice_eq_str(out.body, "plain"));
+    }
+    /* BROADCAST carrying attachment metadata AND a display-name override. */
+    {
+        oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str("here"), 0, {{0}}, {0} };
+        in.n_attach = 1;
+        in.attach[0].id = 77; in.attach[0].filename = oc_slice_str("a.png");
+        in.attach[0].mime = oc_slice_str("image/png"); in.attach[0].size = 4096;
+        in.author_name = oc_slice_str("GitHub CI");
+        ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
+        oc_broadcast out;
+        CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
+        CHECK(out.n_attach == 1 && out.attach[0].id == 77 && out.attach[0].size == 4096);
+        CHECK(slice_eq_str(out.attach[0].filename, "a.png"));
+        CHECK(slice_eq_str(out.author_name, "GitHub CI"));
+    }
+    /* Author name with NO attachments: a zero attachment count precedes the name
+     * (REQ-170 display-name override, ARCH-71). */
+    {
+        oc_broadcast in = { 6, 3, 42, 999, 0, oc_slice_str("hi"), 0, {{0}}, {0} };
+        in.author_name = oc_slice_str("Zapier");
+        ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
+        oc_broadcast out;
+        CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
+        CHECK(out.n_attach == 0 && slice_eq_str(out.author_name, "Zapier"));
+        CHECK(slice_eq_str(out.body, "hi"));
+    }
+    /* No attachments and no name -> byte-identical to the original layout. */
+    {
+        oc_broadcast in = { 7, 3, 42, 999, 0, oc_slice_str("plain"), 0, {{0}}, {0} };
+        ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
+        oc_broadcast out;
+        CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
+        CHECK(out.n_attach == 0 && out.author_name.len == 0 && slice_eq_str(out.body, "plain"));
+    }
+}
+
+/* The files list and its paging cursor (REQ-143): the request carries where the
+ * caller left off, the terminator says whether more remain. */
+static void test_file_frames(void) {
+    {
+        oc_list_files in = { 7, 1751200500000ull, 42 };
+        ROUNDTRIP(oc_encode_list_files(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_FILES, h, p);
+        oc_list_files out;
+        CHECK(oc_decode_list_files(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.before_ms == 1751200500000ull && out.before_id == 42);
+    }
+    {   /* The first page asks with no cursor. */
+        oc_list_files in = { 0, 0, 0 };
+        ROUNDTRIP(oc_encode_list_files(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_FILES, h, p);
+        oc_list_files out;
+        CHECK(oc_decode_list_files(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 0 && out.before_ms == 0 && out.before_id == 0);
+    }
+    {
+        oc_file_entry in = { 11, 7, 22, 33, 4096, 1751200500000ull, 1,
+                             oc_slice_str("notes.pdf"), oc_slice_str("application/pdf"), 0, 0 };
+        ROUNDTRIP(oc_encode_file_entry(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FILE_ENTRY, h, p);
+        oc_file_entry out;
+        CHECK(oc_decode_file_entry(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 11 && out.channel_id == 7 && out.message_id == 22);
+        CHECK(out.uploader_id == 33 && out.size == 4096 && out.reclaimed == 1);
+        CHECK(out.filename.len == 9 && memcmp(out.filename.ptr, "notes.pdf", 9) == 0);
+    }
+    {
+        oc_files in = { 7, 200, 1 };
+        ROUNDTRIP(oc_encode_files(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FILES, h, p);
+        oc_files out;
+        CHECK(oc_decode_files(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.count == 200 && out.more == 1);
+    }
+    {   /* The last page says so. */
+        oc_files in = { 7, 3, 0 };
+        ROUNDTRIP(oc_encode_files(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FILES, h, p);
+        oc_files out;
+        CHECK(oc_decode_files(&p, &out) == OC_OK && out.more == 0 && out.count == 3);
+    }
+}
+
+static void test_backfill_and_error(void) {
+    {
+        oc_cursor cursors[3] = { {7, 1000}, {8, 0}, {9, 512} };
+        oc_backfill_request in = { 3, cursors };
+        ROUNDTRIP(oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_BACKFILL_REQUEST, h, p);
+        oc_cursor out[3]; uint16_t n = 0;
+        CHECK(oc_decode_backfill_request(&p, out, 3, &n) == OC_OK);
+        CHECK(n == 3);
+        CHECK(out[0].channel_id == 7 && out[0].after_message_id == 1000);
+        CHECK(out[2].channel_id == 9 && out[2].after_message_id == 512);
+    }
+    {   /* count == 0 (a fresh client bootstrapping) */
+        oc_backfill_request in = { 0, NULL };
+        ROUNDTRIP(oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_BACKFILL_REQUEST, h, p);
+        oc_cursor out[1]; uint16_t n = 99;
+        CHECK(oc_decode_backfill_request(&p, out, 1, &n) == OC_OK);
+        CHECK(n == 0);
+    }
+    {   /* cap smaller than wire count: still well-formed, count reported */
+        oc_cursor cursors[3] = { {1, 1}, {2, 2}, {3, 3} };
+        oc_backfill_request in = { 3, cursors };
+        ROUNDTRIP(oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_BACKFILL_REQUEST, h, p);
+        oc_cursor out[2]; uint16_t n = 0;
+        CHECK(oc_decode_backfill_request(&p, out, 2, &n) == OC_OK);
+        CHECK(n == 3);                       /* wire count exceeds our capacity */
+        CHECK(out[0].channel_id == 1 && out[1].channel_id == 2);
+    }
+    {
+        oc_backfill_done in = { 4242, 1 };
+        ROUNDTRIP(oc_encode_backfill_done(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_BACKFILL_DONE, h, p);
+        oc_backfill_done out;
+        CHECK(oc_decode_backfill_done(&p, &out) == OC_OK);
+        CHECK(out.more == 1);
+        CHECK(out.high_water == 4242);
+    }
+    {
+        uint8_t idem[OC_IDEM_SIZE]; memset(idem, 0x5A, sizeof idem);
+        oc_error in;
+        in.code = OC_ERR_SEND_RATE_LIMITED; in.fatal = 0;
+        in.context.ptr = idem; in.context.len = OC_IDEM_SIZE;
+        in.message = oc_slice_str("slow down");
+        ROUNDTRIP(oc_encode_error(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ERROR, h, p);
+        oc_error out;
+        CHECK(oc_decode_error(&p, &out) == OC_OK);
+        CHECK(out.code == OC_ERR_SEND_RATE_LIMITED && out.fatal == 0);
+        CHECK(out.context.len == OC_IDEM_SIZE && out.context.ptr[0] == 0x5A);
+        CHECK(slice_eq_str(out.message, "slow down"));
+    }
+}
+
+/* --- Size limits (§2.1) ------------------------------------------------- */
+static void test_size_limits(void) {
+    memset(big, 'x', sizeof big);
+
+    /* A body at exactly MAX_BODY_SIZE fits within a frame (headroom reconciles
+     * REQ-054's 64KB body with the 65KB frame cap). */
+    oc_send in = {0}; in.channel_id = 1; memset(in.idem, 0, OC_IDEM_SIZE);
+    in.body.ptr = big; in.body.len = OC_MAX_BODY_SIZE;
+    oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &in) == OC_OK);
+    CHECK(w.len <= OC_MAX_FRAME_SIZE);
+
+    /* One byte over the body cap is rejected before any writing. */
+    in.body.len = OC_MAX_BODY_SIZE + 1;
+    oc_wbuf w2; oc_wbuf_init(&w2, frame, sizeof frame);
+    CHECK(oc_encode_send(&w2, OC_PROTOCOL_VERSION, &in) == OC_E_BODY_TOO_LARGE);
+
+    /* A writer with too small a buffer reports overflow, not a scribble. */
+    uint8_t tiny[4];
+    oc_wbuf w3; oc_wbuf_init(&w3, tiny, sizeof tiny);
+    oc_welcome wel = { 1, 0 };
+    CHECK(oc_encode_welcome(&w3, &wel) == OC_E_OVERFLOW);
+}
+
+/* --- Malformed frames --------------------------------------------------- */
+static void test_malformed(void) {
+    oc_header h; oc_rbuf p;
+
+    /* Fewer than 8 bytes: no header. */
+    uint8_t tiny[4] = {0};
+    CHECK(oc_parse_frame(tiny, sizeof tiny, &h, &p) == OC_E_MALFORMED);
+
+    /* length below the 4-byte minimum. */
+    uint8_t bad_len[8] = {0,0,0,3, 0,1, 0,2};
+    CHECK(oc_parse_frame(bad_len, sizeof bad_len, &h, &p) == OC_E_MALFORMED);
+
+    /* length claiming a frame past MAX_FRAME_SIZE. */
+    uint32_t huge = OC_MAX_FRAME_SIZE; /* 4 + huge > MAX_FRAME_SIZE */
+    uint8_t big_len[8];
+    big_len[0] = (uint8_t)(huge >> 24); big_len[1] = (uint8_t)(huge >> 16);
+    big_len[2] = (uint8_t)(huge >> 8);  big_len[3] = (uint8_t)huge;
+    big_len[4] = 0; big_len[5] = 1; big_len[6] = 0; big_len[7] = 2;
+    CHECK(oc_parse_frame(big_len, sizeof big_len, &h, &p) == OC_E_TOO_LARGE);
+
+    /* Header says length N but the buffer is short (incomplete frame). */
+    uint8_t incomplete[8] = {0,0,0,100, 0,1, 0,0x22};
+    CHECK(oc_parse_frame(incomplete, sizeof incomplete, &h, &p) == OC_E_MALFORMED);
+
+    /* A str length prefix that overruns the payload -> decode underflow. */
+    uint8_t overrun[6] = {0,1, 0,1, 0,255}; /* min_ver, max_ver, str len=255, no bytes */
+    oc_rbuf pr; oc_rbuf_init(&pr, overrun, sizeof overrun);
+    oc_hello hello;
+    CHECK(oc_decode_hello(&pr, &hello) == OC_E_MALFORMED);
+
+    /* Trailing bytes after a complete payload -> not this v1 layout. */
+    uint8_t trailing[11] = {0,2, 0,0,0,0,0,0,0,0, 0xFF}; /* welcome payload + 1 extra */
+    oc_rbuf tr; oc_rbuf_init(&tr, trailing, sizeof trailing);
+    oc_welcome wel;
+    CHECK(oc_decode_welcome(&tr, &wel) == OC_E_MALFORMED);
+}
+
+/* --- Version negotiation (§3.2) ----------------------------------------- */
+static void test_version_negotiation(void) {
+    uint16_t chosen = 0, code = 0;
+
+    /* Overlapping ranges pick min(server_max, client_max). */
+    CHECK(oc_negotiate_version(1, 3, 1, 2, &chosen, &code) == OC_OK);
+    CHECK(chosen == 2);
+    CHECK(oc_negotiate_version(1, 2, 1, 5, &chosen, &code) == OC_OK);
+    CHECK(chosen == 2);
+    CHECK(oc_negotiate_version(2, 2, 1, 2, &chosen, &code) == OC_OK);
+    CHECK(chosen == 2);
+
+    /* Client too old: its max is below the server's minimum. */
+    CHECK(oc_negotiate_version(1, 1, 2, 3, &chosen, &code) == OC_E_MALFORMED);
+    CHECK(code == OC_ERR_VERSION_TOO_OLD);
+
+    /* Client too new: its min is above the server's maximum. */
+    CHECK(oc_negotiate_version(4, 5, 1, 3, &chosen, &code) == OC_E_MALFORMED);
+    CHECK(code == OC_ERR_VERSION_TOO_NEW);
+}
+
+
+/* Storage status (REQ-214): a fixed-width report, so the round-trip is the
+ * whole contract. */
+static void test_storage_status_frames(void) {
+    uint8_t buf[256];
+    oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_storage_status in = { 1000, 200, 50, 7, 3, 2, 1, 12345, 30, 256, 1, 1 };
+    CHECK(oc_encode_storage_status(&w, OC_PROTOCOL_VERSION, &in) == OC_OK);
+
+    oc_header h; oc_rbuf r;
+    CHECK(oc_parse_frame(buf, w.len, &h, &r) == OC_OK);
+    CHECK(h.msg_type == OC_MSG_STORAGE_STATUS);
+    oc_storage_status out;
+    CHECK(oc_decode_storage_status(&r, &out) == OC_OK);
+    CHECK(out.total_bytes == 1000 && out.avail_bytes == 200);
+    CHECK(out.attach_bytes == 50 && out.attach_count == 7);
+    CHECK(out.reclaimed_orphan == 3 && out.reclaimed_expired == 2 && out.reclaimed_evicted == 1);
+    CHECK(out.last_reclaim_ms == 12345);
+    CHECK(out.max_age_days == 30 && out.reserve_bytes == 256);
+    CHECK(out.evict_enabled == 1 && out.under_pressure == 1);
+
+    /* The request carries no body. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_storage_status_req(&w, OC_PROTOCOL_VERSION) == OC_OK);
+    CHECK(oc_parse_frame(buf, w.len, &h, &r) == OC_OK);
+    CHECK(h.msg_type == OC_MSG_STORAGE_STATUS_REQ);
+}
+
+/* Every reason code is distinct.
+ *
+ * This exists because they were not. INVALID_MESSAGE (REQ-224) was added in
+ * 2026-08 reusing 3014, which REGISTER_DEVICE_TOKEN's INVALID_DEVICE_TOKEN had
+ * held since 2026-07 -- so one number meant two things and a client reading the
+ * ERROR frame could not tell which. Nothing caught it because nothing looked.
+ *
+ * Listed explicitly rather than derived: an enum cannot be enumerated in C, and
+ * a test that walks a range would pass for a code nobody remembered to add. A
+ * new reason code belongs in this array, and the compiler says nothing if it is
+ * missing -- but the next duplicate does not reach the wire.
+ */
+/* Read-aloud's frames (REQ-291-295, ARCH-111): the capability after
+ * authentication, and the download of one message's speech. */
+static void test_tts_frames(void) {
+    uint8_t frame[4096];
+    {
+        oc_tts_info in;
+        memset(&in, 0, sizeof in);
+        in.model_version = oc_slice_str("kitten-mini-0.8/ttskit-1/rate-1.2");
+        /* Three voices, with language tags of DIFFERENT lengths: the language
+         * sits inside the repeated voice list, so a field appended in the wrong
+         * place, or read as a fixed width, round-trips the first voice and
+         * mis-aligns every one after it. One voice could not tell the
+         * difference; these can. */
+        in.count = 3;
+        in.voices[0].id = oc_slice_str("expr-voice-2-m");
+        in.voices[0].label = oc_slice_str("Jasper");
+        in.voices[0].lang = oc_slice_str("en-US");
+        in.voices[1].id = oc_slice_str("expr-voice-5-f");
+        in.voices[1].label = oc_slice_str("Kiki");
+        in.voices[1].lang = oc_slice_str("zh-Hant-HK");
+        in.voices[2].id = oc_slice_str("expr-voice-3-m");
+        in.voices[2].label = oc_slice_str("Bruno");
+        in.voices[2].lang = oc_slice_str("de");
+        in.preview = oc_slice_str("This is how I read your messages.");
+        ROUNDTRIP(oc_encode_tts_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TTS_INFO, h, p);
+        oc_tts_info out;
+        CHECK(oc_decode_tts_info(&p, &out) == OC_OK);
+        CHECK(out.count == 3);
+        CHECK(slice_eq_str(out.model_version, "kitten-mini-0.8/ttskit-1/rate-1.2"));
+        CHECK(slice_eq_str(out.voices[0].lang, "en-US"));
+        CHECK(slice_eq_str(out.voices[1].id, "expr-voice-5-f"));
+        CHECK(slice_eq_str(out.voices[1].label, "Kiki"));
+        CHECK(slice_eq_str(out.voices[1].lang, "zh-Hant-HK"));
+        CHECK(slice_eq_str(out.voices[2].id, "expr-voice-3-m"));
+        CHECK(slice_eq_str(out.voices[2].lang, "de"));
+        CHECK(slice_eq_str(out.preview, "This is how I read your messages."));
+    }
+    {
+        /* A daemon without read-aloud says so with no voices at all. */
+        oc_tts_info in;
+        memset(&in, 0, sizeof in);
+        in.model_version = oc_slice_str("");
+        in.preview = oc_slice_str("");
+        ROUNDTRIP(oc_encode_tts_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TTS_INFO, h, p);
+        oc_tts_info out;
+        CHECK(oc_decode_tts_info(&p, &out) == OC_OK && out.count == 0);
+    }
+    {
+        /* More voices than the frame holds is refused rather than read as a
+         * mis-aligned rest of the payload: the count is a bound, not a hint. */
+        uint8_t payload[] = { 0, 1,                          /* min_ver, max_ver */
+                              0, 1, 'v',                     /* model_version */
+                              OC_TTS_VOICE_MAX + 1 };        /* impossible voice count */
+        oc_rbuf pr;
+        oc_rbuf_init(&pr, payload, sizeof payload);
+        oc_tts_info out;
+        CHECK(oc_decode_tts_info(&pr, &out) != OC_OK);
+    }
+    {
+        /* CAPABILITIES: names round-trip in order, including one a client does
+         * not know, and none at all is a valid answer. */
+        oc_capabilities in;
+        memset(&in, 0, sizeof in);
+        in.count = 3;
+        in.names[0] = oc_slice_str(OC_CAP_TTS);
+        in.names[1] = oc_slice_str("something-new");
+        in.names[2] = oc_slice_str(OC_CAP_STT);
+        ROUNDTRIP(oc_encode_capabilities(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CAPABILITIES, h, p);
+        oc_capabilities out;
+        CHECK(oc_decode_capabilities(&p, &out) == OC_OK && out.count == 3);
+        CHECK(slice_eq_str(out.names[0], "tts"));
+        CHECK(slice_eq_str(out.names[1], "something-new"));
+        CHECK(slice_eq_str(out.names[2], "stt"));
+    }
+    {
+        oc_capabilities in;
+        memset(&in, 0, sizeof in);
+        ROUNDTRIP(oc_encode_capabilities(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CAPABILITIES, h, p);
+        oc_capabilities out;
+        CHECK(oc_decode_capabilities(&p, &out) == OC_OK && out.count == 0);
+    }
+    {
+        /* More names than the frame holds is refused, as TTS_INFO's voices are. */
+        uint8_t payload[] = { OC_CAP_MAX + 1 };
+        oc_rbuf pr;
+        oc_rbuf_init(&pr, payload, sizeof payload);
+        oc_capabilities out;
+        CHECK(oc_decode_capabilities(&pr, &out) != OC_OK);
+    }
+    {
+        oc_voice_preview_get in = { oc_slice_str("expr-voice-5-f") };
+        ROUNDTRIP(oc_encode_voice_preview_get(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_VOICE_PREVIEW_GET, h, p);
+        oc_voice_preview_get out;
+        CHECK(oc_decode_voice_preview_get(&p, &out) == OC_OK && slice_eq_str(out.voice_id, "expr-voice-5-f"));
+    }
+    {
+        oc_stt_info in = { oc_slice_str("moonshine-tiny-streaming-en/quantized_26_08_21"), oc_slice_str("en-US"), 30000 };
+        ROUNDTRIP(oc_encode_stt_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_STT_INFO, h, p);
+        oc_stt_info out;
+        CHECK(oc_decode_stt_info(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.model_version, "moonshine-tiny-streaming-en/quantized_26_08_21"));
+        CHECK(slice_eq_str(out.lang, "en-US") && out.max_segment_ms == 30000);
+    }
+    {
+        oc_stt_begin in = { 7, OC_STT_MODE_FREE, 42, 900, {0}, 480000 };
+        for (int i = 0; i < 16; i++) in.idem[i] = (uint8_t)(0xA0 + i);
+        ROUNDTRIP(oc_encode_stt_begin(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_STT_BEGIN, h, p);
+        oc_stt_begin out;
+        CHECK(oc_decode_stt_begin(&p, &out) == OC_OK);
+        CHECK(out.segment_id == 7 && out.mode == OC_STT_MODE_FREE && out.channel_id == 42);
+        CHECK(out.thread_root == 900 && out.sample_count == 480000);
+        CHECK(!memcmp(out.idem, in.idem, 16));
+    }
+    {
+        uint8_t pcm[6] = { 1, 2, 3, 4, 5, 6 };
+        oc_stt_chunk in = { 7, 3, { pcm, sizeof pcm } };
+        ROUNDTRIP(oc_encode_stt_chunk(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_STT_CHUNK, h, p);
+        oc_stt_chunk out;
+        CHECK(oc_decode_stt_chunk(&p, &out) == OC_OK);
+        CHECK(out.segment_id == 7 && out.seq == 3 && out.data.len == 6 && !memcmp(out.data.ptr, pcm, 6));
+    }
+    {
+        oc_stt_end in = { 7 };
+        ROUNDTRIP(oc_encode_stt_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_STT_END, h, p);
+        oc_stt_end out;
+        CHECK(oc_decode_stt_end(&p, &out) == OC_OK && out.segment_id == 7);
+    }
+    {
+        oc_stt_text in = { 7, 555, oc_slice_str("Send the report to @dana.") };
+        ROUNDTRIP(oc_encode_stt_text(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_STT_TEXT, h, p);
+        oc_stt_text out;
+        CHECK(oc_decode_stt_text(&p, &out) == OC_OK);
+        CHECK(out.segment_id == 7 && out.message_id == 555 && slice_eq_str(out.text, "Send the report to @dana."));
+    }
+    {
+        oc_audio_get in = { 4242 };
+        ROUNDTRIP(oc_encode_audio_get(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUDIO_GET, h, p);
+        oc_audio_get out;
+        CHECK(oc_decode_audio_get(&p, &out) == OC_OK && out.message_id == 4242);
+    }
+    {
+        oc_audio_info in = { 4242, 5533, 18836 };
+        ROUNDTRIP(oc_encode_audio_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUDIO_INFO, h, p);
+        oc_audio_info out;
+        CHECK(oc_decode_audio_info(&p, &out) == OC_OK);
+        CHECK(out.message_id == 4242 && out.duration_ms == 5533 && out.total_size == 18836);
+    }
+    {
+        uint8_t audio[300];
+        for (size_t i = 0; i < sizeof audio; i++) audio[i] = (uint8_t)(i * 7);
+        oc_audio_chunk in = { 4242, 3, { audio, sizeof audio } };
+        ROUNDTRIP(oc_encode_audio_chunk(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUDIO_CHUNK, h, p);
+        oc_audio_chunk out;
+        CHECK(oc_decode_audio_chunk(&p, &out) == OC_OK);
+        CHECK(out.message_id == 4242 && out.seq == 3 && out.data.len == sizeof audio);
+        CHECK(out.data.ptr && memcmp(out.data.ptr, audio, sizeof audio) == 0);
+    }
+    {
+        oc_audio_end in = { 4242 };
+        ROUNDTRIP(oc_encode_audio_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUDIO_END, h, p);
+        oc_audio_end out;
+        CHECK(oc_decode_audio_end(&p, &out) == OC_OK && out.message_id == 4242);
+    }
+}
+
+static void test_reason_codes_unique(void) {
+    static const struct { const char *name; int code; } codes[] = {
+        { "MALFORMED_FRAME",        OC_ERR_MALFORMED_FRAME },
+        { "VERSION_TOO_OLD",        OC_ERR_VERSION_TOO_OLD },
+        { "VERSION_TOO_NEW",        OC_ERR_VERSION_TOO_NEW },
+        { "UNEXPECTED_MSG_TYPE",    OC_ERR_UNEXPECTED_MSG_TYPE },
+        { "VERSION_MISMATCH",       OC_ERR_VERSION_MISMATCH },
+        { "FRAME_TOO_LARGE",        OC_ERR_FRAME_TOO_LARGE },
+        { "AUTH_INVALID_TOKEN",     OC_ERR_AUTH_INVALID_TOKEN },
+        { "AUTH_REQUIRED",          OC_ERR_AUTH_REQUIRED },
+        { "AUTH_RATE_LIMITED",      OC_ERR_AUTH_RATE_LIMITED },
+        { "USER_LIMIT",             OC_ERR_USER_LIMIT },
+        { "AUTH_NOT_ALLOWED",       OC_ERR_AUTH_NOT_ALLOWED },
+        { "AUTH_SOURCE_UNAVAILABLE", OC_ERR_AUTH_SOURCE_UNAVAILABLE },
+        { "UNKNOWN_CHANNEL",        OC_ERR_UNKNOWN_CHANNEL },
+        { "NOT_A_MEMBER",           OC_ERR_NOT_A_MEMBER },
+        { "BODY_TOO_LARGE",         OC_ERR_BODY_TOO_LARGE },
+        { "SEND_RATE_LIMITED",      OC_ERR_SEND_RATE_LIMITED },
+        { "FORBIDDEN",              OC_ERR_FORBIDDEN },
+        { "LAST_OWNER",             OC_ERR_LAST_OWNER },
+        { "UNKNOWN_MESSAGE",        OC_ERR_UNKNOWN_MESSAGE },
+        { "INVALID_CHANNEL",        OC_ERR_INVALID_CHANNEL },
+        { "INVALID_REACTION",       OC_ERR_INVALID_REACTION },
+        { "ATTACHMENT_TOO_LARGE",   OC_ERR_ATTACHMENT_TOO_LARGE },
+        { "UNKNOWN_ATTACHMENT",     OC_ERR_UNKNOWN_ATTACHMENT },
+        { "STORAGE_FULL",           OC_ERR_STORAGE_FULL },
+        { "ATTACHMENT_GONE",        OC_ERR_ATTACHMENT_GONE },
+        { "INVALID_DEVICE_TOKEN",   OC_ERR_INVALID_DEVICE_TOKEN },
+        { "TRANSFER_PROTOCOL",      OC_ERR_TRANSFER_PROTOCOL },
+        { "UNKNOWN_WEBHOOK",        OC_ERR_UNKNOWN_WEBHOOK },
+        { "CHANNEL_EXISTS",         OC_ERR_CHANNEL_EXISTS },
+        { "TOO_MANY_PINS",          OC_ERR_TOO_MANY_PINS },
+        { "CHANNEL_ARCHIVED",       OC_ERR_CHANNEL_ARCHIVED },
+        { "INVALID_MESSAGE",        OC_ERR_INVALID_MESSAGE },
+        { "INTERNAL",               OC_ERR_INTERNAL },
+    };
+    const size_t n = sizeof codes / sizeof codes[0];
+    for (size_t i = 0; i < n; i++) {
+        for (size_t j = i + 1; j < n; j++) {
+            if (codes[i].code == codes[j].code)
+                printf("  FAIL reason code %d is both %s and %s\n",
+                       codes[i].code, codes[i].name, codes[j].name);
+            CHECK(codes[i].code != codes[j].code);
+        }
+    }
+    /* The specific collision this test was written for. */
+    CHECK(OC_ERR_INVALID_MESSAGE != OC_ERR_INVALID_DEVICE_TOKEN);
+}
+
+/* Every reason code the protocol defines has words a person reads (the client
+ * shows them, not the server's text). Read from the header itself, so a code
+ * added without its words fails here. */
+static void test_error_texts(void) {
+    FILE *f = fopen("shared/protocol.h", "r");
+    CHECK(f != NULL);
+    if (!f) return;
+    char line[512];
+    int seen = 0;
+    while (fgets(line, sizeof line, f)) {
+        char name[64]; unsigned code = 0;
+        if (sscanf(line, " OC_ERR_%63[A-Z_] = %u", name, &code) != 2) continue;
+        seen++;
+        const char *t = oc_error_text((uint16_t)code);
+        if (!t || !t[0]) printf("  FAIL no words for OC_ERR_%s (%u)\n", name, code);
+        CHECK(t && t[0]);
+    }
+    fclose(f);
+    CHECK(seen >= 50);
+    CHECK(oc_error_text(65000) == NULL);
+}
+
+int run_protocol_tests(void) {
+    printf("test_protocol: primitives, handshake, auth, messaging, backfill,\n");
+    printf("               error, size limits, malformed frames, version negotiation\n");
+    test_reason_codes_unique();
+    test_error_texts();
+    test_primitives();
+    test_device_token_ok();
+    test_handshake_frames();
+    test_pdm_frames();
+    test_auth_frames();
+    test_messaging_frames();
+    test_reaction_frames();
+    test_unfurl_frame();
+    test_forward_frame();
+    test_action_frames();
+    test_poll_frames();
+    test_thread_frames();
+    test_thread_list_frames();
+    test_mark_all_read_frame();
+    test_failed_frame_rolls_back();
+    test_channel_description_frames();
+    test_channel_frames();
+    test_admin_frames();
+    test_search_frames();
+    test_presence_frames();
+    test_attachment_frames();
+    test_file_frames();
+    test_webhook_frames();
+    test_group_frames();
+    test_notify_frames();
+    test_draft_frames();
+    test_client_settings_frames();
+    test_read_cursor_frames();
+    test_storage_status_frames();
+    test_profile_frames();
+    test_tts_frames();
+    test_call_frames();
+    test_backfill_and_error();
+    test_size_limits();
+    test_malformed();
+    test_version_negotiation();
+    return failures;
+}

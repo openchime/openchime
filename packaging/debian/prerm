@@ -1,0 +1,23 @@
+#!/bin/sh
+# Stop the service before the files go away. On an upgrade dpkg calls prerm with
+# "upgrade" and postinst restarts it afterwards, so only a real removal stops it
+# for good.
+set -e
+
+case "$1" in
+  remove|deconfigure)
+    if [ -d /run/systemd/system ]; then
+      systemctl --no-reload disable --now openchimed.service >/dev/null 2>&1 || true
+    fi
+    ;;
+
+  upgrade|failed-upgrade)
+    ;;
+
+  *)
+    echo "prerm called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

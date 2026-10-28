@@ -1,0 +1,122 @@
+# Pull request policy. The title becomes the commit subject once merged
+# (squash-only merges, repo setting), so the title is what is checked here.
+# The body must be empty; the description lives in the issue, not the PR.
+name: pr-policy
+
+on:
+  pull_request:
+    # 'edited' matters: the title is a checked artifact and the default type
+    # list does not include it.
+    types: [opened, synchronize, reopened, edited]
+    # staging only: nothing takes a pull request into main.
+    branches: [staging]
+
+concurrency:
+  group: pr-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: pr policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # The required check `guard`, posted from here: the attribution scan is a
+      # step of this job rather than a job of its own, which would cost a
+      # runner start for seconds of work.
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Attribution scan
+        id: scan
+        continue-on-error: true
+        env:
+          EVENT: pull_request
+          BASE_REF: ${{ github.base_ref }}
+          REF: ${{ github.ref }}
+          BEFORE: ""
+          AFTER: ""
+        run: scripts/release/attribution_scan.sh
+      - name: Report the guard
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OUTCOME: ${{ steps.scan.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$OUTCOME" = success ]; then c=success; t="no banned reference in the new commits"
+          else c=failure; t="a banned reference, or the scan could not run"; fi
+          gh api "repos/${GITHUB_REPOSITORY}/check-runs" -f name=guard -f head_sha="$HEAD_SHA" \
+            -f status=completed -f conclusion="$c" -f details_url="$RUN_URL" \
+            -f "output[title]=$t" -f "output[summary]=$t: a step of pr policy, in ${RUN_URL}" >/dev/null
+          echo "guard: $c"
+      # A pull request that changes only documentation skips the local test run
+      # (.githooks/pre-push), so the tree's no-issue-numbers rule is checked
+      # here over the pull request's tree, with the base branch's copy of
+      # scripts/check/refs.sh: nothing of the pull request's runs.
+      - name: No issue numbers in the tree
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git worktree add -q "$RUNNER_TEMP/base" "origin/${BASE}"
+          git worktree add -q "$RUNNER_TEMP/head" HEAD
+          cd "$RUNNER_TEMP/head" && sh "$RUNNER_TEMP/base/scripts/check/refs.sh"
+      - name: Title and body
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Through env, never inline: an expression is substituted as text
+          # before bash parses the line, and a title is attacker-controlled.
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          # The tracker OC-N numbers, wherever this runs; the workflow token reads it.
+          ISSUES_REPO: openchime/openchime
+        run: |
+          set -uo pipefail
+          fail=0
+
+          # GitHub appends the pull request number in parentheses when it
+          # squashes, so the committed subject is longer than the title.
+          # Check what will actually be committed.
+          SUBJECT="${TITLE} (#${NUMBER})"
+
+          if ! grep -qE '^OC-[0-9]+: [A-Z]([^[:cntrl:]]*[^.,;:!?[:space:]])?$' <<<"$TITLE"; then
+            echo "::error::Title must read 'OC-<issue>: Capitalised description' with no trailing punctuation. Got: ${TITLE}"
+            fail=1
+          fi
+
+          if [ "${#SUBJECT}" -gt 72 ]; then
+            echo "::error::Subject will be ${#SUBJECT} chars once GitHub appends ' (#${NUMBER})', limit 72."
+            fail=1
+          fi
+
+          if [ -n "${BODY//[$'\r\n\t ']/}" ]; then
+            echo "::error::Pull request body must be empty. The description belongs in the issue."
+            fail=1
+          fi
+
+          # The number must be an OPEN ISSUE on the tracker.
+          # Issues and pull requests share one counter, so a format-only check
+          # accepts a pull request number.
+          P=$(printf '%s' "$TITLE" | sed -nE 's/^(OC)-[0-9]+:.*/\1/p')
+          N=$(printf '%s' "$TITLE" | sed -nE 's/^OC-([0-9]+):.*/\1/p')
+          REPO="$ISSUES_REPO"
+          if [ -n "$N" ]; then
+            if ! J=$(gh api "repos/${REPO}/issues/${N}" 2>/tmp/e); then
+              grep -qF '(HTTP 404)' /tmp/e \
+                && echo "::error::${P}-${N} is not an issue on ${REPO}." \
+                || echo "::error::Could not check ${P}-${N}: $(head -1 /tmp/e)"
+              fail=1
+            elif [ "$(jq -r 'if .pull_request then "pr" else .state end' <<<"$J")" != open ]; then
+              echo "::error::${P}-${N} is not an open issue on ${REPO}."
+              fail=1
+            fi
+          fi
+
+          [ "$fail" = 0 ] && echo "pr policy ok" || exit 1

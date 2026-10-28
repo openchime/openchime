@@ -1,0 +1,112 @@
+/*
+ * OpenChime client — workspace resolution (REQ-010/011, ARCH-14). Turns a
+ * user-typed *workspace* (a self-hosted domain like `chat.acme.com`, or a bare
+ * hosted-tier name like `acme`) into a daemon `host:port` by **plain DNS**, with
+ * no hosted resolution service: a bare name gets the configured DNS suffix
+ * appended, then the domain is resolved via an SRV record
+ * (`_openchime._tcp.<domain>`), falling back to the domain's A/AAAA record at
+ * 443. Resolution failure is reported as a distinct status so the caller can tell
+ * "this org doesn't exist" apart from "unreachable" and "login failed" (REQ-011).
+ *
+ * The optional `.well-known` half of REQ-010 is consulted when SRV says nothing:
+ * see wellknown.h for the document, and for why its fetch insists on a verified
+ * chain. It cannot move the host -- the A record does that -- but it may name
+ * the port, which is second in the precedence SRV > `.well-known` > 443
+ * (ARCH-54). A document that is present and malformed is its own failure
+ * (REQ-011), not "this workspace does not exist".
+ */
+
+#ifndef OC_RESOLVE_H
+#define OC_RESOLVE_H
+
+#include <stddef.h>
+
+typedef enum {
+    OC_RESOLVE_OK = 0,
+    OC_RESOLVE_BAD_WORKSPACE,   /* empty / malformed workspace string */
+    OC_RESOLVE_NOT_FOUND,      /* the workspace does not resolve in DNS (REQ-011) */
+    /* The domain resolves and serves `.well-known` metadata that is not what it
+     * claims to be (REQ-011). Distinct from NOT_FOUND on purpose: the operator
+     * published something, and "does not exist" would send them looking in the
+     * wrong place entirely. */
+    OC_RESOLVE_BAD_METADATA
+} oc_resolve_status;
+
+/* `domain` is the workspace's own name after suffixing — what the connection
+ * names in its TLS handshake (SNI), even when an SRV record sent `host` somewhere
+ * else: a shared front door routes by workspace, not by where it was reached. */
+/* `fingerprint` is the daemon certificate the `.well-known` document named, if
+ * it named one (ARCH-10) -- carried because the document is where it lives, and
+ * empty otherwise. */
+typedef struct { char host[256]; int port; char domain[256]; char fingerprint[96]; } oc_endpoint;
+
+/* The service's own DNS suffix (ARCH-14). A hosted tenant is reached by bare
+ * name — `acme` -> `acme.workspace.openchime.io` — which is what REQ-010 means by "the
+ * client appends the service's known DNS suffix as a pure client-side string
+ * convention". Self-hosted tenants type a full domain instead, which passes
+ * through untouched. */
+#define OC_SERVICE_SUFFIX "workspace.openchime.io"
+
+/* The suffix a frontend should hand to oc_resolve(): OC_SERVICE_SUFFIX, or in a
+ * development mode $OPENCHIME_DEV_SUFFIX when set (a test's own). Exists so every
+ * frontend agrees on the default instead of each calling getenv() and getting NULL. */
+const char *oc_default_suffix(void);
+
+/* Does the hosted suffix belong beside what has been typed so far? Only a bare
+ * name takes it (`acme` -> `acme.<suffix>`), so a frontend that shows the suffix
+ * as a hint beside its workspace field shows it for that and for an empty field
+ * -- never beside an address, a `:port`, a scheme or path, a dotted name or
+ * `localhost`, which resolve as typed. 1 or 0; 0 whenever `suffix` is empty. */
+int oc_workspace_takes_suffix(const char *typed, const char *suffix);
+
+/* Normalize a workspace to a DNS domain: strip a leading scheme (`x://`) and any
+ * trailing `:port`/path; a bare name (no dot) gets `.<suffix>` appended when a
+ * non-empty suffix is given (`acme` -> `acme.openchime.example`), while a name
+ * that already contains a dot passes through. Returns 0 on success (domain in
+ * `out`), -1 if the workspace is empty or does not fit. */
+int oc_resolve_domain(const char *workspace, const char *suffix, char *out, size_t cap);
+
+/* Parse a raw DNS SRV answer, choosing the lowest-priority (most-preferred)
+ * target. Returns 0 and fills host/port, or -1 if the answer has no usable SRV
+ * record. Exposed for testing with a canned answer (no live DNS). */
+int oc_srv_parse(const unsigned char *answer, int len, char *host, size_t hostcap, int *port);
+
+/* `host:port` as text a person or a key reads: an IPv6 host in brackets
+ * (`[2001:db8::10]:9640`), anything else as `host:port`, byte-for-byte what it
+ * always was. 0, or -1 if it does not fit. */
+int oc_hostport(const char *host, int port, char *out, size_t cap);
+
+/* Is `host` this machine? `localhost`, IPv4 127.0.0.0/8, `::1` in any spelling
+ * (bracketed or not), and an IPv4-mapped 127.x. */
+int oc_addr_is_loopback(const char *host);
+
+/* How many SRV queries, DNS lookups and `.well-known` requests resolution has
+ * made, process-wide: a test hook, so "an address makes none" is counted rather
+ * than inferred (an address literal is used as given, see oc_resolve). */
+void oc_resolve_counts(unsigned *srv, unsigned *dns, unsigned *wellknown);
+
+/* Resolve a workspace to a daemon endpoint. An address -- IPv4, or IPv6 bare or
+ * in brackets, with or without `:port` -- is used as given, before anything
+ * else: no SRV query, no DNS, no `.well-known` request; its port, or 443. The
+ * host comes back in canonical form, IPv6 unbracketed; `domain` brackets it.
+ * `suffix` is the hosted-tier DNS suffix for bare names (NULL/"" disables
+ * suffixing). See the header comment for the SRV -> A fallback order for names,
+ * and the distinct failure statuses. */
+oc_resolve_status oc_resolve(const char *workspace, const char *suffix, oc_endpoint *out);
+
+/* The key a workspace's credential entry is filed under: the workspace AS NAMED —
+ * its domain (oc_resolve_domain), lowercased, with the port only if one was
+ * typed. Not the address resolution produced: that is an answer, and answers
+ * change — an SRV record moves, two names share a front door — while the pin and
+ * the session belong to the name a person trusted. `acme`, `Acme` and
+ * `acme.workspace.openchime.io` are one key; `127.0.0.1:8443` is its own. 0, or -1 if the
+ * workspace is empty or does not fit. */
+int oc_workspace_key(const char *workspace, const char *suffix, char *out, size_t cap);
+
+/* The name a connection to `name` sends as SNI, into `out`: the name itself, minus
+ * any `:port` and brackets — or nothing (returns 0) when it is an IPv4 or IPv6
+ * literal, which RFC 6066 §3 forbids in SNI and mbedTLS would send unchecked.
+ * `localhost` is a name, and is sent. Accepts a workspace key. */
+int oc_sni_name(const char *name, char *out, size_t cap);
+
+#endif /* OC_RESOLVE_H */

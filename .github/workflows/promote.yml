@@ -1,0 +1,141 @@
+# Put documentation on main without a release.
+#
+# main is a line of snapshot commits, fast-forward only (scripts/release/
+# main_next.sh). This appends one, "Documentation": main's tree with every
+# documentation-only commit on staging that main has not taken yet
+# (scripts/release/docs_only.sh) applied on top, in staging's order, each named
+# with its patch-id in a "Docs:" trailer. One that does not apply to main, or
+# that names a setting main's daemon/config_table.c does not have, is skipped
+# and named, and the rest go on; it reaches main with the release that carries its
+# commit. main then moves with the deploy key, a plain fast-forward, and is
+# copied to the public repository (the PUBLIC_REPO variable) the same way. No build, no tag, no number, and
+# no issue is closed: an issue closes when a release ships it.
+name: promote
+
+# Dispatched by hand on staging, whenever documentation should reach main
+# ahead of the next release; nothing starts it on its own:
+#   gh workflow run promote.yml --ref staging
+on:
+  workflow_dispatch:
+
+# Its own group, so a promote never displaces a release waiting in `release`.
+# main is safe without sharing one: the new snapshot's parent is the main it
+# was built on, and a plain push of it is refused if main moved since.
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # One job: each step is seconds of work, and a job costs a runner start.
+  promote:
+    name: put documentation on main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Refuse any other ref or repository
+        env:
+          REF: ${{ github.ref }}
+          REPO: ${{ github.repository }}
+          RELEASE_REPO: ${{ vars.RELEASE_REPO }}
+        run: |
+          [ -n "$RELEASE_REPO" ] && [ "$REPO" = "$RELEASE_REPO" ] || {
+            echo "::error::promote runs only in the repository the RELEASE_REPO variable names"; exit 1; }
+          [ "$REF" = "refs/heads/staging" ] || {
+            echo "::error::promote runs on staging only (this run is on ${REF})"; exit 1; }
+      # staging's checkout: the scripts below are staging's.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - id: next
+        name: Build the Documentation snapshot
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main" "+refs/heads/staging:refs/remotes/origin/staging"
+          from=$(git rev-parse origin/main)
+          to=$(scripts/release/main_next.sh docs origin/staging "$from")
+          echo "FROM=${from}" >> "$GITHUB_ENV"
+          echo "TO=${to}" >> "$GITHUB_ENV"
+          if [ -n "$to" ]; then echo "made=true" >> "$GITHUB_OUTPUT"; else echo "made=false" >> "$GITHUB_OUTPUT"; fi
+
+      # What main is about to take, checked first: each documentation commit it
+      # carries and the snapshot itself are scanned for a banned reference,
+      # which refuses the promotion; each commit's subject is held to the
+      # commit policy, which only warns, as in the staging build; and the tree
+      # main would have is scanned for issue references (scripts/check/refs.sh).
+      - name: Check what main takes
+        if: steps.next.outputs.made == 'true'
+        env:
+          EVENT: push
+          REF: refs/heads/main
+          BASE_REF: ""
+        run: |
+          set -euo pipefail
+          BEFORE="$FROM" AFTER="$TO" scripts/release/attribution_scan.sh
+          docs=$(git log -1 --format='%(trailers:key=Docs,valueonly,separator=%x0A)' "$TO" | awk 'NF {print $1}')
+          for d in $docs; do
+            BEFORE="${d}^" AFTER="$d" scripts/release/attribution_scan.sh
+            if ! BEFORE="${d}^" GITHUB_SHA="$d" scripts/release/commit_policy.sh 2>&1 | sed -u 's/^::error::/::warning::/'; then
+              echo "::warning::$(git log -1 --format='%h %s' "$d") does not meet the commit policy; reported, not enforced"
+            fi
+          done
+          tree="$RUNNER_TEMP/next-main"
+          mkdir -p "$tree"
+          git archive "$TO" | tar -x -C "$tree"
+          (cd "$tree" && sh "$GITHUB_WORKSPACE/scripts/check/refs.sh")
+
+      # A plain push: a fast-forward of the main the snapshot was built on, so
+      # one that moved since refuses it.
+      - name: Move main
+        if: steps.next.outputs.made == 'true'
+        env:
+          KEY: ${{ secrets.RELEASE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$KEY" ] || { echo "::error::RELEASE_SSH_KEY is not set in the release environment"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/release_key
+          chmod 600 ~/.ssh/release_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          GIT_SSH_COMMAND="ssh -i $HOME/.ssh/release_key -o IdentitiesOnly=yes" \
+            git push "git@github.com:${GITHUB_REPOSITORY}.git" "${TO}:refs/heads/main"
+          echo "main moved from ${FROM:0:7} to ${TO:0:7}"
+          git log -1 --format='%B' "$TO"
+
+      # main here, copied exactly to the public repository (skipped when the
+      # PUBLIC_REPO variable is unset): whatever main is now,
+      # also when nothing was added, so a copy that failed before catches up.
+      # A fast-forward only: a main there that is not an ancestor of main here
+      # is never overwritten, and is reported as an error to put right by hand.
+      - name: Copy main to the public repository
+        if: vars.PUBLIC_REPO != ''
+        continue-on-error: true
+        env:
+          KEY: ${{ secrets.PUBLIC_DEPLOY_KEY }}
+          PUBLIC_REPO: ${{ vars.PUBLIC_REPO }}
+        run: |
+          set -euo pipefail
+          [ -n "$KEY" ] || { echo "::warning::PUBLIC_DEPLOY_KEY is not set in the release environment; nothing copied"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/public_key
+          chmod 600 ~/.ssh/public_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main"
+          now=$(git rev-parse origin/main)
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/public_key -o IdentitiesOnly=yes"
+          remote="git@github.com:${PUBLIC_REPO}.git"
+          there=$(git ls-remote "$remote" refs/heads/main | cut -f1)
+          if [ "$there" = "$now" ]; then echo "${PUBLIC_REPO}: main already is ${now:0:7}"; exit 0; fi
+          if [ -n "$there" ]; then
+            git fetch --quiet "$remote" "+refs/heads/main:refs/remotes/public/main"
+            git merge-base --is-ancestor "$there" "$now" || {
+              echo "::error::main on ${PUBLIC_REPO} (${there:0:7}) is not an ancestor of main here (${now:0:7}); not copied. Put it right by hand"; exit 1; }
+          fi
+          git push "$remote" "${now}:refs/heads/main"
+          echo "${PUBLIC_REPO}: main is ${now:0:7}"

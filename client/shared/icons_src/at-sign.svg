@@ -1,0 +1,12 @@
+<!-- Hand-authored for OpenChime, not from Lucide — kept out of third_party so
+     the ISC attribution there stays accurate. Lucide conventions: 24x24 box,
+     2px stroke, round caps/joins. The composer's mention button. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+     fill="none" stroke="currentColor" stroke-width="2"
+     stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="4" />
+  <path d="M16 8 L16 13.5 C16 15.4 17.6 16.5 19.2 15.7
+           C20.7 14.9 21.5 13.1 21.5 11.2
+           C21.5 5.9 17.2 2 12 2 C6.5 2 2 6.5 2 12
+           C2 17.5 6.5 22 12 22 C14.2 22 16.3 21.3 18 20" />
+</svg>

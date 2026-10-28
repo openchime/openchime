@@ -1,0 +1,1612 @@
+/*
+ * OpenChime DB-writer thread (ARCH-5) + the write-job queue.
+ *
+ * The single SQLite write connection is owned by one dedicated thread; the
+ * network event loop never touches the database. The net thread submits jobs
+ * (AUTH, SEND) via oc_dbwriter_submit and is woken to collect results by an
+ * eventfd it polls in epoll (ARCH-22) — keeping all socket I/O on the net
+ * thread and all DB writes on this one. On startup the writer opens the
+ * database in WAL mode and applies migrations (ARCH-27).
+ */
+
+#ifndef OPENCHIME_DBWRITER_H
+#define OPENCHIME_DBWRITER_H
+
+#include "sum_worker.h"   /* summaries: the worker's batch and answer (ARCH-116) */
+#include <stddef.h>
+#include <stdint.h>
+
+#include "protocol.h"   /* OC_SESSION_TOKEN_LEN, OC_AUTH_*, OC_ROLE_* */
+
+#define OC_IDEM_LEN 16
+
+/* The stub AUTH auto-provisions this one shared channel and joins every user to
+ * it, so the SEND/BROADCAST path has somewhere to deliver. Real channel
+ * create/join is a later feature. */
+#define OC_DEFAULT_CHANNEL 1
+
+/* ARCH-104's participation predicate, written ONCE. Three callers ask "is this
+ * user in this thread" — the push audience (REQ-061), the cross-channel thread
+ * list (REQ-062), and the per-recipient byte on THREAD_REPLY — and ARCH-104
+ * requires that they cannot disagree, because a view that lists a thread while
+ * the notification skips it is two answers to one question.
+ *
+ * Participation is DERIVED, never stored: you are in a thread if you wrote its
+ * root or a live reply to it. `thread_follows` carries only overrides — state 1
+ * an explicit follow of one you never wrote in, state 0 an explicit unfollow.
+ * The UNFOLLOW is an outer guard rather than an arm of the OR, because it
+ * OUTRANKS having replied: that is the whole meaning of "turn off replies", and
+ * it is the rule a plain OR silently loses.
+ *
+ * A deleted reply does not keep you in a thread. Deriving rather than storing is
+ * what makes that answerable at all (ARCH-104's own argument for the shape), and
+ * the two hand-written copies this replaces disagreed about it — the list
+ * excluded deleted replies and the push audience did not.
+ *
+ * `usr` and `root` are SQL expressions, so a caller substitutes its own column
+ * or bind parameter. Both are used more than once; neither may have side
+ * effects. */
+#define OC_THREAD_PARTICIPANT_SQL(usr, root)                                    \
+    "( NOT EXISTS(SELECT 1 FROM thread_follows tfx "                            \
+    "              WHERE tfx.user_id = " usr " AND tfx.root_id = " root " "     \
+    "                AND tfx.state = 0) "                                       \
+    "  AND ( EXISTS(SELECT 1 FROM messages rmx "                                \
+    "                WHERE rmx.id = " root " AND rmx.author_id = " usr ") "     \
+    "     OR EXISTS(SELECT 1 FROM messages rpx "                                \
+    "                WHERE rpx.parent_id = " root " AND rpx.author_id = " usr " " \
+    "                  AND rpx.deleted_at_ms IS NULL) "                         \
+    "     OR EXISTS(SELECT 1 FROM thread_follows tfy "                          \
+    "                WHERE tfy.user_id = " usr " AND tfy.root_id = " root " "   \
+    "                  AND tfy.state = 1) ) )"
+
+/* --- Jobs (net thread -> writer) ---------------------------------------- */
+
+enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 4,
+       OC_JOB_SET_ROLE = 5, OC_JOB_LOGOUT = 6, OC_JOB_EDIT = 7, OC_JOB_DELETE = 8,
+       OC_JOB_CREATE_CHANNEL = 9, OC_JOB_LIST_CHANNELS = 10, OC_JOB_JOIN_CHANNEL = 11,
+       OC_JOB_LEAVE_CHANNEL = 12, OC_JOB_INVITE_CHANNEL = 13, OC_JOB_REMOVE_CHANNEL = 14,
+       OC_JOB_LIST_USERS = 15, OC_JOB_INVITE_USER = 16, OC_JOB_REMOVE_USER = 17,
+       OC_JOB_REDEEM = 18, OC_JOB_REACT = 19, OC_JOB_LIST_REACTIONS = 20,
+       OC_JOB_SEND_REPLY = 21, OC_JOB_LIST_THREAD = 22, OC_JOB_SEARCH = 23,
+       OC_JOB_SETUP_INVITE = 24, OC_JOB_CLIENT_ACK = 25,
+       OC_JOB_LOAD_IDENTITY = 26, OC_JOB_STORE_IDENTITY = 27, OC_JOB_OPEN_DM = 28,
+       OC_JOB_TYPING = 29,
+       /* Pins (REQ-230, ARCH-90). PIN is a write (add/remove); LIST_PINS is a
+        * read served on the reader connection. */
+       OC_JOB_PIN = 62, OC_JOB_LIST_PINS = 63,
+       /* Channel details (REQ-031, REQ-143). Both reads. */
+       OC_JOB_LIST_MEMBERS = 64, OC_JOB_LIST_FILES = 65,
+       /* Channel mutability (REQ-034/035/036, ARCH-93). */
+       OC_JOB_UPDATE_CHANNEL = 66,
+       /* Saved items + activity (REQ-231/139, ARCH-95). SAVE is a write; the
+        * two listings are reads. */
+       OC_JOB_SAVE_ITEM = 67, OC_JOB_LIST_SAVED = 68, OC_JOB_LIST_ACTIVITY = 69,
+       /* Attachments (REQ-140/141, ARCH-69/70). CREATE mints a pending row + a
+        * storage key on UPLOAD_BEGIN (write); FINALIZE records the streamed
+        * size + digest on UPLOAD_END (write); LOOKUP authorizes + fetches the
+        * pointer for a download (read). */
+       OC_JOB_ATTACH_CREATE = 30, OC_JOB_ATTACH_FINALIZE = 31,
+       OC_JOB_ATTACH_LOOKUP = 32,
+       /* Incoming webhooks (REQ-170). CREATE_WEBHOOK mints a per-channel token
+        * for a client; WEBHOOK_POST resolves a token presented over HTTP and
+        * posts the message as the webhook's creator. */
+       OC_JOB_CREATE_WEBHOOK = 33, OC_JOB_WEBHOOK_POST = 34,
+       OC_JOB_LIST_WEBHOOKS = 35, OC_JOB_DELETE_WEBHOOK = 36,
+       /* Notification preferences (REQ-130/131). */
+       OC_JOB_SET_NOTIFY_PREF = 37, /* 38 was SET_DND, retired with REQ-131's window */
+       OC_JOB_LIST_NOTIFY_PREFS = 39,
+       /* Audio call join authorization (REQ-150): read job, channel access gate. */
+       OC_JOB_CALL_AUTH = 40,
+       /* Synced client settings bucket. SET upserts/deletes one key; LIST reads a
+        * client_type bucket. Both answer with a CLIENT_SETTINGS snapshot. */
+       OC_JOB_SET_CLIENT_SETTING = 41, OC_JOB_LIST_CLIENT_SETTINGS = 42,
+       /* Self-service profile (REQ-020): rename yourself / rotate your local
+        * password (verifies the old one). Both are writes. */
+       OC_JOB_SET_DISPLAY_NAME = 43, /* 44 was CHANGE_PASSWORD: passwords change on the page */
+       /* Storage maintenance pass (ARCH-78): find what to reclaim. Read-mostly
+        * but it tombstones rows, so it runs on the writer. */
+       OC_JOB_STORAGE_MAINT = 45,
+       /* Storage usage report for an owner/admin (REQ-214). Read-only. */
+       OC_JOB_STORAGE_STATUS = 46,
+       OC_JOB_AUDIT_QUERY = 47,
+       OC_JOB_LOAD_ENROLLMENT = 48, OC_JOB_STORE_ENROLLMENT = 49,
+       /* Push device tokens (ARCH-85, REQ-132). REGISTER/UNREGISTER are client
+        * writes; PRUNE is submitted by the push worker when central reports a
+        * token stale (fire-and-forget, no result). */
+       OC_JOB_REGISTER_DEVICE_TOKEN = 50, OC_JOB_UNREGISTER_DEVICE_TOKEN = 51,
+       OC_JOB_PRUNE_DEVICE_TOKEN = 52,
+       /* Page backwards through one channel's history (§6.3). Read-only; it
+        * answers with the same BACKFILL_OK shape the forward replay uses. */
+       OC_JOB_HISTORY = 53,
+       /* Invite management (REQ-026) and webhook lifecycle. Both
+        * read/write tables that already had the columns; only the ops were missing. */
+       OC_JOB_LIST_INVITES = 54, OC_JOB_REVOKE_INVITE = 55,
+       OC_JOB_SET_WEBHOOK_STATE = 56, OC_JOB_ROTATE_WEBHOOK = 57,
+       /* Mute (REQ-137) and mark-unread (REQ-235). The latter is deliberately NOT
+        * OC_JOB_CLIENT_ACK: that one may only advance. */
+       OC_JOB_SET_MUTE = 58, OC_JOB_SET_READ_CURSOR = 59,
+       /* Custom status (REQ-241) and profile fields (REQ-240).
+        *
+        * Numbered from 70, PAST the current maximum, not into the gap at 54-61: this
+        * enum has gaps AND a later block (PIN..LIST_ACTIVITY at 62-69), so "the next
+        * free-looking number" collided GET_PROFILE with OC_JOB_PIN. The dispatcher
+        * then routed every pin to the profile handler, which the pin tests caught —
+        * reading the enum would not have, because the two declarations are 200 lines
+        * apart. New jobs go after the highest value, always. */
+       OC_JOB_SET_STATUS = 70, OC_JOB_SET_PROFILE = 71, OC_JOB_GET_PROFILE = 72,
+       OC_JOB_LIST_FILE_CHANNELS = 73,   /* */
+       OC_JOB_LIST_SESSIONS = 74,        /* REQ-182 */
+       OC_JOB_SET_NOTIFY_DEFAULT = 75,   /* REQ-134 */
+       OC_JOB_SET_AVATAR = 76,           /* */
+       OC_JOB_OPEN_GROUP_DM = 77,        /* REQ-056 */
+       /* Custom emoji (REQ-072). ADD carries ch_name + message_id (attachment). */
+       OC_JOB_ADD_EMOJI = 78, OC_JOB_DELETE_EMOJI = 79, OC_JOB_LIST_EMOJI = 80,
+       /* Drafts (REQ-223, ARCH-101). SET reuses channel_id + parent_id (the
+        * thread root) + body/body_len — the same fields SEND already carries,
+        * because a draft is the message you have not sent. */
+       OC_JOB_SET_DRAFT = 81, OC_JOB_LIST_DRAFTS = 82,
+       /* Scheduled messages (REQ-224, ARCH-102). FIRE_SCHEDULED is raised by the
+        * netloop's timer with no connection behind it, like STORAGE_MAINT. */
+       OC_JOB_SCHEDULE = 83, OC_JOB_LIST_SCHEDULED = 84,
+       OC_JOB_CANCEL_SCHEDULED = 85, OC_JOB_UPDATE_SCHEDULED = 86,
+       OC_JOB_FIRE_SCHEDULED = 87,
+       /* Pause notifications (REQ-278). Minutes from now in `snooze_minutes`,
+        * 0 to end it — one job, because ending early is just "until now". */
+       OC_JOB_SET_SNOOZE = 88,
+       /* The recurring schedule and the two alert lists (REQ-135/136). Each
+        * REPLACES what was there: the lists are short and a client editing one
+        * holds all of it, so an add/remove pair would need ids for terms that
+        * are their own identity. */
+       OC_JOB_SET_SCHEDULE = 89, OC_JOB_SET_KEYWORDS = 90, OC_JOB_SET_PRIORITY = 91,
+       /* Threads across channels (REQ-062, ARCH-104). */
+       OC_JOB_LIST_THREADS = 92, OC_JOB_SET_THREAD_FOLLOW = 93,
+       OC_JOB_MARK_THREAD_READ = 94,
+       /* The client's current UTC offset, refreshed on every connect (ARCH-103).
+        * Fire-and-forget: nothing is returned, because nothing about the
+        * session changes — it only keeps the stored offset from going stale
+        * when the user travels or crosses a daylight-saving boundary. */
+       OC_JOB_SET_TZ_OFFSET = 95,
+       /* Store a completed link unfurl (REQ-222, ARCH-105). Submitted by the
+        * unfurl worker with conn_id 0 — never by a client frame. */
+       OC_JOB_UNFURL_STORE = 96,
+       /* Mark a finalized upload as a video message (REQ-162/164, ARCH-110).
+        * attachment_id + media_* below; att_size carries the byte cap. Write. */
+       OC_JOB_ATTACH_MEDIA_SET = 97,
+       /* Read-aloud (REQ-291-293, ARCH-111). LOOKUP is the whole question a
+        * client's AUDIO_GET asks: may this user read the message, is there
+        * anything to say, in whose voice, and has that rendering been made
+        * already. Read. STORE records a finished rendering, TOUCH marks one used
+        * (both conn_id 0, fire and forget), VOICE_SET writes back the voice the
+        * daemon chose for an author so it is visible and correctable. Writes. */
+       OC_JOB_TTS_LOOKUP = 98, OC_JOB_TTS_STORE = 99, OC_JOB_TTS_TOUCH = 100,
+       OC_JOB_TTS_VOICE_SET = 101, OC_JOB_TTS_PREVIEW = 102,
+       /* Voice input (REQ-296-300, ARCH-112): before a segment is recognized,
+        * may this user put words in this conversation -- post, in free talk;
+        * read, in push to talk -- and who are its members, by display name, for
+        * turning a spoken "at Name" into a mention. user_id, channel_id,
+        * stt_mode, stt_req. Read. */
+       OC_JOB_STT_PREP = 103,
+       /* Calls (REQ-301-305). CALL_AUTH (40, above) answers a join or an
+        * invitation: may the actor read the conversation, which of `call_uids`
+        * may, and who are its members. CALL_EVENT writes a call event -- a
+        * missed call -- as a message of kind OC_MSG_KIND_CALL, authored by
+        * user_id in channel_id, body in body/body_len; the net thread raises it
+        * with no connection behind it. Write. */
+       OC_JOB_CALL_EVENT = 104,
+       /* Catch-up: advance every one of a user's memberships (OC_MSG_MARK_ALL_READ).
+        * A write, and on the writer for the same reason CLIENT_ACK is. */
+       OC_JOB_MARK_ALL_READ = 105,
+       /* A channel's long-form description (REQ-034). A read, on the reader. */
+       OC_JOB_GET_CHANNEL_DESCRIPTION = 106,
+       /* A managed workspace's first boot: create #general with a welcome
+        * topic and description (ch_name carries the workspace's name). Write,
+        * setup-time only. */
+       OC_JOB_WELCOME_GENERAL = 107,
+       /* User groups (REQ-307-309, ARCH-114). LIST is a read; the rest write.
+        * The group's text rides grp_handle/grp_name/grp_desc, its id group_id,
+        * the people grp_uids; a channel op names channel_id and group_id. */
+       OC_JOB_LIST_GROUPS = 108,
+       OC_JOB_CREATE_GROUP = 109,
+       OC_JOB_UPDATE_GROUP = 110,
+       OC_JOB_DELETE_GROUP = 111,
+       OC_JOB_GROUP_ADD_MEMBERS = 112,
+       OC_JOB_GROUP_REMOVE_MEMBERS = 113,
+       OC_JOB_CHANNEL_ADD_GROUP = 114,
+       OC_JOB_CHANNEL_REMOVE_GROUP = 115,
+       OC_JOB_LOAD_TLS_STATE = 116, OC_JOB_STORE_ACME_ACCOUNT = 117, OC_JOB_STORE_TLS_CERT = 118,
+       /* Critical failures (REQ-263): raised or cleared by the daemon's own
+        * workers (`alert_key`, `alert_message`), listed and acknowledged by an
+        * owner or admin (`alert_id`, 0 for every one). */
+       OC_JOB_ALERT_RAISE = 119, OC_JOB_ALERT_CLEAR = 120,
+       OC_JOB_ALERTS_LIST = 121, OC_JOB_ALERT_ACK = 122,
+       /* A delete taken back, by the person who made it (REQ-052):
+        * channel_id, message_id, user_id. */
+       OC_JOB_RESTORE = 123,
+       /* A local account's second step (AUTH.md §8.6): `user_id`, the credential
+        * version its password was checked against (`auth_version`), the code in
+        * `token`, which page it finishes (`web`) with that page's `web_nonce`
+        * and, for a password change, the new password's key (`pw_*`). */
+       OC_JOB_AUTH_STEP = 124,
+       /* The second step's own page (AUTH.md §8.6), past its password: `scope`
+        * 1 confirms a new secret with its first code (in `token`) and hands out
+        * recovery codes, 2 turns the step off with a current code. `user_id`
+        * and `auth_version` as for AUTH_STEP. */
+       OC_JOB_SECURITY = 125,
+       /* An administrator's reset of a local account (AUTH.md §2): actor
+        * `user_id`, account `target_user_id`, `scope` 1 to clear its second
+        * step too. Answered CREDENTIAL_RESET, or USER_ERR. */
+       OC_JOB_RESET_CREDENTIAL = 126,
+       /* The reset page's new password, for the link's token (hex, `token`):
+        * `pf_new_pw`. Derived on the auth pool, then stored. WEB_OK/WEB_ERR. */
+       OC_JOB_RESET_REDEEM = 127,
+       /* A removed member brought back (REQ-033): actor `user_id`, member
+        * `target_user_id`. USER_UPDATED (disabled 0; for a local account
+        * `body` a reset link's token), or USER_ERR. */
+       OC_JOB_ENABLE_USER = 128,
+       /* Sign one of `user_id`'s sessions out (REQ-182): `target_user_id` is the
+        * session's id, `message_id` the asking connection's own. Answered with a
+        * SESSION_LIST, `revoked_session` the one that went. */
+       OC_JOB_REVOKE_SESSION = 129,
+       /* Sessions in use (REQ-181): `grp_uids` holds their ids, `n_grp_uids`
+        * how many; each one's last_seen_ms becomes now. No answer. */
+       OC_JOB_SESSIONS_SEEN = 130,
+       /* A local account's own address (`pf_name` the address): PROFILE_INFO, or
+        * PROFILE_ERR. */
+       OC_JOB_SET_EMAIL = 131,
+       /* Summaries (REQ-310, ARCH-116): find a period's summary, or say what
+        * the worker must build; and store what the worker built. */
+       OC_JOB_SUMMARY_LOOKUP = 132,
+       OC_JOB_SUMMARY_STORE = 133,
+       /* The queue of summaries someone waits on (summary_requests): QUEUE adds
+        * the request (`sum_*`, channel_id, user_id, conn_id); TAKE marks row
+        * `sum_row` running for the worker, which waits on `sum_batch`; DROP
+        * deletes conn_id's queued rows. Each answers with every waiting
+        * request's place (OC_RES_SUMMARY_QUEUE). */
+       OC_JOB_SUMMARY_QUEUE = 134,
+       OC_JOB_SUMMARY_TAKE = 135,
+       OC_JOB_SUMMARY_DROP = 136,
+       /* Summaries did not come up: every waiting request is deleted and
+        * answered (OC_RES_SUMMARY_FAILALL). */
+       OC_JOB_SUMMARY_FAIL = 137,
+       /* A request its asker stopped watching (DETACH: conn_id's req `sum_req`),
+        * or cancelled (CANCEL); a notice opened (OPEN: `sum_notice`, answered
+        * as SUMMARY to `sum_req`), or seen (SEEN: dismissed, or its summary
+        * delivered live). */
+       OC_JOB_SUMMARY_DETACH = 138,
+       OC_JOB_SUMMARY_CANCEL = 139,
+       OC_JOB_SUMMARY_OPEN = 140,
+       OC_JOB_SUMMARY_SEEN = 141,
+       /* A demo workspace's first start (AUTH.md §8.12): its sample channels
+        * and messages, by an author nobody signs in as. Write, setup-time. */
+       OC_JOB_SEED_DEMO = 142,
+       /* An encrypted DM ended (PRIVATE-DM.md): it is closed, archived like any
+        * channel, for the maintenance pass to remove. Write, no answer. */
+       OC_JOB_E2E_CLOSE = 143,
+       /* Polls (REQ-225, ARCH-119). A poll is posted as a SEND or SEND_REPLY
+        * carrying poll_* fields. VOTE replaces the voter's whole selection
+        * (poll_picks); LIST_POLL_VOTERS is a read. */
+       OC_JOB_VOTE = 144, OC_JOB_LIST_POLL_VOTERS = 145,
+       /* The author changes a poll: poll_opts/poll_flags/poll_close_at_ms are
+        * all of it, as it is now to be. */
+       OC_JOB_EDIT_POLL = 146 };
+/* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
+#define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
+#define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
+#define OC_SEC_PASSKEY_ASK  3   /* a code: a passkey may be added (WEB_OK, step_pw 3) */
+#define OC_SEC_PASSKEY_ADD  4   /* a passkey's registration (WEB_OK, step_pw 4) */
+
+/* A direct connection's sign-in (AUTH.md §8.5), as its worker hands it over:
+ * the provider's checked identity, or why there is none (`err`, an OC_ERR_*,
+ * and `reason` for the audit). */
+typedef struct {
+    uint16_t err;
+    char     reason[48];
+    char     iss[256];        /* the provider's issuer */
+    char     sub[520];        /* "<issuer>|<subject>": sub, or oid where the connection says */
+    char     email[256], name[256];
+    char     tenant[256];     /* Google's hd, Microsoft's tid */
+    char     idp[32];         /* google, microsoft, or oidc */
+    int      email_verified;
+} oc_direct_auth;
+
+/* Per-channel reconnect cursor: replay messages with id > after_message_id. */
+typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
+
+/* Where a password sign-in is on its way (see auth_stage below). */
+#define OC_WEB_NONE     0
+#define OC_WEB_SIGNIN   1
+#define OC_WEB_PASSWORD 2
+#define OC_WEB_SIGNUP   3
+#define OC_WEB_SECURITY 4   /* the second step's own page: set it up or turn it off */
+#define OC_AUTH_STAGE_NEW     0   /* as submitted: the writer checks the limiter */
+#define OC_AUTH_STAGE_READ    1   /* a reader fetches the credential */
+#define OC_AUTH_STAGE_CHECKED 2   /* back from the auth pool: the writer finishes */
+
+typedef struct oc_job {
+    struct oc_job *next;
+    int            type;
+    uint64_t       conn_id;   /* originating connection, echoed on the result */
+    uint64_t       user_id;   /* the authenticated user (for SEND author / backfill auth) */
+    /* Which state of the connection's this job's answer is for -- the net
+     * thread's counter for it: a transfer's, a call join's -- echoed on every
+     * result it gives, 0 for work that has none. A result for a transfer since
+     * cancelled, or a join since left, is then known for what it is, and never
+     * taken for the one after it (REQ-140, REQ-301). */
+    uint32_t       gen;
+
+    /* OPEN_DM: an encrypted DM (PRIVATE-DM.md), a new conversation each time. */
+    uint8_t        e2e;
+
+    /* AUTH */
+    uint8_t        method;    /* OC_AUTH_LOCAL / OC_AUTH_OIDC / OC_AUTH_SESSION */
+    char          *token;     /* heap; the raw credential bytes (method-specific) */
+    size_t         token_len; /* credential length (token has a trailing NUL too) */
+    char           source[46];/* peer IP string, for per-source rate limiting ("" if none) */
+    char          *proof;     /* heap; the verifier a browser sign-in carries (AUTH.md §8.2) */
+    size_t         proof_len;
+    char           auth_source[16];   /* AUTH: the source it names ("local", "relay"; "" none) */
+    /* From the daemon's own sign-in pages (AUTH.md §8.10) rather than a frame:
+     * which page (OC_WEB_*), and for a sign-in or sign-up the PKCE challenge the
+     * token it ends with is bound to. An AUTH job signs in or changes a password;
+     * a REDEEM job signs up. */
+    uint8_t        web;
+    uint8_t        demo_invite;   /* REDEEM: `token` is central's signed demo invite */
+    char           web_nonce[48];
+    /* A password sign-in's path (AUTH.md §2): the writer checks the limiter, a
+     * reader fetches the credential and its version, the auth pool checks the
+     * password, and the writer mints the session if that version is still the
+     * stored one. The stage says which of these the job is at. */
+    int            auth_stage;              /* OC_AUTH_STAGE_* */
+    int            auth_ok;                 /* CHECKED: the password matched */
+    uint64_t       auth_uid;                /* CHECKED: whose credential it was */
+    uint64_t       auth_version;            /* CHECKED: which version of it */
+    /* A password change, CHECKED: the new password's key, derived on the pool. */
+    int            pw_derived;
+    uint32_t       pw_mem;
+    uint8_t        pw_salt[16];             /* OC_PW_SALT_LEN */
+    uint8_t        pw_hash[32];             /* OC_PW_HASH_LEN */
+    char          *email;     /* heap; INVITE_USER: the address the invite is bound to */
+    /* A passkey (AUTH.md §8.6): the trusted name it is for -- its relying party
+     * and origin -- the ceremony's challenge, and what the browser answered,
+     * each base64url: a credential id, client data, authenticator data, a
+     * signature, an attestation object. */
+    char           wa_rp[256], wa_origin[300], wa_challenge[48];
+    char          *wa_cred, *wa_cd, *wa_ad, *wa_sig, *wa_att;
+    /* AUTH from a direct connection's worker (heap, or NULL): the identity it
+     * checked, in place of a token. */
+    oc_direct_auth *direct;
+
+    /* REGISTER (create a local account; AUTH.md §2 — bootstrap / invite) */
+    char          *username;  /* heap */
+    char          *password;  /* heap */
+    uint8_t        role;      /* OC_ROLE_* for the new account (also SET_ROLE next) */
+    uint16_t       uses;      /* INVITE_USER: how many may redeem it; 0 = no limit */
+    uint32_t       mem_kib;/* Argon2id memory, KiB (0 -> the writer's, OC_PW_MEM_KIB) */
+
+    /* SET_ROLE (change a user's tenant role; ARCH-60). Actor is `user_id`.
+     * Also carries the target for channel INVITE/REMOVE. */
+    uint64_t       target_user_id;
+    /* OPEN_GROUP_DM (REQ-056): the other participants. A small fixed array rather
+     * than a heap list — the wire caps it at OC_MAX_GROUP_DM, so there is nothing
+     * to allocate and nothing to free. */
+    uint64_t       group_uids[8];
+    uint16_t       n_group_uids;
+
+    /* CREATE_CHANNEL */
+    char          *ch_name;    /* heap */
+    /* User groups (REQ-307-309). */
+    uint64_t       group_id;
+    char          *grp_handle, *grp_name, *grp_desc;   /* heap */
+    uint64_t      *grp_uids;                            /* heap */
+    uint16_t       n_grp_uids;
+    uint8_t        ch_is_public;
+
+    /* STORE_IDENTITY (persist the TLS cert+key PEM) */
+    char          *cert_pem;   /* heap */
+    char          *key_pem;    /* heap */
+    struct oc_tls_state *tls_state;   /* heap: STORE_ACME_ACCOUNT, STORE_TLS_CERT */
+
+    /* STORE_ENROLLMENT (ARCH-84): the federated keypair + audience + state. */
+    char          *enroll_privkey;   /* heap */
+    char          *enroll_audience;  /* heap */
+    int            enroll_active;
+    int            enroll_quiet;     /* fire and forget: no result comes back */
+
+    /* REGISTER/UNREGISTER/PRUNE_DEVICE_TOKEN (ARCH-85). */
+    char          *device_token;     /* heap */
+    uint8_t        device_platform;  /* OC_PUSH_APNS / OC_PUSH_FCM */
+
+    /* SET_PROFILE (REQ-240). Its own named fields, for the reason the
+     * `hook_disabled` comment below gives: two of these used to ride `ch_name`
+     * and `body`, which was survivable at two fields and is not at five — a
+     * reader should not have to know that "ch_name" secretly means "title" for
+     * one job type. All heap, all freed in job_free. */
+    char          *pf_full_name;
+    char          *pf_title;
+    char          *pf_pronouns;
+    char          *pf_phone;
+    char          *pf_timezone;
+    char          *pf_voice_id;   /* read-aloud's voice (REQ-292); "" keeps the current one */
+
+    /* Read-aloud (ARCH-111). LOOKUP reads message_id + user_id and needs the
+     * model version to find a rendering made by THIS model; STORE and TOUCH
+     * carry what the render worker produced. `tts_text` on a result is the
+     * speakable form the daemon will hand the worker. */
+    char          *tts_model_version;
+    char          *tts_text;      /* TTS_PREVIEW: the sentence, said in tts_voice */
+    char          *tts_voices;    /* the engine's voice ids, comma separated */
+    char          *tts_lang;      /* the language it speaks; picks the voice rules */
+    char          *tts_blob_key;
+    uint8_t        tts_handle[32];
+    uint64_t       tts_seq;    /* TTS_LOOKUP/PREVIEW: the net thread's count, echoed */
+    uint64_t       tts_bytes;
+    uint32_t       tts_duration_ms;
+    uint8_t        tts_voice;
+    /* A WARMING job: the same cache probe, with nobody waiting for the answer.
+     * The eight voices all audition with one sentence, so rendering it once per
+     * voice at startup turns every later press of Play into a cache hit
+     * (docs/READ-ALOUD.md §5). */
+    uint8_t        tts_warm;
+
+    /* REACT (channel_id + message_id above); emoji is heap, op is add/remove. */
+    char          *emoji;      /* heap */
+    uint8_t        react_op;
+
+    /* PIN (channel_id + message_id above); op is add/remove (REQ-230). */
+    uint8_t        pin_op;
+
+    /* UPDATE_CHANNEL (channel_id above): op + the new topic/name in ch_name. */
+    uint8_t        chup_op;
+
+    /* SAVE_ITEM (message_id above): add/remove. */
+    uint8_t        save_op;
+    /* SET_WEBHOOK_STATE's desired state. Its own field rather than reusing
+     * one of the *_op flags above: a reader should not have to know that "save_op"
+     * secretly means "disabled" for a different job type. */
+    uint8_t        hook_disabled;
+    /* Search filters (REQ-081) and the paging cursor (carried in
+     * message_id). Parsed by the CLIENT via shared/searchq.c — the daemon receives
+     * predicates, never a grammar to interpret. */
+    char          *sq_from;      /* heap; "" or NULL = any */
+    char          *sq_in;
+    uint8_t        sq_has;
+    uint64_t       sq_after, sq_before;
+
+    /* HISTORY: 0 pages backwards from message_id, 1 fetches AROUND it (ARCH-96). */
+    uint8_t        hist_around;
+
+    /* SEARCH: query text is carried in body/body_len; this bounds the result. */
+    uint16_t       search_limit;
+
+    /* LOGOUT (revoke sessions; REQ-182). Actor is `user_id`; the token to revoke
+     * (scope THIS) is carried in `token`/`token_len`. */
+    uint8_t        scope;     /* OC_LOGOUT_THIS / OC_LOGOUT_ALL */
+
+    /* SEND / EDIT / DELETE / SEND_REPLY */
+    uint64_t       channel_id;
+    uint64_t       message_id; /* target message for EDIT / DELETE */
+    uint64_t       parent_id;  /* thread parent for SEND_REPLY / LIST_THREAD */
+    uint64_t       sched_at_ms; /* SCHEDULE / UPDATE_SCHEDULED: when to send */
+    uint8_t        act_filter;  /* LIST_ACTIVITY: OC_ACTF_* (REQ-139) */
+    char          *recipients;  /* SET_DRAFT with no channel (REQ-229); heap */
+    uint8_t        idem[OC_IDEM_LEN];
+    uint8_t       *body;      /* heap (SEND / EDIT new body) */
+    size_t         body_len;
+    /* SEND: attachment ids to link to this message (REQ-140). */
+    uint64_t       attach_ids[OC_MAX_ATTACH];
+    uint16_t       n_attach;
+    /* SEND: the forward source (REQ-057), 0/0 when not a forward. The client
+     * sends only these two ids; the author, the excerpt and the attachment
+     * count are resolved here from the row the daemon already holds, so a
+     * client cannot assert who said what. */
+    uint64_t       src_channel, src_message;
+
+    /* Notification prefs (REQ-130/131). SET_NOTIFY_PREF uses channel_id + level;
+     * SET_DND uses the dnd_* fields. */
+    uint8_t        notify_level;
+    uint32_t       snooze_minutes;   /* SET_SNOOZE: from now; 0 ends the pause */
+    int16_t        tz_offset_min;    /* SET_TZ_OFFSET: minutes east of UTC */
+    /* SET_SCHEDULE (REQ-136). `sched_days` is heap when n_sched_days > 0. */
+    uint8_t          sched_mode;
+    int16_t          sched_tz_offset_min;
+    uint16_t         sched_start_min, sched_end_min;
+    oc_schedule_day *sched_days;
+    uint8_t          n_sched_days;
+    /* Threads (REQ-062): LIST reads `thread_filter`; FOLLOW reads channel_id +
+     * parent_id + `follow_on`; MARK_READ reads parent_id + message_id (0 = all). */
+    uint8_t        thread_filter;
+    uint8_t        follow_on;
+    /* SET_KEYWORDS / SET_PRIORITY (REQ-135), both heap and both wholesale. */
+    char           **kw_terms;
+    uint8_t          n_kw_terms;
+    /* SEND / SEND_REPLY that posts a poll (REQ-225): its options, heap, and
+     * OC_POLL_* flags; n_poll_opts 0 is an ordinary message. VOTE reads
+     * poll_picks (option indexes, none to withdraw). */
+    char           **poll_opts;
+    uint8_t          n_poll_opts;
+    uint8_t          poll_flags;
+    uint64_t         poll_close_at_ms;
+    uint8_t          poll_picks[OC_POLL_MAX_OPTIONS];
+    uint8_t          n_poll_picks;
+    uint64_t        *pri_people;
+    uint8_t          n_pri_people;
+
+    /* BACKFILL */
+    oc_bf_cursor  *cursors;   /* heap */
+    size_t         n_cursors;
+
+    /* Attachments (REQ-140). CREATE reads channel_id/user_id/idem + att_size +
+     * filename/mime; FINALIZE + LOOKUP read attachment_id; FINALIZE also carries
+     * the streamed size (att_size) and digest (att_sha256). */
+    uint64_t       attachment_id;
+    uint64_t       att_size;
+    char          *filename;   /* heap */
+    char          *mime;       /* heap */
+    uint8_t        att_sha256[32];
+    /* ATTACH_MEDIA_SET (REQ-162): the client-measured facts and the poster. */
+    uint8_t        media_kind;
+    uint32_t       media_duration_ms;
+    uint16_t       media_width, media_height;
+    uint64_t       media_poster_id;
+
+    /* Synced client settings. SET uses client_type + key + value (empty value
+     * deletes); LIST uses client_type only. */
+    char          *cs_client_type; /* heap */
+    char          *cs_key;         /* heap */
+    char          *cs_value;       /* heap */
+
+    /* Self-service profile (REQ-020). SET_DISPLAY_NAME uses pf_name;
+     * The password page uses pf_new_pw. */
+    char          *pf_name;        /* heap */
+    char          *pf_new_pw;      /* heap */
+
+    /* UNFURL_STORE (REQ-222): the fetched preview for one URL of message_id.
+     * All heap; the writer re-validates the message before storing. */
+    char          *unf_url;
+    char          *unf_title;
+    char          *unf_descr;
+
+    /* Storage maintenance pass inputs (ARCH-78). */
+    uint64_t       maint_max_age_ms;  /* expire attachments older than this (0 = never) */
+    uint64_t       maint_grace_ms;    /* never reclaim anything younger than this */
+    uint32_t       maint_batch;       /* cap on rows reclaimed in one pass */
+    uint32_t       audit_limit;       /* AUDIT_QUERY: rows per page */
+    uint64_t       audit_before_ms;   /* AUDIT_QUERY: page backwards from here (0 = newest) */
+    /* LIST_FILES: the keyset cursor -- the created-at and id of the last row the
+     * caller has, 0/0 for the first page (REQ-143). */
+    uint64_t       files_before_ms, files_before_id;
+    uint64_t       audit_max_age_ms;  /* STORAGE_MAINT: age out audit entries past this */
+    int            maint_evict;       /* also evict oldest under pressure (REQ-215) */
+    /* STT_PREP (ARCH-112): the segment this answers, and its mode. */
+    uint64_t       stt_req;
+    uint8_t        stt_mode;
+    /* CALL_AUTH (REQ-301/302): what is being asked -- OC_CALL_OP_* -- and the
+     * users to invite, heap. */
+    uint8_t        call_op;
+    uint64_t      *call_uids;
+    uint16_t       n_call_uids;
+    uint8_t        call_key[OC_CALL_DEVICE_KEY_LEN];   /* a join's device key, echoed */
+    uint8_t        call_codecs;                        /* a join's decodable codecs, echoed */
+    /* ALERT_* (REQ-263): heap strings; the entry acknowledged. */
+    char          *alert_key, *alert_message;
+    uint64_t       alert_id;
+    /* SUMMARY_LOOKUP (REQ-310): the request as sent, and the version current
+     * summaries are built with (heap). SUMMARY_STORE: the worker's batch,
+     * borrowed -- the worker waits on it until the writer is done. */
+    uint32_t       sum_req;
+    uint8_t        sum_scope;
+    uint64_t       sum_start, sum_end;
+    int            sum_tz;
+    int64_t        sum_row;
+    uint64_t       sum_notice;
+    char          *sum_version;
+    struct oc_sum_batch *sum_batch;
+} oc_job;
+
+/* CALL_AUTH's question: a join (perhaps starting, with invitations) or an
+ * invitation from someone already in the call. */
+enum { OC_CALL_OP_JOIN = 0, OC_CALL_OP_INVITE = 1 };
+
+/* --- Results (writer -> net thread) ------------------------------------- */
+
+enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
+       OC_RES_SEND_ERR = 4, OC_RES_BACKFILL_OK = 5,
+       OC_RES_REGISTER_OK = 6, OC_RES_REGISTER_ERR = 7,
+       OC_RES_SETROLE_OK = 8, OC_RES_SETROLE_ERR = 9,
+       OC_RES_LOGOUT_OK = 10, OC_RES_LOGOUT_ERR = 11,
+       OC_RES_EDIT_OK = 12, OC_RES_EDIT_ERR = 13,
+       OC_RES_DELETE_OK = 14, OC_RES_DELETE_ERR = 15,
+       OC_RES_CHANNEL_INFO = 16, OC_RES_CHANNEL_ERR = 17,
+       OC_RES_CHANNEL_LIST = 18, OC_RES_USER_LIST = 19,
+       OC_RES_INVITE_OK = 20, OC_RES_INVITE_ERR = 21,
+       OC_RES_USER_UPDATED = 22, OC_RES_USER_ERR = 23,
+       OC_RES_REACTION_OK = 24, OC_RES_REACTION_ERR = 25, OC_RES_REACTIONS = 26,
+       OC_RES_REPLY_OK = 27, OC_RES_REPLY_ERR = 28, OC_RES_THREAD = 29,
+       OC_RES_SEARCH = 30, OC_RES_IDENTITY = 31, OC_RES_OK = 32,
+       OC_RES_TYPING = 33,
+       /* Attachments. CREATED: a minted pending row + storage key (net thread
+        * opens the blob). ATTACH_OK: an upload finalized. ATTACH_META: an
+        * authorized download's pointer + metadata. ATTACH_ERR: err_code. */
+       OC_RES_ATTACH_CREATED = 34, OC_RES_ATTACH_OK = 35,
+       OC_RES_ATTACH_META = 36, OC_RES_ATTACH_ERR = 37,
+       /* Webhooks. CREATED: a minted token for a client. POSTED: a message
+        * posted via HTTP (carries SEND-style broadcast fields). ERR: err_code. */
+       OC_RES_WEBHOOK_CREATED = 38, OC_RES_WEBHOOK_POSTED = 39,
+       OC_RES_WEBHOOK_ERR = 40, OC_RES_WEBHOOK_LIST = 41,
+       OC_RES_WEBHOOK_DELETED = 42,
+       /* Notification prefs snapshot (also a sync push); ERR on a bad set. */
+       OC_RES_NOTIFY_PREFS = 43, OC_RES_NOTIFY_ERR = 44,
+       /* Call join authorized (net thread then updates in-memory call state) / denied. */
+       OC_RES_CALL_AUTH = 45, OC_RES_CALL_ERR = 46,
+       /* Synced client settings bucket snapshot (also fanned as a device-sync push). */
+       OC_RES_CLIENT_SETTINGS = 47,
+       /* Profile change ok (display name fanned tenant-wide; also the self ack for a
+        * password change) / denied (bad old password, etc.). */
+       OC_RES_PROFILE_UPDATED = 48, OC_RES_PROFILE_ERR = 49,
+       /* Storage keys whose bytes the net thread should hand to the transfer
+        * pool for deletion (ARCH-78). */
+       OC_RES_STORAGE_MAINT = 51,
+       OC_RES_STORAGE_STATUS = 52, OC_RES_STORAGE_ERR = 53,
+       OC_RES_AUDIT_PAGE = 54, OC_RES_AUDIT_ERR = 55,
+       /* A read cursor advanced (REQ-090 seen-by): fan the acker's new cursor to
+        * the channel's members + backfill the acker with the others' cursors. */
+       OC_RES_READ_CURSOR = 50, OC_RES_ENROLLMENT = 56,
+       /* Device-token register/unregister acknowledged / rejected (ARCH-85). */
+       OC_RES_DEVICE_TOKEN_OK = 57, OC_RES_DEVICE_TOKEN_ERR = 58,
+       /* Pins (REQ-230). PIN_OK fans out to the channel's members; PINS is the
+        * channel's pinned-message list; PIN_ERR carries err_code. */
+       OC_RES_PIN_OK = 59, OC_RES_PIN_ERR = 60, OC_RES_PINS = 61,
+       /* A channel's member roster / its shared files; ERR carries err_code. */
+       OC_RES_MEMBER_LIST = 66, OC_RES_FILE_LIST = 67, OC_RES_LIST_ERR = 68,
+       OC_RES_SAVED_OK = 69, OC_RES_SAVED_LIST = 70, OC_RES_ACTIVITY = 71,
+       OC_RES_INVITE_LIST = 72, OC_RES_INVITE_REVOKED = 73,
+       OC_RES_PROFILE_INFO = 74, OC_RES_FILE_CHANNELS = 75,
+       OC_RES_SESSION_LIST = 76, OC_RES_EMOJI_LIST = 77,
+       /* One draft — fanned to the user's OTHER connections as a device sync
+        * (ARCH-101) — and the full list for the connection that asked. */
+       OC_RES_DRAFT = 78, OC_RES_DRAFTS = 79,
+       /* One scheduled row (list entry and push) and the list terminator. FIRED
+        * carries the messages the sweep actually delivered, which the net thread
+        * broadcasts exactly as it would an ordinary send. */
+       OC_RES_SCHEDULED = 80, OC_RES_SCHEDULED_LIST = 81, OC_RES_SCHED_FIRED = 82,
+       /* The pause's new end instant, to that user's own connections (REQ-278).
+        * The net thread also re-broadcasts their presence, because the FACT that
+        * they are paused is public even though this instant is not. */
+       OC_RES_SNOOZE = 83,
+       /* The schedule as stored, and the two alert lists — both self-only, both
+        * fanned to every one of the user's connections like NOTIFY_PREFS. */
+       OC_RES_SCHEDULE = 84, OC_RES_ALERT_PREFS = 85,
+       /* The aggregated thread list, and the ack for a follow/read change —
+        * which carries the ONE row that changed, so a client folds it without
+        * re-listing (the shape DRAFT already uses). */
+       OC_RES_THREAD_LIST = 86, OC_RES_THREAD_ONE = 87,
+       /* A stored link unfurl to fan out (REQ-222): message/channel ids,
+        * unf_* strings, and `members` for the recipients. */
+       OC_RES_UNFURL_STORED = 88,
+       /* ATTACH_MEDIA_SET accepted (attachment_id), or refused (err_code). */
+       OC_RES_MEDIA_OK = 89, OC_RES_MEDIA_ERR = 90,
+       /* Read-aloud (ARCH-111): what to do about one AUDIO_GET -- serve the
+        * stored rendering, render it first, or refuse (err_code). */
+       OC_RES_TTS_META = 91, OC_RES_TTS_ERR = 92,
+       /* Voice input (ARCH-112): the STT_PREP answer -- err_code 0 and the
+        * member names, or the refusal. stt_req names the segment. */
+       OC_RES_STT_PREP = 93,
+       /* A call event written (REQ-304): the SEND-shaped fields and `members`,
+        * which the net thread broadcasts with kind OC_MSG_KIND_CALL. */
+       OC_RES_CALL_EVENT = 94,
+       /* A channel's description: the answer to a fetch (to the asker only) and,
+        * with ch_fanout, the announcement of a change (to every member). The
+        * text rides `body`/`body_len`. */
+       OC_RES_CHANNEL_DESCRIPTION = 95,
+       /* User groups (REQ-307-309). LIST answers the asker with `groups`;
+        * CHANGED and DELETED are pushed to everyone signed in (groups[0], or
+        * group_id), with `mchan`/`mchg` saying who gained or lost a channel by
+        * it; ERR answers the actor with err_code. */
+       OC_RES_GROUP_LIST = 96,
+       OC_RES_GROUP_CHANGED = 97,
+       OC_RES_GROUP_DELETED = 98,
+       OC_RES_GROUP_ERR = 99,
+       /* Mark unread (REQ-235): the reader's own cursor moved, backwards as
+        * likely as forwards. Sent to every connection of user_id as a
+        * READ_CURSOR naming them, so each of their devices resets its count; the
+        * channel's other members are not told -- having seen a message stays
+        * true. */
+       OC_RES_OWN_READ_CURSOR = 100,
+       OC_RES_TLS_STATE = 101,
+       /* The daemon's own sign-in pages (AUTH.md §8.10): done -- `body` the ID
+        * token for a sign-in or sign-up, empty for a password change -- or
+        * refused, `err_code` why. */
+       OC_RES_WEB_OK = 102, OC_RES_WEB_ERR = 103,
+       /* Critical failures (REQ-263): the counts, to every owner and admin
+        * connected (conn_id 0) or to the one that asked; the entries; a
+        * refusal (err_code). */
+       OC_RES_ALERTS_SUMMARY = 104, OC_RES_ALERTS = 105, OC_RES_ALERTS_ERR = 106,
+       /* A rendering's row has been written (ARCH-111): `tts_handle`. Until this
+        * comes the net thread answers lookups for it from memory. */
+       OC_RES_TTS_STORED = 107,
+       /* RESTORE: the message whole again -- author, time, body, attachments,
+        * the members to tell -- or refused (err_code). */
+       OC_RES_RESTORE_OK = 108, OC_RES_RESTORE_ERR = 109,
+       /* A page's password was right and the account has a second step: no token
+        * yet. `user_id`, `step_version`, and a password change's new key. */
+       OC_RES_WEB_STEP2 = 110,
+       /* The second step's page, past its password: `step_version`, and either
+        * the account has one (`step_pw` 1) or a new secret waits for its first
+        * code, `body` its base32. */
+       OC_RES_WEB_SECURITY = 111,
+       /* A reset link made: `user_id` the account, `body` the token, hex. */
+       OC_RES_CREDENTIAL_RESET = 112,
+       /* SUMMARY: the answer to a SUMMARIZE (sum_status, sum_body); SUMMARY_NEED:
+        * nothing stored yet -- the span, for the worker to build. */
+       OC_RES_SUMMARY = 113, OC_RES_SUMMARY_NEED = 114,
+       /* The summary queue moved: `sum_places` holds where each request in it
+        * now is (also on a SUMMARY the queue moved with). On a QUEUE that was
+        * refused because the queue is full, `sum_status` is UNAVAILABLE. */
+       OC_RES_SUMMARY_QUEUE = 115,
+       /* Every request that was waiting when summaries failed to come up, in
+        * `sum_places`, now deleted: each is told summaries are unavailable. */
+       OC_RES_SUMMARY_FAILALL = 116,
+       /* Polls (REQ-225). POLL: a vote landed; rpoll[0] is the tally with the
+        * voter's own selection, `user_id` the voter, `members` the
+        * conversation. POLL_VOTERS: `pvoters` for the asker. POLL_ERR: either
+        * refused, err_code saying why. */
+       OC_RES_POLL = 117, OC_RES_POLL_VOTERS = 118, OC_RES_POLL_ERR = 119,
+       /* The author changed a poll: rpoll[0] for the conversation, nobody's
+        * selection in it. */
+       OC_RES_POLL_EDITED = 120 };
+
+/* One user group (REQ-307). Heap strings and member array. */
+typedef struct oc_group_row {
+    uint64_t  id, created_by;
+    char     *handle, *name, *description;
+    uint64_t *members;
+    uint16_t  n_members;
+} oc_group_row;
+
+/* A channel whose membership a change touched (REQ-309): what a CHANNEL_INFO
+ * says of it, the groups it has, and its members after the change. */
+typedef struct oc_chan_brief {
+    uint64_t  channel_id, created_at;
+    uint8_t   kind, is_public, archived;
+    uint8_t   groups_changed;   /* its groups changed: tell every member */
+    char     *name, *topic;     /* heap */
+    uint64_t  groups[OC_MAX_CHANNEL_GROUPS];
+    uint16_t  n_groups;
+    uint64_t *members;          /* heap */
+    size_t    n_members;
+} oc_chan_brief;
+
+/* One person who gained (joined=1) or lost a channel. */
+typedef struct { uint64_t channel_id, user_id; uint8_t joined; } oc_memb_change;
+
+/* One thread in the aggregated view (REQ-062). Mirrors oc_thread_summary on the
+ * wire; `preview` is heap. */
+typedef struct oc_thread_row {
+    uint64_t root_id, channel_id, root_author;
+    uint64_t root_at, last_reply_at;
+    uint32_t reply_count, unread;
+    uint8_t  following;
+    char    *preview;
+    uint8_t  action;   /* the root is an action; preview is its text (REQ-058) */
+} oc_thread_row;
+
+/* One custom emoji (REQ-072). */
+typedef struct oc_emoji_row {
+    char    *name;          /* heap; lowercase, no colons */
+    uint64_t attachment_id;
+    uint64_t created_by;
+} oc_emoji_row;
+
+/* One saved message (REQ-231). Carries its body for the same reason a pin does:
+ * a saved message is usually far outside loaded history. */
+typedef struct {
+    uint64_t message_id, channel_id, author_id, created_at, saved_at;
+    char    *body, *attach_name;   /* heap */
+    uint8_t  action;               /* body is the action text (REQ-058) */
+} oc_saved_row;
+
+/* One activity item (REQ-139). `text` is the message body for a mention or a
+ * reply, and the emoji for a reaction. */
+typedef struct {
+    uint8_t  kind;
+    uint64_t message_id, channel_id, actor_id, at;
+    char    *text;                 /* heap */
+    uint8_t  action;               /* text is the action text (REQ-058) */
+} oc_activity_row;
+
+/* One row of a channel's member roster (REQ-031). */
+/* `only_via_group`: in the channel only through a group (REQ-309). */
+typedef struct { uint64_t user_id, joined_at; uint8_t role; uint8_t only_via_group; } oc_chanmem_row;
+
+/* One shared file (REQ-143, ARCH-91). */
+typedef struct {
+    uint64_t id, channel_id, message_id, uploader_id, size, created_at;
+    uint8_t  reclaimed;
+    char    *filename, *mime;   /* heap */
+    uint8_t  media_kind;        /* OC_MEDIA_* (REQ-165) */
+    uint32_t duration_ms;
+} oc_file_row;
+
+/* One row in a PINS result. The body travels with it because a pinned message
+ * is usually scrolled out of the client's loaded history — a list of bare ids
+ * would force the client to fetch each one. */
+typedef struct {
+    uint64_t message_id, author_id, created_at_ms, pinned_by, pinned_at;
+    char    *body;         /* heap; NULL for a tombstoned message */
+    char    *attach_name;  /* heap; first attachment's filename, else NULL */
+    uint8_t  action;       /* body is the action text (REQ-058) */
+} oc_pin_row;
+
+/* One row in a REACTIONS result (a distinct emoji + one reacting user). */
+typedef struct { char *emoji; uint64_t user_id; } oc_reaction_row;
+
+/* One row in a CHANNEL_LIST result (net thread renders as a list entry). */
+typedef struct {
+    uint64_t channel_id;
+    char    *name;       /* heap */
+    uint8_t  is_public;
+    uint8_t  joined;     /* 1 if the requesting user is a member */
+    uint8_t  kind;       /* OC_CHANNEL_KIND / OC_CHANNEL_KIND_DM */
+    char    *topic;      /* heap; NULL = none (REQ-034) */
+    uint8_t  archived;   /* REQ-035 */
+    uint64_t created_at;
+    /* Sidebar ordering + badging for a client that caches nothing (ARCH-88):
+     * the newest top-level message's time, and how many of them sit past this
+     * user's delivery cursor (REQ-090). Both are 0 for an empty channel. */
+    uint64_t last_message_at;
+    uint32_t unread;
+    uint64_t peer_id;    /* DM: the other participant, so a client can name it */
+    /* GROUP DM (REQ-056): every participant. Empty unless this is a DM with more
+     * than two, so the sidebar can title it on FIRST paint — a group whose name
+     * arrives only after you open it is a row you cannot choose between. */
+    uint64_t peers[9];
+    uint16_t n_peers;
+    char    *preview;       /* heap; newest top-level body, truncated */
+    uint64_t preview_author;
+    uint8_t  preview_action;   /* preview is the action text (REQ-058) */
+    uint64_t groups[OC_MAX_CHANNEL_GROUPS];   /* the channel's groups (REQ-309) */
+    uint16_t n_groups;
+    uint8_t  e2e;              /* an encrypted DM (PRIVATE-DM.md) */
+} oc_channel_row;
+
+/* One row in a NOTIFY_PREFS result (REQ-130): a channel and its level. */
+typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; } oc_notify_pref_row;
+
+/* One row in a CLIENT_SETTINGS result: a synced key/value. */
+typedef struct { char *key; char *value; } oc_client_setting_row;
+typedef struct { uint64_t id, channel_id, thread_root, updated_ms;
+                 char *recipients, *body; } oc_draft_row;
+/* One scheduled message (REQ-224). `state` is OC_SCHED_*; `fail_reason` is set
+ * only when the sweep could not deliver it, and is what the author is shown. */
+typedef struct { uint64_t id, channel_id, thread_root, send_at_ms, created_ms;
+                 uint8_t state; char *fail_reason, *body; } oc_sched_row;
+/* One blob the maintenance pass decided to reclaim (ARCH-78). The row is already
+ * tombstoned in SQLite; only the bytes remain, and deleting those is the net
+ * thread's job via the transfer pool because it can block on S3. */
+/* Why a blob was reclaimed, recorded on the attachments row (migration 0015) so
+ * REQ-215's audit trail is a query rather than a second log. */
+/* Audit families (REQ-251, ARCH-79). The cap is applied per family so a flood of
+ * attacker-controlled security events cannot evict administrative history. */
+enum { OC_AUDIT_ADMIN = 1, OC_AUDIT_ACCOUNT = 2,
+       OC_AUDIT_SECURITY = 3, OC_AUDIT_MODERATION = 4 };
+
+enum { OC_RECLAIM_NONE = 0, OC_RECLAIM_ORPHAN = 1,
+       OC_RECLAIM_EXPIRED = 2, OC_RECLAIM_EVICTED = 3 };
+
+typedef struct { char *storage_key; uint64_t attachment_id; } oc_reclaim_row;
+
+/* One audit entry as read back for an admin (REQ-251). */
+typedef struct oc_audit_row {
+    uint64_t at_ms;
+    uint64_t actor_id;
+    uint64_t target_id;
+    char    *actor_name;   /* heap; denormalized, the actor may since be removed */
+    char    *action;       /* heap */
+    char    *target;       /* heap */
+    char    *detail;       /* heap; never carries the secret involved */
+    uint8_t  family;
+    uint8_t  outcome;      /* 1 ok, 0 denied/failed */
+} oc_audit_row;
+
+/* One row in a READ_CURSOR result: a member's read position in the channel. */
+typedef struct { uint64_t user_id; uint64_t message_id; } oc_read_cursor_row;
+
+/* One row in a WEBHOOK_LIST result (REQ-170); the token is never returned. */
+typedef struct {
+    uint64_t id;
+    uint64_t channel_id;
+    char    *label;       /* heap */
+    uint8_t  disabled;
+} oc_webhook_row;
+
+/* One row in a USER_LIST result. */
+typedef struct {
+    uint64_t user_id;
+    uint8_t  role;
+    uint8_t  disabled;
+    char    *email;         /* heap; may be "" */
+    char    *display_name;  /* heap; may be "" */
+    uint64_t avatar_id;     /* attachment id, 0 = none */
+    /* REQ-289: the profile fields a directory needs, and the ones PROFILE_INFO
+     * was sending only to their owner. Expired status reads as absent, the same
+     * rule build_profile applies. */
+    char    *title;         /* heap; may be "" */
+    char    *timezone;      /* heap; may be "" */
+    char    *status_emoji;  /* heap; may be "" */
+    char    *status_text;   /* heap; may be "" */
+    /* Read BESIDE a name, so the roster is where every client learns them
+     * (REQ-240/289). `phone` is deliberately not here: it is contact detail,
+     * and PROFILE_INFO carries it to whoever opened the card. */
+    char    *full_name;     /* heap; may be "" */
+    char    *pronouns;      /* heap; may be "" */
+    /* The voice this person is read aloud in (REQ-292). Everyone hears the same
+     * one for the same author, so the roster carries it like a name decoration. */
+    char    *voice_id;      /* heap; may be "" */
+} oc_user_row;
+
+/* One message to replay on reconnect (rendered as a BROADCAST by the net thread),
+ * or one reply in a THREAD. reply_count/last_reply_at are set for backfilled
+ * top-level messages that have thread replies (drives THREAD_META). */
+/* One attachment linked to a message (REQ-140): its id + metadata for delivery.
+ * filename/mime are heap; the blob itself lives in object storage. */
+typedef struct {
+    uint64_t id;
+    char    *filename;   /* heap */
+    char    *mime;       /* heap */
+    uint64_t size;
+    uint8_t  reclaimed;  /* bytes removed by age or pressure; row is a tombstone */
+    /* A video message's media row (REQ-165), else media_kind 0. */
+    uint8_t  media_kind;
+    uint32_t duration_ms;
+    uint16_t width, height;
+    uint64_t poster_id;
+} oc_attach_meta;
+
+typedef struct {
+    uint64_t message_id, channel_id, author_id, server_time;
+    uint8_t *body;       /* heap */
+    size_t   body_len;
+    uint32_t reply_count;
+    uint64_t last_reply_at;
+    oc_attach_meta attach[OC_MAX_ATTACH];  /* linked attachments (REQ-140) */
+    size_t         n_attach;
+    char    *author_name;  /* heap; override display name (webhooks), else NULL */
+    /* Pin state (REQ-230). A BROADCAST carries none, so without this every pin
+     * vanished the moment a client reloaded — the same defect the reaction
+     * replay above exists to prevent. */
+    uint64_t pinned_by;    /* 0 when not pinned */
+    uint64_t pinned_at;
+    /* Saved-for-later state (REQ-231), for the REQUESTING user only — a pin is a
+     * channel-wide fact, this is private, so it can never travel in a fan-out
+     * BROADCAST. It rides the per-connection replay and the net thread turns it
+     * into a SAVED_UPDATED, exactly as pins do above. */
+    uint8_t  saved;
+    uint64_t saved_at;
+    uint8_t  kind;         /* OC_MSG_KIND_*: a call event is drawn as history (REQ-304) */
+    /* SEARCH only: the snippet in `body` is cut from an action's text
+     * (REQ-058). A replay carries actions on their own frames instead. */
+    uint8_t  action;
+} oc_replay_msg;
+
+typedef struct oc_dbres {
+    struct oc_dbres *next;
+    int            type;
+    uint64_t       conn_id;
+    uint32_t       gen;  /* the job's, echoed (oc_job) */
+    uint16_t       err_code;  /* reason code for *_ERR */
+    /* WEB_STEP2: the credential version the password was checked against, and a
+     * password change's new key, held for the step that finishes it. */
+    uint64_t       step_version;
+    int            step_pw;
+    /* WEB_STEP2, and SECURITY's passkey screens: the account's passkeys on the
+     * job's relying party, base64url, comma-separated (heap, or NULL). */
+    char          *pk_creds;
+    uint32_t       step_mem;
+    uint8_t        step_salt[16], step_hash[32];
+    /* LOGOUT_OK, WEB_OK, PROFILE_UPDATED: the user's sessions were revoked, so
+     * every connection of `user_id` closes but `conn_id`'s (REQ-182). */
+    uint8_t        revoked;
+    /* SESSION_LIST from REVOKE_SESSION: the session signed out, whose connection
+     * closes too. */
+    uint64_t       revoked_session;
+
+    /* AUTH_OK / REGISTER_OK */
+    uint64_t       user_id;
+    uint8_t        role;                              /* OC_ROLE_* */
+    uint64_t       session_expiry;                    /* ms since epoch */
+    uint8_t        session_token[OC_SESSION_TOKEN_LEN];
+    int            has_session_token;                 /* 0 on session re-auth */
+
+    /* SEND_OK */
+    uint64_t       message_id;
+    uint64_t       server_time;
+    uint64_t       channel_id;
+    uint64_t       author_id;
+    uint8_t        idem[OC_IDEM_LEN];
+    uint8_t       *body;      /* heap; for the broadcast */
+    size_t         body_len;
+    uint64_t      *members;   /* heap; user ids to fan the broadcast out to */
+    size_t         n_members;
+    /* REPLY_OK only: parallel to members, 1 where that member is in the thread
+     * (ARCH-104). THREAD_REPLY's `participant` byte is the one per-recipient
+     * field on a fan-out frame, and the net thread has no database to ask, so
+     * the answer travels with the audience. NULL for every other result. */
+    uint8_t       *member_participant;
+    /* THREAD only: the caller's own answer to the same question, for the
+     * THREAD_REPLY frames a LIST_THREAD replay streams back. One recipient, so
+     * one flag rather than an array. */
+    uint8_t        list_participant;
+    int            duplicate; /* idempotent replay: ack only, no broadcast */
+    oc_attach_meta attach[OC_MAX_ATTACH];  /* SEND_OK: attachments linked to this message */
+    /* SEND_OK: names that are people here but not in this channel (REQ-287).
+     * count == 0 for the overwhelming majority of sends. */
+    oc_mention_unresolved unres;
+    uint16_t       unres_total;     /* everyone it could not reach, beyond unres's eight (REQ-308) */
+    size_t         n_attach;
+    char          *author_name;  /* heap; SEND_OK/WEBHOOK_POSTED override name, else NULL */
+
+    /* BACKFILL_OK */
+    oc_replay_msg *replay;    /* heap array, ascending message_id */
+    size_t         n_replay;
+    /* Reaction aggregates for the replayed messages, one row per
+     * (message, emoji). A BROADCAST carries no reaction state, so without these
+     * every reaction disappeared from a client that reloaded — permanently,
+     * now that clients keep no local cache (ARCH-88). `user_id` is the
+     * requesting user when they are one of the reactors, else any other
+     * reactor, which is exactly what the client needs to render the "mine"
+     * state without a second round trip. */
+    struct oc_replay_react { uint64_t message_id, channel_id, user_id, count; char *emoji; }
+                  *rreact;
+    size_t         n_rreact;
+    /* Link unfurls for the replayed messages (REQ-222, ARCH-105) — the same
+     * reasoning as the reactions above: a BROADCAST carries none, an unfurl
+     * travels on its own frame, and a client that reloads must not silently
+     * lose every preview. Also carries UNFURL_STORED's own strings. */
+    struct oc_replay_unfurl { uint64_t message_id, channel_id; char *url, *title, *descr; }
+                  *runfurl;
+    size_t         n_runfurl;
+    /* Forward references (REQ-057), for the same reason as the two above: the
+     * reference travels on its own FORWARD frame rather than in the
+     * BROADCAST, so a replay that omitted it would lose the attribution on
+     * every reload. ONE array serves both the live send (one entry) and the
+     * replay (one per forwarded message in the window), so the two cannot
+     * drift the way reactions once did. */
+    struct oc_replay_forward { uint64_t message_id, channel_id,
+                                        src_channel, src_message, src_author;
+                               char *excerpt, *attach_name; uint16_t n_attach;
+                               uint8_t src_action; }
+                  *rfwd;
+    size_t         n_rfwd;
+    /* Actions (REQ-058, ARCH-115), on the forward's pattern above: the object
+     * travels on its own ACTION frame, one array serves the live result and the
+     * replay. text_len 0 is an entry saying "not an action" -- what an edit or
+     * restore sends when the body no longer is one. actor_name is heap, NULL
+     * for the actor's current name. */
+    struct oc_replay_action { uint64_t message_id, channel_id, actor_id;
+                              char *actor_name; uint32_t text_start, text_len; }
+                  *ract;
+    size_t         n_ract;
+    /* Polls (REQ-225, ARCH-119), on the same pattern: one array for the live
+     * send, a vote and the replay. `mine` is the selection of the user the
+     * result is for (OC_POLL_HAS_MINE in flags when it is known); a fan-out to
+     * the whole conversation clears it. Labels are heap. */
+    struct oc_replay_poll { uint64_t message_id, channel_id, close_at_ms;
+                            uint8_t flags, n_options; uint16_t mine; uint32_t voters;
+                            char *labels[OC_POLL_MAX_OPTIONS];
+                            uint32_t counts[OC_POLL_MAX_OPTIONS]; }
+                  *rpoll;
+    size_t         n_rpoll;
+    /* POLL_VOTERS: who picked which option, ordered by option then user. */
+    oc_poll_voter *pvoters;
+    size_t         n_pvoters;
+    char          *unf_url;    /* heap; UNFURL_STORED */
+    char          *unf_title;  /* heap */
+    char          *unf_descr;  /* heap */
+    uint64_t       high_water;
+    uint8_t        truncated;  /* results hit the per-response cap (backfill/search/thread) */
+
+    /* CHANNEL_INFO (create/join/leave/invite/remove ack). channel_id above. */
+    uint8_t        ch_kind;
+    char          *ch_name;         /* heap */
+    uint8_t        ch_is_public;
+    uint8_t        ch_joined;       /* the actor's membership after the op */
+    uint64_t       ch_created_at;
+    char          *ch_topic;        /* heap; NULL = none (REQ-034) */
+    uint8_t        ch_archived;     /* REQ-035 */
+    /* CHANNEL_INFO from an UPDATE_CHANNEL fans to every member, not just the
+     * actor: a rename or archive changes what everyone's sidebar should say. */
+    uint8_t        ch_fanout;
+    uint64_t       ch_peer;         /* DM (ch_kind=1): the other participant's id (0 = not a DM) */
+    /* GROUP DM (REQ-056): every participant, including the actor. Empty for a
+     * channel and for a 1:1 DM, whose other participant is ch_peer. Carried so a
+     * client can title the conversation without a roster fetch per group. */
+    uint64_t       ch_peers[9];
+    uint16_t       n_ch_peers;
+    uint64_t       push_user_id;    /* INVITE: also push CHANNEL_INFO to this user (0 = none) */
+    /* CHANNEL_INFO: the channel is an encrypted DM. SEND_OK, REPLY, EDIT_OK: the
+     * message is in one (its body is ciphertext: no previews, no transcripts). */
+    uint8_t        ch_e2e;
+    /* CHANNEL_INFO answering an encrypted DM's opening (PDM_OPEN); channel_id 0
+     * when it could not be made. */
+    uint8_t        pdm_open;
+    /* CHANNEL_INFO: the channel's groups (REQ-309), sent beside it. */
+    uint64_t       ch_groups[OC_MAX_CHANNEL_GROUPS];
+    uint16_t       n_ch_groups;
+
+    /* User groups (REQ-307-309): the groups a LIST or a change carries, and who
+     * gained or lost which channel by a change (heap arrays). */
+    oc_group_row   *groups;
+    size_t          n_groups;
+    uint64_t        group_id;       /* GROUP_DELETED */
+    oc_chan_brief  *mchan;
+    size_t          n_mchan;
+    oc_memb_change *mchg;
+    size_t          n_mchg;
+
+    /* CHANNEL_LIST */
+    oc_channel_row *chlist;         /* heap array */
+    size_t          n_chlist;
+
+    /* Admin ops (REQ-033). USER_UPDATED carries user_id (above) + role + disabled.
+     * INVITE_OK reuses session_token/session_expiry/role for the minted invite. */
+    /* INVITE_OK for an invite bound to an address: the id and address the
+     * invitation mail report carries (ARCH-85). Empty/NULL for a bearer invite. */
+    char            invite_id[33];
+    char           *invite_email;   /* heap */
+    uint16_t        invite_uses;    /* INVITE_OK: how many may redeem it; 0 = no limit */
+    uint8_t         disabled;       /* USER_UPDATED: the target's disabled flag */
+    oc_user_row    *ulist;          /* USER_LIST: heap array */
+    size_t          n_ulist;
+    /* Set on any result whose job created an account: `ulist` then holds that
+     * one member's row, which the loop sends everyone connected as a USER_LIST
+     * of one, so every roster gains them without asking (PROTOCOL.md §5.8). */
+    uint8_t         joined;
+
+    /* Reactions (REQ-070/071). REACTION_OK: emoji + op + aggregate count for the
+     * fan-out (message_id/channel_id/user_id above, members for the recipients).
+     * REACTIONS: the full per-message reactor list. */
+    char           *emoji;          /* heap; REACTION_OK */
+    uint8_t         react_op;
+    uint64_t        react_count;
+    oc_reaction_row *rlist;         /* heap array; REACTIONS */
+    size_t           n_rlist;
+
+    /* EMOJI_LIST (REQ-072): the whole custom catalogue. Sent whole — a workspace
+     * has tens of these, and a partial catalogue means a message whose emoji renders
+     * on one client and not another. Named `elist` because `emoji` above is the
+     * reaction's shortcode and one letter of difference is not a distinction. */
+    oc_emoji_row   *elist;
+    size_t          n_elist;
+
+    /* Pins (REQ-230). PIN_OK reuses message_id/channel_id/user_id/members above
+     * for the fan-out; pin_op says which way and pinned_at when. PINS carries
+     * the channel's list. */
+    uint8_t          pin_op;
+    uint64_t         pinned_at;
+    oc_pin_row      *plist;         /* heap array; PINS */
+    size_t           n_plist;
+
+    /* Channel details (REQ-031, REQ-143). channel_id above. */
+    oc_chanmem_row  *cmlist;        /* heap array; MEMBER_LIST */
+    size_t           n_cmlist;
+    oc_file_row     *flist;         /* heap array; FILE_LIST */
+    size_t           n_flist;
+    uint8_t          flist_more;    /* the page filled and rows remain */
+
+    /* Saved items + activity (REQ-231/139). */
+    uint8_t          save_op;
+    uint64_t         saved_at;
+    oc_saved_row    *slist;
+    size_t           n_slist;
+    oc_activity_row *alist;
+    size_t           n_alist;
+    uint64_t         activity_seen;
+
+    /* Threads (REQ-060). REPLY_OK reuses message_id/channel_id/author_id/
+     * server_time/body/idem/members/duplicate above, plus parent_id + reply_count.
+     * THREAD carries the reply list. */
+    uint64_t        parent_id;
+    uint32_t        reply_count;
+    oc_replay_msg  *thread;         /* heap array; THREAD replies */
+    size_t          n_thread;
+
+    /* SEARCH results (REQ-080): each row reuses oc_replay_msg with `body`
+     * holding the FTS snippet. */
+    oc_replay_msg  *search;
+    size_t          n_search;
+
+    /* IDENTITY (load): the stored TLS cert+key PEM, or NULL if none. */
+    char           *cert_pem;
+    char           *key_pem;
+    struct oc_tls_state *tls_state;   /* OC_RES_TLS_STATE */
+
+    /* ENROLLMENT (load, ARCH-84): the persisted keypair + audience + state. */
+    char           *enroll_privkey;
+    char           *enroll_audience;
+    int             enroll_active;
+    int             enroll_present;
+
+    /* Attachments (REQ-140/141). CREATED: attachment_id (above) + storage_key.
+     * META (download): attachment_id + channel_id (above) + storage_key +
+     * filename + mime + att_size + att_sha256. */
+    uint64_t        attachment_id;
+    char           *storage_key;  /* heap */
+    char           *filename;      /* heap */
+    char           *mime;          /* heap */
+    uint64_t        att_size;
+    uint8_t         att_sha256[32];
+
+    /* Webhook management (REQ-170). WEBHOOK_LIST: the rows; WEBHOOK_DELETED reuses
+     * message_id above to echo the removed webhook id. */
+    oc_webhook_row *whlist;        /* heap array */
+    size_t          n_whlist;
+
+    /* NOTIFY_PREFS (REQ-130/131): the user's DND window + per-channel levels. */
+    oc_notify_pref_row *nprefs;    /* heap array */
+    uint8_t            np_default;  /* REQ-134: the level for channels with no row */
+    size_t              n_nprefs;
+    /* OC_RES_SCHEDULE (REQ-136) — also carried on the prefs snapshot and at auth,
+     * so a client learns all of its notification state in one exchange. */
+    uint8_t             sc_mode;
+    int16_t             sc_tz_offset_min;
+    uint16_t            sc_start_min, sc_end_min;
+    oc_schedule_day     sc_days[OC_SCHEDULE_DAYS];
+    uint8_t             sc_n_days;
+    /* OC_RES_THREAD_LIST / _ONE (REQ-062): heap array of summaries with heap
+     * previews, freed by oc_dbres_free like every other list result. */
+    struct oc_thread_row *threads;
+    size_t               n_threads;
+    /* OC_RES_ALERT_PREFS (REQ-135): my keywords and my priority people. */
+    char              **al_terms;      /* heap array of heap strings */
+    uint8_t             al_n_terms;
+    uint64_t           *al_people;     /* heap */
+    uint8_t             al_n_people;
+    /* OC_RES_SNOOZE, and carried on AUTH_OK so the net thread can seed its
+     * in-memory copy without a second round trip. Already expiry-checked. */
+    uint64_t            snooze_until_ms;
+
+    /* CLIENT_SETTINGS: the bucket's client_type + its key/value rows. */
+    char                   *cs_client_type;  /* heap */
+    oc_sched_row            sched;           /* OC_RES_SCHEDULED — heap strings */
+    oc_sched_row           *scheds;          /* heap array (OC_RES_SCHEDULED_LIST) */
+    size_t                  n_scheds;
+    oc_draft_row            draft;           /* OC_RES_DRAFT — body is heap */
+    oc_draft_row           *drafts;          /* heap array (OC_RES_DRAFTS) */
+    size_t                  n_drafts;
+    oc_client_setting_row  *cslist;          /* heap array */
+    size_t                  n_cslist;
+    oc_reclaim_row         *reclaim;         /* heap array (OC_RES_STORAGE_MAINT) */
+    /* Outstanding invites (OC_RES_INVITE_LIST). Ids, never tokens: only a hash is
+     * stored, and a list is not a place to hand credentials back. */
+    oc_invite_entry        *invites;
+    size_t                  n_invites;
+    /* OC_RES_PROFILE_INFO (53). Heap strings, freed with the result. Appended
+     * at the END rather than inserted mid-struct: the first attempt landed between
+     * `reclaim` and `n_reclaim`, splitting a pointer from its count, which is exactly
+     * the pairing a reader relies on. */
+    char                   *st_emoji, *st_text, *pf_title, *pf_tz;
+    char                   *pf_full_name, *pf_pronouns, *pf_phone, *pf_voice_id;
+    /* The profile was just changed by its owner (SET_PROFILE, SET_EMAIL): it
+     * goes to every one of their connections, not only the one that saved it,
+     * so their other devices show it too (REQ-240). */
+    uint8_t                 pf_fanout;
+    /* OC_RES_TTS_META (ARCH-111): `tts_cached` says the rendering is stored
+     * already, in which case tts_blob_key/tts_bytes/tts_duration_ms describe it;
+     * otherwise tts_text is what to render, in voice `tts_voice`. `tts_persist`
+     * asks the caller to write that voice back to the author's profile. */
+    char                   *tts_text, *tts_blob_key;
+    uint8_t                 tts_handle[32];
+    uint64_t                tts_seq;    /* the lookup's, echoed (oc_job) */
+    uint64_t                tts_bytes;
+    uint32_t                tts_duration_ms;
+    uint8_t                 tts_voice, tts_cached, tts_persist, tts_warm;
+    uint64_t                tts_author_id;
+    uint64_t                st_expires, pf_avatar;
+    /* OC_RES_FILE_CHANNELS. */
+    oc_file_channel_entry  *fchans;
+    size_t                  n_fchans;
+    /* OC_RES_SESSION_LIST (REQ-182). `session_id` also rides an AUTH_OK, to mark
+     * which row is the asking connection. */
+    oc_session_entry       *sessions;
+    size_t                  n_sessions;
+    uint64_t                session_id;
+    size_t                  n_reclaim;
+    uint64_t                maint_orphans;   /* counts, for the log line */
+    uint64_t                maint_expired;
+    uint64_t                maint_evicted;
+    uint64_t                maint_renders;   /* read-aloud renderings reclaimed (ARCH-111) */
+    /* Storage report (REQ-214). The free-space half is filled in by the net
+     * thread from its cached statvfs sample; the writer supplies what only the
+     * database knows. */
+    uint64_t                st_attach_bytes, st_attach_count;
+    uint64_t                st_rec_orphan, st_rec_expired, st_rec_evicted;
+    uint64_t                st_last_reclaim_ms;
+    /* Audit page (REQ-251). `audit` is a heap array of rows, newest first. */
+    struct oc_audit_row    *audit;
+    size_t                  n_audit;
+
+    /* PROFILE_UPDATED: the (possibly unchanged) display name to broadcast; the
+     * subject user is `user_id` above. */
+    char                   *profile_name;    /* heap */
+
+    /* READ_CURSOR (REQ-090): the acker (user_id) advanced to message_id in
+     * channel_id; members holds the channel members to fan it to, and rcur holds
+     * the *other* members' current cursors to backfill the acker. */
+    oc_read_cursor_row     *rcur;            /* heap array */
+    size_t                  n_rcur;
+
+    /* OC_RES_STT_PREP (ARCH-112): the segment, and the conversation's members'
+     * display names (heap strings) for mention normalization. */
+    uint64_t                stt_req;
+    char                  **stt_names;
+    size_t                  n_stt_names;
+
+    /* OC_RES_CALL_AUTH (REQ-301/302): the question it answers, and which of the
+     * users asked about may read the conversation -- the ones who may be
+     * invited. `members` carries the conversation's members. */
+    uint8_t                 call_op;
+    uint64_t               *call_uids;       /* heap */
+    size_t                  n_call_uids;
+    uint8_t                 call_key[OC_CALL_DEVICE_KEY_LEN];
+    uint8_t                 call_codecs;
+
+    /* Critical failures (REQ-263). On AUTH_OK for an owner or admin, and on
+     * OC_RES_ALERTS_SUMMARY: `alerts_admin` set, and the counts. On
+     * OC_RES_ALERTS: the entries, newest first (heap). */
+    int                     alerts_admin;
+    uint32_t                alerts_unacked, alerts_current;
+    struct oc_alert_row {
+        uint64_t id, first_ms, last_ms;
+        uint32_t count;
+        uint8_t  current, acked;
+        char     key[OC_MAX_ALERT_KEY + 1], message[OC_MAX_ALERT_MESSAGE + 1];
+    }                      *alert_rows;
+    size_t                  n_alert_rows;
+    /* SUMMARY / SUMMARY_NEED (REQ-310): the request, the span resolved for the
+     * reader, and on SUMMARY the answer (heap strings). */
+    uint32_t                sum_req;
+    uint8_t                 sum_status;
+    uint64_t                sum_id;
+    int64_t                 sum_start, sum_end;
+    int                     sum_tz;
+    char                   *sum_body, *sum_version;
+    /* Every request waiting on a summary, and how many are ahead of it (0: it
+     * is being made). Heap. */
+    struct oc_sum_place { uint64_t conn_id; uint32_t req_id; uint16_t position; } *sum_places;
+    size_t                  n_sum_places;
+    /* A finished request's notice (SUMMARY: `sum_notice` for `sum_user`, sent
+     * live to conn_id if it still watches, else told as SUMMARY_READY); a
+     * cancelled one's running row (`sum_row`, for the worker to stop). */
+    uint64_t                sum_notice, sum_user, sum_made_at;
+    uint8_t                 sum_scope;
+    int64_t                 sum_row;
+    /* AUTH_OK: the person's notices not yet seen, oldest first. Heap. */
+    struct oc_sum_notice_row { uint64_t id, channel_id, start_ms, end_ms, made_at_ms; uint8_t scope, status; }
+                           *sum_notices;
+    size_t                  n_sum_notices;
+} oc_dbres;
+
+typedef struct oc_dbwriter oc_dbwriter;
+
+/* Open `path`, WAL + foreign_keys, migrate, start the thread. NULL on failure.
+ * The identity (ARCH-66b) is kept in memory: for tests and tools. */
+oc_dbwriter *oc_dbwriter_start(const char *path);
+
+/* What the daemon's own start asks of the store beyond oc_dbwriter_start, and
+ * what it learns. */
+typedef struct {
+    const char *identity_path;   /* the identity's own file (ARCH-66b, migration 0064); NULL: in memory */
+    const char *factor_key_file; /* where the factor key was kept before 0064; NULL: no factor key */
+    int  too_new;                /* out: the database was written by a newer daemon */
+    int  factor;                 /* out: 0 kept, 1 made, 2 taken in from the file, -1 none */
+    char factor_why[256];        /* out: why there is none */
+} oc_dbwriter_boot;
+
+/* As oc_dbwriter_start, with the identity in its own file and the factor key
+ * (AUTH.md §8.6) settled before the threads start: the identity's row, or the
+ * old file taken in once, or a new key -- but never a new key while second
+ * steps sealed under a lost one are kept, which would leave them unopenable
+ * without a word. NULL on failure; b->too_new says if that was the reason. */
+oc_dbwriter *oc_dbwriter_start_boot(const char *path, oc_dbwriter_boot *b);
+
+/* The issuer name this daemon's local accounts' tokens carry (AUTH.md §8.10),
+ * or NULL before it is loaded. */
+const char *oc_dbwriter_local_issuer_name(oc_dbwriter *w);
+void         oc_dbwriter_stop(oc_dbwriter *w);
+
+/* The eventfd the net thread registers in epoll; readable when results wait. */
+int  oc_dbwriter_eventfd(oc_dbwriter *w);
+
+/* Enable the relay source (AUTH.md §3, §8): AUTH{oidc} tokens are verified
+ * against the pinned ES256 keys. Other sources are left as they are. Copies its
+ * args; call once before serving traffic. `pubkey_pem` is one or more PEM
+ * SubjectPublicKeyInfo blocks; `relay_origin` is where AUTH_BEGIN sends a browser
+ * ("" when the box is not enrolled anywhere). Returns 0 / -1. */
+/* Set the registered-user cap (AUTH.md §2, OPENCHIME_MANAGED_MAX_USERS); <=0 = unlimited. Call
+ * once before serving. */
+void oc_dbwriter_set_max_users(oc_dbwriter *w, int max_users);
+
+/* Argon2id memory (KiB) for new password keys, a register job given 0, and the
+ * check an unknown name gets; 0 = OC_PW_MEM_KIB. Tests only. Call before serving. */
+void oc_dbwriter_set_pw_mem(oc_dbwriter *w, uint32_t mem_kib);
+
+int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
+                               const char *audience, const char *pubkey_pem,
+                               const char *relay_origin);
+/* The keys the relay publishes (relaykeys.h), trusted beside the pinned ones,
+ * which no fetch removes; each call replaces the last. Any thread, after
+ * oc_dbwriter_configure_oidc. */
+void oc_dbwriter_set_relay_keys(oc_dbwriter *w, const char *fetched_pem);
+
+/* Local accounts on or off (on by default). Off, the pages refuse a password
+ * and an invitation. */
+void oc_dbwriter_set_local_enabled(oc_dbwriter *w, int on);
+
+/* Who may join through an OIDC source (OPENCHIME_JOIN, AUTH.md §8.4).
+ * NULL or "" admits nobody new. Returns -1 with a reason in `err` on a rule it
+ * does not understand; call before the writer serves traffic. */
+int oc_dbwriter_configure_join_rules(oc_dbwriter *w, const char *spec,
+                                     char *err, size_t errcap);
+/* Whether an emailed code may sign into a person who signs in here with a
+ * provider (a constant: never); off, it is refused. Before serving. */
+void oc_dbwriter_set_email_link(oc_dbwriter *w, int any);
+/* The key a local account's TOTP secret is sealed under (AUTH.md §8.6), or NULL
+ * when none could be had: an account with a second step then cannot pass it,
+ * rather than passing without it. Before serving. */
+void oc_dbwriter_set_factor_key(oc_dbwriter *w, const uint8_t *key32);
+/* Whether local accounts are asked for a second step (OPENCHIME_MFA):
+ * OC_MFA_OFF never, and its page is closed; OC_MFA_OPTIONAL when one is set
+ * up; OC_MFA_REQUIRED always -- an account with none signs in only once it has
+ * set one up. Before serving. */
+#define OC_MFA_OFF      0
+#define OC_MFA_OPTIONAL 1
+#define OC_MFA_REQUIRED 2
+void oc_dbwriter_set_local_mfa(oc_dbwriter *w, int policy);
+/* How long a session lives (OC_SESSION_TTL_MS), and how long one may go
+ * unused before it is refused (OC_SESSION_IDLE_MS; 0, never), in ms.
+ * Before serving. */
+void oc_dbwriter_set_session_policy(oc_dbwriter *w, uint64_t ttl_ms, uint64_t idle_ms);
+int  oc_dbwriter_local_mfa(oc_dbwriter *w);
+/* The issuers of this deployment's direct connections (AUTH.md §8.5): the relay
+ * does not deliver their identities, and links nobody to them. Before serving. */
+void oc_dbwriter_set_direct_issuers(oc_dbwriter *w, const char *const *issuers, int n);
+
+/* Which sources are on (OC_AUTH_* bits), and what AUTH_BEGIN builds the relay's
+ * authorize URL from. For the net loop; set before serving and never after. */
+uint8_t     oc_dbwriter_auth_methods(oc_dbwriter *w);
+/* Local accounts sign in in the browser, on the daemon's pages (AUTH.md §8.10):
+ * its issuer is ready. */
+int         oc_dbwriter_local_browser(oc_dbwriter *w);
+const char *oc_dbwriter_relay_origin(oc_dbwriter *w);
+const char *oc_dbwriter_oidc_audience(oc_dbwriter *w);
+
+/* Override the idempotency-map retention + prune interval (ARCH-44). Production
+ * defaults are 24h / 1h; tests set small values to exercise pruning. */
+void oc_dbwriter_set_idem_retention(oc_dbwriter *w, uint64_t retention_ms,
+                                    uint64_t interval_ms);
+
+/* Allocate a zeroed job of `type` for `conn_id`. Fill in the type's fields
+ * (oc_job_set_token / oc_job_set_body copy into heap) then submit. */
+oc_job *oc_job_new(int type, uint64_t conn_id);
+/* Free a job that was never submitted, and what it holds. */
+void    oc_job_free(oc_job *j);
+int     oc_job_set_token(oc_job *j, const void *tok, size_t len);
+int     oc_job_set_proof(oc_job *j, const void *proof, size_t len);
+int     oc_job_set_email(oc_job *j, const void *email, size_t len);
+int     oc_job_set_body(oc_job *j, const void *body, size_t len);
+/* Fill a REGISTER job (copies strings). mem_kib 0 -> the writer's Argon2id memory. */
+int     oc_job_set_register(oc_job *j, const char *username, const char *password,
+                            uint8_t role, uint32_t mem_kib);
+
+/* Synchronously ensure a local account exists (bootstrap the first owner, or a
+ * fixed set of accounts for tests). Runs a REGISTER job through the writer and
+ * blocks for its result; returns the user id, or 0 on failure. */
+uint64_t oc_dbwriter_register_local(oc_dbwriter *w, const char *username,
+                                    const char *password, uint8_t role,
+                                    uint32_t mem_kib);
+
+/* The auth pool's hold and its count of waiting checks (authpool.h): a test's
+ * knob, for putting a password change between a sign-in's fetch of the
+ * credential and its check of the password. */
+void   oc_dbwriter_hold_auth(oc_dbwriter *w, int on);
+/* A test's knob: while held, the writer, the readers, or both take no job from
+ * their queues, so a test can put frames between a job's submission and its
+ * result. 0 releases. */
+enum { OC_DBW_HOLD_WRITER = 1, OC_DBW_HOLD_READERS = 2, OC_DBW_HOLD_ALL = 3 };
+void   oc_dbwriter_hold(oc_dbwriter *w, int what);
+/* How long a delete can be taken back (default two minutes); tests shorten it. */
+void   oc_dbwriter_set_restore_window_ms(oc_dbwriter *w, uint64_t ms);
+
+/* A critical failure (REQ-263), from any thread: raise `key` with `message` --
+ * again on the same entry while it holds -- or clear it, once it has stopped.
+ * Every owner and admin connected is told the new counts. */
+void   oc_dbwriter_alert(oc_dbwriter *w, const char *key, const char *message);
+void   oc_dbwriter_alert_clear(oc_dbwriter *w, const char *key);
+/* The jobs of `type` (OC_JOB_*) queued for the writer or a reader, for a test
+ * waiting on them. */
+size_t oc_dbwriter_jobs_waiting(oc_dbwriter *w, int type);
+size_t oc_dbwriter_auth_waiting(oc_dbwriter *w);
+
+/* First-run bootstrap (REQ-024): if the tenant has no owner, mint a one-time
+ * owner invite and return its raw token in `token_out` (returns 1); returns 0
+ * if an owner already exists. Setup-time only (drains one result). */
+int oc_dbwriter_setup_invite(oc_dbwriter *w, uint8_t token_out[OC_INVITE_TOKEN_LEN]);
+
+/* Persisted TLS identity (ARCH-66b) so the trusted certificate survives the database being
+ * restored onto a new box (the cert lives in the DB, not just on local disk).
+ * load returns 1 + heap cert/key PEM (caller frees) if stored, else 0; store
+ * returns 1 on success. Setup-time only (each drains one result). */
+int oc_dbwriter_load_identity(oc_dbwriter *w, char **cert_out, char **key_out);
+int oc_dbwriter_store_identity(oc_dbwriter *w, const char *cert_pem, const char *key_pem);
+
+/* A CA-issued certificate and the ACME account behind it (migration 0049). Any
+ * member may be NULL (none kept). */
+typedef struct oc_tls_state {
+    char    *acme_directory, *acme_key_pem, *acme_url;
+    char    *source, *names, *chain_pem, *key_pem;
+    uint64_t issued_ms, not_after_ms;
+} oc_tls_state;
+void oc_tls_state_free(oc_tls_state *s);
+/* What is kept, into `out`. Setup-time only, like oc_dbwriter_load_identity. */
+int  oc_dbwriter_load_tls_state(oc_dbwriter *w, oc_tls_state *out);
+/* Keep the ACME account / the certificate obtained. Any thread, while serving:
+ * the job is the writer's and nothing is answered. */
+void oc_dbwriter_store_acme_account(oc_dbwriter *w, const char *directory, const char *key_pem, const char *url);
+void oc_dbwriter_store_tls_cert(oc_dbwriter *w, const char *source, const char *names, const char *chain_pem,
+                                const char *key_pem, uint64_t issued_ms, uint64_t not_after_ms);
+
+/* Federated enrollment persistence (ARCH-84), setup-time only. Load returns 1 and
+ * heap-allocates privkey_pem + audience (caller frees) + *active when a row
+ * exists, else 0. Store persists the keypair + audience + state; returns 1 on
+ * success. */
+int oc_dbwriter_load_enrollment(oc_dbwriter *w, char **privkey_out, char **audience_out, int *active_out);
+int oc_dbwriter_store_enrollment(oc_dbwriter *w, const char *privkey_pem, const char *audience, int active);
+/* Record the binding as active, fire and forget: no result comes back, so this
+ * may run while the net loop consumes results (a managed box claims its binding
+ * once it is serving). */
+void oc_dbwriter_note_enrollment_active(oc_dbwriter *w, const char *privkey_pem, const char *audience);
+
+/* A managed workspace's welcome: no message, no system user. With
+ * `deployment_mode` OC_DEPLOY_MANAGED (config.h), the first time #general is made
+ * it is made with a welcome topic and description naming `workspace_name` (""
+ * names none); any other mode does nothing at all. A #general that already
+ * exists is left as it is, so this runs on every boot. Returns 1 when it wrote
+ * the welcome, 0 otherwise. Setup-time only. */
+int oc_dbwriter_welcome_general(oc_dbwriter *w, int deployment_mode, const char *workspace_name);
+
+/* A demo workspace (OPENCHIME_MODE=demo, AUTH.md §8.12): sign-up takes
+ * central's signed invite as well as a token; channel topics and
+ * descriptions are a moderator's; and its first start seeds sample channels
+ * and messages. Call before serving. */
+void oc_dbwriter_set_demo(oc_dbwriter *w, int on);
+/* The seed, once: 1 when it was written now, 0 when it was there already. */
+int oc_dbwriter_seed_demo(oc_dbwriter *w, const char *workspace_name);
+
+/* Register a push device token (ARCH-85): submits + blocks for the ack; returns 1
+ * on success, 0 on a bad platform/empty token. */
+int oc_dbwriter_register_device_token(oc_dbwriter *w, uint64_t user_id, uint8_t platform, const char *token);
+/* Drop a device token across all users — fire-and-forget. Called by the push
+ * worker from its own thread when central reports the token stale. */
+void oc_dbwriter_prune_device_token(oc_dbwriter *w, const char *token);
+
+/* Whether any row names each of `n` blob keys: an attachment (avatars, emoji
+ * and video posters are attachments) or a read-aloud render. The blob store's
+ * sweep asks, from its own thread, on a read-only connection of its own to the
+ * database at `db_path` (an oc_blob_ref_fn, blobstore.h). 0, or -1 when the
+ * database could not be read. */
+int oc_db_blob_referenced(void *db_path, const char *const *keys, size_t n, uint8_t *ref);
+
+/* Hand a job to the writer (transfers ownership; the writer frees it). */
+void       oc_dbwriter_submit(oc_dbwriter *w, oc_job *j);
+/* Store a summary batch through the writer and wait for it (the summary
+ * worker's sink, ARCH-116): 0 stored, 1 refused because a message changed, -1.
+ * The answer, when someone waits, comes back to the net loop as OC_RES_SUMMARY. */
+int        oc_dbwriter_sum_store(oc_dbwriter *w, const oc_sum_answer *a, oc_sum_new *nodes, int n);
+/* Mark queued request `row` running for the worker, and wait: 1 taken, 0 when
+ * it is no longer queued (its connection closed), -1. */
+int        oc_dbwriter_sum_take(oc_dbwriter *w, int64_t row);
+/* Pop the next completed result, or NULL when drained. Caller frees it. */
+oc_dbres *oc_dbwriter_next_result(oc_dbwriter *w);
+void       oc_dbres_free(oc_dbres *r);
+
+#endif /* OPENCHIME_DBWRITER_H */

@@ -1,0 +1,185 @@
+/*
+ * OpenChime client — network thread (ARCH-62).
+ *
+ * Owns the TLS socket for one connection: connect → TLS handshake (ARCH-10) →
+ * HELLO/WELCOME → (stub) AUTH → read loop dispatching server frames into `to_ui`
+ * as oc_ev, while draining user oc_cmd from `from_ui` to send. Lifts the
+ * connect/read/write logic from tests/e2e_client.c; blocking-style over a
+ * non-blocking socket polled with a short timeout so it can interleave sends.
+ */
+
+#ifndef OC_NET_H
+#define OC_NET_H
+
+#include "callsig.h"
+#include "event.h"
+#include "queue.h"
+#include "secret.h"
+
+typedef struct oc_net oc_net;
+
+/* One way a workspace signs people in, as its AUTH_CHALLENGE lists it. `kind` is
+ * OC_SOURCE_LOCAL (a password form) or a browser source (a button). */
+typedef struct { char id[64]; char label[96]; uint8_t kind; } oc_signin_source;
+#define OC_PROBE_UNREACHABLE (-1)
+#define OC_PROBE_VERSION     (-2)   /* the server speaks another protocol version */
+
+/* Connect, read how the workspace signs people in, and leave — so a frontend can
+ * draw the right controls before asking for anything. Blocking (a few seconds at
+ * worst); returns the number of sources written to `out`, or OC_PROBE_*.
+ * `workspace` is the workspace's domain or key, named in the handshake as the
+ * sign-in connection names it; NULL names `host`. */
+int oc_net_probe(const char *workspace, const char *host, int port, oc_signin_source *out, int max);
+
+/* A certificate shown to the person to judge (ARCH-10): its fingerprint, and
+ * the certificate itself for a frontend that shows it (der_len 0 if it was
+ * larger than OC_CERT_DER_MAX). */
+typedef struct {
+    char    fp_hex[65];
+    uint8_t der[OC_CERT_DER_MAX];
+    size_t  der_len;
+} oc_cert_seen;
+
+/* The certificate a probe was shown was not one to trust (ARCH-10): no trusted
+ * root vouches for it and `trusted_fp` (what the person trusted, or NULL) is not
+ * it. It is described in `seen`. */
+#define OC_PROBE_UNTRUSTED   (-3)
+int oc_net_probe_ex(const char *workspace, const char *host, int port, const unsigned char *trusted_fp,
+                    oc_signin_source *out, int max, oc_cert_seen *seen);
+
+/* Trust the certificate with this fingerprint -- one the person was shown
+ * (OC_EV_CERT_UNTRUSTED) and accepted: kept for the workspace, and presented to
+ * the next attempt. Any thread. */
+void oc_net_trust_cert(oc_net *n, const unsigned char fp[32]);
+
+/* Sign in with this source (an AUTH_CHALLENGE id: "local", "relay", ...) when
+ * no password is given; "" or NULL, the first browser source offered, else
+ * local accounts. Before the first connection. */
+void oc_net_set_signin_source(oc_net *n, const char *source_id);
+
+/* 1 when the daemon's pages open directly, its certificate vouched for by a
+ * trusted authority -- so a link to one works from any browser -- else 0. */
+int oc_net_pages_direct(oc_net *n);
+
+/* One of the daemon's own pages -- `page` "account/password", `query` its
+ * query or NULL -- as the browser should open it (AUTH.md §8.10): the daemon's
+ * own https origin when a trusted authority vouched for its certificate, else a
+ * loopback tunnel carried for ten minutes to the certificate this client
+ * accepted. The URL into `url`. -1 before any connection has got that far. UI
+ * thread. */
+int oc_net_open_page(oc_net *n, const char *page, const char *query, char *url, size_t cap);
+
+/* Start the network thread. `token` is NULL or "": a stored session reconnects
+ * silently, else a browser sign-in through the first such source the workspace
+ * offers: OC_EV_AUTH_BROWSER then carries the URL for the frontend to open,
+ * and the thread waits for the browser to come back. A password never reaches
+ * the core (AUTH.md §8.10). `store_path` (or NULL for in-memory only) is a local
+ * SQLite store persisting the session token + trusted fingerprint, so a relaunch reconnects
+ * silently. `secret` (borrowed; NULL = none) routes the session token into an OS
+ * keyring instead of the SQLite file. Returns NULL on failure to spawn. */
+oc_net *oc_net_start(const char *host, int port, const char *token,
+                     const char *store_path, oc_secret *secret,
+                     oc_queue *to_ui, oc_queue *from_ui);
+
+/* As oc_net_start, with the key the workspace's credential entry is filed under
+ * (oc_workspace_key of what the person typed). NULL keys it by "host:port". An
+ * entry found under "host:port" is moved to the key on first use. */
+oc_net *oc_net_start_named(const char *workspace_key, const char *host, int port, const char *token,
+                           const char *store_path, oc_secret *secret,
+                           oc_queue *to_ui, oc_queue *from_ui);
+
+/* As oc_net_start_named. With `pin_only` set nothing about the session is kept —
+ * no token, owner, device key or book entry, which is what Remember-me off means —
+ * but the workspace's trusted fingerprint still is: it is not a secret, and without it every
+ * connection is a first connection (ARCH-10). */
+oc_net *oc_net_start_opts(const char *workspace_key, const char *host, int port, const char *token,
+                          const char *store_path, oc_secret *secret, int pin_only,
+                          oc_queue *to_ui, oc_queue *from_ui);
+
+/* As oc_net_start_opts, with the certificate fingerprint the workspace PUBLISHED
+ * (ARCH-10, via `.well-known`; NULL when it published none, 32 bytes when it
+ * did). It is used only where there is no stored pin yet -- the first connection,
+ * the one trust-on-first-use cannot check -- and a daemon presenting anything
+ * else is refused rather than pinned. A stored pin still wins: it is what this
+ * person already trusted, and a document cannot overrule it. */
+oc_net *oc_net_start_verified(const char *workspace_key, const char *host, int port,
+                              const char *token, const char *store_path, oc_secret *secret,
+                              int pin_only, const unsigned char *published_pin,
+                              oc_queue *to_ui, oc_queue *from_ui);
+/* As oc_net_start_verified, signing in with `source_id` (oc_net_set_signin_source)
+ * and, for a browser sign-in, carrying the invitation `invite` (hex) to the
+ * sign-up page -- both set before the thread runs. */
+oc_net *oc_net_start_signin(const char *workspace_key, const char *host, int port,
+                            const char *token, const char *source_id, const char *invite,
+                            const char *store_path, oc_secret *secret,
+                            int pin_only, const unsigned char *published_pin,
+                            oc_queue *to_ui, oc_queue *from_ui);
+/* A browser sign-in's result, for a client that could not wait for it: the
+ * token the daemon's page sent back (AUTH.md §8.2), with the source and the
+ * PKCE verifier the sign-in began with, and the state for a provider's code
+ * (NULL otherwise). The web client (WEB.md) resumes its sign-in this way after
+ * the browser comes back to it. */
+#ifndef OC_SIGNIN_RESULT_DEFINED
+#define OC_SIGNIN_RESULT_DEFINED
+typedef struct {
+    const char *source_id, *verifier, *token, *state;
+} oc_signin_result;
+#endif
+/* As oc_net_start_signin, presenting `result` as the first thing: AUTH with
+ * it, no AUTH_BEGIN. */
+oc_net *oc_net_start_signin_result(const char *workspace_key, const char *host, int port,
+                                   const oc_signin_result *result,
+                                   const char *store_path, oc_secret *secret,
+                                   int pin_only, const unsigned char *published_pin,
+                                   oc_queue *to_ui, oc_queue *from_ui);
+/* As oc_net_start_signin to a local account, opening first the page that sets
+ * a new password with the reset's token `reset` (hex), which goes on to the
+ * sign-in (AUTH.md §2). */
+oc_net *oc_net_start_reset(const char *workspace_key, const char *host, int port, const char *reset,
+                           const char *store_path, oc_secret *secret,
+                           int pin_only, const unsigned char *published_pin,
+                           oc_queue *to_ui, oc_queue *from_ui);
+/* As oc_net_start_signin, signing in to a local account with a device code
+ * (AUTH.md §8.11): OC_EV_AUTH_DEVICE carries the code and where to enter it,
+ * and the thread polls until it is approved, refused or runs out. */
+oc_net *oc_net_start_device(const char *workspace_key, const char *host, int port,
+                            const char *store_path, oc_secret *secret,
+                            int pin_only, const unsigned char *published_pin,
+                            oc_queue *to_ui, oc_queue *from_ui);
+
+/* Cut short the reconnect backoff so the next attempt happens immediately (no-op
+ * if not currently backing off). */
+void oc_net_reconnect(oc_net *n);
+
+/* Stop waiting for the browser (the person pressed cancel). */
+void oc_net_cancel_signin(oc_net *n);
+
+/* Set the synced-settings bucket id for this client (default "tui"). Call once
+ * right after start, before soliciting settings; identifies the per-frontend
+ * bucket so a TUI's synced prefs stay separate from a future GUI's. */
+void oc_net_set_client_type(oc_net *n, const char *client_type);
+
+/* The media engine calls go to (callsig.h); NULL removes it. Returns once no call
+ * into the old one is running, so it may be freed after. */
+void oc_net_set_call_media(oc_net *n, const oc_call_media *media, void *ctx);
+
+/* Signal the thread to stop, join it, and free. */
+void oc_net_stop(oc_net *n);
+
+/* Sends queued in the in-memory outbox but not yet acked (REQ-102/ARCH-88).
+ * Safe from the UI thread: the net thread only ever publishes a count here. */
+int oc_net_outbox_pending(oc_net *n);
+
+/* The frame dispatch with no connection behind it: bytes in, the events a live
+ * connection would hand the UI out on `to_ui`. It exists so that what the
+ * network thread promises about ORDER can be proven one frame at a time --
+ * above all that a live message is held until its ACTION and handed on with it
+ * (REQ-058, ARCH-115), which a real socket delivers in one read and so never
+ * shows. `feed` returns -1 where a connection would be dropped; `free` hands on
+ * whatever is still held, as a closing connection does. */
+typedef struct oc_net_frames oc_net_frames;
+oc_net_frames *oc_net_frames_new(oc_queue *to_ui);
+int          oc_net_frames_push(oc_net_frames *f, const uint8_t *bytes, size_t len);
+void         oc_net_frames_free(oc_net_frames *f);
+
+#endif /* OC_NET_H */

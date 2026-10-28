@@ -1,0 +1,6568 @@
+/* Headless test for the client app-core (ARCH-74). Brings the daemon's netloop
+ * up in-process (TLS server + DB-writer thread, like itest_netloop.c) with one
+ * registered account, then drives a real oc_client against it over the loopback:
+ * connect → auth → the post-auth LIST_CHANNELS populates the model's channel
+ * list, and a sent message round-trips back as a BROADCAST folded into the
+ * per-channel buffer. Proves the whole core — net thread, queues, reducers, and
+ * the facade — with no UI. */
+
+#include "client.h"     /* the core facade under test */
+#include "testsignin.h" /* a person's sign-in, on the daemon's page */
+#include "model.h"
+#include "store.h"       /* to assert the persisted token/pin */
+#include "resolve.h"     /* workspace resolution (REQ-010/011) */
+#include "wellknown.h"   /* the optional `.well-known` half of REQ-010 */
+#include "complete.h"    /* who the New message pane may address (REQ-229) */
+
+#include "netloop.h"
+#include "config.h"
+#include "dbwriter.h"
+#include "sum_worker.h"   /* the daemon summarizes with a stub model here */
+#include "protocol.h"
+#include "tls.h"
+#include "tts_render.h"
+#include "stt_render.h"
+#include "audio_dev.h"
+#include "oc_dictate.h"
+#include "oc_mp4.h"
+#include "oc_call_engine.h"
+#include "oc_capture.h"
+#include "audio.h"        /* the relay, run on a thread for the call test */
+#include "e2e_hpke.h"
+#include "e2e_sframe.h"
+#include "osnotify.h"
+#include "feedback.h"
+#include "check.h"
+#include "testenv.h"     /* a directory and ports of the suite's own */
+#include "testpki.h"
+#include "issuer.h"       /* mints what central would, for the browser sign-in test */
+#include "signin.h"
+#include <mbedtls/sha256.h>
+#include "net.h"          /* oc_net_probe */
+
+#include <ctype.h>
+#include <math.h>
+#include <sqlite3.h>     /* to hand-build a pre-rename store for the upgrade test */
+#include "oc_port.h"      /* oc_utc_offset_min: the value the core sends on connect */
+
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+struct core_loop_arg {
+    int                   port;      /* 0: the kernel picks; core_loop_start reads it back */
+    oc_tls_server        *srv;
+    oc_dbwriter          *dbw;
+    volatile sig_atomic_t stop;
+    int                   exited;    /* the loop returned (atomic): a bind refused, or stopped */
+    oc_netloop_view       view;      /* the loop's own account: the port it bound */
+};
+
+/* The suite's own directory (oc_test_mkdtemp), made by run_client_core_tests:
+ * every database, store and file the suite writes is under it, so nothing is
+ * shared with another suite, another run or another checkout. */
+static char g_dir[512];
+
+/* `name` under the suite's directory, interned: the same name is the same
+ * buffer for the whole run, so a path can be held as long as it is needed. */
+static const char *tpath(const char *name) {
+    static struct { char name[64], path[640]; } tab[96];
+    static int n;
+    for (int i = 0; i < n; i++) if (strcmp(tab[i].name, name) == 0) return tab[i].path;
+    if (n == (int)(sizeof tab / sizeof tab[0]) || strlen(name) >= sizeof tab[0].name) return "";
+    snprintf(tab[n].name, sizeof tab[n].name, "%s", name);
+    oc_test_path(tab[n].path, sizeof tab[n].path, g_dir, name);
+    return tab[n++].path;
+}
+
+/* A database's file and its WAL companions, gone. */
+static void unlink_db(const char *db) {
+    char x[700];
+    unlink(db);
+    snprintf(x, sizeof x, "%s-wal", db); unlink(x);
+    snprintf(x, sizeof x, "%s-shm", db); unlink(x);
+}
+
+/* Words the tests feed in and read back: each written once, so what is
+ * compared is what was given -- the model's handling of it, never its wording. */
+#define T_PIN    "the runbook"
+#define T_SAID   "Link copied."
+#define T_KEPT   "keep this"
+#define T_ERR    "auth failed"
+#define T_ANSWER "here is the answer"
+#define T_POLL   "Which colour?"
+#define T_EDITED "the private words, edited"
+#define T_FULLNAME  "Erik Lund"
+#define T_DESCR     "What this channel is for."
+#define T_DISPLAY   "Dana Q"
+#define T_REPLY     "a threaded reply"
+#define T_EDIT_BODY "edited body"
+
+/* Read-aloud with a stub voice (ARCH-111): the core's half is the queue, the
+ * fetch and the bytes, none of which needs a real model. */
+static void *core_tts_open(void *ctx, char *err, size_t cap) { (void)ctx; (void)err; (void)cap; static int t; return &t; }
+static void core_tts_close(void *e) { (void)e; }
+static const char *core_tts_voice_id(int v) { return v == 0 ? "core-voice-m" : "core-voice-f"; }
+static const char *core_tts_voice_label(int v) { return v == 0 ? "Core Low" : "Core High"; }
+
+static int core_tts_say(void *e, const char *segment, int voice, float **pcm, size_t *n,
+                        char *err, size_t cap) {
+    (void)e; (void)voice; (void)err; (void)cap;
+    size_t samples = strlen(segment) * 240;          /* 10 ms a character at 24 kHz */
+    *pcm = calloc(samples, sizeof **pcm);
+    if (!*pcm) return -1;
+    for (size_t i = 0; i < samples; i++) (*pcm)[i] = (float)(0.2 * sin(2 * M_PI * 220.0 * (double)i / 24000.0));
+    *n = samples;
+    return 0;
+}
+
+static const oc_tts_engine CORE_TTS = {
+    .version = "core-stub-1", .lang = "en-US", .rate = 24000, .voices = 2, .ctx = NULL,
+    .voice_id = core_tts_voice_id, .voice_label = core_tts_voice_label,
+    .preview = "This is a test voice.",
+    .open = core_tts_open, .close = core_tts_close, .say = core_tts_say,
+};
+
+/* Voice input with a stub recognizer (ARCH-112): the first sample is a code, the
+ * second a marker -- 1 says "spoken <marker> at erik", 3 fails. */
+static void *core_stt_open(void *ctx, char *err, size_t cap) { (void)ctx; (void)err; (void)cap; static int t; return &t; }
+static void core_stt_close(void *e) { (void)e; }
+static int core_stt_hear(void *e, const int16_t *pcm, size_t n, char **text, char *err, size_t cap) {
+    (void)e;
+    int code = n > 0 ? pcm[0] : 0, marker = n > 1 ? pcm[1] : 0;
+    if (code == 3) { snprintf(err, cap, "stub failure"); return -1; }
+    char buf[64] = "";
+    if (code == 1) snprintf(buf, sizeof buf, "spoken %d at erik", marker);
+    *text = strdup(buf);
+    return *text ? 0 : -1;
+}
+static const oc_stt_engine CORE_STT = {
+    .version = "core-stt-1", .lang = "en-US", .ctx = NULL,
+    .open = core_stt_open, .close = core_stt_close, .hear = core_stt_hear,
+};
+
+/* What the stub's "spoken <marker> at erik" becomes: the spoken mention made a
+ * mention. One buffer per marker, so two may be compared at once. */
+static const char *spoken_words(int marker) {
+    static char buf[10][32];
+    snprintf(buf[marker % 10], sizeof buf[0], "spoken %d @%s", marker, "erik");
+    return buf[marker % 10];
+}
+
+static void stt_say(oc_client *c, uint8_t mode, uint64_t channel, int16_t code, int16_t marker) {
+    int16_t pcm[8000];
+    memset(pcm, 0, sizeof pcm);
+    pcm[0] = code;
+    pcm[1] = marker;
+    CHECK(oc_client_stt_send(c, mode, channel, 0, pcm, 8000) != 0);
+}
+
+static void *core_loop_thread(void *p) {
+    struct core_loop_arg *a = (struct core_loop_arg *)p;
+    char cfgerr[128];
+    oc_config_load(cfgerr, sizeof cfgerr);   /* daemon config (blob dir, storage, …) */
+    oc_netloop_run_ex(a->port, a->srv, a->dbw, &a->stop, &a->view);
+    __atomic_store_n(&a->exited, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* Start the in-process daemon's loop on its thread and wait until it accepts
+ * connections: oc_client's connect does not retry, so a client started before
+ * the listener is up would lose the race. A port of 0 is bound as 0, so the
+ * kernel picks, and the loop's view says which (oc_netloop_run_ex): nothing to
+ * race with. A port already set (a restart that must keep its address) is used
+ * as it is. 0 with a->port set, or -1 when the loop did not come up. */
+static int core_loop_start(struct core_loop_arg *a, pthread_t *th) {
+    memset(&a->view, 0, sizeof a->view);
+    __atomic_store_n(&a->exited, 0, __ATOMIC_RELEASE);
+    if (pthread_create(th, NULL, core_loop_thread, a) != 0) return -1;
+    if (!WAIT_UNTIL(__atomic_load_n(&a->view.proto_port, __ATOMIC_ACQUIRE) > 0 ||
+                    __atomic_load_n(&a->exited, __ATOMIC_ACQUIRE), 10000)) return -1;
+    if (__atomic_load_n(&a->exited, __ATOMIC_ACQUIRE)) { pthread_join(*th, NULL); return -1; }
+    a->port = __atomic_load_n(&a->view.proto_port, __ATOMIC_ACQUIRE);
+    return 0;
+}
+
+
+/* Start a client signed in as `cred` ("user:password") the way a person is:
+ * the password goes to the daemon's sign-in page (tests/signin.h) and the
+ * token it ends with is what the client presents (AUTH.md §8.10). NULL, with
+ * the reason printed, when the page refuses: a wrong password signs nothing in.
+ * `host` may be "::1"; the page is reached over IPv4 either way. */
+static oc_client *start_as(const char *workspace_key, const char *host, int port, const char *cred,
+                           const char *store_path, oc_secret *secret, int remember,
+                           const char *published_fingerprint) {
+    const char *colon = strchr(cred, ':');
+    if (!colon) return NULL;
+    char user[128], tok[OC_TEST_TOKEN_CAP], ver[OC_TEST_VERIFIER_CAP], why[256];
+    snprintf(user, sizeof user, "%.*s", (int)(colon - cred), cred);
+    if (oc_test_signin("127.0.0.1", port, NULL, user, colon + 1, tok, sizeof tok, ver, sizeof ver, why, sizeof why) != 0) {
+        printf("    %s: the sign-in page refused: %s\n", user, why);
+        return NULL;
+    }
+    oc_signin_result res = { "local", ver, tok, NULL };
+    return oc_client_start_signin_result(workspace_key, host, port, &res, store_path, secret, remember,
+                                         published_fingerprint);
+}
+
+/* Tick `cl` until `cond` holds of its model `m`, up to `ms` on the monotonic
+ * clock (WAIT_UNTIL_DO, tests/check.h); whether it held. WAIT_FOR is the
+ * ordinary five seconds. */
+#define WAIT_FOR_MS(cl, cond, ms)                                              \
+    WAIT_UNTIL_DO(oc_client_tick((cl)),                                        \
+                  ({ const oc_model *m = oc_client_model((cl)); (void)m; (cond); }), (ms))
+#define WAIT_FOR(cl, cond) WAIT_FOR_MS(cl, cond, 5000)
+
+static int channel_has_body(const oc_model *m, uint64_t cid, const char *body) {
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++)
+            if (m->channels[i].msgs[j].body && strcmp(m->channels[i].msgs[j].body, body) == 0)
+                return 1;
+    }
+    return 0;
+}
+
+/* The id of the message in `cid` whose body is `body`; 0 if there is none. */
+static uint64_t body_id(const oc_model *m, uint64_t cid, const char *body) {
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++)
+            if (m->channels[i].msgs[j].body && strcmp(m->channels[i].msgs[j].body, body) == 0)
+                return m->channels[i].msgs[j].message_id;
+    }
+    return 0;
+}
+
+static int channel_unread(const oc_model *m, uint64_t cid) {
+    for (size_t i = 0; i < m->n_channels; i++)
+        if (m->channels[i].channel_id == cid) return m->channels[i].unread;
+    return -1;
+}
+
+/* The message id of the message with `body` in channel `cid`, or 0. */
+static uint64_t message_id_of(const oc_model *m, uint64_t cid, const char *body) {
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++)
+            if (m->channels[i].msgs[j].body && strcmp(m->channels[i].msgs[j].body, body) == 0)
+                return m->channels[i].msgs[j].message_id;
+    }
+    return 0;
+}
+
+/* The aggregate count for `emoji` on message `mid` (-1 if the message/emoji is
+ * absent), and separately whether we reacted (`mine`). */
+static int reaction_count(const oc_model *m, uint64_t cid, uint64_t mid, const char *emoji, int *mine) {
+    if (mine) *mine = 0;
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++) {
+            const oc_msg *msg = &m->channels[i].msgs[j];
+            if (msg->message_id != mid) continue;
+            for (uint8_t k = 0; k < msg->n_reactions; k++)
+                if (strcmp(msg->reactions[k].emoji, emoji) == 0) {
+                    if (mine) *mine = msg->reactions[k].mine;
+                    return (int)msg->reactions[k].count;
+                }
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* A roster member's role / disabled flag (-1 if the user isn't in the roster). */
+static int member_role(const oc_model *m, uint64_t uid) {
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == uid) return (int)m->users[i].role;
+    return -1;
+}
+static int member_disabled(const oc_model *m, uint64_t uid) {
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == uid) return (int)m->users[i].disabled;
+    return -1;
+}
+
+/* The id of a DM channel whose peer is `peer`, or 0. */
+static uint64_t dm_with_peer(const oc_model *m, uint64_t peer) {
+    for (size_t i = 0; i < m->n_channels; i++)
+        if (m->channels[i].kind == OC_CHANNEL_KIND_DM && m->channels[i].peer_id == peer)
+            return m->channels[i].channel_id;
+    return 0;
+}
+
+/* The id of a channel with the given name, or 0. */
+static uint64_t channel_named(const oc_model *m, const char *name) {
+    for (size_t i = 0; i < m->n_channels; i++)
+        if (m->channels[i].name && strcmp(m->channels[i].name, name) == 0)
+            return m->channels[i].channel_id;
+    return 0;
+}
+
+/* Find a message by id; return NULL if absent. */
+static const oc_msg *find_msg(const oc_model *m, uint64_t cid, uint64_t mid) {
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++)
+            if (m->channels[i].msgs[j].message_id == mid) return &m->channels[i].msgs[j];
+    }
+    return NULL;
+}
+
+/* Does channel `cid` hold a message whose body and author display name match? */
+static int channel_has_named(const oc_model *m, uint64_t cid, const char *body, const char *name) {
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++) {
+            const oc_msg *msg = &m->channels[i].msgs[j];
+            if (msg->body && strcmp(msg->body, body) == 0 && strcmp(msg->author_name, name) == 0)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+/* The id of the first attachment on any message in channel `cid` (0 if none),
+ * filling `fn_out`/`size_out` with its filename + byte size. */
+/* The newest video message in channel `cid` (REQ-165), or NULL. */
+static const oc_msg *channel_video(const oc_model *m, uint64_t cid) {
+    const oc_msg *found = NULL;
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++) {
+            const oc_msg *msg = &m->channels[i].msgs[j];
+            if (msg->n_attach && msg->attach[0].media_kind == OC_MEDIA_VIDEO_MESSAGE) found = msg;
+        }
+    }
+    return found;
+}
+
+static int channel_video_count(const oc_model *m, uint64_t cid) {
+    int n = 0;
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++)
+            if (m->channels[i].msgs[j].n_attach &&
+                m->channels[i].msgs[j].attach[0].media_kind == OC_MEDIA_VIDEO_MESSAGE) n++;
+    }
+    return n;
+}
+
+/* Take fetched bytes for `aid` if they have arrived; others are dropped. */
+static uint8_t *take_fetched(oc_client *cl, uint64_t aid, size_t *len) {
+    uint64_t id; size_t n; uint8_t *d;
+    while ((d = oc_model_take_attachment((oc_model *)oc_client_model(cl), &id, &n)) != NULL) {
+        if (id == aid) { *len = n; return d; }
+        free(d);
+    }
+    return NULL;
+}
+
+static const oc_msg *channel_msg_by_body(const oc_model *m, uint64_t cid, const char *body) {
+    const oc_channel *ch = oc_model_channel((oc_model *)m, cid);
+    for (size_t j = 0; ch && j < ch->n_msgs; j++)
+        if (ch->msgs[j].body && strcmp(ch->msgs[j].body, body) == 0) return &ch->msgs[j];
+    return NULL;
+}
+
+static uint64_t channel_attach(const oc_model *m, uint64_t cid, char *fn_out,
+                               size_t fncap, uint64_t *size_out) {
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++) {
+            const oc_msg *msg = &m->channels[i].msgs[j];
+            if (msg->n_attach > 0) {
+                snprintf(fn_out, fncap, "%s", msg->attach[0].filename);
+                if (size_out) *size_out = msg->attach[0].size;
+                return msg->attach[0].id;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Whole-file compare: does `path` hold exactly `data[0..len)`? */
+static int file_matches(const char *path, const unsigned char *data, size_t len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char buf[8192];
+    size_t off = 0; int ok = 1;
+    for (;;) {
+        size_t got = fread(buf, 1, sizeof buf, f);
+        if (got == 0) break;
+        if (off + got > len || memcmp(buf, data + off, got) != 0) { ok = 0; break; }
+        off += got;
+    }
+    fclose(f);
+    return ok && off == len;
+}
+
+/* Workspace resolution (REQ-010/011). The pure pieces are tested here without
+ * live DNS: normalization and the SRV-answer parser (fed a canned wire response).
+ * A minimal DNS reply for `_openchime._tcp.acme.com` -> `srv.acme.com:8443`
+ * (priority 10, weight 5), the answer name a compression pointer to the query. */
+static const unsigned char SRV_ANSWER[] = {
+    0x12,0x34, 0x81,0x80, 0x00,0x01, 0x00,0x01, 0x00,0x00, 0x00,0x00,   /* header */
+    0x0a,'_','o','p','e','n','c','h','i','m','e', 0x04,'_','t','c','p',   /* qname */
+    0x04,'a','c','m','e', 0x03,'c','o','m', 0x00,
+    0x00,0x21, 0x00,0x01,                                                /* qtype SRV, qclass IN */
+    0xc0,0x0c,                                                           /* answer name -> qname */
+    0x00,0x21, 0x00,0x01, 0x00,0x00,0x01,0x2c, 0x00,0x14,                /* SRV, IN, ttl 300, rdlen 20 */
+    0x00,0x0a, 0x00,0x05, 0x20,0xfb,                                     /* prio 10, weight 5, port 8443 */
+    0x03,'s','r','v', 0x04,'a','c','m','e', 0x03,'c','o','m', 0x00       /* target srv.acme.com */
+};
+
+/* The sidebar helper (6): grouping, filter, sort, collapse — shared by
+ * every frontend so the TUI and the GUI cannot disagree about what belongs
+ * where. Built against a hand-made model, no daemon needed. */
+/* What the daemon offers, folded into the model (REQ-295). Read-aloud is shown
+ * only where CAPABILITIES names "tts", and the answer is replaced on every
+ * connection rather than added to -- a client that reconnects to a daemon whose
+ * voice data has gone must stop offering the feature, not keep the old yes. */
+static int caps_fold(oc_model *m, const char *names) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CAPABILITIES;
+    e.body = names ? strdup(names) : NULL;
+    oc_model_apply(m, &e);
+    free(e.body);
+    return oc_model_tts_available(m);
+}
+
+static void test_capabilities(void) {
+    oc_model m; oc_model_init(&m);
+    CHECK(oc_model_tts_available(&m) == 0);                 /* nothing said yet: nothing shown */
+    CHECK(caps_fold(&m, "tts") == 1);
+    CHECK(caps_fold(&m, "stt") == 0);                       /* replaced, not accumulated */
+    CHECK(oc_model_has_capability(&m, OC_CAP_STT) == 1);
+    CHECK(caps_fold(&m, "stt,tts") == 1);                   /* order is not meaning */
+    CHECK(caps_fold(&m, "ttsx,xtts,tt") == 0);              /* whole names only */
+    CHECK(caps_fold(&m, "") == 0);                          /* the daemon offers nothing */
+    CHECK(caps_fold(&m, "tts") == 1);
+    CHECK(caps_fold(&m, NULL) == 0);
+    CHECK(oc_model_has_capability(&m, "") == 0);
+    oc_model_free(&m);
+}
+
+/* The daemon's build (SERVER_BUILD) for About: kept as said, and cleared by the
+ * WORKSPACE_INFO it follows, so a daemon too old to send it shows none rather
+ * than the build of the daemon before it. */
+static void ev_body(oc_model *m, int type, const char *body) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = type;
+    e.body = body ? strdup(body) : NULL;
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+static void test_server_build(void) {
+    oc_model m; oc_model_init(&m);
+    CHECK(strcmp(oc_model_server_build(&m), "") == 0);      /* nothing said yet */
+    ev_body(&m, OC_EV_WORKSPACE_INFO, "Acme");
+    ev_body(&m, OC_EV_SERVER_BUILD, "74359c0");
+    CHECK(strcmp(oc_model_server_build(&m), "74359c0") == 0);
+    ev_body(&m, OC_EV_WORKSPACE_INFO, "Acme");              /* the next connection */
+    CHECK(strcmp(oc_model_server_build(&m), "") == 0);
+    ev_body(&m, OC_EV_SERVER_BUILD, NULL);
+    CHECK(strcmp(oc_model_server_build(&m), "") == 0);
+    oc_model_free(&m);
+}
+
+/* Invitations in the model (REQ-033): which kind a workspace can redeem, from
+ * its sign-in sources, and the text an INVITE_CREATED becomes -- by address, or
+ * with the token -- with the workspace, how to sign in and the expiry. */
+static void invite_created(oc_model *m, const char *token, uint8_t role, uint64_t expires_ms) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_INVITE;
+    e.op = role;
+    e.server_time = expires_ms;
+    e.uses = 1;
+    e.body = strdup(token);
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+/* A reset to send its person: the workspace, the code for the app's sign-in,
+ * and the page's own link only where one is given (AUTH.md §2). */
+static void test_reset_text(void) {
+    oc_model m; oc_model_init(&m);
+    char text[1024];
+    CHECK(oc_model_reset_text(&m, "acme.example", NULL, text, sizeof text) == 0 && text[0] == '\0');
+    char tok[65];
+    memset(tok, 'a', 64); tok[64] = '\0';
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CREDENTIAL_RESET;
+    e.user_id = 7;
+    e.body = strdup(tok);
+    oc_model_apply(&m, &e);
+    free(e.body);
+    snprintf(m.workspace_name, sizeof m.workspace_name, "Acme");
+    size_t n = oc_model_reset_text(&m, "acme.example", NULL, text, sizeof text);
+    /* The facts the person needs, whatever the wording: the workspace by name
+     * and address, and the code; no link where none was given. */
+    CHECK(n > 0 && n == strlen(text));
+    CHECK(strstr(text, "Acme") && strstr(text, "acme.example") && strstr(text, tok));
+    CHECK(!strstr(text, "http"));
+    /* With the page's link, the link too, whole -- and still the code. */
+    const char *rlink = "https://acme.example/account/reset?t=aa";
+    CHECK(oc_model_reset_text(&m, "acme.example", rlink, text, sizeof text) > 0);
+    CHECK(strstr(text, rlink) && strstr(text, tok));
+    oc_model_free(&m);
+}
+
+static void test_invitation_text(void) {
+    oc_model m; oc_model_init(&m);
+    char text[1024];
+    /* Nothing said yet: both kinds are offered, and there is nothing to word. */
+    CHECK(oc_model_offers_local(&m) && oc_model_offers_browser(&m));
+    CHECK(oc_model_invitation_text(&m, "acme.example", NULL, text, sizeof text) == 0 && text[0] == '\0');
+
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_SIGNIN_SOURCES;
+    e.count = 1u << OC_SOURCE_RELAY;                  /* hosted: the relay alone */
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_offers_browser(&m) && !oc_model_offers_local(&m));
+    e.count = (1u << OC_SOURCE_LOCAL) | (1u << OC_SOURCE_RELAY);
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_offers_browser(&m) && oc_model_offers_local(&m));
+    e.count = 1u << OC_SOURCE_LOCAL;
+    oc_model_apply(&m, &e);
+    CHECK(!oc_model_offers_browser(&m) && oc_model_offers_local(&m));
+
+    snprintf(m.workspace_name, sizeof m.workspace_name, "Acme");
+    /* By address: the token that comes back is zeros and is never shown. */
+    oc_model_invite_asked(&m, "lee@partner.example");
+    char zeros[2 * OC_INVITE_TOKEN_LEN + 1];
+    memset(zeros, '0', 2 * OC_INVITE_TOKEN_LEN); zeros[2 * OC_INVITE_TOKEN_LEN] = '\0';
+    invite_created(&m, zeros, OC_ROLE_MEMBER, 1760000000000ull);   /* 2025-10-09 08:53 UTC */
+    CHECK(strcmp(m.invite_email, "lee@partner.example") == 0 && m.invite_asked_email[0] == '\0');
+    size_t n = oc_model_invitation_text(&m, "acme.example", NULL, text, sizeof text);
+    /* By address: the workspace by name and address, the address to sign in
+     * as, the expiry -- and never the token, which is zeros here. */
+    CHECK(n > 0 && n == strlen(text));
+    CHECK(strstr(text, "Acme") && strstr(text, "acme.example"));
+    CHECK(strstr(text, "lee@partner.example"));
+    CHECK(strstr(text, "2025-10-09") && strstr(text, "08:53"));
+    CHECK(!strstr(text, zeros));
+    CHECK(oc_model_signin_provider(&m)[0] == '\0');
+    /* With no provider known the text names none. */
+    CHECK(!strstr(text, "Google") && !strstr(text, "Microsoft"));
+
+    /* A source id that names a provider is said as that provider; any other --
+     * the relay's own, an operator's connection -- keeps the wording generic. */
+    CHECK(strcmp(oc_signin_provider_name("google", 6), "Google") == 0);
+    CHECK(strcmp(oc_signin_provider_name("Microsoft", 9), "Microsoft") == 0);
+    CHECK(oc_signin_provider_name("relay", 5) == NULL);
+    CHECK(oc_signin_provider_name("googlex", 7) == NULL);
+    CHECK(oc_signin_provider_name("google\n", 6) != NULL);   /* the length is what counts */
+    CHECK(oc_signin_provider_name("goog", 4) == NULL && oc_signin_provider_name(NULL, 0) == NULL);
+    e.count = 1u << OC_SOURCE_OIDC;
+    e.body = strdup("google\n");
+    oc_model_apply(&m, &e);
+    free(e.body); e.body = NULL;
+    CHECK(strcmp(oc_model_signin_provider(&m), "Google") == 0);
+    CHECK(oc_model_invitation_text(&m, "acme.example", NULL, text, sizeof text) > 0);
+    CHECK(strstr(text, "Google") && !strstr(text, "Microsoft"));
+    /* Two providers, each once, both named, apart. */
+    e.body = strdup("google\nmicrosoft\nGoogle\n");
+    oc_model_apply(&m, &e);
+    free(e.body); e.body = NULL;
+    {
+        const char *pv = oc_model_signin_provider(&m);
+        const char *g = strstr(pv, "Google"), *ms = strstr(pv, "Microsoft");
+        CHECK(g && ms && g < ms && !strstr(g + 1, "Google"));
+    }
+    /* One source that does not say is enough to leave the provider unsaid. */
+    e.body = strdup("google\nrelay\n");
+    oc_model_apply(&m, &e);
+    free(e.body); e.body = NULL;
+    CHECK(oc_model_signin_provider(&m)[0] == '\0');
+    CHECK(oc_model_invitation_text(&m, "acme.example", NULL, text, sizeof text) > 0 &&
+          !strstr(text, "Google") && strstr(text, "lee@partner.example"));
+    e.body = strdup("google\n");
+    oc_model_apply(&m, &e);
+    free(e.body); e.body = NULL;
+    e.body = NULL;                                     /* a challenge with no browser source */
+    e.count = 1u << OC_SOURCE_LOCAL;
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_signin_provider(&m)[0] == '\0');
+
+    /* Asking again forgets the last: a frontend waiting for the answer cannot
+     * take the old invitation for it. */
+    oc_model_invite_asked(&m, NULL);
+    CHECK(m.invite_token[0] == '\0' && oc_model_invitation_text(&m, "acme.example", NULL, text, sizeof text) == 0);
+    /* A token: the one thing that must be in the text is the token itself,
+     * with the workspace's address and the expiry. */
+    invite_created(&m, "0a1b2c3d", OC_ROLE_ADMIN, 1760000000000ull);
+    CHECK(m.invite_email[0] == '\0');
+    char admin_text[1024];
+    CHECK(oc_model_invitation_text(&m, "acme.example", NULL, admin_text, sizeof admin_text) > 0);
+    CHECK(strstr(admin_text, "0a1b2c3d") && strstr(admin_text, "acme.example") && strstr(admin_text, "2025-10-09"));
+    /* The role is said: the same invitation as a member's reads otherwise. */
+    m.invite_role = OC_ROLE_MEMBER;
+    CHECK(oc_model_invitation_text(&m, "acme.example", NULL, text, sizeof text) > 0 &&
+          strstr(text, "0a1b2c3d") && strcmp(text, admin_text) != 0);
+    m.invite_role = OC_ROLE_ADMIN;
+    /* A link (REQ-026), where the frontend has one: offered first, the token
+     * after for the app. */
+    const char *link = "https://acme.example/app/?invite=0a1b2c3d";
+    CHECK(!strstr(admin_text, "https://"));
+    CHECK(oc_model_invitation_text(&m, "acme.example", link, text, sizeof text) > 0);
+    {
+        const char *at_link = strstr(text, link), *at_tok = at_link ? strstr(at_link + strlen(link), "0a1b2c3d") : NULL;
+        CHECK(at_link && at_tok);                 /* the link, then the token on its own */
+    }
+    /* How many may use it: once, up to seven (the number said: no other part
+     * of this text has a 7), or anyone until it expires -- three different texts. */
+    char once[1024], five[1024], any[1024];
+    m.invite_uses = 1;
+    CHECK(oc_model_invitation_text(&m, "acme.example", NULL, once, sizeof once) > 0);
+    m.invite_uses = 7;
+    CHECK(oc_model_invitation_text(&m, "acme.example", NULL, five, sizeof five) > 0 && strstr(five, "7"));
+    CHECK(!strstr(once, "7"));
+    m.invite_uses = 0;
+    CHECK(oc_model_invitation_text(&m, "acme.example", NULL, any, sizeof any) > 0);
+    CHECK(strcmp(once, five) != 0 && strcmp(once, any) != 0 && strcmp(five, any) != 0);
+    m.invite_uses = 1;
+    /* Cut to fit, never overrun. */
+    char small[24];
+    CHECK(oc_model_invitation_text(&m, "acme.example", NULL, small, sizeof small) == sizeof small - 1);
+    oc_model_free(&m);
+}
+
+/* A summary in the model (REQ-310): the body read into an overview and items,
+ * each with the messages it came from; only the answer to the open request
+ * lands; a refusal keeps its sentence; and it is offered only with the
+ * "summarize" capability. */
+static void summary_answer(oc_model *m, uint32_t req, uint8_t status, const char *body) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_SUMMARY;
+    e.req_id = req;
+    e.status = status;
+    e.channel_id = 10;
+    e.span_start = 1000;
+    e.span_end = 2000;
+    e.body = body ? strdup(body) : NULL;
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+/* The fixture's own values, so what is parsed out is compared with what was
+ * put in -- never a sentence typed twice. */
+#define SV_OVERVIEW "Bob Stone took ticket 6701."
+#define SV_TOPIC    "Ann asked Bob Stone about it."
+#define SV_DETAIL   "Bob took it"
+#define SV_ACTION   "Bob Stone to close 6701"
+#define SV_BOB      "Bob Stone"
+#define SV_SAID     "On it."
+#define SV_FAILED   "You cannot read this conversation."
+#define SV_CAFE     "Caf\xc3\xa9 \xf0\x9f\x98\x80"   /* the fixture's \\u escapes, decoded */
+
+static void test_summary_model(void) {
+    static const char BODY[] =
+        "{\"summary\":{\"overview\":{\"text\":\"" SV_OVERVIEW "\",\"refs\":[101]},\"topics\":["
+        "{\"title\":\"Ticket \\\"6701\\\"\",\"text\":\"" SV_TOPIC "\",\"refs\":[100,101],"
+        "\"count\":2,\"people\":[\"Ann\",\"" SV_BOB "\"],"
+        "\"details\":[{\"text\":\"Ann asked Bob Stone to look\",\"refs\":[100]},{\"text\":\"" SV_DETAIL "\",\"refs\":[101]}]},"
+        "{\"title\":\"\",\"text\":\"Caf\\u00e9 \\ud83d\\ude00\",\"refs\":[102],\"count\":1,\"people\":[],\"details\":[]}],"
+        "\"attention\":[{\"kind\":\"question\",\"text\":\"Is 6701 fixed?\",\"refs\":[101]},"
+        "{\"kind\":\"action\",\"text\":\"" SV_ACTION "\",\"refs\":[101]}],"
+        "\"more\":[\"Lunch\",\"Parking\"]},"
+        "\"posters\":[{\"id\":0,\"name\":\"PartsFisher\"},{\"id\":10,\"name\":\"Ann\"},{\"id\":11,\"name\":\"Bob Stone\"}],"
+        "\"count\":525,"
+        "\"sources\":{\"100\":{\"author\":\"Ann\",\"author_id\":10,\"at\":1000,\"parent\":0,\"text\":\"Bob, look at 6701?\"},"
+        "\"101\":{\"author\":\"" SV_BOB "\",\"author_id\":11,\"at\":2000,\"parent\":100,\"text\":\"" SV_SAID "\"}}}";
+    oc_summary_view v;
+    CHECK(oc_summary_view_parse(BODY, strlen(BODY), &v) == 0);
+    CHECK(!strcmp(v.overview, SV_OVERVIEW) && v.n_refs == 1 && v.refs[0] == 101);
+    CHECK(v.n_topics == 2 && v.count == 525);
+    CHECK(v.n_attention == 2 && v.attention[0].question && !v.attention[1].question &&
+          !strcmp(v.attention[1].text, SV_ACTION) && v.attention[1].refs[0] == 101);
+    CHECK(v.n_more == 2 && !strcmp(v.more[1], "Parking"));
+    if (v.n_topics == 2) {
+        CHECK(!strcmp(v.topics[0].title, "Ticket \"6701\"") && !strcmp(v.topics[0].text, SV_TOPIC));   /* contract: the fixture's own data, parsed back */
+        CHECK(v.topics[0].n_refs == 2 && v.topics[0].n_details == 2 && v.topics[0].count == 2 &&
+              v.topics[0].n_people == 2 && !strcmp(v.topics[0].people[1], SV_BOB));
+        if (v.topics[0].n_details == 2)
+            CHECK(!strcmp(v.topics[0].details[1].text, SV_DETAIL) && v.topics[0].details[1].n_refs == 1 &&
+                  v.topics[0].details[1].refs[0] == 101);
+        CHECK(!strcmp(v.topics[1].title, "") && !strcmp(v.topics[1].text, SV_CAFE) &&
+              v.topics[1].n_details == 0);
+    }
+    CHECK(v.n_posters == 3 && v.posters[0].id == 0 && !strcmp(v.posters[0].name, "PartsFisher") && v.posters[2].id == 11);
+    const oc_summary_source *src = oc_summary_source_of(&v, 101);
+    CHECK(src && !strcmp(src->author, SV_BOB) && src->author_id == 11 && src->at == 2000 && src->parent == 100 &&
+          !strcmp(src->text, SV_SAID));
+    CHECK(oc_summary_source_of(&v, 102) == NULL);
+    char ptext[96];
+    oc_summary_posters_text(&v, ptext, sizeof ptext);
+    {   /* every poster, in the summary's order */
+        const char *p1 = strstr(ptext, "PartsFisher"), *p2 = p1 ? strstr(p1, "Ann") : NULL,
+                   *p3 = p2 ? strstr(p2, SV_BOB) : NULL;
+        CHECK(p1 && p2 && p3);
+    }
+    /* Names in the text are found whole, the longer first, not inside a word. */
+    oc_summary_mention mn[4];
+    size_t nmn = oc_summary_mentions(&v, "Ann asked Bob Stone; Annie and Bob did not.", mn, 4);
+    CHECK(nmn == 2 && mn[0].start == 0 && mn[0].len == 3 && mn[0].poster == 1 && mn[1].start == 10 &&
+          mn[1].len == 9 && mn[1].poster == 2);
+    oc_summary_view_free(&v);
+    CHECK(oc_summary_view_parse("not json", 8, &v) == -1 && v.n_topics == 0);
+    CHECK(oc_summary_view_parse("{\"posters\":[]}", 14, &v) == -1);
+    /* A body from before topics is not a summary this client reads. */
+    CHECK(oc_summary_view_parse("{\"summary\":{\"overview\":\"x\",\"decisions\":[]}}", 44, &v) == -1);
+    CHECK(oc_summary_view_parse("{\"summary\":{\"refs\":[],\"topics\":[]}}", 37, &v) == -1);   /* topics, no overview */
+
+    /* A typed range is two local dates, the second day whole. */
+    uint64_t rs = 0, re = 0, d0 = 0;
+    CHECK(oc_summary_range_parse("2026-09-04 2026-09-14", &rs, &re) == 0 && re > rs);
+    CHECK(re - rs >= 11ull * 86400000 - 3600000 && re - rs <= 11ull * 86400000 + 3600000);
+    CHECK(oc_summary_date_parse("2026-09-04", &d0) == 0 && d0 == rs);
+    CHECK(oc_summary_date_parse("2026-09-04x", &d0) == -1);
+    /* A range's label holds its first day's and its last day's own labels; one
+     * day's is that day's alone. */
+    char lab[64], first[64], last[64];
+    uint64_t d14 = 0;
+    CHECK(oc_summary_date_parse("2026-09-14", &d14) == 0);
+    oc_summary_dates(rs, rs + 86400000ull, first, sizeof first);
+    oc_summary_dates(d14, d14 + 86400000ull, last, sizeof last);
+    oc_summary_dates(rs, re, lab, sizeof lab);
+    CHECK(first[0] && last[0] && strcmp(first, last) != 0);
+    CHECK(strstr(lab, first) && strstr(lab, last) && strstr(lab, first) < strstr(lab, last));
+    CHECK(strstr(first, "4") && strstr(last, "14"));
+    CHECK(oc_summary_range_parse("2026-09-04 to 2026-09-04", &rs, &re) == 0);
+    oc_summary_dates(rs, re, lab, sizeof lab);
+    CHECK(!strcmp(lab, first));
+    CHECK(oc_summary_range_parse("2026-09-14 2026-09-04", &rs, &re) == -1);   /* backwards */
+    CHECK(oc_summary_range_parse("2026-02-30 2026-03-01", &rs, &re) == -1);   /* no such day */
+    CHECK(oc_summary_range_parse("last week", &rs, &re) == -1);
+    /* Every span has a name of its own. */
+    {
+        const uint8_t sc[] = { OC_SUM_UNREAD, OC_SUM_WEEK, OC_SUM_RANGE, OC_SUM_DAILY, OC_SUM_TODAY };
+        for (size_t i = 0; i < sizeof sc; i++) {
+            CHECK(oc_summary_scope_name(sc[i]) && oc_summary_scope_name(sc[i])[0]);
+            for (size_t j = 0; j < i; j++) CHECK(strcmp(oc_summary_scope_name(sc[i]), oc_summary_scope_name(sc[j])) != 0);
+        }
+    }
+    /* The waiting title names the conversation, and a range by its dates. */
+    char lab2[64];
+    oc_summary_wait_title(OC_SUM_UNREAD, 0, 0, "#general", lab, sizeof lab);
+    oc_summary_wait_title(OC_SUM_TODAY, 0, 0, "#general", lab2, sizeof lab2);
+    CHECK(strstr(lab, "#general") && strstr(lab2, "#general") && strcmp(lab, lab2) != 0);
+    oc_summary_wait_title(OC_SUM_RANGE, rs, re, "@Ann", lab, sizeof lab);
+    CHECK(strstr(lab, "@Ann") && strstr(lab, first));
+    /* The range picker: the first click the first day, the second the last;
+     * one before the first starts over, a day after today is not taken. */
+    {
+        oc_sumcal cal;
+        uint64_t today = 0, a = 0, b = 0;
+        CHECK(oc_summary_date_parse("2026-10-05", &today) == 0);
+        oc_sumcal_init(&cal, today + 15ull * 3600000);
+        CHECK(cal.today == today && cal.year == 2026 && cal.month == 10);
+        uint64_t s28 = 0, o2 = 0, o7 = 0;
+        oc_summary_date_parse("2026-09-28", &s28);
+        oc_summary_date_parse("2026-10-02", &o2);
+        oc_summary_date_parse("2026-10-07", &o7);
+        CHECK(oc_sumcal_range(&cal, &a, &b) == -1);
+        oc_sumcal_pick(&cal, o2);
+        CHECK(cal.start == o2 && !cal.end && oc_sumcal_range(&cal, &a, &b) == -1);
+        oc_sumcal_pick(&cal, s28);                 /* before the first: starts over */
+        CHECK(cal.start == s28 && !cal.end);
+        oc_sumcal_pick(&cal, o7);                  /* not yet happened: not taken */
+        CHECK(!cal.end);
+        oc_sumcal_pick(&cal, o2);
+        CHECK(cal.end == o2 && oc_sumcal_range(&cal, &a, &b) == 0 && a == s28);
+        oc_summary_dates(a, b, lab, sizeof lab);
+        oc_summary_dates(s28, s28 + 86400000ull, first, sizeof first);
+        oc_summary_dates(o2, o2 + 86400000ull, last, sizeof last);
+        CHECK(strstr(lab, first) && strstr(lab, last) && strstr(lab, first) < strstr(lab, last));
+        /* October 2026 starts on a Thursday: its 1st is the fifth cell; its
+         * 31st the 35th. Shown one month earlier, it is the right one. */
+        int yy, mm;
+        uint64_t cells[42];
+        oc_sumcal_month(&cal, 0, &yy, &mm, cells);
+        CHECK(yy == 2026 && mm == 10 && cells[3] == 0 && cells[35] == 0);
+        oc_summary_day_text(cells[4], lab, sizeof lab);
+        CHECK(!strcmp(lab, "2026-10-01"));
+        oc_summary_day_text(cells[34], lab, sizeof lab);
+        CHECK(!strcmp(lab, "2026-10-31"));
+        oc_sumcal_shift(&cal, -1);
+        oc_sumcal_month(&cal, 1, &yy, &mm, cells);
+        CHECK(yy == 2026 && mm == 10 && cells[4] != 0);
+        oc_sumcal_month(&cal, 0, &yy, &mm, cells);
+        CHECK(yy == 2026 && mm == 9);
+    }
+    /* When a source was posted, by the calendar. */
+    /* The time of day is said on the clock asked for; today and yesterday are
+     * said as such, not by date, and an older day by its date. */
+    uint64_t noon = d0 + 12ull * 3600000;
+    char today[64], yday[64], older[64], d1[64];
+    oc_summary_when(noon + 22 * 60000 - 3600000, noon, 0, today, sizeof today);
+    CHECK(strstr(today, "11:22"));
+    oc_summary_when(noon - 86400000ull + 9 * 3600000, noon, 1, yday, sizeof yday);
+    CHECK(strstr(yday, "21:00"));
+    oc_summary_when(noon - 86400000ull + 9 * 3600000, noon, 0, lab, sizeof lab);
+    CHECK(!strstr(lab, "21:00") && strstr(lab, "9:00"));          /* the 12-hour clock */
+    oc_summary_when(noon - 3 * 86400000ull, noon, 0, older, sizeof older);
+    oc_summary_dates(d0 - 3 * 86400000ull, d0 - 2 * 86400000ull, d1, sizeof d1);
+    CHECK(strstr(older, "12:00") && strstr(older, d1));
+    oc_summary_dates(d0, d0 + 86400000ull, lab, sizeof lab);
+    CHECK(!strstr(today, lab));                                    /* today is not said by its date */
+    oc_summary_dates(d0 - 86400000ull, d0, lab, sizeof lab);
+    CHECK(!strstr(yday, lab));
+
+    oc_model m; oc_model_init(&m);
+    /* Nothing open: an answer is dropped. */
+    summary_answer(&m, 1, OC_SUM_OK, BODY);
+    CHECK(!m.summary_open && m.summary.n_topics == 0);
+    oc_model_summary_begin(&m, 10, OC_SUM_WEEK, 0, 0, 2);
+    CHECK(m.summary_open && m.summary_loading && m.summary_req == 2 && m.summary_position == -1);
+    /* Its place in the daemon's queue follows SUMMARY_QUEUED; another request's
+     * place is not its own. */
+    {
+        oc_ev q;
+        memset(&q, 0, sizeof q);
+        q.type = OC_EV_SUMMARY_QUEUED;
+        q.req_id = 2;
+        q.count = 2;
+        oc_model_apply(&m, &q);
+        CHECK(m.summary_position == 2);
+        char wt[96], wt1[96];
+        oc_summary_wait_text(m.summary_position, wt, sizeof wt);
+        CHECK(strstr(wt, "2") != NULL);            /* the place is said */
+        q.req_id = 1;
+        q.count = 0;
+        oc_model_apply(&m, &q);
+        CHECK(m.summary_position == 2);
+        q.req_id = 2;
+        oc_model_apply(&m, &q);
+        CHECK(m.summary_position == 0);
+        oc_summary_wait_text(1, wt1, sizeof wt1);
+        CHECK(strstr(wt1, "1") && strcmp(wt1, wt) != 0);
+        char starting[96], making[96];
+        oc_summary_wait_text((int32_t)OC_SUM_POS_STARTING, starting, sizeof starting);
+        oc_summary_wait_text(0, making, sizeof making);
+        CHECK(starting[0] && strcmp(starting, wt1) != 0 && strcmp(starting, making) != 0);
+    }
+    /* An answer to an earlier request is not this one. */
+    summary_answer(&m, 1, OC_SUM_OK, BODY);
+    CHECK(m.summary_loading && m.summary.n_topics == 0);
+    summary_answer(&m, 2, OC_SUM_OK, BODY);
+    CHECK(!m.summary_loading && m.summary_status == OC_SUM_OK && m.summary.n_topics == 2 &&
+          m.summary_start == 1000 && m.summary_end == 2000);
+    /* A refusal keeps the daemon's sentence. */
+    oc_model_summary_begin(&m, 10, OC_SUM_UNREAD, 0, 0, 3);
+    CHECK(m.summary.n_topics == 0);
+    summary_answer(&m, 3, OC_SUM_FORBIDDEN, SV_FAILED);
+    CHECK(m.summary_status == OC_SUM_FORBIDDEN && m.summary_error && !strcmp(m.summary_error, SV_FAILED));
+    /* An OK body that is not a summary is a failure, said plainly. */
+    oc_model_summary_begin(&m, 10, OC_SUM_UNREAD, 0, 0, 4);
+    summary_answer(&m, 4, OC_SUM_OK, "garbage");
+    CHECK(m.summary_status == OC_SUM_FAILED && m.summary_error);
+    /* Notices (SUMMARY_READY): each kept once however often told, given to a
+     * toast once, and forgotten when opened or dismissed. */
+    {
+        oc_ev r;
+        memset(&r, 0, sizeof r);
+        r.type = OC_EV_SUMMARY_READY;
+        r.summary_id = 70; r.channel_id = 10; r.sum_scope = OC_SUM_TODAY; r.status = OC_SUM_OK;
+        r.span_start = 1000; r.span_end = 2000; r.made_at = 3000;
+        oc_model_apply(&m, &r);
+        oc_model_apply(&m, &r);
+        r.summary_id = 71; r.status = OC_SUM_FAILED;
+        oc_model_apply(&m, &r);
+        CHECK(m.n_sum_notices == 2);
+        oc_summary_notice n;
+        CHECK(oc_model_summary_notice_take(&m, &n) == 1 && n.id == 70 && n.channel_id == 10 &&
+              n.scope == OC_SUM_TODAY && n.status == OC_SUM_OK && n.made_at_ms == 3000);
+        CHECK(oc_model_summary_notice_take(&m, &n) == 1 && n.id == 71 && n.status == OC_SUM_FAILED);
+        CHECK(oc_model_summary_notice_take(&m, &n) == 0);
+        r.summary_id = 70; r.status = OC_SUM_OK;
+        oc_model_apply(&m, &r);                 /* told again at sign-in: no second toast */
+        CHECK(oc_model_summary_notice_take(&m, &n) == 0);
+        oc_model_summary_notice_drop(&m, 70);
+        CHECK(m.n_sum_notices == 1 && oc_model_summary_notice(&m, 70) == NULL && oc_model_summary_notice(&m, 71));
+        /* A notice names the conversation and the span, and a made one reads
+         * otherwise than one that was not. */
+        char t[160], tf[160];
+        oc_summary_notice_title(OC_SUM_OK, OC_SUM_TODAY, 0, 0, "#kudos", t, sizeof t);
+        CHECK(strstr(t, "#kudos") && strstr(t, oc_summary_scope_name(OC_SUM_TODAY)));
+        oc_summary_notice_title(OC_SUM_FAILED, OC_SUM_TODAY, 0, 0, "#kudos", tf, sizeof tf);
+        CHECK(strstr(tf, "#kudos") && strstr(tf, oc_summary_scope_name(OC_SUM_TODAY)) && strcmp(t, tf) != 0);
+        oc_summary_notice_title(OC_SUM_FAILED, OC_SUM_WEEK, 0, 0, "#kudos", t, sizeof t);
+        CHECK(strstr(t, "#kudos") && strstr(t, oc_summary_scope_name(OC_SUM_WEEK)));
+        oc_model_summary_notice_drop(&m, 71);
+    }
+    /* Each way of not being made has its headline. */
+    {
+        const char *u = oc_summary_fail_title(OC_SUM_UNAVAILABLE), *f = oc_summary_fail_title(OC_SUM_FORBIDDEN),
+                   *x = oc_summary_fail_title(OC_SUM_FAILED);
+        CHECK(u && f && x && u[0] && f[0] && x[0] && strcmp(u, f) != 0 && strcmp(u, x) != 0 && strcmp(f, x) != 0);
+    }
+    /* A connection lost while it waits: it is asked again, from the start of
+     * the queue; one already answered is not. */
+    oc_model_summary_begin(&m, 10, OC_SUM_TODAY, 0, 0, 5);
+    {
+        oc_ev q;
+        memset(&q, 0, sizeof q);
+        q.type = OC_EV_SUMMARY_QUEUED;
+        q.req_id = 5;
+        q.count = 3;
+        oc_model_apply(&m, &q);
+        memset(&q, 0, sizeof q);
+        q.type = OC_EV_DISCONNECTED;
+        oc_model_apply(&m, &q);
+        CHECK(m.summary_resend && m.summary_loading && m.summary_position == -1);
+        summary_answer(&m, 5, OC_SUM_OK, BODY);
+        oc_model_close_summary(&m);
+        CHECK(!m.summary_resend);
+        oc_model_summary_begin(&m, 10, OC_SUM_TODAY, 0, 0, 6);
+        summary_answer(&m, 6, OC_SUM_OK, BODY);
+        oc_model_apply(&m, &q);
+        CHECK(!m.summary_resend);
+    }
+    oc_model_close_summary(&m);
+    CHECK(!m.summary_open && !m.summary_error);
+    /* Offered only where the daemon says so. */
+    CHECK(oc_model_summarize_available(&m) == 0);
+    caps_fold(&m, "tts,summarize");
+    CHECK(oc_model_summarize_available(&m) == 1);
+    caps_fold(&m, "tts");
+    CHECK(oc_model_summarize_available(&m) == 0);
+    oc_model_free(&m);
+}
+
+/* The daemon's summarizer for the live test: a stub model and a quiet
+ * machine, so a summary is made at once. What it says is the test's own: the
+ * overview that comes back is this. */
+#define CSUM_OVERVIEW "The ship date was set."
+static int core_sum_calls;
+static void *csum_open(void *ctx, char *err, size_t cap) { (void)err; (void)cap; return ctx; }
+static void csum_close(void *h) { (void)h; }
+/* Held: the model is busy, as a real one is for minutes. */
+static volatile int core_sum_hold;
+static int csum_run(void *h, const char *system, const char *user, const char *grammar, int max_out,
+                    oc_sum_gate_fn gate, void *gctx, char **out, oc_sum_run_stats *st, char *err, size_t cap) {
+    (void)h; (void)system; (void)user; (void)max_out; (void)err; (void)cap;
+    __atomic_add_fetch(&core_sum_calls, 1, __ATOMIC_RELAXED);
+    while (__atomic_load_n(&core_sum_hold, __ATOMIC_ACQUIRE)) {
+        if (gate && gate(gctx)) return -1;
+        oc_test_let_time_pass(5);   /* a busy model: time goes by while it holds */
+    }
+    if (st) memset(st, 0, sizeof *st);
+    *out = strdup(grammar && strstr(grammar, "note ::=")   /* contract: the summarizer's grammar rule name */
+                  ? "- [1] decision | Shipping | " CSUM_OVERVIEW "\n"
+                  : "Overview: [1] " CSUM_OVERVIEW "\n## Shipping\n[1] " CSUM_OVERVIEW "\n- [1] Ship on Friday\n");
+    return 0;
+}
+static int csum_cpu(void *c, uint64_t *b, uint64_t *t) { (void)c; static uint64_t n; n += 100; *b = 0; *t = n; return 0; }
+static int csum_mem(void *c, uint64_t *m) { (void)c; *m = 1u << 20; return 0; }
+static int csum_net(void *c, uint64_t *n) { (void)c; *n = 0; return 0; }
+static uint64_t csum_now(void *c) { (void)c; static uint64_t t; t += SUM_LOAD_SAMPLE_MS; return t; }
+static oc_dbwriter *g_csum_dbw;
+static int csum_store(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, int n) {
+    (void)ctx;
+    return oc_dbwriter_sum_store(g_csum_dbw, a, nodes, n);
+}
+static int csum_take(void *ctx, int64_t row) {
+    (void)ctx;
+    return oc_dbwriter_sum_take(g_csum_dbw, row);
+}
+
+/* Pins folded into the model (REQ-230, ARCH-90): the inline flag on a message
+ * and the standalone pins overlay, which is fed by its own frames because a
+ * pinned message is usually outside loaded history. */
+static void test_pins(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 5; e.author_id = 2;
+    e.server_time = 1000; e.body = strdup(T_PIN); oc_model_apply(&m, &e);
+
+    oc_channel *c = oc_model_channel(&m, 10);
+    CHECK(c && c->n_msgs == 1 && c->msgs[0].pinned == 0);
+
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PIN; e.channel_id = 10; e.message_id = 5; e.user_id = 7;
+    e.op = 1; e.server_time = 2000; oc_model_apply(&m, &e);
+    CHECK(c->msgs[0].pinned == 1 && c->msgs[0].pinned_by == 7 && c->msgs[0].pinned_at == 2000);
+
+    /* An unpin clears the attribution too, so a frontend cannot render a stale
+     * "pinned by" on an unpinned message. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PIN; e.channel_id = 10; e.message_id = 5; e.user_id = 7; e.op = 0;
+    oc_model_apply(&m, &e);
+    CHECK(c->msgs[0].pinned == 0 && c->msgs[0].pinned_by == 0);
+
+    /* A pin for a message we have not loaded is dropped, not a crash: it is the
+     * normal case when another member pins far up the scroll. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PIN; e.channel_id = 10; e.message_id = 9999; e.op = 1;
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PIN; e.channel_id = 404; e.message_id = 5; e.op = 1;
+    oc_model_apply(&m, &e);
+
+    /* The overlay. Entries only land while it is open and for its channel — a
+     * late frame from a previous open must not pollute the current one. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PINNED_MSG; e.channel_id = 10; e.message_id = 5;
+    e.body = strdup("ignored"); oc_model_apply(&m, &e);
+    CHECK(m.n_pins == 0);
+
+    oc_model_pinlist_begin(&m, 10);
+    CHECK(m.pinlist_open && m.pinlist_loading && m.pinlist_channel == 10);
+
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PINNED_MSG; e.channel_id = 10; e.message_id = 5; e.author_id = 2;
+    e.server_time = 1000; e.user_id = 7; e.pinned_at = 2000;
+    e.body = strdup(T_PIN); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PINNED_MSG; e.channel_id = 99; e.message_id = 6;
+    e.body = strdup("other channel"); oc_model_apply(&m, &e);
+    CHECK(m.n_pins == 1);
+    CHECK(m.pins[0].message_id == 5 && m.pins[0].pinned_by == 7);
+    CHECK(m.pins[0].pinned_at == 2000);       /* a ms stamp, not truncated to 32 bits */
+    CHECK(m.pins[0].body && strcmp(m.pins[0].body, T_PIN) == 0);
+
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PINS_END; e.channel_id = 10; oc_model_apply(&m, &e);
+    CHECK(m.pinlist_open && !m.pinlist_loading);   /* open, done loading, one row */
+
+    /* Someone else unpinning drops the row from the open list, rather than
+     * leaving an entry that does nothing when clicked. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PIN; e.channel_id = 10; e.message_id = 5; e.op = 0;
+    oc_model_apply(&m, &e);
+    CHECK(m.n_pins == 0);
+
+    oc_model_close_pinlist(&m);
+    CHECK(!m.pinlist_open && m.n_pins == 0);
+
+    /* A thread reply lives outside the channel's message list, so a pin on one
+     * has to be applied there too — marking only the channel list left a pinned
+     * reply looking unpinned, with a menu that could not unpin it. */
+    m.thread_open = 1;
+    m.thread_channel = 10;
+    m.n_thread_msgs = 1;
+    m.cap_thread_msgs = 1;
+    m.thread_msgs = calloc(1, sizeof *m.thread_msgs);
+    CHECK(m.thread_msgs != NULL);
+    m.thread_msgs[0].message_id = 77;
+
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PIN; e.channel_id = 10; e.message_id = 77; e.user_id = 3;
+    e.op = 1; e.server_time = 4000; oc_model_apply(&m, &e);
+    CHECK(m.thread_msgs[0].pinned == 1 && m.thread_msgs[0].pinned_by == 3);
+
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PIN; e.channel_id = 10; e.message_id = 77; e.op = 0;
+    oc_model_apply(&m, &e);
+    CHECK(m.thread_msgs[0].pinned == 0);
+
+    oc_model_free(&m);
+}
+
+/* A GROUP DM is titled by everyone in it, the reader included (REQ-056). This
+ * went untested, and the title quietly disagreed with both the member pane and
+ * the participant count beside it: a three-person group read "bob, carol". */
+/* A GROUP event as the net thread makes one: the group, owned by the event. */
+static void apply_group(oc_model *m, uint64_t id, const char *handle, const uint64_t *mem, uint16_t n) {
+    oc_ev e; memset(&e, 0, sizeof e);
+    e.type = OC_EV_GROUP;
+    e.group = calloc(1, sizeof *e.group);
+    e.group->id = id;
+    snprintf(e.group->handle, sizeof e.group->handle, "%s", handle);
+    snprintf(e.group->name, sizeof e.group->name, "%s", handle);
+    for (uint16_t i = 0; i < n; i++) e.group->members[i] = mem[i];
+    e.group->n_members = n;
+    oc_model_apply(m, &e);
+    free(e.group);   /* NULL once the model took it */
+}
+
+/* User groups in the client (REQ-307-309): the model keeps them and each
+ * channel's; a member of a group a channel has is in it through that group;
+ * @group names everyone in it, for the toast; the composer offers groups; a
+ * deleted group leaves every channel; and a list forgets what it did not
+ * mention. */
+static void test_groups_model(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("alice"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob");   oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 10; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 0; e.body = strdup("vault"); e.server_time = 10;
+    oc_model_apply(&m, &e);
+
+    uint64_t crew[1] = { 1 }, ops[1] = { 2 };
+    apply_group(&m, 7, "crew", crew, 1);
+    apply_group(&m, 8, "ops", ops, 1);
+    CHECK(m.n_groups == 2 && oc_model_group_by_handle(&m, "CREW") == oc_model_group(&m, 7));
+
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL_GROUPS; e.channel_id = 10; e.n_groups = 1; e.groups[0] = 7;
+    oc_model_apply(&m, &e);
+    /* "Only through a group" is the daemon's to say, after a member list: until
+     * then the model does not know whether alice was also added directly. */
+    CHECK(oc_model_via_group(&m, 10, 1) == 0);
+    oc_model_chanmem_begin(&m, 10);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL_VIA_GROUP; e.channel_id = 10;
+    e.ids = malloc(sizeof *e.ids); e.ids[0] = 1; e.n_ids = 1;
+    oc_model_apply(&m, &e);
+    free(e.ids);   /* NULL once the model took it */
+    CHECK(oc_model_only_via_group(&m, 10, 1) && oc_model_via_group(&m, 10, 1) == 7);
+    CHECK(!oc_model_only_via_group(&m, 10, 2) && oc_model_via_group(&m, 10, 2) == 0);
+    CHECK(!oc_model_only_via_group(&m, 11, 1));   /* another channel: not known */
+
+    oc_channel *c = oc_model_channel(&m, 10);
+    CHECK(c != NULL);
+    if (!c) { oc_model_free(&m); return; }
+    c->notify_level = OC_NOTIFY_MENTIONS;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 1; e.author_id = 2;
+    e.server_time = 100; e.body = strdup("@ops only"); oc_model_apply(&m, &e);
+    int men = 0, kw = 0, vip = 0;
+    CHECK(oc_model_notify_scan(&m, c, 0, 0, 0, &men, &kw, &vip) == NULL);   /* not alice's group */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 2; e.author_id = 2;
+    e.server_time = 200; e.body = strdup("@Crew standup"); oc_model_apply(&m, &e);
+    const oc_msg *pick = oc_model_notify_scan(&m, c, 0, 0, 0, &men, &kw, &vip);
+    CHECK(pick && pick->message_id == 2 && men == 1);
+
+    oc_completion comp[8]; int start = 0, kind = 0;
+    size_t nc = oc_complete(&m, "hey @cr", comp, 8, &start, &kind);
+    CHECK(nc >= 1 && kind == OC_AC_MENTION && strcmp(comp[0].repl, "@crew") == 0);
+
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_GROUP_DELETED; e.message_id = 7;
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_group(&m, 7) == NULL && c->n_groups == 0 && oc_model_via_group(&m, 10, 1) == 0);
+
+    /* The total that follows a notice (REQ-308): kept for that message only. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MENTION_UNRESOLVED; e.channel_id = 10; e.message_id = 5; e.n_peers = 1; e.peers[0] = 2;
+    e.body = strdup("bob"); oc_model_apply(&m, &e); free(e.body);
+    uint32_t ts = m.unresolved.total_seq;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MENTION_UNRESOLVED_MORE; e.channel_id = 10; e.message_id = 4; e.count = 20;
+    oc_model_apply(&m, &e);
+    CHECK(m.unresolved.total == 0 && m.unresolved.total_seq == ts);   /* another message */
+    e.message_id = 5;
+    oc_model_apply(&m, &e);
+    CHECK(m.unresolved.total == 20 && m.unresolved.total_seq == ts + 1);
+
+    /* A list: ops was deleted while away, so a list that names only a new one
+     * leaves only that one. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_GROUPS_END; oc_model_apply(&m, &e);    /* the list at sign-in: ops, seen */
+    CHECK(m.n_groups == 1);
+    apply_group(&m, 9, "design", crew, 1);                 /* the next list names design only */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_GROUPS_END; oc_model_apply(&m, &e);
+    CHECK(m.n_groups == 1 && oc_model_group(&m, 9) != NULL && oc_model_group(&m, 8) == NULL);
+    oc_model_free(&m);
+}
+
+/* A roster asked for twice before either answer came lists each member once
+ * (two clears, then both answers): the second answer updates, it does not add. */
+static void test_chanmem_overlap(void) {
+    oc_model m; oc_model_init(&m);
+    oc_model_chanmem_begin(&m, 10);
+    oc_model_chanmem_begin(&m, 10);          /* opened, then refreshed */
+    for (int pass = 0; pass < 2; pass++)     /* both answers arrive */
+        for (uint64_t uid = 1; uid <= 2; uid++) {
+            oc_ev e; memset(&e, 0, sizeof e);
+            e.type = OC_EV_CHAN_MEMBER; e.channel_id = 10; e.user_id = uid;
+            e.status = (uint8_t)(pass ? OC_ROLE_ADMIN : OC_ROLE_MEMBER); e.server_time = 100 + (uint64_t)pass;
+            oc_model_apply(&m, &e);
+        }
+    CHECK(m.n_chanmem == 2);
+    CHECK(m.chanmem[0].user_id == 1 && m.chanmem[1].user_id == 2);
+    CHECK(m.chanmem[0].role == OC_ROLE_ADMIN && m.chanmem[0].joined_at == 101);   /* the later answer */
+    oc_model_free(&m);
+}
+
+static void test_group_dm_title(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;                                  /* signed in as alice */
+
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("alice"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob");   oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 3; e.body = strdup("carol"); oc_model_apply(&m, &e);
+
+    /* The daemon sends every member of the DM, self included (dbwriter.c selects
+     * the whole channel_members row set), so n_peers is 3 here, not 2. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 20; e.status = 1; e.op = OC_CHANNEL_KIND_DM;
+    e.user_id = 2; e.server_time = 500;
+    e.n_peers = 3; e.peers[0] = 1; e.peers[1] = 2; e.peers[2] = 3;
+    oc_model_apply(&m, &e);
+
+    const oc_channel *c = oc_model_channel(&m, 20);
+    CHECK(c != NULL);
+    CHECK(c->n_peers == 3);                          /* the count the GUI badge draws */
+
+    char title[96];
+    oc_model_dm_title(&m, c, title, sizeof title);
+    {   /* every participant, alphabetical, self included */
+        const char *ta = strstr(title, "alice"), *tb = ta ? strstr(ta, "bob") : NULL, *tc = tb ? strstr(tb, "carol") : NULL;
+        CHECK(ta && tb && tc);
+    }
+
+    /* A 1:1 DM is still titled by the other person, not by both of them. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 21; e.status = 1; e.op = OC_CHANNEL_KIND_DM;
+    e.user_id = 2; e.server_time = 600; oc_model_apply(&m, &e);
+    const oc_channel *d = oc_model_channel(&m, 21);
+    CHECK(d != NULL);
+    oc_model_dm_title(&m, d, title, sizeof title);
+    CHECK(strcmp(title, "bob") == 0);
+
+    oc_model_free(&m);
+}
+
+/* A channel that appears AFTER the settings sync starts at the user's global
+ * default (REQ-134), not at whatever zeroed memory means.
+ *
+ * NOTIFY_PREFS is a full sync: its header sets the default and re-seeds every
+ * channel the model already holds, then the per-channel entries set the
+ * exceptions. A channel created later never passed through that, so it was born
+ * with notify_level 0 — which is OC_NOTIFY_ALL, the one level a user who set
+ * "only when mentioned" has explicitly said they do not want. The setting held
+ * until somebody made a channel and then quietly stopped holding there. */
+static void test_new_channel_takes_the_default_level(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+
+    oc_ev e;
+    /* The sync: "mentions only, everywhere". */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_DND; e.op = OC_NOTIFY_MENTIONS; oc_model_apply(&m, &e);
+    CHECK(m.notify_default == OC_NOTIFY_MENTIONS);
+
+    /* A channel that arrives afterwards. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 42; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("late"); e.server_time = 500;
+    oc_model_apply(&m, &e);
+
+    const oc_channel *c = oc_model_channel(&m, 42);
+    CHECK(c != NULL);
+    if (c) CHECK(c->notify_level == OC_NOTIFY_MENTIONS);
+
+    /* An explicit per-channel preference still outranks the default, so this
+     * is a floor and not a new way to ignore what the user set. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_NOTIFY_PREF; e.channel_id = 42; e.op = OC_NOTIFY_ALL; e.status = 0;
+    oc_model_apply(&m, &e);
+    c = oc_model_channel(&m, 42);
+    if (c) CHECK(c->notify_level == OC_NOTIFY_ALL);
+
+    /* And a default of ALL still means ALL: the seeding must not have been
+     * written as "anything but zero". */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_DND; e.op = OC_NOTIFY_ALL; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 43; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("later"); e.server_time = 600;
+    oc_model_apply(&m, &e);
+    c = oc_model_channel(&m, 43);
+    CHECK(c != NULL);
+    if (c) CHECK(c->notify_level == OC_NOTIFY_ALL);
+
+    oc_model_free(&m);
+}
+
+/* Every CHANNEL_INFO for a channel moves its info_seq, and one for another
+ * channel does not: an invite or a removal is answered with nothing else, so it
+ * is what an open roster watches to know it should ask again. */
+/* The daemon's critical failures in the model (REQ-263): nothing until a summary
+ * says this is an owner or admin; the counts; a list that replaces the last;
+ * and a new session that starts from nothing again. */
+/* In-app feedback (feedback.h): each kind's lifetime, a repeat refreshing
+ * rather than stacking, what goes when full, holding, progress ending as a
+ * result, and banners by severity -- with what was said, and how loudly. */
+static char g_fb_said[8][OC_FB_TEXT];
+static int  g_fb_loud[8], g_fb_n_said;
+static void fb_say(const char *text, int assertive) {
+    if (g_fb_n_said < 8) { snprintf(g_fb_said[g_fb_n_said], OC_FB_TEXT, "%s", text); g_fb_loud[g_fb_n_said++] = assertive; }
+}
+static void test_feedback(void) {
+    oc_fb f; oc_fb_init(&f, fb_say);
+    uint64_t t = 1000;
+    uint32_t a = oc_fb_show(&f, OC_FB_CONFIRM, T_SAID, NULL, 0, t);
+    CHECK(a && f.n == 1 && f.t[0].deadline_ms == t + 4000);
+    CHECK(g_fb_n_said == 1 && !g_fb_loud[0] && !strcmp(g_fb_said[0], T_SAID));
+    CHECK(oc_fb_show(&f, OC_FB_CONFIRM, T_SAID, NULL, 0, t + 3000) == a && f.n == 1);   /* again: refreshed */
+    CHECK(f.t[0].deadline_ms == t + 7000 && g_fb_n_said == 2);
+    CHECK(oc_fb_duration_ms(OC_FB_CONFIRM, "a sentence that runs well past forty characters, as some do") > 4000);
+    CHECK(oc_fb_duration_ms(OC_FB_CONFIRM, "x") == 4000 && oc_fb_duration_ms(OC_FB_UNDO, "x") == 10000);
+    CHECK(oc_fb_duration_ms(OC_FB_FAILED, "x") == 0 && oc_fb_duration_ms(OC_FB_PROGRESS, "x") == 0);
+    CHECK(oc_fb_duration_ms(OC_FB_NOTICE, "x") == 0);   /* a notice stays until acted on */
+    {
+        oc_fb g; oc_fb_init(&g, NULL);
+        uint32_t nt = oc_fb_show(&g, OC_FB_NOTICE, "Your summary of #kudos (Today) is ready", "View", 1000, t);
+        oc_fb_tick(&g, t + 3600000);
+        CHECK(oc_fb_find(&g, nt) != NULL);                   /* an hour on, still there */
+        oc_fb_dismiss(&g, nt);
+        CHECK(oc_fb_find(&g, nt) == NULL);
+    }
+    uint32_t fail = oc_fb_show(&f, OC_FB_FAILED, "Screen sharing could not start.", NULL, 0, t);
+    CHECK(g_fb_loud[2] == 1);                                                     /* a failure, said assertively */
+    uint32_t prog = oc_fb_show(&f, OC_FB_PROGRESS, "Sending video message…", NULL, 0, t);
+    CHECK(f.n == 3);
+    /* Full: a fourth sends the confirmation away, never the failure or progress. */
+    uint32_t und = oc_fb_show(&f, OC_FB_UNDO, "Draft deleted", "Undo", 7, t);
+    CHECK(f.n == 3 && !oc_fb_find(&f, a) && oc_fb_find(&f, fail) && oc_fb_find(&f, prog) && oc_fb_find(&f, und));
+    CHECK(!strcmp(oc_fb_find(&f, und)->action, "Undo") && oc_fb_find(&f, und)->action_id == 7);
+    /* Time passes: failures and progress stay; Undo held while pointed at. */
+    oc_fb_hold(&f, und, t + 9000);
+    CHECK(!oc_fb_tick(&f, t + 60000) && oc_fb_find(&f, und));
+    oc_fb_hold(&f, 0, t + 60000);                                                  /* the pointer leaves: 2 s more */
+    CHECK(!oc_fb_tick(&f, t + 61000) && oc_fb_tick(&f, t + 62500) && !oc_fb_find(&f, und));
+    CHECK(oc_fb_find(&f, fail) && oc_fb_find(&f, prog));
+    /* Progress ends as a confirmation, which then leaves by itself. */
+    CHECK(oc_fb_update(&f, prog, OC_FB_CONFIRM, "Video message sent", t + 70000));
+    CHECK(oc_fb_tick(&f, t + 74100) && !oc_fb_find(&f, prog) && oc_fb_find(&f, fail));
+    oc_fb_dismiss(&f, fail);
+    CHECK(f.n == 0 && !oc_fb_update(&f, prog, OC_FB_CONFIRM, "x", t));
+    /* Banners: the most severe shows; a repeat of the same state is not said again. */
+    int said = g_fb_n_said;
+    oc_fb_banner_set(&f, 1, OC_FB_ERROR, "Connection lost: reconnecting in 3s…", "Retry now", 9);
+    oc_fb_banner_set(&f, 2, OC_FB_INFO, "This channel is archived.", NULL, 0);
+    CHECK(oc_fb_banner_top(&f) && oc_fb_banner_top(&f)->id == 1 && g_fb_n_said == said + 2 && g_fb_loud[said]);
+    oc_fb_banner_set(&f, 1, OC_FB_ERROR, "Connection lost: reconnecting in 2s…", "Retry now", 9);
+    CHECK(g_fb_n_said == said + 2 && strstr(oc_fb_banner_top(&f)->text, "2s"));
+    oc_fb_banner_clear(&f, 1);
+    CHECK(oc_fb_banner_top(&f) && oc_fb_banner_top(&f)->id == 2);
+    oc_fb_banner_set(&f, 2, OC_FB_INFO, "", NULL, 0);                            /* empty: cleared */
+    CHECK(oc_fb_banner_top(&f) == NULL);
+}
+
+/* Where the platform's own notifications are not built (osnotify_null.c):
+ * nothing can be raised or taken back, and every call says so, so the frontend
+ * falls back and the badges carry on. */
+static void test_osnotify_null(void) {
+    CHECK(oc_osn_init("test.app", "Test", NULL, 0, NULL) == 0);
+    CHECK(oc_osn_available() == 0 && oc_osn_caps() == 0);
+    const char *labels[1] = { "Send" }, *args[1] = { "reply|0|1|" };
+    oc_osn n = { "bob", "hello", "#general", "c1", "w0", "openchime://x/c/1", OC_OSN_SOUND_IM, "Reply",
+                 labels, args, 1 };
+    CHECK(oc_osn_show(&n) == OC_OSN_NOT_SHOWN);
+    CHECK(oc_osn_withdraw("c1", "w0") == 0 && oc_osn_withdraw_group("w0") == 0);
+    oc_osn_done();
+}
+
+/* A tombstone taken back (REQ-052): the body returns in place. */
+static void test_restore_model(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 70; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("room");
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 70; e.message_id = 5; e.author_id = 2;
+    e.body = strdup(T_KEPT);
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_DELETE; e.channel_id = 70; e.message_id = 5;
+    oc_model_apply(&m, &e);
+    const oc_channel *c = oc_model_channel(&m, 70);
+    CHECK(c && c->n_msgs == 1 && c->msgs[0].deleted);
+    memset(&e, 0, sizeof e); e.type = OC_EV_RESTORE; e.channel_id = 70; e.message_id = 5;
+    e.body = strdup(T_KEPT);
+    oc_model_apply(&m, &e);
+    free(e.body);
+    c = oc_model_channel(&m, 70);
+    CHECK(c && c->n_msgs == 1 && !c->msgs[0].deleted && c->msgs[0].body && !strcmp(c->msgs[0].body, T_KEPT));
+    oc_model_free(&m);
+}
+
+/* A poll folded into the model (REQ-225): the daemon's definition and tallies
+ * on the message, the user's own selection kept when a tally for everyone
+ * arrives without it, the poll gone with a tombstone, and the who-voted rows
+ * kept for the poll asked about only. */
+static oc_poll_view *poll_ev(uint8_t flags, uint16_t mine, uint32_t c0, uint32_t c1) {
+    oc_poll_view *pv = calloc(1, sizeof *pv);
+    if (!pv) return NULL;
+    pv->flags = flags; pv->mine = mine; pv->n_options = 2;
+    snprintf(pv->labels[0], sizeof pv->labels[0], "%s", "red");
+    snprintf(pv->labels[1], sizeof pv->labels[1], "%s", "blue");
+    pv->counts[0] = c0; pv->counts[1] = c1; pv->voters = c0 + c1;
+    return pv;
+}
+
+/* A table reads as one line wherever a message is summed up (MARKDOWN.md §1a):
+ * the sidebar's preview and the one-line text a toast or a screen reader gets. */
+static void test_table_preview(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 73; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("room");
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 73; e.message_id = 4; e.author_id = 2;
+    e.body = strdup("| a | b |\n|---|---|\n| 1 | 2 |");
+    oc_model_apply(&m, &e);
+    const oc_channel *c = oc_model_channel(&m, 73);
+    /* contract: the excerpt wording MARKDOWN.md §1a specifies */
+    CHECK(c && strcmp(c->preview, "Table: 1 row \xC3\x97 2 columns") == 0);
+    char line[128];
+    oc_model_msg_preview(&m, c ? &c->msgs[0] : NULL, line, sizeof line);
+    /* contract: the same wording */
+    CHECK(strcmp(line, "Table: 1 row \xC3\x97 2 columns") == 0);
+    oc_model_free(&m);
+}
+
+static void test_poll_model(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 72; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("room");
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 72; e.message_id = 9; e.author_id = 2;
+    e.body = strdup(T_POLL);
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_poll(&m, 72, 9) == NULL);
+
+    /* My own vote, on blue. */
+    memset(&e, 0, sizeof e); e.type = OC_EV_POLL; e.channel_id = 72; e.message_id = 9;
+    e.poll = poll_ev(OC_POLL_HAS_MINE, 0x2, 0, 1);
+    oc_model_apply(&m, &e);
+    free(e.poll);
+    const oc_poll_view *pv = oc_model_poll(&m, 72, 9);
+    CHECK(pv && pv->n_options == 2 && pv->counts[1] == 1 && pv->mine == 0x2);
+    CHECK(pv && !(pv->flags & OC_POLL_HAS_MINE));
+
+    /* Somebody else votes red: the tally moves, my choice stays. */
+    memset(&e, 0, sizeof e); e.type = OC_EV_POLL; e.channel_id = 72; e.message_id = 9;
+    e.poll = poll_ev(0, 0, 1, 1);
+    oc_model_apply(&m, &e);
+    free(e.poll);
+    pv = oc_model_poll(&m, 72, 9);
+    CHECK(pv && pv->counts[0] == 1 && pv->voters == 2 && pv->mine == 0x2);
+
+    /* Who voted: rows for the poll asked about, none for another. */
+    oc_model_voterlist_begin(&m, 9);
+    memset(&e, 0, sizeof e); e.type = OC_EV_POLL_VOTERS; e.message_id = 9; e.user_id = 2; e.poll_option = 1;
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_POLL_VOTERS; e.message_id = 8; e.user_id = 3; e.poll_option = 0;
+    oc_model_apply(&m, &e);
+    CHECK(m.voterlist_open && m.n_voters == 1 && m.voters[0].user_id == 2 && m.voters[0].option == 1);
+    oc_model_close_voterlist(&m);
+    CHECK(!m.voterlist_open && m.n_voters == 0);
+
+    /* Deleted: no question, no poll -- and a late tally does not bring it back. */
+    memset(&e, 0, sizeof e); e.type = OC_EV_DELETE; e.channel_id = 72; e.message_id = 9;
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_poll(&m, 72, 9) == NULL);
+    memset(&e, 0, sizeof e); e.type = OC_EV_POLL; e.channel_id = 72; e.message_id = 9;
+    e.poll = poll_ev(0, 0, 2, 1);
+    oc_model_apply(&m, &e);
+    free(e.poll);
+    CHECK(oc_model_poll(&m, 72, 9) == NULL);
+    oc_model_free(&m);
+}
+
+/* The two-tier badge: a channel's plain unread is a dot, a mention a count; in a
+ * direct message every unread is to you, so it counts; muted shows neither; and
+ * reading clears both. */
+static void test_badge_tiers(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("alice"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 80; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("general"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 81; e.status = 1; e.op = OC_CHANNEL_KIND_DM;
+    e.user_id = 2; oc_model_apply(&m, &e);
+    const char *bodies[3] = { "lunch?", "deploy is green", "@alice can you look" };
+    for (int i = 0; i < 3; i++) {
+        memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 80; e.message_id = (uint64_t)(10 + i);
+        e.author_id = 2; e.body = strdup(bodies[i]);
+        oc_model_apply(&m, &e);
+    }
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 81; e.message_id = 20; e.author_id = 2;
+    e.body = strdup("ping"); oc_model_apply(&m, &e);
+    int n = -1, dot = -1;
+    const oc_channel *ch = oc_model_channel(&m, 80), *dm = oc_model_channel(&m, 81);
+    CHECK(ch && ch->unread == 3 && ch->priority_unread == 1);
+    oc_model_badge(&m, ch, &n, &dot);
+    CHECK(n == 1 && dot == 0);                                   /* the mention, counted */
+    oc_model_badge(&m, dm, &n, &dot);
+    CHECK(n == 1 && dot == 0);                                   /* a DM's every message */
+    oc_model_mark_read(&m, 80);
+    oc_model_badge(&m, oc_model_channel(&m, 80), &n, &dot);
+    CHECK(n == 0 && dot == 0 && oc_model_channel(&m, 80)->priority_unread == 0);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 80; e.message_id = 30; e.author_id = 2;
+    e.body = strdup("no mention here"); oc_model_apply(&m, &e);
+    oc_model_badge(&m, oc_model_channel(&m, 80), &n, &dot);
+    CHECK(n == 0 && dot == 1);                                   /* plain unread: a dot */
+    oc_model_channel(&m, 80)->muted = 1;
+    oc_model_badge(&m, oc_model_channel(&m, 80), &n, &dot);
+    CHECK(n == 0 && dot == 0);                                   /* muted: nothing */
+    oc_model_free(&m);
+}
+
+/* Disconnected, nobody reads as present -- yourself least of all: what the model
+ * holds is what it was when the line dropped. Back, it is what it says again. */
+static void test_presence_offline(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_AUTH_OK; e.user_id = 1; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_PRESENCE; e.user_id = 1; e.status = OC_PRESENCE_ONLINE; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_PRESENCE; e.user_id = 2; e.status = OC_PRESENCE_AWAY; oc_model_apply(&m, &e);
+    CHECK(oc_model_presence_of(&m, 1) == OC_PRESENCE_ONLINE && oc_model_presence_of(&m, 2) == OC_PRESENCE_AWAY);
+    m.authed = false;                                       /* the line drops */
+    CHECK(oc_model_presence_of(&m, 1) == OC_PRESENCE_OFFLINE && oc_model_presence_of(&m, 2) == OC_PRESENCE_OFFLINE);
+    m.authed = true;
+    CHECK(oc_model_presence_of(&m, 2) == OC_PRESENCE_AWAY);
+    oc_model_free(&m);
+}
+
+static void test_srvalerts_model(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_AUTH_OK; e.user_id = 4;
+    oc_model_apply(&m, &e);
+    CHECK(!m.srvalerts_have && m.srvalerts_unacked == 0);             /* a member hears nothing */
+    uint32_t seq = m.srvalerts_seq;
+    memset(&e, 0, sizeof e); e.type = OC_EV_SRVALERTS; e.count = 2; e.srvalert_current = 1;
+    oc_model_apply(&m, &e);
+    CHECK(m.srvalerts_have && m.srvalerts_unacked == 2 && m.srvalerts_current == 1 && m.srvalerts_seq != seq);
+    for (int round = 0; round < 2; round++) {
+        memset(&e, 0, sizeof e); e.type = OC_EV_SRVALERT_BEGIN;
+        oc_model_apply(&m, &e);
+        for (int i = 0; i < 3 - round; i++) {
+            memset(&e, 0, sizeof e); e.type = OC_EV_SRVALERT;
+            e.srvalert = calloc(1, sizeof *e.srvalert);
+            e.srvalert->id = (uint64_t)(10 + i); e.srvalert->current = i == 0;
+            snprintf(e.srvalert->key, sizeof e.srvalert->key, "tls.obtain");
+            snprintf(e.srvalert->message, sizeof e.srvalert->message, "failure %d", i);
+            oc_model_apply(&m, &e);
+            free(e.srvalert);
+        }
+    }
+    {
+        char want[32];
+        snprintf(want, sizeof want, "failure %d", 1);    /* the second alert's own message, above */
+        CHECK(m.n_srvalerts == 2 && m.srvalerts[1].id == 11 && !strcmp(m.srvalerts[1].message, want));
+    }
+    memset(&e, 0, sizeof e); e.type = OC_EV_AUTH_OK; e.user_id = 4;     /* a new session */
+    oc_model_apply(&m, &e);
+    CHECK(!m.srvalerts_have && m.n_srvalerts == 0);
+    oc_model_free(&m);
+}
+
+static void test_channel_info_seq(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 50; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("room");
+    oc_model_apply(&m, &e);
+    const oc_channel *c = oc_model_channel(&m, 50);
+    CHECK(c != NULL);
+    uint32_t first = c ? c->info_seq : 0;
+    CHECK(first != 0);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 51; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("other");
+    oc_model_apply(&m, &e);
+    c = oc_model_channel(&m, 50);
+    CHECK(c && c->info_seq == first);                   /* another channel's */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 50; e.status = 1; e.op = OC_CHANNEL_KIND;
+    oc_model_apply(&m, &e);                              /* the same state again */
+    c = oc_model_channel(&m, 50);
+    CHECK(c && c->info_seq == first + 1);
+    oc_model_free(&m);
+}
+
+/* The client's half of the one notify decision (ARCH-89, ARCH-103).
+ *
+ * oc_model_notify_scan gathers the inputs and asks oc_notify_decide, the same
+ * function the daemon's push query asks — so what is worth testing here is not
+ * the precedence order (test_push sweeps that against the daemon over all 192
+ * states) but the SCAN: which messages it considers at all. That is where the
+ * client's copy was wrong in ways the shared rule could not see, because it was
+ * never asked about the messages that were skipped. */
+static void test_notify_scan(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("alice"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob");   oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 10; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("general"); e.server_time = 10;
+    oc_model_apply(&m, &e);
+
+    oc_channel *c = oc_model_channel(&m, 10);
+    CHECK(c != NULL);
+    if (!c) { oc_model_free(&m); return; }
+    c->notify_level = OC_NOTIFY_MENTIONS;
+
+    /* A BATCH: a message that names me, then two that do not. The tick sees all
+     * three at once. Sampling only the newest — which is what the toast gate
+     * used to do — asks the rule about "afternoon all" and gets silence, so the
+     * mention two rows above it is never announced at all. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 1; e.author_id = 2;
+    e.server_time = 100; e.body = strdup("@alice can you look"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 2; e.author_id = 2;
+    e.server_time = 200; e.body = strdup("never mind"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 3; e.author_id = 2;
+    e.server_time = 300; e.body = strdup("afternoon all"); oc_model_apply(&m, &e);
+
+    int men = 0, kw = 0, vip = 0;
+    const oc_msg *pick = oc_model_notify_scan(&m, c, 0, 0, 0, &men, &kw, &vip);
+    CHECK(pick != NULL);
+    if (pick) CHECK(pick->message_id == 1);   /* the only one that notifies */
+    CHECK(men == 1);
+    CHECK(kw == 0 && vip == 0);
+
+    /* `since_id` is honoured: nothing above message 3 is new. */
+    pick = oc_model_notify_scan(&m, c, 3, 0, 0, &men, &kw, &vip);
+    CHECK(pick == NULL);
+    CHECK(men == 0);   /* the out-params are cleared, not left from last time */
+
+    /* The NEWEST notifying message is the subject when several qualify, and the
+     * flags are the OR across all of them — the sound and the taskbar flash ask
+     * "did any of this name me?", not "did the last one?". */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 4; e.author_id = 2;
+    e.server_time = 400; e.body = strdup("@alice again"); oc_model_apply(&m, &e);
+    pick = oc_model_notify_scan(&m, c, 0, 0, 0, &men, &kw, &vip);
+    if (pick) CHECK(pick->message_id == 4);
+    CHECK(men == 1);
+
+    /* A DELETED message is not news. The tombstone stays for the reader, but it
+     * has no body to preview and nothing left to interrupt for — this used to
+     * raise a toast with an empty body. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_DELETE; e.channel_id = 10; e.message_id = 4; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_DELETE; e.channel_id = 10; e.message_id = 1; oc_model_apply(&m, &e);
+    pick = oc_model_notify_scan(&m, c, 0, 0, 0, &men, &kw, &vip);
+    CHECK(pick == NULL);        /* both mentions are tombstones now */
+    CHECK(men == 0);
+
+    /* My OWN message never notifies me, whatever it says. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 5; e.author_id = 1;
+    e.server_time = 500; e.body = strdup("@alice talking to myself");
+    oc_model_apply(&m, &e);
+    pick = oc_model_notify_scan(&m, c, 0, 0, 0, &men, &kw, &vip);
+    CHECK(pick == NULL);
+
+    /* The shared rule still governs: mute silences a mention, and so does the
+     * schedule and the pause. Precedence itself is test_push's sweep; this only
+     * proves the scan actually routes through it rather than deciding on its
+     * own. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 6; e.author_id = 2;
+    e.server_time = 600; e.body = strdup("@alice one more"); oc_model_apply(&m, &e);
+    CHECK(oc_model_notify_scan(&m, c, 5, 0, 0, NULL, NULL, NULL) != NULL);
+    CHECK(oc_model_notify_scan(&m, c, 5, 1, 0, NULL, NULL, NULL) == NULL);   /* quiet */
+    CHECK(oc_model_notify_scan(&m, c, 5, 0, 1, NULL, NULL, NULL) == NULL);   /* paused */
+    c->muted = 1;
+    CHECK(oc_model_notify_scan(&m, c, 5, 0, 0, NULL, NULL, NULL) == NULL);   /* muted */
+    c->muted = 0;
+
+    /* A KEYWORD hit passes the MENTIONS level as an @-mention does (REQ-135),
+     * through the same scanner the daemon resolved with (ARCH-103) — the client
+     * used to ignore keywords entirely, so the phone rang and the desktop did
+     * not. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 7; e.author_id = 2;
+    e.server_time = 700; e.body = strdup("the deploy is done"); oc_model_apply(&m, &e);
+    CHECK(oc_model_notify_scan(&m, c, 6, 0, 0, NULL, NULL, NULL) == NULL);
+    snprintf(m.kw_terms[0], sizeof m.kw_terms[0], "deploy");
+    m.n_kw_terms = 1;
+    men = kw = vip = 0;
+    pick = oc_model_notify_scan(&m, c, 6, 0, 0, &men, &kw, &vip);
+    CHECK(pick != NULL);
+    if (pick) CHECK(pick->message_id == 7);
+    CHECK(kw == 1 && men == 0);
+    /* Still inside the level, not around it: mute and the schedule silence a
+     * keyword exactly as they silence a mention. */
+    CHECK(oc_model_notify_scan(&m, c, 6, 1, 0, NULL, NULL, NULL) == NULL);
+    m.n_kw_terms = 0;
+
+    /* A PRIORITY PERSON pierces the level, the schedule and the pause alike —
+     * the one input that says WHO where the rest say WHEN. Mute is the
+     * deliberate limit and still wins. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 8; e.author_id = 2;
+    e.server_time = 800; e.body = strdup("morning"); oc_model_apply(&m, &e);
+    CHECK(oc_model_notify_scan(&m, c, 7, 1, 1, NULL, NULL, NULL) == NULL);
+    m.pri_people[0] = 2; m.n_pri_people = 1;
+    men = kw = vip = 0;
+    pick = oc_model_notify_scan(&m, c, 7, 1, 1, &men, &kw, &vip);
+    CHECK(pick != NULL);            /* through both the schedule and the pause */
+    CHECK(vip == 1);
+    c->muted = 1;
+    CHECK(oc_model_notify_scan(&m, c, 7, 0, 0, NULL, NULL, NULL) == NULL);
+    c->muted = 0;
+
+    oc_model_free(&m);
+}
+
+static void test_sidebar(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+
+    /* Two named channels (one private), plus a DM — which has NO name on the
+     * wire, the case that made DMs invisible in the Win32 sidebar. */
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 10; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("zulu");   e.server_time = 100; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 11; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 0; e.body = strdup("alpha");  e.server_time = 300; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 12; e.status = 1; e.op = OC_CHANNEL_KIND_DM;
+    e.user_id = 2; e.server_time = 200; e.count = 3; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(&m, &e);
+
+    oc_sidebar_opts o; oc_sidebar_opts_defaults(&o);
+    oc_sidebar_row rows[16];
+
+    /* With nothing starred there is NO Starred section at all: it is purely
+     * derived, so an empty one is a row that says nothing and opens onto
+     * nothing. Two headers then — Channels A-Z, and the DM titled by its peer. */
+    size_t n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(n == 5);
+    CHECK(rows[0].is_header && rows[0].section == OC_SB_CHANNELS && rows[0].section_total == 2);
+    CHECK(strcmp(rows[1].label, "alpha") == 0 && rows[1].is_private == 1);
+    CHECK(strcmp(rows[2].label, "zulu") == 0  && rows[2].is_private == 0);
+    CHECK(rows[3].is_header && rows[3].section == OC_SB_DMS);
+    CHECK(strcmp(rows[4].label, "bob") == 0 && rows[4].unread == 3);
+
+    /* Starring lifts a conversation OUT of its section into Starred — it must appear
+     * once, not twice. */
+    CHECK(oc_sidebar_toggle_star(&o, 11) == 1);
+    CHECK(oc_sidebar_is_starred(&o, 11) && !oc_sidebar_is_starred(&o, 12));
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    /* ...and starring one brings the section INTO existence. */
+    CHECK(n == 6);
+    CHECK(rows[0].is_header && rows[0].section == OC_SB_STARRED && rows[0].section_total == 1);
+    CHECK(strcmp(rows[1].label, "alpha") == 0 && rows[1].section == OC_SB_STARRED);
+    CHECK(rows[2].is_header && rows[2].section == OC_SB_CHANNELS);
+    CHECK(strcmp(rows[3].label, "zulu") == 0);      /* alpha is gone from Channels */
+    /* A DM stars too, and un-starring puts it back. */
+    CHECK(oc_sidebar_toggle_star(&o, 12) == 1);
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(rows[0].section_total == 2);
+    CHECK(oc_sidebar_toggle_star(&o, 11) == 1 && oc_sidebar_toggle_star(&o, 12) == 1);
+    CHECK(o.n_starred == 0);
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    /* Un-starring the last one takes the section away again, and the
+     * conversations go back where they came from. */
+    CHECK(n == 5 && rows[0].section == OC_SB_CHANNELS);
+    CHECK(strcmp(rows[1].label, "alpha") == 0);
+
+    /* Unreads only (REQ-234's sidebar): every section keeps just what has something
+     * unread — here only the DM (3 unread) — and the open conversation stays even
+     * though it is read, so reading it cannot pull it out from under you. */
+    o.unreads_only = 1;
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(n == 3);
+    CHECK(rows[0].is_header && rows[0].section == OC_SB_CHANNELS && rows[0].section_total == 2);
+    CHECK(rows[1].is_header && rows[1].section == OC_SB_DMS);
+    CHECK(strcmp(rows[2].label, "bob") == 0);
+    o.keep_id = 10;                                  /* zulu is open */
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(n == 4 && strcmp(rows[1].label, "zulu") == 0);
+    {   /* It persists, and an older setting without it reads as off. */
+        char enc[512]; oc_sidebar_opts_encode(&o, enc, sizeof enc);
+        CHECK(strstr(enc, ";ro:1") != NULL);
+        oc_sidebar_opts back; oc_sidebar_opts_defaults(&back);
+        oc_sidebar_opts_parse(&back, enc);
+        CHECK(back.unreads_only == 1 && back.keep_id == 0);
+        oc_sidebar_opts old; oc_sidebar_opts_defaults(&old);
+        old.unreads_only = 1;
+        oc_sidebar_opts_parse(&old, "c:0,0,0;d:0,0,0");
+        CHECK(old.unreads_only == 0);
+        /* A custom section NAMED with the key must not switch it on. */
+        oc_sidebar_opts named; oc_sidebar_opts_defaults(&named);
+        oc_sidebar_opts_parse(&named, "c:0,0,0;d:0,0,0;sc:0;u:x;ro:1|0,0,0|");
+        CHECK(named.unreads_only == 0);
+    }
+    o.unreads_only = 0; o.keep_id = 0;
+
+    /* Recency uses the server-reported last_message_at: alpha(300) before zulu(100). */
+    o.sort[OC_SB_CHANNELS] = OC_SB_SORT_RECENT;
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(strcmp(rows[1].label, "alpha") == 0 && strcmp(rows[2].label, "zulu") == 0);
+
+    /* Collapsing keeps the header (so it can be reopened) and drops the children. */
+    o.collapsed[OC_SB_CHANNELS] = 1;
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(n == 3 && rows[0].is_header && rows[0].section_total == 2);
+    o.collapsed[OC_SB_CHANNELS] = 0;
+
+    /* Unread-only hides the read channels but keeps the unread DM. */
+    o.filter[OC_SB_CHANNELS] = OC_SB_FILTER_UNREAD;
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(n == 3 && rows[1].is_header && strcmp(rows[2].label, "bob") == 0);
+    o.filter[OC_SB_CHANNELS] = OC_SB_FILTER_ALL;
+
+    /* Find matches the rendered LABEL, so a DM (which has no name) is findable. */
+    snprintf(o.find, sizeof o.find, "bo");
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(n == 3 && strcmp(rows[2].label, "bob") == 0);
+    o.find[0] = '\0';
+
+    /* Options round-trip through the settings bucket (ARCH-88: no local file). */
+    o.sort[OC_SB_DMS] = OC_SB_SORT_UNREAD; o.collapsed[OC_SB_DMS] = 1;
+    CHECK(oc_sidebar_toggle_star(&o, 11) == 1);
+    CHECK(oc_sidebar_toggle_star(&o, 12) == 1);
+    o.collapsed[OC_SB_STARRED] = 1;
+    char enc[256]; oc_sidebar_opts_encode(&o, enc, sizeof enc);
+    oc_sidebar_opts p2; oc_sidebar_opts_defaults(&p2);
+    oc_sidebar_opts_parse(&p2, enc);
+    CHECK(p2.sort[OC_SB_DMS] == OC_SB_SORT_UNREAD && p2.collapsed[OC_SB_DMS] == 1);
+    CHECK(p2.sort[OC_SB_CHANNELS] == OC_SB_SORT_RECENT);
+    /* The starred set survives the round trip, in order, with its collapse. */
+    CHECK(p2.n_starred == 2 && p2.starred[0] == 11 && p2.starred[1] == 12);
+    CHECK(p2.collapsed[OC_SB_STARRED] == 1);
+    /* And a bucket written by an OLDER client (no ";s:" suffix) still parses, with
+     * no stars — the suffix is optional by design. */
+    oc_sidebar_opts p3; oc_sidebar_opts_defaults(&p3);
+    oc_sidebar_opts_parse(&p3, "c:1,0,0;d:2,0,1");
+    CHECK(p3.n_starred == 0 && p3.sort[OC_SB_DMS] == OC_SB_SORT_UNREAD);
+    CHECK(p3.n_custom == 0);
+
+    /* ---- user-defined sections (the other half of REQ-234) ---------- */
+    oc_sidebar_opts u; oc_sidebar_opts_defaults(&u);
+    int work = oc_sidebar_section_add(&u, "Work");
+    CHECK(work == 0 && u.n_custom == 1);
+
+    /* A named section sits where Starred would be (nothing is starred here, so
+     * that section is absent) and above Channels, and a conversation in it is
+     * REMOVED from Channels — the same appear-once rule Starred follows. A custom
+     * section, unlike Starred, stays visible when empty: somebody made it, and
+     * hiding it would leave no way to manage or remove it. */
+    CHECK(oc_sidebar_assign(&u, 10, work) == 1);         /* zulu */
+    CHECK(oc_sidebar_section_of(&u, 10) == work);
+    n = oc_model_sidebar(&m, &u, rows, 16);
+    CHECK(n == 6);
+    CHECK(rows[0].is_header && rows[0].section == OC_SB_CUSTOM_BASE);
+    CHECK(strcmp(rows[0].label, "Work") == 0 && rows[0].section_total == 1);
+    CHECK(strcmp(rows[1].label, "zulu") == 0 && rows[1].section == OC_SB_CUSTOM_BASE);
+    CHECK(rows[2].is_header && rows[2].section == OC_SB_CHANNELS && rows[2].section_total == 1);
+    CHECK(strcmp(rows[3].label, "alpha") == 0);           /* zulu is gone from here */
+
+    /* At most one section: assigning again MOVES rather than duplicating. */
+    int later = oc_sidebar_section_add(&u, "Later");
+    CHECK(later == 1);
+    CHECK(oc_sidebar_assign(&u, 10, later) == 1);
+    CHECK(oc_sidebar_section_of(&u, 10) == later);
+    CHECK(u.custom[work].n_ids == 0 && u.custom[later].n_ids == 1);
+
+    /* Starred WINS over a custom section: two lift-it-out rules need a precedence,
+     * and a conversation in both must still appear exactly once. */
+    CHECK(oc_sidebar_toggle_star(&u, 10) == 1);
+    n = oc_model_sidebar(&m, &u, rows, 16);
+    CHECK(rows[0].section_total == 1);                    /* in Starred */
+    {
+        int seen = 0;
+        for (size_t i = 0; i < n; i++)
+            if (!rows[i].is_header && rows[i].channel_id == 10) seen++;
+        CHECK(seen == 1);
+    }
+    CHECK(oc_sidebar_toggle_star(&u, 10) == 1);           /* back to Later */
+
+    /* Per-section sort/filter/collapse work through the accessors, which is what a
+     * frontend must use: a custom section's number is past the end of the built-in
+     * arrays, and indexing them directly would read off the end. */
+    CHECK(oc_sb_custom_index(OC_SB_CUSTOM_BASE + 1) == 1);
+    CHECK(oc_sb_custom_index(OC_SB_CHANNELS) == -1);
+    oc_sb_set_collapsed(&u, OC_SB_CUSTOM_BASE + later, 1);
+    CHECK(oc_sb_collapsed_of(&u, OC_SB_CUSTOM_BASE + later) == 1);
+    n = oc_model_sidebar(&m, &u, rows, 16);
+    CHECK(rows[2].is_header);                             /* its child is hidden */
+    oc_sb_set_collapsed(&u, OC_SB_CUSTOM_BASE + later, 0);
+    oc_sb_set_sort(&u, OC_SB_CUSTOM_BASE + later, OC_SB_SORT_RECENT);
+    CHECK(oc_sb_sort_of(&u, OC_SB_CUSTOM_BASE + later) == OC_SB_SORT_RECENT);
+    CHECK(u.sort[OC_SB_CHANNELS] == OC_SB_SORT_AZ);       /* did not touch a built-in */
+
+    /* The name is sanitised, because it round-trips through ONE flat setting string
+     * and the separators cannot survive inside it. Stripped, not rejected: the user
+     * asked for a section and should get one. */
+    int odd = oc_sidebar_section_add(&u, "A;b:c,d|e ");
+    CHECK(odd == 2 && strcmp(u.custom[odd].name, "Abcde") == 0);
+    CHECK(oc_sidebar_section_add(&u, ";;;") == -1);       /* nothing left = no section */
+    CHECK(oc_sidebar_section_add(&u, "") == -1);
+
+    /* Round-trip, with the ids and each section's own sort/filter/collapse. */
+    char e2[512]; oc_sidebar_opts_encode(&u, e2, sizeof e2);
+    oc_sidebar_opts p4; oc_sidebar_opts_defaults(&p4);
+    oc_sidebar_opts_parse(&p4, e2);
+    CHECK(p4.n_custom == 3);
+    CHECK(strcmp(p4.custom[0].name, "Work") == 0);
+    CHECK(strcmp(p4.custom[1].name, "Later") == 0);
+    CHECK(strcmp(p4.custom[2].name, "Abcde") == 0);
+    CHECK(p4.custom[1].n_ids == 1 && p4.custom[1].ids[0] == 10);
+    CHECK(oc_sb_sort_of(&p4, OC_SB_CUSTOM_BASE + 1) == OC_SB_SORT_RECENT);
+    CHECK(oc_sidebar_section_of(&p4, 10) == 1);
+
+    /* Removing a section returns its conversations to Channels rather than losing
+     * them: a section is a view, not a container. */
+    oc_sidebar_section_remove(&p4, 1);
+    CHECK(p4.n_custom == 2 && oc_sidebar_section_of(&p4, 10) == -1);
+    CHECK(strcmp(p4.custom[1].name, "Abcde") == 0);       /* the list closed up */
+    n = oc_model_sidebar(&m, &p4, rows, 16);
+    {
+        int in_channels = 0;
+        for (size_t i = 0; i < n; i++)
+            if (!rows[i].is_header && rows[i].channel_id == 10 &&
+                rows[i].section == OC_SB_CHANNELS) in_channels = 1;
+        CHECK(in_channels);
+    }
+
+    /* Rename keeps the members; an empty rename is refused rather than leaving an
+     * unclickable header. */
+    oc_sidebar_section_rename(&p4, 0, "Projects");
+    CHECK(strcmp(p4.custom[0].name, "Projects") == 0);
+    oc_sidebar_section_rename(&p4, 0, ";");
+    CHECK(strcmp(p4.custom[0].name, "Projects") == 0);
+
+    /* The cap refuses rather than evicting, like the starred list. */
+    oc_sidebar_opts f2; oc_sidebar_opts_defaults(&f2);
+    for (unsigned i = 0; i < OC_SB_CUSTOM_MAX; i++) {
+        char nm[16]; snprintf(nm, sizeof nm, "s%u", i);
+        CHECK(oc_sidebar_section_add(&f2, nm) == (int)i);
+    }
+    CHECK(oc_sidebar_section_add(&f2, "one more") == -1);
+    CHECK(f2.n_custom == (int)OC_SB_CUSTOM_MAX);
+
+    /* "Active only" and a GROUP DM (REQ-056). A group has no single peer, so the 1:1
+     * test — "is peer_id online" — read peer 0 as offline and hid every group. The
+     * rule for a group is "is ANYONE in it around", which is what the filter means. */
+    {
+        oc_ev ge; memset(&ge, 0, sizeof ge);
+        ge.type = OC_EV_CHANNEL; ge.channel_id = 13; ge.status = 1; ge.op = OC_CHANNEL_KIND_DM;
+        ge.n_peers = 3; ge.peers[0] = 1; ge.peers[1] = 2; ge.peers[2] = 3;
+        oc_model_apply(&m, &ge);
+        memset(&ge, 0, sizeof ge);
+        ge.type = OC_EV_USER; ge.user_id = 3; ge.body = strdup("carol"); oc_model_apply(&m, &ge);
+
+        oc_sidebar_opts a2; oc_sidebar_opts_defaults(&a2);
+        a2.filter[OC_SB_DMS] = OC_SB_FILTER_ACTIVE;
+        oc_sidebar_row ar[16];
+        size_t an = oc_model_sidebar(&m, &a2, ar, 16);
+        int saw_group = 0;
+        for (size_t i = 0; i < an; i++)
+            if (!ar[i].is_header && ar[i].channel_id == 13) saw_group = 1;
+        CHECK(!saw_group);                       /* nobody in it is online yet */
+
+        memset(&ge, 0, sizeof ge);
+        ge.type = OC_EV_PRESENCE; ge.user_id = 3; ge.status = OC_PRESENCE_ONLINE;
+        oc_model_apply(&m, &ge);
+        m.authed = true;                         /* presence means something only while connected */
+        an = oc_model_sidebar(&m, &a2, ar, 16);
+        saw_group = 0;
+        for (size_t i = 0; i < an; i++)
+            if (!ar[i].is_header && ar[i].channel_id == 13) saw_group = 1;
+        CHECK(saw_group);                        /* carol is around, so the group is */
+    }
+
+
+    oc_model_free(&m);
+}
+
+/* The `.well-known` document (REQ-010) and what counts as malformed (REQ-011).
+ * The PARSE is the whole of what can be tested without a web server, and it is
+ * where the distinction lives: a document that is absent, or served by something
+ * that is not a workspace, is "no metadata"; one that is present and wrong is a
+ * failure with its own name. */
+static void test_wellknown_parse(void) {
+    oc_wellknown wk;
+
+    /* What a workspace publishes: a port, and the fingerprint ARCH-10 allows. */
+    const char *full = "{\"port\": 9443, \"fingerprint\": \"AA:BB:CC\"}";
+    CHECK(oc_wellknown_parse(full, strlen(full), &wk) == OC_WK_OK);
+    CHECK(wk.port == 9443 && strcmp(wk.fingerprint, "AA:BB:CC") == 0);
+
+    /* Either field alone, and neither: the document is optional, so every field
+     * in it is too. An empty object is valid and says nothing. */
+    const char *just_port = "{\"port\":8443}";
+    CHECK(oc_wellknown_parse(just_port, strlen(just_port), &wk) == OC_WK_OK);
+    CHECK(wk.port == 8443 && wk.fingerprint[0] == '\0');
+    const char *just_fp = "{\"fingerprint\":\"beef\"}";
+    CHECK(oc_wellknown_parse(just_fp, strlen(just_fp), &wk) == OC_WK_OK);
+    CHECK(wk.port == 0 && strcmp(wk.fingerprint, "beef") == 0);
+    CHECK(oc_wellknown_parse("{}", 2, &wk) == OC_WK_OK && wk.port == 0);
+
+    /* Unknown keys are ignored -- a newer daemon may publish more than this
+     * client reads -- including whole nested values, whose own keys must not be
+     * mistaken for the document's. */
+    const char *extra =
+        "{\"nope\":{\"port\":1},\"list\":[1,2,3],\"port\":7000,\"later\":\"x\"}";
+    CHECK(oc_wellknown_parse(extra, strlen(extra), &wk) == OC_WK_OK);
+    CHECK(wk.port == 7000);
+
+    /* Malformed (REQ-011): not JSON, not an object, and a key we DO know
+     * carrying the wrong type or an impossible value. The last is the one that
+     * matters -- silently ignoring it would connect to the wrong port. */
+    CHECK(oc_wellknown_parse("", 0, &wk) == OC_WK_MALFORMED);
+    CHECK(oc_wellknown_parse("not json", 8, &wk) == OC_WK_MALFORMED);
+    CHECK(oc_wellknown_parse("[1,2]", 5, &wk) == OC_WK_MALFORMED);
+    CHECK(oc_wellknown_parse("{\"port\":", 8, &wk) == OC_WK_MALFORMED);   /* truncated */
+    const char *bad_type = "{\"port\":\"8443\"}";
+    CHECK(oc_wellknown_parse(bad_type, strlen(bad_type), &wk) == OC_WK_MALFORMED);
+    const char *bad_fp = "{\"fingerprint\":443}";
+    CHECK(oc_wellknown_parse(bad_fp, strlen(bad_fp), &wk) == OC_WK_MALFORMED);
+    const char *zero = "{\"port\":0}";
+    CHECK(oc_wellknown_parse(zero, strlen(zero), &wk) == OC_WK_MALFORMED);
+    const char *huge = "{\"port\":70000}";
+    CHECK(oc_wellknown_parse(huge, strlen(huge), &wk) == OC_WK_MALFORMED);
+    const char *neg = "{\"port\":-1}";
+    CHECK(oc_wellknown_parse(neg, strlen(neg), &wk) == OC_WK_MALFORMED);
+
+    /* Shape, not just types: a document that ends and then continues, one whose
+     * pairs are not separated, and one missing its colon are each malformed. A
+     * parser that stops at the first '}' would accept the first of these and
+     * read only the part before whatever else was appended to it. */
+    {
+        const char *trailing = "{\"port\":8443} and then some";
+        CHECK(oc_wellknown_parse(trailing, strlen(trailing), &wk) == OC_WK_MALFORMED);
+        const char *two_docs = "{\"port\":8443}{\"port\":9}";
+        CHECK(oc_wellknown_parse(two_docs, strlen(two_docs), &wk) == OC_WK_MALFORMED);
+        const char *no_comma = "{\"port\":8443 \"fingerprint\":\"a\"}";
+        CHECK(oc_wellknown_parse(no_comma, strlen(no_comma), &wk) == OC_WK_MALFORMED);
+        const char *dangling = "{\"port\":8443,}";
+        CHECK(oc_wellknown_parse(dangling, strlen(dangling), &wk) == OC_WK_MALFORMED);
+        const char *no_colon = "{\"port\" 8443}";
+        CHECK(oc_wellknown_parse(no_colon, strlen(no_colon), &wk) == OC_WK_MALFORMED);
+        const char *unterminated = "{\"fingerprint\":\"abc}";
+        CHECK(oc_wellknown_parse(unterminated, strlen(unterminated), &wk) == OC_WK_MALFORMED);
+        /* An escape is refused rather than half-understood: nothing this
+         * document carries needs one. */
+        const char *escaped = "{\"fingerprint\":\"a\\\\b\"}";
+        CHECK(oc_wellknown_parse(escaped, strlen(escaped), &wk) == OC_WK_MALFORMED);
+        /* Whitespace around every part is ordinary JSON, and is accepted. */
+        const char *spaced = "  {  \"port\" : 8443 ,  \"fingerprint\" : \"aa\"  }  ";
+        CHECK(oc_wellknown_parse(spaced, strlen(spaced), &wk) == OC_WK_OK);
+        CHECK(wk.port == 8443 && strcmp(wk.fingerprint, "aa") == 0);
+    }
+
+    /* A fingerprint longer than we hold is refused rather than truncated: half
+     * a fingerprint is not a weaker check, it is a different one. */
+    {
+        char big[OC_WK_FP_MAX + 64];
+        int at = snprintf(big, sizeof big, "{\"fingerprint\":\"");
+        memset(big + at, 'a', OC_WK_FP_MAX);
+        snprintf(big + at + OC_WK_FP_MAX, sizeof big - at - OC_WK_FP_MAX, "\"}");
+        CHECK(oc_wellknown_parse(big, strlen(big), &wk) == OC_WK_MALFORMED);
+    }
+
+    /* From a whole HTTP response, which is what the fetch actually holds. The
+     * status decides between "no document" and "a document that is wrong", and
+     * only a 200 can be the second. */
+    {
+        const char *ok200 =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"port\":9443}";
+        CHECK(oc_wellknown_read_response(ok200, strlen(ok200), &wk) == OC_WK_OK);
+        CHECK(wk.port == 9443);
+
+        const char *ten = "HTTP/1.0 200 OK\r\n\r\n{\"port\":7}";
+        CHECK(oc_wellknown_read_response(ten, strlen(ten), &wk) == OC_WK_OK && wk.port == 7);
+
+        const char *notfound = "HTTP/1.1 404 Not Found\r\n\r\n<html>nope</html>";
+        CHECK(oc_wellknown_read_response(notfound, strlen(notfound), &wk) == OC_WK_NONE);
+        const char *moved = "HTTP/1.1 301 Moved\r\nLocation: /x\r\n\r\n";
+        CHECK(oc_wellknown_read_response(moved, strlen(moved), &wk) == OC_WK_NONE);
+        const char *garbage = "not an http response at all";
+        CHECK(oc_wellknown_read_response(garbage, strlen(garbage), &wk) == OC_WK_NONE);
+
+        /* A 200 that is not the document IS the distinct failure: the workspace
+         * served something at this path and it is not this. */
+        const char *html200 = "HTTP/1.1 200 OK\r\n\r\n<html>hello</html>";
+        CHECK(oc_wellknown_read_response(html200, strlen(html200), &wk) == OC_WK_MALFORMED);
+        const char *empty200 = "HTTP/1.1 200 OK\r\n\r\n";
+        CHECK(oc_wellknown_read_response(empty200, strlen(empty200), &wk) == OC_WK_MALFORMED);
+        const char *headersonly = "HTTP/1.1 200 OK\r\nContent-Type: text/plain";
+        CHECK(oc_wellknown_read_response(headersonly, strlen(headersonly), &wk) == OC_WK_MALFORMED);
+    }
+
+    /* The fingerprint as bytes (ARCH-10). Anything that is not exactly 32 bytes
+     * of hex is refused, because a pin half-read is a different check, not a
+     * weaker one. */
+    {
+        unsigned char b[32];
+        const char *plain = "00112233445566778899aabbccddeeff"
+                            "00112233445566778899aabbccddeeff";
+        CHECK(oc_wellknown_fingerprint_bytes(plain, b) == 0);
+        CHECK(b[0] == 0x00 && b[1] == 0x11 && b[31] == 0xff);
+        /* The colons people paste, and upper case, are the same fingerprint. */
+        char colons[128]; int at = 0;
+        for (int i = 0; i < 32; i++)
+            at += snprintf(colons + at, sizeof colons - at, i ? ":%02X" : "%02X", b[i]);
+        unsigned char c2[32];
+        CHECK(oc_wellknown_fingerprint_bytes(colons, c2) == 0);
+        CHECK(memcmp(b, c2, 32) == 0);
+
+        CHECK(oc_wellknown_fingerprint_bytes("", b) == -1);
+        CHECK(oc_wellknown_fingerprint_bytes("nothex", b) == -1);
+        CHECK(oc_wellknown_fingerprint_bytes("00112233", b) == -1);          /* too short */
+        {
+            char toolong[200];
+            snprintf(toolong, sizeof toolong, "%s00", plain);                /* too long */
+            CHECK(oc_wellknown_fingerprint_bytes(toolong, b) == -1);
+        }
+        {
+            char odd[80];
+            snprintf(odd, sizeof odd, "%.63s", plain);                       /* odd digit */
+            CHECK(oc_wellknown_fingerprint_bytes(odd, b) == -1);
+        }
+        CHECK(oc_wellknown_fingerprint_bytes(NULL, b) == -1);
+    }
+
+    /* Bigger than any discovery document: refused without parsing it. */
+    {
+        static char flood[OC_WK_MAX + 32];
+        memset(flood, ' ', sizeof flood);
+        flood[0] = '{'; flood[sizeof flood - 1] = '}';
+        CHECK(oc_wellknown_parse(flood, sizeof flood, &wk) == OC_WK_MALFORMED);
+    }
+}
+
+/* An address is used as given, before anything else: IPv4 or IPv6, bracketed
+ * or bare, with or without a port -- and none of them makes an SRV query, a DNS
+ * lookup or a `.well-known` request, which is what an air-gapped network needs.
+ * Counted (oc_resolve_counts), not inferred. */
+static void test_resolve_literals(void) {
+    static const struct { const char *typed, *host, *domain; int port; } OK[] = {
+        { "10.0.0.5",                  "10.0.0.5",        "10.0.0.5",          443 },
+        { "10.0.0.5:9640",             "10.0.0.5",        "10.0.0.5",         9640 },
+        { "https://10.0.0.5:9640/x",   "10.0.0.5",        "10.0.0.5",         9640 },
+        { "[2001:DB8::10]",            "2001:db8::10",    "[2001:db8::10]",    443 },
+        { "[2001:db8::10]:9640",       "2001:db8::10",    "[2001:db8::10]",   9640 },
+        { "2001:db8::10",              "2001:db8::10",    "[2001:db8::10]",    443 },
+        { "::1",                       "::1",             "[::1]",             443 },
+        { "[::1]:9000",                "::1",             "[::1]",            9000 },
+        { "[0:0:0:0:0:0:0:1]:9000",    "::1",             "[::1]",            9000 },
+        { "fe80::1%eth0",              "fe80::1%eth0",    "[fe80::1%eth0]",    443 },
+        { "[fe80::1%eth0]:9000",       "fe80::1%eth0",    "[fe80::1%eth0]",   9000 },
+        { "openchime://[::1]:9443/c",  "::1",             "[::1]",            9443 },
+    };
+    for (size_t i = 0; i < sizeof OK / sizeof OK[0]; i++) {
+        unsigned srv0, dns0, wk0, srv1, dns1, wk1;
+        oc_resolve_counts(&srv0, &dns0, &wk0);
+        oc_endpoint ep; memset(&ep, 0, sizeof ep);
+        oc_resolve_status st = oc_resolve(OK[i].typed, "openchime.test", &ep);
+        oc_resolve_counts(&srv1, &dns1, &wk1);
+        int ok = st == OC_RESOLVE_OK && strcmp(ep.host, OK[i].host) == 0 &&
+                 strcmp(ep.domain, OK[i].domain) == 0 && ep.port == OK[i].port;
+        if (!ok) printf("  resolve(%s) = %d host=%s domain=%s port=%d\n", OK[i].typed, (int)st,
+                        ep.host, ep.domain, ep.port);
+        CHECK(ok);
+        /* Nothing asked of anyone but the address itself. */
+        CHECK(srv1 == srv0 && dns1 == dns0 && wk1 == wk0);
+    }
+    /* Malformed addresses are refused, never guessed at or suffixed. */
+    static const char *const BAD[] = {
+        "[::1", "[::1]x", "[::1]:0", "[::1]:99999", "[::1]:", "[10.0.0.5]", "[]",
+        "10.0.0.5:0", "10.0.0.5:99999", "fe80::1%", "[chat.acme.com]",
+    };
+    for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
+        oc_endpoint ep;
+        oc_resolve_status st = oc_resolve(BAD[i], "openchime.test", &ep);
+        if (st != OC_RESOLVE_BAD_WORKSPACE) printf("  resolve(%s) = %d, want BAD_WORKSPACE\n", BAD[i], (int)st);
+        CHECK(st == OC_RESOLVE_BAD_WORKSPACE);
+    }
+    /* A name is still a name: counted as looked up, so the counters count. */
+    unsigned dns0, dns1;
+    oc_resolve_counts(NULL, &dns0, NULL);
+    oc_endpoint ep;
+    (void)oc_resolve("localhost:9", NULL, &ep);
+    oc_resolve_counts(NULL, &dns1, NULL);
+    CHECK(dns1 == dns0 + 1);
+
+    /* host:port as text: IPv6 bracketed, everything else exactly as it was. */
+    static const struct { const char *host; int port; const char *want; } HP[] = {
+        { "10.0.0.5", 9640, "10.0.0.5:9640" }, { "chat.acme.com", 443, "chat.acme.com:443" },
+        { "2001:db8::10", 9640, "[2001:db8::10]:9640" }, { "::1", 1, "[::1]:1" },
+    };
+    for (size_t i = 0; i < sizeof HP / sizeof HP[0]; i++) {
+        char out[64];
+        CHECK(oc_hostport(HP[i].host, HP[i].port, out, sizeof out) == 0 && strcmp(out, HP[i].want) == 0);
+    }
+    /* This machine, in any spelling. */
+    static const struct { const char *h; int lo; } LB[] = {
+        { "localhost", 1 }, { "LocalHost", 1 }, { "127.0.0.1", 1 }, { "127.5.6.7", 1 },
+        { "::1", 1 }, { "[::1]", 1 }, { "0:0:0:0:0:0:0:1", 1 }, { "::ffff:127.0.0.1", 1 },
+        { "10.0.0.5", 0 }, { "::2", 0 }, { "::ffff:10.0.0.1", 0 }, { "localhost.acme.com", 0 },
+        { "128.0.0.1", 0 }, { "", 0 },
+    };
+    for (size_t i = 0; i < sizeof LB / sizeof LB[0]; i++) {
+        if (oc_addr_is_loopback(LB[i].h) != LB[i].lo) printf("  loopback(%s) != %d\n", LB[i].h, LB[i].lo);
+        CHECK(oc_addr_is_loopback(LB[i].h) == LB[i].lo);
+    }
+}
+
+static void test_resolve(void) {
+    char d[256];
+    /* The suffix hint goes beside a bare name, or nothing typed yet -- and beside
+     * nothing that already names a host or a port. */
+    {
+        static const struct { const char *t; int want; } SUF[] = {
+            { "", 1 }, { "acme", 1 }, { "acme-eu", 1 }, { "localhost-eu", 1 },
+            { "172.24.206.100:8551", 0 }, { "172.24.206.100", 0 }, { "127.0.0.1", 0 },
+            { "[::1]:8443", 0 }, { "::1", 0 }, { "acme:8443", 0 }, { "chat.acme.com", 0 },
+            { "acme.", 0 }, { "localhost", 0 }, { "LocalHost", 0 }, { "localhost:8443", 0 },
+            { "openchime://acme", 0 }, { "acme/x", 0 },
+        };
+        for (size_t i = 0; i < sizeof SUF / sizeof SUF[0]; i++) {
+            if (oc_workspace_takes_suffix(SUF[i].t, "openchime.example") != SUF[i].want)
+                printf("  takes_suffix(%s) != %d\n", SUF[i].t, SUF[i].want);
+            CHECK(oc_workspace_takes_suffix(SUF[i].t, "openchime.example") == SUF[i].want);
+        }
+        CHECK(oc_workspace_takes_suffix("acme", "") == 0);
+        CHECK(oc_workspace_takes_suffix("acme", NULL) == 0);
+    }
+    /* Bare name gets the suffix; a dotted name passes through; no suffix = as-is. */
+    CHECK(oc_resolve_domain("acme", "openchime.example", d, sizeof d) == 0 &&
+          strcmp(d, "acme.openchime.example") == 0);
+    CHECK(oc_resolve_domain("chat.acme.com", "openchime.example", d, sizeof d) == 0 &&
+          strcmp(d, "chat.acme.com") == 0);
+    CHECK(oc_resolve_domain("acme", NULL, d, sizeof d) == 0 && strcmp(d, "acme") == 0);
+    /* `localhost` is a host, not an org shorthand: suffixing it gave
+     * "localhost.openchime.example", which resolves nowhere — so the address a
+     * developer reaches for first was the one address that could not work. */
+    CHECK(oc_resolve_domain("localhost", "openchime.example", d, sizeof d) == 0 &&
+          strcmp(d, "localhost") == 0);
+    CHECK(oc_resolve_domain("localhost:8443", "openchime.example", d, sizeof d) == 0 &&
+          strcmp(d, "localhost") == 0);
+    CHECK(oc_resolve_domain("LocalHost.", "openchime.example", d, sizeof d) == 0 &&
+          strcmp(d, "localhost") == 0);
+    /* A name that merely starts that way is still an org name. */
+    CHECK(oc_resolve_domain("localhost-eu", "openchime.example", d, sizeof d) == 0 &&
+          strcmp(d, "localhost-eu.openchime.example") == 0);
+    /* A scheme and :port are stripped. */
+    CHECK(oc_resolve_domain("openchime://chat.acme.com:8443", "x", d, sizeof d) == 0 &&
+          strcmp(d, "chat.acme.com") == 0);
+    /* Empty workspace is rejected distinctly. */
+    CHECK(oc_resolve_domain("", "x", d, sizeof d) == -1);
+    oc_endpoint ep;
+    CHECK(oc_resolve("", NULL, &ep) == OC_RESOLVE_BAD_WORKSPACE);
+    /* An explicit host:port (literal IP resolves instantly, no DNS) pins the port. */
+    CHECK(oc_resolve("127.0.0.1:9000", NULL, &ep) == OC_RESOLVE_OK &&
+          strcmp(ep.host, "127.0.0.1") == 0 && ep.port == 9000);
+
+    /* The SRV parser picks the target host + port out of the wire answer. */
+    char host[256]; int port = 0;
+    CHECK(oc_srv_parse(SRV_ANSWER, (int)sizeof SRV_ANSWER, host, sizeof host, &port) == 0);
+    CHECK(strcmp(host, "srv.acme.com") == 0 && port == 8443);
+}
+
+/* The transfer table keeps each tag's latest notice, in place, so what finished
+ * between two frames is still there to read. A full table gives up its oldest
+ * finished transfer before any running one, and only when all are running, its
+ * oldest. */
+static void test_xfer_table(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e; memset(&e, 0, sizeof e);
+    e.type = OC_EV_XFER;
+    e.xfer_tag = 7; e.op = 0; e.xfer_done = 10; e.xfer_total = 100; e.xfer_file = 1;
+    oc_model_apply(&m, &e);
+    e.xfer_tag = 8; e.op = 0; e.xfer_done = 5; e.xfer_total = 50; e.xfer_file = 0;
+    oc_model_apply(&m, &e);
+    e.xfer_tag = 7; e.op = 1; e.xfer_done = 100; e.xfer_total = 100; e.xfer_file = 2;
+    oc_model_apply(&m, &e);
+    const oc_xfer_state *x = oc_model_xfer(&m, 7);
+    CHECK(x && x->phase == 1 && x->done == 100 && x->total == 100 && x->file == 2);
+    CHECK(m.xfer_tag == 7);                               /* the last notice, as before */
+    x = oc_model_xfer(&m, 8);
+    CHECK(x && x->phase == 0 && x->done == 5);
+    CHECK(oc_model_xfer(&m, 9) == NULL && oc_model_xfer(&m, 0) == NULL);
+    e.xfer_tag = 0; oc_model_apply(&m, &e);               /* no tag, no entry */
+    CHECK(oc_model_xfer(&m, 0) == NULL);
+
+    /* Fill it: 7 (finished) and 8 (running) are the two oldest. */
+    for (uint64_t t = 100; t < 100 + OC_MODEL_XFERS - 2; t++) {
+        e.xfer_tag = t; e.op = 0; oc_model_apply(&m, &e);
+    }
+    CHECK(oc_model_xfer(&m, 7) && oc_model_xfer(&m, 100 + OC_MODEL_XFERS - 3));
+    e.xfer_tag = 500; e.op = 0; oc_model_apply(&m, &e);   /* the finished one goes */
+    CHECK(oc_model_xfer(&m, 7) == NULL && oc_model_xfer(&m, 8) && oc_model_xfer(&m, 500));
+    e.xfer_tag = 501; e.op = 0; oc_model_apply(&m, &e);   /* all running: the oldest goes */
+    CHECK(oc_model_xfer(&m, 8) == NULL && oc_model_xfer(&m, 100) && oc_model_xfer(&m, 501));
+    e.xfer_tag = 100; e.op = 2; oc_model_apply(&m, &e);   /* a failure is finished too */
+    e.xfer_tag = 502; e.op = 0; oc_model_apply(&m, &e);
+    CHECK(oc_model_xfer(&m, 100) == NULL && oc_model_xfer(&m, 101) && oc_model_xfer(&m, 502));
+    oc_model_free(&m);
+}
+
+/* The model's sticky last_error (the login flow reads it to tell auth-fail from
+ * unreachable): set by an error, preserved across the "disconnected" line, and
+ * cleared on a successful auth. */
+static void test_last_error(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev *e = oc_ev_new(OC_EV_ERROR); e->body = strdup(T_ERR);
+    oc_model_apply(&m, e); oc_ev_free(e);
+    CHECK(strcmp(m.last_error, T_ERR) == 0);
+    e = oc_ev_new(OC_EV_DISCONNECTED); oc_model_apply(&m, e); oc_ev_free(e);
+    CHECK(strcmp(m.last_error, T_ERR) == 0 && m.connected == false);   /* not overwritten */
+    e = oc_ev_new(OC_EV_AUTH_OK); e->user_id = 7; oc_model_apply(&m, e); oc_ev_free(e);
+    CHECK(m.last_error[0] == '\0');                                            /* cleared on auth */
+    oc_model_free(&m);
+}
+
+/* A mock oc_secret (in-memory keyring) for the credential-cache routing test. */
+/* `val` is sized well past the credential blob for the same reason the libsecret
+ * backend's hex buffer is: a mock that starts refusing writes when the blob grows
+ * would fail these tests everywhere except at the line that actually changed. */
+static struct { char account[64]; uint8_t val[1024]; size_t len; int used; } g_mock[8];
+static int mock_get(void *ctx, const char *a, uint8_t *out, size_t cap, size_t *len) {
+    (void)ctx;
+    for (int i = 0; i < 8; i++)
+        if (g_mock[i].used && strcmp(g_mock[i].account, a) == 0) {
+            if (g_mock[i].len > cap) return 0;
+            memcpy(out, g_mock[i].val, g_mock[i].len); *len = g_mock[i].len; return 1;
+        }
+    return 0;
+}
+/* What the backend actually holds, so the migration can be asserted on bytes
+ * rather than on the API agreeing with itself. */
+static size_t mock_len_of(const char *a) {
+    for (int i = 0; i < 8; i++)
+        if (g_mock[i].used && strcmp(g_mock[i].account, a) == 0) return g_mock[i].len;
+    return 0;
+}
+static int mock_ver_of(const char *a) {
+    for (int i = 0; i < 8; i++)
+        if (g_mock[i].used && strcmp(g_mock[i].account, a) == 0) return g_mock[i].val[0];
+    return -1;
+}
+
+static int mock_put(void *ctx, const char *a, const uint8_t *v, size_t n) {
+    (void)ctx;
+    if (n > sizeof g_mock[0].val) return 0;
+    for (int i = 0; i < 8; i++)
+        if (!g_mock[i].used || strcmp(g_mock[i].account, a) == 0) {
+            g_mock[i].used = 1; snprintf(g_mock[i].account, sizeof g_mock[i].account, "%s", a);
+            memcpy(g_mock[i].val, v, n); g_mock[i].len = n; return 1;
+        }
+    return 0;
+}
+static int mock_each(void *ctx, oc_secret_each_cb cb, void *ud) {
+    (void)ctx;
+    for (int i = 0; i < 8; i++) if (g_mock[i].used) cb(ud, g_mock[i].account);
+    return 1;
+}
+static void mock_reset(void) { memset(g_mock, 0, sizeof g_mock); }
+static void mock_del(void *ctx, const char *a) {
+    (void)ctx;
+    for (int i = 0; i < 8; i++)
+        if (g_mock[i].used && strcmp(g_mock[i].account, a) == 0) g_mock[i].used = 0;
+}
+
+/* The message/outbox replay callbacks and the .log finder that used to live
+ * here went with the client's SQLite store (ARCH-88): the API they fed no
+ * longer exists, so they were five definitions nothing could call. Kept as a
+ * note rather than as code, because dead scaffolding reads like coverage. */
+
+/* Capture the workspace book in call order (most-recently-used first). */
+struct book_capture { int n; char ws[4][64]; char label[4][64]; char user[4][64]; };
+static void book_cb(void *ctx, const char *workspace, const char *label,
+                    const char *username, uint64_t last_used_ms) {
+    (void)last_used_ms;
+    struct book_capture *b = ctx;
+    if (b->n >= 4) return;
+    snprintf(b->ws[b->n],    sizeof b->ws[0],    "%s", workspace ? workspace : "");
+    snprintf(b->label[b->n], sizeof b->label[0], "%s", label     ? label     : "");
+    snprintf(b->user[b->n],  sizeof b->user[0],  "%s", username  ? username  : "");
+    b->n++;
+}
+
+/* ARCH-88: the client writes NOTHING to disk. The store is a thin front for the
+ * OS credential store, so with no keyring attached nothing persists at all —
+ * which is the contract the sign-in screen's "Remember me = off" relies on. */
+static void test_store_no_persistence_without_keyring(void) {
+    oc_store *s = oc_store_open(tpath("itest_core_nostore"));
+    CHECK(s != NULL);
+    if (!s) return;
+    uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN], got[OC_SESSION_TOKEN_LEN];
+    memset(tok, 0xAB, sizeof tok); memset(pin, 0xCD, sizeof pin);
+    oc_store_save_session(s, "acme:443", tok, 0, "dana");
+    oc_store_save_pin(s, "acme:443", pin);
+    oc_store_workspace_remember(s, "acme:443", "acme.example.com", "dana", 1000);
+    CHECK(oc_store_load_session(s, "acme:443", got, NULL, 0) == 0);
+    CHECK(oc_store_load_pin(s, "acme:443", got) == 0);
+    struct book_capture b; memset(&b, 0, sizeof b);
+    oc_store_workspace_each(s, book_cb, &b);
+    CHECK(b.n == 0);
+    oc_store_close(s);
+}
+
+static void test_workspace_book(void) {
+    /* The book IS the credential store's contents now (one entry per workspace),
+     * so it needs the keyring attached from the start. */
+    mock_reset();
+    oc_secret book_sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open(tpath("itest_core_book"));
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &book_sec);
+
+    oc_store_workspace_remember(s, "acme:443",   "acme.example.com",   "dana", 1000);
+    oc_store_workspace_remember(s, "globex:443", "globex.example.com", "dana", 2000);
+
+    /* Most-recently-used first: globex (2000) before acme (1000). */
+    struct book_capture b; memset(&b, 0, sizeof b);
+    oc_store_workspace_each(s, book_cb, &b);
+    CHECK(b.n == 2);
+    CHECK(strcmp(b.ws[0], "globex:443") == 0);
+    CHECK(strcmp(b.ws[1], "acme:443") == 0);
+    CHECK(strcmp(b.label[1], "acme.example.com") == 0);
+
+    /* Re-touching acme moves it to the front, and a NULL label/username keeps
+     * what was stored rather than blanking the switcher entry. */
+    oc_store_workspace_remember(s, "acme:443", NULL, NULL, 3000);
+    struct book_capture b2; memset(&b2, 0, sizeof b2);
+    oc_store_workspace_each(s, book_cb, &b2);
+    CHECK(b2.n == 2);
+    CHECK(strcmp(b2.ws[0], "acme:443") == 0);
+    CHECK(strcmp(b2.label[0], "acme.example.com") == 0);
+    CHECK(strcmp(b2.user[0], "dana") == 0);
+
+    /* Forgetting a workspace deletes its whole credential — book entry AND token
+     * — in one go, leaving nothing behind. */
+    uint8_t tok[OC_SESSION_TOKEN_LEN];
+    for (unsigned i = 0; i < OC_SESSION_TOKEN_LEN; i++) tok[i] = (uint8_t)(i + 1);
+    oc_store_save_session(s, "acme:443", tok, 0, "dana");
+    CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1);
+
+    oc_store_workspace_forget(s, "acme:443");
+    struct book_capture b3; memset(&b3, 0, sizeof b3);
+    oc_store_workspace_each(s, book_cb, &b3);
+    CHECK(b3.n == 1 && strcmp(b3.ws[0], "globex:443") == 0);
+    CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 0);
+    oc_store_close(s);
+}
+
+/* With a secret set, the session token round-trips through the keyring vtable and
+ * does NOT land in the SQLite column; clearing goes through the vtable too. */
+/* Whose token is it? This is the assertion the first attempt at the fix could
+ * not have passed: it compared against the BOOK's username, which the Win32
+ * client writes with the account it is about to TRY, immediately after starting
+ * the net thread (connect_start). So the book said "bob" while the token was
+ * alice's, the comparison agreed, and the second client came up as the first
+ * one's user. The token's account is written only with the token, by the code
+ * that obtained it, and nothing a frontend does can move it. */
+static void test_session_owner(void) {
+    mock_reset();
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open("ignored");
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &sec);
+
+    uint8_t tok[OC_SESSION_TOKEN_LEN];
+    for (unsigned i = 0; i < OC_SESSION_TOKEN_LEN; i++) tok[i] = (uint8_t)(0xA0 + i);
+    char who[128];
+
+    /* No token, no owner. */
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 0);
+
+    oc_store_save_session(s, "acme:443", tok, 0, "alice");
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 1 && strcmp(who, "alice") == 0);
+
+    /* Exactly what the GUI does at connect time, for an account that has not
+     * authenticated and may never. The token is still alice's. */
+    oc_store_workspace_remember(s, "acme:443", "acme:443", "bob", 1000);
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 1 && strcmp(who, "alice") == 0);
+
+    /* A silent reconnect names nobody and must not blank the record. */
+    oc_store_save_session(s, "acme:443", tok, 0, "");
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 1 && strcmp(who, "alice") == 0);
+
+    /* Signing in as somebody else replaces both together. */
+    oc_store_save_session(s, "acme:443", tok, 0, "bob");
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 1 && strcmp(who, "bob") == 0);
+
+    /* The owner goes out with the token, and the pin stays. */
+    uint8_t pin[OC_TLS_FINGERPRINT_LEN];
+    for (unsigned i = 0; i < OC_TLS_FINGERPRINT_LEN; i++) pin[i] = (uint8_t)(i + 7);
+    oc_store_save_pin(s, "acme:443", pin);
+    oc_store_clear_session(s, "acme:443");
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 0);
+    CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 0);
+    uint8_t back[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_store_load_pin(s, "acme:443", back) == 1 && memcmp(back, pin, sizeof pin) == 0);
+    oc_store_close(s);
+}
+
+/* An entry written by a client from before tokens recorded their account is read,
+ * not discarded. Discarding it would take the trusted fingerprint with it, and a dropped pin
+ * is a silent re-pin on the next connect (ARCH-10) — a downgrade in what the
+ * client promises, paid by everyone who upgrades. */
+static void test_store_legacy_entry(void) {
+    mock_reset();
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open("ignored");
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &sec);
+
+    /* Version 1: [ver][flags][expiry][token 32][pin 32][last_used][label 128][user 128]. */
+    enum { V1_LABEL = 128, V1_USER = 128,
+           V1_BLOB = 2 + 8 + OC_SESSION_TOKEN_LEN + OC_TLS_FINGERPRINT_LEN + 8 + V1_LABEL + V1_USER };
+    uint8_t v1[V1_BLOB];
+    memset(v1, 0, sizeof v1);
+    v1[0] = 1;
+    v1[1] = 1 | 2 | 4;                                  /* token + pin + book */
+    for (unsigned i = 0; i < OC_SESSION_TOKEN_LEN; i++) v1[10 + i] = (uint8_t)(i + 1);
+    for (unsigned i = 0; i < OC_TLS_FINGERPRINT_LEN; i++)
+        v1[10 + OC_SESSION_TOKEN_LEN + i] = (uint8_t)(0x40 + i);
+    char *lbl = (char *)(v1 + 18 + OC_SESSION_TOKEN_LEN + OC_TLS_FINGERPRINT_LEN);
+    snprintf(lbl, V1_LABEL, "%s", "acme.example.com");
+    snprintf(lbl + V1_LABEL, V1_USER, "%s", "dana");
+    CHECK(mock_put(NULL, "acme:443", v1, sizeof v1) == 1);
+
+    /* Everything it held survives being read by this version... */
+    uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1 && tok[0] == 1);
+    CHECK(oc_store_load_pin(s, "acme:443", pin) == 1 && pin[0] == 0x40);
+    struct book_capture b; memset(&b, 0, sizeof b);
+    oc_store_workspace_each(s, book_cb, &b);
+    CHECK(b.n == 1 && strcmp(b.label[0], "acme.example.com") == 0 && strcmp(b.user[0], "dana") == 0);
+    /* ...and the one thing it cannot hold reads as unknown, not as nobody. */
+    char who[128];
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 0);
+
+    /* The next write of anything upgrades the entry in place, keeping the rest. */
+    oc_store_save_pin(s, "acme:443", pin);
+    CHECK(mock_len_of("acme:443") > (size_t)V1_BLOB && mock_ver_of("acme:443") == 4);
+    CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1 && tok[0] == 1);
+    memset(&b, 0, sizeof b);
+    oc_store_workspace_each(s, book_cb, &b);
+    CHECK(b.n == 1 && strcmp(b.user[0], "dana") == 0);
+    oc_store_close(s);
+}
+
+/* The key a workspace's entry is filed under is the workspace as NAMED — one
+ * spelling per workspace, whatever address it resolves to. */
+static void test_workspace_key(void) {
+    static const struct { const char *typed, *want; } T[] = {
+        { "acme",                         "acme.openchime.test" },   /* bare name -> the suffix */
+        { "Acme",                         "acme.openchime.test" },   /* one spelling */
+        { "  acme",                       "acme.openchime.test" },
+        { "acme.openchime.test",          "acme.openchime.test" },   /* idempotent: a key is a name */
+        { "Chat.Acme.Example",            "chat.acme.example" },
+        { "chat.acme.example.",           "chat.acme.example" },
+        { "https://chat.acme.example/x",  "chat.acme.example" },
+        { "chat.acme.example:8443",       "chat.acme.example:8443" }, /* a typed port is part of the name */
+        { "127.0.0.1:8443",               "127.0.0.1:8443" },
+        { "LocalHost:9443",               "localhost:9443" },
+        { "acme:0",                       "acme.openchime.test" },    /* not a port */
+        { "acme:99999",                   "acme.openchime.test" },
+        /* An address is its own key, in one spelling: IPv6 in brackets, so a
+         * port after it is not read as part of it (the air-gapped case). */
+        { "10.0.0.5",                     "10.0.0.5" },
+        { "[2001:DB8:0:0::10]:9640",      "[2001:db8::10]:9640" },
+        { "[2001:db8::10]:9640",          "[2001:db8::10]:9640" },
+        { "2001:db8::10",                 "[2001:db8::10]" },
+        { "[::1]",                        "[::1]" },
+        { "openchime://[::1]:9443/x",     "[::1]:9443" },
+    };
+    for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) {
+        char key[288] = "";
+        CHECK(oc_workspace_key(T[i].typed, "openchime.test", key, sizeof key) == 0);
+        if (strcmp(key, T[i].want) != 0) printf("  key(%s) = %s, want %s\n", T[i].typed, key, T[i].want);
+        CHECK(strcmp(key, T[i].want) == 0);
+    }
+    char key[288], tiny[4];
+    CHECK(oc_workspace_key("", "openchime.test", key, sizeof key) != 0);
+    CHECK(oc_workspace_key("acme", "openchime.test", tiny, sizeof tiny) != 0);
+}
+
+/* What a connection names in its handshake: the workspace's domain, never an
+ * address (RFC 6066 §3), whatever port or brackets came with it. */
+static void test_sni_name(void) {
+    static const struct { const char *in, *want; } T[] = {
+        { "acme.workspace.openchime.test",      "acme.workspace.openchime.test" },
+        { "chat.acme.example:8443",             "chat.acme.example" },
+        { "localhost",                          "localhost" },        /* a name, and sent */
+        { "localhost:9443",                     "localhost" },
+        { "127.0.0.1",                          NULL },
+        { "127.0.0.1:8443",                     NULL },
+        { "::1",                                NULL },
+        { "2001:db8::1",                        NULL },
+        { "[2001:db8::1]:443",                  NULL },
+        { "[::1]",                              NULL },
+        { "",                                   NULL },
+    };
+    for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) {
+        char out[256] = "x";
+        int sent = oc_sni_name(T[i].in, out, sizeof out);
+        if (sent != (T[i].want != NULL) || (T[i].want && strcmp(out, T[i].want) != 0))
+            printf("  sni(%s) = %d \"%s\"\n", T[i].in, sent, out);
+        CHECK(sent == (T[i].want != NULL));
+        CHECK(T[i].want ? strcmp(out, T[i].want) == 0 : out[0] == '\0');
+    }
+    /* A bare name resolves under the hosted suffix; in development mode OPENCHIME_DEV_SUFFIX wins. */
+    char d[256];
+    unsetenv("OPENCHIME_DEV_SUFFIX");
+    CHECK(oc_resolve_domain("acme", oc_default_suffix(), d, sizeof d) == 0);
+    CHECK(strcmp(d, "acme.workspace.openchime.io") == 0);
+    setenv("OPENCHIME_DEV_SUFFIX", "chat.example", 1);
+    CHECK(oc_resolve_domain("acme", oc_default_suffix(), d, sizeof d) == 0 && strcmp(d, "acme.chat.example") == 0);
+    unsetenv("OPENCHIME_DEV_SUFFIX");
+}
+
+struct moved_label { const char *workspace; char label[256]; };
+static void moved_label_cb(void *ctx, const char *workspace, const char *label,
+                           const char *username, uint64_t last_used_ms) {
+    struct moved_label *m = ctx;
+    (void)username; (void)last_used_ms;
+    if (strcmp(workspace, m->workspace) == 0) snprintf(m->label, sizeof m->label, "%s", label ? label : "");
+}
+
+/* A workspace that moved (WORKSPACE_ADDRESS) is filed under its new address, its
+ * session and book entry with it, so the next connection dials the new one. The
+ * same address, or none, changes nothing. */
+static void test_workspace_move(void) {
+    mock_reset();
+    unsetenv("OPENCHIME_DEV_SUFFIX");
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open("ignored");
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &sec);
+
+    uint8_t tok[OC_SESSION_TOKEN_LEN], got[OC_SESSION_TOKEN_LEN];
+    memset(tok, 0x5a, sizeof tok);
+    oc_store_save_session(s, "acme.workspace.openchime.io", tok, 0, "dana");
+    oc_store_workspace_remember(s, "acme.workspace.openchime.io", "acme", "dana", 5);
+
+    char key[288];
+    CHECK(oc_workspace_move(s, "acme.workspace.openchime.io", "acme.workspace.openchime.io", key, sizeof key) == 0);
+    CHECK(oc_workspace_move(s, "acme.workspace.openchime.io", "", key, sizeof key) == 0);
+
+    CHECK(oc_workspace_move(s, "acme.workspace.openchime.io", "Acme-New.workspace.openchime.io", key, sizeof key) == 1);
+    CHECK(strcmp(key, "acme-new.workspace.openchime.io") == 0);
+    CHECK(oc_store_load_session(s, key, got, NULL, 0) == 1 && memcmp(got, tok, sizeof tok) == 0);
+    CHECK(mock_len_of("acme.workspace.openchime.io") == 0);
+    struct moved_label m = { key, "" };
+    oc_store_workspace_each(s, moved_label_cb, &m);
+    CHECK(strcmp(m.label, "Acme-New.workspace.openchime.io") == 0);
+
+    /* Nothing kept (Remember-me off): only the key moves. */
+    CHECK(oc_workspace_move(NULL, "beta.workspace.openchime.io", "gamma.workspace.openchime.io", key, sizeof key) == 1);
+    CHECK(strcmp(key, "gamma.workspace.openchime.io") == 0);
+    oc_store_close(s);
+}
+
+/* An entry from when the key was the resolved address moves to the name — all of
+ * it, once — and an entry already under the name keeps what it has. */
+static void test_store_adopt(void) {
+    mock_reset();
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open("ignored");
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &sec);
+
+    uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN], sk[32], pk[32];
+    memset(tok, 0x11, sizeof tok); memset(pin, 0x22, sizeof pin);
+    oc_store_save_session(s, "edge7.host.example:443", tok, 0, "dana");
+    oc_store_save_pin(s, "edge7.host.example:443", pin);
+    CHECK(oc_store_device_key(s, "edge7.host.example:443", sk, pk) == 1);
+    oc_store_workspace_remember(s, "edge7.host.example:443", "acme", "dana", 5);
+
+    CHECK(oc_store_adopt(s, "acme.openchime.test", "edge7.host.example:443") == 1);
+    uint8_t got[OC_SESSION_TOKEN_LEN], gpin[OC_TLS_FINGERPRINT_LEN], sk2[32], pk2[32];
+    char owner[64];
+    CHECK(oc_store_load_session(s, "acme.openchime.test", got, NULL, 0) == 1 && memcmp(got, tok, sizeof tok) == 0);
+    CHECK(oc_store_session_user(s, "acme.openchime.test", owner, sizeof owner) == 1 && strcmp(owner, "dana") == 0);
+    CHECK(oc_store_load_pin(s, "acme.openchime.test", gpin) == 1 && memcmp(gpin, pin, sizeof pin) == 0);
+    CHECK(oc_store_device_key(s, "acme.openchime.test", sk2, pk2) == 1 && memcmp(sk, sk2, 32) == 0);
+    CHECK(mock_len_of("edge7.host.example:443") == 0);             /* the old entry is gone */
+    /* Again is nothing; so is a key adopting itself, and a legacy that is not there. */
+    CHECK(oc_store_adopt(s, "acme.openchime.test", "edge7.host.example:443") == 0);
+    CHECK(oc_store_adopt(s, "acme.openchime.test", "acme.openchime.test") == 0);
+    CHECK(oc_store_load_session(s, "acme.openchime.test", got, NULL, 0) == 1);
+
+    /* What the Win32 client left: the book under what was typed, the token under the
+     * address. They merge, and what the name already holds is never overwritten. */
+    uint8_t tokB[OC_SESSION_TOKEN_LEN], pinB[OC_TLS_FINGERPRINT_LEN], pinOld[OC_TLS_FINGERPRINT_LEN];
+    memset(tokB, 0x33, sizeof tokB); memset(pinB, 0x44, sizeof pinB); memset(pinOld, 0x55, sizeof pinOld);
+    oc_store_workspace_remember(s, "beta.openchime.test", "Beta", "erik", 9);   /* book only */
+    oc_store_save_pin(s, "beta.openchime.test", pinB);                          /* the name's own pin */
+    oc_store_save_session(s, "10.0.0.9:443", tokB, 0, "erik");
+    oc_store_save_pin(s, "10.0.0.9:443", pinOld);
+    CHECK(oc_store_adopt(s, "beta.openchime.test", "10.0.0.9:443") == 1);
+    CHECK(oc_store_load_session(s, "beta.openchime.test", got, NULL, 0) == 1 && memcmp(got, tokB, sizeof tokB) == 0);
+    CHECK(oc_store_load_pin(s, "beta.openchime.test", gpin) == 1 && memcmp(gpin, pinB, sizeof pinB) == 0);
+    CHECK(mock_len_of("10.0.0.9:443") == 0);
+    oc_store_close(s);
+}
+
+static void test_secret_routing(void) {
+    memset(g_mock, 0, sizeof g_mock);
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    const char *sp = tpath("itest_core_secret.db");
+    unlink_db(sp);
+
+    uint8_t tok[OC_SESSION_TOKEN_LEN];
+    for (unsigned i = 0; i < OC_SESSION_TOKEN_LEN; i++) tok[i] = (uint8_t)(i + 1);
+
+    oc_store *s = oc_store_open(sp);
+    CHECK(s != NULL);
+    if (s) {
+        oc_store_set_secret(s, &sec);
+        oc_store_save_session(s, "host:1", tok, 0, "dana");
+        uint8_t got[OC_SESSION_TOKEN_LEN];
+        CHECK(oc_store_load_session(s, "host:1", got, NULL, 0) == 1 &&
+              memcmp(got, tok, OC_SESSION_TOKEN_LEN) == 0);      /* via the keyring */
+        oc_store_close(s);
+    }
+    /* Reopen WITHOUT the secret: the token is not in SQLite (it went to the mock). */
+    oc_store *s2 = oc_store_open(sp);
+    CHECK(s2 != NULL);
+    if (s2) {
+        uint8_t g2[OC_SESSION_TOKEN_LEN];
+        CHECK(oc_store_load_session(s2, "host:1", g2, NULL, 0) == 0);
+        oc_store_close(s2);
+    }
+    /* Clear via the secret. */
+    oc_store *s3 = oc_store_open(sp);
+    if (s3) {
+        oc_store_set_secret(s3, &sec);
+        oc_store_clear_session(s3, "host:1");
+        uint8_t g3[OC_SESSION_TOKEN_LEN];
+        CHECK(oc_store_load_session(s3, "host:1", g3, NULL, 0) == 0);
+        oc_store_close(s3);
+    }
+    unlink_db(sp);
+}
+
+/* Build a model with one channel and one other user, ready to be fed replies. */
+static void notice_fixture(oc_model *m) {
+    oc_model_init(m);
+    m->user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("alice"); oc_model_apply(m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 10; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("general"); e.server_time = 10;
+    oc_model_apply(m, &e);
+}
+
+static void feed_reply(oc_model *m, uint64_t message_id, uint64_t author,
+                       int participant, const char *body) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_THREAD_REPLY;
+    e.channel_id = 10; e.parent_id = 500; e.message_id = message_id;
+    e.author_id = author; e.server_time = 100 + message_id; e.count = 1;
+    e.participant = (uint8_t)participant;
+    e.body = strdup(body);
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+/* WHICH thread replies the client considers at all (REQ-061).
+ *
+ * The precedence order is test_push's, swept against the daemon over all 384
+ * states. What is left — and what the client alone can get wrong — is the
+ * gathering: a reply is not in any scroll the client keeps, so everything about
+ * whether it is even a candidate lives here. */
+static void test_thread_notices(void) {
+    oc_thread_notice out[OC_MAX_THREAD_NOTICES];
+    {   /* The daemon says it is not mine: nothing to consider. */
+        oc_model m; notice_fixture(&m);
+        feed_reply(&m, 1, 2, 0, "not your thread");
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 0);
+        oc_model_free(&m);
+    }
+    {   /* Mine, from someone else: a toast, and the body travels with it. */
+        oc_model m; notice_fixture(&m);
+        feed_reply(&m, 1, 2, 1, T_ANSWER);
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 1);
+        CHECK(out[0].message_id == 1 && out[0].author_id == 2);
+        CHECK(strcmp(out[0].body, T_ANSWER) == 0);
+        oc_model_free(&m);
+    }
+    {   /* My own reply, in my own thread. Your own words are not news, and the
+         * model must not queue one at all — a later take cannot tell it apart. */
+        oc_model m; notice_fixture(&m);
+        feed_reply(&m, 1, 1, 1, "my own reply");
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 0);
+        oc_model_free(&m);
+    }
+    {   /* A LIST_THREAD replay. The frames are identical to live ones and carry
+         * the same true participation byte, so only the in-flight mark tells
+         * history from news — and the terminator ends it. */
+        oc_model m; notice_fixture(&m);
+        oc_model_open_thread(&m, 10, 500);
+        feed_reply(&m, 1, 2, 1, "an old reply");
+        feed_reply(&m, 2, 2, 1, "another old one");
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 0);
+        oc_ev e;
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_THREAD_END; e.parent_id = 500; e.count = 2;
+        oc_model_apply(&m, &e);
+        feed_reply(&m, 3, 2, 1, "a live one");
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 1);
+        CHECK(out[0].message_id == 3);
+        oc_model_free(&m);
+    }
+    {   /* Closing a thread clears the mark too. A replay that never arrives —
+         * the request failed, or the user closed the pane first — would
+         * otherwise silence every reply for the rest of the session. */
+        oc_model m; notice_fixture(&m);
+        oc_model_open_thread(&m, 10, 500);
+        oc_model_close_thread(&m);
+        feed_reply(&m, 1, 2, 1, "live after a closed thread");
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 1);
+        oc_model_free(&m);
+    }
+    {   /* Taking DRAINS: a reply is considered once, whatever the verdict, or a
+         * timer that runs every tick would toast it every tick. */
+        oc_model m; notice_fixture(&m);
+        feed_reply(&m, 1, 2, 1, "once");
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 1);
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 0);
+        /* Silenced by quiet hours, and still drained — it was considered. */
+        feed_reply(&m, 2, 2, 1, "during quiet hours");
+        CHECK(oc_model_thread_notify_take(&m, 1, 0, out, OC_MAX_THREAD_NOTICES) == 0);
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 0);
+        oc_model_free(&m);
+    }
+    {   /* The queue is bounded and drops the OLDEST: a burst costs the stalest
+         * notice, never memory, and what survives is what just happened. */
+        oc_model m; notice_fixture(&m);
+        for (uint64_t i = 1; i <= OC_MAX_THREAD_NOTICES + 5; i++)
+            feed_reply(&m, i, 2, 1, "burst");
+        size_t n = oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES);
+        CHECK(n == OC_MAX_THREAD_NOTICES);
+        CHECK(out[n - 1].message_id == OC_MAX_THREAD_NOTICES + 5);
+        CHECK(out[0].message_id == 6);
+        oc_model_free(&m);
+    }
+    {   /* The Threads badge moves with the toast, rather than waiting for the
+         * next LIST_THREADS to say so (REQ-062). */
+        oc_model m; notice_fixture(&m);
+        oc_ev e;
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_THREAD_SUMMARY; e.message_id = 500; e.channel_id = 10;
+        e.author_id = 2; e.server_time = 10; e.reply_count = 1; e.unread_count = 0;
+        e.following = 1; e.body = strdup("the root");
+        oc_model_apply(&m, &e);
+        CHECK(oc_model_thread_unread(&m) == 0);
+        feed_reply(&m, 1, 2, 1, "a reply");
+        CHECK(oc_model_thread_unread(&m) == 1);
+        oc_model_free(&m);
+    }
+}
+
+/* What a channel's badge counts (REQ-284): the messages that would have
+ * NOTIFIED, with the schedule and the pause left out. */
+static void test_unread_counts_what_notifies(void) {
+    {   /* Mark unread (REQ-235): the position goes back to a message, and what
+         * lies past it counts again by the same rule -- my own and a deleted one
+         * not. The daemon's READ_CURSOR naming ME moves it either way (another
+         * device did it); naming someone else is only seen-by. */
+        oc_model m; notice_fixture(&m);
+        oc_channel *c = oc_model_channel(&m, 10);
+        if (c) c->notify_level = OC_NOTIFY_ALL;
+        oc_ev e;
+        const uint64_t authors[5] = { 2, 2, 1, 2, 2 };
+        for (int i = 1; i <= 5; i++) {
+            memset(&e, 0, sizeof e);
+            e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = (uint64_t)i * 10;
+            e.author_id = authors[i - 1]; e.server_time = 100 + i; e.body = strdup("words");
+            oc_model_apply(&m, &e);
+        }
+        oc_model_mark_read(&m, 10);
+        CHECK(channel_unread(&m, 10) == 0);
+        c = oc_model_channel(&m, 10);
+        if (c) c->msgs[4].deleted = 1;               /* message 50 is gone */
+        oc_model_set_read_marker(&m, 10, 10);         /* unread from 20 */
+        CHECK(channel_unread(&m, 10) == 2);           /* 20 and 40: not mine (30), not 50 */
+        c = oc_model_channel(&m, 10);
+        CHECK(c && c->read_marker == 10);
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_READ_CURSOR; e.channel_id = 10; e.user_id = 1; e.message_id = 0;
+        oc_model_apply(&m, &e);
+        CHECK(channel_unread(&m, 10) == 3);           /* all of it: 10, 20, 40 */
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_READ_CURSOR; e.channel_id = 10; e.user_id = 2; e.message_id = 0;
+        oc_model_apply(&m, &e);
+        CHECK(channel_unread(&m, 10) == 3);           /* someone else's cursor: no change */
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_READ_CURSOR; e.channel_id = 10; e.user_id = 1; e.message_id = 50;
+        oc_model_apply(&m, &e);
+        CHECK(channel_unread(&m, 10) == 0);           /* read again elsewhere */
+        oc_model_free(&m);
+    }
+    {   /* On MENTIONS, only the one that names me. Before REQ-284 this counted
+         * every message and the daemon counted something else again. */
+        oc_model m; notice_fixture(&m);
+        oc_channel *c = oc_model_channel(&m, 10);
+        CHECK(c != NULL);
+        if (c) c->notify_level = OC_NOTIFY_MENTIONS;
+        oc_ev e;
+        for (int i = 1; i <= 3; i++) {
+            memset(&e, 0, sizeof e);
+            e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = (uint64_t)i;
+            e.author_id = 2; e.server_time = 100 + i;
+            e.body = strdup(i == 2 ? "@alice look" : "chatter");
+            oc_model_apply(&m, &e);
+        }
+        CHECK(channel_unread(&m, 10) == 1);
+        oc_model_free(&m);
+    }
+    {   /* Muted counts nothing, whatever the level says. */
+        oc_model m; notice_fixture(&m);
+        oc_channel *c = oc_model_channel(&m, 10);
+        if (c) { c->notify_level = OC_NOTIFY_ALL; c->muted = 1; }
+        oc_ev e;
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 1; e.author_id = 2;
+        e.server_time = 100; e.body = strdup("@alice look"); oc_model_apply(&m, &e);
+        CHECK(channel_unread(&m, 10) == 0);
+        oc_model_free(&m);
+    }
+    {   /* A priority person pierces the level, exactly as they pierce a toast. */
+        oc_model m; notice_fixture(&m);
+        oc_channel *c = oc_model_channel(&m, 10);
+        if (c) c->notify_level = OC_NOTIFY_MENTIONS;
+        m.n_pri_people = 1; m.pri_people[0] = 2;
+        oc_ev e;
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 1; e.author_id = 2;
+        e.server_time = 100; e.body = strdup("nothing special"); oc_model_apply(&m, &e);
+        CHECK(channel_unread(&m, 10) == 1);
+        oc_model_free(&m);
+    }
+    {   /* My own messages never badge, and NONE passes nothing. */
+        oc_model m; notice_fixture(&m);
+        oc_channel *c = oc_model_channel(&m, 10);
+        if (c) c->notify_level = OC_NOTIFY_ALL;
+        oc_ev e;
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 1; e.author_id = 1;
+        e.server_time = 100; e.body = strdup("mine"); oc_model_apply(&m, &e);
+        CHECK(channel_unread(&m, 10) == 0);
+        if (c) c->notify_level = OC_NOTIFY_NONE;
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 2; e.author_id = 2;
+        e.server_time = 101; e.body = strdup("@alice look"); oc_model_apply(&m, &e);
+        CHECK(channel_unread(&m, 10) == 0);
+        oc_model_free(&m);
+    }
+    {   /* A thread reply badges the THREAD, never the channel: it is not in the
+         * scroll, so a channel badge would point at something you cannot find
+         * by opening it. */
+        oc_model m; notice_fixture(&m);
+        oc_channel *c = oc_model_channel(&m, 10);
+        if (c) c->notify_level = OC_NOTIFY_ALL;
+        feed_reply(&m, 1, 2, 1, "a reply");
+        CHECK(channel_unread(&m, 10) == 0);
+        oc_model_free(&m);
+    }
+}
+
+
+/* Who the To: field in New message may address (REQ-229). The rules are not
+ * decoration: each one here is a message that would otherwise be refused after
+ * the composer had already been emptied, or a channel joined by picking a name
+ * out of an address list. */
+static void tgt_user(oc_model *m, uint64_t id, const char *name, int disabled,
+                     const char *full_name, const char *title) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER;
+    e.user_id = id;
+    e.body = strdup(name);
+    e.status = OC_ROLE_MEMBER;
+    e.op = disabled;
+    if (full_name) snprintf(e.pf_full_name, sizeof e.pf_full_name, "%s", full_name);
+    if (title)     snprintf(e.pf_title, sizeof e.pf_title, "%s", title);
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+static void tgt_channel(oc_model *m, uint64_t id, const char *name, int archived, int joined) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL;
+    e.channel_id = id;
+    e.body = strdup(name);
+    e.status = joined;
+    e.op = 0;               /* an ordinary channel, not a DM */
+    e.archived = (uint8_t)archived;
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+static int tgt_has(const oc_model *m, const char *q, const char *name) {
+    oc_target out[12];
+    size_t n = oc_complete_targets(m, q, out, 12);
+    for (size_t i = 0; i < n; i++)
+        if (strcmp(out[i].name, name) == 0) return 1;
+    return 0;
+}
+
+static void test_addressable_targets(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    tgt_user(&m, 1, "me", 0, NULL, NULL);
+    tgt_user(&m, 2, "alice", 0, "Alice Aardvark", "Platform");
+    tgt_user(&m, 3, "gene", 0, NULL, NULL);
+    tgt_user(&m, 4, "ghost", 1, NULL, NULL);            /* removed by an admin */
+    tgt_channel(&m, 10, "general", 0, 1);
+    tgt_channel(&m, 11, "attic", 1, 1);                 /* archived: read-only */
+    tgt_channel(&m, 12, "strangers", 0, 0);             /* public, never joined */
+
+    CHECK(tgt_has(&m, "ali", "alice"));
+    CHECK(!tgt_has(&m, "me", "me"));                    /* never yourself */
+    CHECK(!tgt_has(&m, "gho", "ghost"));                /* a removed account */
+    CHECK(tgt_has(&m, "gen", "general"));
+    CHECK(!tgt_has(&m, "att", "attic"));                /* archived is read-only */
+    CHECK(!tgt_has(&m, "str", "strangers"));            /* picking is not joining */
+
+    /* The sigil SELECTS. "#gen" means the channel, not the person called gene,
+     * which is what it means in the composer and everywhere else. */
+    CHECK(tgt_has(&m, "#gen", "general"));
+    CHECK(!tgt_has(&m, "#gen", "gene"));
+    CHECK(tgt_has(&m, "@gen", "gene"));
+    CHECK(!tgt_has(&m, "@gen", "general"));
+
+    /* A colleague is findable by the name they are known by, and by the title the
+     * row already prints beside it -- not only by the handle they log in with. */
+    CHECK(tgt_has(&m, "Aardvark", "alice"));
+    CHECK(tgt_has(&m, "Platform", "alice"));
+
+    oc_model_free(&m);
+}
+
+/* ---- calls end to end (REQ-150, REQ-301-305, ARCH-113) -------------------------
+ * The daemon's relay, and a TAP in front of it: a UDP
+ * forwarder the daemon advertises as the relay's port, with an upstream socket per
+ * client so the relay still tells the clients apart. What passes through it is
+ * what anyone on the network -- or the relay itself -- would see. */
+
+static struct { int udp; } g_relay;   /* the socket the daemon's relay runs on */
+
+#define TAP_CLIENTS 16
+#define TAP_KEEP    4000
+typedef struct { uint64_t kid; uint8_t b0; size_t len; uint64_t t_ms; } tap_pkt;
+static struct {
+    int      front;                          /* where the clients send */
+    uint16_t relay_port;
+    struct { struct sockaddr_in6 from; int up; } cl[TAP_CLIENTS];   /* IPv4 arrives mapped */
+    int      n_cl, n_v6;                     /* clients seen; of them, over IPv6 itself */
+    pthread_mutex_t mu;
+    tap_pkt  seen[TAP_KEEP];                 /* client -> relay payloads that carried audio */
+    int      n_seen, bad_header;
+    int      big;                            /* payloads over 1000 bytes: a shared screen's */
+    volatile int drop_pm;                    /* client -> relay packets lost, per mille */
+    volatile int block;                      /* every packet lost, both ways: UDP is blocked */
+    volatile int rebind;                     /* every client's path moves: new source ports */
+    unsigned rng;
+    volatile int stop;
+} g_tap;
+static pthread_t g_tap_th;
+
+static uint64_t mono_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static void *tap_thread(void *p) {
+    (void)p;
+    struct sockaddr_in relay;
+    memset(&relay, 0, sizeof relay);
+    relay.sin_family = AF_INET;
+    relay.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    relay.sin_port = htons(g_tap.relay_port);
+    uint8_t buf[2048];
+    while (!__atomic_load_n(&g_tap.stop, __ATOMIC_ACQUIRE)) {
+        /* A NAT rebinding, or a front door's failover: each client's packets
+         * reach the relay from a new address from now on. */
+        if (__atomic_exchange_n(&g_tap.rebind, 0, __ATOMIC_ACQ_REL))
+            for (int i = 0; i < g_tap.n_cl; i++) { close(g_tap.cl[i].up); g_tap.cl[i].up = socket(AF_INET, SOCK_DGRAM, 0); }
+        /* Only the sockets polled are looked at afterwards: a client first seen
+         * in this pass has no revents yet, and reading one anyway is a blocking
+         * recv on an empty socket. Every recv is non-blocking all the same. */
+        struct pollfd pf[1 + TAP_CLIENTS];
+        memset(pf, 0, sizeof pf);
+        int polled = g_tap.n_cl;
+        pf[0].fd = g_tap.front; pf[0].events = POLLIN;
+        for (int i = 0; i < polled; i++) { pf[1 + i].fd = g_tap.cl[i].up; pf[1 + i].events = POLLIN; }
+        if (poll(pf, (nfds_t)(1 + polled), 50) <= 0) continue;
+        if (pf[0].revents & POLLIN) {
+            struct sockaddr_in6 from; socklen_t fl = sizeof from;
+            ssize_t n = recvfrom(g_tap.front, buf, sizeof buf, MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
+            if (n > 0) {
+                int k = 0;
+                while (k < g_tap.n_cl && (g_tap.cl[k].from.sin6_port != from.sin6_port ||
+                                          memcmp(&g_tap.cl[k].from.sin6_addr, &from.sin6_addr, 16) != 0)) k++;
+                if (k == g_tap.n_cl && k < TAP_CLIENTS) {
+                    g_tap.cl[k].from = from;
+                    g_tap.cl[k].up = socket(AF_INET, SOCK_DGRAM, 0);
+                    if (!IN6_IS_ADDR_V4MAPPED(&from.sin6_addr)) g_tap.n_v6++;
+                    g_tap.n_cl++;
+                }
+                if (k < g_tap.n_cl) {
+                    /* token(16) seq(2) payload: record what the payload looks like. */
+                    if (n > 18) {
+                        uint64_t kid, ctr; size_t hl;
+                        pthread_mutex_lock(&g_tap.mu);
+                        if (oc_sframe_header_decode(buf + 18, (size_t)n - 18, &kid, &ctr, &hl) != 0) g_tap.bad_header++;
+                        else if (g_tap.n_seen < TAP_KEEP && (size_t)n > 18 + hl)
+                            g_tap.seen[g_tap.n_seen++] = (tap_pkt){ kid, buf[18 + hl], (size_t)n - 18, mono_ms() };
+                        if (n > 1000) g_tap.big++;
+                        pthread_mutex_unlock(&g_tap.mu);
+                    }
+                    if (__atomic_load_n(&g_tap.block, __ATOMIC_ACQUIRE)) continue;
+                    g_tap.rng = g_tap.rng * 1664525u + 1013904223u;
+                    int drop = __atomic_load_n(&g_tap.drop_pm, __ATOMIC_ACQUIRE);
+                    if (n > 18 && drop && (int)((g_tap.rng >> 8) % 1000) < drop) continue;
+                    sendto(g_tap.cl[k].up, buf, (size_t)n, 0, (struct sockaddr *)&relay, sizeof relay);
+                }
+            }
+        }
+        for (int i = 0; i < polled; i++)
+            if (pf[1 + i].revents & POLLIN) {
+                ssize_t n = recv(g_tap.cl[i].up, buf, sizeof buf, MSG_DONTWAIT);
+                if (n > 0 && !__atomic_load_n(&g_tap.block, __ATOMIC_ACQUIRE)) sendto(g_tap.front, buf, (size_t)n, 0, (struct sockaddr *)&g_tap.cl[i].from, sizeof g_tap.cl[i].from);
+            }
+    }
+    return NULL;
+}
+
+/* A test's microphone and ears: a tone out, and how much of each tone came in. */
+typedef struct {
+    double freq, phase;
+    pthread_mutex_t mu;
+    double hear[3];              /* amplitude of each listened-for tone, last 0.5 s */
+    double acc[3][25];
+    int    at, frames;
+} tone_io;
+static const double LISTEN[3] = { 440.0, 660.0, 880.0 };
+
+static void tone_source(void *ctx, int16_t *pcm, int n) {
+    tone_io *t = ctx;
+    for (int i = 0; i < n; i++) {
+        pcm[i] = (int16_t)(6000.0 * sin(t->phase));
+        t->phase += 2 * M_PI * t->freq / 16000.0;
+        if (t->phase > 2 * M_PI) t->phase -= 2 * M_PI;
+    }
+}
+
+/* Goertzel: the amplitude of one frequency in a frame, through a Hann window so
+ * a loud tone 220 Hz away does not leak into the one being measured. */
+static double goertzel(const int16_t *x, int n, double f) {
+    double w = 2 * M_PI * f / 16000.0, c = 2 * cos(w), s1 = 0, s2 = 0;
+    for (int i = 0; i < n; i++) {
+        double h = 0.5 - 0.5 * cos(2 * M_PI * i / (n - 1));
+        double s = x[i] * h + c * s1 - s2; s2 = s1; s1 = s;
+    }
+    double p = s1 * s1 + s2 * s2 - c * s1 * s2;
+    return 4 * sqrt(p > 0 ? p : 0) / n;    /* x2 for the window's loss of gain */
+}
+
+static void tone_sink(void *ctx, const int16_t *pcm, int n) {
+    tone_io *t = ctx;
+    pthread_mutex_lock(&t->mu);
+    for (int k = 0; k < 3; k++) {
+        t->acc[k][t->at] = goertzel(pcm, n, LISTEN[k]);
+        double sum = 0;
+        for (int i = 0; i < 25; i++) sum += t->acc[k][i];
+        t->hear[k] = sum / 25;
+    }
+    t->at = (t->at + 1) % 25;
+    t->frames++;
+    pthread_mutex_unlock(&t->mu);
+}
+
+static double heard(tone_io *t, int k) {
+    pthread_mutex_lock(&t->mu);
+    double v = t->hear[k];
+    pthread_mutex_unlock(&t->mu);
+    return v;
+}
+
+/* Wait up to `ms` (monotonic) for `cond`, ticking the three clients meanwhile. */
+#define CALL_WAIT(ms, cond) \
+    WAIT_UNTIL_DO(({ oc_client_tick(a); oc_client_tick(b); if (c) oc_client_tick(c); }), (cond), (ms))
+
+static int calls_in(const oc_model *m, uint64_t ch) { return oc_model_call_in(m, ch) != NULL; }
+
+/* The newest frame of a share on `e`, and whether the synthetic screen's frame
+ * numbers in what arrived kept rising. */
+typedef struct { oc_frame f; uint32_t seq, fno; int frames, last, rising, bad, gone; } view_watch;
+
+static void watch(oc_call_engine *e, view_watch *w) {
+    int r = oc_call_engine_share_frame(e, &w->f, &w->seq, &w->fno);
+    if (r < 0) { w->gone = 1; return; }
+    if (r == 0) return;
+    w->gone = 0;
+    int n = oc_capture_synthetic_frame_number(&w->f);
+    if (n < 0) w->bad++;
+    else { if (n < w->last) w->rising = 0; w->last = n; }
+    w->frames++;
+}
+
+/* Screen sharing in the call (REQ-161): dana shares the synthetic screen; erik
+ * sees it, at its size, the frames in order; the relay sees only SFrame; a tenth
+ * of the packets lost on the way costs NACKs and resends, not the picture; faye
+ * joins late and has a picture within a few seconds; erik takes over, which stops
+ * dana's; erik stops, and the picture goes. */
+static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
+                           oc_call_engine *ea, oc_call_engine *eb, oc_call_engine *ec) {
+    const oc_model *ma = oc_client_model(a), *mb = oc_client_model(b), *mc = oc_client_model(c);
+    uint64_t ua = ma->user_id, ub = mb->user_id;
+    oc_call_stats st;
+    setenv("OPENCHIME_DEV_CAPTURE", "synthetic", 1);
+    view_watch wb = { .last = -1, .rising = 1 }, wa = { .last = -1, .rising = 1 }, wc = { .last = -1, .rising = 1 };
+    int big0 = g_tap.big;
+
+    CHECK(oc_call_engine_share_start(ea, "screen:synthetic", 1280, 800) == 0);
+    oc_call_engine_stats(ea, &st);
+    CHECK(st.share_state == 1);                               /* waiting for the daemon */
+    oc_client_call_share(a, 1, 1);
+    CHECK(CALL_WAIT(3000, ma->call.sharer == ua && mb->call.sharer == ua));
+    CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 2; })));
+    CHECK(CALL_WAIT(WAIT_MS(6000), ({ watch(eb, &wb); wb.frames >= 10; })));
+    CHECK(wb.f.width == 1280 && wb.f.height == 800 && wb.rising && wb.bad == 0);
+    oc_call_engine_stats(ea, &st);
+    printf("  dana shares: erik has %d frames at %dx%d; dana sends %dx%d at %d fps, %d kbps, %u keyframes\n",
+           wb.frames, wb.f.width, wb.f.height, st.share_width, st.share_height, st.share_fps, st.share_kbps,
+           st.share_keyframes);
+    pthread_mutex_lock(&g_tap.mu);
+    int big = g_tap.big - big0, bad = g_tap.bad_header;
+    pthread_mutex_unlock(&g_tap.mu);
+    CHECK(big > 10 && bad == 0);                              /* the screen went as SFrame, in fragments */
+
+    /* A tenth of everything lost on the way to the relay: the picture keeps
+     * coming. The loss stays on until three more frames have arrived through
+     * it, erik has asked again for what was lost and dana has sent it --
+     * however long that takes on this machine -- so what is measured is
+     * recovery, not how many frames fit in a fixed time. */
+    oc_call_engine_stats(eb, &st);
+    uint32_t nacks0 = st.view_nacks;
+    int got0 = wb.frames;
+    uint64_t lossy = mono_ms();
+    __atomic_store_n(&g_tap.drop_pm, 100, __ATOMIC_RELEASE);
+    oc_call_stats sa;
+    int through = CALL_WAIT(20000, ({ watch(eb, &wb); oc_call_engine_stats(eb, &st); oc_call_engine_stats(ea, &sa);
+                                      wb.frames - got0 >= 3 && st.view_nacks > nacks0 && sa.share_resent > 0; }));
+    __atomic_store_n(&g_tap.drop_pm, 0, __ATOMIC_RELEASE);
+    oc_call_engine_stats(eb, &st);
+    oc_call_engine_stats(ea, &sa);
+    printf("  at 10%% loss: erik has %d more frames in %llu ms, %u NACKs, dana resent %u, %u PLIs, %u given up;"
+           " dana's rate %d kbps at %dx%d\n", wb.frames - got0, (unsigned long long)(mono_ms() - lossy),
+           st.view_nacks - nacks0, sa.share_resent, st.view_plis, st.view_skipped, sa.share_kbps,
+           sa.share_width, sa.share_height);
+    CHECK(through && wb.rising && wb.bad == 0);
+
+    /* faye joins late: a keyframe comes for her. */
+    uint64_t joined = mono_ms();
+    oc_client_call_join(c, 1);
+    CHECK(CALL_WAIT(3000, mc->in_call && mc->call.sharer == ua));
+    CHECK(CALL_WAIT(WAIT_MS(6000), ({ watch(ec, &wc); wc.frames >= 1; })));
+    printf("  faye joined late: her first frame after %d ms, %dx%d, frame number %d\n", (int)(mono_ms() - joined),
+           wc.f.width, wc.f.height, wc.last);
+    /* The loss above halved the rate, which may have stepped the size down to
+     * fit 1280x720: the shape is what holds. */
+    CHECK(wc.f.width * 800 == wc.f.height * 1280 && wc.bad == 0);
+    CHECK_SPEED(mono_ms() - joined < 5000);
+
+    /* erik takes over: dana's share stops, and dana sees erik's. */
+    CHECK(oc_call_engine_share_start(eb, "window:synthetic", 1280, 800) == 0);
+    oc_client_call_share(b, 1, 1);
+    CHECK(CALL_WAIT(3000, ma->call.sharer == ub && mb->call.sharer == ub && mc->call.sharer == ub));
+    CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 0 && st.share_taken; })));
+    CHECK(CALL_WAIT(WAIT_MS(6000), ({ watch(ea, &wa); wa.frames >= 5; })));
+    CHECK(wa.f.width * 800 == wa.f.height * 1280 && wa.rising && wa.bad == 0);
+
+    /* erik stops: nobody shares, and the picture goes. */
+    oc_call_engine_share_stop(eb);
+    oc_client_call_share(b, 1, 0);
+    CHECK(CALL_WAIT(3000, ma->call.sharer == 0 && mb->call.sharer == 0 && mc->call.sharer == 0));
+    CHECK(CALL_WAIT(3000, ({ watch(ea, &wa); wa.gone; })));
+    oc_call_engine_stats(eb, &st);
+    CHECK(st.share_state == 0 && st.sharer == 0);
+
+    oc_client_call_leave(c, 1);
+    CHECK(CALL_WAIT(3000, !mc->in_call && ma->call.n_parts == 2));
+    oc_frame_free(&wa.f); oc_frame_free(&wb.f); oc_frame_free(&wc.f);
+    unsetenv("OPENCHIME_DEV_CAPTURE");
+}
+
+/* The call engine's relay address: IPv4 first, IPv6 when that is all there is
+ * (AUDIO.md §4). And with no UDP at all, a call goes by the connection instead
+ * of not at all -- it used to leave. */
+static int tcp_fallback_calls;
+static int count_tcp(void *ctx, uint16_t seq, const uint8_t *ct, size_t len) {
+    (void)ctx; (void)seq; (void)ct; (void)len;
+    __atomic_add_fetch(&tcp_fallback_calls, 1, __ATOMIC_RELAXED);
+    return 0;
+}
+static void test_call_relay_family(void) {
+    struct sockaddr_storage ss; int len = 0;
+    CHECK(oc_call_relay_addr("127.0.0.1", 9000, &ss, &len) == 0 && ss.ss_family == AF_INET &&
+          ntohs(((struct sockaddr_in *)&ss)->sin_port) == 9000);
+    CHECK(oc_call_relay_addr("localhost", 9000, &ss, &len) == 0 && ss.ss_family == AF_INET);
+    CHECK(oc_call_relay_addr("::1", 9001, &ss, &len) == 0 && ss.ss_family == AF_INET6 &&
+          ntohs(((struct sockaddr_in6 *)&ss)->sin6_port) == 9001 && len == (int)sizeof(struct sockaddr_in6));
+    CHECK(oc_call_relay_addr("2001:db8::10", 9002, &ss, &len) == 0 && ss.ss_family == AF_INET6);
+    CHECK(oc_call_relay_addr("", 9000, &ss, &len) != 0);
+
+    /* No address for the relay at all: with the connection offered, the call
+     * starts on it; without, it does not start. */
+    tone_io tio = { 440, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    oc_call_engine_opts o = { NULL, NULL, 0, tone_source, tone_sink, &tio };
+    oc_call_engine *e = oc_call_engine_new(&o);
+    CHECK(e != NULL);
+    if (!e) return;
+    const oc_call_media *md = oc_call_engine_media();
+    static const uint8_t tok[16] = { 1 };
+    CHECK(md->start(e, "", 9000, tok, sizeof tok, 7, 1) != 0);   /* no address, and no DNS asked */
+    md->tcp(e, count_tcp, NULL);
+    CHECK(md->start(e, "", 9000, tok, sizeof tok, 7, 1) == 0);
+    oc_call_stats st; memset(&st, 0, sizeof st);
+    oc_call_engine_stats(e, &st);
+    CHECK(st.transport == 1);                              /* on the connection */
+    CHECK(WAIT_UNTIL(__atomic_load_n(&tcp_fallback_calls, __ATOMIC_RELAXED) > 0, 3000));   /* keepalives went by it */
+    md->stop(e);
+    oc_call_engine_free(e);
+}
+
+/* Whether this host has an IPv6 loopback to bind. */
+static int host_has_ipv6(void) {
+    int probe = (int)socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in6 a6; memset(&a6, 0, sizeof a6);
+    a6.sin6_family = AF_INET6; a6.sin6_addr = in6addr_loopback;
+    int ok = probe >= 0 && bind(probe, (struct sockaddr *)&a6, sizeof a6) == 0;
+    if (probe >= 0) close(probe);
+    return ok;
+}
+
+/* An encrypted DM between two clients through the real daemon (PRIVATE-DM.md):
+ * opened, accepted, the same safety number on both; then an ordinary DM channel,
+ * marked e2e, in which text, an edit, a reaction and a delete work as in any DM;
+ * and closed, and forgotten with its text. */
+static const oc_pdm_view *pdm_of(const oc_model *m, uint64_t peer) {
+    for (size_t i = 0; i < m->n_pdms; i++) if (m->pdms[i].peer == peer) return &m->pdms[i];
+    return NULL;
+}
+
+static oc_channel *chan_of(const oc_model *m, uint64_t id) { return oc_model_channel((oc_model *)m, id); }
+
+static void test_pdm_e2e(oc_client *a, oc_client *b) {
+    oc_client *c = NULL;   /* CALL_WAIT ticks a third when there is one */
+    const oc_model *ma = oc_client_model(a), *mb = oc_client_model(b);
+    uint64_t ua = ma->user_id, ub = mb->user_id;
+
+    /* To oneself: refused, and said so. */
+    uint32_t refused = ma->pdm_refused_seq;
+    oc_client_open_dm(a, ua, 1);
+    CHECK(CALL_WAIT(3000, ma->pdm_refused_seq != refused));
+
+    /* dana asks erik; erik is asked, and accepts on this device. */
+    oc_client_open_dm(a, ub, 1);
+    CHECK(CALL_WAIT(3000, pdm_of(ma, ub) && pdm_of(ma, ub)->state == OC_PDM_EV_OPENING));
+    CHECK(CALL_WAIT(3000, pdm_of(mb, ua) && pdm_of(mb, ua)->state == OC_PDM_EV_INVITED));
+    uint64_t id = pdm_of(mb, ua)->id;
+    CHECK(id != 0 && id == pdm_of(ma, ub)->id);
+    CHECK(chan_of(mb, id) == NULL);              /* nothing until it is accepted */
+    oc_client_pdm_accept(b, id);
+    CHECK(CALL_WAIT(5000, pdm_of(ma, ub)->state == OC_PDM_EV_OPEN && pdm_of(mb, ua)->state == OC_PDM_EV_OPEN));
+
+    /* The same safety number, twelve groups of five digits, on both. */
+    CHECK(strlen(pdm_of(ma, ub)->safety) == 71);
+    CHECK(strcmp(pdm_of(ma, ub)->safety, pdm_of(mb, ua)->safety) == 0);
+
+    /* Its channel: a DM with the other, marked e2e, on both. */
+    CHECK(CALL_WAIT(3000, chan_of(ma, id) && chan_of(mb, id)));
+    CHECK(chan_of(ma, id)->e2e && chan_of(mb, id)->e2e);
+    CHECK(chan_of(ma, id)->kind == OC_CHANNEL_KIND_DM && chan_of(ma, id)->peer_id == ub);
+
+    /* Both ways, as in any DM: the sender reads its own (kept, not opened). */
+    oc_client_send(a, id, "the **private** words");
+    CHECK(CALL_WAIT(3000, channel_has_body(mb, id, "the **private** words")));
+    CHECK(CALL_WAIT(3000, channel_has_body(ma, id, "the **private** words")));
+    oc_client_send(b, id, "and a private answer");
+    CHECK(CALL_WAIT(3000, channel_has_body(ma, id, "and a private answer")));
+    CHECK(CALL_WAIT(3000, channel_has_body(mb, id, "and a private answer")));
+
+    /* An edit, a reaction, a delete. */
+    uint64_t m1 = body_id(ma, id, "the **private** words");
+    CHECK(m1 != 0);
+    oc_client_edit(a, id, m1, T_EDITED);
+    CHECK(CALL_WAIT(3000, find_msg(mb, id, m1) && find_msg(mb, id, m1)->edited &&
+                          strcmp(find_msg(mb, id, m1)->body, T_EDITED) == 0));
+    CHECK(CALL_WAIT(3000, strcmp(find_msg(ma, id, m1)->body, T_EDITED) == 0));
+    oc_client_react(b, id, m1, "\xF0\x9F\x91\x8D", 1);
+    CHECK(CALL_WAIT(3000, find_msg(ma, id, m1)->n_reactions == 1));
+    uint64_t m2 = body_id(mb, id, "and a private answer");
+    oc_client_delete(b, id, m2);
+    CHECK(CALL_WAIT(3000, find_msg(ma, id, m2) && find_msg(ma, id, m2)->deleted));
+
+    /* dana closes it: erik is told; both forget it, and its text with it. */
+    oc_client_pdm_close(a, id);
+    CHECK(CALL_WAIT(3000, pdm_of(mb, ua) && pdm_of(mb, ua)->state == OC_PDM_EV_ENDED &&
+                          pdm_of(mb, ua)->reason == OC_PDM_END_CLOSED));
+    /* Nothing is sent: the session is gone, and erik's client says so -- the
+     * refusal is the event the absence below is read after. */
+    uint32_t eseq = mb->error_seq;
+    oc_client_send(b, id, "too late");
+    CHECK(CALL_WAIT(3000, mb->error_seq != eseq && mb->last_error_kind == OC_CERR_PDM_CLOSED));
+    CHECK(!channel_has_body(ma, id, "too late") && !channel_has_body(mb, id, "too late"));
+    oc_model_pdm_forget((oc_model *)mb, id);
+    oc_model_pdm_forget((oc_model *)ma, id);
+    CHECK(pdm_of(mb, ua) == NULL && pdm_of(ma, ub) == NULL);
+    CHECK(chan_of(mb, id)->forgotten && chan_of(mb, id)->n_msgs == 0);
+
+    /* A declined invitation: dana is told why. */
+    oc_client_open_dm(a, ub, 1);
+    CHECK(CALL_WAIT(3000, pdm_of(mb, ua) && pdm_of(mb, ua)->state == OC_PDM_EV_INVITED));
+    oc_client_pdm_decline(b, pdm_of(mb, ua)->id);
+    CHECK(CALL_WAIT(3000, pdm_of(ma, ub) && pdm_of(ma, ub)->state == OC_PDM_EV_ENDED &&
+                          pdm_of(ma, ub)->reason == OC_PDM_END_DECLINED));
+    oc_model_pdm_forget((oc_model *)ma, pdm_of(ma, ub)->id);
+    if (pdm_of(mb, ua)) oc_model_pdm_forget((oc_model *)mb, pdm_of(mb, ua)->id);
+}
+
+static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
+    tone_io ta = { 440, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    tone_io tb = { 660, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    tone_io tc = { 880, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    oc_call_engine_opts oa = { NULL, NULL, 0, tone_source, tone_sink, &ta };
+    oc_call_engine_opts ob = { NULL, NULL, 0, tone_source, tone_sink, &tb };
+    oc_call_engine_opts occ = { NULL, NULL, 0, tone_source, tone_sink, &tc };
+    oc_call_engine *ea = oc_call_engine_new(&oa), *eb = oc_call_engine_new(&ob), *ec = oc_call_engine_new(&occ);
+    oc_client_set_call_media(a, oc_call_engine_media(), ea);
+    oc_client_set_call_media(b, oc_call_engine_media(), eb);
+    /* faye signs in by [::1] where the host has IPv6 (AUDIO.md §4): her engine
+     * then sends to the relay at ::1, IPv6 being all that address has, and the
+     * dual-stack tap sees her arrive over it. The others are on 127.0.0.1. */
+    int v6 = host_has_ipv6();
+    if (!v6) SKIP("no IPv6 loopback on this host: faye calls over IPv4, the relay's IPv6 path unexercised");
+    int v6_before = __atomic_load_n(&g_tap.n_v6, __ATOMIC_ACQUIRE);
+    oc_client *c = start_as(NULL, v6 ? "::1" : "127.0.0.1", port, "faye:pw-faye", NULL, NULL, 1, NULL);
+    CHECK(c != NULL);
+    if (!c) { oc_call_engine_free(ea); oc_call_engine_free(eb); oc_call_engine_free(ec); return; }
+    oc_client_set_call_media(c, oc_call_engine_media(), ec);
+    CHECK(WAIT_FOR(c, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+    const oc_model *ma = oc_client_model(a), *mb = oc_client_model(b), *mc = oc_client_model(c);
+    uint64_t ua = ma->user_id, ub = mb->user_id, uc = mc->user_id;
+    oc_call_stats st;
+
+    /* dana starts a call in channel 1, inviting erik: she is in it; erik sees it
+     * in his Calls list as an invitation, and it is one worth a toast. */
+    uint64_t inv[1] = { ub };
+    oc_client_call_start(a, 1, inv, 1);
+    CHECK(CALL_WAIT(3000, ma->in_call && ma->call.channel_id == 1 && ma->call.starter == ua));
+    CHECK(CALL_WAIT(3000, calls_in(mb, 1) && oc_model_call_invited(oc_model_call_in(mb, 1), ub)));
+    oc_call_notice nt[4];
+    CHECK(oc_client_call_notify_take(b, 0, 0, nt, 4) == 1 && nt[0].channel_id == 1 && nt[0].starter == ua);
+    CHECK(oc_client_call_notify_take(b, 0, 0, nt, 4) == 0);        /* considered once */
+
+    /* erik joins: each hears the other's tone and not their own. */
+    oc_client_call_join(b, 1);
+    uint64_t joined_ms = mono_ms();
+    CHECK(CALL_WAIT(3000, mb->in_call && mb->call.n_parts == 2 && ma->call.n_parts == 2));
+    CHECK(CALL_WAIT(6000, heard(&ta, 1) > 1500 && heard(&tb, 0) > 1500));
+    /* Once settled, each at the level it was sent (6000), less what Opus and
+     * the limiter take -- not a fraction of it, which would be frames lost. */
+    CHECK(CALL_WAIT(4000, heard(&ta, 1) > 4800 && heard(&tb, 0) > 4800));
+    printf("  two in the call: dana hears 660 Hz at %.0f, erik hears 440 Hz at %.0f\n", heard(&ta, 1), heard(&tb, 0));
+    CHECK(heard(&ta, 0) < 300 && heard(&tb, 1) < 300);
+    oc_call_engine_stats(ea, &st);
+    CHECK(st.active && st.n_peers == 1 && st.peers[0].user_id == ub && st.peers[0].packets > 20);
+    CHECK(st.peers[0].keyed);
+    /* A joiner misses at most the grace (CALLS.md §5.3): the others go on with
+     * the previous key for a second, which a joiner never gets. After that
+     * nothing fails to decrypt. */
+    {
+        CALL_WAIT(3000, mono_ms() > joined_ms + 1000 + 300);   /* the grace (GRACE_MS), and a margin */
+        oc_call_engine_stats(eb, &st);
+        uint32_t u1 = st.n_peers ? st.peers[0].undecryptable : 0, p1 = st.n_peers ? st.peers[0].packets : 0;
+        CHECK(CALL_WAIT(600, 0) == 0);                          /* ~30 packets at 50 a second */
+        oc_call_engine_stats(eb, &st);
+        CHECK(st.n_peers == 1 && st.peers[0].undecryptable == u1 && st.peers[0].packets > p1 + 20);
+        printf("  erik's first second: %u packets he could not decrypt, none since\n", u1);
+    }
+
+    /* faye joins: a new epoch, new keys all round, and everyone hears everyone. */
+    uint32_t epoch2 = ma->call.epoch;
+    oc_client_call_join(c, 1);
+    CHECK(CALL_WAIT(3000, mc->in_call && ma->call.n_parts == 3 && mb->call.n_parts == 3));
+    CHECK(ma->call.epoch > epoch2);
+    CHECK(CALL_WAIT(8000, heard(&ta, 1) > 1000 && heard(&ta, 2) > 1000 && heard(&tb, 0) > 1000 &&
+                           heard(&tb, 2) > 1000 && heard(&tc, 0) > 1000 && heard(&tc, 1) > 1000));
+    if (v6) {
+        oc_call_stats sc; oc_call_engine_stats(ec, &sc);
+        CHECK(sc.active && sc.transport == 0);                                  /* by UDP... */
+        CHECK(__atomic_load_n(&g_tap.n_v6, __ATOMIC_ACQUIRE) > v6_before);      /* ...over IPv6 */
+    }
+    printf("  three: dana hears 660 %.0f / 880 %.0f, faye hears 440 %.0f / 660 %.0f\n",
+           heard(&ta, 1), heard(&ta, 2), heard(&tc, 0), heard(&tc, 1));
+
+    /* faye leaves. Everyone after her epoch sends under keys she was never given:
+     * the relay may forward to her or not, it makes no difference. */
+    uint32_t her_last = mc->call.epoch;
+    oc_client_call_leave(c, 1);
+    CHECK(CALL_WAIT(3000, !mc->in_call && ma->call.n_parts == 2));
+    CHECK(ma->call.epoch > her_last);
+    uint64_t after_leave = mono_ms() + 1100;          /* past the 1 s grace */
+    CHECK(CALL_WAIT(3000, mono_ms() > after_leave + 500));
+    {
+        int later = 0, newer = 0;
+        pthread_mutex_lock(&g_tap.mu);
+        for (int i = 0; i < g_tap.n_seen; i++)
+            if (g_tap.seen[i].t_ms > after_leave) { later++; if ((g_tap.seen[i].kid >> 8) > her_last) newer++; }
+        pthread_mutex_unlock(&g_tap.mu);
+        CHECK(later > 20 && newer == later);
+    }
+    CHECK(CALL_WAIT(4000, heard(&ta, 2) < 300 && heard(&ta, 1) > 1000));    /* 880 Hz is gone */
+
+    /* What the network carried was ciphertext: every audio payload an SFrame
+     * header and then bytes that do not repeat. In the clear the first byte
+     * after it would be the high byte of the frame number -- the same for every
+     * packet of a call this short. */
+    {
+        int distinct = 0, seen_b[256] = {0};
+        pthread_mutex_lock(&g_tap.mu);
+        for (int i = 0; i < g_tap.n_seen; i++) if (!seen_b[g_tap.seen[i].b0]++) distinct++;
+        int n = g_tap.n_seen, bad = g_tap.bad_header;
+        pthread_mutex_unlock(&g_tap.mu);
+        printf("  the relay saw %d audio packets: %d distinct leading bytes, %d without an SFrame header\n",
+               n, distinct, bad);
+        CHECK(n > 200 && distinct > 200 && bad == 0);
+    }
+
+    /* erik mutes: dana stops hearing him. Push to talk, held, lets him through. */
+    oc_call_engine_set_mute(eb, 1);
+    CHECK(CALL_WAIT(4000, heard(&ta, 1) < 300));
+    /* ...and she can see that he is muted, which only the call's keys say. */
+    CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.n_peers == 1 && st.peers[0].muted; })));
+    oc_call_engine_set_ptt(eb, 1);
+    CHECK(CALL_WAIT(4000, heard(&ta, 1) > 1000));
+    oc_call_engine_set_ptt(eb, 0);
+    oc_call_engine_set_mute(eb, 0);
+
+    /* dana turns erik down to nothing: she hears nothing of him, and he is
+     * still sending. */
+    oc_call_engine_set_volume(ea, ub, 0.0f);
+    CHECK(CALL_WAIT(4000, heard(&ta, 1) < 100));
+    oc_call_engine_stats(eb, &st);
+    CHECK(st.sent > 100 && !st.muted);
+    oc_call_engine_set_volume(ea, ub, 1.0f);
+
+    test_share_e2e(a, b, c, ea, eb, ec);
+
+    /* erik may not end it; dana, who started it, may -- for everyone. */
+    uint32_t errs = mb->call_error_seq;
+    oc_client_call_end(b, 1);
+    CHECK(CALL_WAIT(3000, mb->call_error_seq != errs && mb->call_error == OC_ERR_NOT_CALL_STARTER));
+    oc_client_call_end(a, 1);
+    CHECK(CALL_WAIT(3000, !ma->in_call && !mb->in_call && !calls_in(ma, 1) && !calls_in(mb, 1)));
+    oc_call_engine_stats(eb, &st);
+    CHECK(!st.active);
+
+    /* A missed call: dana starts one inviting faye, nobody comes, dana leaves.
+     * faye's history gains a line that is a call event, not something dana said. */
+    uint64_t inv_c[1] = { uc };
+    oc_client_call_start(a, 1, inv_c, 1);
+    CHECK(CALL_WAIT(3000, ma->in_call));
+    CHECK(CALL_WAIT(3000, calls_in(mc, 1)));
+    oc_client_call_leave(a, 1);
+    CHECK(CALL_WAIT(3000, !ma->in_call && !calls_in(mc, 1)));
+    int missed = 0;
+    CHECK(CALL_WAIT(3000, ({
+        const oc_channel *ch = oc_model_channel((oc_model *)mc, 1);
+        missed = 0;
+        for (size_t i = 0; ch && i < ch->n_msgs; i++)
+            /* a call event (the only one there is: a missed call), dana's, with
+             * words to read where a client draws none of its own */
+            if (ch->msgs[i].kind == OC_MSG_KIND_CALL && ch->msgs[i].author_id == ua &&
+                ch->msgs[i].body && ch->msgs[i].body[0]) missed = 1;
+        missed; })));
+
+    oc_client_set_call_media(a, NULL, NULL);
+    oc_client_set_call_media(b, NULL, NULL);
+    oc_client_stop(c);
+    oc_call_engine_free(ea);
+    oc_call_engine_free(eb);
+    oc_call_engine_free(ec);
+}
+
+/* A network that passes no UDP (PROTOCOL.md §5.17): with the tap dropping every
+ * datagram both ways, each engine finds within seconds that the relay does not
+ * answer and sends by the connection instead, and each hears the other's tone as
+ * well as over UDP. When UDP comes back, the next probe finds it and both return
+ * to it, still hearing each other. */
+static void test_calls_tcp(oc_client *a, oc_client *b) {
+    oc_client *c = NULL;
+    tone_io ta = { 440, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    tone_io tb = { 660, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    oc_call_engine_opts oa = { NULL, NULL, 0, tone_source, tone_sink, &ta };
+    oc_call_engine_opts ob = { NULL, NULL, 0, tone_source, tone_sink, &tb };
+    /* The transport timers shortened (call_engine.c): falling back and coming
+     * back are the same decisions at a fifth of the wait. */
+    setenv("OPENCHIME_DEV_CALL_TIMERS", "probe:200,udp_wait:600,tcp_probe:800", 1);
+    oc_call_engine *ea = oc_call_engine_new(&oa), *eb = oc_call_engine_new(&ob);
+    unsetenv("OPENCHIME_DEV_CALL_TIMERS");
+    oc_client_set_call_media(a, oc_call_engine_media(), ea);
+    oc_client_set_call_media(b, oc_call_engine_media(), eb);
+    const oc_model *ma = oc_client_model(a), *mb = oc_client_model(b);
+    oc_call_stats sa, sb;
+
+    __atomic_store_n(&g_tap.block, 1, __ATOMIC_RELEASE);
+    oc_client_call_start(a, 1, NULL, 0);
+    CHECK(CALL_WAIT(3000, ma->in_call && ma->call.channel_id == 1));
+    oc_client_call_join(b, 1);
+    CHECK(CALL_WAIT(3000, mb->in_call && mb->call.n_parts == 2 && ma->call.n_parts == 2));
+    CHECK(CALL_WAIT(8000, (oc_call_engine_stats(ea, &sa), oc_call_engine_stats(eb, &sb),
+                           sa.transport == 1 && sb.transport == 1)));
+    /* As clear as over UDP: the level it was sent at, less what Opus and the
+     * limiter take, which frames lost to the connection would not reach. */
+    CHECK(CALL_WAIT(8000, heard(&ta, 1) > 4800 && heard(&tb, 0) > 4800));
+    printf("  UDP blocked: both by the connection; dana hears 660 Hz at %.0f, erik 440 Hz at %.0f\n",
+           heard(&ta, 1), heard(&tb, 0));
+    CHECK(heard(&ta, 0) < 300 && heard(&tb, 1) < 300);
+    oc_call_engine_stats(ea, &sa);
+    CHECK(sa.n_peers == 1 && sa.peers[0].lost == 0 && sa.peers[0].late == 0);
+    if (sa.n_peers) printf("  by the connection, dana from erik: %u packets, %u lost, %u late, jitter target %d ms\n",
+                           sa.peers[0].packets, sa.peers[0].lost, sa.peers[0].late, sa.target_ms);
+
+    __atomic_store_n(&g_tap.block, 0, __ATOMIC_RELEASE);
+    CHECK(CALL_WAIT(4000, (oc_call_engine_stats(ea, &sa), oc_call_engine_stats(eb, &sb),
+                           sa.transport == 0 && sb.transport == 0)));
+    CHECK(CALL_WAIT(6000, heard(&ta, 1) > 4800 && heard(&tb, 0) > 4800));
+    printf("  UDP back: both on it again; dana hears 660 Hz at %.0f, erik 440 Hz at %.0f\n",
+           heard(&ta, 1), heard(&tb, 0));
+
+    oc_client_call_leave(b, 1);
+    oc_client_call_leave(a, 1);
+    CHECK(CALL_WAIT(3000, !ma->in_call && !mb->in_call));
+    oc_client_set_call_media(a, NULL, NULL);
+    oc_client_set_call_media(b, NULL, NULL);
+    oc_call_engine_free(ea);
+    oc_call_engine_free(eb);
+}
+
+/* A TCP forwarder in front of the daemon, for one client: what passes through
+ * it can be cut, as a front door's failover or a network change cuts a
+ * connection, while the daemon and every other client go on. */
+#define PROXY_PAIRS 8
+static struct {
+    int lfd, port, daemon_port;
+    struct { int c, d; } pr[PROXY_PAIRS];
+    int n;
+    volatile int cut, stop;
+} g_px;
+static pthread_t g_px_th;
+
+static void *proxy_thread(void *arg) {
+    (void)arg;
+    uint8_t buf[16384];
+    while (!__atomic_load_n(&g_px.stop, __ATOMIC_ACQUIRE)) {
+        if (__atomic_exchange_n(&g_px.cut, 0, __ATOMIC_ACQ_REL)) {
+            for (int i = 0; i < g_px.n; i++) { close(g_px.pr[i].c); close(g_px.pr[i].d); }
+            g_px.n = 0;
+        }
+        struct pollfd pf[1 + 2 * PROXY_PAIRS];
+        pf[0].fd = g_px.lfd; pf[0].events = POLLIN; pf[0].revents = 0;
+        int n = g_px.n;
+        for (int i = 0; i < n; i++) {
+            pf[1 + 2 * i] = (struct pollfd){ g_px.pr[i].c, POLLIN, 0 };
+            pf[2 + 2 * i] = (struct pollfd){ g_px.pr[i].d, POLLIN, 0 };
+        }
+        if (poll(pf, (nfds_t)(1 + 2 * n), 50) <= 0) continue;
+        int dead[PROXY_PAIRS] = { 0 };
+        for (int i = 0; i < n; i++)
+            for (int side = 0; side < 2; side++) {
+                if (!(pf[1 + 2 * i + side].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+                int from = side ? g_px.pr[i].d : g_px.pr[i].c, to = side ? g_px.pr[i].c : g_px.pr[i].d;
+                ssize_t r = recv(from, buf, sizeof buf, MSG_DONTWAIT);
+                if (r <= 0) { dead[i] = 1; continue; }
+                for (ssize_t off = 0; off < r; ) {
+                    ssize_t w = send(to, buf + off, (size_t)(r - off), MSG_NOSIGNAL);
+                    if (w <= 0) { dead[i] = 1; break; }
+                    off += w;
+                }
+            }
+        for (int i = n - 1; i >= 0; i--)
+            if (dead[i]) { close(g_px.pr[i].c); close(g_px.pr[i].d); g_px.pr[i] = g_px.pr[--g_px.n]; }
+        if ((pf[0].revents & POLLIN) && g_px.n < PROXY_PAIRS) {
+            int c = accept(g_px.lfd, NULL, NULL);
+            if (c < 0) continue;
+            int d = socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+            sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            sa.sin_port = htons((uint16_t)g_px.daemon_port);
+            if (d < 0 || connect(d, (struct sockaddr *)&sa, sizeof sa) != 0) { close(c); if (d >= 0) close(d); continue; }
+            g_px.pr[g_px.n].c = c; g_px.pr[g_px.n].d = d; g_px.n++;
+        }
+    }
+    for (int i = 0; i < g_px.n; i++) { close(g_px.pr[i].c); close(g_px.pr[i].d); }
+    return NULL;
+}
+
+static int proxy_start(int daemon_port) {
+    memset(&g_px, 0, sizeof g_px);
+    g_px.daemon_port = daemon_port;
+    g_px.lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof sa;
+    if (g_px.lfd < 0 || bind(g_px.lfd, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(g_px.lfd, 8) != 0 ||
+        getsockname(g_px.lfd, (struct sockaddr *)&sa, &sl) != 0) return -1;
+    g_px.port = ntohs(sa.sin_port);
+    return pthread_create(&g_px_th, NULL, proxy_thread, NULL) == 0 ? g_px.port : -1;
+}
+
+static void proxy_stop(void) {
+    __atomic_store_n(&g_px.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(g_px_th, NULL);
+    close(g_px.lfd);
+}
+
+/* Whether `uid` is marked away in the call `m` is in: 1, 0, or -1 if not in it. */
+static int away_in(const oc_model *m, uint64_t uid) {
+    for (int i = 0; i < m->call.n_parts; i++) if (m->call.parts[i] == uid) return m->call.away[i] != 0;
+    return -1;
+}
+
+/* A call survives what moves under it (REQ-152, PROTOCOL.md §5.17): faye's
+ * connection is cut mid-call, and she is back in the same call by herself --
+ * her seat held meanwhile, dana's roster never dropping her -- and they hear
+ * each other again; then everyone's UDP path moves, as a NAT rebinding or a
+ * front door's failover moves it, and each engine reports its path lost and
+ * rejoins for a fresh token, and they hear each other over UDP again, not
+ * left on the connection. */
+static void test_calls_rejoin(oc_client *a, oc_client *b, int port) {
+    int pport = proxy_start(port);
+    CHECK(pport > 0);
+    if (pport <= 0) return;
+    tone_io ta = { 440, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    tone_io tc = { 880, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    oc_call_engine_opts oa = { NULL, NULL, 0, tone_source, tone_sink, &ta };
+    oc_call_engine_opts occ = { NULL, NULL, 0, tone_source, tone_sink, &tc };
+    /* A lost path is reported after 0.8 s of quiet rather than twelve. */
+    setenv("OPENCHIME_DEV_CALL_TIMERS", "probe:200,udp_wait:600,udp_lost:800,tcp_probe:800", 1);
+    oc_call_engine *ea = oc_call_engine_new(&oa), *ec = oc_call_engine_new(&occ);
+    unsetenv("OPENCHIME_DEV_CALL_TIMERS");
+    oc_client *c = start_as(NULL, "127.0.0.1", pport, "faye:pw-faye", NULL, NULL, 1, NULL);
+    CHECK(c != NULL);
+    if (!c) { oc_call_engine_free(ea); oc_call_engine_free(ec); proxy_stop(); return; }
+    oc_client_set_call_media(a, oc_call_engine_media(), ea);
+    oc_client_set_call_media(c, oc_call_engine_media(), ec);
+    CHECK(WAIT_FOR(c, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+    const oc_model *ma = oc_client_model(a), *mc = oc_client_model(c);
+    oc_call_stats sa, sc;
+
+    oc_client_call_start(a, 1, NULL, 0);
+    CHECK(CALL_WAIT(3000, ma->in_call && ma->call.channel_id == 1));
+    uint64_t call_id = ma->call.call_id;
+    /* dana talks alone -- nothing comes back but the relay's answers to her
+     * keep-alives -- for twice the lost-path time: her path is not lost, and
+     * she stays put, on UDP. */
+    { uint32_t b0 = ma->call_back_seq;
+      CALL_WAIT(1700, 0);
+      oc_call_engine_stats(ea, &sa);
+      CHECK(ma->in_call && ma->call_back_seq == b0 && !ma->call_rejoining && sa.transport == 0); }
+    oc_client_call_join(c, 1);
+    CHECK(CALL_WAIT(3000, mc->in_call && ma->call.n_parts == 2));
+    CHECK(CALL_WAIT(8000, heard(&ta, 2) > 1500 && heard(&tc, 0) > 1500));
+
+    /* faye's connection is cut: she is getting back in, and dana's roster still
+     * has her -- the seat is held. dana, still connected, goes nowhere. */
+    uint32_t back = mc->call_back_seq, epoch = ma->call.epoch, back_a0 = ma->call_back_seq;
+    __atomic_store_n(&g_px.cut, 1, __ATOMIC_RELEASE);
+    CHECK(CALL_WAIT(3000, mc->call_rejoining == 1 && !mc->in_call));
+    /* ...and dana sees her marked as away, not gone. */
+    CHECK(CALL_WAIT(3000, ma->call.n_parts == 2 && away_in(ma, mc->user_id) == 1));
+    oc_client_reconnect(c);
+    CHECK(CALL_WAIT(8000, mc->in_call && mc->call_back_seq == back + 1));
+    CHECK(mc->call.call_id == call_id && mc->call_rejoining == 0 && mc->call_lost_seq == 0);
+    CHECK(ma->call.n_parts == 2 && ma->call.epoch > epoch);
+    CHECK(CALL_WAIT(3000, away_in(ma, mc->user_id) == 0));   /* back: not away */
+    CHECK(ma->call_back_seq == back_a0);
+    /* Heard since: faye's engine started afresh on the rejoin, so what it
+     * counts from dana arrived after it. */
+    CHECK(CALL_WAIT(8000, (oc_call_engine_stats(ec, &sc), sc.n_peers == 1 && sc.peers[0].keyed &&
+                           sc.peers[0].packets > 25) && heard(&ta, 2) > 1500 && heard(&tc, 0) > 1500));
+    printf("  faye's connection cut: back in the same call; dana hears 880 Hz at %.0f, faye 440 Hz at %.0f\n",
+           heard(&ta, 2), heard(&tc, 0));
+
+    /* Everyone's path moves. Both rejoin -- a new epoch each -- and are heard by
+     * UDP again from the new addresses. */
+    uint32_t back_a = ma->call_back_seq, back_c = mc->call_back_seq;
+    epoch = ma->call.epoch;
+    __atomic_store_n(&g_tap.rebind, 1, __ATOMIC_RELEASE);
+    CHECK(CALL_WAIT(10000, ma->call_back_seq > back_a && mc->call_back_seq > back_c &&
+                           ma->in_call && mc->in_call && ma->call.n_parts == 2));
+    CHECK(ma->call.call_id == call_id && ma->call.epoch > epoch);
+    CHECK(CALL_WAIT(6000, (oc_call_engine_stats(ea, &sa), oc_call_engine_stats(ec, &sc),
+                           sa.transport == 0 && sc.transport == 0)));
+    CHECK(CALL_WAIT(8000, (oc_call_engine_stats(ea, &sa), oc_call_engine_stats(ec, &sc),
+                           sa.n_peers == 1 && sa.peers[0].packets > 25 && sc.n_peers == 1 && sc.peers[0].packets > 25) &&
+                          heard(&ta, 2) > 1500 && heard(&tc, 0) > 1500));
+    printf("  every path moved: both rejoined, by UDP; dana hears 880 Hz at %.0f, faye 440 Hz at %.0f\n",
+           heard(&ta, 2), heard(&tc, 0));
+    CHECK(ma->call_lost_seq == 0 && mc->call_lost_seq == 0);
+
+    oc_client_call_leave(c, 1);
+    oc_client_call_leave(a, 1);
+    CHECK(CALL_WAIT(3000, !ma->in_call && !mc->in_call));
+    oc_client_set_call_media(a, NULL, NULL);
+    oc_client_set_call_media(c, NULL, NULL);
+    oc_client_stop(c);
+    oc_call_engine_free(ea);
+    oc_call_engine_free(ec);
+    proxy_stop();
+}
+
+/* The device key (ARCH-113): made once and kept beside the token, the same one
+ * read back, a version 2 entry upgraded in place, and forgotten with the
+ * session. */
+static void test_device_key(void) {
+    mock_reset();
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open("ignored");
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &sec);
+    uint8_t sk[32], pk[32], sk2[32], pk2[32], pkc[32];
+    CHECK(oc_store_device_key(s, "acme:443", sk, pk) == 1);
+    CHECK(oc_x25519_public(sk, pkc) == 0 && memcmp(pkc, pk, 32) == 0);
+    CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1);
+    CHECK(memcmp(sk, sk2, 32) == 0 && memcmp(pk, pk2, 32) == 0);
+    CHECK(mock_ver_of("acme:443") == 4);
+
+    /* The people of private DMs (PRIVATE-DM.md §5): the first key is remembered,
+     * the same is known, a different one is reported and changes nothing until
+     * accepted; sixteen are kept, the oldest dropped; a logout forgets them. */
+    uint8_t f1[OC_STORE_PEER_FP], f2[OC_STORE_PEER_FP];
+    memset(f1, 1, sizeof f1); memset(f2, 2, sizeof f2);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, f1) == 0);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, f1) == 1);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, f2) == 2);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, f1) == 1);
+    oc_store_peer_accept(s, "acme:443", 77, f2);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, f2) == 1);
+    for (uint64_t u = 100; u < 116; u++) oc_store_peer_accept(s, "acme:443", u, f1);
+    CHECK(oc_store_peer_check(s, "acme:443", 100, f1) == 1);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, f2) == 0);     /* the oldest went: first again */
+    CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1 && memcmp(sk, sk2, 32) == 0);   /* untouched */
+    CHECK(oc_store_peer_check(NULL, "acme:443", 77, f1) == -1);
+    /* Another workspace, another key. */
+    CHECK(oc_store_device_key(s, "other:443", sk2, pk2) == 1 && memcmp(pk, pk2, 32) != 0);
+    /* Signing out forgets it: the next one is new. */
+    uint8_t tok[OC_SESSION_TOKEN_LEN] = { 1 };
+    oc_store_save_session(s, "acme:443", tok, 0, "dana");
+    oc_store_clear_session(s, "acme:443");
+    CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1 && memcmp(pk, pk2, 32) != 0);
+    CHECK(oc_store_peer_check(s, "acme:443", 100, f2) == 0);   /* and the peers went with the account */
+    /* No credential store: a key for this session only. */
+    oc_store *none = oc_store_open("ignored");
+    CHECK(oc_store_device_key(none, "acme:443", sk2, pk2) == 0);
+    oc_store_close(none);
+    oc_store_close(s);
+}
+
+/* ---- a browser sign-in, end to end (AUTH.md §8.1, §8.2) ---------------------
+ * A real daemon with the relay source on, the real client core, and a "browser"
+ * played here: it reads the URL the daemon built, mints the token central would —
+ * carrying the URL's nonce — and delivers it to the client's loopback address. */
+
+/* The name the daemon's TLS layer was given by the last client to connect. */
+static char g_daemon_saw_sni[256];
+static int daemon_sni_cb(void *ctx, mbedtls_ssl_context *ssl, const unsigned char *name, size_t len) {
+    (void)ctx; (void)ssl;
+    if (len >= sizeof g_daemon_saw_sni) len = sizeof g_daemon_saw_sni - 1;
+    memcpy(g_daemon_saw_sni, name, len);
+    g_daemon_saw_sni[len] = '\0';
+    return 0;
+}
+
+static void count_book_cb(void *ctx, const char *workspace, const char *label,
+                          const char *username, uint64_t last) {
+    (void)workspace; (void)label; (void)username; (void)last;
+    (*(int *)ctx)++;
+}
+
+/* The page the client's listener last answered the browser with, whole. */
+static char g_browser_page[4096];
+
+/* GET `url_path_and_query` from 127.0.0.1:port, reading the answer to its close
+ * into g_browser_page; returns the status code. The listener answers once the
+ * daemon has, so this waits that long. */
+static int browser_get(int port, const char *target) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons((uint16_t)port);
+    struct timeval to = { 20, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof to);
+    int status = 0;
+    size_t got = 0;
+    g_browser_page[0] = '\0';
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) == 0) {
+        char req[9000];
+        int n = snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", target);
+        ssize_t w = write(fd, req, (size_t)n); (void)w;
+        ssize_t r;
+        while (got < sizeof g_browser_page - 1 &&
+               (r = read(fd, g_browser_page + got, sizeof g_browser_page - 1 - got)) > 0)
+            got += (size_t)r;
+        g_browser_page[got] = '\0';
+        if (got > 12) status = atoi(g_browser_page + 9);
+    }
+    close(fd);
+    return status;
+}
+
+/* Play the browser and central for one waiting sign-in. `email_verified_tenant`
+ * is spliced into the token. 0 once the client's listener has answered 200. */
+static int browser_complete(const oc_model *m, oc_issuer *is, const char *sub, const char *jti,
+                            const char *extra, const char *nonce_override) {
+    const char *q = strchr(m->signin_url, '?');
+    if (!q) return -1;
+    char redirect[256], nonce[64], aud[128];
+    if (oc_query_get(q + 1, "redirect_uri", redirect, sizeof redirect) != 1 ||
+        oc_query_get(q + 1, "nonce", nonce, sizeof nonce) != 1 ||
+        oc_query_get(q + 1, "workspace", aud, sizeof aud) != 1) return -1;
+    if (strncmp(redirect, "http://127.0.0.1:", 17) != 0) return -1;
+    int port = atoi(redirect + 17);
+    const char *path = strchr(redirect + 17, '/');
+    if (!path) return -1;
+
+    char hdr[160], payload[1024], token[4096], target[4400];
+    unsigned long long now = (unsigned long long)time(NULL);
+    oc_issuer_header(is, hdr, sizeof hdr);
+    snprintf(payload, sizeof payload,
+             "{\"iss\":\"https://central.example\",\"aud\":\"%s\",\"sub\":\"%s\",\"jti\":\"%s\","
+             "\"nonce\":\"%s\",\"iat\":%llu,\"nbf\":%llu,\"exp\":%llu,%s}",
+             aud, sub, jti, nonce_override ? nonce_override : nonce, now - 5, now - 5, now + 290, extra);
+    oc_issuer_mint(is, hdr, payload, token);
+    snprintf(target, sizeof target, "%s?token=%s", path, token);
+    return browser_get(port, target) == 200 ? 0 : -1;
+}
+
+/* A channel list too large for one frame, AND longer than one frame may carry
+ * (OC_CHANNEL_LIST_PAGE): 300 channels, each with a full-length topic, run to
+ * about 110 KB against a 65 KiB frame. It used to go out as a single frame whose
+ * failed encode left no length, desynchronising the client on connect; and a
+ * client kept the first 256 entries of any frame and dropped the rest without a
+ * word. Every channel has to arrive, and the one past the first page with its
+ * topic whole. */
+/* The daemon's read cursor for `uid` in `channel` (delivery_cursors), read
+ * from the live test's database; 0 when there is none yet. */
+static uint64_t db_cursor(uint64_t uid, uint64_t channel) {
+    sqlite3 *db = NULL;
+    uint64_t v = 0;
+    if (sqlite3_open_v2(tpath("itest_core.db"), &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT message_id FROM delivery_cursors WHERE user_id=?1 AND channel_id=?2;",
+                               -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)channel);
+            if (sqlite3_step(st) == SQLITE_ROW) v = (uint64_t)sqlite3_column_int64(st, 0);
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return v;
+}
+
+static oc_dbres *seed_result(oc_dbwriter *w) {
+    oc_dbres *r = NULL;
+    WAIT_UNTIL((r = oc_dbwriter_next_result(w)) != NULL, 2000);
+    return r;
+}
+
+static size_t big_channels(const oc_model *m) {
+    size_t n = 0;
+    for (size_t i = 0; i < m->n_channels; i++)
+        if (m->channels[i].name && strncmp(m->channels[i].name, "big-", 4) == 0) n++;
+    return n;
+}
+
+static void test_big_channel_list(void) {
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    unlink_db(tpath("test_core_biglist.db"));
+    oc_dbwriter *dbw = oc_dbwriter_start(tpath("test_core_biglist.db"));
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
+    CHECK(dbw != NULL);
+    if (!dbw) { oc_tls_server_free(&srv); return; }
+    uint64_t uid = oc_dbwriter_register_local(dbw, "hana", "pw-hana", OC_ROLE_OWNER, 2048);
+    CHECK(uid != 0);
+
+    /* Seeded BEFORE the loop runs: once it does, it drains the writer's results,
+     * and these would be answered to a connection that does not exist. */
+    char topic[OC_MAX_TOPIC + 1];
+    memset(topic, 'T', OC_MAX_TOPIC); topic[OC_MAX_TOPIC] = '\0';
+    int made = 0;
+    for (int i = 0; i < 300; i++) {
+        char nm[32]; snprintf(nm, sizeof nm, "big-%03d", i);
+        oc_job *j = oc_job_new(OC_JOB_CREATE_CHANNEL, 1);
+        j->user_id = uid; j->ch_is_public = 1; j->ch_name = strdup(nm);
+        oc_dbwriter_submit(dbw, j);
+        oc_dbres *r = seed_result(dbw);
+        uint64_t cid = (r && r->type == OC_RES_CHANNEL_INFO) ? r->channel_id : 0;
+        oc_dbres_free(r);
+        if (!cid) continue;
+        j = oc_job_new(OC_JOB_UPDATE_CHANNEL, 1);
+        j->user_id = uid; j->channel_id = cid; j->chup_op = OC_CHUP_TOPIC;
+        j->ch_name = strdup(topic);
+        oc_dbwriter_submit(dbw, j);
+        oc_dbres_free(seed_result(dbw));
+        made++;
+    }
+    CHECK(made == 300);
+
+    struct core_loop_arg arg;
+    arg.port = 0; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+    pthread_t th;
+    CHECK(core_loop_start(&arg, &th) == 0);
+
+    oc_client *c = start_as(NULL, "127.0.0.1", arg.port, "hana:pw-hana", NULL, NULL, 1, NULL);
+    CHECK(c != NULL);
+    if (c) {
+        /* Still connected, and every one of them there -- not 256, and not a
+         * connection lost halfway through the list. */
+        CHECK(WAIT_FOR(c, m->authed && big_channels(m) == 300));
+        const oc_model *m = oc_client_model(c);
+        CHECK(big_channels(m) == 300);
+        CHECK(m->authed);
+        const oc_channel *last = NULL;
+        for (size_t i = 0; i < m->n_channels; i++)
+            if (m->channels[i].name && strcmp(m->channels[i].name, "big-299") == 0)
+                last = &m->channels[i];
+        CHECK(last && last->topic && strlen(last->topic) == OC_MAX_TOPIC);
+        oc_client_stop(c);
+    }
+
+    __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(th, NULL);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    unlink_db(tpath("test_core_biglist.db"));
+}
+
+/* The published fingerprint is CHECKED (ARCH-10). Trust-on-first-use trusts
+ * whatever answers the first connection; a workspace that publishes its
+ * certificate in `.well-known` is stating which one is its own, and the point of
+ * publishing it is that the first connection is refused when it does not match.
+ * Both directions are asserted here, against a real daemon with a real
+ * self-signed certificate: the right fingerprint connects, the wrong one does
+ * not and says why. */
+static void fp_hex(const uint8_t *b, size_t n, char *out, size_t cap) {
+    size_t at = 0;
+    /* at + 2 chars + the NUL: `at + 3 < cap` drops the last byte and yields 62
+     * hex digits, which is not a fingerprint and is refused -- as it should be. */
+    for (size_t i = 0; i < n && at + 3 <= cap; i++)
+        at += (size_t)snprintf(out + at, cap - at, "%02x", b[i]);
+}
+
+/* A LAN address of this machine: the daemon is reached off loopback, where
+ * loopback's exemption does not apply (ARCH-10). "" if it has none. */
+static void lan_address(char *out, size_t cap) {
+    out[0] = '\0';
+    struct ifaddrs *ifs = NULL;
+    if (getifaddrs(&ifs) != 0) return;
+    for (struct ifaddrs *i = ifs; i && !out[0]; i = i->ifa_next)
+        if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET && (i->ifa_flags & IFF_UP) && !(i->ifa_flags & IFF_LOOPBACK))
+            inet_ntop(AF_INET, &((struct sockaddr_in *)i->ifa_addr)->sin_addr, out, (socklen_t)cap);
+    freeifaddrs(ifs);
+}
+
+/* Trust instead of pinning (ARCH-10): a certificate a trusted root vouches for
+ * under the workspace's name is taken as it is; one nobody vouches for is shown
+ * to the person -- its fingerprint -- and taken only once they say so, and
+ * then only that certificate; a CA-issued certificate replaces a trust the
+ * person gave, which is forgotten. Reached at this machine's LAN address, where
+ * loopback's exemption does not apply. */
+/* `der` is the certificate whose SHA-256 is `fp_hex`. */
+static int der_is(const uint8_t *der, size_t len, const char *want) {
+    unsigned char h[32]; char hex[65];
+    if (!len || mbedtls_sha256(der, len, h, 0) != 0) return 0;
+    fp_hex(h, sizeof h, hex, sizeof hex);
+    return strcmp(hex, want) == 0;
+}
+
+static void test_cert_trust(void) {
+    {   /* A fingerprint as it is shown: upper case, colons, 16 bytes a line. */
+        char out[128];
+        CHECK(oc_fingerprint_format("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff", 16,
+                                    out, sizeof out) == 0);
+        CHECK(!strcmp(out, "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\n"
+                           "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"));
+        CHECK(oc_fingerprint_format("not hex", 16, out, sizeof out) == -1);
+    }
+    char lan[64];
+    lan_address(lan, sizeof lan);
+    if (!lan[0]) { SKIP("no LAN address: the certificate-trust checks cannot run"); return; }
+    testpki pki;
+    CHECK(testpki_init(&pki) == 0);
+    FILE *f = fopen(tpath("test_core_root.pem"), "w");
+    if (f) { fputs(pki.pem, f); fclose(f); }
+
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    unlink_db(tpath("test_core_trust.db"));
+    oc_dbwriter *dbw = oc_dbwriter_start(tpath("test_core_trust.db"));
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
+    CHECK(dbw != NULL);
+    if (!dbw) { oc_tls_server_free(&srv); return; }
+    CHECK(oc_dbwriter_register_local(dbw, "iris", "pw-iris", OC_ROLE_OWNER, 2048) != 0);
+    struct core_loop_arg arg;
+    arg.port = 0; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+    pthread_t th;
+    CHECK(core_loop_start(&arg, &th) == 0);
+    /* After the daemon is up: its configuration, loaded as it starts, sets the
+     * extra roots from its environment -- none, here. */
+    CHECK(oc_tls_set_extra_ca(tpath("test_core_root.pem")) == 0);
+    mock_reset();
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    uint8_t real[OC_TLS_FINGERPRINT_LEN]; char real_hex[65];
+    CHECK(oc_tls_server_fingerprint(&srv, real) == 0);
+    fp_hex(real, sizeof real, real_hex, sizeof real_hex);
+
+    /* Self-signed, off loopback: shown, not talked to -- its fingerprint the
+     * one the daemon has. */
+    oc_client *c = start_as(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec, 1, NULL);
+    CHECK(c != NULL);
+    if (!c) goto out;
+    CHECK(WAIT_FOR(c, m->cert_seq > 0));
+    CHECK(!strcmp(oc_client_model(c)->cert_fp, real_hex) && !oc_client_model(c)->cert_changed);
+    CHECK(der_is(oc_client_model(c)->cert_der, oc_client_model(c)->cert_der_len, real_hex));
+    CHECK(!oc_client_model(c)->authed);
+    /* Not answered, and retried: asked again -- the way back for someone who
+     * declined -- and still not talked to. */
+    {
+        uint32_t asked = oc_client_model(c)->cert_seq;
+        oc_client_reconnect(c);
+        CHECK(WAIT_FOR(c, m->cert_seq > asked));
+        CHECK(!oc_client_model(c)->authed);
+    }
+    /* The person trusts it: in, and it is kept for next time. */
+    CHECK(oc_client_trust_cert(c, oc_client_model(c)->cert_fp) == 0);
+    CHECK(WAIT_FOR(c, m->authed));
+    oc_client_stop(c);
+    c = start_as(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec, 1, NULL);
+    CHECK(c && WAIT_FOR(c, m->authed) && oc_client_model(c)->cert_seq == 0);   /* no question asked */
+    if (c) oc_client_stop(c);
+
+    /* The daemon's certificate is replaced by another self-signed one: that is
+     * a change, shown as one, and not taken on the old trust. */
+    char chain[8192], key[2048];
+    CHECK(testpki_leaf(&pki, "anything.test", 1, chain, sizeof chain, key, sizeof key) == 0);
+    CHECK(oc_tls_server_use(&srv, chain, strlen(chain), key, strlen(key)) == 0);
+    c = start_as(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec, 1, NULL);
+    CHECK(c && WAIT_FOR(c, m->cert_seq > 0) && oc_client_model(c)->cert_changed && !oc_client_model(c)->authed);
+    if (c) oc_client_stop(c);
+
+    /* A certificate the root vouches for, for the name the workspace is: taken
+     * as it is, and the person's old trust is forgotten. */
+    CHECK(testpki_leaf(&pki, "trust.openchime.test", 0, chain, sizeof chain, key, sizeof key) == 0);
+    CHECK(oc_tls_server_use(&srv, chain, strlen(chain), key, strlen(key)) == 0);
+    c = start_as(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec, 1, NULL);   /* key: the address */
+    CHECK(c && WAIT_FOR(c, m->cert_seq > 0) && !oc_client_model(c)->authed);        /* ...which it does not name */
+    if (c) oc_client_stop(c);
+    c = start_as("trust.openchime.test", lan, arg.port, "iris:pw-iris", "ignored", &sec, 1, NULL);
+    CHECK(c && WAIT_FOR(c, m->authed) && oc_client_model(c)->cert_seq == 0);
+    if (c) oc_client_stop(c);
+    {
+        oc_store *chk = oc_store_open("ignored");
+        uint8_t pin[OC_TLS_FINGERPRINT_LEN];
+        if (chk) {
+            oc_store_set_secret(chk, &sec);
+            oc_store_save_pin(chk, "trust.openchime.test", real);            /* an old trust... */
+            oc_store_close(chk);
+        }
+        c = start_as("trust.openchime.test", lan, arg.port, "iris:pw-iris", "ignored", &sec, 1, NULL);
+        CHECK(c && WAIT_FOR(c, m->authed));
+        if (c) oc_client_stop(c);
+        chk = oc_store_open("ignored");
+        if (chk) {
+            oc_store_set_secret(chk, &sec);
+            CHECK(oc_store_load_pin(chk, "trust.openchime.test", pin) == 0);  /* ...forgotten */
+            oc_store_close(chk);
+        }
+    }
+    /* Central re-keys the certificate -- a renewal, a rename -- under a client
+     * that is connected, and that once trusted another: a new key for the same
+     * name, on a box restarted with it, so no session resumes and the client
+     * sees the new certificate whole. It comes back, and nobody is asked
+     * anything, because the chain vouches for it and no pin is consulted. */
+    {
+        oc_store *chk = oc_store_open("ignored");
+        if (chk) {
+            oc_store_set_secret(chk, &sec);
+            oc_store_save_pin(chk, "trust.openchime.test", real);            /* a stale trust */
+            oc_store_close(chk);
+        }
+        c = start_as("trust.openchime.test", lan, arg.port, "iris:pw-iris", "ignored", &sec, 1, NULL);
+        CHECK(c && WAIT_FOR(c, m->authed && m->connected));
+        uint8_t before[OC_TLS_FINGERPRINT_LEN], after[OC_TLS_FINGERPRINT_LEN];
+        CHECK(oc_tls_server_fingerprint(&srv, before) == 0);
+        __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+        pthread_join(th, NULL);
+        CHECK(c && WAIT_FOR(c, !m->connected));
+        oc_tls_server_free(&srv);
+        CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+        CHECK(testpki_leaf(&pki, "trust.openchime.test", 0, chain, sizeof chain, key, sizeof key) == 0);
+        CHECK(oc_tls_server_use(&srv, chain, strlen(chain), key, strlen(key)) == 0);
+        CHECK(oc_tls_server_fingerprint(&srv, after) == 0 && memcmp(before, after, sizeof after) != 0);
+        arg.stop = 0;
+        CHECK(core_loop_start(&arg, &th) == 0);
+        CHECK(oc_tls_set_extra_ca(tpath("test_core_root.pem")) == 0);   /* after the daemon's config, as above */
+        if (c) oc_client_reconnect(c);
+        CHECK(c && WAIT_FOR(c, m->connected && m->authed));
+        CHECK(c && oc_client_model(c)->cert_seq == 0);
+        CHECK(__atomic_load_n(&srv.resumed, __ATOMIC_RELAXED) == 0);   /* a full handshake, on the new key */
+        if (c) oc_client_stop(c);
+    }
+    /* The probe judges the same way, before anyone is asked anything. */
+    {
+        oc_signin_source src[4];
+        static oc_cert_seen seen;
+        CHECK(oc_net_probe_ex("trust.openchime.test", lan, arg.port, NULL, src, 4, &seen) >= 0);
+        CHECK(oc_net_probe_ex("other.openchime.test", lan, arg.port, NULL, src, 4, &seen) == OC_PROBE_UNTRUSTED);
+        CHECK(der_is(seen.der, seen.der_len, seen.fp_hex));     /* the certificate itself, to show */
+    }
+
+out:
+    __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(th, NULL);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    oc_tls_set_extra_ca(NULL);
+    testpki_free(&pki);
+    unlink(tpath("test_core_root.pem"));
+    unlink_db(tpath("test_core_trust.db"));
+    mock_reset();
+}
+
+static void test_published_fingerprint(void) {
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    unlink_db(tpath("test_core_fp.db"));
+    oc_dbwriter *dbw = oc_dbwriter_start(tpath("test_core_fp.db"));
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
+    CHECK(dbw != NULL);
+    if (!dbw) { oc_tls_server_free(&srv); return; }
+    CHECK(oc_dbwriter_register_local(dbw, "iris", "pw-iris", OC_ROLE_OWNER, 2048) != 0);
+
+    uint8_t real[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv, real) == 0);
+    char right[2 * OC_TLS_FINGERPRINT_LEN + 1];
+    fp_hex(real, sizeof real, right, sizeof right);
+    uint8_t other[OC_TLS_FINGERPRINT_LEN];
+    memcpy(other, real, sizeof other);
+    other[0] ^= 0x01;                      /* one bit is a different certificate */
+    char wrong[2 * OC_TLS_FINGERPRINT_LEN + 1];
+    fp_hex(other, sizeof other, wrong, sizeof wrong);
+
+    struct core_loop_arg arg;
+    arg.port = 0; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+    pthread_t th;
+    CHECK(core_loop_start(&arg, &th) == 0);
+
+    /* The certificate the workspace published: in, and pinned. */
+    {
+        oc_client *c = start_as("fp-right.openchime.test", "127.0.0.1", arg.port, "iris:pw-iris", "ignored", NULL, 1, right);
+        CHECK(c != NULL);
+        if (c) {
+            CHECK(WAIT_FOR(c, m->authed));
+            oc_client_stop(c);
+        }
+    }
+
+    /* One bit different: refused, and never authenticated. The store is a fresh
+     * key, so there is no pin -- this is the first connection, the one only
+     * the published fingerprint can check. */
+    {
+        oc_client *c = start_as("fp-wrong.openchime.test", "127.0.0.1", arg.port, "iris:pw-iris", "ignored", NULL, 1, wrong);
+        CHECK(c != NULL);
+        if (c) {
+            /* The refusal is what arrives; not signing in is then a fact, not
+             * a timeout sat out. */
+            CHECK(WAIT_FOR(c, strstr(m->last_error, "certificate") != NULL));
+            const oc_model *m = oc_client_model(c);
+            CHECK(!m->authed);
+            oc_client_stop(c);
+        }
+    }
+
+    /* Text that is not a fingerprint is no fingerprint, not a pin half-read: the
+     * connection proceeds on trust-on-first-use as it did before. */
+    {
+        oc_client *c = start_as("fp-junk.openchime.test", "127.0.0.1", arg.port, "iris:pw-iris", "ignored", NULL, 1, "not-a-fingerprint");
+        CHECK(c != NULL);
+        if (c) {
+            CHECK(WAIT_FOR(c, m->authed));
+            oc_client_stop(c);
+        }
+    }
+
+    __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(th, NULL);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    unlink_db(tpath("test_core_fp.db"));
+}
+
+/* --- local accounts in the browser (AUTH.md §8.10) --------------------------- */
+
+/* A browser: one HTTP/1.1 exchange at `url` -- https verified as a browser does
+ * (a trusted root, and the URL's name), or plain http to loopback -- sending
+ * `method`, the extra header lines `hdrs` and `body`. The status, and the whole
+ * response in `resp`. The daemon under test is on loopback whatever the name. */
+/* A browser that has been told to go on past its certificate warning -- for a
+ * daemon only a fingerprint vouches for. */
+static int g_web_insecure;
+
+static int web_fetch(const char *url, const char *method, const char *hdrs, const char *body,
+                     char *resp, size_t cap) {
+    resp[0] = '\0';
+    int https = strncmp(url, "https://", 8) == 0;
+    const char *auth = url + (https ? 8 : 7);
+    const char *path = strchr(auth, '/');
+    if (!path) return -1;
+    char authority[300], name[300];
+    snprintf(authority, sizeof authority, "%.*s", (int)(path - auth), auth);
+    snprintf(name, sizeof name, "%s", authority);
+    char *colon = strrchr(name, ':');
+    int port = https ? 443 : 80;
+    if (colon) { port = atoi(colon + 1); *colon = '\0'; }
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons((uint16_t)port);
+    struct timeval tv = { 10, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
+    char req[8192];
+    size_t bl = body ? strlen(body) : 0;
+    int n = snprintf(req, sizeof req, "%s %s HTTP/1.1\r\nHost: %s\r\n%sContent-Length: %zu\r\n"
+                     "Connection: close\r\n\r\n%s", method, path, authority, hdrs ? hdrs : "", bl, body ? body : "");
+    size_t got = 0;
+    int status = -1;
+    if (!https) {
+        if (write(fd, req, (size_t)n) == n) {
+            for (ssize_t r; got < cap - 1 && (r = read(fd, resp + got, cap - 1 - got)) > 0; ) got += (size_t)r;
+        }
+    } else {
+        static const char *alpn[] = { OC_ALPN_HTTP11, NULL };
+        oc_tls_client cli; oc_tls_conn conn;
+        if (oc_tls_client_init_verify(&cli, alpn) == 0) {
+            if (oc_tls_conn_init(&conn, &cli.conf, fd) == 0) {
+                oc_tls_conn_defer_verify(&conn);
+                oc_tls_conn_set_hostname(&conn, name);
+                oc_tls_status st;
+                while ((st = oc_tls_handshake(&conn)) == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) {}
+                /* What a browser insists on: a root it trusts vouches for this name. */
+                if (st == OC_TLS_OK && (g_web_insecure || oc_tls_conn_ca_trusted(&conn))) {
+                    size_t off = 0, w = 0;
+                    while (off < (size_t)n && oc_tls_write(&conn, req + off, (size_t)n - off, &w) != OC_TLS_ERROR) off += w;
+                    for (;;) {
+                        size_t r = 0;
+                        oc_tls_status rs = oc_tls_read(&conn, resp + got, cap - 1 - got, &r);
+                        got += r;
+                        if (rs == OC_TLS_WANT_READ || rs == OC_TLS_WANT_WRITE) continue;
+                        if (r == 0 || got >= cap - 1) break;
+                    }
+                }
+                oc_tls_conn_free(&conn);
+            }
+            oc_tls_client_free(&cli);
+        }
+    }
+    close(fd);
+    resp[got] = '\0';
+    if (strncmp(resp, "HTTP/1.1 ", 9) == 0) status = atoi(resp + 9);   /* contract: HTTP's status line */
+    return status;
+}
+
+/* Whether `page` shows `text` as a page escapes it (', ", <, >, &). */
+static int html_has_text(const char *page, const char *text) {
+    char esc[1024];
+    size_t o = 0;
+    for (const char *t = text; *t && o + 7 < sizeof esc; t++) {
+        const char *e = *t == '<' ? "&lt;" : *t == '>' ? "&gt;" : *t == '&' ? "&amp;"
+                      : *t == '"' ? "&quot;" : *t == '\'' ? "&#39;" : NULL;
+        if (e) { memcpy(esc + o, e, strlen(e)); o += strlen(e); } else esc[o++] = *t;
+    }
+    esc[o] = '\0';
+    return text[0] && strstr(page, esc) != NULL;
+}
+
+/* What the last web_person was answered: a form shown again carries why
+ * (data-oc-error), which is what a caller checks. */
+static char g_web_last[32768];
+
+/* Play the person in the browser for a waiting local sign-in: open the URL the
+ * client published -- one of the daemon's pages, which names itself -- post
+ * the form as the page does, from the page's own origin, and follow the answer
+ * to the client's callback. 0 when the callback says the person is signed in;
+ * else the status the post got (a form shown again is 200, its page in
+ * g_web_last). */
+static int web_person(const char *url, const char *page, const char *fields) {
+    char *resp = g_web_last;
+    const size_t rcap = sizeof g_web_last;
+    if (web_fetch(url, "GET", NULL, NULL, resp, rcap) != 200) return -1;
+    if (!oc_test_page_is(resp, "signin") && !oc_test_page_is(resp, "signup")) return -1;
+    const char *q = strchr(url, '?');
+    char redirect[256] = "", nonce[64] = "";
+    if (q && (oc_query_get(q + 1, "redirect_uri", redirect, sizeof redirect) != 1 ||
+              oc_query_get(q + 1, "nonce", nonce, sizeof nonce) != 1)) return -1;
+    /* The page's own URL, and its origin. */
+    char base[1024], origin[300], post[1200], hdrs[400];
+    snprintf(base, sizeof base, "%.*s", (int)(q ? (size_t)(q - url) : strlen(url)), url);
+    const char *auth = strstr(base, "://") + 3;
+    const char *slash = strchr(auth, '/');
+    snprintf(origin, sizeof origin, "%.*s", (int)(slash - base), base);
+    /* The form posts to the page's own relative action. */
+    char *last = strrchr(base, '/');
+    snprintf(post, sizeof post, "%.*s/%s", (int)(last - base), base, page);
+    snprintf(hdrs, sizeof hdrs, "Origin: %s\r\nContent-Type: application/x-www-form-urlencoded\r\n", origin);
+    char body[1024], er[512], en[128];
+    size_t eo = 0; er[0] = '\0';
+    for (const char *c = redirect; *c; c++) eo += (size_t)snprintf(er + eo, sizeof er - eo, isalnum((unsigned char)*c) ? "%c" : "%%%02X", (unsigned char)*c);
+    snprintf(en, sizeof en, "%s", nonce);
+    snprintf(body, sizeof body, "%s%sredirect_uri=%s&nonce=%s", fields, fields[0] ? "&" : "", er, en);
+    int st = web_fetch(post, "POST", hdrs, body, resp, rcap);
+    if (st != 303) return st;
+    const char *loc = strstr(resp, "\r\nLocation: ");   /* contract: HTTP's redirect header */
+    if (!loc) return -1;
+    loc += 12;
+    char cb[4096];
+    snprintf(cb, sizeof cb, "%.*s", (int)strcspn(loc, "\r\n"), loc);
+    /* The callback is the client's own page, answered once the daemon has. */
+    return web_fetch(cb, "GET", NULL, NULL, resp, rcap) == 200 && oc_test_page_result(resp, "signed-in") ? 0 : -1;
+}
+
+/* A daemon for local sign-in in the browser. */
+static oc_dbwriter *web_daemon(const char *db, uint8_t setup[OC_INVITE_TOKEN_LEN]) {
+    char f[128];
+    unlink(db);
+    snprintf(f, sizeof f, "%s-wal", db); unlink(f);
+    snprintf(f, sizeof f, "%s-shm", db); unlink(f);
+    oc_dbwriter *dbw = oc_dbwriter_start(db);
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
+    if (dbw && setup && oc_dbwriter_setup_invite(dbw, setup) != 1) { oc_dbwriter_stop(dbw); return NULL; }
+    if (dbw && !oc_dbwriter_register_local(dbw, "lia", "pw-lia", OC_ROLE_MEMBER, 2048)) {
+        oc_dbwriter_stop(dbw); return NULL;
+    }
+    return dbw;
+}
+
+/* End to end, both ways a browser reaches the pages. A daemon a trusted root
+ * vouches for is opened DIRECTLY, at its own https origin; one this client
+ * accepted another way (here, on loopback with its self-signed certificate) is
+ * opened through the client's loopback TUNNEL. Either way the person types the
+ * password into the page, and the client ends signed in with the ID token. */
+static void test_local_browser(void) {
+    /* --- the tunnel ---------------------------------------------------------- */
+    {
+        oc_tls_server srv;
+        CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+        uint8_t setup[OC_INVITE_TOKEN_LEN];
+        oc_dbwriter *dbw = web_daemon(tpath("test_core_web1.db"), setup);
+        CHECK(dbw != NULL);
+        if (!dbw) { oc_tls_server_free(&srv); return; }
+        struct core_loop_arg arg;
+        arg.port = 0; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+        pthread_t th;
+        CHECK(core_loop_start(&arg, &th) == 0);
+
+        /* The first owner signs up with the setup token, through the tunnel. */
+        char setup_hex[2 * OC_INVITE_TOKEN_LEN + 1];
+        for (size_t i = 0; i < sizeof setup; i++) snprintf(setup_hex + 2 * i, 3, "%02x", setup[i]);
+        oc_client *c = oc_client_start_signin(NULL, "127.0.0.1", arg.port, "", "local", setup_hex,
+                                              NULL, NULL, 1, NULL);
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        char url[2048];
+        snprintf(url, sizeof url, "%s", oc_client_model(c)->signin_url);
+        CHECK(strncmp(url, "http://127.0.0.1:", 17) == 0 && strstr(url, "/p/") && strstr(url, "/signin?"));
+        CHECK(strstr(url, setup_hex) != NULL);
+        {   /* The tunnel carries the pages, under its own Host, and nothing else. */
+            char resp[32768], other[2100];
+            const char *p = strstr(url + 7, "/");
+            snprintf(other, sizeof other, "%.*s/webhook/00", (int)(strstr(url, "/signin?") - url), url);
+            CHECK(web_fetch(other, "GET", NULL, NULL, resp, sizeof resp) == 404);
+            char foreign[2100];
+            snprintf(foreign, sizeof foreign, "http://evil.example:%d%s", atoi(url + 17), p);
+            CHECK(web_fetch(foreign, "GET", NULL, NULL, resp, sizeof resp) == 404);
+            /* A post from another site keeps its own Origin, which the daemon refuses. */
+            char post[2100];
+            snprintf(post, sizeof post, "%.*s/signin", (int)(strstr(url, "/signin?") - url), url);
+            CHECK(web_fetch(post, "POST", "Origin: https://evil.example\r\nContent-Type: application/x-www-form-urlencoded\r\n",
+                            "username=lia&password=pw-lia", resp, sizeof resp) == 403);
+        }
+        CHECK(web_person(url, "signup", "invite=&username=owen&password=lantern-orchard-copper&confirm=lantern-orchard-copper") == 200);
+        CHECK(oc_test_page_error(g_web_last, "invite-invalid"));   /* no invitation: the form, saying so */
+        char f2[256];
+        snprintf(f2, sizeof f2, "invite=%s&username=owen&password=lantern-orchard-copper&confirm=lantern-orchard-copper", setup_hex);
+        CHECK(web_person(url, "signup", f2) == 0);
+        CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
+        /* The password page, opened on its own through a tunnel of its own. */
+        char purl[1024];
+        CHECK(oc_client_open_page(c, "account/password", "username=owen", purl, sizeof purl) == 0);
+        CHECK(strncmp(purl, "http://127.0.0.1:", 17) == 0 && strstr(purl, "/account/password?username=owen"));
+        {
+            char resp[32768];
+            CHECK(web_fetch(purl, "GET", NULL, NULL, resp, sizeof resp) == 200);
+            CHECK(strstr(resp, "value=\"owen\"") != NULL);
+            /* And the recovery codes' copy script, which that page runs. */
+            char js[1100];
+            snprintf(js, sizeof js, "%.*s/codes.js", (int)(strstr(purl, "/account/password") - purl), purl);
+            CHECK(web_fetch(js, "GET", NULL, NULL, resp, sizeof resp) == 200);
+            CHECK(strstr(resp, "navigator.clipboard") != NULL);
+            /* And Show password's, which every password page runs (AUTH.md §2):
+             * without it the toggle stays hidden. */
+            snprintf(js, sizeof js, "%.*s/showpw.js", (int)(strstr(purl, "/account/password") - purl), purl);
+            CHECK(web_fetch(js, "GET", NULL, NULL, resp, sizeof resp) == 200);
+            CHECK(strstr(resp, "showpw") != NULL);
+        }
+        oc_client_stop(c);
+
+        /* Reset: the sign-in opens first on the page that sets the password,
+         * through this client's own tunnel, carrying the sign-in to go on to. */
+        char rtok[65];
+        memset(rtok, 'b', 64); rtok[64] = '\0';
+        c = oc_client_start_reset(NULL, "127.0.0.1", arg.port, rtok, NULL, NULL, 1, NULL);
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        snprintf(url, sizeof url, "%s", oc_client_model(c)->signin_url);
+        CHECK(strncmp(url, "http://127.0.0.1:", 17) == 0 && strstr(url, "/p/"));
+        CHECK(strstr(url, "/account/reset?t=") && strstr(url, rtok) && strstr(url, "&redirect_uri=") &&
+              strstr(url, "&nonce="));
+        {
+            char resp[32768];
+            CHECK(web_fetch(url, "GET", NULL, NULL, resp, sizeof resp) == 200);
+            /* contract: the form field the sign-in goes on with */
+            CHECK(oc_test_page_is(resp, "reset") && strstr(resp, "name=\"redirect_uri\" value=\"http://127.0.0.1:"));
+        }
+        oc_client_stop(c);
+
+        /* A member signs in: a wrong password shows the form again and the
+         * client keeps waiting; the right one signs it in. */
+        c = oc_client_start_signin(NULL, "127.0.0.1", arg.port, "", "local", NULL, NULL, NULL, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->signin_url[0] != '\0'));
+        snprintf(url, sizeof url, "%s", oc_client_model(c)->signin_url);
+        CHECK(web_person(url, "signin", "username=lia&password=wrong") == 200);
+        CHECK(oc_test_page_error(g_web_last, "bad-credentials") && !oc_client_model(c)->authed);
+        CHECK(web_person(url, "signin", "username=lia&password=pw-lia") == 0);
+        CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
+        oc_client_stop(c);
+
+        /* Cancel. */
+        c = oc_client_start_signin(NULL, "127.0.0.1", arg.port, "", "local", NULL, NULL, NULL, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->signin_url[0] != '\0'));
+        oc_client_cancel_signin(c);
+        CHECK(WAIT_FOR(c, strstr(m->last_error, "cancelled") != NULL));
+        oc_client_stop(c);
+
+        __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+        pthread_join(th, NULL);
+        oc_dbwriter_stop(dbw);
+        oc_tls_server_free(&srv);
+    }
+
+    /* --- direct -------------------------------------------------------------- */
+    {
+        testpki pki;
+        CHECK(testpki_init(&pki) == 0);
+        FILE *f = fopen(tpath("test_core_web_root.pem"), "w");
+        if (f) { fputs(pki.pem, f); fclose(f); }
+        char chain[8192], key[2048];
+        CHECK(testpki_leaf(&pki, "web.openchime.test", 0, chain, sizeof chain, key, sizeof key) == 0);
+        oc_tls_server srv;
+        CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+        CHECK(oc_tls_server_use(&srv, chain, strlen(chain), key, strlen(key)) == 0);
+        oc_dbwriter *dbw = web_daemon(tpath("test_core_web2.db"), NULL);
+        CHECK(dbw != NULL);
+        if (!dbw) { oc_tls_server_free(&srv); testpki_free(&pki); return; }
+        struct core_loop_arg arg;
+        arg.port = 0; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+        pthread_t th;
+        CHECK(core_loop_start(&arg, &th) == 0);
+        CHECK(oc_tls_set_extra_ca(tpath("test_core_web_root.pem")) == 0);   /* after the daemon's config */
+
+        mock_reset();
+        oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+        oc_client *c = oc_client_start_signin("web.openchime.test", "127.0.0.1", arg.port, "", "local", NULL,
+                                              "ignored", &sec, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->signin_url[0] != '\0'));
+        char url[2048], want[128];
+        snprintf(url, sizeof url, "%s", oc_client_model(c)->signin_url);
+        snprintf(want, sizeof want, "https://web.openchime.test:%d/signin?", arg.port);
+        CHECK(strncmp(url, want, strlen(want)) == 0);
+        CHECK(web_person(url, "signin", "username=lia&password=pw-lia") == 0);   /* verified as a browser would */
+        CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
+        char purl[1024];
+        snprintf(want, sizeof want, "https://web.openchime.test:%d/account/password", arg.port);
+        CHECK(oc_client_open_page(c, "account/password", NULL, purl, sizeof purl) == 0 && strcmp(purl, want) == 0);
+        oc_client_stop(c);
+        /* Remember me kept the session: the next start rides in on it, no browser. */
+        c = oc_client_start_signin("web.openchime.test", "127.0.0.1", arg.port, "", "local", NULL,
+                                   "ignored", &sec, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->authed) && oc_client_model(c)->signin_seq == 0);
+        oc_client_stop(c);
+
+        __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+        pthread_join(th, NULL);
+        oc_tls_set_extra_ca(NULL);
+        oc_dbwriter_stop(dbw);
+        oc_tls_server_free(&srv);
+        testpki_free(&pki);
+        unlink(tpath("test_core_web_root.pem"));
+    }
+    unlink_db(tpath("test_core_web1.db"));
+    unlink_db(tpath("test_core_web2.db"));
+}
+
+/* A local account signed in to with a device code (AUTH.md §8.11): the client
+ * shows where to enter which code -- and, where no authority vouches for the
+ * daemon, its fingerprint, for the browser's warning -- and signs in once the
+ * code is approved on the /device page, from anywhere. */
+static int device_approve(const char *url, const char *code, const char *user, const char *pw) {
+    char resp[32768], post[640], origin[300], hdrs[400], body[256];
+    if (web_fetch(url, "GET", NULL, NULL, resp, sizeof resp) != 200 || !oc_test_page_is(resp, "device-confirm") ||
+        !strstr(resp, code)) return -1;
+    const char *path = strchr(url + 8, '/');
+    snprintf(origin, sizeof origin, "%.*s", (int)(path - url), url);
+    snprintf(post, sizeof post, "%s/device", origin);
+    snprintf(hdrs, sizeof hdrs, "Origin: %s\r\nContent-Type: application/x-www-form-urlencoded\r\n", origin);
+    snprintf(body, sizeof body, "code=%s&username=%s&password=%s&action=approve", code, user, pw);
+    return web_fetch(post, "POST", hdrs, body, resp, sizeof resp) == 200 && oc_test_page_result(resp, "approved")
+           ? 0 : -1;
+}
+
+static void test_device_client(void) {
+    /* --- a daemon only a fingerprint vouches for (loopback, self-signed) --- */
+    {
+        oc_tls_server srv;
+        CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+        uint8_t fpb[OC_TLS_FINGERPRINT_LEN]; char fp[65];
+        CHECK(oc_tls_server_fingerprint(&srv, fpb) == 0);
+        fp_hex(fpb, sizeof fpb, fp, sizeof fp);
+        oc_dbwriter *dbw = web_daemon(tpath("test_core_dev1.db"), NULL);
+        CHECK(dbw != NULL);
+        if (!dbw) { oc_tls_server_free(&srv); return; }
+        oc_netloop_set_device_interval_s(1);
+        oc_netloop_set_device_ttl_ms(1500);
+        struct core_loop_arg arg;
+        arg.port = 0; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+        pthread_t th;
+        CHECK(core_loop_start(&arg, &th) == 0);
+
+        oc_client *c = oc_client_start_device(NULL, "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
+        char url[700], code[20], want[128];
+        snprintf(url, sizeof url, "%s", oc_client_model(c)->device_url);
+        snprintf(code, sizeof code, "%s", oc_client_model(c)->device_code);
+        snprintf(want, sizeof want, "https://127.0.0.1:%d/device?code=%s", arg.port, code);
+        CHECK(strcmp(url, want) == 0);
+        CHECK(strcmp(oc_client_model(c)->device_fp, fp) == 0);        /* for the browser's warning */
+        CHECK(!oc_client_model(c)->authed);
+        g_web_insecure = 1;                                          /* the person went on past it */
+        CHECK(device_approve(url, code, "lia", "wrong") != 0);
+        CHECK(device_approve(url, code, "lia", "pw-lia") == 0);
+        g_web_insecure = 0;
+        CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
+        CHECK(oc_client_model(c)->device_code[0] == '\0');
+        oc_client_stop(c);
+
+        /* Cancel; and a code nobody enters runs out. */
+        c = oc_client_start_device(NULL, "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
+        oc_client_cancel_signin(c);
+        CHECK(WAIT_FOR(c, strstr(m->last_error, "cancelled") != NULL));
+        oc_client_stop(c);
+        c = oc_client_start_device(NULL, "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
+        CHECK(WAIT_FOR(c, strstr(m->last_error, "expired") != NULL) && !oc_client_model(c)->authed);
+        oc_client_stop(c);
+
+        __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+        pthread_join(th, NULL);
+        oc_netloop_set_device_interval_s(0);
+        oc_netloop_set_device_ttl_ms(0);
+        oc_dbwriter_stop(dbw);
+        oc_tls_server_free(&srv);
+    }
+
+    /* --- a daemon a trusted root vouches for: no fingerprint, its own name --- */
+    {
+        testpki pki;
+        CHECK(testpki_init(&pki) == 0);
+        FILE *f = fopen(tpath("test_core_dev_root.pem"), "w");
+        if (f) { fputs(pki.pem, f); fclose(f); }
+        char chain[8192], key[2048];
+        CHECK(testpki_leaf(&pki, "web.openchime.test", 0, chain, sizeof chain, key, sizeof key) == 0);
+        oc_tls_server srv;
+        CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+        CHECK(oc_tls_server_use(&srv, chain, strlen(chain), key, strlen(key)) == 0);
+        oc_dbwriter *dbw = web_daemon(tpath("test_core_dev2.db"), NULL);
+        CHECK(dbw != NULL);
+        if (!dbw) { oc_tls_server_free(&srv); testpki_free(&pki); return; }
+        oc_netloop_set_device_interval_s(1);
+        struct core_loop_arg arg;
+        arg.port = 0; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+        pthread_t th;
+        CHECK(core_loop_start(&arg, &th) == 0);
+        CHECK(oc_tls_set_extra_ca(tpath("test_core_dev_root.pem")) == 0);
+
+        oc_client *c = oc_client_start_device("web.openchime.test", "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
+        char url[700], code[20], want[128];
+        snprintf(url, sizeof url, "%s", oc_client_model(c)->device_url);
+        snprintf(code, sizeof code, "%s", oc_client_model(c)->device_code);
+        snprintf(want, sizeof want, "https://web.openchime.test:%d/device?code=%s", arg.port, code);
+        CHECK(strcmp(url, want) == 0 && oc_client_model(c)->device_fp[0] == '\0');
+        CHECK(device_approve(url, code, "lia", "pw-lia") == 0);          /* verified as a browser would */
+        CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
+        oc_client_stop(c);
+
+        /* An approval slower than a connection is given to sign in (REQ-191:
+         * a second and a half here, with the code good for its full ten minutes): the
+         * poll keeps the connection, so the approval signs in on it and nothing
+         * is said meanwhile. The daemon used to close it, and the client called
+         * that "could not reach the server", which ended a terminal's wait
+         * though the code was still good. */
+        oc_netloop_set_unauthed_ms(1500);
+        c = oc_client_start_device("web.openchime.test", "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
+        snprintf(url, sizeof url, "%s", oc_client_model(c)->device_url);
+        snprintf(code, sizeof code, "%s", oc_client_model(c)->device_code);
+        for (int k = 0; k < 2; k++) {                   /* three seconds: twice the limit */
+            uint64_t past = oc_model_now_ms() + 1500;
+            CHECK(WAIT_FOR(c, oc_model_now_ms() >= past));
+        }
+        CHECK(oc_client_model(c)->error_seq == 0 && oc_client_model(c)->device_code[0] != '\0');
+        CHECK(device_approve(url, code, "lia", "pw-lia") == 0);
+        CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
+        CHECK(oc_client_model(c)->error_seq == 0);                     /* nothing was said */
+        oc_client_stop(c);
+        oc_netloop_set_unauthed_ms(0);
+
+        __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+        pthread_join(th, NULL);
+        oc_netloop_set_device_interval_s(0);
+        oc_tls_set_extra_ca(NULL);
+        oc_dbwriter_stop(dbw);
+        oc_tls_server_free(&srv);
+        testpki_free(&pki);
+        unlink(tpath("test_core_dev_root.pem"));
+    }
+    unlink_db(tpath("test_core_dev1.db"));
+    unlink_db(tpath("test_core_dev2.db"));
+}
+
+static void test_browser_signin(void) {
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    mbedtls_ssl_conf_sni(&srv.conf, daemon_sni_cb, NULL);   /* a daemon ignores the name; the test reads it */
+    unlink_db(tpath("test_core_browser.db"));
+    oc_dbwriter *dbw = oc_dbwriter_start(tpath("test_core_browser.db"));
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
+    CHECK(dbw != NULL);
+    oc_issuer is;
+    CHECK(oc_issuer_init(&is, "oc-core-browser") == 0);
+    CHECK(oc_dbwriter_configure_oidc(dbw, "https://central.example", "ws_browser_test", is.pem,
+                                     "https://central.example") == 0);
+    oc_dbwriter_set_local_enabled(dbw, 0);
+    char why[128];
+    CHECK(oc_dbwriter_configure_join_rules(dbw, "owner:dana@acme.example", why, sizeof why) == 0);
+
+    struct core_loop_arg arg;
+    arg.port = 0; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+    pthread_t th;
+    CHECK(core_loop_start(&arg, &th) == 0);
+
+    const char *DANA = "\"email\":\"dana@acme.example\",\"email_verified\":true,\"name\":\"Dana\",\"idp\":\"google\"";
+    const char *STRANGER = "\"email\":\"s@elsewhere.example\",\"email_verified\":true,\"idp\":\"google\"";
+
+    /* Before anyone types anything, a frontend asks how the workspace signs people
+     * in — and this one takes no passwords. */
+    {
+        oc_signin_source src[8];
+        int n = oc_net_probe(NULL, "127.0.0.1", arg.port, src, 8);
+        CHECK(n == 1);
+        CHECK(n == 1 && src[0].kind == OC_SOURCE_RELAY && strcmp(src[0].id, "relay") == 0);
+        CHECK(n == 1 && src[0].label[0] != '\0');   /* a label to show on its button */
+        CHECK(oc_net_probe(NULL, "127.0.0.1", 1, src, 8) == OC_PROBE_UNREACHABLE);
+    }
+
+    /* No password given: the core asks the daemon for the URL, hands it to the
+     * frontend through the model, and waits. The browser comes back; the core
+     * connects again, presents the token with its verifier, and is in. */
+    {
+        oc_client *c = oc_client_start("127.0.0.1", arg.port, "");
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        const oc_model *m = oc_client_model(c);
+        CHECK(strncmp(m->signin_url, "https://central.example/oidc/authorize?workspace=ws_browser_test&", 65) == 0);
+        CHECK(m->signin_seq == 1 && !m->authed);
+        CHECK(browser_complete(m, &is, "https://accounts.google.com|dana", "b1", DANA, NULL) == 0);
+        /* The tab was answered after the daemon accepted the token, not before:
+         * by then the client is signed in, and the page says so. */
+        CHECK(oc_test_page_result(g_browser_page, "signed-in"));
+        CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
+        CHECK(oc_client_model(c)->signin_url[0] == '\0');
+        oc_client_stop(c);
+    }
+    /* The credential entry is filed under the workspace as NAMED. A client from
+     * before that filed it under the address; one that names the workspace finds
+     * that entry, moves it, and rides in on its session — no browser this time. */
+    {
+        mock_reset();
+        oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+        char legacy[64]; snprintf(legacy, sizeof legacy, "127.0.0.1:%d", arg.port);
+        g_daemon_saw_sni[0] = '\0';
+        oc_client *old = oc_client_start_secure("127.0.0.1", arg.port, "", "ignored", &sec);
+        CHECK(old != NULL);
+        CHECK(WAIT_FOR(old, m->signin_url[0] != '\0'));
+        CHECK(g_daemon_saw_sni[0] == '\0');                 /* an address is never named */
+        CHECK(browser_complete(oc_client_model(old), &is, "https://accounts.google.com|dana", "b1k", DANA, NULL) == 0);
+        CHECK(WAIT_FOR(old, m->authed));
+        oc_client_stop(old);
+        CHECK(mock_len_of(legacy) > 0);
+
+        oc_client *named = oc_client_start_named("acme.openchime.test", "127.0.0.1", arg.port, "",
+                                                 "ignored", &sec);
+        CHECK(named != NULL);
+        CHECK(WAIT_FOR(named, m->authed && m->user_id != 0));
+        CHECK(oc_client_model(named)->signin_seq == 0);          /* the session, not the browser */
+        /* The handshake named the WORKSPACE, though the connection went to an address
+         * — which is what lets a shared front door find the workspace's daemon. */
+        CHECK(strcmp(g_daemon_saw_sni, "acme.openchime.test") == 0);
+        oc_client_stop(named);
+        CHECK(mock_len_of("acme.openchime.test") > 0);
+        CHECK(mock_len_of(legacy) == 0);                          /* moved, not copied */
+        mock_reset();
+    }
+
+    /* A session that was good and is not any more, with no credential to try
+     * instead: said as what it is — signed out — so a frontend opens the sign-in
+     * rather than leaving an error line over a dead workspace. The dead token is
+     * dropped; the pin is not. */
+    {
+        mock_reset();
+        oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+        const char *KEY = "expired.openchime.test";
+        oc_client *c = oc_client_start_named(KEY, "127.0.0.1", arg.port, "", "ignored", &sec);
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        CHECK(browser_complete(oc_client_model(c), &is, "https://accounts.google.com|dana", "b1x", DANA, NULL) == 0);
+        CHECK(WAIT_FOR(c, m->authed));
+        CHECK(!oc_client_model(c)->signed_out);
+        oc_client_stop(c);
+
+        /* The token the daemon will not know: the stored one, one bit off. */
+        for (int i = 0; i < 8; i++)
+            if (g_mock[i].used && strcmp(g_mock[i].account, KEY) == 0) g_mock[i].val[10] ^= 0x01;
+
+        oc_client *back = oc_client_start_named(KEY, "127.0.0.1", arg.port, "", "ignored", &sec);
+        CHECK(back != NULL);
+        CHECK(WAIT_FOR(back, m->signed_out));
+        CHECK(!oc_client_model(back)->authed);
+        CHECK(oc_client_model(back)->signin_seq == 0);   /* it did not start a browser sign-in unasked */
+        oc_client_stop(back);
+
+        oc_store *chk = oc_store_open("ignored");
+        if (chk) {
+            oc_store_set_secret(chk, &sec);
+            uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN];
+            CHECK(oc_store_load_session(chk, KEY, tok, NULL, 0) == 0);
+            CHECK(oc_store_load_pin(chk, KEY, pin) == 0);         /* nothing trusted by default */
+            oc_store_close(chk);
+        }
+        mock_reset();
+    }
+
+    /* Remember-me off leaves nothing of the SESSION behind, and nothing is
+     * trusted by default either: a certificate is trusted by a root, or by the
+     * person, never by having been seen once (ARCH-10). */
+    {
+        mock_reset();
+        oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+        oc_client *c = oc_client_start_opts("forgetful.openchime.test", "127.0.0.1", arg.port, "",
+                                            "ignored", &sec, 0);
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        CHECK(browser_complete(oc_client_model(c), &is, "https://accounts.google.com|dana", "b1p", DANA, NULL) == 0);
+        CHECK(WAIT_FOR(c, m->authed));
+        oc_client_stop(c);
+
+        oc_store *chk = oc_store_open("ignored");
+        CHECK(chk != NULL);
+        if (chk) {
+            oc_store_set_secret(chk, &sec);
+            uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN], want[OC_TLS_FINGERPRINT_LEN];
+            char who[64];
+            CHECK(oc_store_load_pin(chk, "forgetful.openchime.test", pin) == 0);
+            (void)want;
+            CHECK(oc_store_load_session(chk, "forgetful.openchime.test", tok, NULL, 0) == 0);
+            CHECK(oc_store_session_user(chk, "forgetful.openchime.test", who, sizeof who) == 0);
+            oc_store_close(chk);
+        }
+        /* Not in the switcher either: a pin is not a book entry. */
+        int listed = 0;
+        {
+            oc_store *bk = oc_store_open("ignored");
+            if (bk) { oc_store_set_secret(bk, &sec); oc_store_workspace_each(bk, count_book_cb, &listed); oc_store_close(bk); }
+        }
+        CHECK(listed == 0);
+        mock_reset();
+    }
+
+    /* A token that was not minted for this client's challenge: the daemon wants the
+     * verifier the nonce is the hash of, and this client holds a different one. */
+    {
+        oc_client *c = oc_client_start("127.0.0.1", arg.port, "");
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        CHECK(browser_complete(oc_client_model(c), &is, "https://accounts.google.com|dana", "b2", DANA,
+                               "JBbiqONGWPaAmwXk_8bT6UnlPfrn65D32eZlJS-zGG0") == 0);
+        CHECK(WAIT_FOR(c, m->last_error[0] != '\0'));
+        CHECK(oc_client_model(c)->last_error_kind == OC_CERR_AUTH &&
+              oc_client_model(c)->last_error_code == OC_ERR_AUTH_INVALID_TOKEN && !oc_client_model(c)->authed);
+        oc_client_stop(c);
+    }
+    /* Somebody the workspace did not name: told so, in words. */
+    {
+        oc_client *c = oc_client_start("127.0.0.1", arg.port, "");
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        CHECK(browser_complete(oc_client_model(c), &is, "https://accounts.google.com|stranger", "b3",
+                               STRANGER, NULL) == 0);
+        /* The browser is not told it is signed in: it waits for the daemon's
+         * refusal and says it, in the same words the client does. */
+        CHECK(oc_test_page_result(g_browser_page, "refused") && !oc_test_page_result(g_browser_page, "signed-in"));
+        CHECK(WAIT_FOR(c, m->last_error[0] != '\0'));
+        CHECK(oc_client_model(c)->last_error_kind == OC_CERR_AUTH &&
+              oc_client_model(c)->last_error_code == OC_ERR_AUTH_NOT_ALLOWED);
+        CHECK(html_has_text(g_browser_page, oc_client_model(c)->last_error));
+        oc_client_stop(c);
+    }
+    /* The person gives up. */
+    {
+        oc_client *c = oc_client_start("127.0.0.1", arg.port, "");
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        oc_client_cancel_signin(c);
+        CHECK(WAIT_FOR(c, m->last_error[0] != '\0'));
+        CHECK(oc_client_model(c)->last_error_kind == OC_CERR_SIGNIN_CANCELLED);
+        CHECK(oc_client_model(c)->signin_url[0] == '\0');
+        oc_client_stop(c);
+    }
+
+    __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(th, NULL);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    oc_issuer_free(&is);
+    unlink_db(tpath("test_core_browser.db"));
+}
+
+/* The pairing the net thread promises (REQ-058, ARCH-115), one frame at a time,
+ * which no real socket can show: it delivers a message and its ACTION in one
+ * read. A live message -- its attachments and forward with it -- is held until
+ * its ACTION and handed over with the action on it; anything unrelated releases
+ * it unpaired; an ACTION for something not held stands on its own. */
+static size_t frame_of_broadcast(uint8_t *buf, size_t cap, uint64_t mid, const char *body, int with_file) {
+    oc_wbuf w; oc_wbuf_init(&w, buf, cap);
+    oc_broadcast b = { mid, 1, 42, 1000, OC_MSG_KIND_MESSAGE, oc_slice_str(body), 0, {{0}}, {0} };
+    if (with_file) {
+        b.n_attach = 1;
+        b.attach[0].id = 9;
+        b.attach[0].filename = oc_slice_str("a.txt");
+        b.attach[0].mime = oc_slice_str("text/plain");
+        b.attach[0].size = 3;
+    }
+    b.author_name = oc_slice_str("");
+    return oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b) == OC_OK ? w.len : 0;
+}
+static size_t frame_of_action(uint8_t *buf, size_t cap, uint64_t mid, uint32_t start, uint32_t len) {
+    oc_wbuf w; oc_wbuf_init(&w, buf, cap);
+    oc_action a = { mid, 1, 42, oc_slice_str(""), start, len };
+    return oc_encode_action(&w, OC_PROTOCOL_VERSION, &a) == OC_OK ? w.len : 0;
+}
+static size_t frame_of_forward(uint8_t *buf, size_t cap, uint64_t mid) {
+    oc_wbuf w; oc_wbuf_init(&w, buf, cap);
+    oc_forward fw = { mid, 1, 1, 5, 42, oc_slice_str("x"), 0, oc_slice_str(""), 0 };
+    return oc_encode_forward(&w, OC_PROTOCOL_VERSION, &fw) == OC_OK ? w.len : 0;
+}
+static size_t frame_of_meta(uint8_t *buf, size_t cap, uint64_t mid) {
+    oc_wbuf w; oc_wbuf_init(&w, buf, cap);
+    oc_thread_meta tm = { mid, 2, 2000 };
+    return oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &tm) == OC_OK ? w.len : 0;
+}
+
+static void test_action_pairing(void) {
+    oc_queue q; oc_queue_init(&q);
+    oc_net_frames *f = oc_net_frames_new(&q);
+    CHECK(f != NULL);
+    uint8_t buf[1024]; size_t n;
+    oc_ev *e;
+
+    /* A message with a file, then its forward: nothing yet. */
+    n = frame_of_broadcast(buf, sizeof buf, 100, "/me waves", 1);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    CHECK(oc_queue_try_pop(&q) == NULL);
+    n = frame_of_forward(buf, sizeof buf, 100);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    CHECK(oc_queue_try_pop(&q) == NULL);
+    /* Its ACTION: the message first, the action on it, then what waited. */
+    n = frame_of_action(buf, sizeof buf, 100, 4, 5);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_MESSAGE && e->message_id == 100 && e->action_known &&
+          e->action && e->action_start == 4 && e->action_len == 5);
+    oc_ev_free(e);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_ATTACHMENT && e->message_id == 100);
+    oc_ev_free(e);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_FORWARD && e->message_id == 100);
+    oc_ev_free(e);
+    CHECK(oc_queue_try_pop(&q) == NULL);
+
+    /* "Not an action" pairs the same way. */
+    n = frame_of_broadcast(buf, sizeof buf, 101, "hello", 0);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    CHECK(oc_queue_try_pop(&q) == NULL);
+    n = frame_of_action(buf, sizeof buf, 101, 0, 0);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_MESSAGE && e->message_id == 101 && e->action_known && !e->action);
+    oc_ev_free(e);
+    CHECK(oc_queue_try_pop(&q) == NULL);
+
+    /* A replay's message is followed by something else: released unpaired,
+     * and the other frame after it, in order. */
+    n = frame_of_broadcast(buf, sizeof buf, 102, "/me old", 0);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    n = frame_of_meta(buf, sizeof buf, 102);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_MESSAGE && e->message_id == 102 && !e->action_known);
+    oc_ev_free(e);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_THREAD_META);
+    oc_ev_free(e);
+    /* ...and its action arrives later on its own. */
+    n = frame_of_action(buf, sizeof buf, 102, 4, 3);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_ACTION && e->message_id == 102 && e->action && e->action_len == 3);
+    oc_ev_free(e);
+
+    /* An ACTION for another message releases what is held, then stands alone. */
+    n = frame_of_broadcast(buf, sizeof buf, 103, "x", 0);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    n = frame_of_action(buf, sizeof buf, 99, 4, 1);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_MESSAGE && e->message_id == 103 && !e->action_known);
+    oc_ev_free(e);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_ACTION && e->message_id == 99);
+    oc_ev_free(e);
+
+    /* Both in one read pair just the same; and a hold still open when the
+     * connection goes is handed on as it stands. */
+    size_t n1 = frame_of_broadcast(buf, sizeof buf, 104, "/me two", 0);
+    size_t n2 = frame_of_action(buf + n1, sizeof buf - n1, 104, 4, 3);
+    CHECK(n1 && n2 && oc_net_frames_push(f, buf, n1 + n2) == 0);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_MESSAGE && e->message_id == 104 && e->action && e->action_len == 3);
+    oc_ev_free(e);
+    n = frame_of_broadcast(buf, sizeof buf, 105, "left", 0);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    CHECK(oc_queue_try_pop(&q) == NULL);
+    oc_net_frames_free(f);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_MESSAGE && e->message_id == 105);
+    oc_ev_free(e);
+    CHECK(oc_queue_try_pop(&q) == NULL);
+    oc_queue_destroy(&q);
+}
+
+int run_client_core_tests(void) {
+    printf("test_client_core: sidebar, resolve, .well-known metadata, a published fingerprint, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, catch-up, channel description, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox, a channel list past one frame\n");
+    if (oc_test_mkdtemp("client_core", g_dir, sizeof g_dir) != 0) {
+        printf("  FAIL test_client_core: no directory of its own under $TMPDIR\n");
+        return failures + 1;
+    }
+
+    test_group_dm_title();
+    test_action_pairing();
+    test_groups_model();
+    test_chanmem_overlap();
+    test_sidebar();
+    test_new_channel_takes_the_default_level();
+    test_channel_info_seq();
+    test_srvalerts_model();
+    test_presence_offline();
+    test_restore_model();
+    test_poll_model();
+    test_table_preview();
+    test_badge_tiers();
+    test_osnotify_null();
+    test_feedback();
+    test_notify_scan();
+    test_thread_notices();
+    test_unread_counts_what_notifies();
+    test_capabilities();
+    test_server_build();
+    test_invitation_text();
+    test_reset_text();
+    test_addressable_targets();
+    test_pins();
+    test_summary_model();
+    test_resolve();
+    test_resolve_literals();
+    test_wellknown_parse();
+    test_last_error();
+    test_xfer_table();
+    test_workspace_key();
+    test_sni_name();
+    test_store_adopt();
+    test_workspace_move();
+    test_secret_routing();
+    test_store_no_persistence_without_keyring();
+    test_workspace_book();
+    test_session_owner();
+    test_store_legacy_entry();
+    test_device_key();
+
+    /* The daemon opens its blob store at netloop startup; point it at a build-local
+     * dir (the /data/blobs default isn't writable in the test sandbox), matching
+     * how itest_netloop provisions it. */
+    mkdir(tpath("itest_core_data"), 0700);
+    setenv("OPENCHIME_DATA_DIR", tpath("itest_core_data"), 1);
+    /* Two files to a page, so the paging below is exercised with three uploads
+     * rather than two hundred and one. Read once, by the config the loop thread
+     * loads before the netloop runs. */
+    setenv("OPENCHIME_DEV_FILE_PAGE", "2", 1);
+
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+
+    unlink_db(tpath("itest_core.db"));
+    oc_dbwriter *dbw = oc_dbwriter_start(tpath("itest_core.db"));
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
+    CHECK(dbw != NULL);
+    if (!dbw) { oc_tls_server_free(&srv); oc_test_rmtree(g_dir); return failures; }
+
+    /* Accounts the cores authenticate as (client sends "user:pass"). */
+    CHECK(oc_dbwriter_register_local(dbw, "dana", "pw-dana", OC_ROLE_OWNER,  2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "erik", "pw-erik", OC_ROLE_MEMBER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "faye", "pw-faye", OC_ROLE_MEMBER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "gil",  "pw-gil",  OC_ROLE_MEMBER, 2048) != 0);
+
+    /* Pin the process timezone before any client connects, so the offset the
+     * core sends on connect (ARCH-103) is a value that cannot be confused with
+     * an unwritten column: +05:30 is non-zero AND not a whole hour, so neither
+     * the schema default nor a truncating bug can produce it by accident. */
+    const char *tz_saved = getenv("TZ");
+    char tz_saved_buf[64] = "";
+    if (tz_saved) snprintf(tz_saved_buf, sizeof tz_saved_buf, "%s", tz_saved);
+    setenv("TZ", "Asia/Kolkata", 1);
+    tzset();
+
+    /* The daemon this test drives speaks with a stub voice (ARCH-111). */
+    oc_netloop_set_tts(&CORE_TTS);
+    oc_netloop_set_stt(&CORE_STT);
+
+    /* ...and summarizes with a stub model (REQ-310). */
+    static oc_sum_engine csum_eng = { &core_sum_calls, "stub", csum_open, csum_close, csum_run, 0 };
+    static oc_sum_probe csum_quiet = { csum_cpu, csum_mem, csum_net, csum_now, NULL };
+    oc_sum_worker *csum = NULL;
+    {
+        g_csum_dbw = dbw;
+        oc_sum_worker_cfg cfg;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.db_path = tpath("itest_core.db");
+        cfg.engine = &csum_eng;
+        cfg.probe = &csum_quiet;
+        cfg.sink.store = csum_store;
+        cfg.sink.take = csum_take;
+        char err[256] = "";
+        csum = oc_sum_worker_start(&cfg, err, sizeof err);
+        CHECK(csum != NULL);
+        oc_netloop_set_summary(csum);
+    }
+
+    /* A relay, and the tap in front of it that the daemon advertises (calls). */
+    {
+        g_relay.udp = socket(AF_INET, SOCK_DGRAM, 0);
+        /* The tap takes both families on one socket, as the daemon's relay does,
+         * so a client that reaches it over IPv6 is relayed too. */
+        g_tap.front = socket(AF_INET6, SOCK_DGRAM, 0);
+        int v6only = 0;
+        CHECK(setsockopt(g_tap.front, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof v6only) == 0);
+        struct sockaddr_in ra; memset(&ra, 0, sizeof ra);
+        ra.sin_family = AF_INET; ra.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        struct sockaddr_in6 ta; memset(&ta, 0, sizeof ta);
+        ta.sin6_family = AF_INET6; ta.sin6_addr = in6addr_any;
+        CHECK(bind(g_relay.udp, (struct sockaddr *)&ra, sizeof ra) == 0);
+        CHECK(bind(g_tap.front, (struct sockaddr *)&ta, sizeof ta) == 0);
+        socklen_t l = sizeof ra; getsockname(g_relay.udp, (struct sockaddr *)&ra, &l);
+        l = sizeof ta; getsockname(g_tap.front, (struct sockaddr *)&ta, &l);
+        g_tap.relay_port = ntohs(ra.sin_port);
+        pthread_mutex_init(&g_tap.mu, NULL);
+        CHECK(pthread_create(&g_tap_th, NULL, tap_thread, NULL) == 0);
+        oc_netloop_set_audio(g_relay.udp, ntohs(ta.sin6_port));
+    }
+
+    struct core_loop_arg arg;
+    arg.port = 0;   /* the kernel picks (core_loop_start) */
+    arg.srv = &srv;
+    arg.dbw = dbw;
+    arg.stop = 0;
+    pthread_t th;
+    CHECK(core_loop_start(&arg, &th) == 0);
+
+    oc_client *a = start_as(NULL, "127.0.0.1", arg.port, "dana:pw-dana", NULL, NULL, 1, NULL);
+    oc_client *b = start_as(NULL, "127.0.0.1", arg.port, "erik:pw-erik", NULL, NULL, 1, NULL);
+    CHECK(a != NULL);
+    CHECK(b != NULL);
+
+    if (a && b) {
+        /* Auth completes: each model reports connected+authed with its user id,
+         * and the post-auth LIST_CHANNELS populates the default channel (id 1). */
+        CHECK(WAIT_FOR(a, m->authed && m->user_id != 0));
+        CHECK(WAIT_FOR(b, m->authed && m->user_id != 0));
+        CHECK(oc_client_model(a)->connected);
+
+        /* The UTC offset is refreshed on connect (ARCH-103). It used to be
+         * written only as a field on SET_SCHEDULE, so it was captured whenever
+         * the user last edited their quiet hours and never again — and the
+         * offset is precisely what changes without the schedule changing, when
+         * the user travels or daylight saving turns over. Asserted against the
+         * daemon's own row: the client says nothing about this, so the model
+         * cannot be the witness. */
+        {
+            int expect = oc_utc_offset_min();
+            CHECK(expect == 330);          /* Asia/Kolkata, per the TZ set above */
+            int got = -9999;
+            /* The job is async: read the row until it holds the value, or time is up. */
+            WAIT_UNTIL(({
+                sqlite3 *rdb = NULL;
+                if (sqlite3_open_v2(tpath("itest_core.db"), &rdb,
+                                    SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                    sqlite3_stmt *st = NULL;
+                    /* Identity is `subject`, namespaced by source (AUTH.md §4);
+                     * there is no username column. */
+                    if (sqlite3_prepare_v2(rdb, "SELECT tz_offset_min FROM users"
+                                                " WHERE subject='local:dana';",
+                                           -1, &st, NULL) == SQLITE_OK &&
+                        sqlite3_step(st) == SQLITE_ROW)
+                        got = sqlite3_column_int(st, 0);
+                    sqlite3_finalize(st);
+                    sqlite3_close(rdb);
+                }
+                got == expect;
+            }), 2000);
+            CHECK(got == expect);
+        }
+        CHECK(WAIT_FOR(a, oc_model_channel((oc_model *)m, 1) != NULL));
+        CHECK(WAIT_FOR(b, oc_model_channel((oc_model *)m, 1) != NULL));
+
+        /* The roster loads after auth: dana resolves erik (and faye) by name. */
+        CHECK(WAIT_FOR(a, oc_model_user_id(m, "erik") != 0 && oc_model_user_id(m, "faye") != 0));
+        {
+            const oc_model *am = oc_client_model(a);
+            uint64_t eid = oc_model_user_id(am, "erik");
+            CHECK(eid != 0 && strcmp(oc_model_user_name(am, eid), "erik") == 0);
+        }
+
+        /* dana sends: it round-trips to her own model as a BROADCAST (channel 1),
+         * and reaches erik live. erik counts it unread (author != self). */
+        oc_client_send(a, 1, "hello from the core");
+        CHECK(WAIT_FOR(a, channel_has_body(m, 1, "hello from the core")));
+        CHECK(WAIT_FOR(b, channel_has_body(m, 1, "hello from the core") && channel_unread(m, 1) == 1));
+
+        /* The message carries dana's display name (= her login name), live. */
+        CHECK(channel_has_named(oc_client_model(b), 1, "hello from the core", "dana"));
+
+        /* Actions (REQ-058, ARCH-115). The net thread holds a live message
+         * until its ACTION and hands both over together, so the FIRST moment
+         * erik's model holds dana's "/me" message, its action is already on
+         * it -- never a tick with the message and without the answer. */
+        {
+            /* The test's own messages: an action, its edit to none, and back. */
+            static const char AWAY[] = "/me is away", BACK[] = "back now", BACK2[] = "/me  is back";
+            oc_client_send(a, 1, AWAY);
+            int paired = -1;
+            uint64_t amid = 0;
+            CHECK(WAIT_UNTIL_DO(oc_client_tick(b), ({
+                      amid = message_id_of(oc_client_model(b), 1, AWAY);
+                      const oc_msg *am = amid ? find_msg(oc_client_model(b), 1, amid) : NULL;
+                      if (am) paired = am->action.present && am->action.start == 4 && am->action.len == 7;
+                      am != NULL; }), 5000));
+            CHECK(paired == 1);
+            const oc_model *bm = oc_client_model(b);
+            const oc_channel *bc = oc_model_channel((oc_model *)bm, 1);
+            /* The preview is the action's span; the line, the actor's name before it. */
+            CHECK(bc && bc->preview_action == 1 && strcmp(bc->preview, AWAY + 4) == 0);
+            char line[128], want[128];
+            oc_model_msg_preview(bm, find_msg(bm, 1, amid), line, sizeof line);
+            snprintf(want, sizeof want, "%s %s", "dana", AWAY + 4);
+            CHECK(strcmp(line, want) == 0);
+            /* The formatter: a name given wins, none looks the author up, and
+             * a non-action is its text alone. */
+            oc_model_line(bm, oc_model_user_id(bm, "dana"), NULL, 1, "waves", line, sizeof line);
+            snprintf(want, sizeof want, "%s %s", "dana", "waves");
+            CHECK(strcmp(line, want) == 0);
+            oc_model_line(bm, oc_model_user_id(bm, "dana"), "Deploy-Bot", 1, "ships", line, sizeof line);
+            snprintf(want, sizeof want, "%s %s", "Deploy-Bot", "ships");
+            CHECK(strcmp(line, want) == 0);
+            oc_model_line(bm, oc_model_user_id(bm, "dana"), NULL, 0, AWAY, line, sizeof line);
+            CHECK(strcmp(line, AWAY) == 0);
+
+            /* An edit unmakes it: the new body and no action, together. */
+            oc_client_edit(a, 1, amid, BACK);
+            paired = -1;
+            CHECK(WAIT_UNTIL_DO(oc_client_tick(b), ({
+                      const oc_msg *am = find_msg(oc_client_model(b), 1, amid);
+                      int there = am && am->body && strcmp(am->body, BACK) == 0;
+                      if (there) paired = !am->action.present;
+                      there; }), 5000));
+            CHECK(paired == 1);
+            /* And another makes one again, its span with it. */
+            oc_client_edit(a, 1, amid, BACK2);
+            paired = -1;
+            CHECK(WAIT_UNTIL_DO(oc_client_tick(b), ({
+                      const oc_msg *am = find_msg(oc_client_model(b), 1, amid);
+                      int there = am && am->body && strcmp(am->body, BACK2) == 0;
+                      if (there) paired = am->action.present && am->action.start == 5 && am->action.len == 7;
+                      there; }), 5000));
+            CHECK(paired == 1);
+            /* A tombstone has no body to be an action. */
+            oc_client_delete(a, 1, amid);
+            CHECK(WAIT_FOR(b, find_msg(m, 1, amid) && find_msg(m, 1, amid)->deleted &&
+                              !find_msg(m, 1, amid)->action.present));
+        }
+
+        /* erik signals typing in channel 1; dana sees erik (and only erik) typing
+         * (the server relays to other members, so dana's own view excludes her). */
+        uint64_t erik_id = oc_client_model(b)->user_id;
+        oc_client_typing(b, 1);
+        uint64_t typers[4];
+        CHECK(WAIT_FOR(a, oc_model_typing(m, 1, m->user_id, typers, 4) == 1));
+        CHECK(typers[0] == erik_id);
+
+        /* erik reacts to dana's message: both see the aggregate (count 1), erik
+         * sees it as his own; a second react toggles it off (count 0). */
+        uint64_t mid = message_id_of(oc_client_model(b), 1, "hello from the core");
+        CHECK(mid != 0);
+        oc_client_react(b, 1, mid, ":+1:", 1);
+        int mine = 0;
+        CHECK(WAIT_FOR(b, reaction_count(m, 1, mid, ":+1:", NULL) == 1));
+        CHECK(reaction_count(oc_client_model(b), 1, mid, ":+1:", &mine) == 1 && mine == 1);
+        CHECK(WAIT_FOR(a, reaction_count(m, 1, mid, ":+1:", NULL) == 1));
+        oc_client_react(b, 1, mid, ":+1:", 0);
+        CHECK(WAIT_FOR(a, reaction_count(m, 1, mid, ":+1:", NULL) == 0));
+
+        /* read receipts (REQ-090 seen-by): erik marks channel 1 read; the server
+         * fans his advanced read cursor to dana, whose seen-by (excluding herself)
+         * then names erik as having read up to dana's message. */
+        oc_client_mark_read(b, 1);
+        {
+            uint64_t seen[8];
+            CHECK(WAIT_FOR(a, oc_model_seen_by(m, 1, mid, m->user_id, seen, 8) == 1 && seen[0] == erik_id));
+        }
+
+        /* Catch-up in ONE frame (REQ-238): dana posts again, and erik clears
+         * everything with MARK_ALL_READ instead of acking the channel. The same
+         * seen-by fan-out must then name him on the new message -- which is the
+         * whole path proved end to end: the client's frame, the daemon's
+         * dispatch, the writer's sweep, and the other member's model. His own
+         * unread clears on the call, not on the reply. */
+        oc_client_send(a, 1, "catch up on this");
+        uint64_t mid2 = 0;
+        CHECK(WAIT_FOR(b, (mid2 = message_id_of(oc_client_model(b), 1, "catch up on this")) != 0 &&
+                          channel_unread(oc_client_model(b), 1) == 1));
+        oc_client_mark_all_read(b);
+        CHECK(channel_unread(oc_client_model(b), 1) == 0);
+        {
+            uint64_t seen[8];
+            CHECK(WAIT_FOR(a, oc_model_seen_by(m, 1, mid2, m->user_id, seen, 8) == 1 && seen[0] == erik_id));
+        }
+
+        /* Mark unread (REQ-235) reaches every device of the reader: erik on a
+         * second connection has read everything too, and when the first marks
+         * the conversation unread, the second's badge comes back. */
+        {
+            oc_client *b2 = start_as(NULL, "127.0.0.1", arg.port, "erik:pw-erik", NULL, NULL, 1, NULL);
+            CHECK(b2 != NULL);
+            if (b2) {
+                CHECK(WAIT_FOR(b2, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+                oc_client_backfill(b2, 1);
+                CHECK(WAIT_FOR(b2, ({ const oc_channel *bc = oc_model_channel((oc_model *)m, 1);
+                                      bc && bc->n_msgs > 0; })));
+                /* A profile saved on one device shows on the other (REQ-240). */
+                oc_client_set_profile(b, T_FULLNAME, "Engineer", "he/him", "", "Europe/Oslo", "");
+                CHECK(WAIT_FOR(b2, ({ int ok = 0;
+                                      for (size_t i = 0; i < m->n_users; i++)
+                                          if (m->users[i].user_id == m->user_id)
+                                              ok = !strcmp(m->users[i].full_name, T_FULLNAME) &&
+                                                   !strcmp(m->users[i].title, "Engineer") &&
+                                                   !strcmp(m->users[i].pronouns, "he/him") &&
+                                                   !strcmp(m->users[i].timezone, "Europe/Oslo");
+                                      ok; })));
+                oc_client_mark_read(b2, 1);
+                CHECK(channel_unread(oc_client_model(b2), 1) == 0);
+                oc_client_set_read_cursor(b, 1, 0);
+                CHECK(channel_unread(oc_client_model(b), 1) > 0);        /* at once, here */
+                CHECK(WAIT_FOR(b2, channel_unread(m, 1) > 0));            /* and there */
+                oc_client_mark_read(b, 1);                              /* as it was */
+                oc_client_stop(b2);
+            }
+        }
+
+        /* A channel's description (REQ-034) is not on the channel list, so it is
+         * UNKNOWN until asked for -- which is what description_known exists to
+         * say, since a NULL cannot tell "none" from "never fetched". Asking fills
+         * it; and dana setting one reaches erik live, on the same frame. */
+        {
+            oc_channel *ch = oc_model_channel((oc_model *)oc_client_model(b), 1);
+            CHECK(ch && !ch->description_known);
+            oc_client_get_channel_description(b, 1);
+            CHECK(WAIT_FOR(b, (ch = oc_model_channel((oc_model *)oc_client_model(b), 1)) &&
+                              ch->description_known && ch->description == NULL));
+            oc_client_update_channel(a, 1, OC_CHUP_DESCRIPTION, T_DESCR);
+            CHECK(WAIT_FOR(b, (ch = oc_model_channel((oc_model *)oc_client_model(b), 1)) &&
+                              ch->description &&
+                              strcmp(ch->description, T_DESCR) == 0));
+        }
+
+        /* A summary (REQ-310): offered because the daemon summarizes; asked
+         * for, it opens loading and fills with what the daemon made; asked
+         * again, it comes from what the daemon stored, the model not asked;
+         * closed, it is gone. */
+        {
+            CHECK(WAIT_FOR(a, oc_model_summarize_available(m)));
+            uint32_t req = oc_client_summarize(a, 1, OC_SUM_WEEK, 0, 0);
+            CHECK(req != 0);
+            const oc_model *am = oc_client_model(a);
+            CHECK(am->summary_open && am->summary_channel == 1);
+            CHECK(WAIT_FOR(a, m->summary_open && !m->summary_loading));
+            /* A span of one short message: its overview, citing it. */
+            CHECK(am->summary_status == OC_SUM_OK && !strcmp(am->summary.overview, CSUM_OVERVIEW) &&
+                  am->summary.n_refs >= 1 && am->summary.n_posters >= 1 &&
+                  am->summary.count >= 1 && am->summary.n_sources >= 1 &&
+                  am->summary_end > am->summary_start);
+            int calls = __atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED);
+            uint32_t again = oc_client_summarize(a, 1, OC_SUM_WEEK, 0, 0);
+            CHECK(again != req);
+            CHECK(WAIT_FOR(a, m->summary_open && !m->summary_loading && m->summary_status == OC_SUM_OK));
+            CHECK(__atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED) == calls);
+            /* Nothing to retry in a summary that was made. */
+            CHECK(oc_client_summary_retry(a) == 0);
+            oc_client_close_summary(a);
+            CHECK(!am->summary_open && am->summary.n_topics == 0);
+            /* Today, the newest span, is asked for and made. */
+            CHECK(oc_client_summarize(a, 1, OC_SUM_TODAY, 0, 0) != 0);
+            CHECK(am->summary_open && am->summary_scope == OC_SUM_TODAY);
+            CHECK(WAIT_FOR(a, m->summary_open && !m->summary_loading && m->summary_status == OC_SUM_OK));
+            oc_client_close_summary(a);
+            /* A span past the newest is not one. */
+            CHECK(oc_client_summarize(a, 1, OC_SUM_TODAY + 1, 0, 0) == 0 && !am->summary_open);
+            /* Closed while it is made, it goes on: its person is told when it
+             * is, and opening the notice shows it as it was made. */
+            uint64_t now_ms = (uint64_t)time(NULL) * 1000u;
+            __atomic_store_n(&core_sum_hold, 1, __ATOMIC_RELEASE);
+            int c0 = __atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED);
+            CHECK(oc_client_summarize(a, 1, OC_SUM_RANGE, now_ms - 3 * 86400000ull, now_ms + 86400000ull) != 0);
+            CHECK(WAIT_UNTIL_DO(oc_client_tick(a), __atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED) != c0, 5000));
+            oc_client_close_summary(a);         /* still being made: detached */
+            CHECK(!am->summary_open);
+            /* The detach is the daemon's before the model is let go. */
+            CHECK(WAIT_UNTIL_DO(oc_client_tick(a), ({
+                      sqlite3 *qdb = NULL;
+                      int watched = -1;
+                      if (sqlite3_open_v2(tpath("itest_core.db"), &qdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                          sqlite3_stmt *qs = NULL;
+                          if (sqlite3_prepare_v2(qdb, "SELECT COUNT(*) FROM summary_requests WHERE conn_id<>0;", -1, &qs,
+                                                 NULL) == SQLITE_OK && sqlite3_step(qs) == SQLITE_ROW)
+                              watched = sqlite3_column_int(qs, 0);
+                          sqlite3_finalize(qs);
+                      }
+                      sqlite3_close(qdb);
+                      watched == 0; }), 5000));
+            __atomic_store_n(&core_sum_hold, 0, __ATOMIC_RELEASE);
+            CHECK(WAIT_FOR(a, m->n_sum_notices == 1));
+            oc_summary_notice n;
+            CHECK(oc_model_summary_notice_take((oc_model *)am, &n) == 1 && n.status == OC_SUM_OK && n.channel_id == 1 &&
+                  n.scope == OC_SUM_RANGE);
+            CHECK(oc_client_summary_open_notice(a, n.id, 0, 0) != 0);
+            CHECK(am->summary_open && am->summary_loading && am->n_sum_notices == 0);
+            CHECK(WAIT_FOR(a, m->summary_open && !m->summary_loading));
+            CHECK(am->summary_status == OC_SUM_OK && !strcmp(am->summary.overview, CSUM_OVERVIEW));
+            oc_client_close_summary(a);
+            /* Cancelled while it is made: closed here, and nothing told after. */
+            __atomic_store_n(&core_sum_hold, 1, __ATOMIC_RELEASE);
+            c0 = __atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED);
+            CHECK(oc_client_summarize(a, 1, OC_SUM_RANGE, now_ms - 4 * 86400000ull, now_ms + 86400000ull) != 0);
+            CHECK(WAIT_UNTIL_DO(oc_client_tick(a), __atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED) != c0, 5000));
+            oc_client_summary_cancel(a);
+            CHECK(!am->summary_open);
+            /* The cancel stops the held model at its next pause; a summary
+             * asked after it is made, and no notice came for the cancelled. */
+            __atomic_store_n(&core_sum_hold, 0, __ATOMIC_RELEASE);
+            c0 = __atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED);
+            CHECK(oc_client_summarize(a, 1, OC_SUM_RANGE, now_ms - 5 * 86400000ull, now_ms + 86400000ull) != 0);
+            CHECK(WAIT_FOR(a, m->summary_open && !m->summary_loading && m->summary_status == OC_SUM_OK));
+            CHECK(__atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED) > c0);   /* the worker made it */
+            CHECK(am->n_sum_notices == 0);
+            oc_client_close_summary(a);
+        }
+
+        /* who-reacted (REQ-071): erik reacts :+1:, dana reacts :tada:; dana
+         * inspects the message and the reactor list carries both — each reactor
+         * paired with the emoji they used. */
+        oc_client_react(b, 1, mid, ":+1:", 1);
+        oc_client_react(a, 1, mid, ":tada:", 1);
+        CHECK(WAIT_FOR(a, reaction_count(m, 1, mid, ":+1:", NULL) == 1 &&
+                          reaction_count(m, 1, mid, ":tada:", NULL) == 1));
+        oc_client_list_reactions(a, 1, mid);
+        CHECK(WAIT_FOR(a, m->reactlist_open && m->n_reactors >= 2));
+        {
+            const oc_model *am = oc_client_model(a);
+            int erik_thumb = 0, dana_tada = 0;
+            for (size_t j = 0; j < am->n_reactors; j++) {
+                const char *nm = oc_model_user_name(am, am->reactors[j].user_id);
+                if (nm && strcmp(nm, "erik") == 0 && strcmp(am->reactors[j].emoji, ":+1:") == 0) erik_thumb = 1;
+                if (nm && strcmp(nm, "dana") == 0 && strcmp(am->reactors[j].emoji, ":tada:") == 0) dana_tada = 1;
+            }
+            CHECK(erik_thumb && dana_tada);
+        }
+        oc_client_close_reactions(a);
+        CHECK(!oc_client_model(a)->reactlist_open && oc_client_model(a)->n_reactors == 0);
+
+        /* polls (REQ-225): offered by this daemon; dana posts one, both see
+         * it; erik votes and both see the count, his choice on his side only;
+         * dana asks who voted and gets erik. */
+        CHECK(oc_model_has_capability(oc_client_model(a), OC_CAP_POLLS));
+        {
+            const char *colours[3] = { "red", "green", "blue" };
+            CHECK(oc_client_post_poll(a, 1, 0, T_POLL, colours, 3, 0, 0) == 0);
+            CHECK(oc_client_post_poll(a, 1, 0, T_POLL, colours, 1, 0, 0) == -1);   /* one option: refused here */
+            CHECK(WAIT_FOR(b, channel_msg_by_body(m, 1, T_POLL) && channel_msg_by_body(m, 1, T_POLL)->poll));
+            const oc_msg *pm = channel_msg_by_body(oc_client_model(b), 1, T_POLL);
+            uint64_t pid = pm ? pm->message_id : 0;
+            CHECK(pm && pm->poll->n_options == 3 && pm->poll->voters == 0);
+            uint8_t blue[1] = { 2 };
+            oc_client_vote(b, 1, pid, blue, 1);
+            CHECK(WAIT_FOR(b, oc_model_poll(m, 1, pid) && oc_model_poll(m, 1, pid)->mine == 0x4));
+            CHECK(WAIT_FOR(a, oc_model_poll(m, 1, pid) && oc_model_poll(m, 1, pid)->counts[2] == 1));
+            CHECK(oc_model_poll(oc_client_model(a), 1, pid)->mine == 0);
+            oc_client_list_poll_voters(a, 1, pid);
+            CHECK(WAIT_FOR(a, m->voterlist_open && m->n_voters == 1));
+            const char *who = oc_model_user_name(oc_client_model(a), oc_client_model(a)->voters[0].user_id);
+            CHECK(who && strcmp(who, "erik") == 0 && oc_client_model(a)->voters[0].option == 2);
+            oc_client_close_poll_voters(a);
+        }
+
+        /* notification prefs (REQ-130/131): dana mutes channel 1 to mentions-only
+         * and sets a DND window; each SET returns a fresh NOTIFY_PREFS sync that
+         * folds into the channel's notify_level + the model DND fields. */
+        oc_client_set_notify_pref(a, 1, OC_NOTIFY_MENTIONS);
+        CHECK(WAIT_FOR(a, oc_model_channel((oc_model *)m, 1) &&
+                          oc_model_channel((oc_model *)m, 1)->notify_level == OC_NOTIFY_MENTIONS));
+        /* The SCHEDULE (REQ-136): a per-weekday one, so the round trip proves the
+         * rows survive and not merely the two base integers. The window is the
+         * ALLOWED range now — 07:00 to 22:00 is the working day. */
+        { oc_schedule_day d[2] = { { 1, 1, 540, 1020 }, { 0, 0, 0, 0 } };  /* Mon 9-5, Sun off */
+          oc_client_set_schedule(a, OC_DND_CUSTOM, -300, 420, 1320, d, 2); }
+        CHECK(WAIT_FOR(a, m->dnd_mode == OC_DND_CUSTOM && m->allow_start_min == 420 &&
+                          m->allow_end_min == 1320 && m->n_sched_days == 2 &&
+                          m->tz_offset_min == -300));
+        /* Stored — and returned — in WEEKDAY order, not the order they were sent:
+         * a schedule is a week, and a client rendering seven rows should not have
+         * to sort them or care how the last edit happened to be assembled. */
+        { const oc_model *sm = oc_client_model(a);
+          CHECK(sm->sched_days[0].weekday == 0 && sm->sched_days[0].enabled == 0);
+          CHECK(sm->sched_days[1].weekday == 1 && sm->sched_days[1].start_min == 540); }
+        /* Opening the prefs overlay re-syncs and the channel level survives. */
+        oc_client_toggle_prefs(a, 1);
+        CHECK(WAIT_FOR(a, m->prefs_open &&
+                          oc_model_channel((oc_model *)m, 1)->notify_level == OC_NOTIFY_MENTIONS));
+        /* Turning the schedule off keeps nothing behind — including the days,
+         * which would otherwise apply again the moment it was re-enabled. */
+        oc_client_set_schedule(a, OC_DND_OFF, -300, 0, 0, NULL, 0);
+        CHECK(WAIT_FOR(a, m->dnd_mode == OC_DND_OFF && m->n_sched_days == 0));
+
+        /* Keywords and priority people (REQ-135), and the client-side matcher
+         * that has to agree with the server's — same list, same scanner. */
+        { char terms[2][OC_KEYWORD_MAX] = { "deploy", "release train" };
+          oc_client_set_keywords(a, terms, 2); }
+        CHECK(WAIT_FOR(a, m->n_kw_terms == 2));
+        { const oc_model *km = oc_client_model(a);
+          CHECK(oc_model_keyword_hit(km, "ship the deploy now", 19, NULL, NULL));
+          CHECK(oc_model_keyword_hit(km, "the release train leaves", 24, NULL, NULL));
+          /* "deploy" must not match "deployment": a highlight-word that fires on
+           * every longer word containing it is a word you turn off. */
+          CHECK(!oc_model_keyword_hit(km, "the deployment is fine", 22, NULL, NULL)); }
+        /* A real person: the daemon refuses an id that is nobody, so a test using
+         * 4242 would pass on a list that silently stayed empty. */
+        uint64_t vip_id = oc_model_user_id(oc_client_model(a), "erik");
+        CHECK(vip_id != 0);
+        { uint64_t vip[1] = { vip_id }; oc_client_set_priority(a, vip, 1); }
+        CHECK(WAIT_FOR(a, m->n_pri_people == 1 && oc_model_is_priority(m, vip_id)));
+        CHECK(!oc_model_is_priority(oc_client_model(a), 999999));
+        oc_client_toggle_prefs(a, 0);
+        CHECK(!oc_client_model(a)->prefs_open);
+
+        /* synced client-settings bucket: dana sets keys on device `a`; each SET
+         * returns a fresh snapshot that folds into her model (read via
+         * oc_model_setting) and — because the daemon fans the sync to all of a
+         * user's connections — reaches a second dana device `d`. Deleting a key
+         * (empty value) drops it everywhere. */
+        oc_client *d = start_as(NULL, "127.0.0.1", arg.port, "dana:pw-dana", NULL, NULL, 1, NULL);
+        CHECK(d);
+        CHECK(WAIT_FOR(d, m->authed && m->user_id != 0));
+        oc_client_list_settings(d);                 /* subscribe to the (empty) bucket */
+        CHECK(WAIT_FOR(d, m->settings_synced));
+        oc_client_set_setting(a, "mouse", "1");
+        CHECK(WAIT_FOR(a, oc_model_setting(m, "mouse") && strcmp(oc_model_setting(m, "mouse"), "1") == 0));
+        CHECK(WAIT_FOR(d, oc_model_setting(m, "mouse") && strcmp(oc_model_setting(m, "mouse"), "1") == 0));
+        oc_client_set_setting(a, "time_24h", "1");   /* a second key: both persist */
+        CHECK(WAIT_FOR(d, oc_model_setting(m, "time_24h") &&
+                          strcmp(oc_model_setting(m, "time_24h"), "1") == 0 &&
+                          oc_model_setting(m, "mouse") != NULL));
+        oc_client_set_setting(a, "mouse", "");       /* empty value deletes the key */
+        CHECK(WAIT_FOR(d, oc_model_setting(m, "mouse") == NULL &&
+                          oc_model_setting(m, "time_24h") != NULL));
+        oc_client_stop(d);
+
+        /* self-service profile (REQ-020): dana renames herself; the change fans to
+         * every roster — her own (a) and erik's view (b). A password rotation
+         * succeeds with the right old password and is rejected with a wrong one.
+         * Restore both so the later "dana" author/roster assertions still hold. */
+        uint64_t danaid = oc_client_model(a)->user_id;
+        oc_client_set_display_name(a, T_DISPLAY);
+        CHECK(WAIT_FOR(a, strcmp(oc_model_user_name(m, danaid), T_DISPLAY) == 0));
+        CHECK(WAIT_FOR(b, strcmp(oc_model_user_name(m, danaid), T_DISPLAY) == 0));
+        /* A password is changed on the daemon's page (AUTH.md §8.10), which
+         * signs every device out -- the page is no session -- so dana's client
+         * is started again after, as a person's would be. */
+        {
+            char why[256];
+            CHECK(oc_test_change_password("127.0.0.1", arg.port, NULL, "dana", "pw-dana", "harbor-violet-granite", why, sizeof why) == 0);
+            CHECK(oc_test_change_password("127.0.0.1", arg.port, NULL, "dana", "wrong-old", "irrelevant", why, sizeof why) != 0);
+            CHECK(oc_test_change_password("127.0.0.1", arg.port, NULL, "dana", "harbor-violet-granite", "meadow-cobalt-thunder", why, sizeof why) == 0);
+            oc_client_stop(a);
+            a = start_as(NULL, "127.0.0.1", arg.port, "dana:meadow-cobalt-thunder", NULL, NULL, 1, NULL);
+            CHECK(a != NULL);
+            if (!a) return failures;
+            CHECK(WAIT_FOR(a, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+        }
+        oc_client_set_display_name(a, "dana");                      /* restore name */
+        CHECK(WAIT_FOR(a, strcmp(oc_model_user_name(m, danaid), "dana") == 0));
+        CHECK(WAIT_FOR(b, strcmp(oc_model_user_name(m, danaid), "dana") == 0));
+
+        /* erik replies to dana's message in a thread: both see the parent's reply
+         * count rise, and opening the thread streams the reply into the buffer. */
+        oc_client_reply(b, 1, mid, T_REPLY);
+        CHECK(WAIT_FOR(a, find_msg(m, 1, mid) && find_msg(m, 1, mid)->reply_count == 1));
+        oc_client_open_thread(b, 1, mid);
+        CHECK(WAIT_FOR(b, m->thread_open && m->n_thread_msgs >= 1));
+        {
+            const oc_model *bm = oc_client_model(b);
+            int found = 0;
+            for (size_t j = 0; j < bm->n_thread_msgs; j++)
+                if (bm->thread_msgs[j].body && strcmp(bm->thread_msgs[j].body, T_REPLY) == 0)
+                    found = 1;
+            CHECK(found);
+        }
+        oc_client_close_thread(b);
+        CHECK(!oc_client_model(b)->thread_open && oc_client_model(b)->n_thread_msgs == 0);
+
+        /* dana searches for a word in her message; the hit streams into the
+         * search buffer and includes that message. */
+        oc_client_search(a, "core");
+        CHECK(WAIT_FOR(a, m->search_open && m->n_search >= 1));
+        {
+            const oc_model *am = oc_client_model(a);
+            int found = 0;
+            for (size_t j = 0; j < am->n_search; j++)
+                if (am->search_results[j].message_id == mid) found = 1;
+            CHECK(found);
+        }
+        oc_client_close_search(a);
+        CHECK(!oc_client_model(a)->search_open && oc_client_model(a)->n_search == 0);
+
+        /* dana creates a public channel — it shows up joined in her list — and
+         * erik joins it by id, seeing it joined too. */
+        oc_client_create_channel(a, "war-room");
+        CHECK(WAIT_FOR(a, channel_named(m, "war-room") != 0));
+        uint64_t warroom = channel_named(oc_client_model(a), "war-room");
+        CHECK(warroom != 0);
+        oc_client_join_channel(b, warroom);
+        CHECK(WAIT_FOR(b, oc_model_channel((oc_model *)m, warroom) &&
+                          oc_model_channel((oc_model *)m, warroom)->joined));
+
+        /* dana opens a DM with erik: a DM channel appears carrying erik as the
+         * peer (the daemon now reports the DM peer in CHANNEL_INFO). */
+        uint64_t erikid = oc_model_user_id(oc_client_model(a), "erik");
+        CHECK(erikid != 0);
+        oc_client_open_dm(a, erikid, 0);
+        CHECK(WAIT_FOR(a, dm_with_peer(m, erikid) != 0));
+
+        /* Marking channel 1 read clears erik's unread. */
+        oc_client_mark_read(b, 1);
+        oc_client_tick(b);
+        CHECK(channel_unread(oc_client_model(b), 1) == 0);
+
+        /* dana's own send never counts as unread for her. */
+        CHECK(channel_unread(oc_client_model(a), 1) == 0);
+
+        /* A second message, then a fresh client (faye) that was not connected for
+         * either: it backfills channel 1 and sees the full history replayed. */
+        oc_client_send(a, 1, "second line for history");
+        CHECK(WAIT_FOR(b, channel_has_body(m, 1, "second line for history")));
+
+        oc_client *c = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", NULL, NULL, 1, NULL);
+        CHECK(c != NULL);
+        if (c) {
+            CHECK(WAIT_FOR(c, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+            oc_client_backfill(c, 1);
+            CHECK(WAIT_FOR(c, channel_has_body(m, 1, "hello from the core") &&
+                              channel_has_body(m, 1, "second line for history")));
+            /* Backfilled history carries the author's display name too (the JOIN
+             * fallback in the replay query). */
+            CHECK(channel_has_named(oc_client_model(c), 1, "second line for history", "dana"));
+            /* faye logs out: the server revokes her session and closes the
+             * connection, so the model reports disconnected. */
+            oc_client_logout(c, OC_LOGOUT_THIS);
+            CHECK(WAIT_FOR(c, !m->connected));
+            oc_client_stop(c);
+        }
+
+        /* dana edits her first message; erik sees the new body + edited flag,
+         * then dana deletes it and erik sees the tombstone. (After faye's
+         * backfill, which asserted the pre-edit body.) */
+        oc_client_edit(a, 1, mid, T_EDIT_BODY);
+        CHECK(WAIT_FOR(b, find_msg(m, 1, mid) && find_msg(m, 1, mid)->edited &&
+                          find_msg(m, 1, mid)->body &&
+                          strcmp(find_msg(m, 1, mid)->body, T_EDIT_BODY) == 0));
+        oc_client_delete(a, 1, mid);
+        CHECK(WAIT_FOR(b, find_msg(m, 1, mid) && find_msg(m, 1, mid)->deleted));
+
+        /* attachments (REQ-140/141): dana uploads a multi-chunk file to channel 1;
+         * the core streams it (UPLOAD_BEGIN→CHUNK×N→END→OK) and links it into a
+         * message. erik sees the message carry the attachment metadata, downloads
+         * it by id, and the reassembled bytes match the original. */
+        {
+            const size_t N = 150000;   /* > 2× the 65024-byte chunk: exercises windowing */
+            unsigned char *blob = malloc(N);
+            CHECK(blob != NULL);
+            for (size_t k = 0; k < N; k++) blob[k] = (unsigned char)((k * 7 + 3) % 251);
+            const char *src = tpath("itest_core_upload.bin");
+            const char *dst = tpath("itest_core_download.bin");
+            unlink(src); unlink(dst);
+            FILE *sf = fopen(src, "wb");
+            CHECK(sf != NULL);
+            if (sf) { CHECK(fwrite(blob, 1, N, sf) == N); fclose(sf); }
+
+            oc_client_upload(a, 1, src);
+            /* erik receives a message carrying the attachment (empty body). */
+            char fn[128] = {0}; uint64_t asz = 0, aid = 0;
+            CHECK(WAIT_FOR(b, (aid = channel_attach(m, 1, fn, sizeof fn, &asz)) != 0));
+            CHECK(asz == N);
+            CHECK(strcmp(fn, "itest_core_upload.bin") == 0);
+            /* erik downloads it by id; the bytes round-trip intact. */
+            uint64_t aid_b = channel_attach(oc_client_model(b), 1, fn, sizeof fn, &asz);
+            oc_client_download(b, aid_b, dst);
+            CHECK(WAIT_FOR(b, file_matches(dst, blob, N)));
+
+            free(blob);
+            unlink(src); unlink(dst);
+        }
+
+        /* The files list pages (REQ-143). Three files, two to a page: the first
+         * page says there are more, the second brings the rest and says there are
+         * not, and no row appears twice. The daemon's page size is 2 here. */
+        {
+            uint64_t seen[8];
+            size_t n_seen = 0;
+            for (int k = 0; k < 3; k++) {
+                char path[sizeof g_dir + 32];
+                snprintf(path, sizeof path, "%s/itest_core_page%d.bin", g_dir, k);
+                FILE *pf = fopen(path, "wb");
+                CHECK(pf != NULL);
+                if (pf) { fputc('a' + k, pf); fclose(pf); }
+                oc_client_upload(a, 1, path);
+                /* One at a time, so their order is the order they were shared. */
+                size_t want = (size_t)k + 2;   /* the earlier upload is already there */
+                CHECK(WAIT_FOR(a, ({
+                    size_t nf = 0;
+                    const oc_channel *ch = oc_model_channel((oc_model *)m, 1);
+                    for (size_t i2 = 0; ch && i2 < ch->n_msgs; i2++) nf += ch->msgs[i2].n_attach;
+                    nf >= want; })));
+            }
+            const oc_model *am = oc_client_model(a);
+            oc_client_list_files(a, 1);
+            CHECK(WAIT_FOR(a, !m->filelist_loading && m->n_files > 0));
+            CHECK(am->n_files == 2);
+            CHECK(am->files_more == 1);
+            for (size_t i2 = 0; i2 < am->n_files; i2++) seen[n_seen++] = am->files[i2].id;
+            /* Newest first, and strictly ordered: the cursor is (created, id). */
+            CHECK(am->files[0].created_at >= am->files[1].created_at);
+            oc_client_list_files_more(a);
+            CHECK(WAIT_FOR(a, !m->filelist_loading && m->n_files > 2));
+            /* Four files are shared by now: the multi-chunk upload above and these
+             * three, so the second page brings two more and the list holds four. */
+            CHECK(am->n_files == 4);
+            int repeated = 0;
+            for (size_t i2 = 2; i2 < am->n_files; i2++)
+                for (size_t j2 = 0; j2 < n_seen; j2++) if (am->files[i2].id == seen[j2]) repeated = 1;
+            CHECK(!repeated);
+            /* The last page says so, and asking again does nothing. */
+            CHECK(WAIT_FOR(a, m->files_more == 0));
+            size_t had = am->n_files;
+            oc_client_list_files_more(a);
+            CHECK(WAIT_FOR(a, m->n_files == had));
+            for (int k = 0; k < 3; k++) {
+                char path[sizeof g_dir + 32];
+                snprintf(path, sizeof path, "%s/itest_core_page%d.bin", g_dir, k);
+                unlink(path);
+            }
+        }
+
+        /* video messages (REQ-162/165): dana asks for an earlier file's bytes and
+         * posts a video message straight after, so the post has to wait its turn in
+         * the transfer queue rather than be refused as busy; both complete. erik
+         * sees the media facts and the summary line, fetches the 9 MiB video — past
+         * the 8 MiB inline ceiling — with progress, and fetches the poster. A post
+         * cancelled while queued never goes out. */
+        {
+            uint64_t earlier = channel_attach(oc_client_model(b), 1, (char[128]){0}, 128, NULL);
+            CHECK(earlier != 0);
+            const size_t VN = 9u * 1024u * 1024u, PN = 3000;
+            uint8_t *video = malloc(VN), *poster = malloc(PN);
+            uint8_t *vcopy = malloc(VN), *pcopy = malloc(PN);
+            CHECK(video && poster && vcopy && pcopy);
+            if (video && poster && vcopy && pcopy) {
+                for (size_t k = 0; k < VN; k++) video[k] = (uint8_t)(k * 13u + (k >> 16));
+                for (size_t k = 0; k < PN; k++) poster[k] = (uint8_t)(k * 5u + 1u);
+                memcpy(vcopy, video, VN); memcpy(pcopy, poster, PN);
+
+                oc_client_fetch_attachment(a, earlier);
+                uint64_t tag = oc_client_post_video(a, 1, 0, video, VN, poster, PN,
+                                                    65000, 1280, 720, "");
+                video = poster = NULL;                          /* the core owns them */
+                CHECK(tag != 0);
+                int posted = 0;
+                posted = WAIT_FOR_MS(a, m->media_posted_tag == tag, 30000);
+                CHECK(posted);
+                size_t elen = 0;
+                uint8_t *ebytes = NULL;
+                CHECK(WAIT_FOR(a, (ebytes = take_fetched(a, earlier, &elen)) != NULL));
+                CHECK(elen == 150000);
+                free(ebytes);
+
+                const oc_msg *vm = NULL;
+                CHECK(WAIT_FOR(b, (vm = channel_video(m, 1)) != NULL));
+                vm = channel_video(oc_client_model(b), 1);
+                if (vm) {
+                    const oc_attachment *va = &vm->attach[0];
+                    CHECK(va->duration_ms == 65000 && va->width == 1280 && va->height == 720);
+                    CHECK(va->poster_id != 0 && va->size == VN);
+                    CHECK(strcmp(va->mime, "video/mp4") == 0);
+                    /* Named for whose and when: "dana-video-YYYYMMDDHHMMSS.mp4". */
+                    CHECK(strncmp(va->filename, "dana-video-", 11) == 0 && strlen(va->filename) == 11 + 14 + 4 &&
+                          strcmp(va->filename + 25, ".mp4") == 0);
+                    char prev[96];
+                    oc_model_msg_preview(oc_client_model(b), vm, prev, sizeof prev);
+                    CHECK(strstr(prev, "1:05") != NULL);   /* said as a video, with its length */
+
+                    uint64_t vid = va->id, pid = va->poster_id;
+                    CHECK(oc_client_fetch_media(b, vid) == vid);
+                    size_t vlen = 0;
+                    uint8_t *vbytes = NULL;
+                                            WAIT_FOR_MS(b, (vbytes = take_fetched(b, vid, &vlen)) != NULL, 30000);
+                    CHECK(vbytes && vlen == VN && memcmp(vbytes, vcopy, VN) == 0);
+                    free(vbytes);
+                    CHECK(oc_client_model(b)->xfer_tag == vid &&
+                          oc_client_model(b)->xfer_done == VN && oc_client_model(b)->xfer_total == VN);
+
+                    oc_client_fetch_attachment(b, pid);
+                    size_t plen = 0;
+                    uint8_t *pbytes = NULL;
+                    CHECK(WAIT_FOR(b, (pbytes = take_fetched(b, pid, &plen)) != NULL));
+                    CHECK(pbytes && plen == PN && memcmp(pbytes, pcopy, PN) == 0);
+                    free(pbytes);
+                }
+
+                /* Cancelled while queued behind another post: only the other lands. */
+                uint8_t *v2 = malloc(2 * 1024 * 1024), *p2 = malloc(100);
+                uint8_t *v3 = malloc(1000), *p3 = malloc(100);
+                if (v2 && p2 && v3 && p3) {
+                    memset(v2, 2, 2 * 1024 * 1024); memset(p2, 2, 100);
+                    memset(v3, 3, 1000); memset(p3, 3, 100);
+                    uint64_t t2 = oc_client_post_video(a, 1, 0, v2, 2 * 1024 * 1024, p2, 100, 1000, 640, 360, "first");
+                    uint64_t t3 = oc_client_post_video(a, 1, 0, v3, 1000, p3, 100, 1000, 640, 360, "second");
+                    oc_client_cancel_transfer(a, t2);
+                    int second = 0;
+                    second = WAIT_FOR_MS(a, m->media_posted_tag == t3, 30000);
+                    CHECK(second);
+                    CHECK(WAIT_FOR(b, channel_has_body(m, 1, "second")));
+                    CHECK(!channel_has_body(oc_client_model(b), 1, "first"));
+                    CHECK(channel_video_count(oc_client_model(b), 1) == 2);
+                } else {
+                    free(v2); free(p2); free(v3); free(p3);
+                }
+            }
+            free(video); free(poster); free(vcopy); free(pcopy);
+        }
+
+        /* several files and a line of text as ONE message (REQ-140): the files go
+         * up in order and one message carries them all, in that order, with the
+         * text. The same into a thread. A file that cannot be read posts nothing.
+         * Every outcome is readable by tag afterwards, however quickly it came and
+         * went. Cancelling is proved in itest_slow_blob.c, where a gated backend
+         * makes "still running" and "still queued" hold by construction. */
+        {
+            const char *fp3[3] = { tpath("itest_core_pf0.txt"), tpath("itest_core_pf1.bin"),
+                                   tpath("itest_core_pf2.txt") };
+            const size_t fsz[3] = { 10, 200000, 1 };   /* the middle one spans chunks */
+            for (int k = 0; k < 3; k++) {
+                FILE *f = fopen(fp3[k], "wb");
+                CHECK(f != NULL);
+                if (f) { for (size_t i2 = 0; i2 < fsz[k]; i2++) fputc('a' + k, f); fclose(f); }
+            }
+            uint64_t tag = oc_client_post_files(a, 1, 0, fp3, 3, "three files");
+            CHECK(tag != 0);
+            CHECK(WAIT_FOR(a, ({ const oc_xfer_state *xs = oc_model_xfer(m, tag); xs && xs->phase == 1; })));
+            const oc_xfer_state *xs = oc_model_xfer(oc_client_model(a), tag);
+            CHECK(xs && xs->file == 2 && xs->done == 1 && xs->total == 1);
+            CHECK(WAIT_FOR(b, channel_has_body(m, 1, "three files")));
+            const oc_msg *pm = channel_msg_by_body(oc_client_model(b), 1, "three files");
+            CHECK(pm && pm->n_attach == 3);
+            if (pm && pm->n_attach == 3) {
+                CHECK(strcmp(pm->attach[0].filename, "itest_core_pf0.txt") == 0 && pm->attach[0].size == 10);
+                CHECK(strcmp(pm->attach[1].filename, "itest_core_pf1.bin") == 0 && pm->attach[1].size == 200000);
+                CHECK(strcmp(pm->attach[2].filename, "itest_core_pf2.txt") == 0 && pm->attach[2].size == 1);
+            }
+
+            /* Into a thread: the root gains a reply, and the channel no message. */
+            if (pm) {
+                uint64_t root = pm->message_id;
+                uint64_t rt = oc_client_post_files(a, 1, root, fp3, 1, "one in the thread");
+                CHECK(rt != 0);
+                CHECK(WAIT_FOR(a, ({ const oc_xfer_state *r = oc_model_xfer(m, rt); r && r->phase == 1; })));
+                CHECK(WAIT_FOR(b, ({ const oc_msg *r = channel_msg_by_body(m, 1, "three files");
+                                     r && r->reply_count == 1; })));
+                CHECK(!channel_has_body(oc_client_model(b), 1, "one in the thread"));
+            }
+
+            /* A file missing from the middle: a failure, and no message. */
+            const char *bad[3] = { fp3[0], tpath("itest_core_pf_missing.txt"), fp3[2] };
+            uint64_t bt = oc_client_post_files(a, 1, 0, bad, 3, "never posted");
+            CHECK(WAIT_FOR(a, ({ const oc_xfer_state *r = oc_model_xfer(m, bt); r && r->phase == 2; })));
+            CHECK(oc_model_xfer(oc_client_model(a), bt)->file == 1);
+
+            /* Messages arrive in the order they were sent, so once erik has the
+             * next one he would already have the failed post, had it gone. */
+            oc_client_send(a, 1, "after the failed post");
+            CHECK(WAIT_FOR(b, channel_has_body(m, 1, "after the failed post")));
+            CHECK(!channel_has_body(oc_client_model(b), 1, "never posted"));
+
+            /* No more than the wire carries, and nothing empty. */
+            const char *many[OC_MAX_ATTACH + 1];
+            for (size_t i2 = 0; i2 <= OC_MAX_ATTACH; i2++) many[i2] = fp3[0];
+            CHECK(oc_client_post_files(a, 1, 0, many, OC_MAX_ATTACH + 1, "") == 0);
+            CHECK(oc_client_post_files(a, 1, 0, many, 0, "") == 0);
+            const char *blank[1] = { "" };
+            CHECK(oc_client_post_files(a, 1, 0, blank, 1, "") == 0);
+
+            /* An image pasted from the clipboard (REQ-140): bytes held in memory
+             * beside a file on disk, posted as one message under the name given,
+             * the bytes intact. The core copies them, so the caller's buffer may
+             * go at once. */
+            {
+                uint8_t *img = malloc(150000);
+                CHECK(img != NULL);
+                if (img) {
+                    for (size_t i2 = 0; i2 < 150000; i2++) img[i2] = (uint8_t)(i2 * 7);
+                    oc_post_item items[2];
+                    memset(items, 0, sizeof items);
+                    items[0].data = img; items[0].len = 150000; items[0].name = "pasted-image-1.png";
+                    items[1].path = fp3[0];
+                    uint64_t it = oc_client_post_items(a, 1, 0, items, 2, "pasted");
+                    CHECK(it != 0);
+                    free(img);
+                    CHECK(WAIT_FOR(b, channel_has_body(m, 1, "pasted")));
+                    const oc_msg *im = channel_msg_by_body(oc_client_model(b), 1, "pasted");
+                    CHECK(im && im->n_attach == 2);
+                    if (im && im->n_attach == 2) {
+                        CHECK(strcmp(im->attach[0].filename, "pasted-image-1.png") == 0);
+                        CHECK(im->attach[0].size == 150000);
+                        CHECK(strcmp(im->attach[0].mime, "image/png") == 0);
+                        CHECK(strcmp(im->attach[1].filename, "itest_core_pf0.txt") == 0);
+                    }
+                }
+                /* Exactly one of a path and bytes, and bytes need a name. */
+                uint8_t one = 1;
+                oc_post_item both = { fp3[0], &one, 1, "x.png" };
+                oc_post_item unnamed = { NULL, &one, 1, NULL };
+                oc_post_item neither = { NULL, NULL, 0, "x.png" };
+                CHECK(oc_client_post_items(a, 1, 0, &both, 1, "") == 0);
+                CHECK(oc_client_post_items(a, 1, 0, &unnamed, 1, "") == 0);
+                CHECK(oc_client_post_items(a, 1, 0, &neither, 1, "") == 0);
+            }
+
+            for (int k = 0; k < 3; k++) unlink(fp3[k]);
+        }
+
+        /* incoming webhooks (REQ-170): dana mints a webhook on channel 1 — the
+         * server answers with a WEBHOOK_INFO whose token is shown once in her
+         * model. She opens the webhook overlay (a list refresh), sees the labeled
+         * entry, then deletes it and the row drops from the list. */
+        oc_client_create_webhook(a, 1, "ci-bot");
+        CHECK(WAIT_FOR(a, m->webhook_token[0] != '\0' && m->webhook_new_id != 0));
+        uint64_t wid = oc_client_model(a)->webhook_new_id;
+        oc_client_webhooks(a, 1);
+        CHECK(WAIT_FOR(a, m->weblist_open && m->n_webhooks >= 1));
+        {
+            const oc_model *am = oc_client_model(a);
+            int found = 0;
+            for (size_t j = 0; j < am->n_webhooks; j++)
+                if (am->webhooks[j].webhook_id == wid && strcmp(am->webhooks[j].label, "ci-bot") == 0) found = 1;
+            CHECK(found);
+        }
+        oc_client_delete_webhook(a, wid);
+        CHECK(WAIT_FOR(a, m->n_webhooks == 0));
+        oc_client_close_webhooks(a);
+
+        /* admin / user management (REQ-030/033): dana (owner) promotes erik to
+         * admin — the USER_UPDATED folds his new role into her roster — mints a
+         * tenant invite token (shown once in the model), then removes him, which
+         * marks him disabled in the roster and drops his connection. This runs
+         * last, since removal closes erik's client (b). */
+        /* Talking mode (REQ-291-295, ARCH-111): the daemon's voices arrive with
+         * the connection, messages that arrive while it is on are queued and
+         * their speech fetched in order, and what has nothing to say is skipped
+         * without stalling the queue. */
+        {
+            const oc_model *ma = oc_client_model(a);
+            CHECK(WAIT_FOR(a, oc_model_tts_available(m)));
+            CHECK(oc_model_tts_voice_count(ma) == 2);
+            CHECK(strcmp(oc_model_tts_voice(ma, 0)->id, "core-voice-m") == 0);
+            CHECK(strcmp(oc_model_tts_voice(ma, 1)->label, core_tts_voice_label(1)) == 0);
+            CHECK(strcmp(oc_model_tts_preview(ma), CORE_TTS.preview) == 0);
+            CHECK(strcmp(oc_model_tts_voice_label(ma, "core-voice-f"), core_tts_voice_label(1)) == 0);
+            CHECK(strcmp(oc_model_tts_voice_label(ma, "nope"), "") == 0);
+
+            /* Off by default: what was said before the toggle is not read. */
+            CHECK(oc_model_listening_channel(ma) == 0);
+            oc_client_send(b, 1, "Said before anyone was listening.");
+            CHECK(WAIT_FOR(a, channel_has_body(m, 1, "Said before anyone was listening.")));
+            CHECK(oc_model_listen_queued(ma) == 0);
+
+            oc_client_listen(a, 1, 1);
+            CHECK(oc_model_listening_channel(ma) == 1);
+
+            /* From now on: the speech of what arrives, in order. */
+            oc_client_send(b, 1, "The first thing to be read aloud.");
+            uint8_t *mp4 = NULL;
+            size_t mlen = 0;
+            uint64_t spoken = 0;
+                            WAIT_FOR_MS(a, (spoken = oc_model_listen_take_audio((oc_model *)m, &mp4, &mlen)) != 0, 40000);
+            CHECK(spoken != 0 && mp4 != NULL && mlen > 0);
+            if (mp4) {
+                /* What arrives is playable: an audio-only Opus MP4. */
+                oc_mp4_info info;
+                CHECK(oc_mp4_parse(mp4, mlen, &info) == 0);
+                CHECK(!info.video.present && info.audio.present && info.duration_ms > 0);
+                oc_mp4_info_free(&info);
+                free(mp4);
+                mp4 = NULL;
+            }
+            CHECK(oc_model_listen_playing(ma) == spoken);
+
+            /* The next message waits its turn while that one is playing. */
+            oc_client_send(b, 1, "The second thing to be read aloud.");
+            CHECK(WAIT_FOR(a, m->n_listen_queue == 1));
+            oc_client_listen_done(a);                       /* the frontend finished playing */
+            uint64_t second = 0;
+                            WAIT_FOR_MS(a, (second = oc_model_listen_take_audio((oc_model *)m, &mp4, &mlen)) != 0, 40000);
+            CHECK(second != 0 && second != spoken);
+            free(mp4);
+            mp4 = NULL;
+            oc_client_listen_done(a);
+
+            /* What the listener types is not read back to them. They know what
+             * they just said, and the queue plays end to end, so it would land
+             * on top of the next person's reply. */
+            oc_client_send(a, 1, "Typed by the listener, not read aloud.");
+            CHECK(WAIT_FOR(a, channel_has_body(m, 1, "Typed by the listener, not read aloud.")));
+            /* Asserted on what is OFFERED TO PLAY, not on the queue: an empty
+             * queue proves nothing here, because the pump takes the only entry
+             * out of it the moment nothing else is playing. So someone else
+             * speaks next, and what is offered is theirs: the queue plays in
+             * order, so had the listener's own line been queued it would come
+             * first. No wait for something that should not happen. */
+            oc_client_send(b, 1, "Said after the listener's own line.");
+            CHECK(WAIT_FOR(a, body_id(m, 1, "Said after the listener's own line.") != 0));
+            uint64_t next = 0;
+                            WAIT_FOR_MS(a, (next = oc_model_listen_take_audio((oc_model *)m, &mp4, &mlen)) != 0, 40000);
+            CHECK(next != 0 && next == body_id(ma, 1, "Said after the listener's own line."));
+            CHECK(next != body_id(ma, 1, "Typed by the listener, not read aloud."));
+            free(mp4);
+            mp4 = NULL;
+            oc_client_listen_done(a);
+
+            /* A message with nothing to say is passed over, and the one after it
+             * is still spoken: the queue does not stall on it (REQ-294). */
+            uint32_t skipped_before = oc_model_listen_skipped(ma);
+            oc_client_send(b, 1, "\xF0\x9F\x8E\x89");
+            oc_client_send(b, 1, "And on to the next one.");
+            uint64_t third = 0;
+                            WAIT_FOR_MS(a, (third = oc_model_listen_take_audio((oc_model *)m, &mp4, &mlen)) != 0, 40000);
+            CHECK(third != 0);
+            CHECK(oc_model_listen_skipped(ma) > skipped_before);
+            free(mp4);
+            mp4 = NULL;
+            oc_client_listen_done(a);
+
+            /* Turning it off forgets the queue; a later message is not spoken. */
+            oc_client_listen(a, 1, 0);
+            CHECK(oc_model_listening_channel(ma) == 0 && oc_model_listen_queued(ma) == 0);
+            oc_client_send(b, 1, "Nobody is listening to this one.");
+            CHECK(WAIT_FOR(a, channel_has_body(m, 1, "Nobody is listening to this one.")));
+            uint8_t *none = NULL;
+            size_t nlen = 0;
+            CHECK(oc_model_listen_take_audio((oc_model *)ma, &none, &nlen) == 0);
+        }
+
+        /* Voice input (REQ-296-300, ARCH-112), with the stub recognizer. */
+        {
+            const oc_model *ma = oc_client_model(a);
+            CHECK(WAIT_FOR(a, oc_model_stt_available(m)));
+            CHECK(ma->stt_max_ms == 30000 && strcmp(ma->stt_lang, "en-US") == 0);
+
+            /* Push to talk: the words come back for the composer they were
+             * spoken into, with the spoken mention made a mention, and nothing
+             * is posted. */
+            size_t before_b = 0;
+            stt_say(a, OC_STT_MODE_PTT, 1, 1, 5);
+            char *words = NULL;
+            CHECK(WAIT_FOR(a, oc_model_stt_take_words((oc_model *)m, 1, 0, &words)));
+            CHECK(words && strcmp(words, spoken_words(5)) == 0);
+            free(words);
+            words = NULL;
+            CHECK(!channel_has_body(oc_client_model(b), 1, spoken_words(5)));
+            (void)before_b;
+
+            /* Words for another conversation wait for it. */
+            stt_say(a, OC_STT_MODE_PTT, 2, 1, 6);
+            uint32_t answered = ma->stt_answered;
+            CHECK(WAIT_FOR(a, m->stt_answered > answered));
+            CHECK(!oc_model_stt_take_words((oc_model *)ma, 1, 0, &words));
+            CHECK(oc_model_stt_take_words((oc_model *)ma, 2, 0, &words) && strcmp(words, spoken_words(6)) == 0);
+            free(words);
+            words = NULL;
+
+            /* Free talk: each segment is posted by the daemon, in order, as
+             * dana; erik reads them as ordinary messages. The client never sent
+             * a SEND for them. */
+            stt_say(a, OC_STT_MODE_FREE, 1, 1, 7);
+            stt_say(a, OC_STT_MODE_FREE, 1, 1, 8);
+            CHECK(WAIT_FOR(b, channel_has_body(m, 1, spoken_words(7)) && channel_has_body(m, 1, spoken_words(8))));
+            CHECK(WAIT_FOR(a, channel_has_body(m, 1, spoken_words(8))));
+            {
+                const oc_model *mb = oc_client_model(b);
+                uint64_t id7 = 0, id8 = 0, author = 0;
+                for (size_t i = 0; i < mb->n_channels; i++) {
+                    if (mb->channels[i].channel_id != 1) continue;
+                    for (size_t j = 0; j < mb->channels[i].n_msgs; j++) {
+                        const char *body = mb->channels[i].msgs[j].body;
+                        if (body && !strcmp(body, spoken_words(7))) { id7 = mb->channels[i].msgs[j].message_id; author = mb->channels[i].msgs[j].author_id; }
+                        if (body && !strcmp(body, spoken_words(8))) id8 = mb->channels[i].msgs[j].message_id;
+                    }
+                }
+                CHECK(id7 != 0 && id8 > id7);               /* in the order spoken */
+                CHECK(author == ma->user_id);               /* as the speaker */
+            }
+
+            /* A refusal reaches the model as one, with its reason. */
+            uint32_t errs = ma->stt_error_seq;
+            stt_say(a, OC_STT_MODE_PTT, 1, 3, 0);
+            CHECK(WAIT_FOR(a, m->stt_error_seq > errs));
+            CHECK(ma->stt_error_code == OC_ERR_STT_UNAVAILABLE);
+
+            /* The microphone has one owner: while dictation holds it, nothing
+             * else can open it, and stopping gives it back. */
+            setenv("OPENCHIME_DEV_AUDIO", "synthetic", 1);
+            int derr = 0;
+            oc_dictate *dict = oc_dictate_start(a, OC_STT_MODE_FREE, 1, 0, NULL, ma->stt_max_ms, &derr);
+            CHECK(dict != NULL && derr == OC_DICTATE_OK);
+            int aerr = 0;
+            oc_audio_dev *other = oc_audio_capture_open(NULL, 48000, 1, &aerr);
+            CHECK(other == NULL && aerr == OC_AUDIO_BUSY);
+            oc_dictate *second = oc_dictate_start(a, OC_STT_MODE_PTT, 1, 0, NULL, ma->stt_max_ms, &derr);
+            CHECK(second == NULL && derr == OC_DICTATE_BUSY);
+            oc_dictate_stop(dict, 0);
+            other = oc_audio_capture_open(NULL, 48000, 1, &aerr);
+            CHECK(other != NULL);
+            oc_audio_close(other);
+            unsetenv("OPENCHIME_DEV_AUDIO");
+        }
+
+        test_call_relay_family();
+        test_calls_e2e(a, b, arg.port);
+        test_calls_tcp(a, b);
+        test_calls_rejoin(a, b, arg.port);
+        test_pdm_e2e(a, b);
+
+        oc_client_set_role(a, erikid, OC_ROLE_ADMIN);
+        CHECK(WAIT_FOR(a, member_role(m, erikid) == OC_ROLE_ADMIN));
+        oc_client_invite_user(a, OC_ROLE_MEMBER);
+        CHECK(WAIT_FOR(a, m->invite_token[0] != '\0' && m->invite_role == OC_ROLE_MEMBER));
+        {
+            /* This daemon has password accounts and no provider, and its
+             * AUTH_CHALLENGE said so. */
+            const oc_model *am = oc_client_model(a);
+            CHECK(oc_model_offers_local(am) && !oc_model_offers_browser(am));
+            char text[1024];
+            CHECK(oc_model_invitation_text(am, "127.0.0.1", NULL, text, sizeof text) > 0 &&
+                  strstr(text, am->invite_token) != NULL);
+            /* The address goes on the wire as INVITE_USER's email -- trimmed of
+             * what a paste brings -- and this daemon, which nothing could redeem
+             * it at, refuses it in words. */
+            /* A refusal is told in this client's words for its code, not the
+             * server's text ("admin op rejected"). */
+            uint32_t seq = am->error_seq;
+            oc_client_set_role(a, am->user_id, OC_ROLE_MEMBER);   /* the only owner */
+            CHECK(WAIT_FOR(a, m->error_seq != seq && m->last_error_kind == OC_CERR_REFUSED &&
+                              m->last_error_code == OC_ERR_LAST_OWNER &&
+                              strcmp(m->last_error, oc_error_text(OC_ERR_LAST_OWNER)) == 0));
+            seq = am->error_seq;
+            oc_client_invite(a, OC_ROLE_MEMBER, "  lee@partner.example \n", 1);
+            CHECK(WAIT_FOR(a, m->error_seq != seq && m->last_error_kind == OC_CERR_REFUSED &&
+                              m->last_error_code == OC_ERR_INVITE_UNREDEEMABLE));
+            CHECK(am->invite_token[0] == '\0');
+        }
+        oc_client_remove_user(a, erikid);
+        CHECK(WAIT_FOR(a, member_disabled(m, erikid) == 1));
+        /* Shown as deactivated wherever a name is shown, and the DM with him is
+         * still there (REQ-033). */
+        {
+            const char *nm = oc_model_user_name(oc_client_model(a), erikid);
+            CHECK(nm && strncmp(nm, "erik", 4) == 0 && strlen(nm) > 4);   /* his name, marked */
+        }
+        CHECK(oc_model_user_disabled(oc_client_model(a), erikid) == 1);
+        CHECK(dm_with_peer(oc_client_model(a), erikid) != 0);
+
+        oc_client_stop(a);
+        oc_client_stop(b);
+
+        /* local store (ARCH-58): the session token + trusted fingerprint persist to a client
+         * SQLite file. A client authenticates with a password, its token lands in
+         * the store, and a second client pointed at the same store — given a
+         * *wrong* password — still authenticates, because it rides in on the
+         * stored session token (OC_AUTH_SESSION), never using the password. */
+        {
+            const char *sp = tpath("itest_core_store.db");
+            unlink_db(sp);
+            char inst[64]; snprintf(inst, sizeof inst, "127.0.0.1:%d", arg.port);
+
+            /* A session token persists only into a credential store, so this
+             * round-trip needs one (the in-memory mock stands in for the OS). */
+            oc_secret store_sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+            oc_client *s1 = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", sp, &store_sec, 1, NULL);
+            CHECK(s1 != NULL);
+            if (s1) {
+                CHECK(WAIT_FOR(s1, m->authed && m->user_id != 0));
+                oc_client_stop(s1);   /* QUIT (not logout): the session stays live */
+            }
+            /* The token + pin were persisted for this workspace. */
+            oc_store *chk = oc_store_open(sp);
+            CHECK(chk != NULL);
+            if (chk) {
+                uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN];
+                oc_store_set_secret(chk, &store_sec);
+                CHECK(oc_store_load_session(chk, inst, tok, NULL, 0) == 1);
+                CHECK(oc_store_load_pin(chk, inst, pin) == 0);    /* loopback: accepted, not trusted */
+                oc_store_close(chk);
+            }
+            /* A relaunch with no credential rides in on the stored token, as
+             * faye. */
+            uint64_t faye_id = 0;
+            oc_client *s2 = oc_client_start_secure("127.0.0.1", arg.port, "", sp, &store_sec);
+            CHECK(s2 != NULL);
+            if (s2) {
+                CHECK(WAIT_FOR(s2, m->authed && m->user_id != 0));
+                faye_id = oc_client_model(s2)->user_id;
+                oc_client_stop(s2);
+            }
+
+            /* Somebody else signing in at the same address -- on the page, as
+             * a person does -- is that somebody else: the token presented wins
+             * over the token stored, and replaces it. */
+            oc_client *s3 = start_as(NULL, "127.0.0.1", arg.port, "gil:pw-gil", sp, &store_sec, 1, NULL);
+            CHECK(s3 != NULL);
+            if (s3) {
+                CHECK(WAIT_FOR(s3, m->authed && m->user_id != 0));
+                uint64_t gil_id = oc_client_model(s3)->user_id;
+                CHECK(faye_id != 0 && gil_id != 0 && gil_id != faye_id);
+                oc_client_stop(s3);
+            }
+
+            /* The token now belongs to gil, so a silent relaunch is gil. */
+            oc_client *s4 = oc_client_start_secure("127.0.0.1", arg.port, "", sp, &store_sec);
+            CHECK(s4 != NULL);
+            if (s4) {
+                CHECK(WAIT_FOR(s4, m->authed && m->user_id != 0));
+                CHECK(oc_client_model(s4)->user_id != faye_id);
+                oc_client_stop(s4);
+            }
+
+            /* A wrong password signs nobody in: the page refuses it and no
+             * client is started -- the stored token is not consulted for a
+             * sign-in somebody is making afresh. */
+            CHECK(start_as(NULL, "127.0.0.1", arg.port, "gil:WRONG-pw", sp, &store_sec, 1, NULL) == NULL);
+
+            /* And faye, signing in again on the page, is faye. */
+            oc_client *s5 = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", sp, &store_sec, 1, NULL);
+            CHECK(s5 != NULL);
+            if (s5) {
+                CHECK(WAIT_FOR(s5, m->authed && m->user_id != 0));
+                CHECK(oc_client_model(s5)->user_id == faye_id);
+                oc_client_stop(s5);
+            }
+            unlink_db(sp);
+        }
+
+        /* auto-reconnect with the session token (REQ-100/101). A fresh client
+         * authenticates (capturing a session token), sends a message, then the
+         * daemon's netloop is torn down and restarted on the same port (same DB,
+         * so the session survives). The client silently re-authenticates with the
+         * stored token — no password — its in-memory history is preserved, and it
+         * can send again on the recovered session. */
+        oc_client *rc = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", NULL, NULL, 1, NULL);
+        CHECK(rc != NULL);
+        if (rc) {
+            CHECK(WAIT_FOR(rc, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+            oc_client_send(rc, 1, "before the restart");
+            CHECK(WAIT_FOR(rc, channel_has_body(m, 1, "before the restart")));
+
+            /* Bounce the daemon: the client's connection drops and it begins
+             * reconnecting with backoff while the listener is down. */
+            __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+            pthread_join(th, NULL);
+            arg.stop = 0;
+            CHECK(core_loop_start(&arg, &th) == 0);
+            oc_client_reconnect(rc);   /* cut the backoff so the retry is prompt */
+
+            /* It comes back authenticated (session-token reconnect), with its
+             * pre-restart history intact, and a new send round-trips. */
+            CHECK(WAIT_FOR(rc, m->connected && m->authed));
+            CHECK(channel_has_body(oc_client_model(rc), 1, "before the restart"));
+            oc_client_send(rc, 1, "after the restart");
+            CHECK(WAIT_FOR(rc, channel_has_body(m, 1, "after the restart")));
+
+            oc_client_stop(rc);
+        }
+
+        /* ARCH-88: a client keeps NO local history, so a cold one must still land
+         * on what it missed. It sends a cursorless BACKFILL_REQUEST and the daemon
+         * resumes from that user's server-side read position (REQ-090) — the thing
+         * that makes a stateless client possible. Proven by posting while faye is
+         * away and asserting a brand-new client (no store at all) receives it. */
+        {
+            oc_client *c1 = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", NULL, NULL, 1, NULL);
+            CHECK(c1 != NULL);
+            if (c1) {
+                CHECK(WAIT_FOR(c1, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+                oc_client_backfill(c1, 1);
+                oc_client_send(c1, 1, "read before going away");
+                CHECK(WAIT_FOR(c1, channel_has_body(m, 1, "read before going away")));
+                oc_client_mark_read(c1, 1);      /* advances the server-side cursor */
+                /* The daemon has the cursor before the client goes: what the
+                 * cold client below lands on is that cursor. */
+                uint64_t marker = oc_model_channel((oc_model *)oc_client_model(c1), 1)
+                                      ? oc_model_channel((oc_model *)oc_client_model(c1), 1)->read_marker : 0;
+                CHECK(marker != 0);
+                CHECK(WAIT_UNTIL_DO(oc_client_tick(c1), db_cursor(oc_client_model(c1)->user_id, 1) >= marker, 5000));
+                oc_client_stop(c1);
+            }
+            /* Posted while faye has no client running at all. */
+            oc_client *other = start_as(NULL, "127.0.0.1", arg.port, "gil:pw-gil", NULL, NULL, 1, NULL);
+            if (other) {
+                CHECK(WAIT_FOR(other, m->authed));
+                oc_client_send(other, 1, "arrived while away");
+                CHECK(WAIT_FOR(other, channel_has_body(m, 1, "arrived while away")));
+                oc_client_stop(other);
+            }
+            /* A cold client: no store, no cursor, nothing remembered. */
+            oc_client *c2 = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", NULL, NULL, 1, NULL);
+            CHECK(c2 != NULL);
+            if (c2) {
+                CHECK(WAIT_FOR(c2, m->authed));
+                CHECK(WAIT_FOR(c2, channel_has_body(m, 1, "arrived while away")));
+                oc_client_stop(c2);
+            }
+        }
+
+        /* The count of unsent messages belongs to the CONNECTION that holds them
+         * (REQ-102, ARCH-88). It was one global written by every net thread, so a
+         * client with two workspaces signed in read whichever thread published
+         * last: a workspace holding unsent messages could report none, and that
+         * count is what warns before quitting. Two clients here are two
+         * workspaces: separate connections, separate threads, separate outboxes.
+         *
+         * A send to a channel that does not exist is refused, so its row STAYS in
+         * the outbox -- a stable state to read both counts in, rather than the
+         * instant between a send and its acknowledgement. */
+        {
+            oc_client *w1 = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", NULL, NULL, 1, NULL);
+            oc_client *w2 = start_as(NULL, "127.0.0.1", arg.port, "gil:pw-gil", NULL, NULL, 1, NULL);
+            CHECK(w1 != NULL && w2 != NULL);
+            if (w1 && w2) {
+                CHECK(WAIT_FOR(w1, m->authed));
+                CHECK(WAIT_FOR(w2, m->authed));
+                oc_client_send(w1, 999999, "nowhere to go");
+                oc_client_send(w1, 999999, "nor this one");
+                oc_client_send(w2, 999999, "the other workspace's own");
+                int p1 = 0, p2 = 0;
+                WAIT_UNTIL(((p1 = oc_client_outbox_pending(w1)), (p2 = oc_client_outbox_pending(w2)),
+                            p1 == 2 && p2 == 1), 2000);
+                CHECK(p1 == 2);                /* two refused sends, held by w1 */
+                CHECK(p2 == 1);                /* one, held by w2, whoever published last */
+
+                /* And an ACCEPTED send leaves nothing behind: the row goes on the
+                 * acknowledgement. The removal used to be gated on the local store,
+                 * so a client without one counted every message it ever sent as
+                 * unsent, for ever. */
+                oc_client_send(w2, 1, "this one is accepted");
+                CHECK(WAIT_FOR(w2, channel_has_body(m, 1, "this one is accepted")));
+                CHECK(WAIT_UNTIL(oc_client_outbox_pending(w2) == 1, 2000));   /* just the refused one */
+                CHECK(oc_client_outbox_pending(w1) == 2);   /* w2's ack is not w1's */
+                oc_client_stop(w1);
+                oc_client_stop(w2);
+            } else {
+                if (w1) oc_client_stop(w1);
+                if (w2) oc_client_stop(w2);
+            }
+        }
+
+        /* offline outbox (REQ-102), now in memory: a message composed while the
+         * daemon is down is held by the net thread and resent when the connection
+         * comes back — within the life of the process, which is what REQ-102 asks
+         * for ("queued locally, sent automatically on reconnect"). */
+        {
+            oc_client *o1 = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", NULL, NULL, 1, NULL);
+            CHECK(o1 != NULL);
+            if (o1) {
+                CHECK(WAIT_FOR(o1, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+                __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+                pthread_join(th, NULL);
+                CHECK(WAIT_FOR(o1, !m->connected));
+                oc_client_send(o1, 1, "queued while offline");   /* -> in-memory outbox */
+
+                /* Bring the daemon back; the same client reconnects and flushes. */
+                arg.stop = 0;
+                CHECK(core_loop_start(&arg, &th) == 0);
+                oc_client_reconnect(o1);
+                CHECK(WAIT_FOR(o1, m->authed));
+                CHECK(WAIT_FOR(o1, channel_has_body(m, 1, "queued while offline")));
+                oc_client_stop(o1);
+            }
+        }
+    } else {
+        if (a) oc_client_stop(a);
+        if (b) oc_client_stop(b);
+    }
+
+    __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(th, NULL);
+    oc_netloop_set_summary(NULL);
+    oc_sum_worker_stop(csum);
+    oc_netloop_set_audio(-1, 0);
+    /* The process-wide knobs this daemon had, put back for the ones after it. */
+    oc_netloop_set_tts(NULL);
+    oc_netloop_set_stt(NULL);
+    unsetenv("OPENCHIME_DEV_FILE_PAGE");
+    __atomic_store_n(&g_tap.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(g_tap_th, NULL);
+    close(g_relay.udp);
+    close(g_tap.front);
+    for (int i = 0; i < g_tap.n_cl; i++) close(g_tap.cl[i].up);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    unlink_db(tpath("itest_core.db"));
+
+    /* Put the process timezone back: it is global state, and a later suite
+     * reading a local time should not inherit this one's fixture. */
+    if (tz_saved_buf[0]) setenv("TZ", tz_saved_buf, 1);
+    else                 unsetenv("TZ");
+    tzset();
+
+    /* Each daemon below listens on a port the kernel picks (core_loop_start). */
+    test_browser_signin();
+    test_big_channel_list();
+    test_published_fingerprint();
+    test_cert_trust();
+    test_local_browser();
+    test_device_client();
+    oc_test_rmtree(g_dir);
+    return failures;
+}

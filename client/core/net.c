@@ -1,0 +1,4474 @@
+/*
+ * OpenChime client — network thread. See net.h.
+ */
+
+#include "net.h"
+#include "searchq.h"
+#include "event.h"
+#include "model.h"        /* oc_model_now_ms: one clock for the backoff deadline */
+#include "store.h"
+#include "pdm.h"
+#include "e2e_hpke.h"   /* oc_e2e_wipe */
+#include "signin.h"
+#include "resolve.h"     /* oc_sni_name */
+
+#include "protocol.h"
+#include "tls.h"
+#include "framebuf.h"
+#include "sock.h"       /* POSIX/Winsock shim (also pulls in getaddrinfo) */
+
+#include "oc_thread.h"
+#include "oc_port.h"
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#  include <bcrypt.h>
+#endif
+#include <stdio.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <string.h>
+#include <time.h>
+
+/* Transfers waiting their turn (REQ-140/162). A connection runs one transfer at a
+ * time — the daemon's rule — so the rest wait here instead of being refused as
+ * busy. It belongs to the net thread and outlives a connection: a job running
+ * when the link drops goes back to the front and starts over on the next one. */
+typedef struct {
+    oc_cmd  **q;
+    size_t    n, cap;
+    oc_cmd   *active;          /* the job running now, or NULL */
+    uint8_t   vstage;          /* POST_VIDEO: 0 poster, 1 video, 2 ATTACH_MEDIA_SET sent */
+    uint64_t  vposter, vvideo; /* POST_VIDEO: the two finished uploads */
+    uint8_t   ffile;           /* POST_FILES: the file uploading now */
+    uint64_t  fids[OC_MAX_ATTACH]; /* POST_FILES: the finished uploads, in order */
+    uint64_t  progress_ms;     /* when the last progress tick went out */
+} oc_xqueue;
+
+/* Voice-input segments sent and not yet answered (ARCH-112), so an answer can
+ * say where it was spoken and in which mode. Net-thread only. The daemon keeps a
+ * handful waiting per connection, so a small ring is plenty. */
+#define OC_STT_SENT_MAX 16
+typedef struct {
+    struct { uint32_t id; uint8_t mode; uint64_t channel_id, thread_root; } v[OC_STT_SENT_MAX];
+    unsigned next;
+} oc_stt_sent;
+
+struct oc_net {
+    oc_thread_t   thread;
+    /* How many sends are queued on THIS connection, published by its own net
+     * thread for the UI thread to read (obox_publish). One per oc_net: a global
+     * made every signed-in workspace report whichever thread published last. */
+    atomic_int    obox_pending;
+    atomic_int    stop;
+    atomic_int    reconnect_now;   /* set by oc_net_reconnect: cut short the backoff */
+    char          host[256];
+    int           port;
+    char         *token;
+    char         *invite;       /* one-shot signup token, else NULL */
+    int           invite_reset; /* `invite` is a password reset's token instead */
+    char          signin_pref[64];  /* the source to sign in with; "" the first browser one */
+    /* A device code (AUTH.md §8.11): this client signs in by a code the person
+     * enters on the daemon's page elsewhere. The secret it polls with, kept
+     * across a dropped connection, and the interval to poll at. Net thread only. */
+    int           device;
+    char          device_secret[64];
+    unsigned      device_interval;
+    /* How the certificate of the last connection that got past it was accepted
+     * (cert_judge): whether a trusted authority vouched for it, and which it
+     * was. The daemon's pages are opened directly on a CA-trusted daemon and
+     * through the loopback tunnel otherwise (AUTH.md §8.10). Written by the net
+     * thread, read by the UI thread's oc_net_open_page, under accept_mu. */
+    oc_mutex_t    accept_mu;
+    int           accepted, accepted_ca;
+    unsigned char accepted_fp[OC_TLS_FINGERPRINT_LEN];
+    /* A page opened on its own through the tunnel (the password page), and the
+     * thread carrying it. */
+    oc_loopback  *page_lb;
+    oc_thread_t   page_th;
+    int           page_running;
+    atomic_int    page_cancel;
+    char          ws_key[288];  /* the workspace as named (oc_workspace_key); "" = host:port */
+    int           pin_only;     /* Remember-me off: keep the trusted fingerprint, and nothing else */
+    /* The fingerprint the workspace PUBLISHED (ARCH-10, via `.well-known`), used
+     * only when nothing is pinned yet -- see oc_net_start_verified. */
+    unsigned char published_pin[OC_TLS_FINGERPRINT_LEN];
+    int           have_published_pin;
+    /* The certificate last refused as untrusted (net thread), and one the person
+     * has since said to trust (set by the UI thread, taken by the net thread). */
+    oc_cert_seen  seen;         /* the certificate last put to the person */
+    atomic_int    trust_pending;
+    unsigned char trust_fp[OC_TLS_FINGERPRINT_LEN];
+    /* A browser sign-in in progress (AUTH.md §8.1): the listener the browser comes
+     * back to, the verifier kept for the daemon, and — once the browser has been —
+     * the token to present on the next connection. Net thread only, but for
+     * `signin_cancel`, which the UI thread sets. */
+    oc_loopback  *loopback;
+    /* The browser tab that brought the token back, kept waiting until the daemon
+     * has accepted or refused it, so its page says which (signin_answer). */
+    oc_loopback  *answer_lb;
+    char          verifier[OC_SIGNIN_VERIFIER_LEN + 1];
+    char          source_id[64];
+    char         *oidc_token;
+    /* A direct connection's (AUTH.md §8.5): the provider sends back a code -- held
+     * in oidc_token -- and the state the daemon began the sign-in with. */
+    char          oidc_state[128];
+    atomic_int    signin_cancel;
+    char         *store_path;   /* local store for token/pin persistence, or NULL */
+    oc_secret    *secret;       /* borrowed OS keyring for the session token, or NULL */
+    char          client_type[32]; /* synced-settings bucket id (default "tui") */
+    oc_queue     *to_ui;
+    oc_queue     *from_ui;
+    oc_xqueue     xq;
+    oc_stt_sent   stt;           /* voice-input segments awaiting an answer */
+    oc_callsig    calls;         /* the call this device is in, and its keys (ARCH-113) */
+    oc_pdm        pdm;           /* its private DMs and their keys (PRIVATE-DM.md) */
+    oc_tls_session resume;       /* the daemon's last ticket: a reconnect resumes (ARCH-22) */
+};
+
+/* ---- the offline outbox, in memory (REQ-102, ARCH-88) ----------------------
+ * A send is recorded here before it goes out and removed on its SEND_ACK, so a
+ * drop mid-flight leaves it to be resent on reconnect — deduped by the daemon on
+ * the idempotency token. It lives for the life of the process and no longer: the
+ * requirement is "queued locally, sent automatically on reconnect", and a client
+ * that writes nothing to disk cannot honour more than that. A message still
+ * queued when the app exits is lost, which is why a frontend should warn on quit
+ * while oc_net_outbox_pending() is non-zero. */
+/* src_channel/src_message ride the row so a RESEND is still the same forward
+ * (REQ-057). Without them, a message that went out once as a forward would come
+ * back after a reconnect as a bare note with its attribution silently gone. */
+typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; char *body;
+                 uint64_t src_channel, src_message; } obox_row;
+/* `owner` is the connection whose sends these are: what obox_publish tells. */
+typedef struct { obox_row *v; size_t n, cap; oc_net *owner; } obox;
+
+/* The UI thread must not walk the outbox (net-thread-owned), so the net thread
+ * publishes just its size on the connection that owns it. A stale-by-one-tick
+ * read is fine: this drives a confirm-on-quit prompt, not a correctness decision.
+ *
+ * It is per-connection because the outbox is. A single global made a client with
+ * two workspaces signed in report whichever net thread published last: a
+ * workspace with messages queued read zero because the other one had none, so the
+ * app could quit without the warning that count exists to raise -- and the two
+ * threads writing it was a data race besides. Atomic, because two threads do
+ * publish, each to its own. */
+static void obox_publish(const obox *o) {
+    if (o->owner) atomic_store(&o->owner->obox_pending, (int)o->n);
+}
+int oc_net_outbox_pending(oc_net *n) { return n ? atomic_load(&n->obox_pending) : 0; }
+
+static void obox_add(obox *o, const uint8_t idem[OC_IDEM_SIZE], uint64_t cid, const char *body,
+                     uint64_t src_channel, uint64_t src_message) {
+    for (size_t i = 0; i < o->n; i++)
+        if (memcmp(o->v[i].idem, idem, OC_IDEM_SIZE) == 0) return;
+    if (o->n == o->cap) {
+        size_t want = o->cap ? o->cap * 2 : 16;
+        obox_row *q = realloc(o->v, want * sizeof *q);
+        if (!q) return;
+        o->v = q; o->cap = want;
+    }
+    memcpy(o->v[o->n].idem, idem, OC_IDEM_SIZE);
+    o->v[o->n].channel_id = cid;
+    o->v[o->n].body = body ? strdup(body) : NULL;
+    o->v[o->n].src_channel = src_channel;
+    o->v[o->n].src_message = src_message;
+    o->n++;
+    obox_publish(o);
+}
+static void obox_remove(obox *o, const uint8_t idem[OC_IDEM_SIZE]) {
+    size_t w = 0;
+    for (size_t i = 0; i < o->n; i++) {
+        if (memcmp(o->v[i].idem, idem, OC_IDEM_SIZE) == 0) { free(o->v[i].body); continue; }
+        o->v[w++] = o->v[i];
+    }
+    o->n = w;
+    obox_publish(o);
+}
+static void obox_free(obox *o) {
+    for (size_t i = 0; i < o->n; i++) free(o->v[i].body);
+    free(o->v); o->v = NULL; o->n = o->cap = 0;
+    obox_publish(o);
+}
+
+/* The store-backed connection context (session token + trusted fingerprint persistence),
+ * threaded through run_connection so the net thread persists across restarts. */
+typedef struct {
+    oc_store   *store;                          /* NULL = no persistence */
+    oc_store   *pins;        /* where the trusted fingerprint is kept — set even when `store` is not,
+                               * because a pin is not what Remember-me is about (ARCH-10) */
+    char       *workspace;                       /* the key; rewritten in place if the workspace moves */
+    uint8_t     pin[OC_TLS_FINGERPRINT_LEN];
+    int         have_pin;                       /* pin loaded/captured this run */
+    int         logged_out;                     /* set on /logout: drop the stored token */
+    obox       *obox;                           /* in-memory outbox (REQ-102) */
+} conn_store;
+
+/* ---- helpers ---- */
+
+/* Copy a wire slice into a fixed buffer, NUL-terminated and truncated to fit. */
+static void slice_to_buf(oc_slice sl, char *out, size_t cap) {
+    size_t n = sl.len < cap - 1 ? sl.len : cap - 1;
+    if (n && sl.ptr) memcpy(out, sl.ptr, n);
+    out[n] = '\0';
+}
+
+/* An error for the frontend: its sentence, what it is about (oc_client_err)
+ * and the daemon's code it answers (0 if none). */
+static void push_err_ex(oc_queue *to_ui, oc_client_err kind, uint16_t code, const char *msg) {
+    oc_ev *e = oc_ev_new(OC_EV_ERROR);
+    if (e) { e->body = strdup(msg); e->err_kind = (uint8_t)kind; e->err_code = code; oc_queue_push(to_ui, e); }
+}
+
+static void push_err(oc_queue *to_ui, const char *msg) { push_err_ex(to_ui, OC_CERR_OTHER, 0, msg); }
+
+static void push_simple(oc_queue *to_ui, int type, uint64_t user_id) {
+    oc_ev *e = oc_ev_new(type);
+    if (e) { e->user_id = user_id; oc_queue_push(to_ui, e); }
+}
+
+static void gen_idem(uint8_t out[OC_IDEM_SIZE]) {
+#ifdef _WIN32
+    /* CSPRNG from the OS (bcrypt). Falls back to rand() only if that fails. */
+    if (BCryptGenRandom(NULL, out, OC_IDEM_SIZE, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0)
+        return;
+    for (int i = 0; i < (int)OC_IDEM_SIZE; i++) out[i] = (uint8_t)rand();
+#else
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) { size_t r = fread(out, 1, OC_IDEM_SIZE, f); (void)r; fclose(f); }
+    else   { for (int i = 0; i < (int)OC_IDEM_SIZE; i++) out[i] = (uint8_t)rand(); }
+#endif
+}
+
+static int dial(const char *host, int port) {
+    /* Each address a bounded few seconds, in the system's order (sock.h), so a
+     * dead IPv6 route does not hold the connection for the kernel's minutes. */
+    int fd = oc_connect_any(host, port, OC_CONNECT_PER_ADDR_MS);
+    if (fd >= 0) oc_sock_setnonblock(fd);
+    return fd;
+}
+
+static void wait_io(int fd, oc_tls_status st, int timeout_ms) {
+    oc_poll(fd, st == OC_TLS_WANT_WRITE, timeout_ms);
+}
+
+/* Drive a TLS handshake to completion. Returns 0 on success, -1 on error. */
+static int do_handshake(oc_tls_conn *c, int fd, atomic_int *stop) {
+    for (;;) {
+        if (*stop) return -1;
+        oc_tls_status st = oc_tls_handshake(c);
+        if (st == OC_TLS_OK) return 0;
+        if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) { wait_io(fd, st, 500); continue; }
+        return -1;
+    }
+}
+
+/* Write all bytes, waiting on the socket as needed. 0 ok, -1 error. */
+static int write_all(oc_tls_conn *c, int fd, const uint8_t *buf, size_t len, atomic_int *stop) {
+    size_t sent = 0;
+    while (sent < len) {
+        if (*stop) return -1;
+        size_t n = 0;
+        oc_tls_status st = oc_tls_write(c, buf + sent, len - sent, &n);
+        if (st == OC_TLS_OK) { sent += n; continue; }
+        if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) { wait_io(fd, st, 500); continue; }
+        return -1;
+    }
+    return 0;
+}
+
+/* Encode + write one SEND with a caller-chosen idempotency token (so a resend
+ * from the outbox reuses it and the daemon dedups). */
+static void send_message(oc_tls_conn *c, int fd, atomic_int *stop,
+                         uint64_t channel_id, const uint8_t idem[OC_IDEM_SIZE],
+                         const char *body, uint64_t src_channel, uint64_t src_message) {
+    uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s; memset(&s, 0, sizeof s);   /* n_attach = 0: a plain text message */
+    s.channel_id = channel_id ? channel_id : 1;
+    memcpy(s.idem, idem, OC_IDEM_SIZE);
+    s.body = oc_slice_str(body ? body : "");
+    /* The forward source (REQ-057), 0/0 for an ordinary message. Only the two
+     * ids: the daemon resolves the author and the excerpt, so this client
+     * cannot claim someone said something they did not. */
+    s.src_channel = src_channel;
+    s.src_message = src_message;
+    if (oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK)
+        (void)write_all(c, fd, buf, w.len, stop);
+}
+
+/* Block until one full frame is read (used only during handshake/auth). */
+static int read_one(oc_tls_conn *c, int fd, oc_framebuf *fb, oc_header *hdr,
+                    oc_rbuf *payload, atomic_int *stop) {
+    for (;;) {
+        if (*stop) return -1;
+        const uint8_t *frame; size_t flen;
+        int r = oc_framebuf_next(fb, &frame, &flen);
+        if (r == 1) return oc_parse_frame(frame, flen, hdr, payload) == OC_OK ? 0 : -1;
+        if (r < 0) return -1;
+        uint8_t buf[4096]; size_t n = 0;
+        oc_tls_status st = oc_tls_read(c, buf, sizeof buf, &n);
+        if (st == OC_TLS_OK) { if (oc_framebuf_push(fb, buf, n) != 0) return -1; continue; }
+        if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) { wait_io(fd, st, 500); continue; }
+        return -1;
+    }
+}
+
+/* ---- attachment transfer (REQ-140/141, ARCH-69) ----
+ * One transfer at a time per connection (matching the daemon). An upload streams
+ * a local file out as UPLOAD_CHUNKs within the server-advertised window, then
+ * links it into a SEND; a download writes DOWNLOAD_CHUNKs to a local file. The
+ * state lives on the net thread and is driven by the serve loop (commands) and
+ * dispatch (server frames). */
+typedef struct {
+    int      mode;        /* 0 idle, 1 upload, 2 download, 3 waiting for ATTACH_MEDIA_OK,
+                           * 4 a message's speech (ARCH-111): the download shape over
+                           * AUDIO_* frames, keyed by message id rather than attachment */
+    uint64_t id;          /* attachment id (0 for an upload until UPLOAD_READY) */
+    FILE    *fp;          /* the local file (source for upload, sink for download) */
+    /* An in-memory download: `fp` is NULL and chunks accumulate here
+     * instead. Inline image thumbnails must not write a file — a client stores
+     * nothing locally (ARCH-88) — and a temp file for rendering would be exactly
+     * the cache that decision removed. */
+    uint8_t *buf;
+    size_t   buf_len, buf_cap;
+    size_t   buf_max;     /* in-memory download ceiling: OC_INLINE_MAX, or a video's */
+    const uint8_t *src;   /* an in-memory upload (a recording): read here, not from fp */
+    uint64_t total;       /* declared/expected byte size */
+    uint64_t done;        /* upload: bytes handed to chunks; download: bytes written */
+    uint32_t chunk;       /* max data bytes per chunk (from UPLOAD_READY) */
+    uint32_t win_chunks;  /* in-flight window, in chunks (from UPLOAD_READY) */
+    uint32_t next_seq;    /* next chunk seq to send (upload) / expect (download) */
+    uint32_t acked_seq;   /* upload: chunks the server has acked */
+    int      ended;       /* upload: UPLOAD_END has been sent */
+    uint64_t channel;     /* upload: channel to link the finished attachment into */
+    /* What the finished upload is FOR. 0 posts it as a message, which is
+     * every ordinary upload; 1 makes it the user's avatar and posts nothing. Without
+     * this an avatar arrived in the transcript as a bare image nobody sent. */
+    uint8_t  purpose;
+    char     ename[48];   /* purpose 2: the shortcode to claim it as (REQ-072) */
+    char     name[128];   /* filename (upload src basename / download dest label) */
+} oc_xfer;
+
+/* Per-channel high-water the net thread tracks (from every BROADCAST) so a
+ * reconnect can BACKFILL_REQUEST from where each channel left off (REQ-101). It
+ * persists across reconnects; the model dedups replays by its own high-water. */
+typedef struct { uint64_t channel_id, high_water; } oc_hwrow;
+typedef struct { oc_hwrow *v; size_t n, cap; } oc_hwtab;
+
+static void hwtab_note(oc_hwtab *t, uint64_t channel_id, uint64_t message_id) {
+    for (size_t i = 0; i < t->n; i++)
+        if (t->v[i].channel_id == channel_id) {
+            if (message_id > t->v[i].high_water) t->v[i].high_water = message_id;
+            return;
+        }
+    if (t->n == t->cap) {
+        size_t cap = t->cap ? t->cap * 2 : 16;
+        oc_hwrow *nv = realloc(t->v, cap * sizeof *nv);
+        if (!nv) return;
+        t->v = nv; t->cap = cap;
+    }
+    t->v[t->n].channel_id = channel_id; t->v[t->n].high_water = message_id; t->n++;
+}
+static void hwtab_free(oc_hwtab *t) { free(t->v); t->v = NULL; t->n = t->cap = 0; }
+
+/* The last-seen message id for a channel (0 if none) — the backfill cursor. */
+static uint64_t hwtab_get(const oc_hwtab *t, uint64_t channel_id) {
+    for (size_t i = 0; i < t->n; i++)
+        if (t->v[i].channel_id == channel_id) return t->v[i].high_water;
+    return 0;
+}
+
+typedef struct {
+    oc_queue    *to_ui;
+    oc_tls_conn *conn;
+    int          fd;
+    atomic_int *stop;
+    oc_xfer     *xfer;
+    oc_hwtab    *hw;
+    oc_store    *store;      /* token/pin persistence (NULL = none) */
+    obox        *obox;       /* in-memory outbox, cleared on each SEND_ACK */
+    const char  *workspace;
+    const char  *client_type; /* which settings bucket this frontend syncs */
+    uint16_t     version;     /* negotiated at WELCOME; every frame must carry it */
+    oc_xqueue   *xq;
+    oc_stt_sent *stt;
+    oc_callsig  *calls;
+    const char  *host;        /* where the relay is, for a call (CALLS.md §4) */
+    char        *rekey;       /* the stored key, rewritten when the workspace moves (288 bytes) */
+    char        *sni;         /* the name the next connection sends (oc_net.ws_key, 288 bytes) */
+    /* A live message waiting for its action (REQ-058, ARCH-115). The daemon
+     * follows every live message frame with exactly one ACTION, so the frame,
+     * its attachments and its forward are held here until that ACTION arrives
+     * and then handed on as one: nothing downstream ever sees the message
+     * without the answer. Anything unrelated releases the hold unpaired --
+     * a replay's messages, whose actions come later on their own. */
+    oc_queue    *held;
+    uint64_t     held_id;
+    int          holding;
+    oc_pdm      *pdm;         /* private DMs (PRIVATE-DM.md) */
+} disp_ctx;
+
+/* Hand on whatever is held, in the order it arrived. */
+static void held_release(disp_ctx *ctx, oc_queue *to_ui) {
+    if (!ctx->held) return;
+    void *e;
+    while ((e = oc_queue_try_pop(ctx->held)) != NULL) oc_queue_push(to_ui, e);
+    ctx->holding = 0;
+    ctx->held_id = 0;
+}
+
+/* Where a message-bearing frame's events go: held, keyed by its message, when
+ * there is somewhere to hold them. */
+static oc_queue *held_begin(disp_ctx *ctx, oc_queue *to_ui, uint64_t message_id) {
+    if (!ctx->held) return to_ui;
+    held_release(ctx, to_ui);
+    ctx->holding = 1;
+    ctx->held_id = message_id;
+    return ctx->held;
+}
+
+/* Fill an event's action fields from an ACTION frame. */
+static void ev_set_action(oc_ev *e, const oc_action *ac) {
+    e->action_known = 1;
+    e->action       = ac->text_len > 0;
+    e->action_start = ac->text_start;
+    e->action_len   = ac->text_len;
+    size_t n = ac->actor_name.len < sizeof e->actor_name - 1 ? ac->actor_name.len : sizeof e->actor_name - 1;
+    if (n) memcpy(e->actor_name, ac->actor_name.ptr, n);
+    e->actor_name[n] = '\0';
+}
+
+static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx);
+
+struct oc_net_frames { oc_framebuf fb; oc_queue held; disp_ctx ctx; };
+
+oc_net_frames *oc_net_frames_new(oc_queue *to_ui) {
+    oc_net_frames *f = calloc(1, sizeof *f);
+    if (!f) return NULL;
+    oc_framebuf_init(&f->fb);
+    oc_queue_init(&f->held);
+    f->ctx.to_ui   = to_ui;
+    f->ctx.fd      = -1;
+    f->ctx.version = OC_PROTOCOL_VERSION;
+    f->ctx.held    = &f->held;
+    return f;
+}
+
+int oc_net_frames_push(oc_net_frames *f, const uint8_t *bytes, size_t len) {
+    if (!f || oc_framebuf_push(&f->fb, bytes, len) != 0) return -1;
+    return dispatch(&f->fb, f->ctx.to_ui, &f->ctx);
+}
+
+void oc_net_frames_free(oc_net_frames *f) {
+    if (!f) return;
+    held_release(&f->ctx, f->ctx.to_ui);
+    oc_queue_destroy(&f->held);
+    oc_framebuf_free(&f->fb);
+    free(f);
+}
+
+/* The call engine queued media for the connection: end this thread's wait. */
+static void net_wake(void *w) { oc_wake_signal((oc_wake *)w); }
+
+/* How the call module writes a frame: on this connection, like everything else. */
+static int ctx_write(void *wctx, const uint8_t *buf, size_t len) {
+    disp_ctx *ctx = wctx;
+    return write_all(ctx->conn, ctx->fd, buf, len, ctx->stop);
+}
+
+/* Push a transfer notice (phase: 0 progress, 1 done, 2 error) to the UI. */
+static void xfer_notice(disp_ctx *ctx, uint8_t phase, const char *msg) {
+    oc_ev *e = oc_ev_new(OC_EV_XFER);
+    if (!e) return;
+    e->op = phase;
+    e->body = msg ? strdup(msg) : NULL;
+    if (ctx->xq && ctx->xq->active) {
+        e->xfer_tag = ctx->xq->active->xfer_tag;
+        if (ctx->xq->active->type == OC_CMD_POST_FILES) e->xfer_file = ctx->xq->ffile;
+    }
+    /* An upload counts what the server has acknowledged, which it does once a
+     * chunk is written (ARCH-69), not what has merely left for it: a window of
+     * chunks in flight would otherwise read as progress nobody has made. */
+    oc_xfer *x = ctx->xfer;
+    uint64_t done = x->done;
+    if (x->mode == 1) {
+        uint64_t acked = (uint64_t)x->acked_seq * x->chunk;
+        done = phase == 1 ? x->total : acked < x->total ? acked : x->total;
+    }
+    e->xfer_done = done;
+    e->xfer_total = x->total;
+    oc_queue_push(ctx->to_ui, e);
+}
+
+/* A bare progress tick, at most ten a second: enough for a bar or a ring to move
+ * smoothly, few enough that a fast link does not flood the UI queue. */
+static void xfer_progress(disp_ctx *ctx) {
+    uint64_t now = oc_model_now_ms();
+    if (ctx->xq && now - ctx->xq->progress_ms < 100 && ctx->xfer->done < ctx->xfer->total) return;
+    if (ctx->xq) ctx->xq->progress_ms = now;
+    xfer_notice(ctx, 0, NULL);
+}
+
+/* Tear down the active transfer (closing the file), leaving it idle. */
+/* Cap on an in-memory download. Big enough for any screenshot someone
+ * pastes into chat, small enough that a hostile size cannot be used to grow the
+ * client without bound. Anything larger falls back to "download to a file". */
+#define OC_INLINE_MAX (8u * 1024u * 1024u)
+
+/* The last path component, splitting on EITHER separator. Splitting only on '/'
+ * meant a Windows upload declared its whole path as the filename. */
+static const char *path_basename(const char *path) {
+    const char *b = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '/' || *p == '\\') b = p + 1;
+    return b;
+}
+
+/* The content type, from the extension. Every upload used to be declared
+ * application/octet-stream, so nothing downstream could tell an image from a
+ * zip — which makes inline rendering (REQ-142) impossible however good the
+ * client is. The server stores what we declare, so it has to be right here. */
+static const char *mime_for(const char *name) {
+    const char *dot = strrchr(name, '.');
+    if (!dot) return "application/octet-stream";
+    static const struct { const char *ext, *mime; } T[] = {
+        { "png", "image/png" },   { "jpg", "image/jpeg" }, { "jpeg", "image/jpeg" },
+        { "gif", "image/gif" },   { "bmp", "image/bmp" },  { "webp", "image/webp" },
+        { "svg", "image/svg+xml" },
+        { "pdf", "application/pdf" },
+        { "txt", "text/plain" },  { "md",  "text/markdown" }, { "csv", "text/csv" },
+        { "log", "text/plain" },
+        { "json", "application/json" }, { "xml", "application/xml" },
+        { "zip", "application/zip" },   { "gz",  "application/gzip" },
+        { "mp4", "video/mp4" },   { "webm", "video/webm" },
+        { "mp3", "audio/mpeg" },  { "wav",  "audio/wav" },  { "ogg", "audio/ogg" },
+    };
+    for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) {
+        const char *e = dot + 1;
+        const char *t = T[i].ext;
+        size_t k = 0;
+        while (t[k] && e[k] && tolower((unsigned char)e[k]) == t[k]) k++;
+        if (!t[k] && !e[k]) return T[i].mime;
+    }
+    return "application/octet-stream";
+}
+
+static void xfer_reset(oc_xfer *x) {
+    if (x->fp) fclose(x->fp);
+    free(x->buf);
+    memset(x, 0, sizeof *x);
+}
+
+/* Emit OC_EV_ATTACHMENT events for a message's attachment list (BROADCAST /
+ * THREAD_REPLY), each folded onto its message by the model. */
+static void push_attachments(oc_queue *to_ui, uint64_t channel_id, uint64_t message_id,
+                             const oc_attach_entry *att, uint16_t n) {
+    for (uint16_t i = 0; i < n && i < OC_MAX_ATTACH; i++) {
+        oc_ev *e = oc_ev_new(OC_EV_ATTACHMENT);
+        if (!e) continue;
+        e->channel_id = channel_id;
+        e->message_id = message_id;
+        e->parent_id  = att[i].id;        /* attachment id (used to download) */
+        e->server_time = att[i].size;
+        e->status = att[i].reclaimed;   /* bytes gone; row is a tombstone */
+        e->media_kind  = att[i].media_kind;
+        e->duration_ms = att[i].duration_ms;
+        e->media_w     = att[i].width;
+        e->media_h     = att[i].height;
+        e->poster_id   = att[i].poster_id;
+        size_t fn = att[i].filename.len < sizeof e->author_name - 1 ? att[i].filename.len : 0;
+        /* filename in body (heap, may be long), mime in author_name (bounded). */
+        e->body = malloc(att[i].filename.len + 1);
+        if (e->body) { memcpy(e->body, att[i].filename.ptr, att[i].filename.len); e->body[att[i].filename.len] = '\0'; }
+        size_t mn = att[i].mime.len < sizeof e->author_name - 1 ? att[i].mime.len : sizeof e->author_name - 1;
+        memcpy(e->author_name, att[i].mime.ptr, mn); e->author_name[mn] = '\0';
+        (void)fn;
+        oc_queue_push(to_ui, e);
+    }
+}
+
+/* Send as many UPLOAD_CHUNKs as the window allows, then UPLOAD_END once the whole
+ * file has been streamed. Called on UPLOAD_READY and each UPLOAD_ACK. */
+static void upload_pump(disp_ctx *ctx) {
+    oc_xfer *x = ctx->xfer;
+    if (x->mode != 1 || x->id == 0 || x->ended) return;
+    static uint8_t frame[OC_MAX_FRAME_SIZE];
+    uint8_t data[OC_ATTACH_CHUNK_SIZE];
+    while (x->done < x->total && (x->next_seq - x->acked_seq) < x->win_chunks) {
+        size_t want = (x->total - x->done) < x->chunk ? (size_t)(x->total - x->done) : x->chunk;
+        size_t got = want;
+        if (x->src) memcpy(data, x->src + x->done, want);
+        else got = fread(data, 1, want, x->fp);
+        if (got != want) { xfer_notice(ctx, 2, "upload: read error"); xfer_reset(x); return; }
+        oc_upload_chunk uc = { x->id, x->next_seq, { data, got } };
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        if (oc_encode_upload_chunk(&w, OC_PROTOCOL_VERSION, &uc) != OC_OK ||
+            write_all(ctx->conn, ctx->fd, frame, w.len, ctx->stop) != 0) {
+            xfer_notice(ctx, 2, "upload: send failed"); xfer_reset(x); return;
+        }
+        x->next_seq++; x->done += got;
+    }
+    if (x->done) xfer_progress(ctx);
+    if (x->done == x->total && !x->ended) {
+        oc_upload_end ue = { x->id };
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        if (oc_encode_upload_end(&w, OC_PROTOCOL_VERSION, &ue) == OC_OK)
+            (void)write_all(ctx->conn, ctx->fd, frame, w.len, ctx->stop);
+        x->ended = 1;
+    }
+}
+
+/* Declare an upload, from a file (`fp`) or from memory (`src`). On failure the
+ * transfer is left idle with an error notice. */
+static void begin_upload(disp_ctx *ctx, uint64_t channel, const char *name, const char *mime,
+                         const uint8_t *src, uint64_t total, uint8_t purpose) {
+    oc_xfer *x = ctx->xfer;
+    FILE *fp = x->fp;                      /* a file upload opened it already */
+    memset(x, 0, sizeof *x);
+    x->mode = 1; x->fp = fp; x->src = src; x->total = total;
+    x->chunk = OC_ATTACH_CHUNK_SIZE; x->win_chunks = 8;
+    x->channel = channel;
+    x->purpose = purpose;
+    snprintf(x->name, sizeof x->name, "%s", name);
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_upload_begin ub; memset(&ub, 0, sizeof ub);
+    ub.channel_id = channel;
+    gen_idem(ub.idem);
+    ub.filename = oc_slice_str(x->name);
+    ub.mime = oc_slice_str(mime);
+    ub.total_size = total;
+    if (oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) == OC_OK &&
+        write_all(ctx->conn, ctx->fd, buf, w.len, ctx->stop) == 0) {
+        char msg[200]; snprintf(msg, sizeof msg, "uploading %s…", x->name);
+        xfer_notice(ctx, 0, msg);
+    } else {
+        xfer_notice(ctx, 2, "upload: begin failed");
+        xfer_reset(x);
+    }
+}
+
+static void begin_download(disp_ctx *ctx, uint64_t aid, FILE *fp, size_t buf_max, const char *label) {
+    oc_xfer *x = ctx->xfer;
+    memset(x, 0, sizeof *x);
+    x->mode = 2; x->fp = fp; x->id = aid; x->buf_max = buf_max;
+    if (label) snprintf(x->name, sizeof x->name, "%s", label);
+    uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_download_begin db = { aid };
+    if (oc_encode_download_begin(&w, OC_PROTOCOL_VERSION, &db) == OC_OK &&
+        write_all(ctx->conn, ctx->fd, buf, w.len, ctx->stop) == 0) {
+        if (label) { char msg[200]; snprintf(msg, sizeof msg, "downloading to %s…", x->name); xfer_notice(ctx, 0, msg); }
+    } else {
+        if (label) xfer_notice(ctx, 2, "download: begin failed");
+        xfer_reset(x);
+    }
+}
+
+/* A wire string as a heap C string ("" if empty, NULL on failure). */
+/* Record a segment as sent, and look up where one was spoken. */
+static void stt_note(oc_stt_sent *t, uint32_t id, uint8_t mode, uint64_t channel_id, uint64_t root) {
+    unsigned i = t->next++ % OC_STT_SENT_MAX;
+    t->v[i].id = id;
+    t->v[i].mode = mode;
+    t->v[i].channel_id = channel_id;
+    t->v[i].thread_root = root;
+}
+
+static void stt_where(disp_ctx *ctx, uint32_t id, oc_ev *e) {
+    if (!ctx || !ctx->stt) return;
+    for (unsigned i = 0; i < OC_STT_SENT_MAX; i++) {
+        if (ctx->stt->v[i].id != id) continue;
+        e->op = ctx->stt->v[i].mode;
+        e->channel_id = ctx->stt->v[i].channel_id;
+        e->parent_id = ctx->stt->v[i].thread_root;
+        return;
+    }
+}
+
+/* Send one whole segment: STT_BEGIN, the samples in frames that stay under the
+ * size limit, STT_END. Written straight out, not queued behind a transfer: the
+ * speaker is waiting on it. Returns 0 or -1 if the connection failed. */
+static int send_stt_segment(oc_tls_conn *conn, int fd, atomic_int *stop, oc_stt_sent *t, const oc_cmd *c) {
+    static uint8_t buf[OC_MAX_FRAME_SIZE];
+    oc_wbuf w;
+    uint32_t id = (uint32_t)c->xfer_tag;
+    oc_stt_begin sb = { id, c->op, c->channel_id, c->message_id, {0}, (uint32_t)(c->blob_len / 2) };
+    gen_idem(sb.idem);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    if (oc_encode_stt_begin(&w, OC_PROTOCOL_VERSION, &sb) != OC_OK) return 0;
+    if (write_all(conn, fd, buf, w.len, stop) != 0) return -1;
+    stt_note(t, id, c->op, c->channel_id, c->message_id);
+    const size_t per = 60000;               /* even, and well inside a frame */
+    uint32_t seq = 0;
+    for (size_t off = 0; off < c->blob_len; off += per) {
+        size_t n = c->blob_len - off < per ? c->blob_len - off : per;
+        oc_stt_chunk ch = { id, seq++, { c->blob + off, n } };
+        oc_wbuf_init(&w, buf, sizeof buf);
+        if (oc_encode_stt_chunk(&w, OC_PROTOCOL_VERSION, &ch) != OC_OK) return 0;
+        if (write_all(conn, fd, buf, w.len, stop) != 0) return -1;
+    }
+    oc_stt_end se = { id };
+    oc_wbuf_init(&w, buf, sizeof buf);
+    if (oc_encode_stt_end(&w, OC_PROTOCOL_VERSION, &se) != OC_OK) return 0;
+    return write_all(conn, fd, buf, w.len, stop);
+}
+
+static char *slice_dup(oc_slice s) {
+    char *out = malloc(s.len + 1);
+    if (!out) return NULL;
+    if (s.len) memcpy(out, s.ptr, s.len);
+    out[s.len] = '\0';
+    return out;
+}
+
+/* Ask for one message's speech (ARCH-111). Like a download into memory, but the
+ * daemon may have to render it first, so the first frame can be a while coming. */
+static void begin_listen(disp_ctx *ctx, uint64_t message_id) {
+    oc_xfer *x = ctx->xfer;
+    memset(x, 0, sizeof *x);
+    x->mode = 4; x->id = message_id; x->buf_max = (size_t)OC_MAX_ATTACHMENT_SIZE;
+    uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_audio_get ag = { message_id };
+    if (oc_encode_audio_get(&w, OC_PROTOCOL_VERSION, &ag) != OC_OK ||
+        write_all(ctx->conn, ctx->fd, buf, w.len, ctx->stop) != 0) {
+        oc_ev *e = oc_ev_new(OC_EV_LISTEN_SKIP);
+        if (e) { e->message_id = message_id; oc_queue_push(ctx->to_ui, e); }
+        xfer_reset(x);
+    }
+}
+
+/* Ask to hear a voice say the audition sentence (REQ-292). The same download as a
+ * message's speech, answered as message 0; a failure is simply no sample, since
+ * the choice it would have helped with is still there to make. */
+static void begin_voice_preview(disp_ctx *ctx, const char *voice_id) {
+    oc_xfer *x = ctx->xfer;
+    memset(x, 0, sizeof *x);
+    x->mode = 5; x->id = 0; x->buf_max = (size_t)OC_MAX_ATTACHMENT_SIZE;
+    uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_voice_preview_get vp = { oc_slice_str(voice_id ? voice_id : "") };
+    if (oc_encode_voice_preview_get(&w, OC_PROTOCOL_VERSION, &vp) != OC_OK ||
+        write_all(ctx->conn, ctx->fd, buf, w.len, ctx->stop) != 0)
+        xfer_reset(x);
+}
+
+/* Open a local file to upload and measure it. On failure the notice has gone
+ * and NULL comes back. */
+static FILE *open_upload(disp_ctx *ctx, const char *path, uint64_t *size) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) { xfer_notice(ctx, 2, "upload: cannot open file"); return NULL; }
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); xfer_notice(ctx, 2, "upload: not a regular file"); return NULL; }
+    long sz = ftell(fp);
+    if (sz < 0 || (unsigned long long)sz > OC_MAX_ATTACHMENT_SIZE) {
+        fclose(fp); xfer_notice(ctx, 2, "upload: file too large"); return NULL;
+    }
+    rewind(fp);
+    *size = (uint64_t)sz;
+    return fp;
+}
+
+/* POST_FILES: start uploading the file `ffile` names, or the in-memory item
+ * held in its place. */
+static void files_next(disp_ctx *ctx) {
+    oc_cmd *c = ctx->xq->active;
+    unsigned f = ctx->xq->ffile;
+    if (c->mem[f]) {
+        const char *name = c->paths[f];
+        begin_upload(ctx, c->channel_id, name, mime_for(name), c->mem[f], c->mem_len[f], 4);
+        return;
+    }
+    uint64_t sz = 0;
+    FILE *fp = open_upload(ctx, c->paths[ctx->xq->ffile], &sz);
+    if (!fp) return;
+    const char *name = path_basename(c->paths[ctx->xq->ffile]);
+    ctx->xfer->fp = fp;
+    begin_upload(ctx, c->channel_id, name, mime_for(name), NULL, sz, 4);
+}
+
+/* Start the active job. Whatever leaves the transfer idle has already finished,
+ * with its notice sent; xq_pump then retires it. */
+static void xq_start(disp_ctx *ctx) {
+    oc_cmd *c = ctx->xq->active;
+    oc_xfer *x = ctx->xfer;
+    if (c->type == OC_CMD_UPLOAD) {
+        uint64_t sz = 0;
+        FILE *fp = open_upload(ctx, c->body, &sz);
+        if (!fp) return;
+        const char *name = path_basename(c->body);
+        x->fp = fp;
+        begin_upload(ctx, c->channel_id, name, mime_for(name), NULL, sz,
+                     (uint8_t)(c->op == 1 ? 1 : c->op == 2 ? 2 : 0));
+        if (x->mode && x->purpose == 2 && c->body2) snprintf(x->ename, sizeof x->ename, "%s", c->body2);
+    } else if (c->type == OC_CMD_FETCH) {
+        /* op 1: a video message, fetched whole into memory under the attachment
+         * ceiling rather than the thumbnail one (ARCH-88: nothing on disk). */
+        begin_download(ctx, c->message_id, NULL, c->op == 1 ? (size_t)OC_MAX_ATTACHMENT_SIZE : OC_INLINE_MAX, NULL);
+    } else if (c->type == OC_CMD_DOWNLOAD) {
+        FILE *fp = fopen(c->body, "wb");
+        if (!fp) { xfer_notice(ctx, 2, "download: cannot create file"); return; }
+        const char *slash = strrchr(c->body, '/');
+        begin_download(ctx, c->message_id, fp, 0, slash ? slash + 1 : c->body);
+    } else if (c->type == OC_CMD_LISTEN_FETCH) {
+        begin_listen(ctx, c->message_id);
+    } else if (c->type == OC_CMD_VOICE_PREVIEW) {
+        begin_voice_preview(ctx, c->body);
+    } else if (c->type == OC_CMD_POST_FILES) {
+        /* From the first file every time, a restart after a lost link included:
+         * what an earlier connection finished was never posted, and the daemon
+         * reclaims an upload no message took (ARCH-77). */
+        ctx->xq->ffile = 0;
+        files_next(ctx);
+    } else if (c->type == OC_CMD_POST_VIDEO) {
+        ctx->xq->vstage = 0; ctx->xq->vposter = ctx->xq->vvideo = 0;
+        char pname[128];
+        snprintf(pname, sizeof pname, "%s.jpg", c->body2 ? c->body2 : "video-message");
+        begin_upload(ctx, c->channel_id, pname, "image/jpeg", c->blob2, c->blob2_len, 3);
+    }
+}
+
+/* Retire a finished job and start the next. Called whenever the transfer may
+ * have gone idle: after the command queue drains and after server frames. */
+static void xq_pump(disp_ctx *ctx) {
+    oc_xqueue *q = ctx->xq;
+    while (ctx->xfer->mode == 0) {
+        if (q->active) { oc_cmd_free(q->active); q->active = NULL; }
+        if (q->n == 0) return;
+        q->active = q->q[0];
+        memmove(q->q, q->q + 1, (q->n - 1) * sizeof *q->q);
+        q->n--;
+        xq_start(ctx);
+    }
+}
+
+/* Queue a transfer command, taking ownership. A fetch already waiting or
+ * running for the same attachment is not queued twice: frontends ask again on
+ * every frame until the bytes arrive. */
+static void xq_add(oc_xqueue *q, oc_cmd *c) {
+    if (c->type == OC_CMD_FETCH) {
+        if (q->active && q->active->type == OC_CMD_FETCH && q->active->message_id == c->message_id &&
+            q->active->op >= c->op) { oc_cmd_free(c); return; }
+        for (size_t i = 0; i < q->n; i++)
+            if (q->q[i]->type == OC_CMD_FETCH && q->q[i]->message_id == c->message_id) {
+                if (c->op > q->q[i]->op) q->q[i]->op = c->op;
+                oc_cmd_free(c);
+                return;
+            }
+    }
+    if (q->n == q->cap) {
+        size_t cap = q->cap ? q->cap * 2 : 16;
+        oc_cmd **nq = realloc(q->q, cap * sizeof *nq);
+        if (!nq) { oc_cmd_free(c); return; }
+        q->q = nq; q->cap = cap;
+    }
+    q->q[q->n++] = c;
+}
+
+/* Put the running job back at the front: its connection is gone, so it starts
+ * over on the next one. */
+static void xq_requeue_active(oc_xqueue *q) {
+    if (!q->active) return;
+    if (q->n == q->cap) {
+        size_t cap = q->cap ? q->cap * 2 : 16;
+        oc_cmd **nq = realloc(q->q, cap * sizeof *nq);
+        if (!nq) { oc_cmd_free(q->active); q->active = NULL; return; }
+        q->q = nq; q->cap = cap;
+    }
+    memmove(q->q + 1, q->q, q->n * sizeof *q->q);
+    q->q[0] = q->active;
+    q->n++;
+    q->active = NULL;
+}
+
+/* Dispatch every buffered server frame into UI events. Returns 0 to keep the
+ * connection, -1 to drop it. */
+/* A message body for the UI: an encrypted DM's opened here first (PRIVATE-DM.md). */
+static char *body_for_ui(disp_ctx *ctx, uint64_t channel_id, oc_slice b) {
+    if (ctx->pdm && oc_pdm_is_e2e(ctx->pdm, channel_id)) return oc_pdm_unseal(ctx->pdm, channel_id, b.ptr, b.len);
+    char *s = malloc(b.len + 1);
+    if (s) { if (b.len) memcpy(s, b.ptr, b.len); s[b.len] = '\0'; }
+    return s;
+}
+
+/* An encrypted DM whose session is on another of this person's devices: not
+ * shown here, as nothing in it can be read here. */
+static int e2e_elsewhere(disp_ctx *ctx, uint64_t channel_id) {
+    return ctx->pdm && oc_pdm_is_e2e(ctx->pdm, channel_id) && !oc_pdm_holds(ctx->pdm, channel_id);
+}
+
+static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
+    for (;;) {
+        const uint8_t *frame; size_t flen;
+        int r = oc_framebuf_next(fb, &frame, &flen);
+        if (r == 0) return 0;
+        if (r < 0)  return -1;
+        oc_header hdr; oc_rbuf p;
+        if (oc_parse_frame(frame, flen, &hdr, &p) != OC_OK) return -1;
+
+        /* The version stamped on the frame must be the one this session
+         * negotiated. Dropping the connection is the whole of the response: a
+         * payload in a layout we did not agree to has no correct reading, and
+         * decoding it anyway is what turns a version disagreement into a
+         * mystery "connection lost" further down. */
+        if (hdr.version != ctx->version) {
+            push_err_ex(ctx->to_ui, OC_CERR_PROTOCOL, 0, "server sent a frame with an unnegotiated protocol version");
+            return -1;
+        }
+
+        /* Calls (REQ-150, ARCH-113): the call module answers its own frames. */
+        if (ctx->calls) {
+            int cr = oc_callsig_frame(ctx->calls, hdr.msg_type, &p, ctx->host, ctx_write, ctx, to_ui);
+            if (cr < 0) return -1;
+            if (cr > 0) continue;
+        }
+        /* Private DMs (PRIVATE-DM.md): likewise. */
+        if (ctx->pdm) {
+            int pr = oc_pdm_frame(ctx->pdm, hdr.msg_type, &p, ctx_write, ctx, to_ui);
+            if (pr < 0) return -1;
+            if (pr > 0) continue;
+        }
+
+        /* A held message waits only for its own ACTION, with its forward
+         * allowed in between; any other frame means it was not live. */
+        if (ctx->holding && hdr.msg_type != OC_MSG_ACTION && hdr.msg_type != OC_MSG_FORWARD)
+            held_release(ctx, to_ui);
+
+        if (hdr.msg_type == OC_MSG_ACTION) {
+            oc_action ac;
+            if (oc_decode_action(&p, &ac) != OC_OK) return -1;
+            if (ctx->holding && ac.message_id == ctx->held_id) {
+                /* The held message is the first thing held. */
+                oc_ev *m = ctx->held->head ? (oc_ev *)ctx->held->head->item : NULL;
+                if (m) ev_set_action(m, &ac);
+                held_release(ctx, to_ui);
+            } else {
+                if (ctx->holding) held_release(ctx, to_ui);
+                oc_ev *e = oc_ev_new(OC_EV_ACTION);
+                if (e) {
+                    e->channel_id = ac.channel_id;
+                    e->message_id = ac.message_id;
+                    e->author_id  = ac.actor_id;
+                    ev_set_action(e, &ac);
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_BROADCAST) {
+            oc_broadcast b;
+            if (oc_decode_broadcast(&p, &b) != OC_OK) return -1;
+            if (e2e_elsewhere(ctx, b.channel_id)) continue;
+            oc_queue *out = held_begin(ctx, to_ui, b.message_id);
+            oc_ev *e = oc_ev_new(OC_EV_MESSAGE);
+            if (e) {
+                e->channel_id = b.channel_id;
+                e->author_id = b.author_id;
+                e->message_id = b.message_id;
+                e->server_time = b.server_time;
+                e->msg_kind = b.kind;
+                if (b.author_name.len) {
+                    size_t an = b.author_name.len < sizeof e->author_name - 1
+                                    ? b.author_name.len : sizeof e->author_name - 1;
+                    memcpy(e->author_name, b.author_name.ptr, an);
+                    e->author_name[an] = '\0';
+                }
+                e->body = body_for_ui(ctx, b.channel_id, b.body);
+                oc_queue_push(out, e);
+                /* Trailing attachment metadata (REQ-140): fold each onto the message. */
+                push_attachments(out, b.channel_id, b.message_id, b.attach, b.n_attach);
+            }
+            if (ctx && ctx->hw) hwtab_note(ctx->hw, b.channel_id, b.message_id);
+            /* Cache the message so a relaunch shows it instantly (ARCH-45/46). */
+            if (ctx && ctx->store) {
+                char an[64]; size_t al = b.author_name.len < sizeof an - 1 ? b.author_name.len : sizeof an - 1;
+                memcpy(an, b.author_name.ptr, al); an[al] = '\0';
+                char *cb = malloc(b.body.len + 1);
+                if (cb) {
+                    memcpy(cb, b.body.ptr, b.body.len); cb[b.body.len] = '\0';
+                    free(cb);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_MSG_RESTORED) {
+            /* A delete taken back (REQ-052): the message whole, over its
+             * tombstone, then its files folded on as a BROADCAST's are. */
+            oc_broadcast b;
+            if (oc_decode_broadcast(&p, &b) != OC_OK) return -1;
+            if (e2e_elsewhere(ctx, b.channel_id)) continue;
+            oc_queue *out = held_begin(ctx, to_ui, b.message_id);
+            oc_ev *e = oc_ev_new(OC_EV_RESTORE);
+            if (e) {
+                e->channel_id = b.channel_id;
+                e->author_id = b.author_id;
+                e->message_id = b.message_id;
+                e->server_time = b.server_time;
+                e->body = body_for_ui(ctx, b.channel_id, b.body);
+                oc_queue_push(out, e);
+                push_attachments(out, b.channel_id, b.message_id, b.attach, b.n_attach);
+            }
+        } else if (hdr.msg_type == OC_MSG_CHANNEL_LIST) {
+            oc_channel_list_entry ents[OC_CHANNEL_LIST_PAGE]; uint16_t count = 0;
+            if (oc_decode_channel_list(&p, ents, OC_CHANNEL_LIST_PAGE, &count) != OC_OK) return -1;
+            if (count > OC_CHANNEL_LIST_PAGE) count = OC_CHANNEL_LIST_PAGE;
+            for (uint16_t i = 0; i < count; i++) {
+                if (ctx->pdm) oc_pdm_channel(ctx->pdm, ents[i].channel_id, ents[i].e2e);
+                if (e2e_elsewhere(ctx, ents[i].channel_id)) continue;
+                oc_ev *e = oc_ev_new(OC_EV_CHANNEL);
+                if (!e) continue;
+                e->channel_id = ents[i].channel_id;
+                e->e2e = ents[i].e2e;
+                e->status = ents[i].joined;
+                e->op = ents[i].kind;
+                e->is_public = ents[i].is_public;
+                /* Sidebar ordering + badging without a local cache (ARCH-88). */
+                e->server_time = ents[i].last_message_at;
+                e->count = ents[i].unread;
+                if (ents[i].kind == OC_CHANNEL_KIND_DM) e->user_id = ents[i].peer_id;
+                e->n_peers = ents[i].n_peers;                       /* REQ-056 */
+                for (uint16_t k = 0; k < ents[i].n_peers && k < 9; k++)
+                    e->peers[k] = ents[i].peers[k];
+                e->body = malloc(ents[i].name.len + 1);
+                if (e->body) { memcpy(e->body, ents[i].name.ptr, ents[i].name.len); e->body[ents[i].name.len] = '\0'; }
+                e->archived = ents[i].archived;
+                e->created_at = ents[i].created_at;
+                e->preview_author = ents[i].preview_author;
+                e->action = ents[i].preview_action;   /* REQ-058 */
+                e->preview = malloc(ents[i].preview.len + 1);
+                if (e->preview) {
+                    if (ents[i].preview.len) memcpy(e->preview, ents[i].preview.ptr, ents[i].preview.len);
+                    e->preview[ents[i].preview.len] = '\0';
+                }
+                e->topic = malloc(ents[i].topic.len + 1);
+                if (e->topic) { memcpy(e->topic, ents[i].topic.ptr, ents[i].topic.len); e->topic[ents[i].topic.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_WORKSPACE_INFO) {
+            oc_workspace_info wi;
+            if (oc_decode_workspace_info(&p, &wi) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_WORKSPACE_INFO);
+            if (e) {
+                e->status = wi.deployment_mode;
+                e->count  = wi.max_users;
+                e->op     = wi.call_max;
+                e->ws_mode = wi.mode;
+                e->size    = wi.max_video_size;
+                e->body = malloc(wi.workspace_name.len + 1);
+                if (e->body) { memcpy(e->body, wi.workspace_name.ptr, wi.workspace_name.len); e->body[wi.workspace_name.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_SERVER_BUILD) {
+            oc_server_build sb;
+            if (oc_decode_server_build(&p, &sb) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_SERVER_BUILD);
+            if (e) {
+                e->body = malloc(sb.build.len + 1);
+                if (e->body) { memcpy(e->body, sb.build.ptr, sb.build.len); e->body[sb.build.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_WORKSPACE_ADDRESS) {
+            /* The workspace's address now: one that moved still answers at the old
+             * one for a while. File it under the new one, and dial that next time. */
+            oc_workspace_address wa;
+            if (oc_decode_workspace_address(&p, &wa) != OC_OK) return -1;
+            char address[256], key[288];
+            slice_to_buf(wa.address, address, sizeof address);
+            if (ctx->rekey && oc_workspace_move(ctx->store, ctx->rekey, address, key, sizeof key)) {
+                snprintf(ctx->rekey, 288, "%s", key);
+                if (ctx->sni) snprintf(ctx->sni, 288, "%s", key);
+                oc_ev *e = oc_ev_new(OC_EV_WORKSPACE_MOVED);
+                if (e) {
+                    e->body = strdup(key);
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_CHANNEL_INFO) {
+            oc_channel_info ci;
+            if (oc_decode_channel_info(&p, &ci) == OC_OK) {
+                if (ctx->pdm) oc_pdm_channel(ctx->pdm, ci.channel_id, ci.e2e);
+                oc_ev *e = e2e_elsewhere(ctx, ci.channel_id) ? NULL : oc_ev_new(OC_EV_CHANNEL);   /* add/update the channel */
+                if (e) {
+                    e->channel_id = ci.channel_id;
+                    e->e2e = ci.e2e;
+                    e->status = ci.joined;
+                    e->op = ci.kind;
+                    e->is_public = ci.is_public;
+                    e->user_id = ci.peer_id;           /* DM peer, if any */
+                    e->n_peers = ci.n_peers;                        /* REQ-056 */
+                    for (uint16_t k = 0; k < ci.n_peers && k < 9; k++)
+                        e->peers[k] = ci.peers[k];
+                    e->body = malloc(ci.name.len + 1);
+                    if (e->body) { memcpy(e->body, ci.name.ptr, ci.name.len); e->body[ci.name.len] = '\0'; }
+                    e->archived = ci.archived;
+                    e->created_at = ci.created_at;
+                    e->topic = malloc(ci.topic.len + 1);
+                    if (e->topic) { memcpy(e->topic, ci.topic.ptr, ci.topic.len); e->topic[ci.topic.len] = '\0'; }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_SUMMARY) {
+            oc_summary sm;
+            if (oc_decode_summary(&p, &sm) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SUMMARY);
+                if (e) {
+                    e->req_id = sm.req_id;
+                    e->status = sm.status;
+                    e->summary_id = sm.summary_id;
+                    e->channel_id = sm.channel_id;
+                    e->span_start = sm.start_ms;
+                    e->span_end = sm.end_ms;
+                    e->body = malloc(sm.body.len + 1);
+                    if (e->body) {
+                        memcpy(e->body, sm.body.ptr, sm.body.len);
+                        e->body[sm.body.len] = '\0';
+                    }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_SUMMARY_QUEUED) {
+            oc_summary_queued sq;
+            if (oc_decode_summary_queued(&p, &sq) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SUMMARY_QUEUED);
+                if (e) {
+                    e->req_id = sq.req_id;
+                    e->count = sq.position;
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_SUMMARY_READY) {
+            oc_summary_ready rd;
+            if (oc_decode_summary_ready(&p, &rd) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SUMMARY_READY);
+                if (e) {
+                    e->summary_id = rd.notice_id;
+                    e->channel_id = rd.channel_id;
+                    e->sum_scope = rd.scope;
+                    e->status = rd.status;
+                    e->span_start = rd.start_ms;
+                    e->span_end = rd.end_ms;
+                    e->made_at = rd.made_at_ms;
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_CHANNEL_DESCRIPTION) {
+            oc_channel_description cd;
+            if (oc_decode_channel_description(&p, &cd) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_CHANNEL_DESCRIPTION);
+                if (e) {
+                    e->channel_id = cd.channel_id;
+                    e->body = malloc(cd.description.len + 1);
+                    if (e->body) {
+                        memcpy(e->body, cd.description.ptr, cd.description.len);
+                        e->body[cd.description.len] = '\0';
+                    }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_USER_LIST) {
+            oc_user_list_entry ue[512]; uint16_t count = 0;
+            if (oc_decode_user_list(&p, ue, 512, &count) != OC_OK) return -1;
+            if (count > 512) count = 512;
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_USER);
+                if (!e) continue;
+                e->user_id = ue[i].user_id;
+                e->status = ue[i].role;
+                e->op = ue[i].disabled;
+                e->message_id = ue[i].avatar_id;      /* */
+                e->body = malloc(ue[i].display_name.len + 1);
+                if (e->body) { memcpy(e->body, ue[i].display_name.ptr, ue[i].display_name.len); e->body[ue[i].display_name.len] = '\0'; }
+                /* REQ-289: the profile fields now travel with the roster, so a
+                 * client knows them for EVERYONE rather than only for itself.
+                 * Fixed-size copies, as oc_member holds them. */
+                {
+                    size_t n2 = ue[i].title.len < sizeof e->pf_title - 1 ? ue[i].title.len : sizeof e->pf_title - 1;
+                    if (n2) memcpy(e->pf_title, ue[i].title.ptr, n2);
+                    e->pf_title[n2] = '\0';
+                }
+                {
+                    size_t n2 = ue[i].timezone.len < sizeof e->pf_tz - 1 ? ue[i].timezone.len : sizeof e->pf_tz - 1;
+                    if (n2) memcpy(e->pf_tz, ue[i].timezone.ptr, n2);
+                    e->pf_tz[n2] = '\0';
+                }
+                {
+                    size_t n2 = ue[i].status_emoji.len < sizeof e->emoji - 1 ? ue[i].status_emoji.len : sizeof e->emoji - 1;
+                    if (n2) memcpy(e->emoji, ue[i].status_emoji.ptr, n2);
+                    e->emoji[n2] = '\0';
+                }
+                {
+                    size_t n2 = ue[i].status_text.len < sizeof e->author_name - 1 ? ue[i].status_text.len : sizeof e->author_name - 1;
+                    if (n2) memcpy(e->author_name, ue[i].status_text.ptr, n2);
+                    e->author_name[n2] = '\0';
+                }
+                {
+                    size_t n2 = ue[i].full_name.len < sizeof e->pf_full_name - 1 ? ue[i].full_name.len : sizeof e->pf_full_name - 1;
+                    if (n2) memcpy(e->pf_full_name, ue[i].full_name.ptr, n2);
+                    e->pf_full_name[n2] = '\0';
+                }
+                {
+                    size_t n2 = ue[i].pronouns.len < sizeof e->pf_pronouns - 1 ? ue[i].pronouns.len : sizeof e->pf_pronouns - 1;
+                    if (n2) memcpy(e->pf_pronouns, ue[i].pronouns.ptr, n2);
+                    e->pf_pronouns[n2] = '\0';
+                }
+                {
+                    size_t n2 = ue[i].voice_id.len < sizeof e->pf_voice - 1 ? ue[i].voice_id.len : sizeof e->pf_voice - 1;
+                    if (n2) memcpy(e->pf_voice, ue[i].voice_id.ptr, n2);
+                    e->pf_voice[n2] = '\0';
+                }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_PRESENCE_UPDATE) {
+            oc_presence_update pu;
+            if (oc_decode_presence_update(&p, &pu) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_PRESENCE);
+                /* `op` carries the do-not-disturb FACT (REQ-122): a second axis
+                 * beside presence, not a status value — somebody can be online
+                 * and paused, and folding it into `status` would make "away" and
+                 * "do not disturb" the same thing. */
+                if (e) { e->user_id = pu.user_id; e->status = pu.status; e->op = pu.dnd;
+                         oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_MENTION_UNRESOLVED) {
+            /* REQ-287. Flattened to a display string here rather than in the
+             * frontend, so the TUI and the GUI phrase it the same way — the same
+             * reason oc_model_dm_title exists. The ids travel alongside, because
+             * "add them" needs the person, not the text. */
+            oc_mention_unresolved mu;
+            if (oc_decode_mention_unresolved(&p, &mu) == OC_OK && mu.count) {
+                oc_ev *e = oc_ev_new(OC_EV_MENTION_UNRESOLVED);
+                if (e) {
+                    e->channel_id = mu.channel_id;
+                    e->message_id = mu.message_id;
+                    e->status = (uint8_t)((mu.can_add ? 1 : 0) | (mu.is_private ? 2 : 0));
+                    char names[256]; size_t at = 0;
+                    for (uint16_t i = 0; i < mu.count && i < 9; i++) {
+                        e->peers[i] = mu.who[i].user_id;
+                        e->n_peers  = (uint16_t)(i + 1);
+                        at += (size_t)snprintf(names + at, sizeof names - at, "%s%s",
+                                               at ? ", " : "", mu.who[i].name);
+                        if (at >= sizeof names - 1) break;
+                    }
+                    e->body = strdup(names);
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_MEMBER_ENTRY) {
+            oc_member_entry me;
+            if (oc_decode_member_entry(&p, &me) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_CHAN_MEMBER);
+                if (e) {
+                    e->channel_id  = me.channel_id;
+                    e->user_id     = me.user_id;
+                    e->status      = me.role;
+                    e->server_time = me.joined_at;
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_MEMBERS) {
+            oc_members mm;
+            if (oc_decode_members(&p, &mm) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_CHAN_MEMBERS_END);
+                if (e) { e->channel_id = mm.channel_id; e->count = mm.count; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_FILE_ENTRY) {
+            oc_file_entry fe;
+            if (oc_decode_file_entry(&p, &fe) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_FILE);
+                if (e) {
+                    e->attach_id   = fe.attachment_id;
+                    e->channel_id  = fe.channel_id;
+                    e->message_id  = fe.message_id;
+                    e->author_id   = fe.uploader_id;
+                    e->size        = fe.size;
+                    e->server_time = fe.created_at;
+                    e->reclaimed   = fe.reclaimed;
+                    e->media_kind  = fe.media_kind;
+                    e->duration_ms = fe.duration_ms;
+                    size_t mn = fe.mime.len < sizeof e->emoji - 1 ? fe.mime.len : sizeof e->emoji - 1;
+                    memcpy(e->emoji, fe.mime.ptr, mn);
+                    e->emoji[mn] = '\0';
+                    e->body = malloc(fe.filename.len + 1);
+                    if (e->body) {
+                        if (fe.filename.len) memcpy(e->body, fe.filename.ptr, fe.filename.len);
+                        e->body[fe.filename.len] = '\0';
+                    }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_FILES) {
+            oc_files ff;
+            if (oc_decode_files(&p, &ff) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_FILES_END);
+                if (e) { e->channel_id = ff.channel_id; e->count = ff.count;
+                         e->status = ff.more; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_SAVED_UPDATED) {
+            oc_saved_updated su;
+            if (oc_decode_saved_updated(&p, &su) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SAVED_UPDATED);
+                if (e) { e->message_id = su.message_id; e->op = su.op;
+                         e->pinned_at = su.saved_at; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_SAVED_MSG) {
+            oc_saved_msg sm;
+            if (oc_decode_saved_msg(&p, &sm) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SAVED_MSG);
+                if (e) {
+                    e->message_id = sm.message_id; e->channel_id = sm.channel_id;
+                    e->author_id = sm.author_id;   e->server_time = sm.server_time;
+                    e->pinned_at = sm.saved_at;
+                    e->action = sm.action;   /* REQ-058 */
+                    size_t an = sm.attach_name.len < sizeof e->author_name - 1
+                              ? sm.attach_name.len : sizeof e->author_name - 1;
+                    memcpy(e->author_name, sm.attach_name.ptr, an);
+                    e->author_name[an] = '\0';
+                    e->body = malloc(sm.body.len + 1);
+                    if (e->body) { if (sm.body.len) memcpy(e->body, sm.body.ptr, sm.body.len);
+                                   e->body[sm.body.len] = '\0'; }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_DRAFT) {
+            /* A list entry and a device-sync push are the same frame (ARCH-101),
+             * so this fold does not care which prompted it. */
+            oc_draft d;
+            if (oc_decode_draft(&p, &d) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_DRAFT);
+                if (e) {
+                    e->channel_id  = d.channel_id;
+                    e->message_id  = d.thread_root;
+                    e->server_time = d.updated_ms;
+                    e->body = malloc(d.body.len + 1);
+                    if (e->body) { if (d.body.len) memcpy(e->body, d.body.ptr, d.body.len);
+                                   e->body[d.body.len] = '\0'; }
+                    /* Who the unaddressed draft was for (REQ-229). The wire has
+                     * carried this since the frame existed; dropping it here is
+                     * why coming back to the pane found the words and not the
+                     * people. `topic` is the spare heap slot on this event. */
+                    if (d.recipients.len) {
+                        e->topic = malloc(d.recipients.len + 1);
+                        if (e->topic) { memcpy(e->topic, d.recipients.ptr, d.recipients.len);
+                                        e->topic[d.recipients.len] = '\0'; }
+                    }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_SCHEDULED) {
+            oc_scheduled sc;
+            if (oc_decode_scheduled(&p, &sc) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SCHEDULED);
+                if (e) {
+                    e->message_id  = sc.id;
+                    e->channel_id  = sc.channel_id;
+                    e->server_time = sc.send_at_ms;
+                    e->op          = sc.state;
+                    size_t fn = sc.fail_reason.len < sizeof e->author_name - 1
+                              ? sc.fail_reason.len : sizeof e->author_name - 1;
+                    memcpy(e->author_name, sc.fail_reason.ptr, fn);
+                    e->author_name[fn] = '\0';
+                    e->body = malloc(sc.body.len + 1);
+                    if (e->body) { if (sc.body.len) memcpy(e->body, sc.body.ptr, sc.body.len);
+                                   e->body[sc.body.len] = '\0'; }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_SCHEDULED_LIST) {
+            oc_scheduled_list sl;
+            if (oc_decode_scheduled_list(&p, &sl) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SCHEDULED_END);
+                if (e) { e->count = sl.count; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_DRAFTS) {
+            oc_drafts dl;
+            if (oc_decode_drafts(&p, &dl) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_DRAFTS_END);
+                if (e) { e->count = dl.count; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_SAVED) {
+            oc_saved sv;
+            if (oc_decode_saved(&p, &sv) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SAVED_END);
+                if (e) { e->count = sv.count; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_ACTIVITY_ENTRY) {
+            oc_activity_entry ae;
+            if (oc_decode_activity_entry(&p, &ae) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_ACTIVITY);
+                if (e) {
+                    e->status = ae.kind; e->message_id = ae.message_id;
+                    e->channel_id = ae.channel_id; e->user_id = ae.actor_id;
+                    e->server_time = ae.at;
+                    e->action = ae.action;   /* REQ-058 */
+                    e->body = malloc(ae.text.len + 1);
+                    if (e->body) { if (ae.text.len) memcpy(e->body, ae.text.ptr, ae.text.len);
+                                   e->body[ae.text.len] = '\0'; }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_ACTIVITY) {
+            oc_activity ac;
+            if (oc_decode_activity(&p, &ac) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_ACTIVITY_END);
+                if (e) { e->count = ac.count; e->pinned_at = ac.seen_at; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_PIN_UPDATED) {
+            oc_pin_updated pu;
+            if (oc_decode_pin_updated(&p, &pu) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_PIN);
+                if (e) {
+                    e->channel_id  = pu.channel_id;
+                    e->message_id  = pu.message_id;
+                    e->user_id     = pu.user_id;      /* the pinner */
+                    e->op          = pu.op;
+                    e->server_time = pu.pinned_at;
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_PINNED_MSG) {
+            oc_pinned_msg pm;
+            if (oc_decode_pinned_msg(&p, &pm) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_PINNED_MSG);
+                if (e) {
+                    e->channel_id  = pm.channel_id;
+                    e->message_id  = pm.message_id;
+                    e->author_id   = pm.author_id;
+                    e->server_time = pm.server_time;
+                    e->user_id     = pm.pinned_by;
+                    e->pinned_at   = pm.pinned_at;
+                    e->action      = pm.action;   /* REQ-058 */
+                    size_t an = pm.attach_name.len < sizeof e->author_name - 1
+                              ? pm.attach_name.len : sizeof e->author_name - 1;
+                    memcpy(e->author_name, pm.attach_name.ptr, an);
+                    e->author_name[an] = '\0';
+                    e->body = malloc(pm.body.len + 1);
+                    if (e->body) {
+                        if (pm.body.len) memcpy(e->body, pm.body.ptr, pm.body.len);
+                        e->body[pm.body.len] = '\0';
+                    }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_PINS) {
+            oc_pins pn;
+            if (oc_decode_pins(&p, &pn) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_PINS_END);
+                if (e) { e->channel_id = pn.channel_id; e->count = pn.count; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_FORWARD) {
+            oc_forward fw;
+            if (oc_decode_forward(&p, &fw) == OC_OK) {
+                /* The held message's own forward waits with it; any other
+                 * releases the hold first. */
+                if (ctx->holding && fw.message_id != ctx->held_id) held_release(ctx, to_ui);
+                oc_queue *out = ctx->holding ? ctx->held : to_ui;
+                oc_ev *e = oc_ev_new(OC_EV_FORWARD);
+                if (e) {
+                    e->channel_id   = fw.channel_id;
+                    e->message_id   = fw.message_id;
+                    e->src_channel  = fw.src_channel;
+                    e->src_message  = fw.src_message;
+                    e->author_id    = fw.src_author;
+                    e->src_n_attach = fw.n_attach;
+                    e->action       = fw.src_action;   /* REQ-058 */
+                    if (fw.src_attach_name.len < sizeof e->src_attach_name) {
+                        memcpy(e->src_attach_name, fw.src_attach_name.ptr,
+                               fw.src_attach_name.len);
+                        e->src_attach_name[fw.src_attach_name.len] = '\0';
+                    }
+                    e->body = malloc(fw.src_excerpt.len + 1);
+                    if (e->body) {
+                        memcpy(e->body, fw.src_excerpt.ptr, fw.src_excerpt.len);
+                        e->body[fw.src_excerpt.len] = '\0';
+                    }
+                    oc_queue_push(out, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_UNFURL) {
+            oc_unfurl uf;
+            if (oc_decode_unfurl(&p, &uf) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_UNFURL);
+                if (e) {
+                    e->channel_id = uf.channel_id;
+                    e->message_id = uf.message_id;
+                    e->body = malloc(uf.url.len + 1);
+                    if (e->body) { memcpy(e->body, uf.url.ptr, uf.url.len); e->body[uf.url.len] = '\0'; }
+                    e->topic = malloc(uf.title.len + 1);
+                    if (e->topic) { memcpy(e->topic, uf.title.ptr, uf.title.len); e->topic[uf.title.len] = '\0'; }
+                    e->preview = malloc(uf.descr.len + 1);
+                    if (e->preview) { memcpy(e->preview, uf.descr.ptr, uf.descr.len); e->preview[uf.descr.len] = '\0'; }
+                    if (e->body && e->topic && e->preview) oc_queue_push(to_ui, e);
+                    else oc_ev_free(e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_REACTION_UPDATED) {
+            oc_reaction_updated ru;
+            if (oc_decode_reaction_updated(&p, &ru) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_REACTION);
+                if (e) {
+                    e->channel_id = ru.channel_id;
+                    e->message_id = ru.message_id;
+                    e->user_id = ru.user_id;
+                    e->op = ru.op;
+                    e->count = (uint32_t)ru.count;
+                    size_t en = ru.emoji.len < sizeof e->emoji - 1 ? ru.emoji.len : sizeof e->emoji - 1;
+                    memcpy(e->emoji, ru.emoji.ptr, en);
+                    e->emoji[en] = '\0';
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_TYPING_UPDATE) {
+            oc_typing_update tu;
+            if (oc_decode_typing_update(&p, &tu) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_TYPING);
+                if (e) { e->channel_id = tu.channel_id; e->user_id = tu.user_id; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_MSG_EDITED) {
+            oc_msg_edited me;
+            if (oc_decode_msg_edited(&p, &me) == OC_OK) {
+                oc_queue *out = held_begin(ctx, to_ui, me.message_id);
+                oc_ev *e = e2e_elsewhere(ctx, me.channel_id) ? NULL : oc_ev_new(OC_EV_EDIT);
+                if (e) {
+                    e->channel_id = me.channel_id;
+                    e->message_id = me.message_id;
+                    e->body = body_for_ui(ctx, me.channel_id, me.body);
+                    oc_queue_push(out, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_MSG_DELETED) {
+            oc_msg_deleted md;
+            if (oc_decode_msg_deleted(&p, &md) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_DELETE);
+                if (e) { e->channel_id = md.channel_id; e->message_id = md.message_id; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_THREAD_REPLY) {
+            oc_thread_reply tr;
+            if (oc_decode_thread_reply(&p, &tr) == OC_OK) {
+                oc_queue *out = held_begin(ctx, to_ui, tr.message_id);
+                oc_ev *e = e2e_elsewhere(ctx, tr.channel_id) ? NULL : oc_ev_new(OC_EV_THREAD_REPLY);
+                if (e) {
+                    e->channel_id = tr.channel_id;
+                    e->parent_id = tr.parent_id;
+                    e->message_id = tr.message_id;
+                    e->author_id = tr.author_id;
+                    e->server_time = tr.server_time;
+                    e->count = tr.reply_count;
+                    e->participant = tr.participant;
+                    e->body = body_for_ui(ctx, tr.channel_id, tr.body);
+                    oc_queue_push(out, e);
+                    push_attachments(out, tr.channel_id, tr.message_id, tr.attach, tr.n_attach);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_THREAD) {
+            /* The replay's terminator. Decoded so the model can tell a thread's
+             * HISTORY from a reply that just happened: both arrive as
+             * THREAD_REPLY, and only the second one is news. */
+            oc_thread th;
+            if (oc_decode_thread(&p, &th) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_THREAD_END);
+                if (e) { e->parent_id = th.parent_id; e->count = th.count; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_THREAD_META) {
+            oc_thread_meta tm;
+            if (oc_decode_thread_meta(&p, &tm) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_THREAD_META);
+                if (e) { e->message_id = tm.message_id; e->count = tm.reply_count; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_SEARCH_RESULTS) {
+            oc_search_result_entry se[64]; uint16_t count = 0; uint8_t trunc = 0;
+            if (oc_decode_search_results(&p, se, 64, &count, &trunc) != OC_OK) return -1;
+            /* Our own 64-entry decode cap truncates just as surely as the
+             * server's does, so report either. */
+            if (count > 64) { count = 64; trunc = 1; }
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_SEARCH_RESULT);
+                if (!e) continue;
+                e->status = (i + 1 == count) ? trunc : 0;
+                e->channel_id = se[i].channel_id;
+                e->message_id = se[i].message_id;
+                e->author_id = se[i].author_id;
+                e->server_time = se[i].server_time;
+                e->action = se[i].action;   /* REQ-058 */
+                e->body = malloc(se[i].snippet.len + 1);
+                if (e->body) { memcpy(e->body, se[i].snippet.ptr, se[i].snippet.len); e->body[se[i].snippet.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_POLL) {
+            /* A poll's definition and tallies (REQ-225). It follows its
+             * message's ACTION, so a held message has been released by now. */
+            oc_poll_msg pm;
+            if (oc_decode_poll(&p, &pm) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_POLL);
+                if (e && (e->poll = calloc(1, sizeof *e->poll))) {
+                    e->channel_id = pm.channel_id;
+                    e->message_id = pm.message_id;
+                    e->poll->flags = pm.flags;
+                    e->poll->close_at_ms = pm.close_at_ms;
+                    e->poll->voters = pm.voters;
+                    e->poll->mine = pm.mine;
+                    e->poll->n_options = pm.n_options;
+                    for (uint8_t i = 0; i < pm.n_options; i++) {
+                        size_t n = pm.options[i].label.len < OC_POLL_OPTION_MAX ? pm.options[i].label.len : OC_POLL_OPTION_MAX;
+                        memcpy(e->poll->labels[i], pm.options[i].label.ptr, n);
+                        e->poll->labels[i][n] = '\0';
+                        e->poll->counts[i] = pm.options[i].count;
+                    }
+                    oc_queue_push(to_ui, e);
+                } else {
+                    oc_ev_free(e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_POLL_VOTERS) {
+            enum { VOTERS_CAP = 4096 };
+            oc_poll_voter *vs = malloc(VOTERS_CAP * sizeof *vs);
+            uint16_t count = 0; uint64_t mid = 0;
+            if (vs && oc_decode_poll_voters(&p, vs, VOTERS_CAP, &count, &mid) == OC_OK) {
+                if (count > VOTERS_CAP) count = VOTERS_CAP;
+                for (uint16_t i = 0; i < count; i++) {
+                    oc_ev *e = oc_ev_new(OC_EV_POLL_VOTERS);
+                    if (!e) continue;
+                    e->message_id = mid;
+                    e->user_id = vs[i].user_id;
+                    e->poll_option = vs[i].option;
+                    oc_queue_push(to_ui, e);
+                }
+            }
+            free(vs);
+        } else if (hdr.msg_type == OC_MSG_REACTIONS) {
+            oc_reaction_entry re[256]; uint16_t count = 0; uint64_t mid = 0;
+            if (oc_decode_reactions(&p, re, 256, &count, &mid) != OC_OK) return -1;
+            if (count > 256) count = 256;
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_REACTIONS);
+                if (!e) continue;
+                e->message_id = mid;
+                e->user_id = re[i].user_id;
+                size_t n = re[i].emoji.len < sizeof e->emoji - 1 ? re[i].emoji.len : sizeof e->emoji - 1;
+                memcpy(e->emoji, re[i].emoji.ptr, n); e->emoji[n] = '\0';
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_NOTIFY_PREFS) {
+            enum { NPREF_CAP = 256 };
+            oc_notify_pref_entry ne[NPREF_CAP]; uint16_t count = 0;
+            uint8_t npdefault = 0;
+            if (oc_decode_notify_prefs(&p, ne, NPREF_CAP, &count, &npdefault) != OC_OK) return -1;
+            if (count > NPREF_CAP) count = NPREF_CAP;
+            /* Header first (the sync boundary), then one event per channel. The
+             * DND window left with REQ-136 — the schedule is its own frame. */
+            oc_ev *h = oc_ev_new(OC_EV_DND);
+            if (h) {
+                h->op = npdefault;                /* REQ-134 */
+                oc_queue_push(to_ui, h);
+            }
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_NOTIFY_PREF);
+                if (!e) continue;
+                e->channel_id = ne[i].channel_id;
+                e->op = ne[i].level;
+                e->status = ne[i].muted;      /* distinct from the level */
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_THREAD_SUMMARY) {
+            oc_thread_summary ts;
+            if (oc_decode_thread_summary(&p, &ts) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_THREAD_SUMMARY);
+                if (e) {
+                    e->message_id  = ts.root_id;
+                    e->channel_id  = ts.channel_id;
+                    e->author_id   = ts.root_author;
+                    e->server_time = ts.root_at;
+                    e->pinned_at   = ts.last_reply_at;
+                    e->reply_count = ts.reply_count;
+                    e->unread_count= ts.unread;
+                    e->following   = ts.following;
+                    e->action      = ts.action;   /* REQ-058 */
+                    e->body = malloc(ts.preview.len + 1);
+                    if (e->body) {
+                        if (ts.preview.len) memcpy(e->body, ts.preview.ptr, ts.preview.len);
+                        e->body[ts.preview.len] = '\0';
+                    }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_THREADS) {
+            oc_threads th;
+            if (oc_decode_threads(&p, &th) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_THREADS_END);
+                if (e) { e->count = th.count; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_SCHEDULE) {
+            oc_schedule sc; oc_schedule_day days[OC_SCHEDULE_DAYS];
+            if (oc_decode_schedule(&p, &sc, days) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SCHEDULE);
+                if (e) {
+                    e->sched_mode = sc.mode;
+                    e->tz_offset_min = sc.tz_offset_min;
+                    e->sched_start_min = sc.start_min;
+                    e->sched_end_min = sc.end_min;
+                    e->n_sched_days = sc.count;
+                    for (uint8_t i = 0; i < sc.count; i++) e->sched_days[i] = days[i];
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_ALERT_PREFS) {
+            oc_slice terms[OC_MAX_KEYWORDS]; uint8_t nt = 0;
+            uint64_t people[OC_MAX_PRIORITY]; uint8_t np = 0;
+            if (oc_decode_alert_prefs(&p, terms, OC_MAX_KEYWORDS, &nt,
+                                      people, OC_MAX_PRIORITY, &np) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_ALERT_PREFS);
+                if (e) {
+                    for (uint8_t i = 0; i < nt; i++) {
+                        size_t len = terms[i].len < OC_KEYWORD_MAX - 1 ? terms[i].len : OC_KEYWORD_MAX - 1;
+                        if (len) memcpy(e->kw_terms[i], terms[i].ptr, len);
+                        e->kw_terms[i][len] = '\0';
+                    }
+                    e->n_kw_terms = nt;
+                    for (uint8_t i = 0; i < np; i++) e->pri_people[i] = people[i];
+                    e->n_pri_people = np;
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_SNOOZE) {
+            oc_snooze sn;
+            if (oc_decode_snooze(&p, &sn) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SNOOZE);
+                if (e) { e->server_time = sn.until_ms; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_GROUP_INFO) {
+            /* User groups (REQ-307): one, whole -- listed or pushed on a change. */
+            oc_ev *e = oc_ev_new(OC_EV_GROUP);
+            oc_group_view *g = e ? calloc(1, sizeof *g) : NULL;
+            if (!e || !g) { oc_ev_free(e); free(g); return 0; }
+            oc_group_info gi;
+            if (oc_decode_group_info(&p, &gi, g->members, OC_MAX_GROUP_MEMBERS) != OC_OK) {
+                oc_ev_free(e); free(g); return -1;
+            }
+            g->id = gi.group_id; g->created_by = gi.created_by; g->n_members = gi.count;
+            snprintf(g->handle, sizeof g->handle, "%.*s", (int)gi.handle.len, (const char *)gi.handle.ptr);
+            snprintf(g->name, sizeof g->name, "%.*s", (int)gi.name.len, (const char *)gi.name.ptr);
+            snprintf(g->description, sizeof g->description, "%.*s", (int)gi.description.len,
+                     (const char *)gi.description.ptr);
+            e->group = g;
+            e->message_id = g->id;
+            oc_queue_push(to_ui, e);
+        } else if (hdr.msg_type == OC_MSG_GROUP_DELETED) {
+            oc_group_ref gr;
+            if (oc_decode_group_ref(&p, &gr) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_GROUP_DELETED);
+            if (e) { e->message_id = gr.group_id; oc_queue_push(to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_GROUPS_END) {
+            oc_groups_end ge;
+            if (oc_decode_groups_end(&p, &ge) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_GROUPS_END);
+            if (e) { e->count = ge.count; oc_queue_push(to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_CHANNEL_GROUPS) {
+            oc_ev *e = oc_ev_new(OC_EV_CHANNEL_GROUPS);
+            if (!e) return 0;
+            oc_channel_groups cg;
+            if (oc_decode_channel_groups(&p, &cg, e->groups, OC_MAX_CHANNEL_GROUPS) != OC_OK) {
+                oc_ev_free(e); return -1;
+            }
+            e->channel_id = cg.channel_id;
+            e->n_groups = cg.count;
+            oc_queue_push(to_ui, e);
+        } else if (hdr.msg_type == OC_MSG_CHANNEL_VIA_GROUP) {
+            oc_ev *e = oc_ev_new(OC_EV_CHANNEL_VIA_GROUP);
+            uint64_t *ids = e ? calloc(OC_MAX_MEMBER_LIST, sizeof *ids) : NULL;
+            if (!e || !ids) { oc_ev_free(e); free(ids); return 0; }
+            oc_channel_via_group cv;
+            if (oc_decode_channel_via_group(&p, &cv, ids, OC_MAX_MEMBER_LIST) != OC_OK) {
+                oc_ev_free(e); free(ids); return -1;
+            }
+            e->channel_id = cv.channel_id;
+            e->ids = ids;
+            e->n_ids = cv.count;
+            oc_queue_push(to_ui, e);
+        } else if (hdr.msg_type == OC_MSG_MENTION_UNRESOLVED_MORE) {
+            oc_mention_unresolved_more um;
+            if (oc_decode_mention_unresolved_more(&p, &um) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_MENTION_UNRESOLVED_MORE);
+            if (e) { e->channel_id = um.channel_id; e->message_id = um.message_id; e->count = um.total;
+                     oc_queue_push(to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_EMOJI_LIST) {
+            oc_emoji_entry ee[OC_MAX_CUSTOM_EMOJI]; uint16_t count = 0;
+            if (oc_decode_emoji_list(&p, ee, OC_MAX_CUSTOM_EMOJI, &count) != OC_OK) return -1;
+            if (count > OC_MAX_CUSTOM_EMOJI) count = OC_MAX_CUSTOM_EMOJI;
+            oc_ev *b = oc_ev_new(OC_EV_EMOJI_BEGIN);
+            if (b) oc_queue_push(to_ui, b);
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_EMOJI);
+                if (!e) continue;
+                e->message_id = ee[i].attachment_id;
+                e->user_id = ee[i].created_by;
+                e->body = malloc(ee[i].name.len + 1);
+                if (e->body) { memcpy(e->body, ee[i].name.ptr, ee[i].name.len); e->body[ee[i].name.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_CLIENT_SETTINGS) {
+            enum { CS_CAP = OC_MAX_CLIENT_SETTINGS };
+            oc_client_setting_entry ce[CS_CAP];
+            oc_client_settings cst;
+            if (oc_decode_client_settings(&p, &cst, ce, CS_CAP) != OC_OK) return -1;
+            /* Only fold a bucket meant for this frontend; the daemon fans the sync
+             * to all of a user's connections regardless of client_type. */
+            const char *ct = ctx->client_type ? ctx->client_type : "";
+            if (cst.client_type.len != strlen(ct) ||
+                (cst.client_type.len && memcmp(cst.client_type.ptr, ct, cst.client_type.len) != 0))
+                continue;
+            oc_ev *h = oc_ev_new(OC_EV_SETTINGS_BEGIN);   /* clears the bucket (sync boundary) */
+            if (h) oc_queue_push(to_ui, h);
+            for (uint16_t i = 0; i < cst.count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_SETTING);
+                if (!e) continue;
+                size_t kn = ce[i].key.len < sizeof e->author_name - 1 ? ce[i].key.len : sizeof e->author_name - 1;
+                memcpy(e->author_name, ce[i].key.ptr, kn); e->author_name[kn] = '\0';
+                e->body = malloc(ce[i].value.len + 1);
+                if (e->body) { memcpy(e->body, ce[i].value.ptr, ce[i].value.len); e->body[ce[i].value.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_AUDIT_PAGE) {
+            oc_audit_entry ents[OC_AUDIT_PAGE_MAX];
+            uint16_t n = 0;
+            if (oc_decode_audit_page(&p, ents, OC_AUDIT_PAGE_MAX, &n) != OC_OK) return -1;
+            oc_ev *b = oc_ev_new(OC_EV_AUDIT_BEGIN);
+            if (b) oc_queue_push(ctx->to_ui, b);
+            for (uint16_t i = 0; i < n; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_AUDIT);
+                if (!e) break;
+                e->audit.at_ms     = ents[i].at_ms;
+                e->audit.actor_id  = ents[i].actor_id;
+                e->audit.target_id = ents[i].target_id;
+                e->audit.family    = ents[i].family;
+                e->audit.outcome   = ents[i].outcome;
+                slice_to_buf(ents[i].actor_name, e->audit.actor_name, sizeof e->audit.actor_name);
+                slice_to_buf(ents[i].action,     e->audit.action,     sizeof e->audit.action);
+                slice_to_buf(ents[i].target,     e->audit.target,     sizeof e->audit.target);
+                slice_to_buf(ents[i].detail,     e->audit.detail,     sizeof e->audit.detail);
+                oc_queue_push(ctx->to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_ALERTS_SUMMARY) {
+            oc_alerts_summary sm;
+            if (oc_decode_alerts_summary(&p, &sm) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_SRVALERTS);
+            if (e) { e->count = sm.unacked; e->srvalert_current = sm.current; oc_queue_push(ctx->to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_ALERTS) {
+            static oc_alert rows[OC_MAX_ALERTS];
+            oc_alerts al;
+            if (oc_decode_alerts(&p, &al, rows, OC_MAX_ALERTS) != OC_OK) return -1;
+            oc_ev *b = oc_ev_new(OC_EV_SRVALERT_BEGIN);
+            if (b) oc_queue_push(ctx->to_ui, b);
+            for (uint16_t i = 0; i < al.count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_SRVALERT);
+                if (!e) break;
+                if (!(e->srvalert = calloc(1, sizeof *e->srvalert))) { oc_ev_free(e); break; }
+                oc_srvalert_view *v = e->srvalert;
+                v->id = rows[i].id; v->first_ms = rows[i].first_ms; v->last_ms = rows[i].last_ms;
+                v->count = rows[i].count; v->current = rows[i].current; v->acked = rows[i].acked;
+                slice_to_buf(rows[i].key, v->key, sizeof v->key);
+                slice_to_buf(rows[i].message, v->message, sizeof v->message);
+                oc_queue_push(ctx->to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_STORAGE_STATUS) {
+            oc_storage_status ss;
+            if (oc_decode_storage_status(&p, &ss) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_STORAGE);
+            if (e) {
+                e->storage.total_bytes  = ss.total_bytes;
+                e->storage.avail_bytes  = ss.avail_bytes;
+                e->storage.attach_bytes = ss.attach_bytes;
+                e->storage.attach_count = ss.attach_count;
+                e->storage.rec_orphan   = ss.reclaimed_orphan;
+                e->storage.rec_expired  = ss.reclaimed_expired;
+                e->storage.rec_evicted  = ss.reclaimed_evicted;
+                e->storage.last_reclaim_ms = ss.last_reclaim_ms;
+                e->storage.max_age_days = ss.max_age_days;
+                e->storage.reserve_bytes = ss.reserve_bytes;
+                e->storage.evict_enabled = ss.evict_enabled;
+                e->storage.under_pressure = ss.under_pressure;
+                oc_queue_push(ctx->to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_READ_CURSOR) {
+            oc_read_cursor rc;
+            if (oc_decode_read_cursor(&p, &rc) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_READ_CURSOR);
+            if (e) { e->channel_id = rc.channel_id; e->user_id = rc.user_id; e->message_id = rc.message_id; oc_queue_push(to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_PROFILE_UPDATED) {
+            oc_profile_updated pu;
+            if (oc_decode_profile_updated(&p, &pu) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_PROFILE);
+            if (e) {
+                e->user_id = pu.user_id;
+                e->body = malloc(pu.display_name.len + 1);
+                if (e->body) { memcpy(e->body, pu.display_name.ptr, pu.display_name.len); e->body[pu.display_name.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_USER_UPDATED) {
+            oc_user_updated uu;
+            if (oc_decode_user_updated(&p, &uu) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_USER_UPDATED);
+            if (e) { e->user_id = uu.user_id; e->status = uu.role; e->op = uu.disabled; oc_queue_push(to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_CREDENTIAL_RESET) {
+            oc_credential_reset cr;
+            if (oc_decode_credential_reset(&p, &cr) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_CREDENTIAL_RESET);
+            if (e) {
+                e->user_id = cr.user_id;
+                e->body = malloc(cr.token.len + 1);
+                if (e->body) { memcpy(e->body, cr.token.ptr, cr.token.len); e->body[cr.token.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_INVITE_CREATED) {
+            oc_invite_created ic;
+            if (oc_decode_invite_created(&p, &ic) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_INVITE);
+            if (e) {
+                e->op = ic.role;
+                e->server_time = ic.expires_at;
+                e->uses = ic.uses;
+                e->body = malloc(ic.token.len + 1);
+                if (e->body) { memcpy(e->body, ic.token.ptr, ic.token.len); e->body[ic.token.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_UPLOAD_READY) {
+            oc_upload_ready rd;
+            if (oc_decode_upload_ready(&p, &rd) == OC_OK && ctx && ctx->xfer->mode == 1) {
+                oc_xfer *x = ctx->xfer;
+                x->id = rd.attachment_id;
+                x->chunk = rd.chunk_size ? rd.chunk_size : OC_ATTACH_CHUNK_SIZE;
+                if (x->chunk > OC_ATTACH_CHUNK_SIZE) x->chunk = OC_ATTACH_CHUNK_SIZE;
+                x->win_chunks = rd.window_bytes / x->chunk;
+                if (x->win_chunks == 0) x->win_chunks = 1;
+                upload_pump(ctx);
+            }
+        } else if (hdr.msg_type == OC_MSG_UPLOAD_ACK) {
+            oc_upload_ack ack;
+            if (oc_decode_upload_ack(&p, &ack) == OC_OK && ctx && ctx->xfer->mode == 1 &&
+                ack.attachment_id == ctx->xfer->id) {
+                ctx->xfer->acked_seq = ack.acked_through;
+                upload_pump(ctx);
+            }
+        } else if (hdr.msg_type == OC_MSG_UPLOAD_OK) {
+            oc_upload_ok ok;
+            if (oc_decode_upload_ok(&p, &ok) == OC_OK && ctx && ctx->xfer->mode == 1 &&
+                ok.attachment_id == ctx->xfer->id) {
+                oc_xfer *x = ctx->xfer;
+                if (x->purpose == 3) {
+                    /* A video message (REQ-162): poster, then video, then its media
+                     * facts. The job stays busy across the steps, so nothing else
+                     * starts between them. */
+                    oc_xqueue *q = ctx->xq;
+                    oc_cmd *job = q->active;
+                    if (q->vstage == 0) {
+                        q->vposter = x->id;
+                        xfer_reset(x);
+                        q->vstage = 1;
+                        char vname[128];
+                        snprintf(vname, sizeof vname, "%s.mp4", job->body2 ? job->body2 : "video-message");
+                        begin_upload(ctx, job->channel_id, vname, "video/mp4",
+                                     job->blob, job->blob_len, 3);
+                    } else {
+                        q->vvideo = x->id;
+                        xfer_reset(x);
+                        uint8_t mf[64]; oc_wbuf mw; oc_wbuf_init(&mw, mf, sizeof mf);
+                        oc_attach_media_set ms = { q->vvideo, OC_MEDIA_VIDEO_MESSAGE, job->duration_ms,
+                                                   job->media_w, job->media_h, q->vposter };
+                        if (oc_encode_attach_media_set(&mw, OC_PROTOCOL_VERSION, &ms) == OC_OK &&
+                            write_all(ctx->conn, ctx->fd, mf, mw.len, ctx->stop) == 0) {
+                            x->mode = 3;
+                            x->id = q->vvideo;
+                            q->vstage = 2;
+                        } else {
+                            xfer_notice(ctx, 2, "video message: could not send");
+                        }
+                    }
+                    continue;
+                }
+                if (x->purpose == 4) {
+                    /* One of several files for one message: the next file, or,
+                     * after the last, the message carrying them all. */
+                    oc_xqueue *q = ctx->xq;
+                    oc_cmd *job = q->active;
+                    q->fids[q->ffile] = x->id;
+                    if (q->ffile + 1 < job->n_paths) {
+                        xfer_reset(x);
+                        q->ffile++;
+                        files_next(ctx);
+                        continue;
+                    }
+                    static uint8_t pf[OC_MAX_FRAME_SIZE];
+                    oc_wbuf pw; oc_wbuf_init(&pw, pf, sizeof pf);
+                    oc_result pr;
+                    if (job->message_id) {
+                        oc_send_reply sr; memset(&sr, 0, sizeof sr);
+                        sr.channel_id = job->channel_id; sr.parent_id = job->message_id;
+                        gen_idem(sr.idem);
+                        sr.body = oc_slice_str(job->body ? job->body : "");
+                        sr.n_attach = job->n_paths;
+                        memcpy(sr.attach_ids, q->fids, job->n_paths * sizeof q->fids[0]);
+                        pr = oc_encode_send_reply(&pw, OC_PROTOCOL_VERSION, &sr);
+                    } else {
+                        oc_send sd; memset(&sd, 0, sizeof sd);
+                        sd.channel_id = job->channel_id;
+                        gen_idem(sd.idem);
+                        sd.body = oc_slice_str(job->body ? job->body : "");
+                        sd.n_attach = job->n_paths;
+                        memcpy(sd.attach_ids, q->fids, job->n_paths * sizeof q->fids[0]);
+                        pr = oc_encode_send(&pw, OC_PROTOCOL_VERSION, &sd);
+                    }
+                    if (pr == OC_OK && write_all(ctx->conn, ctx->fd, pf, pw.len, ctx->stop) == 0) {
+                        char msg[64];
+                        snprintf(msg, sizeof msg, "posted %u file%s", (unsigned)job->n_paths,
+                                 job->n_paths == 1 ? "" : "s");
+                        xfer_notice(ctx, 1, msg);
+                    } else {
+                        xfer_notice(ctx, 2, "files: could not send the message");
+                    }
+                    xfer_reset(x);
+                    continue;
+                }
+                if (x->purpose == 2) {
+                    /* A custom emoji (REQ-072): claim the finished upload by name,
+                     * and post nothing — the same shape as an avatar. */
+                    uint8_t ef[128]; oc_wbuf ew; oc_wbuf_init(&ew, ef, sizeof ef);
+                    oc_add_emoji ae = { oc_slice_str(x->ename), x->id };
+                    if (oc_encode_add_emoji(&ew, OC_PROTOCOL_VERSION, &ae) == OC_OK)
+                        (void)write_all(ctx->conn, ctx->fd, ef, ew.len, ctx->stop);
+                    xfer_notice(ctx, 1, "emoji added");
+                    xfer_reset(x);
+                    continue;
+                }
+                if (x->purpose == 1) {
+                    /* An avatar: claim it with SET_AVATAR instead of posting
+                     * it. The daemon checks that the uploader is the setter, and its
+                     * reclaim sweep excludes avatars — an attachment no message
+                     * references would otherwise be collected as an orphan. */
+                    uint8_t af[24]; oc_wbuf aw; oc_wbuf_init(&aw, af, sizeof af);
+                    oc_set_avatar sa = { x->id };
+                    if (oc_encode_set_avatar(&aw, OC_PROTOCOL_VERSION, &sa) == OC_OK)
+                        (void)write_all(ctx->conn, ctx->fd, af, aw.len, ctx->stop);
+                    xfer_notice(ctx, 1, "photo updated");
+                    xfer_reset(x);
+                    continue;
+                }
+                /* Publish the pending attachment by linking it into a SEND. */
+                uint8_t frame[256]; oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+                oc_send s; memset(&s, 0, sizeof s);
+                s.channel_id = x->channel;
+                gen_idem(s.idem);
+                s.body = oc_slice_str("");
+                s.n_attach = 1; s.attach_ids[0] = x->id;
+                if (oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK)
+                    (void)write_all(ctx->conn, ctx->fd, frame, w.len, ctx->stop);
+                char msg[200];
+                snprintf(msg, sizeof msg, "uploaded %s (%llu bytes)", x->name, (unsigned long long)ok.size);
+                xfer_notice(ctx, 1, msg);
+                xfer_reset(x);
+            }
+        } else if (hdr.msg_type == OC_MSG_ATTACH_MEDIA_OK) {
+            oc_attach_media_ok mo;
+            if (oc_decode_attach_media_ok(&p, &mo) == OC_OK && ctx && ctx->xfer->mode == 3 &&
+                ctx->xq->active && mo.attachment_id == ctx->xq->vvideo) {
+                oc_cmd *job = ctx->xq->active;
+                static uint8_t frame[OC_MAX_FRAME_SIZE];
+                oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+                oc_result er;
+                if (job->message_id) {
+                    oc_send_reply sr; memset(&sr, 0, sizeof sr);
+                    sr.channel_id = job->channel_id; sr.parent_id = job->message_id;
+                    gen_idem(sr.idem);
+                    sr.body = oc_slice_str(job->body ? job->body : "");
+                    sr.n_attach = 1; sr.attach_ids[0] = mo.attachment_id;
+                    er = oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &sr);
+                } else {
+                    oc_send sd; memset(&sd, 0, sizeof sd);
+                    sd.channel_id = job->channel_id;
+                    gen_idem(sd.idem);
+                    sd.body = oc_slice_str(job->body ? job->body : "");
+                    sd.n_attach = 1; sd.attach_ids[0] = mo.attachment_id;
+                    er = oc_encode_send(&w, OC_PROTOCOL_VERSION, &sd);
+                }
+                if (er == OC_OK && write_all(ctx->conn, ctx->fd, frame, w.len, ctx->stop) == 0) {
+                    oc_ev *e = oc_ev_new(OC_EV_MEDIA_POSTED);
+                    if (e) {
+                        e->xfer_tag = job->xfer_tag;
+                        e->attach_id = mo.attachment_id;
+                        e->channel_id = job->channel_id;
+                        e->parent_id = job->message_id;
+                        oc_queue_push(ctx->to_ui, e);
+                    }
+                    xfer_notice(ctx, 1, "video message sent");
+                } else {
+                    xfer_notice(ctx, 2, "video message: could not send");
+                }
+                xfer_reset(ctx->xfer);
+            }
+        } else if (hdr.msg_type == OC_MSG_DOWNLOAD_INFO) {
+            oc_download_info di;
+            if (oc_decode_download_info(&p, &di) == OC_OK && ctx && ctx->xfer->mode == 2 &&
+                di.attachment_id == ctx->xfer->id) {
+                ctx->xfer->total = di.total_size;
+            }
+        } else if (hdr.msg_type == OC_MSG_DOWNLOAD_CHUNK) {
+            oc_download_chunk dc;
+            if (oc_decode_download_chunk(&p, &dc) == OC_OK && ctx && ctx->xfer->mode == 2 &&
+                dc.attachment_id == ctx->xfer->id && dc.seq == ctx->xfer->next_seq) {
+                oc_xfer *x = ctx->xfer;
+                int failed = 0;
+                if (dc.data.len) {
+                    if (x->fp) {
+                        failed = fwrite(dc.data.ptr, 1, dc.data.len, x->fp) != dc.data.len;
+                    } else {
+                        /* Bounded: an image we are about to decode, not a file. */
+                        if (x->buf_len + dc.data.len > (x->buf_max ? x->buf_max : OC_INLINE_MAX)) failed = 1;
+                        else {
+                            if (x->buf_len + dc.data.len > x->buf_cap) {
+                                size_t want = x->buf_cap ? x->buf_cap * 2 : 65536;
+                                while (want < x->buf_len + dc.data.len) want *= 2;
+                                uint8_t *g = realloc(x->buf, want);
+                                if (!g) failed = 1; else { x->buf = g; x->buf_cap = want; }
+                            }
+                            if (!failed) {
+                                memcpy(x->buf + x->buf_len, dc.data.ptr, dc.data.len);
+                                x->buf_len += dc.data.len;
+                            }
+                        }
+                    }
+                }
+                if (failed) { xfer_notice(ctx, 2, "download: write error"); xfer_reset(x); }
+                else { x->done += dc.data.len; x->next_seq++; xfer_progress(ctx); }
+            }
+        } else if (hdr.msg_type == OC_MSG_DOWNLOAD_END) {
+            oc_download_end de;
+            if (oc_decode_download_end(&p, &de) == OC_OK && ctx && ctx->xfer->mode == 2 &&
+                de.attachment_id == ctx->xfer->id) {
+                oc_xfer *x = ctx->xfer;
+                int short_read = (x->total && x->done != x->total);
+                if (!x->fp) {
+                    /* In-memory: hand the bytes to the UI thread, which owns them
+                     * from here. No notice — an inline thumbnail is not an event
+                     * the user asked for and should not toast. */
+                    if (!short_read && x->buf_len) {
+                        oc_ev *e = oc_ev_new(OC_EV_ATTACHMENT_DATA);
+                        if (e) {
+                            e->message_id = x->id;
+                            e->count = (uint32_t)x->buf_len;
+                            e->body = (char *)x->buf;
+                            x->buf = NULL; x->buf_len = x->buf_cap = 0;
+                            oc_queue_push(ctx->to_ui, e);
+                        }
+                    }
+                    xfer_reset(x);
+                } else {
+                    char msg[256];
+                    if (short_read)
+                        snprintf(msg, sizeof msg, "download: size mismatch (%llu/%llu)",
+                                 (unsigned long long)x->done, (unsigned long long)x->total);
+                    else
+                        snprintf(msg, sizeof msg, "saved %s (%llu bytes)", x->name, (unsigned long long)x->done);
+                    xfer_notice(ctx, short_read ? 2 : 1, msg);
+                    xfer_reset(x);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_AUDIO_INFO) {
+            oc_audio_info ai;
+            if (oc_decode_audio_info(&p, &ai) == OC_OK && ctx && (ctx->xfer->mode == 4 || ctx->xfer->mode == 5) &&
+                ai.message_id == ctx->xfer->id)
+                ctx->xfer->total = ai.total_size;
+        } else if (hdr.msg_type == OC_MSG_AUDIO_CHUNK) {
+            oc_audio_chunk ac;
+            if (oc_decode_audio_chunk(&p, &ac) == OC_OK && ctx && (ctx->xfer->mode == 4 || ctx->xfer->mode == 5) &&
+                ac.message_id == ctx->xfer->id && ac.seq == ctx->xfer->next_seq) {
+                oc_xfer *x = ctx->xfer;
+                int failed = 0;
+                if (ac.data.len) {
+                    if (x->buf_len + ac.data.len > x->buf_max) failed = 1;
+                    else {
+                        if (x->buf_len + ac.data.len > x->buf_cap) {
+                            size_t want = x->buf_cap ? x->buf_cap * 2 : 65536;
+                            while (want < x->buf_len + ac.data.len) want *= 2;
+                            uint8_t *g = realloc(x->buf, want);
+                            if (!g) failed = 1; else { x->buf = g; x->buf_cap = want; }
+                        }
+                        if (!failed) {
+                            memcpy(x->buf + x->buf_len, ac.data.ptr, ac.data.len);
+                            x->buf_len += ac.data.len;
+                        }
+                    }
+                }
+                if (failed) {
+                    if (x->mode == 4) {                    /* a preview just goes without */
+                        oc_ev *e = oc_ev_new(OC_EV_LISTEN_SKIP);
+                        if (e) { e->message_id = x->id; oc_queue_push(ctx->to_ui, e); }
+                    }
+                    xfer_reset(x);
+                } else { x->done += ac.data.len; x->next_seq++; }
+            }
+        } else if (hdr.msg_type == OC_MSG_AUDIO_END) {
+            oc_audio_end ae;
+            if (oc_decode_audio_end(&p, &ae) == OC_OK && ctx && (ctx->xfer->mode == 4 || ctx->xfer->mode == 5) &&
+                ae.message_id == ctx->xfer->id) {
+                oc_xfer *x = ctx->xfer;
+                int whole = x->buf_len && (!x->total || x->done == x->total);
+                oc_ev *e = x->mode == 5 ? (whole ? oc_ev_new(OC_EV_VOICE_PREVIEW) : NULL)
+                                        : oc_ev_new(whole ? OC_EV_LISTEN_AUDIO : OC_EV_LISTEN_SKIP);
+                if (e) {
+                    e->message_id = x->id;
+                    if (whole) {
+                        e->count = (uint32_t)x->buf_len;
+                        e->body = (char *)x->buf;
+                        x->buf = NULL; x->buf_len = x->buf_cap = 0;
+                    }
+                    oc_queue_push(ctx->to_ui, e);
+                }
+                xfer_reset(x);
+            }
+        } else if (hdr.msg_type == OC_MSG_CAPABILITIES) {
+            oc_capabilities caps;
+            if (oc_decode_capabilities(&p, &caps) != OC_OK) return -1;
+            if (ctx->pdm) {
+                ctx->pdm->enabled = 0;
+                for (uint8_t i = 0; i < caps.count; i++)
+                    if (caps.names[i].len == strlen(OC_CAP_PDM) &&
+                        memcmp(caps.names[i].ptr, OC_CAP_PDM, caps.names[i].len) == 0)
+                        ctx->pdm->enabled = 1;
+            }
+            if (ctx->calls) {
+                ctx->calls->tcp_ok = 0;
+                for (uint8_t i = 0; i < caps.count; i++)
+                    if (caps.names[i].len == strlen(OC_CAP_CALLS_TCP) &&
+                        memcmp(caps.names[i].ptr, OC_CAP_CALLS_TCP, caps.names[i].len) == 0)
+                        ctx->calls->tcp_ok = 1;
+            }
+            char joined[256] = "";
+            size_t used = 0;
+            for (uint8_t i = 0; i < caps.count; i++) {
+                const oc_slice *nm = &caps.names[i];
+                /* A name holding a comma would split into two on the way back
+                 * out; no name the daemon sends has one, so one that does is
+                 * dropped rather than misread. */
+                if (!nm->len || memchr(nm->ptr, ',', nm->len) || used + nm->len + 2 > sizeof joined) continue;
+                if (used) joined[used++] = ',';
+                memcpy(joined + used, nm->ptr, nm->len);
+                used += nm->len;
+                joined[used] = '\0';
+            }
+            oc_ev *e = oc_ev_new(OC_EV_CAPABILITIES);
+            if (e) {
+                e->body = strdup(joined);
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_TTS_INFO) {
+            /* What this daemon can say, replaced whole on every connection: a
+             * BEGIN and then one event per voice, as the emoji list is. */
+            oc_tts_info ti;
+            if (oc_decode_tts_info(&p, &ti) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_TTS_BEGIN);
+            if (e) {
+                e->body = slice_dup(ti.model_version);
+                e->topic = slice_dup(ti.preview);
+                oc_queue_push(to_ui, e);
+            }
+            for (uint8_t i = 0; i < ti.count; i++) {
+                oc_ev *ve = oc_ev_new(OC_EV_TTS_VOICE);
+                if (!ve) break;
+                ve->body = slice_dup(ti.voices[i].id);
+                ve->topic = slice_dup(ti.voices[i].label);
+                ve->preview = slice_dup(ti.voices[i].lang);
+                oc_queue_push(to_ui, ve);
+            }
+        } else if (hdr.msg_type == OC_MSG_WEBHOOK_INFO) {
+            oc_webhook_info wi;
+            if (oc_decode_webhook_info(&p, &wi) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_WEBHOOK_INFO);
+            if (e) {
+                e->message_id = wi.webhook_id;
+                e->channel_id = wi.channel_id;
+                e->body = malloc(wi.token.len + 1);
+                if (e->body) { memcpy(e->body, wi.token.ptr, wi.token.len); e->body[wi.token.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_SESSION_LIST) {
+            oc_session_entry se[OC_MAX_SESSIONS]; uint16_t count = 0;
+            if (oc_decode_session_list(&p, se, OC_MAX_SESSIONS, &count) != OC_OK) return -1;
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_SESSION_ROW);
+                if (!e) continue;
+                e->message_id  = se[i].session_id;
+                e->server_time = se[i].created_at;
+                e->pinned_at   = se[i].last_seen;
+                /* channel_id, not count: `count` is an int and an epoch-ms expiry
+                 * truncates in it — the field was showing no expiry at all. A spare
+                 * 64-bit slot is right there. */
+                e->channel_id  = se[i].expires_at;
+                e->op          = se[i].current;
+                e->body = malloc(se[i].device_label.len + 1);
+                if (e->body) {
+                    memcpy(e->body, se[i].device_label.ptr, se[i].device_label.len);
+                    e->body[se[i].device_label.len] = '\0';
+                }
+                oc_queue_push(to_ui, e);
+            }
+            oc_ev *end = oc_ev_new(OC_EV_SESSIONS_END);
+            if (end) oc_queue_push(to_ui, end);
+        } else if (hdr.msg_type == OC_MSG_FILE_CHANNELS) {
+            oc_file_channel_entry fe[OC_MAX_FILE_CHANNELS]; uint16_t count = 0;
+            if (oc_decode_file_channels(&p, fe, OC_MAX_FILE_CHANNELS, &count) != OC_OK) return -1;
+            oc_ev *b = oc_ev_new(OC_EV_FILE_CHANNELS_BEGIN);
+            if (b) oc_queue_push(to_ui, b);
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_FILE_CHANNEL);
+                if (!e) continue;
+                e->channel_id = fe[i].channel_id;
+                e->count = (int)fe[i].count;
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_PROFILE_INFO) {
+            oc_profile_info pi;
+            if (oc_decode_profile_info(&p, &pi) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_PROFILE_INFO);
+            if (e) {
+                e->user_id     = pi.user_id;
+                e->server_time = pi.status_expires;
+                e->message_id  = pi.avatar_id;
+                e->op          = pi.role;
+                /* Four strings in two slots plus the roster's own name field: packed
+                 * with \x1f separators rather than growing oc_ev by four pointers for
+                 * one event. Unpacked in model.c, next to the struct it fills. */
+                size_t need = pi.display_name.len + pi.status_emoji.len +
+                              pi.status_text.len + pi.title.len + pi.timezone.len +
+                              pi.full_name.len + pi.pronouns.len + pi.phone.len +
+                              pi.voice_id.len + 18;
+                e->body = malloc(need);
+                if (e->body) {
+                    int k = snprintf(e->body, need,
+                                     "%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s",
+                                     (int)pi.display_name.len, (const char *)pi.display_name.ptr,
+                                     (int)pi.status_emoji.len, (const char *)pi.status_emoji.ptr,
+                                     (int)pi.status_text.len,  (const char *)pi.status_text.ptr,
+                                     (int)pi.title.len,        (const char *)pi.title.ptr,
+                                     (int)pi.timezone.len,     (const char *)pi.timezone.ptr,
+                                     (int)pi.full_name.len,    (const char *)pi.full_name.ptr,
+                                     (int)pi.pronouns.len,     (const char *)pi.pronouns.ptr,
+                                     (int)pi.phone.len,        (const char *)pi.phone.ptr,
+                                     (int)pi.voice_id.len,     (const char *)pi.voice_id.ptr);
+                    (void)k;
+                }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_INVITE_LIST) {
+            /* Cap-safe like the webhook list above: the decoder drains the
+             * whole frame and keeps what fits, so an over-long list cannot desync
+             * the stream. */
+            oc_invite_entry iv[OC_MAX_INVITES]; uint16_t count = 0;
+            if (oc_decode_invite_list(&p, iv, OC_MAX_INVITES, &count) != OC_OK) return -1;
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_INVITE_ROW);
+                if (!e) continue;
+                e->message_id  = iv[i].invite_id;
+                e->op          = iv[i].role;
+                e->server_time = iv[i].expires_at;
+                e->user_id     = iv[i].created_by;
+                e->uses        = iv[i].uses;
+                e->used        = iv[i].used;
+                oc_queue_push(to_ui, e);
+            }
+            oc_ev *end = oc_ev_new(OC_EV_INVITE_END);
+            if (end) oc_queue_push(to_ui, end);
+        } else if (hdr.msg_type == OC_MSG_INVITE_REVOKED) {
+            oc_revoke_invite rv;
+            if (oc_decode_invite_revoked(&p, &rv) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_INVITE_REVOKED);
+            if (e) { e->message_id = rv.invite_id; oc_queue_push(to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_WEBHOOK_LIST) {
+            oc_webhook_list_entry we[256]; uint16_t count = 0;
+            if (oc_decode_webhook_list(&p, we, 256, &count) != OC_OK) return -1;
+            if (count > 256) count = 256;
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_WEBHOOK);
+                if (!e) continue;
+                e->message_id = we[i].webhook_id;
+                e->channel_id = we[i].channel_id;
+                e->op = we[i].disabled;
+                e->body = malloc(we[i].label.len + 1);
+                if (e->body) { memcpy(e->body, we[i].label.ptr, we[i].label.len); e->body[we[i].label.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_WEBHOOK_DELETED) {
+            oc_webhook_deleted wd;
+            if (oc_decode_webhook_deleted(&p, &wd) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_WEBHOOK_DELETED);
+            if (e) { e->message_id = wd.webhook_id; oc_queue_push(to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_STT_INFO) {
+            oc_stt_info si;
+            if (oc_decode_stt_info(&p, &si) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_STT_INFO);
+            if (e) {
+                e->body = slice_dup(si.model_version);
+                e->topic = slice_dup(si.lang);
+                e->count = si.max_segment_ms;
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_STT_TEXT) {
+            oc_stt_text st;
+            if (oc_decode_stt_text(&p, &st) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_STT_TEXT);
+            if (e) {
+                e->count = st.segment_id;
+                e->message_id = st.message_id;
+                e->body = slice_dup(st.text);
+                stt_where(ctx, st.segment_id, e);
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_SEND_ACK) {
+            /* The server has durably accepted a send: clear it from the outbox so
+             * it isn't resent (REQ-102). The matching BROADCAST already folded it
+             * into the model. */
+            /* Gated on the OUTBOX, and nothing else. It used to require ctx->store
+             * as well -- the local persistence store, which this has nothing to do
+             * with -- so a client without one (the TUI unpersisted, every test
+             * client) never cleared a single row: the count only grew, and every
+             * reconnect resent the whole history of the process for the daemon to
+             * dedup. */
+            oc_send_ack ack;
+            if (oc_decode_send_ack(&p, &ack) == OC_OK && ctx && ctx->obox)
+                obox_remove(ctx->obox, ack.idem);
+        } else if (hdr.msg_type == OC_MSG_ERROR) {
+            oc_error err;
+            if (oc_decode_error(&p, &err) != OC_OK) {
+                /* Malformed: nothing to act on. */
+            } else if (err.context.len == 4 && !err.fatal) {
+                /* A refused voice-input segment: its id, not an attachment's or a
+                 * send's, is the context. The frontend says what it means. */
+                oc_ev *e = oc_ev_new(OC_EV_STT_ERROR);
+                if (e) {
+                    e->count = (uint32_t)err.context.ptr[0] << 24 | (uint32_t)err.context.ptr[1] << 16 |
+                               (uint32_t)err.context.ptr[2] << 8 | err.context.ptr[3];
+                    e->size = err.code;
+                    stt_where(ctx, e->count, e);
+                    oc_queue_push(to_ui, e);
+                }
+            } else if (err.code == OC_ERR_CALL_UNAVAILABLE || err.code == OC_ERR_CALL_FULL ||
+                       err.code == OC_ERR_NOT_CALL_STARTER || err.code == OC_ERR_NOT_IN_CALL ||
+                       (err.code == OC_ERR_NOT_A_MEMBER && err.message.len == 16 &&
+                        memcmp(err.message.ptr, "call join denied", 16) == 0)) {
+                /* A call request refused (REQ-150, REQ-305): the call view says
+                 * why, in its own words, rather than a status line. */
+                oc_ev *e = oc_ev_new(OC_EV_CALL_ERROR);
+                if (e) { e->size = err.code; oc_queue_push(to_ui, e); }
+                if (ctx->calls) oc_callsig_refused(ctx->calls, to_ui);
+            } else {
+                /* The code's meaning, in this client's words: the server's own
+                 * text is its to choose, and says less. The storage conditions
+                 * read as what they are -- "this file was reclaimed", "the
+                 * server is out of space" -- not as a bug (REQ-215/216). */
+                const char *t = oc_error_text(err.code);
+                push_err_ex(to_ui, OC_CERR_REFUSED, err.code, t ? t : "the workspace refused that");
+                /* An error ABOUT THE TRANSFER aborts it; abandon the local file.
+                 *
+                 * It used to abort on *any* error that happened to arrive while a
+                 * transfer was running, which desynchronised the two ends: the
+                 * client freed its slot and the daemon did not, so every later
+                 * upload on that connection was refused with `transfer error`
+                 * (netloop.c rejects UPLOAD_BEGIN when `c->xfer.state !=
+                 * XFER_NONE`). The trigger was ordinary and unrelated — a
+                 * "channel already exists" landing mid-upload was enough — and
+                 * the symptom appeared much later and nowhere near the cause,
+                 * as custom emoji and avatars silently failing to upload.
+                 *
+                 * The daemon already distinguishes these: send_transfer_error()
+                 * puts the attachment id in `context`, and the codes below are
+                 * the ones it uses. Everything else is somebody else's error and
+                 * must leave the transfer alone. */
+                int about_transfer =
+                    err.code == OC_ERR_TRANSFER_PROTOCOL   ||
+                    err.code == OC_ERR_ATTACHMENT_TOO_LARGE ||
+                    err.code == OC_ERR_ATTACHMENT_GONE      ||
+                    err.code == OC_ERR_UNKNOWN_ATTACHMENT   ||
+                    err.code == OC_ERR_STORAGE_FULL         ||
+                    /* A video message refused at ATTACH_MEDIA_SET (REQ-164). */
+                    (ctx && ctx->xfer->mode == 3 &&
+                     (err.code == OC_ERR_MEDIA_INVALID || err.code == OC_ERR_MEDIA_TOO_LARGE)) ||
+                    /* Speech this daemon will not produce (REQ-294/295): the
+                     * message has nothing to say, or read-aloud is off or busy. */
+                    (ctx && (ctx->xfer->mode == 4 || ctx->xfer->mode == 5) &&
+                     (err.code == OC_ERR_NOT_RENDERABLE || err.code == OC_ERR_TTS_UNAVAILABLE ||
+                      err.code == OC_ERR_FORBIDDEN || err.code == OC_ERR_UNKNOWN_MESSAGE));
+                /* An upload the daemon gave up on is a failure for its job, which
+                 * a frontend following the tag must see. The status line above
+                 * already says why, so the notice carries no text of its own. */
+                if (ctx && ctx->xfer->mode == 1 && about_transfer) xfer_notice(ctx, 2, NULL);
+                if (ctx && ctx->xfer->mode == 3 && about_transfer)
+                    xfer_notice(ctx, 2, err.code == OC_ERR_MEDIA_TOO_LARGE
+                                        ? "video message: larger than this server accepts"
+                                        : "video message refused by the server");
+                /* Talking mode moves on: the queue is what matters, not this
+                 * one message (ARCH-111). The reason travels so a frontend can
+                 * say something once rather than for every message. */
+                if (ctx && ctx->xfer->mode == 4 && about_transfer) {
+                    oc_ev *le = oc_ev_new(OC_EV_LISTEN_SKIP);
+                    if (le) {
+                        le->message_id = ctx->xfer->id;
+                        le->status = err.code;
+                        oc_queue_push(ctx->to_ui, le);
+                    }
+                }
+                if (ctx && ctx->xfer->mode != 0 && about_transfer) xfer_reset(ctx->xfer);
+                if (err.fatal) return -1;
+            }
+        }
+        /* SEND_ACK and others are ignored in the Phase 1 skeleton. */
+    }
+}
+
+/* ---- the thread ---- */
+
+enum { RC_STOP = 0, RC_LOST = 1, RC_FATAL = 2, RC_CERT_CHANGED = 3,
+       RC_BROWSER = 4, /* the person is in their browser; wait for them, then connect again */
+       /* The workspace PUBLISHED a fingerprint and the daemon presented something
+        * else (ARCH-10). Distinct from CERT_CHANGED: nothing changed and there is
+        * nothing to re-trust -- this is the first connection, refused because the
+        * certificate is not the one the workspace says is its own. */
+       RC_CERT_UNPUBLISHED = 5,
+       /* A certificate no trusted root vouches for, and nothing else trusts it:
+        * the person has not said to (ARCH-10). The fingerprint is shown to them. */
+       RC_CERT_UNTRUSTED = 6 };
+
+/* Checking a certificate defends against a network man-in-the-middle
+ * substituting the server's. A loopback connection never leaves the host, so
+ * there is no MITM vector, and asking about it would only raise false alarms
+ * across local daemon restarts (each fresh daemon self-signs a new cert). So a
+ * loopback certificate is accepted as it is (ARCH-10) — matching how tools skip
+ * TLS verification for localhost. */
+/* This machine, in any spelling (resolve.h). */
+static int is_loopback(const char *host) { return oc_addr_is_loopback(host); }
+
+/* The daemon builds the authorize URL (AUTH.md §8.1), and the client opens it only
+ * over https — or plain http to loopback, which is a developer's relay. */
+static int url_is_openable(const char *u) {
+    if (strncmp(u, "https://", 8) == 0) return 1;
+    static const char *const LOCAL[] = { "http://127.0.0.1", "http://localhost", "http://[::1]" };
+    for (size_t i = 0; i < sizeof LOCAL / sizeof LOCAL[0]; i++) {
+        size_t l = strlen(LOCAL[i]);
+        if (strncmp(u, LOCAL[i], l) == 0 && (u[l] == ':' || u[l] == '/' || u[l] == '\0')) return 1;
+    }
+    return 0;
+}
+
+/* What to tell a person about a refused sign-in. */
+static const char *auth_error_text(uint16_t code, int reconnecting) {
+    switch (code) {
+    case OC_ERR_AUTH_NOT_ALLOWED:        return "this account isn't allowed in this workspace";
+    case OC_ERR_AUTH_USE_PROVIDER:       return "this address signs in here with Google or Microsoft: use that";
+    case OC_ERR_AUTH_RATE_LIMITED:       return "too many attempts: try again in a minute";
+    case OC_ERR_USER_LIMIT:              return "this workspace is full";
+    case OC_ERR_AUTH_SOURCE_UNAVAILABLE: return "this way of signing in isn't available right now";
+    case OC_ERR_AUTH_REQUIRED:           return "this workspace doesn't sign in that way";
+    default: return reconnecting ? "session expired: please log in again" : "auth failed";
+    }
+}
+
+/* The daemon's origin as a browser names it: the name its certificate was
+ * checked for (set_expected_name), or its address, and the port unless 443. */
+static int daemon_authority(const oc_net *n, char *name, size_t ncap, char *auth, size_t acap) {
+    char port[8] = "";
+    if (n->port != 443) snprintf(port, sizeof port, "%d", n->port);
+    if (!oc_sni_name(n->ws_key[0] ? n->ws_key : n->host, name, ncap)) name[0] = '\0';
+    return oc_url_hostheader(name[0] ? name : n->host, port, auth, acap);
+}
+
+static void device_forget(oc_net *n) {
+    oc_signin_wipe(n->device_secret, sizeof n->device_secret);
+    n->device_interval = 0;
+}
+
+/* A device code's wait (AUTH.md §8.11), on this connection: ask for a code if
+ * there is none yet, publish it for the frontend, then poll at the interval the
+ * daemon keeps. 0 once the token is in n->oidc_token; else the RC_ to end the
+ * attempt with -- a dropped connection keeps the code, and the next one polls
+ * on with it. */
+static int device_flow(oc_net *n, oc_tls_conn *conn, int fd, oc_framebuf *fb, uint16_t negotiated) {
+    oc_header hdr; oc_rbuf p;
+    if (!n->device_secret[0]) {
+        char challenge[OC_SIGNIN_CHALLENGE_LEN + 1];
+        if (oc_signin_verifier(n->verifier, challenge) != 0) {
+            push_err_ex(n->to_ui, OC_CERR_LOCAL, 0, "could not start a sign-in on this computer");
+            return RC_FATAL;
+        }
+        uint8_t bb[256]; oc_wbuf bw; oc_wbuf_init(&bw, bb, sizeof bb);
+        oc_auth_device_begin b = { oc_slice_str(OC_SOURCE_ID_LOCAL), oc_slice_str(challenge) };
+        if (oc_encode_auth_device_begin(&bw, OC_PROTOCOL_VERSION, &b) != OC_OK ||
+            write_all(conn, fd, bb, bw.len, &n->stop) != 0 ||
+            read_one(conn, fd, fb, &hdr, &p, &n->stop) != 0 || hdr.version != negotiated) return RC_LOST;
+        if (hdr.msg_type != OC_MSG_AUTH_DEVICE) {
+            oc_error er0; uint16_t code = 0;
+            if (hdr.msg_type == OC_MSG_ERROR && oc_decode_error(&p, &er0) == OC_OK) code = er0.code;
+            push_err_ex(n->to_ui, OC_CERR_AUTH, code, code == OC_ERR_AUTH_RATE_LIMITED ? "too many sign-in codes waiting: try again later"
+                                                               : auth_error_text(code, 0));
+            return RC_FATAL;
+        }
+        oc_auth_device d;
+        if (oc_decode_auth_device(&p, &d) != OC_OK || d.device_code.len >= sizeof n->device_secret ||
+            d.user_code.len > 16 || d.verification_path.len == 0 || d.verification_path.len > 64 ||
+            d.verification_path.ptr[0] != '/') return RC_FATAL;
+        memcpy(n->device_secret, d.device_code.ptr, d.device_code.len);
+        n->device_secret[d.device_code.len] = '\0';
+        n->device_interval = d.interval_s ? d.interval_s : 5;
+        /* Where the person goes: the daemon's own https origin, under the name
+         * its certificate was checked for. A daemon no authority vouches for
+         * gets a browser's warning there, so its fingerprint -- the one this
+         * client accepted -- goes along, to be checked against it. */
+        char name[256], auth[300], url[600], ucode[20];
+        snprintf(ucode, sizeof ucode, "%.*s", (int)d.user_code.len, (const char *)d.user_code.ptr);
+        oc_mutex_lock(&n->accept_mu);
+        int ca = n->accepted_ca;
+        unsigned char fp[OC_TLS_FINGERPRINT_LEN];
+        memcpy(fp, n->accepted_fp, sizeof fp);
+        oc_mutex_unlock(&n->accept_mu);
+        if (daemon_authority(n, name, sizeof name, auth, sizeof auth) != 0) return RC_FATAL;
+        int w = snprintf(url, sizeof url, "https://%s%.*s?code=%s", auth, (int)d.verification_path.len,
+                         (const char *)d.verification_path.ptr, ucode);
+        if (w < 0 || (size_t)w >= sizeof url) return RC_FATAL;
+        char fphex[OC_TLS_FINGERPRINT_LEN * 2 + 1] = "";
+        if (!ca) for (int i = 0; i < OC_TLS_FINGERPRINT_LEN; i++) snprintf(fphex + 2 * i, 3, "%02x", fp[i]);
+        n->signin_cancel = 0;
+        oc_ev *e = oc_ev_new(OC_EV_AUTH_DEVICE);
+        if (e) {
+            e->body = strdup(url);
+            e->topic = strdup(ucode);
+            e->preview = strdup(fphex);
+            e->count = d.expires_in_s;
+            oc_queue_push(n->to_ui, e);
+        }
+    }
+    for (;;) {
+        /* The interval, watching for a stop or a cancel. */
+        for (unsigned waited = 0; waited < n->device_interval * 10u; waited++) {
+            if (n->stop) return RC_STOP;
+            if (n->signin_cancel) {
+                device_forget(n);
+                push_err_ex(n->to_ui, OC_CERR_SIGNIN_CANCELLED, 0, "sign-in cancelled");
+                return RC_FATAL;
+            }
+            oc_nanosleep(100 * 1000 * 1000);
+        }
+        uint8_t pb[128]; oc_wbuf pw; oc_wbuf_init(&pw, pb, sizeof pb);
+        oc_auth_device_poll dp = { oc_slice_str(n->device_secret) };
+        if (oc_encode_auth_device_poll(&pw, OC_PROTOCOL_VERSION, &dp) != OC_OK ||
+            write_all(conn, fd, pb, pw.len, &n->stop) != 0 ||
+            read_one(conn, fd, fb, &hdr, &p, &n->stop) != 0 || hdr.version != negotiated) return RC_LOST;
+        if (hdr.msg_type == OC_MSG_AUTH_DEVICE_TOKEN) {
+            oc_auth_device_token t;
+            if (oc_decode_auth_device_token(&p, &t) != OC_OK || !(n->oidc_token = malloc(t.token.len + 1)))
+                return RC_FATAL;
+            memcpy(n->oidc_token, t.token.ptr, t.token.len);
+            n->oidc_token[t.token.len] = '\0';
+            snprintf(n->source_id, sizeof n->source_id, "%s", OC_SOURCE_ID_LOCAL);
+            device_forget(n);
+            return 0;
+        }
+        oc_error er0; uint16_t code = 0;
+        if (hdr.msg_type == OC_MSG_ERROR && oc_decode_error(&p, &er0) == OC_OK) code = er0.code;
+        if (code == OC_ERR_AUTH_PENDING) continue;
+        if (code == OC_ERR_AUTH_SLOW_DOWN) { n->device_interval += 5; continue; }
+        device_forget(n);
+        push_err_ex(n->to_ui, OC_CERR_AUTH, code, code == OC_ERR_AUTH_DENIED  ? "the sign-in was refused on the sign-in page" :
+                           code == OC_ERR_AUTH_EXPIRED ? "the sign-in code expired: start again" :
+                                                         auth_error_text(code, 0));
+        return RC_FATAL;
+    }
+}
+
+/* Where the browser goes for one of the daemon's pages (AUTH.md §8.10): the
+ * daemon itself, when a trusted authority vouched for its certificate -- the
+ * page then has the workspace's own origin, which password managers and
+ * passkeys key on; otherwise `lb`'s tunnel, carrying the pages to the very
+ * certificate this client accepted. -1 before any connection got that far. */
+static int page_url(oc_net *n, oc_loopback *lb, const char *path, char *out, size_t cap) {
+#ifdef __EMSCRIPTEN__
+    /* The web client is served by the daemon whose pages these are (WEB.md):
+     * the page's own origin, which the browser judged. */
+    (void)n;
+    char base[300];
+    if (!lb || oc_loopback_tunnel_base(lb, base, sizeof base) != 0) return -1;
+    int wb = snprintf(out, cap, "%s%s", base, path);
+    return wb < 0 || (size_t)wb >= cap ? -1 : 0;
+#endif
+    oc_mutex_lock(&n->accept_mu);
+    int have = n->accepted, ca = n->accepted_ca;
+    oc_tunnel_target t;
+    memset(&t, 0, sizeof t);
+    memcpy(t.fp, n->accepted_fp, sizeof t.fp);
+    oc_mutex_unlock(&n->accept_mu);
+    if (!have) return -1;
+    if (daemon_authority(n, t.name, sizeof t.name, t.authority, sizeof t.authority) != 0) return -1;
+    int w;
+    if (ca) {
+        w = snprintf(out, cap, "https://%s%s", t.authority, path);
+    } else {
+        if (!lb) return -1;
+        snprintf(t.host, sizeof t.host, "%s", n->host);
+        t.port = n->port;
+        oc_loopback_set_tunnel(lb, &t);
+        char base[128];
+        if (oc_loopback_tunnel_base(lb, base, sizeof base) != 0) return -1;
+        w = snprintf(out, cap, "%s%s", base, path);
+    }
+    return w < 0 || (size_t)w >= cap ? -1 : 0;
+}
+
+/* Tell the waiting browser tab how its sign-in went, and let it go. */
+static void signin_answer(oc_net *n, oc_loopback_outcome outcome, const char *why) {
+    if (!n->answer_lb) return;
+    oc_loopback_answer(n->answer_lb, outcome, why);
+    oc_loopback_close(n->answer_lb);
+    n->answer_lb = NULL;
+}
+
+static void signin_forget(oc_net *n) {
+    oc_loopback_close(n->loopback);
+    n->loopback = NULL;
+    oc_signin_wipe(n->verifier, sizeof n->verifier);
+    if (n->oidc_token) { oc_signin_wipe(n->oidc_token, strlen(n->oidc_token)); free(n->oidc_token); }
+    n->oidc_token = NULL;
+    oc_signin_wipe(n->oidc_state, sizeof n->oidc_state);
+}
+
+/* Ask a workspace how it signs people in, before anyone has typed anything
+ * (AUTH.md §8.1): connect, shake hands, read the challenge, leave. No pin is
+ * enforced and none is stored — nothing secret is sent, and what comes back only
+ * decides which controls to draw; the connection that signs in checks the pin. */
+int oc_net_probe(const char *workspace, const char *host, int port, oc_signin_source *out, int max) {
+    oc_cert_seen *unused = malloc(sizeof *unused);   /* large for a stack */
+    if (!unused) return OC_PROBE_UNREACHABLE;
+    int rc = oc_net_probe_ex(workspace, host, port, NULL, out, max, unused);
+    free(unused);
+    return rc;
+}
+
+/* Describe a certificate for the person to judge: fingerprint in hex, and the
+ * certificate if it fits. */
+static void cert_seen_fill(oc_cert_seen *s, const unsigned char fp[OC_TLS_FINGERPRINT_LEN],
+                           const oc_tls_conn *conn) {
+    for (int i = 0; i < OC_TLS_FINGERPRINT_LEN; i++) snprintf(s->fp_hex + 2 * i, 3, "%02x", fp[i]);
+    const uint8_t *der; size_t len;
+    s->der_len = 0;
+    if (oc_tls_peer_der(conn, &der, &len) == 0 && len <= sizeof s->der) {
+        memcpy(s->der, der, len);
+        s->der_len = len;
+    }
+}
+
+int oc_net_probe_ex(const char *workspace, const char *host, int port, const unsigned char *trusted_fp,
+                    oc_signin_source *out, int max, oc_cert_seen *seen) {
+    seen->fp_hex[0] = '\0';
+    seen->der_len = 0;
+    int fd = dial(host, port);
+    if (fd < 0) return OC_PROBE_UNREACHABLE;
+    oc_tls_client cli;
+    oc_tls_conn conn;
+    oc_framebuf fb;
+    if (oc_tls_client_init_verify(&cli, NULL) != 0 || oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
+        oc_closesock(fd);
+        return OC_PROBE_UNREACHABLE;
+    }
+    oc_tls_conn_defer_verify(&conn);
+    {
+        char sni[256];
+        const char *name = workspace && workspace[0] ? workspace : host;
+        if (oc_sni_name(name, sni, sizeof sni)) oc_tls_conn_set_hostname(&conn, sni);
+        else oc_tls_conn_set_hostname(&conn, host);
+    }
+    oc_framebuf_init(&fb);
+    atomic_int stop = 0;
+    int rc = OC_PROBE_UNREACHABLE;
+    if (do_handshake(&conn, fd, &stop) != 0) goto done;
+    /* The same judgement as the connection that signs in (cert_judge), before
+     * anything is asked of anyone: a certificate nobody vouches for is shown to
+     * the person to judge, not talked to. */
+    if (!oc_tls_conn_ca_trusted(&conn)) {
+        unsigned char fp[OC_TLS_FINGERPRINT_LEN];
+        if (oc_tls_peer_fingerprint(&conn, fp) != 0) goto done;
+        if (!(trusted_fp && memcmp(fp, trusted_fp, sizeof fp) == 0) && !is_loopback(host)) {
+            cert_seen_fill(seen, fp, &conn);
+            rc = OC_PROBE_UNTRUSTED;
+            goto done;
+        }
+    }
+    {
+        uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_hello h = { OC_PROTOCOL_VERSION, OC_PROTOCOL_VERSION, oc_slice_str("openchime-client/0.1") };
+        if (oc_encode_hello(&w, &h) != OC_OK || write_all(&conn, fd, buf, w.len, &stop) != 0) goto done;
+        oc_header hdr; oc_rbuf p;
+        if (read_one(&conn, fd, &fb, &hdr, &p, &stop) != 0) goto done;
+        if (hdr.msg_type == OC_MSG_REJECT) { rc = OC_PROBE_VERSION; goto done; }
+        if (hdr.msg_type != OC_MSG_WELCOME) goto done;
+        if (read_one(&conn, fd, &fb, &hdr, &p, &stop) != 0 || hdr.msg_type != OC_MSG_AUTH_CHALLENGE)
+            goto done;
+        oc_auth_challenge ch;
+        if (oc_decode_auth_challenge(&p, &ch) != OC_OK) goto done;
+        int n = 0;
+        for (uint8_t i = 0; i < ch.n_sources && n < max; i++) {
+            const oc_auth_source *s = &ch.sources[i];
+            if (s->id.len >= sizeof out[n].id || s->label.len >= sizeof out[n].label) continue;
+            memcpy(out[n].id, s->id.ptr, s->id.len);          out[n].id[s->id.len] = '\0';
+            memcpy(out[n].label, s->label.ptr, s->label.len); out[n].label[s->label.len] = '\0';
+            out[n].kind = s->kind;
+            n++;
+        }
+        rc = n;
+    }
+done:
+    oc_framebuf_free(&fb);
+    oc_tls_conn_free(&conn);
+    oc_tls_client_free(&cli);
+    oc_closesock(fd);
+    return rc;
+}
+
+/* The name the certificate must carry: the workspace's domain (its key), sent
+ * as SNI; or, for a workspace that is an address, the address -- checked among
+ * the certificate's iPAddress names, and never sent (RFC 6066 §3). */
+static void set_expected_name(oc_tls_conn *conn, const oc_net *n) {
+    char sni[256];
+    if (oc_sni_name(n->ws_key[0] ? n->ws_key : n->host, sni, sizeof sni))
+        oc_tls_conn_set_hostname(conn, sni);
+    else
+        oc_tls_conn_set_hostname(conn, n->host);
+}
+
+/* Is this certificate one to talk to (ARCH-10)? 0 if so; else the RC_ to end
+ * the attempt with. In order:
+ *   - a trusted root vouches for it, under the workspace's name: yes, and a
+ *     trust the person gave an earlier, self-signed certificate is no longer
+ *     needed, and is forgotten;
+ *   - the workspace published a fingerprint (.well-known, fetched over verified
+ *     HTTPS): yes if it is that one, and refused if not, whatever else holds --
+ *     the workspace said which certificate is its own;
+ *   - the person has said to trust this certificate: yes if it is that one;
+ *   - a daemon on this machine (loopback): yes -- nothing sits in that path;
+ *   - otherwise refused, its fingerprint kept for the person to judge. */
+static void accepted_as(oc_net *n, oc_tls_conn *conn, int ca) {
+    unsigned char fp[OC_TLS_FINGERPRINT_LEN];
+    if (oc_tls_peer_fingerprint(conn, fp) != 0) return;
+    oc_mutex_lock(&n->accept_mu);
+    memcpy(n->accepted_fp, fp, sizeof fp);
+    n->accepted_ca = ca;
+    n->accepted = 1;
+    oc_mutex_unlock(&n->accept_mu);
+}
+
+static int cert_judge_why(oc_net *n, conn_store *cs, oc_tls_conn *conn);
+
+static int cert_judge(oc_net *n, conn_store *cs, oc_tls_conn *conn) {
+    int rc = cert_judge_why(n, cs, conn);
+    if (rc == 0) accepted_as(n, conn, oc_tls_conn_ca_trusted(conn));
+    return rc;
+}
+
+static int cert_judge_why(oc_net *n, conn_store *cs, oc_tls_conn *conn) {
+    if (oc_tls_conn_ca_trusted(conn)) {
+        if (cs && cs->have_pin) {
+            cs->have_pin = 0;
+            if (cs->pins) oc_store_clear_pin(cs->pins, cs->workspace);
+        }
+        return 0;
+    }
+    unsigned char fp[OC_TLS_FINGERPRINT_LEN];
+    if (oc_tls_peer_fingerprint(conn, fp) != 0) return RC_LOST;
+    if (n->have_published_pin)
+        return memcmp(fp, n->published_pin, sizeof fp) == 0 ? 0 : RC_CERT_UNPUBLISHED;
+    if (cs && cs->have_pin && memcmp(fp, cs->pin, sizeof fp) == 0) return 0;
+    if (is_loopback(n->host)) return 0;
+    cert_seen_fill(&n->seen, fp, conn);
+    return cs && cs->have_pin ? RC_CERT_CHANGED : RC_CERT_UNTRUSTED;
+}
+
+/* One connection lifecycle: dial → TLS → handshake → auth → serve, then clean up.
+ * `reconnecting` selects session-token auth (OC_AUTH_SESSION) over password; the
+ * AUTH_OK session token is captured into `sess`/`*have_sess` (kept across
+ * reconnects — the daemon issues no new token on reconnect). Returns RC_STOP
+ * (graceful quit/logout), RC_LOST (dropped — a session reconnect may follow), or
+ * RC_FATAL (version/auth reject — do not retry). `*served` is set once the serve
+ * loop is entered, so the caller can shorten the backoff after a live session. */
+static int run_connection(oc_net *n, int reconnecting,
+                          uint8_t sess[OC_SESSION_TOKEN_LEN], int *have_sess,
+                          oc_hwtab *hw, int *served, conn_store *cs) {
+    int rc = RC_LOST;
+    *served = 0;
+    oc_wake wake = { -1, -1 };   /* opened for serving (below); closed at drop */
+
+    int fd = dial(n->host, n->port);
+    if (fd < 0) return RC_LOST;
+
+    oc_tls_client cli;
+    oc_tls_conn conn;
+    oc_framebuf fb;
+    /* Trust (ARCH-10): the certificate is verified as any HTTPS server's is --
+     * a trusted root, and the workspace's name -- and judged after the handshake
+     * (cert_judge), where the fallback for a daemon that has no such certificate
+     * is applied. Multiple oc_clients in one process (the headless test) set up
+     * TLS concurrently; safe because the vendored mbedTLS is built with
+     * MBEDTLS_THREADING. */
+#ifdef __EMSCRIPTEN__
+    /* The browser client (CLIENT.md §4): the socket is a WebSocket the page
+     * opened over HTTPS, so the wire is secured and judged by the browser, and
+     * the connection carries the protocol in the clear inside it. There is no
+     * certificate here to pin. */
+    memset(&cli, 0, sizeof cli);
+    (void)cert_judge;
+    if (oc_tls_conn_init_plain(&conn, fd) != 0) { oc_closesock(fd); return RC_LOST; }
+#else
+    if (oc_tls_client_init_verify(&cli, NULL) != 0 ||
+        oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
+        oc_closesock(fd); return RC_LOST;
+    }
+    oc_tls_conn_defer_verify(&conn);
+#endif
+    /* Resume the last session if the daemon still takes its ticket: a reconnect
+     * then skips the certificate and signature of a full handshake. The ticket
+     * came from a connection that passed the same pin check. */
+    oc_tls_conn_resume(&conn, &n->resume);
+    /* Name the workspace in the handshake (SNI): a shared front door reads it to
+     * find the workspace's daemon, without terminating anything. It is the
+     * workspace's own domain — its key — even when an SRV record sent this
+     * connection elsewhere, and never an address (RFC 6066 §3). It is also the
+     * name the certificate must carry. A workspace that is an address has the
+     * address checked instead, among the certificate's iPAddress names. */
+    set_expected_name(&conn, n);
+    oc_framebuf_init(&fb);
+    /* Attachment transfer state, valid from here to `drop:` (which may reset it). */
+    oc_xfer xfer; memset(&xfer, 0, sizeof xfer);
+    uint16_t negotiated = 0;   /* set from WELCOME; checked on every later frame */
+
+    if (do_handshake(&conn, fd, &n->stop) != 0) {
+        oc_tls_session_free(&n->resume);   /* the next attempt starts from nothing */
+        goto drop;
+    }
+#ifndef __EMSCRIPTEN__
+    {
+        int judged = cert_judge(n, cs, &conn);
+        if (judged != 0) { rc = judged; oc_tls_session_free(&n->resume); goto drop; }
+    }
+#endif
+
+    /* HELLO -> WELCOME */
+    {
+        uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_hello h = { OC_PROTOCOL_VERSION, OC_PROTOCOL_VERSION, oc_slice_str("openchime-client/0.1") };
+        if (oc_encode_hello(&w, &h) != OC_OK || write_all(&conn, fd, buf, w.len, &n->stop) != 0) goto drop;
+        oc_header hdr; oc_rbuf p;
+        if (read_one(&conn, fd, &fb, &hdr, &p, &n->stop) != 0) goto drop;
+        if (hdr.msg_type == OC_MSG_REJECT) { push_err_ex(n->to_ui, OC_CERR_PROTOCOL, 0, "version rejected"); rc = RC_FATAL; goto drop; }
+        if (hdr.msg_type != OC_MSG_WELCOME) goto drop;
+        /* WELCOME's payload was previously never decoded — the frame's presence
+         * was the whole handshake. The chosen version is what every later frame
+         * is checked against, so it has to be read. */
+        oc_welcome wel;
+        if (oc_decode_welcome(&p, &wel) != OC_OK) goto drop;
+        if (wel.chosen_version != OC_PROTOCOL_VERSION) {
+            /* We send min == max, so the server cannot legitimately choose
+             * anything else; if it did, we could not speak what it picked. */
+            push_err_ex(n->to_ui, OC_CERR_PROTOCOL, 0, "server chose a protocol version we did not offer");
+            rc = RC_FATAL; goto drop;
+        }
+        negotiated = wel.chosen_version;
+    }
+
+    /* WELCOME is followed by AUTH_CHALLENGE advertising the daemon's methods
+     * (PROTOCOL.md §4.1). This skeleton only does local auth, so we read and
+     * accept the challenge without inspecting the offered set. */
+    {
+        oc_header hdr; oc_rbuf p;
+        if (read_one(&conn, fd, &fb, &hdr, &p, &n->stop) != 0) goto drop;
+        /* Post-handshake, so the negotiated version applies from here on — the
+         * auth exchange is checked like any other frame rather than being a
+         * window where the field is ignored. */
+        if (hdr.version != negotiated) goto drop;
+        if (hdr.msg_type != OC_MSG_AUTH_CHALLENGE) goto drop;
+        oc_auth_challenge ch;
+        if (oc_decode_auth_challenge(&p, &ch) != OC_OK) goto drop;
+        /* What the workspace offers, for the frontend to shape what it asks for
+         * (an invitation by address needs a browser source; a token, local). */
+        {
+            uint32_t kinds = 0;
+            /* The browser sources' ids too, one per line: an id that names a
+             * provider lets the invite prompt say which one. */
+            char ids[OC_MAX_SOURCES * 65] = "";
+            size_t il = 0;
+            for (uint8_t i = 0; i < ch.n_sources; i++) {
+                const oc_auth_source *s = &ch.sources[i];
+                if (s->kind < 32) kinds |= 1u << s->kind;
+                if ((s->kind == OC_SOURCE_RELAY || s->kind == OC_SOURCE_OIDC) &&
+                    s->id.len && s->id.len <= 64 && il + s->id.len + 1 < sizeof ids) {
+                    memcpy(ids + il, s->id.ptr, s->id.len);
+                    il += s->id.len;
+                    ids[il++] = '\n';
+                    ids[il] = '\0';
+                }
+            }
+            oc_ev *se = oc_ev_new(OC_EV_SIGNIN_SOURCES);
+            if (se) {
+                se->count = kinds;
+                se->body = strdup(ids);
+                oc_queue_push(n->to_ui, se);
+            }
+        }
+
+        /* Which way in. A stored session needs no source. Otherwise the first
+         * browser source offered is the way: the daemon builds the URL, the
+         * frontend opens it, and this connection ends: nothing is held open
+         * while the person is in their browser (AUTH.md §8.1). A password is
+         * never sent in a frame (§8.10). */
+        int fresh = !(reconnecting && *have_sess);
+        if (fresh && !n->oidc_token && n->device) {
+            int local = 0;
+            for (uint8_t i = 0; i < ch.n_sources; i++) if (ch.sources[i].kind == OC_SOURCE_LOCAL) local = 1;
+            if (!local) {
+                push_err_ex(n->to_ui, OC_CERR_AUTH, 0, "this workspace has no accounts of its own to sign in to with a code");
+                rc = RC_FATAL; goto drop;
+            }
+            int dr = device_flow(n, &conn, fd, &fb, negotiated);
+            if (dr != 0) { rc = dr; goto drop; }
+            /* ...and on to AUTH below, with the token, on this connection. */
+        } else if (fresh && !n->oidc_token) {
+            /* The source asked for; else the first browser source offered; else
+             * local accounts, which sign in on the daemon's own pages (§8.10). */
+            const oc_auth_source *src = NULL;
+            for (uint8_t i = 0; i < ch.n_sources && !src && n->signin_pref[0]; i++)
+                if (ch.sources[i].id.len == strlen(n->signin_pref) &&
+                    memcmp(ch.sources[i].id.ptr, n->signin_pref, ch.sources[i].id.len) == 0)
+                    src = &ch.sources[i];
+            for (uint8_t i = 0; i < ch.n_sources && !src && !n->signin_pref[0]; i++)
+                if (ch.sources[i].kind == OC_SOURCE_RELAY || ch.sources[i].kind == OC_SOURCE_OIDC)
+                    src = &ch.sources[i];
+            for (uint8_t i = 0; i < ch.n_sources && !src && !n->signin_pref[0]; i++)
+                if (ch.sources[i].kind == OC_SOURCE_LOCAL) src = &ch.sources[i];
+            if (!src || src->id.len >= sizeof n->source_id) {
+                push_err_ex(n->to_ui, OC_CERR_AUTH, 0, "this workspace doesn't offer that way of signing in");
+                rc = RC_FATAL; goto drop;
+            }
+            memcpy(n->source_id, src->id.ptr, src->id.len);
+            n->source_id[src->id.len] = '\0';
+
+            signin_forget(n);
+            char redirect[160], challenge[OC_SIGNIN_CHALLENGE_LEN + 1];
+            n->loopback = src->kind == OC_SOURCE_OIDC ? oc_loopback_open_provider(redirect, sizeof redirect)
+                                                      : oc_loopback_open(redirect, sizeof redirect);
+            if (!n->loopback || oc_signin_verifier(n->verifier, challenge) != 0) {
+                signin_forget(n);
+                push_err_ex(n->to_ui, OC_CERR_LOCAL, 0, "could not start a browser sign-in on this computer");
+                rc = RC_FATAL; goto drop;
+            }
+#ifdef __EMSCRIPTEN__
+            /* The browser leaves this page for the sign-in and comes back to
+             * a new one, which resumes with these (signin_web.c). */
+            oc_signin_stash(n->source_id, n->verifier);
+#endif
+            uint8_t bb[512]; oc_wbuf bw; oc_wbuf_init(&bw, bb, sizeof bb);
+            oc_auth_begin ab = { oc_slice_str(n->source_id), oc_slice_str(redirect),
+                                 oc_slice_str(challenge) };
+            if (oc_encode_auth_begin(&bw, OC_PROTOCOL_VERSION, &ab) != OC_OK ||
+                write_all(&conn, fd, bb, bw.len, &n->stop) != 0) { signin_forget(n); goto drop; }
+            if (read_one(&conn, fd, &fb, &hdr, &p, &n->stop) != 0 || hdr.version != negotiated) {
+                signin_forget(n); goto drop;
+            }
+            if (hdr.msg_type != OC_MSG_AUTH_REDIRECT) {
+                oc_error er0; uint16_t code = 0;
+                if (hdr.msg_type == OC_MSG_ERROR && oc_decode_error(&p, &er0) == OC_OK) code = er0.code;
+                signin_forget(n);
+                push_err_ex(n->to_ui, OC_CERR_AUTH, code, auth_error_text(code, 0));
+                rc = RC_FATAL; goto drop;
+            }
+            oc_auth_redirect ar;
+            char url[2048];
+            if (oc_decode_auth_redirect(&p, &ar) != OC_OK || ar.authorize_url.len >= sizeof url) {
+                signin_forget(n); rc = RC_FATAL; goto drop;
+            }
+            memcpy(url, ar.authorize_url.ptr, ar.authorize_url.len);
+            url[ar.authorize_url.len] = '\0';
+            if (url[0] == '/') {
+                /* A path on the daemon's own pages: direct, or through the
+                 * tunnel, as this connection judged its certificate. An
+                 * invitation rides along and opens the sign-up form; a reset's
+                 * token opens the page that sets a new password, which goes
+                 * on to this sign-in. */
+                char path[1200];
+                int pw;
+                if (n->invite_reset && n->invite && strncmp(url, "/signin?", 8) == 0)
+                    pw = snprintf(path, sizeof path, "/account/reset?t=%s&%s", n->invite, url + 8);
+                else
+                    pw = snprintf(path, sizeof path, "%s%s%s", url, n->invite && n->invite[0] ? "&invite=" : "",
+                                  n->invite && n->invite[0] ? n->invite : "");
+                if (pw < 0 || (size_t)pw >= sizeof path || page_url(n, n->loopback, path, url, sizeof url) != 0) {
+                    signin_forget(n);
+                    push_err_ex(n->to_ui, OC_CERR_LOCAL, 0, "could not start a browser sign-in on this computer");
+                    rc = RC_FATAL; goto drop;
+                }
+            }
+            if (!url_is_openable(url)) {
+                signin_forget(n);
+                push_err(n->to_ui, "the server sent a sign-in address this app will not open");
+                rc = RC_FATAL; goto drop;
+            }
+            /* Cleared before the address is shown, not when the wait begins: a
+             * Cancel pressed the moment the browser opens must not be undone. */
+            n->signin_cancel = 0;
+            oc_ev *e = oc_ev_new(OC_EV_AUTH_BROWSER);
+            if (e) { e->body = strdup(url); oc_queue_push(n->to_ui, e); }
+            rc = RC_BROWSER;
+            goto drop;
+        }
+    }
+
+    /* AUTH -> AUTH_OK. A reconnect re-auths silently with the stored session
+     * token (OC_AUTH_SESSION, ARCH-58); the first connect presents what the
+     * browser or the device code brought back. The AUTH_OK session token is
+     * captured so a later drop can reconnect silently. */
+    {
+        uint8_t buf[8192]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);   /* room for a token */
+        oc_result er;
+        if (n->oidc_token && !(reconnecting && *have_sess)) {
+            /* What the browser brought back, with the verifier only this client
+             * holds (AUTH.md §8.2). Both are spent here, whatever the answer. */
+            oc_auth a = { OC_AUTH_OIDC, oc_slice_str(n->source_id), oc_slice_str(n->oidc_token),
+                          oc_slice_str(n->verifier), oc_slice_str(n->oidc_state) };
+            er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
+            if (er == OC_OK && write_all(&conn, fd, buf, w.len, &n->stop) != 0) er = OC_E_OVERFLOW;
+            oc_signin_wipe(buf, sizeof buf);
+            signin_forget(n);
+            if (er != OC_OK) goto drop;
+            w.len = 0;
+        } else if (reconnecting && *have_sess) {
+            oc_auth a = { OC_AUTH_SESSION, { NULL, 0 }, { sess, OC_SESSION_TOKEN_LEN }, { NULL, 0 }, { NULL, 0 } };
+            er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
+        } else {
+            goto drop;   /* nothing to present: the branches above started a sign-in */
+        }
+        if (er != OC_OK || (w.len && write_all(&conn, fd, buf, w.len, &n->stop) != 0)) goto drop;
+        oc_header hdr; oc_rbuf p;
+        if (read_one(&conn, fd, &fb, &hdr, &p, &n->stop) != 0) goto drop;
+        if (hdr.version != negotiated) goto drop;
+        if (hdr.msg_type != OC_MSG_AUTH_OK) {
+            /* Bad password, a refused identity, or an expired/revoked session on
+             * reconnect — either way there is nothing to silently retry. */
+            oc_error er0; uint16_t code = 0;
+            if (hdr.msg_type == OC_MSG_ERROR && oc_decode_error(&p, &er0) == OC_OK) code = er0.code;
+            const char *why = auth_error_text(code, reconnecting);
+            push_err_ex(n->to_ui, OC_CERR_AUTH, code, why);
+            signin_answer(n, OC_LOOPBACK_REFUSED, why);   /* the browser hears it too */
+            rc = RC_FATAL; goto drop;
+        }
+        signin_answer(n, OC_LOOPBACK_SIGNED_IN, NULL);
+        oc_auth_ok ok;
+        oc_decode_auth_ok(&p, &ok);
+        if (ok.session_token.len == OC_SESSION_TOKEN_LEN) {   /* fresh token (first auth) */
+            memcpy(sess, ok.session_token.ptr, OC_SESSION_TOKEN_LEN);
+            *have_sess = 1;
+            if (cs && cs->store)   /* persist it so a relaunch reconnects silently */
+                oc_store_save_session(cs->store, cs->workspace, sess, ok.session_expiry, "");
+        }
+        push_simple(n->to_ui, OC_EV_CONNECTED, ok.user_id);
+        push_simple(n->to_ui, OC_EV_AUTH_OK, ok.user_id);
+        oc_callsig_authed(&n->calls, oc_model_now_ms());   /* a call to get back into is rejoined */
+        oc_pdm_authed(&n->pdm, ok.user_id, cs ? cs->store : NULL, cs ? cs->workspace : NULL);
+
+        /* Refresh the stored UTC offset on every connect (ARCH-103). It was only
+         * ever written as a field on SET_SCHEDULE, so it was captured when the
+         * user last edited their quiet hours and never again — and the offset is
+         * exactly the thing that moves without the schedule changing, when the
+         * user travels or a daylight-saving boundary passes. Sent here, from the
+         * core, so every frontend gets it rather than each remembering to. */
+        {
+            uint8_t tb[16]; oc_wbuf tw; oc_wbuf_init(&tw, tb, sizeof tb);
+            oc_set_tz_offset tz = { (int16_t)oc_utc_offset_min() };
+            if (oc_encode_set_tz_offset(&tw, negotiated, &tz) == OC_OK)
+                (void)write_all(&conn, fd, tb, tw.len, &n->stop);
+        }
+
+        /* Ask for the channel list + the roster so the model can populate the
+         * sidebar and resolve user names (for DMs, mentions). */
+        uint8_t lb[16]; oc_wbuf lw; oc_wbuf_init(&lw, lb, sizeof lb);
+        if (oc_encode_list_channels(&lw, OC_PROTOCOL_VERSION) == OC_OK)
+            (void)write_all(&conn, fd, lb, lw.len, &n->stop);
+        oc_wbuf_init(&lw, lb, sizeof lb);
+        if (oc_encode_list_users(&lw, OC_PROTOCOL_VERSION) == OC_OK)
+            (void)write_all(&conn, fd, lb, lw.len, &n->stop);
+        /* The workspace's groups (REQ-307) follow the user list unasked. */
+        /* And this user's drafts (REQ-223). On connect, not on demand: the
+         * sidebar marks conversations holding one, so the answer has to be
+         * there before anything is drawn — and it is a small list. */
+        oc_wbuf_init(&lw, lb, sizeof lb);
+        if (oc_encode_list_drafts(&lw, OC_PROTOCOL_VERSION) == OC_OK)
+            (void)write_all(&conn, fd, lb, lw.len, &n->stop);
+        /* And anything waiting to be sent (REQ-224): the pane counts them and
+         * a failure needs surfacing whether or not anyone opens it. */
+        oc_wbuf_init(&lw, lb, sizeof lb);
+        if (oc_encode_list_scheduled(&lw, OC_PROTOCOL_VERSION) == OC_OK)
+            (void)write_all(&conn, fd, lb, lw.len, &n->stop);
+
+        /* On a reconnect, recover anything missed while offline: backfill each
+         * known channel from its last-seen message id (REQ-101). Replays dedup on
+         * the model's high-water mark. */
+        /* A cold start (nothing seen yet) sends a CURSORLESS backfill: the daemon
+         * then resumes every member channel from that user's server-side read
+         * position (REQ-090), which is what lets the client keep no local
+         * history at all (ARCH-88). This is the FIRST connect as much as a
+         * reconnect — a client with no stored state has no cursor either way.
+         * Once a high-water table exists we send it, so a mid-session reconnect
+         * fetches only the gap. */
+        if (hw->n == 0) {
+            uint8_t bb[64]; oc_wbuf bw; oc_wbuf_init(&bw, bb, sizeof bb);
+            oc_backfill_request req = { 0, NULL };
+            if (oc_encode_backfill_request(&bw, OC_PROTOCOL_VERSION, &req) == OC_OK)
+                (void)write_all(&conn, fd, bb, bw.len, &n->stop);
+        }
+        if (reconnecting && hw->n > 0) {
+            oc_cursor *curs = malloc(hw->n * sizeof *curs);
+            if (curs) {
+                for (size_t i = 0; i < hw->n; i++) {
+                    curs[i].channel_id = hw->v[i].channel_id;
+                    curs[i].after_message_id = hw->v[i].high_water;
+                }
+                uint8_t bb[OC_MAX_FRAME_SIZE]; oc_wbuf bw; oc_wbuf_init(&bw, bb, sizeof bb);
+                oc_backfill_request req = { (uint16_t)(hw->n > 0xFFFF ? 0xFFFF : hw->n), curs };
+                if (oc_encode_backfill_request(&bw, OC_PROTOCOL_VERSION, &req) == OC_OK)
+                    (void)write_all(&conn, fd, bb, bw.len, &n->stop);
+                free(curs);
+            }
+        }
+
+        /* Flush the offline outbox (REQ-102): resend anything composed while
+         * disconnected earlier in this process, reusing each idem so the daemon
+         * dedups a partial delivery. */
+        if (cs && cs->obox) {
+            for (size_t i = 0; i < cs->obox->n; i++)
+                send_message(&conn, fd, &n->stop, cs->obox->v[i].channel_id,
+                             cs->obox->v[i].idem, cs->obox->v[i].body ? cs->obox->v[i].body : "",
+                             cs->obox->v[i].src_channel, cs->obox->v[i].src_message);
+        }
+    }
+
+    /* Serve: interleave reading server frames with sending queued user actions.
+     * An in-flight attachment transfer (upload/download) is driven by both. */
+    *served = 1;
+    oc_queue heldq;
+    oc_queue_init(&heldq);
+    disp_ctx ctx = { n->to_ui, &conn, fd, &n->stop, &xfer, hw,
+                     cs ? cs->store : NULL, cs ? cs->obox : NULL,
+                     cs ? cs->workspace : NULL, n->client_type, negotiated, &n->xq, &n->stt,
+                     &n->calls, n->host, cs ? cs->workspace : NULL, n->ws_key[0] ? n->ws_key : NULL,
+                     &heldq, 0, 0, &n->pdm };
+    /* Call media on the connection (PROTOCOL.md §5.17) is queued by the call
+     * engine's threads, which wake this one to write it rather than leave it
+     * for the next 50 ms poll. Without a wake it still goes, at that pace. */
+    if (oc_wake_open(&wake) == 0) oc_callsig_set_wake(&n->calls, net_wake, &wake);
+    while (!n->stop) {
+        /* Media first in each turn, ahead of an upload's chunks or a voice
+         * segment: it is the one thing here that is late if it waits. */
+        oc_callsig_pump(&n->calls, ctx_write, &ctx);
+        oc_callsig_tick(&n->calls, oc_model_now_ms(), ctx_write, &ctx, n->to_ui);
+        oc_pdm_tick(&n->pdm, oc_model_now_ms(), ctx_write, &ctx, n->to_ui);
+        oc_cmd *c;
+        while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
+            if (c->type == OC_CMD_QUIT) {
+                /* Going on purpose: out of any call now, so the daemon holds no
+                 * seat for a rejoin that will not come. */
+                oc_callsig_quit(&n->calls, ctx_write, &ctx, n->to_ui);
+                oc_pdm_quit(&n->pdm, ctx_write, &ctx);   /* and out of every private DM */
+                oc_cmd_free(c); rc = RC_STOP; goto served_end;
+            }
+            if (c->type >= OC_CMD_PDM_OPEN && c->type <= OC_CMD_PDM_TRUST) {
+                oc_pdm_command(&n->pdm, c, ctx_write, &ctx, n->to_ui);
+                oc_cmd_free(c);
+                continue;
+            }
+            /* An encrypted DM (PRIVATE-DM.md): what is said is sealed here, and
+             * nothing that would carry its text in the clear leaves (a draft, a
+             * scheduled message); nothing is quoted out of it either. */
+            if (c->type == OC_CMD_SEND && oc_pdm_is_e2e(&n->pdm, c->src_channel)) c->src_channel = c->src_message = 0;
+            if (oc_pdm_is_e2e(&n->pdm, c->channel_id)) {
+                if ((c->type == OC_CMD_SEND || c->type == OC_CMD_REPLY || c->type == OC_CMD_EDIT) && c->body) {
+                    char *sealed = oc_pdm_seal(&n->pdm, c->channel_id, c->body);
+                    oc_e2e_wipe(c->body, strlen(c->body));
+                    free(c->body);
+                    c->body = sealed;
+                    c->src_channel = c->src_message = 0;
+                    if (!sealed) {
+                        push_err_ex(n->to_ui, OC_CERR_PDM_CLOSED, 0, "This encrypted conversation is not open on this device.");
+                        oc_cmd_free(c);
+                        continue;
+                    }
+                } else if (c->type == OC_CMD_SET_DRAFT || c->type == OC_CMD_SCHEDULE ||
+                           c->type == OC_CMD_POST_POLL) {
+                    /* A poll's question and options would go in the clear. */
+                    oc_cmd_free(c);
+                    continue;
+                }
+            }
+            if (c->type >= OC_CMD_CALL_JOIN && c->type <= OC_CMD_CALL_SHARE) {
+                (void)oc_callsig_command(&n->calls, c, cs ? cs->store : NULL, cs ? cs->workspace : NULL,
+                                         ctx_write, &ctx, n->to_ui);
+                oc_cmd_free(c);
+                continue;
+            }
+            if (c->type == OC_CMD_BACKFILL) {
+                /* Replay history for one channel from the last id we already hold
+                 * (cached-history cursor, ARCH-45/46) — 0 the first time. Replies
+                 * arrive as BROADCASTs that dispatch() turns into OC_EV_MESSAGE,
+                 * dedup'd by the model's high-water mark; BACKFILL_DONE is ignored. */
+                uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_cursor cur = { c->channel_id, hwtab_get(hw, c->channel_id) };
+                oc_backfill_request req = { 1, &cur };
+                if (oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &req) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_HISTORY) {
+                /* Older messages, so nothing here touches the high-water mark:
+                 * hw tracks the NEWEST id seen and a backwards page is all
+                 * below it. The model dedups by id either way. */
+                uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_history_request hr = { c->channel_id, c->message_id, 0 };
+                if (oc_encode_history_request(&w, OC_PROTOCOL_VERSION, &hr) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SEND && c->body) {
+                /* Record in the outbox before sending (REQ-102): a drop before the
+                 * SEND_ACK leaves it there to be resent, deduped by the idem. */
+                uint8_t idem[OC_IDEM_SIZE]; gen_idem(idem);
+                uint64_t cid = c->channel_id ? c->channel_id : 1;
+                if (ctx.obox) obox_add(ctx.obox, idem, cid, c->body, c->src_channel, c->src_message);
+                send_message(&conn, fd, &n->stop, cid, idem, c->body,
+                             c->src_channel, c->src_message);
+            }
+            if (c->type == OC_CMD_REACT && c->body) {
+                uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_react rc = { c->channel_id, c->message_id, oc_slice_str(c->body), c->op };
+                if (oc_encode_react(&w, OC_PROTOCOL_VERSION, &rc) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_EDIT && c->body) {
+                uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_edit ed = { c->channel_id, c->message_id, oc_slice_str(c->body) };
+                if (oc_encode_edit(&w, OC_PROTOCOL_VERSION, &ed) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_DELETE) {
+                uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_delete dl = { c->channel_id, c->message_id };
+                if (oc_encode_delete(&w, OC_PROTOCOL_VERSION, &dl) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_TYPING) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_typing ty = { c->channel_id };
+                if (oc_encode_typing(&w, OC_PROTOCOL_VERSION, &ty) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_OPEN_THREAD) {
+                uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_thread lt = { c->channel_id, c->message_id };
+                if (oc_encode_list_thread(&w, OC_PROTOCOL_VERSION, &lt) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_REPLY && c->body) {
+                uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_send_reply sr = {0};
+                sr.channel_id = c->channel_id;
+                gen_idem(sr.idem);
+                sr.parent_id = c->message_id;
+                sr.body = oc_slice_str(c->body);
+                if (oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &sr) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SEARCH && c->body) {
+                /* Parse HERE, in the core, with the shared parser: the wire
+                 * carries predicates, not a grammar, so the daemon never has to agree
+                 * with us about what "from:" means — and the TUI gets the same
+                 * behaviour for free because it calls the same function. */
+                oc_searchq sq;
+                oc_searchq_parse(c->body, &sq);
+                /* Dates are resolved to epoch-ms HERE too, because only the client
+                 * knows the user's timezone; "after:2026-01-01" means local midnight. */
+                uint64_t after_ms = 0, before_ms = 0;
+                if (sq.after[0])  after_ms  = oc_day_start_ms(sq.after);
+                if (sq.before[0]) before_ms = oc_day_end_ms(sq.before);
+                uint8_t buf[768]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_search s;
+                memset(&s, 0, sizeof s);
+                s.query      = oc_slice_str(sq.text);
+                s.limit      = 50;
+                s.before_id  = c->message_id;          /* paging cursor */
+                s.from_name  = oc_slice_str(sq.from);
+                s.in_channel = oc_slice_str(sq.in);
+                s.has_mask   = (uint8_t)sq.has;
+                s.after_ms   = after_ms;
+                s.before_ms  = before_ms;
+                if (oc_encode_search(&w, OC_PROTOCOL_VERSION, &s) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_CREATE_CHANNEL && c->body) {
+                uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_create_channel cc = { oc_slice_str(c->body), c->op };
+                if (oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_JOIN_CHANNEL || c->type == OC_CMD_LEAVE_CHANNEL) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_channel_ref cr = { c->channel_id };
+                oc_result rr = (c->type == OC_CMD_JOIN_CHANNEL)
+                    ? oc_encode_join_channel(&w, OC_PROTOCOL_VERSION, &cr)
+                    : oc_encode_leave_channel(&w, OC_PROTOCOL_VERSION, &cr);
+                if (rr == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_AUDIT_QUERY) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_audit_query aq = { c->message_id, 50 };   /* message_id = before_ms */
+                if (oc_encode_audit_query(&w, OC_PROTOCOL_VERSION, &aq) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_RESTORE) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_restore rs = { c->channel_id, c->message_id };
+                if (oc_encode_restore(&w, OC_PROTOCOL_VERSION, &rs) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SRVALERTS_LIST) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_alerts_list(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SRVALERT_ACK) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_alert_ack ak = { c->message_id };
+                if (oc_encode_alert_ack(&w, OC_PROTOCOL_VERSION, &ak) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_STORAGE_STATUS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_storage_status_req(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_CHANNELS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_USERS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_users(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_PRESENCE) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_presence sp = { c->op };
+                if (oc_encode_set_presence(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_PIN) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_pin pn = { c->channel_id, c->message_id, c->op };
+                if (oc_encode_pin(&w, OC_PROTOCOL_VERSION, &pn) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_PINS) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_pins lp = { c->channel_id };
+                if (oc_encode_list_pins(&w, OC_PROTOCOL_VERSION, &lp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_UPDATE_CHANNEL) {
+                uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_update_channel uc = { c->channel_id, c->op,
+                                         oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_update_channel(&w, OC_PROTOCOL_VERSION, &uc) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_HISTORY_AROUND) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_history_around ha = { c->channel_id, c->message_id, (uint16_t)c->op };
+                if (oc_encode_history_around(&w, OC_PROTOCOL_VERSION, &ha) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SAVE_ITEM) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_save_item si = { c->message_id, c->op };
+                if (oc_encode_save_item(&w, OC_PROTOCOL_VERSION, &si) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_SAVED) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_saved(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_ACTIVITY) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_activity(&w, OC_PROTOCOL_VERSION, c->op) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_MEMBERS) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_members lm = { c->channel_id };
+                if (oc_encode_list_members(&w, OC_PROTOCOL_VERSION, &lm) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_FILES) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_files lf = { c->channel_id, c->server_time, c->message_id };
+                if (oc_encode_list_files(&w, OC_PROTOCOL_VERSION, &lf) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_POST_POLL && c->body) {
+                /* A poll (REQ-225), answered as a SEND is: the ack, then the
+                 * message, its action and its poll come back like anyone's. */
+                uint8_t *buf = malloc(OC_MAX_FRAME_SIZE);
+                if (buf) {
+                    oc_wbuf w; oc_wbuf_init(&w, buf, OC_MAX_FRAME_SIZE);
+                    oc_post_poll pp;
+                    memset(&pp, 0, sizeof pp);
+                    pp.channel_id = c->channel_id;
+                    gen_idem(pp.idem);
+                    pp.parent_id = c->message_id;
+                    pp.question = oc_slice_str(c->body);
+                    pp.flags = c->poll_flags;
+                    pp.close_at_ms = c->poll_close_at_ms;
+                    pp.n_options = c->n_poll_opts > OC_POLL_MAX_OPTIONS ? OC_POLL_MAX_OPTIONS : c->n_poll_opts;
+                    for (uint8_t i = 0; i < pp.n_options; i++) pp.options[i] = oc_slice_str(c->poll_opts[i]);
+                    if (oc_encode_post_poll(&w, OC_PROTOCOL_VERSION, &pp) == OC_OK)
+                        (void)write_all(&conn, fd, buf, w.len, &n->stop);
+                    free(buf);
+                }
+            }
+            if (c->type == OC_CMD_VOTE) {
+                uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_vote v;
+                memset(&v, 0, sizeof v);
+                v.channel_id = c->channel_id;
+                v.message_id = c->message_id;
+                v.count = c->n_poll_picks > OC_POLL_MAX_OPTIONS ? OC_POLL_MAX_OPTIONS : c->n_poll_picks;
+                memcpy(v.picks, c->poll_picks, v.count);
+                if (oc_encode_vote(&w, OC_PROTOCOL_VERSION, &v) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_EDIT_POLL) {
+                uint8_t *buf = malloc(OC_MAX_FRAME_SIZE);
+                if (buf) {
+                    oc_wbuf w; oc_wbuf_init(&w, buf, OC_MAX_FRAME_SIZE);
+                    oc_edit_poll ep;
+                    memset(&ep, 0, sizeof ep);
+                    ep.channel_id = c->channel_id;
+                    ep.message_id = c->message_id;
+                    ep.flags = c->poll_flags;
+                    ep.close_at_ms = c->poll_close_at_ms;
+                    ep.n_options = c->n_poll_opts > OC_POLL_MAX_OPTIONS ? OC_POLL_MAX_OPTIONS : c->n_poll_opts;
+                    for (uint8_t i = 0; i < ep.n_options; i++) ep.options[i] = oc_slice_str(c->poll_opts[i]);
+                    if (oc_encode_edit_poll(&w, OC_PROTOCOL_VERSION, &ep) == OC_OK)
+                        (void)write_all(&conn, fd, buf, w.len, &n->stop);
+                    free(buf);
+                }
+            }
+            if (c->type == OC_CMD_LIST_POLL_VOTERS) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_poll_voters lv = { c->channel_id, c->message_id };
+                if (oc_encode_list_poll_voters(&w, OC_PROTOCOL_VERSION, &lv) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_REACTIONS) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_reactions lr = { c->channel_id, c->message_id };
+                if (oc_encode_list_reactions(&w, OC_PROTOCOL_VERSION, &lr) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_NOTIFY_PREF) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_notify_pref sp = { c->channel_id, c->op };   /* op = level */
+                if (oc_encode_set_notify_pref(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_SCHEDULE) {
+                uint8_t buf[96]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_schedule sc = { c->sched_mode, c->tz_offset_min, c->sched_start_min,
+                                   c->sched_end_min, c->n_sched_days, c->sched_days };
+                if (oc_encode_set_schedule(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_THREADS) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_threads lt = { c->op };
+                if (oc_encode_list_threads(&w, OC_PROTOCOL_VERSION, &lt) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_THREAD_FOLLOW) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_thread_follow tf = { c->message_id, c->channel_id, c->op };
+                if (oc_encode_set_thread_follow(&w, OC_PROTOCOL_VERSION, &tf) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_MARK_THREAD_READ) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_mark_thread_read mr = { c->message_id, c->server_time };
+                if (oc_encode_mark_thread_read(&w, OC_PROTOCOL_VERSION, &mr) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_KEYWORDS) {
+                uint8_t buf[OC_MAX_KEYWORDS * (OC_KEYWORD_MAX + 4) + 16];
+                oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_slice terms[OC_MAX_KEYWORDS];
+                for (uint8_t i = 0; i < c->n_kw_terms; i++) terms[i] = oc_slice_str(c->kw_terms[i]);
+                oc_set_keywords sk = { c->n_kw_terms, terms };
+                if (oc_encode_set_keywords(&w, OC_PROTOCOL_VERSION, &sk) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_PRIORITY) {
+                uint8_t buf[OC_MAX_PRIORITY * 8 + 16];
+                oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_priority sp = { c->n_pri_people, c->pri_people };
+                if (oc_encode_set_priority(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_SNOOZE) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_snooze ss = { (uint32_t)c->message_id };
+                if (oc_encode_set_snooze(&w, OC_PROTOCOL_VERSION, &ss) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_NOTIFY_PREFS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_notify_prefs(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_SETTING) {
+                static uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_client_setting cs = { oc_slice_str(n->client_type),
+                                             oc_slice_str(c->body ? c->body : ""),
+                                             oc_slice_str(c->body2 ? c->body2 : "") };
+                if (oc_encode_set_client_setting(&w, OC_PROTOCOL_VERSION, &cs) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_DRAFT) {
+                static uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                /* body2 carries the recipient list for an UNADDRESSED draft
+                 * (REQ-229); empty for the ordinary channel case. */
+                oc_set_draft sd = { c->channel_id, c->message_id,
+                                    oc_slice_str(c->body2 ? c->body2 : ""),
+                                    oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SCHEDULE) {
+                static uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_schedule_message sm = { c->channel_id, c->message_id, c->server_time,
+                                           oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_schedule_message(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_SCHEDULED) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_scheduled(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_CANCEL_SCHEDULED) {
+                uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_cancel_scheduled cs = { c->message_id };
+                if (oc_encode_cancel_scheduled(&w, OC_PROTOCOL_VERSION, &cs) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_UPDATE_SCHEDULED) {
+                static uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_update_scheduled us = { c->message_id, c->server_time,
+                                           oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_update_scheduled(&w, OC_PROTOCOL_VERSION, &us) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_DRAFTS) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_drafts(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_SETTINGS) {
+                uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_client_settings ls = { oc_slice_str(n->client_type) };
+                if (oc_encode_list_client_settings(&w, OC_PROTOCOL_VERSION, &ls) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_MARK_READ) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_client_ack ca = { c->channel_id, c->message_id };
+                if (oc_encode_client_ack(&w, OC_PROTOCOL_VERSION, &ca) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_GET_CHANNEL_DESCRIPTION) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_get_channel_description gd = { c->channel_id };
+                if (oc_encode_get_channel_description(&w, OC_PROTOCOL_VERSION, &gd) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SUMMARIZE) {
+                uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_summarize sm = { c->req_id, c->channel_id, c->scope, c->start_ms, c->end_ms };
+                if (oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SUMMARY_DETACH || c->type == OC_CMD_SUMMARY_CANCEL) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_summary_req sr = { c->req_id };
+                if (oc_encode_summary_req(&w, OC_PROTOCOL_VERSION, c->type == OC_CMD_SUMMARY_DETACH
+                        ? OC_MSG_SUMMARY_DETACH : OC_MSG_SUMMARY_CANCEL, &sr) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SUMMARY_OPEN) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_summary_open so = { c->req_id, c->message_id };
+                if (oc_encode_summary_open(&w, OC_PROTOCOL_VERSION, &so) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SUMMARY_DISMISS) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_summary_dismiss sd = { c->message_id };
+                if (oc_encode_summary_dismiss(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_MARK_ALL_READ) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_mark_all_read(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_EMAIL) {
+                uint8_t buf[320]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_email se = { oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_set_email(&w, OC_PROTOCOL_VERSION, &se) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_DISPLAY_NAME) {
+                uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_display_name sn = { oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_set_display_name(&w, OC_PROTOCOL_VERSION, &sn) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_CHANNEL_INVITE || c->type == OC_CMD_CHANNEL_KICK) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_channel_member_op mo = { c->channel_id, c->message_id };
+                oc_result rr = (c->type == OC_CMD_CHANNEL_INVITE)
+                    ? oc_encode_invite_to_channel(&w, OC_PROTOCOL_VERSION, &mo)
+                    : oc_encode_remove_from_channel(&w, OC_PROTOCOL_VERSION, &mo);
+                if (rr == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_ROLE) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_role sr = { c->channel_id, c->op };   /* channel_id reused as user id, op = role */
+                if (oc_encode_set_role(&w, OC_PROTOCOL_VERSION, &sr) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_INVITE_USER) {
+                uint8_t buf[320]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                /* op = role; body = the address, or none for a bearer token */
+                oc_invite_user iu = { c->op, c->body ? oc_slice_str(c->body) : (oc_slice){ NULL, 0 }, c->uses };
+                if (oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &iu) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_ENABLE_USER) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_enable_user eu = { c->channel_id };
+                if (oc_encode_enable_user(&w, OC_PROTOCOL_VERSION, &eu) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_RESET_CREDENTIAL) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_reset_credential rc = { c->channel_id, (uint8_t)(c->op ? 1 : 0) };
+                if (oc_encode_reset_credential(&w, OC_PROTOCOL_VERSION, &rc) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_REMOVE_USER) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_remove_user ru = { c->channel_id };   /* channel_id reused as user id */
+                if (oc_encode_remove_user(&w, OC_PROTOCOL_VERSION, &ru) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_CREATE_WEBHOOK && c->body) {
+                uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_create_webhook cw = { c->channel_id, oc_slice_str(c->body) };
+                if (oc_encode_create_webhook(&w, OC_PROTOCOL_VERSION, &cw) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_WEBHOOKS) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_webhooks lw = { c->channel_id };
+                if (oc_encode_list_webhooks(&w, OC_PROTOCOL_VERSION, &lw) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_DELETE_WEBHOOK) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_delete_webhook dw = { c->message_id };   /* message_id reused as webhook id */
+                if (oc_encode_delete_webhook(&w, OC_PROTOCOL_VERSION, &dw) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_INVITES) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_invites(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_REVOKE_INVITE) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_revoke_invite ri = { c->message_id };
+                if (oc_encode_revoke_invite(&w, OC_PROTOCOL_VERSION, &ri) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_WEBHOOK_STATE) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_webhook_state sw = { c->message_id, c->op };
+                if (oc_encode_set_webhook_state(&w, OC_PROTOCOL_VERSION, &sw) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_ROTATE_WEBHOOK) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_rotate_webhook rw = { c->message_id };
+                if (oc_encode_rotate_webhook(&w, OC_PROTOCOL_VERSION, &rw) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_REVOKE_SESSION) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_revoke_session rs = { c->message_id };
+                if (oc_encode_revoke_session(&w, OC_PROTOCOL_VERSION, &rs) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_SESSIONS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_sessions(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_FILE_CHANNELS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_file_channels(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_STATUS) {
+                uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_status ss = { oc_slice_str(c->body ? c->body : ""),
+                                     oc_slice_str(c->body2 ? c->body2 : ""),
+                                     c->message_id };
+                if (oc_encode_set_status(&w, OC_PROTOCOL_VERSION, &ss) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_PROFILE) {
+                uint8_t buf[1024]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                /* Unpack the \x1f-separated fields client.c packed, beside the
+                 * encode that consumes them. A field the sender left empty stays
+                 * empty here and clears the column: that is the user deleting it,
+                 * which is a thing they did. A sender that names fewer fields
+                 * than the frame has -- one that does not set a voice
+                 * (REQ-292) -- leaves the rest empty. */
+                char pb[512]; const char *pf[6] = { "", "", "", "", "", "" };
+                snprintf(pb, sizeof pb, "%s", c->body ? c->body : "");
+                int np = 0; pf[np++] = pb;
+                for (char *q = pb; *q && np < 6; q++)
+                    if (*q == '\x1f') { *q = '\0'; pf[np++] = q + 1; }
+                oc_set_profile sp = { oc_slice_str(pf[0]), oc_slice_str(pf[1]),
+                                      oc_slice_str(pf[2]), oc_slice_str(pf[3]),
+                                      oc_slice_str(pf[4]), oc_slice_str(pf[5]) };
+                if (oc_encode_set_profile(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_MUTE) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_mute sm = { c->channel_id, c->op };
+                if (oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_EMOJI) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_emoji(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_ADD_EMOJI && c->body) {
+                uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_add_emoji ae = { oc_slice_str(c->body), c->message_id };
+                if (oc_encode_add_emoji(&w, OC_PROTOCOL_VERSION, &ae) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_DELETE_EMOJI && c->body) {
+                uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_delete_emoji de = { oc_slice_str(c->body) };
+                if (oc_encode_delete_emoji(&w, OC_PROTOCOL_VERSION, &de) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            /* User groups (REQ-307-309). */
+            if (c->type == OC_CMD_LIST_GROUPS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_groups(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if ((c->type == OC_CMD_CREATE_GROUP || c->type == OC_CMD_UPDATE_GROUP) && c->body) {
+                uint8_t buf[OC_GROUP_HANDLE_MAX + OC_GROUP_NAME_MAX + OC_GROUP_DESC_MAX + 64];
+                oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_update_group ug = { c->message_id, oc_slice_str(c->body), oc_slice_str(c->body2 ? c->body2 : ""),
+                                       oc_slice_str(c->body3 ? c->body3 : "") };
+                oc_result er;
+                if (c->type == OC_CMD_CREATE_GROUP) {
+                    oc_create_group cg = { ug.handle, ug.name, ug.description };
+                    er = oc_encode_create_group(&w, OC_PROTOCOL_VERSION, &cg);
+                } else {
+                    er = oc_encode_update_group(&w, OC_PROTOCOL_VERSION, &ug);
+                }
+                if (er == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_DELETE_GROUP) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_group_ref gr = { c->message_id };
+                if (oc_encode_delete_group(&w, OC_PROTOCOL_VERSION, &gr) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_GROUP_ADD_MEMBERS || c->type == OC_CMD_GROUP_REMOVE_MEMBERS) {
+                oc_group_members_op *gm = calloc(1, sizeof *gm);   /* 2 KB of ids: not the stack's */
+                uint8_t buf[32 + 8 * OC_MAX_CALL_INVITES]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (gm) {
+                    gm->group_id = c->message_id;
+                    gm->count = c->n_uids;
+                    for (uint16_t i = 0; i < c->n_uids; i++) gm->user_ids[i] = c->uids[i];
+                    if (oc_encode_group_members_op(&w, OC_PROTOCOL_VERSION,
+                                                   c->type == OC_CMD_GROUP_ADD_MEMBERS ? OC_MSG_GROUP_ADD_MEMBERS
+                                                                                       : OC_MSG_GROUP_REMOVE_MEMBERS,
+                                                   gm) == OC_OK)
+                        (void)write_all(&conn, fd, buf, w.len, &n->stop);
+                    free(gm);
+                }
+            }
+            if (c->type == OC_CMD_CHANNEL_ADD_GROUP || c->type == OC_CMD_CHANNEL_REMOVE_GROUP) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_channel_group_op op = { c->channel_id, c->message_id };
+                if (oc_encode_channel_group_op(&w, OC_PROTOCOL_VERSION,
+                                               c->type == OC_CMD_CHANNEL_ADD_GROUP ? OC_MSG_CHANNEL_ADD_GROUP
+                                                                                   : OC_MSG_CHANNEL_REMOVE_GROUP,
+                                               &op) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_OPEN_GROUP_DM) {
+                uint8_t buf[96]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_open_group_dm gd; memset(&gd, 0, sizeof gd);
+                gd.count = (uint16_t)(c->n_gids > (int)OC_MAX_GROUP_DM ? (int)OC_MAX_GROUP_DM : c->n_gids);
+                for (uint16_t i = 0; i < gd.count; i++) gd.user_ids[i] = c->gids[i];
+                if (oc_encode_open_group_dm(&w, OC_PROTOCOL_VERSION, &gd) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_AVATAR) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_avatar sa = { c->message_id };
+                if (oc_encode_set_avatar(&w, OC_PROTOCOL_VERSION, &sa) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_NOTIFY_DEFAULT) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_notify_default sd = { c->op };
+                if (oc_encode_set_notify_default(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_STT_SEGMENT) {
+                /* A failed write is a dropped connection, which the read side
+                 * notices; the segment is lost with it, as its audio is kept
+                 * nowhere to resend from. */
+                (void)send_stt_segment(&conn, fd, &n->stop, &n->stt, c);
+            }
+            if (c->type == OC_CMD_SET_READ_CURSOR) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_read_cursor sc = { c->channel_id, c->message_id };
+                if (oc_encode_set_read_cursor(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LISTEN_FETCH || (c->type == OC_CMD_VOICE_PREVIEW && c->body) ||
+                (c->type == OC_CMD_UPLOAD && c->body) || c->type == OC_CMD_FETCH ||
+                (c->type == OC_CMD_POST_FILES && c->n_paths) ||
+                (c->type == OC_CMD_DOWNLOAD && c->body) ||
+                (c->type == OC_CMD_POST_VIDEO && c->blob && c->blob2)) {
+                xq_add(&n->xq, c);             /* owned by the queue now */
+                continue;
+            }
+            if (c->type == OC_CMD_CANCEL_TRANSFER) {
+                oc_xqueue *q = &n->xq;
+                for (size_t i = 0; i < q->n;) {
+                    if (q->q[i]->xfer_tag == c->xfer_tag) {
+                        oc_cmd_free(q->q[i]);
+                        memmove(q->q + i, q->q + i + 1, (q->n - i - 1) * sizeof *q->q);
+                        q->n--;
+                    } else i++;
+                }
+                if (q->active && q->active->xfer_tag == c->xfer_tag && xfer.mode != 0) {
+                    if ((xfer.mode == 1 || xfer.mode == 2) && xfer.id) {
+                        uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                        oc_transfer_cancel tc = { xfer.id };
+                        if (oc_encode_transfer_cancel(&w, OC_PROTOCOL_VERSION, &tc) == OC_OK)
+                            (void)write_all(&conn, fd, buf, w.len, &n->stop);
+                    }
+                    xfer_notice(&ctx, 2, "cancelled");
+                    xfer_reset(&xfer);
+                }
+            }
+            if (c->type == OC_CMD_OPEN_DM) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_open_dm od = { c->channel_id };   /* channel_id reused as target user id */
+                if (oc_encode_open_dm(&w, OC_PROTOCOL_VERSION, &od) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LOGOUT) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_logout lo = { c->op, { NULL, 0 } };   /* op = scope; empty token = this session */
+                if (oc_encode_logout(&w, OC_PROTOCOL_VERSION, &lo) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+                /* The daemon revokes + closes; treat it as a graceful stop (and
+                 * do not session-reconnect — the session is now dead, so drop the
+                 * stored token too). */
+                if (cs) cs->logged_out = 1;
+                oc_cmd_free(c);
+                rc = RC_STOP;
+                goto served_end;
+            }
+            oc_cmd_free(c);
+        }
+        xq_pump(&ctx);
+
+        /* Pending first: a TLS record holds up to 16 KiB and one read takes 4,
+         * so after the first read the rest sits decrypted inside TLS, where the
+         * socket poll cannot see it. Polling alone waited 50 ms per read on data
+         * already here — invisible for a message, minutes for a video. */
+        int ready = oc_tls_pending(&conn) > 0;
+        if (!ready) {
+            int pr = wake.rd >= 0 ? oc_poll_wake(fd, 0, &wake, 50) : (oc_poll(fd, 0, 50) > 0);
+            if (pr > 0 && (pr & 2)) oc_wake_drain(&wake);   /* media queued: the top of the loop writes it */
+            ready = pr > 0 && (pr & 1);
+        }
+        if (ready) {
+            uint8_t buf[4096]; size_t rn = 0;
+            oc_tls_status st = oc_tls_read(&conn, buf, sizeof buf, &rn);
+            if (st == OC_TLS_OK) {
+                if (oc_framebuf_push(&fb, buf, rn) != 0 || dispatch(&fb, n->to_ui, &ctx) < 0) break;
+                xq_pump(&ctx);
+            } else if (st == OC_TLS_CLOSED || st == OC_TLS_ERROR) {
+                break;
+            }
+        }
+    }
+served_end:
+    /* A message still waiting for its action when the connection goes is
+     * handed on as it stands; the next connection's backfill brings the rest. */
+    held_release(&ctx, n->to_ui);
+    oc_queue_destroy(&heldq);
+
+drop:
+    /* The daemon holds a closed connection's seat in its call for a rejoin
+     * (REQ-152); this side stops the audio at once -- its token is dead -- and
+     * rejoins once a connection signs in again. */
+    oc_callsig_set_wake(&n->calls, NULL, NULL);   /* no call engine thread touches it after this */
+    oc_wake_close(&wake);
+    oc_callsig_lost(&n->calls, n->to_ui, oc_model_now_ms());
+    xfer_reset(&xfer);   /* close any half-done transfer file */
+    xq_requeue_active(&n->xq);
+    oc_framebuf_free(&fb);
+    oc_tls_conn_free(&conn);
+    oc_tls_client_free(&cli);
+    oc_closesock(fd);
+    return rc;
+}
+
+/* Replay one cached message into the model at startup: push it as an ordinary
+ * OC_EV_MESSAGE (folded + deduped by the reducer), plus an OC_EV_EDIT/_DELETE so
+ * the "(edited)" marker / tombstone survives a relaunch, and seed the backfill
+ * cursor. */
+/* The net thread: run one connection after another, silently reconnecting with
+ * the session token after an unexpected drop (REQ-100). The model is preserved
+ * across reconnects (dedup on high-water), so a blip is invisible beyond a brief
+ * status line. Gives up on a graceful stop, a fatal reject, or before ever
+ * authenticating (no session token to reconnect with). */
+static void *net_thread(void *arg) {
+    oc_net *n = (oc_net *)arg;
+    oc_hwtab hw; memset(&hw, 0, sizeof hw);
+    obox outbox; memset(&outbox, 0, sizeof outbox);
+    outbox.owner = n;                  /* the count goes to this workspace, not a global */
+    uint8_t sess[OC_SESSION_TOKEN_LEN];
+    int have_sess = 0, reconnecting = 0, backoff_ms = 0;
+
+    /* Local store (ARCH-58): pre-load the pin + a still-valid session token for
+     * this workspace, so the first connect can pin the cert and auth silently with
+     * the token instead of the password. */
+    conn_store cs; memset(&cs, 0, sizeof cs);
+    char workspace[288];
+    char legacy[288];
+    oc_hostport(n->host, n->port, legacy, sizeof legacy);
+    /* Filed under the workspace the person named, not the address resolution
+     * produced for it (oc_workspace_key). */
+    snprintf(workspace, sizeof workspace, "%s", n->ws_key[0] ? n->ws_key : legacy);
+    cs.workspace = workspace;
+    cs.obox = &outbox;
+    /* With Remember-me off nothing about the SESSION is kept — no token, no owner,
+     * no device key, no book entry — but the pin still is: it is not a secret, and
+     * without it every connection to this workspace would be a first connection,
+     * trusting whatever certificate it met (ARCH-10). */
+    oc_store *opened = n->store_path ? oc_store_open(n->store_path) : NULL;
+    cs.pins = opened;
+    cs.store = n->pin_only ? NULL : opened;
+    if (opened) {
+        oc_store_set_secret(opened, n->secret);   /* token -> keyring if available */
+        /* An entry from when the key was the address moves to the name, once. */
+        if (cs.store) oc_store_adopt(opened, workspace, legacy);
+        cs.have_pin = oc_store_load_pin(opened, workspace, cs.pin);
+    }
+    /* A sign-in the person has just made (the browser's token in hand) is the
+     * one to present: whatever session the store holds for this workspace is
+     * somebody's earlier one, and it is replaced by this sign-in's. */
+    if (cs.store && !n->oidc_token) {
+        uint64_t now_ms = (uint64_t)time(NULL) * 1000;
+        if (oc_store_load_session(cs.store, workspace, sess, NULL, now_ms)) {
+            have_sess = 1;
+            reconnecting = 1;   /* use OC_AUTH_SESSION on the very first connect */
+        }
+    }
+
+    int reach_notified = 0;   /* latch so "unreachable" isn't repeated each retry */
+    while (!n->stop) {
+        /* The person said to trust the certificate shown them: remember it, and
+         * this attempt presents it (cert_judge). */
+        if (atomic_exchange(&n->trust_pending, 0)) {
+            memcpy(cs.pin, n->trust_fp, sizeof cs.pin);
+            cs.have_pin = 1;
+            if (cs.pins) oc_store_save_pin(cs.pins, workspace, cs.pin);
+            reach_notified = 0;
+        }
+        int served = 0;
+        int rc = run_connection(n, reconnecting, sess, &have_sess, &hw, &served, &cs);
+        /* A browser still waiting got no answer from the daemon: the connection
+         * that was to present its token never got that far. */
+        signin_answer(n, OC_LOOPBACK_REFUSED, "OpenChime could not reach the workspace to finish signing in.");
+        push_simple(n->to_ui, OC_EV_DISCONNECTED, 0);   /* this connection ended */
+        if (cs.store && cs.logged_out) oc_store_clear_session(cs.store, workspace);
+        /* Distinguish "unreachable" from "login failed" (REQ-011): a drop before
+         * ever serving, without a fatal auth reject, is a connectivity problem. */
+        if (served) reach_notified = 0;
+        else if (rc == RC_CERT_UNPUBLISHED && !reach_notified) {
+            push_err_ex(n->to_ui, OC_CERR_CERT, 0, "this workspace publishes the certificate its server should "
+                               "present, and the server presented a different one: the "
+                               "connection was refused");
+            reach_notified = 1;
+        }
+        else if ((rc == RC_CERT_CHANGED || rc == RC_CERT_UNTRUSTED) && !reach_notified) {
+            /* What the person is asked to judge: the fingerprint, and whether a
+             * certificate they trusted before has been replaced. */
+            oc_ev *e = oc_ev_new(OC_EV_CERT_UNTRUSTED);
+            if (e) {
+                e->body = strdup(n->seen.fp_hex);
+                if (n->seen.der_len && (e->der = malloc(n->seen.der_len))) {
+                    memcpy(e->der, n->seen.der, n->seen.der_len);
+                    e->der_len = n->seen.der_len;
+                }
+                e->status = rc == RC_CERT_CHANGED;
+                oc_queue_push(n->to_ui, e);
+            }
+            push_err_ex(n->to_ui, OC_CERR_CERT, 0, rc == RC_CERT_CHANGED
+                ? "the server's certificate has changed since you trusted it: if you did not "
+                  "expect that, someone may be in the way; check its fingerprint before trusting it"
+                : "the server's certificate is not from an authority this computer trusts: check "
+                  "its fingerprint with the workspace's administrator before trusting it");
+            reach_notified = 1;
+        }
+        else if (rc == RC_LOST && !reach_notified) {
+            push_err_ex(n->to_ui, OC_CERR_UNREACHABLE, 0, "could not reach the server");
+            reach_notified = 1;
+        }
+        if (rc == RC_STOP || n->stop) break;
+        if (rc == RC_BROWSER) {
+            /* The person is in their browser. Five minutes, or until they cancel. */
+            char query[8192], tok[8192];
+            oc_loopback_result lr = OC_LOOPBACK_ERROR;
+            for (int waited = 0; waited < 300 && !n->stop; waited++) {
+                lr = oc_loopback_wait(n->loopback, 1000, &n->signin_cancel, query, sizeof query);
+                if (lr != OC_LOOPBACK_TIMEOUT) break;
+            }
+            /* The tab that came back waits on this listener for its answer. */
+            n->answer_lb = n->loopback;
+            n->loopback = NULL;
+            if (n->stop) break;
+            n->oidc_state[0] = '\0';
+            /* The relay sends a token; a direct connection's provider, a code and
+             * the state the daemon began with -- presented the same way. */
+            if (lr == OC_LOOPBACK_OK && (oc_query_get(query, "token", tok, sizeof tok) == 1 ||
+                                         (oc_query_get(query, "code", tok, sizeof tok) == 1 &&
+                                          oc_query_get(query, "state", n->oidc_state, sizeof n->oidc_state) == 1))) {
+                n->oidc_token = strdup(tok);
+                oc_signin_wipe(tok, sizeof tok);
+                oc_signin_wipe(query, sizeof query);
+                if (n->oidc_token) continue;   /* connect again and present it */
+            }
+            char why[200] = "";
+            if (lr == OC_LOOPBACK_OK) oc_query_get(query, "error", why, sizeof why);
+            signin_forget(n);
+            const char *said = lr == OC_LOOPBACK_CANCELLED ? "sign-in cancelled"
+                             : lr == OC_LOOPBACK_TIMEOUT   ? "sign-in timed out: try again"
+                             : why[0] ? why : "the browser sign-in did not finish";
+            signin_answer(n, OC_LOOPBACK_REFUSED, said);
+            push_err_ex(n->to_ui, lr == OC_LOOPBACK_CANCELLED ? OC_CERR_SIGNIN_CANCELLED :
+                                  lr == OC_LOOPBACK_TIMEOUT   ? OC_CERR_SIGNIN_TIMEOUT : OC_CERR_SIGNIN_UNFINISHED,
+                        0, said);
+            break;
+        }
+        if (rc == RC_FATAL) {
+            /* A session token (stored or reconnect) was rejected: drop it and
+             * give up: signing in again is the person's to start. */
+            if (reconnecting && cs.store) oc_store_clear_session(cs.store, workspace);
+            /* A session that was good and is not any more — expired, revoked, the
+             * account removed — with no credential to try instead. Said as what it
+             * is, so a frontend can open the sign-in instead of showing an error. */
+            if (reconnecting) push_simple(n->to_ui, OC_EV_SIGNED_OUT, 0);
+            break;
+        }
+        /* A certificate the person must judge: wait for them. Trusting it
+         * (oc_net_trust_cert) connects again at once; so does a retry
+         * (oc_net_reconnect), which asks again -- the way back for someone who
+         * declined, or closed the question unanswered. Stopping ends it. */
+        if (rc == RC_CERT_UNTRUSTED || rc == RC_CERT_CHANGED) {
+            while (!n->stop && !atomic_load(&n->trust_pending) && !n->reconnect_now)
+                oc_nanosleep(50 * 1000 * 1000);
+            if (n->stop) break;
+            if (n->reconnect_now) reach_notified = 0;   /* a retry asks again */
+            n->reconnect_now = 0;
+            continue;
+        }
+        /* A device code still waiting: its secret outlives the connection, so
+         * connect again and poll on. */
+        if (!have_sess && rc == RC_LOST && n->device && n->device_secret[0]) {
+            for (int s = 0; s < 20 && !n->stop; s++) oc_nanosleep(100 * 1000 * 1000);
+            continue;
+        }
+        if (!have_sess) break;   /* never authenticated: nothing to reconnect with */
+        /* Connection lost mid-session: back off, then reconnect with the token.
+         * A connection that actually served resets the backoff so the first
+         * retry is prompt; repeated connect/auth failures grow it. */
+        backoff_ms = served ? 500 : (backoff_ms ? (backoff_ms < 4000 ? backoff_ms * 2 : 4000) : 500);
+        {
+            char msg[96];
+            /* State only, no keybinding: the core is frontend-agnostic, so each
+             * UI adds its own affordance (the TUI a Ctrl+R hint, the GUI its
+             * "Retry now" button). A TUI chord leaking into the GUI banner is
+             * what this used to do. */
+            snprintf(msg, sizeof msg, "Connection lost: reconnecting in %ds…",
+                     (backoff_ms + 999) / 1000);
+            push_err_ex(n->to_ui, OC_CERR_RECONNECTING, 0, msg);
+        }
+        /* Publish the deadline so a frontend can tick it down. The
+         * error string can only say the delay once, which is why the GUI banner
+         * showed a number that never moved. */
+        {
+            oc_ev *e = oc_ev_new(OC_EV_BACKOFF);
+            if (e) { e->server_time = oc_model_now_ms() + (uint64_t)backoff_ms; oc_queue_push(n->to_ui, e); }
+        }
+        n->reconnect_now = 0;
+        for (int s = 0; s < backoff_ms && !n->stop && !n->reconnect_now; s += 50) {
+            oc_nanosleep(50 * 1000 * 1000);
+            oc_callsig_tick(&n->calls, oc_model_now_ms(), NULL, NULL, n->to_ui);   /* a rejoin's deadline */
+        }
+        n->reconnect_now = 0;
+        { oc_ev *e = oc_ev_new(OC_EV_BACKOFF);      /* attempting now */
+          if (e) { e->server_time = 0; oc_queue_push(n->to_ui, e); } }
+        reconnecting = 1;
+    }
+
+    signin_answer(n, OC_LOOPBACK_UNKNOWN, NULL);   /* stopped with a tab still waiting */
+    oc_store_close(opened);
+    obox_free(&outbox);
+    hwtab_free(&hw);
+    return NULL;
+}
+
+/* ---- lifecycle ---- */
+
+oc_net *oc_net_start(const char *host, int port, const char *token,
+                     const char *store_path, oc_secret *secret,
+                     oc_queue *to_ui, oc_queue *from_ui) {
+    return oc_net_start_named(NULL, host, port, token, store_path, secret, to_ui, from_ui);
+}
+
+oc_net *oc_net_start_named(const char *workspace_key, const char *host, int port, const char *token,
+                           const char *store_path, oc_secret *secret,
+                           oc_queue *to_ui, oc_queue *from_ui) {
+    return oc_net_start_opts(workspace_key, host, port, token, store_path, secret, 0, to_ui, from_ui);
+}
+
+oc_net *oc_net_start_opts(const char *workspace_key, const char *host, int port, const char *token,
+                          const char *store_path, oc_secret *secret, int pin_only,
+                          oc_queue *to_ui, oc_queue *from_ui) {
+    return oc_net_start_verified(workspace_key, host, port, token, store_path, secret,
+                                 pin_only, NULL, to_ui, from_ui);
+}
+
+oc_net *oc_net_start_verified(const char *workspace_key, const char *host, int port,
+                              const char *token, const char *store_path, oc_secret *secret,
+                              int pin_only, const unsigned char *published_pin,
+                              oc_queue *to_ui, oc_queue *from_ui) {
+    return oc_net_start_signin(workspace_key, host, port, token, NULL, NULL, store_path, secret, pin_only,
+                               published_pin, to_ui, from_ui);
+}
+
+static oc_net *net_start(const char *workspace_key, const char *host, int port,
+                         const char *token, const char *source_id, const char *invite, int device,
+                         int reset, const oc_signin_result *result,
+                         const char *store_path, oc_secret *secret,
+                         int pin_only, const unsigned char *published_pin,
+                         oc_queue *to_ui, oc_queue *from_ui);
+
+oc_net *oc_net_start_signin(const char *workspace_key, const char *host, int port,
+                            const char *token, const char *source_id, const char *invite,
+                            const char *store_path, oc_secret *secret,
+                            int pin_only, const unsigned char *published_pin,
+                            oc_queue *to_ui, oc_queue *from_ui) {
+    return net_start(workspace_key, host, port, token, source_id, invite, 0, 0, NULL, store_path, secret, pin_only,
+                     published_pin, to_ui, from_ui);
+}
+
+oc_net *oc_net_start_signin_result(const char *workspace_key, const char *host, int port,
+                                   const oc_signin_result *result,
+                                   const char *store_path, oc_secret *secret,
+                                   int pin_only, const unsigned char *published_pin,
+                                   oc_queue *to_ui, oc_queue *from_ui) {
+    if (!result || !result->token || !result->token[0] || !result->verifier || !result->source_id) return NULL;
+    return net_start(workspace_key, host, port, "", result->source_id, NULL, 0, 0, result, store_path, secret,
+                     pin_only, published_pin, to_ui, from_ui);
+}
+
+oc_net *oc_net_start_reset(const char *workspace_key, const char *host, int port, const char *reset,
+                           const char *store_path, oc_secret *secret,
+                           int pin_only, const unsigned char *published_pin,
+                           oc_queue *to_ui, oc_queue *from_ui) {
+    return net_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, reset, 0, 1, NULL, store_path, secret,
+                     pin_only, published_pin, to_ui, from_ui);
+}
+
+oc_net *oc_net_start_device(const char *workspace_key, const char *host, int port,
+                            const char *store_path, oc_secret *secret,
+                            int pin_only, const unsigned char *published_pin,
+                            oc_queue *to_ui, oc_queue *from_ui) {
+    return net_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, NULL, 1, 0, NULL, store_path, secret, pin_only,
+                     published_pin, to_ui, from_ui);
+}
+
+static oc_net *net_start(const char *workspace_key, const char *host, int port,
+                         const char *token, const char *source_id, const char *invite, int device,
+                         int reset, const oc_signin_result *result,
+                         const char *store_path, oc_secret *secret,
+                         int pin_only, const unsigned char *published_pin,
+                         oc_queue *to_ui, oc_queue *from_ui) {
+    oc_net *n = calloc(1, sizeof *n);
+    if (!n) return NULL;
+    n->device = device;
+    if (source_id) snprintf(n->signin_pref, sizeof n->signin_pref, "%s", source_id);
+    if (invite && invite[0] && !(n->invite = strdup(invite))) { free(n); return NULL; }
+    n->invite_reset = reset;
+    if (workspace_key) snprintf(n->ws_key, sizeof n->ws_key, "%s", workspace_key);
+    if (published_pin) { memcpy(n->published_pin, published_pin, OC_TLS_FINGERPRINT_LEN);
+                         n->have_published_pin = 1; }
+    n->pin_only = pin_only;
+    snprintf(n->host, sizeof n->host, "%s", host ? host : "127.0.0.1");
+    n->port = port;
+    n->token = token ? strdup(token) : NULL;
+    if (result) {
+        /* Resuming a browser sign-in: the token is presented on the first
+         * connection, with what the sign-in began with. */
+        snprintf(n->source_id, sizeof n->source_id, "%s", result->source_id);
+        snprintf(n->verifier, sizeof n->verifier, "%s", result->verifier);
+        if (result->state) snprintf(n->oidc_state, sizeof n->oidc_state, "%s", result->state);
+        n->oidc_token = strdup(result->token);
+    }
+    n->store_path = (store_path && store_path[0]) ? strdup(store_path) : NULL;
+    n->secret = secret;
+    snprintf(n->client_type, sizeof n->client_type, "%s", "tui");
+    n->to_ui = to_ui;
+    n->from_ui = from_ui;
+    oc_mutex_init(&n->accept_mu);
+    oc_callsig_init(&n->calls);
+    oc_tls_session_init(&n->resume);
+    if (oc_thread_create(&n->thread, net_thread, n) != 0) {
+        oc_callsig_destroy(&n->calls);
+        oc_tls_session_free(&n->resume);
+        oc_mutex_destroy(&n->accept_mu);
+        free(n->token); free(n->invite); free(n->store_path); free(n); return NULL;
+    }
+    return n;
+}
+
+void oc_net_set_call_media(oc_net *n, const oc_call_media *media, void *ctx) {
+    if (n) oc_callsig_set_media(&n->calls, media, ctx);
+}
+
+
+void oc_net_cancel_signin(oc_net *n) { if (n) n->signin_cancel = 1; }
+
+void oc_net_set_signin_source(oc_net *n, const char *source_id) {
+    if (n) snprintf(n->signin_pref, sizeof n->signin_pref, "%s", source_id ? source_id : "");
+}
+
+/* The page tunnel's thread: it carries the pages until it is stopped or ten
+ * minutes pass. */
+static void *page_thread(void *arg) {
+    oc_net *n = arg;
+    oc_loopback_serve(n->page_lb, 10 * 60 * 1000, &n->page_cancel);
+    return NULL;
+}
+
+static void page_stop(oc_net *n) {
+    if (n->page_running) {
+        atomic_store(&n->page_cancel, 1);
+        oc_thread_join(n->page_th);
+        n->page_running = 0;
+    }
+    oc_loopback_close(n->page_lb);
+    n->page_lb = NULL;
+}
+
+int oc_net_pages_direct(oc_net *n) {
+    if (!n) return 0;
+    oc_mutex_lock(&n->accept_mu);
+    int direct = n->accepted && n->accepted_ca;
+    oc_mutex_unlock(&n->accept_mu);
+    return direct;
+}
+
+int oc_net_open_page(oc_net *n, const char *page, const char *query, char *url, size_t cap) {
+    if (!n || !page || !url) return -1;
+    char path[600];
+    int w = snprintf(path, sizeof path, "/%s%s%s", page, query && query[0] ? "?" : "", query ? query : "");
+    if (w < 0 || (size_t)w >= sizeof path) return -1;
+    oc_mutex_lock(&n->accept_mu);
+    int have = n->accepted, ca = n->accepted_ca;
+    oc_mutex_unlock(&n->accept_mu);
+    if (!have) return -1;
+    if (ca) return page_url(n, NULL, path, url, cap);
+    page_stop(n);                                  /* one page tunnel at a time */
+    n->page_lb = oc_loopback_open(NULL, 0);
+    if (!n->page_lb || page_url(n, n->page_lb, path, url, cap) != 0) { page_stop(n); return -1; }
+    atomic_store(&n->page_cancel, 0);
+    if (oc_thread_create(&n->page_th, page_thread, n) != 0) { page_stop(n); return -1; }
+    n->page_running = 1;
+    return 0;
+}
+
+void oc_net_trust_cert(oc_net *n, const unsigned char fp[OC_TLS_FINGERPRINT_LEN]) {
+    if (!n || !fp) return;
+    memcpy(n->trust_fp, fp, OC_TLS_FINGERPRINT_LEN);
+    atomic_store(&n->trust_pending, 1);
+}
+
+void oc_net_reconnect(oc_net *n) {
+    if (n) n->reconnect_now = 1;   /* the backoff loop polls this and retries at once */
+}
+
+void oc_net_set_client_type(oc_net *n, const char *client_type) {
+    if (n && client_type && client_type[0])
+        snprintf(n->client_type, sizeof n->client_type, "%s", client_type);
+}
+
+void oc_net_stop(oc_net *n) {
+    if (!n) return;
+    page_stop(n);
+    n->stop = 1;
+    oc_queue_push(n->from_ui, oc_cmd_new(OC_CMD_QUIT)); /* wake it promptly */
+    oc_thread_join(n->thread);
+    if (n->xq.active) oc_cmd_free(n->xq.active);
+    for (size_t i = 0; i < n->xq.n; i++) oc_cmd_free(n->xq.q[i]);
+    free(n->xq.q);
+    oc_callsig_destroy(&n->calls);
+    oc_pdm_free(&n->pdm);   /* every private DM's keys wiped */
+    oc_tls_session_free(&n->resume);
+    signin_forget(n);
+    device_forget(n);
+    oc_mutex_destroy(&n->accept_mu);
+    free(n->token);
+    free(n->store_path);
+    free(n);
+}

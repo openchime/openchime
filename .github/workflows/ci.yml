@@ -1,0 +1,242 @@
+name: ci
+
+# The tests, called by the staging build (staging-build.yml) before it builds
+# anything a release ships, and by nothing else: no pull request and no push
+# runs them. The staging build is dispatched by hand on staging, for its tip
+# (docs/CONTRIBUTING.md); a pull request runs only pr-policy. Two jobs, on two
+# machines at once, and nothing checked twice:
+#   - build:       the daemon built and started for real (health check plus the
+#                  protocol vertical over TLS), static linking, every Linux
+#                  translation unit through the release's clang (the second
+#                  compiler), the suites that run no threads, and the web
+#                  client in a headless Chrome.
+#   - thread-sanitizer: the suites whose code runs threads, under
+#                  ThreadSanitizer -- their one run in CI.
+# The Windows front-ends and their test programs are cross-compiled by the
+# staging build's own Windows job, with the toolchain and caches it builds the
+# shipped clients with.
+#
+# Each suite runs once: the threaded ones under the sanitizer, the rest plainly
+# (the Makefile's TSAN_SUITES). Every vendored library and toolchain is fetched
+# pinned by the script that builds it (mk/toolchains.mk) and cached by that
+# script's hash; nothing is installed from a package the day decides. One
+# runner image everywhere, ubuntu-24.04, the same one the release builds on.
+# What the release build checks itself -- read-aloud and voice input on the
+# stripped binary and the installed package -- is not repeated here.
+#
+# There is deliberately no GUI job. scripts/gui/smoke.sh needs a Windows host for
+# the client and a Linux one for the epoll-based daemon at the same time, which no
+# hosted runner provides; a job was carried here for a self-hosted box gated on
+# vars.GUI_SMOKE and, with that variable never set, ran zero times while the release
+# inherited its skip as a pass. The Win32 run stays a check run by hand before
+# pushing a client change (the pre-push hook does not run it); the build job
+# runs the same smoke on the web client. See docs/TESTING.md for the full strategy.
+#
+# The end-to-end step runs the daemon in development mode, so these jobs live
+# here and not in a release-path workflow, which scripts/check/release_lint.sh
+# keeps free of it.
+
+on:
+  # Called, never triggered: the staging build gates its release jobs on these
+  # exact jobs rather than re-implement them. A build that ran a weaker suite
+  # would be worse than no gate, because it would look like one.
+  workflow_call:
+
+# No concurrency group of its own: a called workflow's group would be evaluated
+# with the caller's workflow and ref, so two staging builds of different
+# commits would cancel each other's tests. The caller groups its runs.
+
+# Least privilege: the jobs read the tree and nothing else. A workflow calling
+# this one must grant at least that much, or GitHub refuses to start the call.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build + unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90   # a cold cache builds the vendored libraries: ~44 min
+    steps:
+      # Every CPU the runner has, for every make below and the makes they
+      # start (the Makefile is safe under -j; locally nothing changes).
+      - name: Use every CPU for make
+        run: echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+      - name: Install build deps
+        timeout-minutes: 20
+        run: |
+          # scripts/build/apt.sh: the mirror rewritten, each apt-get bounded
+          # and retried, so a stall fails the step instead of holding the job.
+          # bzip2 for the vendored mbedTLS tarball that `make` builds via
+          # scripts/build/mbedtls.sh; nasm for libvpx's assembly
+          # (scripts/build/libvpx.sh); xz-utils for the toolchain tarballs. gdb
+          # so that a test binary that crashes prints every thread's stack
+          # (tests/main.c). cmake, curl, git and python3 are on the image.
+          scripts/build/apt.sh bzip2 nasm gdb xz-utils
+      # The toolchains make fetches pinned (mk/toolchains.mk): zig for the
+      # release-compiler pass, Emscripten for the web client the daemon embeds.
+      # Keyed by the scripts, which pin the versions and the checksums.
+      - name: Restore the toolchains
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/zig-0.13.0
+            third_party/emsdk-6.0.8
+          key: toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
+      # Read-aloud's engine and model (ARCH-111): ONNX Runtime built minimal and
+      # static from source (about 20 minutes), the converted voice model, and
+      # voice input's recognizer files (ARCH-112). All are pure functions of the
+      # files in the key, so a hit skips the build and a change to any of them
+      # rebuilds. The timeout allows for a miss.
+      - name: Restore the speech engine and models
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/onnxruntime-1.30.0
+            build/kitten
+            build/moonshine
+          key: tts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build/onnxruntime.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+      # The vendored native libraries: each script builds only what is missing,
+      # so a hit skips the download and the build. Keyed by the scripts, which pin
+      # the versions and checksums, and by the compiler that builds them.
+      - name: Restore the vendored libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/mbedtls-3.6.2
+            third_party/libvpx-1.17.0
+            third_party/opus-1.6.1
+            third_party/speexdsp-1.2.1
+            third_party/llamacpp-0.5.0
+          key: vendor-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh', 'scripts/build/llamacpp.sh') }}
+      # The web client's libraries (docs/WEB.md): the release daemon carries the
+      # client (WEB=1), so this job builds it too. Built once by their scripts
+      # and cached, keyed by the scripts and the pinned Emscripten.
+      - name: Restore the wasm libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/wasm/mbedtls
+            build/wasm/sdl3
+            build/wasm/libvpx
+            build/wasm/opus
+            build/wasm/speexdsp
+          key: wasm-emsdk6.0.8-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/sdl3_wasm.sh', 'scripts/build/media_wasm.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
+      # The daemon as the release builds it (every feature, the web client in),
+      # the e2e client the step below drives, and the Linux terminal client: one
+      # make, so the web client's link overlaps the other compiles.
+      - name: Build the daemon, the e2e client and the terminal client
+        run: make TTS=1 STT=1 SUM=1 WEB=1 all build/e2e_client build/demo_client linux
+      # Only the C runtime may be dynamic. ONNX Runtime, llama.cpp, their C++
+      # runtime, mbedTLS, libopus and SQLite are all inside the binary, so anything else
+      # appearing here is a dependency that crept back in.
+      - name: The daemon links statically
+        run: |
+          ldd openchimed
+          if ldd openchimed | grep -vE 'linux-vdso|libc\.so|libm\.so|ld-linux'; then
+            echo "::error::openchimed has a dynamic dependency beyond libc and libm"; exit 1
+          fi
+      # The built binary, started from its environment as a deployment starts
+      # it: the one thing the in-process suites cannot show, since they link the
+      # daemon's code without its main(). Start, assert, stop in ONE step -- a
+      # backgrounded daemon does not outlive the step that launched it.
+      - name: End-to-end (healthz, then the protocol vertical over TLS)
+        env:
+          OPENCHIME_DATA_DIR: ${{ runner.temp }}/itest
+          OPENCHIME_HEALTH_PORT: '8080'
+          OPENCHIME_PORT: '8443'
+          # Development mode: the step bootstraps its users, which only that
+          # mode reads (CONFIG.md "Mode"). The e2e client signs in on the
+          # daemon's page, as a person does (AUTH.md §8.10, tests/testsignin.h).
+          OPENCHIME_MODE: development
+          OPENCHIME_DEV_USERS: 'e2e-alice:e2e-pw:owner,e2e-bob:e2e-pw:member'
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ runner.temp }}/itest"
+          log="${{ runner.temp }}/daemon.log"
+          ./openchimed >"$log" 2>&1 &
+          dpid=$!
+          trap 'kill "$dpid" 2>/dev/null || true' EXIT
+          ok=
+          for _ in $(seq 1 60); do
+            if curl -sf http://localhost:8080/healthz >/dev/null 2>&1; then ok=1; break; fi
+            kill -0 "$dpid" 2>/dev/null || break
+            sleep 1
+          done
+          if [ -z "$ok" ]; then echo "::error::daemon did not become healthy"; cat "$log"; exit 1; fi
+          ./build/e2e_client 127.0.0.1 8443
+          # A push token registered after sign-in is acknowledged, even with the
+          # daemon's own messages arriving first.
+          out=$(./build/demo_client 127.0.0.1 8443 e2e-bob e2e-pw token fcm e2e-device-token)
+          echo "$out"
+          grep -q "registered fcm token" <<<"$out" || { echo "::error::demo_client did not register a push token"; exit 1; }
+      # The release compiles with zig's clang against glibc 2.34, and a newer
+      # clang refuses things gcc accepts: a C11 typedef repetition and a
+      # declaration after a label each passed gcc and broke a release. Every
+      # Linux translation unit -- the daemon's, the client's and the tests' --
+      # goes through that exact compiler under -Werror, which is the tree's
+      # second-compiler check too. make fetches the pinned zig.
+      - name: Everything compiles with the release's compiler
+        run: make check-release-cc
+      # The suites that run no threads; the others run under the sanitizer in
+      # its own job. Its recipe runs the six source checks first (mk/tests.mk's
+      # SOURCE_CHECKS: opcodes, issue references, make targets, the configuration
+      # registry, release lint, tests lint).
+      - name: Run the suites the sanitizer does not
+        run: make test-ci PART=plain
+      # The web client in a browser (docs/TESTING.md §3.4), against the daemon
+      # built above, which carries it: the gfx pixel test under Node, the client
+      # signing in, drawing, recording and taking an input method's text
+      # (scripts/web/test.sh), the sign-in pages (scripts/web/pages.sh), and the
+      # quick GUI scripts on the web platform. The runner's own Chrome, driven
+      # by playwright-core at the exact version package.json pins. The same
+      # make variables as the build, so nothing is relinked.
+      - name: The web client in a headless Chrome
+        timeout-minutes: 20
+        env:
+          CHROME: /usr/bin/google-chrome
+        run: |
+          npm install --no-audit --no-fund
+          make TTS=1 STT=1 SUM=1 WEB=1 web-test
+          scripts/gui/run.sh --web smoke chords
+
+  thread-sanitizer:
+    name: thread sanitizer
+    # The daemon is threads -- the event loop, its I/O threads, the writer, the
+    # readers and the auth pool, the worker pools -- and so are the client, its
+    # call engine and its recorder. `make test-ci PART=threads` runs the suites whose code
+    # runs threads (the Makefile's TSAN_SUITES) under ThreadSanitizer, and a data
+    # race between our threads fails it (tests/tsan.supp). This is those
+    # suites' only run in CI.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      # Every CPU the runner has, for every make below and the makes they
+      # start (the Makefile is safe under -j; locally nothing changes).
+      - name: Use every CPU for make
+        run: echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+      - name: Install build deps
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          # ffmpeg only for ffprobe, which the media suite runs over a recorded
+          # file as an independent validator -- nothing links it. gdb so that a
+          # crash prints every thread's stack (tests/main.c).
+          scripts/build/apt.sh bzip2 nasm ffmpeg gdb
+      # The vendored native libraries: each script builds only what is missing,
+      # so a hit skips the download and the build. Keyed by the scripts, which pin
+      # the versions and checksums, and by the compiler that builds them.
+      - name: Restore the vendored libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/mbedtls-3.6.2
+            third_party/libvpx-1.17.0
+            third_party/opus-1.6.1
+            third_party/speexdsp-1.2.1
+          key: vendor-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
+      # The test binary needs no Emscripten: the web client's page is embedded
+      # from source and its loader only into a daemon built with WEB=1.
+      - name: Test under ThreadSanitizer
+        run: make test-ci PART=threads

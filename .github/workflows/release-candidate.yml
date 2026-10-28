@@ -1,0 +1,428 @@
+# Promote a stored staging build to a release-candidate (ARCH-20).
+#
+# Nothing is compiled or tested here. staging-build.yml builds a staging
+# commit, tests it, and stores what a release ships by its build id, the short
+# commit: the trees and binaries in the mirror bucket (DIST_MIRROR_BUCKET,
+# which holds the apt/dnf mirror and the stored builds) under candidates/<id>/
+# with a signed manifest, the images in the build repository as :build-<id>.
+# This workflow takes one such build -- by default the newest unreleased
+# stored build whose commit is on staging and that main can move to, or the
+# one named -- fetches it from that bucket, verifies it (the manifest's
+# signature, every file, the commit, the build id the binary reports, the image's digest), and publishes it in this
+# repository: the commit is tagged release-N-rcK (N the number the next
+# release would take, K counting the release-candidates for it), and a
+# prerelease of that tag carries the stored files. Last, the commit, the tag
+# and the prerelease are copied to the repository the PUBLIC_REPO variable
+# names (sync-public), a convenience nothing here depends on. A release (release.yml) takes exactly
+# one release-candidate, assigns it release-N, packages and publishes it.
+#
+# The files come from the bucket, never from a workflow artifact, so a build
+# can be promoted for as long as it is stored, not for as long as the run that
+# made it keeps its artifacts.
+#
+# Start it on staging:
+#   gh workflow run release-candidate.yml --ref staging                # the newest passed build
+#   gh workflow run release-candidate.yml --ref staging -f build=<id>  # a build id or commit
+name: release-candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: 'The staging build to promote, as its build id (the short commit) or full commit; empty for the newest passed build'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+# Every deployment-specific value is a repository variable or secret.
+env:
+  # The build's images (basic auth: the IMAGE_REGISTRY_USER variable,
+  # IMAGE_REGISTRY_TOKEN_BUILD as the password; the registry is the
+  # repository's first path segment).
+  BUILD_IMAGE: ${{ vars.IMAGE_REPO_BUILD }}
+  IMAGE_REGISTRY_USER: ${{ vars.IMAGE_REGISTRY_USER }}
+  DIST_S3_REGION: ${{ vars.DIST_S3_REGION || 'auto' }}
+
+jobs:
+  # The release-candidate, published in this repository: the build chosen,
+  # fetched from the mirror bucket and verified, then its commit tagged
+  # release-N-rcK and a prerelease of that tag made with the build's files: the
+  # Linux trees, the Windows binaries and the GUI's debug symbols, exactly as
+  # stored. N is the number the next release would take
+  # (scripts/release/version.sh, which counts release-N tags only); K is one
+  # past the highest release-candidate already tagged for N. The tag is pushed
+  # with the deploy key and the prerelease made with the job's own token. One
+  # job: each step is seconds, and a job costs a runner start.
+  #
+  # Serialised with release.yml, whose runs share the `release` group: a
+  # release removes the release-candidates of its number when it finishes, so
+  # one tagged for that number while it ran would go with them; and two
+  # release-candidates numbered at once would both take the same K. The build
+  # is chosen inside the group, so "the newest" is read after any release
+  # before it has finished.
+  publish:
+    name: publish the release-candidate
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      number: ${{ steps.tag.outputs.number }}
+      k: ${{ steps.tag.outputs.k }}
+      sha: ${{ steps.fetch.outputs.sha }}
+      build_id: ${{ steps.fetch.outputs.build_id }}
+    env:
+      DIST_S3_ENDPOINT:          ${{ vars.DIST_S3_ENDPOINT }}
+      DIST_S3_MIRROR_ACCESS_KEY: ${{ secrets.DIST_S3_MIRROR_ACCESS_KEY }}
+      DIST_S3_MIRROR_SECRET_KEY: ${{ secrets.DIST_S3_MIRROR_SECRET_KEY }}
+      DIST_MIRROR_BUCKET:        ${{ vars.DIST_MIRROR_BUCKET }}
+    steps:
+      # Dispatched on staging only, and only in the repository the
+      # RELEASE_REPO variable names; copies of it make none. The commit promoted is the build's, chosen below, not
+      # necessarily the staging tip this run was dispatched on.
+      - name: Refuse any other ref or repository
+        env:
+          REF: ${{ github.ref }}
+          REPO: ${{ github.repository }}
+          RELEASE_REPO: ${{ vars.RELEASE_REPO }}
+        run: |
+          [ -n "$RELEASE_REPO" ] && [ "$REPO" = "$RELEASE_REPO" ] || {
+            echo "::error::release-candidates are made only in the repository the RELEASE_REPO variable names"; exit 1; }
+          [ "$REF" = "refs/heads/staging" ] || {
+            echo "::error::release-candidate is dispatched on staging only (this run is on $REF). Use: gh workflow run release-candidate.yml --ref staging"; exit 1; }
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # Tags are pushed with the deploy key: the workflow's own token may not
+      # create a ref on a commit that changes workflow files.
+      - name: Push with the deploy key
+        env:
+          KEY: ${{ secrets.RELEASE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$KEY" ] || { echo "::error::RELEASE_SSH_KEY is not set in the release environment"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/release_key
+          chmod 600 ~/.ssh/release_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git remote set-url --push origin "git@github.com:${GITHUB_REPOSITORY}.git"
+          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/release_key -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
+      - name: Install tooling
+        timeout-minutes: 20
+        run: scripts/build/apt.sh rclone gnupg skopeo
+      - name: Import the signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.REPO_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$GPG_PRIVATE_KEY" ] || { echo "::error::REPO_SIGNING_KEY is not set; the build cannot be verified"; exit 1; }
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+      - name: Configure rclone for the mirror bucket
+        run: |
+          set -euo pipefail
+          for v in DIST_S3_ENDPOINT DIST_S3_MIRROR_ACCESS_KEY DIST_S3_MIRROR_SECRET_KEY DIST_MIRROR_BUCKET; do
+            [ -n "${!v}" ] || { echo "::error::$v is not set"; exit 1; }
+          done
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [dist-mirror]
+          type = s3
+          provider = Other
+          access_key_id = ${DIST_S3_MIRROR_ACCESS_KEY}
+          secret_access_key = ${DIST_S3_MIRROR_SECRET_KEY}
+          endpoint = ${DIST_S3_ENDPOINT}
+          region = ${DIST_S3_REGION}
+          EOF
+
+      # Which build. A stored manifest is a passed staging build: the staging
+      # build uploads it last, only once every test and build job passed.
+      # Named, it is that build; not named, it is the newest unreleased one:
+      # among the stored builds whose commit is on staging, carries no
+      # release-N tag, and that main can take as its next release
+      # (scripts/release/main_next.sh: it descends from the last release's
+      # candidate and the newest release-N, and the documentation promoted to
+      # main applies on it), the one furthest down staging -- by commit order,
+      # not by when it was stored, since builds of two commits can finish in
+      # either order. The cheap checks first.
+      - name: Choose the build
+        id: choose
+        env:
+          WANT: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main" "+refs/heads/staging:refs/remotes/origin/staging"
+          want=$(printf '%s' "$WANT" | tr -d '[:space:]' | tr 'A-F' 'a-f')
+          if [ -n "$want" ]; then
+            [[ "$want" =~ ^[0-9a-f]{7,40}$ ]] || {
+              echo "::error::'${WANT}' is not a build id or a commit (7 to 40 hex digits)"; exit 1; }
+            echo "build_id=${want:0:7}" >> "$GITHUB_OUTPUT"
+            echo "want=${want}" >> "$GITHUB_OUTPUT"
+            echo "build ${want:0:7}, as asked"
+            exit 0
+          fi
+          hint="Build the tip first: gh workflow run staging-build.yml --ref staging"
+          rm -rf "$RUNNER_TEMP/manifests"
+          # Before the first staging build there is no candidates/ at all:
+          # rclone's exit 3, "directory not found", reads as no builds, and
+          # nothing else does.
+          rc=0
+          rclone copy "dist-mirror:${DIST_MIRROR_BUCKET}/candidates" "$RUNNER_TEMP/manifests" \
+            --include '/*/manifest.json' --fast-list || rc=$?
+          [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || {
+            echo "::error::could not read candidates/ in ${DIST_MIRROR_BUCKET} (rclone exit ${rc})"; exit 1; }
+          # "<created> <sha> <id>", one per stored build.
+          python3 -I - "$RUNNER_TEMP/manifests" > "$RUNNER_TEMP/builds.txt" <<'PY'
+          import json, os, sys
+          root = sys.argv[1]
+          rows = []
+          for name in os.listdir(root) if os.path.isdir(root) else []:
+              try:
+                  m = json.load(open(os.path.join(root, name, "manifest.json")))
+                  rows.append((m["created"], m["sha"], m["build_id"]))
+              except (OSError, ValueError, KeyError) as e:
+                  print(f"choose: {name}: unreadable manifest ({e}); skipped", file=sys.stderr)
+          for r in sorted(rows, reverse=True):
+              print(*r)
+          PY
+          next=$(scripts/release/version.sh next)
+          pick="" pick_sha=""
+          while read -r created sha id; do
+            if ! git cat-file -e "${sha}^{commit}" 2>/dev/null \
+               || ! git merge-base --is-ancestor "$sha" origin/staging; then
+              echo "skipped ${id} (${sha}, stored ${created}): not on staging"; continue
+            fi
+            released=$(git tag --points-at "$sha" | grep -E '^release-[0-9]+$' || true)
+            if [ -n "$released" ]; then
+              echo "skipped ${id} (${sha}): already ${released}"; continue
+            fi
+            if ! scripts/release/main_next.sh release "$sha" "$next" >/dev/null 2>&1; then
+              echo "skipped ${id} (${sha}): main cannot take it as its next release"; continue
+            fi
+            # Every qualifying commit is on staging, so any two are in line:
+            # keep the one the other descends from.
+            if [ -z "$pick_sha" ] || git merge-base --is-ancestor "$pick_sha" "$sha"; then
+              pick="$id"; pick_sha="$sha"
+            fi
+          done < "$RUNNER_TEMP/builds.txt"
+          [ -n "$pick" ] || {
+            echo "::error::no unreleased staging build: none stored is on staging, unreleased, and one main can take next. ${hint}"; exit 1; }
+          echo "newest unreleased build: ${pick} (${pick_sha})"
+          echo "build_id=${pick}" >> "$GITHUB_OUTPUT"
+          echo "want=" >> "$GITHUB_OUTPUT"
+
+      # The commit first, which costs nothing: on staging, not already
+      # released, and one main can take as its next release
+      # (scripts/release/main_next.sh). Then the build, fetched from the
+      # mirror bucket and verified: the manifest's signature and every file's
+      # sha256 (scripts/release/candidate_fetch.sh), the commit it records, the
+      # build id the binary itself reports, and the image the manifest names
+      # being in the registry with the digest it recorded.
+      - name: Fetch and verify the build
+        id: fetch
+        env:
+          ID: ${{ steps.choose.outputs.build_id }}
+          WANT: ${{ steps.choose.outputs.want }}
+          IMAGE_REGISTRY_TOKEN_BUILD: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
+        run: |
+          set -euo pipefail
+          for v in BUILD_IMAGE IMAGE_REGISTRY_USER; do
+            [ -n "${!v}" ] || { echo "::error::the image variables are not set ($v)"; exit 1; }
+          done
+          [ -n "$IMAGE_REGISTRY_TOKEN_BUILD" ] || { echo "::error::IMAGE_REGISTRY_TOKEN_BUILD is not set in the release environment"; exit 1; }
+          sha=$(git rev-parse -q --verify "${WANT:-$ID}^{commit}") || {
+            echo "::error::${WANT:-$ID} is not a commit in ${GITHUB_REPOSITORY}"; exit 1; }
+          git merge-base --is-ancestor "$sha" origin/staging || {
+            echo "::error::${sha:0:7} is not on staging"; exit 1; }
+          released=$(git tag --points-at "$sha" | grep -E '^release-[0-9]+$' || true)
+          [ -z "$released" ] || { echo "::error::${sha:0:7} is already ${released}"; exit 1; }
+          rc=0; scripts/release/main_next.sh release "$sha" "$(scripts/release/version.sh next)" >/dev/null || rc=$?
+          [ "$rc" -eq 0 ] || {
+            echo "::error::main cannot take ${sha:0:7} as its next release (above)"; exit 1; }
+          scripts/release/candidate_fetch.sh "$ID" rc
+          recorded=$(python3 -c 'import json; print(json.load(open("rc/manifest.json"))["sha"])')
+          [ "$recorded" = "$sha" ] || { echo "::error::build ${ID} records the commit ${recorded}, not ${sha}"; exit 1; }
+          [ "$sha" = "$(git rev-parse origin/staging)" ] \
+            || echo "::notice::${sha:0:7} is not the staging tip ($(git rev-parse --short origin/staging)); promoting it as asked"
+          # The binary says what it is: unpacked and asked, so the id in the
+          # manifest is the id the code carries, not merely the directory's name.
+          mkdir -p check && tar xzf "rc/linux-amd64/openchimed-build-${ID}-linux-amd64.tar.gz" -C check
+          got=$("check/openchimed-build-${ID}-linux-amd64/openchimed" --version)
+          echo "$got"
+          grep -q "^openchimed ${ID} " <<<"$got" || { echo "::error::the build's daemon reports '$got', not build ${ID}"; exit 1; }
+          # And the image a release will re-tag exists, with the digest the
+          # manifest recorded.
+          want=$(python3 -c 'import json,sys; print(json.load(open("rc/manifest.json"))["images"]["build-'"$ID"'"])')
+          have="sha256:$(skopeo inspect --raw --creds "${IMAGE_REGISTRY_USER}:${IMAGE_REGISTRY_TOKEN_BUILD}" \
+                           "docker://${BUILD_IMAGE}:build-${ID}" | sha256sum | cut -d' ' -f1)"
+          [ "$have" = "$want" ] || { echo "::error::${BUILD_IMAGE}:build-${ID} is ${have}, the manifest says ${want}"; exit 1; }
+          echo "image ${BUILD_IMAGE}:build-${ID} matches the manifest"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "build_id=$ID" >> "$GITHUB_OUTPUT"
+          echo "SHA=$sha" >> "$GITHUB_ENV"
+          echo "BUILD_ID=$ID" >> "$GITHUB_ENV"
+
+      # A release-candidate tag already on this commit is reused, so re-running
+      # this job after a failure finishes that release-candidate instead of
+      # numbering the same commit twice.
+      - name: Number the release-candidate
+        id: tag
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet
+          N=$(scripts/release/version.sh next)
+          rcs=$( { git tag -l "release-${N}-rc*" | grep -E "^release-${N}-rc[0-9]+$" || true; } \
+                 | sed "s/^release-${N}-rc//" | sort -n)
+          K=""
+          for k in $rcs; do
+            if [ "$(git rev-parse "release-${N}-rc${k}^{commit}")" = "$SHA" ]; then K="$k"; fi
+          done
+          if [ -n "$K" ]; then
+            echo "release-${N}-rc${K} is already on ${SHA:0:7}; finishing it"
+          else
+            K=$(( $(printf '%s\n' $rcs | tail -1 | grep -E '^[0-9]+$' || echo 0) + 1 ))
+          fi
+          TAG="release-${N}-rc${K}"
+          echo "number=$N" >> "$GITHUB_OUTPUT"
+          echo "k=$K" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "this release-candidate is ${TAG}: build ${BUILD_ID} (${SHA})"
+
+      - name: Tag the commit
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then
+            echo "${TAG} is already tagged"
+          else
+            git tag -f "$TAG" "$SHA"
+            git push origin "refs/tags/${TAG}"
+          fi
+          echo "${TAG} is ${SHA:0:7}"
+
+      - name: Publish the release-candidate's files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          N: ${{ steps.tag.outputs.number }}
+          K: ${{ steps.tag.outputs.k }}
+        run: |
+          set -euo pipefail
+          find rc -type f | sort
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "${TAG} is already published"
+          else
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --prerelease \
+              --title "$TAG" \
+              --notes "Release-candidate ${K} for release-${N}: build ${BUILD_ID}, commit ${SHA}. If it is released, release-${N} carries these same files." \
+              rc/linux-*/*.tar.gz rc/windows-x64/*.exe rc/windows-x64/openchime.debug
+          fi
+          # The earlier release-candidates for this number stay, named as
+          # superseded, until release-N removes them all.
+          for t in $( { git tag -l "release-${N}-rc*" | grep -E "^release-${N}-rc[0-9]+$" || true; } | grep -vx "$TAG" || true); do
+            gh release edit "$t" -R "$GITHUB_REPOSITORY" --title "$t (superseded by $TAG)" >/dev/null \
+              || echo "::warning::could not mark ${t} superseded"
+          done
+
+      - name: Summary
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          {
+            echo "### Release-candidate \`${TAG}\`"
+            echo
+            echo "- build \`${BUILD_ID}\`, commit \`${SHA}\`"
+            echo "- to release it: \`gh workflow run release.yml --ref ${TAG}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The release-candidate, copied to the public repository (the PUBLIC_REPO
+  # variable; skipped when it is unset): the commit to its
+  # staging, the tag, and a prerelease with the same files, title and notes,
+  # read back from the prerelease just made here (`gh release download`).
+  # A copy and nothing more: nothing here or in release.yml reads it back, so a
+  # failure is a warning, never a failed run (continue-on-error). It reads
+  # nothing from that repository but whether the tag and the release are
+  # already there, so a re-run completes it. The staging push is plain, never
+  # forced: a push that is not a fast-forward is refused. Pushes use
+  # PUBLIC_DEPLOY_KEY, a write deploy key there; the release is
+  # made with PUBLIC_TOKEN (contents write there). Both are in the `release`
+  # environment.
+  sync-public:
+    name: copy to the public repository
+    needs: publish
+    if: ${{ success() && vars.PUBLIC_REPO != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: true
+    environment: release
+    permissions:
+      contents: read
+    env:
+      PUBLIC_REPO: ${{ vars.PUBLIC_REPO }}
+      SHA: ${{ needs.publish.outputs.sha }}
+      TAG: ${{ needs.publish.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up the deploy key
+        env:
+          KEY: ${{ secrets.PUBLIC_DEPLOY_KEY }}
+          TOKEN: ${{ secrets.PUBLIC_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$KEY" ] || { echo "::warning::PUBLIC_DEPLOY_KEY is not set in the release environment; nothing copied to ${PUBLIC_REPO}"; exit 1; }
+          [ -n "$TOKEN" ] || { echo "::warning::PUBLIC_TOKEN is not set in the release environment; nothing copied to ${PUBLIC_REPO}"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/public_key
+          chmod 600 ~/.ssh/public_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/public_key -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
+
+      - name: Push the commit to staging and the tag
+        run: |
+          set -euo pipefail
+          remote="git@github.com:${PUBLIC_REPO}.git"
+          git push "$remote" "${SHA}:refs/heads/staging" || {
+            echo "::warning::could not push ${SHA:0:7} to staging on ${PUBLIC_REPO} (not a fast-forward?)"; exit 1; }
+          if git ls-remote --exit-code --tags "$remote" "refs/tags/${TAG}" >/dev/null; then
+            echo "${TAG} is already there"
+          else
+            git fetch --force --quiet origin "refs/tags/${TAG}:refs/tags/${TAG}"
+            git push "$remote" "refs/tags/${TAG}" || {
+              echo "::warning::could not push ${TAG} to ${PUBLIC_REPO}"; exit 1; }
+          fi
+          echo "${PUBLIC_REPO}: staging and ${TAG} are ${SHA:0:7}"
+
+      - name: Copy the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLIC_TOKEN: ${{ secrets.PUBLIC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if GH_TOKEN="$PUBLIC_TOKEN" gh release view "$TAG" -R "$PUBLIC_REPO" >/dev/null 2>&1; then
+            echo "${TAG} is already published on ${PUBLIC_REPO}"
+            exit 0
+          fi
+          # The files, title and notes of the prerelease here, exactly.
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D files
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json name --jq .name > title.txt
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
+          ls -l files
+          GH_TOKEN="$PUBLIC_TOKEN" gh release create "$TAG" -R "$PUBLIC_REPO" --verify-tag --prerelease \
+            --title "$(cat title.txt)" --notes-file notes.md files/* || {
+            echo "::warning::could not publish ${TAG} on ${PUBLIC_REPO}"; exit 1; }
+          echo "${TAG} published on ${PUBLIC_REPO}"
+
+      - name: Report a failed copy
+        if: ${{ failure() }}
+        run: echo "::warning::the copy to ${PUBLIC_REPO} did not complete; ${TAG} is published here regardless. Re-run this job to finish it."

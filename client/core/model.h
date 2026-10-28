@@ -1,0 +1,1274 @@
+/*
+ * OpenChime client — the view-model + reducers (ARCH-74). Frontend-agnostic C:
+ * a frontend owns an oc_model, folds net→UI events into it each tick with
+ * oc_model_apply, and renders it. All logic/state lives here so a frontend is
+ * pure view + input. Single-threaded on the frontend, so no locking.
+ */
+
+#ifndef OC_MODEL_H
+#define OC_MODEL_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "event.h"
+#include "summary.h"
+
+/* One emoji's aggregate on a message: the running count and whether we reacted. */
+/* One of the daemon's voices (ARCH-111): the id a profile stores, and the name a
+ * person picks from. */
+#define OC_VOICE_MAX 16
+typedef struct { char id[32]; char label[32]; char lang[16]; } oc_voice;
+
+/* How many messages may wait to be spoken before the oldest is dropped. A
+ * listener who has fallen this far behind a busy channel is not going to catch
+ * up by hearing every one. */
+#define OC_STT_WORDS_MAX 16
+#define OC_LISTEN_QUEUE_MAX 64
+
+typedef struct { char emoji[40]; uint32_t count; uint8_t mine; } oc_reaction;
+
+/* One synced client setting (the daemon-side config bucket). key/value sizes
+ * mirror OC_SETTING_KEY_MAX / OC_SETTING_VALUE_MAX (+1 for NUL). */
+typedef struct { char key[65]; char value[513]; } oc_setting;
+/* Custom emoji (REQ-072): the workspace catalogue, replaced wholesale by each
+ * EMOJI_LIST — a partial catalogue means a shortcode that renders on one client and
+ * not another. The image is an attachment id, which is what a frontend fetches. */
+typedef struct { char name[48]; uint64_t attachment_id; uint64_t created_by; } oc_custom_emoji;
+
+/* One member's read cursor in a channel (REQ-090 seen-by). */
+typedef struct { uint64_t user_id; uint64_t message_id; } oc_read_cursor_view;
+
+/* One attachment hanging off a message (REQ-140): the server id (used to
+ * download it), its filename + mime, and the byte size. */
+/* `reclaimed` means the server removed the bytes by age or storage pressure
+ * (REQ-215/217) while keeping the row, so the message still reads sensibly. A
+ * frontend should show it as unavailable rather than offer a download. */
+typedef struct {
+    uint64_t id;
+    char     filename[128];
+    char     mime[64];
+    uint64_t size;
+    uint8_t  reclaimed;
+    /* A video message (REQ-165): media_kind OC_MEDIA_VIDEO_MESSAGE with its
+     * length, size and poster attachment; 0 for an ordinary file. */
+    uint8_t  media_kind;
+    uint32_t duration_ms;
+    uint16_t width, height;
+    uint64_t poster_id;
+} oc_attachment;
+
+/* One link preview under a message (REQ-222, ARCH-105): the daemon's fetched
+ * title + description for a URL the body carries. All heap. */
+typedef struct { char *url, *title, *descr; } oc_msg_unfurl;
+
+/* What a forwarded message points at (REQ-057). Resolved by the daemon and
+ * carried on its own frame, so it survives a reload the way a reaction does.
+ * The files stay on the source message, so `n_attach` counts them and
+ * `attach_name` is the first one's name: the card NAMES them and the permalink
+ * reaches them, rather than offering a download the recipient may not be
+ * allowed to make. */
+typedef struct {
+    uint64_t src_channel, src_message, src_author;
+    char    *excerpt;      /* heap; a snapshot taken when the forward was sent */
+    char    *attach_name;  /* heap; the first file's name, "" = none */
+    uint16_t n_attach;
+    uint8_t  src_action;   /* the source was an action: excerpt is its text (REQ-058) */
+} oc_msg_forward;
+
+/* A message's action (REQ-058, ARCH-115), as the daemon recorded it: the body
+ * stays what was typed, and `start`/`len` are the BYTES of it that are the
+ * action text. `actor_name` is a webhook's label, "" for the author's own name.
+ * A client never decides this for itself; it is set and cleared only by what
+ * the daemon sends. */
+typedef struct {
+    uint8_t  present;
+    uint32_t start, len;
+    char     actor_name[64];
+} oc_msg_action;
+
+typedef struct {
+    char    *body;         /* heap */
+    char     author_name[64]; /* author display name ("" = fall back to id) */
+    uint64_t author_id;
+    uint64_t message_id;
+    uint64_t server_time;
+    oc_reaction *reactions;   /* heap, NULL until the message gets a reaction */
+    uint8_t      n_reactions, cap_reactions;
+    oc_attachment *attach;    /* heap, NULL until the message carries an attachment */
+    uint8_t      n_attach, cap_attach;
+    uint8_t      edited;      /* body was edited (REQ-051) */
+    uint8_t      deleted;     /* tombstoned (REQ-052) */
+    uint32_t     reply_count; /* thread replies to this message (REQ-060) */
+    uint8_t      pinned;      /* pinned to its channel (REQ-230) */
+    uint64_t     pinned_by;   /* who pinned it (0 = unknown) */
+    uint64_t     pinned_at;
+    /* Saved for later by THIS user (REQ-231). Private, unlike a pin: it arrives
+     * only on this connection, from SAVED_UPDATED — live when you save, and
+     * replayed after a reconnect so a bookmark survives a reload. */
+    uint8_t      saved;
+    uint64_t     saved_at;
+    /* OC_MSG_KIND_*: a call event (a missed call, REQ-304) is drawn as a line of
+     * history rather than as something its author said. */
+    uint8_t      kind;
+    /* Link previews (REQ-222): fanned after the BROADCAST, replayed on
+     * backfill, cleared on edit (the daemon drops and re-fetches). */
+    oc_msg_unfurl *unfurls;   /* heap, NULL until one arrives */
+    uint8_t        n_unfurls, cap_unfurls;
+    /* The forward reference (REQ-057), NULL unless this message is a forward. */
+    oc_msg_forward *forward;
+    oc_msg_action   action;   /* REQ-058 */
+    /* The poll (REQ-225), NULL unless this message is one: its body is the
+     * question. Set and updated only by what the daemon sends. */
+    oc_poll_view   *poll;
+} oc_msg;
+
+/* How many live thread replies can be waiting for the toast pass at once. The
+ * pass runs every tick, so this only has to survive a burst between two of
+ * them; a deeper queue would only mean toasting something older. */
+#define OC_MAX_THREAD_NOTICES 32
+
+/* A live thread reply that may deserve a toast (REQ-061). `mentioned` and
+ * `keyword_hit` are resolved WHEN THE REPLY ARRIVES, against the full body,
+ * because the body itself is not kept — the excerpt below is for the toast, and
+ * scanning a truncated body would silently lose a mention past the cut. Whether
+ * it actually notifies is decided later, from state that can change in between:
+ * the channel's mute and level, the author's priority, the schedule and the
+ * pause. */
+typedef struct {
+    uint64_t channel_id;
+    uint64_t message_id;
+    uint64_t parent_id;
+    uint64_t author_id;
+    uint8_t  mentioned;
+    uint8_t  keyword_hit;
+    uint8_t  action;       /* the reply is an action: body is its text (REQ-058) */
+    char     body[256];    /* NUL-terminated excerpt, for the toast */
+} oc_thread_notice;
+
+/* Calls (REQ-150, REQ-301-305). The Calls section lists at most this many; a
+ * workspace with more calls going at once than a sidebar can show has a
+ * different problem. */
+#define OC_MAX_CALLS_LISTED 32
+#define OC_MAX_CALL_NOTICES 8
+
+/* An invitation that may deserve a toast (REQ-302), decided when it is taken,
+ * like a thread reply: mute, the schedule and the pause can change between. */
+typedef struct {
+    uint64_t channel_id;
+    uint64_t call_id;
+    uint64_t starter;
+} oc_call_notice;
+
+/* An encrypted DM's session on this device, as the UI shows it (PRIVATE-DM.md).
+ * `id` is its channel, whose messages are the conversation; `state` is the last
+ * OC_PDM_EV_* that changed it (INVITED, OPENING, OPEN, KEY_CHANGED or ENDED). An
+ * invitation has a view and no channel until it is accepted. */
+#define OC_PDM_VIEW_MAX   16
+typedef struct {
+    uint64_t     id, peer;
+    uint8_t      state, reason;
+    char         safety[72];
+} oc_pdm_view;
+
+/* A summary made while its asker was not watching (REQ-310, SUMMARY_READY):
+ * made (`status` OC_SUM_OK) or not, over the span asked for. */
+typedef struct {
+    uint64_t id, channel_id, start_ms, end_ms, made_at_ms;
+    uint8_t  scope, status, toasted;
+} oc_summary_notice;
+
+typedef struct {
+    uint64_t channel_id;
+    char    *name;         /* heap; NULL until a CHANNEL_LIST entry names it */
+    oc_msg  *msgs;
+    size_t   n_msgs, cap_msgs;
+    char    *topic;        /* heap; NULL = none (REQ-034) */
+    /* The long-form description (REQ-034). Not on the channel list, so it is
+     * unknown until asked for: `description_known` is what tells "none" apart
+     * from "never fetched", which a NULL alone cannot. */
+    char    *description;  /* heap; NULL = none, or not yet known */
+    uint8_t  description_known;
+    uint8_t  archived;     /* read-only; hidden from the default list (REQ-035) */
+    /* An encrypted DM (PRIVATE-DM.md): its session is oc_model_pdm(id). Its
+     * texts are wiped from memory when it is forgotten, which also takes it out
+     * of the sidebar. */
+    uint8_t  e2e, forgotten;
+    uint32_t info_seq;     /* bumped by every CHANNEL_INFO for it: a roster on screen
+                            * asks again when it moves, since an invite or a removal
+                            * is answered with one and nothing else says so */
+    uint64_t created_at;   /* from CHANNEL_INFO; shown in the About surface */
+    /* The newest message, for a scannable list. Seeded by CHANNEL_LIST and kept
+     * live by BROADCAST — otherwise it would be right only at connect. */
+    char     preview[128];
+    uint64_t preview_author;
+    uint8_t  preview_action;   /* preview is an action's text (REQ-058) */
+    uint64_t high_water;   /* dedup mark: ignore message_id <= this (ARCH-45) */
+    uint64_t read_marker;  /* high_water as of the last mark-read; drives unread */
+    int      unread;       /* messages from others since the last mark-read */
+    /* Of those, the ones that are about YOU -- a mention, a keyword, a priority
+     * person -- which the badge counts; the rest are a dot (oc_model_badge). */
+    int      priority_unread;
+    /* Server-reported, from CHANNEL_LIST — the only activity a cache-less client
+     * (ARCH-88) knows about a channel it has not opened. `srv_unread` seeds the
+     * badge before any backfill; `last_message_at` drives Recency sorting. */
+    uint64_t last_message_at;
+    uint32_t srv_unread;
+    uint8_t  joined;
+    uint8_t  history_requested; /* a backfill has been asked for (once per open) */
+    uint8_t  kind;             /* OC_CHANNEL_KIND / _DM */
+    uint8_t  is_public;        /* 1 public, 0 private/DM (REQ-031) */
+    uint64_t peer_id;          /* DM: the other participant (for the title) */
+    /* GROUP DM (REQ-056): every participant, including you. n_peers is 0 for a
+     * channel and for a 1:1 DM — a DM IS a group when it has more than two people
+     * in it, which is what a DM's identity has always been on the server. Carried on
+     * the channel so the sidebar can title it on first paint. */
+    uint64_t peers[9];
+    uint16_t n_peers;
+    uint8_t  notify_level;     /* OC_NOTIFY_ALL/_MENTIONS/_NONE (REQ-130) */
+    /* Muted (REQ-137) — NOT the same as level=NONE. Level decides whether
+     * the daemon notifies; muted also de-emphasises the row and suppresses its
+     * unread badge, so a conversation can be quiet but still countable, or
+     * countable but silent. */
+    uint8_t  muted;
+    /* Per-member read cursors (REQ-090 seen-by): the highest message id each
+     * member has read in this channel. Advance-only; drives "seen by …". */
+    oc_read_cursor_view *readers;
+    size_t   n_readers, cap_readers;
+    /* The groups this channel has (REQ-309): their members are in it through
+     * them. From CHANNEL_GROUPS; a deleted group is taken out here too. */
+    uint64_t groups[OC_MAX_CHANNEL_GROUPS];
+    uint16_t n_groups;
+} oc_channel;
+
+/* `dnd` is a SECOND AXIS beside status, not a status value (REQ-122): a person
+ * can be online and not to be disturbed, and one field could not say both. */
+typedef struct { uint64_t user_id; uint8_t status; uint8_t dnd; } oc_presence_row;
+
+/* A tenant roster entry (from LIST_USERS): id, display name, role, disabled. */
+typedef struct {
+    uint64_t user_id;
+    char     name[64];
+    /* What a client shows for them: the name, with " (deactivated)" once they
+     * have been removed (REQ-033). oc_model_user_name returns it. */
+    char     label[80];
+    uint8_t  role;
+    uint8_t  disabled;
+    /* Custom status (REQ-241) and profile fields (REQ-240). Kept on
+     * the roster entry rather than in a side table so a member list can render a
+     * status without a second lookup — the roster is small and already in memory.
+     * An EXPIRED status arrives empty: the daemon applies that rule, so no client
+     * needs its own clock to decide. */
+    /* Sized to the event field it is copied from (oc_ev.emoji), not to what a
+     * status emoji "should" need: a shorter buffer truncated the copy, and
+     * truncating UTF-8 at a byte offset splits a codepoint and produces a
+     * status nothing can render. Matching the source makes the copy total. */
+    char     status_emoji[40];
+    char     status_text[80];
+    uint64_t status_expires;
+    char     title[64];
+    char     timezone[48];
+    uint64_t avatar_id;
+    /* Read beside the name, so they ride USER_LIST with the fields above
+     * (REQ-240/289). A phone number does not: it reaches the card through
+     * PROFILE_INFO, and is not held for every member of the roster. */
+    char     full_name[64];
+    char     pronouns[32];
+    char     voice_id[32];   /* read aloud in this voice (REQ-292); "" = not chosen yet */
+    /* Filled by PROFILE_INFO only, never by USER_LIST: a phone number reaches
+     * the person who opened the card, not every roster fan-out. Empty until a
+     * card is fetched, which is what "not on the roster" means here. */
+    char     phone[40];
+} oc_member;
+
+/* An ephemeral "user is typing in channel" mark, expiring on a timeout. */
+typedef struct { uint64_t channel_id; uint64_t user_id; long long seen; } oc_typing_row;
+
+/* One full-text search hit (REQ-080). */
+typedef struct { uint64_t message_id, channel_id, author_id, server_time; char *snippet;
+                 uint8_t action; /* the snippet is an action's text (REQ-058) */ } oc_search_result;
+
+/* One reactor entry (from LIST_REACTIONS -> REACTIONS, REQ-071): who reacted
+ * with which emoji on the inspected message. */
+typedef struct { uint64_t user_id; char emoji[40]; } oc_reactor_row;
+typedef struct { uint64_t user_id; uint8_t option; } oc_voter_row;   /* REQ-225 */
+
+/* One entry of a channel's pins list (REQ-230). The body travels with it, so a
+ * frontend can render the list without the message being in loaded history. */
+typedef struct {
+    uint64_t message_id, author_id, server_time, pinned_by, pinned_at;
+    char    *body;                /* heap */
+    char     attach_name[128];    /* first attachment, "" if none */
+    uint8_t  action;              /* body is an action's text (REQ-058) */
+} oc_pinned_row;
+
+/* One member of a CHANNEL (REQ-031) — distinct from oc_member, which is the
+ * tenant roster. Keeping both is the point: showing the tenant's people beside a
+ * channel name was the bug this replaces. */
+typedef struct { uint64_t user_id, joined_at; uint8_t role; } oc_chan_member;
+
+/* One live session (REQ-182). No token: only its hash exists server-side. */
+typedef struct {
+    uint64_t session_id, created_at, last_seen, expires_at;
+    uint8_t  current;
+    char     device[64];
+} oc_session_row;
+
+/* (channel, count) — the shape of a census row. */
+typedef struct { uint64_t channel_id; uint32_t count; } oc_chan_count;
+
+/* One file shared in a channel (REQ-143, ARCH-91). */
+typedef struct {
+    uint64_t id, channel_id, message_id, uploader_id, size, created_at;
+    uint8_t  reclaimed;
+    char     filename[128], mime[64];
+    uint8_t  media_kind;         /* a video message lists as video (REQ-165) */
+    uint32_t duration_ms;
+} oc_file_view;
+
+/* One outstanding invite (REQ-026). No token: only its SHA-256 is stored
+ * server-side, so there is nothing to carry. */
+typedef struct { uint64_t invite_id, expires_at, created_by; uint8_t role;
+                 uint16_t uses, used; } oc_invite_row;   /* uses 0 = no limit */
+
+/* One saved item (REQ-231) — private to this user. */
+typedef struct {
+    uint64_t message_id, channel_id, author_id, server_time, saved_at;
+    char    *body;                 /* heap */
+    char     attach_name[128];
+    uint8_t  action;               /* body is an action's text (REQ-058) */
+} oc_saved_view;
+
+/* One draft (REQ-223, ARCH-101). Keyed by the conversation, not by time: there
+ * is exactly one per (channel, thread root), which is why a write replaces
+ * rather than appends. `gen` is the sync generation — see oc_model_drafts_begin. */
+typedef struct {
+    uint64_t channel_id;
+    uint64_t thread_root;
+    uint64_t updated_ms;
+    char    *body;        /* heap, never NULL for a stored draft */
+    char    *recipients;  /* heap or NULL; the unaddressed draft's ids (REQ-229) */
+    uint32_t gen;
+} oc_draft_view;
+
+/* One thread in the aggregated view (REQ-062). `gen` is the sync generation, as
+ * drafts use it: a list replaces what the server did not mention. */
+typedef struct {
+    uint64_t root_id, channel_id, root_author;
+    uint64_t root_at, last_reply_at;
+    uint32_t reply_count, unread;
+    uint8_t  following;
+    char    *preview;     /* heap */
+    uint8_t  action;      /* the root is an action; preview is its text (REQ-058) */
+    uint32_t gen;
+} oc_thread_view;
+
+/* One scheduled message (REQ-224). `state` is OC_SCHED_*; a FAILED one keeps its
+ * reason, because that is the whole of what its author needs to see. */
+typedef struct {
+    uint64_t id;
+    uint64_t channel_id;
+    uint64_t send_at_ms;
+    uint8_t  state;
+    char    *body;        /* heap */
+    char     fail[96];
+    uint32_t gen;
+} oc_sched_view;
+
+/* One activity item (REQ-139): `text` is the message for a mention or reply and
+ * the emoji for a reaction. */
+typedef struct {
+    uint8_t  kind;
+    uint64_t message_id, channel_id, actor_id, at;
+    char    *text;                 /* heap */
+    uint8_t  action;               /* text is an action's text (REQ-058) */
+} oc_activity_view;
+
+/* One incoming-webhook entry (from LIST_WEBHOOKS -> WEBHOOK_LIST, REQ-170): the
+ * webhook's id + label + disabled flag. Tokens are never listed (shown once at
+ * creation, in webhook_token). */
+typedef struct { uint64_t webhook_id; char label[64]; uint8_t disabled; } oc_webhook_view;
+
+/* One transfer's latest notice (0 tag = an empty slot): bytes moved of the
+ * total, the phase (0 running, 1 done, 2 failed) and, for a job that posts
+ * several files, which file is moving. */
+#define OC_MODEL_XFERS 32
+typedef struct { uint64_t tag, done, total; uint8_t phase, file; } oc_xfer_state;
+
+typedef struct {
+    bool     connected;
+    bool     authed;
+    uint64_t user_id;                 /* our own id, from AUTH_OK */
+    /* Workspace facts from WORKSPACE_INFO (infra config the daemon serves). */
+    uint8_t  deployment_mode;         /* 0 standalone · 1 federated · 2 managed */
+    uint8_t  workspace_mode;          /* OC_WS_MODE_*: a public demo says so (AUTH.md §8.12) */
+    uint32_t max_users;               /* 0 = unlimited */
+    char     workspace_name[64];      /* "" ⇒ frontend derives from the host subdomain */
+    char     server_build[48];        /* the daemon's build id (SERVER_BUILD); "" from a daemon that does not say */
+
+    /* Read-aloud (REQ-291-295, ARCH-111), from TTS_INFO after auth and replaced
+     * on every reconnect. Without it a frontend shows nothing of the feature. */
+    char     capabilities[256];         /* the daemon's feature names, comma separated */
+    uint8_t  n_voices;
+    /* Wide enough for the whole string. It was 64 while the daemon sent 71
+     * characters, so this silently held a truncated version -- harmless only
+     * because nothing compares it, which is exactly how it would go wrong. */
+    char     tts_model_version[96];
+    char     tts_preview[160];        /* the sentence that auditions a voice */
+    oc_voice voices[OC_VOICE_MAX];
+
+    /* Talking mode (one conversation at a time): 0 = off. Messages that arrive
+     * from the moment it is turned on are queued and spoken in order; the queue
+     * running dry is not the end, it waits for the next message. It belongs to
+     * the conversation on screen -- a frontend turns it off when the user leaves,
+     * and turning it on for another conversation replaces it. */
+    uint64_t listen_channel;
+    uint64_t listen_queue[OC_LISTEN_QUEUE_MAX];
+    uint8_t  n_listen_queue;
+    uint64_t listen_fetching;         /* the message whose speech is on its way */
+    uint64_t listen_ready_id;         /* speech in hand, waiting for the frontend */
+    uint8_t *listen_ready;            /* the MP4; owned here until taken */
+    size_t   listen_ready_len;
+    uint8_t *preview_ready;           /* a voice's audition MP4 (REQ-292), owned until taken */
+    size_t   preview_ready_len;
+    uint64_t listen_playing;          /* what the frontend says it is playing now */
+    uint32_t listen_skipped;          /* messages passed over, for the notice line */
+
+    /* Voice input (REQ-296-300, ARCH-112), from STT_INFO after auth. */
+    char     stt_model_version[96];
+    char     stt_lang[16];
+    uint32_t stt_max_ms;              /* the longest segment the daemon accepts */
+    /* Push-to-talk words waiting for the composer they were spoken into, in the
+     * order spoken. Owned here until the frontend takes them. */
+    struct { char *text; uint64_t channel_id, thread_root; } stt_words[OC_STT_WORDS_MAX];
+    uint8_t  n_stt_words;
+    /* Segments answered, and the last one refused and why, for the frontend to
+     * say so once. */
+    uint32_t stt_answered;
+    uint32_t stt_error_seq;
+    uint16_t stt_error_code;
+    oc_channel      *channels;
+    size_t           n_channels, cap_channels;
+    oc_presence_row *presence;
+    size_t           n_presence, cap_presence;
+    oc_typing_row   *typing;
+    size_t           n_typing, cap_typing;
+    /* The open thread (REQ-060): the parent's channel + id, and its replies. A
+     * frontend opens a thread, gets replies streamed in, and renders parent +
+     * replies in place of the channel; thread_open is 0 when no thread is open. */
+    uint8_t   thread_open;
+    uint64_t  thread_channel, thread_parent;
+    oc_msg   *thread_msgs;
+    size_t    n_thread_msgs, cap_thread_msgs;
+    /* A LIST_THREAD replay is in flight: set when the thread is opened, cleared
+     * by its THREAD terminator. History and a live reply arrive as the same
+     * frame, and only the second is worth interrupting anyone for. */
+    uint8_t   thread_replay;
+    /* Replies that arrived live and may be worth a toast (REQ-061). A thread
+     * reply never enters a channel's scroll (REQ-060) and so never moves the
+     * high-water mark the toast pass watches, and its body is dropped entirely
+     * unless its thread happens to be open — so what a toast needs is kept here
+     * as it arrives, and nowhere else. Bounded and oldest-dropping: a burst
+     * costs the oldest notice, never memory. */
+    oc_thread_notice notices[OC_MAX_THREAD_NOTICES];
+    size_t    n_notices;
+    /* The open search view (REQ-080): the query and its hits. */
+    uint8_t   search_open;
+    char      search_query[128];
+    oc_search_result *search_results;
+    size_t    n_search, cap_search;
+    /* The server said it had more hits than it sent. The wire gained a keyset
+     * cursor, so this now drives a "Load more" affordance rather than only an
+     * apology; it still exists to be honest about the cap
+     * rather than to drive a load-more. */
+    uint8_t   search_truncated;
+    /* The open "who reacted" view (REQ-071): the inspected message + its full
+     * reactor list. reactlist_open is 0 when no such overlay is open. */
+    uint8_t   reactlist_open;
+    uint64_t  reactlist_message;
+    oc_reactor_row *reactors;
+    size_t    n_reactors, cap_reactors;
+    /* The open "who voted" view (REQ-225), on the who-reacted pattern: the
+     * poll and the answer, row by row. 0 when none is open. */
+    uint8_t   voterlist_open;
+    uint64_t  voterlist_message;
+    oc_voter_row *voters;
+    size_t    n_voters, cap_voters;
+    /* The open pins view (REQ-230): a channel's pinned messages. pinlist_open
+     * is 0 when no such overlay is open. Distinct from the per-message `pinned`
+     * flag, which is what marks a pin inline in the transcript. */
+    uint8_t   pinlist_open;
+    uint64_t  pinlist_channel;
+    uint8_t   pinlist_loading;   /* asked, terminator not yet seen */
+    oc_pinned_row *pins;
+    size_t    n_pins, cap_pins;
+    /* The open summary (REQ-310): one conversation over one span, asked as
+     * `summary_req`. Shown to the person who asked and kept nowhere: closing it
+     * forgets it, and an answer to anything but the open request is dropped.
+     * While `summary_loading`, nothing has come back; then `summary_status` is
+     * OC_SUM_*, with `summary` when OK and `summary_error` (heap) otherwise. */
+    uint8_t   summary_open;
+    uint8_t   summary_loading;
+    uint8_t   summary_scope;     /* OC_SUM_UNREAD... */
+    uint8_t   summary_status;
+    uint32_t  summary_req;
+    int32_t   summary_position;  /* requests ahead of it while loading; -1 until told */
+    uint8_t   summary_resend;    /* the connection dropped while loading: ask again once signed in */
+    uint64_t  summary_notice;    /* opened from this notice (SUMMARY_OPEN), 0 when asked */
+    uint64_t  summary_channel;
+    uint64_t  summary_start, summary_end;   /* the span: asked for, then as covered */
+    char     *summary_error;
+    oc_summary_view summary;
+    /* Summaries made while their asker was not watching, not yet opened or
+     * dismissed (SUMMARY_READY), oldest first. `toasted`: given to the
+     * frontend once (oc_model_summary_notice_take). */
+    oc_summary_notice *sum_notices;
+    size_t    n_sum_notices, cap_sum_notices;
+    /* The selected channel's own member roster (REQ-031) and shared files
+     * (REQ-143). Both are per-channel views, refreshed on open rather than
+     * cached: a client stores nothing (ARCH-88) and a stale roster is worse
+     * than a moment's load. */
+    uint64_t  chanmem_channel;
+    uint8_t   chanmem_loading;
+    oc_chan_member *chanmem;
+    size_t    n_chanmem, cap_chanmem;
+    /* Of those, who is in only through a group (REQ-309): CHANNEL_VIA_GROUP,
+     * after the list. Owned; replaced whole. */
+    uint64_t *chanmem_via;
+    size_t    n_chanmem_via;
+    uint8_t   filelist_open, filelist_loading;
+    uint64_t  filelist_channel;      /* 0 = the workspace-wide view */
+    oc_file_view *files;
+    size_t    n_files, cap_files;
+    /* The daemon stopped at a page boundary and more remain (REQ-143): what a
+     * "load more" affordance is drawn from, and what oc_client_list_files_more
+     * refuses without. */
+    uint8_t   files_more;
+    /* The caller's own live sessions (REQ-182). Refreshed on open like every other
+     * report; a client caches nothing (ARCH-88). */
+    uint8_t   sessions_open, sessions_loading;
+    oc_session_row *sessions;
+    size_t    n_sessions, cap_sessions;
+    /* Which channels hold files, with counts. Server-computed, so the Files
+     * column is complete rather than "whatever was in the newest 200". */
+    oc_chan_count *fchans;
+    size_t    n_fchans, cap_fchans;
+    /* Saved items (REQ-231) and the activity feed (REQ-139). Both are per-user
+     * lists refreshed on open — a client caches nothing (ARCH-88). */
+    uint8_t   saved_open, saved_loading;
+    oc_saved_view *saved;
+    size_t    n_saved, cap_saved;
+    /* Drafts (REQ-223). Always loaded — the sidebar marks conversations that
+     * hold one — so unlike `saved` this has no open/close, only a generation
+     * that a full LIST bumps so stale entries can be swept when it completes. */
+    /* Threads I am in (REQ-062), newest activity first as the server ordered them. */
+    oc_thread_view *threads;
+    size_t    n_threads, cap_threads;
+    uint32_t  thread_gen;
+    uint8_t   threads_loading;
+    oc_draft_view *drafts;
+    size_t    n_drafts, cap_drafts;
+    uint32_t  draft_gen;
+    oc_sched_view *scheds;
+    size_t    n_scheds, cap_scheds;
+    uint32_t  sched_gen;
+    uint8_t   activity_open, activity_loading;
+    oc_activity_view *activity;
+    size_t    n_activity, cap_activity;
+    uint64_t  activity_seen;      /* watermark from the last feed read */
+    /* The tenant roster (REQ, LIST_USERS) + whether the roster view is open. */
+    uint8_t   roster_open;
+    oc_member *users;
+    size_t    n_users, cap_users;
+    /* Notification preferences (REQ-130/131): the DND window (minutes since
+     * midnight, local) + whether the prefs overlay is open. Per-channel levels
+     * live on each oc_channel.notify_level. A NOTIFY_PREFS frame is a full sync. */
+    /* The custom-emoji catalogue (REQ-072). */
+    oc_custom_emoji *cemoji;
+    size_t    n_cemoji, cap_cemoji;
+    /* The workspace's user groups (REQ-307), each owned here. A list answer is
+     * the whole truth: what it did not mention by its end is gone. */
+    oc_group_view **groups;
+    uint64_t *group_gen;           /* per group: the list it was last seen in */
+    size_t    n_groups, cap_groups;
+    uint64_t  groups_gen;
+    uint8_t   prefs_open;
+    /* The recurring SCHEDULE (REQ-136): `dnd_mode` is OC_DND_*, and the window
+     * is the hours notifications are ALLOWED — the opposite sense from the quiet
+     * window it replaced, which is why the fields are named for it. */
+    uint8_t   dnd_mode;
+    int16_t   tz_offset_min;
+    uint16_t  allow_start_min, allow_end_min;
+    oc_schedule_day sched_days[OC_SCHEDULE_DAYS];
+    uint8_t   n_sched_days;
+    /* Keyword alerts and priority people (REQ-135). Held so the client can
+     * HIGHLIGHT what the server notified on — the same list, matched by the same
+     * scanner, which is the whole point of ARCH-103. */
+    char      kw_terms[OC_MAX_KEYWORDS][OC_KEYWORD_MAX];
+    uint8_t   n_kw_terms;
+    uint64_t  pri_people[OC_MAX_PRIORITY];
+    uint8_t   n_pri_people;
+    /* REQ-278: when the manual PAUSE ends, 0 for none. Distinct from the window
+     * above in type as well as in name — one instant against a daily range. */
+    uint64_t  snooze_until_ms;
+    /* REQ-134: the level a channel takes when it has NO per-channel row. Server
+     * state, not a client guess — the daemon is what decides whether to push. */
+    uint8_t   notify_default;
+    /* The last invite token minted this session (REQ-033, shown once): the
+     * token is empty until an INVITE_CREATED arrives. */
+    char      invite_token[96];
+    uint8_t   invite_role;
+    uint64_t  invite_expires;
+    uint16_t  invite_uses;     /* how many may redeem it; 0 = no limit (REQ-026) */
+    /* The address the last invite is bound to ("" for a bearer token), and the
+     * one asked for but not answered yet: INVITE_CREATED does not repeat it. */
+    char      invite_email[256];
+    char      invite_asked_email[256];
+    /* How the workspace signs people in, from AUTH_CHALLENGE: one bit per
+     * source kind, 1u << OC_SOURCE_*. 0 until a connection has said. */
+    uint32_t  signin_kinds;
+    /* The provider its browser sources name, for people ("Google", "Google or
+     * Microsoft"); "" where any of them names none a client knows. */
+    char      signin_provider[64];
+    /* The incoming-webhook overlay (REQ-170): the channel it lists, its webhooks,
+     * and the last-minted token (shown once, empty until a WEBHOOK_INFO arrives).
+     * weblist_open is 0 when no such overlay is open. */
+    uint8_t   weblist_open;
+    uint64_t  weblist_channel;
+    oc_webhook_view *webhooks;
+    size_t    n_webhooks, cap_webhooks;
+    char      webhook_token[80];
+    /* The last reset link made (AUTH.md §2): whose, and its token -- shown once. */
+    uint64_t  reset_user_id;
+    char      reset_token[80];
+    /* Outstanding invites (REQ-026). Refreshed on open, like every other
+     * admin report — a client caches nothing (ARCH-88). */
+    uint8_t   invites_open, invites_loading;
+    oc_invite_row *invites;
+    size_t    n_invites, cap_invites;
+    uint64_t  webhook_new_id;
+    /* The synced client-settings bucket (the daemon-side config layer). A
+     * CLIENT_SETTINGS frame — solicited or a device-sync push — replaces it
+     * wholesale (OC_EV_SETTINGS_BEGIN clears, OC_EV_SETTING entries refill). The
+     * frontend reads values with oc_model_setting and layers them over its
+     * machine-local file defaults. */
+    oc_setting *settings;
+    size_t    n_settings, cap_settings;
+    uint8_t   settings_synced;        /* a snapshot has arrived at least once */
+
+    /* Storage report (REQ-214). Owner/admin only, so it stays zeroed for a
+     * member — the daemon refuses the request rather than sending zeros.
+     * `storage_open` is frontend view state for the overlay. */
+    oc_storage_view storage;
+    uint8_t   storage_have;
+    uint8_t   storage_open;
+
+    /* The daemon's critical failures (REQ-263), owner/admin only. `srvalerts_have`
+     * once a summary has come -- which only an owner's or admin's sign-in
+     * brings: how many are unacknowledged and how many still hold. The list,
+     * newest first, once asked for. `srvalerts_seq` moves with any change. */
+    uint8_t   srvalerts_have;
+    uint32_t  srvalerts_unacked, srvalerts_current;
+    oc_srvalert_view *srvalerts;
+    size_t    n_srvalerts, cap_srvalerts;
+    uint32_t  srvalerts_seq;
+
+    /* Audit log page (REQ-251), newest first. Owner/admin only. */
+    oc_audit_view *audit;
+    size_t    n_audit, cap_audit;
+    uint8_t   audit_open;
+    char     status[160];             /* last status / error line */
+    /* The last hard error (auth failed, unreachable, …). Unlike `status` it is
+     * NOT overwritten by the "disconnected" line, so a login flow can read the
+     * reason after the connection drops; cleared on a successful connect. */
+    /* The most recent in-memory attachment fetch. The model holds the
+     * bytes until a frontend takes them; taking transfers ownership, so nothing
+     * accumulates if nobody asks. */
+    /* A few, not one: transfers queue now, so a thumbnail and a video can both
+     * land between two frames, and the second must not free the first. */
+    struct { uint64_t id; uint8_t *data; size_t len; } fetched[8];
+    uint8_t  n_fetched;
+    /* The transfer running now (0 tag = none), for a progress bar or ring. */
+    uint64_t xfer_tag, xfer_done, xfer_total;
+    uint8_t  xfer_phase;             /* the last notice: 0 running, 1 done, 2 failed */
+    /* The latest notice for each recent transfer, by tag. The fields above keep
+     * only the last one, and a frame drains every event before it draws, so a
+     * small file that finished between two frames would never be seen to finish.
+     * A frontend that follows its own transfers reads them here. */
+    oc_xfer_state xfers[OC_MODEL_XFERS];
+    /* The last video message this client sent (REQ-162): its queue tag. */
+    uint64_t media_posted_tag;
+
+    /* When the net thread will next attempt a reconnect, as a monotonic
+     * millisecond stamp (0 = not backing off). The error text carries the delay
+     * once per backoff, which cannot tick; a frontend that wants a live
+     * countdown needs the deadline itself. */
+    uint64_t reconnect_at_ms;
+
+    char     last_error[160];
+    /* What the last error is about (event.h oc_client_err) and, for a refusal,
+     * the daemon's OC_ERR_* code: what a frontend decides by, never the text. */
+    uint8_t  last_error_kind;
+    uint16_t last_error_code;
+    /* A browser sign-in is waiting (AUTH.md §8.1): the URL to open, and a counter
+     * that moves each time one starts, so a frontend opens each URL once. Empty
+     * again once the sign-in ends either way. */
+    /* The stored or reconnecting session was refused and the connection has given
+     * up: a frontend opens this workspace's sign-in rather than leave an error line
+     * over a dead workspace. Cleared by the next successful sign-in. */
+    bool     signed_out;
+    char     signin_url[2048];
+    uint32_t signin_seq;
+    /* A device code waiting to be entered (AUTH.md §8.11): where, the code, the
+     * daemon's fingerprint where a browser will warn about it ("" where an
+     * authority vouches for it), when it runs out, and a count that moves with
+     * each. Cleared by the sign-in, and by any error. */
+    char     device_url[600];
+    char     device_code[20];
+    char     device_fp[65];
+    uint64_t device_expires_ms;
+    uint32_t device_seq;
+    /* A certificate the person must judge (ARCH-10): its SHA-256 in hex, whether
+     * it replaced one they trusted, and a count that moves each time one is
+     * shown. oc_client_trust_cert accepts it. */
+    char     cert_fp[65];
+    uint8_t  cert_der[OC_CERT_DER_MAX];   /* the certificate itself, to show; */
+    size_t   cert_der_len;                /* 0 when it did not fit */
+    bool     cert_changed;
+    uint32_t cert_seq;
+    /* Bumped every time an error arrives, even an identical one. A frontend that
+     * notices only when the TEXT changes stays silent when you repeat a failing
+     * action — the second attempt looks like it worked. */
+    uint32_t error_seq;
+
+    /* REQ-287: the last SEND that named people who are not in that channel.
+     * `seq` bumps per occurrence for the same reason `error_seq` does — mention
+     * the same absent colleague in two messages and the second must not be
+     * swallowed as a duplicate of the first. */
+    struct {
+        uint64_t channel_id, message_id;
+        uint64_t peers[9];
+        uint16_t n_peers;
+        uint8_t  can_add;      /* the sender may add people here */
+        uint8_t  is_private;   /* adding discloses the channel's history */
+        char     names[192];   /* comma-joined, ready to show */
+        uint32_t seq;
+        /* Everyone it could not reach, when more than the names listed (a
+         * group, REQ-308): 0 until MENTION_UNRESOLVED_MORE says, which bumps
+         * `total_seq` -- it arrives just after the notice it belongs to. */
+        uint16_t total;
+        uint32_t total_seq;
+    } unresolved;
+
+    /* Calls (REQ-150, REQ-301-305, CALLS.md). `calls` is the Calls section: every
+     * call in a conversation this user belongs to or is invited to, as CALL_STATE
+     * last said, ended ones removed; the daemon sends them all again after a
+     * reconnect. `call` is the one this client is in, while `in_call`, with each
+     * participant's slot. `call_pending` is a start or join on its way. */
+    oc_call_view calls[OC_MAX_CALLS_LISTED];
+    size_t       n_calls;
+    uint8_t      call_max;              /* the daemon's cap on a call (REQ-305) */
+    uint64_t     max_video_size;        /* the daemon's cap on a video message (REQ-164); 0 until WORKSPACE_INFO */
+    uint8_t      in_call;
+    oc_call_view call;
+    uint64_t     call_pending;          /* the channel a join is on its way to, 0 = none */
+    /* Getting back into the call in this channel (0 = not), after the
+     * connection or the media path went (PROTOCOL.md §5.17); `call` still says
+     * what it was. `call_back_seq` bumps when that succeeds, `call_lost_seq`
+     * when it is given up -- each once, for a frontend to say so. */
+    uint64_t     call_rejoining;
+    uint32_t     call_back_seq, call_lost_seq;
+    /* The last refusal: an OC_ERR_* code, `seq` bumping per occurrence, as the
+     * error line's does. */
+    uint16_t     call_error;
+    uint32_t     call_error_seq;
+    oc_call_notice call_notices[OC_MAX_CALL_NOTICES];
+    size_t       n_call_notices;
+    /* Private DMs (PRIVATE-DM.md): each this device is in or invited to, with
+     * what was said, in memory only. `pdm_seq` bumps on any change. */
+    oc_pdm_view  pdms[OC_PDM_VIEW_MAX];
+    size_t       n_pdms;
+    uint32_t     pdm_seq;
+    /* An open that ended before it had an id (refused): with whom, and a count
+     * a frontend watches to say so. */
+    uint64_t     pdm_refused_peer;
+    uint32_t     pdm_refused_seq;
+} oc_model;
+
+/* The private DM `id`, or NULL. */
+oc_pdm_view *oc_model_pdm(oc_model *m, uint64_t id);
+/* Forget a private DM that has ended: its messages are wiped. */
+void oc_model_pdm_forget(oc_model *m, uint64_t id);
+
+void oc_model_init(oc_model *m);
+void oc_model_free(oc_model *m);
+
+/* Fold one net event into the model. Takes ownership of `e->body` (moves it into
+ * the model and clears it); the caller still frees the event struct itself. */
+void oc_model_apply(oc_model *m, oc_ev *e);
+
+/* Find a channel by id, or NULL. */
+oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id);
+
+/* User groups (REQ-307-309). A group by id or by @handle (without case), or
+ * NULL; whether a person is in it; and, for someone in the channel ONLY through
+ * a group (oc_model_only_via_group), the first of its groups that has them --
+ * 0 otherwise. */
+const oc_group_view *oc_model_group(const oc_model *m, uint64_t group_id);
+/* Is `user_id` in `channel_id` only through a group? Known for the channel whose
+ * member list is loaded (CHANNEL_VIA_GROUP follows it); 0 for any other. */
+int oc_model_only_via_group(const oc_model *m, uint64_t channel_id, uint64_t user_id);
+const oc_group_view *oc_model_group_by_handle(const oc_model *m, const char *handle);
+int      oc_model_in_group(const oc_group_view *g, uint64_t user_id);
+uint64_t oc_model_via_group(const oc_model *m, uint64_t channel_id, uint64_t user_id);
+/* Does `body` mention this user -- by their name, or by a group they are in
+ * (REQ-308)? What a toast and a highlight ask. */
+int      oc_model_mentions_me(const oc_model *m, const char *body, size_t len);
+
+/* ---- the sidebar (6) --------------------------------------------------
+ * Grouping, filtering, sorting and collapse are IDENTICAL in every frontend, so
+ * they live here rather than being written twice (ARCH-74: the core holds the
+ * logic, a frontend is view + input). A frontend asks for the rows and draws
+ * them; it does not decide what belongs where.
+ *
+ * Two sections, matching Slack: Channels (public and private together, the
+ * private ones marked) and Direct messages. A DM has no name on the wire — the
+ * daemon stores NULL (kind='dm') — so a row carries a rendered `label` and a
+ * frontend must never filter on `name`. */
+/* Three sections now. STARRED is Slack's shape: pinned conversations lifted to the
+ * top and REMOVED from their normal section, so a starred channel appears once. It
+ * is last in the enum so the existing per-section arrays keep their indices — the
+ * order on SCREEN is decided by the builder, not by this numbering. */
+enum { OC_SB_CHANNELS = 0, OC_SB_DMS = 1, OC_SB_STARRED = 2, OC_SB_SECTIONS = 3 };
+#define OC_SB_STARRED_MAX 32u
+
+/* User-defined sections (REQ-234's other half). A custom section is a NAME
+ * plus a set of conversation ids, and a conversation in one is removed from
+ * Channels/DMs so it still appears exactly once — the same rule Starred follows.
+ * Starred wins over a custom section when a conversation is in both: two "lift it
+ * out of its section" rules need a precedence and the explicit star is the one the
+ * user set most recently by hand.
+ *
+ * Sections are numbered from OC_SB_CUSTOM_BASE in a row's `section` field, which is
+ * why the built-in per-section arrays above are indexed through the accessors
+ * below rather than directly — a custom section's sort/filter/collapse live on the
+ * section itself, so adding one cannot renumber anyone's saved preferences. */
+#define OC_SB_CUSTOM_MAX   8u
+#define OC_SB_CUSTOM_IDS   32u
+#define OC_SB_CUSTOM_BASE  16
+#define OC_SB_NAME_MAX     32
+enum { OC_SB_SORT_AZ = 0, OC_SB_SORT_RECENT, OC_SB_SORT_UNREAD };
+enum { OC_SB_FILTER_ALL = 0, OC_SB_FILTER_UNREAD, OC_SB_FILTER_ACTIVE };
+
+typedef struct {
+    uint8_t  sort[OC_SB_SECTIONS];       /* OC_SB_SORT_*   , per section */
+    uint8_t  filter[OC_SB_SECTIONS];     /* OC_SB_FILTER_* , per section */
+    uint8_t  collapsed[OC_SB_SECTIONS];  /* 1 = show the header only */
+    char     find[64];                   /* "Find a conversation" text, lowercased */
+    /* Starred conversations (REQ-234). Ids rather than names: a channel can
+     * be renamed and a DM has no name at all. Kept in the OPTIONS rather than the
+     * model because it is a per-user display choice, exactly like sort and filter,
+     * and the frontend owns persisting it. */
+    uint64_t starred[OC_SB_STARRED_MAX];
+    uint8_t  n_starred;
+    /* Custom sections, in the order they appear on screen (between Starred and
+     * Channels). Ids, not names, for the same reason as `starred`. */
+    struct {
+        char     name[OC_SB_NAME_MAX];
+        uint64_t ids[OC_SB_CUSTOM_IDS];
+        uint8_t  n_ids;
+        uint8_t  sort, filter, collapsed;
+    } custom[OC_SB_CUSTOM_MAX];
+    uint8_t  n_custom;
+    /* Unreads only: EVERY section shows just the conversations with something
+     * unread, on top of its own filter — the sidebar collapsed to what wants
+     * attention. Persisted with the rest. */
+    uint8_t  unreads_only;
+    /* The conversation open right now, which unreads-only KEEPS even once it is
+     * read: reading the channel you are in must not make it vanish from under
+     * you. View state set by the frontend on each build; never persisted. */
+    uint64_t keep_id;
+} oc_sidebar_opts;
+
+/* Per-section sort / filter / collapse, for BOTH kinds of section. A frontend must
+ * go through these rather than indexing o->sort[sec]: a custom section's number is
+ * >= OC_SB_CUSTOM_BASE and would run off the end of those arrays. */
+uint8_t oc_sb_sort_of(const oc_sidebar_opts *o, int section);
+uint8_t oc_sb_filter_of(const oc_sidebar_opts *o, int section);
+uint8_t oc_sb_collapsed_of(const oc_sidebar_opts *o, int section);
+void    oc_sb_set_sort(oc_sidebar_opts *o, int section, uint8_t v);
+void    oc_sb_set_filter(oc_sidebar_opts *o, int section, uint8_t v);
+void    oc_sb_set_collapsed(oc_sidebar_opts *o, int section, uint8_t v);
+/* Is this a user-defined section, and which one? -1 when it is a built-in. */
+int     oc_sb_custom_index(int section);
+
+/* Create a section. Returns its index, or -1 when the list is full or the name is
+ * empty. The name is SANITISED (the setting's separators are stripped) because it
+ * round-trips through one flat string in client_settings. */
+int  oc_sidebar_section_add(oc_sidebar_opts *o, const char *name);
+void oc_sidebar_section_rename(oc_sidebar_opts *o, int idx, const char *name);
+/* Delete a section. Its conversations return to Channels/DMs rather than
+ * disappearing — a section is a view, not a container. */
+void oc_sidebar_section_remove(oc_sidebar_opts *o, int idx);
+/* Which custom section holds `channel_id`, or -1. */
+int  oc_sidebar_section_of(const oc_sidebar_opts *o, uint64_t channel_id);
+/* Put `channel_id` in section `idx`, or take it out of every section with idx < 0.
+ * A conversation is in at most one section: assigning moves it. Returns 1 when
+ * something changed. */
+int  oc_sidebar_assign(oc_sidebar_opts *o, uint64_t channel_id, int idx);
+
+/* Is `channel_id` starred? Shared so a frontend's menu and the builder cannot
+ * disagree about it. */
+int  oc_sidebar_is_starred(const oc_sidebar_opts *o, uint64_t channel_id);
+/* Toggle. Returns 1 when the set changed (a full list refuses silently otherwise). */
+int  oc_sidebar_toggle_star(oc_sidebar_opts *o, uint64_t channel_id);
+
+typedef struct {
+    uint8_t  is_header;      /* a section header row */
+    uint8_t  section;        /* OC_SB_CHANNELS / OC_SB_DMS */
+    uint64_t channel_id;     /* 0 on a header */
+    char     label[96];      /* rendered: "general", or a DM peer's name */
+    uint8_t  is_private;     /* draw a lock */
+    uint8_t  is_self;        /* the self-DM: render the name, then a dimmed "you" */
+    uint64_t peer_id;        /* DM only: lets a frontend draw an avatar + presence
+                              * instead of a bare "@" marker, as Slack does */
+    uint8_t  joined;
+    int      unread;
+    int      section_total;  /* header rows: how many children (before collapse) */
+} oc_sidebar_row;
+
+/* Look one up by shortcode (no colons). Returns the attachment id, or 0. */
+uint64_t oc_model_custom_emoji(const oc_model *m, const char *name);
+
+/* Render a DM's title — the peer's name for a 1:1, the participants for a group
+ * (REQ-056). Exposed because a frontend needs the same string in its header as the
+ * sidebar shows, and two renderers would eventually disagree about who is in a
+ * conversation. */
+void oc_model_dm_title(const oc_model *m, const oc_channel *c, char *out, size_t cap);
+
+/* Build the sidebar. Returns the row count written to `out` (capped by `cap`).
+ * Headers are emitted even when a section is empty or collapsed, so the user can
+ * always expand it again. */
+size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
+                        oc_sidebar_row *out, size_t cap);
+
+/* Default options: both sections open, A-Z, unfiltered. */
+void oc_sidebar_opts_defaults(oc_sidebar_opts *o);
+
+/* Serialize/parse the options for the daemon's client_settings bucket, so the
+ * choice survives a restart without the client storing anything (ARCH-88).
+ * Format is a compact "c:s,f,x;d:s,f,x" so one setting key carries all of it. */
+void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap);
+void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s);
+/* A conversation's badge, two tiers as every chat client draws it: a COUNT of
+ * what is about you -- mentions, keywords, priority people, and in a direct
+ * message every message, since all of it is to you -- and a DOT for any other
+ * unread. Muted shows neither. */
+void oc_model_badge(const oc_model *m, const oc_channel *c, int *count, int *dot);
+
+/* Clear a channel's unread count and advance its read marker to high_water. */
+void oc_model_mark_read(oc_model *m, uint64_t channel_id);
+/* Put this user's read position in a channel at `message_id`, backwards included
+ * (mark unread, REQ-235), and recount its unread badge from the loaded messages. */
+void oc_model_set_read_marker(oc_model *m, uint64_t channel_id, uint64_t message_id);
+
+/* Begin/end viewing a thread. open clears any previously-loaded replies. */
+void oc_model_open_thread(oc_model *m, uint64_t channel_id, uint64_t parent_id);
+void oc_model_close_thread(oc_model *m);
+
+/* Begin a search (clears prior hits, records the query) / close the search view. */
+void oc_model_search_begin(oc_model *m, const char *query);
+void oc_model_close_search(oc_model *m);
+
+/* Begin a "who reacted" inspection (clears prior reactors, records the message)
+ * / close the overlay. */
+void oc_model_reactlist_begin(oc_model *m, uint64_t message_id);
+void oc_model_close_reactlist(oc_model *m);
+
+/* Begin / end a pins inspection for a channel (REQ-230). Begin clears any prior
+ * list and marks it loading, so a frontend can tell "no pins yet" from "empty". */
+void oc_model_pinlist_begin(oc_model *m, uint64_t channel_id);
+void oc_model_close_pinlist(oc_model *m);
+
+/* Begin / end a summary (REQ-310). Begin forgets any open one and waits for
+ * the answer to request `req_id`. */
+void oc_model_summary_begin(oc_model *m, uint64_t channel_id, uint8_t scope, uint64_t start_ms,
+                            uint64_t end_ms, uint32_t req_id);
+void oc_model_close_summary(oc_model *m);
+
+/* A channel's own member roster (REQ-031) and shared files (REQ-143). */
+void oc_model_chanmem_begin(oc_model *m, uint64_t channel_id);
+void oc_model_filelist_begin(oc_model *m, uint64_t channel_id);
+void oc_model_close_filelist(oc_model *m);
+
+/* Saved items / activity (REQ-231/139). */
+void oc_model_saved_begin(oc_model *m);
+void oc_model_close_saved(oc_model *m);
+void oc_model_activity_begin(oc_model *m);
+void oc_model_close_activity(oc_model *m);
+
+/* Begin listing a channel's incoming webhooks (clears prior entries + the
+ * shown-once token, records the channel) / close the overlay. */
+void oc_model_weblist_begin(oc_model *m, uint64_t channel_id);
+void oc_model_close_weblist(oc_model *m);
+void oc_model_invites_begin(oc_model *m);
+void oc_model_close_invites(oc_model *m);
+void oc_model_sessions_begin(oc_model *m);
+void oc_model_close_sessions(oc_model *m);
+
+/* A synced setting's value by key, or NULL if the bucket has no such key. Valid
+ * until the next CLIENT_SETTINGS frame folds in. */
+const char *oc_model_setting(const oc_model *m, const char *key);
+/* The draft for a conversation, or NULL. `thread_root` is 0 for the channel. */
+const char *oc_model_draft(const oc_model *m, uint64_t channel_id, uint64_t thread_root);
+/* Does this channel hold any draft? (the sidebar marker) */
+int         oc_model_has_draft(const oc_model *m, uint64_t channel_id);
+/* A full LIST is starting: bump the generation so oc_model_drafts_end can drop
+ * whatever the server did not mention this time. */
+void        oc_model_drafts_begin(oc_model *m);
+/* Apply a draft this client just wrote. The daemon does not echo a draft to the
+ * connection that wrote it (ARCH-101 — echoing it back is how a client ends up
+ * overwriting the composer someone is still typing in), so without this our own
+ * drafts would be invisible to our own sidebar until the next connect. */
+/* Who an unaddressed draft (channel 0) was addressed to: a comma-separated user
+ * id list, or NULL. The pane restores its chips from this. */
+const char *oc_model_draft_recipients(const oc_model *m);
+void        oc_model_draft_local(oc_model *m, uint64_t channel_id,
+                                 uint64_t thread_root, const char *body);
+/* The same, for the unaddressed draft: body and recipients together. */
+void        oc_model_draft_local_to(oc_model *m, const char *recipients, const char *body);
+/* How many scheduled messages are waiting, and how many failed — the pane's two
+ * counts, and the only reason the sidebar row needs to know about them. */
+size_t      oc_model_scheduled_pending(const oc_model *m);
+size_t      oc_model_scheduled_failed(const oc_model *m);
+
+/* Seen-by (REQ-090): fill `out` with up to `cap` user ids who have read
+ * `channel_id` up to at least `message_id`, excluding `exclude` (typically self).
+ * Returns the count. */
+size_t oc_model_seen_by(const oc_model *m, uint64_t channel_id, uint64_t message_id,
+                        uint64_t exclude, uint64_t *out, size_t cap);
+
+/* Open/close the notification-prefs overlay (frontend view state). */
+void oc_model_set_prefs_open(oc_model *m, int open);
+/* Milliseconds until the next reconnect attempt, 0 when not backing off. Pass
+ * the frontend's current monotonic clock — the core does not own a clock. */
+uint64_t oc_model_reconnect_in(const oc_model *m, uint64_t now_ms);
+
+/* The clock the core stamps that deadline with. A frontend must read the time
+ * from HERE rather than its own source, or the two disagree and the countdown
+ * jumps. */
+uint64_t oc_model_now_ms(void);
+
+/* Take the last fetched attachment's bytes, transferring ownership to
+ * the caller, which must free() them. Returns NULL when nothing is waiting. */
+uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *len);
+
+/* What a message says in a one-line summary — a sidebar row, a toast, the
+ * activity feed: its text, or for a message that is only a file, what the file
+ * is ("🎥 Video message (1:05)" for a video message, REQ-165). */
+/* One line for a message as a person reads it: "<name> <text>" for an action
+ * (REQ-058, ARCH-115), else the text. `name` overrides the roster name (a
+ * webhook's label); NULL or "" looks `author_id` up. Every surface that shows an
+ * excerpt, a toast or a screen-reader string goes through this, so an action
+ * reads the same everywhere. */
+void oc_model_line(const oc_model *m, uint64_t author_id, const char *name, int action,
+                   const char *text, char *out, size_t cap);
+void oc_model_msg_preview(const oc_model *m, const oc_msg *msg, char *out, size_t cap);
+/* "m:ss" for a duration in milliseconds (h:mm:ss past an hour). */
+void oc_model_format_duration(uint32_t ms, char *out, size_t cap);
+
+/* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
+uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);
+/* The thread list (REQ-062). `oc_model_threads_begin` bumps the sync generation;
+ * the terminator sweeps anything the server did not mention. */
+void oc_model_threads_begin(oc_model *m);
+/* Total unread replies across every thread — the badge on the Threads row. */
+uint32_t oc_model_thread_unread(const oc_model *m);
+/* Whether a user is not to be disturbed right now (REQ-122). The fact only: the
+ * server never sends anyone else's end time. */
+int oc_model_dnd_of(const oc_model *m, uint64_t user_id);
+/* Are MY notifications paused, and until when (0 = no) — my own end time is the
+ * one this client is allowed to know. */
+int oc_model_snoozed(const oc_model *m);
+/* Does `body` hit one of MY keywords (REQ-135)? The client's half of ARCH-103:
+ * the same scanner the daemon notified with, so a highlight and a notification
+ * can never disagree. */
+int oc_model_keyword_hit(const oc_model *m, const char *body, size_t len,
+                         size_t *span_start, size_t *span_len);
+/* Is `user_id` one of my priority people? */
+int oc_model_is_priority(const oc_model *m, uint64_t user_id);
+
+/* Which of a channel's NEW messages should interrupt me, if any?
+ *
+ * The client half of the one notify decision (ARCH-89, ARCH-103). It walks
+ * every message newer than `since_id` — the channel's previous high-water mark
+ * — computes each one's inputs with the scanners the daemon resolved with
+ * (REQ-221), and asks oc_notify_decide, the same function the daemon's push
+ * query asks. Returns the NEWEST message that notifies, or NULL if none does.
+ *
+ * It walks the batch rather than sampling the newest message because this runs
+ * on a timer: everything that arrived between two ticks is present at once, so
+ * a mention followed by an ordinary message would otherwise go unannounced, and
+ * the toast would name whoever spoke last rather than whoever needed you.
+ * Deleted messages are skipped — the tombstone stays in the model for the
+ * reader, but there is no body to preview and nothing left to interrupt for —
+ * and so are your own.
+ *
+ * `mentioned`, `keyword_hit` and `vip` (each optional) come back as the OR
+ * across every message that notified, not just the returned one: they drive the
+ * sound and the taskbar flash, which ask "did any of this name me?".
+ *
+ * `quiet` and `paused` are the caller's, because they belong to the WORKSPACE
+ * rather than the channel and a client may hold several at once. */
+const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
+                                   uint64_t since_id, int quiet, int paused,
+                                   int *mentioned, int *keyword_hit, int *vip);
+
+/* The same question for THREAD REPLIES, which oc_model_notify_scan structurally
+ * cannot answer: it walks a channel's scroll, and a reply is deliberately not in
+ * one (REQ-060), so it never sees a reply and passes 0 for the evaluator's
+ * thread_reply input.
+ *
+ * A sibling rather than a parameter, because the two gather from different
+ * places — a scroll the client keeps, and a queue of replies it was TOLD about
+ * (ARCH-104), since it cannot derive its own participation. Both then ask
+ * oc_notify_decide, which stays the only thing that decides.
+ *
+ * DRAINS the queue — every pending notice is considered exactly once, whether or
+ * not it notifies — and writes those that do into `out`, newest last, returning
+ * how many were written. Notices past `max` are dropped rather than left behind,
+ * so a caller with a small buffer cannot make the queue grow.
+ *
+ * `quiet` and `paused` are the caller's, as they are for the scan: they belong
+ * to the workspace rather than the channel. */
+size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
+                                   oc_thread_notice *out, size_t max);
+
+/* The latest notice for transfer `tag`, or NULL once it has aged out of the
+ * table (the oldest go first, finished ones before any still running). */
+const oc_xfer_state *oc_model_xfer(const oc_model *m, uint64_t tag);
+
+/* Calls (REQ-301-305). The Calls section's entry for a conversation, or NULL. */
+const oc_call_view *oc_model_call_in(const oc_model *m, uint64_t channel_id);
+/* Is `user_id` invited to `v` and not yet in it? */
+int oc_model_call_invited(const oc_call_view *v, uint64_t user_id);
+/* Drain the invitations worth a toast: each is a mention of this user, so a
+ * muted conversation, the schedule (`quiet`) and a pause (`paused`) silence it
+ * and the level cannot (ARCH-103). Considered once, whatever the verdict. */
+size_t oc_model_call_notify_take(oc_model *m, int quiet, int paused,
+                                 oc_call_notice *out, size_t max);
+/* The next summary notice not yet given to the frontend (for a toast): 1 and
+ * *out, or 0. Each is given once, however often the daemon tells it. */
+int oc_model_summary_notice_take(oc_model *m, oc_summary_notice *out);
+/* A notice by id, or NULL. */
+const oc_summary_notice *oc_model_summary_notice(const oc_model *m, uint64_t id);
+/* Forget notice `id` (opened or dismissed). */
+void oc_model_summary_notice_drop(oc_model *m, uint64_t id);
+/* Record a presence value (used for our own presence, which the server does not
+ * echo back to us). */
+void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status);
+
+/* Roster lookups: a user's display name ("" if unknown), or an id by name (0). */
+const char *oc_model_user_name(const oc_model *m, uint64_t user_id);
+/* 1 when the user has been removed from the workspace (REQ-033): shown as
+ * deactivated, their avatar dimmed. */
+int         oc_model_user_disabled(const oc_model *m, uint64_t user_id);
+uint64_t    oc_model_user_id(const oc_model *m, const char *name);
+
+/* Invitations (REQ-033). Whether the workspace offers a local account source
+ * (a bearer-token invite can be redeemed) and a browser source (an invite bound
+ * to an address can). Both answer 1 before any connection has said. */
+int oc_model_offers_local(const oc_model *m);
+int oc_model_offers_browser(const oc_model *m);
+/* A sign-in source's id as the provider it names, for people: "google" is
+ * "Google", "microsoft" is "Microsoft" (any case). NULL for any other id --
+ * the relay's own, or an operator's connection -- whose provider it does not say. */
+const char *oc_signin_provider_name(const char *id, size_t len);
+/* The provider the workspace's browser sources name, as the invite prompt and
+ * the invitation say it ("must be able to sign in with Google"); "" when it is
+ * not known, and the wording stays generic. */
+const char *oc_model_signin_provider(const oc_model *m);
+/* Note the address an invite is being asked for ("" or NULL for a token), so the
+ * INVITE_CREATED that answers it is read as that invitation. */
+void oc_model_invite_asked(oc_model *m, const char *email);
+/* The invitation to hand the invited person, for the last INVITE_CREATED: the
+ * workspace's name and `address` (what people type to reach it), how to sign in
+ * -- the provider and the invited address, or the token for a local account --
+ * and when it expires. `link`, when given, is the daemon's own web client
+ * opened with the token (`https://<workspace>/app/?invite=<hex>`, WEB.md),
+ * which a browser anywhere can follow: the text offers it first and the token
+ * for the app after. Pass it only where the daemon's pages open directly
+ * (oc_client_pages_direct); a link through this client's tunnel works nowhere
+ * else. Plain text, lines ended by "\n". Returns the length written
+ * (truncated to fit `cap`), 0 when there is no invite to describe. */
+size_t oc_model_invitation_text(const oc_model *m, const char *address, const char *link,
+                                char *out, size_t cap);
+/* The reset to hand its person, for the last CREDENTIAL_RESET: the workspace's
+ * name and `address`, the code to enter in the app's sign-in ("Have a reset
+ * code?"), and `link` -- the page itself, where a browser can reach it from
+ * anywhere -- unless NULL. Plain text, lines ended by "\n". Returns the length
+ * written (truncated to fit `cap`), 0 when there is no reset to describe. */
+size_t oc_model_reset_text(const oc_model *m, const char *address, const char *link, char *out, size_t cap);
+
+/* Workspace facts (WORKSPACE_INFO). deployment mode name: "standalone" /
+ * "federated" / "managed". workspace_name is "" until a name is configured. */
+uint8_t     oc_model_deployment_mode(const oc_model *m);
+const char *oc_model_deployment_name(const oc_model *m);
+const char *oc_model_workspace_name(const oc_model *m);
+uint32_t    oc_model_max_users(const oc_model *m);
+/* The daemon's build id (SERVER_BUILD), "" until it says -- a daemon older than
+ * the frame never does. */
+const char *oc_model_server_build(const oc_model *m);
+
+/* Read-aloud (TTS_INFO, ARCH-111). `available` 0 means this daemon does not speak
+ * messages and a frontend shows nothing of the feature (REQ-295). The voices are
+ * the ones a person may be read in, and `preview` is the sentence that auditions
+ * one. */
+/* Whether the daemon offers the feature called `name` (OC_CAP_*). */
+int             oc_model_has_capability(const oc_model *m, const char *name);
+/* Who voted on a poll (REQ-225): begin clears any open list and records the
+ * poll; rows fold in as they arrive. */
+void            oc_model_voterlist_begin(oc_model *m, uint64_t message_id);
+void            oc_model_close_voterlist(oc_model *m);
+/* A message's poll, by id, in `channel_id` or the open thread; NULL if none. */
+const oc_poll_view *oc_model_poll(const oc_model *m, uint64_t channel_id, uint64_t message_id);
+/* Read-aloud is offered: the "tts" capability. */
+uint8_t         oc_model_tts_available(const oc_model *m);
+/* Voice input is offered on this connection (the "stt" capability). */
+uint8_t         oc_model_stt_available(const oc_model *m);
+/* The daemon offers calls: its relay is up (REQ-150). */
+uint8_t         oc_model_calls_available(const oc_model *m);
+/* The daemon summarizes conversations (the "summarize" capability, REQ-313):
+ * without it, a frontend shows nothing of summaries. */
+uint8_t         oc_model_summarize_available(const oc_model *m);
+/* The oldest push-to-talk words spoken into (channel_id, thread_root): 1 and a
+ * malloc'd string the caller frees, or 0 if none are waiting. Words for another
+ * conversation stay until asked for there. */
+int             oc_model_stt_take_words(oc_model *m, uint64_t channel_id, uint64_t thread_root, char **text);
+uint8_t         oc_model_tts_voice_count(const oc_model *m);
+const oc_voice *oc_model_tts_voice(const oc_model *m, uint8_t i);
+const char     *oc_model_tts_preview(const oc_model *m);
+/* The label for a voice id ("" if this daemon does not have it). */
+const char     *oc_model_tts_voice_label(const oc_model *m, const char *voice_id);
+
+/* Talking mode: which conversation is being spoken (0 = none), how many messages
+ * are waiting, and which one is being read right now (0 = none yet). */
+uint64_t oc_model_listening_channel(const oc_model *m);
+uint8_t  oc_model_listen_queued(const oc_model *m);
+uint64_t oc_model_listen_playing(const oc_model *m);
+uint32_t oc_model_listen_skipped(const oc_model *m);
+/* Take the speech that is ready to play, if any: the caller owns the bytes and
+ * frees them. Returns the message id, or 0 when nothing is waiting. */
+uint64_t oc_model_listen_take_audio(oc_model *m, uint8_t **mp4, size_t *len);
+/* A voice's audition, if one has arrived: 1 with the MP4 handed over (the caller
+ * frees it), or 0. A newer sample replaces one not yet taken -- only the voice
+ * last chosen is worth hearing. */
+int      oc_model_preview_take_audio(oc_model *m, uint8_t **mp4, size_t *len);
+
+/* User ids currently typing in `channel_id` (last seen within the timeout),
+ * excluding `exclude` (typically self). Fills `out` up to `cap`; returns count. */
+size_t oc_model_typing(const oc_model *m, uint64_t channel_id, uint64_t exclude,
+                       uint64_t *out, size_t cap);
+
+#endif /* OC_MODEL_H */

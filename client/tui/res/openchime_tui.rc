@@ -1,0 +1,9 @@
+/* Windows resources for the terminal client.
+ *
+ * Version metadata only. The GUI's resource script also carries the app icon;
+ * this one deliberately does not, because a console program's icon comes from
+ * the host terminal window rather than the image.
+ */
+#define OC_RES_DESC "Terminal chat client for an OpenChime server."
+#define OC_RES_ORIG "openchime-tui.exe"
+#include "version_info.rc"
