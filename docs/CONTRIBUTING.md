@@ -6,6 +6,11 @@ The branch, commit, and CI policy for this repo.
 reviewed; one that is taken is included in the next release candidate, with its
 author kept and their `Signed-off-by` beside the maintainer's, and its pull
 request is then closed, since its change reaches `staging` with that candidate.
+No automated check runs on a pull request on `openchime/openchime`: the
+checks, protections and builds this document describes (`pr policy`, `guard`,
+the staging build) run where the maintainers integrate a change, not on an
+outside pull request, so run the local checks below yourself before opening
+one.
 Most of this document is the maintainers' own workflow; an outside contributor
 needs "Before a pull request" and "Commits" (and "Adding a setting" for a new
 setting).

@@ -128,8 +128,10 @@ Rendering is never allowed to lose characters the author typed.
   and receives the spans, and the daemon's speakable text uses the same function,
   for the reason ARCH-89 gives for the mention scanner: two implementations of
   "is this bold" will drift, and nobody can tell which is right from either side
-  alone. The TUI does not call it (nothing in `client/tui/` includes
-  `richtext.h`); it shows a body as written, markers included.
+  alone. The TUI does not parse a message body (nothing in `client/tui/`
+  includes `richtext.h`); it shows one as written, markers included. Its
+  action (`/me`) lines and search hits go through the core's `oc_model_line`,
+  which flattens a table with `oc_rt_flatten` (§1a).
 
 The parser returns **spans over the original bytes** — `{start, len, style}` —
 never a rewritten string. The body a client renders is byte-identical to the body
@@ -236,7 +238,9 @@ and an underline is indistinguishable from a link in most renderings.
   exist to make long-form prose readable and neither survives a chat transcript;
   an image is an attachment.
 - **The TUI shows the source, not the formatting.** It does not parse the body:
-  bold, italic, code, links and tables appear with their delimiters, as typed. That stays
+  bold, italic, code, links and tables appear with their delimiters, as typed
+  (in an action line or a search hit a table is flattened to its one-line
+  summary, §1a). That stays
   readable because the delimiters are the ones people already type in plain
   text, and the stored body is the same either way.
 
@@ -319,7 +323,8 @@ business:
   opens a confirmation — "This link goes to *host*", the full address, and Open
   link — rather than the browser.
 - **TUI** — no rendering: the body is drawn as written, delimiters and all,
-  since the TUI never calls the parser. Markup shown as source stays legible,
+  since the TUI never parses a body (action lines and search hits flatten a
+  table, through the core's `oc_rt_flatten`). Markup shown as source stays legible,
   which the dialect guarantees.
 
 **The composer shows formatting as you type**, which is only affordable because

@@ -8,15 +8,15 @@ changes that an operator has to know about. Installing is in the
 ## Versions: a build id and a release number
 
 A build is identified by its **build id**: the short commit it was built from
-(`a30809b`). It is compiled into the daemon, the web client the daemon serves
+(`ce31d6d`). It is compiled into the daemon, the web client the daemon serves
 and the Windows clients, and it is what `openchimed --version`, the startup
 log, `openchime-tui --version`, the Windows file properties (ProductVersion
-`build a30809b`) and the GUI's About OpenChime report. About shows the
+`build ce31d6d`) and the GUI's About OpenChime report. About shows the
 daemon's too, which the daemon sends each client at sign-in (PROTOCOL.md
 `SERVER_BUILD`). A daemon built from source without one reports `dev`.
 
 A **release number** is a label given to one build id when it is released:
-`release-1` is build `a30809b`. It appears only where a growing version is
+`release-1` is build `ce31d6d`. It appears only where a growing version is
 required: the deb and rpm versions and filenames, the tarball and installer
 filenames, the installer's version, the `release-N` tag and the GitHub
 release, whose notes name the build id. Nothing about a release number is in

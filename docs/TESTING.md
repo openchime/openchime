@@ -53,10 +53,12 @@ order" belongs in integration.
 CI), `make`, `curl` and `bzip2` (the pinned mbedTLS tarball), `nasm` (libvpx's
 assembly) and `python3`. The vendored libraries build themselves on
 first use (`scripts/build/*.sh`); no ONNX Runtime, llama.cpp or Emscripten is
-needed. Three things are checked only where present, and a missing one is a
+needed. Four things are checked only where present, and a missing one is a
 `SKIP` (a failure where `CI` is set): `ffprobe` (package `ffmpeg`, the media
-suite's recording check), an IPv6 loopback (`::1`), and a non-loopback LAN
-address (`test_client_core`'s certificate-trust checks). `gdb` is optional and
+suite's recording check), an IPv6 loopback (`::1`), a non-loopback LAN
+address (`test_client_core`'s certificate-trust checks), and a kernel that
+leaves a connection attempt pending (`test_sock`'s connect bound, skipped when
+the kernel answers every SYN). `gdb` is optional and
 makes a crash print every thread's stack. `make test-ci PART=threads` (the
 ThreadSanitizer half) also needs `setarch`; it refuses outside CI, so run it
 locally as `CI=1 make test-ci PART=threads`.
@@ -125,7 +127,8 @@ skipped without it.
 
 - Built and run by `make test`, compiled `-O0 -g` (debuggable). A non-zero exit
   fails the build and CI. One rule builds the single binary from every
-  `tests/*.c` plus the daemon and app-core objects it links (`mk/tests.mk`):
+  `tests/*.c` except the tool programs (`e2e_client`, `demo_client`,
+  `bench_load`, `bench_loop`, `testsignin_main`), plus the daemon and app-core objects it links (`mk/tests.mk`):
 
   ```makefile
   test: $(TEST_BIN) $(BIN)
@@ -450,8 +453,9 @@ Unit tests must be reproducible and independent of wall-clock or environment:
   crosses the 2 s keyframe the poster and the slow-decoder check need; the
   screen recording is two seconds, enough for the narrator's pause and a
   second of talking; a frame-rate check needs about fifteen frames.
-- **Every test's database starts as a copy of one migrated template**
-  (`start_db` in `test_dbwriter.c`) rather than migrating from nothing.
+- **Every `test_dbwriter` database starts as a copy of one migrated template**
+  (`start_db` in `test_dbwriter.c`) rather than migrating from nothing; the
+  other suites start their writers on fresh paths, which migrate on boot.
 - **A real-time rate is reported, not asserted narrowly.** Capture and recording
   run in real time, so how many frames a second of them yields is a property of
   the machine: a host that cannot encode 720p at 30 fps produces fewer frames,
@@ -612,7 +616,9 @@ runs threads (CI runs the halves in parallel jobs, `PART=threads` and
   threads, the writer and readers, the worker pools, the client, the recorder and
   player — under ThreadSanitizer (address randomization off, `tests/tsan.supp`
   for the one test-only reconfiguration). The list is the Makefile's
-  `TSAN_SUITES` (`mk/tests.mk`); a suite that starts a thread belongs on it. The sanitizer run
+  `TSAN_SUITES` (`mk/tests.mk`); a suite that starts a thread belongs on it.
+  Two that do are not on it yet, `run_relaykeys_tests` and `run_summary_tests`,
+  so they run only in the plain half and never under the sanitizer. The sanitizer run
   judges races, never speed: a limit on how fast code runs — wall-clock time, or
   one timing against another — is a `CHECK_SPEED` (`tests/check.h`), asserted in
   the ordinary build and not under the sanitizer, which slows code five to
@@ -1029,7 +1035,8 @@ answer in frames, a ping's pong, and an unmasked frame ending the connection.
 CI is GitHub Actions, and nothing in it runs on its own but the pull request's
 policy check and the monthly toolchain check (`toolchains.yml`, which only files
 an issue). A pull request into `staging` runs `pr-policy` (its title, body
-and open issue, and the attribution scan that posts `guard`), the two required
+and open issue, the tree's issue-reference check, `scripts/check/refs.sh` from
+the base branch, and the attribution scan that posts `guard`), the two required
 checks; nothing builds or tests it, and nothing runs on a push. The local
 `make test` (`scripts/check/test.sh`, which the pre-push hook requires) is the
 test a change gets before it merges. The hook is on once per clone, `git config core.hooksPath
@@ -1096,7 +1103,7 @@ injected by resampling one side, and ERLE in dB asserted.
 installed `.deb`, so each speech feature checks the other by content; the
 speech suites (`tts_worker`, `stt`, `ttskit`) run in CI.
 
-A new suite is its declaration and one `S(run_<name>_tests)` line in `tests/main.c`; if its code starts a thread it also goes on `TSAN_LIST` in `mk/tests.mk`, and CI runs it with no change here.
+A new suite is its declaration and one `S(run_<name>_tests)` line in `tests/main.c`; if its code starts a thread it also goes on `TSAN_LIST` in `mk/tests.mk`, and CI runs it with no change here. Nothing checks that it does: the relay-key and summary suites start threads and are missing from the list.
 
 ---
 
@@ -1255,7 +1262,7 @@ does once the gate opens. Making the cancel a no-op fails the run.
 
 ### Maintenance-pass overhead (ARCH-78)
 
-Running the storage maintenance pass every 200 ms — 25× more often than the
+Running the storage maintenance pass every 200 ms — 1500× more often than the
 5-minute default — against the same load shows no measurable change in daemon
 RSS, per-connection memory or round-trip latency.
 
@@ -1482,7 +1489,7 @@ CONFIG.md "Mode"), and any build will do.
 | `OC_TEST_WHO`, `OC_TEST_DEBUG_PORT` | `a`, unset | The web driver's client letter; Chromium's remote-debugging port. |
 | `OC_TEST_HEALTH_PORT`, `OC_TEST_WEB_PORT` | 8080, 8551 | The fixture daemon's health port; the fixture daemon's port in `scripts/gui/web_signin.sh` (the Win32 browser sign-in). |
 | `OC_TEST_KEEP_DB`, `OC_TEST_WAIT_MS` | 0, the script's | The smoke keeps the database; a longer wait for a slow machine. |
-| `GUI_DRIVE_OUT` | `/tmp/ocshot` | Where `shot`/`dump` copies land on the Linux side. |
+| `GUI_DRIVE_OUT` | `/tmp/ocshot` (`/tmp/ocshot-web` in `web_signin.sh`) | Where `shot`/`dump` copies land on the Linux side. |
 | `OC_PARITY_OUT` | `/tmp/oc-parity` | `parity.sh`'s report and side-by-side images. |
 
 The suite's own share the prefix: `OC_TEST_ONLY`, `OC_TEST_EXCEPT`,

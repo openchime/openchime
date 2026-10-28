@@ -135,7 +135,10 @@ non-public channel; this table is that membership set. The channel-management
 frames (PROTOCOL.md §5.7) maintain it: create/join/invite insert rows,
 leave/remove delete them, and posting to a *public* channel auto-joins the
 sender. Public channels are readable/postable by any tenant user; private
-channels are members-only, reachable only via `INVITE_TO_CHANNEL` (REQ-033).
+channels are members-only, reachable only via `INVITE_TO_CHANNEL` (REQ-033) or
+through a user group the channel has (`CHANNEL_ADD_GROUP`, §3am).
+`membership_sync` in `daemon/dbwriter.c` is the only code that writes or
+deletes a row.
 
 | column         | type    | notes                                    |
 |----------------|---------|------------------------------------------|
@@ -1647,8 +1650,9 @@ ALTER TABLE local_credentials DROP COLUMN iterations;
 ```
 
 Passwords are hashed with Argon2id, and each row carries its settings in `kdf`
-in place of a PBKDF2 count, so the memory, passes and lanes can be raised
-later without a format change. The PBKDF2 rows are deleted rather than carried:
+in place of a PBKDF2 count, so the memory cost can be raised later without a
+format change; passes and lanes are fixed (t=2, p=1), and a row naming others
+matches no password (§3). The PBKDF2 rows are deleted rather than carried:
 there were no deployments to keep. An account that had one sets a password
 again by a reset link (`RESET_CREDENTIAL`).
 
@@ -1781,7 +1785,7 @@ and never sent.
 row it must delete first. (An encrypted DM takes no poll, so the case is one of
 keeping the purge generic rather than one that arises.)
 
-*Written* in the send's own transaction, by `SEND` or `SEND_REPLY` when it carries
-a poll; a vote replaces the voter's rows in one transaction of its own. A delete
+*Written* in the send's own transaction: `POST_POLL` is posted as a `SEND` (or,
+with a parent, `SEND_REPLY`) job, and the writer stores the poll in it; a vote replaces the voter's rows in one transaction of its own. A delete
 removes all three tables' rows with the body, and a restore does not bring them
 back.

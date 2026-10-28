@@ -186,7 +186,8 @@ constraint does no work that can stall.
 **miniaudio**, vendored as a single header, matching the existing pattern
 (termbox2, utf8proc, jsmn — ARCH-75). MIT-0/public-domain, so it does not
 disturb the licensing stance that ruled out notcurses. It wraps ALSA,
-PulseAudio, PipeWire, CoreAudio, and WASAPI behind one API, with resampling so the engine can request
+PulseAudio (and so PipeWire, through its PulseAudio and ALSA layers), CoreAudio,
+and WASAPI behind one API, with resampling so the engine can request
 16 kHz regardless of what the hardware prefers.
 
 **The device layer is one file over a backend seam.** What is the same
@@ -478,8 +479,8 @@ path 30 ms late and a decaying tail:
 |---|---|
 | Converged | 22.5 dB ERLE |
 | Far end resampled 100 ppm fast | 15.5 dB ERLE — re-converges |
-| Double-talk | 13.2 dB of echo removed; output correlates 0.93 with the near-end voice |
-| The same rooms at 48 kHz, on the 16 kHz band (`OC_PROCESSOR_SPEEX_48K`) | 22.1 dB converged; 13.2 dB in double-talk, voice correlating 0.93 — against 23.2 dB, 11.0 dB and 0.88 for speexdsp run at 48 kHz |
+| Double-talk | 16.7 dB of echo removed; output correlates 0.91 with the near-end voice |
+| The same rooms at 48 kHz, on the 16 kHz band (`OC_PROCESSOR_SPEEX_48K`) | 22.1 dB converged; 16.6 dB in double-talk, voice correlating 0.91 — against 23.2 dB, 15.1 dB and 0.87 for speexdsp run directly at 48 kHz (a one-off run of the same rooms; the harness does not measure that case) |
 
 speexdsp's **residual-echo suppressor is left off**: in the same double-talk it
 cut the near-end voice to a correlation of 0.05. The linear filter alone keeps the

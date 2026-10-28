@@ -43,8 +43,9 @@ likewise vendored — as committed single-file source, both MIT (ARCH-75).
   chain to a trusted root and name the workspace — the domain the client sends as
   SNI, or, for a workspace that is an address, the address among the
   certificate's iPAddress names (which is never sent as SNI, RFC 6066 §3). The
-  trusted roots are the built-in ones (below), `OPENCHIME_EXTRA_CA`, and **the
-  operating system's**: Windows' ROOT store (`CertOpenSystemStoreW`), or the
+  trusted roots are the built-in ones (below) and **the operating system's**
+  (`OPENCHIME_EXTRA_CA` is the daemon's, for its own outbound connections; no
+  client reads it): Windows' ROOT store (`CertOpenSystemStoreW`), or the
   distribution's bundle (`/etc/ssl/certs/ca-certificates.crt`, then
   `/etc/pki/tls/certs/ca-bundle.crt`), which is where an organisation installs
   its internal CA. They are parsed once and shared by every client connection;
@@ -107,7 +108,7 @@ service — S3, central, a linked page, a workspace's `.well-known`
 document, an ACME CA — trust is an ordinary CA chain (ARCH-10).
 `oc_tls_client_init_ca` verifies the chain and the hostname
 (`MBEDTLS_SSL_VERIFY_REQUIRED`) against **Mozilla's trusted roots, compiled
-into the binary**, plus `OPENCHIME_EXTRA_CA`. The daemon never reads the host's
+into the binary**, plus, for the daemon, `OPENCHIME_EXTRA_CA`. The daemon never reads the host's
 store, so what a daemon build trusts is the same on every distribution and in a
 container with none; a client connecting to a daemon adds the operating
 system's roots (above).
@@ -124,8 +125,9 @@ system's roots (above).
   in, the set is a fact of the build and the same everywhere.
 - **What it costs.** The set is a snapshot: a root Mozilla removes stays
   trusted until the next release carries the refresh (`scripts/gen/ca_roots.sh`).
-- **A private CA.** `OPENCHIME_EXTRA_CA` names a PEM file whose roots are
-  trusted **as well**, never instead (`oc_tls_set_extra_ca`). The daemon reads
+- **A private CA.** `OPENCHIME_EXTRA_CA` names a PEM file whose roots the
+  daemon trusts **as well**, never instead (`oc_tls_set_extra_ca`); a client
+  trusts a private CA only from the operating system's store. The daemon reads
   it once at startup, and a file that is missing, empty, or holds a certificate
   that does not parse stops the boot, rather than trusting less than its
   operator wrote.
