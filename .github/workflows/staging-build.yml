@@ -51,6 +51,9 @@ permissions:
 
 # Every deployment-specific value is a repository variable or secret.
 env:
+  # Every bash step, and every script it runs, retries what fails in a call to
+  # GitHub's network and gives up on a dead connection (.github/net-retry.bash).
+  BASH_ENV: ${{ github.workspace }}/.github/net-retry.bash
   # The build's images: the repository they are pushed to, and the registry's
   # login (basic auth: the user below, IMAGE_REGISTRY_TOKEN_BUILD as password).
   # The registry is the repository's first path segment (${BUILD_IMAGE%%/*}).

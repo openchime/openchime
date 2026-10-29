@@ -232,6 +232,8 @@ and run the staging build again on the new tip.
 
 See [TESTING.md](./TESTING.md) for the full test strategy.
 
+**Calls to GitHub retry a failed connection.** Every workflow sets `BASH_ENV` to `.github/net-retry.bash`, so every bash step, and every script it runs, gets wrappers for `git`, `gh` and `ssh-keyscan`: git's network commands give up on a dead or stalled connection within about a minute, and a call that failed in the connection (a timeout, a dropped or refused connection, a 5xx) is retried with backoff, up to four times. A real refusal, such as a rejected push, a missing ref or a 4xx, fails at once.
+
 ## Releases
 
 The maintainers cut releases; a contributor does nothing for one. A staging
