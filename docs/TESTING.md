@@ -69,8 +69,8 @@ compiler (`scripts/build/onnxruntime.sh`, `llamacpp.sh`).
 
 **`make web-test` and the web harness** (`scripts/web/*`,
 `scripts/gui/run.sh --web`): `git` (make fetches Emscripten, about 400 MB, and
-its Node), a Chromium (`CHROME=/path`, else Playwright's download under
-`~/.cache/ms-playwright`), `npm` to install `playwright-core` from
+its Node), Chrome (`CHROME=/path`, else the installed `google-chrome` on
+`PATH`; nothing is downloaded), `npm` to install `playwright-core` from
 `package.json` (the scripts do it when it is missing), `openssl` and `python3`.
 `scripts/gui/run.sh` builds nothing by default (`OC_TEST_NO_BUILD=1`): run
 `make web-test` first.
@@ -1415,8 +1415,8 @@ Chromium's fake camera and microphone, its own permission prompts answered,
 its screen picker choosing the screen; `OPENCHIME_DEV_AUDIO`, `_MIC`,
 `_CAPTURE`, `_TONE` and the other switches reach the page as `?env=`, and a
 `_MIC` WAV is served to it. Needs `node`, the `playwright-core` package
-(`package.json`; `launch` installs it) and a Chromium (`CHROME`, else
-Playwright's download).
+(`package.json`; `launch` installs it) and Chrome (`CHROME`, else the
+installed `google-chrome`).
 
 **What the ports skip in a browser**, by `PLAT`: UI Automation (`uia_*.ps1`),
 the recording bar's own window and its capture exclusion, a window as a

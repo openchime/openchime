@@ -424,7 +424,7 @@ int main(int argc, char **argv) {
     /* Whether this daemon would run on the database at PATH, read-only and
      * writing nothing: the image's entrypoint asks before Litestream starts,
      * since Litestream exits 1 for any failure of the daemon it runs and the
-     * refusal's own status would be lost (SCHEMA.md "Migrations"). No database
+     * refusal's own status would be lost (SCHEMA.md §1). No database
      * there is one this daemon would begin. */
     if (argc >= 2 && strcmp(argv[1], "--check-data") == 0) {
         if (argc != 3) { fprintf(stderr, "usage: openchimed --check-data PATH\n"); return 2; }

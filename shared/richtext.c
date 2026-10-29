@@ -47,7 +47,7 @@ static int rt_space(char ch) { return ch == ' ' || ch == '\t' || ch == '\n' || c
 static int rt_delim(char ch) { return ch == '*' || ch == '_' || ch == '~' || ch == '`'; }
 
 /* The set a backslash may escape. Slack has none at all; without one there is
- * no way to write a literal asterisk at a word boundary (MARKDOWN.md §2.3). */
+ * no way to write a literal asterisk at a word boundary (MARKDOWN.md §2, rule 3). */
 static int rt_escapable(char ch) {
     return rt_delim(ch) || ch == '>' || ch == '-' || ch == '\\' || ch == '|';
 }
@@ -248,7 +248,7 @@ static void scan_inline(rt_ctx *c, size_t s, size_t e, int depth) {
                 continue;
             }
         }
-        i += d;                                /* unclosed: literal, MARKDOWN.md §2.2 */
+        i += d;                                /* unclosed: literal, MARKDOWN.md §2, rule 2 */
     }
 }
 

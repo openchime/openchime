@@ -68,7 +68,10 @@ jobs:
       # carries and the snapshot itself are scanned for a banned reference,
       # which refuses the promotion; each commit's subject is held to the
       # commit policy, which only warns, as in the staging build; and the tree
-      # main would have is scanned for issue references (scripts/check/refs.sh).
+      # main would have is scanned for issue references by its own
+      # scripts/check/refs.sh, the one main will carry: staging's may be
+      # stricter, and the files that would fail it reach main only with the
+      # next release. The documentation promoted met staging's in pr-policy.
       - name: Check what main takes
         if: steps.next.outputs.made == 'true'
         env:
@@ -88,7 +91,7 @@ jobs:
           tree="$RUNNER_TEMP/next-main"
           mkdir -p "$tree"
           git archive "$TO" | tar -x -C "$tree"
-          (cd "$tree" && sh "$GITHUB_WORKSPACE/scripts/check/refs.sh")
+          (cd "$tree" && sh ./scripts/check/refs.sh)
 
       # A plain push: a fast-forward of the main the snapshot was built on, so
       # one that moved since refuses it.

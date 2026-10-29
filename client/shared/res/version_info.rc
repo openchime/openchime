@@ -68,9 +68,7 @@ BEGIN
             VALUE "OriginalFilename", OC_RES_ORIG
             VALUE "ProductName",      "OpenChime"
             VALUE "ProductVersion",   OC_BUILD_ID_STR
-            /* No LegalCopyright: the licence is an open decision and this is
-               not the place to assert one. Add it when the tree gets a
-               LICENSE file. */
+            VALUE "LegalCopyright",   "Copyright (c) OpenChime LLC"
         END
     END
     BLOCK "VarFileInfo"

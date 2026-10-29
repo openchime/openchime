@@ -6,7 +6,8 @@
 # refuses a push without it:
 #
 #   - a branch whose tip tree scripts/check/test.sh did not pass on (the local
-#     test /oc-feature-finish runs) -- unless it changes only documentation;
+#     test, CONTRIBUTING.md "Before a pull request") -- unless it changes only
+#     documentation;
 #   - workflows actionlint rejects, when the push changes any: a workflow runs
 #     first when it is dispatched, after it has merged.
 #

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# The local test before a commit (/oc-feature-finish): build the daemon and run
-# the suites once (make && make test), and, when both pass, record the tree that passed, so the
-# pre-push hook (.githooks/pre-push) can tell a tested push from an untested
-# one. Nothing builds or tests a pull request; the staging build, run by hand
+# The local test before a commit (CONTRIBUTING.md "Before a pull request"):
+# build the daemon and run the suites once (make && make test), and, when both
+# pass, record the tree that passed, so the pre-push hook (.githooks/pre-push)
+# can tell a tested push from an untested one. Nothing builds or tests a pull request; the staging build, run by hand
 # after changes have merged, is the confirmation, not where a failure is found:
 # a red run there blocks every change merged with it, a red local run blocks
 # nothing.

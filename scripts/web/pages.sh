@@ -11,11 +11,11 @@
 # of the 303, its cache -- is what is exercised, which the suites' scripted
 # posts cannot show. Needs ./openchimed with the web client beside it (make
 # web), run here in development mode, build/signin, build/demo_client, node with
-# playwright-core, openssl, and a Chromium (CHROME, else Playwright's download).
+# playwright-core, openssl, and Chrome (CHROME, else the installed google-chrome on PATH).
 set -uo pipefail
 cd "$(dirname "$0")/../.."
-CHROME="${CHROME:-$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome 2>/dev/null | sort | tail -1)}"
-[ -x "${CHROME:-/nonexistent}" ] || { echo "pages: no Chromium (set CHROME)" >&2; exit 2; }
+CHROME="${CHROME:-$(command -v google-chrome || true)}"
+[ -x "${CHROME:-/nonexistent}" ] || { echo "pages: no Chrome (set CHROME)" >&2; exit 2; }
 [ -d node_modules/playwright-core ] || npm install --no-audit --no-fund --silent
 export OPENCHIME_MODE=development   # the fixture's users (CONFIG.md "Mode")
 # Made here, not only when missing: one left from before a protocol bump would

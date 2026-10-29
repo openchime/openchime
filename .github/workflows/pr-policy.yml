@@ -1,5 +1,6 @@
 # Pull request policy. The title becomes the commit subject once merged
-# (squash-only merges, repo setting), so the title is what is checked here.
+# (squash-only merges, repo setting), so the title is checked here, beside
+# the attribution scan (`guard`) and the tree's issue references.
 # The body must be empty; the description lives in the issue, not the PR.
 name: pr-policy
 

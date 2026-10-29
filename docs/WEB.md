@@ -273,5 +273,5 @@ native trees in `third_party/`. The page takes the workspace in its query
 (`host` and `port`, or `ws`, for a page served from elsewhere than the
 daemon; they become the application's `--signin`) and, on a page in
 development mode, with `hook=1`, the client's test hook on the page's
-filesystem (`ocHook('verb')`, `ocShot()`), which is what the test drives. `make web-test` needs a Chromium: Playwright's download is
-found under `~/.cache/ms-playwright`, or name one in `CHROME`.
+filesystem (`ocHook('verb')`, `ocShot()`), which is what the test drives. `make web-test` needs Chrome: the one `CHROME` names, else the installed
+`google-chrome` on `PATH`.

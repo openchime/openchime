@@ -1,37 +1,15 @@
 name: ci
 
-# The tests, called by the staging build (staging-build.yml) before it builds
-# anything a release ships, and by nothing else: no pull request and no push
-# runs them. The staging build is dispatched by hand on staging, for its tip
-# (docs/CONTRIBUTING.md); a pull request runs only pr-policy. Two jobs, on two
-# machines at once, and nothing checked twice:
-#   - build:       the daemon built and started for real (health check plus the
-#                  protocol vertical over TLS), static linking, every Linux
-#                  translation unit through the release's clang (the second
-#                  compiler), the suites that run no threads, and the web
-#                  client in a headless Chrome.
-#   - thread-sanitizer: the suites whose code runs threads, under
-#                  ThreadSanitizer -- their one run in CI.
-# The Windows front-ends and their test programs are cross-compiled by the
-# staging build's own Windows job, with the toolchain and caches it builds the
-# shipped clients with.
-#
+# The tests, called by the staging build (staging-build.yml) and by nothing
+# else; the pipeline and what each job covers are docs/CONTRIBUTING.md "CI".
 # Each suite runs once: the threaded ones under the sanitizer, the rest plainly
-# (the Makefile's TSAN_SUITES). Every vendored library and toolchain is fetched
+# (mk/tests.mk's TSAN_SUITES). Every vendored library and toolchain is fetched
 # pinned, or built from the committed sources, by the script that builds it
-# (mk/toolchains.mk) and cached by that script's hash; nothing is installed
-# from a package the day decides. One runner image everywhere, ubuntu-24.04,
-# the same one the release builds on.
-# What the release build checks itself -- read-aloud and voice input on the
-# stripped binary and the installed package -- is not repeated here.
+# (mk/toolchains.mk) and cached by that script's hash. One runner image
+# everywhere, ubuntu-24.04, the same one the release builds on.
 #
-# There is deliberately no GUI job. scripts/gui/smoke.sh needs a Windows host for
-# the client and a Linux one for the epoll-based daemon at the same time, which no
-# hosted runner provides; a job was carried here for a self-hosted box gated on
-# vars.GUI_SMOKE and, with that variable never set, ran zero times while the release
-# inherited its skip as a pass. The Win32 run stays a check run by hand before
-# pushing a client change (the pre-push hook does not run it); the build job
-# runs the same smoke on the web client. See docs/TESTING.md for the full strategy.
+# There is no GUI job beyond the web smoke (docs/TESTING.md "Reading the GUI
+# smoke").
 #
 # The end-to-end step runs the daemon in development mode, so these jobs live
 # here and not in a release-path workflow, which scripts/check/release_lint.sh
@@ -181,19 +159,17 @@ jobs:
       - name: Everything compiles with the release's compiler
         run: make check-release-cc
       # The suites that run no threads; the others run under the sanitizer in
-      # its own job. Its recipe runs the six source checks first (mk/tests.mk's
-      # SOURCE_CHECKS: opcodes, issue references, make targets, the configuration
-      # registry, release lint, tests lint).
+      # its own job. Its recipe runs mk/tests.mk's SOURCE_CHECKS first.
       - name: Run the suites the sanitizer does not
         run: make test-ci PART=plain
       # The web client in a browser (docs/TESTING.md §3.4), against the daemon
       # built above, which carries it: the gfx pixel test under Node, the client
-      # signing in, drawing, recording and taking an input method's text
-      # (scripts/web/test.sh), the sign-in pages (scripts/web/pages.sh), and the
-      # GUI smoke on the web platform. The checks that race the wall clock --
-      # the recording and input-method parts of test.sh, and the chords
-      # script's fixed sleep -- are not run here (OC_TEST_TIMING=0,
-      # tests/check.h): a busy runner must not fail a build. The runner's own Chrome, driven
+      # signing in and drawing (scripts/web/test.sh), the sign-in pages
+      # (scripts/web/pages.sh), and the GUI smoke on the web platform. Checks
+      # that race the wall clock do not judge here, so a busy runner cannot fail
+      # a build: OC_TEST_TIMING=0 (tests/check.h) skips test.sh's recording and
+      # input-method parts, and the chords script, which reads its result after
+      # a fixed sleep, is not run. The runner's own Chrome, driven
       # by playwright-core at the exact version package.json pins. The same
       # make variables as the build, so nothing is relinked.
       - name: The web client in a headless Chrome
@@ -211,7 +187,7 @@ jobs:
     # The daemon is threads -- the event loop, its I/O threads, the writer, the
     # readers and the auth pool, the worker pools -- and so are the client, its
     # call engine and its recorder. `make test-ci PART=threads` runs the suites whose code
-    # runs threads (the Makefile's TSAN_SUITES) under ThreadSanitizer, and a data
+    # runs threads (mk/tests.mk's TSAN_SUITES) under ThreadSanitizer, and a data
     # race between our threads fails it (tests/tsan.supp). This is those
     # suites' only run in CI.
     runs-on: ubuntu-24.04
