@@ -28,6 +28,11 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Every bash step, and every script it runs, retries what fails in a call to
+  # GitHub's network and gives up on a dead connection (.github/net-retry.bash).
+  BASH_ENV: ${{ github.workspace }}/.github/net-retry.bash
+
 jobs:
   # One job: each step is seconds of work, and a job costs a runner start.
   promote:

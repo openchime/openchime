@@ -16,6 +16,11 @@ concurrency:
   group: pr-policy-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+env:
+  # Every bash step, and every script it runs, retries what fails in a call to
+  # GitHub's network and gives up on a dead connection (.github/net-retry.bash).
+  BASH_ENV: ${{ github.workspace }}/.github/net-retry.bash
+
 jobs:
   policy:
     name: pr policy
