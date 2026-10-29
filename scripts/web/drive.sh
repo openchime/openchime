@@ -16,7 +16,7 @@
 # OC_TEST_PORT, OC_TEST_DIR, OC_TEST_WS, OC_TEST_USERS as scripts/gui/drive.sh; the
 # OPENCHIME_DEV_* switches reach the page (scripts/web/drive.mjs). Needs node, the
 # playwright-core package (npm install, from package.json) and a Chromium:
-# CHROME names it, else Playwright's download is looked for.
+# CHROME names it, else the installed google-chrome on PATH.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="${GUI_DRIVE_OUT:-/tmp/ocshot}"
@@ -28,7 +28,7 @@ mkdir -p "$DIR" "$OUT"
 
 chromium() {
   if [ -n "${CHROME:-}" ]; then printf '%s\n' "$CHROME"; return; fi
-  ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome 2>/dev/null | sort | tail -1
+  command -v google-chrome || true
 }
 
 daemon_pid() {
