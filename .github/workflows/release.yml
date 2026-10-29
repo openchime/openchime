@@ -1106,9 +1106,12 @@ jobs:
       # IMAGE_REPO_EXTRA names one. --preserve-digests keeps every manifest
       # digest exactly, and --all
       # copies the whole manifest list, not just the host architecture. In each
-      # repository the digest of :N is checked against the build's and only
-      # then is :N copied to :latest, so :latest never names an unverified
-      # image. Basic auth: IMAGE_REGISTRY_USER and each one's token.
+      # repository each copy proves the build's digest from skopeo's own report
+      # (scripts/release/copy_image.sh), and :latest is copied from the build by
+      # digest only after :N is, so :latest never names an unverified image.
+      # Nothing reads back a tag just written: a registry does not always serve
+      # a tag the moment its push finishes. Basic auth: IMAGE_REGISTRY_USER and
+      # each one's token.
       - name: Tag the image as the release and move :latest
         env:
           BUILD_CREDS: ${{ vars.IMAGE_REGISTRY_USER }}:${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
@@ -1119,14 +1122,9 @@ jobs:
           src="docker://${BUILD_IMAGE}:build-${BUILD_ID}"
           want=$(skopeo inspect --raw --creds "$BUILD_CREDS" "$src" | sha256sum | cut -d' ' -f1)
           release_image() {   # <image> <creds>
-            local image="$1" creds="$2" have
-            skopeo copy --all --preserve-digests --src-creds "$BUILD_CREDS" --dest-creds "$creds" \
-              "$src" "docker://${image}:${VERSION}"
-            have=$(skopeo inspect --raw --creds "$creds" "docker://${image}:${VERSION}" | sha256sum | cut -d' ' -f1)
-            [ "$have" = "$want" ] || {
-              echo "::error::${image}:${VERSION} is sha256:${have}, the build is sha256:${want}"; exit 1; }
-            skopeo copy --all --preserve-digests --src-creds "$creds" --dest-creds "$creds" \
-              "docker://${image}:${VERSION}" "docker://${image}:latest"
+            local image="$1" creds="$2"
+            scripts/release/copy_image.sh "$BUILD_CREDS" "${BUILD_IMAGE}@sha256:${want}" "$creds" "${image}:${VERSION}" >/dev/null
+            scripts/release/copy_image.sh "$BUILD_CREDS" "${BUILD_IMAGE}@sha256:${want}" "$creds" "${image}:latest" >/dev/null
             echo "${image}: ${VERSION} and latest -> build-${BUILD_ID} (sha256:${want})"
           }
           release_image "$BUILD_IMAGE" "$BUILD_CREDS"
