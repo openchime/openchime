@@ -12,9 +12,13 @@ on:
     # staging only: nothing takes a pull request into main.
     branches: [staging]
 
+# Runs for one pull request wait for each other; none is cancelled. One push can
+# raise two events for the same commit (a rebase that also edits the
+# description), and a cancelled run leaves a cancelled check on that commit
+# beside the passing one, which keeps the pull request from merging.
 concurrency:
   group: pr-policy-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   # Every bash step, and every script it runs, retries what fails in a call to
