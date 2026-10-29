@@ -960,14 +960,28 @@ jobs:
           ! grep -qF 'entrypoint: replica=on' "$W/g.log" \
             || { echo "::error::G started replicating data it refused"; exit 1; }
           echo "G: newer data refused with exit 4, before replication"
+      # The digest is buildah's own report of what it pushed (--digestfile),
+      # handed on as an artifact: no later job reads the tag back, since a
+      # registry does not always serve a tag the moment its push finishes.
       - name: Push the per-architecture image
         env:
           TOKEN: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           [ -n "$TOKEN" ] || { echo "::error::IMAGE_REGISTRY_TOKEN_BUILD is not set in the release environment"; exit 1; }
           printf '%s' "$TOKEN" | buildah login -u "$IMAGE_REGISTRY_USER" --password-stdin "${BUILD_IMAGE%%/*}"
-          buildah push "${BUILD_IMAGE}:build-${BUILD_ID}-${{ matrix.arch }}"
+          mkdir -p image-digest
+          buildah push --digestfile "image-digest/${ARCH}" "${BUILD_IMAGE}:build-${BUILD_ID}-${ARCH}"
+          d=$(tr -d '[:space:]' < "image-digest/${ARCH}")
+          [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::buildah reported no digest for ${ARCH} (${d:-nothing})"; exit 1; }
+          echo "pushed ${BUILD_IMAGE}:build-${BUILD_ID}-${ARCH}: ${d}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: image-digest-${{ matrix.arch }}
+          path: image-digest/${{ matrix.arch }}
+          retention-days: 1
+          if-no-files-found: error
 
   # :build-<id> only; a release copies it to :N and moves :latest, in the
   # build repository and the optional second one (release.yml).
@@ -979,14 +993,26 @@ jobs:
     environment: release
     env:
       BUILD_ID: ${{ needs.gate.outputs.build_id }}
+    outputs:
+      amd64: ${{ steps.publish.outputs.amd64 }}
+      arm64: ${{ steps.publish.outputs.arm64 }}
+      list: ${{ steps.publish.outputs.list }}
     steps:
       - uses: actions/checkout@v7   # for scripts/build/apt.sh
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: image-digest-*
+          path: image-digest
+          merge-multiple: true
       - name: Install buildah
         timeout-minutes: 20
         run: |
           set -euo pipefail
           scripts/build/apt.sh buildah
-      - name: Publish the manifest list
+      # Each architecture by the digest its push reported, never by the tag it
+      # just wrote; the list's own digest is buildah's report of what it pushed.
+      - id: publish
+        name: Publish the manifest list
         env:
           TOKEN: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
         run: |
@@ -995,9 +1021,16 @@ jobs:
           printf '%s' "$TOKEN" | buildah login -u "$IMAGE_REGISTRY_USER" --password-stdin "${BUILD_IMAGE%%/*}"
           buildah manifest create "${BUILD_IMAGE}:build-${BUILD_ID}"
           for a in amd64 arm64; do
-            buildah manifest add "${BUILD_IMAGE}:build-${BUILD_ID}" "docker://${BUILD_IMAGE}:build-${BUILD_ID}-${a}"
+            d=$(tr -d '[:space:]' < "image-digest/${a}")
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no pushed digest for ${a} (${d:-nothing})"; exit 1; }
+            buildah manifest add "${BUILD_IMAGE}:build-${BUILD_ID}" "docker://${BUILD_IMAGE}@${d}"
+            echo "${a}=${d}" >> "$GITHUB_OUTPUT"
           done
-          buildah manifest push --all "${BUILD_IMAGE}:build-${BUILD_ID}" "docker://${BUILD_IMAGE}:build-${BUILD_ID}"
+          buildah manifest push --all --digestfile list.digest "${BUILD_IMAGE}:build-${BUILD_ID}" "docker://${BUILD_IMAGE}:build-${BUILD_ID}"
+          list=$(tr -d '[:space:]' < list.digest)
+          [[ "$list" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::buildah reported no digest for the manifest list (${list:-nothing})"; exit 1; }
+          echo "pushed ${BUILD_IMAGE}:build-${BUILD_ID}: ${list}"
+          echo "list=${list}" >> "$GITHUB_OUTPUT"
 
   # The Windows client (ARCH-80/81). It carries the same build id as the
   # daemon even though it is a separate program, so a support question only
@@ -1178,8 +1211,7 @@ jobs:
     needs: [gate, packages, image-manifest, windows-build, windows-package]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    # The `release` environment for IMAGE_REGISTRY_TOKEN_BUILD: the digests
-    # below are read from the build repository, which needs a login.
+    # The `release` environment for REPO_SIGNING_KEY, which signs the manifest.
     environment: release
     permissions:
       contents: read
@@ -1207,7 +1239,7 @@ jobs:
           path: candidate/windows-x64
       - name: Install tooling
         timeout-minutes: 20
-        run: scripts/build/apt.sh rclone gnupg skopeo
+        run: scripts/build/apt.sh rclone gnupg
       - name: Import the signing key
         env:
           GPG_PRIVATE_KEY: ${{ secrets.REPO_SIGNING_KEY }}
@@ -1231,19 +1263,20 @@ jobs:
           endpoint = ${DIST_S3_ENDPOINT}
           region = ${DIST_S3_REGION}
           EOF
+      # The images' digests are the ones their pushes reported (the image and
+      # image-manifest jobs), not read back from the tags those jobs wrote.
       - name: Write and sign the manifest
         env:
-          IMAGE_REGISTRY_TOKEN_BUILD: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
+          AMD64: ${{ needs.image-manifest.outputs.amd64 }}
+          ARM64: ${{ needs.image-manifest.outputs.arm64 }}
+          LIST: ${{ needs.image-manifest.outputs.list }}
         run: |
           set -euo pipefail
-          [ -n "$IMAGE_REGISTRY_TOKEN_BUILD" ] || { echo "::error::IMAGE_REGISTRY_TOKEN_BUILD is not set in the release environment"; exit 1; }
-          find candidate -type f | sort
-          images=""
-          for t in "build-${BUILD_ID}-amd64" "build-${BUILD_ID}-arm64" "build-${BUILD_ID}"; do
-            d=$(skopeo inspect --raw --creds "${IMAGE_REGISTRY_USER}:${IMAGE_REGISTRY_TOKEN_BUILD}" \
-                  "docker://${BUILD_IMAGE}:${t}" | sha256sum | cut -d' ' -f1)
-            images="$images ${t}=sha256:${d}"
+          for d in "$AMD64" "$ARM64" "$LIST"; do
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::an image digest is missing from the image-manifest job (${d:-nothing})"; exit 1; }
           done
+          find candidate -type f | sort
+          images="build-${BUILD_ID}-amd64=${AMD64} build-${BUILD_ID}-arm64=${ARM64} build-${BUILD_ID}=${LIST}"
           scripts/release/candidate_manifest.sh write candidate "$BUILD_ID" "$GITHUB_SHA" "$RUN_NUMBER" "$GITHUB_RUN_ID" $images
           scripts/release/candidate_manifest.sh sign candidate
           scripts/release/candidate_manifest.sh verify candidate "$BUILD_ID"
