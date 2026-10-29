@@ -412,15 +412,19 @@ jobs:
           PUBLIC_TOKEN: ${{ secrets.PUBLIC_TOKEN }}
         run: |
           set -euo pipefail
-          if GH_TOKEN="$PUBLIC_TOKEN" gh release view "$TAG" -R "$PUBLIC_REPO" >/dev/null 2>&1; then
-            echo "${TAG} is already published on ${PUBLIC_REPO}"
-            exit 0
-          fi
           # The files, title and notes of the prerelease here, exactly.
           gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D files
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json name --jq .name > title.txt
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
           ls -l files
+          # One an earlier attempt left part way is completed in place: every
+          # file is uploaded again, replacing what is there.
+          if GH_TOKEN="$PUBLIC_TOKEN" gh release view "$TAG" -R "$PUBLIC_REPO" >/dev/null 2>&1; then
+            GH_TOKEN="$PUBLIC_TOKEN" gh release upload "$TAG" -R "$PUBLIC_REPO" --clobber files/* || {
+              echo "::warning::could not complete ${TAG} on ${PUBLIC_REPO}"; exit 1; }
+            echo "${TAG} was on ${PUBLIC_REPO}; its files are now complete"
+            exit 0
+          fi
           GH_TOKEN="$PUBLIC_TOKEN" gh release create "$TAG" -R "$PUBLIC_REPO" --verify-tag --prerelease \
             --title "$(cat title.txt)" --notes-file notes.md files/* || {
             echo "::warning::could not publish ${TAG} on ${PUBLIC_REPO}"; exit 1; }

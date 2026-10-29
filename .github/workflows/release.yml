@@ -1096,11 +1096,17 @@ jobs:
             unsigned="**The Windows installer in this release is not code-signed.** Windows SmartScreen will warn that the publisher is unrecognised; the download is still the artifact this workflow built, and its checksum is in the release assets."
             notes="${notes}"$'\n\n'"${unsigned}"
           fi
-          gh release create "release-${VERSION}" -R "$GITHUB_REPOSITORY" --verify-tag \
-            --title "release-${VERSION}" \
-            --notes "$notes" \
-            dist/linux-*/*.tar.gz dist/linux-*/*.sha256 dist/windows-x64/*-setup.exe \
-            dist/windows-x64/openchime.debug
+          files=(dist/linux-*/*.tar.gz dist/linux-*/*.sha256 dist/windows-x64/*-setup.exe dist/windows-x64/openchime.debug)
+          # A re-run finds the release an earlier attempt made, perhaps with only
+          # some of its files: it is completed in place, never created twice.
+          if gh release view "release-${VERSION}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "release-${VERSION}" -R "$GITHUB_REPOSITORY" --title "release-${VERSION}" --notes "$notes"
+            gh release upload "release-${VERSION}" -R "$GITHUB_REPOSITORY" --clobber "${files[@]}"
+            echo "release-${VERSION} existed; its notes and files are now this build's"
+          else
+            gh release create "release-${VERSION}" -R "$GITHUB_REPOSITORY" --verify-tag \
+              --title "release-${VERSION}" --notes "$notes" "${files[@]}"
+          fi
 
       # The build's image becomes the release's: `skopeo copy` copies the
       # manifest list :build-<id> from the build repository, where the build
@@ -1182,8 +1188,10 @@ jobs:
         if: ${{ !inputs.skip_repo_smoke }}
         run: |
           set -euo pipefail
-          sudo curl -fsSL "$DIST_VERIFY_URL/openchime-archive-keyring.gpg" \
-            -o /usr/share/keyrings/openchime-archive-keyring.gpg
+          # Fetched unprivileged, so the retrying curl (.github/net-retry.bash)
+          # does it, then put in place with sudo.
+          curl -fsSL "$DIST_VERIFY_URL/openchime-archive-keyring.gpg" -o "$RUNNER_TEMP/keyring.gpg"
+          sudo install -m 0644 "$RUNNER_TEMP/keyring.gpg" /usr/share/keyrings/openchime-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] $DIST_VERIFY_URL/apt stable main" \
             | sudo tee /etc/apt/sources.list.d/openchime.list >/dev/null
           # Through apt.sh: the index fetched first (install alone can find
@@ -1494,15 +1502,19 @@ jobs:
           PUBLIC_TOKEN: ${{ secrets.PUBLIC_TOKEN }}
         run: |
           set -euo pipefail
-          if GH_TOKEN="$PUBLIC_TOKEN" gh release view "release-${N}" -R "$PUBLIC_REPO" >/dev/null 2>&1; then
-            echo "release-${N} is already published on ${PUBLIC_REPO}"
-            exit 0
-          fi
           # The files, title and notes of release-N here, exactly.
           gh release download "release-${N}" -R "$GITHUB_REPOSITORY" -D files
           gh release view "release-${N}" -R "$GITHUB_REPOSITORY" --json name --jq .name > title.txt
           gh release view "release-${N}" -R "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
           ls -l files
+          # One an earlier attempt left part way is completed in place: every
+          # file is uploaded again, replacing what is there.
+          if GH_TOKEN="$PUBLIC_TOKEN" gh release view "release-${N}" -R "$PUBLIC_REPO" >/dev/null 2>&1; then
+            GH_TOKEN="$PUBLIC_TOKEN" gh release upload "release-${N}" -R "$PUBLIC_REPO" --clobber files/* || {
+              echo "::warning::could not complete release-${N} on ${PUBLIC_REPO}"; exit 1; }
+            echo "release-${N} was on ${PUBLIC_REPO}; its files are now complete"
+            exit 0
+          fi
           GH_TOKEN="$PUBLIC_TOKEN" gh release create "release-${N}" -R "$PUBLIC_REPO" --verify-tag \
             --title "$(cat title.txt)" --notes-file notes.md files/* || {
             echo "::warning::could not publish release-${N} on ${PUBLIC_REPO}"; exit 1; }
