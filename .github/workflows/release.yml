@@ -17,7 +17,9 @@
 #   dnf/yum  RHEL family, GPG-signed repository in object storage
 #   tarball  everyone else, and the offline case -- attached to the GitHub release
 #   image    the build's image, copied to :N and :latest in the build
-#            repository (IMAGE_REPO_BUILD) and, when set, IMAGE_REPO_EXTRA
+#            repository (IMAGE_REPO_BUILD) and, when set, IMAGE_REPO_EXTRA;
+#            and to :rc in the build repository alone, which a
+#            release-candidate moved and which never trails :latest
 #   windows  the client, not the daemon: an installer attached to the GitHub
 #            release (signed when Artifact Signing is configured), and an
 #            MSIX for the Store
@@ -1118,6 +1120,9 @@ jobs:
       # repository each copy proves the build's digest from skopeo's own report
       # (scripts/release/copy_image.sh), and :latest is copied from the build by
       # digest only after :N is, so :latest never names an unverified image.
+      # Then :rc, in the build repository alone: release-candidate.yml moves it
+      # to each newest candidate, and the release moves it on to itself, so
+      # what follows :rc never runs older than :latest.
       # Nothing reads back a tag just written: a registry does not always serve
       # a tag the moment its push finishes. Basic auth: IMAGE_REGISTRY_USER and
       # each one's token.
@@ -1138,6 +1143,8 @@ jobs:
           }
           release_image "$BUILD_IMAGE" "$BUILD_CREDS"
           if [ -n "$EXTRA_IMAGE" ]; then release_image "$EXTRA_IMAGE" "$EXTRA_CREDS"; fi
+          scripts/release/copy_image.sh "$BUILD_CREDS" "${BUILD_IMAGE}@sha256:${want}" "$BUILD_CREDS" "${BUILD_IMAGE}:rc" >/dev/null
+          echo "${BUILD_IMAGE}: rc -> build-${BUILD_ID} (sha256:${want})"
 
       - name: Summary
         if: always()

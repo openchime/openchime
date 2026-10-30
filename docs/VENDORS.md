@@ -341,8 +341,9 @@ is the upstream's own stability contract for a base OS.
   host's daemon uses the system cc.
 - **buildah / podman / skopeo** — **staging build, release-candidate and
   release only**. Build, start and push the OCI image (the staging build),
-  check its digest (the release-candidate), copy it to its released tags and
-  move the `:latest` tag (the release), daemonlessly.
+  check its digest and copy it to `:N-rcK` and `:rc` (the release-candidate),
+  copy it to its released tags and move the `:latest` and `:rc` tags (the
+  release), daemonlessly.
 - **Docker and Docker Compose are NOT used**, anywhere, by anything — not to
   build, not to test, not locally, not in CI. This is a standing constraint;
   see ARCH-36 and the header of `.github/workflows/staging-build.yml`.
