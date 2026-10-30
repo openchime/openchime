@@ -102,7 +102,7 @@ Locally, and in about 2 minutes, a pull request needs exactly this:
    only when step 3 rewrote a branch already pushed.
 5. `gh pr create --base staging --title "<the commit's subject>" --body ""`.
 
-After a policy failure on the pull request (`pr policy`, `guard`), fix it, run
+After a policy failure on the pull request (`pr policy`), fix it, run
 step 1 again if anything but the title changed, and push once.
 
 That is all. **The thread sanitizer, the release compiler, the Windows builds
@@ -150,7 +150,7 @@ the change.
 - **Never** add a `Co-Authored-By:` or any attribution trailer naming Claude /
   Anthropic. The attribution scan (`scripts/release/attribution_scan.sh`)
   checks author, committer, and message on every pull request (a step of
-  `pr-policy`, which posts the required check `guard`), over the commits since
+  `pr-policy`, so a match fails the required check `pr policy`), over the commits since
   the last release in the staging build, and over what `promote` puts on
   `main`, and **rejects** matches: the pull request cannot merge, and the staging
   build or the promotion is refused. `main` is never force-pushed, and
@@ -192,9 +192,9 @@ The hooks are on once per clone: `git config core.hooksPath .githooks`
 Nothing runs on a pull request but **`pr policy`**, and nothing runs on a push.
 `pr-policy.yml` checks the pull request's title and body, that the title
 names an open issue, and the tree's issue references (`scripts/check/refs.sh`,
-from the base branch); the attribution scan is a step of it that posts
-**`guard`**. These two are the required checks on `staging`, and the branch
-need not be up to date to merge.
+from the base branch), and its attribution scan is a step of the same job, so
+a banned reference fails it too. **`pr policy`** is the one required check on
+`staging`, and the branch need not be up to date to merge.
 
 The build and the tests run in the **staging build** (`staging-build.yml`),
 dispatched by hand on `staging` for its tip, usually after a few changes have
