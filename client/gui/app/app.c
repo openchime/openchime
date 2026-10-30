@@ -8125,7 +8125,7 @@ static const struct {
      * workspace's place in the rail, counting from 1. Handled in the dispatcher
      * below rather than as nine rows, so this one is the documentation. */
     { 0,                  0,          ACC_NONE,    "Ctrl+1 \u2026 Ctrl+9", "Switch to that workspace" },
-    { AM_CTRL,            'Q',        ACC_QUIT,    "Ctrl+Q",           "Quit OpenChime (closing the window only hides it)" },
+    { AM_CTRL,            'Q',        ACC_QUIT,    "Ctrl+Q",           "Quit OpenChime" },
     { 0,                  OCK_F6,      ACC_FOCUS,   "F6",               "Move focus between the composer and the filter box" },
     { 0,                  0,          ACC_NONE,  "Mouse wheel",        "Scroll the transcript, sidebar or open pane" },
     { 0,                  0,          ACC_NONE,  "Right-click",        "Actions for a message, member or channel" },
@@ -37114,17 +37114,20 @@ static int on_focus_lost(oc_win *hwnd) {
         return 0;
 }
 
-/* The window's close box, or Ctrl+Q. CLOSING HIDES when there is a tray to
- * come back from; quitting asks about unsent messages first. */
+/* The window's close box, or Ctrl+Q (app_quit). Closing quits by default; it
+ * hides instead only when Hide to tray is chosen (REQ-138) and there is a tray
+ * to come back from. Quitting asks about unsent messages first. */
 static int on_close_request(oc_win *hwnd) {
         /* The draft goes with the window. Before anything below, because a
          * decision you reverse still leaves the draft correct. */
         if (g_sel) draft_flush(g_sel);
         if (geom_capture(hwnd) && g_geom_applied) prefs_save();
-        /* CLOSING HIDES. The connection, the clients and every notification go
-         * on running behind the tray icon; quitting is Ctrl+Q or the tray menu.
-         * A chat client that stops notifying the moment its window closes has
-         * stopped being one, which is what this used to do.
+        /* HIDE TO TRAY, when the person chose it (g_pref_close; the default is
+         * to quit, REQ-138). The connection, the clients and every
+         * notification then go on running behind the tray icon; quitting is
+         * Ctrl+Q or the tray menu. That is the option's reason to exist: a chat
+         * client that stops notifying when its window closes has stopped being
+         * one.
          *
          * Only when the tray icon actually exists. If Shell_NotifyIcon failed
          * there is nothing to restore the window from, and hiding would leave a
