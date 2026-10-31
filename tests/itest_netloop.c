@@ -3602,6 +3602,16 @@ static void dev_daemon_stop(struct dev_daemon *d) {
  * terms; the name is checked; and the visitor goes on signed in, to an account
  * no password opens. */
 static void test_demo_signup(void) {
+    /* The run's own values, put back at the end: the suites after this one in
+     * the same process run in development mode (tests/main.c). */
+    static const char *const ENV[] = { "OPENCHIME_MODE", "OPENCHIME_AUTH", "OPENCHIME_ENROLL_URL" };
+    char saved[3][256];
+    int had[3];
+    for (int i = 0; i < 3; i++) {
+        const char *v = getenv(ENV[i]);
+        had[i] = v != NULL;
+        snprintf(saved[i], sizeof saved[i], "%s", v ? v : "");
+    }
     setenv("OPENCHIME_MODE", "demo", 1);
     setenv("OPENCHIME_AUTH", "local,relay", 1);
     setenv("OPENCHIME_ENROLL_URL", "https://central.example", 1);
@@ -3691,9 +3701,10 @@ static void test_demo_signup(void) {
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
     db_unlink("itest_demo.db");
-    unsetenv("OPENCHIME_MODE");
-    unsetenv("OPENCHIME_AUTH");
-    unsetenv("OPENCHIME_ENROLL_URL");
+    for (int i = 0; i < 3; i++) {
+        if (had[i]) setenv(ENV[i], saved[i], 1);
+        else unsetenv(ENV[i]);
+    }
     char cfgerr[128];
     oc_config_load(cfgerr, sizeof cfgerr);
 }

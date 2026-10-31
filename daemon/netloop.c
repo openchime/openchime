@@ -9430,6 +9430,9 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     if (hfd >= 0) close(hfd);
     loop_state_free(conns);
     free(g_live); g_live = NULL; g_nlive = 0;
+    /* The day's demo counts are this loop's: a loop started after it, in
+     * another mode, counts nothing (demolimits.h). */
+    oc_dl_free(g_demo_limits); g_demo_limits = NULL;
     oc_ioloop_stop(g_io);   /* after the closes above: it closes their sockets */
     g_io = NULL;
     oc_idmap_free(&g_by_id);
