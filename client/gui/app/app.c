@@ -32710,17 +32710,45 @@ static void *devlist_thread(void *arg) {
     return NULL;
 }
 
+/* The open confirmation, and which one: the harness answers some of them
+ * (scripts/gui/drive.sh trust_dev_cert, lib.sh sign_in_card), signed in or not. */
+static void test_dump_confirm(FILE *f) {
+    fprintf(f, "confirm open=%d act=%d url=\"%s\"\n", g_confirm_open, g_confirm_act, g_confirm_url);
+}
+
+/* THE TREE ITSELF, one line per element, so a check outside the client
+ * can ask questions this loop cannot. The one it exists for: does
+ * anything actually get DRAWN inside each of these rects? An element
+ * published at coordinates nothing painted is a phantom — the stale
+ * transcript rows were exactly that, and were invisible to every check
+ * here because they were internally consistent. Comparing the published
+ * tree against the paint ledger catches the whole class rather than the
+ * instance. It is also where the harness finds a button to press. */
+static void test_dump_a11y(FILE *f) {
+    for (int i = 0; i < g_a11y_n; i++) {
+        const oc_acc_item *a = &g_acc_items[i];
+        fprintf(f, "a11yitem %s %d %d %d %d\n", a->aid[0] ? a->aid : "-",
+                a->l, a->t, a->r, a->b);
+    }
+}
+
 static void test_dump(const char *path) {
     const oc_model *m = model();
     FILE *f = fopen(path, "wb"); if (!f) return;
     if (!m) {
-        /* Not signed in: the sign-in card's state is what there is to see. */
-        fprintf(f, "no model\nview=%d wsbook=%d\nsignin step=%d browser=%d connecting=%d err=%s\n",
-                g_view, ws_book_count(), g_si_step, g_si_browser, g_si_connecting, g_si_err);
+        /* Not signed in: the sign-in card's state is what there is to see --
+         * and whatever it asks over itself. A self-signed certificate is put to
+         * the person before sign-in, and the harness answers it from the
+         * confirmation, the button's rectangle and the DPI to scale it by; a
+         * dump without them left every Windows script stuck at launch. */
+        fprintf(f, "no model\nview=%d wsbook=%d dpi=%u\nsignin step=%d browser=%d connecting=%d err=%s\n",
+                g_view, ws_book_count(), g_dpi, g_si_step, g_si_browser, g_si_connecting, g_si_err);
         if (g_si_client) {
             const oc_model *sm = oc_client_model(g_si_client);
             if (sm) fprintf(f, "signin last_error=%s signin_url=%.120s\n", sm->last_error, sm->signin_url);
         }
+        test_dump_confirm(f);
+        test_dump_a11y(f);
         fclose(f); return;
     }
     fprintf(f, "mode=%s\n", oc_env_is_dev() ? "development" : "normal");
@@ -33737,19 +33765,7 @@ static void test_dump(const char *path) {
                    "ov=\"%s\" out=\"%s\" dupid=\"%s\" clip=\"%s\" clippx=%.0f\n",
                 overlaps, outside, dup, g_clip_n, g_a11y_n,
                 first_ov, first_out, first_dup, g_clip_first, g_clip_worst);
-        /* THE TREE ITSELF, one line per element, so a check outside the client
-         * can ask questions this loop cannot. The one it exists for: does
-         * anything actually get DRAWN inside each of these rects? An element
-         * published at coordinates nothing painted is a phantom — the stale
-         * transcript rows were exactly that, and were invisible to every check
-         * here because they were internally consistent. Comparing the published
-         * tree against the paint ledger catches the whole class rather than the
-         * instance. */
-        for (int i = 0; i < g_a11y_n; i++) {
-            const oc_acc_item *a = &g_acc_items[i];
-            fprintf(f, "a11yitem %s %d %d %d %d\n", a->aid[0] ? a->aid : "-",
-                    a->l, a->t, a->r, a->b);
-        }
+        test_dump_a11y(f);   /* the tree itself, one line per element */
     }
     /* ARCH-108: the pinned metrics, checked, not remembered — the live
      * line_h/baseline pairs per token, plus a real render probe that the two
@@ -33946,7 +33962,7 @@ static void test_dump(const char *path) {
     }
     fprintf(f, "link hover=\"%s\" labelled=%d chan=%llu\n", g_link_hover, g_link_hover_lab,
             (unsigned long long)g_chan_hover);
-    fprintf(f, "confirm open=%d act=%d url=\"%s\"\n", g_confirm_open, g_confirm_act, g_confirm_url);
+    test_dump_confirm(f);
     /* What the client last put on the clipboard, escaped onto one line (\t \r
      * \n \" \\): Copy table's TSV is only checkable as the bytes it handed
      * over. */
