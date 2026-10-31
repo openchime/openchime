@@ -3788,6 +3788,74 @@ static void test_voice_input_absent(int by_env) {
     db_unlink("itest_stt_off.db");
 }
 
+/* Read-aloud not running (READ-ALOUD.md §6): with no engine set -- the way the
+ * test build stands in for a daemon built without it, which refuses through the
+ * same code -- a message's speech and a voice's preview are each refused
+ * TTS_UNAVAILABLE, naming the message asked about (0 for the preview), and the
+ * connection stays open: the next request on it is answered. */
+static void test_read_aloud_absent(void) {
+    oc_netloop_set_tts(NULL);
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
+    db_unlink("itest_tts_off.db");
+    oc_dbwriter *dbw2 = oc_dbwriter_start(tpath("itest_tts_off.db"));
+    if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
+    CHECK(dbw2 != NULL);
+    CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
+    struct loop_arg arg2;
+    pthread_t th2;
+    int port = start_loop(&arg2, &th2, &srv2, dbw2, 0);
+    CHECK(port != 0);
+
+    client a;
+    CHECK(client_open(&a, port, pin2) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    uint64_t mid = say_something(&a, OC_DEFAULT_CHANNEL, "Nobody will hear this.", 0x73);
+    CHECK(mid != 0);
+
+    /* Each refusal names what was asked for. */
+    for (int k = 0; k < 2; k++) {
+        uint8_t buf[128];
+        oc_wbuf w;
+        oc_wbuf_init(&w, buf, sizeof buf);
+        if (k == 0) {
+            oc_audio_get ag = { mid };
+            CHECK(oc_encode_audio_get(&w, OC_PROTOCOL_VERSION, &ag) == OC_OK);
+        } else {
+            oc_voice_preview_get vp = { oc_slice_str("test-voice-f") };
+            CHECK(oc_encode_voice_preview_get(&w, OC_PROTOCOL_VERSION, &vp) == OC_OK);
+        }
+        CHECK(send_frame(&a, buf, w.len) == 0);
+        oc_header hdr;
+        oc_rbuf p;
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        CHECK(hdr.msg_type == OC_MSG_ERROR);
+        oc_error e;
+        CHECK(oc_decode_error(&p, &e) == OC_OK);
+        CHECK(e.code == OC_ERR_TTS_UNAVAILABLE && !e.fatal && e.context.len == 8);
+        uint64_t named = 0;
+        for (size_t i = 0; e.context.len == 8 && i < 8; i++) named = named << 8 | e.context.ptr[i];
+        CHECK(named == (k == 0 ? mid : 0));
+    }
+    /* And by the helpers a listener uses, asked again on the same connection. */
+    uint16_t code = 0;
+    CHECK(fetch_audio(&a, mid, NULL, &code) == 0 && code == OC_ERR_TTS_UNAVAILABLE);
+    CHECK(fetch_preview(&a, "test-voice-f", NULL, &code) == 0 && code == OC_ERR_TTS_UNAVAILABLE);
+    /* Still open: the next request is answered. */
+    CHECK(say_something(&a, OC_DEFAULT_CHANNEL, "Typed instead.", 0x74) != 0);
+    client_close(&a);
+
+    stop_loop(&arg2, th2);
+    oc_dbwriter_stop(dbw2);
+    oc_tls_server_free(&srv2);
+    oc_netloop_set_tts(&STUB_TTS);
+    db_unlink("itest_tts_off.db");
+}
+
 /* Summaries over the wire (REQ-310, ARCH-116): the "summarize" capability is
  * told only when the worker is wired; a SUMMARIZE is built by the worker (a stub
  * model here) and answered with SUMMARY; asked again it comes from the store
@@ -7556,6 +7624,7 @@ int run_netloop_tests(void) {
      * shared loop's tests, passed or not. */
     test_voice_input_absent(1);
     test_voice_input_absent(0);
+    test_read_aloud_absent();
     test_summaries();
     test_web_signin();
     test_device_signin();

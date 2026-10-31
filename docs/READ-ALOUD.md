@@ -186,7 +186,10 @@ Full layouts in PROTOCOL.md §5.14b.
   `AUDIO_CHUNK` / `AUDIO_END`, with message id 0: the preview sentence in that voice,
   rendered once and cached for everyone.
 - **Errors:** `3023 NOT_RENDERABLE` (nothing to say), `3024 TTS_UNAVAILABLE` (read-aloud off,
-  or the queue is full, or the render failed).
+  or the queue is full, or the render failed). A daemon built without read-aloud answers
+  `AUDIO_GET` and `VOICE_PREVIEW_GET` the same way as one built with it and turned off:
+  `TTS_UNAVAILABLE`, naming the message asked about (0 for a preview), and the connection
+  stays open.
 - **Profile:** `SET_PROFILE`, `PROFILE_INFO` and `USER_LIST` carry `voice_id`.
 
 ## 7. The client

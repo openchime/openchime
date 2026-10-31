@@ -2521,9 +2521,9 @@ static void stt_drop_conn(uint64_t conn_id) {
 
 /* --- Attachment transfer (REQ-140/141, ARCH-69) ------------------------- */
 
-#ifdef OC_TTS
 static int send_transfer_error(conn *c, uint64_t aid, uint16_t code);
 
+#ifdef OC_TTS
 /* Start streaming a stored rendering: open the blob, then AUDIO_INFO and the
  * pump, exactly as an attachment download does (ARCH-69). Returns -1 if the
  * connection was told about a failure instead. */
@@ -2595,6 +2595,20 @@ static int send_transfer_error(conn *c, uint64_t aid, uint16_t code) {
     int rc = out_append(c, tmp, w.len);
     xfer_reset(&c->xfer);
     return rc;
+}
+
+/* Read-aloud is not running here -- not built in, or built in with no engine --
+ * so a request for speech is refused by name and the connection stays open, the
+ * same answer from either build (READ-ALOUD.md §6). Preview is message 0. The
+ * frame is send_transfer_error's, but nothing was started, so a download already
+ * running on the connection is left alone. */
+static int tts_refuse(conn *c, uint64_t message_id) {
+    uint8_t ctxb[8];
+    for (int i = 0; i < 8; i++) ctxb[i] = (uint8_t)(message_id >> (56 - 8 * i));
+    uint8_t tmp[96]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
+    oc_error e = { OC_ERR_TTS_UNAVAILABLE, 0, { ctxb, 8 }, oc_slice_str("transfer error") };
+    oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+    return out_append(c, tmp, w.len);
 }
 
 /* Ask the pool for the next slice of the blob, if the output buffer has room.
@@ -4506,14 +4520,11 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_AUDIO_GET) {
             oc_audio_get ag;
             if (oc_decode_audio_get(&p, &ag) != OC_OK) return -1;
-            c->xfer.audio_message_id = ag.message_id;
             if (!g_tts) {
-                c->xfer.audio = 1;                       /* so the error names the message */
-                int rc = send_transfer_error(c, ag.message_id, OC_ERR_TTS_UNAVAILABLE);
-                c->xfer.audio = 0;
-                if (rc != 0) return -1;
+                if (tts_refuse(c, ag.message_id) != 0) return -1;
                 continue;
             }
+            c->xfer.audio_message_id = ag.message_id;
             /* One transfer at a time on a connection, as for an attachment: the
              * pump and its backpressure are per connection, not per request. */
             if (c->xfer.state != XFER_NONE) {
@@ -4551,6 +4562,10 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_VOICE_PREVIEW_GET) {
             oc_voice_preview_get vp;
             if (oc_decode_voice_preview_get(&p, &vp) != OC_OK) return -1;
+            if (!g_tts) {
+                if (tts_refuse(c, 0) != 0) return -1;
+                continue;
+            }
             if (c->xfer.state != XFER_NONE) {
                 /* Busy with another download -- most often the next message being
                  * read aloud. Refuse the preview WITHOUT touching that transfer:
@@ -4575,8 +4590,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 }
             }
             const char *preview = g_tts_engine && g_tts_engine->preview ? g_tts_engine->preview : "";
-            int refuse = !g_tts ? OC_ERR_TTS_UNAVAILABLE
-                       : voice < 0 || !preview[0] ? OC_ERR_TTS_UNAVAILABLE
+            int refuse = voice < 0 || !preview[0] ? OC_ERR_TTS_UNAVAILABLE
                        : !audio_rate_ok(c) ? OC_ERR_TTS_UNAVAILABLE : 0;
             if (refuse) {                              /* nothing in flight to disturb */
                 if (send_transfer_error(c, 0, (uint16_t)refuse) != 0) return -1;
@@ -4593,6 +4607,21 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             xfer_submit(dbw, &c->xfer, j);
             c->xfer.audio = 1;
             c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
+            continue;
+        }
+#else
+        /* Read-aloud is not built in: the same refusal a daemon built with it
+         * gives when it has no engine, not the unknown-frame close below. */
+        if (hdr.msg_type == OC_MSG_AUDIO_GET) {
+            oc_audio_get ag;
+            if (oc_decode_audio_get(&p, &ag) != OC_OK) return -1;
+            if (tts_refuse(c, ag.message_id) != 0) return -1;
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_VOICE_PREVIEW_GET) {
+            oc_voice_preview_get vp;
+            if (oc_decode_voice_preview_get(&p, &vp) != OC_OK) return -1;
+            if (tts_refuse(c, 0) != 0) return -1;
             continue;
         }
 #endif
