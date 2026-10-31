@@ -9227,8 +9227,13 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     if (!indexed) NETLOOP_FAIL("allocating the connection indexes");
     /* The I/O threads (ARCH-22): every accepted socket is theirs from here. */
     sites_init();
-    /* A demo workspace counts its day (demolimits.h). */
-    if (oc_config_get()->mode == OC_MODE_DEMO && !g_demo_limits) g_demo_limits = oc_dl_new();
+    /* A demo workspace counts its day (demolimits.h). The loop that makes the
+     * counts frees them when it stops; no other loop touches them. */
+    int own_demo_limits = 0;
+    if (oc_config_get()->mode == OC_MODE_DEMO && !g_demo_limits) {
+        g_demo_limits = oc_dl_new();
+        own_demo_limits = 1;
+    }
     g_io = indexed ? oc_ioloop_start(OC_IO_THREADS, tls, trusted, &g_tls_site, &g_health_site) : NULL;
     int iofd = -1;
     if (indexed && !g_io) { NETLOOP_FAIL("starting the I/O threads"); indexed = 0; }
@@ -9431,8 +9436,9 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     loop_state_free(conns);
     free(g_live); g_live = NULL; g_nlive = 0;
     /* The day's demo counts are this loop's: a loop started after it, in
-     * another mode, counts nothing (demolimits.h). */
-    oc_dl_free(g_demo_limits); g_demo_limits = NULL;
+     * another mode, counts nothing (demolimits.h). Only the loop that made
+     * them clears them, so a loop that never did writes nothing here. */
+    if (own_demo_limits) { oc_dl_free(g_demo_limits); g_demo_limits = NULL; }
     oc_ioloop_stop(g_io);   /* after the closes above: it closes their sockets */
     g_io = NULL;
     oc_idmap_free(&g_by_id);
