@@ -2059,6 +2059,8 @@ client always folds a complete picture rather than a delta.
 
     level (u8)
 
+A level above `2` (none) is refused with a non-fatal `ERROR MALFORMED_FRAME` (1003), and the default is left as it was.
+
 **`SET_MUTE` (C → S), `0x006D`** — Mute or unmute one conversation for the calling user. (REQ-137)
 
     channel_id (u64), muted (u8)
@@ -3086,7 +3088,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 |--------|-----------------------|------------|-------|----------------------------------------------------------------|
 | `1001` | `VERSION_TOO_OLD`     | handshake  | yes   | Client's `max_version` < server minimum. Show "please update." |
 | `1002` | `VERSION_TOO_NEW`     | handshake  | yes   | Client's `min_version` > server maximum. Operator must upgrade the daemon; do **not** prompt the user to update the app. |
-| `1003` | `MALFORMED_FRAME`     | any        | see note | A `HELLO` that does not decode (fatal, as `REJECT`); non-fatal for a custom-emoji name out of bounds (`ADD_EMOJI`/`DELETE_EMOJI`) or a group DM of fewer than three people. Any other frame that does not decode closes the connection without an `ERROR`. |
+| `1003` | `MALFORMED_FRAME`     | any        | see note | A `HELLO` that does not decode (fatal, as `REJECT`); non-fatal for a custom-emoji name out of bounds (`ADD_EMOJI`/`DELETE_EMOJI`), a group DM of fewer than three people, or a `SET_NOTIFY_DEFAULT` level out of range. Any other frame that does not decode closes the connection without an `ERROR`. |
 | `1004` | `FRAME_TOO_LARGE`     | any        | yes   | Reserved: a `length` implying a frame larger than `MAX_FRAME_SIZE`. The daemon closes the connection without sending it. |
 | `1005` | `UNEXPECTED_MSG_TYPE` | any        | yes   | A frame not valid in the current state: a non-`HELLO` first frame (sent as `REJECT`, since no version is negotiated yet) or a post-auth type this version does not define (sent as `ERROR`). A `SEND` before `AUTH_OK` gets the more specific `AUTH_REQUIRED` instead. |
 | `1006` | `VERSION_MISMATCH`    | post-hello | yes   | A post-handshake frame carried a `version` other than the negotiated one. Distinct from `1001`/`1002`, which answer a `HELLO` and precede a session: this says the peer agreed and then sent something else. The `ERROR` itself is stamped with the negotiated version, so it is readable by the peer being disconnected. |

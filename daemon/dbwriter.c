@@ -8358,7 +8358,7 @@ static oc_dbres *process_set_notify_default(sqlite3 *db, const oc_job *j) {
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     if (j->notify_level > OC_NOTIFY_NONE) {
-        r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_E_MALFORMED; r->user_id = j->user_id; return r;
+        r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_MALFORMED_FRAME; r->user_id = j->user_id; return r;
     }
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db, "UPDATE users SET notify_default=? WHERE id=?;", -1, &st, NULL);

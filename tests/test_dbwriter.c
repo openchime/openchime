@@ -6689,7 +6689,7 @@ static void test_notify_prefs(void) {
     j->user_id = alice; j->notify_level = 9;
     oc_dbwriter_submit(w, j);
     r = wait_result(w);
-    CHECK(r && r->type == OC_RES_NOTIFY_ERR);
+    CHECK(r && r->type == OC_RES_NOTIFY_ERR && r->err_code == OC_ERR_MALFORMED_FRAME);   /* a code the wire knows */
     oc_dbres_free(r);
 
     j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 11);
