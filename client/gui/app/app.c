@@ -1896,7 +1896,10 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
        CONF_CHANNEL_ARCHIVE, CONF_WS_FORGET,
        CONF_CHANNEL_PRIVATE, CONF_CHANNEL_PUBLIC, CONF_MENTION_ADD, CONF_DRAFT_DELETE,
        CONF_GROUP_DELETE, CONF_CHANNEL_GROUP_REMOVE, CONF_LINK_OPEN, CONF_CERT_TRUST,
-       CONF_PDM_TRUST, CONF_PDM_SAFETY };
+       CONF_PDM_TRUST, CONF_PDM_SAFETY,
+       /* New ones go last: the dump's `confirm act=` is this number, and the
+        * GUI harness reads it (CONF_CERT_TRUST is act=13 to scripts/gui). */
+       CONF_WS_FORGET_ALL };
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 
@@ -1924,6 +1927,7 @@ static struct {
 /* Copy fingerprint, and View certificate: the question's two footer actions. */
 enum { CERT_CMD_COPY = 2700, CERT_CMD_VIEW = 2701 };
 enum { ABOUT_CMD_COPY = 2702 };
+enum { WSM_CMD_REMOVE_ALL = 2703 };   /* the Workspaces footer's Remove all */
 static float cert_q_body(gfx *rt, rectf body);   /* fwd */
 
 static char     g_confirm_body[640];
@@ -2002,6 +2006,17 @@ static rectf g_wsmgr_list;
  * scroll it into view -- the geometry only exists there. */
 static int g_wsmgr_focus = -1, g_wsmgr_reveal;
 enum { WSM_GO = 0, WSM_SIGNOUT, WSM_FORGET };
+
+/* MB_DANGER is pushed to the far LEFT, away from a form's Save — a destructive
+ * button beside the commit is a misclick waiting to happen. MB_DANGER_PRIMARY is for
+ * a CONFIRMATION, where the destructive action *is* the affirmative: it sits in the
+ * primary slot on the right, because putting Cancel there and "Revoke" on the far
+ * left reads as though Cancel were the thing being asked for. */
+enum { MB_NORMAL = 0, MB_PRIMARY, MB_DANGER, MB_DANGER_PRIMARY };
+/* A dialog button, as the modal footer draws it (modal_button); its width for a
+ * label (btn_width). The Workspaces rows draw theirs the same way. */
+static float btn_width(const char *label);   /* fwd */
+static void  modal_button(gfx *rt, rectf r, const char *label, int kind);   /* fwd */
 
 /* Notification-prefs review + the shortcut sheet. */
 static int g_notify_open, g_keys_open;
@@ -2329,6 +2344,7 @@ static void signin_begin_known(oc_win *hwnd, const char *ws, const char *user); 
 static void sw_book_load(void);      /* fwd */
 static void ws_forget(const char *ws);   /* fwd */
 static void ws_forget_begin(const char *ws);   /* fwd */
+static void ws_forget_all(void);   /* fwd */
 
 static struct { char ws[256], label[80], user[80]; int current; } g_sw[16];
 static int   g_n_sw;
@@ -9909,8 +9925,9 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
      * footer and everything after it could not be reached by any means. The
      * shared overlay offset is what the wheel already drives for a modal, and it
      * belongs to this list until another one claims it -- a confirmation does
-     * not, which is what keeps the position across Remove. */
-    rectf list = rf(body.left, body.top + UIS(28), body.right, body.bottom);
+     * not, which is what keeps the position across Remove. It starts under the
+     * header: the frame's subtitle is the dialog's only header. */
+    rectf list = body;
     if (list.bottom < list.top) list.bottom = list.top;
     g_wsmgr_list = list;
     if (g_wsmgr_focus >= g_n_sw) g_wsmgr_focus = g_n_sw - 1;
@@ -9923,43 +9940,32 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
     g_wsmgr_reveal = 0;
     float y = ovl_begin(rt, list, (float)g_n_sw * rowh + 12);
 
+    /* A row is laid out from what it holds, not from fixed offsets: the
+     * highlight, and the divider under it, span the same width; the two lines
+     * and the buttons are centred in the row's height; the name and its state
+     * take the width up to the buttons. Fixed clip points cut "current" to
+     * "cur..." beside a long name with room to spare. */
+    float hl_l = body.left + UIS(8), hl_r = body.right - UIS(12);
+    float pad = UIS(12), bh = 32;   /* bh: the footer's button height */
+    float l1 = g_ui_b->line_h, l2 = g_meta->line_h;
     for (int i = 0; i < g_n_sw; i++) {
         int slot = ws_find(g_sw[i].ws);
         int live = (slot >= 0 && g_wss[slot].client);
         if (i == g_wsmgr_focus)
-            fill_round(rt, rf(body.left + 12, y + 2, body.right - 16, y + rowh - 3),
-                       OC_R_CONTROL, OC_COL_HOVER);
-        draw_text(rt, g_sw[i].label, g_ui_b, rf(body.left + 24, y, body.left + 300, y + 22), OC_COL_TEXT);
-        /* State on the sub-line rather than its own column: as a column it
-         * collided with the buttons whenever the pane was narrow. */
-        const char *state = g_sw[i].current ? "current" : live ? "connected" : "signed out";
-        uint32_t sc = g_sw[i].current ? OC_COL_ACCENT : live ? OC_COL_ONLINE : OC_COL_FAINT;
-        draw_text(rt, state, g_meta,
-                  baseline_align(rf(body.left + 24, y, body.left + 300, y + 22),
-                                 g_ui_b, g_meta,
-                                 body.left + 24 + text_width(g_sw[i].label, g_ui_b) + 12,
-                                 body.left + 340), sc);
-        char sub[320];
-        snprintf(sub, sizeof sub, "%s%s%s", g_sw[i].ws,
-                 g_sw[i].user[0] ? "  \u00b7  " : "", g_sw[i].user);
-        draw_text(rt, sub, g_meta, rf(body.left + 24, y + 20, body.left + 340, y + 40), OC_COL_FAINT);
+            fill_round(rt, rf(hl_l, y + 2, hl_r, y + rowh - 2), OC_R_CONTROL, OC_COL_HOVER);
 
-        /* Buttons right-aligned, built right-to-left so widths can vary. */
-        float bx = body.right - 24;
-        struct { const char *lbl; int act; uint32_t col; } B[2];
+        /* Buttons right-aligned, built right-to-left so widths can vary: the
+         * dialog's own buttons (modal_button), so they read as one control. */
+        float bx = hl_r - pad, by = y + (rowh - bh) / 2;
+        struct { const char *lbl; int act; int kind; } B[2];
         int nb = 0;
-        B[nb].lbl = "Remove"; B[nb].act = WSM_FORGET; B[nb].col = OC_COL_DANGER; nb++;
-        if (live && !g_sw[i].current) { B[nb].lbl = "Switch to"; B[nb].act = WSM_GO; B[nb].col = OC_COL_MUTED; nb++; }
-        else if (live)                { B[nb].lbl = "Sign out";  B[nb].act = WSM_SIGNOUT; B[nb].col = OC_COL_MUTED; nb++; }
-        else                          { B[nb].lbl = "Sign in";   B[nb].act = WSM_GO; B[nb].col = OC_COL_MUTED; nb++; }
+        B[nb].lbl = "Remove"; B[nb].act = WSM_FORGET; B[nb].kind = MB_DANGER; nb++;
+        if (live && !g_sw[i].current) { B[nb].lbl = "Switch to"; B[nb].act = WSM_GO; B[nb].kind = MB_NORMAL; nb++; }
+        else if (live)                { B[nb].lbl = "Sign out";  B[nb].act = WSM_SIGNOUT; B[nb].kind = MB_NORMAL; nb++; }
+        else                          { B[nb].lbl = "Sign in";   B[nb].act = WSM_GO; B[nb].kind = MB_NORMAL; nb++; }
         for (int k = 0; k < nb; k++) {
-            float bw = text_width(B[k].lbl, g_meta) + 24;
-            rectf b = rf(bx - bw, y + 8, bx, y + 34);
-            fill_round(rt, b, OC_R_CONTROL, OC_COL_INPUT);
-            stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-            g_meta->align = ST_ALIGN_CENTER;
-            draw_text(rt, B[k].lbl, g_meta, b, B[k].col);
-            g_meta->align = ST_ALIGN_LEFT;
+            rectf b = rf(bx - btn_width(B[k].lbl), by, bx, by + bh);
+            modal_button(rt, b, B[k].lbl, B[k].kind);
             if (g_n_wsmgr_hits < (int)(sizeof g_wsmgr_hits / sizeof g_wsmgr_hits[0])) {
                 g_wsmgr_hits[g_n_wsmgr_hits].r = b;
                 g_wsmgr_hits[g_n_wsmgr_hits].row = i;
@@ -9968,7 +9974,26 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
             }
             bx = b.left - 8;
         }
-        fill(rt, rf(body.left + 24, y + rowh - 1, body.right - 24, y + rowh), OC_COL_BORDER);
+
+        /* The name, then its state on the name's baseline, then the address
+         * and account under them; all of it left of the buttons. The state is
+         * drawn whole: a long name gives way to it, not the other way round. */
+        float tx = hl_l + pad, tr = bx - pad, ty = y + (rowh - l1 - l2) / 2;
+        const char *state = g_sw[i].current ? "current" : live ? "connected" : "signed out";
+        uint32_t sc = g_sw[i].current ? OC_COL_ACCENT : live ? OC_COL_ONLINE : OC_COL_FAINT;
+        float sw = text_width(state, g_meta), gap = UIS(10);
+        float nr = tx + text_width(g_sw[i].label, g_ui_b);
+        if (nr > tr - gap - sw) nr = tr - gap - sw;
+        if (nr < tx) nr = tx;
+        rectf nrect = rf(tx, ty, nr, ty + l1);
+        draw_text(rt, g_sw[i].label, g_ui_b, nrect, OC_COL_TEXT);
+        draw_text(rt, state, g_meta, baseline_align(nrect, g_ui_b, g_meta, nr + gap, nr + gap + sw + 1), sc);
+        char sub[320];
+        snprintf(sub, sizeof sub, "%s%s%s", g_sw[i].ws,
+                 g_sw[i].user[0] ? "  \u00b7  " : "", g_sw[i].user);
+        draw_text(rt, sub, g_meta, rf(tx, ty + l1, tr, ty + l1 + l2), OC_COL_FAINT);
+
+        fill(rt, rf(hl_l, y + rowh - 1, hl_r, y + rowh), OC_COL_BORDER);
         y += rowh;
     }
     ovl_end(rt, list);
@@ -13810,6 +13835,7 @@ static void confirm_run(oc_win *hwnd) {
      * "1" would have been a plausible-looking change of behaviour smuggled in with
      * a refactor. */
     case CONF_WS_FORGET: ws_forget_begin(g_confirm_ws); break;
+    case CONF_WS_FORGET_ALL: ws_forget_all(); break;
     case CONF_DRAFT_DELETE: draft_delete(g_confirm_id, g_confirm_root); break;
     case CONF_CHANNEL_ARCHIVE: oc_client_update_channel(g_client, g_confirm_id,
                                                         OC_CHUP_ARCHIVE, ""); break;
@@ -13908,12 +13934,6 @@ static void draw_confirm(gfx *rt, rectf body) {
  * a single dismissing button. The frame supports both rather than pretending
  * everything is a settings sheet.
  */
-/* MB_DANGER is pushed to the far LEFT, away from a form's Save — a destructive
- * button beside the commit is a misclick waiting to happen. MB_DANGER_PRIMARY is for
- * a CONFIRMATION, where the destructive action *is* the affirmative: it sits in the
- * primary slot on the right, because putting Cancel there and "Revoke" on the far
- * left reads as though Cancel were the thing being asked for. */
-enum { MB_NORMAL = 0, MB_PRIMARY, MB_DANGER, MB_DANGER_PRIMARY };
 enum { MODAL_SM = 0, MODAL_LG };
 #define MODAL_MAX_BTNS 4
 
@@ -13952,9 +13972,40 @@ enum { MODAL_CANCEL = -2, MODAL_OK = -1 };
 #define MODAL_TITLE_H UIS(52.0f)
 #define MODAL_FOOT_H  UIS(60.0f)
 
+/* What a reader announces for a footer button: its label, except where the
+ * label leans on the dialog around it ("Remove all" of what). */
+static const char *modal_btn_name(const oc_mbtn *b) {
+    return b->cmd == WSM_CMD_REMOVE_ALL ? "Remove all workspaces" : b->label;
+}
+
 static float btn_width(const char *label) {
     float w = text_width(label, g_ui) + 34;
     return w < 88 ? 88 : w;      /* a floor, so "OK" is not a tiny target */
+}
+
+/* One dialog button in rect `r`, of kind MB_*: the footer's, and any dialog's
+ * own buttons that should read as the same control. */
+static void modal_button(gfx *rt, rectf r, const char *label, int kind) {
+    int hot = in_rect(r, (float)g_mouse_x, (float)g_mouse_y);
+    uint32_t tc = OC_COL_TEXT;
+    if (kind == MB_DANGER_PRIMARY) {
+        fill_round(rt, r, OC_R_CONTROL, OC_COL_DANGER);
+        if (hot) stroke_round(rt, r, OC_R_CONTROL, OC_COL_TEXT, 1.0f);
+        tc = 0xFFFFFF;
+    } else if (kind == MB_PRIMARY) {
+        fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_ACCENT_DIM : OC_COL_ACCENT);
+        tc = 0xFFFFFF;
+    } else if (kind == MB_DANGER) {
+        fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+        stroke_round(rt, r, OC_R_CONTROL, OC_COL_DANGER, 1.0f);
+        tc = OC_COL_DANGER;
+    } else {
+        fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+        stroke_round(rt, r, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+    }
+    g_ui->align = ST_ALIGN_CENTER;
+    draw_text(rt, label, g_ui, rf(r.left, r.top + 1, r.right, r.bottom), tc);
+    g_ui->align = ST_ALIGN_LEFT;
 }
 
 /* Draw the frame and return the CONTENT rect, already inset. */
@@ -14056,7 +14107,6 @@ static rectf modal_frame(gfx *rt, const oc_modal_spec *s,
             if (b->kind == MB_DANGER) continue;      /* placed separately, left */
             float bw = btn_width(b->label);
             rectf r = rf(bx - bw, foot_top + 14, bx, foot_top + 46);
-            int hot = in_rect(r, (float)g_mouse_x, (float)g_mouse_y);
             if (b->cmd == g_modal_off_cmd) {
                 /* Not yet: drawn, named for a reader, and no target for a click
                  * or Enter. */
@@ -14068,20 +14118,7 @@ static rectf modal_frame(gfx *rt, const oc_modal_spec *s,
                 bx = r.left - 10;
                 continue;
             }
-            if (b->kind == MB_DANGER_PRIMARY) {
-                fill_round(rt, r, OC_R_CONTROL, OC_COL_DANGER);
-                if (hot) stroke_round(rt, r, OC_R_CONTROL, OC_COL_TEXT, 1.0f);
-            } else if (b->kind == MB_PRIMARY) {
-                fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_ACCENT_DIM : OC_COL_ACCENT);
-            } else {
-                fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
-                stroke_round(rt, r, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-            }
-            g_ui->align = ST_ALIGN_CENTER;
-            draw_text(rt, b->label, g_ui, rf(r.left, r.top + 1, r.right, r.bottom),
-                      (b->kind == MB_PRIMARY || b->kind == MB_DANGER_PRIMARY) ? 0xFFFFFF
-                                                                             : OC_COL_TEXT);
-            g_ui->align = ST_ALIGN_LEFT;
+            modal_button(rt, r, b->label, b->kind);
             if (g_n_modal_btns < MODAL_MAX_BTNS) {
                 g_modal_btns[g_n_modal_btns].r = r;
                 g_modal_btns[g_n_modal_btns].cmd = b->cmd;
@@ -14090,7 +14127,7 @@ static rectf modal_frame(gfx *rt, const oc_modal_spec *s,
                  * button announced as "modal.button.1" tells a screen reader
                  * nothing and a test nothing it did not already know. */
                 snprintf(g_modal_btns[g_n_modal_btns].label,
-                         sizeof g_modal_btns[g_n_modal_btns].label, "%s", b->label);
+                         sizeof g_modal_btns[g_n_modal_btns].label, "%s", modal_btn_name(b));
                 g_n_modal_btns++;
             }
             if (b->kind == MB_PRIMARY || b->kind == MB_DANGER_PRIMARY)
@@ -14105,12 +14142,7 @@ static rectf modal_frame(gfx *rt, const oc_modal_spec *s,
             if (b->kind != MB_DANGER || !b->label || !b->label[0]) continue;
             float bw = btn_width(b->label);
             rectf r = rf(dx, foot_top + 14, dx + bw, foot_top + 46);
-            int hot = in_rect(r, (float)g_mouse_x, (float)g_mouse_y);
-            fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
-            stroke_round(rt, r, OC_R_CONTROL, OC_COL_DANGER, 1.0f);
-            g_ui->align = ST_ALIGN_CENTER;
-            draw_text(rt, b->label, g_ui, rf(r.left, r.top + 1, r.right, r.bottom), OC_COL_DANGER);
-            g_ui->align = ST_ALIGN_LEFT;
+            modal_button(rt, r, b->label, MB_DANGER);
             if (g_n_modal_btns < MODAL_MAX_BTNS) {
                 g_modal_btns[g_n_modal_btns].r = r;
                 g_modal_btns[g_n_modal_btns].cmd = b->cmd;
@@ -14119,7 +14151,7 @@ static rectf modal_frame(gfx *rt, const oc_modal_spec *s,
                  * nameless was announced as nothing, or as whatever this slot
                  * last held. */
                 snprintf(g_modal_btns[g_n_modal_btns].label,
-                         sizeof g_modal_btns[g_n_modal_btns].label, "%s", b->label);
+                         sizeof g_modal_btns[g_n_modal_btns].label, "%s", modal_btn_name(b));
                 g_n_modal_btns++;
             }
             dx = r.right + 10;
@@ -16070,6 +16102,8 @@ static const oc_modal_spec *modal_current(void) {
         sp.size = MODAL_LG;
         sp.buttons[0] = (oc_mbtn){ "Done", MB_PRIMARY, MODAL_OK };
         sp.n_buttons = 1;
+        if (g_n_sw > 0)   /* danger: the frame puts it on the left, away from Done */
+            sp.buttons[sp.n_buttons++] = (oc_mbtn){ "Remove all", MB_DANGER, WSM_CMD_REMOVE_ALL };
     }
     return &sp;
 }
@@ -29733,6 +29767,22 @@ static void ws_forget_begin(const char *ws) {
     sw_book_load();
 }
 
+/* Remove every remembered workspace from this device (the Workspaces dialog's
+ * Remove all): each as Remove takes one, background ones first, the one on
+ * screen last, since that one is forgotten once its sign-out lands. By address,
+ * from a copy: each removal reloads the list. */
+static void ws_forget_all(void) {
+    char ws[16][256];
+    int n = 0, cur = -1;
+    for (int i = 0; i < g_n_sw && n < 16; i++) {
+        int slot = ws_find(g_sw[i].ws);
+        if (slot >= 0 && slot == g_ws_active && g_wss[slot].client) cur = n;
+        snprintf(ws[n++], sizeof ws[0], "%s", g_sw[i].ws);
+    }
+    for (int i = 0; i < n; i++) if (i != cur) ws_forget_begin(ws[i]);
+    if (cur >= 0) ws_forget_begin(ws[cur]);
+}
+
 static void ws_forget(const char *ws) {
     const char *sp = store_path();
     oc_store *st = (sp && ws && ws[0]) ? oc_store_open(sp) : NULL;
@@ -30668,6 +30718,25 @@ static void sw_book_load(void) {
     oc_store_set_secret(st, g_secret);
     oc_store_workspace_each(st, sw_book_cb, NULL);
     oc_store_close(st);
+}
+
+/* How many workspaces the device remembers, from the store itself rather than
+ * the dialog's copy, which is only as fresh as its last load -- the test dump's
+ * `wsbook=`, signed in or not. */
+static void ws_book_count_cb(void *ctx, const char *workspace, const char *label,
+                             const char *username, uint64_t last) {
+    (void)workspace; (void)label; (void)username; (void)last;
+    (*(int *)ctx)++;
+}
+static int ws_book_count(void) {
+    int n = 0;
+    const char *sp = store_path();
+    oc_store *st = sp ? oc_store_open(sp) : NULL;
+    if (!st) return 0;
+    oc_store_set_secret(st, g_secret);
+    oc_store_workspace_each(st, ws_book_count_cb, &n);
+    oc_store_close(st);
+    return n;
 }
 
 static void open_ws_menu(oc_win *hwnd) {
@@ -32146,6 +32215,18 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
     case 71: oc_client_list_notify_prefs(g_client); modal_enter(hwnd, &g_notify_open); break;   /* */
     case 72: modal_enter(hwnd, &g_keys_open); break;   /* */
     case 89: modal_enter(hwnd, &g_about_open); break;
+    case WSM_CMD_REMOVE_ALL: {
+        if (g_n_sw <= 0) break;
+        char what[48], body[320];
+        if (g_n_sw == 1) snprintf(what, sizeof what, "the 1 remembered workspace");
+        else             snprintf(what, sizeof what, "all %d remembered workspaces", g_n_sw);
+        snprintf(body, sizeof body,
+                 "Remove %s from this device?\n\n"
+                 "Each one's saved sign-in is deleted, the one you are signed in to "
+                 "included, which signs you out. You can add any of them again by "
+                 "entering its address.", what);
+        confirm_open(hwnd, CONF_WS_FORGET_ALL, 0, "Remove all workspaces?", body, "Remove all");
+        break; }
     case ABOUT_CMD_COPY: {
         char t[256];
         about_text(model(), t, sizeof t);
@@ -32634,8 +32715,8 @@ static void test_dump(const char *path) {
     FILE *f = fopen(path, "wb"); if (!f) return;
     if (!m) {
         /* Not signed in: the sign-in card's state is what there is to see. */
-        fprintf(f, "no model\nsignin step=%d browser=%d connecting=%d err=%s\n",
-                g_si_step, g_si_browser, g_si_connecting, g_si_err);
+        fprintf(f, "no model\nview=%d wsbook=%d\nsignin step=%d browser=%d connecting=%d err=%s\n",
+                g_view, ws_book_count(), g_si_step, g_si_browser, g_si_connecting, g_si_err);
         if (g_si_client) {
             const oc_model *sm = oc_client_model(g_si_client);
             if (sm) fprintf(f, "signin last_error=%s signin_url=%.120s\n", sm->last_error, sm->signin_url);
@@ -33055,7 +33136,7 @@ static void test_dump(const char *path) {
                 g_preview_player != NULL, (int)ps.state, ps.has_audio, ps.position_ms, ps.duration_ms,
                 g_preview_wait_ms, g_form_action_busy);
     }
-    fprintf(f, "view=%d si_overlay=%d wsmgr=%d\n", g_view, g_si_overlay, g_wsmgr_open);
+    fprintf(f, "view=%d si_overlay=%d wsmgr=%d wsbook=%d\n", g_view, g_si_overlay, g_wsmgr_open, ws_book_count());
     /* How the client started (scripts/gui/startup.sh). `visible` is whether the
      * window is on screen at all -- a client that started and showed nothing
      * looked, from here, exactly like one that never started. `started` counts

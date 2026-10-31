@@ -67,6 +67,7 @@ dlg-pause-until	view home;open 64	modal	!none
 dlg-invite-member	view home;open 40	modal	!none
 dlg-manage-groups	view home;open 87	view	7
 dlg-add-workspace	view home;open 80	view	100
+dlg-workspaces	view home;open 81	modal	!none
 # --- overlays and floating surfaces ----------------------------------------
 palette	view home;palette	view	0
 search	view home;channel general;search render	view	0
