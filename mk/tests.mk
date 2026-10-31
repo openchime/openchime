@@ -12,8 +12,10 @@
 # `test` builds it first); nothing that ships is a box in development mode
 # (release_lint.sh); and the tests wait on outcomes, compare markers rather
 # than a person's words, share no paths, and the workflows pipe nothing into
-# grep -q under pipefail (tests_lint.sh, docs/TESTING.md "Brittle tests").
-SOURCE_CHECKS := scripts/check/opcodes.sh shared/protocol.h && scripts/check/refs.sh && scripts/check/make_targets.sh && scripts/check/config.sh && scripts/check/release_lint.sh && scripts/check/tests_lint.sh
+# grep -q under pipefail (tests_lint.sh, docs/TESTING.md "Brittle tests"); and
+# every third-party component the daemon links has its licence notice in
+# packaging/licenses.sh, in every TTS/STT/SUM build (notices.sh).
+SOURCE_CHECKS := scripts/check/opcodes.sh shared/protocol.h && scripts/check/refs.sh && scripts/check/make_targets.sh && scripts/check/config.sh && scripts/check/release_lint.sh && scripts/check/tests_lint.sh && scripts/check/notices.sh
 
 # Unit + in-process integration tests, one binary (docs/TESTING.md §2). Built
 # -O0 -g; a non-zero exit fails the build and CI. The suites run side by side,

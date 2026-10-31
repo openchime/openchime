@@ -232,6 +232,13 @@ and run the staging build again on the new tip.
 
 See [TESTING.md](./TESTING.md) for the full test strategy.
 
+**A library the daemon links needs its licence notice.** A component added to
+the daemon's build under `third_party/` needs an `emit` line in
+`packaging/licenses.sh`, under the same `TTS`, `STT` or `SUM` condition the
+build uses, so the notice travels with every binary that links it.
+`scripts/check/notices.sh`, one of `make test`'s source checks, compares the
+two for all eight combinations and names any component without one.
+
 **Every network call retries a failed connection.** Every workflow sets `BASH_ENV` to `.github/net-retry.bash`, so every bash step, and every bash script it runs, gets it: `git`, `gh` and `ssh-keyscan` (GitHub); `skopeo`, `docker`, `buildah` and `flyctl` (Fly's registry, API and builder); `curl`; and `dotnet restore`, while `rclone`, `npm` and NuGet are told through their own settings to retry harder and give up on a stall. Each attempt is bounded, so a stalled connection fails instead of hanging, and a call that failed in the connection (a timeout, a dropped, reset or refused connection, a 5xx) is retried with backoff, up to four times. A real refusal, such as a rejected push, a missing ref or image, a 4xx or a failed health check, fails at once.
 
 ## Releases
