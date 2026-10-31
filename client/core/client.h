@@ -171,9 +171,10 @@ void oc_client_close_thread(oc_client *c);
 /* Run a full-text search (results stream into the model's search buffer) / close
  * the search view. */
 void oc_client_open_search(oc_client *c);
-void oc_client_search(oc_client *c, const char *query);
-/* Next page of the current search: `before_id` is the oldest id shown. */
-void oc_client_search_more(oc_client *c, uint64_t before_id);
+/* `sort` is OC_SEARCH_NEWEST, _OLDEST or _RELEVANCE (protocol.h). */
+void oc_client_search(oc_client *c, const char *query, uint8_t sort);
+/* Next page of the current search, in its order, from the last hit shown. */
+void oc_client_search_more(oc_client *c);
 void oc_client_close_search(oc_client *c);
 
 /* Channel management: create a public channel, join / leave one. The server

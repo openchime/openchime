@@ -7095,7 +7095,9 @@ static int build_fts_query(const char *in, size_t inlen, char *out, size_t outca
 
 /* Full-text search over message bodies (REQ-080). Scoped to the channels the
  * user can read (public or a member, REQ-031); tombstones are excluded. Results
- * are FTS5 snippets, newest first, bounded by OC_SEARCH_MAX. */
+ * are FTS5 snippets, bounded by OC_SEARCH_MAX, in the order asked for: newest
+ * first, oldest first, or by relevance (bm25, best first, ties by id). Each
+ * pages by a keyset (protocol.h, oc_search), never an offset. */
 static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -7113,14 +7115,23 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
 
     uint16_t lim = j->search_limit;
     if (lim == 0 || lim > OC_SEARCH_MAX) lim = OC_SEARCH_MAX;
+    /* Nothing ranks a filters-only search: relevance is newest first there. */
+    int sort = j->search_sort;
+    if (sort != OC_SEARCH_OLDEST && sort != OC_SEARCH_RELEVANCE) sort = OC_SEARCH_NEWEST;
+    if (sort == OC_SEARCH_RELEVANCE && !have_text) sort = OC_SEARCH_NEWEST;
+    /* The rank as it is compared and sent: an integer, so the cursor a client
+     * hands back matches the row it came from exactly. bm25 is lower for a
+     * better match. */
+    const char *rank_sql = sort == OC_SEARCH_RELEVANCE
+        ? "CAST(ROUND(bm25(messages_fts) * 1000000.0) AS INTEGER)" : "0";
 
     /* Built up rather than one literal, because the FTS join must DISAPPEAR when there
      * is no text: `messages_fts MATCH ''` matches nothing, so a filters-only search
      * would silently return zero rows. */
-    char sql[2048];
+    char sql[3072];
     int k = snprintf(sql, sizeof sql,
         "SELECT m.id, m.channel_id, m.author_id, m.created_at_ms, %s, "
-        "       (SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id) "
+        "       (SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id), %s "
         "FROM %s messages m %s "
         "JOIN channels c ON c.id = m.channel_id "
         "WHERE m.deleted_at_ms IS NULL "
@@ -7129,12 +7140,31 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
         "  AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members cm "
         "       WHERE cm.channel_id=m.channel_id AND cm.user_id=?2)) ",
         have_text ? "snippet(messages_fts, 0, '', '', ' ... ', 12)" : "substr(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,1,160)",
+        rank_sql,
         have_text ? "messages_fts JOIN" : "",
         have_text ? "ON m.id = messages_fts.rowid" : "");
     if (have_text) k += snprintf(sql + k, sizeof sql - (size_t)k, " AND messages_fts MATCH ?1 ");
-    /* Keyset cursor: id < before, which is stable while people keep posting —
-     * an OFFSET would skip or repeat rows as the table grows underneath. */
-    if (j->message_id) k += snprintf(sql + k, sizeof sql - (size_t)k, " AND m.id < ?4 ");
+    /* Keyset cursor, which is stable while people keep posting — an OFFSET
+     * would skip or repeat rows as the table grows underneath: the rows after
+     * the last one shown, in this order. */
+    if (j->message_id) {
+        if (sort == OC_SEARCH_NEWEST)
+            k += snprintf(sql + k, sizeof sql - (size_t)k, " AND m.id < ?4 ");
+        else if (sort == OC_SEARCH_OLDEST)
+            k += snprintf(sql + k, sizeof sql - (size_t)k, " AND m.id > ?4 ");
+        else
+            /* The cursor row's rank as it is NOW: a message posted since the
+             * last page moves every bm25 score (the count, the lengths, the
+             * IDF), so the rank the client was sent would no longer sit where
+             * its row does. Recomputed, both sides are measured alike; the
+             * client's copy stands in when the row no longer matches. */
+            k += snprintf(sql + k, sizeof sql - (size_t)k,
+                          " AND (%s > COALESCE((SELECT CAST(ROUND(bm25(messages_fts) * 1000000.0) AS INTEGER) "
+                          "                    FROM messages_fts WHERE messages_fts MATCH ?1 AND rowid = ?4), ?9) "
+                          "      OR (%s = COALESCE((SELECT CAST(ROUND(bm25(messages_fts) * 1000000.0) AS INTEGER) "
+                          "                    FROM messages_fts WHERE messages_fts MATCH ?1 AND rowid = ?4), ?9) "
+                          "          AND m.id > ?4)) ", rank_sql, rank_sql);
+    }
     if (j->sq_from && j->sq_from[0])
         k += snprintf(sql + k, sizeof sql - (size_t)k,
                       " AND m.author_id IN (SELECT id FROM users WHERE "
@@ -7167,7 +7197,8 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
                       "      CAST(m.body AS TEXT) LIKE '%%https://%%') ");
     if (j->sq_after)  k += snprintf(sql + k, sizeof sql - (size_t)k, " AND m.created_at_ms >= ?7 ");
     if (j->sq_before) k += snprintf(sql + k, sizeof sql - (size_t)k, " AND m.created_at_ms <= ?8 ");
-    snprintf(sql + k, sizeof sql - (size_t)k, " ORDER BY m.id DESC LIMIT ?3;");
+    snprintf(sql + k, sizeof sql - (size_t)k, " ORDER BY %s LIMIT ?3;",
+             sort == OC_SEARCH_OLDEST ? "m.id ASC" : sort == OC_SEARCH_RELEVANCE ? "7, m.id ASC" : "m.id DESC");
 
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
@@ -7181,6 +7212,8 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
     if (j->sq_in && j->sq_in[0])     sqlite3_bind_text(st, 6, j->sq_in, -1, SQLITE_STATIC);
     if (j->sq_after)  sqlite3_bind_int64(st, 7, (sqlite3_int64)j->sq_after);
     if (j->sq_before) sqlite3_bind_int64(st, 8, (sqlite3_int64)j->sq_before);
+    if (j->message_id && sort == OC_SEARCH_RELEVANCE)
+        sqlite3_bind_int64(st, 9, (sqlite3_int64)j->search_cursor_rank);
 
     size_t cap = 8, n = 0;
     oc_replay_msg *arr = malloc(cap * sizeof *arr);
@@ -7192,6 +7225,7 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
         m->channel_id  = (uint64_t)sqlite3_column_int64(st, 1);
         m->author_id   = (uint64_t)sqlite3_column_int64(st, 2);
         m->server_time = (uint64_t)sqlite3_column_int64(st, 3);
+        m->rank        = (int64_t)sqlite3_column_int64(st, 6);
         const unsigned char *snip = sqlite3_column_text(st, 4);
         int slen = sqlite3_column_bytes(st, 4);
         /* An action's snippet is cut from its action text (REQ-058). A snippet

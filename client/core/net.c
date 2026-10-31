@@ -1583,6 +1583,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->author_id = se[i].author_id;
                 e->server_time = se[i].server_time;
                 e->action = se[i].action;   /* REQ-058 */
+                e->rank = se[i].rank;
                 e->body = malloc(se[i].snippet.len + 1);
                 if (e->body) { memcpy(e->body, se[i].snippet.ptr, se[i].snippet.len); e->body[se[i].snippet.len] = '\0'; }
                 oc_queue_push(to_ui, e);
@@ -3397,6 +3398,8 @@ static int run_connection(oc_net *n, int reconnecting,
                 s.has_mask   = (uint8_t)sq.has;
                 s.after_ms   = after_ms;
                 s.before_ms  = before_ms;
+                s.sort        = c->op;                  /* OC_SEARCH_* */
+                s.cursor_rank = c->rank;
                 if (oc_encode_search(&w, OC_PROTOCOL_VERSION, &s) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }

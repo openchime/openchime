@@ -1878,6 +1878,10 @@ static uint64_t g_flash_until;
 /* Webhook-overlay row hit-boxes (row -> webhook id, for delete). */
 /* Per-row action buttons: enable/disable, rotate, delete. */
 static rectf g_srch_more_btn;   /* next page of search results */
+/* The order search results come in (OC_SEARCH_*), chosen in the search pane and
+ * kept for the next search; the three choices' hit-boxes, as drawn. */
+static uint8_t g_search_sort;
+static rectf g_srch_sort_btn[3];
 static int g_await_webhook;     /* show the minted webhook token once it arrives */
 static int g_await_reset;       /* a reset asked for: show it once (AUTH.md §2) */
 static int      g_sessions_open;   /* REQ-182 */
@@ -7198,7 +7202,22 @@ static void draw_search(gfx *rt, const oc_model *m, rectf reg) {
                   /* gave the wire a cursor, so this stops apologising and the
                    * footer offers the next page instead. */
                   m->search_truncated ? ", more below" : "");
-    draw_text(rt, count, g_meta, rf(body.left + 20, body.top, body.right - 16, body.top + 18),
+    /* The order, on the count line's right: newest first by default, oldest
+     * first, or the best match first. */
+    static const char *const SORTS[3] = { "Newest", "Oldest", "Best match" };
+    float sx = body.right - 16;
+    for (int k = 2; k >= 0; k--) {
+        float bw = text_width(SORTS[k], g_meta) + 16;
+        rectf b = rf(sx - bw, body.top - 2, sx, body.top + 18);
+        int on = g_search_sort == (uint8_t)k, hot = in_rect(b, g_mouse_x, g_mouse_y);
+        fill_round(rt, b, OC_R_CONTROL, on ? OC_COL_ACCENT : hot ? OC_COL_HOVER : OC_COL_INPUT);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, SORTS[k], g_meta, b, on ? 0xFFFFFF : OC_COL_TEXT);
+        g_meta->align = ST_ALIGN_LEFT;
+        g_srch_sort_btn[k] = b;
+        sx = b.left - 4;
+    }
+    draw_text(rt, count, g_meta, rf(body.left + 20, body.top, sx - 8, body.top + 18),
               m->search_truncated ? OC_COL_NOTICE : OC_COL_MUTED);
     body.top += 22;
 
@@ -26456,7 +26475,7 @@ static void search_submit(void) {
     snprintf(q, sizeof q, "%s", g_srch->buf);
     if (!q[0]) return;
     g_srch_scroll = 0;
-    oc_client_search(g_client, q);
+    oc_client_search(g_client, q, g_search_sort);
 }
 
 /* Open the overlay with the box focused and empty — no modal prompt. */
@@ -27507,7 +27526,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
                     if (me && me[0]) {
                         char q[96];
                         snprintf(q, sizeof q, "from:%s", me);
-                        oc_client_search(g_client, q);
+                        oc_client_search(g_client, q, OC_SEARCH_NEWEST);   /* what you sent, latest first */
                     }
                 }
                 return 1;
@@ -28643,15 +28662,25 @@ static int on_click(oc_win *hwnd, int x, int y) {
         const oc_model *mm = model();
         if (mm && x > RAIL_W + SIDEBAR_W) {
             if (mm->search_open && in_rect(g_srch_more_btn, x, y)) {
-                /* The OLDEST id shown is the cursor: results are newest-first, so the
-                 * next page is everything before it. */
-                uint64_t oldest = 0;
-                for (size_t k = 0; k < mm->n_search; k++)
-                    if (!oldest || mm->search_results[k].message_id < oldest)
-                        oldest = mm->search_results[k].message_id;
-                if (oldest) oc_client_search_more(g_client, oldest);
+                /* The next page continues from the last hit shown, in the order
+                 * the hits are in (the core keeps the cursor). */
+                oc_client_search_more(g_client);
                 return 1;
             }
+            /* A different order starts the search again in it: a keyset in one
+             * order is no cursor in another. */
+            for (int k = 0; mm->search_open && k < 3; k++)
+                if (in_rect(g_srch_sort_btn[k], x, y)) {
+                    if (g_search_sort != (uint8_t)k) {
+                        g_search_sort = (uint8_t)k;
+                        char q[128];
+                        snprintf(q, sizeof q, "%s", mm->search_query);
+                        g_srch_scroll = 0;
+                        if (q[0]) oc_client_search(g_client, q, g_search_sort);
+                        invalidate();
+                    }
+                    return 1;
+                }
             if (mm->search_open)
                 for (int i = 0; i < g_n_searchrows; i++)
                     if ((float)y >= g_searchrows[i].top && (float)y < g_searchrows[i].bot) {

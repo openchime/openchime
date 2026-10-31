@@ -168,8 +168,13 @@
  *
  * 27: WORKSPACE_INFO carries `max_video_size`, the daemon's cap on a video
  * message (OPENCHIME_MAX_VIDEO_SIZE), which a client's recorder stays within
- * (REQ-164). A u64 appended to a layout. */
-#define OC_PROTOCOL_VERSION 27u
+ * (REQ-164). A u64 appended to a layout.
+ *
+ * 28: SEARCH carries `sort` and `cursor_rank`, and each SEARCH_RESULTS entry its
+ * `rank`, so search can be ordered oldest first or by relevance and still be
+ * paged by a keyset (REQ-080). Fields appended to two layouts, one of them a
+ * repeated entry. */
+#define OC_PROTOCOL_VERSION 28u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -1701,9 +1706,17 @@ typedef struct { uint64_t user_id; oc_slice display_name; } oc_profile_updated;
  * MATCHing them as literal text would find messages that merely mention them.
  * Parsing lives in shared/searchq.c so both frontends mean the same thing.
  *
- * `before_id` is the paging cursor: results come back newest-first ordered by
- * id, so "give me the page before this id" is a keyset cursor — stable under
- * concurrent posting, unlike an offset. 0 = the first page. */
+ * `before_id` is the paging cursor: the id of the last row of the page before,
+ * 0 for the first page. With `sort` newest first (0) the next page is the ids
+ * below it, oldest first (1) the ids above it, and by relevance (2) the rows
+ * after (`cursor_rank`, `before_id`) in (rank, id) order — a keyset cursor in
+ * every order, stable under concurrent posting, unlike an offset. A rank is
+ * bm25 × 1,000,000, rounded, so the wire carries no floating point; lower is
+ * the better match. A message posted since moves every bm25 score, so the
+ * daemon measures the cursor row's rank afresh and uses `cursor_rank` only when
+ * that row no longer matches. Relevance with no text to rank falls back to
+ * newest first. */
+enum { OC_SEARCH_NEWEST = 0, OC_SEARCH_OLDEST = 1, OC_SEARCH_RELEVANCE = 2 };
 typedef struct {
     oc_slice query;          /* free text for FTS; may be empty when filters carry it */
     uint16_t limit;
@@ -1713,11 +1726,15 @@ typedef struct {
     uint8_t  has_mask;       /* OC_SQ_HAS_* */
     uint64_t after_ms, before_ms;   /* 0 = unbounded; resolved by the CLIENT, which
                                      * knows the user's timezone */
+    uint8_t  sort;           /* OC_SEARCH_*; 0 = newest first */
+    int64_t  cursor_rank;    /* relevance paging: the last row's rank */
 } oc_search;
 /* `action` 1: the message is an action and the snippet is cut from its action
  * text (REQ-058). */
+/* `rank` the row's relevance (bm25 × 1,000,000; 0 unless sorted by relevance),
+ * which the next page's cursor carries. */
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice snippet;
-                 uint8_t action; } oc_search_result_entry;
+                 uint8_t action; int64_t rank; } oc_search_result_entry;
 typedef struct { uint16_t count; const oc_search_result_entry *entries; uint8_t truncated; } oc_search_results;
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_cursor;
 typedef struct { uint16_t count; const oc_cursor *cursors; } oc_backfill_request;

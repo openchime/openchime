@@ -5738,7 +5738,7 @@ int run_client_core_tests(void) {
 
         /* dana searches for a word in her message; the hit streams into the
          * search buffer and includes that message. */
-        oc_client_search(a, "core");
+        oc_client_search(a, "core", OC_SEARCH_NEWEST);
         CHECK(WAIT_FOR(a, m->search_open && m->n_search >= 1));
         {
             const oc_model *am = oc_client_model(a);

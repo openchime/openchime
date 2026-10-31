@@ -475,8 +475,12 @@ typedef struct oc_job {
     /* HISTORY: 0 pages backwards from message_id, 1 fetches AROUND it (ARCH-96). */
     uint8_t        hist_around;
 
-    /* SEARCH: query text is carried in body/body_len; this bounds the result. */
+    /* SEARCH: query text is carried in body/body_len; this bounds the result.
+     * `search_sort` is OC_SEARCH_*, and `search_cursor_rank` the relevance
+     * cursor's rank beside the id in message_id (protocol.h, oc_search). */
     uint16_t       search_limit;
+    uint8_t        search_sort;
+    int64_t        search_cursor_rank;
 
     /* LOGOUT (revoke sessions; REQ-182). Actor is `user_id`; the token to revoke
      * (scope THIS) is carried in `token`/`token_len`. */
@@ -986,6 +990,8 @@ typedef struct {
     /* SEARCH only: the snippet in `body` is cut from an action's text
      * (REQ-058). A replay carries actions on their own frames instead. */
     uint8_t  action;
+    /* SEARCH only: the row's relevance, bm25 × 1,000,000 (0 unless sorted so). */
+    int64_t  rank;
 } oc_replay_msg;
 
 typedef struct oc_dbres {

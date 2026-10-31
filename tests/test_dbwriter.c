@@ -4359,6 +4359,169 @@ static void test_search_filters_and_paging(void) {
     cleanup_db(path);
 }
 
+/* The three orders (REQ-080): newest first, oldest first and by relevance,
+ * each paged by its keyset so that walking every page meets every row once, and
+ * none of them reaching a channel the caller cannot read. Relevance with no text
+ * to rank is newest first. */
+static oc_dbres *search_s(oc_dbwriter *w, uint64_t uid, const char *text, const char *from,
+                          uint8_t sort, uint64_t before_id, int64_t cursor_rank, uint16_t limit) {
+    oc_job *j = oc_job_new(OC_JOB_SEARCH, 150);
+    j->user_id = uid;
+    j->search_limit = limit;
+    if (text && text[0]) oc_job_set_body(j, text, strlen(text));
+    if (from && from[0]) j->sq_from = strdup(from);
+    j->search_sort = sort;
+    j->message_id = before_id;
+    j->search_cursor_rank = cursor_rank;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* Every page of a search in `sort`, `limit` at a time, into ids[] (and ranks[]),
+ * each page asked from the last row of the one before. The row count, or -1
+ * when a row came back twice. */
+static int search_walk(oc_dbwriter *w, uint64_t uid, const char *text, uint8_t sort,
+                       uint16_t limit, uint64_t *ids, int64_t *ranks, int cap) {
+    int n = 0;
+    uint64_t cur_id = 0; int64_t cur_rank = 0;
+    for (int page = 0; page < 20; page++) {
+        oc_dbres *r = search_s(w, uid, text, NULL, sort, cur_id, cur_rank, limit);
+        if (!r) return -1;
+        size_t got = r->n_search;
+        for (size_t i = 0; i < got && n < cap; i++) {
+            for (int k = 0; k < n; k++) if (ids[k] == r->search[i].message_id) { oc_dbres_free(r); return -1; }
+            ids[n] = r->search[i].message_id; ranks[n] = r->search[i].rank; n++;
+        }
+        if (got) { cur_id = r->search[got - 1].message_id; cur_rank = r->search[got - 1].rank; }
+        int more = r->truncated && got > 0;
+        oc_dbres_free(r);
+        if (!more) break;
+    }
+    return n;
+}
+
+static void test_search_orders(void) {
+    const char *path = tdb("searcho.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "so-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "so-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+    /* Seven in the default channel, the term as dense as a whole message and as
+     * thin as one word in a long one, two of them alike (a tie, broken by id). */
+    static const char *const bodies[] = {
+        "release notes for the quarter, long and mostly about other things entirely",
+        "release",
+        "release release release",
+        "after the release we went to lunch and talked about the weather for an hour",
+        "release",
+        "a release candidate",
+        "the release",
+    };
+    /* Most of a workspace's messages do not say the word: without them every
+     * message matches, bm25's IDF is at its floor and every rank ties. */
+    for (int i = 0; i < 40; i++) {
+        char b[64];
+        snprintf(b, sizeof b, "ordinary chatter about lunch number %d", i);
+        CHECK(send_id(w, i % 2 ? bob : alice, OC_DEFAULT_CHANNEL, b) != 0);
+    }
+    uint64_t mid[7];
+    for (int i = 0; i < 7; i++) {
+        mid[i] = send_id(w, i % 2 ? bob : alice, OC_DEFAULT_CHANNEL, bodies[i]);
+        CHECK(mid[i] != 0);
+    }
+    /* And one in a private channel only alice is in: no order may show it to bob. */
+    oc_dbres *r = create_channel(w, alice, "so-vault", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t vault = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    uint64_t secret = send_id(w, alice, vault, "release release release release");
+    CHECK(secret != 0);
+
+    /* Newest first, as before: ids falling, ranks zero. */
+    r = search_s(w, bob, "release", NULL, OC_SEARCH_NEWEST, 0, 0, 50);
+    CHECK(r && r->n_search == 7);
+    if (r) for (size_t i = 0; i + 1 < r->n_search; i++) CHECK(r->search[i].message_id > r->search[i + 1].message_id);
+    if (r && r->n_search) CHECK(r->search[0].message_id == mid[6] && r->search[0].rank == 0);
+    oc_dbres_free(r);
+
+    /* Oldest first: ids rising. */
+    r = search_s(w, bob, "release", NULL, OC_SEARCH_OLDEST, 0, 0, 50);
+    CHECK(r && r->n_search == 7);
+    if (r) for (size_t i = 0; i + 1 < r->n_search; i++) CHECK(r->search[i].message_id < r->search[i + 1].message_id);
+    if (r && r->n_search) CHECK(r->search[0].message_id == mid[0]);
+    oc_dbres_free(r);
+
+    /* By relevance: best (lowest bm25) first, a tie by id; the dense one before
+     * the long one that only mentions it. */
+    r = search_s(w, bob, "release", NULL, OC_SEARCH_RELEVANCE, 0, 0, 50);
+    CHECK(r && r->n_search == 7);
+    int pos_dense = -1, pos_long = -1;
+    if (r) for (size_t i = 0; i < r->n_search; i++) {
+        CHECK(r->search[i].rank < 0);
+        if (i + 1 < r->n_search)
+            CHECK(r->search[i].rank < r->search[i + 1].rank ||
+                  (r->search[i].rank == r->search[i + 1].rank &&
+                   r->search[i].message_id < r->search[i + 1].message_id));
+        if (r->search[i].message_id == mid[2]) pos_dense = (int)i;
+        if (r->search[i].message_id == mid[3]) pos_long = (int)i;
+    }
+    CHECK(pos_dense >= 0 && pos_long >= 0 && pos_dense < pos_long);
+    uint64_t rel_all[7] = { 0 };
+    if (r) for (size_t i = 0; i < r->n_search && i < 7; i++) rel_all[i] = r->search[i].message_id;
+    oc_dbres_free(r);
+
+    /* Paged two at a time, each order meets every row once, in the same order
+     * as the single page -- across ties too. */
+    uint64_t ids[16]; int64_t ranks[16];
+    CHECK(search_walk(w, bob, "release", OC_SEARCH_RELEVANCE, 2, ids, ranks, 16) == 7);
+    for (int i = 0; i < 7; i++) CHECK(ids[i] == rel_all[i]);
+    CHECK(search_walk(w, bob, "release", OC_SEARCH_OLDEST, 2, ids, ranks, 16) == 7);
+    for (int i = 0; i < 7; i++) CHECK(ids[i] == mid[i]);
+    CHECK(search_walk(w, bob, "release", OC_SEARCH_NEWEST, 2, ids, ranks, 16) == 7);
+    for (int i = 0; i < 7; i++) CHECK(ids[i] == mid[6 - i]);
+
+    /* A message posted between pages repeats nothing and loses nothing. */
+    r = search_s(w, bob, "release", NULL, OC_SEARCH_RELEVANCE, 0, 0, 3);
+    CHECK(r && r->n_search == 3);
+    uint64_t seen[16]; int n_seen = 0;
+    uint64_t cid = 0; int64_t crank = 0;
+    if (r) { for (size_t i = 0; i < r->n_search; i++) seen[n_seen++] = r->search[i].message_id;
+             cid = r->search[r->n_search - 1].message_id; crank = r->search[r->n_search - 1].rank; }
+    oc_dbres_free(r);
+    CHECK(send_id(w, alice, OC_DEFAULT_CHANNEL, "release") != 0);
+    r = search_s(w, bob, "release", NULL, OC_SEARCH_RELEVANCE, cid, crank, 50);
+    if (r) for (size_t i = 0; i < r->n_search; i++)
+        for (int k = 0; k < n_seen; k++) CHECK(r->search[i].message_id != seen[k]);
+    CHECK(r && n_seen + (int)r->n_search == 8);
+    oc_dbres_free(r);
+
+    /* Readable channels only, in every order: bob never sees the vault; alice
+     * does, and by relevance it is her best match. */
+    for (uint8_t so = 0; so < 3; so++) {
+        r = search_s(w, bob, "release", NULL, so, 0, 0, 50);
+        if (r) for (size_t i = 0; i < r->n_search; i++) CHECK(r->search[i].message_id != secret);
+        oc_dbres_free(r);
+    }
+    r = search_s(w, alice, "release", NULL, OC_SEARCH_RELEVANCE, 0, 0, 50);
+    CHECK(r && r->n_search == 9 && r->search[0].message_id == secret);
+    oc_dbres_free(r);
+
+    /* Relevance with nothing to rank -- filters alone -- is newest first. */
+    r = search_s(w, bob, NULL, "so-bob", OC_SEARCH_RELEVANCE, 0, 0, 50);
+    CHECK(r && r->n_search == 23);                /* twenty of the chatter, three of the seven */
+    if (r) for (size_t i = 0; i + 1 < r->n_search; i++) {
+        CHECK(r->search[i].message_id > r->search[i + 1].message_id);
+        CHECK(r->search[i].rank == 0);
+    }
+    if (r && r->n_search) CHECK(r->search[0].message_id == mid[5]);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_search(void) {
     const char *path = tdb("search.db");
     cleanup_db(path);
@@ -8830,6 +8993,7 @@ int run_dbwriter_tests(void) {
     test_badge_matches_evaluator();
     test_search();
     test_search_filters_and_paging();
+    test_search_orders();
     test_setup_invite();
     test_remove_user_integrations();
     test_remove_keeps_history();

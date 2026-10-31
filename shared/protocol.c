@@ -2499,6 +2499,8 @@ oc_result oc_encode_search(oc_wbuf *w, uint16_t version, const oc_search *m) {
     oc_w_u8(w, m->has_mask);
     oc_w_u64(w, m->after_ms);
     oc_w_u64(w, m->before_ms);
+    oc_w_u8(w, m->sort);                            /* 28 */
+    oc_w_u64(w, (uint64_t)m->cursor_rank);
     return oc_frame_end(w, off);
 }
 
@@ -2512,6 +2514,7 @@ oc_result oc_encode_search_results(oc_wbuf *w, uint16_t version, const oc_search
         oc_w_u64(w, m->entries[i].server_time);
         oc_w_str(w, m->entries[i].snippet);
         oc_w_u8(w, m->entries[i].action);
+        oc_w_u64(w, (uint64_t)m->entries[i].rank);  /* 28 */
     }
     oc_w_u8(w, m->truncated);   /* 1 if more matches exist past the cap */
     return oc_frame_end(w, off);
@@ -3694,6 +3697,8 @@ oc_result oc_decode_search(oc_rbuf *p, oc_search *m) {
     m->has_mask   = oc_r_u8(p);
     m->after_ms   = oc_r_u64(p);
     m->before_ms  = oc_r_u64(p);
+    m->sort        = oc_r_u8(p);
+    m->cursor_rank = (int64_t)oc_r_u64(p);
     return r_done(p);
 }
 
@@ -3708,6 +3713,7 @@ oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries,
         uint64_t ts = oc_r_u64(p);
         oc_slice snip = oc_r_str(p);
         uint8_t act = oc_r_u8(p);
+        int64_t rank = (int64_t)oc_r_u64(p);
         if (i < cap) {
             entries[i].message_id = mid;
             entries[i].channel_id = ch;
@@ -3715,6 +3721,7 @@ oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries,
             entries[i].server_time = ts;
             entries[i].snippet = snip;
             entries[i].action = act;
+            entries[i].rank = rank;
         }
     }
     uint8_t trunc = oc_r_u8(p);

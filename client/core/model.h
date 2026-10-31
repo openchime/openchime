@@ -287,7 +287,8 @@ typedef struct { uint64_t channel_id; uint64_t user_id; long long seen; } oc_typ
 
 /* One full-text search hit (REQ-080). */
 typedef struct { uint64_t message_id, channel_id, author_id, server_time; char *snippet;
-                 uint8_t action; /* the snippet is an action's text (REQ-058) */ } oc_search_result;
+                 uint8_t action; /* the snippet is an action's text (REQ-058) */
+                 int64_t rank;   /* relevance, the next page's cursor beside the id */ } oc_search_result;
 
 /* One reactor entry (from LIST_REACTIONS -> REACTIONS, REQ-071): who reacted
  * with which emoji on the inspected message. */
@@ -476,6 +477,7 @@ typedef struct {
     /* The open search view (REQ-080): the query and its hits. */
     uint8_t   search_open;
     char      search_query[128];
+    uint8_t   search_sort;       /* OC_SEARCH_*: the order the hits are in */
     oc_search_result *search_results;
     size_t    n_search, cap_search;
     /* The server said it had more hits than it sent. The wire gained a keyset

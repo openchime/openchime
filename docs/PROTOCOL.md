@@ -213,9 +213,10 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 27** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 28** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
-> 27 appended `max_video_size` to `WORKSPACE_INFO` (§4.3a). Since the
+> 28 appended `sort` and `cursor_rank` to `SEARCH` and `rank` to each
+> `SEARCH_RESULTS` entry (§5.11). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
 > change moves the number even when it adds one byte.
@@ -1390,25 +1391,27 @@ Implemented with a SQLite FTS5 index over message bodies (ARCH-15, SCHEMA.md
 |---------------|------|----------------------------------------------------------|
 | `query`       | str  | Free text. The daemon quotes each whitespace-separated term, so query punctuation is literal and multiple terms are ANDed; it never errors on syntax. May be empty when the filters below carry the whole query. |
 | `limit`       | u16  | Max results wanted; the daemon caps it (50).             |
-| `before_id`   | u64  | **Keyset paging cursor** — return only messages with a lower id. `0` for the first page. Not an offset, so a message posted mid-paging cannot make a row repeat or vanish. |
+| `before_id`   | u64  | **Keyset paging cursor** — the id of the last row of the page before; `0` for the first page. Newest first, the next page is the lower ids; oldest first, the higher ones; by relevance, the rows after (`cursor_rank`, `before_id`). Not an offset, so a message posted mid-paging cannot make a row repeat or vanish. |
 | `from_name`   | str  | `from:` — restrict to one author. Empty for no constraint. |
 | `in_channel`  | str  | `in:` — restrict to one channel. Empty for no constraint. |
 | `has_mask`    | u8   | `has:` — bitmask, `0x01` file, `0x02` link, `0x04` image, `0x08` video. `0` for no constraint. |
 | `after_ms`    | u64  | `after:` — lower time bound, ms since epoch UTC. `0` for none. |
 | `before_ms`   | u64  | `before:` — upper time bound. `0` for none. |
+| `sort`        | u8   | `0` newest first (by id, descending), `1` oldest first (by id, ascending), `2` by relevance (best match first, ties by id ascending). Relevance with no `query` text falls back to newest first: nothing ranks a filters-only search. Since protocol 28. |
+| `cursor_rank` | i64  | Relevance paging: the last row's `rank`, with its id in `before_id`. A message posted since moves every bm25 score, so the daemon measures that row's rank afresh and uses `cursor_rank` only when the row no longer matches (edited or deleted). Ignored by the other orders. Since protocol 28. |
 
 The operator grammar is parsed by `shared/searchq.c`, which the daemon and both
 frontends link, so the filter line a client shows and the `WHERE` clause the
 daemon builds cannot disagree (REQ-081). Results stay scoped to history the
 caller may read (REQ-031).
 
-Replies **`SEARCH_RESULTS` (server → client), msg_type `0x0061`**, newest match
-first:
+Replies **`SEARCH_RESULTS` (server → client), msg_type `0x0061`**, in the order
+`sort` asked for:
 
 | Field       | Type            | Notes                                                |
 |-------------|-----------------|------------------------------------------------------|
 | `count`     | u16             | Number of entries.                                   |
-| `entries[]` | `count` × entry | Each: `message_id` (u64), `channel_id` (u64), `author_id` (u64), `server_time` (u64), `snippet` (str — an FTS5 excerpt around the match, or the body's first 160 bytes for a search with no text), `action` (u8 — `1` when the message is an action and the snippet is cut from its text, REQ-058). |
+| `entries[]` | `count` × entry | Each: `message_id` (u64), `channel_id` (u64), `author_id` (u64), `server_time` (u64), `snippet` (str — an FTS5 excerpt around the match, or the body's first 160 bytes for a search with no text), `action` (u8 — `1` when the message is an action and the snippet is cut from its text, REQ-058), `rank` (i64 — the row's relevance, bm25 × 1,000,000 rounded, lower is better; `0` unless sorted by relevance; since protocol 28). |
 | `truncated` | u8              | 1 if more matches exist past the cap (`limit`).      |
 
 Tombstoned messages (§5.6) are excluded, and an edit (§5.5) re-indexes the

@@ -450,6 +450,7 @@ typedef struct {
     char     pdm_safety[72];         /* PDM: OPEN, KEY_CHANGED */
     uint8_t  err_kind;               /* ERROR: OC_CERR_* */
     uint16_t err_code;               /* ERROR: the daemon's OC_ERR_* it answers, 0 if none */
+    int64_t  rank;                   /* SEARCH_RESULT: the row's relevance (protocol.h, oc_search) */
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);
@@ -679,6 +680,9 @@ typedef struct {
     uint64_t poll_close_at_ms;
     uint8_t  poll_picks[OC_POLL_MAX_OPTIONS];
     uint8_t  n_poll_picks;
+    /* SEARCH: the order is `op` (OC_SEARCH_*), the cursor `message_id` and, by
+     * relevance, this rank beside it. */
+    int64_t  rank;
 } oc_cmd;
 
 oc_cmd *oc_cmd_new(int type);

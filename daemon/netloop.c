@@ -3338,6 +3338,8 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->sq_has    = sq.has_mask;
             j->sq_after  = sq.after_ms;
             j->sq_before = sq.before_ms;
+            j->search_sort = sq.sort;                       /* 28 */
+            j->search_cursor_rank = sq.cursor_rank;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -7048,6 +7050,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             ents[i].snippet.ptr = r->search[i].body;
             ents[i].snippet.len = r->search[i].body_len;
             ents[i].action = r->search[i].action;   /* REQ-058 */
+            ents[i].rank = r->search[i].rank;
         }
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_search_results sr = { (uint16_t)n, ents, r->truncated };

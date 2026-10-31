@@ -897,7 +897,7 @@ static void test_action_frames(void) {
         CHECK(out[1].preview_action == 0 && slice_eq_str(out[1].preview, "/me"));
     }
     {
-        oc_search_result_entry ents[1] = { { 1001, 7, 42, 5, oc_slice_str("is away"), 1 } };
+        oc_search_result_entry ents[1] = { { 1001, 7, 42, 5, oc_slice_str("is away"), 1, 0 } };
         oc_search_results in = { 1, ents, 0 };
         ROUNDTRIP(oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH_RESULTS, h, p);
         oc_search_result_entry out[1]; uint16_t n = 0; uint8_t trunc = 9;
@@ -1253,11 +1253,21 @@ static void test_search_frames(void) {
         oc_search out;
         CHECK(oc_decode_search(&p, &out) == OC_OK);
         CHECK(slice_eq_str(out.query, "deploy pipeline") && out.limit == 25);
+        CHECK(out.sort == OC_SEARCH_NEWEST && out.cursor_rank == 0);   /* 0: today's order */
+    }
+    {   /* The order and the relevance cursor (28): a rank is negative, lower the
+         * better match, and crosses the wire as the integer it is. */
+        oc_search in = { .query = oc_slice_str("deploy"), .limit = 50, .before_id = 990,
+                         .sort = OC_SEARCH_RELEVANCE, .cursor_rank = -4321987 };
+        ROUNDTRIP(oc_encode_search(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH, h, p);
+        oc_search out;
+        CHECK(oc_decode_search(&p, &out) == OC_OK);
+        CHECK(out.sort == OC_SEARCH_RELEVANCE && out.cursor_rank == -4321987 && out.before_id == 990);
     }
     {
         oc_search_result_entry ents[2] = {
-            { 1001, 7, 42, 1751200500000ull, oc_slice_str("... the deploy ..."), 0 },
-            { 990,  7, 43, 1751200400000ull, oc_slice_str("deploy again"), 0 },
+            { 1001, 7, 42, 1751200500000ull, oc_slice_str("... the deploy ..."), 0, -2500000 },
+            { 990,  7, 43, 1751200400000ull, oc_slice_str("deploy again"), 0, -1250000 },
         };
         oc_search_results in = { 2, ents, 1 };
         ROUNDTRIP(oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH_RESULTS, h, p);
@@ -1267,6 +1277,7 @@ static void test_search_frames(void) {
         CHECK(out[0].message_id == 1001 && out[0].channel_id == 7 && out[0].author_id == 42);
         CHECK(out[0].server_time == 1751200500000ull && slice_eq_str(out[0].snippet, "... the deploy ..."));
         CHECK(out[1].message_id == 990 && slice_eq_str(out[1].snippet, "deploy again"));
+        CHECK(out[0].rank == -2500000 && out[1].rank == -1250000);
     }
 }
 

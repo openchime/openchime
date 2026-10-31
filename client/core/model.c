@@ -1105,7 +1105,8 @@ static void thread_append(oc_model *m, uint64_t message_id, uint64_t author_id,
 
 /* Append a search hit, stealing ownership of `*snippet` (NULL on success). */
 static void search_append(oc_model *m, uint64_t message_id, uint64_t channel_id,
-                          uint64_t author_id, uint64_t server_time, uint8_t action, char **snippet) {
+                          uint64_t author_id, uint64_t server_time, uint8_t action, int64_t rank,
+                          char **snippet) {
     for (size_t i = 0; i < m->n_search; i++)
         if (m->search_results[i].message_id == message_id) return;   /* dedup */
     if (m->n_search == m->cap_search) {
@@ -1118,6 +1119,7 @@ static void search_append(oc_model *m, uint64_t message_id, uint64_t channel_id,
     sr->message_id = message_id; sr->channel_id = channel_id;
     sr->author_id = author_id; sr->server_time = server_time;
     sr->action = action;
+    sr->rank = rank;
     sr->snippet = *snippet; *snippet = NULL;
 }
 
@@ -2531,7 +2533,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     case OC_EV_SEARCH_RESULT:
         if (m->search_open) {
-            search_append(m, e->message_id, e->channel_id, e->author_id, e->server_time, e->action, &e->body);
+            search_append(m, e->message_id, e->channel_id, e->author_id, e->server_time, e->action, e->rank, &e->body);
             if (e->status) m->search_truncated = 1;
         }
         break;

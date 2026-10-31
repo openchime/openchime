@@ -479,10 +479,16 @@ static const char *name_for(const oc_channel *ch, uint64_t uid) {
 
 /* Build the rows for the open search view: a header + each hit (channel, time,
  * author, snippet). */
+/* The order a search's results come in (OC_SEARCH_*), cycled with Ctrl+O while
+ * the results are open and kept for the next search. */
+static uint8_t g_search_sort;
+static const char *const SEARCH_SORT_NAME[3] = { "newest first", "oldest first", "best match first" };
+
 static void build_search_rows(rows_t *r, const oc_model *m, int width) {
     char line[200];
-    snprintf(line, sizeof line, "%zu result%s for \"%s\"", m->n_search,
-             m->n_search == 1 ? "" : "s", m->search_query);
+    snprintf(line, sizeof line, "%zu result%s for \"%s\", %s (Ctrl+O: order)", m->n_search,
+             m->n_search == 1 ? "" : "s", m->search_query,
+             SEARCH_SORT_NAME[m->search_sort < 3 ? m->search_sort : 0]);
     char *h = malloc(strlen(line) + 1);
     if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
     for (size_t i = 0; i < m->n_search; i++) {
@@ -821,6 +827,7 @@ static void draw_help(int W, int H) {
         { "New DM",     "type to find a person · Space end-to-end encrypted · Enter opens" },
         { "Encrypted",  "Ctrl+K: accept or decline, trust a new key, end or forget it" },
         { "Messages",   "t thread · r react · e edit · x delete" },
+        { "Search",     "Ctrl+O newest first · oldest first · best match first" },
         { NULL, NULL },
         { NULL, "Everything else" },
         { "Ctrl+K",     "notifications, invites, webhooks, profile, upload, logout…" },
@@ -3272,6 +3279,16 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* Ctrl+O on open results: the next order, and the search again in it --
+         * a page in one order is no cursor in another. */
+        if (ev.key == TB_KEY_CTRL_O && oc_client_model(cl)->search_open && !prompt_kind) {
+            g_search_sort = (uint8_t)((g_search_sort + 1) % 3);
+            char q[128];
+            snprintf(q, sizeof q, "%s", oc_client_model(cl)->search_query);
+            if (q[0]) oc_client_search(cl, q, g_search_sort);
+            continue;
+        }
+
         size_t nch = oc_client_model(cl)->n_channels;
         if (switcher_open) {                   /* workspace switcher (REQ-013) */
             int rows = g_nsw + 1;              /* + the "log in to new" row */
@@ -3405,7 +3422,7 @@ int main(int argc, char **argv) {
                 int k = prompt_kind;
                 prompt_kind = PROMPT_NONE;
                 if      (k == PROMPT_NEWCHAN && *v) oc_client_create_channel(cl, v);
-                else if (k == PROMPT_SEARCH  && *v) oc_client_search(cl, v);
+                else if (k == PROMPT_SEARCH  && *v) oc_client_search(cl, v, g_search_sort);
                 else if (k == PROMPT_NICK    && *v) oc_client_set_display_name(cl, v);
                 else if (k == PROMPT_WEBHOOK && *v) oc_client_create_webhook(cl, act_cid, v);
                 else if (k == PROMPT_INVITE) {

@@ -451,28 +451,33 @@ void oc_client_open_search(oc_client *c) {
     oc_model_search_begin(&c->model, "");
 }
 
-void oc_client_search(oc_client *c, const char *query) {
+void oc_client_search(oc_client *c, const char *query, uint8_t sort) {
     if (!c || !query || !query[0]) return;
     oc_model_search_begin(&c->model, query);      /* clears prior hits + records it */
+    c->model.search_sort = sort;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SEARCH);
     if (!cmd) return;
     cmd->body = strdup(query);
+    cmd->op = sort;
     oc_queue_push(&c->cmds, cmd);
 }
 
-/* the next page of the CURRENT search. `before_id` is the oldest id already
- * shown — a keyset cursor, so a message posted while you page cannot make a row
- * repeat or vanish the way an OFFSET would. The query is re-sent verbatim because the
- * server holds no search state; that is deliberate (a stateless server cannot leak a
- * stale cursor).
+/* the next page of the CURRENT search, in its order. The cursor is the last hit
+ * shown -- its id, and by relevance its rank -- a keyset, so a message posted
+ * while you page cannot make a row repeat or vanish the way an OFFSET would. The
+ * query and the order are re-sent verbatim because the server holds no search
+ * state; that is deliberate (a stateless server cannot leak a stale cursor).
  *
  * Appends rather than replacing: oc_model_search_begin is NOT called here. */
-void oc_client_search_more(oc_client *c, uint64_t before_id) {
-    if (!c || !before_id || !c->model.search_query[0]) return;
+void oc_client_search_more(oc_client *c) {
+    if (!c || !c->model.search_query[0] || !c->model.n_search) return;
+    const oc_search_result *last = &c->model.search_results[c->model.n_search - 1];
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SEARCH);
     if (!cmd) return;
     cmd->body = strdup(c->model.search_query);
-    cmd->message_id = before_id;
+    cmd->op = c->model.search_sort;
+    cmd->message_id = last->message_id;
+    cmd->rank = last->rank;
     oc_queue_push(&c->cmds, cmd);
 }
 
