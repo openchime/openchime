@@ -51,10 +51,18 @@ WIN_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
 WIN_TUI_RES := build/openchime_tui_res.o
 $(WIN_TUI_RES): client/tui/res/openchime_tui.rc $(WIN_RES_SRC) $(MINGW_CC) | build
 	$(WINDRES) $(WINDRES_ARGS) $< -O coff -o $@
-$(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(WIN_TUI_RES) \
-                $(wildcard client/tui/*.h tuikit/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) $(BUILD_ID_STAMP) | build
-	$(WINCC) $(WIN_CFLAGS) $(VERSION_DEF) -Wno-unused-result $(WIN_INC) \
-	    $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(WIN_TUI_RES) \
+# Each Windows binary is linked from one object per source, in a tree of its
+# own per flag set (mk/sources.mk, "Objects"), so `make -j` spreads the
+# compiles; the resource objects stay link inputs. A change of the compiler
+# recompiles a tree, and of the build id the trees that take it, as the
+# daemon's does. -mwindows (the GUI subsystem) is the link's: on a compile
+# alone it is an unused argument, which -Werror refuses.
+WIN_TUI_CC   = $(WINCC) $(WIN_CFLAGS) $(VERSION_DEF) -Wno-unused-result $(WIN_INC)
+WIN_TUI_OBJS := $(call oc_objs,$(OBJ_DIR)/win-tui,$(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC))
+$(eval $(call oc_obj_rules,$(OBJ_DIR)/win-tui,WIN_TUI_CC,$(MINGW_CC) $(BUILD_ID_STAMP),$(WIN_MBEDLIBS)))
+-include $(WIN_TUI_OBJS:.o=.d)
+$(WIN_TUI_BIN): $(WIN_TUI_OBJS) $(WIN_TUI_RES) $(WIN_MBEDLIBS) | build
+	$(WINCC) $(WIN_CFLAGS) $(WIN_TUI_OBJS) $(WIN_TUI_RES) \
 	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lcrypt32 -lole32 -ladvapi32 -lshell32 -static -o $@
 
 # --- The GUI ------------------------------------------------------------------
@@ -105,11 +113,12 @@ WIN_GUI_RES := build/openchime_res.o
 $(WIN_GUI_RES): client/gui/platform/win32/res/openchime.rc client/gui/platform/win32/res/openchime.ico \
                 client/gui/platform/win32/res/openchime_res.h $(WIN_RES_SRC) $(MINGW_CC) | build
 	$(WINDRES) -I client/gui/platform/win32/res $(WINDRES_ARGS) $< -O coff -o $@
-$(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
-                $(wildcard client/gui/app/*.h client/gui/platform/*.h client/gui/platform/win32/*.h client/core/*.h shared/*.h sdltext/*.h client/gui/gfx/*.h) $(MEDIA_HDRS) $(VOICE_HDRS) $(CALL_HDRS) \
-                $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A) $(BUILD_ID_STAMP) | build
-	$(WINCC) $(WIN_CFLAGS) $(VERSION_DEF) -std=c11 -Wno-unused-result -mwindows $(WIN_GUI_INC) $(WIN_MEDIA_INC) -Iclient/gui/platform/win32/res \
-	    $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
+WIN_GUI_CC   = $(WINCC) $(WIN_CFLAGS) $(VERSION_DEF) -std=c11 -Wno-unused-result $(WIN_GUI_INC) $(WIN_MEDIA_INC) -Iclient/gui/platform/win32/res
+WIN_GUI_OBJS := $(call oc_objs,$(OBJ_DIR)/win-gui,$(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SHARED_SRC))
+$(eval $(call oc_obj_rules,$(OBJ_DIR)/win-gui,WIN_GUI_CC,$(MINGW_CC) $(BUILD_ID_STAMP),$(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A)))
+-include $(WIN_GUI_OBJS:.o=.d)
+$(WIN_GUI_BIN): $(WIN_GUI_OBJS) $(WIN_GUI_RES) $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A) | build
+	$(WINCC) $(WIN_CFLAGS) -std=c11 -mwindows $(WIN_GUI_OBJS) $(WIN_GUI_RES) \
 	    $(WIN_MBEDLIBS) $(WIN_MEDIA_A) -L$(SDL3_WIN)/lib -lSDL3 -lws2_32 -ldnsapi -lbcrypt -lcrypt32 -lcomdlg32 \
 	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -limm32 $(WIN_MEDIA_SYSLIBS) $(WIN_SDL_SYSLIBS) -static -o $@
 # Split the debug info out rather than discarding it. The client writes real
@@ -131,16 +140,21 @@ windows: $(WIN_GUI_BIN) $(WIN_TUI_BIN)
 # header/vtable check mingw keeps honest), a Windows host -- or WSL interop --
 # runs it. docs/TESTING.md records the split.
 WIN_SDLTEXT_TEST := build/sdltext_test.exe
-$(WIN_SDLTEXT_TEST): $(SDLTEXT_WIN) sdltext/st_test_win.c $(wildcard sdltext/*.h) $(MINGW_CC) | build
-	$(WINCC) $(WIN_CFLAGS) $(SDLTEXT_INC) \
-	    $(SDLTEXT_WIN) sdltext/st_test_win.c \
+WIN_SDLTEXT_CC   = $(WINCC) $(WIN_CFLAGS) $(SDLTEXT_INC)
+WIN_SDLTEXT_OBJS := $(call oc_objs,$(OBJ_DIR)/win-sdltext,$(SDLTEXT_WIN) sdltext/st_test_win.c)
+$(eval $(call oc_obj_rules,$(OBJ_DIR)/win-sdltext,WIN_SDLTEXT_CC,$(MINGW_CC),))
+-include $(WIN_SDLTEXT_OBJS:.o=.d)
+$(WIN_SDLTEXT_TEST): $(WIN_SDLTEXT_OBJS) | build
+	$(WINCC) $(WIN_CFLAGS) $(WIN_SDLTEXT_OBJS) \
 	    -ld2d1 -ldwrite -lwindowscodecs -lole32 -luuid -static -o $@
 # The gfx layer's: SDL's software renderer on a plain surface -- no window, no
 # GPU -- asserting pixels. Exit code is the failure count (docs/TESTING.md, the
 # platform-backend exception).
 WIN_GFX_TEST := build/gfx_test.exe
-$(WIN_GFX_TEST): $(GFX_SRC) client/gui/gfx/gfx_test_win.c client/shared/icons.c \
-                 $(wildcard client/gui/gfx/*.h) $(SDL3_WIN_LIB) $(MINGW_CC) | build
-	$(WINCC) $(WIN_CFLAGS) -std=c11 -Iclient/gui/gfx -Iclient/shared -I$(SDL3_WIN)/include \
-	    $(GFX_SRC) client/gui/gfx/gfx_test_win.c client/shared/icons.c \
+WIN_GFX_CC   = $(WINCC) $(WIN_CFLAGS) -std=c11 -Iclient/gui/gfx -Iclient/shared -I$(SDL3_WIN)/include
+WIN_GFX_OBJS := $(call oc_objs,$(OBJ_DIR)/win-gfx,$(GFX_SRC) client/gui/gfx/gfx_test_win.c client/shared/icons.c)
+$(eval $(call oc_obj_rules,$(OBJ_DIR)/win-gfx,WIN_GFX_CC,$(MINGW_CC),$(SDL3_WIN_LIB)))
+-include $(WIN_GFX_OBJS:.o=.d)
+$(WIN_GFX_TEST): $(WIN_GFX_OBJS) $(SDL3_WIN_LIB) | build
+	$(WINCC) $(WIN_CFLAGS) -std=c11 $(WIN_GFX_OBJS) \
 	    -L$(SDL3_WIN)/lib -lSDL3 $(WIN_SDL_SYSLIBS) -static -o $@
