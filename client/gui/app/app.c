@@ -57,7 +57,7 @@
 #include "table.h"      /* a table as a grid: the composer's cards and the table editor (MARKDOWN.md §1a) */
 #include "searchq.h"    /* the same query parser the core sends to the daemon */
 #include "resolve.h"
-#include "store.h"            /* peek a stored session token (skip the login box) */
+#include "store.h"            /* peek a stored session token (skip the sign-in box) */
 #include "oc_port.h"          /* oc_mkdir, oc_localtime_r */
 #include "protocol.h"         /* OC_CHANNEL_KIND_DM, OC_PRESENCE_* */
 #include "build_id.h"         /* OC_BUILD_ID: About OpenChime */
@@ -9646,7 +9646,7 @@ static void draw_prefs(gfx *rt, rectf reg) {
                      "Minimising hides the window instead of leaving it on the taskbar.",
                      ONOFF2, 2, g_pref_min_tray ? 1 : 0);
         y = pref_row(rt, body, y, PREF_ROW_STARTUP, "Start with Windows",
-                     "Sign in and start receiving messages when you log in.",
+                     "Sign in and start receiving messages when you sign in.",
                      ONOFF2, 2, startup_enabled() ? 1 : 0);
         /* Reset ends the category it belongs to. "Advanced" held this and a DPI
          * override and nothing else; the override was a harness affordance that
@@ -30124,7 +30124,7 @@ static void signin_submit(oc_win *hwnd) {
         if (!g_si_ws[0]) { snprintf(g_si_err, sizeof g_si_err,
                                     "enter a workspace (domain or name)"); goto redraw; }
         oc_endpoint ep;
-        /* Same statuses and wording as the TUI's login box, so the two clients
+        /* Same statuses and wording as the TUI's sign-in box, so the two clients
          * describe an unresolvable workspace identically. */
         oc_resolve_status st = oc_resolve(g_si_ws, oc_default_suffix(), &ep);
         if (st == OC_RESOLVE_BAD_WORKSPACE) {

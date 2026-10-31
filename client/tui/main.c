@@ -14,11 +14,11 @@
  * signed-in workspace (g_ws, up to MAX_WS), ticks them all every frame so a
  * background workspace keeps receiving and counting unread, and renders only the
  * active one. Ctrl+W opens the switcher: remembered workspaces with their unread +
- * connection state, and an always-present "Log in to new workspace" row. Each
+ * connection state, and an always-present "Sign in to a new workspace" row. Each
  * session carries its own focused channel, scroll, and half-typed message, so
  * switching away and back doesn't lose work.
  *
- * Usage: openchime-tui [<workspace>]      (login box if omitted)
+ * Usage: openchime-tui [<workspace>]      (sign-in box if omitted)
  *        openchime-tui <host> <port>      (dev/local direct connect)
  *
  * Keys: everything is menus, dialogs, and screens — no commands to type. The
@@ -48,7 +48,7 @@
 #include "model.h"
 #include "complete.h"
 #include "resolve.h"    /* workspace -> host:port (REQ-010/011) */
-#include "store.h"      /* peek a stored session token (skip the login box) */
+#include "store.h"      /* peek a stored session token (skip the sign-in box) */
 #include "secret_os.h" /* OS keyring for the session token */
 #include "config.h"     /* machine-local prefs (mouse, panels, time) */
 #include "env.h"        /* the development inputs */
@@ -830,7 +830,7 @@ static void draw_help(int W, int H) {
         { "Search",     "Ctrl+O newest first · oldest first · best match first" },
         { NULL, NULL },
         { NULL, "Everything else" },
-        { "Ctrl+K",     "notifications, invites, webhooks, profile, upload, logout…" },
+        { "Ctrl+K",     "notifications, invites, webhooks, profile, upload, sign out…" },
         { "Summaries",  "Summarize ▾ in the title, Ctrl+K, or Enter on a channel" },
         { "",           "↑/↓ select · Space details · Enter goes to the message" },
     };
@@ -1039,7 +1039,7 @@ static const tk_pal_item g_launcher_items[] = {
     { "Admin",   "Daemon alerts",       NULL, NULL, ACT_ALERTS },
     { "Workspace","Switch workspace",   NULL, "Ctrl+W", ACT_WORKSPACES },
     { "Session", "Help",                NULL, "?",  ACT_HELP },
-    { "Session", "Log out",             NULL, NULL, ACT_LOGOUT },
+    { "Session", "Sign out",            NULL, NULL, ACT_LOGOUT },
     { "Channel", "Summarize",           NULL, NULL, ACT_SUMMARIZE },
 };
 /* The launcher as it is now: summaries only where the daemon makes them
@@ -2170,7 +2170,7 @@ static int sumcal_key(oc_client *cl, const struct tb_event *ev) {
 
 /* ---- workspace switcher (REQ-013) -------------------------------------------
  * One list, the same on every platform: the workspaces this device remembers,
- * each with its unread + connection state, and an always-present "Log in to new
+ * each with its unread + connection state, and an always-present "Sign in to a new
  * workspace" row at the bottom. Open sessions come first (they have live state
  * to show), then remembered-but-closed workspaces from the book. */
 
@@ -2218,7 +2218,7 @@ static void sw_build(void) {
 
 static void draw_switcher(int sel) {
     int W = tb_width(), H = tb_height();
-    int rows = g_nsw + 1;                       /* + the "log in" row */
+    int rows = g_nsw + 1;                       /* + the "sign in" row */
     int show = rows > 12 ? 12 : rows;
     int bw = 60; if (bw > W - 4) bw = W - 4; if (bw < 28) bw = 28;
     int bh = show + 4; if (bh > H - 2) bh = H - 2;
@@ -2238,7 +2238,7 @@ static void draw_switcher(int sel) {
 
         char line[320];
         if (idx == g_nsw) {                      /* the always-present last row */
-            snprintf(line, sizeof line, "+ Log in to new workspace");
+            snprintf(line, sizeof line, "+ Sign in to a new workspace");
             tk_text(x + 2, y + 1 + i, x + bw - 1, line,
                       is_sel ? fg : (th->ok | TB_BOLD), bg);
             continue;
@@ -2542,7 +2542,7 @@ static void draw_field(int x, int y, int w, const char *label, const char *val,
     }
 }
 
-/* Run the login box until the user submits (fields filled, workspace resolved into
+/* Run the sign-in box until the user submits (fields filled, workspace resolved into
  * `f->ep`) or quits. `err` is an optional message to show (e.g. a prior auth
  * failure). Returns LOGIN_SUBMIT or LOGIN_QUIT. */
 static int login_dialog(login_form *f, const char *err) {
@@ -2777,7 +2777,7 @@ static void remember_workspace(const char *key, const char *label, const char *u
     oc_store_close(s);
 }
 
-/* Drive the login box + connect, retrying on failure, until authenticated or the
+/* Drive the sign-in box + connect, retrying on failure, until authenticated or the
  * user quits. On success fills `w` (client + key/label/user) and returns 1.
  * `initial_user` pre-fills the username when re-signing into a known workspace. */
 static int run_login(const char *initial_workspace, const char *initial_user,
@@ -2825,7 +2825,7 @@ static int run_login(const char *initial_workspace, const char *initial_user,
 }
 
 /* Open (or re-focus) a workspace from the switcher. A stored session token
- * reconnects silently; without one we fall back to the login box pre-filled with
+ * reconnects silently; without one we fall back to the sign-in box pre-filled with
  * what the book knows. Returns the session index, or -1 if it didn't open. */
 static int open_workspace(const char *key, const char *label, const char *user) {
     int existing = ws_find(key);
@@ -2877,7 +2877,7 @@ static int open_workspace(const char *key, const char *label, const char *user) 
 }
 
 /* Is a still-valid session token stored for this workspace? If so we skip the
- * login box and let the net thread reconnect silently. */
+ * sign-in box and let the net thread reconnect silently. */
 static int have_stored_token(const char *store_path, const char *key, const char *host, int port,
                              oc_secret *secret) {
     oc_store *s = store_path ? oc_store_open(store_path) : NULL;
@@ -2902,7 +2902,7 @@ int main(int argc, char **argv) {
     if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         fprintf(stderr, "usage: %s [<workspace>]\n"
                         "       %s <host> <port>\n"
-                        "  With no workspace a login box is shown; local accounts sign in\n"
+                        "  With no workspace a sign-in box is shown; local accounts sign in\n"
                         "  in the browser or with a device code (AUTH.md).\n",
                         argv[0], argv[0]);
         return 0;
@@ -2928,7 +2928,7 @@ int main(int argc, char **argv) {
     /* Decide how to connect. Three shapes:
      *   <host> <port> : dev/local direct connect (argv[2] is a port);
      *   <workspace>   : resolve by DNS (REQ-010), then connect;
-     *   (nothing)     : show the login box (REQ-020).
+     *   (nothing)     : show the sign-in box (REQ-020).
      * Connect directly when a session token is
      * already stored; otherwise prompt. A resolution failure is reported
      * distinctly from connect/auth failure (REQ-011). */
@@ -2960,7 +2960,7 @@ int main(int argc, char **argv) {
             oc_hostport(host, port, key0, sizeof key0);
         if (have_stored_token(store_path, key0, host, port, secret)) { cred = ""; direct = 1; }  /* silent reconnect */
         else                                                       { prefill = inst; direct = 0; }  /* prompt */
-    }                                                /* else: no args -> login box */
+    }                                                /* else: no args -> sign-in box */
     if (!cred) cred = "";
 
     if (tb_init() != TB_OK) {
@@ -2996,7 +2996,7 @@ int main(int argc, char **argv) {
     } else if (run_login(prefill, NULL, store_path, secret, &g_ws[0])) {
         g_nws = 1;
     } else {
-        tb_shutdown();       /* user quit the login box */
+        tb_shutdown();       /* user quit the sign-in box */
         oc_secret_free(secret);
         return 0;
     }
@@ -3291,7 +3291,7 @@ int main(int argc, char **argv) {
 
         size_t nch = oc_client_model(cl)->n_channels;
         if (switcher_open) {                   /* workspace switcher (REQ-013) */
-            int rows = g_nsw + 1;              /* + the "log in to new" row */
+            int rows = g_nsw + 1;              /* + the "sign in to a new" row */
             if (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C) switcher_open = 0;
             else if (ev.key == TB_KEY_CTRL_Q) running = 0;
             else if (ev.key == TB_KEY_ARROW_DOWN) { if (wsel + 1 < rows) wsel++; }
@@ -3317,7 +3317,7 @@ int main(int argc, char **argv) {
                 g_ws[g_active].last_focus_cid = last_focus_cid;
 
                 int target;
-                if (wsel >= g_nsw) {           /* "+ Log in to new workspace" */
+                if (wsel >= g_nsw) {           /* "+ Sign in to a new workspace" */
                     if (g_nws >= MAX_WS) { switcher_open = 0; continue; }
                     target = run_login(NULL, NULL, store_path, secret, &g_ws[g_nws])
                            ? g_nws++ : -1;

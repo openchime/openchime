@@ -2558,7 +2558,7 @@ static const char *auth_error_text(uint16_t code, int reconnecting) {
     case OC_ERR_USER_LIMIT:              return "this workspace is full";
     case OC_ERR_AUTH_SOURCE_UNAVAILABLE: return "this way of signing in isn't available right now";
     case OC_ERR_AUTH_REQUIRED:           return "this workspace doesn't sign in that way";
-    default: return reconnecting ? "session expired: please log in again" : "auth failed";
+    default: return reconnecting ? "session expired: please sign in again" : "auth failed";
     }
 }
 
