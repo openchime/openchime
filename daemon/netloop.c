@@ -3994,9 +3994,10 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (oc_decode_set_display_name(&p, &sn) != OC_OK) return -1;
             oc_job *j = oc_job_new(OC_JOB_SET_DISPLAY_NAME, c->conn_id);
             if (!j) return -1;
-            size_t nl = sn.name.len < OC_MAX_DISPLAY_NAME ? sn.name.len : OC_MAX_DISPLAY_NAME;
+            /* Whole: the writer refuses a name over the cap (FORBIDDEN), and a
+             * cut here would store a shorter one, maybe inside a character. */
             j->user_id = c->user_id;
-            j->pf_name = strndup((const char *)sn.name.ptr, nl);
+            j->pf_name = strndup((const char *)sn.name.ptr, sn.name.len);
             if (!j->pf_name) return -1;
             oc_dbwriter_submit(dbw, j);
             continue;

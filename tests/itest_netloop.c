@@ -4704,6 +4704,47 @@ static int main_db_int(const char *sql) {
     return v;
 }
 
+/* A display name past its cap is refused, not cut (REQ-240, PROTOCOL.md):
+ * 49 bytes, and 47 bytes and a two-byte character whose 48-byte cut would fall
+ * inside it, are each FORBIDDEN, the connection open and the stored name
+ * unchanged; 48 bytes is taken whole. carol's own name is put back after. */
+static int set_name(client *c, const char *name) {
+    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_display_name sn = { oc_slice_str(name) };
+    return oc_encode_set_display_name(&w, OC_PROTOCOL_VERSION, &sn) == OC_OK ? send_frame(c, buf, w.len) : -1;
+}
+static void test_display_name_limits(int port, const uint8_t *pin) {
+    client c;
+    uint64_t uc = 0;
+    CHECK(client_open(&c, port, pin) == 0 && do_handshake(&c) == 0 && do_auth(&c, "carol", "pw", &uc) == 0);
+    char same[128], whole[160];
+    snprintf(same, sizeof same, "SELECT display_name = 'carol' FROM users WHERE id = %llu;", (unsigned long long)uc);
+    snprintf(whole, sizeof whole, "SELECT length(display_name) = 48 AND display_name GLOB 'z*' FROM users WHERE id = %llu;",
+             (unsigned long long)uc);
+    CHECK(main_db_int(same) == 1);
+    char n49[50], n47u[50], n48[49];
+    memset(n49, 'x', 49); n49[49] = '\0';
+    memset(n47u, 'y', 47); memcpy(n47u + 47, "\xC3\xA9", 2); n47u[49] = '\0';   /* ...e-acute, bytes 48 and 49 */
+    memset(n48, 'z', 48); n48[48] = '\0';
+    const char *const refused[] = { n49, n47u };
+    for (int i = 0; i < 2; i++) {
+        uint16_t code = 0;
+        CHECK(set_name(&c, refused[i]) == 0);
+        CHECK(read_error(&c, &code) == 0 && code == OC_ERR_FORBIDDEN);
+        CHECK(main_db_int(same) == 1);
+    }
+    /* Still open, and 48 bytes is a name. */
+    CHECK(set_name(&c, n48) == 0);
+    oc_header hdr; oc_rbuf p; oc_profile_updated pu;
+    CHECK(read_type(&c, OC_MSG_PROFILE_UPDATED, &hdr, &p) == 0 && oc_decode_profile_updated(&p, &pu) == OC_OK);
+    CHECK(pu.user_id == uc && pu.display_name.len == 48 && memcmp(pu.display_name.ptr, n48, 48) == 0);
+    CHECK(main_db_int(whole) == 1);
+    CHECK(set_name(&c, "carol") == 0);
+    CHECK(read_type(&c, OC_MSG_PROFILE_UPDATED, &hdr, &p) == 0);
+    CHECK(main_db_int(same) == 1);
+    client_close(&c);
+}
+
 static void test_alerts_wire(int port, const uint8_t *pin, oc_dbwriter *dbw) {
     oc_dbwriter_alert(dbw, "test.wire", "a thing the daemon cannot fix alone");
     /* stored, and told to nobody signed in */
@@ -7590,6 +7631,7 @@ int run_netloop_tests(void) {
         test_call_leave_while_joining(arg.port, pin, dbw);
         test_alerts_wire(arg.port, pin, dbw);
         test_restore_wire(arg.port, pin);
+        test_display_name_limits(arg.port, pin);
         test_call_state_audience(arg.port, pin);
         test_call_share(arg.port, pin);
         test_call_udp_vertical(arg.port, pin, audio_port);
