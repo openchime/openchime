@@ -200,11 +200,17 @@ jobs:
           # `SIGN` requires all six, so a PARTIAL set is the dangerous state: it
           # reads as configured and silently ships unsigned. Named separately
           # for that reason.
+          # The ones missing are named by their secret names, never values:
+          # a count says something is wrong, a name says what to set.
           ts_set=0
-          for v in TS_ENDPOINT TS_ACCOUNT TS_PROFILE AZ_TENANT AZ_CLIENT AZ_SECRET; do
-            eval "val=\${$v:-}"
-            [ -n "$val" ] && ts_set=$((ts_set + 1))
+          ts_missing=""
+          for v in TS_ENDPOINT:TRUSTED_SIGNING_ENDPOINT TS_ACCOUNT:TRUSTED_SIGNING_ACCOUNT \
+                   TS_PROFILE:TRUSTED_SIGNING_PROFILE AZ_TENANT:AZURE_TENANT_ID \
+                   AZ_CLIENT:AZURE_CLIENT_ID AZ_SECRET:AZURE_CLIENT_SECRET; do
+            eval "val=\${${v%%:*}:-}"
+            if [ -n "$val" ]; then ts_set=$((ts_set + 1)); else ts_missing="$ts_missing ${v#*:}"; fi
           done
+          ts_missing="${ts_missing# }"
 
           {
             echo "### Release credentials"
@@ -219,12 +225,12 @@ jobs:
             case "$ts_set" in
               6) echo "Authenticode signing: configured." ;;
               0) echo "Authenticode signing: not configured — the installer ships unsigned, as designed." ;;
-              *) echo "Authenticode signing: **PARTIALLY configured ($ts_set of 6)** — signing will be skipped and the installer will ship unsigned. Set all six or none." ;;
+              *) echo "Authenticode signing: **PARTIALLY configured ($ts_set of 6; missing: $ts_missing)** — signing will be skipped and the installer will ship unsigned. Set all six or none." ;;
             esac
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$ts_set" != 0 ] && [ "$ts_set" != 6 ]; then
-            echo "::warning::Authenticode signing is partially configured ($ts_set of 6); the installer will ship unsigned."
+            echo "::warning::Authenticode signing is partially configured ($ts_set of 6; missing: $ts_missing); the installer will ship unsigned."
           fi
 
           if [ -z "$missing" ]; then
@@ -686,11 +692,37 @@ jobs:
       - name: Note the missing signature
         if: ${{ !inputs.dry_run && env.SIGN != 'true' }}
         shell: bash
+        # Which of the six are set, as the preflight sees them: "unset" is only
+        # true when none is, and a partial set is named, not miscounted.
+        env:
+          TS_ENDPOINT: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          TS_ACCOUNT:  ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          TS_PROFILE:  ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+          AZ_TENANT:   ${{ secrets.AZURE_TENANT_ID }}
+          AZ_CLIENT:   ${{ secrets.AZURE_CLIENT_ID }}
+          AZ_SECRET:   ${{ secrets.AZURE_CLIENT_SECRET }}
         run: |
-          echo "::warning::Artifact Signing credentials are not set; the Windows installer and binaries in this release are UNSIGNED. Users will see a SmartScreen warning."
+          ts_set=0
+          ts_missing=""
+          for v in TS_ENDPOINT:TRUSTED_SIGNING_ENDPOINT TS_ACCOUNT:TRUSTED_SIGNING_ACCOUNT \
+                   TS_PROFILE:TRUSTED_SIGNING_PROFILE AZ_TENANT:AZURE_TENANT_ID \
+                   AZ_CLIENT:AZURE_CLIENT_ID AZ_SECRET:AZURE_CLIENT_SECRET; do
+            eval "val=\${${v%%:*}:-}"
+            if [ -n "$val" ]; then ts_set=$((ts_set + 1)); else ts_missing="$ts_missing ${v#*:}"; fi
+          done
+          ts_missing="${ts_missing# }"
+          if [ "$ts_set" = 0 ]; then
+            echo "::warning::Artifact Signing credentials are not set; the Windows installer and binaries in this release are UNSIGNED. Users will see a SmartScreen warning."
+          else
+            echo "::warning::Artifact Signing credentials are partially set (missing: $ts_missing); the Windows installer and binaries in this release are UNSIGNED. Users will see a SmartScreen warning."
+          fi
           echo "### Windows artifacts are unsigned" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "TRUSTED_SIGNING_ENDPOINT / _ACCOUNT / _PROFILE and AZURE_TENANT_ID / _CLIENT_ID / _CLIENT_SECRET are unset, so signing was skipped. Set all six to turn it back on; nothing else needs changing." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ts_set" = 0 ]; then
+            echo "TRUSTED_SIGNING_ENDPOINT / _ACCOUNT / _PROFILE and AZURE_TENANT_ID / _CLIENT_ID / _CLIENT_SECRET are unset, so signing was skipped. Set all six to turn it back on; nothing else needs changing." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Artifact Signing is partially set ($ts_set of 6; missing: $ts_missing), so signing was skipped. Set the missing ones to turn it back on; nothing else needs changing." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Sign the installer
         if: env.SIGN == 'true'
