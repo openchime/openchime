@@ -27,6 +27,7 @@
 #include "http.h"
 #include "webpages.h"
 #include "pwpolicy.h"
+#include "utf8proc.h"   /* a demo visitor's name (AUTH.md §8.12) */
 #include "demolimits.h"
 #include "webapp.h"   /* the sign-in pages (AUTH.md §8.10) */
 #include "devicecodes.h" /* a terminal signs in with a code (AUTH.md §8.11) */
@@ -54,6 +55,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -196,6 +198,11 @@ typedef struct web_req {
     char step[OC_STEP_TICKET_LEN + 1];   /* a second step's: the ticket it is for */
     char rp[256], origin[300];           /* reached on a passkey's trusted name: which */
     int  done;                           /* SIGNIN: just back from setting a new password */
+    /* SIGNUP in a demo workspace (AUTH.md §8.12): the visitor's name, and what
+     * the page says again if it is shown again. */
+    int  demo;
+    char name[256], terms[320];
+    unsigned left_min;
 } web_req;
 
 typedef struct conn_s {
@@ -4888,7 +4895,9 @@ static void web_page(conn *c, int status, const oc_page *pg) {
     if (!html) { http_reply(c, 500, "text/plain", "error\n", 6); return; }
     int scripts = pg->pk_mode != 0 || (pg->kind == OC_PAGE_SECURITY && pg->sec == OC_SEC_CODES) ||
                   oc_page_has_password(pg);
-    web_reply_ex(c, status, html, len, pg->redirect_uri, NULL, scripts);
+    int opts = (scripts ? OC_PAGE_HDR_SCRIPTS : 0) |
+               (pg->kind == OC_PAGE_SIGNUP && pg->demo ? OC_PAGE_HDR_PREFETCH : 0);
+    web_reply_ex(c, status, html, len, pg->redirect_uri, NULL, opts);
     free(html);
 }
 
@@ -4920,6 +4929,63 @@ static int is_compact_jws(const char *s) {
         else if (!isalnum((unsigned char)ch) && ch != '-' && ch != '_') return 0;
     }
     return dots == 2;
+}
+
+/* A demo visitor's name (AUTH.md §8.12), trimmed in place: at most 40
+ * characters, valid UTF-8 with no control or format character, and not the
+ * demo's own. The writer refuses an owner's or an admin's. */
+#define DEMO_NAME_MAX 40
+static oc_page_err demo_name_check(char *name) {
+    size_t n = strlen(name), a = 0;
+    while (a < n && isspace((unsigned char)name[a])) a++;
+    while (n > a && isspace((unsigned char)name[n - 1])) n--;
+    memmove(name, name + a, n - a);
+    name[n - a] = '\0';
+    n -= a;
+    if (n == 0) return OC_PERR_NAME_EMPTY;
+    size_t chars = 0;
+    for (utf8proc_ssize_t i = 0; i < (utf8proc_ssize_t)n;) {
+        utf8proc_int32_t cp;
+        utf8proc_ssize_t k = utf8proc_iterate((const utf8proc_uint8_t *)name + i, (utf8proc_ssize_t)n - i, &cp);
+        if (k <= 0) return OC_PERR_NAME_CHARS;
+        utf8proc_category_t cat = utf8proc_category(cp);
+        if (cat == UTF8PROC_CATEGORY_CC || cat == UTF8PROC_CATEGORY_CF || cat == UTF8PROC_CATEGORY_CN ||
+            cat == UTF8PROC_CATEGORY_CS || cat == UTF8PROC_CATEGORY_CO) return OC_PERR_NAME_CHARS;
+        i += k;
+        chars++;
+    }
+    if (chars > DEMO_NAME_MAX) return OC_PERR_NAME_LONG;
+    if (strcasecmp(name, "OpenChime") == 0 || strcasecmp(name, "OpenChime Demo") == 0) return OC_PERR_NAME_RESERVED;
+    return OC_PERR_NONE;
+}
+
+/* The username a demo visitor gets: the name's ASCII letters and digits,
+ * lowercased, up to 20, then "-" and four random base32 characters, so two
+ * visitors of the same name are two people; "guest" when the name has none. */
+static int demo_username(const char *name, char *out, size_t cap) {
+    static const char B32[] = "abcdefghijklmnopqrstuvwxyz234567";
+    char base[21];
+    size_t o = 0;
+    for (const char *p = name; *p && o < 20; p++)
+        if (isalnum((unsigned char)*p) && !((unsigned char)*p & 0x80)) base[o++] = (char)tolower((unsigned char)*p);
+    base[o] = '\0';
+    uint8_t rnd[4];
+    if (oc_rand_bytes(rnd, sizeof rnd) != 0) return -1;
+    int n = snprintf(out, cap, "%s-%c%c%c%c", o ? base : "guest",
+                     B32[rnd[0] & 31], B32[rnd[1] & 31], B32[rnd[2] & 31], B32[rnd[3] & 31]);
+    return n > 0 && (size_t)n < cap ? 0 : -1;
+}
+
+/* What the demo's sign-up page says beside the form: the terms, on the
+ * issuer's site (central, whose invite brought the visitor), and the minutes
+ * to the nightly erase at 00:00 UTC, rounded up. */
+static void demo_page_facts(oc_dbwriter *dbw, char *terms, size_t cap, unsigned *left_min) {
+    const char *origin = oc_dbwriter_relay_origin(dbw);
+    if (origin && origin[0]) snprintf(terms, cap, "%s/demo/terms", origin);
+    else terms[0] = '\0';
+    time_t now = time(NULL);
+    unsigned left_s = (unsigned)(86400 - (unsigned long)(now % 86400));
+    *left_min = (left_s + 59) / 60;
 }
 
 static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw);   /* fwd */
@@ -5041,7 +5107,8 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
               field_get(q, "invite", w->invite, sizeof w->invite) ||
               field_get(q, "password", pass, sizeof pass) ||
               field_get(q, "confirm", confirm, sizeof confirm) ||
-              field_get(q, "current", current, sizeof current);
+              field_get(q, "current", current, sizeof current) ||
+              field_get(q, "name", w->name, sizeof w->name);
     char set[4] = "";
     if (!post && kind == OC_PAGE_SIGNIN && field_get(q, "set", set, sizeof set) == 0 && strcmp(set, "1") == 0)
         w->done = 1;   /* just back from setting a new password */
@@ -5064,16 +5131,22 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     }
     /* A sign-in link carrying an invitation opens the sign-up form. */
     if (!post && kind == OC_PAGE_SIGNIN && w->invite[0]) kind = w->kind = OC_PAGE_SIGNUP;
+    /* A demo's own invite opens its one-field sign-up (AUTH.md §8.12). */
+    if (kind == OC_PAGE_SIGNUP && oc_config_get()->mode == OC_MODE_DEMO && is_compact_jws(w->invite)) {
+        w->demo = 1;
+        demo_page_facts(dbw, w->terms, sizeof w->terms, &w->left_min);
+    }
     const char *wsname = oc_config_get()->workspace_name;
     oc_page pg = { .kind = kind, .redirect_uri = w->redirect_uri, .nonce = w->nonce,
                    .username = w->username, .invite = w->invite, .done = w->done,
-                   .workspace = wsname };
+                   .workspace = wsname, .demo = w->demo, .name = w->name, .terms_url = w->terms,
+                   .demo_left_min = w->left_min };
     if (!post) { web_page(c, 200, &pg); free(w); return -1; }
 
     int rc = -1;
     oc_job *j = NULL;
     char norm[OC_PW_NORM_MAX];
-    if (kind == OC_PAGE_SIGNUP || kind == OC_PAGE_PASSWORD) {
+    if ((kind == OC_PAGE_SIGNUP && !w->demo) || kind == OC_PAGE_PASSWORD) {
         const char *np = pass;
         if (strcmp(np, confirm) != 0) { pg.err = OC_PERR_PW_MISMATCH; goto show; }
         if (!np[0]) { pg.err = OC_PERR_PW_EMPTY; goto show; }
@@ -5100,8 +5173,21 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
             demo = oc_config_get()->mode == OC_MODE_DEMO && is_compact_jws(w->invite);
             if (!demo) { pg.err = OC_PERR_INVITE_INVALID; goto show; }
         }
+        if (w->demo) {
+            /* The visitor gives a name and nothing else: the username is made
+             * from it, and the password is a secret nobody is shown, so the
+             * account is signed into once, here, and never by a password. */
+            oc_page_err ne = demo_name_check(w->name);
+            if (ne != OC_PERR_NONE) { pg.err = ne; goto show; }
+            uint8_t secret[32];
+            if (demo_username(w->name, w->username, sizeof w->username) != 0 ||
+                oc_rand_bytes(secret, sizeof secret) != 0) goto fail;
+            oc_base64url_encode(secret, sizeof secret, pass);
+            oc_e2e_wipe(secret, sizeof secret);
+        }
         j = oc_job_new(OC_JOB_REDEEM, c->conn_id);
         if (!j || oc_job_set_register(j, w->username, pass, 0, 0) != 0 ||
+            (w->demo && oc_job_set_display(j, w->name) != 0) ||
             (demo ? oc_job_set_token(j, w->invite, strlen(w->invite)) : oc_job_set_token(j, raw, sizeof raw)) != 0)
             goto fail;
         j->demo_invite = (uint8_t)demo;
@@ -5590,7 +5676,9 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
         return;
     }
     oc_page pg = { .kind = w->kind, .redirect_uri = w->redirect_uri, .nonce = w->nonce,
-                   .username = w->username, .invite = w->invite, .user_code = w->user_code };
+                   .username = w->username, .invite = w->invite, .user_code = w->user_code,
+                   .workspace = oc_config_get()->workspace_name, .demo = w->demo, .name = w->name,
+                   .terms_url = w->terms, .demo_left_min = w->left_min };
     if (r->type == OC_RES_WEB_STEP2) {
         /* What the password proved, kept against a ticket for the step page --
          * which posts from the page it replaces, at that page's depth. */
@@ -5705,6 +5793,8 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
         switch (r->err_code) {
         case OC_ERR_AUTH_RATE_LIMITED: status = 429; pg.err = OC_PERR_RATE_LIMITED; break;
         case OC_ERR_USER_LIMIT:        pg.err = OC_PERR_WORKSPACE_FULL; break;
+        /* A demo visitor's name that is an owner's or an admin's (AUTH.md §8.12). */
+        case OC_ERR_GROUP_HANDLE_TAKEN: pg.err = w->demo ? OC_PERR_NAME_RESERVED : OC_PERR_SIGNUP_REFUSED; break;
         case OC_ERR_SIGNUP_LIMITED:
             status = 429; pg.err = OC_PERR_SIGNUP_LIMITED; break;
         case OC_ERR_AUTH_SETUP_REQUIRED:

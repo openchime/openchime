@@ -379,6 +379,7 @@ typedef struct oc_job {
     /* REGISTER (create a local account; AUTH.md §2 — bootstrap / invite) */
     char          *username;  /* heap */
     char          *password;  /* heap */
+    char          *display;   /* heap, or NULL: a demo visitor's display name (AUTH.md §8.12) */
     uint8_t        role;      /* OC_ROLE_* for the new account (also SET_ROLE next) */
     uint16_t       uses;      /* INVITE_USER: how many may redeem it; 0 = no limit */
     uint32_t       mem_kib;/* Argon2id memory, KiB (0 -> the writer's, OC_PW_MEM_KIB) */
@@ -1501,6 +1502,9 @@ int     oc_job_set_proof(oc_job *j, const void *proof, size_t len);
 int     oc_job_set_email(oc_job *j, const void *email, size_t len);
 int     oc_job_set_body(oc_job *j, const void *body, size_t len);
 /* Fill a REGISTER job (copies strings). mem_kib 0 -> the writer's Argon2id memory. */
+/* REDEEM in a demo workspace: the new account's display name, which is
+ * otherwise its username. */
+int     oc_job_set_display(oc_job *j, const char *display);
 int     oc_job_set_register(oc_job *j, const char *username, const char *password,
                             uint8_t role, uint32_t mem_kib);
 

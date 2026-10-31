@@ -8632,6 +8632,40 @@ static void test_demo_mode(void) {
     oc_dbres_free(r);
     #undef DEMO_REDEEM
 
+    /* The one-field sign-up: a name, and an account made from it. A visitor may
+     * not take an owner's or an admin's name, whatever its case and spacing,
+     * and such a refusal leaves the invite unspent; at the workspace's limit
+     * there is no room. */
+    CHECK(reg(w, "dana", "pw", OC_ROLE_OWNER) != 0);
+    #define DEMO_MINT(jti) do { \
+        snprintf(pay, sizeof pay, "{\"iss\":\"%s\",\"aud\":\"%s\",\"iat\":%llu,\"exp\":%llu," \
+                 "\"jti\":\"%s\",\"role\":\"member\"}", ISS, AUD, now - 5, now + 895, jti); \
+        n = oc_issuer_mint(&is, hdr, pay, tok); } while (0)
+    #define DEMO_NAMED(cid, user, display, out) do { \
+        oc_job *j = oc_job_new(OC_JOB_REDEEM, cid); \
+        j->web = OC_WEB_SIGNUP; j->demo_invite = 1; \
+        snprintf(j->web_nonce, sizeof j->web_nonce, "%s", test_challenge()); \
+        oc_job_set_register(j, user, "an-unshown-random-secret", 0, TEST_PW_MEM); \
+        oc_job_set_display(j, display); \
+        oc_job_set_token(j, tok, n); \
+        oc_dbwriter_submit(w, j); \
+        out = wait_result(w); } while (0)
+    DEMO_MINT("d-2");
+    DEMO_NAMED(45, "dana-q7k2", "  DANA ", r);
+    CHECK(r && r->type == OC_RES_WEB_ERR && r->err_code == OC_ERR_GROUP_HANDLE_TAKEN);
+    oc_dbres_free(r);
+    DEMO_NAMED(46, "ada-q7k2", "Ada Lovelace", r);   /* the same invite: not spent */
+    CHECK(r && r->type == OC_RES_WEB_OK);
+    oc_dbres_free(r);
+    oc_dbwriter_set_max_users(w, 3);                  /* visitor, dana and Ada: full */
+    DEMO_MINT("d-3");
+    DEMO_NAMED(47, "grace-b4m2", "Grace", r);
+    CHECK(r && r->type == OC_RES_WEB_ERR && r->err_code == OC_ERR_USER_LIMIT);
+    oc_dbres_free(r);
+    oc_dbwriter_set_max_users(w, 0);
+    #undef DEMO_NAMED
+    #undef DEMO_MINT
+
     /* The seed: once, its channels and messages, by an author nobody signs in as. */
     CHECK(oc_dbwriter_seed_demo(w, "Demo") == 1);
     CHECK(oc_dbwriter_seed_demo(w, "Demo") == 0);
@@ -8641,6 +8675,13 @@ static void test_demo_mode(void) {
     CHECK(demo_count(db, "SELECT COUNT(*) FROM messages m JOIN users u ON u.id=m.author_id "
                           "WHERE u.subject='demo:openchime' AND u.disabled=1;") == 5);
     CHECK(demo_count(db, "SELECT COUNT(*) FROM users WHERE subject='local:visitor' AND role='member';") == 1);
+    CHECK(demo_count(db, "SELECT COUNT(*) FROM users WHERE subject='local:ada-q7k2' AND display_name='Ada Lovelace' "
+                          "AND role='member';") == 1);
+    CHECK(demo_count(db, "SELECT COUNT(*) FROM local_credentials c JOIN users u ON u.id=c.user_id "
+                          "WHERE u.subject='local:ada-q7k2';") == 1);
+    CHECK(demo_count(db, "SELECT COUNT(*) FROM audit_log WHERE action='user.demo_join' AND target='ada-q7k2' "
+                          "AND detail LIKE '%terms=accepted%';") == 1);
+    CHECK(demo_count(db, "SELECT COUNT(*) FROM users WHERE subject='local:grace-b4m2';") == 0);
     sqlite3_int64 visitor = 0;
     {
         sqlite3_stmt *st = NULL;

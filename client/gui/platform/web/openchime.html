@@ -165,6 +165,26 @@ canvas{display:block;outline:none}
     const inv = q.get('invite') || '';
     if (/^[0-9a-f]{64}$/.test(inv) || (inv.length <= 1000 && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(inv)))
       args.push('--invite', inv); }
+  // An invitation goes to the sign-up page before the client loads (WEB.md,
+  // "An invitation"): the client is only needed once the account exists, so
+  // the page makes the sign-in's verifier and challenge itself (AUTH.md §8.2),
+  // leaves them where oc_signin_stash would (signin_web.c), and the client that
+  // comes back with ?token= resumes from them. Without Web Crypto (not a
+  // secure context), or if it fails once, the client begins it as before.
+  let noHop = false; try { noHop = sessionStorage.getItem('oc.nohop') === '1'; sessionStorage.removeItem('oc.nohop'); } catch (e) {}
+  if (args.includes('--invite') && !q.has('token') && !noHop && window.isSecureContext && window.crypto && crypto.subtle) {
+    window.ocHop = true;
+    stage('Opening the invitation…');
+    const b64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    (async () => {
+      const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
+      const challenge = b64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))));
+      sessionStorage.setItem('oc.signin.source', 'local');
+      sessionStorage.setItem('oc.signin.verifier', verifier);
+      location.replace('/signin?redirect_uri=' + encodeURIComponent(location.origin + '/app/') +
+                       '&nonce=' + encodeURIComponent(challenge) + '&invite=' + encodeURIComponent(q.get('invite')));
+    })().catch(() => { try { sessionStorage.setItem('oc.nohop', '1'); } catch (e) {} location.reload(); });
+  }
   var Module = {
     arguments: args,
     // The test knobs the native harness sets in the environment (TESTING.md)
@@ -291,7 +311,7 @@ if (!window.crossOriginIsolated) {
   document.querySelector('#load .stage').textContent =
     'This page was not served with the isolation OpenChime needs (Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy). Open it from the workspace\'s own address.';
   document.getElementById('load').classList.add('failed');
-} else {
+} else if (!window.ocHop) {
   const s = document.createElement('script');
   s.src = 'openchime.js';
   s.onerror = () => { const l = document.getElementById('load'); if (!l) return;

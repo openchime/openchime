@@ -157,12 +157,17 @@ for the person:
 sign-in form itself and follow the redirect back (`plat_web.c`).
 
 **An invitation link.** `/app/?invite=<hex>` is the page opened with an
-invitation (REQ-026): the page starts the client as `openchime --signin
-<host:port> --invite <hex>`, the sign-in begins with the invitation, and the
-daemon's page opens on the sign-up form, naming the workspace and carrying the
-invitation out of sight, so a person who was sent the link
-chooses a username and password in the browser and comes back here signed in
-as the new member, with nothing installed. The clients offer the link in the
+invitation (REQ-026). The client is needed only once the account exists, so the
+page does not load it first: it makes the sign-in's verifier and challenge with
+Web Crypto (AUTH.md §8.2), leaves them in the tab's session storage where
+`oc_signin_stash` would, and goes straight to the daemon's sign-up form, naming
+the workspace and carrying the invitation out of sight. A person who was sent
+the link chooses a username and password in the browser (in a demo workspace,
+gives a name: AUTH.md §8.12) and comes back here, where the client loads and
+resumes from what the page kept, signed in as the new member, with nothing
+installed. Outside a secure context, or if Web Crypto fails, the page starts
+the client as `openchime --signin <host:port> --invite <hex>` and the sign-in
+begins as any other. The clients offer the link in the
 invitation text where the daemon's pages open directly
 (`oc_client_pages_direct`); `scripts/web/invite.mjs` proves it from a cold
 browser.

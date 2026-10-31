@@ -257,6 +257,12 @@ int oc_job_set_register(oc_job *j, const char *username, const char *password,
     return 0;
 }
 
+int oc_job_set_display(oc_job *j, const char *display) {
+    free(j->display);
+    j->display = display ? strdup(display) : NULL;
+    return display && !j->display ? -1 : 0;
+}
+
 int oc_job_set_body(oc_job *j, const void *body, size_t len) {
     j->body = malloc(len ? len : 1);
     if (!j->body) return -1;
@@ -283,6 +289,7 @@ static void job_free(oc_job *j) {
     free(j->sq_in);
     free(j->username);
     free(j->password);
+    free(j->display);
     free(j->body);
     free(j->cursors);
     free(j->ch_name);
@@ -3043,6 +3050,18 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
     sqlite3_finalize(st);
     if (taken) { r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r; }
 
+    /* A demo visitor may not take the name of someone who runs the demo: an
+     * owner's or an admin's, ignoring case and the spaces around it (AUTH.md
+     * §8.12). The invite is not spent. */
+    if (j->demo_invite && j->display) {
+        sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE role IN ('owner','admin') "
+                               "AND lower(trim(display_name)) = lower(trim(?));", -1, &st, NULL);
+        sqlite3_bind_text(st, 1, j->display, -1, SQLITE_TRANSIENT);
+        int reserved = sqlite3_step(st) == SQLITE_ROW;
+        sqlite3_finalize(st);
+        if (reserved) { r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_GROUP_HANDLE_TAKEN; return r; }
+    }
+
     /* Registered-user cap (AUTH.md §2): a redeem that would create a new member is
      * refused once the workspace is at its limit. */
     if (user_slots_full(db, subject, sublen, w->max_users)) {
@@ -3061,7 +3080,16 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
         sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
         sqlite3_step(st);
         sqlite3_finalize(st);
-        audit_log(db, OC_AUDIT_ACCOUNT, "user.demo_join", 0, NULL, uid, user, 1, "via=browser");
+        /* The name the visitor gave, in place of the username made from it. */
+        if (j->display && j->display[0]) {
+            sqlite3_prepare_v2(db, "UPDATE users SET display_name=? WHERE id=?;", -1, &st, NULL);
+            sqlite3_bind_text(st, 1, j->display, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)uid);
+            sqlite3_step(st);
+            sqlite3_finalize(st);
+        }
+        /* Entering the demo is agreeing to its terms; this entry is when. */
+        audit_log(db, OC_AUDIT_ACCOUNT, "user.demo_join", 0, NULL, uid, user, 1, "via=browser terms=accepted");
         return web_finish(w, j, r, uid);
     }
     /* Take one use; the last one consumes the invite (REQ-026). The single

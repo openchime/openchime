@@ -1022,9 +1022,10 @@ the daemon's page and bootstraps its user.
   what this proves, and what no scripted post can. Then an invitation link
   (REQ-026): the owner mints an invite anyone may use (`build/demo_client
   ... invite 0`) and a second browser opens `/app/?invite=<hex>` cold
-  (`scripts/web/invite.mjs`), lands on the sign-up form, chooses a name and a
-  password and comes back signed in to the web client, which its own dump
-  says. Last, the client's load (`scripts/web/load.mjs`, WEB.md "Loading"),
+  (`scripts/web/invite.mjs`), lands on the sign-up form before the client has
+  been fetched, chooses a name and a password and comes back signed in to the
+  web client, which its own dump says; the tab is closed and the client opened
+  again in a new one, and it is still signed in. Last, the client's load (`scripts/web/load.mjs`, WEB.md "Loading"),
   cold and then warm in one browser that trusts the daemon's certificate by
   its key (a browser caches nothing from one it was told to overlook): the load
   screen counts the download in bytes against its size, shows Downloading,

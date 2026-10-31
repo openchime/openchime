@@ -15,7 +15,7 @@ if (!origin || !invite) { console.error('usage: invite.mjs <origin> <invite-hex>
 
 const browser = await chromium.launch({ headless: true, executablePath: exe || undefined, args: ['--ignore-certificate-errors'] });
 const ctx = await browser.newContext({ ignoreHTTPSErrors: true });
-const page = await ctx.newPage();
+let page = await ctx.newPage();
 const say = (s) => console.log(s);
 let failures = 0;
 const check = (ok, what) => { if (ok) say('  ok   ' + what); else { say('  FAIL ' + what); failures++; } };
@@ -27,12 +27,17 @@ const until = async (what, pred, ms) => {
   }
 };
 
-// 1. The link: the web client starts with the invitation and sends the
-// browser to the sign-up form. ?hook=1 keeps the client's test hook for the
-// tab, which is how its state is read afterwards (openchime.html).
+// 1. The link: the page sends the browser to the sign-up form before the web
+// client loads -- the client is needed only once the account exists. ?hook=1
+// keeps the client's test hook for the tab, which is how its state is read
+// afterwards (openchime.html).
+let wasmAt = 0;
+page.on('request', (req) => { if (!wasmAt && req.url().endsWith('/openchime.wasm')) wasmAt = Date.now(); });
 await page.goto(`${origin}/app/?invite=${invite}&hook=1`);
 await until('the sign-up form', async () => (await page.locator('form[action="signup"]').count()) === 1, 60000);
+const formAt = Date.now();
 check(page.url().startsWith(origin + '/signin?'), 'the link opens the daemon\'s sign-up form');
+check(!wasmAt || wasmAt >= formAt - 1000, 'without loading the web client first');
 check(new URL(page.url()).searchParams.get('invite') === invite, 'with the invitation');
 
 // 2. The newcomer chooses a name and a password and is sent back to the web client.
@@ -58,5 +63,23 @@ await until('the client to sign in', async () => {
 }, 60000).catch((e) => { say('  FAIL ' + e.message); failures++; });
 check(/authed=1 connected=1/.test(dump), 'the new member is signed in to the web client');
 check(!page.url().includes('token='), 'the token is taken off the address');
+
+// 4. The tab closed and the web client opened again: the session is kept, as
+// any remembered one is, so the newcomer is the same person, still signed in.
+await page.close();
+page = await ctx.newPage();
+await page.goto(`${origin}/app/?hook=1`);
+let dump2 = '';
+await until('the client to sign in again', async () => {
+  dump2 = await page.evaluate(async () => {
+    try {
+      if (typeof ocHook !== 'function' || typeof FS === 'undefined') return '';
+      await ocHook('dump /t/d.txt', 5000);
+      return FS.readFile('/t/d.txt', { encoding: 'utf8' });
+    } catch (e) { return ''; }
+  });
+  return /authed=1 connected=1/.test(dump2);
+}, 60000).catch((e) => { say('  FAIL ' + e.message); failures++; });
+check(/authed=1 connected=1/.test(dump2), 'a closed tab keeps the session');
 await browser.close();
 process.exit(failures ? 1 : 0);

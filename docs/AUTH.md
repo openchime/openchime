@@ -938,7 +938,12 @@ same loopback and challenge checks as §8.1, is answered with a **path**:
   loopback address when `<host>` is the `Host` the page's WebSocket was
   upgraded with (`daemon/webapp.h`). The browser leaves the client for the
   sign-in page and comes back to it with the token on the address, and the
-  client resumes from what it kept in the tab's session storage.
+  client resumes from what it kept in the tab's session storage. An invitation
+  link (`/app/?invite=`) does not wait for the client: the page itself makes
+  the verifier and challenge with Web Crypto, keeps them where the client
+  would, and goes straight to the sign-up page, so the client loads once, after
+  the account exists. Without Web Crypto (not a secure context) the client
+  begins it as for any sign-in.
 
 The person signs in on the page; the daemon checks the password on the same
 staged path as §2 — the limiters, the pool, the credential's version, the audit
@@ -954,7 +959,8 @@ from `daemon/webpages.c`:
 - `/signin` — username and password. A sign-in link carrying `invite=` opens the
   sign-up form instead.
 - `/signup` — an invitation or the setup token, a username and a password twice.
-  It makes the account, then goes on as a sign-in.
+  It makes the account, then goes on as a sign-in. In a demo workspace,
+  central's invite opens a form of one field instead (§8.12).
 - `/account/password` — username, current password and a new one twice. It
   needs no session, so the limiters stand in front of it as of a sign-in. A
   change revokes every session the account has and closes each connection on
@@ -1059,6 +1065,23 @@ and the relay's keys are what vouch for them.
   (`oc_jwt_verify_demo_invite`), and that its `jti` was never used -- kept as a
   spent invite, so a restart does not forget it. A sign-in token is no invite
   and an invite no sign-in token: the type and the claims differ.
+- **One field.** With central's invite the sign-up page asks for the visitor's
+  name and nothing else, and says under its one button that the demo is
+  public, is erased every night at 00:00 UTC (with the time left), takes no
+  personal information, and that entering agrees to the demo terms, at
+  `/demo/terms` on central's origin. The name is trimmed and must be 1 to 40
+  characters, with no control or format character, and not "OpenChime",
+  "OpenChime Demo" or an owner's or admin's display name, ignoring case; a
+  refused name spends nothing. The username is made from it (its ASCII letters
+  and digits, lowercased, up to 20, then `-` and four random characters;
+  `guest` when it has none), and the password is 32 random bytes nobody is
+  shown, so the account is signed into once, from this page, and no password
+  sign-in, password change or second step opens it. The visitor goes on signed
+  in as from any sign-up, and the `user.demo_join` audit entry records that the
+  terms were accepted. At the workspace's user cap the page says the demo is
+  full until 00:00 UTC. The page prefetches the web client while the name is
+  typed: its policy allows this origin (`default-src 'self'`) and still runs no
+  script.
 - **What a visitor is.** A member. Members cannot manage people, so the admin
   screens are shown through the owner's account, which is the operator's.
 - **Daily limits** (`daemon/demolimits.c`), per person and per workspace, in a

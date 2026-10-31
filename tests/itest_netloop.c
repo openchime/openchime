@@ -25,6 +25,7 @@
 #include "sqlite3.h"
 #include "signin.h"       /* a verifier and its challenge, as a client makes them */
 #include "localissuer.h"   /* a token the daemon did not sign, to refuse */
+#include "issuer.h"        /* central's demo invite, minted here (AUTH.md §8.12) */
 #include "devicecodes.h"
 #include "oidcrp.h"        /* a direct connection's worker */
 #include "jwt.h"
@@ -3593,6 +3594,108 @@ static void dev_daemon_stop(struct dev_daemon *d) {
     oc_dbwriter_stop(d->dbw);
     oc_tls_server_free(&d->srv);
     db_unlink("itest_dev.db");
+}
+
+
+/* A demo workspace's sign-up (AUTH.md §8.12): central's invite opens a page
+ * that asks for a name and nothing else, says what the demo is and links its
+ * terms; the name is checked; and the visitor goes on signed in, to an account
+ * no password opens. */
+static void test_demo_signup(void) {
+    setenv("OPENCHIME_MODE", "demo", 1);
+    setenv("OPENCHIME_AUTH", "local,relay", 1);
+    setenv("OPENCHIME_ENROLL_URL", "https://central.example", 1);
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin) == 0);
+    db_unlink("itest_demo.db");
+    oc_dbwriter *dbw2 = oc_dbwriter_start(tpath("itest_demo.db"));
+    CHECK(dbw2 != NULL);
+    if (!dbw2) { oc_tls_server_free(&srv2); return; }
+    oc_dbwriter_set_pw_mem(dbw2, 2048);
+    oc_dbwriter_set_demo(dbw2, 1);
+    oc_issuer is;
+    CHECK(oc_issuer_init(&is, "oc-itest-demo") == 0);
+    const char *ISS = "https://central.example", *AUD = "ws_demo";
+    CHECK(oc_dbwriter_configure_oidc(dbw2, ISS, AUD, is.pem, ISS) == 0);
+    CHECK(oc_dbwriter_register_local(dbw2, "dana", "pw-dana", OC_ROLE_OWNER, 2048) != 0);
+    char kid[OC_JWT_THUMBPRINT_LEN + 1], hdr[200], pay[512], inv[2048];
+    CHECK(oc_jwt_key_thumbprint(is.pem, strlen(is.pem) + 1, kid) == 0);
+    snprintf(hdr, sizeof hdr, "{\"alg\":\"ES256\",\"typ\":\"" OC_JWT_DEMO_INVITE_TYP "\",\"kid\":\"%s\"}", kid);
+    unsigned long long now = (unsigned long long)time(NULL);
+    snprintf(pay, sizeof pay, "{\"iss\":\"%s\",\"aud\":\"%s\",\"iat\":%llu,\"exp\":%llu,\"jti\":\"it-1\",\"role\":\"member\"}",
+             ISS, AUD, now - 5, now + 895);
+    CHECK(oc_issuer_mint(&is, hdr, pay, inv) > 0);
+    struct loop_arg arg2;
+    pthread_t th2;
+    int port = start_loop(&arg2, &th2, &srv2, dbw2, 0);
+    CHECK(port != 0);
+
+    char resp[16384], tok[2048], body[4096], path[2560];
+    char ver[OC_SIGNIN_VERIFIER_LEN + 1], ch[OC_SIGNIN_CHALLENGE_LEN + 1];
+    CHECK(oc_signin_verifier(ver, ch) == 0);
+    snprintf(path, sizeof path, "/signin?redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&invite=%s", ch, inv);
+    CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
+    CHECK(oc_test_page_is(resp, "signup") && !oc_test_page_any_error(resp));
+    /* contract: the page's markup -- one field, no password, the terms and the time left */
+    CHECK(strstr(resp, "name=\"name\"") != NULL && strstr(resp, "type=\"password\"") == NULL);
+    CHECK(strstr(resp, "name=\"username\"") == NULL);
+    CHECK(strstr(resp, "href=\"https://central.example/demo/terms\"") != NULL);
+    CHECK(strstr(resp, "data-oc-demo-terms") != NULL);
+    CHECK(strstr(resp, "00:00 UTC (in ") != NULL);   /* contract: the time left, which the page computes */
+    CHECK(strstr(resp, "rel=\"prefetch\" href=\"/app/openchime.wasm\"") != NULL);   /* contract: HTML */
+    /* contract: CSP -- the prefetch from this origin, and still no script */
+    CHECK(strstr(resp, "Content-Security-Policy: default-src 'self'") != NULL);   /* contract: CSP */
+    CHECK(strstr(resp, "script-src 'none'") != NULL);   /* contract: CSP */
+    CHECK(strstr(resp, "form-action 'self' http://127.0.0.1:5") != NULL);   /* contract: CSP */
+
+    /* The name: given, not too long, printable, and not one of those who run it. */
+    static const struct { const char *name, *err; } BAD[] = {
+        { "%20%20", "name-empty" },
+        { "Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "name-long" },
+        { "Ada%01", "name-chars" },
+        { "openchime%20demo", "name-reserved" },
+        { "%20DANA", "name-reserved" },
+    };
+    for (size_t i = 0; i < sizeof BAD / sizeof *BAD; i++) {
+        snprintf(body, sizeof body, "redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&invite=%s&name=%s",
+                 ch, inv, BAD[i].name);
+        CHECK(web_call(port, pin, "POST", "/signup", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(oc_test_page_is(resp, "signup") && oc_test_page_error(resp, BAD[i].err));
+    }
+    /* Refused names spent nothing: the same invite goes on, signed in. */
+    snprintf(body, sizeof body, "redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&invite=%s"
+             "&name=Ada%%20Lovelace", ch, inv);
+    CHECK(web_call(port, pin, "POST", "/signup", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 303);
+    CHECK(token_of(resp, tok, sizeof tok));
+    uint64_t ada = 0;
+    CHECK(token_auth(port, pin, tok, ver, &ada) == 0 && ada != 0);
+
+    /* Named as given, with a username made from the name; no password opens it. */
+    char user[128] = "";
+    {
+        sqlite3 *db = NULL; sqlite3_stmt *st = NULL;
+        CHECK(sqlite3_open(tpath("itest_demo.db"), &db) == SQLITE_OK);
+        sqlite3_prepare_v2(db, "SELECT substr(subject, 7) FROM users WHERE display_name='Ada Lovelace';", -1, &st, NULL);
+        if (sqlite3_step(st) == SQLITE_ROW) snprintf(user, sizeof user, "%s", (const char *)sqlite3_column_text(st, 0));
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+    }
+    CHECK(strncmp(user, "adalovelace-", 12) == 0 && strlen(user) == 16);
+    CHECK(web_signin(port, pin, user, "", ch, tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
+    CHECK(web_signin(port, pin, user, "Ada%20Lovelace", ch, tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
+
+    stop_loop(&arg2, th2);
+    oc_issuer_free(&is);
+    oc_dbwriter_stop(dbw2);
+    oc_tls_server_free(&srv2);
+    db_unlink("itest_demo.db");
+    unsetenv("OPENCHIME_MODE");
+    unsetenv("OPENCHIME_AUTH");
+    unsetenv("OPENCHIME_ENROLL_URL");
+    char cfgerr[128];
+    oc_config_load(cfgerr, sizeof cfgerr);
 }
 
 /* A terminal signs in with a code: asked for on the protocol, entered and
@@ -7685,6 +7788,7 @@ int run_netloop_tests(void) {
     test_read_aloud_absent();
     test_summaries();
     test_web_signin();
+    test_demo_signup();
     test_device_signin();
     test_direct_signin();
 
