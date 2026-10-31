@@ -140,12 +140,26 @@ full:
 # who can reach this machine can sign in with those passwords. Run it only on
 # a trusted network or behind a firewall. Connect from another terminal:
 # build/openchime-tui 127.0.0.1 8443, then sign in as alice/pw
+#
+# LEAN=1 runs the same daemon under the lean profile's ceiling (ARCH-4,
+# REQ-210): 256 MB with no swap and one CPU, in a transient systemd user scope,
+# so running out of memory ends in the kill a small box gives rather than
+# swapping. An approximation of a small machine, not a copy of one. Where no
+# user scope can be made it stops and says so; it never runs unconstrained.
+LEAN ?= 0
+LEAN_SCOPE := systemd-run --user --scope --quiet -p MemoryMax=256M -p MemorySwapMax=0 -p CPUQuota=100%
 run: $(BIN) $(TUI_BIN)
 	@mkdir -p /tmp/openchime-dev
+	@if [ "$(LEAN)" = 1 ] && ! $(LEAN_SCOPE) true >/dev/null 2>&1; then \
+	   echo "make run LEAN=1: cannot create a systemd user scope here (no systemd, no user session, or cgroup v2 delegation of the memory and cpu controllers missing)." >&2; \
+	   echo "The daemon was not started: it would have run without the limits. Run it on a host with a systemd user session, or in a 256 MB, one-CPU VM or container; or run make run without LEAN." >&2; \
+	   exit 1; \
+	 fi
 	@echo "openchime dev daemon -> port 8443 on EVERY interface, not just loopback  (users: alice/pw, bob/pw)"
+	@[ "$(LEAN)" != 1 ] || echo "lean profile: MemoryMax=256M, MemorySwapMax=0, CPUQuota=100% (one CPU), in a systemd user scope"
 	@echo "connect: build/openchime-tui 127.0.0.1 8443  (sign in as alice/pw)"
 	@OPENCHIME_MODE=development OPENCHIME_DATA_DIR=/tmp/openchime-dev OPENCHIME_PORT=8443 OPENCHIME_HEALTH_PORT=8080 \
-	 OPENCHIME_DEV_USERS="alice:pw:owner,bob:pw:member" ./$(BIN)
+	 OPENCHIME_DEV_USERS="alice:pw:owner,bob:pw:member" $(if $(filter 1,$(LEAN)),$(LEAN_SCOPE) -- )./$(BIN)
 
 # Every client the tree builds, one per platform: macOS, iOS and Android join
 # this list when they exist.

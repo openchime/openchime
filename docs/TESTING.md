@@ -1137,7 +1137,10 @@ latency from `build/bench_loop` below.
 Working from ~45 MB after a sign-in burst + ~100 KB per idle connection:
 
 - **By memory:** `(256 − 45) MB ÷ 100 KB ≈ 2,000 idle connections` before RAM
-  is the constraint in the lean profile (REQ-210).
+  is the constraint in the lean profile (REQ-210). `make run LEAN=1` runs the
+  development daemon under that ceiling locally — 256 MB, no swap, one CPU, in
+  a systemd user scope (README, "Local development environment") — an
+  approximation of a small box, not a copy of one.
 - **The fd cap:** `OC_NETLOOP_MAX_FD = 4096` (a compile-time constant in
   `daemon/netloop.c`) caps the daemon at ~4,000 connections whatever the RAM;
   that many idle connections need about 450 MB, so on a 256 MB box memory binds

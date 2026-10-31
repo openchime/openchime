@@ -329,6 +329,15 @@ and sign in as `alice` / `pw` (in the browser or with a device code):
 build/openchime-tui 127.0.0.1 8443
 ```
 
+`make run LEAN=1` runs the same daemon under the lean profile's ceiling (ARCH-4,
+REQ-210): at most 256 MB of memory with no swap, and one CPU, in a transient
+systemd user scope (`systemd-run --user --scope`). Past the ceiling the daemon is
+killed, as a small box would kill it, instead of swapping. It is an
+approximation of a small machine, not a copy of one: the disk, the network and
+the kernel are still this machine's. It needs a systemd user session with the
+memory and cpu controllers delegated; where it cannot make the scope, it stops
+and says so rather than running the daemon without limits.
+
 Stop it with Ctrl-C. To start from scratch, delete `/tmp/openchime-dev` — there
 are no volumes and no daemon holding state anywhere else.
 
@@ -363,10 +372,11 @@ See [LICENSING.md](LICENSING.md) for the full map, including `third_party/`.
 
 ## Known fidelity gaps
 
-- **Local development does not approximate the deployment target.**
-  `make run` applies no resource limits, so nothing stands in for the lean
-  memory profile (ARCH-4, REQ-210), and constrained-resource behaviour is
-  unexercised in local development.
+- **Local development only approximates the deployment target.**
+  `make run` applies no resource limits; `make run LEAN=1` applies the lean
+  profile's memory and CPU ceiling (ARCH-4, REQ-210) in a systemd user scope,
+  but on this machine's disk, network and kernel, so constrained-resource
+  behaviour is approximated rather than reproduced.
 - The container image is exercised by the staging build's image checks
   (TESTING.md §3.2: started, asked `/healthz`, replicated and restored) and by
   the release's smoke, which pulls the released tag and asks it `--version`.
