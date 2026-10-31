@@ -150,8 +150,8 @@ async function serve(line) {
       for (const [type, key, code, mods] of evs)
         t.dispatchEvent(new KeyboardEvent(type, { key, code, ...mods, bubbles: true, cancelable: true }));
     }, evs);
-    // A frame or two for the client to take the batch.
-    await new Promise((r) => setTimeout(r, 200));
+    // Dispatched, not yet taken: the client takes the batch on a frame of its
+    // own, so what follows polls for the state the chord leads to.
     writeAck('ok');
     return;
   }

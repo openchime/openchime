@@ -98,6 +98,11 @@ static void on_tcp(void *ctx, uint64_t conn_id, uint64_t sender, uint16_t seq,
 
 static int addressing_tests(void);
 
+/* The relay's clock for this suite: it moves only when a test moves it, so who
+ * the silence sweep drops is decided here and not by the scheduler. */
+static uint64_t g_relay_now = 1000000;
+static uint64_t relay_now(void) { return g_relay_now; }
+
 int run_audio_tests(void) {
     printf("test_audio: relay -- authorized fan-out, call isolation, address binding, revoke, "
            "keepalive echo, a full call, index collisions, the silence sweep\n");
@@ -111,6 +116,7 @@ int run_audio_tests(void) {
     oc_relay *r = oc_relay_open(udp, &hooks, NULL);
     CHECK(r != NULL);
     if (!r) return failures;
+    oc_relay_set_clock(r, relay_now);
 
     uint8_t tA[16], tB[16], tC[16], tD[16];
     memset(tA, 0xA1, 16); memset(tB, 0xB2, 16); memset(tC, 0xC3, 16); memset(tD, 0xD4, 16);
@@ -243,26 +249,23 @@ int run_audio_tests(void) {
         drain(cB); drain(cD);
     }
 
-    /* The sweep: B falls silent while A keeps talking; B is dropped and reported
-     * whole, A is not. */
+    /* The sweep: B falls silent while A and D keep talking; B is dropped and
+     * reported whole, A and D are not. Time is the relay's clock, moved here: B
+     * is last heard 70 ms before the sweep, A and D 40 ms, against a 60 ms window. */
     oc_relay_set_silence_ms(r, 60);
     g_gone.n = 0;
-    {   /* Silence is time passing, so time passes here: a third of the window
-         * between sweeps, until B is dropped or a deadline long past it. */
-        uint64_t end = oc_test_deadline(800);
-        uint16_t seq = 80;
-        do {
-            udp_send(cA, &relay_addr, tA, seq, NULL);
-            udp_send(cD, &relay_addr, tD, seq, NULL);
-            seq++;
-            pump(r, udp);
-            oc_test_let_time_pass(20);
-            oc_relay_sweep(r);
-        } while (!g_gone.n && oc_test_pause(end));
-    }
-    /* A descheduling longer than the window drops A or D as well: timing. */
-    CHECK_TIMING(g_gone.n == 1 && g_gone.len == 16 && memcmp(g_gone.t, tB, 16) == 0);
-    CHECK_TIMING(oc_relay_count(r) == 2);
+    g_relay_now += 30;
+    udp_send(cA, &relay_addr, tA, 80, NULL);
+    udp_send(cD, &relay_addr, tD, 80, NULL);
+    pump(r, udp);
+    g_relay_now += 40;
+    oc_relay_sweep(r);
+    CHECK(g_gone.n == 1 && g_gone.len == 16 && memcmp(g_gone.t, tB, 16) == 0);
+    CHECK(oc_relay_count(r) == 2);
+    /* And once A and D fall as silent, the next sweep drops them too. */
+    g_relay_now += 61;
+    oc_relay_sweep(r);
+    CHECK(oc_relay_count(r) == 0);
     oc_relay_set_silence_ms(r, 0);
 
     oc_relay_close(r);

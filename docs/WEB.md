@@ -200,8 +200,7 @@ context another rate (Safari for a microphone), a speexdsp resampler runs in
 the callback. A browser that cannot start the worklet falls back to a
 `ScriptProcessorNode` on the page's thread (1024 frames of latency), and the
 console says which ran (`oc-web: audio worklet`); `make web-test` requires
-the worklet when run by hand. Under `OC_TEST_TIMING=0` (CI) it skips this, the
-`sttest` check and the input method below (TESTING.md §3.4). The device lists come from a cache the page keeps
+the worklet (TESTING.md §3.4). The device lists come from a cache the page keeps
 (`devices_web.c`), so any thread can ask; the labels appear once a device
 has been allowed, as the browser decides.
 

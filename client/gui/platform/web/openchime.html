@@ -124,6 +124,30 @@ canvas{display:block;outline:none}
       if (a !== null) res(a); else if (Date.now() - t0 > limit) res('(no ack)'); else setTimeout(poll, 20); };
     setTimeout(poll, 20);
   });
+  // The model dump, fresh, or null when the hook did not answer (or the
+  // runtime is not up yet).
+  const dumpNow = async () => {
+    try { if ((await ocHook('dump /dump.txt', 10000)) === '(no ack)') return null; return FS.readFile('/dump.txt', { encoding: 'utf8' }); } catch (e) { return null; }
+  };
+  // Poll the dump until ok(text) holds: that text, or null once `limit` ms
+  // pass. What the harness waits on is the client's state, never a schedule.
+  const untilDump = async (ok, limit) => {
+    const t0 = Date.now();
+    for (;;) {
+      const t = await dumpNow();
+      if (t !== null && ok(t)) return t;
+      if (Date.now() - t0 > limit) return null;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  };
+  // Signed in, or SIGNIN-FAIL: logged with the dump's line, so the harness
+  // fails at once rather than waiting out a clock of its own.
+  const signedIn = async () => {
+    if (await untilDump((t) => authLine(t).includes('authed=1'), 60000)) return true;
+    const t = await dumpNow();
+    console.log('SIGNIN-FAIL:' + (t === null ? '(no dump)' : authLine(t)));
+    return false;
+  };
   window.ocShot = async () => { await ocHook('shot /shot.bmp', 1500); const b = FS.readFile('/shot.bmp'); let s = ''; for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(s); };
   // The command line. Served by the daemon (WEB.md) the page is
   // `openchime --signin <host:port>`: the workspace is the page's own origin
@@ -201,48 +225,47 @@ canvas{display:block;outline:none}
   if (hookOn && tq.has('cmd')) setTimeout(async () => console.log('ACK:' + (await ocHook(tq.get('cmd')))), parseInt(tq.get('at') || '6000', 10));
   // ?ime=1: once signed in, a composition is played into the hidden input the
   // platform keeps for the input method (plat_web.c) -- what a Japanese IME
-  // sends -- and the composer's text is logged as IME: for the web test.
+  // sends -- and the composer's line is logged as IME-COMPOSING: once it shows
+  // two units composing (comp=2), and as IME: once it holds two committed
+  // characters (len=2), for the web test; each is polled for, and logged as it
+  // stands if it never comes.
   if (hookOn && tq.get('ime') === '1') (async () => {
-    const t0 = Date.now(); let line = '';
-    while (Date.now() - t0 < 60000) {
-      await new Promise((r) => setTimeout(r, 1500));
-      try { await ocHook('dump /dump.txt', 1200); line = authLine(FS.readFile('/dump.txt', { encoding: 'utf8' })); } catch (e) { line = ''; }
-      if (line.includes('authed=1')) break;
-    }
-    await ocHook('channel general', 1500);
-    await new Promise((r) => setTimeout(r, 1500));
+    if (!(await signedIn())) return;
+    await ocHook('channel general', 10000);
+    const edLine = (t) => (t || '').split('\n').find((l) => l.startsWith('ed ')) || '';
+    if (!(await untilDump((t) => edLine(t) !== '', 30000))) { console.log('IME-ERR: no composer'); return; }
     const ime = document.getElementById('oc-ime');
     ime.focus();
     ime.dispatchEvent(new CompositionEvent('compositionstart', { data: '' }));
     ime.dispatchEvent(new CompositionEvent('compositionupdate', { data: 'にほ' }));
-    await new Promise((r) => setTimeout(r, 400));
-    await ocHook('dump /dump.txt', 1200);
-    let mid = ''; try { mid = FS.readFile('/dump.txt', { encoding: 'utf8' }).split('\n').find((l) => l.startsWith('ed ')) || ''; } catch (e) {}
-    ime.dispatchEvent(new CompositionEvent('compositionend', { data: '日本' }));
-    await new Promise((r) => setTimeout(r, 600));
-    await ocHook('dump /dump.txt', 1200);
-    let after = ''; try { after = FS.readFile('/dump.txt', { encoding: 'utf8' }).split('\n').find((l) => l.startsWith('ed ')) || ''; } catch (e) {}
+    const mid = edLine((await untilDump((t) => / comp=2 /.test(edLine(t)), 10000)) || (await dumpNow()));
     console.log('IME-COMPOSING:' + mid);
+    ime.dispatchEvent(new CompositionEvent('compositionend', { data: '日本' }));
+    const after = edLine((await untilDump((t) => /^ed len=2 /.test(edLine(t)), 10000)) || (await dumpNow()));
     console.log('IME:' + after);
   })();
-  // ?script=verb@ms|verb@ms…: each verb at its time after the client is signed
-  // in, its ACK logged; then, after the last, DUMP: of the model -- the web
-  // test's way of recording a video message end to end.
+  // ?script=step|step…: once the client is signed in, each step in turn. A
+  // step is a verb, sent and its ACK awaited and logged; or `verb~pattern …`,
+  // after whose ACK the dump is polled until every pattern (regular
+  // expressions, space-separated) matches one line of it, logged as UNTIL. A
+  // step that is not answered, or whose state never comes, ends the script.
+  // Then DUMPALL: of the model -- the web test's way of recording a video
+  // message end to end, paced by the client's state and not by a clock.
   if (hookOn && tq.has('script')) (async () => {
-    const t0 = Date.now(); let line = '';
-    while (Date.now() - t0 < 60000) {
-      await new Promise((r) => setTimeout(r, 1500));
-      try { await ocHook('dump /dump.txt', 1200); line = authLine(FS.readFile('/dump.txt', { encoding: 'utf8' })); } catch (e) { line = ''; }
-      if (line.includes('authed=1')) break;
-    }
-    const start = Date.now();
+    if (!(await signedIn())) return;
     for (const step of tq.get('script').split('|')) {
-      const [verb, at] = step.split('@');
-      const wait = start + parseInt(at || '0', 10) - Date.now();
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-      console.log('ACK ' + verb + ': ' + (await ocHook(verb, 1200)));
+      const [verb, cond] = step.split('~');
+      const ack = await ocHook(verb, 30000);
+      console.log('ACK ' + verb + ': ' + ack);
+      if (ack === '(no ack)') break;
+      if (cond) {
+        const pats = cond.split(' ').filter((x) => x).map((x) => new RegExp(x));
+        const held = await untilDump((t) => t.split('\n').some((l) => pats.every((re) => re.test(l))), 60000);
+        console.log('UNTIL ' + verb + ': ' + (held ? 'ok' : 'never: ' + cond));
+        if (!held) break;
+      }
     }
-    await ocHook('dump /dump.txt', 1500);
+    await ocHook('dump /dump.txt', 10000);
     try { console.log('DUMPALL:' + btoa(unescape(encodeURIComponent(FS.readFile('/dump.txt', { encoding: 'utf8' }))))); } catch (e) { console.log('DUMP-ERR:' + e); }
   })();
   if (hookOn && tq.has('dumpat')) setTimeout(async () => { await ocHook('dump /dump.txt', 1200); try { console.log('DUMP:' + authLine(FS.readFile('/dump.txt', { encoding: 'utf8' }))); } catch (e) { console.log('DUMP-ERR:' + e); } }, parseInt(tq.get('dumpat'), 10));

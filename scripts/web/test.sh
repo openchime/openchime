@@ -60,39 +60,48 @@ PY
         exit 1
     fi
     echo "webtest: the client signed in and drew itself in the browser"
-    # The media and input-method checks below run on a wall-clock script and
-    # fixed sleeps, so a busy machine can fail them with nothing wrong. The
-    # build pipeline sets OC_TEST_TIMING=0 and leaves them to `make web-test`
-    # run by hand, until they wait on outcomes instead (tests/check.h).
-    if [ "${OC_TEST_TIMING:-1}" = 0 ]; then
-        echo "webtest: PASS -- the client signed in and drew itself; media and input method not run (OC_TEST_TIMING=0)"; exit 0
-    fi
+    # Each check below is judged on its own and said on its own line; the run
+    # fails at the end if any did. What they wait on is the client's state,
+    # never a schedule: the page takes each step when the last has happened.
+    bad=0
+    judge() {   # judge <what> <0|1>
+        if [ "$2" = 1 ]; then echo "  ok   $1"; else echo "  FAIL $1"; bad=1; fi
+    }
+    # Run Chrome on the page until its log says one of the patterns, the page
+    # gives up on the sign-in, or Chrome ends; the outer bound only stops a hang.
+    run_page() {   # run_page <url> <profile> <log> <done-pattern> [chrome flags...]
+        local url=$1 prof=$2 log=$3 done=$4; shift 4
+        timeout 600 "$CHROME" --headless=new --no-sandbox --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader --ignore-certificate-errors \
+            "$@" --hide-scrollbars --window-size=1280,800 --enable-logging=stderr --v=0 \
+            --user-data-dir="build/webtest-profile/$prof" --no-first-run --disable-background-networking \
+            "$url" > /dev/null 2> "$log" &
+        local c=$!
+        while kill -0 $c 2>/dev/null; do
+            grep -qE "$done|\"SIGNIN-FAIL:" "$log" 2>/dev/null && break
+            sleep 0.25
+        done
+        kill $c 2>/dev/null; wait $c 2>/dev/null
+        if grep -q '"SIGNIN-FAIL:' "$log"; then
+            echo "webtest: FAIL ($prof) -- the client did not sign in: $(grep -m1 -oE '"SIGNIN-FAIL:[^"]*' "$log" | cut -c14-) -- see $log" >&2
+            exit 1
+        fi
+    }
 
     # Media (WEB.md): a video message recorded from the synthetic camera and the
     # browser's (fake) microphone through Web Audio, stopped, and the file taken
-    # -- the same recorder, codecs and muxer the desktop runs, in wasm.
-    URL3="$APP&hook=1&env=OPENCHIME_DEV_CAPTURE%3Dsynthetic&script=sttest@0|vm%20open@1000|vm%20record@18000|vm%20stop@23000|dump%20/t/d.txt@33000|about@34000"
-    timeout 120 "$CHROME" --headless=new --no-sandbox --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader --ignore-certificate-errors \
-        --use-fake-device-for-media-stream --use-fake-ui-for-media-stream --autoplay-policy=no-user-gesture-required \
-        --hide-scrollbars --window-size=1280,800 --enable-logging=stderr --v=0 \
-        --user-data-dir="build/webtest-profile/media" --no-first-run --disable-background-networking \
-        "$URL3" > /dev/null 2> "$W/chrome-media.log" &
-    C3=$!
-    mok=0
-    for _ in $(seq 1 400); do
-        if grep -q '"DUMPALL:' "$W/chrome-media.log" 2>/dev/null; then mok=1; break; fi
-        kill -0 $C3 2>/dev/null || break
-        sleep 0.25
-    done
-    kill $C3 2>/dev/null; wait $C3 2>/dev/null
-    grep -oE '"ACK [^"]*' "$W/chrome-media.log" | sed 's/^"/  /' | head -8
-    taken=$(grep -oE '"ACK vm stop[^"]*' "$W/chrome-media.log" | head -1)
+    # -- the same recorder, codecs and muxer the desktop runs, in wasm. The card
+    # opens and shows the camera; the stop comes once the recording has begun
+    # (after the countdown), and is followed until the file has bytes. How long
+    # it ran is the machine's business; that it was taken is the check.
+    script='sttest|vm open~^vm=1 recphase=0 frame=[1-9]|vm record~^vm=1 recphase=2|vm stop~^vm=1 take_bytes=[1-9]|about'
+    URL3="$APP&hook=1&env=OPENCHIME_DEV_CAPTURE%3Dsynthetic&script=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$script")"
+    run_page "$URL3" media "$W/chrome-media.log" '"(DUMPALL|DUMP-ERR):' \
+        --use-fake-device-for-media-stream --use-fake-ui-for-media-stream --autoplay-policy=no-user-gesture-required
+    grep -oE '"(ACK|UNTIL) [^"]*' "$W/chrome-media.log" | sed 's/^"/  /'
     # The text layer (sdltext/st_canvas.c): right-to-left order, clusters, line breaks.
     sttest=$(grep -oE '"ACK sttest: [^"]*' "$W/chrome-media.log" | head -1 | cut -c14-)
-    echo "  text: ${sttest:-no answer}"
-    # The recording's state after the stop: taken when the file has bytes.
-    vm=$(grep -oE 'vm=[0-9]+ recphase=[0-9]+ [^"]*take_bytes=[0-9]+' "$W/chrome-media.log" | tail -1)
-    [ -n "$vm" ] || vm=$(python3 - "$W" <<'PY'
+    # The recording's state at the end: taken when the file has bytes.
+    vm=$(python3 - "$W" <<'PY'
 import re, sys, base64
 log = open(sys.argv[1] + '/chrome-media.log', errors='replace').read()
 m = re.findall(r'"DUMPALL:([A-Za-z0-9+/=]+)', log)
@@ -102,35 +111,31 @@ if m:
         if l.startswith('vm='): print(l[:200])
 PY
 )
-    echo "  media: $vm"
+    echo "  media: ${vm:-no dump}"
     # The audio ran on the worklet (audio_web.c): the fallback would say "scriptprocessor".
     audio=$(grep -oE 'oc-web: audio [a-z]+' "$W/chrome-media.log" | head -1)
-    echo "  audio: ${audio:-not reported}"
     # About OpenChime: both builds on one line, the daemon's told by SERVER_BUILD.
     about=$(grep -oE '"ACK about: [^"]*' "$W/chrome-media.log" | head -1 | cut -c13-)
-    echo "  about: ${about:-no answer}"
+    judge "text layer (sttest): ${sttest:-no answer}" "$(echo "$sttest" | grep -q '^ok ' && echo 1)"
+    judge "video card opened on the camera" "$(grep -q '"UNTIL vm open: ok' "$W/chrome-media.log" && echo 1)"
+    judge "recording began" "$(grep -q '"UNTIL vm record: ok' "$W/chrome-media.log" && echo 1)"
+    judge "stopped and the file taken (take_bytes>0)" "$(grep -q '"UNTIL vm stop: ok' "$W/chrome-media.log" && echo "$vm" | grep -qE 'take_bytes=[1-9]' && echo 1)"
+    judge "audio on the worklet: ${audio:-not reported}" "$([ "$audio" = "oc-web: audio worklet" ] && echo 1)"
+    judge "about: ${about:-no answer}" "$(echo "$about" | grep -qE '^OpenChime client [^ ]+ \(web\), server [0-9a-z]+, protocol [0-9]+$' && echo 1)"
+
     # The input method (plat_web.c): a composition played into the page's
-    # hidden input ends in the composer, as a desktop IME's does.
-    URL4="$APP&hook=1&ime=1"
-    timeout 120 "$CHROME" --headless=new --no-sandbox --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader --ignore-certificate-errors \
-        --hide-scrollbars --window-size=1280,800 --enable-logging=stderr --v=0 \
-        --user-data-dir="build/webtest-profile/ime" --no-first-run --disable-background-networking \
-        "$URL4" > /dev/null 2> "$W/chrome-ime.log" &
-    C4=$!
-    for _ in $(seq 1 400); do
-        if grep -q '"IME:' "$W/chrome-ime.log" 2>/dev/null; then break; fi
-        kill -0 $C4 2>/dev/null || break
-        sleep 0.25
-    done
-    kill $C4 2>/dev/null; wait $C4 2>/dev/null
+    # hidden input ends in the composer, as a desktop IME's does. The page
+    # polls for each state; this reads what it found.
+    run_page "$APP&hook=1&ime=1" ime "$W/chrome-ime.log" '"(IME|IME-ERR):'
     ime=$(grep -m1 '"IME:' "$W/chrome-ime.log" | sed 's/.*"IME://; s/", source:.*//')
     composing=$(grep -m1 '"IME-COMPOSING:' "$W/chrome-ime.log" | sed 's/.*"IME-COMPOSING://; s/", source:.*//')
-    echo "  ime: ${ime:-no answer}"
-    # Two units composing (comp=2) and, committed, two characters in the box.
-    imeok=0; echo "$composing" | grep -q 'comp=2' && echo "$ime" | grep -q 'len=2 ' && echo "$ime" | grep -q '日本' && imeok=1
-    if [ $mok = 1 ] && echo "$taken" | grep -q ': ok' && echo "$vm" | grep -qE 'take_bytes=[1-9]' && [ "$audio" = "oc-web: audio worklet" ] && [ $imeok = 1 ] && echo "$sttest" | grep -q '^ok ' && echo "$about" | grep -qE '^OpenChime client [^ ]+ \(web\), server [0-9a-z]+, protocol [0-9]+$'; then
-        echo "webtest: PASS -- the client signed in, drew itself and recorded a video message in the browser"; exit 0
+    echo "  ime: ${ime:-$(grep -m1 -oE '"IME-ERR:[^"]*' "$W/chrome-ime.log" | cut -c10-)}"
+    judge "composing: two units (comp=2)" "$(echo "$composing" | grep -q ' comp=2 ' && echo 1)"
+    judge "committed: two characters in the composer (len=2, 日本)" "$(echo "$ime" | grep -q '^ed len=2 ' && echo "$ime" | grep -q '日本' && echo 1)"
+
+    if [ $bad = 0 ]; then
+        echo "webtest: PASS -- the client signed in, drew itself, recorded a video message and took a composition in the browser"; exit 0
     fi
-    echo "webtest: FAIL (media) -- see $W/chrome-media.log" >&2
+    echo "webtest: FAIL -- see the FAIL lines above, and $W/chrome-media.log and $W/chrome-ime.log" >&2
     exit 1
 }

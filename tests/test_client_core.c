@@ -3250,10 +3250,28 @@ static void watch(oc_call_engine *e, view_watch *w) {
     w->frames++;
 }
 
+/* Wait for `want` frames of a share on `e`. A real-time source makes as many as
+ * the machine allows, so the deadline is a stall's, not the count's: it starts
+ * again with every new frame, and only a share that stops -- no frame for
+ * `stall_ms` -- fails it, as the recorder's own clock decides the window-gone
+ * test (test_media.c) rather than a time counted from the start. */
+static int share_frames(oc_client *a, oc_client *b, oc_client *c, oc_call_engine *e,
+                        view_watch *w, int want, uint64_t stall_ms) {
+    int seen = w->frames;
+    uint64_t end = oc_test_deadline(stall_ms);
+    for (;;) {
+        oc_client_tick(a); oc_client_tick(b); if (c) oc_client_tick(c);
+        watch(e, w);
+        if (w->frames >= want) return 1;
+        if (w->frames > seen) { seen = w->frames; end = oc_test_deadline(stall_ms); }
+        if (!oc_test_pause(end)) return 0;
+    }
+}
+
 /* Screen sharing in the call (REQ-161): dana shares the synthetic screen; erik
  * sees it, at its size, the frames in order; the relay sees only SFrame; a tenth
  * of the packets lost on the way costs NACKs and resends, not the picture; faye
- * joins late and has a picture within a few seconds; erik takes over, which stops
+ * joins late and is sent a picture; erik takes over, which stops
  * dana's; erik stops, and the picture goes. */
 static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
                            oc_call_engine *ea, oc_call_engine *eb, oc_call_engine *ec) {
@@ -3270,9 +3288,8 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     oc_client_call_share(a, 1, 1);
     CHECK(CALL_WAIT(3000, ma->call.sharer == ua && mb->call.sharer == ua));
     CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 2; })));
-    /* Frames from a real-time source within a fixed time: timing. */
-    CHECK_TIMING(CALL_WAIT(WAIT_MS(6000), ({ watch(eb, &wb); wb.frames >= 10; })));
-    CHECK_TIMING(wb.f.width == 1280 && wb.f.height == 800 && wb.rising && wb.bad == 0);
+    CHECK(share_frames(a, b, c, eb, &wb, 10, WAIT_MS(6000)));
+    CHECK(wb.f.width == 1280 && wb.f.height == 800 && wb.rising && wb.bad == 0);
     oc_call_engine_stats(ea, &st);
     printf("  dana shares: erik has %d frames at %dx%d; dana sends %dx%d at %d fps, %d kbps, %u keyframes\n",
            wb.frames, wb.f.width, wb.f.height, st.share_width, st.share_height, st.share_fps, st.share_kbps,
@@ -3281,7 +3298,7 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     int big = g_tap.big - big0, bad = g_tap.bad_header;
     pthread_mutex_unlock(&g_tap.mu);
     CHECK(bad == 0);
-    CHECK_TIMING(big > 10);                                   /* the screen went as SFrame, in fragments */
+    CHECK(big > 10);                                          /* the screen went as SFrame, in fragments */
 
     /* A tenth of everything lost on the way to the relay: the picture keeps
      * coming. The loss stays on until three more frames have arrived through
@@ -3309,21 +3326,20 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     uint64_t joined = mono_ms();
     oc_client_call_join(c, 1);
     CHECK(CALL_WAIT(3000, mc->in_call && mc->call.sharer == ua));
-    CHECK_TIMING(CALL_WAIT(WAIT_MS(6000), ({ watch(ec, &wc); wc.frames >= 1; })));
+    CHECK(share_frames(a, b, c, ec, &wc, 1, WAIT_MS(6000)));
     printf("  faye joined late: her first frame after %d ms, %dx%d, frame number %d\n", (int)(mono_ms() - joined),
            wc.f.width, wc.f.height, wc.last);
     /* The loss above halved the rate, which may have stepped the size down to
      * fit 1280x720: the shape is what holds. */
-    CHECK_TIMING(wc.f.width * 800 == wc.f.height * 1280 && wc.bad == 0);
-    CHECK_SPEED(mono_ms() - joined < 5000);
+    CHECK(wc.f.width * 800 == wc.f.height * 1280 && wc.bad == 0);
 
     /* erik takes over: dana's share stops, and dana sees erik's. */
     CHECK(oc_call_engine_share_start(eb, "window:synthetic", 1280, 800) == 0);
     oc_client_call_share(b, 1, 1);
     CHECK(CALL_WAIT(3000, ma->call.sharer == ub && mb->call.sharer == ub && mc->call.sharer == ub));
     CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 0 && st.share_taken; })));
-    CHECK_TIMING(CALL_WAIT(WAIT_MS(6000), ({ watch(ea, &wa); wa.frames >= 5; })));
-    CHECK_TIMING(wa.f.width * 800 == wa.f.height * 1280 && wa.rising && wa.bad == 0);
+    CHECK(share_frames(a, b, c, ea, &wa, 5, WAIT_MS(6000)));
+    CHECK(wa.f.width * 800 == wa.f.height * 1280 && wa.rising && wa.bad == 0);
 
     /* erik stops: nobody shares, and the picture goes. */
     oc_call_engine_share_stop(eb);
@@ -4700,8 +4716,12 @@ static void test_device_client(void) {
         oc_dbwriter *dbw = web_daemon(tpath("test_core_dev1.db"), NULL);
         CHECK(dbw != NULL);
         if (!dbw) { oc_tls_server_free(&srv); return; }
-        oc_netloop_set_device_interval_s(1);
-        oc_netloop_set_device_ttl_ms(1500);
+        /* A code lives far longer than two approvals over HTTPS take, however
+         * slow the host (WAIT_MS); the client asks once an interval. */
+        const int dev_interval_s = WAIT_MS(1);
+        const uint64_t dev_ttl_ms = WAIT_MS(4000);
+        oc_netloop_set_device_interval_s(dev_interval_s);
+        oc_netloop_set_device_ttl_ms(dev_ttl_ms);
         struct core_loop_arg arg;
         arg.port = 0; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
         pthread_t th;
@@ -4717,12 +4737,11 @@ static void test_device_client(void) {
         CHECK(strcmp(oc_client_model(c)->device_fp, fp) == 0);        /* for the browser's warning */
         CHECK(!oc_client_model(c)->authed);
         g_web_insecure = 1;                                          /* the person went on past it */
-        /* Both approvals have to land inside the code's 1500 ms life: timing. */
-        CHECK_TIMING(device_approve(url, code, "lia", "wrong") != 0);
-        CHECK_TIMING(device_approve(url, code, "lia", "pw-lia") == 0);
+        CHECK(device_approve(url, code, "lia", "wrong") != 0);
+        CHECK(device_approve(url, code, "lia", "pw-lia") == 0);
         g_web_insecure = 0;
-        CHECK_TIMING(WAIT_FOR(c, m->authed && m->user_id != 0));
-        CHECK_TIMING(oc_client_model(c)->device_code[0] == '\0');
+        CHECK(WAIT_FOR_MS(c, m->authed && m->user_id != 0, dev_interval_s * 1000 + 5000));
+        CHECK(oc_client_model(c)->device_code[0] == '\0');
         oc_client_stop(c);
 
         /* Cancel; and a code nobody enters runs out. */
@@ -4733,7 +4752,8 @@ static void test_device_client(void) {
         oc_client_stop(c);
         c = oc_client_start_device(NULL, "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
         CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
-        CHECK(WAIT_FOR(c, strstr(m->last_error, "expired") != NULL) && !oc_client_model(c)->authed);
+        CHECK(WAIT_FOR_MS(c, strstr(m->last_error, "expired") != NULL, dev_ttl_ms + dev_interval_s * 1000 + 5000) &&
+              !oc_client_model(c)->authed);
         oc_client_stop(c);
 
         __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);

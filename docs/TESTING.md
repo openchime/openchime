@@ -559,7 +559,8 @@ short real-time window, or a count that depends on where a window's edge falls
 — is a `CHECK_TIMING` (`tests/check.h`), and so is every `CHECK_SPEED`. The
 build pipeline sets `OC_TEST_TIMING=0` (`make test-ci`, and the web step in
 `ci.yml`), which leaves them unjudged so that a busy runner cannot fail a build
-with nothing wrong; `make test` and `make web-test` run by hand judge them.
+with nothing wrong; `make test` run by hand judges them. (`make web-test` has
+none: it waits on the client's state, §3.4.)
 The code around them still runs everywhere, ThreadSanitizer included. Each is
 a debt: the fix is an injected clock, an explicit sweep or a wait on the
 outcome, after which it is a `CHECK` again. A new test is written that way
@@ -974,9 +975,8 @@ works. The shipped *image* is the staging build's release jobs' to prove (§3.2)
 The browser build (WEB.md) is checked where a Chromium is present: a
 developer's box, and CI's `build` job, which runs `make web-test` and the GUI
 smoke on the web platform in the runner's Chrome (§4; make fetches Emscripten
-itself). CI sets `OC_TEST_TIMING=0` (§2.3a), so there `test.sh` stops after the
-sign-in and drawing check: the recording and input-method checks run on a
-wall-clock script and fixed sleeps, and are judged only when run by hand. The daemon it starts runs in development mode,
+itself). Every check in it waits on the client's state, never a schedule, so
+all of them are judged there as by hand, `OC_TEST_TIMING=0` or not. The daemon it starts runs in development mode,
 and so serves its own `/app/` page that way: the check signs in by password on
 the daemon's page and bootstraps its user.
 `make web-test` runs the first three:
@@ -996,8 +996,10 @@ the daemon's page and bootstraps its user.
   the browser logs.
 
   Then a video message is recorded through the client's own `vm` verbs with
-  the synthetic camera and the browser's fake microphone: the dump must show
-  the file taken (`take_bytes`) and the console that the audio ran on the
+  the synthetic camera and the browser's fake microphone, each verb taken once
+  the last has happened (the page's `?script=`, `verb~pattern`: its ack, then
+  the dump polled until the state comes; a sign-in that fails ends the run at
+  once): the dump must show the file taken (`take_bytes`) and the console that the audio ran on the
   worklet (`oc-web: audio worklet`, not the fallback), and the client's
   `sttest` verb must pass: the text layer's right-to-left order, cluster
   hit-testing and line breaking through the API the views use; and the
@@ -1005,7 +1007,9 @@ the daemon's page and bootstraps its user.
   <build> (web), server <build>, protocol <n>`, the daemon's from
   `SERVER_BUILD`). Last, a Japanese
   composition is played into the page's hidden input for the input method
-  (`?ime=1`) and the composer must hold its result.
+  (`?ime=1`), the page polling for it composing (`comp=2`) and then for the
+  composer holding its result (`len=2`). Each of these is reported on a line
+  of its own.
 - **`scripts/web/pages.sh`** — the daemon's sign-in pages from a real browser.
   A headless Chromium (`scripts/web/pages.mjs`, Playwright) types into the
   forms and submits them: the first owner signed up with the setup token, a
@@ -1055,7 +1059,7 @@ repeated. The end-to-end step (§3.2) is the one thing the in-process suites
 cannot show, since they link the daemon's code without its `main()`. Of the
 GUI scripts only the smoke runs, on the web platform (§3.4); the longer web
 scripts (uploads, voice, calls, …) take minutes each and stay local, and so
-does `chords`, which reads its result after a fixed sleep.
+does `chords`.
 
 All run on `ubuntu-24.04`, the image the release builds on too. The native
 build and the tests use the runner's gcc; zig (the release's clang), Emscripten
@@ -1410,7 +1414,9 @@ directly; `press` goes the way a keyboard does, through the page and SDL.
 several times each and checks Preferences and the shortcuts open every
 time: the client must read a key's modifiers from the key event, not from
 the keyboard's state when it gets to the key, by which time a quick
-Ctrl is already up. The browser runs with
+Ctrl is already up. `press` acks once the events are dispatched, and the
+script polls the dump for the state each chord leads to, as the smoke's
+`wait_for` does. The browser runs with
 Chromium's fake camera and microphone, its own permission prompts answered,
 its screen picker choosing the screen; `OPENCHIME_DEV_AUDIO`, `_MIC`,
 `_CAPTURE`, `_TONE` and the other switches reach the page as `?env=`, and a

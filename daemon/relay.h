@@ -75,6 +75,11 @@ void oc_relay_sweep(oc_relay *r);
 /* The silence interval: OC_AUDIO_SILENCE_MS unless a test shortens it (0 restores). */
 void oc_relay_set_silence_ms(oc_relay *r, uint64_t ms);
 
+/* The clock, in milliseconds, that silence is measured on: the monotonic clock
+ * unless a test drives its own, so a sweep's verdict is the test's to decide
+ * rather than the scheduler's (NULL restores). Set it before authorizing anyone. */
+void oc_relay_set_clock(oc_relay *r, uint64_t (*now_ms)(void));
+
 /* How many datagrams have been taken off the socket, relayed or dropped; the
  * loop's thread. */
 uint64_t oc_relay_received(const oc_relay *r);

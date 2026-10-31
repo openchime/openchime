@@ -63,9 +63,9 @@ static void test_bound(void) {
         CHECK(fd < 0);
         printf("  connect to a full queue took %llu ms (bound 300)\n", (unsigned long long)took);
         /* The mechanism: the bound ended it, not the kernel, whose own retries
-         * of a dropped SYN run to minutes. How close to the bound is speed. */
+         * of a dropped SYN run to minutes. How close to the bound is the host's
+         * speed, printed above and not judged. */
         CHECK(took < 30000);
-        CHECK_SPEED(took < 1500);                      /* one address, a 300 ms bound */
     }
     for (int i = 0; i < nfill; i++) close(fill[i]);
     close(lfd);

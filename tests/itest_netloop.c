@@ -2360,17 +2360,18 @@ static void test_unauthed_closed(int port, const uint8_t *pin) {
     CHECK(peer_closed(&a, PEER_CLOSES) == 1);
     client_close(&a);
 
-    oc_netloop_set_unauthed_ms(1000);
+    /* The close is long against the TLS, the sign-in page and the password
+     * check that signing in races, however slow the host (WAIT_MS). */
+    const int unauthed_ms = WAIT_MS(4000);
+    oc_netloop_set_unauthed_ms(unauthed_ms);
     client idle, quiet, in;
     CHECK(client_open(&idle, port, pin) == 0 && do_handshake(&idle) == 0);
     CHECK(client_open(&quiet, port, pin) == 0);                 /* TLS, then nothing */
-    /* Signing in has to beat the 1000 ms close: timing. A sign-in that lost
-     * the race left no client to close. */
     int in_ok = signed_in(&in, port, pin, "carol", "pw") == 0;
-    CHECK_TIMING(in_ok);
-    CHECK(peer_closed(&idle, PEER_CLOSES) == 1);
-    CHECK(peer_closed(&quiet, PEER_CLOSES) == 1);
-    CHECK_TIMING(in_ok && peer_open(&in));
+    CHECK(in_ok);
+    CHECK(peer_closed(&idle, PEER_CLOSES + unauthed_ms / 1000) == 1);
+    CHECK(peer_closed(&quiet, PEER_CLOSES + unauthed_ms / 1000) == 1);
+    CHECK(in_ok && peer_open(&in));
     oc_netloop_set_unauthed_ms(0);
     client_close(&idle); client_close(&quiet);
     if (in_ok) client_close(&in);
@@ -3711,16 +3712,19 @@ static void test_device_signin(void) {
     CHECK(oc_test_page_error(resp, "device-limited"));
     dev_daemon_stop(&d);
 
-    /* A code's life runs out. */
-    CHECK(dev_daemon_start(&d, 400) == 0);
+    /* A code's life runs out. It is long against the handshake, the code and
+     * one HTTPS GET it races, however slow the host (WAIT_MS), and then it
+     * passes. */
+    const uint64_t life = WAIT_MS(3000);
+    CHECK(dev_daemon_start(&d, life) == 0);
     port = d.arg.port;
     client e;
     CHECK(client_open(&e, port, d.pin) == 0 && do_handshake(&e) == 0);
     CHECK(device_begin(&e, ch, dcode, sizeof dcode, ucode, sizeof ucode, &interval, &expires, vpath, sizeof vpath) == 0);
     snprintf(path, sizeof path, "/device?code=%s", ucode);
-    CHECK_TIMING(web_call(port, d.pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200 &&
-                 oc_test_page_is(resp, "device-confirm"));                /* alive, inside its 400 ms life */
-    oc_test_let_time_pass(600);                                          /* a 400 ms life: time itself */
+    CHECK(web_call(port, d.pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200 &&
+          oc_test_page_is(resp, "device-confirm"));                       /* alive, inside its life */
+    oc_test_let_time_pass(life + 200);                                   /* its life: time itself */
     CHECK(device_poll(&e, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_EXPIRED);
     CHECK(web_call(port, d.pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200 &&
           oc_test_page_error(resp, "device-unknown"));
@@ -5401,7 +5405,10 @@ static void test_call_rejoin_grace(int port, const uint8_t *pin) {
     client a, b, o;
     oc_header hdr; oc_rbuf p; oc_call_part parts[32]; oc_call_roster ro; oc_call_joined jd;
     uint64_t sp[32], si[32]; oc_call_state st;
-    oc_netloop_set_call_grace_ms(5000);
+    /* A grace long against the sign-ins and joins that race it, and a short one
+     * for the seats that are to go; both scaled to the host (WAIT_MS). */
+    const int long_grace = WAIT_MS(5000), short_grace = WAIT_MS(300);
+    oc_netloop_set_call_grace_ms(long_grace);
     CHECK(rejoin_as(&a, port, pin, "alice", "pw-alice", 0xA1, &jd, parts) == 0);
     uint64_t call_id = jd.call_id;
     CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", 0xB1, &jd, parts) == 0);
@@ -5435,26 +5442,25 @@ static void test_call_rejoin_grace(int port, const uint8_t *pin) {
       CHECK(fresh && !away); }
 
     /* bob goes again and does not come back: away, then at the grace his seat goes. */
-    oc_netloop_set_call_grace_ms(300);
+    oc_netloop_set_call_grace_ms(short_grace);
     client_close(&b);
     CHECK(next_roster(&a, &ro, parts) == 2);
     CHECK(next_roster(&a, &ro, parts) == 1 && parts[0].device_key[0] == 0xA1 && !parts[0].flags);
 
     /* Everyone's connection goes at once, and both come back inside the grace:
      * the call is still there. An observer outside the call watches it. */
-    oc_netloop_set_call_grace_ms(5000);
+    oc_netloop_set_call_grace_ms(long_grace);
     CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", 0xB3, &jd, parts) == 0 && jd.call_id == call_id);
     CHECK(client_open(&o, port, pin) == 0 && do_handshake(&o) == 0);
     { uint64_t uo = 0; CHECK(do_auth(&o, "carol", "pw", &uo) == 0); }
     client_close(&a);
     client_close(&b);
-    /* Two sign-ins have to beat the 5000 ms grace: timing. */
-    CHECK_TIMING(rejoin_as(&a, port, pin, "alice", "pw-alice", 0xA2, &jd, parts) == 0 && jd.call_id == call_id);
-    CHECK_TIMING(rejoin_as(&b, port, pin, "bob", "pw-bob", 0xB4, &jd, parts) == 0 && jd.call_id == call_id);
-    CHECK_TIMING(jd.count == 2);
+    CHECK(rejoin_as(&a, port, pin, "alice", "pw-alice", 0xA2, &jd, parts) == 0 && jd.call_id == call_id);
+    CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", 0xB4, &jd, parts) == 0 && jd.call_id == call_id);
+    CHECK(jd.count == 2);
 
     /* ...and when neither comes back, it ends at the grace. */
-    oc_netloop_set_call_grace_ms(300);
+    oc_netloop_set_call_grace_ms(short_grace);
     client_close(&a);
     client_close(&b);
     { int ended = 0;
@@ -5538,12 +5544,16 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
      * him GONE and the daemon takes him out of the call, so alice's roster says
      * who can actually be heard (CALLS.md §4). */
     /* alice keeps talking (a keepalive every 100 ms) while bob says nothing,
-     * and alice's roster is watched between them until it holds her alone. */
-    oc_netloop_set_relay_silence_ms(300);
+     * and alice's roster is watched between them until it holds her alone. The
+     * silence is long against the keep-alive's pace however slow the host
+     * (WAIT_MS), so only bob can fall silent for it; the wait outlasts it, the
+     * loop's half-second sweep and then some. */
+    const int silence_ms = WAIT_MS(1500);
+    oc_netloop_set_relay_silence_ms(silence_ms);
     oc_call_roster ro;
     int gone = 0;
     set_read_timeout(&a, 100);   /* the keep-alive's pace */
-    uint64_t end = oc_test_deadline(4000);
+    uint64_t end = oc_test_deadline(silence_ms + WAIT_MS(6000));
     for (int i = 0; !gone && oc_test_mono_ms() < end; i++) {
         udp_send_audio(sa, &relay, atok2, (uint16_t)(10 + i), NULL);
         if (read_type(&a, OC_MSG_CALL_ROSTER, &hdr, &p) == 0 &&
@@ -5551,8 +5561,7 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
             gone = 1;
     }
     set_read_timeout(&a, 20000);
-    /* A gap over 300 ms between alice's keep-alives drops her too: timing. */
-    CHECK_TIMING(gone);
+    CHECK(gone);
     oc_netloop_set_relay_silence_ms(0);
     /* ...and bob, whose connection is still open, is told: a roster without him,
      * his cue to rejoin (PROTOCOL.md §5.17). */
@@ -5561,7 +5570,7 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
           if (read_type(&b, OC_MSG_CALL_ROSTER, &hdr, &p) == 0 &&
               oc_decode_call_roster(&p, &ro, parts, 32) == OC_OK && ro.count == 1 && parts[0].user_id == ua)
               told = 1;
-      CHECK_TIMING(told); }
+      CHECK(told); }
 
     close(sa); close(sb);
     client_close(&a);
@@ -6235,9 +6244,11 @@ static void test_fanout_limits(int port, const uint8_t *pin) {
     uint64_t ub = 0; CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
     /* Every count below ends at a fence, never at a timeout; the timeout only
      * bounds a failure. The presence window is shortened so its last word does
-     * not cost ten seconds. */
+     * not cost ten seconds, but stays long against the burst it has to hold,
+     * however slow the host (WAIT_MS). */
     set_read_timeout(&a, 5000); set_read_timeout(&b, 5000);
-    oc_netloop_set_presence_rate_ms(600);
+    const int presence_ms = WAIT_MS(2000);
+    oc_netloop_set_presence_rate_ms(presence_ms);
     CHECK(fenced(&a) && fenced(&b));               /* the sign-ins' presence, read past */
 
     uint8_t buf[128]; oc_wbuf w;
@@ -6252,8 +6263,10 @@ static void test_fanout_limits(int port, const uint8_t *pin) {
     CHECK(fenced(&b));                              /* bob's burst is handled... */
     CHECK(count_frames(&a, OC_MSG_TYPING_UPDATE, 0, ub, NULL, 1, 0) == 3);   /* ...and alice has what it made */
 
-    /* Presence: eight changes, away first and online last. Five go out now; the
-     * last word follows once the window has passed, and it is ONLINE. */
+    /* Presence: eight changes, away first and online last. alice has set none
+     * before, so the first opens her window and the burst falls inside it. Five
+     * go out now; the last word follows once the window has passed, and it is
+     * ONLINE. */
     for (int i = 0; i < 8; i++) {
         oc_wbuf_init(&w, buf, sizeof buf);
         oc_set_presence sp = { i % 2 ? OC_PRESENCE_ONLINE : OC_PRESENCE_AWAY };
@@ -6262,12 +6275,13 @@ static void test_fanout_limits(int port, const uint8_t *pin) {
     }
     uint8_t st = 0;
     CHECK(fenced(&a));
-    /* The counts depend on where the 600 ms window's edge falls: timing. */
-    CHECK_TIMING(count_frames(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st, 1, 0) == 5);
-    CHECK_TIMING(st == OC_PRESENCE_AWAY);
-    CHECK_TIMING(count_frames(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st, 0, 1) == 1);   /* the window passes */
-    CHECK_TIMING(st == OC_PRESENCE_ONLINE);
-    CHECK_TIMING(count_frames(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st, 1, 0) == 0);   /* and that was all */
+    CHECK(count_frames(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st, 1, 0) == 5);
+    CHECK(st == OC_PRESENCE_AWAY);
+    set_read_timeout(&b, presence_ms + 5000);
+    CHECK(count_frames(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st, 0, 1) == 1);   /* the window passes */
+    CHECK(st == OC_PRESENCE_ONLINE);
+    set_read_timeout(&b, 5000);
+    CHECK(count_frames(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st, 1, 0) == 0);   /* and that was all */
     oc_netloop_set_presence_rate_ms(0);
 
     /* Reactions: thirty-five in a burst, the last five refused. */
@@ -7624,8 +7638,10 @@ int run_netloop_tests(void) {
         test_webhook_vertical(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
         /* The call group: a held seat goes quickly for every one of them, and
-         * the knob is put back after the group, whatever it found. */
-        oc_netloop_set_call_grace_ms(300);
+         * the knob is put back after the group, whatever it found. Quickly is
+         * still scaled to the host (WAIT_MS), so a slow one does not lose a
+         * seat a test is still using. */
+        oc_netloop_set_call_grace_ms(WAIT_MS(300));
         test_call_vertical(arg.port, pin);
         test_pdm_relay(arg.port, pin);
         test_call_leave_while_joining(arg.port, pin, dbw);
@@ -7636,7 +7652,7 @@ int run_netloop_tests(void) {
         test_call_share(arg.port, pin);
         test_call_udp_vertical(arg.port, pin, audio_port);
         test_call_rejoin_grace(arg.port, pin);
-        oc_netloop_set_call_grace_ms(300);   /* rejoin_grace sets its own */
+        oc_netloop_set_call_grace_ms(WAIT_MS(300));   /* rejoin_grace sets its own */
         test_call_transports(arg.port, pin, audio_port);
         test_call_routed();
         oc_netloop_set_call_grace_ms(0);
