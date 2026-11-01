@@ -5,8 +5,9 @@
 # nothing downstream chains a redistributable), and with BUILD_NUM and
 # BUILD_ID set their version resources name the build: FileVersion
 # 1.0.<BUILD_NUM>.0, ProductVersion "build <BUILD_ID>". The installer is a
-# PE at 1.0.<version>.0, and the MSIX holds its manifest, block map, content
-# types and both binaries, its Identity at 1.0.<version>.0. Read on Linux;
+# PE at 1.0.<version>.0, 32-bit or 64-bit (NSIS builds on a 32-bit stub), and
+# the MSIX holds its manifest, block map, content types and both binaries, its
+# Identity at 1.0.<version>.0. Read on Linux;
 # whether they install is checked on Windows (docs/TESTING.md §4).
 #
 # Needs: python3 with pefile (apt: python3-pefile); <bindir>/openchime.exe and
@@ -27,6 +28,6 @@ setup="$dist/openchime-${version}-windows-x64-setup.exe"
 pkg="$dist/openchime-${version}.msix"
 have "$setup" "packaging/build-windows.sh makes it"
 have "$pkg" "packaging/build-windows.sh makes it"
-python3 -I "$files" pe "$setup" "1.0.${version}.0" || fail "$setup"
+python3 -I "$files" installer "$setup" "1.0.${version}.0" || fail "$setup"
 python3 -I "$files" msix "$pkg" "1.0.${version}.0" || fail "$pkg"
 ok "the binaries, the installer and the MSIX are what ships"
