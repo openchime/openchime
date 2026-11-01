@@ -156,6 +156,8 @@ Everything an operator may set. A value that does not parse, is out of its range
 | Variable | Default | Meaning |
 |---|---|---|
 | `OPENCHIME_MODE` | `normal` | What the box is for: `normal` (a deployment), `development` (the tests and harnesses; the only mode that reads the Development rows) or `demo` (the public demo workspace). One of `normal`, `development`, `demo`. |
+| `OPENCHIME_BROADCAST_MENTIONS` | `everyone` | Who may notify a whole large channel with `@channel`, `@everyone` or `@here` (REQ-221): `everyone`, `admins` (owners and admins) or `nobody`. From anyone else the mention stays in the message as text and notifies nobody. One of `everyone`, `admins`, `nobody`. Clients are told it, read-only, as `broadcast_mentions`. |
+| `OPENCHIME_BROADCAST_LARGE` | `0` | The member count from which a channel is large for `OPENCHIME_BROADCAST_MENTIONS`; 0 makes every channel large. Integer 0..1000000. Clients are told it, read-only, as `broadcast_large`. |
 | `OPENCHIME_WORKSPACE_NAME` | *(empty)* | The workspace's display name, shown to clients; unset, a client derives one from the host. Clients are told it, read-only, as `workspace_name`. |
 | `OPENCHIME_CUSTOM_EMOJI_ADD` | `everyone` | Who may add a custom emoji (REQ-072): `everyone`, or `admins` (owners and admins). Deleting stays the emoji's creator's, an admin's or an owner's. One of `everyone`, `admins`. Clients are told it, read-only, as `custom_emoji_add`. |
 | `OPENCHIME_EDIT_WINDOW` | *(empty)* | How long an author may edit their own message (REQ-051): `never`, or seconds after sending, 1 to 31536000. Empty: always. Clients are told it, read-only, as `edit_window`. |

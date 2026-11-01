@@ -1903,9 +1903,11 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
        CONF_PDM_TRUST, CONF_PDM_SAFETY,
        /* New ones go last: the dump's `confirm act=` is this number, and the
         * GUI harness reads it (CONF_CERT_TRUST is act=13 to scripts/gui). */
-       CONF_WS_FORGET_ALL };
+       CONF_WS_FORGET_ALL, CONF_BROADCAST };
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
+static int      g_bc_confirmed;     /* CONF_BROADCAST: the send it confirmed is under way */
+static void composer_send(void);    /* fwd */
 
 static char     g_confirm_title[80];
 
@@ -13997,6 +13999,11 @@ static void confirm_run(oc_win *hwnd) {
         link_open(u);
         break;
     }
+    case CONF_BROADCAST:   /* the composer's text, now confirmed (REQ-221) */
+        g_bc_confirmed = 1;
+        composer_send();
+        g_bc_confirmed = 0;
+        break;
     case CONF_GROUP_DELETE:
         oc_client_delete_group(g_client, g_confirm_id);
         if (g_grp_sel == g_confirm_id) g_grp_sel = 0;
@@ -24867,6 +24874,28 @@ static void composer_send(void) {
         free(b);
         composer_hint("This message is too long to send. Make a table smaller, or split it in two.", 1);
         return;
+    }
+    /* A broadcast mention under the workspace's rule (REQ-221): one that will
+     * notify nobody is said and sent anyway; one that will notify a channel the
+     * workspace calls large asks first. An edit notifies nobody, so neither. */
+    if (b && !g_edit_msg && !g_bc_confirmed) {
+        const oc_model *bm = model();
+        uint64_t bcid = bm && bm->thread_open ? bm->thread_channel : g_sel;
+        char tok[OC_MENTION_NAME_MAX + 2], t[96], why[160];
+        size_t n = 0;
+        int bc = oc_model_broadcast_will_notify(bm, bcid, b, tok, sizeof tok, &n);
+        if (bc == 2) {
+            if (n) snprintf(t, sizeof t, "Notify %zu people?", n);
+            else snprintf(t, sizeof t, "Notify everyone here?");
+            snprintf(why, sizeof why, "%s notifies everyone in this channel.", tok);
+            confirm_open(g_main, CONF_BROADCAST, bcid, t, why, "Send");
+            free(b);
+            return;
+        }
+        if (bc == 0) {
+            snprintf(why, sizeof why, "%s won't notify anyone here.", tok);
+            composer_hint(why, 0);
+        }
     }
     if (b) {
         /* Drop a trailing newline; skip empty/whitespace. */

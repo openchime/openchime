@@ -292,6 +292,35 @@ int oc_model_may_change_own(const oc_model *m, uint64_t sent_ms, int edit, uint6
     return now_ms <= sent_ms || now_ms - sent_ms <= win;
 }
 
+int oc_model_broadcast_will_notify(const oc_model *m, uint64_t channel_id, const char *body,
+                                   char *token, size_t tcap, size_t *members) {
+    if (token && tcap) token[0] = '\0';
+    if (members) *members = 0;
+    if (!m || !body) return -1;
+    oc_mention mm[OC_MENTION_MAX];
+    size_t n = oc_mention_scan(body, strlen(body), mm, OC_MENTION_MAX), i;
+    if (n > OC_MENTION_MAX) n = OC_MENTION_MAX;
+    for (i = 0; i < n; i++)
+        if (mm[i].kind == OC_MENTION_HERE || mm[i].kind == OC_MENTION_CHANNEL || mm[i].kind == OC_MENTION_EVERYONE) break;
+    if (i == n) return -1;
+    if (token && tcap) snprintf(token, tcap, "@%s", mm[i].name);
+    /* The roster is known for the open channel; elsewhere the count is not,
+     * and the channel is taken as large, as the daemon may find it. */
+    int known = m->chanmem_channel == channel_id && !m->chanmem_loading;
+    if (members && known) *members = m->n_chanmem;
+    char who[16] = "", lg[16] = "";
+    oc_model_workspace_setting(m, "broadcast_mentions", who, sizeof who);
+    oc_model_workspace_setting(m, "broadcast_large", lg, sizeof lg);
+    long large = strtol(lg, NULL, 10);
+    int is_large = !known || (size_t)(large < 0 ? 0 : large) <= m->n_chanmem;
+    if (!is_large) return 1;
+    uint8_t role = OC_ROLE_MEMBER;
+    for (size_t k = 0; k < m->n_users; k++)
+        if (m->users[k].user_id == m->user_id) { role = m->users[k].role; break; }
+    if (!strcmp(who, "nobody") || (!strcmp(who, "admins") && role < OC_ROLE_ADMIN)) return 0;
+    return large > 0 ? 2 : 1;
+}
+
 void oc_model_free(oc_model *m) {
     memset(m->pdms, 0, sizeof m->pdms);
     m->n_pdms = 0;

@@ -378,6 +378,13 @@ static void test_mode(void) {
     refuses("OPENCHIME_DELETE_WINDOW", "31536001");
     refuses("OPENCHIME_DELETE_WINDOW", "-5");
     CHECK(oc_config_window_ms("") == -1 && oc_config_window_ms("never") == 0 && oc_config_window_ms("60") == 60000);
+    /* Who may notify a whole large channel, and from what size. */
+    accepts("OPENCHIME_BROADCAST_MENTIONS", "admins");
+    accepts("OPENCHIME_BROADCAST_MENTIONS", "nobody");
+    refuses("OPENCHIME_BROADCAST_MENTIONS", "members");
+    accepts("OPENCHIME_BROADCAST_LARGE", "50");
+    refuses("OPENCHIME_BROADCAST_LARGE", "-1");
+    refuses("OPENCHIME_BROADCAST_LARGE", "many");
     /* normal and demo: every development row refuses the start, naming itself
      * and the mode; the constants hold, and the managed rows want the ticket. */
     static const char *const modes[] = { "normal", "demo" };
@@ -451,7 +458,7 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 26);     /* OPENCHIME_MODE among them */
+    CHECK(operator_rows == 28);     /* OPENCHIME_MODE among them */
     CHECK(managed_rows == 7);
     CHECK(dev_rows == 4 + 12);      /* the daemon's four, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);

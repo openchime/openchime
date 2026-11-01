@@ -1493,6 +1493,52 @@ static void test_change_windows_model(void) {
     oc_model_free(&m);
 }
 
+/* What a broadcast mention will do, as the composer reads it (REQ-221). */
+static void bc_settings(oc_model *m, const char *body) {
+    oc_ev e; memset(&e, 0, sizeof e); e.type = OC_EV_WORKSPACE_SETTINGS; e.body = strdup(body);
+    oc_model_apply(m, &e);
+}
+static void bc_me(oc_model *m, uint8_t role) {
+    oc_ev e; memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.status = role;
+    e.body = strdup("me"); oc_model_apply(m, &e);
+}
+static void test_broadcast_model(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    bc_me(&m, OC_ROLE_MEMBER);
+    oc_model_chanmem_begin(&m, 10);
+    for (uint64_t uid = 1; uid <= 5; uid++) {
+        oc_ev e; memset(&e, 0, sizeof e);
+        e.type = OC_EV_CHAN_MEMBER; e.channel_id = 10; e.user_id = uid;
+        oc_model_apply(&m, &e);
+    }
+    m.chanmem_loading = 0;
+    char tok[24]; size_t n = 0;
+
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "hello @bob", tok, sizeof tok, &n) == -1);
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@channel standup", tok, sizeof tok, &n) == 1);   /* not told */
+    CHECK(!strcmp(tok, "@channel") && n == 5);
+
+    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "0\x1e");
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "ok @here", tok, sizeof tok, &n) == 0);
+    CHECK(!strcmp(tok, "@here"));
+    bc_me(&m, OC_ROLE_ADMIN);
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "ok @here", tok, sizeof tok, &n) == 1);   /* 0: no threshold to confirm */
+
+    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "5\x1e");
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@everyone", tok, sizeof tok, &n) == 2);   /* at the threshold */
+    bc_me(&m, OC_ROLE_MEMBER);
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@everyone", tok, sizeof tok, &n) == 0);
+    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "6\x1e");
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@everyone", tok, sizeof tok, &n) == 1);   /* under it */
+    CHECK(oc_model_broadcast_will_notify(&m, 11, "@everyone", tok, sizeof tok, &n) == 0 && n == 0);   /* roster unknown: large */
+
+    bc_settings(&m, "broadcast_mentions\x1f" "nobody\x1e" "broadcast_large\x1f" "0\x1e");
+    bc_me(&m, OC_ROLE_OWNER);
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@channel", tok, sizeof tok, &n) == 0);
+    oc_model_free(&m);
+}
+
 static void test_poll_model(void) {
     oc_model m; oc_model_init(&m);
     oc_ev e;
@@ -5238,6 +5284,7 @@ int run_client_core_tests(void) {
     test_table_preview();
     test_workspace_settings_model();
     test_change_windows_model();
+    test_broadcast_model();
     test_badge_tiers();
     test_osnotify_null();
     test_feedback();

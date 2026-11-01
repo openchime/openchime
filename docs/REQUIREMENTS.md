@@ -1601,6 +1601,14 @@ keeps to its own share of the free space and gives it back under pressure
   for the mentioned party, and has driven notification delivery under the
   recipient's per-channel level (REQ-130) — the "mentions" notification level
   *depends* on this feature (ARCH-89).
+
+  Who may notify a whole channel is the workspace's configuration
+  (`OPENCHIME_BROADCAST_MENTIONS`: everyone, owners and admins, or nobody),
+  from a member count that makes a channel large
+  (`OPENCHIME_BROADCAST_LARGE`; 0, every channel). From anyone else, in a
+  large channel, `@here`, `@channel` and `@everyone` stay in the message as
+  text and notify nobody; the composer says so before sending, and asks for
+  confirmation, naming how many it will notify, when it will.
 - **REQ-287.** Mentioning someone who is **not in the channel** has
   never been silent. The sender has been told — privately, in a notice only they see, since
   it concerns their action and not the conversation — that the mention reached

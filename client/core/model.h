@@ -1094,6 +1094,15 @@ int oc_model_may_add_emoji(const oc_model *m);
  * unset for always, `never`, or seconds after sending. The daemon decides;
  * this only keeps the action off the menu once it would be refused. */
 int oc_model_may_change_own(const oc_model *m, uint64_t sent_ms, int edit, uint64_t now_ms);
+/* What a broadcast mention in `body` (@here, @channel, @everyone) will do in
+ * `channel_id` under the workspace's `broadcast_mentions` and
+ * `broadcast_large` (REQ-221): -1 there is none; 0 it will notify nobody,
+ * from this person in a channel this large; 1 it will notify; 2 it will
+ * notify a channel the workspace calls large, which the composer confirms.
+ * `token` gets the mention as written, `members` the channel's size when the
+ * roster is loaded (else 0). The daemon decides; this is the warning. */
+int oc_model_broadcast_will_notify(const oc_model *m, uint64_t channel_id, const char *body,
+                                   char *token, size_t tcap, size_t *members);
 
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);

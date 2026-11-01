@@ -4285,6 +4285,31 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
      * is the only thing missing, and withholding it just means they find out late
      * or never. In a private one they cannot read it at all, and a notification
      * pointing at something unreadable is worse than silence. */
+    /* Who may notify a whole large channel (OPENCHIME_BROADCAST_MENTIONS and
+     * _LARGE, REQ-221): from anyone else @channel, @everyone and @here stay in
+     * the message as text and get no row, so they notify nobody. */
+    int broadcast_ok = 1;
+    {
+        const oc_config *cf = oc_config_get();
+        if (cf->broadcast_mentions != 0) {
+            uint64_t author = 0;
+            int64_t members = 0;
+            sqlite3_stmt *bq = NULL;
+            if (sqlite3_prepare_v2(db,
+                    "SELECT author_id, (SELECT COUNT(*) FROM channel_members WHERE channel_id=?2) "
+                    "FROM messages WHERE id=?1;", -1, &bq, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(bq, 1, (sqlite3_int64)mid);
+                sqlite3_bind_int64(bq, 2, (sqlite3_int64)channel_id);
+                if (sqlite3_step(bq) == SQLITE_ROW) {
+                    author = (uint64_t)sqlite3_column_int64(bq, 0);
+                    members = sqlite3_column_int64(bq, 1);
+                }
+                sqlite3_finalize(bq);
+            }
+            if (members >= cf->broadcast_large)
+                broadcast_ok = cf->broadcast_mentions == 1 && get_role(db, author) >= OC_ROLE_ADMIN;
+        }
+    }
     int chan_public = 0;
     {
         sqlite3_stmt *cq = NULL;
@@ -4358,6 +4383,9 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
             group_row_free(&g);
             continue;
         }
+        if ((m[i].kind == OC_MENTION_HERE || m[i].kind == OC_MENTION_CHANNEL ||
+             m[i].kind == OC_MENTION_EVERYONE) && !broadcast_ok)
+            continue;
         if (m[i].kind == OC_MENTION_USER) {
             /* Match the display name case-insensitively among this channel's
              * members. Membership is asked first regardless of channel kind,

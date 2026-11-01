@@ -9150,6 +9150,78 @@ static void test_edit_windows(void) {
     cleanup_db(path);
 }
 
+/* Who may notify a whole large channel (OPENCHIME_BROADCAST_MENTIONS and
+ * OPENCHIME_BROADCAST_LARGE, REQ-221): under each rule, a broadcast from a
+ * member, an admin and an owner, in a channel under and at the threshold,
+ * stores its row or stays text. */
+static void set_broadcast(const char *who, const char *large) {
+    char err[256];
+    if (who) setenv("OPENCHIME_BROADCAST_MENTIONS", who, 1); else unsetenv("OPENCHIME_BROADCAST_MENTIONS");
+    if (large) setenv("OPENCHIME_BROADCAST_LARGE", large, 1); else unsetenv("OPENCHIME_BROADCAST_LARGE");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+}
+static int channel_size(const char *path, uint64_t cid) {
+    sqlite3 *raw = NULL;
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_open(path, &raw) != SQLITE_OK) return -1;
+    sqlite3_prepare_v2(raw, "SELECT COUNT(*) FROM channel_members WHERE channel_id=?1;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)cid);
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_close(raw);
+    return n;
+}
+static void test_broadcast_rules(void) {
+    const char *path = tdb("broadcast.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t who[3];
+    who[0] = reg(w, "bc-member", "pw", OC_ROLE_MEMBER);
+    who[1] = reg(w, "bc-admin", "pw", OC_ROLE_ADMIN);
+    who[2] = reg(w, "bc-owner", "pw", OC_ROLE_OWNER);
+    int size = channel_size(path, OC_DEFAULT_CHANNEL);
+    CHECK(size >= 3);
+    char at[16], above[16];
+    snprintf(at, sizeof at, "%d", size);
+    snprintf(above, sizeof above, "%d", size + 1);
+
+    static const char *const bodies[] = { "@channel standup", "@everyone lunch", "@here anyone?" };
+    static const int kinds[] = { OC_MENTION_CHANNEL, OC_MENTION_EVERYONE, OC_MENTION_HERE };
+    struct { const char *rule, *large; int stored[3]; } cases[] = {
+        { NULL,       NULL,  { 1, 1, 1 } },   /* unset: everyone, every channel */
+        { "everyone", "0",   { 1, 1, 1 } },
+        { "admins",   "0",   { 0, 1, 1 } },
+        { "admins",   at,    { 0, 1, 1 } },   /* at the threshold is large */
+        { "admins",   above, { 1, 1, 1 } },   /* under it, anyone */
+        { "nobody",   "0",   { 0, 0, 0 } },
+        { "nobody",   above, { 1, 1, 1 } },
+    };
+    uint8_t idem[OC_IDEM_LEN];
+    int seq = 0;
+    for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+        set_broadcast(cases[c].rule, cases[c].large);
+        for (int u = 0; u < 3; u++) {
+            memset(idem, 0, sizeof idem);
+            idem[0] = 0xBC; idem[1] = (uint8_t)++seq;
+            uint64_t mid = send_msg(w, who[u], idem, bodies[seq % 3]);
+            CHECK(mid != 0);
+            CHECK(mention_rows(path, mid, 0, kinds[seq % 3]) == cases[c].stored[u]);
+        }
+    }
+    /* A personal mention is not a broadcast: under `nobody` it still notifies. */
+    set_broadcast("nobody", "0");
+    memset(idem, 0xBD, sizeof idem);
+    uint64_t mid = send_msg(w, who[0], idem, "@bc-admin and @channel");
+    CHECK(mention_rows(path, mid, who[1], OC_MENTION_USER) == 1);
+    CHECK(mention_rows(path, mid, 0, OC_MENTION_CHANNEL) == 0);
+
+    set_broadcast(NULL, NULL);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
@@ -9201,6 +9273,7 @@ int run_dbwriter_tests(void) {
     test_search();
     test_search_filters_and_paging();
     test_edit_windows();
+    test_broadcast_rules();
     test_default_channels();
     test_search_orders();
     test_setup_invite();

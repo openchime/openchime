@@ -44,6 +44,13 @@ const cfg_row OC_CFG[] = {
     /* --- Settings: no feature behind them, a value an operator chooses -------- */
     /* First: the mode decides whether the development rows below may be read. */
     ENUM("OPENCHIME_MODE", CFG_OPERATOR, G_SET, "normal", "normal|development|demo", "What the box is for: `normal` (a deployment), `development` (the tests and harnesses; the only mode that reads the Development rows) or `demo` (the public demo workspace).", mode),
+    /* ENUMs and INTs a client is told (CFG_VISIBLE), written out: the macros have no flags. */
+    { "OPENCHIME_BROADCAST_MENTIONS", CFG_ENUM, CFG_OPERATOR, G_SET, "everyone",
+      "Who may notify a whole large channel with `@channel`, `@everyone` or `@here` (REQ-221): `everyone`, `admins` (owners and admins) or `nobody`. From anyone else the mention stays in the message as text and notifies nobody.",
+      0, 0, "everyone|admins|nobody", F(broadcast_mentions), NULL, CFG_VISIBLE, 0 },
+    { "OPENCHIME_BROADCAST_LARGE", CFG_INT, CFG_OPERATOR, G_SET, "0",
+      "The member count from which a channel is large for `OPENCHIME_BROADCAST_MENTIONS`; 0 makes every channel large.",
+      0, 1000000, NULL, F(broadcast_large), NULL, CFG_VISIBLE, 0 },
     STR("OPENCHIME_WORKSPACE_NAME", CFG_OPERATOR, G_SET, "", "The workspace's display name, shown to clients; unset, a client derives one from the host.", F(workspace_name), NULL, CFG_VISIBLE, 0),
     /* An ENUM a client is told (CFG_VISIBLE), written out: the macro has no flags. */
     { "OPENCHIME_CUSTOM_EMOJI_ADD", CFG_ENUM, CFG_OPERATOR, G_SET, "everyone",

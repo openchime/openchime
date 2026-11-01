@@ -46,6 +46,7 @@
 
 #include "client.h"
 #include "model.h"
+#include "mention.h"    /* OC_MENTION_NAME_MAX: a broadcast mention as written */
 #include "complete.h"
 #include "resolve.h"    /* workspace -> host:port (REQ-010/011) */
 #include "store.h"      /* peek a stored session token (skip the sign-in box) */
@@ -402,6 +403,8 @@ static void build_rows(rows_t *r, const oc_model *m, const oc_channel *ch, uint6
  * the launcher offers to accept or decline (0: none); and what was last said of
  * each session, so each change is said once. */
 static char     g_e2e_note[200];
+static char     g_bc_note[200];     /* a broadcast mention's note or question (REQ-221) */
+static char     g_bc_ask[1024];     /* the text the question was about: a second Enter on it sends */
 static uint64_t g_e2e_invite;
 static uint32_t g_e2e_refused_seen;
 static struct { uint64_t id; uint8_t state; } g_e2e_said[OC_PDM_VIEW_MAX];
@@ -1553,6 +1556,11 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             char pl[220];
             snprintf(pl, sizeof pl, "   \xf0\x9f\x94\x92 %s", g_e2e_note);
             sx = tk_text(sx, H - 3, W, pl, th->accent, TB_DEFAULT);
+        }
+        if (g_bc_note[0]) {
+            char bl[sizeof g_bc_note + 4];
+            snprintf(bl, sizeof bl, "   %s", g_bc_note);
+            sx = tk_text(sx, H - 3, W, bl, g_bc_ask[0] ? TB_YELLOW | TB_BOLD : th->accent, TB_DEFAULT);
         }
         if (m->n_sum_notices) {
             /* The newest summary made while you were away, until it is opened. */
@@ -3870,6 +3878,8 @@ int main(int argc, char **argv) {
 
         if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) {
             running = 0;
+        } else if (ev.key == TB_KEY_ESC && g_bc_ask[0]) {   /* keep editing the broadcast */
+            g_bc_ask[0] = '\0'; g_bc_note[0] = '\0';
         } else if (ev.key == TB_KEY_ESC) {    /* composer → navigation mode */
             if (editing) { editing = 0; composer[0] = '\0'; clen = 0; }
             else { panel = 2; if (focus < nch) msg_sel = m->channels[focus].n_msgs ? (int)m->channels[focus].n_msgs - 1 : -1; }
@@ -3884,8 +3894,27 @@ int main(int argc, char **argv) {
                 const oc_model *mm = oc_client_model(cl);
                 uint64_t cid = mm->channels[focus].channel_id;
                 if (mm->search_open || mm->roster_open || mm->reactlist_open || mm->voterlist_open || mm->prefs_open || mm->weblist_open) { /* read-only overlay: ignore */ }
-                else if (mm->thread_open) oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
-                else                      oc_client_send(cl, cid, composer);
+                else {
+                    /* A broadcast mention under the workspace's rule (REQ-221):
+                     * one that will notify nobody is said and sent; one that will
+                     * notify a channel the workspace calls large asks, and a
+                     * second Enter on the same text sends it. */
+                    uint64_t bcid = mm->thread_open ? mm->thread_channel : cid;
+                    char tok[OC_MENTION_NAME_MAX + 2];
+                    size_t bn = 0;
+                    int bc = oc_model_broadcast_will_notify(mm, bcid, composer, tok, sizeof tok, &bn);
+                    g_bc_note[0] = '\0';
+                    if (bc == 2 && strcmp(g_bc_ask, composer) != 0) {
+                        snprintf(g_bc_ask, sizeof g_bc_ask, "%s", composer);
+                        if (bn) snprintf(g_bc_note, sizeof g_bc_note, "%s notifies %zu people: Enter to send, Esc to keep editing", tok, bn);
+                        else snprintf(g_bc_note, sizeof g_bc_note, "%s notifies everyone here: Enter to send, Esc to keep editing", tok);
+                        continue;
+                    }
+                    g_bc_ask[0] = '\0';
+                    if (bc == 0) snprintf(g_bc_note, sizeof g_bc_note, "%s won't notify anyone here.", tok);
+                    if (mm->thread_open) oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
+                    else                 oc_client_send(cl, cid, composer);
+                }
                 clen = 0; composer[0] = '\0'; scroll = 0;
             }
         } else if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {
