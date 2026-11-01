@@ -1246,6 +1246,7 @@ static oc_msgrow g_msgrows[600];
  * is precisely what the tree must not contain. */
 static rectf g_msglist_reg;
 static int   g_msglist_drawn;
+static uint64_t g_msglist_cid;   /* the conversation those rows are from */
 static int g_n_msgrows;
 /* The same, for the thread pane — replies were read-only because the
  * pane recorded no hit-boxes at all. Its own scroll offset, so opening a thread
@@ -1860,6 +1861,9 @@ static int g_n_searchrows;
  * usually still in flight when the click lands — `g_jump_deadline` is what turns
  * "not loaded yet" into an honest failure instead of a silent no-op. */
 static uint64_t  g_jump_mid;            /* message to scroll to, 0 = none */
+/* The jump is going BACK to a place (navigation history): the message goes to
+ * the top of the pane, where it was, and nothing flashes -- it is not news. */
+static int       g_jump_quiet;
 /* Forwarding (REQ-057): the message chosen in the kebab, waiting for a
  * destination. The palette picks the destination — it already lists every
  * conversation, so a forward needs no new picker. */
@@ -2076,6 +2080,8 @@ static rectf g_members_btn;       /* header toggle hit-box */
 /* Add people, beside the member count (REQ-031): opens the members pane with
  * the people picker. Not in DMs. */
 static rectf g_addppl_btn;
+/* Back and forward (navigation history), at the header's left. */
+static rectf g_hist_back_btn, g_hist_fwd_btn;
 /* The pane's GROUPS subheading's + (REQ-309): add a group to the channel. */
 static rectf g_grp_plus;
 /* Tooltips for those two icon-only buttons, drawn BELOW them -- the header is
@@ -3754,6 +3760,147 @@ static void select_channel(uint64_t cid) {
     g_tab = TAB_MESSAGES;                /* a new channel opens on its transcript */
     draft_restore(cid);
     ac_close();
+}
+
+/* ---- navigation history: back and forward -----------------------------------
+ *
+ * Following a link, a search hit or an Activity row used to be one-way: there
+ * was no getting back to where you were reading. This is the browser's answer.
+ * A PLACE is a conversation, the thread open in it if any, and where in it you
+ * were -- the message at the top of the transcript, or 0 for the newest. A
+ * message id rather than a pixel offset, so it survives a resize, a new text
+ * size and messages arriving underneath.
+ *
+ * Recorded by watching rather than by calling from every path: hist_track runs
+ * each tick and pushes whenever the conversation or the open thread is not the
+ * current entry's, so the sidebar, the palette, a toast, a permalink and Alt+Up
+ * all record without each having to remember to. Jumps within one conversation
+ * change neither, so the paths that jump say so (hist_jump). While an entry is
+ * current its position is kept fresh, so leaving it remembers where you left.
+ *
+ * In the browser each entry is also a history entry (oc_plat_nav_push), and the
+ * browser's own Back and Forward come back here by sequence number. */
+#define HIST_MAX 100
+typedef struct { uint64_t cid, thread, mid; uint32_t seq; int view; } hist_place;
+static hist_place g_hist[HIST_MAX];
+static int        g_hist_n, g_hist_pos = -1;
+static uint32_t   g_hist_seq;
+/* A restore in flight: the thread it opens arrives a beat later, and until it
+ * does the place looks different from the entry -- which must not be recorded
+ * as somewhere new. */
+static int        g_hist_restoring;
+static uint64_t   g_hist_restore_until;
+
+static int transcript_shell(void);   /* fwd */
+
+static int hist_here(hist_place *p) {
+    const oc_model *m = model();
+    if (!m || !g_client || !g_sel || !transcript_shell()) return 0;
+    memset(p, 0, sizeof *p);
+    p->cid = g_sel;
+    p->thread = (m->thread_open && m->thread_channel == g_sel) ? m->thread_parent : 0;
+    p->view = g_view;
+    return 1;
+}
+
+static int hist_same(const hist_place *a, const hist_place *b) {
+    return a->cid == b->cid && a->thread == b->thread && a->view == b->view;
+}
+
+static void hist_push(hist_place p) {
+    if (g_hist_pos < g_hist_n - 1) g_hist_n = g_hist_pos + 1;   /* somewhere new: no forward */
+    if (g_hist_n == HIST_MAX) {
+        memmove(g_hist, g_hist + 1, (HIST_MAX - 1) * sizeof g_hist[0]);
+        g_hist_n--;
+    }
+    p.seq = ++g_hist_seq;
+    g_hist[g_hist_n++] = p;
+    g_hist_pos = g_hist_n - 1;
+    oc_plat_nav_push(p.seq, g_hist_n == 1);
+}
+
+/* The message at the top of the transcript as last drawn, or 0 at the newest. */
+static uint64_t hist_top_mid(void) {
+    if (g_scroll <= 0.5f) return 0;
+    for (int i = 0; i < g_n_msgrows; i++)
+        if (g_msgrows[i].bot > g_msglist_reg.top + 1) return g_msgrows[i].mid;
+    return 0;
+}
+
+static void hist_track(void) {
+    hist_place h;
+    if (!hist_here(&h)) return;
+    hist_place *cur = g_hist_pos >= 0 ? &g_hist[g_hist_pos] : NULL;
+    int same = cur && hist_same(cur, &h);
+    if (g_hist_restoring) {
+        if (same || now_ms() > g_hist_restore_until) g_hist_restoring = 0;
+        return;
+    }
+    if (!same) { hist_push(h); return; }
+    /* Fresh while current, from rows drawn for THIS conversation, and not while
+     * a jump is still on its way to where it is going. */
+    if (!g_jump_mid && g_msglist_drawn && g_msglist_cid == h.cid) cur->mid = hist_top_mid();
+}
+
+/* A jump to `mid` in `cid` (now selected): a place of its own, even in the
+ * conversation already open. */
+static void hist_jump(uint64_t cid, uint64_t mid) {
+    g_jump_quiet = 0;
+    hist_place h;
+    if (!mid || !hist_here(&h) || h.cid != cid) return;
+    h.mid = mid;
+    hist_place *cur = g_hist_pos >= 0 ? &g_hist[g_hist_pos] : NULL;
+    if (cur && hist_same(cur, &h) && cur->mid == mid) return;
+    hist_push(h);
+}
+
+static void hist_restore(int idx) {
+    if (idx < 0 || idx >= g_hist_n || !g_client) return;
+    const oc_model *m = model();
+    hist_place p = g_hist[idx];
+    if (!m || !oc_model_channel((oc_model *)m, p.cid)) return;   /* left or gone */
+    g_hist_pos = idx;
+    g_hist_restoring = 1;
+    g_hist_restore_until = now_ms() + 3000;
+    crumb("hist_restore %d %llu", idx, (unsigned long long)p.cid);
+    close_overlays();              /* closes an open thread, too */
+    g_view = p.view;
+    if (g_sel != p.cid) select_channel(p.cid);
+    if (p.thread) oc_client_open_thread(g_client, p.cid, p.thread);
+    g_jump_fetched = 0;
+    if (p.mid) {
+        g_jump_mid = p.mid;
+        g_jump_quiet = 1;
+        g_jump_deadline = now_ms() + 4000;
+    } else {
+        g_jump_mid = 0;
+        g_jump_quiet = 0;
+        g_scroll = 0;
+    }
+    invalidate();
+}
+
+static int hist_can(int d) {
+    int to = g_hist_pos + d;
+    return g_hist_pos >= 0 && to >= 0 && to < g_hist_n;
+}
+
+static void hist_go(int d) {
+    if (!hist_can(d)) return;
+    /* The browser owns its history: ask it to move, and its popstate comes back
+     * through hist_goto_seq. A desktop moves at once. */
+    if (oc_plat_nav_go(d)) return;
+    hist_restore(g_hist_pos + d);
+}
+
+static void hist_goto_seq(uint32_t seq) {
+    for (int i = 0; i < g_hist_n; i++)
+        if (g_hist[i].seq == seq) { if (i != g_hist_pos) hist_restore(i); return; }
+}
+
+/* A different workspace is a different history. */
+static void hist_reset(void) {
+    g_hist_n = 0; g_hist_pos = -1; g_hist_restoring = 0;
 }
 
 /* Are quiet hours in force RIGHT NOW (REQ-131)? The window is minutes since local
@@ -6805,10 +6952,15 @@ static void draw_msglist(gfx *rt, const oc_model *m,
      * clamp is what keeps a hit in the newest or oldest screenful sensible
      * rather than scrolling past the end. */
     if (capture && jump_i >= 0) {
-        *scroll = total - jump_off - visible * 0.66f;
-        g_flash_mid = g_jump_mid;
-        g_flash_until = now_ms() + 1600;
+        if (g_jump_quiet) {
+            *scroll = total - jump_off - visible;     /* its top at the pane's top */
+        } else {
+            *scroll = total - jump_off - visible * 0.66f;
+            g_flash_mid = g_jump_mid;
+            g_flash_until = now_ms() + 1600;
+        }
         g_jump_mid = 0;
+        g_jump_quiet = 0;
     }
 
     if (*scroll > *scroll_max) *scroll = *scroll_max;
@@ -6855,6 +7007,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
          * the part that lands on the transcript (a11y_publish_scene). */
         g_msglist_reg = reg;
         g_msglist_drawn = 1;
+        g_msglist_cid = g_sel;
     }
     else if (hits) g_n_thrrows = 0;
     for (size_t i = 0; i < n; i++) {
@@ -8111,7 +8264,7 @@ static void nav_conversation(oc_win *hwnd, int delta, int unread_only) {
 enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
        ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_PTT, ACC_FREETALK, ACC_QUIT, ACC_CALL_MUTE, ACC_CALL_SHARE,
-       ACC_MARK_ALL_READ, ACC_TOAST_ACTION };
+       ACC_MARK_ALL_READ, ACC_TOAST_ACTION, ACC_HIST_BACK, ACC_HIST_FWD };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -8137,6 +8290,9 @@ static const struct {
     { AM_ALT,             OCK_DOWN,    ACC_NAV_NEXT,        NULL, NULL },
     { AM_ALT | AM_SHIFT,  OCK_UP,      ACC_NAV_PREV_UNREAD, "Alt+Shift+Up / Down", "Previous / next UNREAD conversation" },
     { AM_ALT | AM_SHIFT,  OCK_DOWN,    ACC_NAV_NEXT_UNREAD, NULL, NULL },
+    /* Back and forward through the places you have been, as a browser's. */
+    { AM_ALT,             OCK_LEFT,    ACC_HIST_BACK, "Alt+Left / Alt+Right", "Back / forward to where you were" },
+    { AM_ALT,             OCK_RIGHT,   ACC_HIST_FWD,  NULL, NULL },
     { AM_CTRL,            'K',        ACC_PALETTE, "Ctrl+K",           "Command palette" },
     { AM_CTRL,            'F',        ACC_SEARCH,  "Ctrl+F",           "Search messages" },
     { AM_CTRL,            OCK_SLASH,   ACC_KEYS,    "Ctrl+/",           "This list" },
@@ -8236,6 +8392,8 @@ static void accel_run(oc_win *hwnd, int action) {
     case ACC_NAV_NEXT:        nav_conversation(hwnd,  1, 0); break;
     case ACC_NAV_PREV_UNREAD: nav_conversation(hwnd, -1, 1); break;
     case ACC_NAV_NEXT_UNREAD: nav_conversation(hwnd,  1, 1); break;
+    case ACC_HIST_BACK:       hist_go(-1); break;
+    case ACC_HIST_FWD:        hist_go( 1); break;
     case ACC_FOCUS: {
         /* One toggle rather than an F6 handler in each control, which is how the
          * two ends drifted: the composer sent focus to the filter box even in the
@@ -10122,17 +10280,36 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         right_used += UIS(38) + text_width("Summarize", g_meta) + UIS(12);
     if (pv && pv->safety[0]) right_used += call_button_w("Safety number", OC_ICON_SHIELD) + UIS(8);
     if (pv && pv->state != OC_PDM_EV_ENDED) right_used += call_button_w("End", -1) + UIS(8);
+    /* Back and forward, ahead of the title, as a browser's: dimmed while there
+     * is nowhere to go. The title starts after them. */
+    float tx = x0 + 20;
+    if (c) {
+        float bs = UIS(26), by = (HEADER_H - bs) / 2, bx = x0 + UIS(10);
+        g_hist_back_btn = rf(bx, by, bx + bs, by + bs);
+        g_hist_fwd_btn  = rf(bx + bs + UIS(2), by, bx + 2 * bs + UIS(2), by + bs);
+        for (int k = 0; k < 2; k++) {
+            rectf b = k ? g_hist_fwd_btn : g_hist_back_btn;
+            int can = hist_can(k ? 1 : -1);
+            if (can && in_rect(b, g_mouse_x, g_mouse_y)) fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
+            const char *ar = k ? "\u2192" : "\u2190";
+            float aw = text_width(ar, g_ui), ax = (b.left + b.right - aw) / 2;
+            draw_text(rt, ar, g_ui, rf(ax, b.top, b.right, b.bottom), can ? OC_COL_TEXT : OC_COL_FAINT);
+        }
+        tx = g_hist_fwd_btn.right + UIS(10);
+    } else {
+        g_hist_back_btn = g_hist_fwd_btn = rf(0, 0, 0, 0);
+    }
     float title_r = x0 + w - right_used - UIS(12);
-    if (title_r < x0 + UIS(80)) title_r = x0 + UIS(80);   /* never nothing at all */
+    if (title_r < tx + UIS(60)) title_r = tx + UIS(60);   /* never nothing at all */
 
     if (typing[0]) {
-        draw_text(rt, title, g_display, rf(x0 + 20, 6, title_r, 34), OC_COL_TEXT);
-        draw_text(rt, typing, g_meta, rf(x0 + 20, 32, title_r, HEADER_H - 6), OC_COL_ACCENT);
+        draw_text(rt, title, g_display, rf(tx, 6, title_r, 34), OC_COL_TEXT);
+        draw_text(rt, typing, g_meta, rf(tx, 32, title_r, HEADER_H - 6), OC_COL_ACCENT);
     } else if (topic) {
-        draw_text(rt, title, g_display, rf(x0 + 20, 6, title_r, 34), OC_COL_TEXT);
-        draw_text(rt, topic, g_meta, rf(x0 + 20, 32, title_r, HEADER_H - 6), OC_COL_MUTED);
+        draw_text(rt, title, g_display, rf(tx, 6, title_r, 34), OC_COL_TEXT);
+        draw_text(rt, topic, g_meta, rf(tx, 32, title_r, HEADER_H - 6), OC_COL_MUTED);
     } else {
-        draw_text(rt, title, g_display, rf(x0 + 20, 0, title_r, HEADER_H), OC_COL_TEXT);
+        draw_text(rt, title, g_display, rf(tx, 0, title_r, HEADER_H), OC_COL_TEXT);
     }
 
     /* Member count chip (right), Slack's shape: an icon and a number rather than
@@ -20258,9 +20435,11 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
         }
         /* The header's and the pane's icon-only buttons' names, over both. */
         if (g_chtip && now_ms() - g_chtip_since >= FMT_TIP_MS) {
-            rectf tb = g_chtip == 1 ? g_addppl_btn : g_grp_plus;
-            if (tb.right > tb.left)
-                draw_tip_below(rt, tb, g_chtip == 1 ? "Add people" : "Add a group", 0, W);
+            rectf tb = g_chtip == 1 ? g_addppl_btn : g_chtip == 2 ? g_grp_plus :
+                       g_chtip == 3 ? g_hist_back_btn : g_hist_fwd_btn;
+            const char *tt = g_chtip == 1 ? "Add people" : g_chtip == 2 ? "Add a group" :
+                             g_chtip == 3 ? "Back (Alt+Left)" : "Forward (Alt+Right)";
+            if (tb.right > tb.left) draw_tip_below(rt, tb, tt, 0, W);
         }
         /* The summary pane's hover names and citation card, over everything. */
         draw_summary_float(rt, m, W, H);
@@ -23520,6 +23699,7 @@ enum {
     AT_GRPPICK,       /* ... accept one match */
     AT_GRPADD,        /* ... add the chosen people */
     AT_ADDPPL,        /* the header's Add people */
+    AT_HIST,          /* payload: 0 back, 1 forward */
     AT_GRPPLUS,       /* the members pane's Add a group */
     AT_DTAB,          /* payload: drafts tab index */
     AT_REACTCHIP,     /* payload: who-reacted chip index — add or take back yours */
@@ -23886,6 +24066,10 @@ static void a11y_publish_scene(const oc_model *m) {
     /* The two icon-only membership buttons, named as their tooltips are. */
     if (g_addppl_btn.right > g_addppl_btn.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_BUTTON, "header.addpeople", "Add people", g_addppl_btn, ATOK(AT_ADDPPL, 0));
+    if (g_hist_back_btn.right > g_hist_back_btn.left && n < OC_ACC_MAX)
+        acc_push(items, &n, OC_ACC_BUTTON, "header.back", "Back", g_hist_back_btn, ATOK(AT_HIST, 0));
+    if (g_hist_fwd_btn.right > g_hist_fwd_btn.left && n < OC_ACC_MAX)
+        acc_push(items, &n, OC_ACC_BUTTON, "header.forward", "Forward", g_hist_fwd_btn, ATOK(AT_HIST, 1));
     if (g_grp_plus.right > g_grp_plus.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_BUTTON, "members.groups.add", "Add a group", g_grp_plus, ATOK(AT_GRPPLUS, 0));
     for (int i = 0; i < g_n_call_rows && n < OC_ACC_MAX; i++) {
@@ -27235,6 +27419,7 @@ static int files_click(oc_win *hwnd, int x, int y) {
                 if (from_view) { g_view = VIEW_HOME; layout_composer(hwnd); }
                 g_jump_mid = f->message_id;
             g_jump_deadline = now_ms() + 1500;
+                hist_jump(g_sel, g_jump_mid);
                 select_tab(TAB_MESSAGES);
             }
             return 1;
@@ -27350,6 +27535,7 @@ static int permalink_follow(oc_win *hwnd, const char *text) {
     if (mid) {
         g_jump_mid = mid;
         g_jump_deadline = now_ms() + 4000;
+        hist_jump(chan, mid);
     }
     select_tab(TAB_MESSAGES);
     layout_composer(hwnd);
@@ -28277,6 +28463,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 if (g_listrows[i].cid) select_channel(g_listrows[i].cid);
                 g_jump_mid = g_listrows[i].mid;
                 g_jump_deadline = now_ms() + 1500;
+                hist_jump(g_sel, g_jump_mid);
                 return 1;
             }
     }
@@ -28303,6 +28490,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 if (g_listrows[i].cid) select_channel(g_listrows[i].cid);
                 g_jump_mid = g_listrows[i].mid;
             g_jump_deadline = now_ms() + 1500;
+                hist_jump(g_sel, g_jump_mid);
                 select_tab(TAB_MESSAGES);
                 layout_composer(hwnd);
                 return 1;
@@ -28400,6 +28588,8 @@ static int on_click(oc_win *hwnd, int x, int y) {
         listen_set(hwnd, on ? 0 : 1);
         return 1;
     }
+    if (in_rect(g_hist_back_btn, x, y)) { hist_go(-1); return 1; }
+    if (in_rect(g_hist_fwd_btn, x, y))  { hist_go( 1); return 1; }
     /* Add people, beside the count: the pane, with the people picker. */
     if (in_rect(g_addppl_btn, x, y) && g_sel) {
         members_open(hwnd, g_sel, 1);
@@ -28539,6 +28729,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
              * conversation, so landing on it in context is the point. */
             g_jump_mid = g_pinrows[i].mid;
             g_jump_deadline = now_ms() + 1500;
+            hist_jump(g_sel, g_jump_mid);
             oc_client_close_pins(g_client);
             return 1;
         }
@@ -28615,6 +28806,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
             select_channel(g_fwd_hits[i].chan);
             g_jump_mid = g_fwd_hits[i].mid;
             g_jump_deadline = now_ms() + 4000;
+            hist_jump(g_sel, g_jump_mid);
             select_tab(TAB_MESSAGES);
             layout_composer(hwnd);
             invalidate();
@@ -28723,6 +28915,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
                         g_jump_mid = g_searchrows[i].mid;
                         g_jump_deadline = now_ms() + 4000;
                         select_channel(g_searchrows[i].cid);   /* also closes the overlay */
+                        hist_jump(g_sel, g_jump_mid);
                         return 1;
                     }
             if (mm->weblist_open)
@@ -29846,6 +30039,7 @@ static void ws_load(int i) {
     if (i < 0 || i >= g_n_wss) return;
     oc_ws_slot *w = &g_wss[i];
     g_ws_active = i;
+    if (g_client != w->client) hist_reset();
     g_client = w->client;
     g_sel = w->sel; g_scroll = w->scroll; g_post_auth = w->post_auth;
     g_n_backfilled = w->n_backfilled;
@@ -33893,6 +34087,18 @@ static void test_dump(const char *path) {
         }
     }
     fprintf(f, "sbsel=%d\n", g_n_sbsel);
+    {   /* Navigation history: the entries, which is current, and where each is. */
+        const hist_place *hc = g_hist_pos >= 0 ? &g_hist[g_hist_pos] : NULL;
+        fprintf(f, "hist n=%d pos=%d restoring=%d back=%d fwd=%d cid=%llu thread=%llu mid=%llu scroll=%.0f btn=%.0f,%.0f,%.0f,%.0f\n",
+                g_hist_n, g_hist_pos, g_hist_restoring, hist_can(-1), hist_can(1),
+                (unsigned long long)(hc ? hc->cid : 0), (unsigned long long)(hc ? hc->thread : 0),
+                (unsigned long long)(hc ? hc->mid : 0), g_scroll,
+                g_hist_back_btn.left, g_hist_back_btn.top, g_hist_fwd_btn.right, g_hist_fwd_btn.bottom);
+        for (int i = 0; i < g_hist_n; i++)
+            fprintf(f, "  histent %d cid=%llu thread=%llu mid=%llu view=%d\n", i,
+                    (unsigned long long)g_hist[i].cid, (unsigned long long)g_hist[i].thread,
+                    (unsigned long long)g_hist[i].mid, g_hist[i].view);
+    }
     fprintf(f, "sbunreads on=%d chip=%.0f,%.0f,%.0f,%.0f\n", g_sb.unreads_only,
             g_sb_unread_chip.left, g_sb_unread_chip.top, g_sb_unread_chip.right, g_sb_unread_chip.bottom);
     fprintf(f, "shelf n=%d", g_n_shelf);
@@ -36133,12 +36339,14 @@ static int on_tick(oc_win *hwnd) {
                     g_jump_deadline = now_ms() + 4000;
                 } else {
                     /* Asked and it still did not arrive: it is not in a channel
-                     * we can read, or it is gone. */
-                    g_jump_mid = 0; g_jump_fetched = 0;
-                    fb_failed("Could not find that message.");
+                     * we can read, or it is gone. Going back to a place whose
+                     * message has since gone lands at the newest, unannounced. */
+                    if (!g_jump_quiet) fb_failed("Could not find that message.");
+                    g_jump_mid = 0; g_jump_fetched = 0; g_jump_quiet = 0;
                 }
             }
             if (!g_jump_mid) g_jump_fetched = 0;
+            hist_track();
             /* The settings bucket arrives a beat after auth; fold it in once. */
             if (g_sb_settings_pending && oc_model_setting(m, SB_SETTING_KEY)) {
                 sidebar_opts_load(m);
@@ -36628,6 +36836,8 @@ static int on_mouse_move(oc_win *hwnd, int mx, int my) {
             if (!pointer_blocked()) {
                 if (in_rect(g_addppl_btn, (float)mx, (float)my)) ch = 1;
                 else if (in_rect(g_grp_plus, (float)mx, (float)my)) ch = 2;
+                else if (in_rect(g_hist_back_btn, (float)mx, (float)my)) ch = 3;
+                else if (in_rect(g_hist_fwd_btn, (float)mx, (float)my)) ch = 4;
             }
             if (ch != g_chtip) {
                 g_chtip = ch;
@@ -37004,6 +37214,7 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
         case AT_GRPPICK:   if (g_tgt_host != TGT_HOST_NEWMSG) tgt_accept((int)arg); break;
         case AT_GRPADD:    if (g_tgt_host == TGT_HOST_CHANNEL) chan_pick_commit(); else grp_pick_commit(); break;
         case AT_ADDPPL:    if (g_sel) members_open(hwnd, g_sel, 1); break;
+        case AT_HIST:      hist_go(arg ? 1 : -1); break;
         case AT_GRPPLUS:   if (g_sel && model()) channel_group_pick(hwnd, model(), g_sel, 1); break;
         case AT_VIDEO:     vm_command(hwnd, (int)arg); break;
         case AT_VOICE:
@@ -37325,6 +37536,9 @@ static void on_handoff(oc_win *hwnd, char *s) {
         snprintf(url, sizeof url, "%s", payload);
         show_and_focus(hwnd);
         permalink_follow(hwnd, url);
+    } else if (!strcmp(kind, "nav")) {
+        /* The browser's Back or Forward, arrived at one of our places. */
+        hist_goto_seq((uint32_t)strtoul(payload, NULL, 10));
     }
     free(s);
 }
@@ -37468,6 +37682,12 @@ static void handle_event(const SDL_Event *e) {
         int mx = (int)DIPF(wc_px(win, e->button.x)), my = (int)DIPF(wc_px(win, e->button.y));
         if (win == &g_recbar || win == &g_sharebar) { bar_click(win, mx, my); return; }
         if (win != hwnd) return;
+        /* A mouse's side buttons: back and forward, as everywhere else. */
+        if (e->button.button == SDL_BUTTON_X1 || e->button.button == SDL_BUTTON_X2) {
+            hist_go(e->button.button == SDL_BUTTON_X1 ? -1 : 1);
+            invalidate();
+            return;
+        }
         if (e->button.button == SDL_BUTTON_RIGHT) {
             on_rclick(hwnd, mx, my);
             invalidate();
