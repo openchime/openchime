@@ -288,7 +288,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_VOTE = 144, OC_JOB_LIST_POLL_VOTERS = 145,
        /* The author changes a poll: poll_opts/poll_flags/poll_close_at_ms are
         * all of it, as it is now to be. */
-       OC_JOB_EDIT_POLL = 146 };
+       OC_JOB_EDIT_POLL = 146,
+       /* READ_RECEIPTS (REQ-090): receipts_op 0/1 sets whether I share my
+        * read position, OC_RECEIPTS_ASK asks. Answered OC_RES_READ_RECEIPTS. */
+       OC_JOB_READ_RECEIPTS = 147 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -521,6 +524,7 @@ typedef struct oc_job {
      * parent_id + `follow_on`; MARK_READ reads parent_id + message_id (0 = all). */
     uint8_t        thread_filter;
     uint8_t        follow_on;
+    uint8_t        receipts_op;   /* OC_JOB_READ_RECEIPTS: 0, 1, or OC_RECEIPTS_ASK */
     /* SET_KEYWORDS / SET_PRIORITY (REQ-135), both heap and both wholesale. */
     char           **kw_terms;
     uint8_t          n_kw_terms;
@@ -763,7 +767,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * joined, a channel made or changed, a person added or given a role):
         * the SEND-shaped fields and `members`, broadcast as an ordinary
         * message. Chained onto the answer of the job that caused it. */
-       OC_RES_NOTICE = 121 };
+       OC_RES_NOTICE = 121,
+       /* Whether user_id shares their read receipts (rc_share): to the asker
+        * (rc_asked), or to every device of theirs when it changed. */
+       OC_RES_READ_RECEIPTS = 122 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -1347,6 +1354,11 @@ typedef struct oc_dbres {
      * the *other* members' current cursors to backfill the acker. */
     oc_read_cursor_row     *rcur;            /* heap array */
     size_t                  n_rcur;
+    /* READ_CURSOR: whether this reader's position may reach the others (the
+     * workspace's OPENCHIME_READ_RECEIPTS and their own choice); `rcur` holds
+     * only the others who share. READ_RECEIPTS: the choice, and whether it
+     * answers an ask. */
+    uint8_t                 rc_share, rc_asked;
 
     /* OC_RES_STT_PREP (ARCH-112): the segment, and the conversation's members'
      * display names (heap strings) for mention normalization. */

@@ -344,6 +344,7 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
             hdr->msg_type != OC_MSG_TYPING_UPDATE &&
             hdr->msg_type != OC_MSG_WORKSPACE_INFO &&
             hdr->msg_type != OC_MSG_WORKSPACE_SETTINGS &&
+            hdr->msg_type != OC_MSG_READ_CURSOR &&     /* seen-by, beside reads (REQ-090) */
             hdr->msg_type != OC_MSG_SERVER_BUILD &&
             hdr->msg_type != OC_MSG_CAPABILITIES &&
             hdr->msg_type != OC_MSG_TTS_INFO &&
@@ -396,7 +397,7 @@ static oc_alerts_summary g_auth_alerts;   /* what the last owner's or admin's si
 /* Sign `c` in as a person does (AUTH.md §8.10): the page, then the token on
  * AUTH; the post-auth pushes drained, so the stream is positional after. */
 /* The last sign-in's WORKSPACE_SETTINGS: up to 8 key/value pairs. */
-static char g_auth_settings[8][2][128];
+static char g_auth_settings[OC_WS_SETTINGS_MAX][2][128];
 static int  g_auth_settings_n;
 
 static int do_auth(client *c, const char *user, const char *pass, uint64_t *user_id) {
@@ -429,7 +430,7 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
         oc_workspace_settings ws;
         if (oc_decode_workspace_settings(&p, &ws) != OC_OK) return -1;
         g_auth_settings_n = 0;
-        for (uint8_t k = 0; k < ws.count && k < 8; k++) {
+        for (uint8_t k = 0; k < ws.count && k < OC_WS_SETTINGS_MAX; k++) {
             snprintf(g_auth_settings[k][0], sizeof g_auth_settings[k][0], "%.*s", (int)ws.keys[k].len, (const char *)ws.keys[k].ptr);
             snprintf(g_auth_settings[k][1], sizeof g_auth_settings[k][1], "%.*s", (int)ws.values[k].len, (const char *)ws.values[k].ptr);
             g_auth_settings_n++;
@@ -1260,6 +1261,90 @@ static void set_snooze(client *c, uint32_t minutes) {
     oc_set_snooze sn = { minutes };
     CHECK(oc_encode_set_snooze(&w, OC_PROTOCOL_VERSION, &sn) == OC_OK);
     CHECK(send_frame(c, buf, w.len) == 0);
+}
+
+/* Read receipts (REQ-090): a member who stops sharing has their read
+ * position kept from the others and still sees theirs; turning it back on
+ * shows only what is read from then. Within `ms`, the next READ_CURSOR about
+ * `of_user` (1), or none (0). */
+static int await_cursor(client *c, uint64_t of_user, int ms, uint64_t *mid) {
+    struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    int got = 0;
+    oc_header hdr; oc_rbuf p;
+    for (int i = 0; i < 40 && !got; i++) {
+        if (read_frame_raw(c, &hdr, &p) != 0) break;
+        if (hdr.msg_type != OC_MSG_READ_CURSOR) continue;
+        oc_read_cursor rc;
+        if (oc_decode_read_cursor(&p, &rc) == OC_OK && rc.user_id == of_user) { got = 1; if (mid) *mid = rc.message_id; }
+    }
+    tv.tv_sec = 0; tv.tv_usec = 0;
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    return got;
+}
+static uint64_t rr_send(client *c, uint8_t tag, const char *body) {
+    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0}; s.channel_id = 1; memset(s.idem, tag, OC_IDEM_SIZE);
+    s.body = oc_slice_str(body);
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(send_frame(c, buf, w.len) == 0);
+    oc_header hdr; oc_rbuf p;
+    CHECK(read_type(c, OC_MSG_SEND_ACK, &hdr, &p) == 0);
+    oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK);
+    return ack.message_id;
+}
+static void rr_ack(client *c, uint64_t mid) {
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_client_ack ca = { 1, mid };
+    CHECK(oc_encode_client_ack(&w, OC_PROTOCOL_VERSION, &ca) == OC_OK);
+    CHECK(send_frame(c, buf, w.len) == 0);
+}
+static void rr_share(client *c, uint8_t share) {
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_read_receipts rr = { share };
+    CHECK(oc_encode_read_receipts(&w, OC_PROTOCOL_VERSION, &rr) == OC_OK);
+    CHECK(send_frame(c, buf, w.len) == 0);
+    oc_header hdr; oc_rbuf p;
+    CHECK(read_type(c, OC_MSG_READ_RECEIPTS, &hdr, &p) == 0);
+    CHECK(oc_decode_read_receipts(&p, &rr) == OC_OK && rr.share == (share == OC_RECEIPTS_ASK ? 1 : share));
+}
+static void test_read_receipts(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    rr_share(&b, OC_RECEIPTS_ASK);                         /* shared, by default */
+
+    /* Shared: bob's read reaches alice. */
+    uint64_t m1 = rr_send(&a, 0x71, "one");
+    rr_ack(&b, m1);
+    uint64_t seen = 0;
+    CHECK(await_cursor(&a, ub, 3000, &seen) && seen == m1);
+
+    /* bob stops sharing: his next read does not reach alice... */
+    rr_share(&b, 0);
+    uint64_t m2 = rr_send(&a, 0x72, "two");
+    rr_ack(&b, m2);
+    CHECK(!await_cursor(&a, ub, 700, NULL));
+    /* ...and he still sees hers. */
+    rr_ack(&a, m2);
+    CHECK(await_cursor(&b, ua, 3000, &seen) && seen == m2);
+
+    /* bob shares again: alice's next read is not answered with his read from
+     * before he did, and his next one reaches her. */
+    rr_share(&b, 1);
+    uint64_t m3 = rr_send(&a, 0x73, "three");
+    rr_ack(&a, m3);
+    CHECK(!await_cursor(&a, ub, 700, NULL));
+    rr_ack(&b, m3);
+    CHECK(await_cursor(&a, ub, 3000, &seen) && seen == m3);
+
+    client_close(&a);
+    client_close(&b);
 }
 
 static void test_presence_dnd(int port, const uint8_t *pin) {
@@ -7772,6 +7857,7 @@ int run_netloop_tests(void) {
         test_presence_typing(arg.port, pin);
         test_fanout_limits(arg.port, pin);
         test_presence_dnd(arg.port, pin);
+        test_read_receipts(arg.port, pin);
         test_read_aloud_vertical(arg.port, pin);
         test_read_aloud_store_window(arg.port, pin, dbw);
         test_voice_input_vertical(arg.port, pin);

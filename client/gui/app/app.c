@@ -2060,6 +2060,7 @@ static rectf g_thread_follow_hit[32];
 static uint64_t    g_thread_menu_root;   /* which card's overflow is open */
 static rectf g_sched_mode_hit[4];
 static rectf g_sched_default_hit;   /* "Use the workspace default" (REQ-136) */
+static rectf g_receipts_hit;        /* "Share my read receipts" (REQ-090) */
 static rectf g_sched_base_hit[2];
 static rectf g_sched_day_chk[7];
 static rectf g_sched_day_hit[7][2];
@@ -8008,6 +8009,25 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
         body.top = y1 + vipblk + 10;
     }
 
+    /* Read receipts (REQ-090): whether others see what I have read. Mine
+     * alone -- theirs still show -- and nothing at all when the workspace has
+     * them off, which this says instead of offering a switch that does nothing. */
+    {
+        float y0 = body.top;
+        g_receipts_hit = rf(0, 0, 0, 0);
+        draw_text(rt, "Read receipts", g_ui_b, rf(body.left + 20, y0, body.right - 20, y0 + 20), OC_COL_TEXT);
+        if (!oc_model_receipts_on(m)) {
+            draw_text(rt, "Off for this workspace: nobody sees who has read what.", g_meta,
+                      rf(body.left + 20, y0 + 22, body.right - 20, y0 + 44), OC_COL_MUTED);
+        } else {
+            const char *lbl = "Share my read receipts";
+            float bw = text_width(lbl, g_meta) + 22;
+            g_receipts_hit = rf(body.left + 20, y0 + 24, body.left + 20 + bw, y0 + 50);
+            draw_chip_r(rt, g_receipts_hit, lbl, m->share_receipts);
+        }
+        body.top = y0 + 60;
+    }
+
     /* The SCHEDULE (REQ-136), in Slack's shape: one row of choices, a time range
      * beside it, and — for Custom — the seven days expanded in place. Inline
      * rather than behind a dialog because that is where Slack keeps it, and
@@ -8163,6 +8183,7 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
     g_notify_vip_btn = hit_visible(g_notify_vip_btn, reg);
     for (int i = 0; i < 4; i++) g_sched_mode_hit[i] = hit_visible(g_sched_mode_hit[i], reg);
     g_sched_default_hit = hit_visible(g_sched_default_hit, reg);
+    g_receipts_hit = hit_visible(g_receipts_hit, reg);
     for (int i = 0; i < 2; i++) g_sched_base_hit[i] = hit_visible(g_sched_base_hit[i], reg);
     for (int d = 0; d < 7; d++) {
         g_sched_day_chk[d]    = hit_visible(g_sched_day_chk[d],    reg);
@@ -27911,6 +27932,11 @@ static int on_click(oc_win *hwnd, int x, int y) {
              * setting that waited for one would be the only thing here that did. */
             if (in_rect(g_sched_default_hit, x, y)) {
                 sched_send(OC_DND_FROM_DEFAULT, 0, 0, NULL);
+                return 1;
+            }
+            if (in_rect(g_receipts_hit, x, y)) {
+                const oc_model *rm = model();
+                if (rm) oc_client_set_read_receipts(g_client, !rm->share_receipts);
                 return 1;
             }
             for (int i = 0; i < 4; i++)

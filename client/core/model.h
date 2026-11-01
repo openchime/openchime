@@ -625,6 +625,9 @@ typedef struct {
     /* REQ-278: when the manual PAUSE ends, 0 for none. Distinct from the window
      * above in type as well as in name — one instant against a daily range. */
     uint64_t  snooze_until_ms;
+    /* Whether I share my read receipts (REQ-090), as the daemon last said;
+     * 1 until it says. */
+    uint8_t   share_receipts;
     /* REQ-134: the level a channel takes when it has NO per-channel row. Server
      * state, not a client guess — the daemon is what decides whether to push. */
     uint8_t   notify_default;
@@ -1113,6 +1116,9 @@ int oc_model_broadcast_will_notify(const oc_model *m, uint64_t channel_id, const
 /* Whether the workspace has default quiet hours (`default_quiet_hours`, REQ-136)
  * a person may return to. */
 int oc_model_has_default_quiet_hours(const oc_model *m);
+/* Whether the workspace has read receipts on (`read_receipts`, REQ-090): off,
+ * nobody's position reaches anyone and no seen-by is drawn. */
+int oc_model_receipts_on(const oc_model *m);
 
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);

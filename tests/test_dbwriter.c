@@ -2420,7 +2420,9 @@ static void test_index_mentions(void) {
                            /* 0066's workspace sender. */
                            "ALTER TABLE users DROP COLUMN is_system;"
                            /* 0067's own-schedule flag. */
-                           "ALTER TABLE users DROP COLUMN dnd_own;",
+                           "ALTER TABLE users DROP COLUMN dnd_own;"
+                           /* 0068's read receipts. */
+                           "ALTER TABLE users DROP COLUMN share_receipts; ALTER TABLE users DROP COLUMN receipts_since_ms;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -9538,6 +9540,97 @@ static void test_default_quiet_hours(void) {
     cleanup_db(path);
 }
 
+/* Read receipts (OPENCHIME_READ_RECEIPTS, REQ-090): with the workspace's off,
+ * no read position goes anywhere; a member who stops sharing keeps theirs and
+ * still sees the others'; and turned back on, nothing read meanwhile shows. */
+static oc_dbres *ack_result(oc_dbwriter *w, uint64_t uid, uint64_t mid) {
+    oc_job *j = oc_job_new(OC_JOB_CLIENT_ACK, 1);
+    j->user_id = uid; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = mid;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static int rcur_has(const oc_dbres *r, uint64_t uid) {
+    for (size_t i = 0; r && i < r->n_rcur; i++) if (r->rcur[i].user_id == uid) return 1;
+    return 0;
+}
+static void receipts_job(oc_dbwriter *w, uint64_t uid, uint8_t op, int want) {
+    oc_job *j = oc_job_new(OC_JOB_READ_RECEIPTS, 2);
+    j->user_id = uid; j->receipts_op = op;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_READ_RECEIPTS && r->rc_share == want && r->rc_asked == (op == OC_RECEIPTS_ASK));
+    oc_dbres_free(r);
+}
+static void test_read_receipts(void) {
+    const char *path = tdb("receipts.db");
+    cleanup_db(path);
+    char err[256];
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "rr-a", "pw", OC_ROLE_MEMBER), b = reg(w, "rr-b", "pw", OC_ROLE_MEMBER);
+    uint8_t idem[OC_IDEM_LEN];
+    uint64_t m[6];
+    for (int k = 0; k < 6; k++) { memset(idem, 0x90 + k, sizeof idem); m[k] = send_msg(w, a, idem, "x"); }
+
+    /* On: b's read is shared, and a sees it. */
+    receipts_job(w, b, OC_RECEIPTS_ASK, 1);
+    oc_dbres *r = ack_result(w, b, m[0]);
+    CHECK(r && r->type == OC_RES_READ_CURSOR && r->rc_share == 1);
+    oc_dbres_free(r);
+    r = ack_result(w, a, m[0]);
+    CHECK(r && rcur_has(r, b));
+    oc_dbres_free(r);
+
+    /* b stops: not shared, and b still sees a's. */
+    receipts_job(w, b, 0, 0);
+    r = ack_result(w, b, m[1]);
+    CHECK(r && r->rc_share == 0 && rcur_has(r, a));
+    oc_dbres_free(r);
+    r = ack_result(w, a, m[1]);
+    CHECK(r && !rcur_has(r, b));
+    oc_dbres_free(r);
+
+    /* b shares again: the read from before does not show; the next one does. */
+    receipts_job(w, b, 1, 1);
+    r = ack_result(w, a, m[2]);
+    CHECK(r && !rcur_has(r, b));
+    oc_dbres_free(r);
+    r = ack_result(w, b, m[2]);
+    CHECK(r && r->rc_share == 1);
+    oc_dbres_free(r);
+    r = ack_result(w, a, m[3]);
+    CHECK(r && rcur_has(r, b));
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+
+    /* The workspace's off: nobody's goes anywhere. */
+    setenv("OPENCHIME_READ_RECEIPTS", "off", 1);
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    w = start_db(path);
+    CHECK(w != NULL);
+    r = ack_result(w, b, m[4]);
+    CHECK(r && r->rc_share == 0 && r->n_rcur == 0);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+
+    /* On again: b's read from while it was off is not shown; a new one is. */
+    unsetenv("OPENCHIME_READ_RECEIPTS");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    w = start_db(path);
+    CHECK(w != NULL);
+    r = ack_result(w, a, m[4]);
+    CHECK(r && !rcur_has(r, b));
+    oc_dbres_free(r);
+    r = ack_result(w, b, m[5]);
+    CHECK(r && r->rc_share == 1);
+    oc_dbres_free(r);
+    r = ack_result(w, a, m[5]);
+    CHECK(r && rcur_has(r, b));
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
@@ -9593,6 +9686,7 @@ int run_dbwriter_tests(void) {
     test_notices();
     test_welcome_message();
     test_default_quiet_hours();
+    test_read_receipts();
     test_default_channels();
     test_search_orders();
     test_setup_invite();

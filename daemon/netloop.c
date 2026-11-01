@@ -3831,6 +3831,15 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_READ_RECEIPTS) {
+            oc_read_receipts rr;
+            if (oc_decode_read_receipts(&p, &rr) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_READ_RECEIPTS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->receipts_op = rr.share;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_TZ_OFFSET) {
             oc_set_tz_offset tz;
             if (oc_decode_set_tz_offset(&p, &tz) != OC_OK) return -1;
@@ -8131,7 +8140,9 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_read_cursor(&w, OC_PROTOCOL_VERSION, &rc);
         size_t len = w.len;
-        fanout_members(ep, conns, r->members, r->n_members, r->user_id, g_enc, len);
+        /* Only when receipts are on and this reader shares (REQ-090); the
+         * others' positions are already filtered to those who share. */
+        if (r->rc_share) fanout_members(ep, conns, r->members, r->n_members, r->user_id, g_enc, len);
         conn *ac = find_by_id(conns, r->conn_id);
         if (ac) {
             for (size_t i = 0; i < r->n_rcur; i++) {
@@ -8140,6 +8151,20 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                 oc_encode_read_cursor(&w, OC_PROTOCOL_VERSION, &rb);
                 send_bytes(ep, conns, ac->fd, g_enc, w.len);
             }
+        }
+        break;
+    }
+    case OC_RES_READ_RECEIPTS: {
+        /* My choice to share read receipts: to the device that asked, or, set,
+         * to every device of mine so each shows it. */
+        oc_read_receipts rr = { r->rc_share };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_encode_read_receipts(&w, OC_PROTOCOL_VERSION, &rr);
+        if (r->rc_asked) {
+            conn *ac = find_by_id(conns, r->conn_id);
+            if (ac) send_bytes(ep, conns, ac->fd, g_enc, w.len);
+        } else {
+            send_to_user(ep, conns, r->user_id, 0, g_enc, w.len);
         }
         break;
     }

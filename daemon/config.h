@@ -118,6 +118,7 @@ typedef struct {
     const char *notice_channel_created; /* OPENCHIME_NOTICE_CHANNEL_CREATED: likewise */
     int notice_channel_changes;         /* OPENCHIME_NOTICE_CHANNEL_CHANGES: posted in the channel changed */
     const char *default_quiet_hours;    /* OPENCHIME_DEFAULT_QUIET_HOURS: "" ⇒ none (oc_config_quiet_hours) */
+    int read_receipts;                  /* OPENCHIME_READ_RECEIPTS: 0 on, 1 off (REQ-090 seen-by) */
     const char *workspace_address;      /* OPENCHIME_MANAGED_ADDRESS; "" ⇒ clients keep what they dialled */
     const char *default_channels;       /* OPENCHIME_DEFAULT_CHANNELS: public channel names a new member joins */
     const char *edit_window;            /* OPENCHIME_EDIT_WINDOW: "" always, "never", or seconds */

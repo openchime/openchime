@@ -1724,6 +1724,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     oc_queue_push(to_ui, e);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_READ_RECEIPTS) {
+            oc_read_receipts rr;
+            if (oc_decode_read_receipts(&p, &rr) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_READ_RECEIPTS);
+                if (e) { e->status = rr.share ? 1 : 0; oc_queue_push(to_ui, e); }
+            }
         } else if (hdr.msg_type == OC_MSG_SNOOZE) {
             oc_snooze sn;
             if (oc_decode_snooze(&p, &sn) == OC_OK) {
@@ -3205,6 +3211,14 @@ static int run_connection(oc_net *n, int reconnecting,
                 (void)write_all(&conn, fd, tb, tw.len, &n->stop);
         }
 
+        /* Whether I share my read receipts (REQ-090), for the settings. */
+        {
+            uint8_t rb[16]; oc_wbuf rw; oc_wbuf_init(&rw, rb, sizeof rb);
+            oc_read_receipts rr = { OC_RECEIPTS_ASK };
+            if (oc_encode_read_receipts(&rw, negotiated, &rr) == OC_OK)
+                (void)write_all(&conn, fd, rb, rw.len, &n->stop);
+        }
+
         /* Ask for the channel list + the roster so the model can populate the
          * sidebar and resolve user names (for DMs, mentions). */
         uint8_t lb[16]; oc_wbuf lw; oc_wbuf_init(&lw, lb, sizeof lb);
@@ -3645,6 +3659,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_priority sp = { c->n_pri_people, c->pri_people };
                 if (oc_encode_set_priority(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_READ_RECEIPTS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_read_receipts rr = { (uint8_t)(c->message_id ? 1 : 0) };
+                if (oc_encode_read_receipts(&w, OC_PROTOCOL_VERSION, &rr) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SET_SNOOZE) {

@@ -1081,6 +1081,22 @@ static void test_admin_frames(void) {
         CHECK(out[0].flags == 0 && out[1].flags == OC_USER_SYSTEM);
     }
     {
+        /* READ_RECEIPTS (REQ-090): set, ask, and nothing past ask. */
+        oc_read_receipts in = { 0 }, out;
+        ROUNDTRIP(oc_encode_read_receipts(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_READ_RECEIPTS, h, p);
+        CHECK(oc_decode_read_receipts(&p, &out) == OC_OK && out.share == 0);
+    }
+    {
+        oc_read_receipts in = { OC_RECEIPTS_ASK }, out;
+        ROUNDTRIP(oc_encode_read_receipts(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_READ_RECEIPTS, h, p);
+        CHECK(oc_decode_read_receipts(&p, &out) == OC_OK && out.share == OC_RECEIPTS_ASK);
+    }
+    {
+        oc_read_receipts in = { 3 }, out;
+        ROUNDTRIP(oc_encode_read_receipts(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_READ_RECEIPTS, h, p);
+        CHECK(oc_decode_read_receipts(&p, &out) == OC_E_MALFORMED);
+    }
+    {
         /* SET_PROFILE — the whole screen in one frame, at its own opcode. It
          * shared 0x0070 with SET_PRESENCE, where the dispatch chain reached
          * presence first and this frame could not be delivered at all. */

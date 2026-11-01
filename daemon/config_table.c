@@ -57,6 +57,10 @@ const cfg_row OC_CFG[] = {
     STR("OPENCHIME_NOTICE_CHANNEL_CREATED", CFG_OPERATOR, G_SET, "", "The public channel the workspace posts in when a public channel is created, naming it and who made it. Empty: none is posted.", F(notice_channel_created), NULL, 0, 0),
     BOOL("OPENCHIME_NOTICE_CHANNEL_CHANGES", CFG_OPERATOR, G_SET, "off", "Whether the workspace posts in a channel when its name, description, visibility or archived state changes, naming who changed it.", notice_channel_changes),
     STR("OPENCHIME_DEFAULT_QUIET_HOURS", CFG_OPERATOR, G_SET, "", "The quiet hours a member follows until they set their own (REQ-136): `everyday` or `weekdays`, a space, and the hours notifications are allowed, `HH:MM-HH:MM` in each member's own time, as in `weekdays 09:00-18:00`. Empty: none, and a member without their own is never quiet.", F(default_quiet_hours), cfg_parse_quiet, CFG_VISIBLE, 0),
+    /* An ENUM a client is told (CFG_VISIBLE), written out: the macro has no flags. */
+    { "OPENCHIME_READ_RECEIPTS", CFG_ENUM, CFG_OPERATOR, G_SET, "on",
+      "Whether members see who has read a message (seen-by, REQ-090): `on`, or `off`, when no member's read position reaches anyone else. Each member may also stop sharing their own. Turned back on, reads from while it was off are never shown.",
+      0, 0, "on|off", F(read_receipts), NULL, CFG_VISIBLE, 0 },
     STR("OPENCHIME_WORKSPACE_NAME", CFG_OPERATOR, G_SET, "", "The workspace's display name, shown to clients; unset, a client derives one from the host.", F(workspace_name), NULL, CFG_VISIBLE, 0),
     /* An ENUM a client is told (CFG_VISIBLE), written out: the macro has no flags. */
     { "OPENCHIME_CUSTOM_EMOJI_ADD", CFG_ENUM, CFG_OPERATOR, G_SET, "everyone",

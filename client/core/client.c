@@ -920,6 +920,14 @@ void oc_client_set_snooze(oc_client *c, uint32_t minutes) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_set_read_receipts(oc_client *c, int share) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_READ_RECEIPTS);
+    if (!cmd) return;
+    cmd->message_id = share ? 1 : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 /* Threads I am in, across channels (REQ-062). `filter` is OC_THREADF_*. Opens
  * the list first, as every other list command does — the fold drops entries that
  * arrive while it is closed, which is the bug that made the activity feed look

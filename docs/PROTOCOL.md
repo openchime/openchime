@@ -1676,6 +1676,18 @@ nothing is sent while the daemon runs. A client acts on what it is told; the
 daemon enforces whatever it must. At most 64; more is refused as malformed. A
 client ignores a key it does not know.
 
+**`READ_RECEIPTS` (both ways), `0x011A`** `{ share: u8 }` — whether this person
+shares their read position (seen-by). From a client, `share` `1` or `0` sets
+it and `2` (`OC_RECEIPTS_ASK`) asks; a client asks once after sign-in. From the
+daemon, `share` `0` or `1` tells it: to the device that asked, or, when it
+changes, to every device of the person's. Anything above `2` is malformed. Not
+sharing keeps the person's `READ_CURSOR` from the others and still shows them
+everyone else's. When the workspace has receipts off (`read_receipts` on
+`WORKSPACE_SETTINGS`), no member's `READ_CURSOR` reaches any other. A read made
+before a person shared, or while the workspace had receipts off, is never
+shown: the daemon sends another member's position only when it was recorded
+since then.
+
 **`CAPABILITIES` (S → C), `0x00E1`** `{ count: u8, count × name: str }` — the
 features this daemon offers, by name, sent once to every client just after
 `SERVER_BUILD` (§4.3c) and before the frames that describe any feature. A name present
@@ -3437,6 +3449,7 @@ this table cannot silently gain a shared value.
 | `0x0113` | `POLL_VOTERS` | S → C | the answer; refused for an anonymous poll |
 | `0x0114` | `EDIT_POLL` | C → S | the author changes a poll: options and settings until the first vote, the deadline always |
 | `0x0119` | `WORKSPACE_SETTINGS` | S → C | read-only: the workspace's settings clients act on, after `WORKSPACE_INFO` |
+| `0x011A` | `READ_RECEIPTS` | both | whether I share my read receipts: set or ask, and told |
 
 ## 10. Connection state machine
 

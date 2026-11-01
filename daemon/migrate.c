@@ -1242,6 +1242,14 @@ static const char MIGRATION_0067[] =
     "ALTER TABLE users ADD COLUMN dnd_own INTEGER NOT NULL DEFAULT 0 CHECK (dnd_own IN (0,1));"
     "UPDATE users SET dnd_own = 1 WHERE dnd_mode <> 0;";
 
+static const char MIGRATION_0068[] =
+    /* Read receipts as a choice (REQ-090): whether this person shares their
+     * read position, and since when, so that a read from before they shared
+     * -- or from while the workspace had receipts off (-1, until it is on
+     * again) -- is never shown to anyone. */
+    "ALTER TABLE users ADD COLUMN share_receipts INTEGER NOT NULL DEFAULT 1 CHECK (share_receipts IN (0,1));"
+    "ALTER TABLE users ADD COLUMN receipts_since_ms INTEGER NOT NULL DEFAULT 0;";
+
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
      * author is doing, and the daemon records that as its own object beside the
@@ -1591,6 +1599,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 65, MIGRATION_0065 },
     { 66, MIGRATION_0066 },
     { 67, MIGRATION_0067 },
+    { 68, MIGRATION_0068 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

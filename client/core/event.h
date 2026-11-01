@@ -139,6 +139,7 @@ enum {
     OC_EV_REACTIONS,       /* a REACTIONS entry: message_id + one reactor (user_id + emoji) */
     OC_EV_DND,             /* a NOTIFY_PREFS header (frame start): status=enabled, count=(start<<16|end) */
     OC_EV_SNOOZE,          /* a SNOOZE: server_time = when the pause ends, 0 = not paused (REQ-278) */
+    OC_EV_READ_RECEIPTS,   /* READ_RECEIPTS: status = 1 if I share my read receipts (REQ-090) */
     OC_EV_SCHEDULE,        /* a SCHEDULE frame: the recurring allowed-hours schedule (REQ-136) */
     OC_EV_ALERT_PREFS,     /* an ALERT_PREFS frame: my keywords + priority people (REQ-135) */
     OC_EV_THREAD_SUMMARY,  /* one aggregated thread (REQ-062): a list entry AND the push */
@@ -490,6 +491,7 @@ enum {
     OC_CMD_SET_NOTIFY_PREF, /* set `channel_id`'s notification level (op = level) */
     OC_CMD_SET_DND,         /* set the DND window: op = enabled, channel_id = start_min, message_id = end_min */
     OC_CMD_SET_SNOOZE,      /* pause notifications: message_id = minutes from now, 0 ends it (REQ-278) */
+    OC_CMD_SET_READ_RECEIPTS, /* share my read receipts: message_id = 1, or 0 to stop (REQ-090) */
     OC_CMD_SET_SCHEDULE,    /* the recurring schedule (REQ-136), carried in cmd->sched */
     OC_CMD_SET_KEYWORDS,    /* replace my keyword list (REQ-135), carried in cmd->list */
     OC_CMD_SET_PRIORITY,    /* replace my priority-people list (REQ-135) */

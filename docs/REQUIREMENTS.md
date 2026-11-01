@@ -587,6 +587,12 @@ where one exists.
   currently-connected, authorized client at least once. The wire protocol's
   `msg_type` enum has included an explicit ack message type used by the
   client to confirm receipt (ARCH-8).
+
+  **Seen-by is a choice.** The workspace may turn read receipts off
+  (`OPENCHIME_READ_RECEIPTS`, configuration), and then no member's read
+  position reaches anyone. Each person may stop sharing their own; they still
+  see everyone else's. Neither is retroactive: a read from before a person
+  shared, or from while receipts were off, is never shown.
 - **REQ-091.** A client has treated redelivery of a message it has already
   acked as a duplicate and has suppressed it rather than rendering it twice,
   keyed on the server-assigned message id (REQ-050), using a per-channel

@@ -1,7 +1,7 @@
 # OpenChime — Database Schema
 
 The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
-ARCH-27 (§1); the daemon applies migrations 0001–0067 (`daemon/migrate.c`,
+ARCH-27 (§1); the daemon applies migrations 0001–0068 (`daemon/migrate.c`,
 `OC_MIGRATIONS`), in order, and new tables/columns arrive as later numbered
 migrations, never as edits to an existing one. 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
@@ -36,7 +36,7 @@ credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
 **0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
-(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours.
+(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -1825,3 +1825,19 @@ same as never having chosen. `SET_SCHEDULE` sets it; `SET_SCHEDULE` with mode
 `OC_DND_FROM_DEFAULT` alone clears it. The schedule a member's clients are sent
 and the one the push decision reads are the same resolved one. A schedule set
 before the migration counts as the member's own.
+## 3bg. Migration 0068 — read receipts as a choice (REQ-090)
+
+```sql
+ALTER TABLE users ADD COLUMN share_receipts INTEGER NOT NULL DEFAULT 1 CHECK (share_receipts IN (0,1));
+ALTER TABLE users ADD COLUMN receipts_since_ms INTEGER NOT NULL DEFAULT 0;
+```
+
+*`share_receipts`* is the person's own choice, set with `READ_RECEIPTS`: 0 keeps
+their read position from the others and still shows them everyone else's.
+
+*`receipts_since_ms`* makes neither switch retroactive. Another member's
+position is sent only when its `delivery_cursors.updated_at_ms` is at or after
+it. Turning sharing back on sets it to now. A daemon starting with
+`OPENCHIME_READ_RECEIPTS` off sets it to −1 for everyone (and for anyone who
+joins meanwhile), which shows nothing. Starting with receipts on again sets
+every −1 to now.

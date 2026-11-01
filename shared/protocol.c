@@ -3432,6 +3432,18 @@ oc_result oc_decode_capabilities(oc_rbuf *p, oc_capabilities *m) {
     return r_done(p);
 }
 
+oc_result oc_encode_read_receipts(oc_wbuf *w, uint16_t version, const oc_read_receipts *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_READ_RECEIPTS);
+    oc_w_u8(w, m->share);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_read_receipts(oc_rbuf *p, oc_read_receipts *m) {
+    m->share = oc_r_u8(p);
+    if (m->share > OC_RECEIPTS_ASK) return OC_E_MALFORMED;
+    return r_done(p);
+}
+
 oc_result oc_decode_workspace_settings(oc_rbuf *p, oc_workspace_settings *m) {
     memset(m, 0, sizeof *m);
     uint8_t n = oc_r_u8(p);

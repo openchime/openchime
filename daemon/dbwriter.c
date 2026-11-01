@@ -7480,11 +7480,27 @@ static oc_dbres *read_cursor_result(sqlite3 *db, uint64_t conn_id, uint64_t user
     r->user_id = user_id;
     r->message_id = message_id;
     load_members(db, channel_id, r);
+    /* Read receipts (REQ-090): with the workspace's off, nobody's position
+     * goes anywhere; with this reader's own off, theirs does not, and they
+     * still see the others'. */
+    int ws_on = oc_config_get()->read_receipts == 0;
+    r->rc_share = 0;
+    if (ws_on) {
+        sqlite3_prepare_v2(db, "SELECT share_receipts FROM users WHERE id=?1;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
+        r->rc_share = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 1;
+        sqlite3_finalize(st);
+    }
+    if (!ws_on) return r;
 
     size_t cap = 8, n = 0;
     r->rcur = malloc(cap * sizeof *r->rcur);
+    /* The others who share, and only a read made since they did: one from
+     * before (receipts_since_ms) is never shown. */
     sqlite3_prepare_v2(db,
-        "SELECT user_id, message_id FROM delivery_cursors WHERE channel_id=? AND user_id<>?;",
+        "SELECT dc.user_id, dc.message_id FROM delivery_cursors dc JOIN users u ON u.id = dc.user_id "
+        " WHERE dc.channel_id=? AND dc.user_id<>? AND u.share_receipts = 1 "
+        "   AND u.receipts_since_ms >= 0 AND dc.updated_at_ms >= u.receipts_since_ms;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
@@ -7497,6 +7513,49 @@ static oc_dbres *read_cursor_result(sqlite3 *db, uint64_t conn_id, uint64_t user
     sqlite3_finalize(st);
     r->n_rcur = n;
     return r;
+}
+
+/* Whether I share my read receipts (REQ-090), set or asked. Turning it on
+ * starts from now: what I read before is never shown. */
+static oc_dbres *process_read_receipts(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_READ_RECEIPTS;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+    sqlite3_stmt *st = NULL;
+    if (j->receipts_op != OC_RECEIPTS_ASK) {
+        sqlite3_prepare_v2(db,
+            "UPDATE users SET share_receipts=?2, "
+            "  receipts_since_ms = CASE WHEN ?2 = 1 AND share_receipts = 0 AND receipts_since_ms >= 0 "
+            "                           THEN ?3 ELSE receipts_since_ms END WHERE id=?1;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int(st, 2, j->receipts_op ? 1 : 0);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    r->rc_asked = j->receipts_op == OC_RECEIPTS_ASK;
+    sqlite3_prepare_v2(db, "SELECT share_receipts FROM users WHERE id=?1;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    r->rc_share = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 1;
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* The workspace's switch, as this daemon starts (OPENCHIME_READ_RECEIPTS):
+ * off marks everyone (-1) so that nothing read meanwhile is ever shown; on
+ * again starts the marked from now. */
+static void receipts_start(sqlite3 *db) {
+    sqlite3_stmt *st = NULL;
+    if (oc_config_get()->read_receipts != 0) {
+        sqlite3_exec(db, "UPDATE users SET receipts_since_ms = -1;", NULL, NULL, NULL);
+        return;
+    }
+    sqlite3_prepare_v2(db, "UPDATE users SET receipts_since_ms = ?1 WHERE receipts_since_ms < 0;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
 }
 
 static oc_dbres *process_client_ack(sqlite3 *db, const oc_job *j) {
@@ -10984,6 +11043,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_PRIORITY)    return process_set_priority(w->db, j);
     if (j->type == OC_JOB_SET_SNOOZE)      return process_set_snooze(w->db, j);
     if (j->type == OC_JOB_SET_TZ_OFFSET)   return process_set_tz_offset(w->db, j);
+    if (j->type == OC_JOB_READ_RECEIPTS)   return process_read_receipts(w->db, j);
     if (j->type == OC_JOB_REGISTER_DEVICE_TOKEN)   return process_register_device_token(w->db, j);
     if (j->type == OC_JOB_UNREGISTER_DEVICE_TOKEN) return process_unregister_device_token(w->db, j);
     if (j->type == OC_JOB_PRUNE_DEVICE_TOKEN)      return process_prune_device_token(w->db, j);
@@ -11572,6 +11632,14 @@ static void *writer_loop(void *arg) {
             if (r) { oc_dbres *t = r; while (t->next) t = t->next; t->next = g_notices; }
             else r = g_notices;
             g_notices = NULL;
+        }
+        /* Joined while receipts are off: marked, as everyone was at start. */
+        if (g_joined_uid && oc_config_get()->read_receipts != 0) {
+            sqlite3_stmt *rs = NULL;
+            sqlite3_prepare_v2(w->db, "UPDATE users SET receipts_since_ms = -1 WHERE id=?1;", -1, &rs, NULL);
+            sqlite3_bind_int64(rs, 1, (sqlite3_int64)g_joined_uid);
+            sqlite3_step(rs);
+            sqlite3_finalize(rs);
         }
         /* A member who did not exist before this job: their roster row rides on
          * its result, for everyone connected, whatever the job answers. */
@@ -12324,6 +12392,7 @@ oc_dbwriter *oc_dbwriter_start_boot(const char *path, oc_dbwriter_boot *b) {
     if (schema_before < 60) index_mentions(w->db);
     join_default_channels(w->db, 0, 1);   /* a default channel that is not one, said once */
     notice_report(w->db);
+    receipts_start(w->db);
     /* An encrypted DM's keys were on its two devices, joined through the daemon
      * that stopped: none still open can go on, so each is closed now, and the
      * maintenance pass removes it a day later (PRIVATE-DM.md). */

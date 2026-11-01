@@ -627,6 +627,11 @@ static void build_prefs_rows(rows_t *r, const oc_model *m, int width) {
         snprintf(line + strlen(line), sizeof line - strlen(line), " (your own; 'default' in Do not disturb returns to the workspace's)");
     char *h = malloc(strlen(line) + 1);
     if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+    /* Read receipts (REQ-090): the workspace's, then mine. */
+    snprintf(line, sizeof line, "read receipts: %s", !oc_model_receipts_on(m) ? "off for this workspace"
+             : m->share_receipts ? "shared (Ctrl+K: Share my read receipts)" : "not shared (Ctrl+K: Share my read receipts)");
+    h = malloc(strlen(line) + 1);
+    if (h) { strcpy(h, line); rows_push(r, h, TB_DEFAULT); }
 
     int any = 0;
     for (size_t i = 0; i < m->n_channels; i++) {
@@ -938,7 +943,7 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        /* channel menu */
        ACT_OPEN, ACT_JOIN, ACT_NOTIFY_ALL, ACT_NOTIFY_MENTIONS, ACT_NOTIFY_NONE, ACT_WEBHOOK_CREATE,
        /* global action launcher (Ctrl-K) — replaces the remaining slash commands */
-       ACT_NEWCHAN, ACT_NEWDM, ACT_SEARCH, ACT_NICK, ACT_AWAY, ACT_ONLINE, ACT_DND, ACT_PASSWD,
+       ACT_NEWCHAN, ACT_NEWDM, ACT_SEARCH, ACT_NICK, ACT_AWAY, ACT_ONLINE, ACT_DND, ACT_PASSWD, ACT_RECEIPTS,
        ACT_PREFS, ACT_WEBHOOKS, ACT_LEAVE, ACT_INVITE, ACT_PROFILE, ACT_UPLOAD,
        ACT_STORAGE, ACT_AUDIT, ACT_ALERTS, ACT_WORKSPACES, ACT_HELP, ACT_LOGOUT, ACT_SECURITY,
        /* summaries (REQ-310): ask, pick the span, or go back to the open one */
@@ -1043,6 +1048,7 @@ static const tk_pal_item g_launcher_items[] = {
     { "You",     "Change password",     NULL, NULL, ACT_PASSWD },
     { "You",     "Two-step sign-in",    NULL, NULL, ACT_SECURITY },
     { "You",     "Do not disturb",      NULL, NULL, ACT_DND },
+    { "You",     "Share my read receipts (on/off)", NULL, NULL, ACT_RECEIPTS },
     { "You",     "Your profile",        NULL, NULL, ACT_PROFILE },
     { "Admin",   "Invite a user",       NULL, NULL, ACT_INVITE },
     { "Admin",   "Storage usage",       NULL, NULL, ACT_STORAGE },
@@ -3533,6 +3539,8 @@ int main(int argc, char **argv) {
                 }
                 else if (id == ACT_AWAY)    oc_client_set_presence(cl, OC_PRESENCE_AWAY);
                 else if (id == ACT_ONLINE)  oc_client_set_presence(cl, OC_PRESENCE_ONLINE);
+                else if (id == ACT_RECEIPTS)   /* mine only: the others' still show (REQ-090) */
+                    oc_client_set_read_receipts(cl, !oc_client_model(cl)->share_receipts);
                 else if (id == ACT_SECURITY){   /* the workspace's own page (AUTH.md §8.6) */
                     char url[1200];
                     if (oc_client_open_page(cl, "account/security", NULL, url, sizeof url) == 0) open_in_browser(url);
@@ -3677,6 +3685,7 @@ int main(int argc, char **argv) {
                     else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
                     else if (id == ACT_AWAY)    oc_client_set_presence(cl, OC_PRESENCE_AWAY);
                     else if (id == ACT_ONLINE)  oc_client_set_presence(cl, OC_PRESENCE_ONLINE);
+                    else if (id == ACT_RECEIPTS) oc_client_set_read_receipts(cl, !oc_client_model(cl)->share_receipts);
                     else if (id == ACT_PREFS)   { oc_client_toggle_prefs(cl, 1); }
                     else if (id == ACT_LEAVE)   { if (act_cid) oc_client_leave_channel(cl, act_cid); }
                     else if (id == ACT_WEBHOOKS){ if (act_cid) oc_client_webhooks(cl, act_cid); }

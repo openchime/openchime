@@ -23,6 +23,7 @@
 
 void oc_model_init(oc_model *m) {
     memset(m, 0, sizeof *m);
+    m->share_receipts = 1;   /* the default, until the daemon says */
 }
 
 static void msg_clear_unfurls(oc_msg *m) {
@@ -326,6 +327,11 @@ int oc_model_has_default_quiet_hours(const oc_model *m) {
     return oc_model_workspace_setting(m, "default_quiet_hours", v, sizeof v) && v[0];
 }
 
+int oc_model_receipts_on(const oc_model *m) {
+    char v[8];
+    return !oc_model_workspace_setting(m, "read_receipts", v, sizeof v) || strcmp(v, "off") != 0;
+}
+
 void oc_model_free(oc_model *m) {
     memset(m->pdms, 0, sizeof m->pdms);
     m->n_pdms = 0;
@@ -536,7 +542,7 @@ static void reader_advance(oc_channel *c, uint64_t user_id, uint64_t message_id)
 size_t oc_model_seen_by(const oc_model *m, uint64_t channel_id, uint64_t message_id,
                         uint64_t exclude, uint64_t *out, size_t cap) {
     oc_channel *c = oc_model_channel((oc_model *)m, channel_id);
-    if (!c || message_id == 0) return 0;
+    if (!c || message_id == 0 || !oc_model_receipts_on(m)) return 0;   /* the workspace has none */
     size_t n = 0;
     for (size_t i = 0; i < c->n_readers && n < cap; i++)
         if (c->readers[i].user_id != exclude && c->readers[i].message_id >= message_id)
@@ -2050,6 +2056,9 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             snprintf(m->kw_terms[i], sizeof m->kw_terms[i], "%s", e->kw_terms[i]);
         m->n_pri_people = e->n_pri_people;
         for (uint8_t i = 0; i < e->n_pri_people; i++) m->pri_people[i] = e->pri_people[i];
+        break;
+    case OC_EV_READ_RECEIPTS:
+        m->share_receipts = e->status ? 1 : 0;
         break;
     case OC_EV_SNOOZE:
         /* MY pause (REQ-278). The end instant is self-only, so this is the one

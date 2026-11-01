@@ -324,6 +324,9 @@ void oc_client_set_keywords(oc_client *c, const char terms[][OC_KEYWORD_MAX], ui
 void oc_client_set_priority(oc_client *c, const uint64_t *people, uint8_t n);
 /* REQ-278: pause notifications for `minutes` from now; 0 ends the pause. */
 void oc_client_set_snooze(oc_client *c, uint32_t minutes);
+/* Share my read receipts, or stop (REQ-090). Mine only: I still see the
+ * others' who share. */
+void oc_client_set_read_receipts(oc_client *c, int share);
 /* REQ-062: threads I am in, and the two acts the view offers. */
 void oc_client_list_threads(oc_client *c, uint8_t filter);
 void oc_client_thread_follow(oc_client *c, uint64_t channel_id, uint64_t root_id, uint8_t on);
