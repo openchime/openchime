@@ -267,6 +267,30 @@ where one exists.
   deployment model the inviter has been shown the invitation as **copyable
   text**: the workspace address, how to sign in (the provider and the invited
   address, or the token) and when it expires.
+- **REQ-371.** A workspace has had a **moderator** role, between admin and
+  member. A moderator has been able to delete another person's message,
+  remove people from a channel (not from the workspace), and resolve reports
+  (REQ-372). A moderator has not been able to change anyone's role or invite
+  people to the workspace. Owners and admins have kept everything a moderator
+  may do, and only they have appointed or removed moderators (ARCH-128).
+- **REQ-372.** Any member has been able to **report a message** in a
+  conversation they can read, other than their own, with a reason from a fixed
+  list (spam, harassment, inappropriate, other) and an optional note.
+  Moderators, admins and owners have seen the open reports and resolved each
+  as "action taken" or "dismissed", with a note. Filing and resolving have both
+  been in the audit log's moderation family. The reported person has never been
+  told who reported them.
+- **REQ-373.** A report of a message in a **private channel or a DM** has
+  carried a copy of only that message and its sender, so the moderator who
+  resolves it sees what was reported and nothing else from the conversation,
+  without being in it.
+- **REQ-374.** Who may **create public channels**, who may **create private
+  channels** and who may **invite people to the workspace** have each been the
+  workspace's configuration: everyone, moderators and up, or admins and up.
+  The defaults have matched what came before (anyone creates either kind of
+  channel; owners and admins invite), so an upgrade has changed nothing.
+  Clients have been told the three and offered only what a person may do; the
+  daemon has refused the rest.
 - **REQ-034.** Each channel has carried an optional human-set **topic/
   description** — a short line shown in the channel header — set by a channel
   member. It is metadata on the channel, distinct from the channel name
