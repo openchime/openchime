@@ -330,6 +330,13 @@ static void test_visible(void) {
     accepts("OPENCHIME_WORKSPACE_NAME", "x");
     for (size_t i = 0; oc_config_visible(i, key, sizeof key, val, sizeof val); i++)
         if (!strcmp(key, "default_channels")) CHECK(val[0] == '\0');
+    /* Who may add custom emoji: told as the word an operator writes. */
+    accepts("OPENCHIME_CUSTOM_EMOJI_ADD", "admins");
+    int saw = 0;
+    for (size_t i = 0; oc_config_visible(i, key, sizeof key, val, sizeof val); i++)
+        if (!strcmp(key, "custom_emoji_add")) saw = !strcmp(val, "admins");
+    CHECK(saw);
+    refuses("OPENCHIME_CUSTOM_EMOJI_ADD", "moderators");
 }
 
 /* Load with `mode` as OPENCHIME_MODE and `name=value` set. */
@@ -435,7 +442,7 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 23);     /* OPENCHIME_MODE among them */
+    CHECK(operator_rows == 24);     /* OPENCHIME_MODE among them */
     CHECK(managed_rows == 7);
     CHECK(dev_rows == 4 + 12);      /* the daemon's four, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);

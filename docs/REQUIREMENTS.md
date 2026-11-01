@@ -530,7 +530,9 @@ where one exists.
   available on inspection (hover/tap).
 - **REQ-072.** A tenant has been able to register **custom emoji** (a named
   image usable in reactions and message text) beyond the built-in Unicode set;
-  any member may add one and only its creator or an admin may delete it. A reaction (REQ-070) references an
+  any member may add one, or only owners and admins where the workspace's
+  configuration says so (`OPENCHIME_CUSTOM_EMOJI_ADD`, which clients are told and
+  the daemon enforces), and only its creator or an admin may delete it. A reaction (REQ-070) references an
   emoji by a stable shortcode that resolves to either a Unicode sequence or a
   tenant custom-emoji asset; a text-only client (the TUI) shows the shortcode
   rather than the image.

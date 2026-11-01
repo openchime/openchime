@@ -31060,7 +31060,8 @@ static void open_new_menu(oc_win *hwnd) {
     mi_item(8, "Jump to  (Ctrl+K)");
     mi_item(9, "Browse channels");
     mi_item(82, "New sidebar section");   /* */
-    mi_item(84, "Add custom emoji");      /* REQ-072 */
+    /* REQ-072: only for whom the workspace lets add one (custom_emoji_add). */
+    if (model() && oc_model_may_add_emoji(model())) mi_item(84, "Add custom emoji");
     g_menu = MENU_NEW; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 224;
     g_menu_x = RAIL_W + 8;
     /* Bottom-aligned to the New button, so the menu grows upward out of the thing

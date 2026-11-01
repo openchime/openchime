@@ -1456,6 +1456,19 @@ static void test_workspace_settings_model(void) {
     oc_model_apply(&m, &e);
     CHECK(oc_model_workspace_setting(&m, "workspace_name", v, sizeof v) == 1 && v[0] == '\0');
     CHECK(oc_model_workspace_setting(&m, "default_channels", v, sizeof v) == 0);
+    /* Who may add custom emoji: everyone unless told otherwise; with
+     * `admins`, a member may not and an admin may. */
+    CHECK(oc_model_may_add_emoji(&m) == 1);
+    m.user_id = 7;
+    m.users = calloc(1, sizeof *m.users);
+    m.n_users = 1;
+    if (m.users) { m.users[0].user_id = 7; m.users[0].role = OC_ROLE_MEMBER; }
+    memset(&e, 0, sizeof e); e.type = OC_EV_WORKSPACE_SETTINGS;
+    e.body = strdup("custom_emoji_add\x1f" "admins\x1e");
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_may_add_emoji(&m) == 0);
+    if (m.users) m.users[0].role = OC_ROLE_ADMIN;
+    CHECK(oc_model_may_add_emoji(&m) == 1);
     oc_model_free(&m);
 }
 

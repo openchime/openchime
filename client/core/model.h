@@ -1086,6 +1086,9 @@ void oc_model_format_duration(uint32_t ms, char *out, size_t cap);
 /* A workspace setting by key ("default_channels"), as the daemon told it,
  * into `out`; returns 1, or 0 (and "") when the daemon did not tell it. */
 int oc_model_workspace_setting(const oc_model *m, const char *key, char *out, size_t cap);
+/* Whether this person may add a custom emoji (REQ-072): the workspace's
+ * `custom_emoji_add`, everyone by default, or only owners and admins. */
+int oc_model_may_add_emoji(const oc_model *m);
 
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);

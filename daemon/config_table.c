@@ -44,6 +44,10 @@ const cfg_row OC_CFG[] = {
     /* First: the mode decides whether the development rows below may be read. */
     ENUM("OPENCHIME_MODE", CFG_OPERATOR, G_SET, "normal", "normal|development|demo", "What the box is for: `normal` (a deployment), `development` (the tests and harnesses; the only mode that reads the Development rows) or `demo` (the public demo workspace).", mode),
     STR("OPENCHIME_WORKSPACE_NAME", CFG_OPERATOR, G_SET, "", "The workspace's display name, shown to clients; unset, a client derives one from the host.", F(workspace_name), NULL, CFG_VISIBLE, 0),
+    /* An ENUM a client is told (CFG_VISIBLE), written out: the macro has no flags. */
+    { "OPENCHIME_CUSTOM_EMOJI_ADD", CFG_ENUM, CFG_OPERATOR, G_SET, "everyone",
+      "Who may add a custom emoji (REQ-072): `everyone`, or `admins` (owners and admins). Deleting stays the emoji's creator's, an admin's or an owner's.",
+      0, 0, "everyone|admins", F(custom_emoji_add), NULL, CFG_VISIBLE, 0 },
     STR("OPENCHIME_DEFAULT_CHANNELS", CFG_OPERATOR, G_SET, "", "Public channels, by name and comma-separated, that a new member joins when their account is made, beside #general. A name that matches no public, unarchived channel is skipped, said once in the log at start.", F(default_channels), NULL, CFG_VISIBLE, 0),
     U64("OPENCHIME_MAX_VIDEO_SIZE", CFG_OPERATOR, G_SET, "167772160", 1048576, (int64_t)OC_MAX_ATTACHMENT_SIZE, "The most bytes one video message may hold (REQ-164), at most the attachment cap of 209715200; clients learn it at sign-in and record within it. 160 MiB by default.", max_video_size),
     PATHR("OPENCHIME_DATA_DIR", CFG_OPERATOR, G_SET, "/data", "Where the daemon keeps everything: `openchime.db`, `identity/`, `blobs/`, `cert.pem`, `key.pem`, `summary/`. The packages set `/var/lib/openchime`.", F(data_dir), NULL, 0, 0),

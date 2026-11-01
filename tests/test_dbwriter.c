@@ -6288,6 +6288,42 @@ static void test_custom_emoji(void) {
     CHECK(r && r->type == OC_RES_LIST_ERR);
     oc_dbres_free(r);
 
+    /* Who may add is configuration (OPENCHIME_CUSTOM_EMOJI_ADD). With `admins`,
+     * a member is refused before anything else is looked at; an owner gets
+     * past it (refused here only because the image is not theirs). With
+     * `everyone`, the member may. */
+    {
+        char cerr[256];
+        setenv("OPENCHIME_CUSTOM_EMOJI_ADD", "admins", 1);
+        CHECK(oc_config_load(cerr, sizeof cerr) == 0);
+        j = oc_job_new(OC_JOB_ADD_EMOJI, 9);
+        j->user_id = carol; j->message_id = 3; j->ch_name = strdup("carols");
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_FORBIDDEN);
+        oc_dbres_free(r);
+        j = oc_job_new(OC_JOB_ADD_EMOJI, 9);
+        j->user_id = alice; j->message_id = 3; j->ch_name = strdup("alices");
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_UNKNOWN_ATTACHMENT);
+        oc_dbres_free(r);
+        setenv("OPENCHIME_CUSTOM_EMOJI_ADD", "everyone", 1);
+        CHECK(oc_config_load(cerr, sizeof cerr) == 0);
+        j = oc_job_new(OC_JOB_ADD_EMOJI, 9);
+        j->user_id = carol; j->message_id = 3; j->ch_name = strdup("carols");
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_EMOJI_LIST);
+        oc_dbres_free(r);
+        j = oc_job_new(OC_JOB_DELETE_EMOJI, 9);            /* as it was, for what follows */
+        j->user_id = carol; j->ch_name = strdup("carols");
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+        unsetenv("OPENCHIME_CUSTOM_EMOJI_ADD");
+        CHECK(oc_config_load(cerr, sizeof cerr) == 0);
+    }
+
     /* Anyone can READ it — an emoji only half the workspace can see is unusable. */
     j = oc_job_new(OC_JOB_ATTACH_LOOKUP, 7);
     j->user_id = carol; j->attachment_id = 1;

@@ -157,6 +157,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 |---|---|---|
 | `OPENCHIME_MODE` | `normal` | What the box is for: `normal` (a deployment), `development` (the tests and harnesses; the only mode that reads the Development rows) or `demo` (the public demo workspace). One of `normal`, `development`, `demo`. |
 | `OPENCHIME_WORKSPACE_NAME` | *(empty)* | The workspace's display name, shown to clients; unset, a client derives one from the host. Clients are told it, read-only, as `workspace_name`. |
+| `OPENCHIME_CUSTOM_EMOJI_ADD` | `everyone` | Who may add a custom emoji (REQ-072): `everyone`, or `admins` (owners and admins). Deleting stays the emoji's creator's, an admin's or an owner's. One of `everyone`, `admins`. Clients are told it, read-only, as `custom_emoji_add`. |
 | `OPENCHIME_DEFAULT_CHANNELS` | *(empty)* | Public channels, by name and comma-separated, that a new member joins when their account is made, beside #general. A name that matches no public, unarchived channel is skipped, said once in the log at start. Clients are told it, read-only, as `default_channels`. |
 | `OPENCHIME_MAX_VIDEO_SIZE` | `167772160` | The most bytes one video message may hold (REQ-164), at most the attachment cap of 209715200; clients learn it at sign-in and record within it. 160 MiB by default. Integer 1048576..209715200. |
 | `OPENCHIME_DATA_DIR` | `/data` | Where the daemon keeps everything: `openchime.db`, `identity/`, `blobs/`, `cert.pem`, `key.pem`, `summary/`. The packages set `/var/lib/openchime`. |

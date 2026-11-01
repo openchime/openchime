@@ -140,6 +140,7 @@ typedef struct {
     /* Auth (OPENCHIME_AUTH): which sources are on. */
     int auth_local, auth_relay;
     int local_mfa;                      /* OPENCHIME_MFA: 0 off, 1 optional, 2 required */
+    int custom_emoji_add;               /* OPENCHIME_CUSTOM_EMOJI_ADD: 0 everyone, 1 admins (and owners) */
     struct {
         const char *audience;           /* OPENCHIME_MANAGED_AUDIENCE: registered with central */
         const char *pubkey;             /* OPENCHIME_MANAGED_RELAY_KEY: a pinned floor under the published keys; "" none */

@@ -5821,6 +5821,14 @@ static oc_dbres *process_add_emoji(sqlite3 *db, const oc_job *j) {
     if (!emoji_name_ok(j->ch_name, name, sizeof name)) {
         r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_MALFORMED_FRAME; return r;
     }
+    /* Who may add one is the workspace's configuration
+     * (OPENCHIME_CUSTOM_EMOJI_ADD): everyone, or owners and admins. */
+    if (oc_config_get()->custom_emoji_add == 1) {
+        uint8_t role = OC_ROLE_MEMBER;
+        if (!user_role(db, j->user_id, &role) || role < OC_ROLE_ADMIN) {
+            r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+        }
+    }
     /* The image must exist, be finalized, be an image, and be one THIS user
      * uploaded — the same rule as an avatar and for the same reason: an
      * emoji is readable workspace-wide, so the id has to be one the setter was

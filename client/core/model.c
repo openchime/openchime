@@ -275,6 +275,15 @@ int oc_model_workspace_setting(const oc_model *m, const char *key, char *out, si
     return 0;
 }
 
+int oc_model_may_add_emoji(const oc_model *m) {
+    char who[16];
+    if (!m || !oc_model_workspace_setting(m, "custom_emoji_add", who, sizeof who) || strcmp(who, "admins") != 0)
+        return 1;
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == m->user_id) return m->users[i].role >= OC_ROLE_ADMIN;
+    return 0;
+}
+
 void oc_model_free(oc_model *m) {
     memset(m->pdms, 0, sizeof m->pdms);
     m->n_pdms = 0;
