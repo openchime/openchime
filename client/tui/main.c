@@ -620,6 +620,11 @@ static void build_prefs_rows(rows_t *r, const oc_model *m, int width) {
                  m->allow_end_min / 60, m->allow_end_min % 60);
     else
         snprintf(line, sizeof line, "notifications: any time");
+    /* Whose it is (REQ-136): the workspace's default, or your own. */
+    if (m->dnd_default)
+        snprintf(line + strlen(line), sizeof line - strlen(line), " (workspace default)");
+    else if (oc_model_has_default_quiet_hours(m))
+        snprintf(line + strlen(line), sizeof line - strlen(line), " (your own; 'default' in Do not disturb returns to the workspace's)");
     char *h = malloc(strlen(line) + 1);
     if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
 
@@ -3474,7 +3479,9 @@ int main(int argc, char **argv) {
                      * The full per-weekday schedule is a Win32-first feature; the
                      * TUI keeps the everyday case working rather than pretending
                      * the old quiet-hours meaning still holds. */
-                    if (strcmp(v, "off") == 0 || !*v)
+                    if (strcmp(v, "default") == 0)   /* back to the workspace's default */
+                        oc_client_set_schedule(cl, OC_DND_FROM_DEFAULT, 0, 0, 0, NULL, 0);
+                    else if (strcmp(v, "off") == 0 || !*v)
                         oc_client_set_schedule(cl, OC_DND_OFF, 0, 0, 0, NULL, 0);
                     else {
                         char s1[16] = "", s2[16] = "";
@@ -3519,7 +3526,7 @@ int main(int argc, char **argv) {
                 else if (id == ACT_SEARCH)  { prompt_kind = PROMPT_SEARCH; prompt_title = "Search messages"; tk_input_init(&prompt_input, 0, "query"); }
                 else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
                 else if (id == ACT_UPLOAD)  { prompt_kind = PROMPT_UPLOAD; prompt_title = "Upload a file"; tk_input_init(&prompt_input, 0, "path"); }
-                else if (id == ACT_DND)     { prompt_kind = PROMPT_DND; prompt_title = "Do not disturb (HH:MM HH:MM, or 'off')"; tk_input_init(&prompt_input, 0, "e.g. 22:00 08:00"); }
+                else if (id == ACT_DND)     { prompt_kind = PROMPT_DND; prompt_title = "Do not disturb (HH:MM HH:MM, 'off', or 'default')"; tk_input_init(&prompt_input, 0, "e.g. 22:00 08:00"); }
                 else if (id == ACT_PASSWD)  {   /* the workspace's own page (AUTH.md §8.10) */
                     char url[1200];
                     if (oc_client_open_page(cl, "account/password", NULL, url, sizeof url) == 0) open_in_browser(url);

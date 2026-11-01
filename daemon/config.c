@@ -738,6 +738,33 @@ int64_t oc_config_window_ms(const char *v) {
     return (int64_t)strtoll(v, NULL, 10) * 1000;
 }
 
+int oc_config_quiet_hours(const char *v, int *mode, int *start_min, int *end_min) {
+    if (!v || !*v) return 0;
+    int m;
+    const char *p;
+    if (!strncmp(v, "everyday ", 9)) { m = OC_DND_EVERY_DAY; p = v + 9; }
+    else if (!strncmp(v, "weekdays ", 9)) { m = OC_DND_WEEKDAYS; p = v + 9; }
+    else return 0;
+    int h1, m1, h2, m2, used = 0;
+    if (sscanf(p, "%2d:%2d-%2d:%2d%n", &h1, &m1, &h2, &m2, &used) != 4 || p[used] != '\0') return 0;
+    if (strlen(p) != 11 || h1 > 24 || h2 > 24 || m1 > 59 || m2 > 59 || h1 < 0 || h2 < 0 || m1 < 0 || m2 < 0) return 0;
+    int s = h1 * 60 + m1, e = h2 * 60 + m2;
+    if (s > 1440 || e > 1440 || s == e) return 0;
+    if (mode) *mode = m;
+    if (start_min) *start_min = s % 1440;
+    if (end_min) *end_min = e % 1440;
+    return 1;
+}
+
+/* The workspace's default quiet hours (OPENCHIME_DEFAULT_QUIET_HOURS):
+ * `everyday` or `weekdays`, then the hours notifications are allowed, as
+ * `HH:MM-HH:MM` in each member's own time. */
+int cfg_parse_quiet(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap) {
+    (void)c; (void)r;
+    if (oc_config_quiet_hours(v, NULL, NULL, NULL)) return 0;
+    return fail(err, errcap, name, v, "must be `everyday` or `weekdays`, a space, and the allowed hours as HH:MM-HH:MM");
+}
+
 /* A stored row's effective value as an operator would write it. */
 static void row_value(const oc_config *c, const cfg_row *r, char *val, size_t cap) {
     const void *p = (const char *)c + r->off;

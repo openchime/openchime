@@ -385,6 +385,18 @@ static void test_mode(void) {
     accepts("OPENCHIME_BROADCAST_LARGE", "50");
     refuses("OPENCHIME_BROADCAST_LARGE", "-1");
     refuses("OPENCHIME_BROADCAST_LARGE", "many");
+    /* The workspace's default quiet hours: a mode and the allowed window. */
+    accepts("OPENCHIME_DEFAULT_QUIET_HOURS", "weekdays 09:00-18:00");
+    accepts("OPENCHIME_DEFAULT_QUIET_HOURS", "everyday 22:00-07:30");
+    refuses("OPENCHIME_DEFAULT_QUIET_HOURS", "custom 09:00-18:00");
+    refuses("OPENCHIME_DEFAULT_QUIET_HOURS", "weekdays 9-18");
+    refuses("OPENCHIME_DEFAULT_QUIET_HOURS", "weekdays 09:00-09:00");
+    refuses("OPENCHIME_DEFAULT_QUIET_HOURS", "weekdays 09:00-25:00");
+    {
+        int qm = 0, qs = 0, qe = 0;
+        CHECK(oc_config_quiet_hours("weekdays 09:00-18:30", &qm, &qs, &qe) && qm == OC_DND_WEEKDAYS && qs == 540 && qe == 1110);
+        CHECK(!oc_config_quiet_hours("", &qm, &qs, &qe));
+    }
     /* normal and demo: every development row refuses the start, naming itself
      * and the mode; the constants hold, and the managed rows want the ticket. */
     static const char *const modes[] = { "normal", "demo" };
@@ -458,7 +470,7 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 32);     /* OPENCHIME_MODE among them */
+    CHECK(operator_rows == 33);     /* OPENCHIME_MODE among them */
     CHECK(managed_rows == 7);
     CHECK(dev_rows == 4 + 12);      /* the daemon's four, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);

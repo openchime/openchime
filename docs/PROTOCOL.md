@@ -1909,6 +1909,13 @@ day for half the world — and only the client knows the zone. One shape both
 directions: the schedule a client sends and the schedule the server echoes are
 the same fact.
 
+A member who has set no schedule of their own follows the workspace's default
+(`OPENCHIME_DEFAULT_QUIET_HOURS`). Their `SCHEDULE` is then that default,
+resolved, with `0x80` (`OC_DND_FROM_DEFAULT`) or'd into `mode`, so a client can
+say "Workspace default". A `SET_SCHEDULE` whose `mode` is `0x80` alone drops the
+member's own schedule and returns them to the default. Any other mode sets their
+own, which takes precedence from then on.
+
 **`SET_TZ_OFFSET` (C → S), `0x00D6`** `{ tz_offset_min: i16 }` — the client's
 UTC offset in minutes east, sent **on every connect** (ARCH-103). The offset the
 schedule above is evaluated against is not a property of the schedule: it changes

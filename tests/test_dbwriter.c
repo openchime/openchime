@@ -2418,7 +2418,9 @@ static void test_index_mentions(void) {
                            /* 0065's polls. */
                            "DROP TABLE poll_votes; DROP TABLE poll_options; DROP TABLE polls;"
                            /* 0066's workspace sender. */
-                           "ALTER TABLE users DROP COLUMN is_system;",
+                           "ALTER TABLE users DROP COLUMN is_system;"
+                           /* 0067's own-schedule flag. */
+                           "ALTER TABLE users DROP COLUMN dnd_own;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -9481,6 +9483,61 @@ static void test_notices(void) {
     cleanup_db(path);
 }
 
+/* The workspace's default quiet hours (OPENCHIME_DEFAULT_QUIET_HOURS,
+ * REQ-136): a member who never set their own follows it, marked; their own,
+ * once set, wins; "use the default" returns them to it. */
+static oc_dbres *schedule_job(oc_dbwriter *w, uint64_t uid, uint8_t mode, uint16_t start, uint16_t end) {
+    oc_job *j = oc_job_new(OC_JOB_SET_SCHEDULE, 66);
+    j->user_id = uid; j->sched_mode = mode;
+    j->sched_start_min = start; j->sched_end_min = end;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static oc_dbres *schedule_now(oc_dbwriter *w, uint64_t uid) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 67);
+    j->user_id = uid;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static void test_default_quiet_hours(void) {
+    const char *path = tdb("quietdef.db");
+    cleanup_db(path);
+    char err[256];
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "qd-a", "pw", OC_ROLE_MEMBER);
+    CHECK(a);
+
+    /* No default: the stored schedule, unmarked. */
+    oc_dbres *r = schedule_now(w, a);
+    CHECK(r && r->sc_mode == OC_DND_OFF);
+    oc_dbres_free(r);
+
+    setenv("OPENCHIME_DEFAULT_QUIET_HOURS", "weekdays 09:00-18:00", 1);
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    r = schedule_now(w, a);
+    CHECK(r && r->sc_mode == (OC_DND_WEEKDAYS | OC_DND_FROM_DEFAULT) && r->sc_start_min == 540 && r->sc_end_min == 1080);
+    oc_dbres_free(r);
+
+    /* Their own wins -- "any time" chosen on purpose too. */
+    r = schedule_job(w, a, OC_DND_EVERY_DAY, 480, 1320);
+    CHECK(r && r->sc_mode == OC_DND_EVERY_DAY && r->sc_start_min == 480);
+    oc_dbres_free(r);
+    r = schedule_job(w, a, OC_DND_OFF, 0, 0);
+    CHECK(r && r->sc_mode == OC_DND_OFF);
+    oc_dbres_free(r);
+
+    /* Back to the default. */
+    r = schedule_job(w, a, OC_DND_FROM_DEFAULT, 0, 0);
+    CHECK(r && r->sc_mode == (OC_DND_WEEKDAYS | OC_DND_FROM_DEFAULT) && r->sc_start_min == 540);
+    oc_dbres_free(r);
+
+    unsetenv("OPENCHIME_DEFAULT_QUIET_HOURS");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
@@ -9535,6 +9592,7 @@ int run_dbwriter_tests(void) {
     test_broadcast_rules();
     test_notices();
     test_welcome_message();
+    test_default_quiet_hours();
     test_default_channels();
     test_search_orders();
     test_setup_invite();

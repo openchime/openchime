@@ -117,6 +117,7 @@ typedef struct {
     const char *notice_member_joined;   /* OPENCHIME_NOTICE_MEMBER_JOINED: a public channel's name, or "" (off) */
     const char *notice_channel_created; /* OPENCHIME_NOTICE_CHANNEL_CREATED: likewise */
     int notice_channel_changes;         /* OPENCHIME_NOTICE_CHANNEL_CHANGES: posted in the channel changed */
+    const char *default_quiet_hours;    /* OPENCHIME_DEFAULT_QUIET_HOURS: "" ⇒ none (oc_config_quiet_hours) */
     const char *workspace_address;      /* OPENCHIME_MANAGED_ADDRESS; "" ⇒ clients keep what they dialled */
     const char *default_channels;       /* OPENCHIME_DEFAULT_CHANNELS: public channel names a new member joins */
     const char *edit_window;            /* OPENCHIME_EDIT_WINDOW: "" always, "never", or seconds */
@@ -244,6 +245,10 @@ int oc_config_visible(size_t i, char *key, size_t kcap, char *val, size_t vcap);
 /* A message window's value (OPENCHIME_EDIT_WINDOW's form) in milliseconds: -1
  * for always, 0 for never, else the window. */
 int64_t oc_config_window_ms(const char *v);
+/* An OPENCHIME_DEFAULT_QUIET_HOURS value, read: 1 and its OC_DND_* mode and
+ * allowed window in minutes from midnight, or 0 when it is empty or malformed.
+ * The clients read the same value, told it as `default_quiet_hours`. */
+int oc_config_quiet_hours(const char *v, int *mode, int *start_min, int *end_min);
 
 /* CONFIG.md's reference section, as markdown, from the registry. */
 void oc_config_print_reference(void *out /* FILE* */);

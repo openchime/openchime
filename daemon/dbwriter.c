@@ -9083,8 +9083,9 @@ static oc_dbres *process_mark_thread_read(sqlite3 *db, const oc_job *j) {
  * cost one query. */
 static void fill_schedule(sqlite3 *db, uint64_t uid, oc_dbres *r) {
     sqlite3_stmt *st = NULL;
+    int own = 1;
     sqlite3_prepare_v2(db,
-        "SELECT dnd_mode, tz_offset_min, allow_start_min, allow_end_min "
+        "SELECT dnd_mode, tz_offset_min, allow_start_min, allow_end_min, dnd_own "
         "  FROM users WHERE id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
     if (sqlite3_step(st) == SQLITE_ROW) {
@@ -9092,8 +9093,18 @@ static void fill_schedule(sqlite3 *db, uint64_t uid, oc_dbres *r) {
         r->sc_tz_offset_min  = (int16_t)sqlite3_column_int(st, 1);
         r->sc_start_min      = (uint16_t)sqlite3_column_int(st, 2);
         r->sc_end_min        = (uint16_t)sqlite3_column_int(st, 3);
+        own = sqlite3_column_int(st, 4);
     }
     sqlite3_finalize(st);
+    /* Never set their own: the workspace's default, resolved and marked, so
+     * every device of theirs and the push decision agree (OPENCHIME_DEFAULT_QUIET_HOURS). */
+    int dm, ds, de;
+    if (!own && oc_config_quiet_hours(oc_config_get()->default_quiet_hours, &dm, &ds, &de)) {
+        r->sc_mode = (uint8_t)(dm | OC_DND_FROM_DEFAULT);
+        r->sc_start_min = (uint16_t)ds;
+        r->sc_end_min = (uint16_t)de;
+        return;
+    }
     sqlite3_prepare_v2(db,
         "SELECT weekday, enabled, start_min, end_min FROM notify_schedule "
         " WHERE user_id=? ORDER BY weekday;", -1, &st, NULL);
@@ -9122,9 +9133,13 @@ static oc_dbres *process_set_schedule(sqlite3 *db, const oc_job *j) {
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     sqlite3_stmt *st = NULL;
+    /* OC_DND_FROM_DEFAULT alone: drop my own and follow the workspace's
+     * default again. Anything else is my own, which wins from now on. */
+    int to_default = j->sched_mode == OC_DND_FROM_DEFAULT;
     sqlite3_prepare_v2(db,
         "UPDATE users SET dnd_mode=?1, tz_offset_min=?2, allow_start_min=?3, "
-        "                 allow_end_min=?4 WHERE id=?5;", -1, &st, NULL);
+        "                 allow_end_min=?4, dnd_own=?6 WHERE id=?5;", -1, &st, NULL);
+    sqlite3_bind_int  (st, 6, to_default ? 0 : 1);
     sqlite3_bind_int  (st, 1, j->sched_mode > OC_DND_CUSTOM ? 0 : (int)j->sched_mode);
     sqlite3_bind_int  (st, 2, (int)j->sched_tz_offset_min);
     sqlite3_bind_int  (st, 3, (int)j->sched_start_min);
@@ -9138,7 +9153,7 @@ static oc_dbres *process_set_schedule(sqlite3 *db, const oc_job *j) {
     sqlite3_step(st);
     sqlite3_finalize(st);
 
-    for (uint8_t i = 0; i < j->n_sched_days && j->sched_days; i++) {
+    for (uint8_t i = 0; !to_default && i < j->n_sched_days && j->sched_days; i++) {
         const oc_schedule_day *d = &j->sched_days[i];
         if (d->weekday > 6) continue;              /* a day that does not exist */
         sqlite3_prepare_v2(db,

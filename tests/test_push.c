@@ -257,6 +257,23 @@ static void test_collect(void) {
     CHECK(!saw_carol && !saw_alice);   /* muted / author never notified */
     sqlite3_close(rdb);
 
+    /* The workspace's default quiet hours (REQ-136): dave set none of his own,
+     * so at 10:30 under "everyday 11:00-23:00" he is quiet; bob's own schedule
+     * still decides for bob. */
+    {
+        char err[256];
+        setenv("OPENCHIME_DEFAULT_QUIET_HOURS", "everyday 11:00-23:00", 1);
+        CHECK(oc_config_load(err, sizeof err) == 0);
+        CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+        n = oc_push_collect(rdb, 1, alice, 0, 0, 630, (uint64_t)630 * 60000ull, t, 8);
+        CHECK(n == 0);                                   /* dave by the default, bob by his own */
+        n = oc_push_collect(rdb, 1, alice, 0, 0, 700, (uint64_t)700 * 60000ull, t, 8);
+        CHECK(n == 2);                                   /* 11:40: both allowed */
+        sqlite3_close(rdb);
+        unsetenv("OPENCHIME_DEFAULT_QUIET_HOURS");
+        CHECK(oc_config_load(err, sizeof err) == 0);
+    }
+
     /* --- the MENTIONS level (REQ-221) — the deferred half of ARCH-72 ---------
      * Level MENTIONS must deliver only when the message actually names the
      * recipient. Before REQ-221 there was no way to answer that, so the level

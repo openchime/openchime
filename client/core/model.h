@@ -608,6 +608,9 @@ typedef struct {
      * is the hours notifications are ALLOWED — the opposite sense from the quiet
      * window it replaced, which is why the fields are named for it. */
     uint8_t   dnd_mode;
+    /* The schedule above is the workspace's default (OPENCHIME_DEFAULT_QUIET_HOURS),
+     * followed because this person never set their own (OC_DND_FROM_DEFAULT). */
+    uint8_t   dnd_default;
     int16_t   tz_offset_min;
     uint16_t  allow_start_min, allow_end_min;
     oc_schedule_day sched_days[OC_SCHEDULE_DAYS];
@@ -1107,6 +1110,9 @@ int oc_model_may_change_own(const oc_model *m, uint64_t sent_ms, int edit, uint6
  * roster is loaded (else 0). The daemon decides; this is the warning. */
 int oc_model_broadcast_will_notify(const oc_model *m, uint64_t channel_id, const char *body,
                                    char *token, size_t tcap, size_t *members);
+/* Whether the workspace has default quiet hours (`default_quiet_hours`, REQ-136)
+ * a person may return to. */
+int oc_model_has_default_quiet_hours(const oc_model *m);
 
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);

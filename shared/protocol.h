@@ -1380,6 +1380,11 @@ typedef struct { uint64_t channel_id; uint8_t level; } oc_set_notify_pref;
  * (the same reason SET_SNOOZE carries minutes rather than an instant). */
 #define OC_SCHEDULE_DAYS 7u
 enum { OC_DND_OFF = 0, OC_DND_EVERY_DAY = 1, OC_DND_WEEKDAYS = 2, OC_DND_CUSTOM = 3 };
+/* Or'd into `mode` on SCHEDULE: the member set none of their own, so this is
+ * the workspace's default (OPENCHIME_DEFAULT_QUIET_HOURS), resolved. Alone on
+ * SET_SCHEDULE: drop my own and follow the default again. */
+#define OC_DND_FROM_DEFAULT 0x80u
+#define OC_DND_MODE(m) ((uint8_t)((m) & 0x7Fu))
 typedef struct { uint8_t weekday; uint8_t enabled; uint16_t start_min; uint16_t end_min; } oc_schedule_day;
 typedef struct { uint8_t mode; int16_t tz_offset_min;
                  uint16_t start_min, end_min;

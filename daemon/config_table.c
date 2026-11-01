@@ -23,6 +23,7 @@ int cfg_parse_connect(oc_config *c, const cfg_row *r, const char *name, const ch
 int cfg_parse_token_prefix(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_trusted_proxies(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_window(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
+int cfg_parse_quiet(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 
 #define F(field) offsetof(oc_config, field)
 #define STR(n, cls, grp, d, doc, ...)   { n, CFG_STR,  cls, grp, d, doc, 0, 0, NULL, __VA_ARGS__ }
@@ -55,6 +56,7 @@ const cfg_row OC_CFG[] = {
     STR("OPENCHIME_NOTICE_MEMBER_JOINED", CFG_OPERATOR, G_SET, "", "The public channel the workspace posts in when a new member joins, naming them. Empty: none is posted. A name that is no public, unarchived channel is said once at start, and nothing is posted.", F(notice_member_joined), NULL, 0, 0),
     STR("OPENCHIME_NOTICE_CHANNEL_CREATED", CFG_OPERATOR, G_SET, "", "The public channel the workspace posts in when a public channel is created, naming it and who made it. Empty: none is posted.", F(notice_channel_created), NULL, 0, 0),
     BOOL("OPENCHIME_NOTICE_CHANNEL_CHANGES", CFG_OPERATOR, G_SET, "off", "Whether the workspace posts in a channel when its name, description, visibility or archived state changes, naming who changed it.", notice_channel_changes),
+    STR("OPENCHIME_DEFAULT_QUIET_HOURS", CFG_OPERATOR, G_SET, "", "The quiet hours a member follows until they set their own (REQ-136): `everyday` or `weekdays`, a space, and the hours notifications are allowed, `HH:MM-HH:MM` in each member's own time, as in `weekdays 09:00-18:00`. Empty: none, and a member without their own is never quiet.", F(default_quiet_hours), cfg_parse_quiet, CFG_VISIBLE, 0),
     STR("OPENCHIME_WORKSPACE_NAME", CFG_OPERATOR, G_SET, "", "The workspace's display name, shown to clients; unset, a client derives one from the host.", F(workspace_name), NULL, CFG_VISIBLE, 0),
     /* An ENUM a client is told (CFG_VISIBLE), written out: the macro has no flags. */
     { "OPENCHIME_CUSTOM_EMOJI_ADD", CFG_ENUM, CFG_OPERATOR, G_SET, "everyone",

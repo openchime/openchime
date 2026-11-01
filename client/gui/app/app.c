@@ -2059,6 +2059,7 @@ static rectf g_threads_unread_btn;
 static rectf g_thread_follow_hit[32];
 static uint64_t    g_thread_menu_root;   /* which card's overflow is open */
 static rectf g_sched_mode_hit[4];
+static rectf g_sched_default_hit;   /* "Use the workspace default" (REQ-136) */
 static rectf g_sched_base_hit[2];
 static rectf g_sched_day_chk[7];
 static rectf g_sched_day_hit[7][2];
@@ -8037,6 +8038,21 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
             mx = b.right + 8;
         }
         float ny = my + 34;
+        /* Whose schedule this is (REQ-136): the workspace's default, followed
+         * until a choice above makes it your own, or your own, with the way
+         * back to the default when the workspace has one. */
+        g_sched_default_hit = rf(0, 0, 0, 0);
+        if (m->dnd_default) {
+            draw_text(rt, "Workspace default. Change it to make it your own.", g_meta,
+                      rf(body.left + 20, ny, body.right - 20, ny + 20), OC_COL_MUTED);
+            ny += 26;
+        } else if (oc_model_has_default_quiet_hours(m)) {
+            draw_text(rt, "Your own.", g_meta, rf(body.left + 20, ny, body.left + 100, ny + 26), OC_COL_MUTED);
+            float bw = text_width("Use the workspace default", g_meta) + 22;
+            g_sched_default_hit = rf(body.left + 100, ny, body.left + 100 + bw, ny + 26);
+            draw_chip_r(rt, g_sched_default_hit, "Use the workspace default", 0);
+            ny += 34;
+        }
         for (int i = 0; i < 7; i++) {
             g_sched_day_chk[i] = rf(0, 0, 0, 0);
             g_sched_day_hit[i][0] = g_sched_day_hit[i][1] = rf(0, 0, 0, 0);
@@ -8146,6 +8162,7 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
     g_notify_kw_btn  = hit_visible(g_notify_kw_btn,  reg);
     g_notify_vip_btn = hit_visible(g_notify_vip_btn, reg);
     for (int i = 0; i < 4; i++) g_sched_mode_hit[i] = hit_visible(g_sched_mode_hit[i], reg);
+    g_sched_default_hit = hit_visible(g_sched_default_hit, reg);
     for (int i = 0; i < 2; i++) g_sched_base_hit[i] = hit_visible(g_sched_base_hit[i], reg);
     for (int d = 0; d < 7; d++) {
         g_sched_day_chk[d]    = hit_visible(g_sched_day_chk[d],    reg);
@@ -27892,6 +27909,10 @@ static int on_click(oc_win *hwnd, int x, int y) {
             /* The schedule (REQ-136). Every control applies immediately, as the
              * level chips beside them do — this overlay has no Save button and a
              * setting that waited for one would be the only thing here that did. */
+            if (in_rect(g_sched_default_hit, x, y)) {
+                sched_send(OC_DND_FROM_DEFAULT, 0, 0, NULL);
+                return 1;
+            }
             for (int i = 0; i < 4; i++)
                 if (in_rect(g_sched_mode_hit[i], x, y)) {
                     const oc_model *sm = model();

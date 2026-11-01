@@ -321,6 +321,11 @@ int oc_model_broadcast_will_notify(const oc_model *m, uint64_t channel_id, const
     return large > 0 ? 2 : 1;
 }
 
+int oc_model_has_default_quiet_hours(const oc_model *m) {
+    char v[40];
+    return oc_model_workspace_setting(m, "default_quiet_hours", v, sizeof v) && v[0];
+}
+
 void oc_model_free(oc_model *m) {
     memset(m->pdms, 0, sizeof m->pdms);
     m->n_pdms = 0;
@@ -2031,7 +2036,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         presence_set(m, e->user_id, e->status, e->op);
         break;
     case OC_EV_SCHEDULE:
-        m->dnd_mode        = e->sched_mode;
+        m->dnd_mode        = OC_DND_MODE(e->sched_mode);
+        m->dnd_default     = (e->sched_mode & OC_DND_FROM_DEFAULT) != 0;
         m->tz_offset_min   = e->tz_offset_min;
         m->allow_start_min = e->sched_start_min;
         m->allow_end_min   = e->sched_end_min;
