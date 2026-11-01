@@ -20,10 +20,10 @@ integration suites that drive the real epoll server over TLS (`itest_netloop`,
 `itest_tls`, `itest_slow_blob`) and the headless client app-core
 (`test_client_core.c`) — all compiled into one `build/tests` binary by `make test`.
 The black-box integration tier drives a natively-run daemon over a real socket
-(the `build` job in `.github/workflows/ci.yml`; §3.2). A deterministic codec fuzzer (7k iterations by default —
-5k random + 2k framed, raised with `-DOC_FUZZ_RANDOM_ITERS=` /
-`-DOC_FUZZ_FRAMED_ITERS=` for a deep run, e.g. under ASan) and a concurrency load test (`tests/bench_load.c`, driven by
-`scripts/bench.sh`) round it out.
+(the `build` job in `.github/workflows/ci.yml`; §3.2). The codec is fuzzed twice
+over: a deterministic sweep in every `make test` and coverage-guided libFuzzer
+harnesses in CI (§2.2b, "Fuzzing"). A concurrency load test (`tests/bench_load.c`,
+driven by `scripts/bench.sh`) rounds it out.
 
 ---
 
@@ -422,6 +422,58 @@ leaves a fixture switched must put it back or the second round fails somewhere
 that has nothing to do with the cause: a suite that swaps the loop's call relay
 socket, as `itest_netloop`'s routed-call test does, must hand it back, or the next
 round's loop starts without one.
+
+### 2.2b Fuzzing
+
+**Two speeds.** `tests/test_fuzz.c` is a deterministic sweep, in every
+`make test`: 5,000 random and 2,000 framed inputs through `oc_parse_frame` and
+every payload decoder, from a fixed seed (raise them with
+`-DOC_FUZZ_RANDOM_ITERS=` and `-DOC_FUZZ_FRAMED_ITERS=` for a deep run). The
+coverage-guided tier is libFuzzer harnesses under `tests/fuzz/`, each built
+under ASan and UBSan and run in CI. Both use one list of decoders,
+`tests/fuzz/decoders.c`, so a new message type's decoder is added there once,
+and its encoder to `tests/fuzz/seeds.c`.
+
+| Harness | Built as | What it fuzzes |
+|---|---|---|
+| `frame` | `build/fuzz/frame` | `oc_parse_frame`, then every decoder on the parsed payload and on the raw bytes. A decoder may refuse, but must not crash, read outside its input, or answer anything but OK or MALFORMED. A parsed payload's view must stay inside the input. |
+| `framebuf` | `build/fuzz/framebuf` | `shared/framebuf.c`'s reassembly. The input's first bytes choose the chunk sizes the rest is pushed in, and every complete frame is drained after each push. A frame yielded must lie inside the buffer and agree with its own length prefix. |
+
+**Prerequisites.** A clang with libFuzzer and the sanitizer runtimes: on
+Ubuntu, `clang` and `libclang-rt-18-dev` (or the version your clang is). Only
+the harnesses need it. `make` and `make test` never do. Make uses `/usr/bin/clang`
+(`FUZZ_CC`): the pinned llvm-mingw make puts first on `PATH` has no Linux
+runtimes.
+
+**Building and running one.** Harnesses are tools built by path, not a
+target:
+
+```
+make build/fuzz/frame
+mkdir -p /tmp/frame && build/fuzz/frame -dict=tests/fuzz/frame.dict /tmp/frame tests/fuzz/corpus/frame
+```
+
+The first directory is where libFuzzer writes what it finds. Keep it out of the
+tree. `-max_total_time=<s>` stops a run. CI runs each harness for
+`FUZZ_SECONDS` (60 by default) from its corpus in `make test-merge`
+(`scripts/test/merge/fuzz.sh`). A finding fails the job, with the sanitizer's
+report and the input, base64, in the log.
+
+**The corpora** under `tests/fuzz/corpus/<harness>/` are real frames:
+`build/fuzz/seeds <dir>` writes one per encoder in `shared/protocol.c` (each
+over a zeroed message) and a few streams of them for `framebuf`. They are kept
+whole rather than minimized with `-merge=1`, which would keep about one in five
+and lose the frame for most message types. `tests/fuzz/frame.dict` holds the
+protocol version and every message type id. Regenerate both when the protocol
+changes.
+
+**A crash.** Reproduce it with `build/fuzz/<harness> <file>`, and minimize it
+with `build/fuzz/<harness> -minimize_crash=1 -runs=10000 <file>`. Check the
+minimized input in under `tests/fuzz/crashes/<harness>/`:
+`run_fuzz_replay_tests` (`tests/test_fuzz_replay.c`) runs every corpus and
+reproducer file through its harness in `make test`, so the crash fails there
+until it is fixed, and stays a regression test afterwards. A missing
+`crashes/` directory counts as no files.
 
 ### 2.3 Determinism rules
 
@@ -1057,7 +1109,7 @@ need and call them, and the workflows call only the targets.
 | Command | Where | Scripts | What it runs |
 |---|---|---|---|
 | `make test` | locally, before every push (`scripts/check/test.sh`, which the pre-push hook requires) | `scripts/test/local/` | the source checks and every suite but the slow ones (§2.4), on the default daemon; about a minute |
-| `make test-merge` | CI only: every pull request (`pr-tests.yml`, a required check) and the staging build, through `ci.yml` | `scripts/test/merge/` | every feature built; every suite, the threaded ones under ThreadSanitizer (§2.4); the static-link check; the end-to-end run (§3.2); the release's compiler; the speech round trip; the web client and the GUI smoke on the web (§3.4) |
+| `make test-merge` | CI only: every pull request (`pr-tests.yml`, a required check) and the staging build, through `ci.yml` | `scripts/test/merge/` | every feature built; every suite, the threaded ones under ThreadSanitizer (§2.4); the static-link check; the end-to-end run (§3.2); the release's compiler; the speech round trip; the web client and the GUI smoke on the web (§3.4); each fuzzing harness for `FUZZ_SECONDS` (§2.2b) |
 | `make test-release` | CI only: the staging build and the release, on the artifacts they make | `scripts/test/release/` | `PART=packages`: glibc floor, one binary in all three packages, the `.deb` installed and speaking, its unit file; `PART=image`: the image starts, its database replicates and restores (§3.2); `PART=windows`: the binaries' version resources, the installer and the MSIX |
 
 `make test-merge` and `make test-release` refuse to run unless `CI` is set (as

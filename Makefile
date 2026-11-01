@@ -30,7 +30,7 @@
 # workflows call only the targets. Tool binaries are built by
 # their path (make build/demo_client, build/bench_load, build/bench_loop,
 # build/tuikit-demo, build/tts_pack, build/s3_smoke, build/e2e_client,
-# build/signin). The rules live in
+# build/signin, build/fuzz/frame, build/fuzz/framebuf, build/fuzz/seeds). The rules live in
 # mk/, one file per concern; scripts/test/local/make_targets.sh keeps the typed
 # targets (the list above and PUBLIC/INTERNAL) in step, not this tool list.
 PUBLIC   := all full run test test-merge test-release clients linux windows web clean distclean

@@ -73,7 +73,12 @@ INC := -Ishared -Idaemon -I$(ARGON2_DIR) -Ithird_party/utf8proc -Ithird_party/js
 APP_SRC  := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES) $(PWLIST_RES)
 # e2e_client is a standalone black-box tool (its own main), not part of the
 # single in-process test binary.
-TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/bench_loop.c tests/testsignin_main.c,$(wildcard tests/*.c))
+# The fuzzing tier's harnesses and decoder list (tests/fuzz/fuzz.h): in the test
+# binary, which replays their corpora, and in each libFuzzer binary
+# (mk/tests.mk, build/fuzz/%). tests/fuzz/main.c and seeds.c are the tools'.
+FUZZ_HARNESS_SRC := tests/fuzz/decoders.c tests/fuzz/frame.c tests/fuzz/framebuf.c
+TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/bench_loop.c tests/testsignin_main.c,$(wildcard tests/*.c)) \
+            $(FUZZ_HARNESS_SRC)
 TEST_BIN := build/tests
 
 # --- Client app-core (ARCH-74) ------------------------------------------------

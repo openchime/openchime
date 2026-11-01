@@ -59,7 +59,10 @@ jobs:
           # (scripts/build/libvpx.sh); xz-utils for the toolchain tarballs. gdb
           # so that a test binary that crashes prints every thread's stack
           # (tests/main.c). cmake, curl, git and python3 are on the image.
-          scripts/build/apt.sh bzip2 nasm gdb xz-utils
+          # libclang-rt-18-dev for libFuzzer and the sanitizer runtimes of the
+          # image's clang 18, which the fuzzing harnesses build with
+          # (scripts/test/merge/fuzz.sh).
+          scripts/build/apt.sh bzip2 nasm gdb xz-utils libclang-rt-18-dev
       # The toolchains make fetches pinned (mk/toolchains.mk): zig for the
       # release-compiler pass, Emscripten for the web client the daemon embeds.
       # Keyed by the scripts, which pin the versions and the checksums.

@@ -53,7 +53,8 @@ test-merge:
 	@scripts/test/lib/require_ci.sh test-merge
 	+@$(foreach p,$(if $(PART),$(PART),plain threads),$(MAKE) --no-print-directory test-merge-$(p) &&) true
 test-merge-plain:
-	+@$(MAKE) --no-print-directory $(FULL_SWITCHES) all linux build/e2e_client build/demo_client $(TEST_BIN) $(WEB_DIR)/openchime.js
+	+@$(MAKE) --no-print-directory $(FULL_SWITCHES) all linux build/e2e_client build/demo_client $(TEST_BIN) $(WEB_DIR)/openchime.js \
+	    build/fuzz/frame build/fuzz/framebuf
 	scripts/test/local/source.sh
 	scripts/test/merge/suites.sh
 	scripts/test/merge/static_link.sh $(BIN)
@@ -62,6 +63,7 @@ test-merge-plain:
 	scripts/test/lib/speech.sh ./$(BIN)
 	NODE="$(NODE)" scripts/test/merge/web.sh
 	NODE="$(NODE)" scripts/test/merge/gui_web_smoke.sh
+	scripts/test/merge/fuzz.sh
 test-merge-threads: $(TSAN_BIN)
 	scripts/test/merge/tsan.sh
 $(TEST_BIN): $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build
@@ -135,6 +137,24 @@ check-release-cc: $(RELCC_DAEMON_OBJS) $(RELCC_TEST_OBJS)
 build/e2e_client: tests/e2e_client.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build
 	$(CC) $(CFLAGS) -O0 -g -Ishared -Itests -I$(MBEDTLS_INC) \
 	    tests/e2e_client.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
+# The fuzzing tier (docs/TESTING.md, "Fuzzing"): one libFuzzer binary per
+# harness, build/fuzz/<harness>, from tests/fuzz/<harness>.c, under ASan and
+# UBSan. The host's clang, since zig's has no libFuzzer runtime: a prerequisite
+# for building a harness only, never for make or make test.
+# By path when it is in the usual places: make puts the pinned llvm-mingw first
+# on PATH (mk/toolchains.mk), and its clang has no Linux sanitizer runtimes.
+FUZZ_CC  ?= $(firstword $(wildcard /usr/bin/clang /usr/local/bin/clang) clang)
+FUZZ_LIB := tests/fuzz/decoders.c shared/protocol.c shared/framebuf.c
+build/fuzz/%: tests/fuzz/main.c tests/fuzz/%.c $(FUZZ_LIB) $(wildcard shared/*.h tests/fuzz/*.h) | build
+	@mkdir -p $(dir $@)
+	$(FUZZ_CC) $(CFLAGS) -O1 -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
+	    -Ishared -Itests -DOC_FUZZ_TARGET=oc_fuzz_$* tests/fuzz/main.c tests/fuzz/$*.c \
+	    $(filter-out tests/fuzz/$*.c,$(FUZZ_LIB)) -o $@
+# Writes one valid frame per message type, and a few streams of them, as the
+# harnesses' seed corpora (tests/fuzz/corpus/): build/fuzz/seeds <dir>.
+build/fuzz/seeds: tests/fuzz/seeds.c shared/protocol.c $(wildcard shared/*.h) | build
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -O0 -g -Ishared tests/fuzz/seeds.c shared/protocol.c -o $@
 # Flexible black-box client for the local federated demo (register a device token /
 # send a message against a running daemon). Same shared-only linkage as e2e_client.
 build/demo_client: tests/demo_client.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build

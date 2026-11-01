@@ -12,6 +12,7 @@
 int run_protocol_tests(void);
 int run_callsig_tests(void);
 int run_fuzz_tests(void);
+int run_fuzz_replay_tests(void);
 int run_framebuf_tests(void);
 int run_migrate_tests(void);
 int run_auth_tests(void);
@@ -234,6 +235,7 @@ static void print_times(void) {
 static const struct suite { const char *name; int (*fn)(void); } SUITES[] = {
     S(run_protocol_tests),
     S(run_fuzz_tests),
+    S(run_fuzz_replay_tests),
     S(run_framebuf_tests),
     S(run_migrate_tests),
     S(run_auth_tests),
