@@ -239,12 +239,39 @@ static void test_static_answers(void) {
 #undef PICK
 }
 
+/* A browser's WebSocket frame (RFC 6455 §5), parsed before it is unmasked:
+ * each length form, and each refusal. */
+static void test_ws_parse(void) {
+    oc_ws_frame f;
+    uint8_t b[300];
+    /* Short form: binary, masked, three bytes. */
+    const uint8_t small[] = { 0x82, 0x83, 1, 2, 3, 4, 'a', 'b', 'c' };
+    CHECK(oc_ws_parse(small, sizeof small, 1000, &f) == OC_WS_FRAME);
+    CHECK(f.opcode == 2 && f.fin && f.mask_off == 2 && f.payload_off == 6 && f.len == 3 && f.whole == 9);
+    for (size_t n = 0; n < sizeof small; n++) CHECK(oc_ws_parse(small, n, 1000, &f) == OC_WS_MORE);
+    /* 16-bit length. */
+    memset(b, 0, sizeof b);
+    b[0] = 0x02; b[1] = 0x80 | 126; b[2] = 0; b[3] = 200;
+    CHECK(oc_ws_parse(b, 3, 1000, &f) == OC_WS_MORE);
+    CHECK(oc_ws_parse(b, 8 + 200, 1000, &f) == OC_WS_FRAME && f.len == 200 && !f.fin && f.payload_off == 8);
+    /* 64-bit length, over the limit. */
+    memset(b, 0, sizeof b);
+    b[0] = 0x82; b[1] = 0x80 | 127; b[6] = 1;
+    CHECK(oc_ws_parse(b, 9, 1000, &f) == OC_WS_MORE);
+    CHECK(oc_ws_parse(b, 14, 1000, &f) == OC_WS_REFUSE);
+    /* Unmasked, and a reserved bit. */
+    const uint8_t bare[] = { 0x82, 0x01, 'x' }, rsv[] = { 0xC2, 0x81, 0, 0, 0, 0, 'x' };
+    CHECK(oc_ws_parse(bare, sizeof bare, 1000, &f) == OC_WS_REFUSE);
+    CHECK(oc_ws_parse(rsv, sizeof rsv, 1000, &f) == OC_WS_REFUSE);
+}
+
 int run_http_tests(void) {
     printf("test_http: request line, headers, body framing, partial input, size limits,\n");
     printf("           refusals, JSON/plain webhook text, the router, the response writer,\n");
     printf("           a static route's gzip copy and ETag\n");
     test_parse_json();
     test_parse_plain();
+    test_ws_parse();
     test_incomplete();
     test_body_too_large();
     test_case_insensitive_headers();

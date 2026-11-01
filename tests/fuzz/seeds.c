@@ -2,7 +2,8 @@
  * "Fuzzing"). One frame per encoder, each over a zeroed message, so every
  * message type is in the corpus as the encoder writes it, into <dir>/frame/;
  * and into <dir>/framebuf/, streams of those frames under a few chunkings,
- * prefixed as tests/fuzz/framebuf.c reads them. The corpora checked in are this
+ * prefixed as tests/fuzz/framebuf.c reads them; and for each pre-authentication
+ * parser, a few real inputs of its kind, into <dir>/<harness>/. The corpora checked in are this
  * output minimized (libFuzzer -merge=1); a new message type's encoder is added
  * here as well as to tests/fuzz/decoders.c.
  *
@@ -56,6 +57,93 @@ static void stream(const char *name, const uint16_t *sizes, size_t nsizes, size_
     for (size_t i = 0; i < nsizes; i++) { head[1 + i * 2] = (uint8_t)(sizes[i] >> 8); head[2 + i * 2] = (uint8_t)sizes[i]; }
     if (from + len > g_stream_len) len = g_stream_len > from ? g_stream_len - from : 0;
     put("framebuf", name, head, 1 + nsizes * 2, g_stream + from, len);
+}
+
+/* One seed for a harness other than frame's: `n` byte runs written whole. */
+static void seed(const char *harness, const char *name, const void *a, size_t alen, const void *b, size_t blen) {
+    char sub[600];
+    snprintf(sub, sizeof sub, "%s/%s", g_dir, harness);
+    mkdir(sub, 0755);
+    put(harness, name, a, alen, b, blen);
+}
+static void seed_str(const char *harness, const char *name, const char *text) {
+    seed(harness, name, text, strlen(text), NULL, 0);
+}
+/* Two parts, as oc_fuzz_split reads them: the first prefixed by its length. */
+static void seed_two(const char *harness, const char *name, const void *a, size_t alen, const void *b, size_t blen) {
+    static uint8_t buf[8192];
+    if (alen + blen + 2 > sizeof buf) return;
+    buf[0] = (uint8_t)(alen >> 8); buf[1] = (uint8_t)alen;
+    memcpy(buf + 2, a, alen);
+    seed(harness, name, buf, alen + 2, b, blen);
+}
+
+/* The pre-authentication parsers' seeds: what each sees on a good day. */
+static void preauth_seeds(void) {
+    seed_str("http", "get", "GET / HTTP/1.1\r\nHost: acme.example\r\nAccept-Encoding: gzip, br\r\n\r\n");
+    seed_str("http", "conditional", "GET /app.js HTTP/1.1\r\nHost: acme.example\r\nIf-None-Match: \"abc\", W/\"d\"\r\n\r\n");
+    seed_str("http", "webhook-json", "POST /hooks/abc HTTP/1.1\r\nHost: acme.example\r\nContent-Type: application/json\r\n"
+                                     "Content-Length: 27\r\n\r\n{\"text\":\"deploy \\u00e9 done\"}");
+    seed_str("http", "webhook-plain", "POST /hooks/abc HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello");
+    seed_str("http", "form", "POST /signin HTTP/1.1\r\nHost: acme.example\r\nOrigin: https://acme.example\r\n"
+                             "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 19\r\n\r\nuser=ada&pass=x%20y");
+    seed_str("http", "upgrade", "GET /ws HTTP/1.1\r\nHost: acme.example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+                                "Sec-WebSocket-Protocol: openchime, x\r\n\r\n");
+
+    static const uint8_t ws_small[] = { 0x82, 0x85, 1, 2, 3, 4, 'h' ^ 1, 'e' ^ 2, 'l' ^ 3, 'l' ^ 4, 'o' ^ 1 };
+    static const uint8_t ws_ping[] = { 0x89, 0x80, 9, 9, 9, 9, 0x88, 0x80, 0, 0, 0, 0 };
+    static uint8_t ws_mid[4 + 4 + 200], ws_big[10 + 4 + 300];
+    ws_mid[0] = 0x02; ws_mid[1] = 0x80 | 126; ws_mid[2] = 0; ws_mid[3] = 200;
+    ws_big[0] = 0x82; ws_big[1] = 0x80 | 127; ws_big[8] = 1; ws_big[9] = 44;
+    seed("ws", "small", ws_small, sizeof ws_small, NULL, 0);
+    seed("ws", "ping-close", ws_ping, sizeof ws_ping, NULL, 0);
+    seed("ws", "fragment-16", ws_mid, sizeof ws_mid, ws_small, sizeof ws_small);
+    seed("ws", "len-64", ws_big, sizeof ws_big, NULL, 0);
+
+    static const uint8_t sig[12] = { 0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A };
+    static uint8_t v4[16 + 12], v6[16 + 36], local[16], unix_[16 + 216];
+    memcpy(v4, sig, 12);  v4[12] = 0x21; v4[13] = 0x11; v4[15] = 12;
+    v4[16] = 203; v4[17] = 0; v4[18] = 113; v4[19] = 7; v4[20] = 10; v4[23] = 1; v4[24] = 0x1F; v4[25] = 0x90; v4[26] = 0x01; v4[27] = 0xBB;
+    memcpy(v6, sig, 12);  v6[12] = 0x21; v6[13] = 0x21; v6[15] = 36; v6[16] = 0x20; v6[17] = 0x01; v6[18] = 0x0d; v6[19] = 0xb8; v6[31] = 1;
+    memcpy(local, sig, 12); local[12] = 0x20;
+    memcpy(unix_, sig, 12); unix_[12] = 0x21; unix_[13] = 0x31; unix_[14] = 0; unix_[15] = 216;
+    seed("proxy", "tcp4", v4, sizeof v4, "\x16\x03\x01", 3);
+    seed("proxy", "tcp6", v6, sizeof v6, NULL, 0);
+    seed("proxy", "local", local, sizeof local, NULL, 0);
+    seed("proxy", "unix", unix_, sizeof unix_, NULL, 0);
+
+    static const char claims[] = "{\"iss\":\"https://accounts.google.com\",\"aud\":\"client-1\",\"sub\":\"1234\","
+        "\"email\":\"ada@acme.example\",\"email_verified\":\"true\",\"name\":\"Ada \\u00c9\",\"nonce\":\"n-1\","
+        "\"iat\":1799999990,\"exp\":1800000300,\"hd\":\"acme.example\",\"amr\":[\"pwd\",\"mfa\"]}";
+    static const char jwks[] = "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"k1\",\"use\":\"sig\","
+        "\"x\":\"DqHKx-q7OAQmDqj5y9NaFRRyMFoHtdCjHSfxAGUIA98\",\"y\":\"uFFNNuB01X8MZQMhCfwGbiW8iRuQ67WxHBF0lXV9VNQ\"},"
+        "{\"kty\":\"RSA\",\"kid\":\"r1\",\"n\":\"sXchDaQebHnPiGvyDOAT4saGEUetSyo9MKLOoWFsueri23bOdgWp4Dy1Wl\",\"e\":\"AQAB\"}]}";
+    seed_str("json", "claims", claims);
+    seed_str("json", "jwks", jwks);
+    seed_str("json", "nested", "[{\"a\":[1,2,{\"b\":null}],\"c\":true,\"d\":\"\\ud83d\\ude00\\n\\\"\"},-0.5e3,18446744073709551615]");
+
+    /* A "none" attestation, and a P-256 COSE key, as a browser makes them. */
+    static const uint8_t att[] = { 0xA3, 0x63, 'f', 'm', 't', 0x64, 'n', 'o', 'n', 'e', 0x67, 'a', 't', 't', 'S', 't', 'm', 't', 0xA0,
+                                   0x68, 'a', 'u', 't', 'h', 'D', 'a', 't', 'a', 0x58, 0x25,
+                                   1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32, 0x45, 0,0,0,1 };
+    static const uint8_t cose[] = { 0xA5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20,
+                                    1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,
+                                    0x22, 0x58, 0x20,
+                                    1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32 };
+    seed("cbor", "attestation", att, sizeof att, NULL, 0);
+    seed("cbor", "cose-key", cose, sizeof cose, NULL, 0);
+    static const uint8_t misc[] = { 0x9F, 0x01, 0x82, 0x02, 0x03, 0xFF, 0xC1, 0x1A, 0x5F, 0x00, 0x00, 0x00, 0xF9, 0x3C, 0x00, 0x3B, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    seed("cbor", "kinds", misc, sizeof misc, NULL, 0);
+
+    seed_str("jwt", "es256", "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImxRY2pzNVBNV3RmeDdfVi1kSEFEQTNldWhHLUppb3BiOTJDNWhQclRtWU0ifQ"
+             ".eyJpc3MiOiJodHRwczovL2F1dGgub3BlbmNoaW1lLmlvIiwiYXVkIjoiYWNtZS5leGFtcGxlIiwic3ViIjoiZ29vZ2xlfDQyIiwiZXhwIjoxODAwMDAwMjAwLCJpYXQiOjE3OTk5OTk5OTB9"
+             ".AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    seed_str("jwt", "none", "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0.");
+
+    static const char cdata[] = "{\"type\":\"webauthn.create\",\"challenge\":\"Y2hhbGxlbmdl\",\"origin\":\"https://acme.example\",\"crossOrigin\":false}";
+    seed_two("webauthn", "register", cdata, strlen(cdata), att, sizeof att);
+    seed_two("idtoken", "token-jwks", "eyJhbGciOiJSUzI1NiIsImtpZCI6InIxIn0.eyJzdWIiOiIxMjM0In0.c2ln", 58, jwks, strlen(jwks));
 }
 
 int main(int argc, char **argv) {
@@ -316,6 +404,7 @@ int main(int argc, char **argv) {
     stream("small", small, 3, 0, 4000);
     stream("whole", whole, 1, 0, g_stream_len);
     stream("mixed", mixed, 4, 200, 8000);
+    preauth_seeds();
     printf("seeds: %d frames, 4 streams, into %s\n", g_written, g_dir);
     return g_failed ? 1 : 0;
 }

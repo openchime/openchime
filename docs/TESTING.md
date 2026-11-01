@@ -438,6 +438,19 @@ and its encoder to `tests/fuzz/seeds.c`.
 |---|---|---|
 | `frame` | `build/fuzz/frame` | `oc_parse_frame`, then every decoder on the parsed payload and on the raw bytes. A decoder may refuse, but must not crash, read outside its input, or answer anything but OK or MALFORMED. A parsed payload's view must stay inside the input. |
 | `framebuf` | `build/fuzz/framebuf` | `shared/framebuf.c`'s reassembly. The input's first bytes choose the chunk sizes the rest is pushed in, and every complete frame is drained after each push. A frame yielded must lie inside the buffer and agree with its own length prefix. |
+| `http` | `build/fuzz/http` | The HTTP request parser (`oc_http_parse_head`, `oc_http_parse`), the webhook text, and the header values static routes read. Every field is a view inside the request. |
+| `ws` | `build/fuzz/ws` | A browser's WebSocket frames (`oc_ws_parse`), one after another. Each frame's parts add up and lie inside the input. |
+| `proxy` | `build/fuzz/proxy` | The PROXY v2 header (`oc_proxy_v2_parse`). Its length lies inside the input, and the address is a string. |
+| `json` | `build/fuzz/json` | The JSON reader used at sign-in: every token read as a string, a number and a boolean, skipped, and searched. |
+| `cbor` | `build/fuzz/cbor` | The CBOR reader passkeys use: items one after another, read as each type and as maps. Strings and readers stay inside the input. |
+| `jwt` | `build/fuzz/jwt` | The central service's token (`oc_jwt_verify`) against a fixed key, and base64url decoding. A token nobody signed is never accepted. |
+| `webauthn` | `build/fuzz/webauthn` | A passkey's registration and sign-in, the input split into the browser's parts. A credential fits its bounds, and a sign-in without a key is never accepted. |
+| `idtoken` | `build/fuzz/idtoken` | A provider's ID token against a key set, the input split into the token and the JWKS. |
+
+A harness that takes several inputs reads them with `oc_fuzz_split`
+(`tests/fuzz/fuzz.h`): each part but the last is prefixed by its length, a
+big-endian u16. `tests/fuzz/http.dict` and `tests/fuzz/json.dict` are the text
+formats' dictionaries.
 
 **Prerequisites.** A clang with libFuzzer and the sanitizer runtimes: on
 Ubuntu, `clang` and `libclang-rt-18-dev` (or the version your clang is). Only

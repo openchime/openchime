@@ -2,6 +2,7 @@
 #define OC_HTTP_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* The daemon's HTTP stack (ARCH-32): parsing, routing and the response writer,
  * used by the I/O threads (ioloop.c) for every HTTP connection -- a webhook
@@ -138,5 +139,15 @@ int oc_http_etag_listed(const char *v, size_t n, const char *etag);
 
 /* The small fixed page an error status is answered with (text/plain). */
 const char *oc_http_error_body(int status, size_t *len);
+
+/* One client-to-server WebSocket frame (RFC 6455 §5) at the front of `buf`:
+ * OC_WS_FRAME with `out` filled (the opcode, the masking key's and the
+ * payload's offsets, the payload's length and the frame's whole length);
+ * OC_WS_MORE when more bytes are needed; OC_WS_REFUSE for a frame no browser
+ * sends -- reserved bits set, unmasked, or a payload over `max_len`. The
+ * payload is not unmasked: that is the caller's, in place. */
+enum { OC_WS_REFUSE = -1, OC_WS_MORE = 0, OC_WS_FRAME = 1 };
+typedef struct { int opcode, fin; size_t mask_off, payload_off, len, whole; } oc_ws_frame;
+int oc_ws_parse(const uint8_t *buf, size_t n, uint64_t max_len, oc_ws_frame *out);
 
 #endif /* OC_HTTP_H */

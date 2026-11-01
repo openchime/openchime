@@ -54,7 +54,7 @@ test-merge:
 	+@$(foreach p,$(if $(PART),$(PART),plain threads),$(MAKE) --no-print-directory test-merge-$(p) &&) true
 test-merge-plain:
 	+@$(MAKE) --no-print-directory $(FULL_SWITCHES) all linux build/e2e_client build/demo_client $(TEST_BIN) $(WEB_DIR)/openchime.js \
-	    build/fuzz/frame build/fuzz/framebuf
+	    $(patsubst %,build/fuzz/%,$(FUZZ_HARNESSES))
 	scripts/test/local/source.sh
 	scripts/test/merge/suites.sh
 	scripts/test/merge/static_link.sh $(BIN)
@@ -145,11 +145,24 @@ build/e2e_client: tests/e2e_client.c tests/testsignin.c $(SHARED_SRC) $(wildcard
 # on PATH (mk/toolchains.mk), and its clang has no Linux sanitizer runtimes.
 FUZZ_CC  ?= $(firstword $(wildcard /usr/bin/clang /usr/local/bin/clang) clang)
 FUZZ_LIB := tests/fuzz/decoders.c shared/protocol.c shared/framebuf.c
-build/fuzz/%: tests/fuzz/main.c tests/fuzz/%.c $(FUZZ_LIB) $(wildcard shared/*.h tests/fuzz/*.h) | build
+# What each harness links beyond FUZZ_LIB: the parser it fuzzes, and what that
+# needs. Every harness links mbedTLS; jsmn's implementation is daemon/jwt.c's.
+FUZZ_SRC_http     := daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/jwt.c daemon/json.c
+FUZZ_SRC_ws       := $(FUZZ_SRC_http)
+FUZZ_SRC_proxy    := daemon/proxyproto.c
+FUZZ_SRC_json     := daemon/json.c daemon/jwt.c
+FUZZ_SRC_cbor     := daemon/cbor.c
+FUZZ_SRC_jwt      := daemon/jwt.c daemon/json.c
+FUZZ_SRC_webauthn := daemon/webauthn.c daemon/cbor.c daemon/json.c daemon/jwt.c
+FUZZ_SRC_idtoken  := daemon/idtoken.c daemon/json.c daemon/jwt.c
+FUZZ_ALL_SRC := $(sort $(foreach h,$(FUZZ_HARNESSES),$(FUZZ_SRC_$(h))))
+build/fuzz/%: tests/fuzz/main.c tests/fuzz/%.c $(FUZZ_LIB) $(FUZZ_ALL_SRC) $(MBEDTLS_A) \
+              $(wildcard shared/*.h daemon/*.h tests/fuzz/*.h) | build
 	@mkdir -p $(dir $@)
 	$(FUZZ_CC) $(CFLAGS) -O1 -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
-	    -Ishared -Itests -DOC_FUZZ_TARGET=oc_fuzz_$* tests/fuzz/main.c tests/fuzz/$*.c \
-	    $(filter-out tests/fuzz/$*.c,$(FUZZ_LIB)) -o $@
+	    -Ishared -Idaemon -Itests -Ithird_party/jsmn -Ithird_party/picohttpparser -I$(MBEDTLS_INC) \
+	    -DOC_FUZZ_TARGET=oc_fuzz_$* tests/fuzz/main.c tests/fuzz/$*.c \
+	    $(filter-out tests/fuzz/$*.c,$(FUZZ_LIB)) $(FUZZ_SRC_$*) $(MBEDTLS_LIBS) -o $@
 # Writes one valid frame per message type, and a few streams of them, as the
 # harnesses' seed corpora (tests/fuzz/corpus/): build/fuzz/seeds <dir>.
 build/fuzz/seeds: tests/fuzz/seeds.c shared/protocol.c $(wildcard shared/*.h) | build

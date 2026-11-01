@@ -43,6 +43,14 @@ int run_fuzz_replay_tests(void) {
     static const struct { const char *name; int (*fn)(const uint8_t *, size_t); } H[] = {
         { "frame", oc_fuzz_frame },
         { "framebuf", oc_fuzz_framebuf },
+        { "http", oc_fuzz_http },
+        { "ws", oc_fuzz_ws },
+        { "proxy", oc_fuzz_proxy },
+        { "json", oc_fuzz_json },
+        { "cbor", oc_fuzz_cbor },
+        { "jwt", oc_fuzz_jwt },
+        { "webauthn", oc_fuzz_webauthn },
+        { "idtoken", oc_fuzz_idtoken },
     };
     int total = 0;
     for (size_t i = 0; i < sizeof H / sizeof H[0]; i++) {

@@ -76,7 +76,8 @@ APP_SRC  := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES
 # The fuzzing tier's harnesses and decoder list (tests/fuzz/fuzz.h): in the test
 # binary, which replays their corpora, and in each libFuzzer binary
 # (mk/tests.mk, build/fuzz/%). tests/fuzz/main.c and seeds.c are the tools'.
-FUZZ_HARNESS_SRC := tests/fuzz/decoders.c tests/fuzz/frame.c tests/fuzz/framebuf.c
+FUZZ_HARNESSES   := frame framebuf http ws proxy json cbor jwt webauthn idtoken
+FUZZ_HARNESS_SRC := tests/fuzz/decoders.c $(patsubst %,tests/fuzz/%.c,$(FUZZ_HARNESSES))
 TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/bench_loop.c tests/testsignin_main.c,$(wildcard tests/*.c)) \
             $(FUZZ_HARNESS_SRC)
 TEST_BIN := build/tests

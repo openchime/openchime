@@ -1,0 +1,4 @@
+GET /app.js HTTP/1.1
+Host: acme.example
+If-None-Match: "abc", W/"d"
+
