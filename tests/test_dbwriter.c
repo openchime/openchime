@@ -8984,6 +8984,66 @@ static void test_polls(void) {
     cleanup_db(path);
 }
 
+/* OPENCHIME_DEFAULT_CHANNELS (configuration, CONFIG.md): a new member joins the
+ * public, unarchived channels it names, whether their account came from local
+ * registration or an invitation; a name that is no such channel is skipped;
+ * an existing member is not moved. */
+static int is_in(const char *path, uint64_t cid, uint64_t uid) {
+    char sql[160];
+    snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM channel_members WHERE channel_id=?1 AND user_id=%llu;",
+             (unsigned long long)uid);
+    return e2e_scalar(path, sql, cid) == 1;
+}
+static void test_default_channels(void) {
+    const char *path = tdb("defchan.db");
+    cleanup_db(path);
+    char err[256];
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t owner = reg(w, "dc-owner", "pw", OC_ROLE_OWNER);
+    uint64_t early = reg(w, "dc-early", "pw", OC_ROLE_MEMBER);
+    oc_dbres *cr = create_channel(w, owner, "announcements", 1);
+    uint64_t ann = cr ? cr->channel_id : 0;
+    oc_dbres_free(cr);
+    cr = create_channel(w, owner, "old-news", 1);
+    uint64_t old = cr ? cr->channel_id : 0;
+    oc_dbres_free(cr);
+    cr = create_channel(w, owner, "secret", 0);
+    uint64_t sec = cr ? cr->channel_id : 0;
+    oc_dbres_free(cr);
+    CHECK(ann && old && sec);
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_busy_timeout(db, 5000);
+    char upd[128];
+    snprintf(upd, sizeof upd, "UPDATE channels SET archived_at_ms=1 WHERE id=%llu;", (unsigned long long)old);
+    CHECK(sqlite3_exec(db, upd, NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+
+    setenv("OPENCHIME_DEFAULT_CHANNELS", " #announcements, old-news,secret,nowhere ", 1);
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    uint64_t newbie = reg(w, "dc-newbie", "pw", OC_ROLE_MEMBER);
+    CHECK(newbie && is_in(path, ann, newbie));
+    CHECK(!is_in(path, old, newbie));      /* archived */
+    CHECK(!is_in(path, sec, newbie));      /* private */
+    CHECK(early && !is_in(path, ann, early));   /* an existing member is not moved */
+
+    oc_dbres *r = invite_user(w, owner, OC_ROLE_MEMBER);
+    CHECK(r && r->type == OC_RES_INVITE_OK);
+    uint8_t tok[OC_INVITE_TOKEN_LEN];
+    if (r) memcpy(tok, r->session_token, OC_INVITE_TOKEN_LEN);
+    oc_dbres_free(r);
+    r = redeem_invite(w, tok, "dc-invited", "dc-invited-pass");
+    uint64_t invited = (r && r->type == OC_RES_AUTH_OK) ? r->user_id : 0;
+    oc_dbres_free(r);
+    CHECK(invited && is_in(path, ann, invited));
+
+    unsetenv("OPENCHIME_DEFAULT_CHANNELS");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
@@ -9034,6 +9094,7 @@ int run_dbwriter_tests(void) {
     test_badge_matches_evaluator();
     test_search();
     test_search_filters_and_paging();
+    test_default_channels();
     test_search_orders();
     test_setup_invite();
     test_remove_user_integrations();

@@ -411,6 +411,10 @@ typedef struct {
     /* Read-aloud (REQ-291-295, ARCH-111), from TTS_INFO after auth and replaced
      * on every reconnect. Without it a frontend shows nothing of the feature. */
     char     capabilities[256];         /* the daemon's feature names, comma separated */
+    /* The workspace's settings (WORKSPACE_SETTINGS), read-only: what the
+     * daemon's configuration tells clients, replaced whole at each sign-in.
+     * Read with oc_model_workspace_setting. */
+    char    *ws_settings;               /* heap: "key\x1fvalue\x1e..." as it came */
     uint8_t  n_voices;
     /* Wide enough for the whole string. It was 64 while the daemon sent 71
      * characters, so this silently held a truncated version -- harmless only
@@ -1079,6 +1083,9 @@ void oc_model_line(const oc_model *m, uint64_t author_id, const char *name, int 
 void oc_model_msg_preview(const oc_model *m, const oc_msg *msg, char *out, size_t cap);
 /* "m:ss" for a duration in milliseconds (h:mm:ss past an hour). */
 void oc_model_format_duration(uint32_t ms, char *out, size_t cap);
+/* A workspace setting by key ("default_channels"), as the daemon told it,
+ * into `out`; returns 1, or 0 (and "") when the daemon did not tell it. */
+int oc_model_workspace_setting(const oc_model *m, const char *key, char *out, size_t cap);
 
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);

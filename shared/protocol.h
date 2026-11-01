@@ -569,6 +569,7 @@ typedef enum {
     OC_MSG_LIST_POLL_VOTERS     = 0x0112, /* C->S, who picked what */
     OC_MSG_POLL_VOTERS          = 0x0113, /* S->C, the answer; refused for an anonymous poll */
     OC_MSG_EDIT_POLL            = 0x0114, /* C->S, the author changes a poll: options and settings until the first vote */
+    OC_MSG_WORKSPACE_SETTINGS   = 0x0119, /* S->C, read-only: the workspace settings clients act on, after WORKSPACE_INFO */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -1621,6 +1622,12 @@ typedef struct { oc_slice model_version; uint8_t count;
 #define OC_CAP_PDM "pdm" /* private DMs, end to end between two devices (PRIVATE-DM.md) */
 #define OC_CAP_POLLS "polls" /* post a poll and vote in one (REQ-225) */
 typedef struct { uint8_t count; oc_slice names[OC_CAP_MAX]; } oc_capabilities;
+/* The workspace's settings as clients are told them, read-only: each a key and
+ * its effective value. They are the daemon's configuration (CONFIG.md, the
+ * client-visible rows), set by the control plane or the operator; no frame
+ * changes one. Sent at sign-in after WORKSPACE_INFO. */
+#define OC_WS_SETTINGS_MAX 64
+typedef struct { uint8_t count; oc_slice keys[OC_WS_SETTINGS_MAX]; oc_slice values[OC_WS_SETTINGS_MAX]; } oc_workspace_settings;
 typedef struct { uint64_t message_id; } oc_audio_get;
 /* Hear voice `voice_id` (an id TTS_INFO listed) say TTS_INFO's preview sentence.
  * Answered by AUDIO_INFO/AUDIO_CHUNK/AUDIO_END for message_id 0. */
@@ -2015,6 +2022,7 @@ oc_result oc_encode_audio_info(oc_wbuf *w, uint16_t version, const oc_audio_info
 oc_result oc_encode_audio_chunk(oc_wbuf *w, uint16_t version, const oc_audio_chunk *m);
 oc_result oc_encode_audio_end(oc_wbuf *w, uint16_t version, const oc_audio_end *m);
 oc_result oc_encode_capabilities(oc_wbuf *w, uint16_t version, const oc_capabilities *m);
+oc_result oc_encode_workspace_settings(oc_wbuf *w, uint16_t version, const oc_workspace_settings *m);
 oc_result oc_encode_voice_preview_get(oc_wbuf *w, uint16_t version, const oc_voice_preview_get *m);
 oc_result oc_encode_stt_info(oc_wbuf *w, uint16_t version, const oc_stt_info *m);
 oc_result oc_encode_stt_begin(oc_wbuf *w, uint16_t version, const oc_stt_begin *m);
@@ -2229,6 +2237,7 @@ oc_result oc_decode_audio_info(oc_rbuf *p, oc_audio_info *m);
 oc_result oc_decode_audio_chunk(oc_rbuf *p, oc_audio_chunk *m);
 oc_result oc_decode_audio_end(oc_rbuf *p, oc_audio_end *m);
 oc_result oc_decode_capabilities(oc_rbuf *p, oc_capabilities *m);
+oc_result oc_decode_workspace_settings(oc_rbuf *p, oc_workspace_settings *m);
 oc_result oc_decode_voice_preview_get(oc_rbuf *p, oc_voice_preview_get *m);
 oc_result oc_decode_stt_info(oc_rbuf *p, oc_stt_info *m);
 oc_result oc_decode_stt_begin(oc_rbuf *p, oc_stt_begin *m);

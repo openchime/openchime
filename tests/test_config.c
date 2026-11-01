@@ -306,6 +306,32 @@ static void test_max_video_size(void) {
     refuses_removed("OPENCHIME_MAX_VIDEO_MESSAGE_SIZE", "167772160", "OPENCHIME_MAX_VIDEO_SIZE");
 }
 
+/* The workspace settings clients are told (CFG_VISIBLE): exactly the rows
+ * marked so, by their key, with the effective value; never a secret. */
+static void test_visible(void) {
+    char key[64], val[256];
+    setenv("OPENCHIME_DEFAULT_CHANNELS", "announcements,help", 1);
+    accepts("OPENCHIME_WORKSPACE_NAME", "Acme");
+    int saw_name = 0, saw_chan = 0;
+    size_t n = 0;
+    for (size_t i = 0; oc_config_visible(i, key, sizeof key, val, sizeof val); i++, n++) {
+        if (!strcmp(key, "workspace_name")) saw_name = !strcmp(val, "Acme");
+        if (!strcmp(key, "default_channels")) saw_chan = !strcmp(val, "announcements,help");
+    }
+    CHECK(saw_name && saw_chan);
+    size_t marked = 0;
+    for (const cfg_row *r = OC_CFG; r->name; r++) {
+        if (!(r->flags & CFG_VISIBLE)) continue;
+        marked++;
+        CHECK(!(r->flags & CFG_SECRET));
+    }
+    CHECK(n == marked);
+    unsetenv("OPENCHIME_DEFAULT_CHANNELS");
+    accepts("OPENCHIME_WORKSPACE_NAME", "x");
+    for (size_t i = 0; oc_config_visible(i, key, sizeof key, val, sizeof val); i++)
+        if (!strcmp(key, "default_channels")) CHECK(val[0] == '\0');
+}
+
 /* Load with `mode` as OPENCHIME_MODE and `name=value` set. */
 static int load_in_mode(const char *mode, const char *name, const char *value, char *err, size_t cap) {
     setenv("OPENCHIME_MODE", mode, 1);
@@ -409,7 +435,7 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 22);     /* OPENCHIME_MODE among them */
+    CHECK(operator_rows == 23);     /* OPENCHIME_MODE among them */
     CHECK(managed_rows == 7);
     CHECK(dev_rows == 4 + 12);      /* the daemon's four, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);
@@ -458,7 +484,7 @@ static void test_env_file(void) {
 int run_config_tests(void) {
     printf("test_config: strict numbers, bools and enums; unknown and removed names; the structured values; "
            "the cross-row rules; the data directory; the constants; the mode; reload; the registry's "
-           "own consistency; the EnvironmentFile\n");
+           "own consistency; the EnvironmentFile; what clients are told\n");
     char err[512];
     CHECK(oc_config_load(err, sizeof err) == 0);
     test_numbers();
@@ -468,6 +494,7 @@ int run_config_tests(void) {
     test_cross_rules();
     test_data_dir();
     test_constants();
+    test_visible();
     test_max_video_size();
     test_mode();
     test_reload_and_registry();

@@ -2217,6 +2217,30 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 }
                 xfer_reset(x);
             }
+        } else if (hdr.msg_type == OC_MSG_WORKSPACE_SETTINGS) {
+            /* Read-only, all of them at once: packed for the model as
+             * "key\x1fvalue\x1e...". A value holding either separator could
+             * not come from an environment variable, and is cut at it. */
+            oc_workspace_settings ws;
+            if (oc_decode_workspace_settings(&p, &ws) != OC_OK) return -1;
+            size_t need = 1;
+            for (uint8_t i = 0; i < ws.count; i++) need += ws.keys[i].len + ws.values[i].len + 2;
+            oc_ev *e = oc_ev_new(OC_EV_WORKSPACE_SETTINGS);
+            if (e && (e->body = malloc(need)) != NULL) {
+                size_t o = 0;
+                for (uint8_t i = 0; i < ws.count; i++) {
+                    for (size_t k = 0; k < ws.keys[i].len && ws.keys[i].ptr[k] != 0x1f && ws.keys[i].ptr[k] != 0x1e; k++)
+                        e->body[o++] = (char)ws.keys[i].ptr[k];
+                    e->body[o++] = '\x1f';
+                    for (size_t k = 0; k < ws.values[i].len && ws.values[i].ptr[k] != 0x1f && ws.values[i].ptr[k] != 0x1e; k++)
+                        e->body[o++] = (char)ws.values[i].ptr[k];
+                    e->body[o++] = '\x1e';
+                }
+                e->body[o] = '\0';
+                oc_queue_push(to_ui, e);
+            } else if (e) {
+                oc_ev_free(e);
+            }
         } else if (hdr.msg_type == OC_MSG_CAPABILITIES) {
             oc_capabilities caps;
             if (oc_decode_capabilities(&p, &caps) != OC_OK) return -1;

@@ -112,6 +112,7 @@ typedef struct {
     oc_deploy_mode deployment_mode;     /* derived (above) */
     const char *workspace_name;         /* "" ⇒ a client derives one from the host */
     const char *workspace_address;      /* OPENCHIME_MANAGED_ADDRESS; "" ⇒ clients keep what they dialled */
+    const char *default_channels;       /* OPENCHIME_DEFAULT_CHANNELS: public channel names a new member joins */
 
     /* OPENCHIME_DATA_DIR and its layout: everything the daemon keeps, under one
      * directory, at fixed names. */
@@ -228,6 +229,9 @@ int oc_config_apply_env_file(const char *path, char *err, size_t errcap);
 /* Print every row's effective value and its source (default, environment, file)
  * to `out`, after a load; secrets are shown as `(set)`. */
 void oc_config_report(void *out /* FILE* */);
+/* The workspace settings clients are told (CFG_VISIBLE rows), read-only: the
+ * i-th one's key and effective value. Returns 1, or 0 past the last. */
+int oc_config_visible(size_t i, char *key, size_t kcap, char *val, size_t vcap);
 
 /* CONFIG.md's reference section, as markdown, from the registry. */
 void oc_config_print_reference(void *out /* FILE* */);

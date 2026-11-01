@@ -718,6 +718,46 @@ int oc_config_apply_env_file(const char *path, char *err, size_t errcap) {
 
 /* --- the views --------------------------------------------------------------------- */
 
+/* A stored row's effective value as an operator would write it. */
+static void row_value(const oc_config *c, const cfg_row *r, char *val, size_t cap) {
+    const void *p = (const char *)c + r->off;
+    val[0] = '\0';
+    switch (r->kind) {
+    case CFG_STR: case CFG_PATH: {
+        const char *s = *(const char *const *)p;
+        snprintf(val, cap, "%s", s ? s : "");
+        break; }
+    case CFG_INT:  snprintf(val, cap, "%d", *(const int *)p); break;
+    case CFG_U64:  snprintf(val, cap, "%llu", (unsigned long long)*(const uint64_t *)p); break;
+    case CFG_BOOL: snprintf(val, cap, "%s", *(const int *)p ? "on" : "off"); break;
+    case CFG_ENUM: {
+        int idx = *(const int *)p, k = 0;
+        const char *e = r->enums;
+        while (e && k < idx) { e = strchr(e, '|'); if (e) e++; k++; }
+        if (e) { const char *bar = strchr(e, '|'); snprintf(val, cap, "%.*s", bar ? (int)(bar - e) : (int)strlen(e), e); }
+        break; }
+    default: break;
+    }
+}
+
+int oc_config_visible(size_t i, char *key, size_t kcap, char *val, size_t vcap) {
+    size_t n = 0;
+    for (const cfg_row *r = OC_CFG; r->name; r++) {
+        /* Never a secret, a client's own, a structured or a patterned row: what
+         * clients are told is a plain value under one name. */
+        if (!(r->flags & CFG_VISIBLE) || (r->flags & (CFG_SECRET | CFG_CLIENT | CFG_PATTERN)) ||
+            r->kind == CFG_CUSTOM) continue;
+        if (n++ != i) continue;
+        const char *nm = strncmp(r->name, "OPENCHIME_", 10) == 0 ? r->name + 10 : r->name;
+        size_t k = 0;
+        for (; nm[k] && k + 1 < kcap; k++) key[k] = (char)tolower((unsigned char)nm[k]);
+        key[k] = '\0';
+        row_value(&g_cfg, r, val, vcap);
+        return 1;
+    }
+    return 0;
+}
+
 void oc_config_report(void *out_) {
     FILE *out = out_;
     const oc_config *c = &g_cfg;
@@ -786,7 +826,17 @@ static void print_group(FILE *out, const char *group, cfg_class cls) {
             snprintf(range, sizeof range, " One of `%s`.", r->enums);
             for (char *p = range; *p; p++) if (*p == '|') { memmove(p + 4, p + 1, strlen(p)); memcpy(p, "`, `", 4); p += 3; }
         }
-        fprintf(out, "| `%s` | %s | %s%s |\n", name, dflt, r->doc, range);
+        /* What clients are told, read-only, on WORKSPACE_SETTINGS, by its key. */
+        char shown[128] = "";
+        if (r->flags & CFG_VISIBLE) {
+            char key[64];
+            size_t k = 0;
+            for (const char *q = name + (strncmp(name, "OPENCHIME_", 10) ? 0 : 10); *q && k + 1 < sizeof key; q++)
+                key[k++] = (char)tolower((unsigned char)*q);
+            key[k] = '\0';
+            snprintf(shown, sizeof shown, " Clients are told it, read-only, as `%s`.", key);
+        }
+        fprintf(out, "| `%s` | %s | %s%s%s |\n", name, dflt, r->doc, range, shown);
     }
 }
 

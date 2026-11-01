@@ -1657,6 +1657,17 @@ file itself from the message's text. What the wire carries is therefore the
 download shape without the upload half, keyed by the **message** id the client
 already has.
 
+**`WORKSPACE_SETTINGS` (S → C), `0x0119`** `{ count: u8, count × (key: str,
+value: str) }` — the workspace's settings, **read-only**, sent once to every
+client at sign-in, after `WORKSPACE_INFO`. They are the daemon's configuration,
+the rows CONFIG.md marks "Clients are told it": each `key` is the variable's name
+without `OPENCHIME_`, lower-cased, and `value` its effective value as an operator
+writes it (empty when unset). Workspace settings are set by the control plane or
+the operator and take effect when the daemon restarts; no frame changes one, so
+nothing is sent while the daemon runs. A client acts on what it is told; the
+daemon enforces whatever it must. At most 64; more is refused as malformed. A
+client ignores a key it does not know.
+
 **`CAPABILITIES` (S → C), `0x00E1`** `{ count: u8, count × name: str }` — the
 features this daemon offers, by name, sent once to every client just after
 `SERVER_BUILD` (§4.3c) and before the frames that describe any feature. A name present
@@ -3408,6 +3419,7 @@ this table cannot silently gain a shared value.
 | `0x0112` | `LIST_POLL_VOTERS` | C → S | who picked what on a poll |
 | `0x0113` | `POLL_VOTERS` | S → C | the answer; refused for an anonymous poll |
 | `0x0114` | `EDIT_POLL` | C → S | the author changes a poll: options and settings until the first vote, the deadline always |
+| `0x0119` | `WORKSPACE_SETTINGS` | S → C | read-only: the workspace's settings clients act on, after `WORKSPACE_INFO` |
 
 ## 10. Connection state machine
 

@@ -343,6 +343,7 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
         if (hdr->msg_type != OC_MSG_PRESENCE_UPDATE &&
             hdr->msg_type != OC_MSG_TYPING_UPDATE &&
             hdr->msg_type != OC_MSG_WORKSPACE_INFO &&
+            hdr->msg_type != OC_MSG_WORKSPACE_SETTINGS &&
             hdr->msg_type != OC_MSG_SERVER_BUILD &&
             hdr->msg_type != OC_MSG_CAPABILITIES &&
             hdr->msg_type != OC_MSG_TTS_INFO &&
@@ -394,6 +395,10 @@ static _Atomic int g_auth_polls;       /* ... and "polls" (REQ-225) */
 static oc_alerts_summary g_auth_alerts;   /* what the last owner's or admin's sign-in was told */
 /* Sign `c` in as a person does (AUTH.md §8.10): the page, then the token on
  * AUTH; the post-auth pushes drained, so the stream is positional after. */
+/* The last sign-in's WORKSPACE_SETTINGS: up to 8 key/value pairs. */
+static char g_auth_settings[8][2][128];
+static int  g_auth_settings_n;
+
 static int do_auth(client *c, const char *user, const char *pass, uint64_t *user_id) {
     char tok[OC_TEST_TOKEN_CAP], ver[OC_TEST_VERIFIER_CAP], why[256];
     if (oc_test_signin("127.0.0.1", c->port, c->pin, user, pass,
@@ -416,6 +421,19 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
          * default here, as nothing sets OPENCHIME_MAX_VIDEO_SIZE (REQ-164). */
         oc_workspace_info wi;
         if (oc_decode_workspace_info(&p, &wi) != OC_OK || wi.max_video_size != 160ull * 1024 * 1024) return -1;
+    }
+    /* Then the workspace's settings, read-only (CONFIG.md's client-visible
+     * rows), kept for the test that checks them. */
+    if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_WORKSPACE_SETTINGS) return -1;
+    {
+        oc_workspace_settings ws;
+        if (oc_decode_workspace_settings(&p, &ws) != OC_OK) return -1;
+        g_auth_settings_n = 0;
+        for (uint8_t k = 0; k < ws.count && k < 8; k++) {
+            snprintf(g_auth_settings[k][0], sizeof g_auth_settings[k][0], "%.*s", (int)ws.keys[k].len, (const char *)ws.keys[k].ptr);
+            snprintf(g_auth_settings[k][1], sizeof g_auth_settings[k][1], "%.*s", (int)ws.values[k].len, (const char *)ws.values[k].ptr);
+            g_auth_settings_n++;
+        }
     }
     /* Then which build the daemon is (About in a client): always, and never empty. */
     if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_SERVER_BUILD) return -1;
@@ -1646,6 +1664,17 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
     CHECK(do_handshake(&a) == 0);
     uint64_t ua = 0;
     CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    /* The workspace's settings came right after WORKSPACE_INFO (do_auth reads
+     * them there), read-only, with the configured values: the name, and the
+     * default channels, empty here. */
+    {
+        int name = 0, chans = 0;
+        for (int k = 0; k < g_auth_settings_n; k++) {
+            if (!strcmp(g_auth_settings[k][0], "workspace_name")) name = 1;
+            if (!strcmp(g_auth_settings[k][0], "default_channels")) chans = g_auth_settings[k][1][0] == '\0';
+        }
+        CHECK(name && chans);
+    }
 
     /* The capability is told at auth, with the stub's voices. */
     {
@@ -1663,7 +1692,7 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
         oc_header hdr;
         oc_rbuf p;
         int saw = 0, saw_caps = 0;
-        for (int i = 0; i < 5 && !saw; i++) {
+        for (int i = 0; i < 8 && !saw; i++) {   /* AUTH_OK's followers, TTS_INFO among them */
             CHECK(read_frame_raw(&cap, &hdr, &p) == 0);
             if (hdr.msg_type == OC_MSG_CAPABILITIES) {
                 /* Read-aloud and voice input are both running (stub engines),

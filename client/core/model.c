@@ -258,10 +258,28 @@ void oc_model_pdm_forget(oc_model *m, uint64_t id) {
         }
 }
 
+int oc_model_workspace_setting(const oc_model *m, const char *key, char *out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    if (!m || !key || !m->ws_settings) return 0;
+    size_t kl = strlen(key);
+    for (const char *p = m->ws_settings; *p; ) {
+        const char *end = strchr(p, '\x1e');
+        if (!end) end = p + strlen(p);
+        const char *sep = memchr(p, '\x1f', (size_t)(end - p));
+        if (sep && (size_t)(sep - p) == kl && memcmp(p, key, kl) == 0) {
+            if (out && cap) snprintf(out, cap, "%.*s", (int)(end - sep - 1), sep + 1);
+            return 1;
+        }
+        p = *end ? end + 1 : end;
+    }
+    return 0;
+}
+
 void oc_model_free(oc_model *m) {
     memset(m->pdms, 0, sizeof m->pdms);
     m->n_pdms = 0;
     free(m->sum_notices);
+    free(m->ws_settings);
     free(m->chanmem_via);
     for (size_t i = 0; i < m->n_groups; i++) free(m->groups[i]);
     free(m->groups);
@@ -1888,6 +1906,11 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     }
     case OC_EV_CAPABILITIES:
         snprintf(m->capabilities, sizeof m->capabilities, "%s", e->body ? e->body : "");
+        break;
+    case OC_EV_WORKSPACE_SETTINGS:
+        free(m->ws_settings);
+        m->ws_settings = e->body;      /* taken: replaced whole, as the daemon sent it */
+        e->body = NULL;
         break;
     case OC_EV_TTS_BEGIN:
         /* Replaces what we knew: the daemon says this again on every reconnect,

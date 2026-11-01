@@ -1438,6 +1438,27 @@ static void test_table_preview(void) {
     oc_model_free(&m);
 }
 
+/* The workspace's settings (WORKSPACE_SETTINGS): held as told, read by key,
+ * replaced whole by the next. */
+static void test_workspace_settings_model(void) {
+    oc_model m; oc_model_init(&m);
+    char v[64];
+    CHECK(oc_model_workspace_setting(&m, "default_channels", v, sizeof v) == 0 && v[0] == '\0');
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_WORKSPACE_SETTINGS;
+    e.body = strdup("workspace_name\x1f" "Acme\x1e" "default_channels\x1f" "announcements,help\x1e");
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_workspace_setting(&m, "workspace_name", v, sizeof v) == 1 && !strcmp(v, "Acme"));
+    CHECK(oc_model_workspace_setting(&m, "default_channels", v, sizeof v) == 1 && !strcmp(v, "announcements,help"));
+    CHECK(oc_model_workspace_setting(&m, "default", v, sizeof v) == 0);   /* a prefix is not a key */
+    memset(&e, 0, sizeof e); e.type = OC_EV_WORKSPACE_SETTINGS;
+    e.body = strdup("workspace_name\x1f\x1e");
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_workspace_setting(&m, "workspace_name", v, sizeof v) == 1 && v[0] == '\0');
+    CHECK(oc_model_workspace_setting(&m, "default_channels", v, sizeof v) == 0);
+    oc_model_free(&m);
+}
+
 static void test_poll_model(void) {
     oc_model m; oc_model_init(&m);
     oc_ev e;
@@ -5181,6 +5202,7 @@ int run_client_core_tests(void) {
     test_restore_model();
     test_poll_model();
     test_table_preview();
+    test_workspace_settings_model();
     test_badge_tiers();
     test_osnotify_null();
     test_feedback();

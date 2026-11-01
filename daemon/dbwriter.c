@@ -842,6 +842,34 @@ static size_t local_subject(char *buf, size_t cap, const char *username, size_t 
 static int membership_sync(sqlite3 *db, uint64_t channel_id, uint64_t user_id, int direct);
 static uint64_t *ids_of(sqlite3 *db, const char *sql, uint64_t a, size_t *n_out);
 
+/* The public, unarchived channels OPENCHIME_DEFAULT_CHANNELS names, by name:
+ * `user_id` joins each (a new member); with `report` set, each name that
+ * matches none is said in the log instead (once, at start). */
+static void join_default_channels(sqlite3 *db, uint64_t user_id, int report) {
+    const char *list = oc_config_get()->default_channels;
+    if (!list || !list[0]) return;
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", list);
+    for (char *save = NULL, *nm = strtok_r(buf, ",", &save); nm; nm = strtok_r(NULL, ",", &save)) {
+        while (*nm == ' ' || *nm == '#') nm++;
+        size_t l = strlen(nm);
+        while (l && nm[l - 1] == ' ') nm[--l] = '\0';
+        if (!l) continue;
+        sqlite3_stmt *st = NULL;
+        uint64_t cid = 0;
+        sqlite3_prepare_v2(db, "SELECT id FROM channels WHERE kind='channel' AND name=?1 AND is_public=1 "
+                               "AND archived_at_ms IS NULL;", -1, &st, NULL);
+        sqlite3_bind_text(st, 1, nm, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) cid = (uint64_t)sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+        if (report) {
+            if (!cid) fprintf(stderr, "openchimed: OPENCHIME_DEFAULT_CHANNELS: no public channel named %s; it is skipped\n", nm);
+        } else if (cid) {
+            membership_sync(db, cid, user_id, 1);
+        }
+    }
+}
+
 static void ensure_default_membership(sqlite3 *db, uint64_t user_id) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
@@ -11177,6 +11205,9 @@ static void *writer_loop(void *arg) {
         w->auth_deferred = 0;
         g_joined_uid = 0;
         oc_dbres *r = process_write(w, j);
+        /* A new member joins the workspace's default channels, whichever way
+         * their account was made (OPENCHIME_DEFAULT_CHANNELS). */
+        if (g_joined_uid) join_default_channels(w->db, g_joined_uid, 0);
         /* A member who did not exist before this job: their roster row rides on
          * its result, for everyone connected, whatever the job answers. */
         if (g_joined_uid && r && !r->ulist) {
@@ -11915,6 +11946,7 @@ oc_dbwriter *oc_dbwriter_start_boot(const char *path, oc_dbwriter_boot *b) {
         sqlite3_free(err); goto fail;
     }
     if (schema_before < 60) index_mentions(w->db);
+    join_default_channels(w->db, 0, 1);   /* a default channel that is not one, said once */
     /* An encrypted DM's keys were on its two devices, joined through the daemon
      * that stopped: none still open can go on, so each is closed now, and the
      * maintenance pass removes it a day later (PRIVATE-DM.md). */

@@ -2241,6 +2241,14 @@ oc_result oc_encode_capabilities(oc_wbuf *w, uint16_t version, const oc_capabili
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_workspace_settings(oc_wbuf *w, uint16_t version, const oc_workspace_settings *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_WORKSPACE_SETTINGS);
+    uint8_t n = m->count > OC_WS_SETTINGS_MAX ? OC_WS_SETTINGS_MAX : m->count;
+    oc_w_u8(w, n);
+    for (uint8_t i = 0; i < n; i++) { oc_w_str(w, m->keys[i]); oc_w_str(w, m->values[i]); }
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_voice_preview_get(oc_wbuf *w, uint16_t version, const oc_voice_preview_get *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_VOICE_PREVIEW_GET);
     oc_w_str(w, m->voice_id);
@@ -3418,6 +3426,15 @@ oc_result oc_decode_capabilities(oc_rbuf *p, oc_capabilities *m) {
     if (n > OC_CAP_MAX) return OC_E_MALFORMED;
     m->count = n;
     for (uint8_t i = 0; i < n; i++) m->names[i] = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_workspace_settings(oc_rbuf *p, oc_workspace_settings *m) {
+    memset(m, 0, sizeof *m);
+    uint8_t n = oc_r_u8(p);
+    if (n > OC_WS_SETTINGS_MAX) return OC_E_MALFORMED;
+    m->count = n;
+    for (uint8_t i = 0; i < n; i++) { m->keys[i] = oc_r_str(p); m->values[i] = oc_r_str(p); }
     return r_done(p);
 }
 

@@ -6147,6 +6147,25 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (!conns[fd]) break;   /* dropped on the WORKSPACE_INFO write */
 
+            /* The workspace's settings, read-only: the configuration rows
+             * marked for clients (CFG_VISIBLE). Set by the control plane or
+             * the operator, so they cannot change while this daemon runs. */
+            {
+                static char keys[OC_WS_SETTINGS_MAX][64], vals[OC_WS_SETTINGS_MAX][1024];
+                oc_workspace_settings ws;
+                memset(&ws, 0, sizeof ws);
+                for (size_t i = 0; i < OC_WS_SETTINGS_MAX &&
+                     oc_config_visible(i, keys[i], sizeof keys[i], vals[i], sizeof vals[i]); i++) {
+                    ws.keys[i] = oc_slice_str(keys[i]);
+                    ws.values[i] = oc_slice_str(vals[i]);
+                    ws.count++;
+                }
+                oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+                oc_encode_workspace_settings(&w, OC_PROTOCOL_VERSION, &ws);
+                send_bytes(ep, conns, fd, g_enc, w.len);
+                if (!conns[fd]) break;
+            }
+
             /* Where the workspace is now, when the deployment says: a client that
              * dialled a former address files its workspace under this one. */
             if (cfg->workspace_address && cfg->workspace_address[0]) {

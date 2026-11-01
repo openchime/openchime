@@ -2386,6 +2386,25 @@ static void test_tts_frames(void) {
         oc_capabilities out;
         CHECK(oc_decode_capabilities(&p, &out) == OC_OK && out.count == 0);
     }
+    {   /* The workspace's settings, read-only: keys and values, in order. */
+        oc_workspace_settings in;
+        memset(&in, 0, sizeof in);
+        in.count = 2;
+        in.keys[0] = oc_slice_str("workspace_name");   in.values[0] = oc_slice_str("Acme");
+        in.keys[1] = oc_slice_str("default_channels"); in.values[1] = oc_slice_str("");
+        ROUNDTRIP(oc_encode_workspace_settings(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WORKSPACE_SETTINGS, h, p);
+        oc_workspace_settings out;
+        CHECK(oc_decode_workspace_settings(&p, &out) == OC_OK && out.count == 2);
+        CHECK(slice_eq_str(out.keys[0], "workspace_name") && slice_eq_str(out.values[0], "Acme"));
+        CHECK(slice_eq_str(out.keys[1], "default_channels") && out.values[1].len == 0);
+    }
+    {   /* More settings than the frame holds is refused. */
+        uint8_t payload[] = { OC_WS_SETTINGS_MAX + 1 };
+        oc_rbuf pr;
+        oc_rbuf_init(&pr, payload, sizeof payload);
+        oc_workspace_settings out;
+        CHECK(oc_decode_workspace_settings(&pr, &out) != OC_OK);
+    }
     {
         /* More names than the frame holds is refused, as TTS_INFO's voices are. */
         uint8_t payload[] = { OC_CAP_MAX + 1 };

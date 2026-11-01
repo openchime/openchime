@@ -43,7 +43,8 @@ const cfg_row OC_CFG[] = {
     /* --- Settings: no feature behind them, a value an operator chooses -------- */
     /* First: the mode decides whether the development rows below may be read. */
     ENUM("OPENCHIME_MODE", CFG_OPERATOR, G_SET, "normal", "normal|development|demo", "What the box is for: `normal` (a deployment), `development` (the tests and harnesses; the only mode that reads the Development rows) or `demo` (the public demo workspace).", mode),
-    STR("OPENCHIME_WORKSPACE_NAME", CFG_OPERATOR, G_SET, "", "The workspace's display name, shown to clients; unset, a client derives one from the host.", F(workspace_name), NULL, 0, 0),
+    STR("OPENCHIME_WORKSPACE_NAME", CFG_OPERATOR, G_SET, "", "The workspace's display name, shown to clients; unset, a client derives one from the host.", F(workspace_name), NULL, CFG_VISIBLE, 0),
+    STR("OPENCHIME_DEFAULT_CHANNELS", CFG_OPERATOR, G_SET, "", "Public channels, by name and comma-separated, that a new member joins when their account is made, beside #general. A name that matches no public, unarchived channel is skipped, said once in the log at start.", F(default_channels), NULL, CFG_VISIBLE, 0),
     U64("OPENCHIME_MAX_VIDEO_SIZE", CFG_OPERATOR, G_SET, "167772160", 1048576, (int64_t)OC_MAX_ATTACHMENT_SIZE, "The most bytes one video message may hold (REQ-164), at most the attachment cap of 209715200; clients learn it at sign-in and record within it. 160 MiB by default.", max_video_size),
     PATHR("OPENCHIME_DATA_DIR", CFG_OPERATOR, G_SET, "/data", "Where the daemon keeps everything: `openchime.db`, `identity/`, `blobs/`, `cert.pem`, `key.pem`, `summary/`. The packages set `/var/lib/openchime`.", F(data_dir), NULL, 0, 0),
     INT("OPENCHIME_PORT", CFG_OPERATOR, G_SET, "8443", 1, 65535, "The TLS port the protocol, the web client and the sign-in pages are served on, and the UDP port calls use (443 for a real deployment, ARCH-54).", proto_port),
