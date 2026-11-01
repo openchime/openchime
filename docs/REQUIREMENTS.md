@@ -393,9 +393,14 @@ where one exists.
   server-assigned timestamp distinct from any client-supplied send time.
 - **REQ-051.** A user has been able to edit their own message after sending
   it. An edited message has carried a visible "edited" marker and has
-  retained its original send timestamp and position in history.
+  retained its original send timestamp and position in history. The workspace's
+  configuration may limit it (`OPENCHIME_EDIT_WINDOW`: `never`, or seconds
+  after sending; by default always), which the daemon enforces and clients
+  are told.
 - **REQ-052.** A user has been able to delete their own message after
-  sending it. Deletion has produced a tombstone record (author, timestamp,
+  sending it, within the window the workspace's configuration sets
+  (`OPENCHIME_DELETE_WINDOW`, by default always); an admin's or owner's
+  delete of someone else's message (REQ-032) is never limited. Deletion has produced a tombstone record (author, timestamp,
   and thread linkage preserved; body removed) rather than removing the row,
   so that thread reply counts and quoted references have not broken.
   A tombstone has also dropped everything that hung off the body — its

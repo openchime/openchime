@@ -672,6 +672,7 @@ typedef enum {
     OC_ERR_INVALID_POLL        = 3038, /* a poll's options or a vote out of bounds (REQ-225) */
     OC_ERR_POLL_CLOSED         = 3039, /* the poll is past its deadline: no more votes (REQ-225) */
     OC_ERR_POLL_HAS_VOTES      = 3040, /* a poll's options or settings, once anyone has voted (REQ-225) */
+    OC_ERR_EDIT_WINDOW_CLOSED  = 3041, /* an author's edit or delete of their own message, past the workspace's window (REQ-051/052) */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not

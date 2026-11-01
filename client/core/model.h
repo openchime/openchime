@@ -1089,6 +1089,11 @@ int oc_model_workspace_setting(const oc_model *m, const char *key, char *out, si
 /* Whether this person may add a custom emoji (REQ-072): the workspace's
  * `custom_emoji_add`, everyone by default, or only owners and admins. */
 int oc_model_may_add_emoji(const oc_model *m);
+/* Whether an author may still edit (`edit`) or delete their own message sent
+ * at `sent_ms` (REQ-051/052): the workspace's `edit_window` or `delete_window`,
+ * unset for always, `never`, or seconds after sending. The daemon decides;
+ * this only keeps the action off the menu once it would be refused. */
+int oc_model_may_change_own(const oc_model *m, uint64_t sent_ms, int edit, uint64_t now_ms);
 
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);

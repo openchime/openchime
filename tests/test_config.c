@@ -369,6 +369,15 @@ static void test_mode(void) {
     /* The values, and nothing else. */
     refuses("OPENCHIME_MODE", "production");
     refuses("OPENCHIME_MODE", "Development");   /* case matters */
+    /* The edit and delete windows: never, or whole seconds up to a year. */
+    accepts("OPENCHIME_EDIT_WINDOW", "never");
+    accepts("OPENCHIME_EDIT_WINDOW", "600");
+    accepts("OPENCHIME_DELETE_WINDOW", "31536000");
+    refuses("OPENCHIME_EDIT_WINDOW", "0");
+    refuses("OPENCHIME_EDIT_WINDOW", "10m");
+    refuses("OPENCHIME_DELETE_WINDOW", "31536001");
+    refuses("OPENCHIME_DELETE_WINDOW", "-5");
+    CHECK(oc_config_window_ms("") == -1 && oc_config_window_ms("never") == 0 && oc_config_window_ms("60") == 60000);
     /* normal and demo: every development row refuses the start, naming itself
      * and the mode; the constants hold, and the managed rows want the ticket. */
     static const char *const modes[] = { "normal", "demo" };
@@ -442,7 +451,7 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 24);     /* OPENCHIME_MODE among them */
+    CHECK(operator_rows == 26);     /* OPENCHIME_MODE among them */
     CHECK(managed_rows == 7);
     CHECK(dev_rows == 4 + 12);      /* the daemon's four, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);

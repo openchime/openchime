@@ -3155,6 +3155,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3038` | `INVALID_POLL`        | messaging  | no    | A poll's question or options out of bounds, or a vote naming options the poll does not have, or two on a single-choice poll (REQ-225). |
 | `3039` | `POLL_CLOSED`         | messaging  | no    | The poll is past its deadline and takes no more votes (REQ-225). |
 | `3040` | `POLL_HAS_VOTES`      | messaging  | no    | An `EDIT_POLL` changing a poll's options or settings after someone voted; only its deadline can change now (REQ-225). |
+| `3041` | `EDIT_WINDOW_CLOSED`  | messaging  | no    | An author's `EDIT`, or `DELETE` of their own message, past the window the workspace's configuration sets (`OPENCHIME_EDIT_WINDOW`, `OPENCHIME_DELETE_WINDOW`, which clients are told as `edit_window` and `delete_window`). An admin's or owner's delete of someone else's message is never limited (REQ-051, REQ-052). |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing

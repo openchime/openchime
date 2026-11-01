@@ -113,6 +113,8 @@ typedef struct {
     const char *workspace_name;         /* "" ⇒ a client derives one from the host */
     const char *workspace_address;      /* OPENCHIME_MANAGED_ADDRESS; "" ⇒ clients keep what they dialled */
     const char *default_channels;       /* OPENCHIME_DEFAULT_CHANNELS: public channel names a new member joins */
+    const char *edit_window;            /* OPENCHIME_EDIT_WINDOW: "" always, "never", or seconds */
+    const char *delete_window;          /* OPENCHIME_DELETE_WINDOW: the same, for an author's own delete */
 
     /* OPENCHIME_DATA_DIR and its layout: everything the daemon keeps, under one
      * directory, at fixed names. */
@@ -233,6 +235,9 @@ void oc_config_report(void *out /* FILE* */);
 /* The workspace settings clients are told (CFG_VISIBLE rows), read-only: the
  * i-th one's key and effective value. Returns 1, or 0 past the last. */
 int oc_config_visible(size_t i, char *key, size_t kcap, char *val, size_t vcap);
+/* A message window's value (OPENCHIME_EDIT_WINDOW's form) in milliseconds: -1
+ * for always, 0 for never, else the window. */
+int64_t oc_config_window_ms(const char *v);
 
 /* CONFIG.md's reference section, as markdown, from the registry. */
 void oc_config_print_reference(void *out /* FILE* */);

@@ -9080,6 +9080,76 @@ static void test_default_channels(void) {
     cleanup_db(path);
 }
 
+/* The workspace's edit and delete windows (OPENCHIME_EDIT_WINDOW and
+ * OPENCHIME_DELETE_WINDOW, REQ-051/052): an author's own edit or delete is
+ * refused once the window has closed, always under `never`; a moderator's
+ * delete of someone else's never is; a shorter window applies to messages
+ * already sent. Age is backdated in the database, not waited for. */
+static void set_windows(const char *edit, const char *del) {
+    char err[256];
+    if (edit) setenv("OPENCHIME_EDIT_WINDOW", edit, 1); else unsetenv("OPENCHIME_EDIT_WINDOW");
+    if (del) setenv("OPENCHIME_DELETE_WINDOW", del, 1); else unsetenv("OPENCHIME_DELETE_WINDOW");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+}
+static void age_message(const char *path, uint64_t mid, int64_t ago_ms) {
+    sqlite3 *db = NULL;
+    char sql[160];
+    snprintf(sql, sizeof sql, "UPDATE messages SET created_at_ms=%lld WHERE id=%llu;",
+             (long long)((int64_t)time(NULL) * 1000 - ago_ms), (unsigned long long)mid);
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_busy_timeout(db, 5000);
+    CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+}
+static int err_of(oc_dbres *r) { int e = r ? (int)r->err_code : -1; oc_dbres_free(r); return e; }
+static void test_edit_windows(void) {
+    const char *path = tdb("windows.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t owner = reg(w, "ew-owner", "pw", OC_ROLE_OWNER);
+    uint64_t author = reg(w, "ew-author", "pw", OC_ROLE_MEMBER);
+    uint8_t idem[OC_IDEM_LEN];
+    uint64_t m[6];
+    for (int k = 0; k < 6; k++) {
+        memset(idem, 0x70 + k, sizeof idem);
+        m[k] = send_msg(w, k == 5 ? owner : author, idem, "words");
+        CHECK(m[k]);
+    }
+
+    /* Unset: always. */
+    set_windows(NULL, NULL);
+    age_message(path, m[0], 400LL * 86400000);
+    CHECK(err_of(do_edit(w, author, OC_DEFAULT_CHANNEL, m[0], "still mine")) == 0);
+
+    /* never: the author may not; a moderator still removes theirs; a
+     * moderator's own message is limited like anyone's. */
+    set_windows("never", "never");
+    CHECK(err_of(do_edit(w, author, OC_DEFAULT_CHANNEL, m[1], "x")) == OC_ERR_EDIT_WINDOW_CLOSED);
+    CHECK(err_of(do_delete(w, author, OC_DEFAULT_CHANNEL, m[1])) == OC_ERR_EDIT_WINDOW_CLOSED);
+    CHECK(err_of(do_delete(w, owner, OC_DEFAULT_CHANNEL, m[1])) == 0);
+    CHECK(err_of(do_delete(w, owner, OC_DEFAULT_CHANNEL, m[5])) == OC_ERR_EDIT_WINDOW_CLOSED);
+
+    /* A minute: inside it, then outside. */
+    set_windows("60", "60");
+    age_message(path, m[2], 30000);
+    CHECK(err_of(do_edit(w, author, OC_DEFAULT_CHANNEL, m[2], "fixed a typo")) == 0);
+    age_message(path, m[3], 120000);
+    CHECK(err_of(do_edit(w, author, OC_DEFAULT_CHANNEL, m[3], "too late")) == OC_ERR_EDIT_WINDOW_CLOSED);
+    CHECK(err_of(do_delete(w, author, OC_DEFAULT_CHANNEL, m[3])) == OC_ERR_EDIT_WINDOW_CLOSED);
+
+    /* Shortened to ten seconds: the thirty-second-old message that was inside
+     * the minute is outside now. */
+    set_windows("10", "10");
+    CHECK(err_of(do_edit(w, author, OC_DEFAULT_CHANNEL, m[2], "again")) == OC_ERR_EDIT_WINDOW_CLOSED);
+    age_message(path, m[4], 1000);
+    CHECK(err_of(do_delete(w, author, OC_DEFAULT_CHANNEL, m[4])) == 0);
+
+    set_windows(NULL, NULL);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
@@ -9130,6 +9200,7 @@ int run_dbwriter_tests(void) {
     test_badge_matches_evaluator();
     test_search();
     test_search_filters_and_paging();
+    test_edit_windows();
     test_default_channels();
     test_search_orders();
     test_setup_invite();

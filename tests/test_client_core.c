@@ -1472,6 +1472,27 @@ static void test_workspace_settings_model(void) {
     oc_model_free(&m);
 }
 
+/* The edit and delete windows as the client reads them (REQ-051/052). */
+static void test_change_windows_model(void) {
+    oc_model m; oc_model_init(&m);
+    const uint64_t sent = 1000000;
+    CHECK(oc_model_may_change_own(&m, sent, 1, sent + 400ull * 86400000) == 1);   /* not told: always */
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_WORKSPACE_SETTINGS;
+    e.body = strdup("edit_window\x1f" "60\x1e" "delete_window\x1f" "never\x1e");
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_may_change_own(&m, sent, 1, sent + 59000) == 1);
+    CHECK(oc_model_may_change_own(&m, sent, 1, sent + 61000) == 0);
+    CHECK(oc_model_may_change_own(&m, sent, 1, sent - 5000) == 1);   /* a clock behind the server's */
+    CHECK(oc_model_may_change_own(&m, sent, 0, sent) == 0);
+    memset(&e, 0, sizeof e); e.type = OC_EV_WORKSPACE_SETTINGS;
+    e.body = strdup("edit_window\x1f\x1e");
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_may_change_own(&m, sent, 1, sent + 61000) == 1);
+    CHECK(oc_model_may_change_own(&m, sent, 0, sent + 61000) == 1);
+    oc_model_free(&m);
+}
+
 static void test_poll_model(void) {
     oc_model m; oc_model_init(&m);
     oc_ev e;
@@ -5216,6 +5237,7 @@ int run_client_core_tests(void) {
     test_poll_model();
     test_table_preview();
     test_workspace_settings_model();
+    test_change_windows_model();
     test_badge_tiers();
     test_osnotify_null();
     test_feedback();

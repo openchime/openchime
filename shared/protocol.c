@@ -1462,6 +1462,7 @@ const char *oc_error_text(uint16_t code) {
     case OC_ERR_INVALID_POLL: return "a poll needs a question and two to ten options, and a vote only options it has";
     case OC_ERR_POLL_CLOSED: return "the poll has closed";
     case OC_ERR_POLL_HAS_VOTES: return "people have voted, so the options and settings can no longer change";
+    case OC_ERR_EDIT_WINDOW_CLOSED: return "this workspace no longer lets you change or delete that message";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;

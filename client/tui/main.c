@@ -949,7 +949,7 @@ static void menu_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
  * your vote: Tacos" when it is yours. The labels live here, not in the
  * model, which may move while the menu is open. */
 static char g_vote_labels[OC_POLL_MAX_OPTIONS][OC_POLL_OPTION_MAX + 32];
-static void menu_build_msg(int own, int deleted, int has_attach, const oc_poll_view *poll) {
+static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int has_attach, const oc_poll_view *poll) {
     g_nmenu = 0;
     if (!deleted) g_menu[g_nmenu++] = (menuitem){ "Reply in thread", ACT_THREAD };
     if (!deleted) g_menu[g_nmenu++] = (menuitem){ "Add reaction",    ACT_REACT };
@@ -964,8 +964,8 @@ static void menu_build_msg(int own, int deleted, int has_attach, const oc_poll_v
     if (poll && own && !(poll->close_at_ms && (uint64_t)time(NULL) * 1000u >= poll->close_at_ms))
         g_menu[g_nmenu++] = (menuitem){ "Close poll now", ACT_POLL_CLOSE };
     if (has_attach) g_menu[g_nmenu++] = (menuitem){ "Download file", ACT_DOWNLOAD };
-    if (own)      g_menu[g_nmenu++] = (menuitem){ "Edit",            ACT_EDIT };
-    if (own)      g_menu[g_nmenu++] = (menuitem){ "Delete",          ACT_DELETE };
+    if (may_edit) g_menu[g_nmenu++] = (menuitem){ "Edit",            ACT_EDIT };
+    if (may_del)  g_menu[g_nmenu++] = (menuitem){ "Delete",          ACT_DELETE };
     g_menu[g_nmenu++] = (menuitem){ "Who reacted", ACT_REACTORS };
     g_menu[g_nmenu++] = (menuitem){ "Mark unread from here", ACT_UNREAD };
 }
@@ -3837,22 +3837,27 @@ int main(int argc, char **argv) {
                     const oc_pdm_view *lv = ch->e2e ? oc_model_pdm((oc_model *)mm, cid) : NULL;
                     int locked = ch->e2e && (!lv || lv->state == OC_PDM_EV_ENDED);
                     int own = (sel->author_id == mm->user_id) && !sel->deleted && !locked;
+                    /* The workspace's windows (REQ-051/052): past them the
+                     * daemon refuses an author's own edit or delete. */
+                    uint64_t now = (uint64_t)time(NULL) * 1000u;
+                    int may_edit = own && oc_model_may_change_own(mm, sel->server_time, 1, now);
+                    int may_del = own && oc_model_may_change_own(mm, sel->server_time, 0, now);
                     int has_attach = 0;
                     for (uint8_t ak = 0; ak < sel->n_attach; ak++)
                         if (!sel->attach[ak].reclaimed) { has_attach = 1; break; }
                     if (ev.key == TB_KEY_ENTER) {   /* open the discoverable action menu */
-                        menu_build_msg(own, sel->deleted || locked, has_attach && !ch->e2e, sel->poll);   /* no files in an encrypted DM */
+                        menu_build_msg(own, may_edit, may_del, sel->deleted || locked, has_attach && !ch->e2e, sel->poll);   /* no files in an encrypted DM */
                         act_cid = cid; act_mid = mid; act_uid = 0; act_title = "Message";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
                     else if (ev.ch == 't' && !locked) oc_client_open_thread(cl, cid, mid);
                     else if (ev.ch == 'w') oc_client_list_reactions(cl, cid, mid);
-                    else if ((ev.ch == 'x' || ev.ch == 'd') && own) oc_client_delete(cl, cid, mid);
+                    else if ((ev.ch == 'x' || ev.ch == 'd') && may_del) oc_client_delete(cl, cid, mid);
                     else if (ev.ch == 'r' && !sel->deleted && !locked) {   /* open the emoji picker */
                         picker_open = 1; eq[0] = '\0'; eqlen = 0; esel = 0;
                         picker_cid = cid; picker_mid = mid;
                     }
-                    else if (ev.ch == 'e' && own) {             /* edit: prefill + drop to composer */
+                    else if (ev.ch == 'e' && may_edit) {             /* edit: prefill + drop to composer */
                         editing = mid;
                         snprintf(composer, sizeof composer, "%s", sel->body ? sel->body : "");
                         clen = strlen(composer);

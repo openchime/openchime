@@ -27096,10 +27096,15 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
     }
     int own = (msg->author_id == m->user_id);
     int canmod = own || self_role(m) >= OC_ROLE_ADMIN;
-    if ((own || canmod) && !msg->deleted && !locked) mi_sep();
-    if (own && !msg->deleted && !locked)    mi_item(21, "Edit");
+    /* The workspace's windows (REQ-051/052): an author's own message stops
+     * offering Edit or Delete once the daemon would refuse it; a moderator's
+     * delete of someone else's is never limited. */
+    int may_edit = own && oc_model_may_change_own(m, msg->server_time, 1, wall_ms());
+    int may_del = own ? oc_model_may_change_own(m, msg->server_time, 0, wall_ms()) : canmod;
+    if ((may_edit || may_del || (own && msg->poll)) && !msg->deleted && !locked) mi_sep();
+    if (may_edit && !msg->deleted && !locked) mi_item(21, "Edit");
     if (own && msg->poll && !msg->deleted && !locked) mi_item(108, "Edit poll");   /* REQ-225 */
-    if (canmod && !msg->deleted && !locked) mi_item_d(22, "Delete");
+    if (may_del && !msg->deleted && !locked) mi_item_d(22, "Delete");
 
     g_menu = MENU_MSG; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 248;
     g_menu_target = mid; g_menu_target2 = chan;

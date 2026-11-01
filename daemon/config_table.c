@@ -22,6 +22,7 @@ int cfg_parse_summary(oc_config *c, const cfg_row *r, const char *name, const ch
 int cfg_parse_connect(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_token_prefix(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_trusted_proxies(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
+int cfg_parse_window(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 
 #define F(field) offsetof(oc_config, field)
 #define STR(n, cls, grp, d, doc, ...)   { n, CFG_STR,  cls, grp, d, doc, 0, 0, NULL, __VA_ARGS__ }
@@ -48,6 +49,8 @@ const cfg_row OC_CFG[] = {
     { "OPENCHIME_CUSTOM_EMOJI_ADD", CFG_ENUM, CFG_OPERATOR, G_SET, "everyone",
       "Who may add a custom emoji (REQ-072): `everyone`, or `admins` (owners and admins). Deleting stays the emoji's creator's, an admin's or an owner's.",
       0, 0, "everyone|admins", F(custom_emoji_add), NULL, CFG_VISIBLE, 0 },
+    STR("OPENCHIME_EDIT_WINDOW", CFG_OPERATOR, G_SET, "", "How long an author may edit their own message (REQ-051): `never`, or seconds after sending, 1 to 31536000. Empty: always.", F(edit_window), cfg_parse_window, CFG_VISIBLE, 0),
+    STR("OPENCHIME_DELETE_WINDOW", CFG_OPERATOR, G_SET, "", "How long an author may delete their own message (REQ-052): `never`, or seconds after sending, 1 to 31536000. Empty: always. An admin's or owner's delete of someone else's message is never limited.", F(delete_window), cfg_parse_window, CFG_VISIBLE, 0),
     STR("OPENCHIME_DEFAULT_CHANNELS", CFG_OPERATOR, G_SET, "", "Public channels, by name and comma-separated, that a new member joins when their account is made, beside #general. A name that matches no public, unarchived channel is skipped, said once in the log at start.", F(default_channels), NULL, CFG_VISIBLE, 0),
     U64("OPENCHIME_MAX_VIDEO_SIZE", CFG_OPERATOR, G_SET, "167772160", 1048576, (int64_t)OC_MAX_ATTACHMENT_SIZE, "The most bytes one video message may hold (REQ-164), at most the attachment cap of 209715200; clients learn it at sign-in and record within it. 160 MiB by default.", max_video_size),
     PATHR("OPENCHIME_DATA_DIR", CFG_OPERATOR, G_SET, "/data", "Where the daemon keeps everything: `openchime.db`, `identity/`, `blobs/`, `cert.pem`, `key.pem`, `summary/`. The packages set `/var/lib/openchime`.", F(data_dir), NULL, 0, 0),

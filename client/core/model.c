@@ -284,6 +284,14 @@ int oc_model_may_add_emoji(const oc_model *m) {
     return 0;
 }
 
+int oc_model_may_change_own(const oc_model *m, uint64_t sent_ms, int edit, uint64_t now_ms) {
+    char v[24];
+    if (!oc_model_workspace_setting(m, edit ? "edit_window" : "delete_window", v, sizeof v) || !v[0]) return 1;
+    if (!strcmp(v, "never")) return 0;
+    uint64_t win = strtoull(v, NULL, 10) * 1000u;
+    return now_ms <= sent_ms || now_ms - sent_ms <= win;
+}
+
 void oc_model_free(oc_model *m) {
     memset(m->pdms, 0, sizeof m->pdms);
     m->n_pdms = 0;

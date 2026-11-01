@@ -423,6 +423,9 @@ static int store(oc_config *c, const cfg_row *r, const char *name, const char *v
     switch (r->kind) {
     case CFG_STR:
         if (r->flags & CFG_CLIENT) return 0;
+        /* A string row may name a check for its shape (`parse`), which only
+         * says yes or no: the value is kept as written. */
+        if (v && *v && r->parse && r->parse(c, r, name, v, err, errcap) != 0) return -1;
         *(const char **)dst = v;
         return 0;
     case CFG_PATH:
@@ -717,6 +720,23 @@ int oc_config_apply_env_file(const char *path, char *err, size_t errcap) {
 }
 
 /* --- the views --------------------------------------------------------------------- */
+
+/* A message window (OPENCHIME_EDIT_WINDOW, OPENCHIME_DELETE_WINDOW): `never`,
+ * or a whole number of seconds from 1 to a year. Empty is unset: always. */
+int cfg_parse_window(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap) {
+    (void)c; (void)r;
+    if (!strcmp(v, "never")) return 0;
+    char *end = NULL;
+    long long n = strtoll(v, &end, 10);
+    if (end && !*end && *v >= '0' && *v <= '9' && n >= 1 && n <= 31536000) return 0;
+    return fail(err, errcap, name, v, "must be `never` or seconds, 1 to 31536000");
+}
+
+int64_t oc_config_window_ms(const char *v) {
+    if (!v || !*v) return -1;
+    if (!strcmp(v, "never")) return 0;
+    return (int64_t)strtoll(v, NULL, 10) * 1000;
+}
 
 /* A stored row's effective value as an operator would write it. */
 static void row_value(const oc_config *c, const cfg_row *r, char *val, size_t cap) {

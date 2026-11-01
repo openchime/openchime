@@ -4709,6 +4709,25 @@ static int message_lookup(sqlite3 *db, uint64_t channel_id, uint64_t message_id,
 /* Edit one's own message (REQ-051): only the author may edit, the body is
  * replaced and edited_at_ms is stamped while the original id/created_at/position
  * are kept. A tombstoned message is no longer editable. */
+/* Whether an author's own edit (`edit` set) or delete of message `mid` is still
+ * open under the workspace's window (OPENCHIME_EDIT_WINDOW / _DELETE_WINDOW):
+ * always unless set, never under `never`, else for that long after it was
+ * sent, by the daemon's clock. A change to the setting applies to every
+ * message from then on. */
+static int author_window_open(sqlite3 *db, uint64_t mid, int edit) {
+    const oc_config *cfg = oc_config_get();
+    int64_t win = oc_config_window_ms(edit ? cfg->edit_window : cfg->delete_window);
+    if (win < 0) return 1;
+    if (win == 0) return 0;
+    sqlite3_stmt *st = NULL;
+    int64_t sent = 0;
+    sqlite3_prepare_v2(db, "SELECT created_at_ms FROM messages WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+    if (sqlite3_step(st) == SQLITE_ROW) sent = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return (int64_t)dbw_now_ms() - sent <= win;
+}
+
 static oc_dbres *process_edit(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -4722,6 +4741,9 @@ static oc_dbres *process_edit(sqlite3 *db, const oc_job *j) {
     }
     if (author != j->user_id) {   /* no moderator edit — author only (REQ-032) */
         r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    if (!author_window_open(db, j->message_id, 1)) {
+        r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_EDIT_WINDOW_CLOSED; return r;
     }
     if (e2e_closed(db, j->channel_id)) { r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
 
@@ -4983,6 +5005,11 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
     }
     if (author != j->user_id && !oc_role_can_moderate(get_role(db, j->user_id))) {
         r->type = OC_RES_DELETE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    /* The window is an author's, for their own message: a moderator removing
+     * someone else's is never limited (REQ-032). */
+    if (author == j->user_id && !author_window_open(db, j->message_id, 0)) {
+        r->type = OC_RES_DELETE_ERR; r->err_code = OC_ERR_EDIT_WINDOW_CLOSED; return r;
     }
     if (e2e_closed(db, j->channel_id)) { r->type = OC_RES_DELETE_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
 
