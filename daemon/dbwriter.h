@@ -758,7 +758,12 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_POLL = 117, OC_RES_POLL_VOTERS = 118, OC_RES_POLL_ERR = 119,
        /* The author changed a poll: rpoll[0] for the conversation, nobody's
         * selection in it. */
-       OC_RES_POLL_EDITED = 120 };
+       OC_RES_POLL_EDITED = 120,
+       /* A notice the workspace's own sender posted (its welcome, a member
+        * joined, a channel made or changed, a person added or given a role):
+        * the SEND-shaped fields and `members`, broadcast as an ordinary
+        * message. Chained onto the answer of the job that caused it. */
+       OC_RES_NOTICE = 121 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {

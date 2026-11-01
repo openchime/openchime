@@ -523,6 +523,8 @@ static void test_collect(void) {
         /* NONE means none: a mention does not pierce it. Only a person does. */
         CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_NONE, 1, 1, 0, 0, 0) == 0);
         CHECK(oc_notify_decide(0, 0, 1, OC_NOTIFY_NONE, 0, 0, 0, 0, 0) == 1);
+        /* Nor is the workspace's notice: its callers pass it as `own`. */
+        CHECK(oc_notify_decide(1, 0, 1, OC_NOTIFY_ALL, 1, 0, 0, 0, 0) == 0);
         /* Your own message is not news, whoever you are to yourself. */
         CHECK(oc_notify_decide(1, 0, 1, OC_NOTIFY_ALL, 1, 1, 0, 0, 0) == 0);
         /* Mute is absolute (REQ-137): not even a priority person pierces it. */

@@ -25,11 +25,22 @@
 
 /* Block until a result is available (bounded): woken by the writer's eventfd,
  * not by polling on a timer. */
+/* The next result, past any notice the workspace posted beside it (a job's
+ * notices ride after its answer, OC_RES_NOTICE): a test asks about the
+ * answer, and test_notices reads notices from the database. */
+static oc_dbres *next_answer(oc_dbwriter *w) {
+    for (;;) {
+        oc_dbres *r = oc_dbwriter_next_result(w);
+        if (!r || r->type != OC_RES_NOTICE) return r;
+        oc_dbres_free(r);
+    }
+}
+
 static oc_dbres *wait_result(oc_dbwriter *w) {
     struct timespec t0, t;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (;;) {
-        oc_dbres *r = oc_dbwriter_next_result(w);
+        oc_dbres *r = next_answer(w);
         if (r) return r;
         clock_gettime(CLOCK_MONOTONIC, &t);
         /* Only a guard against a hang: a loaded machine can take seconds. */
@@ -7356,7 +7367,7 @@ static uint64_t pool_mono_us(void) {
 /* The next result before a deadline on the monotonic clock, or NULL. */
 static oc_dbres *wait_result_ms(oc_dbwriter *w, int ms) {
     oc_dbres *r = NULL;
-    WAIT_UNTIL((r = oc_dbwriter_next_result(w)) != NULL, (uint64_t)ms);
+    WAIT_UNTIL((r = next_answer(w)) != NULL, (uint64_t)ms);
     return r;
 }
 
@@ -9354,6 +9365,122 @@ static void test_welcome_message(void) {
     cleanup_db(path);
 }
 
+/* The workspace's notices (OPENCHIME_NOTICE_*): posted where configured, by
+ * the workspace's own sender; nothing when off; never a mention row and never
+ * unread; and a person told directly when added to a channel or a group, or
+ * given a role. */
+static char *last_notice(const char *path, uint64_t cid, int *count) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    char *out = NULL;
+    *count = 0;
+    if (sqlite3_open(path, &db) != SQLITE_OK) return NULL;
+    sqlite3_prepare_v2(db, "SELECT m.body FROM messages m JOIN users s ON s.id=m.author_id AND s.is_system=1 "
+                           "WHERE m.channel_id=?1 ORDER BY m.id;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)cid);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        free(out);
+        out = strndup((const char *)sqlite3_column_blob(st, 0), (size_t)sqlite3_column_bytes(st, 0));
+        (*count)++;
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return out;
+}
+static int notice_is(const char *path, uint64_t cid, int want_count, const char *want) {
+    int n = 0;
+    char *got = last_notice(path, cid, &n);
+    int ok = n == want_count && (!want || (got && !strcmp(got, want)));
+    if (!ok) printf("  notice in %llu: %d, \"%s\"\n", (unsigned long long)cid, n, got ? got : "");
+    free(got);
+    return ok;
+}
+static uint64_t notice_dm_of(const char *path, uint64_t uid) {
+    return (uint64_t)e2e_scalar(path,
+        "SELECT COALESCE(MAX(c.id),0) FROM channels c JOIN channel_members cm ON cm.channel_id=c.id AND cm.user_id=?1 "
+        "JOIN channel_members sm ON sm.channel_id=c.id JOIN users s ON s.id=sm.user_id AND s.is_system=1 "
+        "WHERE c.kind='dm'", uid);
+}
+static void set_notices(const char *joined, const char *created, const char *changes) {
+    char err[256];
+    if (joined) setenv("OPENCHIME_NOTICE_MEMBER_JOINED", joined, 1); else unsetenv("OPENCHIME_NOTICE_MEMBER_JOINED");
+    if (created) setenv("OPENCHIME_NOTICE_CHANNEL_CREATED", created, 1); else unsetenv("OPENCHIME_NOTICE_CHANNEL_CREATED");
+    if (changes) setenv("OPENCHIME_NOTICE_CHANNEL_CHANGES", changes, 1); else unsetenv("OPENCHIME_NOTICE_CHANNEL_CHANGES");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+}
+static void test_notices(void) {
+    const char *path = tdb("notices.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    set_notices(NULL, NULL, NULL);
+    uint64_t owner = reg(w, "nt-owner", "pw", OC_ROLE_OWNER);
+    uint64_t alice = reg(w, "nt-alice", "pw", OC_ROLE_MEMBER);
+    CHECK(owner && alice);
+    oc_dbres *r = create_channel(w, owner, "lobby", 1);
+    uint64_t lobby = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(lobby && notice_is(path, lobby, 0, NULL) && notice_is(path, OC_DEFAULT_CHANNEL, 0, NULL));   /* off */
+
+    set_notices("general", "#lobby", "on");
+    uint64_t newbie = reg(w, "nt-new", "pw", OC_ROLE_MEMBER);
+    CHECK(newbie && notice_is(path, OC_DEFAULT_CHANNEL, 1, "@nt-new joined the workspace."));
+    uint64_t jmid = (uint64_t)e2e_scalar(path, "SELECT MAX(id) FROM messages WHERE channel_id=?1", OC_DEFAULT_CHANNEL);
+    CHECK(mention_rows(path, jmid, 0, -1) == 0);           /* names a person, mentions nobody */
+
+    r = create_channel(w, alice, "plans", 1);
+    uint64_t plans = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(plans && notice_is(path, lobby, 1, "@nt-alice created #plans."));
+    oc_dbres_free(create_channel(w, alice, "hush", 0));
+    CHECK(notice_is(path, lobby, 1, NULL));                  /* a private channel is not announced */
+
+    oc_dbres_free(chan_member(w, OC_JOB_INVITE_CHANNEL, alice, plans, owner));
+    oc_dbres_free(chan_update(w, owner, plans, OC_CHUP_RENAME, "roadmap"));
+    CHECK(notice_is(path, plans, 1, "@nt-owner renamed this channel to #roadmap."));
+    oc_dbres_free(chan_update(w, alice, plans, OC_CHUP_DESCRIPTION, "What we will build."));
+    CHECK(notice_is(path, plans, 2, "@nt-alice changed this channel's description."));
+    oc_dbres_free(chan_update(w, owner, plans, OC_CHUP_PRIVATE, ""));
+    CHECK(notice_is(path, plans, 3, "@nt-owner made this channel private."));
+    oc_dbres_free(chan_update(w, owner, plans, OC_CHUP_ARCHIVE, ""));
+    CHECK(notice_is(path, plans, 4, "@nt-owner archived this channel."));
+    oc_dbres_free(chan_update(w, alice, OC_DEFAULT_CHANNEL, OC_CHUP_TOPIC, "Hello"));
+    CHECK(notice_is(path, OC_DEFAULT_CHANNEL, 1, NULL));    /* a topic is not one of them */
+
+    /* Off again: nothing more. A channel that is none: nothing. */
+    set_notices("nowhere", "", "off");
+    oc_dbres_free(chan_update(w, owner, plans, OC_CHUP_UNARCHIVE, ""));
+    CHECK(notice_is(path, plans, 4, NULL));
+    uint64_t later = reg(w, "nt-later", "pw", OC_ROLE_MEMBER);
+    CHECK(later && notice_is(path, OC_DEFAULT_CHANNEL, 1, NULL));
+    oc_dbres_free(create_channel(w, alice, "more", 1));
+    CHECK(notice_is(path, lobby, 1, NULL));
+
+    /* Told directly, always. */
+    CHECK(notice_dm_of(path, newbie) == 0);
+    oc_dbres_free(chan_member(w, OC_JOB_INVITE_CHANNEL, owner, lobby, newbie));
+    uint64_t dm = notice_dm_of(path, newbie);
+    CHECK(dm && notice_is(path, dm, 1, "@nt-owner added you to #lobby."));
+    uint64_t gid = grp_create(w, owner, "crew");
+    CHECK(gid);
+    oc_dbres_free(grp_members(w, owner, gid, 1, &newbie, 1));
+    CHECK(notice_is(path, dm, 2, "@nt-owner added you to the group @crew."));
+    CHECK(set_role(w, owner, newbie, OC_ROLE_ADMIN) == 0);
+    CHECK(notice_is(path, dm, 3, "@nt-owner made you an admin."));
+
+    /* None of it is anyone's unread: #general holds only notices. */
+    r = list_channels(w, alice);
+    int seen = 0;
+    for (size_t i = 0; r && i < r->n_chlist; i++)
+        if (r->chlist[i].channel_id == OC_DEFAULT_CHANNEL) { seen = 1; CHECK(r->chlist[i].unread == 0); }
+    CHECK(seen);
+    oc_dbres_free(r);
+
+    set_notices(NULL, NULL, NULL);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
@@ -9406,6 +9533,7 @@ int run_dbwriter_tests(void) {
     test_search_filters_and_paging();
     test_edit_windows();
     test_broadcast_rules();
+    test_notices();
     test_welcome_message();
     test_default_channels();
     test_search_orders();

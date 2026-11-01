@@ -1494,8 +1494,8 @@ void oc_model_set_read_marker(oc_model *m, uint64_t channel_id, uint64_t message
             kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
         }
         int vip = oc_model_is_priority(m, msg->author_id);
-        if (oc_notify_decide(msg->author_id == m->user_id, c->muted, vip,
-                             c->notify_level, men, kw, 0, 0, 0)) {
+        if (oc_notify_decide(msg->author_id == m->user_id || oc_model_is_workspace_sender(m, msg->author_id),
+                             c->muted, vip, c->notify_level, men, kw, 0, 0, 0)) {
             n++;
             if (men || kw || vip) pri++;
         }
@@ -1655,8 +1655,8 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
         /* thread_reply is 0: this watches a channel's main scroll, and a thread
          * reply is deliberately not in it (REQ-060), so it never sees one.
          * Replies are answered by oc_model_thread_notify_take instead. */
-        if (!oc_notify_decide(0, c->muted, is_vip, c->notify_level,
-                              men, kw, 0, quiet, paused)) continue;
+        if (!oc_notify_decide(oc_model_is_workspace_sender(m, msg->author_id), c->muted, is_vip,
+                              c->notify_level, men, kw, 0, quiet, paused)) continue;
 
         pick = msg;                      /* ascending ids: the newest wins */
         if (mentioned)   *mentioned   |= men;
@@ -1931,8 +1931,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             }
             int vip = oc_model_is_priority(m, e->author_id);
             if (e->message_id > c->read_marker &&
-                oc_notify_decide(e->author_id == m->user_id, c->muted, vip,
-                                 c->notify_level, men, kw, 0, 0, 0)) {
+                oc_notify_decide(e->author_id == m->user_id || oc_model_is_workspace_sender(m, e->author_id),
+                                 c->muted, vip, c->notify_level, men, kw, 0, 0, 0)) {
                 c->unread++;
                 if (men || kw || vip) c->priority_unread++;   /* the badge's count, not its dot */
             }

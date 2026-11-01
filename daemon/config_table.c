@@ -52,6 +52,9 @@ const cfg_row OC_CFG[] = {
       "The member count from which a channel is large for `OPENCHIME_BROADCAST_MENTIONS`; 0 makes every channel large.",
       0, 1000000, NULL, F(broadcast_large), NULL, CFG_VISIBLE, 0 },
     STR("OPENCHIME_WELCOME_MESSAGE", CFG_OPERATOR, G_SET, "", "The welcome each new member is sent once, as a direct message from the workspace, when their account is made: the text as it is then, in the message formatting (MARKDOWN.md), `\\n` for a line break. Empty: none is sent.", F(welcome_message), NULL, 0, 0),
+    STR("OPENCHIME_NOTICE_MEMBER_JOINED", CFG_OPERATOR, G_SET, "", "The public channel the workspace posts in when a new member joins, naming them. Empty: none is posted. A name that is no public, unarchived channel is said once at start, and nothing is posted.", F(notice_member_joined), NULL, 0, 0),
+    STR("OPENCHIME_NOTICE_CHANNEL_CREATED", CFG_OPERATOR, G_SET, "", "The public channel the workspace posts in when a public channel is created, naming it and who made it. Empty: none is posted.", F(notice_channel_created), NULL, 0, 0),
+    BOOL("OPENCHIME_NOTICE_CHANNEL_CHANGES", CFG_OPERATOR, G_SET, "off", "Whether the workspace posts in a channel when its name, description, visibility or archived state changes, naming who changed it.", notice_channel_changes),
     STR("OPENCHIME_WORKSPACE_NAME", CFG_OPERATOR, G_SET, "", "The workspace's display name, shown to clients; unset, a client derives one from the host.", F(workspace_name), NULL, CFG_VISIBLE, 0),
     /* An ENUM a client is told (CFG_VISIBLE), written out: the macro has no flags. */
     { "OPENCHIME_CUSTOM_EMOJI_ADD", CFG_ENUM, CFG_OPERATOR, G_SET, "everyone",

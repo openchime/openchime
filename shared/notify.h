@@ -62,7 +62,11 @@ int oc_notify_quiet(int mode, int base_start, int base_end,
  *
  * `level` is OC_NOTIFY_* (protocol.h), already resolved against the user's
  * global default (REQ-134): the fallback is the caller's to apply, because
- * only the caller knows whether a per-channel preference exists. */
+ * only the caller knows whether a per-channel preference exists.
+ *
+ * `own` is the reader's own message, or the workspace's: a notice from its own
+ * sender (USER_LIST `flags`). Neither is news, so neither notifies or counts
+ * as unread. */
 int oc_notify_decide(int own, int muted, int vip, unsigned level,
                      int mentioned, int keyword_hit, int thread_reply,
                      int quiet, int paused);

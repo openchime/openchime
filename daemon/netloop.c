@@ -8293,6 +8293,20 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         fanout_actions(ep, conns, r);   /* "not an action", as every live message is answered (ARCH-115) */
         break;
     }
+    case OC_RES_NOTICE: {
+        /* The workspace's notice, to the conversation's connected members as
+         * any message is. It notifies nobody and counts as unread for nobody:
+         * the clients know its sender (USER_LIST `flags`). */
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_slice body = { r->body, r->body_len };
+        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, OC_MSG_KIND_MESSAGE,
+                           body, 0, {{0}}, {0} };
+        oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
+        size_t blen = w.len;
+        fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
+        fanout_actions(ep, conns, r);
+        break;
+    }
     case OC_RES_UNFURL_STORED: {
         /* Fan the stored preview to every connected member (REQ-222). The same
          * shape as an edit fan-out; there is no requester to ack — the job was

@@ -114,6 +114,9 @@ typedef struct {
     int broadcast_mentions;             /* OPENCHIME_BROADCAST_MENTIONS: 0 everyone, 1 admins (and owners), 2 nobody */
     int broadcast_large;                /* OPENCHIME_BROADCAST_LARGE: members from which the rule applies; 0 every channel */
     const char *welcome_message;        /* OPENCHIME_WELCOME_MESSAGE: "" ⇒ none is sent */
+    const char *notice_member_joined;   /* OPENCHIME_NOTICE_MEMBER_JOINED: a public channel's name, or "" (off) */
+    const char *notice_channel_created; /* OPENCHIME_NOTICE_CHANNEL_CREATED: likewise */
+    int notice_channel_changes;         /* OPENCHIME_NOTICE_CHANNEL_CHANGES: posted in the channel changed */
     const char *workspace_address;      /* OPENCHIME_MANAGED_ADDRESS; "" ⇒ clients keep what they dialled */
     const char *default_channels;       /* OPENCHIME_DEFAULT_CHANNELS: public channel names a new member joins */
     const char *edit_window;            /* OPENCHIME_EDIT_WINDOW: "" always, "never", or seconds */

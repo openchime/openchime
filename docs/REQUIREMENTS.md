@@ -376,6 +376,17 @@ where one exists.
   members auto-join, and the tenant's join/invite policy — stored on the tenant
   and shown wherever the workspace is presented (the switcher, REQ-013; the
   client header).
+
+  **The workspace speaks for itself,** as configuration rather than an
+  in-app setting: a new member is sent its welcome
+  (`OPENCHIME_WELCOME_MESSAGE`), and it posts notices where it is told to — a
+  member joined (`OPENCHIME_NOTICE_MEMBER_JOINED`), a public channel created
+  (`OPENCHIME_NOTICE_CHANNEL_CREATED`), a channel's name, description,
+  visibility or archived state changed, in that channel
+  (`OPENCHIME_NOTICE_CHANNEL_CHANGES`). A person is always told, in their DM
+  with the workspace, when someone adds them to a channel or a group or
+  changes their role. These come from the workspace's own sender, never a
+  person; they notify nobody and count as unread for nobody.
 - **REQ-043.** An owner/admin has had an **administration console** distinct from
   the ordinary chat surface: a sortable member table with bulk actions (role
   change, remove — REQ-030/033), a channel-management view
