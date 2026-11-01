@@ -23,7 +23,9 @@ scripts/build/nsis_plugins.sh
 scripts/build/makemsix.sh
 mkdir -p "$outdir"
 
-makensis -V2 -DVERSION="$version" -DBINDIR="$bindir" -DOUTDIR="$outdir" \
+# -NOCD: makensis otherwise changes into the script's directory, and every
+# path given here is from the repository root.
+makensis -V2 -NOCD -DVERSION="$version" -DBINDIR="$bindir" -DOUTDIR="$outdir" \
   -DPLUGINDIR=third_party/nsis-plugins -DSRCDIR=. packaging/windows/openchime.nsi
 
 # The MSIX: the manifest and its assets, the two binaries under bin/, and the

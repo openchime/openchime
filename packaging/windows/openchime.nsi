@@ -8,7 +8,7 @@
 ;
 ; Built on Linux by makensis (packaging/build-windows.sh), so no Windows
 ; machine is in the build:
-;   makensis -DVERSION=7 -DBINDIR=build -DOUTDIR=dist/windows-x64 \
+;   makensis -NOCD -DVERSION=7 -DBINDIR=build -DOUTDIR=dist/windows-x64 \
 ;            -DPLUGINDIR=third_party/nsis-plugins -DSRCDIR=. packaging/windows/openchime.nsi
 ;
 ; PER-USER, deliberately. RequestExecutionLevel user installs under
