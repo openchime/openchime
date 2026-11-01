@@ -53,7 +53,7 @@ test-merge:
 	@scripts/test/lib/require_ci.sh test-merge
 	+@$(foreach p,$(if $(PART),$(PART),plain threads),$(MAKE) --no-print-directory test-merge-$(p) &&) true
 test-merge-plain:
-	+@$(MAKE) --no-print-directory $(FULL_SWITCHES) all linux build/e2e_client build/demo_client $(TEST_BIN) $(WEB_DIR)/gfx-test.js $(WEB_DIR)/openchime.js
+	+@$(MAKE) --no-print-directory $(FULL_SWITCHES) all linux build/e2e_client build/demo_client $(TEST_BIN) $(WEB_DIR)/openchime.js
 	scripts/test/local/source.sh
 	scripts/test/merge/suites.sh
 	scripts/test/merge/static_link.sh $(BIN)

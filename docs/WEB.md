@@ -41,8 +41,7 @@ behind it (`client/gui/platform/web/secret_mem.c`).
 
 **The drawing layer in a browser.** SDL3 builds for wasm from the same release
 the Windows client uses (`scripts/build/sdl3_wasm.sh`), and `oc_gfx` compiles
-over it unchanged. `scripts/test/merge/web.sh` runs the backend's own pixel test
-(`client/gui/gfx/gfx_test_win.c`, the same assertions) under Node first.
+over it unchanged.
 
 **The application in a browser.** `make web` compiles the application
 layer -- `client/gui/app/`, the same sources `make windows` compiles --

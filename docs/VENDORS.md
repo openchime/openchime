@@ -195,7 +195,7 @@ exits. Override for a new version with `MBEDTLS_SHA256=<sum>`.
 `scripts/build/sdl3_windows.sh` fetches the pinned release tarball
 (SHA-256-verified, refuses an unpinned bump), cross-builds a **static-only**
 `libSDL3.a` with llvm-mingw into `third_party/sdl3-3.4.14-win/` (gitignored), and
-`make build/gfx_test.exe` links it. SDL's own build is CMake; the script invoking
+`make windows` links it. SDL's own build is CMake; the script invoking
 it is the same arrangement as invoking mbedTLS's make — the dependency's build
 system stays its own business, and this tree's stays make. It is a
 large dependency, fetched pinned rather than committed. zlib-licensed: no notice needs to travel with a shipped
@@ -360,7 +360,7 @@ The Windows GUI is the portable application (`client/gui/app/`, ARCH-80) over
 |------|---------|------|---------|
 | `scripts/build/llvm_mingw.sh`, `third_party/llvm-mingw-20261006` | 20261006 | The toolchain itself (clang, lld, LLVM binutils, mingw-w64 headers and CRT, UCRT), fetched by make | Apache-2.0 with LLVM exception |
 | `scripts/build/mbedtls_windows.sh`, `third_party/mbedtls-3.6.2-win` | 3.6.2 | Windows cross-compile; used by `make windows` | Apache-2.0 |
-| `scripts/build/sdl3_windows.sh`, `third_party/sdl3-3.4.14-win` | 3.4.14 | Windows cross-compile (static, CMake invoked by the script); used by `make windows` and `make build/gfx_test.exe` | zlib |
+| `scripts/build/sdl3_windows.sh`, `third_party/sdl3-3.4.14-win` | 3.4.14 | Windows cross-compile (static, CMake invoked by the script); used by `make windows` | zlib |
 | `scripts/build/libvpx.sh windows`, `third_party/libvpx-1.17.0-win` | 1.17.0 | Windows cross-compile (static, nasm); used by `make windows` | BSD-3-Clause |
 | `scripts/build/opus.sh windows`, `third_party/opus-1.6.1-win` | 1.6.1 | Windows cross-compile (static); used by `make windows` | BSD-3-Clause |
 | `scripts/build/speexdsp.sh windows`, `third_party/speexdsp-1.2.1-win` | 1.2.1 | Windows cross-compile (static); used by `make windows` | BSD-3-Clause |

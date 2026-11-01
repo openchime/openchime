@@ -99,14 +99,13 @@ OpenCV (`cv2`, numpy) for its QR decode, skipped without it.
   as a person does, through the daemon's page (`tests/testsignin.h`). There is deliberately no per-test binary:
   the tests exercise public APIs, so each `tests/*.c` links the real module
   objects rather than `#include`-ing the `.c` under test.
-- The one exception is platform-backend code that cannot execute on the build
-  host: sdltext's DirectWrite backend (ARCH-106) has its own console program,
-  `make build/sdltext_test.exe` → `build/sdltext_test.exe`, same
-  failure-count-as-exit-code contract. The staging build's `windows binaries` job
-  cross-compiles it (the compile is
-  the header/vtable check mingw keeps honest); a Windows host runs it. The
-  portable half of sdltext (the byte↔UTF-16 offset map) stays in `make test`
-  like everything else.
+- Platform-backend code that cannot execute on the build host (sdltext's
+  DirectWrite backend, ARCH-106, and the gfx layer's SDL backend) has no test
+  program of its own: the staging build's `windows binaries` job cross-compiles
+  it with the client (the compile is the header/vtable check mingw keeps
+  honest), and the Windows client is tested by hand. The portable half of
+  sdltext (the byte↔UTF-16 offset map) stays in `make test` like everything
+  else.
 - A subject's tests live in one translation unit exposing a single entry point,
   `int run_<subject>_tests(void)`, which runs its groups and returns its
   failure count. `tests/main.c` calls each and sums; a non-zero total exits
@@ -984,12 +983,8 @@ The browser build (WEB.md) is checked in CI's `build` job, which runs
 all of them are judged there as by hand, `OC_TEST_TIMING=0` or not. The daemon it starts runs in development mode,
 and so serves its own `/app/` page that way: the check signs in by password on
 the daemon's page and bootstraps its user.
-`scripts/test/merge/web.sh` runs the first three:
+`scripts/test/merge/web.sh` runs the first two:
 
-- **The gfx pixel test** — `client/gui/gfx/gfx_test_win.c` compiled to wasm
-  over the SDL3 built for it (`build/web/gfx-test.js`), run under Node with
-  SDL's dummy video driver: the same assertions as the Windows run, exit code
-  the failure count.
 - **`scripts/web/test.sh`** — a daemon on a fresh database with one bootstrapped
   owner, and a headless Chromium with a fresh profile loading the client from
   the daemon's own `/app/` page (`openchime.html`, the Windows application

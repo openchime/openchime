@@ -742,7 +742,7 @@ static void      (*g_form_on_action)(int field);
  * outside the clip — and what survives is asymmetric: the LEFT edge disappears
  * entirely while the right keeps a sliver, so every field rendered as a
  * rounded rectangle missing one side. One DIP clears the 0.75 half-width of the
- * 1.5 stroke. `make build/gfx_test.exe` measures both the trap and this rule. */
+ * 1.5 stroke. */
 #define FORM_BOX_INSET 1.0f
 static rectf g_form_sel_box[FORM_MAX_FIELDS];
 static int   g_form_sel_field = -1;      /* which field's list is open, -1 none */

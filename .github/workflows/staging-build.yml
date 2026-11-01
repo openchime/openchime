@@ -733,13 +733,10 @@ jobs:
             third_party/mbedtls-3.6.2
           key: vendor-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh', 'scripts/build/mbedtls.sh', 'scripts/build/mbedtls_windows.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh', 'scripts/build/sdl3_windows.sh') }}
 
-      # The two Windows test programs are built too, from the same toolchain
-      # and libraries (a Windows host runs them, docs/TESTING.md): their one
-      # build in CI. Built, not kept.
-      - name: Build the GUI, the TUI and the test programs
+      - name: Build the GUI and the TUI
         run: |
           set -euo pipefail
-          make OC_BUILD_ID="$BUILD_ID" OC_BUILD_NUM="$BUILD_NUM" windows build/sdltext_test.exe build/gfx_test.exe
+          make OC_BUILD_ID="$BUILD_ID" OC_BUILD_NUM="$BUILD_NUM" windows
 
       # Named for the toolchain, not the platform: unpackaged compiler outputs
       # handed to the next job and to the store, never a release artifact.

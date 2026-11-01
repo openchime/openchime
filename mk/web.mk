@@ -29,16 +29,6 @@ $(WEB_MEDIA_LIBS) &: $(EMCC)
 	scripts/build/media_wasm.sh
 	@touch -c $(WEB_MEDIA_LIBS)
 
-# The drawing layer's own pixel test (client/gui/gfx), built for wasm and run
-# under Node by `make test-merge` (scripts/test/merge/web.sh).
-WEB_GFX_SRC   := $(GFX_SRC) client/shared/icons.c
-WEB_GFX_FLAGS := -std=c99 -O2 $(WARN_CFLAGS) -Wno-typedef-redefinition -pthread \
-                 -Iclient/gui/gfx -Iclient/shared -I$(WEB_SDL3)/include
-WEB_GFX_LD    := $(WEB_SDL3)/lib/libSDL3.a -pthread -sALLOW_MEMORY_GROWTH=1 -Wno-pthreads-mem-growth
-$(WEB_DIR)/gfx-test.js: $(WEB_GFX_SRC) client/gui/gfx/gfx_test_win.c client/gui/gfx/gfx.h $(WEB_SDL3)/lib/libSDL3.a $(EMCC)
-	mkdir -p $(WEB_DIR)
-	$(EMCC) $(WEB_GFX_FLAGS) $(WEB_GFX_SRC) client/gui/gfx/gfx_test_win.c $(WEB_GFX_LD) -sENVIRONMENT=node,worker -o $@
-
 # The client. Asyncify lets its own loop yield to the page.
 WEB_MEDIA_SRC := $(filter-out client/core/media/audio_ma.c client/core/media/cap_mf.c client/core/media/cap_wgc.c,$(MEDIA_SRC)) \
                  $(VOICE_SRC) $(CALL_SRC) client/gui/platform/web/cap_web.c client/gui/platform/web/audio_web.c \

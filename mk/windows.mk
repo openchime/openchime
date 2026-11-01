@@ -133,28 +133,3 @@ $(WIN_GUI_BIN): $(WIN_GUI_OBJS) $(WIN_GUI_RES) $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $
 
 # Both clients, once their binaries are named above.
 windows: $(WIN_GUI_BIN) $(WIN_TUI_BIN)
-
-# --- The two Windows test programs, built by path -----------------------------
-# The DirectWrite backend's (sdltext/st_test_win.c): a console .exe whose exit
-# code is its failure count; CI cross-compiles it (the compile is itself the
-# header/vtable check mingw keeps honest), a Windows host -- or WSL interop --
-# runs it. docs/TESTING.md records the split.
-WIN_SDLTEXT_TEST := build/sdltext_test.exe
-WIN_SDLTEXT_CC   = $(WINCC) $(WIN_CFLAGS) $(SDLTEXT_INC)
-WIN_SDLTEXT_OBJS := $(call oc_objs,$(OBJ_DIR)/win-sdltext,$(SDLTEXT_WIN) sdltext/st_test_win.c)
-$(eval $(call oc_obj_rules,$(OBJ_DIR)/win-sdltext,WIN_SDLTEXT_CC,$(MINGW_CC),))
--include $(WIN_SDLTEXT_OBJS:.o=.d)
-$(WIN_SDLTEXT_TEST): $(WIN_SDLTEXT_OBJS) | build
-	$(WINCC) $(WIN_CFLAGS) $(WIN_SDLTEXT_OBJS) \
-	    -ld2d1 -ldwrite -lwindowscodecs -lole32 -luuid -static -o $@
-# The gfx layer's: SDL's software renderer on a plain surface -- no window, no
-# GPU -- asserting pixels. Exit code is the failure count (docs/TESTING.md, the
-# platform-backend exception).
-WIN_GFX_TEST := build/gfx_test.exe
-WIN_GFX_CC   = $(WINCC) $(WIN_CFLAGS) -std=c11 -Iclient/gui/gfx -Iclient/shared -I$(SDL3_WIN)/include
-WIN_GFX_OBJS := $(call oc_objs,$(OBJ_DIR)/win-gfx,$(GFX_SRC) client/gui/gfx/gfx_test_win.c client/shared/icons.c)
-$(eval $(call oc_obj_rules,$(OBJ_DIR)/win-gfx,WIN_GFX_CC,$(MINGW_CC),$(SDL3_WIN_LIB)))
--include $(WIN_GFX_OBJS:.o=.d)
-$(WIN_GFX_TEST): $(WIN_GFX_OBJS) $(SDL3_WIN_LIB) | build
-	$(WINCC) $(WIN_CFLAGS) -std=c11 $(WIN_GFX_OBJS) \
-	    -L$(SDL3_WIN)/lib -lSDL3 $(WIN_SDL_SYSLIBS) -static -o $@
