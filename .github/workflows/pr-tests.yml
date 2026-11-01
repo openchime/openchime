@@ -1,0 +1,72 @@
+name: pr tests
+
+# Run on every pull request into staging: `make test-merge`,
+# the same jobs the staging build runs (ci.yml), so nothing merges untested
+# (docs/CONTRIBUTING.md "Before a pull request"). `make test` runs locally
+# before the push; this is everything else a change must pass before it
+# reaches staging. A pull request whose one commit changes documentation alone
+# (scripts/release/docs_only.sh) builds nothing. The required check is the
+# last job, `pr tests`, which reads the others.
+
+on:
+  pull_request:
+    branches: [staging]
+
+# A newer push to the same pull request makes the older run worthless: it is
+# cancelled rather than finished.
+concurrency:
+  group: pr-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  BASH_ENV: ${{ github.workspace }}/.github/net-retry.bash
+
+jobs:
+  scope:
+    name: what the change touches
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.docs.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 2
+      - id: docs
+        run: |
+          set -uo pipefail
+          if scripts/release/docs_only.sh HEAD >/dev/null; then echo "code=false" >> "$GITHUB_OUTPUT"
+          else echo "code=true" >> "$GITHUB_OUTPUT"; fi
+
+  tests:
+    needs: scope
+    if: needs.scope.outputs.code == 'true'
+    uses: ./.github/workflows/ci.yml
+
+  # The required check. A skipped job reads as passing, so requiring the job
+  # above would pass a pull request whose scope job failed; this one passes
+  # only when the tests passed, or were skipped for a documentation-only change.
+  result:
+    name: pr tests
+    needs: [scope, tests]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          BASH_ENV: ""
+          SCOPE: ${{ needs.scope.result }}
+          CODE: ${{ needs.scope.outputs.code }}
+          TESTS: ${{ needs.tests.result }}
+        run: |
+          set -uo pipefail
+          [ "$SCOPE" = success ] || { echo "::error::what the change touches: $SCOPE"; exit 1; }
+          case "$CODE/$TESTS" in
+            true/success) echo "make test-merge passed" ;;
+            false/skipped) echo "documentation only: nothing to build" ;;
+            *) echo "::error::make test-merge: $TESTS"; exit 1 ;;
+          esac

@@ -3,8 +3,8 @@
 # "Brittle tests"): a test's result changes only when behaviour a person,
 # an operator or an integrator could see changes, and it cannot stay green
 # while that behaviour regresses. What a C test cannot see of itself -- its
-# own text -- is checked here, before the suite. Run by `make test` and CI's
-# build job with the other source checks.
+# own text -- is checked here, before the suite. Run by
+# scripts/test/source_checks.sh with the other source checks.
 #
 # In tests/ (*.c, *.h), but tests/manual/, which a person runs by hand:
 #   sleep    usleep, nanosleep, msleep, sleep, SDL_Delay called anywhere but
@@ -19,7 +19,8 @@
 #            line before: /* contract: <why> */
 #   tmp      a "/tmp/ literal: a path every run, every suite and every checkout
 #            shares. tests/testenv.h's oc_test_mkdtemp gives each its own.
-# In .github/workflows/*.yml:
+# In .github/workflows/*.yml, and in the scripts under scripts/test/ and
+# scripts/smoke/ that run under pipefail:
 #   pipe     `| grep -q` in a step that runs under pipefail: grep -q exits at
 #            its first match, the writer dies on the closed pipe, and pipefail
 #            turns a match into a failure. Capture first, then grep the
@@ -27,7 +28,7 @@
 #
 # Prints file:line: rule: text for each, and exits 1 if there is any.
 set -uo pipefail
-cd "$(dirname "$0")/../.." || exit 2
+cd "$(dirname "$0")/../../.." || exit 2
 
 list() {   # NUL-separated paths under $1 matching the -name patterns after it
     local dir=$1; shift
@@ -197,6 +198,17 @@ while IFS= read -r -d '' f; do
         while IFS= read -r line; do report "tests_lint: $line"; done <<<"$out"
     fi
 done < <(list .github/workflows '*.yml' '*.yaml')
+
+# --- the test scripts ---------------------------------------------------------
+while IFS= read -r -d '' f; do
+    # Only a script that runs under pipefail: one that sets it, or sources
+    # lib/common.sh, which does. A POSIX sh script (refs.sh) has no pipefail.
+    grep -qE 'pipefail|lib/common\.sh' "$f" || continue
+    out=$(awk '!/^[ \t]*#/ && /\|[ \t]*grep[ \t]+-[A-Za-z]*q/ { printf "%s:%d: pipe: capture, then grep the capture (pipefail fails a grep -q match): %s\n", FILENAME, FNR, $0 }' "$f")
+    if [ -n "$out" ]; then
+        while IFS= read -r line; do report "tests_lint: $line"; done <<<"$out"
+    fi
+done < <(list scripts/test '*.sh'; list scripts/smoke '*.sh')
 
 if [ $found != 0 ]; then
     echo "tests_lint: the tests wait on outcomes, compare markers rather than words, and share no paths (docs/TESTING.md \"Brittle tests\")" >&2

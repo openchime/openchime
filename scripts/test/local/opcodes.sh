@@ -3,7 +3,7 @@
 #
 # The wire contract is "one value, one meaning".
 #
-# Run by `make test` and `make test-ci` (mk/tests.mk SOURCE_CHECKS).
+# Run by scripts/test/local/source.sh (make test).
 #
 # KNOWN_SHARED lists opcodes that are still shared. An entry here is a defect on
 # the record, not an exemption: delete the value when it is fixed, and the check

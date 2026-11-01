@@ -84,7 +84,7 @@ migration, never an edit to an existing one (SCHEMA.md §1).
 
 ## Before a pull request — the minimal set
 
-Locally, and in about 2 minutes, a pull request needs exactly this:
+Locally, and in about a minute, a pull request needs exactly this:
 
 1. `scripts/check/test.sh` — `make && make test`, then it records the tree it
    passed on for the pre-push hook. Zero warnings, every suite passing
@@ -105,13 +105,11 @@ Locally, and in about 2 minutes, a pull request needs exactly this:
 After a policy failure on the pull request (`pr policy`), fix it, run
 step 1 again if anything but the title changed, and push once.
 
-That is all. **The thread sanitizer, the release compiler, the Windows builds
-and the end-to-end run are the staging build's** ("CI"); running them locally as
-well repeats that and costs the time it exists to save. `make test-ci` refuses
-to run outside CI. A change that risks them (threads, a new compiler idiom,
-Windows code) may run `make check-release-cc` or `make windows` locally first,
-by choice: a failure in the staging build holds back everything merged with
-the change.
+That is all locally. **Every other test is CI's, and only CI's** ("CI"):
+`make test-merge` on the pull request, the required check, and
+`make test-release` on what the staging build and the release make. Both
+refuse to run outside CI. There are exactly three test commands, and every
+test runs through one of them (TESTING.md §4).
 
 **Before pushing a GUI change, run `scripts/gui/smoke.sh`** (TESTING.md
 "Reading the GUI smoke").
@@ -129,7 +127,7 @@ the change.
   `openchime/openchime`, the project's public issue tracker, whose numbers are
   stable identifiers.
   `pr-policy` checks N is open there, and the release closes it.
-  `scripts/check/refs.sh` refuses a tracker prefix with a number in any file.
+  `scripts/test/local/refs.sh` refuses a tracker prefix with a number in any file.
 - **No file cites an issue number — a commit message is the only place one
   belongs.** Not source, not scripts, not the workflows, not the documents.
   Comments explain themselves, or cite a `REQ-N` / `ARCH-N`: REQUIREMENTS.md and
@@ -141,7 +139,7 @@ the change.
   Instead of pointing at an issue, say the thing: "the daemon exits 0 when it
   cannot start, which systemd reads as success". The prose survives the tracker.
 
-  **This is enforced.** `scripts/check/refs.sh` fails on a hash followed by
+  **This is enforced.** `scripts/test/local/refs.sh` fails on a hash followed by
   digits and on a tracker URL ending in a number. `make test` and the staging
   build's tests run it before the suite.
   A bare link to the tracker carrying no number is fine — and note the rule
@@ -169,7 +167,7 @@ A daemon setting is one row in `daemon/config_table.c`: its name, kind, range
 or values, default, class (operator, managed, or development) and one line of
 meaning. Nothing else: the loader reads it from the row, CONFIG.md's reference
 and `packaging/openchimed.env` are regenerated from it
-(`scripts/check/config.sh --write`), `openchimed --check-config` reports it, and
+(`scripts/test/local/config.sh --write`), `openchimed --check-config` reports it, and
 `make test` fails if a `getenv` appears outside the loader or a name appears
 anywhere the registry does not know. A client setting goes through
 `client/core/env.c` and a `CLIENT` row, so the name is known. A test input is a
@@ -178,23 +176,34 @@ does nothing unless `OPENCHIME_MODE=development` (CONFIG.md "Mode").
 
 ## Keeping CI small
 
-Nothing runs on its own but what must ("CI"). The cheap checks are steps of a job a workflow already has, never jobs
-of their own; no job waits on another workflow (a gate checks once and fails
-fast); every job has a timeout. A failure is found locally, not in CI:
+Three test commands, and nothing else runs a test: `make test` locally before
+every push, `make test-merge` on every pull request and in the staging build,
+`make test-release` on the artifacts the staging build and the release make
+(TESTING.md §4). Each test is a script under `scripts/test/`; the targets call
+the scripts, and the workflows call only the targets. The smoke test of a
+published release is `scripts/smoketest.sh`, which runs every check in
+`scripts/smoke/` and runs only in the release.
+
+A compile error or a failing fast test is found locally, not in CI:
 `scripts/check/test.sh` (`make && make test`) runs before the commit, and
 `.githooks/pre-push` refuses a tree it did not pass on (a change to `*.md`,
 `.gitignore` or `.claude/` alone excepted) and workflows `actionlint` rejects.
 The hooks are on once per clone: `git config core.hooksPath .githooks`
-("Starting a feature").
+("Starting a feature"). A pull request whose one commit changes documentation
+alone builds nothing in CI, and a newer push to a pull request cancels the
+run it replaces. Every job has a timeout.
 
 ## CI
 
-Nothing runs on a pull request but **`pr policy`**, and nothing runs on a push.
+Two workflows run on a pull request, and nothing runs on a push.
 `pr-policy.yml` checks the pull request's title and body, that the title
-names an open issue, and the tree's issue references (`scripts/check/refs.sh`,
+names an open issue, and the tree's issue references (`scripts/test/local/refs.sh`,
 from the base branch), and its attribution scan is a step of the same job, so
-a banned reference fails it too. **`pr policy`** is the one required check on
-`staging`, and the branch need not be up to date to merge.
+a banned reference fails it too. `pr-tests.yml` runs `make test-merge`
+(`ci.yml`, below) unless the pull request's commit changes documentation
+alone; its last job, `pr tests`, passes only when those tests passed or were
+skipped for documentation. `pr policy` and `pr tests` are the required checks
+on `staging`, and the branch need not be up to date to merge.
 
 The build and the tests run in the **staging build** (`staging-build.yml`),
 dispatched by hand on `staging` for its tip, usually after a few changes have
@@ -203,24 +212,27 @@ merged:
     gh workflow run staging-build.yml --ref staging
 
 Its gate checks the commits since the last release (the attribution scan refuses; the
-commit policy warns) and refuses a commit already built. Then the tests, by
-calling `ci.yml`, two jobs on two machines at once:
+commit policy warns) and refuses a commit already built. Then `make test-merge`
+again, on the merged tip, by calling `ci.yml`: two jobs on two machines at
+once.
 
-- **`build + unit tests`** — builds the daemon; checks it links only libc and
-  libm; starts it and drives it over TLS with the e2e client; compiles every
-  Linux translation unit with the release's clang under `-Werror`
-  (`check-release-cc`); runs the suites that start no threads
-  (`make test-ci PART=plain`, which runs `mk/tests.mk`'s `SOURCE_CHECKS`
-  first); and the web client in a headless Chrome (TESTING.md §3.4).
-- **`thread sanitizer`** — the suites that start threads, under
-  ThreadSanitizer (`make test-ci PART=threads`); their only run in CI.
+- **`build + unit tests`** — `make test-merge PART=plain`: the daemon with
+  every feature; the source checks; the suites that start no threads; the
+  static-link check; the daemon started and driven over TLS with the e2e
+  client; every Linux translation unit through the release's clang under
+  `-Werror`; the speech round trip; the web client in a headless Chrome and
+  the GUI smoke on the web (TESTING.md §3.4).
+- **`thread sanitizer`** — `make test-merge PART=threads`: the suites that
+  start threads, under ThreadSanitizer.
 
 Only when both pass does it build what a release ships — both daemons with
 their data, the images, and the Windows clients (with the two Windows test
 programs) — and store the daemon trees, the Windows binaries and the images by
-commit; a stored build is what a release-candidate is made from. The packages
-and installers are built too, under a placeholder version, only to prove they
-build; a release makes them again under its number. Every vendored library and
+commit; a stored build is what a release-candidate is made from. The packages,
+the Windows installer and the MSIX are built too, under a placeholder version,
+and `make test-release` checks each (PART=packages, image, windows); a release
+makes them again under its number and checks them the same way. Everything
+runs on Linux, the Windows packaging included (NSIS, makemsix). Every vendored library and
 toolchain is cached by the script that builds it, and the staging build's runs
 save the caches the next one restores; a cache unused for seven days is
 evicted. Once a month `toolchains.yml` files an issue when a pinned toolchain
@@ -236,7 +248,7 @@ See [TESTING.md](./TESTING.md) for the full test strategy.
 the daemon's build under `third_party/` needs an `emit` line in
 `packaging/licenses.sh`, under the same `TTS`, `STT` or `SUM` condition the
 build uses, so the notice travels with every binary that links it.
-`scripts/check/notices.sh`, one of `make test`'s source checks, compares the
+`scripts/test/local/notices.sh`, one of `make test`'s source checks, compares the
 two for all eight combinations and names any component without one.
 
 **Every network call retries a failed connection.** Every workflow sets `BASH_ENV` to `.github/net-retry.bash`, so every bash step, and every bash script it runs, gets it: `git`, `gh` and `ssh-keyscan` (GitHub); `skopeo`, `docker`, `buildah` and `flyctl` (Fly's registry, API and builder); `curl`; and `dotnet restore`, while `rclone`, `npm` and NuGet are told through their own settings to retry harder and give up on a stall. Each attempt is bounded, so a stalled connection fails instead of hanging, and a call that failed in the connection (a timeout, a dropped, reset or refused connection, a 5xx) is retried with backoff, up to four times. A real refusal, such as a rejected push, a missing ref or image, a 4xx or a failed health check, fails at once.

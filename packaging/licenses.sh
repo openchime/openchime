@@ -23,7 +23,7 @@
 #   [TTS=0] [STT=0] [SUM=0] licenses.sh <mbedtls-dir>
 #
 # LICENSES_LIST=1 prints the path of each text it would include, one per line,
-# and nothing else: scripts/check/notices.sh compares that list with what the
+# and nothing else: scripts/test/local/notices.sh compares that list with what the
 # daemon's build links, through these same conditionals rather than a copy.
 set -euo pipefail
 

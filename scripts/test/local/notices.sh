@@ -14,7 +14,7 @@
 # build/wasm and is a client (its components are the clients' to declare), and
 # data outside third_party/ (the speech models, CMUdict) is not a linked library.
 set -uo pipefail
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../.."
 # Not the calling make's flags or variables: this asks a fresh one. And not the
 # tree's remembered switches either: make remakes an included makefile even
 # under -n, so a dry run with TTS=1 would rewrite build/.features and the next

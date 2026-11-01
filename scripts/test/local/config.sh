@@ -13,7 +13,7 @@
 #   d. CONFIG.md's generated block and packaging/openchimed.env are what the
 #      daemon prints (--config-reference, --config-env), byte for byte.
 set -uo pipefail
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../.."
 BIN=./openchimed
 [ -x "$BIN" ] || { echo "config: ./openchimed is not built (make; \`make test\` builds it first)" >&2; exit 2; }
 fail=0
@@ -75,8 +75,8 @@ PY
     cp "$gen_env" packaging/openchimed.env
     echo "config: CONFIG.md's reference and packaging/openchimed.env regenerated"
 else
-    if ! diff -q "$cur_ref" "$gen_ref" >/dev/null; then say "docs/CONFIG.md's reference block is not what the daemon prints (scripts/check/config.sh --write)"; diff "$cur_ref" "$gen_ref" | head -10 >&2; fail=1; fi
-    if ! diff -q packaging/openchimed.env "$gen_env" >/dev/null; then say "packaging/openchimed.env is not what the daemon prints (scripts/check/config.sh --write)"; fail=1; fi
+    if ! diff -q "$cur_ref" "$gen_ref" >/dev/null; then say "docs/CONFIG.md's reference block is not what the daemon prints (scripts/test/local/config.sh --write)"; diff "$cur_ref" "$gen_ref" | head -10 >&2; fail=1; fi
+    if ! diff -q packaging/openchimed.env "$gen_env" >/dev/null; then say "packaging/openchimed.env is not what the daemon prints (scripts/test/local/config.sh --write)"; fail=1; fi
 fi
 rm -f "$gen_ref" "$cur_ref" "$gen_env"
 n_rows=$("$BIN" --config-reference | sed '/^## No longer read/,$d' | grep -c '^| `OPENCHIME')

@@ -158,9 +158,12 @@ has moved (`scripts/check/toolchains.sh`).
 
 | Toolchain | Version | Script | Builds | License |
 |-----------|---------|--------|--------|---------|
-| **zig** (its bundled clang and lld) | 0.13.0 | `scripts/build/zig.sh` | the release's Linux daemon against glibc 2.34 (`make RELEASE=1`), the arm64 daemon cross-built from x86 (`make ARCH=aarch64`), and CI's second-compiler pass (`make check-release-cc`) | MIT |
-| **Emscripten** (emsdk) | 6.0.8 | `scripts/build/emsdk.sh` | the web client (`make web`) and the loader compiled into a `WEB=1` daemon; brings its own Node for `make web-test` | MIT / NCSA |
+| **zig** (its bundled clang and lld) | 0.13.0 | `scripts/build/zig.sh` | the release's Linux daemon against glibc 2.34 (`make RELEASE=1`), the arm64 daemon cross-built from x86 (`make ARCH=aarch64`), and CI's second-compiler pass (`make test-merge`) | MIT |
+| **Emscripten** (emsdk) | 6.0.8 | `scripts/build/emsdk.sh` | the web client (`make web`) and the loader compiled into a `WEB=1` daemon; brings its own Node for the web client's checks (`make test-merge`) | MIT / NCSA |
 | **llvm-mingw** (clang, lld, LLVM binutils, mingw-w64 headers and CRT) | 20261006 | `scripts/build/llvm_mingw.sh` | the Windows GUI and TUI and their libraries (`make windows`), through the `x86_64-w64-mingw32-*` names | Apache-2.0 with LLVM exception; mingw-w64 under its own permissive terms |
+| **makemsix** (Microsoft msix-packaging, with CMake 3.31.6 to build it) | commit `25a65f5` | `scripts/build/makemsix.sh` | the Windows client's MSIX, on Linux (`packaging/build-windows.sh`); built from source because no release compiles with a current clang | MIT (makemsix); BSD-3-Clause (CMake) |
+| **WinShell** (NSIS plugin) | the NSIS wiki's `WinShell.zip`, SHA-256 pinned | `scripts/build/nsis_plugins.sh` | the installer's Start-menu shortcut AppUserModelID (`packaging/windows/openchime.nsi`); `makensis` itself is Ubuntu's `nsis` | zlib |
+| **jsign** | 7.6 | `scripts/build/jsign.sh` | Authenticode signing of the Windows binaries and installer against Azure Trusted Signing, on Linux (`scripts/release/sign_windows.sh`) | Apache-2.0 |
 
 | Package | Version | Purpose | Used by | Source | License |
 |---------|---------|---------|---------|--------|---------|

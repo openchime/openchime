@@ -16,7 +16,7 @@
 # ARCHITECTURE.md are stable documents that live in this repository, and their
 # ids are identifiers rather than positions.
 #
-# Run by `make test` and `make test-ci` (mk/tests.mk SOURCE_CHECKS), by pr-policy
+# Run by scripts/test/local/source.sh (make test), by pr-policy
 # over a pull request's tree, and by promote over main's next tree.
 #
 # These fail, described rather than written out, because this file is

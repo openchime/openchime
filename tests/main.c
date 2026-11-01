@@ -181,9 +181,10 @@ static void crash_report_install(void) {
  * minute of unrelated suites per attempt. Unset, nothing changes. */
 static const char *g_only;
 
-/* OC_TEST_EXCEPT is the opposite list: the suites NOT to run. CI's build job
- * runs every suite its thread-sanitizer job does not (the Makefile's
- * TSAN_SUITES), so each suite runs once in CI, not twice. */
+/* OC_TEST_EXCEPT is the opposite list: the suites NOT to run. `make test`
+ * leaves out the slow suites, and `make test-merge` runs every suite its
+ * thread-sanitizer half does not, so each runs once there
+ * (scripts/test/lib/common.sh). */
 static const char *g_except;
 
 static int listed(const char *list, const char *name) {

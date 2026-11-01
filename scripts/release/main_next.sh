@@ -133,7 +133,7 @@ apply() {
   esac
 }
 # Does <docs commit> name an OPENCHIME_ setting <main>'s registry lacks? Prints
-# the first such name. A cheap stand-in for scripts/check/config.sh, which
+# the first such name. A cheap stand-in for scripts/test/local/config.sh, which
 # needs the daemon built: documentation describing a setting reaches main with
 # the code that has it.
 unknown_setting() {  # <docs commit> <main>

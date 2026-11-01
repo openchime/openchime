@@ -3,7 +3,7 @@
  * variable it reads, declared once in the registry (config_table.c), read
  * once at startup by oc_config_load() into one process-global oc_config that
  * everything reaches through oc_config_get(). Nothing else in the daemon
- * calls getenv (scripts/check/config.sh enforces it).
+ * calls getenv (scripts/test/local/config.sh enforces it).
  *
  * The registry is the one source: the loader reads from it, `openchimed
  * --config-reference` prints CONFIG.md's reference from it, `--config-env`

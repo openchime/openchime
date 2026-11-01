@@ -6,7 +6,7 @@
 # Run by `make test` with the other source checks; keeps the target list from
 # growing back one convenience at a time.
 set -uo pipefail
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../.."
 public=$(sed -n 's/^PUBLIC *:= *//p' Makefile | tr ' ' '\n' | grep . | sort)
 internal=$(sed -n 's/^INTERNAL *:= *//p' Makefile | tr ' ' '\n' | grep . | sort)
 # The header: every "#   make <target>   description" line before the first

@@ -1,21 +1,7 @@
-# The tests (docs/TESTING.md), CI's split of them, the release-compiler pass,
-# and the tool binaries a person builds by path.
-
-# Source checks run before the suite, because a C test cannot inspect the text
-# of the tree: no two message types share an opcode (the wire contract's one
-# static invariant); no file cites an issue by number (CONTRIBUTING.md: a
-# commit cites the issue it closes; a file says the thing instead, because a
-# number in a comment rots silently the moment the issue does); and the
-# Makefile's typed targets are the ones its header names; the configuration
-# registry is the one source of every OPENCHIME_* name, CONFIG.md's reference
-# and the packaged environment file (config.sh, which asks the daemon, so
-# `test` builds it first); nothing that ships is a box in development mode
-# (release_lint.sh); and the tests wait on outcomes, compare markers rather
-# than a person's words, share no paths, and the workflows pipe nothing into
-# grep -q under pipefail (tests_lint.sh, docs/TESTING.md "Brittle tests"); and
-# every third-party component the daemon links has its licence notice in
-# packaging/licenses.sh, in every TTS/STT/SUM build (notices.sh).
-SOURCE_CHECKS := scripts/check/opcodes.sh shared/protocol.h && scripts/check/refs.sh && scripts/check/make_targets.sh && scripts/check/config.sh && scripts/check/release_lint.sh && scripts/check/tests_lint.sh && scripts/check/notices.sh
+# The tests (docs/TESTING.md), the release-compiler pass, and the tool
+# binaries a person builds by path. Every test is a script in scripts/test/; a
+# target here builds what the scripts need and calls them, and the workflows
+# call only these targets (docs/TESTING.md §4).
 
 # Unit + in-process integration tests, one binary (docs/TESTING.md §2). Built
 # -O0 -g; a non-zero exit fails the build and CI. The suites run side by side,
@@ -38,53 +24,77 @@ TEST_OBJS   := $(call oc_objs,$(OBJ_DIR)/test,$(TEST_ALL_SRC))
 TEST_VENDOR := $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A)
 $(eval $(call oc_obj_rules,$(OBJ_DIR)/test,TEST_CC,$(CC_STAMP),$(TEST_VENDOR)))
 -include $(TEST_OBJS:.o=.d)
+# --- The three test commands (docs/TESTING.md §4) ----------------------------
+# Every test is a script under scripts/test/; these targets build what the
+# scripts need and call them, and nothing else runs a test. The workflows call
+# only these targets (and scripts/smoketest.sh, after a release publishes).
+#
+#   make test          local, before every push (scripts/check/test.sh, the
+#                      pre-push hook): the source checks and the fast suites,
+#                      on the default daemon. About a minute once built.
+#   make test-merge    CI only, on every pull request and in the staging
+#                      build: every feature built, every suite (the threaded
+#                      ones under ThreadSanitizer), the static-link check, the
+#                      end-to-end run, the release's compiler, the speech
+#                      round trip, the web client in a headless Chrome and the
+#                      GUI smoke on the web. PART=plain or PART=threads runs
+#                      one half, as CI's two jobs do; unset, both.
+#   make test-release  CI only, on what the release ships: PART=packages (on
+#                      DIST), PART=image (on IMAGE), PART=windows (on WIN_BIN
+#                      and WIN_DIST); unset, all three. A check on a binary or
+#                      image the runner cannot execute says so and skips it.
 test: $(TEST_BIN) $(BIN)
-	@$(SOURCE_CHECKS)
-	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" ./$(TEST_BIN)
+	scripts/test/local/source.sh
+	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" scripts/test/local/suites.sh
+
+FULL_SWITCHES := TTS=1 STT=1 SUM=1 WEB=1
+TSAN_BIN      := build/tests-tsan
+test-merge:
+	@scripts/test/lib/require_ci.sh test-merge
+	+@$(foreach p,$(if $(PART),$(PART),plain threads),$(MAKE) --no-print-directory test-merge-$(p) &&) true
+test-merge-plain:
+	+@$(MAKE) --no-print-directory $(FULL_SWITCHES) all linux build/e2e_client build/demo_client $(TEST_BIN) $(WEB_DIR)/gfx-test.js $(WEB_DIR)/openchime.js
+	scripts/test/local/source.sh
+	scripts/test/merge/suites.sh
+	scripts/test/merge/static_link.sh $(BIN)
+	scripts/test/merge/e2e.sh
+	+MAKE="$(MAKE) $(FULL_SWITCHES)" scripts/test/merge/release_cc.sh
+	scripts/test/lib/speech.sh ./$(BIN)
+	NODE="$(NODE)" scripts/test/merge/web.sh
+	NODE="$(NODE)" scripts/test/merge/gui_web_smoke.sh
+test-merge-threads: $(TSAN_BIN)
+	scripts/test/merge/tsan.sh
 $(TEST_BIN): $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build
 	$(CC) $(CFLAGS) -O0 -g $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
-
-# --- CI's split (docs/TESTING.md §2.4) ----------------------------------------
-# The suites whose code runs threads -- the loop and its I/O threads, the
-# writer and readers, the worker pools, the client, the recorder and player --
-# run under ThreadSanitizer and the rest plainly, so every suite runs once
-# there, never twice. A suite with no thread cannot race, and instrumenting it
-# only makes it slower. test-ci refuses outside CI, before its long build. CI
-# runs its halves in parallel jobs: PART=plain or PART=threads; unset, both,
-# one after the other: each binary already runs as many suites at once as
-# there are CPUs, and under -j the two would otherwise run together. Both set
-# OC_TEST_TIMING=0: a verdict that races the wall clock (CHECK_TIMING,
-# tests/check.h) is not judged in the pipeline; `make test` judges it.
-comma := ,
-TSAN_LIST := run_netloop_tests run_client_core_tests run_dbwriter_tests run_ioloop_tests \
-             run_authpool_tests run_xferpool_tests run_slow_blob_tests run_storage_tests \
-             run_blob_s3_tests run_blob_cache_tests run_media_tests run_video_media_tests run_tts_worker_tests \
-             run_stt_tests run_push_tests run_invite_mail_tests run_enroll_tests \
-             run_tls_tests run_signin_tests run_acme_tests
-TSAN_SUITES := $(subst $(eval) ,$(comma),$(strip $(TSAN_LIST)))
-# The same test binary under ThreadSanitizer. The vendored libraries are not
-# instrumented, so a race inside one is not seen; one between our threads is.
-# Run with address randomization off (setarch -R): ThreadSanitizer maps its
-# shadow memory at fixed addresses, and the randomization of recent kernels
-# places the binary where that shadow has to go ("unexpected memory mapping").
-TSAN_BIN := build/tests-tsan
-ci-only:
-	@if [ -z "$$CI" ]; then echo "make test-ci runs in CI only; locally, run make test"; exit 1; fi
-TEST_CI_PARTS := $(if $(filter plain,$(PART)),test-ci-plain,$(if $(filter threads,$(PART)),test-ci-threads,test-ci-plain test-ci-threads))
-test-ci: ci-only
-	@$(foreach t,$(TEST_CI_PARTS),$(MAKE) --no-print-directory $(t) &&) true
-test-ci-plain: ci-only $(TEST_BIN) $(BIN)
-	@$(SOURCE_CHECKS)
-	OC_TEST_TIMING=0 OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" OC_TEST_EXCEPT="$(TSAN_SUITES)" ./$(TEST_BIN)
-test-ci-threads: ci-only $(TSAN_BIN)
-	OC_TEST_TIMING=0 OC_TEST_ONLY="$${OC_TEST_ONLY:-$(TSAN_SUITES)}" \
-	TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 suppressions=$(CURDIR)/tests/tsan.supp" setarch $$(uname -m) -R ./$(TSAN_BIN)
+# The same test binary under ThreadSanitizer (scripts/test/merge/tsan.sh runs
+# it; TSAN_BIN is set above, before the rule that needs it). The vendored
+# libraries are not instrumented.
 TSAN_CC   = $(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TEST_INC)
 TSAN_OBJS := $(call oc_objs,$(OBJ_DIR)/tsan,$(TEST_ALL_SRC))
 $(eval $(call oc_obj_rules,$(OBJ_DIR)/tsan,TSAN_CC,$(CC_STAMP),$(TEST_VENDOR)))
 -include $(TSAN_OBJS:.o=.d)
 $(TSAN_BIN): $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build
 	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
+
+PKG_ARCH    ?= $(if $(filter aarch64,$(shell uname -m)),arm64,amd64)
+PKG_VERSION ?= 0
+DIST        ?= dist/linux-$(PKG_ARCH)
+WIN_BIN     ?= build
+WIN_DIST    ?= dist/windows-x64
+test-release:
+	@scripts/test/lib/require_ci.sh test-release
+	+@$(foreach p,$(if $(PART),$(PART),packages image windows),$(MAKE) --no-print-directory test-release-$(p) &&) true
+test-release-packages:
+	scripts/test/release/glibc_floor.sh $(DIST)/openchimed
+	scripts/test/release/same_binary.sh $(DIST) $(PKG_VERSION) $(PKG_ARCH)
+	scripts/test/lib/speech.sh $(DIST)/openchimed
+	scripts/test/release/package.sh $(DIST) $(PKG_VERSION) $(PKG_ARCH)
+	scripts/test/release/unit_file.sh $(DIST)/openchimed
+test-release-image:
+	scripts/test/release/image.sh $(IMAGE)
+	scripts/test/release/db_restore.sh $(IMAGE)
+test-release-windows:
+	scripts/test/release/windows.sh $(WIN_BIN) $(WIN_DIST) $(PKG_VERSION)
 
 # --- The release's compiler (CI) ----------------------------------------------
 # The daemon's sources through the RELEASE's compiler, with the release's flags,

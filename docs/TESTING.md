@@ -59,21 +59,23 @@ suite's recording check), an IPv6 loopback (`::1`), a non-loopback LAN
 address (`test_client_core`'s certificate-trust checks), and a kernel that
 leaves a connection attempt pending (`test_sock`'s connect bound, skipped when
 the kernel answers every SYN). `gdb` is optional and
-makes a crash print every thread's stack. `make test-ci PART=threads` (the
-ThreadSanitizer half) also needs `setarch`; it refuses outside CI, so run it
-locally as `CI=1 make test-ci PART=threads`.
+makes a crash print every thread's stack.
 
-**`make check-release-cc`, `make TTS=1 STT=1 SUM=1`**: add `xz` (zig's
-tarball) and, for the speech and summary builds, `cmake` 3.28+ and a C++17
-compiler (`scripts/build/onnxruntime.sh`, `llamacpp.sh`).
+**`make test-merge` and `make test-release`** run in CI only and refuse
+anywhere else (§4). What they need is installed by the workflows: `xz` (zig's
+tarball), `cmake` 3.28+ and a C++17 compiler for the speech and summary
+builds, `setarch` for the ThreadSanitizer half, Chrome and Node for the web
+client, and for the release checks `podman`, `rpm`, `cpio`, `nsis`,
+`python3-pefile`, and clang and the pinned CMake `scripts/build/makemsix.sh`
+fetches.
 
-**`make web-test` and the web harness** (`scripts/web/*`,
+**The web harness by hand** (`scripts/web/*`,
 `scripts/gui/run.sh --web`): `git` (make fetches Emscripten, about 400 MB, and
 its Node), Chrome (`CHROME=/path`, else the installed `google-chrome` on
 `PATH`; nothing is downloaded), `npm` to install `playwright-core` from
 `package.json` (the scripts do it when it is missing), `openssl` and `python3`.
-`scripts/gui/run.sh` builds nothing by default (`OC_TEST_NO_BUILD=1`): run
-`make web-test` first.
+`scripts/gui/run.sh` builds nothing by default (`OC_TEST_NO_BUILD=1`): build
+the web client (`make WEB=1 web`) first.
 
 **The Win32 GUI harness** (`scripts/gui/*.sh`): WSL2 on a Windows host with an
 interactive desktop session (`powershell.exe` and `/mnt/c` reachable); make
@@ -132,8 +134,8 @@ OpenCV (`cv2`, numpy) for its QR decode, skipped without it.
 
   ```makefile
   test: $(TEST_BIN) $(BIN)
-  	@$(SOURCE_CHECKS)
-  	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" ./$(TEST_BIN)
+  	scripts/test/local/source.sh
+  	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" scripts/test/local/suites.sh
   $(TEST_BIN): $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build
 	$(CC) $(CFLAGS) -O0 -g $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
   ```
@@ -557,10 +559,10 @@ the cache was hit) rather than the clock.
 **Timing.** A verdict that races the wall clock — work that must land inside a
 short real-time window, or a count that depends on where a window's edge falls
 — is a `CHECK_TIMING` (`tests/check.h`), and so is every `CHECK_SPEED`. The
-build pipeline sets `OC_TEST_TIMING=0` (`make test-ci`, and the web step in
-`ci.yml`), which leaves them unjudged so that a busy runner cannot fail a build
-with nothing wrong; `make test` run by hand judges them. (`make web-test` has
-none: it waits on the client's state, §3.4.)
+build pipeline sets `OC_TEST_TIMING=0` (`make test-merge`), which leaves them
+unjudged so that a busy runner cannot fail a build with nothing wrong;
+`make test` judges them. (The web client's checks have none: they wait on the
+client's state, §3.4.)
 The code around them still runs everywhere, ThreadSanitizer included. Each is
 a debt: the fix is an injected clock, an explicit sweep or a wait on the
 outcome, after which it is a `CHECK` again. A new test is written that way
@@ -580,7 +582,7 @@ and `build/tests` prints the total at the end. **Where `CI` is set, a skip is a
 failure**: the runner is meant to have everything, and a check that silently
 stops running is a check that passes while what it covered regresses.
 
-**Enforced.** `scripts/check/tests_lint.sh` runs with the other source checks
+**Enforced.** `scripts/test/local/tests_lint.sh` runs with the other source checks
 before the suite (`make test`, CI's `build` job) and fails on: a sleep call in
 `tests/` outside `tests/check.h` (or a `slow-on-purpose` line); a comparison
 (`strstr`, `strcmp`, `memcmp`, …) whose literal argument has a space and
@@ -593,14 +595,17 @@ failure, so the output is captured first (`grep -q … <<<"$out"`, or a file).
 
 ### 2.4 Which suites run where
 
-`make test` runs every suite, side by side: as many at once as there are CPUs,
-each in a process of its own (`OC_TEST_JOBS`, `tests/main.c`), its output printed
-whole when it ends. It ends by printing each suite's time, slowest first. The
-suites are nearly all waiting -- on timers, sockets, real-time audio and video
--- so the run takes about as long as the slowest suite (`client_core` and
-`netloop`, under a minute each on a 12-core machine); `build/tests` prints every
-suite's time at the end. The budget is two minutes. `OC_TEST_JOBS=1` runs them
-one after another in one process.
+`make test` runs every suite but the slow ones, side by side: as many at once
+as there are CPUs, each in a process of its own (`OC_TEST_JOBS`,
+`tests/main.c`), its output printed whole when it ends. It ends by printing
+each suite's time, slowest first. The suites are nearly all waiting -- on
+timers, sockets, real-time audio and video -- so the run takes about as long as
+the slowest suite it runs. The budget is one minute, build included once built
+(about 20 seconds on a 12-core machine). The slow suites, `SLOW_SUITES` in
+`scripts/test/lib/common.sh` (the network loop, the client core, the database
+writer and media, chosen by those times), run in `make test-merge` on every
+pull request; a suite that pushes `make test` past its minute joins them.
+`OC_TEST_JOBS=1` runs them one after another in one process.
 
 Side by side, suites must not share anything outside their process: each
 suite's files are in its own `oc_test_mkdtemp` directory, and a suite that
@@ -618,17 +623,15 @@ unknown name gets and a new password's key, where production uses 19 MiB.
 Passwords a test sets on the pages must pass the policy (AUTH.md §2): fifteen
 characters or more, not common, not built on the username.
 
-There are two test commands: `make test`, every suite plainly, the one to run
-locally; and `make test-ci`, CI's, which refuses unless `CI` is set (as GitHub
-Actions sets it). `make test-ci` runs each suite once, split by whether its code
-runs threads (CI runs the halves in parallel jobs, `PART=threads` and
+`make test-merge` (CI only, §4) runs every suite once, split by whether its
+code runs threads (CI runs the halves in parallel jobs, `PART=threads` and
 `PART=plain`):
 
 - the suites whose code runs threads — the loop and its I/O
   threads, the writer and readers, the worker pools, the client, the recorder and
   player — under ThreadSanitizer (address randomization off, `tests/tsan.supp`
-  for the one test-only reconfiguration). The list is the Makefile's
-  `TSAN_SUITES` (`mk/tests.mk`); a suite that starts a thread belongs on it.
+  for the one test-only reconfiguration). The list is `TSAN_SUITES`
+  (`scripts/test/lib/common.sh`); a suite that starts a thread belongs on it.
   Two that do are not on it yet, `run_relaykeys_tests` and `run_summary_tests`,
   so they run only in the plain half and never under the sanitizer. The sanitizer run
   judges races, never speed: a limit on how fast code runs — wall-clock time, or
@@ -643,8 +646,8 @@ runs threads (CI runs the halves in parallel jobs, `PART=threads` and
   suites to leave out). A suite with no thread cannot race, so instrumenting it
   would only make it slower.
 
-Locally, `make test` is the one to run before a pull request: nothing builds or
-tests a pull request, and `make test-ci` runs only in the staging build (§4).
+Locally, `make test` is the one to run, before every push; `make test-merge`
+runs on the pull request and in the staging build, and nowhere else (§4).
 
 ---
 
@@ -749,11 +752,13 @@ approves on the page; the TUI reaches the workspace.
 ### 3.2 Runner: a natively-run daemon in CI
 
 Integration tests run **against the daemon binary CI just built**, started
-directly on the runner and driven by `build/e2e_client`.
+directly on the runner and driven by `build/e2e_client`
+(`scripts/test/merge/e2e.sh`, in `make test-merge`).
 
-**The container image is exercised by the staging build's release jobs, not
-here.** Its `image` job builds it with buildah and, before pushing it, starts
-the amd64 image with podman twice over (`.github/workflows/staging-build.yml`):
+**The container image is exercised by `make test-release PART=image`, not
+here.** The staging build's `image` job builds it with buildah and, before
+pushing it, starts the amd64 image with podman twice over
+(`scripts/test/release/image.sh` and `db_restore.sh`):
 
 - **Plain:** no bucket and no key, so no replicator; `/healthz` answers.
 - **Replicated (ARCH-3, ARCH-39):** a bucket served as S3 on the runner by a pinned
@@ -970,16 +975,16 @@ works. The shipped *image* is the staging build's release jobs' to prove (§3.2)
   the loop stops nothing answers the health port. The webhook post itself is
   `test_webhook_vertical`, unchanged.
 
-### 3.4 The web client (`make web-test`)
+### 3.4 The web client (`make test-merge`)
 
-The browser build (WEB.md) is checked where a Chromium is present: a
-developer's box, and CI's `build` job, which runs `make web-test` and the GUI
-smoke on the web platform in the runner's Chrome (§4; make fetches Emscripten
-itself). Every check in it waits on the client's state, never a schedule, so
+The browser build (WEB.md) is checked in CI's `build` job, which runs
+`scripts/test/merge/web.sh` and the GUI smoke on the web platform
+(`scripts/test/merge/gui_web_smoke.sh`) in the runner's Chrome, as part of
+`make test-merge PART=plain` (§4; make fetches Emscripten itself). Every check in it waits on the client's state, never a schedule, so
 all of them are judged there as by hand, `OC_TEST_TIMING=0` or not. The daemon it starts runs in development mode,
 and so serves its own `/app/` page that way: the check signs in by password on
 the daemon's page and bootstraps its user.
-`make web-test` runs the first three:
+`scripts/test/merge/web.sh` runs the first three:
 
 - **The gfx pixel test** — `client/gui/gfx/gfx_test_win.c` compiled to wasm
   over the SDL3 built for it (`build/web/gfx-test.js`), run under Node with
@@ -1032,7 +1037,7 @@ the daemon's page and bootstraps its user.
   Starting and Opening in that order and comes down once the client has
   drawn; the wasm and the loader arrive gzipped; and the second load brings
   the page, the loader and the wasm under 2 KB each, every one a `304`. Needs
-  the web client beside the daemon (`make web`) and `openssl`. `make web-test`
+  the web client beside the daemon (`make web`) and `openssl`. `scripts/test/merge/web.sh`
   runs it after `test.sh`.
 - **`scripts/gui/run.sh --web all`** — the Windows feature scripts against the browser
   ("Driving the web client" below): the smoke, chords, voice input, screen recording,
@@ -1050,17 +1055,35 @@ answer in frames, a ping's pong, and an unmasked frame ending the connection.
 
 ## 4. Continuous integration
 
-The pipeline — what runs on a pull request, the staging build and the two test
-jobs it calls in `.github/workflows/ci.yml` — is CONTRIBUTING.md "CI". The
-local `make test` (`scripts/check/test.sh`, which the pre-push hook requires)
-is the test a change gets before it merges. Nothing is checked twice: each
-suite runs once (§2.4), one clang compile is both the release-compiler and the
-second-compiler check, and what the release jobs check themselves is not
-repeated. The end-to-end step (§3.2) is the one thing the in-process suites
-cannot show, since they link the daemon's code without its `main()`. Of the
-GUI scripts only the smoke runs, on the web platform (§3.4); the longer web
-scripts (uploads, voice, calls, …) take minutes each and stay local, and so
-does `chords`.
+**Three test commands, and every test runs through one of them.** Each test is
+a standalone script under `scripts/test/`; the targets build what the scripts
+need and call them, and the workflows call only the targets.
+
+| Command | Where | Scripts | What it runs |
+|---|---|---|---|
+| `make test` | locally, before every push (`scripts/check/test.sh`, which the pre-push hook requires) | `scripts/test/local/` | the source checks and every suite but the slow ones (§2.4), on the default daemon; about a minute |
+| `make test-merge` | CI only: every pull request (`pr-tests.yml`, a required check) and the staging build, through `ci.yml` | `scripts/test/merge/` | every feature built; every suite, the threaded ones under ThreadSanitizer (§2.4); the static-link check; the end-to-end run (§3.2); the release's compiler; the speech round trip; the web client and the GUI smoke on the web (§3.4) |
+| `make test-release` | CI only: the staging build and the release, on the artifacts they make | `scripts/test/release/` | `PART=packages`: glibc floor, one binary in all three packages, the `.deb` installed and speaking, its unit file; `PART=image`: the image starts, its database replicates and restores (§3.2); `PART=windows`: the binaries' version resources, the installer and the MSIX |
+
+`make test-merge` and `make test-release` refuse to run unless `CI` is set (as
+GitHub Actions sets it): they build every feature and drive the release's
+artifacts, which a developer's machine is not for. Shared helpers are in
+`scripts/test/lib/`.
+
+**The smoke test of a published release** is not one of the three:
+`scripts/smoketest.sh` runs every check in `scripts/smoke/` (the apt and dnf
+repositories install it, each index lists it once more, the released image
+pulls and runs), each one even when another failed, and only in the release,
+after it publishes.
+
+Nothing is checked twice: each suite runs once in `make test-merge`, one clang
+compile is both the release-compiler and the second-compiler check, and the
+end-to-end run (§3.2) is the one thing the in-process suites cannot show,
+since they link the daemon's code without its `main()`. Of the GUI scripts only
+the smoke runs in CI, on the web platform (§3.4); the longer web scripts
+(uploads, voice, calls, …) take minutes each and are run by hand, and so is
+`chords`. The pipeline itself — what runs on a pull request, the staging build,
+the release — is CONTRIBUTING.md "CI".
 
 All run on `ubuntu-24.04`, the image the release builds on too. The native
 build and the tests use the runner's gcc; zig (the release's clang), Emscripten
@@ -1076,12 +1099,14 @@ silence sweep. Echo cancellation is measured by the ERLE harness in
 impulse response over a far-end signal, near-end speech mixed in, clock drift
 injected by resampling one side, and ERLE in dB asserted.
 
-**Speech.** The staging build's release jobs (`staging-build.yml`) render a sentence with read-aloud and require
-`openchimed --stt-hear` to hear its words, on the stripped binary and on the
-installed `.deb`, so each speech feature checks the other by content; the
-speech suites (`tts_worker`, `stt`, `ttskit`) run in CI.
+**Speech.** `scripts/test/lib/speech.sh` renders a sentence with read-aloud
+and requires `openchimed --stt-hear` to hear its words, so each speech feature
+checks the other by content: on the full-feature build (`make test-merge`),
+and on the stripped release binary and the installed `.deb`
+(`make test-release PART=packages`); the speech suites (`tts_worker`, `stt`,
+`ttskit`) run in `make test-merge`.
 
-A new suite is its declaration and one `S(run_<name>_tests)` line in `tests/main.c`; if its code starts a thread it also goes on `TSAN_LIST` in `mk/tests.mk`, and CI runs it with no change here. Nothing checks that it does: the relay-key and summary suites start threads and are missing from the list.
+A new suite is its declaration and one `S(run_<name>_tests)` line in `tests/main.c`; if its code starts a thread it also goes on `TSAN_SUITES` in `scripts/test/lib/common.sh`, and if it is slow, on `SLOW_SUITES`. Nothing checks that it does: the relay-key and summary suites start threads and are missing from the list.
 
 ---
 

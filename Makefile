@@ -2,12 +2,13 @@
 #   make              the daemon (openchimed), quickly: no speech, no summaries, no web client
 #   make full         everything: the daemon with every feature and its data, and every client
 #   make run          a dev daemon on port 8443, every interface, alice/bob
-#   make test         the host test suite
+#   make test         the fast tests, before every push (local)
+#   make test-merge   everything a pull request must pass (CI only; PART=plain|threads)
+#   make test-release the checks on what the release ships (CI only; PART=packages|image|windows)
 #   make clients      every client below
 #   make linux        the Linux client (the TUI today; the GUI when it exists)
 #   make windows      the Windows GUI and TUI (mingw-w64)
 #   make web          the browser client (emsdk)
-#   make web-test     the browser client's checks, in a headless Chromium
 #   make clean        everything built, except the downloaded speech models
 #   make distclean    everything built, and the remembered configuration
 # There is one build: what a box is for -- a deployment, the tests and
@@ -25,14 +26,15 @@
 # so `make full` needs only cc, cmake, python3, git, curl, xz, bzip2 and nasm
 # installed.
 #
-# CI's own: make test-ci, make check-release-cc. Tool binaries are built by
+# Each test is a script in scripts/test/ that one of these targets calls; the
+# workflows call only the targets. Tool binaries are built by
 # their path (make build/demo_client, build/bench_load, build/bench_loop,
 # build/tuikit-demo, build/tts_pack, build/s3_smoke, build/e2e_client,
 # build/signin, build/sdltext_test.exe, build/gfx_test.exe). The rules live in
-# mk/, one file per concern; scripts/check/make_targets.sh keeps the typed
+# mk/, one file per concern; scripts/test/local/make_targets.sh keeps the typed
 # targets (the list above and PUBLIC/INTERNAL) in step, not this tool list.
-PUBLIC   := all full run test clients linux windows web web-test clean distclean
-INTERNAL := test-ci check-release-cc ci-only test-ci-plain test-ci-threads FORCE
+PUBLIC   := all full run test test-merge test-release clients linux windows web clean distclean
+INTERNAL := test-merge-plain test-merge-threads test-release-packages test-release-image test-release-windows check-release-cc FORCE
 .PHONY: $(PUBLIC) $(INTERNAL)
 
 CC ?= cc

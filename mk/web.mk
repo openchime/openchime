@@ -30,7 +30,7 @@ $(WEB_MEDIA_LIBS) &: $(EMCC)
 	@touch -c $(WEB_MEDIA_LIBS)
 
 # The drawing layer's own pixel test (client/gui/gfx), built for wasm and run
-# under Node by `make web-test`.
+# under Node by `make test-merge` (scripts/test/merge/web.sh).
 WEB_GFX_SRC   := $(GFX_SRC) client/shared/icons.c
 WEB_GFX_FLAGS := -std=c99 -O2 $(WARN_CFLAGS) -Wno-typedef-redefinition -pthread \
                  -Iclient/gui/gfx -Iclient/shared -I$(WEB_SDL3)/include
@@ -103,11 +103,3 @@ $(WEBAPP_RES): client/gui/platform/web/openchime.html $(WEBAPP_JS) scripts/build
 	python3 scripts/build/embed_res.py $@ oc_webapp_html=client/gui/platform/web/openchime.html oc_webapp_js=$(WEBAPP_JS) \
 	    oc_webapp_js_gz=$(if $(WEBAPP_JS),gzip:$(WEBAPP_JS))
 
-# The client's checks: the gfx pixel test under Node, then the client signing
-# in, drawing, recording and composing in a headless Chromium
-# (scripts/web/test.sh), against a daemon built with the client in it.
-web-test: $(WEB_DIR)/gfx-test.js $(WEB_DIR)/openchime.js
-	@$(MAKE) --no-print-directory WEB=1 $(BIN)
-	$(NODE) $(WEB_DIR)/gfx-test.js
-	scripts/web/test.sh
-	scripts/web/pages.sh

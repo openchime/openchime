@@ -50,7 +50,7 @@ jobs:
       # A pull request that changes only documentation skips the local test run
       # (.githooks/pre-push), so the tree's no-issue-numbers rule is checked
       # here over the pull request's tree, with the base branch's copy of
-      # scripts/check/refs.sh: nothing of the pull request's runs.
+      # scripts/test/local/refs.sh: nothing of the pull request's runs.
       - name: No issue numbers in the tree
         env:
           BASE: ${{ github.base_ref }}
@@ -58,7 +58,11 @@ jobs:
           set -euo pipefail
           git worktree add -q "$RUNNER_TEMP/base" "origin/${BASE}"
           git worktree add -q "$RUNNER_TEMP/head" HEAD
-          cd "$RUNNER_TEMP/head" && sh "$RUNNER_TEMP/base/scripts/check/refs.sh"
+          # A base from before the source checks moved to scripts/test/local/
+          # has its copy under scripts/check/.
+          refs="$RUNNER_TEMP/base/scripts/test/local/refs.sh"
+          [ -f "$refs" ] || refs="$RUNNER_TEMP/base/scripts/check/refs.sh"
+          cd "$RUNNER_TEMP/head" && sh "$refs"
       - name: Title and body
         env:
           GH_TOKEN: ${{ github.token }}

@@ -653,7 +653,7 @@ model; translate input to intents }, stop.
   mirroring the accessibility tree, the credential store, notifications, file
   pickers and media capture. Nothing is installed: the browser loads it from the
   workspace. The application is the same sources as Windows over
-  `client/gui/platform/web/` (`make web`, `make web-test`); the design is
+  `client/gui/platform/web/` (`make web`; checked by `make test-merge`); the design is
   [WEB.md](./WEB.md).
 
 **Across the graphical frontends.** Win32 is the reference client (ARCH-82): it
@@ -1269,7 +1269,7 @@ release number is a label on a build and is not in either binary, so the build
 is what is shown. **Copy** puts the whole as one line on the clipboard --
 `OpenChime client 74359c0 (win32), server 74359c0, protocol 27` -- for pasting
 into a report; the harness's `about` verb opens the dialog and answers that
-line, which `make web-test` checks.
+line, which `make test-merge` checks (TESTING.md §3.4).
 
 ### What the window says, and where (REQ-263)
 

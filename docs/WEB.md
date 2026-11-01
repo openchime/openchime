@@ -41,7 +41,7 @@ behind it (`client/gui/platform/web/secret_mem.c`).
 
 **The drawing layer in a browser.** SDL3 builds for wasm from the same release
 the Windows client uses (`scripts/build/sdl3_wasm.sh`), and `oc_gfx` compiles
-over it unchanged. `make web-test` runs the backend's own pixel test
+over it unchanged. `scripts/test/merge/web.sh` runs the backend's own pixel test
 (`client/gui/gfx/gfx_test_win.c`, the same assertions) under Node first.
 
 **The application in a browser.** `make web` compiles the application
@@ -63,7 +63,7 @@ text fields are drawn by the application on every platform (CLIENT.md, "The
 text fields are drawn"), so the sign-in field, the search boxes and a form's
 fields are the same code here. Signed in with a password, it
 shows the workspace: the sidebar, a channel's transcript with mentions, the
-member pane, the composer; `make web-test` checks that through the client's
+member pane, the composer; `scripts/test/merge/web.sh` checks that through the client's
 own test hook (the model dumped, a screenshot taken) in a headless Chromium.
 
 **The browser platform** (`client/gui/platform/web/`), what a page can do of
@@ -204,7 +204,7 @@ the media clock. One context per device rate; where the browser gave a
 context another rate (Safari for a microphone), a speexdsp resampler runs in
 the callback. A browser that cannot start the worklet falls back to a
 `ScriptProcessorNode` on the page's thread (1024 frames of latency), and the
-console says which ran (`oc-web: audio worklet`); `make web-test` requires
+console says which ran (`oc-web: audio worklet`); `scripts/test/merge/web.sh` requires
 the worklet (TESTING.md §3.4). The device lists come from a cache the page keeps
 (`devices_web.c`), so any thread can ask; the labels appear once a device
 has been allowed, as the browser decides.
@@ -221,7 +221,7 @@ with each right-to-left run measured and drawn with the canvas's direction
 set and a line's runs placed in visual order, and alignment following the
 paragraph's reading direction as DirectWrite's does. Tested on the host
 (`tests/test_sdltext_unicode.c`) and in the browser through the client's
-`sttest` verb, which `make web-test` runs by hand.
+`sttest` verb, which `scripts/web/test.sh` runs by hand.
 
 **The input method.** A browser's IME composes into an element, so the
 platform keeps a hidden `<input>` at the caret (`oc_plat_text_input_area`,
@@ -229,7 +229,7 @@ the contract's one line for it; Win32 answers with SDL's text input area)
 and hands its composition to SDL's own events -- `SDL_EVENT_TEXT_EDITING`
 while composing, `SDL_EVENT_TEXT_INPUT` at the commit -- so the composer
 shows the composition underlined and takes the result as it does from a
-desktop IME. `make web-test`, run by hand, plays a Japanese composition into it.
+desktop IME. `scripts/web/test.sh`, run by hand, plays a Japanese composition into it.
 
 Rough edges: fonts are the browser's, so layouts are near-identical to
 Windows, not pixel-identical, and the harness compares state, not pixels. The picker and the clipboard need a
@@ -265,7 +265,6 @@ the system's notification sounds, a crash dump, UDP for a call.
 ```
 make web                             # the client in build/web; the first run fetches Emscripten 6.0.8 (mk/toolchains.mk) and builds SDL3, mbedTLS and the codecs for wasm once
 make WEB=1                           # the daemon with the client compiled in and web/openchime.wasm beside it (remembered; `make full` does the same)
-make web-test                        # gfx under Node, then the client in a headless Chromium (development mode: the check signs in by password)
 python3 scripts/web/serve.py build/web  # the dev server: http://127.0.0.1:8765/openchime.html?host=…&port=…
 ```
 
@@ -277,5 +276,7 @@ native trees in `third_party/`. The page takes the workspace in its query
 (`host` and `port`, or `ws`, for a page served from elsewhere than the
 daemon; they become the application's `--signin`) and, on a page in
 development mode, with `hook=1`, the client's test hook on the page's
-filesystem (`ocHook('verb')`, `ocShot()`), which is what the test drives. `make web-test` needs Chrome: the one `CHROME` names, else the installed
-`google-chrome` on `PATH`.
+filesystem (`ocHook('verb')`, `ocShot()`), which is what the test drives. The
+client's checks (`scripts/test/merge/web.sh`) run in `make test-merge`, in CI
+(TESTING.md §3.4); they need Chrome: the one `CHROME` names, else the
+installed `google-chrome` on `PATH`.
