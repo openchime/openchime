@@ -458,7 +458,7 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 28);     /* OPENCHIME_MODE among them */
+    CHECK(operator_rows == 29);     /* OPENCHIME_MODE among them */
     CHECK(managed_rows == 7);
     CHECK(dev_rows == 4 + 12);      /* the daemon's four, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);

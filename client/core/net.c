@@ -1210,6 +1210,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     if (n2) memcpy(e->pf_voice, ue[i].voice_id.ptr, n2);
                     e->pf_voice[n2] = '\0';
                 }
+                e->user_system = (ue[i].flags & OC_USER_SYSTEM) != 0;
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_PRESENCE_UPDATE) {

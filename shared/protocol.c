@@ -1463,6 +1463,7 @@ const char *oc_error_text(uint16_t code) {
     case OC_ERR_POLL_CLOSED: return "the poll has closed";
     case OC_ERR_POLL_HAS_VOTES: return "people have voted, so the options and settings can no longer change";
     case OC_ERR_EDIT_WINDOW_CLOSED: return "this workspace no longer lets you change or delete that message";
+    case OC_ERR_WORKSPACE_SENDER: return "messages from the workspace take no replies";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
@@ -2410,6 +2411,7 @@ oc_result oc_encode_user_list(oc_wbuf *w, uint16_t version, const oc_user_list *
         oc_w_str(w, m->entries[i].full_name);      /* REQ-240/289 */
         oc_w_str(w, m->entries[i].pronouns);
         oc_w_str(w, m->entries[i].voice_id);       /* REQ-292 */
+        oc_w_u8(w, m->entries[i].flags);           /* OC_USER_SYSTEM */
     }
     return oc_frame_end(w, off);
 }
@@ -3582,6 +3584,7 @@ oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries,
         oc_slice fname = oc_r_str(p);
         oc_slice prn = oc_r_str(p);
         oc_slice voice = oc_r_str(p);
+        uint8_t flags = oc_r_u8(p);
         if (i < cap) {
             entries[i].user_id = uid;
             entries[i].role = role;
@@ -3596,6 +3599,7 @@ oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries,
             entries[i].full_name = fname;
             entries[i].pronouns = prn;
             entries[i].voice_id = voice;
+            entries[i].flags = flags;
         }
     }
     return r_done(p);

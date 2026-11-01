@@ -586,6 +586,10 @@ typedef struct {
     /* The tenant roster (REQ, LIST_USERS) + whether the roster view is open. */
     uint8_t   roster_open;
     oc_member *users;
+    /* The workspace's own sender (USER_LIST `flags`, OC_USER_SYSTEM), which
+     * posts what the workspace says, such as its welcome. Kept out of `users`,
+     * so no list of people can offer it; 0 until the daemon names one. */
+    uint64_t   ws_sender;
     size_t    n_users, cap_users;
     /* Notification preferences (REQ-130/131): the DND window (minutes since
      * midnight, local) + whether the prefs overlay is open. Per-channel levels
@@ -1197,6 +1201,9 @@ void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status);
 
 /* Roster lookups: a user's display name ("" if unknown), or an id by name (0). */
 const char *oc_model_user_name(const oc_model *m, uint64_t user_id);
+/* Whether `user_id` is the workspace's own sender, not a person: its messages
+ * are the workspace's, and it is offered nowhere a person is. */
+int oc_model_is_workspace_sender(const oc_model *m, uint64_t user_id);
 /* 1 when the user has been removed from the workspace (REQ-033): shown as
  * deactivated, their avatar dimmed. */
 int         oc_model_user_disabled(const oc_model *m, uint64_t user_id);

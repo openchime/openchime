@@ -2405,7 +2405,9 @@ static void test_index_mentions(void) {
                            "  key_pem TEXT, issued_at_ms INTEGER, not_after_ms INTEGER);"
                            "CREATE TABLE local_issuer (id INTEGER PRIMARY KEY, key_pem TEXT, issuer TEXT, created_at_ms INTEGER);"
                            /* 0065's polls. */
-                           "DROP TABLE poll_votes; DROP TABLE poll_options; DROP TABLE polls;",
+                           "DROP TABLE poll_votes; DROP TABLE poll_options; DROP TABLE polls;"
+                           /* 0066's workspace sender. */
+                           "ALTER TABLE users DROP COLUMN is_system;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -9222,6 +9224,136 @@ static void test_broadcast_rules(void) {
     cleanup_db(path);
 }
 
+/* OPENCHIME_WELCOME_MESSAGE: each new member, however their account was made,
+ * is sent the text as it is when they join, once, in a DM from the workspace's
+ * own sender; an existing member is not; empty sends nothing. The sender is
+ * nobody's to sign in as, mention, DM, change or reply to, and USER_LIST
+ * marks it. */
+static char *welcome_of(const char *path, uint64_t uid) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    char *out = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK) return NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT m.body FROM messages m JOIN users s ON s.id = m.author_id AND s.is_system = 1 "
+        "JOIN channels c ON c.id = m.channel_id AND c.kind = 'dm' "
+        "JOIN channel_members cm ON cm.channel_id = m.channel_id AND cm.user_id = ?1 ORDER BY m.id;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        out = strndup((const char *)sqlite3_column_blob(st, 0), (size_t)sqlite3_column_bytes(st, 0));
+        if (sqlite3_step(st) == SQLITE_ROW) { free(out); out = strdup("(twice)"); }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return out;
+}
+static int welcome_is(const char *path, uint64_t uid, const char *want) {
+    char *got = welcome_of(path, uid);
+    int ok = want ? got && !strcmp(got, want) : got == NULL;
+    free(got);
+    return ok;
+}
+static void set_welcome(const char *v) {
+    char err[256];
+    if (v) setenv("OPENCHIME_WELCOME_MESSAGE", v, 1); else unsetenv("OPENCHIME_WELCOME_MESSAGE");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+}
+static void test_welcome_message(void) {
+    const char *path = tdb("welcome.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    set_welcome(NULL);
+    uint64_t owner = reg(w, "wm-owner", "pw", OC_ROLE_OWNER);
+    CHECK(owner && welcome_is(path, owner, NULL));
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM users WHERE is_system=?1", 1) == 0);   /* not made until needed */
+
+    /* Local registration: the text, with \n as a line break. */
+    set_welcome("Hello **there**.\\nStart in #general.");
+    uint64_t a = reg(w, "wm-a", "pw", OC_ROLE_MEMBER);
+    CHECK(a && welcome_is(path, a, "Hello **there**.\nStart in #general."));
+    CHECK(welcome_is(path, owner, NULL));                   /* an existing member is not sent it */
+
+    /* An invitation redeemed after the text changed: the text at joining. */
+    oc_dbres *r = invite_user(w, owner, OC_ROLE_MEMBER);
+    CHECK(r && r->type == OC_RES_INVITE_OK);
+    uint8_t tok[OC_INVITE_TOKEN_LEN];
+    if (r) memcpy(tok, r->session_token, OC_INVITE_TOKEN_LEN);
+    oc_dbres_free(r);
+    set_welcome("Welcome, again.");
+    r = redeem_invite(w, tok, "wm-invited", "wm-invited-pass");
+    uint64_t b = (r && r->type == OC_RES_AUTH_OK) ? r->user_id : 0;
+    oc_dbres_free(r);
+    CHECK(b && welcome_is(path, b, "Welcome, again."));
+    CHECK(welcome_is(path, a, "Hello **there**.\nStart in #general."));   /* once, not again */
+
+    /* A first sign-in through a provider. */
+    {
+        oc_issuer is;
+        CHECK(oc_issuer_init(&is, "oc-dbw-welcome") == 0);
+        const char *ISS = "https://auth.openchime.io", *AUD = "acme.example";
+        CHECK(oc_dbwriter_configure_oidc(w, ISS, AUD, is.pem, "authorize=https://auth.openchime.io/authorize") == 0);
+        char why[128];
+        CHECK(oc_dbwriter_configure_join_rules(w, "tenant:google:acme.example", why, sizeof why) == 0);
+        char HDR[160], payload[1024], token[4096];
+        oc_issuer_header(&is, HDR, sizeof HDR);
+        unsigned long long now = (unsigned long long)time(NULL);
+        oc_issuer_payload(payload, sizeof payload, ISS, AUD, "google|wm7", "jti-welcome", now - 5, now + 290,
+                          "\"email\":\"wm@acme.example\",\"name\":\"WM\","
+                          "\"idp\":\"google\",\"tenant\":\"acme.example\"");
+        size_t tlen = oc_issuer_mint(&is, HDR, payload, token);
+        oc_job *j = oc_job_new(OC_JOB_AUTH, 21);
+        j->method = OC_AUTH_OIDC;
+        oc_job_set_token(j, token, tlen);
+        oc_job_set_proof(j, OC_ISSUER_VERIFIER, strlen(OC_ISSUER_VERIFIER));
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        uint64_t c = (r && r->type == OC_RES_AUTH_OK) ? r->user_id : 0;
+        oc_dbres_free(r);
+        CHECK(c && welcome_is(path, c, "Welcome, again."));
+        oc_issuer_free(&is);
+    }
+
+    /* Empty: nothing. */
+    set_welcome("");
+    uint64_t d = reg(w, "wm-d", "pw", OC_ROLE_MEMBER);
+    CHECK(d && welcome_is(path, d, NULL));
+
+    /* The sender: one row, marked on USER_LIST, nobody's to act on. */
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM users WHERE is_system=?1", 1) == 1);
+    uint64_t sys = (uint64_t)e2e_scalar(path, "SELECT id FROM users WHERE is_system=?1", 1);
+    r = list_users(w, owner);
+    int marked = 0, people = 0;
+    for (size_t i = 0; r && i < r->n_ulist; i++) {
+        if (r->ulist[i].user_id == sys) marked = r->ulist[i].flags == OC_USER_SYSTEM;
+        else people += r->ulist[i].flags == 0;
+    }
+    CHECK(marked && people == (int)r->n_ulist - 1);
+    oc_dbres_free(r);
+    uint16_t code = 0;
+    char *t = page_signin(w, 30, "Workspace", "x", NULL, &code);
+    CHECK(t == NULL && code != 0);
+    free(t);
+    r = open_dm(w, a, sys);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    CHECK(set_role(w, owner, sys, OC_ROLE_ADMIN) == OC_ERR_FORBIDDEN);
+    CHECK(remove_user(w, owner, sys) == OC_ERR_FORBIDDEN);
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0x57, sizeof idem);
+    uint64_t mid = send_msg(w, owner, idem, "thanks @Workspace");
+    CHECK(mid && mention_rows(path, mid, sys, -1) == 0);
+    uint64_t wdm = (uint64_t)e2e_scalar(path,
+        "SELECT m.channel_id FROM messages m JOIN users s ON s.id=m.author_id AND s.is_system=1 "
+        "JOIN channel_members cm ON cm.channel_id=m.channel_id WHERE cm.user_id=?1", a);
+    CHECK(wdm && send_to(w, a, wdm, "thanks!") == OC_ERR_WORKSPACE_SENDER);
+
+    set_welcome(NULL);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
@@ -9274,6 +9406,7 @@ int run_dbwriter_tests(void) {
     test_search_filters_and_paging();
     test_edit_windows();
     test_broadcast_rules();
+    test_welcome_message();
     test_default_channels();
     test_search_orders();
     test_setup_invite();

@@ -213,10 +213,10 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 28** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 30** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
-> 28 appended `sort` and `cursor_rank` to `SEARCH` and `rank` to each
-> `SEARCH_RESULTS` entry (§5.11). Since the
+> 30 appended `flags` to each `USER_LIST` entry, marking the workspace's own
+> sender. Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
 > change moves the number even when it adds one byte.
@@ -932,7 +932,15 @@ Each entry, in wire order:
 `user_id` (u64) · `role` (u8) · `disabled` (u8) · `email` (str) ·
 `display_name` (str) · `avatar_id` (u64) · `title` (str) · `timezone` (str) ·
 `status_emoji` (str) · `status_text` (str) · `full_name` (str) ·
-`pronouns` (str) · `voice_id` (str).
+`pronouns` (str) · `voice_id` (str) · `flags` (u8, since version 30).
+
+`flags` bit `0x01` (`OC_USER_SYSTEM`) marks **the workspace's own sender**: the
+account that posts what the workspace says, such as the welcome a new member is
+sent (`OPENCHIME_WELCOME_MESSAGE`). It is not a person. A client draws its
+messages as the workspace's, with no avatar of a person, keeps it out of every
+list of people (the roster, the directory, a member picker, mention
+completion), and offers no DM, profile or role action on it. Nothing signs in
+as it, and a message sent into its DM is refused with `WORKSPACE_SENDER`.
 
 A **phone number is deliberately absent**: it is contact detail rather than
 something drawn beside a name, and every member's number in every roster
@@ -3156,6 +3164,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3039` | `POLL_CLOSED`         | messaging  | no    | The poll is past its deadline and takes no more votes (REQ-225). |
 | `3040` | `POLL_HAS_VOTES`      | messaging  | no    | An `EDIT_POLL` changing a poll's options or settings after someone voted; only its deadline can change now (REQ-225). |
 | `3041` | `EDIT_WINDOW_CLOSED`  | messaging  | no    | An author's `EDIT`, or `DELETE` of their own message, past the window the workspace's configuration sets (`OPENCHIME_EDIT_WINDOW`, `OPENCHIME_DELETE_WINDOW`, which clients are told as `edit_window` and `delete_window`). An admin's or owner's delete of someone else's message is never limited (REQ-051, REQ-052). |
+| `3042` | `WORKSPACE_SENDER`    | messaging  | no    | A message, reply or file sent into a DM with the workspace's own sender (`USER_LIST` `flags`), whose DMs nobody reads. |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing

@@ -582,9 +582,14 @@ static void user_update_role(oc_model *m, uint64_t user_id, uint8_t role, uint8_
 }
 
 const char *oc_model_user_name(const oc_model *m, uint64_t user_id) {
+    if (oc_model_is_workspace_sender(m, user_id)) return "Workspace";
     for (size_t i = 0; i < m->n_users; i++)
         if (m->users[i].user_id == user_id) return m->users[i].label;
     return "";
+}
+
+int oc_model_is_workspace_sender(const oc_model *m, uint64_t user_id) {
+    return m && user_id && user_id == m->ws_sender;
 }
 
 int oc_model_user_disabled(const oc_model *m, uint64_t user_id) {
@@ -2834,6 +2839,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             snprintf(m->status, sizeof m->status, "This workspace has moved to %s; it is used from now on.", e->body);
         break;
     case OC_EV_USER:
+        if (e->user_system) { m->ws_sender = e->user_id; break; }
         user_upsert(m, e->user_id, e->body ? e->body : "", e->status, e->op, e->message_id);
         /* The roster carries the profile fields now (REQ-289), so every surface
          * that shows a person can show them — the profile card included, which

@@ -6079,6 +6079,7 @@ static size_t encode_user_list(const oc_dbres *r) {
         ents[i].full_name = oc_slice_str(r->ulist[i].full_name ? r->ulist[i].full_name : "");
         ents[i].pronouns = oc_slice_str(r->ulist[i].pronouns ? r->ulist[i].pronouns : "");
         ents[i].voice_id = oc_slice_str(r->ulist[i].voice_id ? r->ulist[i].voice_id : "");
+        ents[i].flags = r->ulist[i].flags;
     }
     oc_wbuf w;
     oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);

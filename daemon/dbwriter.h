@@ -947,6 +947,7 @@ typedef struct {
     /* The voice this person is read aloud in (REQ-292). Everyone hears the same
      * one for the same author, so the roster carries it like a name decoration. */
     char    *voice_id;      /* heap; may be "" */
+    uint8_t  flags;         /* OC_USER_SYSTEM: the workspace's own sender */
 } oc_user_row;
 
 /* One message to replay on reconnect (rendered as a BROADCAST by the net thread),

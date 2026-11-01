@@ -173,8 +173,13 @@
  * 28: SEARCH carries `sort` and `cursor_rank`, and each SEARCH_RESULTS entry its
  * `rank`, so search can be ordered oldest first or by relevance and still be
  * paged by a keyset (REQ-080). Fields appended to two layouts, one of them a
- * repeated entry. */
-#define OC_PROTOCOL_VERSION 28u
+ * repeated entry.
+ *
+ * 30: each USER_LIST entry carries `flags`, OC_USER_SYSTEM marking the
+ * workspace's own sender (the welcome a new member is sent), which a client
+ * draws as the workspace and keeps out of its people lists. A byte appended
+ * to a repeated entry. (29 is SEARCH's audit filters.) */
+#define OC_PROTOCOL_VERSION 30u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -673,6 +678,7 @@ typedef enum {
     OC_ERR_POLL_CLOSED         = 3039, /* the poll is past its deadline: no more votes (REQ-225) */
     OC_ERR_POLL_HAS_VOTES      = 3040, /* a poll's options or settings, once anyone has voted (REQ-225) */
     OC_ERR_EDIT_WINDOW_CLOSED  = 3041, /* an author's edit or delete of their own message, past the workspace's window (REQ-051/052) */
+    OC_ERR_WORKSPACE_SENDER    = 3042, /* a message to the workspace's own sender, whose DMs nobody reads */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -1666,7 +1672,11 @@ typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice emai
                  oc_slice full_name; oc_slice pronouns;
                  /* Everyone hears the same voice for the same author (REQ-292),
                   * so it travels with the roster, not only with the card. */
-                 oc_slice voice_id; } oc_user_list_entry;
+                 oc_slice voice_id;
+                 /* OC_USER_SYSTEM: the workspace's own sender, which posts
+                  * what the workspace says (its welcome); not a person. */
+                 uint8_t flags; } oc_user_list_entry;
+#define OC_USER_SYSTEM 0x01u
 typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
 typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;
 /* `email` binds the invite to an address, consumed at that address's first

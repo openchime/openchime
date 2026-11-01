@@ -4062,6 +4062,13 @@ static void draw_user_avatar(gfx *rt, const oc_model *m, uint64_t uid,
     uint32_t tint = avatar_tint(uid);
     uint64_t aid = avatar_of(m, uid);
     float radius = avatar_corner(box);
+    /* The workspace's own sender: the workspace's mark, not a person's face. */
+    if (oc_model_is_workspace_sender(m, uid)) {
+        fill_round(rt, box, radius, OC_COL_ACCENT);
+        float in = (box.right - box.left) * 0.22f;
+        draw_lucide(rt, OC_ICON_HOME, rf(box.left + in, box.top + in, box.right - in, box.bottom - in), 0xFFFFFF);
+        return;
+    }
     /* Removed from the workspace (REQ-033): shown disabled, a plain grey tile
      * with the initial in place of the photo and the colour. */
     if (oc_model_user_disabled(m, uid)) {
@@ -11814,6 +11821,8 @@ static void profile_close(void) {
  * profile is not a state to render nicely; it is one to refuse. */
 static int profile_open(uint64_t uid) {
     const oc_model *m = model();
+    /* The workspace's own sender is not a person: it has no card. */
+    if (m && oc_model_is_workspace_sender(m, uid)) return 0;
     const char *nm = (m && uid) ? oc_model_user_name((oc_model *)m, uid) : NULL;
     if (!nm || !nm[0]) {
         fb_failed("That person is not in this workspace.");
@@ -17109,7 +17118,7 @@ static rectf g_dm_compose_btn;
  * somewhere in the sidebar. A button labelled "Message" that does not take you to
  * the message is not a button that half works; it is one that does not work. */
 static void open_dm_go(uint64_t uid) {
-    if (!g_client || !uid) return;
+    if (!g_client || !uid || oc_model_is_workspace_sender(model(), uid)) return;
     g_view = VIEW_HOME;
     g_dm_pending = uid;
     oc_client_open_dm(g_client, uid, 0);
@@ -24847,6 +24856,11 @@ static void composer_send(void) {
             composer_hint("This channel is archived, so it is read-only.", 1);
             return;
         }
+        /* The workspace's own DM (its welcome): nobody reads a reply. */
+        if (c && c->kind == OC_CHANNEL_KIND_DM && oc_model_is_workspace_sender(m, c->peer_id)) {
+            composer_hint("Messages from the workspace take no replies.", 1);
+            return;
+        }
         /* An encrypted DM takes text only while its session is open here; the
          * text stays in the box otherwise (PRIVATE-DM.md). */
         if (c && c->e2e) {
@@ -27276,6 +27290,7 @@ static void msg_menu_react(int idx) {
 }
 
 static void show_member_menu(oc_win *hwnd, const oc_model *m, uint64_t uid, float cx, float cy) {
+    if (oc_model_is_workspace_sender(m, uid)) return;   /* not a person: nothing to do to it */
     int self = (uid == m->user_id);
     uint8_t me = self_role(m);
     g_n_mi = 0;

@@ -954,7 +954,7 @@ static int user_slots_full(sqlite3 *db, const char *subject, size_t sublen, int 
     sqlite3_finalize(st);
     if (exists) return 0;
     int count = 0;
-    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM users WHERE disabled=0;", -1, &st, NULL);
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM users WHERE disabled=0 AND is_system=0;", -1, &st, NULL);
     if (sqlite3_step(st) == SQLITE_ROW) count = sqlite3_column_int(st, 0);
     sqlite3_finalize(st);
     return count >= max_users;
@@ -1184,7 +1184,9 @@ static uint64_t lookup_session(sqlite3 *db, const uint8_t *token, size_t tlen,
 static int user_role(sqlite3 *db, uint64_t uid, uint8_t *role_out) {
     sqlite3_stmt *st = NULL;
     int found = 0;
-    sqlite3_prepare_v2(db, "SELECT role FROM users WHERE id=?;", -1, &st, NULL);
+    /* The workspace's own sender is nobody's to act on: as a target it is
+     * unknown, so no role, removal, DM, invite or group reaches it. */
+    sqlite3_prepare_v2(db, "SELECT role FROM users WHERE id=? AND is_system=0;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
     if (sqlite3_step(st) == SQLITE_ROW) {
         *role_out = role_to_u8((const char *)sqlite3_column_text(st, 0));
@@ -1481,7 +1483,7 @@ static uint64_t identity_user(sqlite3 *db, const char *issuer, const char *subje
 static uint64_t user_by_subject(sqlite3 *db, const char *subject) {
     sqlite3_stmt *st = NULL;
     uint64_t uid = 0;
-    sqlite3_prepare_v2(db, "SELECT id FROM users WHERE subject=?;", -1, &st, NULL);
+    sqlite3_prepare_v2(db, "SELECT id FROM users WHERE subject=? AND is_system=0;", -1, &st, NULL);
     sqlite3_bind_text(st, 1, subject, -1, SQLITE_STATIC);
     if (sqlite3_step(st) == SQLITE_ROW) uid = (uint64_t)sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
@@ -2747,7 +2749,7 @@ static void user_rows(sqlite3 *db, uint64_t only, oc_dbres *r) {
         "SELECT id, role, disabled, COALESCE(email,''), COALESCE(display_name,''), "
         "       COALESCE(avatar_attachment_id,0), COALESCE(title,''), COALESCE(timezone,''), "
         "       COALESCE(status_emoji,''), COALESCE(status_text,''), status_expires_ms, "
-        "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(voice_id,'') "
+        "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(voice_id,''), is_system "
         "FROM users WHERE ?1 = 0 OR id = ?1 ORDER BY id;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)only);
     size_t cap = 8, n = 0;
@@ -2776,6 +2778,7 @@ static void user_rows(sqlite3 *db, uint64_t only, oc_dbres *r) {
         arr[n].full_name    = strdup((const char *)sqlite3_column_text(st, 11));
         arr[n].pronouns     = strdup((const char *)sqlite3_column_text(st, 12));
         arr[n].voice_id     = strdup((const char *)sqlite3_column_text(st, 13));
+        arr[n].flags        = sqlite3_column_int(st, 14) ? OC_USER_SYSTEM : 0;
         n++;
     }
     sqlite3_finalize(st);
@@ -4074,6 +4077,21 @@ static int channel_is_archived(sqlite3 *db, uint64_t channel_id) {
  * so broadcasts reach them); CH_UNKNOWN: no such channel; CH_DENIED: a private
  * channel the user does not belong to. */
 enum { CH_OK = 0, CH_UNKNOWN = 1, CH_DENIED = 2, CH_ARCHIVED = 3 };
+
+/* Whether `channel_id` is a DM with the workspace's own sender: what the
+ * workspace says there takes no reply, since nobody reads it. */
+static int workspace_dm(sqlite3 *db, uint64_t channel_id) {
+    sqlite3_stmt *st = NULL;
+    int yes = 0;
+    sqlite3_prepare_v2(db,
+        "SELECT 1 FROM channels c JOIN channel_members cm ON cm.channel_id = c.id "
+        "JOIN users u ON u.id = cm.user_id WHERE c.id = ?1 AND c.kind = 'dm' AND u.is_system = 1;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+    yes = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return yes;
+}
 static int channel_post_access(sqlite3 *db, uint64_t channel_id, uint64_t user_id) {
     uint8_t is_public = 0;
     if (!channel_exists(db, channel_id, &is_public)) return CH_UNKNOWN;
@@ -4393,7 +4411,7 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
             sqlite3_stmt *q = NULL;
             if (sqlite3_prepare_v2(db,
                     "SELECT u.id FROM users u JOIN channel_members cm ON cm.user_id = u.id "
-                    "WHERE cm.channel_id = ?1 AND u.disabled = 0 "
+                    "WHERE cm.channel_id = ?1 AND u.disabled = 0 AND u.is_system = 0 "
                     "  AND lower(u.display_name) = lower(?2) LIMIT 1;", -1, &q, NULL) != SQLITE_OK)
                 continue;
             sqlite3_bind_int64(q, 1, (sqlite3_int64)channel_id);
@@ -4409,7 +4427,7 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
                 sqlite3_stmt *w = NULL;
                 if (sqlite3_prepare_v2(db,
                         "SELECT id, display_name FROM users "
-                        "WHERE disabled = 0 AND lower(display_name) = lower(?1) LIMIT 1;",
+                        "WHERE disabled = 0 AND is_system = 0 AND lower(display_name) = lower(?1) LIMIT 1;",
                         -1, &w, NULL) == SQLITE_OK) {
                     sqlite3_bind_text(w, 1, m[i].name, -1, SQLITE_STATIC);
                     if (sqlite3_step(w) == SQLITE_ROW) {
@@ -4632,6 +4650,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     if (acc == CH_UNKNOWN) { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
     if (acc == CH_DENIED)  { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
     if (acc == CH_ARCHIVED){ r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
+    if (workspace_dm(db, j->channel_id)) { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_WORKSPACE_SENDER; return r; }
     /* An encrypted DM carries text only: no files, no forwards (PRIVATE-DM.md). */
     r->ch_e2e = (uint8_t)channel_is_e2e(db, j->channel_id);
     if (r->ch_e2e && (j->n_attach || j->src_message || j->n_poll_opts)) { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
@@ -7053,6 +7072,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     int acc = channel_post_access(db, j->channel_id, j->user_id);
     if (acc == CH_UNKNOWN) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
     if (acc == CH_DENIED)  { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
+    if (workspace_dm(db, j->channel_id)) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_WORKSPACE_SENDER; return r; }
     if (acc == CH_ARCHIVED){ r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
     r->ch_e2e = (uint8_t)channel_is_e2e(db, j->channel_id);
     if (r->ch_e2e && (j->n_attach || j->src_message || j->n_poll_opts)) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
@@ -7950,6 +7970,7 @@ static oc_dbres *process_attach_create(sqlite3 *db, const oc_job *j) {
     int acc = channel_post_access(db, j->channel_id, j->user_id);
     if (acc == CH_UNKNOWN) { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
     if (acc == CH_DENIED)  { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
+    if (workspace_dm(db, j->channel_id)) { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_WORKSPACE_SENDER; return r; }
     if (acc == CH_ARCHIVED){ r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
     if (channel_is_e2e(db, j->channel_id)) { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
 
@@ -11253,6 +11274,80 @@ static void maybe_prune_idem(oc_dbwriter *w) {
     sqlite3_finalize(st);
 }
 
+/* The workspace's own sender (SCHEMA.md §3be): its user id, made the first
+ * time it is needed. No credential and no identity, so nothing signs in as
+ * it. 0 if it could not be made. */
+static uint64_t workspace_sender(sqlite3 *db) {
+    sqlite3_stmt *st = NULL;
+    uint64_t id = 0;
+    sqlite3_prepare_v2(db, "SELECT id FROM users WHERE is_system=1 ORDER BY id LIMIT 1;", -1, &st, NULL);
+    if (sqlite3_step(st) == SQLITE_ROW) id = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    if (id) return id;
+    sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO users(subject, display_name, role, created_at_ms, is_system) "
+                           "VALUES('system:workspace', 'Workspace', 'member', ?1, 1);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "SELECT id FROM users WHERE subject='system:workspace' AND is_system=1;", -1, &st, NULL);
+    if (sqlite3_step(st) == SQLITE_ROW) id = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return id;
+}
+
+/* The welcome a new member is sent (OPENCHIME_WELCOME_MESSAGE): the text as it
+ * is when they join, in a DM from the workspace's own sender. Unset sends
+ * nothing. `\n` in the value is a line break, since one line is what a
+ * variable holds. */
+static void send_welcome(sqlite3 *db, uint64_t uid) {
+    const char *text = oc_config_get()->welcome_message;
+    if (!text || !*text || !uid) return;
+    size_t tl = strlen(text);
+    char *body = malloc(tl + 1);
+    if (!body) return;
+    size_t n = 0;
+    for (size_t i = 0; i < tl; i++) {
+        if (text[i] == '\\' && text[i + 1] == 'n') { body[n++] = '\n'; i++; }
+        else body[n++] = text[i];
+    }
+    body[n] = '\0';
+    if (n > OC_MAX_BODY_SIZE) n = (size_t)utf8_prefix_len(body, OC_MAX_BODY_SIZE);
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    uint64_t sys = workspace_sender(db), cid = 0;
+    char key[48];
+    snprintf(key, sizeof key, "%llu,%llu", (unsigned long long)(sys < uid ? sys : uid),
+             (unsigned long long)(sys < uid ? uid : sys));
+    sqlite3_stmt *st = NULL;
+    int ok = sys != 0 && sys != uid;
+    if (ok) {
+        sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO channels(kind,name,is_public,created_at_ms,dm_key) "
+                               "VALUES('dm',NULL,0,?1,?2);", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+        sqlite3_bind_text(st, 2, key, -1, SQLITE_TRANSIENT);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+        sqlite3_prepare_v2(db, "SELECT id FROM channels WHERE kind='dm' AND dm_key=?1;", -1, &st, NULL);
+        sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) cid = (uint64_t)sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+        ok = cid != 0;
+    }
+    if (ok) {
+        add_membership(db, cid, sys);
+        add_membership(db, cid, uid);
+        sqlite3_prepare_v2(db, "INSERT INTO messages(channel_id, author_id, body, created_at_ms) VALUES(?,?,?,?);",
+                           -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)cid);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)sys);
+        sqlite3_bind_blob(st, 3, body, (int)n, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    sqlite3_exec(db, ok ? "COMMIT;" : "ROLLBACK;", NULL, NULL, NULL);
+    free(body);
+}
+
 static void *writer_loop(void *arg) {
     oc_dbwriter *w = (oc_dbwriter *)arg;
     for (;;) {
@@ -11271,6 +11366,8 @@ static void *writer_loop(void *arg) {
         /* A new member joins the workspace's default channels, whichever way
          * their account was made (OPENCHIME_DEFAULT_CHANNELS). */
         if (g_joined_uid) join_default_channels(w->db, g_joined_uid, 0);
+        /* And is sent the workspace's welcome, as it reads now. */
+        if (g_joined_uid) send_welcome(w->db, g_joined_uid);
         /* A member who did not exist before this job: their roster row rides on
          * its result, for everyone connected, whatever the job answers. */
         if (g_joined_uid && r && !r->ulist) {

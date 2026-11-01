@@ -1539,6 +1539,22 @@ static void test_broadcast_model(void) {
     oc_model_free(&m);
 }
 
+/* The workspace's own sender (USER_LIST `flags`): named as the workspace,
+ * kept out of the roster every list of people is drawn from. */
+static void test_workspace_sender_model(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("alice");
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 7; e.body = strdup("Workspace"); e.user_system = 1;
+    oc_model_apply(&m, &e);
+    CHECK(m.n_users == 1 && m.users[0].user_id == 1);
+    CHECK(oc_model_is_workspace_sender(&m, 7) && !oc_model_is_workspace_sender(&m, 1));
+    CHECK(!oc_model_is_workspace_sender(&m, 0));
+    CHECK(!strcmp(oc_model_user_name(&m, 7), "Workspace"));
+    oc_model_free(&m);
+}
+
 static void test_poll_model(void) {
     oc_model m; oc_model_init(&m);
     oc_ev e;
@@ -5285,6 +5301,7 @@ int run_client_core_tests(void) {
     test_workspace_settings_model();
     test_change_windows_model();
     test_broadcast_model();
+    test_workspace_sender_model();
     test_badge_tiers();
     test_osnotify_null();
     test_feedback();

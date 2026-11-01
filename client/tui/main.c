@@ -226,7 +226,10 @@ static const char *name_for(const oc_channel *ch, uint64_t uid);
 /* Fill `out` with the nick to show for message `m`: the name the daemon stamped,
  * "you" for self, a name resolved from the channel (thread replies carry no
  * name), else "user<id>". */
+static uint64_t g_ws_sender;   /* the workspace's own sender (oc_model.ws_sender), as last drawn */
 static void msg_nick(char *out, size_t cap, const oc_msg *m, uint64_t me, const oc_channel *ch) {
+    /* Not a person: the workspace, with its mark. */
+    if (g_ws_sender && m->author_id == g_ws_sender) { snprintf(out, cap, "\xe2\x8c\x82 Workspace"); return; }
     if (m->author_name[0]) { snprintf(out, cap, "%s", m->author_name); return; }
     if (m->author_id == me) { snprintf(out, cap, "you"); return; }
     const char *nm = ch ? name_for(ch, m->author_id) : "someone";
@@ -1322,6 +1325,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     if (W < 24 || H < 8) { tk_text(0, 0, W, " terminal too small ", TB_RED | TB_BOLD, TB_DEFAULT); tb_present(); return; }
 
     const oc_channel *fc = (focus < m->n_channels) ? &m->channels[focus] : NULL;
+    g_ws_sender = m->ws_sender;
     const char *conn = m->authed ? "connected" : (m->connected ? "connecting…" : "offline");
 
     /* Header bar (row 0): workspace · you · presence · connection · unread. */

@@ -440,6 +440,7 @@ typedef struct {
     uint16_t n_groups;
     uint64_t *ids;        /* heap; CHANNEL_VIA_GROUP */
     size_t    n_ids;
+    uint8_t  user_system; /* USER: the workspace's own sender (OC_USER_SYSTEM), not a person */
     uint8_t  msg_kind;    /* MESSAGE: OC_MSG_KIND_* (a call event, REQ-304) */
     uint8_t *der;         /* heap; CERT_UNTRUSTED: the certificate (DER) */
     size_t    der_len;

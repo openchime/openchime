@@ -51,6 +51,7 @@ const cfg_row OC_CFG[] = {
     { "OPENCHIME_BROADCAST_LARGE", CFG_INT, CFG_OPERATOR, G_SET, "0",
       "The member count from which a channel is large for `OPENCHIME_BROADCAST_MENTIONS`; 0 makes every channel large.",
       0, 1000000, NULL, F(broadcast_large), NULL, CFG_VISIBLE, 0 },
+    STR("OPENCHIME_WELCOME_MESSAGE", CFG_OPERATOR, G_SET, "", "The welcome each new member is sent once, as a direct message from the workspace, when their account is made: the text as it is then, in the message formatting (MARKDOWN.md), `\\n` for a line break. Empty: none is sent.", F(welcome_message), NULL, 0, 0),
     STR("OPENCHIME_WORKSPACE_NAME", CFG_OPERATOR, G_SET, "", "The workspace's display name, shown to clients; unset, a client derives one from the host.", F(workspace_name), NULL, CFG_VISIBLE, 0),
     /* An ENUM a client is told (CFG_VISIBLE), written out: the macro has no flags. */
     { "OPENCHIME_CUSTOM_EMOJI_ADD", CFG_ENUM, CFG_OPERATOR, G_SET, "everyone",

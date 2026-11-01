@@ -1,7 +1,7 @@
 # OpenChime — Database Schema
 
 The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
-ARCH-27 (§1); the daemon applies migrations 0001–0065 (`daemon/migrate.c`,
+ARCH-27 (§1); the daemon applies migrations 0001–0066 (`daemon/migrate.c`,
 `OC_MIGRATIONS`), in order, and new tables/columns arrive as later numbered
 migrations, never as edits to an existing one. 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
@@ -36,7 +36,7 @@ credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
 **0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
-(§3bc) the identity in a database of its own; **0065** (§3bd) polls.
+(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -1790,3 +1790,24 @@ keeping the purge generic rather than one that arises.)
 with a parent, `SEND_REPLY`) job, and the writer stores the poll in it; a vote replaces the voter's rows in one transaction of its own. A delete
 removes all three tables' rows with the body, and a restore does not bring them
 back.
+
+## 3be. Migration 0066 — the workspace's own sender
+
+```sql
+ALTER TABLE users ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0 CHECK (is_system IN (0,1));
+```
+
+*One row posts what the workspace says* — the welcome a new member is sent
+(`OPENCHIME_WELCOME_MESSAGE`) — so the message has an author like any other and
+every join on `author_id`, a permalink and an export keep working. The row is
+`subject` `system:workspace`, display name `Workspace`, `is_system` 1.
+
+*Made the first time it is needed*, not by the migration: a row made then would
+take id 1 in a new workspace, ahead of its first person.
+
+*Nothing signs in as it and no list offers it.* It has no `local_credentials`
+row and no `user_identities` row, and a lookup by subject skips it. It is left
+out of the user cap, of mention resolution, and of a DM's or a role change's
+targets; `USER_LIST` carries it marked (PROTOCOL.md, `flags`), so a client can
+draw its messages as the workspace's and keep it out of its people lists. A
+message to it is refused: nobody reads its DMs.

@@ -1059,12 +1059,12 @@ static void test_admin_frames(void) {
             { 1, OC_ROLE_OWNER,  0, oc_slice_str("a@x.io"), oc_slice_str("Alice"), 9,
               oc_slice_str("Principal Engineer"), oc_slice_str("America/New_York"),
               oc_slice_str("\xf0\x9f\x8c\xb4"), oc_slice_str("On holiday"),
-              oc_slice_str("Alice Liddell"), oc_slice_str("she/her"), oc_slice_str("expr-voice-2-f") },
+              oc_slice_str("Alice Liddell"), oc_slice_str("she/her"), oc_slice_str("expr-voice-2-f"), 0 },
             /* Every string empty, which is the common case and the one where an
              * off-by-one in the stride is easiest to miss. */
             { 2, OC_ROLE_MEMBER, 0, oc_slice_str(""), oc_slice_str("Bob"), 0,
               oc_slice_str(""), oc_slice_str(""), oc_slice_str(""), oc_slice_str(""),
-              oc_slice_str(""), oc_slice_str(""), oc_slice_str("") },
+              oc_slice_str(""), oc_slice_str(""), oc_slice_str(""), OC_USER_SYSTEM },
         };
         oc_user_list in = { 2, ents };
         ROUNDTRIP(oc_encode_user_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_USER_LIST, h, p);
@@ -1077,6 +1077,8 @@ static void test_admin_frames(void) {
         CHECK(out[1].user_id == 2 && slice_eq_str(out[1].display_name, "Bob"));
         CHECK(slice_eq_str(out[0].voice_id, "expr-voice-2-f"));
         CHECK(out[1].full_name.len == 0 && out[1].pronouns.len == 0 && out[1].voice_id.len == 0);
+        /* The workspace's own sender is marked, on the entry after the first. */
+        CHECK(out[0].flags == 0 && out[1].flags == OC_USER_SYSTEM);
     }
     {
         /* SET_PROFILE — the whole screen in one frame, at its own opcode. It
