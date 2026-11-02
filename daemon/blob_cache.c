@@ -363,9 +363,20 @@ static size_t queue_list(cache *c, qent **out) {
     return n;
 }
 
+static int upload_once(cache *c, const char *key);
+
 /* 1 sent, 0 nothing to send (the blob is gone), 2 not yet published (try on
- * the next pass), -1 failed. */
+ * the next pass), -1 failed. A kept connection that went stale before the
+ * store answered (EAGAIN from the backend) is not the store failing: the blob
+ * is sent once more, at once, on a new connection, and only that attempt's
+ * failure counts. */
 static int upload(cache *c, const char *key) {
+    int rc = upload_once(c, key);
+    if (rc == -1 && errno == EAGAIN && !stopping(c)) rc = upload_once(c, key);
+    return rc;
+}
+
+static int upload_once(cache *c, const char *key) {
     char path[1400], staged[1400];
     if (path_of(path, sizeof path, c->base, key, "") != 0 ||
         path_of(staged, sizeof staged, c->base, key, ".tmp") != 0) return 0;
@@ -390,9 +401,14 @@ static int upload(cache *c, const char *key) {
         if (stopping(c)) { ok = 0; break; }   /* shutting down: it stays queued */
         ok = oc_blob_backend_s3.put_chunk(w, buf, n) == 0;
     }
+    int e = errno;
     ok = ok && !ferror(fp);
     fclose(fp);
-    if (!ok) { oc_blob_backend_s3.put_abort(w); return -1; }
+    if (!ok) {
+        oc_blob_backend_s3.put_abort(w);
+        errno = e;
+        return -1;
+    }
     return oc_blob_backend_s3.put_commit(w) == 0 ? 1 : -1;
 }
 

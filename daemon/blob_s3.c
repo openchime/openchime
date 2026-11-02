@@ -443,11 +443,22 @@ static void *s3_put_begin(void *store, const char *key, uint64_t size_hint) {
     return w;
 }
 
+/* A kept connection that failed before any byte of the response came back --
+ * a write error while the body streamed, or nothing at all after it -- says
+ * so with errno EAGAIN: the body cannot be sent twice from here, but the
+ * caller, which has it, can send it once more on a new connection (that one
+ * is fresh, and its failures are reported as they are). */
+static int stale_fail(s3_writer *w) {
+    w->failed = 1;
+    errno = w->c && w->c->reused ? EAGAIN : EIO;
+    return -1;
+}
+
 static int s3_put_chunk(void *wv, const void *data, size_t len) {
     s3_writer *w = wv;
     if (!w || w->failed || len == 0) return w && w->failed ? -1 : 0;
-    if (len > w->remaining) { w->failed = 1; return -1; }
-    if (conn_write(w->c, data, len) != 0) { w->failed = 1; return -1; }
+    if (len > w->remaining) { w->failed = 1; errno = EIO; return -1; }
+    if (conn_write(w->c, data, len) != 0) return stale_fail(w);
     w->remaining -= len;
     return 0;
 }
@@ -460,9 +471,15 @@ static int s3_put_commit(void *wv) {
         long long cl; uint8_t spill[64]; size_t sl; int keep = 0;
         int status = read_response_head_te(w->c, &cl, NULL, &keep, spill, sizeof spill, &sl);
         if (status >= 200 && status < 300) rc = 0;
+        else if (status == -2) stale_fail(w);   /* no byte of a response */
+        else errno = EIO;
         reusable = status > 0 && keep && drain_body(w->c, cl, sl);
+    } else {
+        errno = w && w->failed && errno == EAGAIN ? EAGAIN : EIO;
     }
+    int keep_errno = errno;
     if (w) { conn_give(w->s, w->c, reusable); free(w); }
+    errno = keep_errno;
     return rc;
 }
 

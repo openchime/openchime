@@ -28,6 +28,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -428,6 +430,59 @@ static void keepalive_tests(fake_s3 *f) {
     }
 }
 
+/* An upload on a kept connection that goes stale before the store answers
+ * (the server takes the request and closes it unanswered): the backend says
+ * EAGAIN, since the body cannot be sent twice from there; the cache's
+ * uploader, which has the blob, sends it once more on a new connection, and
+ * does not count it as the store failing. */
+static int uploaded(oc_blobstore *bs, uint64_t n, oc_blob_cache_stats *st) {
+    oc_blobstore_cache_kick(bs);
+    return oc_blobstore_cache_stats(bs, st) == 0 && st->uploaded >= n && st->pending_count == 0;
+}
+static int wait_uploaded(oc_blobstore *bs, uint64_t n, oc_blob_cache_stats *st) {
+    return WAIT_UNTIL(uploaded(bs, n, st), 5000);
+}
+static void stale_put_tests(fake_s3 *f, const char *dir) {
+    {
+        oc_blobstore *bs = oc_blobstore_open_remote(&g_s3cfg);
+        CHECK(bs != NULL);
+        if (bs) {
+            int a = fake_accepts(f);
+            CHECK(put_all(bs, "kkkk0010", "kept", 4) == 0);
+            fake_set(f, &f->drop_second, 1);
+            errno = 0;
+            CHECK(put_all(bs, "kkkk0011", "late", 4) == -1 && errno == EAGAIN);
+            CHECK(put_all(bs, "kkkk0011", "late", 4) == 0);      /* a new connection */
+            CHECK(get_all(bs, "kkkk0011", "late", 4));
+            CHECK(fake_accepts(f) == a + 2);
+            fake_set(f, &f->drop_second, 0);
+            oc_blobstore_close(bs);
+        }
+    }
+    {
+        char cdir[700];
+        oc_test_path(cdir, sizeof cdir, dir, "stale-cache");
+        mkdir(cdir, 0700);
+        oc_blobstore *bs = oc_blobstore_open(cdir, &g_s3cfg);
+        CHECK(bs != NULL);
+        if (bs) {
+            oc_blob_cache_policy p;
+            memset(&p, 0, sizeof p);
+            p.retry_base_ms = 10000; p.retry_cap_ms = 10000; p.pass_ms = 20;   /* a backoff would show */
+            oc_blobstore_cache_policy(bs, &p);
+            oc_blob_cache_stats st;
+            CHECK(put_all(bs, "abcd0012", "first", 5) == 0);
+            CHECK(wait_uploaded(bs, 1, &st));
+            fake_set(f, &f->drop_second, 1);
+            CHECK(put_all(bs, "abcd0013", "second", 6) == 0);
+            CHECK(wait_uploaded(bs, 2, &st));
+            CHECK(st.failures == 0 && st.next_try_ms == 0 && st.last_error[0] == '\0');
+            fake_set(f, &f->drop_second, 0);
+            oc_blobstore_close(bs);
+        }
+    }
+}
+
 int run_blob_s3_tests(void) {
     printf("test_blob_s3: fake S3 endpoint: streaming put/get round-trip, "
            "sizes, SigV4 header shape, delete, 404, config selection, kept connections\n");
@@ -444,6 +499,7 @@ int run_blob_s3_tests(void) {
 
     /* The backend itself, uncached: every call is a request the fake sees.
      * The cache in front of it has its own suite (test_blob_cache.c). */
+    stale_put_tests(f, dir);
     oc_blobstore *bs = oc_blobstore_open_remote(&g_s3cfg);
     CHECK(bs != NULL);
     CHECK(!oc_blobstore_is_local(bs));
