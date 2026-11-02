@@ -1648,8 +1648,14 @@ keeps to its own share of the free space and gives it back under pressure
   from a member count that makes a channel large
   (`OPENCHIME_BROADCAST_LARGE`; 0, every channel; at most 500). From anyone
   else, in a large channel, `@here`, `@channel` and `@everyone` stay in the
-  message as text and notify nobody; the composer says so before sending,
-  and asks for confirmation, naming how many it will notify, when it will.
+  message as text and notify nobody. The daemon decides, and every message
+  it delivers, live or replayed, says whether its broadcast notifies, so a
+  client counts, notifies and highlights a broadcast mention exactly as the
+  daemon stored it, in every channel and not only the open one. The composer
+  says before sending when a broadcast will notify nobody, judged from the
+  channel's own member list, asked for when it does not hold it; and asks for
+  confirmation when it will notify a large channel, naming how many, or
+  "everyone here" when the channel has more members than the list carries.
 - **REQ-287.** Mentioning someone who is **not in the channel** has
   never been silent. The sender has been told — privately, in a notice only they see, since
   it concerns their action and not the conversation — that the mention reached

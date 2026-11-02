@@ -118,7 +118,10 @@ PY
     # opens and shows the camera; the stop comes once the recording has begun
     # (after the countdown), and is followed until the file has bytes. How long
     # it ran is the machine's business; that it was taken is the check.
-    script='sttest|vm open~^vm=1 recphase=0 frame=[1-9]|vm record~^vm=1 recphase=2|vm stop~^vm=1 take_bytes=[1-9]|about'
+    # The card opens only in a selected channel, and a signed-in client may
+    # not have selected one yet: the first step waits for one, so `vm open`
+    # is never sent to a client that would drop it.
+    script='sttest~authed=1 sel=[1-9]|vm open~^vm=1 recphase=0 frame=[1-9]|vm record~^vm=1 recphase=2|vm stop~^vm=1 take_bytes=[1-9]|about'
     URL3="$APP&hook=1&env=OPENCHIME_DEV_CAPTURE%3Dsynthetic&script=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$script")"
     run_page "$URL3" media "$W/chrome-media.log" '"(DUMPALL|DUMP-ERR):' \
         --use-fake-device-for-media-stream --use-fake-ui-for-media-stream --autoplay-policy=no-user-gesture-required

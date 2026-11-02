@@ -112,6 +112,10 @@ typedef struct {
     /* OC_MSG_KIND_*: a call event (a missed call, REQ-304) is drawn as a line of
      * history rather than as something its author said. */
     uint8_t      kind;
+    /* Its @here, @channel or @everyone notifies nobody (REQ-221): the daemon's
+     * answer, carried on BROADCAST and THREAD_REPLY, which oc_model_mentions_me_in
+     * takes instead of judging the channel's size. */
+    uint8_t      broadcast_held;
     /* Link previews (REQ-222): fanned after the BROADCAST, replayed on
      * backfill, cleared on edit (the daemon drops and re-fetches). */
     oc_msg_unfurl *unfurls;   /* heap, NULL until one arrives */
@@ -841,10 +845,12 @@ uint64_t oc_model_via_group(const oc_model *m, uint64_t channel_id, uint64_t use
 /* Does `body` mention this user -- by their name, or by a group they are in
  * (REQ-308)? What a toast and a highlight ask. */
 int      oc_model_mentions_me(const oc_model *m, const char *body, size_t len);
-/* The same, for a message in `channel_id` from `author_id`: a broadcast
- * (@here, @channel, @everyone) counts only when the workspace lets that
- * author notify that channel (REQ-221), as the daemon stores it. */
-int      oc_model_mentions_me_in(const oc_model *m, uint64_t channel_id, uint64_t author_id,
+/* The same, for a message whose broadcast (@here, @channel, @everyone) the
+ * daemon `broadcast_held` or not (the message's own flag, REQ-221): a broadcast
+ * counts only when it was not held. The daemon decides who may notify a
+ * channel of what size; a client knows the size only of the channel whose
+ * member list it has loaded, so it does not judge it again. */
+int      oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_held,
                                  const char *body, size_t len);
 
 /* ---- the sidebar (6) --------------------------------------------------
@@ -1113,11 +1119,19 @@ int oc_model_may_change_own(const oc_model *m, uint64_t sent_ms, int edit, uint6
  * `channel_id` under the workspace's `broadcast_mentions` and
  * `broadcast_large` (REQ-221): -1 there is none; 0 it will notify nobody,
  * from this person in a channel this large; 1 it will notify; 2 it will
- * notify a channel the workspace calls large, which the composer confirms.
- * `token` gets the mention as written, `members` the channel's size when the
- * roster is loaded (else 0). The daemon decides; this is the warning. */
+ * notify a channel the workspace calls large, which the composer confirms;
+ * 3 the answer is the channel's size and its member list is not loaded (or
+ * is still loading): the composer asks for it (oc_client_list_members) and
+ * asks again once it is in. `token` gets the mention as written, `members`
+ * the channel's size when its list is loaded, else 0 -- and 0 when the list
+ * is at its cap (OC_MAX_MEMBER_LIST), where the channel may be larger and the
+ * composer names no number. The daemon decides; this is the warning. */
 int oc_model_broadcast_will_notify(const oc_model *m, uint64_t channel_id, const char *body,
                                    char *token, size_t tcap, size_t *members);
+/* Whom the confirmation says a broadcast notifies, from that `members`:
+ * "N people", or "everyone here" when the number is not known -- the list
+ * at its cap, where a number would be the cap's and not the channel's. */
+void oc_model_broadcast_whom(size_t members, char *out, size_t cap);
 /* Whether the workspace has default quiet hours (`default_quiet_hours`, REQ-136)
  * a person may return to. */
 int oc_model_has_default_quiet_hours(const oc_model *m);

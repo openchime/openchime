@@ -9291,6 +9291,85 @@ static void test_broadcast_rules(void) {
     cleanup_db(path);
 }
 
+/* Whether a broadcast notifies is told to every client with the message
+ * (`broadcast_held`, REQ-221), read from the rows the send stored: on the live
+ * result a BROADCAST is built from, on a reply's, and on the rows history,
+ * backfill and a thread's replay are built from -- and still so after the rule
+ * changes, since history says what the send did. */
+static oc_dbres *send_r(oc_dbwriter *w, uint64_t uid, uint8_t tag, const char *body) {
+    oc_job *j = oc_job_new(OC_JOB_SEND, 1);
+    j->user_id = uid; j->channel_id = OC_DEFAULT_CHANNEL;
+    memset(j->idem, 0, OC_IDEM_LEN); j->idem[0] = 0xBE; j->idem[1] = tag;
+    oc_job_set_body(j, body, strlen(body));
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static int replay_held(const oc_dbres *r, uint64_t mid) {
+    for (size_t i = 0; r && i < r->n_replay; i++)
+        if (r->replay[i].message_id == mid) return r->replay[i].broadcast_held;
+    return -1;
+}
+static void test_broadcast_held(void) {
+    const char *path = tdb("broadcast_held.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t member = reg(w, "bh-member", "pw", OC_ROLE_MEMBER);
+    uint64_t admin = reg(w, "bh-admin", "pw", OC_ROLE_ADMIN);
+    int size = channel_size(path, OC_DEFAULT_CHANNEL);
+    CHECK(size >= 2);
+    char at[16];
+    snprintf(at, sizeof at, "%d", size);
+    set_broadcast("admins", at);   /* the channel is large: a member's is held */
+
+    oc_dbres *r = send_r(w, member, 1, "@channel standup");
+    CHECK(r && r->type == OC_RES_SEND_OK && r->broadcast_held == 1);
+    uint64_t held = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    CHECK(mention_rows(path, held, 0, OC_MENTION_CHANNEL) == 0);
+    r = send_r(w, admin, 2, "@everyone lunch");
+    CHECK(r && r->type == OC_RES_SEND_OK && r->broadcast_held == 0);
+    uint64_t reached = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    CHECK(mention_rows(path, reached, 0, OC_MENTION_EVERYONE) == 1);
+    r = send_r(w, member, 3, "no broadcast, @bh-admin");
+    CHECK(r && r->type == OC_RES_SEND_OK && r->broadcast_held == 0);
+    uint64_t plain = r ? r->message_id : 0;
+    oc_dbres_free(r);
+
+    /* A thread reply, live and replayed. */
+    r = send_reply(w, member, OC_DEFAULT_CHANNEL, reached, "@here thoughts?");
+    CHECK(r && r->type == OC_RES_REPLY_OK && r->broadcast_held == 1);
+    uint64_t rheld = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    r = send_reply(w, admin, OC_DEFAULT_CHANNEL, reached, "@here yes");
+    CHECK(r && r->type == OC_RES_REPLY_OK && r->broadcast_held == 0);
+    uint64_t rreached = r ? r->message_id : 0;
+    oc_dbres_free(r);
+
+    /* Under a rule that would now let both through, the replays still say
+     * what was stored. */
+    set_broadcast(NULL, NULL);
+    r = history(w, member, OC_DEFAULT_CHANNEL, plain + 100, 50);
+    CHECK(r && replay_held(r, held) == 1 && replay_held(r, reached) == 0 && replay_held(r, plain) == 0);
+    oc_dbres_free(r);
+    r = backfill(w, member, OC_DEFAULT_CHANNEL, 0);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK);
+    CHECK(replay_held(r, held) == 1 && replay_held(r, reached) == 0 && replay_held(r, plain) == 0);
+    oc_dbres_free(r);
+    r = list_thread_r(w, member, OC_DEFAULT_CHANNEL, reached);
+    int seen = 0;
+    for (size_t i = 0; r && i < r->n_thread; i++) {
+        if (r->thread[i].message_id == rheld)    { CHECK(r->thread[i].broadcast_held == 1); seen++; }
+        if (r->thread[i].message_id == rreached) { CHECK(r->thread[i].broadcast_held == 0); seen++; }
+    }
+    CHECK(seen == 2);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* OPENCHIME_WELCOME_MESSAGE: each new member, however their account was made,
  * is sent the text as it is when they join, once, in a DM from the workspace's
  * own sender; an existing member is not; empty sends nothing. The sender is
@@ -9768,6 +9847,7 @@ int run_dbwriter_tests(void) {
     test_search_filters_and_paging();
     test_edit_windows();
     test_broadcast_rules();
+    test_broadcast_held();
     test_notices();
     test_welcome_message();
     test_default_quiet_hours();

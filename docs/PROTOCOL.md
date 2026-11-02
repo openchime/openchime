@@ -213,10 +213,11 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 30** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 31** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
-> 30 appended `flags` to each `USER_LIST` entry, marking the workspace's own
-> sender. Since the
+> 31 put `broadcast_held` in `BROADCAST` (and so `MSG_RESTORED`) and
+> `THREAD_REPLY`, ahead of the body: whether the message's broadcast mention
+> notifies anyone (§5.3). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
 > change moves the number even when it adds one byte.
@@ -577,7 +578,16 @@ tenant-monotonic (ARCH-43).
 | `author_id`    | u64  | Authoring user's id.                         |
 | `server_time`  | u64  | Server timestamp, ms since epoch UTC.        |
 | `kind`         | u8   | `0` something someone said; `1` a call event the daemon wrote — a missed call (REQ-304, §5.17). Any other value is malformed. |
+| `broadcast_held` | u8 | `1` when the body holds `@here`, `@channel` or `@everyone` and the daemon stored no mention for it, so it notifies nobody (REQ-221); else `0`. Any other value is malformed. Since version 31. |
 | `body`         | lstr | Message body (§7).                           |
+
+`broadcast_held` is the daemon's answer to whether a broadcast mention reached
+anyone, read from the mentions it stored when the message was sent, so a
+replay (§6) says what the live frame said. A client counts a broadcast as a
+mention only when it is `0`: it does not guess from a channel's size, which it
+knows only for the channel whose member list it has loaded. An edit stores no
+mentions (§5.5), so a broadcast an edit adds is held, and one it keeps is as
+it was.
 
 The frame may then carry the **optional trailing block** (§5.14): the attachment
 metadata list, followed by an optional `author_name` (str) — the **display name
@@ -684,6 +694,10 @@ whose copy doubles as the acknowledgement:
 | `author_id`  | u64  | The message's author.                            |
 | `edited_at`  | u64  | Server edit time, ms since epoch UTC (REQ-051).  |
 | `body`       | lstr | The new body (§7).                               |
+
+An edit notifies nobody and stores no mentions: the message keeps those its
+send stored. So `MSG_EDITED` carries no `broadcast_held` (§5.3); a client keeps
+the one it had for a broadcast the edit kept, and holds one the edit added.
 
 ### 5.6 Deleting a message (REQ-052, REQ-032)
 
@@ -1302,6 +1316,7 @@ member of the channel:
 | `server_time` | u64  | Server timestamp, ms since epoch UTC.                    |
 | `reply_count` | u32  | The root's total reply count after this reply (REQ-060). |
 | `participant` | u8   | 1 if **this recipient** is in the thread (REQ-061).      |
+| `broadcast_held` | u8 | As on `BROADCAST` (§5.3): `1` when the reply's broadcast mention notifies nobody (REQ-221). Since version 31. |
 | `body`        | lstr | The reply body.                                          |
 
 `participant` is the only per-recipient field on a fan-out frame, so the daemon

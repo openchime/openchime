@@ -4224,6 +4224,38 @@ static void load_message_attachments(sqlite3 *db, uint64_t mid, oc_attach_meta *
  *
  * Thread messages included, deliberately diverging from Slack: a thread is where
  * the substantive discussion usually is, and the worst place to go deaf. */
+
+/* Whether message `mid`'s broadcast mention (@here, @channel, @everyone)
+ * notifies nobody (REQ-221): 1 when `body` holds one and no broadcast mention
+ * row was stored for it, which is what store_mentions does for an author the
+ * workspace's rule does not allow, and for a message stored without mentions
+ * (a webhook's, the workspace's notice). Read from the rows rather than
+ * decided again, so history says what the send did, whatever the rule or the
+ * channel's size is now. The byte BROADCAST and THREAD_REPLY carry: a client
+ * knows a channel's size only for the member list it has loaded. */
+static uint8_t broadcast_held(sqlite3 *db, uint64_t mid, const void *body, size_t len) {
+    if (!body || !len || !memchr(body, '@', len)) return 0;
+    oc_mention m[OC_MENTION_MAX];
+    size_t n = oc_mention_scan((const char *)body, len, m, OC_MENTION_MAX), i;
+    if (n > OC_MENTION_MAX) n = OC_MENTION_MAX;
+    for (i = 0; i < n; i++)
+        if (m[i].kind == OC_MENTION_HERE || m[i].kind == OC_MENTION_CHANNEL || m[i].kind == OC_MENTION_EVERYONE) break;
+    if (i == n) return 0;
+    sqlite3_stmt *st = NULL;
+    int stored = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT EXISTS(SELECT 1 FROM mentions WHERE message_id=?1 AND kind IN (?2,?3,?4));",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+        sqlite3_bind_int(st, 2, (int)OC_MENTION_HERE);
+        sqlite3_bind_int(st, 3, (int)OC_MENTION_CHANNEL);
+        sqlite3_bind_int(st, 4, (int)OC_MENTION_EVERYONE);
+        if (sqlite3_step(st) == SQLITE_ROW) stored = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return (uint8_t)!stored;
+}
+
 /* Index the mentions of every message that has none: the one-time pass a
  * database loaded from an export needs (migrate.c, 0060), with the same scanner
  * a send uses, so the server's unread count and the client's reading of the
@@ -4782,6 +4814,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     /* The poll, read back as the forward is, for the frame after the ACTION. */
     if (j->n_poll_opts) append_poll(db, r, mid, j->channel_id, 0);
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
+    r->broadcast_held = broadcast_held(db, mid, j->body, j->body_len);
     load_members(db, j->channel_id, r);
     return r;
 }
@@ -5078,6 +5111,7 @@ static oc_dbres *process_restore(oc_dbwriter *w, const oc_job *j) {
     r->author_id = author;
     r->body = (uint8_t *)body;
     r->body_len = strlen(body);
+    r->broadcast_held = broadcast_held(db, j->message_id, r->body, r->body_len);
     sqlite3_prepare_v2(db, "SELECT created_at_ms FROM messages WHERE id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
     if (sqlite3_step(st) == SQLITE_ROW) r->server_time = (uint64_t)sqlite3_column_int64(st, 0);
@@ -7240,6 +7274,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     append_action(db, r, mid, j->channel_id, 1);   /* always: the client pairs them (ARCH-115) */
     if (j->n_poll_opts) append_poll(db, r, mid, j->channel_id, 0);
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
+    r->broadcast_held = broadcast_held(db, mid, j->body, j->body_len);
     load_members(db, j->channel_id, r);
     /* Asked AFTER the reply is committed, so the author of the reply being
      * fanned out counts as a participant on the strength of it. */
@@ -7284,6 +7319,7 @@ static oc_dbres *process_list_thread(sqlite3 *db, const oc_job *j) {
         const void *b = sqlite3_column_blob(st, 3);
         int blen = sqlite3_column_bytes(st, 3);
         if (b && blen > 0) { m->body = malloc((size_t)blen); if (m->body) { memcpy(m->body, b, (size_t)blen); m->body_len = (size_t)blen; } }
+        m->broadcast_held = broadcast_held(db, m->message_id, m->body, m->body_len);
         load_message_attachments(db, m->message_id, m->attach, &m->n_attach);  /* REQ-140 */
         n++;
     }
@@ -7828,6 +7864,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             m->saved_at  = (uint64_t)sqlite3_column_int64(st, 9);
             m->saved     = m->saved_at != 0;
             m->kind      = (uint8_t)sqlite3_column_int(st, 10);
+            m->broadcast_held = broadcast_held(db, m->message_id, m->body, m->body_len);
             /* Re-attach the message's linked attachments so a reconnecting client
              * sees them inline, not just live members (REQ-140). */
             load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
@@ -7960,6 +7997,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
         m->saved_at  = (uint64_t)sqlite3_column_int64(st, 9);
         m->saved     = m->saved_at != 0;
         m->kind      = (uint8_t)sqlite3_column_int(st, 10);
+        m->broadcast_held = broadcast_held(db, m->message_id, m->body, m->body_len);
         load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
         n++;
     }
@@ -8512,6 +8550,7 @@ static oc_dbres *process_webhook_post(sqlite3 *db, const oc_job *j) {
     r->author_name = label_dup;   /* transferred; freed by oc_dbres_free */
     r->server_time = ts;
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
+    r->broadcast_held = broadcast_held(db, mid, j->body, j->body_len);
     load_members(db, cid, r);
     return r;
 }
@@ -11494,6 +11533,7 @@ static uint64_t notice_post(sqlite3 *db, uint64_t channel_id, const char *body, 
         r->server_time = ts;
         r->body = malloc(len ? len : 1);
         if (r->body) { memcpy(r->body, body, len); r->body_len = len; }
+        r->broadcast_held = broadcast_held(db, mid, body, len);
         append_action(db, r, mid, channel_id, 1);
         load_members(db, channel_id, r);
         oc_dbres **tail = &g_notices;

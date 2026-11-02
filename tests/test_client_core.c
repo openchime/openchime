@@ -1531,11 +1531,49 @@ static void test_broadcast_model(void) {
     CHECK(oc_model_broadcast_will_notify(&m, 10, "@everyone", tok, sizeof tok, &n) == 0);
     bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "6\x1e");
     CHECK(oc_model_broadcast_will_notify(&m, 10, "@everyone", tok, sizeof tok, &n) == 1);   /* under it */
-    CHECK(oc_model_broadcast_will_notify(&m, 11, "@everyone", tok, sizeof tok, &n) == 0 && n == 0);   /* roster unknown: large */
+    /* Another channel's size is not known, nor is this one's while its list
+     * is loading: no guess, the composer asks for the list. */
+    CHECK(oc_model_broadcast_will_notify(&m, 11, "@everyone", tok, sizeof tok, &n) == 3 && n == 0);
+    m.chanmem_loading = 1;
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@everyone", tok, sizeof tok, &n) == 3 && n == 0);
+    m.chanmem_loading = 0;
 
     bc_settings(&m, "broadcast_mentions\x1f" "nobody\x1e" "broadcast_large\x1f" "0\x1e");
     bc_me(&m, OC_ROLE_OWNER);
     CHECK(oc_model_broadcast_will_notify(&m, 10, "@channel", tok, sizeof tok, &n) == 0);
+    /* With no threshold every channel is large: answered without a list. */
+    CHECK(oc_model_broadcast_will_notify(&m, 11, "@channel", tok, sizeof tok, &n) == 0);
+    oc_model_free(&m);
+}
+
+/* A channel of more than the member list's cap (OC_MAX_MEMBER_LIST): the
+ * list stops at the cap, so the confirmation names no number -- the cap's
+ * would not be the channel's -- and says it notifies everyone here. */
+static void test_broadcast_at_cap(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    bc_me(&m, OC_ROLE_ADMIN);
+    oc_model_chanmem_begin(&m, 10);
+    for (uint64_t uid = 1; uid <= OC_MAX_MEMBER_LIST; uid++) {
+        oc_ev e; memset(&e, 0, sizeof e);
+        e.type = OC_EV_CHAN_MEMBER; e.channel_id = 10; e.user_id = uid;
+        oc_model_apply(&m, &e);
+    }
+    m.chanmem_loading = 0;
+    CHECK(m.n_chanmem == OC_MAX_MEMBER_LIST);
+    bc_settings(&m, "broadcast_mentions\x1f" "everyone\x1e" "broadcast_large\x1f" "500\x1e");
+    char tok[24], whom[48]; size_t n = 99;
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@channel now", tok, sizeof tok, &n) == 2);
+    CHECK(n == 0);
+    oc_model_broadcast_whom(n, whom, sizeof whom);
+    CHECK(!strcmp(whom, "everyone here"));   /* contract: REQ-221 names no number past the list's cap */
+    CHECK(!strpbrk(whom, "0123456789"));
+    /* One under the cap is a count, and named. */
+    m.n_chanmem = OC_MAX_MEMBER_LIST - 1;
+    bc_settings(&m, "broadcast_mentions\x1f" "everyone\x1e" "broadcast_large\x1f" "499\x1e");
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@channel now", tok, sizeof tok, &n) == 2);
+    oc_model_broadcast_whom(n, whom, sizeof whom);
+    CHECK(n == OC_MAX_MEMBER_LIST - 1 && !strcmp(whom, "499 people"));   /* contract: REQ-221 names how many */
     oc_model_free(&m);
 }
 
@@ -1571,25 +1609,82 @@ static void test_workspace_sender_model(void) {
     oc_model_free(&m);
 }
 
-/* A broadcast mentions the reader only when the workspace lets its author
- * notify the channel (REQ-221), as the daemon stores it. */
+/* A broadcast mentions the reader only when the daemon says it notifies
+ * (REQ-221): the message's `broadcast_held`, whatever the workspace's rule
+ * and whatever member list the client holds. */
 static void test_broadcast_mentions_me(void) {
     oc_model m; oc_model_init(&m);
     m.user_id = 1;
     oc_ev e;
     memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("ada"); oc_model_apply(&m, &e);
     memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(&m, &e);
-    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 3; e.body = strdup("cat"); e.status = OC_ROLE_ADMIN;
-    oc_model_apply(&m, &e);
     const char *b = "@channel standup";
-    CHECK(oc_model_mentions_me_in(&m, 10, 2, b, strlen(b)) == 1);     /* not told: everyone */
-    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "0\x1e");
-    CHECK(oc_model_mentions_me_in(&m, 10, 2, b, strlen(b)) == 0);     /* a member's: text */
-    CHECK(oc_model_mentions_me_in(&m, 10, 3, b, strlen(b)) == 1);     /* an admin's */
+    CHECK(oc_model_mentions_me_in(&m, 0, b, strlen(b)) == 1);         /* reached */
+    CHECK(oc_model_mentions_me_in(&m, 1, b, strlen(b)) == 0);         /* held: text */
     const char *p2 = "@ada and @channel";
-    CHECK(oc_model_mentions_me_in(&m, 10, 2, p2, strlen(p2)) == 1);   /* by name, whoever */
-    bc_settings(&m, "broadcast_mentions\x1f" "nobody\x1e" "broadcast_large\x1f" "0\x1e");
-    CHECK(oc_model_mentions_me_in(&m, 10, 3, b, strlen(b)) == 0);
+    CHECK(oc_model_mentions_me_in(&m, 1, p2, strlen(p2)) == 1);       /* by name, held or not */
+    const char *q = "@bob only";
+    CHECK(oc_model_mentions_me_in(&m, 0, q, strlen(q)) == 0);
+    oc_model_free(&m);
+}
+
+/* The same answer where it is counted, in a channel whose member list is not
+ * loaded -- every channel but the open one -- under a rule whose answer is the
+ * channel's size: a clear flag is a mention (the badge's priority count, a
+ * thread reply's toast), a held one is not. And an edit, which stores no
+ * mentions, holds a broadcast it adds and keeps the answer for one it keeps. */
+static void bc_message(oc_model *m, uint64_t mid, const char *body, uint8_t held) {
+    oc_ev e; memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 40; e.message_id = mid; e.author_id = 2;
+    e.server_time = mid; e.broadcast_held = held; e.body = strdup(body);
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+static const oc_msg *bc_find(oc_model *m, uint64_t mid) {
+    const oc_channel *c = oc_model_channel(m, 40);
+    for (size_t i = 0; c && i < c->n_msgs; i++) if (c->msgs[i].message_id == mid) return &c->msgs[i];
+    return NULL;
+}
+static void test_broadcast_held_model(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("ada"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(&m, &e);
+    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "5\x1e");
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 40; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("small"); oc_model_apply(&m, &e);
+    CHECK(m.chanmem_channel != 40);                      /* its size is not known here */
+
+    bc_message(&m, 100, "@channel standup", 0);          /* a member's, in a small channel */
+    const oc_channel *c = oc_model_channel(&m, 40);
+    CHECK(c && c->unread == 1 && c->priority_unread == 1);
+    bc_message(&m, 101, "@channel lunch", 1);            /* the daemon held it */
+    c = oc_model_channel(&m, 40);
+    CHECK(c && c->unread == 2 && c->priority_unread == 1);
+    CHECK(bc_find(&m, 100) && bc_find(&m, 100)->broadcast_held == 0);
+    CHECK(bc_find(&m, 101) && bc_find(&m, 101)->broadcast_held == 1);
+
+    /* The same in a thread reply, which the model keeps only as a notice. */
+    memset(&e, 0, sizeof e); e.type = OC_EV_THREAD_REPLY; e.channel_id = 40; e.parent_id = 100;
+    e.message_id = 102; e.author_id = 2; e.server_time = 102; e.count = 1; e.participant = 1;
+    e.broadcast_held = 0; e.body = strdup("@here look"); oc_model_apply(&m, &e); free(e.body);
+    memset(&e, 0, sizeof e); e.type = OC_EV_THREAD_REPLY; e.channel_id = 40; e.parent_id = 100;
+    e.message_id = 103; e.author_id = 2; e.server_time = 103; e.count = 2; e.participant = 1;
+    e.broadcast_held = 1; e.body = strdup("@here again"); oc_model_apply(&m, &e); free(e.body);
+    CHECK(m.n_notices == 2 && m.notices[0].mentioned == 1 && m.notices[1].mentioned == 0);
+
+    /* Edits. */
+    bc_message(&m, 104, "plain words", 0);
+    memset(&e, 0, sizeof e); e.type = OC_EV_EDIT; e.channel_id = 40; e.message_id = 104;
+    e.body = strdup("now @everyone"); oc_model_apply(&m, &e); free(e.body);
+    CHECK(bc_find(&m, 104) && bc_find(&m, 104)->broadcast_held == 1);
+    memset(&e, 0, sizeof e); e.type = OC_EV_EDIT; e.channel_id = 40; e.message_id = 100;
+    e.body = strdup("@channel standup at ten"); oc_model_apply(&m, &e); free(e.body);
+    CHECK(bc_find(&m, 100) && bc_find(&m, 100)->broadcast_held == 0);
+    memset(&e, 0, sizeof e); e.type = OC_EV_EDIT; e.channel_id = 40; e.message_id = 101;
+    e.body = strdup("@channel lunch at one"); oc_model_apply(&m, &e); free(e.body);
+    CHECK(bc_find(&m, 101) && bc_find(&m, 101)->broadcast_held == 1);
     oc_model_free(&m);
 }
 
@@ -5200,7 +5295,7 @@ static void test_browser_signin(void) {
  * it unpaired; an ACTION for something not held stands on its own. */
 static size_t frame_of_broadcast(uint8_t *buf, size_t cap, uint64_t mid, const char *body, int with_file) {
     oc_wbuf w; oc_wbuf_init(&w, buf, cap);
-    oc_broadcast b = { mid, 1, 42, 1000, OC_MSG_KIND_MESSAGE, oc_slice_str(body), 0, {{0}}, {0} };
+    oc_broadcast b = { mid, 1, 42, 1000, OC_MSG_KIND_MESSAGE, oc_slice_str(body), 0, {{0}}, {0}, 0 };
     if (with_file) {
         b.n_attach = 1;
         b.attach[0].id = 9;
@@ -5339,7 +5434,9 @@ int run_client_core_tests(void) {
     test_workspace_settings_model();
     test_change_windows_model();
     test_broadcast_model();
+    test_broadcast_at_cap();
     test_broadcast_mentions_me();
+    test_broadcast_held_model();
     test_workspace_sender_model();
     test_badge_tiers();
     test_osnotify_null();

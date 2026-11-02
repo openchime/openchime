@@ -3957,15 +3957,16 @@ int main(int argc, char **argv) {
                     /* Whether the channel is large is its member count, which
                      * this client asks for only here: until it has it the
                      * answer is a guess, so it asks and waits for the next Enter. */
-                    if ((bc == 0 || bc == 2) && !(mm->chanmem_channel == bcid && !mm->chanmem_loading)) {
+                    if (bc == 3) {
                         oc_client_list_members(cl, bcid);
                         snprintf(g_bc_note, sizeof g_bc_note, "Checking how many people %s reaches: Enter again to send.", tok);
                         continue;
                     }
                     if (bc == 2 && strcmp(g_bc_ask, composer) != 0) {
                         snprintf(g_bc_ask, sizeof g_bc_ask, "%s", composer);
-                        if (bn) snprintf(g_bc_note, sizeof g_bc_note, "%s notifies %zu people: Enter to send, Esc to keep editing", tok, bn);
-                        else snprintf(g_bc_note, sizeof g_bc_note, "%s notifies everyone here: Enter to send, Esc to keep editing", tok);
+                        char whom[48];
+                        oc_model_broadcast_whom(bn, whom, sizeof whom);
+                        snprintf(g_bc_note, sizeof g_bc_note, "%s notifies %s: Enter to send, Esc to keep editing", tok, whom);
                         continue;
                     }
                     g_bc_ask[0] = '\0';

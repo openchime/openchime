@@ -1907,6 +1907,10 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 static int      g_bc_confirmed;     /* CONF_BROADCAST: the send it confirmed is under way */
+/* A broadcast send waiting on its channel's member list (REQ-221): the channel,
+ * and the text it was for (heap), sent once the list is in (bc_tick). */
+static uint64_t g_bc_wait_ch;
+static char    *g_bc_wait_text;
 static void composer_send(void);    /* fwd */
 
 static char     g_confirm_title[80];
@@ -3730,6 +3734,7 @@ static void select_channel(uint64_t cid) {
      * channel's draft. */
     nm_editor_release();
     g_cmp_hint[0] = '\0';                 /* the hint was about the conversation left */
+    g_bc_wait_ch = 0;                     /* and so was a send waiting on its size */
     if (g_sel && g_sel != cid) draft_flush(g_sel);   /* leaving writes it, if changed */
     close_overlays();
     g_has_sel = 0;                       /* drop any transcript text selection */
@@ -7109,9 +7114,10 @@ static void draw_msglist(gfx *rt, const oc_model *m,
              * coloured word alone is easy to scroll past. Same scanner as the
              * notification, so the two always agree about what counted. */
             if (capture && !msgs[first + i].deleted && msgs[first + i].body) {
-                /* By name, or by a group this user is in (REQ-308). */
+                /* By name, or by a group this user is in (REQ-308), or by a
+                 * broadcast the daemon let notify (REQ-221). */
                 if (msgs[first + i].author_id != m->user_id &&
-                    oc_model_mentions_me_in(m, g_sel, msgs[first + i].author_id, msgs[first + i].body,
+                    oc_model_mentions_me_in(m, msgs[first + i].broadcast_held, msgs[first + i].body,
                                             strlen(msgs[first + i].body))) {
                     rectf mr = rf(reg.left, y, reg.right, y + heights[i]);
                     gfx_fill(rt, gr(mr), OC_COL_ACCENT, 0.10f);
@@ -24931,15 +24937,33 @@ static void composer_send(void) {
     /* A broadcast mention under the workspace's rule (REQ-221): one that will
      * notify nobody is said and sent anyway; one that will notify a channel the
      * workspace calls large asks first. An edit notifies nobody, so neither. */
+    g_bc_wait_ch = 0;
     if (b && !g_edit_msg && !g_bc_confirmed) {
         const oc_model *bm = model();
         uint64_t bcid = bm && bm->thread_open ? bm->thread_channel : g_sel;
         char tok[OC_MENTION_NAME_MAX + 2], t[96], why[160];
         size_t n = 0;
         int bc = oc_model_broadcast_will_notify(bm, bcid, b, tok, sizeof tok, &n);
+        /* Which it is depends on the channel's size, and the member list this
+         * client holds is not this channel's, or is still loading: judged from
+         * it, the warning said a broadcast that notifies would not, or asked to
+         * confirm one in a small channel. So the list is asked for, the text
+         * stays in the box, and bc_tick sends it once the list is in. Asked
+         * for on each such send, as the terminal client does, so a load that
+         * never finished is not waited on for good. */
+        if (bc == 3) {
+            oc_client_list_members(g_client, bcid);
+            free(g_bc_wait_text);
+            g_bc_wait_text = b;
+            g_bc_wait_ch = bcid;
+            snprintf(why, sizeof why, "Checking how many people %s reaches\u2026", tok);
+            composer_hint(why, 0);
+            return;
+        }
         if (bc == 2) {
-            if (n) snprintf(t, sizeof t, "Notify %zu people?", n);
-            else snprintf(t, sizeof t, "Notify everyone here?");
+            char whom[48];
+            oc_model_broadcast_whom(n, whom, sizeof whom);
+            snprintf(t, sizeof t, "Notify %s?", whom);
             snprintf(why, sizeof why, "%s notifies everyone in this channel.", tok);
             confirm_open(g_main, CONF_BROADCAST, bcid, t, why, "Send");
             free(b);
@@ -31560,6 +31584,24 @@ static void call_start_here(oc_win *hwnd, uint64_t ch) {
     call_open_view(hwnd, ch);
 }
 
+/* Once a tick: a broadcast send waiting on its channel's member list
+ * (composer_send) goes when the list is in -- if the text in the box is still
+ * the text it was for. Changed, the wait is dropped and the next send judges
+ * the new text with the list now held. */
+static void bc_tick(void) {
+    const oc_model *m = model();
+    if (!g_bc_wait_ch || !m || m->chanmem_channel != g_bc_wait_ch || m->chanmem_loading) return;
+    g_bc_wait_ch = 0;
+    char *now = ed_md_all();
+    int same = now && g_bc_wait_text && !strcmp(now, g_bc_wait_text);
+    free(now);
+    free(g_bc_wait_text);
+    g_bc_wait_text = NULL;
+    if (!same) return;
+    g_cmp_hint[0] = '\0';
+    composer_send();
+}
+
 /* Once a tick: a start waiting on a member list goes when the list is in. */
 static void call_tick(oc_win *hwnd) {
     const oc_model *m = model();
@@ -35894,6 +35936,7 @@ static int on_tick(oc_win *hwnd) {
             ftray_tick(hwnd);        /* uploads in the composer's tray */
             nt_tick();               /* the notification window expires on this tick too */
             call_tick(hwnd);         /* a start waiting on a member list */
+            bc_tick();               /* and a broadcast send (REQ-221) */
             pdm_tick(hwnd);          /* private DMs: invitations, arrivals, endings */
             /* The call view's duration, levels and speaking rings move without
              * any event to repaint on. */

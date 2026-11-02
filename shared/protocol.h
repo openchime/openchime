@@ -178,8 +178,14 @@
  * 30: each USER_LIST entry carries `flags`, OC_USER_SYSTEM marking the
  * workspace's own sender (the welcome a new member is sent), which a client
  * draws as the workspace and keeps out of its people lists. A byte appended
- * to a repeated entry. (29 is SEARCH's audit filters.) */
-#define OC_PROTOCOL_VERSION 30u
+ * to a repeated entry. (29 is SEARCH's audit filters.)
+ *
+ * 31: BROADCAST (and MSG_RESTORED, its layout) and THREAD_REPLY carry
+ * `broadcast_held`, 1 when the body's @here, @channel or @everyone got no
+ * mention row and so notifies nobody (REQ-221): the daemon's answer, which a
+ * client reads instead of guessing the channel's size. A byte in each fixed
+ * part, ahead of the body. */
+#define OC_PROTOCOL_VERSION 31u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -1034,10 +1040,15 @@ typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; uint64_t messa
 /* `kind` is OC_MSG_KIND_*: an ordinary message, or a call event the daemon wrote
  * (a missed call, REQ-304) that a client draws as a line of history rather than
  * as something said. */
+/* `broadcast_held` is 1 when the body holds @here, @channel or @everyone and
+ * the daemon stored no mention row for it, so it notifies nobody (REQ-221); 0
+ * otherwise. Last in the struct, where it was added; on the wire it sits in
+ * the fixed part, after `kind`. */
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time;
                  uint8_t kind; oc_slice body;
                  uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH];
-                 oc_slice author_name; } oc_broadcast;  /* override name (webhooks); empty = use author_id */
+                 oc_slice author_name;   /* override name (webhooks); empty = use author_id */
+                 uint8_t broadcast_held; } oc_broadcast;
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_client_ack;
 /* A member's read cursor in a channel advanced (REQ-090 seen-by). */
 typedef struct { uint64_t channel_id; uint64_t user_id; uint64_t message_id; } oc_read_cursor;
@@ -1203,8 +1214,10 @@ typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; uint64_t paren
  * written to, so the daemon encodes the frame twice — once each way — and sends
  * whichever matches. It is the evaluator's thread_reply INPUT and not a verdict;
  * the recipient still decides with its own mute, level and schedule. */
+/* `broadcast_held` as on BROADCAST (REQ-221): written after `participant`. */
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t parent_id; uint64_t author_id; uint64_t server_time; uint32_t reply_count; uint8_t participant; oc_slice body;
-                 uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH]; } oc_thread_reply;
+                 uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH];
+                 uint8_t broadcast_held; } oc_thread_reply;
 typedef struct { uint64_t channel_id; uint64_t parent_id; } oc_list_thread;
 /* THREAD is the terminator of a LIST_THREAD response: the daemon streams the
  * replies as THREAD_REPLY frames (each self-framed, so a 64KB body is fine),

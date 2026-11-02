@@ -643,10 +643,12 @@ static void test_channels_vertical(int port, const uint8_t *pin) {
     oc_channel_info pushed; CHECK(oc_decode_channel_info(&p, &pushed) == OC_OK);
     CHECK(pushed.channel_id == cid && pushed.joined == 1);
 
-    /* Now bob posts to the private channel; both members receive the BROADCAST. */
+    /* Now bob posts to the private channel; both members receive the BROADCAST.
+     * His @channel reaches them under the workspace's default rule (REQ-221),
+     * and the frame says so. */
     oc_wbuf_init(&w, buf, sizeof buf);
     oc_send s2 = {0}; s2.channel_id = cid; memset(s2.idem, 0x22, OC_IDEM_SIZE);
-    s2.body = oc_slice_str("war plans");
+    s2.body = oc_slice_str("@channel war plans");
     CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s2) == OC_OK);
     CHECK(send_frame(&b, buf, w.len) == 0);
     /* By type: bob was just told, in his DM with the workspace, that alice
@@ -660,6 +662,7 @@ static void test_channels_vertical(int port, const uint8_t *pin) {
     CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0);
     oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
     CHECK(bc.channel_id == cid && bc.author_id == ub && bc.message_id == bmid);
+    CHECK(bc.broadcast_held == 0);
 
     /* carol (a non-member) never sees the private channel in LIST_CHANNELS. */
     oc_wbuf_init(&w, buf, sizeof buf);
@@ -4700,12 +4703,44 @@ static void test_webhook_vertical(int port, const uint8_t *pin) {
     CHECK(bc.channel_id == OC_DEFAULT_CHANNEL && bc.author_id == ua);
     CHECK(bc.body.len == 12 && memcmp(bc.body.ptr, "from webhook", 12) == 0);   /* contract: the test's own input, echoed */
     CHECK(bc.author_name.len == 2 && memcmp(bc.author_name.ptr, "ci", 2) == 0);  /* label override */
+    CHECK(bc.broadcast_held == 0);   /* no broadcast in it */
 
     /* The sender gets a 200. */
     char resp[512];
     http_read_response(&h, resp, sizeof resp);
     CHECK(strncmp(resp, "HTTP/1.1 200", 12) == 0);
     client_close(&h);
+
+    /* A webhook's post is stored without mentions, so its @channel notifies
+     * nobody (REQ-221): the frame says it is held, live and replayed. */
+    CHECK(http_client_open(&h, port, pin) == 0);
+    body = "{\"text\":\"@channel deploy done\"}";
+    rn = snprintf(req, sizeof req,
+        "POST /webhook/%s HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        "Content-Length: %zu\r\nConnection: close\r\n\r\n%s", hex, strlen(body), body);
+    CHECK(write_all(&h.conn, (const uint8_t *)req, (size_t)rn) == 0);
+    CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0);
+    CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+    CHECK(bc.body.len == 20 && memcmp(bc.body.ptr, "@channel deploy done", 20) == 0);
+    CHECK(bc.broadcast_held == 1);
+    uint64_t held_id = bc.message_id;
+    http_read_response(&h, resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 200", 12) == 0);
+    client_close(&h);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_cursor cur = { OC_DEFAULT_CHANNEL, 0 };
+    oc_backfill_request bq = { 1, &cur };
+    CHECK(oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &bq) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    int replayed = -1;
+    for (int i = 0; i < 3000; i++) {
+        if (read_frame(&a, &hdr, &p) != 0) { CHECK(0 /* the connection ended */); break; }
+        if (hdr.msg_type == OC_MSG_BACKFILL_DONE) break;
+        if (hdr.msg_type != OC_MSG_BROADCAST) continue;
+        oc_broadcast bx; CHECK(oc_decode_broadcast(&p, &bx) == OC_OK);
+        if (bx.message_id == held_id) replayed = bx.broadcast_held;
+    }
+    CHECK(replayed == 1);
 
     /* An unknown token gets a 404. */
     client h2;

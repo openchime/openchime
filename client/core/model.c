@@ -305,23 +305,38 @@ int oc_model_broadcast_will_notify(const oc_model *m, uint64_t channel_id, const
         if (mm[i].kind == OC_MENTION_HERE || mm[i].kind == OC_MENTION_CHANNEL || mm[i].kind == OC_MENTION_EVERYONE) break;
     if (i == n) return -1;
     if (token && tcap) snprintf(token, tcap, "@%s", mm[i].name);
-    /* The roster is known for the open channel; elsewhere the count is not,
-     * and the channel is taken as large, as the daemon may find it. The roster
-     * is the daemon's count up to its cap, and the threshold is at most the
-     * cap, so the two agree on which side of it the channel is. */
-    int known = m->chanmem_channel == channel_id && !m->chanmem_loading;
-    if (members && known) *members = m->n_chanmem;
     char who[16] = "", lg[16] = "";
     oc_model_workspace_setting(m, "broadcast_mentions", who, sizeof who);
     oc_model_workspace_setting(m, "broadcast_large", lg, sizeof lg);
     long large = strtol(lg, NULL, 10);
-    int is_large = !known || (size_t)(large < 0 ? 0 : large) <= m->n_chanmem;
-    if (!is_large) return 1;
+    if (large < 0) large = 0;
     uint8_t role = OC_ROLE_MEMBER;
     for (size_t k = 0; k < m->n_users; k++)
         if (m->users[k].user_id == m->user_id) { role = m->users[k].role; break; }
-    if (!strcmp(who, "nobody") || (!strcmp(who, "admins") && role < OC_ROLE_ADMIN)) return 0;
-    return large > 0 ? 2 : 1;
+    int allowed = strcmp(who, "nobody") != 0 && !(!strcmp(who, "admins") && role < OC_ROLE_ADMIN);
+    /* The channel's size is what only its own loaded member list says: one
+     * still loading, or another channel's (a call's, say), is not it. At the
+     * cap the list stops counting and the channel may be far larger, so no
+     * number is given and the composer says "everyone here". */
+    int known = m->chanmem_channel == channel_id && !m->chanmem_loading;
+    if (members && known && m->n_chanmem < OC_MAX_MEMBER_LIST) *members = m->n_chanmem;
+    /* No threshold: every channel is large, whatever its size, and there is
+     * nothing to confirm. */
+    if (large == 0) return allowed;
+    /* Otherwise the answer is the size, and a guess either way tells someone
+     * their message will not notify when it will, or asks them to confirm in
+     * a small channel. The list is the daemon's count up to its cap, and the
+     * threshold is at most the cap, so the two agree on which side of it the
+     * channel is. */
+    if (!known) return 3;
+    if (m->n_chanmem < (size_t)large) return 1;
+    return allowed ? 2 : 0;
+}
+
+void oc_model_broadcast_whom(size_t members, char *out, size_t cap) {
+    if (!out || !cap) return;
+    if (members) snprintf(out, cap, "%zu people", members);
+    else snprintf(out, cap, "everyone here");
 }
 
 int oc_model_has_default_quiet_hours(const oc_model *m) {
@@ -1410,10 +1425,6 @@ uint64_t oc_model_via_group(const oc_model *m, uint64_t channel_id, uint64_t use
     return 0;
 }
 
-/* Whether a broadcast mention (@here, @channel, @everyone) from `author_id`
- * reaches anyone in `channel_id`, as the daemon decides it (REQ-221): the
- * workspace's `broadcast_mentions` and `broadcast_large`. A channel whose size
- * is not loaded is taken as large, as the daemon may find it. */
 /* ASCII case-insensitive equality: names and handles are ASCII (mention.h). */
 static int name_eq(const char *a, const char *b) {
     for (; *a && *b; a++, b++)
@@ -1421,21 +1432,23 @@ static int name_eq(const char *a, const char *b) {
     return *a == *b;
 }
 
-static int broadcast_reaches(const oc_model *m, uint64_t channel_id, uint64_t author_id) {
-    char who[16] = "", lg[16] = "";
-    oc_model_workspace_setting(m, "broadcast_mentions", who, sizeof who);
-    if (!who[0] || !strcmp(who, "everyone")) return 1;
-    oc_model_workspace_setting(m, "broadcast_large", lg, sizeof lg);
-    long large = strtol(lg, NULL, 10);
-    int known = m->chanmem_channel == channel_id && !m->chanmem_loading;
-    if (known && large > 0 && m->n_chanmem < (size_t)large) return 1;   /* not large */
-    if (!strcmp(who, "nobody")) return 0;
-    for (size_t i = 0; i < m->n_users; i++)
-        if (m->users[i].user_id == author_id) return m->users[i].role >= OC_ROLE_ADMIN;
+/* Whether `body` holds a broadcast mention: @here, @channel or @everyone. */
+static int has_broadcast(const char *body) {
+    if (!body || !strchr(body, '@')) return 0;
+    oc_mention mm[OC_MENTION_MAX];
+    size_t n = oc_mention_scan(body, strlen(body), mm, OC_MENTION_MAX);
+    if (n > OC_MENTION_MAX) n = OC_MENTION_MAX;
+    for (size_t i = 0; i < n; i++)
+        if (mm[i].kind != OC_MENTION_USER) return 1;
     return 0;
 }
 
-int oc_model_mentions_me_in(const oc_model *m, uint64_t channel_id, uint64_t author_id,
+/* A broadcast mention (@here, @channel, @everyone) counts as the daemon stored
+ * it (REQ-221): whether the workspace let its author notify a channel that
+ * large is the daemon's to say, and it says so on every message frame. Judged
+ * here instead, it was judged from the one member list a client may have
+ * loaded, and every other channel was guessed large. */
+int oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_held,
                             const char *body, size_t len) {
     if (!m || !body) return 0;
     oc_mention mm[OC_MENTION_MAX];
@@ -1449,7 +1462,7 @@ int oc_model_mentions_me_in(const oc_model *m, uint64_t channel_id, uint64_t aut
             if (oc_model_in_group(m->groups[k], m->user_id) && name_eq(mm[i].name, m->groups[k]->handle))
                 return 1;
     }
-    return bc && broadcast_reaches(m, channel_id, author_id);
+    return bc && !broadcast_held;
 }
 
 int oc_model_mentions_me(const oc_model *m, const char *body, size_t len) {
@@ -1545,7 +1558,7 @@ void oc_model_set_read_marker(oc_model *m, uint64_t channel_id, uint64_t message
         int men = 0, kw = 0;
         if (msg->body) {
             size_t blen = strlen(msg->body);
-            men = oc_model_mentions_me_in(m, c->channel_id, msg->author_id, msg->body, blen);
+            men = oc_model_mentions_me_in(m, msg->broadcast_held, msg->body, blen);
             kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
         }
         int vip = oc_model_is_priority(m, msg->author_id);
@@ -1586,7 +1599,8 @@ static oc_channel *channel_ensure(oc_model *m, uint64_t channel_id) {
 /* Append a message, stealing ownership of `*body` (set to NULL on success).
  * Returns 1 if a message was appended, 0 if it was a dedup/alloc no-op. */
 static int channel_append(oc_channel *c, uint64_t author_id, const char *author_name,
-                          uint64_t message_id, uint64_t server_time, uint8_t kind, char **body) {
+                          uint64_t message_id, uint64_t server_time, uint8_t kind,
+                          uint8_t broadcast_held, char **body) {
     /* Dedup on the per-channel high-water mark (ARCH-45). message_id 0 means the
      * server did not assign one (shouldn't happen for a BROADCAST) — keep it.
      *
@@ -1623,6 +1637,7 @@ static int channel_append(oc_channel *c, uint64_t author_id, const char *author_
     msg->message_id = message_id;
     msg->server_time = server_time;
     msg->kind = kind;
+    msg->broadcast_held = broadcast_held;   /* REQ-221 */
     *body = NULL;
     if (message_id > c->high_water) c->high_water = message_id;
     return 1;
@@ -1703,7 +1718,7 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
         int men = 0, kw = 0;
         if (msg->body) {
             size_t blen = strlen(msg->body);
-            men = oc_model_mentions_me_in(m, c->channel_id, msg->author_id, msg->body, blen);
+            men = oc_model_mentions_me_in(m, msg->broadcast_held, msg->body, blen);
             kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
         }
         int is_vip = oc_model_is_priority(m, msg->author_id);
@@ -1742,7 +1757,7 @@ static void notice_push(oc_model *m, const oc_ev *e) {
     n->author_id  = e->author_id;
     if (e->body) {
         size_t blen = strlen(e->body);
-        n->mentioned   = (uint8_t)(oc_model_mentions_me_in(m, e->channel_id, e->author_id, e->body, blen) != 0);
+        n->mentioned   = (uint8_t)(oc_model_mentions_me_in(m, e->broadcast_held, e->body, blen) != 0);
         n->keyword_hit = (uint8_t)(oc_model_keyword_hit(m, e->body, blen, NULL, NULL) != 0);
         /* An action keeps its action text, flagged, for "<name> <text>"
          * (REQ-058); the net thread paired it with the reply before this. */
@@ -1965,7 +1980,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             c->preview_action = (uint8_t)act;
         }
         if (c && channel_append(c, e->author_id, e->author_name, e->message_id, e->server_time,
-                                e->msg_kind, &e->body)) {
+                                e->msg_kind, e->broadcast_held, &e->body)) {
             msg_set_action(&c->msgs[c->n_msgs - 1], e);
             /* A badge counts what WOULD HAVE NOTIFIED, with the schedule and
              * the pause left out — they say when to interrupt you, not whether
@@ -1981,7 +1996,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             int men = 0, kw = 0;
             if (msg->body) {
                 size_t blen = strlen(msg->body);
-                men = oc_model_mentions_me_in(m, c->channel_id, msg->author_id, msg->body, blen);
+                men = oc_model_mentions_me_in(m, msg->broadcast_held, msg->body, blen);
                 kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
             }
             int vip = oc_model_is_priority(m, e->author_id);
@@ -2588,6 +2603,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (c) {
             for (size_t i = 0; i < c->n_msgs; i++) {
                 if (c->msgs[i].message_id == e->message_id) {
+                    /* An edit stores no mentions (PROTOCOL.md §5.5): a
+                     * broadcast the old text had keeps the daemon's answer,
+                     * and one only the new text has got no row, so is held
+                     * (REQ-221). */
+                    int stored = has_broadcast(c->msgs[i].body) && !c->msgs[i].broadcast_held;
+                    c->msgs[i].broadcast_held = (uint8_t)(has_broadcast(e->body) && !stored);
                     free(c->msgs[i].body);
                     c->msgs[i].body = e->body;   /* steal the new text */
                     e->body = NULL;
@@ -2627,12 +2648,14 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             if (c->msgs[i].message_id == e->message_id) {
                 msg_untombstone(&c->msgs[i], e->body);
                 msg_set_action(&c->msgs[i], e);   /* back with its body (REQ-058) */
+                c->msgs[i].broadcast_held = e->broadcast_held;   /* REQ-221 */
                 break;
             }
         for (size_t i = 0; i < m->n_thread_msgs; i++)
             if (m->thread_msgs[i].message_id == e->message_id) {
                 msg_untombstone(&m->thread_msgs[i], e->body);
                 msg_set_action(&m->thread_msgs[i], e);
+                m->thread_msgs[i].broadcast_held = e->broadcast_held;
                 break;
             }
         break;
@@ -2654,7 +2677,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (m->thread_open && e->parent_id == m->thread_parent) {
             size_t before = m->n_thread_msgs;
             thread_append(m, e->message_id, e->author_id, e->server_time, &e->body);
-            if (m->n_thread_msgs > before) msg_set_action(&m->thread_msgs[m->n_thread_msgs - 1], e);
+            if (m->n_thread_msgs > before) {
+                msg_set_action(&m->thread_msgs[m->n_thread_msgs - 1], e);
+                m->thread_msgs[m->n_thread_msgs - 1].broadcast_held = e->broadcast_held;   /* REQ-221 */
+            }
         }
         break;
     case OC_EV_THREAD_END:
