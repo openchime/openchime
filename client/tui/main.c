@@ -226,6 +226,27 @@ static const char *name_for(const oc_channel *ch, uint64_t uid);
 /* Fill `out` with the nick to show for message `m`: the name the daemon stamped,
  * "you" for self, a name resolved from the channel (thread replies carry no
  * name), else "user<id>". */
+static char     g_closed_note[160]; /* why `e` or `x` did nothing: the workspace's window closed (REQ-051/052) */
+/* Why an author's own edit or delete is not offered (REQ-051/052): the
+ * workspace's window, as it reads it, said in the status line. */
+static void closed_note(const oc_model *m, int edit) {
+    char v[24];
+    const char *what = edit ? "Editing" : "Deleting";
+    oc_model_workspace_setting(m, edit ? "edit_window" : "delete_window", v, sizeof v);
+    if (!strcmp(v, "never")) {
+        snprintf(g_closed_note, sizeof g_closed_note, "%s your messages is off in this workspace.", what);
+        return;
+    }
+    long s = strtol(v, NULL, 10);
+    char span[48];
+    if (s >= 86400 && s % 86400 == 0) snprintf(span, sizeof span, "%ld day%s", s / 86400, s == 86400 ? "" : "s");
+    else if (s >= 3600 && s % 3600 == 0) snprintf(span, sizeof span, "%ld hour%s", s / 3600, s == 3600 ? "" : "s");
+    else if (s >= 60 && s % 60 == 0) snprintf(span, sizeof span, "%ld minute%s", s / 60, s == 60 ? "" : "s");
+    else snprintf(span, sizeof span, "%ld second%s", s, s == 1 ? "" : "s");
+    snprintf(g_closed_note, sizeof g_closed_note, "%s this message has closed: the workspace allows it for %s after sending.",
+             what, span);
+}
+
 static uint64_t g_ws_sender;   /* the workspace's own sender (oc_model.ws_sender), as last drawn */
 static void msg_nick(char *out, size_t cap, const oc_msg *m, uint64_t me, const oc_channel *ch) {
     /* Not a person: the workspace, with its mark. */
@@ -1571,6 +1592,11 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             char pl[220];
             snprintf(pl, sizeof pl, "   \xf0\x9f\x94\x92 %s", g_e2e_note);
             sx = tk_text(sx, H - 3, W, pl, th->accent, TB_DEFAULT);
+        }
+        if (g_closed_note[0]) {
+            char cl2[sizeof g_closed_note + 4];
+            snprintf(cl2, sizeof cl2, "   %s", g_closed_note);
+            sx = tk_text(sx, H - 3, W, cl2, TB_YELLOW, TB_DEFAULT);
         }
         if (g_bc_note[0]) {
             char bl[sizeof g_bc_note + 4];
@@ -3860,6 +3886,7 @@ int main(int argc, char **argv) {
                 else if (msg_sel >= 0 && msg_sel < n) {
                     const oc_msg *sel = &ch->msgs[msg_sel];
                     uint64_t mid = sel->message_id;
+                    g_closed_note[0] = '\0';     /* said once, for the key that met it */
                     /* An encrypted DM that has ended, or is not on this device,
                      * stands as it is: no reply, reaction, edit or delete. */
                     const oc_pdm_view *lv = ch->e2e ? oc_model_pdm((oc_model *)mm, cid) : NULL;
@@ -3881,6 +3908,8 @@ int main(int argc, char **argv) {
                     else if (ev.ch == 't' && !locked) oc_client_open_thread(cl, cid, mid);
                     else if (ev.ch == 'w') oc_client_list_reactions(cl, cid, mid);
                     else if ((ev.ch == 'x' || ev.ch == 'd') && may_del) oc_client_delete(cl, cid, mid);
+                    else if ((ev.ch == 'x' || ev.ch == 'd' || ev.ch == 'e') && own)   /* the window has closed */
+                        closed_note(mm, ev.ch == 'e');
                     else if (ev.ch == 'r' && !sel->deleted && !locked) {   /* open the emoji picker */
                         picker_open = 1; eq[0] = '\0'; eqlen = 0; esel = 0;
                         picker_cid = cid; picker_mid = mid;
