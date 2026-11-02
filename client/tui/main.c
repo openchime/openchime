@@ -3908,7 +3908,8 @@ int main(int argc, char **argv) {
                     else if (ev.ch == 't' && !locked) oc_client_open_thread(cl, cid, mid);
                     else if (ev.ch == 'w') oc_client_list_reactions(cl, cid, mid);
                     else if ((ev.ch == 'x' || ev.ch == 'd') && may_del) oc_client_delete(cl, cid, mid);
-                    else if ((ev.ch == 'x' || ev.ch == 'd' || ev.ch == 'e') && own)   /* the window has closed */
+                    else if (own && ((ev.ch == 'e' && !may_edit) ||                  /* the window has closed */
+                                     ((ev.ch == 'x' || ev.ch == 'd') && !may_del)))
                         closed_note(mm, ev.ch == 'e');
                     else if (ev.ch == 'r' && !sel->deleted && !locked) {   /* open the emoji picker */
                         picker_open = 1; eq[0] = '\0'; eqlen = 0; esel = 0;
