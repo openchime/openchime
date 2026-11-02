@@ -1408,6 +1408,48 @@ uint64_t oc_model_via_group(const oc_model *m, uint64_t channel_id, uint64_t use
     return 0;
 }
 
+/* Whether a broadcast mention (@here, @channel, @everyone) from `author_id`
+ * reaches anyone in `channel_id`, as the daemon decides it (REQ-221): the
+ * workspace's `broadcast_mentions` and `broadcast_large`. A channel whose size
+ * is not loaded is taken as large, as the daemon may find it. */
+/* ASCII case-insensitive equality: names and handles are ASCII (mention.h). */
+static int name_eq(const char *a, const char *b) {
+    for (; *a && *b; a++, b++)
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+    return *a == *b;
+}
+
+static int broadcast_reaches(const oc_model *m, uint64_t channel_id, uint64_t author_id) {
+    char who[16] = "", lg[16] = "";
+    oc_model_workspace_setting(m, "broadcast_mentions", who, sizeof who);
+    if (!who[0] || !strcmp(who, "everyone")) return 1;
+    oc_model_workspace_setting(m, "broadcast_large", lg, sizeof lg);
+    long large = strtol(lg, NULL, 10);
+    int known = m->chanmem_channel == channel_id && !m->chanmem_loading;
+    if (known && large > 0 && m->n_chanmem < (size_t)large) return 1;   /* not large */
+    if (!strcmp(who, "nobody")) return 0;
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == author_id) return m->users[i].role >= OC_ROLE_ADMIN;
+    return 0;
+}
+
+int oc_model_mentions_me_in(const oc_model *m, uint64_t channel_id, uint64_t author_id,
+                            const char *body, size_t len) {
+    if (!m || !body) return 0;
+    oc_mention mm[OC_MENTION_MAX];
+    size_t n = oc_mention_scan(body, len, mm, OC_MENTION_MAX), bc = 0;
+    if (n > OC_MENTION_MAX) n = OC_MENTION_MAX;
+    const char *me = oc_model_user_name(m, m->user_id);
+    for (size_t i = 0; i < n; i++) {
+        if (mm[i].kind != OC_MENTION_USER) { bc = 1; continue; }
+        if (me && me[0] && name_eq(mm[i].name, me)) return 1;
+        for (size_t k = 0; k < m->n_groups; k++)
+            if (oc_model_in_group(m->groups[k], m->user_id) && name_eq(mm[i].name, m->groups[k]->handle))
+                return 1;
+    }
+    return bc && broadcast_reaches(m, channel_id, author_id);
+}
+
 int oc_model_mentions_me(const oc_model *m, const char *body, size_t len) {
     if (!m || !body) return 0;
     if (oc_mention_targets(body, len, oc_model_user_name(m, m->user_id))) return 1;
@@ -1501,7 +1543,7 @@ void oc_model_set_read_marker(oc_model *m, uint64_t channel_id, uint64_t message
         int men = 0, kw = 0;
         if (msg->body) {
             size_t blen = strlen(msg->body);
-            men = oc_model_mentions_me(m, msg->body, blen);
+            men = oc_model_mentions_me_in(m, c->channel_id, msg->author_id, msg->body, blen);
             kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
         }
         int vip = oc_model_is_priority(m, msg->author_id);
@@ -1659,7 +1701,7 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
         int men = 0, kw = 0;
         if (msg->body) {
             size_t blen = strlen(msg->body);
-            men = oc_model_mentions_me(m, msg->body, blen);
+            men = oc_model_mentions_me_in(m, c->channel_id, msg->author_id, msg->body, blen);
             kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
         }
         int is_vip = oc_model_is_priority(m, msg->author_id);
@@ -1698,7 +1740,7 @@ static void notice_push(oc_model *m, const oc_ev *e) {
     n->author_id  = e->author_id;
     if (e->body) {
         size_t blen = strlen(e->body);
-        n->mentioned   = (uint8_t)(oc_model_mentions_me(m, e->body, blen) != 0);
+        n->mentioned   = (uint8_t)(oc_model_mentions_me_in(m, e->channel_id, e->author_id, e->body, blen) != 0);
         n->keyword_hit = (uint8_t)(oc_model_keyword_hit(m, e->body, blen, NULL, NULL) != 0);
         /* An action keeps its action text, flagged, for "<name> <text>"
          * (REQ-058); the net thread paired it with the reply before this. */
@@ -1937,7 +1979,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             int men = 0, kw = 0;
             if (msg->body) {
                 size_t blen = strlen(msg->body);
-                men = oc_model_mentions_me(m, msg->body, blen);
+                men = oc_model_mentions_me_in(m, c->channel_id, msg->author_id, msg->body, blen);
                 kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
             }
             int vip = oc_model_is_priority(m, e->author_id);

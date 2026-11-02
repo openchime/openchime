@@ -7111,7 +7111,8 @@ static void draw_msglist(gfx *rt, const oc_model *m,
             if (capture && !msgs[first + i].deleted && msgs[first + i].body) {
                 /* By name, or by a group this user is in (REQ-308). */
                 if (msgs[first + i].author_id != m->user_id &&
-                    oc_model_mentions_me(m, msgs[first + i].body, strlen(msgs[first + i].body))) {
+                    oc_model_mentions_me_in(m, g_sel, msgs[first + i].author_id, msgs[first + i].body,
+                                            strlen(msgs[first + i].body))) {
                     rectf mr = rf(reg.left, y, reg.right, y + heights[i]);
                     gfx_fill(rt, gr(mr), OC_COL_ACCENT, 0.10f);
                     fill(rt, rf(reg.left, y, reg.left + 3, y + heights[i]), OC_COL_ACCENT);

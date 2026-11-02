@@ -1571,6 +1571,28 @@ static void test_workspace_sender_model(void) {
     oc_model_free(&m);
 }
 
+/* A broadcast mentions the reader only when the workspace lets its author
+ * notify the channel (REQ-221), as the daemon stores it. */
+static void test_broadcast_mentions_me(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("ada"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 3; e.body = strdup("cat"); e.status = OC_ROLE_ADMIN;
+    oc_model_apply(&m, &e);
+    const char *b = "@channel standup";
+    CHECK(oc_model_mentions_me_in(&m, 10, 2, b, strlen(b)) == 1);     /* not told: everyone */
+    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "0\x1e");
+    CHECK(oc_model_mentions_me_in(&m, 10, 2, b, strlen(b)) == 0);     /* a member's: text */
+    CHECK(oc_model_mentions_me_in(&m, 10, 3, b, strlen(b)) == 1);     /* an admin's */
+    const char *p2 = "@ada and @channel";
+    CHECK(oc_model_mentions_me_in(&m, 10, 2, p2, strlen(p2)) == 1);   /* by name, whoever */
+    bc_settings(&m, "broadcast_mentions\x1f" "nobody\x1e" "broadcast_large\x1f" "0\x1e");
+    CHECK(oc_model_mentions_me_in(&m, 10, 3, b, strlen(b)) == 0);
+    oc_model_free(&m);
+}
+
 static void test_poll_model(void) {
     oc_model m; oc_model_init(&m);
     oc_ev e;
@@ -5317,6 +5339,7 @@ int run_client_core_tests(void) {
     test_workspace_settings_model();
     test_change_windows_model();
     test_broadcast_model();
+    test_broadcast_mentions_me();
     test_workspace_sender_model();
     test_badge_tiers();
     test_osnotify_null();

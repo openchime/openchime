@@ -841,6 +841,11 @@ uint64_t oc_model_via_group(const oc_model *m, uint64_t channel_id, uint64_t use
 /* Does `body` mention this user -- by their name, or by a group they are in
  * (REQ-308)? What a toast and a highlight ask. */
 int      oc_model_mentions_me(const oc_model *m, const char *body, size_t len);
+/* The same, for a message in `channel_id` from `author_id`: a broadcast
+ * (@here, @channel, @everyone) counts only when the workspace lets that
+ * author notify that channel (REQ-221), as the daemon stores it. */
+int      oc_model_mentions_me_in(const oc_model *m, uint64_t channel_id, uint64_t author_id,
+                                 const char *body, size_t len);
 
 /* ---- the sidebar (6) --------------------------------------------------
  * Grouping, filtering, sorting and collapse are IDENTICAL in every frontend, so
