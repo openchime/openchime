@@ -369,6 +369,13 @@ static void test_mode(void) {
     /* The values, and nothing else. */
     refuses("OPENCHIME_MODE", "production");
     refuses("OPENCHIME_MODE", "Development");   /* case matters */
+    /* The workspace's notices: a channel's name (any, checked at start), or
+     * empty; and on or off for a channel's own changes. */
+    accepts("OPENCHIME_NOTICE_MEMBER_JOINED", "general");
+    accepts("OPENCHIME_NOTICE_CHANNEL_CREATED", "#lobby");
+    accepts("OPENCHIME_NOTICE_CHANNEL_CHANGES", "on");
+    accepts("OPENCHIME_NOTICE_CHANNEL_CHANGES", "off");
+    refuses("OPENCHIME_NOTICE_CHANNEL_CHANGES", "sometimes");
     /* The edit and delete windows: never, or whole seconds up to a year. */
     accepts("OPENCHIME_EDIT_WINDOW", "never");
     accepts("OPENCHIME_EDIT_WINDOW", "600");

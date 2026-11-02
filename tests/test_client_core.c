@@ -1552,6 +1552,22 @@ static void test_workspace_sender_model(void) {
     CHECK(oc_model_is_workspace_sender(&m, 7) && !oc_model_is_workspace_sender(&m, 1));
     CHECK(!oc_model_is_workspace_sender(&m, 0));
     CHECK(!strcmp(oc_model_user_name(&m, 7), "Workspace"));
+    /* Its notices are news to nobody: they count as unread for no one,
+     * and a person's message after them does (oc_notify_decide's `own`). */
+    m.user_id = 1;
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 40; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("room");
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 40; e.message_id = 100; e.author_id = 7;
+    e.body = strdup("@bob joined the workspace.");
+    oc_model_apply(&m, &e);
+    const oc_channel *c = oc_model_channel(&m, 40);
+    CHECK(c && c->unread == 0);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 40; e.message_id = 101; e.author_id = 9;
+    e.body = strdup("hello");
+    oc_model_apply(&m, &e);
+    c = oc_model_channel(&m, 40);
+    CHECK(c && c->unread == 1);
     oc_model_free(&m);
 }
 
