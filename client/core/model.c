@@ -306,7 +306,9 @@ int oc_model_broadcast_will_notify(const oc_model *m, uint64_t channel_id, const
     if (i == n) return -1;
     if (token && tcap) snprintf(token, tcap, "@%s", mm[i].name);
     /* The roster is known for the open channel; elsewhere the count is not,
-     * and the channel is taken as large, as the daemon may find it. */
+     * and the channel is taken as large, as the daemon may find it. The roster
+     * is the daemon's count up to its cap, and the threshold is at most the
+     * cap, so the two agree on which side of it the channel is. */
     int known = m->chanmem_channel == channel_id && !m->chanmem_loading;
     if (members && known) *members = m->n_chanmem;
     char who[16] = "", lg[16] = "";

@@ -390,6 +390,8 @@ static void test_mode(void) {
     accepts("OPENCHIME_BROADCAST_MENTIONS", "nobody");
     refuses("OPENCHIME_BROADCAST_MENTIONS", "members");
     accepts("OPENCHIME_BROADCAST_LARGE", "50");
+    accepts("OPENCHIME_BROADCAST_LARGE", "500");
+    refuses("OPENCHIME_BROADCAST_LARGE", "501");
     refuses("OPENCHIME_BROADCAST_LARGE", "-1");
     refuses("OPENCHIME_BROADCAST_LARGE", "many");
     /* The workspace's default quiet hours: a mode and the allowed window. */
