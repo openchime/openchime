@@ -82,9 +82,7 @@ interactive desktop session (`powershell.exe` and `/mnt/c` reachable); make
 fetches llvm-mingw for `make windows`. `screenrec.sh` also needs `ffmpeg`, and
 `voice.sh` a daemon built with `TTS=1 STT=1`.
 
-**TUI scripts** (`scripts/demo/tui.sh`, `scripts/tui_device.sh`): `tmux` and
-`curl`; `openssl` for `tui_device.sh`'s fingerprint check, and python3 with
-OpenCV (`cv2`, numpy) for its QR decode, skipped without it.
+**TUI script** (`scripts/demo/tui.sh`): `tmux` and `curl`.
 
 ---
 
@@ -750,7 +748,7 @@ resumed, and back in with nobody asked, whatever it had pinned before.
 
 **Local sign-in in the browser** (AUTH.md §8.10) is proven at every layer, and
 it is also how every suite signs in, and a real browser is held to it too
-(`scripts/web/pages.sh`, below): `tests/testsignin.h` plays the browser --
+(`scripts/test/merge/web.sh`, below): `tests/testsignin.h` plays the browser --
 the form POSTed to the daemon's page over TLS, the token read off the 303 --
 and the client presents that token, so a suite's sign-in is a person's. The
 same helper is the `signin` command (`build/signin`) and links into the e2e,
@@ -807,11 +805,7 @@ connection is given to sign in (a short `unauthed_ms`) signing in on the
 connection that polled, with nothing said meanwhile. `test_tkqr`: the QR code's size,
 quiet zone and finder pattern as half blocks. Mutation proofs cover the slow
 down, expiry, the refusal, the lookup limiter, the per-source cap, polling by the
-user code, single collection and the challenge binding. `scripts/tui_device.sh`
-runs the real TUI in tmux against a development-mode daemon: the dialog, the
-code, the URL, the fingerprint and, where python3's OpenCV (`cv2`) is installed,
-a QR code it decodes back to the URL; curl
-approves on the page; the TUI reaches the workspace.
+user code, single collection and the challenge binding.
 
 ### 3.2 Runner: a natively-run daemon in CI
 
@@ -1048,9 +1042,9 @@ The browser build (WEB.md) is checked in CI's `build` job, which runs
 all of them are judged there as by hand, `OC_TEST_TIMING=0` or not. The daemon it starts runs in development mode,
 and so serves its own `/app/` page that way: the check signs in by password on
 the daemon's page and bootstraps its user.
-`scripts/test/merge/web.sh` runs the first two:
+`scripts/test/merge/web.sh` runs the first two, as its two parts:
 
-- **`scripts/web/test.sh`** — a daemon on a fresh database with one bootstrapped
+- **client** — a daemon on a fresh database with one bootstrapped
   owner, and a headless Chromium with a fresh profile loading the client from
   the daemon's own `/app/` page (`openchime.html`, the Windows application
   compiled for the browser); it signs in on the daemon's page and comes back,
@@ -1075,8 +1069,8 @@ the daemon's page and bootstraps its user.
   (`?ime=1`), the page polling for it composing (`comp=2`) and then for the
   composer holding its result (`len=2`). Each of these is reported on a line
   of its own.
-- **`scripts/web/pages.sh`** — the daemon's sign-in pages from a real browser.
-  A headless Chromium (`scripts/web/pages.mjs`, Playwright) types into the
+- **pages** — the daemon's sign-in pages from a real browser.
+  A headless Chromium (`scripts/test/lib/web/pages.mjs`, Playwright) types into the
   forms and submits them: the first owner signed up with the setup token, a
   wrong password refused on the page, the right one signing in, the password
   changed on its page, the old one refused and the new one signing in; each
@@ -1087,18 +1081,18 @@ the daemon's page and bootstraps its user.
   what this proves, and what no scripted post can. Then an invitation link
   (REQ-026): the owner mints an invite anyone may use (`build/demo_client
   ... invite 0`) and a second browser opens `/app/?invite=<hex>` cold
-  (`scripts/web/invite.mjs`), lands on the sign-up form before the client has
+  (`scripts/test/lib/web/invite.mjs`), lands on the sign-up form before the client has
   been fetched, chooses a name and a password and comes back signed in to the
   web client, which its own dump says; the tab is closed and the client opened
-  again in a new one, and it is still signed in. Last, the client's load (`scripts/web/load.mjs`, WEB.md "Loading"),
+  again in a new one, and it is still signed in. Last, the client's load (`scripts/test/lib/web/load.mjs`, WEB.md "Loading"),
   cold and then warm in one browser that trusts the daemon's certificate by
   its key (a browser caches nothing from one it was told to overlook): the load
   screen counts the download in bytes against its size, shows Downloading,
   Starting and Opening in that order and comes down once the client has
   drawn; the wasm and the loader arrive gzipped; and the second load brings
   the page, the loader and the wasm under 2 KB each, every one a `304`. Needs
-  the web client beside the daemon (`make web`) and `openssl`. `scripts/test/merge/web.sh`
-  runs it after `test.sh`.
+  the web client beside the daemon (`make web`) and `openssl`. It runs after
+  the client part.
 - **`scripts/gui/run.sh --web all`** — the Windows feature scripts against the browser
   ("Driving the web client" below): the smoke, chords, voice input, screen recording,
   uploads, files, the two call scripts, the search boxes, encrypted DMs (`pdm`),

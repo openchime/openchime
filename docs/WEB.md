@@ -168,7 +168,7 @@ installed. Outside a secure context, or if Web Crypto fails, the page starts
 the client as `openchime --signin <host:port> --invite <hex>` and the sign-in
 begins as any other. The clients offer the link in the
 invitation text where the daemon's pages open directly
-(`oc_client_pages_direct`); `scripts/web/invite.mjs` proves it from a cold
+(`oc_client_pages_direct`); `scripts/test/lib/web/invite.mjs` proves it from a cold
 browser.
 
 **Media in the browser.** The same media, voice and call code the desktop
@@ -220,7 +220,7 @@ with each right-to-left run measured and drawn with the canvas's direction
 set and a line's runs placed in visual order, and alignment following the
 paragraph's reading direction as DirectWrite's does. Tested on the host
 (`tests/test_sdltext_unicode.c`) and in the browser through the client's
-`sttest` verb, which `scripts/web/test.sh` runs by hand.
+`sttest` verb, which `scripts/test/merge/web.sh` runs.
 
 **The input method.** A browser's IME composes into an element, so the
 platform keeps a hidden `<input>` at the caret (`oc_plat_text_input_area`,
@@ -228,7 +228,7 @@ the contract's one line for it; Win32 answers with SDL's text input area)
 and hands its composition to SDL's own events -- `SDL_EVENT_TEXT_EDITING`
 while composing, `SDL_EVENT_TEXT_INPUT` at the commit -- so the composer
 shows the composition underlined and takes the result as it does from a
-desktop IME. `scripts/web/test.sh`, run by hand, plays a Japanese composition into it.
+desktop IME. `scripts/test/merge/web.sh` plays a Japanese composition into it.
 
 Rough edges: fonts are the browser's, so layouts are near-identical to
 Windows, not pixel-identical, and the harness compares state, not pixels. The picker and the clipboard need a

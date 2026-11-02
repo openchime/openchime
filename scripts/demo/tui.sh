@@ -7,7 +7,7 @@
 # demo_client), and assert both render in the transcript. Not unattended: the
 # TUI starts with no stored token and offers the device-code sign-in, which a
 # person must approve as alice (pw) while the script waits; nothing here
-# approves it (scripts/tui_device.sh shows how a script can).
+# approves it.
 #
 # Prereqs: tmux, and this repo's toolchain (builds the daemon, TUI, demo_client).
 #

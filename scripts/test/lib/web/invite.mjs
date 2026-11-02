@@ -3,9 +3,9 @@
 // daemon's own web client started with the invitation. The client sends the
 // browser to the daemon's sign-up form, the newcomer chooses a username and
 // password, and the browser comes back to the web client signed in as them,
-// with nothing installed. scripts/web/pages.sh runs it after pages.mjs.
+// with nothing installed. scripts/test/merge/web.sh runs it after pages.mjs.
 //
-//   node scripts/web/invite.mjs <origin> <invite-hex> [chromium]
+//   node scripts/test/lib/web/invite.mjs <origin> <invite-hex> [chromium]
 //
 // One line per check on stdout; exit 1 when any fails.
 import { chromium } from 'playwright-core';

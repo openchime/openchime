@@ -185,7 +185,7 @@ build/bench_loop: tests/bench_loop.c tests/testsignin.c $(APP_SRC) $(HDRS) $(MBE
 	    tests/bench_loop.c tests/testsignin.c $(APP_SRC) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) -ldl -lpthread -lm -o $@
 # The sign-in helper as a command, for the shell scripts: prints the token and
 # the verifier a client presents on AUTH, and presents one (`present`) for a
-# script that played the browser itself (scripts/web/pages.sh).
+# script that played the browser itself (scripts/test/merge/web.sh).
 build/signin: tests/testsignin_main.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build
 	$(CC) $(CFLAGS) -O0 -g -Ishared -Itests -I$(MBEDTLS_INC) \
 	    tests/testsignin_main.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
