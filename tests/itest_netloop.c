@@ -595,6 +595,8 @@ static int send_frame(client *c, const uint8_t *buf, size_t len) {
  * a non-member is refused, an invite grants access + pushes CHANNEL_INFO to the
  * invitee, both members then exchange a BROADCAST, and a third user never sees
  * the private channel in LIST_CHANNELS. */
+static int read_type(client *c, uint16_t type, oc_header *hdr, oc_rbuf *p);   /* below */
+
 static void test_channels_vertical(int port, const uint8_t *pin) {
     client a, b, cc;
     CHECK(client_open(&a, port, pin) == 0);
@@ -647,13 +649,15 @@ static void test_channels_vertical(int port, const uint8_t *pin) {
     s2.body = oc_slice_str("war plans");
     CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s2) == OC_OK);
     CHECK(send_frame(&b, buf, w.len) == 0);
+    /* By type: bob was just told, in his DM with the workspace, that alice
+     * added him, and everyone connected was told the workspace's sender
+     * (USER_LIST) when that notice made it. */
     uint64_t bmid = 0;
-    for (int i = 0; i < 2; i++) {            /* bob: SEND_ACK + own BROADCAST */
-        CHECK(read_frame(&b, &hdr, &p) == 0);
-        if (hdr.msg_type == OC_MSG_SEND_ACK) { oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK); bmid = ack.message_id; }
+    if (read_type(&b, OC_MSG_SEND_ACK, &hdr, &p) == 0) {
+        oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK); bmid = ack.message_id;
     }
     CHECK(bmid != 0);
-    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BROADCAST);
+    CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0);
     oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
     CHECK(bc.channel_id == cid && bc.author_id == ub && bc.message_id == bmid);
 
@@ -661,7 +665,7 @@ static void test_channels_vertical(int port, const uint8_t *pin) {
     oc_wbuf_init(&w, buf, sizeof buf);
     CHECK(oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK);
     CHECK(send_frame(&cc, buf, w.len) == 0);
-    CHECK(read_frame(&cc, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_LIST);
+    CHECK(read_type(&cc, OC_MSG_CHANNEL_LIST, &hdr, &p) == 0);
     oc_channel_list_entry ents[64]; uint16_t n = 0;
     CHECK(oc_decode_channel_list(&p, ents, 64, &n) == OC_OK);
     int saw_private = 0, saw_general = 0;

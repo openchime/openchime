@@ -770,7 +770,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_NOTICE = 121,
        /* Whether user_id shares their read receipts (rc_share): to the asker
         * (rc_asked), or to every device of theirs when it changed. */
-       OC_RES_READ_RECEIPTS = 122 };
+       OC_RES_READ_RECEIPTS = 122,
+       /* A roster row everyone connected is told (its `ulist`, with `joined`),
+        * and nothing else: the workspace's own sender, made by this job. */
+       OC_RES_ROSTER_ROW = 123 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {

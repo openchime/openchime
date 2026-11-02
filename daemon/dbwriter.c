@@ -988,6 +988,9 @@ static __thread uint64_t g_joined_uid;
  * result of its own (OC_RES_NOTICE) chained onto the job's answer by the
  * writer loop, so connected members see it arrive. */
 static __thread oc_dbres *g_notices;
+/* The workspace's own sender, when this job made it: everyone connected is
+ * told its roster row, so their clients know it before its first notice. */
+static __thread uint64_t g_sender_made;
 static uint64_t workspace_sender(sqlite3 *db);
 static uint64_t notice_post(sqlite3 *db, uint64_t channel_id, const char *body, size_t len);
 static void notice_channel(sqlite3 *db, uint64_t channel_id, const char *fmt, ...)
@@ -11458,6 +11461,7 @@ static uint64_t workspace_sender(sqlite3 *db) {
     sqlite3_prepare_v2(db, "SELECT id FROM users WHERE subject='system:workspace' AND is_system=1;", -1, &st, NULL);
     if (sqlite3_step(st) == SQLITE_ROW) id = (uint64_t)sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
+    g_sender_made = id;
     return id;
 }
 
@@ -11634,6 +11638,7 @@ static void *writer_loop(void *arg) {
         w->auth_deferred = 0;
         g_joined_uid = 0;
         g_notices = NULL;
+        g_sender_made = 0;
         oc_dbres *r = process_write(w, j);
         /* A new member joins the workspace's default channels, whichever way
          * their account was made (OPENCHIME_DEFAULT_CHANNELS). */
@@ -11646,6 +11651,18 @@ static void *writer_loop(void *arg) {
             notice_named(w->db, oc_config_get()->notice_member_joined, "@%s joined the workspace.",
                          who ? who : "someone");
             free(who);
+        }
+        /* A sender made just now is told to everyone first (USER_LIST, flagged),
+         * so no client takes its first notice for a person's message. */
+        if (g_sender_made) {
+            oc_dbres *ro = calloc(1, sizeof *ro);
+            if (ro) {
+                ro->type = OC_RES_ROSTER_ROW;
+                user_rows(w->db, g_sender_made, ro);
+                ro->joined = ro->n_ulist != 0;
+                ro->next = g_notices;
+                g_notices = ro;
+            }
         }
         /* The notices the job posted ride on its answer. */
         if (g_notices) {
@@ -11960,7 +11977,7 @@ void oc_dbwriter_set_idem_retention(oc_dbwriter *w, uint64_t retention_ms,
 static oc_dbres *sync_next(oc_dbwriter *w) {
     for (;;) {
         oc_dbres *r = oc_dbwriter_next_result(w);
-        if (!r || r->type != OC_RES_NOTICE) return r;
+        if (!r || (r->type != OC_RES_NOTICE && r->type != OC_RES_ROSTER_ROW)) return r;
         oc_dbres_free(r);
     }
 }

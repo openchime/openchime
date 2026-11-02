@@ -28,10 +28,15 @@
 /* The next result, past any notice the workspace posted beside it (a job's
  * notices ride after its answer, OC_RES_NOTICE): a test asks about the
  * answer, and test_notices reads notices from the database. */
+/* Roster rows told to everyone beside an answer (OC_RES_ROSTER_ROW): counted,
+ * for the test that the workspace's sender is announced once. */
+static int g_roster_rows;
 static oc_dbres *next_answer(oc_dbwriter *w) {
     for (;;) {
         oc_dbres *r = oc_dbwriter_next_result(w);
-        if (!r || r->type != OC_RES_NOTICE) return r;
+        if (!r || (r->type != OC_RES_NOTICE && r->type != OC_RES_ROSTER_ROW)) return r;
+        if (r->type == OC_RES_ROSTER_ROW && r->joined && r->n_ulist == 1 && r->ulist[0].flags == OC_USER_SYSTEM)
+            g_roster_rows++;
         oc_dbres_free(r);
     }
 }
@@ -9331,11 +9336,15 @@ static void test_welcome_message(void) {
     CHECK(owner && welcome_is(path, owner, NULL));
     CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM users WHERE is_system=?1", 1) == 0);   /* not made until needed */
 
-    /* Local registration: the text, with \n as a line break. */
+    /* Local registration: the text, with \n as a line break. The sender is
+     * made by this first welcome, and everyone connected told its row. */
     set_welcome("Hello **there**.\\nStart in #general.");
+    g_roster_rows = 0;
     uint64_t a = reg(w, "wm-a", "pw", OC_ROLE_MEMBER);
+    oc_dbres_free(list_users(w, owner));            /* a round trip: what reg left queued is read */
     CHECK(a && welcome_is(path, a, "Hello **there**.\nStart in #general."));
     CHECK(welcome_is(path, owner, NULL));                   /* an existing member is not sent it */
+    CHECK(g_roster_rows == 1);
 
     /* An invitation redeemed after the text changed: the text at joining. */
     oc_dbres *r = invite_user(w, owner, OC_ROLE_MEMBER);
@@ -9377,6 +9386,7 @@ static void test_welcome_message(void) {
         oc_issuer_free(&is);
     }
 
+    CHECK(g_roster_rows == 1);                               /* told once, not per welcome */
     /* Empty: nothing. */
     set_welcome("");
     uint64_t d = reg(w, "wm-d", "pw", OC_ROLE_MEMBER);
