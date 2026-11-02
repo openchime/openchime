@@ -403,7 +403,7 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
 static void build_rows(rows_t *r, const oc_model *m, const oc_channel *ch, uint64_t me, int width) {
     for (size_t i = 0; i < ch->n_msgs; i++)
         append_msg_rows(r, &ch->msgs[i], me, width, ch, 1, (int)i);
-    if (ch->n_msgs == 0) return;
+    if (ch->n_msgs == 0 || !oc_model_receipts_on(m)) return;   /* the workspace has none (REQ-090) */
     uint64_t last = ch->msgs[ch->n_msgs - 1].message_id;
     char names[192]; size_t p = 0; int shown = 0;
     for (size_t i = 0; i < ch->n_readers; i++) {
