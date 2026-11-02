@@ -6337,6 +6337,25 @@ static void test_custom_emoji(void) {
         j->user_id = carol; j->ch_name = strdup("carols");
         oc_dbwriter_submit(w, j);
         oc_dbres_free(wait_result(w));
+        /* Every role under each value: an admin and an owner get past the
+         * rule under both (refused only because the image is not theirs); a
+         * member only under `everyone` (shown above). */
+        uint64_t admin = reg(w, "ce-admin", "pw", OC_ROLE_ADMIN);
+        CHECK(admin);
+        static const char *const vals[] = { "admins", "everyone" };
+        for (int v = 0; v < 2; v++) {
+            setenv("OPENCHIME_CUSTOM_EMOJI_ADD", vals[v], 1);
+            CHECK(oc_config_load(cerr, sizeof cerr) == 0);
+            const uint64_t who[] = { admin, alice };
+            for (int k = 0; k < 2; k++) {
+                j = oc_job_new(OC_JOB_ADD_EMOJI, 9);
+                j->user_id = who[k]; j->message_id = 3; j->ch_name = strdup("byrole");
+                oc_dbwriter_submit(w, j);
+                r = wait_result(w);
+                CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_UNKNOWN_ATTACHMENT);
+                oc_dbres_free(r);
+            }
+        }
         unsetenv("OPENCHIME_CUSTOM_EMOJI_ADD");
         CHECK(oc_config_load(cerr, sizeof cerr) == 0);
     }
