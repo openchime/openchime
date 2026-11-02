@@ -85,6 +85,7 @@ typedef struct {
     s3_conn  *c;
     uint64_t remaining;   /* body bytes still to send */
     int      failed;
+    int      stale;       /* failed on a kept connection before any response byte */
 } s3_writer;
 
 /* Spill must be >= read_response_head's header buffer, so all body bytes that
@@ -237,6 +238,19 @@ static s3_conn *conn_take(s3_store *s) {
         conn_close(c);
     }
     return conn_open(s);   /* reused = 0 */
+}
+
+/* Close every idle connection: one kept as long as they were went stale, so
+ * they likely did too, and the retry the caller makes must reach the store on
+ * a new one rather than meet another dead socket. */
+static void conn_drop_idle(s3_store *s) {
+    pthread_mutex_lock(&s->idle_mu);
+    int n = s->n_idle;
+    s3_conn *drop[S3_IDLE_MAX];
+    for (int i = 0; i < n; i++) drop[i] = s->idle[i];
+    s->n_idle = 0;
+    pthread_mutex_unlock(&s->idle_mu);
+    for (int i = 0; i < n; i++) conn_close(drop[i]);
 }
 
 /* After a request: back to the idle set when `reusable` (the response said
@@ -450,7 +464,9 @@ static void *s3_put_begin(void *store, const char *key, uint64_t size_hint) {
  * is fresh, and its failures are reported as they are). */
 static int stale_fail(s3_writer *w) {
     w->failed = 1;
-    errno = w->c && w->c->reused ? EAGAIN : EIO;
+    w->stale = w->c && w->c->reused;
+    if (w->stale) conn_drop_idle(w->s);   /* the retry opens a new connection */
+    errno = w->stale ? EAGAIN : EIO;
     return -1;
 }
 
@@ -475,7 +491,7 @@ static int s3_put_commit(void *wv) {
         else errno = EIO;
         reusable = status > 0 && keep && drain_body(w->c, cl, sl);
     } else {
-        errno = w && w->failed && errno == EAGAIN ? EAGAIN : EIO;
+        errno = w && w->stale ? EAGAIN : EIO;
     }
     int keep_errno = errno;
     if (w) { conn_give(w->s, w->c, reusable); free(w); }

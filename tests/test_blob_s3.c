@@ -459,6 +459,28 @@ static void stale_put_tests(fake_s3 *f, const char *dir) {
             oc_blobstore_close(bs);
         }
     }
+    /* Two kept connections idle; one goes stale under a PUT: the other is
+     * dropped with it, so the retry reaches the store on a new connection
+     * rather than on another socket kept as long. */
+    {
+        oc_blobstore *bs = oc_blobstore_open_remote(&g_s3cfg);
+        CHECK(bs != NULL);
+        if (bs) {
+            oc_blob_writer *w1 = oc_blob_put_begin(bs, "abcd0020", 2);
+            oc_blob_writer *w2 = oc_blob_put_begin(bs, "abcd0021", 2);
+            CHECK(w1 && w2);
+            CHECK(w1 && oc_blob_put_chunk(w1, "w1", 2) == 0 && oc_blob_put_commit(w1) == 0);
+            CHECK(w2 && oc_blob_put_chunk(w2, "w2", 2) == 0 && oc_blob_put_commit(w2) == 0);
+            fake_set(f, &f->drop_second, 1);
+            errno = 0;
+            CHECK(put_all(bs, "abcd0022", "late", 4) == -1 && errno == EAGAIN);
+            int a = fake_accepts(f);
+            CHECK(put_all(bs, "abcd0022", "late", 4) == 0);
+            CHECK(fake_accepts(f) == a + 1);                       /* a new connection */
+            fake_set(f, &f->drop_second, 0);
+            oc_blobstore_close(bs);
+        }
+    }
     {
         char cdir[700];
         oc_test_path(cdir, sizeof cdir, dir, "stale-cache");
