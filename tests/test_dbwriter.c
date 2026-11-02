@@ -9397,6 +9397,12 @@ static void test_welcome_message(void) {
     char *t = page_signin(w, 30, "Workspace", "x", NULL, &code);
     CHECK(t == NULL && code != 0);
     free(t);
+    /* Nothing to sign in with: no password, no provider identity, and no
+     * local account name -- its subject is not a `local:` one, so no sign-in
+     * page can name it. */
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM local_credentials WHERE user_id=?1", sys) == 0);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM user_identities WHERE user_id=?1", sys) == 0);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM users WHERE id=?1 AND subject LIKE 'local:%'", sys) == 0);
     r = open_dm(w, a, sys);
     CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
     oc_dbres_free(r);
