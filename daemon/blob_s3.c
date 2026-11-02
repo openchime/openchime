@@ -435,7 +435,7 @@ static int key_uri(const s3_store *s, const char *key, char *uri, size_t cap) {
 
 /* --- backend: upload ------------------------------------------------------ */
 
-static void *s3_put_begin(void *store, const char *key, uint64_t size_hint) {
+static void *put_begin(void *store, const char *key, uint64_t size_hint, int fresh) {
     s3_store *s = store;
     char uri[600];
     if (key_uri(s, key, uri, sizeof uri) != 0) return NULL;
@@ -444,7 +444,7 @@ static void *s3_put_begin(void *store, const char *key, uint64_t size_hint) {
     w->s = s;
     /* The body streams after this, from the caller, and cannot be sent twice:
      * the retry a kept connection gets is here, on the request head. */
-    if (!(w->c = conn_take(s))) { free(w); return NULL; }
+    if (!(w->c = fresh ? conn_open(s) : conn_take(s))) { free(w); return NULL; }
     if (send_request_uri(s, w->c, "PUT", uri, "", (long long)size_hint) != 0) {
         int retry = w->c->reused;
         conn_close(w->c);
@@ -455,6 +455,14 @@ static void *s3_put_begin(void *store, const char *key, uint64_t size_hint) {
     }
     w->remaining = size_hint;
     return w;
+}
+
+static void *s3_put_begin(void *store, const char *key, uint64_t size_hint) {
+    return put_begin(store, key, size_hint, 0);
+}
+
+void *oc_blob_s3_put_begin_fresh(void *store, const char *key, uint64_t size_hint) {
+    return put_begin(store, key, size_hint, 1);
 }
 
 /* A kept connection that failed before any byte of the response came back --

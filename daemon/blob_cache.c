@@ -156,11 +156,13 @@ static void *cache_put_begin(void *store, const char *key, uint64_t size_hint) {
     uint64_t floor = c->pol.floor_bytes;
     pthread_mutex_unlock(&c->mu);
     /* Staging it here needs the room to; without, it goes to the store as the
-     * S3 backend alone would send it, and the client waits for that. */
+     * S3 backend alone would send it, and the client waits for that -- on a
+     * new connection: the body streams from the client and is not kept here,
+     * so a kept connection gone stale under it could not be retried. */
     uint64_t avail = avail_bytes(c);
     if (avail != UINT64_MAX && avail < floor + size_hint) {
         w->be = &oc_blob_backend_s3;
-        w->h = w->be->put_begin(c->s3, key, size_hint);
+        w->h = oc_blob_s3_put_begin_fresh(c->s3, key, size_hint);
     } else {
         w->be = &oc_blob_backend_fs;
         w->h = w->be->put_begin(c->fs, key, size_hint);

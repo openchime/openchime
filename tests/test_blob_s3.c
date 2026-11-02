@@ -123,10 +123,34 @@ static int fake_serve(fake_s3 *f, int fd, int nth) {
     size_t total = 0;
     long hlen = read_headers(fd, buf, sizeof buf, &total);
     if (hlen < 0) return -1;
+    /* A PUT's body is read before the lock is taken: two uploads can be open
+     * at once, on two connections, and the client sends one body before the
+     * other; read under the lock, the second connection's wait for its body
+     * would hold up the first one's answer. */
+    uint8_t *put_body = NULL;
+    size_t want = 0, got = 0;
+    if (strncmp(buf, "PUT ", 4) == 0) {
+        char clv[32];
+        header_value(buf, "Content-Length", clv, sizeof clv);
+        want = (size_t)atoll(clv);
+        put_body = malloc(sizeof f->body);
+        if (!put_body) return -1;
+        size_t have = total - (size_t)hlen;
+        if (have > want) have = want;
+        if (have > sizeof f->body) have = sizeof f->body;
+        memcpy(put_body, buf + hlen, have);
+        got = have;
+        while (got < want && got < sizeof f->body) {
+            ssize_t n = read(fd, put_body + got, want - got);
+            if (n <= 0) break;
+            got += (size_t)n;
+        }
+    }
     pthread_mutex_lock(&f->mu);
     if (nth == 2 && f->drop_second) {          /* the stale-connection case */
         f->drop_second = 0;
         pthread_mutex_unlock(&f->mu);
+        free(put_body);
         return -1;
     }
     sscanf(buf, "%15s %511s", f->last_method, f->last_uri);
@@ -143,20 +167,7 @@ static int fake_serve(fake_s3 *f, int fd, int nth) {
 
     char head[256];
     if (strcmp(f->last_method, "PUT") == 0) {
-        char clv[32];
-        header_value(buf, "Content-Length", clv, sizeof clv);
-        size_t want = (size_t)atoll(clv);
-        /* Body bytes that arrived with the headers. */
-        size_t have = total - (size_t)hlen;
-        if (have > want) have = want;
-        if (have > sizeof f->body) have = sizeof f->body;
-        memcpy(f->body, buf + hlen, have);
-        size_t got = have;
-        while (got < want && got < sizeof f->body) {
-            ssize_t n = read(fd, f->body + got, want - got);
-            if (n <= 0) break;
-            got += (size_t)n;
-        }
+        memcpy(f->body, put_body, got);
         f->body_len = got;
         f->have_obj = (got == want);
         int n = snprintf(head, sizeof head, "HTTP/1.1 %s\r\nContent-Length: 0\r\n%s\r\n",
@@ -182,6 +193,7 @@ static int fake_serve(fake_s3 *f, int fd, int nth) {
         send_all(fd, head, (size_t)n);
     }
     pthread_mutex_unlock(&f->mu);
+    free(put_body);
     return close_after ? -1 : 0;
 }
 
@@ -499,6 +511,31 @@ static void stale_put_tests(fake_s3 *f, const char *dir) {
             CHECK(put_all(bs, "abcd0013", "second", 6) == 0);
             CHECK(wait_uploaded(bs, 2, &st));
             CHECK(st.failures == 0 && st.next_try_ms == 0 && st.last_error[0] == '\0');
+            fake_set(f, &f->drop_second, 0);
+            oc_blobstore_close(bs);
+        }
+    }
+    /* Short of disk the cache streams an upload straight to the store, with
+     * nothing kept to send again: on a new connection each time, so a kept
+     * one gone stale is never under it. The second upload would be the kept
+     * connection's second request, the one the fake drops. */
+    {
+        char cdir[700];
+        oc_test_path(cdir, sizeof cdir, dir, "direct-cache");
+        mkdir(cdir, 0700);
+        oc_blobstore *bs = oc_blobstore_open(cdir, &g_s3cfg);
+        CHECK(bs != NULL);
+        if (bs) {
+            oc_blob_cache_policy p;
+            memset(&p, 0, sizeof p);
+            p.floor_bytes = UINT64_MAX / 4;   /* no room: every upload goes direct */
+            oc_blobstore_cache_policy(bs, &p);
+            int a = fake_accepts(f);
+            CHECK(put_all(bs, "abcd0030", "first", 5) == 0);
+            fake_set(f, &f->drop_second, 1);
+            CHECK(put_all(bs, "abcd0031", "second", 6) == 0);
+            CHECK(fake_accepts(f) == a + 2);
+            CHECK(get_all(bs, "abcd0031", "second", 6));
             fake_set(f, &f->drop_second, 0);
             oc_blobstore_close(bs);
         }

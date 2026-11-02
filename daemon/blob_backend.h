@@ -38,6 +38,13 @@ typedef int (*oc_blob_list_fn)(void *ctx, const char *key, uint64_t size, uint64
 int oc_blob_s3_list(void *store, const char *token, oc_blob_list_fn fn, void *ctx,
                     char *next, size_t next_cap);
 
+/* An upload on a new connection, never a kept one: put_begin otherwise, for a
+ * caller that cannot send the body twice (the cache, short of disk, streams a
+ * client's upload straight through). A kept connection gone stale under the
+ * body fails the upload with nothing to send again; a new one is not stale,
+ * and what fails on it is reported as it is. */
+void *oc_blob_s3_put_begin_fresh(void *store, const char *key, uint64_t size_hint);
+
 /* The cache's own, behind blobstore.h's (blob_cache.c). */
 #include "blobstore.h"
 void oc_blob_cache_set_policy(void *store, const oc_blob_cache_policy *p);
