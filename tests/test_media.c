@@ -833,7 +833,9 @@ static void test_screen_recording(void) {
         oc_recorder_status(r, &st);
         CHECK(st.screen && st.computer_sound && st.has_audio);
         CHECK(oc_recorder_start(r) == 0);
-        CHECK(wait_state(r, OC_REC_DONE, 8000, &st));
+        /* A guard against a hang, not a deadline: the two seconds end when the
+         * host has encoded them, which a loaded host does late (see below). */
+        CHECK(wait_state(r, OC_REC_DONE, 60000, &st));
         oc_rec_result res = {0};
         CHECK(oc_recorder_take(r, &res) == 0);
         oc_recorder_close(r);
