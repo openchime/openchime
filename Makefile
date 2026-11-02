@@ -150,9 +150,16 @@ full:
 # user scope can be made it stops and says so; it never runs unconstrained.
 LEAN ?= 0
 LEAN_SCOPE := systemd-run --user --scope --quiet -p MemoryMax=256M -p MemorySwapMax=0 -p CPUQuota=100%
+# The probe reads the limits back from inside a scope: systemd accepts a limit
+# for a controller the user manager was not delegated and applies nothing, so
+# a scope that starts proves nothing. 268435456 is 256M; "100000 100000" one CPU.
+LEAN_PROBE := sh -c 'cg=$$(sed -n "s/^0:://p" /proc/self/cgroup); \
+	[ "$$(cat /sys/fs/cgroup$$cg/memory.max 2>/dev/null)" = 268435456 ] && \
+	[ "$$(cat /sys/fs/cgroup$$cg/memory.swap.max 2>/dev/null)" = 0 ] && \
+	[ "$$(cat /sys/fs/cgroup$$cg/cpu.max 2>/dev/null)" = "100000 100000" ]'
 run: $(BIN) $(TUI_BIN)
 	@mkdir -p /tmp/openchime-dev
-	@if [ "$(LEAN)" = 1 ] && ! $(LEAN_SCOPE) true >/dev/null 2>&1; then \
+	@if [ "$(LEAN)" = 1 ] && ! $(LEAN_SCOPE) $(LEAN_PROBE) >/dev/null 2>&1; then \
 	   echo "make run LEAN=1: cannot create a systemd user scope here (no systemd, no user session, or cgroup v2 delegation of the memory and cpu controllers missing)." >&2; \
 	   echo "The daemon was not started: it would have run without the limits. Run it on a host with a systemd user session, or in a 256 MB, one-CPU VM or container; or run make run without LEAN." >&2; \
 	   exit 1; \
