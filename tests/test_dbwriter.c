@@ -9091,6 +9091,34 @@ static void test_default_channels(void) {
     oc_dbres_free(r);
     CHECK(invited && is_in(path, ann, invited));
 
+    /* A first sign-in through a provider: the third way an account is made. */
+    {
+        oc_issuer is;
+        CHECK(oc_issuer_init(&is, "oc-dbw-defchan") == 0);
+        const char *ISS = "https://auth.openchime.io", *AUD = "acme.example";
+        CHECK(oc_dbwriter_configure_oidc(w, ISS, AUD, is.pem, "authorize=https://auth.openchime.io/authorize") == 0);
+        char why[128];
+        CHECK(oc_dbwriter_configure_join_rules(w, "tenant:google:acme.example", why, sizeof why) == 0);
+        char HDR[160], payload[1024], token[4096];
+        oc_issuer_header(&is, HDR, sizeof HDR);
+        unsigned long long now = (unsigned long long)time(NULL);
+        oc_issuer_payload(payload, sizeof payload, ISS, AUD, "google|dc9", "jti-defchan", now - 5, now + 290,
+                          "\"email\":\"dc@acme.example\",\"name\":\"DC\","
+                          "\"idp\":\"google\",\"tenant\":\"acme.example\"");
+        size_t tlen = oc_issuer_mint(&is, HDR, payload, token);
+        oc_job *j = oc_job_new(OC_JOB_AUTH, 22);
+        j->method = OC_AUTH_OIDC;
+        oc_job_set_token(j, token, tlen);
+        oc_job_set_proof(j, OC_ISSUER_VERIFIER, strlen(OC_ISSUER_VERIFIER));
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        uint64_t viaidp = (r && r->type == OC_RES_AUTH_OK) ? r->user_id : 0;
+        oc_dbres_free(r);
+        CHECK(viaidp && is_in(path, ann, viaidp));
+        CHECK(!is_in(path, old, viaidp) && !is_in(path, sec, viaidp));
+        oc_issuer_free(&is);
+    }
+
     unsetenv("OPENCHIME_DEFAULT_CHANNELS");
     CHECK(oc_config_load(err, sizeof err) == 0);
     oc_dbwriter_stop(w);
