@@ -9524,6 +9524,14 @@ static void test_notices(void) {
     CHECK(notice_is(path, dm, 2, "@nt-owner added you to the group @crew."));
     CHECK(set_role(w, owner, newbie, OC_ROLE_ADMIN) == 0);
     CHECK(notice_is(path, dm, 3, "@nt-owner made you an admin."));
+    /* Added to a channel through a group of theirs: told as well. */
+    r = create_channel(w, owner, "crewroom", 0);
+    uint64_t crewroom = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(crewroom && !is_in(path, crewroom, newbie));
+    oc_dbres_free(chan_group(w, owner, crewroom, gid, 1));
+    CHECK(is_in(path, crewroom, newbie));
+    CHECK(notice_is(path, dm, 4, "@nt-owner added you to #crewroom, through the group @crew."));
 
     /* None of it is anyone's unread: #general holds only notices. */
     r = list_channels(w, alice);

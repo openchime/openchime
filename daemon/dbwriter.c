@@ -4070,10 +4070,30 @@ static oc_dbres *process_channel_group(sqlite3 *db, const oc_job *j, int add) {
     if (changed) {
         note_change(db, r, j->channel_id, 0, 0);
         r->mchan[r->n_mchan - 1].groups_changed = 1;
+        /* Told, always, as one added alone is: someone put them in the
+         * channel, through a group of theirs. */
+        char *who = NULL, *ch = NULL, *handle = NULL;
+        if (add) {
+            who = audit_name_of(db, j->user_id);
+            sqlite3_stmt *q = NULL;
+            sqlite3_prepare_v2(db, "SELECT (SELECT name FROM channels WHERE id=?1), "
+                                   "(SELECT handle FROM user_groups WHERE id=?2);", -1, &q, NULL);
+            sqlite3_bind_int64(q, 1, (sqlite3_int64)j->channel_id);
+            sqlite3_bind_int64(q, 2, (sqlite3_int64)j->group_id);
+            if (sqlite3_step(q) == SQLITE_ROW) {
+                if (sqlite3_column_text(q, 0)) ch = strdup((const char *)sqlite3_column_text(q, 0));
+                if (sqlite3_column_text(q, 1)) handle = strdup((const char *)sqlite3_column_text(q, 1));
+            }
+            sqlite3_finalize(q);
+        }
         for (size_t u = 0; u < nu; u++) {
             int d = membership_sync(db, j->channel_id, users[u], -1);
             if (d) note_change(db, r, j->channel_id, users[u], d > 0);
+            if (d > 0 && users[u] != j->user_id)
+                notice_person(db, users[u], "@%s added you to #%s, through the group @%s.",
+                              who ? who : "someone", ch ? ch : "a channel", handle ? handle : "group");
         }
+        free(who); free(ch); free(handle);
     }
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
     free(users);
