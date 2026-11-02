@@ -443,6 +443,15 @@ static void test_collect(void) {
      * his quiet hours and would be pushed — a pause has to reach him anyway,
      * which is the whole reason the two mechanisms both exist. */
     {
+        /* The pause alone decides here: bob's quiet hours (10:00-11:00 above)
+         * go, or a run whose real clock puts the pause's end inside them
+         * would find him quiet for the other reason. */
+        {
+            oc_job *oj = oc_job_new(OC_JOB_SET_SCHEDULE, 0);
+            oj->user_id = bob; oj->sched_mode = OC_DND_OFF;
+            oc_dbwriter_submit(w, oj);
+            oc_dbres_free(wait_result(w));
+        }
         oc_job *sj = oc_job_new(OC_JOB_SET_SNOOZE, 0);
         sj->user_id = bob; sj->snooze_minutes = 60;
         oc_dbwriter_submit(w, sj);
