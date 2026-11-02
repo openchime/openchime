@@ -143,6 +143,27 @@ static void preauth_seeds(void) {
 
     static const char cdata[] = "{\"type\":\"webauthn.create\",\"challenge\":\"Y2hhbGxlbmdl\",\"origin\":\"https://acme.example\",\"crossOrigin\":false}";
     seed_two("webauthn", "register", cdata, strlen(cdata), att, sizeof att);
+    /* A sign-in (an assertion): its client data, the authenticator data
+     * (rpIdHash, flags with user presence, a counter), an ES256 signature's DER
+     * shape, and the P-256 COSE key above; four parts, as oc_fuzz_split reads
+     * them. */
+    {
+        static const char gdata[] = "{\"type\":\"webauthn.get\",\"challenge\":\"Y2hhbGxlbmdl\",\"origin\":\"https://acme.example\"}";
+        static uint8_t authd[37], sig[72], buf[1024];
+        for (int i = 0; i < 32; i++) authd[i] = (uint8_t)(i + 1);
+        authd[32] = 0x05; authd[36] = 2;
+        sig[0] = 0x30; sig[1] = 0x46; sig[2] = 0x02; sig[3] = 0x21; sig[4] = 0x00;
+        for (int i = 5; i < 37; i++) sig[i] = (uint8_t)(i * 7);
+        sig[37] = 0x02; sig[38] = 0x21; sig[39] = 0x00;
+        for (int i = 40; i < 72; i++) sig[i] = (uint8_t)(i * 3);
+        const void *part[3] = { gdata, authd, sig };
+        size_t plen[3] = { strlen(gdata), sizeof authd, sizeof sig }, n = 0;
+        for (int k = 0; k < 3; k++) {
+            buf[n++] = (uint8_t)(plen[k] >> 8); buf[n++] = (uint8_t)plen[k];
+            memcpy(buf + n, part[k], plen[k]); n += plen[k];
+        }
+        seed("webauthn", "assert", buf, n, cose, sizeof cose);
+    }
     seed_two("idtoken", "token-jwks", "eyJhbGciOiJSUzI1NiIsImtpZCI6InIxIn0.eyJzdWIiOiIxMjM0In0.c2ln", 58, jwks, strlen(jwks));
 }
 
