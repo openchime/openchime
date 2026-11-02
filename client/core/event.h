@@ -365,9 +365,10 @@ typedef struct {
     uint8_t  participant;  /* THREAD_REPLY: this user is in the thread (REQ-061).
                               Derived server-side (ARCH-104) because the client
                               holds a thread's replies only while it is open. */
-    uint8_t  broadcast_held; /* MESSAGE, RESTORE, THREAD_REPLY: the body's @here,
-                              @channel or @everyone notifies nobody, as the
-                              daemon stored it (REQ-221) */
+    uint8_t  broadcast_stored; /* MESSAGE, RESTORE, THREAD_REPLY: the daemon
+                              stored a broadcast mention row for the message, so
+                              an @here, @channel or @everyone in it notifies
+                              (REQ-221) */
     uint8_t  archived;     /* CHANNEL: the channel is archived (REQ-035) */
     uint8_t  e2e;          /* CHANNEL: an encrypted DM (PRIVATE-DM.md) */
     uint8_t  ws_mode;      /* WORKSPACE_INFO: OC_WS_MODE_* (a public demo, AUTH.md §8.12) */

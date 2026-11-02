@@ -374,49 +374,57 @@ static void test_messaging_frames(void) {
     }
 }
 
-/* `broadcast_held` (REQ-221): the daemon's answer to whether a message's
- * broadcast mention notifies, on every frame that delivers a body a client
- * judges mentions on -- BROADCAST, MSG_RESTORED (its layout) and THREAD_REPLY.
- * Both values round trip, with and without the optional tails behind it, and
- * any other value is malformed. */
-static void test_broadcast_held_frames(void) {
-    for (uint8_t held = 0; held <= 1; held++) {
+/* `broadcast_stored` (REQ-221): whether the send stored a broadcast mention
+ * row for the message, on every frame that delivers a body a client judges
+ * mentions on -- BROADCAST, MSG_RESTORED (its layout) and THREAD_REPLY. Both
+ * values round trip, with and without the optional tails behind it, and with
+ * a body that holds no broadcast (an edit took it out: the row is still the
+ * send's); any other value is malformed. */
+static void test_broadcast_stored_frames(void) {
+    for (uint8_t stored = 0; stored <= 1; stored++) {
         {
             oc_broadcast in = { 1001, 7, 42, 1751200500000ull, 0, oc_slice_str("@channel standup"),
-                                0, {{0}}, {0}, held };
+                                0, {{0}}, {0}, stored };
             ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
             oc_broadcast out;
             CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
-            CHECK(out.broadcast_held == held && out.kind == 0);
+            CHECK(out.broadcast_stored == stored && out.kind == 0);
             CHECK(slice_eq_str(out.body, "@channel standup") && out.n_attach == 0 && out.author_name.len == 0);
         }
         {   /* The tail behind it: a name, so a zero attachment count first. */
             oc_broadcast in = { 1002, 7, 42, 1751200500000ull, 0, oc_slice_str("@here"),
-                                0, {{0}}, oc_slice_str("CI"), held };
+                                0, {{0}}, oc_slice_str("CI"), stored };
             ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
             oc_broadcast out;
             CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
-            CHECK(out.broadcast_held == held && slice_eq_str(out.body, "@here"));
+            CHECK(out.broadcast_stored == stored && slice_eq_str(out.body, "@here"));
             CHECK(slice_eq_str(out.author_name, "CI"));
         }
         {
-            oc_broadcast in = { 1003, 7, 42, 1000, 0, oc_slice_str("@everyone back"), 0, {{0}}, {0}, held };
+            oc_broadcast in = { 1003, 7, 42, 1000, 0, oc_slice_str("@everyone back"), 0, {{0}}, {0}, stored };
             ROUNDTRIP(oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MSG_RESTORED, h, p);
             oc_broadcast out;
             CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
-            CHECK(out.broadcast_held == held && slice_eq_str(out.body, "@everyone back"));
+            CHECK(out.broadcast_stored == stored && slice_eq_str(out.body, "@everyone back"));
+        }
+        {   /* Not tied to the body: an edit may have taken the broadcast out. */
+            oc_broadcast in = { 1005, 7, 42, 1000, 0, oc_slice_str("standup moved"), 0, {{0}}, {0}, stored };
+            ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
+            oc_broadcast out;
+            CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
+            CHECK(out.broadcast_stored == stored && slice_eq_str(out.body, "standup moved"));
         }
         {
             oc_thread_reply in = { .message_id = 1004, .channel_id = 7, .parent_id = 500,
                                    .author_id = 42, .server_time = 1751200500000ull,
-                                   .reply_count = 2, .participant = (uint8_t)!held,
-                                   .body = oc_slice_str("@channel look"), .broadcast_held = held };
+                                   .reply_count = 2, .participant = (uint8_t)!stored,
+                                   .body = oc_slice_str("@channel look"), .broadcast_stored = stored };
             in.n_attach = 1; in.attach[0].id = 9; in.attach[0].filename = oc_slice_str("a.txt");
             in.attach[0].mime = oc_slice_str("text/plain"); in.attach[0].size = 3;
             ROUNDTRIP(oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_REPLY, h, p);
             oc_thread_reply out = {0};
             CHECK(oc_decode_thread_reply(&p, &out) == OC_OK);
-            CHECK(out.broadcast_held == held && out.participant == (uint8_t)!held);
+            CHECK(out.broadcast_stored == stored && out.participant == (uint8_t)!stored);
             CHECK(slice_eq_str(out.body, "@channel look") && out.n_attach == 1 && out.attach[0].id == 9);
         }
     }
@@ -435,7 +443,7 @@ static void test_broadcast_held_frames(void) {
     {
         oc_thread_reply in = { .message_id = 1, .channel_id = 7, .parent_id = 5, .author_id = 42,
                                .server_time = 1, .reply_count = 1, .participant = 0,
-                               .body = oc_slice_str("@here"), .broadcast_held = 1 };
+                               .body = oc_slice_str("@here"), .broadcast_stored = 1 };
         oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
         CHECK(oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &in) == OC_OK);
         CHECK(frame[OC_HEADER_SIZE + 45] == 1);
@@ -2667,7 +2675,7 @@ int run_protocol_tests(void) {
     test_action_frames();
     test_poll_frames();
     test_thread_frames();
-    test_broadcast_held_frames();
+    test_broadcast_stored_frames();
     test_thread_list_frames();
     test_mark_all_read_frame();
     test_failed_frame_rolls_back();

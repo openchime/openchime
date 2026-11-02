@@ -6398,7 +6398,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         if (!r->duplicate) {
             oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_slice body = { r->body, r->body_len };
-            oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_held };
+            oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored };
             broadcast_set_attach(&b, r->attach, r->n_attach);
             b.author_name = oc_slice_str(r->author_name ? r->author_name : "");
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
@@ -6488,7 +6488,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
     case OC_RES_RESTORE_OK: {
         /* Back for every member: the message whole, replacing its tombstone. */
         oc_slice body = { r->body, r->body_len };
-        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_held };
+        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored };
         broadcast_set_attach(&b, r->attach, r->n_attach);
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         if (oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &b) == OC_OK) {
@@ -7073,7 +7073,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                                    .reply_count = r->reply_count,
                                    .participant = 0,
                                    .body        = body,
-                                   .broadcast_held = r->broadcast_held };   /* REQ-221 */
+                                   .broadcast_stored = r->broadcast_stored };   /* REQ-221 */
             tr.n_attach = fill_attach_entries(tr.attach, r->attach, r->n_attach);
 
             oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
@@ -7164,7 +7164,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                                    .reply_count = (uint32_t)r->n_thread,
                                    .participant = (uint8_t)(in_thread != 0),
                                    .body        = body,
-                                   .broadcast_held = m->broadcast_held };   /* REQ-221 */
+                                   .broadcast_stored = m->broadcast_stored };   /* REQ-221 */
             tr.n_attach = fill_attach_entries(tr.attach, m->attach, m->n_attach);
             oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &tr);
             send_bytes(ep, conns, fd, g_enc, w.len);
@@ -7657,7 +7657,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         /* Fan the posted message out to connected members (like SEND_OK)... */
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice body = { r->body, r->body_len };
-        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_held };
+        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored };
         b.author_name = oc_slice_str(r->author_name ? r->author_name : "");   /* webhook label (REQ-170) */
         oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
         size_t blen = w.len;
@@ -8327,7 +8327,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice body = { r->body, r->body_len };
         oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, OC_MSG_KIND_MESSAGE,
-                           body, 0, {{0}}, {0}, r->broadcast_held };
+                           body, 0, {{0}}, {0}, r->broadcast_stored };
         oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
         size_t blen = w.len;
         fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
@@ -8375,7 +8375,7 @@ static size_t backfill_next(conn *c) {
             if (i >= r->n_replay) { c->bf_phase = BF_PIN; c->bf_i = 0; continue; }
             oc_replay_msg *m = &r->replay[i];
             oc_slice body = { m->body, m->body_len };
-            oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, m->kind, body, 0, {{0}}, {0}, m->broadcast_held };
+            oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, m->kind, body, 0, {{0}}, {0}, m->broadcast_stored };
             broadcast_set_attach(&b, m->attach, m->n_attach);
             b.author_name = oc_slice_str(m->author_name ? m->author_name : "");
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);

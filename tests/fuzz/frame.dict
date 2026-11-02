@@ -1,7 +1,7 @@
 # libFuzzer dictionary for build/fuzz/frame and build/fuzz/framebuf: the
 # protocol version and every message type id, big-endian as a frame header
 # carries them (shared/protocol.h). Regenerate when either changes.
-version="\x00\x1f"
+version="\x00\x20"
 hello="\x00\x01"
 welcome="\x00\x02"
 reject="\x00\x03"

@@ -963,7 +963,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->message_id = b.message_id;
                 e->server_time = b.server_time;
                 e->msg_kind = b.kind;
-                e->broadcast_held = b.broadcast_held;
+                e->broadcast_stored = b.broadcast_stored;
                 if (b.author_name.len) {
                     size_t an = b.author_name.len < sizeof e->author_name - 1
                                     ? b.author_name.len : sizeof e->author_name - 1;
@@ -999,7 +999,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->author_id = b.author_id;
                 e->message_id = b.message_id;
                 e->server_time = b.server_time;
-                e->broadcast_held = b.broadcast_held;
+                e->broadcast_stored = b.broadcast_stored;
                 e->body = body_for_ui(ctx, b.channel_id, b.body);
                 oc_queue_push(out, e);
                 push_attachments(out, b.channel_id, b.message_id, b.attach, b.n_attach);
@@ -1551,7 +1551,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->server_time = tr.server_time;
                     e->count = tr.reply_count;
                     e->participant = tr.participant;
-                    e->broadcast_held = tr.broadcast_held;
+                    e->broadcast_stored = tr.broadcast_stored;
                     e->body = body_for_ui(ctx, tr.channel_id, tr.body);
                     oc_queue_push(out, e);
                     push_attachments(out, tr.channel_id, tr.message_id, tr.attach, tr.n_attach);

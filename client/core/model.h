@@ -112,10 +112,11 @@ typedef struct {
     /* OC_MSG_KIND_*: a call event (a missed call, REQ-304) is drawn as a line of
      * history rather than as something its author said. */
     uint8_t      kind;
-    /* Its @here, @channel or @everyone notifies nobody (REQ-221): the daemon's
-     * answer, carried on BROADCAST and THREAD_REPLY, which oc_model_mentions_me_in
-     * takes instead of judging the channel's size. */
-    uint8_t      broadcast_held;
+    /* Its send stored a broadcast mention row (REQ-221): the daemon's answer,
+     * carried on BROADCAST and THREAD_REPLY, which oc_model_mentions_me_in
+     * takes instead of judging the channel's size. Fixed at send: an edit
+     * changes the body and leaves this as it was. */
+    uint8_t      broadcast_stored;
     /* Link previews (REQ-222): fanned after the BROADCAST, replayed on
      * backfill, cleared on edit (the daemon drops and re-fetches). */
     oc_msg_unfurl *unfurls;   /* heap, NULL until one arrives */
@@ -845,12 +846,13 @@ uint64_t oc_model_via_group(const oc_model *m, uint64_t channel_id, uint64_t use
 /* Does `body` mention this user -- by their name, or by a group they are in
  * (REQ-308)? What a toast and a highlight ask. */
 int      oc_model_mentions_me(const oc_model *m, const char *body, size_t len);
-/* The same, for a message whose broadcast (@here, @channel, @everyone) the
- * daemon `broadcast_held` or not (the message's own flag, REQ-221): a broadcast
- * counts only when it was not held. The daemon decides who may notify a
- * channel of what size; a client knows the size only of the channel whose
- * member list it has loaded, so it does not judge it again. */
-int      oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_held,
+/* The same, for a message whose send the daemon `broadcast_stored` a
+ * broadcast mention row for or not (the message's own flag, REQ-221): a
+ * broadcast (@here, @channel, @everyone) in `body` counts only when it did.
+ * The daemon decides who may notify a channel of what size; a client knows
+ * the size only of the channel whose member list it has loaded, so it does not
+ * judge it again. */
+int      oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_stored,
                                  const char *body, size_t len);
 
 /* ---- the sidebar (6) --------------------------------------------------
@@ -1132,6 +1134,30 @@ int oc_model_broadcast_will_notify(const oc_model *m, uint64_t channel_id, const
  * "N people", or "everyone here" when the number is not known -- the list
  * at its cap, where a number would be the cap's and not the channel's. */
 void oc_model_broadcast_whom(size_t members, char *out, size_t cap);
+/* What a send of `body` to `channel_id` does about its broadcast mention
+ * (REQ-221), from oc_model_broadcast_will_notify's answer, and what it says:
+ * one judgement for every path that sends text -- the composer, sending it
+ * later, a new message, a reply from a notification -- so none of them says
+ * it differently or skips it. An edit notifies nobody and is not asked. */
+enum {
+    OC_BC_SEND    = 0,   /* no broadcast, or one that notifies: send */
+    OC_BC_NOTE    = 1,   /* it will notify nobody: say `note`, and send */
+    OC_BC_CONFIRM = 2,   /* it will notify a large channel: ask (`title`, `why`) first */
+    OC_BC_LOAD    = 3    /* the channel's own member list is not loaded (another
+                            channel's, or still loading): ask for it
+                            (oc_client_list_members), say `note`, and judge
+                            again once it is in */
+};
+typedef struct {
+    int  act;          /* OC_BC_* */
+    char token[16];    /* the mention as written: "@here", "@channel", "@everyone" */
+    char whom[48];     /* CONFIRM: oc_model_broadcast_whom's "N people" or "everyone here" */
+    char note[96];     /* NOTE and LOAD: what the sender is told */
+    char title[64];    /* CONFIRM: the question */
+    char why[96];      /* CONFIRM: the line under it */
+} oc_bc_check;
+void oc_model_broadcast_check(const oc_model *m, uint64_t channel_id, const char *body,
+                              oc_bc_check *out);
 /* Whether the workspace has default quiet hours (`default_quiet_hours`, REQ-136)
  * a person may return to. */
 int oc_model_has_default_quiet_hours(const oc_model *m);

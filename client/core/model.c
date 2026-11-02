@@ -339,6 +339,33 @@ void oc_model_broadcast_whom(size_t members, char *out, size_t cap) {
     else snprintf(out, cap, "everyone here");
 }
 
+void oc_model_broadcast_check(const oc_model *m, uint64_t channel_id, const char *body,
+                              oc_bc_check *out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    size_t n = 0;
+    int bc = oc_model_broadcast_will_notify(m, channel_id, body, out->token, sizeof out->token, &n);
+    switch (bc) {
+    case 0:
+        out->act = OC_BC_NOTE;
+        snprintf(out->note, sizeof out->note, "%s won't notify anyone here.", out->token);
+        break;
+    case 2:
+        out->act = OC_BC_CONFIRM;
+        oc_model_broadcast_whom(n, out->whom, sizeof out->whom);
+        snprintf(out->title, sizeof out->title, "Notify %s?", out->whom);
+        snprintf(out->why, sizeof out->why, "%s notifies everyone in this channel.", out->token);
+        break;
+    case 3:
+        out->act = OC_BC_LOAD;
+        snprintf(out->note, sizeof out->note, "Checking how many people %s reaches\u2026", out->token);
+        break;
+    default:
+        out->act = OC_BC_SEND;
+        break;
+    }
+}
+
 int oc_model_has_default_quiet_hours(const oc_model *m) {
     char v[40];
     return oc_model_workspace_setting(m, "default_quiet_hours", v, sizeof v) && v[0];
@@ -1432,23 +1459,14 @@ static int name_eq(const char *a, const char *b) {
     return *a == *b;
 }
 
-/* Whether `body` holds a broadcast mention: @here, @channel or @everyone. */
-static int has_broadcast(const char *body) {
-    if (!body || !strchr(body, '@')) return 0;
-    oc_mention mm[OC_MENTION_MAX];
-    size_t n = oc_mention_scan(body, strlen(body), mm, OC_MENTION_MAX);
-    if (n > OC_MENTION_MAX) n = OC_MENTION_MAX;
-    for (size_t i = 0; i < n; i++)
-        if (mm[i].kind != OC_MENTION_USER) return 1;
-    return 0;
-}
-
 /* A broadcast mention (@here, @channel, @everyone) counts as the daemon stored
  * it (REQ-221): whether the workspace let its author notify a channel that
  * large is the daemon's to say, and it says so on every message frame. Judged
  * here instead, it was judged from the one member list a client may have
- * loaded, and every other channel was guessed large. */
-int oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_held,
+ * loaded, and every other channel was guessed large. The body is the current
+ * one and the flag the send's, so a broadcast an edit removed counts no more,
+ * and one a later edit puts back counts again where the send stored it. */
+int oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_stored,
                             const char *body, size_t len) {
     if (!m || !body) return 0;
     oc_mention mm[OC_MENTION_MAX];
@@ -1462,7 +1480,7 @@ int oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_held,
             if (oc_model_in_group(m->groups[k], m->user_id) && name_eq(mm[i].name, m->groups[k]->handle))
                 return 1;
     }
-    return bc && !broadcast_held;
+    return bc && broadcast_stored;
 }
 
 int oc_model_mentions_me(const oc_model *m, const char *body, size_t len) {
@@ -1558,7 +1576,7 @@ void oc_model_set_read_marker(oc_model *m, uint64_t channel_id, uint64_t message
         int men = 0, kw = 0;
         if (msg->body) {
             size_t blen = strlen(msg->body);
-            men = oc_model_mentions_me_in(m, msg->broadcast_held, msg->body, blen);
+            men = oc_model_mentions_me_in(m, msg->broadcast_stored, msg->body, blen);
             kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
         }
         int vip = oc_model_is_priority(m, msg->author_id);
@@ -1600,7 +1618,7 @@ static oc_channel *channel_ensure(oc_model *m, uint64_t channel_id) {
  * Returns 1 if a message was appended, 0 if it was a dedup/alloc no-op. */
 static int channel_append(oc_channel *c, uint64_t author_id, const char *author_name,
                           uint64_t message_id, uint64_t server_time, uint8_t kind,
-                          uint8_t broadcast_held, char **body) {
+                          uint8_t broadcast_stored, char **body) {
     /* Dedup on the per-channel high-water mark (ARCH-45). message_id 0 means the
      * server did not assign one (shouldn't happen for a BROADCAST) — keep it.
      *
@@ -1637,7 +1655,7 @@ static int channel_append(oc_channel *c, uint64_t author_id, const char *author_
     msg->message_id = message_id;
     msg->server_time = server_time;
     msg->kind = kind;
-    msg->broadcast_held = broadcast_held;   /* REQ-221 */
+    msg->broadcast_stored = broadcast_stored;   /* REQ-221 */
     *body = NULL;
     if (message_id > c->high_water) c->high_water = message_id;
     return 1;
@@ -1718,7 +1736,7 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
         int men = 0, kw = 0;
         if (msg->body) {
             size_t blen = strlen(msg->body);
-            men = oc_model_mentions_me_in(m, msg->broadcast_held, msg->body, blen);
+            men = oc_model_mentions_me_in(m, msg->broadcast_stored, msg->body, blen);
             kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
         }
         int is_vip = oc_model_is_priority(m, msg->author_id);
@@ -1757,7 +1775,7 @@ static void notice_push(oc_model *m, const oc_ev *e) {
     n->author_id  = e->author_id;
     if (e->body) {
         size_t blen = strlen(e->body);
-        n->mentioned   = (uint8_t)(oc_model_mentions_me_in(m, e->broadcast_held, e->body, blen) != 0);
+        n->mentioned   = (uint8_t)(oc_model_mentions_me_in(m, e->broadcast_stored, e->body, blen) != 0);
         n->keyword_hit = (uint8_t)(oc_model_keyword_hit(m, e->body, blen, NULL, NULL) != 0);
         /* An action keeps its action text, flagged, for "<name> <text>"
          * (REQ-058); the net thread paired it with the reply before this. */
@@ -1980,7 +1998,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             c->preview_action = (uint8_t)act;
         }
         if (c && channel_append(c, e->author_id, e->author_name, e->message_id, e->server_time,
-                                e->msg_kind, e->broadcast_held, &e->body)) {
+                                e->msg_kind, e->broadcast_stored, &e->body)) {
             msg_set_action(&c->msgs[c->n_msgs - 1], e);
             /* A badge counts what WOULD HAVE NOTIFIED, with the schedule and
              * the pause left out — they say when to interrupt you, not whether
@@ -1996,7 +2014,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             int men = 0, kw = 0;
             if (msg->body) {
                 size_t blen = strlen(msg->body);
-                men = oc_model_mentions_me_in(m, msg->broadcast_held, msg->body, blen);
+                men = oc_model_mentions_me_in(m, msg->broadcast_stored, msg->body, blen);
                 kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
             }
             int vip = oc_model_is_priority(m, e->author_id);
@@ -2603,12 +2621,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (c) {
             for (size_t i = 0; i < c->n_msgs; i++) {
                 if (c->msgs[i].message_id == e->message_id) {
-                    /* An edit stores no mentions (PROTOCOL.md §5.5): a
-                     * broadcast the old text had keeps the daemon's answer,
-                     * and one only the new text has got no row, so is held
-                     * (REQ-221). */
-                    int stored = has_broadcast(c->msgs[i].body) && !c->msgs[i].broadcast_held;
-                    c->msgs[i].broadcast_held = (uint8_t)(has_broadcast(e->body) && !stored);
+                    /* An edit stores no mentions (PROTOCOL.md §5.5), so the
+                     * message keeps its broadcast_stored: whether a broadcast
+                     * counts is the new text's against the send's row
+                     * (REQ-221), never a guess from the text it replaces. */
                     free(c->msgs[i].body);
                     c->msgs[i].body = e->body;   /* steal the new text */
                     e->body = NULL;
@@ -2648,14 +2664,14 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             if (c->msgs[i].message_id == e->message_id) {
                 msg_untombstone(&c->msgs[i], e->body);
                 msg_set_action(&c->msgs[i], e);   /* back with its body (REQ-058) */
-                c->msgs[i].broadcast_held = e->broadcast_held;   /* REQ-221 */
+                c->msgs[i].broadcast_stored = e->broadcast_stored;   /* REQ-221 */
                 break;
             }
         for (size_t i = 0; i < m->n_thread_msgs; i++)
             if (m->thread_msgs[i].message_id == e->message_id) {
                 msg_untombstone(&m->thread_msgs[i], e->body);
                 msg_set_action(&m->thread_msgs[i], e);
-                m->thread_msgs[i].broadcast_held = e->broadcast_held;
+                m->thread_msgs[i].broadcast_stored = e->broadcast_stored;
                 break;
             }
         break;
@@ -2679,7 +2695,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             thread_append(m, e->message_id, e->author_id, e->server_time, &e->body);
             if (m->n_thread_msgs > before) {
                 msg_set_action(&m->thread_msgs[m->n_thread_msgs - 1], e);
-                m->thread_msgs[m->n_thread_msgs - 1].broadcast_held = e->broadcast_held;   /* REQ-221 */
+                m->thread_msgs[m->n_thread_msgs - 1].broadcast_stored = e->broadcast_stored;   /* REQ-221 */
             }
         }
         break;

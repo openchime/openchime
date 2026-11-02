@@ -662,7 +662,7 @@ static void test_channels_vertical(int port, const uint8_t *pin) {
     CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0);
     oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
     CHECK(bc.channel_id == cid && bc.author_id == ub && bc.message_id == bmid);
-    CHECK(bc.broadcast_held == 0);
+    CHECK(bc.broadcast_stored == 1);
 
     /* carol (a non-member) never sees the private channel in LIST_CHANNELS. */
     oc_wbuf_init(&w, buf, sizeof buf);
@@ -4703,7 +4703,7 @@ static void test_webhook_vertical(int port, const uint8_t *pin) {
     CHECK(bc.channel_id == OC_DEFAULT_CHANNEL && bc.author_id == ua);
     CHECK(bc.body.len == 12 && memcmp(bc.body.ptr, "from webhook", 12) == 0);   /* contract: the test's own input, echoed */
     CHECK(bc.author_name.len == 2 && memcmp(bc.author_name.ptr, "ci", 2) == 0);  /* label override */
-    CHECK(bc.broadcast_held == 0);   /* no broadcast in it */
+    CHECK(bc.broadcast_stored == 0);   /* no broadcast in it */
 
     /* The sender gets a 200. */
     char resp[512];
@@ -4712,7 +4712,7 @@ static void test_webhook_vertical(int port, const uint8_t *pin) {
     client_close(&h);
 
     /* A webhook's post is stored without mentions, so its @channel notifies
-     * nobody (REQ-221): the frame says it is held, live and replayed. */
+     * nobody (REQ-221): the frame says no row was stored, live and replayed. */
     CHECK(http_client_open(&h, port, pin) == 0);
     body = "{\"text\":\"@channel deploy done\"}";
     rn = snprintf(req, sizeof req,
@@ -4722,7 +4722,7 @@ static void test_webhook_vertical(int port, const uint8_t *pin) {
     CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0);
     CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
     CHECK(bc.body.len == 20 && memcmp(bc.body.ptr, "@channel deploy done", 20) == 0);
-    CHECK(bc.broadcast_held == 1);
+    CHECK(bc.broadcast_stored == 0);
     uint64_t held_id = bc.message_id;
     http_read_response(&h, resp, sizeof resp);
     CHECK(strncmp(resp, "HTTP/1.1 200", 12) == 0);
@@ -4738,9 +4738,9 @@ static void test_webhook_vertical(int port, const uint8_t *pin) {
         if (hdr.msg_type == OC_MSG_BACKFILL_DONE) break;
         if (hdr.msg_type != OC_MSG_BROADCAST) continue;
         oc_broadcast bx; CHECK(oc_decode_broadcast(&p, &bx) == OC_OK);
-        if (bx.message_id == held_id) replayed = bx.broadcast_held;
+        if (bx.message_id == held_id) replayed = bx.broadcast_stored;
     }
-    CHECK(replayed == 1);
+    CHECK(replayed == 0);
 
     /* An unknown token gets a 404. */
     client h2;

@@ -1004,9 +1004,9 @@ typedef struct {
     uint8_t  saved;
     uint64_t saved_at;
     uint8_t  kind;         /* OC_MSG_KIND_*: a call event is drawn as history (REQ-304) */
-    /* Replays and THREAD: its broadcast mention notifies nobody (REQ-221), the
-     * byte BROADCAST and THREAD_REPLY carry. */
-    uint8_t  broadcast_held;
+    /* Replays and THREAD: its send stored a broadcast mention row (REQ-221),
+     * whatever the body says now; the byte BROADCAST and THREAD_REPLY carry. */
+    uint8_t  broadcast_stored;
     /* SEARCH only: the snippet in `body` is cut from an action's text
      * (REQ-058). A replay carries actions on their own frames instead. */
     uint8_t  action;
@@ -1070,9 +1070,9 @@ typedef struct oc_dbres {
     uint16_t       unres_total;     /* everyone it could not reach, beyond unres's eight (REQ-308) */
     size_t         n_attach;
     char          *author_name;  /* heap; SEND_OK/WEBHOOK_POSTED override name, else NULL */
-    /* SEND_OK, REPLY_OK, RESTORE_OK, WEBHOOK_POSTED, NOTICE: the body's
-     * broadcast mention got no row and notifies nobody (REQ-221). */
-    uint8_t        broadcast_held;
+    /* SEND_OK, REPLY_OK, RESTORE_OK, WEBHOOK_POSTED, NOTICE: the send stored
+     * a broadcast mention row, so a broadcast in the body notifies (REQ-221). */
+    uint8_t        broadcast_stored;
 
     /* BACKFILL_OK */
     oc_replay_msg *replay;    /* heap array, ascending message_id */

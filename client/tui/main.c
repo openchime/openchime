@@ -3945,32 +3945,31 @@ int main(int argc, char **argv) {
                 uint64_t cid = mm->channels[focus].channel_id;
                 if (mm->search_open || mm->roster_open || mm->reactlist_open || mm->voterlist_open || mm->prefs_open || mm->weblist_open) { /* read-only overlay: ignore */ }
                 else {
-                    /* A broadcast mention under the workspace's rule (REQ-221):
-                     * one that will notify nobody is said and sent; one that will
-                     * notify a channel the workspace calls large asks, and a
-                     * second Enter on the same text sends it. */
+                    /* A broadcast mention under the workspace's rule (REQ-221),
+                     * judged as every client's send path judges it
+                     * (oc_model_broadcast_check): one that will notify nobody
+                     * is said and sent; one that will notify a channel the
+                     * workspace calls large asks, and a second Enter on the
+                     * same text sends it. */
                     uint64_t bcid = mm->thread_open ? mm->thread_channel : cid;
-                    char tok[OC_MENTION_NAME_MAX + 2];
-                    size_t bn = 0;
-                    int bc = oc_model_broadcast_will_notify(mm, bcid, composer, tok, sizeof tok, &bn);
+                    oc_bc_check bv;
+                    oc_model_broadcast_check(mm, bcid, composer, &bv);
                     g_bc_note[0] = '\0';
                     /* Whether the channel is large is its member count, which
                      * this client asks for only here: until it has it the
                      * answer is a guess, so it asks and waits for the next Enter. */
-                    if (bc == 3) {
+                    if (bv.act == OC_BC_LOAD) {
                         oc_client_list_members(cl, bcid);
-                        snprintf(g_bc_note, sizeof g_bc_note, "Checking how many people %s reaches: Enter again to send.", tok);
+                        snprintf(g_bc_note, sizeof g_bc_note, "Checking how many people %s reaches: Enter again to send.", bv.token);
                         continue;
                     }
-                    if (bc == 2 && strcmp(g_bc_ask, composer) != 0) {
+                    if (bv.act == OC_BC_CONFIRM && strcmp(g_bc_ask, composer) != 0) {
                         snprintf(g_bc_ask, sizeof g_bc_ask, "%s", composer);
-                        char whom[48];
-                        oc_model_broadcast_whom(bn, whom, sizeof whom);
-                        snprintf(g_bc_note, sizeof g_bc_note, "%s notifies %s: Enter to send, Esc to keep editing", tok, whom);
+                        snprintf(g_bc_note, sizeof g_bc_note, "%s notifies %s: Enter to send, Esc to keep editing", bv.token, bv.whom);
                         continue;
                     }
                     g_bc_ask[0] = '\0';
-                    if (bc == 0) snprintf(g_bc_note, sizeof g_bc_note, "%s won't notify anyone here.", tok);
+                    if (bv.act == OC_BC_NOTE) snprintf(g_bc_note, sizeof g_bc_note, "%s", bv.note);
                     if (mm->thread_open) oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
                     else                 oc_client_send(cl, cid, composer);
                 }

@@ -438,7 +438,7 @@ static oc_result encode_broadcast_as(oc_wbuf *w, uint16_t version, uint16_t type
     oc_w_u64(w, m->author_id);
     oc_w_u64(w, m->server_time);
     oc_w_u8(w, m->kind);
-    oc_w_u8(w, m->broadcast_held ? 1u : 0u);
+    oc_w_u8(w, m->broadcast_stored ? 1u : 0u);
     oc_w_lstr(w, m->body);
     /* Optional trailing block (REQ-140/170): the attachment list, then an
      * optional author-name override. Both are self-describing — present only
@@ -879,7 +879,7 @@ oc_result oc_encode_thread_reply(oc_wbuf *w, uint16_t version, const oc_thread_r
      * already optional, and a second field sharing it is how a decoder loses
      * its place. */
     oc_w_u8(w, m->participant ? 1u : 0u);
-    oc_w_u8(w, m->broadcast_held ? 1u : 0u);
+    oc_w_u8(w, m->broadcast_stored ? 1u : 0u);
     oc_w_lstr(w, m->body);
     /* Optional trailing attachment metadata (REQ-140), as on BROADCAST. */
     if (m->n_attach) {
@@ -2726,8 +2726,8 @@ oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m) {
     m->server_time = oc_r_u64(p);
     m->kind = oc_r_u8(p);
     if (m->kind > OC_MSG_KIND_CALL) return OC_E_MALFORMED;   /* a kind this version does not define */
-    m->broadcast_held = oc_r_u8(p);
-    if (m->broadcast_held > 1) return OC_E_MALFORMED;   /* a flag, nothing else */
+    m->broadcast_stored = oc_r_u8(p);
+    if (m->broadcast_stored > 1) return OC_E_MALFORMED;   /* a flag, nothing else */
     m->body = oc_r_lstr(p);
     /* Optional trailing block: attachment list, then an optional author name. */
     m->n_attach = 0;
@@ -3136,8 +3136,8 @@ oc_result oc_decode_thread_reply(oc_rbuf *p, oc_thread_reply *m) {
     m->server_time = oc_r_u64(p);
     m->reply_count = oc_r_u32(p);
     m->participant = oc_r_u8(p);
-    m->broadcast_held = oc_r_u8(p);
-    if (m->broadcast_held > 1) return OC_E_MALFORMED;   /* a flag, nothing else */
+    m->broadcast_stored = oc_r_u8(p);
+    if (m->broadcast_stored > 1) return OC_E_MALFORMED;   /* a flag, nothing else */
     m->body = oc_r_lstr(p);
     m->n_attach = 0;
     if (!p->underflow && p->pos < p->len) {

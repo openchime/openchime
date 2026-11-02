@@ -1907,10 +1907,25 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 static int      g_bc_confirmed;     /* CONF_BROADCAST: the send it confirmed is under way */
-/* A broadcast send waiting on its channel's member list (REQ-221): the channel,
- * and the text it was for (heap), sent once the list is in (bc_tick). */
-static uint64_t g_bc_wait_ch;
-static char    *g_bc_wait_text;
+/* A send the broadcast check holds (REQ-221, bc_gate), by the path it came
+ * from: the composer, its Send later, the New message pane, a reply from a
+ * notification. Each path's text waits on its channel's member list in its own
+ * slot (bc_tick sends it once the list is in), and one waits on the
+ * confirmation. `text` is heap; `at` a schedule's time, 0 for a send; `ws`
+ * the workspace it was written in. */
+enum { BCS_COMPOSER, BCS_LATER, BCS_NEWMSG, BCS_TOAST, BCS_N };
+typedef struct { uint64_t cid, at; char *text; int ws; } bc_held;
+static bc_held  g_bc_wait[BCS_N];
+static bc_held  g_bc_conf;
+static int      g_bc_conf_path;
+static void bc_held_clear(bc_held *h) { free(h->text); memset(h, 0, sizeof *h); }
+/* The sends whose text is in a box: another conversation puts other text
+ * there, and a send waiting on the one left is dropped with it. */
+static void bc_drop_box(void) {
+    bc_held_clear(&g_bc_wait[BCS_COMPOSER]);
+    bc_held_clear(&g_bc_wait[BCS_LATER]);
+    bc_held_clear(&g_bc_wait[BCS_NEWMSG]);
+}
 static void composer_send(void);    /* fwd */
 
 static char     g_confirm_title[80];
@@ -3734,7 +3749,7 @@ static void select_channel(uint64_t cid) {
      * channel's draft. */
     nm_editor_release();
     g_cmp_hint[0] = '\0';                 /* the hint was about the conversation left */
-    g_bc_wait_ch = 0;                     /* and so was a send waiting on its size */
+    bc_drop_box();                        /* and so was a send waiting on its size */
     if (g_sel && g_sel != cid) draft_flush(g_sel);   /* leaving writes it, if changed */
     close_overlays();
     g_has_sel = 0;                       /* drop any transcript text selection */
@@ -7117,7 +7132,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
                 /* By name, or by a group this user is in (REQ-308), or by a
                  * broadcast the daemon let notify (REQ-221). */
                 if (msgs[first + i].author_id != m->user_id &&
-                    oc_model_mentions_me_in(m, msgs[first + i].broadcast_held, msgs[first + i].body,
+                    oc_model_mentions_me_in(m, msgs[first + i].broadcast_stored, msgs[first + i].body,
                                             strlen(msgs[first + i].body))) {
                     rectf mr = rf(reg.left, y, reg.right, y + heights[i]);
                     gfx_fill(rt, gr(mr), OC_COL_ACCENT, 0.10f);
@@ -8258,6 +8273,58 @@ static int win_visible(const oc_win *w) {
     SDL_WindowFlags fl = SDL_GetWindowFlags(w->sdl);
     return !(fl & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED));
 }
+
+/* Where a broadcast check says what it found: at the composer while the text
+ * waits in it, and beside a send from it; in a toast across the window once
+ * the text has left the box any other way -- Send later and the New message
+ * pane say what they did in a toast, and the box's next change clears a hint
+ * -- or never was in one, as a reply typed into a notification. */
+static void bc_say(int path, const char *text, int held) {
+    if (path == BCS_TOAST || (path != BCS_COMPOSER && !held)) fb_confirm(text);
+    else composer_hint(text, 0);
+}
+
+/* The one broadcast check every send path makes before its text goes to
+ * `cid` (REQ-221; oc_model_broadcast_check): 1 to send now, 0 when the send
+ * is held. One that will notify nobody is said and sent. One that will notify
+ * a channel the workspace calls large is held for the confirmation, and goes
+ * from confirm_run. One whose answer is the channel's size, when the member
+ * list this client holds is another channel's or still loading, is held while
+ * the list is asked for: judged from the wrong list, the note said a
+ * broadcast that notifies would not, or the confirmation asked in a small
+ * channel. bc_tick sends it once the list is in. Asked for on each such send,
+ * as the terminal client does, so a load that never finished is not waited on
+ * for good. A new send on a path replaces the one it held. */
+static int bc_gate(int path, uint64_t cid, uint64_t at, const char *text) {
+    bc_held_clear(&g_bc_wait[path]);
+    if (g_bc_confirmed || !text || !cid) return 1;
+    oc_bc_check v;
+    oc_model_broadcast_check(model(), cid, text, &v);
+    bc_held *h = NULL;
+    if (v.act == OC_BC_LOAD) h = &g_bc_wait[path];
+    else if (v.act == OC_BC_CONFIRM) { h = &g_bc_conf; bc_held_clear(h); g_bc_conf_path = path; }
+    if (h) {
+        h->text = strdup(text);
+        if (!h->text) return 0;
+        h->cid = cid; h->at = at; h->ws = g_ws_active;
+    }
+    switch (v.act) {
+    case OC_BC_LOAD:
+        oc_client_list_members(g_client, cid);
+        bc_say(path, v.note, 1);
+        return 0;
+    case OC_BC_CONFIRM:
+        if (path == BCS_TOAST) show_and_focus(g_main);   /* asked where it can be seen */
+        confirm_open(g_main, CONF_BROADCAST, cid, v.title, v.why, "Send");
+        return 0;
+    case OC_BC_NOTE:
+        bc_say(path, v.note, 0);
+        return 1;
+    default:
+        return 1;
+    }
+}
+
 static int win_front(const oc_win *w) {
     return win_visible(w) && (SDL_GetWindowFlags(w->sdl) & SDL_WINDOW_INPUT_FOCUS) != 0;
 }
@@ -10930,6 +10997,11 @@ static void nt_activate(int i) {
  * for what was typed, because a reply may contain anything including the
  * separator the first line uses. */
 static void call_join_here(oc_win *hwnd, uint64_t ch);   /* fwd: an invitation's Join */
+/* A reply typed into a notification, into the channel it is about: checked as
+ * a send from that channel's composer is (bc_gate, REQ-221). */
+static void toast_reply_send(uint64_t cid, const char *text) {
+    if (bc_gate(BCS_TOAST, cid, 0, text)) oc_client_send(g_client, cid, text);
+}
 static void toast_action_perform(char *p2) {
     char *nl = strchr(p2, '\n');
     const char *reply = nl ? nl + 1 : "";
@@ -10957,7 +11029,7 @@ static void toast_action_perform(char *p2) {
                 oc_client_call_decline(g_client, cid);
             }
         } else if (!strcmp(verb, "reply") && reply[0]) {
-            oc_client_send(g_client, cid, reply);
+            toast_reply_send((uint64_t)cid, reply);
         } else if (!strcmp(verb, "react") && extra[0]) {
             const oc_model *am = model();
             const oc_channel *ac = am ? oc_model_channel((oc_model *)am, cid) : NULL;
@@ -14036,6 +14108,7 @@ static void confirm_open(oc_win *hwnd, int act, uint64_t id, const char *title,
 
 static void link_open(const char *url);   /* fwd */
 static void cert_trust_run(oc_win *hwnd);    /* fwd */
+static void bc_resume(int path, bc_held h);  /* fwd */
 
 static void confirm_run(oc_win *hwnd) {
     (void)hwnd;
@@ -14053,11 +14126,14 @@ static void confirm_run(oc_win *hwnd) {
         link_open(u);
         break;
     }
-    case CONF_BROADCAST:   /* the composer's text, now confirmed (REQ-221) */
+    case CONF_BROADCAST: { /* a send's text, now confirmed (REQ-221, bc_gate) */
+        bc_held h = g_bc_conf;
+        memset(&g_bc_conf, 0, sizeof g_bc_conf);
         g_bc_confirmed = 1;
-        composer_send();
+        bc_resume(g_bc_conf_path, h);
         g_bc_confirmed = 0;
         break;
+    }
     case CONF_GROUP_DELETE:
         oc_client_delete_group(g_client, g_confirm_id);
         if (g_grp_sel == g_confirm_id) g_grp_sel = 0;
@@ -19165,6 +19241,9 @@ static void newmsg_send_at(oc_win *hwnd, uint64_t at) {
         composer_hint("This message is too long to send. Make a table smaller, or split it in two.", 1);
         return;
     }
+    /* Into a channel, checked as its own composer's send is (bc_gate,
+     * REQ-221): held, the text stays in the pane with its recipients. */
+    if (g_tgt_chip[0].is_channel && !bc_gate(BCS_NEWMSG, g_tgt_chip[0].id, at, b)) { free(b); return; }
 
     /* Empty the field FIRST. select_channel() flushes the outgoing conversation's
      * draft on its way out, and with the message still in the box it wrote the
@@ -24861,6 +24940,9 @@ static void sched_at(oc_win *hwnd, uint64_t at) {
     int reply = tm && tm->thread_open;
     uint64_t cid  = reply ? tm->thread_channel : g_sel;
     uint64_t root = reply ? tm->thread_parent  : 0;
+    /* Checked as a send is (bc_gate, REQ-221): the daemon judges it when it
+     * posts, and the channel's size then is the one to warn about now. */
+    if (!bc_gate(BCS_LATER, cid, at, b)) { free(b); return; }
     oc_client_schedule(g_client, cid, root, at, b);
     free(b);
     ed_clear();
@@ -24934,45 +25016,12 @@ static void composer_send(void) {
         composer_hint("This message is too long to send. Make a table smaller, or split it in two.", 1);
         return;
     }
-    /* A broadcast mention under the workspace's rule (REQ-221): one that will
-     * notify nobody is said and sent anyway; one that will notify a channel the
-     * workspace calls large asks first. An edit notifies nobody, so neither. */
-    g_bc_wait_ch = 0;
-    if (b && !g_edit_msg && !g_bc_confirmed) {
+    /* A broadcast mention under the workspace's rule (REQ-221), checked as
+     * every send path checks it (bc_gate). An edit notifies nobody, so not. */
+    if (b && !g_edit_msg) {
         const oc_model *bm = model();
         uint64_t bcid = bm && bm->thread_open ? bm->thread_channel : g_sel;
-        char tok[OC_MENTION_NAME_MAX + 2], t[96], why[160];
-        size_t n = 0;
-        int bc = oc_model_broadcast_will_notify(bm, bcid, b, tok, sizeof tok, &n);
-        /* Which it is depends on the channel's size, and the member list this
-         * client holds is not this channel's, or is still loading: judged from
-         * it, the warning said a broadcast that notifies would not, or asked to
-         * confirm one in a small channel. So the list is asked for, the text
-         * stays in the box, and bc_tick sends it once the list is in. Asked
-         * for on each such send, as the terminal client does, so a load that
-         * never finished is not waited on for good. */
-        if (bc == 3) {
-            oc_client_list_members(g_client, bcid);
-            free(g_bc_wait_text);
-            g_bc_wait_text = b;
-            g_bc_wait_ch = bcid;
-            snprintf(why, sizeof why, "Checking how many people %s reaches\u2026", tok);
-            composer_hint(why, 0);
-            return;
-        }
-        if (bc == 2) {
-            char whom[48];
-            oc_model_broadcast_whom(n, whom, sizeof whom);
-            snprintf(t, sizeof t, "Notify %s?", whom);
-            snprintf(why, sizeof why, "%s notifies everyone in this channel.", tok);
-            confirm_open(g_main, CONF_BROADCAST, bcid, t, why, "Send");
-            free(b);
-            return;
-        }
-        if (bc == 0) {
-            snprintf(why, sizeof why, "%s won't notify anyone here.", tok);
-            composer_hint(why, 0);
-        }
+        if (!bc_gate(BCS_COMPOSER, bcid, 0, b)) { free(b); return; }
     }
     if (b) {
         /* Drop a trailing newline; skip empty/whitespace. */
@@ -31584,22 +31633,50 @@ static void call_start_here(oc_win *hwnd, uint64_t ch) {
     call_open_view(hwnd, ch);
 }
 
-/* Once a tick: a broadcast send waiting on its channel's member list
- * (composer_send) goes when the list is in -- if the text in the box is still
- * the text it was for. Changed, the wait is dropped and the next send judges
- * the new text with the list now held. */
+/* A held send goes on (bc_gate, REQ-221), through the path it came from,
+ * which checks it again: now with its channel's member list, or past the
+ * confirmation. Text from a box goes only if the box still holds it, where it
+ * was written; changed, or another conversation's, the hold is dropped and
+ * the next send judges what is there. Takes the text. */
+static void bc_resume(int path, bc_held h) {
+    int same = h.text && h.ws == g_ws_active;
+    if (same && path != BCS_TOAST) {
+        char *now = ed_md_all();
+        same = now && !strcmp(now, h.text);
+        free(now);
+    }
+    if (same) switch (path) {
+    case BCS_COMPOSER:
+        if (!g_edit_msg && g_view != VIEW_NEWMSG) { g_cmp_hint[0] = '\0'; composer_send(); }
+        break;
+    case BCS_LATER:
+        if (g_view != VIEW_NEWMSG) { g_cmp_hint[0] = '\0'; sched_at(g_main, h.at); }
+        break;
+    case BCS_NEWMSG:
+        if (g_view == VIEW_NEWMSG && g_n_tgt_chip && g_tgt_chip[0].is_channel && g_tgt_chip[0].id == h.cid) {
+            g_cmp_hint[0] = '\0';
+            newmsg_send_at(g_main, h.at);
+        }
+        break;
+    case BCS_TOAST:
+        toast_reply_send(h.cid, h.text);
+        break;
+    }
+    free(h.text);
+}
+
+/* Once a tick: each send waiting on its channel's member list goes on when
+ * the list is in. */
 static void bc_tick(void) {
     const oc_model *m = model();
-    if (!g_bc_wait_ch || !m || m->chanmem_channel != g_bc_wait_ch || m->chanmem_loading) return;
-    g_bc_wait_ch = 0;
-    char *now = ed_md_all();
-    int same = now && g_bc_wait_text && !strcmp(now, g_bc_wait_text);
-    free(now);
-    free(g_bc_wait_text);
-    g_bc_wait_text = NULL;
-    if (!same) return;
-    g_cmp_hint[0] = '\0';
-    composer_send();
+    if (!m) return;
+    for (int p = 0; p < BCS_N; p++) {
+        bc_held *w = &g_bc_wait[p];
+        if (!w->text || m->chanmem_channel != w->cid || m->chanmem_loading) continue;
+        bc_held h = *w;
+        memset(w, 0, sizeof *w);
+        bc_resume(p, h);
+    }
 }
 
 /* Once a tick: a start waiting on a member list goes when the list is in. */
