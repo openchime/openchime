@@ -1340,6 +1340,12 @@ static void test_read_receipts(int port, const uint8_t *pin) {
     uint64_t m3 = rr_send(&a, 0x73, "three");
     rr_ack(&a, m3);
     CHECK(!await_cursor(&a, ub, 700, NULL));
+    {   /* a read counts once recorded after sharing began, to the millisecond */
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_REALTIME, &t0);
+        CHECK(WAIT_UNTIL((clock_gettime(CLOCK_REALTIME, &t1), t1.tv_sec * 1000 + t1.tv_nsec / 1000000 >
+                                                         t0.tv_sec * 1000 + t0.tv_nsec / 1000000), 1000));
+    }
     rr_ack(&b, m3);
     CHECK(await_cursor(&a, ub, 3000, &seen) && seen == m3);
 

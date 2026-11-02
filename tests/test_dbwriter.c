@@ -9561,6 +9561,18 @@ static void receipts_job(oc_dbwriter *w, uint64_t uid, uint8_t op, int want) {
     CHECK(r && r->type == OC_RES_READ_RECEIPTS && r->rc_share == want && r->rc_asked == (op == OC_RECEIPTS_ASK));
     oc_dbres_free(r);
 }
+/* The wall clock in ms, as the writer stamps reads and "shared since". */
+static uint64_t wall_ms_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+/* A read counts only once recorded after sharing began, to the millisecond:
+ * the clock moves on before the read that should show. */
+static void next_ms(void) {
+    uint64_t t0 = wall_ms_now();
+    CHECK(WAIT_UNTIL(wall_ms_now() > t0, 1000));
+}
 static void test_read_receipts(void) {
     const char *path = tdb("receipts.db");
     cleanup_db(path);
@@ -9595,6 +9607,7 @@ static void test_read_receipts(void) {
     r = ack_result(w, a, m[2]);
     CHECK(r && !rcur_has(r, b));
     oc_dbres_free(r);
+    next_ms();
     r = ack_result(w, b, m[2]);
     CHECK(r && r->rc_share == 1);
     oc_dbres_free(r);
@@ -9621,6 +9634,7 @@ static void test_read_receipts(void) {
     r = ack_result(w, a, m[4]);
     CHECK(r && !rcur_has(r, b));
     oc_dbres_free(r);
+    next_ms();
     r = ack_result(w, b, m[5]);
     CHECK(r && r->rc_share == 1);
     oc_dbres_free(r);

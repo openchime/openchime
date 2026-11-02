@@ -7500,7 +7500,7 @@ static oc_dbres *read_cursor_result(sqlite3 *db, uint64_t conn_id, uint64_t user
     sqlite3_prepare_v2(db,
         "SELECT dc.user_id, dc.message_id FROM delivery_cursors dc JOIN users u ON u.id = dc.user_id "
         " WHERE dc.channel_id=? AND dc.user_id<>? AND u.share_receipts = 1 "
-        "   AND u.receipts_since_ms >= 0 AND dc.updated_at_ms >= u.receipts_since_ms;",
+        "   AND u.receipts_since_ms >= 0 AND dc.updated_at_ms > u.receipts_since_ms;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
