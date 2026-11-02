@@ -1484,6 +1484,16 @@ platform's alone. `scripts/gui/run.sh [--win32|--web] <name>... | all` runs
 them by name and tallies the results, skipping on the web the scripts whose
 checks are Windows-only.
 
+**One driver per client.** Two drivers serving one command directory race for
+each verb, so a run fails at random with nothing wrong in the client. `kill`
+ends every driver serving the directory, found by the command line that names
+it, and the browser it held. It asks first (`quit`), then sends SIGTERM, then
+SIGKILL to whatever is still running 3 seconds later, and says how many it had
+to force; a driver ends on SIGTERM or SIGINT by closing its browser. `launch`
+runs `kill`, then refuses to start, naming the pids, if `held` still finds a
+driver on the directory. `scripts/test/local/web_driver.sh`, in `make test`,
+checks both with stand-in drivers that ignore SIGTERM.
+
 **How it drives.** `launch` builds and starts the fixture daemon as
 `scripts/gui/drive.sh` does (`OC_TEST_PORT`, `OC_TEST_DIR`, `OC_TEST_WS`,
 `OC_TEST_USERS`; the health port off), then starts `scripts/web/drive.mjs`: a

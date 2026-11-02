@@ -10,7 +10,8 @@
 #   scripts/web/drive.sh devaddr                   # the workspace `launch` defaults to
 #   scripts/web/drive.sh <cmd...>                  # one verb, wait for its ack
 #   scripts/web/drive.sh shot <name> | dump <name> # into $GUI_DRIVE_OUT / to stdout
-#   scripts/web/drive.sh kill
+#   scripts/web/drive.sh kill                      # every driver for this client, and its browser
+#   scripts/web/drive.sh held                      # 1 and the pids if a driver still serves it
 #
 # OC_TEST_WHO=a|b names the client for a pair (its own page and channel);
 # OC_TEST_PORT, OC_TEST_DIR, OC_TEST_WS, OC_TEST_USERS as scripts/gui/drive.sh; the
@@ -35,6 +36,26 @@ daemon_pid() {
   local p
   for p in $(pgrep -x openchimed 2>/dev/null); do
     tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PORT=$OC_TEST_PORT" && { echo "$p"; return; }
+  done
+}
+
+# The drivers serving directory $1: by their command line, which names it.
+drivers_of() { pgrep -f "scripts/web/drive.mjs $1 " 2>/dev/null || true; }
+# End the processes named: SIGTERM, up to 3 s for each to exit, then SIGKILL.
+# `forced` counts those that had to be killed.
+stop_pids() {
+  [ $# -gt 0 ] || return 0
+  kill "$@" 2>/dev/null || true
+  for _ in $(seq 1 30); do
+    left=""; for p in "$@"; do kill -0 "$p" 2>/dev/null && left="$left $p"; done
+    [ -z "$left" ] && return 0
+    sleep 0.1
+  done
+  for p in $left; do kill -9 "$p" 2>/dev/null && forced=$((forced + 1)); done
+  for _ in $(seq 1 20); do
+    alive=0; for p in $left; do kill -0 "$p" 2>/dev/null && alive=1; done
+    [ "$alive" = 0 ] && return 0
+    sleep 0.1
   done
 }
 
@@ -88,8 +109,10 @@ case "${1:-}" in
         echo "daemon restarted (was stale or absent)" >&2
       fi
     fi
-    # One page per client name: the old one closed first.
+    # One page per client name: the old one closed first, and none left after:
+    # two drivers on one directory race for each command.
     "$0" kill >/dev/null 2>&1 || true
+    "$0" held >/dev/null || { echo "launch refused: drivers still serve $DIR (pids $("$0" held))" >&2; exit 1; }
     rm -f "$DIR"/cmd "$DIR"/ack "$DIR"/quit "$DIR"/drive.log
     host="${ws%:*}"; port="${ws##*:}"
     url="https://${ws}/app/?host=${host}&port=${port}&env=OPENCHIME_DEV_SIGNIN%3D$(python3 -c 'import sys,urllib.parse as u;print(u.quote(sys.argv[1],safe=""))' "$cred")"
@@ -107,22 +130,26 @@ case "${1:-}" in
       sleep 0.3
     done
     echo "launched (not yet signed in)"; exit 0 ;;
+  held)
+    # Whether a driver still serves this client's directory: 1 and their pids.
+    pids="$(drivers_of "$DIR" | tr '\n' ' ')"
+    [ -z "${pids// /}" ] && exit 0
+    echo "$pids"; exit 1 ;;
   kill)
     # By the directory it serves, not a pid file alone: a fixture that wipes
     # its directory (fresh_fixture in the feature scripts) takes the pid file
     # with it, and a driver left behind would answer the next page's verbs.
-    if [ -f "$DIR/pid" ]; then
-      : > "$DIR/quit"
-      for _ in $(seq 1 50); do kill -0 "$(cat "$DIR/pid")" 2>/dev/null || break; sleep 0.1; done
-    fi
-    for p in $(pgrep -f "scripts/web/drive.mjs $DIR " 2>/dev/null); do kill "$p" 2>/dev/null || true; done
-    # The browser too, should the driver have gone without closing it: found
-    # by the profile directory it was given (scripts/web/drive.mjs names it from $DIR).
-    sleep 0.5
+    # Every driver for $DIR, and its browser, is gone before this returns:
+    # asked (`quit`), then SIGTERM, then SIGKILL for what is left after 3 s.
+    mkdir -p "$DIR" 2>/dev/null || true
+    : > "$DIR/quit"
+    forced=0
+    stop_pids $(drivers_of "$DIR")
     prof="$(printf '%s' "$(cd "$DIR" 2>/dev/null && pwd || printf '%s' "$DIR")" | sed 's|^/*||; s|[^A-Za-z0-9_.-]\+|-|g')"
-    for p in $(pgrep -f "openchime-webdrive/$prof" 2>/dev/null); do kill "$p" 2>/dev/null || true; done
+    stop_pids $(pgrep -f "openchime-webdrive/$prof" 2>/dev/null || true)
     rm -f "$DIR/pid" "$DIR/quit" "$DIR/chrome.pid"
-    echo killed; exit 0 ;;
+    [ "$forced" = 0 ] && echo killed || echo "killed ($forced forced)"
+    exit 0 ;;
   "") echo "usage: scripts/web/drive.sh launch|<cmd...>|kill" >&2; exit 2 ;;
 esac
 
