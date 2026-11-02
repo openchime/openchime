@@ -43,6 +43,10 @@ WIN_CFLAGS := -std=c99 $(WARN_CFLAGS) -O2 -g -D_WIN32_WINNT=0x0601 -DUTF8PROC_ST
 # --- The TUI ------------------------------------------------------------------
 # The termbox2 backend is tuikit/tk_term.c (Console API); the core seams
 # (threads/DNS/RNG) are in shared/oc_thread.h + resolve.c + net.c.
+# The PE header's link timestamp is the one byte-range that differs between two
+# links of the same objects; without it a serial and a parallel build of a
+# client give the same .exe, byte for byte.
+WIN_REPRO_LDFLAGS := -Wl,--no-insert-timestamp
 WIN_TUI_BIN := build/openchime-tui.exe
 WIN_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
            $(CORE_INC) -Iclient/tui -Iclient/shared -Ituikit -Ithird_party/qrcodegen -Ithird_party/termbox2 -Ithird_party/utf8proc
@@ -63,7 +67,7 @@ $(eval $(call oc_obj_rules,$(OBJ_DIR)/win-tui,WIN_TUI_CC,$(MINGW_CC) $(BUILD_ID_
 -include $(WIN_TUI_OBJS:.o=.d)
 $(WIN_TUI_BIN): $(WIN_TUI_OBJS) $(WIN_TUI_RES) $(WIN_MBEDLIBS) | build
 	$(WINCC) $(WIN_CFLAGS) $(WIN_TUI_OBJS) $(WIN_TUI_RES) \
-	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lcrypt32 -lole32 -ladvapi32 -lshell32 -static -o $@
+	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lcrypt32 -lole32 -ladvapi32 -lshell32 -static $(WIN_REPRO_LDFLAGS) -o $@
 
 # --- The GUI ------------------------------------------------------------------
 # The portable application layer (client/gui/app: SDL3 + oc_gfx + sdltext) over
@@ -120,7 +124,7 @@ $(eval $(call oc_obj_rules,$(OBJ_DIR)/win-gui,WIN_GUI_CC,$(MINGW_CC) $(BUILD_ID_
 $(WIN_GUI_BIN): $(WIN_GUI_OBJS) $(WIN_GUI_RES) $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A) | build
 	$(WINCC) $(WIN_CFLAGS) -std=c11 -mwindows $(WIN_GUI_OBJS) $(WIN_GUI_RES) \
 	    $(WIN_MBEDLIBS) $(WIN_MEDIA_A) -L$(SDL3_WIN)/lib -lSDL3 -lws2_32 -ldnsapi -lbcrypt -lcrypt32 -lcomdlg32 \
-	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -limm32 $(WIN_MEDIA_SYSLIBS) $(WIN_SDL_SYSLIBS) -static -o $@
+	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -limm32 $(WIN_MEDIA_SYSLIBS) $(WIN_SDL_SYSLIBS) -static $(WIN_REPRO_LDFLAGS) -o $@
 # Split the debug info out rather than discarding it. The client writes real
 # minidumps on a crash (crash_filter, client/gui/platform/win32/plat_win32.c),
 # and symbolicating a mingw build needs its DWARF -- a plain strip would shrink
