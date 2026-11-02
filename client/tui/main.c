@@ -3954,6 +3954,14 @@ int main(int argc, char **argv) {
                     size_t bn = 0;
                     int bc = oc_model_broadcast_will_notify(mm, bcid, composer, tok, sizeof tok, &bn);
                     g_bc_note[0] = '\0';
+                    /* Whether the channel is large is its member count, which
+                     * this client asks for only here: until it has it the
+                     * answer is a guess, so it asks and waits for the next Enter. */
+                    if ((bc == 0 || bc == 2) && !(mm->chanmem_channel == bcid && !mm->chanmem_loading)) {
+                        oc_client_list_members(cl, bcid);
+                        snprintf(g_bc_note, sizeof g_bc_note, "Checking how many people %s reaches: Enter again to send.", tok);
+                        continue;
+                    }
                     if (bc == 2 && strcmp(g_bc_ask, composer) != 0) {
                         snprintf(g_bc_ask, sizeof g_bc_ask, "%s", composer);
                         if (bn) snprintf(g_bc_note, sizeof g_bc_note, "%s notifies %zu people: Enter to send, Esc to keep editing", tok, bn);
