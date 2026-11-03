@@ -4229,7 +4229,8 @@ static void load_message_attachments(sqlite3 *db, uint64_t mid, oc_attach_meta *
  * @channel, @everyone; REQ-221): store_mentions writes one when the
  * workspace's rule let the author notify the channel, and none for an author
  * it does not, or for a message stored without mentions (a webhook's, the
- * workspace's notice). Read from the rows rather than decided again, so
+ * workspace's notice, and every message in an encrypted DM, whose body is
+ * ciphertext here). Read from the rows rather than decided again, so
  * history says what the send did, whatever the rule or the channel's size is
  * now; and asked of the rows alone, not the body, because an edit changes the
  * body and stores no mentions (PROTOCOL.md §5.5): a broadcast an edit removes
@@ -4368,6 +4369,9 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
                            const void *body, size_t body_len, uint64_t ts,
                            oc_mention_unresolved *unres, uint16_t *unres_total) {
     unreached_set unreached = { NULL, 0, 0 };
+    /* An encrypted DM's body is ciphertext (PRIVATE-DM.md): no mention of any
+     * kind is read from it, so a broadcast there stores no row and notifies
+     * nobody, and its message carries broadcast_stored 0 (REQ-221). */
     if (!body || !body_len || channel_is_e2e(db, channel_id)) return;
     oc_mention m[OC_MENTION_MAX];
     size_t n = oc_mention_scan((const char *)body, body_len, m, OC_MENTION_MAX);

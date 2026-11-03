@@ -305,6 +305,12 @@ int oc_model_broadcast_will_notify(const oc_model *m, uint64_t channel_id, const
         if (mm[i].kind == OC_MENTION_HERE || mm[i].kind == OC_MENTION_CHANNEL || mm[i].kind == OC_MENTION_EVERYONE) break;
     if (i == n) return -1;
     if (token && tcap) snprintf(token, tcap, "@%s", mm[i].name);
+    /* An encrypted DM's body is ciphertext to the daemon (PRIVATE-DM.md): it
+     * stores no mention row for it, so a broadcast there notifies nobody,
+     * whoever writes it and whatever the conversation's size -- and its member
+     * list is not needed to say so. */
+    const oc_channel *ch = oc_model_channel((oc_model *)m, channel_id);
+    if (ch && ch->e2e) return 0;
     char who[16] = "", lg[16] = "";
     oc_model_workspace_setting(m, "broadcast_mentions", who, sizeof who);
     oc_model_workspace_setting(m, "broadcast_large", lg, sizeof lg);
@@ -345,16 +351,23 @@ void oc_model_broadcast_check(const oc_model *m, uint64_t channel_id, const char
     memset(out, 0, sizeof *out);
     size_t n = 0;
     int bc = oc_model_broadcast_will_notify(m, channel_id, body, out->token, sizeof out->token, &n);
+    /* Said of the conversation it is: an encrypted DM's note says why nobody
+     * is notified, and a DM or a group DM is a conversation, not a channel. */
+    const oc_channel *c = m ? oc_model_channel((oc_model *)m, channel_id) : NULL;
     switch (bc) {
     case 0:
         out->act = OC_BC_NOTE;
-        snprintf(out->note, sizeof out->note, "%s won't notify anyone here.", out->token);
+        if (c && c->e2e)
+            snprintf(out->note, sizeof out->note, "%s won't notify anyone: this conversation is encrypted.", out->token);
+        else
+            snprintf(out->note, sizeof out->note, "%s won't notify anyone here.", out->token);
         break;
     case 2:
         out->act = OC_BC_CONFIRM;
         oc_model_broadcast_whom(n, out->whom, sizeof out->whom);
         snprintf(out->title, sizeof out->title, "Notify %s?", out->whom);
-        snprintf(out->why, sizeof out->why, "%s notifies everyone in this channel.", out->token);
+        snprintf(out->why, sizeof out->why, "%s notifies everyone in this %s.", out->token,
+                 c && c->kind == OC_CHANNEL_KIND_DM ? "conversation" : "channel");
         break;
     case 3:
         out->act = OC_BC_LOAD;

@@ -1641,6 +1641,100 @@ static void test_broadcast_check(void) {
     oc_model_free(&m);
 }
 
+/* The same judgement for a DM and a group DM, each by its own member list
+ * (REQ-221): the daemon applies the workspace's rule in every conversation, so
+ * the sender is told before sending into one as into a channel, and the
+ * confirmation calls it a conversation. An encrypted DM's body the daemon
+ * cannot read: it stores no broadcast row there, so a broadcast notifies
+ * nobody whoever writes it, and the sender is told so without the list. */
+static void bc_dm(oc_model *m, uint64_t cid, const uint64_t *peers, uint16_t n, uint8_t e2e) {
+    oc_ev e; memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = cid; e.status = 1; e.op = OC_CHANNEL_KIND_DM;
+    if (n == 1) e.user_id = peers[0];
+    e.n_peers = n;
+    for (uint16_t k = 0; k < n && k < 9; k++) e.peers[k] = peers[k];
+    e.e2e = e2e;
+    oc_model_apply(m, &e);
+}
+static void test_broadcast_check_dm(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    bc_me(&m, OC_ROLE_MEMBER);
+    const uint64_t one[] = { 2 }, six[] = { 1, 2, 3, 4, 5, 6 };
+    bc_dm(&m, 20, one, 1, 0);          /* a DM */
+    bc_dm(&m, 21, six, 6, 0);          /* a group DM of six */
+    bc_dm(&m, 22, one, 1, 1);          /* an encrypted DM */
+    oc_bc_check v;
+    char tok[24]; size_t n = 0;
+
+    /* Under a threshold, nothing is known until the DM's own list is in. */
+    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "5\x1e");
+    oc_model_broadcast_check(&m, 20, "@here lunch?", &v);
+    CHECK(v.act == OC_BC_LOAD && !strcmp(v.token, "@here") && strstr(v.note, v.token));
+    oc_model_broadcast_check(&m, 21, "@here lunch?", &v);
+    CHECK(v.act == OC_BC_LOAD);
+    oc_model_broadcast_check(&m, 20, "lunch, @bob?", &v);
+    CHECK(v.act == OC_BC_SEND && !v.note[0]);
+
+    /* The DM's list: two people, under the threshold, notifies, said nothing. */
+    bc_fill(&m, 20, 2);
+    CHECK(oc_model_broadcast_will_notify(&m, 20, "@here lunch?", tok, sizeof tok, &n) == 1 && n == 2);
+    oc_model_broadcast_check(&m, 20, "@here lunch?", &v);
+    CHECK(v.act == OC_BC_SEND && !v.note[0] && !v.title[0]);
+    /* ...and the group DM's is not the DM's. */
+    oc_model_broadcast_check(&m, 21, "@here lunch?", &v);
+    CHECK(v.act == OC_BC_LOAD);
+
+    /* The group DM's list: six, over the threshold. A member under `admins`
+     * notifies nobody, and is told; an admin is asked, naming how many. */
+    bc_fill(&m, 21, 6);
+    oc_model_broadcast_check(&m, 21, "@channel lunch?", &v);
+    CHECK(v.act == OC_BC_NOTE && !strcmp(v.token, "@channel") && strstr(v.note, v.token) && !v.title[0]);
+    bc_me(&m, OC_ROLE_ADMIN);
+    oc_model_broadcast_check(&m, 21, "@channel lunch?", &v);
+    CHECK(v.act == OC_BC_CONFIRM && strtol(v.whom, NULL, 10) == 6 && strstr(v.title, v.whom));
+    CHECK(strstr(v.why, v.token) && strstr(v.why, "conversation") && !strstr(v.why, "channel."));
+    /* `nobody`: not even an admin, in a conversation that large. */
+    bc_settings(&m, "broadcast_mentions\x1f" "nobody\x1e" "broadcast_large\x1f" "5\x1e");
+    oc_model_broadcast_check(&m, 21, "@everyone lunch?", &v);
+    CHECK(v.act == OC_BC_NOTE && !strcmp(v.token, "@everyone"));
+    /* Under the threshold the rule does not apply: a DM of two notifies. */
+    bc_fill(&m, 20, 2);
+    oc_model_broadcast_check(&m, 20, "@everyone lunch?", &v);
+    CHECK(v.act == OC_BC_SEND);
+    /* No threshold: every conversation is large, answered without a list. */
+    bc_settings(&m, "broadcast_mentions\x1f" "nobody\x1e" "broadcast_large\x1f" "0\x1e");
+    oc_model_broadcast_check(&m, 21, "@here lunch?", &v);
+    CHECK(v.act == OC_BC_NOTE);
+    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "0\x1e");
+    bc_me(&m, OC_ROLE_MEMBER);
+    oc_model_broadcast_check(&m, 21, "@here lunch?", &v);
+    CHECK(v.act == OC_BC_NOTE);
+    bc_me(&m, OC_ROLE_ADMIN);
+    oc_model_broadcast_check(&m, 21, "@here lunch?", &v);
+    CHECK(v.act == OC_BC_SEND);
+
+    /* An encrypted DM: notifies nobody under every rule, the most permissive
+     * included, its list loaded or not, and the note says why. */
+    bc_settings(&m, "broadcast_mentions\x1f" "everyone\x1e" "broadcast_large\x1f" "0\x1e");
+    CHECK(oc_model_broadcast_will_notify(&m, 22, "@here hi", tok, sizeof tok, &n) == 0);
+    oc_model_broadcast_check(&m, 22, "@here hi", &v);
+    CHECK(v.act == OC_BC_NOTE && strstr(v.note, "@here") && strstr(v.note, "encrypted"));
+    bc_settings(&m, "broadcast_mentions\x1f" "everyone\x1e" "broadcast_large\x1f" "5\x1e");
+    oc_model_broadcast_check(&m, 22, "@here hi", &v);    /* its list not loaded: not asked for */
+    CHECK(v.act == OC_BC_NOTE && strstr(v.note, "encrypted"));
+    bc_fill(&m, 22, 2);
+    oc_model_broadcast_check(&m, 22, "@channel hi", &v);
+    CHECK(v.act == OC_BC_NOTE && !strcmp(v.token, "@channel"));
+    oc_model_broadcast_check(&m, 22, "hi @bob", &v);
+    CHECK(v.act == OC_BC_SEND && !v.note[0]);
+    /* The plain DM with the same person is not encrypted: it notifies. */
+    bc_fill(&m, 20, 2);
+    oc_model_broadcast_check(&m, 20, "@here hi", &v);
+    CHECK(v.act == OC_BC_SEND);
+    oc_model_free(&m);
+}
+
 /* The workspace's own sender (USER_LIST `flags`): named as the workspace,
  * kept out of the roster every list of people is drawn from. */
 static void test_workspace_sender_model(void) {
@@ -5523,6 +5617,7 @@ int run_client_core_tests(void) {
     test_broadcast_model();
     test_broadcast_at_cap();
     test_broadcast_check();
+    test_broadcast_check_dm();
     test_broadcast_mentions_me();
     test_broadcast_stored_model();
     test_workspace_sender_model();

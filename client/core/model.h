@@ -1118,9 +1118,10 @@ int oc_model_may_add_emoji(const oc_model *m);
  * this only keeps the action off the menu once it would be refused. */
 int oc_model_may_change_own(const oc_model *m, uint64_t sent_ms, int edit, uint64_t now_ms);
 /* What a broadcast mention in `body` (@here, @channel, @everyone) will do in
- * `channel_id` under the workspace's `broadcast_mentions` and
- * `broadcast_large` (REQ-221): -1 there is none; 0 it will notify nobody,
- * from this person in a channel this large; 1 it will notify; 2 it will
+ * `channel_id` -- a channel, a DM or a group DM -- under the workspace's
+ * `broadcast_mentions` and `broadcast_large` (REQ-221): -1 there is none; 0
+ * it will notify nobody, from this person in a channel this large, or in an
+ * encrypted DM, whose body the daemon cannot read; 1 it will notify; 2 it will
  * notify a channel the workspace calls large, which the composer confirms;
  * 3 the answer is the channel's size and its member list is not loaded (or
  * is still loading): the composer asks for it (oc_client_list_members) and
@@ -1137,8 +1138,10 @@ void oc_model_broadcast_whom(size_t members, char *out, size_t cap);
 /* What a send of `body` to `channel_id` does about its broadcast mention
  * (REQ-221), from oc_model_broadcast_will_notify's answer, and what it says:
  * one judgement for every path that sends text -- the composer, sending it
- * later, a new message, a reply from a notification -- so none of them says
- * it differently or skips it. An edit notifies nobody and is not asked. */
+ * later, a new message (into a channel, a DM or a group DM, the one it opens
+ * included), a poll's question, a reply from a notification -- so none of
+ * them says it differently or skips it. An edit notifies nobody and is not
+ * asked. */
 enum {
     OC_BC_SEND    = 0,   /* no broadcast, or one that notifies: send */
     OC_BC_NOTE    = 1,   /* it will notify nobody: say `note`, and send */

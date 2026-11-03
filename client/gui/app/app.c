@@ -1908,12 +1908,14 @@ static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the pars
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 static int      g_bc_confirmed;     /* CONF_BROADCAST: the send it confirmed is under way */
 /* A send the broadcast check holds (REQ-221, bc_gate), by the path it came
- * from: the composer, its Send later, the New message pane, a reply from a
- * notification. Each path's text waits on its channel's member list in its own
- * slot (bc_tick sends it once the list is in), and one waits on the
+ * from: the composer, its Send later, the New message pane into a conversation
+ * that exists, the pane's text once the DM or group DM it asked for does
+ * (BCS_OPENED, no longer in any box), a poll's question, a reply from a
+ * notification. Each path's text waits on its conversation's member list in
+ * its own slot (bc_tick sends it once the list is in), and one waits on the
  * confirmation. `text` is heap; `at` a schedule's time, 0 for a send; `ws`
  * the workspace it was written in. */
-enum { BCS_COMPOSER, BCS_LATER, BCS_NEWMSG, BCS_TOAST, BCS_N };
+enum { BCS_COMPOSER, BCS_LATER, BCS_NEWMSG, BCS_OPENED, BCS_POLL, BCS_TOAST, BCS_N };
 typedef struct { uint64_t cid, at; char *text; int ws; } bc_held;
 static bc_held  g_bc_wait[BCS_N];
 static bc_held  g_bc_conf;
@@ -1927,6 +1929,8 @@ static void bc_drop_box(void) {
     bc_held_clear(&g_bc_wait[BCS_NEWMSG]);
 }
 static void composer_send(void);    /* fwd */
+static void bc_opened_back(const bc_held *h);   /* fwd */
+static void pc_say(const char *note);           /* fwd */
 
 static char     g_confirm_title[80];
 
@@ -8275,12 +8279,15 @@ static int win_visible(const oc_win *w) {
 }
 
 /* Where a broadcast check says what it found: at the composer while the text
- * waits in it, and beside a send from it; in a toast across the window once
- * the text has left the box any other way -- Send later and the New message
- * pane say what they did in a toast, and the box's next change clears a hint
- * -- or never was in one, as a reply typed into a notification. */
+ * waits in it, and beside a send from it; at the question while a poll waits
+ * in its card; in a toast across the window once the text has left the box
+ * any other way -- Send later, the New message pane and Post poll say what
+ * they did in a toast, and the box's next change clears a hint -- or is in
+ * none, as the pane's text once its conversation is made, or a reply typed
+ * into a notification. */
 static void bc_say(int path, const char *text, int held) {
-    if (path == BCS_TOAST || (path != BCS_COMPOSER && !held)) fb_confirm(text);
+    if (path == BCS_POLL && held) pc_say(text);
+    else if (path == BCS_TOAST || path == BCS_OPENED || (path != BCS_COMPOSER && !held)) fb_confirm(text);
     else composer_hint(text, 0);
 }
 
@@ -8296,6 +8303,8 @@ static void bc_say(int path, const char *text, int held) {
  * as the terminal client does, so a load that never finished is not waited on
  * for good. A new send on a path replaces the one it held. */
 static int bc_gate(int path, uint64_t cid, uint64_t at, const char *text) {
+    /* Text with no box to go back to is put back in one, not dropped. */
+    if (path == BCS_OPENED && g_bc_wait[path].text) bc_opened_back(&g_bc_wait[path]);
     bc_held_clear(&g_bc_wait[path]);
     if (g_bc_confirmed || !text || !cid) return 1;
     oc_bc_check v;
@@ -15529,6 +15538,8 @@ static char     g_pc_was_q[FIELD_BUF];      /* and its question, trimmed */
 static int      g_pc_err_at;                /* PCE_*: the field the refusal is said at */
 static uint16_t g_pc_err_rows;              /* PCE_OPTS: the rows it is about */
 static const char *g_pc_err;
+static int      g_pc_err_info;              /* it is a note, not a refusal (pc_say) */
+static char     g_pc_note[96];              /* the note's words */
 static int      g_pc_quiet;                 /* the card is filling its own fields */
 static field   *g_pc_q, *g_pc_opt[OC_POLL_MAX_OPTIONS], *g_pc_time;
 static rectf    g_pc_qrect, g_pc_orect[OC_POLL_MAX_OPTIONS], g_pc_rm[OC_POLL_MAX_OPTIONS];
@@ -15913,13 +15924,14 @@ static void draw_poll_compose(gfx *rt, rectf body) {
     draw_text(rt, "Question", g_ui_b, rf(lx, y, lr, y + UIS(20.0f)), OC_COL_TEXT);
     y += PC_LABEL_H;
     rectf qb = rf(lx + FORM_BOX_INSET, y, br, y + PC_FIELD_H);
-    pc_box(rt, qb, g_pc_err_at == PCE_Q, g_focus == g_pc_q, 0);
+    pc_box(rt, qb, g_pc_err_at == PCE_Q && !g_pc_err_info, g_focus == g_pc_q, 0);
     g_pc_qrect = qb;
     field_draw(rt, g_pc_q, rf(qb.left + UIS(10.0f), qb.top + UIS(4.0f), qb.right - UIS(10.0f), qb.bottom - UIS(4.0f)),
                OC_COL_TEXT);
     y = qb.bottom;
     if (g_pc_err_at == PCE_Q && g_pc_err) {
-        draw_text(rt, g_pc_err, g_meta, rf(lx, y + UIS(3.0f), lr, y + PC_ERR_H), OC_COL_DANGER);
+        draw_text(rt, g_pc_err, g_meta, rf(lx, y + UIS(3.0f), lr, y + PC_ERR_H),
+                  g_pc_err_info ? OC_COL_MUTED : OC_COL_DANGER);
         y += PC_ERR_H;
     }
     y += PC_SECT_GAP;
@@ -16145,18 +16157,43 @@ static int pc_control_name(int c, char *aid, size_t acap, char *nm, size_t ncap)
 /* Refuse at field `at`, rows `rows` of the options, saying `why`; the keyboard
  * goes there. Nothing is sent. */
 static int pc_refuse(int at, uint16_t rows, const char *why, field *go) {
-    g_pc_err_at = at; g_pc_err_rows = rows; g_pc_err = why;
+    g_pc_err_at = at; g_pc_err_rows = rows; g_pc_err = why; g_pc_err_info = 0;
     if (go) focus_set(go);
     invalidate();
     return 0;
 }
 
+/* Say `note` at the question, as a note: what the broadcast check says while
+ * the poll waits in its card (bc_say). */
+static void pc_say(const char *note) {
+    snprintf(g_pc_note, sizeof g_pc_note, "%s", note ? note : "");
+    g_pc_err_at = PCE_Q; g_pc_err_rows = 0; g_pc_err = g_pc_note; g_pc_err_info = 1;
+    invalidate();
+}
+
+/* The card is under a dialog opened from it -- the broadcast confirmation --
+ * and comes back when that closes (g_modal_stack). */
+static int pc_under(void) {
+    return g_n_modal_stack > 0 && g_modal_stack[g_n_modal_stack - 1] == &g_pc_open;
+}
+
+/* Whether the card, open or under the confirmation, still holds the new poll
+ * whose question `q` the broadcast check held for conversation `cid`. */
+static int pc_holds(uint64_t cid, const char *q) {
+    if ((!g_pc_open && !pc_under()) || g_pc_mode || g_pc_cid != cid || !q) return 0;
+    char now[FIELD_BUF];
+    pc_trim(g_pc_q->buf, now, sizeof now);
+    return !strcmp(now, q);
+}
+
 /* Post poll / Save. Checked here, where each refusal can be said at its field,
  * before the core's own check (oc_client_post_poll), which can only say no.
- * Returns 1 when something was sent and the card closed. */
+ * Returns 1 when something was sent and the card closed. Also run with the
+ * card under the broadcast confirmation, once that says Send (bc_resume):
+ * posted, the card does not come back; refused, it does, with the reason. */
 static int poll_compose_submit(void) {
-    if (!g_pc_open || !g_client) return 0;
-    g_pc_err_at = PCE_NONE; g_pc_err_rows = 0; g_pc_err = NULL;
+    if ((!g_pc_open && !pc_under()) || !g_client) return 0;
+    g_pc_err_at = PCE_NONE; g_pc_err_rows = 0; g_pc_err = NULL; g_pc_err_info = 0;
     char q[FIELD_BUF];
     pc_trim(g_pc_q->buf, q, sizeof q);
     if (!q[0]) return pc_refuse(PCE_Q, 0, "A poll needs a question.", g_pc_q);
@@ -16198,6 +16235,11 @@ static int poll_compose_submit(void) {
         if (close_at <= wall_ms()) return pc_refuse(PCE_TIME, 0, "The deadline has to be in the future.", g_pc_time);
     }
     if (!g_pc_mode) {
+        /* The question is the message's body, so a broadcast in it notifies as
+         * one in a message does: checked as a send is (bc_gate, REQ-221).
+         * Held, the card stays, saying why at the question, or under the
+         * confirmation, and the poll goes from bc_resume. */
+        if (!bc_gate(BCS_POLL, g_pc_cid, 0, q)) return 0;
         if (oc_client_post_poll(g_client, g_pc_cid, 0, q, ov, (uint8_t)n, flags, close_at) != 0) {
             fb_failed("The poll could not be posted.");
             return 0;
@@ -16210,7 +16252,8 @@ static int poll_compose_submit(void) {
             return 0;
         }
     }
-    modal_finish(0);
+    if (g_pc_open) modal_finish(0);
+    else g_n_modal_stack--;   /* under the confirmation: posted, so it does not come back */
     return 1;
 }
 
@@ -16447,8 +16490,12 @@ static void modal_enter(oc_win *hwnd, int *flag) {
      * (g_modal_stack). Read before close_overlays() clears it. */
     int *opener = g_prefs_open ? &g_prefs_open : g_keys_open ? &g_keys_open :
                   g_wsmgr_open ? &g_wsmgr_open : g_notify_open ? &g_notify_open :
-                  g_browse_open ? &g_browse_open : g_sessions_open ? &g_sessions_open : NULL;
+                  g_browse_open ? &g_browse_open : g_sessions_open ? &g_sessions_open :
+                  g_pc_open ? &g_pc_open : NULL;
     if (opener == flag) opener = NULL;
+    /* The poll card asks the broadcast confirmation over itself (bc_gate) and
+     * comes back under it: put away here, since close_overlays() leaves it. */
+    if (opener == &g_pc_open) { g_pc_open = 0; pc_fields_hide(); }
     g_modal_entering = 1;
     close_overlays();
     g_modal_entering = 0;
@@ -16489,7 +16536,11 @@ static void modal_enter(oc_win *hwnd, int *flag) {
 /* Close it. `commit` decides which way: Save runs commit, Cancel runs restore. */
 static const char *g_modal_closed_by = "";   /* diagnosis only; see the dump */
 
+static void bc_unconfirmed(void);   /* fwd */
 static void modal_finish(int save) {
+    /* The broadcast confirmation said no to (bc_unconfirmed), once the card
+     * it may have been asked over is back. */
+    int bc_no = !save && g_confirm_open && g_confirm_act == CONF_BROADCAST;
     g_tp_open = 0;   /* nothing floating may outlive the card it was opened from */
     if (g_pick_open && picker_floats()) picker_close(NULL);
     if (g_status_edit) field_show(g_status_edit, 0);
@@ -16519,6 +16570,7 @@ static void modal_finish(int save) {
         *back = 1;
         if (back == &g_wsmgr_open) sw_book_load();
     }
+    if (bc_no) bc_unconfirmed();
 }
 
 /* Clicks the FRAME owns, tested before any modal's own content. Returns 1 when it
@@ -19201,6 +19253,20 @@ static void newmsg_deliver(uint64_t cid, const char *body, uint64_t at) {
     }
 }
 
+/* The conversation the pane's recipients already are, which its send is
+ * checked against (bc_gate, REQ-221): a channel, or the DM with the one person
+ * named. 0 for one the send makes -- a DM not opened yet, a group DM, an
+ * encrypted DM -- which is checked once it exists, where the text goes into
+ * it (BCS_OPENED). */
+static uint64_t newmsg_target(uint64_t at) {
+    if (!g_n_tgt_chip) return 0;
+    if (g_tgt_chip[0].is_channel) return g_tgt_chip[0].id;
+    if (g_n_tgt_chip != 1 || (nm_e2e_on() && !at)) return 0;
+    const oc_model *m = model();
+    const oc_channel *ex = m ? dm_with(m, g_tgt_chip[0].id) : NULL;
+    return ex ? ex->channel_id : 0;
+}
+
 /* Send the pane's message, or -- when `at` is non-zero -- schedule it for then.
  * Both need the same conversation, and when that conversation does not exist yet
  * both wait for the daemon to create it (REQ-224, REQ-229). */
@@ -19241,9 +19307,13 @@ static void newmsg_send_at(oc_win *hwnd, uint64_t at) {
         composer_hint("This message is too long to send. Make a table smaller, or split it in two.", 1);
         return;
     }
-    /* Into a channel, checked as its own composer's send is (bc_gate,
-     * REQ-221): held, the text stays in the pane with its recipients. */
-    if (g_tgt_chip[0].is_channel && !bc_gate(BCS_NEWMSG, g_tgt_chip[0].id, at, b)) { free(b); return; }
+    /* Into a channel or a DM that exists, checked as its own composer's send
+     * is (bc_gate, REQ-221): held, the text stays in the pane with its
+     * recipients. */
+    {
+        uint64_t gcid = newmsg_target(at);
+        if (gcid && !bc_gate(BCS_NEWMSG, gcid, at, b)) { free(b); return; }
+    }
 
     /* Empty the field FIRST. select_channel() flushes the outgoing conversation's
      * draft on its way out, and with the message still in the box it wrote the
@@ -31633,14 +31703,54 @@ static void call_start_here(oc_win *hwnd, uint64_t ch) {
     call_open_view(hwnd, ch);
 }
 
+/* The pane's text for a conversation it opened (BCS_OPENED), held and then
+ * not sent -- its confirmation said no to, or the workspace left -- comes back
+ * to a box rather than going nowhere: that conversation's composer, or, when
+ * the conversation is not here to go to, New message, as when it could not be
+ * opened. Added after whatever the box holds, which is kept. */
+static void bc_opened_back(const bc_held *h) {
+    if (!h || !h->text || !h->text[0]) return;
+    const oc_model *m = model();
+    if (h->ws == g_ws_active && m && oc_model_channel((oc_model *)m, h->cid)) {
+        if (g_view != VIEW_HOME || g_sel != h->cid) {
+            g_view = VIEW_HOME;
+            select_channel(h->cid);
+            layout_composer(g_main);
+        }
+    } else {
+        open_new_message(g_main);
+    }
+    char *now = ed_md_all();
+    if (now && now[0]) {
+        size_t a = strlen(now), b = strlen(h->text);
+        char *both = malloc(a + 2 + b + 1);
+        if (both) {
+            memcpy(both, now, a);
+            memcpy(both + a, "\n\n", 2);
+            memcpy(both + a + 2, h->text, b + 1);
+            ed_set_md(both);
+            free(both);
+        }
+    } else {
+        ed_set_md(h->text);
+    }
+    free(now);
+    ed_changed(g_main);
+    fb_confirm("Not sent: your message is back in the box.");
+    invalidate();
+}
+
 /* A held send goes on (bc_gate, REQ-221), through the path it came from,
- * which checks it again: now with its channel's member list, or past the
- * confirmation. Text from a box goes only if the box still holds it, where it
- * was written; changed, or another conversation's, the hold is dropped and
- * the next send judges what is there. Takes the text. */
+ * which checks it again: now with its conversation's member list, or past
+ * the confirmation. Text from a box, or a poll's card, goes only if it still
+ * holds it, where it was written; changed, or another conversation's, the
+ * hold is dropped and the next send judges what is there. Text in no box goes
+ * where it was going, in the workspace it was written in. Takes the text. */
 static void bc_resume(int path, bc_held h) {
     int same = h.text && h.ws == g_ws_active;
-    if (same && path != BCS_TOAST) {
+    if (path == BCS_OPENED && h.text && !same) bc_opened_back(&h);
+    if (same && path == BCS_POLL) same = pc_holds(h.cid, h.text);
+    else if (same && path != BCS_TOAST && path != BCS_OPENED) {
         char *now = ed_md_all();
         same = now && !strcmp(now, h.text);
         free(now);
@@ -31653,15 +31763,32 @@ static void bc_resume(int path, bc_held h) {
         if (g_view != VIEW_NEWMSG) { g_cmp_hint[0] = '\0'; sched_at(g_main, h.at); }
         break;
     case BCS_NEWMSG:
-        if (g_view == VIEW_NEWMSG && g_n_tgt_chip && g_tgt_chip[0].is_channel && g_tgt_chip[0].id == h.cid) {
+        if (g_view == VIEW_NEWMSG && newmsg_target(h.at) == h.cid) {
             g_cmp_hint[0] = '\0';
             newmsg_send_at(g_main, h.at);
         }
+        break;
+    case BCS_OPENED:
+        newmsg_deliver(h.cid, h.text, h.at);
+        break;
+    case BCS_POLL:
+        poll_compose_submit();
         break;
     case BCS_TOAST:
         toast_reply_send(h.cid, h.text);
         break;
     }
+    free(h.text);
+}
+
+/* The broadcast confirmation said no to (REQ-221): the send it held is not
+ * made. Its text stays where it was written -- the box, or the poll's card,
+ * which comes back -- and the pane's text for a conversation it opened, in no
+ * box, is put back in one (bc_opened_back). */
+static void bc_unconfirmed(void) {
+    bc_held h = g_bc_conf;
+    memset(&g_bc_conf, 0, sizeof g_bc_conf);
+    if (g_bc_conf_path == BCS_OPENED) bc_opened_back(&h);
     free(h.text);
 }
 
@@ -31879,9 +32006,13 @@ static void pdm_tick(oc_win *hwnd) {
             /* The words of the request only, never of a message. */
             if (g_pref_notify != NOTIFY_OFF) notify_plain("Encrypted conversation", t);
         }
-        /* Open: what was typed in New message goes into it. */
+        /* Open: what was typed in New message goes into it, checked as the
+         * text New message opens any DM for is (bc_gate, REQ-221). The daemon
+         * cannot read it, so a broadcast in it notifies nobody, and the check
+         * says so without its member list. */
         if (v->state == OC_PDM_EV_OPEN && g_pdm_ask_peer == v->peer) {
-            if (g_pdm_ask_text) oc_client_send(g_client, v->id, g_pdm_ask_text);
+            if (g_pdm_ask_text && bc_gate(BCS_OPENED, v->id, 0, g_pdm_ask_text))
+                oc_client_send(g_client, v->id, g_pdm_ask_text);
             free(g_pdm_ask_text); g_pdm_ask_text = NULL;
             g_pdm_ask_peer = 0;
         }
@@ -36165,20 +36296,26 @@ static int on_tick(oc_win *hwnd) {
                 if (g_nm_wait_uid) nc = dm_with(m, g_nm_wait_uid);
                 else if (g_n_group_pending) nc = group_dm_with(m, g_group_pending, g_n_group_pending);
                 if (nc) {
-                    newmsg_deliver(nc->channel_id, g_nm_pending, g_nm_pending_when);
-                    int was_scheduled = g_nm_pending_when != 0;
+                    uint64_t ncid = nc->channel_id, when = g_nm_pending_when;
+                    char *text = g_nm_pending;
+                    g_nm_pending = NULL;
                     g_nm_pending_when = 0;
-                    free(g_nm_pending); g_nm_pending = NULL;
                     g_nm_wait_uid = 0; g_n_group_pending = 0;
                     /* Follow the message into its conversation only if the user
                      * is still where they pressed send. Doing it unconditionally
                      * yanked them out of whatever they had started reading in the
                      * second the daemon took to answer. */
-                    if (!was_scheduled && (g_view == VIEW_NEWMSG || g_view == VIEW_HOME)) {
+                    if (!when && (g_view == VIEW_NEWMSG || g_view == VIEW_HOME)) {
                         g_view = VIEW_HOME;
-                        select_channel(nc->channel_id);
+                        select_channel(ncid);
                         layout_composer(hwnd);
                     }
+                    /* Checked now that the conversation is there to be checked,
+                     * against its own member list, as a send into one that
+                     * already existed is (bc_gate, REQ-221). Held, it goes from
+                     * bc_resume, or comes back to a box (bc_opened_back). */
+                    if (bc_gate(BCS_OPENED, ncid, when, text)) newmsg_deliver(ncid, text, when);
+                    free(text);
                     invalidate();
                 }
             }
