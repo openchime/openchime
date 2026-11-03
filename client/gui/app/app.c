@@ -1911,11 +1911,11 @@ static int      g_bc_confirmed;     /* CONF_BROADCAST: the send it confirmed is 
  * from: the composer, its Send later, the New message pane into a conversation
  * that exists, the pane's text once the DM or group DM it asked for does
  * (BCS_OPENED, no longer in any box), a poll's question, a reply from a
- * notification. Each path's text waits on its conversation's member list in
+ * notification, a video message's caption (the composer's text). Each path's text waits on its conversation's member list in
  * its own slot (bc_tick sends it once the list is in), and one waits on the
  * confirmation. `text` is heap; `at` a schedule's time, 0 for a send; `ws`
  * the workspace it was written in. */
-enum { BCS_COMPOSER, BCS_LATER, BCS_NEWMSG, BCS_OPENED, BCS_POLL, BCS_TOAST, BCS_N };
+enum { BCS_COMPOSER, BCS_LATER, BCS_NEWMSG, BCS_OPENED, BCS_POLL, BCS_TOAST, BCS_VIDEO, BCS_N };
 typedef struct { uint64_t cid, at; char *text; int ws; } bc_held;
 static bc_held  g_bc_wait[BCS_N];
 static bc_held  g_bc_conf;
@@ -8287,7 +8287,7 @@ static int win_visible(const oc_win *w) {
  * into a notification. */
 static void bc_say(int path, const char *text, int held) {
     if (path == BCS_POLL && held) pc_say(text);
-    else if (path == BCS_TOAST || path == BCS_OPENED || (path != BCS_COMPOSER && !held)) fb_confirm(text);
+    else if (path == BCS_TOAST || path == BCS_OPENED || path == BCS_VIDEO || (path != BCS_COMPOSER && !held)) fb_confirm(text);
     else composer_hint(text, 0);
 }
 
@@ -26227,7 +26227,6 @@ static int vm_take_bytes(uint64_t id, uint8_t *d, size_t n) {
 
 static void vm_send(oc_win *hwnd) {
     if (!g_rec_res.video || !g_client || !g_sel) return;
-    vm_player_close();                                /* it borrows the bytes being handed over */
     char cap[8192] = "";
     {
         char *md = ed_len() > 0 ? ed_md_all() : NULL;
@@ -26238,6 +26237,12 @@ static void vm_send(oc_win *hwnd) {
     const oc_model *pm = model();
     uint64_t pch = (pm && pm->thread_open) ? pm->thread_channel : g_sel;
     uint64_t proot = (pm && pm->thread_open) ? pm->thread_parent : 0;
+    /* The caption is a message body the daemon reads for mentions, so a
+     * broadcast in it is checked as the composer's is (REQ-221, bc_gate).
+     * Held, the card and the recording stay as they are, and bc_resume sends
+     * once the caption in the box is still the one judged. */
+    if (cap[0] && !bc_gate(BCS_VIDEO, pch, 0, cap)) return;
+    vm_player_close();                                /* it borrows the bytes being handed over */
     g_vm_post_tag = oc_client_post_video(g_client, pch, proot,
                                          g_rec_res.video, g_rec_res.video_len,
                                          g_rec_res.poster, g_rec_res.poster_len,
@@ -31776,6 +31781,9 @@ static void bc_resume(int path, bc_held h) {
         break;
     case BCS_TOAST:
         toast_reply_send(h.cid, h.text);
+        break;
+    case BCS_VIDEO:
+        if (g_vm == VM_REC && g_rec_res.video) vm_send(g_main);
         break;
     }
     free(h.text);
