@@ -14,7 +14,7 @@ TEST=$(basename "$0" .sh)
 # `make test-merge` runs them under ThreadSanitizer (merge/tsan.sh) and the
 # others plainly (merge/suites.sh), so each runs once there. A suite with no
 # thread cannot race, and instrumenting it only makes it slower.
-TSAN_SUITES=run_netloop_tests,run_client_core_tests,run_dbwriter_tests,run_ioloop_tests,run_authpool_tests,run_xferpool_tests,run_slow_blob_tests,run_storage_tests,run_blob_s3_tests,run_blob_cache_tests,run_media_tests,run_video_media_tests,run_tts_worker_tests,run_stt_tests,run_push_tests,run_invite_mail_tests,run_enroll_tests,run_tls_tests,run_signin_tests,run_acme_tests
+TSAN_SUITES=run_netloop_tests,run_client_core_tests,run_dbwriter_tests,run_ioloop_tests,run_authpool_tests,run_xferpool_tests,run_slow_blob_tests,run_storage_tests,run_blob_s3_tests,run_blob_cache_tests,run_media_tests,run_video_media_tests,run_tts_worker_tests,run_stt_tests,run_push_tests,run_invite_mail_tests,run_enroll_tests,run_tls_tests,run_signin_tests,run_acme_tests,run_relaykeys_tests,run_summary_tests
 
 # The suites too slow for the minute `make test` has (measured; the times
 # make test prints at the end, slowest first). They run in make test-merge on

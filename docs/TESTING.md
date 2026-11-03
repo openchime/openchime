@@ -1160,7 +1160,7 @@ and on the stripped release binary and the installed `.deb`
 (`make test-release PART=packages`); the speech suites (`tts_worker`, `stt`,
 `ttskit`) run in `make test-merge`.
 
-A new suite is its declaration and one `S(run_<name>_tests)` line in `tests/main.c`; if its code starts a thread it also goes on `TSAN_SUITES` in `scripts/test/lib/common.sh`, and if it is slow, on `SLOW_SUITES`. Nothing checks that it does: the relay-key and summary suites start threads and are missing from the list.
+A new suite is its declaration and one `S(run_<name>_tests)` line in `tests/main.c`; if its code starts a thread it also goes on `TSAN_SUITES` in `scripts/test/lib/common.sh`, and if it is slow, on `SLOW_SUITES`.
 
 ---
 
