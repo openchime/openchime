@@ -6,7 +6,7 @@
 # how the repository builds and works), third_party/ (vendored sources),
 # LICENSING.md (what the packages carry), and docs/CONFIG.md (its reference
 # is generated from the daemon's settings and checked against them by
-# scripts/check/config.sh, so it ships with the code).
+# scripts/test/local/config.sh, so it ships with the code).
 # Used by promote, which copies such commits onto main without a release, and
 # by scripts/release/main_next.sh.
 #

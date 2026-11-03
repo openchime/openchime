@@ -74,6 +74,28 @@ int   oc_plat_data_dir(char *out, size_t cap) {
 void *oc_plat_ring_map(const char *path, size_t size) { (void)path; (void)size; return NULL; }
 void  oc_plat_ring_unmap(void *p, size_t size) { (void)p; (void)size; }
 int   oc_plat_handoff(const char *kind, const char *payload) { (void)kind; (void)payload; return 0; }
+
+/* The browser's Back and Forward are the application's: each place it records
+ * is a history entry carrying its number, and a popstate hands the number back
+ * (oc_web_handoff "nav"). The listener goes on with the first entry. */
+int   oc_plat_nav_push(uint32_t seq, int replace) {
+    EM_ASM({
+        if (!window.ocNavListening) {
+            window.ocNavListening = true;
+            window.addEventListener("popstate", function (e) {
+                if (e.state && typeof e.state.ocnav === "number")
+                    Module.ccall("oc_web_handoff", null, ["string", "string"], ["nav", String(e.state.ocnav)]);
+            });
+        }
+        if ($1) history.replaceState({ ocnav: $0 }, "");
+        else    history.pushState({ ocnav: $0 }, "");
+    }, (int)seq, replace);
+    return 1;
+}
+int   oc_plat_nav_go(int delta) {
+    EM_ASM({ history.go($0); }, delta);
+    return 1;
+}
 /* The page goes to the daemon's sign-in page itself; it comes back to /app/
  * with the token (oc_plat_signin_result). In development mode, with
  * OPENCHIME_DEV_SIGNIN=user:password set (TESTING.md) is its own harness: it

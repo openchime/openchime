@@ -267,6 +267,30 @@ where one exists.
   deployment model the inviter has been shown the invitation as **copyable
   text**: the workspace address, how to sign in (the provider and the invited
   address, or the token) and when it expires.
+- **REQ-371.** A workspace has had a **moderator** role, between admin and
+  member. A moderator has been able to delete another person's message,
+  remove people from a channel (not from the workspace), and resolve reports
+  (REQ-372). A moderator has not been able to change anyone's role or invite
+  people to the workspace. Owners and admins have kept everything a moderator
+  may do, and only they have appointed or removed moderators (ARCH-128).
+- **REQ-372.** Any member has been able to **report a message** in a
+  conversation they can read, other than their own, with a reason from a fixed
+  list (spam, harassment, inappropriate, other) and an optional note.
+  Moderators, admins and owners have seen the open reports and resolved each
+  as "action taken" or "dismissed", with a note. Filing and resolving have both
+  been in the audit log's moderation family. The reported person has never been
+  told who reported them.
+- **REQ-373.** A report of a message in a **private channel or a DM** has
+  carried a copy of only that message and its sender, so the moderator who
+  resolves it sees what was reported and nothing else from the conversation,
+  without being in it.
+- **REQ-374.** Who may **create public channels**, who may **create private
+  channels** and who may **invite people to the workspace** have each been the
+  workspace's configuration: everyone, moderators and up, or admins and up.
+  The defaults have matched what came before (anyone creates either kind of
+  channel; owners and admins invite), so an upgrade has changed nothing.
+  Clients have been told the three and offered only what a person may do; the
+  daemon has refused the rest.
 - **REQ-034.** Each channel has carried an optional human-set **topic/
   description** — a short line shown in the channel header — set by a channel
   member. It is metadata on the channel, distinct from the channel name
@@ -376,6 +400,17 @@ where one exists.
   members auto-join, and the tenant's join/invite policy — stored on the tenant
   and shown wherever the workspace is presented (the switcher, REQ-013; the
   client header).
+
+  **The workspace speaks for itself,** as configuration rather than an
+  in-app setting: a new member is sent its welcome
+  (`OPENCHIME_WELCOME_MESSAGE`), and it posts notices where it is told to — a
+  member joined (`OPENCHIME_NOTICE_MEMBER_JOINED`), a public channel created
+  (`OPENCHIME_NOTICE_CHANNEL_CREATED`), a channel's name, description,
+  visibility or archived state changed, in that channel
+  (`OPENCHIME_NOTICE_CHANNEL_CHANGES`). A person is always told, in their DM
+  with the workspace, when someone adds them to a channel or a group or
+  changes their role. These come from the workspace's own sender, never a
+  person; they notify nobody and count as unread for nobody.
 - **REQ-043.** An owner/admin has had an **administration console** distinct from
   the ordinary chat surface: a sortable member table with bulk actions (role
   change, remove — REQ-030/033), a channel-management view
@@ -393,9 +428,14 @@ where one exists.
   server-assigned timestamp distinct from any client-supplied send time.
 - **REQ-051.** A user has been able to edit their own message after sending
   it. An edited message has carried a visible "edited" marker and has
-  retained its original send timestamp and position in history.
+  retained its original send timestamp and position in history. The workspace's
+  configuration may limit it (`OPENCHIME_EDIT_WINDOW`: `never`, or seconds
+  after sending; by default always), which the daemon enforces and clients
+  are told.
 - **REQ-052.** A user has been able to delete their own message after
-  sending it. Deletion has produced a tombstone record (author, timestamp,
+  sending it, within the window the workspace's configuration sets
+  (`OPENCHIME_DELETE_WINDOW`, by default always); an admin's or owner's
+  delete of someone else's message (REQ-032) is never limited. Deletion has produced a tombstone record (author, timestamp,
   and thread linkage preserved; body removed) rather than removing the row,
   so that thread reply counts and quoted references have not broken.
   A tombstone has also dropped everything that hung off the body — its
@@ -530,7 +570,9 @@ where one exists.
   available on inspection (hover/tap).
 - **REQ-072.** A tenant has been able to register **custom emoji** (a named
   image usable in reactions and message text) beyond the built-in Unicode set;
-  any member may add one and only its creator or an admin may delete it. A reaction (REQ-070) references an
+  any member may add one, or only owners and admins where the workspace's
+  configuration says so (`OPENCHIME_CUSTOM_EMOJI_ADD`, which clients are told and
+  the daemon enforces), and only its creator or an admin may delete it. A reaction (REQ-070) references an
   emoji by a stable shortcode that resolves to either a Unicode sequence or a
   tenant custom-emoji asset; a text-only client (the TUI) shows the shortcode
   rather than the image.
@@ -569,6 +611,12 @@ where one exists.
   currently-connected, authorized client at least once. The wire protocol's
   `msg_type` enum has included an explicit ack message type used by the
   client to confirm receipt (ARCH-8).
+
+  **Seen-by is a choice.** The workspace may turn read receipts off
+  (`OPENCHIME_READ_RECEIPTS`, configuration), and then no member's read
+  position reaches anyone. Each person may stop sharing their own; they still
+  see everyone else's. Neither is retroactive: a read from before a person
+  shared, or from while receipts were off, is never shown.
 - **REQ-091.** A client has treated redelivery of a message it has already
   acked as a duplicate and has suppressed it rather than rendering it twice,
   keyed on the server-assigned message id (REQ-050), using a per-channel
@@ -1594,6 +1642,30 @@ keeps to its own share of the free space and gives it back under pressure
   for the mentioned party, and has driven notification delivery under the
   recipient's per-channel level (REQ-130) — the "mentions" notification level
   *depends* on this feature (ARCH-89).
+
+  Who may notify a whole channel is the workspace's configuration
+  (`OPENCHIME_BROADCAST_MENTIONS`: everyone, owners and admins, or nobody),
+  from a member count that makes a channel large
+  (`OPENCHIME_BROADCAST_LARGE`; 0, every channel; at most 500). From anyone
+  else, in a large channel, `@here`, `@channel` and `@everyone` stay in the
+  message as text and notify nobody. The rule is the same in a DM and a group
+  DM, by their member count. In an encrypted DM the daemon cannot read the
+  body, stores no mention for it, and a broadcast there notifies nobody,
+  whoever writes it. The daemon decides, and every message
+  it delivers, live or replayed, says whether its send stored a broadcast
+  mention, so a client counts, notifies and highlights a broadcast mention
+  exactly as the daemon stored it, in every channel and not only the open
+  one, and after an edit too: an edit stores no mentions, so a broadcast it
+  removes counts no more and one it puts back counts as the send stored it.
+  Wherever a message is written to a channel, a DM or a group DM (the
+  composer, sending it later, a new message, the one a new message sends
+  into the DM or group DM it opens, a poll's question, a reply from a
+  notification), the client says before sending when a broadcast will notify
+  nobody, judged from that conversation's own member list, asked for when it
+  does not hold it, and in an encrypted DM that it notifies nobody because
+  the conversation is encrypted; and asks for confirmation when it will
+  notify a large one, naming how many, or "everyone here" when it has more
+  members than the list carries.
 - **REQ-287.** Mentioning someone who is **not in the channel** has
   never been silent. The sender has been told — privately, in a notice only they see, since
   it concerns their action and not the conversation — that the mention reached

@@ -139,6 +139,7 @@ enum {
     OC_EV_REACTIONS,       /* a REACTIONS entry: message_id + one reactor (user_id + emoji) */
     OC_EV_DND,             /* a NOTIFY_PREFS header (frame start): status=enabled, count=(start<<16|end) */
     OC_EV_SNOOZE,          /* a SNOOZE: server_time = when the pause ends, 0 = not paused (REQ-278) */
+    OC_EV_READ_RECEIPTS,   /* READ_RECEIPTS: status = 1 if I share my read receipts (REQ-090) */
     OC_EV_SCHEDULE,        /* a SCHEDULE frame: the recurring allowed-hours schedule (REQ-136) */
     OC_EV_ALERT_PREFS,     /* an ALERT_PREFS frame: my keywords + priority people (REQ-135) */
     OC_EV_THREAD_SUMMARY,  /* one aggregated thread (REQ-062): a list entry AND the push */
@@ -244,6 +245,7 @@ enum {
     /* The features this daemon offers, by name (CAPABILITIES): body is the names
      * joined by commas, and replaces what was known -- sent on every connection. */
     OC_EV_CAPABILITIES,
+    OC_EV_WORKSPACE_SETTINGS,  /* body: "key\x1fvalue\x1e..." -- all of them, replacing what was held */
     OC_EV_TTS_BEGIN,
     OC_EV_TTS_VOICE,
     /* One message's speech has arrived, ready to play: message_id, count=bytes,
@@ -363,6 +365,10 @@ typedef struct {
     uint8_t  participant;  /* THREAD_REPLY: this user is in the thread (REQ-061).
                               Derived server-side (ARCH-104) because the client
                               holds a thread's replies only while it is open. */
+    uint8_t  broadcast_stored; /* MESSAGE, RESTORE, THREAD_REPLY: the daemon
+                              stored a broadcast mention row for the message, so
+                              an @here, @channel or @everyone in it notifies
+                              (REQ-221) */
     uint8_t  archived;     /* CHANNEL: the channel is archived (REQ-035) */
     uint8_t  e2e;          /* CHANNEL: an encrypted DM (PRIVATE-DM.md) */
     uint8_t  ws_mode;      /* WORKSPACE_INFO: OC_WS_MODE_* (a public demo, AUTH.md §8.12) */
@@ -439,6 +445,7 @@ typedef struct {
     uint16_t n_groups;
     uint64_t *ids;        /* heap; CHANNEL_VIA_GROUP */
     size_t    n_ids;
+    uint8_t  user_system; /* USER: the workspace's own sender (OC_USER_SYSTEM), not a person */
     uint8_t  msg_kind;    /* MESSAGE: OC_MSG_KIND_* (a call event, REQ-304) */
     uint8_t *der;         /* heap; CERT_UNTRUSTED: the certificate (DER) */
     size_t    der_len;
@@ -450,6 +457,7 @@ typedef struct {
     char     pdm_safety[72];         /* PDM: OPEN, KEY_CHANGED */
     uint8_t  err_kind;               /* ERROR: OC_CERR_* */
     uint16_t err_code;               /* ERROR: the daemon's OC_ERR_* it answers, 0 if none */
+    int64_t  rank;                   /* SEARCH_RESULT: the row's relevance (protocol.h, oc_search) */
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);
@@ -487,6 +495,7 @@ enum {
     OC_CMD_SET_NOTIFY_PREF, /* set `channel_id`'s notification level (op = level) */
     OC_CMD_SET_DND,         /* set the DND window: op = enabled, channel_id = start_min, message_id = end_min */
     OC_CMD_SET_SNOOZE,      /* pause notifications: message_id = minutes from now, 0 ends it (REQ-278) */
+    OC_CMD_SET_READ_RECEIPTS, /* share my read receipts: message_id = 1, or 0 to stop (REQ-090) */
     OC_CMD_SET_SCHEDULE,    /* the recurring schedule (REQ-136), carried in cmd->sched */
     OC_CMD_SET_KEYWORDS,    /* replace my keyword list (REQ-135), carried in cmd->list */
     OC_CMD_SET_PRIORITY,    /* replace my priority-people list (REQ-135) */
@@ -679,6 +688,9 @@ typedef struct {
     uint64_t poll_close_at_ms;
     uint8_t  poll_picks[OC_POLL_MAX_OPTIONS];
     uint8_t  n_poll_picks;
+    /* SEARCH: the order is `op` (OC_SEARCH_*), the cursor `message_id` and, by
+     * relevance, this rank beside it. */
+    int64_t  rank;
 } oc_cmd;
 
 oc_cmd *oc_cmd_new(int type);

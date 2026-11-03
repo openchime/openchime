@@ -54,8 +54,8 @@ static int failures OC_UNUSED = 0;
 /* A verdict that races the wall clock -- work that must land inside a short
  * real-time window, or a count that depends on where a window's edge falls --
  * can fail on a loaded machine with nothing wrong. It is asserted unless
- * OC_TEST_TIMING is 0, which the build pipeline sets (make test-ci) so that a
- * busy runner cannot fail a build; `make test` asserts it. The code around it
+ * OC_TEST_TIMING is 0, which CI sets (make test-merge) so that a busy runner
+ * cannot fail a build; `make test` asserts it. The code around it
  * still runs everywhere, under ThreadSanitizer too. A speed limit is such a
  * verdict as well. Each one is to be made deterministic -- an injected clock,
  * an explicit sweep, a wait on the outcome -- and become a CHECK again. */
@@ -88,7 +88,7 @@ static inline int oc_test_timing(void) {
  * a loaded machine, or the assertion passes for a reason that is not the one
  * meant), and never counts iterations (a loop of 500 x 10 ms is not 5 s when
  * each turn does work). This is the one place in tests/ that sleeps
- * (scripts/check/tests_lint.sh holds every other file to it). */
+ * (scripts/test/local/tests_lint.sh holds every other file to it). */
 
 /* Milliseconds on CLOCK_MONOTONIC: for deadlines and for measuring, never for
  * a date. */

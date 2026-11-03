@@ -963,6 +963,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->message_id = b.message_id;
                 e->server_time = b.server_time;
                 e->msg_kind = b.kind;
+                e->broadcast_stored = b.broadcast_stored;
                 if (b.author_name.len) {
                     size_t an = b.author_name.len < sizeof e->author_name - 1
                                     ? b.author_name.len : sizeof e->author_name - 1;
@@ -998,6 +999,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->author_id = b.author_id;
                 e->message_id = b.message_id;
                 e->server_time = b.server_time;
+                e->broadcast_stored = b.broadcast_stored;
                 e->body = body_for_ui(ctx, b.channel_id, b.body);
                 oc_queue_push(out, e);
                 push_attachments(out, b.channel_id, b.message_id, b.attach, b.n_attach);
@@ -1210,6 +1212,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     if (n2) memcpy(e->pf_voice, ue[i].voice_id.ptr, n2);
                     e->pf_voice[n2] = '\0';
                 }
+                e->user_system = (ue[i].flags & OC_USER_SYSTEM) != 0;
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_PRESENCE_UPDATE) {
@@ -1548,6 +1551,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->server_time = tr.server_time;
                     e->count = tr.reply_count;
                     e->participant = tr.participant;
+                    e->broadcast_stored = tr.broadcast_stored;
                     e->body = body_for_ui(ctx, tr.channel_id, tr.body);
                     oc_queue_push(out, e);
                     push_attachments(out, tr.channel_id, tr.message_id, tr.attach, tr.n_attach);
@@ -1583,6 +1587,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->author_id = se[i].author_id;
                 e->server_time = se[i].server_time;
                 e->action = se[i].action;   /* REQ-058 */
+                e->rank = se[i].rank;
                 e->body = malloc(se[i].snippet.len + 1);
                 if (e->body) { memcpy(e->body, se[i].snippet.ptr, se[i].snippet.len); e->body[se[i].snippet.len] = '\0'; }
                 oc_queue_push(to_ui, e);
@@ -1721,6 +1726,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->n_pri_people = np;
                     oc_queue_push(to_ui, e);
                 }
+            }
+        } else if (hdr.msg_type == OC_MSG_READ_RECEIPTS) {
+            oc_read_receipts rr;
+            if (oc_decode_read_receipts(&p, &rr) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_READ_RECEIPTS);
+                if (e) { e->status = rr.share ? 1 : 0; oc_queue_push(to_ui, e); }
             }
         } else if (hdr.msg_type == OC_MSG_SNOOZE) {
             oc_snooze sn;
@@ -2216,6 +2227,30 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 }
                 xfer_reset(x);
             }
+        } else if (hdr.msg_type == OC_MSG_WORKSPACE_SETTINGS) {
+            /* Read-only, all of them at once: packed for the model as
+             * "key\x1fvalue\x1e...". A value holding either separator could
+             * not come from an environment variable, and is cut at it. */
+            oc_workspace_settings ws;
+            if (oc_decode_workspace_settings(&p, &ws) != OC_OK) return -1;
+            size_t need = 1;
+            for (uint8_t i = 0; i < ws.count; i++) need += ws.keys[i].len + ws.values[i].len + 2;
+            oc_ev *e = oc_ev_new(OC_EV_WORKSPACE_SETTINGS);
+            if (e && (e->body = malloc(need)) != NULL) {
+                size_t o = 0;
+                for (uint8_t i = 0; i < ws.count; i++) {
+                    for (size_t k = 0; k < ws.keys[i].len && ws.keys[i].ptr[k] != 0x1f && ws.keys[i].ptr[k] != 0x1e; k++)
+                        e->body[o++] = (char)ws.keys[i].ptr[k];
+                    e->body[o++] = '\x1f';
+                    for (size_t k = 0; k < ws.values[i].len && ws.values[i].ptr[k] != 0x1f && ws.values[i].ptr[k] != 0x1e; k++)
+                        e->body[o++] = (char)ws.values[i].ptr[k];
+                    e->body[o++] = '\x1e';
+                }
+                e->body[o] = '\0';
+                oc_queue_push(to_ui, e);
+            } else if (e) {
+                oc_ev_free(e);
+            }
         } else if (hdr.msg_type == OC_MSG_CAPABILITIES) {
             oc_capabilities caps;
             if (oc_decode_capabilities(&p, &caps) != OC_OK) return -1;
@@ -2557,7 +2592,7 @@ static const char *auth_error_text(uint16_t code, int reconnecting) {
     case OC_ERR_USER_LIMIT:              return "this workspace is full";
     case OC_ERR_AUTH_SOURCE_UNAVAILABLE: return "this way of signing in isn't available right now";
     case OC_ERR_AUTH_REQUIRED:           return "this workspace doesn't sign in that way";
-    default: return reconnecting ? "session expired: please log in again" : "auth failed";
+    default: return reconnecting ? "session expired: please sign in again" : "auth failed";
     }
 }
 
@@ -3179,6 +3214,14 @@ static int run_connection(oc_net *n, int reconnecting,
                 (void)write_all(&conn, fd, tb, tw.len, &n->stop);
         }
 
+        /* Whether I share my read receipts (REQ-090), for the settings. */
+        {
+            uint8_t rb[16]; oc_wbuf rw; oc_wbuf_init(&rw, rb, sizeof rb);
+            oc_read_receipts rr = { OC_RECEIPTS_ASK };
+            if (oc_encode_read_receipts(&rw, negotiated, &rr) == OC_OK)
+                (void)write_all(&conn, fd, rb, rw.len, &n->stop);
+        }
+
         /* Ask for the channel list + the roster so the model can populate the
          * sidebar and resolve user names (for DMs, mentions). */
         uint8_t lb[16]; oc_wbuf lw; oc_wbuf_init(&lw, lb, sizeof lb);
@@ -3397,6 +3440,8 @@ static int run_connection(oc_net *n, int reconnecting,
                 s.has_mask   = (uint8_t)sq.has;
                 s.after_ms   = after_ms;
                 s.before_ms  = before_ms;
+                s.sort        = c->op;                  /* OC_SEARCH_* */
+                s.cursor_rank = c->rank;
                 if (oc_encode_search(&w, OC_PROTOCOL_VERSION, &s) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
@@ -3617,6 +3662,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_priority sp = { c->n_pri_people, c->pri_people };
                 if (oc_encode_set_priority(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_READ_RECEIPTS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_read_receipts rr = { (uint8_t)(c->message_id ? 1 : 0) };
+                if (oc_encode_read_receipts(&w, OC_PROTOCOL_VERSION, &rr) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SET_SNOOZE) {

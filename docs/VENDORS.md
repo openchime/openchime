@@ -158,9 +158,12 @@ has moved (`scripts/check/toolchains.sh`).
 
 | Toolchain | Version | Script | Builds | License |
 |-----------|---------|--------|--------|---------|
-| **zig** (its bundled clang and lld) | 0.13.0 | `scripts/build/zig.sh` | the release's Linux daemon against glibc 2.34 (`make RELEASE=1`), the arm64 daemon cross-built from x86 (`make ARCH=aarch64`), and CI's second-compiler pass (`make check-release-cc`) | MIT |
-| **Emscripten** (emsdk) | 6.0.8 | `scripts/build/emsdk.sh` | the web client (`make web`) and the loader compiled into a `WEB=1` daemon; brings its own Node for `make web-test` | MIT / NCSA |
+| **zig** (its bundled clang and lld) | 0.13.0 | `scripts/build/zig.sh` | the release's Linux daemon against glibc 2.34 (`make RELEASE=1`), the arm64 daemon cross-built from x86 (`make ARCH=aarch64`), and CI's second-compiler pass (`make test-merge`) | MIT |
+| **Emscripten** (emsdk) | 6.0.8 | `scripts/build/emsdk.sh` | the web client (`make web`) and the loader compiled into a `WEB=1` daemon; brings its own Node for the web client's checks (`make test-merge`) | MIT / NCSA |
 | **llvm-mingw** (clang, lld, LLVM binutils, mingw-w64 headers and CRT) | 20261006 | `scripts/build/llvm_mingw.sh` | the Windows GUI and TUI and their libraries (`make windows`), through the `x86_64-w64-mingw32-*` names | Apache-2.0 with LLVM exception; mingw-w64 under its own permissive terms |
+| **makemsix** (Microsoft msix-packaging, with CMake 3.31.6 to build it) | commit `25a65f5` | `scripts/build/makemsix.sh` | the Windows client's MSIX, on Linux (`packaging/build-windows.sh`); built from source because no release compiles with a current clang | MIT (makemsix); BSD-3-Clause (CMake) |
+| **WinShell** (NSIS plugin) | the NSIS wiki's `WinShell.zip`, SHA-256 pinned | `scripts/build/nsis_plugins.sh` | the installer's Start-menu shortcut AppUserModelID (`packaging/windows/openchime.nsi`); `makensis` itself is Ubuntu's `nsis` | zlib |
+| **jsign** | 7.6 | `scripts/build/jsign.sh` | Authenticode signing of the Windows binaries and installer against Azure Trusted Signing, on Linux (`scripts/release/sign_windows.sh`) | Apache-2.0 |
 
 | Package | Version | Purpose | Used by | Source | License |
 |---------|---------|---------|---------|--------|---------|
@@ -192,7 +195,7 @@ exits. Override for a new version with `MBEDTLS_SHA256=<sum>`.
 `scripts/build/sdl3_windows.sh` fetches the pinned release tarball
 (SHA-256-verified, refuses an unpinned bump), cross-builds a **static-only**
 `libSDL3.a` with llvm-mingw into `third_party/sdl3-3.4.14-win/` (gitignored), and
-`make build/gfx_test.exe` links it. SDL's own build is CMake; the script invoking
+`make windows` links it. SDL's own build is CMake; the script invoking
 it is the same arrangement as invoking mbedTLS's make — the dependency's build
 system stays its own business, and this tree's stays make. It is a
 large dependency, fetched pinned rather than committed. zlib-licensed: no notice needs to travel with a shipped
@@ -341,8 +344,9 @@ is the upstream's own stability contract for a base OS.
   host's daemon uses the system cc.
 - **buildah / podman / skopeo** — **staging build, release-candidate and
   release only**. Build, start and push the OCI image (the staging build),
-  check its digest (the release-candidate), copy it to its released tags and
-  move the `:latest` tag (the release), daemonlessly.
+  check its digest and copy it to `:N-rcK` and `:rc` (the release-candidate),
+  copy it to its released tags and move the `:latest` and `:rc` tags (the
+  release), daemonlessly.
 - **Docker and Docker Compose are NOT used**, anywhere, by anything — not to
   build, not to test, not locally, not in CI. This is a standing constraint;
   see ARCH-36 and the header of `.github/workflows/staging-build.yml`.
@@ -356,7 +360,7 @@ The Windows GUI is the portable application (`client/gui/app/`, ARCH-80) over
 |------|---------|------|---------|
 | `scripts/build/llvm_mingw.sh`, `third_party/llvm-mingw-20261006` | 20261006 | The toolchain itself (clang, lld, LLVM binutils, mingw-w64 headers and CRT, UCRT), fetched by make | Apache-2.0 with LLVM exception |
 | `scripts/build/mbedtls_windows.sh`, `third_party/mbedtls-3.6.2-win` | 3.6.2 | Windows cross-compile; used by `make windows` | Apache-2.0 |
-| `scripts/build/sdl3_windows.sh`, `third_party/sdl3-3.4.14-win` | 3.4.14 | Windows cross-compile (static, CMake invoked by the script); used by `make windows` and `make build/gfx_test.exe` | zlib |
+| `scripts/build/sdl3_windows.sh`, `third_party/sdl3-3.4.14-win` | 3.4.14 | Windows cross-compile (static, CMake invoked by the script); used by `make windows` | zlib |
 | `scripts/build/libvpx.sh windows`, `third_party/libvpx-1.17.0-win` | 1.17.0 | Windows cross-compile (static, nasm); used by `make windows` | BSD-3-Clause |
 | `scripts/build/opus.sh windows`, `third_party/opus-1.6.1-win` | 1.6.1 | Windows cross-compile (static); used by `make windows` | BSD-3-Clause |
 | `scripts/build/speexdsp.sh windows`, `third_party/speexdsp-1.2.1-win` | 1.2.1 | Windows cross-compile (static); used by `make windows` | BSD-3-Clause |

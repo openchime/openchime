@@ -1,5 +1,5 @@
 /* The clients' few environment reads (CONFIG.md "Development mode only"), in
- * one place so scripts/check/config.sh can hold the rest of the
+ * one place so scripts/test/local/config.sh can hold the rest of the
  * client to none. The development inputs (OPENCHIME_DEV_*) are read only when
  * OPENCHIME_MODE=development: an ordinary client ignores them, whatever is
  * set. In the browser the page sets OPENCHIME_MODE from the daemon that served

@@ -27,6 +27,7 @@
 #include "http.h"
 #include "webpages.h"
 #include "pwpolicy.h"
+#include "utf8proc.h"   /* a demo visitor's name (AUTH.md §8.12) */
 #include "demolimits.h"
 #include "webapp.h"   /* the sign-in pages (AUTH.md §8.10) */
 #include "devicecodes.h" /* a terminal signs in with a code (AUTH.md §8.11) */
@@ -54,6 +55,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -196,6 +198,11 @@ typedef struct web_req {
     char step[OC_STEP_TICKET_LEN + 1];   /* a second step's: the ticket it is for */
     char rp[256], origin[300];           /* reached on a passkey's trusted name: which */
     int  done;                           /* SIGNIN: just back from setting a new password */
+    /* SIGNUP in a demo workspace (AUTH.md §8.12): the visitor's name, and what
+     * the page says again if it is shown again. */
+    int  demo;
+    char name[256], terms[320];
+    unsigned left_min;
 } web_req;
 
 typedef struct conn_s {
@@ -2521,9 +2528,9 @@ static void stt_drop_conn(uint64_t conn_id) {
 
 /* --- Attachment transfer (REQ-140/141, ARCH-69) ------------------------- */
 
-#ifdef OC_TTS
 static int send_transfer_error(conn *c, uint64_t aid, uint16_t code);
 
+#ifdef OC_TTS
 /* Start streaming a stored rendering: open the blob, then AUDIO_INFO and the
  * pump, exactly as an attachment download does (ARCH-69). Returns -1 if the
  * connection was told about a failure instead. */
@@ -2595,6 +2602,20 @@ static int send_transfer_error(conn *c, uint64_t aid, uint16_t code) {
     int rc = out_append(c, tmp, w.len);
     xfer_reset(&c->xfer);
     return rc;
+}
+
+/* Read-aloud is not running here -- not built in, or built in with no engine --
+ * so a request for speech is refused by name and the connection stays open, the
+ * same answer from either build (READ-ALOUD.md §6). Preview is message 0. The
+ * frame is send_transfer_error's, but nothing was started, so a download already
+ * running on the connection is left alone. */
+static int tts_refuse(conn *c, uint64_t message_id) {
+    uint8_t ctxb[8];
+    for (int i = 0; i < 8; i++) ctxb[i] = (uint8_t)(message_id >> (56 - 8 * i));
+    uint8_t tmp[96]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
+    oc_error e = { OC_ERR_TTS_UNAVAILABLE, 0, { ctxb, 8 }, oc_slice_str("transfer error") };
+    oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+    return out_append(c, tmp, w.len);
 }
 
 /* Ask the pool for the next slice of the blob, if the output buffer has room.
@@ -3338,6 +3359,8 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->sq_has    = sq.has_mask;
             j->sq_after  = sq.after_ms;
             j->sq_before = sq.before_ms;
+            j->search_sort = sq.sort;                       /* 28 */
+            j->search_cursor_rank = sq.cursor_rank;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -3808,6 +3831,15 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_READ_RECEIPTS) {
+            oc_read_receipts rr;
+            if (oc_decode_read_receipts(&p, &rr) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_READ_RECEIPTS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->receipts_op = rr.share;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_TZ_OFFSET) {
             oc_set_tz_offset tz;
             if (oc_decode_set_tz_offset(&p, &tz) != OC_OK) return -1;
@@ -3978,9 +4010,10 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (oc_decode_set_display_name(&p, &sn) != OC_OK) return -1;
             oc_job *j = oc_job_new(OC_JOB_SET_DISPLAY_NAME, c->conn_id);
             if (!j) return -1;
-            size_t nl = sn.name.len < OC_MAX_DISPLAY_NAME ? sn.name.len : OC_MAX_DISPLAY_NAME;
+            /* Whole: the writer refuses a name over the cap (FORBIDDEN), and a
+             * cut here would store a shorter one, maybe inside a character. */
             j->user_id = c->user_id;
-            j->pf_name = strndup((const char *)sn.name.ptr, nl);
+            j->pf_name = strndup((const char *)sn.name.ptr, sn.name.len);
             if (!j->pf_name) return -1;
             oc_dbwriter_submit(dbw, j);
             continue;
@@ -4504,14 +4537,11 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_AUDIO_GET) {
             oc_audio_get ag;
             if (oc_decode_audio_get(&p, &ag) != OC_OK) return -1;
-            c->xfer.audio_message_id = ag.message_id;
             if (!g_tts) {
-                c->xfer.audio = 1;                       /* so the error names the message */
-                int rc = send_transfer_error(c, ag.message_id, OC_ERR_TTS_UNAVAILABLE);
-                c->xfer.audio = 0;
-                if (rc != 0) return -1;
+                if (tts_refuse(c, ag.message_id) != 0) return -1;
                 continue;
             }
+            c->xfer.audio_message_id = ag.message_id;
             /* One transfer at a time on a connection, as for an attachment: the
              * pump and its backpressure are per connection, not per request. */
             if (c->xfer.state != XFER_NONE) {
@@ -4549,6 +4579,10 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_VOICE_PREVIEW_GET) {
             oc_voice_preview_get vp;
             if (oc_decode_voice_preview_get(&p, &vp) != OC_OK) return -1;
+            if (!g_tts) {
+                if (tts_refuse(c, 0) != 0) return -1;
+                continue;
+            }
             if (c->xfer.state != XFER_NONE) {
                 /* Busy with another download -- most often the next message being
                  * read aloud. Refuse the preview WITHOUT touching that transfer:
@@ -4573,8 +4607,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 }
             }
             const char *preview = g_tts_engine && g_tts_engine->preview ? g_tts_engine->preview : "";
-            int refuse = !g_tts ? OC_ERR_TTS_UNAVAILABLE
-                       : voice < 0 || !preview[0] ? OC_ERR_TTS_UNAVAILABLE
+            int refuse = voice < 0 || !preview[0] ? OC_ERR_TTS_UNAVAILABLE
                        : !audio_rate_ok(c) ? OC_ERR_TTS_UNAVAILABLE : 0;
             if (refuse) {                              /* nothing in flight to disturb */
                 if (send_transfer_error(c, 0, (uint16_t)refuse) != 0) return -1;
@@ -4591,6 +4624,21 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             xfer_submit(dbw, &c->xfer, j);
             c->xfer.audio = 1;
             c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
+            continue;
+        }
+#else
+        /* Read-aloud is not built in: the same refusal a daemon built with it
+         * gives when it has no engine, not the unknown-frame close below. */
+        if (hdr.msg_type == OC_MSG_AUDIO_GET) {
+            oc_audio_get ag;
+            if (oc_decode_audio_get(&p, &ag) != OC_OK) return -1;
+            if (tts_refuse(c, ag.message_id) != 0) return -1;
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_VOICE_PREVIEW_GET) {
+            oc_voice_preview_get vp;
+            if (oc_decode_voice_preview_get(&p, &vp) != OC_OK) return -1;
+            if (tts_refuse(c, 0) != 0) return -1;
             continue;
         }
 #endif
@@ -4856,7 +4904,9 @@ static void web_page(conn *c, int status, const oc_page *pg) {
     if (!html) { http_reply(c, 500, "text/plain", "error\n", 6); return; }
     int scripts = pg->pk_mode != 0 || (pg->kind == OC_PAGE_SECURITY && pg->sec == OC_SEC_CODES) ||
                   oc_page_has_password(pg);
-    web_reply_ex(c, status, html, len, pg->redirect_uri, NULL, scripts);
+    int opts = (scripts ? OC_PAGE_HDR_SCRIPTS : 0) |
+               (pg->kind == OC_PAGE_SIGNUP && pg->demo ? OC_PAGE_HDR_PREFETCH : 0);
+    web_reply_ex(c, status, html, len, pg->redirect_uri, NULL, opts);
     free(html);
 }
 
@@ -4888,6 +4938,63 @@ static int is_compact_jws(const char *s) {
         else if (!isalnum((unsigned char)ch) && ch != '-' && ch != '_') return 0;
     }
     return dots == 2;
+}
+
+/* A demo visitor's name (AUTH.md §8.12), trimmed in place: at most 40
+ * characters, valid UTF-8 with no control or format character, and not the
+ * demo's own. The writer refuses an owner's or an admin's. */
+#define DEMO_NAME_MAX 40
+static oc_page_err demo_name_check(char *name) {
+    size_t n = strlen(name), a = 0;
+    while (a < n && isspace((unsigned char)name[a])) a++;
+    while (n > a && isspace((unsigned char)name[n - 1])) n--;
+    memmove(name, name + a, n - a);
+    name[n - a] = '\0';
+    n -= a;
+    if (n == 0) return OC_PERR_NAME_EMPTY;
+    size_t chars = 0;
+    for (utf8proc_ssize_t i = 0; i < (utf8proc_ssize_t)n;) {
+        utf8proc_int32_t cp;
+        utf8proc_ssize_t k = utf8proc_iterate((const utf8proc_uint8_t *)name + i, (utf8proc_ssize_t)n - i, &cp);
+        if (k <= 0) return OC_PERR_NAME_CHARS;
+        utf8proc_category_t cat = utf8proc_category(cp);
+        if (cat == UTF8PROC_CATEGORY_CC || cat == UTF8PROC_CATEGORY_CF || cat == UTF8PROC_CATEGORY_CN ||
+            cat == UTF8PROC_CATEGORY_CS || cat == UTF8PROC_CATEGORY_CO) return OC_PERR_NAME_CHARS;
+        i += k;
+        chars++;
+    }
+    if (chars > DEMO_NAME_MAX) return OC_PERR_NAME_LONG;
+    if (strcasecmp(name, "OpenChime") == 0 || strcasecmp(name, "OpenChime Demo") == 0) return OC_PERR_NAME_RESERVED;
+    return OC_PERR_NONE;
+}
+
+/* The username a demo visitor gets: the name's ASCII letters and digits,
+ * lowercased, up to 20, then "-" and four random base32 characters, so two
+ * visitors of the same name are two people; "guest" when the name has none. */
+static int demo_username(const char *name, char *out, size_t cap) {
+    static const char B32[] = "abcdefghijklmnopqrstuvwxyz234567";
+    char base[21];
+    size_t o = 0;
+    for (const char *p = name; *p && o < 20; p++)
+        if (isalnum((unsigned char)*p) && !((unsigned char)*p & 0x80)) base[o++] = (char)tolower((unsigned char)*p);
+    base[o] = '\0';
+    uint8_t rnd[4];
+    if (oc_rand_bytes(rnd, sizeof rnd) != 0) return -1;
+    int n = snprintf(out, cap, "%s-%c%c%c%c", o ? base : "guest",
+                     B32[rnd[0] & 31], B32[rnd[1] & 31], B32[rnd[2] & 31], B32[rnd[3] & 31]);
+    return n > 0 && (size_t)n < cap ? 0 : -1;
+}
+
+/* What the demo's sign-up page says beside the form: the terms, on the
+ * issuer's site (central, whose invite brought the visitor), and the minutes
+ * to the nightly erase at 00:00 UTC, rounded up. */
+static void demo_page_facts(oc_dbwriter *dbw, char *terms, size_t cap, unsigned *left_min) {
+    const char *origin = oc_dbwriter_relay_origin(dbw);
+    if (origin && origin[0]) snprintf(terms, cap, "%s/demo/terms", origin);
+    else terms[0] = '\0';
+    time_t now = time(NULL);
+    unsigned left_s = (unsigned)(86400 - (unsigned long)(now % 86400));
+    *left_min = (left_s + 59) / 60;
 }
 
 static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw);   /* fwd */
@@ -5009,7 +5116,8 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
               field_get(q, "invite", w->invite, sizeof w->invite) ||
               field_get(q, "password", pass, sizeof pass) ||
               field_get(q, "confirm", confirm, sizeof confirm) ||
-              field_get(q, "current", current, sizeof current);
+              field_get(q, "current", current, sizeof current) ||
+              field_get(q, "name", w->name, sizeof w->name);
     char set[4] = "";
     if (!post && kind == OC_PAGE_SIGNIN && field_get(q, "set", set, sizeof set) == 0 && strcmp(set, "1") == 0)
         w->done = 1;   /* just back from setting a new password */
@@ -5032,16 +5140,22 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     }
     /* A sign-in link carrying an invitation opens the sign-up form. */
     if (!post && kind == OC_PAGE_SIGNIN && w->invite[0]) kind = w->kind = OC_PAGE_SIGNUP;
+    /* A demo's own invite opens its one-field sign-up (AUTH.md §8.12). */
+    if (kind == OC_PAGE_SIGNUP && oc_config_get()->mode == OC_MODE_DEMO && is_compact_jws(w->invite)) {
+        w->demo = 1;
+        demo_page_facts(dbw, w->terms, sizeof w->terms, &w->left_min);
+    }
     const char *wsname = oc_config_get()->workspace_name;
     oc_page pg = { .kind = kind, .redirect_uri = w->redirect_uri, .nonce = w->nonce,
                    .username = w->username, .invite = w->invite, .done = w->done,
-                   .workspace = wsname };
+                   .workspace = wsname, .demo = w->demo, .name = w->name, .terms_url = w->terms,
+                   .demo_left_min = w->left_min };
     if (!post) { web_page(c, 200, &pg); free(w); return -1; }
 
     int rc = -1;
     oc_job *j = NULL;
     char norm[OC_PW_NORM_MAX];
-    if (kind == OC_PAGE_SIGNUP || kind == OC_PAGE_PASSWORD) {
+    if ((kind == OC_PAGE_SIGNUP && !w->demo) || kind == OC_PAGE_PASSWORD) {
         const char *np = pass;
         if (strcmp(np, confirm) != 0) { pg.err = OC_PERR_PW_MISMATCH; goto show; }
         if (!np[0]) { pg.err = OC_PERR_PW_EMPTY; goto show; }
@@ -5068,8 +5182,21 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
             demo = oc_config_get()->mode == OC_MODE_DEMO && is_compact_jws(w->invite);
             if (!demo) { pg.err = OC_PERR_INVITE_INVALID; goto show; }
         }
+        if (w->demo) {
+            /* The visitor gives a name and nothing else: the username is made
+             * from it, and the password is a secret nobody is shown, so the
+             * account is signed into once, here, and never by a password. */
+            oc_page_err ne = demo_name_check(w->name);
+            if (ne != OC_PERR_NONE) { pg.err = ne; goto show; }
+            uint8_t secret[32];
+            if (demo_username(w->name, w->username, sizeof w->username) != 0 ||
+                oc_rand_bytes(secret, sizeof secret) != 0) goto fail;
+            oc_base64url_encode(secret, sizeof secret, pass);
+            oc_e2e_wipe(secret, sizeof secret);
+        }
         j = oc_job_new(OC_JOB_REDEEM, c->conn_id);
         if (!j || oc_job_set_register(j, w->username, pass, 0, 0) != 0 ||
+            (w->demo && oc_job_set_display(j, w->name) != 0) ||
             (demo ? oc_job_set_token(j, w->invite, strlen(w->invite)) : oc_job_set_token(j, raw, sizeof raw)) != 0)
             goto fail;
         j->demo_invite = (uint8_t)demo;
@@ -5558,7 +5685,9 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
         return;
     }
     oc_page pg = { .kind = w->kind, .redirect_uri = w->redirect_uri, .nonce = w->nonce,
-                   .username = w->username, .invite = w->invite, .user_code = w->user_code };
+                   .username = w->username, .invite = w->invite, .user_code = w->user_code,
+                   .workspace = oc_config_get()->workspace_name, .demo = w->demo, .name = w->name,
+                   .terms_url = w->terms, .demo_left_min = w->left_min };
     if (r->type == OC_RES_WEB_STEP2) {
         /* What the password proved, kept against a ticket for the step page --
          * which posts from the page it replaces, at that page's depth. */
@@ -5673,6 +5802,8 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
         switch (r->err_code) {
         case OC_ERR_AUTH_RATE_LIMITED: status = 429; pg.err = OC_PERR_RATE_LIMITED; break;
         case OC_ERR_USER_LIMIT:        pg.err = OC_PERR_WORKSPACE_FULL; break;
+        /* A demo visitor's name that is an owner's or an admin's (AUTH.md §8.12). */
+        case OC_ERR_GROUP_HANDLE_TAKEN: pg.err = w->demo ? OC_PERR_NAME_RESERVED : OC_PERR_SIGNUP_REFUSED; break;
         case OC_ERR_SIGNUP_LIMITED:
             status = 429; pg.err = OC_PERR_SIGNUP_LIMITED; break;
         case OC_ERR_AUTH_SETUP_REQUIRED:
@@ -5957,6 +6088,7 @@ static size_t encode_user_list(const oc_dbres *r) {
         ents[i].full_name = oc_slice_str(r->ulist[i].full_name ? r->ulist[i].full_name : "");
         ents[i].pronouns = oc_slice_str(r->ulist[i].pronouns ? r->ulist[i].pronouns : "");
         ents[i].voice_id = oc_slice_str(r->ulist[i].voice_id ? r->ulist[i].voice_id : "");
+        ents[i].flags = r->ulist[i].flags;
     }
     oc_wbuf w;
     oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
@@ -6024,6 +6156,25 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &wi);
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (!conns[fd]) break;   /* dropped on the WORKSPACE_INFO write */
+
+            /* The workspace's settings, read-only: the configuration rows
+             * marked for clients (CFG_VISIBLE). Set by the control plane or
+             * the operator, so they cannot change while this daemon runs. */
+            {
+                static char keys[OC_WS_SETTINGS_MAX][64], vals[OC_WS_SETTINGS_MAX][1024];
+                oc_workspace_settings ws;
+                memset(&ws, 0, sizeof ws);
+                for (size_t i = 0; i < OC_WS_SETTINGS_MAX &&
+                     oc_config_visible(i, keys[i], sizeof keys[i], vals[i], sizeof vals[i]); i++) {
+                    ws.keys[i] = oc_slice_str(keys[i]);
+                    ws.values[i] = oc_slice_str(vals[i]);
+                    ws.count++;
+                }
+                oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+                oc_encode_workspace_settings(&w, OC_PROTOCOL_VERSION, &ws);
+                send_bytes(ep, conns, fd, g_enc, w.len);
+                if (!conns[fd]) break;
+            }
 
             /* Where the workspace is now, when the deployment says: a client that
              * dialled a former address files its workspace under this one. */
@@ -6247,7 +6398,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         if (!r->duplicate) {
             oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_slice body = { r->body, r->body_len };
-            oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0} };
+            oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored };
             broadcast_set_attach(&b, r->attach, r->n_attach);
             b.author_name = oc_slice_str(r->author_name ? r->author_name : "");
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
@@ -6337,7 +6488,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
     case OC_RES_RESTORE_OK: {
         /* Back for every member: the message whole, replacing its tombstone. */
         oc_slice body = { r->body, r->body_len };
-        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0} };
+        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored };
         broadcast_set_attach(&b, r->attach, r->n_attach);
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         if (oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &b) == OC_OK) {
@@ -6921,7 +7072,8 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                                    .server_time = r->server_time,
                                    .reply_count = r->reply_count,
                                    .participant = 0,
-                                   .body        = body };
+                                   .body        = body,
+                                   .broadcast_stored = r->broadcast_stored };   /* REQ-221 */
             tr.n_attach = fill_attach_entries(tr.attach, r->attach, r->n_attach);
 
             oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
@@ -7011,7 +7163,8 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                                    .server_time = m->server_time,
                                    .reply_count = (uint32_t)r->n_thread,
                                    .participant = (uint8_t)(in_thread != 0),
-                                   .body        = body };
+                                   .body        = body,
+                                   .broadcast_stored = m->broadcast_stored };   /* REQ-221 */
             tr.n_attach = fill_attach_entries(tr.attach, m->attach, m->n_attach);
             oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &tr);
             send_bytes(ep, conns, fd, g_enc, w.len);
@@ -7048,6 +7201,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             ents[i].snippet.ptr = r->search[i].body;
             ents[i].snippet.len = r->search[i].body_len;
             ents[i].action = r->search[i].action;   /* REQ-058 */
+            ents[i].rank = r->search[i].rank;
         }
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_search_results sr = { (uint16_t)n, ents, r->truncated };
@@ -7503,7 +7657,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         /* Fan the posted message out to connected members (like SEND_OK)... */
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice body = { r->body, r->body_len };
-        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0} };
+        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored };
         b.author_name = oc_slice_str(r->author_name ? r->author_name : "");   /* webhook label (REQ-170) */
         oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
         size_t blen = w.len;
@@ -7988,7 +8142,9 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_read_cursor(&w, OC_PROTOCOL_VERSION, &rc);
         size_t len = w.len;
-        fanout_members(ep, conns, r->members, r->n_members, r->user_id, g_enc, len);
+        /* Only when receipts are on and this reader shares (REQ-090); the
+         * others' positions are already filtered to those who share. */
+        if (r->rc_share) fanout_members(ep, conns, r->members, r->n_members, r->user_id, g_enc, len);
         conn *ac = find_by_id(conns, r->conn_id);
         if (ac) {
             for (size_t i = 0; i < r->n_rcur; i++) {
@@ -7997,6 +8153,20 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                 oc_encode_read_cursor(&w, OC_PROTOCOL_VERSION, &rb);
                 send_bytes(ep, conns, ac->fd, g_enc, w.len);
             }
+        }
+        break;
+    }
+    case OC_RES_READ_RECEIPTS: {
+        /* My choice to share read receipts: to the device that asked, or, set,
+         * to every device of mine so each shows it. */
+        oc_read_receipts rr = { r->rc_share };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_encode_read_receipts(&w, OC_PROTOCOL_VERSION, &rr);
+        if (r->rc_asked) {
+            conn *ac = find_by_id(conns, r->conn_id);
+            if (ac) send_bytes(ep, conns, ac->fd, g_enc, w.len);
+        } else {
+            send_to_user(ep, conns, r->user_id, 0, g_enc, w.len);
         }
         break;
     }
@@ -8143,11 +8313,25 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice body = { r->body, r->body_len };
         oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, OC_MSG_KIND_CALL,
-                           body, 0, {{0}}, {0} };
+                           body, 0, {{0}}, {0}, 0 };
         oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
         size_t blen = w.len;
         fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
         fanout_actions(ep, conns, r);   /* "not an action", as every live message is answered (ARCH-115) */
+        break;
+    }
+    case OC_RES_NOTICE: {
+        /* The workspace's notice, to the conversation's connected members as
+         * any message is. It notifies nobody and counts as unread for nobody:
+         * the clients know its sender (USER_LIST `flags`). */
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_slice body = { r->body, r->body_len };
+        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, OC_MSG_KIND_MESSAGE,
+                           body, 0, {{0}}, {0}, r->broadcast_stored };
+        oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
+        size_t blen = w.len;
+        fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
+        fanout_actions(ep, conns, r);
         break;
     }
     case OC_RES_UNFURL_STORED: {
@@ -8191,7 +8375,7 @@ static size_t backfill_next(conn *c) {
             if (i >= r->n_replay) { c->bf_phase = BF_PIN; c->bf_i = 0; continue; }
             oc_replay_msg *m = &r->replay[i];
             oc_slice body = { m->body, m->body_len };
-            oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, m->kind, body, 0, {{0}}, {0} };
+            oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, m->kind, body, 0, {{0}}, {0}, m->broadcast_stored };
             broadcast_set_attach(&b, m->attach, m->n_attach);
             b.author_name = oc_slice_str(m->author_name ? m->author_name : "");
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
@@ -9104,8 +9288,13 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     if (!indexed) NETLOOP_FAIL("allocating the connection indexes");
     /* The I/O threads (ARCH-22): every accepted socket is theirs from here. */
     sites_init();
-    /* A demo workspace counts its day (demolimits.h). */
-    if (oc_config_get()->mode == OC_MODE_DEMO && !g_demo_limits) g_demo_limits = oc_dl_new();
+    /* A demo workspace counts its day (demolimits.h). The loop that makes the
+     * counts frees them when it stops; no other loop touches them. */
+    int own_demo_limits = 0;
+    if (oc_config_get()->mode == OC_MODE_DEMO && !g_demo_limits) {
+        g_demo_limits = oc_dl_new();
+        own_demo_limits = 1;
+    }
     g_io = indexed ? oc_ioloop_start(OC_IO_THREADS, tls, trusted, &g_tls_site, &g_health_site) : NULL;
     int iofd = -1;
     if (indexed && !g_io) { NETLOOP_FAIL("starting the I/O threads"); indexed = 0; }
@@ -9307,6 +9496,10 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     if (hfd >= 0) close(hfd);
     loop_state_free(conns);
     free(g_live); g_live = NULL; g_nlive = 0;
+    /* The day's demo counts are this loop's: a loop started after it, in
+     * another mode, counts nothing (demolimits.h). Only the loop that made
+     * them clears them, so a loop that never did writes nothing here. */
+    if (own_demo_limits) { oc_dl_free(g_demo_limits); g_demo_limits = NULL; }
     oc_ioloop_stop(g_io);   /* after the closes above: it closes their sockets */
     g_io = NULL;
     oc_idmap_free(&g_by_id);

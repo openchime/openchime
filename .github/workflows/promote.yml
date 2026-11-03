@@ -74,7 +74,7 @@ jobs:
       # which refuses the promotion; each commit's subject is held to the
       # commit policy, which only warns, as in the staging build; and the tree
       # main would have is scanned for issue references by its own
-      # scripts/check/refs.sh, the one main will carry: staging's may be
+      # scripts/test/local/refs.sh, the one main will carry: staging's may be
       # stricter, and the files that would fail it reach main only with the
       # next release. The documentation promoted met staging's in pr-policy.
       - name: Check what main takes
@@ -96,7 +96,11 @@ jobs:
           tree="$RUNNER_TEMP/next-main"
           mkdir -p "$tree"
           git archive "$TO" | tar -x -C "$tree"
-          (cd "$tree" && sh ./scripts/check/refs.sh)
+          # A main from before the source checks moved to scripts/test/local/
+          # has its copy under scripts/check/.
+          refs=./scripts/test/local/refs.sh
+          [ -f "$tree/$refs" ] || refs=./scripts/check/refs.sh
+          (cd "$tree" && sh "$refs")
 
       # A plain push: a fast-forward of the main the snapshot was built on, so
       # one that moved since refuses it.

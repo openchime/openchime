@@ -54,6 +54,14 @@ void  oc_plat_ring_unmap(void *p, size_t size);
 /* Deliver `payload` of `kind` ("url", "action") to the instance of this
  * application already running. 1 when one took it: this process should exit. */
 int   oc_plat_handoff(const char *kind, const char *payload);
+/* Navigation history (back and forward). A platform with a history of its own
+ * -- the browser's -- is told of each place the application records, by its
+ * sequence number (`replace`: the first, which takes the page's own entry
+ * rather than adding one), and moves through it when asked; it then hands the
+ * place it arrived at back as a "nav" handoff carrying the number. 0 from both
+ * where the application keeps the history alone (a desktop). */
+int   oc_plat_nav_push(uint32_t seq, int replace);
+int   oc_plat_nav_go(int delta);
 /* A browser sign-in's start and its result (AUTH.md §8.10, WEB.md). The
  * application sends the person to `url` to sign in: a desktop opens the
  * default browser and keeps running; a page IS the browser and goes there

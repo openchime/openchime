@@ -1,0 +1,7 @@
+POST /signin HTTP/1.1
+Host: acme.example
+Origin: https://acme.example
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 19
+
+user=ada&pass=x%20y

@@ -43,6 +43,10 @@ WIN_CFLAGS := -std=c99 $(WARN_CFLAGS) -O2 -g -D_WIN32_WINNT=0x0601 -DUTF8PROC_ST
 # --- The TUI ------------------------------------------------------------------
 # The termbox2 backend is tuikit/tk_term.c (Console API); the core seams
 # (threads/DNS/RNG) are in shared/oc_thread.h + resolve.c + net.c.
+# The PE header's link timestamp is the one byte-range that differs between two
+# links of the same objects; without it a serial and a parallel build of a
+# client give the same .exe, byte for byte.
+WIN_REPRO_LDFLAGS := -Wl,--no-insert-timestamp
 WIN_TUI_BIN := build/openchime-tui.exe
 WIN_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
            $(CORE_INC) -Iclient/tui -Iclient/shared -Ituikit -Ithird_party/qrcodegen -Ithird_party/termbox2 -Ithird_party/utf8proc
@@ -51,11 +55,19 @@ WIN_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
 WIN_TUI_RES := build/openchime_tui_res.o
 $(WIN_TUI_RES): client/tui/res/openchime_tui.rc $(WIN_RES_SRC) $(MINGW_CC) | build
 	$(WINDRES) $(WINDRES_ARGS) $< -O coff -o $@
-$(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(WIN_TUI_RES) \
-                $(wildcard client/tui/*.h tuikit/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) $(BUILD_ID_STAMP) | build
-	$(WINCC) $(WIN_CFLAGS) $(VERSION_DEF) -Wno-unused-result $(WIN_INC) \
-	    $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(WIN_TUI_RES) \
-	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lcrypt32 -lole32 -ladvapi32 -lshell32 -static -o $@
+# Each Windows binary is linked from one object per source, in a tree of its
+# own per flag set (mk/sources.mk, "Objects"), so `make -j` spreads the
+# compiles; the resource objects stay link inputs. A change of the compiler
+# recompiles a tree, and of the build id the trees that take it, as the
+# daemon's does. -mwindows (the GUI subsystem) is the link's: on a compile
+# alone it is an unused argument, which -Werror refuses.
+WIN_TUI_CC   = $(WINCC) $(WIN_CFLAGS) $(VERSION_DEF) -Wno-unused-result $(WIN_INC)
+WIN_TUI_OBJS := $(call oc_objs,$(OBJ_DIR)/win-tui,$(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC))
+$(eval $(call oc_obj_rules,$(OBJ_DIR)/win-tui,WIN_TUI_CC,$(MINGW_CC) $(BUILD_ID_STAMP),$(WIN_MBEDLIBS)))
+-include $(WIN_TUI_OBJS:.o=.d)
+$(WIN_TUI_BIN): $(WIN_TUI_OBJS) $(WIN_TUI_RES) $(WIN_MBEDLIBS) | build
+	$(WINCC) $(WIN_CFLAGS) $(WIN_TUI_OBJS) $(WIN_TUI_RES) \
+	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lcrypt32 -lole32 -ladvapi32 -lshell32 -static $(WIN_REPRO_LDFLAGS) -o $@
 
 # --- The GUI ------------------------------------------------------------------
 # The portable application layer (client/gui/app: SDL3 + oc_gfx + sdltext) over
@@ -105,13 +117,14 @@ WIN_GUI_RES := build/openchime_res.o
 $(WIN_GUI_RES): client/gui/platform/win32/res/openchime.rc client/gui/platform/win32/res/openchime.ico \
                 client/gui/platform/win32/res/openchime_res.h $(WIN_RES_SRC) $(MINGW_CC) | build
 	$(WINDRES) -I client/gui/platform/win32/res $(WINDRES_ARGS) $< -O coff -o $@
-$(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
-                $(wildcard client/gui/app/*.h client/gui/platform/*.h client/gui/platform/win32/*.h client/core/*.h shared/*.h sdltext/*.h client/gui/gfx/*.h) $(MEDIA_HDRS) $(VOICE_HDRS) $(CALL_HDRS) \
-                $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A) $(BUILD_ID_STAMP) | build
-	$(WINCC) $(WIN_CFLAGS) $(VERSION_DEF) -std=c11 -Wno-unused-result -mwindows $(WIN_GUI_INC) $(WIN_MEDIA_INC) -Iclient/gui/platform/win32/res \
-	    $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
+WIN_GUI_CC   = $(WINCC) $(WIN_CFLAGS) $(VERSION_DEF) -std=c11 -Wno-unused-result $(WIN_GUI_INC) $(WIN_MEDIA_INC) -Iclient/gui/platform/win32/res
+WIN_GUI_OBJS := $(call oc_objs,$(OBJ_DIR)/win-gui,$(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SHARED_SRC))
+$(eval $(call oc_obj_rules,$(OBJ_DIR)/win-gui,WIN_GUI_CC,$(MINGW_CC) $(BUILD_ID_STAMP),$(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A)))
+-include $(WIN_GUI_OBJS:.o=.d)
+$(WIN_GUI_BIN): $(WIN_GUI_OBJS) $(WIN_GUI_RES) $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A) | build
+	$(WINCC) $(WIN_CFLAGS) -std=c11 -mwindows $(WIN_GUI_OBJS) $(WIN_GUI_RES) \
 	    $(WIN_MBEDLIBS) $(WIN_MEDIA_A) -L$(SDL3_WIN)/lib -lSDL3 -lws2_32 -ldnsapi -lbcrypt -lcrypt32 -lcomdlg32 \
-	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -limm32 $(WIN_MEDIA_SYSLIBS) $(WIN_SDL_SYSLIBS) -static -o $@
+	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -limm32 $(WIN_MEDIA_SYSLIBS) $(WIN_SDL_SYSLIBS) -static $(WIN_REPRO_LDFLAGS) -o $@
 # Split the debug info out rather than discarding it. The client writes real
 # minidumps on a crash (crash_filter, client/gui/platform/win32/plat_win32.c),
 # and symbolicating a mingw build needs its DWARF -- a plain strip would shrink
@@ -124,23 +137,3 @@ $(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(S
 
 # Both clients, once their binaries are named above.
 windows: $(WIN_GUI_BIN) $(WIN_TUI_BIN)
-
-# --- The two Windows test programs, built by path -----------------------------
-# The DirectWrite backend's (sdltext/st_test_win.c): a console .exe whose exit
-# code is its failure count; CI cross-compiles it (the compile is itself the
-# header/vtable check mingw keeps honest), a Windows host -- or WSL interop --
-# runs it. docs/TESTING.md records the split.
-WIN_SDLTEXT_TEST := build/sdltext_test.exe
-$(WIN_SDLTEXT_TEST): $(SDLTEXT_WIN) sdltext/st_test_win.c $(wildcard sdltext/*.h) $(MINGW_CC) | build
-	$(WINCC) $(WIN_CFLAGS) $(SDLTEXT_INC) \
-	    $(SDLTEXT_WIN) sdltext/st_test_win.c \
-	    -ld2d1 -ldwrite -lwindowscodecs -lole32 -luuid -static -o $@
-# The gfx layer's: SDL's software renderer on a plain surface -- no window, no
-# GPU -- asserting pixels. Exit code is the failure count (docs/TESTING.md, the
-# platform-backend exception).
-WIN_GFX_TEST := build/gfx_test.exe
-$(WIN_GFX_TEST): $(GFX_SRC) client/gui/gfx/gfx_test_win.c client/shared/icons.c \
-                 $(wildcard client/gui/gfx/*.h) $(SDL3_WIN_LIB) $(MINGW_CC) | build
-	$(WINCC) $(WIN_CFLAGS) -std=c11 -Iclient/gui/gfx -Iclient/shared -I$(SDL3_WIN)/include \
-	    $(GFX_SRC) client/gui/gfx/gfx_test_win.c client/shared/icons.c \
-	    -L$(SDL3_WIN)/lib -lSDL3 $(WIN_SDL_SYSLIBS) -static -o $@

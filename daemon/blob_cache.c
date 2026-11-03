@@ -156,11 +156,13 @@ static void *cache_put_begin(void *store, const char *key, uint64_t size_hint) {
     uint64_t floor = c->pol.floor_bytes;
     pthread_mutex_unlock(&c->mu);
     /* Staging it here needs the room to; without, it goes to the store as the
-     * S3 backend alone would send it, and the client waits for that. */
+     * S3 backend alone would send it, and the client waits for that -- on a
+     * new connection: the body streams from the client and is not kept here,
+     * so a kept connection gone stale under it could not be retried. */
     uint64_t avail = avail_bytes(c);
     if (avail != UINT64_MAX && avail < floor + size_hint) {
         w->be = &oc_blob_backend_s3;
-        w->h = w->be->put_begin(c->s3, key, size_hint);
+        w->h = oc_blob_s3_put_begin_fresh(c->s3, key, size_hint);
     } else {
         w->be = &oc_blob_backend_fs;
         w->h = w->be->put_begin(c->fs, key, size_hint);
@@ -363,9 +365,20 @@ static size_t queue_list(cache *c, qent **out) {
     return n;
 }
 
+static int upload_once(cache *c, const char *key);
+
 /* 1 sent, 0 nothing to send (the blob is gone), 2 not yet published (try on
- * the next pass), -1 failed. */
+ * the next pass), -1 failed. A kept connection that went stale before the
+ * store answered (EAGAIN from the backend) is not the store failing: the blob
+ * is sent once more, at once, on a new connection, and only that attempt's
+ * failure counts. */
 static int upload(cache *c, const char *key) {
+    int rc = upload_once(c, key);
+    if (rc == -1 && errno == EAGAIN && !stopping(c)) rc = upload_once(c, key);
+    return rc;
+}
+
+static int upload_once(cache *c, const char *key) {
     char path[1400], staged[1400];
     if (path_of(path, sizeof path, c->base, key, "") != 0 ||
         path_of(staged, sizeof staged, c->base, key, ".tmp") != 0) return 0;
@@ -390,9 +403,14 @@ static int upload(cache *c, const char *key) {
         if (stopping(c)) { ok = 0; break; }   /* shutting down: it stays queued */
         ok = oc_blob_backend_s3.put_chunk(w, buf, n) == 0;
     }
+    int e = errno;
     ok = ok && !ferror(fp);
     fclose(fp);
-    if (!ok) { oc_blob_backend_s3.put_abort(w); return -1; }
+    if (!ok) {
+        oc_blob_backend_s3.put_abort(w);
+        errno = e;
+        return -1;
+    }
     return oc_blob_backend_s3.put_commit(w) == 0 ? 1 : -1;
 }
 

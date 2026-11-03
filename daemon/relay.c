@@ -44,6 +44,7 @@ struct oc_relay {
     int            fd;
     int            family;           /* the socket's, which decides the control messages */
     uint64_t       silence_ms;
+    uint64_t     (*now_ms)(void);    /* the clock silence is measured on; a test sets its own */
     oc_relay_hooks hooks;
     void          *ctx;
     size_t         token_len;        /* every token one daemon issues has the one length */
@@ -117,6 +118,7 @@ oc_relay *oc_relay_open(int udp_fd, const oc_relay_hooks *hooks, void *ctx) {
     }
     r->fd = udp_fd;
     r->silence_ms = OC_AUDIO_SILENCE_MS;
+    r->now_ms = mono_ms;
     if (hooks) r->hooks = *hooks;
     r->ctx = ctx;
     int fl = fcntl(udp_fd, F_GETFL, 0);
@@ -150,6 +152,10 @@ void oc_relay_set_silence_ms(oc_relay *r, uint64_t ms) {
     if (r) r->silence_ms = ms ? ms : OC_AUDIO_SILENCE_MS;
 }
 
+void oc_relay_set_clock(oc_relay *r, uint64_t (*now_ms)(void)) {
+    if (r) r->now_ms = now_ms ? now_ms : mono_ms;
+}
+
 size_t oc_relay_count(const oc_relay *r) { return r ? r->n : 0; }
 
 int oc_relay_authorize(oc_relay *r, uint64_t call_id, uint64_t user_id, uint64_t conn_id,
@@ -178,7 +184,7 @@ int oc_relay_authorize(oc_relay *r, uint64_t call_id, uint64_t user_id, uint64_t
     p->call_id = call_id;
     p->user_id = user_id;
     p->conn_id = conn_id;
-    p->last_seen_ms = mono_ms();
+    p->last_seen_ms = r->now_ms();
     if (call_link(r, p) != 0) { drop(r, p); return -1; }
     if (conn_id) oc_idmap_put(&r->by_conn, conn_id, p);   /* one call per connection */
     return 0;
@@ -277,7 +283,7 @@ int oc_relay_from_tcp(oc_relay *r, uint64_t conn_id, uint16_t seq, const uint8_t
     participant *me = r && conn_id ? oc_idmap_get(&r->by_conn, conn_id) : NULL;
     if (!me) return -1;
     me->tcp = 1;
-    me->last_seen_ms = mono_ms();
+    me->last_seen_ms = r->now_ms();
     forward(r, me, seq, ct, len);
     return 0;
 }
@@ -329,7 +335,7 @@ static int relay_one(oc_relay *r) {
     } else if (!same_peer(me, &src, sl)) {
         return 1;
     }
-    me->last_seen_ms = mono_ms();
+    me->last_seen_ms = r->now_ms();
 
     me->tcp = 0;
     const uint8_t *seq = pkt + me->token_len;
@@ -348,7 +354,7 @@ uint64_t oc_relay_received(const oc_relay *r) { return r ? r->received : 0; }
 
 void oc_relay_sweep(oc_relay *r) {
     if (!r || !r->n) return;
-    uint64_t now = mono_ms();
+    uint64_t now = r->now_ms();
     struct { uint8_t t[OC_AUDIO_TOKEN_MAX]; size_t len; } *gone = NULL;
     size_t ng = 0;
     for (int i = 0; i < OC_RELAY_MAX_PARTS; i++) {

@@ -32,6 +32,9 @@ enum {
                            * name is not "unknown" in a shared environment, and
                            * documented; never stored */
     CFG_PATTERN    = 8,   /* `name` carries %d; instances 1..`count` */
+    CFG_VISIBLE    = 16,  /* a workspace setting the clients are told, read-only,
+                           * on WORKSPACE_SETTINGS: its key is the name without
+                           * OPENCHIME_, lower-cased; never with CFG_SECRET */
 };
 
 typedef struct cfg_row cfg_row;

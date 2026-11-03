@@ -136,6 +136,12 @@ static const struct { const char *code, *text; } PERR[OC_PERR_COUNT] = {
     [OC_PERR_DEVICE_EXPIRED]  = { "device-expired", "That code has expired. Start again in your terminal." },
     [OC_PERR_RESET_SPENT]     = { "reset-spent", "This reset isn't good any more: it was used, or a day has "
                                                  "passed. Ask for another." },
+    [OC_PERR_NAME_EMPTY]      = { "name-empty", "Say what to call you." },
+    [OC_PERR_NAME_LONG]       = { "name-long", "That name is too long: 40 characters at most." },
+    [OC_PERR_NAME_CHARS]      = { "name-chars", "That name has characters that can't be shown. Use letters, "
+                                                "numbers, spaces and punctuation." },
+    [OC_PERR_NAME_RESERVED]   = { "name-reserved", "That name belongs to the people who run this demo. Choose "
+                                                   "another." },
     [OC_PERR_INTERNAL]        = { "internal", "Something went wrong. Try again." },
 };
 
@@ -219,6 +225,14 @@ static void message(pg *p, oc_page_err e) {
     if (e <= OC_PERR_NONE || e >= OC_PERR_COUNT) return;
     raw(p, "<p class=\"msg\" role=\"alert\" data-oc-error=\""); raw(p, oc_page_err_code(e)); raw(p, "\">");
     esc(p, oc_page_err_text(e)); raw(p, "</p>\n");
+}
+
+/* A demo's sign-up says a full workspace in its own words: it is full for the
+ * day, and the nightly erase opens it again. */
+static void demo_message(pg *p, oc_page_err e) {
+    if (e != OC_PERR_WORKSPACE_FULL) { message(p, e); return; }
+    raw(p, "<p class=\"msg\" role=\"alert\" data-oc-error=\""); raw(p, oc_page_err_code(e)); raw(p, "\">");
+    raw(p, "The demo is full for today. It opens again at 00:00 UTC, when it is erased and starts afresh.</p>\n");
 }
 
 static void hidden(pg *p, const char *name, const char *value) {
@@ -349,7 +363,7 @@ const char *oc_showpw_js_integrity(void) {
 }
 
 int oc_page_has_password(const oc_page *pp) {
-    return pp->kind == OC_PAGE_SIGNIN || pp->kind == OC_PAGE_SIGNUP ||
+    return pp->kind == OC_PAGE_SIGNIN || (pp->kind == OC_PAGE_SIGNUP && !pp->demo) ||
            ((pp->kind == OC_PAGE_PASSWORD || pp->kind == OC_PAGE_RESET) && !pp->done);
 }
 
@@ -405,6 +419,39 @@ static void passkey_script(pg *p) {
     raw(p, "<script src=\"/webauthn.js\" integrity=\""); raw(p, oc_webauthn_js_integrity()); raw(p, "\"></script>\n");
 }
 
+/* A demo workspace's sign-up (AUTH.md §8.12): the visitor's name and one
+ * button, and under it what the demo is -- public, erased every night, no
+ * personal information -- and that entering agrees to its terms. The client is
+ * prefetched while the name is typed, so it is there when the account is. */
+static void demo_signup(pg *p, const oc_page *pp) {
+    open_page(p, "Join the public demo \xC2\xB7 OpenChime", pp);
+    raw(p, "<h1>Join ");
+    if (pp->workspace && pp->workspace[0]) esc(p, pp->workspace); else raw(p, "the OpenChime demo");
+    raw(p, "</h1>\n<p>The public demo of OpenChime: try it in your browser, with nothing to install.</p>\n");
+    demo_message(p, pp->err);
+    raw(p, "<form method=\"post\" action=\"signup\">\n");
+    hidden(p, "redirect_uri", pp->redirect_uri);
+    hidden(p, "nonce", pp->nonce);
+    hidden(p, "invite", pp->invite ? pp->invite : "");
+    raw(p, "<label for=\"name\">Your name</label>\n");
+    raw(p, "<input id=\"name\" name=\"name\" type=\"text\" autocomplete=\"nickname\" maxlength=\"40\" required autofocus");
+    if (pp->name && pp->name[0]) { raw(p, " value=\""); esc(p, pp->name); raw(p, "\""); }
+    raw(p, ">\n<button type=\"submit\">Enter the demo</button>\n</form>\n");
+    char left[64];
+    unsigned h = pp->demo_left_min / 60, m = pp->demo_left_min % 60;
+    if (h) snprintf(left, sizeof left, "in %u h %u min", h, m);
+    else   snprintf(left, sizeof left, "in %u min", m);
+    raw(p, "<p class=\"alt\" data-oc-demo-terms>Public: everyone here sees what you post. Erased every night at "
+           "00:00 UTC (");
+    raw(p, left);
+    raw(p, "). Don't post personal information. By entering, you agree to the ");
+    if (pp->terms_url && pp->terms_url[0]) {
+        raw(p, "<a href=\""); esc(p, pp->terms_url); raw(p, "\" target=\"_blank\" rel=\"noopener\">demo terms</a>");
+    } else raw(p, "demo terms");
+    raw(p, ".</p>\n");
+    raw(p, "<link rel=\"prefetch\" href=\"/app/openchime.wasm\">\n");
+}
+
 char *oc_page_render(const oc_page *pp, size_t *len) {
     pg p = { 0 };
     const char *user = pp->username ? pp->username : "";
@@ -430,6 +477,7 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
                 "<a href=\"account/security\">Two-step sign-in</a></p>\n");
         break;
     case OC_PAGE_SIGNUP:
+        if (pp->demo) { demo_signup(&p, pp); break; }
         open_page(&p, "Create an account \xC2\xB7 OpenChime", pp);
         raw(&p, "<h1>Create an account</h1>\n<p>");
         if (pp->workspace && pp->workspace[0]) { raw(&p, "to join "); esc(&p, pp->workspace); }
@@ -652,7 +700,7 @@ int oc_page_headers(const char *redirect_uri, char *out, size_t cap) {
     return oc_page_headers_ex(redirect_uri, 0, out, cap);
 }
 
-int oc_page_headers_ex(const char *redirect_uri, int scripts, char *out, size_t cap) {
+int oc_page_headers_ex(const char *redirect_uri, int opts, char *out, size_t cap) {
     /* The callback's origin: scheme://host:port of a loopback redirect, which the
      * caller has checked. IPv6 loopback cannot be written in a policy's host
      * grammar, so there the policy does not name form targets at all -- the
@@ -668,13 +716,16 @@ int oc_page_headers_ex(const char *redirect_uri, int scripts, char *out, size_t 
         if ((size_t)(e - redirect_uri) < sizeof cb) snprintf(cb, sizeof cb, "%.*s", (int)(e - redirect_uri), redirect_uri);
     }
     int v6 = redirect_uri && strncmp(redirect_uri, "http://[::1]", 12) == 0;
+    int scripts = (opts & OC_PAGE_HDR_SCRIPTS) != 0, prefetch = (opts & OC_PAGE_HDR_PREFETCH) != 0;
     int n = snprintf(out, cap,
-        "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; %s"
+        "Content-Security-Policy: default-src %s; style-src 'unsafe-inline'; %s%s"
         "frame-ancestors 'none'; base-uri 'none'%s%s%s\r\n"
         "X-Frame-Options: DENY\r\n"
         "X-Content-Type-Options: nosniff\r\n"
         "Cache-Control: no-store\r\n"
         "Referrer-Policy: same-origin\r\n",
-        scripts ? "script-src 'self'; " : "", v6 ? "" : "; form-action 'self'", cb[0] ? " " : "", cb);
+        prefetch ? "'self'" : "'none'",
+        scripts ? "script-src 'self'; " : prefetch ? "script-src 'none'; " : "",
+        prefetch ? "object-src 'none'; " : "", v6 ? "" : "; form-action 'self'", cb[0] ? " " : "", cb);
     return n < 0 || (size_t)n >= cap ? -1 : 0;
 }

@@ -257,6 +257,23 @@ static void test_collect(void) {
     CHECK(!saw_carol && !saw_alice);   /* muted / author never notified */
     sqlite3_close(rdb);
 
+    /* The workspace's default quiet hours (REQ-136): dave set none of his own,
+     * so at 10:30 under "everyday 11:00-23:00" he is quiet; bob's own schedule
+     * still decides for bob. */
+    {
+        char err[256];
+        setenv("OPENCHIME_DEFAULT_QUIET_HOURS", "everyday 11:00-23:00", 1);
+        CHECK(oc_config_load(err, sizeof err) == 0);
+        CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+        n = oc_push_collect(rdb, 1, alice, 0, 0, 630, (uint64_t)630 * 60000ull, t, 8);
+        CHECK(n == 0);                                   /* dave by the default, bob by his own */
+        n = oc_push_collect(rdb, 1, alice, 0, 0, 700, (uint64_t)700 * 60000ull, t, 8);
+        CHECK(n == 2);                                   /* 11:40: both allowed */
+        sqlite3_close(rdb);
+        unsetenv("OPENCHIME_DEFAULT_QUIET_HOURS");
+        CHECK(oc_config_load(err, sizeof err) == 0);
+    }
+
     /* --- the MENTIONS level (REQ-221) — the deferred half of ARCH-72 ---------
      * Level MENTIONS must deliver only when the message actually names the
      * recipient. Before REQ-221 there was no way to answer that, so the level
@@ -426,6 +443,15 @@ static void test_collect(void) {
      * his quiet hours and would be pushed — a pause has to reach him anyway,
      * which is the whole reason the two mechanisms both exist. */
     {
+        /* The pause alone decides here: bob's quiet hours (10:00-11:00 above)
+         * go, or a run whose real clock puts the pause's end inside them
+         * would find him quiet for the other reason. */
+        {
+            oc_job *oj = oc_job_new(OC_JOB_SET_SCHEDULE, 0);
+            oj->user_id = bob; oj->sched_mode = OC_DND_OFF;
+            oc_dbwriter_submit(w, oj);
+            oc_dbres_free(wait_result(w));
+        }
         oc_job *sj = oc_job_new(OC_JOB_SET_SNOOZE, 0);
         sj->user_id = bob; sj->snooze_minutes = 60;
         oc_dbwriter_submit(w, sj);
@@ -523,6 +549,8 @@ static void test_collect(void) {
         /* NONE means none: a mention does not pierce it. Only a person does. */
         CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_NONE, 1, 1, 0, 0, 0) == 0);
         CHECK(oc_notify_decide(0, 0, 1, OC_NOTIFY_NONE, 0, 0, 0, 0, 0) == 1);
+        /* Nor is the workspace's notice: its callers pass it as `own`. */
+        CHECK(oc_notify_decide(1, 0, 1, OC_NOTIFY_ALL, 1, 0, 0, 0, 0) == 0);
         /* Your own message is not news, whoever you are to yourself. */
         CHECK(oc_notify_decide(1, 0, 1, OC_NOTIFY_ALL, 1, 1, 0, 0, 0) == 0);
         /* Mute is absolute (REQ-137): not even a priority person pierces it. */

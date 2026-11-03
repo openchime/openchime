@@ -57,7 +57,7 @@
 #include "table.h"      /* a table as a grid: the composer's cards and the table editor (MARKDOWN.md §1a) */
 #include "searchq.h"    /* the same query parser the core sends to the daemon */
 #include "resolve.h"
-#include "store.h"            /* peek a stored session token (skip the login box) */
+#include "store.h"            /* peek a stored session token (skip the sign-in box) */
 #include "oc_port.h"          /* oc_mkdir, oc_localtime_r */
 #include "protocol.h"         /* OC_CHANNEL_KIND_DM, OC_PRESENCE_* */
 #include "build_id.h"         /* OC_BUILD_ID: About OpenChime */
@@ -742,7 +742,7 @@ static void      (*g_form_on_action)(int field);
  * outside the clip — and what survives is asymmetric: the LEFT edge disappears
  * entirely while the right keeps a sliver, so every field rendered as a
  * rounded rectangle missing one side. One DIP clears the 0.75 half-width of the
- * 1.5 stroke. `make build/gfx_test.exe` measures both the trap and this rule. */
+ * 1.5 stroke. */
 #define FORM_BOX_INSET 1.0f
 static rectf g_form_sel_box[FORM_MAX_FIELDS];
 static int   g_form_sel_field = -1;      /* which field's list is open, -1 none */
@@ -1246,6 +1246,7 @@ static oc_msgrow g_msgrows[600];
  * is precisely what the tree must not contain. */
 static rectf g_msglist_reg;
 static int   g_msglist_drawn;
+static uint64_t g_msglist_cid;   /* the conversation those rows are from */
 static int g_n_msgrows;
 /* The same, for the thread pane — replies were read-only because the
  * pane recorded no hit-boxes at all. Its own scroll offset, so opening a thread
@@ -1860,6 +1861,9 @@ static int g_n_searchrows;
  * usually still in flight when the click lands — `g_jump_deadline` is what turns
  * "not loaded yet" into an honest failure instead of a silent no-op. */
 static uint64_t  g_jump_mid;            /* message to scroll to, 0 = none */
+/* The jump is going BACK to a place (navigation history): the message goes to
+ * the top of the pane, where it was, and nothing flashes -- it is not news. */
+static int       g_jump_quiet;
 /* Forwarding (REQ-057): the message chosen in the kebab, waiting for a
  * destination. The palette picks the destination — it already lists every
  * conversation, so a forward needs no new picker. */
@@ -1878,6 +1882,10 @@ static uint64_t g_flash_until;
 /* Webhook-overlay row hit-boxes (row -> webhook id, for delete). */
 /* Per-row action buttons: enable/disable, rotate, delete. */
 static rectf g_srch_more_btn;   /* next page of search results */
+/* The order search results come in (OC_SEARCH_*), chosen in the search pane and
+ * kept for the next search; the three choices' hit-boxes, as drawn. */
+static uint8_t g_search_sort;
+static rectf g_srch_sort_btn[3];
 static int g_await_webhook;     /* show the minted webhook token once it arrives */
 static int g_await_reset;       /* a reset asked for: show it once (AUTH.md §2) */
 static int      g_sessions_open;   /* REQ-182 */
@@ -1892,9 +1900,37 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
        CONF_CHANNEL_ARCHIVE, CONF_WS_FORGET,
        CONF_CHANNEL_PRIVATE, CONF_CHANNEL_PUBLIC, CONF_MENTION_ADD, CONF_DRAFT_DELETE,
        CONF_GROUP_DELETE, CONF_CHANNEL_GROUP_REMOVE, CONF_LINK_OPEN, CONF_CERT_TRUST,
-       CONF_PDM_TRUST, CONF_PDM_SAFETY };
+       CONF_PDM_TRUST, CONF_PDM_SAFETY,
+       /* New ones go last: the dump's `confirm act=` is this number, and the
+        * GUI harness reads it (CONF_CERT_TRUST is act=13 to scripts/gui). */
+       CONF_WS_FORGET_ALL, CONF_BROADCAST };
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
+static int      g_bc_confirmed;     /* CONF_BROADCAST: the send it confirmed is under way */
+/* A send the broadcast check holds (REQ-221, bc_gate), by the path it came
+ * from: the composer, its Send later, the New message pane into a conversation
+ * that exists, the pane's text once the DM or group DM it asked for does
+ * (BCS_OPENED, no longer in any box), a poll's question, a reply from a
+ * notification, a video message's caption (the composer's text). Each path's text waits on its conversation's member list in
+ * its own slot (bc_tick sends it once the list is in), and one waits on the
+ * confirmation. `text` is heap; `at` a schedule's time, 0 for a send; `ws`
+ * the workspace it was written in. */
+enum { BCS_COMPOSER, BCS_LATER, BCS_NEWMSG, BCS_OPENED, BCS_POLL, BCS_TOAST, BCS_VIDEO, BCS_N };
+typedef struct { uint64_t cid, at; char *text; int ws; } bc_held;
+static bc_held  g_bc_wait[BCS_N];
+static bc_held  g_bc_conf;
+static int      g_bc_conf_path;
+static void bc_held_clear(bc_held *h) { free(h->text); memset(h, 0, sizeof *h); }
+/* The sends whose text is in a box: another conversation puts other text
+ * there, and a send waiting on the one left is dropped with it. */
+static void bc_drop_box(void) {
+    bc_held_clear(&g_bc_wait[BCS_COMPOSER]);
+    bc_held_clear(&g_bc_wait[BCS_LATER]);
+    bc_held_clear(&g_bc_wait[BCS_NEWMSG]);
+}
+static void composer_send(void);    /* fwd */
+static void bc_opened_back(const bc_held *h);   /* fwd */
+static void pc_say(const char *note);           /* fwd */
 
 static char     g_confirm_title[80];
 
@@ -1920,6 +1956,7 @@ static struct {
 /* Copy fingerprint, and View certificate: the question's two footer actions. */
 enum { CERT_CMD_COPY = 2700, CERT_CMD_VIEW = 2701 };
 enum { ABOUT_CMD_COPY = 2702 };
+enum { WSM_CMD_REMOVE_ALL = 2703 };   /* the Workspaces footer's Remove all */
 static float cert_q_body(gfx *rt, rectf body);   /* fwd */
 
 static char     g_confirm_body[640];
@@ -1999,6 +2036,17 @@ static rectf g_wsmgr_list;
 static int g_wsmgr_focus = -1, g_wsmgr_reveal;
 enum { WSM_GO = 0, WSM_SIGNOUT, WSM_FORGET };
 
+/* MB_DANGER is pushed to the far LEFT, away from a form's Save — a destructive
+ * button beside the commit is a misclick waiting to happen. MB_DANGER_PRIMARY is for
+ * a CONFIRMATION, where the destructive action *is* the affirmative: it sits in the
+ * primary slot on the right, because putting Cancel there and "Revoke" on the far
+ * left reads as though Cancel were the thing being asked for. */
+enum { MB_NORMAL = 0, MB_PRIMARY, MB_DANGER, MB_DANGER_PRIMARY };
+/* A dialog button, as the modal footer draws it (modal_button); its width for a
+ * label (btn_width). The Workspaces rows draw theirs the same way. */
+static float btn_width(const char *label);   /* fwd */
+static void  modal_button(gfx *rt, rectf r, const char *label, int kind);   /* fwd */
+
 /* Notification-prefs review + the shortcut sheet. */
 static int g_notify_open, g_keys_open;
 /* About OpenChime: which build this client is and which the daemon is, to read
@@ -2034,6 +2082,8 @@ static rectf g_threads_unread_btn;
 static rectf g_thread_follow_hit[32];
 static uint64_t    g_thread_menu_root;   /* which card's overflow is open */
 static rectf g_sched_mode_hit[4];
+static rectf g_sched_default_hit;   /* "Use the workspace default" (REQ-136) */
+static rectf g_receipts_hit;        /* "Share my read receipts" (REQ-090) */
 static rectf g_sched_base_hit[2];
 static rectf g_sched_day_chk[7];
 static rectf g_sched_day_hit[7][2];
@@ -2057,6 +2107,8 @@ static rectf g_members_btn;       /* header toggle hit-box */
 /* Add people, beside the member count (REQ-031): opens the members pane with
  * the people picker. Not in DMs. */
 static rectf g_addppl_btn;
+/* Back and forward (navigation history), at the header's left. */
+static rectf g_hist_back_btn, g_hist_fwd_btn;
 /* The pane's GROUPS subheading's + (REQ-309): add a group to the channel. */
 static rectf g_grp_plus;
 /* Tooltips for those two icon-only buttons, drawn BELOW them -- the header is
@@ -2325,6 +2377,7 @@ static void signin_begin_known(oc_win *hwnd, const char *ws, const char *user); 
 static void sw_book_load(void);      /* fwd */
 static void ws_forget(const char *ws);   /* fwd */
 static void ws_forget_begin(const char *ws);   /* fwd */
+static void ws_forget_all(void);   /* fwd */
 
 static struct { char ws[256], label[80], user[80]; int current; } g_sw[16];
 static int   g_n_sw;
@@ -3700,6 +3753,7 @@ static void select_channel(uint64_t cid) {
      * channel's draft. */
     nm_editor_release();
     g_cmp_hint[0] = '\0';                 /* the hint was about the conversation left */
+    bc_drop_box();                        /* and so was a send waiting on its size */
     if (g_sel && g_sel != cid) draft_flush(g_sel);   /* leaving writes it, if changed */
     close_overlays();
     g_has_sel = 0;                       /* drop any transcript text selection */
@@ -3734,6 +3788,147 @@ static void select_channel(uint64_t cid) {
     g_tab = TAB_MESSAGES;                /* a new channel opens on its transcript */
     draft_restore(cid);
     ac_close();
+}
+
+/* ---- navigation history: back and forward -----------------------------------
+ *
+ * Following a link, a search hit or an Activity row used to be one-way: there
+ * was no getting back to where you were reading. This is the browser's answer.
+ * A PLACE is a conversation, the thread open in it if any, and where in it you
+ * were -- the message at the top of the transcript, or 0 for the newest. A
+ * message id rather than a pixel offset, so it survives a resize, a new text
+ * size and messages arriving underneath.
+ *
+ * Recorded by watching rather than by calling from every path: hist_track runs
+ * each tick and pushes whenever the conversation or the open thread is not the
+ * current entry's, so the sidebar, the palette, a toast, a permalink and Alt+Up
+ * all record without each having to remember to. Jumps within one conversation
+ * change neither, so the paths that jump say so (hist_jump). While an entry is
+ * current its position is kept fresh, so leaving it remembers where you left.
+ *
+ * In the browser each entry is also a history entry (oc_plat_nav_push), and the
+ * browser's own Back and Forward come back here by sequence number. */
+#define HIST_MAX 100
+typedef struct { uint64_t cid, thread, mid; uint32_t seq; int view; } hist_place;
+static hist_place g_hist[HIST_MAX];
+static int        g_hist_n, g_hist_pos = -1;
+static uint32_t   g_hist_seq;
+/* A restore in flight: the thread it opens arrives a beat later, and until it
+ * does the place looks different from the entry -- which must not be recorded
+ * as somewhere new. */
+static int        g_hist_restoring;
+static uint64_t   g_hist_restore_until;
+
+static int transcript_shell(void);   /* fwd */
+
+static int hist_here(hist_place *p) {
+    const oc_model *m = model();
+    if (!m || !g_client || !g_sel || !transcript_shell()) return 0;
+    memset(p, 0, sizeof *p);
+    p->cid = g_sel;
+    p->thread = (m->thread_open && m->thread_channel == g_sel) ? m->thread_parent : 0;
+    p->view = g_view;
+    return 1;
+}
+
+static int hist_same(const hist_place *a, const hist_place *b) {
+    return a->cid == b->cid && a->thread == b->thread && a->view == b->view;
+}
+
+static void hist_push(hist_place p) {
+    if (g_hist_pos < g_hist_n - 1) g_hist_n = g_hist_pos + 1;   /* somewhere new: no forward */
+    if (g_hist_n == HIST_MAX) {
+        memmove(g_hist, g_hist + 1, (HIST_MAX - 1) * sizeof g_hist[0]);
+        g_hist_n--;
+    }
+    p.seq = ++g_hist_seq;
+    g_hist[g_hist_n++] = p;
+    g_hist_pos = g_hist_n - 1;
+    oc_plat_nav_push(p.seq, g_hist_n == 1);
+}
+
+/* The message at the top of the transcript as last drawn, or 0 at the newest. */
+static uint64_t hist_top_mid(void) {
+    if (g_scroll <= 0.5f) return 0;
+    for (int i = 0; i < g_n_msgrows; i++)
+        if (g_msgrows[i].bot > g_msglist_reg.top + 1) return g_msgrows[i].mid;
+    return 0;
+}
+
+static void hist_track(void) {
+    hist_place h;
+    if (!hist_here(&h)) return;
+    hist_place *cur = g_hist_pos >= 0 ? &g_hist[g_hist_pos] : NULL;
+    int same = cur && hist_same(cur, &h);
+    if (g_hist_restoring) {
+        if (same || now_ms() > g_hist_restore_until) g_hist_restoring = 0;
+        return;
+    }
+    if (!same) { hist_push(h); return; }
+    /* Fresh while current, from rows drawn for THIS conversation, and not while
+     * a jump is still on its way to where it is going. */
+    if (!g_jump_mid && g_msglist_drawn && g_msglist_cid == h.cid) cur->mid = hist_top_mid();
+}
+
+/* A jump to `mid` in `cid` (now selected): a place of its own, even in the
+ * conversation already open. */
+static void hist_jump(uint64_t cid, uint64_t mid) {
+    g_jump_quiet = 0;
+    hist_place h;
+    if (!mid || !hist_here(&h) || h.cid != cid) return;
+    h.mid = mid;
+    hist_place *cur = g_hist_pos >= 0 ? &g_hist[g_hist_pos] : NULL;
+    if (cur && hist_same(cur, &h) && cur->mid == mid) return;
+    hist_push(h);
+}
+
+static void hist_restore(int idx) {
+    if (idx < 0 || idx >= g_hist_n || !g_client) return;
+    const oc_model *m = model();
+    hist_place p = g_hist[idx];
+    if (!m || !oc_model_channel((oc_model *)m, p.cid)) return;   /* left or gone */
+    g_hist_pos = idx;
+    g_hist_restoring = 1;
+    g_hist_restore_until = now_ms() + 3000;
+    crumb("hist_restore %d %llu", idx, (unsigned long long)p.cid);
+    close_overlays();              /* closes an open thread, too */
+    g_view = p.view;
+    if (g_sel != p.cid) select_channel(p.cid);
+    if (p.thread) oc_client_open_thread(g_client, p.cid, p.thread);
+    g_jump_fetched = 0;
+    if (p.mid) {
+        g_jump_mid = p.mid;
+        g_jump_quiet = 1;
+        g_jump_deadline = now_ms() + 4000;
+    } else {
+        g_jump_mid = 0;
+        g_jump_quiet = 0;
+        g_scroll = 0;
+    }
+    invalidate();
+}
+
+static int hist_can(int d) {
+    int to = g_hist_pos + d;
+    return g_hist_pos >= 0 && to >= 0 && to < g_hist_n;
+}
+
+static void hist_go(int d) {
+    if (!hist_can(d)) return;
+    /* The browser owns its history: ask it to move, and its popstate comes back
+     * through hist_goto_seq. A desktop moves at once. */
+    if (oc_plat_nav_go(d)) return;
+    hist_restore(g_hist_pos + d);
+}
+
+static void hist_goto_seq(uint32_t seq) {
+    for (int i = 0; i < g_hist_n; i++)
+        if (g_hist[i].seq == seq) { if (i != g_hist_pos) hist_restore(i); return; }
+}
+
+/* A different workspace is a different history. */
+static void hist_reset(void) {
+    g_hist_n = 0; g_hist_pos = -1; g_hist_restoring = 0;
 }
 
 /* Are quiet hours in force RIGHT NOW (REQ-131)? The window is minutes since local
@@ -3893,6 +4088,13 @@ static void draw_user_avatar(gfx *rt, const oc_model *m, uint64_t uid,
     uint32_t tint = avatar_tint(uid);
     uint64_t aid = avatar_of(m, uid);
     float radius = avatar_corner(box);
+    /* The workspace's own sender: the workspace's mark, not a person's face. */
+    if (oc_model_is_workspace_sender(m, uid)) {
+        fill_round(rt, box, radius, OC_COL_ACCENT);
+        float in = (box.right - box.left) * 0.22f;
+        draw_lucide(rt, OC_ICON_HOME, rf(box.left + in, box.top + in, box.right - in, box.bottom - in), 0xFFFFFF);
+        return;
+    }
     /* Removed from the workspace (REQ-033): shown disabled, a plain grey tile
      * with the initial in place of the photo and the colour. */
     if (oc_model_user_disabled(m, uid)) {
@@ -6785,10 +6987,15 @@ static void draw_msglist(gfx *rt, const oc_model *m,
      * clamp is what keeps a hit in the newest or oldest screenful sensible
      * rather than scrolling past the end. */
     if (capture && jump_i >= 0) {
-        *scroll = total - jump_off - visible * 0.66f;
-        g_flash_mid = g_jump_mid;
-        g_flash_until = now_ms() + 1600;
+        if (g_jump_quiet) {
+            *scroll = total - jump_off - visible;     /* its top at the pane's top */
+        } else {
+            *scroll = total - jump_off - visible * 0.66f;
+            g_flash_mid = g_jump_mid;
+            g_flash_until = now_ms() + 1600;
+        }
         g_jump_mid = 0;
+        g_jump_quiet = 0;
     }
 
     if (*scroll > *scroll_max) *scroll = *scroll_max;
@@ -6835,6 +7042,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
          * the part that lands on the transcript (a11y_publish_scene). */
         g_msglist_reg = reg;
         g_msglist_drawn = 1;
+        g_msglist_cid = g_sel;
     }
     else if (hits) g_n_thrrows = 0;
     for (size_t i = 0; i < n; i++) {
@@ -6925,9 +7133,11 @@ static void draw_msglist(gfx *rt, const oc_model *m,
              * coloured word alone is easy to scroll past. Same scanner as the
              * notification, so the two always agree about what counted. */
             if (capture && !msgs[first + i].deleted && msgs[first + i].body) {
-                /* By name, or by a group this user is in (REQ-308). */
+                /* By name, or by a group this user is in (REQ-308), or by a
+                 * broadcast the daemon let notify (REQ-221). */
                 if (msgs[first + i].author_id != m->user_id &&
-                    oc_model_mentions_me(m, msgs[first + i].body, strlen(msgs[first + i].body))) {
+                    oc_model_mentions_me_in(m, msgs[first + i].broadcast_stored, msgs[first + i].body,
+                                            strlen(msgs[first + i].body))) {
                     rectf mr = rf(reg.left, y, reg.right, y + heights[i]);
                     gfx_fill(rt, gr(mr), OC_COL_ACCENT, 0.10f);
                     fill(rt, rf(reg.left, y, reg.left + 3, y + heights[i]), OC_COL_ACCENT);
@@ -7198,7 +7408,22 @@ static void draw_search(gfx *rt, const oc_model *m, rectf reg) {
                   /* gave the wire a cursor, so this stops apologising and the
                    * footer offers the next page instead. */
                   m->search_truncated ? ", more below" : "");
-    draw_text(rt, count, g_meta, rf(body.left + 20, body.top, body.right - 16, body.top + 18),
+    /* The order, on the count line's right: newest first by default, oldest
+     * first, or the best match first. */
+    static const char *const SORTS[3] = { "Newest", "Oldest", "Best match" };
+    float sx = body.right - 16;
+    for (int k = 2; k >= 0; k--) {
+        float bw = text_width(SORTS[k], g_meta) + 16;
+        rectf b = rf(sx - bw, body.top - 2, sx, body.top + 18);
+        int on = g_search_sort == (uint8_t)k, hot = in_rect(b, g_mouse_x, g_mouse_y);
+        fill_round(rt, b, OC_R_CONTROL, on ? OC_COL_ACCENT : hot ? OC_COL_HOVER : OC_COL_INPUT);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, SORTS[k], g_meta, b, on ? 0xFFFFFF : OC_COL_TEXT);
+        g_meta->align = ST_ALIGN_LEFT;
+        g_srch_sort_btn[k] = b;
+        sx = b.left - 4;
+    }
+    draw_text(rt, count, g_meta, rf(body.left + 20, body.top, sx - 8, body.top + 18),
               m->search_truncated ? OC_COL_NOTICE : OC_COL_MUTED);
     body.top += 22;
 
@@ -7810,6 +8035,25 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
         body.top = y1 + vipblk + 10;
     }
 
+    /* Read receipts (REQ-090): whether others see what I have read. Mine
+     * alone -- theirs still show -- and nothing at all when the workspace has
+     * them off, which this says instead of offering a switch that does nothing. */
+    {
+        float y0 = body.top;
+        g_receipts_hit = rf(0, 0, 0, 0);
+        draw_text(rt, "Read receipts", g_ui_b, rf(body.left + 20, y0, body.right - 20, y0 + 20), OC_COL_TEXT);
+        if (!oc_model_receipts_on(m)) {
+            draw_text(rt, "Off for this workspace: nobody sees who has read what.", g_meta,
+                      rf(body.left + 20, y0 + 22, body.right - 20, y0 + 44), OC_COL_MUTED);
+        } else {
+            const char *lbl = "Share my read receipts";
+            float bw = text_width(lbl, g_meta) + 22;
+            g_receipts_hit = rf(body.left + 20, y0 + 24, body.left + 20 + bw, y0 + 50);
+            draw_chip_r(rt, g_receipts_hit, lbl, m->share_receipts);
+        }
+        body.top = y0 + 60;
+    }
+
     /* The SCHEDULE (REQ-136), in Slack's shape: one row of choices, a time range
      * beside it, and — for Custom — the seven days expanded in place. Inline
      * rather than behind a dialog because that is where Slack keeps it, and
@@ -7840,6 +8084,21 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
             mx = b.right + 8;
         }
         float ny = my + 34;
+        /* Whose schedule this is (REQ-136): the workspace's default, followed
+         * until a choice above makes it your own, or your own, with the way
+         * back to the default when the workspace has one. */
+        g_sched_default_hit = rf(0, 0, 0, 0);
+        if (m->dnd_default) {
+            draw_text(rt, "Workspace default. Change it to make it your own.", g_meta,
+                      rf(body.left + 20, ny, body.right - 20, ny + 20), OC_COL_MUTED);
+            ny += 26;
+        } else if (oc_model_has_default_quiet_hours(m)) {
+            draw_text(rt, "Your own.", g_meta, rf(body.left + 20, ny, body.left + 100, ny + 26), OC_COL_MUTED);
+            float bw = text_width("Use the workspace default", g_meta) + 22;
+            g_sched_default_hit = rf(body.left + 100, ny, body.left + 100 + bw, ny + 26);
+            draw_chip_r(rt, g_sched_default_hit, "Use the workspace default", 0);
+            ny += 34;
+        }
         for (int i = 0; i < 7; i++) {
             g_sched_day_chk[i] = rf(0, 0, 0, 0);
             g_sched_day_hit[i][0] = g_sched_day_hit[i][1] = rf(0, 0, 0, 0);
@@ -7949,6 +8208,8 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
     g_notify_kw_btn  = hit_visible(g_notify_kw_btn,  reg);
     g_notify_vip_btn = hit_visible(g_notify_vip_btn, reg);
     for (int i = 0; i < 4; i++) g_sched_mode_hit[i] = hit_visible(g_sched_mode_hit[i], reg);
+    g_sched_default_hit = hit_visible(g_sched_default_hit, reg);
+    g_receipts_hit = hit_visible(g_receipts_hit, reg);
     for (int i = 0; i < 2; i++) g_sched_base_hit[i] = hit_visible(g_sched_base_hit[i], reg);
     for (int d = 0; d < 7; d++) {
         g_sched_day_chk[d]    = hit_visible(g_sched_day_chk[d],    reg);
@@ -8016,6 +8277,63 @@ static int win_visible(const oc_win *w) {
     SDL_WindowFlags fl = SDL_GetWindowFlags(w->sdl);
     return !(fl & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED));
 }
+
+/* Where a broadcast check says what it found: at the composer while the text
+ * waits in it, and beside a send from it; at the question while a poll waits
+ * in its card; in a toast across the window once the text has left the box
+ * any other way -- Send later, the New message pane and Post poll say what
+ * they did in a toast, and the box's next change clears a hint -- or is in
+ * none, as the pane's text once its conversation is made, or a reply typed
+ * into a notification. */
+static void bc_say(int path, const char *text, int held) {
+    if (path == BCS_POLL && held) pc_say(text);
+    else if (path == BCS_TOAST || path == BCS_OPENED || path == BCS_VIDEO || (path != BCS_COMPOSER && !held)) fb_confirm(text);
+    else composer_hint(text, 0);
+}
+
+/* The one broadcast check every send path makes before its text goes to
+ * `cid` (REQ-221; oc_model_broadcast_check): 1 to send now, 0 when the send
+ * is held. One that will notify nobody is said and sent. One that will notify
+ * a channel the workspace calls large is held for the confirmation, and goes
+ * from confirm_run. One whose answer is the channel's size, when the member
+ * list this client holds is another channel's or still loading, is held while
+ * the list is asked for: judged from the wrong list, the note said a
+ * broadcast that notifies would not, or the confirmation asked in a small
+ * channel. bc_tick sends it once the list is in. Asked for on each such send,
+ * as the terminal client does, so a load that never finished is not waited on
+ * for good. A new send on a path replaces the one it held. */
+static int bc_gate(int path, uint64_t cid, uint64_t at, const char *text) {
+    /* Text with no box to go back to is put back in one, not dropped. */
+    if (path == BCS_OPENED && g_bc_wait[path].text) bc_opened_back(&g_bc_wait[path]);
+    bc_held_clear(&g_bc_wait[path]);
+    if (g_bc_confirmed || !text || !cid) return 1;
+    oc_bc_check v;
+    oc_model_broadcast_check(model(), cid, text, &v);
+    bc_held *h = NULL;
+    if (v.act == OC_BC_LOAD) h = &g_bc_wait[path];
+    else if (v.act == OC_BC_CONFIRM) { h = &g_bc_conf; bc_held_clear(h); g_bc_conf_path = path; }
+    if (h) {
+        h->text = strdup(text);
+        if (!h->text) return 0;
+        h->cid = cid; h->at = at; h->ws = g_ws_active;
+    }
+    switch (v.act) {
+    case OC_BC_LOAD:
+        oc_client_list_members(g_client, cid);
+        bc_say(path, v.note, 1);
+        return 0;
+    case OC_BC_CONFIRM:
+        if (path == BCS_TOAST) show_and_focus(g_main);   /* asked where it can be seen */
+        confirm_open(g_main, CONF_BROADCAST, cid, v.title, v.why, "Send");
+        return 0;
+    case OC_BC_NOTE:
+        bc_say(path, v.note, 0);
+        return 1;
+    default:
+        return 1;
+    }
+}
+
 static int win_front(const oc_win *w) {
     return win_visible(w) && (SDL_GetWindowFlags(w->sdl) & SDL_WINDOW_INPUT_FOCUS) != 0;
 }
@@ -8076,7 +8394,7 @@ static void nav_conversation(oc_win *hwnd, int delta, int unread_only) {
 enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
        ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_PTT, ACC_FREETALK, ACC_QUIT, ACC_CALL_MUTE, ACC_CALL_SHARE,
-       ACC_MARK_ALL_READ, ACC_TOAST_ACTION };
+       ACC_MARK_ALL_READ, ACC_TOAST_ACTION, ACC_HIST_BACK, ACC_HIST_FWD };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -8102,6 +8420,9 @@ static const struct {
     { AM_ALT,             OCK_DOWN,    ACC_NAV_NEXT,        NULL, NULL },
     { AM_ALT | AM_SHIFT,  OCK_UP,      ACC_NAV_PREV_UNREAD, "Alt+Shift+Up / Down", "Previous / next UNREAD conversation" },
     { AM_ALT | AM_SHIFT,  OCK_DOWN,    ACC_NAV_NEXT_UNREAD, NULL, NULL },
+    /* Back and forward through the places you have been, as a browser's. */
+    { AM_ALT,             OCK_LEFT,    ACC_HIST_BACK, "Alt+Left / Alt+Right", "Back / forward to where you were" },
+    { AM_ALT,             OCK_RIGHT,   ACC_HIST_FWD,  NULL, NULL },
     { AM_CTRL,            'K',        ACC_PALETTE, "Ctrl+K",           "Command palette" },
     { AM_CTRL,            'F',        ACC_SEARCH,  "Ctrl+F",           "Search messages" },
     { AM_CTRL,            OCK_SLASH,   ACC_KEYS,    "Ctrl+/",           "This list" },
@@ -8125,7 +8446,7 @@ static const struct {
      * workspace's place in the rail, counting from 1. Handled in the dispatcher
      * below rather than as nine rows, so this one is the documentation. */
     { 0,                  0,          ACC_NONE,    "Ctrl+1 \u2026 Ctrl+9", "Switch to that workspace" },
-    { AM_CTRL,            'Q',        ACC_QUIT,    "Ctrl+Q",           "Quit OpenChime (closing the window only hides it)" },
+    { AM_CTRL,            'Q',        ACC_QUIT,    "Ctrl+Q",           "Quit OpenChime" },
     { 0,                  OCK_F6,      ACC_FOCUS,   "F6",               "Move focus between the composer and the filter box" },
     { 0,                  0,          ACC_NONE,  "Mouse wheel",        "Scroll the transcript, sidebar or open pane" },
     { 0,                  0,          ACC_NONE,  "Right-click",        "Actions for a message, member or channel" },
@@ -8201,6 +8522,8 @@ static void accel_run(oc_win *hwnd, int action) {
     case ACC_NAV_NEXT:        nav_conversation(hwnd,  1, 0); break;
     case ACC_NAV_PREV_UNREAD: nav_conversation(hwnd, -1, 1); break;
     case ACC_NAV_NEXT_UNREAD: nav_conversation(hwnd,  1, 1); break;
+    case ACC_HIST_BACK:       hist_go(-1); break;
+    case ACC_HIST_FWD:        hist_go( 1); break;
     case ACC_FOCUS: {
         /* One toggle rather than an F6 handler in each control, which is how the
          * two ends drifted: the composer sent focus to the filter box even in the
@@ -9611,7 +9934,7 @@ static void draw_prefs(gfx *rt, rectf reg) {
                      "Minimising hides the window instead of leaving it on the taskbar.",
                      ONOFF2, 2, g_pref_min_tray ? 1 : 0);
         y = pref_row(rt, body, y, PREF_ROW_STARTUP, "Start with Windows",
-                     "Sign in and start receiving messages when you log in.",
+                     "Sign in and start receiving messages when you sign in.",
                      ONOFF2, 2, startup_enabled() ? 1 : 0);
         /* Reset ends the category it belongs to. "Advanced" held this and a DPI
          * override and nothing else; the override was a harness affordance that
@@ -9890,8 +10213,9 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
      * footer and everything after it could not be reached by any means. The
      * shared overlay offset is what the wheel already drives for a modal, and it
      * belongs to this list until another one claims it -- a confirmation does
-     * not, which is what keeps the position across Remove. */
-    rectf list = rf(body.left, body.top + UIS(28), body.right, body.bottom);
+     * not, which is what keeps the position across Remove. It starts under the
+     * header: the frame's subtitle is the dialog's only header. */
+    rectf list = body;
     if (list.bottom < list.top) list.bottom = list.top;
     g_wsmgr_list = list;
     if (g_wsmgr_focus >= g_n_sw) g_wsmgr_focus = g_n_sw - 1;
@@ -9904,43 +10228,32 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
     g_wsmgr_reveal = 0;
     float y = ovl_begin(rt, list, (float)g_n_sw * rowh + 12);
 
+    /* A row is laid out from what it holds, not from fixed offsets: the
+     * highlight, and the divider under it, span the same width; the two lines
+     * and the buttons are centred in the row's height; the name and its state
+     * take the width up to the buttons. Fixed clip points cut "current" to
+     * "cur..." beside a long name with room to spare. */
+    float hl_l = body.left + UIS(8), hl_r = body.right - UIS(12);
+    float pad = UIS(12), bh = 32;   /* bh: the footer's button height */
+    float l1 = g_ui_b->line_h, l2 = g_meta->line_h;
     for (int i = 0; i < g_n_sw; i++) {
         int slot = ws_find(g_sw[i].ws);
         int live = (slot >= 0 && g_wss[slot].client);
         if (i == g_wsmgr_focus)
-            fill_round(rt, rf(body.left + 12, y + 2, body.right - 16, y + rowh - 3),
-                       OC_R_CONTROL, OC_COL_HOVER);
-        draw_text(rt, g_sw[i].label, g_ui_b, rf(body.left + 24, y, body.left + 300, y + 22), OC_COL_TEXT);
-        /* State on the sub-line rather than its own column: as a column it
-         * collided with the buttons whenever the pane was narrow. */
-        const char *state = g_sw[i].current ? "current" : live ? "connected" : "signed out";
-        uint32_t sc = g_sw[i].current ? OC_COL_ACCENT : live ? OC_COL_ONLINE : OC_COL_FAINT;
-        draw_text(rt, state, g_meta,
-                  baseline_align(rf(body.left + 24, y, body.left + 300, y + 22),
-                                 g_ui_b, g_meta,
-                                 body.left + 24 + text_width(g_sw[i].label, g_ui_b) + 12,
-                                 body.left + 340), sc);
-        char sub[320];
-        snprintf(sub, sizeof sub, "%s%s%s", g_sw[i].ws,
-                 g_sw[i].user[0] ? "  \u00b7  " : "", g_sw[i].user);
-        draw_text(rt, sub, g_meta, rf(body.left + 24, y + 20, body.left + 340, y + 40), OC_COL_FAINT);
+            fill_round(rt, rf(hl_l, y + 2, hl_r, y + rowh - 2), OC_R_CONTROL, OC_COL_HOVER);
 
-        /* Buttons right-aligned, built right-to-left so widths can vary. */
-        float bx = body.right - 24;
-        struct { const char *lbl; int act; uint32_t col; } B[2];
+        /* Buttons right-aligned, built right-to-left so widths can vary: the
+         * dialog's own buttons (modal_button), so they read as one control. */
+        float bx = hl_r - pad, by = y + (rowh - bh) / 2;
+        struct { const char *lbl; int act; int kind; } B[2];
         int nb = 0;
-        B[nb].lbl = "Remove"; B[nb].act = WSM_FORGET; B[nb].col = OC_COL_DANGER; nb++;
-        if (live && !g_sw[i].current) { B[nb].lbl = "Switch to"; B[nb].act = WSM_GO; B[nb].col = OC_COL_MUTED; nb++; }
-        else if (live)                { B[nb].lbl = "Sign out";  B[nb].act = WSM_SIGNOUT; B[nb].col = OC_COL_MUTED; nb++; }
-        else                          { B[nb].lbl = "Sign in";   B[nb].act = WSM_GO; B[nb].col = OC_COL_MUTED; nb++; }
+        B[nb].lbl = "Remove"; B[nb].act = WSM_FORGET; B[nb].kind = MB_DANGER; nb++;
+        if (live && !g_sw[i].current) { B[nb].lbl = "Switch to"; B[nb].act = WSM_GO; B[nb].kind = MB_NORMAL; nb++; }
+        else if (live)                { B[nb].lbl = "Sign out";  B[nb].act = WSM_SIGNOUT; B[nb].kind = MB_NORMAL; nb++; }
+        else                          { B[nb].lbl = "Sign in";   B[nb].act = WSM_GO; B[nb].kind = MB_NORMAL; nb++; }
         for (int k = 0; k < nb; k++) {
-            float bw = text_width(B[k].lbl, g_meta) + 24;
-            rectf b = rf(bx - bw, y + 8, bx, y + 34);
-            fill_round(rt, b, OC_R_CONTROL, OC_COL_INPUT);
-            stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-            g_meta->align = ST_ALIGN_CENTER;
-            draw_text(rt, B[k].lbl, g_meta, b, B[k].col);
-            g_meta->align = ST_ALIGN_LEFT;
+            rectf b = rf(bx - btn_width(B[k].lbl), by, bx, by + bh);
+            modal_button(rt, b, B[k].lbl, B[k].kind);
             if (g_n_wsmgr_hits < (int)(sizeof g_wsmgr_hits / sizeof g_wsmgr_hits[0])) {
                 g_wsmgr_hits[g_n_wsmgr_hits].r = b;
                 g_wsmgr_hits[g_n_wsmgr_hits].row = i;
@@ -9949,7 +10262,26 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
             }
             bx = b.left - 8;
         }
-        fill(rt, rf(body.left + 24, y + rowh - 1, body.right - 24, y + rowh), OC_COL_BORDER);
+
+        /* The name, then its state on the name's baseline, then the address
+         * and account under them; all of it left of the buttons. The state is
+         * drawn whole: a long name gives way to it, not the other way round. */
+        float tx = hl_l + pad, tr = bx - pad, ty = y + (rowh - l1 - l2) / 2;
+        const char *state = g_sw[i].current ? "current" : live ? "connected" : "signed out";
+        uint32_t sc = g_sw[i].current ? OC_COL_ACCENT : live ? OC_COL_ONLINE : OC_COL_FAINT;
+        float sw = text_width(state, g_meta), gap = UIS(10);
+        float nr = tx + text_width(g_sw[i].label, g_ui_b);
+        if (nr > tr - gap - sw) nr = tr - gap - sw;
+        if (nr < tx) nr = tx;
+        rectf nrect = rf(tx, ty, nr, ty + l1);
+        draw_text(rt, g_sw[i].label, g_ui_b, nrect, OC_COL_TEXT);
+        draw_text(rt, state, g_meta, baseline_align(nrect, g_ui_b, g_meta, nr + gap, nr + gap + sw + 1), sc);
+        char sub[320];
+        snprintf(sub, sizeof sub, "%s%s%s", g_sw[i].ws,
+                 g_sw[i].user[0] ? "  \u00b7  " : "", g_sw[i].user);
+        draw_text(rt, sub, g_meta, rf(tx, ty + l1, tr, ty + l1 + l2), OC_COL_FAINT);
+
+        fill(rt, rf(hl_l, y + rowh - 1, hl_r, y + rowh), OC_COL_BORDER);
         y += rowh;
     }
     ovl_end(rt, list);
@@ -10078,17 +10410,36 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         right_used += UIS(38) + text_width("Summarize", g_meta) + UIS(12);
     if (pv && pv->safety[0]) right_used += call_button_w("Safety number", OC_ICON_SHIELD) + UIS(8);
     if (pv && pv->state != OC_PDM_EV_ENDED) right_used += call_button_w("End", -1) + UIS(8);
+    /* Back and forward, ahead of the title, as a browser's: dimmed while there
+     * is nowhere to go. The title starts after them. */
+    float tx = x0 + 20;
+    if (c) {
+        float bs = UIS(26), by = (HEADER_H - bs) / 2, bx = x0 + UIS(10);
+        g_hist_back_btn = rf(bx, by, bx + bs, by + bs);
+        g_hist_fwd_btn  = rf(bx + bs + UIS(2), by, bx + 2 * bs + UIS(2), by + bs);
+        for (int k = 0; k < 2; k++) {
+            rectf b = k ? g_hist_fwd_btn : g_hist_back_btn;
+            int can = hist_can(k ? 1 : -1);
+            if (can && in_rect(b, g_mouse_x, g_mouse_y)) fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
+            const char *ar = k ? "\u2192" : "\u2190";
+            float aw = text_width(ar, g_ui), ax = (b.left + b.right - aw) / 2;
+            draw_text(rt, ar, g_ui, rf(ax, b.top, b.right, b.bottom), can ? OC_COL_TEXT : OC_COL_FAINT);
+        }
+        tx = g_hist_fwd_btn.right + UIS(10);
+    } else {
+        g_hist_back_btn = g_hist_fwd_btn = rf(0, 0, 0, 0);
+    }
     float title_r = x0 + w - right_used - UIS(12);
-    if (title_r < x0 + UIS(80)) title_r = x0 + UIS(80);   /* never nothing at all */
+    if (title_r < tx + UIS(60)) title_r = tx + UIS(60);   /* never nothing at all */
 
     if (typing[0]) {
-        draw_text(rt, title, g_display, rf(x0 + 20, 6, title_r, 34), OC_COL_TEXT);
-        draw_text(rt, typing, g_meta, rf(x0 + 20, 32, title_r, HEADER_H - 6), OC_COL_ACCENT);
+        draw_text(rt, title, g_display, rf(tx, 6, title_r, 34), OC_COL_TEXT);
+        draw_text(rt, typing, g_meta, rf(tx, 32, title_r, HEADER_H - 6), OC_COL_ACCENT);
     } else if (topic) {
-        draw_text(rt, title, g_display, rf(x0 + 20, 6, title_r, 34), OC_COL_TEXT);
-        draw_text(rt, topic, g_meta, rf(x0 + 20, 32, title_r, HEADER_H - 6), OC_COL_MUTED);
+        draw_text(rt, title, g_display, rf(tx, 6, title_r, 34), OC_COL_TEXT);
+        draw_text(rt, topic, g_meta, rf(tx, 32, title_r, HEADER_H - 6), OC_COL_MUTED);
     } else {
-        draw_text(rt, title, g_display, rf(x0 + 20, 0, title_r, HEADER_H), OC_COL_TEXT);
+        draw_text(rt, title, g_display, rf(tx, 0, title_r, HEADER_H), OC_COL_TEXT);
     }
 
     /* Member count chip (right), Slack's shape: an icon and a number rather than
@@ -10655,6 +11006,11 @@ static void nt_activate(int i) {
  * for what was typed, because a reply may contain anything including the
  * separator the first line uses. */
 static void call_join_here(oc_win *hwnd, uint64_t ch);   /* fwd: an invitation's Join */
+/* A reply typed into a notification, into the channel it is about: checked as
+ * a send from that channel's composer is (bc_gate, REQ-221). */
+static void toast_reply_send(uint64_t cid, const char *text) {
+    if (bc_gate(BCS_TOAST, cid, 0, text)) oc_client_send(g_client, cid, text);
+}
 static void toast_action_perform(char *p2) {
     char *nl = strchr(p2, '\n');
     const char *reply = nl ? nl + 1 : "";
@@ -10682,7 +11038,7 @@ static void toast_action_perform(char *p2) {
                 oc_client_call_decline(g_client, cid);
             }
         } else if (!strcmp(verb, "reply") && reply[0]) {
-            oc_client_send(g_client, cid, reply);
+            toast_reply_send((uint64_t)cid, reply);
         } else if (!strcmp(verb, "react") && extra[0]) {
             const oc_model *am = model();
             const oc_channel *ac = am ? oc_model_channel((oc_model *)am, cid) : NULL;
@@ -11591,6 +11947,8 @@ static void profile_close(void) {
  * profile is not a state to render nicely; it is one to refuse. */
 static int profile_open(uint64_t uid) {
     const oc_model *m = model();
+    /* The workspace's own sender is not a person: it has no card. */
+    if (m && oc_model_is_workspace_sender(m, uid)) return 0;
     const char *nm = (m && uid) ? oc_model_user_name((oc_model *)m, uid) : NULL;
     if (!nm || !nm[0]) {
         fb_failed("That person is not in this workspace.");
@@ -13759,6 +14117,7 @@ static void confirm_open(oc_win *hwnd, int act, uint64_t id, const char *title,
 
 static void link_open(const char *url);   /* fwd */
 static void cert_trust_run(oc_win *hwnd);    /* fwd */
+static void bc_resume(int path, bc_held h);  /* fwd */
 
 static void confirm_run(oc_win *hwnd) {
     (void)hwnd;
@@ -13776,6 +14135,14 @@ static void confirm_run(oc_win *hwnd) {
         link_open(u);
         break;
     }
+    case CONF_BROADCAST: { /* a send's text, now confirmed (REQ-221, bc_gate) */
+        bc_held h = g_bc_conf;
+        memset(&g_bc_conf, 0, sizeof g_bc_conf);
+        g_bc_confirmed = 1;
+        bc_resume(g_bc_conf_path, h);
+        g_bc_confirmed = 0;
+        break;
+    }
     case CONF_GROUP_DELETE:
         oc_client_delete_group(g_client, g_confirm_id);
         if (g_grp_sel == g_confirm_id) g_grp_sel = 0;
@@ -13791,6 +14158,7 @@ static void confirm_run(oc_win *hwnd) {
      * "1" would have been a plausible-looking change of behaviour smuggled in with
      * a refactor. */
     case CONF_WS_FORGET: ws_forget_begin(g_confirm_ws); break;
+    case CONF_WS_FORGET_ALL: ws_forget_all(); break;
     case CONF_DRAFT_DELETE: draft_delete(g_confirm_id, g_confirm_root); break;
     case CONF_CHANNEL_ARCHIVE: oc_client_update_channel(g_client, g_confirm_id,
                                                         OC_CHUP_ARCHIVE, ""); break;
@@ -13889,12 +14257,6 @@ static void draw_confirm(gfx *rt, rectf body) {
  * a single dismissing button. The frame supports both rather than pretending
  * everything is a settings sheet.
  */
-/* MB_DANGER is pushed to the far LEFT, away from a form's Save — a destructive
- * button beside the commit is a misclick waiting to happen. MB_DANGER_PRIMARY is for
- * a CONFIRMATION, where the destructive action *is* the affirmative: it sits in the
- * primary slot on the right, because putting Cancel there and "Revoke" on the far
- * left reads as though Cancel were the thing being asked for. */
-enum { MB_NORMAL = 0, MB_PRIMARY, MB_DANGER, MB_DANGER_PRIMARY };
 enum { MODAL_SM = 0, MODAL_LG };
 #define MODAL_MAX_BTNS 4
 
@@ -13933,9 +14295,40 @@ enum { MODAL_CANCEL = -2, MODAL_OK = -1 };
 #define MODAL_TITLE_H UIS(52.0f)
 #define MODAL_FOOT_H  UIS(60.0f)
 
+/* What a reader announces for a footer button: its label, except where the
+ * label leans on the dialog around it ("Remove all" of what). */
+static const char *modal_btn_name(const oc_mbtn *b) {
+    return b->cmd == WSM_CMD_REMOVE_ALL ? "Remove all workspaces" : b->label;
+}
+
 static float btn_width(const char *label) {
     float w = text_width(label, g_ui) + 34;
     return w < 88 ? 88 : w;      /* a floor, so "OK" is not a tiny target */
+}
+
+/* One dialog button in rect `r`, of kind MB_*: the footer's, and any dialog's
+ * own buttons that should read as the same control. */
+static void modal_button(gfx *rt, rectf r, const char *label, int kind) {
+    int hot = in_rect(r, (float)g_mouse_x, (float)g_mouse_y);
+    uint32_t tc = OC_COL_TEXT;
+    if (kind == MB_DANGER_PRIMARY) {
+        fill_round(rt, r, OC_R_CONTROL, OC_COL_DANGER);
+        if (hot) stroke_round(rt, r, OC_R_CONTROL, OC_COL_TEXT, 1.0f);
+        tc = 0xFFFFFF;
+    } else if (kind == MB_PRIMARY) {
+        fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_ACCENT_DIM : OC_COL_ACCENT);
+        tc = 0xFFFFFF;
+    } else if (kind == MB_DANGER) {
+        fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+        stroke_round(rt, r, OC_R_CONTROL, OC_COL_DANGER, 1.0f);
+        tc = OC_COL_DANGER;
+    } else {
+        fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+        stroke_round(rt, r, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+    }
+    g_ui->align = ST_ALIGN_CENTER;
+    draw_text(rt, label, g_ui, rf(r.left, r.top + 1, r.right, r.bottom), tc);
+    g_ui->align = ST_ALIGN_LEFT;
 }
 
 /* Draw the frame and return the CONTENT rect, already inset. */
@@ -14037,7 +14430,6 @@ static rectf modal_frame(gfx *rt, const oc_modal_spec *s,
             if (b->kind == MB_DANGER) continue;      /* placed separately, left */
             float bw = btn_width(b->label);
             rectf r = rf(bx - bw, foot_top + 14, bx, foot_top + 46);
-            int hot = in_rect(r, (float)g_mouse_x, (float)g_mouse_y);
             if (b->cmd == g_modal_off_cmd) {
                 /* Not yet: drawn, named for a reader, and no target for a click
                  * or Enter. */
@@ -14049,20 +14441,7 @@ static rectf modal_frame(gfx *rt, const oc_modal_spec *s,
                 bx = r.left - 10;
                 continue;
             }
-            if (b->kind == MB_DANGER_PRIMARY) {
-                fill_round(rt, r, OC_R_CONTROL, OC_COL_DANGER);
-                if (hot) stroke_round(rt, r, OC_R_CONTROL, OC_COL_TEXT, 1.0f);
-            } else if (b->kind == MB_PRIMARY) {
-                fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_ACCENT_DIM : OC_COL_ACCENT);
-            } else {
-                fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
-                stroke_round(rt, r, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-            }
-            g_ui->align = ST_ALIGN_CENTER;
-            draw_text(rt, b->label, g_ui, rf(r.left, r.top + 1, r.right, r.bottom),
-                      (b->kind == MB_PRIMARY || b->kind == MB_DANGER_PRIMARY) ? 0xFFFFFF
-                                                                             : OC_COL_TEXT);
-            g_ui->align = ST_ALIGN_LEFT;
+            modal_button(rt, r, b->label, b->kind);
             if (g_n_modal_btns < MODAL_MAX_BTNS) {
                 g_modal_btns[g_n_modal_btns].r = r;
                 g_modal_btns[g_n_modal_btns].cmd = b->cmd;
@@ -14071,7 +14450,7 @@ static rectf modal_frame(gfx *rt, const oc_modal_spec *s,
                  * button announced as "modal.button.1" tells a screen reader
                  * nothing and a test nothing it did not already know. */
                 snprintf(g_modal_btns[g_n_modal_btns].label,
-                         sizeof g_modal_btns[g_n_modal_btns].label, "%s", b->label);
+                         sizeof g_modal_btns[g_n_modal_btns].label, "%s", modal_btn_name(b));
                 g_n_modal_btns++;
             }
             if (b->kind == MB_PRIMARY || b->kind == MB_DANGER_PRIMARY)
@@ -14086,12 +14465,7 @@ static rectf modal_frame(gfx *rt, const oc_modal_spec *s,
             if (b->kind != MB_DANGER || !b->label || !b->label[0]) continue;
             float bw = btn_width(b->label);
             rectf r = rf(dx, foot_top + 14, dx + bw, foot_top + 46);
-            int hot = in_rect(r, (float)g_mouse_x, (float)g_mouse_y);
-            fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
-            stroke_round(rt, r, OC_R_CONTROL, OC_COL_DANGER, 1.0f);
-            g_ui->align = ST_ALIGN_CENTER;
-            draw_text(rt, b->label, g_ui, rf(r.left, r.top + 1, r.right, r.bottom), OC_COL_DANGER);
-            g_ui->align = ST_ALIGN_LEFT;
+            modal_button(rt, r, b->label, MB_DANGER);
             if (g_n_modal_btns < MODAL_MAX_BTNS) {
                 g_modal_btns[g_n_modal_btns].r = r;
                 g_modal_btns[g_n_modal_btns].cmd = b->cmd;
@@ -14100,7 +14474,7 @@ static rectf modal_frame(gfx *rt, const oc_modal_spec *s,
                  * nameless was announced as nothing, or as whatever this slot
                  * last held. */
                 snprintf(g_modal_btns[g_n_modal_btns].label,
-                         sizeof g_modal_btns[g_n_modal_btns].label, "%s", b->label);
+                         sizeof g_modal_btns[g_n_modal_btns].label, "%s", modal_btn_name(b));
                 g_n_modal_btns++;
             }
             dx = r.right + 10;
@@ -15164,6 +15538,8 @@ static char     g_pc_was_q[FIELD_BUF];      /* and its question, trimmed */
 static int      g_pc_err_at;                /* PCE_*: the field the refusal is said at */
 static uint16_t g_pc_err_rows;              /* PCE_OPTS: the rows it is about */
 static const char *g_pc_err;
+static int      g_pc_err_info;              /* it is a note, not a refusal (pc_say) */
+static char     g_pc_note[96];              /* the note's words */
 static int      g_pc_quiet;                 /* the card is filling its own fields */
 static field   *g_pc_q, *g_pc_opt[OC_POLL_MAX_OPTIONS], *g_pc_time;
 static rectf    g_pc_qrect, g_pc_orect[OC_POLL_MAX_OPTIONS], g_pc_rm[OC_POLL_MAX_OPTIONS];
@@ -15548,13 +15924,14 @@ static void draw_poll_compose(gfx *rt, rectf body) {
     draw_text(rt, "Question", g_ui_b, rf(lx, y, lr, y + UIS(20.0f)), OC_COL_TEXT);
     y += PC_LABEL_H;
     rectf qb = rf(lx + FORM_BOX_INSET, y, br, y + PC_FIELD_H);
-    pc_box(rt, qb, g_pc_err_at == PCE_Q, g_focus == g_pc_q, 0);
+    pc_box(rt, qb, g_pc_err_at == PCE_Q && !g_pc_err_info, g_focus == g_pc_q, 0);
     g_pc_qrect = qb;
     field_draw(rt, g_pc_q, rf(qb.left + UIS(10.0f), qb.top + UIS(4.0f), qb.right - UIS(10.0f), qb.bottom - UIS(4.0f)),
                OC_COL_TEXT);
     y = qb.bottom;
     if (g_pc_err_at == PCE_Q && g_pc_err) {
-        draw_text(rt, g_pc_err, g_meta, rf(lx, y + UIS(3.0f), lr, y + PC_ERR_H), OC_COL_DANGER);
+        draw_text(rt, g_pc_err, g_meta, rf(lx, y + UIS(3.0f), lr, y + PC_ERR_H),
+                  g_pc_err_info ? OC_COL_MUTED : OC_COL_DANGER);
         y += PC_ERR_H;
     }
     y += PC_SECT_GAP;
@@ -15780,18 +16157,43 @@ static int pc_control_name(int c, char *aid, size_t acap, char *nm, size_t ncap)
 /* Refuse at field `at`, rows `rows` of the options, saying `why`; the keyboard
  * goes there. Nothing is sent. */
 static int pc_refuse(int at, uint16_t rows, const char *why, field *go) {
-    g_pc_err_at = at; g_pc_err_rows = rows; g_pc_err = why;
+    g_pc_err_at = at; g_pc_err_rows = rows; g_pc_err = why; g_pc_err_info = 0;
     if (go) focus_set(go);
     invalidate();
     return 0;
 }
 
+/* Say `note` at the question, as a note: what the broadcast check says while
+ * the poll waits in its card (bc_say). */
+static void pc_say(const char *note) {
+    snprintf(g_pc_note, sizeof g_pc_note, "%s", note ? note : "");
+    g_pc_err_at = PCE_Q; g_pc_err_rows = 0; g_pc_err = g_pc_note; g_pc_err_info = 1;
+    invalidate();
+}
+
+/* The card is under a dialog opened from it -- the broadcast confirmation --
+ * and comes back when that closes (g_modal_stack). */
+static int pc_under(void) {
+    return g_n_modal_stack > 0 && g_modal_stack[g_n_modal_stack - 1] == &g_pc_open;
+}
+
+/* Whether the card, open or under the confirmation, still holds the new poll
+ * whose question `q` the broadcast check held for conversation `cid`. */
+static int pc_holds(uint64_t cid, const char *q) {
+    if ((!g_pc_open && !pc_under()) || g_pc_mode || g_pc_cid != cid || !q) return 0;
+    char now[FIELD_BUF];
+    pc_trim(g_pc_q->buf, now, sizeof now);
+    return !strcmp(now, q);
+}
+
 /* Post poll / Save. Checked here, where each refusal can be said at its field,
  * before the core's own check (oc_client_post_poll), which can only say no.
- * Returns 1 when something was sent and the card closed. */
+ * Returns 1 when something was sent and the card closed. Also run with the
+ * card under the broadcast confirmation, once that says Send (bc_resume):
+ * posted, the card does not come back; refused, it does, with the reason. */
 static int poll_compose_submit(void) {
-    if (!g_pc_open || !g_client) return 0;
-    g_pc_err_at = PCE_NONE; g_pc_err_rows = 0; g_pc_err = NULL;
+    if ((!g_pc_open && !pc_under()) || !g_client) return 0;
+    g_pc_err_at = PCE_NONE; g_pc_err_rows = 0; g_pc_err = NULL; g_pc_err_info = 0;
     char q[FIELD_BUF];
     pc_trim(g_pc_q->buf, q, sizeof q);
     if (!q[0]) return pc_refuse(PCE_Q, 0, "A poll needs a question.", g_pc_q);
@@ -15833,6 +16235,11 @@ static int poll_compose_submit(void) {
         if (close_at <= wall_ms()) return pc_refuse(PCE_TIME, 0, "The deadline has to be in the future.", g_pc_time);
     }
     if (!g_pc_mode) {
+        /* The question is the message's body, so a broadcast in it notifies as
+         * one in a message does: checked as a send is (bc_gate, REQ-221).
+         * Held, the card stays, saying why at the question, or under the
+         * confirmation, and the poll goes from bc_resume. */
+        if (!bc_gate(BCS_POLL, g_pc_cid, 0, q)) return 0;
         if (oc_client_post_poll(g_client, g_pc_cid, 0, q, ov, (uint8_t)n, flags, close_at) != 0) {
             fb_failed("The poll could not be posted.");
             return 0;
@@ -15845,7 +16252,8 @@ static int poll_compose_submit(void) {
             return 0;
         }
     }
-    modal_finish(0);
+    if (g_pc_open) modal_finish(0);
+    else g_n_modal_stack--;   /* under the confirmation: posted, so it does not come back */
     return 1;
 }
 
@@ -16051,6 +16459,8 @@ static const oc_modal_spec *modal_current(void) {
         sp.size = MODAL_LG;
         sp.buttons[0] = (oc_mbtn){ "Done", MB_PRIMARY, MODAL_OK };
         sp.n_buttons = 1;
+        if (g_n_sw > 0)   /* danger: the frame puts it on the left, away from Done */
+            sp.buttons[sp.n_buttons++] = (oc_mbtn){ "Remove all", MB_DANGER, WSM_CMD_REMOVE_ALL };
     }
     return &sp;
 }
@@ -16080,8 +16490,12 @@ static void modal_enter(oc_win *hwnd, int *flag) {
      * (g_modal_stack). Read before close_overlays() clears it. */
     int *opener = g_prefs_open ? &g_prefs_open : g_keys_open ? &g_keys_open :
                   g_wsmgr_open ? &g_wsmgr_open : g_notify_open ? &g_notify_open :
-                  g_browse_open ? &g_browse_open : g_sessions_open ? &g_sessions_open : NULL;
+                  g_browse_open ? &g_browse_open : g_sessions_open ? &g_sessions_open :
+                  g_pc_open ? &g_pc_open : NULL;
     if (opener == flag) opener = NULL;
+    /* The poll card asks the broadcast confirmation over itself (bc_gate) and
+     * comes back under it: put away here, since close_overlays() leaves it. */
+    if (opener == &g_pc_open) { g_pc_open = 0; pc_fields_hide(); }
     g_modal_entering = 1;
     close_overlays();
     g_modal_entering = 0;
@@ -16122,7 +16536,11 @@ static void modal_enter(oc_win *hwnd, int *flag) {
 /* Close it. `commit` decides which way: Save runs commit, Cancel runs restore. */
 static const char *g_modal_closed_by = "";   /* diagnosis only; see the dump */
 
+static void bc_unconfirmed(void);   /* fwd */
 static void modal_finish(int save) {
+    /* The broadcast confirmation said no to (bc_unconfirmed), once the card
+     * it may have been asked over is back. */
+    int bc_no = !save && g_confirm_open && g_confirm_act == CONF_BROADCAST;
     g_tp_open = 0;   /* nothing floating may outlive the card it was opened from */
     if (g_pick_open && picker_floats()) picker_close(NULL);
     if (g_status_edit) field_show(g_status_edit, 0);
@@ -16152,6 +16570,7 @@ static void modal_finish(int save) {
         *back = 1;
         if (back == &g_wsmgr_open) sw_book_load();
     }
+    if (bc_no) bc_unconfirmed();
 }
 
 /* Clicks the FRAME owns, tested before any modal's own content. Returns 1 when it
@@ -16872,7 +17291,7 @@ static rectf g_dm_compose_btn;
  * somewhere in the sidebar. A button labelled "Message" that does not take you to
  * the message is not a button that half works; it is one that does not work. */
 static void open_dm_go(uint64_t uid) {
-    if (!g_client || !uid) return;
+    if (!g_client || !uid || oc_model_is_workspace_sender(model(), uid)) return;
     g_view = VIEW_HOME;
     g_dm_pending = uid;
     oc_client_open_dm(g_client, uid, 0);
@@ -18834,6 +19253,20 @@ static void newmsg_deliver(uint64_t cid, const char *body, uint64_t at) {
     }
 }
 
+/* The conversation the pane's recipients already are, which its send is
+ * checked against (bc_gate, REQ-221): a channel, or the DM with the one person
+ * named. 0 for one the send makes -- a DM not opened yet, a group DM, an
+ * encrypted DM -- which is checked once it exists, where the text goes into
+ * it (BCS_OPENED). */
+static uint64_t newmsg_target(uint64_t at) {
+    if (!g_n_tgt_chip) return 0;
+    if (g_tgt_chip[0].is_channel) return g_tgt_chip[0].id;
+    if (g_n_tgt_chip != 1 || (nm_e2e_on() && !at)) return 0;
+    const oc_model *m = model();
+    const oc_channel *ex = m ? dm_with(m, g_tgt_chip[0].id) : NULL;
+    return ex ? ex->channel_id : 0;
+}
+
 /* Send the pane's message, or -- when `at` is non-zero -- schedule it for then.
  * Both need the same conversation, and when that conversation does not exist yet
  * both wait for the daemon to create it (REQ-224, REQ-229). */
@@ -18873,6 +19306,13 @@ static void newmsg_send_at(oc_win *hwnd, uint64_t at) {
         free(b);
         composer_hint("This message is too long to send. Make a table smaller, or split it in two.", 1);
         return;
+    }
+    /* Into a channel or a DM that exists, checked as its own composer's send
+     * is (bc_gate, REQ-221): held, the text stays in the pane with its
+     * recipients. */
+    {
+        uint64_t gcid = newmsg_target(at);
+        if (gcid && !bc_gate(BCS_NEWMSG, gcid, at, b)) { free(b); return; }
     }
 
     /* Empty the field FIRST. select_channel() flushes the outgoing conversation's
@@ -20205,9 +20645,11 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
         }
         /* The header's and the pane's icon-only buttons' names, over both. */
         if (g_chtip && now_ms() - g_chtip_since >= FMT_TIP_MS) {
-            rectf tb = g_chtip == 1 ? g_addppl_btn : g_grp_plus;
-            if (tb.right > tb.left)
-                draw_tip_below(rt, tb, g_chtip == 1 ? "Add people" : "Add a group", 0, W);
+            rectf tb = g_chtip == 1 ? g_addppl_btn : g_chtip == 2 ? g_grp_plus :
+                       g_chtip == 3 ? g_hist_back_btn : g_hist_fwd_btn;
+            const char *tt = g_chtip == 1 ? "Add people" : g_chtip == 2 ? "Add a group" :
+                             g_chtip == 3 ? "Back (Alt+Left)" : "Forward (Alt+Right)";
+            if (tb.right > tb.left) draw_tip_below(rt, tb, tt, 0, W);
         }
         /* The summary pane's hover names and citation card, over everything. */
         draw_summary_float(rt, m, W, H);
@@ -23467,6 +23909,7 @@ enum {
     AT_GRPPICK,       /* ... accept one match */
     AT_GRPADD,        /* ... add the chosen people */
     AT_ADDPPL,        /* the header's Add people */
+    AT_HIST,          /* payload: 0 back, 1 forward */
     AT_GRPPLUS,       /* the members pane's Add a group */
     AT_DTAB,          /* payload: drafts tab index */
     AT_REACTCHIP,     /* payload: who-reacted chip index — add or take back yours */
@@ -23833,6 +24276,10 @@ static void a11y_publish_scene(const oc_model *m) {
     /* The two icon-only membership buttons, named as their tooltips are. */
     if (g_addppl_btn.right > g_addppl_btn.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_BUTTON, "header.addpeople", "Add people", g_addppl_btn, ATOK(AT_ADDPPL, 0));
+    if (g_hist_back_btn.right > g_hist_back_btn.left && n < OC_ACC_MAX)
+        acc_push(items, &n, OC_ACC_BUTTON, "header.back", "Back", g_hist_back_btn, ATOK(AT_HIST, 0));
+    if (g_hist_fwd_btn.right > g_hist_fwd_btn.left && n < OC_ACC_MAX)
+        acc_push(items, &n, OC_ACC_BUTTON, "header.forward", "Forward", g_hist_fwd_btn, ATOK(AT_HIST, 1));
     if (g_grp_plus.right > g_grp_plus.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_BUTTON, "members.groups.add", "Add a group", g_grp_plus, ATOK(AT_GRPPLUS, 0));
     for (int i = 0; i < g_n_call_rows && n < OC_ACC_MAX; i++) {
@@ -24563,6 +25010,9 @@ static void sched_at(oc_win *hwnd, uint64_t at) {
     int reply = tm && tm->thread_open;
     uint64_t cid  = reply ? tm->thread_channel : g_sel;
     uint64_t root = reply ? tm->thread_parent  : 0;
+    /* Checked as a send is (bc_gate, REQ-221): the daemon judges it when it
+     * posts, and the channel's size then is the one to warn about now. */
+    if (!bc_gate(BCS_LATER, cid, at, b)) { free(b); return; }
     oc_client_schedule(g_client, cid, root, at, b);
     free(b);
     ed_clear();
@@ -24603,6 +25053,11 @@ static void composer_send(void) {
             composer_hint("This channel is archived, so it is read-only.", 1);
             return;
         }
+        /* The workspace's own DM (its welcome): nobody reads a reply. */
+        if (c && c->kind == OC_CHANNEL_KIND_DM && oc_model_is_workspace_sender(m, c->peer_id)) {
+            composer_hint("Messages from the workspace take no replies.", 1);
+            return;
+        }
         /* An encrypted DM takes text only while its session is open here; the
          * text stays in the box otherwise (PRIVATE-DM.md). */
         if (c && c->e2e) {
@@ -24630,6 +25085,13 @@ static void composer_send(void) {
         free(b);
         composer_hint("This message is too long to send. Make a table smaller, or split it in two.", 1);
         return;
+    }
+    /* A broadcast mention under the workspace's rule (REQ-221), checked as
+     * every send path checks it (bc_gate). An edit notifies nobody, so not. */
+    if (b && !g_edit_msg) {
+        const oc_model *bm = model();
+        uint64_t bcid = bm && bm->thread_open ? bm->thread_channel : g_sel;
+        if (!bc_gate(BCS_COMPOSER, bcid, 0, b)) { free(b); return; }
     }
     if (b) {
         /* Drop a trailing newline; skip empty/whitespace. */
@@ -25765,7 +26227,6 @@ static int vm_take_bytes(uint64_t id, uint8_t *d, size_t n) {
 
 static void vm_send(oc_win *hwnd) {
     if (!g_rec_res.video || !g_client || !g_sel) return;
-    vm_player_close();                                /* it borrows the bytes being handed over */
     char cap[8192] = "";
     {
         char *md = ed_len() > 0 ? ed_md_all() : NULL;
@@ -25776,6 +26237,12 @@ static void vm_send(oc_win *hwnd) {
     const oc_model *pm = model();
     uint64_t pch = (pm && pm->thread_open) ? pm->thread_channel : g_sel;
     uint64_t proot = (pm && pm->thread_open) ? pm->thread_parent : 0;
+    /* The caption is a message body the daemon reads for mentions, so a
+     * broadcast in it is checked as the composer's is (REQ-221, bc_gate).
+     * Held, the card and the recording stay as they are, and bc_resume sends
+     * once the caption in the box is still the one judged. */
+    if (cap[0] && !bc_gate(BCS_VIDEO, pch, 0, cap)) return;
+    vm_player_close();                                /* it borrows the bytes being handed over */
     g_vm_post_tag = oc_client_post_video(g_client, pch, proot,
                                          g_rec_res.video, g_rec_res.video_len,
                                          g_rec_res.poster, g_rec_res.poster_len,
@@ -26456,7 +26923,7 @@ static void search_submit(void) {
     snprintf(q, sizeof q, "%s", g_srch->buf);
     if (!q[0]) return;
     g_srch_scroll = 0;
-    oc_client_search(g_client, q);
+    oc_client_search(g_client, q, g_search_sort);
 }
 
 /* Open the overlay with the box focused and empty — no modal prompt. */
@@ -26859,10 +27326,15 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
     }
     int own = (msg->author_id == m->user_id);
     int canmod = own || self_role(m) >= OC_ROLE_ADMIN;
-    if ((own || canmod) && !msg->deleted && !locked) mi_sep();
-    if (own && !msg->deleted && !locked)    mi_item(21, "Edit");
+    /* The workspace's windows (REQ-051/052): an author's own message stops
+     * offering Edit or Delete once the daemon would refuse it; a moderator's
+     * delete of someone else's is never limited. */
+    int may_edit = own && oc_model_may_change_own(m, msg->server_time, 1, wall_ms());
+    int may_del = own ? oc_model_may_change_own(m, msg->server_time, 0, wall_ms()) : canmod;
+    if ((may_edit || may_del || (own && msg->poll)) && !msg->deleted && !locked) mi_sep();
+    if (may_edit && !msg->deleted && !locked) mi_item(21, "Edit");
     if (own && msg->poll && !msg->deleted && !locked) mi_item(108, "Edit poll");   /* REQ-225 */
-    if (canmod && !msg->deleted && !locked) mi_item_d(22, "Delete");
+    if (may_del && !msg->deleted && !locked) mi_item_d(22, "Delete");
 
     g_menu = MENU_MSG; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 248;
     g_menu_target = mid; g_menu_target2 = chan;
@@ -27005,6 +27477,7 @@ static void msg_menu_react(int idx) {
 }
 
 static void show_member_menu(oc_win *hwnd, const oc_model *m, uint64_t uid, float cx, float cy) {
+    if (oc_model_is_workspace_sender(m, uid)) return;   /* not a person: nothing to do to it */
     int self = (uid == m->user_id);
     uint8_t me = self_role(m);
     g_n_mi = 0;
@@ -27182,6 +27655,7 @@ static int files_click(oc_win *hwnd, int x, int y) {
                 if (from_view) { g_view = VIEW_HOME; layout_composer(hwnd); }
                 g_jump_mid = f->message_id;
             g_jump_deadline = now_ms() + 1500;
+                hist_jump(g_sel, g_jump_mid);
                 select_tab(TAB_MESSAGES);
             }
             return 1;
@@ -27297,6 +27771,7 @@ static int permalink_follow(oc_win *hwnd, const char *text) {
     if (mid) {
         g_jump_mid = mid;
         g_jump_deadline = now_ms() + 4000;
+        hist_jump(chan, mid);
     }
     select_tab(TAB_MESSAGES);
     layout_composer(hwnd);
@@ -27507,7 +27982,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
                     if (me && me[0]) {
                         char q[96];
                         snprintf(q, sizeof q, "from:%s", me);
-                        oc_client_search(g_client, q);
+                        oc_client_search(g_client, q, OC_SEARCH_NEWEST);   /* what you sent, latest first */
                     }
                 }
                 return 1;
@@ -27604,6 +28079,15 @@ static int on_click(oc_win *hwnd, int x, int y) {
             /* The schedule (REQ-136). Every control applies immediately, as the
              * level chips beside them do — this overlay has no Save button and a
              * setting that waited for one would be the only thing here that did. */
+            if (in_rect(g_sched_default_hit, x, y)) {
+                sched_send(OC_DND_FROM_DEFAULT, 0, 0, NULL);
+                return 1;
+            }
+            if (in_rect(g_receipts_hit, x, y)) {
+                const oc_model *rm = model();
+                if (rm) oc_client_set_read_receipts(g_client, !rm->share_receipts);
+                return 1;
+            }
             for (int i = 0; i < 4; i++)
                 if (in_rect(g_sched_mode_hit[i], x, y)) {
                     const oc_model *sm = model();
@@ -28224,6 +28708,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 if (g_listrows[i].cid) select_channel(g_listrows[i].cid);
                 g_jump_mid = g_listrows[i].mid;
                 g_jump_deadline = now_ms() + 1500;
+                hist_jump(g_sel, g_jump_mid);
                 return 1;
             }
     }
@@ -28250,6 +28735,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 if (g_listrows[i].cid) select_channel(g_listrows[i].cid);
                 g_jump_mid = g_listrows[i].mid;
             g_jump_deadline = now_ms() + 1500;
+                hist_jump(g_sel, g_jump_mid);
                 select_tab(TAB_MESSAGES);
                 layout_composer(hwnd);
                 return 1;
@@ -28347,6 +28833,8 @@ static int on_click(oc_win *hwnd, int x, int y) {
         listen_set(hwnd, on ? 0 : 1);
         return 1;
     }
+    if (in_rect(g_hist_back_btn, x, y)) { hist_go(-1); return 1; }
+    if (in_rect(g_hist_fwd_btn, x, y))  { hist_go( 1); return 1; }
     /* Add people, beside the count: the pane, with the people picker. */
     if (in_rect(g_addppl_btn, x, y) && g_sel) {
         members_open(hwnd, g_sel, 1);
@@ -28486,6 +28974,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
              * conversation, so landing on it in context is the point. */
             g_jump_mid = g_pinrows[i].mid;
             g_jump_deadline = now_ms() + 1500;
+            hist_jump(g_sel, g_jump_mid);
             oc_client_close_pins(g_client);
             return 1;
         }
@@ -28562,6 +29051,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
             select_channel(g_fwd_hits[i].chan);
             g_jump_mid = g_fwd_hits[i].mid;
             g_jump_deadline = now_ms() + 4000;
+            hist_jump(g_sel, g_jump_mid);
             select_tab(TAB_MESSAGES);
             layout_composer(hwnd);
             invalidate();
@@ -28643,15 +29133,25 @@ static int on_click(oc_win *hwnd, int x, int y) {
         const oc_model *mm = model();
         if (mm && x > RAIL_W + SIDEBAR_W) {
             if (mm->search_open && in_rect(g_srch_more_btn, x, y)) {
-                /* The OLDEST id shown is the cursor: results are newest-first, so the
-                 * next page is everything before it. */
-                uint64_t oldest = 0;
-                for (size_t k = 0; k < mm->n_search; k++)
-                    if (!oldest || mm->search_results[k].message_id < oldest)
-                        oldest = mm->search_results[k].message_id;
-                if (oldest) oc_client_search_more(g_client, oldest);
+                /* The next page continues from the last hit shown, in the order
+                 * the hits are in (the core keeps the cursor). */
+                oc_client_search_more(g_client);
                 return 1;
             }
+            /* A different order starts the search again in it: a keyset in one
+             * order is no cursor in another. */
+            for (int k = 0; mm->search_open && k < 3; k++)
+                if (in_rect(g_srch_sort_btn[k], x, y)) {
+                    if (g_search_sort != (uint8_t)k) {
+                        g_search_sort = (uint8_t)k;
+                        char q[128];
+                        snprintf(q, sizeof q, "%s", mm->search_query);
+                        g_srch_scroll = 0;
+                        if (q[0]) oc_client_search(g_client, q, g_search_sort);
+                        invalidate();
+                    }
+                    return 1;
+                }
             if (mm->search_open)
                 for (int i = 0; i < g_n_searchrows; i++)
                     if ((float)y >= g_searchrows[i].top && (float)y < g_searchrows[i].bot) {
@@ -28660,6 +29160,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
                         g_jump_mid = g_searchrows[i].mid;
                         g_jump_deadline = now_ms() + 4000;
                         select_channel(g_searchrows[i].cid);   /* also closes the overlay */
+                        hist_jump(g_sel, g_jump_mid);
                         return 1;
                     }
             if (mm->weblist_open)
@@ -29704,6 +30205,22 @@ static void ws_forget_begin(const char *ws) {
     sw_book_load();
 }
 
+/* Remove every remembered workspace from this device (the Workspaces dialog's
+ * Remove all): each as Remove takes one, background ones first, the one on
+ * screen last, since that one is forgotten once its sign-out lands. By address,
+ * from a copy: each removal reloads the list. */
+static void ws_forget_all(void) {
+    char ws[16][256];
+    int n = 0, cur = -1;
+    for (int i = 0; i < g_n_sw && n < 16; i++) {
+        int slot = ws_find(g_sw[i].ws);
+        if (slot >= 0 && slot == g_ws_active && g_wss[slot].client) cur = n;
+        snprintf(ws[n++], sizeof ws[0], "%s", g_sw[i].ws);
+    }
+    for (int i = 0; i < n; i++) if (i != cur) ws_forget_begin(ws[i]);
+    if (cur >= 0) ws_forget_begin(ws[cur]);
+}
+
 static void ws_forget(const char *ws) {
     const char *sp = store_path();
     oc_store *st = (sp && ws && ws[0]) ? oc_store_open(sp) : NULL;
@@ -29767,6 +30284,7 @@ static void ws_load(int i) {
     if (i < 0 || i >= g_n_wss) return;
     oc_ws_slot *w = &g_wss[i];
     g_ws_active = i;
+    if (g_client != w->client) hist_reset();
     g_client = w->client;
     g_sel = w->sel; g_scroll = w->scroll; g_post_auth = w->post_auth;
     g_n_backfilled = w->n_backfilled;
@@ -30045,7 +30563,7 @@ static void signin_submit(oc_win *hwnd) {
         if (!g_si_ws[0]) { snprintf(g_si_err, sizeof g_si_err,
                                     "enter a workspace (domain or name)"); goto redraw; }
         oc_endpoint ep;
-        /* Same statuses and wording as the TUI's login box, so the two clients
+        /* Same statuses and wording as the TUI's sign-in box, so the two clients
          * describe an unresolvable workspace identically. */
         oc_resolve_status st = oc_resolve(g_si_ws, oc_default_suffix(), &ep);
         if (st == OC_RESOLVE_BAD_WORKSPACE) {
@@ -30641,6 +31159,25 @@ static void sw_book_load(void) {
     oc_store_close(st);
 }
 
+/* How many workspaces the device remembers, from the store itself rather than
+ * the dialog's copy, which is only as fresh as its last load -- the test dump's
+ * `wsbook=`, signed in or not. */
+static void ws_book_count_cb(void *ctx, const char *workspace, const char *label,
+                             const char *username, uint64_t last) {
+    (void)workspace; (void)label; (void)username; (void)last;
+    (*(int *)ctx)++;
+}
+static int ws_book_count(void) {
+    int n = 0;
+    const char *sp = store_path();
+    oc_store *st = sp ? oc_store_open(sp) : NULL;
+    if (!st) return 0;
+    oc_store_set_secret(st, g_secret);
+    oc_store_workspace_each(st, ws_book_count_cb, &n);
+    oc_store_close(st);
+    return n;
+}
+
 static void open_ws_menu(oc_win *hwnd) {
     (void)hwnd;
     const oc_model *m = model();
@@ -30768,7 +31305,8 @@ static void open_new_menu(oc_win *hwnd) {
     mi_item(8, "Jump to  (Ctrl+K)");
     mi_item(9, "Browse channels");
     mi_item(82, "New sidebar section");   /* */
-    mi_item(84, "Add custom emoji");      /* REQ-072 */
+    /* REQ-072: only for whom the workspace lets add one (custom_emoji_add). */
+    if (model() && oc_model_may_add_emoji(model())) mi_item(84, "Add custom emoji");
     g_menu = MENU_NEW; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 224;
     g_menu_x = RAIL_W + 8;
     /* Bottom-aligned to the New button, so the menu grows upward out of the thing
@@ -31170,6 +31708,112 @@ static void call_start_here(oc_win *hwnd, uint64_t ch) {
     call_open_view(hwnd, ch);
 }
 
+/* The pane's text for a conversation it opened (BCS_OPENED), held and then
+ * not sent -- its confirmation said no to, or the workspace left -- comes back
+ * to a box rather than going nowhere: that conversation's composer, or, when
+ * the conversation is not here to go to, New message, as when it could not be
+ * opened. Added after whatever the box holds, which is kept. */
+static void bc_opened_back(const bc_held *h) {
+    if (!h || !h->text || !h->text[0]) return;
+    const oc_model *m = model();
+    if (h->ws == g_ws_active && m && oc_model_channel((oc_model *)m, h->cid)) {
+        if (g_view != VIEW_HOME || g_sel != h->cid) {
+            g_view = VIEW_HOME;
+            select_channel(h->cid);
+            layout_composer(g_main);
+        }
+    } else {
+        open_new_message(g_main);
+    }
+    char *now = ed_md_all();
+    if (now && now[0]) {
+        size_t a = strlen(now), b = strlen(h->text);
+        char *both = malloc(a + 2 + b + 1);
+        if (both) {
+            memcpy(both, now, a);
+            memcpy(both + a, "\n\n", 2);
+            memcpy(both + a + 2, h->text, b + 1);
+            ed_set_md(both);
+            free(both);
+        }
+    } else {
+        ed_set_md(h->text);
+    }
+    free(now);
+    ed_changed(g_main);
+    fb_confirm("Not sent: your message is back in the box.");
+    invalidate();
+}
+
+/* A held send goes on (bc_gate, REQ-221), through the path it came from,
+ * which checks it again: now with its conversation's member list, or past
+ * the confirmation. Text from a box, or a poll's card, goes only if it still
+ * holds it, where it was written; changed, or another conversation's, the
+ * hold is dropped and the next send judges what is there. Text in no box goes
+ * where it was going, in the workspace it was written in. Takes the text. */
+static void bc_resume(int path, bc_held h) {
+    int same = h.text && h.ws == g_ws_active;
+    if (path == BCS_OPENED && h.text && !same) bc_opened_back(&h);
+    if (same && path == BCS_POLL) same = pc_holds(h.cid, h.text);
+    else if (same && path != BCS_TOAST && path != BCS_OPENED) {
+        char *now = ed_md_all();
+        same = now && !strcmp(now, h.text);
+        free(now);
+    }
+    if (same) switch (path) {
+    case BCS_COMPOSER:
+        if (!g_edit_msg && g_view != VIEW_NEWMSG) { g_cmp_hint[0] = '\0'; composer_send(); }
+        break;
+    case BCS_LATER:
+        if (g_view != VIEW_NEWMSG) { g_cmp_hint[0] = '\0'; sched_at(g_main, h.at); }
+        break;
+    case BCS_NEWMSG:
+        if (g_view == VIEW_NEWMSG && newmsg_target(h.at) == h.cid) {
+            g_cmp_hint[0] = '\0';
+            newmsg_send_at(g_main, h.at);
+        }
+        break;
+    case BCS_OPENED:
+        newmsg_deliver(h.cid, h.text, h.at);
+        break;
+    case BCS_POLL:
+        poll_compose_submit();
+        break;
+    case BCS_TOAST:
+        toast_reply_send(h.cid, h.text);
+        break;
+    case BCS_VIDEO:
+        if (g_vm == VM_REC && g_rec_res.video) vm_send(g_main);
+        break;
+    }
+    free(h.text);
+}
+
+/* The broadcast confirmation said no to (REQ-221): the send it held is not
+ * made. Its text stays where it was written -- the box, or the poll's card,
+ * which comes back -- and the pane's text for a conversation it opened, in no
+ * box, is put back in one (bc_opened_back). */
+static void bc_unconfirmed(void) {
+    bc_held h = g_bc_conf;
+    memset(&g_bc_conf, 0, sizeof g_bc_conf);
+    if (g_bc_conf_path == BCS_OPENED) bc_opened_back(&h);
+    free(h.text);
+}
+
+/* Once a tick: each send waiting on its channel's member list goes on when
+ * the list is in. */
+static void bc_tick(void) {
+    const oc_model *m = model();
+    if (!m) return;
+    for (int p = 0; p < BCS_N; p++) {
+        bc_held *w = &g_bc_wait[p];
+        if (!w->text || m->chanmem_channel != w->cid || m->chanmem_loading) continue;
+        bc_held h = *w;
+        memset(w, 0, sizeof *w);
+        bc_resume(p, h);
+    }
+}
+
 /* Once a tick: a start waiting on a member list goes when the list is in. */
 static void call_tick(oc_win *hwnd) {
     const oc_model *m = model();
@@ -31370,9 +32014,13 @@ static void pdm_tick(oc_win *hwnd) {
             /* The words of the request only, never of a message. */
             if (g_pref_notify != NOTIFY_OFF) notify_plain("Encrypted conversation", t);
         }
-        /* Open: what was typed in New message goes into it. */
+        /* Open: what was typed in New message goes into it, checked as the
+         * text New message opens any DM for is (bc_gate, REQ-221). The daemon
+         * cannot read it, so a broadcast in it notifies nobody, and the check
+         * says so without its member list. */
         if (v->state == OC_PDM_EV_OPEN && g_pdm_ask_peer == v->peer) {
-            if (g_pdm_ask_text) oc_client_send(g_client, v->id, g_pdm_ask_text);
+            if (g_pdm_ask_text && bc_gate(BCS_OPENED, v->id, 0, g_pdm_ask_text))
+                oc_client_send(g_client, v->id, g_pdm_ask_text);
             free(g_pdm_ask_text); g_pdm_ask_text = NULL;
             g_pdm_ask_peer = 0;
         }
@@ -32117,6 +32765,18 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
     case 71: oc_client_list_notify_prefs(g_client); modal_enter(hwnd, &g_notify_open); break;   /* */
     case 72: modal_enter(hwnd, &g_keys_open); break;   /* */
     case 89: modal_enter(hwnd, &g_about_open); break;
+    case WSM_CMD_REMOVE_ALL: {
+        if (g_n_sw <= 0) break;
+        char what[48], body[320];
+        if (g_n_sw == 1) snprintf(what, sizeof what, "the 1 remembered workspace");
+        else             snprintf(what, sizeof what, "all %d remembered workspaces", g_n_sw);
+        snprintf(body, sizeof body,
+                 "Remove %s from this device?\n\n"
+                 "Each one's saved sign-in is deleted, the one you are signed in to "
+                 "included, which signs you out. You can add any of them again by "
+                 "entering its address.", what);
+        confirm_open(hwnd, CONF_WS_FORGET_ALL, 0, "Remove all workspaces?", body, "Remove all");
+        break; }
     case ABOUT_CMD_COPY: {
         char t[256];
         about_text(model(), t, sizeof t);
@@ -32600,17 +33260,45 @@ static void *devlist_thread(void *arg) {
     return NULL;
 }
 
+/* The open confirmation, and which one: the harness answers some of them
+ * (scripts/gui/drive.sh trust_dev_cert, lib.sh sign_in_card), signed in or not. */
+static void test_dump_confirm(FILE *f) {
+    fprintf(f, "confirm open=%d act=%d url=\"%s\"\n", g_confirm_open, g_confirm_act, g_confirm_url);
+}
+
+/* THE TREE ITSELF, one line per element, so a check outside the client
+ * can ask questions this loop cannot. The one it exists for: does
+ * anything actually get DRAWN inside each of these rects? An element
+ * published at coordinates nothing painted is a phantom — the stale
+ * transcript rows were exactly that, and were invisible to every check
+ * here because they were internally consistent. Comparing the published
+ * tree against the paint ledger catches the whole class rather than the
+ * instance. It is also where the harness finds a button to press. */
+static void test_dump_a11y(FILE *f) {
+    for (int i = 0; i < g_a11y_n; i++) {
+        const oc_acc_item *a = &g_acc_items[i];
+        fprintf(f, "a11yitem %s %d %d %d %d\n", a->aid[0] ? a->aid : "-",
+                a->l, a->t, a->r, a->b);
+    }
+}
+
 static void test_dump(const char *path) {
     const oc_model *m = model();
     FILE *f = fopen(path, "wb"); if (!f) return;
     if (!m) {
-        /* Not signed in: the sign-in card's state is what there is to see. */
-        fprintf(f, "no model\nsignin step=%d browser=%d connecting=%d err=%s\n",
-                g_si_step, g_si_browser, g_si_connecting, g_si_err);
+        /* Not signed in: the sign-in card's state is what there is to see --
+         * and whatever it asks over itself. A self-signed certificate is put to
+         * the person before sign-in, and the harness answers it from the
+         * confirmation, the button's rectangle and the DPI to scale it by; a
+         * dump without them left every Windows script stuck at launch. */
+        fprintf(f, "no model\nview=%d wsbook=%d dpi=%u\nsignin step=%d browser=%d connecting=%d err=%s\n",
+                g_view, ws_book_count(), g_dpi, g_si_step, g_si_browser, g_si_connecting, g_si_err);
         if (g_si_client) {
             const oc_model *sm = oc_client_model(g_si_client);
             if (sm) fprintf(f, "signin last_error=%s signin_url=%.120s\n", sm->last_error, sm->signin_url);
         }
+        test_dump_confirm(f);
+        test_dump_a11y(f);
         fclose(f); return;
     }
     fprintf(f, "mode=%s\n", oc_env_is_dev() ? "development" : "normal");
@@ -33026,7 +33714,7 @@ static void test_dump(const char *path) {
                 g_preview_player != NULL, (int)ps.state, ps.has_audio, ps.position_ms, ps.duration_ms,
                 g_preview_wait_ms, g_form_action_busy);
     }
-    fprintf(f, "view=%d si_overlay=%d wsmgr=%d\n", g_view, g_si_overlay, g_wsmgr_open);
+    fprintf(f, "view=%d si_overlay=%d wsmgr=%d wsbook=%d\n", g_view, g_si_overlay, g_wsmgr_open, ws_book_count());
     /* How the client started (scripts/gui/startup.sh). `visible` is whether the
      * window is on screen at all -- a client that started and showed nothing
      * looked, from here, exactly like one that never started. `started` counts
@@ -33627,19 +34315,7 @@ static void test_dump(const char *path) {
                    "ov=\"%s\" out=\"%s\" dupid=\"%s\" clip=\"%s\" clippx=%.0f\n",
                 overlaps, outside, dup, g_clip_n, g_a11y_n,
                 first_ov, first_out, first_dup, g_clip_first, g_clip_worst);
-        /* THE TREE ITSELF, one line per element, so a check outside the client
-         * can ask questions this loop cannot. The one it exists for: does
-         * anything actually get DRAWN inside each of these rects? An element
-         * published at coordinates nothing painted is a phantom — the stale
-         * transcript rows were exactly that, and were invisible to every check
-         * here because they were internally consistent. Comparing the published
-         * tree against the paint ledger catches the whole class rather than the
-         * instance. */
-        for (int i = 0; i < g_a11y_n; i++) {
-            const oc_acc_item *a = &g_acc_items[i];
-            fprintf(f, "a11yitem %s %d %d %d %d\n", a->aid[0] ? a->aid : "-",
-                    a->l, a->t, a->r, a->b);
-        }
+        test_dump_a11y(f);   /* the tree itself, one line per element */
     }
     /* ARCH-108: the pinned metrics, checked, not remembered — the live
      * line_h/baseline pairs per token, plus a real render probe that the two
@@ -33767,6 +34443,18 @@ static void test_dump(const char *path) {
         }
     }
     fprintf(f, "sbsel=%d\n", g_n_sbsel);
+    {   /* Navigation history: the entries, which is current, and where each is. */
+        const hist_place *hc = g_hist_pos >= 0 ? &g_hist[g_hist_pos] : NULL;
+        fprintf(f, "hist n=%d pos=%d restoring=%d back=%d fwd=%d cid=%llu thread=%llu mid=%llu scroll=%.0f btn=%.0f,%.0f,%.0f,%.0f\n",
+                g_hist_n, g_hist_pos, g_hist_restoring, hist_can(-1), hist_can(1),
+                (unsigned long long)(hc ? hc->cid : 0), (unsigned long long)(hc ? hc->thread : 0),
+                (unsigned long long)(hc ? hc->mid : 0), g_scroll,
+                g_hist_back_btn.left, g_hist_back_btn.top, g_hist_fwd_btn.right, g_hist_fwd_btn.bottom);
+        for (int i = 0; i < g_hist_n; i++)
+            fprintf(f, "  histent %d cid=%llu thread=%llu mid=%llu view=%d\n", i,
+                    (unsigned long long)g_hist[i].cid, (unsigned long long)g_hist[i].thread,
+                    (unsigned long long)g_hist[i].mid, g_hist[i].view);
+    }
     fprintf(f, "sbunreads on=%d chip=%.0f,%.0f,%.0f,%.0f\n", g_sb.unreads_only,
             g_sb_unread_chip.left, g_sb_unread_chip.top, g_sb_unread_chip.right, g_sb_unread_chip.bottom);
     fprintf(f, "shelf n=%d", g_n_shelf);
@@ -33836,7 +34524,7 @@ static void test_dump(const char *path) {
     }
     fprintf(f, "link hover=\"%s\" labelled=%d chan=%llu\n", g_link_hover, g_link_hover_lab,
             (unsigned long long)g_chan_hover);
-    fprintf(f, "confirm open=%d act=%d url=\"%s\"\n", g_confirm_open, g_confirm_act, g_confirm_url);
+    test_dump_confirm(f);
     /* What the client last put on the clipboard, escaped onto one line (\t \r
      * \n \" \\): Copy table's TSV is only checkable as the bytes it handed
      * over. */
@@ -35464,6 +36152,7 @@ static int on_tick(oc_win *hwnd) {
             ftray_tick(hwnd);        /* uploads in the composer's tray */
             nt_tick();               /* the notification window expires on this tick too */
             call_tick(hwnd);         /* a start waiting on a member list */
+            bc_tick();               /* and a broadcast send (REQ-221) */
             pdm_tick(hwnd);          /* private DMs: invitations, arrivals, endings */
             /* The call view's duration, levels and speaking rings move without
              * any event to repaint on. */
@@ -35615,20 +36304,26 @@ static int on_tick(oc_win *hwnd) {
                 if (g_nm_wait_uid) nc = dm_with(m, g_nm_wait_uid);
                 else if (g_n_group_pending) nc = group_dm_with(m, g_group_pending, g_n_group_pending);
                 if (nc) {
-                    newmsg_deliver(nc->channel_id, g_nm_pending, g_nm_pending_when);
-                    int was_scheduled = g_nm_pending_when != 0;
+                    uint64_t ncid = nc->channel_id, when = g_nm_pending_when;
+                    char *text = g_nm_pending;
+                    g_nm_pending = NULL;
                     g_nm_pending_when = 0;
-                    free(g_nm_pending); g_nm_pending = NULL;
                     g_nm_wait_uid = 0; g_n_group_pending = 0;
                     /* Follow the message into its conversation only if the user
                      * is still where they pressed send. Doing it unconditionally
                      * yanked them out of whatever they had started reading in the
                      * second the daemon took to answer. */
-                    if (!was_scheduled && (g_view == VIEW_NEWMSG || g_view == VIEW_HOME)) {
+                    if (!when && (g_view == VIEW_NEWMSG || g_view == VIEW_HOME)) {
                         g_view = VIEW_HOME;
-                        select_channel(nc->channel_id);
+                        select_channel(ncid);
                         layout_composer(hwnd);
                     }
+                    /* Checked now that the conversation is there to be checked,
+                     * against its own member list, as a send into one that
+                     * already existed is (bc_gate, REQ-221). Held, it goes from
+                     * bc_resume, or comes back to a box (bc_opened_back). */
+                    if (bc_gate(BCS_OPENED, ncid, when, text)) newmsg_deliver(ncid, text, when);
+                    free(text);
                     invalidate();
                 }
             }
@@ -36007,12 +36702,14 @@ static int on_tick(oc_win *hwnd) {
                     g_jump_deadline = now_ms() + 4000;
                 } else {
                     /* Asked and it still did not arrive: it is not in a channel
-                     * we can read, or it is gone. */
-                    g_jump_mid = 0; g_jump_fetched = 0;
-                    fb_failed("Could not find that message.");
+                     * we can read, or it is gone. Going back to a place whose
+                     * message has since gone lands at the newest, unannounced. */
+                    if (!g_jump_quiet) fb_failed("Could not find that message.");
+                    g_jump_mid = 0; g_jump_fetched = 0; g_jump_quiet = 0;
                 }
             }
             if (!g_jump_mid) g_jump_fetched = 0;
+            hist_track();
             /* The settings bucket arrives a beat after auth; fold it in once. */
             if (g_sb_settings_pending && oc_model_setting(m, SB_SETTING_KEY)) {
                 sidebar_opts_load(m);
@@ -36502,6 +37199,8 @@ static int on_mouse_move(oc_win *hwnd, int mx, int my) {
             if (!pointer_blocked()) {
                 if (in_rect(g_addppl_btn, (float)mx, (float)my)) ch = 1;
                 else if (in_rect(g_grp_plus, (float)mx, (float)my)) ch = 2;
+                else if (in_rect(g_hist_back_btn, (float)mx, (float)my)) ch = 3;
+                else if (in_rect(g_hist_fwd_btn, (float)mx, (float)my)) ch = 4;
             }
             if (ch != g_chtip) {
                 g_chtip = ch;
@@ -36878,6 +37577,7 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
         case AT_GRPPICK:   if (g_tgt_host != TGT_HOST_NEWMSG) tgt_accept((int)arg); break;
         case AT_GRPADD:    if (g_tgt_host == TGT_HOST_CHANNEL) chan_pick_commit(); else grp_pick_commit(); break;
         case AT_ADDPPL:    if (g_sel) members_open(hwnd, g_sel, 1); break;
+        case AT_HIST:      hist_go(arg ? 1 : -1); break;
         case AT_GRPPLUS:   if (g_sel && model()) channel_group_pick(hwnd, model(), g_sel, 1); break;
         case AT_VIDEO:     vm_command(hwnd, (int)arg); break;
         case AT_VOICE:
@@ -37114,17 +37814,20 @@ static int on_focus_lost(oc_win *hwnd) {
         return 0;
 }
 
-/* The window's close box, or Ctrl+Q. CLOSING HIDES when there is a tray to
- * come back from; quitting asks about unsent messages first. */
+/* The window's close box, or Ctrl+Q (app_quit). Closing quits by default; it
+ * hides instead only when Hide to tray is chosen (REQ-138) and there is a tray
+ * to come back from. Quitting asks about unsent messages first. */
 static int on_close_request(oc_win *hwnd) {
         /* The draft goes with the window. Before anything below, because a
          * decision you reverse still leaves the draft correct. */
         if (g_sel) draft_flush(g_sel);
         if (geom_capture(hwnd) && g_geom_applied) prefs_save();
-        /* CLOSING HIDES. The connection, the clients and every notification go
-         * on running behind the tray icon; quitting is Ctrl+Q or the tray menu.
-         * A chat client that stops notifying the moment its window closes has
-         * stopped being one, which is what this used to do.
+        /* HIDE TO TRAY, when the person chose it (g_pref_close; the default is
+         * to quit, REQ-138). The connection, the clients and every
+         * notification then go on running behind the tray icon; quitting is
+         * Ctrl+Q or the tray menu. That is the option's reason to exist: a chat
+         * client that stops notifying when its window closes has stopped being
+         * one.
          *
          * Only when the tray icon actually exists. If Shell_NotifyIcon failed
          * there is nothing to restore the window from, and hiding would leave a
@@ -37196,6 +37899,9 @@ static void on_handoff(oc_win *hwnd, char *s) {
         snprintf(url, sizeof url, "%s", payload);
         show_and_focus(hwnd);
         permalink_follow(hwnd, url);
+    } else if (!strcmp(kind, "nav")) {
+        /* The browser's Back or Forward, arrived at one of our places. */
+        hist_goto_seq((uint32_t)strtoul(payload, NULL, 10));
     }
     free(s);
 }
@@ -37339,6 +38045,12 @@ static void handle_event(const SDL_Event *e) {
         int mx = (int)DIPF(wc_px(win, e->button.x)), my = (int)DIPF(wc_px(win, e->button.y));
         if (win == &g_recbar || win == &g_sharebar) { bar_click(win, mx, my); return; }
         if (win != hwnd) return;
+        /* A mouse's side buttons: back and forward, as everywhere else. */
+        if (e->button.button == SDL_BUTTON_X1 || e->button.button == SDL_BUTTON_X2) {
+            hist_go(e->button.button == SDL_BUTTON_X1 ? -1 : 1);
+            invalidate();
+            return;
+        }
         if (e->button.button == SDL_BUTTON_RIGHT) {
             on_rclick(hwnd, mx, my);
             invalidate();

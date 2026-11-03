@@ -213,9 +213,13 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 27** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 32** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
-> 27 appended `max_video_size` to `WORKSPACE_INFO` (§4.3a). Since the
+> 32 gave the byte version 31 put in `BROADCAST` (and so `MSG_RESTORED`) and
+> `THREAD_REPLY`, ahead of the body, a new meaning: `broadcast_stored`, whether
+> the send stored a broadcast mention for the message, whatever its body says
+> now (§5.3). A frame whose layout is unchanged but whose meaning is not moves
+> the number too. Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
 > change moves the number even when it adds one byte.
@@ -576,7 +580,17 @@ tenant-monotonic (ARCH-43).
 | `author_id`    | u64  | Authoring user's id.                         |
 | `server_time`  | u64  | Server timestamp, ms since epoch UTC.        |
 | `kind`         | u8   | `0` something someone said; `1` a call event the daemon wrote — a missed call (REQ-304, §5.17). Any other value is malformed. |
+| `broadcast_stored` | u8 | `1` when the daemon stored a broadcast mention (`@here`, `@channel` or `@everyone`) for the message when it was sent, so a broadcast its body holds notifies (REQ-221); else `0`, whatever the body. Any other value is malformed. Since version 32 (version 31 carried `broadcast_held` here). |
 | `body`         | lstr | Message body (§7).                           |
+
+`broadcast_stored` is the daemon's answer to whether a broadcast mention
+reached anyone, read from the mentions it stored when the message was sent, so
+a replay (§6) says what the live frame said. It does not depend on the body:
+an edit changes the body and stores no mentions (§5.5), so a message keeps the
+answer its send got, in history loaded after an edit as on the live frame. A
+client counts a broadcast as a mention when the current body holds one and
+`broadcast_stored` is `1`: it does not guess from a channel's size, which it
+knows only for the channel whose member list it has loaded.
 
 The frame may then carry the **optional trailing block** (§5.14): the attachment
 metadata list, followed by an optional `author_name` (str) — the **display name
@@ -683,6 +697,11 @@ whose copy doubles as the acknowledgement:
 | `author_id`  | u64  | The message's author.                            |
 | `edited_at`  | u64  | Server edit time, ms since epoch UTC (REQ-051).  |
 | `body`       | lstr | The new body (§7).                               |
+
+An edit notifies nobody and stores no mentions: the message keeps those its
+send stored. So `MSG_EDITED` carries no `broadcast_stored` (§5.3) and a client
+keeps the one the message had: a broadcast the edit removes counts no more,
+and one a later edit puts back counts again where the send stored one.
 
 ### 5.6 Deleting a message (REQ-052, REQ-032)
 
@@ -931,7 +950,15 @@ Each entry, in wire order:
 `user_id` (u64) · `role` (u8) · `disabled` (u8) · `email` (str) ·
 `display_name` (str) · `avatar_id` (u64) · `title` (str) · `timezone` (str) ·
 `status_emoji` (str) · `status_text` (str) · `full_name` (str) ·
-`pronouns` (str) · `voice_id` (str).
+`pronouns` (str) · `voice_id` (str) · `flags` (u8, since version 30).
+
+`flags` bit `0x01` (`OC_USER_SYSTEM`) marks **the workspace's own sender**: the
+account that posts what the workspace says, such as the welcome a new member is
+sent (`OPENCHIME_WELCOME_MESSAGE`). It is not a person. A client draws its
+messages as the workspace's, with no avatar of a person, keeps it out of every
+list of people (the roster, the directory, a member picker, mention
+completion), and offers no DM, profile or role action on it. Nothing signs in
+as it, and a message sent into its DM is refused with `WORKSPACE_SENDER`.
 
 A **phone number is deliberately absent**: it is contact detail rather than
 something drawn beside a name, and every member's number in every roster
@@ -1293,6 +1320,7 @@ member of the channel:
 | `server_time` | u64  | Server timestamp, ms since epoch UTC.                    |
 | `reply_count` | u32  | The root's total reply count after this reply (REQ-060). |
 | `participant` | u8   | 1 if **this recipient** is in the thread (REQ-061).      |
+| `broadcast_stored` | u8 | As on `BROADCAST` (§5.3): `1` when the reply's send stored a broadcast mention (REQ-221). Since version 32. |
 | `body`        | lstr | The reply body.                                          |
 
 `participant` is the only per-recipient field on a fan-out frame, so the daemon
@@ -1390,25 +1418,27 @@ Implemented with a SQLite FTS5 index over message bodies (ARCH-15, SCHEMA.md
 |---------------|------|----------------------------------------------------------|
 | `query`       | str  | Free text. The daemon quotes each whitespace-separated term, so query punctuation is literal and multiple terms are ANDed; it never errors on syntax. May be empty when the filters below carry the whole query. |
 | `limit`       | u16  | Max results wanted; the daemon caps it (50).             |
-| `before_id`   | u64  | **Keyset paging cursor** — return only messages with a lower id. `0` for the first page. Not an offset, so a message posted mid-paging cannot make a row repeat or vanish. |
+| `before_id`   | u64  | **Keyset paging cursor** — the id of the last row of the page before; `0` for the first page. Newest first, the next page is the lower ids; oldest first, the higher ones; by relevance, the rows after (`cursor_rank`, `before_id`). Not an offset, so a message posted mid-paging cannot make a row repeat or vanish. |
 | `from_name`   | str  | `from:` — restrict to one author. Empty for no constraint. |
 | `in_channel`  | str  | `in:` — restrict to one channel. Empty for no constraint. |
 | `has_mask`    | u8   | `has:` — bitmask, `0x01` file, `0x02` link, `0x04` image, `0x08` video. `0` for no constraint. |
 | `after_ms`    | u64  | `after:` — lower time bound, ms since epoch UTC. `0` for none. |
 | `before_ms`   | u64  | `before:` — upper time bound. `0` for none. |
+| `sort`        | u8   | `0` newest first (by id, descending), `1` oldest first (by id, ascending), `2` by relevance (best match first, ties by id ascending). Relevance with no `query` text falls back to newest first: nothing ranks a filters-only search. Since protocol 28. |
+| `cursor_rank` | i64  | Relevance paging: the last row's `rank`, with its id in `before_id`. A message posted since moves every bm25 score, so the daemon measures that row's rank afresh and uses `cursor_rank` only when the row no longer matches (edited or deleted). Ignored by the other orders. Since protocol 28. |
 
 The operator grammar is parsed by `shared/searchq.c`, which the daemon and both
 frontends link, so the filter line a client shows and the `WHERE` clause the
 daemon builds cannot disagree (REQ-081). Results stay scoped to history the
 caller may read (REQ-031).
 
-Replies **`SEARCH_RESULTS` (server → client), msg_type `0x0061`**, newest match
-first:
+Replies **`SEARCH_RESULTS` (server → client), msg_type `0x0061`**, in the order
+`sort` asked for:
 
 | Field       | Type            | Notes                                                |
 |-------------|-----------------|------------------------------------------------------|
 | `count`     | u16             | Number of entries.                                   |
-| `entries[]` | `count` × entry | Each: `message_id` (u64), `channel_id` (u64), `author_id` (u64), `server_time` (u64), `snippet` (str — an FTS5 excerpt around the match, or the body's first 160 bytes for a search with no text), `action` (u8 — `1` when the message is an action and the snippet is cut from its text, REQ-058). |
+| `entries[]` | `count` × entry | Each: `message_id` (u64), `channel_id` (u64), `author_id` (u64), `server_time` (u64), `snippet` (str — an FTS5 excerpt around the match, or the body's first 160 bytes for a search with no text), `action` (u8 — `1` when the message is an action and the snippet is cut from its text, REQ-058), `rank` (i64 — the row's relevance, bm25 × 1,000,000 rounded, lower is better; `0` unless sorted by relevance; since protocol 28). |
 | `truncated` | u8              | 1 if more matches exist past the cap (`limit`).      |
 
 Tombstoned messages (§5.6) are excluded, and an edit (§5.5) re-indexes the
@@ -1654,6 +1684,29 @@ file itself from the message's text. What the wire carries is therefore the
 download shape without the upload half, keyed by the **message** id the client
 already has.
 
+**`WORKSPACE_SETTINGS` (S → C), `0x0119`** `{ count: u8, count × (key: str,
+value: str) }` — the workspace's settings, **read-only**, sent once to every
+client at sign-in, after `WORKSPACE_INFO`. They are the daemon's configuration,
+the rows CONFIG.md marks "Clients are told it": each `key` is the variable's name
+without `OPENCHIME_`, lower-cased, and `value` its effective value as an operator
+writes it (empty when unset). Workspace settings are set by the control plane or
+the operator and take effect when the daemon restarts; no frame changes one, so
+nothing is sent while the daemon runs. A client acts on what it is told; the
+daemon enforces whatever it must. At most 64; more is refused as malformed. A
+client ignores a key it does not know.
+
+**`READ_RECEIPTS` (both ways), `0x011A`** `{ share: u8 }` — whether this person
+shares their read position (seen-by). From a client, `share` `1` or `0` sets
+it and `2` (`OC_RECEIPTS_ASK`) asks; a client asks once after sign-in. From the
+daemon, `share` `0` or `1` tells it: to the device that asked, or, when it
+changes, to every device of the person's. Anything above `2` is malformed. Not
+sharing keeps the person's `READ_CURSOR` from the others and still shows them
+everyone else's. When the workspace has receipts off (`read_receipts` on
+`WORKSPACE_SETTINGS`), no member's `READ_CURSOR` reaches any other. A read made
+before a person shared, or while the workspace had receipts off, is never
+shown: the daemon sends another member's position only when it was recorded
+since then.
+
 **`CAPABILITIES` (S → C), `0x00E1`** `{ count: u8, count × name: str }` — the
 features this daemon offers, by name, sent once to every client just after
 `SERVER_BUILD` (§4.3c) and before the frames that describe any feature. A name present
@@ -1887,6 +1940,13 @@ day for half the world — and only the client knows the zone. One shape both
 directions: the schedule a client sends and the schedule the server echoes are
 the same fact.
 
+A member who has set no schedule of their own follows the workspace's default
+(`OPENCHIME_DEFAULT_QUIET_HOURS`). Their `SCHEDULE` is then that default,
+resolved, with `0x80` (`OC_DND_FROM_DEFAULT`) or'd into `mode`, so a client can
+say "Workspace default". A `SET_SCHEDULE` whose `mode` is `0x80` alone drops the
+member's own schedule and returns them to the default. Any other mode sets their
+own, which takes precedence from then on.
+
 **`SET_TZ_OFFSET` (C → S), `0x00D6`** `{ tz_offset_min: i16 }` — the client's
 UTC offset in minutes east, sent **on every connect** (ARCH-103). The offset the
 schedule above is evaluated against is not a property of the schedule: it changes
@@ -2055,6 +2115,8 @@ client always folds a complete picture rather than a delta.
 **`SET_NOTIFY_DEFAULT` (C → S), `0x0077`** — Set my own fallback notification level, used by my channels that have no per-channel override. (REQ-134)
 
     level (u8)
+
+A level above `2` (none) is refused with a non-fatal `ERROR MALFORMED_FRAME` (1003), and the default is left as it was.
 
 **`SET_MUTE` (C → S), `0x006D`** — Mute or unmute one conversation for the calling user. (REQ-137)
 
@@ -3083,7 +3145,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 |--------|-----------------------|------------|-------|----------------------------------------------------------------|
 | `1001` | `VERSION_TOO_OLD`     | handshake  | yes   | Client's `max_version` < server minimum. Show "please update." |
 | `1002` | `VERSION_TOO_NEW`     | handshake  | yes   | Client's `min_version` > server maximum. Operator must upgrade the daemon; do **not** prompt the user to update the app. |
-| `1003` | `MALFORMED_FRAME`     | any        | see note | A `HELLO` that does not decode (fatal, as `REJECT`); non-fatal for a custom-emoji name out of bounds (`ADD_EMOJI`/`DELETE_EMOJI`) or a group DM of fewer than three people. Any other frame that does not decode closes the connection without an `ERROR`. |
+| `1003` | `MALFORMED_FRAME`     | any        | see note | A `HELLO` that does not decode (fatal, as `REJECT`); non-fatal for a custom-emoji name out of bounds (`ADD_EMOJI`/`DELETE_EMOJI`), a group DM of fewer than three people, or a `SET_NOTIFY_DEFAULT` level out of range. Any other frame that does not decode closes the connection without an `ERROR`. |
 | `1004` | `FRAME_TOO_LARGE`     | any        | yes   | Reserved: a `length` implying a frame larger than `MAX_FRAME_SIZE`. The daemon closes the connection without sending it. |
 | `1005` | `UNEXPECTED_MSG_TYPE` | any        | yes   | A frame not valid in the current state: a non-`HELLO` first frame (sent as `REJECT`, since no version is negotiated yet) or a post-auth type this version does not define (sent as `ERROR`). A `SEND` before `AUTH_OK` gets the more specific `AUTH_REQUIRED` instead. |
 | `1006` | `VERSION_MISMATCH`    | post-hello | yes   | A post-handshake frame carried a `version` other than the negotiated one. Distinct from `1001`/`1002`, which answer a `HELLO` and precede a session: this says the peer agreed and then sent something else. The `ERROR` itself is stamped with the negotiated version, so it is readable by the peer being disconnected. |
@@ -3139,6 +3201,8 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3038` | `INVALID_POLL`        | messaging  | no    | A poll's question or options out of bounds, or a vote naming options the poll does not have, or two on a single-choice poll (REQ-225). |
 | `3039` | `POLL_CLOSED`         | messaging  | no    | The poll is past its deadline and takes no more votes (REQ-225). |
 | `3040` | `POLL_HAS_VOTES`      | messaging  | no    | An `EDIT_POLL` changing a poll's options or settings after someone voted; only its deadline can change now (REQ-225). |
+| `3041` | `EDIT_WINDOW_CLOSED`  | messaging  | no    | An author's `EDIT`, or `DELETE` of their own message, past the window the workspace's configuration sets (`OPENCHIME_EDIT_WINDOW`, `OPENCHIME_DELETE_WINDOW`, which clients are told as `edit_window` and `delete_window`). An admin's or owner's delete of someone else's message is never limited (REQ-051, REQ-052). |
+| `3042` | `WORKSPACE_SENDER`    | messaging  | no    | A message, reply or file sent into a DM with the workspace's own sender (`USER_LIST` `flags`), whose DMs nobody reads. |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing
@@ -3155,7 +3219,7 @@ frames (§4.2a, §4.2c).
 defines, in opcode order, 239 of them. The sections above specify the payload layouts; this
 table is the index and the authority on which values are taken.
 
-**Every opcode carries exactly one message type.** `scripts/check/opcodes.sh`
+**Every opcode carries exactly one message type.** `scripts/test/local/opcodes.sh`
 (run by `make test` and CI) fails on any duplicate, with no exception list, so
 this table cannot silently gain a shared value.
 
@@ -3403,6 +3467,8 @@ this table cannot silently gain a shared value.
 | `0x0112` | `LIST_POLL_VOTERS` | C → S | who picked what on a poll |
 | `0x0113` | `POLL_VOTERS` | S → C | the answer; refused for an anonymous poll |
 | `0x0114` | `EDIT_POLL` | C → S | the author changes a poll: options and settings until the first vote, the deadline always |
+| `0x0119` | `WORKSPACE_SETTINGS` | S → C | read-only: the workspace's settings clients act on, after `WORKSPACE_INFO` |
+| `0x011A` | `READ_RECEIPTS` | both | whether I share my read receipts: set or ask, and told |
 
 ## 10. Connection state machine
 

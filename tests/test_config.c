@@ -306,6 +306,39 @@ static void test_max_video_size(void) {
     refuses_removed("OPENCHIME_MAX_VIDEO_MESSAGE_SIZE", "167772160", "OPENCHIME_MAX_VIDEO_SIZE");
 }
 
+/* The workspace settings clients are told (CFG_VISIBLE): exactly the rows
+ * marked so, by their key, with the effective value; never a secret. */
+static void test_visible(void) {
+    char key[64], val[256];
+    setenv("OPENCHIME_DEFAULT_CHANNELS", "announcements,help", 1);
+    accepts("OPENCHIME_WORKSPACE_NAME", "Acme");
+    int saw_name = 0, saw_chan = 0;
+    size_t n = 0;
+    for (size_t i = 0; oc_config_visible(i, key, sizeof key, val, sizeof val); i++, n++) {
+        if (!strcmp(key, "workspace_name")) saw_name = !strcmp(val, "Acme");
+        if (!strcmp(key, "default_channels")) saw_chan = !strcmp(val, "announcements,help");
+    }
+    CHECK(saw_name && saw_chan);
+    size_t marked = 0;
+    for (const cfg_row *r = OC_CFG; r->name; r++) {
+        if (!(r->flags & CFG_VISIBLE)) continue;
+        marked++;
+        CHECK(!(r->flags & CFG_SECRET));
+    }
+    CHECK(n == marked);
+    unsetenv("OPENCHIME_DEFAULT_CHANNELS");
+    accepts("OPENCHIME_WORKSPACE_NAME", "x");
+    for (size_t i = 0; oc_config_visible(i, key, sizeof key, val, sizeof val); i++)
+        if (!strcmp(key, "default_channels")) CHECK(val[0] == '\0');
+    /* Who may add custom emoji: told as the word an operator writes. */
+    accepts("OPENCHIME_CUSTOM_EMOJI_ADD", "admins");
+    int saw = 0;
+    for (size_t i = 0; oc_config_visible(i, key, sizeof key, val, sizeof val); i++)
+        if (!strcmp(key, "custom_emoji_add")) saw = !strcmp(val, "admins");
+    CHECK(saw);
+    refuses("OPENCHIME_CUSTOM_EMOJI_ADD", "moderators");
+}
+
 /* Load with `mode` as OPENCHIME_MODE and `name=value` set. */
 static int load_in_mode(const char *mode, const char *name, const char *value, char *err, size_t cap) {
     setenv("OPENCHIME_MODE", mode, 1);
@@ -336,6 +369,45 @@ static void test_mode(void) {
     /* The values, and nothing else. */
     refuses("OPENCHIME_MODE", "production");
     refuses("OPENCHIME_MODE", "Development");   /* case matters */
+    /* The workspace's notices: a channel's name (any, checked at start), or
+     * empty; and on or off for a channel's own changes. */
+    accepts("OPENCHIME_NOTICE_MEMBER_JOINED", "general");
+    accepts("OPENCHIME_NOTICE_CHANNEL_CREATED", "#lobby");
+    accepts("OPENCHIME_NOTICE_CHANNEL_CHANGES", "on");
+    accepts("OPENCHIME_NOTICE_CHANNEL_CHANGES", "off");
+    refuses("OPENCHIME_NOTICE_CHANNEL_CHANGES", "sometimes");
+    /* The edit and delete windows: never, or whole seconds up to a year. */
+    accepts("OPENCHIME_EDIT_WINDOW", "never");
+    accepts("OPENCHIME_EDIT_WINDOW", "600");
+    accepts("OPENCHIME_DELETE_WINDOW", "31536000");
+    refuses("OPENCHIME_EDIT_WINDOW", "0");
+    refuses("OPENCHIME_EDIT_WINDOW", "10m");
+    refuses("OPENCHIME_DELETE_WINDOW", "31536001");
+    refuses("OPENCHIME_DELETE_WINDOW", "-5");
+    CHECK(oc_config_window_ms("") == -1 && oc_config_window_ms("never") == 0 && oc_config_window_ms("60") == 60000);
+    /* Who may notify a whole large channel, and from what size. */
+    accepts("OPENCHIME_BROADCAST_MENTIONS", "admins");
+    accepts("OPENCHIME_BROADCAST_MENTIONS", "nobody");
+    refuses("OPENCHIME_BROADCAST_MENTIONS", "members");
+    accepts("OPENCHIME_BROADCAST_LARGE", "50");
+    accepts("OPENCHIME_BROADCAST_LARGE", "500");
+    refuses("OPENCHIME_BROADCAST_LARGE", "501");
+    refuses("OPENCHIME_BROADCAST_LARGE", "-1");
+    refuses("OPENCHIME_BROADCAST_LARGE", "many");
+    /* The workspace's default quiet hours: a mode and the allowed window. */
+    accepts("OPENCHIME_DEFAULT_QUIET_HOURS", "weekdays 09:00-18:00");
+    accepts("OPENCHIME_DEFAULT_QUIET_HOURS", "everyday 22:00-07:30");
+    refuses("OPENCHIME_DEFAULT_QUIET_HOURS", "custom 09:00-18:00");
+    refuses("OPENCHIME_DEFAULT_QUIET_HOURS", "weekdays 9-18");
+    refuses("OPENCHIME_DEFAULT_QUIET_HOURS", "weekdays 09:00-09:00");
+    refuses("OPENCHIME_DEFAULT_QUIET_HOURS", "weekdays 09:00-25:00");
+    {
+        int qm = 0, qs = 0, qe = 0;
+        CHECK(oc_config_quiet_hours("weekdays 09:00-18:30", &qm, &qs, &qe) && qm == OC_DND_WEEKDAYS && qs == 540 && qe == 1110);
+        CHECK(!oc_config_quiet_hours("", &qm, &qs, &qe));
+    }
+    accepts("OPENCHIME_READ_RECEIPTS", "off");
+    refuses("OPENCHIME_READ_RECEIPTS", "admins");
     /* normal and demo: every development row refuses the start, naming itself
      * and the mode; the constants hold, and the managed rows want the ticket. */
     static const char *const modes[] = { "normal", "demo" };
@@ -409,7 +481,7 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 22);     /* OPENCHIME_MODE among them */
+    CHECK(operator_rows == 34);     /* OPENCHIME_MODE among them */
     CHECK(managed_rows == 7);
     CHECK(dev_rows == 4 + 12);      /* the daemon's four, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);
@@ -458,7 +530,7 @@ static void test_env_file(void) {
 int run_config_tests(void) {
     printf("test_config: strict numbers, bools and enums; unknown and removed names; the structured values; "
            "the cross-row rules; the data directory; the constants; the mode; reload; the registry's "
-           "own consistency; the EnvironmentFile\n");
+           "own consistency; the EnvironmentFile; what clients are told\n");
     char err[512];
     CHECK(oc_config_load(err, sizeof err) == 0);
     test_numbers();
@@ -468,6 +540,7 @@ int run_config_tests(void) {
     test_cross_rules();
     test_data_dir();
     test_constants();
+    test_visible();
     test_max_video_size();
     test_mode();
     test_reload_and_registry();

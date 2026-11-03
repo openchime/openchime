@@ -1225,6 +1225,31 @@ static const char MIGRATION_0065[] =
     ");"
     "CREATE INDEX poll_votes_option ON poll_votes(message_id, idx);";
 
+static const char MIGRATION_0066[] =
+    /* The workspace's own sender (OPENCHIME_WELCOME_MESSAGE): a user row that
+     * posts what the workspace says, so author joins, permalinks and exports
+     * work unchanged. Made the first time it is needed, not here: a row made
+     * now would take id 1 in a new workspace from its first person. It has no
+     * credential and no identity, so nothing signs in as it, and every list
+     * of people leaves it out. */
+    "ALTER TABLE users ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0 CHECK (is_system IN (0,1));";
+
+static const char MIGRATION_0067[] =
+    /* Whether a member set their own quiet hours (REQ-136), stored rather than
+     * inferred: one who never did follows the workspace's default
+     * (OPENCHIME_DEFAULT_QUIET_HOURS), and "off" chosen on purpose is not the
+     * same as never having chosen. A schedule set before this is their own. */
+    "ALTER TABLE users ADD COLUMN dnd_own INTEGER NOT NULL DEFAULT 0 CHECK (dnd_own IN (0,1));"
+    "UPDATE users SET dnd_own = 1 WHERE dnd_mode <> 0;";
+
+static const char MIGRATION_0068[] =
+    /* Read receipts as a choice (REQ-090): whether this person shares their
+     * read position, and since when, so that a read from before they shared
+     * -- or from while the workspace had receipts off (-1, until it is on
+     * again) -- is never shown to anyone. */
+    "ALTER TABLE users ADD COLUMN share_receipts INTEGER NOT NULL DEFAULT 1 CHECK (share_receipts IN (0,1));"
+    "ALTER TABLE users ADD COLUMN receipts_since_ms INTEGER NOT NULL DEFAULT 0;";
+
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
      * author is doing, and the daemon records that as its own object beside the
@@ -1572,6 +1597,9 @@ const oc_migration OC_MIGRATIONS[] = {
     { 63, MIGRATION_0063 },
     { 64, MIGRATION_0064 },
     { 65, MIGRATION_0065 },
+    { 66, MIGRATION_0066 },
+    { 67, MIGRATION_0067 },
+    { 68, MIGRATION_0068 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

@@ -11,7 +11,11 @@
  * and that a well-formed SigV4 Authorization header is actually sent. It
  * CANNOT prove a real provider accepts our signatures — a fake validates
  * whatever we produce by construction. That gap is closed by the manual
- * tests/manual/s3_smoke.c run against a live provider. */
+ * tests/manual/s3_smoke.c run against a live provider.
+ *
+ * The fake keeps a connection open across requests, as S3 does, one thread per
+ * connection, and counts the connections it accepts: that count is how the
+ * reuse of a kept connection (and the cases that must not reuse one) is seen. */
 
 #include "blobstore.h"
 #include "check.h"
@@ -24,6 +28,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -37,6 +43,18 @@ typedef struct {
     int      v6;         /* listening on [::1] rather than 127.0.0.1 */
     pthread_t th;
     volatile int stop;
+
+    /* One thread per accepted connection, each serving requests on it until
+     * the client closes it. */
+    pthread_mutex_t mu;               /* the object, the observations, the counts */
+    pthread_t conn_th[64];
+    int       conn_fd[64];
+    int       n_conn;
+    int       accepts;                /* connections accepted, for the reuse tests */
+    /* Behaviours a test asks for. */
+    int      close_after;            /* close after each response, saying nothing */
+    int      say_close;              /* answer `Connection: close`, but keep the socket */
+    int      drop_second;            /* once: read a connection's second request, close unanswered */
 
     /* Exactly one object, which is all the backend ever handles per request. */
     char     key[256];
@@ -96,73 +114,129 @@ static void send_all(int fd, const char *s, size_t n) {
     }
 }
 
+typedef struct { fake_s3 *f; int fd; } fake_conn;
+
+/* One request on `fd`, answered. 0 to go on serving the connection, -1 to stop
+ * (the client closed it, or the test asked for it closed). */
+static int fake_serve(fake_s3 *f, int fd, int nth) {
+    char buf[8192];
+    size_t total = 0;
+    long hlen = read_headers(fd, buf, sizeof buf, &total);
+    if (hlen < 0) return -1;
+    /* A PUT's body is read before the lock is taken: two uploads can be open
+     * at once, on two connections, and the client sends one body before the
+     * other; read under the lock, the second connection's wait for its body
+     * would hold up the first one's answer. */
+    uint8_t *put_body = NULL;
+    size_t want = 0, got = 0;
+    if (strncmp(buf, "PUT ", 4) == 0) {
+        char clv[32];
+        header_value(buf, "Content-Length", clv, sizeof clv);
+        want = (size_t)atoll(clv);
+        put_body = malloc(sizeof f->body);
+        if (!put_body) return -1;
+        size_t have = total - (size_t)hlen;
+        if (have > want) have = want;
+        if (have > sizeof f->body) have = sizeof f->body;
+        memcpy(put_body, buf + hlen, have);
+        got = have;
+        while (got < want && got < sizeof f->body) {
+            ssize_t n = read(fd, put_body + got, want - got);
+            if (n <= 0) break;
+            got += (size_t)n;
+        }
+    }
+    pthread_mutex_lock(&f->mu);
+    if (nth == 2 && f->drop_second) {          /* the stale-connection case */
+        f->drop_second = 0;
+        pthread_mutex_unlock(&f->mu);
+        free(put_body);
+        return -1;
+    }
+    sscanf(buf, "%15s %511s", f->last_method, f->last_uri);
+    header_value(buf, "Authorization", f->last_auth, sizeof f->last_auth);
+    header_value(buf, "x-amz-content-sha256", f->last_sha_hdr, sizeof f->last_sha_hdr);
+    f->saw_request = 1;
+
+    /* The object key is the path after /<bucket>/. */
+    const char *k = f->last_uri;
+    const char *slash = strchr(k + 1, '/');
+    snprintf(f->key, sizeof f->key, "%.255s", slash ? slash + 1 : k);
+    const char *conn_hdr = f->say_close ? "Connection: close\r\n" : "";
+    int close_after = f->close_after;
+
+    char head[256];
+    if (strcmp(f->last_method, "PUT") == 0) {
+        memcpy(f->body, put_body, got);
+        f->body_len = got;
+        f->have_obj = (got == want);
+        int n = snprintf(head, sizeof head, "HTTP/1.1 %s\r\nContent-Length: 0\r\n%s\r\n",
+                         f->have_obj ? "200 OK" : "400 Bad Request", conn_hdr);
+        send_all(fd, head, (size_t)n);
+    } else if (strcmp(f->last_method, "GET") == 0) {
+        if (!f->have_obj) {
+            int n = snprintf(head, sizeof head, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n%s\r\n", conn_hdr);
+            send_all(fd, head, (size_t)n);
+        } else {
+            int n = snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n%s\r\n",
+                             f->body_len, conn_hdr);
+            send_all(fd, head, (size_t)n);
+            send_all(fd, (const char *)f->body, f->body_len);
+        }
+    } else if (strcmp(f->last_method, "DELETE") == 0) {
+        f->have_obj = 0;
+        f->body_len = 0;
+        int n = snprintf(head, sizeof head, "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n%s\r\n", conn_hdr);
+        send_all(fd, head, (size_t)n);
+    } else {
+        int n = snprintf(head, sizeof head, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n%s\r\n", conn_hdr);
+        send_all(fd, head, (size_t)n);
+    }
+    pthread_mutex_unlock(&f->mu);
+    free(put_body);
+    return close_after ? -1 : 0;
+}
+
+static void *fake_conn_thread(void *arg) {
+    fake_conn fc = *(fake_conn *)arg;
+    free(arg);
+    /* Until the client closes it, or fake_stop shuts it down under it. */
+    for (int nth = 1; fake_serve(fc.f, fc.fd, nth) == 0; nth++) {}
+    shutdown(fc.fd, SHUT_RDWR);
+    return NULL;
+}
+
 static void *fake_thread(void *arg) {
     fake_s3 *f = arg;
     for (;;) {
         int fd = accept(f->listen_fd, NULL, NULL);
         if (fd < 0) { if (f->stop) break; continue; }
         if (f->stop) { close(fd); break; }
-
-        char buf[8192];
-        size_t total = 0;
-        long hlen = read_headers(fd, buf, sizeof buf, &total);
-        if (hlen < 0) { close(fd); continue; }
-
-        sscanf(buf, "%15s %511s", f->last_method, f->last_uri);
-        header_value(buf, "Authorization", f->last_auth, sizeof f->last_auth);
-        header_value(buf, "x-amz-content-sha256", f->last_sha_hdr, sizeof f->last_sha_hdr);
-        f->saw_request = 1;
-
-        /* The object key is the path after /<bucket>/. */
-        const char *k = f->last_uri;
-        const char *slash = strchr(k + 1, '/');
-        snprintf(f->key, sizeof f->key, "%.255s", slash ? slash + 1 : k);
-
-        if (strcmp(f->last_method, "PUT") == 0) {
-            char clv[32];
-            header_value(buf, "Content-Length", clv, sizeof clv);
-            size_t want = (size_t)atoll(clv);
-            /* Body bytes that arrived with the headers. */
-            size_t have = total - (size_t)hlen;
-            if (have > want) have = want;
-            if (have > sizeof f->body) have = sizeof f->body;
-            memcpy(f->body, buf + hlen, have);
-            size_t got = have;
-            while (got < want && got < sizeof f->body) {
-                ssize_t n = read(fd, f->body + got, want - got);
-                if (n <= 0) break;
-                got += (size_t)n;
-            }
-            f->body_len = got;
-            f->have_obj = (got == want);
-            const char *resp = f->have_obj
-                ? "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                : "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            send_all(fd, resp, strlen(resp));
-        } else if (strcmp(f->last_method, "GET") == 0) {
-            if (!f->have_obj) {
-                const char *resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                send_all(fd, resp, strlen(resp));
-            } else {
-                char head[256];
-                int n = snprintf(head, sizeof head,
-                                 "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n"
-                                 "Connection: close\r\n\r\n", f->body_len);
-                send_all(fd, head, (size_t)n);
-                send_all(fd, (const char *)f->body, f->body_len);
-            }
-        } else if (strcmp(f->last_method, "DELETE") == 0) {
-            f->have_obj = 0;
-            f->body_len = 0;
-            const char *resp = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            send_all(fd, resp, strlen(resp));
-        } else {
-            const char *resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            send_all(fd, resp, strlen(resp));
+        fake_conn *fc = malloc(sizeof *fc);
+        pthread_mutex_lock(&f->mu);
+        int slot = f->n_conn < 64 && fc ? f->n_conn++ : -1;
+        if (slot >= 0) { f->accepts++; f->conn_fd[slot] = fd; }
+        pthread_mutex_unlock(&f->mu);
+        if (slot < 0) { free(fc); close(fd); continue; }
+        fc->f = f; fc->fd = fd;
+        if (pthread_create(&f->conn_th[slot], NULL, fake_conn_thread, fc) != 0) {
+            free(fc); shutdown(fd, SHUT_RDWR); f->conn_th[slot] = 0;
         }
-        close(fd);
     }
     return NULL;
+}
+
+static int fake_accepts(fake_s3 *f) {
+    pthread_mutex_lock(&f->mu);
+    int n = f->accepts;
+    pthread_mutex_unlock(&f->mu);
+    return n;
+}
+
+static void fake_set(fake_s3 *f, int *field, int v) {
+    pthread_mutex_lock(&f->mu);
+    *field = v;
+    pthread_mutex_unlock(&f->mu);
 }
 
 /* The loopback of `v6`'s family, at `port` (0: the kernel picks). */
@@ -180,6 +254,7 @@ static socklen_t loop_addr(struct sockaddr_storage *a, int v6, int port) {
 
 static int fake_start(fake_s3 *f, int v6) {
     memset(f, 0, sizeof *f);
+    pthread_mutex_init(&f->mu, NULL);
     f->v6 = v6;
     f->listen_fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
     if (f->listen_fd < 0) return -1;
@@ -206,6 +281,15 @@ static void fake_stop(fake_s3 *f) {
     }
     pthread_join(f->th, NULL);
     close(f->listen_fd);
+    /* Every connection's thread: its client has closed it (each store is
+     * closed first), or this wakes it. */
+    for (int i = 0; i < f->n_conn; i++) {
+        shutdown(f->conn_fd[i], SHUT_RDWR);
+        if (f->conn_th[i]) pthread_join(f->conn_th[i], NULL);
+        close(f->conn_fd[i]);
+    }
+    f->n_conn = 0;
+    pthread_mutex_destroy(&f->mu);
 }
 
 /* --- the test -------------------------------------------------------------- */
@@ -245,9 +329,13 @@ static void round_trip(oc_blobstore *bs, fake_s3 *f, const char *key,
         CHECK(oc_blob_put_chunk(w, src + off, n) == 0);
     }
     CHECK(oc_blob_put_commit(w) == 0);
-    /* The fake reassembled exactly the bytes we streamed. */
+    /* The fake reassembled exactly the bytes we streamed. Read under its lock:
+     * its connection threads write these, and a socket is no ordering a race
+     * detector can see. */
+    pthread_mutex_lock(&f->mu);
     CHECK(f->body_len == size);
     CHECK(memcmp(f->body, src, size) == 0);
+    pthread_mutex_unlock(&f->mu);
 
     uint64_t reported = 0;
     oc_blob_reader *r = oc_blob_get_begin(bs, key, &reported);
@@ -267,9 +355,196 @@ static void round_trip(oc_blobstore *bs, fake_s3 *f, const char *key,
     free(src); free(got);
 }
 
+/* A whole object fetched; 1 when it is `len` bytes equal to `want`. */
+static int get_all(oc_blobstore *bs, const char *key, const void *want, size_t len) {
+    uint8_t got[256];
+    uint64_t sz = 0;
+    oc_blob_reader *r = oc_blob_get_begin(bs, key, &sz);
+    if (!r) return 0;
+    size_t total = 0;
+    for (long n; total < sizeof got && (n = oc_blob_get_chunk(r, got + total, sizeof got - total)) > 0; )
+        total += (size_t)n;
+    oc_blob_get_close(r);
+    return sz == len && total == len && memcmp(got, want, len) == 0;
+}
+
+static int put_all(oc_blobstore *bs, const char *key, const void *data, size_t len) {
+    oc_blob_writer *w = oc_blob_put_begin(bs, key, len);
+    if (!w) return -1;
+    if (oc_blob_put_chunk(w, data, len) != 0) { oc_blob_put_abort(w); return -1; }
+    return oc_blob_put_commit(w);
+}
+
+/* Connections are kept between requests (blob_s3.c, "Connections are kept"):
+ * successive requests share one; one the server closed while it was idle is
+ * left for a new one without an error; one that fails before any byte of its
+ * response is retried once on a new one; and a response that says
+ * `Connection: close` is not kept. Each on a store of its own, so the counts
+ * start from nothing kept. */
+static void keepalive_tests(fake_s3 *f) {
+    /* Successive requests: one connection. */
+    {
+        oc_blobstore *bs = oc_blobstore_open_remote(&g_s3cfg);
+        CHECK(bs != NULL);
+        if (bs) {
+            int a = fake_accepts(f);
+            CHECK(put_all(bs, "kkkk0001", "kept", 4) == 0);
+            CHECK(get_all(bs, "kkkk0001", "kept", 4));
+            CHECK(oc_blob_delete(bs, "kkkk0001") == 0);
+            CHECK(fake_accepts(f) == a + 1);
+            oc_blobstore_close(bs);
+        }
+    }
+    /* The server closes the kept connection while it is idle: the next request
+     * goes on a new one, and succeeds. */
+    {
+        oc_blobstore *bs = oc_blobstore_open_remote(&g_s3cfg);
+        CHECK(bs != NULL);
+        if (bs) {
+            fake_set(f, &f->close_after, 1);
+            CHECK(put_all(bs, "kkkk0002", "idle", 4) == 0);
+            fake_set(f, &f->close_after, 0);
+            int a = fake_accepts(f);
+            CHECK(get_all(bs, "kkkk0002", "idle", 4));
+            CHECK(fake_accepts(f) == a + 1);
+            oc_blobstore_close(bs);
+        }
+    }
+    /* A kept connection that takes the request and answers nothing (closed as
+     * the request went out): retried once on a new one, and no error. */
+    {
+        oc_blobstore *bs = oc_blobstore_open_remote(&g_s3cfg);
+        CHECK(bs != NULL);
+        if (bs) {
+            int a = fake_accepts(f);
+            fake_set(f, &f->drop_second, 1);
+            CHECK(put_all(bs, "kkkk0003", "late", 4) == 0);
+            CHECK(get_all(bs, "kkkk0003", "late", 4));
+            CHECK(fake_accepts(f) == a + 2);
+            fake_set(f, &f->drop_second, 0);
+            oc_blobstore_close(bs);
+        }
+    }
+    /* `Connection: close` is believed: the socket is left open by the server,
+     * and still each request opens its own. */
+    {
+        oc_blobstore *bs = oc_blobstore_open_remote(&g_s3cfg);
+        CHECK(bs != NULL);
+        if (bs) {
+            fake_set(f, &f->say_close, 1);
+            int a = fake_accepts(f);
+            CHECK(oc_blob_delete(bs, "kkkk0002") == 0);
+            CHECK(oc_blob_delete(bs, "kkkk0003") == 0);
+            CHECK(fake_accepts(f) == a + 2);
+            fake_set(f, &f->say_close, 0);
+            oc_blobstore_close(bs);
+        }
+    }
+}
+
+/* An upload on a kept connection that goes stale before the store answers
+ * (the server takes the request and closes it unanswered): the backend says
+ * EAGAIN, since the body cannot be sent twice from there; the cache's
+ * uploader, which has the blob, sends it once more on a new connection, and
+ * does not count it as the store failing. */
+static int uploaded(oc_blobstore *bs, uint64_t n, oc_blob_cache_stats *st) {
+    oc_blobstore_cache_kick(bs);
+    return oc_blobstore_cache_stats(bs, st) == 0 && st->uploaded >= n && st->pending_count == 0;
+}
+static int wait_uploaded(oc_blobstore *bs, uint64_t n, oc_blob_cache_stats *st) {
+    return WAIT_UNTIL(uploaded(bs, n, st), 5000);
+}
+static void stale_put_tests(fake_s3 *f, const char *dir) {
+    {
+        oc_blobstore *bs = oc_blobstore_open_remote(&g_s3cfg);
+        CHECK(bs != NULL);
+        if (bs) {
+            int a = fake_accepts(f);
+            CHECK(put_all(bs, "kkkk0010", "kept", 4) == 0);
+            fake_set(f, &f->drop_second, 1);
+            errno = 0;
+            CHECK(put_all(bs, "kkkk0011", "late", 4) == -1 && errno == EAGAIN);
+            CHECK(put_all(bs, "kkkk0011", "late", 4) == 0);      /* a new connection */
+            CHECK(get_all(bs, "kkkk0011", "late", 4));
+            CHECK(fake_accepts(f) == a + 2);
+            fake_set(f, &f->drop_second, 0);
+            oc_blobstore_close(bs);
+        }
+    }
+    /* Two kept connections idle; one goes stale under a PUT: the other is
+     * dropped with it, so the retry reaches the store on a new connection
+     * rather than on another socket kept as long. */
+    {
+        oc_blobstore *bs = oc_blobstore_open_remote(&g_s3cfg);
+        CHECK(bs != NULL);
+        if (bs) {
+            oc_blob_writer *w1 = oc_blob_put_begin(bs, "abcd0020", 2);
+            oc_blob_writer *w2 = oc_blob_put_begin(bs, "abcd0021", 2);
+            CHECK(w1 && w2);
+            CHECK(w1 && oc_blob_put_chunk(w1, "w1", 2) == 0 && oc_blob_put_commit(w1) == 0);
+            CHECK(w2 && oc_blob_put_chunk(w2, "w2", 2) == 0 && oc_blob_put_commit(w2) == 0);
+            fake_set(f, &f->drop_second, 1);
+            errno = 0;
+            CHECK(put_all(bs, "abcd0022", "late", 4) == -1 && errno == EAGAIN);
+            int a = fake_accepts(f);
+            CHECK(put_all(bs, "abcd0022", "late", 4) == 0);
+            CHECK(fake_accepts(f) == a + 1);                       /* a new connection */
+            fake_set(f, &f->drop_second, 0);
+            oc_blobstore_close(bs);
+        }
+    }
+    {
+        char cdir[700];
+        oc_test_path(cdir, sizeof cdir, dir, "stale-cache");
+        mkdir(cdir, 0700);
+        oc_blobstore *bs = oc_blobstore_open(cdir, &g_s3cfg);
+        CHECK(bs != NULL);
+        if (bs) {
+            oc_blob_cache_policy p;
+            memset(&p, 0, sizeof p);
+            p.retry_base_ms = 10000; p.retry_cap_ms = 10000; p.pass_ms = 20;   /* a backoff would show */
+            oc_blobstore_cache_policy(bs, &p);
+            oc_blob_cache_stats st;
+            CHECK(put_all(bs, "abcd0012", "first", 5) == 0);
+            CHECK(wait_uploaded(bs, 1, &st));
+            fake_set(f, &f->drop_second, 1);
+            CHECK(put_all(bs, "abcd0013", "second", 6) == 0);
+            CHECK(wait_uploaded(bs, 2, &st));
+            CHECK(st.failures == 0 && st.next_try_ms == 0 && st.last_error[0] == '\0');
+            fake_set(f, &f->drop_second, 0);
+            oc_blobstore_close(bs);
+        }
+    }
+    /* Short of disk the cache streams an upload straight to the store, with
+     * nothing kept to send again: on a new connection each time, so a kept
+     * one gone stale is never under it. The second upload would be the kept
+     * connection's second request, the one the fake drops. */
+    {
+        char cdir[700];
+        oc_test_path(cdir, sizeof cdir, dir, "direct-cache");
+        mkdir(cdir, 0700);
+        oc_blobstore *bs = oc_blobstore_open(cdir, &g_s3cfg);
+        CHECK(bs != NULL);
+        if (bs) {
+            oc_blob_cache_policy p;
+            memset(&p, 0, sizeof p);
+            p.floor_bytes = UINT64_MAX / 4;   /* no room: every upload goes direct */
+            oc_blobstore_cache_policy(bs, &p);
+            int a = fake_accepts(f);
+            CHECK(put_all(bs, "abcd0030", "first", 5) == 0);
+            fake_set(f, &f->drop_second, 1);
+            CHECK(put_all(bs, "abcd0031", "second", 6) == 0);
+            CHECK(fake_accepts(f) == a + 2);
+            CHECK(get_all(bs, "abcd0031", "second", 6));
+            fake_set(f, &f->drop_second, 0);
+            oc_blobstore_close(bs);
+        }
+    }
+}
+
 int run_blob_s3_tests(void) {
     printf("test_blob_s3: fake S3 endpoint: streaming put/get round-trip, "
-           "sizes, SigV4 header shape, delete, 404, config selection\n");
+           "sizes, SigV4 header shape, delete, 404, config selection, kept connections\n");
 
     fake_s3 *f = &g_fake;
     CHECK(fake_start(f, 0) == 0);
@@ -283,6 +558,7 @@ int run_blob_s3_tests(void) {
 
     /* The backend itself, uncached: every call is a request the fake sees.
      * The cache in front of it has its own suite (test_blob_cache.c). */
+    stale_put_tests(f, dir);
     oc_blobstore *bs = oc_blobstore_open_remote(&g_s3cfg);
     CHECK(bs != NULL);
     CHECK(!oc_blobstore_is_local(bs));
@@ -297,6 +573,7 @@ int run_blob_s3_tests(void) {
     /* The request the backend actually sent: path-style URI, SigV4 header with
      * the right algorithm + credential scope, and the unsigned-payload marker
      * that lets the body stream. */
+    pthread_mutex_lock(&f->mu);
     CHECK(f->saw_request == 1);
     CHECK(strncmp(f->last_uri, "/testbucket/", 12) == 0);
     CHECK(strncmp(f->last_auth, "AWS4-HMAC-SHA256 ", 17) == 0);
@@ -305,6 +582,7 @@ int run_blob_s3_tests(void) {
     CHECK(strstr(f->last_auth, "SignedHeaders=") != NULL);
     CHECK(strstr(f->last_auth, "Signature=") != NULL);
     CHECK(strcmp(f->last_sha_hdr, "UNSIGNED-PAYLOAD") == 0);
+    pthread_mutex_unlock(&f->mu);
 
     /* With a prefix, the keys go under it, and still round-trip. */
     {
@@ -313,7 +591,9 @@ int run_blob_s3_tests(void) {
         CHECK(pb != NULL);
         if (pb) {
             round_trip(pb, f, "cccc0001", 1000, 4096);
+            pthread_mutex_lock(&f->mu);
             CHECK(strncmp(f->last_uri, "/testbucket/p/q/2/cccc0001", 26) == 0);
+            pthread_mutex_unlock(&f->mu);
             oc_blobstore_close(pb);
         }
         g_s3cfg.prefix = NULL;
@@ -331,6 +611,8 @@ int run_blob_s3_tests(void) {
     CHECK(oc_blob_delete(bs, "aaaa0009") == 0);
 
     oc_blobstore_close(bs);
+
+    keepalive_tests(f);
 
     /* --- backend selection is by configuration (ARCH-70) ------------------- */
     clear_env();
@@ -379,7 +661,9 @@ int run_blob_s3_tests(void) {
     CHECK(bs6 != NULL);
     if (bs6) {
         round_trip(bs6, f, "cccc0001", 5000, 4096);
+        pthread_mutex_lock(&f->mu);
         CHECK(f->saw_request == 1);
+        pthread_mutex_unlock(&f->mu);
         oc_blobstore_close(bs6);
     }
     clear_env();

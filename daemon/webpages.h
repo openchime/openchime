@@ -56,6 +56,10 @@ typedef enum {
     OC_PERR_DEVICE_UNKNOWN,     /* a device code not pending */
     OC_PERR_DEVICE_EXPIRED,
     OC_PERR_RESET_SPENT,        /* a reset used, or a day old */
+    OC_PERR_NAME_EMPTY,         /* a demo visitor's name (AUTH.md §8.12): none given */
+    OC_PERR_NAME_LONG,
+    OC_PERR_NAME_CHARS,         /* a control character, or not UTF-8 */
+    OC_PERR_NAME_RESERVED,      /* the demo's own, or an owner's or admin's */
     OC_PERR_INTERNAL,
     OC_PERR_COUNT
 } oc_page_err;
@@ -108,6 +112,13 @@ typedef struct {
      * name for a new one. */
     int          pk_mode;
     const char  *pk_challenge, *pk_rp, *pk_creds, *pk_user, *pk_name;
+    /* SIGNUP in a demo workspace (AUTH.md §8.12): the one-field form -- the
+     * visitor's name, prefilled or "" -- the demo terms' address, and the
+     * minutes until the nightly erase at 00:00 UTC. */
+    int          demo;
+    const char  *name;
+    const char  *terms_url;
+    unsigned     demo_left_min;
 } oc_page;
 
 /* The page's data-oc-page and data-oc-result values (the latter "" when the
@@ -131,9 +142,12 @@ const char *oc_page_unavailable(size_t *len);
  * to form-action too). `redirect_uri` may be NULL. Returns 0, -1 if `cap` is
  * too small. */
 int oc_page_headers(const char *redirect_uri, char *out, size_t cap);
-/* The same, for a page that runs a script the daemon serves (a passkey's, or
- * the recovery codes' copy button: `script-src 'self'`) when `scripts`. */
-int oc_page_headers_ex(const char *redirect_uri, int scripts, char *out, size_t cap);
+/* The same, with what the page needs beyond that, OC_PAGE_HDR_* or'd: a script
+ * the daemon serves (a passkey's, or the recovery codes' copy button:
+ * `script-src 'self'`), or a prefetch of the web client from this origin (the
+ * demo's sign-up page: `default-src 'self'`, scripts still none). */
+enum { OC_PAGE_HDR_SCRIPTS = 1, OC_PAGE_HDR_PREFETCH = 2 };
+int oc_page_headers_ex(const char *redirect_uri, int opts, char *out, size_t cap);
 
 /* The passkey script (AUTH.md §8.6), served at /webauthn.js, and its SRI
  * value ("sha256-<base64>") for the page that loads it. */

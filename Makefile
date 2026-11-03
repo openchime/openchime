@@ -2,12 +2,13 @@
 #   make              the daemon (openchimed), quickly: no speech, no summaries, no web client
 #   make full         everything: the daemon with every feature and its data, and every client
 #   make run          a dev daemon on port 8443, every interface, alice/bob
-#   make test         the host test suite
+#   make test         the fast tests, before every push (local)
+#   make test-merge   everything a pull request must pass (CI only; PART=plain|threads)
+#   make test-release the checks on what the release ships (CI only; PART=packages|image|windows)
 #   make clients      every client below
 #   make linux        the Linux client (the TUI today; the GUI when it exists)
 #   make windows      the Windows GUI and TUI (mingw-w64)
 #   make web          the browser client (emsdk)
-#   make web-test     the browser client's checks, in a headless Chromium
 #   make clean        everything built, except the downloaded speech models
 #   make distclean    everything built, and the remembered configuration
 # There is one build: what a box is for -- a deployment, the tests and
@@ -25,14 +26,15 @@
 # so `make full` needs only cc, cmake, python3, git, curl, xz, bzip2 and nasm
 # installed.
 #
-# CI's own: make test-ci, make check-release-cc. Tool binaries are built by
+# Each test is a script in scripts/test/ that one of these targets calls; the
+# workflows call only the targets. Tool binaries are built by
 # their path (make build/demo_client, build/bench_load, build/bench_loop,
 # build/tuikit-demo, build/tts_pack, build/s3_smoke, build/e2e_client,
-# build/signin, build/sdltext_test.exe, build/gfx_test.exe). The rules live in
-# mk/, one file per concern; scripts/check/make_targets.sh keeps the typed
+# build/signin, build/fuzz/frame, build/fuzz/framebuf, build/fuzz/seeds). The rules live in
+# mk/, one file per concern; scripts/test/local/make_targets.sh keeps the typed
 # targets (the list above and PUBLIC/INTERNAL) in step, not this tool list.
-PUBLIC   := all full run test clients linux windows web web-test clean distclean
-INTERNAL := test-ci check-release-cc ci-only test-ci-plain test-ci-threads FORCE
+PUBLIC   := all full run test test-merge test-release clients linux windows web clean distclean
+INTERNAL := test-merge-plain test-merge-threads test-release-packages test-release-image test-release-windows check-release-cc FORCE
 .PHONY: $(PUBLIC) $(INTERNAL)
 
 CC ?= cc
@@ -140,12 +142,33 @@ full:
 # who can reach this machine can sign in with those passwords. Run it only on
 # a trusted network or behind a firewall. Connect from another terminal:
 # build/openchime-tui 127.0.0.1 8443, then sign in as alice/pw
+#
+# LEAN=1 runs the same daemon under the lean profile's ceiling (ARCH-4,
+# REQ-210): 256 MB with no swap and one CPU, in a transient systemd user scope,
+# so running out of memory ends in the kill a small box gives rather than
+# swapping. An approximation of a small machine, not a copy of one. Where no
+# user scope can be made it stops and says so; it never runs unconstrained.
+LEAN ?= 0
+LEAN_SCOPE := systemd-run --user --scope --quiet -p MemoryMax=256M -p MemorySwapMax=0 -p CPUQuota=100%
+# The probe reads the limits back from inside a scope: systemd accepts a limit
+# for a controller the user manager was not delegated and applies nothing, so
+# a scope that starts proves nothing. 268435456 is 256M; "100000 100000" one CPU.
+LEAN_PROBE := sh -c 'cg=$$(sed -n "s/^0:://p" /proc/self/cgroup); \
+	[ "$$(cat /sys/fs/cgroup$$cg/memory.max 2>/dev/null)" = 268435456 ] && \
+	[ "$$(cat /sys/fs/cgroup$$cg/memory.swap.max 2>/dev/null)" = 0 ] && \
+	[ "$$(cat /sys/fs/cgroup$$cg/cpu.max 2>/dev/null)" = "100000 100000" ]'
 run: $(BIN) $(TUI_BIN)
 	@mkdir -p /tmp/openchime-dev
+	@if [ "$(LEAN)" = 1 ] && ! $(LEAN_SCOPE) $(LEAN_PROBE) >/dev/null 2>&1; then \
+	   echo "make run LEAN=1: cannot create a systemd user scope here (no systemd, no user session, or cgroup v2 delegation of the memory and cpu controllers missing)." >&2; \
+	   echo "The daemon was not started: it would have run without the limits. Run it on a host with a systemd user session, or in a 256 MB, one-CPU VM or container; or run make run without LEAN." >&2; \
+	   exit 1; \
+	 fi
 	@echo "openchime dev daemon -> port 8443 on EVERY interface, not just loopback  (users: alice/pw, bob/pw)"
+	@[ "$(LEAN)" != 1 ] || echo "lean profile: MemoryMax=256M, MemorySwapMax=0, CPUQuota=100% (one CPU), in a systemd user scope"
 	@echo "connect: build/openchime-tui 127.0.0.1 8443  (sign in as alice/pw)"
 	@OPENCHIME_MODE=development OPENCHIME_DATA_DIR=/tmp/openchime-dev OPENCHIME_PORT=8443 OPENCHIME_HEALTH_PORT=8080 \
-	 OPENCHIME_DEV_USERS="alice:pw:owner,bob:pw:member" ./$(BIN)
+	 OPENCHIME_DEV_USERS="alice:pw:owner,bob:pw:member" $(if $(filter 1,$(LEAN)),$(LEAN_SCOPE) -- )./$(BIN)
 
 # Every client the tree builds, one per platform: macOS, iOS and Android join
 # this list when they exist.

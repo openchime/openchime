@@ -1438,6 +1438,437 @@ static void test_table_preview(void) {
     oc_model_free(&m);
 }
 
+/* The workspace's settings (WORKSPACE_SETTINGS): held as told, read by key,
+ * replaced whole by the next. */
+static void test_workspace_settings_model(void) {
+    oc_model m; oc_model_init(&m);
+    char v[64];
+    CHECK(oc_model_workspace_setting(&m, "default_channels", v, sizeof v) == 0 && v[0] == '\0');
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_WORKSPACE_SETTINGS;
+    e.body = strdup("workspace_name\x1f" "Acme\x1e" "default_channels\x1f" "announcements,help\x1e");
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_workspace_setting(&m, "workspace_name", v, sizeof v) == 1 && !strcmp(v, "Acme"));
+    CHECK(oc_model_workspace_setting(&m, "default_channels", v, sizeof v) == 1 && !strcmp(v, "announcements,help"));
+    CHECK(oc_model_workspace_setting(&m, "default", v, sizeof v) == 0);   /* a prefix is not a key */
+    memset(&e, 0, sizeof e); e.type = OC_EV_WORKSPACE_SETTINGS;
+    e.body = strdup("workspace_name\x1f\x1e");
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_workspace_setting(&m, "workspace_name", v, sizeof v) == 1 && v[0] == '\0');
+    CHECK(oc_model_workspace_setting(&m, "default_channels", v, sizeof v) == 0);
+    /* Who may add custom emoji: everyone unless told otherwise; with
+     * `admins`, a member may not and an admin may. */
+    CHECK(oc_model_may_add_emoji(&m) == 1);
+    m.user_id = 7;
+    m.users = calloc(1, sizeof *m.users);
+    m.n_users = 1;
+    if (m.users) { m.users[0].user_id = 7; m.users[0].role = OC_ROLE_MEMBER; }
+    memset(&e, 0, sizeof e); e.type = OC_EV_WORKSPACE_SETTINGS;
+    e.body = strdup("custom_emoji_add\x1f" "admins\x1e");
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_may_add_emoji(&m) == 0);
+    if (m.users) m.users[0].role = OC_ROLE_ADMIN;
+    CHECK(oc_model_may_add_emoji(&m) == 1);
+    oc_model_free(&m);
+}
+
+/* The edit and delete windows as the client reads them (REQ-051/052). */
+static void test_change_windows_model(void) {
+    oc_model m; oc_model_init(&m);
+    const uint64_t sent = 1000000;
+    CHECK(oc_model_may_change_own(&m, sent, 1, sent + 400ull * 86400000) == 1);   /* not told: always */
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_WORKSPACE_SETTINGS;
+    e.body = strdup("edit_window\x1f" "60\x1e" "delete_window\x1f" "never\x1e");
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_may_change_own(&m, sent, 1, sent + 59000) == 1);
+    CHECK(oc_model_may_change_own(&m, sent, 1, sent + 61000) == 0);
+    CHECK(oc_model_may_change_own(&m, sent, 1, sent - 5000) == 1);   /* a clock behind the server's */
+    CHECK(oc_model_may_change_own(&m, sent, 0, sent) == 0);
+    memset(&e, 0, sizeof e); e.type = OC_EV_WORKSPACE_SETTINGS;
+    e.body = strdup("edit_window\x1f\x1e");
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_may_change_own(&m, sent, 1, sent + 61000) == 1);
+    CHECK(oc_model_may_change_own(&m, sent, 0, sent + 61000) == 1);
+    oc_model_free(&m);
+}
+
+/* What a broadcast mention will do, as the composer reads it (REQ-221). */
+static void bc_settings(oc_model *m, const char *body) {
+    oc_ev e; memset(&e, 0, sizeof e); e.type = OC_EV_WORKSPACE_SETTINGS; e.body = strdup(body);
+    oc_model_apply(m, &e);
+}
+static void bc_me(oc_model *m, uint8_t role) {
+    oc_ev e; memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.status = role;
+    e.body = strdup("me"); oc_model_apply(m, &e);
+}
+static void test_broadcast_model(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    bc_me(&m, OC_ROLE_MEMBER);
+    oc_model_chanmem_begin(&m, 10);
+    for (uint64_t uid = 1; uid <= 5; uid++) {
+        oc_ev e; memset(&e, 0, sizeof e);
+        e.type = OC_EV_CHAN_MEMBER; e.channel_id = 10; e.user_id = uid;
+        oc_model_apply(&m, &e);
+    }
+    m.chanmem_loading = 0;
+    char tok[24]; size_t n = 0;
+
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "hello @bob", tok, sizeof tok, &n) == -1);
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@channel standup", tok, sizeof tok, &n) == 1);   /* not told */
+    CHECK(!strcmp(tok, "@channel") && n == 5);
+
+    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "0\x1e");
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "ok @here", tok, sizeof tok, &n) == 0);
+    CHECK(!strcmp(tok, "@here"));
+    bc_me(&m, OC_ROLE_ADMIN);
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "ok @here", tok, sizeof tok, &n) == 1);   /* 0: no threshold to confirm */
+
+    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "5\x1e");
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@everyone", tok, sizeof tok, &n) == 2);   /* at the threshold */
+    bc_me(&m, OC_ROLE_MEMBER);
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@everyone", tok, sizeof tok, &n) == 0);
+    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "6\x1e");
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@everyone", tok, sizeof tok, &n) == 1);   /* under it */
+    /* Another channel's size is not known, nor is this one's while its list
+     * is loading: no guess, the composer asks for the list. */
+    CHECK(oc_model_broadcast_will_notify(&m, 11, "@everyone", tok, sizeof tok, &n) == 3 && n == 0);
+    m.chanmem_loading = 1;
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@everyone", tok, sizeof tok, &n) == 3 && n == 0);
+    m.chanmem_loading = 0;
+
+    bc_settings(&m, "broadcast_mentions\x1f" "nobody\x1e" "broadcast_large\x1f" "0\x1e");
+    bc_me(&m, OC_ROLE_OWNER);
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@channel", tok, sizeof tok, &n) == 0);
+    /* With no threshold every channel is large: answered without a list. */
+    CHECK(oc_model_broadcast_will_notify(&m, 11, "@channel", tok, sizeof tok, &n) == 0);
+    oc_model_free(&m);
+}
+
+/* A channel of more than the member list's cap (OC_MAX_MEMBER_LIST): the
+ * list stops at the cap, so the confirmation names no number -- the cap's
+ * would not be the channel's -- and says it notifies everyone here. */
+static void test_broadcast_at_cap(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    bc_me(&m, OC_ROLE_ADMIN);
+    oc_model_chanmem_begin(&m, 10);
+    for (uint64_t uid = 1; uid <= OC_MAX_MEMBER_LIST; uid++) {
+        oc_ev e; memset(&e, 0, sizeof e);
+        e.type = OC_EV_CHAN_MEMBER; e.channel_id = 10; e.user_id = uid;
+        oc_model_apply(&m, &e);
+    }
+    m.chanmem_loading = 0;
+    CHECK(m.n_chanmem == OC_MAX_MEMBER_LIST);
+    bc_settings(&m, "broadcast_mentions\x1f" "everyone\x1e" "broadcast_large\x1f" "500\x1e");
+    char tok[24], whom[48]; size_t n = 99;
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@channel now", tok, sizeof tok, &n) == 2);
+    CHECK(n == 0);
+    oc_model_broadcast_whom(n, whom, sizeof whom);
+    CHECK(!strcmp(whom, "everyone here"));   /* contract: REQ-221 names no number past the list's cap */
+    CHECK(!strpbrk(whom, "0123456789"));
+    /* One under the cap is a count, and named. */
+    m.n_chanmem = OC_MAX_MEMBER_LIST - 1;
+    bc_settings(&m, "broadcast_mentions\x1f" "everyone\x1e" "broadcast_large\x1f" "499\x1e");
+    CHECK(oc_model_broadcast_will_notify(&m, 10, "@channel now", tok, sizeof tok, &n) == 2);
+    oc_model_broadcast_whom(n, whom, sizeof whom);
+    CHECK(n == OC_MAX_MEMBER_LIST - 1 && !strcmp(whom, "499 people"));   /* contract: REQ-221 names how many */
+    oc_model_free(&m);
+}
+
+/* The one judgement every send path makes (oc_model_broadcast_check,
+ * REQ-221): the composer, Send later, the New message pane and a reply from a
+ * notification each send what it answers, to a channel that may not be the
+ * one whose member list is loaded. Its answer comes only from the target
+ * channel's own list: another channel's, or one still loading, is asked for. */
+static void bc_fill(oc_model *m, uint64_t cid, uint64_t count) {
+    oc_model_chanmem_begin(m, cid);
+    for (uint64_t uid = 1; uid <= count; uid++) {
+        oc_ev e; memset(&e, 0, sizeof e);
+        e.type = OC_EV_CHAN_MEMBER; e.channel_id = cid; e.user_id = uid;
+        oc_model_apply(m, &e);
+    }
+    m->chanmem_loading = 0;
+}
+static void test_broadcast_check(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    bc_me(&m, OC_ROLE_MEMBER);
+    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "5\x1e");
+    bc_fill(&m, 10, 5);
+    oc_bc_check v;
+
+    oc_model_broadcast_check(&m, 10, "hello @me", &v);
+    CHECK(v.act == OC_BC_SEND && !v.note[0]);
+    /* Another channel than the loaded one: its list is asked for. */
+    oc_model_broadcast_check(&m, 11, "@here quick one", &v);
+    CHECK(v.act == OC_BC_LOAD && !strcmp(v.token, "@here"));
+    CHECK(v.note[0] && strstr(v.note, v.token));
+    /* The target's own list, still loading: the same. */
+    m.chanmem_loading = 1;
+    oc_model_broadcast_check(&m, 10, "@here quick one", &v);
+    CHECK(v.act == OC_BC_LOAD);
+    m.chanmem_loading = 0;
+    /* At the threshold, from a member: notifies nobody, said and sent. */
+    oc_model_broadcast_check(&m, 10, "@everyone lunch", &v);
+    CHECK(v.act == OC_BC_NOTE && !strcmp(v.token, "@everyone"));
+    CHECK(v.note[0] && strstr(v.note, v.token) && !v.title[0]);
+    /* From an admin: asks first, naming how many. */
+    bc_me(&m, OC_ROLE_ADMIN);
+    oc_model_broadcast_check(&m, 10, "@everyone lunch", &v);
+    CHECK(v.act == OC_BC_CONFIRM && strtol(v.whom, NULL, 10) == 5);
+    CHECK(strstr(v.title, v.whom) && strstr(v.why, v.token) && !v.note[0]);
+    /* Under the threshold: sent, nothing said. */
+    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "6\x1e");
+    oc_model_broadcast_check(&m, 10, "@channel lunch", &v);
+    CHECK(v.act == OC_BC_SEND && !v.note[0] && !v.title[0]);
+
+    /* The list that comes in is the target's, and the one it replaced is no
+     * longer known: the answers swap. */
+    bc_fill(&m, 11, 7);
+    oc_model_broadcast_check(&m, 11, "@here quick one", &v);
+    CHECK(v.act == OC_BC_CONFIRM && strtol(v.whom, NULL, 10) == 7);
+    oc_model_broadcast_check(&m, 10, "@here quick one", &v);
+    CHECK(v.act == OC_BC_LOAD);
+
+    /* At the list's cap: the channel may be larger, so no number. */
+    bc_settings(&m, "broadcast_mentions\x1f" "everyone\x1e" "broadcast_large\x1f" "500\x1e");
+    bc_fill(&m, 12, OC_MAX_MEMBER_LIST);
+    oc_model_broadcast_check(&m, 12, "@channel all hands", &v);
+    CHECK(v.act == OC_BC_CONFIRM && v.whom[0] && !strpbrk(v.whom, "0123456789"));
+    CHECK(strstr(v.title, v.whom) && !strpbrk(v.title, "0123456789"));
+    oc_model_free(&m);
+}
+
+/* The same judgement for a DM and a group DM, each by its own member list
+ * (REQ-221): the daemon applies the workspace's rule in every conversation, so
+ * the sender is told before sending into one as into a channel, and the
+ * confirmation calls it a conversation. An encrypted DM's body the daemon
+ * cannot read: it stores no broadcast row there, so a broadcast notifies
+ * nobody whoever writes it, and the sender is told so without the list. */
+static void bc_dm(oc_model *m, uint64_t cid, const uint64_t *peers, uint16_t n, uint8_t e2e) {
+    oc_ev e; memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = cid; e.status = 1; e.op = OC_CHANNEL_KIND_DM;
+    if (n == 1) e.user_id = peers[0];
+    e.n_peers = n;
+    for (uint16_t k = 0; k < n && k < 9; k++) e.peers[k] = peers[k];
+    e.e2e = e2e;
+    oc_model_apply(m, &e);
+}
+static void test_broadcast_check_dm(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    bc_me(&m, OC_ROLE_MEMBER);
+    const uint64_t one[] = { 2 }, six[] = { 1, 2, 3, 4, 5, 6 };
+    bc_dm(&m, 20, one, 1, 0);          /* a DM */
+    bc_dm(&m, 21, six, 6, 0);          /* a group DM of six */
+    bc_dm(&m, 22, one, 1, 1);          /* an encrypted DM */
+    oc_bc_check v;
+    char tok[24]; size_t n = 0;
+
+    /* Under a threshold, nothing is known until the DM's own list is in. */
+    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "5\x1e");
+    oc_model_broadcast_check(&m, 20, "@here lunch?", &v);
+    CHECK(v.act == OC_BC_LOAD && !strcmp(v.token, "@here") && strstr(v.note, v.token));
+    oc_model_broadcast_check(&m, 21, "@here lunch?", &v);
+    CHECK(v.act == OC_BC_LOAD);
+    oc_model_broadcast_check(&m, 20, "lunch, @bob?", &v);
+    CHECK(v.act == OC_BC_SEND && !v.note[0]);
+
+    /* The DM's list: two people, under the threshold, notifies, said nothing. */
+    bc_fill(&m, 20, 2);
+    CHECK(oc_model_broadcast_will_notify(&m, 20, "@here lunch?", tok, sizeof tok, &n) == 1 && n == 2);
+    oc_model_broadcast_check(&m, 20, "@here lunch?", &v);
+    CHECK(v.act == OC_BC_SEND && !v.note[0] && !v.title[0]);
+    /* ...and the group DM's is not the DM's. */
+    oc_model_broadcast_check(&m, 21, "@here lunch?", &v);
+    CHECK(v.act == OC_BC_LOAD);
+
+    /* The group DM's list: six, over the threshold. A member under `admins`
+     * notifies nobody, and is told; an admin is asked, naming how many. */
+    bc_fill(&m, 21, 6);
+    oc_model_broadcast_check(&m, 21, "@channel lunch?", &v);
+    CHECK(v.act == OC_BC_NOTE && !strcmp(v.token, "@channel") && strstr(v.note, v.token) && !v.title[0]);
+    bc_me(&m, OC_ROLE_ADMIN);
+    oc_model_broadcast_check(&m, 21, "@channel lunch?", &v);
+    CHECK(v.act == OC_BC_CONFIRM && strtol(v.whom, NULL, 10) == 6 && strstr(v.title, v.whom));
+    CHECK(strstr(v.why, v.token) && strstr(v.why, "conversation") && !strstr(v.why, "channel."));
+    /* `nobody`: not even an admin, in a conversation that large. */
+    bc_settings(&m, "broadcast_mentions\x1f" "nobody\x1e" "broadcast_large\x1f" "5\x1e");
+    oc_model_broadcast_check(&m, 21, "@everyone lunch?", &v);
+    CHECK(v.act == OC_BC_NOTE && !strcmp(v.token, "@everyone"));
+    /* Under the threshold the rule does not apply: a DM of two notifies. */
+    bc_fill(&m, 20, 2);
+    oc_model_broadcast_check(&m, 20, "@everyone lunch?", &v);
+    CHECK(v.act == OC_BC_SEND);
+    /* No threshold: every conversation is large, answered without a list. */
+    bc_settings(&m, "broadcast_mentions\x1f" "nobody\x1e" "broadcast_large\x1f" "0\x1e");
+    oc_model_broadcast_check(&m, 21, "@here lunch?", &v);
+    CHECK(v.act == OC_BC_NOTE);
+    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "0\x1e");
+    bc_me(&m, OC_ROLE_MEMBER);
+    oc_model_broadcast_check(&m, 21, "@here lunch?", &v);
+    CHECK(v.act == OC_BC_NOTE);
+    bc_me(&m, OC_ROLE_ADMIN);
+    oc_model_broadcast_check(&m, 21, "@here lunch?", &v);
+    CHECK(v.act == OC_BC_SEND);
+
+    /* An encrypted DM: notifies nobody under every rule, the most permissive
+     * included, its list loaded or not, and the note says why. */
+    bc_settings(&m, "broadcast_mentions\x1f" "everyone\x1e" "broadcast_large\x1f" "0\x1e");
+    CHECK(oc_model_broadcast_will_notify(&m, 22, "@here hi", tok, sizeof tok, &n) == 0);
+    oc_model_broadcast_check(&m, 22, "@here hi", &v);
+    CHECK(v.act == OC_BC_NOTE && strstr(v.note, "@here") && strstr(v.note, "encrypted"));
+    bc_settings(&m, "broadcast_mentions\x1f" "everyone\x1e" "broadcast_large\x1f" "5\x1e");
+    oc_model_broadcast_check(&m, 22, "@here hi", &v);    /* its list not loaded: not asked for */
+    CHECK(v.act == OC_BC_NOTE && strstr(v.note, "encrypted"));
+    bc_fill(&m, 22, 2);
+    oc_model_broadcast_check(&m, 22, "@channel hi", &v);
+    CHECK(v.act == OC_BC_NOTE && !strcmp(v.token, "@channel"));
+    oc_model_broadcast_check(&m, 22, "hi @bob", &v);
+    CHECK(v.act == OC_BC_SEND && !v.note[0]);
+    /* The plain DM with the same person is not encrypted: it notifies. */
+    bc_fill(&m, 20, 2);
+    oc_model_broadcast_check(&m, 20, "@here hi", &v);
+    CHECK(v.act == OC_BC_SEND);
+    oc_model_free(&m);
+}
+
+/* The workspace's own sender (USER_LIST `flags`): named as the workspace,
+ * kept out of the roster every list of people is drawn from. */
+static void test_workspace_sender_model(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("alice");
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 7; e.body = strdup("Workspace"); e.user_system = 1;
+    oc_model_apply(&m, &e);
+    CHECK(m.n_users == 1 && m.users[0].user_id == 1);
+    CHECK(oc_model_is_workspace_sender(&m, 7) && !oc_model_is_workspace_sender(&m, 1));
+    CHECK(!oc_model_is_workspace_sender(&m, 0));
+    CHECK(!strcmp(oc_model_user_name(&m, 7), "Workspace"));
+    /* Its notices are news to nobody: they count as unread for no one,
+     * and a person's message after them does (oc_notify_decide's `own`). */
+    m.user_id = 1;
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 40; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("room");
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 40; e.message_id = 100; e.author_id = 7;
+    e.body = strdup("@bob joined the workspace.");
+    oc_model_apply(&m, &e);
+    const oc_channel *c = oc_model_channel(&m, 40);
+    CHECK(c && c->unread == 0);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 40; e.message_id = 101; e.author_id = 9;
+    e.body = strdup("hello");
+    oc_model_apply(&m, &e);
+    c = oc_model_channel(&m, 40);
+    CHECK(c && c->unread == 1);
+    oc_model_free(&m);
+}
+
+/* A broadcast mentions the reader only when the daemon stored a broadcast
+ * mention row for the message (REQ-221): the message's `broadcast_stored`,
+ * whatever the workspace's rule and whatever member list the client holds. */
+static void test_broadcast_mentions_me(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("ada"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(&m, &e);
+    const char *b = "@channel standup";
+    CHECK(oc_model_mentions_me_in(&m, 1, b, strlen(b)) == 1);         /* stored */
+    CHECK(oc_model_mentions_me_in(&m, 0, b, strlen(b)) == 0);         /* held: text */
+    const char *p2 = "@ada and @channel";
+    CHECK(oc_model_mentions_me_in(&m, 0, p2, strlen(p2)) == 1);       /* by name, stored or not */
+    const char *q = "@bob only";
+    CHECK(oc_model_mentions_me_in(&m, 1, q, strlen(q)) == 0);         /* a row, but no broadcast now */
+    oc_model_free(&m);
+}
+
+/* The same answer where it is counted, in a channel whose member list is not
+ * loaded -- every channel but the open one -- under a rule whose answer is the
+ * channel's size: a stored broadcast is a mention (the badge's priority count,
+ * a thread reply's toast), a held one is not. And an edit, which stores no
+ * mentions, leaves the flag as the send set it: the current body decides
+ * whether there is a broadcast, the flag whether it counts. */
+static void bc_message(oc_model *m, uint64_t mid, const char *body, uint8_t stored) {
+    oc_ev e; memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 40; e.message_id = mid; e.author_id = 2;
+    e.server_time = mid; e.broadcast_stored = stored; e.body = strdup(body);
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+static const oc_msg *bc_find(oc_model *m, uint64_t mid) {
+    const oc_channel *c = oc_model_channel(m, 40);
+    for (size_t i = 0; c && i < c->n_msgs; i++) if (c->msgs[i].message_id == mid) return &c->msgs[i];
+    return NULL;
+}
+static void bc_edit(oc_model *m, uint64_t mid, const char *body) {
+    oc_ev e; memset(&e, 0, sizeof e);
+    e.type = OC_EV_EDIT; e.channel_id = 40; e.message_id = mid; e.body = strdup(body);
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+/* Whether message `mid`, as the model holds it now, mentions the reader. */
+static int bc_counts(oc_model *m, uint64_t mid) {
+    const oc_msg *x = bc_find(m, mid);
+    return x && x->body && oc_model_mentions_me_in(m, x->broadcast_stored, x->body, strlen(x->body));
+}
+static void test_broadcast_stored_model(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("ada"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(&m, &e);
+    bc_settings(&m, "broadcast_mentions\x1f" "admins\x1e" "broadcast_large\x1f" "5\x1e");
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 40; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("small"); oc_model_apply(&m, &e);
+    CHECK(m.chanmem_channel != 40);                      /* its size is not known here */
+
+    bc_message(&m, 100, "@channel standup", 1);          /* a member's, in a small channel */
+    const oc_channel *c = oc_model_channel(&m, 40);
+    CHECK(c && c->unread == 1 && c->priority_unread == 1);
+    bc_message(&m, 101, "@channel lunch", 0);            /* the daemon held it */
+    c = oc_model_channel(&m, 40);
+    CHECK(c && c->unread == 2 && c->priority_unread == 1);
+    CHECK(bc_find(&m, 100) && bc_find(&m, 100)->broadcast_stored == 1);
+    CHECK(bc_find(&m, 101) && bc_find(&m, 101)->broadcast_stored == 0);
+
+    /* The same in a thread reply, which the model keeps only as a notice. */
+    memset(&e, 0, sizeof e); e.type = OC_EV_THREAD_REPLY; e.channel_id = 40; e.parent_id = 100;
+    e.message_id = 102; e.author_id = 2; e.server_time = 102; e.count = 1; e.participant = 1;
+    e.broadcast_stored = 1; e.body = strdup("@here look"); oc_model_apply(&m, &e); free(e.body);
+    memset(&e, 0, sizeof e); e.type = OC_EV_THREAD_REPLY; e.channel_id = 40; e.parent_id = 100;
+    e.message_id = 103; e.author_id = 2; e.server_time = 103; e.count = 2; e.participant = 1;
+    e.broadcast_stored = 0; e.body = strdup("@here again"); oc_model_apply(&m, &e); free(e.body);
+    CHECK(m.n_notices == 2 && m.notices[0].mentioned == 1 && m.notices[1].mentioned == 0);
+
+    /* A stored broadcast: an edit that removes it is no mention, and a later
+     * edit that puts it back is one again -- the row is still the send's. */
+    CHECK(bc_counts(&m, 100) == 1);
+    bc_edit(&m, 100, "standup at ten");
+    CHECK(bc_find(&m, 100) && bc_find(&m, 100)->broadcast_stored == 1);
+    CHECK(bc_counts(&m, 100) == 0);
+    bc_edit(&m, 100, "@channel standup at ten");
+    CHECK(bc_find(&m, 100) && bc_find(&m, 100)->broadcast_stored == 1);
+    CHECK(bc_counts(&m, 100) == 1);
+
+    /* A held one never counts, through the same edits. */
+    CHECK(bc_counts(&m, 101) == 0);
+    bc_edit(&m, 101, "lunch at one");
+    bc_edit(&m, 101, "@channel lunch at one");
+    CHECK(bc_find(&m, 101) && bc_find(&m, 101)->broadcast_stored == 0);
+    CHECK(bc_counts(&m, 101) == 0);
+
+    /* Nor does one an edit adds to a message whose send had none. */
+    bc_message(&m, 104, "plain words", 0);
+    bc_edit(&m, 104, "now @everyone");
+    CHECK(bc_find(&m, 104) && bc_find(&m, 104)->broadcast_stored == 0);
+    CHECK(bc_counts(&m, 104) == 0);
+    oc_model_free(&m);
+}
+
 static void test_poll_model(void) {
     oc_model m; oc_model_init(&m);
     oc_ev e;
@@ -3250,10 +3681,28 @@ static void watch(oc_call_engine *e, view_watch *w) {
     w->frames++;
 }
 
+/* Wait for `want` frames of a share on `e`. A real-time source makes as many as
+ * the machine allows, so the deadline is a stall's, not the count's: it starts
+ * again with every new frame, and only a share that stops -- no frame for
+ * `stall_ms` -- fails it, as the recorder's own clock decides the window-gone
+ * test (test_media.c) rather than a time counted from the start. */
+static int share_frames(oc_client *a, oc_client *b, oc_client *c, oc_call_engine *e,
+                        view_watch *w, int want, uint64_t stall_ms) {
+    int seen = w->frames;
+    uint64_t end = oc_test_deadline(stall_ms);
+    for (;;) {
+        oc_client_tick(a); oc_client_tick(b); if (c) oc_client_tick(c);
+        watch(e, w);
+        if (w->frames >= want) return 1;
+        if (w->frames > seen) { seen = w->frames; end = oc_test_deadline(stall_ms); }
+        if (!oc_test_pause(end)) return 0;
+    }
+}
+
 /* Screen sharing in the call (REQ-161): dana shares the synthetic screen; erik
  * sees it, at its size, the frames in order; the relay sees only SFrame; a tenth
  * of the packets lost on the way costs NACKs and resends, not the picture; faye
- * joins late and has a picture within a few seconds; erik takes over, which stops
+ * joins late and is sent a picture; erik takes over, which stops
  * dana's; erik stops, and the picture goes. */
 static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
                            oc_call_engine *ea, oc_call_engine *eb, oc_call_engine *ec) {
@@ -3270,9 +3719,8 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     oc_client_call_share(a, 1, 1);
     CHECK(CALL_WAIT(3000, ma->call.sharer == ua && mb->call.sharer == ua));
     CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 2; })));
-    /* Frames from a real-time source within a fixed time: timing. */
-    CHECK_TIMING(CALL_WAIT(WAIT_MS(6000), ({ watch(eb, &wb); wb.frames >= 10; })));
-    CHECK_TIMING(wb.f.width == 1280 && wb.f.height == 800 && wb.rising && wb.bad == 0);
+    CHECK(share_frames(a, b, c, eb, &wb, 10, WAIT_MS(6000)));
+    CHECK(wb.f.width == 1280 && wb.f.height == 800 && wb.rising && wb.bad == 0);
     oc_call_engine_stats(ea, &st);
     printf("  dana shares: erik has %d frames at %dx%d; dana sends %dx%d at %d fps, %d kbps, %u keyframes\n",
            wb.frames, wb.f.width, wb.f.height, st.share_width, st.share_height, st.share_fps, st.share_kbps,
@@ -3281,7 +3729,7 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     int big = g_tap.big - big0, bad = g_tap.bad_header;
     pthread_mutex_unlock(&g_tap.mu);
     CHECK(bad == 0);
-    CHECK_TIMING(big > 10);                                   /* the screen went as SFrame, in fragments */
+    CHECK(big > 10);                                          /* the screen went as SFrame, in fragments */
 
     /* A tenth of everything lost on the way to the relay: the picture keeps
      * coming. The loss stays on until three more frames have arrived through
@@ -3309,21 +3757,20 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     uint64_t joined = mono_ms();
     oc_client_call_join(c, 1);
     CHECK(CALL_WAIT(3000, mc->in_call && mc->call.sharer == ua));
-    CHECK_TIMING(CALL_WAIT(WAIT_MS(6000), ({ watch(ec, &wc); wc.frames >= 1; })));
+    CHECK(share_frames(a, b, c, ec, &wc, 1, WAIT_MS(6000)));
     printf("  faye joined late: her first frame after %d ms, %dx%d, frame number %d\n", (int)(mono_ms() - joined),
            wc.f.width, wc.f.height, wc.last);
     /* The loss above halved the rate, which may have stepped the size down to
      * fit 1280x720: the shape is what holds. */
-    CHECK_TIMING(wc.f.width * 800 == wc.f.height * 1280 && wc.bad == 0);
-    CHECK_SPEED(mono_ms() - joined < 5000);
+    CHECK(wc.f.width * 800 == wc.f.height * 1280 && wc.bad == 0);
 
     /* erik takes over: dana's share stops, and dana sees erik's. */
     CHECK(oc_call_engine_share_start(eb, "window:synthetic", 1280, 800) == 0);
     oc_client_call_share(b, 1, 1);
     CHECK(CALL_WAIT(3000, ma->call.sharer == ub && mb->call.sharer == ub && mc->call.sharer == ub));
     CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 0 && st.share_taken; })));
-    CHECK_TIMING(CALL_WAIT(WAIT_MS(6000), ({ watch(ea, &wa); wa.frames >= 5; })));
-    CHECK_TIMING(wa.f.width * 800 == wa.f.height * 1280 && wa.rising && wa.bad == 0);
+    CHECK(share_frames(a, b, c, ea, &wa, 5, WAIT_MS(6000)));
+    CHECK(wa.f.width * 800 == wa.f.height * 1280 && wa.rising && wa.bad == 0);
 
     /* erik stops: nobody shares, and the picture goes. */
     oc_call_engine_share_stop(eb);
@@ -4700,8 +5147,12 @@ static void test_device_client(void) {
         oc_dbwriter *dbw = web_daemon(tpath("test_core_dev1.db"), NULL);
         CHECK(dbw != NULL);
         if (!dbw) { oc_tls_server_free(&srv); return; }
-        oc_netloop_set_device_interval_s(1);
-        oc_netloop_set_device_ttl_ms(1500);
+        /* A code lives far longer than two approvals over HTTPS take, however
+         * slow the host (WAIT_MS); the client asks once an interval. */
+        const int dev_interval_s = WAIT_MS(1);
+        const uint64_t dev_ttl_ms = WAIT_MS(4000);
+        oc_netloop_set_device_interval_s(dev_interval_s);
+        oc_netloop_set_device_ttl_ms(dev_ttl_ms);
         struct core_loop_arg arg;
         arg.port = 0; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
         pthread_t th;
@@ -4717,12 +5168,11 @@ static void test_device_client(void) {
         CHECK(strcmp(oc_client_model(c)->device_fp, fp) == 0);        /* for the browser's warning */
         CHECK(!oc_client_model(c)->authed);
         g_web_insecure = 1;                                          /* the person went on past it */
-        /* Both approvals have to land inside the code's 1500 ms life: timing. */
-        CHECK_TIMING(device_approve(url, code, "lia", "wrong") != 0);
-        CHECK_TIMING(device_approve(url, code, "lia", "pw-lia") == 0);
+        CHECK(device_approve(url, code, "lia", "wrong") != 0);
+        CHECK(device_approve(url, code, "lia", "pw-lia") == 0);
         g_web_insecure = 0;
-        CHECK_TIMING(WAIT_FOR(c, m->authed && m->user_id != 0));
-        CHECK_TIMING(oc_client_model(c)->device_code[0] == '\0');
+        CHECK(WAIT_FOR_MS(c, m->authed && m->user_id != 0, dev_interval_s * 1000 + 5000));
+        CHECK(oc_client_model(c)->device_code[0] == '\0');
         oc_client_stop(c);
 
         /* Cancel; and a code nobody enters runs out. */
@@ -4733,7 +5183,8 @@ static void test_device_client(void) {
         oc_client_stop(c);
         c = oc_client_start_device(NULL, "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
         CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
-        CHECK(WAIT_FOR(c, strstr(m->last_error, "expired") != NULL) && !oc_client_model(c)->authed);
+        CHECK(WAIT_FOR_MS(c, strstr(m->last_error, "expired") != NULL, dev_ttl_ms + dev_interval_s * 1000 + 5000) &&
+              !oc_client_model(c)->authed);
         oc_client_stop(c);
 
         __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
@@ -5025,7 +5476,7 @@ static void test_browser_signin(void) {
  * it unpaired; an ACTION for something not held stands on its own. */
 static size_t frame_of_broadcast(uint8_t *buf, size_t cap, uint64_t mid, const char *body, int with_file) {
     oc_wbuf w; oc_wbuf_init(&w, buf, cap);
-    oc_broadcast b = { mid, 1, 42, 1000, OC_MSG_KIND_MESSAGE, oc_slice_str(body), 0, {{0}}, {0} };
+    oc_broadcast b = { mid, 1, 42, 1000, OC_MSG_KIND_MESSAGE, oc_slice_str(body), 0, {{0}}, {0}, 0 };
     if (with_file) {
         b.n_attach = 1;
         b.attach[0].id = 9;
@@ -5161,6 +5612,15 @@ int run_client_core_tests(void) {
     test_restore_model();
     test_poll_model();
     test_table_preview();
+    test_workspace_settings_model();
+    test_change_windows_model();
+    test_broadcast_model();
+    test_broadcast_at_cap();
+    test_broadcast_check();
+    test_broadcast_check_dm();
+    test_broadcast_mentions_me();
+    test_broadcast_stored_model();
+    test_workspace_sender_model();
     test_badge_tiers();
     test_osnotify_null();
     test_feedback();
@@ -5738,7 +6198,7 @@ int run_client_core_tests(void) {
 
         /* dana searches for a word in her message; the hit streams into the
          * search buffer and includes that message. */
-        oc_client_search(a, "core");
+        oc_client_search(a, "core", OC_SEARCH_NEWEST);
         CHECK(WAIT_FOR(a, m->search_open && m->n_search >= 1));
         {
             const oc_model *am = oc_client_model(a);

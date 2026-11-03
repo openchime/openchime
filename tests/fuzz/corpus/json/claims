@@ -1,0 +1,1 @@
+{"iss":"https://accounts.google.com","aud":"client-1","sub":"1234","email":"ada@acme.example","email_verified":"true","name":"Ada \u00c9","nonce":"n-1","iat":1799999990,"exp":1800000300,"hd":"acme.example","amr":["pwd","mfa"]}

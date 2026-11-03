@@ -24,10 +24,30 @@ fi
 export OC_TEST_PORT="${OC_TEST_PORT:-9700}"
 export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-chords}"
 TIMES=5
+WAIT_MS="${OC_TEST_WAIT_MS:-6000}"
 
 drive() { "$DRIVE" "$@" >/dev/null; }
 modal() { "$DRIVE" dump chords 2>/dev/null | grep -m1 '^modal=' | sed 's/^modal=\([^ ]*\).*/\1/'; }
-is()    { [ "$(modal)" = "$1" ]; }
+# The chord is dispatched when `press` acks, and taken on the client's next
+# frame: poll for the state it leads to, as smoke.sh's wait_for does, rather
+# than read once after a pause.
+is() {                             # is <modal> [ms]
+  local want="$1" ms="${2:-$WAIT_MS}" t=0
+  while :; do
+    [ "$(modal)" = "$want" ] && return 0
+    [ "$t" -ge "$ms" ] && return 1
+    sleep 0.05; t=$((t + 50))
+  done
+}
+# Nothing opens: still `none` after a second. A slow client could only make
+# this pass wrongly, never fail with nothing wrong.
+stays_none() {
+  local t=0
+  while [ "$t" -lt 1000 ]; do
+    [ "$(modal)" = none ] || return 1
+    sleep 0.05; t=$((t + 50))
+  done
+}
 
 say "== fixture: alice in the browser"
 "$DRIVE" kill >/dev/null 2>&1
@@ -42,6 +62,7 @@ for _ in $(seq 1 $TIMES); do
   drive press ctrl+comma
   is prefs && n=$((n + 1))
   drive press esc
+  is none
 done
 check "Preferences opened $n of $TIMES times" [ "$n" = "$TIMES" ]
 check "...and Esc closed it" is none
@@ -52,12 +73,13 @@ for _ in $(seq 1 $TIMES); do
   drive press ctrl+slash
   is keys && n=$((n + 1))
   drive press esc
+  is none
 done
 check "the shortcuts opened $n of $TIMES times" [ "$n" = "$TIMES" ]
 
 say "== a bare comma is not the shortcut"
 drive press comma
-check "a comma alone opens nothing" is none
+check "a comma alone opens nothing" stays_none
 
 [ "${1:-}" = --down ] && { "$DRIVE" kill >/dev/null 2>&1; kill_dev_daemon; }
 echo "gui_chords: $((checks - fails))/$checks passed ($((SECONDS - START))s)"

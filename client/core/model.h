@@ -112,6 +112,11 @@ typedef struct {
     /* OC_MSG_KIND_*: a call event (a missed call, REQ-304) is drawn as a line of
      * history rather than as something its author said. */
     uint8_t      kind;
+    /* Its send stored a broadcast mention row (REQ-221): the daemon's answer,
+     * carried on BROADCAST and THREAD_REPLY, which oc_model_mentions_me_in
+     * takes instead of judging the channel's size. Fixed at send: an edit
+     * changes the body and leaves this as it was. */
+    uint8_t      broadcast_stored;
     /* Link previews (REQ-222): fanned after the BROADCAST, replayed on
      * backfill, cleared on edit (the daemon drops and re-fetches). */
     oc_msg_unfurl *unfurls;   /* heap, NULL until one arrives */
@@ -287,7 +292,8 @@ typedef struct { uint64_t channel_id; uint64_t user_id; long long seen; } oc_typ
 
 /* One full-text search hit (REQ-080). */
 typedef struct { uint64_t message_id, channel_id, author_id, server_time; char *snippet;
-                 uint8_t action; /* the snippet is an action's text (REQ-058) */ } oc_search_result;
+                 uint8_t action; /* the snippet is an action's text (REQ-058) */
+                 int64_t rank;   /* relevance, the next page's cursor beside the id */ } oc_search_result;
 
 /* One reactor entry (from LIST_REACTIONS -> REACTIONS, REQ-071): who reacted
  * with which emoji on the inspected message. */
@@ -410,6 +416,10 @@ typedef struct {
     /* Read-aloud (REQ-291-295, ARCH-111), from TTS_INFO after auth and replaced
      * on every reconnect. Without it a frontend shows nothing of the feature. */
     char     capabilities[256];         /* the daemon's feature names, comma separated */
+    /* The workspace's settings (WORKSPACE_SETTINGS), read-only: what the
+     * daemon's configuration tells clients, replaced whole at each sign-in.
+     * Read with oc_model_workspace_setting. */
+    char    *ws_settings;               /* heap: "key\x1fvalue\x1e..." as it came */
     uint8_t  n_voices;
     /* Wide enough for the whole string. It was 64 while the daemon sent 71
      * characters, so this silently held a truncated version -- harmless only
@@ -476,6 +486,7 @@ typedef struct {
     /* The open search view (REQ-080): the query and its hits. */
     uint8_t   search_open;
     char      search_query[128];
+    uint8_t   search_sort;       /* OC_SEARCH_*: the order the hits are in */
     oc_search_result *search_results;
     size_t    n_search, cap_search;
     /* The server said it had more hits than it sent. The wire gained a keyset
@@ -580,6 +591,10 @@ typedef struct {
     /* The tenant roster (REQ, LIST_USERS) + whether the roster view is open. */
     uint8_t   roster_open;
     oc_member *users;
+    /* The workspace's own sender (USER_LIST `flags`, OC_USER_SYSTEM), which
+     * posts what the workspace says, such as its welcome. Kept out of `users`,
+     * so no list of people can offer it; 0 until the daemon names one. */
+    uint64_t   ws_sender;
     size_t    n_users, cap_users;
     /* Notification preferences (REQ-130/131): the DND window (minutes since
      * midnight, local) + whether the prefs overlay is open. Per-channel levels
@@ -598,6 +613,9 @@ typedef struct {
      * is the hours notifications are ALLOWED — the opposite sense from the quiet
      * window it replaced, which is why the fields are named for it. */
     uint8_t   dnd_mode;
+    /* The schedule above is the workspace's default (OPENCHIME_DEFAULT_QUIET_HOURS),
+     * followed because this person never set their own (OC_DND_FROM_DEFAULT). */
+    uint8_t   dnd_default;
     int16_t   tz_offset_min;
     uint16_t  allow_start_min, allow_end_min;
     oc_schedule_day sched_days[OC_SCHEDULE_DAYS];
@@ -612,6 +630,9 @@ typedef struct {
     /* REQ-278: when the manual PAUSE ends, 0 for none. Distinct from the window
      * above in type as well as in name — one instant against a daily range. */
     uint64_t  snooze_until_ms;
+    /* Whether I share my read receipts (REQ-090), as the daemon last said;
+     * 1 until it says. */
+    uint8_t   share_receipts;
     /* REQ-134: the level a channel takes when it has NO per-channel row. Server
      * state, not a client guess — the daemon is what decides whether to push. */
     uint8_t   notify_default;
@@ -825,6 +846,14 @@ uint64_t oc_model_via_group(const oc_model *m, uint64_t channel_id, uint64_t use
 /* Does `body` mention this user -- by their name, or by a group they are in
  * (REQ-308)? What a toast and a highlight ask. */
 int      oc_model_mentions_me(const oc_model *m, const char *body, size_t len);
+/* The same, for a message whose send the daemon `broadcast_stored` a
+ * broadcast mention row for or not (the message's own flag, REQ-221): a
+ * broadcast (@here, @channel, @everyone) in `body` counts only when it did.
+ * The daemon decides who may notify a channel of what size; a client knows
+ * the size only of the channel whose member list it has loaded, so it does not
+ * judge it again. */
+int      oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_stored,
+                                 const char *body, size_t len);
 
 /* ---- the sidebar (6) --------------------------------------------------
  * Grouping, filtering, sorting and collapse are IDENTICAL in every frontend, so
@@ -1077,6 +1106,67 @@ void oc_model_line(const oc_model *m, uint64_t author_id, const char *name, int 
 void oc_model_msg_preview(const oc_model *m, const oc_msg *msg, char *out, size_t cap);
 /* "m:ss" for a duration in milliseconds (h:mm:ss past an hour). */
 void oc_model_format_duration(uint32_t ms, char *out, size_t cap);
+/* A workspace setting by key ("default_channels"), as the daemon told it,
+ * into `out`; returns 1, or 0 (and "") when the daemon did not tell it. */
+int oc_model_workspace_setting(const oc_model *m, const char *key, char *out, size_t cap);
+/* Whether this person may add a custom emoji (REQ-072): the workspace's
+ * `custom_emoji_add`, everyone by default, or only owners and admins. */
+int oc_model_may_add_emoji(const oc_model *m);
+/* Whether an author may still edit (`edit`) or delete their own message sent
+ * at `sent_ms` (REQ-051/052): the workspace's `edit_window` or `delete_window`,
+ * unset for always, `never`, or seconds after sending. The daemon decides;
+ * this only keeps the action off the menu once it would be refused. */
+int oc_model_may_change_own(const oc_model *m, uint64_t sent_ms, int edit, uint64_t now_ms);
+/* What a broadcast mention in `body` (@here, @channel, @everyone) will do in
+ * `channel_id` -- a channel, a DM or a group DM -- under the workspace's
+ * `broadcast_mentions` and `broadcast_large` (REQ-221): -1 there is none; 0
+ * it will notify nobody, from this person in a channel this large, or in an
+ * encrypted DM, whose body the daemon cannot read; 1 it will notify; 2 it will
+ * notify a channel the workspace calls large, which the composer confirms;
+ * 3 the answer is the channel's size and its member list is not loaded (or
+ * is still loading): the composer asks for it (oc_client_list_members) and
+ * asks again once it is in. `token` gets the mention as written, `members`
+ * the channel's size when its list is loaded, else 0 -- and 0 when the list
+ * is at its cap (OC_MAX_MEMBER_LIST), where the channel may be larger and the
+ * composer names no number. The daemon decides; this is the warning. */
+int oc_model_broadcast_will_notify(const oc_model *m, uint64_t channel_id, const char *body,
+                                   char *token, size_t tcap, size_t *members);
+/* Whom the confirmation says a broadcast notifies, from that `members`:
+ * "N people", or "everyone here" when the number is not known -- the list
+ * at its cap, where a number would be the cap's and not the channel's. */
+void oc_model_broadcast_whom(size_t members, char *out, size_t cap);
+/* What a send of `body` to `channel_id` does about its broadcast mention
+ * (REQ-221), from oc_model_broadcast_will_notify's answer, and what it says:
+ * one judgement for every path that sends text -- the composer, sending it
+ * later, a new message (into a channel, a DM or a group DM, the one it opens
+ * included), a poll's question, a reply from a notification -- so none of
+ * them says it differently or skips it. An edit notifies nobody and is not
+ * asked. */
+enum {
+    OC_BC_SEND    = 0,   /* no broadcast, or one that notifies: send */
+    OC_BC_NOTE    = 1,   /* it will notify nobody: say `note`, and send */
+    OC_BC_CONFIRM = 2,   /* it will notify a large channel: ask (`title`, `why`) first */
+    OC_BC_LOAD    = 3    /* the channel's own member list is not loaded (another
+                            channel's, or still loading): ask for it
+                            (oc_client_list_members), say `note`, and judge
+                            again once it is in */
+};
+typedef struct {
+    int  act;          /* OC_BC_* */
+    char token[16];    /* the mention as written: "@here", "@channel", "@everyone" */
+    char whom[48];     /* CONFIRM: oc_model_broadcast_whom's "N people" or "everyone here" */
+    char note[96];     /* NOTE and LOAD: what the sender is told */
+    char title[64];    /* CONFIRM: the question */
+    char why[96];      /* CONFIRM: the line under it */
+} oc_bc_check;
+void oc_model_broadcast_check(const oc_model *m, uint64_t channel_id, const char *body,
+                              oc_bc_check *out);
+/* Whether the workspace has default quiet hours (`default_quiet_hours`, REQ-136)
+ * a person may return to. */
+int oc_model_has_default_quiet_hours(const oc_model *m);
+/* Whether the workspace has read receipts on (`read_receipts`, REQ-090): off,
+ * nobody's position reaches anyone and no seen-by is drawn. */
+int oc_model_receipts_on(const oc_model *m);
 
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);
@@ -1171,6 +1261,9 @@ void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status);
 
 /* Roster lookups: a user's display name ("" if unknown), or an id by name (0). */
 const char *oc_model_user_name(const oc_model *m, uint64_t user_id);
+/* Whether `user_id` is the workspace's own sender, not a person: its messages
+ * are the workspace's, and it is offered nowhere a person is. */
+int oc_model_is_workspace_sender(const oc_model *m, uint64_t user_id);
 /* 1 when the user has been removed from the workspace (REQ-033): shown as
  * deactivated, their avatar dimmed. */
 int         oc_model_user_disabled(const oc_model *m, uint64_t user_id);

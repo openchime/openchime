@@ -286,6 +286,10 @@ int oc_plat_handoff(const char *kind, const char *payload) {
     return 1;
 }
 
+/* The desktop's back and forward are the application's own. */
+int oc_plat_nav_push(uint32_t seq, int replace) { (void)seq; (void)replace; return 0; }
+int oc_plat_nav_go(int delta) { (void)delta; return 0; }
+
 int oc_plat_tray_init(SDL_Window *w, const char *tooltip) {
     (void)w;
     HWND h = msgwnd();

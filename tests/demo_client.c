@@ -176,7 +176,7 @@ static int cmd_token(client *c, const char *platform, const char *token) {
 }
 
 /* Mint a member invite that `uses` people may redeem (0: no limit) and print
- * its token as hex: what scripts/web/pages.sh opens as an invitation link. */
+ * its token as hex: what scripts/test/merge/web.sh opens as an invitation link. */
 static int cmd_invite(client *c, unsigned uses) {
     uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
     oc_invite_user iu = { OC_ROLE_MEMBER, { NULL, 0 }, (uint16_t)uses };

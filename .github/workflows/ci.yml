@@ -1,9 +1,12 @@
 name: ci
 
-# The tests, called by the staging build (staging-build.yml) and by nothing
-# else; the pipeline and what each job covers are docs/CONTRIBUTING.md "CI".
-# Each suite runs once: the threaded ones under the sanitizer, the rest plainly
-# (mk/tests.mk's TSAN_SUITES). Every vendored library and toolchain is fetched
+# `make test-merge`, in two jobs: called on every pull request (pr-tests.yml,
+# the required check) and by the staging build on the merged tip
+# (staging-build.yml); the pipeline and what each job covers are
+# docs/CONTRIBUTING.md "CI".
+# Each job runs one make target, the same one a person runs locally; every test
+# is a script in scripts/test/ (docs/TESTING.md §4). Each suite runs once: the
+# threaded ones under the sanitizer, the rest plainly. Every vendored library and toolchain is fetched
 # pinned, or built from the committed sources, by the script that builds it
 # (mk/toolchains.mk) and cached by that script's hash. One runner image
 # everywhere, ubuntu-24.04, the same one the release builds on.
@@ -11,14 +14,14 @@ name: ci
 # There is no GUI job beyond the web smoke (docs/TESTING.md "Reading the GUI
 # smoke").
 #
-# The end-to-end step runs the daemon in development mode, so these jobs live
-# here and not in a release-path workflow, which scripts/check/release_lint.sh
-# keeps free of it.
+# The end-to-end test (scripts/test/merge/e2e.sh) runs the daemon in development
+# mode, so these jobs live here and not in a release-path workflow, which
+# scripts/test/local/release_lint.sh keeps free of it.
 
 on:
-  # Called, never triggered: the staging build gates its release jobs on these
-  # exact jobs rather than re-implement them. A build that ran a weaker suite
-  # would be worse than no gate, because it would look like one.
+  # Called, never triggered: the pull request and the staging build gate on
+  # these exact jobs rather than re-implement them. A build that ran a weaker
+  # suite would be worse than no gate, because it would look like one.
   workflow_call:
 
 # No concurrency group of its own: a called workflow's group would be evaluated
@@ -56,7 +59,10 @@ jobs:
           # (scripts/build/libvpx.sh); xz-utils for the toolchain tarballs. gdb
           # so that a test binary that crashes prints every thread's stack
           # (tests/main.c). cmake, curl, git and python3 are on the image.
-          scripts/build/apt.sh bzip2 nasm gdb xz-utils
+          # libclang-rt-18-dev for libFuzzer and the sanitizer runtimes of the
+          # image's clang 18, which the fuzzing harnesses build with
+          # (scripts/test/merge/fuzz.sh).
+          scripts/build/apt.sh bzip2 nasm gdb xz-utils libclang-rt-18-dev
       # The toolchains make fetches pinned (mk/toolchains.mk): zig for the
       # release-compiler pass, Emscripten for the web client the daemon embeds.
       # Keyed by the scripts, which pin the versions and the checksums.
@@ -106,95 +112,34 @@ jobs:
             build/wasm/opus
             build/wasm/speexdsp
           key: wasm-emsdk6.0.8-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/sdl3_wasm.sh', 'scripts/build/media_wasm.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
-      # The daemon as the release builds it (every feature, the web client in),
-      # the e2e client the step below drives, and the Linux terminal client: one
-      # make, so the web client's link overlaps the other compiles.
-      - name: Build the daemon, the e2e client and the terminal client
-        run: make TTS=1 STT=1 SUM=1 WEB=1 all build/e2e_client build/demo_client linux
-      # Only the C runtime may be dynamic. ONNX Runtime, llama.cpp, their C++
-      # runtime, mbedTLS, libopus and SQLite are all inside the binary, so anything else
-      # appearing here is a dependency that crept back in.
-      - name: The daemon links statically
-        run: |
-          ldd openchimed
-          if ldd openchimed | grep -vE 'linux-vdso|libc\.so|libm\.so|ld-linux'; then
-            echo "::error::openchimed has a dynamic dependency beyond libc and libm"; exit 1
-          fi
-      # The built binary, started from its environment as a deployment starts
-      # it: the one thing the in-process suites cannot show, since they link the
-      # daemon's code without its main(). Start, assert, stop in ONE step -- a
-      # backgrounded daemon does not outlive the step that launched it.
-      - name: End-to-end (healthz, then the protocol vertical over TLS)
-        env:
-          OPENCHIME_DATA_DIR: ${{ runner.temp }}/itest
-          OPENCHIME_HEALTH_PORT: '8080'
-          OPENCHIME_PORT: '8443'
-          # Development mode: the step bootstraps its users, which only that
-          # mode reads (CONFIG.md "Mode"). The e2e client signs in on the
-          # daemon's page, as a person does (AUTH.md §8.10, tests/testsignin.h).
-          OPENCHIME_MODE: development
-          OPENCHIME_DEV_USERS: 'e2e-alice:e2e-pw:owner,e2e-bob:e2e-pw:member'
-        run: |
-          set -euo pipefail
-          mkdir -p "${{ runner.temp }}/itest"
-          log="${{ runner.temp }}/daemon.log"
-          ./openchimed >"$log" 2>&1 &
-          dpid=$!
-          trap 'kill "$dpid" 2>/dev/null || true' EXIT
-          ok=
-          for _ in $(seq 1 60); do
-            if curl -sf http://localhost:8080/healthz >/dev/null 2>&1; then ok=1; break; fi
-            kill -0 "$dpid" 2>/dev/null || break
-            sleep 1
-          done
-          if [ -z "$ok" ]; then echo "::error::daemon did not become healthy"; cat "$log"; exit 1; fi
-          ./build/e2e_client 127.0.0.1 8443
-          # A push token registered after sign-in is acknowledged, even with the
-          # daemon's own messages arriving first.
-          out=$(./build/demo_client 127.0.0.1 8443 e2e-bob e2e-pw token fcm e2e-device-token)
-          echo "$out"
-          grep -q "registered fcm token" <<<"$out" || { echo "::error::demo_client did not register a push token"; exit 1; }
-      # The release compiles with zig's clang against glibc 2.34, and a newer
-      # clang refuses things gcc accepts: a C11 typedef repetition and a
-      # declaration after a label each passed gcc and broke a release. The
-      # daemon's, the client app-core's and the tests' translation units (not
-      # the terminal client, tuikit or the tool programs) go through that
-      # exact compiler under -Werror, which is the tree's
-      # second-compiler check too. make fetches the pinned zig.
-      - name: Everything compiles with the release's compiler
-        run: make check-release-cc
-      # The suites that run no threads; the others run under the sanitizer in
-      # its own job. Its recipe runs mk/tests.mk's SOURCE_CHECKS first.
-      - name: Run the suites the sanitizer does not
-        run: make test-ci PART=plain
-      # The web client in a browser (docs/TESTING.md §3.4), against the daemon
-      # built above, which carries it: the gfx pixel test under Node, the client
-      # signing in and drawing (scripts/web/test.sh), the sign-in pages
-      # (scripts/web/pages.sh), and the GUI smoke on the web platform. Checks
-      # that race the wall clock do not judge here, so a busy runner cannot fail
-      # a build: OC_TEST_TIMING=0 (tests/check.h) skips test.sh's recording and
-      # input-method parts, and the chords script, which reads its result after
-      # a fixed sleep, is not run. The runner's own Chrome, driven
-      # by playwright-core at the exact version package.json pins. The same
-      # make variables as the build, so nothing is relinked.
-      - name: The web client in a headless Chrome
-        timeout-minutes: 20
+      # Everything the staging build tests but the threaded suites, run by the
+      # one target a person can run too (docs/TESTING.md §4): it builds the
+      # daemon with every feature and the web client in it, the e2e client and
+      # the terminal client, then runs the source checks, the suites with no
+      # threads, the static-link check, the end-to-end run, the release's
+      # compiler, the speech round trip, the web client in a headless Chrome
+      # and the GUI smoke on the web. Checks that race the wall clock do not
+      # judge here, so a busy runner cannot fail a build (OC_TEST_TIMING=0,
+      # tests/check.h). The runner's own Chrome, driven by playwright-core at
+      # the version package.json pins.
+      - name: Install the browser driver
+        run: npm install --no-audit --no-fund
+      - name: make test-merge PART=plain
+        timeout-minutes: 60
         env:
           CHROME: /usr/bin/google-chrome
           OC_TEST_TIMING: '0'
-        run: |
-          npm install --no-audit --no-fund
-          make TTS=1 STT=1 SUM=1 WEB=1 web-test
-          scripts/gui/run.sh --web smoke
+        run: make test-merge PART=plain
 
   thread-sanitizer:
     name: thread sanitizer
     # The daemon is threads -- the event loop, its I/O threads, the writer, the
     # readers and the auth pool, the worker pools -- and so are the client, its
-    # call engine and its recorder. `make test-ci PART=threads` runs the suites whose code
-    # runs threads (mk/tests.mk's TSAN_SUITES) under ThreadSanitizer, and a data
-    # race between our threads fails it (tests/tsan.supp). This is those
-    # suites' only run in CI.
+    # call engine and its recorder. `make test-merge PART=threads` runs the
+    # suites whose code runs threads (scripts/test/lib/common.sh's TSAN_SUITES) under
+    # ThreadSanitizer, and a data race between our threads fails it
+    # (tests/tsan.supp). This is those suites' only run in CI, and the same
+    # target runs them locally.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -225,5 +170,7 @@ jobs:
           key: vendor-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
       # The test binary needs no Emscripten: the web client's page is embedded
       # from source and its loader only into a daemon built with WEB=1.
-      - name: Test under ThreadSanitizer
-        run: make test-ci PART=threads
+      - name: make test-merge PART=threads
+        env:
+          OC_TEST_TIMING: '0'
+        run: make test-merge PART=threads

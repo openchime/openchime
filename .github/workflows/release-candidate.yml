@@ -16,6 +16,12 @@
 # names (sync-public), a convenience nothing here depends on. A release (release.yml) takes exactly
 # one release-candidate, assigns it release-N, packages and publishes it.
 #
+# The build's image is also tagged :N-rcK and, when this is the newest
+# release-candidate for N, moves :rc, both in the build repository only: :rc is
+# the newest tested daemon, which a deployment can follow. A release moves :rc
+# on to itself, so it never trails :latest. No candidate tag is written to the
+# second repository.
+#
 # The files come from the bucket, never from a workflow artifact, so a build
 # can be promoted for as long as it is stored, not for as long as the run that
 # made it keeps its artifacts.
@@ -311,6 +317,31 @@ jobs:
           fi
           echo "${TAG} is ${SHA:0:7}"
 
+      # The image the build's manifest records, copied by digest to :N-rcK and,
+      # unless a later release-candidate for N already exists, to :rc. A re-run
+      # of an older release-candidate therefore never moves :rc back. Build
+      # repository only; nothing reads back a tag just written
+      # (scripts/release/copy_image.sh).
+      - name: Tag the image as the release-candidate
+        env:
+          N: ${{ steps.tag.outputs.number }}
+          K: ${{ steps.tag.outputs.k }}
+          IMAGE_REGISTRY_TOKEN_BUILD: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
+        run: |
+          set -euo pipefail
+          creds="${IMAGE_REGISTRY_USER}:${IMAGE_REGISTRY_TOKEN_BUILD}"
+          want=$(python3 -c 'import json,sys; print(json.load(open("rc/manifest.json"))["images"]["build-'"$BUILD_ID"'"])')
+          scripts/release/copy_image.sh "$creds" "${BUILD_IMAGE}@${want}" "$creds" "${BUILD_IMAGE}:${N}-rc${K}" >/dev/null
+          echo "${BUILD_IMAGE}:${N}-rc${K} -> ${want}"
+          newest=$( { git tag -l "release-${N}-rc*" | grep -E "^release-${N}-rc[0-9]+$" || true; } \
+                    | sed "s/^release-${N}-rc//" | sort -n | tail -1)
+          if [ "${newest:-0}" -gt "$K" ]; then
+            echo "release-${N}-rc${newest} is newer: :rc stays where it is"
+          else
+            scripts/release/copy_image.sh "$creds" "${BUILD_IMAGE}@${want}" "$creds" "${BUILD_IMAGE}:rc" >/dev/null
+            echo "${BUILD_IMAGE}:rc -> ${want}"
+          fi
+
       - name: Publish the release-candidate's files
         env:
           GH_TOKEN: ${{ github.token }}
@@ -343,6 +374,7 @@ jobs:
             echo "### Release-candidate \`${TAG}\`"
             echo
             echo "- build \`${BUILD_ID}\`, commit \`${SHA}\`"
+            echo "- image \`${BUILD_IMAGE}:${TAG#release-}\`, and \`:rc\` unless a later release-candidate holds it"
             echo "- to release it: \`gh workflow run release.yml --ref ${TAG}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 

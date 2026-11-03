@@ -21,6 +21,10 @@
 # image (packaging/image-context.sh, /usr/share/doc/litestream/LICENSE).
 #
 #   [TTS=0] [STT=0] [SUM=0] licenses.sh <mbedtls-dir>
+#
+# LICENSES_LIST=1 prints the path of each text it would include, one per line,
+# and nothing else: scripts/test/local/notices.sh compares that list with what the
+# daemon's build links, through these same conditionals rather than a copy.
 set -euo pipefail
 
 MBEDTLS_DIR="${1:?usage: licenses.sh <mbedtls-dir>}"
@@ -29,8 +33,11 @@ STT="${STT:-1}"
 SUM="${SUM:-1}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+LIST="${LICENSES_LIST:-0}"
+
 emit() {
   local name="$1" path="$2"
+  if [ "$LIST" = 1 ]; then echo "$path"; return; fi
   if [ ! -f "$path" ]; then
     echo "licenses.sh: missing licence text for ${name}: ${path}" >&2
     echo "licenses.sh: refusing to ship a binary without it" >&2
@@ -44,7 +51,10 @@ emit() {
   cat "$path"
 }
 
-cat <<'HEADER'
+# The plain-text blocks, which a list has no use for.
+header() { if [ "$LIST" = 1 ]; then cat >/dev/null; else cat; fi; }
+
+header <<'HEADER'
 OpenChime daemon (openchimed)
 =============================
 
@@ -89,7 +99,7 @@ in full here, as those licences require.
 HEADER
 
 if [ "$TTS" = 1 ] || [ "$STT" = 1 ]; then
-  cat <<'HEADER'
+  header <<'HEADER'
 
 and, for read-aloud and voice input (built into the binary):
 
@@ -99,21 +109,21 @@ and, for read-aloud and voice input (built into the binary):
 HEADER
 fi
 if [ "$TTS" = 1 ]; then
-  cat <<'HEADER'
+  header <<'HEADER'
   Kitten TTS mini 0.8  Apache-2.0   the voice model, embedded
   Opus 1.6.1           BSD-3-Clause encoding read-aloud's audio
   CMUdict              BSD-style    source of the embedded pronunciation data
 HEADER
 fi
 if [ "$STT" = 1 ]; then
-  cat <<'HEADER'
+  header <<'HEADER'
   Moonshine Tiny       MIT          the speech recognizer's model and tokenizer,
     Streaming (en)                  shipped as data in stt/
 HEADER
 fi
 
 if [ "$SUM" = 1 ]; then
-  cat <<'HEADER'
+  header <<'HEADER'
 
 and, for summaries (built into the binary):
 

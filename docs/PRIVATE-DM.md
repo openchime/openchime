@@ -68,7 +68,9 @@ encrypted DM alone:
 
 - not indexed for search (migration 0063's triggers skip `e2e` channels), and `SEARCH`
   leaves e2e channels out;
-- no mentions, keyword hits, actions, link previews, summaries, read-aloud or voice input;
+- no mentions, keyword hits, actions, link previews, summaries, read-aloud or voice input
+  (so `@here`, `@channel` and `@everyone` in one notify nobody, which the client says
+  before sending, REQ-221);
 - no forward into or out of it;
 - no body text anywhere the server excerpts one: the channel list's preview, activity,
   threads, pins and saved items are blank for it;

@@ -4,7 +4,7 @@
  * client which has no browser of its own.
  *
  * `signin present <host> <port> <token> <verifier>`: the other half, for a
- * script that played the browser itself (scripts/web/pages.sh): HELLO, then
+ * script that played the browser itself (scripts/test/merge/web.sh): HELLO, then
  * AUTH{oidc, "local", token, verifier}, and the user id AUTH_OK names, or
  * the refusal's code. Exit 1 with the reason on stderr either way. */
 #include "check.h"        /* oc_test_deadline, oc_test_pause: waits on the monotonic clock */

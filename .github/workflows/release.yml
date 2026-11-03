@@ -17,7 +17,9 @@
 #   dnf/yum  RHEL family, GPG-signed repository in object storage
 #   tarball  everyone else, and the offline case -- attached to the GitHub release
 #   image    the build's image, copied to :N and :latest in the build
-#            repository (IMAGE_REPO_BUILD) and, when set, IMAGE_REPO_EXTRA
+#            repository (IMAGE_REPO_BUILD) and, when set, IMAGE_REPO_EXTRA;
+#            and to :rc in the build repository alone, which a
+#            release-candidate moved and which never trails :latest
 #   windows  the client, not the daemon: an installer attached to the GitHub
 #            release (signed when Artifact Signing is configured), and an
 #            MSIX for the Store
@@ -26,7 +28,8 @@
 # image, so all four ship a byte-identical artifact: the one the build's
 # manifest names. NOTHING IN THIS WORKFLOW USES DOCKER (skopeo copies, buildah
 # built); the Windows installer and MSIX are packaged, and signed when
-# configured, on a Windows runner.
+# configured, on Linux (packaging/build-windows.sh, scripts/release/
+# sign_windows.sh).
 #
 # Everything happens in this repository: the release-N tag is pushed and main
 # is moved with the deploy key (RELEASE_SSH_KEY, in the `release` environment),
@@ -198,11 +201,17 @@ jobs:
           # `SIGN` requires all six, so a PARTIAL set is the dangerous state: it
           # reads as configured and silently ships unsigned. Named separately
           # for that reason.
+          # The ones missing are named by their secret names, never values:
+          # a count says something is wrong, a name says what to set.
           ts_set=0
-          for v in TS_ENDPOINT TS_ACCOUNT TS_PROFILE AZ_TENANT AZ_CLIENT AZ_SECRET; do
-            eval "val=\${$v:-}"
-            [ -n "$val" ] && ts_set=$((ts_set + 1))
+          ts_missing=""
+          for v in TS_ENDPOINT:TRUSTED_SIGNING_ENDPOINT TS_ACCOUNT:TRUSTED_SIGNING_ACCOUNT \
+                   TS_PROFILE:TRUSTED_SIGNING_PROFILE AZ_TENANT:AZURE_TENANT_ID \
+                   AZ_CLIENT:AZURE_CLIENT_ID AZ_SECRET:AZURE_CLIENT_SECRET; do
+            eval "val=\${${v%%:*}:-}"
+            if [ -n "$val" ]; then ts_set=$((ts_set + 1)); else ts_missing="$ts_missing ${v#*:}"; fi
           done
+          ts_missing="${ts_missing# }"
 
           {
             echo "### Release credentials"
@@ -217,12 +226,12 @@ jobs:
             case "$ts_set" in
               6) echo "Authenticode signing: configured." ;;
               0) echo "Authenticode signing: not configured — the installer ships unsigned, as designed." ;;
-              *) echo "Authenticode signing: **PARTIALLY configured ($ts_set of 6)** — signing will be skipped and the installer will ship unsigned. Set all six or none." ;;
+              *) echo "Authenticode signing: **PARTIALLY configured ($ts_set of 6; missing: $ts_missing)** — signing will be skipped and the installer will ship unsigned. Set all six or none." ;;
             esac
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$ts_set" != 0 ] && [ "$ts_set" != 6 ]; then
-            echo "::warning::Authenticode signing is partially configured ($ts_set of 6); the installer will ship unsigned."
+            echo "::warning::Authenticode signing is partially configured ($ts_set of 6; missing: $ts_missing); the installer will ship unsigned."
           fi
 
           if [ -z "$missing" ]; then
@@ -521,38 +530,13 @@ jobs:
           # Each package is named for ITS architecture: the publish job pools
           # both architectures' files under one prefix, and two named alike
           # collide there.
-          rpm_arch=$([ "${{ matrix.arch }}" = arm64 ] && echo aarch64 || echo x86_64)
-          for want in "openchimed_${VERSION}_${{ matrix.arch }}.deb" \
-                      "openchimed-${VERSION}-1.${rpm_arch}.rpm" \
-                      "openchimed-${VERSION}-linux-${{ matrix.arch }}.tar.gz"; do
-            [ -f "$DIST/$want" ] || { echo "::error::$DIST has no $want"; ls "$DIST"; exit 1; }
-          done
-      # Proves the three channels carry the same file, and that it is the one
-      # the candidate's manifest names: the sha256 of the binary in each
-      # package equals the sha256 of the binary the candidate build made.
-      - name: Verify all channels ship the candidate's binary
-        run: |
-          set -euo pipefail
-          want=$(sha256sum "$DIST/openchimed" | cut -d' ' -f1)
-          mkdir -p v/deb v/rpm v/tar
-          dpkg-deb -x "$DIST/openchimed_${VERSION}_${{ matrix.arch }}.deb" v/deb
-          ( cd v/rpm && rpm2cpio ../../"$DIST"/openchimed-${VERSION}-1.*.rpm | cpio -idm --quiet )
-          tar xzf "$DIST/openchimed-${VERSION}-linux-${{ matrix.arch }}.tar.gz" -C v/tar
-          for f in v/deb/usr/bin/openchimed v/rpm/usr/bin/openchimed \
-                   v/tar/openchimed-${VERSION}-linux-${{ matrix.arch }}/openchimed; do
-            got=$(sha256sum "$f" | cut -d' ' -f1)
-            [ "$got" = "$want" ] || { echo "::error::$f differs from the candidate's binary"; exit 1; }
-          done
-          echo "all three channels ship $want (build ${BUILD_ID})"
-      - name: Install the package and run it
-        if: matrix.arch == 'amd64'
-        run: |
-          set -euo pipefail
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            "./$DIST/openchimed_${VERSION}_${{ matrix.arch }}.deb"
-          ver="$(/usr/bin/openchimed --version)"
-          grep -q "^openchimed ${BUILD_ID} " <<<"$ver" || {
-            echo "::error::the installed daemon does not report build ${BUILD_ID}"; exit 1; }
+
+      # The packages carry the candidate's binary, and it is the build the
+      # candidate names, installs and speaks (scripts/test/release/, the same
+      # target the staging build ran on this binary).
+      - name: make test-release PART=packages
+        run: make test-release PART=packages DIST="$DIST" PKG_VERSION="$VERSION" PKG_ARCH="${{ matrix.arch }}"
+
       # The artifact is NAMED for the platform, and the publish job downloads
       # without merge-multiple. That combination is what rebuilds dist/<platform>/
       # on the other side: upload-artifact strips the common path prefix, so the
@@ -574,27 +558,17 @@ jobs:
   windows:
     name: windows installers
     needs: [version, candidate, resolve]
-    runs-on: windows-latest
+    # On Linux, like everything else: the binaries were cross-compiled here,
+    # the installer is NSIS (makensis), the MSIX is makemsix, and signing is
+    # jsign against Azure Trusted Signing (packaging/build-windows.sh,
+    # scripts/release/sign_windows.sh). No Windows machine is in the release.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.version.outputs.number }}
       BUILD_ID: ${{ needs.candidate.outputs.build_id }}
       BUILD_NUM: ${{ needs.candidate.outputs.run_number }}
-      # Signing is gated on a real release AND on the credentials existing. A dry
-      # run produces the same artifacts unsigned and never reads them. An
-      # incomplete signing config degrades the artifact; it does not fail the
-      # release.
-      #
-      # Nothing needs editing when Artifact Signing is provisioned; setting the
-      # six secrets below turns signing back on by itself. All six are required:
-      # the first three name the signing profile, the last three are the service
-      # principal that proves the caller may use it -- the action authenticates
-      # via DefaultAzureCredential and has nothing to authenticate with otherwise.
       SIGN: ${{ !inputs.dry_run && secrets.TRUSTED_SIGNING_ENDPOINT != '' && secrets.TRUSTED_SIGNING_ACCOUNT != '' && secrets.TRUSTED_SIGNING_PROFILE != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' }}
-      # Same convention as the packages job: artifacts land in dist/<platform>/
-      # and the artifact is named for that platform. build/ stays the staging
-      # area -- the unpackaged binaries and the MSIX layout are inputs to a
-      # package, not outputs of one, and the .iss reads them from there.
       PLATFORM: windows-x64
       DIST: dist/windows-x64
     steps:
@@ -606,139 +580,85 @@ jobs:
           name: candidate-windows-x64
           path: candidate/windows-x64
       - name: Take the candidate's binaries
-        shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force build | Out-Null
-          Copy-Item candidate\windows-x64\openchime.exe, candidate\windows-x64\openchime-tui.exe, candidate\windows-x64\openchime.debug build\
-          Get-ChildItem build
+          set -euo pipefail
+          mkdir -p build
+          cp candidate/windows-x64/openchime.exe candidate/windows-x64/openchime-tui.exe candidate/windows-x64/openchime.debug build/
+          ls -la build
+      - name: Install the packaging tools
+        timeout-minutes: 20
+        run: scripts/build/apt.sh nsis python3-pefile
+      # makemsix is built from pinned source on first use (scripts/build/
+      # makemsix.sh); kept by that script's hash, so a release restores it.
+      - name: Restore makemsix
+        uses: actions/cache@v6
+        with:
+          path: third_party/makemsix-*
+          key: makemsix-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/makemsix.sh') }}
 
-      # Both binaries carry a VERSIONINFO resource (client/shared/res): the
-      # file version is the candidate build's run number, the product version
-      # names the build id. Asserted rather than assumed because the failure
-      # is silent: a missing or misbuilt resource still produces a working
-      # .exe, and the installer wrapping it carries its own version.
-      - name: Check the embedded version
-        shell: pwsh
-        run: |
-          $want = "1.0.$env:BUILD_NUM.0"
-          foreach ($f in 'build\openchime.exe','build\openchime-tui.exe') {
-            $vi = (Get-Item $f).VersionInfo
-            if ($vi.FileVersion -ne $want) { throw "$f reports FileVersion '$($vi.FileVersion)', expected '$want'" }
-            if ($vi.ProductVersion -ne "build $env:BUILD_ID") { throw "$f reports ProductVersion '$($vi.ProductVersion)', expected 'build $env:BUILD_ID'" }
-            Write-Host "$f $($vi.FileVersion) $($vi.ProductVersion)"
-          }
-
-      # The SDK ships on the runner image but is not on PATH, and its versioned
-      # directory moves with each image update, so it is discovered rather than
-      # pinned to a build number that would silently rot.
-      - name: Locate the Windows SDK
-        shell: pwsh
-        run: |
-          $bin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
-          $sdk = Get-ChildItem $bin -Directory -ErrorAction Stop |
-                 Where-Object Name -match '^10\.' | Sort-Object Name | Select-Object -Last 1
-          if (-not $sdk) { throw "no Windows 10 SDK under $bin" }
-          Write-Host "using SDK $($sdk.Name)"
-          "$($sdk.FullName)\x64" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
-
-      # Signed before packaging, not after: both the installer and the MSIX
-      # embed these files, so signing them afterwards would leave the copies
-      # inside the packages unsigned.
+      # The installer embeds the binaries, so they are signed first.
       - name: Sign the binaries
         if: env.SIGN == 'true'
-        uses: Azure/artifact-signing-action@v2
-        with:
-          endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
-          certificate-profile-name: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          exclude-workload-identity-credential: true
-          exclude-managed-identity-credential: true
-          exclude-shared-token-cache-credential: true
-          exclude-visual-studio-credential: true
-          exclude-visual-studio-code-credential: true
-          exclude-azure-powershell-credential: true
-          exclude-azure-developer-cli-credential: true
-          exclude-interactive-browser-credential: true
-          files-folder: build
-          files-folder-filter: exe
-          file-digest: SHA256
+        env: &signing
+          TRUSTED_SIGNING_ENDPOINT: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          TRUSTED_SIGNING_ACCOUNT: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          TRUSTED_SIGNING_PROFILE: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: scripts/release/sign_windows.sh build/openchime.exe build/openchime-tui.exe
 
-      - name: Build the installer
-        shell: pwsh
-        run: |
-          # DIST is written with forward slashes because upload-artifact's globs
-          # require them; ISCC is given the backslash form rather than trusting
-          # it to normalise a path handed to /O.
-          $out = $env:DIST -replace '/','\'
-          New-Item -ItemType Directory -Force $out | Out-Null
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
-              "/DVersion=$env:VERSION" "/O$out" packaging\windows\openchime.iss
-          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
-
-      # An unsigned installer is a real cost, not a footnote: Windows SmartScreen
-      # will warn on it and some users will not click through. Said here so the
-      # run itself records why, rather than leaving it to be rediscovered.
-      - name: Note the missing signature
-        if: ${{ !inputs.dry_run && env.SIGN != 'true' }}
-        shell: bash
-        run: |
-          echo "::warning::Artifact Signing credentials are not set; the Windows installer and binaries in this release are UNSIGNED. Users will see a SmartScreen warning."
-          echo "### Windows artifacts are unsigned" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "TRUSTED_SIGNING_ENDPOINT / _ACCOUNT / _PROFILE and AZURE_TENANT_ID / _CLIENT_ID / _CLIENT_SECRET are unset, so signing was skipped. Set all six to turn it back on; nothing else needs changing." >> "$GITHUB_STEP_SUMMARY"
+      # The installer and the MSIX under the release number. The MSIX is left
+      # unsigned on purpose: a Store submission is re-signed by Microsoft, and
+      # signing it here with our own certificate would be discarded. A
+      # sideloadable .msix is a different artifact and would need one.
+      - name: Build the installer and the MSIX
+        run: packaging/build-windows.sh "$VERSION" build "$DIST"
 
       - name: Sign the installer
         if: env.SIGN == 'true'
-        uses: Azure/artifact-signing-action@v2
-        with:
-          endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
-          certificate-profile-name: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          exclude-workload-identity-credential: true
-          exclude-managed-identity-credential: true
-          exclude-shared-token-cache-credential: true
-          exclude-visual-studio-credential: true
-          exclude-visual-studio-code-credential: true
-          exclude-azure-powershell-credential: true
-          exclude-azure-developer-cli-credential: true
-          exclude-interactive-browser-credential: true
-          files-folder: ${{ env.DIST }}
-          files-folder-filter: exe
-          file-digest: SHA256
+        env: *signing
+        run: scripts/release/sign_windows.sh "$DIST/openchime-${VERSION}-windows-x64-setup.exe"
 
-      # Left unsigned on purpose: a Store submission is re-signed by Microsoft,
-      # and signing it here with our own certificate would be discarded. A
-      # sideloadable .msix is a different artifact and would need one.
-      - name: Build the MSIX
-        shell: pwsh
+      - name: Note the missing signature
+        if: ${{ !inputs.dry_run && env.SIGN != 'true' }}
+        # Which of the six are set, as the preflight sees them: "unset" is only
+        # true when none is, and a partial set is named, not miscounted.
+        env:
+          TS_ENDPOINT: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          TS_ACCOUNT:  ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          TS_PROFILE:  ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+          AZ_TENANT:   ${{ secrets.AZURE_TENANT_ID }}
+          AZ_CLIENT:   ${{ secrets.AZURE_CLIENT_ID }}
+          AZ_SECRET:   ${{ secrets.AZURE_CLIENT_SECRET }}
         run: |
-          $stage = 'build\msix'
-          New-Item -ItemType Directory -Force "$stage\bin" | Out-Null
-          Copy-Item packaging\windows\msix\* $stage -Recurse -Force
-          Copy-Item build\*.exe "$stage\bin"
+          ts_set=0
+          ts_missing=""
+          for v in TS_ENDPOINT:TRUSTED_SIGNING_ENDPOINT TS_ACCOUNT:TRUSTED_SIGNING_ACCOUNT \
+                   TS_PROFILE:TRUSTED_SIGNING_PROFILE AZ_TENANT:AZURE_TENANT_ID \
+                   AZ_CLIENT:AZURE_CLIENT_ID AZ_SECRET:AZURE_CLIENT_SECRET; do
+            eval "val=\${${v%%:*}:-}"
+            if [ -n "$val" ]; then ts_set=$((ts_set + 1)); else ts_missing="$ts_missing ${v#*:}"; fi
+          done
+          ts_missing="${ts_missing# }"
+          if [ "$ts_set" = 0 ]; then
+            echo "::warning::Artifact Signing credentials are not set; the Windows installer and binaries in this release are UNSIGNED. Users will see a SmartScreen warning."
+          else
+            echo "::warning::Artifact Signing credentials are partially set (missing: $ts_missing); the Windows installer and binaries in this release are UNSIGNED. Users will see a SmartScreen warning."
+          fi
+          echo "### Windows artifacts are unsigned" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ts_set" = 0 ]; then
+            echo "TRUSTED_SIGNING_ENDPOINT / _ACCOUNT / _PROFILE and AZURE_TENANT_ID / _CLIENT_ID / _CLIENT_SECRET are unset, so signing was skipped. Set all six to turn it back on; nothing else needs changing." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Artifact Signing is partially set ($ts_set of 6; missing: $ts_missing), so signing was skipped. Set the missing ones to turn it back on; nothing else needs changing." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-          # scripts/release/version.sh hands out a bare integer; MSIX requires a.b.c.d with the
-          # fourth field reserved for the Store, so the release number lands in
-          # the third. Monotonic, which is all the Store checks.
-          $m = "$stage\AppxManifest.xml"
-          (Get-Content $m -Raw).Replace('Version="1.0.0.0"', "Version=`"1.0.$env:VERSION.0`"") |
-            Set-Content $m -Encoding utf8
-
-          # Without a resources.pri the scale-N asset variants are inert and
-          # the tile renders from the scale-100 file at every DPI.
-          makepri.exe createconfig /cf "$stage\priconfig.xml" /dq en-US /o
-          makepri.exe new /pr $stage /cf "$stage\priconfig.xml" /of "$stage\resources.pri" /o
-          Remove-Item "$stage\priconfig.xml"
-
-          $out = $env:DIST -replace '/','\'
-          makeappx.exe pack /d $stage /p "$out\openchime-$env:VERSION.msix" /o
-          if ($LASTEXITCODE -ne 0) { throw "makeappx failed" }
+      # What ships, checked by the target a person runs too
+      # (scripts/test/release/windows.sh): the binaries name the candidate's
+      # build, and the installer and the MSIX carry the release number.
+      - name: make test-release PART=windows
+        run: make test-release PART=windows WIN_BIN=build WIN_DIST="$DIST" PKG_VERSION="$VERSION"
 
       # The GUI's DWARF, split out by the Makefile and referenced by a
       # .gnu_debuglink in the shipped .exe. It has to travel in THIS artifact:
@@ -746,10 +666,7 @@ jobs:
       # intermediate mingw-binaries, so anything left there never reaches the
       # release.
       - name: Stage the GUI debug symbols beside the installer
-        shell: pwsh
-        run: |
-          $out = $env:DIST -replace '/','\'
-          Copy-Item build\openchime.debug "$out\openchime.debug"
+        run: cp build/openchime.debug "$DIST/openchime.debug"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -1118,6 +1035,9 @@ jobs:
       # repository each copy proves the build's digest from skopeo's own report
       # (scripts/release/copy_image.sh), and :latest is copied from the build by
       # digest only after :N is, so :latest never names an unverified image.
+      # Then :rc, in the build repository alone: release-candidate.yml moves it
+      # to each newest candidate, and the release moves it on to itself, so
+      # what follows :rc never runs older than :latest.
       # Nothing reads back a tag just written: a registry does not always serve
       # a tag the moment its push finishes. Basic auth: IMAGE_REGISTRY_USER and
       # each one's token.
@@ -1138,6 +1058,8 @@ jobs:
           }
           release_image "$BUILD_IMAGE" "$BUILD_CREDS"
           if [ -n "$EXTRA_IMAGE" ]; then release_image "$EXTRA_IMAGE" "$EXTRA_CREDS"; fi
+          scripts/release/copy_image.sh "$BUILD_CREDS" "${BUILD_IMAGE}@sha256:${want}" "$BUILD_CREDS" "${BUILD_IMAGE}:rc" >/dev/null
+          echo "${BUILD_IMAGE}: rc -> build-${BUILD_ID} (sha256:${want})"
 
       - name: Summary
         if: always()
@@ -1180,60 +1102,18 @@ jobs:
       - uses: actions/checkout@v7   # for scripts/build/apt.sh
         with:
           ref: ${{ needs.resolve.outputs.sha }}
-      - name: Smoke the published apt repository
-        # Skipped only when explicitly asked. The default stays a hard failure:
-        # this step existing to fail while DIST_BASE_URL is unserved is a
-        # recorded decision, not an oversight, and auto-detecting the outage
-        # would silently mask a genuinely broken repository later.
-        if: ${{ !inputs.skip_repo_smoke }}
-        run: |
-          set -euo pipefail
-          # Fetched unprivileged, so the retrying curl (.github/net-retry.bash)
-          # does it, then put in place with sudo.
-          curl -fsSL "$DIST_VERIFY_URL/openchime-archive-keyring.gpg" -o "$RUNNER_TEMP/keyring.gpg"
-          sudo install -m 0644 "$RUNNER_TEMP/keyring.gpg" /usr/share/keyrings/openchime-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] $DIST_VERIFY_URL/apt stable main" \
-            | sudo tee /etc/apt/sources.list.d/openchime.list >/dev/null
-          # Through apt.sh: the index fetched first (install alone can find
-          # nothing), bounded and retried.
-          scripts/build/apt.sh openchimed
-          openchimed --version
-
-      # The dnf half: the apt check above proves one of the two channels, and
-      # this installs the .rpm the way an operator does.
-      #
-      # podman, not docker: this pipeline is daemon-free by standing constraint,
-      # which is why the image is built with buildah rather than a daemon. podman
-      # is that same family and needs no daemon either, so the rule is kept
-      # rather than bent. rockylinux:9 is the floor the glibc 2.34 target exists
-      # to support, so this also exercises the oldest supported RHEL.
-      #
-      # The whole point is to consume the repository the way an operator does:
-      # over HTTPS, with the published key and the published .repo file, on a
-      # machine that has never seen this project.
-      - name: Smoke the published dnf repository
-        if: ${{ !inputs.skip_repo_smoke }}
-        run: |
-          set -euo pipefail
-          command -v podman >/dev/null || scripts/build/apt.sh podman
-          podman run --rm rockylinux:9 bash -euo pipefail -c "
-            curl -fsSL '${DIST_VERIFY_URL}/openchime-archive-keyring.asc' -o /tmp/oc.asc
-            rpm --import /tmp/oc.asc
-            curl -fsSL '${DIST_VERIFY_URL}/openchime.repo' -o /etc/yum.repos.d/openchime.repo
-            # The published file names DIST_BASE_URL; read it from where it is verified.
-            sed -i 's|${DIST_BASE_URL}|${DIST_VERIFY_URL}|g' /etc/yum.repos.d/openchime.repo
-            dnf install -y openchimed
-            openchimed --version
-          "
-
-      # Each index, read back from each bucket, lists one version more per
-      # architecture than before this release: the count publish recorded
-      # before writing, plus this release exactly once, every package it names
-      # present, and the signed top matching the files it names. Read from the
-      # buckets, not DIST_VERIFY_URL, so not behind skip_repo_smoke; and
-      # !cancelled(), so a failed install above cannot hide what this says.
-      - name: Check each index lists one version more
-        if: ${{ !cancelled() }}
+      # The smoke test of what this release published (scripts/smoketest.sh,
+      # every check in scripts/smoke/): the apt repository installs it, the dnf
+      # repository installs it on rockylinux:9 (the oldest RHEL the glibc 2.34
+      # floor exists to support), each index lists this release once more, and
+      # the released image pulls and runs. Every check runs even when one
+      # fails. skip_repo_smoke skips only the two repository installs, for
+      # while DIST_BASE_URL is not yet served: this failing then is a recorded
+      # decision, not an oversight, and detecting the outage would silently
+      # mask a genuinely broken repository later.
+      - name: Install podman and rclone
+        run: scripts/build/apt.sh podman rclone
+      - name: scripts/smoketest.sh
         env:
           APT_EXPECT: ${{ needs.publish.outputs.apt_expect }}
           RPM_EXPECT: ${{ needs.publish.outputs.rpm_expect }}
@@ -1244,58 +1124,8 @@ jobs:
           DIST_S3_MIRROR_ACCESS_KEY: ${{ secrets.DIST_S3_MIRROR_ACCESS_KEY }}
           DIST_S3_MIRROR_SECRET_KEY: ${{ secrets.DIST_S3_MIRROR_SECRET_KEY }}
           DIST_MIRROR_BUCKET:        ${{ vars.DIST_MIRROR_BUCKET }}
-        run: |
-          set -euo pipefail
-          [ -n "$APT_EXPECT" ] && [ -n "$RPM_EXPECT" ] || { echo "::error::publish recorded no counts to check"; exit 1; }
-          for v in DIST_S3_ACCESS_KEY DIST_S3_SECRET_KEY DIST_S3_ENDPOINT DIST_BUCKET \
-                   DIST_S3_MIRROR_ACCESS_KEY DIST_S3_MIRROR_SECRET_KEY DIST_MIRROR_BUCKET; do
-            [ -n "${!v}" ] || { echo "::error::$v is not set"; exit 1; }
-          done
-          command -v rclone >/dev/null || scripts/build/apt.sh rclone
-          # As publish configures it; a job cannot read another's files.
-          mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf <<EOF
-          [dist]
-          type = s3
-          provider = Other
-          access_key_id = ${DIST_S3_ACCESS_KEY}
-          secret_access_key = ${DIST_S3_SECRET_KEY}
-          endpoint = ${DIST_S3_ENDPOINT}
-          region = ${DIST_S3_REGION}
-
-          [dist-mirror]
-          type = s3
-          provider = Other
-          access_key_id = ${DIST_S3_MIRROR_ACCESS_KEY}
-          secret_access_key = ${DIST_S3_MIRROR_SECRET_KEY}
-          endpoint = ${DIST_S3_ENDPOINT}
-          region = ${DIST_S3_REGION}
-          EOF
-          for bucket in "dist:${DIST_BUCKET}" "dist-mirror:${DIST_MIRROR_BUCKET}"; do
-            scripts/release/repo_update.sh verify apt "${bucket}/apt" "$APT_EXPECT"
-            scripts/release/repo_update.sh verify rpm "${bucket}/rpm" "$RPM_EXPECT"
-          done
-
-      # The third channel: the image, pulled by its released tag from the
-      # build repository, logged in with its token, and run. A tag that did
-      # not land, or an image that does not start on this base, is found here
-      # rather than after the release.
-      #
-      # Not behind skip_repo_smoke: that switch exists for DIST_BASE_URL being
-      # unserved, and the registry does not depend on it. And !cancelled(), so
-      # a repository step failing above cannot hide what this one would say.
-      - name: Smoke the released container image
-        if: ${{ !cancelled() }}
-        env:
-          TOKEN: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
-        run: |
-          set -euo pipefail
-          command -v podman >/dev/null || scripts/build/apt.sh podman
-          [ -n "$TOKEN" ] || { echo "::error::IMAGE_REGISTRY_TOKEN_BUILD is not set in the release environment"; exit 1; }
-          printf '%s' "$TOKEN" | podman login -u "$IMAGE_REGISTRY_USER" --password-stdin "${BUILD_IMAGE%%/*}"
-          IMAGE="${BUILD_IMAGE}:${VERSION}"
-          podman pull "$IMAGE"
-          podman run --rm "$IMAGE" --version
+          IMAGE_REGISTRY_TOKEN: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
+        run: scripts/smoketest.sh ${{ inputs.skip_repo_smoke && '--skip-repos' || '' }}
 
       - name: Note the skipped smoke test
         if: ${{ inputs.skip_repo_smoke }}

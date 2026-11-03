@@ -29,16 +29,6 @@ $(WEB_MEDIA_LIBS) &: $(EMCC)
 	scripts/build/media_wasm.sh
 	@touch -c $(WEB_MEDIA_LIBS)
 
-# The drawing layer's own pixel test (client/gui/gfx), built for wasm and run
-# under Node by `make web-test`.
-WEB_GFX_SRC   := $(GFX_SRC) client/shared/icons.c
-WEB_GFX_FLAGS := -std=c99 -O2 $(WARN_CFLAGS) -Wno-typedef-redefinition -pthread \
-                 -Iclient/gui/gfx -Iclient/shared -I$(WEB_SDL3)/include
-WEB_GFX_LD    := $(WEB_SDL3)/lib/libSDL3.a -pthread -sALLOW_MEMORY_GROWTH=1 -Wno-pthreads-mem-growth
-$(WEB_DIR)/gfx-test.js: $(WEB_GFX_SRC) client/gui/gfx/gfx_test_win.c client/gui/gfx/gfx.h $(WEB_SDL3)/lib/libSDL3.a $(EMCC)
-	mkdir -p $(WEB_DIR)
-	$(EMCC) $(WEB_GFX_FLAGS) $(WEB_GFX_SRC) client/gui/gfx/gfx_test_win.c $(WEB_GFX_LD) -sENVIRONMENT=node,worker -o $@
-
 # The client. Asyncify lets its own loop yield to the page.
 WEB_MEDIA_SRC := $(filter-out client/core/media/audio_ma.c client/core/media/cap_mf.c client/core/media/cap_wgc.c,$(MEDIA_SRC)) \
                  $(VOICE_SRC) $(CALL_SRC) client/gui/platform/web/cap_web.c client/gui/platform/web/audio_web.c \
@@ -103,12 +93,3 @@ $(WEBAPP_RES): client/gui/platform/web/openchime.html $(WEBAPP_JS) scripts/build
 	python3 scripts/build/embed_res.py $@ oc_webapp_html=client/gui/platform/web/openchime.html oc_webapp_js=$(WEBAPP_JS) \
 	    oc_webapp_js_gz=$(if $(WEBAPP_JS),gzip:$(WEBAPP_JS))
 
-# The client's checks: the gfx pixel test under Node, then the client signing
-# in, drawing, recording and composing in a headless Chromium
-# (scripts/web/test.sh), against a daemon built with the client in it. Under
-# OC_TEST_TIMING=0 the recording and composing parts are skipped.
-web-test: $(WEB_DIR)/gfx-test.js $(WEB_DIR)/openchime.js
-	@$(MAKE) --no-print-directory WEB=1 $(BIN)
-	$(NODE) $(WEB_DIR)/gfx-test.js
-	scripts/web/test.sh
-	scripts/web/pages.sh

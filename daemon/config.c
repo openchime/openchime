@@ -423,6 +423,9 @@ static int store(oc_config *c, const cfg_row *r, const char *name, const char *v
     switch (r->kind) {
     case CFG_STR:
         if (r->flags & CFG_CLIENT) return 0;
+        /* A string row may name a check for its shape (`parse`), which only
+         * says yes or no: the value is kept as written. */
+        if (v && *v && r->parse && r->parse(c, r, name, v, err, errcap) != 0) return -1;
         *(const char **)dst = v;
         return 0;
     case CFG_PATH:
@@ -718,6 +721,90 @@ int oc_config_apply_env_file(const char *path, char *err, size_t errcap) {
 
 /* --- the views --------------------------------------------------------------------- */
 
+/* A message window (OPENCHIME_EDIT_WINDOW, OPENCHIME_DELETE_WINDOW): `never`,
+ * or a whole number of seconds from 1 to a year. Empty is unset: always. */
+int cfg_parse_window(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap) {
+    (void)c; (void)r;
+    if (!strcmp(v, "never")) return 0;
+    char *end = NULL;
+    long long n = strtoll(v, &end, 10);
+    if (end && !*end && *v >= '0' && *v <= '9' && n >= 1 && n <= 31536000) return 0;
+    return fail(err, errcap, name, v, "must be `never` or seconds, 1 to 31536000");
+}
+
+int64_t oc_config_window_ms(const char *v) {
+    if (!v || !*v) return -1;
+    if (!strcmp(v, "never")) return 0;
+    return (int64_t)strtoll(v, NULL, 10) * 1000;
+}
+
+int oc_config_quiet_hours(const char *v, int *mode, int *start_min, int *end_min) {
+    if (!v || !*v) return 0;
+    int m;
+    const char *p;
+    if (!strncmp(v, "everyday ", 9)) { m = OC_DND_EVERY_DAY; p = v + 9; }
+    else if (!strncmp(v, "weekdays ", 9)) { m = OC_DND_WEEKDAYS; p = v + 9; }
+    else return 0;
+    int h1, m1, h2, m2, used = 0;
+    if (sscanf(p, "%2d:%2d-%2d:%2d%n", &h1, &m1, &h2, &m2, &used) != 4 || p[used] != '\0') return 0;
+    if (strlen(p) != 11 || h1 > 24 || h2 > 24 || m1 > 59 || m2 > 59 || h1 < 0 || h2 < 0 || m1 < 0 || m2 < 0) return 0;
+    int s = h1 * 60 + m1, e = h2 * 60 + m2;
+    if (s > 1440 || e > 1440 || s == e) return 0;
+    if (mode) *mode = m;
+    if (start_min) *start_min = s % 1440;
+    if (end_min) *end_min = e % 1440;
+    return 1;
+}
+
+/* The workspace's default quiet hours (OPENCHIME_DEFAULT_QUIET_HOURS):
+ * `everyday` or `weekdays`, then the hours notifications are allowed, as
+ * `HH:MM-HH:MM` in each member's own time. */
+int cfg_parse_quiet(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap) {
+    (void)c; (void)r;
+    if (oc_config_quiet_hours(v, NULL, NULL, NULL)) return 0;
+    return fail(err, errcap, name, v, "must be `everyday` or `weekdays`, a space, and the allowed hours as HH:MM-HH:MM");
+}
+
+/* A stored row's effective value as an operator would write it. */
+static void row_value(const oc_config *c, const cfg_row *r, char *val, size_t cap) {
+    const void *p = (const char *)c + r->off;
+    val[0] = '\0';
+    switch (r->kind) {
+    case CFG_STR: case CFG_PATH: {
+        const char *s = *(const char *const *)p;
+        snprintf(val, cap, "%s", s ? s : "");
+        break; }
+    case CFG_INT:  snprintf(val, cap, "%d", *(const int *)p); break;
+    case CFG_U64:  snprintf(val, cap, "%llu", (unsigned long long)*(const uint64_t *)p); break;
+    case CFG_BOOL: snprintf(val, cap, "%s", *(const int *)p ? "on" : "off"); break;
+    case CFG_ENUM: {
+        int idx = *(const int *)p, k = 0;
+        const char *e = r->enums;
+        while (e && k < idx) { e = strchr(e, '|'); if (e) e++; k++; }
+        if (e) { const char *bar = strchr(e, '|'); snprintf(val, cap, "%.*s", bar ? (int)(bar - e) : (int)strlen(e), e); }
+        break; }
+    default: break;
+    }
+}
+
+int oc_config_visible(size_t i, char *key, size_t kcap, char *val, size_t vcap) {
+    size_t n = 0;
+    for (const cfg_row *r = OC_CFG; r->name; r++) {
+        /* Never a secret, a client's own, a structured or a patterned row: what
+         * clients are told is a plain value under one name. */
+        if (!(r->flags & CFG_VISIBLE) || (r->flags & (CFG_SECRET | CFG_CLIENT | CFG_PATTERN)) ||
+            r->kind == CFG_CUSTOM) continue;
+        if (n++ != i) continue;
+        const char *nm = strncmp(r->name, "OPENCHIME_", 10) == 0 ? r->name + 10 : r->name;
+        size_t k = 0;
+        for (; nm[k] && k + 1 < kcap; k++) key[k] = (char)tolower((unsigned char)nm[k]);
+        key[k] = '\0';
+        row_value(&g_cfg, r, val, vcap);
+        return 1;
+    }
+    return 0;
+}
+
 void oc_config_report(void *out_) {
     FILE *out = out_;
     const oc_config *c = &g_cfg;
@@ -786,13 +873,23 @@ static void print_group(FILE *out, const char *group, cfg_class cls) {
             snprintf(range, sizeof range, " One of `%s`.", r->enums);
             for (char *p = range; *p; p++) if (*p == '|') { memmove(p + 4, p + 1, strlen(p)); memcpy(p, "`, `", 4); p += 3; }
         }
-        fprintf(out, "| `%s` | %s | %s%s |\n", name, dflt, r->doc, range);
+        /* What clients are told, read-only, on WORKSPACE_SETTINGS, by its key. */
+        char shown[128] = "";
+        if (r->flags & CFG_VISIBLE) {
+            char key[64];
+            size_t k = 0;
+            for (const char *q = name + (strncmp(name, "OPENCHIME_", 10) ? 0 : 10); *q && k + 1 < sizeof key; q++)
+                key[k++] = (char)tolower((unsigned char)*q);
+            key[k] = '\0';
+            snprintf(shown, sizeof shown, " Clients are told it, read-only, as `%s`.", key);
+        }
+        fprintf(out, "| `%s` | %s | %s%s%s |\n", name, dflt, r->doc, range, shown);
     }
 }
 
 void oc_config_print_reference(void *out_) {
     FILE *out = out_;
-    fprintf(out, "<!-- Generated by `openchimed --config-reference` from daemon/config_table.c; do not edit by hand (scripts/check/config.sh). -->\n");
+    fprintf(out, "<!-- Generated by `openchimed --config-reference` from daemon/config_table.c; do not edit by hand (scripts/test/local/config.sh). -->\n");
     fprintf(out, "\n## Settings and features\n\nEverything an operator may set. A value that does not parse, is out of its range, or names a setting that does not exist stops the daemon before it opens anything; an empty value is unset. `openchimed --check-config` tests a file before a restart.\n");
     /* Operator rows, by group in table order. */
     const char *seen[32]; int n_seen = 0;

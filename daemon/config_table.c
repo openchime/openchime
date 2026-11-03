@@ -22,6 +22,8 @@ int cfg_parse_summary(oc_config *c, const cfg_row *r, const char *name, const ch
 int cfg_parse_connect(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_token_prefix(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_trusted_proxies(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
+int cfg_parse_window(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
+int cfg_parse_quiet(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 
 #define F(field) offsetof(oc_config, field)
 #define STR(n, cls, grp, d, doc, ...)   { n, CFG_STR,  cls, grp, d, doc, 0, 0, NULL, __VA_ARGS__ }
@@ -43,7 +45,30 @@ const cfg_row OC_CFG[] = {
     /* --- Settings: no feature behind them, a value an operator chooses -------- */
     /* First: the mode decides whether the development rows below may be read. */
     ENUM("OPENCHIME_MODE", CFG_OPERATOR, G_SET, "normal", "normal|development|demo", "What the box is for: `normal` (a deployment), `development` (the tests and harnesses; the only mode that reads the Development rows) or `demo` (the public demo workspace).", mode),
-    STR("OPENCHIME_WORKSPACE_NAME", CFG_OPERATOR, G_SET, "", "The workspace's display name, shown to clients; unset, a client derives one from the host.", F(workspace_name), NULL, 0, 0),
+    /* ENUMs and INTs a client is told (CFG_VISIBLE), written out: the macros have no flags. */
+    { "OPENCHIME_BROADCAST_MENTIONS", CFG_ENUM, CFG_OPERATOR, G_SET, "everyone",
+      "Who may notify a whole large channel with `@channel`, `@everyone` or `@here` (REQ-221): `everyone`, `admins` (owners and admins) or `nobody`. From anyone else the mention stays in the message as text and notifies nobody.",
+      0, 0, "everyone|admins|nobody", F(broadcast_mentions), NULL, CFG_VISIBLE, 0 },
+    { "OPENCHIME_BROADCAST_LARGE", CFG_INT, CFG_OPERATOR, G_SET, "0",
+      "The member count from which a channel is large for `OPENCHIME_BROADCAST_MENTIONS`; 0 makes every channel large. At most 500, the most members a channel's member list carries, so a client counts a channel as the daemon does.",
+      0, (int64_t)OC_MAX_MEMBER_LIST, NULL, F(broadcast_large), NULL, CFG_VISIBLE, 0 },
+    STR("OPENCHIME_WELCOME_MESSAGE", CFG_OPERATOR, G_SET, "", "The welcome each new member is sent once, as a direct message from the workspace, when their account is made: the text as it is then, in the message formatting (MARKDOWN.md), `\\n` for a line break. Empty: none is sent.", F(welcome_message), NULL, 0, 0),
+    STR("OPENCHIME_NOTICE_MEMBER_JOINED", CFG_OPERATOR, G_SET, "", "The public channel the workspace posts in when a new member joins, naming them. Empty: none is posted. A name that is no public, unarchived channel is said once at start, and nothing is posted.", F(notice_member_joined), NULL, 0, 0),
+    STR("OPENCHIME_NOTICE_CHANNEL_CREATED", CFG_OPERATOR, G_SET, "", "The public channel the workspace posts in when a public channel is created, naming it and who made it. Empty: none is posted.", F(notice_channel_created), NULL, 0, 0),
+    BOOL("OPENCHIME_NOTICE_CHANNEL_CHANGES", CFG_OPERATOR, G_SET, "off", "Whether the workspace posts in a channel when its name, description, visibility or archived state changes, naming who changed it.", notice_channel_changes),
+    STR("OPENCHIME_DEFAULT_QUIET_HOURS", CFG_OPERATOR, G_SET, "", "The quiet hours a member follows until they set their own (REQ-136): `everyday` or `weekdays`, a space, and the hours notifications are allowed, `HH:MM-HH:MM` in each member's own time, as in `weekdays 09:00-18:00`. Empty: none, and a member without their own is never quiet.", F(default_quiet_hours), cfg_parse_quiet, CFG_VISIBLE, 0),
+    /* An ENUM a client is told (CFG_VISIBLE), written out: the macro has no flags. */
+    { "OPENCHIME_READ_RECEIPTS", CFG_ENUM, CFG_OPERATOR, G_SET, "on",
+      "Whether members see who has read a message (seen-by, REQ-090): `on`, or `off`, when no member's read position reaches anyone else. Each member may also stop sharing their own. Turned back on, reads from while it was off are never shown.",
+      0, 0, "on|off", F(read_receipts), NULL, CFG_VISIBLE, 0 },
+    STR("OPENCHIME_WORKSPACE_NAME", CFG_OPERATOR, G_SET, "", "The workspace's display name, shown to clients; unset, a client derives one from the host.", F(workspace_name), NULL, CFG_VISIBLE, 0),
+    /* An ENUM a client is told (CFG_VISIBLE), written out: the macro has no flags. */
+    { "OPENCHIME_CUSTOM_EMOJI_ADD", CFG_ENUM, CFG_OPERATOR, G_SET, "everyone",
+      "Who may add a custom emoji (REQ-072): `everyone`, or `admins` (owners and admins). Deleting stays the emoji's creator's, an admin's or an owner's.",
+      0, 0, "everyone|admins", F(custom_emoji_add), NULL, CFG_VISIBLE, 0 },
+    STR("OPENCHIME_EDIT_WINDOW", CFG_OPERATOR, G_SET, "", "How long an author may edit their own message (REQ-051): `never`, or seconds after sending, 1 to 31536000. Empty: always.", F(edit_window), cfg_parse_window, CFG_VISIBLE, 0),
+    STR("OPENCHIME_DELETE_WINDOW", CFG_OPERATOR, G_SET, "", "How long an author may delete their own message (REQ-052): `never`, or seconds after sending, 1 to 31536000. Empty: always. An admin's or owner's delete of someone else's message is never limited.", F(delete_window), cfg_parse_window, CFG_VISIBLE, 0),
+    STR("OPENCHIME_DEFAULT_CHANNELS", CFG_OPERATOR, G_SET, "", "Public channels, by name and comma-separated, that a new member joins when their account is made, beside #general. A name that matches no public, unarchived channel is skipped, said once in the log at start.", F(default_channels), NULL, CFG_VISIBLE, 0),
     U64("OPENCHIME_MAX_VIDEO_SIZE", CFG_OPERATOR, G_SET, "167772160", 1048576, (int64_t)OC_MAX_ATTACHMENT_SIZE, "The most bytes one video message may hold (REQ-164), at most the attachment cap of 209715200; clients learn it at sign-in and record within it. 160 MiB by default.", max_video_size),
     PATHR("OPENCHIME_DATA_DIR", CFG_OPERATOR, G_SET, "/data", "Where the daemon keeps everything: `openchime.db`, `identity/`, `blobs/`, `cert.pem`, `key.pem`, `summary/`. The packages set `/var/lib/openchime`.", F(data_dir), NULL, 0, 0),
     INT("OPENCHIME_PORT", CFG_OPERATOR, G_SET, "8443", 1, 65535, "The TLS port the protocol, the web client and the sign-in pages are served on, and the UDP port calls use (443 for a real deployment, ARCH-54).", proto_port),

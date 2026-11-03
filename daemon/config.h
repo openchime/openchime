@@ -3,7 +3,7 @@
  * variable it reads, declared once in the registry (config_table.c), read
  * once at startup by oc_config_load() into one process-global oc_config that
  * everything reaches through oc_config_get(). Nothing else in the daemon
- * calls getenv (scripts/check/config.sh enforces it).
+ * calls getenv (scripts/test/local/config.sh enforces it).
  *
  * The registry is the one source: the loader reads from it, `openchimed
  * --config-reference` prints CONFIG.md's reference from it, `--config-env`
@@ -111,7 +111,18 @@ typedef struct {
     oc_mode        mode;                /* OPENCHIME_MODE */
     oc_deploy_mode deployment_mode;     /* derived (above) */
     const char *workspace_name;         /* "" ⇒ a client derives one from the host */
+    int broadcast_mentions;             /* OPENCHIME_BROADCAST_MENTIONS: 0 everyone, 1 admins (and owners), 2 nobody */
+    int broadcast_large;                /* OPENCHIME_BROADCAST_LARGE: members from which the rule applies; 0 every channel */
+    const char *welcome_message;        /* OPENCHIME_WELCOME_MESSAGE: "" ⇒ none is sent */
+    const char *notice_member_joined;   /* OPENCHIME_NOTICE_MEMBER_JOINED: a public channel's name, or "" (off) */
+    const char *notice_channel_created; /* OPENCHIME_NOTICE_CHANNEL_CREATED: likewise */
+    int notice_channel_changes;         /* OPENCHIME_NOTICE_CHANNEL_CHANGES: posted in the channel changed */
+    const char *default_quiet_hours;    /* OPENCHIME_DEFAULT_QUIET_HOURS: "" ⇒ none (oc_config_quiet_hours) */
+    int read_receipts;                  /* OPENCHIME_READ_RECEIPTS: 0 on, 1 off (REQ-090 seen-by) */
     const char *workspace_address;      /* OPENCHIME_MANAGED_ADDRESS; "" ⇒ clients keep what they dialled */
+    const char *default_channels;       /* OPENCHIME_DEFAULT_CHANNELS: public channel names a new member joins */
+    const char *edit_window;            /* OPENCHIME_EDIT_WINDOW: "" always, "never", or seconds */
+    const char *delete_window;          /* OPENCHIME_DELETE_WINDOW: the same, for an author's own delete */
 
     /* OPENCHIME_DATA_DIR and its layout: everything the daemon keeps, under one
      * directory, at fixed names. */
@@ -139,6 +150,7 @@ typedef struct {
     /* Auth (OPENCHIME_AUTH): which sources are on. */
     int auth_local, auth_relay;
     int local_mfa;                      /* OPENCHIME_MFA: 0 off, 1 optional, 2 required */
+    int custom_emoji_add;               /* OPENCHIME_CUSTOM_EMOJI_ADD: 0 everyone, 1 admins (and owners) */
     struct {
         const char *audience;           /* OPENCHIME_MANAGED_AUDIENCE: registered with central */
         const char *pubkey;             /* OPENCHIME_MANAGED_RELAY_KEY: a pinned floor under the published keys; "" none */
@@ -228,6 +240,16 @@ int oc_config_apply_env_file(const char *path, char *err, size_t errcap);
 /* Print every row's effective value and its source (default, environment, file)
  * to `out`, after a load; secrets are shown as `(set)`. */
 void oc_config_report(void *out /* FILE* */);
+/* The workspace settings clients are told (CFG_VISIBLE rows), read-only: the
+ * i-th one's key and effective value. Returns 1, or 0 past the last. */
+int oc_config_visible(size_t i, char *key, size_t kcap, char *val, size_t vcap);
+/* A message window's value (OPENCHIME_EDIT_WINDOW's form) in milliseconds: -1
+ * for always, 0 for never, else the window. */
+int64_t oc_config_window_ms(const char *v);
+/* An OPENCHIME_DEFAULT_QUIET_HOURS value, read: 1 and its OC_DND_* mode and
+ * allowed window in minutes from midnight, or 0 when it is empty or malformed.
+ * The clients read the same value, told it as `default_quiet_hours`. */
+int oc_config_quiet_hours(const char *v, int *mode, int *start_min, int *end_min);
 
 /* CONFIG.md's reference section, as markdown, from the registry. */
 void oc_config_print_reference(void *out /* FILE* */);

@@ -326,7 +326,7 @@ static void test_messaging_frames(void) {
         CHECK(out.server_time == 1751200500000ull);
     }
     {
-        oc_broadcast in = { 1001, 7, 42, 1751200500000ull, 0, oc_slice_str("hello channel"), 0, {{0}}, {0} };
+        oc_broadcast in = { 1001, 7, 42, 1751200500000ull, 0, oc_slice_str("hello channel"), 0, {{0}}, {0}, 0 };
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -371,6 +371,86 @@ static void test_messaging_frames(void) {
         CHECK(oc_decode_msg_deleted(&p, &out) == OC_OK);
         CHECK(out.message_id == 1001 && out.channel_id == 7 && out.author_id == 42);
         CHECK(out.deleted_by == 9 && out.deleted_at == 1751200500000ull);
+    }
+}
+
+/* `broadcast_stored` (REQ-221): whether the send stored a broadcast mention
+ * row for the message, on every frame that delivers a body a client judges
+ * mentions on -- BROADCAST, MSG_RESTORED (its layout) and THREAD_REPLY. Both
+ * values round trip, with and without the optional tails behind it, and with
+ * a body that holds no broadcast (an edit took it out: the row is still the
+ * send's); any other value is malformed. */
+static void test_broadcast_stored_frames(void) {
+    for (uint8_t stored = 0; stored <= 1; stored++) {
+        {
+            oc_broadcast in = { 1001, 7, 42, 1751200500000ull, 0, oc_slice_str("@channel standup"),
+                                0, {{0}}, {0}, stored };
+            ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
+            oc_broadcast out;
+            CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
+            CHECK(out.broadcast_stored == stored && out.kind == 0);
+            CHECK(slice_eq_str(out.body, "@channel standup") && out.n_attach == 0 && out.author_name.len == 0);
+        }
+        {   /* The tail behind it: a name, so a zero attachment count first. */
+            oc_broadcast in = { 1002, 7, 42, 1751200500000ull, 0, oc_slice_str("@here"),
+                                0, {{0}}, oc_slice_str("CI"), stored };
+            ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
+            oc_broadcast out;
+            CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
+            CHECK(out.broadcast_stored == stored && slice_eq_str(out.body, "@here"));
+            CHECK(slice_eq_str(out.author_name, "CI"));
+        }
+        {
+            oc_broadcast in = { 1003, 7, 42, 1000, 0, oc_slice_str("@everyone back"), 0, {{0}}, {0}, stored };
+            ROUNDTRIP(oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MSG_RESTORED, h, p);
+            oc_broadcast out;
+            CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
+            CHECK(out.broadcast_stored == stored && slice_eq_str(out.body, "@everyone back"));
+        }
+        {   /* Not tied to the body: an edit may have taken the broadcast out. */
+            oc_broadcast in = { 1005, 7, 42, 1000, 0, oc_slice_str("standup moved"), 0, {{0}}, {0}, stored };
+            ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
+            oc_broadcast out;
+            CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
+            CHECK(out.broadcast_stored == stored && slice_eq_str(out.body, "standup moved"));
+        }
+        {
+            oc_thread_reply in = { .message_id = 1004, .channel_id = 7, .parent_id = 500,
+                                   .author_id = 42, .server_time = 1751200500000ull,
+                                   .reply_count = 2, .participant = (uint8_t)!stored,
+                                   .body = oc_slice_str("@channel look"), .broadcast_stored = stored };
+            in.n_attach = 1; in.attach[0].id = 9; in.attach[0].filename = oc_slice_str("a.txt");
+            in.attach[0].mime = oc_slice_str("text/plain"); in.attach[0].size = 3;
+            ROUNDTRIP(oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_REPLY, h, p);
+            oc_thread_reply out = {0};
+            CHECK(oc_decode_thread_reply(&p, &out) == OC_OK);
+            CHECK(out.broadcast_stored == stored && out.participant == (uint8_t)!stored);
+            CHECK(slice_eq_str(out.body, "@channel look") && out.n_attach == 1 && out.attach[0].id == 9);
+        }
+    }
+    /* A byte that is not a flag. BROADCAST's sits after four u64s and `kind`;
+     * THREAD_REPLY's after five u64s, `reply_count` and `participant`. */
+    {
+        oc_broadcast in = { 1, 7, 42, 1, 0, oc_slice_str("@here"), 0, {{0}}, {0}, 1 };
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        CHECK(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in) == OC_OK);
+        CHECK(frame[OC_HEADER_SIZE + 33] == 1);
+        frame[OC_HEADER_SIZE + 33] = 2;
+        oc_header h; oc_rbuf p; oc_broadcast out;
+        CHECK(oc_parse_frame(frame, w.len, &h, &p) == OC_OK);
+        CHECK(oc_decode_broadcast(&p, &out) == OC_E_MALFORMED);
+    }
+    {
+        oc_thread_reply in = { .message_id = 1, .channel_id = 7, .parent_id = 5, .author_id = 42,
+                               .server_time = 1, .reply_count = 1, .participant = 0,
+                               .body = oc_slice_str("@here"), .broadcast_stored = 1 };
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        CHECK(oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &in) == OC_OK);
+        CHECK(frame[OC_HEADER_SIZE + 45] == 1);
+        frame[OC_HEADER_SIZE + 45] = 7;
+        oc_header h; oc_rbuf p; oc_thread_reply out = {0};
+        CHECK(oc_parse_frame(frame, w.len, &h, &p) == OC_OK);
+        CHECK(oc_decode_thread_reply(&p, &out) == OC_E_MALFORMED);
     }
 }
 
@@ -897,7 +977,7 @@ static void test_action_frames(void) {
         CHECK(out[1].preview_action == 0 && slice_eq_str(out[1].preview, "/me"));
     }
     {
-        oc_search_result_entry ents[1] = { { 1001, 7, 42, 5, oc_slice_str("is away"), 1 } };
+        oc_search_result_entry ents[1] = { { 1001, 7, 42, 5, oc_slice_str("is away"), 1, 0 } };
         oc_search_results in = { 1, ents, 0 };
         ROUNDTRIP(oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH_RESULTS, h, p);
         oc_search_result_entry out[1]; uint16_t n = 0; uint8_t trunc = 9;
@@ -1059,12 +1139,12 @@ static void test_admin_frames(void) {
             { 1, OC_ROLE_OWNER,  0, oc_slice_str("a@x.io"), oc_slice_str("Alice"), 9,
               oc_slice_str("Principal Engineer"), oc_slice_str("America/New_York"),
               oc_slice_str("\xf0\x9f\x8c\xb4"), oc_slice_str("On holiday"),
-              oc_slice_str("Alice Liddell"), oc_slice_str("she/her"), oc_slice_str("expr-voice-2-f") },
+              oc_slice_str("Alice Liddell"), oc_slice_str("she/her"), oc_slice_str("expr-voice-2-f"), 0 },
             /* Every string empty, which is the common case and the one where an
              * off-by-one in the stride is easiest to miss. */
             { 2, OC_ROLE_MEMBER, 0, oc_slice_str(""), oc_slice_str("Bob"), 0,
               oc_slice_str(""), oc_slice_str(""), oc_slice_str(""), oc_slice_str(""),
-              oc_slice_str(""), oc_slice_str(""), oc_slice_str("") },
+              oc_slice_str(""), oc_slice_str(""), oc_slice_str(""), OC_USER_SYSTEM },
         };
         oc_user_list in = { 2, ents };
         ROUNDTRIP(oc_encode_user_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_USER_LIST, h, p);
@@ -1077,6 +1157,24 @@ static void test_admin_frames(void) {
         CHECK(out[1].user_id == 2 && slice_eq_str(out[1].display_name, "Bob"));
         CHECK(slice_eq_str(out[0].voice_id, "expr-voice-2-f"));
         CHECK(out[1].full_name.len == 0 && out[1].pronouns.len == 0 && out[1].voice_id.len == 0);
+        /* The workspace's own sender is marked, on the entry after the first. */
+        CHECK(out[0].flags == 0 && out[1].flags == OC_USER_SYSTEM);
+    }
+    {
+        /* READ_RECEIPTS (REQ-090): set, ask, and nothing past ask. */
+        oc_read_receipts in = { 0 }, out;
+        ROUNDTRIP(oc_encode_read_receipts(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_READ_RECEIPTS, h, p);
+        CHECK(oc_decode_read_receipts(&p, &out) == OC_OK && out.share == 0);
+    }
+    {
+        oc_read_receipts in = { OC_RECEIPTS_ASK }, out;
+        ROUNDTRIP(oc_encode_read_receipts(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_READ_RECEIPTS, h, p);
+        CHECK(oc_decode_read_receipts(&p, &out) == OC_OK && out.share == OC_RECEIPTS_ASK);
+    }
+    {
+        oc_read_receipts in = { 3 }, out;
+        ROUNDTRIP(oc_encode_read_receipts(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_READ_RECEIPTS, h, p);
+        CHECK(oc_decode_read_receipts(&p, &out) == OC_E_MALFORMED);
     }
     {
         /* SET_PROFILE — the whole screen in one frame, at its own opcode. It
@@ -1253,11 +1351,21 @@ static void test_search_frames(void) {
         oc_search out;
         CHECK(oc_decode_search(&p, &out) == OC_OK);
         CHECK(slice_eq_str(out.query, "deploy pipeline") && out.limit == 25);
+        CHECK(out.sort == OC_SEARCH_NEWEST && out.cursor_rank == 0);   /* 0: today's order */
+    }
+    {   /* The order and the relevance cursor (28): a rank is negative, lower the
+         * better match, and crosses the wire as the integer it is. */
+        oc_search in = { .query = oc_slice_str("deploy"), .limit = 50, .before_id = 990,
+                         .sort = OC_SEARCH_RELEVANCE, .cursor_rank = -4321987 };
+        ROUNDTRIP(oc_encode_search(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH, h, p);
+        oc_search out;
+        CHECK(oc_decode_search(&p, &out) == OC_OK);
+        CHECK(out.sort == OC_SEARCH_RELEVANCE && out.cursor_rank == -4321987 && out.before_id == 990);
     }
     {
         oc_search_result_entry ents[2] = {
-            { 1001, 7, 42, 1751200500000ull, oc_slice_str("... the deploy ..."), 0 },
-            { 990,  7, 43, 1751200400000ull, oc_slice_str("deploy again"), 0 },
+            { 1001, 7, 42, 1751200500000ull, oc_slice_str("... the deploy ..."), 0, -2500000 },
+            { 990,  7, 43, 1751200400000ull, oc_slice_str("deploy again"), 0, -1250000 },
         };
         oc_search_results in = { 2, ents, 1 };
         ROUNDTRIP(oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH_RESULTS, h, p);
@@ -1267,6 +1375,7 @@ static void test_search_frames(void) {
         CHECK(out[0].message_id == 1001 && out[0].channel_id == 7 && out[0].author_id == 42);
         CHECK(out[0].server_time == 1751200500000ull && slice_eq_str(out[0].snippet, "... the deploy ..."));
         CHECK(out[1].message_id == 990 && slice_eq_str(out[1].snippet, "deploy again"));
+        CHECK(out[0].rank == -2500000 && out[1].rank == -1250000);
     }
 }
 
@@ -1836,7 +1945,7 @@ static void test_group_frames(void) {
         CHECK(oc_decode_restore(&p, &out) == OC_OK && out.channel_id == 7 && out.message_id == 42);
     }
     {
-        oc_broadcast in = { 42, 7, 3, 1000, 0, oc_slice_str("back again"), 0, {{0}}, {0} };
+        oc_broadcast in = { 42, 7, 3, 1000, 0, oc_slice_str("back again"), 0, {{0}}, {0}, 0 };
         ROUNDTRIP(oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MSG_RESTORED, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK && out.message_id == 42 && out.channel_id == 7 &&
@@ -2043,7 +2152,7 @@ static void test_attachment_frames(void) {
     }
     /* BROADCAST carrying attachment metadata AND a display-name override. */
     {
-        oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str("here"), 0, {{0}}, {0} };
+        oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str("here"), 0, {{0}}, {0}, 0 };
         in.n_attach = 1;
         in.attach[0].id = 77; in.attach[0].filename = oc_slice_str("a.png");
         in.attach[0].mime = oc_slice_str("image/png"); in.attach[0].size = 4096;
@@ -2058,7 +2167,7 @@ static void test_attachment_frames(void) {
     /* Author name with NO attachments: a zero attachment count precedes the name
      * (REQ-170 display-name override, ARCH-71). */
     {
-        oc_broadcast in = { 6, 3, 42, 999, 0, oc_slice_str("hi"), 0, {{0}}, {0} };
+        oc_broadcast in = { 6, 3, 42, 999, 0, oc_slice_str("hi"), 0, {{0}}, {0}, 0 };
         in.author_name = oc_slice_str("Zapier");
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
@@ -2068,7 +2177,7 @@ static void test_attachment_frames(void) {
     }
     /* No attachments and no name -> byte-identical to the original layout. */
     {
-        oc_broadcast in = { 7, 3, 42, 999, 0, oc_slice_str("plain"), 0, {{0}}, {0} };
+        oc_broadcast in = { 7, 3, 42, 999, 0, oc_slice_str("plain"), 0, {{0}}, {0}, 0 };
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -2375,6 +2484,25 @@ static void test_tts_frames(void) {
         oc_capabilities out;
         CHECK(oc_decode_capabilities(&p, &out) == OC_OK && out.count == 0);
     }
+    {   /* The workspace's settings, read-only: keys and values, in order. */
+        oc_workspace_settings in;
+        memset(&in, 0, sizeof in);
+        in.count = 2;
+        in.keys[0] = oc_slice_str("workspace_name");   in.values[0] = oc_slice_str("Acme");
+        in.keys[1] = oc_slice_str("default_channels"); in.values[1] = oc_slice_str("");
+        ROUNDTRIP(oc_encode_workspace_settings(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WORKSPACE_SETTINGS, h, p);
+        oc_workspace_settings out;
+        CHECK(oc_decode_workspace_settings(&p, &out) == OC_OK && out.count == 2);
+        CHECK(slice_eq_str(out.keys[0], "workspace_name") && slice_eq_str(out.values[0], "Acme"));
+        CHECK(slice_eq_str(out.keys[1], "default_channels") && out.values[1].len == 0);
+    }
+    {   /* More settings than the frame holds is refused. */
+        uint8_t payload[] = { OC_WS_SETTINGS_MAX + 1 };
+        oc_rbuf pr;
+        oc_rbuf_init(&pr, payload, sizeof payload);
+        oc_workspace_settings out;
+        CHECK(oc_decode_workspace_settings(&pr, &out) != OC_OK);
+    }
     {
         /* More names than the frame holds is refused, as TTS_INFO's voices are. */
         uint8_t payload[] = { OC_CAP_MAX + 1 };
@@ -2547,6 +2675,7 @@ int run_protocol_tests(void) {
     test_action_frames();
     test_poll_frames();
     test_thread_frames();
+    test_broadcast_stored_frames();
     test_thread_list_frames();
     test_mark_all_read_frame();
     test_failed_frame_rolls_back();

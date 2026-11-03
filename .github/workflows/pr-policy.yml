@@ -1,6 +1,6 @@
 # Pull request policy. The title becomes the commit subject once merged
 # (squash-only merges, repo setting), so the title is checked here, beside
-# the attribution scan (`guard`) and the tree's issue references.
+# the attribution scan and the tree's issue references.
 # The body must be empty; the description lives in the issue, not the PR.
 name: pr-policy
 
@@ -12,9 +12,11 @@ on:
     # staging only: nothing takes a pull request into main.
     branches: [staging]
 
-concurrency:
-  group: pr-policy-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+# No concurrency group: every run is seconds of work and stands alone, so each
+# event's run is left to finish. A shared group cannot keep them all, whether it
+# cancels or not: GitHub holds at most one run pending per group and cancels it
+# when another is queued, and a cancelled run leaves a cancelled check on its
+# commit beside the passing one, which keeps the pull request from merging.
 
 env:
   # Every bash step, and every script it runs, retries what fails in a call to
@@ -28,17 +30,16 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      # The required check `guard`, posted from here: the attribution scan is a
-      # step of this job rather than a job of its own, which would cost a
-      # runner start for seconds of work.
-      checks: write
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      # A step of this job, so a banned reference fails `pr policy` itself, the
+      # one required check. It used to post a check of its own, `guard`, through
+      # the check-runs API, which files a check in the commit's first check
+      # suite rather than its own run's: a commit's second run then had no
+      # `guard` in its suite, and the pull request stayed blocked.
       - name: Attribution scan
-        id: scan
-        continue-on-error: true
         env:
           EVENT: pull_request
           BASE_REF: ${{ github.base_ref }}
@@ -46,25 +47,10 @@ jobs:
           BEFORE: ""
           AFTER: ""
         run: scripts/release/attribution_scan.sh
-      - name: Report the guard
-        if: ${{ !cancelled() }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          OUTCOME: ${{ steps.scan.outcome }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          if [ "$OUTCOME" = success ]; then c=success; t="no banned reference in the new commits"
-          else c=failure; t="a banned reference, or the scan could not run"; fi
-          gh api "repos/${GITHUB_REPOSITORY}/check-runs" -f name=guard -f head_sha="$HEAD_SHA" \
-            -f status=completed -f conclusion="$c" -f details_url="$RUN_URL" \
-            -f "output[title]=$t" -f "output[summary]=$t: a step of pr policy, in ${RUN_URL}" >/dev/null
-          echo "guard: $c"
       # A pull request that changes only documentation skips the local test run
       # (.githooks/pre-push), so the tree's no-issue-numbers rule is checked
       # here over the pull request's tree, with the base branch's copy of
-      # scripts/check/refs.sh: nothing of the pull request's runs.
+      # scripts/test/local/refs.sh: nothing of the pull request's runs.
       - name: No issue numbers in the tree
         env:
           BASE: ${{ github.base_ref }}
@@ -72,7 +58,11 @@ jobs:
           set -euo pipefail
           git worktree add -q "$RUNNER_TEMP/base" "origin/${BASE}"
           git worktree add -q "$RUNNER_TEMP/head" HEAD
-          cd "$RUNNER_TEMP/head" && sh "$RUNNER_TEMP/base/scripts/check/refs.sh"
+          # A base from before the source checks moved to scripts/test/local/
+          # has its copy under scripts/check/.
+          refs="$RUNNER_TEMP/base/scripts/test/local/refs.sh"
+          [ -f "$refs" ] || refs="$RUNNER_TEMP/base/scripts/check/refs.sh"
+          cd "$RUNNER_TEMP/head" && sh "$refs"
       - name: Title and body
         env:
           GH_TOKEN: ${{ github.token }}

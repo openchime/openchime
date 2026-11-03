@@ -432,29 +432,17 @@ static void ws_bytes(io_thread *t, io_conn *c, const uint8_t *chunk, size_t n) {
     memcpy(c->win + c->wlen, chunk, n);
     c->wlen += n;
     for (;;) {
-        if (c->wlen < 2) return;
-        uint8_t b0 = c->win[0], b1 = c->win[1];
-        int fin = b0 & 0x80, op = b0 & 0x0f, masked = b1 & 0x80;
-        uint64_t len = b1 & 0x7f;
-        size_t hdr = 2;
-        if (b0 & 0x70) { finish(t, c); return; }          /* reserved bits: no extension agreed */
-        if (!masked) { finish(t, c); return; }
-        if (len == 126) {
-            if (c->wlen < 4) return;
-            len = ((uint64_t)c->win[2] << 8) | c->win[3]; hdr = 4;
-        } else if (len == 127) {
-            if (c->wlen < 10) return;
-            len = 0;
-            for (int i = 0; i < 8; i++) len = (len << 8) | c->win[2 + i];
-            hdr = 10;
-        }
-        if (len > IO_WS_MAX_FRAME) { finish(t, c); return; }
-        size_t whole = hdr + 4 + (size_t)len;
-        if (c->wlen < whole) return;
-        const uint8_t *mask = c->win + hdr;
-        uint8_t *payload = c->win + hdr + 4;
+        oc_ws_frame wf;
+        int pr = oc_ws_parse(c->win, c->wlen, IO_WS_MAX_FRAME, &wf);
+        if (pr == OC_WS_MORE) return;
+        if (pr != OC_WS_FRAME) { finish(t, c); return; }
+        /* The protocol's frames delimit themselves: fragments are one stream,
+         * so FIN is not read. */
+        int op = wf.opcode;
+        size_t len = wf.len, whole = wf.whole;
+        const uint8_t *mask = c->win + wf.mask_off;
+        uint8_t *payload = c->win + wf.payload_off;
         for (size_t i = 0; i < len; i++) payload[i] ^= mask[i & 3];
-        (void)fin;   /* the protocol's frames delimit themselves: fragments are one stream */
         if (op == 0x2 || op == 0x0) {
             if (len && oc_framebuf_push(&c->fb, payload, (size_t)len) != 0) { finish(t, c); return; }
             const uint8_t *frame; size_t flen; int r;

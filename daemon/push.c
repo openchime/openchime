@@ -6,6 +6,7 @@
 
 #include "push.h"
 #include "notify.h"
+#include "config.h"   /* OPENCHIME_DEFAULT_QUIET_HOURS */
 #include "tls.h"
 
 #include <mbedtls/base64.h>
@@ -364,7 +365,13 @@ static int collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
      * one recipient's keyword row as an audience for the whole channel. A rule
      * written once cannot disagree with itself. */
     if (sqlite3_prepare_v2(db,
-            "SELECT dt.platform, dt.token, u.dnd_mode, u.allow_start_min, u.allow_end_min, "
+            /* The schedule resolved (REQ-136): a member who never set their
+             * own follows the workspace's default (?7, -1 for none, then its
+             * window ?8-?9), as their clients are told it is. */
+            "SELECT dt.platform, dt.token, "
+            "       CASE WHEN u.dnd_own = 0 AND ?7 >= 0 THEN ?7 ELSE u.dnd_mode END, "
+            "       CASE WHEN u.dnd_own = 0 AND ?7 >= 0 THEN ?8 ELSE u.allow_start_min END, "
+            "       CASE WHEN u.dnd_own = 0 AND ?7 >= 0 THEN ?9 ELSE u.allow_end_min END, "
             "       u.dnd_until_ms, u.tz_offset_min, "
             "       ns.weekday IS NOT NULL, COALESCE(ns.enabled,0), "
             "       COALESCE(ns.start_min,0), COALESCE(ns.end_min,0), "
@@ -446,6 +453,13 @@ static int collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
      * test, so a channel message keeps exactly the audience it had. */
     sqlite3_bind_int64(st, 5, (sqlite3_int64)root_id);
     sqlite3_bind_int64(st, 6, (sqlite3_int64)invitee);
+    {
+        int dm = -1, ds = 0, de = 0;
+        if (!oc_config_quiet_hours(oc_config_get()->default_quiet_hours, &dm, &ds, &de)) dm = -1;
+        sqlite3_bind_int(st, 7, dm);
+        sqlite3_bind_int(st, 8, ds);
+        sqlite3_bind_int(st, 9, de);
+    }
 
     int n = 0;
     while (n < max && sqlite3_step(st) == SQLITE_ROW) {

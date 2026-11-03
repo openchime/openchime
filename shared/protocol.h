@@ -168,8 +168,31 @@
  *
  * 27: WORKSPACE_INFO carries `max_video_size`, the daemon's cap on a video
  * message (OPENCHIME_MAX_VIDEO_SIZE), which a client's recorder stays within
- * (REQ-164). A u64 appended to a layout. */
-#define OC_PROTOCOL_VERSION 27u
+ * (REQ-164). A u64 appended to a layout.
+ *
+ * 28: SEARCH carries `sort` and `cursor_rank`, and each SEARCH_RESULTS entry its
+ * `rank`, so search can be ordered oldest first or by relevance and still be
+ * paged by a keyset (REQ-080). Fields appended to two layouts, one of them a
+ * repeated entry.
+ *
+ * 30: each USER_LIST entry carries `flags`, OC_USER_SYSTEM marking the
+ * workspace's own sender (the welcome a new member is sent), which a client
+ * draws as the workspace and keeps out of its people lists. A byte appended
+ * to a repeated entry. (29 is SEARCH's audit filters.)
+ *
+ * 31: BROADCAST (and MSG_RESTORED, its layout) and THREAD_REPLY carry
+ * `broadcast_held`, 1 when the body's @here, @channel or @everyone got no
+ * mention row and so notifies nobody (REQ-221): the daemon's answer, which a
+ * client reads instead of guessing the channel's size. A byte in each fixed
+ * part, ahead of the body.
+ *
+ * 32: the byte is `broadcast_stored` instead, 1 when the send stored a
+ * broadcast mention row for the message, whatever its body says now; a
+ * client counts a broadcast the current body holds only when it is 1. Held
+ * depended on the body, which an edit changes without storing mentions, so a
+ * client had to guess it from the text before the edit, and history loaded
+ * after an edit could not say a row existed. Same layout, a new meaning. */
+#define OC_PROTOCOL_VERSION 32u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -327,7 +350,7 @@ typedef enum {
      * property the next inbound branch silently removes. Typing moves rather
      * than the other two because it is the only contiguous pair among them, so
      * two values buy back both collisions. Every opcode now carries exactly one
-     * message type, which is what scripts/check/opcodes.sh enforces with no
+     * message type, which is what scripts/test/local/opcodes.sh enforces with no
      * exceptions. */
     OC_MSG_TYPING           = 0x007E, /* C->S, "I am typing" in a channel (REQ-121) */
     OC_MSG_TYPING_UPDATE    = 0x007F, /* S->C, relay of a typing signal */
@@ -564,6 +587,8 @@ typedef enum {
     OC_MSG_LIST_POLL_VOTERS     = 0x0112, /* C->S, who picked what */
     OC_MSG_POLL_VOTERS          = 0x0113, /* S->C, the answer; refused for an anonymous poll */
     OC_MSG_EDIT_POLL            = 0x0114, /* C->S, the author changes a poll: options and settings until the first vote */
+    OC_MSG_WORKSPACE_SETTINGS   = 0x0119, /* S->C, read-only: the workspace settings clients act on, after WORKSPACE_INFO */
+    OC_MSG_READ_RECEIPTS        = 0x011A, /* both: whether I share my read receipts; C->S sets or asks, S->C tells */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -666,6 +691,8 @@ typedef enum {
     OC_ERR_INVALID_POLL        = 3038, /* a poll's options or a vote out of bounds (REQ-225) */
     OC_ERR_POLL_CLOSED         = 3039, /* the poll is past its deadline: no more votes (REQ-225) */
     OC_ERR_POLL_HAS_VOTES      = 3040, /* a poll's options or settings, once anyone has voted (REQ-225) */
+    OC_ERR_EDIT_WINDOW_CLOSED  = 3041, /* an author's edit or delete of their own message, past the workspace's window (REQ-051/052) */
+    OC_ERR_WORKSPACE_SENDER    = 3042, /* a message to the workspace's own sender, whose DMs nobody reads */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -1020,10 +1047,16 @@ typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; uint64_t messa
 /* `kind` is OC_MSG_KIND_*: an ordinary message, or a call event the daemon wrote
  * (a missed call, REQ-304) that a client draws as a line of history rather than
  * as something said. */
+/* `broadcast_stored` is 1 when the daemon stored a broadcast mention row
+ * (@here, @channel, @everyone) for the message when it was sent, so a
+ * broadcast its body holds notifies (REQ-221); 0 otherwise, whatever the body.
+ * Last in the struct, where it was added; on the wire it sits in the fixed
+ * part, after `kind`. */
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time;
                  uint8_t kind; oc_slice body;
                  uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH];
-                 oc_slice author_name; } oc_broadcast;  /* override name (webhooks); empty = use author_id */
+                 oc_slice author_name;   /* override name (webhooks); empty = use author_id */
+                 uint8_t broadcast_stored; } oc_broadcast;
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_client_ack;
 /* A member's read cursor in a channel advanced (REQ-090 seen-by). */
 typedef struct { uint64_t channel_id; uint64_t user_id; uint64_t message_id; } oc_read_cursor;
@@ -1189,8 +1222,10 @@ typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; uint64_t paren
  * written to, so the daemon encodes the frame twice — once each way — and sends
  * whichever matches. It is the evaluator's thread_reply INPUT and not a verdict;
  * the recipient still decides with its own mute, level and schedule. */
+/* `broadcast_stored` as on BROADCAST (REQ-221): written after `participant`. */
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t parent_id; uint64_t author_id; uint64_t server_time; uint32_t reply_count; uint8_t participant; oc_slice body;
-                 uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH]; } oc_thread_reply;
+                 uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH];
+                 uint8_t broadcast_stored; } oc_thread_reply;
 typedef struct { uint64_t channel_id; uint64_t parent_id; } oc_list_thread;
 /* THREAD is the terminator of a LIST_THREAD response: the daemon streams the
  * replies as THREAD_REPLY frames (each self-framed, so a 64KB body is fine),
@@ -1367,6 +1402,11 @@ typedef struct { uint64_t channel_id; uint8_t level; } oc_set_notify_pref;
  * (the same reason SET_SNOOZE carries minutes rather than an instant). */
 #define OC_SCHEDULE_DAYS 7u
 enum { OC_DND_OFF = 0, OC_DND_EVERY_DAY = 1, OC_DND_WEEKDAYS = 2, OC_DND_CUSTOM = 3 };
+/* Or'd into `mode` on SCHEDULE: the member set none of their own, so this is
+ * the workspace's default (OPENCHIME_DEFAULT_QUIET_HOURS), resolved. Alone on
+ * SET_SCHEDULE: drop my own and follow the default again. */
+#define OC_DND_FROM_DEFAULT 0x80u
+#define OC_DND_MODE(m) ((uint8_t)((m) & 0x7Fu))
 typedef struct { uint8_t weekday; uint8_t enabled; uint16_t start_min; uint16_t end_min; } oc_schedule_day;
 typedef struct { uint8_t mode; int16_t tz_offset_min;
                  uint16_t start_min, end_min;
@@ -1616,6 +1656,18 @@ typedef struct { oc_slice model_version; uint8_t count;
 #define OC_CAP_PDM "pdm" /* private DMs, end to end between two devices (PRIVATE-DM.md) */
 #define OC_CAP_POLLS "polls" /* post a poll and vote in one (REQ-225) */
 typedef struct { uint8_t count; oc_slice names[OC_CAP_MAX]; } oc_capabilities;
+/* The workspace's settings as clients are told them, read-only: each a key and
+ * its effective value. They are the daemon's configuration (CONFIG.md, the
+ * client-visible rows), set by the control plane or the operator; no frame
+ * changes one. Sent at sign-in after WORKSPACE_INFO. */
+#define OC_WS_SETTINGS_MAX 64
+typedef struct { uint8_t count; oc_slice keys[OC_WS_SETTINGS_MAX]; oc_slice values[OC_WS_SETTINGS_MAX]; } oc_workspace_settings;
+/* READ_RECEIPTS: whether this person shares their read position with the
+ * other members (seen-by, REQ-090). C->S `share` 0 or 1 sets it, OC_RECEIPTS_ASK
+ * asks; S->C tells it, to every device of theirs when it changes. Theirs
+ * alone: not sharing still shows them everyone else's. */
+#define OC_RECEIPTS_ASK 2u
+typedef struct { uint8_t share; } oc_read_receipts;
 typedef struct { uint64_t message_id; } oc_audio_get;
 /* Hear voice `voice_id` (an id TTS_INFO listed) say TTS_INFO's preview sentence.
  * Answered by AUDIO_INFO/AUDIO_CHUNK/AUDIO_END for message_id 0. */
@@ -1653,7 +1705,11 @@ typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice emai
                  oc_slice full_name; oc_slice pronouns;
                  /* Everyone hears the same voice for the same author (REQ-292),
                   * so it travels with the roster, not only with the card. */
-                 oc_slice voice_id; } oc_user_list_entry;
+                 oc_slice voice_id;
+                 /* OC_USER_SYSTEM: the workspace's own sender, which posts
+                  * what the workspace says (its welcome); not a person. */
+                 uint8_t flags; } oc_user_list_entry;
+#define OC_USER_SYSTEM 0x01u
 typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
 typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;
 /* `email` binds the invite to an address, consumed at that address's first
@@ -1701,9 +1757,17 @@ typedef struct { uint64_t user_id; oc_slice display_name; } oc_profile_updated;
  * MATCHing them as literal text would find messages that merely mention them.
  * Parsing lives in shared/searchq.c so both frontends mean the same thing.
  *
- * `before_id` is the paging cursor: results come back newest-first ordered by
- * id, so "give me the page before this id" is a keyset cursor — stable under
- * concurrent posting, unlike an offset. 0 = the first page. */
+ * `before_id` is the paging cursor: the id of the last row of the page before,
+ * 0 for the first page. With `sort` newest first (0) the next page is the ids
+ * below it, oldest first (1) the ids above it, and by relevance (2) the rows
+ * after (`cursor_rank`, `before_id`) in (rank, id) order — a keyset cursor in
+ * every order, stable under concurrent posting, unlike an offset. A rank is
+ * bm25 × 1,000,000, rounded, so the wire carries no floating point; lower is
+ * the better match. A message posted since moves every bm25 score, so the
+ * daemon measures the cursor row's rank afresh and uses `cursor_rank` only when
+ * that row no longer matches. Relevance with no text to rank falls back to
+ * newest first. */
+enum { OC_SEARCH_NEWEST = 0, OC_SEARCH_OLDEST = 1, OC_SEARCH_RELEVANCE = 2 };
 typedef struct {
     oc_slice query;          /* free text for FTS; may be empty when filters carry it */
     uint16_t limit;
@@ -1713,11 +1777,15 @@ typedef struct {
     uint8_t  has_mask;       /* OC_SQ_HAS_* */
     uint64_t after_ms, before_ms;   /* 0 = unbounded; resolved by the CLIENT, which
                                      * knows the user's timezone */
+    uint8_t  sort;           /* OC_SEARCH_*; 0 = newest first */
+    int64_t  cursor_rank;    /* relevance paging: the last row's rank */
 } oc_search;
 /* `action` 1: the message is an action and the snippet is cut from its action
  * text (REQ-058). */
+/* `rank` the row's relevance (bm25 × 1,000,000; 0 unless sorted by relevance),
+ * which the next page's cursor carries. */
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice snippet;
-                 uint8_t action; } oc_search_result_entry;
+                 uint8_t action; int64_t rank; } oc_search_result_entry;
 typedef struct { uint16_t count; const oc_search_result_entry *entries; uint8_t truncated; } oc_search_results;
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_cursor;
 typedef struct { uint16_t count; const oc_cursor *cursors; } oc_backfill_request;
@@ -1998,6 +2066,8 @@ oc_result oc_encode_audio_info(oc_wbuf *w, uint16_t version, const oc_audio_info
 oc_result oc_encode_audio_chunk(oc_wbuf *w, uint16_t version, const oc_audio_chunk *m);
 oc_result oc_encode_audio_end(oc_wbuf *w, uint16_t version, const oc_audio_end *m);
 oc_result oc_encode_capabilities(oc_wbuf *w, uint16_t version, const oc_capabilities *m);
+oc_result oc_encode_workspace_settings(oc_wbuf *w, uint16_t version, const oc_workspace_settings *m);
+oc_result oc_encode_read_receipts(oc_wbuf *w, uint16_t version, const oc_read_receipts *m);
 oc_result oc_encode_voice_preview_get(oc_wbuf *w, uint16_t version, const oc_voice_preview_get *m);
 oc_result oc_encode_stt_info(oc_wbuf *w, uint16_t version, const oc_stt_info *m);
 oc_result oc_encode_stt_begin(oc_wbuf *w, uint16_t version, const oc_stt_begin *m);
@@ -2212,6 +2282,8 @@ oc_result oc_decode_audio_info(oc_rbuf *p, oc_audio_info *m);
 oc_result oc_decode_audio_chunk(oc_rbuf *p, oc_audio_chunk *m);
 oc_result oc_decode_audio_end(oc_rbuf *p, oc_audio_end *m);
 oc_result oc_decode_capabilities(oc_rbuf *p, oc_capabilities *m);
+oc_result oc_decode_workspace_settings(oc_rbuf *p, oc_workspace_settings *m);
+oc_result oc_decode_read_receipts(oc_rbuf *p, oc_read_receipts *m);
 oc_result oc_decode_voice_preview_get(oc_rbuf *p, oc_voice_preview_get *m);
 oc_result oc_decode_stt_info(oc_rbuf *p, oc_stt_info *m);
 oc_result oc_decode_stt_begin(oc_rbuf *p, oc_stt_begin *m);

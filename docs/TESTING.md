@@ -20,10 +20,10 @@ integration suites that drive the real epoll server over TLS (`itest_netloop`,
 `itest_tls`, `itest_slow_blob`) and the headless client app-core
 (`test_client_core.c`) — all compiled into one `build/tests` binary by `make test`.
 The black-box integration tier drives a natively-run daemon over a real socket
-(the `build` job in `.github/workflows/ci.yml`; §3.2). A deterministic codec fuzzer (7k iterations by default —
-5k random + 2k framed, raised with `-DOC_FUZZ_RANDOM_ITERS=` /
-`-DOC_FUZZ_FRAMED_ITERS=` for a deep run, e.g. under ASan) and a concurrency load test (`tests/bench_load.c`, driven by
-`scripts/bench.sh`) round it out.
+(the `build` job in `.github/workflows/ci.yml`; §3.2). The codec is fuzzed twice
+over: a deterministic sweep in every `make test` and coverage-guided libFuzzer
+harnesses in CI (§2.2b, "Fuzzing"). A concurrency load test (`tests/bench_load.c`,
+driven by `scripts/bench.sh`) rounds it out.
 
 ---
 
@@ -59,30 +59,30 @@ suite's recording check), an IPv6 loopback (`::1`), a non-loopback LAN
 address (`test_client_core`'s certificate-trust checks), and a kernel that
 leaves a connection attempt pending (`test_sock`'s connect bound, skipped when
 the kernel answers every SYN). `gdb` is optional and
-makes a crash print every thread's stack. `make test-ci PART=threads` (the
-ThreadSanitizer half) also needs `setarch`; it refuses outside CI, so run it
-locally as `CI=1 make test-ci PART=threads`.
+makes a crash print every thread's stack.
 
-**`make check-release-cc`, `make TTS=1 STT=1 SUM=1`**: add `xz` (zig's
-tarball) and, for the speech and summary builds, `cmake` 3.28+ and a C++17
-compiler (`scripts/build/onnxruntime.sh`, `llamacpp.sh`).
+**`make test-merge` and `make test-release`** run in CI only and refuse
+anywhere else (§4). What they need is installed by the workflows: `xz` (zig's
+tarball), `cmake` 3.28+ and a C++17 compiler for the speech and summary
+builds, `setarch` for the ThreadSanitizer half, Chrome and Node for the web
+client, and for the release checks `podman`, `rpm`, `cpio`, `nsis`,
+`python3-pefile`, and clang and the pinned CMake `scripts/build/makemsix.sh`
+fetches.
 
-**`make web-test` and the web harness** (`scripts/web/*`,
+**The web harness by hand** (`scripts/web/*`,
 `scripts/gui/run.sh --web`): `git` (make fetches Emscripten, about 400 MB, and
 its Node), Chrome (`CHROME=/path`, else the installed `google-chrome` on
 `PATH`; nothing is downloaded), `npm` to install `playwright-core` from
 `package.json` (the scripts do it when it is missing), `openssl` and `python3`.
-`scripts/gui/run.sh` builds nothing by default (`OC_TEST_NO_BUILD=1`): run
-`make web-test` first.
+`scripts/gui/run.sh` builds nothing by default (`OC_TEST_NO_BUILD=1`): build
+the web client (`make WEB=1 web`) first.
 
 **The Win32 GUI harness** (`scripts/gui/*.sh`): WSL2 on a Windows host with an
 interactive desktop session (`powershell.exe` and `/mnt/c` reachable); make
 fetches llvm-mingw for `make windows`. `screenrec.sh` also needs `ffmpeg`, and
 `voice.sh` a daemon built with `TTS=1 STT=1`.
 
-**TUI scripts** (`scripts/demo/tui.sh`, `scripts/tui_device.sh`): `tmux` and
-`curl`; `openssl` for `tui_device.sh`'s fingerprint check, and python3 with
-OpenCV (`cv2`, numpy) for its QR decode, skipped without it.
+**TUI script** (`scripts/demo/tui.sh`): `tmux` and `curl`.
 
 ---
 
@@ -97,14 +97,13 @@ OpenCV (`cv2`, numpy) for its QR decode, skipped without it.
   as a person does, through the daemon's page (`tests/testsignin.h`). There is deliberately no per-test binary:
   the tests exercise public APIs, so each `tests/*.c` links the real module
   objects rather than `#include`-ing the `.c` under test.
-- The one exception is platform-backend code that cannot execute on the build
-  host: sdltext's DirectWrite backend (ARCH-106) has its own console program,
-  `make build/sdltext_test.exe` → `build/sdltext_test.exe`, same
-  failure-count-as-exit-code contract. The staging build's `windows binaries` job
-  cross-compiles it (the compile is
-  the header/vtable check mingw keeps honest); a Windows host runs it. The
-  portable half of sdltext (the byte↔UTF-16 offset map) stays in `make test`
-  like everything else.
+- Platform-backend code that cannot execute on the build host (sdltext's
+  DirectWrite backend, ARCH-106, and the gfx layer's SDL backend) has no test
+  program of its own: the staging build's `windows binaries` job cross-compiles
+  it with the client (the compile is the header/vtable check mingw keeps
+  honest), and the Windows client is tested by hand. The portable half of
+  sdltext (the byte↔UTF-16 offset map) stays in `make test` like everything
+  else.
 - A subject's tests live in one translation unit exposing a single entry point,
   `int run_<subject>_tests(void)`, which runs its groups and returns its
   failure count. `tests/main.c` calls each and sums; a non-zero total exits
@@ -132,8 +131,8 @@ OpenCV (`cv2`, numpy) for its QR decode, skipped without it.
 
   ```makefile
   test: $(TEST_BIN) $(BIN)
-  	@$(SOURCE_CHECKS)
-  	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" ./$(TEST_BIN)
+  	scripts/test/local/source.sh
+  	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" scripts/test/local/suites.sh
   $(TEST_BIN): $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build
 	$(CC) $(CFLAGS) -O0 -g $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
   ```
@@ -422,6 +421,71 @@ that has nothing to do with the cause: a suite that swaps the loop's call relay
 socket, as `itest_netloop`'s routed-call test does, must hand it back, or the next
 round's loop starts without one.
 
+### 2.2b Fuzzing
+
+**Two speeds.** `tests/test_fuzz.c` is a deterministic sweep, in every
+`make test`: 5,000 random and 2,000 framed inputs through `oc_parse_frame` and
+every payload decoder, from a fixed seed (raise them with
+`-DOC_FUZZ_RANDOM_ITERS=` and `-DOC_FUZZ_FRAMED_ITERS=` for a deep run). The
+coverage-guided tier is libFuzzer harnesses under `tests/fuzz/`, each built
+under ASan and UBSan and run in CI. Both use one list of decoders,
+`tests/fuzz/decoders.c`, so a new message type's decoder is added there once,
+and its encoder to `tests/fuzz/seeds.c`.
+
+| Harness | Built as | What it fuzzes |
+|---|---|---|
+| `frame` | `build/fuzz/frame` | `oc_parse_frame`, then every decoder on the parsed payload and on the raw bytes. A decoder may refuse, but must not crash, read outside its input, or answer anything but OK or MALFORMED. A parsed payload's view must stay inside the input. |
+| `framebuf` | `build/fuzz/framebuf` | `shared/framebuf.c`'s reassembly. The input's first bytes choose the chunk sizes the rest is pushed in, and every complete frame is drained after each push. A frame yielded must lie inside the buffer and agree with its own length prefix. |
+| `http` | `build/fuzz/http` | The HTTP request parser (`oc_http_parse_head`, `oc_http_parse`), the webhook text, and the header values static routes read. Every field is a view inside the request. |
+| `ws` | `build/fuzz/ws` | A browser's WebSocket frames (`oc_ws_parse`), one after another. Each frame's parts add up and lie inside the input. |
+| `proxy` | `build/fuzz/proxy` | The PROXY v2 header (`oc_proxy_v2_parse`). Its length lies inside the input, and the address is a string. |
+| `json` | `build/fuzz/json` | The JSON reader used at sign-in: every token read as a string, a number and a boolean, skipped, and searched. |
+| `cbor` | `build/fuzz/cbor` | The CBOR reader passkeys use: items one after another, read as each type and as maps. Strings and readers stay inside the input. |
+| `jwt` | `build/fuzz/jwt` | The central service's token (`oc_jwt_verify`) against a fixed key, and base64url decoding. A token nobody signed is never accepted. |
+| `webauthn` | `build/fuzz/webauthn` | A passkey's registration and sign-in, the input split into the browser's parts. A credential fits its bounds, and a sign-in without a key is never accepted. |
+| `idtoken` | `build/fuzz/idtoken` | A provider's ID token against a key set, the input split into the token and the JWKS. |
+
+A harness that takes several inputs reads them with `oc_fuzz_split`
+(`tests/fuzz/fuzz.h`): each part but the last is prefixed by its length, a
+big-endian u16. `tests/fuzz/http.dict` and `tests/fuzz/json.dict` are the text
+formats' dictionaries.
+
+**Prerequisites.** A clang with libFuzzer and the sanitizer runtimes: on
+Ubuntu, `clang` and `libclang-rt-18-dev` (or the version your clang is). Only
+the harnesses need it. `make` and `make test` never do. Make uses `/usr/bin/clang`
+(`FUZZ_CC`): the pinned llvm-mingw make puts first on `PATH` has no Linux
+runtimes.
+
+**Building and running one.** Harnesses are tools built by path, not a
+target:
+
+```
+make build/fuzz/frame
+mkdir -p /tmp/frame && build/fuzz/frame -dict=tests/fuzz/frame.dict /tmp/frame tests/fuzz/corpus/frame
+```
+
+The first directory is where libFuzzer writes what it finds. Keep it out of the
+tree. `-max_total_time=<s>` stops a run. CI runs each harness for
+`FUZZ_SECONDS` (60 by default) from its corpus in `make test-merge`
+(`scripts/test/merge/fuzz.sh`). A finding fails the job, with the sanitizer's
+report and the input, base64, in the log.
+
+**The corpora** under `tests/fuzz/corpus/<harness>/` are real frames:
+`build/fuzz/seeds <dir>` writes one per encoder in `shared/protocol.c` (each
+over a zeroed message) and a few streams of them for `framebuf`. They are kept
+whole rather than minimized with `-merge=1`, which would keep about one in five
+and lose the frame for most message types. `tests/fuzz/frame.dict` holds the
+protocol version and every message type id. Regenerate both when the protocol
+changes.
+
+**A crash.** Reproduce it with `build/fuzz/<harness> <file>`, and minimize it
+with `build/fuzz/<harness> -minimize_crash=1 -runs=10000 <file>`. Check the
+minimized input in under `tests/fuzz/crashes/<harness>/`:
+`run_fuzz_replay_tests` (`tests/test_fuzz_replay.c`) runs every corpus and
+reproducer file through its harness in `make test`, so the crash fails there
+until it is fixed, and stays a regression test afterwards. A missing
+`crashes/` directory counts as no files.
+
 ### 2.3 Determinism rules
 
 Unit tests must be reproducible and independent of wall-clock or environment:
@@ -557,9 +621,10 @@ the cache was hit) rather than the clock.
 **Timing.** A verdict that races the wall clock — work that must land inside a
 short real-time window, or a count that depends on where a window's edge falls
 — is a `CHECK_TIMING` (`tests/check.h`), and so is every `CHECK_SPEED`. The
-build pipeline sets `OC_TEST_TIMING=0` (`make test-ci`, and the web step in
-`ci.yml`), which leaves them unjudged so that a busy runner cannot fail a build
-with nothing wrong; `make test` and `make web-test` run by hand judge them.
+build pipeline sets `OC_TEST_TIMING=0` (`make test-merge`), which leaves them
+unjudged so that a busy runner cannot fail a build with nothing wrong;
+`make test` judges them. (The web client's checks have none: they wait on the
+client's state, §3.4.)
 The code around them still runs everywhere, ThreadSanitizer included. Each is
 a debt: the fix is an injected clock, an explicit sweep or a wait on the
 outcome, after which it is a `CHECK` again. A new test is written that way
@@ -579,7 +644,7 @@ and `build/tests` prints the total at the end. **Where `CI` is set, a skip is a
 failure**: the runner is meant to have everything, and a check that silently
 stops running is a check that passes while what it covered regresses.
 
-**Enforced.** `scripts/check/tests_lint.sh` runs with the other source checks
+**Enforced.** `scripts/test/local/tests_lint.sh` runs with the other source checks
 before the suite (`make test`, CI's `build` job) and fails on: a sleep call in
 `tests/` outside `tests/check.h` (or a `slow-on-purpose` line); a comparison
 (`strstr`, `strcmp`, `memcmp`, …) whose literal argument has a space and
@@ -592,14 +657,17 @@ failure, so the output is captured first (`grep -q … <<<"$out"`, or a file).
 
 ### 2.4 Which suites run where
 
-`make test` runs every suite, side by side: as many at once as there are CPUs,
-each in a process of its own (`OC_TEST_JOBS`, `tests/main.c`), its output printed
-whole when it ends. It ends by printing each suite's time, slowest first. The
-suites are nearly all waiting -- on timers, sockets, real-time audio and video
--- so the run takes about as long as the slowest suite (`client_core` and
-`netloop`, under a minute each on a 12-core machine); `build/tests` prints every
-suite's time at the end. The budget is two minutes. `OC_TEST_JOBS=1` runs them
-one after another in one process.
+`make test` runs every suite but the slow ones, side by side: as many at once
+as there are CPUs, each in a process of its own (`OC_TEST_JOBS`,
+`tests/main.c`), its output printed whole when it ends. It ends by printing
+each suite's time, slowest first. The suites are nearly all waiting -- on
+timers, sockets, real-time audio and video -- so the run takes about as long as
+the slowest suite it runs. The budget is one minute, build included once built
+(about 20 seconds on a 12-core machine). The slow suites, `SLOW_SUITES` in
+`scripts/test/lib/common.sh` (the network loop, the client core, the database
+writer and media, chosen by those times), run in `make test-merge` on every
+pull request; a suite that pushes `make test` past its minute joins them.
+`OC_TEST_JOBS=1` runs them one after another in one process.
 
 Side by side, suites must not share anything outside their process: each
 suite's files are in its own `oc_test_mkdtemp` directory, and a suite that
@@ -617,17 +685,15 @@ unknown name gets and a new password's key, where production uses 19 MiB.
 Passwords a test sets on the pages must pass the policy (AUTH.md §2): fifteen
 characters or more, not common, not built on the username.
 
-There are two test commands: `make test`, every suite plainly, the one to run
-locally; and `make test-ci`, CI's, which refuses unless `CI` is set (as GitHub
-Actions sets it). `make test-ci` runs each suite once, split by whether its code
-runs threads (CI runs the halves in parallel jobs, `PART=threads` and
+`make test-merge` (CI only, §4) runs every suite once, split by whether its
+code runs threads (CI runs the halves in parallel jobs, `PART=threads` and
 `PART=plain`):
 
 - the suites whose code runs threads — the loop and its I/O
   threads, the writer and readers, the worker pools, the client, the recorder and
   player — under ThreadSanitizer (address randomization off, `tests/tsan.supp`
-  for the one test-only reconfiguration). The list is the Makefile's
-  `TSAN_SUITES` (`mk/tests.mk`); a suite that starts a thread belongs on it.
+  for the one test-only reconfiguration). The list is `TSAN_SUITES`
+  (`scripts/test/lib/common.sh`); a suite that starts a thread belongs on it.
   Two that do are not on it yet, `run_relaykeys_tests` and `run_summary_tests`,
   so they run only in the plain half and never under the sanitizer. The sanitizer run
   judges races, never speed: a limit on how fast code runs — wall-clock time, or
@@ -642,8 +708,8 @@ runs threads (CI runs the halves in parallel jobs, `PART=threads` and
   suites to leave out). A suite with no thread cannot race, so instrumenting it
   would only make it slower.
 
-Locally, `make test` is the one to run before a pull request: nothing builds or
-tests a pull request, and `make test-ci` runs only in the staging build (§4).
+Locally, `make test` is the one to run, before every push; `make test-merge`
+runs on the pull request and in the staging build, and nowhere else (§4).
 
 ---
 
@@ -682,7 +748,7 @@ resumed, and back in with nobody asked, whatever it had pinned before.
 
 **Local sign-in in the browser** (AUTH.md §8.10) is proven at every layer, and
 it is also how every suite signs in, and a real browser is held to it too
-(`scripts/web/pages.sh`, below): `tests/testsignin.h` plays the browser --
+(`scripts/test/merge/web.sh`, below): `tests/testsignin.h` plays the browser --
 the form POSTed to the daemon's page over TLS, the token read off the 303 --
 and the client presents that token, so a suite's sign-in is a person's. The
 same helper is the `signin` command (`build/signin`) and links into the e2e,
@@ -739,20 +805,18 @@ connection is given to sign in (a short `unauthed_ms`) signing in on the
 connection that polled, with nothing said meanwhile. `test_tkqr`: the QR code's size,
 quiet zone and finder pattern as half blocks. Mutation proofs cover the slow
 down, expiry, the refusal, the lookup limiter, the per-source cap, polling by the
-user code, single collection and the challenge binding. `scripts/tui_device.sh`
-runs the real TUI in tmux against a development-mode daemon: the dialog, the
-code, the URL, the fingerprint and, where python3's OpenCV (`cv2`) is installed,
-a QR code it decodes back to the URL; curl
-approves on the page; the TUI reaches the workspace.
+user code, single collection and the challenge binding.
 
 ### 3.2 Runner: a natively-run daemon in CI
 
 Integration tests run **against the daemon binary CI just built**, started
-directly on the runner and driven by `build/e2e_client`.
+directly on the runner and driven by `build/e2e_client`
+(`scripts/test/merge/e2e.sh`, in `make test-merge`).
 
-**The container image is exercised by the staging build's release jobs, not
-here.** Its `image` job builds it with buildah and, before pushing it, starts
-the amd64 image with podman twice over (`.github/workflows/staging-build.yml`):
+**The container image is exercised by `make test-release PART=image`, not
+here.** The staging build's `image` job builds it with buildah and, before
+pushing it, starts the amd64 image with podman twice over
+(`scripts/test/release/image.sh` and `db_restore.sh`):
 
 - **Plain:** no bucket and no key, so no replicator; `/healthz` answers.
 - **Replicated (ARCH-3, ARCH-39):** a bucket served as S3 on the runner by a pinned
@@ -969,23 +1033,18 @@ works. The shipped *image* is the staging build's release jobs' to prove (§3.2)
   the loop stops nothing answers the health port. The webhook post itself is
   `test_webhook_vertical`, unchanged.
 
-### 3.4 The web client (`make web-test`)
+### 3.4 The web client (`make test-merge`)
 
-The browser build (WEB.md) is checked where a Chromium is present: a
-developer's box, and CI's `build` job, which runs `make web-test` and the GUI
-smoke on the web platform in the runner's Chrome (§4; make fetches Emscripten
-itself). CI sets `OC_TEST_TIMING=0` (§2.3a), so there `test.sh` stops after the
-sign-in and drawing check: the recording and input-method checks run on a
-wall-clock script and fixed sleeps, and are judged only when run by hand. The daemon it starts runs in development mode,
+The browser build (WEB.md) is checked in CI's `build` job, which runs
+`scripts/test/merge/web.sh` and the GUI smoke on the web platform
+(`scripts/test/merge/gui_web_smoke.sh`) in the runner's Chrome, as part of
+`make test-merge PART=plain` (§4; make fetches Emscripten itself). Every check in it waits on the client's state, never a schedule, so
+all of them are judged there as by hand, `OC_TEST_TIMING=0` or not. The daemon it starts runs in development mode,
 and so serves its own `/app/` page that way: the check signs in by password on
 the daemon's page and bootstraps its user.
-`make web-test` runs the first three:
+`scripts/test/merge/web.sh` runs the first two, as its two parts:
 
-- **The gfx pixel test** — `client/gui/gfx/gfx_test_win.c` compiled to wasm
-  over the SDL3 built for it (`build/web/gfx-test.js`), run under Node with
-  SDL's dummy video driver: the same assertions as the Windows run, exit code
-  the failure count.
-- **`scripts/web/test.sh`** — a daemon on a fresh database with one bootstrapped
+- **client** — a daemon on a fresh database with one bootstrapped
   owner, and a headless Chromium with a fresh profile loading the client from
   the daemon's own `/app/` page (`openchime.html`, the Windows application
   compiled for the browser); it signs in on the daemon's page and comes back,
@@ -996,8 +1055,10 @@ the daemon's page and bootstraps its user.
   the browser logs.
 
   Then a video message is recorded through the client's own `vm` verbs with
-  the synthetic camera and the browser's fake microphone: the dump must show
-  the file taken (`take_bytes`) and the console that the audio ran on the
+  the synthetic camera and the browser's fake microphone, each verb taken once
+  the last has happened (the page's `?script=`, `verb~pattern`: its ack, then
+  the dump polled until the state comes; a sign-in that fails ends the run at
+  once): the dump must show the file taken (`take_bytes`) and the console that the audio ran on the
   worklet (`oc-web: audio worklet`, not the fallback), and the client's
   `sttest` verb must pass: the text layer's right-to-left order, cluster
   hit-testing and line breaking through the API the views use; and the
@@ -1005,9 +1066,11 @@ the daemon's page and bootstraps its user.
   <build> (web), server <build>, protocol <n>`, the daemon's from
   `SERVER_BUILD`). Last, a Japanese
   composition is played into the page's hidden input for the input method
-  (`?ime=1`) and the composer must hold its result.
-- **`scripts/web/pages.sh`** — the daemon's sign-in pages from a real browser.
-  A headless Chromium (`scripts/web/pages.mjs`, Playwright) types into the
+  (`?ime=1`), the page polling for it composing (`comp=2`) and then for the
+  composer holding its result (`len=2`). Each of these is reported on a line
+  of its own.
+- **pages** — the daemon's sign-in pages from a real browser.
+  A headless Chromium (`scripts/test/lib/web/pages.mjs`, Playwright) types into the
   forms and submits them: the first owner signed up with the setup token, a
   wrong password refused on the page, the right one signing in, the password
   changed on its page, the old one refused and the new one signing in; each
@@ -1018,17 +1081,18 @@ the daemon's page and bootstraps its user.
   what this proves, and what no scripted post can. Then an invitation link
   (REQ-026): the owner mints an invite anyone may use (`build/demo_client
   ... invite 0`) and a second browser opens `/app/?invite=<hex>` cold
-  (`scripts/web/invite.mjs`), lands on the sign-up form, chooses a name and a
-  password and comes back signed in to the web client, which its own dump
-  says. Last, the client's load (`scripts/web/load.mjs`, WEB.md "Loading"),
+  (`scripts/test/lib/web/invite.mjs`), lands on the sign-up form before the client has
+  been fetched, chooses a name and a password and comes back signed in to the
+  web client, which its own dump says; the tab is closed and the client opened
+  again in a new one, and it is still signed in. Last, the client's load (`scripts/test/lib/web/load.mjs`, WEB.md "Loading"),
   cold and then warm in one browser that trusts the daemon's certificate by
   its key (a browser caches nothing from one it was told to overlook): the load
   screen counts the download in bytes against its size, shows Downloading,
   Starting and Opening in that order and comes down once the client has
   drawn; the wasm and the loader arrive gzipped; and the second load brings
   the page, the loader and the wasm under 2 KB each, every one a `304`. Needs
-  the web client beside the daemon (`make web`) and `openssl`. `make web-test`
-  runs it after `test.sh`.
+  the web client beside the daemon (`make web`) and `openssl`. It runs after
+  the client part.
 - **`scripts/gui/run.sh --web all`** — the Windows feature scripts against the browser
   ("Driving the web client" below): the smoke, chords, voice input, screen recording,
   uploads, files, the two call scripts, the search boxes, encrypted DMs (`pdm`),
@@ -1045,17 +1109,35 @@ answer in frames, a ping's pong, and an unmasked frame ending the connection.
 
 ## 4. Continuous integration
 
-The pipeline — what runs on a pull request, the staging build and the two test
-jobs it calls in `.github/workflows/ci.yml` — is CONTRIBUTING.md "CI". The
-local `make test` (`scripts/check/test.sh`, which the pre-push hook requires)
-is the test a change gets before it merges. Nothing is checked twice: each
-suite runs once (§2.4), one clang compile is both the release-compiler and the
-second-compiler check, and what the release jobs check themselves is not
-repeated. The end-to-end step (§3.2) is the one thing the in-process suites
-cannot show, since they link the daemon's code without its `main()`. Of the
-GUI scripts only the smoke runs, on the web platform (§3.4); the longer web
-scripts (uploads, voice, calls, …) take minutes each and stay local, and so
-does `chords`, which reads its result after a fixed sleep.
+**Three test commands, and every test runs through one of them.** Each test is
+a standalone script under `scripts/test/`; the targets build what the scripts
+need and call them, and the workflows call only the targets.
+
+| Command | Where | Scripts | What it runs |
+|---|---|---|---|
+| `make test` | locally, before every push (`scripts/check/test.sh`, which the pre-push hook requires) | `scripts/test/local/` | the source checks and every suite but the slow ones (§2.4), on the default daemon; about a minute |
+| `make test-merge` | CI only: every pull request (`pr-tests.yml`, a required check) and the staging build, through `ci.yml` | `scripts/test/merge/` | every feature built; every suite, the threaded ones under ThreadSanitizer (§2.4); the static-link check; the end-to-end run (§3.2); the release's compiler; the speech round trip; the web client and the GUI smoke on the web (§3.4); each fuzzing harness for `FUZZ_SECONDS` (§2.2b) |
+| `make test-release` | CI only: the staging build and the release, on the artifacts they make | `scripts/test/release/` | `PART=packages`: glibc floor, one binary in all three packages, the `.deb` installed and speaking, its unit file; `PART=image`: the image starts, its database replicates and restores (§3.2); `PART=windows`: the binaries' version resources, the installer and the MSIX |
+
+`make test-merge` and `make test-release` refuse to run unless `CI` is set (as
+GitHub Actions sets it): they build every feature and drive the release's
+artifacts, which a developer's machine is not for. Shared helpers are in
+`scripts/test/lib/`.
+
+**The smoke test of a published release** is not one of the three:
+`scripts/smoketest.sh` runs every check in `scripts/smoke/` (the apt and dnf
+repositories install it, each index lists it once more, the released image
+pulls and runs), each one even when another failed, and only in the release,
+after it publishes.
+
+Nothing is checked twice: each suite runs once in `make test-merge`, one clang
+compile is both the release-compiler and the second-compiler check, and the
+end-to-end run (§3.2) is the one thing the in-process suites cannot show,
+since they link the daemon's code without its `main()`. Of the GUI scripts only
+the smoke runs in CI, on the web platform (§3.4); the longer web scripts
+(uploads, voice, calls, …) take minutes each and are run by hand, and so is
+`chords`. The pipeline itself — what runs on a pull request, the staging build,
+the release — is CONTRIBUTING.md "CI".
 
 All run on `ubuntu-24.04`, the image the release builds on too. The native
 build and the tests use the runner's gcc; zig (the release's clang), Emscripten
@@ -1071,12 +1153,14 @@ silence sweep. Echo cancellation is measured by the ERLE harness in
 impulse response over a far-end signal, near-end speech mixed in, clock drift
 injected by resampling one side, and ERLE in dB asserted.
 
-**Speech.** The staging build's release jobs (`staging-build.yml`) render a sentence with read-aloud and require
-`openchimed --stt-hear` to hear its words, on the stripped binary and on the
-installed `.deb`, so each speech feature checks the other by content; the
-speech suites (`tts_worker`, `stt`, `ttskit`) run in CI.
+**Speech.** `scripts/test/lib/speech.sh` renders a sentence with read-aloud
+and requires `openchimed --stt-hear` to hear its words, so each speech feature
+checks the other by content: on the full-feature build (`make test-merge`),
+and on the stripped release binary and the installed `.deb`
+(`make test-release PART=packages`); the speech suites (`tts_worker`, `stt`,
+`ttskit`) run in `make test-merge`.
 
-A new suite is its declaration and one `S(run_<name>_tests)` line in `tests/main.c`; if its code starts a thread it also goes on `TSAN_LIST` in `mk/tests.mk`, and CI runs it with no change here. Nothing checks that it does: the relay-key and summary suites start threads and are missing from the list.
+A new suite is its declaration and one `S(run_<name>_tests)` line in `tests/main.c`; if its code starts a thread it also goes on `TSAN_SUITES` in `scripts/test/lib/common.sh`, and if it is slow, on `SLOW_SUITES`.
 
 ---
 
@@ -1133,7 +1217,10 @@ latency from `build/bench_loop` below.
 Working from ~45 MB after a sign-in burst + ~100 KB per idle connection:
 
 - **By memory:** `(256 − 45) MB ÷ 100 KB ≈ 2,000 idle connections` before RAM
-  is the constraint in the lean profile (REQ-210).
+  is the constraint in the lean profile (REQ-210). `make run LEAN=1` runs the
+  development daemon under that ceiling locally — 256 MB, no swap, one CPU, in
+  a systemd user scope (README, "Local development environment") — an
+  approximation of a small box, not a copy of one.
 - **The fd cap:** `OC_NETLOOP_MAX_FD = 4096` (a compile-time constant in
   `daemon/netloop.c`) caps the daemon at ~4,000 connections whatever the RAM;
   that many idle connections need about 450 MB, so on a 256 MB box memory binds
@@ -1391,6 +1478,16 @@ platform's alone. `scripts/gui/run.sh [--win32|--web] <name>... | all` runs
 them by name and tallies the results, skipping on the web the scripts whose
 checks are Windows-only.
 
+**One driver per client.** Two drivers serving one command directory race for
+each verb, so a run fails at random with nothing wrong in the client. `kill`
+ends every driver serving the directory, found by the command line that names
+it, and the browser it held. It asks first (`quit`), then sends SIGTERM, then
+SIGKILL to whatever is still running 3 seconds later, and says how many it had
+to force; a driver ends on SIGTERM or SIGINT by closing its browser. `launch`
+runs `kill`, then refuses to start, naming the pids, if `held` still finds a
+driver on the directory. `scripts/test/local/web_driver.sh`, in `make test`,
+checks both with stand-in drivers that ignore SIGTERM.
+
 **How it drives.** `launch` builds and starts the fixture daemon as
 `scripts/gui/drive.sh` does (`OC_TEST_PORT`, `OC_TEST_DIR`, `OC_TEST_WS`,
 `OC_TEST_USERS`; the health port off), then starts `scripts/web/drive.mjs`: a
@@ -1410,7 +1507,9 @@ directly; `press` goes the way a keyboard does, through the page and SDL.
 several times each and checks Preferences and the shortcuts open every
 time: the client must read a key's modifiers from the key event, not from
 the keyboard's state when it gets to the key, by which time a quick
-Ctrl is already up. The browser runs with
+Ctrl is already up. `press` acks once the events are dispatched, and the
+script polls the dump for the state each chord leads to, as the smoke's
+`wait_for` does. The browser runs with
 Chromium's fake camera and microphone, its own permission prompts answered,
 its screen picker choosing the screen; `OPENCHIME_DEV_AUDIO`, `_MIC`,
 `_CAPTURE`, `_TONE` and the other switches reach the page as `?env=`, and a

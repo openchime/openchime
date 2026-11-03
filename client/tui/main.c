@@ -14,11 +14,11 @@
  * signed-in workspace (g_ws, up to MAX_WS), ticks them all every frame so a
  * background workspace keeps receiving and counting unread, and renders only the
  * active one. Ctrl+W opens the switcher: remembered workspaces with their unread +
- * connection state, and an always-present "Log in to new workspace" row. Each
+ * connection state, and an always-present "Sign in to a new workspace" row. Each
  * session carries its own focused channel, scroll, and half-typed message, so
  * switching away and back doesn't lose work.
  *
- * Usage: openchime-tui [<workspace>]      (login box if omitted)
+ * Usage: openchime-tui [<workspace>]      (sign-in box if omitted)
  *        openchime-tui <host> <port>      (dev/local direct connect)
  *
  * Keys: everything is menus, dialogs, and screens — no commands to type. The
@@ -46,9 +46,10 @@
 
 #include "client.h"
 #include "model.h"
+#include "mention.h"    /* OC_MENTION_NAME_MAX: a broadcast mention as written */
 #include "complete.h"
 #include "resolve.h"    /* workspace -> host:port (REQ-010/011) */
-#include "store.h"      /* peek a stored session token (skip the login box) */
+#include "store.h"      /* peek a stored session token (skip the sign-in box) */
 #include "secret_os.h" /* OS keyring for the session token */
 #include "config.h"     /* machine-local prefs (mouse, panels, time) */
 #include "env.h"        /* the development inputs */
@@ -225,7 +226,31 @@ static const char *name_for(const oc_channel *ch, uint64_t uid);
 /* Fill `out` with the nick to show for message `m`: the name the daemon stamped,
  * "you" for self, a name resolved from the channel (thread replies carry no
  * name), else "user<id>". */
+static char     g_closed_note[160]; /* why `e` or `x` did nothing: the workspace's window closed (REQ-051/052) */
+/* Why an author's own edit or delete is not offered (REQ-051/052): the
+ * workspace's window, as it reads it, said in the status line. */
+static void closed_note(const oc_model *m, int edit) {
+    char v[24];
+    const char *what = edit ? "Editing" : "Deleting";
+    oc_model_workspace_setting(m, edit ? "edit_window" : "delete_window", v, sizeof v);
+    if (!strcmp(v, "never")) {
+        snprintf(g_closed_note, sizeof g_closed_note, "%s your messages is off in this workspace.", what);
+        return;
+    }
+    long s = strtol(v, NULL, 10);
+    char span[48];
+    if (s >= 86400 && s % 86400 == 0) snprintf(span, sizeof span, "%ld day%s", s / 86400, s == 86400 ? "" : "s");
+    else if (s >= 3600 && s % 3600 == 0) snprintf(span, sizeof span, "%ld hour%s", s / 3600, s == 3600 ? "" : "s");
+    else if (s >= 60 && s % 60 == 0) snprintf(span, sizeof span, "%ld minute%s", s / 60, s == 60 ? "" : "s");
+    else snprintf(span, sizeof span, "%ld second%s", s, s == 1 ? "" : "s");
+    snprintf(g_closed_note, sizeof g_closed_note, "%s this message has closed: the workspace allows it for %s after sending.",
+             what, span);
+}
+
+static uint64_t g_ws_sender;   /* the workspace's own sender (oc_model.ws_sender), as last drawn */
 static void msg_nick(char *out, size_t cap, const oc_msg *m, uint64_t me, const oc_channel *ch) {
+    /* Not a person: the workspace, with its mark. */
+    if (g_ws_sender && m->author_id == g_ws_sender) { snprintf(out, cap, "\xe2\x8c\x82 Workspace"); return; }
     if (m->author_name[0]) { snprintf(out, cap, "%s", m->author_name); return; }
     if (m->author_id == me) { snprintf(out, cap, "you"); return; }
     const char *nm = ch ? name_for(ch, m->author_id) : "someone";
@@ -378,7 +403,7 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
 static void build_rows(rows_t *r, const oc_model *m, const oc_channel *ch, uint64_t me, int width) {
     for (size_t i = 0; i < ch->n_msgs; i++)
         append_msg_rows(r, &ch->msgs[i], me, width, ch, 1, (int)i);
-    if (ch->n_msgs == 0) return;
+    if (ch->n_msgs == 0 || !oc_model_receipts_on(m)) return;   /* the workspace has none (REQ-090) */
     uint64_t last = ch->msgs[ch->n_msgs - 1].message_id;
     char names[192]; size_t p = 0; int shown = 0;
     for (size_t i = 0; i < ch->n_readers; i++) {
@@ -402,6 +427,8 @@ static void build_rows(rows_t *r, const oc_model *m, const oc_channel *ch, uint6
  * the launcher offers to accept or decline (0: none); and what was last said of
  * each session, so each change is said once. */
 static char     g_e2e_note[200];
+static char     g_bc_note[200];     /* a broadcast mention's note or question (REQ-221) */
+static char     g_bc_ask[1024];     /* the text the question was about: a second Enter on it sends */
 static uint64_t g_e2e_invite;
 static uint32_t g_e2e_refused_seen;
 static struct { uint64_t id; uint8_t state; } g_e2e_said[OC_PDM_VIEW_MAX];
@@ -479,10 +506,16 @@ static const char *name_for(const oc_channel *ch, uint64_t uid) {
 
 /* Build the rows for the open search view: a header + each hit (channel, time,
  * author, snippet). */
+/* The order a search's results come in (OC_SEARCH_*), cycled with Ctrl+O while
+ * the results are open and kept for the next search. */
+static uint8_t g_search_sort;
+static const char *const SEARCH_SORT_NAME[3] = { "newest first", "oldest first", "best match first" };
+
 static void build_search_rows(rows_t *r, const oc_model *m, int width) {
     char line[200];
-    snprintf(line, sizeof line, "%zu result%s for \"%s\"", m->n_search,
-             m->n_search == 1 ? "" : "s", m->search_query);
+    snprintf(line, sizeof line, "%zu result%s for \"%s\", %s (Ctrl+O: order)", m->n_search,
+             m->n_search == 1 ? "" : "s", m->search_query,
+             SEARCH_SORT_NAME[m->search_sort < 3 ? m->search_sort : 0]);
     char *h = malloc(strlen(line) + 1);
     if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
     for (size_t i = 0; i < m->n_search; i++) {
@@ -608,8 +641,18 @@ static void build_prefs_rows(rows_t *r, const oc_model *m, int width) {
                  m->allow_end_min / 60, m->allow_end_min % 60);
     else
         snprintf(line, sizeof line, "notifications: any time");
+    /* Whose it is (REQ-136): the workspace's default, or your own. */
+    if (m->dnd_default)
+        snprintf(line + strlen(line), sizeof line - strlen(line), " (workspace default)");
+    else if (oc_model_has_default_quiet_hours(m))
+        snprintf(line + strlen(line), sizeof line - strlen(line), " (your own; 'default' in Do not disturb returns to the workspace's)");
     char *h = malloc(strlen(line) + 1);
     if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+    /* Read receipts (REQ-090): the workspace's, then mine. */
+    snprintf(line, sizeof line, "read receipts: %s", !oc_model_receipts_on(m) ? "off for this workspace"
+             : m->share_receipts ? "shared (Ctrl+K: Share my read receipts)" : "not shared (Ctrl+K: Share my read receipts)");
+    h = malloc(strlen(line) + 1);
+    if (h) { strcpy(h, line); rows_push(r, h, TB_DEFAULT); }
 
     int any = 0;
     for (size_t i = 0; i < m->n_channels; i++) {
@@ -821,9 +864,10 @@ static void draw_help(int W, int H) {
         { "New DM",     "type to find a person · Space end-to-end encrypted · Enter opens" },
         { "Encrypted",  "Ctrl+K: accept or decline, trust a new key, end or forget it" },
         { "Messages",   "t thread · r react · e edit · x delete" },
+        { "Search",     "Ctrl+O newest first · oldest first · best match first" },
         { NULL, NULL },
         { NULL, "Everything else" },
-        { "Ctrl+K",     "notifications, invites, webhooks, profile, upload, logout…" },
+        { "Ctrl+K",     "notifications, invites, webhooks, profile, upload, sign out…" },
         { "Summaries",  "Summarize ▾ in the title, Ctrl+K, or Enter on a channel" },
         { "",           "↑/↓ select · Space details · Enter goes to the message" },
     };
@@ -920,7 +964,7 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        /* channel menu */
        ACT_OPEN, ACT_JOIN, ACT_NOTIFY_ALL, ACT_NOTIFY_MENTIONS, ACT_NOTIFY_NONE, ACT_WEBHOOK_CREATE,
        /* global action launcher (Ctrl-K) — replaces the remaining slash commands */
-       ACT_NEWCHAN, ACT_NEWDM, ACT_SEARCH, ACT_NICK, ACT_AWAY, ACT_ONLINE, ACT_DND, ACT_PASSWD,
+       ACT_NEWCHAN, ACT_NEWDM, ACT_SEARCH, ACT_NICK, ACT_AWAY, ACT_ONLINE, ACT_DND, ACT_PASSWD, ACT_RECEIPTS,
        ACT_PREFS, ACT_WEBHOOKS, ACT_LEAVE, ACT_INVITE, ACT_PROFILE, ACT_UPLOAD,
        ACT_STORAGE, ACT_AUDIT, ACT_ALERTS, ACT_WORKSPACES, ACT_HELP, ACT_LOGOUT, ACT_SECURITY,
        /* summaries (REQ-310): ask, pick the span, or go back to the open one */
@@ -942,7 +986,7 @@ static void menu_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
  * your vote: Tacos" when it is yours. The labels live here, not in the
  * model, which may move while the menu is open. */
 static char g_vote_labels[OC_POLL_MAX_OPTIONS][OC_POLL_OPTION_MAX + 32];
-static void menu_build_msg(int own, int deleted, int has_attach, const oc_poll_view *poll) {
+static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int has_attach, const oc_poll_view *poll) {
     g_nmenu = 0;
     if (!deleted) g_menu[g_nmenu++] = (menuitem){ "Reply in thread", ACT_THREAD };
     if (!deleted) g_menu[g_nmenu++] = (menuitem){ "Add reaction",    ACT_REACT };
@@ -957,8 +1001,8 @@ static void menu_build_msg(int own, int deleted, int has_attach, const oc_poll_v
     if (poll && own && !(poll->close_at_ms && (uint64_t)time(NULL) * 1000u >= poll->close_at_ms))
         g_menu[g_nmenu++] = (menuitem){ "Close poll now", ACT_POLL_CLOSE };
     if (has_attach) g_menu[g_nmenu++] = (menuitem){ "Download file", ACT_DOWNLOAD };
-    if (own)      g_menu[g_nmenu++] = (menuitem){ "Edit",            ACT_EDIT };
-    if (own)      g_menu[g_nmenu++] = (menuitem){ "Delete",          ACT_DELETE };
+    if (may_edit) g_menu[g_nmenu++] = (menuitem){ "Edit",            ACT_EDIT };
+    if (may_del)  g_menu[g_nmenu++] = (menuitem){ "Delete",          ACT_DELETE };
     g_menu[g_nmenu++] = (menuitem){ "Who reacted", ACT_REACTORS };
     g_menu[g_nmenu++] = (menuitem){ "Mark unread from here", ACT_UNREAD };
 }
@@ -1025,6 +1069,7 @@ static const tk_pal_item g_launcher_items[] = {
     { "You",     "Change password",     NULL, NULL, ACT_PASSWD },
     { "You",     "Two-step sign-in",    NULL, NULL, ACT_SECURITY },
     { "You",     "Do not disturb",      NULL, NULL, ACT_DND },
+    { "You",     "Share my read receipts (on/off)", NULL, NULL, ACT_RECEIPTS },
     { "You",     "Your profile",        NULL, NULL, ACT_PROFILE },
     { "Admin",   "Invite a user",       NULL, NULL, ACT_INVITE },
     { "Admin",   "Storage usage",       NULL, NULL, ACT_STORAGE },
@@ -1032,7 +1077,7 @@ static const tk_pal_item g_launcher_items[] = {
     { "Admin",   "Daemon alerts",       NULL, NULL, ACT_ALERTS },
     { "Workspace","Switch workspace",   NULL, "Ctrl+W", ACT_WORKSPACES },
     { "Session", "Help",                NULL, "?",  ACT_HELP },
-    { "Session", "Log out",             NULL, NULL, ACT_LOGOUT },
+    { "Session", "Sign out",            NULL, NULL, ACT_LOGOUT },
     { "Channel", "Summarize",           NULL, NULL, ACT_SUMMARIZE },
 };
 /* The launcher as it is now: summaries only where the daemon makes them
@@ -1312,6 +1357,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     if (W < 24 || H < 8) { tk_text(0, 0, W, " terminal too small ", TB_RED | TB_BOLD, TB_DEFAULT); tb_present(); return; }
 
     const oc_channel *fc = (focus < m->n_channels) ? &m->channels[focus] : NULL;
+    g_ws_sender = m->ws_sender;
     const char *conn = m->authed ? "connected" : (m->connected ? "connecting…" : "offline");
 
     /* Header bar (row 0): workspace · you · presence · connection · unread. */
@@ -1546,6 +1592,16 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             char pl[220];
             snprintf(pl, sizeof pl, "   \xf0\x9f\x94\x92 %s", g_e2e_note);
             sx = tk_text(sx, H - 3, W, pl, th->accent, TB_DEFAULT);
+        }
+        if (g_closed_note[0]) {
+            char cl2[sizeof g_closed_note + 4];
+            snprintf(cl2, sizeof cl2, "   %s", g_closed_note);
+            sx = tk_text(sx, H - 3, W, cl2, TB_YELLOW, TB_DEFAULT);
+        }
+        if (g_bc_note[0]) {
+            char bl[sizeof g_bc_note + 4];
+            snprintf(bl, sizeof bl, "   %s", g_bc_note);
+            sx = tk_text(sx, H - 3, W, bl, g_bc_ask[0] ? TB_YELLOW | TB_BOLD : th->accent, TB_DEFAULT);
         }
         if (m->n_sum_notices) {
             /* The newest summary made while you were away, until it is opened. */
@@ -2163,7 +2219,7 @@ static int sumcal_key(oc_client *cl, const struct tb_event *ev) {
 
 /* ---- workspace switcher (REQ-013) -------------------------------------------
  * One list, the same on every platform: the workspaces this device remembers,
- * each with its unread + connection state, and an always-present "Log in to new
+ * each with its unread + connection state, and an always-present "Sign in to a new
  * workspace" row at the bottom. Open sessions come first (they have live state
  * to show), then remembered-but-closed workspaces from the book. */
 
@@ -2211,7 +2267,7 @@ static void sw_build(void) {
 
 static void draw_switcher(int sel) {
     int W = tb_width(), H = tb_height();
-    int rows = g_nsw + 1;                       /* + the "log in" row */
+    int rows = g_nsw + 1;                       /* + the "sign in" row */
     int show = rows > 12 ? 12 : rows;
     int bw = 60; if (bw > W - 4) bw = W - 4; if (bw < 28) bw = 28;
     int bh = show + 4; if (bh > H - 2) bh = H - 2;
@@ -2231,7 +2287,7 @@ static void draw_switcher(int sel) {
 
         char line[320];
         if (idx == g_nsw) {                      /* the always-present last row */
-            snprintf(line, sizeof line, "+ Log in to new workspace");
+            snprintf(line, sizeof line, "+ Sign in to a new workspace");
             tk_text(x + 2, y + 1 + i, x + bw - 1, line,
                       is_sel ? fg : (th->ok | TB_BOLD), bg);
             continue;
@@ -2535,7 +2591,7 @@ static void draw_field(int x, int y, int w, const char *label, const char *val,
     }
 }
 
-/* Run the login box until the user submits (fields filled, workspace resolved into
+/* Run the sign-in box until the user submits (fields filled, workspace resolved into
  * `f->ep`) or quits. `err` is an optional message to show (e.g. a prior auth
  * failure). Returns LOGIN_SUBMIT or LOGIN_QUIT. */
 static int login_dialog(login_form *f, const char *err) {
@@ -2770,7 +2826,7 @@ static void remember_workspace(const char *key, const char *label, const char *u
     oc_store_close(s);
 }
 
-/* Drive the login box + connect, retrying on failure, until authenticated or the
+/* Drive the sign-in box + connect, retrying on failure, until authenticated or the
  * user quits. On success fills `w` (client + key/label/user) and returns 1.
  * `initial_user` pre-fills the username when re-signing into a known workspace. */
 static int run_login(const char *initial_workspace, const char *initial_user,
@@ -2818,7 +2874,7 @@ static int run_login(const char *initial_workspace, const char *initial_user,
 }
 
 /* Open (or re-focus) a workspace from the switcher. A stored session token
- * reconnects silently; without one we fall back to the login box pre-filled with
+ * reconnects silently; without one we fall back to the sign-in box pre-filled with
  * what the book knows. Returns the session index, or -1 if it didn't open. */
 static int open_workspace(const char *key, const char *label, const char *user) {
     int existing = ws_find(key);
@@ -2870,7 +2926,7 @@ static int open_workspace(const char *key, const char *label, const char *user) 
 }
 
 /* Is a still-valid session token stored for this workspace? If so we skip the
- * login box and let the net thread reconnect silently. */
+ * sign-in box and let the net thread reconnect silently. */
 static int have_stored_token(const char *store_path, const char *key, const char *host, int port,
                              oc_secret *secret) {
     oc_store *s = store_path ? oc_store_open(store_path) : NULL;
@@ -2895,7 +2951,7 @@ int main(int argc, char **argv) {
     if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         fprintf(stderr, "usage: %s [<workspace>]\n"
                         "       %s <host> <port>\n"
-                        "  With no workspace a login box is shown; local accounts sign in\n"
+                        "  With no workspace a sign-in box is shown; local accounts sign in\n"
                         "  in the browser or with a device code (AUTH.md).\n",
                         argv[0], argv[0]);
         return 0;
@@ -2921,7 +2977,7 @@ int main(int argc, char **argv) {
     /* Decide how to connect. Three shapes:
      *   <host> <port> : dev/local direct connect (argv[2] is a port);
      *   <workspace>   : resolve by DNS (REQ-010), then connect;
-     *   (nothing)     : show the login box (REQ-020).
+     *   (nothing)     : show the sign-in box (REQ-020).
      * Connect directly when a session token is
      * already stored; otherwise prompt. A resolution failure is reported
      * distinctly from connect/auth failure (REQ-011). */
@@ -2953,7 +3009,7 @@ int main(int argc, char **argv) {
             oc_hostport(host, port, key0, sizeof key0);
         if (have_stored_token(store_path, key0, host, port, secret)) { cred = ""; direct = 1; }  /* silent reconnect */
         else                                                       { prefill = inst; direct = 0; }  /* prompt */
-    }                                                /* else: no args -> login box */
+    }                                                /* else: no args -> sign-in box */
     if (!cred) cred = "";
 
     if (tb_init() != TB_OK) {
@@ -2989,7 +3045,7 @@ int main(int argc, char **argv) {
     } else if (run_login(prefill, NULL, store_path, secret, &g_ws[0])) {
         g_nws = 1;
     } else {
-        tb_shutdown();       /* user quit the login box */
+        tb_shutdown();       /* user quit the sign-in box */
         oc_secret_free(secret);
         return 0;
     }
@@ -3272,9 +3328,19 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* Ctrl+O on open results: the next order, and the search again in it --
+         * a page in one order is no cursor in another. */
+        if (ev.key == TB_KEY_CTRL_O && oc_client_model(cl)->search_open && !prompt_kind) {
+            g_search_sort = (uint8_t)((g_search_sort + 1) % 3);
+            char q[128];
+            snprintf(q, sizeof q, "%s", oc_client_model(cl)->search_query);
+            if (q[0]) oc_client_search(cl, q, g_search_sort);
+            continue;
+        }
+
         size_t nch = oc_client_model(cl)->n_channels;
         if (switcher_open) {                   /* workspace switcher (REQ-013) */
-            int rows = g_nsw + 1;              /* + the "log in to new" row */
+            int rows = g_nsw + 1;              /* + the "sign in to a new" row */
             if (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C) switcher_open = 0;
             else if (ev.key == TB_KEY_CTRL_Q) running = 0;
             else if (ev.key == TB_KEY_ARROW_DOWN) { if (wsel + 1 < rows) wsel++; }
@@ -3300,7 +3366,7 @@ int main(int argc, char **argv) {
                 g_ws[g_active].last_focus_cid = last_focus_cid;
 
                 int target;
-                if (wsel >= g_nsw) {           /* "+ Log in to new workspace" */
+                if (wsel >= g_nsw) {           /* "+ Sign in to a new workspace" */
                     if (g_nws >= MAX_WS) { switcher_open = 0; continue; }
                     target = run_login(NULL, NULL, store_path, secret, &g_ws[g_nws])
                            ? g_nws++ : -1;
@@ -3405,7 +3471,7 @@ int main(int argc, char **argv) {
                 int k = prompt_kind;
                 prompt_kind = PROMPT_NONE;
                 if      (k == PROMPT_NEWCHAN && *v) oc_client_create_channel(cl, v);
-                else if (k == PROMPT_SEARCH  && *v) oc_client_search(cl, v);
+                else if (k == PROMPT_SEARCH  && *v) oc_client_search(cl, v, g_search_sort);
                 else if (k == PROMPT_NICK    && *v) oc_client_set_display_name(cl, v);
                 else if (k == PROMPT_WEBHOOK && *v) oc_client_create_webhook(cl, act_cid, v);
                 else if (k == PROMPT_INVITE) {
@@ -3445,7 +3511,9 @@ int main(int argc, char **argv) {
                      * The full per-weekday schedule is a Win32-first feature; the
                      * TUI keeps the everyday case working rather than pretending
                      * the old quiet-hours meaning still holds. */
-                    if (strcmp(v, "off") == 0 || !*v)
+                    if (strcmp(v, "default") == 0)   /* back to the workspace's default */
+                        oc_client_set_schedule(cl, OC_DND_FROM_DEFAULT, 0, 0, 0, NULL, 0);
+                    else if (strcmp(v, "off") == 0 || !*v)
                         oc_client_set_schedule(cl, OC_DND_OFF, 0, 0, 0, NULL, 0);
                     else {
                         char s1[16] = "", s2[16] = "";
@@ -3490,13 +3558,15 @@ int main(int argc, char **argv) {
                 else if (id == ACT_SEARCH)  { prompt_kind = PROMPT_SEARCH; prompt_title = "Search messages"; tk_input_init(&prompt_input, 0, "query"); }
                 else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
                 else if (id == ACT_UPLOAD)  { prompt_kind = PROMPT_UPLOAD; prompt_title = "Upload a file"; tk_input_init(&prompt_input, 0, "path"); }
-                else if (id == ACT_DND)     { prompt_kind = PROMPT_DND; prompt_title = "Do not disturb (HH:MM HH:MM, or 'off')"; tk_input_init(&prompt_input, 0, "e.g. 22:00 08:00"); }
+                else if (id == ACT_DND)     { prompt_kind = PROMPT_DND; prompt_title = "Do not disturb (HH:MM HH:MM, 'off', or 'default')"; tk_input_init(&prompt_input, 0, "e.g. 22:00 08:00"); }
                 else if (id == ACT_PASSWD)  {   /* the workspace's own page (AUTH.md §8.10) */
                     char url[1200];
                     if (oc_client_open_page(cl, "account/password", NULL, url, sizeof url) == 0) open_in_browser(url);
                 }
                 else if (id == ACT_AWAY)    oc_client_set_presence(cl, OC_PRESENCE_AWAY);
                 else if (id == ACT_ONLINE)  oc_client_set_presence(cl, OC_PRESENCE_ONLINE);
+                else if (id == ACT_RECEIPTS)   /* mine only: the others' still show (REQ-090) */
+                    oc_client_set_read_receipts(cl, !oc_client_model(cl)->share_receipts);
                 else if (id == ACT_SECURITY){   /* the workspace's own page (AUTH.md §8.6) */
                     char url[1200];
                     if (oc_client_open_page(cl, "account/security", NULL, url, sizeof url) == 0) open_in_browser(url);
@@ -3641,6 +3711,7 @@ int main(int argc, char **argv) {
                     else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
                     else if (id == ACT_AWAY)    oc_client_set_presence(cl, OC_PRESENCE_AWAY);
                     else if (id == ACT_ONLINE)  oc_client_set_presence(cl, OC_PRESENCE_ONLINE);
+                    else if (id == ACT_RECEIPTS) oc_client_set_read_receipts(cl, !oc_client_model(cl)->share_receipts);
                     else if (id == ACT_PREFS)   { oc_client_toggle_prefs(cl, 1); }
                     else if (id == ACT_LEAVE)   { if (act_cid) oc_client_leave_channel(cl, act_cid); }
                     else if (id == ACT_WEBHOOKS){ if (act_cid) oc_client_webhooks(cl, act_cid); }
@@ -3815,27 +3886,36 @@ int main(int argc, char **argv) {
                 else if (msg_sel >= 0 && msg_sel < n) {
                     const oc_msg *sel = &ch->msgs[msg_sel];
                     uint64_t mid = sel->message_id;
+                    g_closed_note[0] = '\0';     /* said once, for the key that met it */
                     /* An encrypted DM that has ended, or is not on this device,
                      * stands as it is: no reply, reaction, edit or delete. */
                     const oc_pdm_view *lv = ch->e2e ? oc_model_pdm((oc_model *)mm, cid) : NULL;
                     int locked = ch->e2e && (!lv || lv->state == OC_PDM_EV_ENDED);
                     int own = (sel->author_id == mm->user_id) && !sel->deleted && !locked;
+                    /* The workspace's windows (REQ-051/052): past them the
+                     * daemon refuses an author's own edit or delete. */
+                    uint64_t now = (uint64_t)time(NULL) * 1000u;
+                    int may_edit = own && oc_model_may_change_own(mm, sel->server_time, 1, now);
+                    int may_del = own && oc_model_may_change_own(mm, sel->server_time, 0, now);
                     int has_attach = 0;
                     for (uint8_t ak = 0; ak < sel->n_attach; ak++)
                         if (!sel->attach[ak].reclaimed) { has_attach = 1; break; }
                     if (ev.key == TB_KEY_ENTER) {   /* open the discoverable action menu */
-                        menu_build_msg(own, sel->deleted || locked, has_attach && !ch->e2e, sel->poll);   /* no files in an encrypted DM */
+                        menu_build_msg(own, may_edit, may_del, sel->deleted || locked, has_attach && !ch->e2e, sel->poll);   /* no files in an encrypted DM */
                         act_cid = cid; act_mid = mid; act_uid = 0; act_title = "Message";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
                     else if (ev.ch == 't' && !locked) oc_client_open_thread(cl, cid, mid);
                     else if (ev.ch == 'w') oc_client_list_reactions(cl, cid, mid);
-                    else if ((ev.ch == 'x' || ev.ch == 'd') && own) oc_client_delete(cl, cid, mid);
+                    else if ((ev.ch == 'x' || ev.ch == 'd') && may_del) oc_client_delete(cl, cid, mid);
+                    else if (own && ((ev.ch == 'e' && !may_edit) ||                  /* the window has closed */
+                                     ((ev.ch == 'x' || ev.ch == 'd') && !may_del)))
+                        closed_note(mm, ev.ch == 'e');
                     else if (ev.ch == 'r' && !sel->deleted && !locked) {   /* open the emoji picker */
                         picker_open = 1; eq[0] = '\0'; eqlen = 0; esel = 0;
                         picker_cid = cid; picker_mid = mid;
                     }
-                    else if (ev.ch == 'e' && own) {             /* edit: prefill + drop to composer */
+                    else if (ev.ch == 'e' && may_edit) {             /* edit: prefill + drop to composer */
                         editing = mid;
                         snprintf(composer, sizeof composer, "%s", sel->body ? sel->body : "");
                         clen = strlen(composer);
@@ -3848,6 +3928,8 @@ int main(int argc, char **argv) {
 
         if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) {
             running = 0;
+        } else if (ev.key == TB_KEY_ESC && g_bc_ask[0]) {   /* keep editing the broadcast */
+            g_bc_ask[0] = '\0'; g_bc_note[0] = '\0';
         } else if (ev.key == TB_KEY_ESC) {    /* composer → navigation mode */
             if (editing) { editing = 0; composer[0] = '\0'; clen = 0; }
             else { panel = 2; if (focus < nch) msg_sel = m->channels[focus].n_msgs ? (int)m->channels[focus].n_msgs - 1 : -1; }
@@ -3862,8 +3944,35 @@ int main(int argc, char **argv) {
                 const oc_model *mm = oc_client_model(cl);
                 uint64_t cid = mm->channels[focus].channel_id;
                 if (mm->search_open || mm->roster_open || mm->reactlist_open || mm->voterlist_open || mm->prefs_open || mm->weblist_open) { /* read-only overlay: ignore */ }
-                else if (mm->thread_open) oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
-                else                      oc_client_send(cl, cid, composer);
+                else {
+                    /* A broadcast mention under the workspace's rule (REQ-221),
+                     * judged as every client's send path judges it
+                     * (oc_model_broadcast_check): one that will notify nobody
+                     * is said and sent; one that will notify a channel the
+                     * workspace calls large asks, and a second Enter on the
+                     * same text sends it. */
+                    uint64_t bcid = mm->thread_open ? mm->thread_channel : cid;
+                    oc_bc_check bv;
+                    oc_model_broadcast_check(mm, bcid, composer, &bv);
+                    g_bc_note[0] = '\0';
+                    /* Whether the channel is large is its member count, which
+                     * this client asks for only here: until it has it the
+                     * answer is a guess, so it asks and waits for the next Enter. */
+                    if (bv.act == OC_BC_LOAD) {
+                        oc_client_list_members(cl, bcid);
+                        snprintf(g_bc_note, sizeof g_bc_note, "Checking how many people %s reaches: Enter again to send.", bv.token);
+                        continue;
+                    }
+                    if (bv.act == OC_BC_CONFIRM && strcmp(g_bc_ask, composer) != 0) {
+                        snprintf(g_bc_ask, sizeof g_bc_ask, "%s", composer);
+                        snprintf(g_bc_note, sizeof g_bc_note, "%s notifies %s: Enter to send, Esc to keep editing", bv.token, bv.whom);
+                        continue;
+                    }
+                    g_bc_ask[0] = '\0';
+                    if (bv.act == OC_BC_NOTE) snprintf(g_bc_note, sizeof g_bc_note, "%s", bv.note);
+                    if (mm->thread_open) oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
+                    else                 oc_client_send(cl, cid, composer);
+                }
                 clen = 0; composer[0] = '\0'; scroll = 0;
             }
         } else if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {

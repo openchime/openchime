@@ -288,7 +288,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_VOTE = 144, OC_JOB_LIST_POLL_VOTERS = 145,
        /* The author changes a poll: poll_opts/poll_flags/poll_close_at_ms are
         * all of it, as it is now to be. */
-       OC_JOB_EDIT_POLL = 146 };
+       OC_JOB_EDIT_POLL = 146,
+       /* READ_RECEIPTS (REQ-090): receipts_op 0/1 sets whether I share my
+        * read position, OC_RECEIPTS_ASK asks. Answered OC_RES_READ_RECEIPTS. */
+       OC_JOB_READ_RECEIPTS = 147 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -379,6 +382,7 @@ typedef struct oc_job {
     /* REGISTER (create a local account; AUTH.md §2 — bootstrap / invite) */
     char          *username;  /* heap */
     char          *password;  /* heap */
+    char          *display;   /* heap, or NULL: a demo visitor's display name (AUTH.md §8.12) */
     uint8_t        role;      /* OC_ROLE_* for the new account (also SET_ROLE next) */
     uint16_t       uses;      /* INVITE_USER: how many may redeem it; 0 = no limit */
     uint32_t       mem_kib;/* Argon2id memory, KiB (0 -> the writer's, OC_PW_MEM_KIB) */
@@ -475,8 +479,12 @@ typedef struct oc_job {
     /* HISTORY: 0 pages backwards from message_id, 1 fetches AROUND it (ARCH-96). */
     uint8_t        hist_around;
 
-    /* SEARCH: query text is carried in body/body_len; this bounds the result. */
+    /* SEARCH: query text is carried in body/body_len; this bounds the result.
+     * `search_sort` is OC_SEARCH_*, and `search_cursor_rank` the relevance
+     * cursor's rank beside the id in message_id (protocol.h, oc_search). */
     uint16_t       search_limit;
+    uint8_t        search_sort;
+    int64_t        search_cursor_rank;
 
     /* LOGOUT (revoke sessions; REQ-182). Actor is `user_id`; the token to revoke
      * (scope THIS) is carried in `token`/`token_len`. */
@@ -516,6 +524,7 @@ typedef struct oc_job {
      * parent_id + `follow_on`; MARK_READ reads parent_id + message_id (0 = all). */
     uint8_t        thread_filter;
     uint8_t        follow_on;
+    uint8_t        receipts_op;   /* OC_JOB_READ_RECEIPTS: 0, 1, or OC_RECEIPTS_ASK */
     /* SET_KEYWORDS / SET_PRIORITY (REQ-135), both heap and both wholesale. */
     char           **kw_terms;
     uint8_t          n_kw_terms;
@@ -753,7 +762,18 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_POLL = 117, OC_RES_POLL_VOTERS = 118, OC_RES_POLL_ERR = 119,
        /* The author changed a poll: rpoll[0] for the conversation, nobody's
         * selection in it. */
-       OC_RES_POLL_EDITED = 120 };
+       OC_RES_POLL_EDITED = 120,
+       /* A notice the workspace's own sender posted (its welcome, a member
+        * joined, a channel made or changed, a person added or given a role):
+        * the SEND-shaped fields and `members`, broadcast as an ordinary
+        * message. Chained onto the answer of the job that caused it. */
+       OC_RES_NOTICE = 121,
+       /* Whether user_id shares their read receipts (rc_share): to the asker
+        * (rc_asked), or to every device of theirs when it changed. */
+       OC_RES_READ_RECEIPTS = 122,
+       /* A roster row everyone connected is told (its `ulist`, with `joined`),
+        * and nothing else: the workspace's own sender, made by this job. */
+       OC_RES_ROSTER_ROW = 123 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -942,6 +962,7 @@ typedef struct {
     /* The voice this person is read aloud in (REQ-292). Everyone hears the same
      * one for the same author, so the roster carries it like a name decoration. */
     char    *voice_id;      /* heap; may be "" */
+    uint8_t  flags;         /* OC_USER_SYSTEM: the workspace's own sender */
 } oc_user_row;
 
 /* One message to replay on reconnect (rendered as a BROADCAST by the net thread),
@@ -983,9 +1004,14 @@ typedef struct {
     uint8_t  saved;
     uint64_t saved_at;
     uint8_t  kind;         /* OC_MSG_KIND_*: a call event is drawn as history (REQ-304) */
+    /* Replays and THREAD: its send stored a broadcast mention row (REQ-221),
+     * whatever the body says now; the byte BROADCAST and THREAD_REPLY carry. */
+    uint8_t  broadcast_stored;
     /* SEARCH only: the snippet in `body` is cut from an action's text
      * (REQ-058). A replay carries actions on their own frames instead. */
     uint8_t  action;
+    /* SEARCH only: the row's relevance, bm25 × 1,000,000 (0 unless sorted so). */
+    int64_t  rank;
 } oc_replay_msg;
 
 typedef struct oc_dbres {
@@ -1044,6 +1070,9 @@ typedef struct oc_dbres {
     uint16_t       unres_total;     /* everyone it could not reach, beyond unres's eight (REQ-308) */
     size_t         n_attach;
     char          *author_name;  /* heap; SEND_OK/WEBHOOK_POSTED override name, else NULL */
+    /* SEND_OK, REPLY_OK, RESTORE_OK, WEBHOOK_POSTED, NOTICE: the send stored
+     * a broadcast mention row, so a broadcast in the body notifies (REQ-221). */
+    uint8_t        broadcast_stored;
 
     /* BACKFILL_OK */
     oc_replay_msg *replay;    /* heap array, ascending message_id */
@@ -1334,6 +1363,11 @@ typedef struct oc_dbres {
      * the *other* members' current cursors to backfill the acker. */
     oc_read_cursor_row     *rcur;            /* heap array */
     size_t                  n_rcur;
+    /* READ_CURSOR: whether this reader's position may reach the others (the
+     * workspace's OPENCHIME_READ_RECEIPTS and their own choice); `rcur` holds
+     * only the others who share. READ_RECEIPTS: the choice, and whether it
+     * answers an ask. */
+    uint8_t                 rc_share, rc_asked;
 
     /* OC_RES_STT_PREP (ARCH-112): the segment, and the conversation's members'
      * display names (heap strings) for mention normalization. */
@@ -1495,6 +1529,9 @@ int     oc_job_set_proof(oc_job *j, const void *proof, size_t len);
 int     oc_job_set_email(oc_job *j, const void *email, size_t len);
 int     oc_job_set_body(oc_job *j, const void *body, size_t len);
 /* Fill a REGISTER job (copies strings). mem_kib 0 -> the writer's Argon2id memory. */
+/* REDEEM in a demo workspace: the new account's display name, which is
+ * otherwise its username. */
+int     oc_job_set_display(oc_job *j, const char *display);
 int     oc_job_set_register(oc_job *j, const char *username, const char *password,
                             uint8_t role, uint32_t mem_kib);
 

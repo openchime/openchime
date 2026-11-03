@@ -285,3 +285,32 @@ const char *oc_http_error_body(int status, size_t *len) {
     *len = strlen(b);
     return b;
 }
+
+int oc_ws_parse(const uint8_t *buf, size_t n, uint64_t max_len, oc_ws_frame *out) {
+    if (n < 2) return OC_WS_MORE;
+    uint8_t b0 = buf[0], b1 = buf[1];
+    if (b0 & 0x70) return OC_WS_REFUSE;          /* reserved bits: no extension agreed */
+    if (!(b1 & 0x80)) return OC_WS_REFUSE;       /* a client's frames are masked */
+    uint64_t len = b1 & 0x7f;
+    size_t hdr = 2;
+    if (len == 126) {
+        if (n < 4) return OC_WS_MORE;
+        len = ((uint64_t)buf[2] << 8) | buf[3];
+        hdr = 4;
+    } else if (len == 127) {
+        if (n < 10) return OC_WS_MORE;
+        len = 0;
+        for (int i = 0; i < 8; i++) len = (len << 8) | buf[2 + i];
+        hdr = 10;
+    }
+    if (len > max_len) return OC_WS_REFUSE;
+    size_t whole = hdr + 4 + (size_t)len;
+    if (n < whole) return OC_WS_MORE;
+    out->opcode = b0 & 0x0f;
+    out->fin = (b0 & 0x80) != 0;
+    out->mask_off = hdr;
+    out->payload_off = hdr + 4;
+    out->len = (size_t)len;
+    out->whole = whole;
+    return OC_WS_FRAME;
+}

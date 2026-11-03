@@ -217,7 +217,7 @@ on (`TTS`, `STT`, `SUM`, `WEB`) are remembered in `build/.features`, so a later
 `make distclean` forgets them. `make ARCH=aarch64` cross-builds the daemon for
 arm64 into `build/aarch64/` (build only), and `make RELEASE=1` builds the host's
 as the release does, with zig against glibc 2.34; zig is fetched only for
-these two and for `make check-release-cc`.
+these two and for the release-compiler check in `make test-merge`.
 `make OC_BUILD_ID=<commit>` stamps the build id into `openchimed --version`;
 an unstamped build reports `dev`. There is one build: the tests, the GUI and
 web harness and the demo scripts run it with `OPENCHIME_MODE=development`,
@@ -240,9 +240,9 @@ libraries for each version and links against whichever it is told to, so the
 floor holds without a container, and the arm64 daemon comes off the same x86
 runner (`make RELEASE=1 ARCH=aarch64`). The staging build asserts the result rather
 than trusting it: if the built binary needs a symbol above `GLIBC_2.34`, the
-build fails. Linux runners build everything but the Windows installers, which
-are packaged (and, when configured, signed) on a Windows runner; nothing in the
-pipeline uses Docker.
+build fails. Linux runners build everything, the Windows installer and MSIX
+included (NSIS and makemsix, signed with jsign when configured); nothing in the
+pipeline uses Docker or Windows.
 
 ## Client (app-core + native frontends)
 
@@ -329,6 +329,15 @@ and sign in as `alice` / `pw` (in the browser or with a device code):
 build/openchime-tui 127.0.0.1 8443
 ```
 
+`make run LEAN=1` runs the same daemon under the lean profile's ceiling (ARCH-4,
+REQ-210): at most 256 MB of memory with no swap, and one CPU, in a transient
+systemd user scope (`systemd-run --user --scope`). Past the ceiling the daemon is
+killed, as a small box would kill it, instead of swapping. It is an
+approximation of a small machine, not a copy of one: the disk, the network and
+the kernel are still this machine's. It needs a systemd user session with the
+memory and cpu controllers delegated; where it cannot make the scope, it stops
+and says so rather than running the daemon without limits.
+
 Stop it with Ctrl-C. To start from scratch, delete `/tmp/openchime-dev` — there
 are no volumes and no daemon holding state anywhere else.
 
@@ -363,10 +372,11 @@ See [LICENSING.md](LICENSING.md) for the full map, including `third_party/`.
 
 ## Known fidelity gaps
 
-- **Local development does not approximate the deployment target.**
-  `make run` applies no resource limits, so nothing stands in for the lean
-  memory profile (ARCH-4, REQ-210), and constrained-resource behaviour is
-  unexercised in local development.
+- **Local development only approximates the deployment target.**
+  `make run` applies no resource limits; `make run LEAN=1` applies the lean
+  profile's memory and CPU ceiling (ARCH-4, REQ-210) in a systemd user scope,
+  but on this machine's disk, network and kernel, so constrained-resource
+  behaviour is approximated rather than reproduced.
 - The container image is exercised by the staging build's image checks
   (TESTING.md §3.2: started, asked `/healthz`, replicated and restored) and by
   the release's smoke, which pulls the released tag and asks it `--version`.

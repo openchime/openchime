@@ -61,6 +61,18 @@ const ctx = await chromium.launchPersistentContext(profile, {
          '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream',
          '--autoplay-policy=no-user-gesture-required', '--auto-select-desktop-capture-source=Entire screen'],
 });
+// SIGTERM and SIGINT end the driver as `quit` does: the browser closed and the
+// process gone, within a second and a half even if closing hangs. A driver that
+// outlived its run would answer the next run's commands (scripts/web/drive.sh kill).
+let stopping = false;
+const stop = () => {
+  if (stopping) return;
+  stopping = true;
+  setTimeout(() => process.exit(0), 1500).unref();
+  ctx.close().catch(() => {}).finally(() => process.exit(0));
+};
+process.on('SIGTERM', stop);
+process.on('SIGINT', stop);
 // A stored session from an earlier run must not sign the page in as someone else.
 try { await ctx.clearCookies(); } catch (e) {}
 if (mic) await ctx.route((u) => u.pathname.endsWith('/mic.wav'), (route) => route.fulfill({ path: mic, contentType: 'audio/wav' }));
@@ -150,8 +162,8 @@ async function serve(line) {
       for (const [type, key, code, mods] of evs)
         t.dispatchEvent(new KeyboardEvent(type, { key, code, ...mods, bubbles: true, cancelable: true }));
     }, evs);
-    // A frame or two for the client to take the batch.
-    await new Promise((r) => setTimeout(r, 200));
+    // Dispatched, not yet taken: the client takes the batch on a frame of its
+    // own, so what follows polls for the state the chord leads to.
     writeAck('ok');
     return;
   }

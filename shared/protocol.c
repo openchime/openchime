@@ -438,6 +438,7 @@ static oc_result encode_broadcast_as(oc_wbuf *w, uint16_t version, uint16_t type
     oc_w_u64(w, m->author_id);
     oc_w_u64(w, m->server_time);
     oc_w_u8(w, m->kind);
+    oc_w_u8(w, m->broadcast_stored ? 1u : 0u);
     oc_w_lstr(w, m->body);
     /* Optional trailing block (REQ-140/170): the attachment list, then an
      * optional author-name override. Both are self-describing — present only
@@ -878,6 +879,7 @@ oc_result oc_encode_thread_reply(oc_wbuf *w, uint16_t version, const oc_thread_r
      * already optional, and a second field sharing it is how a decoder loses
      * its place. */
     oc_w_u8(w, m->participant ? 1u : 0u);
+    oc_w_u8(w, m->broadcast_stored ? 1u : 0u);
     oc_w_lstr(w, m->body);
     /* Optional trailing attachment metadata (REQ-140), as on BROADCAST. */
     if (m->n_attach) {
@@ -1462,6 +1464,8 @@ const char *oc_error_text(uint16_t code) {
     case OC_ERR_INVALID_POLL: return "a poll needs a question and two to ten options, and a vote only options it has";
     case OC_ERR_POLL_CLOSED: return "the poll has closed";
     case OC_ERR_POLL_HAS_VOTES: return "people have voted, so the options and settings can no longer change";
+    case OC_ERR_EDIT_WINDOW_CLOSED: return "this workspace no longer lets you change or delete that message";
+    case OC_ERR_WORKSPACE_SENDER: return "messages from the workspace take no replies";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
@@ -2241,6 +2245,14 @@ oc_result oc_encode_capabilities(oc_wbuf *w, uint16_t version, const oc_capabili
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_workspace_settings(oc_wbuf *w, uint16_t version, const oc_workspace_settings *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_WORKSPACE_SETTINGS);
+    uint8_t n = m->count > OC_WS_SETTINGS_MAX ? OC_WS_SETTINGS_MAX : m->count;
+    oc_w_u8(w, n);
+    for (uint8_t i = 0; i < n; i++) { oc_w_str(w, m->keys[i]); oc_w_str(w, m->values[i]); }
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_voice_preview_get(oc_wbuf *w, uint16_t version, const oc_voice_preview_get *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_VOICE_PREVIEW_GET);
     oc_w_str(w, m->voice_id);
@@ -2401,6 +2413,7 @@ oc_result oc_encode_user_list(oc_wbuf *w, uint16_t version, const oc_user_list *
         oc_w_str(w, m->entries[i].full_name);      /* REQ-240/289 */
         oc_w_str(w, m->entries[i].pronouns);
         oc_w_str(w, m->entries[i].voice_id);       /* REQ-292 */
+        oc_w_u8(w, m->entries[i].flags);           /* OC_USER_SYSTEM */
     }
     return oc_frame_end(w, off);
 }
@@ -2499,6 +2512,8 @@ oc_result oc_encode_search(oc_wbuf *w, uint16_t version, const oc_search *m) {
     oc_w_u8(w, m->has_mask);
     oc_w_u64(w, m->after_ms);
     oc_w_u64(w, m->before_ms);
+    oc_w_u8(w, m->sort);                            /* 28 */
+    oc_w_u64(w, (uint64_t)m->cursor_rank);
     return oc_frame_end(w, off);
 }
 
@@ -2512,6 +2527,7 @@ oc_result oc_encode_search_results(oc_wbuf *w, uint16_t version, const oc_search
         oc_w_u64(w, m->entries[i].server_time);
         oc_w_str(w, m->entries[i].snippet);
         oc_w_u8(w, m->entries[i].action);
+        oc_w_u64(w, (uint64_t)m->entries[i].rank);  /* 28 */
     }
     oc_w_u8(w, m->truncated);   /* 1 if more matches exist past the cap */
     return oc_frame_end(w, off);
@@ -2710,6 +2726,8 @@ oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m) {
     m->server_time = oc_r_u64(p);
     m->kind = oc_r_u8(p);
     if (m->kind > OC_MSG_KIND_CALL) return OC_E_MALFORMED;   /* a kind this version does not define */
+    m->broadcast_stored = oc_r_u8(p);
+    if (m->broadcast_stored > 1) return OC_E_MALFORMED;   /* a flag, nothing else */
     m->body = oc_r_lstr(p);
     /* Optional trailing block: attachment list, then an optional author name. */
     m->n_attach = 0;
@@ -3118,6 +3136,8 @@ oc_result oc_decode_thread_reply(oc_rbuf *p, oc_thread_reply *m) {
     m->server_time = oc_r_u64(p);
     m->reply_count = oc_r_u32(p);
     m->participant = oc_r_u8(p);
+    m->broadcast_stored = oc_r_u8(p);
+    if (m->broadcast_stored > 1) return OC_E_MALFORMED;   /* a flag, nothing else */
     m->body = oc_r_lstr(p);
     m->n_attach = 0;
     if (!p->underflow && p->pos < p->len) {
@@ -3418,6 +3438,27 @@ oc_result oc_decode_capabilities(oc_rbuf *p, oc_capabilities *m) {
     return r_done(p);
 }
 
+oc_result oc_encode_read_receipts(oc_wbuf *w, uint16_t version, const oc_read_receipts *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_READ_RECEIPTS);
+    oc_w_u8(w, m->share);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_read_receipts(oc_rbuf *p, oc_read_receipts *m) {
+    m->share = oc_r_u8(p);
+    if (m->share > OC_RECEIPTS_ASK) return OC_E_MALFORMED;
+    return r_done(p);
+}
+
+oc_result oc_decode_workspace_settings(oc_rbuf *p, oc_workspace_settings *m) {
+    memset(m, 0, sizeof *m);
+    uint8_t n = oc_r_u8(p);
+    if (n > OC_WS_SETTINGS_MAX) return OC_E_MALFORMED;
+    m->count = n;
+    for (uint8_t i = 0; i < n; i++) { m->keys[i] = oc_r_str(p); m->values[i] = oc_r_str(p); }
+    return r_done(p);
+}
+
 oc_result oc_decode_voice_preview_get(oc_rbuf *p, oc_voice_preview_get *m) {
     m->voice_id = oc_r_str(p);
     return r_done(p);
@@ -3561,6 +3602,7 @@ oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries,
         oc_slice fname = oc_r_str(p);
         oc_slice prn = oc_r_str(p);
         oc_slice voice = oc_r_str(p);
+        uint8_t flags = oc_r_u8(p);
         if (i < cap) {
             entries[i].user_id = uid;
             entries[i].role = role;
@@ -3575,6 +3617,7 @@ oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries,
             entries[i].full_name = fname;
             entries[i].pronouns = prn;
             entries[i].voice_id = voice;
+            entries[i].flags = flags;
         }
     }
     return r_done(p);
@@ -3694,6 +3737,8 @@ oc_result oc_decode_search(oc_rbuf *p, oc_search *m) {
     m->has_mask   = oc_r_u8(p);
     m->after_ms   = oc_r_u64(p);
     m->before_ms  = oc_r_u64(p);
+    m->sort        = oc_r_u8(p);
+    m->cursor_rank = (int64_t)oc_r_u64(p);
     return r_done(p);
 }
 
@@ -3708,6 +3753,7 @@ oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries,
         uint64_t ts = oc_r_u64(p);
         oc_slice snip = oc_r_str(p);
         uint8_t act = oc_r_u8(p);
+        int64_t rank = (int64_t)oc_r_u64(p);
         if (i < cap) {
             entries[i].message_id = mid;
             entries[i].channel_id = ch;
@@ -3715,6 +3761,7 @@ oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries,
             entries[i].server_time = ts;
             entries[i].snippet = snip;
             entries[i].action = act;
+            entries[i].rank = rank;
         }
     }
     uint8_t trunc = oc_r_u8(p);

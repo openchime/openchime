@@ -25,11 +25,27 @@
 
 /* Block until a result is available (bounded): woken by the writer's eventfd,
  * not by polling on a timer. */
+/* The next result, past any notice the workspace posted beside it (a job's
+ * notices ride after its answer, OC_RES_NOTICE): a test asks about the
+ * answer, and test_notices reads notices from the database. */
+/* Roster rows told to everyone beside an answer (OC_RES_ROSTER_ROW): counted,
+ * for the test that the workspace's sender is announced once. */
+static int g_roster_rows;
+static oc_dbres *next_answer(oc_dbwriter *w) {
+    for (;;) {
+        oc_dbres *r = oc_dbwriter_next_result(w);
+        if (!r || (r->type != OC_RES_NOTICE && r->type != OC_RES_ROSTER_ROW)) return r;
+        if (r->type == OC_RES_ROSTER_ROW && r->joined && r->n_ulist == 1 && r->ulist[0].flags == OC_USER_SYSTEM)
+            g_roster_rows++;
+        oc_dbres_free(r);
+    }
+}
+
 static oc_dbres *wait_result(oc_dbwriter *w) {
     struct timespec t0, t;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (;;) {
-        oc_dbres *r = oc_dbwriter_next_result(w);
+        oc_dbres *r = next_answer(w);
         if (r) return r;
         clock_gettime(CLOCK_MONOTONIC, &t);
         /* Only a guard against a hang: a loaded machine can take seconds. */
@@ -2405,7 +2421,13 @@ static void test_index_mentions(void) {
                            "  key_pem TEXT, issued_at_ms INTEGER, not_after_ms INTEGER);"
                            "CREATE TABLE local_issuer (id INTEGER PRIMARY KEY, key_pem TEXT, issuer TEXT, created_at_ms INTEGER);"
                            /* 0065's polls. */
-                           "DROP TABLE poll_votes; DROP TABLE poll_options; DROP TABLE polls;",
+                           "DROP TABLE poll_votes; DROP TABLE poll_options; DROP TABLE polls;"
+                           /* 0066's workspace sender. */
+                           "ALTER TABLE users DROP COLUMN is_system;"
+                           /* 0067's own-schedule flag. */
+                           "ALTER TABLE users DROP COLUMN dnd_own;"
+                           /* 0068's read receipts. */
+                           "ALTER TABLE users DROP COLUMN share_receipts; ALTER TABLE users DROP COLUMN receipts_since_ms;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -4359,6 +4381,169 @@ static void test_search_filters_and_paging(void) {
     cleanup_db(path);
 }
 
+/* The three orders (REQ-080): newest first, oldest first and by relevance,
+ * each paged by its keyset so that walking every page meets every row once, and
+ * none of them reaching a channel the caller cannot read. Relevance with no text
+ * to rank is newest first. */
+static oc_dbres *search_s(oc_dbwriter *w, uint64_t uid, const char *text, const char *from,
+                          uint8_t sort, uint64_t before_id, int64_t cursor_rank, uint16_t limit) {
+    oc_job *j = oc_job_new(OC_JOB_SEARCH, 150);
+    j->user_id = uid;
+    j->search_limit = limit;
+    if (text && text[0]) oc_job_set_body(j, text, strlen(text));
+    if (from && from[0]) j->sq_from = strdup(from);
+    j->search_sort = sort;
+    j->message_id = before_id;
+    j->search_cursor_rank = cursor_rank;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* Every page of a search in `sort`, `limit` at a time, into ids[] (and ranks[]),
+ * each page asked from the last row of the one before. The row count, or -1
+ * when a row came back twice. */
+static int search_walk(oc_dbwriter *w, uint64_t uid, const char *text, uint8_t sort,
+                       uint16_t limit, uint64_t *ids, int64_t *ranks, int cap) {
+    int n = 0;
+    uint64_t cur_id = 0; int64_t cur_rank = 0;
+    for (int page = 0; page < 20; page++) {
+        oc_dbres *r = search_s(w, uid, text, NULL, sort, cur_id, cur_rank, limit);
+        if (!r) return -1;
+        size_t got = r->n_search;
+        for (size_t i = 0; i < got && n < cap; i++) {
+            for (int k = 0; k < n; k++) if (ids[k] == r->search[i].message_id) { oc_dbres_free(r); return -1; }
+            ids[n] = r->search[i].message_id; ranks[n] = r->search[i].rank; n++;
+        }
+        if (got) { cur_id = r->search[got - 1].message_id; cur_rank = r->search[got - 1].rank; }
+        int more = r->truncated && got > 0;
+        oc_dbres_free(r);
+        if (!more) break;
+    }
+    return n;
+}
+
+static void test_search_orders(void) {
+    const char *path = tdb("searcho.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "so-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "so-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+    /* Seven in the default channel, the term as dense as a whole message and as
+     * thin as one word in a long one, two of them alike (a tie, broken by id). */
+    static const char *const bodies[] = {
+        "release notes for the quarter, long and mostly about other things entirely",
+        "release",
+        "release release release",
+        "after the release we went to lunch and talked about the weather for an hour",
+        "release",
+        "a release candidate",
+        "the release",
+    };
+    /* Most of a workspace's messages do not say the word: without them every
+     * message matches, bm25's IDF is at its floor and every rank ties. */
+    for (int i = 0; i < 40; i++) {
+        char b[64];
+        snprintf(b, sizeof b, "ordinary chatter about lunch number %d", i);
+        CHECK(send_id(w, i % 2 ? bob : alice, OC_DEFAULT_CHANNEL, b) != 0);
+    }
+    uint64_t mid[7];
+    for (int i = 0; i < 7; i++) {
+        mid[i] = send_id(w, i % 2 ? bob : alice, OC_DEFAULT_CHANNEL, bodies[i]);
+        CHECK(mid[i] != 0);
+    }
+    /* And one in a private channel only alice is in: no order may show it to bob. */
+    oc_dbres *r = create_channel(w, alice, "so-vault", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t vault = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    uint64_t secret = send_id(w, alice, vault, "release release release release");
+    CHECK(secret != 0);
+
+    /* Newest first, as before: ids falling, ranks zero. */
+    r = search_s(w, bob, "release", NULL, OC_SEARCH_NEWEST, 0, 0, 50);
+    CHECK(r && r->n_search == 7);
+    if (r) for (size_t i = 0; i + 1 < r->n_search; i++) CHECK(r->search[i].message_id > r->search[i + 1].message_id);
+    if (r && r->n_search) CHECK(r->search[0].message_id == mid[6] && r->search[0].rank == 0);
+    oc_dbres_free(r);
+
+    /* Oldest first: ids rising. */
+    r = search_s(w, bob, "release", NULL, OC_SEARCH_OLDEST, 0, 0, 50);
+    CHECK(r && r->n_search == 7);
+    if (r) for (size_t i = 0; i + 1 < r->n_search; i++) CHECK(r->search[i].message_id < r->search[i + 1].message_id);
+    if (r && r->n_search) CHECK(r->search[0].message_id == mid[0]);
+    oc_dbres_free(r);
+
+    /* By relevance: best (lowest bm25) first, a tie by id; the dense one before
+     * the long one that only mentions it. */
+    r = search_s(w, bob, "release", NULL, OC_SEARCH_RELEVANCE, 0, 0, 50);
+    CHECK(r && r->n_search == 7);
+    int pos_dense = -1, pos_long = -1;
+    if (r) for (size_t i = 0; i < r->n_search; i++) {
+        CHECK(r->search[i].rank < 0);
+        if (i + 1 < r->n_search)
+            CHECK(r->search[i].rank < r->search[i + 1].rank ||
+                  (r->search[i].rank == r->search[i + 1].rank &&
+                   r->search[i].message_id < r->search[i + 1].message_id));
+        if (r->search[i].message_id == mid[2]) pos_dense = (int)i;
+        if (r->search[i].message_id == mid[3]) pos_long = (int)i;
+    }
+    CHECK(pos_dense >= 0 && pos_long >= 0 && pos_dense < pos_long);
+    uint64_t rel_all[7] = { 0 };
+    if (r) for (size_t i = 0; i < r->n_search && i < 7; i++) rel_all[i] = r->search[i].message_id;
+    oc_dbres_free(r);
+
+    /* Paged two at a time, each order meets every row once, in the same order
+     * as the single page -- across ties too. */
+    uint64_t ids[16]; int64_t ranks[16];
+    CHECK(search_walk(w, bob, "release", OC_SEARCH_RELEVANCE, 2, ids, ranks, 16) == 7);
+    for (int i = 0; i < 7; i++) CHECK(ids[i] == rel_all[i]);
+    CHECK(search_walk(w, bob, "release", OC_SEARCH_OLDEST, 2, ids, ranks, 16) == 7);
+    for (int i = 0; i < 7; i++) CHECK(ids[i] == mid[i]);
+    CHECK(search_walk(w, bob, "release", OC_SEARCH_NEWEST, 2, ids, ranks, 16) == 7);
+    for (int i = 0; i < 7; i++) CHECK(ids[i] == mid[6 - i]);
+
+    /* A message posted between pages repeats nothing and loses nothing. */
+    r = search_s(w, bob, "release", NULL, OC_SEARCH_RELEVANCE, 0, 0, 3);
+    CHECK(r && r->n_search == 3);
+    uint64_t seen[16]; int n_seen = 0;
+    uint64_t cid = 0; int64_t crank = 0;
+    if (r) { for (size_t i = 0; i < r->n_search; i++) seen[n_seen++] = r->search[i].message_id;
+             cid = r->search[r->n_search - 1].message_id; crank = r->search[r->n_search - 1].rank; }
+    oc_dbres_free(r);
+    CHECK(send_id(w, alice, OC_DEFAULT_CHANNEL, "release") != 0);
+    r = search_s(w, bob, "release", NULL, OC_SEARCH_RELEVANCE, cid, crank, 50);
+    if (r) for (size_t i = 0; i < r->n_search; i++)
+        for (int k = 0; k < n_seen; k++) CHECK(r->search[i].message_id != seen[k]);
+    CHECK(r && n_seen + (int)r->n_search == 8);
+    oc_dbres_free(r);
+
+    /* Readable channels only, in every order: bob never sees the vault; alice
+     * does, and by relevance it is her best match. */
+    for (uint8_t so = 0; so < 3; so++) {
+        r = search_s(w, bob, "release", NULL, so, 0, 0, 50);
+        if (r) for (size_t i = 0; i < r->n_search; i++) CHECK(r->search[i].message_id != secret);
+        oc_dbres_free(r);
+    }
+    r = search_s(w, alice, "release", NULL, OC_SEARCH_RELEVANCE, 0, 0, 50);
+    CHECK(r && r->n_search == 9 && r->search[0].message_id == secret);
+    oc_dbres_free(r);
+
+    /* Relevance with nothing to rank -- filters alone -- is newest first. */
+    r = search_s(w, bob, NULL, "so-bob", OC_SEARCH_RELEVANCE, 0, 0, 50);
+    CHECK(r && r->n_search == 23);                /* twenty of the chatter, three of the seven */
+    if (r) for (size_t i = 0; i + 1 < r->n_search; i++) {
+        CHECK(r->search[i].message_id > r->search[i + 1].message_id);
+        CHECK(r->search[i].rank == 0);
+    }
+    if (r && r->n_search) CHECK(r->search[0].message_id == mid[5]);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_search(void) {
     const char *path = tdb("search.db");
     cleanup_db(path);
@@ -6125,6 +6310,61 @@ static void test_custom_emoji(void) {
     CHECK(r && r->type == OC_RES_LIST_ERR);
     oc_dbres_free(r);
 
+    /* Who may add is configuration (OPENCHIME_CUSTOM_EMOJI_ADD). With `admins`,
+     * a member is refused before anything else is looked at; an owner gets
+     * past it (refused here only because the image is not theirs). With
+     * `everyone`, the member may. */
+    {
+        char cerr[256];
+        setenv("OPENCHIME_CUSTOM_EMOJI_ADD", "admins", 1);
+        CHECK(oc_config_load(cerr, sizeof cerr) == 0);
+        j = oc_job_new(OC_JOB_ADD_EMOJI, 9);
+        j->user_id = carol; j->message_id = 3; j->ch_name = strdup("carols");
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_FORBIDDEN);
+        oc_dbres_free(r);
+        j = oc_job_new(OC_JOB_ADD_EMOJI, 9);
+        j->user_id = alice; j->message_id = 3; j->ch_name = strdup("alices");
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_UNKNOWN_ATTACHMENT);
+        oc_dbres_free(r);
+        setenv("OPENCHIME_CUSTOM_EMOJI_ADD", "everyone", 1);
+        CHECK(oc_config_load(cerr, sizeof cerr) == 0);
+        j = oc_job_new(OC_JOB_ADD_EMOJI, 9);
+        j->user_id = carol; j->message_id = 3; j->ch_name = strdup("carols");
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_EMOJI_LIST);
+        oc_dbres_free(r);
+        j = oc_job_new(OC_JOB_DELETE_EMOJI, 9);            /* as it was, for what follows */
+        j->user_id = carol; j->ch_name = strdup("carols");
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+        /* Every role under each value: an admin and an owner get past the
+         * rule under both (refused only because the image is not theirs); a
+         * member only under `everyone` (shown above). */
+        uint64_t admin = reg(w, "ce-admin", "pw", OC_ROLE_ADMIN);
+        CHECK(admin);
+        static const char *const vals[] = { "admins", "everyone" };
+        for (int v = 0; v < 2; v++) {
+            setenv("OPENCHIME_CUSTOM_EMOJI_ADD", vals[v], 1);
+            CHECK(oc_config_load(cerr, sizeof cerr) == 0);
+            const uint64_t who[] = { admin, alice };
+            for (int k = 0; k < 2; k++) {
+                j = oc_job_new(OC_JOB_ADD_EMOJI, 9);
+                j->user_id = who[k]; j->message_id = 3; j->ch_name = strdup("byrole");
+                oc_dbwriter_submit(w, j);
+                r = wait_result(w);
+                CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_UNKNOWN_ATTACHMENT);
+                oc_dbres_free(r);
+            }
+        }
+        unsetenv("OPENCHIME_CUSTOM_EMOJI_ADD");
+        CHECK(oc_config_load(cerr, sizeof cerr) == 0);
+    }
+
     /* Anyone can READ it — an emoji only half the workspace can see is unusable. */
     j = oc_job_new(OC_JOB_ATTACH_LOOKUP, 7);
     j->user_id = carol; j->attachment_id = 1;
@@ -6526,7 +6766,7 @@ static void test_notify_prefs(void) {
     j->user_id = alice; j->notify_level = 9;
     oc_dbwriter_submit(w, j);
     r = wait_result(w);
-    CHECK(r && r->type == OC_RES_NOTIFY_ERR);
+    CHECK(r && r->type == OC_RES_NOTIFY_ERR && r->err_code == OC_ERR_MALFORMED_FRAME);   /* a code the wire knows */
     oc_dbres_free(r);
 
     j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 11);
@@ -7155,7 +7395,7 @@ static uint64_t pool_mono_us(void) {
 /* The next result before a deadline on the monotonic clock, or NULL. */
 static oc_dbres *wait_result_ms(oc_dbwriter *w, int ms) {
     oc_dbres *r = NULL;
-    WAIT_UNTIL((r = oc_dbwriter_next_result(w)) != NULL, (uint64_t)ms);
+    WAIT_UNTIL((r = next_answer(w)) != NULL, (uint64_t)ms);
     return r;
 }
 
@@ -8469,6 +8709,40 @@ static void test_demo_mode(void) {
     oc_dbres_free(r);
     #undef DEMO_REDEEM
 
+    /* The one-field sign-up: a name, and an account made from it. A visitor may
+     * not take an owner's or an admin's name, whatever its case and spacing,
+     * and such a refusal leaves the invite unspent; at the workspace's limit
+     * there is no room. */
+    CHECK(reg(w, "dana", "pw", OC_ROLE_OWNER) != 0);
+    #define DEMO_MINT(jti) do { \
+        snprintf(pay, sizeof pay, "{\"iss\":\"%s\",\"aud\":\"%s\",\"iat\":%llu,\"exp\":%llu," \
+                 "\"jti\":\"%s\",\"role\":\"member\"}", ISS, AUD, now - 5, now + 895, jti); \
+        n = oc_issuer_mint(&is, hdr, pay, tok); } while (0)
+    #define DEMO_NAMED(cid, user, display, out) do { \
+        oc_job *j = oc_job_new(OC_JOB_REDEEM, cid); \
+        j->web = OC_WEB_SIGNUP; j->demo_invite = 1; \
+        snprintf(j->web_nonce, sizeof j->web_nonce, "%s", test_challenge()); \
+        oc_job_set_register(j, user, "an-unshown-random-secret", 0, TEST_PW_MEM); \
+        oc_job_set_display(j, display); \
+        oc_job_set_token(j, tok, n); \
+        oc_dbwriter_submit(w, j); \
+        out = wait_result(w); } while (0)
+    DEMO_MINT("d-2");
+    DEMO_NAMED(45, "dana-q7k2", "  DANA ", r);
+    CHECK(r && r->type == OC_RES_WEB_ERR && r->err_code == OC_ERR_GROUP_HANDLE_TAKEN);
+    oc_dbres_free(r);
+    DEMO_NAMED(46, "ada-q7k2", "Ada Lovelace", r);   /* the same invite: not spent */
+    CHECK(r && r->type == OC_RES_WEB_OK);
+    oc_dbres_free(r);
+    oc_dbwriter_set_max_users(w, 3);                  /* visitor, dana and Ada: full */
+    DEMO_MINT("d-3");
+    DEMO_NAMED(47, "grace-b4m2", "Grace", r);
+    CHECK(r && r->type == OC_RES_WEB_ERR && r->err_code == OC_ERR_USER_LIMIT);
+    oc_dbres_free(r);
+    oc_dbwriter_set_max_users(w, 0);
+    #undef DEMO_NAMED
+    #undef DEMO_MINT
+
     /* The seed: once, its channels and messages, by an author nobody signs in as. */
     CHECK(oc_dbwriter_seed_demo(w, "Demo") == 1);
     CHECK(oc_dbwriter_seed_demo(w, "Demo") == 0);
@@ -8478,6 +8752,13 @@ static void test_demo_mode(void) {
     CHECK(demo_count(db, "SELECT COUNT(*) FROM messages m JOIN users u ON u.id=m.author_id "
                           "WHERE u.subject='demo:openchime' AND u.disabled=1;") == 5);
     CHECK(demo_count(db, "SELECT COUNT(*) FROM users WHERE subject='local:visitor' AND role='member';") == 1);
+    CHECK(demo_count(db, "SELECT COUNT(*) FROM users WHERE subject='local:ada-q7k2' AND display_name='Ada Lovelace' "
+                          "AND role='member';") == 1);
+    CHECK(demo_count(db, "SELECT COUNT(*) FROM local_credentials c JOIN users u ON u.id=c.user_id "
+                          "WHERE u.subject='local:ada-q7k2';") == 1);
+    CHECK(demo_count(db, "SELECT COUNT(*) FROM audit_log WHERE action='user.demo_join' AND target='ada-q7k2' "
+                          "AND detail LIKE '%terms=accepted%';") == 1);
+    CHECK(demo_count(db, "SELECT COUNT(*) FROM users WHERE subject='local:grace-b4m2';") == 0);
     sqlite3_int64 visitor = 0;
     {
         sqlite3_stmt *st = NULL;
@@ -8780,6 +9061,758 @@ static void test_polls(void) {
     cleanup_db(path);
 }
 
+/* OPENCHIME_DEFAULT_CHANNELS (configuration, CONFIG.md): a new member joins the
+ * public, unarchived channels it names, whether their account came from local
+ * registration or an invitation; a name that is no such channel is skipped;
+ * an existing member is not moved. */
+static int is_in(const char *path, uint64_t cid, uint64_t uid) {
+    char sql[160];
+    snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM channel_members WHERE channel_id=?1 AND user_id=%llu;",
+             (unsigned long long)uid);
+    return e2e_scalar(path, sql, cid) == 1;
+}
+static void test_default_channels(void) {
+    const char *path = tdb("defchan.db");
+    cleanup_db(path);
+    char err[256];
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t owner = reg(w, "dc-owner", "pw", OC_ROLE_OWNER);
+    uint64_t early = reg(w, "dc-early", "pw", OC_ROLE_MEMBER);
+    oc_dbres *cr = create_channel(w, owner, "announcements", 1);
+    uint64_t ann = cr ? cr->channel_id : 0;
+    oc_dbres_free(cr);
+    cr = create_channel(w, owner, "old-news", 1);
+    uint64_t old = cr ? cr->channel_id : 0;
+    oc_dbres_free(cr);
+    cr = create_channel(w, owner, "secret", 0);
+    uint64_t sec = cr ? cr->channel_id : 0;
+    oc_dbres_free(cr);
+    CHECK(ann && old && sec);
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_busy_timeout(db, 5000);
+    char upd[128];
+    snprintf(upd, sizeof upd, "UPDATE channels SET archived_at_ms=1 WHERE id=%llu;", (unsigned long long)old);
+    CHECK(sqlite3_exec(db, upd, NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+
+    setenv("OPENCHIME_DEFAULT_CHANNELS", " #announcements, old-news,secret,nowhere ", 1);
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    uint64_t newbie = reg(w, "dc-newbie", "pw", OC_ROLE_MEMBER);
+    CHECK(newbie && is_in(path, ann, newbie));
+    CHECK(!is_in(path, old, newbie));      /* archived */
+    CHECK(!is_in(path, sec, newbie));      /* private */
+    CHECK(early && !is_in(path, ann, early));   /* an existing member is not moved */
+
+    oc_dbres *r = invite_user(w, owner, OC_ROLE_MEMBER);
+    CHECK(r && r->type == OC_RES_INVITE_OK);
+    uint8_t tok[OC_INVITE_TOKEN_LEN];
+    if (r) memcpy(tok, r->session_token, OC_INVITE_TOKEN_LEN);
+    oc_dbres_free(r);
+    r = redeem_invite(w, tok, "dc-invited", "dc-invited-pass");
+    uint64_t invited = (r && r->type == OC_RES_AUTH_OK) ? r->user_id : 0;
+    oc_dbres_free(r);
+    CHECK(invited && is_in(path, ann, invited));
+
+    /* A first sign-in through a provider: the third way an account is made. */
+    {
+        oc_issuer is;
+        CHECK(oc_issuer_init(&is, "oc-dbw-defchan") == 0);
+        const char *ISS = "https://auth.openchime.io", *AUD = "acme.example";
+        CHECK(oc_dbwriter_configure_oidc(w, ISS, AUD, is.pem, "authorize=https://auth.openchime.io/authorize") == 0);
+        char why[128];
+        CHECK(oc_dbwriter_configure_join_rules(w, "tenant:google:acme.example", why, sizeof why) == 0);
+        char HDR[160], payload[1024], token[4096];
+        oc_issuer_header(&is, HDR, sizeof HDR);
+        unsigned long long now = (unsigned long long)time(NULL);
+        oc_issuer_payload(payload, sizeof payload, ISS, AUD, "google|dc9", "jti-defchan", now - 5, now + 290,
+                          "\"email\":\"dc@acme.example\",\"name\":\"DC\","
+                          "\"idp\":\"google\",\"tenant\":\"acme.example\"");
+        size_t tlen = oc_issuer_mint(&is, HDR, payload, token);
+        oc_job *j = oc_job_new(OC_JOB_AUTH, 22);
+        j->method = OC_AUTH_OIDC;
+        oc_job_set_token(j, token, tlen);
+        oc_job_set_proof(j, OC_ISSUER_VERIFIER, strlen(OC_ISSUER_VERIFIER));
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        uint64_t viaidp = (r && r->type == OC_RES_AUTH_OK) ? r->user_id : 0;
+        oc_dbres_free(r);
+        CHECK(viaidp && is_in(path, ann, viaidp));
+        CHECK(!is_in(path, old, viaidp) && !is_in(path, sec, viaidp));
+        oc_issuer_free(&is);
+    }
+
+    unsetenv("OPENCHIME_DEFAULT_CHANNELS");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* The workspace's edit and delete windows (OPENCHIME_EDIT_WINDOW and
+ * OPENCHIME_DELETE_WINDOW, REQ-051/052): an author's own edit or delete is
+ * refused once the window has closed, always under `never`; a moderator's
+ * delete of someone else's never is; a shorter window applies to messages
+ * already sent. Age is backdated in the database, not waited for. */
+static void set_windows(const char *edit, const char *del) {
+    char err[256];
+    if (edit) setenv("OPENCHIME_EDIT_WINDOW", edit, 1); else unsetenv("OPENCHIME_EDIT_WINDOW");
+    if (del) setenv("OPENCHIME_DELETE_WINDOW", del, 1); else unsetenv("OPENCHIME_DELETE_WINDOW");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+}
+static void age_message(const char *path, uint64_t mid, int64_t ago_ms) {
+    sqlite3 *db = NULL;
+    char sql[160];
+    snprintf(sql, sizeof sql, "UPDATE messages SET created_at_ms=%lld WHERE id=%llu;",
+             (long long)((int64_t)time(NULL) * 1000 - ago_ms), (unsigned long long)mid);
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_busy_timeout(db, 5000);
+    CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+}
+static int err_of(oc_dbres *r) { int e = r ? (int)r->err_code : -1; oc_dbres_free(r); return e; }
+static void test_edit_windows(void) {
+    const char *path = tdb("windows.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t owner = reg(w, "ew-owner", "pw", OC_ROLE_OWNER);
+    uint64_t author = reg(w, "ew-author", "pw", OC_ROLE_MEMBER);
+    uint8_t idem[OC_IDEM_LEN];
+    uint64_t m[6];
+    for (int k = 0; k < 6; k++) {
+        memset(idem, 0x70 + k, sizeof idem);
+        m[k] = send_msg(w, k == 5 ? owner : author, idem, "words");
+        CHECK(m[k]);
+    }
+
+    /* Unset: always. */
+    set_windows(NULL, NULL);
+    age_message(path, m[0], 400LL * 86400000);
+    CHECK(err_of(do_edit(w, author, OC_DEFAULT_CHANNEL, m[0], "still mine")) == 0);
+
+    /* never: the author may not; a moderator still removes theirs; a
+     * moderator's own message is limited like anyone's. */
+    set_windows("never", "never");
+    CHECK(err_of(do_edit(w, author, OC_DEFAULT_CHANNEL, m[1], "x")) == OC_ERR_EDIT_WINDOW_CLOSED);
+    CHECK(err_of(do_delete(w, author, OC_DEFAULT_CHANNEL, m[1])) == OC_ERR_EDIT_WINDOW_CLOSED);
+    CHECK(err_of(do_delete(w, owner, OC_DEFAULT_CHANNEL, m[1])) == 0);
+    CHECK(err_of(do_delete(w, owner, OC_DEFAULT_CHANNEL, m[5])) == OC_ERR_EDIT_WINDOW_CLOSED);
+
+    /* A minute: inside it, then outside. */
+    set_windows("60", "60");
+    age_message(path, m[2], 30000);
+    CHECK(err_of(do_edit(w, author, OC_DEFAULT_CHANNEL, m[2], "fixed a typo")) == 0);
+    age_message(path, m[3], 120000);
+    CHECK(err_of(do_edit(w, author, OC_DEFAULT_CHANNEL, m[3], "too late")) == OC_ERR_EDIT_WINDOW_CLOSED);
+    CHECK(err_of(do_delete(w, author, OC_DEFAULT_CHANNEL, m[3])) == OC_ERR_EDIT_WINDOW_CLOSED);
+
+    /* Shortened to ten seconds: the thirty-second-old message that was inside
+     * the minute is outside now. */
+    set_windows("10", "10");
+    CHECK(err_of(do_edit(w, author, OC_DEFAULT_CHANNEL, m[2], "again")) == OC_ERR_EDIT_WINDOW_CLOSED);
+    age_message(path, m[4], 1000);
+    CHECK(err_of(do_delete(w, author, OC_DEFAULT_CHANNEL, m[4])) == 0);
+
+    set_windows(NULL, NULL);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* Who may notify a whole large channel (OPENCHIME_BROADCAST_MENTIONS and
+ * OPENCHIME_BROADCAST_LARGE, REQ-221): under each rule, a broadcast from a
+ * member, an admin and an owner, in a channel under and at the threshold,
+ * stores its row or stays text. */
+static void set_broadcast(const char *who, const char *large) {
+    char err[256];
+    if (who) setenv("OPENCHIME_BROADCAST_MENTIONS", who, 1); else unsetenv("OPENCHIME_BROADCAST_MENTIONS");
+    if (large) setenv("OPENCHIME_BROADCAST_LARGE", large, 1); else unsetenv("OPENCHIME_BROADCAST_LARGE");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+}
+static int channel_size(const char *path, uint64_t cid) {
+    sqlite3 *raw = NULL;
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_open(path, &raw) != SQLITE_OK) return -1;
+    sqlite3_prepare_v2(raw, "SELECT COUNT(*) FROM channel_members WHERE channel_id=?1;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)cid);
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_close(raw);
+    return n;
+}
+static void test_broadcast_rules(void) {
+    const char *path = tdb("broadcast.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t who[3];
+    who[0] = reg(w, "bc-member", "pw", OC_ROLE_MEMBER);
+    who[1] = reg(w, "bc-admin", "pw", OC_ROLE_ADMIN);
+    who[2] = reg(w, "bc-owner", "pw", OC_ROLE_OWNER);
+    int size = channel_size(path, OC_DEFAULT_CHANNEL);
+    CHECK(size >= 3);
+    char at[16], above[16];
+    snprintf(at, sizeof at, "%d", size);
+    snprintf(above, sizeof above, "%d", size + 1);
+
+    static const char *const bodies[] = { "@channel standup", "@everyone lunch", "@here anyone?" };
+    static const int kinds[] = { OC_MENTION_CHANNEL, OC_MENTION_EVERYONE, OC_MENTION_HERE };
+    struct { const char *rule, *large; int stored[3]; } cases[] = {
+        { NULL,       NULL,  { 1, 1, 1 } },   /* unset: everyone, every channel */
+        { "everyone", "0",   { 1, 1, 1 } },
+        { "admins",   "0",   { 0, 1, 1 } },
+        { "admins",   at,    { 0, 1, 1 } },   /* at the threshold is large */
+        { "admins",   above, { 1, 1, 1 } },   /* under it, anyone */
+        { "nobody",   "0",   { 0, 0, 0 } },
+        { "nobody",   above, { 1, 1, 1 } },
+    };
+    uint8_t idem[OC_IDEM_LEN];
+    int seq = 0;
+    for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+        set_broadcast(cases[c].rule, cases[c].large);
+        for (int u = 0; u < 3; u++) {
+            memset(idem, 0, sizeof idem);
+            idem[0] = 0xBC; idem[1] = (uint8_t)++seq;
+            uint64_t mid = send_msg(w, who[u], idem, bodies[seq % 3]);
+            CHECK(mid != 0);
+            CHECK(mention_rows(path, mid, 0, kinds[seq % 3]) == cases[c].stored[u]);
+        }
+    }
+    /* A personal mention is not a broadcast: under `nobody` it still notifies. */
+    set_broadcast("nobody", "0");
+    memset(idem, 0xBD, sizeof idem);
+    uint64_t mid = send_msg(w, who[0], idem, "@bc-admin and @channel");
+    CHECK(mention_rows(path, mid, who[1], OC_MENTION_USER) == 1);
+    CHECK(mention_rows(path, mid, 0, OC_MENTION_CHANNEL) == 0);
+
+    set_broadcast(NULL, NULL);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* Whether a send stored a broadcast mention row is told to every client with
+ * the message (`broadcast_stored`, REQ-221), read from the rows: on the live
+ * result a BROADCAST is built from, on a reply's, and on the rows history,
+ * backfill and a thread's replay are built from -- and still so after the rule
+ * changes, since history says what the send did. An edit stores no mentions,
+ * so it changes nothing here: a stored broadcast an edit took out of the body
+ * still reads 1 (a later edit may put it back, and the row is still there), a
+ * held one 0, and one an edit added to a message that had none 0. */
+static oc_dbres *send_r(oc_dbwriter *w, uint64_t uid, uint8_t tag, const char *body) {
+    oc_job *j = oc_job_new(OC_JOB_SEND, 1);
+    j->user_id = uid; j->channel_id = OC_DEFAULT_CHANNEL;
+    memset(j->idem, 0, OC_IDEM_LEN); j->idem[0] = 0xBE; j->idem[1] = tag;
+    oc_job_set_body(j, body, strlen(body));
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static int replay_stored(const oc_dbres *r, uint64_t mid) {
+    for (size_t i = 0; r && i < r->n_replay; i++)
+        if (r->replay[i].message_id == mid) return r->replay[i].broadcast_stored;
+    return -1;
+}
+static int edited_ok(oc_dbwriter *w, uint64_t uid, uint64_t mid, const char *body) {
+    oc_dbres *r = do_edit(w, uid, OC_DEFAULT_CHANNEL, mid, body);
+    int ok = r && r->type == OC_RES_EDIT_OK;
+    oc_dbres_free(r);
+    return ok;
+}
+static void test_broadcast_stored(void) {
+    const char *path = tdb("broadcast_stored.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t member = reg(w, "bh-member", "pw", OC_ROLE_MEMBER);
+    uint64_t admin = reg(w, "bh-admin", "pw", OC_ROLE_ADMIN);
+    int size = channel_size(path, OC_DEFAULT_CHANNEL);
+    CHECK(size >= 2);
+    char at[16];
+    snprintf(at, sizeof at, "%d", size);
+    set_broadcast("admins", at);   /* the channel is large: a member's is held */
+
+    oc_dbres *r = send_r(w, member, 1, "@channel standup");
+    CHECK(r && r->type == OC_RES_SEND_OK && r->broadcast_stored == 0);
+    uint64_t held = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    CHECK(mention_rows(path, held, 0, OC_MENTION_CHANNEL) == 0);
+    r = send_r(w, admin, 2, "@everyone lunch");
+    CHECK(r && r->type == OC_RES_SEND_OK && r->broadcast_stored == 1);
+    uint64_t reached = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    CHECK(mention_rows(path, reached, 0, OC_MENTION_EVERYONE) == 1);
+    r = send_r(w, member, 3, "no broadcast, @bh-admin");
+    CHECK(r && r->type == OC_RES_SEND_OK && r->broadcast_stored == 0);
+    uint64_t plain = r ? r->message_id : 0;
+    oc_dbres_free(r);
+
+    /* A thread reply, live and replayed. */
+    r = send_reply(w, member, OC_DEFAULT_CHANNEL, reached, "@here thoughts?");
+    CHECK(r && r->type == OC_RES_REPLY_OK && r->broadcast_stored == 0);
+    uint64_t rheld = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    r = send_reply(w, admin, OC_DEFAULT_CHANNEL, reached, "@here yes");
+    CHECK(r && r->type == OC_RES_REPLY_OK && r->broadcast_stored == 1);
+    uint64_t rreached = r ? r->message_id : 0;
+    oc_dbres_free(r);
+
+    /* Edits take the broadcasts out of the stored ones and put one into the
+     * plain message; none of it touches the rows. */
+    CHECK(edited_ok(w, admin, reached, "lunch moved to one"));
+    CHECK(edited_ok(w, admin, rreached, "yes, after all"));
+    CHECK(edited_ok(w, member, held, "standup moved"));
+    CHECK(edited_ok(w, member, plain, "now @channel too"));
+    CHECK(mention_rows(path, reached, 0, OC_MENTION_EVERYONE) == 1);
+    CHECK(mention_rows(path, plain, 0, OC_MENTION_CHANNEL) == 0);
+
+    /* Under a rule that would now let both through, the replays still say
+     * what was stored. */
+    set_broadcast(NULL, NULL);
+    r = history(w, member, OC_DEFAULT_CHANNEL, plain + 100, 50);
+    CHECK(r && replay_stored(r, held) == 0 && replay_stored(r, reached) == 1 && replay_stored(r, plain) == 0);
+    oc_dbres_free(r);
+    r = backfill(w, member, OC_DEFAULT_CHANNEL, 0);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK);
+    CHECK(replay_stored(r, held) == 0 && replay_stored(r, reached) == 1 && replay_stored(r, plain) == 0);
+    oc_dbres_free(r);
+    r = list_thread_r(w, member, OC_DEFAULT_CHANNEL, reached);
+    int seen = 0;
+    for (size_t i = 0; r && i < r->n_thread; i++) {
+        if (r->thread[i].message_id == rheld)    { CHECK(r->thread[i].broadcast_stored == 0); seen++; }
+        if (r->thread[i].message_id == rreached) { CHECK(r->thread[i].broadcast_stored == 1); seen++; }
+    }
+    CHECK(seen == 2);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* OPENCHIME_WELCOME_MESSAGE: each new member, however their account was made,
+ * is sent the text as it is when they join, once, in a DM from the workspace's
+ * own sender; an existing member is not; empty sends nothing. The sender is
+ * nobody's to sign in as, mention, DM, change or reply to, and USER_LIST
+ * marks it. */
+static char *welcome_of(const char *path, uint64_t uid) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    char *out = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK) return NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT m.body FROM messages m JOIN users s ON s.id = m.author_id AND s.is_system = 1 "
+        "JOIN channels c ON c.id = m.channel_id AND c.kind = 'dm' "
+        "JOIN channel_members cm ON cm.channel_id = m.channel_id AND cm.user_id = ?1 ORDER BY m.id;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        out = strndup((const char *)sqlite3_column_blob(st, 0), (size_t)sqlite3_column_bytes(st, 0));
+        if (sqlite3_step(st) == SQLITE_ROW) { free(out); out = strdup("(twice)"); }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return out;
+}
+static int welcome_is(const char *path, uint64_t uid, const char *want) {
+    char *got = welcome_of(path, uid);
+    int ok = want ? got && !strcmp(got, want) : got == NULL;
+    free(got);
+    return ok;
+}
+static void set_welcome(const char *v) {
+    char err[256];
+    if (v) setenv("OPENCHIME_WELCOME_MESSAGE", v, 1); else unsetenv("OPENCHIME_WELCOME_MESSAGE");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+}
+static void test_welcome_message(void) {
+    const char *path = tdb("welcome.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    set_welcome(NULL);
+    uint64_t owner = reg(w, "wm-owner", "pw", OC_ROLE_OWNER);
+    CHECK(owner && welcome_is(path, owner, NULL));
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM users WHERE is_system=?1", 1) == 0);   /* not made until needed */
+
+    /* Local registration: the text, with \n as a line break. The sender is
+     * made by this first welcome, and everyone connected told its row. */
+    set_welcome("Hello **there**.\\nStart in #general.");
+    g_roster_rows = 0;
+    uint64_t a = reg(w, "wm-a", "pw", OC_ROLE_MEMBER);
+    oc_dbres_free(list_users(w, owner));            /* a round trip: what reg left queued is read */
+    CHECK(a && welcome_is(path, a, "Hello **there**.\nStart in #general."));
+    CHECK(welcome_is(path, owner, NULL));                   /* an existing member is not sent it */
+    CHECK(g_roster_rows == 1);
+
+    /* An invitation redeemed after the text changed: the text at joining. */
+    oc_dbres *r = invite_user(w, owner, OC_ROLE_MEMBER);
+    CHECK(r && r->type == OC_RES_INVITE_OK);
+    uint8_t tok[OC_INVITE_TOKEN_LEN];
+    if (r) memcpy(tok, r->session_token, OC_INVITE_TOKEN_LEN);
+    oc_dbres_free(r);
+    set_welcome("Welcome, again.");
+    r = redeem_invite(w, tok, "wm-invited", "wm-invited-pass");
+    uint64_t b = (r && r->type == OC_RES_AUTH_OK) ? r->user_id : 0;
+    oc_dbres_free(r);
+    CHECK(b && welcome_is(path, b, "Welcome, again."));
+    CHECK(welcome_is(path, a, "Hello **there**.\nStart in #general."));   /* once, not again */
+
+    /* A first sign-in through a provider. */
+    {
+        oc_issuer is;
+        CHECK(oc_issuer_init(&is, "oc-dbw-welcome") == 0);
+        const char *ISS = "https://auth.openchime.io", *AUD = "acme.example";
+        CHECK(oc_dbwriter_configure_oidc(w, ISS, AUD, is.pem, "authorize=https://auth.openchime.io/authorize") == 0);
+        char why[128];
+        CHECK(oc_dbwriter_configure_join_rules(w, "tenant:google:acme.example", why, sizeof why) == 0);
+        char HDR[160], payload[1024], token[4096];
+        oc_issuer_header(&is, HDR, sizeof HDR);
+        unsigned long long now = (unsigned long long)time(NULL);
+        oc_issuer_payload(payload, sizeof payload, ISS, AUD, "google|wm7", "jti-welcome", now - 5, now + 290,
+                          "\"email\":\"wm@acme.example\",\"name\":\"WM\","
+                          "\"idp\":\"google\",\"tenant\":\"acme.example\"");
+        size_t tlen = oc_issuer_mint(&is, HDR, payload, token);
+        oc_job *j = oc_job_new(OC_JOB_AUTH, 21);
+        j->method = OC_AUTH_OIDC;
+        oc_job_set_token(j, token, tlen);
+        oc_job_set_proof(j, OC_ISSUER_VERIFIER, strlen(OC_ISSUER_VERIFIER));
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        uint64_t c = (r && r->type == OC_RES_AUTH_OK) ? r->user_id : 0;
+        oc_dbres_free(r);
+        CHECK(c && welcome_is(path, c, "Welcome, again."));
+        oc_issuer_free(&is);
+    }
+
+    CHECK(g_roster_rows == 1);                               /* told once, not per welcome */
+    /* Empty: nothing. */
+    set_welcome("");
+    uint64_t d = reg(w, "wm-d", "pw", OC_ROLE_MEMBER);
+    CHECK(d && welcome_is(path, d, NULL));
+
+    /* The sender: one row, marked on USER_LIST, nobody's to act on. */
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM users WHERE is_system=?1", 1) == 1);
+    uint64_t sys = (uint64_t)e2e_scalar(path, "SELECT id FROM users WHERE is_system=?1", 1);
+    r = list_users(w, owner);
+    int marked = 0, people = 0;
+    for (size_t i = 0; r && i < r->n_ulist; i++) {
+        if (r->ulist[i].user_id == sys) marked = r->ulist[i].flags == OC_USER_SYSTEM;
+        else people += r->ulist[i].flags == 0;
+    }
+    CHECK(marked && people == (int)r->n_ulist - 1);
+    oc_dbres_free(r);
+    uint16_t code = 0;
+    char *t = page_signin(w, 30, "Workspace", "x", NULL, &code);
+    CHECK(t == NULL && code != 0);
+    free(t);
+    /* Nothing to sign in with: no password, no provider identity, and no
+     * local account name -- its subject is not a `local:` one, so no sign-in
+     * page can name it. */
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM local_credentials WHERE user_id=?1", sys) == 0);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM user_identities WHERE user_id=?1", sys) == 0);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM users WHERE id=?1 AND subject LIKE 'local:%'", sys) == 0);
+    r = open_dm(w, a, sys);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    CHECK(set_role(w, owner, sys, OC_ROLE_ADMIN) == OC_ERR_FORBIDDEN);
+    CHECK(remove_user(w, owner, sys) == OC_ERR_FORBIDDEN);
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0x57, sizeof idem);
+    uint64_t mid = send_msg(w, owner, idem, "thanks @Workspace");
+    CHECK(mid && mention_rows(path, mid, sys, -1) == 0);
+    uint64_t wdm = (uint64_t)e2e_scalar(path,
+        "SELECT m.channel_id FROM messages m JOIN users s ON s.id=m.author_id AND s.is_system=1 "
+        "JOIN channel_members cm ON cm.channel_id=m.channel_id WHERE cm.user_id=?1", a);
+    CHECK(wdm && send_to(w, a, wdm, "thanks!") == OC_ERR_WORKSPACE_SENDER);
+
+    set_welcome(NULL);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* The workspace's notices (OPENCHIME_NOTICE_*): posted where configured, by
+ * the workspace's own sender; nothing when off; never a mention row and never
+ * unread; and a person told directly when added to a channel or a group, or
+ * given a role. */
+static char *last_notice(const char *path, uint64_t cid, int *count) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    char *out = NULL;
+    *count = 0;
+    if (sqlite3_open(path, &db) != SQLITE_OK) return NULL;
+    sqlite3_prepare_v2(db, "SELECT m.body FROM messages m JOIN users s ON s.id=m.author_id AND s.is_system=1 "
+                           "WHERE m.channel_id=?1 ORDER BY m.id;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)cid);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        free(out);
+        out = strndup((const char *)sqlite3_column_blob(st, 0), (size_t)sqlite3_column_bytes(st, 0));
+        (*count)++;
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return out;
+}
+static int notice_is(const char *path, uint64_t cid, int want_count, const char *want) {
+    int n = 0;
+    char *got = last_notice(path, cid, &n);
+    int ok = n == want_count && (!want || (got && !strcmp(got, want)));
+    if (!ok) printf("  notice in %llu: %d, \"%s\"\n", (unsigned long long)cid, n, got ? got : "");
+    free(got);
+    return ok;
+}
+static uint64_t notice_dm_of(const char *path, uint64_t uid) {
+    return (uint64_t)e2e_scalar(path,
+        "SELECT COALESCE(MAX(c.id),0) FROM channels c JOIN channel_members cm ON cm.channel_id=c.id AND cm.user_id=?1 "
+        "JOIN channel_members sm ON sm.channel_id=c.id JOIN users s ON s.id=sm.user_id AND s.is_system=1 "
+        "WHERE c.kind='dm'", uid);
+}
+static void set_notices(const char *joined, const char *created, const char *changes) {
+    char err[256];
+    if (joined) setenv("OPENCHIME_NOTICE_MEMBER_JOINED", joined, 1); else unsetenv("OPENCHIME_NOTICE_MEMBER_JOINED");
+    if (created) setenv("OPENCHIME_NOTICE_CHANNEL_CREATED", created, 1); else unsetenv("OPENCHIME_NOTICE_CHANNEL_CREATED");
+    if (changes) setenv("OPENCHIME_NOTICE_CHANNEL_CHANGES", changes, 1); else unsetenv("OPENCHIME_NOTICE_CHANNEL_CHANGES");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+}
+static void test_notices(void) {
+    const char *path = tdb("notices.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    set_notices(NULL, NULL, NULL);
+    uint64_t owner = reg(w, "nt-owner", "pw", OC_ROLE_OWNER);
+    uint64_t alice = reg(w, "nt-alice", "pw", OC_ROLE_MEMBER);
+    CHECK(owner && alice);
+    oc_dbres *r = create_channel(w, owner, "lobby", 1);
+    uint64_t lobby = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(lobby && notice_is(path, lobby, 0, NULL) && notice_is(path, OC_DEFAULT_CHANNEL, 0, NULL));   /* off */
+
+    set_notices("general", "#lobby", "on");
+    uint64_t newbie = reg(w, "nt-new", "pw", OC_ROLE_MEMBER);
+    CHECK(newbie && notice_is(path, OC_DEFAULT_CHANNEL, 1, "@nt-new joined the workspace."));
+    uint64_t jmid = (uint64_t)e2e_scalar(path, "SELECT MAX(id) FROM messages WHERE channel_id=?1", OC_DEFAULT_CHANNEL);
+    CHECK(mention_rows(path, jmid, 0, -1) == 0);           /* names a person, mentions nobody */
+
+    r = create_channel(w, alice, "plans", 1);
+    uint64_t plans = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(plans && notice_is(path, lobby, 1, "@nt-alice created #plans."));
+    oc_dbres_free(create_channel(w, alice, "hush", 0));
+    CHECK(notice_is(path, lobby, 1, NULL));                  /* a private channel is not announced */
+
+    oc_dbres_free(chan_member(w, OC_JOB_INVITE_CHANNEL, alice, plans, owner));
+    oc_dbres_free(chan_update(w, owner, plans, OC_CHUP_RENAME, "roadmap"));
+    CHECK(notice_is(path, plans, 1, "@nt-owner renamed this channel to #roadmap."));
+    oc_dbres_free(chan_update(w, alice, plans, OC_CHUP_DESCRIPTION, "What we will build."));
+    CHECK(notice_is(path, plans, 2, "@nt-alice changed this channel's description."));
+    oc_dbres_free(chan_update(w, owner, plans, OC_CHUP_PRIVATE, ""));
+    CHECK(notice_is(path, plans, 3, "@nt-owner made this channel private."));
+    oc_dbres_free(chan_update(w, owner, plans, OC_CHUP_ARCHIVE, ""));
+    CHECK(notice_is(path, plans, 4, "@nt-owner archived this channel."));
+    oc_dbres_free(chan_update(w, alice, OC_DEFAULT_CHANNEL, OC_CHUP_TOPIC, "Hello"));
+    CHECK(notice_is(path, OC_DEFAULT_CHANNEL, 1, NULL));    /* a topic is not one of them */
+
+    /* Off again: nothing more. A channel that is none: nothing. */
+    set_notices("nowhere", "", "off");
+    oc_dbres_free(chan_update(w, owner, plans, OC_CHUP_UNARCHIVE, ""));
+    CHECK(notice_is(path, plans, 4, NULL));
+    uint64_t later = reg(w, "nt-later", "pw", OC_ROLE_MEMBER);
+    CHECK(later && notice_is(path, OC_DEFAULT_CHANNEL, 1, NULL));
+    oc_dbres_free(create_channel(w, alice, "more", 1));
+    CHECK(notice_is(path, lobby, 1, NULL));
+
+    /* Told directly, always. */
+    CHECK(notice_dm_of(path, newbie) == 0);
+    oc_dbres_free(chan_member(w, OC_JOB_INVITE_CHANNEL, owner, lobby, newbie));
+    uint64_t dm = notice_dm_of(path, newbie);
+    CHECK(dm && notice_is(path, dm, 1, "@nt-owner added you to #lobby."));
+    uint64_t gid = grp_create(w, owner, "crew");
+    CHECK(gid);
+    oc_dbres_free(grp_members(w, owner, gid, 1, &newbie, 1));
+    CHECK(notice_is(path, dm, 2, "@nt-owner added you to the group @crew."));
+    CHECK(set_role(w, owner, newbie, OC_ROLE_ADMIN) == 0);
+    CHECK(notice_is(path, dm, 3, "@nt-owner made you an admin."));
+    /* Added to a channel through a group of theirs: told as well. */
+    r = create_channel(w, owner, "crewroom", 0);
+    uint64_t crewroom = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(crewroom && !is_in(path, crewroom, newbie));
+    oc_dbres_free(chan_group(w, owner, crewroom, gid, 1));
+    CHECK(is_in(path, crewroom, newbie));
+    CHECK(notice_is(path, dm, 4, "@nt-owner added you to #crewroom, through the group @crew."));
+
+    /* None of it is anyone's unread: #general holds only notices. */
+    r = list_channels(w, alice);
+    int seen = 0;
+    for (size_t i = 0; r && i < r->n_chlist; i++)
+        if (r->chlist[i].channel_id == OC_DEFAULT_CHANNEL) { seen = 1; CHECK(r->chlist[i].unread == 0); }
+    CHECK(seen);
+    oc_dbres_free(r);
+
+    set_notices(NULL, NULL, NULL);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* The workspace's default quiet hours (OPENCHIME_DEFAULT_QUIET_HOURS,
+ * REQ-136): a member who never set their own follows it, marked; their own,
+ * once set, wins; "use the default" returns them to it. */
+static oc_dbres *schedule_job(oc_dbwriter *w, uint64_t uid, uint8_t mode, uint16_t start, uint16_t end) {
+    oc_job *j = oc_job_new(OC_JOB_SET_SCHEDULE, 66);
+    j->user_id = uid; j->sched_mode = mode;
+    j->sched_start_min = start; j->sched_end_min = end;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static oc_dbres *schedule_now(oc_dbwriter *w, uint64_t uid) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 67);
+    j->user_id = uid;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static void test_default_quiet_hours(void) {
+    const char *path = tdb("quietdef.db");
+    cleanup_db(path);
+    char err[256];
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "qd-a", "pw", OC_ROLE_MEMBER);
+    CHECK(a);
+
+    /* No default: the stored schedule, unmarked. */
+    oc_dbres *r = schedule_now(w, a);
+    CHECK(r && r->sc_mode == OC_DND_OFF);
+    oc_dbres_free(r);
+
+    setenv("OPENCHIME_DEFAULT_QUIET_HOURS", "weekdays 09:00-18:00", 1);
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    r = schedule_now(w, a);
+    CHECK(r && r->sc_mode == (OC_DND_WEEKDAYS | OC_DND_FROM_DEFAULT) && r->sc_start_min == 540 && r->sc_end_min == 1080);
+    oc_dbres_free(r);
+
+    /* Their own wins -- "any time" chosen on purpose too. */
+    r = schedule_job(w, a, OC_DND_EVERY_DAY, 480, 1320);
+    CHECK(r && r->sc_mode == OC_DND_EVERY_DAY && r->sc_start_min == 480);
+    oc_dbres_free(r);
+    r = schedule_job(w, a, OC_DND_OFF, 0, 0);
+    CHECK(r && r->sc_mode == OC_DND_OFF);
+    oc_dbres_free(r);
+
+    /* Back to the default. */
+    r = schedule_job(w, a, OC_DND_FROM_DEFAULT, 0, 0);
+    CHECK(r && r->sc_mode == (OC_DND_WEEKDAYS | OC_DND_FROM_DEFAULT) && r->sc_start_min == 540);
+    oc_dbres_free(r);
+
+    unsetenv("OPENCHIME_DEFAULT_QUIET_HOURS");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* Read receipts (OPENCHIME_READ_RECEIPTS, REQ-090): with the workspace's off,
+ * no read position goes anywhere; a member who stops sharing keeps theirs and
+ * still sees the others'; and turned back on, nothing read meanwhile shows. */
+static oc_dbres *ack_result(oc_dbwriter *w, uint64_t uid, uint64_t mid) {
+    oc_job *j = oc_job_new(OC_JOB_CLIENT_ACK, 1);
+    j->user_id = uid; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = mid;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static int rcur_has(const oc_dbres *r, uint64_t uid) {
+    for (size_t i = 0; r && i < r->n_rcur; i++) if (r->rcur[i].user_id == uid) return 1;
+    return 0;
+}
+static void receipts_job(oc_dbwriter *w, uint64_t uid, uint8_t op, int want) {
+    oc_job *j = oc_job_new(OC_JOB_READ_RECEIPTS, 2);
+    j->user_id = uid; j->receipts_op = op;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_READ_RECEIPTS && r->rc_share == want && r->rc_asked == (op == OC_RECEIPTS_ASK));
+    oc_dbres_free(r);
+}
+/* The wall clock in ms, as the writer stamps reads and "shared since". */
+static uint64_t wall_ms_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+/* A read counts only once recorded after sharing began, to the millisecond:
+ * the clock moves on before the read that should show. */
+static void next_ms(void) {
+    uint64_t t0 = wall_ms_now();
+    CHECK(WAIT_UNTIL(wall_ms_now() > t0, 1000));
+}
+static void test_read_receipts(void) {
+    const char *path = tdb("receipts.db");
+    cleanup_db(path);
+    char err[256];
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "rr-a", "pw", OC_ROLE_MEMBER), b = reg(w, "rr-b", "pw", OC_ROLE_MEMBER);
+    uint8_t idem[OC_IDEM_LEN];
+    uint64_t m[6];
+    for (int k = 0; k < 6; k++) { memset(idem, 0x90 + k, sizeof idem); m[k] = send_msg(w, a, idem, "x"); }
+
+    /* On: b's read is shared, and a sees it. */
+    receipts_job(w, b, OC_RECEIPTS_ASK, 1);
+    oc_dbres *r = ack_result(w, b, m[0]);
+    CHECK(r && r->type == OC_RES_READ_CURSOR && r->rc_share == 1);
+    oc_dbres_free(r);
+    r = ack_result(w, a, m[0]);
+    CHECK(r && rcur_has(r, b));
+    oc_dbres_free(r);
+
+    /* b stops: not shared, and b still sees a's. */
+    receipts_job(w, b, 0, 0);
+    r = ack_result(w, b, m[1]);
+    CHECK(r && r->rc_share == 0 && rcur_has(r, a));
+    oc_dbres_free(r);
+    r = ack_result(w, a, m[1]);
+    CHECK(r && !rcur_has(r, b));
+    oc_dbres_free(r);
+
+    /* b shares again: the read from before does not show; the next one does. */
+    receipts_job(w, b, 1, 1);
+    r = ack_result(w, a, m[2]);
+    CHECK(r && !rcur_has(r, b));
+    oc_dbres_free(r);
+    next_ms();
+    r = ack_result(w, b, m[2]);
+    CHECK(r && r->rc_share == 1);
+    oc_dbres_free(r);
+    r = ack_result(w, a, m[3]);
+    CHECK(r && rcur_has(r, b));
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+
+    /* The workspace's off: nobody's goes anywhere. */
+    setenv("OPENCHIME_READ_RECEIPTS", "off", 1);
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    w = start_db(path);
+    CHECK(w != NULL);
+    r = ack_result(w, b, m[4]);
+    CHECK(r && r->rc_share == 0 && r->n_rcur == 0);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+
+    /* On again: b's read from while it was off is not shown; a new one is. */
+    unsetenv("OPENCHIME_READ_RECEIPTS");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    w = start_db(path);
+    CHECK(w != NULL);
+    r = ack_result(w, a, m[4]);
+    CHECK(r && !rcur_has(r, b));
+    oc_dbres_free(r);
+    next_ms();
+    r = ack_result(w, b, m[5]);
+    CHECK(r && r->rc_share == 1);
+    oc_dbres_free(r);
+    r = ack_result(w, a, m[5]);
+    CHECK(r && rcur_has(r, b));
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
@@ -8830,6 +9863,15 @@ int run_dbwriter_tests(void) {
     test_badge_matches_evaluator();
     test_search();
     test_search_filters_and_paging();
+    test_edit_windows();
+    test_broadcast_rules();
+    test_broadcast_stored();
+    test_notices();
+    test_welcome_message();
+    test_default_quiet_hours();
+    test_read_receipts();
+    test_default_channels();
+    test_search_orders();
     test_setup_invite();
     test_remove_user_integrations();
     test_remove_keeps_history();

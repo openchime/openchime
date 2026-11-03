@@ -171,9 +171,10 @@ void oc_client_close_thread(oc_client *c);
 /* Run a full-text search (results stream into the model's search buffer) / close
  * the search view. */
 void oc_client_open_search(oc_client *c);
-void oc_client_search(oc_client *c, const char *query);
-/* Next page of the current search: `before_id` is the oldest id shown. */
-void oc_client_search_more(oc_client *c, uint64_t before_id);
+/* `sort` is OC_SEARCH_NEWEST, _OLDEST or _RELEVANCE (protocol.h). */
+void oc_client_search(oc_client *c, const char *query, uint8_t sort);
+/* Next page of the current search, in its order, from the last hit shown. */
+void oc_client_search_more(oc_client *c);
 void oc_client_close_search(oc_client *c);
 
 /* Channel management: create a public channel, join / leave one. The server
@@ -323,6 +324,9 @@ void oc_client_set_keywords(oc_client *c, const char terms[][OC_KEYWORD_MAX], ui
 void oc_client_set_priority(oc_client *c, const uint64_t *people, uint8_t n);
 /* REQ-278: pause notifications for `minutes` from now; 0 ends the pause. */
 void oc_client_set_snooze(oc_client *c, uint32_t minutes);
+/* Share my read receipts, or stop (REQ-090). Mine only: I still see the
+ * others' who share. */
+void oc_client_set_read_receipts(oc_client *c, int share);
 /* REQ-062: threads I am in, and the two acts the view offers. */
 void oc_client_list_threads(oc_client *c, uint8_t filter);
 void oc_client_thread_follow(oc_client *c, uint64_t channel_id, uint64_t root_id, uint8_t on);
