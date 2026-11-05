@@ -1267,7 +1267,7 @@ reported (an older daemon)" from a daemon that predates the frame. A build is
 the short commit it was compiled from (`shared/build_id.h`, UPGRADING.md); a
 release number is a label on a build and is not in either binary, so the build
 is what is shown. **Copy** puts the whole as one line on the clipboard --
-`OpenChime client 74359c0 (win32), server 74359c0, protocol 27` -- for pasting
+`OpenChime client <build> (win32), server <build>, protocol <n>` -- for pasting
 into a report; the harness's `about` verb opens the dialog and answers that
 line, which `make test-merge` checks (TESTING.md §3.4).
 
