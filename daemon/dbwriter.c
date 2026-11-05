@@ -2907,10 +2907,12 @@ static oc_dbres *process_invite_user(oc_dbwriter *w, const oc_job *j) {
     if (uses != 1 && want != OC_ROLE_MEMBER) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
-    /* Only a provider's verified sign-in spends an address-bound invite. Where no
-     * such source is on, nothing could ever redeem it, and minting it anyway would
-     * hand the inviter a row that sits there until it expires. */
-    if (email && !(w->auth_methods & OC_AUTH_OIDC)) {
+    /* Only a provider's verified sign-in spends an address-bound invite: the
+     * relay's, or a direct connection's, which goes through the same admission
+     * and spends it the same way. Where neither is on, nothing could ever redeem
+     * it, and minting it anyway would hand the inviter a row that sits there
+     * until it expires. */
+    if (email && !(w->auth_methods & OC_AUTH_OIDC) && w->n_direct_iss == 0) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INVITE_UNREDEEMABLE; return r;
     }
     uint8_t token[OC_INVITE_TOKEN_LEN], hash[OC_SHA256_LEN]; uint64_t expiry = 0;

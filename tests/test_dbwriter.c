@@ -7310,6 +7310,44 @@ static void test_invite_by_address(void) {
     sqlite3_finalize(st);
     sqlite3_close(db);
     cleanup_db(path);
+
+    /* A direct connection alone, no relay: its verified sign-in spends an
+     * address-bound invite as the relay's does, so the invite is made, and the
+     * invited address joins with the invite's role and spends it. */
+    w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    owner = reg(w, "ia-owner", "pw", OC_ROLE_OWNER);
+    CHECK(owner != 0);
+    const char *ISS[1] = { "https://sso.partner.example" };
+    oc_dbwriter_set_direct_issuers(w, ISS, 1);
+    {
+        oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 99);
+        j->user_id = owner; j->role = OC_ROLE_ADMIN; j->uses = 1;
+        oc_job_set_email(j, "kai@partner.example", strlen("kai@partner.example"));
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+    }
+    CHECK(r && r->type == OC_RES_INVITE_OK);
+    oc_dbres_free(r);
+    int err = 0;
+    uint64_t kai = direct_signin(w, 5, ISS[0], "kai", "kai@partner.example", 1, &err);
+    CHECK(kai != 0);
+    oc_dbwriter_stop(w);
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    st = NULL;
+    CHECK(sqlite3_prepare_v2(db, "SELECT role FROM users WHERE id=?1;", -1, &st, NULL) == SQLITE_OK);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)kai);
+    CHECK(st && sqlite3_step(st) == SQLITE_ROW &&
+          strcmp((const char *)sqlite3_column_text(st, 0), "admin") == 0);
+    sqlite3_finalize(st);
+    st = NULL;
+    CHECK(sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM invites WHERE email='kai@partner.example' "
+                                 "AND consumed_at_ms IS NOT NULL;", -1, &st, NULL) == SQLITE_OK);
+    CHECK(st && sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 1);
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    cleanup_db(path);
 }
 
 /* #general's welcome on a managed workspace: topic and description, written the

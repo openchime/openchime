@@ -1005,7 +1005,8 @@ address — one `@`, a local part of at most 64 bytes with no spaces, controls o
 list separators, a domain of two or more dot-separated labels, 254 bytes in all
 (`oc_email_plausible`, which clients share) — or the invite is refused with
 `FORBIDDEN`. An invite bound to an address needs a
-source that could spend it: where the deployment offers no provider sign-in, it is
+source that could spend it, a provider sign-in through the relay or a direct
+connection: where the deployment offers neither, it is
 refused with the non-fatal `ERROR INVITE_UNREDEEMABLE` (3031), whose message says
 to invite with a token instead. A client reads which kinds are possible from
 `AUTH_CHALLENGE`: a `local` source redeems a token, a browser source an address.
@@ -3191,7 +3192,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3028` | `CALL_FULL`           | calls      | no    | A join, a start's invitations or a `CALL_INVITE` would put the call past the cap (§5.17, REQ-305). |
 | `3029` | `NOT_CALL_STARTER`    | calls      | no    | `CALL_END` from someone other than the call's starter (§5.17). |
 | `3030` | `NOT_IN_CALL`         | calls      | no    | No call in that conversation, or the sender is not in it (`CALL_INVITE`, `CALL_END`, `CALL_KEY`, `CALL_SHARE`). |
-| `3031` | `INVITE_UNREDEEMABLE` | admin      | no    | `INVITE_USER` carried an email where no sign-in source could ever spend an invite bound to one: the deployment offers no provider sign-in (§5.8). |
+| `3031` | `INVITE_UNREDEEMABLE` | admin      | no    | `INVITE_USER` carried an email where no sign-in source could ever spend an invite bound to one: the deployment offers no provider sign-in, neither the relay nor a direct connection (§5.8). |
 | `3032` | `GROUP_HANDLE_TAKEN`  | groups     | no    | A group, a person or a broadcast word already answers to that `@name`: a create, an update, or a rename (`SET_DISPLAY_NAME`) (§5.16k). |
 | `3033` | `UNKNOWN_GROUP`       | groups     | no    | No such group. |
 | `3034` | `MEMBER_VIA_GROUP`    | groups     | no    | `LEAVE_CHANNEL` or `REMOVE_FROM_CHANNEL` for someone in the channel only through a group (§5.16k). |

@@ -636,9 +636,9 @@ An identity that matches no rule joins only through an **invite bound to its
 address** — tenant data an owner or admin creates (`INVITE_USER` carrying an
 email), consumed at that address's first verified sign-in, setting the role.
 Otherwise the answer is `AUTH_NOT_ALLOWED`, audited with the provider and tenant.
-Only a provider sign-in spends such an invite, and the daemon makes one only
-where the relay is on: elsewhere, even beside a direct connection, it refuses
-with `INVITE_UNREDEEMABLE`. What the inviter sends the invited person is the invitation
+Only a provider sign-in spends such an invite, through the relay or a direct
+connection (§8.5) alike, and the daemon makes one only where one of them is on:
+with neither, it refuses with `INVITE_UNREDEEMABLE`. What the inviter sends the invited person is the invitation
 text their client shows — the workspace, the provider and the address, the
 expiry — or, for an enrolled workspace with `OPENCHIME_INVITE_MAIL=on`, a message
 central mails (ARCH-85).
