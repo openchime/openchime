@@ -108,8 +108,10 @@ void st_range_hide     (st_layout *, size_t off, size_t len);
  * above the text baseline; after layout, st_layout_boxes reports where each
  * box landed so the caller composites its image there. This replaces both of
  * the old tricks (transparent glyphs overdrawn, and per-glyph emoji raster,
- * which costs ~1.5 ms per layout — measured, spike 3). */
-void st_range_box(st_layout *, size_t off, size_t len,
+ * which costs ~1.5 ms per layout — measured, spike 3). A layout takes as many
+ * as its text has. Returns 1, or 0 when none could be had (no memory, or a
+ * range outside the text), in which case the text stays as it was. */
+int  st_range_box(st_layout *, size_t off, size_t len,
                   float w, float h, float baseline, uint32_t box_id);
 int  st_layout_boxes(const st_layout *, uint32_t *ids, st_rect *rects, int cap);
 

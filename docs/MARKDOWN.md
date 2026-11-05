@@ -127,9 +127,7 @@ short form in place of the token.
 Only a real date and time are a token: `<time:2026-02-30T10:00Z>`, an hour past
 23, a missing `Z` or an offset in its place leave the text as typed. Inside
 code it is literal. The composer's **Insert a time** picks a date and time in
-your own zone and writes the token; typing one by hand works the same. The
-desktop client draws up to 16 in a message and 8 in a table cell, custom emoji
-included; any more stay as typed, which still says the moment in UTC.
+your own zone and writes the token; typing one by hand works the same.
 
 The parser reports one `OC_RT_TIME` span over the token, with no delimiter
 (`oc_rt_time_value` gives the moment). In a one-line excerpt the token becomes

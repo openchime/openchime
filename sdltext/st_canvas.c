@@ -29,7 +29,7 @@
 #include "st_canvas.h"
 #include "st_priv.h"
 
-enum { ST_MAX_RANGES = 96, ST_MAX_BOXES = 64, ST_MAX_LINES = 512, ST_MAX_ITEMS = 2048 };
+enum { ST_MAX_RANGES = 96, ST_MAX_LINES = 512, ST_MAX_ITEMS = 2048 };
 
 /* ---- the page side: one offscreen canvas, measured and drawn through ------- */
 
@@ -177,7 +177,7 @@ struct st_layout {
     uint8_t   *cb, *brk, *lv;/* cluster starts, break opportunities, bidi levels, per unit (st_priv.h) */
     int        para_rtl;     /* the paragraph reads right to left (P2/P3) */
     st_range   ranges[ST_MAX_RANGES]; int nranges;
-    st_box     boxes[ST_MAX_BOXES]; int nboxes;
+    st_box    *boxes; int nboxes, boxcap;   /* as many as are reserved, grown */
     /* the computed layout */
     int        laid;
     st_item   *items; int nitems;
@@ -273,6 +273,7 @@ void st_layout_destroy(st_layout *l) {
     layout_drop(l);
     st__map_free(&l->map);
     free(l->cb); free(l->brk); free(l->lv); free(l->w16);
+    free(l->boxes);
     free(l->text);
     free(l);
 }
@@ -293,10 +294,17 @@ void st_range_strike(st_layout *l, size_t off, size_t len, bool on) { st_range *
 void st_range_family(st_layout *l, size_t off, size_t len, const char *family) { st_range *r = range_add(l, off, len); if (r) snprintf(r->family, sizeof r->family, "%s", family ? family : ""); }
 void st_range_size(st_layout *l, size_t off, size_t len, float size) { st_range *r = range_add(l, off, len); if (r) r->size = size; }
 void st_range_hide(st_layout *l, size_t off, size_t len) { st_range *r = range_add(l, off, len); if (r) r->hide = 1; }
-void st_range_box(st_layout *l, size_t off, size_t len, float w, float h, float baseline, uint32_t box_id) {
-    if (l->nboxes == ST_MAX_BOXES) return;
+int st_range_box(st_layout *l, size_t off, size_t len, float w, float h, float baseline, uint32_t box_id) {
+    if (!len || off + len > l->len) return 0;
+    if (l->nboxes == l->boxcap) {
+        int cap = l->boxcap ? l->boxcap * 2 : 16;
+        st_box *g = realloc(l->boxes, (size_t)cap * sizeof *g);
+        if (!g) return 0;
+        l->boxes = g; l->boxcap = cap;
+    }
     l->boxes[l->nboxes++] = (st_box){ box_id, (int)off, (int)len, w, h, baseline };
     l->laid = 0;
+    return 1;
 }
 
 /* The style in force at byte `off`: the format's, then every range covering it, in order. */

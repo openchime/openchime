@@ -5534,14 +5534,16 @@ static int draw_custom_emoji(gfx *rt, const char *s, rectf r) {
 
 /* Custom-emoji shortcodes in a body (REQ-072): where each one is, in BYTES,
  * and which image it names. Byte offsets are sdltext's native unit, so the
- * reserved box and the image drawn over it cannot disagree. */
+ * reserved box and the image drawn over it cannot disagree. Returns how many
+ * there are, which may exceed `max`: the first `max` are written to `out`, as
+ * oc_rt_scan does, so a NULL `out` counts them. */
 typedef struct { size_t at, len; uint64_t aid; } oc_emoji_run;
 
 static int emoji_runs(const char *utf8, oc_emoji_run *out, int max) {
     const oc_model *m = model();
-    if (!m || !utf8 || !out || max <= 0) return 0;
+    if (!m || !utf8) return 0;
     int n = 0;
-    for (const char *p = strchr(utf8, ':'); p && n < max; p = strchr(p + 1, ':')) {
+    for (const char *p = strchr(utf8, ':'); p; p = strchr(p + 1, ':')) {
         const char *e = strchr(p + 1, ':');
         if (!e) break;
         size_t L = (size_t)(e - p - 1);
@@ -5550,9 +5552,11 @@ static int emoji_runs(const char *utf8, oc_emoji_run *out, int max) {
         memcpy(name, p + 1, L); name[L] = '\0';
         uint64_t aid = oc_model_custom_emoji(m, name);
         if (!aid) continue;          /* not a custom one: leave the text alone */
-        out[n].at = (size_t)(p - utf8);
-        out[n].len = L + 2;
-        out[n].aid = aid;
+        if (out && n < max) {
+            out[n].at = (size_t)(p - utf8);
+            out[n].len = L + 2;
+            out[n].aid = aid;
+        }
         n++;
         p = e;                        /* do not let one colon start two runs */
     }
@@ -5705,7 +5709,71 @@ static int g_n_morehits;
  * change bumps the generation and the transcript rebuilds lazily. This is
  * what holds the frame at "blit what changed" instead of re-shaping every
  * visible message per frame. */
-enum { MLAY_CACHE = 96, MLAY_BOXES = 16 };
+enum { MLAY_CACHE = 96 };
+
+/* ---- inline boxes ------------------------------------------------------------
+ * Custom emoji (REQ-072) and time tokens (MARKDOWN.md §1c) are drawn into boxes
+ * the layout reserves for them (ARCH-106), every one the text has: a square for
+ * an emoji, and for a time a box as wide as its text in this reader's zone,
+ * which the draw pass writes in. One id sequence for both, in the order they
+ * come in the text. Short of memory a piece gets no box, and its text shows as
+ * typed: an emoji's shortcode, a time's moment in UTC. */
+typedef struct {
+    st_rect  r;      /* where the layout put it */
+    uint64_t aid;    /* a custom emoji's image, or 0 for a time */
+    int64_t  ms;     /* a time token's moment (MARKDOWN.md §1c) */
+} ibox;
+
+/* A piece of a layout's text to draw in a box: its bytes, and what it is. */
+typedef struct { size_t at, len; uint64_t aid; int64_t ms; } ibox_src;
+
+static int ibox_src_cmp(const void *a, const void *b) {
+    size_t x = ((const ibox_src *)a)->at, y = ((const ibox_src *)b)->at;
+    return x < y ? -1 : x > y;
+}
+
+/* Reserve a box in `lay` for each of the `n` pieces in `src`, which this puts
+ * in text order, and where each landed: into *out, the caller's to free.
+ * Returns how many it holds. Call it after every other range is applied. */
+static int ibox_place(st_layout *lay, ibox_src *src, int n, ibox **out) {
+    *out = NULL;
+    if (!lay || !src || n <= 0) return 0;
+    ibox *bx = malloc((size_t)n * sizeof *bx);
+    st_rect *rs = malloc((size_t)n * sizeof *rs);
+    uint32_t *ids = malloc((size_t)n * sizeof *ids);
+    char *got = calloc((size_t)n, 1);
+    if (!bx || !rs || !ids || !got) { free(bx); free(rs); free(ids); free(got); return 0; }
+    qsort(src, (size_t)n, sizeof *src, ibox_src_cmp);
+    float side = g_body->line_h > 4 ? g_body->line_h - 4 : 18.0f;
+    float lh = g_body->line_h > 4 ? g_body->line_h : 22.0f;
+    float base = g_body->baseline > 0 ? g_body->baseline : lh * 0.78f;
+    int nb = 0;
+    for (int i = 0; i < n; i++) {
+        int ok;
+        if (src[i].aid) {
+            ok = st_range_box(lay, src[i].at, src[i].len, side, side, side * 0.85f, (uint32_t)nb + 1);
+        } else {
+            char tt[64];
+            oc_model_time_text(model(), src[i].ms, OC_RT_TIME_SHORT, tt, sizeof tt);
+            ok = st_range_box(lay, src[i].at, src[i].len, text_width(tt, g_body) + 2.0f, lh, base, (uint32_t)nb + 1);
+        }
+        if (!ok) continue;
+        memset(&bx[nb].r, 0, sizeof bx[nb].r);
+        bx[nb].aid = src[i].aid; bx[nb].ms = src[i].ms;
+        nb++;
+    }
+    /* Each rect to the box its id names, whatever order they come back in. One
+     * the layout does not report is not drawn. */
+    int nr = nb ? st_layout_boxes(lay, ids, rs, nb) : 0;
+    for (int k = 0; k < nr; k++)
+        if (ids[k] >= 1 && (int)ids[k] <= nb) { bx[ids[k] - 1].r = rs[k]; got[ids[k] - 1] = 1; }
+    int kept = 0;
+    for (int i = 0; i < nb; i++) if (got[i]) bx[kept++] = bx[i];
+    free(rs); free(ids); free(got);
+    if (!kept) { free(bx); return 0; }
+    *out = bx;
+    return kept;
+}
 
 /* ---- tables in the transcript (REQ-220, ARCH-100, MARKDOWN.md §1a) --------
  * A pipe table is drawn as a grid, never as its pipes. The body keeps ONE
@@ -5723,7 +5791,7 @@ enum { MLAY_CACHE = 96, MLAY_BOXES = 16 };
  * laid out once per message signature and width and rasterized the first time
  * they are drawn, and a table is bounded (MTAB_ROWS, MTAB_CELLS, MCELL_BYTES)
  * so a 64 KiB one costs one bounded first frame and nothing after it. */
-enum { MTAB_MAX = 16, MTAB_ROWS = 200, MTAB_CELLS = 2400, MCELL_BYTES = 2048, MCELL_BOXES = 8 };
+enum { MTAB_MAX = 16, MTAB_ROWS = 200, MTAB_CELLS = 2400, MCELL_BYTES = 2048 };
 #define TAB_PX    UIS(10.0f)    /* cell padding, across */
 #define TAB_PY    UIS(5.0f)     /* ... and down */
 #define TAB_MINW  UIS(40.0f)    /* a column's text width, at least */
@@ -5748,10 +5816,8 @@ typedef struct {
     float      dx, dy;       /* the raster's ink offset (cap_blit) */
     float      w, h;         /* laid out, DIPs */
     size_t     start, len;   /* the cell's bytes in body_text */
-    int        nbox;         /* custom emoji (REQ-072), as the body reserves them */
-    st_rect    box[MCELL_BOXES];
-    uint64_t   box_aid[MCELL_BOXES];   /* a custom emoji's image, or 0 for a time */
-    int64_t    box_ms[MCELL_BOXES];    /* a time token's moment (MARKDOWN.md §1c) */
+    int        nbox;         /* custom emoji and time tokens, as the body boxes them */
+    ibox      *box;
     int        nspl;
     mcspl     *spl;
 } mcell;
@@ -5780,11 +5846,10 @@ typedef struct {
                            * swapped for its grid */
     uint32_t   rgb;       /* the ink, kept for the paint ledger to report */
     size_t     blen;      /* body byte length (selection clamps to it) */
-    /* the inline boxes (custom emoji): where they landed + which image */
+    /* the inline boxes (custom emoji, time tokens): where they landed, and
+     * what each draws; the entry's own, freed with it */
     int        nbox;
-    st_rect    box[MLAY_BOXES];
-    uint64_t   box_aid[MLAY_BOXES];  /* a custom emoji's image, or 0 for a time */
-    int64_t    box_ms[MLAY_BOXES];   /* a time token's moment (MARKDOWN.md §1c) */
+    ibox      *box;
     int        ntab;      /* tables drawn as grids (MARKDOWN.md §1a) */
     mtab      *tab;
     /* spoilers (MARKDOWN.md §1d), however many: each one's lines, layout-relative,
@@ -5808,6 +5873,7 @@ static void mtab_free(mtab *t) {
         if (t->cell[i].tex) gfx_tex_destroy(t->cell[i].tex);
         for (int k = 0; k < t->cell[i].nspl; k++) free(t->cell[i].spl[k].r);
         free(t->cell[i].spl);
+        free(t->cell[i].box);
     }
     free(t->cell);
     free(t->rowy);
@@ -5895,6 +5961,7 @@ static void mlay_drop(mlay_ent *e) {
     if (e->tex) gfx_tex_destroy(e->tex);
     for (int k = 0; k < e->nspl; k++) free(e->spl[k].r);
     free(e->spl);
+    free(e->box);
     memset(e, 0, sizeof *e);             /* the grids are g_tgrid's */
 }
 
@@ -5926,13 +5993,19 @@ static st_layout *tcell_lay(mcell *c, const char *b, float w, int align, int hea
     if (!t) return NULL;
     memcpy(t, b + c->start, n);
     t[n] = '\0';
-    oc_rt_span sp[OC_RT_MAX];
-    size_t ns = oc_rt_scan_cell(b, c->start, n, sp, OC_RT_MAX);
-    if (ns > OC_RT_MAX) ns = OC_RT_MAX;
+    /* Every span, however many: past OC_RT_MAX in memory of their own, and
+     * short of that, the first OC_RT_MAX, past which the text shows as typed. */
+    oc_rt_span stack[OC_RT_MAX], *sp = stack;
+    size_t ns = oc_rt_scan_cell(b, c->start, n, stack, OC_RT_MAX);
+    if (ns > OC_RT_MAX) {
+        oc_rt_span *all = malloc(ns * sizeof *all);
+        if (all) { sp = all; ns = oc_rt_scan_cell(b, c->start, n, all, ns); }
+        else ns = OC_RT_MAX;
+    }
     for (size_t i = 0; i < ns; i++)
         if (sp[i].style == OC_RT_BREAK) t[sp[i].start - c->start] = '\n';
     st_layout *lay = st_layout_create(g_st, g_body->f, t, n, w, 4000.0f, align);
-    if (!lay) { free(t); return NULL; }
+    if (!lay) { if (sp != stack) free(sp); free(t); return NULL; }
     if (header) st_range_weight(lay, 0, n, 700);
     for (size_t i = 0; i < ns; i++) {
         uint16_t st = sp[i].style;
@@ -5983,49 +6056,30 @@ static st_layout *tcell_lay(mcell *c, const char *b, float w, int align, int hea
             st_range_hide(lay, s->hidden + s->hidden_len, s->start + s->len - s->hidden - s->hidden_len);
         if (!s->shown && s->hidden_len) st_range_color(lay, s->hidden, s->hidden_len, OC_COL_MUTED, 1.0f);
     }
-    oc_emoji_run runs[MCELL_BOXES];
-    int nr = emoji_runs(t, runs, MCELL_BOXES);
-    {
-        int kept = 0;
-        for (int i = 0; i < nr; i++)
-            if (!tcell_covered(c, runs[i].at)) runs[kept++] = runs[i];
-        nr = kept;
-    }
-    float side = g_body->line_h > 4 ? g_body->line_h - 4 : 18.0f;
-    /* Emoji and time tokens (MARKDOWN.md §1c) in one id sequence, in the order
-     * they come, as the body's boxes are. A token's box is as wide as its text
-     * in this reader's zone, which mtab_draw writes in. */
-    float lh = g_body->line_h > 4 ? g_body->line_h : 22.0f;
-    float base = g_body->baseline > 0 ? g_body->baseline : lh * 0.78f;
-    int nbx = 0, ei = 0;
-    size_t ti = 0;
-    while ((ei < nr || ti < ns) && nbx < MCELL_BOXES) {
+    /* Emoji and time tokens (MARKDOWN.md §1c), every one, boxed as the body's
+     * are (ibox_place); none under a covered spoiler, whose picture or time
+     * would show through. */
+    free(c->box);
+    c->box = NULL;
+    c->nbox = 0;
+    int ne = emoji_runs(t, NULL, 0), nsrc = 0;
+    oc_emoji_run *runs = ne ? malloc((size_t)ne * sizeof *runs) : NULL;
+    if (runs) { int got = emoji_runs(t, runs, ne); if (got < ne) ne = got; }
+    else ne = 0;
+    ibox_src *src = (ne || ns) ? malloc(((size_t)ne + ns) * sizeof *src) : NULL;
+    for (int i = 0; src && i < ne; i++)
+        if (!tcell_covered(c, runs[i].at))
+            src[nsrc++] = (ibox_src){ runs[i].at, runs[i].len, runs[i].aid, 0 };
+    for (size_t i = 0; src && i < ns; i++) {
         int64_t ms = 0;
-        if (ti < ns && (sp[ti].style != OC_RT_TIME || tcell_covered(c, sp[ti].start - c->start) ||
-                        !oc_rt_time_value(b, c->start + n, &sp[ti], &ms))) { ti++; continue; }
-        if (ei < nr && (ti >= ns || runs[ei].at < sp[ti].start - c->start)) {
-            st_range_box(lay, runs[ei].at, runs[ei].len, side, side, side * 0.85f, (uint32_t)nbx + 1);
-            c->box_aid[nbx] = runs[ei].aid; c->box_ms[nbx] = 0;
-            ei++;
-        } else {
-            char tt[64];
-            oc_model_time_text(model(), ms, OC_RT_TIME_SHORT, tt, sizeof tt);
-            st_range_box(lay, sp[ti].start - c->start, sp[ti].len, text_width(tt, g_body) + 2.0f, lh, base, (uint32_t)nbx + 1);
-            c->box_aid[nbx] = 0; c->box_ms[nbx] = ms;
-            ti++;
-        }
-        nbx++;
+        if (sp[i].style != OC_RT_TIME || tcell_covered(c, sp[i].start - c->start) ||
+            !oc_rt_time_value(b, c->start + n, &sp[i], &ms)) continue;
+        src[nsrc++] = (ibox_src){ sp[i].start - c->start, sp[i].len, 0, ms };
     }
-    uint32_t ids[MCELL_BOXES];
-    int nb = st_layout_boxes(lay, ids, c->box, MCELL_BOXES);
-    c->nbox = nbx < nb ? nbx : nb;
-    {   /* Each rect to the slot its id names, whatever order they come back in. */
-        st_rect byid[MCELL_BOXES];
-        memcpy(byid, c->box, sizeof byid);
-        for (int k = 0; k < nb; k++)
-            if (ids[k] >= 1 && (int)ids[k] <= c->nbox) byid[ids[k] - 1] = c->box[k];
-        memcpy(c->box, byid, sizeof byid);
-    }
+    c->nbox = ibox_place(lay, src, nsrc, &c->box);
+    free(src);
+    free(runs);
+    if (sp != stack) free(sp);
     st_metrics m;
     st_layout_metrics(lay, &m);
     c->w = m.w; c->h = m.h;
@@ -6487,73 +6541,46 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
             best->spl[k].label = lead + spv[k].label; best->spl[k].label_len = spv[k].label_len;
             best->nspl++;
         }
-        /* Custom emoji reserve REAL boxes in the flow (ARCH-106); the draw pass
-         * composites the images at the rects the layout reports. */
-        oc_emoji_run runs[MLAY_BOXES];
-        int nr = emoji_runs(b, runs, MLAY_BOXES);
-        {   /* none inside a covered spoiler: its picture would show through */
-            int kk = 0;
-            for (int i = 0; i < nr; i++) {
-                int hid = 0;
-                for (size_t k = 0; k < nspv; k++)
-                    if (!best->spl[k].shown && runs[i].at >= spv[k].hidden && runs[i].at < spv[k].hidden + spv[k].hidden_len) hid = 1;
-                if (!hid) runs[kk++] = runs[i];
-            }
-            nr = kk;
+        /* Custom emoji reserve REAL boxes in the flow (ARCH-106), and time
+         * tokens (MARKDOWN.md §1c) boxes as wide as their text in this reader's
+         * zone: every one of them (ibox_place). The draw pass composites the
+         * images, and writes the times, at the rects the layout reports. */
+        int ne = emoji_runs(b, NULL, 0), nsrc = 0;
+        oc_emoji_run *runs = ne ? malloc((size_t)ne * sizeof *runs) : NULL;
+        if (runs) { int got = emoji_runs(b, runs, ne); if (got < ne) ne = got; }
+        else ne = 0;
+        oc_rt_span tstack[OC_RT_MAX], *tsp = tstack;
+        size_t nts = strstr(b, "<time:") ? oc_rt_scan(b, blen, tstack, OC_RT_MAX) : 0;
+        if (nts > OC_RT_MAX) {
+            oc_rt_span *all = malloc(nts * sizeof *all);
+            if (all) { tsp = all; nts = oc_rt_scan(b, blen, all, nts); }
+            else nts = OC_RT_MAX;          /* past these, a token shows as typed */
         }
-        float side = g_body->line_h > 4 ? g_body->line_h - 4 : 18.0f;
-        /* Not inside a table: a box there would reserve space in its band. */
-        int kept = 0;
-        for (int i = 0; i < nr; i++)
-            if (!in_tables(rts, nt, runs[i].at)) runs[kept++] = runs[i];
-        nr = kept;
-        /* Time tokens (MARKDOWN.md §1c) reserve a box as wide as their text in
-         * this reader's zone, which the draw pass writes in; one id sequence
-         * with the emoji, in the order they come in the text. */
-        oc_rt_span tsp[OC_RT_MAX];
-        size_t nts = strstr(b, "<time:") ? oc_rt_scan(b, blen, tsp, OC_RT_MAX) : 0;
-        if (nts > OC_RT_MAX) nts = OC_RT_MAX;
-        int nbx = 0, ei = 0;
-        size_t ti = 0;
-        float lh = g_body->line_h > 4 ? g_body->line_h : 22.0f;
-        float base = g_body->baseline > 0 ? g_body->baseline : lh * 0.78f;
-        while ((ei < nr || ti < nts) && nbx < MLAY_BOXES) {
+        ibox_src *src = (ne || nts) ? malloc(((size_t)ne + nts) * sizeof *src) : NULL;
+        for (int i = 0; src && i < ne; i++) {
+            /* Not inside a table, where a box would reserve space in its band,
+             * nor in a covered spoiler, where its picture would show through. */
+            int hid = in_tables(rts, nt, runs[i].at);
+            for (size_t k = 0; k < nspv && !hid; k++)
+                hid = !best->spl[k].shown && runs[i].at >= spv[k].hidden && runs[i].at < spv[k].hidden + spv[k].hidden_len;
+            if (!hid) src[nsrc++] = (ibox_src){ lead + runs[i].at, runs[i].len, runs[i].aid, 0 };
+        }
+        for (size_t i = 0; src && i < nts; i++) {
             int64_t ms = 0;
-            if (ti < nts && (tsp[ti].style != OC_RT_TIME || in_tables(rts, nt, tsp[ti].start) ||
-                             !oc_rt_time_value(b, blen, &tsp[ti], &ms))) { ti++; continue; }
-            if (ei < nr && (ti >= nts || runs[ei].at < tsp[ti].start)) {
-                st_range_box(lay, lead + runs[ei].at, runs[ei].len, side, side, side * 0.85f,
-                             (uint32_t)nbx + 1);
-                best->box_aid[nbx] = runs[ei].aid; best->box_ms[nbx] = 0;
-                ei++;
-            } else {
-                char tt[64];
-                oc_model_time_text(model(), ms, OC_RT_TIME_SHORT, tt, sizeof tt);
-                st_range_box(lay, lead + tsp[ti].start, tsp[ti].len, text_width(tt, g_body) + 2.0f,
-                             lh, base, (uint32_t)nbx + 1);
-                best->box_aid[nbx] = 0; best->box_ms[nbx] = ms;
-                ti++;
-            }
-            nbx++;
+            if (tsp[i].style != OC_RT_TIME || in_tables(rts, nt, tsp[i].start) ||
+                !oc_rt_time_value(b, blen, &tsp[i], &ms)) continue;
+            src[nsrc++] = (ibox_src){ lead + tsp[i].start, tsp[i].len, 0, ms };
         }
-        best->nbox = nbx;
+        best->nbox = ibox_place(lay, src, nsrc, &best->box);
+        free(src);
+        free(runs);
+        if (tsp != tstack) free(tsp);
         b = ab;                 /* the whole line again, for what follows */
         blen += lead;
     }
 
     st_metrics m;
     st_layout_metrics(lay, &m);
-    uint32_t ids[MLAY_BOXES];
-    int nb = st_layout_boxes(lay, ids, best->box, MLAY_BOXES);
-    if (nb < best->nbox) best->nbox = nb;
-    /* Each rect to the slot its id names, whatever order they come back in. */
-    {
-        st_rect byid[MLAY_BOXES];
-        memcpy(byid, best->box, sizeof byid);
-        for (int k = 0; k < nb; k++)
-            if (ids[k] >= 1 && (int)ids[k] <= best->nbox) byid[ids[k] - 1] = best->box[k];
-        memcpy(best->box, byid, sizeof byid);
-    }
     /* Where each spoiler's hidden lines landed, all of them: the cover is drawn
      * there. As many as the text wraps to, so the rects are asked for by lines. */
     if (best->nspl) {
@@ -6770,6 +6797,9 @@ static const tabhit *tabhit_find(uint64_t mid, int idx, int thr) {
 }
 
 static void time_box_draw(gfx *rt, const oc_msg *msg, int64_t ms, rectf box);   /* fwd */
+/* The custom emoji drawn in message bodies and their tables this frame, for
+ * the dump. */
+static int g_n_emojiboxes;
 
 /* A cell's spoilers that are shown, or that are not, its text at ox,oy in the
  * column [cx0, cx1): as the body's covers (spoiler_covers), kept to the column,
@@ -6857,11 +6887,12 @@ static void mtab_draw(gfx *rt, const oc_msg *msg, mlay_ent *e, int k, float x, f
                 gfx_tex_draw(rt, cl->tex, dst, 0.0f, 1.0f);
             }
             for (int i = 0; i < cl->nbox; i++) {
-                rectf box = rf(ox + cl->box[i].x, oy + cl->box[i].y,
-                               ox + cl->box[i].x + cl->box[i].w, oy + cl->box[i].y + cl->box[i].h);
-                if (!cl->box_aid[i]) { time_box_draw(rt, msg, cl->box_ms[i], box); continue; }
-                if (!draw_avatar_image(rt, cl->box_aid[i], box, 3.0f, 1)) {
-                    avatar_want(cl->box_aid[i]);
+                const st_rect *br = &cl->box[i].r;
+                rectf box = rf(ox + br->x, oy + br->y, ox + br->x + br->w, oy + br->y + br->h);
+                if (!cl->box[i].aid) { time_box_draw(rt, msg, cl->box[i].ms, box); continue; }
+                g_n_emojiboxes++;
+                if (!draw_avatar_image(rt, cl->box[i].aid, box, 3.0f, 1)) {
+                    avatar_want(cl->box[i].aid);
                     draw_text(rt, ":…:", g_meta, box, OC_COL_FAINT);
                 }
             }
@@ -6935,16 +6966,21 @@ static void body_draw_split(gfx *rt, const oc_msg *msg, mlay_ent *e, float tx, f
     }
 }
 
-/* The time tokens drawn this frame, where and which moment: for the hover's
- * full date and zone (time_tip_draw), keyboard focus's, and the dump. */
-enum { TIME_HITS = 64 };
-static struct { rectf r; uint64_t mid; int64_t ms; } g_timehits[TIME_HITS];
-static int g_n_timehits;
+/* The time tokens drawn this frame, every one, where and which moment: for the
+ * hover's full date and zone (time_tip_draw), keyboard focus's, and the dump.
+ * Grown as a frame needs; short of memory, a token is drawn without its tip. */
+static struct timehit { rectf r; uint64_t mid; int64_t ms; } *g_timehits;
+static int g_n_timehits, g_timehits_cap;
 static void time_hit_add(uint64_t mid, int64_t ms, rectf r) {
-    if (g_n_timehits < TIME_HITS) {
-        g_timehits[g_n_timehits].r = r; g_timehits[g_n_timehits].mid = mid;
-        g_timehits[g_n_timehits].ms = ms; g_n_timehits++;
+    if (g_n_timehits == g_timehits_cap) {
+        int cap = g_timehits_cap ? g_timehits_cap * 2 : 64;
+        struct timehit *g = realloc(g_timehits, (size_t)cap * sizeof *g);
+        if (!g) return;
+        g_timehits = g;
+        g_timehits_cap = cap;
     }
+    g_timehits[g_n_timehits].r = r; g_timehits[g_n_timehits].mid = mid;
+    g_timehits[g_n_timehits].ms = ms; g_n_timehits++;
 }
 
 /* A time token (MARKDOWN.md §1c), in its box: its time in this reader's zone, in
@@ -7037,11 +7073,10 @@ static float body_draw(gfx *rt, const oc_msg *msg, mlay_ent *body, float tx, flo
      * wrapped, so the rects are its own; below a table, moved down
      * with the text. */
     for (int i = 0; i < body->nbox; i++) {
-        float bty = mtab_down(body, body->box[i].y);
-        rectf box = rf(tx + body->box[i].x, by + bty,
-                       tx + body->box[i].x + body->box[i].w,
-                       by + bty + body->box[i].h);
-        if (!body->box_aid[i]) {
+        const st_rect *br = &body->box[i].r;
+        float bty = mtab_down(body, br->y);
+        rectf box = rf(tx + br->x, by + bty, tx + br->x + br->w, by + bty + br->h);
+        if (!body->box[i].aid) {
             /* Not over a covered spoiler: the cover hides the time too. */
             int hidden = 0;
             for (int k = 0; k < body->nspl && !hidden; k++) {
@@ -7054,11 +7089,12 @@ static float body_draw(gfx *rt, const oc_msg *msg, mlay_ent *body, float tx, flo
                 }
             }
             if (hidden) continue;
-            time_box_draw(rt, msg, body->box_ms[i], box);
+            time_box_draw(rt, msg, body->box[i].ms, box);
             continue;
         }
-        if (!draw_avatar_image(rt, body->box_aid[i], box, 3.0f, 1)) {
-            avatar_want(body->box_aid[i]);
+        g_n_emojiboxes++;
+        if (!draw_avatar_image(rt, body->box[i].aid, box, 3.0f, 1)) {
+            avatar_want(body->box[i].aid);
             /* Until the bytes arrive the shortcode is the honest
              * placeholder — a blank gap would look like a bug. */
             draw_text(rt, ":\u2026:", g_meta, box, OC_COL_FAINT);
@@ -21674,6 +21710,7 @@ static void paint(oc_win *hwnd) {
     g_n_hrx = 0; g_hrx_mid = 0;
     g_caret_placed = 0;
     g_n_timehits = 0;
+    g_n_emojiboxes = 0;
     /* The reader's clock, which the model's excerpts use too. */
     if (m) oc_model_set_clock12((oc_model *)m, !g_pref_time24);
     g_n_splhits = 0;
@@ -35432,11 +35469,13 @@ static void test_dump(const char *path) {
         }
     }
     /* The time tokens the last frame drew (MARKDOWN.md §1c): the text each
-     * reads as, its full form, and which one the tooltip shows. */
+     * reads as, its full form, and which one the tooltip shows; and how many
+     * custom emoji it drew in the bodies and tables beside them. */
     {
         oc_rt_clock k;
         oc_model_clock(m, (int64_t)time(NULL) * 1000, &k);
-        fprintf(f, "timetoks n=%d tz=%d time24=%d tip=%d\n", g_n_timehits, k.tz_min, k.time24, time_tip_index());
+        fprintf(f, "timetoks n=%d tz=%d time24=%d tip=%d emoji=%d\n", g_n_timehits, k.tz_min, k.time24,
+                time_tip_index(), g_n_emojiboxes);
         for (int i = 0; i < g_n_timehits; i++) {
             char sh[64], full[96];
             oc_model_time_text(m, g_timehits[i].ms, OC_RT_TIME_SHORT, sh, sizeof sh);

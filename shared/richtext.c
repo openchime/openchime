@@ -937,8 +937,8 @@ typedef struct { size_t start, len; int kind; uint32_t rows, cols; int64_t ms; s
 size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, char *out, size_t cap) {
     oc_rt_table t[32];
     oc_rt_spoiler sv[32];
-    oc_rt_span sp[OC_RT_MAX];
-    rt_repl r[32 + 32 + OC_RT_MAX];
+    oc_rt_span sps[OC_RT_MAX], *sp = sps;
+    rt_repl rs[32 + 32 + OC_RT_MAX], *r = rs;
     size_t nt, nv, ns, nr = 0, k, i = 0, o = 0, lim;
     if (!out || cap == 0) return 0;
     out[0] = '\0';
@@ -955,8 +955,15 @@ size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, 
         if (sv[31].start + sv[31].len < lim) lim = sv[31].start + sv[31].len;
         nv = 32;
     }
-    ns = memchr(body, '<', len) ? oc_rt_scan(body, len, sp, OC_RT_MAX) : 0;
-    if (ns > OC_RT_MAX) ns = OC_RT_MAX;
+    ns = memchr(body, '<', len) ? oc_rt_scan(body, len, sps, OC_RT_MAX) : 0;
+    if (ns > OC_RT_MAX) {
+        /* Every time token, however many spans come before it; short of
+         * memory, those in the first OC_RT_MAX, and the rest as typed. */
+        oc_rt_span *all = malloc(ns * sizeof *all);
+        rt_repl *rall = all ? malloc((32 + 32 + ns) * sizeof *rall) : NULL;
+        if (rall) { sp = all; r = rall; ns = oc_rt_scan(body, len, sp, ns); }
+        else { free(all); ns = OC_RT_MAX; }
+    }
     for (k = 0; k < nt; k++) {
         if (t[k].start >= lim) continue;
         r[nr].start = t[k].start; r[nr].len = t[k].len; r[nr].kind = RT_R_TABLE;
@@ -1020,22 +1027,29 @@ size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, 
         }
     }
     out[o] = '\0';
+    if (sp != sps) { free(sp); free(r); }
     return o;
 }
 
 char *oc_rt_local_times(const char *body, size_t len, const oc_rt_clock *clock) {
-    oc_rt_span sp[OC_RT_MAX];
+    oc_rt_span sps[OC_RT_MAX], *sp = sps;
     size_t ns, k, i = 0, o = 0, cap;
     char *out;
     if (!body || !memchr(body, '<', len)) return NULL;
-    ns = oc_rt_scan(body, len, sp, OC_RT_MAX);
-    if (ns > OC_RT_MAX) ns = OC_RT_MAX;
+    ns = oc_rt_scan(body, len, sps, OC_RT_MAX);
+    if (ns > OC_RT_MAX) {
+        /* Every token, however many spans there are; short of memory, those
+         * in the first OC_RT_MAX, and the rest as typed. */
+        oc_rt_span *all = malloc(ns * sizeof *all);
+        if (all) { sp = all; ns = oc_rt_scan(body, len, sp, ns); }
+        else ns = OC_RT_MAX;
+    }
     for (k = 0; k < ns && sp[k].style != OC_RT_TIME; k++) {}
-    if (k == ns) return NULL;
+    if (k == ns) { if (sp != sps) free(sp); return NULL; }
     /* A token is at least 24 bytes and its text at most 40: room for each to grow. */
     cap = len + ns * 48 + 1;
     out = malloc(cap);
-    if (!out) return NULL;
+    if (!out) { if (sp != sps) free(sp); return NULL; }
     for (k = 0; k < ns; k++) {
         int64_t ms;
         if (sp[k].style != OC_RT_TIME || !oc_rt_time_value(body, len, &sp[k], &ms)) continue;
@@ -1047,6 +1061,7 @@ char *oc_rt_local_times(const char *body, size_t len, const oc_rt_clock *clock) 
     memcpy(out + o, body + i, len - i);
     o += len - i;
     out[o] = '\0';
+    if (sp != sps) free(sp);
     return out;
 }
 

@@ -584,6 +584,29 @@ static void test_time_flatten(void) {
     CHECK(strcmp(out, "<time:2026-13-01T00:00Z>") == 0);
 }
 
+/* Every token is the reader's, however many there are and however many other
+ * spans come before them: 200 tokens, each after an emphasis of three spans,
+ * are 800 spans, far past what fits in OC_RT_MAX. */
+static void test_time_every_token(void) {
+    const int64_t at = 1793372400000LL;                 /* Friday 30 October 2026, 15:00 UTC */
+    oc_rt_clock utc0 = { 0, 1, 0, at };
+    enum { N = 200 };
+    static char body[N * 32], want[N * 16], out[N * 16];
+    size_t bl = 0, wl = 0;
+    for (int k = 0; k < N; k++) {
+        bl += (size_t)snprintf(body + bl, sizeof body - bl, "*a* <time:2026-10-30T15:00Z> ");
+        wl += (size_t)snprintf(want + wl, sizeof want - wl, "*a* 15:00 ");
+    }
+    CHECK(oc_rt_scan(body, bl, NULL, 0) == 4 * N);
+    /* An excerpt: every one its text, every other byte kept. */
+    CHECK(oc_rt_flatten_at(body, bl, &utc0, out, sizeof out) == wl);
+    CHECK(strcmp(out, want) == 0);
+    /* The terminal client's body: the same. */
+    char *loc = oc_rt_local_times(body, bl, &utc0);
+    CHECK(loc && strcmp(loc, want) == 0);
+    free(loc);
+}
+
 /* Spoilers (MARKDOWN.md §1d): both forms, and what is not one. */
 static void test_spoilers(void) {
     oc_rt_spoiler sp[4];
@@ -936,6 +959,7 @@ int run_richtext_tests(void) {
     test_time_tokens();
     test_time_text();
     test_time_flatten();
+    test_time_every_token();
     test_spoilers();
     test_spoiler_line_start();
     test_spoiler_edges();
@@ -944,6 +968,6 @@ int run_richtext_tests(void) {
     test_spoiler_cell_excerpt();
     printf("test_richtext: emphasis, literal delimiters, escapes, code, fenced blocks, labelled links, "
            "quotes and lists, nesting, byte offsets, autolinking, truncation, tables and their cells and excerpts, "
-           "time tokens in every zone, spoilers\n");
+           "time tokens in every zone and however many, spoilers\n");
     return failures;
 }
