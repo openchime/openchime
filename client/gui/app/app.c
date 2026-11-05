@@ -1917,7 +1917,7 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
        CONF_PDM_TRUST, CONF_PDM_SAFETY,
        /* New ones go last: the dump's `confirm act=` is this number, and the
         * GUI harness reads it (CONF_CERT_TRUST is act=13 to scripts/gui). */
-       CONF_WS_FORGET_ALL, CONF_BROADCAST, CONF_DEACTIVATE_SELF };
+       CONF_WS_FORGET_ALL, CONF_BROADCAST, CONF_DEACTIVATE_SELF, CONF_EMOJI_DELETE };
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 static int      g_bc_confirmed;     /* CONF_BROADCAST: the send it confirmed is under way */
@@ -1983,6 +1983,17 @@ static struct { rectf r; uint64_t id; } g_invrows[64];   /* Revoke buttons */
 static struct { rectf r; uint64_t id; char key[OC_MAX_ALERT_KEY + 1]; } g_alertrows[OC_MAX_ALERTS + 1];
 static int g_n_alertrows;
 static int g_n_invrows;
+/* Admin > Custom emoji (REQ-072): each row's Delete, where it is offered, and
+ * the row's name; and the picker's Manage link, which opens it. */
+static struct { rectf r; char name[48]; } g_emojirows[128];
+static int g_n_emojirows;
+static rectf g_pick_manage;
+static char g_emoji_q[48];             /* its search box's text */
+/* The row the keyboard is on, -1 before any key, and the list it moves in; as
+ * the Workspaces dialog's, `reveal` asks the next paint to scroll it into view. */
+static int g_emoji_focus = -1, g_emoji_reveal;
+static rectf g_emoji_list;
+static char g_confirm_emoji[48];       /* CONF_EMOJI_DELETE: the emoji, by name */
 /* Admin > Groups (REQ-307): the group whose members are open (0 = the list),
  * and the buttons drawn this frame. */
 enum { GRP_ACT_MEMBERS = 1, GRP_ACT_RENAME, GRP_ACT_DELETE, GRP_ACT_REMOVE };
@@ -2225,6 +2236,8 @@ static rectf g_ws_hdr_btn;        /* channel-column workspace header (opens ws m
 static rectf g_hdr_compose;               /* channel-column header compose button */
 static field   *g_find;                 /* "Find a conversation" filter box */
 static field   *g_ffind;                /* "Search files" box, Files view only */
+static field   *g_efind;                /* Admin > Custom emoji's search box */
+static rectf    g_emoji_search_box;
 static field   *g_srch;                 /* search-overlay query box */
 
 /* Composer autocomplete. The candidate list is rebuilt from the text up
@@ -7325,7 +7338,7 @@ static void ovl_end(gfx *rt, rectf body) {
     gfx_clip_pop(rt);
 }
 
-enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS, OVL_WSMGR, OVL_GROUPS, OVL_ALERTS };
+enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS, OVL_WSMGR, OVL_GROUPS, OVL_ALERTS, OVL_EMOJI };
 
 /* Measured from the previous frame's draw, for the same reason the notifications
  * card's is: computing it means restating every row's height a second time. */
@@ -8511,6 +8524,7 @@ static const struct {
     { 0,                  0,          ACC_NONE,  "Ctrl+Up / Ctrl+Down","Move through the messages" },
     { 0,                  0,          ACC_NONE,  "Shift+F10 / Menu",   "Actions for the message you are on, or for this conversation" },
     { 0,                  0,          ACC_NONE,  "Up / Down, Enter",   "Move through an open menu and choose" },
+    { 0,                  0,          ACC_NONE,  "Tab, Up / Down, Del", "Custom emoji: the search box, the rows, delete the selected one" },
 };
 
 static void search_open(oc_win *hwnd);            /* fwd */
@@ -8582,8 +8596,10 @@ static void accel_run(oc_win *hwnd, int action) {
     case ACC_FOCUS: {
         /* One toggle rather than an F6 handler in each control, which is how the
          * two ends drifted: the composer sent focus to the filter box even in the
-         * views that have no filter box. */
-        if (ed_focused() && g_find && g_find->visible) focus_set(g_find);
+         * views that have no filter box. Admin > Custom emoji has no composer:
+         * there it is between the pane and its search box. */
+        if (g_efind && g_efind->visible) focus_set(g_focus == g_efind ? NULL : g_efind);
+        else if (ed_focused() && g_find && g_find->visible) focus_set(g_find);
         else ed_focus(hwnd);
         break; }
     default: break;
@@ -10802,6 +10818,7 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Storage usage",           60 },
     { "Audit log",               61 },
     { "Manage groups",           87 },
+    { "Manage custom emoji",     94 },
     { "Summarize this conversation", 88 },
     { "Create a poll",           90 },
     { "Toggle unreads only in the sidebar", 85 },
@@ -12592,6 +12609,7 @@ static void draw_autocomplete(gfx *rt, float x0, float w, float h) {
  * appear in the same place. */
 static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
     g_n_pick_cells = 0;
+    g_pick_manage = rf(0, 0, 0, 0);
     g_n_pick_tones = 0;
     if (!g_pick_open) { g_pick_panel = rf(0, 0, 0, 0); return; }
 
@@ -12728,10 +12746,21 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
             np++;
         }
         if (np) {
-            if (!q[0])
+            if (!q[0]) {
                 draw_text(rt, "This workspace", g_meta,
                           rf(body.left + 4, y, body.right, y + 18), OC_COL_FAINT);
-            if (!q[0]) y += 20;
+                /* Manage: the catalogue behind these, for everyone (REQ-072). */
+                float mw = text_width("Manage", g_meta) + 8;
+                rectf ml = rf(body.right - 4 - mw, y, body.right - 4, y + 18);
+                if (y + 18 >= body.top && y <= body.bottom) {
+                    int hot = in_rect(ml, g_mouse_x, g_mouse_y);
+                    g_meta->align = ST_ALIGN_RIGHT;
+                    draw_text(rt, "Manage", g_meta, ml, hot ? OC_COL_TEXT : OC_COL_ACCENT);
+                    g_meta->align = ST_ALIGN_LEFT;
+                    g_pick_manage = ml;
+                }
+                y += 20;
+            }
             for (int i = 0; i < np; i++) {
                 if (y + cell >= body.top && y <= body.bottom) {
                     rectf r = rf(x, y, x + cell, y + cell);
@@ -13139,8 +13168,10 @@ static void draw_status_body(gfx *rt, rectf body) {
  * over the status card). Returns 1 always — a click during an open picker is
  * the picker's to consume, wherever it lands. */
 static void prefs_save(void);   /* fwd */
+static void emoji_manage_open(oc_win *hwnd);   /* fwd */
 static int picker_click(oc_win *hwnd, int x, int y) {
     if (in_rect(g_pick_panel, (float)x, (float)y)) {
+        if (in_rect(g_pick_manage, (float)x, (float)y)) { emoji_manage_open(hwnd); return 1; }
         /* A tone is a preference, so choosing one re-renders the picker
          * and stays open — it is a change to what you are looking at, not
          * a selection. Saved immediately: it survives to the next window
@@ -14188,6 +14219,7 @@ static void confirm_run(oc_win *hwnd) {
                               g_await_webhook = 1; break;
     case CONF_INVITE_REVOKE:  oc_client_revoke_invite(g_client, g_confirm_id); break;
     case CONF_DEACTIVATE_SELF: oc_client_deactivate_self(g_client); break;
+    case CONF_EMOJI_DELETE:   oc_client_delete_emoji(g_client, g_confirm_emoji); break;
     case CONF_CERT_TRUST: cert_trust_run(g_main); break;
     case CONF_PDM_TRUST:  oc_client_pdm_trust(g_client, g_confirm_id); break;
     case CONF_PDM_SAFETY: break;   /* shown, nothing to do */
@@ -16822,6 +16854,7 @@ static int modal_key(oc_win *hwnd, int vk) {
  * new overlay has to be named in one of those predicates; it cannot silently
  * inherit somebody else's fields. */
 static void layout_files_find(oc_win *hwnd);   /* fwd */
+static void layout_emoji_find(oc_win *hwnd);   /* fwd */
 static void layout_dir_find(oc_win *hwnd);     /* fwd */
 
 static void layout_natives(oc_win *hwnd) {
@@ -16834,6 +16867,7 @@ static void layout_natives(oc_win *hwnd) {
     layout_composer(hwnd);     /* also does layout_find */
     layout_search(hwnd);
     layout_files_find(hwnd);
+    layout_emoji_find(hwnd);
     layout_dir_find(hwnd);
 
     int covered = window_is_covered();
@@ -16961,13 +16995,16 @@ static int shell_visible(void) {
  * nothing could see them, so a minted invite was write-only. */
 /* adds Alerts: the daemon's critical failures (REQ-263), last so the tabs
  * before it keep their places. */
-enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_COUNT };
+/* adds Custom emoji (REQ-072), the one tab a member is shown too: the
+ * catalogue is everyone's, and its creator may delete an emoji they added. */
+enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_EMOJI, ADM_COUNT };
 static int g_adm_tab;
 static rectf g_adm_tabs[ADM_COUNT];
 
 static void admin_select(int t) {
     g_adm_tab = t;
     grp_pick_close();
+    if (t == ADM_EMOJI && g_efind) field_set(g_efind, "");
     if (!g_client) return;
     /* Ask on entry: these are point-in-time reports, and a stale one is worse
      * than a moment's wait. */
@@ -16975,7 +17012,16 @@ static void admin_select(int t) {
     else if (t == ADM_INVITES)  oc_client_list_invites(g_client);
     else if (t == ADM_GROUPS)  { g_grp_sel = 0; oc_client_list_groups(g_client); }
     else if (t == ADM_ALERTS)   oc_client_srvalerts_list(g_client);
-    else                       { oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); }
+    else if (t == ADM_AUDIT)   { oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); }
+}
+
+/* The picker's Manage link: Admin > Custom emoji, which a member is shown too. */
+static void emoji_manage_open(oc_win *hwnd) {
+    picker_close(hwnd);
+    close_overlays();
+    g_view = VIEW_ADMIN; layout_composer(hwnd);
+    admin_select(ADM_EMOJI);
+    invalidate();
 }
 
 /* Outstanding invites (REQ-026). Soonest expiry first, because the useful
@@ -17284,6 +17330,99 @@ static int groups_click(oc_win *hwnd, const oc_model *m, int x, int y) {
     return 0;
 }
 
+/* Admin > Custom emoji (REQ-072): the workspace's catalogue, by name, each with
+ * its picture and who added it, narrowed by the search box. Delete is offered
+ * where the daemon allows it -- to the emoji's creator and to admins and owners
+ * -- and confirms first, since the messages that used it then show its name.
+ * Live: the rows are the model's, which every EMOJI_LIST push replaces. */
+static int emoji_admin_can_delete(const oc_model *m, const oc_custom_emoji *e) {
+    return e->created_by == m->user_id || self_role(m) >= OC_ROLE_ADMIN;
+}
+
+static int emoji_name_cmp(const void *a, const void *b) {
+    return strcmp((*(const oc_custom_emoji *const *)a)->name, (*(const oc_custom_emoji *const *)b)->name);
+}
+
+/* The catalogue's entries the search box admits, sorted by name; how many. */
+static int emoji_admin_rows(const oc_model *m, const oc_custom_emoji **out, int max) {
+    int n = 0;
+    for (size_t i = 0; m && i < m->n_cemoji && n < max; i++)
+        if (!g_emoji_q[0] || strstr(m->cemoji[i].name, g_emoji_q)) out[n++] = &m->cemoji[i];
+    qsort(out, (size_t)n, sizeof *out, emoji_name_cmp);
+    return n;
+}
+
+static void draw_emoji_admin(gfx *rt, const oc_model *m, rectf body) {
+    g_n_emojirows = 0;
+    float y = body.top + 8;
+    g_emoji_search_box = rf(body.left + 20, y, body.right - 20, y + SEARCH_BOX_H);
+    search_box_draw(rt, g_emoji_search_box, OC_COL_INPUT);
+    if (g_efind) field_draw(rt, g_efind, search_text_box(g_emoji_search_box), OC_COL_TEXT);
+    body.top = g_emoji_search_box.bottom + 8;
+
+    const oc_custom_emoji *rows[128];
+    int n = emoji_admin_rows(m, rows, 128);
+    if (g_emoji_focus >= n) g_emoji_focus = n - 1;
+    g_emoji_list = body;
+    if (!m->n_cemoji) {
+        overlay_empty(rt, body, "No custom emoji yet. Workspace menu \u2192 Add custom emoji.");
+        return;
+    }
+    if (!n) { overlay_empty(rt, body, "No custom emoji match."); return; }
+    ovl_use(OVL_EMOJI);
+    float rowh = UIS(44);
+    if (g_emoji_reveal && g_emoji_focus >= 0) {
+        float top = (float)g_emoji_focus * rowh, visible = body.bottom - body.top;
+        if (top < g_ovl_scroll)                      g_ovl_scroll = top;
+        if (top + rowh + 8 > g_ovl_scroll + visible) g_ovl_scroll = top + rowh + 8 - visible;
+    }
+    g_emoji_reveal = 0;
+    float yy = ovl_begin(rt, body, (float)n * rowh + 8);
+    for (int i = 0; i < n; i++) {
+        const oc_custom_emoji *e = rows[i];
+        if (yy + rowh < body.top) { yy += rowh; continue; }
+        if (yy > body.bottom) break;
+        if (i == g_emoji_focus)
+            fill_round(rt, rf(body.left + 8, yy + 2, body.right - 12, yy + rowh - 2), OC_R_CONTROL, OC_COL_HOVER);
+        rectf pic = rf(body.left + 20, yy + 6, body.left + 20 + UIS(32), yy + 6 + UIS(32));
+        if (!draw_avatar_image(rt, e->attachment_id, pic, 3.0f, 1)) avatar_want(e->attachment_id);
+        float tx = pic.right + 12;
+        char nm[56];
+        snprintf(nm, sizeof nm, ":%s:", e->name);
+        draw_text(rt, nm, g_ui, rf(tx, yy + 2, body.right - 130, yy + 22), OC_COL_TEXT);
+        const char *by = oc_model_user_name((oc_model *)m, e->created_by);
+        char sub[160];
+        snprintf(sub, sizeof sub, "Added by %s", (by && by[0]) ? by : "someone no longer here");
+        draw_text(rt, sub, g_meta, rf(tx, yy + 20, body.right - 130, yy + 40), OC_COL_FAINT);
+        if (emoji_admin_can_delete(m, e)) {
+            rectf b = rf(body.right - 116, yy + 8, body.right - 20, yy + 34);
+            int hot = in_rect(b, g_mouse_x, g_mouse_y);
+            fill_round(rt, b, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+            stroke_round(rt, b, OC_R_CONTROL, OC_COL_DANGER, 1.0f);
+            g_meta->align = ST_ALIGN_CENTER;
+            draw_text(rt, "Delete", g_meta, b, OC_COL_DANGER);
+            g_meta->align = ST_ALIGN_LEFT;
+            if (g_n_emojirows < (int)(sizeof g_emojirows / sizeof g_emojirows[0])) {
+                g_emojirows[g_n_emojirows].r = b;
+                snprintf(g_emojirows[g_n_emojirows].name, sizeof g_emojirows[0].name, "%s", e->name);
+                g_n_emojirows++;
+            }
+        }
+        fill(rt, rf(body.left + 20, yy + rowh - 1, body.right - 20, yy + rowh), OC_COL_BORDER);
+        yy += rowh;
+    }
+    ovl_end(rt, body);
+}
+
+/* Ask before deleting `name`: the messages that used it keep the shortcode. */
+static void emoji_delete_ask(oc_win *hwnd, const char *name) {
+    char title[80], body[200];
+    snprintf(g_confirm_emoji, sizeof g_confirm_emoji, "%s", name);
+    snprintf(title, sizeof title, "Delete :%s:?", name);
+    snprintf(body, sizeof body, "Messages that used :%s: will show the name instead.", name);
+    confirm_open(hwnd, CONF_EMOJI_DELETE, 0, title, body, "Delete");
+}
+
 static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
     fill(rt, rf(reg.left, reg.top, reg.right, reg.top + HEADER_H), OC_COL_HEADER);
     draw_text(rt, "Admin", g_display, rf(reg.left + 20, reg.top, reg.right - 20, reg.top + HEADER_H),
@@ -17298,9 +17437,14 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
         { "Invites",   OC_ICON_USER },
         { "Groups",    OC_ICON_USER },
         { "Alerts",    OC_ICON_ALERT },
+        { "Custom emoji", OC_ICON_SMILE },
     };
     float tx = reg.left + 16, ty = reg.top + HEADER_H;
+    int admin = self_role(m) >= OC_ROLE_ADMIN;
     for (int i = 0; i < ADM_COUNT; i++) {
+        /* A member reaches Admin only through the picker's Manage link, and is
+         * shown the one tab it opens. */
+        if (!admin && i != ADM_EMOJI) { g_adm_tabs[i] = rf(0, 0, 0, 0); continue; }
         float tw = 26 + text_width(T[i].label, g_ui) + 16;
         rectf r = rf(tx, ty + 2, tx + tw, ty + TABBAR_H - 1);
         int on = (g_adm_tab == i);
@@ -17313,7 +17457,8 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
     }
 
     rectf body = rf(reg.left, ty + TABBAR_H, reg.right, reg.bottom);
-    if (self_role(m) < OC_ROLE_ADMIN) {
+    if (g_adm_tab == ADM_EMOJI) { draw_emoji_admin(rt, m, body); return; }
+    if (!admin) {
         overlay_empty(rt, body, "Admin only.");
         return;
     }
@@ -18536,14 +18681,14 @@ static int fields_mouse(int kind, float x, float y) {
     if (g_te_open) modal[nm++] = &g_te_field;
     for (int i = 0; i < OC_POLL_MAX_OPTIONS; i++) if (g_pc_opt[i]) modal[nm++] = g_pc_opt[i];
     for (int i = 0; i < FORM_MAX_FIELDS && nm < 24; i++) if (g_form_edit[i]) modal[nm++] = g_form_edit[i];
-    field *shell[8] = { g_pal_edit, g_pick_edit, g_srch, g_find, g_ffind, g_dir_edit, g_si_e_ws, g_si_e_user };
+    field *shell[9] = { g_pal_edit, g_pick_edit, g_srch, g_find, g_ffind, g_dir_edit, g_si_e_ws, g_si_e_user, g_efind };
     if (kind == 1 || kind == 2) {
         /* A drag or a release belongs to the field that took the press. */
         if (g_focus && g_focus->dragging) return field_mouse(g_focus, kind, x, y);
         return 0;
     }
     for (int i = 0; i < nm; i++) if (modal[i]->visible && field_mouse(modal[i], kind, x, y)) return 1;
-    for (int i = 0; i < 8; i++) if (shell[i] && shell[i]->visible && field_mouse(shell[i], kind, x, y)) return 1;
+    for (int i = 0; i < 9; i++) if (shell[i] && shell[i]->visible && field_mouse(shell[i], kind, x, y)) return 1;
     if (g_si_e_pass && g_si_e_pass->visible && field_mouse(g_si_e_pass, kind, x, y)) return 1;
     if (kind == 0 && g_focus) focus_set(NULL);
     return 0;
@@ -24043,7 +24188,10 @@ enum {
     AT_SUMCAL,        /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the summary range card */
     AT_TABLEED,       /* payload: a table editor control (TEA_*) */
     AT_CTABLE,        /* payload: a composer card's slot * 2, + 1 for its Remove (else its Edit) */
-    AT_PASTECHOICE    /* payload: the paste chooser's choice (PCH_*) */
+    AT_PASTECHOICE,   /* payload: the paste chooser's choice (PCH_*) */
+    AT_EMOJIDEL,      /* payload: Admin > Custom emoji's Delete hit-box index */
+    AT_EMOJIFIND,     /* Admin > Custom emoji's search box */
+    AT_PICKMANAGE     /* the emoji picker's Manage link */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -24309,9 +24457,11 @@ static void a11y_publish_scene(const oc_model *m) {
     }
 
     /* Admin's tabs, and Alerts' Acknowledge buttons, named for what they act on. */
-    if (g_view == VIEW_ADMIN && self_role(m) >= OC_ROLE_ADMIN) {
-        static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts" };
+    if (g_view == VIEW_ADMIN) {
+        static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts", "emoji" };
+        int admin = self_role(m) >= OC_ROLE_ADMIN;
         for (int t = 0; t < ADM_COUNT && n < OC_ACC_MAX; t++) {
+            if (!admin && t != ADM_EMOJI) continue;
             char aid[OC_ACC_AID_MAX];
             snprintf(aid, sizeof aid, "admin.tab.%s", TABAID[t]);
             acc_push(items, &n, OC_ACC_BUTTON, aid, TABAID[t], g_adm_tabs[t], ATOK(AT_ADMTAB, (uint64_t)t));
@@ -24328,7 +24478,22 @@ static void a11y_publish_scene(const oc_model *m) {
                 }
                 acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_alertrows[i].r, ATOK(AT_ALERTACK, (uint64_t)i));
             }
+        if (g_adm_tab == ADM_EMOJI) {
+            if (g_efind && g_efind->visible && n < OC_ACC_MAX)
+                acc_push(items, &n, OC_ACC_BUTTON, "admin.emoji.search", "Search custom emoji",
+                         g_emoji_search_box, ATOK(AT_EMOJIFIND, 0));
+            for (int i = 0; i < g_n_emojirows && n < OC_ACC_MAX; i++) {
+                char aid[OC_ACC_AID_MAX], nm[64];
+                snprintf(aid, sizeof aid, "admin.emoji.%s.delete", g_emojirows[i].name);
+                snprintf(nm, sizeof nm, "Delete :%s:", g_emojirows[i].name);
+                acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_emojirows[i].r, ATOK(AT_EMOJIDEL, (uint64_t)i));
+            }
+        }
     }
+
+    if (g_pick_open && g_pick_manage.right > g_pick_manage.left && n < OC_ACC_MAX)
+        acc_push(items, &n, OC_ACC_BUTTON, "picker.manage", "Manage custom emoji",
+                 g_pick_manage, ATOK(AT_PICKMANAGE, 0));
 
     /* The notices: each toast's action and close, named by what they act on, so
      * a screen reader and the keyboard reach what the pointer does (REQ-290). */
@@ -25478,6 +25643,32 @@ static void layout_files_find(oc_win *hwnd) {
     int want = (g_view == VIEW_FILES) && !window_is_covered() &&
                g_file_search_box.right > g_file_search_box.left;
     field_show(g_ffind, want);
+}
+
+/* Admin > Custom emoji's search box, on the same rules: its own view and tab. */
+static void layout_emoji_find(oc_win *hwnd) {
+    (void)hwnd;
+    if (!g_efind) return;
+    int want = (g_view == VIEW_ADMIN) && g_adm_tab == ADM_EMOJI && !window_is_covered() &&
+               g_emoji_search_box.right > g_emoji_search_box.left;
+    field_show(g_efind, want);
+}
+static void efind_changed(field *f) {
+    snprintf(g_emoji_q, sizeof g_emoji_q, "%s", f->buf);
+    g_emoji_focus = -1;        /* another list: its first row is a key away */
+}
+/* Esc gives the keyboard back to the pane; Down, Enter and Tab take it on to the
+ * rows, where emoji_admin_key has it. */
+static int efind_key(field *f, int key, int ctrl, int shift) {
+    (void)f; (void)ctrl; (void)shift;
+    if (key == OCK_ESCAPE) { focus_set(NULL); return 1; }
+    if (key == OCK_DOWN || key == OCK_RETURN || key == OCK_TAB) {
+        focus_set(NULL);
+        g_emoji_focus = 0;     /* the paint takes it back to -1 on an empty list */
+        g_emoji_reveal = 1;
+        return 1;
+    }
+    return 0;
 }
 
 /* The People pane's search box, written to the same rules as the Files one:
@@ -27970,6 +28161,46 @@ static int wsmgr_key(oc_win *hwnd, int vk) {
     return 1;
 }
 
+/* Admin > Custom emoji's keys while no field has them, on the Workspaces
+ * dialog's pattern: the arrows, Page Up/Down, Home and End move through the rows
+ * and Delete asks about the one selected, where Delete is offered. Tab is the
+ * way to the search box, and Esc takes the keyboard off the row. */
+static int emoji_admin_key(oc_win *hwnd, int vk) {
+    const oc_model *m = model();
+    if (!m || g_view != VIEW_ADMIN || g_adm_tab != ADM_EMOJI || window_is_covered()) return 0;
+    if (vk == OCK_TAB) { focus_set(g_efind); return 1; }
+    if (vk == OCK_ESCAPE) {
+        if (g_emoji_focus < 0) return 0;
+        g_emoji_focus = -1;
+        return 1;
+    }
+    const oc_custom_emoji *rows[128];
+    int n = emoji_admin_rows(m, rows, 128);
+    if (n <= 0) return 0;
+    float rowh = UIS(44), visible = g_emoji_list.bottom - g_emoji_list.top;
+    int page = rowh > 0 ? (int)(visible / rowh) : 1;
+    if (page < 1) page = 1;
+    int at = g_emoji_focus;
+    switch (vk) {
+    case OCK_DOWN:  at = at < 0 ? 0 : at + 1; break;
+    case OCK_UP:    at = at < 0 ? 0 : at - 1; break;
+    case OCK_NEXT:  at = at < 0 ? 0 : at + page; break;
+    case OCK_PRIOR: at = at < 0 ? 0 : at - page; break;
+    case OCK_HOME:  at = 0; break;
+    case OCK_END:   at = n - 1; break;
+    case OCK_DELETE:
+        if (at >= 0 && at < n && emoji_admin_can_delete(m, rows[at]))
+            emoji_delete_ask(hwnd, rows[at]->name);
+        return 1;
+    default: return 0;
+    }
+    if (at < 0) at = 0;
+    if (at >= n) at = n - 1;
+    g_emoji_focus = at;
+    g_emoji_reveal = 1;
+    return 1;
+}
+
 static int on_click(oc_win *hwnd, int x, int y) {
     crumb("click %d %d view=%d", x, y, g_view);
     /* Toasts are painted above everything, a dialog included, so they are
@@ -28393,6 +28624,9 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 if (g_client) oc_client_srvalert_ack(g_client, g_alertrows[i].id);
                 return 1;
             }
+    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_EMOJI)
+        for (int i = 0; i < g_n_emojirows; i++)
+            if (in_rect(g_emojirows[i].r, x, y)) { emoji_delete_ask(hwnd, g_emojirows[i].name); return 1; }
     if (g_view == VIEW_ADMIN && g_adm_tab == ADM_INVITES)
         for (int i = 0; i < g_n_invrows; i++)
             if (in_rect(g_invrows[i].r, x, y)) {
@@ -32863,6 +33097,9 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         g_view = VIEW_ADMIN; layout_composer(hwnd);
         admin_select(ADM_GROUPS);
         break;
+    case 94:   /* Admin > Custom emoji (REQ-072), which a member is shown too */
+        emoji_manage_open(hwnd);
+        break;
     case 74:  /* Threads (REQ-062), the same destination the shelf row opens.
                * 51/52 belong to the profile menu's status items — the dispatch
                * space is shared, which is exactly the collision the context
@@ -33401,7 +33638,7 @@ static void *devlist_thread(void *arg) {
 /* The open confirmation, and which one: the harness answers some of them
  * (scripts/gui/drive.sh trust_dev_cert, lib.sh sign_in_card), signed in or not. */
 static void test_dump_confirm(FILE *f) {
-    fprintf(f, "confirm open=%d act=%d url=\"%s\"\n", g_confirm_open, g_confirm_act, g_confirm_url);
+    fprintf(f, "confirm open=%d act=%d url=\"%s\" emoji=\"%s\"\n", g_confirm_open, g_confirm_act, g_confirm_url, g_confirm_emoji);
 }
 
 /* THE TREE ITSELF, one line per element, so a check outside the client
@@ -34029,6 +34266,23 @@ static void test_dump(const char *path) {
             g_about_archive.left, g_about_archive.top,
             g_about_archive.right, g_about_archive.bottom);
     fprintf(f, "cemoji=%zu\n", m->n_cemoji);
+    /* Admin > Custom emoji: what it lists, in order, and each Delete offered. */
+    {
+        const oc_custom_emoji *er[128];
+        int en = emoji_admin_rows(m, er, 128);
+        fprintf(f, "emojiadmin shown=%d q=\"%s\" n=%d dels=%d manage=%.0f,%.0f,%.0f,%.0f sel=%s searching=%d\n",
+                g_view == VIEW_ADMIN && g_adm_tab == ADM_EMOJI, g_emoji_q, en, g_n_emojirows,
+                g_pick_manage.left, g_pick_manage.top, g_pick_manage.right, g_pick_manage.bottom,
+                g_emoji_focus >= 0 && g_emoji_focus < en ? er[g_emoji_focus]->name : "-",
+                g_efind && g_focus == g_efind);
+        for (int i = 0; i < en; i++) {
+            rectf d = rf(0, 0, 0, 0);
+            for (int k = 0; k < g_n_emojirows; k++)
+                if (!strcmp(g_emojirows[k].name, er[i]->name)) d = g_emojirows[k].r;
+            fprintf(f, "  emojirow %s by=%llu del=%.0f,%.0f,%.0f,%.0f\n", er[i]->name,
+                    (unsigned long long)er[i]->created_by, d.left, d.top, d.right, d.bottom);
+        }
+    }
     for (size_t i = 0; i < m->n_cemoji; i++)
         fprintf(f, "  cemoji %s attach=%llu\n", m->cemoji[i].name,
                 (unsigned long long)m->cemoji[i].attachment_id);
@@ -34242,6 +34496,7 @@ static void test_dump(const char *path) {
             { "find",  g_find,      find_box() },
             { "srch",  g_srch,      g_srch_box },
             { "files", g_ffind,     g_file_search_box },
+            { "emoji", g_efind,     g_emoji_search_box },
             { "people", g_dir_edit, g_dir_search_box },
             { "pal",   g_pal_edit,  g_pal_box },
             { "pick",  g_pick_edit, g_pick_box },
@@ -35390,6 +35645,20 @@ static void test_poll(oc_win *hwnd) {
         if (g_sel) { g_menu_target = g_sel; channel_menu_run(hwnd, atoi(arg)); }
     } else if (!strcmp(verb, "emoji_del")) {
         oc_client_delete_emoji(g_client, arg); test_ack("ok");
+    } else if (!strcmp(verb, "emoji_add")) {
+        /* `emoji_add <name> <path>`: upload the image into the open conversation
+         * and register it as :name:, as Add custom emoji does past its dialogs. */
+        char nm[48] = "";
+        const char *sp = strchr(arg, ' ');
+        if (g_client && g_sel && sp && sp > arg && (size_t)(sp - arg) < sizeof nm) {
+            memcpy(nm, arg, (size_t)(sp - arg)); nm[sp - arg] = 0;
+            oc_client_upload_emoji(g_client, g_sel, nm, sp + 1);
+            test_ack("ok");
+        } else test_ack("err");
+    } else if (!strcmp(verb, "emoji_find")) {
+        /* `emoji_find <text>|-`: type into Admin > Custom emoji's search box. */
+        if (g_efind) { field_set(g_efind, strcmp(arg, "-") ? arg : ""); test_ack("ok"); }
+        else test_ack("err");
     } else if (!strcmp(verb, "groupdm")) {
         /* REQ-056. `groupdm <name>,<name>[,...]` — the menu item opens a form the
          * harness would have to type into and dismiss; this is the call underneath. */
@@ -36196,11 +36465,13 @@ static void unresolved_notice(oc_win *hwnd, const oc_model *m, int update) {
 /* Every drawn field, made once with the window: its placeholder, its keys and
  * its change hook. */
 static void fields_create(void) {
-    static field find, ffind, dir, srch, pal, pick, si[3];
+    static field find, ffind, efind, dir, srch, pal, pick, si[3];
     field_init(&find, "Find a conversation", 0, 0);
     find.key = find_key; find.changed = find_changed; find.maxlen = 63; g_find = &find;
     field_init(&ffind, "Search files", 0, 0);
     ffind.changed = ffind_changed; ffind.maxlen = 63; g_ffind = &ffind;
+    field_init(&efind, "Search custom emoji", 0, 0);
+    efind.key = efind_key; efind.changed = efind_changed; efind.maxlen = 47; g_efind = &efind;
     field_init(&dir, "Search people", 0, 0);
     dir.changed = dir_changed; dir.maxlen = 79; g_dir_edit = &dir;
     field_init(&srch, "Search messages", 0, 0);
@@ -37643,6 +37914,7 @@ static int on_key_down(oc_win *hwnd, int wp) {
         }
         if (wp == OCK_ESCAPE && g_more_open) { g_more_open = 0; invalidate(); return 0; }
         if (wp == OCK_ESCAPE && g_has_sel) { g_has_sel = 0; invalidate(); return 0; }
+        if (emoji_admin_key(hwnd, wp)) { invalidate(); return 0; }
         /* The composer LAST among the specific cases and before the shell's
          * fall-through: the overlays above own Esc while they are open, and the
          * field owns every other key while it has focus. The field is not a
@@ -37818,6 +38090,16 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
         }
         case AT_ADMTAB:
             if (g_view == VIEW_ADMIN && (int)arg < ADM_COUNT) admin_select((int)arg);
+            break;
+        case AT_EMOJIDEL:
+            if (g_view == VIEW_ADMIN && g_adm_tab == ADM_EMOJI && (int)arg < g_n_emojirows)
+                emoji_delete_ask(hwnd, g_emojirows[arg].name);
+            break;
+        case AT_EMOJIFIND:
+            if (g_efind && g_efind->visible) focus_set(g_efind);
+            break;
+        case AT_PICKMANAGE:
+            if (g_pick_open) emoji_manage_open(hwnd);
             break;
         case AT_ALERTACK:
             if (g_view == VIEW_ADMIN && g_adm_tab == ADM_ALERTS && (int)arg < g_n_alertrows && g_client)

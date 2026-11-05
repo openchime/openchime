@@ -11,6 +11,7 @@
 //                               writes them to its own scratch directory
 //   attach <path> -> the file copied onto the page's filesystem first, so the
 //                    verb names a path the client can read
+//   emoji_add <name> <path> -> the same, for the image a custom emoji is made of
 //   <dir>/quit -> the page and the browser are closed and this process ends
 //
 //   node scripts/web/drive.mjs <dir> <url> [chromium-executable]
@@ -182,6 +183,10 @@ async function serve(line) {
     const onPage = '/up/' + path.basename(arg);
     await fsWrite(onPage, fs.readFileSync(arg));
     cmd = `${verb} ${onPage}`;
+  } else if (verb === 'emoji_add' && arg && arg.indexOf(' ') > 0 && fs.existsSync(arg.slice(arg.indexOf(' ') + 1))) {
+    const sp = arg.indexOf(' '), file = arg.slice(sp + 1), onPage = '/up/' + path.basename(file);
+    await fsWrite(onPage, fs.readFileSync(file));
+    cmd = `${verb} ${arg.slice(0, sp)} ${onPage}`;
   }
   const wait = verb === 'shot' || verb === 'shotfull' ? 15000 : 10000;
   const ack = await hook(cmd, wait);

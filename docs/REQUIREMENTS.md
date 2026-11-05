@@ -2455,7 +2455,9 @@ choose — which makes each one a per-frontend *obligation*.*
   **context menus have a keyboard route**: Ctrl+Up / Ctrl+Down put the keyboard on
   a message, Shift+F10 (or the Menu key) opens that message's actions — or, with
   no message under the keyboard, the conversation's own — and the menu that opens
-  is walked with the arrows and chosen from with Enter. A
+  is walked with the arrows and chosen from with Enter. **Admin → Custom emoji**
+  opens from the palette, and its search box and rows take Tab, the arrows and
+  Delete (CLIENT.md). A
   self-drawn UI gets nothing for free here, which is exactly why this is a
   requirement and not an assumption: the cost grows with every pane added.
 
