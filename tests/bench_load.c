@@ -180,10 +180,32 @@ static void *run_worker(void *arg) {
         char cname[32]; snprintf(cname, sizeof cname, "bench-%d", W->idx);
         oc_wbuf_init(&w, b, sizeof b);
         oc_create_channel cc = { oc_slice_str(cname), 0 };
-        if (oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) == OC_OK &&
-            write_all(&c.conn, b, w.len) == 0 &&
-            read_frame(&c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO) {
-            oc_channel_info ci; if (oc_decode_channel_info(&p, &ci) == OC_OK) cid = ci.channel_id;
+        if (oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) != OC_OK ||
+            write_all(&c.conn, b, w.len) != 0) {
+            fprintf(stderr, "bench_load: sender %d: CREATE_CHANNEL not sent\n", W->idx);
+        } else {
+            /* Read to the CHANNEL_INFO, past what the daemon pushes after
+             * sign-in: WORKSPACE_INFO, SNOOZE, TTS_INFO, CAPABILITIES, STT_INFO
+             * and SERVER_BUILD arrive first. Taking the first frame as the
+             * answer left the channel id 0, and the sender then skipped every
+             * send in silence. */
+            int done = 0;
+            for (int k = 0; k < 64 && !done; k++) {
+                if (read_frame(&c, &hdr, &p) != 0) break;
+                if (hdr.msg_type == OC_MSG_CHANNEL_INFO) {
+                    oc_channel_info ci;
+                    if (oc_decode_channel_info(&p, &ci) == OC_OK) cid = ci.channel_id;
+                    done = 1;
+                } else if (hdr.msg_type == OC_MSG_ERROR) {
+                    oc_error e;
+                    if (oc_decode_error(&p, &e) == OC_OK)
+                        fprintf(stderr, "bench_load: sender %d: CREATE_CHANNEL refused, error %u\n", W->idx, (unsigned)e.code);
+                    else
+                        fprintf(stderr, "bench_load: sender %d: CREATE_CHANNEL refused\n", W->idx);
+                    done = 1;
+                }
+            }
+            if (!cid && !done) fprintf(stderr, "bench_load: sender %d: no CHANNEL_INFO\n", W->idx);
         }
     }
 
@@ -198,9 +220,10 @@ static void *run_worker(void *arg) {
         s.body = oc_slice_str("ping");
         double t0 = now_ms();
         if (oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) != OC_OK || write_all(&c.conn, b, w.len) != 0) break;
-        /* Read until this send's ACK (draining its own broadcast). */
+        /* Read until this send's ACK, past its own broadcast and anything the
+         * daemon pushes meanwhile, within a bound. */
         int got = 0;
-        for (int k = 0; k < 8 && !got; k++) {
+        for (int k = 0; k < 64 && !got; k++) {
             if (read_frame(&c, &hdr, &p) != 0) { got = -1; break; }
             if (hdr.msg_type == OC_MSG_SEND_ACK) {
                 oc_send_ack a; if (oc_decode_send_ack(&p, &a) == OC_OK && memcmp(a.idem, idem, OC_IDEM_SIZE) == 0) got = 1;
@@ -255,5 +278,11 @@ int main(int argc, char **argv) {
            ok, n, total_sends, p50, p90, p99, mx);
     for (int i = 0; i < n; i++) free(ws[i].lat);
     free(all); free(ws); free(th);
+    /* Sends asked for and none measured is a broken run, not a fast one: its
+     * percentiles above are all 0.00. */
+    if (sends > 0 && k == 0) {
+        fprintf(stderr, "bench_load: %d sends per connection asked for, none measured\n", sends);
+        return 1;
+    }
     return ok == n ? 0 : 1;
 }

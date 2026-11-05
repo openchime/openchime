@@ -71,3 +71,9 @@ echo "Message round-trip latency ($LAT_N concurrent senders, isolated channels):
 # authenticated, and the run then reported rtt 0.00 from the handful that made
 # it -- a broken measurement that looked like a great one.
 ./build/bench_load 127.0.0.1 "$PROTO_PORT" "$LAT_N" 20 8 "$NUSERS" | sed 's/^/  /'
+# The pipe's status is bench_load's (pipefail): a run that measured no sends,
+# or lost connections, fails the benchmark instead of reading as a result.
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  echo "bench: the latency phase failed (see above); its numbers are not a measurement" >&2
+  exit 1
+fi
