@@ -1474,6 +1474,37 @@ where one exists.
   The family has been bounded like every other (REQ-251a) and aged out on its
   own (REQ-251b), so an agent reading heavily has never pushed security or
   administrative entries out of the log.
+- **REQ-330.** A person has been able to **ask the assistant** a question in
+  plain words — from an Ask pane in the GUI, and from the action launcher in the
+  terminal client — and has been answered from the messages they can read. **The
+  asker's read access has been its only scope**: exactly the history search
+  covers for them (REQ-080/081), checked when the question is asked, so a channel
+  they have left, a private channel they are not in, a deleted message and an
+  encrypted DM (REQ-314) have never informed an answer, and two people asking the
+  same question have each been answered from their own access alone. The
+  assistant has had no access of its own (ARCH-121).
+- **REQ-331.** **Every answer has cited the messages it used**, each citation a
+  permalink (REQ-232) that has shown the message it cites and gone to it. A
+  statement citing nothing has not been shown. Where nothing the asker can read
+  bears on the question, the answer has said so rather than answering from the
+  model's own knowledge.
+- **REQ-332.** The assistant has **taken no actions and posted nothing**: it has
+  sent, edited, reacted, invited, scheduled and changed nothing, and has had no
+  identity a message could be posted under. An answer has gone only to the person
+  who asked; whatever of their conversation with it is kept has been theirs alone,
+  seen by no other member, owner or admin. Supervised reply stays an integration
+  (REQ-275).
+- **REQ-333.** **Nothing has left the box**: the question, the messages read for
+  it and the answer have been handled on the workspace's own server by a local
+  model, on the summary engine (ARCH-116), and the assistant has had no hosted
+  model option, whatever summaries are set to (REQ-313). The one thing fetched
+  from outside has been the model itself, on first use, checked against a pinned
+  digest.
+- **REQ-334.** The assistant has been **absent where no model is configured**: off
+  unless the operator turns it on, and off — with the reason in the log and the
+  rest of the server running — where the model cannot be fetched or loaded, the CPU
+  cannot run it, or it does not fit the deployment's memory (REQ-210). Where it is
+  off, no client has shown it.
 
 ---
 
@@ -2317,10 +2348,13 @@ feature.*
   rejects or sends — has been an external integration built on webhooks
   (REQ-170/173) and the MCP surface, not a product feature. Two things this once
   excluded have since been admitted, each under requirements of its own in §7: an
-  authenticated MCP surface, and an assistant that answers a person's questions
-  from what they can read and takes no action. Summaries of a channel or DM
-  (REQ-310) are a core feature and are not an assistant: they answer no questions,
-  take no actions and post nothing.
+  authenticated MCP surface (REQ-320–325, ARCH-120), and a first-party assistant
+  (REQ-330–334, ARCH-121). The assistant is built, and answers only: it answers a
+  person's questions from what they can read, citing the messages it used, and
+  takes no action and posts nothing. It runs locally, on the workspace's own
+  server with a local model, and nothing it reads or answers leaves the box.
+  Summaries of a channel or DM (REQ-310) are a core feature and are not an
+  assistant: they answer no questions, take no actions and post nothing.
 - **REQ-315.** *(Excluded by decision)* **Translating the clients' interface** into other
   languages has not been provided. It touches every string in three clients, and
   is a separate project to be taken up as one, not a feature added piece by piece.
