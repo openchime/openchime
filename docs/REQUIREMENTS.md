@@ -2273,6 +2273,33 @@ messages (author name, ARCH-74).*
     file CONTENT scanning is a different problem (size, binary formats) and is
     **out of scope** — recorded rather than silently omitted.
 
+- **REQ-360.** A team has been able to **move its history into OpenChime, and an
+  operator to take a portable copy out** (ARCH-124). The export has been a
+  **documented, versioned folder** ([EXPORT.md](./EXPORT.md)): one JSON Lines
+  file per kind — users, channels and DMs with their members, messages with
+  their threads, reactions, pins, attachments — the attachments' bytes beside
+  them, and a manifest carrying the format version, record counts and digests.
+  It has been written by an operator command of the daemon binary, run against
+  the workspace's own database. The import has read the same folder into a
+  fresh or existing workspace, keeping **each message's original time and
+  author**: a person has been **matched to an existing account by email**, and
+  one with no match has been **created deactivated**, so authorship survived
+  without opening an account nobody asked for, and the import's report has
+  listed them. Sessions, credentials, encrypted DMs and drafts have never been
+  exported. Converters from other products have been left to third parties,
+  which the published format is for.
+
+  **This is migration, not compliance capture (REQ-276) or legal hold
+  (REQ-252).** Capture is continuous, keeps edits and deletions, and delivers to
+  an archive the tenant names; a hold suspends retention. An export is one
+  operator's copy of the history as it stands, taken to move a team.
+
+  **It has been customer-side only, in every deployment model (ARCH-76).** The
+  export has been written by the tenant's own daemon to a place its operator
+  chose, and the import read by one; no service the project operates has read,
+  carried or stored either, so central has still never read message content
+  (REQ-040/041).
+
 ---
 
 ## 15. Client Experience and UI Shell
