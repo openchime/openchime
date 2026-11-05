@@ -1418,11 +1418,62 @@ where one exists.
   incoming/outgoing webhooks (REQ-170/173). Because the client-daemon wire is a
   custom binary protocol (ARCH-6), an external API has been an additional surface
   (likely HTTP over the ALPN-demuxed listener, ARCH-32/54), not the wire itself.
+  The **MCP surface** (REQ-320–325, ARCH-120) has been the first such surface: an
+  AI agent, or a person's own AI client, has read and posted through it.
 - **REQ-177.** A channel has been able to receive posts by **email-to-channel
   ingestion** — a per-channel address that turns an inbound email into a channel
   message — the inbound-email complement to incoming webhooks (REQ-170). Delivery
   has required inbound email reception, a deployment capability separate from the
   daemon's request handling (cf. the webhook CA-cert note, REQ-171).
+- **REQ-320.** The daemon has served an **MCP (Model Context Protocol) endpoint**,
+  `POST /mcp`, on the 2026-07-28 revision of the protocol, over the
+  ALPN-demuxed HTTP listener (ARCH-32/54) — **stateless**: every request has
+  stood alone, carrying its protocol version and its credential, with no
+  session, no handshake and no stream held open between requests (ARCH-120).
+  The endpoint has been **off unless the operator turns it on**; while it is off
+  the path has not existed. A request on another revision has been refused with
+  the revision the daemon speaks, and every request has been rate-limited per
+  principal (REQ-190/191).
+- **REQ-321.** A workspace has been able to have **agents**: an AI agent has been
+  an account of its own kind, created and removed by an owner or admin, that
+  reads and posts through the MCP surface and nothing else — it has not signed
+  in to a client, been in a DM or group DM, or been reachable by one. **Channel
+  membership has been its only access control**: an agent has read and posted in
+  exactly the channels it has been added to, and in no other, with no scopes or
+  per-tool grants beside that. An agent has **not counted against the
+  registered-user cap** (AUTH.md §2), and every member surface that lists or
+  names one has marked it as an agent.
+- **REQ-322.** An agent has authenticated with a **bearer token the daemon
+  minted**: random, shown once when an owner or admin creates it, stored only
+  hashed, as a session or webhook token is (ARCH-58/71), listed by name and
+  creation and last-use time, and **revocable** — a revoked token, or one whose
+  agent was removed, has been refused on the very next request. Tokens have
+  needed no identity source and no OpenChime-operated service, so agents have
+  worked on a workspace with nothing else configured and on one that is
+  air-gapped, in every deployment model (ARCH-76).
+- **REQ-323.** A person has been able to **connect their own AI client** to the
+  workspace through the MCP surface, and that client has acted **as them, with
+  exactly their access** — the channels and DMs they can read and post in, no
+  more — for as long as the connection stands. The client has signed in through
+  **MCP's OAuth authorization flow with the daemon as the authorization
+  server**, the person approving it on the daemon's own pages after signing in
+  there as they normally do; a person has been able to see and end their
+  connections, and an ended connection, or a removed person's, has been refused
+  on the next request. Encrypted DMs (REQ-314) have stayed unreadable through
+  it, since the daemon cannot read them.
+- **REQ-324.** A **write through the MCP surface has been visibly attributed**: an
+  agent's post has been authored by the agent and shown as an agent's, and a
+  post through a person's connection has been authored by the person and shown
+  as sent through their AI client — so no reader has mistaken either for
+  something a person typed. Posts have otherwise been ordinary messages,
+  delivered, notified, searched and retained as any other.
+- **REQ-325.** **Reads through the MCP surface have been recorded** in an audit
+  family of their own (REQ-251) — each history read and search, with who made
+  it, through which agent or connection, in which channel, and how many messages
+  it returned, never their content — and each post with the message it made.
+  The family has been bounded like every other (REQ-251a) and aged out on its
+  own (REQ-251b), so an agent reading heavily has never pushed security or
+  administrative entries out of the log.
 
 ---
 
@@ -1954,16 +2005,17 @@ messages (author name, ARCH-74).*
   paid-tier history *cap* (REQ-053 stands).
 - **REQ-251.** The daemon has recorded an **audit log** of administrative and
   security-relevant actions, **append-only, admin-readable, and kept apart from
-  the message store** (ARCH-79). The catalog has covered four families:
+  the message store** (ARCH-79). The catalog has covered five families:
   **administrative** (role change, user invite/remove, channel archive,
   retention or storage-policy change), **account lifecycle** (registration,
   password change, invite redeemed, owner bootstrap), **security** (a successful
-  sign-in, session revocation, failed authentication, denied privileged action), and
+  sign-in, session revocation, failed authentication, denied privileged action),
   **moderation** (a moderator deleting another user's message, removing a member
-  from a channel). A sign-in is recorded when a credential is proven — a password
-  or an identity-provider token — and not when an already-authenticated session
-  reconnects, so the log answers "who signed in, when" rather than counting
-  reconnects. Each entry has recorded when, who acted, what action, on what
+  from a channel), and **MCP access** (each read, search and post made through
+  the MCP surface, REQ-325). A sign-in is recorded when a credential is proven
+  — a password or an identity-provider token — and not when an
+  already-authenticated session reconnects, so the log answers "who signed in,
+  when" rather than counting reconnects. Each entry has recorded when, who acted, what action, on what
   target, and the outcome — **never the secret involved**: that a password
   changed, never the password; that an invite was redeemed, never the token.
 - **REQ-251a.** The audit log has been **bounded**, since an unbounded table on a
@@ -2258,12 +2310,17 @@ feature.*
   Reaffirmed on 2026-10-31: shared channels would reopen the island model
   (ARCH-4, REQ-040) -- one daemon trusting another, identities from a foreign
   workspace, and a question of where each copy of a message is stored.
-- **REQ-275.** *(Excluded by decision)* A **first-party bot/assistant and an MCP (Model Context Protocol)
-  server surface** have not been provided beyond the third-party app platform
-  (REQ-172). OpenChime ships no built-in assistant and exposes no MCP server; such
-  a thing could be built as an installed app, but is not a core feature. Summaries
-  of a channel or DM (REQ-310) are a core feature and are not an assistant: they
-  answer no questions, take no actions and post nothing.
+- **REQ-275.** *(Excluded by decision)* A **first-party bot that acts or posts on
+  its own** has not been provided: nothing in the product posts, invites or
+  changes anything unless a person, or an integration the workspace installed
+  (REQ-172), asks it to. Supervised reply — an agent drafts, a person edits,
+  rejects or sends — has been an external integration built on webhooks
+  (REQ-170/173) and the MCP surface, not a product feature. Two things this once
+  excluded have since been admitted, each under requirements of its own in §7: an
+  authenticated MCP surface, and an assistant that answers a person's questions
+  from what they can read and takes no action. Summaries of a channel or DM
+  (REQ-310) are a core feature and are not an assistant: they answer no questions,
+  take no actions and post nothing.
 - **REQ-315.** *(Excluded by decision)* **Translating the clients' interface** into other
   languages has not been provided. It touches every string in three clients, and
   is a separate project to be taken up as one, not a feature added piece by piece.
