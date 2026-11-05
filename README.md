@@ -40,11 +40,11 @@ or broken is not a document — it is the
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The `ARCH-N` decision record: every architectural choice and its rationale. Design decisions live here; product scope lives in REQUIREMENTS.md. |
 | [PROTOCOL.md](docs/PROTOCOL.md) | The byte-level wire protocol — frame layout, the handshake, every message type and its payload, the error codes, and the connection state machine. Its §9 registry indexes every opcode the codec defines. |
 | [SCHEMA.md](docs/SCHEMA.md) | The SQLite schema and the migration mechanism, documenting every migration and why each table is shaped the way it is. |
-| [CLIENT.md](docs/CLIENT.md) | The client architecture: one shared C app-core with a native UI per platform, and the internals of the Win32 GUI — its self-drawn composer, modal frame, native-child rules, and the paint ledger the audit reads. |
+| [CLIENT.md](docs/CLIENT.md) | The client architecture: one shared C app-core with a native UI per platform, and the internals of the Win32 GUI — its self-drawn composer, modal frame, native-child rules, and the paint ledger the harness reads. |
 | [AUTH.md](docs/AUTH.md) | The two authentication modes — local Argon2id accounts and OIDC brokered by a central relay — and the daemon-issued session both converge on. |
 | [TLS.md](docs/TLS.md) | How the daemon terminates TLS and how a client trusts it: trust-on-first-use certificate pinning against a self-signed cert, with no CA anywhere on the client-facing path. |
 | [CONFIG.md](docs/CONFIG.md) | Every environment variable the daemon reads, with its default and meaning. There is no configuration file. |
-| [TESTING.md](docs/TESTING.md) | The test strategy and its two tiers, what CI runs, the measured capacity benchmark, and the GUI's two harnesses — the boot check and the visual audit that checks a render against itself rather than against a second binary. |
+| [TESTING.md](docs/TESTING.md) | The test strategy and its two tiers, what CI runs, the measured capacity benchmark, and the GUI's harnesses, the boot check first among them. |
 | [MARKDOWN.md](docs/MARKDOWN.md) | The message-formatting dialect — a Slack-compatible subset plus real lists — where it is parsed, and the places it deliberately differs. |
 | [CALLS.md](docs/CALLS.md) | Calls: the Calls section, starting, inviting, ending and missed calls, the call view, and the end-to-end encryption — device keys, per-sender keys sealed with HPKE, packets in SFrame — with what it does and does not guarantee; and screen sharing in calls — the codec as a wire contract, fragments, NACKs and keyframe requests inside the encryption, rate control, and the Windows surfaces. |
 | [AUDIO.md](docs/AUDIO.md) | A call's audio: the relay that never decodes, the client engine — echo cancellation, noise suppression, Opus with FEC and DTX, the adaptive jitter buffer, the mixer — and the ERLE harness that measures the canceller. |
@@ -292,15 +292,9 @@ toolbar (REQ-220/ARCH-100), drafts, scheduled send, the notification schedule
 with keywords and priority people, cross-channel threads, the People directory
 and link-unfurl cards all run end to end with their daemon halves.
 
-**Two harnesses, and they answer different questions.** `scripts/gui/smoke.sh`
-asks whether the client boots and runs, in about ten seconds, by hand before
-pushing a client change (TESTING.md "Reading the GUI smoke"). `scripts/gui/audit.sh` is the long one, walking every surface across
-themes, DPI settings and text sizes and checking each captured scene against
-properties it must hold on its own — a string that fits its box, ink that can be
-read against what is behind it, one label not drawn over another, nothing drawn
-where it cannot be reached. It needs no reference image: a render is checked against itself
-rather than against a second binary. See
-[TESTING.md](docs/TESTING.md).
+**The GUI smoke.** `scripts/gui/smoke.sh` asks whether the client boots and
+runs, in about ten seconds, by hand before pushing a client change (TESTING.md
+"Reading the GUI smoke"). See [TESTING.md](docs/TESTING.md).
 
 Every desktop shares one portable self-rendered application layer over SDL3 and
 sdltext, with a thin native shim per platform (ARCH-80), so Linux and macOS are

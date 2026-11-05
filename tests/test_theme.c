@@ -1,12 +1,10 @@
 /* The palette's contrast guarantee (REQ-262, ARCH-82).
  *
- * The audit (scripts/gui/audit.sh) grades whatever ink happens to land on
- * whatever surface in a captured frame. That is a useful check and it is not a
- * guarantee: it is empirical, so a pair no scene renders is never graded; it
- * reads text ops only; and it runs on a Windows box against one colour scheme
- * when somebody remembers. Both defects this file exists for were live while it
- * passed — no scene leaves a draft, so the pencil was never drawn, and the
- * scenes that show a composer either type into it or were run under Midnight.
+ * Grading whatever ink happens to land on whatever surface in a captured frame
+ * is not a guarantee: it is empirical, so a pair no scene renders is never
+ * graded. Both defects this file exists for were of that kind -- no scene left
+ * a draft, so the pencil was never drawn, and the scenes that showed a composer
+ * either typed into it or ran under Midnight.
  *
  * So the guarantee is asserted here instead, over the whole product of ink,
  * surface, mode and scheme, from the palette itself. No frame is captured and

@@ -52,11 +52,10 @@ trap 'kill $D 2>/dev/null; wait $D 2>/dev/null' EXIT
 APP="https://127.0.0.1:$PORT/app/?host=127.0.0.1&port=$PORT&env=OPENCHIME_DEV_SIGNIN%3Dalice%3Apw"
 for _ in $(seq 1 100); do grep -q "healthz listening" "$W/daemon.log" 2>/dev/null && break; sleep 0.1; done
 # The client (openchime.html): the Windows application compiled for the
-# browser, signed in with the bootstrapped owner. Its test hook dumps the model
-# after a while and takes the client's own screenshot, which is left in
-# $W/gui.bmp for a person to look at.
+# browser, signed in with the bootstrapped owner. Its test hook polls the model
+# until it is signed in and logs the dump's sign-in line.
 {
-    URL2="$APP&wait=authed&shot=1"
+    URL2="$APP&hook=1&wait=authed"
     timeout 90 "$CHROME" --headless=new --no-sandbox --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader --ignore-certificate-errors \
         --hide-scrollbars --window-size=1280,800 --enable-logging=stderr --v=0 \
         --user-data-dir="build/webtest-profile/gui" --no-first-run --disable-background-networking \
@@ -64,22 +63,13 @@ for _ in $(seq 1 100); do grep -q "healthz listening" "$W/daemon.log" 2>/dev/nul
     C2=$!
     gok=0
     for _ in $(seq 1 320); do
-        if grep -q '"SHOT:' "$W/chrome-gui.log" 2>/dev/null; then gok=1; break; fi
+        if grep -q '"DUMP:' "$W/chrome-gui.log" 2>/dev/null; then gok=1; break; fi
         kill -0 $C2 2>/dev/null || break
         sleep 0.25
     done
     kill $C2 2>/dev/null; wait $C2 2>/dev/null
     dump=$(grep -oE '"DUMP:[^"]*' "$W/chrome-gui.log" | head -1 | cut -c7-)
     echo "  gui: $dump"
-    python3 - "$W" <<'PY'
-import re, sys, base64
-w = sys.argv[1]
-log = open(w + '/chrome-gui.log', errors='replace').read()
-m = re.search(r'"SHOT:([A-Za-z0-9+/=]+)', log)
-if m:
-    open(w + '/gui.bmp', 'wb').write(base64.b64decode(m.group(1)))
-    print('  gui: screenshot in ' + w + '/gui.bmp')
-PY
     if ! { [ $gok = 1 ] && grep -q 'authed=1 connected=1' <<<"$dump"; }; then
         echo "webtest: FAIL (gui) -- see $W/chrome-gui.log" >&2
         exit 1
