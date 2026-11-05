@@ -1420,6 +1420,45 @@ where one exists.
   (likely HTTP over the ALPN-demuxed listener, ARCH-32/54), not the wire itself.
   The **MCP surface** (REQ-320–325, ARCH-120) has been the first such surface: an
   AI agent, or a person's own AI client, has read and posted through it.
+  It has been designed as a **documented HTTP API** for reading history,
+  searching and posting, kept beside the MCP surface for agents rather than in
+  place of it (ARCH-123, REQ-350–354); the proposal is
+  [Plans/HTTP-API.md](./Plans/HTTP-API.md).
+- **REQ-350.** The HTTP API has been a **stable, versioned contract**: served
+  under a path that names its major version, documented as the reference an
+  integration is written against, and changed within a version only by
+  additions — a new field, a new endpoint, a new optional parameter. A change
+  that could break a working integration has been a new major version, served
+  beside the old one for a stated time, never a silent change to the old
+  (ARCH-123).
+- **REQ-351.** The HTTP API has been **authenticated by agent tokens**, and by
+  nothing else: a request has carried a bearer token the daemon minted for an
+  **agent principal** — a non-human account, distinct from any person, created
+  and revoked by an owner/admin — stored only as its hash, as a session token is
+  (ARCH-58). The agent's **channel memberships have been its only access**: it
+  has read, searched and posted in the channels it was added to, and nowhere
+  else, whatever the role of the person who created it. A person's session
+  token or browser sign-in has not opened the API (ARCH-123).
+- **REQ-352.** Every HTTP API request has been checked by **the same membership
+  checks as the wire handlers** that do the same thing — reading history,
+  searching, posting, replying in a thread — run against the agent's current
+  memberships at the time of the request, so removing an agent from a channel
+  has taken effect on its next request. Search has stayed bounded to history
+  the agent may read (REQ-031, REQ-081), an archived channel has refused posts
+  as it does on the wire, and an encrypted DM (REQ-314), which the daemon
+  cannot read, has been neither served nor posted to.
+- **REQ-353.** Every HTTP API **read and write has been audited** in the audit
+  log (REQ-251): when, which agent, what it did, on which channel or message,
+  and the outcome — refusals included, and **never the token** nor a message
+  body. API and MCP entries have shared one audit family of their own, so their
+  volume has aged out by itself (REQ-251b) and has not pushed out the
+  administrative record.
+- **REQ-354.** The HTTP API has been **rate-limited per token**, with reads,
+  searches and posts counted separately, answering excess requests with a
+  distinct "too many requests" status and the time to wait rather than
+  dropping them, and reporting on every response the limit, what remains of it
+  and when it resets, so a well-behaved integration has been able to pace itself
+  without ever being refused (cf. REQ-190, ARCH-71's per-token webhook limit).
 - **REQ-177.** A channel has been able to receive posts by **email-to-channel
   ingestion** — a per-channel address that turns an inbound email into a channel
   message — the inbound-email complement to incoming webhooks (REQ-170). Delivery
