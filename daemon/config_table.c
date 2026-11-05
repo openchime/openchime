@@ -77,7 +77,7 @@ const cfg_row OC_CFG[] = {
     { "OPENCHIME_OIDC_CONNECT_%d", CFG_CUSTOM, CFG_OPERATOR, G_SET, NULL,
       "A direct connection to your own provider, 1 to 4 (SSO.md): `label=…;issuer=https://…;client_id=…;secret_file=…;subject=sub|oid;redirect=127.0.0.1|localhost`.",
       0, 0, NULL, 0, cfg_parse_connect, CFG_PATTERN, OC_OIDC_MAX_CONNECT },
-    PATHR("OPENCHIME_EXTRA_CA", CFG_OPERATOR, G_SET, NULL, "PEM roots trusted beside the built-in ones for every outbound connection (push, enrollment, unfurls, S3): a service behind a private CA.", F(extra_ca), NULL, CFG_MUST_EXIST, 0),
+    PATHR("OPENCHIME_EXTRA_CA", CFG_OPERATOR, G_SET, NULL, "PEM roots the daemon trusts beside the built-in ones for its own outbound connections (push, enrollment, unfurls, S3): a service behind a private CA. No client reads it: a client trusts a private CA only through the operating system's store.", F(extra_ca), NULL, CFG_MUST_EXIST, 0),
     CUSTOM("OPENCHIME_TRUSTED_PROXIES", CFG_OPERATOR, G_SET, NULL,
            "Addresses or CIDRs whose PROXY protocol v2 header is believed, comma-separated; the connection's address is then the one the proxy saw.",
            cfg_parse_trusted_proxies, 0),

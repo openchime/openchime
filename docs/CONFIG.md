@@ -175,7 +175,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_HEALTH_PORT` | `8080` | The plaintext port for `/healthz` and the landing page (ARCH-25); 0 opens none. Integer 0..65535. |
 | `OPENCHIME_JOIN` | *(unset)* | Who may join by signing in through a provider: `domain:`, `tenant:`, `subject:` and `owner:` rules, comma-separated (AUTH.md §8.4). Unset: only by invitation. |
 | `OPENCHIME_OIDC_CONNECT_<n>` | *(unset)* | A direct connection to your own provider, 1 to 4 (SSO.md): `label=…;issuer=https://…;client_id=…;secret_file=…;subject=sub|oid;redirect=127.0.0.1|localhost`. |
-| `OPENCHIME_EXTRA_CA` | *(unset)* | PEM roots trusted beside the built-in ones for every outbound connection (push, enrollment, unfurls, S3): a service behind a private CA. |
+| `OPENCHIME_EXTRA_CA` | *(unset)* | PEM roots the daemon trusts beside the built-in ones for its own outbound connections (push, enrollment, unfurls, S3): a service behind a private CA. No client reads it: a client trusts a private CA only through the operating system's store. |
 | `OPENCHIME_TRUSTED_PROXIES` | *(unset)* | Addresses or CIDRs whose PROXY protocol v2 header is believed, comma-separated; the connection's address is then the one the proxy saw. |
 
 ### Features
