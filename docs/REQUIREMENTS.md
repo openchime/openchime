@@ -2276,3 +2276,7 @@ feature.*
   not been supported. A channel's conversation is one stream with threads under
   its messages (REQ-060); a second level would change how every message is placed,
   read and searched.
+- **REQ-318.** *(Excluded by decision)* **Joining a call from a phone line** (dial-in over
+  the PSTN or SIP) has not been supported. A phone participant's audio could not
+  be end-to-end encrypted (REQ-306), and the bridge would need a SIP or PSTN
+  gateway and a paid telephony vendor in the call's path.

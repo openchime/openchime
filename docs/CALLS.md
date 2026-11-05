@@ -242,6 +242,10 @@ CTR is older than a **1024-packet window** or already seen in it (replay).
 
 ### 5.6 What it does not
 
+- **Nobody joins from a phone line.** A participant dialling in over the PSTN or
+  SIP would reach the call through a gateway that hears the audio, so the call could
+  not stay end-to-end encrypted; joining by phone is excluded (REQUIREMENTS.md
+  REQ-318).
 - **The daemon hands out the device keys.** A daemon that substituted its own key for a
   participant's could sit in the middle of the key exchange. Detecting that needs a
   **safety number** the people can compare, and there is none: the
