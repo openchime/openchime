@@ -1166,6 +1166,15 @@ static int g_pref_daysep    = 1;   /* date dividers in the transcript */
 /* 1 = the rich editor (formatting shown, markup hidden),
  * 0 = plain text, where the markup is what you see and the field never restyles
  * what you typed. Rich by default: it is the mode that needs no explaining. */
+/* The shape last set, for the test dump's `cursor kind=`: a harness reads the
+ * client's own state, since a detached session's pointer and a synthetic hover
+ * report nothing it could check. -1 before any. */
+static int g_cursor_kind = -1;
+static const char *cursor_kind_name(void) {
+    static const char *const N[3] = { "arrow", "ibeam", "hand" };
+    return g_cursor_kind >= 0 && g_cursor_kind <= 2 ? N[g_cursor_kind] : "none";
+}
+
 static int g_pref_richtext  = 1;
 /* The formatting toolbar belongs to the rich editor. In plain text it would
  * offer buttons for markup already on screen, and the honest shape of that mode
@@ -33384,11 +33393,13 @@ static void test_dump(const char *path) {
             const oc_model *sm = oc_client_model(g_si_client);
             if (sm) fprintf(f, "signin last_error=%s signin_url=%.120s\n", sm->last_error, sm->signin_url);
         }
+        fprintf(f, "cursor kind=%s\n", cursor_kind_name());
         test_dump_confirm(f);
         test_dump_a11y(f);
         fclose(f); return;
     }
     fprintf(f, "mode=%s\n", oc_env_is_dev() ? "development" : "normal");
+    fprintf(f, "cursor kind=%s\n", cursor_kind_name());
     fprintf(f, "authed=%d connected=%d sel=%llu members=%d\n",
             m->authed, m->connected, (unsigned long long)g_sel, g_show_members);
     /* Whether the DM picker is open (`dmcompose 0|1`), so a harness waits for
@@ -36062,18 +36073,18 @@ static void test_poll(oc_win *hwnd) {
  * intent reads better as an edge. */
 static void cursor_want(int kind) {
     static SDL_Cursor *cur[3];
-    static int have, current = -1;
+    static int have;
     if (!have) {
         cur[0] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
         cur[1] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_TEXT);
         cur[2] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
         have = 1;
     }
-    if (kind < 0 || kind > 2 || kind == current)
+    if (kind < 0 || kind > 2 || kind == g_cursor_kind)
         return;
     if (cur[kind])
         SDL_SetCursor(cur[kind]);
-    current = kind;
+    g_cursor_kind = kind;
 }
 
 /* The notice for a message that named people it could not reach (REQ-287),

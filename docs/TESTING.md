@@ -2070,6 +2070,16 @@ offered= on= mode= hold= sent= answered= words= err=` and the button rects — a
 its `toast[n]` lines. Not in CI, for the smoke's reason. Run it when a change
 touches voice input, the composer's controls or the device layer.
 
+## Reading the cursor harness
+
+The pointer a detached Windows session reports is suppressed, and the harness's
+hover is a synthetic mouse event, so neither says what shape the cursor took.
+The client does: the test dump's `cursor kind=<arrow|ibeam|hand|none>` line, in
+the signed-in dump and the signed-out one alike, is the shape it last set
+(`none` before any). `scripts/gui/cursor.sh` (Windows and the web) sends a
+message with a link, then hovers the composer's text, the link and empty space
+with `move`, and asserts `ibeam`, `hand` and `arrow` in turn.
+
 ## Seeing the whole window
 
 `scripts/gui/drive.sh shot <name>` produces one image of the entire
