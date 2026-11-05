@@ -8,6 +8,8 @@
 #include "check.h"
 #include "richtext.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static oc_rt_span g_sp[OC_RT_MAX];
@@ -466,6 +468,478 @@ static void test_table_flatten(void) {
     for (size_t i = 0; i < n; i++) CHECK((unsigned char)small[i] != 0xC3 || i + 1 < n);
 }
 
+/* Time tokens (MARKDOWN.md §1c): what is one, and what is not. */
+static void test_time_tokens(void) {
+    const char *b = "Meet at <time:2026-10-30T15:00Z> please";
+    int64_t ms = 0;
+    CHECK(span_over(b, "<time:2026-10-30T15:00Z>", OC_RT_TIME));
+    CHECK(content_spans(b, OC_RT_TIME) == 1);
+    {
+        size_t n = scan(b), i;
+        for (i = 0; i < n && g_sp[i].style != OC_RT_TIME; i++) {}
+        CHECK(i < n && oc_rt_time_value(b, strlen(b), &g_sp[i], &ms) && ms == 1793372400000LL);
+    }
+    /* Seconds, and a leap day that exists. */
+    CHECK(span_over("<time:2028-02-29T00:00:30Z>", "<time:2028-02-29T00:00:30Z>", OC_RT_TIME));
+    /* Not a token: a day that does not exist, an hour past 23, no Z, an
+     * offset instead of Z, a space for the T, a leap day in a common year. */
+    CHECK(content_spans("<time:2026-02-30T10:00Z>", OC_RT_TIME) == 0);
+    CHECK(content_spans("<time:2026-10-30T24:00Z>", OC_RT_TIME) == 0);
+    CHECK(content_spans("<time:2026-10-30T15:00>", OC_RT_TIME) == 0);
+    CHECK(content_spans("<time:2026-10-30T15:00+01:00>", OC_RT_TIME) == 0);
+    CHECK(content_spans("<time:2026-10-30 15:00Z>", OC_RT_TIME) == 0);
+    CHECK(content_spans("<time:2026-02-29T10:00Z>", OC_RT_TIME) == 0);
+    CHECK(content_spans("<time:2026-10-30T15:00Z", OC_RT_TIME) == 0);
+    /* Code is literal. */
+    CHECK(content_spans("`<time:2026-10-30T15:00Z>`", OC_RT_TIME) == 0);
+    CHECK(content_spans("```\n<time:2026-10-30T15:00Z>\n```", OC_RT_TIME) == 0);
+    /* Inside emphasis it is still one. */
+    CHECK(span_over("*by <time:2026-10-30T15:00Z>*", "<time:2026-10-30T15:00Z>", OC_RT_TIME));
+    /* The token for a moment, and back. */
+    {
+        char t[48];
+        CHECK(oc_rt_time_token(1793372400000LL, t, sizeof t) > 0 && strcmp(t, "<time:2026-10-30T15:00Z>") == 0);
+        CHECK(oc_rt_time_token(1835395230000LL, t, sizeof t) > 0 && strcmp(t, "<time:2028-02-29T00:00:30Z>") == 0);
+        CHECK(oc_rt_time_token(-60000LL, t, sizeof t) > 0 && strcmp(t, "<time:1969-12-31T23:59Z>") == 0);
+        CHECK(oc_rt_time_token(1793372400000LL, t, 8) == 0);
+    }
+}
+
+/* A moment as a reader is shown it: their zone, their clock, "today". */
+static void test_time_text(void) {
+    const int64_t at = 1793372400000LL;                 /* Friday 30 October 2026, 15:00 UTC */
+    char out[96];
+    /* The same day for the reader: the time alone. */
+    oc_rt_clock utc0 = { 0, 1, 0, at };
+    oc_rt_time_text(at, &utc0, OC_RT_TIME_SHORT, out, sizeof out);
+    CHECK(strcmp(out, "15:00") == 0);
+    /* UTC-8, same day there: 07:00. */
+    oc_rt_clock la = { -480, 1, 0, at };
+    oc_rt_time_text(at, &la, OC_RT_TIME_SHORT, out, sizeof out);
+    CHECK(strcmp(out, "07:00") == 0);
+    /* UTC+5:30, and the 12-hour clock. */
+    oc_rt_clock in = { 330, 0, 0, at };
+    oc_rt_time_text(at, &in, OC_RT_TIME_SHORT, out, sizeof out);
+    CHECK(strcmp(out, "8:30 PM") == 0);
+    /* UTC+14: across the date line it is Saturday there. "Now" is the same
+     * instant, so it is today -- the reader's today, not UTC's. */
+    oc_rt_clock kiri = { 840, 1, 0, at };
+    oc_rt_time_text(at, &kiri, OC_RT_TIME_SHORT, out, sizeof out);
+    CHECK(strcmp(out, "05:00") == 0);
+    oc_rt_time_text(at, &kiri, OC_RT_TIME_FULL, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Saturday 31 October 2026, 05:00 (UTC+14:00)") == 0);
+    /* A day earlier than now, in the reader's zone: with the date. */
+    oc_rt_clock later = { -480, 1, 0, at + 86400000LL };
+    oc_rt_time_text(at, &later, OC_RT_TIME_SHORT, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Fri 30 Oct, 07:00") == 0);
+    /* Another year: with the year. */
+    oc_rt_clock nextyear = { 0, 1, 0, at + 400LL * 86400000LL };
+    oc_rt_time_text(at, &nextyear, OC_RT_TIME_SHORT, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Fri 30 Oct 2026, 15:00") == 0);
+    /* The full form names the zone used. */
+    oc_rt_time_text(at, &in, OC_RT_TIME_FULL, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Friday 30 October 2026, 8:30 PM (UTC+05:30)") == 0);
+    oc_rt_time_text(at, &la, OC_RT_TIME_FULL, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Friday 30 October 2026, 07:00 (UTC-08:00)") == 0);
+    oc_rt_time_text(at, &utc0, OC_RT_TIME_FULL, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Friday 30 October 2026, 15:00 (UTC)") == 0);
+    /* Midnight and noon on the 12-hour clock. */
+    oc_rt_clock h12 = { 0, 0, 0, at };
+    oc_rt_time_text(at - 15LL * 3600000LL, &h12, OC_RT_TIME_SHORT, out, sizeof out);
+    CHECK(strcmp(out, "12:00 AM") == 0);
+    oc_rt_time_text(at - 3LL * 3600000LL, &h12, OC_RT_TIME_SHORT, out, sizeof out);
+    CHECK(strcmp(out, "12:00 PM") == 0);
+    /* No reader -- the daemon -- says UTC. */
+    oc_rt_clock daemon = { 330, 1, 1, at };
+    oc_rt_time_text(at, &daemon, OC_RT_TIME_SHORT, out, sizeof out);
+    CHECK(strcmp(out, "15:00 UTC") == 0);
+    oc_rt_time_text(at, &daemon, OC_RT_TIME_FULL, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Friday 30 October 2026, 15:00 UTC") == 0);
+}
+
+/* An excerpt carries the time as text, in the reader's zone or UTC. */
+static void test_time_flatten(void) {
+    const int64_t at = 1793372400000LL;
+    char out[160];
+    const char *b = "Standup <time:2026-10-30T15:00Z>, and `<time:2026-10-30T15:00Z>` stays";
+    oc_rt_clock in = { 330, 1, 0, at };
+    oc_rt_flatten_at(b, strlen(b), &in, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Standup 20:30, and `<time:2026-10-30T15:00Z>` stays") == 0);
+    /* With a table before it, both are replaced, in order. */
+    const char *t = "| a |\n|---|\n| 1 |\nthen <time:2026-10-30T15:00Z>";
+    oc_rt_clock utc = { 0, 1, 1, at };
+    oc_rt_flatten_at(t, strlen(t), &utc, out, sizeof out);
+    /* contract: the excerpt wording is what MARKDOWN.md §1a and §1b specify */
+    CHECK(strcmp(out, "Table: 1 row \xC3\x97 1 column\nthen 15:00 UTC") == 0);
+    /* An invalid token is text, as written. */
+    oc_rt_flatten_at("<time:2026-13-01T00:00Z>", 24, &in, out, sizeof out);
+    CHECK(strcmp(out, "<time:2026-13-01T00:00Z>") == 0);
+}
+
+/* Every token is the reader's, however many there are and however many other
+ * spans come before them: 200 tokens, each after an emphasis of three spans,
+ * are 800 spans, far past what fits in OC_RT_MAX. */
+static void test_time_every_token(void) {
+    const int64_t at = 1793372400000LL;                 /* Friday 30 October 2026, 15:00 UTC */
+    oc_rt_clock utc0 = { 0, 1, 0, at };
+    enum { N = 200 };
+    static char body[N * 32], want[N * 16], out[N * 16];
+    size_t bl = 0, wl = 0;
+    for (int k = 0; k < N; k++) {
+        bl += (size_t)snprintf(body + bl, sizeof body - bl, "*a* <time:2026-10-30T15:00Z> ");
+        wl += (size_t)snprintf(want + wl, sizeof want - wl, "*a* 15:00 ");
+    }
+    CHECK(oc_rt_scan(body, bl, NULL, 0) == 4 * N);
+    /* An excerpt: every one its text, every other byte kept. */
+    CHECK(oc_rt_flatten_at(body, bl, &utc0, out, sizeof out) == wl);
+    CHECK(strcmp(out, want) == 0);
+    /* The terminal client's body: the same. */
+    char *loc = oc_rt_local_times(body, bl, &utc0);
+    CHECK(loc && strcmp(loc, want) == 0);
+    free(loc);
+}
+
+/* Spoilers (MARKDOWN.md §1d): both forms, and what is not one. */
+static void test_spoilers(void) {
+    oc_rt_spoiler sp[4];
+    const char *b = "The killer is >!the *butler*!< obviously";
+    CHECK(span_over(b, "the *butler*", OC_RT_SPOILER));
+    CHECK(span_over(b, "butler", OC_RT_BOLD));                 /* emphasis inside */
+    CHECK(oc_rt_spoilers(b, strlen(b), sp, 4) == 1);
+    CHECK(sp[0].start == 14 && sp[0].len == 16 && sp[0].hidden == 16 && sp[0].hidden_len == 12 &&
+          !sp[0].block && !sp[0].cell && sp[0].label_len == 0);
+    /* Not a spoiler: empty, white space alone, across lines, unclosed, inside code. */
+    CHECK(content_spans("a >!!< b", OC_RT_SPOILER) == 0);
+    CHECK(content_spans("a >!   !< b", OC_RT_SPOILER) == 0);
+    CHECK(content_spans(">!one\ntwo!<", OC_RT_SPOILER) == 0);
+    CHECK(content_spans("a >!never closed", OC_RT_SPOILER) == 0);
+    CHECK(content_spans("`>!code!<`", OC_RT_SPOILER) == 0);
+    CHECK(content_spans("```\n>!code!<\n```", OC_RT_SPOILER) == 0);
+    CHECK(oc_rt_spoilers("x >! y", 6, sp, 4) == 0);
+    /* The old inline form is ordinary text, with no span at all. */
+    CHECK(scan("||not hidden||") == 0);
+    CHECK(scan("a || b || c") == 0);
+    CHECK(oc_rt_spoilers("||not hidden||", 14, sp, 4) == 0);
+    /* The block form, with a label and lines of text (not code) in it. */
+    const char *k = "Before\n```spoiler Ending\nShe *lives*.\nThe end.\n```\nAfter";
+    CHECK(span_over(k, "She *lives*.\nThe end.", OC_RT_SPOILER_BLOCK));
+    CHECK(span_over(k, "lives", OC_RT_BOLD));
+    CHECK(content_spans(k, OC_RT_CODEBLOCK) == 0);
+    CHECK(oc_rt_spoilers(k, strlen(k), sp, 4) == 1 && sp[0].block);
+    CHECK(sp[0].label_len == 6 && memcmp(k + sp[0].label, "Ending", 6) == 0);
+    CHECK(sp[0].start == 7 && k[sp[0].start + sp[0].len] == '\n');
+    /* No label; and a fence whose word is not "spoiler" stays code. */
+    const char *nl = "```spoiler\nhidden\n```";
+    CHECK(oc_rt_spoilers(nl, strlen(nl), sp, 4) == 1 && sp[0].block && sp[0].label_len == 0);
+    CHECK(content_spans("```spoilers\nx\n```", OC_RT_SPOILER_BLOCK) == 0);
+    CHECK(content_spans("```spoilers\nx\n```", OC_RT_CODEBLOCK) == 1);
+    /* A body is `len` bytes, not a C string: nothing past it is read. Here
+     * the bytes after the body would make it a spoiler if they were. */
+    const char buf[] = "plain text```spoiler\nx\n```";
+    CHECK(oc_rt_spoilers(buf, 10, sp, 4) == 0);
+}
+
+/* `>!` at the start of a line, where a `>` is a quote everywhere else. */
+static void test_spoiler_line_start(void) {
+    oc_rt_spoiler sp[4];
+    /* Closed, it is a spoiler and there is no quote. */
+    CHECK(span_over(">!hidden!<", "hidden", OC_RT_SPOILER));
+    CHECK(content_spans(">!hidden!<", OC_RT_QUOTE) == 0);
+    CHECK(span_over(">!a!< and more", "a", OC_RT_SPOILER));
+    CHECK(content_spans(">!a!< and more", OC_RT_QUOTE) == 0);
+    CHECK(content_spans("  >!a!<", OC_RT_QUOTE) == 0 && content_spans("  >!a!<", OC_RT_SPOILER) == 1);
+    CHECK(content_spans("first\n>!a!<\nlast", OC_RT_SPOILER) == 1 && content_spans("first\n>!a!<\nlast", OC_RT_QUOTE) == 0);
+    /* Unclosed or empty, it is the quote it always was, and hides nothing. */
+    CHECK(span_over(">!text", ">!text", OC_RT_QUOTE) == 0);
+    CHECK(span_over(">!text", "!text", OC_RT_QUOTE));
+    CHECK(content_spans(">!text", OC_RT_SPOILER) == 0);
+    CHECK(span_over(">!!<", "!!<", OC_RT_QUOTE));
+    CHECK(content_spans(">!!<", OC_RT_SPOILER) == 0);
+    CHECK(content_spans(">!a\nb!<", OC_RT_QUOTE) == 1 && content_spans(">!a\nb!<", OC_RT_SPOILER) == 0);
+    /* A quote that holds one, and a list that holds one. */
+    CHECK(span_over("> >!text!<", ">!text!<", OC_RT_QUOTE));
+    CHECK(span_over("> >!text!<", "text", OC_RT_SPOILER));
+    CHECK(span_over(">>!text!<", "text", OC_RT_SPOILER));
+    CHECK(content_spans(">>!text!<", OC_RT_QUOTE) == 1);
+    CHECK(span_over("> say >!text!< now", "text", OC_RT_SPOILER));
+    CHECK(span_over("- >!text!<", "text", OC_RT_SPOILER));
+    /* A plain quote is untouched, and a `!` only opens straight after the `>`. */
+    CHECK(span_over("> quoted", "quoted", OC_RT_QUOTE));
+    CHECK(span_over(">quoted!", "quoted!", OC_RT_QUOTE));
+    CHECK(content_spans("> !x!<", OC_RT_QUOTE) == 1 && content_spans("> !x!<", OC_RT_SPOILER) == 0);
+    /* Escaped, either half: no spoiler; `\>` is no quote either. */
+    CHECK(content_spans("\\>!x!<", OC_RT_SPOILER) == 0 && content_spans("\\>!x!<", OC_RT_QUOTE) == 0);
+    CHECK(content_spans(">\\!x!<", OC_RT_SPOILER) == 0 && content_spans(">\\!x!<", OC_RT_QUOTE) == 1);
+    CHECK(oc_rt_spoilers("\\>!x!<", 6, sp, 4) == 0);
+}
+
+/* What was left open by the syntax, each the reading that shows least. */
+static void test_spoiler_edges(void) {
+    oc_rt_spoiler sp[4];
+    /* Any place in a word, and with spaces inside. */
+    CHECK(span_over("a>!b!<c", "b", OC_RT_SPOILER));
+    CHECK(span_over("say >! both !< now", " both ", OC_RT_SPOILER));
+    /* Nested: the whole of it, and no second spoiler inside. */
+    const char *n = ">!a >!b!< c!< d";
+    CHECK(oc_rt_spoilers(n, strlen(n), sp, 4) == 1);
+    CHECK(sp[0].hidden == 2 && sp[0].hidden_len == 9);
+    CHECK(content_spans(n, OC_RT_SPOILER) == 1);
+    /* More openers than closers: out to the last closer. */
+    const char *u = "x >!a >!b!< d";
+    CHECK(oc_rt_spoilers(u, strlen(u), sp, 4) == 1 && sp[0].hidden_len == strlen("a >!b"));
+    /* Two side by side stay two. */
+    CHECK(oc_rt_spoilers(">!a!< x >!b!<", 13, sp, 4) == 2);
+    /* An escaped closer does not close. */
+    CHECK(span_over(">!a\\!<b!<", "a\\!<b", OC_RT_SPOILER));
+    /* Emphasis cannot cut one in two, whichever starts first. */
+    const char *e = "*a >!b* c!< d*";
+    CHECK(span_over(e, "b* c", OC_RT_SPOILER));
+    CHECK(span_over(e, "a >!b* c!< d", OC_RT_BOLD));
+    CHECK(span_over(">!*bold*!<", "bold", OC_RT_BOLD));
+    CHECK(span_over(">!`code`!<", "code", OC_RT_CODE));
+    CHECK(span_over("*>!x!<*", "x", OC_RT_SPOILER));
+    /* Nor can a link's label; a whole link inside is a link. */
+    const char *l = "[a >!b](https://example.com/x) c!<";
+    CHECK(span_over(l, "b](https://example.com/x) c", OC_RT_SPOILER));
+    CHECK(content_spans(l, OC_RT_LABELLED) == 0);
+    CHECK(span_over(">![a](https://example.com/x)!<", "a", OC_RT_LABELLED));
+    CHECK(span_over(">![a](https://example.com/x)!<", "[a](https://example.com/x)", OC_RT_SPOILER));
+    /* An address ends at the closer, which is neither part of it nor missed. */
+    CHECK(span_over(">!https://example.com/x!<", "https://example.com/x", OC_RT_LINK));
+    CHECK(span_over(">!https://example.com/x!<", "https://example.com/x", OC_RT_SPOILER));
+    CHECK(span_over("see >!at https://example.com/x!!< ok", "https://example.com/x", OC_RT_LINK));
+    /* A time token's `>` before the closer does not read as an opener. */
+    const char *t = ">!at <time:2026-10-30T15:00Z>!<";
+    CHECK(oc_rt_spoilers(t, strlen(t), sp, 4) == 1 && sp[0].hidden_len == strlen("at <time:2026-10-30T15:00Z>"));
+    CHECK(content_spans(t, OC_RT_TIME) == 1);
+    /* Code wins when it starts first, and hides a closer inside it. */
+    CHECK(content_spans("`a >!b` c!<", OC_RT_SPOILER) == 0);
+    CHECK(span_over(">!a `b!<` c!<", "a `b!<` c", OC_RT_SPOILER));
+    /* A fence inside one on its line is its text, not a block that shows. */
+    const char *f = ">! ```a``` !<";
+    CHECK(oc_rt_spoilers(f, strlen(f), sp, 4) == 1 && content_spans(f, OC_RT_CODEBLOCK) == 0);
+    /* Bounded like every delimiter: a line of openers, none closed, is text. */
+    {
+        static char many[8001];
+        for (size_t i = 0; i < 8000; i += 2) memcpy(many + i, ">!", 2);
+        many[8000] = 0;
+        CHECK(oc_rt_spoilers(many, 8000, NULL, 0) == 0);
+    }
+}
+
+/* A spoiler in a table cell: the row splits round it, and it is listed. */
+static void test_spoiler_cells(void) {
+    oc_rt_span cs[16];
+    oc_rt_spoiler sp[8];
+    oc_rt_table t[2];
+    oc_rt_cell cells[OC_RT_TABLE_MAX_COLS];
+    oc_rt_rowit it;
+    uint32_t row;
+    const char *b = "| Who | What |\n|---|---|\n| >!Ada!< | plain |\n| x | >!y!< and >!z!< |";
+    CHECK(oc_rt_tables(b, strlen(b), t, 2) == 1 && t[0].cols == 2 && t[0].rows == 2);
+    /* oc_rt_scan still reports the table as one span. */
+    CHECK(content_spans(b, OC_RT_TABLE) == 1 && content_spans(b, OC_RT_SPOILER) == 0);
+    CHECK(oc_rt_spoilers(b, strlen(b), NULL, 0) == 3);
+    CHECK(oc_rt_spoilers(b, strlen(b), sp, 8) == 3);
+    CHECK(sp[0].cell && sp[1].cell && sp[2].cell);
+    CHECK(memcmp(b + sp[0].hidden, "Ada", 3) == 0 && sp[0].hidden_len == 3);
+    /* The cell's own spans say the same. */
+    oc_rt_rows_begin(&it, b, strlen(b), &t[0]);
+    CHECK(oc_rt_row_next(&it, cells, &row));
+    CHECK(oc_rt_row_next(&it, cells, &row) && row == 1);
+    size_t ns = oc_rt_scan_cell(b, cells[0].start, cells[0].len, cs, 16);
+    CHECK(ns == 3 && cs[1].style == OC_RT_SPOILER && cs[1].start == sp[0].hidden && cs[1].len == 3);
+
+    /* A pipe inside one separates nothing, either way round, escaped or not. */
+    const char *p = "| a | b |\n|---|---|\n| >!x|y!< | c |\n| >!u\\|v!< | w |";
+    CHECK(oc_rt_tables(p, strlen(p), t, 2) == 1 && t[0].cols == 2);
+    CHECK(oc_rt_spoilers(p, strlen(p), sp, 8) == 2);
+    CHECK(sp[0].hidden_len == 3 && memcmp(p + sp[0].hidden, "x|y", 3) == 0);
+    oc_rt_rows_begin(&it, p, strlen(p), &t[0]);
+    oc_rt_row_next(&it, cells, &row);
+    oc_rt_row_next(&it, cells, &row);
+    CHECK(cells[0].len == strlen(">!x|y!<") && cells[1].len == 1 && p[cells[1].start] == 'c');
+    /* In a header too. */
+    const char *h = "| >!x|y!< | c |\n|---|---|\n| 1 | 2 |";
+    CHECK(oc_rt_tables(h, strlen(h), t, 2) == 1 && t[0].cols == 2);
+    CHECK(oc_rt_spoilers(h, strlen(h), sp, 8) == 1 && sp[0].cell);
+    /* A `>!` that does not close leaves the pipes alone, and hides nothing. */
+    const char *o = "| a | b |\n|---|---|\n| >!x | y |";
+    CHECK(oc_rt_tables(o, strlen(o), t, 2) == 1 && oc_rt_spoilers(o, strlen(o), sp, 8) == 0);
+    /* `>!` in a cell's code opens nothing, and takes no pipe with it. */
+    const char *k = "| a | b |\n|---|---|\n| `>!x` | y!< |";
+    CHECK(oc_rt_tables(k, strlen(k), t, 2) == 1 && oc_rt_spoilers(k, strlen(k), sp, 8) == 0);
+    oc_rt_rows_begin(&it, k, strlen(k), &t[0]);
+    oc_rt_row_next(&it, cells, &row);
+    oc_rt_row_next(&it, cells, &row);
+    CHECK(cells[1].len == 3 && memcmp(k + cells[1].start, "y!<", 3) == 0);
+    /* A row may begin with one, with no leading pipe, and so may the header:
+     * it is no block marker. A row's quote still stops a table starting. */
+    const char *n = ">!x!< | b\n---|---\n>!y!< | d";
+    CHECK(oc_rt_tables(n, strlen(n), t, 2) == 1 && t[0].rows == 1);
+    CHECK(oc_rt_spoilers(n, strlen(n), sp, 8) == 2 && sp[0].cell && sp[0].start == 0);
+    CHECK(oc_rt_tables("> x | b\n---|---\n", 16, t, 2) == 0);
+
+    /* A cell past the columns says so, for a frontend whose grid never draws it. */
+    const char *xc = "| a | b |\n|---|---|\n| >!p!< | y | >!q!< |";
+    CHECK(oc_rt_spoilers(xc, strlen(xc), sp, 8) == 2 && sp[0].cell && !sp[0].extra && sp[1].cell && sp[1].extra);
+
+    /* The old form in a row is cells and ordinary text. */
+    const char *leak = "| a | b |\n|---|---|\n| ||TABLELEAK|| | c |";
+    CHECK(oc_rt_tables(leak, strlen(leak), t, 2) == 1);
+    CHECK(oc_rt_spoilers(leak, strlen(leak), sp, 8) == 0);
+    oc_rt_rows_begin(&it, leak, strlen(leak), &t[0]);
+    oc_rt_row_next(&it, cells, &row);
+    oc_rt_row_next(&it, cells, &row);
+    CHECK(cells[0].len == 0 && cells[1].len == 0);
+
+    /* In a table inside a block, it goes with the block. */
+    const char *in = "```spoiler\n| a |\n|---|\n| >!x!< |\n```";
+    CHECK(oc_rt_spoilers(in, strlen(in), sp, 8) == 1 && sp[0].block && !sp[0].cell);
+    /* Beside the block, the text and a table, each is counted in order. */
+    const char *mix = ">!a!<\n\n| h |\n|---|\n| >!b!< |\n\n```spoiler\nc\n```\n\nand >!d!<";
+    CHECK(oc_rt_spoilers(mix, strlen(mix), sp, 8) == 4);
+    CHECK(!sp[0].cell && sp[1].cell && sp[2].block && !sp[2].cell && !sp[3].cell);
+}
+
+/* A cell's spoiler in every excerpt, including the tables past the 32 an
+ * excerpt summarises and a cut past the 32 spoilers it lists. */
+static void test_spoiler_cell_excerpt(void) {
+    char out[4096];
+    const char *b = "| a | b |\n|---|---|\n| >!SECRET!< | c |";
+    oc_rt_plain_excerpt(b, strlen(b), out, sizeof out);
+    CHECK(strstr(out, "Table: 1 row") == out && !strstr(out, "SECRET"));
+    oc_rt_flatten(b, strlen(b), out, sizeof out);
+    CHECK(!strstr(out, "SECRET"));
+    oc_rt_clock k = { 0, 1, 1, 0 };
+    oc_rt_flatten_at(b, strlen(b), &k, out, sizeof out);
+    CHECK(!strstr(out, "SECRET"));
+    /* A first cell with no leading pipe starts where its table does. */
+    const char *f = ">!SECRET!< | b\n---|---\n1 | 2";
+    oc_rt_plain_excerpt(f, strlen(f), out, sizeof out);
+    CHECK(strstr(out, "Table: 1 row") == out && !strstr(out, "SECRET"));
+    /* Past the 32 tables an excerpt sums up, nothing is shown: not a spoiler
+     * in a declared cell, an extra one, or the text after them. */
+    {
+        static char many[4096];
+        size_t o = 0;
+        for (int i = 0; i < 32; i++) o += (size_t)snprintf(many + o, sizeof many - o, "| a |\n|---|\n| %d |\n\n", i);
+        o += (size_t)snprintf(many + o, sizeof many - o, "| a |\n|---|\n| b | >!SECRET!< | raw |\n\nAFTER");
+        oc_rt_plain_excerpt(many, o, out, sizeof out);
+        CHECK(!strstr(out, "SECRET") && !strstr(out, "raw") && !strstr(out, "AFTER"));
+    }
+    /* The limit comes after the list: a block holding the table the limit falls
+     * on, or past it, is still hidden whole. */
+    {
+        static char blk[4096];
+        size_t o = (size_t)snprintf(blk, sizeof blk, "```spoiler\nSECRET\n");
+        for (int i = 0; i < 33; i++) o += (size_t)snprintf(blk + o, sizeof blk - o, "| a |\n|---|\n| CELL%d |\n\n", i);
+        o += (size_t)snprintf(blk + o, sizeof blk - o, "```");
+        oc_rt_plain_excerpt(blk, o, out, sizeof out);
+        /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+        CHECK(!strstr(out, "SECRET") && !strstr(out, "CELL") && strncmp(out, "[spoiler]", 9) == 0);
+    }
+    /* A cell past the table's columns is a cell: it is hidden in every excerpt. */
+    {
+        const char *x = "| a | b |\n|---|---|\n| x | y | >!SECRET!< |";
+        oc_rt_spoiler sv[2];
+        CHECK(oc_rt_spoilers(x, strlen(x), sv, 2) == 1 && sv[0].cell);
+        oc_rt_plain_excerpt(x, strlen(x), out, sizeof out);
+        CHECK(!strstr(out, "SECRET"));
+        char *cov = oc_rt_spoilers_covered(x, strlen(x));
+        /* contract: the wording a frontend that shows the source shows */
+        CHECK(cov && !strstr(cov, "SECRET") && strstr(cov, "| x | y | [spoiler] |"));
+        free(cov);
+        /* And with a pipe in it, and in a later table. */
+        const char *y = "| a |\n|---|\n| b | c | >!S1|S2!< | d |\n\n| a |\n|---|\n| e | >!S3!< |";
+        CHECK(oc_rt_spoilers(y, strlen(y), NULL, 0) == 2);
+        cov = oc_rt_spoilers_covered(y, strlen(y));
+        CHECK(cov && !strstr(cov, "S1") && !strstr(cov, "S2") && !strstr(cov, "S3"));
+        free(cov);
+        /* The source form: none, none to cover; past 32, nothing after the 32nd. */
+        CHECK(oc_rt_spoilers_covered("plain | text", 12) == NULL);
+        static char lots[1024];
+        size_t o = 0;
+        for (int i = 0; i < 33; i++) o += (size_t)snprintf(lots + o, sizeof lots - o, ">!s%d!< ", i);
+        o += (size_t)snprintf(lots + o, sizeof lots - o, "AFTER");
+        cov = oc_rt_spoilers_covered(lots, o);
+        CHECK(cov && !strstr(cov, "s32") && !strstr(cov, "AFTER"));
+        free(cov);
+    }
+    /* An address in a spoiler is not one to fetch, wherever the spoiler is. */
+    {
+        oc_url_span u[4];
+        const char *v = "https://a.example/1 >!https://b.example/2!< >!see https://c.example/3!<\n"
+                        "| h |\n|---|\n| x | >!https://d.example/4!< |\n\n"
+                        "```spoiler\nhttps://e.example/5\n```\nhttps://f.example/6";
+        size_t n = oc_rt_visible_urls(v, strlen(v), u, 4);
+        CHECK(n == 2);
+        if (n == 2) {
+            CHECK(strncmp(v + u[0].start, "https://a.example/1", u[0].len) == 0);
+            CHECK(strncmp(v + u[1].start, "https://f.example/6", u[1].len) == 0);
+        }
+        /* The hidden do not use up `max`. */
+        CHECK(oc_rt_visible_urls(v, strlen(v), u, 1) == 1);
+    }
+    /* More than 32 in one table: the cut falls inside it, and nothing runs on
+     * past the end of what was written. */
+    {
+        static char big[4096];
+        size_t o = (size_t)snprintf(big, sizeof big, "| a |\n|---|\n");
+        for (int i = 0; i < 40; i++) o += (size_t)snprintf(big + o, sizeof big - o, "| >!S%02d!< |\n", i);
+        size_t w = oc_rt_plain_excerpt(big, o, out, sizeof out);
+        CHECK(!strstr(out, "S0") && !strstr(out, "S3"));
+        /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+        CHECK(strstr(out, "Table: 40 rows") == out && w == strlen(out) && w < 64);
+    }
+    /* The old form in a row was drawn as text, and still is: it is no spoiler,
+     * and its excerpt is the table's line. */
+    const char *leak = "| a | b |\n|---|---|\n| ||TABLELEAK|| | c |";
+    oc_rt_plain_excerpt(leak, strlen(leak), out, sizeof out);
+    CHECK(strstr(out, "Table: 1 row") == out && !strstr(out, "TABLELEAK"));
+}
+
+/* Every excerpt hides what a spoiler hides. */
+static void test_spoiler_excerpt(void) {
+    char out[160];
+    const char *b = "The killer is >!the butler!< obviously";
+    oc_rt_plain_excerpt(b, strlen(b), out, sizeof out);
+    /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+    CHECK(strcmp(out, "The killer is [spoiler] obviously") == 0);
+    const char *k = "Before\n```spoiler Ending\nShe lives.\n```\nAfter";
+    oc_rt_plain_excerpt(k, strlen(k), out, sizeof out);
+    /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+    CHECK(strcmp(out, "Before\n[spoiler: Ending]\nAfter") == 0);
+    /* A table inside the block goes with it; one outside stays a table line. */
+    const char *t = "| a |\n|---|\n| 1 |\n\n```spoiler\n| b |\n|---|\n| 2 |\n```";
+    oc_rt_plain_excerpt(t, strlen(t), out, sizeof out);
+    CHECK(strstr(out, "Table: 1 row") == out && strstr(out, "[spoiler]") && !strstr(out, "| 2 |"));
+    /* oc_rt_flatten, the older name, hides them too. */
+    oc_rt_flatten(b, strlen(b), out, sizeof out);
+    CHECK(!strstr(out, "butler"));
+    /* Cut short, the hidden text is never what is left. */
+    char small[20];
+    oc_rt_plain_excerpt(b, strlen(b), small, sizeof small);
+    CHECK(!strstr(small, "butler"));
+    /* A time inside a spoiler is hidden with it, and one outside still reads
+     * as its time. */
+    {
+        char ex[128];
+        const char *tb = "at <time:2026-10-30T15:00Z> >!then <time:2026-10-30T16:00Z>!<";
+        oc_rt_clock k = { 0, 1, 1, 0 };
+        oc_rt_flatten_at(tb, strlen(tb), &k, ex, sizeof ex);
+        CHECK(strstr(ex, "[spoiler]") != NULL && strstr(ex, "16:00") == NULL && strstr(ex, "<time:") == NULL);
+    }
+}
+
 int run_richtext_tests(void) {
     failures = 0;
     test_emphasis();
@@ -482,7 +956,18 @@ int run_richtext_tests(void) {
     test_tables();
     test_table_cells();
     test_table_flatten();
+    test_time_tokens();
+    test_time_text();
+    test_time_flatten();
+    test_time_every_token();
+    test_spoilers();
+    test_spoiler_line_start();
+    test_spoiler_edges();
+    test_spoiler_cells();
+    test_spoiler_excerpt();
+    test_spoiler_cell_excerpt();
     printf("test_richtext: emphasis, literal delimiters, escapes, code, fenced blocks, labelled links, "
-           "quotes and lists, nesting, byte offsets, autolinking, truncation, tables and their cells and excerpts\n");
+           "quotes and lists, nesting, byte offsets, autolinking, truncation, tables and their cells and excerpts, "
+           "time tokens in every zone and however many, spoilers\n");
     return failures;
 }

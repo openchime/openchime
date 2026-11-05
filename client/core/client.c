@@ -618,6 +618,13 @@ void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op) {
     cmd->message_id = message_id; cmd->op = op;
     oc_queue_push(&c->cmds, cmd);
 }
+void oc_client_set_collapsed(oc_client *c, uint64_t message_id, int on) {
+    if (!c || !message_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_COLLAPSED);
+    if (!cmd) return;
+    cmd->message_id = message_id; cmd->op = on ? 1 : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
 void oc_client_list_saved(oc_client *c) {
     if (!c) return;
     oc_model_saved_begin(&c->model);
@@ -1091,7 +1098,21 @@ void oc_client_toggle_storage(oc_client *c, int open) {
 void oc_client_audit_query(oc_client *c, uint64_t before_ms) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_AUDIT_QUERY);
-    if (cmd) { cmd->message_id = before_ms; oc_queue_push(&c->cmds, cmd); }
+    if (!cmd) return;
+    cmd->message_id = before_ms;
+    /* The filter the model holds goes with every page. */
+    cmd->op = c->model.audit_family;
+    cmd->channel_id = c->model.audit_actor;
+    if (c->model.audit_action[0]) cmd->body = strdup(c->model.audit_action);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_audit_filter(oc_client *c, uint8_t family, uint64_t actor_id, const char *action) {
+    if (!c) return;
+    c->model.audit_family = family;
+    c->model.audit_actor = actor_id;
+    snprintf(c->model.audit_action, sizeof c->model.audit_action, "%s", action ? action : "");
+    oc_client_audit_query(c, 0);
 }
 
 void oc_client_toggle_audit(oc_client *c, int open) {
@@ -1158,6 +1179,13 @@ void oc_client_remove_user(oc_client *c, uint64_t user_id) {
     oc_cmd *cmd = oc_cmd_new(OC_CMD_REMOVE_USER);
     if (!cmd) return;
     cmd->channel_id = user_id;   /* reused as the target user id */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_deactivate_self(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_DEACTIVATE_SELF);
+    if (!cmd) return;
     oc_queue_push(&c->cmds, cmd);
 }
 
@@ -1476,6 +1504,22 @@ void oc_client_set_profile(oc_client *c, const char *full_name, const char *titl
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_get_profile(oc_client *c, uint64_t user_id) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_GET_PROFILE);
+    if (!cmd) return;
+    cmd->channel_id = user_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_voice(oc_client *c, const char *voice_id) {
+    if (!c || !voice_id || !voice_id[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_VOICE);
+    if (!cmd) return;
+    cmd->body = strdup(voice_id);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 uint64_t oc_client_upload(oc_client *c, uint64_t channel_id, const char *path) {
     if (!c || !channel_id || !path || !path[0]) return 0;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_UPLOAD);
@@ -1616,6 +1660,8 @@ void oc_client_logout(oc_client *c, uint8_t scope) {
     cmd->op = scope;
     oc_queue_push(&c->cmds, cmd);
 }
+
+unsigned long long oc_client_frames_written(void) { return oc_net_frames_written(); }
 
 int oc_client_outbox_pending(oc_client *c) {
     return c ? oc_net_outbox_pending(c->net) : 0;

@@ -36,7 +36,9 @@
 # which the main and release-* tag rulesets let through, and the GitHub release
 # is made with the job's own token. The shipped issues -- those of the
 # candidate's commits and of the documentation it carries onto main -- are
-# closed on openchime/openchime, the OC tracker, with PUBLIC_TOKEN. Last, sync-public
+# closed on openchime/openchime, the OC tracker, with PUBLIC_TOKEN, and sent to
+# the control plane for the release notes (the notes job, at CONTROL_PLANE_URL,
+# signed in with the job's OIDC token). Last, sync-public
 # copies main, staging, the tag and the release to the repository the
 # PUBLIC_REPO variable names, a convenience nothing here depends on.
 name: release
@@ -384,20 +386,26 @@ jobs:
       # single directory as the path uploads its contents, so each job
       # downloads its own back to candidate/<platform>/, where the steps below
       # read it. The manifest has done its work by now and is not carried on.
+      # Every upload in this workflow is kept one day: a failed release is
+      # finished with Re-run failed jobs only while they last, since publish
+      # downloads them, and a re-run a day or more after the run fails there.
       - uses: actions/upload-artifact@v7
         with:
           name: candidate-linux-amd64
           path: candidate/linux-amd64
+          retention-days: 1
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
         with:
           name: candidate-linux-arm64
           path: candidate/linux-arm64
+          retention-days: 1
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
         with:
           name: candidate-windows-x64
           path: candidate/windows-x64
+          retention-days: 1
           if-no-files-found: error
 
   # The number is a label on the release-candidate's build id, and it is the
@@ -549,6 +557,7 @@ jobs:
             ${{ env.DIST }}/*.rpm
             ${{ env.DIST }}/*.tar.gz
             ${{ env.DIST }}/*.sha256
+          retention-days: 1
           if-no-files-found: error
 
 
@@ -672,6 +681,7 @@ jobs:
         with:
           name: ${{ env.PLATFORM }}
           path: ${{ env.DIST }}/*
+          retention-days: 1
           if-no-files-found: error
 
   # main takes the release here, once the number is reserved and everything is
@@ -1200,6 +1210,36 @@ jobs:
           git fetch --tags --force --quiet || true
           [ -n "$GH_TOKEN" ] || { echo "::warning::PUBLIC_TOKEN is not set in the release environment; closed nothing"; exit 0; }
           scripts/release/close_shipped_issues.sh "release-${N}"
+
+  # Send the control plane what this release shipped, for its release notes:
+  # the issues close-issues closes, each as filed (scripts/release/send_notes.sh).
+  # It signs in with the job's GitHub OIDC token, so no secret is shared, at the
+  # address the CONTROL_PLANE_URL repository variable names. Like close-issues it
+  # never fails: by now the packages are live.
+  notes:
+    name: send release notes
+    needs: [resolve, version, candidate, publish]
+    if: ${{ always() && !inputs.dry_run && needs.publish.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+      - env:
+          N: ${{ needs.version.outputs.number }}
+          BUILD_ID: ${{ needs.candidate.outputs.build_id }}
+          GH_TOKEN: ${{ secrets.PUBLIC_TOKEN }}
+          CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL }}
+        run: |
+          git fetch --tags --force --quiet || true
+          [ -n "$GH_TOKEN" ] || { echo "::warning::PUBLIC_TOKEN is not set in the release environment; the release's notes were not sent"; exit 0; }
+          scripts/release/send_notes.sh "$N" "$BUILD_ID"
 
   # The release-candidates for this number, done with: once release-N is
   # published, every release-N-rcK prerelease and its tag is deleted, the one

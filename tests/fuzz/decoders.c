@@ -70,6 +70,10 @@ void oc_fuzz_decode_all(const uint8_t *buf, size_t len, oc_fuzz_bad_fn bad) {
       rc = oc_decode_poll(&p, &po); if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_poll"); }
     { oc_edit_poll ep; oc_rbuf_init(&p, buf, len);
       rc = oc_decode_edit_poll(&p, &ep); if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_edit_poll"); }
+    { oc_get_profile gp; oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_get_profile(&p, &gp); if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_get_profile"); }
+    { oc_set_collapsed sc; oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_set_collapsed(&p, &sc); if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_set_collapsed"); }
     { oc_list_poll_voters lv; oc_rbuf_init(&p, buf, len);
       rc = oc_decode_list_poll_voters(&p, &lv); if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_list_poll_voters"); }
     { oc_poll_voter pv[4]; uint16_t npv = 0; uint64_t pmid = 0; oc_rbuf_init(&p, buf, len);

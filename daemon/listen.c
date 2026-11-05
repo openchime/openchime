@@ -9,7 +9,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-static int bind_family(int family, int type, int port, const char **op) {
+static int bind_family(int family, int type, int port, int loopback, const char **op) {
     int fd = socket(family, type, 0);
     if (fd < 0) { *op = "socket"; return -1; }
     int yes = 1, no = 0;
@@ -29,7 +29,7 @@ static int bind_family(int family, int type, int port, const char **op) {
     } else {
         struct sockaddr_in *a = (struct sockaddr_in *)&ss;
         a->sin_family = AF_INET;
-        a->sin_addr.s_addr = htonl(INADDR_ANY);
+        a->sin_addr.s_addr = htonl(loopback ? INADDR_LOOPBACK : INADDR_ANY);
         a->sin_port = htons((uint16_t)port);
         sl = sizeof *a;
     }
@@ -43,17 +43,18 @@ static int bind_family(int family, int type, int port, const char **op) {
     return fd;
 }
 
-int oc_listen_bind(int type, int port, const char **op) {
+int oc_listen_bind(int type, int port, int loopback, const char **op) {
     const char *ignored;
     if (!op) op = &ignored;
-    int fd = bind_family(AF_INET6, type, port, op);
+    if (loopback) return bind_family(AF_INET, type, port, 1, op);
+    int fd = bind_family(AF_INET6, type, port, 0, op);
     if (fd >= 0) return fd;
     /* No IPv6 on this host — a container started without it, or a kernel built
      * without it — says so as one of these, and IPv4 alone is then all there is.
      * Anything else (the port is taken, it is privileged) is the same failure
      * for IPv4 and is reported as it is. */
     if (errno == EAFNOSUPPORT || errno == EADDRNOTAVAIL || errno == EPROTONOSUPPORT)
-        return bind_family(AF_INET, type, port, op);
+        return bind_family(AF_INET, type, port, 0, op);
     return -1;
 }
 

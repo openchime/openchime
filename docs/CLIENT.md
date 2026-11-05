@@ -308,7 +308,9 @@ model; translate input to intents }, stop.
   unread), three **bordered, titled panels** — Channels │ Messages │ Members
   (the active one drawn in a bright border) — a status line, the always-ready
   composer, and a **context keybinding hint bar**; `?` opens a full
-  help overlay. Read-only overlays (thread, search, roster, who-reacted,
+  help overlay. (The GUI has no such bar, by decision: its actions are found in
+  its menus, its tooltips and the Ctrl+/ shortcuts sheet, and a permanent footer
+  would cost every view a line of height.) Read-only overlays (thread, search, roster, who-reacted,
   notification prefs, webhooks) render inside the Messages panel. Everything is
   drawn cell-by-cell, re-laid-out on resize, measuring glyph width with utf8proc.
   **Navigation mode** (Esc from the composer, or Tab on an empty composer): a
@@ -585,6 +587,8 @@ model; translate input to intents }, stop.
   REQ-289 and REQ-261.
 
   **Admin → Alerts (REQ-263)** lists the daemon's critical failures, newest first — what failed, whether it still holds, how often and when, and its message — with **Acknowledge** on each unacknowledged one and **Acknowledge all** above. The Admin rail item carries a warning-sign badge, red while any is unacknowledged and amber while an acknowledged one still holds (on **More** when Admin is folded into it); a glyph, so it is not read as unread messages, with the count in its accessible name. Entering Admin while any is unacknowledged opens this tab.
+
+  **Admin → Custom emoji (REQ-072)** lists the workspace's custom emoji by name, each with its picture and who added it, narrowed by a search box, and is the one tab a member is shown too. It opens from the emoji picker's **Manage** link and the palette's "Manage custom emoji". **Delete** is on the rows of the emoji's creator, and on every row for admins and owners, and asks first, since the messages that used it then show the name; the list follows `EMOJI_LIST` as it arrives. By keys (REQ-269): Tab or F6 focuses the search box; Down, Enter or Tab from there, or the arrows, Page Up/Down, Home and End in the pane, select a row, highlighted; Delete asks about the selected row; Esc leaves the box, then the row. The tabs themselves take no keys, in Admin or anywhere: the palette is the keyboard's way between Admin's tabs.
 
   **User groups (REQ-307–309)** appear in these places:
   - **Admin → Groups** lists every group with its handle, name and size. New, Edit and Delete (confirmed) act on a group, and **People** opens its members, with Remove on each. Add people above them is the target picker New message uses (REQ-229), limited to people, yourself included, and to those not yet in the group. Up to 32 can be chosen, and Add (or Enter on an empty query) adds them in one go. The two uses share one picker, which belongs to one of them at a time: opening a group's people takes it, and New message's recipients stay in its draft.
@@ -1267,7 +1271,7 @@ reported (an older daemon)" from a daemon that predates the frame. A build is
 the short commit it was compiled from (`shared/build_id.h`, UPGRADING.md); a
 release number is a label on a build and is not in either binary, so the build
 is what is shown. **Copy** puts the whole as one line on the clipboard --
-`OpenChime client 74359c0 (win32), server 74359c0, protocol 27` -- for pasting
+`OpenChime client <build> (win32), server <build>, protocol <n>` -- for pasting
 into a report; the harness's `about` verb opens the dialog and answers that
 line, which `make test-merge` checks (TESTING.md §3.4).
 
@@ -1388,6 +1392,17 @@ foreground **and** visible **and** not minimised. Asking only the first
 would suppress every toast while the window is closed to the tray, which is
 exactly the case this exists for.
 
+### Email notifications (REQ-365–367, ARCH-125)
+
+The Notifications pane will gain the mention email (on or off, and its delay)
+and the digest (on or off, its days and time), and the workspace settings an
+owner's or admin's switches and member defaults for both. Where a level above
+the person's has turned a kind off, the row says which ("this server sends no
+email", "your workspace has turned this off") rather than disappearing. A link
+in a notification email opens the app at a workspace, conversation and message
+(EMAIL.md §7). Each is specified here as it is built; the design is
+[EMAIL.md](./EMAIL.md).
+
 ### Two standing UI rules
 
 **No "…" on a command.** Not in menus, not on buttons, not in cue banners. The
@@ -1487,6 +1502,42 @@ set. Consequences worth knowing before touching it:
   across whitespace — described with the dialect in
   [MARKDOWN.md](./MARKDOWN.md) §6, since it is a property of how the editor
   keeps markup out of sight rather than of this window plumbing.
+- **Preview shows the draft as it will read** (Ctrl+Shift+P, or Preview at the
+  right of the formatting row; in plain text, which has no such row, just before
+  Send). The text `ed_md_all()` would send — each table
+  card its Markdown — is laid out by `body_layout()` and drawn by `body_draw()`,
+  the transcript's own renderer, in place of the field, so what the preview
+  shows is what the conversation will. The field is only hidden: its text,
+  caret and selection stay as they were, and no key, paste or click edits it
+  until Edit (or Esc) brings it back. Enter or Send sends from the preview.
+  Previewing writes nothing to the connection: no typing notice, since nothing
+  is edited, and what would otherwise go out by itself waits for the preview to
+  close: the draft's save, a custom emoji's or an attachment's image not yet
+  fetched, older messages, and the read marker. A person's own action elsewhere
+  in the window (a reaction, say) still goes, being theirs. The terminal client has no preview: it shows a body as
+  written ([MARKDOWN.md](./MARKDOWN.md) §5), so its message box is already
+  what the conversation will show.
+
+### Long messages
+
+A message a reader **collapses** (its menu's Collapse, or `c` in the terminal
+client) shows its author, time and first line, and "… Show message". It is
+theirs on every device: the daemon keeps the set (`SET_COLLAPSED`,
+`collapsed_messages`) and replays it with history, and tells their other
+connections at once. Show message, or Expand in the menu, opens it and clears
+the flag.
+
+A message longer than **25 lines or 3,000 characters**, as drawn, is
+**auto-collapsed** for everyone: its first **10 lines** and "Show more". Opening
+it is this view's alone — nothing is stored or sent — and lasts until the
+client closes. The rule is the clients', the same in both: the graphical client
+measures lines at the width the message is drawn at; the terminal client counts
+the rows a body wraps to, and `m` shows it whole. A cut message is cut on its
+prefix, so formatting still applies to what shows.
+
+Both are reachable without a pointer: the message's menu (Ctrl+Up to the
+message, Shift+F10) offers Collapse or Expand, and each "Show …" is a button
+for assistive technology (`message.<id>.expand`).
 
 ### Typography (graphical clients) — ARCH-97
 

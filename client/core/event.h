@@ -200,6 +200,7 @@ enum {
                               size/reclaimed + body=filename, emoji=mime */
     OC_EV_FILES_END,       /* the files list is complete: channel_id + count */
     OC_EV_SAVED_UPDATED,   /* a message was saved/unsaved: message_id + op (REQ-231) */
+    OC_EV_COLLAPSED,       /* a message folded away (op 1) or opened (op 0) for me: message_id + op */
     OC_EV_SAVED_MSG,       /* one saved item (streamed) */
     OC_EV_SAVED_END,       /* the saved list is complete: count */
     /* Drafts (REQ-223). One draft — a list entry AND the device-sync push, which
@@ -486,6 +487,7 @@ enum {
     OC_CMD_UPDATE_CHANNEL, /* set topic / rename / archive / unarchive `channel_id`:
                               op = OC_CHUP_*, body = the new topic or name (REQ-034/035/036) */
     OC_CMD_SAVE_ITEM,      /* save/unsave `message_id`: op = add/remove (REQ-231) */
+    OC_CMD_SET_COLLAPSED,  /* fold `message_id` away for me (op 1) or open it (op 0) */
     OC_CMD_LIST_SAVED,     /* my saved items */
     OC_CMD_LIST_ACTIVITY,  /* what involved me — or what I have not read: op = OC_ACTF_* (REQ-139) */
     OC_CMD_HISTORY_AROUND, /* the messages around `message_id` in `channel_id` (REQ-232) */
@@ -530,8 +532,10 @@ enum {
     OC_CMD_SET_ROLE,        /* set a user's tenant role: channel_id = user_id, op = role */
     OC_CMD_INVITE_USER,     /* invite: op = role, body = the address it is bound to (NULL = a token) */
     OC_CMD_REMOVE_USER,     /* remove/disable a user: channel_id = user_id */
+    OC_CMD_DEACTIVATE_SELF, /* deactivate my own account (REQ-033) */
     OC_CMD_RESET_CREDENTIAL,/* a reset link for a local account: channel_id = user_id, op = clear its step */
     OC_CMD_ENABLE_USER,     /* bring a removed member back: channel_id = user_id */
+    OC_CMD_SET_VOICE,       /* my read-aloud voice, every other field kept: body = voice id */
     OC_CMD_CREATE_WEBHOOK,  /* mint an incoming webhook for `channel_id`: body = label */
     OC_CMD_LIST_WEBHOOKS,   /* list `channel_id`'s webhooks */
     OC_CMD_DELETE_WEBHOOK,  /* delete a webhook: message_id = webhook_id */
@@ -548,7 +552,7 @@ enum {
      * body2=timezone. */
     OC_CMD_SET_STATUS,
     OC_CMD_SET_PROFILE,
-    OC_CMD_GET_PROFILE,
+    OC_CMD_GET_PROFILE,          /* a member's whole profile: channel_id = user_id, 0 for mine */
     OC_CMD_LIST_FILE_CHANNELS,   /* */
     OC_CMD_LIST_SESSIONS,        /* REQ-182 */
     OC_CMD_REVOKE_SESSION,       /* sign one of your sessions out: message_id = its id */

@@ -30,4 +30,13 @@ fi
 out=$(./build/demo_client 127.0.0.1 "$port" e2e-bob e2e-pw token fcm e2e-device-token)
 echo "$out"
 grep -q "registered fcm token" <<<"$out" || fail "demo_client did not register a push token"
+# A reply in a thread is acknowledged as stored, behind what the daemon pushes
+# after sign-in, as a send is.
+out=$(./build/demo_client 127.0.0.1 "$port" e2e-bob e2e-pw send 1 "a message to reply to")
+echo "$out"
+mid=$(sed -n 's/^demo_client: sent message \([0-9]*\) .*/\1/p' <<<"$out")
+[ -n "$mid" ] || fail "demo_client did not send a message"
+out=$(./build/demo_client 127.0.0.1 "$port" e2e-bob e2e-pw reply 1 "$mid" "a reply")
+echo "$out"
+grep -q "replied in thread $mid" <<<"$out" || fail "demo_client did not report its reply"
 ok "the daemon served the protocol over TLS"

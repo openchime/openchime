@@ -274,6 +274,21 @@ static void test_auth_frames(void) {
         CHECK(out.session_token.len == OC_SESSION_TOKEN_LEN);
         CHECK(memcmp(out.session_token.ptr, token, sizeof token) == 0);
     }
+    {
+        /* AUDIT_QUERY — the page, and the family, actor and action it is narrowed to. */
+        oc_audit_query in = { 1760000000000ull, 50, 3, 42, oc_slice_str("auth.failure") };
+        ROUNDTRIP(oc_encode_audit_query(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUDIT_QUERY, h, p);
+        oc_audit_query out;
+        CHECK(oc_decode_audit_query(&p, &out) == OC_OK);
+        CHECK(out.before_ms == 1760000000000ull && out.limit == 50 && out.family == 3 && out.actor_id == 42);
+        CHECK(out.action.len == 12 && memcmp(out.action.ptr, "auth.failure", 12) == 0);
+    }
+    {
+        oc_audit_query any = { 0, 50, 0, 0, oc_slice_str("") };
+        oc_audit_query out;
+        ROUNDTRIP(oc_encode_audit_query(&w, OC_PROTOCOL_VERSION, &any), OC_MSG_AUDIT_QUERY, h, p);
+        CHECK(oc_decode_audit_query(&p, &out) == OC_OK && out.family == 0 && out.actor_id == 0 && out.action.len == 0);
+    }
 }
 
 static void test_messaging_frames(void) {
@@ -1294,11 +1309,35 @@ static void test_admin_frames(void) {
         oc_revoke_session out;
         CHECK(oc_decode_revoke_session(&p, &out) == OC_OK && out.session_id == 77);
     }
+    {   /* A message folded away, and the word to my other devices. */
+        oc_set_collapsed in = { 4242, 1 };
+        ROUNDTRIP(oc_encode_set_collapsed(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_COLLAPSED, h, p);
+        oc_set_collapsed out;
+        CHECK(oc_decode_set_collapsed(&p, &out) == OC_OK && out.message_id == 4242 && out.on == 1);
+    }
+    {
+        oc_set_collapsed in = { 4242, 0 };
+        ROUNDTRIP(oc_encode_collapsed_updated(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_COLLAPSED_UPDATED, h, p);
+        oc_set_collapsed out = { 0, 9 };
+        CHECK(oc_decode_set_collapsed(&p, &out) == OC_OK && out.message_id == 4242 && out.on == 0);
+    }
     {   /* A removed member brought back (REQ-033). */
         oc_enable_user in = { 43 };
         ROUNDTRIP(oc_encode_enable_user(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ENABLE_USER, h, p);
         oc_enable_user out;
         CHECK(oc_decode_enable_user(&p, &out) == OC_OK && out.user_id == 43);
+    }
+    {   /* A member's whole profile, 0 for mine (GET_PROFILE). */
+        oc_get_profile in = { 0 };
+        ROUNDTRIP(oc_encode_get_profile(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_GET_PROFILE, h, p);
+        oc_get_profile out = { 9 };
+        CHECK(oc_decode_get_profile(&p, &out) == OC_OK && out.user_id == 0);
+    }
+    {   /* ...and someone else's. */
+        oc_get_profile in = { 77 };
+        ROUNDTRIP(oc_encode_get_profile(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_GET_PROFILE, h, p);
+        oc_get_profile out;
+        CHECK(oc_decode_get_profile(&p, &out) == OC_OK && out.user_id == 77);
     }
     {   /* An administrator's reset of a local account, and its link's token (AUTH.md §2). */
         oc_reset_credential in = { 42, 1 };

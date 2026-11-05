@@ -473,7 +473,9 @@ static void eviction_keeps_the_only_copy(fake *f, const char *dir) {
     /* No room at all: the budget is nothing, and what the store has goes. */
     p.floor_bytes = UINT64_MAX / 4;
     oc_blobstore_cache_policy(bs, &p);
-    CHECK(WAIT_UNTIL((oc_blobstore_cache_kick(bs), !on_disk(dir, "c1") && !on_disk(dir, "c2")), 5000));
+    /* The eviction removes the files, then sets its counts: wait for both. */
+    CHECK(WAIT_UNTIL((oc_blobstore_cache_kick(bs), !on_disk(dir, "c1") && !on_disk(dir, "c2") &&
+                      stats(bs).evictions >= 2 && stats(bs).budget_bytes == 0), 5000));
     CHECK(stats(bs).evictions >= 2);
     CHECK(stats(bs).budget_bytes == 0);
     /* What it does not have stays: it is the only copy. */
@@ -569,7 +571,9 @@ static void sweep_takes_what_no_row_names(fake *f, const char *dir) {
     p.ref_ctx = (void *)keep;
     p.sweep_age_ms = 24ull * 3600 * 1000;
     oc_blobstore_cache_policy(bs, &p);
-    CHECK(WAIT_UNTIL((oc_blobstore_cache_kick(bs), !fk_has(f, "sw/aa01") && !fk_has(f, "sw/aa03")), 5000));
+    /* The sweep deletes, then counts: wait for both. */
+    CHECK(WAIT_UNTIL((oc_blobstore_cache_kick(bs), !fk_has(f, "sw/aa01") && !fk_has(f, "sw/aa03") &&
+                      stats(bs).swept == 2), 5000));
     CHECK(stats(bs).swept == 2);
     CHECK(fk_has(f, "sw/aa02"));
     CHECK(fk_has(f, "sw/bb01"));

@@ -12,6 +12,7 @@
 #include "push.h"
 #include "invite_mail.h"
 #include "unfurl.h"
+#include "richtext.h"   /* oc_rt_visible_urls: what is hidden is not unfurled */
 #include "url.h"
 #include "xferpool.h"
 #ifdef OC_TTS
@@ -107,8 +108,9 @@
  * fast one authenticated client can create messages (SEND / SEND_REPLY), which
  * the broadcast fan-out would otherwise amplify to every channel member. Excess
  * sends get a non-fatal SEND_RATE_LIMITED and are dropped. Generous for a human
- * (10/s sustained, 30 burst); a tight send loop trips it immediately. */
-#define OC_SEND_RATE_MAX       30u
+ * (10/s sustained, 30 burst); a tight send loop trips it immediately. The cap
+ * is OC_SEND_RATE_MAX (config.h); development mode may change it with
+ * OPENCHIME_DEV_SEND_RATE, 0 lifting it, for a fixture that seeds many. */
 #define OC_SEND_RATE_WINDOW_MS 3000u
 
 /* The other frames that fan out, bounded the same way, each by what a person
@@ -229,6 +231,7 @@ typedef struct conn_s {
     uint32_t     events;    /* current epoll interest */
     uint64_t     send_win_start; /* fixed-window start for the send rate limit */
     uint32_t     send_count;     /* sends counted in the current window */
+    uint32_t     send_rate_max;  /* sends a window allows (send_rate_cap); 0: no cap */
     struct rate_win { uint64_t start; uint32_t count; } presence_rl, typing_rl, react_rl, call_rl, pdm_rl;
     /* CALL_JOIN is answered after the reader's check, so a leave can arrive
      * first. Each join advances the counter and carries it (oc_job.gen), a leave
@@ -624,13 +627,14 @@ static char *slice_dup(oc_slice s) {
 /* Fixed-window send rate limit (REQ-190). Returns 1 if this send is within
  * budget for the current window, 0 if the cap is exceeded. */
 static int send_rate_ok(conn *c) {
+    if (c->send_rate_max == 0) return 1;   /* development mode, OPENCHIME_DEV_SEND_RATE=0 */
     uint64_t now = now_ms();
     if (now - c->send_win_start >= OC_SEND_RATE_WINDOW_MS) {
         c->send_win_start = now;
         c->send_count = 0;
     }
     c->send_count++;
-    return c->send_count <= OC_SEND_RATE_MAX;
+    return c->send_count <= c->send_rate_max;
 }
 
 /* One more event in a fixed window: 1 within `max` per `window_ms`, else 0. */
@@ -1340,12 +1344,14 @@ void oc_netloop_set_unfurler(struct oc_unfurler *u) {
 
 /* Queue the URLs of a just-committed body for fetching — the first
  * OC_UNFURL_MAX_URLS of them, extracted by the shared scanner so the daemon
- * fetches exactly the addresses a client links. Fire-and-forget. */
+ * fetches exactly the addresses a client links. An address in a spoiler is left
+ * alone: its card would show, under the message, what the spoiler hides
+ * (MARKDOWN.md §1d). Fire-and-forget. */
 static void unfurl_enqueue(const uint8_t *body, size_t len,
                            uint64_t channel_id, uint64_t message_id) {
     if (!g_unfurler || !body || !len) return;
     oc_url_span sp[OC_UNFURL_MAX_URLS];
-    size_t n = oc_url_extract((const char *)body, len, sp, OC_UNFURL_MAX_URLS);
+    size_t n = oc_rt_visible_urls((const char *)body, len, sp, OC_UNFURL_MAX_URLS);
     for (size_t i = 0; i < n; i++)
         oc_unfurler_fetch(g_unfurler, channel_id, message_id,
                           (const char *)body + sp[i].start, sp[i].len);
@@ -2460,6 +2466,18 @@ static int reject_send_rate(conn *c, const uint8_t idem[OC_IDEM_LEN]) {
     return out_append(c, tmp, w.len);
 }
 
+/* A body past OC_MAX_BODY_SIZE that still fits in a frame decodes, but the
+ * BROADCAST encoder refuses it: taken, it would be stored and acknowledged and
+ * then reach nobody. So it is refused here, before any job, and the connection
+ * goes on (PROTOCOL.md §5.1). */
+static int reject_body_too_large(conn *c, const uint8_t idem[OC_IDEM_LEN]) {
+    uint8_t tmp[128]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
+    oc_slice ctx = { idem, OC_IDEM_LEN };
+    oc_error e = { OC_ERR_BODY_TOO_LARGE, 0, ctx, oc_slice_str(oc_error_text(OC_ERR_BODY_TOO_LARGE)) };
+    oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+    return out_append(c, tmp, w.len);
+}
+
 
 /* --- Voice input (REQ-296-300, ARCH-112) -------------------------------- */
 
@@ -2815,6 +2833,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_SEND) {
             oc_send s = {0};
             if (oc_decode_send(&p, &s) != OC_OK) return -1;
+            if (s.body.len > OC_MAX_BODY_SIZE) { if (reject_body_too_large(c, s.idem) != 0) return -1; continue; }
             if (pdm_refuses(c, s.channel_id)) { if (pdm_forbid(c, s.idem, OC_IDEM_LEN) != 0) return -1; continue; }
             if (!send_rate_ok(c)) { if (reject_send_rate(c, s.idem) != 0) return -1; continue; }
             if (!demo_ok(OC_DL_MESSAGE, c->user_id)) {
@@ -3056,6 +3075,18 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_GET_PROFILE) {
+            /* A member's whole profile, 0 for mine; the answer goes to this
+             * connection alone. */
+            oc_get_profile gp;
+            if (oc_decode_get_profile(&p, &gp) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_GET_PROFILE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->message_id = gp.user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_ENABLE_USER) {
             oc_enable_user eu;
             if (oc_decode_enable_user(&p, &eu) != OC_OK) return -1;
@@ -3074,6 +3105,15 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->user_id = c->user_id;
             j->target_user_id = rc.user_id;
             j->scope = rc.clear_factors ? 1 : 0;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_DEACTIVATE_SELF) {
+            /* A removal of oneself (REQ-033): the result drops this person's
+             * connections, this one among them, as a removal does. */
+            oc_job *j = oc_job_new(OC_JOB_DEACTIVATE_SELF, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -3258,6 +3298,15 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_COLLAPSED) {
+            oc_set_collapsed sc;
+            if (oc_decode_set_collapsed(&p, &sc) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_COLLAPSED, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = sc.message_id; j->save_op = sc.on ? 1 : 0;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_ATTACH_MEDIA_SET) {
             oc_attach_media_set ms;
             if (oc_decode_attach_media_set(&p, &ms) != OC_OK) return -1;
@@ -3314,6 +3363,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_SEND_REPLY) {
             oc_send_reply sr = {0};
             if (oc_decode_send_reply(&p, &sr) != OC_OK) return -1;
+            if (sr.body.len > OC_MAX_BODY_SIZE) { if (reject_body_too_large(c, sr.idem) != 0) return -1; continue; }
             if (pdm_refuses(c, sr.channel_id)) { if (pdm_forbid(c, sr.idem, OC_IDEM_LEN) != 0) return -1; continue; }
             if (!send_rate_ok(c)) { if (reject_send_rate(c, sr.idem) != 0) return -1; continue; }
             if (!demo_ok(OC_DL_MESSAGE, c->user_id)) {
@@ -4270,6 +4320,9 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->user_id = c->user_id;
             j->audit_limit = aq.limit ? aq.limit : 50;
             j->audit_before_ms = aq.before_ms;
+            j->audit_family = aq.family;
+            j->audit_actor = aq.actor_id;
+            if (aq.action.len && oc_job_set_body(j, aq.action.ptr, aq.action.len) != 0) { oc_job_free(j); return -1; }
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -5760,6 +5813,7 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
             return;
         }
         if (r->type == OC_RES_WEB_OK) pg.done = 1;
+        else if (r->pw_verdict) pg.err = oc_page_err_pw(r->pw_verdict);   /* the form again, with its token */
         else pg.err = r->err_code == OC_ERR_AUTH_INVALID_TOKEN
                         ? OC_PERR_RESET_SPENT
                         : OC_PERR_INTERNAL;
@@ -6921,6 +6975,19 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         oc_saved_updated su = { r->message_id, r->save_op, r->saved_at };
         oc_encode_saved_updated(&w, OC_PROTOCOL_VERSION, &su);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_COLLAPSED: {
+        /* The person's own set, so every device of theirs shows it; nobody
+         * else hears of it. */
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_set_collapsed sc = { r->message_id, r->save_op };
+        oc_encode_collapsed_updated(&w, OC_PROTOCOL_VERSION, &sc);
+        size_t len = w.len;
+        for (conn *t = user_head(r->user_id), *next; t; t = next) {
+            next = t->u_next;
+            send_bytes(ep, conns, t->fd, g_enc, len);
+        }
         break;
     }
     case OC_RES_SAVED_LIST: {
@@ -8360,7 +8427,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
  * link previews, the forwards, the actions and the polls for them -- a
  * BROADCAST carries none of those, so a replay without them loses each on
  * reload -- then BACKFILL_DONE. */
-enum { BF_MSG, BF_META, BF_PIN, BF_SAVED, BF_REACT, BF_UNFURL, BF_FWD, BF_ACT, BF_POLL, BF_DONE, BF_END };
+enum { BF_MSG, BF_META, BF_PIN, BF_SAVED, BF_COLLAPSED, BF_REACT, BF_UNFURL, BF_FWD, BF_ACT, BF_POLL, BF_DONE, BF_END };
 
 /* Encode the head result's next frame into g_enc: its length, or 0 when the
  * result has no frames left. */
@@ -8402,12 +8469,21 @@ static size_t backfill_next(conn *c) {
         }
         case BF_SAVED: {
             /* Private (REQ-231): only down this connection, keyed to the requester. */
-            if (i >= r->n_replay) { c->bf_phase = BF_REACT; c->bf_i = 0; continue; }
+            if (i >= r->n_replay) { c->bf_phase = BF_COLLAPSED; c->bf_i = 0; continue; }
             c->bf_i = i + 1;
             if (!r->replay[i].saved) continue;
             oc_saved_updated su = { r->replay[i].message_id, OC_SAVE_ADD,
                                     r->replay[i].saved_at };
             oc_encode_saved_updated(&w, OC_PROTOCOL_VERSION, &su);
+            return w.len;
+        }
+        case BF_COLLAPSED: {
+            /* As private as saved (migration 0070): this connection only. */
+            if (i >= r->n_replay) { c->bf_phase = BF_REACT; c->bf_i = 0; continue; }
+            c->bf_i = i + 1;
+            if (!r->replay[i].collapsed) continue;
+            oc_set_collapsed sc = { r->replay[i].message_id, 1 };
+            oc_encode_collapsed_updated(&w, OC_PROTOCOL_VERSION, &sc);
             return w.len;
         }
         case BF_REACT: {
@@ -8919,7 +8995,7 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
  * the TLS port's, or the plaintext health port's (`plain`, ARCH-25). Both are
  * counted against their source under the same per-address cap. */
 static void accept_all(int lfd, int plain, conn **conns, const oc_trusted_proxies *trusted,
-                       int max_per_ip) {
+                       int max_per_ip, uint32_t send_rate_max) {
     for (;;) {
         struct sockaddr_storage ss;
         socklen_t sl = sizeof ss;
@@ -8943,6 +9019,7 @@ static void accept_all(int lfd, int plain, conn **conns, const oc_trusted_proxie
         if (!c) { close(cfd); continue; }
         c->fd = cfd;
         memcpy(c->source, src, sizeof c->source);
+        c->send_rate_max = send_rate_max;
         c->conn_id = g_next_conn_id++;
         c->accepted_ms = now_ms();
         c->state = CONN_OPENING;
@@ -8976,6 +9053,13 @@ static void loop_state_free(conn **conns) {
 }
 
 /* The port `fd` is bound to, or 0. */
+/* Whether this daemon listens on 127.0.0.1 only: a development daemon with
+ * OPENCHIME_DEV_LOOPBACK on (`make run`), never a deployment. */
+static int dev_loopback(void) {
+    const oc_config *cfg = oc_config_get();
+    return cfg->mode == OC_MODE_DEVELOPMENT && cfg->dev.loopback;
+}
+
 static int bound_port(int fd) {
     struct sockaddr_storage ss;
     socklen_t sl = sizeof ss;
@@ -9031,7 +9115,7 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
      * is privileged and the unit lacks CAP_NET_BIND_SERVICE (ARCH-54) — and
      * lumping three calls under one message would hide which. */
     const char *op = "socket";
-    int lfd = oc_listen_bind(SOCK_STREAM, port, &op);
+    int lfd = oc_listen_bind(SOCK_STREAM, port, dev_loopback(), &op);
     if (lfd < 0) {
         if (strcmp(op, "bind") == 0)
             fprintf(stderr, "openchimed: cannot start: bind port %d: %s\n",
@@ -9215,6 +9299,10 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
      * host while staying generous enough for a large office behind one NAT.
      * The global cap is OC_NETLOOP_MAX_FD. */
     int max_per_ip = oc_config_get()->max_conns_per_ip;
+    /* The send rate cap (REQ-190), read once as the per-address cap is, and
+     * given to each connection: OC_SEND_RATE_MAX unless development mode sets
+     * OPENCHIME_DEV_SEND_RATE (0: none). */
+    uint32_t send_rate_max = (uint32_t)oc_config_get()->send_rate_max;
     /* Parsed once; main refuses to start on a list it cannot read, so NULL here is
      * the empty list and nobody is trusted. */
     oc_trusted_proxies *trusted = oc_trusted_proxies_parse(oc_config_get()->trusted_proxies, NULL, 0);
@@ -9227,7 +9315,7 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     int hport = __atomic_load_n(&g_health_port, __ATOMIC_RELAXED);
     if (hport >= 0) {
         const char *hop = "socket";
-        hfd = oc_listen_bind(SOCK_STREAM, hport, &hop);
+        hfd = oc_listen_bind(SOCK_STREAM, hport, dev_loopback(), &hop);
         if (hfd >= 0) {
             hop = NULL;
             if (listen(hfd, 16) < 0)          hop = "listen";
@@ -9356,7 +9444,7 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
             int fd = events[i].data.fd;
 
             if (fd == lfd || (hfd >= 0 && fd == hfd)) {
-                accept_all(fd, fd == hfd, conns, trusted, max_per_ip);
+                accept_all(fd, fd == hfd, conns, trusted, max_per_ip, send_rate_max);
                 continue;
             }
 

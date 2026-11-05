@@ -62,12 +62,15 @@ test-merge-plain:
 	+MAKE="$(MAKE) $(FULL_SWITCHES)" scripts/test/merge/release_cc.sh
 	scripts/test/lib/speech.sh ./$(BIN)
 	NODE="$(NODE)" scripts/test/merge/web.sh
+	+MAKE="$(MAKE) $(FULL_SWITCHES)" scripts/test/merge/web_deps.sh
 	NODE="$(NODE)" scripts/test/merge/gui_web_smoke.sh
 	scripts/test/merge/fuzz.sh
 test-merge-threads: $(TSAN_BIN)
 	scripts/test/merge/tsan.sh
+# pthread_create is wrapped in the plain test binary, so the runner sees which
+# suites start threads and fails one not on TSAN_SUITES (tests/main.c).
 $(TEST_BIN): $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build
-	$(CC) $(CFLAGS) -O0 -g $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
+	$(CC) $(CFLAGS) -O0 -g $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -Wl,--wrap=pthread_create -lresolv -lpthread -lm -o $@
 # The same test binary under ThreadSanitizer (scripts/test/merge/tsan.sh runs
 # it; TSAN_BIN is set above, before the rule that needs it). The vendored
 # libraries are not instrumented.

@@ -12,13 +12,9 @@
 # staging, and staging is not a release. Nor can the merge do it -- the squash
 # carries no body, so a `Closes` line never reaches staging or main.
 #
-# Every commit on staging names its issue in the subject (pr-policy refuses a
-# title that does not, and the squash commits the title), so the release's
-# commits are the list: the staging commits from the previous release-N tag
-# to this one (the tags are on staging's commits; main holds snapshots). The
-# first release has no predecessor and covers only its own commit. Beside
-# them, the documentation the release carries onto main (the Docs: trailers of
-# its Release N snapshot) closes its issues too.
+# Which issues a release shipped is scripts/release/shipped_issues.sh's: the
+# issue each of its commits names, between the previous release-N tag and this
+# one, and those of the documentation its Release N snapshot carried onto main.
 #
 # A subject names its issue by its prefix: OC-N is an issue on
 # openchime/openchime, closed with GH_TOKEN (which must be able to close issues
@@ -46,78 +42,29 @@ tag="${1:-}"
 dry=0
 [ "${2:-}" = "--dry-run" ] && dry=1
 
+here=$(cd "$(dirname "$0")" && pwd)
 if [ -n "$range" ]; then
-  if ! sha=$(git rev-parse -q --verify "${range##*..}^{commit}"); then
-    warn "$range does not end at a commit in this checkout; closed nothing"
-    exit 0
-  fi
+  # shipped_issues.sh refuses a range that does not end at a commit.
+  sha=$(git rev-parse -q --verify "${range##*..}^{commit}" || true)
   what="${sha:0:7}"
   note="Closed by hand at \`${sha}\`."
+  issues=$("$here/shipped_issues.sh" --range "$range") || { warn "could not list the issues $range shipped; closed nothing"; exit 0; }
 else
-  n="${tag#release-}"
-  if ! printf '%s' "$n" | grep -qE '^[0-9]+$' || ! sha=$(git rev-parse -q --verify "${tag}^{commit}"); then
-    warn "$tag is not a release tag in this checkout; closed nothing"
-    exit 0
-  fi
-  # The newest release below this one, by NUMBER (the same ordering
-  # scripts/release/version.sh uses) -- not by date, and not by ancestry.
-  prev=$(git tag -l 'release-*' | sed 's/^release-//' | grep -E '^[0-9]+$' \
-         | awk -v n="$n" '$1 < n' | sort -n | tail -1 || true)
-  if [ -n "$prev" ]; then
-    range="release-${prev}..${sha}"
-  else
-    range="${sha}~1..${sha}"
-    git rev-parse -q --verify "${sha}~1" >/dev/null || range="$sha"
-  fi
+  sha=$(git rev-parse -q --verify "${tag}^{commit}" || true)
   what="$tag"
   note="Shipped in ${tag} (\`${sha}\`)."
+  issues=$("$here/shipped_issues.sh" "$tag") || { warn "could not list the issues $tag shipped; closed nothing"; exit 0; }
 fi
-
-# Resolved ONCE, and a failure to resolve is reported rather than read as "no
-# commits" -- the fail-open trap scripts/release/commit_policy.sh documents.
-if ! commits=$(git rev-list --no-merges "$range"); then
-  warn "could not resolve $range; closed nothing"
-  exit 0
-fi
-# Documentation the release carried onto main, beyond its candidate (the
-# Docs: lines of its `Release N` commit there), shipped with it too.
-if [ -n "${n:-}" ]; then
-  snap=$(git log "${MAIN_REF:-origin/main}" -1 --format=%H --grep="^Release ${n}\$" 2>/dev/null || true)
-  if [ -n "$snap" ]; then
-    carried=$(git log -1 --format='%(trailers:key=Docs,valueonly,separator=%x0A)' "$snap" | awk 'NF {print $1}')
-    for d in $carried; do
-      if git cat-file -e "${d}^{commit}" 2>/dev/null; then
-        echo "carried documentation: $(git log -1 --format='%h %s' "$d")"
-        commits="${commits:+${commits}
-}${d}"
-      else
-        warn "carried documentation commit ${d:0:7} is not in this checkout; its issue is left open"
-      fi
-    done
-  else
-    warn "no Release ${n} commit on ${MAIN_REF:-origin/main}; only the candidate's own issues are closed"
-  fi
-fi
-[ -z "$commits" ] && { echo "no commits in $range"; exit 0; }
+[ -z "$issues" ] && { echo "no issues named in $what"; exit 0; }
 
 oc_repo="${ISSUES_REPO:-openchime/openchime}"
+token="${GH_TOKEN:-}"
 
-echo "closing issues shipped in $what ($range, $(printf '%s\n' "$commits" | wc -l) commits)"
-seen=" "
-while read -r c; do
-  [ -z "$c" ] && continue
-  subject=$(git log -1 --format=%s "$c")
-  # The pull-request suffix GitHub appends on squash names the PULL REQUEST. Issues and pull
-  # requests share one counter, so that number must never be mistaken for the issue.
-  core=$(printf '%s' "$subject" | sed -E 's/ \(#[0-9]+\)$//')
-  prefix=$(printf '%s' "$core" | sed -nE 's/^(OC)-[0-9]+:.*/\1/p')
-  num=$(printf '%s' "$core" | sed -nE 's/^OC-([0-9]+):.*/\1/p')
+echo "closing issues shipped in $what ($(printf '%s\n' "$issues" | wc -l) issues)"
+while read -r num; do
   [ -z "$num" ] && continue
-  ref="${prefix}-${num}"
-  case "$seen" in *" $ref "*) continue ;; esac
-  seen="$seen$ref "
-
-  repo="$oc_repo"; token="${GH_TOKEN:-}"
+  ref="OC-${num}"
+  repo="$oc_repo"
 
   if ! meta=$(GH_TOKEN="$token" gh api "repos/${repo}/issues/${num}" --jq '[.state, (.pull_request != null)] | @tsv' 2>/dev/null); then
     warn "${ref}: could not read the issue; left open"
@@ -143,5 +90,5 @@ while read -r c; do
   else
     warn "${ref}: close failed; left open"
   fi
-done <<<"$commits"
+done <<<"$issues"
 exit 0

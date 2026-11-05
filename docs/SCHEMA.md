@@ -1,7 +1,7 @@
 # OpenChime — Database Schema
 
 The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
-ARCH-27 (§1); the daemon applies migrations 0001–0068 (`daemon/migrate.c`,
+ARCH-27 (§1); the daemon applies migrations 0001–0070 (`daemon/migrate.c`,
 `OC_MIGRATIONS`), in order, and new tables/columns arrive as later numbered
 migrations, never as edits to an existing one. 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
@@ -36,7 +36,7 @@ credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
 **0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
-(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice.
+(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -244,6 +244,7 @@ An owner/admin issues an invite; the invitee sets a password by presenting it.
 | `consumed_at_ms`| INTEGER | null until the last use is taken.                     |
 | `email`       | TEXT    | null for a bearer invite (migration 0045, §3aj).        |
 | `uses`, `used`| INTEGER | how many may redeem it, and how many have (migration 0061, §3az). |
+| `created_at_ms`| INTEGER | when the invitation was made; null for one made before migration 0069 (§3bh), listed as `0`. |
 
 The `invites` and `local_credentials` tables are exercised by the tenant-admin
 wire ops (PROTOCOL.md §5.8): `INVITE_USER` inserts an `invites` row and the
@@ -508,6 +509,13 @@ Server-authoritative notification settings, synced across a user's devices.
 - A keyword hit is written into **`mentions`** with `kind = 4`, so the push
   query, the activity feed and the reader's highlight all keep working with no
   further change.
+
+**Email notifications** (REQ-365–370, ARCH-126) will add, in migrations of
+their own: a person's mention email and digest settings beside these, the
+workspace's switches and member defaults on its settings, the outbox, and what
+holds back the next mention email per conversation and the next digest. Their
+shape is [EMAIL.md](./EMAIL.md) §2, §4 and §6; each is documented here with its
+migration.
 
 ---
 
@@ -1841,3 +1849,34 @@ it. Turning sharing back on sets it to now. A daemon starting with
 `OPENCHIME_READ_RECEIPTS` off sets it to −1 for everyone (and for anyone who
 joins meanwhile), which shows nothing. Starting with receipts on again sets
 every −1 to now.
+
+## 3bh. Migration 0069 — an invitation's creation time (REQ-026)
+
+```sql
+ALTER TABLE invites ADD COLUMN created_at_ms INTEGER;
+```
+
+When an invitation was made, written by both inserts (an owner's or admin's
+`INVITE_USER`, and the demo's invite spent at once) and returned by `INVITE_LIST`
+as `created_at` (PROTOCOL.md §5.8). *Nullable, with no default*: an invitation
+made before this has no recorded time, none is invented for it, and it lists as
+`0`. Invitations expire, so after one invitation lifetime every outstanding row
+carries a real time.
+
+## 3bi. Migration 0070 — collapsed messages
+
+```sql
+CREATE TABLE collapsed_messages (
+  user_id       INTEGER NOT NULL REFERENCES users(id),
+  message_id    INTEGER NOT NULL REFERENCES messages(id),
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (user_id, message_id));
+```
+
+The messages a person has folded away (`SET_COLLAPSED`, PROTOCOL.md), kept for
+them on every device. A set per person, keyed as `saved_items` (§3c) is, rather
+than a client setting, which would grow without bound. *Written* by the
+collapse and expand themselves; *read* by backfill, which replays the
+requester's own as `COLLAPSED_UPDATED`. A delete removes the message's rows with
+its body, and the purge of a channel clears them as it clears every table
+holding a `message_id`.

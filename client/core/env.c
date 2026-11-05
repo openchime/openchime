@@ -17,3 +17,7 @@ int oc_env_is_dev(void) {
 const char *oc_env_dev(const char *name) {
     return oc_env_is_dev() ? oc_env(name) : NULL;
 }
+
+const char *oc_env_secret_service(void) {
+    return oc_env_dev("OPENCHIME_DEV_DIR") ? "openchime-dev" : "openchime";
+}

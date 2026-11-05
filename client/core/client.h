@@ -263,6 +263,9 @@ void oc_client_get_channel_description(oc_client *c, uint64_t channel_id);
 void oc_client_history_around(oc_client *c, uint64_t channel_id, uint64_t message_id, uint16_t limit);
 
 void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op);
+/* Fold a message away for me on every device (on 1), or open it again (on 0).
+ * The model's msg->collapsed follows when the daemon answers. */
+void oc_client_set_collapsed(oc_client *c, uint64_t message_id, int on);
 void oc_client_list_saved(oc_client *c);
 void oc_client_close_saved(oc_client *c);
 
@@ -375,6 +378,10 @@ void oc_client_toggle_storage(oc_client *c, int open);
 /* Audit log (REQ-251; owner/admin only). Request a page ending before
  * `before_ms` (0 = newest); entries fold into the model, newest first. */
 void oc_client_audit_query(oc_client *c, uint64_t before_ms);
+/* Narrow the audit log to one family (0 any), actor (0 any) and action ("" or
+ * NULL any), and ask for its newest page again: the filter is the daemon's, so
+ * each page holds only matching rows. */
+void oc_client_audit_filter(oc_client *c, uint8_t family, uint64_t actor_id, const char *action);
 void oc_client_toggle_audit(oc_client *c, int open);
 
 /* Self-service profile (REQ-020). Change your own display name (fans to every
@@ -401,6 +408,9 @@ void oc_client_invite_user(oc_client *c, uint8_t role);
  * a workspace refuses the other. */
 void oc_client_invite(oc_client *c, uint8_t role, const char *email, uint16_t uses);
 void oc_client_remove_user(oc_client *c, uint64_t user_id);
+/* Deactivate the signed-in account itself, as a removal would: every session
+ * ends and this connection is dropped. The last owner is refused (LAST_OWNER). */
+void oc_client_deactivate_self(oc_client *c);
 /* An owner's or admin's reset link for a local account (AUTH.md §2), with its
  * second step cleared too when `clear_step`; the model's reset_token is it. */
 void oc_client_reset_credential(oc_client *c, uint64_t user_id, int clear_step);
@@ -470,6 +480,13 @@ void oc_client_set_status(oc_client *c, const char *emoji, const char *text,
 void oc_client_set_profile(oc_client *c, const char *full_name, const char *title,
                            const char *pronouns, const char *phone,
                            const char *timezone, const char *voice_id);
+/* A member's whole profile, `user_id` 0 for mine; it arrives as PROFILE_INFO
+ * (the model's users[], and for mine the phone too). */
+void oc_client_get_profile(oc_client *c, uint64_t user_id);
+/* Set only my read-aloud voice (REQ-292). SET_PROFILE replaces every field,
+ * so the core fetches my whole profile first and sends it back with the voice
+ * changed: nothing else, the phone included, is touched. */
+void oc_client_set_voice(oc_client *c, const char *voice_id);
 void oc_client_set_read_cursor(oc_client *c, uint64_t channel_id, uint64_t message_id);
 
 /* Talking mode (REQ-291, ARCH-111): read this conversation aloud from now on.
@@ -624,6 +641,10 @@ int oc_fingerprint_format(const char *hex, int per_line, char *out, size_t cap);
  * memory only (ARCH-88), so a frontend should warn before quitting while this is
  * non-zero — otherwise the user silently loses what they typed. */
 int oc_client_outbox_pending(oc_client *c);
+
+/* Frames this process has written to its connections, for a test to say that
+ * nothing was sent. */
+unsigned long long oc_client_frames_written(void);
 
 /* Stop the network thread, drain remaining events, and free everything. */
 void oc_client_stop(oc_client *c);

@@ -75,6 +75,7 @@
 #include <SDL3/SDL.h>         /* the window + renderer (ARCH-80) */
 #include "gfx.h"              /* portable primitives over the SDL renderer (ARCH-107) */
 #include "env.h"            /* the development inputs */
+#include "emoticon.h"       /* typed emoticons (compose.emoticons) */
 #include "sdltext.h"          /* portable text layout/hit-testing (ARCH-106) */
 
 /* The scene's rectangle vocabulary, kept in left/top/right/bottom because every
@@ -1158,7 +1159,7 @@ static rectf g_prof_dm_btn;
 /* The SELF card's action buttons — the commands the profile popover no longer
  * lists top-level. Each carries a menu_dispatch cmd; the bodies are all
  * self-contained. */
-static struct { rectf r; int cmd; } g_selfcard_btn[6];
+static struct { rectf r; int cmd; } g_selfcard_btn[8];
 static int g_n_selfcard_btn;
 static int g_pref_time24    = 1;   /* 24-hour timestamps */
 static int g_pref_members   = 1;   /* members pane shown by default */
@@ -1166,7 +1167,20 @@ static int g_pref_daysep    = 1;   /* date dividers in the transcript */
 /* 1 = the rich editor (formatting shown, markup hidden),
  * 0 = plain text, where the markup is what you see and the field never restyles
  * what you typed. Rich by default: it is the mode that needs no explaining. */
+/* The shape last set, for the test dump's `cursor kind=`: a harness reads the
+ * client's own state, since a detached session's pointer and a synthetic hover
+ * report nothing it could check. -1 before any. */
+static int g_cursor_kind = -1;
+static const char *cursor_kind_name(void) {
+    static const char *const N[3] = { "arrow", "ibeam", "hand" };
+    return g_cursor_kind >= 0 && g_cursor_kind <= 2 ? N[g_cursor_kind] : "none";
+}
+
 static int g_pref_richtext  = 1;
+/* Typed emoticons become emoji as a space follows them and on send
+ * (compose.emoticons, a setting of its own: the terminal client reads it too). */
+static int g_pref_emoticons = 0;
+#define EMOTICONS_SETTING_KEY "compose.emoticons"
 /* The formatting toolbar belongs to the rich editor. In plain text it would
  * offer buttons for markup already on screen, and the honest shape of that mode
  * is a plain box. */
@@ -1677,6 +1691,10 @@ static int      g_n_thumb_hits;
 static struct { rectf r; uint64_t chan, mid; } g_fwd_hits[32];
 static int      g_n_fwd_hits;
 static uint64_t g_lightbox;
+/* The expanded view pages through the open conversation's media: its place in
+ * that sequence as last drawn (0-based, of g_lb_n), and the arrows' rects. */
+static int      g_lb_i = -1, g_lb_n;
+static rectf    g_lb_prev, g_lb_next, g_lb_img;
 /* The video message overlay (recording card or player) is up; see draw_video_overlay. */
 static int g_vm;
 /* A screen recording is counting down, recording or finishing: the card and its
@@ -1903,7 +1921,7 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
        CONF_PDM_TRUST, CONF_PDM_SAFETY,
        /* New ones go last: the dump's `confirm act=` is this number, and the
         * GUI harness reads it (CONF_CERT_TRUST is act=13 to scripts/gui). */
-       CONF_WS_FORGET_ALL, CONF_BROADCAST };
+       CONF_WS_FORGET_ALL, CONF_BROADCAST, CONF_DEACTIVATE_SELF, CONF_EMOJI_DELETE };
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 static int      g_bc_confirmed;     /* CONF_BROADCAST: the send it confirmed is under way */
@@ -1969,6 +1987,17 @@ static struct { rectf r; uint64_t id; } g_invrows[64];   /* Revoke buttons */
 static struct { rectf r; uint64_t id; char key[OC_MAX_ALERT_KEY + 1]; } g_alertrows[OC_MAX_ALERTS + 1];
 static int g_n_alertrows;
 static int g_n_invrows;
+/* Admin > Custom emoji (REQ-072): each row's Delete, where it is offered, and
+ * the row's name; and the picker's Manage link, which opens it. */
+static struct { rectf r; char name[48]; } g_emojirows[128];
+static int g_n_emojirows;
+static rectf g_pick_manage;
+static char g_emoji_q[48];             /* its search box's text */
+/* The row the keyboard is on, -1 before any key, and the list it moves in; as
+ * the Workspaces dialog's, `reveal` asks the next paint to scroll it into view. */
+static int g_emoji_focus = -1, g_emoji_reveal;
+static rectf g_emoji_list;
+static char g_confirm_emoji[48];       /* CONF_EMOJI_DELETE: the emoji, by name */
 /* Admin > Groups (REQ-307): the group whose members are open (0 = the list),
  * and the buttons drawn this frame. */
 enum { GRP_ACT_MEMBERS = 1, GRP_ACT_RENAME, GRP_ACT_DELETE, GRP_ACT_REMOVE };
@@ -2007,9 +2036,14 @@ static struct { float top, bot; uint64_t wid; } g_webrows[64];
 static int g_n_webrows;
 
 /* Audit family filter: 0 = all, else the OC audit family id. */
-static int g_audit_family;
 static rectf g_audit_filters[5];
 static int g_n_audit_filters;
+/* The actor and action pickers: each row's actor and action narrow the log to
+ * them when clicked, and their chip clears that filter again. */
+static struct { rectf actor, action; uint64_t actor_id; char action_name[48]; } g_audit_rowhits[64];
+static int   g_n_audit_rowhits;
+static rectf g_audit_clear_actor, g_audit_clear_action;
+static char  g_audit_actor_name[64];
 static uint64_t g_audit_oldest;     /* the oldest entry paged in, for load-older */
 
 /* Command palette. Every action on the rail and in the menus is
@@ -2058,6 +2092,8 @@ static int g_about_open;
  * which fills the one and refocuses the other. */
 static int   g_status_open;
 static int   g_sch_open;              /* the send-later date and time card */
+static int   g_sch_insert;            /* ...opened by Insert a time: any moment, and
+                                       * Insert puts its token in the message */
 static int   g_sr_open;               /* a summary's custom date range (REQ-310) */
 static int   g_pc_open;               /* the poll composer, new or editing (REQ-225) */
 static int   g_te_open;               /* the table editor, a new table or a card's (MARKDOWN.md §6) */
@@ -2206,6 +2242,8 @@ static rectf g_ws_hdr_btn;        /* channel-column workspace header (opens ws m
 static rectf g_hdr_compose;               /* channel-column header compose button */
 static field   *g_find;                 /* "Find a conversation" filter box */
 static field   *g_ffind;                /* "Search files" box, Files view only */
+static field   *g_efind;                /* Admin > Custom emoji's search box */
+static rectf    g_emoji_search_box;
 static field   *g_srch;                 /* search-overlay query box */
 
 /* Composer autocomplete. The candidate list is rebuilt from the text up
@@ -2387,9 +2425,23 @@ static rectf g_send_btn;          /* composer send-button hit-box */
 static rectf g_sched_btn;         /* "send later" chevron beside it (REQ-224) */
 static rectf g_emoji_btn;         /* composer emoji-picker hit-box */
 static rectf g_at_btn;            /* composer mention button */
+static rectf g_time_btn;          /* composer Insert a time (MARKDOWN.md §1c) */
 /* The New message pane's own copies (REQ-229). */
 static rectf g_nm_send, g_nm_sched, g_nm_ed, g_nm_attach, g_nm_emoji, g_nm_at;
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
+/* The composer's Preview (Ctrl+Shift+P): the draft drawn as the transcript
+ * draws a message, by the same renderer, in place of the field. The field keeps
+ * its text, caret and selection underneath, and takes no edits until Edit;
+ * nothing is sent until Send. The conversation's composer only, and only while
+ * the conversation it was opened in is the one shown. */
+static int      g_preview;
+static uint64_t g_preview_ch;
+static rectf    g_preview_btn;
+static float    g_preview_h;            /* the rendered draft's height, lines and */
+static int      g_preview_lines, g_preview_tabs;   /* tables, for the dump */
+static int      g_preview_held;         /* images it did not ask for, for the dump */
+static void preview_set(oc_win *hwnd, int on);   /* fwd */
+static void preview_draw(gfx *rt, rectf box);     /* fwd */
 
 /* The formatting toolbar (REQ-220). One entry per button, in the order
  * they are drawn — emphasis, then code, then the block forms, which is both
@@ -2410,6 +2462,7 @@ static int         g_fmt_tip_shown;     /* dwell crossed; repainted once */
  * on (ACT_*, -1 none) and since when. */
 enum { ACT_ATTACH = 0, ACT_VIDEO, ACT_EMOJI, ACT_MENTION, ACT_MIC, ACT_FREETALK, ACT_SEND,
        ACT_SCHEDULE, ACT_NM_ATTACH, ACT_NM_EMOJI, ACT_NM_MENTION, ACT_NM_SEND, ACT_NM_SCHEDULE,
+       ACT_TIME,
        ACT_COUNT };
 static int         g_act_hover = -1;
 static uint64_t   g_act_hover_since;
@@ -4060,6 +4113,9 @@ static int  g_caret_placed;            /* set by ed_caret_sync, cleared each pai
 static void avatar_want(uint64_t aid) {
     if (!aid || g_thumbs_off || g_thumb_pending || !g_client) return;
     if (thumb_get(NULL, aid, NULL, NULL) || thumb_failed(aid)) return;
+    /* Previewing sends nothing (CLIENT.md): it stays a placeholder, and the draw
+     * after the preview closes asks. */
+    if (g_preview) { g_preview_held++; return; }
     g_thumb_pending = aid;
     g_thumb_deadline = now_ms() + 8000;
     oc_client_fetch_attachment(g_client, aid);
@@ -5396,8 +5452,11 @@ static const char *action_line(const oc_msg *msg) {
     unsigned k = g_act_next++ % ACT_LINES;
     size_t cap = strlen(nm) + 1 + msg->action.len + 1;
     char *line = malloc(cap), *copy = strdup(text);
-    if (!line || !copy) { free(line); free(copy); return msg->body; }
-    oc_model_line(model(), msg->author_id, nm, 1, text, line, cap);
+    if (!line || !copy) { free(line); free(copy); return "(message unavailable)"; }
+    /* With a spoiler, as written: the layout covers it, and it reveals like any
+     * other (MARKDOWN.md §1d). An excerpt's word in its place could not be. */
+    if (oc_rt_spoilers(text, strlen(text), NULL, 0)) snprintf(line, cap, "%s %s", nm, text);
+    else oc_model_line(model(), msg->author_id, nm, 1, text, line, cap);
     free(g_act_line[k].line);
     free(g_act_line[k].text);
     g_act_line[k].mid = msg->message_id;
@@ -5423,6 +5482,15 @@ static const char *body_text(const oc_msg *msg) {
 static size_t body_lead(const oc_msg *msg) {
     if (msg->deleted || !msg->action.present || !msg->body) return 0;
     return strlen(action_name(msg)) + 1;
+}
+
+/* How many spoilers the transcript draws in `msg`, past an action's name: they
+ * are numbered the same way everywhere. */
+static size_t msg_spoilers(const oc_msg *msg) {
+    const char *b = body_text(msg);
+    size_t blen = strlen(b), lead = body_lead(msg);
+    if (lead > blen) lead = blen;
+    return oc_rt_spoilers(b + lead, blen - lead, NULL, 0);
 }
 
 /* Is there any text to show? An attachment-only message has none — body_text()
@@ -5466,14 +5534,16 @@ static int draw_custom_emoji(gfx *rt, const char *s, rectf r) {
 
 /* Custom-emoji shortcodes in a body (REQ-072): where each one is, in BYTES,
  * and which image it names. Byte offsets are sdltext's native unit, so the
- * reserved box and the image drawn over it cannot disagree. */
+ * reserved box and the image drawn over it cannot disagree. Returns how many
+ * there are, which may exceed `max`: the first `max` are written to `out`, as
+ * oc_rt_scan does, so a NULL `out` counts them. */
 typedef struct { size_t at, len; uint64_t aid; } oc_emoji_run;
 
 static int emoji_runs(const char *utf8, oc_emoji_run *out, int max) {
     const oc_model *m = model();
-    if (!m || !utf8 || !out || max <= 0) return 0;
+    if (!m || !utf8) return 0;
     int n = 0;
-    for (const char *p = strchr(utf8, ':'); p && n < max; p = strchr(p + 1, ':')) {
+    for (const char *p = strchr(utf8, ':'); p; p = strchr(p + 1, ':')) {
         const char *e = strchr(p + 1, ':');
         if (!e) break;
         size_t L = (size_t)(e - p - 1);
@@ -5482,9 +5552,11 @@ static int emoji_runs(const char *utf8, oc_emoji_run *out, int max) {
         memcpy(name, p + 1, L); name[L] = '\0';
         uint64_t aid = oc_model_custom_emoji(m, name);
         if (!aid) continue;          /* not a custom one: leave the text alone */
-        out[n].at = (size_t)(p - utf8);
-        out[n].len = L + 2;
-        out[n].aid = aid;
+        if (out && n < max) {
+            out[n].at = (size_t)(p - utf8);
+            out[n].len = L + 2;
+            out[n].aid = aid;
+        }
         n++;
         p = e;                        /* do not let one colon start two runs */
     }
@@ -5540,7 +5612,7 @@ static void apply_richtext(st_layout *lay, const char *u8, size_t blen, int edit
              * written -- the author sees where it goes -- and is hidden once
              * sent, where hovering shows it instead (MARKDOWN.md §4). */
             int block = (st & (OC_RT_BULLET | OC_RT_ORDERED | OC_RT_QUOTE)) != 0 ||
-                        (editing && (st & OC_RT_LABELLED));
+                        (editing && (st & (OC_RT_LABELLED | OC_RT_SPOILER | OC_RT_SPOILER_BLOCK)));
             if (!block) st_range_hide(lay, at, len);
             else        st_range_color(lay, at, len, OC_COL_FAINT, 1.0f);
             continue;
@@ -5563,6 +5635,73 @@ static void apply_richtext(st_layout *lay, const char *u8, size_t blen, int edit
     }
 }
 
+/* ---- spoilers (MARKDOWN.md §1d) ---------------------------------------------
+ * Covered until this reader reveals one, by a click on it or its button for
+ * assistive technology, and covered again the same way. Per reader and per
+ * view: kept here, never sent, and forgotten when the client closes. */
+enum { SPL_REVEALS = 1024 };
+static struct { uint64_t mid; int k; } g_spl_shown[SPL_REVEALS];
+static int g_n_spl_shown;
+static int spoiler_shown(uint64_t mid, int k) {
+    for (int i = 0; i < g_n_spl_shown; i++)
+        if (g_spl_shown[i].mid == mid && g_spl_shown[i].k == k) return 1;
+    return 0;
+}
+static void spoiler_toggle(uint64_t mid, int k) {
+    for (int i = 0; i < g_n_spl_shown; i++)
+        if (g_spl_shown[i].mid == mid && g_spl_shown[i].k == k) {
+            g_spl_shown[i] = g_spl_shown[--g_n_spl_shown];
+            return;
+        }
+    if (g_n_spl_shown == SPL_REVEALS) memmove(g_spl_shown, g_spl_shown + 1, sizeof g_spl_shown[0] * (SPL_REVEALS - 1)), g_n_spl_shown--;
+    g_spl_shown[g_n_spl_shown].mid = mid; g_spl_shown[g_n_spl_shown].k = k; g_n_spl_shown++;
+}
+/* `t` (`nt` tables of a body whose spoilers are `sv`) less those in a covered
+ * spoiler, which stay text under its cover: a grid would be drawn over it, for
+ * all to read. Returns how many are left. */
+static int tables_uncovered(uint64_t mid, const oc_rt_spoiler *sv, size_t nsv, oc_rt_table *t, int nt) {
+    int kept = 0;
+    for (int i = 0; i < nt; i++) {
+        int hid = 0;
+        for (size_t k = 0; k < nsv && !hid; k++)
+            hid = t[i].start >= sv[k].hidden && t[i].start < sv[k].hidden + sv[k].hidden_len &&
+                  !spoiler_shown(mid, (int)k);
+        if (!hid) t[kept++] = t[i];
+    }
+    return kept;
+}
+/* The spoilers drawn this frame, for a click, assistive technology and the dump.
+ * Every spoiler is covered whether or not it finds room here: past the bound one
+ * is revealed by the message's "Show spoilers". */
+enum { SPL_HITS = 256 };
+static struct { rectf r; uint64_t mid; int k; int shown; int lines; } g_splhits[SPL_HITS];
+static int g_n_splhits;
+
+/* ---- collapsing (CLIENT.md "Long messages") --------------------------------
+ * A message this reader folded away (msg->collapsed, theirs on every device)
+ * shows its first line; one longer than COLLAPSE_LINES lines or COLLAPSE_CHARS
+ * characters as drawn shows its first COLLAPSE_SHOW, for everyone. Opening a
+ * long one is this view's alone: kept here, never sent. */
+enum { COLLAPSE_LINES = 25, COLLAPSE_CHARS = 3000, COLLAPSE_SHOW = 10, EXPANDED_MAX = 128 };
+static uint64_t g_expanded[EXPANDED_MAX];
+static int g_n_expanded;
+static int msg_expanded(uint64_t mid) {
+    for (int i = 0; i < g_n_expanded; i++) if (g_expanded[i] == mid) return 1;
+    return 0;
+}
+static void msg_expand(uint64_t mid, int on) {
+    for (int i = 0; i < g_n_expanded; i++)
+        if (g_expanded[i] == mid) { if (!on) g_expanded[i] = g_expanded[--g_n_expanded]; return; }
+    if (!on) return;
+    if (g_n_expanded == EXPANDED_MAX) memmove(g_expanded, g_expanded + 1, sizeof g_expanded[0] * (EXPANDED_MAX - 1)), g_n_expanded--;
+    g_expanded[g_n_expanded++] = mid;
+}
+static void msg_open_cut(uint64_t mid, int kind);   /* fwd */
+/* Each cut message's "Show more" (or "Show message") as drawn this frame. */
+enum { MORE_HITS = 32 };
+static struct { rectf r; uint64_t mid; int kind; } g_morehits[MORE_HITS];
+static int g_n_morehits;
+
 /* ---- the message layout cache --------------------------------------------
  * One entry per recently drawn message: the styled st_layout (selection,
  * links and copy hit-test against it) and its rasterized texture (the frame
@@ -5570,7 +5709,71 @@ static void apply_richtext(st_layout *lay, const char *u8, size_t blen, int edit
  * change bumps the generation and the transcript rebuilds lazily. This is
  * what holds the frame at "blit what changed" instead of re-shaping every
  * visible message per frame. */
-enum { MLAY_CACHE = 96, MLAY_BOXES = 16 };
+enum { MLAY_CACHE = 96 };
+
+/* ---- inline boxes ------------------------------------------------------------
+ * Custom emoji (REQ-072) and time tokens (MARKDOWN.md §1c) are drawn into boxes
+ * the layout reserves for them (ARCH-106), every one the text has: a square for
+ * an emoji, and for a time a box as wide as its text in this reader's zone,
+ * which the draw pass writes in. One id sequence for both, in the order they
+ * come in the text. Short of memory a piece gets no box, and its text shows as
+ * typed: an emoji's shortcode, a time's moment in UTC. */
+typedef struct {
+    st_rect  r;      /* where the layout put it */
+    uint64_t aid;    /* a custom emoji's image, or 0 for a time */
+    int64_t  ms;     /* a time token's moment (MARKDOWN.md §1c) */
+} ibox;
+
+/* A piece of a layout's text to draw in a box: its bytes, and what it is. */
+typedef struct { size_t at, len; uint64_t aid; int64_t ms; } ibox_src;
+
+static int ibox_src_cmp(const void *a, const void *b) {
+    size_t x = ((const ibox_src *)a)->at, y = ((const ibox_src *)b)->at;
+    return x < y ? -1 : x > y;
+}
+
+/* Reserve a box in `lay` for each of the `n` pieces in `src`, which this puts
+ * in text order, and where each landed: into *out, the caller's to free.
+ * Returns how many it holds. Call it after every other range is applied. */
+static int ibox_place(st_layout *lay, ibox_src *src, int n, ibox **out) {
+    *out = NULL;
+    if (!lay || !src || n <= 0) return 0;
+    ibox *bx = malloc((size_t)n * sizeof *bx);
+    st_rect *rs = malloc((size_t)n * sizeof *rs);
+    uint32_t *ids = malloc((size_t)n * sizeof *ids);
+    char *got = calloc((size_t)n, 1);
+    if (!bx || !rs || !ids || !got) { free(bx); free(rs); free(ids); free(got); return 0; }
+    qsort(src, (size_t)n, sizeof *src, ibox_src_cmp);
+    float side = g_body->line_h > 4 ? g_body->line_h - 4 : 18.0f;
+    float lh = g_body->line_h > 4 ? g_body->line_h : 22.0f;
+    float base = g_body->baseline > 0 ? g_body->baseline : lh * 0.78f;
+    int nb = 0;
+    for (int i = 0; i < n; i++) {
+        int ok;
+        if (src[i].aid) {
+            ok = st_range_box(lay, src[i].at, src[i].len, side, side, side * 0.85f, (uint32_t)nb + 1);
+        } else {
+            char tt[64];
+            oc_model_time_text(model(), src[i].ms, OC_RT_TIME_SHORT, tt, sizeof tt);
+            ok = st_range_box(lay, src[i].at, src[i].len, text_width(tt, g_body) + 2.0f, lh, base, (uint32_t)nb + 1);
+        }
+        if (!ok) continue;
+        memset(&bx[nb].r, 0, sizeof bx[nb].r);
+        bx[nb].aid = src[i].aid; bx[nb].ms = src[i].ms;
+        nb++;
+    }
+    /* Each rect to the box its id names, whatever order they come back in. One
+     * the layout does not report is not drawn. */
+    int nr = nb ? st_layout_boxes(lay, ids, rs, nb) : 0;
+    for (int k = 0; k < nr; k++)
+        if (ids[k] >= 1 && (int)ids[k] <= nb) { bx[ids[k] - 1].r = rs[k]; got[ids[k] - 1] = 1; }
+    int kept = 0;
+    for (int i = 0; i < nb; i++) if (got[i]) bx[kept++] = bx[i];
+    free(rs); free(ids); free(got);
+    if (!kept) { free(bx); return 0; }
+    *out = bx;
+    return kept;
+}
 
 /* ---- tables in the transcript (REQ-220, ARCH-100, MARKDOWN.md §1a) --------
  * A pipe table is drawn as a grid, never as its pipes. The body keeps ONE
@@ -5588,13 +5791,23 @@ enum { MLAY_CACHE = 96, MLAY_BOXES = 16 };
  * laid out once per message signature and width and rasterized the first time
  * they are drawn, and a table is bounded (MTAB_ROWS, MTAB_CELLS, MCELL_BYTES)
  * so a 64 KiB one costs one bounded first frame and nothing after it. */
-enum { MTAB_MAX = 16, MTAB_ROWS = 200, MTAB_CELLS = 2400, MCELL_BYTES = 2048, MCELL_BOXES = 4 };
+enum { MTAB_MAX = 16, MTAB_ROWS = 200, MTAB_CELLS = 2400, MCELL_BYTES = 2048 };
 #define TAB_PX    UIS(10.0f)    /* cell padding, across */
 #define TAB_PY    UIS(5.0f)     /* ... and down */
 #define TAB_MINW  UIS(40.0f)    /* a column's text width, at least */
 #define TAB_MAXW  UIS(320.0f)   /* ... and at most: past it, a cell wraps */
 #define TAB_GAP   UIS(6.0f)     /* above and below the grid */
 #define TAB_SB    UIS(10.0f)    /* the horizontal scrollbar's band, when it has one */
+
+/* A spoiler in a cell (MARKDOWN.md §1d), its offsets from the cell's start: `k`
+ * is its index among the message's spoilers, as a click, assistive technology
+ * and "Show spoilers" know it. Where its lines landed is the layout's. */
+typedef struct {
+    int     k, shown;
+    size_t  start, len, hidden, hidden_len;
+    st_rect *r;
+    int     nr;
+} mcspl;
 
 typedef struct {
     st_layout *lay;          /* NULL for an empty cell */
@@ -5603,9 +5816,10 @@ typedef struct {
     float      dx, dy;       /* the raster's ink offset (cap_blit) */
     float      w, h;         /* laid out, DIPs */
     size_t     start, len;   /* the cell's bytes in body_text */
-    int        nbox;         /* custom emoji (REQ-072), as the body reserves them */
-    st_rect    box[MCELL_BOXES];
-    uint64_t   box_aid[MCELL_BOXES];
+    int        nbox;         /* custom emoji and time tokens, as the body boxes them */
+    ibox      *box;
+    int        nspl;
+    mcspl     *spl;
 } mcell;
 
 typedef struct {
@@ -5632,22 +5846,34 @@ typedef struct {
                            * swapped for its grid */
     uint32_t   rgb;       /* the ink, kept for the paint ledger to report */
     size_t     blen;      /* body byte length (selection clamps to it) */
-    /* the inline boxes (custom emoji): where they landed + which image */
+    /* the inline boxes (custom emoji, time tokens): where they landed, and
+     * what each draws; the entry's own, freed with it */
     int        nbox;
-    st_rect    box[MLAY_BOXES];
-    uint64_t   box_aid[MLAY_BOXES];
+    ibox      *box;
     int        ntab;      /* tables drawn as grids (MARKDOWN.md §1a) */
     mtab      *tab;
+    /* spoilers (MARKDOWN.md §1d), however many: each one's lines, layout-relative,
+     * whether it was laid out covered, and a block's label (offset into
+     * body_text). Both are the entry's own, freed with it. */
+    int        nspl;
+    struct mspl { st_rect *r; int nr; int shown; size_t label, label_len; } *spl;
+    /* cut short (CLIENT.md "Long messages"): 1 folded away by this reader, 2
+     * long, else 0; and where its "Show ..." line landed, layout-relative */
+    int        cutkind;
+    st_rect    more_r;
 } mlay_ent;
 static mlay_ent g_mlay[MLAY_CACHE];
 static unsigned g_mlay_stamp;
 
-static size_t tcell_plain(const char *b, size_t start, size_t len, char *out, size_t cap);   /* fwd */
+static size_t tcell_plain(const char *b, size_t start, size_t len, const mcspl *spl, int nspl, char *out, size_t cap);   /* fwd */
 
 static void mtab_free(mtab *t) {
     for (uint32_t i = 0; t->cell && i < t->nrows * t->rt.cols; i++) {
         if (t->cell[i].lay) st_layout_destroy(t->cell[i].lay);
         if (t->cell[i].tex) gfx_tex_destroy(t->cell[i].tex);
+        for (int k = 0; k < t->cell[i].nspl; k++) free(t->cell[i].spl[k].r);
+        free(t->cell[i].spl);
+        free(t->cell[i].box);
     }
     free(t->cell);
     free(t->rowy);
@@ -5685,11 +5911,30 @@ static uint64_t mlay_sig(const oc_msg *msg) {
         h = (h ^ *p) * 1099511628211ull;
     h = (h ^ (uint64_t)(msg->edited ? 2 : 0)) * 1099511628211ull;
     h = (h ^ (uint64_t)(msg->deleted ? 4 : 0)) * 1099511628211ull;
+    {   /* Which spoilers are shown, whatever order they were revealed in. */
+        uint64_t shown = 0;
+        for (int i = 0; i < g_n_spl_shown; i++)
+            if (g_spl_shown[i].mid == msg->message_id) shown += ((uint64_t)g_spl_shown[i].k + 1) * 0x9E3779B97F4A7C15ull;
+        h = (h ^ shown) * 1099511628211ull;
+    }
+    h = (h ^ (uint64_t)(msg->collapsed ? 64 : 0) ^ (uint64_t)(msg_expanded(msg->message_id) ? 128 : 0)) * 1099511628211ull;
     const oc_model *km = model();
     if (km)
         for (uint8_t k = 0; k < km->n_kw_terms; k++)
             for (const char *t = km->kw_terms[k]; *t; t++)
                 h = (h ^ (unsigned char)*t) * 1099511628211ull;
+    /* A time token's text (and so its box) follows the clock preference, the
+     * zone and what "today" is: any of them changing lays the body out again. */
+    if (strstr(b, "<time:")) {
+        time_t now = time(NULL);
+        struct tm lt;
+        int yday = oc_localtime_r(&now, &lt) ? lt.tm_year * 400 + lt.tm_yday : 0;
+        oc_rt_clock k;
+        oc_model_clock(km, (int64_t)now * 1000, &k);
+        h = (h ^ (uint64_t)(g_pref_time24 ? 8 : 16)) * 1099511628211ull;
+        h = (h ^ (uint64_t)(uint32_t)yday) * 1099511628211ull;
+        h = (h ^ (uint64_t)(uint32_t)(k.tz_min + 100000)) * 1099511628211ull;
+    }
     return h ? h : 1;
 }
 
@@ -5714,6 +5959,9 @@ static unsigned  g_tgrid_stamp;
 static void mlay_drop(mlay_ent *e) {
     if (e->lay) st_layout_destroy(e->lay);
     if (e->tex) gfx_tex_destroy(e->tex);
+    for (int k = 0; k < e->nspl; k++) free(e->spl[k].r);
+    free(e->spl);
+    free(e->box);
     memset(e, 0, sizeof *e);             /* the grids are g_tgrid's */
 }
 
@@ -5730,21 +5978,34 @@ static void tgrid_drop(tgrid_ent *g) {
 
 /* A cell's layout at width `w`: its copy of the bytes, `<br>` a newline, and
  * the body's own treatment -- inline formatting with its delimiters and escapes
- * collapsed, links, @mentions, #channels, keywords and custom emoji boxes. The
- * header row is bold throughout. */
+ * collapsed, links, @mentions, #channels, keywords, and boxes for custom emoji
+ * and time tokens. The header row is bold throughout. A covered spoiler's text
+ * takes its cover's colour and reserves no box, whose picture or time would show
+ * through; the cover itself is mtab_draw's, at the rects asked for here. */
+static int tcell_covered(const mcell *c, size_t at) {
+    for (int q = 0; q < c->nspl; q++)
+        if (!c->spl[q].shown && at >= c->spl[q].hidden && at < c->spl[q].hidden + c->spl[q].hidden_len) return 1;
+    return 0;
+}
 static st_layout *tcell_lay(mcell *c, const char *b, float w, int align, int header) {
     size_t n = c->len;
     char *t = malloc(n + 1);
     if (!t) return NULL;
     memcpy(t, b + c->start, n);
     t[n] = '\0';
-    oc_rt_span sp[OC_RT_MAX];
-    size_t ns = oc_rt_scan_cell(b, c->start, n, sp, OC_RT_MAX);
-    if (ns > OC_RT_MAX) ns = OC_RT_MAX;
+    /* Every span, however many: past OC_RT_MAX in memory of their own, and
+     * short of that, the first OC_RT_MAX, past which the text shows as typed. */
+    oc_rt_span stack[OC_RT_MAX], *sp = stack;
+    size_t ns = oc_rt_scan_cell(b, c->start, n, stack, OC_RT_MAX);
+    if (ns > OC_RT_MAX) {
+        oc_rt_span *all = malloc(ns * sizeof *all);
+        if (all) { sp = all; ns = oc_rt_scan_cell(b, c->start, n, all, ns); }
+        else ns = OC_RT_MAX;
+    }
     for (size_t i = 0; i < ns; i++)
         if (sp[i].style == OC_RT_BREAK) t[sp[i].start - c->start] = '\n';
     st_layout *lay = st_layout_create(g_st, g_body->f, t, n, w, 4000.0f, align);
-    if (!lay) { free(t); return NULL; }
+    if (!lay) { if (sp != stack) free(sp); free(t); return NULL; }
     if (header) st_range_weight(lay, 0, n, 700);
     for (size_t i = 0; i < ns; i++) {
         uint16_t st = sp[i].style;
@@ -5786,19 +6047,52 @@ static st_layout *tcell_lay(mcell *c, const char *b, float w, int align, int hea
             off += hs + (hl ? hl : 1);
         }
     }
-    oc_emoji_run runs[MCELL_BOXES];
-    int nr = emoji_runs(t, runs, MCELL_BOXES);
-    float side = g_body->line_h > 4 ? g_body->line_h - 4 : 18.0f;
-    for (int i = 0; i < nr; i++) {
-        st_range_box(lay, runs[i].at, runs[i].len, side, side, side * 0.85f, (uint32_t)i + 1);
-        c->box_aid[i] = runs[i].aid;
+    /* From the whole list rather than the spans above, which may have stopped
+     * short of them, and last, over every colour above. */
+    for (int q = 0; q < c->nspl; q++) {
+        const mcspl *s = &c->spl[q];
+        st_range_hide(lay, s->start, s->hidden - s->start);
+        if (s->start + s->len > s->hidden + s->hidden_len)
+            st_range_hide(lay, s->hidden + s->hidden_len, s->start + s->len - s->hidden - s->hidden_len);
+        if (!s->shown && s->hidden_len) st_range_color(lay, s->hidden, s->hidden_len, OC_COL_MUTED, 1.0f);
     }
-    uint32_t ids[MCELL_BOXES];
-    int nb = st_layout_boxes(lay, ids, c->box, MCELL_BOXES);
-    c->nbox = nr < nb ? nr : nb;
+    /* Emoji and time tokens (MARKDOWN.md §1c), every one, boxed as the body's
+     * are (ibox_place); none under a covered spoiler, whose picture or time
+     * would show through. */
+    free(c->box);
+    c->box = NULL;
+    c->nbox = 0;
+    int ne = emoji_runs(t, NULL, 0), nsrc = 0;
+    oc_emoji_run *runs = ne ? malloc((size_t)ne * sizeof *runs) : NULL;
+    if (runs) { int got = emoji_runs(t, runs, ne); if (got < ne) ne = got; }
+    else ne = 0;
+    ibox_src *src = (ne || ns) ? malloc(((size_t)ne + ns) * sizeof *src) : NULL;
+    for (int i = 0; src && i < ne; i++)
+        if (!tcell_covered(c, runs[i].at))
+            src[nsrc++] = (ibox_src){ runs[i].at, runs[i].len, runs[i].aid, 0 };
+    for (size_t i = 0; src && i < ns; i++) {
+        int64_t ms = 0;
+        if (sp[i].style != OC_RT_TIME || tcell_covered(c, sp[i].start - c->start) ||
+            !oc_rt_time_value(b, c->start + n, &sp[i], &ms)) continue;
+        src[nsrc++] = (ibox_src){ sp[i].start - c->start, sp[i].len, 0, ms };
+    }
+    c->nbox = ibox_place(lay, src, nsrc, &c->box);
+    free(src);
+    free(runs);
+    if (sp != stack) free(sp);
     st_metrics m;
     st_layout_metrics(lay, &m);
     c->w = m.w; c->h = m.h;
+    for (int q = 0; q < c->nspl; q++) {
+        mcspl *s = &c->spl[q];
+        free(s->r);
+        s->nr = 0;
+        s->r = malloc(((size_t)m.lines + 1) * sizeof *s->r);
+        if (s->r && s->hidden_len) {
+            int got = st_hit_range(lay, s->hidden, s->hidden_len, s->r, m.lines + 1);
+            s->nr = got > m.lines + 1 ? m.lines + 1 : got;
+        }
+    }
     free(t);
     return lay;
 }
@@ -5826,6 +6120,13 @@ static float mtab_build(mlay_ent *e, const char *b, size_t blen, size_t lead,
     int nl = st_layout_lines(lay, ln, LINES);
     int budget = MTAB_CELLS, last_line = -1;
     float d = 0;
+    /* The message's spoilers, for those in the cells (MARKDOWN.md §1d): a cell
+     * takes its own from this list, its index theirs across the message. */
+    size_t nsv = oc_rt_spoilers(b + lead, blen - lead, NULL, 0), svi = 0;
+    oc_rt_spoiler *sv = nsv ? malloc(nsv * sizeof *sv) : NULL;
+    if (nsv && !sv) { free(ln); free(e->tab); e->tab = NULL; return 0; }
+    if (nsv) nsv = oc_rt_spoilers(b + lead, blen - lead, sv, nsv);
+    const float spl_minw = text_width("Spoiler", g_meta) + 10;
     for (int k = 0; k < nt; k++) {
         mtab *t = &e->tab[e->ntab];
         size_t s = lead + rts[k].start, end = s + rts[k].len;
@@ -5878,9 +6179,35 @@ static float mtab_build(mlay_ent *e, const char *b, size_t blen, size_t lead,
                     cl->len = MCELL_BYTES;
                     while (cl->len && ((unsigned char)b[cl->start + cl->len] & 0xC0) == 0x80) cl->len--;
                 }
+                /* This cell's spoilers. The bound above may fall inside one, whose
+                 * closer is then not laid out: it stays covered up to the bound. */
+                while (svi < nsv && sv[svi].start < cells[c].start) svi++;
+                size_t sv0 = svi;
+                while (svi < nsv && sv[svi].start < cells[c].start + cells[c].len) svi++;
+                if (svi > sv0 && (cl->spl = calloc(svi - sv0, sizeof *cl->spl)) == NULL) {
+                    cl->len = lead + sv[sv0].start - cl->start;   /* shows less, never more */
+                } else {
+                    for (size_t q = sv0; q < svi && lead + sv[q].start - cl->start < cl->len; q++) {
+                        mcspl *s = &cl->spl[cl->nspl++];
+                        s->k = (int)q;
+                        s->shown = spoiler_shown(e->mid, (int)q);
+                        s->start = lead + sv[q].start - cl->start;
+                        s->len = sv[q].len;
+                        s->hidden = lead + sv[q].hidden - cl->start;
+                        s->hidden_len = sv[q].hidden_len;
+                        if (s->start + s->len > cl->len) {
+                            s->len = cl->len - s->start;
+                            if (s->hidden > cl->len) s->hidden = cl->len;
+                            s->hidden_len = cl->len - s->hidden;
+                        }
+                    }
+                }
                 if (!cl->len) continue;
                 cl->lay = tcell_lay(cl, b, 100000.0f, ST_ALIGN_LEFT, hdr && rr == 0);
                 if (cl->lay && cl->w > natw[c]) natw[c] = cl->w;
+                /* Room for what its cover says, the same whether it is covered
+                 * or not, so a reveal does not move the column. */
+                if (cl->nspl && natw[c] < spl_minw) natw[c] = spl_minw;
             }
             r++;
         }
@@ -5918,6 +6245,7 @@ static float mtab_build(mlay_ent *e, const char *b, size_t blen, size_t lead,
         d += t->seg_h - (t->band1 - t->band0);
     }
     free(ln);
+    free(sv);
     return d;
 }
 
@@ -5967,6 +6295,75 @@ static int in_tables(const oc_rt_table *t, int nt, size_t pos) {
  * The layout carries: markdown spans, the faint inline "(edited)", @mention
  * and keyword accents, and an inline BOX per custom emoji — the real
  * mechanism (ARCH-106) for the space the old transparent-glyph trick faked. */
+/* Where a long body is cut (CLIENT.md "Long messages"): the start of its line
+ * COLLAPSE_SHOW + 1 as it wraps at `cw`, when it runs past COLLAPSE_LINES lines
+ * or COLLAPSE_CHARS characters; else 0. Measured on the text as written. */
+static size_t long_cut(const char *b, size_t blen, float cw) {
+    size_t chars = 0;
+    for (size_t i = 0; i < blen; i++) if (((unsigned char)b[i] & 0xC0) != 0x80) chars++;
+    size_t nl = 0;
+    for (size_t i = 0; i < blen; i++) if (b[i] == '\n') nl++;
+    if (chars <= COLLAPSE_CHARS && nl + 1 <= COLLAPSE_SHOW) return 0;   /* cannot be long */
+    st_layout *l = st_layout_create(g_st, g_body->f, b, blen, cw, 4000.0f, ST_ALIGN_LEFT);
+    if (!l) return 0;
+    st_line ln[COLLAPSE_SHOW + 1];
+    st_metrics mt;
+    st_layout_metrics(l, &mt);
+    int n = st_layout_lines(l, ln, COLLAPSE_SHOW + 1);
+    st_layout_destroy(l);
+    if (mt.lines <= COLLAPSE_LINES && chars <= COLLAPSE_CHARS) return 0;
+    if (n <= COLLAPSE_SHOW) return 0;
+    size_t cut = ln[COLLAPSE_SHOW].off;
+    while (cut > 0 && (b[cut - 1] == '\n' || b[cut - 1] == '\r')) cut--;
+    return cut;
+}
+
+/* The body cut at `cut`, into `out` (OC_MAX_BODY_SIZE + 8 bytes), and its length.
+ * A cut inside a spoiler would leave its fence or its `>!` unclosed, and what
+ * they hide would read as text; so there the spoiler is closed where the cut
+ * falls, and stays covered (MARKDOWN.md §1d). `lead` is where the author's text
+ * starts, past an action's name. */
+static size_t cut_body(const char *b, size_t blen, size_t lead, size_t cut, char *out) {
+    size_t ns = oc_rt_spoilers(b + lead, blen - lead, NULL, 0), hit = ns;
+    oc_rt_spoiler *sv = ns ? malloc(ns * sizeof *sv) : NULL;
+    if (ns && !sv) return memcpy(out, b, lead), lead;   /* shows less, never more */
+    if (ns) ns = oc_rt_spoilers(b + lead, blen - lead, sv, ns);
+    for (size_t k = 0; k < ns; k++)
+        if (cut > lead + sv[k].start && cut < lead + sv[k].start + sv[k].len) { hit = k; break; }
+    if (hit >= ns) { free(sv); memcpy(out, b, cut); return cut; }
+    const oc_rt_spoiler s = sv[hit];
+    size_t start = lead + s.start, hid0 = lead + s.hidden, hid1 = hid0 + s.hidden_len, end = start + s.len, n;
+    const char *close = s.block ? "\n```" : "!<";
+    if (cut >= hid1) {                          /* in its closing delimiter: the whole of it */
+        n = end <= OC_MAX_BODY_SIZE ? end : start;
+        memcpy(out, b, n);
+        free(sv);
+        return n;
+    }
+    if (cut <= hid0 && s.block) {               /* in its opening line: its first hidden line, covered */
+        const char *nl = memchr(b + hid0, '\n', hid1 - hid0);
+        cut = nl ? (size_t)(nl - b) : hid1;
+    }
+    n = cut;
+    while (n > hid0 && (b[n - 1] == '\n' || b[n - 1] == '\r' || b[n - 1] == ' ' || b[n - 1] == '\t')) n--;
+    if (n > hid0) {
+        memcpy(out, b, n);
+        memcpy(out + n, close, strlen(close));
+        n += strlen(close);
+        /* Closed as the scanner reads it, or not kept at all. */
+        oc_rt_spoiler *again = malloc((hit + 1) * sizeof *again);
+        int ok = again && oc_rt_spoilers(out + lead, n - lead, again, hit + 1) == hit + 1 &&
+                 again[hit].start == s.start && again[hit].hidden == s.hidden;
+        free(again);
+        if (ok) { free(sv); return n; }
+    }
+    /* Otherwise the cut goes back to where the spoiler starts, leaving it for
+     * Show more to open. */
+    memcpy(out, b, start);
+    free(sv);
+    return start;
+}
+
 static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     uint64_t sig = mlay_sig(msg);
     unsigned slot = (unsigned)(msg->message_id % MLAY_CACHE);
@@ -5985,6 +6382,26 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
 
     const char *b = body_text(msg);
     size_t blen = strlen(b);
+    /* Cut short (CLIENT.md "Long messages"): folded away, to its first line;
+     * long, to its first COLLAPSE_SHOW. What is laid out is the prefix, so
+     * every offset below means what it did. */
+    static char cutbuf[OC_MAX_BODY_SIZE + 8];
+    int cutkind = 0;
+    if (!msg->deleted && msg_has_body(msg) && !msg_expanded(msg->message_id)) {
+        size_t cut = 0, lead0 = body_lead(msg);
+        if (msg->collapsed) {
+            const char *nl = memchr(b + lead0, '\n', blen - lead0);
+            cut = nl ? (size_t)(nl - b) : blen;
+            cutkind = 1;
+        } else if ((cut = long_cut(b, blen, cw)) != 0) {
+            cutkind = 2;
+        }
+        if (cutkind && cut <= OC_MAX_BODY_SIZE) {
+            blen = cut_body(b, blen, lead0, cut, cutbuf);
+            cutbuf[blen] = '\0';
+            b = cutbuf;
+        } else cutkind = 0;
+    }
     /* The tables (MARKDOWN.md §1a), found before the layout is: their bytes
      * are laid out as one run of hidden filler, the same length, so the band
      * they leave is a line or so whatever the table's size -- a hidden byte
@@ -5994,9 +6411,18 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     int nt = 0;
     size_t tlead = body_lead(msg);
     if (tlead > blen) tlead = blen;
+    /* The spoilers (MARKDOWN.md §1d), every one of them, offsets past the lead. */
+    oc_rt_spoiler *spv = NULL;
+    size_t nspv = msg->deleted ? 0 : oc_rt_spoilers(b + tlead, blen - tlead, NULL, 0);
+    if (nspv) {
+        spv = malloc(nspv * sizeof *spv);
+        if (!spv) return NULL;
+        nspv = oc_rt_spoilers(b + tlead, blen - tlead, spv, nspv);
+    }
     if (!msg->deleted && memchr(b + tlead, '|', blen - tlead)) {
         size_t k = oc_rt_tables(b + tlead, blen - tlead, rts, MTAB_MAX);
         nt = (int)(k > MTAB_MAX ? MTAB_MAX : k);
+        nt = tables_uncovered(msg->message_id, spv, nspv, rts, nt);
     }
     /* The faint inline "(edited)" flows after the last word instead of
      * colliding with a header line that grouped messages don't have. */
@@ -6005,9 +6431,11 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     const char *text = b;
     size_t edit_at = 0, edit_len = 0;
     int edited = msg->edited && !msg->deleted;
-    if (edited || nt) {
-        own = malloc(blen + 16);
-        if (!own) return NULL;
+    static const char *const MORE[3] = { "", "  \xE2\x80\xA6 Show message", "\nShow more" };
+    size_t more_at = 0, more_len = cutkind ? strlen(MORE[cutkind]) : 0;
+    if (edited || nt || cutkind) {
+        own = malloc(blen + 16 + 32);
+        if (!own) { free(spv); return NULL; }
         memcpy(own, b, blen);
         for (int k = 0; k < nt; k++) memset(own + tlead + rts[k].start, 'x', rts[k].len);
         if (edited) {
@@ -6019,15 +6447,25 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
             memcpy(own + total, "  (edited)", edit_len);
             total += edit_len;
         }
+        if (cutkind) {
+            if (nt && tlead + rts[nt - 1].start + rts[nt - 1].len >= blen && cutkind == 1) own[total++] = '\n';
+            more_at = total;
+            memcpy(own + total, MORE[cutkind], more_len);
+            total += more_len;
+        }
         own[total] = '\0';
         text = own;
     }
     st_layout *lay = st_layout_create(g_st, g_body->f, text, total, cw, 4000.0f,
                                       ST_ALIGN_LEFT);
     free(own);
-    if (!lay) return NULL;
+    if (!lay) { free(spv); return NULL; }
     if (edit_len)
         st_range_color(lay, edit_at, edit_len, OC_COL_FAINT, 1.0f);
+    if (more_len) {
+        st_range_color(lay, more_at, more_len, OC_COL_ACCENT, 1.0f);
+        st_range_weight(lay, more_at, more_len, 600);
+    }
     for (int k = 0; k < nt; k++) st_range_hide(lay, tlead + rts[k].start, rts[k].len);
     if (!msg->deleted) {
         /* An action (REQ-058) reads "<name> <text>": the name is bold, and the
@@ -6079,31 +6517,96 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
                 off = at + (hl ? hl : 1);
             }
         }
-        /* Custom emoji reserve REAL boxes in the flow (ARCH-106); the draw pass
-         * composites the images at the rects the layout reports. */
-        oc_emoji_run runs[MLAY_BOXES];
-        int nr = emoji_runs(b, runs, MLAY_BOXES);
-        float side = g_body->line_h > 4 ? g_body->line_h - 4 : 18.0f;
-        /* Not inside a table: a box there would reserve space in its band. */
-        int kept = 0;
-        for (int i = 0; i < nr; i++)
-            if (!in_tables(rts, nt, runs[i].at)) runs[kept++] = runs[i];
-        nr = kept;
-        for (int i = 0; i < nr; i++) {
-            st_range_box(lay, lead + runs[i].at, runs[i].len, side, side, side * 0.85f,
-                         (uint32_t)i + 1);
-            best->box_aid[i] = runs[i].aid;
+        /* Spoilers (MARKDOWN.md §1d), last, over every colour above: a covered
+         * one's text takes the cover's colour, so that its edges do not show
+         * round the cover drawn over it -- not a mention's accent, not a
+         * keyword's. Their delimiters go too, past the spans the scan above
+         * keeps. */
+        if (nspv) {
+            best->spl = calloc(nspv, sizeof *best->spl);
+            if (!best->spl) { free(spv); st_layout_destroy(lay); return NULL; }
         }
-        best->nbox = nr;
+        best->nspl = 0;
+        for (size_t k = 0; k < nspv; k++) {
+            /* One in a cell of a grid is the grid's (mtab_build), and its bytes
+             * are hidden with the table's. One in a table that is not drawn
+             * as a grid, past MTAB_MAX, is text like any other, and covered. */
+            if (spv[k].cell && in_tables(rts, nt, spv[k].start)) { best->nspl++; continue; }
+            st_range_hide(lay, lead + spv[k].start, spv[k].hidden - spv[k].start);
+            st_range_hide(lay, lead + spv[k].hidden + spv[k].hidden_len, spv[k].start + spv[k].len - spv[k].hidden - spv[k].hidden_len);
+            int shown = spoiler_shown(msg->message_id, (int)k);
+            if (!shown && spv[k].hidden_len)
+                st_range_color(lay, lead + spv[k].hidden, spv[k].hidden_len, OC_COL_MUTED, 1.0f);
+            best->spl[k].shown = shown;
+            best->spl[k].label = lead + spv[k].label; best->spl[k].label_len = spv[k].label_len;
+            best->nspl++;
+        }
+        /* Custom emoji reserve REAL boxes in the flow (ARCH-106), and time
+         * tokens (MARKDOWN.md §1c) boxes as wide as their text in this reader's
+         * zone: every one of them (ibox_place). The draw pass composites the
+         * images, and writes the times, at the rects the layout reports. */
+        int ne = emoji_runs(b, NULL, 0), nsrc = 0;
+        oc_emoji_run *runs = ne ? malloc((size_t)ne * sizeof *runs) : NULL;
+        if (runs) { int got = emoji_runs(b, runs, ne); if (got < ne) ne = got; }
+        else ne = 0;
+        oc_rt_span tstack[OC_RT_MAX], *tsp = tstack;
+        size_t nts = strstr(b, "<time:") ? oc_rt_scan(b, blen, tstack, OC_RT_MAX) : 0;
+        if (nts > OC_RT_MAX) {
+            oc_rt_span *all = malloc(nts * sizeof *all);
+            if (all) { tsp = all; nts = oc_rt_scan(b, blen, all, nts); }
+            else nts = OC_RT_MAX;          /* past these, a token shows as typed */
+        }
+        ibox_src *src = (ne || nts) ? malloc(((size_t)ne + nts) * sizeof *src) : NULL;
+        for (int i = 0; src && i < ne; i++) {
+            /* Not inside a table, where a box would reserve space in its band,
+             * nor in a covered spoiler, where its picture would show through. */
+            int hid = in_tables(rts, nt, runs[i].at);
+            for (size_t k = 0; k < nspv && !hid; k++)
+                hid = !best->spl[k].shown && runs[i].at >= spv[k].hidden && runs[i].at < spv[k].hidden + spv[k].hidden_len;
+            if (!hid) src[nsrc++] = (ibox_src){ lead + runs[i].at, runs[i].len, runs[i].aid, 0 };
+        }
+        for (size_t i = 0; src && i < nts; i++) {
+            int64_t ms = 0;
+            if (tsp[i].style != OC_RT_TIME || in_tables(rts, nt, tsp[i].start) ||
+                !oc_rt_time_value(b, blen, &tsp[i], &ms)) continue;
+            src[nsrc++] = (ibox_src){ lead + tsp[i].start, tsp[i].len, 0, ms };
+        }
+        best->nbox = ibox_place(lay, src, nsrc, &best->box);
+        free(src);
+        free(runs);
+        if (tsp != tstack) free(tsp);
         b = ab;                 /* the whole line again, for what follows */
         blen += lead;
     }
 
     st_metrics m;
     st_layout_metrics(lay, &m);
-    uint32_t ids[MLAY_BOXES];
-    int nb = st_layout_boxes(lay, ids, best->box, MLAY_BOXES);
-    if (nb < best->nbox) best->nbox = nb;
+    /* Where each spoiler's hidden lines landed, all of them: the cover is drawn
+     * there. As many as the text wraps to, so the rects are asked for by lines. */
+    if (best->nspl) {
+        st_line *ln = malloc(((size_t)m.lines + 1) * sizeof *ln);
+        int nl = ln ? st_layout_lines(lay, ln, m.lines + 1) : 0, i0 = 0;
+        for (int k = 0; k < best->nspl; k++) {
+            if (!spv[k].hidden_len || (spv[k].cell && in_tables(rts, nt, spv[k].start))) continue;
+            size_t at = tlead + spv[k].hidden, end = at + spv[k].hidden_len;
+            int cap = 1;
+            while (i0 < nl && ln[i0].off + ln[i0].len <= at) i0++;
+            for (int i = i0; i < nl && ln[i].off < end; i++) cap++;
+            best->spl[k].r = malloc((size_t)cap * sizeof *best->spl[k].r);
+            if (!best->spl[k].r) continue;
+            int c = st_hit_range(lay, at, spv[k].hidden_len, best->spl[k].r, cap);
+            best->spl[k].nr = c > cap ? cap : c;
+        }
+        free(ln);
+    }
+    free(spv);
+    best->cutkind = cutkind;
+    if (more_len) {
+        /* The words alone, past the newline or the ellipsis before them. */
+        size_t skip = cutkind == 2 ? 1 : 6;
+        st_rect mr[2];
+        if (st_hit_range(lay, more_at + skip, more_len - skip, mr, 2) >= 1) best->more_r = mr[0];
+    }
 
     /* Raster now, once; the texture is what frames blit. */
     best->rgb = msg->deleted ? OC_COL_FAINT : OC_COL_TEXT;
@@ -6293,6 +6796,49 @@ static const tabhit *tabhit_find(uint64_t mid, int idx, int thr) {
     return NULL;
 }
 
+static void time_box_draw(gfx *rt, const oc_msg *msg, int64_t ms, rectf box);   /* fwd */
+/* The custom emoji drawn in message bodies and their tables this frame, for
+ * the dump. */
+static int g_n_emojiboxes;
+
+/* A cell's spoilers that are shown, or that are not, its text at ox,oy in the
+ * column [cx0, cx1): as the body's covers (spoiler_covers), kept to the column,
+ * and a click's only where the grid's frame and the list show them. */
+static void mcell_covers(gfx *rt, const oc_msg *msg, const mcell *cl, float ox, float oy,
+                         float cx0, float cx1, rectf frame, rectf clip, int shown) {
+    float capw = text_width("Spoiler", g_meta) + 10;
+    for (int k = 0; k < cl->nspl; k++) {
+        const mcspl *s = &cl->spl[k];
+        if (!s->shown != !shown) continue;
+        rectf hit = rf(0, 0, 0, 0);
+        for (int q = 0; q < s->nr; q++) {
+            rectf c = rf(ox + s->r[q].x - 2, oy + s->r[q].y, ox + s->r[q].x + s->r[q].w + 2, oy + s->r[q].y + s->r[q].h);
+            if (!q && !shown && c.right < c.left + capw) c.right = c.left + capw;
+            /* A short one at a column's right edge grows to the left. */
+            if (c.right > cx1 - 1) {
+                c.left -= c.right - (cx1 - 1);
+                c.right = cx1 - 1;
+                if (c.left < cx0 + 1) c.left = cx0 + 1;
+            }
+            if (shown) fill_round_a(rt, c, OC_R_CONTROL, OC_COL_MUTED, 0.16f);
+            else       fill_round(rt, c, OC_R_CONTROL, OC_COL_MUTED);
+            if (!q && !shown) draw_text(rt, "Spoiler", g_meta, rf(c.left + 4, c.top, c.right, c.bottom), 0xFFFFFF);
+            if (!q) hit = c;
+            else { if (c.left < hit.left) hit.left = c.left; if (c.right > hit.right) hit.right = c.right; hit.bottom = c.bottom; }
+        }
+        if (hit.left < frame.left) hit.left = frame.left;
+        if (hit.right > frame.right) hit.right = frame.right;
+        if (hit.top < clip.top) hit.top = clip.top;
+        if (hit.bottom > clip.bottom) hit.bottom = clip.bottom;
+        if (s->nr && hit.right > hit.left && hit.bottom > hit.top && g_n_splhits < SPL_HITS) {
+            g_splhits[g_n_splhits].r = hit; g_splhits[g_n_splhits].mid = msg->message_id;
+            g_splhits[g_n_splhits].k = s->k; g_splhits[g_n_splhits].shown = shown;
+            g_splhits[g_n_splhits].lines = s->nr;
+            g_n_splhits++;
+        }
+    }
+}
+
 /* Table `k` of `e` as a grid, its segment's top at `y`: a rounded frame of the
  * transcript's own border colour, the header row (when there is one) bold on a
  * faint fill, rules between rows and columns, each cell padded and aligned as
@@ -6334,19 +6880,23 @@ static void mtab_draw(gfx *rt, const oc_msg *msg, mlay_ent *e, int k, float x, f
                 cl->dx = g_cap_dx; cl->dy = g_cap_dy;
             }
             float ox = cx0 + TAB_PX, oy = ry0 + TAB_PY;
+            mcell_covers(rt, msg, cl, ox, oy, cx0, cx1, frame, clip, 1);
             if (cl->tex) {
                 gfx_rect dst = { ox + cl->dx, oy + cl->dy, cl->pw / sc, cl->ph / sc };
                 gfx_ink(rt, OC_COL_TEXT, ST_RASTER_PAD, ST_RASTER_PAD);
                 gfx_tex_draw(rt, cl->tex, dst, 0.0f, 1.0f);
             }
             for (int i = 0; i < cl->nbox; i++) {
-                rectf box = rf(ox + cl->box[i].x, oy + cl->box[i].y,
-                               ox + cl->box[i].x + cl->box[i].w, oy + cl->box[i].y + cl->box[i].h);
-                if (!draw_avatar_image(rt, cl->box_aid[i], box, 3.0f, 1)) {
-                    avatar_want(cl->box_aid[i]);
+                const st_rect *br = &cl->box[i].r;
+                rectf box = rf(ox + br->x, oy + br->y, ox + br->x + br->w, oy + br->y + br->h);
+                if (!cl->box[i].aid) { time_box_draw(rt, msg, cl->box[i].ms, box); continue; }
+                g_n_emojiboxes++;
+                if (!draw_avatar_image(rt, cl->box[i].aid, box, 3.0f, 1)) {
+                    avatar_want(cl->box[i].aid);
                     draw_text(rt, ":…:", g_meta, box, OC_COL_FAINT);
                 }
             }
+            mcell_covers(rt, msg, cl, ox, oy, cx0, cx1, frame, clip, 0);
         }
     }
     /* The rules: between rows, under the last when a "more" line follows, and
@@ -6416,6 +6966,152 @@ static void body_draw_split(gfx *rt, const oc_msg *msg, mlay_ent *e, float tx, f
     }
 }
 
+/* The time tokens drawn this frame, every one, where and which moment: for the
+ * hover's full date and zone (time_tip_draw), keyboard focus's, and the dump.
+ * Grown as a frame needs; short of memory, a token is drawn without its tip. */
+static struct timehit { rectf r; uint64_t mid; int64_t ms; } *g_timehits;
+static int g_n_timehits, g_timehits_cap;
+static void time_hit_add(uint64_t mid, int64_t ms, rectf r) {
+    if (g_n_timehits == g_timehits_cap) {
+        int cap = g_timehits_cap ? g_timehits_cap * 2 : 64;
+        struct timehit *g = realloc(g_timehits, (size_t)cap * sizeof *g);
+        if (!g) return;
+        g_timehits = g;
+        g_timehits_cap = cap;
+    }
+    g_timehits[g_n_timehits].r = r; g_timehits[g_n_timehits].mid = mid;
+    g_timehits[g_n_timehits].ms = ms; g_n_timehits++;
+}
+
+/* A time token (MARKDOWN.md §1c), in its box: its time in this reader's zone, in
+ * the accent and dotted under, since hovering it says more (time_tip_draw). */
+static void time_box_draw(gfx *rt, const oc_msg *msg, int64_t ms, rectf box) {
+    char tt[64];
+    oc_model_time_text(model(), ms, OC_RT_TIME_SHORT, tt, sizeof tt);
+    draw_text(rt, tt, g_body, box, OC_COL_ACCENT);
+    for (float dx = box.left; dx < box.right - 2; dx += 4)
+        fill(rt, rf(dx, box.bottom - 2, dx + 2, box.bottom - 1), OC_COL_ACCENT);
+    time_hit_add(msg->message_id, ms, box);
+}
+
+/* Hovering a time token, or moving the keyboard onto its message, shows the
+ * whole of it: the date, the time and the zone it is shown in. */
+static void draw_tip(gfx *rt, rectf b, const char *name, const char *chord, float lim0, float lim1);   /* fwd */
+static int time_tip_index(void) {
+    for (int i = 0; i < g_n_timehits; i++)
+        if (in_rect(g_timehits[i].r, g_mouse_x, g_mouse_y)) return i;
+    for (int i = 0; i < g_n_timehits; i++)
+        if (g_kb_mid && g_timehits[i].mid == g_kb_mid) return i;
+    return -1;
+}
+static void time_tip_draw(gfx *rt, float W) {
+    int i = time_tip_index();
+    if (i < 0) return;
+    char full[96];
+    oc_model_time_text(model(), g_timehits[i].ms, OC_RT_TIME_FULL, full, sizeof full);
+    draw_tip(rt, g_timehits[i].r, full, "", 0, W);
+}
+
+/* What a covered spoiler says on its cover: "Spoiler", or its label. */
+static void spoiler_caption(const oc_msg *msg, const mlay_ent *body, int k, char *out, size_t cap) {
+    if (body->spl[k].label_len)
+        snprintf(out, cap, "Spoiler: %.*s", (int)body->spl[k].label_len, body_text(msg) + body->spl[k].label);
+    else
+        snprintf(out, cap, "Spoiler");
+}
+
+/* The covers (MARKDOWN.md §1d) of the spoilers that are shown, or that are not:
+ * one rect a line, every line, each a click's and assistive technology's. */
+static void spoiler_covers(gfx *rt, const oc_msg *msg, const mlay_ent *body, float tx, float by, int shown) {
+    for (int k = 0; k < body->nspl; k++) {
+        if (!body->spl[k].shown != !shown) continue;
+        rectf hit = rf(0, 0, 0, 0);
+        char capt[96];
+        spoiler_caption(msg, body, k, capt, sizeof capt);
+        for (int q = 0; q < body->spl[k].nr; q++) {
+            float ry = mtab_down(body, body->spl[k].r[q].y);
+            rectf c = rf(tx + body->spl[k].r[q].x - 2, by + ry,
+                         tx + body->spl[k].r[q].x + body->spl[k].r[q].w + 2, by + ry + body->spl[k].r[q].h);
+            /* Wide enough for what the cover says. */
+            if (!q && !shown && c.right < c.left + text_width(capt, g_meta) + 10)
+                c.right = c.left + text_width(capt, g_meta) + 10;
+            if (shown) fill_round_a(rt, c, OC_R_CONTROL, OC_COL_MUTED, 0.16f);
+            else       fill_round(rt, c, OC_R_CONTROL, OC_COL_MUTED);
+            if (!q) hit = c;
+            else { if (c.left < hit.left) hit.left = c.left; if (c.right > hit.right) hit.right = c.right; hit.bottom = c.bottom; }
+        }
+        if (body->spl[k].nr && g_n_splhits < SPL_HITS) {
+            g_splhits[g_n_splhits].r = hit; g_splhits[g_n_splhits].mid = msg->message_id;
+            g_splhits[g_n_splhits].k = k; g_splhits[g_n_splhits].shown = shown;
+            g_splhits[g_n_splhits].lines = body->spl[k].nr;
+            g_n_splhits++;
+        }
+    }
+}
+
+/* A message body laid out by body_layout, drawn with its top left at tx,by:
+ * spoilers' covers, the text (split round its tables when it has any), its
+ * custom emoji and time tokens, and a covered block's caption. The
+ * transcript's, and the composer's Preview's. Returns the height it took. */
+static float body_draw(gfx *rt, const oc_msg *msg, mlay_ent *body, float tx, float by,
+                       float content_w, float right) {
+    /* A shown spoiler's tint, under its text, so it still reads as one. */
+    spoiler_covers(rt, msg, body, tx, by, 1);
+    if (body->ntab) {
+        body_draw_split(rt, msg, body, tx, by, content_w, right);
+    } else if (body->tex) {
+        float sc = gfx_scale(rt);
+        gfx_rect dst = { tx, by, body->pw / sc, body->ph / sc };
+        gfx_ink(rt, body->rgb, ST_RASTER_PAD, ST_RASTER_PAD);
+        gfx_tex_draw(rt, body->tex, dst, 0.0f, 1.0f);
+    }
+    /* A covered spoiler's cover, solid and over its text, so nothing in the
+     * layout can show through it. */
+    spoiler_covers(rt, msg, body, tx, by, 0);
+    /* Custom emoji (REQ-072) composited into the boxes the layout
+     * reserved for them (ARCH-106) — the layout knows where it
+     * wrapped, so the rects are its own; below a table, moved down
+     * with the text. */
+    for (int i = 0; i < body->nbox; i++) {
+        const st_rect *br = &body->box[i].r;
+        float bty = mtab_down(body, br->y);
+        rectf box = rf(tx + br->x, by + bty, tx + br->x + br->w, by + bty + br->h);
+        if (!body->box[i].aid) {
+            /* Not over a covered spoiler: the cover hides the time too. */
+            int hidden = 0;
+            for (int k = 0; k < body->nspl && !hidden; k++) {
+                if (body->spl[k].shown) continue;
+                for (int q = 0; q < body->spl[k].nr; q++) {
+                    float ry = mtab_down(body, body->spl[k].r[q].y);
+                    rectf c = rf(tx + body->spl[k].r[q].x, by + ry,
+                                 tx + body->spl[k].r[q].x + body->spl[k].r[q].w, by + ry + body->spl[k].r[q].h);
+                    if (box.left < c.right && c.left < box.right && box.top < c.bottom && c.top < box.bottom) { hidden = 1; break; }
+                }
+            }
+            if (hidden) continue;
+            time_box_draw(rt, msg, body->box[i].ms, box);
+            continue;
+        }
+        g_n_emojiboxes++;
+        if (!draw_avatar_image(rt, body->box[i].aid, box, 3.0f, 1)) {
+            avatar_want(body->box[i].aid);
+            /* Until the bytes arrive the shortcode is the honest
+             * placeholder — a blank gap would look like a bug. */
+            draw_text(rt, ":\u2026:", g_meta, box, OC_COL_FAINT);
+        }
+    }
+    /* A covered block says what it hides, on its cover. */
+    for (int k = 0; k < body->nspl; k++) {
+        if (body->spl[k].shown || !body->spl[k].nr) continue;
+        char cap[96];
+        spoiler_caption(msg, body, k, cap, sizeof cap);
+        float ry = mtab_down(body, body->spl[k].r[0].y);
+        draw_text(rt, cap, g_meta, rf(tx + body->spl[k].r[0].x + 4, by + ry,
+                                      tx + content_w, by + ry + body->spl[k].r[0].h), 0xFFFFFF);
+    }
+    return body->mh;
+}
+
 static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
                          mlay_ent *body, float x0, float y, float content_w,
                          int grouped) {
@@ -6470,31 +7166,17 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
          * advance nothing when there is no text, or the attachment lines below
          * would sit a line lower than the space reserved for them. */
         if (msg_has_body(msg)) {
-            if (body->ntab) {
-                body_draw_split(rt, msg, body, tx, by, content_w, x0 + content_w + AVA + 12);
-            } else if (body->tex) {
-                float sc = gfx_scale(rt);
-                gfx_rect dst = { tx, by, body->pw / sc, body->ph / sc };
-                gfx_ink(rt, body->rgb, ST_RASTER_PAD, ST_RASTER_PAD);
-                gfx_tex_draw(rt, body->tex, dst, 0.0f, 1.0f);
+            float bby = by;
+            by += body_draw(rt, msg, body, tx, by, content_w, x0 + content_w + AVA + 12);
+            /* A cut message's "Show more", which a click opens (on_click). */
+            if (body->cutkind && g_n_morehits < MORE_HITS && body->more_r.w > 0) {
+                float my = mtab_down(body, body->more_r.y);
+                g_morehits[g_n_morehits].r = rf(tx + body->more_r.x, bby + my,
+                                                tx + body->more_r.x + body->more_r.w, bby + my + body->more_r.h);
+                g_morehits[g_n_morehits].mid = msg->message_id;
+                g_morehits[g_n_morehits].kind = body->cutkind;
+                g_n_morehits++;
             }
-            /* Custom emoji (REQ-072) composited into the boxes the layout
-             * reserved for them (ARCH-106) — the layout knows where it
-             * wrapped, so the rects are its own; below a table, moved down
-             * with the text. */
-            for (int i = 0; i < body->nbox; i++) {
-                float bty = mtab_down(body, body->box[i].y);
-                rectf box = rf(tx + body->box[i].x, by + bty,
-                               tx + body->box[i].x + body->box[i].w,
-                               by + bty + body->box[i].h);
-                if (!draw_avatar_image(rt, body->box_aid[i], box, 3.0f, 1)) {
-                    avatar_want(body->box_aid[i]);
-                    /* Until the bytes arrive the shortcode is the honest
-                     * placeholder — a blank gap would look like a bug. */
-                    draw_text(rt, ":\u2026:", g_meta, box, OC_COL_FAINT);
-                }
-            }
-            by += body->mh;
         }
     }
 
@@ -6640,7 +7322,7 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
             gfx_tex *pbmp = at->poster_id ? thumb_get(rt, at->poster_id, &iw, &ih) : NULL;
             fill_round(rt, area, OC_R_CONTROL, 0x101010);
             if (pbmp) gfx_tex_draw(rt, pbmp, gr(area), OC_R_CONTROL, 1.0f);
-            else if (at->poster_id && !g_thumbs_off && !thumb_failed(at->poster_id) && !g_thumb_pending && g_client) {
+            else if (at->poster_id && !g_preview && !g_thumbs_off && !thumb_failed(at->poster_id) && !g_thumb_pending && g_client) {
                 g_thumb_pending = at->poster_id;
                 g_thumb_deadline = now_ms() + 8000;
                 oc_client_fetch_attachment(g_client, at->poster_id);
@@ -6712,7 +7394,7 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
                  * harness: that render is not the user's screen, and treating
                  * its forced miss as "not fetched yet" re-requested every image
                  * on every shot. */
-                if (!g_thumbs_off && !thumb_failed(at->id) && !g_thumb_pending && g_client) {
+                if (!g_preview && !g_thumbs_off && !thumb_failed(at->id) && !g_thumb_pending && g_client) {
                     g_thumb_pending = at->id;
                     g_thumb_deadline = now_ms() + 8000;
                     oc_client_fetch_attachment(g_client, at->id);
@@ -7236,7 +7918,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
      * single in-flight request and by a per-channel "no more" mark, so this
      * cannot turn a scroll into a request storm. */
     if (capture && *scroll_max > 0.5f && *scroll >= *scroll_max - 1.0f &&
-        nmsgs > 0 && g_sel && !g_hist_pending_chan) {
+        nmsgs > 0 && g_sel && !g_hist_pending_chan && !g_preview) {
         int done = 0;
         for (int k = 0; k < g_n_hist_exhausted; k++) if (g_hist_exhausted[k] == g_sel) done = 1;
         if (!done) {
@@ -7306,7 +7988,7 @@ static void ovl_end(gfx *rt, rectf body) {
     gfx_clip_pop(rt);
 }
 
-enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS, OVL_WSMGR, OVL_GROUPS, OVL_ALERTS };
+enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS, OVL_WSMGR, OVL_GROUPS, OVL_ALERTS, OVL_EMOJI };
 
 /* Measured from the previous frame's draw, for the same reason the notifications
  * card's is: computing it means restating every row's height a second time. */
@@ -7598,33 +8280,50 @@ static const char *audit_family(uint8_t f) {
 static void draw_audit(gfx *rt, const oc_model *m, rectf reg, int embedded) {
     rectf body = embedded ? reg : pane_header(rt, reg, "Audit log");
     ovl_use(OVL_AUDIT);
-    if (m->n_audit == 0) { overlay_empty(rt, body, "No audit entries."); return; }
 
-    /* Family filter. Client-side over what has been paged in, which is
-     * honest: it narrows what you are looking at, it does not re-query. */
+    /* The filters are the daemon's (AUDIT_QUERY): a chip asks for the newest
+     * page of that family, so a sparse family still fills a page, paged back by
+     * time. The actor and action set from a row show as chips that clear them. */
     static const char *FAMS[5] = { "All", "Admin", "Account", "Security", "Moderation" };
     float fx = body.left + 20;
     g_n_audit_filters = 0;
     for (int f = 0; f < 5; f++) {
         float fw = text_width(FAMS[f], g_meta) + 22;
         rectf b = rf(fx, body.top + 6, fx + fw, body.top + 30);
-        int on = (g_audit_family == f);
+        int on = (m->audit_family == f);
         draw_chip_r(rt, b, FAMS[f], on);
         if (g_n_audit_filters < 5) g_audit_filters[g_n_audit_filters++] = b;
         fx += fw + 6;
     }
+    g_audit_clear_actor = g_audit_clear_action = rf(0, 0, 0, 0);
+    if (m->audit_actor) {
+        char lab[96];
+        snprintf(lab, sizeof lab, "By %s  \u00d7", g_audit_actor_name[0] ? g_audit_actor_name : "one person");
+        float fw = text_width(lab, g_meta) + 22;
+        g_audit_clear_actor = rf(fx, body.top + 6, fx + fw, body.top + 30);
+        draw_chip_r(rt, g_audit_clear_actor, lab, 1);
+        fx += fw + 6;
+    }
+    if (m->audit_action[0]) {
+        char lab[96];
+        snprintf(lab, sizeof lab, "%s  \u00d7", m->audit_action);
+        float fw = text_width(lab, g_meta) + 22;
+        g_audit_clear_action = rf(fx, body.top + 6, fx + fw, body.top + 30);
+        draw_chip_r(rt, g_audit_clear_action, lab, 1);
+    }
     body.top += 36;
 
-    size_t shown = 0;
-    for (size_t i = 0; i < m->n_audit; i++)
-        if (!g_audit_family || m->audit[i].family == g_audit_family) shown++;
-    if (shown == 0) { overlay_empty(rt, body, "Nothing in that category yet."); return; }
+    g_n_audit_rowhits = 0;
+    if (m->n_audit == 0) {
+        int any = m->audit_family || m->audit_actor || m->audit_action[0];
+        overlay_empty(rt, body, any ? "Nothing matches these filters yet." : "No audit entries.");
+        return;
+    }
 
     float rowh = UIS(46);
-    float y = ovl_begin(rt, body, (float)shown * rowh + 34);
+    float y = ovl_begin(rt, body, (float)m->n_audit * rowh + 34);
     for (size_t i = 0; i < m->n_audit; i++) {
         const oc_audit_view *a = &m->audit[i];
-        if (g_audit_family && a->family != g_audit_family) continue;
         if (y + rowh < body.top) { y += rowh; continue; }
         if (y > body.bottom) break;
         char when[20] = "";
@@ -7636,6 +8335,25 @@ static void draw_audit(gfx *rt, const oc_model *m, rectf reg, int embedded) {
                  a->target[0] ? " → " : "", a->target);
         draw_text(rt, head, g_ui, rf(body.left + 20, y, body.right - 90, y + 24),
                   a->outcome ? OC_COL_TEXT : OC_COL_DANGER);
+        /* Where the actor and the action fall in the head, as clickable
+         * pickers: "<when>  ·  <actor>  ·  <action>". */
+        if (g_n_audit_rowhits < (int)(sizeof g_audit_rowhits / sizeof g_audit_rowhits[0])) {
+            char pre[96];
+            snprintf(pre, sizeof pre, "%s  \u00b7  ", when);
+            float ax = body.left + 20 + text_width(pre, g_ui);
+            const char *who = a->actor_name[0] ? a->actor_name : "system";
+            float aw = text_width(who, g_ui);
+            char mid[96];
+            snprintf(mid, sizeof mid, "%s  \u00b7  ", who);
+            float cx = body.left + 20 + text_width(pre, g_ui) + text_width(mid, g_ui);
+            float cw = text_width(a->action, g_ui);
+            g_audit_rowhits[g_n_audit_rowhits].actor = rf(ax, y, ax + aw, y + 24);
+            g_audit_rowhits[g_n_audit_rowhits].action = rf(cx, y, cx + cw, y + 24);
+            g_audit_rowhits[g_n_audit_rowhits].actor_id = a->actor_id;
+            snprintf(g_audit_rowhits[g_n_audit_rowhits].action_name,
+                     sizeof g_audit_rowhits[0].action_name, "%s", a->action);
+            g_n_audit_rowhits++;
+        }
         char meta[160];
         snprintf(meta, sizeof meta, "%s%s%s", audit_family(a->family),
                  a->detail[0] ? " · " : "", a->detail);
@@ -8394,7 +9112,7 @@ static void nav_conversation(oc_win *hwnd, int delta, int unread_only) {
 enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
        ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_PTT, ACC_FREETALK, ACC_QUIT, ACC_CALL_MUTE, ACC_CALL_SHARE,
-       ACC_MARK_ALL_READ, ACC_TOAST_ACTION, ACC_HIST_BACK, ACC_HIST_FWD };
+       ACC_MARK_ALL_READ, ACC_TOAST_ACTION, ACC_HIST_BACK, ACC_HIST_FWD, ACC_PREVIEW };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -8442,6 +9160,7 @@ static const struct {
     /* The newest toast's action -- Undo, most often -- without reaching for the
      * pointer (REQ-290); plain Esc dismisses the newest toast. */
     { AM_CTRL | AM_SHIFT, 'Z',        ACC_TOAST_ACTION, "Ctrl+Shift+Z", "Do what the newest notice offers (Undo)" },
+    { AM_CTRL | AM_SHIFT, 'P',        ACC_PREVIEW, "Ctrl+Shift+P",     "Preview the message you are writing, or go back to editing it" },
     /* Ctrl and a digit, as the reference client binds it: the digit is the
      * workspace's place in the rail, counting from 1. Handled in the dispatcher
      * below rather than as nine rows, so this one is the documentation. */
@@ -8456,6 +9175,7 @@ static const struct {
     { 0,                  0,          ACC_NONE,  "Ctrl+Up / Ctrl+Down","Move through the messages" },
     { 0,                  0,          ACC_NONE,  "Shift+F10 / Menu",   "Actions for the message you are on, or for this conversation" },
     { 0,                  0,          ACC_NONE,  "Up / Down, Enter",   "Move through an open menu and choose" },
+    { 0,                  0,          ACC_NONE,  "Tab, Up / Down, Del", "Custom emoji: the search box, the rows, delete the selected one" },
 };
 
 static void search_open(oc_win *hwnd);            /* fwd */
@@ -8494,6 +9214,9 @@ static void accel_run(oc_win *hwnd, int action) {
             }
         break;
     case ACC_SEARCH:  search_open(hwnd);  break;
+    case ACC_PREVIEW:
+        if (main_is_conversation() && g_view != VIEW_NEWMSG && g_sel) preview_set(hwnd, !g_preview);
+        break;
     case ACC_KEYS:    if (g_keys_open) modal_finish(0); else modal_enter(hwnd, &g_keys_open); break;
     case ACC_PREFS:   if (g_prefs_open) modal_finish(0); else modal_enter(hwnd, &g_prefs_open); break;
     case ACC_LISTEN: {
@@ -8527,8 +9250,10 @@ static void accel_run(oc_win *hwnd, int action) {
     case ACC_FOCUS: {
         /* One toggle rather than an F6 handler in each control, which is how the
          * two ends drifted: the composer sent focus to the filter box even in the
-         * views that have no filter box. */
-        if (ed_focused() && g_find && g_find->visible) focus_set(g_find);
+         * views that have no filter box. Admin > Custom emoji has no composer:
+         * there it is between the pane and its search box. */
+        if (g_efind && g_efind->visible) focus_set(g_focus == g_efind ? NULL : g_efind);
+        else if (ed_focused() && g_find && g_find->visible) focus_set(g_find);
         else ed_focus(hwnd);
         break; }
     default: break;
@@ -9660,7 +10385,7 @@ enum { PREF_ROW_DELIVER = 90, PREF_ROW_SNDMUTE = 91,
 enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
        PREF_ROW_NOTIFY, PREF_ROW_QUICK, PREF_ROW_ACCENT, PREF_ROW_TEXTSIZE,
        PREF_ROW_DENSITY, PREF_ROW_RESET,
-       PREF_ROW_EDITOR, PREF_ROW_FLASH, PREF_ROW_TOASTPOS };
+       PREF_ROW_EDITOR, PREF_ROW_FLASH, PREF_ROW_TOASTPOS, PREF_ROW_EMOTICONS };
 
 /* Preferences is two-paned: categories left, one category's rows right.
  * A single scrolling list was fine at six rows and is not at fourteen — and the
@@ -9845,6 +10570,10 @@ static void draw_prefs(gfx *rt, rectf reg) {
                      "Rich text formats as you type. Plain text shows the markup "
                      "and never restyles it.",
                      EDITORS, 2, g_pref_richtext);
+        y = pref_row(rt, body, y, PREF_ROW_EMOTICONS, "Emoticons",
+                     "Typed faces such as :) and <3 become emoji when a space "
+                     "follows them, and when you send. Never inside code.",
+                     ONOFF, 2, g_pref_emoticons);
         /* The quick reactions: six slots you click, each opening the emoji
          * picker for that slot. A typed list of shortcodes asked people to
          * remember names and separators and showed them nothing until the menu
@@ -10011,19 +10740,21 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
          * the Edit profile screen (cmd 53), which is the whole point of
          * consolidating identity onto one card. Three slots per group; an
          * unshown slot is skipped. */
-        struct { const char *label; int cmd; int show; } B[6] = {
+        struct { const char *label; int cmd; int show; } B[8] = {
             { "Edit profile",        53, 1 },
+            { NULL,                   0, 0 },
             { NULL,                   0, 0 },
             { NULL,                   0, 0 },
             { "Change password",     31, 1 },
             { "Active sessions",     54, 1 },
             { "Two-step sign-in",    32, 1 },
+            { "Deactivate account",  34, 1 },   /* REQ-033: one's own, behind a confirmation */
         };
         for (int gi = 0; gi < 2; gi++) {
             draw_text(rt, gi == 0 ? "PROFILE" : "ACCOUNT", g_meta,
                       rf(reg.left + 24, y, reg.right - 12, y + 18), OC_COL_FAINT);
             y += 22;
-            for (int bi = gi * 3; bi < gi * 3 + 3; bi++) {
+            for (int bi = gi * 4; bi < gi * 4 + 4; bi++) {
                 if (!B[bi].show) continue;
                 rectf b = rf(reg.left + 24, y, reg.right - 24, y + 28);
                 int hov = in_rect(b, g_mouse_x, g_mouse_y);
@@ -10741,6 +11472,7 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Storage usage",           60 },
     { "Audit log",               61 },
     { "Manage groups",           87 },
+    { "Manage custom emoji",     94 },
     { "Summarize this conversation", 88 },
     { "Create a poll",           90 },
     { "Toggle unreads only in the sidebar", 85 },
@@ -12531,6 +13263,7 @@ static void draw_autocomplete(gfx *rt, float x0, float w, float h) {
  * appear in the same place. */
 static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
     g_n_pick_cells = 0;
+    g_pick_manage = rf(0, 0, 0, 0);
     g_n_pick_tones = 0;
     if (!g_pick_open) { g_pick_panel = rf(0, 0, 0, 0); return; }
 
@@ -12667,10 +13400,21 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
             np++;
         }
         if (np) {
-            if (!q[0])
+            if (!q[0]) {
                 draw_text(rt, "This workspace", g_meta,
                           rf(body.left + 4, y, body.right, y + 18), OC_COL_FAINT);
-            if (!q[0]) y += 20;
+                /* Manage: the catalogue behind these, for everyone (REQ-072). */
+                float mw = text_width("Manage", g_meta) + 8;
+                rectf ml = rf(body.right - 4 - mw, y, body.right - 4, y + 18);
+                if (y + 18 >= body.top && y <= body.bottom) {
+                    int hot = in_rect(ml, g_mouse_x, g_mouse_y);
+                    g_meta->align = ST_ALIGN_RIGHT;
+                    draw_text(rt, "Manage", g_meta, ml, hot ? OC_COL_TEXT : OC_COL_ACCENT);
+                    g_meta->align = ST_ALIGN_LEFT;
+                    g_pick_manage = ml;
+                }
+                y += 20;
+            }
             for (int i = 0; i < np; i++) {
                 if (y + cell >= body.top && y <= body.bottom) {
                     rectf r = rf(x, y, x + cell, y + cell);
@@ -13078,8 +13822,10 @@ static void draw_status_body(gfx *rt, rectf body) {
  * over the status card). Returns 1 always — a click during an open picker is
  * the picker's to consume, wherever it lands. */
 static void prefs_save(void);   /* fwd */
+static void emoji_manage_open(oc_win *hwnd);   /* fwd */
 static int picker_click(oc_win *hwnd, int x, int y) {
     if (in_rect(g_pick_panel, (float)x, (float)y)) {
+        if (in_rect(g_pick_manage, (float)x, (float)y)) { emoji_manage_open(hwnd); return 1; }
         /* A tone is a preference, so choosing one re-renders the picker
          * and stays open — it is a change to what you are looking at, not
          * a selection. Saved immediately: it survives to the next window
@@ -13225,11 +13971,13 @@ static const char *const FMT_CHORD[FMT_COUNT] = {
 static const char *const ACT_NAME[ACT_COUNT] = {
     "Attach a file", "Record a video message", "Emoji", "Mention someone", "Hold to talk",
     "Free talk", "Send", "Send later",
-    "Attach a file", "Emoji", "Mention someone", "Send", "Send later"
+    "Attach a file", "Emoji", "Mention someone", "Send", "Send later",
+    "Insert a time"
 };
 static const char *const ACT_CHORD[ACT_COUNT] = {
     "", "", "", "@", "Ctrl+Shift+Space", "Ctrl+Shift+T", "Enter", "",
-    "", "", "@", "Enter", ""
+    "", "", "@", "Enter", "",
+    ""
 };
 
 /* The rect each action button was last drawn at; empty when it is not drawn. */
@@ -13248,6 +13996,7 @@ static rectf act_rect(int i) {
     case ACT_NM_MENTION:  return g_nm_at;
     case ACT_NM_SEND:     return g_nm_send;
     case ACT_NM_SCHEDULE: return g_nm_sched;
+    case ACT_TIME:        return g_time_btn;
     default:              return rf(0, 0, 0, 0);
     }
 }
@@ -13864,6 +14613,18 @@ static int ftray_click(oc_win *hwnd, float x, float y) {
     return 0;
 }
 
+/* Preview, or Edit while previewing: in the formatting row, or without one in
+ * the action row. */
+static void preview_btn_draw(gfx *rt, const char *label) {
+    int hot = in_rect(g_preview_btn, g_mouse_x, g_mouse_y);
+    if (g_preview) fill_round(rt, g_preview_btn, OC_R_CONTROL, OC_COL_ACCENT);
+    else if (hot)  fill_round(rt, g_preview_btn, OC_R_CONTROL, OC_COL_HOVER);
+    g_meta->align = ST_ALIGN_CENTER;
+    draw_text(rt, label, g_meta, g_preview_btn,
+              g_preview ? 0xFFFFFF : hot ? OC_COL_TEXT : OC_COL_MUTED);
+    g_meta->align = ST_ALIGN_LEFT;
+}
+
 static void draw_composer(gfx *rt, float x0, float w, float h) {
     float top = h - g_composer_h;
     fill(rt, rf(x0, top, x0 + w, h), OC_COL_BASE);
@@ -13878,7 +14639,21 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
     stroke_round(rt, rf(bx0, by0, bx1, by1), OC_R_CONTROL, OC_COL_BORDER, 1.0f);
 
     if (composer_tray() > 0) ftray_draw(rt, bx0, by0, bx1);
-    if (composer_toolbar_on()) draw_fmt_toolbar(rt, bx0, by0 + composer_tray(), bx1);
+    /* A preview belongs to the conversation it was opened in. */
+    if (g_preview && g_preview_ch != g_sel) g_preview = 0;
+    g_preview_btn = rf(0, 0, 0, 0);
+    if (composer_toolbar_on()) {
+        /* Preview, or Edit while previewing, at the toolbar's right end. The
+         * formatting buttons act on the field, so while it is hidden they are
+         * not offered. */
+        const char *pl = g_preview ? "Edit" : "Preview";
+        float pw = text_width(pl, g_meta) + 20, sq = COMPOSER_BTN;
+        float py = by0 + composer_tray() + (COMPOSER_TB - sq) / 2;
+        g_preview_btn = rf(bx1 - COMPOSER_PAD - pw, py, bx1 - COMPOSER_PAD, py + sq);
+        preview_btn_draw(rt, pl);
+        if (g_preview) { for (int i = 0; i < FMT_COUNT; i++) g_fmt_btn[i] = rf(0, 0, 0, 0); g_fmt_hover = -1; }
+        else draw_fmt_toolbar(rt, bx0, by0 + composer_tray(), g_preview_btn.left - 8);
+    }
     else { for (int i = 0; i < FMT_COUNT; i++) g_fmt_btn[i] = rf(0, 0, 0, 0); g_fmt_hover = -1; }
 
     /* The ACTION ROW, along the bottom of the box under the text — Slack's
@@ -13911,15 +14686,29 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
      * composer.mention+composer.send. Send is the one that must always
      * be there, so the optional icons drop off from the right. */
     float left_limit = bx1 - COMPOSER_GUTTER - sq - UIS(30);
+    /* With no formatting row (plain text), Preview sits just before Send, and
+     * the left cluster yields to it as it does to Send. */
+    if (!composer_toolbar_on()) {
+        const char *pl = g_preview ? "Edit" : "Preview";
+        float pw = text_width(pl, g_meta) + 20;
+        if (left_limit - pw - UIS(4) > composer_row_x(bx0)) {
+            g_preview_btn = rf(left_limit - pw, cy, left_limit, cy + sq);
+            preview_btn_draw(rt, pl);
+            left_limit -= pw + UIS(4);
+        }
+    }
     g_at_btn = ACT_AT(2 + vk);
     if (g_at_btn.right > left_limit) g_at_btn = rf(0, 0, 0, 0);
     /* Voice input after @, and only where the daemon offers it: a button that can
      * only be refused is worse than none. Free talk also needs somewhere it may
      * post. They drop off before @ does, being further right. */
+    /* Insert a time (MARKDOWN.md §1c) after @: a time written so each reader
+     * sees it in their own zone. */
+    g_time_btn = ACT_AT(3 + vk);
     g_mic_btn = g_freetalk_btn = rf(0, 0, 0, 0);
     if (dict_offered()) {
-        g_mic_btn = ACT_AT(3 + vk);
-        if (dict_free_offered()) g_freetalk_btn = ACT_AT(4 + vk);
+        g_mic_btn = ACT_AT(4 + vk);
+        if (dict_free_offered()) g_freetalk_btn = ACT_AT(5 + vk);
     }
     /* An encrypted DM takes no file, no video and no voice input (the server
      * would hear it): emoji and @ only. */
@@ -13927,9 +14716,11 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
         g_attach_btn = g_video_btn = g_mic_btn = g_freetalk_btn = rf(0, 0, 0, 0);
         g_emoji_btn = ACT_AT(0);
         g_at_btn = ACT_AT(1);
+        g_time_btn = ACT_AT(2);
         if (g_at_btn.right > left_limit) g_at_btn = rf(0, 0, 0, 0);
     }
 #undef ACT_AT
+    if (g_time_btn.right > left_limit) g_time_btn = rf(0, 0, 0, 0);
     if (g_freetalk_btn.right > left_limit) g_freetalk_btn = rf(0, 0, 0, 0);
     if (g_mic_btn.right > left_limit) g_mic_btn = rf(0, 0, 0, 0);
     if (g_video_btn.right > left_limit) g_video_btn = rf(0, 0, 0, 0);
@@ -13955,6 +14746,10 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
         draw_lucide(rt, OC_ICON_SMILE, composer_glyph(g_emoji_btn), OC_COL_MUTED);
     if (g_at_btn.right > g_at_btn.left)
         draw_lucide(rt, OC_ICON_AT, composer_glyph(g_at_btn), OC_COL_MUTED);
+    if (g_time_btn.right > g_time_btn.left) {
+        if (in_rect(g_time_btn, g_mouse_x, g_mouse_y)) fill_round(rt, g_time_btn, OC_R_CONTROL, OC_COL_HOVER);
+        draw_lucide(rt, OC_ICON_CALENDAR, composer_glyph(g_time_btn), OC_COL_MUTED);
+    }
     {
         uint8_t dm = g_dict ? oc_dictate_mode(g_dict) : 0xFF;
         dict_draw_btn(rt, g_mic_btn, OC_ICON_MIC, dm == OC_STT_MODE_PTT, OC_COL_DANGER);
@@ -13964,7 +14759,7 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
     /* THE FIELD. Between the left buttons and Send, at the rect
      * layout_composer computed — the same rect ed_hit tests against, so what you
      * click is what you see. */
-    if (cfield.right > cfield.left) ed_draw(rt, cfield);
+    if (cfield.right > cfield.left) { if (g_preview) preview_draw(rt, cfield); else ed_draw(rt, cfield); }
     g_cmp_hint_anchor = cbox;
     g_cmp_hint_below = 0;                  /* the conversation's composer is at the bottom */
     composer_hint_draw(rt);
@@ -14126,6 +14921,8 @@ static void confirm_run(oc_win *hwnd) {
     case CONF_WEBHOOK_ROTATE: oc_client_rotate_webhook(g_client, g_confirm_id);
                               g_await_webhook = 1; break;
     case CONF_INVITE_REVOKE:  oc_client_revoke_invite(g_client, g_confirm_id); break;
+    case CONF_DEACTIVATE_SELF: oc_client_deactivate_self(g_client); break;
+    case CONF_EMOJI_DELETE:   oc_client_delete_emoji(g_client, g_confirm_emoji); break;
     case CONF_CERT_TRUST: cert_trust_run(g_main); break;
     case CONF_PDM_TRUST:  oc_client_pdm_trust(g_client, g_confirm_id); break;
     case CONF_PDM_SAFETY: break;   /* shown, nothing to do */
@@ -14940,6 +15737,7 @@ static struct {
     unsigned dpi;
     char quick[160];
     int  richtext;
+    int  emoticons;
     int  flash;
     int  toastpos;
 } g_prefs_snap;
@@ -14956,6 +15754,7 @@ static void prefs_snapshot(void) {
     g_prefs_snap.textsize = g_pref_textsize;
     g_prefs_snap.density  = g_pref_density;
     g_prefs_snap.richtext = g_pref_richtext;
+    g_prefs_snap.emoticons = g_pref_emoticons;
     g_prefs_snap.dpi      = g_dpi;
     snprintf(g_prefs_snap.quick, sizeof g_prefs_snap.quick, "%s", g_quick_names);
 }
@@ -14979,6 +15778,7 @@ static void prefs_restore(void) {
     g_pref_density = g_prefs_snap.density;
     g_density      = g_prefs_snap.density ? 1.0f : 0.6f;
     g_pref_richtext = g_prefs_snap.richtext;
+    g_pref_emoticons = g_prefs_snap.emoticons;
     ed_mode_changed();
     snprintf(g_quick_names, sizeof g_quick_names, "%s", g_prefs_snap.quick);
     quick_rebuild();
@@ -15044,6 +15844,7 @@ static uint64_t sch_ms(int y, int m, int d, int min) {
 /* Far enough ahead to be a schedule rather than a send: the daemon's sweep runs
  * every few seconds, so anything nearer would effectively go out at once. */
 static int sch_future(uint64_t at) {
+    if (g_sch_insert) return at > 0;          /* a time to write about may be past */
     return at > (uint64_t)time(NULL) * 1000ULL + 60000ULL;
 }
 
@@ -15159,7 +15960,36 @@ static void sched_custom_open(oc_win *hwnd) {
     g_sch_vy = g_sch_y; g_sch_vm = g_sch_m;
     g_sch_tscroll = (float)(min / 30) * SCH_ROW_H - 3 * SCH_ROW_H;
     if (g_sch_tscroll < 0) g_sch_tscroll = 0;
+    g_sch_insert = 0;
     modal_enter(hwnd, &g_sch_open);
+}
+
+/* Insert a time (MARKDOWN.md §1c): the same date and time card, in this
+ * person's own zone, opened on the next half hour; any day may be picked, and
+ * Insert puts the moment's token at the caret. */
+static void time_insert_open(oc_win *hwnd) {
+    time_t t = time(NULL); struct tm tv;
+    if (!oc_localtime_r(&t, &tv)) return;
+    int min = ((tv.tm_hour * 60 + tv.tm_min + 29) / 30) * 30;
+    if (min >= 1440) min = 1410;
+    g_sch_y = tv.tm_year + 1900; g_sch_m = tv.tm_mon; g_sch_d = tv.tm_mday;
+    g_sch_min = min; g_sch_err = 0;
+    g_sch_vy = g_sch_y; g_sch_vm = g_sch_m;
+    g_sch_tscroll = (float)(min / 30) * SCH_ROW_H - 3 * SCH_ROW_H;
+    if (g_sch_tscroll < 0) g_sch_tscroll = 0;
+    g_sch_insert = 1;
+    modal_enter(hwnd, &g_sch_open);
+}
+
+/* The token for the moment the card shows, at the caret. */
+static void time_insert_commit(oc_win *hwnd, uint64_t at) {
+    char tok[48];
+    oc_wch w[48];
+    if (!oc_rt_time_token((int64_t)at, tok, sizeof tok)) return;
+    to_w(tok, w, 48);
+    ed_focus(hwnd);
+    ed_insert(w);
+    ed_changed(hwnd);
 }
 
 static float sched_custom_body_h(void) {
@@ -15247,7 +16077,7 @@ static void draw_sched_custom(gfx *rt, rectf body) {
         draw_text(rt, line, g_ui, rf(body.left, sy, body.right, sy + UIS(24.0f)), OC_COL_DANGER);
     } else {
         char when[96]; sch_describe(at, when, sizeof when);
-        snprintf(line, sizeof line, "Sends %s", when);
+        snprintf(line, sizeof line, g_sch_insert ? "Each reader sees %s in their own time" : "Sends %s", when);
         draw_text(rt, line, g_ui, rf(body.left, sy, body.right, sy + UIS(24.0f)),
                   g_sch_err ? OC_COL_DANGER : OC_COL_TEXT);
     }
@@ -16319,11 +17149,12 @@ static const oc_modal_spec *modal_current(void) {
         /* Schedule is a COMMAND, not MODAL_OK: it validates first, and a time
          * that has passed keeps the card open with the reason, which a plain OK
          * (close, then commit) cannot do. Enter reaches it the same way. */
-        sp.title = "Schedule message";
+        sp.title = g_sch_insert ? "Insert a time" : "Schedule message";
         sp.size = MODAL_SM;
         sp.want_h = (MODAL_TITLE_H + sched_custom_body_h() + MODAL_FOOT_H + UIS(16.0f)) / g_text_scale;
         sp.buttons[0] = (oc_mbtn){ "Cancel",   MB_NORMAL,  MODAL_CANCEL };
-        sp.buttons[1] = (oc_mbtn){ "Schedule", MB_PRIMARY, 304 };
+        sp.buttons[1] = g_sch_insert ? (oc_mbtn){ "Insert", MB_PRIMARY, 305 }
+                                     : (oc_mbtn){ "Schedule", MB_PRIMARY, 304 };
         sp.n_buttons = 2;
     } else if (g_status_open) {
         sp.title = "Set a status";
@@ -16757,6 +17588,7 @@ static int modal_key(oc_win *hwnd, int vk) {
  * new overlay has to be named in one of those predicates; it cannot silently
  * inherit somebody else's fields. */
 static void layout_files_find(oc_win *hwnd);   /* fwd */
+static void layout_emoji_find(oc_win *hwnd);   /* fwd */
 static void layout_dir_find(oc_win *hwnd);     /* fwd */
 
 static void layout_natives(oc_win *hwnd) {
@@ -16769,6 +17601,7 @@ static void layout_natives(oc_win *hwnd) {
     layout_composer(hwnd);     /* also does layout_find */
     layout_search(hwnd);
     layout_files_find(hwnd);
+    layout_emoji_find(hwnd);
     layout_dir_find(hwnd);
 
     int covered = window_is_covered();
@@ -16896,13 +17729,16 @@ static int shell_visible(void) {
  * nothing could see them, so a minted invite was write-only. */
 /* adds Alerts: the daemon's critical failures (REQ-263), last so the tabs
  * before it keep their places. */
-enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_COUNT };
+/* adds Custom emoji (REQ-072), the one tab a member is shown too: the
+ * catalogue is everyone's, and its creator may delete an emoji they added. */
+enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_EMOJI, ADM_COUNT };
 static int g_adm_tab;
 static rectf g_adm_tabs[ADM_COUNT];
 
 static void admin_select(int t) {
     g_adm_tab = t;
     grp_pick_close();
+    if (t == ADM_EMOJI && g_efind) field_set(g_efind, "");
     if (!g_client) return;
     /* Ask on entry: these are point-in-time reports, and a stale one is worse
      * than a moment's wait. */
@@ -16910,7 +17746,16 @@ static void admin_select(int t) {
     else if (t == ADM_INVITES)  oc_client_list_invites(g_client);
     else if (t == ADM_GROUPS)  { g_grp_sel = 0; oc_client_list_groups(g_client); }
     else if (t == ADM_ALERTS)   oc_client_srvalerts_list(g_client);
-    else                       { oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); }
+    else if (t == ADM_AUDIT)   { oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); }
+}
+
+/* The picker's Manage link: Admin > Custom emoji, which a member is shown too. */
+static void emoji_manage_open(oc_win *hwnd) {
+    picker_close(hwnd);
+    close_overlays();
+    g_view = VIEW_ADMIN; layout_composer(hwnd);
+    admin_select(ADM_EMOJI);
+    invalidate();
 }
 
 /* Outstanding invites (REQ-026). Soonest expiry first, because the useful
@@ -17219,6 +18064,99 @@ static int groups_click(oc_win *hwnd, const oc_model *m, int x, int y) {
     return 0;
 }
 
+/* Admin > Custom emoji (REQ-072): the workspace's catalogue, by name, each with
+ * its picture and who added it, narrowed by the search box. Delete is offered
+ * where the daemon allows it -- to the emoji's creator and to admins and owners
+ * -- and confirms first, since the messages that used it then show its name.
+ * Live: the rows are the model's, which every EMOJI_LIST push replaces. */
+static int emoji_admin_can_delete(const oc_model *m, const oc_custom_emoji *e) {
+    return e->created_by == m->user_id || self_role(m) >= OC_ROLE_ADMIN;
+}
+
+static int emoji_name_cmp(const void *a, const void *b) {
+    return strcmp((*(const oc_custom_emoji *const *)a)->name, (*(const oc_custom_emoji *const *)b)->name);
+}
+
+/* The catalogue's entries the search box admits, sorted by name; how many. */
+static int emoji_admin_rows(const oc_model *m, const oc_custom_emoji **out, int max) {
+    int n = 0;
+    for (size_t i = 0; m && i < m->n_cemoji && n < max; i++)
+        if (!g_emoji_q[0] || strstr(m->cemoji[i].name, g_emoji_q)) out[n++] = &m->cemoji[i];
+    qsort(out, (size_t)n, sizeof *out, emoji_name_cmp);
+    return n;
+}
+
+static void draw_emoji_admin(gfx *rt, const oc_model *m, rectf body) {
+    g_n_emojirows = 0;
+    float y = body.top + 8;
+    g_emoji_search_box = rf(body.left + 20, y, body.right - 20, y + SEARCH_BOX_H);
+    search_box_draw(rt, g_emoji_search_box, OC_COL_INPUT);
+    if (g_efind) field_draw(rt, g_efind, search_text_box(g_emoji_search_box), OC_COL_TEXT);
+    body.top = g_emoji_search_box.bottom + 8;
+
+    const oc_custom_emoji *rows[128];
+    int n = emoji_admin_rows(m, rows, 128);
+    if (g_emoji_focus >= n) g_emoji_focus = n - 1;
+    g_emoji_list = body;
+    if (!m->n_cemoji) {
+        overlay_empty(rt, body, "No custom emoji yet. Workspace menu \u2192 Add custom emoji.");
+        return;
+    }
+    if (!n) { overlay_empty(rt, body, "No custom emoji match."); return; }
+    ovl_use(OVL_EMOJI);
+    float rowh = UIS(44);
+    if (g_emoji_reveal && g_emoji_focus >= 0) {
+        float top = (float)g_emoji_focus * rowh, visible = body.bottom - body.top;
+        if (top < g_ovl_scroll)                      g_ovl_scroll = top;
+        if (top + rowh + 8 > g_ovl_scroll + visible) g_ovl_scroll = top + rowh + 8 - visible;
+    }
+    g_emoji_reveal = 0;
+    float yy = ovl_begin(rt, body, (float)n * rowh + 8);
+    for (int i = 0; i < n; i++) {
+        const oc_custom_emoji *e = rows[i];
+        if (yy + rowh < body.top) { yy += rowh; continue; }
+        if (yy > body.bottom) break;
+        if (i == g_emoji_focus)
+            fill_round(rt, rf(body.left + 8, yy + 2, body.right - 12, yy + rowh - 2), OC_R_CONTROL, OC_COL_HOVER);
+        rectf pic = rf(body.left + 20, yy + 6, body.left + 20 + UIS(32), yy + 6 + UIS(32));
+        if (!draw_avatar_image(rt, e->attachment_id, pic, 3.0f, 1)) avatar_want(e->attachment_id);
+        float tx = pic.right + 12;
+        char nm[56];
+        snprintf(nm, sizeof nm, ":%s:", e->name);
+        draw_text(rt, nm, g_ui, rf(tx, yy + 2, body.right - 130, yy + 22), OC_COL_TEXT);
+        const char *by = oc_model_user_name((oc_model *)m, e->created_by);
+        char sub[160];
+        snprintf(sub, sizeof sub, "Added by %s", (by && by[0]) ? by : "someone no longer here");
+        draw_text(rt, sub, g_meta, rf(tx, yy + 20, body.right - 130, yy + 40), OC_COL_FAINT);
+        if (emoji_admin_can_delete(m, e)) {
+            rectf b = rf(body.right - 116, yy + 8, body.right - 20, yy + 34);
+            int hot = in_rect(b, g_mouse_x, g_mouse_y);
+            fill_round(rt, b, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+            stroke_round(rt, b, OC_R_CONTROL, OC_COL_DANGER, 1.0f);
+            g_meta->align = ST_ALIGN_CENTER;
+            draw_text(rt, "Delete", g_meta, b, OC_COL_DANGER);
+            g_meta->align = ST_ALIGN_LEFT;
+            if (g_n_emojirows < (int)(sizeof g_emojirows / sizeof g_emojirows[0])) {
+                g_emojirows[g_n_emojirows].r = b;
+                snprintf(g_emojirows[g_n_emojirows].name, sizeof g_emojirows[0].name, "%s", e->name);
+                g_n_emojirows++;
+            }
+        }
+        fill(rt, rf(body.left + 20, yy + rowh - 1, body.right - 20, yy + rowh), OC_COL_BORDER);
+        yy += rowh;
+    }
+    ovl_end(rt, body);
+}
+
+/* Ask before deleting `name`: the messages that used it keep the shortcode. */
+static void emoji_delete_ask(oc_win *hwnd, const char *name) {
+    char title[80], body[200];
+    snprintf(g_confirm_emoji, sizeof g_confirm_emoji, "%s", name);
+    snprintf(title, sizeof title, "Delete :%s:?", name);
+    snprintf(body, sizeof body, "Messages that used :%s: will show the name instead.", name);
+    confirm_open(hwnd, CONF_EMOJI_DELETE, 0, title, body, "Delete");
+}
+
 static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
     fill(rt, rf(reg.left, reg.top, reg.right, reg.top + HEADER_H), OC_COL_HEADER);
     draw_text(rt, "Admin", g_display, rf(reg.left + 20, reg.top, reg.right - 20, reg.top + HEADER_H),
@@ -17233,9 +18171,14 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
         { "Invites",   OC_ICON_USER },
         { "Groups",    OC_ICON_USER },
         { "Alerts",    OC_ICON_ALERT },
+        { "Custom emoji", OC_ICON_SMILE },
     };
     float tx = reg.left + 16, ty = reg.top + HEADER_H;
+    int admin = self_role(m) >= OC_ROLE_ADMIN;
     for (int i = 0; i < ADM_COUNT; i++) {
+        /* A member reaches Admin only through the picker's Manage link, and is
+         * shown the one tab it opens. */
+        if (!admin && i != ADM_EMOJI) { g_adm_tabs[i] = rf(0, 0, 0, 0); continue; }
         float tw = 26 + text_width(T[i].label, g_ui) + 16;
         rectf r = rf(tx, ty + 2, tx + tw, ty + TABBAR_H - 1);
         int on = (g_adm_tab == i);
@@ -17248,7 +18191,8 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
     }
 
     rectf body = rf(reg.left, ty + TABBAR_H, reg.right, reg.bottom);
-    if (self_role(m) < OC_ROLE_ADMIN) {
+    if (g_adm_tab == ADM_EMOJI) { draw_emoji_admin(rt, m, body); return; }
+    if (!admin) {
         overlay_empty(rt, body, "Admin only.");
         return;
     }
@@ -18471,14 +19415,14 @@ static int fields_mouse(int kind, float x, float y) {
     if (g_te_open) modal[nm++] = &g_te_field;
     for (int i = 0; i < OC_POLL_MAX_OPTIONS; i++) if (g_pc_opt[i]) modal[nm++] = g_pc_opt[i];
     for (int i = 0; i < FORM_MAX_FIELDS && nm < 24; i++) if (g_form_edit[i]) modal[nm++] = g_form_edit[i];
-    field *shell[8] = { g_pal_edit, g_pick_edit, g_srch, g_find, g_ffind, g_dir_edit, g_si_e_ws, g_si_e_user };
+    field *shell[9] = { g_pal_edit, g_pick_edit, g_srch, g_find, g_ffind, g_dir_edit, g_si_e_ws, g_si_e_user, g_efind };
     if (kind == 1 || kind == 2) {
         /* A drag or a release belongs to the field that took the press. */
         if (g_focus && g_focus->dragging) return field_mouse(g_focus, kind, x, y);
         return 0;
     }
     for (int i = 0; i < nm; i++) if (modal[i]->visible && field_mouse(modal[i], kind, x, y)) return 1;
-    for (int i = 0; i < 8; i++) if (shell[i] && shell[i]->visible && field_mouse(shell[i], kind, x, y)) return 1;
+    for (int i = 0; i < 9; i++) if (shell[i] && shell[i]->visible && field_mouse(shell[i], kind, x, y)) return 1;
     if (g_si_e_pass && g_si_e_pass->visible && field_mouse(g_si_e_pass, kind, x, y)) return 1;
     if (kind == 0 && g_focus) focus_set(NULL);
     return 0;
@@ -20572,7 +21516,14 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
      * Files view draws its own header with an Upload button where the listen
      * button sits, and the channel header's rect outlived the frame that drew
      * it -- so the fit check paired a button nobody could see with the one
-     * really there. A rect is a hit-box as much as a row is. */
+     * really there. A rect is a hit-box as much as a row is.
+     *
+     * THE RAIL IS THE FIFTH. The sign-in card draws no rail, so signing out of
+     * the only workspace left the last session's rows behind, Admin among them,
+     * and the published scene asked the model that had just gone about Admin's
+     * alerts: a crash on Windows, and a read of whatever is at that address on
+     * the web. */
+    g_n_navrows = 0;
     g_n_msgrows = 0;
     g_n_tabhits = 0;          /* the grids of tables (MARKDOWN.md §1a) */
     g_n_shelf = 0;
@@ -20707,6 +21658,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
         mem_hits_clear();
     }
     draw_pastechoice(rt, W, H);   /* the paste chooser floats over the field it pastes into */
+    if (!modal_open()) time_tip_draw(rt, W);   /* a time token's full date, over what it is in */
     if (!si_over) draw_modal(rt, m, W, H);  /* your-account surfaces, over a dimmed shell */
     draw_video_overlay(rt, m, W, H);   /* the recording card and the player; menus float above */
     draw_share_full(rt, m, W, H);      /* a shared screen, full screen, when asked for */
@@ -20757,6 +21709,12 @@ static void paint(oc_win *hwnd) {
      * is empty unless this frame put something in it. */
     g_n_hrx = 0; g_hrx_mid = 0;
     g_caret_placed = 0;
+    g_n_timehits = 0;
+    g_n_emojiboxes = 0;
+    /* The reader's clock, which the model's excerpts use too. */
+    if (m) oc_model_set_clock12((oc_model *)m, !g_pref_time24);
+    g_n_splhits = 0;
+    g_n_morehits = 0;
     render_scene(rt, m, W, H);
     if (!g_caret_placed) ed_caret_kill();   /* no field drew a caret this frame */
     /* Boxes placed against chrome the scene just measured, so they can only be
@@ -21025,6 +21983,81 @@ static int ed_canon(int pos) {
  * of an operation instead of once per insert. Which matters — ed_fmt_inline
  * inserts an opener and a closer separately, and repairing between the two would
  * delete the opener for not yet having a partner. */
+/* The edit [p, sn) in place of the old [p, so) when it falls inside an inline
+ * spoiler (MARKDOWN.md §1d), which must not come out of it in the open. A line
+ * break splits it, each line its own spoiler, a list's or a quote's marker left
+ * outside; anything else that would stop it parsing is taken back, as long as it
+ * still has text to hide. Returns 1 when it dealt with the edit. */
+static int ed_is_space(oc_wch c);   /* fwd */
+static void ed_insert_n(const oc_wch *s, int n);   /* fwd */
+static int ed_spoiler_edit(int p, int so, int sn) {
+    static char u8[ED_MAX * 3 + 1];
+    static oc_wch out[ED_MAX + 1];
+    oc_rt_spoiler sv[64];
+    int bytes = to_u8n(g_ed_prev, g_ed_prev_len, u8, (int)sizeof u8 - 1);
+    if (bytes <= 0) return 0;
+    size_t nv = oc_rt_spoilers(u8, (size_t)bytes, sv, 64);
+    if (nv > 64) nv = 64;
+    for (size_t k = 0; k < nv; k++) {
+        if (sv[k].block || sv[k].cell) continue;
+        int os = to_w_count(u8, (int)sv[k].start), oe = to_w_count(u8, (int)(sv[k].start + sv[k].len));
+        if (p < os + 2 || so > oe - 2) continue;
+        int ne = oe + (sn - so), nl = 0;
+        for (int i = p; i < sn; i++) if (g_ed[i] == u'\n') nl = 1;
+        if (!nl) {
+            int text = 0;
+            for (int i = os + 2; i < ne - 2; i++) if (!ed_is_space(g_ed[i])) text = 1;
+            if (g_ed_hidden[os] || !text) return 0;
+            memcpy(g_ed, g_ed_prev, (size_t)(g_ed_prev_len + 1) * sizeof(oc_wch));
+            g_ed_len = g_ed_prev_len;
+            g_ed_caret = g_ed_anchor = p;
+            ed_invalidate_layout();
+            return 1;
+        }
+        /* Rebuilt line by line, each with text in its own delimiters. */
+        int o = 0, caret = -1, at = os + 2, fits = 1, first = 1;
+        while (at <= ne - 2 && fits) {
+            int le = at, m = at, text = 0;
+            while (le < ne - 2 && g_ed[le] != u'\n') le++;
+            if (!first) {
+                for (;;) {
+                    int q = m;
+                    while (q < le && g_ed[q] >= u'0' && g_ed[q] <= u'9') q++;
+                    if (q > m && q + 1 < le && g_ed[q] == u'.' && g_ed[q + 1] == u' ') m = q + 2;
+                    else if (m + 1 < le && (g_ed[m] == u'>' || g_ed[m] == u'-') && g_ed[m + 1] == u' ') m += 2;
+                    else break;
+                }
+            }
+            for (int i = m; i < le; i++) if (!ed_is_space(g_ed[i])) text = 1;
+            if (o + (le - at) + 5 > ED_MAX) { fits = 0; break; }
+            for (int i = at; i < m; i++) out[o++] = g_ed[i];
+            if (text) { out[o++] = u'>'; out[o++] = u'!'; }
+            if (g_ed_caret >= m && g_ed_caret <= le) caret = o + (g_ed_caret - m);
+            for (int i = m; i < le; i++) out[o++] = g_ed[i];
+            if (text) { out[o++] = u'!'; out[o++] = u'<'; }
+            if (le < ne - 2) out[o++] = u'\n';
+            first = 0;
+            at = le + 1;
+        }
+        if (fits && g_ed_len - (ne - os) + o <= ED_MAX) {
+            ed_delete_range(os, ne);
+            g_ed_caret = g_ed_anchor = os;
+            ed_insert_n(out, o);
+            if (caret >= 0) g_ed_caret = g_ed_anchor = os + caret;
+            g_ed_hidden_valid = 0;
+            ed_hidden_build();
+            g_ed_caret = g_ed_anchor = ed_canon(g_ed_caret);
+        } else {                       /* no room to split it: the edit is not made */
+            memcpy(g_ed, g_ed_prev, (size_t)(g_ed_prev_len + 1) * sizeof(oc_wch));
+            g_ed_len = g_ed_prev_len;
+            g_ed_caret = g_ed_anchor = p;
+            ed_invalidate_layout();
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static void ed_repair_orphans(void) {
     int p = 0, so, sn, i, drop[64], n = 0, caret = g_ed_caret, anchor = g_ed_anchor;
     /* Plain text hides nothing, so there is nothing that can stop being hidden.
@@ -21036,14 +22069,19 @@ static void ed_repair_orphans(void) {
     so = g_ed_prev_len; sn = g_ed_len;
     while (so > p && sn > p && g_ed_prev[so - 1] == g_ed[sn - 1]) { so--; sn--; }
     if (!g_ed_hidden_valid) ed_hidden_build();
+    if (ed_spoiler_edit(p, so, sn)) return;
     /* Untouched head, then untouched tail at its new offset. Anything inside the
      * edit itself is the user's own typing and is never second-guessed. */
+    /* Not a spoiler's `>!` or `!<`, whatever broke it: without them what it hid
+     * would go out in the open, with nothing on the screen to say so. */
+#define ED_SPOILER_DELIM(ch) ((ch) == u'>' || (ch) == u'!' || (ch) == u'<')
     for (i = 0; i < p && n < 64; i++)
-        if (g_ed_prev_hidden[i] && !g_ed_hidden[i]) drop[n++] = i;
+        if (g_ed_prev_hidden[i] && !g_ed_hidden[i] && !ED_SPOILER_DELIM(g_ed_prev[i])) drop[n++] = i;
     for (i = so; i < g_ed_prev_len && n < 64; i++) {
         int j = i - so + sn;
-        if (j >= 0 && j < g_ed_len && g_ed_prev_hidden[i] && !g_ed_hidden[j]) drop[n++] = j;
+        if (j >= 0 && j < g_ed_len && g_ed_prev_hidden[i] && !g_ed_hidden[j] && !ED_SPOILER_DELIM(g_ed_prev[i])) drop[n++] = j;
     }
+#undef ED_SPOILER_DELIM
     /* Right to left, so the earlier offsets stay valid, and carry the caret
      * back over everything removed before it. */
     for (i = n - 1; i >= 0; i--) {
@@ -21693,6 +22731,16 @@ static int ed_block_marker(int p, int kind, int *at, int *len) {
     if (at) *at = i;
     if (kind == FMT_QUOTE) {
         if (i < g_ed_len && g_ed[i] == u'>') {
+            /* A `>!` that closes on the line is a spoiler and no marker: taking
+             * its `>` off would send what it hides in the open. The scanner says. */
+            if (i + 1 < g_ed_len && g_ed[i + 1] == u'!') {
+                static char line8[ED_MAX * 3 + 1];
+                oc_rt_span first[1];
+                int e = i;
+                while (e < g_ed_len && g_ed[e] != u'\n') e++;
+                int n8 = to_u8n(g_ed + i, e - i, line8, sizeof line8);
+                if (oc_rt_scan(line8, n8 > 0 ? (size_t)n8 : 0, first, 1) && !(first[0].style & OC_RT_QUOTE)) return 0;
+            }
             if (len) *len = (i + 1 < g_ed_len && g_ed[i + 1] == u' ') ? 2 : 1;
             return 1;
         }
@@ -21758,6 +22806,10 @@ static void ed_fmt_block(int kind) {
      * asked for. */
     g_ed_caret = le;
     g_ed_anchor = had_sel ? ls : le;
+    /* What this did to the parse it meant to: a `>` it put before a spoiler's
+     * `>!` must not read to ed_repair_orphans as that opener stopping parsing. */
+    ed_hidden_build();
+    ed_remember();
 }
 
 /* A soft newline (Shift+Enter) inside a list or a quote CONTINUES it.
@@ -21876,7 +22928,7 @@ static int        g_n_ed_chit;
 
 /* A cell as the card shows it: on one line, its markup gone. */
 static void card_cell(const char *cell, char *out, size_t cap) {
-    size_t n = tcell_plain(cell ? cell : "", 0, cell ? strlen(cell) : 0, out, cap);
+    size_t n = tcell_plain(cell ? cell : "", 0, cell ? strlen(cell) : 0, NULL, 0, out, cap);
     for (size_t i = 0; i < n; i++) if (out[i] == '\n' || out[i] == '\t') out[i] = ' ';
 }
 
@@ -23287,6 +24339,24 @@ static int grp_pick_has_keys(void) {
            g_tgt_host == TGT_HOST_GROUP && g_grp_pick_focus;
 }
 
+/* A typed emoticon ending at the caret becomes its emoji (emoticon.h), as an
+ * edit of its own before the space that follows it: Undo puts the typed text
+ * back. The field holds its Markdown, so code is seen by its backticks. */
+static void ed_emoticon_at_caret(void) {
+    static char text[ED_MAX * 4 + 1], head[ED_MAX * 4 + 1];
+    int len = to_u8n(g_ed, g_ed_len, text, sizeof text);
+    int caret = to_u8n(g_ed, g_ed_caret, head, sizeof head);
+    size_t start = 0;
+    const char *emoji = oc_emoticon_typed(g_pref_emoticons, text, (size_t)len, (size_t)caret, &start);
+    if (!emoji) return;
+    int n = caret - (int)start;          /* an emoticon is ASCII: bytes are units */
+    oc_wch w[8];
+    int wn = to_w(emoji, w, 8);
+    ed_begin_edit();
+    ed_delete_range(g_ed_caret - n, g_ed_caret);
+    ed_insert_n(w, wn);
+}
+
 static int ed_char(oc_win *hwnd, oc_wch ch) {
     /* The group's Add people field keeps every character while it has the
      * keys: the composer is off screen, and must not collect them. */
@@ -23298,10 +24368,12 @@ static int ed_char(oc_win *hwnd, oc_wch ch) {
         return 1;
     }
     if (!g_ed_focus) return 0;
+    if (g_preview && g_view != VIEW_NEWMSG) return 1;   /* the field takes no edits while previewed */
     if (g_pch_open) pastechoice_close();     /* typing on answers the chooser: nothing pasted */
     if (ch == u'\t') return 1;               /* Tab is navigation, never text */
     if (ch < 0x20 && ch != u'\n') return 1;  /* control chars: eaten, not inserted */
     if (ed_tab_reserved(ch)) ch = 0xFFFD;    /* a table's character is never typed */
+    if (ch == u' ' && !ed_has_sel()) ed_emoticon_at_caret();
     oc_wch s[2] = { ch, 0 };
     if (!ed_has_sel() && g_pref_richtext) {
         if (ch == u' ' || ch == u'\n') {
@@ -23422,6 +24494,16 @@ static int ed_key(oc_win *hwnd, int vk) {
         return 1;
     }
     if (!g_ed_focus) return 0;
+    /* Previewing: Enter sends what is shown, Esc goes back to editing it, and
+     * nothing edits the hidden field -- not a key, not a paste. */
+    if (g_preview && g_view != VIEW_NEWMSG) {
+        if (vk == OCK_RETURN && !mod_down(OCK_SHIFT)) { composer_send(); invalidate(); return 1; }
+        if (vk == OCK_ESCAPE) { preview_set(hwnd, 0); return 1; }
+        if (vk == OCK_BACK || vk == OCK_DELETE || vk == OCK_RETURN) return 1;
+        if (mod_down(OCK_CONTROL) && (vk == 'V' || vk == 'X' || vk == 'Z' || vk == 'Y' ||
+                                      vk == 'v' || vk == 'x' || vk == 'z' || vk == 'y')) return 1;
+        return 0;
+    }
     int ctrl = mod_down(OCK_CONTROL);
     int shift = mod_down(OCK_SHIFT);
     int moved = 0, changed = 0;
@@ -23597,6 +24679,8 @@ static int ed_card_press(oc_win *hwnd, float x, float y, int dbl) {
 
 static int ed_mouse_down(oc_win *hwnd, float x, float y) {
     if (!in_rect(g_ed_box, x, y)) return 0;
+    /* Previewing, a click in the box is not a caret placed in hidden text. */
+    if (g_preview && g_view != VIEW_NEWMSG) { ed_focus(hwnd); return 1; }
     if (ed_card_press(hwnd, x, y, 0)) return 1;
     ed_focus(hwnd);
     /* A click in the body is the whole answer to which field has the keys. The
@@ -23929,6 +25013,7 @@ enum {
     AT_FMT,           /* payload: formatting-toolbar button index */
     AT_EMOJI,         /* the composer's emoji picker */
     AT_MENTION,       /* insert the @ trigger, as typing it does */
+    AT_TIMEINS,       /* the composer's Insert a time */
     AT_SCHEDMENU,     /* the send-later menu */
     AT_THREADFILTER,  /* the Threads pane's unreads-only toggle */
     AT_STATUSEMOJI,   /* the status dialog's emoji button */
@@ -23952,7 +25037,13 @@ enum {
     AT_SUMCAL,        /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the summary range card */
     AT_TABLEED,       /* payload: a table editor control (TEA_*) */
     AT_CTABLE,        /* payload: a composer card's slot * 2, + 1 for its Remove (else its Edit) */
-    AT_PASTECHOICE    /* payload: the paste chooser's choice (PCH_*) */
+    AT_PASTECHOICE,   /* payload: the paste chooser's choice (PCH_*) */
+    AT_EMOJIDEL,      /* payload: Admin > Custom emoji's Delete hit-box index */
+    AT_EMOJIFIND,     /* Admin > Custom emoji's search box */
+    AT_PICKMANAGE,    /* the emoji picker's Manage link */
+    AT_PREVIEW,       /* the composer's Preview / Edit */
+    AT_SPOILER,       /* payload: index into g_splhits -- reveal or cover it */
+    AT_MORE           /* payload: index into g_morehits -- open that cut message */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -24042,8 +25133,11 @@ static void a11y_publish_scene(const oc_model *m) {
      * and buttons are unreachable by pointer and must be unreachable by AT and
      * by the harness alike — publishing them invited a screen reader to invoke
      * a message the user cannot see, and made chromefit compare a card's
-     * content against chrome underneath it. Skip straight to the modal block. */
-    if (modal_open()) goto modal_items;
+     * content against chrome underneath it. Skip straight to the modal block.
+     * Signed out, there is no model and no shell: render_scene drew the sign-in
+     * card and whatever it asks over itself, so only that block has anything
+     * true to say, and nothing above it may read `m`. */
+    if (modal_open() || !m) goto modal_items;
     /* An open MENU owns it for the same reason: the click handler consumes
      * every click while one is up. Menus were invisible to AT entirely — now
      * their rows (and the pause flyout's) are the tree while they are open. */
@@ -24163,8 +25257,8 @@ static void a11y_publish_scene(const oc_model *m) {
             for (uint8_t c2 = 0; c2 < t->rt.cols && o + 4 < sizeof nm; c2++) {
                 const mcell *cl = &t->cell[r * t->rt.cols + c2];
                 char v[160], hd[96] = "";
-                tcell_plain(b, cl->start, cl->len, v, sizeof v);
-                if (hdr && row) tcell_plain(b, t->cell[c2].start, t->cell[c2].len, hd, sizeof hd);
+                tcell_plain(b, cl->start, cl->len, cl->spl, cl->nspl, v, sizeof v);
+                if (hdr && row) tcell_plain(b, t->cell[c2].start, t->cell[c2].len, t->cell[c2].spl, t->cell[c2].nspl, hd, sizeof hd);
                 for (char *q = v; *q; q++) if (*q == '\n') *q = ' ';
                 for (char *q = hd; *q; q++) if (*q == '\n') *q = ' ';
                 int w = snprintf(nm + o, sizeof nm - o, "%s%s%s%s", c2 ? ", " : "", hd,
@@ -24215,9 +25309,11 @@ static void a11y_publish_scene(const oc_model *m) {
     }
 
     /* Admin's tabs, and Alerts' Acknowledge buttons, named for what they act on. */
-    if (g_view == VIEW_ADMIN && self_role(m) >= OC_ROLE_ADMIN) {
-        static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts" };
+    if (g_view == VIEW_ADMIN) {
+        static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts", "emoji" };
+        int admin = self_role(m) >= OC_ROLE_ADMIN;
         for (int t = 0; t < ADM_COUNT && n < OC_ACC_MAX; t++) {
+            if (!admin && t != ADM_EMOJI) continue;
             char aid[OC_ACC_AID_MAX];
             snprintf(aid, sizeof aid, "admin.tab.%s", TABAID[t]);
             acc_push(items, &n, OC_ACC_BUTTON, aid, TABAID[t], g_adm_tabs[t], ATOK(AT_ADMTAB, (uint64_t)t));
@@ -24234,6 +25330,36 @@ static void a11y_publish_scene(const oc_model *m) {
                 }
                 acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_alertrows[i].r, ATOK(AT_ALERTACK, (uint64_t)i));
             }
+        if (g_adm_tab == ADM_EMOJI) {
+            if (g_efind && g_efind->visible && n < OC_ACC_MAX)
+                acc_push(items, &n, OC_ACC_BUTTON, "admin.emoji.search", "Search custom emoji",
+                         g_emoji_search_box, ATOK(AT_EMOJIFIND, 0));
+            for (int i = 0; i < g_n_emojirows && n < OC_ACC_MAX; i++) {
+                char aid[OC_ACC_AID_MAX], nm[64];
+                snprintf(aid, sizeof aid, "admin.emoji.%s.delete", g_emojirows[i].name);
+                snprintf(nm, sizeof nm, "Delete :%s:", g_emojirows[i].name);
+                acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_emojirows[i].r, ATOK(AT_EMOJIDEL, (uint64_t)i));
+            }
+        }
+    }
+
+    if (g_pick_open && g_pick_manage.right > g_pick_manage.left && n < OC_ACC_MAX)
+        acc_push(items, &n, OC_ACC_BUTTON, "picker.manage", "Manage custom emoji",
+                 g_pick_manage, ATOK(AT_PICKMANAGE, 0));
+    /* Spoilers: each one a button that reveals or covers it (MARKDOWN.md §1d). */
+    for (int i = 0; i < g_n_splhits && n < OC_ACC_MAX; i++) {
+        char aid[OC_ACC_AID_MAX];
+        snprintf(aid, sizeof aid, "message.%llu.spoiler.%d", (unsigned long long)g_splhits[i].mid, g_splhits[i].k);
+        acc_push(items, &n, OC_ACC_BUTTON, aid, g_splhits[i].shown ? "Hide spoiler" : "Show spoiler",
+                 g_splhits[i].r, ATOK(AT_SPOILER, (uint64_t)i));
+    }
+
+    /* A cut message's "Show more" or "Show message" (CLIENT.md "Long messages"). */
+    for (int i = 0; i < g_n_morehits && n < OC_ACC_MAX; i++) {
+        char aid[OC_ACC_AID_MAX];
+        snprintf(aid, sizeof aid, "message.%llu.expand", (unsigned long long)g_morehits[i].mid);
+        acc_push(items, &n, OC_ACC_BUTTON, aid, g_morehits[i].kind == 1 ? "Show message" : "Show more",
+                 g_morehits[i].r, ATOK(AT_MORE, (uint64_t)i));
     }
 
     /* The notices: each toast's action and close, named by what they act on, so
@@ -24389,6 +25515,8 @@ static void a11y_publish_scene(const oc_model *m) {
                  ATOK(AT_EMOJI, 0));
         acc_push(items, &n, OC_ACC_BUTTON, "composer.mention", "Mention someone", g_at_btn,
                  ATOK(AT_MENTION, 0));
+        acc_push(items, &n, OC_ACC_BUTTON, "composer.time", "Insert a time", g_time_btn,
+                 ATOK(AT_TIMEINS, 0));
         /* Invoke cannot be held, so the microphone toggles for assistive
          * technology: invoke to talk, invoke again to stop. The state is in the
          * name, as the toggle's is. */
@@ -24414,6 +25542,10 @@ static void a11y_publish_scene(const oc_model *m) {
             acc_push(items, &n, OC_ACC_BUTTON, aid, FMT_NAME[i], g_fmt_btn[i],
                      ATOK(AT_FMT, i));
         }
+        if (g_preview_btn.right > g_preview_btn.left && n < OC_ACC_MAX)
+            acc_push(items, &n, OC_ACC_BUTTON, "composer.preview",
+                     g_preview ? "Back to editing" : "Preview the message",
+                     g_preview_btn, ATOK(AT_PREVIEW, 0));
     }
 
     /* Admin > Groups' Add people: the same control as New message's To field,
@@ -25081,6 +26213,13 @@ static void composer_send(void) {
      * so the body is measured against the daemon's limit here, where the text
      * is still in the box to be shortened. */
     char *b = ed_md_all();
+    /* What is left of the typed emoticons -- the last one, with no space after
+     * it -- is converted as it goes. */
+    if (b) {
+        size_t bl = strlen(b), cap = bl * 2 + 16;
+        char *c = malloc(cap);
+        if (c && oc_emoticon_send(g_pref_emoticons, b, bl, c, cap) > 0) { free(b); b = c; } else free(c);
+    }
     if (b && strlen(b) > OC_MAX_BODY_SIZE) {
         free(b);
         composer_hint("This message is too long to send. Make a table smaller, or split it in two.", 1);
@@ -25127,6 +26266,47 @@ static void composer_send(void) {
     }
     g_draft_sent_cid = g_sel; g_draft_sent[0] = 0; g_draft_dirty = 0;
     ed_clear();
+    g_preview = 0;                         /* sent: back to an empty field */
+}
+
+/* Into or out of Preview. Out puts the keys back in the field, whose caret and
+ * selection were never moved. */
+static void preview_set(oc_win *hwnd, int on) {
+    g_preview = on ? 1 : 0;
+    g_preview_ch = g_sel;
+    ac_close();
+    ed_focus(hwnd);
+    invalidate();
+}
+
+/* The draft as it would be sent (ed_md_all: each table card its Markdown),
+ * laid out and drawn by the transcript's own renderer, as a message from you. */
+static void preview_draw(gfx *rt, rectf box) {
+    g_ed_box = box;
+    g_preview_h = 0; g_preview_lines = 0; g_preview_tabs = 0;
+    const oc_model *m = model();
+    char *b = ed_md_all();
+    static oc_msg msg;
+    memset(&msg, 0, sizeof msg);
+    msg.message_id = ~0ull;                 /* no message has it: its own cache slot */
+    msg.author_id = m ? m->user_id : 0;
+    msg.body = b;
+    gfx_clip_push(rt, gr(box));
+    if (!b || !b[0]) {
+        draw_text(rt, "Nothing to preview yet.", g_meta, box, OC_COL_FAINT);
+    } else {
+        float cw = box.right - box.left;
+        mlay_ent *e = body_layout(&msg, cw);
+        if (e) {
+            g_preview_h = body_draw(rt, &msg, e, box.left, box.top, cw, box.right);
+            st_metrics mt;
+            if (e->lay) { st_layout_metrics(e->lay, &mt); g_preview_lines = mt.lines; }
+            g_preview_tabs = e->ntab;
+        }
+    }
+    gfx_clip_pop(rt);
+    msg.body = NULL;
+    free(b);
 }
 
 static void composer_begin_edit(const oc_msg *msg) {
@@ -25377,6 +26557,32 @@ static void layout_files_find(oc_win *hwnd) {
     int want = (g_view == VIEW_FILES) && !window_is_covered() &&
                g_file_search_box.right > g_file_search_box.left;
     field_show(g_ffind, want);
+}
+
+/* Admin > Custom emoji's search box, on the same rules: its own view and tab. */
+static void layout_emoji_find(oc_win *hwnd) {
+    (void)hwnd;
+    if (!g_efind) return;
+    int want = (g_view == VIEW_ADMIN) && g_adm_tab == ADM_EMOJI && !window_is_covered() &&
+               g_emoji_search_box.right > g_emoji_search_box.left;
+    field_show(g_efind, want);
+}
+static void efind_changed(field *f) {
+    snprintf(g_emoji_q, sizeof g_emoji_q, "%s", f->buf);
+    g_emoji_focus = -1;        /* another list: its first row is a key away */
+}
+/* Esc gives the keyboard back to the pane; Down, Enter and Tab take it on to the
+ * rows, where emoji_admin_key has it. */
+static int efind_key(field *f, int key, int ctrl, int shift) {
+    (void)f; (void)ctrl; (void)shift;
+    if (key == OCK_ESCAPE) { focus_set(NULL); return 1; }
+    if (key == OCK_DOWN || key == OCK_RETURN || key == OCK_TAB) {
+        focus_set(NULL);
+        g_emoji_focus = 0;     /* the paint takes it back to -1 on an empty list */
+        g_emoji_reveal = 1;
+        return 1;
+    }
+    return 0;
 }
 
 /* The People pane's search box, written to the same rules as the Files one:
@@ -26863,14 +28069,106 @@ static int vm_key(oc_win *hwnd, int wp) {
  * backdrop. Drawn last so nothing overlaps it. */
 static gfx_tex *thumb_get(gfx *rt, uint64_t id, unsigned *w, unsigned *h);  /* fwd */
 
+/* The media the expanded view pages through: every attachment of the open
+ * conversation's loaded messages that the transcript draws as media -- an image
+ * or a video message, not reclaimed -- in posting order, and within a message
+ * in its order. Fills up to `max`; returns the count. */
+typedef struct { const oc_attachment *at; const oc_msg *msg; int video; } lb_item;
+static int lb_items(lb_item *out, int max) {
+    const oc_model *m = model();
+    const oc_channel *c = m ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+    int n = 0;
+    for (size_t i = 0; c && i < c->n_msgs; i++) {
+        const oc_msg *msg = &c->msgs[i];
+        if (msg->deleted) continue;
+        for (int k = 0; k < msg->n_attach && n < max; k++) {
+            const oc_attachment *a = &msg->attach[k];
+            if (a->reclaimed || !(mime_is_image(a->mime) || is_video_msg(a))) continue;
+            out[n].at = a; out[n].msg = msg; out[n].video = is_video_msg(a); n++;
+        }
+    }
+    return n;
+}
+static int lb_index(const lb_item *it, int n) {
+    for (int i = 0; i < n; i++) if (it[i].at->id == g_lightbox) return i;
+    return -1;
+}
+/* The previous (-1) or next (+1) item; at either end, nothing. */
+static void lb_step(int d) {
+    static lb_item it[512];
+    int n = lb_items(it, 512), i = lb_index(it, n);
+    if (i < 0 || i + d < 0 || i + d >= n) return;
+    g_lightbox = it[i + d].at->id;
+    invalidate();
+}
+/* A video message on screen in the view: the existing player opens it. */
+static void lb_play(oc_win *hwnd) {
+    static lb_item it[512];
+    int n = lb_items(it, 512), i = lb_index(it, n);
+    if (i >= 0 && it[i].video) { g_lightbox = 0; vm_open_player(hwnd, it[i].at); }
+}
+
 static void draw_lightbox(gfx *rt, float W, float H) {
+    g_lb_prev = g_lb_next = g_lb_img = rf(0, 0, 0, 0);
+    g_lb_i = -1; g_lb_n = 0;
     if (!g_lightbox) return;
+    static lb_item it[512];
+    int n = lb_items(it, 512), i = lb_index(it, n);
+    g_lb_i = i; g_lb_n = n;
+    const lb_item *cur = i >= 0 ? &it[i] : NULL;
+    /* A video shows its poster; an image itself. */
+    uint64_t want = cur && cur->video ? cur->at->poster_id : g_lightbox;
     unsigned iw = 0, ih = 0;
-    gfx_tex *bmp = thumb_get(rt, g_lightbox, &iw, &ih);
-    if (!bmp || !iw || !ih) { return; }
+    gfx_tex *bmp = want ? thumb_get(rt, want, &iw, &ih) : NULL;
 
     rectf all = rf(0, 0, W, H);
     gfx_fill(rt, gr(all), 0x000000, 0.82f);
+
+    /* Who posted it, when, and where it is in the conversation's media. */
+    if (cur) {
+        const oc_model *m = model();
+        const char *who = cur->msg->author_name[0] ? cur->msg->author_name
+                        : m ? oc_model_user_name((oc_model *)m, cur->msg->author_id) : "";
+        char when[40] = "", head[200];
+        time_t t = (time_t)(cur->msg->server_time / 1000); struct tm tv;
+        if (cur->msg->server_time && oc_localtime_r(&t, &tv))
+            strftime(when, sizeof when, g_pref_time24 ? "%a %d %b %H:%M" : "%a %d %b %I:%M %p", &tv);
+        snprintf(head, sizeof head, "%s  \xC2\xB7  %s  \xC2\xB7  %d of %d", who && who[0] ? who : "someone", when, i + 1, n);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, head, g_meta, rf(0, 14, W, 38), 0xFFFFFF);
+        g_meta->align = ST_ALIGN_LEFT;
+    }
+
+    /* The arrows at the window's edges, only where there is somewhere to go. */
+    float bw = UIS(44), bh = UIS(64);
+    if (i > 0)     g_lb_prev = rf(12, (H - bh) / 2, 12 + bw, (H + bh) / 2);
+    if (i >= 0 && i + 1 < n) g_lb_next = rf(W - 12 - bw, (H - bh) / 2, W - 12, (H + bh) / 2);
+    rectf arrows[2] = { g_lb_prev, g_lb_next };
+    static const char *const GLYPH[2] = { "\xE2\x80\xB9", "\xE2\x80\xBA" };   /* ‹ › */
+    for (int k = 0; k < 2; k++) {
+        if (arrows[k].right <= arrows[k].left) continue;
+        int hot = in_rect(arrows[k], g_mouse_x, g_mouse_y);
+        fill_round_a(rt, arrows[k], OC_R_CONTROL, 0x000000, hot ? 0.75f : 0.45f);
+        g_display->align = ST_ALIGN_CENTER;
+        draw_text(rt, GLYPH[k], g_display, rf(arrows[k].left, arrows[k].top + bh / 2 - UIS(18),
+                                               arrows[k].right, arrows[k].bottom), 0xFFFFFF);
+        g_display->align = ST_ALIGN_LEFT;
+    }
+
+    if (!bmp || !iw || !ih) {
+        /* Not here yet: ask for it -- this one, once -- and say so meanwhile,
+         * rather than show whatever was on screen before. */
+        if (want && !g_thumbs_off && !thumb_failed(want) && !g_thumb_pending && g_client) {
+            g_thumb_pending = want;
+            g_thumb_deadline = now_ms() + 8000;
+            oc_client_fetch_attachment(g_client, want);
+        }
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, thumb_failed(want) ? "This image could not be loaded." : "Loading\xE2\x80\xA6",
+                  g_meta, rf(0, H / 2 - 12, W, H / 2 + 12), OC_COL_MUTED);
+        g_meta->align = ST_ALIGN_LEFT;
+        return;
+    }
 
     /* Fit inside a margin, and never enlarge past 1:1 — blowing a small image
      * up to fill the window makes it look broken rather than bigger. */
@@ -26881,8 +28179,16 @@ static void draw_lightbox(gfx *rt, float W, float H) {
     float dw = (float)iw * sc, dh = (float)ih * sc;
     rectf dst = rf((W - dw) / 2, (H - dh) / 2, (W + dw) / 2, (H + dh) / 2);
     gfx_tex_draw(rt, bmp, gr(dst), 0.0f, 1.0f);
+    g_lb_img = dst;
+    if (cur && cur->video) {
+        /* A video message: its poster with a play mark; the player plays it. */
+        float pcx = (dst.left + dst.right) / 2, pcy = (dst.top + dst.bottom) / 2, pr = UIS(32);
+        gfx_ellipse(rt, pcx, pcy, pr, pr, 0x000000, 0.55f);
+        draw_lucide(rt, OC_ICON_PLAY, rf(pcx - pr / 2, pcy - pr / 2, pcx + pr / 2, pcy + pr / 2), 0xFFFFFF);
+    }
     g_meta->align = ST_ALIGN_CENTER;
-    draw_text(rt, "Click anywhere or press Esc to close", g_meta,
+    draw_text(rt, cur && cur->video ? "Enter or click to play \xC2\xB7 \xE2\x86\x90 \xE2\x86\x92 to move \xC2\xB7 Esc to close"
+                                    : "\xE2\x86\x90 \xE2\x86\x92 to move \xC2\xB7 Click outside or press Esc to close", g_meta,
               rf(0, dst.bottom + 10, W, dst.bottom + 32), OC_COL_MUTED);
     g_meta->align = ST_ALIGN_LEFT;
 }
@@ -27137,8 +28443,9 @@ static void copy_to_clipboard(oc_win *hwnd, const char *utf8) {
  * it reads, delimiters and escapes gone and a `<br>` a newline, and a cell
  * holding a tab, a newline or a quote in quotes with its quotes doubled. */
 
-/* A cell's text as it reads. Returns its length. */
-static size_t tcell_plain(const char *b, size_t start, size_t len, char *out, size_t cap) {
+/* A cell's text as it reads, each spoiler in `spl` that is covered as an excerpt
+ * says it (MARKDOWN.md §1d). Returns its length. */
+static size_t tcell_plain(const char *b, size_t start, size_t len, const mcspl *spl, int nspl, char *out, size_t cap) {
     oc_rt_span sp[OC_RT_MAX];
     size_t ns = oc_rt_scan_cell(b, start, len, sp, OC_RT_MAX), o = 0;
     if (ns > OC_RT_MAX) ns = OC_RT_MAX;
@@ -27146,6 +28453,13 @@ static size_t tcell_plain(const char *b, size_t start, size_t len, char *out, si
     for (size_t i = start; i < start + len && o + 1 < cap; ) {
         size_t skip = 0;
         int br = 0;
+        for (int q = 0; q < nspl && !skip; q++) {
+            if (spl[q].shown || i != start + spl[q].start) continue;
+            int w = snprintf(out + o, cap - o, "[spoiler]");
+            if (w > 0) o += (size_t)w < cap - o ? (size_t)w : cap - o - 1;
+            skip = spl[q].len;
+        }
+        if (skip) { i += skip; continue; }
         for (size_t k = 0; k < ns; k++) {
             if (i < sp[k].start || i >= sp[k].start + sp[k].len) continue;
             if (sp[k].style == OC_RT_BREAK) { br = 1; skip = sp[k].start + sp[k].len - i; break; }
@@ -27167,7 +28481,17 @@ static int msg_tables(const oc_msg *msg, oc_rt_table *out, int max) {
     if (lead > blen) lead = blen;
     if (!memchr(b + lead, '|', blen - lead)) return 0;
     size_t n = oc_rt_tables(b + lead, blen - lead, out, out ? (size_t)max : 0);
-    return (int)(n > (size_t)max && out ? (size_t)max : n);
+    int nt = (int)(n > (size_t)max && out ? (size_t)max : n);
+    /* The same tables the transcript draws, numbered as it numbers them. */
+    size_t ns = out ? oc_rt_spoilers(b + lead, blen - lead, NULL, 0) : 0;
+    oc_rt_spoiler *sv = ns ? malloc(ns * sizeof *sv) : NULL;
+    if (ns && !sv) return 0;                 /* no table is known not to be under a cover */
+    if (sv) {
+        ns = oc_rt_spoilers(b + lead, blen - lead, sv, ns);
+        nt = tables_uncovered(msg->message_id, sv, ns, out, nt);
+        free(sv);
+    }
+    return nt;
 }
 
 /* Table `idx` of `msg` as TSV, rows on CRLF as a Windows paste target expects;
@@ -27184,6 +28508,12 @@ static char *table_tsv(const oc_msg *msg, int idx) {
     size_t cap = 2 * t->len + 4 * ((size_t)t->rows + 1) * t->cols + 16, o = 0;
     char *out = malloc(cap), *cell = malloc(t->len + 1);
     if (!out || !cell) { free(out); free(cell); return NULL; }
+    /* What the table covers stays covered in what is copied. */
+    size_t nsv = oc_rt_spoilers(b + lead, blen - lead, NULL, 0), svi = 0;
+    oc_rt_spoiler *sv = nsv ? malloc(nsv * sizeof *sv) : NULL;
+    mcspl *cov = nsv ? malloc(nsv * sizeof *cov) : NULL;
+    if (nsv && (!sv || !cov)) { free(sv); free(cov); free(out); free(cell); return NULL; }
+    if (nsv) nsv = oc_rt_spoilers(b + lead, blen - lead, sv, nsv);
     oc_rt_rowit it;
     oc_rt_cell cells[OC_RT_TABLE_MAX_COLS];
     uint32_t row;
@@ -27194,7 +28524,15 @@ static char *table_tsv(const oc_msg *msg, int idx) {
         if (!first) { out[o++] = '\r'; out[o++] = '\n'; }
         first = 0;
         for (uint8_t c = 0; c < t->cols; c++) {
-            size_t n = tcell_plain(b + lead, cells[c].start, cells[c].len, cell, t->len + 1);
+            int ncov = 0;
+            while (svi < nsv && sv[svi].start < cells[c].start) svi++;
+            for (; svi < nsv && sv[svi].start < cells[c].start + cells[c].len; svi++, ncov++) {
+                memset(&cov[ncov], 0, sizeof cov[ncov]);
+                cov[ncov].shown = spoiler_shown(msg->message_id, (int)svi);
+                cov[ncov].start = sv[svi].start - cells[c].start;
+                cov[ncov].len = sv[svi].len;
+            }
+            size_t n = tcell_plain(b + lead, cells[c].start, cells[c].len, cov, ncov, cell, t->len + 1);
             int quote = strpbrk(cell, "\t\r\n\"") != NULL;
             if (c) out[o++] = '\t';
             if (quote) out[o++] = '"';
@@ -27207,7 +28545,28 @@ static char *table_tsv(const oc_msg *msg, int idx) {
     }
     out[o] = '\0';
     free(cell);
+    free(sv);
+    free(cov);
     return out;
+}
+
+/* Does "Show spoilers" change anything on the screen for `msg`? Not for a spoiler
+ * in a cell past a grid's columns, which the grid never draws. */
+static int msg_spoilers_to_show(const oc_msg *msg) {
+    const char *b = body_text(msg);
+    size_t blen = strlen(b), lead = body_lead(msg);
+    if (lead > blen) lead = blen;
+    size_t n = oc_rt_spoilers(b + lead, blen - lead, NULL, 0);
+    if (!n) return 0;
+    oc_rt_spoiler *sv = malloc(n * sizeof *sv);
+    if (!sv) return 1;
+    oc_rt_spoilers(b + lead, blen - lead, sv, n);
+    oc_rt_table rts[MTAB_MAX];
+    int nt = msg_tables(msg, rts, MTAB_MAX), any = 0;
+    for (size_t k = 0; k < n && !any; k++)
+        any = !sv[k].extra || !in_tables(rts, nt, sv[k].start);
+    free(sv);
+    return any;
 }
 
 /* Copy table `idx` of `msg`. Returns 1 when something was copied. */
@@ -27317,6 +28676,19 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
         mi_item(104, "Save for later");
     }
     mi_item(20,  "Copy text");
+    /* Spoilers (MARKDOWN.md §1d), from the keyboard: Ctrl+Up to the message,
+     * Shift+F10, and Enter on this reveals them all, or covers them again. */
+    if (!msg->deleted && msg->body) {
+        if (msg_spoilers_to_show(msg)) mi_item(110, spoiler_shown(mid, 0) ? "Hide spoilers" : "Show spoilers");
+    }
+    /* Folding (CLIENT.md "Long messages"): Collapse puts it away on every
+     * device; Expand opens a folded or a long one. */
+    if (!msg->deleted && msg_has_body(msg)) {
+        int cut_long = 0;
+        for (int i = 0; i < g_n_morehits; i++) if (g_morehits[i].mid == mid) cut_long = 1;
+        if (msg->collapsed || cut_long) mi_item(111, "Expand");
+        else                            mi_item(112, "Collapse");
+    }
     if (msg_tables(msg, NULL, 0) > 0) {
         g_menu_tab = 0;
         for (int i = 0; i < g_n_tabhits; i++)
@@ -27389,6 +28761,17 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
         copy_to_clipboard(hwnd, msg->body ? msg->body : "");
     } else if (cmd == 109) {
         copy_table(hwnd, msg, g_menu_tab);
+    } else if (cmd == 110) {
+        /* All of the message's spoilers, to the state the first is not in. */
+        int n = (int)msg_spoilers(msg), want = !spoiler_shown(mid, 0);
+        for (int k = 0; k < n; k++)
+            if (spoiler_shown(mid, k) != want) spoiler_toggle(mid, k);
+        invalidate();
+    } else if (cmd == 111) {
+        msg_open_cut(mid, msg->collapsed ? 1 : 2);
+    } else if (cmd == 112) {
+        msg_expand(mid, 0);
+        if (g_client) oc_client_set_collapsed(g_client, mid, 1);
     } else if (cmd == 21) {
         composer_begin_edit(msg);
     } else if (cmd == 108) {
@@ -27869,8 +29252,67 @@ static int wsmgr_key(oc_win *hwnd, int vk) {
     return 1;
 }
 
+/* Admin > Custom emoji's keys while no field has them, on the Workspaces
+ * dialog's pattern: the arrows, Page Up/Down, Home and End move through the rows
+ * and Delete asks about the one selected, where Delete is offered. Tab is the
+ * way to the search box, and Esc takes the keyboard off the row. */
+static int emoji_admin_key(oc_win *hwnd, int vk) {
+    const oc_model *m = model();
+    if (!m || g_view != VIEW_ADMIN || g_adm_tab != ADM_EMOJI || window_is_covered()) return 0;
+    if (vk == OCK_TAB) { focus_set(g_efind); return 1; }
+    if (vk == OCK_ESCAPE) {
+        if (g_emoji_focus < 0) return 0;
+        g_emoji_focus = -1;
+        return 1;
+    }
+    const oc_custom_emoji *rows[128];
+    int n = emoji_admin_rows(m, rows, 128);
+    if (n <= 0) return 0;
+    float rowh = UIS(44), visible = g_emoji_list.bottom - g_emoji_list.top;
+    int page = rowh > 0 ? (int)(visible / rowh) : 1;
+    if (page < 1) page = 1;
+    int at = g_emoji_focus;
+    switch (vk) {
+    case OCK_DOWN:  at = at < 0 ? 0 : at + 1; break;
+    case OCK_UP:    at = at < 0 ? 0 : at - 1; break;
+    case OCK_NEXT:  at = at < 0 ? 0 : at + page; break;
+    case OCK_PRIOR: at = at < 0 ? 0 : at - page; break;
+    case OCK_HOME:  at = 0; break;
+    case OCK_END:   at = n - 1; break;
+    case OCK_DELETE:
+        if (at >= 0 && at < n && emoji_admin_can_delete(m, rows[at]))
+            emoji_delete_ask(hwnd, rows[at]->name);
+        return 1;
+    default: return 0;
+    }
+    if (at < 0) at = 0;
+    if (at >= n) at = n - 1;
+    g_emoji_focus = at;
+    g_emoji_reveal = 1;
+    return 1;
+}
+
+/* Open a cut message: a folded one is unfolded on every device (and shown
+ * whole here); a long one is shown whole in this view. */
+static void msg_open_cut(uint64_t mid, int kind) {
+    if (kind == 1 && g_client) oc_client_set_collapsed(g_client, mid, 0);
+    msg_expand(mid, 1);
+    invalidate();
+}
+
 static int on_click(oc_win *hwnd, int x, int y) {
     crumb("click %d %d view=%d", x, y, g_view);
+    /* A spoiler is revealed, or covered again, by a click on it. */
+    if (!modal_open())
+        for (int i = 0; i < g_n_splhits; i++)
+            if (in_rect(g_splhits[i].r, (float)x, (float)y)) {
+                spoiler_toggle(g_splhits[i].mid, g_splhits[i].k);
+                invalidate();
+                return 1;
+            }
+    if (!modal_open())
+        for (int i = 0; i < g_n_morehits; i++)
+            if (in_rect(g_morehits[i].r, (float)x, (float)y)) { msg_open_cut(g_morehits[i].mid, g_morehits[i].kind); return 1; }
     /* Toasts are painted above everything, a dialog included, so they are
      * hit-tested above everything too -- a toast over the composer or a
      * dialog's card would otherwise pass on a click it appears to own. */
@@ -27891,7 +29333,17 @@ static int on_click(oc_win *hwnd, int x, int y) {
     if (modal_frame_click(hwnd, x, y)) return 1;
     /* A shared screen full screen covers everything: only its own bar answers. */
     if (g_share_full && !g_menu && !modal_open()) { call_click(hwnd, x, y); return 1; }
-    if (g_lightbox) { g_lightbox = 0; return 1; }   /* any click dismisses it */
+    if (g_lightbox) {
+        /* The arrows page; a video's poster plays; anywhere else closes. */
+        if (in_rect(g_lb_prev, (float)x, (float)y)) { lb_step(-1); return 1; }
+        if (in_rect(g_lb_next, (float)x, (float)y)) { lb_step(+1); return 1; }
+        if (in_rect(g_lb_img, (float)x, (float)y) && g_lb_i >= 0) {
+            static lb_item it[512];
+            int n = lb_items(it, 512), i = lb_index(it, n);
+            if (i >= 0 && it[i].video) { lb_play(hwnd); return 1; }
+        }
+        g_lightbox = 0; return 1;
+    }
     /* A pane's ✕. One test for every pane, because there is one header:
      * they all occupy the middle column and only one can be up. Gated on a pane
      * ACTUALLY being open so a stale rect from the last one cannot swallow a click
@@ -28019,8 +29471,34 @@ static int on_click(oc_win *hwnd, int x, int y) {
         if (om && om->audit_open) {
             for (int i = 0; i < g_n_audit_filters; i++)
                 if (in_rect(g_audit_filters[i], x, y)) {
-                    g_audit_family = i; g_ovl_scroll = 0; return 1;
+                    oc_client_audit_filter(g_client, (uint8_t)i, om->audit_actor, om->audit_action);
+                    g_ovl_scroll = 0; return 1;
                 }
+            if (in_rect(g_audit_clear_actor, x, y)) {
+                oc_client_audit_filter(g_client, om->audit_family, 0, om->audit_action);
+                g_ovl_scroll = 0; return 1;
+            }
+            if (in_rect(g_audit_clear_action, x, y)) {
+                oc_client_audit_filter(g_client, om->audit_family, om->audit_actor, "");
+                g_ovl_scroll = 0; return 1;
+            }
+            for (int i = 0; i < g_n_audit_rowhits; i++) {
+                if (g_audit_rowhits[i].actor_id && in_rect(g_audit_rowhits[i].actor, x, y)) {
+                    for (size_t k = 0; k < om->n_audit; k++)
+                        if (om->audit[k].actor_id == g_audit_rowhits[i].actor_id) {
+                            snprintf(g_audit_actor_name, sizeof g_audit_actor_name, "%s", om->audit[k].actor_name);
+                            break;
+                        }
+                    oc_client_audit_filter(g_client, om->audit_family, g_audit_rowhits[i].actor_id, om->audit_action);
+                    g_ovl_scroll = 0; return 1;
+                }
+                if (in_rect(g_audit_rowhits[i].action, x, y)) {
+                    char act[48];
+                    snprintf(act, sizeof act, "%s", g_audit_rowhits[i].action_name);
+                    oc_client_audit_filter(g_client, om->audit_family, om->audit_actor, act);
+                    g_ovl_scroll = 0; return 1;
+                }
+            }
         }
         if (g_status_open) {
             if (in_rect(g_status_emoji_btn, x, y)) {
@@ -28266,6 +29744,9 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 if (g_client) oc_client_srvalert_ack(g_client, g_alertrows[i].id);
                 return 1;
             }
+    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_EMOJI)
+        for (int i = 0; i < g_n_emojirows; i++)
+            if (in_rect(g_emojirows[i].r, x, y)) { emoji_delete_ask(hwnd, g_emojirows[i].name); return 1; }
     if (g_view == VIEW_ADMIN && g_adm_tab == ADM_INVITES)
         for (int i = 0; i < g_n_invrows; i++)
             if (in_rect(g_invrows[i].r, x, y)) {
@@ -28393,6 +29874,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 if (composer_remeasure()) layout_composer(hwnd);
                 break;
             case PREF_ROW_NOTIFY:  g_pref_notify = v; break;
+            case PREF_ROW_EMOTICONS: g_pref_emoticons = v ? 1 : 0; break;
             case PREF_ROW_FLASH:   g_pref_flash = v; break;
             case PREF_ROW_TOASTPOS: g_pref_toastpos = v; break;
             case PREF_ROW_DELIVER: g_pref_deliver = v; break;
@@ -29103,6 +30585,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
             }
     }
     if (in_rect(g_emoji_btn, x, y))  { picker_open(hwnd, 0); return 1; }
+    if (in_rect(g_preview_btn, x, y)) { preview_set(hwnd, !g_preview); return 1; }
     /* The formatting toolbar. Focus first: the button acts on the
      * field's selection, and clicking chrome must not be what takes the caret
      * away from the text it is about to wrap. */
@@ -29113,6 +30596,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
             ed_changed(hwnd);
             return 1;
         }
+    if (in_rect(g_time_btn, x, y)) { time_insert_open(hwnd); return 1; }
     if (in_rect(g_at_btn, x, y)) {
         /* Insert the trigger at the caret and let the normal completion path
          * take over, so the button and typing "@" behave identically. */
@@ -29357,6 +30841,24 @@ static uint32_t hit_pos(int ri, int x, int y) {
     return (uint32_t)pos;
 }
 
+/* Is body offset `pos` under a covered spoiler (MARKDOWN.md §1d)? What is under a
+ * cover answers no hover and no click: its address or its channel would show. */
+static int pos_covered(const oc_msg *msg, size_t pos) {
+    const char *b = body_text(msg);
+    size_t blen = strlen(b), lead = body_lead(msg);
+    if (lead > blen || pos < lead) return 0;
+    size_t n = oc_rt_spoilers(b + lead, blen - lead, NULL, 0);
+    oc_rt_spoiler *sv = n ? malloc(n * sizeof *sv) : NULL;
+    if (!n) return 0;
+    if (!sv) return 1;
+    n = oc_rt_spoilers(b + lead, blen - lead, sv, n);
+    int hit = 0;
+    for (size_t k = 0; k < n && !hit; k++)
+        hit = pos - lead >= sv[k].hidden && pos - lead < sv[k].hidden + sv[k].hidden_len && !spoiler_shown(msg->message_id, (int)k);
+    free(sv);
+    return hit;
+}
+
 /* ---- clickable links (item 97) -----------------------------------
  *
  * The shared parser marks a bare URL (OC_RT_LINK); this is the half that turns
@@ -29401,6 +30903,7 @@ static int link_at(int ri, int x, int y, char *out, size_t cap) {
         if (k >= 0) {
             const mcell *cl;
             if (mtab_hit(msg, l, g_msgrows[ri].cw, lx, ly, &cl, &pos) < 0 || !cl || pos == SIZE_MAX) return 0;
+            if (pos_covered(msg, pos)) return 0;
             n = oc_rt_scan_cell(u8, cl->start, cl->len, sp, OC_RT_MAX);
             if (n > OC_RT_MAX) n = OC_RT_MAX;
             for (i = 0; i < n; i++) {
@@ -29428,7 +30931,7 @@ static int link_at(int ri, int x, int y, char *out, size_t cap) {
         ly = lyl;
     }
     pos = st_hit_point(l->lay, lx, ly, &inside, &trailing);
-    if (!inside) return 0;
+    if (!inside || pos_covered(msg, pos)) return 0;
     {   /* An action's name is not the author's text: the spans start past it
          * (REQ-058), exactly as body_layout scanned them. */
         size_t lead = body_lead(msg);
@@ -29497,6 +31000,7 @@ static uint64_t chanref_at(int ri, int x, int y) {
         if (k >= 0) {   /* a cell's reference, scanned in the cell (MARKDOWN.md §1a) */
             const mcell *cl;
             if (mtab_hit(msg, l, g_msgrows[ri].cw, lx, ly, &cl, &pos) < 0 || !cl || pos == SIZE_MAX) return 0;
+            if (pos_covered(msg, pos)) return 0;
             const char *cs = u8 + cl->start;
             size_t p = pos - cl->start;
             n = oc_chanref_scan(cs, cl->len, cr, OC_CHANREF_MAX);
@@ -29509,7 +31013,7 @@ static uint64_t chanref_at(int ri, int x, int y) {
         ly = lyl;
     }
     pos = st_hit_point(l->lay, lx, ly, &inside, &trailing);
-    if (!inside) return 0;
+    if (!inside || pos_covered(msg, pos)) return 0;
     {   /* Past an action's name, as body_layout scanned it (REQ-058). */
         size_t lead = body_lead(msg);
         if (lead > blen || pos < lead) return 0;
@@ -31352,9 +32856,12 @@ static void prefs_save(void) {
                  g_pref_toastpos);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
+    oc_client_set_setting(g_client, EMOTICONS_SETTING_KEY, g_pref_emoticons ? "on" : "off");
 }
 
 static void prefs_load(const oc_model *m) {
+    const char *ev = m ? oc_model_setting(m, EMOTICONS_SETTING_KEY) : NULL;
+    g_pref_emoticons = oc_emoticon_setting_on(ev);
     const char *v = m ? oc_model_setting(m, PREFS_SETTING_KEY) : NULL;
     if (!v || !v[0]) return;
     int t = oc_theme_mode(), h = g_pref_time24, mm = g_pref_members, d = g_pref_daysep;
@@ -32565,6 +34072,13 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
     case 51:     /* the status dialog — bespoke modal, see status_open */
         status_open(hwnd);
         break;
+    case 34:     /* deactivate your own account (REQ-033), said before it happens */
+        confirm_open(hwnd, CONF_DEACTIVATE_SELF, 0, "Deactivate your account?",
+                     "You will be signed out on every device, and you will not be able to sign in. "
+                     "Your messages stay. An owner or admin can bring your account back. If you are "
+                     "this workspace's only owner, make someone else an owner first.",
+                     "Deactivate");
+        break;
     case 54:     /* REQ-182 */
         oc_client_list_sessions(g_client);
         modal_enter(hwnd, &g_sessions_open);
@@ -32581,6 +34095,16 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
             modal_finish(0);
             g_modal_closed_by = "save";
             summarize_start(hwnd, g_sr_cid, OC_SUM_RANGE, rs, re);
+        }
+        break;
+    case 305:   /* the same card's Insert, opened by Insert a time */
+        if (!g_sch_open || !g_sch_insert) break;
+        {
+            uint64_t at = sch_ms(g_sch_y, g_sch_m, g_sch_d, g_sch_min);
+            modal_finish(0);
+            g_modal_closed_by = "save";
+            g_sch_insert = 0;
+            time_insert_commit(hwnd, at);
         }
         break;
     case 304:   /* the custom send-later card's Schedule */
@@ -32618,6 +34142,16 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         const oc_model *vm2 = model();
         int nfields = (vm2 && oc_model_tts_available(vm2)) ? 7 : 6;
         if (nfields == 7) f[6].hint = voice_options(vm2);
+        /* The whole profile, fresh, before the fields are filled: Save sends
+         * every field back (SET_PROFILE replaces them all), so a phone this
+         * device was never told would otherwise be saved as empty. Two seconds
+         * at most; offline, the form opens on what is held. */
+        if (g_client && vm2) {
+            uint32_t seq0 = vm2->self_profile_seq;
+            uint64_t until = now_ms() + 2000;
+            oc_client_get_profile(g_client, 0);
+            while (model() && model()->self_profile_seq == seq0 && model()->authed && now_ms() < until) pump();
+        }
         const oc_model *pm2 = model();
         const char *had_name = "";
         if (pm2) for (size_t i = 0; i < pm2->n_users; i++)
@@ -32724,6 +34258,9 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         close_overlays();
         g_view = VIEW_ADMIN; layout_composer(hwnd);
         admin_select(ADM_GROUPS);
+        break;
+    case 94:   /* Admin > Custom emoji (REQ-072), which a member is shown too */
+        emoji_manage_open(hwnd);
         break;
     case 74:  /* Threads (REQ-062), the same destination the shelf row opens.
                * 51/52 belong to the profile menu's status items — the dispatch
@@ -33263,7 +34800,7 @@ static void *devlist_thread(void *arg) {
 /* The open confirmation, and which one: the harness answers some of them
  * (scripts/gui/drive.sh trust_dev_cert, lib.sh sign_in_card), signed in or not. */
 static void test_dump_confirm(FILE *f) {
-    fprintf(f, "confirm open=%d act=%d url=\"%s\"\n", g_confirm_open, g_confirm_act, g_confirm_url);
+    fprintf(f, "confirm open=%d act=%d url=\"%s\" emoji=\"%s\"\n", g_confirm_open, g_confirm_act, g_confirm_url, g_confirm_emoji);
 }
 
 /* THE TREE ITSELF, one line per element, so a check outside the client
@@ -33297,11 +34834,13 @@ static void test_dump(const char *path) {
             const oc_model *sm = oc_client_model(g_si_client);
             if (sm) fprintf(f, "signin last_error=%s signin_url=%.120s\n", sm->last_error, sm->signin_url);
         }
+        fprintf(f, "cursor kind=%s\n", cursor_kind_name());
         test_dump_confirm(f);
         test_dump_a11y(f);
         fclose(f); return;
     }
     fprintf(f, "mode=%s\n", oc_env_is_dev() ? "development" : "normal");
+    fprintf(f, "cursor kind=%s\n", cursor_kind_name());
     fprintf(f, "authed=%d connected=%d sel=%llu members=%d\n",
             m->authed, m->connected, (unsigned long long)g_sel, g_show_members);
     /* Whether the DM picker is open (`dmcompose 0|1`), so a harness waits for
@@ -33480,6 +35019,19 @@ static void test_dump(const char *path) {
         const oc_channel *dc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
         for (size_t i = 0; dc && i < dc->n_msgs; i++) {
             const oc_msg *tm = &dc->msgs[i];
+            /* How the dialect read the body, for a script to tell a quote from a
+             * spoiler at the start of a line. */
+            if (!tm->deleted && tm->body) {
+                const char *mb = body_text(tm);
+                size_t mlen = strlen(mb), ml = body_lead(tm), mq = 0;
+                if (ml > mlen) ml = mlen;
+                oc_rt_span qs[OC_RT_MAX];
+                size_t qn = oc_rt_scan(mb + ml, mlen - ml, qs, OC_RT_MAX);
+                if (qn > OC_RT_MAX) qn = OC_RT_MAX;
+                for (size_t q = 0; q < qn; q++) if (qs[q].style == OC_RT_QUOTE) mq++;
+                fprintf(f, "  marks msg=%llu quotes=%zu spoilers=%zu\n", (unsigned long long)tm->message_id, mq,
+                        oc_rt_spoilers(mb + ml, mlen - ml, NULL, 0));
+            }
             oc_rt_table rts[MTAB_MAX];
             int nt = msg_tables(tm, rts, MTAB_MAX);
             const char *b = nt ? body_text(tm) : NULL;
@@ -33507,7 +35059,7 @@ static void test_dump(const char *path) {
                         const mcell *cl = &t->cell[r * t->rt.cols + c];
                         char v[256], e[600];
                         size_t o = 0;
-                        tcell_plain(b, cl->start, cl->len, v, sizeof v);
+                        tcell_plain(b, cl->start, cl->len, cl->spl, cl->nspl, v, sizeof v);
                         for (const char *q = v; *q && o + 3 < sizeof e; q++) {
                             if (*q == '\n')      { e[o++] = '\\'; e[o++] = 'n'; }
                             else if (*q == '"') { e[o++] = '\\'; e[o++] = '"'; }
@@ -33879,6 +35431,16 @@ static void test_dump(const char *path) {
                 g_ed_box.left, g_ed_box.top, g_ed_box.right, g_ed_box.bottom,
                 g_ed_comp_len, g_composer_h, box_w > 0 ? ed_lines(box_w) : 0,
                 ed_line_h() > 0 ? (int)((box_w > 0 ? g_ed_box.bottom - g_ed_box.top : 0) / ed_line_h() + 0.5f) : 0, ed8);
+        /* The composer's Preview: whether it is shown, what the renderer made of
+         * the draft, and where its button is. */
+        /* frames: what this process has written, which previewing must not move.
+         * held: the images it did not ask for. draft: 0 nothing to write, 1 waiting
+         * out the debounce, 2 due, and held back by the preview. */
+        fprintf(f, "cpreview on=%d frames=%llu held=%d draft=%d h=%.0f lines=%d tables=%d btn=%.0f,%.0f,%.0f,%.0f\n",
+                g_preview, oc_client_frames_written(), g_preview_held,
+                !g_draft_dirty ? 0 : now_ms() - g_draft_touch_ms >= DRAFT_DEBOUNCE_MS ? 2 : 1,
+                g_preview_h, g_preview_lines, g_preview_tabs,
+                g_preview_btn.left, g_preview_btn.top, g_preview_btn.right, g_preview_btn.bottom);
     }
     /* The About tab's admin buttons, so a test can click the one it means rather
      * than arithmetic that breaks the next time a button is added between them —
@@ -33889,6 +35451,51 @@ static void test_dump(const char *path) {
             g_about_archive.left, g_about_archive.top,
             g_about_archive.right, g_about_archive.bottom);
     fprintf(f, "cemoji=%zu\n", m->n_cemoji);
+    /* Admin > Custom emoji: what it lists, in order, and each Delete offered. */
+    {
+        const oc_custom_emoji *er[128];
+        int en = emoji_admin_rows(m, er, 128);
+        fprintf(f, "emojiadmin shown=%d q=\"%s\" n=%d dels=%d manage=%.0f,%.0f,%.0f,%.0f sel=%s searching=%d\n",
+                g_view == VIEW_ADMIN && g_adm_tab == ADM_EMOJI, g_emoji_q, en, g_n_emojirows,
+                g_pick_manage.left, g_pick_manage.top, g_pick_manage.right, g_pick_manage.bottom,
+                g_emoji_focus >= 0 && g_emoji_focus < en ? er[g_emoji_focus]->name : "-",
+                g_efind && g_focus == g_efind);
+        for (int i = 0; i < en; i++) {
+            rectf d = rf(0, 0, 0, 0);
+            for (int k = 0; k < g_n_emojirows; k++)
+                if (!strcmp(g_emojirows[k].name, er[i]->name)) d = g_emojirows[k].r;
+            fprintf(f, "  emojirow %s by=%llu del=%.0f,%.0f,%.0f,%.0f\n", er[i]->name,
+                    (unsigned long long)er[i]->created_by, d.left, d.top, d.right, d.bottom);
+        }
+    }
+    /* The time tokens the last frame drew (MARKDOWN.md §1c): the text each
+     * reads as, its full form, and which one the tooltip shows; and how many
+     * custom emoji it drew in the bodies and tables beside them. */
+    {
+        oc_rt_clock k;
+        oc_model_clock(m, (int64_t)time(NULL) * 1000, &k);
+        fprintf(f, "timetoks n=%d tz=%d time24=%d tip=%d emoji=%d\n", g_n_timehits, k.tz_min, k.time24,
+                time_tip_index(), g_n_emojiboxes);
+        for (int i = 0; i < g_n_timehits; i++) {
+            char sh[64], full[96];
+            oc_model_time_text(m, g_timehits[i].ms, OC_RT_TIME_SHORT, sh, sizeof sh);
+            oc_model_time_text(m, g_timehits[i].ms, OC_RT_TIME_FULL, full, sizeof full);
+            fprintf(f, "  timetok mid=%llu ms=%lld text=\"%s\" full=\"%s\" r=%.0f,%.0f,%.0f,%.0f\n",
+                    (unsigned long long)g_timehits[i].mid, (long long)g_timehits[i].ms, sh, full,
+                    g_timehits[i].r.left, g_timehits[i].r.top, g_timehits[i].r.right, g_timehits[i].r.bottom);
+        }
+    }
+    /* The spoilers the last frame drew, covered or shown (MARKDOWN.md §1d). */
+    fprintf(f, "spoilers n=%d\n", g_n_splhits);
+    for (int i = 0; i < g_n_splhits; i++)
+        fprintf(f, "  spoiler mid=%llu k=%d shown=%d lines=%d r=%.0f,%.0f,%.0f,%.0f\n",
+                (unsigned long long)g_splhits[i].mid, g_splhits[i].k, g_splhits[i].shown, g_splhits[i].lines,
+                g_splhits[i].r.left, g_splhits[i].r.top, g_splhits[i].r.right, g_splhits[i].r.bottom);
+    /* Cut messages the last frame drew (CLIENT.md "Long messages"). */
+    fprintf(f, "cutmsgs n=%d\n", g_n_morehits);
+    for (int i = 0; i < g_n_morehits; i++)
+        fprintf(f, "  cutmsg mid=%llu kind=%d r=%.0f,%.0f,%.0f,%.0f\n", (unsigned long long)g_morehits[i].mid,
+                g_morehits[i].kind, g_morehits[i].r.left, g_morehits[i].r.top, g_morehits[i].r.right, g_morehits[i].r.bottom);
     for (size_t i = 0; i < m->n_cemoji; i++)
         fprintf(f, "  cemoji %s attach=%llu\n", m->cemoji[i].name,
                 (unsigned long long)m->cemoji[i].attachment_id);
@@ -34102,6 +35709,7 @@ static void test_dump(const char *path) {
             { "find",  g_find,      find_box() },
             { "srch",  g_srch,      g_srch_box },
             { "files", g_ffind,     g_file_search_box },
+            { "emoji", g_efind,     g_emoji_search_box },
             { "people", g_dir_edit, g_dir_search_box },
             { "pal",   g_pal_edit,  g_pal_box },
             { "pick",  g_pick_edit, g_pick_box },
@@ -34576,7 +36184,10 @@ static void test_dump(const char *path) {
     fprintf(f, "badge=%d flash_pref=%d flashes=%d taskbar=%d hr=0x%08lx\n",
             g_badge_shown < 0 ? 0 : g_badge_shown, g_pref_flash, g_flashes_raised,
             oc_plat_badge_status() ? -1 : (g_badge_shown >= 0 ? 1 : 0), (unsigned long)(unsigned)oc_plat_badge_status());
-    fprintf(f, "lightbox=%llu thumb_hits=%d\n", (unsigned long long)g_lightbox, g_n_thumb_hits);
+    fprintf(f, "lightbox=%llu lightbox_pos=%d/%d prev=%d next=%d next_r=%.0f,%.0f,%.0f,%.0f thumb_hits=%d\n",
+            (unsigned long long)g_lightbox, g_lb_i + 1, g_lb_n, g_lb_prev.right > g_lb_prev.left,
+            g_lb_next.right > g_lb_next.left, g_lb_next.left, g_lb_next.top, g_lb_next.right, g_lb_next.bottom,
+            g_n_thumb_hits);
     /* The video overlay (REQ-162/165): which card, its phase, and its buttons. */
     {
         oc_rec_status rs; memset(&rs, 0, sizeof rs);
@@ -35248,8 +36859,36 @@ static void test_poll(oc_win *hwnd) {
          * group, 9 remove one). Ack first: some open a form. */
         test_ack(g_sel ? "ok" : "err");
         if (g_sel) { g_menu_target = g_sel; channel_menu_run(hwnd, atoi(arg)); }
+    } else if (!strcmp(verb, "preview")) {
+        /* `preview`: the composer's Preview toggle, as its button. */
+        if (g_sel && g_view != VIEW_NEWMSG) { preview_set(hwnd, !g_preview); test_ack("ok"); }
+        else test_ack("err");
+    } else if (!strcmp(verb, "timeinsert")) {
+        /* `timeinsert <YYYY>-<MM>-<DD> <HH>:<MM>`, in this machine's zone: Insert
+         * a time's card opened, that moment picked on it, and Insert pressed. */
+        int y = 0, mo = 0, d = 0, hh = 0, mi = 0;
+        if (g_sel && sscanf(arg, "%d-%d-%d %d:%d", &y, &mo, &d, &hh, &mi) == 5) {
+            time_insert_open(hwnd);
+            g_sch_y = y; g_sch_m = mo - 1; g_sch_d = d; g_sch_min = hh * 60 + mi;
+            menu_dispatch(hwnd, 305);
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "emoji_del")) {
         oc_client_delete_emoji(g_client, arg); test_ack("ok");
+    } else if (!strcmp(verb, "emoji_add")) {
+        /* `emoji_add <name> <path>`: upload the image into the open conversation
+         * and register it as :name:, as Add custom emoji does past its dialogs. */
+        char nm[48] = "";
+        const char *sp = strchr(arg, ' ');
+        if (g_client && g_sel && sp && sp > arg && (size_t)(sp - arg) < sizeof nm) {
+            memcpy(nm, arg, (size_t)(sp - arg)); nm[sp - arg] = 0;
+            oc_client_upload_emoji(g_client, g_sel, nm, sp + 1);
+            test_ack("ok");
+        } else test_ack("err");
+    } else if (!strcmp(verb, "emoji_find")) {
+        /* `emoji_find <text>|-`: type into Admin > Custom emoji's search box. */
+        if (g_efind) { field_set(g_efind, strcmp(arg, "-") ? arg : ""); test_ack("ok"); }
+        else test_ack("err");
     } else if (!strcmp(verb, "groupdm")) {
         /* REQ-056. `groupdm <name>,<name>[,...]` — the menu item opens a form the
          * harness would have to type into and dismiss; this is the call underneath. */
@@ -35975,18 +37614,18 @@ static void test_poll(oc_win *hwnd) {
  * intent reads better as an edge. */
 static void cursor_want(int kind) {
     static SDL_Cursor *cur[3];
-    static int have, current = -1;
+    static int have;
     if (!have) {
         cur[0] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
         cur[1] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_TEXT);
         cur[2] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
         have = 1;
     }
-    if (kind < 0 || kind > 2 || kind == current)
+    if (kind < 0 || kind > 2 || kind == g_cursor_kind)
         return;
     if (cur[kind])
         SDL_SetCursor(cur[kind]);
-    current = kind;
+    g_cursor_kind = kind;
 }
 
 /* The notice for a message that named people it could not reach (REQ-287),
@@ -36056,11 +37695,13 @@ static void unresolved_notice(oc_win *hwnd, const oc_model *m, int update) {
 /* Every drawn field, made once with the window: its placeholder, its keys and
  * its change hook. */
 static void fields_create(void) {
-    static field find, ffind, dir, srch, pal, pick, si[3];
+    static field find, ffind, efind, dir, srch, pal, pick, si[3];
     field_init(&find, "Find a conversation", 0, 0);
     find.key = find_key; find.changed = find_changed; find.maxlen = 63; g_find = &find;
     field_init(&ffind, "Search files", 0, 0);
     ffind.changed = ffind_changed; ffind.maxlen = 63; g_ffind = &ffind;
+    field_init(&efind, "Search custom emoji", 0, 0);
+    efind.key = efind_key; efind.changed = efind_changed; efind.maxlen = 47; g_efind = &efind;
     field_init(&dir, "Search people", 0, 0);
     dir.changed = dir_changed; dir.maxlen = 79; g_dir_edit = &dir;
     field_init(&srch, "Search messages", 0, 0);
@@ -36142,7 +37783,7 @@ static int on_tick(oc_win *hwnd) {
              * arrived (nothing is loaded yet), so without this the history then
              * counted itself unread under the reader's eyes, and the row went
              * bold with a number while they were in it. */
-            if (g_sel && transcript_shell() && g_scroll == 0 && !g_edit_msg &&
+            if (g_sel && transcript_shell() && g_scroll == 0 && !g_edit_msg && !g_preview &&
                 win_front(hwnd)) {
                 const oc_model *vm = model();
                 const oc_channel *vc = vm && vm->authed ? oc_model_channel((oc_model *)vm, g_sel) : NULL;
@@ -36197,7 +37838,8 @@ static int on_tick(oc_win *hwnd) {
                 g_draft_dirty = 0;
                 invalidate();   /* the header says "Saved" */
             }
-            if (g_draft_dirty && g_sel && !g_edit_msg && g_view != VIEW_NEWMSG &&
+            /* Not while previewing, which sends nothing: it is still dirty after. */
+            if (g_draft_dirty && g_sel && !g_edit_msg && g_view != VIEW_NEWMSG && !g_preview &&
                 now_ms() - g_draft_touch_ms >= DRAFT_DEBOUNCE_MS) {
                 draft_flush(g_sel);
                 invalidate();   /* the marker is model-drawn */
@@ -37488,6 +39130,8 @@ static int on_key_down(oc_win *hwnd, int wp) {
         }
         if (VM_UP() && vm_key(hwnd, wp)) { invalidate(); return 0; }
         if (wp == OCK_ESCAPE && g_lightbox) { g_lightbox = 0; invalidate(); return 0; }
+        if (g_lightbox && (wp == OCK_LEFT || wp == OCK_RIGHT)) { lb_step(wp == OCK_LEFT ? -1 : +1); return 0; }
+        if (g_lightbox && wp == OCK_RETURN) { lb_play(hwnd); invalidate(); return 0; }
         /* Esc pops the context pane back to the member list before it reaches
          * the middle column's overlays — the pane is what you just opened. */
         if (wp == OCK_ESCAPE && g_rp_mode != RP_MEMBERS) {
@@ -37503,6 +39147,7 @@ static int on_key_down(oc_win *hwnd, int wp) {
         }
         if (wp == OCK_ESCAPE && g_more_open) { g_more_open = 0; invalidate(); return 0; }
         if (wp == OCK_ESCAPE && g_has_sel) { g_has_sel = 0; invalidate(); return 0; }
+        if (emoji_admin_key(hwnd, wp)) { invalidate(); return 0; }
         /* The composer LAST among the specific cases and before the shell's
          * fall-through: the overlays above own Esc while they are open, and the
          * field owns every other key while it has focus. The field is not a
@@ -37617,6 +39262,12 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
             }
             break;
         case AT_PASTECHOICE: pastechoice_pick(hwnd, (int)arg); break;
+        case AT_SPOILER:
+            if ((int)arg < g_n_splhits) { spoiler_toggle(g_splhits[arg].mid, g_splhits[arg].k); invalidate(); }
+            break;
+        case AT_MORE:
+            if ((int)arg < g_n_morehits) msg_open_cut(g_morehits[arg].mid, g_morehits[arg].kind);
+            break;
         case AT_POLLCOMP:
             /* The same path a click takes, at the control's recorded centre. */
             if (g_pc_open) {
@@ -37678,6 +39329,19 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
         }
         case AT_ADMTAB:
             if (g_view == VIEW_ADMIN && (int)arg < ADM_COUNT) admin_select((int)arg);
+            break;
+        case AT_EMOJIDEL:
+            if (g_view == VIEW_ADMIN && g_adm_tab == ADM_EMOJI && (int)arg < g_n_emojirows)
+                emoji_delete_ask(hwnd, g_emojirows[arg].name);
+            break;
+        case AT_EMOJIFIND:
+            if (g_efind && g_efind->visible) focus_set(g_efind);
+            break;
+        case AT_PICKMANAGE:
+            if (g_pick_open) emoji_manage_open(hwnd);
+            break;
+        case AT_PREVIEW:
+            if (g_view != VIEW_NEWMSG && g_sel) preview_set(hwnd, !g_preview);
             break;
         case AT_ALERTACK:
             if (g_view == VIEW_ADMIN && g_adm_tab == ADM_ALERTS && (int)arg < g_n_alertrows && g_client)
@@ -37763,6 +39427,7 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
                 menu_dispatch(hwnd, arg ? g_form_side.remove_cmd : g_form_side.upload_cmd);
             break;
         case AT_MENTION:   ed_focus(hwnd); ed_insert(u"@"); ac_rebuild(); break;
+        case AT_TIMEINS:   time_insert_open(hwnd); break;
         case AT_SCHEDMENU:
             /* The same menu the chevron opens, built where it is built — a second
              * copy of its items here would be a second thing to keep in step. */
@@ -37800,8 +39465,9 @@ static int on_focus_lost(oc_win *hwnd) {
         if (g_dict_hold == DH_KEY) dict_ptt_up(hwnd, DH_KEY);
         /* Whatever you were typing is written now: losing focus is the
          * moment you stopped, and waiting out the debounce risks the app being
-         * closed or killed in between. */
-        if (g_sel) draft_flush(g_sel);
+         * closed or killed in between. Not while previewing, which sends nothing;
+         * it is written when the preview closes. */
+        if (g_sel && !g_preview) draft_flush(g_sel);
         /* Losing it to a child, or to another app: the caret must stop drawing, or
          * two carets blink at once and neither is where your keys go. */
         g_ed_focus = 0;
@@ -38261,7 +39927,7 @@ int main(int argc, char *argv[]) {
     crumbs_start();
     crumb("start");
 
-    g_secret = oc_secret_open_os("openchime");
+    g_secret = oc_secret_open_os(oc_env_secret_service());
     oc_sidebar_opts_defaults(&g_sb);
 
     /* Credential resolution, uniform with the TUI:

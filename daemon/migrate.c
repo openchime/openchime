@@ -1250,6 +1250,18 @@ static const char MIGRATION_0068[] =
     "ALTER TABLE users ADD COLUMN share_receipts INTEGER NOT NULL DEFAULT 1 CHECK (share_receipts IN (0,1));"
     "ALTER TABLE users ADD COLUMN receipts_since_ms INTEGER NOT NULL DEFAULT 0;";
 
+static const char MIGRATION_0070[] =
+    /* Collapsed messages: the messages a person has folded away, kept for them
+     * on every device, as saved items are (saved_items, 0005) -- a set per
+     * person, keyed on (user, message), which a client setting would grow
+     * without bound. A message's rows go with it when it is deleted. */
+    "CREATE TABLE collapsed_messages ("
+    "  user_id       INTEGER NOT NULL REFERENCES users(id),"
+    "  message_id    INTEGER NOT NULL REFERENCES messages(id),"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  PRIMARY KEY (user_id, message_id)"
+    ");";
+
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
      * author is doing, and the daemon records that as its own object beside the
@@ -1531,6 +1543,12 @@ static const char MIGRATION_0059[] =
     ");"
     "CREATE INDEX idx_sum_notices_user ON summary_notices(user_id, seen_at_ms);";
 
+static const char MIGRATION_0069[] =
+    /* When an invitation was made, so INVITE_LIST can say (PROTOCOL.md §5.8).
+     * Nullable, with no default: a row made before this has no recorded time,
+     * and none is invented for it; INVITE_LIST reports it as 0. */
+    "ALTER TABLE invites ADD COLUMN created_at_ms INTEGER;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1600,6 +1618,8 @@ const oc_migration OC_MIGRATIONS[] = {
     { 66, MIGRATION_0066 },
     { 67, MIGRATION_0067 },
     { 68, MIGRATION_0068 },
+    { 69, MIGRATION_0069 },
+    { 70, MIGRATION_0070 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

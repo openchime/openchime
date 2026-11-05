@@ -8,6 +8,7 @@
 #include "notify.h"    /* oc_notify_decide — the one notify rule (ARCH-103) */
 
 #include "protocol.h"   /* OC_PRESENCE_OFFLINE */
+#include "oc_port.h"    /* oc_localtime_r */
 
 #include <ctype.h>
 #include <stdio.h>
@@ -189,13 +190,52 @@ void oc_model_format_duration(uint32_t ms, char *out, size_t cap) {
     else           snprintf(out, cap, "%u:%02u", s / 60, s % 60);
 }
 
+void oc_model_set_clock12(oc_model *m, int on) { if (m) m->clock12 = on ? 1 : 0; }
+
+/* This device's offset from UTC at `at_ms`, in minutes: the local calendar
+ * time the C library gives for that moment, less the moment. Asked per moment,
+ * so a time across a daylight-saving change reads as it will be then. */
+static int local_offset_min(int64_t at_ms) {
+    time_t t = (time_t)(at_ms / 1000);
+    struct tm lt;
+    if (!oc_localtime_r(&t, &lt)) return 0;
+    int64_t y = lt.tm_year + 1900, mo = lt.tm_mon + 1, d = lt.tm_mday;
+    y -= mo <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400, yoe = y - era * 400;
+    int64_t doy = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int64_t days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+    int64_t local = days * 86400 + lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec;
+    return (int)((local - (int64_t)t) / 60);
+}
+
+void oc_model_clock(const oc_model *m, int64_t at_ms, oc_rt_clock *out) {
+    if (!out) return;
+    out->tz_min = local_offset_min(at_ms);
+    out->time24 = !(m && m->clock12);
+    out->utc = 0;
+    out->now_ms = (int64_t)time(NULL) * 1000;
+}
+
+size_t oc_model_time_text(const oc_model *m, int64_t at_ms, int form, char *out, size_t cap) {
+    oc_rt_clock k;
+    oc_model_clock(m, at_ms, &k);
+    return oc_rt_time_text(at_ms, &k, form, out, cap);
+}
+
 /* A body as an excerpt shows it: each table one line saying what it is
- * (MARKDOWN.md §1a), so a sidebar row or a toast never reads as pipes. */
-static void preview_set(char *out, size_t cap, const char *text) {
+ * (MARKDOWN.md §1a), so a sidebar row or a toast never reads as pipes, each
+ * time token its time in this reader's zone (§1c), and each spoiler
+ * "[spoiler]" (§1d), so no excerpt gives away what it hides. One clock for the
+ * line, at the device's offset now: a token across a daylight-saving change
+ * can read an hour out in an excerpt, never in the message itself, which asks
+ * per token. */
+static void preview_set(const oc_model *m, char *out, size_t cap, const char *text) {
     if (!out || !cap) return;
     if (!text) { out[0] = '\0'; return; }
-    if (!strchr(text, '|')) { snprintf(out, cap, "%s", text); return; }
-    oc_rt_flatten(text, strlen(text), out, cap);
+    if (!strchr(text, '|') && !strstr(text, "<time:") && !strstr(text, "```spoiler") && !strstr(text, ">!")) { snprintf(out, cap, "%s", text); return; }
+    oc_rt_clock k;
+    oc_model_clock(m, (int64_t)time(NULL) * 1000, &k);
+    oc_rt_flatten_at(text, strlen(text), &k, out, cap);
 }
 
 void oc_model_line(const oc_model *m, uint64_t author_id, const char *name, int action,
@@ -203,10 +243,10 @@ void oc_model_line(const oc_model *m, uint64_t author_id, const char *name, int 
     if (!out || !cap) return;
     out[0] = '\0';
     if (!text) text = "";
-    if (!action) { preview_set(out, cap, text); return; }
+    if (!action) { preview_set(m, out, cap, text); return; }
     const char *who = (name && name[0]) ? name : oc_model_user_name(m, author_id);
     int n = snprintf(out, cap, "%s ", who ? who : "");
-    if (n > 0 && (size_t)n < cap) preview_set(out + n, cap - (size_t)n, text);
+    if (n > 0 && (size_t)n < cap) preview_set(m, out + n, cap - (size_t)n, text);
 }
 
 void oc_model_msg_preview(const oc_model *m, const oc_msg *msg, char *out, size_t cap) {
@@ -219,7 +259,7 @@ void oc_model_msg_preview(const oc_model *m, const oc_msg *msg, char *out, size_
                       1, msg->body + msg->action.start, out, cap);
         return;
     }
-    if (msg->body && msg->body[0]) { preview_set(out, cap, msg->body); return; }
+    if (msg->body && msg->body[0]) { preview_set(m, out, cap, msg->body); return; }
     if (!msg->n_attach) return;
     const oc_attachment *a = &msg->attach[0];
     if (a->media_kind == OC_MEDIA_VIDEO_MESSAGE) {
@@ -1795,7 +1835,7 @@ static void notice_push(oc_model *m, const oc_ev *e) {
         int act = e->action_known && e->action && e->action_len &&
                   e->action_start <= blen && e->action_len <= blen - e->action_start;
         n->action = (uint8_t)act;
-        snprintf(n->body, sizeof n->body, "%s", act ? e->body + e->action_start : e->body);
+        preview_set(m, n->body, sizeof n->body, act ? e->body + e->action_start : e->body);
     }
 }
 
@@ -1973,7 +2013,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             if (e->e2e) c->e2e = 1;
             if (e->created_at) c->created_at = e->created_at;
             if (e->preview) {
-                preview_set(c->preview, sizeof c->preview, e->preview);
+                preview_set(m, c->preview, sizeof c->preview, e->preview);
                 c->preview_author = e->preview_author;
                 c->preview_action = e->action;   /* REQ-058 */
             }
@@ -2006,7 +2046,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             size_t blen = strlen(e->body);
             int act = e->action_known && e->action && e->action_len &&
                       e->action_start <= blen && e->action_len <= blen - e->action_start;
-            preview_set(c->preview, sizeof c->preview, act ? e->body + e->action_start : e->body);
+            preview_set(m, c->preview, sizeof c->preview, act ? e->body + e->action_start : e->body);
             c->preview_author = e->author_id;
             c->preview_action = (uint8_t)act;
         }
@@ -2315,6 +2355,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         mem->avatar_id      = e->message_id;
         if (e->op) mem->role = e->op;
         user_relabel(mem);
+        if (e->user_id == m->user_id) m->self_profile_seq++;
         break;
     }
     case OC_EV_INVITE_ROW: {
@@ -2346,6 +2387,16 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 m->n_invites--;
                 break;
             }
+        break;
+    case OC_EV_COLLAPSED:
+        /* Mine on every device: the message itself, wherever it is held. */
+        for (size_t ci = 0; ci < m->n_channels; ci++) {
+            oc_channel *c = &m->channels[ci];
+            for (size_t i = 0; i < c->n_msgs; i++)
+                if (c->msgs[i].message_id == e->message_id) { c->msgs[i].collapsed = e->op ? 1 : 0; break; }
+        }
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id) { m->thread_msgs[i].collapsed = e->op ? 1 : 0; break; }
         break;
     case OC_EV_SAVED_UPDATED:
         /* Mark the message itself, in every list that can hold it, so the
@@ -2539,7 +2590,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 oc_msg *msg = &c->msgs[i];
                 msg_set_action(msg, e);
                 if (i + 1 == c->n_msgs && msg->body && c->preview_author == msg->author_id) {
-                    preview_set(c->preview, sizeof c->preview,
+                    preview_set(m, c->preview, sizeof c->preview,
                                 msg->action.present ? msg->body + msg->action.start : msg->body);
                     c->preview_action = msg->action.present;
                 }
@@ -2721,8 +2772,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     case OC_EV_SEARCH_RESULT:
         if (m->search_open) {
-            search_append(m, e->message_id, e->channel_id, e->author_id, e->server_time, e->action, e->rank, &e->body);
-            if (e->status) m->search_truncated = 1;
+            /* message_id 0 is an empty page's end, not a hit. */
+            if (e->message_id)
+                search_append(m, e->message_id, e->channel_id, e->author_id, e->server_time, e->action, e->rank, &e->body);
+            /* The latest page's: only a page's last event carries its
+             * truncation, every earlier row 0, so the page's end decides. */
+            m->search_truncated = e->status ? 1 : 0;
         }
         break;
     case OC_EV_REACTIONS:

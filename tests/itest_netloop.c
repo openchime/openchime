@@ -2284,6 +2284,45 @@ static int peer_closed(client *c, int secs) {
     return closed;
 }
 
+/* A person deactivates their own account (REQ-033): every connection of
+ * theirs is dropped, this one among them, as a removal drops them, and signing
+ * in again is refused. On a loop of its own, so the suite's accounts stay. */
+static void test_deactivate_self_wire(void) {
+    oc_tls_server srv;
+    uint8_t pin[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0 && oc_tls_server_fingerprint(&srv, pin) == 0);
+    db_unlink("itest_deactivate.db");
+    oc_dbwriter *dbw = oc_dbwriter_start(tpath("itest_deactivate.db"));
+    CHECK(dbw != NULL);
+    if (!dbw) { oc_tls_server_free(&srv); return; }
+    oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
+    CHECK(oc_dbwriter_register_local(dbw, "olive", "pw-olive", OC_ROLE_OWNER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "dana", "pw-dana", OC_ROLE_MEMBER, 2048) != 0);
+    struct loop_arg la; pthread_t th;
+    int port = start_loop(&la, &th, &srv, dbw, 0);
+    CHECK(port != 0);
+    if (!port) { oc_dbwriter_stop(dbw); oc_tls_server_free(&srv); return; }
+    client a, b;
+    uint64_t ua = 0, ub = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "dana", "pw-dana", &ua) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "dana", "pw-dana", &ub) == 0);
+    uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_deactivate_self(&w, OC_PROTOCOL_VERSION) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(peer_closed(&a, PEER_CLOSES) == 1);
+    CHECK(peer_closed(&b, PEER_CLOSES) == 1);   /* her other device too */
+    client_close(&a);
+    client_close(&b);
+    client c2;
+    uint64_t uc = 0;
+    CHECK(client_open(&c2, port, pin) == 0 && do_handshake(&c2) == 0);
+    CHECK(do_auth(&c2, "dana", "pw-dana", &uc) != 0);   /* refused */
+    client_close(&c2);
+    stop_loop(&la, th);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    db_unlink("itest_deactivate.db");
+}
+
 /* How many sessions the signed-in `c` sees, or -1; `current` how many of them
  * it is told are its own. */
 static int session_count_of(client *c, int *current) {
@@ -2394,6 +2433,86 @@ static int sid_sessions_seen(sqlite3 *db) {
     if (st && sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
     sqlite3_finalize(st);
     return n;
+}
+
+/* GET_PROFILE over the wire: my own, asked as 0, comes back whole, the phone
+ * with it; someone else asking for mine gets it without the phone. Answered to
+ * the asking connection only. */
+static void test_get_profile(int port, const uint8_t *pin) {
+    client a, s;
+    uint64_t ua = 0, us = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 &&
+          do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(client_open(&s, port, pin) == 0 && do_handshake(&s) == 0 &&
+          do_auth(&s, "sid", "pw-sid", &us) == 0);
+    uint8_t buf[512]; oc_wbuf w; oc_header h; oc_rbuf p;
+    oc_set_profile sp;
+    memset(&sp, 0, sizeof sp);
+    sp.full_name = oc_slice_str("Alice Liddell");
+    sp.phone = oc_slice_str("+1 555 0100");
+    sp.timezone = oc_slice_str("Europe/London");
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_set_profile(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_PROFILE_INFO, &h, &p) == 0);          /* the save's own answer */
+
+    oc_get_profile gp = { 0 };
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_get_profile(&w, OC_PROTOCOL_VERSION, &gp) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
+    oc_profile_info pi;
+    CHECK(read_type(&a, OC_MSG_PROFILE_INFO, &h, &p) == 0 && oc_decode_profile_info(&p, &pi) == OC_OK);
+    CHECK(pi.user_id == ua && pi.phone.len == 11 && memcmp(pi.phone.ptr, "+1 555 0100", 11) == 0);
+    CHECK(pi.timezone.len == 13 && memcmp(pi.timezone.ptr, "Europe/London", 13) == 0);
+
+    gp.user_id = ua;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_get_profile(&w, OC_PROTOCOL_VERSION, &gp) == OC_OK && write_all(&s.conn, buf, w.len) == 0);
+    CHECK(read_type(&s, OC_MSG_PROFILE_INFO, &h, &p) == 0 && oc_decode_profile_info(&p, &pi) == OC_OK);
+    CHECK(pi.user_id == ua && pi.phone.len == 0);
+    CHECK(pi.full_name.len == 13 && memcmp(pi.full_name.ptr, "Alice Liddell", 13) == 0);
+    client_close(&s);
+    client_close(&a);
+}
+
+/* A message folded away (SET_COLLAPSED) is told to every connection of the
+ * person who folded it -- the one that asked and their other device -- and to
+ * nobody else; opening it is told the same way. */
+static void test_collapsed_sync(int port, const uint8_t *pin) {
+    client a1, a2, other;
+    uint64_t ua = 0, uo = 0;
+    CHECK(client_open(&a1, port, pin) == 0 && do_handshake(&a1) == 0 && do_auth(&a1, "sid", "pw-sid", &ua) == 0);
+    CHECK(client_open(&a2, port, pin) == 0 && do_handshake(&a2) == 0 && do_auth(&a2, "sid", "pw-sid", &ua) == 0);
+    CHECK(client_open(&other, port, pin) == 0 && do_handshake(&other) == 0 &&
+          do_auth(&other, "alice", "pw-alice", &uo) == 0);
+    uint8_t idem[OC_IDEM_SIZE]; memset(idem, 0x6D, sizeof idem);
+    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send sd = {0}; sd.channel_id = 1; memcpy(sd.idem, idem, OC_IDEM_SIZE);
+    sd.body = oc_slice_str("a long log to fold");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK && write_all(&a1.conn, buf, w.len) == 0);
+    oc_header h; oc_rbuf p;
+    CHECK(read_type(&a1, OC_MSG_SEND_ACK, &h, &p) == 0);
+    oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK);
+
+    for (int on = 1; on >= 0; on--) {
+        oc_set_collapsed sc = { ack.message_id, (uint8_t)on }, got;
+        oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_set_collapsed(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK && write_all(&a1.conn, buf, w.len) == 0);
+        CHECK(read_type(&a1, OC_MSG_COLLAPSED_UPDATED, &h, &p) == 0 && oc_decode_set_collapsed(&p, &got) == OC_OK);
+        CHECK(got.message_id == ack.message_id && got.on == on);
+        CHECK(read_type(&a2, OC_MSG_COLLAPSED_UPDATED, &h, &p) == 0 && oc_decode_set_collapsed(&p, &got) == OC_OK);
+        CHECK(got.message_id == ack.message_id && got.on == on);
+    }
+    /* alice heard the message, and nothing of its folding: her next frame,
+     * asked for now, is the answer to her own question. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_list_saved(&w, OC_PROTOCOL_VERSION) == OC_OK && write_all(&other.conn, buf, w.len) == 0);
+    int heard = 0;
+    for (;;) {
+        if (read_frame(&other, &h, &p) != 0) break;
+        if (h.msg_type == OC_MSG_COLLAPSED_UPDATED) heard = 1;
+        if (h.msg_type == OC_MSG_SAVED) break;
+    }
+    CHECK(!heard);
+    client_close(&other); client_close(&a2); client_close(&a1);
 }
 
 /* One device signed out on its own (REQ-182): its connection closes, the list
@@ -3581,6 +3700,38 @@ static void test_web_signin(void) {
          * checked, by its constant) must be true of both. */
         CHECK(oc_test_page_is(resp, "reset") && oc_test_page_error(resp, "reset-spent"));
         CHECK(strstr(oc_page_err_text(OC_PERR_RESET_SPENT), "link") == NULL);
+    }
+
+    /* A reset's new password may not be built on the account's username, as at
+     * sign-up and on a change (AUTH.md §2). Only the writer knows whose reset it
+     * is; refused, the token is not spent. A name of four or more characters,
+     * since shorter ones are not checked. */
+    {
+        uint8_t raw[32], hash[32];
+        char hex[65], body[256];
+        for (int i = 0; i < 32; i++) raw[i] = (uint8_t)(0xD0 + i);
+        for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", raw[i]);
+        mbedtls_sha256(raw, sizeof raw, hash, 0);
+        sqlite3 *db = NULL;
+        CHECK(sqlite3_open(tpath("itest_web.db"), &db) == SQLITE_OK);
+        sqlite3_busy_timeout(db, 5000);
+        CHECK(sqlite3_exec(db, "INSERT INTO users(subject, display_name, created_at_ms) "
+                               "VALUES('local:petra', 'petra', 1);", NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db, "INSERT INTO credential_resets(token_hash, user_id, created_by, created_at_ms, "
+                               "expires_at_ms) SELECT ?, id, id, 1, 9000000000000 FROM users WHERE subject='local:petra';",
+                           -1, &st, NULL);
+        sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
+        CHECK(sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1);
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+        snprintf(body, sizeof body, "t=%s&password=petra-ember-glacier&confirm=petra-ember-glacier", hex);
+        CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(oc_test_page_is(resp, "reset") && oc_test_page_error(resp, "pw-personal") && strstr(resp, hex) != NULL);
+        /* Not spent: the same token takes a good password. */
+        snprintf(body, sizeof body, "t=%s&password=quartz-meadow-lantern&confirm=quartz-meadow-lantern", hex);
+        CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(oc_test_page_is(resp, "reset-done") && oc_test_page_result(resp, "password-set"));
     }
 
     /* Opened by the person's own client, the reset page carries its sign-in and,
@@ -6417,7 +6568,7 @@ static void test_send_rate_limit(int port, const uint8_t *pin) {
     /* Fire OC_SEND_RATE_MAX + 5 sends back-to-back (one window). The first
      * OC_SEND_RATE_MAX are accepted (each -> SEND_ACK + BROADCAST to us), the
      * rest are rejected (each -> one ERROR). */
-    const int max = 30;   /* mirrors OC_SEND_RATE_MAX in netloop.c */
+    const int max = (int)OC_SEND_RATE_MAX;   /* config.h */
     const int over = 5;
     for (int i = 0; i < max + over; i++) {
         uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
@@ -6444,6 +6595,57 @@ static void test_send_rate_limit(int port, const uint8_t *pin) {
     CHECK(acks == max && bcasts == max && limited == over);
 
     client_close(&a);
+}
+
+/* Development mode's OPENCHIME_DEV_SEND_RATE=0 lifts the send cap (a fixture
+ * that seeds many messages): a burst past OC_SEND_RATE_MAX is taken in full, on
+ * a loop of its own, which reads the setting when it starts. */
+static void test_send_rate_unlimited(void) {
+    oc_tls_server srv;
+    uint8_t pin[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0 && oc_tls_server_fingerprint(&srv, pin) == 0);
+    db_unlink("itest_sendrate.db");
+    oc_dbwriter *dbw = oc_dbwriter_start(tpath("itest_sendrate.db"));
+    CHECK(dbw != NULL);
+    if (!dbw) { oc_tls_server_free(&srv); return; }
+    oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
+    CHECK(oc_dbwriter_register_local(dbw, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
+    setenv("OPENCHIME_DEV_SEND_RATE", "0", 1);
+    struct loop_arg la; pthread_t th;
+    int port = start_loop(&la, &th, &srv, dbw, 0);
+    unsetenv("OPENCHIME_DEV_SEND_RATE");
+    CHECK(port != 0);
+    if (!port) { oc_dbwriter_stop(dbw); oc_tls_server_free(&srv); return; }
+    client a;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    const int n = (int)OC_SEND_RATE_MAX + 5;
+    for (int i = 0; i < n; i++) {
+        uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_send s = {0}; s.channel_id = 1;
+        memset(s.idem, 0, OC_IDEM_SIZE); s.idem[0] = (uint8_t)i; s.idem[1] = 0x6B;
+        s.body = oc_slice_str("seed");
+        CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+    }
+    int acks = 0, limited = 0;
+    for (int i = 0; i < n * 2; i++) {
+        oc_header hdr; oc_rbuf p;
+        if (read_frame(&a, &hdr, &p) != 0) break;
+        if (hdr.msg_type == OC_MSG_SEND_ACK) acks++;
+        else if (hdr.msg_type == OC_MSG_ERROR) {
+            oc_error e;
+            if (oc_decode_error(&p, &e) == OC_OK && e.code == OC_ERR_SEND_RATE_LIMITED) limited++;
+        }
+    }
+    CHECK(acks == n && limited == 0);
+    client_close(&a);
+    stop_loop(&la, th);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    db_unlink("itest_sendrate.db");
 }
 
 /* Count the frames `c` receives of `type` (for an ERROR, only those with
@@ -6498,6 +6700,89 @@ static int count_frames(client *c, uint16_t type, uint16_t code, uint64_t from_u
 
 /* Everything `c` has sent so far has been handled: its fence is answered. */
 static int fenced(client *c) { return count_frames(c, 0, 0, 0, NULL, 1, 0) == 0; }
+
+/* A SEND or SEND_REPLY frame by hand (PROTOCOL.md §2, §5.1, §5.10), for a body
+ * past what oc_encode_send will write: `parent` != 0 makes it a SEND_REPLY.
+ * Returns the frame's length. */
+static size_t raw_send_frame(uint8_t *buf, uint64_t channel, const uint8_t idem[OC_IDEM_SIZE],
+                             uint64_t parent, size_t body_len) {
+    size_t n = 8;
+    for (int i = 7; i >= 0; i--) buf[n++] = (uint8_t)(channel >> (i * 8));
+    memcpy(buf + n, idem, OC_IDEM_SIZE); n += OC_IDEM_SIZE;
+    if (parent) for (int i = 7; i >= 0; i--) buf[n++] = (uint8_t)(parent >> (i * 8));
+    buf[n++] = (uint8_t)(body_len >> 24); buf[n++] = (uint8_t)(body_len >> 16);
+    buf[n++] = (uint8_t)(body_len >> 8);  buf[n++] = (uint8_t)body_len;
+    memset(buf + n, 'x', body_len); n += body_len;
+    if (!parent) { memset(buf + n, 0, 16); n += 16; }   /* SEND's forward source, 0/0 */
+    uint32_t len = (uint32_t)(n - 4);
+    uint16_t type = parent ? OC_MSG_SEND_REPLY : OC_MSG_SEND;
+    buf[0] = (uint8_t)(len >> 24); buf[1] = (uint8_t)(len >> 16); buf[2] = (uint8_t)(len >> 8); buf[3] = (uint8_t)len;
+    buf[4] = (uint8_t)(OC_PROTOCOL_VERSION >> 8); buf[5] = (uint8_t)OC_PROTOCOL_VERSION;
+    buf[6] = (uint8_t)(type >> 8); buf[7] = (uint8_t)type;
+    return n;
+}
+
+/* A body past OC_MAX_BODY_SIZE is refused with a non-fatal BODY_TOO_LARGE naming
+ * its idempotency token, and nothing is stored or broadcast; one of exactly the
+ * cap is taken; the connection goes on (PROTOCOL.md §5.1). */
+static void test_send_body_limit(int port, const uint8_t *pin) {
+    client a;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    static uint8_t big[OC_MAX_FRAME_SIZE];
+    uint8_t idem[OC_IDEM_SIZE];
+
+    /* One byte over, as SEND: one ERROR, nothing else. */
+    memset(idem, 0, sizeof idem); idem[0] = 0xB1;
+    CHECK(send_frame(&a, big, raw_send_frame(big, 1, idem, 0, OC_MAX_BODY_SIZE + 1)) == 0);
+    oc_header hdr; oc_rbuf p; oc_error e;
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+    CHECK(oc_decode_error(&p, &e) == OC_OK && e.code == OC_ERR_BODY_TOO_LARGE && e.fatal == 0 &&
+          e.context.len == OC_IDEM_SIZE && memcmp(e.context.ptr, idem, OC_IDEM_SIZE) == 0);
+    CHECK(fenced(&a));   /* no SEND_ACK, no BROADCAST */
+
+    /* Exactly the cap is taken: acknowledged and broadcast. */
+    memset(idem, 0, sizeof idem); idem[0] = 0xB2;
+    CHECK(send_frame(&a, big, raw_send_frame(big, 1, idem, 0, OC_MAX_BODY_SIZE)) == 0);
+    uint64_t parent = 0; int acked = 0, heard = 0;
+    for (int i = 0; i < 2; i++) {
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) {
+            oc_send_ack ack;
+            if (oc_decode_send_ack(&p, &ack) == OC_OK && memcmp(ack.idem, idem, OC_IDEM_SIZE) == 0) {
+                acked = 1; parent = ack.message_id;
+            }
+        } else if (hdr.msg_type == OC_MSG_BROADCAST) heard = 1;
+    }
+    CHECK(acked && heard && parent != 0);
+
+    /* One byte over, as SEND_REPLY to that message: the same refusal. */
+    memset(idem, 0, sizeof idem); idem[0] = 0xB3;
+    CHECK(send_frame(&a, big, raw_send_frame(big, 1, idem, parent, OC_MAX_BODY_SIZE + 1)) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+    CHECK(oc_decode_error(&p, &e) == OC_OK && e.code == OC_ERR_BODY_TOO_LARGE && e.fatal == 0 &&
+          e.context.len == OC_IDEM_SIZE && memcmp(e.context.ptr, idem, OC_IDEM_SIZE) == 0);
+    CHECK(fenced(&a));   /* no SEND_ACK, no THREAD_REPLY */
+
+    /* The connection goes on: a short SEND is acknowledged. */
+    memset(idem, 0, sizeof idem); idem[0] = 0xB4;
+    uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0}; s.channel_id = 1; memcpy(s.idem, idem, OC_IDEM_SIZE); s.body = oc_slice_str("after");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    acked = 0;
+    for (int i = 0; i < 2 && !acked; i++) {
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) {
+            oc_send_ack ack;
+            acked = oc_decode_send_ack(&p, &ack) == OC_OK && memcmp(ack.idem, idem, OC_IDEM_SIZE) == 0;
+        }
+    }
+    CHECK(acked);
+
+    client_close(&a);
+}
 
 static void set_read_timeout(client *c, int ms) {
     struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
@@ -7933,6 +8218,9 @@ int run_netloop_tests(void) {
         test_concurrent_load(arg.port, pin);
         test_login_bound(arg.port, pin);
         test_send_rate_limit(arg.port, pin);
+        test_send_body_limit(arg.port, pin);
+        test_send_rate_unlimited();
+        test_deactivate_self_wire();
         test_out_buffer_cap(arg.port, pin, dbw, flooder);
         test_admin_vertical(arg.port, pin);
         test_revoke_other_devices(arg.port, pin);
@@ -7940,6 +8228,8 @@ int run_netloop_tests(void) {
         test_unauthed_closed(arg.port, pin);
         test_reset_frame(arg.port, pin);
         test_revoke_one_session(arg.port, pin);
+        test_get_profile(arg.port, pin);
+        test_collapsed_sync(arg.port, pin);
         test_groups_vertical(arg.port, pin);
         test_groups_unasked(arg.port, pin);
         test_http_stack();

@@ -213,8 +213,10 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 32** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 33** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 33 appended `family`, `actor_id` and `action` to `AUDIT_QUERY`, filters the
+> daemon applies (§5.16c). Version
 > 32 gave the byte version 31 put in `BROADCAST` (and so `MSG_RESTORED`) and
 > `THREAD_REPLY`, ahead of the body, a new meaning: `broadcast_stored`, whether
 > the send stored a broadcast mention for the message, whatever its body says
@@ -545,14 +547,10 @@ connection before the first ack is therefore safely retryable with the same
 token.
 
 Errors: `UNKNOWN_CHANNEL`, `NOT_A_MEMBER` (REQ-031),
-`SEND_RATE_LIMITED` (REQ-190) — all non-fatal `ERROR` frames carrying the
+`SEND_RATE_LIMITED` (REQ-190), `BODY_TOO_LARGE` (a body longer than
+`MAX_BODY_SIZE`, refused before anything is stored, so no `SEND_ACK` or
+`BROADCAST` follows) — all non-fatal `ERROR` frames carrying the
 offending `idempotency_token` in `context` (§8) so the client can correlate.
-
-**The body's size is not checked on `SEND` today.** `BODY_TOO_LARGE` (3001) is
-defined but the daemon does not send it: a body longer than `MAX_BODY_SIZE` that
-still fits in a frame is stored and answered with `SEND_ACK`, and the
-`BROADCAST` encoder then refuses it, so the message reaches no other member. A
-client must not send a body over `MAX_BODY_SIZE`.
 
 ### 5.2 `SEND_ACK` (server → client), msg_type `0x0021`
 
@@ -1005,7 +1003,8 @@ address — one `@`, a local part of at most 64 bytes with no spaces, controls o
 list separators, a domain of two or more dot-separated labels, 254 bytes in all
 (`oc_email_plausible`, which clients share) — or the invite is refused with
 `FORBIDDEN`. An invite bound to an address needs a
-source that could spend it: where the deployment offers no provider sign-in, it is
+source that could spend it, a provider sign-in through the relay or a direct
+connection: where the deployment offers neither, it is
 refused with the non-fatal `ERROR INVITE_UNREDEEMABLE` (3031), whose message says
 to invite with a token instead. A client reads which kinds are possible from
 `AUTH_CHALLENGE`: a `local` source redeems a token, a browser source an address.
@@ -1061,8 +1060,17 @@ Clients show them as **(deactivated)**, from `USER_LIST`'s and `USER_UPDATED`'s
 the actor's as its ack; the removed user's live connections receive it and are
 then dropped.
 
-`SET_ROLE`/`INVITE_USER`/`REMOVE_USER` failures are non-fatal `ERROR` frames
-(`FORBIDDEN`, `LAST_OWNER`, `INVITE_UNREDEEMABLE`, `INTERNAL`).
+**`DEACTIVATE_SELF` (client → server), msg_type `0x0115`**, no payload — a
+person deactivates their own account. The result is exactly a removal's: the
+same rows dropped and kept, the same `USER_UPDATED` (`disabled=1`) to every
+signed-in connection, and every connection of theirs, this one among them,
+dropped. The audit log records it as their own act (`account.deactivate_self`,
+beside a removal's `user.remove`). The workspace's last active owner is refused
+with `LAST_OWNER`: another owner is needed first. The way back is a removed
+account's, `ENABLE_USER` by an owner or admin.
+
+`SET_ROLE`/`INVITE_USER`/`REMOVE_USER`/`DEACTIVATE_SELF` failures are non-fatal
+`ERROR` frames (`FORBIDDEN`, `LAST_OWNER`, `INVITE_UNREDEEMABLE`, `INTERNAL`).
 
 ### 5.9 Reactions (REQ-070, REQ-071)
 
@@ -1254,6 +1262,18 @@ usually far outside loaded history — and, last, an `action` byte (REQ-058,
 §5.16l): `1` when the message is an action, its body then being the action text. Entries whose channel you have since left are
 omitted: leaving a channel must stop it leaking through your saved list.
 
+**`SET_COLLAPSED` (client → server), msg_type `0x0117`** `{ message_id: u64, on: u8 }`
+folds a message away for you (`1`), or opens it again (`0`). A message in a
+channel you are a member of (`NOT_A_MEMBER` otherwise), not a tombstone
+(`UNKNOWN_MESSAGE`). The set is yours on every device: **`COLLAPSED_UPDATED`
+(`0x0118`)** `{ message_id: u64, on: u8 }` goes to **each of your connections**,
+the one that asked among them, and to nobody else. Backfill replays your folded
+messages among those it sends, as one `COLLAPSED_UPDATED` each, after their
+saved state. Folding twice, or opening one that is open, changes nothing and is
+answered the same. A delete takes the message's folds with it. (A message long
+enough to be folded *for everyone* is the client's rule, CLIENT.md, and is not
+on the wire.)
+
 **`LIST_ACTIVITY` (`0x0067`)** `{ filter: u8 }` streams **`ACTIVITY_ENTRY`
 (`0x0068`)** newest first, then **`ACTIVITY` (`0x0069`)** `{ count: u32,
 seen_at: u64 }`. `filter` is `0` involved-me (the original question) · `1` unread
@@ -1395,7 +1415,8 @@ thread:
 `SEND_REPLY`/`LIST_THREAD` failures are non-fatal `ERROR` frames:
 `UNKNOWN_MESSAGE` (no such parent, or, for `SEND_REPLY`, it is tombstoned —
 `LIST_THREAD` still lists the replies under a deleted root), `NOT_A_MEMBER` /
-`UNKNOWN_CHANNEL` (cannot post to / read the channel).
+`UNKNOWN_CHANNEL` (cannot post to / read the channel), and, for `SEND_REPLY`,
+`BODY_TOO_LARGE` with its `idempotency_token` in `context`, as on `SEND` (§5.1).
 
 A `THREAD_REPLY` also drives a notify decision (REQ-061): the reply's root goes
 to the push emitter with it, which notifies the thread's **participants** —
@@ -2052,11 +2073,16 @@ retention/eviction policy, and cumulative reclamation counts **by reason** (orph
     last_reclaim_ms (u64), max_age_days (u64), reserve_bytes (u64),
     evict_enabled (u8), under_pressure (u8)
 
-**`AUDIT_QUERY` (C → S), `0x0099`** `{ before_ms: u64, limit: u16 }` — pages the
-audit log (REQ-251). `before_ms` pages **backwards from a timestamp** rather than
-by offset, so a page boundary stays stable as new entries arrive; `0` asks for the
-newest page. `limit` is the page size: `0` means 50, and more than
-`OC_AUDIT_PAGE_MAX` (200) is cut to 200.
+**`AUDIT_QUERY` (C → S), `0x0099`** `{ before_ms: u64, limit: u16, family: u8,
+actor_id: u64, action: str }` — pages the audit log (REQ-251). `before_ms` pages
+**backwards from a timestamp** rather than by offset, so a page boundary stays
+stable as new entries arrive; `0` asks for the newest page. `limit` is the page
+size: `0` means 50, and more than `OC_AUDIT_PAGE_MAX` (200) is cut to 200.
+`family` (`0` any, else 1–4 as on `AUDIT_PAGE`), `actor_id` (`0` any) and
+`action` (empty for any; an exact match, not a pattern) **narrow the page in the
+daemon**, so a page holds only matching entries however sparse they are, and
+paging back by `before_ms` keeps the filter. The three filter fields since
+protocol 33.
 
 **`AUDIT_PAGE` (S → C), `0x009A`** — a page of entries, newest first: time,
 family (admin / account / security / moderation), action, actor, target, outcome,
@@ -2152,6 +2178,13 @@ feed and the reader's highlight all keep working unchanged — and it is matched
 notified on. Priority people pierce a level and a pause but never a mute
 (REQ-135/137).
 
+**Email notifications** (REQ-365–367, ARCH-125/126) will add frames beside
+these: reading and setting a person's mention email and digest, an owner's or
+admin's workspace switches and member defaults, and telling a client the state
+of each of the three levels so it can name the one that is off. They will be
+specified in a subsection of §5.16 of their own as they are built; the design
+they follow is [EMAIL.md](./EMAIL.md) §2.
+
 ### 5.16e Profile depth: custom status, title, timezone and avatar
 
 **`SET_STATUS` (C → S), `0x006F`** — Set or clear my transient custom status. (REQ-241, REQ-122)
@@ -2172,7 +2205,11 @@ thing they did, and is a different fact from never having set it.
 
     attachment_id (u64)
 
-**`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to any of SET_STATUS / SET_PROFILE / SET_AVATAR / SET_EMAIL. The reply to SET_PROFILE and SET_EMAIL goes to every connection of the person who saved it, so their other devices show the change at once. (REQ-240, REQ-241)
+**`GET_PROFILE` (C → S), `0x0116`** — A member's whole profile, `user_id` 0 for mine; answered with `PROFILE_INFO` to this connection alone. Any member may ask for any member's (the roster is everyone's, REQ-030), but `phone`, the one field the roster does not carry, is filled only in one's own. `SET_PROFILE` replaces every field, so a client that changes one — the terminal client setting its voice — fetches first and sends the rest back as they were.
+
+    user_id (u64)
+
+**`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to any of SET_STATUS / SET_PROFILE / SET_AVATAR / SET_EMAIL / GET_PROFILE. The reply to SET_PROFILE and SET_EMAIL goes to every connection of the person who saved it, so their other devices show the change at once. (REQ-240, REQ-241)
 
     user_id (u64), display_name (str), email (str), status_emoji (str), status_text (str), status_expires (u64), title (str), timezone (str), avatar_id (u64), role (u8), full_name (str), pronouns (str), phone (str), voice_id (str)
 
@@ -2184,11 +2221,12 @@ a client that is not running cannot clear its own status.
 
 `SET_AVATAR` takes an **attachment id, never bytes**, so the upload path's dedup,
 size cap and reclamation all keep working. The id is validated rather than
-trusted: it must exist, have a non-zero size (the size declared at `UPLOAD_BEGIN`; the
-daemon does not check that the upload finished), carry an `image/*` MIME type, **and have
-been uploaded by the caller**. That last check is load-bearing — avatars are
-readable workspace-wide, so without it a member could point their avatar at
-somebody else's private-channel attachment.
+trusted: it must exist, be finished (its bytes arrived) and not reclaimed, carry an
+`image/*` MIME type, **and have been uploaded by the caller**. An unknown, unfinished,
+reclaimed, non-image or another person's attachment is refused with the non-fatal
+`UNKNOWN_ATTACHMENT` (3011), and the avatar is left as it was. The ownership check is
+load-bearing — avatars are readable workspace-wide, so without it a member could point
+their avatar at somebody else's private-channel attachment.
 
 ### 5.16f Drafts and scheduled messages
 
@@ -2323,7 +2361,8 @@ client never offers an action that would fail.
 
     count (u16), then count x { invite_id (u64), role (u8), created_at (u64), expires_at (u64), created_by (u64), uses (u16), used (u16) }
 
-`created_at` is always `0`: the daemon does not store when an invite was made.
+`created_at` is when the invite was made, ms since epoch UTC as `expires_at` is;
+`0` for an invite made before the daemon recorded the time (SCHEMA.md §3bh).
 `uses` is how many may redeem it (`0`: no limit) and `used` how many have (REQ-026);
 an invite leaves the list when its last use is taken.
 
@@ -3161,7 +3200,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `2010` | `AUTH_DENIED` | auth   | no    | A device code refused on the page. |
 | `2011` | `AUTH_USE_PROVIDER` | auth | yes | A sign-in by emailed code for a person who signs in here with a provider; they sign in with that provider instead (AUTH.md §8.4). |
 | `2012` | `AUTH_SETUP_REQUIRED` | auth | — | Pages only: a local account with no second step where `OPENCHIME_MFA=required` (AUTH.md §8.6). |
-| `3001` | `BODY_TOO_LARGE`      | messaging  | no    | Defined for a `SEND` body over `MAX_BODY_SIZE`, but not sent by the daemon today: such a body is stored and acked, and not broadcast (§5.1). |
+| `3001` | `BODY_TOO_LARGE`      | messaging  | no    | A `SEND` or `SEND_REPLY` body over `MAX_BODY_SIZE`; nothing is stored, and the token is in `context` (§5.1). |
 | `3002` | `NOT_A_MEMBER`        | messaging  | no    | Sender is not a member of the target channel (REQ-031).        |
 | `3003` | `UNKNOWN_CHANNEL`     | messaging  | no    | `channel_id` does not exist in this tenant.                    |
 | `3004` | `SEND_RATE_LIMITED`   | messaging  | no    | Per-connection rate exceeded (REQ-190): sends; also reactions (§5.9), poll votes, encrypted-DM (`PDM_*`) frames, voice-input segments and call signalling (§5.17). |
@@ -3191,7 +3230,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3028` | `CALL_FULL`           | calls      | no    | A join, a start's invitations or a `CALL_INVITE` would put the call past the cap (§5.17, REQ-305). |
 | `3029` | `NOT_CALL_STARTER`    | calls      | no    | `CALL_END` from someone other than the call's starter (§5.17). |
 | `3030` | `NOT_IN_CALL`         | calls      | no    | No call in that conversation, or the sender is not in it (`CALL_INVITE`, `CALL_END`, `CALL_KEY`, `CALL_SHARE`). |
-| `3031` | `INVITE_UNREDEEMABLE` | admin      | no    | `INVITE_USER` carried an email where no sign-in source could ever spend an invite bound to one: the deployment offers no provider sign-in (§5.8). |
+| `3031` | `INVITE_UNREDEEMABLE` | admin      | no    | `INVITE_USER` carried an email where no sign-in source could ever spend an invite bound to one: the deployment offers no provider sign-in, neither the relay nor a direct connection (§5.8). |
 | `3032` | `GROUP_HANDLE_TAKEN`  | groups     | no    | A group, a person or a broadcast word already answers to that `@name`: a create, an update, or a rename (`SET_DISPLAY_NAME`) (§5.16k). |
 | `3033` | `UNKNOWN_GROUP`       | groups     | no    | No such group. |
 | `3034` | `MEMBER_VIA_GROUP`    | groups     | no    | `LEAVE_CHANNEL` or `REMOVE_FROM_CHANNEL` for someone in the channel only through a group (§5.16k). |
@@ -3467,6 +3506,10 @@ this table cannot silently gain a shared value.
 | `0x0112` | `LIST_POLL_VOTERS` | C → S | who picked what on a poll |
 | `0x0113` | `POLL_VOTERS` | S → C | the answer; refused for an anonymous poll |
 | `0x0114` | `EDIT_POLL` | C → S | the author changes a poll: options and settings until the first vote, the deadline always |
+| `0x0115` | `DEACTIVATE_SELF` | C → S | deactivate my own account, as a removal does (REQ-033) |
+| `0x0116` | `GET_PROFILE` | C → S | a member's whole profile, 0 for mine; answered with `PROFILE_INFO`, the phone in one's own only |
+| `0x0117` | `SET_COLLAPSED` | C → S | fold a message away for me, or open it again |
+| `0x0118` | `COLLAPSED_UPDATED` | S → C | to each of my connections: a message folded or opened; replayed in backfill |
 | `0x0119` | `WORKSPACE_SETTINGS` | S → C | read-only: the workspace's settings clients act on, after `WORKSPACE_INFO` |
 | `0x011A` | `READ_RECEIPTS` | both | whether I share my read receipts: set or ask, and told |
 

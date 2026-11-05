@@ -57,8 +57,15 @@ typedef struct {
     unsigned next;
 } oc_stt_sent;
 
+/* A voice change waiting for my whole profile (oc_client_set_voice): the
+ * GET_PROFILE has gone, and the PROFILE_INFO for `me` that answers it is sent
+ * back as SET_PROFILE with this voice. Kept across a reconnect, which asks
+ * again, so a dropped link does not lose the choice. */
+typedef struct { uint64_t me; int on; char voice[96]; } prof_pending;
+
 struct oc_net {
     oc_thread_t   thread;
+    prof_pending  pp;
     /* How many sends are queued on THIS connection, published by its own net
      * thread for the UI thread to read (obox_publish). One per oc_net: a global
      * made every signed-in workspace report whichever thread published last. */
@@ -265,8 +272,14 @@ static int do_handshake(oc_tls_conn *c, int fd, atomic_int *stop) {
     }
 }
 
+/* Frames written, on every connection of this process: what a test checks to say
+ * nothing was sent (oc_net_frames_written). */
+static atomic_ullong g_frames_written;
+unsigned long long oc_net_frames_written(void) { return atomic_load(&g_frames_written); }
+
 /* Write all bytes, waiting on the socket as needed. 0 ok, -1 error. */
 static int write_all(oc_tls_conn *c, int fd, const uint8_t *buf, size_t len, atomic_int *stop) {
+    atomic_fetch_add(&g_frames_written, 1);
     size_t sent = 0;
     while (sent < len) {
         if (*stop) return -1;
@@ -408,6 +421,7 @@ typedef struct {
     uint64_t     held_id;
     int          holding;
     oc_pdm      *pdm;         /* private DMs (PRIVATE-DM.md) */
+    prof_pending *pp;         /* a voice change waiting for my profile (NULL: none here) */
 } disp_ctx;
 
 /* Hand on whatever is held, in the order it arrived. */
@@ -1307,6 +1321,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (e) { e->message_id = su.message_id; e->op = su.op;
                          e->pinned_at = su.saved_at; oc_queue_push(to_ui, e); }
             }
+        } else if (hdr.msg_type == OC_MSG_COLLAPSED_UPDATED) {
+            oc_set_collapsed sc;
+            if (oc_decode_set_collapsed(&p, &sc) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_COLLAPSED);
+                if (e) { e->message_id = sc.message_id; e->op = sc.on; oc_queue_push(to_ui, e); }
+            }
         } else if (hdr.msg_type == OC_MSG_SAVED_MSG) {
             oc_saved_msg sm;
             if (oc_decode_saved_msg(&p, &sm) == OC_OK) {
@@ -1591,6 +1611,13 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->body = malloc(se[i].snippet.len + 1);
                 if (e->body) { memcpy(e->body, se[i].snippet.ptr, se[i].snippet.len); e->body[se[i].snippet.len] = '\0'; }
                 oc_queue_push(to_ui, e);
+            }
+            /* A page with no rows still ends a page: one event, message_id 0,
+             * so the model learns that a "load more" found nothing and stops
+             * offering another. */
+            if (count == 0) {
+                oc_ev *e = oc_ev_new(OC_EV_SEARCH_RESULT);
+                if (e) { e->status = trunc; oc_queue_push(to_ui, e); }
             }
         } else if (hdr.msg_type == OC_MSG_POLL) {
             /* A poll's definition and tallies (REQ-225). It follows its
@@ -2383,6 +2410,16 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     (void)k;
                 }
                 oc_queue_push(to_ui, e);
+            }
+            /* My whole profile, asked for so one field can change: sent back
+             * as it came, with the voice waiting for it. */
+            if (ctx->pp && ctx->pp->on && ctx->pp->me && pi.user_id == ctx->pp->me) {
+                uint8_t sbuf[1024]; oc_wbuf sw; oc_wbuf_init(&sw, sbuf, sizeof sbuf);
+                oc_set_profile sp = { pi.full_name, pi.title, pi.pronouns, pi.phone, pi.timezone,
+                                      oc_slice_str(ctx->pp->voice) };
+                if (oc_encode_set_profile(&sw, ctx->version, &sp) == OC_OK &&
+                    write_all(ctx->conn, ctx->fd, sbuf, sw.len, ctx->stop) == 0)
+                    ctx->pp->on = 0;
             }
         } else if (hdr.msg_type == OC_MSG_INVITE_LIST) {
             /* Cap-safe like the webhook list above: the decoder drains the
@@ -3198,6 +3235,7 @@ static int run_connection(oc_net *n, int reconnecting,
         }
         push_simple(n->to_ui, OC_EV_CONNECTED, ok.user_id);
         push_simple(n->to_ui, OC_EV_AUTH_OK, ok.user_id);
+        n->pp.me = ok.user_id;
         oc_callsig_authed(&n->calls, oc_model_now_ms());   /* a call to get back into is rejoined */
         oc_pdm_authed(&n->pdm, ok.user_id, cs ? cs->store : NULL, cs ? cs->workspace : NULL);
 
@@ -3212,6 +3250,14 @@ static int run_connection(oc_net *n, int reconnecting,
             oc_set_tz_offset tz = { (int16_t)oc_utc_offset_min() };
             if (oc_encode_set_tz_offset(&tw, negotiated, &tz) == OC_OK)
                 (void)write_all(&conn, fd, tb, tw.len, &n->stop);
+        }
+        /* A voice change the last connection did not finish: ask for my
+         * profile again, and the answer carries it through (prof_pending). */
+        if (n->pp.on) {
+            uint8_t gb[24]; oc_wbuf gw; oc_wbuf_init(&gw, gb, sizeof gb);
+            oc_get_profile gp = { 0 };
+            if (oc_encode_get_profile(&gw, negotiated, &gp) == OC_OK)
+                (void)write_all(&conn, fd, gb, gw.len, &n->stop);
         }
 
         /* Whether I share my read receipts (REQ-090), for the settings. */
@@ -3294,7 +3340,7 @@ static int run_connection(oc_net *n, int reconnecting,
                      cs ? cs->store : NULL, cs ? cs->obox : NULL,
                      cs ? cs->workspace : NULL, n->client_type, negotiated, &n->xq, &n->stt,
                      &n->calls, n->host, cs ? cs->workspace : NULL, n->ws_key[0] ? n->ws_key : NULL,
-                     &heldq, 0, 0, &n->pdm };
+                     &heldq, 0, 0, &n->pdm, &n->pp };
     /* Call media on the connection (PROTOCOL.md §5.17) is queued by the call
      * engine's threads, which wake this one to write it rather than leave it
      * for the next 50 ms poll. Without a wake it still goes, at that pace. */
@@ -3460,8 +3506,10 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (rr == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_AUDIT_QUERY) {
-                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_audit_query aq = { c->message_id, 50 };   /* message_id = before_ms */
+                uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                /* message_id = before_ms; op, channel_id and body the filter */
+                oc_audit_query aq = { c->message_id, 50, (uint8_t)c->op, c->channel_id,
+                                      oc_slice_str(c->body ? c->body : "") };
                 if (oc_encode_audit_query(&w, OC_PROTOCOL_VERSION, &aq) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
@@ -3532,6 +3580,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_save_item si = { c->message_id, c->op };
                 if (oc_encode_save_item(&w, OC_PROTOCOL_VERSION, &si) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_COLLAPSED) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_collapsed sc = { c->message_id, c->op };
+                if (oc_encode_set_collapsed(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_LIST_SAVED) {
@@ -3810,6 +3864,16 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &iu) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_GET_PROFILE || c->type == OC_CMD_SET_VOICE) {
+                if (c->type == OC_CMD_SET_VOICE) {
+                    snprintf(n->pp.voice, sizeof n->pp.voice, "%s", c->body ? c->body : "");
+                    n->pp.on = 1;
+                }
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_get_profile gp = { c->type == OC_CMD_SET_VOICE ? 0 : c->channel_id };
+                if (oc_encode_get_profile(&w, OC_PROTOCOL_VERSION, &gp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_ENABLE_USER) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_enable_user eu = { c->channel_id };
@@ -3820,6 +3884,11 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_reset_credential rc = { c->channel_id, (uint8_t)(c->op ? 1 : 0) };
                 if (oc_encode_reset_credential(&w, OC_PROTOCOL_VERSION, &rc) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_DEACTIVATE_SELF) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_deactivate_self(&w, OC_PROTOCOL_VERSION) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_REMOVE_USER) {

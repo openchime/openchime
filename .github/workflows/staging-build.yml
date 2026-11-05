@@ -399,8 +399,8 @@ jobs:
         uses: actions/cache@v6
         with:
           path: |
-            third_party/zig-0.13.0
-            third_party/emsdk-6.0.8
+            third_party/zig-0.17.1
+            third_party/emsdk-6.0.13
           key: toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
 
       - name: Install build dependencies
@@ -432,7 +432,7 @@ jobs:
             third_party/llamacpp-0.5.0-aarch64
             build/kitten
             build/moonshine
-          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+          key: tts-release-${{ matrix.arch }}-zig0.17.1-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
 
       # mbedTLS and libopus as this job builds them: with zig's clang against
       # glibc 2.34 for the binary that ships (the arm64 job also builds the
@@ -455,7 +455,7 @@ jobs:
             third_party/mbedtls-3.6.2-aarch64
             third_party/opus-1.6.1
             third_party/opus-1.6.1-aarch64
-          key: vendor-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/opus.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
+          key: vendor-release-${{ matrix.arch }}-zig0.17.1-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/opus.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
 
       # The web client's libraries (docs/WEB.md): the daemon is never built
       # without the client it serves -- the page and loader are compiled into it
@@ -470,7 +470,7 @@ jobs:
             build/wasm/libvpx
             build/wasm/opus
             build/wasm/speexdsp
-          key: wasm-emsdk6.0.8-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/sdl3_wasm.sh', 'scripts/build/media_wasm.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
+          key: wasm-emsdk6.0.13-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/sdl3_wasm.sh', 'scripts/build/media_wasm.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
       # RELEASE=1 ARCH=...: zig's clang against glibc 2.34 for the architecture
       # asked for, every vendored library cross-built the same way (OC_ARCH to
       # the scripts), the binary stripped at the link. No header comes from the
@@ -511,7 +511,7 @@ jobs:
             third_party/llamacpp-0.5.0-aarch64
             build/kitten
             build/moonshine
-          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+          key: tts-release-${{ matrix.arch }}-zig0.17.1-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
 
       # The build-*.sh scripts take an output directory and default to a bare
       # dist/. They are deliberately left knowing nothing about the per-platform
@@ -719,7 +719,7 @@ jobs:
       - name: Restore the toolchain
         uses: actions/cache@v6
         with:
-          path: third_party/llvm-mingw-20261006
+          path: third_party/llvm-mingw-20261020
           key: toolchain-mingw-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh') }}
       - name: Restore the vendored Windows libraries
         uses: actions/cache@v6

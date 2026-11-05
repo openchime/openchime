@@ -45,7 +45,7 @@ static const GUID ST_IID_IDWriteFactory =
 static const GUID ST_IID_IDWriteInlineObject =
     { 0x8339fde3, 0x106f, 0x47ab, { 0x83, 0x73, 0x1c, 0x62, 0x95, 0xeb, 0x10, 0xb3 } };
 
-enum { ST_MAX_COLOR_RANGES = 64, ST_MAX_BOXES = 64 };
+enum { ST_MAX_COLOR_RANGES = 64 };
 
 struct st_ctx {
     IDWriteFactory      *dw;
@@ -71,9 +71,9 @@ struct st_layout {
     struct { int off, len; uint32_t rgb; float alpha; }
                         colors[ST_MAX_COLOR_RANGES];
     int                 ncolors;
-    struct { uint32_t id; int off, len; }
-                        boxes[ST_MAX_BOXES];
-    int                 nboxes;
+    struct st_dwbox { uint32_t id; int off, len; }
+                       *boxes;              /* as many as are reserved, grown */
+    int                 nboxes, boxcap;
 };
 
 /* ---- small helpers ------------------------------------------------------ */
@@ -403,6 +403,7 @@ void st_layout_destroy(st_layout *l)
         return;
     IDWriteTextLayout_Release(l->lay);
     st__map_free(&l->map);
+    free(l->boxes);
     free(l);
 }
 
@@ -470,23 +471,30 @@ void st_range_hide(st_layout *l, size_t off, size_t len)
     IDWriteTextLayout_SetFontSize(l->lay, 0.1f, st__range(l, off, len));
 }
 
-void st_range_box(st_layout *l, size_t off, size_t len, float w, float h,
-                  float baseline, uint32_t box_id)
+int st_range_box(st_layout *l, size_t off, size_t len, float w, float h,
+                 float baseline, uint32_t box_id)
 {
-    if (l->nboxes >= ST_MAX_BOXES)
-        return;
+    if (l->nboxes == l->boxcap) {
+        int cap = l->boxcap ? l->boxcap * 2 : 16;
+        struct st_dwbox *g = realloc(l->boxes, (size_t)cap * sizeof *g);
+        if (!g)
+            return 0;
+        l->boxes = g;
+        l->boxcap = cap;
+    }
     DWRITE_TEXT_RANGE r = st__range(l, off, len);
     if (!r.length)
-        return;
+        return 0;
     IDWriteInlineObject *o = ibox_create(w, h, baseline);
     if (!o)
-        return;
+        return 0;
     IDWriteTextLayout_SetInlineObject(l->lay, o, r);
     IDWriteInlineObject_Release(o);   /* the layout holds it now */
     l->boxes[l->nboxes].id = box_id;
     l->boxes[l->nboxes].off = (int)r.startPosition;
     l->boxes[l->nboxes].len = (int)r.length;
     l->nboxes++;
+    return 1;
 }
 
 int st_layout_boxes(const st_layout *l, uint32_t *ids, st_rect *rects, int cap)

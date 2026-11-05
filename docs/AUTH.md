@@ -70,9 +70,8 @@ authority.
   the common passwords of that length in SecLists' list of a million
   (`third_party/pwlist`, compiled in, compared without regard to case), not one
   character repeated, and not containing the username or the workspace's name
-  (when four characters or more) or "openchime" (a reset on `/account/reset`
-  checks every rule but the username one: it does not pass the account's
-  username to the check, which sign-up and a change do). Nothing else: spaces and every
+  (when four characters or more) or "openchime", at sign-up, on a change and on
+  a reset alike. Nothing else: spaces and every
   printable character are allowed, there are no composition rules, and a
   password never expires. The page says the rule beside the field, and why a
   password was refused. Every password, set or presented, is normalized the
@@ -636,9 +635,9 @@ An identity that matches no rule joins only through an **invite bound to its
 address** — tenant data an owner or admin creates (`INVITE_USER` carrying an
 email), consumed at that address's first verified sign-in, setting the role.
 Otherwise the answer is `AUTH_NOT_ALLOWED`, audited with the provider and tenant.
-Only a provider sign-in spends such an invite, and the daemon makes one only
-where the relay is on: elsewhere, even beside a direct connection, it refuses
-with `INVITE_UNREDEEMABLE`. What the inviter sends the invited person is the invitation
+Only a provider sign-in spends such an invite, through the relay or a direct
+connection (§8.5) alike, and the daemon makes one only where one of them is on:
+with neither, it refuses with `INVITE_UNREDEEMABLE`. What the inviter sends the invited person is the invitation
 text their client shows — the workspace, the provider and the address, the
 expiry — or, for an enrolled workspace with `OPENCHIME_INVITE_MAIL=on`, a message
 central mails (ARCH-85).

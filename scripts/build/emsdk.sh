@@ -9,7 +9,7 @@
 # emcmake and emmake. Needs git, curl and python3; about 400 MB, once.
 set -euo pipefail
 
-EMSDK_VERSION="${EMSDK_VERSION:-6.0.8}"
+EMSDK_VERSION="${EMSDK_VERSION:-6.0.13}"
 
 cd "$(dirname "$0")/../.."
 DEST="third_party/emsdk-${EMSDK_VERSION}"

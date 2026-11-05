@@ -289,7 +289,7 @@ static int addressing_tests(void) {
     printf("test_audio: relay on the daemon's socket -- prefixed tokens, answers from the address sent to, both families\n");
 
     const char *op = NULL;
-    int udp = oc_listen_bind(SOCK_DGRAM, 0, &op);
+    int udp = oc_listen_bind(SOCK_DGRAM, 0, 0, &op);
     CHECK(udp >= 0);
     if (udp < 0) return failures;
     struct sockaddr_storage self; socklen_t sl = sizeof self;

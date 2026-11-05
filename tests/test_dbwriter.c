@@ -2427,7 +2427,11 @@ static void test_index_mentions(void) {
                            /* 0067's own-schedule flag. */
                            "ALTER TABLE users DROP COLUMN dnd_own;"
                            /* 0068's read receipts. */
-                           "ALTER TABLE users DROP COLUMN share_receipts; ALTER TABLE users DROP COLUMN receipts_since_ms;",
+                           "ALTER TABLE users DROP COLUMN share_receipts; ALTER TABLE users DROP COLUMN receipts_since_ms;"
+                           /* 0069's invitation time. */
+                           "ALTER TABLE invites DROP COLUMN created_at_ms;"
+                           /* 0070's collapsed messages. */
+                           "DROP TABLE collapsed_messages;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -3526,6 +3530,175 @@ static uint16_t remove_user(oc_dbwriter *w, uint64_t actor, uint64_t target) {
     uint16_t code = (r && r->type == OC_RES_USER_UPDATED) ? 0 : (r ? r->err_code : 0xFFFF);
     oc_dbres_free(r);
     return code;
+}
+
+static uint16_t deactivate_self(oc_dbwriter *w, uint64_t who) {
+    oc_job *j = oc_job_new(OC_JOB_DEACTIVATE_SELF, 95);
+    j->user_id = who;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint16_t code = (r && r->type == OC_RES_USER_UPDATED && r->disabled && r->user_id == who) ? 0
+                  : (r ? r->err_code : 0xFFFF);
+    oc_dbres_free(r);
+    return code;
+}
+
+/* What an account holds, one count per table a deactivation touches: equal for
+ * two accounts that started alike and ended alike. */
+static void account_footprint(const char *path, uint64_t uid, int out[8]) {
+    static const char *const Q[8] = {
+        "SELECT disabled FROM users WHERE id=?1;",
+        "SELECT COUNT(*) FROM sessions WHERE user_id=?1;",
+        "SELECT COUNT(*) FROM local_credentials WHERE user_id=?1;",
+        ("SELECT COUNT(*) FROM channel_members cm JOIN channels c ON c.id=cm.channel_id "
+         " WHERE cm.user_id=?1 AND c.kind <> 'dm';"),
+        "SELECT COUNT(*) FROM device_tokens WHERE user_id=?1;",
+        "SELECT COUNT(*) FROM drafts WHERE user_id=?1;",
+        "SELECT COUNT(*) FROM scheduled_messages WHERE user_id=?1;",
+        "SELECT COUNT(*) FROM user_group_members WHERE user_id=?1;",
+    };
+    sqlite3 *db = NULL;
+    for (int i = 0; i < 8; i++) out[i] = -1;
+    if (sqlite3_open(path, &db) != SQLITE_OK) { sqlite3_close(db); return; }
+    for (int i = 0; i < 8; i++) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, Q[i], -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+            out[i] = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+}
+
+/* A person deactivates their own account (REQ-033): exactly a removal's state,
+ * recorded as their own act; the last owner is refused; and the way back is a
+ * removed account's. */
+static void test_deactivate_self(void) {
+    const char *path = tdb("deactivate_self.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t owner = reg(w, "ds-owner", "pw", OC_ROLE_OWNER);
+    uint64_t ann   = reg(w, "ds-ann", "pw-ann", OC_ROLE_MEMBER);
+    uint64_t bea   = reg(w, "ds-bea", "pw-bea", OC_ROLE_MEMBER);
+    CHECK(owner && ann && bea);
+    /* The two alike: each signed in once. */
+    uint8_t tok[OC_SESSION_TOKEN_LEN];
+    CHECK(auth_local(w, 100, "ds-ann", "pw-ann", tok, NULL) == ann);
+    CHECK(auth_local(w, 101, "ds-bea", "pw-bea", tok, NULL) == bea);
+
+    /* The last active owner may not leave without another. */
+    CHECK(deactivate_self(w, owner) == OC_ERR_LAST_OWNER);
+
+    /* ann is removed by the owner; bea deactivates herself. */
+    CHECK(remove_user(w, owner, ann) == 0);
+    CHECK(deactivate_self(w, bea) == 0);
+    oc_dbwriter_stop(w);
+    int fa[8], fb[8];
+    account_footprint(path, ann, fa);
+    account_footprint(path, bea, fb);
+    CHECK(fb[0] == 1);                                  /* disabled */
+    CHECK(fb[1] == 0 && fb[2] == 0 && fb[4] == 0);      /* signed out, no password, no devices */
+    CHECK(memcmp(fa, fb, sizeof fa) == 0);              /* row for row, a removal's state */
+
+    w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    /* Her own act, beside the removal's. */
+    CHECK(audit_saw(w, owner, "account.deactivate_self"));
+    CHECK(audit_saw(w, owner, "user.remove"));
+    /* Signing in is refused. */
+    CHECK(auth_local(w, 102, "ds-bea", "pw-bea", tok, NULL) == 0);
+    /* Twice is refused: there is nobody left to deactivate. */
+    CHECK(deactivate_self(w, bea) == OC_ERR_FORBIDDEN);
+    /* The way back is a removed account's. */
+    oc_job *j = oc_job_new(OC_JOB_ENABLE_USER, 103);
+    j->user_id = owner; j->target_user_id = bea;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_USER_UPDATED && r->disabled == 0 && r->user_id == bea);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static oc_dbres *audit_q(oc_dbwriter *w, uint64_t who, uint64_t before, uint32_t limit,
+                         uint8_t family, uint64_t actor, const char *action) {
+    oc_job *j = oc_job_new(OC_JOB_AUDIT_QUERY, 902);
+    j->user_id = who; j->audit_before_ms = before; j->audit_limit = limit;
+    j->audit_family = family; j->audit_actor = actor;
+    if (action && action[0]) oc_job_set_body(j, action, strlen(action));
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* AUDIT_QUERY's filters are applied by the daemon (PROTOCOL.md): a family
+ * sparse in recent history still fills a page, paging back by time keeps the
+ * filter, and the actor and action narrow it alone or together. */
+static void test_audit_filters(void) {
+    const char *path = tdb("audit_filters.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t owner = reg(w, "af-owner", "pw", OC_ROLE_OWNER);
+    CHECK(owner != 0);
+    {
+        sqlite3 *db = NULL;
+        CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+        sqlite3_busy_timeout(db, 5000);
+        sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+        /* Six admin rows long ago, then 300 security rows since, two actors. */
+        for (int i = 0; i < 306; i++) {
+            char sql[256];
+            int admin = i < 6;
+            snprintf(sql, sizeof sql,
+                     "INSERT INTO audit_log(at_ms, family, action, actor_id, actor_name, outcome) "
+                     "VALUES(%d, %d, '%s', %d, '%s', 1);",
+                     1000 + i, admin ? 1 : 3, admin ? "user.remove" : (i % 2 ? "auth.failure" : "auth.success"),
+                     i % 3 ? 7 : 8, i % 3 ? "seven" : "eight");
+            CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+        }
+        sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+        sqlite3_close(db);
+    }
+    /* The sparse family: all six, behind 300 newer rows of another. */
+    oc_dbres *r = audit_q(w, owner, 0, 50, 1, 0, NULL);
+    CHECK(r && r->type == OC_RES_AUDIT_PAGE && r->n_audit == 6);
+    for (size_t i = 0; r && i < r->n_audit; i++) CHECK(r->audit[i].family == 1);
+    oc_dbres_free(r);
+    /* A full page of the dense family, then the next page back, still that family. */
+    r = audit_q(w, owner, 0, 50, 3, 0, NULL);
+    CHECK(r && r->n_audit == 50);
+    uint64_t oldest = r && r->n_audit ? r->audit[r->n_audit - 1].at_ms : 0;
+    oc_dbres_free(r);
+    r = audit_q(w, owner, oldest, 50, 3, 0, NULL);
+    CHECK(r && r->n_audit == 50);
+    for (size_t i = 0; r && i < r->n_audit; i++) CHECK(r->audit[i].family == 3 && r->audit[i].at_ms < oldest);
+    oc_dbres_free(r);
+    /* The actor alone. */
+    r = audit_q(w, owner, 0, 200, 0, 8, NULL);
+    CHECK(r && r->n_audit > 0);
+    for (size_t i = 0; r && i < r->n_audit; i++) CHECK(r->audit[i].actor_id == 8);
+    oc_dbres_free(r);
+    /* The action alone: an exact match, not a pattern. */
+    r = audit_q(w, owner, 0, 200, 0, 0, "auth.failure");
+    CHECK(r && r->n_audit > 0);
+    for (size_t i = 0; r && i < r->n_audit; i++) CHECK(r->audit[i].action && strcmp(r->audit[i].action, "auth.failure") == 0);
+    oc_dbres_free(r);
+    r = audit_q(w, owner, 0, 200, 0, 0, "auth.");
+    CHECK(r && r->n_audit == 0);
+    oc_dbres_free(r);
+    /* All three together. */
+    r = audit_q(w, owner, 0, 200, 3, 7, "auth.success");
+    CHECK(r && r->n_audit > 0);
+    for (size_t i = 0; r && i < r->n_audit; i++)
+        CHECK(r->audit[i].family == 3 && r->audit[i].actor_id == 7 && strcmp(r->audit[i].action, "auth.success") == 0);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
 }
 
 static void test_admin_ops(void) {
@@ -5458,6 +5631,52 @@ static void test_shared_invite(void) {
     oc_dbwriter_stop(w);
 }
 
+/* When an invitation was made (PROTOCOL.md §5.8): INVITE_LIST carries it, in
+ * the unit of expires_at, from the moment it was minted; a row from before the
+ * column was added has none and lists as 0. */
+static void test_invite_created_at(void) {
+    const char *path = tdb("invite_created.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t owner = reg(w, "ic-owner", "pw", OC_ROLE_OWNER);
+    CHECK(owner != 0);
+    oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 1);
+    j->user_id = owner; j->role = OC_ROLE_MEMBER; j->uses = 1;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_INVITE_OK);
+    oc_dbres_free(r);
+    /* As an invitation made before the column: no creation time. */
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(sqlite3_exec(raw, "INSERT INTO invites(token_hash,created_by,role,expires_at_ms,uses) "
+                                "VALUES(x'00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff',"
+                                "NULL,'member',9000000000000,1);", NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+    j = oc_job_new(OC_JOB_LIST_INVITES, 2);
+    j->user_id = owner;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_INVITE_LIST && r->n_invites == 2);
+    int fresh = 0, old = 0;
+    for (size_t i = 0; r && i < r->n_invites; i++) {
+        const oc_invite_entry *e = &r->invites[i];
+        if (e->expires_at == 9000000000000ull) { old = 1; CHECK(e->created_at == 0); continue; }
+        /* Minted a moment before its expiry was set a week ahead. */
+        fresh = 1;
+        CHECK(e->created_at != 0 && e->created_at <= e->expires_at &&
+              e->created_at + 7ull * 24 * 60 * 60 * 1000 >= e->expires_at);
+    }
+    CHECK(fresh && old);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_invites_and_webhook_lifecycle(void) {
     const char *path = tdb("invites.db");
     cleanup_db(path);
@@ -5755,6 +5974,28 @@ static void test_status_and_profile(void) {
     /* The status set above survives a profile write: one screen's fields must
      * not clear another's. */
     CHECK(r->st_emoji && r->st_emoji[0] == '\0');
+    oc_dbres_free(r);
+
+    /* GET_PROFILE: alice's own, asked as 0, carries every field, the phone
+     * among them, so a client can send them back unchanged; bob asking for
+     * hers gets the same profile without the phone, which is hers alone. */
+    uint64_t bob = reg(w, "st-bob", "pw", OC_ROLE_MEMBER);
+    CHECK(bob);
+    j = oc_job_new(OC_JOB_GET_PROFILE, 6);
+    j->user_id = alice; j->message_id = 0;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && r->user_id == alice && r->conn_id == 6);
+    CHECK(r && r->pf_phone && strcmp(r->pf_phone, "+1 555 0100") == 0);
+    CHECK(r && r->pf_tz && strcmp(r->pf_tz, "America/New_York") == 0);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_GET_PROFILE, 7);
+    j->user_id = bob; j->message_id = alice;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && r->user_id == alice && r->conn_id == 7);
+    CHECK(r && r->pf_title && strcmp(r->pf_title, "Principal Engineer") == 0);
+    CHECK(r && (!r->pf_phone || !r->pf_phone[0]));
     oc_dbres_free(r);
 
     /* An empty field CLEARS the column rather than leaving the old value: the
@@ -6552,7 +6793,7 @@ static void test_avatar(void) {
     CHECK(alice && bob);
 
     /* A private channel bob cannot read, holding an image alice uploaded, plus a
-     * non-image and an unfinalized row to reject. */
+     * non-image, an upload still in progress and a reclaimed image to reject. */
     oc_dbres *r = create_channel(w, alice, "avpriv", 0);
     CHECK(r && r->type == OC_RES_CHANNEL_INFO);
     uint64_t priv = r->channel_id;
@@ -6560,13 +6801,15 @@ static void test_avatar(void) {
     {
         sqlite3 *raw = NULL;
         CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
-        char sql[512];
+        char sql[768];
         snprintf(sql, sizeof sql,
             "INSERT INTO attachments(id,channel_id,message_id,uploader_id,storage_key,"
-            "  filename,mime,size,sha256,created_at_ms) VALUES"
-            "  (1,%llu,NULL,%llu,'k1','face.png','image/png',10,x'00',1),"      /* alice's image */
-            "  (2,%llu,NULL,%llu,'k2','doc.pdf','application/pdf',10,x'00',1)," /* not an image */
-            "  (3,%llu,NULL,%llu,'k3','half.png','image/png',0,NULL,1);",       /* not finalized */
+            "  filename,mime,size,sha256,created_at_ms,reclaimed_at_ms) VALUES"
+            "  (1,%llu,NULL,%llu,'k1','face.png','image/png',10,x'00',1,0),"      /* alice's image */
+            "  (2,%llu,NULL,%llu,'k2','doc.pdf','application/pdf',10,x'00',1,0)," /* not an image */
+            "  (3,%llu,NULL,%llu,'k3','half.png','image/png',10,NULL,1,0),"       /* in progress: size declared, bytes not here */
+            "  (4,%llu,NULL,%llu,'k4','gone.png','image/png',10,x'00',1,5);",     /* finished, then reclaimed */
+            (unsigned long long)priv, (unsigned long long)alice,
             (unsigned long long)priv, (unsigned long long)alice,
             (unsigned long long)priv, (unsigned long long)alice,
             (unsigned long long)priv, (unsigned long long)alice);
@@ -6582,13 +6825,13 @@ static void test_avatar(void) {
     CHECK(r && r->type == OC_RES_PROFILE_INFO && r->pf_avatar == 1);
     oc_dbres_free(r);
 
-    /* A non-image, an unfinalized upload, an id that does not exist, and — the
-     * important one — SOMEBODY ELSE'S attachment are all refused. Without the last
-     * check any member could publish a private channel's file to the whole
-     * workspace by pointing their avatar at it. */
-    uint64_t bad[4] = { 2, 3, 999, 1 };
-    uint64_t who[4] = { alice, alice, alice, bob };
-    for (int k = 0; k < 4; k++) {
+    /* A non-image, an upload still in progress, a reclaimed image, an id that
+     * does not exist, and — the important one — SOMEBODY ELSE'S attachment are
+     * all refused. Without the last check any member could publish a private
+     * channel's file to the whole workspace by pointing their avatar at it. */
+    uint64_t bad[5] = { 2, 3, 4, 999, 1 };
+    uint64_t who[5] = { alice, alice, alice, alice, bob };
+    for (int k = 0; k < 5; k++) {
         j = oc_job_new(OC_JOB_SET_AVATAR, 2);
         j->user_id = who[k]; j->message_id = bad[k];
         oc_dbwriter_submit(w, j);
@@ -6953,6 +7196,24 @@ static void test_unfurl_store(void) {
     CHECK(r && r->type == OC_RES_OK);
     oc_dbres_free(r);
 
+    /* An address in a spoiler gets no card, whether it was there at the start or
+     * an edit wrapped it with its fetch in flight (MARKDOWN.md §1d). */
+    memset(idem, 0xD2, sizeof idem);
+    uint64_t hid = send_msg(w, u, idem, "see https://example.com/w today");
+    CHECK(hid != 0);
+    oc_dbres *er = do_edit(w, u, OC_DEFAULT_CHANNEL, hid, "see >!https://example.com/w!< today");
+    CHECK(er && er->type == OC_RES_EDIT_OK);
+    oc_dbres_free(er);
+    j = oc_job_new(OC_JOB_UNFURL_STORE, 0);
+    j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = hid;
+    j->unf_url = strdup("https://example.com/w");
+    j->unf_title = strdup("Hidden title");
+    j->unf_descr = strdup("");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_OK);
+    oc_dbres_free(r);
+
     /* The stored row rides the replay (the same guarantee as reactions/pins). */
     r = backfill(w, u, OC_DEFAULT_CHANNEL, 0);
     CHECK(r && r->type == OC_RES_BACKFILL_OK);
@@ -7307,6 +7568,44 @@ static void test_invite_by_address(void) {
         for (int i = 0; i < 16; i++) snprintf(hex + 2 * i, 3, "%02x", id[i]);
         CHECK(strcmp(hex, first) == 0);
     }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    cleanup_db(path);
+
+    /* A direct connection alone, no relay: its verified sign-in spends an
+     * address-bound invite as the relay's does, so the invite is made, and the
+     * invited address joins with the invite's role and spends it. */
+    w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    owner = reg(w, "ia-owner", "pw", OC_ROLE_OWNER);
+    CHECK(owner != 0);
+    const char *ISS[1] = { "https://sso.partner.example" };
+    oc_dbwriter_set_direct_issuers(w, ISS, 1);
+    {
+        oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 99);
+        j->user_id = owner; j->role = OC_ROLE_ADMIN; j->uses = 1;
+        oc_job_set_email(j, "kai@partner.example", strlen("kai@partner.example"));
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+    }
+    CHECK(r && r->type == OC_RES_INVITE_OK);
+    oc_dbres_free(r);
+    int err = 0;
+    uint64_t kai = direct_signin(w, 5, ISS[0], "kai", "kai@partner.example", 1, &err);
+    CHECK(kai != 0);
+    oc_dbwriter_stop(w);
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    st = NULL;
+    CHECK(sqlite3_prepare_v2(db, "SELECT role FROM users WHERE id=?1;", -1, &st, NULL) == SQLITE_OK);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)kai);
+    CHECK(st && sqlite3_step(st) == SQLITE_ROW &&
+          strcmp((const char *)sqlite3_column_text(st, 0), "admin") == 0);
+    sqlite3_finalize(st);
+    st = NULL;
+    CHECK(sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM invites WHERE email='kai@partner.example' "
+                                 "AND consumed_at_ms IS NOT NULL;", -1, &st, NULL) == SQLITE_OK);
+    CHECK(st && sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 1);
     sqlite3_finalize(st);
     sqlite3_close(db);
     cleanup_db(path);
@@ -9813,6 +10112,182 @@ static void test_read_receipts(void) {
     cleanup_db(path);
 }
 
+/* No excerpt the daemon sends gives a spoiler away (MARKDOWN.md §1d): the
+ * channel list's preview, a search hit -- whether the words matched are
+ * outside the spoiler or inside it, where FTS's snippet() would show them --
+ * and a forward's source excerpt. */
+static void test_spoiler_excerpts(void) {
+    const char *path = tdb("spoiler.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "sp-alice", "pw", OC_ROLE_OWNER);
+    CHECK(alice);
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0x5A, sizeof idem);
+    uint64_t src = send_msg(w, alice, idem, "the killer is >!the butler!< indeed");
+    CHECK(src);
+
+    oc_dbres *r = list_channels(w, alice);
+    int seen = 0;
+    for (size_t i = 0; r && i < r->n_chlist; i++)
+        if (r->chlist[i].channel_id == OC_DEFAULT_CHANNEL) {
+            seen = 1;
+            /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+            CHECK(r->chlist[i].preview && strcmp(r->chlist[i].preview, "the killer is [spoiler] indeed") == 0);
+        }
+    CHECK(seen);
+    oc_dbres_free(r);
+
+    static const char *const Q[2] = { "killer", "butler" };
+    for (int q = 0; q < 2; q++) {
+        r = search(w, alice, Q[q], 10);
+        CHECK(r && r->n_search == 1);
+        if (r && r->n_search == 1) CHECK(r->search[0].body && !strstr((const char *)r->search[0].body, "butler") &&
+                                         strstr((const char *)r->search[0].body, "[spoiler]"));
+        oc_dbres_free(r);
+    }
+
+    /* In a table cell: the channel's preview, and a search hit whichever side of
+     * the cover the word is on, where snippet() would otherwise cut a window. */
+    memset(idem, 0x5D, sizeof idem);
+    uint64_t cellmsg = send_msg(w, alice, idem, "| Who | Note |\n|---|---|\n| >!cellsecret!< | cellplain |");
+    CHECK(cellmsg);
+    r = list_channels(w, alice);
+    for (size_t i = 0; r && i < r->n_chlist; i++)
+        if (r->chlist[i].channel_id == OC_DEFAULT_CHANNEL)
+            /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+            CHECK(r->chlist[i].preview && !strstr(r->chlist[i].preview, "cellsecret") && strstr(r->chlist[i].preview, "Table: 1 row"));
+    oc_dbres_free(r);
+    static const char *const CQ[2] = { "cellsecret", "cellplain" };
+    for (int q = 0; q < 2; q++) {
+        r = search(w, alice, CQ[q], 10);
+        CHECK(r && r->n_search == 1);
+        /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+        if (r && r->n_search == 1) CHECK(r->search[0].body && !strstr((const char *)r->search[0].body, "cellsecret") && strstr((const char *)r->search[0].body, "Table: 1 row"));
+        oc_dbres_free(r);
+    }
+
+    /* In a cell past the table's columns: search on it or beside it, as above. */
+    memset(idem, 0x5E, sizeof idem);
+    CHECK(send_msg(w, alice, idem, "| A | B |\n|---|---|\n| extrax | extray | >!extrasecret!< |"));
+    static const char *const XQ[2] = { "extrasecret", "extrax" };
+    for (int q = 0; q < 2; q++) {
+        r = search(w, alice, XQ[q], 10);
+        CHECK(r && r->n_search == 1);
+        if (r && r->n_search == 1) CHECK(r->search[0].body && !strstr((const char *)r->search[0].body, "extrasecret"));
+        oc_dbres_free(r);
+    }
+
+    oc_dbres *cr = create_channel(w, alice, "sp-dest", 1);
+    uint64_t dest = cr ? cr->channel_id : 0;
+    oc_dbres_free(cr);
+    memset(idem, 0x5B, sizeof idem);
+    uint64_t fwd = forward_msg(w, alice, dest, idem, "look", OC_DEFAULT_CHANNEL, src, 1);
+    CHECK(fwd != 0);
+    r = backfill(w, alice, dest, 0);
+    CHECK(r && r->n_rfwd == 1);
+    if (r && r->n_rfwd == 1) CHECK(r->rfwd[0].excerpt && !strstr(r->rfwd[0].excerpt, "butler"));
+    oc_dbres_free(r);
+
+    /* The activity feed's text for a mention, and a thread's row for its root:
+     * pinned and saved carry the body whole, and the client's excerpt covers
+     * them (test_spoiler_preview). */
+    uint64_t bob = reg(w, "sp-bob", "pw", OC_ROLE_MEMBER);
+    CHECK(bob);
+    memset(idem, 0x5C, sizeof idem);
+    uint64_t men = send_msg(w, bob, idem, "@sp-alice it was >!the butler!<");
+    CHECK(men);
+    r = list_activity(w, alice);
+    int feed = 0;
+    for (size_t i = 0; r && i < r->n_alist; i++)
+        if (r->alist[i].message_id == men) {
+            feed = 1;
+            CHECK(r->alist[i].text && !strstr(r->alist[i].text, "butler") && strstr(r->alist[i].text, "[spoiler]"));
+        }
+    CHECK(feed);
+    oc_dbres_free(r);
+    r = send_reply(w, bob, OC_DEFAULT_CHANNEL, src, "a reply");
+    CHECK(r && r->type == OC_RES_REPLY_OK);
+    oc_dbres_free(r);
+    r = list_threads_r(w, alice, OC_THREADF_ALL);
+    const oc_thread_row *row = row_for(r, src);
+    CHECK(row && row->preview && !strstr(row->preview, "butler") && strstr(row->preview, "[spoiler]"));
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* Collapsed messages (migration 0070): folded and opened, for the person who
+ * did it and nobody else, replayed in their backfill, and gone with the
+ * message. The fan-out to their other connections is itest_netloop's. */
+static oc_dbres *set_collapsed(oc_dbwriter *w, uint64_t uid, uint64_t mid, int on) {
+    oc_job *j = oc_job_new(OC_JOB_SET_COLLAPSED, 61);
+    j->user_id = uid; j->message_id = mid; j->save_op = (uint8_t)on;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static int replay_collapsed(oc_dbwriter *w, uint64_t uid, uint64_t mid) {
+    oc_dbres *r = backfill(w, uid, OC_DEFAULT_CHANNEL, 0);
+    int found = -1;
+    for (size_t i = 0; r && i < r->n_replay; i++)
+        if (r->replay[i].message_id == mid) found = r->replay[i].collapsed;
+    oc_dbres_free(r);
+    return found;
+}
+static void test_collapsed(void) {
+    const char *path = tdb("collapsed.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "co-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob = reg(w, "co-bob", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0x6C, sizeof idem);
+    uint64_t mid = send_msg(w, alice, idem, "a very long log paste");
+    CHECK(mid);
+
+    oc_dbres *r = set_collapsed(w, bob, mid, 1);
+    CHECK(r && r->type == OC_RES_COLLAPSED && r->user_id == bob && r->message_id == mid && r->save_op == 1);
+    oc_dbres_free(r);
+    CHECK(replay_collapsed(w, bob, mid) == 1);      /* his backfill carries it */
+    CHECK(replay_collapsed(w, alice, mid) == 0);    /* hers does not: it is his */
+    r = set_collapsed(w, bob, mid, 1);               /* again: no change, the same answer */
+    CHECK(r && r->type == OC_RES_COLLAPSED && r->save_op == 1);
+    oc_dbres_free(r);
+
+    r = set_collapsed(w, bob, mid, 0);
+    CHECK(r && r->type == OC_RES_COLLAPSED && r->save_op == 0);
+    oc_dbres_free(r);
+    CHECK(replay_collapsed(w, bob, mid) == 0);
+
+    /* Refused: no such message. */
+    r = set_collapsed(w, bob, mid + 1000, 1);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
+    oc_dbres_free(r);
+
+    /* Gone with the message. */
+    r = set_collapsed(w, bob, mid, 1);
+    oc_dbres_free(r);
+    oc_job *j = oc_job_new(OC_JOB_DELETE, 62);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = mid;
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    oc_dbwriter_stop(w);
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    int left = -1;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM collapsed_messages;", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) left = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    CHECK(left == 0);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
@@ -9849,14 +10324,18 @@ int run_dbwriter_tests(void) {
     test_attachments();
     test_webhooks();
     test_invites_and_webhook_lifecycle();
+    test_invite_created_at();
     test_shared_invite();
     test_status_and_profile();
+    test_collapsed();
     test_custom_emoji();
     test_group_dm();
     test_avatar();
     test_notify_prefs();
     test_keyword_alerts();
     test_admin_ops();
+    test_deactivate_self();
+    test_audit_filters();
     test_reactions();
     test_threads();
     test_thread_list();
@@ -9871,6 +10350,7 @@ int run_dbwriter_tests(void) {
     test_default_quiet_hours();
     test_read_receipts();
     test_default_channels();
+    test_spoiler_excerpts();
     test_search_orders();
     test_setup_invite();
     test_remove_user_integrations();

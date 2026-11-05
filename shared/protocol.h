@@ -178,7 +178,7 @@
  * 30: each USER_LIST entry carries `flags`, OC_USER_SYSTEM marking the
  * workspace's own sender (the welcome a new member is sent), which a client
  * draws as the workspace and keeps out of its people lists. A byte appended
- * to a repeated entry. (29 is SEARCH's audit filters.)
+ * to a repeated entry. (29 was set aside and not used.)
  *
  * 31: BROADCAST (and MSG_RESTORED, its layout) and THREAD_REPLY carry
  * `broadcast_held`, 1 when the body's @here, @channel or @everyone got no
@@ -191,8 +191,13 @@
  * client counts a broadcast the current body holds only when it is 1. Held
  * depended on the body, which an edit changes without storing mentions, so a
  * client had to guess it from the text before the edit, and history loaded
- * after an edit could not say a row existed. Same layout, a new meaning. */
-#define OC_PROTOCOL_VERSION 32u
+ * after an edit could not say a row existed. Same layout, a new meaning.
+ *
+ * 33: AUDIT_QUERY carries `family`, `actor_id` and `action`, filters the daemon
+ * applies, so a page holds only matching entries however sparse they are and
+ * paging back by `before_ms` keeps the filter (REQ-251). Fields appended to a
+ * fixed layout. */
+#define OC_PROTOCOL_VERSION 33u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -587,6 +592,10 @@ typedef enum {
     OC_MSG_LIST_POLL_VOTERS     = 0x0112, /* C->S, who picked what */
     OC_MSG_POLL_VOTERS          = 0x0113, /* S->C, the answer; refused for an anonymous poll */
     OC_MSG_EDIT_POLL            = 0x0114, /* C->S, the author changes a poll: options and settings until the first vote */
+    OC_MSG_DEACTIVATE_SELF      = 0x0115, /* C->S, no payload: deactivate my own account, as a removal does */
+    OC_MSG_GET_PROFILE          = 0x0116, /* C->S, a member's whole profile, 0 for mine: answered with PROFILE_INFO */
+    OC_MSG_SET_COLLAPSED        = 0x0117, /* C->S, fold a message away for me, or open it again */
+    OC_MSG_COLLAPSED_UPDATED    = 0x0118, /* S->C, to my connections: a message folded or opened; and replayed */
     OC_MSG_WORKSPACE_SETTINGS   = 0x0119, /* S->C, read-only: the workspace settings clients act on, after WORKSPACE_INFO */
     OC_MSG_READ_RECEIPTS        = 0x011A, /* both: whether I share my read receipts; C->S sets or asks, S->C tells */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
@@ -1243,6 +1252,10 @@ typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id;
                  oc_slice attach_name;
                  uint8_t action;   /* as oc_pinned_msg's (REQ-058) */ } oc_saved_msg;
 typedef struct { uint32_t count; } oc_saved;
+/* Collapsed messages: one person's, on every device of theirs. SET_COLLAPSED
+ * folds a message away (on 1) or opens it (on 0); COLLAPSED_UPDATED says so to
+ * each of that person's connections, and backfill replays their folded ones. */
+typedef struct { uint64_t message_id; uint8_t on; } oc_set_collapsed;
 
 /* Activity (REQ-139). `actor_id` is who did the thing; `text` is the message
  * body for a mention or reply, and the emoji for a reaction. */
@@ -1530,7 +1543,10 @@ typedef struct {
  * rather than by offset, so a boundary stays stable as new entries arrive;
  * 0 asks for the newest page. */
 #define OC_AUDIT_PAGE_MAX 200u
-typedef struct { uint64_t before_ms; uint16_t limit; } oc_audit_query;
+/* family 0, actor_id 0 and an empty action match any: each set filter narrows the
+ * page in the daemon, so a page holds only matching rows, paged by before_ms. */
+typedef struct { uint64_t before_ms; uint16_t limit;
+                 uint8_t family; uint64_t actor_id; oc_slice action; } oc_audit_query;
 
 typedef struct {
     uint64_t at_ms;
@@ -1733,6 +1749,10 @@ typedef struct { uint64_t user_id; oc_slice token; } oc_credential_reset;
  * (disabled 0), and for a local account a CREDENTIAL_RESET too -- removal took
  * its password, so the link is how it gets one. */
 typedef struct { uint64_t user_id; } oc_enable_user;
+/* Ask for a member's whole profile, `user_id` 0 meaning mine; answered with
+ * PROFILE_INFO, whose phone is filled for one's own profile only. A client
+ * that changes one field fetches first, since SET_PROFILE replaces them all. */
+typedef struct { uint64_t user_id; } oc_get_profile;
 /* Sign one of your own sessions out (REQ-182): its row goes and its connection
  * closes. Answered with a fresh SESSION_LIST. */
 typedef struct { uint64_t session_id; } oc_revoke_session;
@@ -1880,6 +1900,8 @@ oc_result oc_encode_saved_updated(oc_wbuf *w, uint16_t version, const oc_saved_u
 oc_result oc_encode_list_saved(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_saved_msg(oc_wbuf *w, uint16_t version, const oc_saved_msg *m);
 oc_result oc_encode_saved(oc_wbuf *w, uint16_t version, const oc_saved *m);
+oc_result oc_encode_set_collapsed(oc_wbuf *w, uint16_t version, const oc_set_collapsed *m);
+oc_result oc_encode_collapsed_updated(oc_wbuf *w, uint16_t version, const oc_set_collapsed *m);
 oc_result oc_encode_list_activity(oc_wbuf *w, uint16_t version, uint8_t filter);
 oc_result oc_decode_list_activity(oc_rbuf *p, uint8_t *filter);
 oc_result oc_encode_activity_entry(oc_wbuf *w, uint16_t version, const oc_activity_entry *m);
@@ -1889,6 +1911,7 @@ oc_result oc_encode_mention_unresolved(oc_wbuf *w, uint16_t version, const oc_me
 oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version);
 /* Bodyless request for the storage report (REQ-214); owner/admin only. */
 oc_result oc_encode_storage_status_req(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_deactivate_self(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_channel_list(oc_wbuf *w, uint16_t version, const oc_channel_list *m);
 oc_result oc_encode_join_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m);
 oc_result oc_encode_leave_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m);
@@ -2087,6 +2110,7 @@ oc_result oc_encode_remove_user(oc_wbuf *w, uint16_t version, const oc_remove_us
 oc_result oc_encode_reset_credential(oc_wbuf *w, uint16_t version, const oc_reset_credential *m);
 oc_result oc_encode_credential_reset(oc_wbuf *w, uint16_t version, const oc_credential_reset *m);
 oc_result oc_encode_enable_user(oc_wbuf *w, uint16_t version, const oc_enable_user *m);
+oc_result oc_encode_get_profile(oc_wbuf *w, uint16_t version, const oc_get_profile *m);
 oc_result oc_encode_revoke_session(oc_wbuf *w, uint16_t version, const oc_revoke_session *m);
 oc_result oc_encode_set_email(oc_wbuf *w, uint16_t version, const oc_set_email *m);
 oc_result oc_encode_user_updated(oc_wbuf *w, uint16_t version, const oc_user_updated *m);
@@ -2181,6 +2205,7 @@ oc_result oc_decode_save_item(oc_rbuf *p, oc_save_item *m);
 oc_result oc_decode_saved_updated(oc_rbuf *p, oc_saved_updated *m);
 oc_result oc_decode_saved_msg(oc_rbuf *p, oc_saved_msg *m);
 oc_result oc_decode_saved(oc_rbuf *p, oc_saved *m);
+oc_result oc_decode_set_collapsed(oc_rbuf *p, oc_set_collapsed *m);   /* both frames */
 oc_result oc_decode_activity_entry(oc_rbuf *p, oc_activity_entry *m);
 oc_result oc_decode_activity(oc_rbuf *p, oc_activity *m);
 oc_result oc_decode_channel_info(oc_rbuf *p, oc_channel_info *m);
@@ -2303,6 +2328,7 @@ oc_result oc_decode_remove_user(oc_rbuf *p, oc_remove_user *m);
 oc_result oc_decode_reset_credential(oc_rbuf *p, oc_reset_credential *m);
 oc_result oc_decode_credential_reset(oc_rbuf *p, oc_credential_reset *m);
 oc_result oc_decode_enable_user(oc_rbuf *p, oc_enable_user *m);
+oc_result oc_decode_get_profile(oc_rbuf *p, oc_get_profile *m);
 oc_result oc_decode_revoke_session(oc_rbuf *p, oc_revoke_session *m);
 oc_result oc_decode_set_email(oc_rbuf *p, oc_set_email *m);
 oc_result oc_decode_user_updated(oc_rbuf *p, oc_user_updated *m);

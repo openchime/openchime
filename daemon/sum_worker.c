@@ -245,7 +245,7 @@ static int ensure_engine(build *b) {
 /* `prompt`, its answer held to `grammar` and to `max_out` tokens. The answer
  * (heap), or NULL with b->err set. */
 /* One call to the engine, counted and logged. */
-static int call_once(build *b, const char *prompt, const char *grammar, int max_out, char **raw,
+static int call_engine(build *b, const char *prompt, const char *grammar, int max_out, char **raw,
                      oc_sum_run_stats *st, char *err, size_t errcap) {
     const oc_sum_engine *e = b->cfg->engine;
     memset(st, 0, sizeof *st);
@@ -259,7 +259,7 @@ static char *ask(build *b, const char *stage, const char *prompt, const char *gr
     if (ensure_engine(b) != 0) return NULL;
     char *raw = NULL, err[256] = "";
     oc_sum_run_stats st;
-    int rc = call_once(b, prompt, grammar, max_out, &raw, &st, err, sizeof err);
+    int rc = call_engine(b, prompt, grammar, max_out, &raw, &st, err, sizeof err);
     /* An answer that ran away -- reached its rail without ending, which a
      * well-formed answer never does -- is asked for once more, the same
      * request: a provider's or a sampler's bad moment, not the prompt's. */
@@ -272,7 +272,7 @@ static char *ask(build *b, const char *stage, const char *prompt, const char *gr
         b->spent.wall_ms += st.wall_ms;
         free(raw);
         raw = NULL;
-        rc = call_once(b, prompt, grammar, max_out, &raw, &st, err, sizeof err);
+        rc = call_engine(b, prompt, grammar, max_out, &raw, &st, err, sizeof err);
     }
     /* Where the time goes, call by call (SUMMARIES.md §6). */
     fprintf(stderr, "summary: call %s in %s: %u tokens in, %u out; reading %.1fs, writing %.1fs, %.1fs in all\n",

@@ -8,12 +8,14 @@
  */
 
 #include <stdarg.h>
+#include "richtext.h"   /* oc_rt_plain_excerpt: excerpts hide spoilers */
 #include "action.h"       /* what makes a message an action (ARCH-115) */
 #include "mention.h"      /* the shared @mention scanner (ARCH-89) */
 #include "speakable.h"    /* what read-aloud says for a body (ARCH-111) */
 #include "voice_pick.h"   /* a default read-aloud voice (REQ-292) */
 #include "dbwriter.h"
 #include "e2e_hpke.h"
+#include "pwpolicy.h"
 
 #include "config.h"   /* the page size a files listing answers with (REQ-143) */
 #include "unfurl.h"   /* OC_UNFURL_MAX_URLS: the store re-validates presence */
@@ -611,6 +613,9 @@ static void store_poll(sqlite3 *db, uint64_t mid, uint64_t channel_id, const oc_
 /* A poll's rows go with its message: on a delete, in the caller's transaction. */
 static void drop_poll(sqlite3 *db, uint64_t mid) {
     static const char *const sql[] = {
+        /* Not a poll's, but a message's that goes with it on a delete too:
+         * whoever folded it away (migration 0070). */
+        "DELETE FROM collapsed_messages WHERE message_id=?1;",
         "DELETE FROM poll_votes WHERE message_id=?1;",
         "DELETE FROM poll_options WHERE message_id=?1;",
         "DELETE FROM polls WHERE message_id=?1;",
@@ -2606,6 +2611,30 @@ static oc_dbres *process_reset_redeem(oc_dbwriter *w, const oc_job *j) {
     oc_dbres *r = NULL;
     int live = reset_lookup(db, j->token, hash, &uid, &clear) && !user_disabled(db, uid);
     if (j->auth_stage == OC_AUTH_STAGE_NEW) {
+        /* The one rule the page cannot apply: whose account this is is known
+         * only here, from the token. A local account's new password may not be
+         * built on its username, as at sign-up and on a change (AUTH.md §2);
+         * refused, the token is not spent and nothing is hashed. */
+        if (live && j->pf_new_pw && j->pf_new_pw[0]) {
+            char subject[256] = "";
+            sqlite3_stmt *sq = NULL;
+            sqlite3_prepare_v2(db, "SELECT subject FROM users WHERE id=?;", -1, &sq, NULL);
+            sqlite3_bind_int64(sq, 1, (sqlite3_int64)uid);
+            if (sqlite3_step(sq) == SQLITE_ROW && sqlite3_column_text(sq, 0))
+                snprintf(subject, sizeof subject, "%s", (const char *)sqlite3_column_text(sq, 0));
+            sqlite3_finalize(sq);
+            if (strncmp(subject, "local:", 6) == 0) {
+                char norm[OC_PW_NORM_MAX];
+                oc_pw_verdict pv = oc_pw_check(j->pf_new_pw, subject + 6, NULL, norm, sizeof norm);
+                oc_e2e_wipe(norm, sizeof norm);
+                if (pv == OC_PW_PERSONAL) {
+                    if (!(r = calloc(1, sizeof *r))) return NULL;
+                    r->conn_id = j->conn_id;
+                    r->type = OC_RES_WEB_ERR; r->pw_verdict = pv;
+                    return r;
+                }
+            }
+        }
         oc_auth_check *chk = live && j->pf_new_pw && j->pf_new_pw[0] ? calloc(1, sizeof *chk) : NULL;
         if (chk && oc_rand_bytes(chk->new_salt, sizeof chk->new_salt) == 0) {
             chk->new_password = j->pf_new_pw;
@@ -2838,8 +2867,8 @@ static int mint_invite_for(sqlite3 *db, uint64_t created_by, uint8_t role, const
     uint64_t expiry = dbw_now_ms() + OC_INVITE_TTL_MS;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "INSERT INTO invites(token_hash,created_by,role,expires_at_ms,email,uses) "
-        "VALUES(?,?,?,?,lower(?),?);",
+        "INSERT INTO invites(token_hash,created_by,role,expires_at_ms,email,uses,created_at_ms) "
+        "VALUES(?,?,?,?,lower(?),?,?);",
         -1, &st, NULL);
     sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
     if (created_by) sqlite3_bind_int64(st, 2, (sqlite3_int64)created_by);
@@ -2849,6 +2878,7 @@ static int mint_invite_for(sqlite3 *db, uint64_t created_by, uint8_t role, const
     if (email && email[0]) sqlite3_bind_text(st, 5, email, -1, SQLITE_STATIC);
     else                   sqlite3_bind_null(st, 5);
     sqlite3_bind_int(st, 6, uses);
+    sqlite3_bind_int64(st, 7, (sqlite3_int64)dbw_now_ms());
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) return -1;
@@ -2907,10 +2937,12 @@ static oc_dbres *process_invite_user(oc_dbwriter *w, const oc_job *j) {
     if (uses != 1 && want != OC_ROLE_MEMBER) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
-    /* Only a provider's verified sign-in spends an address-bound invite. Where no
-     * such source is on, nothing could ever redeem it, and minting it anyway would
-     * hand the inviter a row that sits there until it expires. */
-    if (email && !(w->auth_methods & OC_AUTH_OIDC)) {
+    /* Only a provider's verified sign-in spends an address-bound invite: the
+     * relay's, or a direct connection's, which goes through the same admission
+     * and spends it the same way. Where neither is on, nothing could ever redeem
+     * it, and minting it anyway would hand the inviter a row that sits there
+     * until it expires. */
+    if (email && !(w->auth_methods & OC_AUTH_OIDC) && w->n_direct_iss == 0) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INVITE_UNREDEEMABLE; return r;
     }
     uint8_t token[OC_INVITE_TOKEN_LEN], hash[OC_SHA256_LEN]; uint64_t expiry = 0;
@@ -3127,8 +3159,8 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
 
     if (j->demo_invite) {
         /* Spent at once, as a consumed member invite of one use. */
-        sqlite3_prepare_v2(db, "INSERT INTO invites(token_hash, created_by, role, expires_at_ms, consumed_at_ms, uses, used) "
-                               "VALUES(?, NULL, 'member', ?, ?, 1, 1);", -1, &st, NULL);
+        sqlite3_prepare_v2(db, "INSERT INTO invites(token_hash, created_by, role, expires_at_ms, consumed_at_ms, uses, used, "
+                               "created_at_ms) VALUES(?, NULL, 'member', ?, ?, 1, 1, ?3);", -1, &st, NULL);
         sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)(di.exp * 1000u));
         sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
@@ -3419,6 +3451,52 @@ static void sum_purge_msg(sqlite3 *db, uint64_t message_id) {
  * the conversation and opening a DM with them again finds it. The row survives,
  * `disabled`, which clients show as deactivated. Owner/admin only; an admin
  * cannot remove an admin/owner, and the last owner cannot be removed. */
+/* An account deactivated (REQ-033): nothing is deleted. The person is marked
+ * disabled and signed out everywhere; out of every group and every channel but
+ * their DMs; their password, webhooks, devices, drafts and scheduled messages
+ * gone. A removal and a person's own deactivation are this one act, told apart
+ * in the audit log by `action`, done by `actor`. */
+static void deactivate_user(sqlite3 *db, uint64_t uid, uint64_t actor, const char *action) {
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE users SET disabled=1 WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "DELETE FROM sessions WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    /* Out of every group first, so the rule leaves them in no channel; then out
+     * of every channel but the DMs and group DMs, which keep them as a member so
+     * the conversation stays whole for everyone else in it. */
+    sqlite3_prepare_v2(db, "DELETE FROM user_group_members WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    {
+        size_t nch = 0;
+        uint64_t *chans = ids_of(db,
+            "SELECT cm.channel_id FROM channel_members cm JOIN channels c ON c.id = cm.channel_id "
+            " WHERE cm.user_id=?1 AND c.kind <> 'dm';",
+            uid, &nch);
+        for (size_t c = 0; c < nch; c++) membership_sync(db, chans[c], uid, 0);
+        free(chans);
+    }
+    sqlite3_prepare_v2(db, "DELETE FROM local_credentials WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    /* What acts for them when they are not there stops too: their webhooks post
+     * in their name, and their devices would keep being woken for the workspace. */
+    sqlite3_prepare_v2(db, "UPDATE webhooks SET disabled=1 WHERE creator_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "DELETE FROM device_tokens WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    /* Their drafts go with them (REQ-223, ARCH-101): unsent, so nobody else's. */
+    sqlite3_prepare_v2(db, "DELETE FROM drafts WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    /* And anything they had scheduled (REQ-224): the account is gone, so the
+     * promise cannot be kept and there is nobody left to tell. */
+    sqlite3_prepare_v2(db, "DELETE FROM scheduled_messages WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+
+    audit_actor(db, OC_AUDIT_ADMIN, action, actor, uid, NULL, 1, NULL);
+}
+
 static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -3439,48 +3517,33 @@ static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
         r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_LAST_OWNER; return r;
     }
 
-    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
-    sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db, "UPDATE users SET disabled=1 WHERE id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    sqlite3_prepare_v2(db, "DELETE FROM sessions WHERE user_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    /* Out of every group first, so the rule leaves them in no channel; then out
-     * of every channel but the DMs and group DMs, which keep them as a member so
-     * the conversation stays whole for everyone else in it. */
-    sqlite3_prepare_v2(db, "DELETE FROM user_group_members WHERE user_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    {
-        size_t nch = 0;
-        uint64_t *chans = ids_of(db,
-            "SELECT cm.channel_id FROM channel_members cm JOIN channels c ON c.id = cm.channel_id "
-            " WHERE cm.user_id=?1 AND c.kind <> 'dm';",
-            j->target_user_id, &nch);
-        for (size_t c = 0; c < nch; c++) membership_sync(db, chans[c], j->target_user_id, 0);
-        free(chans);
-    }
-    sqlite3_prepare_v2(db, "DELETE FROM local_credentials WHERE user_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    /* What acts for them when they are not there stops too: their webhooks post
-     * in their name, and their devices would keep being woken for the workspace. */
-    sqlite3_prepare_v2(db, "UPDATE webhooks SET disabled=1 WHERE creator_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    sqlite3_prepare_v2(db, "DELETE FROM device_tokens WHERE user_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    /* Their drafts go with them (REQ-223, ARCH-101): unsent, so nobody else's. */
-    sqlite3_prepare_v2(db, "DELETE FROM drafts WHERE user_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    /* And anything they had scheduled (REQ-224): the account is gone, so the
-     * promise cannot be kept and there is nobody left to tell. */
-    sqlite3_prepare_v2(db, "DELETE FROM scheduled_messages WHERE user_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    deactivate_user(db, j->target_user_id, j->user_id, "user.remove");
 
-    audit_actor(db, OC_AUDIT_ADMIN, "user.remove", j->user_id,
-                j->target_user_id, NULL, 1, NULL);
     r->type = OC_RES_USER_UPDATED;
     r->user_id = j->target_user_id;
     r->role = target_role;
+    r->disabled = 1;
+    return r;
+}
+
+/* A person deactivates their own account: a removal's state exactly, recorded
+ * as their own act. The last active owner may not leave the workspace without
+ * one (LAST_OWNER): another owner is needed first. */
+static oc_dbres *process_deactivate_self(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint8_t role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &role) || user_disabled(db, j->user_id)) {
+        r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    if (role == OC_ROLE_OWNER && count_active_owners(db) <= 1) {
+        r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_LAST_OWNER; return r;
+    }
+    deactivate_user(db, j->user_id, j->user_id, "account.deactivate_self");
+    r->type = OC_RES_USER_UPDATED;
+    r->user_id = j->user_id;
+    r->role = role;
     r->disabled = 1;
     return r;
 }
@@ -4677,14 +4740,8 @@ static void store_forward(sqlite3 *db, uint64_t mid, const oc_job *j) {
         n_attach = (uint64_t)sqlite3_column_int64(st, 2);
         const char *an = (const char *)sqlite3_column_text(st, 3);
         if (an) snprintf(aname, sizeof aname, "%s", an);
-        if (bl > OC_FORWARD_EXCERPT_MAX) {
-            bl = OC_FORWARD_EXCERPT_MAX;
-            /* Back off any trailing continuation bytes so the cut lands
-             * between characters. */
-            while (bl > 0 && (b[bl] & 0xC0) == 0x80) bl--;
-        }
-        if (bl && b) memcpy(excerpt, b, bl);
-        ex_len = bl;
+        /* Cut at a character, a spoiler hidden (MARKDOWN.md §1d). */
+        ex_len = b ? oc_rt_plain_excerpt((const char *)b, bl, excerpt, sizeof excerpt) : 0;
         found = 1;
     }
     sqlite3_finalize(st);
@@ -4948,7 +5005,9 @@ static oc_dbres *process_unfurl_store(sqlite3 *db, const oc_job *j) {
         const char *body = (const char *)sqlite3_column_blob(st, 2);
         size_t body_len  = (size_t)sqlite3_column_bytes(st, 2);
         oc_url_span sp[OC_UNFURL_MAX_URLS];
-        size_t nn = body ? oc_url_extract(body, body_len, sp, OC_UNFURL_MAX_URLS) : 0;
+        /* Nor one an edit has since put in a spoiler, with its fetch in flight
+         * (MARKDOWN.md §1d). */
+        size_t nn = body ? oc_rt_visible_urls(body, body_len, sp, OC_UNFURL_MAX_URLS) : 0;
         size_t ul = strlen(j->unf_url);
         for (size_t i = 0; i < nn; i++)
             if (sp[i].len == ul && memcmp(body + sp[i].start, j->unf_url, ul) == 0)
@@ -5540,7 +5599,7 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
          * skipped: "(deleted)" is not a useful thing to show as the latest
          * activity, and the row below it usually is. An action's preview is its
          * action text, flagged, so the client reads "<author> <text>" (REQ-058). */
-        "  (SELECT substr(CASE WHEN (SELECT e2e FROM channels WHERE id=x.channel_id)=1 THEN '' ELSE COALESCE(x.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=x.id),0),?2) FROM messages x "
+        "  (SELECT oc_excerpt(substr(CASE WHEN (SELECT e2e FROM channels WHERE id=x.channel_id)=1 THEN '' ELSE COALESCE(x.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=x.id),0)),?2) FROM messages x "
         "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.deleted_at_ms IS NULL "
         "     ORDER BY x.id DESC LIMIT 1), "
         "  COALESCE((SELECT x.author_id FROM messages x "
@@ -6498,6 +6557,38 @@ static oc_dbres *process_save_item(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Fold a message away for its reader, or open it again (PROTOCOL.md
+ * SET_COLLAPSED): a message in a channel they are a member of, not a tombstone.
+ * The answer is for every connection of theirs. Write. */
+static oc_dbres *process_set_collapsed(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+    r->message_id = j->message_id;
+    r->save_op = j->save_op ? 1 : 0;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT channel_id FROM messages WHERE id=? AND deleted_at_ms IS NULL;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    uint64_t cid = (sqlite3_step(st) == SQLITE_ROW) ? (uint64_t)sqlite3_column_int64(st, 0) : 0;
+    sqlite3_finalize(st);
+    if (!cid) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r; }
+    if (!is_member(db, cid, j->user_id)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    sqlite3_prepare_v2(db, r->save_op
+        ? "INSERT OR IGNORE INTO collapsed_messages(user_id,message_id,created_at_ms) VALUES(?1,?2,?3);"
+        : "DELETE FROM collapsed_messages WHERE user_id=?1 AND message_id=?2;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
+    if (r->save_op) sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    r->type = OC_RES_COLLAPSED;
+    return r;
+}
+
 /* My saved items, newest save first (REQ-231). Bodies travel with them, as with
  * pins: a saved message is usually far outside loaded history. */
 static oc_dbres *process_list_saved(sqlite3 *db, const oc_job *j) {
@@ -6582,7 +6673,7 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
     if (j->act_filter != OC_ACTF_INVOLVED) {
         static const char *USQL =
             "SELECT ?5 AS kind, m.id, m.channel_id, m.author_id, m.created_at_ms, "
-            "       substr(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0),?2) AS text, EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) AS act "
+            "       oc_excerpt(substr(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0)),?2) AS text, EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) AS act "
             "  FROM messages m "
             "  JOIN channel_members cm ON cm.channel_id = m.channel_id AND cm.user_id = ?1 "
             "  JOIN channels c ON c.id = m.channel_id "
@@ -6630,7 +6721,7 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
         /* --- mentions of me --- */
         "  SELECT 0 AS kind, mn.message_id AS message_id, mn.channel_id AS channel_id, "
         "         m.author_id AS actor_id, m.created_at_ms AS at, "
-        "         substr(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0),?2) AS text, EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) AS act "
+        "         oc_excerpt(substr(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0)),?2) AS text, EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) AS act "
         "    FROM mentions mn JOIN messages m ON m.id = mn.message_id "
         /* Mine -- by name, keyword or group (0, 4, 5) -- or a broadcast
          * (1, 2, 3), named as push.c names them: `kind <> 0` also let in
@@ -6659,7 +6750,7 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
         "  UNION ALL "
         /* --- replies under something I wrote --- */
         "  SELECT 2, c.id, c.channel_id, c.author_id, c.created_at_ms, "
-        "         substr(CASE WHEN (SELECT e2e FROM channels WHERE id=c.channel_id)=1 THEN '' ELSE COALESCE(c.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=c.id),0),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=c.id) "
+        "         oc_excerpt(substr(CASE WHEN (SELECT e2e FROM channels WHERE id=c.channel_id)=1 THEN '' ELSE COALESCE(c.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=c.id),0)),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=c.id) "
         "    FROM messages c JOIN messages p ON p.id = c.parent_id "
         "   WHERE p.author_id = ?1 AND c.author_id <> ?1 AND c.deleted_at_ms IS NULL "
         "     AND EXISTS(SELECT 1 FROM channel_members cm "
@@ -7409,7 +7500,12 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
         "  AND m.kind = 0 AND c.e2e = 0 "
         "  AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members cm "
         "       WHERE cm.channel_id=m.channel_id AND cm.user_id=?2)) ",
-        have_text ? "snippet(messages_fts, 0, '', '', ' ... ', 12)" : "substr(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,1,160)",
+        /* A snippet is a window on the body that could open or close inside
+         * a spoiler (MARKDOWN.md §1d): a body with one is excerpted whole,
+         * through the helper, instead. */
+        have_text ? "CASE WHEN oc_has_spoiler(m.body) THEN oc_excerpt(m.body,160) "
+                    "ELSE snippet(messages_fts, 0, '', '', ' ... ', 12) END"
+                  : "oc_excerpt(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,160)",
         rank_sql,
         have_text ? "messages_fts JOIN" : "",
         have_text ? "ON m.id = messages_fts.rowid" : "");
@@ -7822,7 +7918,9 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             /* And this user's saved-for-later state, for the same reason. LEFT
              * JOIN rather than EXISTS so the timestamp comes with it, and keyed on
              * the REQUESTING user because a saved item is private (REQ-231). */
-            "  COALESCE(s.created_at_ms,0), m.kind "
+            "  COALESCE(s.created_at_ms,0), m.kind, "
+            /* And whether this user folded it away, for the same reason. */
+            "  EXISTS(SELECT 1 FROM collapsed_messages cm WHERE cm.message_id = m.id AND cm.user_id = ?4) "
             "FROM messages m LEFT JOIN users u ON u.id = m.author_id "
             "                LEFT JOIN pins  p ON p.message_id = m.id "
             "                LEFT JOIN saved_items s ON s.message_id = m.id AND s.user_id = ?4 "
@@ -7866,6 +7964,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             m->saved     = m->saved_at != 0;
             m->kind      = (uint8_t)sqlite3_column_int(st, 10);
             m->broadcast_stored = broadcast_stored(db, m->message_id);
+            m->collapsed = (uint8_t)sqlite3_column_int(st, 11);
             /* Re-attach the message's linked attachments so a reconnecting client
              * sees them inline, not just live members (REQ-140). */
             load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
@@ -7936,14 +8035,15 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     "         COALESCE(p.pinned_by,0) AS pinned_by," \
     "         COALESCE(p.created_at_ms,0) AS pinned_at," \
     "         COALESCE(s.created_at_ms,0) AS saved_at," \
-    "         m.kind AS kind" \
+    "         m.kind AS kind," \
+    "         EXISTS(SELECT 1 FROM collapsed_messages cm WHERE cm.message_id = m.id AND cm.user_id = ?4) AS collapsed" \
     "    FROM messages m LEFT JOIN users u ON u.id = m.author_id" \
     "                    LEFT JOIN pins p ON p.message_id = m.id" \
     "                    LEFT JOIN saved_items s ON s.message_id = m.id AND s.user_id = ?4"
 
     const char *sql = j->hist_around
         ? "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name,"
-          "       pinned_by, pinned_at, saved_at, kind FROM ("
+          "       pinned_by, pinned_at, saved_at, kind, collapsed FROM ("
           "  SELECT * FROM (" OC_HIST_COLS
           "   WHERE m.channel_id=?1 AND m.parent_id IS NULL AND m.id<=?2"
           "   ORDER BY m.id DESC LIMIT ?3)"
@@ -7953,7 +8053,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
           "   ORDER BY m.id ASC LIMIT ?3)"
           ") ORDER BY id;"
         : "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name,"
-          "       pinned_by, pinned_at, saved_at, kind FROM ("
+          "       pinned_by, pinned_at, saved_at, kind, collapsed FROM ("
           OC_HIST_COLS
           "   WHERE m.channel_id=?1 AND m.id<?2 AND m.parent_id IS NULL"
           "   ORDER BY m.id DESC LIMIT ?3"
@@ -7999,6 +8099,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
         m->saved     = m->saved_at != 0;
         m->kind      = (uint8_t)sqlite3_column_int(st, 10);
         m->broadcast_stored = broadcast_stored(db, m->message_id);
+        m->collapsed = (uint8_t)sqlite3_column_int(st, 11);
         load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
         n++;
     }
@@ -8932,7 +9033,11 @@ static oc_dbres *process_set_avatar(sqlite3 *db, const oc_job *j) {
         int ok = 0;
         sqlite3_prepare_v2(db,
             "SELECT 1 FROM attachments WHERE id=?1 AND uploader_id=?2 "
-            "  AND size > 0 AND mime LIKE 'image/%';", -1, &ck, NULL);
+            "  AND size > 0 AND mime LIKE 'image/%' "
+            /* Finished (its bytes arrived: sha256 is set when they do, as
+             * link_attachments requires) and not reclaimed: an image that is
+             * there. */
+            "  AND sha256 IS NOT NULL AND reclaimed_at_ms = 0;", -1, &ck, NULL);
         sqlite3_bind_int64(ck, 1, (sqlite3_int64)aid);
         sqlite3_bind_int64(ck, 2, (sqlite3_int64)j->user_id);
         ok = (sqlite3_step(ck) == SQLITE_ROW);
@@ -8954,13 +9059,44 @@ static oc_dbres *process_set_avatar(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Every excerpt the daemon sends -- a channel's preview, a thread's, an
+ * activity row's, a search hit's -- is made by oc_rt_plain_excerpt, so what a
+ * spoiler hides is never in one (MARKDOWN.md §1d). They are built in SQL, so
+ * the helper is a function there: oc_excerpt(text, bytes), and
+ * oc_has_spoiler(text) for where FTS's snippet() would otherwise cut a window. */
+static void sql_excerpt(sqlite3_context *cx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    const char *t = (const char *)sqlite3_value_text(argv[0]);
+    int n = sqlite3_value_bytes(argv[0]);
+    sqlite3_int64 cap = sqlite3_value_int64(argv[1]);
+    if (!t) { sqlite3_result_null(cx); return; }
+    if (cap <= 0 || cap > 65536) cap = 65536;
+    char *out = malloc((size_t)cap + 1);
+    if (!out) { sqlite3_result_error_nomem(cx); return; }
+    size_t w = oc_rt_plain_excerpt(t, (size_t)n, out, (size_t)cap + 1);
+    sqlite3_result_text(cx, out, (int)w, free);
+}
+static void sql_has_spoiler(sqlite3_context *cx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    const char *t = (const char *)sqlite3_value_text(argv[0]);
+    int n = sqlite3_value_bytes(argv[0]);
+    sqlite3_result_int(cx, t && oc_rt_spoilers(t, (size_t)n, NULL, 0) > 0);
+}
+static void sql_functions(sqlite3 *db) {
+    sqlite3_create_function(db, "oc_excerpt", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_excerpt, NULL, NULL);
+    sqlite3_create_function(db, "oc_has_spoiler", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_has_spoiler, NULL, NULL);
+}
+
 static oc_dbres *process_get_profile(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     /* Any tenant member may read any member's profile — the roster is already
-     * visible to everyone (REQ-030), so this adds no exposure. */
-    build_profile(db, j->message_id ? j->message_id : j->user_id, r);
+     * visible to everyone (REQ-030), so this adds no exposure. The phone is the
+     * one field that is not on the roster: it goes to its owner only. */
+    uint64_t whose = j->message_id ? j->message_id : j->user_id;
+    build_profile(db, whose, r);
+    if (whose != j->user_id) { free(r->pf_phone); r->pf_phone = NULL; }
     return r;
 }
 
@@ -9084,7 +9220,7 @@ static oc_dbres *process_list_threads(sqlite3 *db, const oc_job *j) {
         "       COALESCE((SELECT tf.state FROM thread_follows tf "
         "                  WHERE tf.user_id = ?1 AND tf.root_id = r.id), 1) AS following, "
         /* An action root previews as its action text, flagged (REQ-058). */
-        "       substr(CASE WHEN (SELECT e2e FROM channels WHERE id=r.channel_id)=1 THEN '' ELSE COALESCE(r.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=r.id),0),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=r.id) "
+        "       oc_excerpt(substr(CASE WHEN (SELECT e2e FROM channels WHERE id=r.channel_id)=1 THEN '' ELSE COALESCE(r.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=r.id),0)),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=r.id) "
         "  FROM messages r "
         "  JOIN channel_members cm ON cm.channel_id = r.channel_id AND cm.user_id = ?1 "
         " WHERE r.parent_id IS NULL AND r.deleted_at_ms IS NULL "
@@ -9131,7 +9267,7 @@ static void build_thread_one(sqlite3 *db, uint64_t uid, uint64_t root_id, oc_dbr
         "       COALESCE((SELECT tf.state FROM thread_follows tf "
         "                  WHERE tf.user_id = ?1 AND tf.root_id = r.id), 1), "
         /* An action root previews as its action text, flagged (REQ-058). */
-        "       substr(CASE WHEN (SELECT e2e FROM channels WHERE id=r.channel_id)=1 THEN '' ELSE COALESCE(r.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=r.id),0),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=r.id) "
+        "       oc_excerpt(substr(CASE WHEN (SELECT e2e FROM channels WHERE id=r.channel_id)=1 THEN '' ELSE COALESCE(r.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=r.id),0)),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=r.id) "
         "  FROM messages r WHERE r.id = ?3;";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, SQL, -1, &st, NULL) != SQLITE_OK) return;
@@ -9467,7 +9603,7 @@ static oc_dbres *process_list_invites(sqlite3 *db, const oc_job *j) {
      * revoke needs. */
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT rowid, role, expires_at_ms, COALESCE(created_by,0), uses, used FROM invites "
+        "SELECT rowid, role, expires_at_ms, COALESCE(created_by,0), uses, used, COALESCE(created_at_ms,0) FROM invites "
         " WHERE consumed_at_ms IS NULL AND expires_at_ms > ?1 "
         " ORDER BY expires_at_ms ASC LIMIT ?2;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
@@ -9484,7 +9620,7 @@ static oc_dbres *process_list_invites(sqlite3 *db, const oc_job *j) {
         arr[n].created_by = (uint64_t)sqlite3_column_int64(st, 3);
         arr[n].uses       = (uint16_t)sqlite3_column_int(st, 4);
         arr[n].used       = (uint16_t)sqlite3_column_int(st, 5);
-        arr[n].created_at = 0;      /* not stored; the table has no created_at_ms */
+        arr[n].created_at = (uint64_t)sqlite3_column_int64(st, 6);   /* 0: made before the column */
         n++;
     }
     sqlite3_finalize(st);
@@ -11063,6 +11199,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_PIN)            return process_pin(w->db, j);
     if (j->type == OC_JOB_UPDATE_CHANNEL) return process_update_channel(w->db, j);
     if (j->type == OC_JOB_SAVE_ITEM)      return process_save_item(w->db, j);
+    if (j->type == OC_JOB_SET_COLLAPSED)  return process_set_collapsed(w->db, j);
     /* On the WRITER because it stamps the seen watermark; the read half would
      * otherwise be a reader job with a write in it. */
     if (j->type == OC_JOB_LIST_ACTIVITY)  return process_list_activity(w->db, j);
@@ -11097,6 +11234,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_PROFILE)     return process_set_profile(w->db, j);
     if (j->type == OC_JOB_SET_EMAIL)       return process_set_email(w->db, j);
     if (j->type == OC_JOB_SET_AVATAR)      return process_set_avatar(w->db, j);
+    if (j->type == OC_JOB_DEACTIVATE_SELF) return process_deactivate_self(w->db, j);
     if (j->type == OC_JOB_SET_READ_CURSOR) return process_set_read_cursor(w->db, j);
     if (j->type == OC_JOB_LIST_THREADS)    return process_list_threads(w->db, j);
     if (j->type == OC_JOB_SET_THREAD_FOLLOW) return process_set_thread_follow(w->db, j);
@@ -11197,12 +11335,19 @@ static oc_dbres *process_audit_query(sqlite3 *db, const oc_job *j) {
     if (sqlite3_prepare_v2(db,
             "SELECT at_ms, family, action, actor_id, actor_name, target_id, target,"
             " outcome, detail FROM audit_log "
-            "WHERE (?1 = 0 OR at_ms < ?1) ORDER BY at_ms DESC, id DESC LIMIT ?2;",
+            "WHERE (?1 = 0 OR at_ms < ?1) AND (?3 = 0 OR family = ?3) AND (?4 = 0 OR actor_id = ?4)"
+            "  AND (?5 = '' OR action = ?5) "
+            "ORDER BY at_ms DESC, id DESC LIMIT ?2;",
             -1, &st, NULL) != SQLITE_OK) {
         r->type = OC_RES_AUDIT_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->audit_before_ms);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)lim);
+    /* The filters (PROTOCOL.md AUDIT_QUERY): applied here, so a page holds
+     * only matching rows however sparse they are in recent history. */
+    sqlite3_bind_int(st, 3, j->audit_family);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)j->audit_actor);
+    sqlite3_bind_text(st, 5, j->body ? (const char *)j->body : "", j->body ? (int)j->body_len : 0, SQLITE_TRANSIENT);
     while (sqlite3_step(st) == SQLITE_ROW && r->n_audit < lim) {
         oc_audit_row *a = &r->audit[r->n_audit];
         a->at_ms     = (uint64_t)sqlite3_column_int64(st, 0);
@@ -12439,6 +12584,7 @@ oc_dbwriter *oc_dbwriter_start_boot(const char *path, oc_dbwriter_boot *b) {
      * write lock for a moment at each checkpoint: the writer waits it out, as
      * the readers do, rather than failing a commit with SQLITE_BUSY. */
     sqlite3_busy_timeout(w->db, 5000);
+    sql_functions(w->db);
     char *err = NULL;
     if (sqlite3_exec(w->db, "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;",
                      NULL, NULL, &err) != SQLITE_OK) {
@@ -12510,6 +12656,7 @@ oc_dbwriter *oc_dbwriter_start_boot(const char *path, oc_dbwriter_boot *b) {
         }
         sqlite3_busy_timeout(rd->rdb, 5000);
         sqlite3_exec(rd->rdb, "PRAGMA query_only=1;", NULL, NULL, NULL);
+        sql_functions(rd->rdb);
     }
 
     pthread_mutex_init(&w->mu, NULL);

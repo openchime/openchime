@@ -140,10 +140,13 @@ case "${1:-}" in
           done
         fi
         mkdir -p "$OC_TEST_DIR"
+        # No send cap (OPENCHIME_DEV_SEND_RATE=0): a fixture seeds its messages
+        # back to back, which the 30-in-3-seconds limit would throttle.
         env OPENCHIME_DATA_DIR="$OC_TEST_DIR/data" \
             OPENCHIME_PORT="${OC_TEST_PORT}" OPENCHIME_HEALTH_PORT="${OC_TEST_HEALTH_PORT:-8080}" \
             OPENCHIME_WORKSPACE_NAME="${OC_TEST_WS:-Acme HQ}" \
             OPENCHIME_DEV_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
+            OPENCHIME_DEV_SEND_RATE=0 \
             OPENCHIME_MANAGED_MAX_USERS=100 \
             setsid "$HERE/openchimed" > "$OC_TEST_DIR/daemon.log" 2>&1 < /dev/null &
         disown
@@ -172,6 +175,10 @@ case "${1:-}" in
     # the run clean.
     powershell.exe -NoProfile -Command "\$p = Get-Process openchime -EA SilentlyContinue; if (\$p) { \$p.CloseMainWindow() | Out-Null; if (-not \$p.WaitForExit(3000)) { \$p | Stop-Process -Force } }" >/dev/null 2>&1 || true
     sleep 1
+    # The fixture's saved sign-ins: under the development service name
+    # (oc_env_secret_service, client/core/env.c), never the person's own
+    # "openchime:" entries. Listed by that prefix only, then each deleted.
+    powershell.exe -NoProfile -Command "cmdkey /list | Select-String -Pattern 'Target: (?:LegacyGeneric:target=)?(openchime-dev:\S+)' | ForEach-Object { cmdkey /delete:\$(\$_.Matches[0].Groups[1].Value) | Out-Null }" >/dev/null 2>&1 || true
     rm -f "$LIN_DIR"/cmd "$LIN_DIR"/ack
     # OC_TEST_LOCAL=1 runs a copy from a local Windows directory: Windows refuses
     # a real camera to an executable started from the WSL share (TESTING.md).
@@ -203,6 +210,10 @@ case "${1:-}" in
   kill)
     # Graceful first, for the reason the launch path gives.
     powershell.exe -NoProfile -Command "\$p = Get-Process openchime -EA SilentlyContinue; if (\$p) { \$p.CloseMainWindow() | Out-Null; if (-not \$p.WaitForExit(3000)) { \$p | Stop-Process -Force } }" >/dev/null 2>&1 || true
+    # The fixture's saved sign-ins: under the development service name
+    # (oc_env_secret_service, client/core/env.c), never the person's own
+    # "openchime:" entries. Listed by that prefix only, then each deleted.
+    powershell.exe -NoProfile -Command "cmdkey /list | Select-String -Pattern 'Target: (?:LegacyGeneric:target=)?(openchime-dev:\S+)' | ForEach-Object { cmdkey /delete:\$(\$_.Matches[0].Groups[1].Value) | Out-Null }" >/dev/null 2>&1 || true
     echo killed; exit 0 ;;
   "") echo "usage: scripts/gui/drive.sh launch|<cmd...>|kill" >&2; exit 2 ;;
 esac

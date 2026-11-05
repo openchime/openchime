@@ -694,8 +694,10 @@ code runs threads (CI runs the halves in parallel jobs, `PART=threads` and
   player — under ThreadSanitizer (address randomization off, `tests/tsan.supp`
   for the one test-only reconfiguration). The list is `TSAN_SUITES`
   (`scripts/test/lib/common.sh`); a suite that starts a thread belongs on it.
-  Two that do are not on it yet, `run_relaykeys_tests` and `run_summary_tests`,
-  so they run only in the plain half and never under the sanitizer. The sanitizer run
+  That is checked at run time, not read from the source: the plain test binary
+  is linked with `-Wl,--wrap=pthread_create`, the scripts that run it pass the
+  list in `OC_TSAN_SUITES`, and a suite that starts a thread and is not on it
+  fails, naming itself and the list (`tests/main.c`). The sanitizer run
   judges races, never speed: a limit on how fast code runs — wall-clock time, or
   one timing against another — is a `CHECK_SPEED` (`tests/check.h`), asserted in
   the ordinary build and not under the sanitizer, which slows code five to
@@ -734,7 +736,8 @@ exercised in the **in-process** integration suites (`itest_netloop`), not by thi
 client.
 The same job then registers a push token with `build/demo_client`
 (`tests/demo_client.c`) and requires its acknowledgement, which the daemon sends
-after whatever it pushes once a person signs in.
+after whatever it pushes once a person signs in; then it sends a message and
+replies to it in a thread, and requires the reply's acknowledgement too.
 
 **Client-side TLS.** The wire protocol runs over TLS, verified as ARCH-10 says
 (REQ-180); there is no plaintext fallback. The TLS library is mbedTLS (ARCH-51,
@@ -1049,10 +1052,9 @@ the daemon's page and bootstraps its user.
   the daemon's own `/app/` page (`openchime.html`, the Windows application
   compiled for the browser); it signs in on the daemon's page and comes back,
   the page keeping the test's instructions for the tab, as it keeps `?hook=`;
-  the page polls its test hook until the model reads `authed=1 connected=1` and
-  takes the client's own screenshot (`shot`, through `gfx_readback` as on
-  Windows), which is left in `build/webtest/gui.bmp` beside the daemon log and
-  the browser logs.
+  the page polls its test hook until the model reads `authed=1 connected=1`,
+  and logs that line, which the test checks; the browser logs are left beside
+  the daemon log.
 
   Then a video message is recorded through the client's own `vm` verbs with
   the synthetic camera and the browser's fake microphone, each verb taken once
@@ -1116,7 +1118,7 @@ need and call them, and the workflows call only the targets.
 | Command | Where | Scripts | What it runs |
 |---|---|---|---|
 | `make test` | locally, before every push (`scripts/check/test.sh`, which the pre-push hook requires) | `scripts/test/local/` | the source checks and every suite but the slow ones (§2.4), on the default daemon; about a minute |
-| `make test-merge` | CI only: every pull request (`pr-tests.yml`, a required check) and the staging build, through `ci.yml` | `scripts/test/merge/` | every feature built; every suite, the threaded ones under ThreadSanitizer (§2.4); the static-link check; the end-to-end run (§3.2); the release's compiler; the speech round trip; the web client and the GUI smoke on the web (§3.4); each fuzzing harness for `FUZZ_SECONDS` (§2.2b) |
+| `make test-merge` | CI only: every pull request (`pr-tests.yml`, a required check) and the staging build, through `ci.yml` | `scripts/test/merge/` | every feature built; every suite, the threaded ones under ThreadSanitizer (§2.4); the static-link check; the end-to-end run (§3.2); the release's compiler; the speech round trip; the web client, its objects' header dependencies (`web_deps.sh`), and the GUI smoke on the web (§3.4); each fuzzing harness for `FUZZ_SECONDS` (§2.2b) |
 | `make test-release` | CI only: the staging build and the release, on the artifacts they make | `scripts/test/release/` | `PART=packages`: glibc floor, one binary in all three packages, the `.deb` installed and speaking, its unit file; `PART=image`: the image starts, its database replicates and restores (§3.2); `PART=windows`: the binaries' version resources, the installer and the MSIX |
 
 `make test-merge` and `make test-release` refuse to run unless `CI` is set (as
@@ -1160,7 +1162,7 @@ and on the stripped release binary and the installed `.deb`
 (`make test-release PART=packages`); the speech suites (`tts_worker`, `stt`,
 `ttskit`) run in `make test-merge`.
 
-A new suite is its declaration and one `S(run_<name>_tests)` line in `tests/main.c`; if its code starts a thread it also goes on `TSAN_SUITES` in `scripts/test/lib/common.sh`, and if it is slow, on `SLOW_SUITES`.
+A new suite is its declaration and one `S(run_<name>_tests)` line in `tests/main.c`; if its code starts a thread it also goes on `TSAN_SUITES` in `scripts/test/lib/common.sh` (`make test` fails it otherwise, §2.4), and if it is slow, on `SLOW_SUITES`.
 
 ---
 
@@ -1385,7 +1387,7 @@ The loop's own turn is the figure to compare.
 
 ## 6. Running the daemon by hand
 
-`make run` starts a development daemon on port 8443 of every interface (health
+`make run` starts a development daemon on `127.0.0.1:8443`, loopback only (health
 `8080`, data `/tmp/openchime-dev`, users alice/pw and bob/pw).
 
 The federation wires — enrollment (ARCH-84), push (ARCH-85) and the OIDC relay
@@ -1411,7 +1413,7 @@ build/openchime-tui 127.0.0.1 8443             # <host> <port>: a device-code si
   default `/data` is neither, and the daemon exits before `netloop: listening`.
   `scripts/demo/tui.sh` sets it to a temp dir.
 - `demo_client` (`make build/demo_client`) is the flexible black-box tool:
-  `demo_client <host> <port> <user> <pass> token <apns|fcm> <tok> | send <channel> <text> | invite [uses]`
+  `demo_client <host> <port> <user> <pass> token <apns|fcm> <tok> | send <channel> <text> | reply <channel> <parent> <text> | invite [uses]`
   against a running daemon (its usage lists the rest).
 
 ## A death always leaves evidence
@@ -1537,8 +1539,8 @@ real time three times in a single day before the guard existed.
 skips the build and `OC_TEST_NO_DAEMON=1` leaves the daemon alone — for when a
 mismatched pair is the thing under test, such as the version-reject path.
 
-**The harness's variables** begin `OC_TEST_` (but `GUI_DRIVE_OUT` and
-`OC_PARITY_OUT`, the output directories), and are read and defaulted in
+**The harness's variables** begin `OC_TEST_` (but `GUI_DRIVE_OUT`, the output
+directory), and are read and defaulted in
 `scripts/gui/lib.sh` (the feature scripts), `scripts/gui/drive.sh` and
 `scripts/web/drive.sh` (one client) and the two `pair.sh` (two clients); an older
 prefix in the environment (`OC_DEV_`, `OC_PAIR_`, `OC_GUI_`, `OC_DRIVE_`,
@@ -1562,7 +1564,6 @@ CONFIG.md "Mode"), and any build will do.
 | `OC_TEST_HEALTH_PORT`, `OC_TEST_WEB_PORT` | 8080, 8551 | The fixture daemon's health port; the fixture daemon's port in `scripts/gui/web_signin.sh` (the Win32 browser sign-in). |
 | `OC_TEST_KEEP_DB`, `OC_TEST_WAIT_MS` | 0, the script's | The smoke keeps the database; a longer wait for a slow machine. |
 | `GUI_DRIVE_OUT` | `/tmp/ocshot` (`/tmp/ocshot-web` in `web_signin.sh`) | Where `shot`/`dump` copies land on the Linux side. |
-| `OC_PARITY_OUT` | `/tmp/oc-parity` | `parity.sh`'s report and side-by-side images. |
 
 The suite's own share the prefix: `OC_TEST_ONLY`, `OC_TEST_EXCEPT`,
 `OC_TEST_REPEAT`, `OC_TEST_JOBS` (`tests/main.c`), `OC_TEST_TIMING` (`tests/check.h`)
@@ -1901,6 +1902,17 @@ The paging underneath is proven without a screen in `test_client_core.c`, which
 asks the daemon for pages of two and checks the second continues from the first
 rather than repeating it. Not in CI, for the smoke's reason.
 
+## Reading the lightbox harness
+
+`scripts/gui/lightbox.sh` drives the expanded image view against its own
+fixture daemon (port 9710). It uploads three images with a text file between
+them, opens one with a click, and pages with Left, Right and the next arrow,
+asserting the view's place from the dump's `lightbox=` line: `lightbox=` (the
+attachment on screen), `lightbox_pos=<i>/<n>` (its place in the conversation's
+media; the text file is never counted), `prev=` and `next=` (whether each arrow
+is drawn) and `next_r=` (the next arrow's rect). At the last image Right changes
+nothing; Esc closes the view. Run on both platforms, `--web` included.
+
 ## Reading the uploads harness
 
 `scripts/gui/uploads.sh` drives the Win32 message box's upload tray (REQ-140)
@@ -2069,6 +2081,16 @@ offered= on= mode= hold= sent= answered= words= err=` and the button rects — a
 its `toast[n]` lines. Not in CI, for the smoke's reason. Run it when a change
 touches voice input, the composer's controls or the device layer.
 
+## Reading the cursor harness
+
+The pointer a detached Windows session reports is suppressed, and the harness's
+hover is a synthetic mouse event, so neither says what shape the cursor took.
+The client does: the test dump's `cursor kind=<arrow|ibeam|hand|none>` line, in
+the signed-in dump and the signed-out one alike, is the shape it last set
+(`none` before any). `scripts/gui/cursor.sh` (Windows and the web) sends a
+message with a link, then hovers the composer's text, the link and empty space
+with `move`, and asserts `ibeam`, `hand` and `arrow` in turn.
+
 ## Seeing the whole window
 
 `scripts/gui/drive.sh shot <name>` produces one image of the entire
@@ -2087,8 +2109,7 @@ frame drew, in order, with its rect, its clip, its colour and a tag
 (`gfx_ledger_dump`). It exists because a screenshot answers "what does this look
 like" and nothing else: a label clipped to nothing, ink the colour of the
 surface behind it, and two strings drawn over each other all produce a picture
-that looks right to a comparison and wrong to a person. `scripts/gui/audit.sh`
-reads it (the visual audit, below).
+that looks right to a comparison and wrong to a person.
 
 Two rules for anything drawing text through it. A text raster carries its colour
 in its pixels, so the ledger cannot read one back — the call site declares it
@@ -2097,191 +2118,6 @@ recorded rect is the ink and not the bitmap. And a colour that is **content**
 rather than a theme choice — an avatar disc derived from a user id, a swatch for
 a colour scheme you have not picked — says so with a `content:` tag, or the
 palette check reports it as a surface that will not follow the theme.
-
-## The visual audit — checking a render with no render to compare it to
-
-`scripts/gui/audit.sh` walks every surface of the Win32 client across themes,
-DPI settings and text sizes, and checks each captured scene against properties
-it must hold **on its own**. It is not the smoke and must not become one: the
-smoke asks "does the client boot" in ten seconds and is run before pushing a client change;
-this runs a few hundred states, takes minutes, and is for when GUI chrome
-changes.
-
-**Why there is no reference image.** The first version of this audit diffed the
-SDL render against the Direct2D binary it was ported from, ranked the pairs by
-PSNR and walked the ranking. That rig did the job a diff can do and is finished.
-A diff finds *divergence*, so it is blind by construction to anything both
-renderers did the same way — and the defects left are exactly those. Three of
-them were logged against that audit while it was still running, each found by
-eye and none by the diff, and the note on the third says why in one line: *the
-old client has identical geometry.* A picture that looks fine to a diff and
-wrong to a person is the whole remaining category.
-
-So the reference is gone. What replaced it is the client's own account of what
-it drew.
-
-**The paint ledger** (`gfx_ledger_dump`, verb `ledger <path>`) is one row per
-primitive, in draw order, with the rect, the clip in force, the colour and a
-tag — see the note in `client/gui/gfx/gfx.h`. It is allocated only when
-`OPENCHIME_DEV_DIR` is set. From it, `scripts/gui/audit/oracles.py` asks questions
-a single frame can answer:
-
-- a string whose raster runs past its clip is **truncated**, and nothing on
-  screen says so;
-- two strings sharing pixels with no opaque fill between them are
-  **overprinted**;
-- ink measured against the surface beneath it is a **contrast** ratio;
-- a rect drawn outside the window is **unreachable chrome**;
-- a colour that resolves to no palette token is a surface that **will not
-  follow the theme**.
-
-**Read the asymmetries, they are deliberate.** A text row's *width* is the
-advance width of the glyphs, so a rect wider than its clip is a cut string.
-Its *height* is the line box — ascent, descent and leading, pinned per size
-token (ARCH-108) — which legitimately overhangs its seat, and a row half below
-the fold of a scrolling list is ordinary rather than broken. So horizontal
-clipping is reported here and vertical clipping is not, and a clip that removes
-an element *entirely* is not reported at all: that is how scrolling works, and
-from a ledger row a scrolled-out row and a stray one are the same thing. The
-instrument that can tell those apart is the fit check inside the client, which
-is built from the accessibility tree and therefore only ever sees what is
-reachable — and which counts the vertical case itself (`clipped=`, below),
-because it measures a string against the rect it was handed rather than against
-the clip in force, and a box moving off screen says nothing about whether the
-words fit inside it.
-
-The same discipline decides the rest. A scrim is a layer boundary — a modal
-owns the window, the accessibility publisher already skips the shell behind
-one, and the ledger checks do too, or a sidebar label two hundred pixels away
-comes back "overprinted" by a modal row. A colour tagged `content:` is data
-rather than a theme choice (an avatar disc derived from a user id, a swatch for
-a scheme you have not picked) and is exempt from the palette check by that
-declaration rather than by a list of exceptions here.
-
-**Every one of these started as a false positive and was fixed rather than
-muted.** The first run reported sixty-five findings on a healthy screen. A
-check that fires on correct code is one people learn to skip, which is how the
-client's own fit check came to report phantom overlaps for months without
-anybody reading it.
-
-**`scripts/gui/audit/pair.py`** compares two captures of one surface in two states
-and reports what MOVED. Some defects are invisible in one frame: a label that
-shifts a pixel when its row goes semibold looks correct in both screenshots and
-reads as a twitch in use. The property is that changing a state must not change
-a position.
-
-**Two accounts of one frame, cross-checked.** The client also publishes its
-accessibility tree into the dump, one line per element. An element published at
-coordinates the ledger painted nothing at is a **phantom** — a screen reader is
-invited to activate something that is not there, and every check built from the
-tree alone compares it against real elements and reports collisions nobody can
-see. Nothing internal to the tree can catch that, because the tree is
-consistent with itself; only the other account knows. This is what found the
-Admin view still offering conversation rows for a sidebar it does not draw.
-
-**The checks that need pixels** (`scripts/gui/audit/pixels.py`) close the gap
-between what the app asked for and what the renderer produced. A stroke
-tessellator that blows its vertex budget discards icons whole: the draw
-call happens, the ledger records it, and nothing appears. So a
-filled shape must *be* its colour (holes mean uncovered tessellation), an icon
-box must not come back one flat colour, and a disc's rim must be a ramp rather
-than a step. Each is asked only of shapes nothing was drawn over afterwards —
-without that filter every button in the app is a finding.
-
-**The states that must agree** (`scripts/gui/audit/consistency.py`) compare the
-client against itself. A theme reached by a live switch must render as a cold
-start in that theme does; 96 → 192 → 96 must equal a cold 96; a conversation
-reached twice must look the same both times. The theme case is one switch, from
-a cold start in the other theme, and deliberately not a *round trip* — X to Y and
-back to X — which passes with the defect present, because a cache whose key forgets the
-theme is stale in both directions and lands on the right colours by being wrong
-twice.
-
-**Contact sheets** (`scripts/gui/audit/sheets.py`) are for the findings no check
-will ever make. "A 13px marker on an 18px tile looks bad" is a judgement, not a
-property. The sheets do not replace the eye; they change what it is asked to
-do — every icon at every size on one page, every avatar composite on another,
-the corner arc of every rounded rect on a third. A thing that is wrong is then
-sitting beside eleven things that are right, which is a glance rather than a
-hunt through 224 screenshots.
-
-**`scripts/gui/audit/selftest.py` proves every check can fail**, with a synthetic
-scene per check and, for the pixel ones, a real capture handed a ledger that
-lies about it. Run it after touching anything in that directory; it needs no
-client. A check that has never failed has not been shown to check anything, and
-this project has the scars: the client's own fit check spent months reporting
-phantoms nobody read.
-
-**Three tags a call site can declare**, all of them narrowing what the checks
-may ask rather than excusing a result:
-
-- `content:` — this colour is DATA, not a theme choice (an avatar disc derived
-  from a user id, a swatch for a scheme you have not picked).
-- `content:emoji` — a COLOUR glyph: its raster is not the ink it was asked for
-  and its advance is not its ink, so neither contrast nor truncation applies.
-- `transient:` — present in some frames and not others by design (the composer
-  caret blinks on a 530ms phase), so frame-equality checks skip it.
-
-**Reading a run.** Scenes and how to reach them live in
-`scripts/gui/audit/scenes.tsv`, one row per surface with the verbs and — not
-optional — a dump key to wait for. A verb acks when its handler *ran*, not when
-the frame showing its effect has been painted, and several of these views paint
-"Loading…" until the daemon answers; sleeping a fixed time instead
-captures a view mid-load, which reads as a layout defect.
-
-## Web parity: the two clients against each other
-
-`scripts/gui/parity.sh` shows the web client is the Win32 client. It walks the
-audit's scene list (`scripts/gui/audit/scenes.tsv`) on both, against one
-fixture, at one size, theme, scale and text size, and compares what each
-painted. `--quick` runs light, 96 dpi, text size 1; without it the run adds
-dark, 144 dpi and text size 3. `--scene <id>` runs one scene; `--keep` leaves
-both clients up.
-
-The two clients are one application, so a scene's two paint ledgers should
-hold the same primitives at the same places. `scripts/gui/audit/parity.py`
-aligns them and reports what is drawn on one side only, what moved or resized
-by more than a pixel, and what changed colour. Text widths are listed but do
-not fail a scene: DirectWrite and the browser's canvas measure the same string
-a pixel or two apart. A ledger cannot see what a raster holds (a glyph from
-another font, a sign clipped off), so the report ends with the scenes ranked by
-how many pixels differ to the eye, and `<out>/<state>.<scene>.side.png` holds
-Win32, web and their difference side by side.
-
-How a run is kept honest:
-
-- **Its own daemon.** Port 8453 (`OC_TEST_PORT`), data in `/tmp/oc-parity-dev`
-  (`OC_TEST_DIR`), wiped at the start, health port off
-  (`OC_TEST_HEALTH_PORT=0`). A scene that changes the workspace (the emoji
-  picker reacts) otherwise changes the next run.
-- **The fixture sender is rebuilt every run.** A `build/demo_client` from
-  before a protocol change fails its handshake, and a fixture with no messages
-  compares two empty screens. A send that fails stops the run.
-- **Both clients restart for each state,** so one pass does not inherit the
-  last pass's open tab or picker.
-- **The pointer is parked** on the rail's empty stretch on both clients before
-  each capture: the Win32 window is on a real desktop, and a mouse resting over
-  it draws a hover the browser never has.
-- **Each scene waits for its dump key, then for the conversation's members**
-  (`chanmem_ready=1`), so no picture is of "Loading…". A key with a leading `!`
-  waits for anything but that value (`modal !none`: some dialog is up).
-- **The browser gets this machine's Windows fonts** through a fontconfig made
-  for the run (`OC_TEST_FONTS`, default `/mnt/c/Windows/Fonts`). The headless
-  Chromium is a Linux one with no Segoe UI, and its fallback is about 16%
-  wider. Nothing is installed.
-
-The web driver takes `OC_TEST_VIEWPORT=<w>x<h>` and `OC_TEST_DPR=<ratio>`, the
-CSS size and device pixel ratio the page runs at; the run uses 1024x768 and
-dpi/96. Both drivers take `open <cmd>`, which dispatches a menu command id as
-its menu item does, for dialogs no verb reaches.
-
-Known differences that remain, and why:
-
-- A control sized by its label (the member count chip, a Preferences button)
-  is one or two pixels wider on the web, the two text engines' measurement.
-- Active sessions lists the other client's session where the first lists its
-  own, because each is "this device".
-- A colour emoji draws about a pixel larger on the web.
 
 ## `clipped=`: text that does not fit its own box
 

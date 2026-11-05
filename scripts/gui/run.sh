@@ -15,8 +15,8 @@
 # are skipped by name.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ALL="smoke startup composer drafts links keymenu members newmsg shortcuts chords reactions polls tables groups files uploads voice screenrec search_boxes calls calls_tcp balloon pdm workspaces navhistory"
-WEB_OK="smoke voice screenrec uploads files calls calls_tcp search_boxes pdm chords polls tables workspaces navhistory"
+ALL="smoke startup composer drafts links keymenu members newmsg shortcuts chords reactions polls tables groups files uploads voice screenrec search_boxes calls calls_tcp balloon pdm workspaces navhistory cursor emoji_admin preview timetoken spoiler collapse lightbox"
+WEB_OK="smoke voice screenrec uploads files calls calls_tcp search_boxes pdm chords polls tables workspaces navhistory cursor emoji_admin preview timetoken spoiler collapse lightbox"
 plat=win32
 case "${1:-}" in --win32) plat=win32; shift ;; --web) plat=web; shift ;; esac
 [ $# -gt 0 ] || { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }

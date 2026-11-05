@@ -9,6 +9,8 @@
 #include "client.h"     /* the core facade under test */
 #include "testsignin.h" /* a person's sign-in, on the daemon's page */
 #include "model.h"
+#include "emoticon.h"
+#include "richtext.h"     /* time tokens: oc_rt_time_token, oc_rt_clock */
 #include "store.h"       /* to assert the persisted token/pin */
 #include "resolve.h"     /* workspace resolution (REQ-010/011) */
 #include "wellknown.h"   /* the optional `.well-known` half of REQ-010 */
@@ -497,6 +499,105 @@ static void invite_created(oc_model *m, const char *token, uint8_t role, uint64_
 
 /* A reset to send its person: the workspace, the code for the app's sign-in,
  * and the page's own link only where one is given (AUTH.md §2). */
+/* A search result as the network thread hands it on: `status` is the page's
+ * truncation, set on its last row only; message_id 0 is an empty page's end. */
+static void search_ev(oc_model *m, uint64_t message_id, uint8_t status) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_SEARCH_RESULT;
+    e.channel_id = 1; e.message_id = message_id; e.author_id = 2; e.server_time = message_id;
+    e.status = status;
+    if (message_id) e.body = strdup("hit");
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+/* "More below" is the latest page's: a truncated page sets it, a complete page
+ * after it clears it, and so does an empty one (a "load more" that found
+ * nothing), which adds no hit. */
+static void test_search_truncated(void) {
+    oc_model m; oc_model_init(&m);
+    oc_model_search_begin(&m, "q");
+    search_ev(&m, 10, 0); search_ev(&m, 11, 1);       /* a page of two, truncated */
+    CHECK(m.search_truncated == 1 && m.n_search == 2);
+    search_ev(&m, 12, 0); search_ev(&m, 13, 0);       /* the next page, complete */
+    CHECK(m.search_truncated == 0 && m.n_search == 4);
+    search_ev(&m, 14, 1);                             /* truncated again */
+    CHECK(m.search_truncated == 1);
+    search_ev(&m, 0, 0);                              /* an empty page */
+    CHECK(m.search_truncated == 0 && m.n_search == 5);
+    oc_model_free(&m);
+}
+
+/* Typed emoticons (emoticon.h): a word of its own becomes its emoji; inside a
+ * longer word, inside code, or with the setting off, nothing changes. */
+static void test_emoticons(void) {
+    char out[256];
+    static const char *const PAIRS[][2] = {
+        { ":)", "\xF0\x9F\x99\x82" }, { ":-)", "\xF0\x9F\x99\x82" }, { ":(", "\xF0\x9F\x99\x81" },
+        { ":-(", "\xF0\x9F\x99\x81" }, { ":D", "\xF0\x9F\x98\x84" }, { ";)", "\xF0\x9F\x98\x89" },
+        { ";-)", "\xF0\x9F\x98\x89" }, { ":P", "\xF0\x9F\x98\x9B" }, { ":p", "\xF0\x9F\x98\x9B" },
+        { ":O", "\xF0\x9F\x98\xAE" }, { ":o", "\xF0\x9F\x98\xAE" }, { ":/", "\xF0\x9F\x98\x95" },
+        { ":|", "\xF0\x9F\x98\x90" }, { ":'(", "\xF0\x9F\x98\xA2" }, { "<3", "\xE2\x9D\xA4\xEF\xB8\x8F" },
+        { "</3", "\xF0\x9F\x92\x94" }, { "B)", "\xF0\x9F\x98\x8E" },
+    };
+    for (size_t i = 0; i < sizeof PAIRS / sizeof PAIRS[0]; i++) {
+        char in[32], want[64];
+        snprintf(in, sizeof in, "ok %s then", PAIRS[i][0]);
+        snprintf(want, sizeof want, "ok %s then", PAIRS[i][1]);
+        CHECK(oc_emoticon_convert(in, strlen(in), out, sizeof out) == 1 && strcmp(out, want) == 0);
+    }
+    /* At the start and the end of the text. */
+    CHECK(oc_emoticon_convert(":) hi <3", 8, out, sizeof out) == 2 &&
+          strcmp(out, "\xF0\x9F\x99\x82 hi \xE2\x9D\xA4\xEF\xB8\x8F") == 0);   /* contract: the converted bytes are the output */
+    /* Not part of a longer word, and never an address. */
+    CHECK(oc_emoticon_convert("a:)b x:) :)y", 12, out, sizeof out) == 0 && strcmp(out, "a:)b x:) :)y") == 0);
+    CHECK(oc_emoticon_convert("see http://x.example", 20, out, sizeof out) == 0);
+    /* Not in inline code, nor in a fenced block, closed or still being typed. */
+    const char *code = "run `:)` and\n```\n:) <3\n```\nthen :)";
+    CHECK(oc_emoticon_convert(code, strlen(code), out, sizeof out) == 1 &&
+          strstr(out, "`:)`") && strstr(out, "\n:) <3\n") && strstr(out, "then \xF0\x9F\x99\x82"));   /* contract: code left byte for byte */
+    const char *open_fence = "```\nx :)";
+    CHECK(oc_emoticon_convert(open_fence, strlen(open_fence), out, sizeof out) == 0);
+    const char *open_tick = "say `x :)";
+    CHECK(oc_emoticon_convert(open_tick, strlen(open_tick), out, sizeof out) == 0);
+    /* As a space is typed: the emoticon that ends at the caret, and its start. */
+    size_t st = 99;
+    const char *t = "well :-)";
+    CHECK(oc_emoticon_before(t, strlen(t), strlen(t), &st) != NULL && st == 5);
+    CHECK(oc_emoticon_before("x:)", 3, 3, &st) == NULL);
+    CHECK(oc_emoticon_before("`a :)", 5, 5, &st) == NULL);
+    /* Too small an output converts nothing. */
+    char tiny[4];
+    CHECK(oc_emoticon_convert("a :)", 4, tiny, sizeof tiny) == -1);
+    /* The setting: off by default, a person's own, read from the synced bucket. */
+    oc_model m; oc_model_init(&m);
+    CHECK(oc_model_setting(&m, "compose.emoticons") == NULL);   /* off unless set */
+    oc_ev e; memset(&e, 0, sizeof e);
+    e.type = OC_EV_SETTING;
+    snprintf(e.author_name, sizeof e.author_name, "compose.emoticons"); e.body = strdup("on");
+    oc_model_apply(&m, &e);
+    free(e.body);
+    const char *v = oc_model_setting(&m, "compose.emoticons");
+    CHECK(v && strcmp(v, "on") == 0);
+    /* With the setting off a typed emoticon stays as typed, on a space and on
+     * send; unset reads as off. Each composer asks these same calls. */
+    const char *typed = "ok :) then <3";
+    size_t tl = strlen(typed);
+    CHECK(oc_emoticon_setting_on(NULL) == 0 && oc_emoticon_setting_on("") == 0);
+    CHECK(oc_emoticon_setting_on("off") == 0 && oc_emoticon_setting_on(v) == 1);
+    CHECK(oc_emoticon_send(oc_emoticon_setting_on("off"), typed, tl, out, sizeof out) == 0 && strcmp(out, typed) == 0);
+    CHECK(oc_emoticon_send(oc_emoticon_setting_on(NULL), typed, tl, out, sizeof out) == 0 && strcmp(out, typed) == 0);
+    st = 99;
+    CHECK(oc_emoticon_typed(0, "ok :)", 5, 5, &st) == NULL && st == 99);
+    /* And on, the same calls convert. */
+    CHECK(oc_emoticon_send(1, typed, tl, out, sizeof out) == 2 && strcmp(out, typed) != 0);
+    CHECK(oc_emoticon_typed(1, "ok :)", 5, 5, &st) != NULL && st == 3);
+    /* Off, a body too long for the output is refused, as when on. */
+    CHECK(oc_emoticon_send(0, typed, tl, tiny, sizeof tiny) == -1);
+    oc_model_free(&m);
+}
+
 static void test_reset_text(void) {
     oc_model m; oc_model_init(&m);
     char text[1024];
@@ -1866,6 +1967,155 @@ static void test_broadcast_stored_model(void) {
     bc_edit(&m, 104, "now @everyone");
     CHECK(bc_find(&m, 104) && bc_find(&m, 104)->broadcast_stored == 0);
     CHECK(bc_counts(&m, 104) == 0);
+    oc_model_free(&m);
+}
+
+/* A time token in an excerpt reads in the reader's own zone and clock
+ * (MARKDOWN.md §1c). The zones are POSIX TZ rules, so no zone database is
+ * needed: UTC-8, UTC+5:30 and UTC+14, across the date line. The token is now,
+ * to the minute, so it is today in every zone and shows the time alone. */
+static void test_time_preview(void) {
+    const char *saved = getenv("TZ");
+    char keep[64] = "";
+    if (saved) snprintf(keep, sizeof keep, "%s", saved);
+    int64_t now = ((int64_t)time(NULL) / 60) * 60 * 1000;
+    char tok[48], body[96];
+    oc_rt_time_token(now, tok, sizeof tok);
+    snprintf(body, sizeof body, "standup %s", tok);
+    static const struct { const char *tz; int off; int h12; } Z[] = {
+        { "PST8", -480, 0 }, { "IST-5:30", 330, 1 }, { "LINT-14", 840, 0 }, { "UTC0", 0, 1 },
+    };
+    for (size_t k = 0; k < sizeof Z / sizeof Z[0]; k++) {
+        setenv("TZ", Z[k].tz, 1);
+        tzset();
+        oc_model m; oc_model_init(&m);
+        oc_model_set_clock12(&m, Z[k].h12);
+        oc_rt_clock want_clock = { Z[k].off, !Z[k].h12, 0, now };
+        char want[64], line[128];
+        int64_t lm = now / 1000 + Z[k].off * 60;
+        int hh = (int)(((lm % 86400) + 86400) % 86400 / 3600), mi = (int)(((lm % 3600) + 3600) % 3600 / 60);
+        if (Z[k].h12) snprintf(want, sizeof want, "standup %d:%02d %s", hh % 12 ? hh % 12 : 12, mi, hh < 12 ? "AM" : "PM");
+        else          snprintf(want, sizeof want, "standup %02d:%02d", hh, mi);
+        oc_rt_clock got_clock;
+        oc_model_clock(&m, now, &got_clock);
+        CHECK(got_clock.tz_min == want_clock.tz_min && got_clock.time24 == want_clock.time24);
+        oc_ev e;
+        memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 74; e.status = 1; e.op = OC_CHANNEL_KIND;
+        e.body = strdup("room");
+        oc_model_apply(&m, &e);
+        memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 74; e.message_id = 5; e.author_id = 2;
+        e.body = strdup(body);
+        oc_model_apply(&m, &e);
+        const oc_channel *c = oc_model_channel(&m, 74);
+        oc_model_msg_preview(&m, c ? &c->msgs[0] : NULL, line, sizeof line);
+        if (strcmp(line, want) != 0) printf("    %s: preview \"%s\", wanted \"%s\"\n", Z[k].tz, line, want);
+        CHECK(c && strcmp(c->preview, want) == 0);
+        CHECK(strcmp(line, want) == 0);
+        oc_model_free(&m);
+    }
+    if (saved) setenv("TZ", keep, 1); else unsetenv("TZ");
+    tzset();
+}
+
+/* A spoiler never shows in an excerpt (MARKDOWN.md §1d): the sidebar's
+ * preview, the one-line text a toast or a screen reader gets, and a thread
+ * reply's toast. */
+static void test_spoiler_preview(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 75; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("room");
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 75; e.message_id = 6; e.author_id = 2;
+    e.body = strdup("it was >!the butler!<");
+    oc_model_apply(&m, &e);
+    const oc_channel *c = oc_model_channel(&m, 75);
+    /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+    CHECK(c && strcmp(c->preview, "it was [spoiler]") == 0);
+    char line[128];
+    oc_model_msg_preview(&m, c ? &c->msgs[0] : NULL, line, sizeof line);
+    CHECK(!strstr(line, "butler"));
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 75; e.message_id = 7; e.author_id = 2;
+    e.body = strdup("```spoiler Ending\nshe lives\n```");
+    oc_model_apply(&m, &e);
+    c = oc_model_channel(&m, 75);
+    /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+    CHECK(c && strcmp(c->preview, "[spoiler: Ending]") == 0);
+
+    /* In a table cell, and in the old form, which hides nothing and needs no
+     * table to reach the excerpt. */
+    char cl[128];
+    oc_model_line(&m, 2, NULL, 0, "| a |\n|---|\n| >!the butler!< |", cl, sizeof cl);
+    CHECK(strstr(cl, "Table: 1 row") == cl && !strstr(cl, "butler"));
+    oc_model_line(&m, 2, NULL, 0, ">!the butler!<", cl, sizeof cl);
+    CHECK(strcmp(cl, "[spoiler]") == 0);
+    oc_model_line(&m, 2, NULL, 1, ">!the butler!< did it", cl, sizeof cl);
+    /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+    CHECK(!strstr(cl, "butler") && strstr(cl, "[spoiler] did it"));
+    /* The covered /me line the terminal client shows is this excerpt: a block
+     * holding the table the limit falls on is hidden whole there too. */
+    {
+        static char blk[2048];
+        size_t o = (size_t)snprintf(blk, sizeof blk, "```spoiler\nthe butler\n");
+        for (int i = 0; i < 33; i++) o += (size_t)snprintf(blk + o, sizeof blk - o, "| a |\n|---|\n| b |\n\n");
+        snprintf(blk + o, sizeof blk - o, "```");
+        char big[256];
+        oc_model_line(NULL, 2, "ada", 1, blk, big, sizeof big);
+        CHECK(!strstr(big, "butler"));
+        /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+        CHECK(strncmp(big, "ada [spoiler]", 13) == 0);
+    }
+    oc_model_line(&m, 2, NULL, 0, "||plain||", cl, sizeof cl);
+    CHECK(strcmp(cl, "||plain||") == 0);
+
+    /* Each other surface, from what the model keeps to the line it is shown as
+     * (oc_model_line, every excerpt's one path): a toast, the activity feed, a
+     * thread's row, a pinned message and a saved one. */
+    const char *const hid = "it was >!the butler!<";
+    /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+    const char *const want = "it was [spoiler]";
+    memset(&e, 0, sizeof e); e.type = OC_EV_THREAD_REPLY; e.channel_id = 75; e.parent_id = 6;
+    e.message_id = 8; e.author_id = 2; e.server_time = 8; e.count = 1; e.participant = 1;
+    e.body = strdup(hid); oc_model_apply(&m, &e); free(e.body);
+    CHECK(m.n_notices == 1 && strcmp(m.notices[0].body, want) == 0);
+    oc_model_line(&m, m.notices[0].author_id, NULL, m.notices[0].action, m.notices[0].body, line, sizeof line);
+    CHECK(strcmp(line, want) == 0);
+
+    oc_model_activity_begin(&m);
+    memset(&e, 0, sizeof e); e.type = OC_EV_ACTIVITY; e.message_id = 6; e.channel_id = 75; e.user_id = 2;
+    e.body = strdup(hid); oc_model_apply(&m, &e); free(e.body);
+    CHECK(m.n_activity == 1);
+    if (m.n_activity == 1) {
+        oc_model_line(&m, m.activity[0].actor_id, NULL, m.activity[0].action, m.activity[0].text, line, sizeof line);
+        CHECK(strcmp(line, want) == 0);
+    }
+
+    oc_model_threads_begin(&m);
+    memset(&e, 0, sizeof e); e.type = OC_EV_THREAD_SUMMARY; e.channel_id = 75; e.message_id = 6; e.following = 1;
+    e.author_id = 2; e.body = strdup(hid); oc_model_apply(&m, &e); free(e.body);
+    CHECK(m.n_threads == 1 && m.threads && m.threads[0].preview);
+    if (m.n_threads == 1 && m.threads[0].preview) {
+        oc_model_line(&m, m.threads[0].root_author, NULL, m.threads[0].action, m.threads[0].preview, line, sizeof line);
+        CHECK(strcmp(line, want) == 0);
+    }
+
+    oc_model_pinlist_begin(&m, 75);
+    memset(&e, 0, sizeof e); e.type = OC_EV_PINNED_MSG; e.channel_id = 75; e.message_id = 6; e.author_id = 2;
+    e.body = strdup(hid); oc_model_apply(&m, &e); free(e.body);
+    CHECK(m.n_pins == 1);
+    if (m.n_pins == 1) {
+        oc_model_line(&m, m.pins[0].author_id, NULL, m.pins[0].action, m.pins[0].body, line, sizeof line);
+        CHECK(strcmp(line, want) == 0);
+    }
+
+    oc_model_saved_begin(&m);
+    memset(&e, 0, sizeof e); e.type = OC_EV_SAVED_MSG; e.channel_id = 75; e.message_id = 6; e.author_id = 2;
+    e.body = strdup(hid); oc_model_apply(&m, &e); free(e.body);
+    CHECK(m.n_saved == 1);
+    if (m.n_saved == 1) {
+        oc_model_line(&m, m.saved[0].author_id, NULL, m.saved[0].action, m.saved[0].body, line, sizeof line);
+        CHECK(strcmp(line, want) == 0);
+    }
     oc_model_free(&m);
 }
 
@@ -5621,6 +5871,8 @@ int run_client_core_tests(void) {
     test_broadcast_mentions_me();
     test_broadcast_stored_model();
     test_workspace_sender_model();
+    test_time_preview();
+    test_spoiler_preview();
     test_badge_tiers();
     test_osnotify_null();
     test_feedback();
@@ -5631,6 +5883,8 @@ int run_client_core_tests(void) {
     test_server_build();
     test_invitation_text();
     test_reset_text();
+    test_search_truncated();
+    test_emoticons();
     test_addressable_targets();
     test_pins();
     test_summary_model();
@@ -5927,6 +6181,43 @@ int run_client_core_tests(void) {
                                                    !strcmp(m->users[i].pronouns, "he/him") &&
                                                    !strcmp(m->users[i].timezone, "Europe/Oslo");
                                       ok; })));
+                /* Setting only the voice (REQ-292) keeps every other field, the
+                 * phone saved from the other device among them: the core
+                 * fetches the whole profile first and sends it back. */
+                oc_client_set_profile(b2, T_FULLNAME, "Engineer", "he/him", "+47 555 01 99", "Europe/Oslo", "");
+                CHECK(WAIT_FOR(b2, ({ int ok = 0;
+                                      for (size_t i = 0; i < m->n_users; i++)
+                                          if (m->users[i].user_id == m->user_id)
+                                              ok = !strcmp(m->users[i].phone, "+47 555 01 99");
+                                      ok; })));
+                oc_client_set_voice(b, "test-voice-f");
+                CHECK(WAIT_FOR(b2, ({ int ok = 0;
+                                      for (size_t i = 0; i < m->n_users; i++)
+                                          if (m->users[i].user_id == m->user_id)
+                                              ok = !strcmp(m->users[i].voice_id, "test-voice-f") &&
+                                                   !strcmp(m->users[i].phone, "+47 555 01 99") &&
+                                                   !strcmp(m->users[i].title, "Engineer") &&
+                                                   !strcmp(m->users[i].timezone, "Europe/Oslo");
+                                      ok; })));
+                /* A message folded away on one device is folded on the other,
+                 * and opened again the same way (SET_COLLAPSED). */
+                {
+                    const oc_channel *fc = oc_model_channel((oc_model *)oc_client_model(b2), 1);
+                    uint64_t fmid = (fc && fc->n_msgs) ? fc->msgs[fc->n_msgs - 1].message_id : 0;
+                    CHECK(fmid != 0);
+                    oc_client_set_collapsed(b, fmid, 1);
+                    CHECK(WAIT_FOR(b2, ({ const oc_channel *cc = oc_model_channel((oc_model *)m, 1);
+                                          int ok = 0;
+                                          for (size_t i = 0; cc && i < cc->n_msgs; i++)
+                                              if (cc->msgs[i].message_id == fmid) ok = cc->msgs[i].collapsed;
+                                          ok; })));
+                    oc_client_set_collapsed(b, fmid, 0);
+                    CHECK(WAIT_FOR(b2, ({ const oc_channel *cc = oc_model_channel((oc_model *)m, 1);
+                                          int open = 0;
+                                          for (size_t i = 0; cc && i < cc->n_msgs; i++)
+                                              if (cc->msgs[i].message_id == fmid) open = !cc->msgs[i].collapsed;
+                                          open; })));
+                }
                 oc_client_mark_read(b2, 1);
                 CHECK(channel_unread(oc_client_model(b2), 1) == 0);
                 oc_client_set_read_cursor(b, 1, 0);

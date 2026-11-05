@@ -261,9 +261,11 @@ release-candidate is a stored build, tagged `release-N-rcK` and published as a
 prerelease; a release takes one release-candidate and publishes the same
 binaries, numbered N, to apt, dnf, the container registries and the GitHub
 release (the tarballs and the Windows installer), appends a `Release N`
-snapshot to `main`, and closes the issues it shipped, those of the
-documentation it carries included (`staging-build.yml`,
-`release-candidate.yml`, `release.yml`). Each release-candidate, release and
+snapshot to `main`, closes the issues it shipped, those of the
+documentation it carries included, and sends the list of them, each as filed,
+to the control plane for the release notes (`staging-build.yml`,
+`release-candidate.yml`, `release.yml`; the last's `notes` job sends to the
+address the `CONTROL_PLANE_URL` repository variable names). Each release-candidate, release and
 promotion is then copied to the public repository (`openchime/openchime`): its
 `staging`, the tag, the GitHub release and `main`, fast-forward only. Between releases, `promote.yml`
 appends `Documentation` snapshots to `main`. No compiler runs after the staging

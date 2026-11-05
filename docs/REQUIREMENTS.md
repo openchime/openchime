@@ -953,35 +953,108 @@ where one exists.
 
   Slack's **saved custom views** are not adopted: they are a way to cope with a
   filter set larger than this one.
-- **REQ-280.** *(Excluded by decision)* **Email notifications have not been provided, in any deployment
-  model; the one message mailed to a person has been an invitation, which central
-  has delivered for an enrolled workspace that turned invitation mail on
-  (`OPENCHIME_INVITE_MAIL`, ARCH-85).** No digest, no "you were mentioned" mail,
-  no unread summary — no notification email of any kind, and no mail sent by the
-  daemon itself. (The outbound-mail paths in the product are that invitation,
-  sent by central, and REQ-276's opt-in compliance journaling, which is an
-  operator-configured compliance export, not a notification.) The invitation
-  meets both reasons below: no self-hoster runs a mail relay for it, since
-  central sends it, and it carries no message content — only the invited address,
-  for a workspace whose name and address central already holds, and central keeps
-  nothing once it is sent. Everywhere else an invitation is the copyable text the
-  inviter's client shows (REQ-033). Two reasons, both deliberate. **Operationally**, it
-  would oblige every self-hoster to run or rent a mail relay and inherit
-  deliverability, bounce, and unsubscribe handling — a second delivery system
-  with its own failure modes, for a product whose entire delivery story is
-  otherwise one TLS connection. **On principle**, an email notification puts
-  message content (or, at minimum, who is talking to whom) into a third-party
-  mail system, which is precisely what a self-hosted deployment exists to avoid;
-  "we email your messages to Gmail" would undercut REQ-040/041's whole claim.
+- **REQ-280.** **Email notifications have been provided, in every deployment
+  model, of two kinds and no others: the mention email (REQ-365) and the
+  digest (REQ-366).** Each has been switched on or off by the person, within
+  what the workspace and the operator allow (REQ-367, ARCH-125), and both have
+  been sent through the daemon's one email path (REQ-368, ARCH-126), which
+  invitation mail (`OPENCHIME_INVITE_MAIL`, ARCH-85) has used as well. Nothing
+  else has been mailed: not a reaction, not a thread reply that names no one,
+  not a reminder (REQ-283) and not a call (REQ-285) — those stay in the
+  activity feed (REQ-139), on the desktop (REQ-138) and in push (REQ-133).
+  The design is [EMAIL.md](./EMAIL.md).
 
-  **The consequence has been stated rather than discovered.** Push is a federated
-  function (REQ-133) — only the project can mint APNs/FCM credentials for the
-  published apps — so with email excluded, a **self-hosted stand-alone
-  deployment has no out-of-app notification path at all**. Not a degraded one:
-  none. A user who is not looking at a client is not reached, and their unread
-  state is waiting when they return. That is an acceptable, even coherent, trade
-  for an air-gappable deployment, but an operator has been told it up front
-  rather than inferring it after choosing stand-alone.
+  **This reverses an exclusion, and the two reasons for it have been answered
+  rather than dropped.** The exclusion rested on two costs. **Operationally**,
+  mail would oblige every self-hoster to run or rent a relay and inherit
+  deliverability, bounces and unsubscribe handling. That cost has been moved,
+  not imposed: an enrolled or managed workspace has relayed through central,
+  which has carried the relay, the confirmation of every address and the
+  unsubscribe (REQ-370), and an operator who wants no mail at all has had it by
+  choosing no provider. **On principle**, a notification mail put message
+  content into a third-party mail system. It has not here: relayed mail has
+  carried names and a link, **never message text** (REQ-369), so what central
+  and the recipient's mail provider learn is that someone was mentioned in a
+  named conversation, not what was said — the same class of fact push already
+  carries (REQ-133), and a narrower one than REQ-040/041 forbid.
+
+  **The consequence for stand-alone has been stated rather than discovered.**
+  Push is a federated function (REQ-133), and the relay that carries notification
+  mail is central's (REQ-368). A **self-hosted stand-alone deployment has had no
+  out-of-app notification path** until a provider that delivers without central
+  sits behind the same interface: a user who is not looking at a client is not
+  reached, and their unread state is waiting when they return. That is an
+  acceptable trade for an air-gappable deployment, and an operator has been told
+  it up front rather than inferring it after choosing stand-alone.
+- **REQ-365.** A person has been sent a **mention email** for an **@mention or a
+  DM still unread on every one of their devices after a delay they choose**:
+  10 minutes, **30 minutes by default**, 1 hour or 4 hours. It has been sent **at
+  most once per conversation per delay window** — a burst of mentions in one
+  channel is one email, not ten — and never for what the person has read in the
+  meantime on any device, since the read cursor is the server's (REQ-090/095).
+  **Muted conversations and people have been excluded**, by the one notification
+  evaluator (REQ-281) rather than a second rule written for mail. The person has
+  been able to switch it on or off (REQ-367).
+
+  **Unread on every device, because the mail is for someone who is away.** A
+  mention read on the phone has reached its reader; mailing it as well would
+  teach people to filter the mail, which is the failure that makes the feature
+  worthless. The delay is the person's because "away" differs: four hours suits
+  someone who checks in twice a day, ten minutes someone who wants to be found.
+- **REQ-366.** A person has been able to receive a **digest**: on the **days**
+  and at the **time** they choose — **Monday to Friday at 08:00 in their own
+  timezone by default** (REQ-240) — one email listing their **unread mentions
+  and DMs** and the **unread counts in their starred channels** (REQ-234) since
+  the last digest. The digest has been **off by default**.
+
+  **Off by default because it is a habit, not an alert.** A mention email
+  answers "someone needs me"; a digest is a routine, and one nobody chose is
+  mail nobody reads.
+- **REQ-367.** Every feature that can reach a person outside the product — the
+  mention email and the digest first — has been **switched on or off at three
+  levels, and has worked only where all three allow it** (ARCH-125):
+  - **system:** the operator's choice of email provider (REQ-368), fixed by
+    central on a managed box;
+  - **workspace:** an owner's or admin's switches, and the defaults members
+    start from, on the workspace's own settings;
+  - **person:** their own notification settings, the same on all their devices
+    (ARCH-72).
+
+  A level that is off has been **said by name** in the person's settings — "your
+  workspace has turned this off", "this server sends no email" — rather than the
+  switch simply missing or doing nothing. A member's own choice has overridden
+  the workspace's default, as REQ-279's do-not-disturb default is overridden; it
+  has never overridden the workspace's switch.
+- **REQ-368.** The daemon has sent email through **one provider interface**,
+  chosen by the operator, with three providers:
+  - **`none`:** no email is sent, and the features that need it say so
+    (REQ-367);
+  - **`null`:** every message is accepted and dropped, so the rest of the path —
+    the triggers, the outbox, the settings — can be built, run and tested with no
+    mail system at all;
+  - **`openchime`:** messages are relayed to OpenChime's central service, for a
+    **managed or federated** workspace with an active enrollment (ARCH-84), and
+    are the only provider on a managed box.
+
+  Further providers have been additions behind the same interface, not a second
+  mail path (ARCH-126).
+- **REQ-369.** Email relayed through central has carried **names and a link,
+  never message text**: the names of the people, the conversation and the
+  workspace ("Ana mentioned you in #ops"), counts, and a link — never a
+  message's body, an attachment, a preview or a quoted line (REQ-040/041). The
+  link has been **opaque**: central has kept a permanent map from a random id to
+  the destination the daemon reported, and the email has linked to that id on
+  OpenChime's domain, whose page has opened the installed app at the workspace
+  (by its id) or, failing that, the web client. A federated workspace's address
+  has been the one central recorded at enrollment, after the daemon proved it
+  holds the workspace's key, so a link can only ever open the workspace that
+  sent it.
+- **REQ-370.** Central has **confirmed every recipient address once** before
+  sending notification email to it, and has **honoured unsubscribe** itself: an
+  address that unsubscribed has not been mailed again whatever a daemon asks,
+  and the person has been able to switch the feature back on from their own
+  settings (REQ-367). A daemon has not been able to make central mail an address
+  that never confirmed.
 - **REQ-281.** The decision *whether to notify a given user about a given
   message* has been made in **exactly one evaluator**, with a **documented
   precedence order**, and covered by a **truth table** rather than case-by-case
@@ -1418,11 +1491,132 @@ where one exists.
   incoming/outgoing webhooks (REQ-170/173). Because the client-daemon wire is a
   custom binary protocol (ARCH-6), an external API has been an additional surface
   (likely HTTP over the ALPN-demuxed listener, ARCH-32/54), not the wire itself.
+  The **MCP surface** (REQ-320–325, ARCH-120) has been the first such surface: an
+  AI agent, or a person's own AI client, has read and posted through it.
+  It has been designed as a **documented HTTP API** for reading history,
+  searching and posting, kept beside the MCP surface for agents rather than in
+  place of it (ARCH-123, REQ-350–354); the proposal is
+  [Plans/HTTP-API.md](./Plans/HTTP-API.md).
+- **REQ-350.** The HTTP API has been a **stable, versioned contract**: served
+  under a path that names its major version, documented as the reference an
+  integration is written against, and changed within a version only by
+  additions — a new field, a new endpoint, a new optional parameter. A change
+  that could break a working integration has been a new major version, served
+  beside the old one for a stated time, never a silent change to the old
+  (ARCH-123).
+- **REQ-351.** The HTTP API has been **authenticated by agent tokens**, and by
+  nothing else: a request has carried a bearer token the daemon minted for an
+  **agent principal** — a non-human account, distinct from any person, created
+  and revoked by an owner/admin — stored only as its hash, as a session token is
+  (ARCH-58). The agent's **channel memberships have been its only access**: it
+  has read, searched and posted in the channels it was added to, and nowhere
+  else, whatever the role of the person who created it. A person's session
+  token or browser sign-in has not opened the API (ARCH-123).
+- **REQ-352.** Every HTTP API request has been checked by **the same membership
+  checks as the wire handlers** that do the same thing — reading history,
+  searching, posting, replying in a thread — run against the agent's current
+  memberships at the time of the request, so removing an agent from a channel
+  has taken effect on its next request. Search has stayed bounded to history
+  the agent may read (REQ-031, REQ-081), an archived channel has refused posts
+  as it does on the wire, and an encrypted DM (REQ-314), which the daemon
+  cannot read, has been neither served nor posted to.
+- **REQ-353.** Every HTTP API **read and write has been audited** in the audit
+  log (REQ-251): when, which agent, what it did, on which channel or message,
+  and the outcome — refusals included, and **never the token** nor a message
+  body. API and MCP entries have shared one audit family of their own, so their
+  volume has aged out by itself (REQ-251b) and has not pushed out the
+  administrative record.
+- **REQ-354.** The HTTP API has been **rate-limited per token**, with reads,
+  searches and posts counted separately, answering excess requests with a
+  distinct "too many requests" status and the time to wait rather than
+  dropping them, and reporting on every response the limit, what remains of it
+  and when it resets, so a well-behaved integration has been able to pace itself
+  without ever being refused (cf. REQ-190, ARCH-71's per-token webhook limit).
 - **REQ-177.** A channel has been able to receive posts by **email-to-channel
   ingestion** — a per-channel address that turns an inbound email into a channel
   message — the inbound-email complement to incoming webhooks (REQ-170). Delivery
   has required inbound email reception, a deployment capability separate from the
   daemon's request handling (cf. the webhook CA-cert note, REQ-171).
+- **REQ-320.** The daemon has served an **MCP (Model Context Protocol) endpoint**,
+  `POST /mcp`, on the 2026-07-28 revision of the protocol, over the
+  ALPN-demuxed HTTP listener (ARCH-32/54) — **stateless**: every request has
+  stood alone, carrying its protocol version and its credential, with no
+  session, no handshake and no stream held open between requests (ARCH-120).
+  The endpoint has been **off unless the operator turns it on**; while it is off
+  the path has not existed. A request on another revision has been refused with
+  the revision the daemon speaks, and every request has been rate-limited per
+  principal (REQ-190/191).
+- **REQ-321.** A workspace has been able to have **agents**: an AI agent has been
+  an account of its own kind, created and removed by an owner or admin, that
+  reads and posts through the MCP surface and nothing else — it has not signed
+  in to a client, been in a DM or group DM, or been reachable by one. **Channel
+  membership has been its only access control**: an agent has read and posted in
+  exactly the channels it has been added to, and in no other, with no scopes or
+  per-tool grants beside that. An agent has **not counted against the
+  registered-user cap** (AUTH.md §2), and every member surface that lists or
+  names one has marked it as an agent.
+- **REQ-322.** An agent has authenticated with a **bearer token the daemon
+  minted**: random, shown once when an owner or admin creates it, stored only
+  hashed, as a session or webhook token is (ARCH-58/71), listed by name and
+  creation and last-use time, and **revocable** — a revoked token, or one whose
+  agent was removed, has been refused on the very next request. Tokens have
+  needed no identity source and no OpenChime-operated service, so agents have
+  worked on a workspace with nothing else configured and on one that is
+  air-gapped, in every deployment model (ARCH-76).
+- **REQ-323.** A person has been able to **connect their own AI client** to the
+  workspace through the MCP surface, and that client has acted **as them, with
+  exactly their access** — the channels and DMs they can read and post in, no
+  more — for as long as the connection stands. The client has signed in through
+  **MCP's OAuth authorization flow with the daemon as the authorization
+  server**, the person approving it on the daemon's own pages after signing in
+  there as they normally do; a person has been able to see and end their
+  connections, and an ended connection, or a removed person's, has been refused
+  on the next request. Encrypted DMs (REQ-314) have stayed unreadable through
+  it, since the daemon cannot read them.
+- **REQ-324.** A **write through the MCP surface has been visibly attributed**: an
+  agent's post has been authored by the agent and shown as an agent's, and a
+  post through a person's connection has been authored by the person and shown
+  as sent through their AI client — so no reader has mistaken either for
+  something a person typed. Posts have otherwise been ordinary messages,
+  delivered, notified, searched and retained as any other.
+- **REQ-325.** **Reads through the MCP surface have been recorded** in an audit
+  family of their own (REQ-251) — each history read and search, with who made
+  it, through which agent or connection, in which channel, and how many messages
+  it returned, never their content — and each post with the message it made.
+  The family has been bounded like every other (REQ-251a) and aged out on its
+  own (REQ-251b), so an agent reading heavily has never pushed security or
+  administrative entries out of the log.
+- **REQ-330.** A person has been able to **ask the assistant** a question in
+  plain words — from an Ask pane in the GUI, and from the action launcher in the
+  terminal client — and has been answered from the messages they can read. **The
+  asker's read access has been its only scope**: exactly the history search
+  covers for them (REQ-080/081), checked when the question is asked, so a channel
+  they have left, a private channel they are not in, a deleted message and an
+  encrypted DM (REQ-314) have never informed an answer, and two people asking the
+  same question have each been answered from their own access alone. The
+  assistant has had no access of its own (ARCH-121).
+- **REQ-331.** **Every answer has cited the messages it used**, each citation a
+  permalink (REQ-232) that has shown the message it cites and gone to it. A
+  statement citing nothing has not been shown. Where nothing the asker can read
+  bears on the question, the answer has said so rather than answering from the
+  model's own knowledge.
+- **REQ-332.** The assistant has **taken no actions and posted nothing**: it has
+  sent, edited, reacted, invited, scheduled and changed nothing, and has had no
+  identity a message could be posted under. An answer has gone only to the person
+  who asked; whatever of their conversation with it is kept has been theirs alone,
+  seen by no other member, owner or admin. Supervised reply stays an integration
+  (REQ-275).
+- **REQ-333.** **Nothing has left the box**: the question, the messages read for
+  it and the answer have been handled on the workspace's own server by a local
+  model, on the summary engine (ARCH-116), and the assistant has had no hosted
+  model option, whatever summaries are set to (REQ-313). The one thing fetched
+  from outside has been the model itself, on first use, checked against a pinned
+  digest.
+- **REQ-334.** The assistant has been **absent where no model is configured**: off
+  unless the operator turns it on, and off — with the reason in the log and the
+  rest of the server running — where the model cannot be fetched or loaded, the CPU
+  cannot run it, or it does not fit the deployment's memory (REQ-210). Where it is
+  off, no client has shown it.
 
 ---
 
@@ -1954,16 +2148,17 @@ messages (author name, ARCH-74).*
   paid-tier history *cap* (REQ-053 stands).
 - **REQ-251.** The daemon has recorded an **audit log** of administrative and
   security-relevant actions, **append-only, admin-readable, and kept apart from
-  the message store** (ARCH-79). The catalog has covered four families:
+  the message store** (ARCH-79). The catalog has covered five families:
   **administrative** (role change, user invite/remove, channel archive,
   retention or storage-policy change), **account lifecycle** (registration,
   password change, invite redeemed, owner bootstrap), **security** (a successful
-  sign-in, session revocation, failed authentication, denied privileged action), and
+  sign-in, session revocation, failed authentication, denied privileged action),
   **moderation** (a moderator deleting another user's message, removing a member
-  from a channel). A sign-in is recorded when a credential is proven — a password
-  or an identity-provider token — and not when an already-authenticated session
-  reconnects, so the log answers "who signed in, when" rather than counting
-  reconnects. Each entry has recorded when, who acted, what action, on what
+  from a channel), and **MCP access** (each read, search and post made through
+  the MCP surface, REQ-325). A sign-in is recorded when a credential is proven
+  — a password or an identity-provider token — and not when an
+  already-authenticated session reconnects, so the log answers "who signed in,
+  when" rather than counting reconnects. Each entry has recorded when, who acted, what action, on what
   target, and the outcome — **never the secret involved**: that a password
   changed, never the password; that an invite was redeemed, never the token.
 - **REQ-251a.** The audit log has been **bounded**, since an unbounded table on a
@@ -2049,6 +2244,70 @@ messages (author name, ARCH-74).*
   DMs, no private channels, no API, deleted 10 days after download. Compliance
   capture is a differentiator in this segment, not table stakes.
 
+  **Settled by ARCH-122**, with the design in
+  [Plans/COMPLIANCE-CAPTURE.md](./Plans/COMPLIANCE-CAPTURE.md): the file drop is
+  built first, the pull API second and SMTP journaling after them, all three
+  reading one record of what changed. What a captured record holds, who may
+  read it and how a person becomes an email address are REQ-340–345.
+
+- **REQ-340.** Compliance capture has delivered **one extract schema** in every
+  mechanism: a captured **message, edit, deletion, draft, file, channel and
+  user** has each been a record with its own fields — the ids it concerns, the
+  server's timestamps (REQ-050), its author or actor, and its content as stored
+  — and a record has carried the same fields as `X-OpenChime-` headers of its
+  EML and as members of its pull-API JSON, so an archive fed by one mechanism
+  has held what an archive fed by the other holds. Every record has had a
+  **capture sequence number**, server-assigned and strictly increasing, which
+  is the cursor each mechanism keeps and the key the pull API pages by
+  (REQ-276's keyset cursor). Turning capture on has begun with a **baseline**:
+  every channel, user and stored message as it stands, marked as a baseline,
+  since what changed before capture was on was not recorded (ARCH-122).
+- **REQ-341.** The pull API has been read with a **capture credential**, never
+  a user session (REQ-182): **minted by an owner**, shown once and **stored
+  only as its hash** (as a session token is, ARCH-58), carrying a label and a
+  **scope**, **revocable** by any owner with effect on the next request,
+  **rate-limited** per credential, and **audited in a family of its own** —
+  each mint, grant, revocation and read recorded beside the four families of
+  REQ-251, never the credential itself. A credential has been able to read
+  through the pull API and nothing else: it has opened no session, sent
+  nothing and held no role.
+- **REQ-342.** A captured person has been given **an email address by one
+  rule**, the same in the EML and the pull API: the address a sign-in
+  provider **verified**, else the **address on the profile**, else
+  `<username>@<workspace address>`, **marked as synthetic** wherever it
+  appears, so an archive has never taken a made-up address for a mailbox
+  someone reads. A record has also carried the user's id, so the person stays
+  identifiable when the address changes.
+- **REQ-343.** **Private channels, DMs and group DMs have been a separate
+  grant.** A capture credential has read public channels, their messages and
+  files, and the workspace's users by default; private channels, DMs, group
+  DMs and drafts have been read only under a second scope granted by an owner
+  as **its own audited act**, never implied by the first. The file drop and
+  journaling have taken the same two scopes from the operator's configuration,
+  and the daemon has recorded in the same audit family which scopes were in
+  force whenever they changed. Records outside a reader's scope have been left
+  out, not blanked. An encrypted DM (REQ-314) has been captured as the
+  conversation, its participants and each message's id, author and time —
+  never its content, which the daemon has never been able to read.
+- **REQ-344.** **Edits, deletions and drafts have been captured as they
+  happened**, which is what REQ-276's "where retention preserved them" has
+  meant: the daemon keeps only a message's latest text (REQ-051) and nulls a
+  deleted one's (REQ-052), so capture has recorded each change when it was
+  made — an edit as a record with the new text and a reference to the record
+  holding the old, a deletion as a record of who deleted it and when,
+  author or moderator, and a restore inside REQ-052's two minutes as a record
+  of its own. A draft (REQ-223) has been captured as stored user content each
+  time its stored text changed and when it was cleared. What a DLP webhook
+  (REQ-277) rewrote has been captured as it was stored: the original was
+  never stored, so it has never been captured.
+- **REQ-345.** **A legal hold has widened what capture has, never narrowed
+  it.** Where a hold (REQ-252) has kept an original that would otherwise have
+  gone — a body retention (REQ-250) would have removed, or the prior text of
+  an edited or deleted message — capture has included it, marked as held, and
+  the record of its eventual release has been captured too. Capture has not
+  depended on a hold: it has recorded every change whether or not one was in
+  force, and lifting a hold has removed nothing from an archive.
+
 - **REQ-277.** A tenant has been able to apply **data-loss prevention to messages
   before they are stored** — content is offered to a configured **DLP webhook**, and
   what the webhook returns is what gets posted. A redaction therefore *replaces* the
@@ -2086,6 +2345,33 @@ messages (author name, ARCH-74).*
   - **Edits and attachments.** An edit is a new send and goes through the same path;
     file CONTENT scanning is a different problem (size, binary formats) and is
     **out of scope** — recorded rather than silently omitted.
+
+- **REQ-360.** A team has been able to **move its history into OpenChime, and an
+  operator to take a portable copy out** (ARCH-124). The export has been a
+  **documented, versioned folder** ([EXPORT.md](./EXPORT.md)): one JSON Lines
+  file per kind — users, channels and DMs with their members, messages with
+  their threads, reactions, pins, attachments — the attachments' bytes beside
+  them, and a manifest carrying the format version, record counts and digests.
+  It has been written by an operator command of the daemon binary, run against
+  the workspace's own database. The import has read the same folder into a
+  fresh or existing workspace, keeping **each message's original time and
+  author**: a person has been **matched to an existing account by email**, and
+  one with no match has been **created deactivated**, so authorship survived
+  without opening an account nobody asked for, and the import's report has
+  listed them. Sessions, credentials, encrypted DMs and drafts have never been
+  exported. Converters from other products have been left to third parties,
+  which the published format is for.
+
+  **This is migration, not compliance capture (REQ-276) or legal hold
+  (REQ-252).** Capture is continuous, keeps edits and deletions, and delivers to
+  an archive the tenant names; a hold suspends retention. An export is one
+  operator's copy of the history as it stands, taken to move a team.
+
+  **It has been customer-side only, in every deployment model (ARCH-76).** The
+  export has been written by the tenant's own daemon to a place its operator
+  chose, and the import read by one; no service the project operates has read,
+  carried or stored either, so central has still never read message content
+  (REQ-040/041).
 
 ---
 
@@ -2169,7 +2455,9 @@ choose — which makes each one a per-frontend *obligation*.*
   **context menus have a keyboard route**: Ctrl+Up / Ctrl+Down put the keyboard on
   a message, Shift+F10 (or the Menu key) opens that message's actions — or, with
   no message under the keyboard, the conversation's own — and the menu that opens
-  is walked with the arrows and chosen from with Enter. A
+  is walked with the arrows and chosen from with Enter. **Admin → Custom emoji**
+  opens from the palette, and its search box and rows take Tab, the arrows and
+  Delete (CLIENT.md). A
   self-drawn UI gets nothing for free here, which is exactly why this is a
   requirement and not an assumption: the cost grows with every pane added.
 
@@ -2255,9 +2543,36 @@ feature.*
   external DMs** have not been supported. Cross-tenant messaging is precluded by
   the island model (ARCH-4/REQ-040); federation between tenants is a separate
   deployment concern (ARCH-76), not an in-product shared-channel feature.
-- **REQ-275.** *(Excluded by decision)* A **first-party bot/assistant and an MCP (Model Context Protocol)
-  server surface** have not been provided beyond the third-party app platform
-  (REQ-172). OpenChime ships no built-in assistant and exposes no MCP server; such
-  a thing could be built as an installed app, but is not a core feature. Summaries
-  of a channel or DM (REQ-310) are a core feature and are not an assistant: they
-  answer no questions, take no actions and post nothing.
+  Reaffirmed on 2026-10-31: shared channels would reopen the island model
+  (ARCH-4, REQ-040) -- one daemon trusting another, identities from a foreign
+  workspace, and a question of where each copy of a message is stored.
+- **REQ-275.** *(Excluded by decision)* A **first-party bot that acts or posts on
+  its own** has not been provided: nothing in the product posts, invites or
+  changes anything unless a person, or an integration the workspace installed
+  (REQ-172), asks it to. Supervised reply — an agent drafts, a person edits,
+  rejects or sends — has been an external integration built on webhooks
+  (REQ-170/173) and the MCP surface, not a product feature. Two things this once
+  excluded have since been admitted, each under requirements of its own in §7: an
+  authenticated MCP surface (REQ-320–325, ARCH-120), and a first-party assistant
+  (REQ-330–334, ARCH-121). The assistant is built, and answers only: it answers a
+  person's questions from what they can read, citing the messages it used, and
+  takes no action and posts nothing. It runs locally, on the workspace's own
+  server with a local model, and nothing it reads or answers leaves the box.
+  Summaries of a channel or DM (REQ-310) are a core feature and are not an
+  assistant: they answer no questions, take no actions and post nothing.
+- **REQ-315.** *(Excluded by decision)* **Translating the clients' interface** into other
+  languages has not been provided. It touches every string in three clients, and
+  is a separate project to be taken up as one, not a feature added piece by piece.
+- **REQ-316.** *(Excluded by decision)* **Public channels readable without an account** have
+  not been offered. Every reader is a member of the workspace (REQ-031); an
+  anonymous view is a large surface with security weight, for little demand in a
+  self-hosted product.
+- **REQ-317.** *(Excluded by decision)* **Topics as a second level within a channel** —
+  naming, renaming and resolving a topic, or requiring one on every message — have
+  not been supported. A channel's conversation is one stream with threads under
+  its messages (REQ-060); a second level would change how every message is placed,
+  read and searched.
+- **REQ-318.** *(Excluded by decision)* **Joining a call from a phone line** (dial-in over
+  the PSTN or SIP) has not been supported. A phone participant's audio could not
+  be end-to-end encrypted (REQ-306), and the bridge would need a SIP or PSTN
+  gateway and a paid telephony vendor in the call's path.

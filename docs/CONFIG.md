@@ -175,7 +175,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_HEALTH_PORT` | `8080` | The plaintext port for `/healthz` and the landing page (ARCH-25); 0 opens none. Integer 0..65535. |
 | `OPENCHIME_JOIN` | *(unset)* | Who may join by signing in through a provider: `domain:`, `tenant:`, `subject:` and `owner:` rules, comma-separated (AUTH.md §8.4). Unset: only by invitation. |
 | `OPENCHIME_OIDC_CONNECT_<n>` | *(unset)* | A direct connection to your own provider, 1 to 4 (SSO.md): `label=…;issuer=https://…;client_id=…;secret_file=…;subject=sub|oid;redirect=127.0.0.1|localhost`. |
-| `OPENCHIME_EXTRA_CA` | *(unset)* | PEM roots trusted beside the built-in ones for every outbound connection (push, enrollment, unfurls, S3): a service behind a private CA. |
+| `OPENCHIME_EXTRA_CA` | *(unset)* | PEM roots the daemon trusts beside the built-in ones for its own outbound connections (push, enrollment, unfurls, S3): a service behind a private CA. No client reads it: a client trusts a private CA only through the operating system's store. |
 | `OPENCHIME_TRUSTED_PROXIES` | *(unset)* | Addresses or CIDRs whose PROXY protocol v2 header is believed, comma-separated; the connection's address is then the one the proxy saw. |
 
 ### Features
@@ -222,6 +222,8 @@ Read by the daemon or a client only when `OPENCHIME_MODE=development` (TESTING.m
 | `OPENCHIME_DEV_USERS` | *(unset)* | Accounts made at first start, `name:password:role,…`, for a fixture; a real deployment's first owner comes from the setup token. |
 | `OPENCHIME_DEV_FILE_PAGE` | `200` | How many files one LIST_FILES page carries, so a test sees a second page. Integer 1..200. |
 | `OPENCHIME_DEV_CALL_MAX` | `10` | The most people in one call, so a test can fill one. Integer 2..32. |
+| `OPENCHIME_DEV_LOOPBACK` | `off` | Listen on 127.0.0.1 only (the protocol, health and call-audio ports), as `make run` does, so a development daemon and its fixed passwords are not reachable from the network. `on` or `off`. |
+| `OPENCHIME_DEV_SEND_RATE` | `30` | Messages one connection may send in 3 seconds; 0 is no cap, for a fixture that seeds many at once. Integer 0..1000000. |
 | `OPENCHIME_DEV_CONNS_PER_IP` | `1024` | Connections one address may hold; 0 is no cap, for a load test from one host. Integer 0..1000000. |
 | `OPENCHIME_DEV_DIR` | *(unset)* | GUI: the directory of the automation hook's command channel and dumps (TESTING.md). |
 | `OPENCHIME_DEV_AUDIO` | *(unset)* | Clients: `synthetic` audio devices, or `mic-denied`. |
@@ -413,6 +415,15 @@ SSRF gate (no loopback, private, link-local, CGNAT, multicast or reserved
 destination — checked on every resolved address and re-checked per redirect)
 and is capped in bytes, redirects and time; an air-gapped box's fetches simply
 fail, bounded and silent.
+
+## Email (REQ-280, ARCH-126)
+
+Notification email (REQ-365/366) is sent through a provider the operator
+chooses: none, a provider that accepts and drops every message (for testing),
+or OpenChime's central service, for an enrolled box and always on a managed
+one. The setting that chooses it will be a feature row in the reference above,
+documented here with what it needs, when it is built; invitation mail keeps
+`OPENCHIME_INVITE_MAIL`. The design is [EMAIL.md](./EMAIL.md) §3.
 
 ---
 

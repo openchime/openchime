@@ -47,12 +47,14 @@
 #include "client.h"
 #include "model.h"
 #include "mention.h"    /* OC_MENTION_NAME_MAX: a broadcast mention as written */
+#include "richtext.h"   /* time tokens in this terminal's own zone; spoilers covered */
 #include "complete.h"
 #include "resolve.h"    /* workspace -> host:port (REQ-010/011) */
 #include "store.h"      /* peek a stored session token (skip the sign-in box) */
 #include "secret_os.h" /* OS keyring for the session token */
 #include "config.h"     /* machine-local prefs (mouse, panels, time) */
 #include "env.h"        /* the development inputs */
+#include "emoticon.h"   /* typed emoticons (compose.emoticons) */
 #include "protocol.h"   /* OC_PRESENCE_*, OC_SESSION_TOKEN_LEN */
 #include "net.h"        /* oc_net_probe: how a workspace signs people in */
 #include "build_id.h"   /* OC_BUILD_ID: --version */
@@ -258,6 +260,52 @@ static void msg_nick(char *out, size_t cap, const oc_msg *m, uint64_t me, const 
     snprintf(out, cap, "user%llu", (unsigned long long)m->author_id);
 }
 
+/* Spoilers (MARKDOWN.md §1d): shown as "[spoiler]" or "[spoiler: Label]"
+ * until this reader reveals a message's with v (or its menu), per message and
+ * for this run only. */
+static uint64_t g_spl_shown[64];
+static int g_n_spl_shown;
+static int spoilers_shown(uint64_t mid) {
+    for (int i = 0; i < g_n_spl_shown; i++) if (g_spl_shown[i] == mid) return 1;
+    return 0;
+}
+static void spoilers_toggle(uint64_t mid) {
+    for (int i = 0; i < g_n_spl_shown; i++)
+        if (g_spl_shown[i] == mid) { g_spl_shown[i] = g_spl_shown[--g_n_spl_shown]; return; }
+    if (g_n_spl_shown == 64) memmove(g_spl_shown, g_spl_shown + 1, sizeof g_spl_shown[0] * 63), g_n_spl_shown--;
+    g_spl_shown[g_n_spl_shown++] = mid;
+}
+static int has_spoilers(const char *body) {
+    return body && oc_rt_spoilers(body, strlen(body), NULL, 0) > 0;
+}
+/* Long messages (CLIENT.md "Long messages"): one this reader folded away shows
+ * its first row; one past 25 rows or 3,000 characters its first 10, for
+ * everyone. c folds or unfolds (on every device); m shows a long one whole,
+ * here only. */
+enum { TUI_COLLAPSE_ROWS = 25, TUI_COLLAPSE_CHARS = 3000, TUI_COLLAPSE_SHOW = 10 };
+static uint64_t g_tui_expanded[128];
+static int g_n_tui_expanded;
+static int tui_expanded(uint64_t mid) {
+    for (int i = 0; i < g_n_tui_expanded; i++) if (g_tui_expanded[i] == mid) return 1;
+    return 0;
+}
+static void tui_expand(uint64_t mid, int on) {
+    for (int i = 0; i < g_n_tui_expanded; i++)
+        if (g_tui_expanded[i] == mid) { if (!on) g_tui_expanded[i] = g_tui_expanded[--g_n_tui_expanded]; return; }
+    if (!on) return;
+    if (g_n_tui_expanded == 128) memmove(g_tui_expanded, g_tui_expanded + 1, sizeof g_tui_expanded[0] * 127), g_n_tui_expanded--;
+    g_tui_expanded[g_n_tui_expanded++] = mid;
+}
+/* Cut the rows a body wrapped to, from `first`, to `keep`, and say why. */
+static void rows_cut(rows_t *r, size_t first, size_t keep, const char *why) {
+    if (r->n > first + keep) {
+        for (size_t k = first + keep; k < r->n; k++) free(r->v[k].s);
+        r->n = first + keep;
+    }
+    char *m = malloc(strlen(why) + 1);
+    if (m) { strcpy(m, why); rows_push(r, m, TB_CYAN); }
+}
+
 /* Append the wrapped rows for one message: header, body (or tombstone),
  * reactions, and — when `show_replies` — a thread reply-count marker. `ch` is
  * used only to resolve author names. */
@@ -285,7 +333,11 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
             else snprintf(who, sizeof who, "user%llu", (unsigned long long)m->author_id);
         }
         char said[1024];
-        oc_model_line(NULL, m->author_id, who, 1, m->body + m->action.start, said, sizeof said);
+        /* Its spoilers read as their words, or, shown, as written (§1d). */
+        if (spoilers_shown(m->message_id) && has_spoilers(m->body + m->action.start))
+            snprintf(said, sizeof said, "%s %s", who, m->body + m->action.start);
+        else
+            oc_model_line(NULL, m->author_id, who, 1, m->body + m->action.start, said, sizeof said);
         char *al = malloc(strlen(stamp) + strlen(said) + 16);
         if (al) {
             sprintf(al, "%s  * %s%s", stamp, said, m->edited ? " (edited)" : "");
@@ -307,7 +359,32 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
             for (size_t k = rstart; k < r->n; k++) r->v[k].mi = mi;
             return;
         }
-        wrap_push(r, m->body ? m->body : "", TB_DEFAULT, width, 4);
+        /* The source as written (MARKDOWN.md §5), except a spoiler, covered
+         * until it is shown (§1d), and a time token, which is shown as its
+         * time here: the token itself reads in UTC (§1c). */
+        int covering = m->body && !spoilers_shown(m->message_id) && has_spoilers(m->body);
+        char *cov = covering ? oc_rt_spoilers_covered(m->body, strlen(m->body)) : NULL;
+        const char *src = covering ? (cov ? cov : "") : m->body ? m->body : "";   /* no memory shows nothing */
+        oc_rt_clock k;
+        oc_model_clock(NULL, (int64_t)time(NULL) * 1000, &k);
+        k.time24 = !(g_cfg && !g_cfg->time_24h);
+        char *loc = oc_rt_local_times(src, strlen(src), &k);
+        size_t body_first = r->n;
+        wrap_push(r, loc ? loc : src, TB_DEFAULT, width, 4);
+        free(loc);
+        free(cov);
+        if (!tui_expanded(m->message_id)) {
+            size_t chars = 0, rows = r->n - body_first;
+            for (const char *q = m->body ? m->body : ""; *q; q++) if (((unsigned char)*q & 0xC0) != 0x80) chars++;
+            if (m->collapsed)
+                rows_cut(r, body_first, 1, "    \xe2\x80\xa6 collapsed (c to expand)");
+            else if (rows > TUI_COLLAPSE_ROWS || chars > TUI_COLLAPSE_CHARS) {
+                char why[96];
+                snprintf(why, sizeof why, "    \xe2\x80\xa6 %zu more lines (m to show)",
+                         rows > TUI_COLLAPSE_SHOW ? rows - TUI_COLLAPSE_SHOW : 0);
+                rows_cut(r, body_first, TUI_COLLAPSE_SHOW, why);
+            }
+        }
     }
     for (uint8_t k = 0; k < m->n_attach; k++) {           /* attachments (REQ-140) */
         const oc_attachment *a = &m->attach[k];
@@ -863,7 +940,7 @@ static void draw_help(int W, int H) {
         { "Members",    "n  new DM · Enter for message / role / remove" },
         { "New DM",     "type to find a person · Space end-to-end encrypted · Enter opens" },
         { "Encrypted",  "Ctrl+K: accept or decline, trust a new key, end or forget it" },
-        { "Messages",   "t thread · r react · e edit · x delete" },
+        { "Messages",   "t thread · r react · e edit · x delete · v spoilers · c collapse · m more" },
         { "Search",     "Ctrl+O newest first · oldest first · best match first" },
         { NULL, NULL },
         { NULL, "Everything else" },
@@ -973,8 +1050,19 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_PDM_ACCEPT, ACT_PDM_DECLINE, ACT_PDM_TRUST, ACT_PDM_CLOSE, ACT_PDM_FORGET,
        /* polls (REQ-225): who voted, and an option pressed */
        ACT_VOTERS, ACT_POLL_CLOSE, ACT_VOTE0, ACT_VOTE_LAST = ACT_VOTE0 + OC_POLL_MAX_OPTIONS - 1,
+       /* the read-aloud voices (REQ-292): before the summaries' notices, whose
+        * ids run on from ACT_SUM_NOTICE0 without an end */
+       ACT_VOICES, ACT_VOICE0, ACT_VOICE_LAST = ACT_VOICE0 + OC_VOICE_MAX - 1,
        /* summaries made while you were away: the list, then one of them */
-       ACT_SUM_NOTICES, ACT_SUM_NOTICE0 };
+       ACT_SPOILERS,
+       /* a long message folded away, and opened */
+       ACT_COLLAPSE, ACT_EXPAND,
+       ACT_SUM_NOTICES,
+       /* deactivate one's own account (REQ-033), behind a y/N */
+       ACT_DEACTIVATE,
+       /* typed emoticons become emoji (compose.emoticons) */
+       ACT_EMOTICONS,
+       ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
 static int      g_nmenu;
@@ -986,8 +1074,11 @@ static void menu_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
  * your vote: Tacos" when it is yours. The labels live here, not in the
  * model, which may move while the menu is open. */
 static char g_vote_labels[OC_POLL_MAX_OPTIONS][OC_POLL_OPTION_MAX + 32];
-static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int has_attach, const oc_poll_view *poll) {
+static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int has_attach, const oc_poll_view *poll, int spoilers, int collapsed) {
     g_nmenu = 0;
+    if (!deleted) g_menu[g_nmenu++] = (menuitem){ collapsed ? "Expand" : "Collapse", collapsed ? ACT_EXPAND : ACT_COLLAPSE };
+    if (spoilers && !deleted)
+        g_menu[g_nmenu++] = (menuitem){ spoilers > 1 ? "Hide spoilers" : "Show spoilers", ACT_SPOILERS };
     if (!deleted) g_menu[g_nmenu++] = (menuitem){ "Reply in thread", ACT_THREAD };
     if (!deleted) g_menu[g_nmenu++] = (menuitem){ "Add reaction",    ACT_REACT };
     if (poll && !deleted && !(poll->close_at_ms && (uint64_t)time(NULL) * 1000u >= poll->close_at_ms))
@@ -1071,6 +1162,8 @@ static const tk_pal_item g_launcher_items[] = {
     { "You",     "Do not disturb",      NULL, NULL, ACT_DND },
     { "You",     "Share my read receipts (on/off)", NULL, NULL, ACT_RECEIPTS },
     { "You",     "Your profile",        NULL, NULL, ACT_PROFILE },
+    { "You",     "Read-aloud voice",    NULL, NULL, ACT_VOICES },
+    { "You",     "Deactivate account",  NULL, NULL, ACT_DEACTIVATE },
     { "Admin",   "Invite a user",       NULL, NULL, ACT_INVITE },
     { "Admin",   "Storage usage",       NULL, NULL, ACT_STORAGE },
     { "Admin",   "Audit log",           NULL, NULL, ACT_AUDIT },
@@ -1082,8 +1175,15 @@ static const tk_pal_item g_launcher_items[] = {
 };
 /* The launcher as it is now: summaries only where the daemon makes them
  * (REQ-313), and a way back to the open one for this conversation. */
-static tk_pal_item g_launcher_now[sizeof g_launcher_items / sizeof *g_launcher_items + 2 + 2 + 3];
+static tk_pal_item g_launcher_now[sizeof g_launcher_items / sizeof *g_launcher_items + 2 + 2 + 3 + 1];   /* + the emoticons switch */
 static char g_sum_ready_label[48];
+
+/* Whether typed emoticons become emoji (emoticon.h): the person's synced
+ * compose.emoticons, off unless set. */
+#define EMOTICONS_SETTING_KEY "compose.emoticons"
+static int emoticons_on(const oc_model *m) {
+    return oc_emoticon_setting_on(m ? oc_model_setting(m, EMOTICONS_SETTING_KEY) : NULL);
+}
 
 static int launcher_build(const oc_model *m, uint64_t cid) {
     int n = 0;
@@ -1093,10 +1193,14 @@ static int launcher_build(const oc_model *m, uint64_t cid) {
     for (size_t i = 0; i < sizeof g_launcher_items / sizeof *g_launcher_items; i++) {
         if (g_launcher_items[i].id == ACT_SUMMARIZE && (!oc_model_summarize_available(m) || e2e)) continue;
         if (g_launcher_items[i].id == ACT_UPLOAD && e2e) continue;
+        if (g_launcher_items[i].id == ACT_VOICES && !oc_model_tts_available(m)) continue;
         g_launcher_now[n++] = g_launcher_items[i];
     }
     if (m->summary_open && cid && m->summary_channel == cid)
         g_launcher_now[n++] = (tk_pal_item){ "Channel", "Back to the summary", NULL, NULL, ACT_SUM_BACK };
+    /* Typed emoticons, a person's own setting shared with the GUI. */
+    g_launcher_now[n++] = (tk_pal_item){ "You", emoticons_on(m) ? "Emoticons: turn off" : "Emoticons: turn on",
+                                         ":) becomes an emoji", NULL, ACT_EMOTICONS };
     if (m->n_sum_notices) {
         snprintf(g_sum_ready_label, sizeof g_sum_ready_label, "Summaries ready (%zu)", m->n_sum_notices);
         g_launcher_now[n++] = (tk_pal_item){ "You", g_sum_ready_label, NULL, NULL, ACT_SUM_NOTICES };
@@ -1129,6 +1233,31 @@ static void menu_build_sum_notices(const oc_model *m) {
         g_nmenu++;
     }
 }
+/* The read-aloud voices (REQ-292), from TTS_INFO: each by its label and the
+ * language it speaks, the one this person is read in marked. The title carries
+ * the audition sentence, as text: this client plays no audio. Choosing one
+ * sets only the voice (oc_client_set_voice keeps every other field). */
+static char g_voice_labels[OC_VOICE_MAX][96];
+static char g_voice_title[240];
+static void menu_build_voices(const oc_model *m) {
+    const char *mine = "";
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == m->user_id) { mine = m->users[i].voice_id; break; }
+    g_nmenu = 0;
+    uint8_t nv = oc_model_tts_voice_count(m);
+    for (uint8_t k = 0; k < nv && k < OC_VOICE_MAX && g_nmenu < (int)(sizeof g_menu / sizeof *g_menu); k++) {
+        const oc_voice *v = oc_model_tts_voice(m, k);
+        if (!v) continue;
+        snprintf(g_voice_labels[k], sizeof g_voice_labels[k], "%s%s%s%s%s", v->label[0] ? v->label : v->id,
+                 v->lang[0] ? " (" : "", v->lang, v->lang[0] ? ")" : "",
+                 mine[0] && !strcmp(mine, v->id) ? "  \xe2\x9c\x93 current" : "");
+        g_menu[g_nmenu++] = (menuitem){ g_voice_labels[k], ACT_VOICE0 + k };
+    }
+    const char *say = oc_model_tts_preview(m);
+    if (say && say[0]) snprintf(g_voice_title, sizeof g_voice_title, "Read-aloud voice \xe2\x80\x94 each says \"%s\"", say);
+    else               snprintf(g_voice_title, sizeof g_voice_title, "Read-aloud voice");
+}
+
 /* The spans a summary can cover (PROTOCOL.md SUMMARIZE). */
 static void menu_build_summary_span(void) {
     g_nmenu = 0;
@@ -2969,7 +3098,7 @@ int main(int argc, char **argv) {
     const char *store_path = resolve_store_path();
     /* Prefer the OS keyring for the session token; NULL (headless / no keyring)
      * falls back to the SQLite store. Owned here, freed after the client stops. */
-    oc_secret *secret = oc_secret_open_os("openchime");
+    oc_secret *secret = oc_secret_open_os(oc_env_secret_service());
     oc_sidebar_opts_defaults(&g_sb);
     g_store_path = store_path;    /* the switcher reads the book from here */
     g_secret = secret;
@@ -3067,6 +3196,7 @@ int main(int argc, char **argv) {
     int jump_asked = 0;
     int help_open = 0;
     int profile_open = 0;                     /* /profile identity modal */
+    int deactivate_ask = 0;                   /* "Deactivate account": y/N before it is sent */
     int ac_idx = 0;                           /* autocomplete cycle index */
     int panel = 0;                            /* 0 composer · 1 channels · 2 messages · 3 members */
     int msg_sel = -1, mem_sel = 0;            /* selection within the messages / members panel */
@@ -3229,6 +3359,11 @@ int main(int argc, char **argv) {
          * buffer, then a single tb_present() below diffs it to the screen. (Two
          * presents per frame — base then overlay — flicker the overlay.) */
         render(cl, focus, composer, clen, scroll, help_open, ac_idx, panel, msg_sel, mem_sel, editing);
+        if (deactivate_ask)
+            tk_modal_confirm(tb_width(), tb_height(),
+                             "Deactivate your account? You will be signed out everywhere and "
+                             "cannot sign in; an owner or admin can bring it back. The only "
+                             "owner must make another first. [y/N]");
         if (action_open) {
             int mh = g_nmenu + 3; if (mh > tb_height() - 2) mh = tb_height() - 2;
             /* As wide as its longest item (a summary's line is long), within
@@ -3453,6 +3588,11 @@ int main(int argc, char **argv) {
             else storage_open = 0;
             continue;
         }
+        if (deactivate_ask) {                  /* y deactivates; anything else keeps the account */
+            deactivate_ask = 0;
+            if (ev.ch == 'y' || ev.ch == 'Y') oc_client_deactivate_self(cl);
+            continue;
+        }
         if (help_open) {                       /* help overlay: any key closes it */
             if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
             else help_open = 0;
@@ -3583,11 +3723,14 @@ int main(int argc, char **argv) {
                     } else await_invite = 1;
                 }
                 else if (id == ACT_PROFILE) profile_open = 1;
+                else if (id == ACT_DEACTIVATE) deactivate_ask = 1;
                 else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
                 else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
                 else if (id == ACT_ALERTS)  { oc_client_srvalerts_list(cl); alerts_open = 1; asel = 0; }
                 else if (id == ACT_WORKSPACES) { sw_build(); wsel = (g_active < g_nsw) ? g_active : 0; switcher_open = 1; }
                 else if (id == ACT_HELP)    help_open = 1;
+                else if (id == ACT_EMOTICONS)
+                    oc_client_set_setting(cl, EMOTICONS_SETTING_KEY, emoticons_on(oc_client_model(cl)) ? "off" : "on");
                 else if (id == ACT_LOGOUT)  { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
                 else if (id == ACT_SUMMARIZE && act_cid) {
                     menu_build_summary_span();
@@ -3596,6 +3739,12 @@ int main(int argc, char **argv) {
                     action_open = 1; tk_list_reset_filter(&action_menu);
                 }
                 else if (id == ACT_SUM_BACK) { summary_ui = 1; ssel = 0; }
+                else if (id == ACT_VOICES) {
+                    menu_build_voices(oc_client_model(cl));
+                    action_menu.sel = action_menu.top = 0;
+                    act_title = g_voice_title;
+                    action_open = g_nmenu > 0; tk_list_reset_filter(&action_menu);
+                }
                 else if (id == ACT_SUM_NOTICES) {
                     menu_build_sum_notices(oc_client_model(cl));
                     action_menu.sel = action_menu.top = 0;
@@ -3653,6 +3802,9 @@ int main(int argc, char **argv) {
                             oc_client_vote(cl, act_cid, act_mid, picks, np);
                         }
                     }
+                    else if (id == ACT_SPOILERS) spoilers_toggle(act_mid);
+                    else if (id == ACT_COLLAPSE) { tui_expand(act_mid, 0); oc_client_set_collapsed(cl, act_mid, 1); }
+                    else if (id == ACT_EXPAND)   { tui_expand(act_mid, 1); oc_client_set_collapsed(cl, act_mid, 0); }
                     else if (id == ACT_UNREAD) {
                         /* The cursor names the last message READ, so this one is
                          * unread from the one before it; 0 when it is the first. */
@@ -3724,12 +3876,20 @@ int main(int argc, char **argv) {
                         } else await_invite = 1;
                     }
                     else if (id == ACT_PROFILE) profile_open = 1;
+                    else if (id == ACT_DEACTIVATE) deactivate_ask = 1;
                     else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
                     else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
                     else if (id == ACT_ALERTS)  { oc_client_srvalerts_list(cl); alerts_open = 1; asel = 0; }
                     else if (id == ACT_WORKSPACES) { sw_build(); wsel = (g_active < g_nsw) ? g_active : 0; switcher_open = 1; }
                     else if (id == ACT_HELP)    help_open = 1;
+                    else if (id == ACT_EMOTICONS)
+                        oc_client_set_setting(cl, EMOTICONS_SETTING_KEY, emoticons_on(oc_client_model(cl)) ? "off" : "on");
                     else if (id == ACT_LOGOUT)  { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
+                    /* a read-aloud voice: only it changes */
+                    else if (id >= ACT_VOICE0 && id <= ACT_VOICE_LAST) {
+                        const oc_voice *v = oc_model_tts_voice(oc_client_model(cl), (uint8_t)(id - ACT_VOICE0));
+                        if (v) oc_client_set_voice(cl, v->id);
+                    }
                     /* summaries: the span, then the summary */
                     else if (id == ACT_SUMMARIZE) {
                         menu_build_summary_span();
@@ -3901,11 +4061,19 @@ int main(int argc, char **argv) {
                     for (uint8_t ak = 0; ak < sel->n_attach; ak++)
                         if (!sel->attach[ak].reclaimed) { has_attach = 1; break; }
                     if (ev.key == TB_KEY_ENTER) {   /* open the discoverable action menu */
-                        menu_build_msg(own, may_edit, may_del, sel->deleted || locked, has_attach && !ch->e2e, sel->poll);   /* no files in an encrypted DM */
+                        menu_build_msg(own, may_edit, may_del, sel->deleted || locked, has_attach && !ch->e2e, sel->poll,   /* no files in an encrypted DM */
+                                       has_spoilers(sel->body) ? 1 + spoilers_shown(mid) : 0, sel->collapsed);
+
                         act_cid = cid; act_mid = mid; act_uid = 0; act_title = "Message";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
                     else if (ev.ch == 't' && !locked) oc_client_open_thread(cl, cid, mid);
+                    else if (ev.ch == 'v' && has_spoilers(sel->body)) spoilers_toggle(mid);
+                    else if (ev.ch == 'c' && !sel->deleted) {   /* fold or unfold, on every device */
+                        tui_expand(mid, sel->collapsed);
+                        oc_client_set_collapsed(cl, mid, !sel->collapsed);
+                    }
+                    else if (ev.ch == 'm') tui_expand(mid, !tui_expanded(mid));
                     else if (ev.ch == 'w') oc_client_list_reactions(cl, cid, mid);
                     else if ((ev.ch == 'x' || ev.ch == 'd') && may_del) oc_client_delete(cl, cid, mid);
                     else if (own && ((ev.ch == 'e' && !may_edit) ||                  /* the window has closed */
@@ -3970,8 +4138,12 @@ int main(int argc, char **argv) {
                     }
                     g_bc_ask[0] = '\0';
                     if (bv.act == OC_BC_NOTE) snprintf(g_bc_note, sizeof g_bc_note, "%s", bv.note);
-                    if (mm->thread_open) oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
-                    else                 oc_client_send(cl, cid, composer);
+                    /* The last emoticon, with no space after it, converts as it goes. */
+                    char conv[COMPOSER_CAP * 2];
+                    const char *body = composer;
+                    if (oc_emoticon_send(emoticons_on(mm), composer, clen, conv, sizeof conv) > 0) body = conv;
+                    if (mm->thread_open) oc_client_reply(cl, mm->thread_channel, mm->thread_parent, body);
+                    else                 oc_client_send(cl, cid, body);
                 }
                 clen = 0; composer[0] = '\0'; scroll = 0;
             }
@@ -4009,6 +4181,18 @@ int main(int argc, char **argv) {
             tk_palette_set(&launcher, g_launcher_now, launcher_build(mm, act_cid));
             launcher_open = 1;
         } else if (ev.ch != 0) {
+            /* A space after a typed emoticon turns it into its emoji, when the
+             * person has that on (emoticon.h); the composer types at its end. */
+            if (ev.ch == ' ') {
+                size_t st = 0;
+                const char *emoji = oc_emoticon_typed(emoticons_on(oc_client_model(cl)), composer, clen, clen, &st);
+                size_t el = emoji ? strlen(emoji) : 0;
+                if (emoji && st + el + 1 < sizeof composer) {
+                    memcpy(composer + st, emoji, el);
+                    clen = st + el;
+                    composer[clen] = '\0';
+                }
+            }
             /* A typed codepoint: append its UTF-8 encoding to the composer. */
             utf8proc_uint8_t enc[4];
             utf8proc_ssize_t k = utf8proc_encode_char((utf8proc_int32_t)ev.ch, enc);

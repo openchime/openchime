@@ -23,6 +23,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "url.h"   /* oc_url_span */
+
 /* Styles. A span carries exactly one construct; OC_RT_DELIM is OR-ed in to say
  * "these bytes are the construct's delimiter, not its content" so a frontend
  * can dim `*`…`*` while keeping a `- ` bullet visible. */
@@ -46,6 +48,17 @@ enum {
     OC_RT_BREAK     = 0x0800,   /* `<br>` in a table cell: a line break. Only
                                  * oc_rt_scan_cell reports it; the bytes are the
                                  * whole construct, drawn as a new line */
+    OC_RT_TIME      = 0x1000,   /* `<time:2026-10-30T15:00Z>`: a moment, the
+                                 * whole token, drawn as its time in the
+                                 * reader's zone (oc_rt_time_value,
+                                 * oc_rt_time_text); no delimiter span */
+
+    OC_RT_SPOILER   = 0x2000,   /* >!hidden!< on one line: the hidden text, between
+                                 * two OC_RT_DELIM | OC_RT_SPOILER spans */
+    OC_RT_SPOILER_BLOCK = 0x4000, /* ```spoiler Label ... ```: the hidden lines,
+                                 * between the opening line (label included) and
+                                 * the closing fence, both OC_RT_DELIM |
+                                 * OC_RT_SPOILER_BLOCK; see oc_rt_spoilers */
 
     OC_RT_DELIM     = 0x8000    /* the delimiter bytes of the construct above */
 };
@@ -76,7 +89,7 @@ typedef struct {
  *     arithmetic and `a_variable_name` is an identifier.
  *   - Inline emphasis must close ON THE SAME LINE. A fenced code block need
  *     not; it is the only multi-line construct.
- *   - `\*` `\_` `\~` `` \` `` `\>` `\-` `\\` produce the literal character. The
+ *   - `\*` `\_` `\~` `` \` `` `\>` `\-` `\!` `\\` produce the literal character. The
  *     backslash is reported as a lone OC_RT_DELIM span so a frontend can hide
  *     it; the character after it is plain text.
  *   - Code suppresses everything: no markup, and no escapes, inside a code span
@@ -91,6 +104,19 @@ typedef struct {
  *     not the full stop. Only those two schemes are recognised: a link span is
  *     what a frontend turns into something the OS opens, so widening the set is
  *     a security decision and it is taken HERE rather than per frontend.
+ *   - `<time:YYYY-MM-DDTHH:MM[:SS]Z>` is a time token (MARKDOWN.md §1c): one
+ *     OC_RT_TIME span over the whole token, which a frontend draws as that
+ *     moment in the reader's own zone. The date and time must be real ones and
+ *     in UTC (the `Z`); anything else is literal text. Not inside code.
+ *   - `>!hidden!<` is a spoiler (MARKDOWN.md §1d): on one line and not empty,
+ *     opening anywhere in it, at its start before any block marker is looked
+ *     for: a line that begins `>!` and closes is no quote, one that does not
+ *     close is. The text inside may carry emphasis, not another spoiler. Nothing
+ *     else may cut one in two: emphasis, a link's label, a fence or a table's
+ *     pipe that falls inside one is its text. Code is the exception, which
+ *     suppresses a spoiler like anything else. A fenced block whose opening fence
+ *     is followed by the word `spoiler` and an optional label (```spoiler
+ *     Label) is a spoiler block: its lines are scanned as text, not code.
  *   - `[label](https://address)` is a labelled link: an OC_RT_LABELLED span
  *     over the label, which may itself carry emphasis, with OC_RT_DELIM |
  *     OC_RT_LABELLED spans over the `[` and over `](address)`. The address
@@ -165,10 +191,96 @@ int  oc_rt_row_next(oc_rt_rowit *it, oc_rt_cell cells[OC_RT_TABLE_MAX_COLS], uin
  * one line of inline text. Returns the count, which may exceed `max`. */
 size_t oc_rt_scan_cell(const char *body, size_t off, size_t len, oc_rt_span *out, size_t max);
 
+/* ---- time tokens (MARKDOWN.md §1c) ---------------------------------------- */
+
+/* The moment an OC_RT_TIME span from oc_rt_scan over the same `body` names, in
+ * Unix milliseconds. Returns 1, or 0 when `span` is not a time token. */
+int oc_rt_time_value(const char *body, size_t len, const oc_rt_span *span, int64_t *ms);
+
+/* The token for `ms` (whole minutes; seconds are written when not zero) into
+ * `out`, NUL-terminated. Returns its length, or 0 if `cap` is too small. */
+size_t oc_rt_time_token(int64_t ms, char *out, size_t cap);
+
+/* How a reader is shown a moment. `tz_min` is the reader's offset from UTC, in
+ * minutes, AT that moment (a frontend asks its own clock); `utc` says there is
+ * no reader -- the daemon's excerpts and speech -- and the text is UTC's,
+ * saying so. `now_ms` decides "today". */
+typedef struct oc_rt_clock {
+    int     tz_min;
+    int     time24;     /* 24-hour clock, else 12-hour with AM/PM */
+    int     utc;
+    int64_t now_ms;
+} oc_rt_clock;
+
+enum { OC_RT_TIME_SHORT = 0,   /* "15:00" today, else "Fri 30 Oct, 15:00", or
+                                * with the year when it is not this year's */
+       OC_RT_TIME_FULL };      /* "Friday 30 October 2026, 15:00 (UTC+05:30)" */
+
+/* `ms` as `clock` shows it, in the form `form`, into `out` (NUL-terminated).
+ * Returns the length written. A `clock` of NULL is the daemon's: UTC, 24-hour,
+ * "today" by the system clock. */
+size_t oc_rt_time_text(int64_t ms, const oc_rt_clock *clock, int form, char *out, size_t cap);
+
+/* ---- spoilers (MARKDOWN.md §1d) ------------------------------------------- */
+
+/* One spoiler, the whole construct: [start, start+len) from its opening
+ * delimiter to the end of its closing one; [hidden, hidden+hidden_len) the
+ * text it hides; its label, empty for none (always for the inline form); `cell`
+ * says it is in a table's cell, and `extra` one past the table's columns, which a
+ * grid does not draw. */
+typedef struct {
+    size_t start, len;
+    size_t hidden, hidden_len;
+    size_t label, label_len;
+    int    block;
+    int    cell;
+    int    extra;
+} oc_rt_spoiler;
+
+/* The spoilers in `body`, in order, up to `max`; returns how many there are
+ * (which may exceed `max`). `out` may be NULL when `max` is 0. Those in a
+ * table's cells are among them, the cells past its columns too, although
+ * oc_rt_scan reports a table as one span; one inside a spoiler block goes with
+ * the block. It allocates nothing, so it cannot fail: 0 always means none. */
+size_t oc_rt_spoilers(const char *body, size_t len, oc_rt_spoiler *out, size_t max);
+
+/* `body` with each spoiler in its covered form, "[spoiler]" or "[spoiler: Label]",
+ * and every other byte kept: a body as a frontend that shows the source shows it
+ * (the terminal client). Nothing after the 32nd spoiler. Returns a malloc'd
+ * string, or NULL when there is none (or no memory). */
+char *oc_rt_spoilers_covered(const char *body, size_t len);
+
+/* The addresses in `body` that are not in a spoiler, in order, up to `max`: what
+ * the daemon may fetch and show a card for, since a card would show under the
+ * message what the spoiler hides (MARKDOWN.md §1d). Looks at the first 64
+ * addresses, and past that reports none, nor any on no memory. */
+size_t oc_rt_visible_urls(const char *body, size_t len, oc_url_span *out, size_t max);
+
+/* `body` as a one-line excerpt shows it without giving anything away: each
+ * spoiler becomes "[spoiler]", or "[spoiler: Label]", each table its one line
+ * (as oc_rt_flatten), each time token its text in UTC, and every other byte
+ * is kept. At most `cap` bytes with the NUL, cut at a UTF-8 boundary; returns
+ * the length written. Every excerpt -- the client's previews and toasts, the
+ * daemon's excerpt fields -- hides spoilers this way (oc_rt_flatten_at, with
+ * the reader's clock where there is one). */
+size_t oc_rt_plain_excerpt(const char *body, size_t len, char *out, size_t cap);
+
 /* `body` on one line for an excerpt -- a sidebar preview, a toast, a search
- * hit: each table becomes "Table: N rows × M columns" and every other byte is
- * kept. Writes at most `cap` bytes including the NUL, cutting only at a UTF-8
+ * hit: each table becomes "Table: N rows × M columns", each time token its
+ * short text for `clock` (NULL: UTC, saying so), each spoiler is hidden (as
+ * oc_rt_plain_excerpt), and every other byte is kept. Past the 32nd table or the
+ * 32nd spoiler nothing is kept, rather than show something hidden.
+ * Writes at most `cap` bytes including the NUL, cutting only at a UTF-8
  * boundary, and returns the length written. */
+size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, char *out, size_t cap);
+
+/* Only the time tokens of `body` replaced by their short text for `clock`,
+ * every other byte kept, tables included: a body as a frontend that shows the
+ * source shows it (the terminal client, MARKDOWN.md §5). Returns a malloc'd
+ * string, or NULL when there is no token (show `body` as it is) or no memory. */
+char *oc_rt_local_times(const char *body, size_t len, const oc_rt_clock *clock);
+
+/* oc_rt_flatten_at for no reader: time tokens in UTC, spoilers hidden. */
 size_t oc_rt_flatten(const char *body, size_t len, char *out, size_t cap);
 
 #endif /* OC_RICHTEXT_H */

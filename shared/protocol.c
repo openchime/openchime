@@ -957,6 +957,19 @@ oc_result oc_encode_saved(oc_wbuf *w, uint16_t version, const oc_saved *m) {
     oc_w_u32(w, m->count);
     return oc_frame_end(w, off);
 }
+
+static oc_result encode_collapsed(oc_wbuf *w, uint16_t version, uint16_t type, const oc_set_collapsed *m) {
+    size_t off = oc_frame_begin(w, version, type);
+    oc_w_u64(w, m->message_id);
+    oc_w_u8(w, m->on ? 1 : 0);
+    return oc_frame_end(w, off);
+}
+oc_result oc_encode_set_collapsed(oc_wbuf *w, uint16_t version, const oc_set_collapsed *m) {
+    return encode_collapsed(w, version, OC_MSG_SET_COLLAPSED, m);
+}
+oc_result oc_encode_collapsed_updated(oc_wbuf *w, uint16_t version, const oc_set_collapsed *m) {
+    return encode_collapsed(w, version, OC_MSG_COLLAPSED_UPDATED, m);
+}
 oc_result oc_encode_list_activity(oc_wbuf *w, uint16_t version, uint8_t filter) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LIST_ACTIVITY);
     oc_w_u8(w, filter);
@@ -1014,6 +1027,11 @@ oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_
 
 oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LIST_CHANNELS);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_deactivate_self(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_DEACTIVATE_SELF);
     return oc_frame_end(w, off);
 }
 
@@ -1687,12 +1705,18 @@ oc_result oc_encode_audit_query(oc_wbuf *w, uint16_t version, const oc_audit_que
     size_t off = oc_frame_begin(w, version, OC_MSG_AUDIT_QUERY);
     oc_w_u64(w, m->before_ms);
     oc_w_u16(w, m->limit);
+    oc_w_u8(w, m->family);
+    oc_w_u64(w, m->actor_id);
+    oc_w_str(w, m->action);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_decode_audit_query(oc_rbuf *r, oc_audit_query *m) {
     m->before_ms = oc_r_u64(r);
     m->limit = oc_r_u16(r);
+    m->family = oc_r_u8(r);
+    m->actor_id = oc_r_u64(r);
+    m->action = oc_r_str(r);
     return r_done(r);
 }
 
@@ -2459,6 +2483,12 @@ oc_result oc_encode_enable_user(oc_wbuf *w, uint16_t version, const oc_enable_us
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_get_profile(oc_wbuf *w, uint16_t version, const oc_get_profile *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_GET_PROFILE);
+    oc_w_u64(w, m->user_id);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_revoke_session(oc_wbuf *w, uint16_t version, const oc_revoke_session *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_REVOKE_SESSION);
     oc_w_u64(w, m->session_id);
@@ -3203,6 +3233,12 @@ oc_result oc_decode_saved(oc_rbuf *p, oc_saved *m) {
     m->count = oc_r_u32(p);
     return r_done(p);
 }
+
+oc_result oc_decode_set_collapsed(oc_rbuf *p, oc_set_collapsed *m) {
+    m->message_id = oc_r_u64(p);
+    m->on = oc_r_u8(p);
+    return r_done(p);
+}
 oc_result oc_decode_activity_entry(oc_rbuf *p, oc_activity_entry *m) {
     m->kind = oc_r_u8(p); m->message_id = oc_r_u64(p); m->channel_id = oc_r_u64(p);
     m->actor_id = oc_r_u64(p); m->at = oc_r_u64(p); m->text = oc_r_str(p);
@@ -3688,6 +3724,11 @@ oc_result oc_decode_credential_reset(oc_rbuf *p, oc_credential_reset *m) {
 }
 
 oc_result oc_decode_enable_user(oc_rbuf *p, oc_enable_user *m) {
+    m->user_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_get_profile(oc_rbuf *p, oc_get_profile *m) {
     m->user_id = oc_r_u64(p);
     return r_done(p);
 }

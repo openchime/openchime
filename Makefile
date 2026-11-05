@@ -1,7 +1,7 @@
 # What a person types here:
 #   make              the daemon (openchimed), quickly: no speech, no summaries, no web client
 #   make full         everything: the daemon with every feature and its data, and every client
-#   make run          a dev daemon on port 8443, every interface, alice/bob
+#   make run          a dev daemon on 127.0.0.1:8443, alice/bob
 #   make test         the fast tests, before every push (local)
 #   make test-merge   everything a pull request must pass (CI only; PART=plain|threads)
 #   make test-release the checks on what the release ships (CI only; PART=packages|image|windows)
@@ -138,9 +138,8 @@ full:
 
 # One-shot local dev server: builds the daemon + TUI and runs the daemon on
 # port 8443 (health 8080) with sane paths + bootstrap users (alice/pw, bob/pw).
-# The daemon binds every interface (0.0.0.0 and [::]), not loopback: anyone
-# who can reach this machine can sign in with those passwords. Run it only on
-# a trusted network or behind a firewall. Connect from another terminal:
+# It listens on 127.0.0.1 only (OPENCHIME_DEV_LOOPBACK=on), so its fixed
+# passwords are not reachable from the network. Connect from another terminal:
 # build/openchime-tui 127.0.0.1 8443, then sign in as alice/pw
 #
 # LEAN=1 runs the same daemon under the lean profile's ceiling (ARCH-4,
@@ -164,11 +163,11 @@ run: $(BIN) $(TUI_BIN)
 	   echo "The daemon was not started: it would have run without the limits. Run it on a host with a systemd user session, or in a 256 MB, one-CPU VM or container; or run make run without LEAN." >&2; \
 	   exit 1; \
 	 fi
-	@echo "openchime dev daemon -> port 8443 on EVERY interface, not just loopback  (users: alice/pw, bob/pw)"
+	@echo "openchime dev daemon -> 127.0.0.1:8443, loopback only  (users: alice/pw, bob/pw)"
 	@[ "$(LEAN)" != 1 ] || echo "lean profile: MemoryMax=256M, MemorySwapMax=0, CPUQuota=100% (one CPU), in a systemd user scope"
 	@echo "connect: build/openchime-tui 127.0.0.1 8443  (sign in as alice/pw)"
 	@OPENCHIME_MODE=development OPENCHIME_DATA_DIR=/tmp/openchime-dev OPENCHIME_PORT=8443 OPENCHIME_HEALTH_PORT=8080 \
-	 OPENCHIME_DEV_USERS="alice:pw:owner,bob:pw:member" $(if $(filter 1,$(LEAN)),$(LEAN_SCOPE) -- )./$(BIN)
+	 OPENCHIME_DEV_LOOPBACK=on OPENCHIME_DEV_USERS="alice:pw:owner,bob:pw:member" $(if $(filter 1,$(LEAN)),$(LEAN_SCOPE) -- )./$(BIN)
 
 # Every client the tree builds, one per platform: macOS, iOS and Android join
 # this list when they exist.
