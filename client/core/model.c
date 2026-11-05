@@ -2721,8 +2721,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     case OC_EV_SEARCH_RESULT:
         if (m->search_open) {
-            search_append(m, e->message_id, e->channel_id, e->author_id, e->server_time, e->action, e->rank, &e->body);
-            if (e->status) m->search_truncated = 1;
+            /* message_id 0 is an empty page's end, not a hit. */
+            if (e->message_id)
+                search_append(m, e->message_id, e->channel_id, e->author_id, e->server_time, e->action, e->rank, &e->body);
+            /* The latest page's: only a page's last event carries its
+             * truncation, every earlier row 0, so the page's end decides. */
+            m->search_truncated = e->status ? 1 : 0;
         }
         break;
     case OC_EV_REACTIONS:

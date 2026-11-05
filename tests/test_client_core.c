@@ -497,6 +497,36 @@ static void invite_created(oc_model *m, const char *token, uint8_t role, uint64_
 
 /* A reset to send its person: the workspace, the code for the app's sign-in,
  * and the page's own link only where one is given (AUTH.md §2). */
+/* A search result as the network thread hands it on: `status` is the page's
+ * truncation, set on its last row only; message_id 0 is an empty page's end. */
+static void search_ev(oc_model *m, uint64_t message_id, uint8_t status) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_SEARCH_RESULT;
+    e.channel_id = 1; e.message_id = message_id; e.author_id = 2; e.server_time = message_id;
+    e.status = status;
+    if (message_id) e.body = strdup("hit");
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+/* "More below" is the latest page's: a truncated page sets it, a complete page
+ * after it clears it, and so does an empty one (a "load more" that found
+ * nothing), which adds no hit. */
+static void test_search_truncated(void) {
+    oc_model m; oc_model_init(&m);
+    oc_model_search_begin(&m, "q");
+    search_ev(&m, 10, 0); search_ev(&m, 11, 1);       /* a page of two, truncated */
+    CHECK(m.search_truncated == 1 && m.n_search == 2);
+    search_ev(&m, 12, 0); search_ev(&m, 13, 0);       /* the next page, complete */
+    CHECK(m.search_truncated == 0 && m.n_search == 4);
+    search_ev(&m, 14, 1);                             /* truncated again */
+    CHECK(m.search_truncated == 1);
+    search_ev(&m, 0, 0);                              /* an empty page */
+    CHECK(m.search_truncated == 0 && m.n_search == 5);
+    oc_model_free(&m);
+}
+
 static void test_reset_text(void) {
     oc_model m; oc_model_init(&m);
     char text[1024];
@@ -5631,6 +5661,7 @@ int run_client_core_tests(void) {
     test_server_build();
     test_invitation_text();
     test_reset_text();
+    test_search_truncated();
     test_addressable_targets();
     test_pins();
     test_summary_model();

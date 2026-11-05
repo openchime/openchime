@@ -1592,6 +1592,13 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (e->body) { memcpy(e->body, se[i].snippet.ptr, se[i].snippet.len); e->body[se[i].snippet.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+            /* A page with no rows still ends a page: one event, message_id 0,
+             * so the model learns that a "load more" found nothing and stops
+             * offering another. */
+            if (count == 0) {
+                oc_ev *e = oc_ev_new(OC_EV_SEARCH_RESULT);
+                if (e) { e->status = trunc; oc_queue_push(to_ui, e); }
+            }
         } else if (hdr.msg_type == OC_MSG_POLL) {
             /* A poll's definition and tallies (REQ-225). It follows its
              * message's ACTION, so a held message has been released by now. */
