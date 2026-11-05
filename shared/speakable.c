@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct { char *p; size_t n, cap; } sbuf;
@@ -77,26 +78,33 @@ static size_t speak(const char *body, size_t len, oc_speak_name_fn resolve, void
                     char *out, size_t cap) {
     sbuf b = { out, 0, cap };
 
-    oc_rt_span spans[OC_RT_MAX];
-    size_t nsp = oc_rt_scan(body, len, spans, OC_RT_MAX);
-    if (nsp > OC_RT_MAX) nsp = OC_RT_MAX;
+    /* Every span and every spoiler, however many: ordinary text is said in full,
+     * and hidden text never is, so nothing here can stop short. With no memory
+     * for them, nothing is said. */
+    size_t nsp = oc_rt_scan(body, len, NULL, 0), nspl = oc_rt_spoilers(body, len, NULL, 0);
+    oc_rt_span *spans = nsp ? malloc(nsp * sizeof *spans) : NULL;
+    oc_rt_spoiler *spl = nspl ? malloc(nspl * sizeof *spl) : NULL;
+    if ((nsp && !spans) || (nspl && !spl)) { free(spans); free(spl); if (cap) out[0] = '\0'; return 0; }
+    if (nsp) oc_rt_scan(body, len, spans, nsp);
+    if (nspl) oc_rt_spoilers(body, len, spl, nspl);
+    size_t sp_at = 0, spl_at = 0, spl_nl = 0;   /* each list's place: both are in order */
+
     oc_mention ments[OC_MENTION_MAX];
     size_t nm = oc_mention_scan(body, len, ments, OC_MENTION_MAX);
     if (nm > OC_MENTION_MAX) nm = OC_MENTION_MAX;
-
-    /* Spoilers (MARKDOWN.md §1d): said as the word, or with their label, and
-     * never what they hide. */
-    oc_rt_spoiler spl[32];
-    size_t nspl = oc_rt_spoilers(body, len, spl, 32);
-    if (nspl > 32) { len = spl[31].start + spl[31].len; nspl = 32; }   /* nothing past an unlisted one */
 
     int in_quote = 0;
     size_t i = 0;
     while (i < len && b.n + 1 < b.cap) {
         /* Constructs starting here, outermost first. */
         int handled = 0;
-        for (size_t k = 0; k < nspl && !handled; k++) {
-            if (spl[k].start != i) continue;
+        /* Spoilers (MARKDOWN.md §1d): said as the word, or with their label, and
+         * never what they hide. */
+        while (spl_at < nspl && spl[spl_at].start < i) spl_at++;
+        for (size_t k = spl_at; k < nspl && spl[k].start == i && !handled; k++) {
+            /* In a cell, the table it starts is what is said: its announcement
+             * reads no cell. */
+            if (spl[k].cell) continue;
             if (spl[k].block) full_stop(&b); else space(&b);   /* a block is its own sentence */
             puts_(&b, "spoiler");
             if (spl[k].label_len) { puts_(&b, ": "); put(&b, body + spl[k].label, spl[k].label_len); }
@@ -105,9 +113,9 @@ static size_t speak(const char *body, size_t len, oc_speak_name_fn resolve, void
             handled = 1;
         }
         if (handled) continue;
-        for (size_t k = 0; k < nsp && !handled; k++) {
+        while (sp_at < nsp && spans[sp_at].start < i) sp_at++;
+        for (size_t k = sp_at; k < nsp && spans[k].start == i && !handled; k++) {
             const oc_rt_span *s = &spans[k];
-            if (s->start != i) continue;
             uint16_t st = s->style;
             if (st & OC_RT_DELIM) {
                 /* A delimiter, a list marker or an escape: not said. The quote
@@ -183,6 +191,9 @@ static size_t speak(const char *body, size_t len, oc_speak_name_fn resolve, void
             size_t j = i + 1;
             while (j < len && (body[j] == ' ' || body[j] == '\t')) j++;
             if (!(j < len && body[j] == '>')) in_quote = 0;
+            /* `>!` that closes is a spoiler at the start of a line, not the marker. */
+            while (spl_nl < nspl && spl[spl_nl].start < j) spl_nl++;
+            if (spl_nl < nspl && spl[spl_nl].start == j) in_quote = 0;
             i++;
             continue;
         }
@@ -198,6 +209,8 @@ static size_t speak(const char *body, size_t len, oc_speak_name_fn resolve, void
         put(&b, body + i, 1);
         i++;
     }
+    free(spans);
+    free(spl);
     while (b.n && b.p[b.n - 1] == ' ') b.p[--b.n] = '\0';
 
     /* Nothing to say unless a letter or digit survived. */

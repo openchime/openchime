@@ -278,27 +278,6 @@ static void spoilers_toggle(uint64_t mid) {
 static int has_spoilers(const char *body) {
     return body && oc_rt_spoilers(body, strlen(body), NULL, 0) > 0;
 }
-/* `body` with each spoiler in its covered form; NULL when there is none (or
- * no memory), meaning show `body` as it is. A message past 32 spoilers shows
- * nothing after the 32nd. */
-static char *spoilers_covered(const char *body) {
-    oc_rt_spoiler sp[32];
-    size_t len = strlen(body), n = oc_rt_spoilers(body, len, sp, 32), i = 0, o = 0;
-    if (!n) return NULL;
-    if (n > 32) { len = sp[31].start + sp[31].len; n = 32; }
-    char *out = malloc(len + n * 80 + 1);
-    if (!out) return NULL;
-    for (size_t k = 0; k < n; k++) {
-        memcpy(out + o, body + i, sp[k].start - i); o += sp[k].start - i;
-        if (sp[k].label_len) o += (size_t)sprintf(out + o, "[spoiler: %.*s]", (int)(sp[k].label_len > 64 ? 64 : sp[k].label_len), body + sp[k].label);
-        else                 o += (size_t)sprintf(out + o, "[spoiler]");
-        i = sp[k].start + sp[k].len;
-    }
-    memcpy(out + o, body + i, len - i); o += len - i;
-    out[o] = '\0';
-    return out;
-}
-
 /* Long messages (CLIENT.md "Long messages"): one this reader folded away shows
  * its first row; one past 25 rows or 3,000 characters its first 10, for
  * everyone. c folds or unfolds (on every device); m shows a long one whole,
@@ -354,7 +333,11 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
             else snprintf(who, sizeof who, "user%llu", (unsigned long long)m->author_id);
         }
         char said[1024];
-        oc_model_line(NULL, m->author_id, who, 1, m->body + m->action.start, said, sizeof said);
+        /* Its spoilers read as their words, or, shown, as written (§1d). */
+        if (spoilers_shown(m->message_id) && has_spoilers(m->body + m->action.start))
+            snprintf(said, sizeof said, "%s %s", who, m->body + m->action.start);
+        else
+            oc_model_line(NULL, m->author_id, who, 1, m->body + m->action.start, said, sizeof said);
         char *al = malloc(strlen(stamp) + strlen(said) + 16);
         if (al) {
             sprintf(al, "%s  * %s%s", stamp, said, m->edited ? " (edited)" : "");
@@ -379,8 +362,9 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
         /* The source as written (MARKDOWN.md §5), except a spoiler, covered
          * until it is shown (§1d), and a time token, which is shown as its
          * time here: the token itself reads in UTC (§1c). */
-        char *cov = (m->body && !spoilers_shown(m->message_id)) ? spoilers_covered(m->body) : NULL;
-        const char *src = cov ? cov : m->body ? m->body : "";
+        int covering = m->body && !spoilers_shown(m->message_id) && has_spoilers(m->body);
+        char *cov = covering ? oc_rt_spoilers_covered(m->body, strlen(m->body)) : NULL;
+        const char *src = covering ? (cov ? cov : "") : m->body ? m->body : "";   /* no memory shows nothing */
         oc_rt_clock k;
         oc_model_clock(NULL, (int64_t)time(NULL) * 1000, &k);
         k.time24 = !(g_cfg && !g_cfg->time_24h);

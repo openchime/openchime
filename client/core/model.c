@@ -232,7 +232,7 @@ size_t oc_model_time_text(const oc_model *m, int64_t at_ms, int form, char *out,
 static void preview_set(const oc_model *m, char *out, size_t cap, const char *text) {
     if (!out || !cap) return;
     if (!text) { out[0] = '\0'; return; }
-    if (!strchr(text, '|') && !strstr(text, "<time:") && !strstr(text, "```spoiler")) { snprintf(out, cap, "%s", text); return; }
+    if (!strchr(text, '|') && !strstr(text, "<time:") && !strstr(text, "```spoiler") && !strstr(text, ">!")) { snprintf(out, cap, "%s", text); return; }
     oc_rt_clock k;
     oc_model_clock(m, (int64_t)time(NULL) * 1000, &k);
     oc_rt_flatten_at(text, strlen(text), &k, out, cap);

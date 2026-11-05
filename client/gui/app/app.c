@@ -5452,8 +5452,11 @@ static const char *action_line(const oc_msg *msg) {
     unsigned k = g_act_next++ % ACT_LINES;
     size_t cap = strlen(nm) + 1 + msg->action.len + 1;
     char *line = malloc(cap), *copy = strdup(text);
-    if (!line || !copy) { free(line); free(copy); return msg->body; }
-    oc_model_line(model(), msg->author_id, nm, 1, text, line, cap);
+    if (!line || !copy) { free(line); free(copy); return "(message unavailable)"; }
+    /* With a spoiler, as written: the layout covers it, and it reveals like any
+     * other (MARKDOWN.md §1d). An excerpt's word in its place could not be. */
+    if (oc_rt_spoilers(text, strlen(text), NULL, 0)) snprintf(line, cap, "%s %s", nm, text);
+    else oc_model_line(model(), msg->author_id, nm, 1, text, line, cap);
     free(g_act_line[k].line);
     free(g_act_line[k].text);
     g_act_line[k].mid = msg->message_id;
@@ -5479,6 +5482,15 @@ static const char *body_text(const oc_msg *msg) {
 static size_t body_lead(const oc_msg *msg) {
     if (msg->deleted || !msg->action.present || !msg->body) return 0;
     return strlen(action_name(msg)) + 1;
+}
+
+/* How many spoilers the transcript draws in `msg`, past an action's name: they
+ * are numbered the same way everywhere. */
+static size_t msg_spoilers(const oc_msg *msg) {
+    const char *b = body_text(msg);
+    size_t blen = strlen(b), lead = body_lead(msg);
+    if (lead > blen) lead = blen;
+    return oc_rt_spoilers(b + lead, blen - lead, NULL, 0);
 }
 
 /* Is there any text to show? An attachment-only message has none — body_text()
@@ -5719,6 +5731,16 @@ enum { MTAB_MAX = 16, MTAB_ROWS = 200, MTAB_CELLS = 2400, MCELL_BYTES = 2048, MC
 #define TAB_GAP   UIS(6.0f)     /* above and below the grid */
 #define TAB_SB    UIS(10.0f)    /* the horizontal scrollbar's band, when it has one */
 
+/* A spoiler in a cell (MARKDOWN.md §1d), its offsets from the cell's start: `k`
+ * is its index among the message's spoilers, as a click, assistive technology
+ * and "Show spoilers" know it. Where its lines landed is the layout's. */
+typedef struct {
+    int     k, shown;
+    size_t  start, len, hidden, hidden_len;
+    st_rect *r;
+    int     nr;
+} mcspl;
+
 typedef struct {
     st_layout *lay;          /* NULL for an empty cell */
     gfx_tex   *tex;          /* rasterized on its first draw */
@@ -5730,6 +5752,8 @@ typedef struct {
     st_rect    box[MCELL_BOXES];
     uint64_t   box_aid[MCELL_BOXES];   /* a custom emoji's image, or 0 for a time */
     int64_t    box_ms[MCELL_BOXES];    /* a time token's moment (MARKDOWN.md §1c) */
+    int        nspl;
+    mcspl     *spl;
 } mcell;
 
 typedef struct {
@@ -5776,12 +5800,14 @@ typedef struct {
 static mlay_ent g_mlay[MLAY_CACHE];
 static unsigned g_mlay_stamp;
 
-static size_t tcell_plain(const char *b, size_t start, size_t len, char *out, size_t cap);   /* fwd */
+static size_t tcell_plain(const char *b, size_t start, size_t len, const mcspl *spl, int nspl, char *out, size_t cap);   /* fwd */
 
 static void mtab_free(mtab *t) {
     for (uint32_t i = 0; t->cell && i < t->nrows * t->rt.cols; i++) {
         if (t->cell[i].lay) st_layout_destroy(t->cell[i].lay);
         if (t->cell[i].tex) gfx_tex_destroy(t->cell[i].tex);
+        for (int k = 0; k < t->cell[i].nspl; k++) free(t->cell[i].spl[k].r);
+        free(t->cell[i].spl);
     }
     free(t->cell);
     free(t->rowy);
@@ -5886,7 +5912,14 @@ static void tgrid_drop(tgrid_ent *g) {
 /* A cell's layout at width `w`: its copy of the bytes, `<br>` a newline, and
  * the body's own treatment -- inline formatting with its delimiters and escapes
  * collapsed, links, @mentions, #channels, keywords, and boxes for custom emoji
- * and time tokens. The header row is bold throughout. */
+ * and time tokens. The header row is bold throughout. A covered spoiler's text
+ * takes its cover's colour and reserves no box, whose picture or time would show
+ * through; the cover itself is mtab_draw's, at the rects asked for here. */
+static int tcell_covered(const mcell *c, size_t at) {
+    for (int q = 0; q < c->nspl; q++)
+        if (!c->spl[q].shown && at >= c->spl[q].hidden && at < c->spl[q].hidden + c->spl[q].hidden_len) return 1;
+    return 0;
+}
 static st_layout *tcell_lay(mcell *c, const char *b, float w, int align, int header) {
     size_t n = c->len;
     char *t = malloc(n + 1);
@@ -5941,8 +5974,23 @@ static st_layout *tcell_lay(mcell *c, const char *b, float w, int align, int hea
             off += hs + (hl ? hl : 1);
         }
     }
+    /* From the whole list rather than the spans above, which may have stopped
+     * short of them, and last, over every colour above. */
+    for (int q = 0; q < c->nspl; q++) {
+        const mcspl *s = &c->spl[q];
+        st_range_hide(lay, s->start, s->hidden - s->start);
+        if (s->start + s->len > s->hidden + s->hidden_len)
+            st_range_hide(lay, s->hidden + s->hidden_len, s->start + s->len - s->hidden - s->hidden_len);
+        if (!s->shown && s->hidden_len) st_range_color(lay, s->hidden, s->hidden_len, OC_COL_MUTED, 1.0f);
+    }
     oc_emoji_run runs[MCELL_BOXES];
     int nr = emoji_runs(t, runs, MCELL_BOXES);
+    {
+        int kept = 0;
+        for (int i = 0; i < nr; i++)
+            if (!tcell_covered(c, runs[i].at)) runs[kept++] = runs[i];
+        nr = kept;
+    }
     float side = g_body->line_h > 4 ? g_body->line_h - 4 : 18.0f;
     /* Emoji and time tokens (MARKDOWN.md §1c) in one id sequence, in the order
      * they come, as the body's boxes are. A token's box is as wide as its text
@@ -5953,7 +6001,8 @@ static st_layout *tcell_lay(mcell *c, const char *b, float w, int align, int hea
     size_t ti = 0;
     while ((ei < nr || ti < ns) && nbx < MCELL_BOXES) {
         int64_t ms = 0;
-        if (ti < ns && (sp[ti].style != OC_RT_TIME || !oc_rt_time_value(b, c->start + n, &sp[ti], &ms))) { ti++; continue; }
+        if (ti < ns && (sp[ti].style != OC_RT_TIME || tcell_covered(c, sp[ti].start - c->start) ||
+                        !oc_rt_time_value(b, c->start + n, &sp[ti], &ms))) { ti++; continue; }
         if (ei < nr && (ti >= ns || runs[ei].at < sp[ti].start - c->start)) {
             st_range_box(lay, runs[ei].at, runs[ei].len, side, side, side * 0.85f, (uint32_t)nbx + 1);
             c->box_aid[nbx] = runs[ei].aid; c->box_ms[nbx] = 0;
@@ -5980,6 +6029,16 @@ static st_layout *tcell_lay(mcell *c, const char *b, float w, int align, int hea
     st_metrics m;
     st_layout_metrics(lay, &m);
     c->w = m.w; c->h = m.h;
+    for (int q = 0; q < c->nspl; q++) {
+        mcspl *s = &c->spl[q];
+        free(s->r);
+        s->nr = 0;
+        s->r = malloc(((size_t)m.lines + 1) * sizeof *s->r);
+        if (s->r && s->hidden_len) {
+            int got = st_hit_range(lay, s->hidden, s->hidden_len, s->r, m.lines + 1);
+            s->nr = got > m.lines + 1 ? m.lines + 1 : got;
+        }
+    }
     free(t);
     return lay;
 }
@@ -6007,6 +6066,13 @@ static float mtab_build(mlay_ent *e, const char *b, size_t blen, size_t lead,
     int nl = st_layout_lines(lay, ln, LINES);
     int budget = MTAB_CELLS, last_line = -1;
     float d = 0;
+    /* The message's spoilers, for those in the cells (MARKDOWN.md §1d): a cell
+     * takes its own from this list, its index theirs across the message. */
+    size_t nsv = oc_rt_spoilers(b + lead, blen - lead, NULL, 0), svi = 0;
+    oc_rt_spoiler *sv = nsv ? malloc(nsv * sizeof *sv) : NULL;
+    if (nsv && !sv) { free(ln); free(e->tab); e->tab = NULL; return 0; }
+    if (nsv) nsv = oc_rt_spoilers(b + lead, blen - lead, sv, nsv);
+    const float spl_minw = text_width("Spoiler", g_meta) + 10;
     for (int k = 0; k < nt; k++) {
         mtab *t = &e->tab[e->ntab];
         size_t s = lead + rts[k].start, end = s + rts[k].len;
@@ -6059,9 +6125,35 @@ static float mtab_build(mlay_ent *e, const char *b, size_t blen, size_t lead,
                     cl->len = MCELL_BYTES;
                     while (cl->len && ((unsigned char)b[cl->start + cl->len] & 0xC0) == 0x80) cl->len--;
                 }
+                /* This cell's spoilers. The bound above may fall inside one, whose
+                 * closer is then not laid out: it stays covered up to the bound. */
+                while (svi < nsv && sv[svi].start < cells[c].start) svi++;
+                size_t sv0 = svi;
+                while (svi < nsv && sv[svi].start < cells[c].start + cells[c].len) svi++;
+                if (svi > sv0 && (cl->spl = calloc(svi - sv0, sizeof *cl->spl)) == NULL) {
+                    cl->len = lead + sv[sv0].start - cl->start;   /* shows less, never more */
+                } else {
+                    for (size_t q = sv0; q < svi && lead + sv[q].start - cl->start < cl->len; q++) {
+                        mcspl *s = &cl->spl[cl->nspl++];
+                        s->k = (int)q;
+                        s->shown = spoiler_shown(e->mid, (int)q);
+                        s->start = lead + sv[q].start - cl->start;
+                        s->len = sv[q].len;
+                        s->hidden = lead + sv[q].hidden - cl->start;
+                        s->hidden_len = sv[q].hidden_len;
+                        if (s->start + s->len > cl->len) {
+                            s->len = cl->len - s->start;
+                            if (s->hidden > cl->len) s->hidden = cl->len;
+                            s->hidden_len = cl->len - s->hidden;
+                        }
+                    }
+                }
                 if (!cl->len) continue;
                 cl->lay = tcell_lay(cl, b, 100000.0f, ST_ALIGN_LEFT, hdr && rr == 0);
                 if (cl->lay && cl->w > natw[c]) natw[c] = cl->w;
+                /* Room for what its cover says, the same whether it is covered
+                 * or not, so a reveal does not move the column. */
+                if (cl->nspl && natw[c] < spl_minw) natw[c] = spl_minw;
             }
             r++;
         }
@@ -6099,6 +6191,7 @@ static float mtab_build(mlay_ent *e, const char *b, size_t blen, size_t lead,
         d += t->seg_h - (t->band1 - t->band0);
     }
     free(ln);
+    free(sv);
     return d;
 }
 
@@ -6172,7 +6265,7 @@ static size_t long_cut(const char *b, size_t blen, float cw) {
 }
 
 /* The body cut at `cut`, into `out` (OC_MAX_BODY_SIZE + 8 bytes), and its length.
- * A cut inside a spoiler would leave its fence or its bars unclosed, and what
+ * A cut inside a spoiler would leave its fence or its `>!` unclosed, and what
  * they hide would read as text; so there the spoiler is closed where the cut
  * falls, and stays covered (MARKDOWN.md §1d). `lead` is where the author's text
  * starts, past an action's name. */
@@ -6186,7 +6279,7 @@ static size_t cut_body(const char *b, size_t blen, size_t lead, size_t cut, char
     if (hit >= ns) { free(sv); memcpy(out, b, cut); return cut; }
     const oc_rt_spoiler s = sv[hit];
     size_t start = lead + s.start, hid0 = lead + s.hidden, hid1 = hid0 + s.hidden_len, end = start + s.len, n;
-    const char *close = s.block ? "\n```" : "||";
+    const char *close = s.block ? "\n```" : "!<";
     if (cut >= hid1) {                          /* in its closing delimiter: the whole of it */
         n = end <= OC_MAX_BODY_SIZE ? end : start;
         memcpy(out, b, n);
@@ -6381,6 +6474,10 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
         }
         best->nspl = 0;
         for (size_t k = 0; k < nspv; k++) {
+            /* One in a cell of a grid is the grid's (mtab_build), and its bytes
+             * are hidden with the table's. One in a table that is not drawn
+             * as a grid, past MTAB_MAX, is text like any other, and covered. */
+            if (spv[k].cell && in_tables(rts, nt, spv[k].start)) { best->nspl++; continue; }
             st_range_hide(lay, lead + spv[k].start, spv[k].hidden - spv[k].start);
             st_range_hide(lay, lead + spv[k].hidden + spv[k].hidden_len, spv[k].start + spv[k].len - spv[k].hidden - spv[k].hidden_len);
             int shown = spoiler_shown(msg->message_id, (int)k);
@@ -6463,7 +6560,7 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
         st_line *ln = malloc(((size_t)m.lines + 1) * sizeof *ln);
         int nl = ln ? st_layout_lines(lay, ln, m.lines + 1) : 0, i0 = 0;
         for (int k = 0; k < best->nspl; k++) {
-            if (!spv[k].hidden_len) continue;
+            if (!spv[k].hidden_len || (spv[k].cell && in_tables(rts, nt, spv[k].start))) continue;
             size_t at = tlead + spv[k].hidden, end = at + spv[k].hidden_len;
             int cap = 1;
             while (i0 < nl && ln[i0].off + ln[i0].len <= at) i0++;
@@ -6674,6 +6771,44 @@ static const tabhit *tabhit_find(uint64_t mid, int idx, int thr) {
 
 static void time_box_draw(gfx *rt, const oc_msg *msg, int64_t ms, rectf box);   /* fwd */
 
+/* A cell's spoilers that are shown, or that are not, its text at ox,oy in the
+ * column [cx0, cx1): as the body's covers (spoiler_covers), kept to the column,
+ * and a click's only where the grid's frame and the list show them. */
+static void mcell_covers(gfx *rt, const oc_msg *msg, const mcell *cl, float ox, float oy,
+                         float cx0, float cx1, rectf frame, rectf clip, int shown) {
+    float capw = text_width("Spoiler", g_meta) + 10;
+    for (int k = 0; k < cl->nspl; k++) {
+        const mcspl *s = &cl->spl[k];
+        if (!s->shown != !shown) continue;
+        rectf hit = rf(0, 0, 0, 0);
+        for (int q = 0; q < s->nr; q++) {
+            rectf c = rf(ox + s->r[q].x - 2, oy + s->r[q].y, ox + s->r[q].x + s->r[q].w + 2, oy + s->r[q].y + s->r[q].h);
+            if (!q && !shown && c.right < c.left + capw) c.right = c.left + capw;
+            /* A short one at a column's right edge grows to the left. */
+            if (c.right > cx1 - 1) {
+                c.left -= c.right - (cx1 - 1);
+                c.right = cx1 - 1;
+                if (c.left < cx0 + 1) c.left = cx0 + 1;
+            }
+            if (shown) fill_round_a(rt, c, OC_R_CONTROL, OC_COL_MUTED, 0.16f);
+            else       fill_round(rt, c, OC_R_CONTROL, OC_COL_MUTED);
+            if (!q && !shown) draw_text(rt, "Spoiler", g_meta, rf(c.left + 4, c.top, c.right, c.bottom), 0xFFFFFF);
+            if (!q) hit = c;
+            else { if (c.left < hit.left) hit.left = c.left; if (c.right > hit.right) hit.right = c.right; hit.bottom = c.bottom; }
+        }
+        if (hit.left < frame.left) hit.left = frame.left;
+        if (hit.right > frame.right) hit.right = frame.right;
+        if (hit.top < clip.top) hit.top = clip.top;
+        if (hit.bottom > clip.bottom) hit.bottom = clip.bottom;
+        if (s->nr && hit.right > hit.left && hit.bottom > hit.top && g_n_splhits < SPL_HITS) {
+            g_splhits[g_n_splhits].r = hit; g_splhits[g_n_splhits].mid = msg->message_id;
+            g_splhits[g_n_splhits].k = s->k; g_splhits[g_n_splhits].shown = shown;
+            g_splhits[g_n_splhits].lines = s->nr;
+            g_n_splhits++;
+        }
+    }
+}
+
 /* Table `k` of `e` as a grid, its segment's top at `y`: a rounded frame of the
  * transcript's own border colour, the header row (when there is one) bold on a
  * faint fill, rules between rows and columns, each cell padded and aligned as
@@ -6715,6 +6850,7 @@ static void mtab_draw(gfx *rt, const oc_msg *msg, mlay_ent *e, int k, float x, f
                 cl->dx = g_cap_dx; cl->dy = g_cap_dy;
             }
             float ox = cx0 + TAB_PX, oy = ry0 + TAB_PY;
+            mcell_covers(rt, msg, cl, ox, oy, cx0, cx1, frame, clip, 1);
             if (cl->tex) {
                 gfx_rect dst = { ox + cl->dx, oy + cl->dy, cl->pw / sc, cl->ph / sc };
                 gfx_ink(rt, OC_COL_TEXT, ST_RASTER_PAD, ST_RASTER_PAD);
@@ -6729,6 +6865,7 @@ static void mtab_draw(gfx *rt, const oc_msg *msg, mlay_ent *e, int k, float x, f
                     draw_text(rt, ":…:", g_meta, box, OC_COL_FAINT);
                 }
             }
+            mcell_covers(rt, msg, cl, ox, oy, cx0, cx1, frame, clip, 0);
         }
     }
     /* The rules: between rows, under the last when a "more" line follows, and
@@ -21809,6 +21946,81 @@ static int ed_canon(int pos) {
  * of an operation instead of once per insert. Which matters — ed_fmt_inline
  * inserts an opener and a closer separately, and repairing between the two would
  * delete the opener for not yet having a partner. */
+/* The edit [p, sn) in place of the old [p, so) when it falls inside an inline
+ * spoiler (MARKDOWN.md §1d), which must not come out of it in the open. A line
+ * break splits it, each line its own spoiler, a list's or a quote's marker left
+ * outside; anything else that would stop it parsing is taken back, as long as it
+ * still has text to hide. Returns 1 when it dealt with the edit. */
+static int ed_is_space(oc_wch c);   /* fwd */
+static void ed_insert_n(const oc_wch *s, int n);   /* fwd */
+static int ed_spoiler_edit(int p, int so, int sn) {
+    static char u8[ED_MAX * 3 + 1];
+    static oc_wch out[ED_MAX + 1];
+    oc_rt_spoiler sv[64];
+    int bytes = to_u8n(g_ed_prev, g_ed_prev_len, u8, (int)sizeof u8 - 1);
+    if (bytes <= 0) return 0;
+    size_t nv = oc_rt_spoilers(u8, (size_t)bytes, sv, 64);
+    if (nv > 64) nv = 64;
+    for (size_t k = 0; k < nv; k++) {
+        if (sv[k].block || sv[k].cell) continue;
+        int os = to_w_count(u8, (int)sv[k].start), oe = to_w_count(u8, (int)(sv[k].start + sv[k].len));
+        if (p < os + 2 || so > oe - 2) continue;
+        int ne = oe + (sn - so), nl = 0;
+        for (int i = p; i < sn; i++) if (g_ed[i] == u'\n') nl = 1;
+        if (!nl) {
+            int text = 0;
+            for (int i = os + 2; i < ne - 2; i++) if (!ed_is_space(g_ed[i])) text = 1;
+            if (g_ed_hidden[os] || !text) return 0;
+            memcpy(g_ed, g_ed_prev, (size_t)(g_ed_prev_len + 1) * sizeof(oc_wch));
+            g_ed_len = g_ed_prev_len;
+            g_ed_caret = g_ed_anchor = p;
+            ed_invalidate_layout();
+            return 1;
+        }
+        /* Rebuilt line by line, each with text in its own delimiters. */
+        int o = 0, caret = -1, at = os + 2, fits = 1, first = 1;
+        while (at <= ne - 2 && fits) {
+            int le = at, m = at, text = 0;
+            while (le < ne - 2 && g_ed[le] != u'\n') le++;
+            if (!first) {
+                for (;;) {
+                    int q = m;
+                    while (q < le && g_ed[q] >= u'0' && g_ed[q] <= u'9') q++;
+                    if (q > m && q + 1 < le && g_ed[q] == u'.' && g_ed[q + 1] == u' ') m = q + 2;
+                    else if (m + 1 < le && (g_ed[m] == u'>' || g_ed[m] == u'-') && g_ed[m + 1] == u' ') m += 2;
+                    else break;
+                }
+            }
+            for (int i = m; i < le; i++) if (!ed_is_space(g_ed[i])) text = 1;
+            if (o + (le - at) + 5 > ED_MAX) { fits = 0; break; }
+            for (int i = at; i < m; i++) out[o++] = g_ed[i];
+            if (text) { out[o++] = u'>'; out[o++] = u'!'; }
+            if (g_ed_caret >= m && g_ed_caret <= le) caret = o + (g_ed_caret - m);
+            for (int i = m; i < le; i++) out[o++] = g_ed[i];
+            if (text) { out[o++] = u'!'; out[o++] = u'<'; }
+            if (le < ne - 2) out[o++] = u'\n';
+            first = 0;
+            at = le + 1;
+        }
+        if (fits && g_ed_len - (ne - os) + o <= ED_MAX) {
+            ed_delete_range(os, ne);
+            g_ed_caret = g_ed_anchor = os;
+            ed_insert_n(out, o);
+            if (caret >= 0) g_ed_caret = g_ed_anchor = os + caret;
+            g_ed_hidden_valid = 0;
+            ed_hidden_build();
+            g_ed_caret = g_ed_anchor = ed_canon(g_ed_caret);
+        } else {                       /* no room to split it: the edit is not made */
+            memcpy(g_ed, g_ed_prev, (size_t)(g_ed_prev_len + 1) * sizeof(oc_wch));
+            g_ed_len = g_ed_prev_len;
+            g_ed_caret = g_ed_anchor = p;
+            ed_invalidate_layout();
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static void ed_repair_orphans(void) {
     int p = 0, so, sn, i, drop[64], n = 0, caret = g_ed_caret, anchor = g_ed_anchor;
     /* Plain text hides nothing, so there is nothing that can stop being hidden.
@@ -21820,14 +22032,19 @@ static void ed_repair_orphans(void) {
     so = g_ed_prev_len; sn = g_ed_len;
     while (so > p && sn > p && g_ed_prev[so - 1] == g_ed[sn - 1]) { so--; sn--; }
     if (!g_ed_hidden_valid) ed_hidden_build();
+    if (ed_spoiler_edit(p, so, sn)) return;
     /* Untouched head, then untouched tail at its new offset. Anything inside the
      * edit itself is the user's own typing and is never second-guessed. */
+    /* Not a spoiler's `>!` or `!<`, whatever broke it: without them what it hid
+     * would go out in the open, with nothing on the screen to say so. */
+#define ED_SPOILER_DELIM(ch) ((ch) == u'>' || (ch) == u'!' || (ch) == u'<')
     for (i = 0; i < p && n < 64; i++)
-        if (g_ed_prev_hidden[i] && !g_ed_hidden[i]) drop[n++] = i;
+        if (g_ed_prev_hidden[i] && !g_ed_hidden[i] && !ED_SPOILER_DELIM(g_ed_prev[i])) drop[n++] = i;
     for (i = so; i < g_ed_prev_len && n < 64; i++) {
         int j = i - so + sn;
-        if (j >= 0 && j < g_ed_len && g_ed_prev_hidden[i] && !g_ed_hidden[j]) drop[n++] = j;
+        if (j >= 0 && j < g_ed_len && g_ed_prev_hidden[i] && !g_ed_hidden[j] && !ED_SPOILER_DELIM(g_ed_prev[i])) drop[n++] = j;
     }
+#undef ED_SPOILER_DELIM
     /* Right to left, so the earlier offsets stay valid, and carry the caret
      * back over everything removed before it. */
     for (i = n - 1; i >= 0; i--) {
@@ -22477,6 +22694,16 @@ static int ed_block_marker(int p, int kind, int *at, int *len) {
     if (at) *at = i;
     if (kind == FMT_QUOTE) {
         if (i < g_ed_len && g_ed[i] == u'>') {
+            /* A `>!` that closes on the line is a spoiler and no marker: taking
+             * its `>` off would send what it hides in the open. The scanner says. */
+            if (i + 1 < g_ed_len && g_ed[i + 1] == u'!') {
+                static char line8[ED_MAX * 3 + 1];
+                oc_rt_span first[1];
+                int e = i;
+                while (e < g_ed_len && g_ed[e] != u'\n') e++;
+                int n8 = to_u8n(g_ed + i, e - i, line8, sizeof line8);
+                if (oc_rt_scan(line8, n8 > 0 ? (size_t)n8 : 0, first, 1) && !(first[0].style & OC_RT_QUOTE)) return 0;
+            }
             if (len) *len = (i + 1 < g_ed_len && g_ed[i + 1] == u' ') ? 2 : 1;
             return 1;
         }
@@ -22542,6 +22769,10 @@ static void ed_fmt_block(int kind) {
      * asked for. */
     g_ed_caret = le;
     g_ed_anchor = had_sel ? ls : le;
+    /* What this did to the parse it meant to: a `>` it put before a spoiler's
+     * `>!` must not read to ed_repair_orphans as that opener stopping parsing. */
+    ed_hidden_build();
+    ed_remember();
 }
 
 /* A soft newline (Shift+Enter) inside a list or a quote CONTINUES it.
@@ -22660,7 +22891,7 @@ static int        g_n_ed_chit;
 
 /* A cell as the card shows it: on one line, its markup gone. */
 static void card_cell(const char *cell, char *out, size_t cap) {
-    size_t n = tcell_plain(cell ? cell : "", 0, cell ? strlen(cell) : 0, out, cap);
+    size_t n = tcell_plain(cell ? cell : "", 0, cell ? strlen(cell) : 0, NULL, 0, out, cap);
     for (size_t i = 0; i < n; i++) if (out[i] == '\n' || out[i] == '\t') out[i] = ' ';
 }
 
@@ -24989,8 +25220,8 @@ static void a11y_publish_scene(const oc_model *m) {
             for (uint8_t c2 = 0; c2 < t->rt.cols && o + 4 < sizeof nm; c2++) {
                 const mcell *cl = &t->cell[r * t->rt.cols + c2];
                 char v[160], hd[96] = "";
-                tcell_plain(b, cl->start, cl->len, v, sizeof v);
-                if (hdr && row) tcell_plain(b, t->cell[c2].start, t->cell[c2].len, hd, sizeof hd);
+                tcell_plain(b, cl->start, cl->len, cl->spl, cl->nspl, v, sizeof v);
+                if (hdr && row) tcell_plain(b, t->cell[c2].start, t->cell[c2].len, t->cell[c2].spl, t->cell[c2].nspl, hd, sizeof hd);
                 for (char *q = v; *q; q++) if (*q == '\n') *q = ' ';
                 for (char *q = hd; *q; q++) if (*q == '\n') *q = ' ';
                 int w = snprintf(nm + o, sizeof nm - o, "%s%s%s%s", c2 ? ", " : "", hd,
@@ -28175,8 +28406,9 @@ static void copy_to_clipboard(oc_win *hwnd, const char *utf8) {
  * it reads, delimiters and escapes gone and a `<br>` a newline, and a cell
  * holding a tab, a newline or a quote in quotes with its quotes doubled. */
 
-/* A cell's text as it reads. Returns its length. */
-static size_t tcell_plain(const char *b, size_t start, size_t len, char *out, size_t cap) {
+/* A cell's text as it reads, each spoiler in `spl` that is covered as an excerpt
+ * says it (MARKDOWN.md §1d). Returns its length. */
+static size_t tcell_plain(const char *b, size_t start, size_t len, const mcspl *spl, int nspl, char *out, size_t cap) {
     oc_rt_span sp[OC_RT_MAX];
     size_t ns = oc_rt_scan_cell(b, start, len, sp, OC_RT_MAX), o = 0;
     if (ns > OC_RT_MAX) ns = OC_RT_MAX;
@@ -28184,6 +28416,13 @@ static size_t tcell_plain(const char *b, size_t start, size_t len, char *out, si
     for (size_t i = start; i < start + len && o + 1 < cap; ) {
         size_t skip = 0;
         int br = 0;
+        for (int q = 0; q < nspl && !skip; q++) {
+            if (spl[q].shown || i != start + spl[q].start) continue;
+            int w = snprintf(out + o, cap - o, "[spoiler]");
+            if (w > 0) o += (size_t)w < cap - o ? (size_t)w : cap - o - 1;
+            skip = spl[q].len;
+        }
+        if (skip) { i += skip; continue; }
         for (size_t k = 0; k < ns; k++) {
             if (i < sp[k].start || i >= sp[k].start + sp[k].len) continue;
             if (sp[k].style == OC_RT_BREAK) { br = 1; skip = sp[k].start + sp[k].len - i; break; }
@@ -28209,6 +28448,7 @@ static int msg_tables(const oc_msg *msg, oc_rt_table *out, int max) {
     /* The same tables the transcript draws, numbered as it numbers them. */
     size_t ns = out ? oc_rt_spoilers(b + lead, blen - lead, NULL, 0) : 0;
     oc_rt_spoiler *sv = ns ? malloc(ns * sizeof *sv) : NULL;
+    if (ns && !sv) return 0;                 /* no table is known not to be under a cover */
     if (sv) {
         ns = oc_rt_spoilers(b + lead, blen - lead, sv, ns);
         nt = tables_uncovered(msg->message_id, sv, ns, out, nt);
@@ -28231,6 +28471,12 @@ static char *table_tsv(const oc_msg *msg, int idx) {
     size_t cap = 2 * t->len + 4 * ((size_t)t->rows + 1) * t->cols + 16, o = 0;
     char *out = malloc(cap), *cell = malloc(t->len + 1);
     if (!out || !cell) { free(out); free(cell); return NULL; }
+    /* What the table covers stays covered in what is copied. */
+    size_t nsv = oc_rt_spoilers(b + lead, blen - lead, NULL, 0), svi = 0;
+    oc_rt_spoiler *sv = nsv ? malloc(nsv * sizeof *sv) : NULL;
+    mcspl *cov = nsv ? malloc(nsv * sizeof *cov) : NULL;
+    if (nsv && (!sv || !cov)) { free(sv); free(cov); free(out); free(cell); return NULL; }
+    if (nsv) nsv = oc_rt_spoilers(b + lead, blen - lead, sv, nsv);
     oc_rt_rowit it;
     oc_rt_cell cells[OC_RT_TABLE_MAX_COLS];
     uint32_t row;
@@ -28241,7 +28487,15 @@ static char *table_tsv(const oc_msg *msg, int idx) {
         if (!first) { out[o++] = '\r'; out[o++] = '\n'; }
         first = 0;
         for (uint8_t c = 0; c < t->cols; c++) {
-            size_t n = tcell_plain(b + lead, cells[c].start, cells[c].len, cell, t->len + 1);
+            int ncov = 0;
+            while (svi < nsv && sv[svi].start < cells[c].start) svi++;
+            for (; svi < nsv && sv[svi].start < cells[c].start + cells[c].len; svi++, ncov++) {
+                memset(&cov[ncov], 0, sizeof cov[ncov]);
+                cov[ncov].shown = spoiler_shown(msg->message_id, (int)svi);
+                cov[ncov].start = sv[svi].start - cells[c].start;
+                cov[ncov].len = sv[svi].len;
+            }
+            size_t n = tcell_plain(b + lead, cells[c].start, cells[c].len, cov, ncov, cell, t->len + 1);
             int quote = strpbrk(cell, "\t\r\n\"") != NULL;
             if (c) out[o++] = '\t';
             if (quote) out[o++] = '"';
@@ -28254,7 +28508,28 @@ static char *table_tsv(const oc_msg *msg, int idx) {
     }
     out[o] = '\0';
     free(cell);
+    free(sv);
+    free(cov);
     return out;
+}
+
+/* Does "Show spoilers" change anything on the screen for `msg`? Not for a spoiler
+ * in a cell past a grid's columns, which the grid never draws. */
+static int msg_spoilers_to_show(const oc_msg *msg) {
+    const char *b = body_text(msg);
+    size_t blen = strlen(b), lead = body_lead(msg);
+    if (lead > blen) lead = blen;
+    size_t n = oc_rt_spoilers(b + lead, blen - lead, NULL, 0);
+    if (!n) return 0;
+    oc_rt_spoiler *sv = malloc(n * sizeof *sv);
+    if (!sv) return 1;
+    oc_rt_spoilers(b + lead, blen - lead, sv, n);
+    oc_rt_table rts[MTAB_MAX];
+    int nt = msg_tables(msg, rts, MTAB_MAX), any = 0;
+    for (size_t k = 0; k < n && !any; k++)
+        any = !sv[k].extra || !in_tables(rts, nt, sv[k].start);
+    free(sv);
+    return any;
 }
 
 /* Copy table `idx` of `msg`. Returns 1 when something was copied. */
@@ -28367,8 +28642,7 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
     /* Spoilers (MARKDOWN.md §1d), from the keyboard: Ctrl+Up to the message,
      * Shift+F10, and Enter on this reveals them all, or covers them again. */
     if (!msg->deleted && msg->body) {
-        size_t nsp = oc_rt_spoilers(msg->body, strlen(msg->body), NULL, 0);
-        if (nsp) mi_item(110, spoiler_shown(mid, 0) ? "Hide spoilers" : "Show spoilers");
+        if (msg_spoilers_to_show(msg)) mi_item(110, spoiler_shown(mid, 0) ? "Hide spoilers" : "Show spoilers");
     }
     /* Folding (CLIENT.md "Long messages"): Collapse puts it away on every
      * device; Expand opens a folded or a long one. */
@@ -28452,7 +28726,7 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
         copy_table(hwnd, msg, g_menu_tab);
     } else if (cmd == 110) {
         /* All of the message's spoilers, to the state the first is not in. */
-        int n = (int)oc_rt_spoilers(msg->body, strlen(msg->body), NULL, 0), want = !spoiler_shown(mid, 0);
+        int n = (int)msg_spoilers(msg), want = !spoiler_shown(mid, 0);
         for (int k = 0; k < n; k++)
             if (spoiler_shown(mid, k) != want) spoiler_toggle(mid, k);
         invalidate();
@@ -30530,6 +30804,24 @@ static uint32_t hit_pos(int ri, int x, int y) {
     return (uint32_t)pos;
 }
 
+/* Is body offset `pos` under a covered spoiler (MARKDOWN.md §1d)? What is under a
+ * cover answers no hover and no click: its address or its channel would show. */
+static int pos_covered(const oc_msg *msg, size_t pos) {
+    const char *b = body_text(msg);
+    size_t blen = strlen(b), lead = body_lead(msg);
+    if (lead > blen || pos < lead) return 0;
+    size_t n = oc_rt_spoilers(b + lead, blen - lead, NULL, 0);
+    oc_rt_spoiler *sv = n ? malloc(n * sizeof *sv) : NULL;
+    if (!n) return 0;
+    if (!sv) return 1;
+    n = oc_rt_spoilers(b + lead, blen - lead, sv, n);
+    int hit = 0;
+    for (size_t k = 0; k < n && !hit; k++)
+        hit = pos - lead >= sv[k].hidden && pos - lead < sv[k].hidden + sv[k].hidden_len && !spoiler_shown(msg->message_id, (int)k);
+    free(sv);
+    return hit;
+}
+
 /* ---- clickable links (item 97) -----------------------------------
  *
  * The shared parser marks a bare URL (OC_RT_LINK); this is the half that turns
@@ -30574,6 +30866,7 @@ static int link_at(int ri, int x, int y, char *out, size_t cap) {
         if (k >= 0) {
             const mcell *cl;
             if (mtab_hit(msg, l, g_msgrows[ri].cw, lx, ly, &cl, &pos) < 0 || !cl || pos == SIZE_MAX) return 0;
+            if (pos_covered(msg, pos)) return 0;
             n = oc_rt_scan_cell(u8, cl->start, cl->len, sp, OC_RT_MAX);
             if (n > OC_RT_MAX) n = OC_RT_MAX;
             for (i = 0; i < n; i++) {
@@ -30601,7 +30894,7 @@ static int link_at(int ri, int x, int y, char *out, size_t cap) {
         ly = lyl;
     }
     pos = st_hit_point(l->lay, lx, ly, &inside, &trailing);
-    if (!inside) return 0;
+    if (!inside || pos_covered(msg, pos)) return 0;
     {   /* An action's name is not the author's text: the spans start past it
          * (REQ-058), exactly as body_layout scanned them. */
         size_t lead = body_lead(msg);
@@ -30670,6 +30963,7 @@ static uint64_t chanref_at(int ri, int x, int y) {
         if (k >= 0) {   /* a cell's reference, scanned in the cell (MARKDOWN.md §1a) */
             const mcell *cl;
             if (mtab_hit(msg, l, g_msgrows[ri].cw, lx, ly, &cl, &pos) < 0 || !cl || pos == SIZE_MAX) return 0;
+            if (pos_covered(msg, pos)) return 0;
             const char *cs = u8 + cl->start;
             size_t p = pos - cl->start;
             n = oc_chanref_scan(cs, cl->len, cr, OC_CHANREF_MAX);
@@ -30682,7 +30976,7 @@ static uint64_t chanref_at(int ri, int x, int y) {
         ly = lyl;
     }
     pos = st_hit_point(l->lay, lx, ly, &inside, &trailing);
-    if (!inside) return 0;
+    if (!inside || pos_covered(msg, pos)) return 0;
     {   /* Past an action's name, as body_layout scanned it (REQ-058). */
         size_t lead = body_lead(msg);
         if (lead > blen || pos < lead) return 0;
@@ -34688,6 +34982,19 @@ static void test_dump(const char *path) {
         const oc_channel *dc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
         for (size_t i = 0; dc && i < dc->n_msgs; i++) {
             const oc_msg *tm = &dc->msgs[i];
+            /* How the dialect read the body, for a script to tell a quote from a
+             * spoiler at the start of a line. */
+            if (!tm->deleted && tm->body) {
+                const char *mb = body_text(tm);
+                size_t mlen = strlen(mb), ml = body_lead(tm), mq = 0;
+                if (ml > mlen) ml = mlen;
+                oc_rt_span qs[OC_RT_MAX];
+                size_t qn = oc_rt_scan(mb + ml, mlen - ml, qs, OC_RT_MAX);
+                if (qn > OC_RT_MAX) qn = OC_RT_MAX;
+                for (size_t q = 0; q < qn; q++) if (qs[q].style == OC_RT_QUOTE) mq++;
+                fprintf(f, "  marks msg=%llu quotes=%zu spoilers=%zu\n", (unsigned long long)tm->message_id, mq,
+                        oc_rt_spoilers(mb + ml, mlen - ml, NULL, 0));
+            }
             oc_rt_table rts[MTAB_MAX];
             int nt = msg_tables(tm, rts, MTAB_MAX);
             const char *b = nt ? body_text(tm) : NULL;
@@ -34715,7 +35022,7 @@ static void test_dump(const char *path) {
                         const mcell *cl = &t->cell[r * t->rt.cols + c];
                         char v[256], e[600];
                         size_t o = 0;
-                        tcell_plain(b, cl->start, cl->len, v, sizeof v);
+                        tcell_plain(b, cl->start, cl->len, cl->spl, cl->nspl, v, sizeof v);
                         for (const char *q = v; *q && o + 3 < sizeof e; q++) {
                             if (*q == '\n')      { e[o++] = '\\'; e[o++] = 'n'; }
                             else if (*q == '"') { e[o++] = '\\'; e[o++] = '"'; }

@@ -12,8 +12,8 @@ static int u_space(char ch) { return ch == ' ' || ch == '\t' || ch == '\n' || ch
 static int u_delim(char ch) { return ch == '*' || ch == '_' || ch == '~' || ch == '`'; }
 static char u_lower(char ch) { return (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch; }
 
-/* May an address START at `i`? Preceded by a line start, whitespace or an
- * opening bracket — looking THROUGH any run of formatting delimiters
+/* May an address START at `i`? Preceded by a line start, whitespace, an
+ * opening bracket or a spoiler's `>!` — looking THROUGH any run of formatting delimiters
  * immediately before it, so `*https://x.com*` links while
  * `xhttps://x.com` (an identifier) does not. The same look-through rule the
  * formatting parser applies to its own openers, for the same reason. */
@@ -22,7 +22,8 @@ static int u_boundary_ok(const char *b, size_t i) {
     while (i > 0 && u_delim(b[i - 1])) i--;
     if (i == 0) return 1;
     p = b[i - 1];
-    return u_space(p) || p == '(' || p == '[' || p == '{' || p == '<';
+    return u_space(p) || p == '(' || p == '[' || p == '{' || p == '<' ||
+           (p == '!' && i >= 2 && b[i - 2] == '>');
 }
 
 static size_t u_scheme_len(const char *b, size_t end, size_t i) {

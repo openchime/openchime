@@ -8,6 +8,11 @@
  *   scan_inline  walks the remainder emitting emphasis, code spans and escapes,
  *                recursing into the content it matched so emphasis nests.
  *
+ * An inline spoiler is the one construct the other passes have to ask about:
+ * `>!` looks like a quote to scan_line, a table row splits on any pipe, and a
+ * fence or an emphasis run may start inside one. Each asks spoiler_close, so
+ * what is hidden is decided once, and before any of them can show it.
+ *
  * No allocation and no rewriting: every span points into the caller's bytes. */
 
 #include "richtext.h"
@@ -33,10 +38,56 @@ typedef struct {
     size_t      tmax, tn;
     int         tables_only;
     int         in_cell;  /* scanning one table cell: `<br>` is a break */
+    int         in_spoiler;  /* inside an inline spoiler, where `>!` is only text */
+    /* oc_rt_spoilers: what emit is told goes straight into this list, not spans. */
+    oc_rt_spoiler *sv;
+    size_t      sv_max, sv_n;
+    uint16_t    sv_kind;     /* the spoiler open now, or 0 */
+    size_t      sv_start, sv_hidden, sv_table_end;
+    int         sv_cell, sv_extra;
+    uint32_t    cols;        /* scan_cells: the table's columns */
+    int         cell_extra;  /* scanning a cell past them */
 } rt_ctx;
+
+/* A span, as oc_rt_spoilers reads it: each opener and the next closer of its kind
+ * make one spoiler, and a closer of the other kind inside a block goes with it.
+ * Nothing is kept but the list, so this cannot run out of memory: "none" from
+ * oc_rt_spoilers always means none. */
+static void note_spoiler(rt_ctx *c, size_t start, size_t len, uint16_t style) {
+    uint16_t kind = style & (OC_RT_SPOILER | OC_RT_SPOILER_BLOCK);
+    if (style == OC_RT_TABLE) c->sv_table_end = start + len;
+    if (!kind || style != (OC_RT_DELIM | kind)) return;
+    if (!c->sv_kind) {
+        c->sv_kind = kind; c->sv_start = start; c->sv_hidden = start + len;
+        c->sv_cell = start < c->sv_table_end;
+        c->sv_extra = c->sv_cell && c->cell_extra;
+        return;
+    }
+    if (kind != c->sv_kind) return;
+    if (c->sv_n < c->sv_max) {
+        oc_rt_spoiler *o = &c->sv[c->sv_n];
+        memset(o, 0, sizeof *o);
+        o->start = c->sv_start;
+        o->len = start + len - c->sv_start;
+        o->hidden = c->sv_hidden;
+        o->hidden_len = start - c->sv_hidden;
+        o->block = kind == OC_RT_SPOILER_BLOCK;
+        o->cell = c->sv_cell;
+        o->extra = c->sv_extra;
+        if (o->block) {
+            size_t a = c->sv_start + 10, b = c->sv_hidden;
+            while (a < b && (c->b[a] == ' ' || c->b[a] == '\t')) a++;
+            while (b > a && (c->b[b - 1] == '\n' || c->b[b - 1] == '\r' || c->b[b - 1] == ' ' || c->b[b - 1] == '\t')) b--;
+            o->label = a; o->label_len = b - a;
+        }
+    }
+    c->sv_n++;
+    c->sv_kind = 0;
+}
 
 static void emit(rt_ctx *c, size_t start, size_t len, uint16_t style) {
     if (len == 0) return;             /* an empty span is not a rendering */
+    if (c->sv) { note_spoiler(c, start, len, style); return; }
     if (c->n < c->max) {
         c->out[c->n].start = start;
         c->out[c->n].len   = len;
@@ -51,7 +102,7 @@ static int rt_delim(char ch) { return ch == '*' || ch == '_' || ch == '~' || ch 
 /* The set a backslash may escape. Slack has none at all; without one there is
  * no way to write a literal asterisk at a word boundary (MARKDOWN.md §2, rule 3). */
 static int rt_escapable(char ch) {
-    return rt_delim(ch) || ch == '>' || ch == '-' || ch == '\\' || ch == '|';
+    return rt_delim(ch) || ch == '>' || ch == '-' || ch == '\\' || ch == '|' || ch == '!';
 }
 
 /* `<br>`, `<br/>` or `<br />` at `i`, in any case: its length, else 0. The one
@@ -84,6 +135,15 @@ static int open_ok(rt_ctx *c, size_t i) {
     return rt_space(p) || p == '(' || p == '[' || p == '{' || p == '<';
 }
 
+/* open_ok for what may follow a spoiler's opening, so that what it hides can
+ * start with emphasis or code. Not for a fence: a block cannot open in a line's
+ * spoiler. */
+static int inner_open_ok(rt_ctx *c, size_t i) {
+    if (open_ok(c, i)) return 1;
+    while (i > 0 && rt_delim(c->b[i - 1])) i--;
+    return i >= 2 && c->b[i - 1] == '!' && c->b[i - 2] == '>';
+}
+
 /* If a complete `code` span opens at `i` and closes before `e`, its total
  * length including both backticks; otherwise 0. A RUN of backticks is never an
  * inline code opener — the fenced form is handled a pass above, and a leftover
@@ -92,7 +152,7 @@ static size_t code_span_len(rt_ctx *c, size_t i, size_t e) {
     size_t j;
     if (c->b[i] != '`') return 0;
     if (i + 1 < e && c->b[i + 1] == '`') return 0;
-    if (!open_ok(c, i)) return 0;
+    if (!inner_open_ok(c, i)) return 0;
     if (i + 1 >= e || rt_space(c->b[i + 1])) return 0;
     for (j = i + 2; j < e; j++)
         if (c->b[j] == '`' && !rt_space(c->b[j - 1])) return j - i + 1;
@@ -193,15 +253,70 @@ static size_t time_len(const char *b, size_t e, size_t i, int64_t *ms) {
     return j + 2 - i;
 }
 
+/* ---- inline spoilers (MARKDOWN.md §1d) ------------------------------------ */
+
+static int at_spoiler_open(rt_ctx *c, size_t i, size_t e) {
+    return i + 1 < e && c->b[i] == '>' && c->b[i + 1] == '!';
+}
+
+/* The `!<` that closes the `>!` at `i`, before `e`, or RT_NONE when there is no
+ * closer at all. Escapes, code, addresses and time tokens are stepped over. An
+ * opener inside counts, so `>!a >!b!< c!<` hides all of it, and when the
+ * openers outnumber the closers the last closer is the one: the wider reading
+ * is the one that leaves nothing out. `>!<` can open nothing, so `a>!<` closes
+ * after the `a>`. */
+static size_t spoiler_close(rt_ctx *c, size_t i, size_t e) {
+    size_t j = i + 2, last = RT_NONE, depth = 1, L, k;
+    while (j < e) {
+        char ch = c->b[j];
+        if (ch == '\\' && j + 1 < e && rt_escapable(c->b[j + 1])) { j += 2; continue; }
+        if ((L = code_span_len(c, j, e)) != 0 || (L = url_len(c, j, e)) != 0 ||
+            (L = labelled_len(c, j, e, &k)) != 0 ||
+            (ch == '<' && (L = time_len(c->b, e, j, NULL)) != 0)) { j += L; continue; }
+        if (ch == '`') { while (j < e && c->b[j] == '`') j++; continue; }   /* a bare run is literal */
+        if (ch == '!' && j + 1 < e && c->b[j + 1] == '<') {
+            last = j;
+            if (--depth == 0) break;
+            j += 2;
+            continue;
+        }
+        if (at_spoiler_open(c, j, e) && !(j + 2 < e && c->b[j + 2] == '<')) { depth++; j += 2; continue; }
+        j++;
+    }
+    return last;
+}
+
+/* Is there nothing but white space in [s, e)? An empty spoiler is no spoiler. */
+static int all_space(const char *b, size_t s, size_t e) {
+    for (; s < e; s++) if (!rt_space(b[s])) return 0;
+    return 1;
+}
+
+/* Does a spoiler, closed and not empty, open at the `>!` at `i`? */
+static int spoiler_opens(rt_ctx *c, size_t i, size_t e) {
+    size_t j;
+    if (!at_spoiler_open(c, i, e)) return 0;
+    j = spoiler_close(c, i, e);
+    return j != RT_NONE && !all_space(c->b, i + 2, j);
+}
+
 /* The first valid closer for a `d`-byte run of `ch` in [from, e), or RT_NONE.
  * Escapes, code spans and URLs are stepped over rather than looked inside, so
  * the `*` in "*a `b*c` d*" closes at the end and not in the middle — and an
  * underscore inside a URL cannot close an emphasis run that opened before it. */
 static size_t find_close(rt_ctx *c, size_t from, size_t e, char ch, size_t d) {
     size_t i = from;
+    int no_spoiler = c->in_spoiler;
     while (i < e) {
         size_t cs;
         if (c->b[i] == '\\' && i + 1 < e && rt_escapable(c->b[i + 1])) { i += 2; continue; }
+        /* A spoiler is stepped over whole: emphasis closing inside one would
+         * cut its range short of the closer, and show what it hides. */
+        if (!no_spoiler && at_spoiler_open(c, i, e)) {
+            cs = spoiler_close(c, i, e);
+            if (cs == RT_NONE) no_spoiler = 1;
+            else { i = cs + 2; continue; }
+        }
         cs = code_span_len(c, i, e);
         if (cs) { i += cs; continue; }
         cs = url_len(c, i, e);
@@ -219,6 +334,26 @@ static size_t find_close(rt_ctx *c, size_t from, size_t e, char ch, size_t d) {
         i++;
     }
     return RT_NONE;
+}
+
+/* Does a spoiler that opens in [s, z) close at or past `z`, before `e`? A link's
+ * label is such a range: taken as a link it would cut the spoiler in two. */
+static int spoiler_leaves(rt_ctx *c, size_t s, size_t z, size_t e) {
+    if (c->in_spoiler) return 0;
+    while (s < z) {
+        size_t j;
+        if (c->b[s] == '\\' && s + 1 < z && rt_escapable(c->b[s + 1])) { s += 2; continue; }
+        if ((j = code_span_len(c, s, z)) != 0) { s += j; continue; }
+        if (at_spoiler_open(c, s, z)) {
+            j = spoiler_close(c, s, e);
+            if (j == RT_NONE) return 0;
+            if (j >= z) return 1;
+            s = j + 2;
+            continue;
+        }
+        s++;
+    }
+    return 0;
 }
 
 static void scan_inline(rt_ctx *c, size_t s, size_t e, int depth) {
@@ -271,7 +406,7 @@ static void scan_inline(rt_ctx *c, size_t s, size_t e, int depth) {
         }
         if (ch == '[') {
             size_t k, L = labelled_len(c, i, e, &k);
-            if (L) {
+            if (L && !spoiler_leaves(c, i + 1, k, e)) {
                 emit(c, i, 1, OC_RT_DELIM | OC_RT_LABELLED);
                 emit(c, i + 1, k - i - 1, OC_RT_LABELLED);
                 scan_inline(c, i + 1, k, depth + 1);
@@ -292,24 +427,23 @@ static void scan_inline(rt_ctx *c, size_t s, size_t e, int depth) {
             }
             continue;
         }
-        /* A spoiler (MARKDOWN.md §1d): `||` opens before a non-space and
-         * closes after one, on the same line, as emphasis does; what it hides
-         * may itself carry emphasis. */
-        if (ch == '|' && i + 1 < e && c->b[i + 1] == '|') {
-            if (i + 2 < e && !rt_space(c->b[i + 2]) && c->b[i + 2] != '|' && !hopeless_spoiler) {
-                size_t j = find_close(c, i + 2, e, '|', 2);
-                if (j == RT_NONE) hopeless_spoiler = 1;
-                else {
-                    emit(c, i, 2, OC_RT_DELIM | OC_RT_SPOILER);
-                    emit(c, i + 2, j - (i + 2), OC_RT_SPOILER);
-                    scan_inline(c, i + 2, j, depth + 1);
-                    emit(c, j, 2, OC_RT_DELIM | OC_RT_SPOILER);
-                    i = j + 2;
-                    continue;
-                }
+        /* A spoiler (MARKDOWN.md §1d): `>!` opens anywhere and `!<` closes it,
+         * on the same line, with something other than white space between.
+         * What it hides may carry emphasis, but not another spoiler. */
+        if (ch == '>' && i + 1 < e && c->b[i + 1] == '!' && !c->in_spoiler && !hopeless_spoiler) {
+            size_t j = spoiler_close(c, i, e);
+            if (j == RT_NONE) hopeless_spoiler = 1;
+            else if (all_space(c->b, i + 2, j)) { i = j + 2; continue; }
+            else {
+                emit(c, i, 2, OC_RT_DELIM | OC_RT_SPOILER);
+                emit(c, i + 2, j - (i + 2), OC_RT_SPOILER);
+                c->in_spoiler++;
+                scan_inline(c, i + 2, j, depth + 1);
+                c->in_spoiler--;
+                emit(c, j, 2, OC_RT_DELIM | OC_RT_SPOILER);
+                i = j + 2;
+                continue;
             }
-            while (i < e && c->b[i] == '|') i++;   /* a bare run is literal */
-            continue;
         }
         if      (ch == '*') { style = OC_RT_BOLD;   slot = 0; }
         else if (ch == '_') { style = OC_RT_ITALIC; slot = 1; }
@@ -325,7 +459,7 @@ static void scan_inline(rt_ctx *c, size_t s, size_t e, int depth) {
         while (i + d < e && c->b[i + d] == ch) d++;
         if (d > 2 || (d == 2 && ch != '*')) { i += d; continue; }
 
-        if (open_ok(c, i) && i + d < e && !rt_space(c->b[i + d]) && !hopeless[slot][d]) {
+        if (inner_open_ok(c, i) && i + d < e && !rt_space(c->b[i + d]) && !hopeless[slot][d]) {
             size_t j = find_close(c, i + d, e, ch, d);
             if (j == RT_NONE) hopeless[slot][d] = 1;
             else {
@@ -348,6 +482,10 @@ static void scan_line(rt_ctx *c, size_t s, size_t e, int depth) {
     if (depth > 3) { scan_inline(c, s, e, 0); return; }
     while (p < e && (c->b[p] == ' ' || c->b[p] == '\t')) p++;   /* indentation */
 
+    /* `>!` that closes on this line is a spoiler, not a quote whose text begins
+     * with a `!` (MARKDOWN.md §1d). One that does not close is the quote it
+     * always was. */
+    if (spoiler_opens(c, p, e)) { scan_inline(c, s, e, 0); return; }
     if (p < e && c->b[p] == '>') {
         size_t d = (p + 1 < e && c->b[p + 1] == ' ') ? 2 : 1;
         emit(c, p, d, OC_RT_DELIM | OC_RT_QUOTE);
@@ -392,10 +530,15 @@ static size_t line_at(rt_ctx *c, size_t i, size_t e, size_t *trim) {
 
 /* Split the line [s, e) into cells on its unescaped pipes, after dropping a
  * leading and a trailing one, each cell trimmed of spaces. Writes up to `max`
- * to `cells` and returns how many there are; *pipes says whether the line had
- * an unescaped pipe at all. */
-static size_t split_row(const char *b, size_t s, size_t e, oc_rt_cell *cells, size_t max, int *pipes) {
+ * to `cells` and returns how many there are, however many that is; *pipes says
+ * whether the line had an unescaped pipe at all. With `scan`, each cell's inline
+ * spans are reported too, past `max` as well. A pipe inside a spoiler separates nothing: split
+ * there, the spoiler's closer would be in the next cell and neither would be
+ * hidden (MARKDOWN.md §1d). */
+static size_t split_row(rt_ctx *c, size_t s, size_t e, oc_rt_cell *cells, size_t max, int *pipes, int scan) {
+    const char *b = c->b;
     size_t n = 0, k, cs;
+    int spoilers = 0;
     *pipes = 0;
     while (s < e && (b[s] == ' ' || b[s] == '\t')) s++;
     while (e > s && (b[e - 1] == ' ' || b[e - 1] == '\t')) e--;
@@ -406,15 +549,30 @@ static size_t split_row(const char *b, size_t s, size_t e, oc_rt_cell *cells, si
         for (k = e - 1; k > s && b[k - 1] == '\\'; k--) bs++;
         if (bs % 2 == 0) { e--; *pipes = 1; }
     }
+    for (k = s; k + 1 < e && !spoilers; k++) spoilers = b[k] == '>' && b[k + 1] == '!';
     cs = s;
     for (k = s; k <= e; k++) {
         if (k < e && b[k] == '\\' && k + 1 < e) { k++; continue; }
+        if (spoilers && k < e && b[k] == '`') {
+            /* Code that stays in one cell: a `>!` in it opens nothing. */
+            size_t L = code_span_len(c, k, e);
+            if (L && !memchr(b + k, '|', L)) { k += L - 1; continue; }
+        }
+        if (spoilers && at_spoiler_open(c, k, e)) {
+            size_t j = spoiler_close(c, k, e);
+            if (j == RT_NONE) spoilers = 0;   /* nor will a later one close */
+            else if (!all_space(b, k + 2, j)) { k = j + 1; continue; }
+        }
         if (k == e || b[k] == '|') {
             size_t a = cs, z = k;
             if (k < e) *pipes = 1;
             while (a < z && (b[a] == ' ' || b[a] == '\t')) a++;
             while (z > a && (b[z - 1] == ' ' || b[z - 1] == '\t')) z--;
             if (n < max) { cells[n].start = a; cells[n].len = z - a; }
+            if (scan) {
+                c->cell_extra = n >= c->cols;
+                scan_inline(c, a, z, 0);
+            }
             n++;
             cs = k + 1;
         }
@@ -435,11 +593,12 @@ static int sep_cell(const char *b, const oc_rt_cell *cell, uint8_t *align) {
 }
 
 /* Does a block marker begin the line [s, e)? Such a line belongs to a quote or a
- * list and does not start a table. */
-static int block_marker(const char *b, size_t s, size_t e) {
+ * list and does not start a table. A spoiler's `>!` is no marker. */
+static int block_marker(rt_ctx *c, size_t s, size_t e) {
+    const char *b = c->b;
     size_t q;
     while (s < e && (b[s] == ' ' || b[s] == '\t')) s++;
-    if (s < e && b[s] == '>') return 1;
+    if (s < e && b[s] == '>') return !spoiler_opens(c, s, e);
     if (s + 1 < e && b[s] == '-' && b[s + 1] == ' ') return 1;
     for (q = s; q < e && b[q] >= '0' && b[q] <= '9'; q++) {}
     return q > s && q + 1 < e && b[q] == '.' && b[q + 1] == ' ';
@@ -453,11 +612,11 @@ static size_t table_at(rt_ctx *c, size_t i, size_t e, oc_rt_table *t) {
     size_t ht, hn, st, sn, nh, ns, k, last, p;
     int hp, sp;
     hn = line_at(c, i, e, &ht);
-    if (hn >= e || ht == i || block_marker(b, i, ht)) return 0;
-    nh = split_row(b, i, ht, head, OC_RT_TABLE_MAX_COLS + 1, &hp);
+    if (hn >= e || ht == i || block_marker(c, i, ht)) return 0;
+    nh = split_row(c, i, ht, head, OC_RT_TABLE_MAX_COLS + 1, &hp, 0);
     if (!hp || nh == 0 || nh > OC_RT_TABLE_MAX_COLS) return 0;
     sn = line_at(c, hn + 1, e, &st);
-    ns = split_row(b, hn + 1, st, sep, OC_RT_TABLE_MAX_COLS + 1, &sp);
+    ns = split_row(c, hn + 1, st, sep, OC_RT_TABLE_MAX_COLS + 1, &sp, 0);
     if (!sp || ns != nh) return 0;
     memset(t, 0, sizeof *t);
     for (k = 0; k < ns; k++)
@@ -472,7 +631,7 @@ static size_t table_at(rt_ctx *c, size_t i, size_t e, oc_rt_table *t) {
         oc_rt_cell tmp[1];
         int rp;
         if (rt == p) break;                       /* a blank line ends it */
-        split_row(b, p, rt, tmp, 0, &rp);
+        split_row(c, p, rt, tmp, 0, &rp, 0);
         if (!rp) break;                           /* so does a line with no pipe */
         t->rows++;
         last = rt;
@@ -480,6 +639,22 @@ static size_t table_at(rt_ctx *c, size_t i, size_t e, oc_rt_table *t) {
     }
     t->len = last - i;
     return p;
+}
+
+/* The inline spans of every cell of table `t`, for oc_rt_spoilers, in order: the
+ * cells a row has past the table's columns too. No one draws those, but a frontend
+ * that shows the source, or a table as text, shows them. */
+static void scan_cells(rt_ctx *c, const oc_rt_table *t) {
+    size_t p = t->start, end = t->start + t->len, row = 0;
+    c->in_cell = 1;
+    c->cols = t->cols;
+    while (p < end) {
+        size_t trim, nl = line_at(c, p, end, &trim);
+        int pipes;
+        if (row++ != 1) split_row(c, p, trim, NULL, 0, &pipes, 1);   /* row 1 is the separator */
+        p = nl + 1;
+    }
+    c->in_cell = 0;
 }
 
 /* Everything between two fenced blocks, split into lines; a table where one
@@ -495,6 +670,7 @@ static void scan_text(rt_ctx *c, size_t s, size_t e) {
                 c->tn++;
             } else {
                 emit(c, t.start, t.len, OC_RT_TABLE);
+                if (c->sv) scan_cells(c, &t);
             }
             i = after;
             continue;
@@ -503,6 +679,24 @@ static void scan_text(rt_ctx *c, size_t s, size_t e) {
         if (end > i && !c->tables_only) scan_line(c, i, end, 0);
         i = nl + 1;
     }
+}
+
+/* Is `i` inside an inline spoiler on its own line? Then the fence there opens
+ * nothing: it would show what the spoiler around it hides. */
+static int in_line_spoiler(rt_ctx *c, size_t i) {
+    size_t s = i, e = i, p;
+    while (s > 0 && c->b[s - 1] != '\n') s--;
+    while (e < c->len && c->b[e] != '\n') e++;
+    for (p = s; p < i; p++) {
+        size_t j;
+        if (c->b[p] == '\\' && p + 1 < e && rt_escapable(c->b[p + 1])) { p++; continue; }
+        if (!at_spoiler_open(c, p, e)) continue;
+        j = spoiler_close(c, p, e);
+        if (j == RT_NONE) return 0;
+        if (j >= i && !all_space(c->b, p + 2, j)) return 1;
+        p = j + 1;
+    }
+    return 0;
 }
 
 /* The walk both oc_rt_scan and oc_rt_tables make: fenced code blocks first,
@@ -516,7 +710,7 @@ static void scan_body(rt_ctx *c) {
               && open_ok(c, i))) { i++; continue; }
         for (j = i + 3; j + 3 <= len; j++)
             if (body[j] == '`' && body[j + 1] == '`' && body[j + 2] == '`') { close = j; break; }
-        if (close == RT_NONE) { i++; continue; }   /* unclosed fence: literal text */
+        if (close == RT_NONE || in_line_spoiler(c, i)) { i++; continue; }   /* unclosed fence: literal text */
 
         scan_text(c, seg, i);
         /* ```spoiler Label (MARKDOWN.md §1d): the opening line, label and all,
@@ -598,7 +792,7 @@ int oc_rt_row_next(oc_rt_rowit *it, oc_rt_cell cells[OC_RT_TABLE_MAX_COLS], uint
         if (it->pos >= it->end) return 0;
     }
     nl = line_at(&c, it->pos, it->end, &trim);
-    n = split_row(it->b, it->pos, trim, cells, it->cols, &pipes);
+    n = split_row(&c, it->pos, trim, cells, it->cols, &pipes, 0);
     for (k = n; k < it->cols; k++) { cells[k].start = trim; cells[k].len = 0; }
     *row = it->row++;
     it->pos = nl + 1;
@@ -673,51 +867,66 @@ size_t oc_rt_time_text(int64_t ms, const oc_rt_clock *clock, int form, char *out
     return (size_t)w < cap ? (size_t)w : cap - 1;
 }
 
-/* Whether `body` holds a spoiler block's opening anywhere in its `len` bytes:
+/* Whether `body` holds what a spoiler opens with anywhere in its `len` bytes:
  * bounded, since a body need not end in a NUL. */
-static int has_spoiler_fence(const char *body, size_t len) {
-    for (const char *p = body; (p = memchr(p, '`', len - (size_t)(p - body))) != NULL; p++)
-        if ((size_t)(body + len - p) >= 10 && memcmp(p, "```spoiler", 10) == 0) return 1;
+static int has_spoiler_open(const char *body, size_t len) {
+    for (size_t i = 0; i + 1 < len; i++) {
+        if (body[i] == '>' && body[i + 1] == '!') return 1;
+        if (body[i] == '`' && len - i >= 10 && memcmp(body + i, "```spoiler", 10) == 0) return 1;
+    }
     return 0;
 }
 
 size_t oc_rt_spoilers(const char *body, size_t len, oc_rt_spoiler *out, size_t max) {
-    size_t ns, k, n = 0;
-    oc_rt_span *sp;
-    if (!body || len == 0 || (!memchr(body, '|', len) && !has_spoiler_fence(body, len))) return 0;
-    ns = oc_rt_scan(body, len, NULL, 0);
-    if (!ns) return 0;
-    sp = malloc(ns * sizeof *sp);
-    if (!sp) return 0;
-    oc_rt_scan(body, len, sp, ns);
-    for (k = 0; k < ns; k++) {
-        uint16_t kind = sp[k].style & (OC_RT_SPOILER | OC_RT_SPOILER_BLOCK);
-        size_t q, close = RT_NONE;
-        if (!kind || !(sp[k].style & OC_RT_DELIM)) continue;
-        /* An opener; its closer is the next delimiter of the same kind. */
-        for (q = k + 1; q < ns; q++)
-            if (sp[q].style == (OC_RT_DELIM | kind)) { close = q; break; }
-        if (close == RT_NONE) break;
-        if (n < max) {
-            oc_rt_spoiler *o = &out[n];
-            memset(o, 0, sizeof *o);
-            o->start = sp[k].start;
-            o->len = sp[close].start + sp[close].len - sp[k].start;
-            o->hidden = sp[k].start + sp[k].len;
-            o->hidden_len = sp[close].start - o->hidden;
-            o->block = kind == OC_RT_SPOILER_BLOCK;
-            if (o->block) {
-                size_t a = sp[k].start + 10, b = sp[k].start + sp[k].len;
-                while (a < b && (body[a] == ' ' || body[a] == '\t')) a++;
-                while (b > a && (body[b - 1] == '\n' || body[b - 1] == '\r' || body[b - 1] == ' ' || body[b - 1] == '\t')) b--;
-                o->label = a; o->label_len = b - a;
-            }
-        }
-        n++;
-        k = close;
+    oc_rt_spoiler none;
+    rt_ctx c;
+    if (!body || len == 0 || !has_spoiler_open(body, len)) return 0;
+    /* The scan oc_rt_scan makes, with what is in each table's cells as well. */
+    memset(&c, 0, sizeof c);
+    c.b = body; c.len = len;
+    c.sv = out ? out : &none; c.sv_max = out ? max : 0;
+    scan_body(&c);
+    return c.sv_n;
+}
+
+char *oc_rt_spoilers_covered(const char *body, size_t len) {
+    oc_rt_spoiler sp[32];
+    size_t n = oc_rt_spoilers(body, len, sp, 32), i = 0, o = 0;
+    char *out;
+    if (!n) return NULL;
+    if (n > 32) { len = sp[31].start + sp[31].len; n = 32; }
+    out = malloc(len + n * 80 + 1);
+    if (!out) return NULL;
+    for (size_t k = 0; k < n; k++) {
+        memcpy(out + o, body + i, sp[k].start - i);
+        o += sp[k].start - i;
+        if (sp[k].label_len) o += (size_t)sprintf(out + o, "[spoiler: %.*s]", (int)(sp[k].label_len > 64 ? 64 : sp[k].label_len), body + sp[k].label);
+        else                 o += (size_t)sprintf(out + o, "[spoiler]");
+        i = sp[k].start + sp[k].len;
     }
-    free(sp);
-    return n;
+    memcpy(out + o, body + i, len - i);
+    o += len - i;
+    out[o] = '\0';
+    return out;
+}
+
+size_t oc_rt_visible_urls(const char *body, size_t len, oc_url_span *out, size_t max) {
+    oc_url_span all[64];
+    size_t n = oc_url_extract(body, len, all, 64), nh, w = 0;
+    oc_rt_spoiler *hid;
+    if (!n) return 0;
+    nh = oc_rt_spoilers(body, len, NULL, 0);
+    hid = nh ? malloc(nh * sizeof *hid) : NULL;
+    if (nh && !hid) return 0;
+    if (nh) nh = oc_rt_spoilers(body, len, hid, nh);
+    for (size_t i = 0; i < n && w < max; i++) {
+        int hidden = 0;
+        for (size_t k = 0; k < nh && !hidden; k++)
+            hidden = all[i].start >= hid[k].start && all[i].start < hid[k].start + hid[k].len;
+        if (!hidden) out[w++] = all[i];
+    }
+    free(hid);
+    return w;
 }
 
 /* What an excerpt puts in place of a construct: a table's one line, a time
@@ -730,36 +939,39 @@ size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, 
     oc_rt_spoiler sv[32];
     oc_rt_span sp[OC_RT_MAX];
     rt_repl r[32 + 32 + OC_RT_MAX];
-    size_t nt, nv, ns, nr = 0, k, i = 0, o = 0;
+    size_t nt, nv, ns, nr = 0, k, i = 0, o = 0, lim;
     if (!out || cap == 0) return 0;
     out[0] = '\0';
     if (!body) return 0;
+    /* Everything from the whole body, and only then any limit: a limit that fell
+     * inside a spoiler before it was listed would cut off its closer, and with it
+     * the fact that it was one. What starts before the limit goes whole, and past
+     * the limit nothing is shown, rather than show something hidden. */
+    lim = len;
     nt = oc_rt_tables(body, len, t, 32);
-    if (nt > 32) nt = 32;                     /* past that, the rest stay as written */
+    if (nt > 32) { lim = t[31].start + t[31].len; nt = 32; }
     nv = oc_rt_spoilers(body, len, sv, 32);
     if (nv > 32) {
-        /* More spoilers than are listed: the rest of the body is not shown at
-         * all rather than shown with something it hides. */
-        len = sv[31].start + sv[31].len;
+        if (sv[31].start + sv[31].len < lim) lim = sv[31].start + sv[31].len;
         nv = 32;
     }
     ns = memchr(body, '<', len) ? oc_rt_scan(body, len, sp, OC_RT_MAX) : 0;
     if (ns > OC_RT_MAX) ns = OC_RT_MAX;
     for (k = 0; k < nt; k++) {
-        if (t[k].start >= len) continue;
+        if (t[k].start >= lim) continue;
         r[nr].start = t[k].start; r[nr].len = t[k].len; r[nr].kind = RT_R_TABLE;
         r[nr].rows = t[k].rows; r[nr].cols = t[k].cols; nr++;
     }
     for (k = 0; k < nv; k++) {
+        if (sv[k].start >= lim) continue;
         r[nr].start = sv[k].start; r[nr].len = sv[k].len; r[nr].kind = RT_R_SPOILER;
         r[nr].label = sv[k].label; r[nr].label_len = sv[k].label_len; nr++;
     }
     for (k = 0; k < ns; k++) {
-        if (sp[k].style != OC_RT_TIME || !oc_rt_time_value(body, len, &sp[k], &r[nr].ms)) continue;
+        if (sp[k].style != OC_RT_TIME || sp[k].start >= lim || !oc_rt_time_value(body, len, &sp[k], &r[nr].ms)) continue;
         r[nr].start = sp[k].start; r[nr].len = sp[k].len; r[nr].kind = RT_R_TIME; nr++;
     }
-    /* In order of where each starts; one inside another goes with the outer
-     * (a table or a time inside a spoiler is hidden with it). */
+    len = lim;
     for (k = 1; k < nr; k++) {
         rt_repl x = r[k];
         size_t q = k;
@@ -774,7 +986,8 @@ size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, 
         nr = m;
     }
     for (k = 0; k <= nr && o + 1 < cap; k++) {
-        size_t upto = k < nr ? r[k].start : len, n = upto - i;
+        /* A limit inside a table or a spoiler leaves `i` past `len`: it went whole. */
+        size_t upto = k < nr ? r[k].start : len, n = upto > i ? upto - i : 0;
         if (n > cap - 1 - o) n = cap - 1 - o;
         memcpy(out + o, body + i, n);
         o += n;

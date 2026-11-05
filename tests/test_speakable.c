@@ -37,7 +37,62 @@ int run_speakable_tests(void) {
         CHECK(strstr(out, "October") == NULL);
     }
     /* A spoiler is named, never read (MARKDOWN.md §1d). */
-    CHECK(said("the killer is ||the butler|| indeed", "the killer is spoiler indeed"));
+    CHECK(said("the killer is >!the butler!< indeed", "the killer is spoiler indeed"));
+    /* At the start of a line it is a spoiler and no quote; a quote can hold one. */
+    CHECK(said(">!the butler!< did it", "spoiler did it"));
+    CHECK(said("> >!the butler!< did it", "Quote: spoiler did it"));
+    CHECK(said("> the old plan\n>!the butler!<", "Quote: the old plan. spoiler"));
+    CHECK(said(">!not closed", "Quote: !not closed"));
+    /* In a table a spoiler is hidden with the cells, which are never read,
+     * even where it starts the table. */
+    CHECK(said("| a | b |\n|---|---|\n| >!the butler!< | c |", "Table, 1 row."));
+    CHECK(said(">!the butler!< | b\n---|---\n1 | 2", "Table, 1 row."));
+    CHECK(said("| a | b |\n|---|---|\n| x | y | >!the butler!< |", "Table, 1 row."));
+    /* However many spans a message has, ordinary text is said in full and
+     * hidden text never is. */
+    {
+        static char many[8192], out[OC_SPEAK_MAX + 1];
+        size_t o;
+        /* Bold words, then a table whose cells are not read. */
+        o = 0;
+        for (int i = 0; i < 44; i++) o += (size_t)snprintf(many + o, sizeof many - o, "*w%d* ", i);
+        o += (size_t)snprintf(many + o, sizeof many - o, "\n| a | b |\n|---|---|\n| x | y | >!THEBUTLER!< | PLAINCELL |\nLAST");
+        oc_speakable(many, o, names, NULL, out, sizeof out);
+        CHECK(strstr(out, "w43") && strstr(out, "LAST") && !strstr(out, "THEBUTLER") && !strstr(out, "PLAINCELL"));
+        /* The 128th span is what a spoiler hides. */
+        o = 0;
+        for (int i = 0; i < 42; i++) o += (size_t)snprintf(many + o, sizeof many - o, "*w%d* ", i);
+        o += (size_t)snprintf(many + o, sizeof many - o, ">!THEBUTLER!< LAST");
+        oc_speakable(many, o, names, NULL, out, sizeof out);
+        CHECK(strstr(out, "w41") && strstr(out, "LAST") && !strstr(out, "THEBUTLER"));
+        /* The same text is what a summary gets. */
+        static char whole[32768];
+        oc_speakable_full(many, o, names, NULL, whole, sizeof whole);
+        CHECK(strstr(whole, "w41") && strstr(whole, "LAST") && !strstr(whole, "THEBUTLER"));
+        /* The span limit falling inside a block. */
+        o = (size_t)snprintf(many, sizeof many, "```spoiler\n");
+        for (int i = 0; i < 64; i++) o += (size_t)snprintf(many + o, sizeof many - o, "- HIDDEN%d\n", i);
+        o += (size_t)snprintf(many + o, sizeof many - o, "```\nLAST");
+        oc_speakable(many, o, names, NULL, out, sizeof out);
+        CHECK(!strstr(out, "HIDDEN") && strstr(out, "LAST"));
+        /* Nothing hidden: said to the end, past any number of spans. */
+        o = 0;
+        for (int i = 0; i < 64; i++) o += (size_t)snprintf(many + o, sizeof many - o, "- item%d\n", i);
+        oc_speakable(many, o, names, NULL, out, sizeof out);
+        CHECK(strstr(out, "item0") && strstr(out, "item63"));
+        o = 0;
+        for (int i = 0; i < 100; i++) o += (size_t)snprintf(many + o, sizeof many - o, "*b%d* ", i);
+        oc_speakable(many, o, names, NULL, out, sizeof out);
+        CHECK(strstr(out, "b99") != NULL);
+        /* Past 32 spoilers each is named, and what follows is said. */
+        o = 0;
+        for (int i = 0; i < 40; i++) o += (size_t)snprintf(many + o, sizeof many - o, ">!HIDDEN%d!< ", i);
+        o += (size_t)snprintf(many + o, sizeof many - o, "LAST");
+        oc_speakable(many, o, names, NULL, out, sizeof out);
+        CHECK(!strstr(out, "HIDDEN") && strstr(out, "LAST"));
+    }
+    /* The old form is said as it is written. */
+    CHECK(said("a||b", "a||b"));
     CHECK(said("Before\n```spoiler Ending\nShe lives.\n```\nThe end.", "Before. spoiler: Ending. The end."));
     CHECK(said("see https://www.github.com/openchime/openchime/pull/285 for it", "see github.com for it"));
     CHECK(said("read [the release notes](https://example.com/notes) today", "read the release notes today"));

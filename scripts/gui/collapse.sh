@@ -67,6 +67,20 @@ click_rect "$(cut_of "$MID" r)"
 spl_open() { snap; [ -z "$(cut_of "$MID" kind)" ] && grep -q "^  spoiler mid=$MID k=0 shown=0 lines=3[0-9] " "$D"; }
 check "opened whole, all its lines are still covered" waitfor 5 spl_open
 
+say "== a cut inside an inline spoiler closes it"
+words=""; for i in $(seq 1 480); do words="${words}hide$i "; done
+"$DRIVE" sendraw "before\\n>!${words}INLINELAST!<\\nafter" >/dev/null
+inl_cut() { snap; IN="$(grep '^  cutmsg .* kind=2 ' "$D" | tail -1 | grep -o 'mid=[0-9]*' | cut -d= -f2)";
+            [ "${IN:-$MID}" != "$MID" ] && grep -q "^  spoiler mid=$IN k=0 shown=0 lines=[0-9]* " "$D"; }
+check "the message is cut, and the part above the cut is drawn covered" waitfor 10 inl_cut
+INL="$(grep -m1 "^  spoiler mid=$IN k=0 " "$D" | grep -o 'lines=[0-9]*' | cut -d= -f2)"
+check "under a cover on every line above the cut ($INL)" [ "${INL:-0}" -ge 8 ] && [ "${INL:-99}" -le 10 ]
+"$DRIVE" shot collapse_inline >/dev/null
+click_rect "$(cut_of "$IN" r)"
+inl_open() { snap; [ -z "$(cut_of "$IN" kind)" ] && [ "$(grep -m1 "^  spoiler mid=$IN k=0 " "$D" | grep -o 'lines=[0-9]*' | cut -d= -f2)" -gt 10 ] &&
+             grep -q "^  spoiler mid=$IN k=0 shown=0 " "$D"; }
+check "opened whole, the rest is still covered" waitfor 5 inl_open
+
 say "== a short message collapsed from its menu"
 "$DRIVE" send "first line of a note" >/dev/null
 sleep 1

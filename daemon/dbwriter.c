@@ -5005,7 +5005,9 @@ static oc_dbres *process_unfurl_store(sqlite3 *db, const oc_job *j) {
         const char *body = (const char *)sqlite3_column_blob(st, 2);
         size_t body_len  = (size_t)sqlite3_column_bytes(st, 2);
         oc_url_span sp[OC_UNFURL_MAX_URLS];
-        size_t nn = body ? oc_url_extract(body, body_len, sp, OC_UNFURL_MAX_URLS) : 0;
+        /* Nor one an edit has since put in a spoiler, with its fetch in flight
+         * (MARKDOWN.md §1d). */
+        size_t nn = body ? oc_rt_visible_urls(body, body_len, sp, OC_UNFURL_MAX_URLS) : 0;
         size_t ul = strlen(j->unf_url);
         for (size_t i = 0; i < nn; i++)
             if (sp[i].len == ul && memcmp(body + sp[i].start, j->unf_url, ul) == 0)

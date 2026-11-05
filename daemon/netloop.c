@@ -12,6 +12,7 @@
 #include "push.h"
 #include "invite_mail.h"
 #include "unfurl.h"
+#include "richtext.h"   /* oc_rt_visible_urls: what is hidden is not unfurled */
 #include "url.h"
 #include "xferpool.h"
 #ifdef OC_TTS
@@ -1343,12 +1344,14 @@ void oc_netloop_set_unfurler(struct oc_unfurler *u) {
 
 /* Queue the URLs of a just-committed body for fetching — the first
  * OC_UNFURL_MAX_URLS of them, extracted by the shared scanner so the daemon
- * fetches exactly the addresses a client links. Fire-and-forget. */
+ * fetches exactly the addresses a client links. An address in a spoiler is left
+ * alone: its card would show, under the message, what the spoiler hides
+ * (MARKDOWN.md §1d). Fire-and-forget. */
 static void unfurl_enqueue(const uint8_t *body, size_t len,
                            uint64_t channel_id, uint64_t message_id) {
     if (!g_unfurler || !body || !len) return;
     oc_url_span sp[OC_UNFURL_MAX_URLS];
-    size_t n = oc_url_extract((const char *)body, len, sp, OC_UNFURL_MAX_URLS);
+    size_t n = oc_rt_visible_urls((const char *)body, len, sp, OC_UNFURL_MAX_URLS);
     for (size_t i = 0; i < n; i++)
         oc_unfurler_fetch(g_unfurler, channel_id, message_id,
                           (const char *)body + sp[i].start, sp[i].len);

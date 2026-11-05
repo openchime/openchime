@@ -7196,6 +7196,24 @@ static void test_unfurl_store(void) {
     CHECK(r && r->type == OC_RES_OK);
     oc_dbres_free(r);
 
+    /* An address in a spoiler gets no card, whether it was there at the start or
+     * an edit wrapped it with its fetch in flight (MARKDOWN.md §1d). */
+    memset(idem, 0xD2, sizeof idem);
+    uint64_t hid = send_msg(w, u, idem, "see https://example.com/w today");
+    CHECK(hid != 0);
+    oc_dbres *er = do_edit(w, u, OC_DEFAULT_CHANNEL, hid, "see >!https://example.com/w!< today");
+    CHECK(er && er->type == OC_RES_EDIT_OK);
+    oc_dbres_free(er);
+    j = oc_job_new(OC_JOB_UNFURL_STORE, 0);
+    j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = hid;
+    j->unf_url = strdup("https://example.com/w");
+    j->unf_title = strdup("Hidden title");
+    j->unf_descr = strdup("");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_OK);
+    oc_dbres_free(r);
+
     /* The stored row rides the replay (the same guarantee as reactions/pins). */
     r = backfill(w, u, OC_DEFAULT_CHANNEL, 0);
     CHECK(r && r->type == OC_RES_BACKFILL_OK);
@@ -10107,7 +10125,7 @@ static void test_spoiler_excerpts(void) {
     CHECK(alice);
     uint8_t idem[OC_IDEM_LEN];
     memset(idem, 0x5A, sizeof idem);
-    uint64_t src = send_msg(w, alice, idem, "the killer is ||the butler|| indeed");
+    uint64_t src = send_msg(w, alice, idem, "the killer is >!the butler!< indeed");
     CHECK(src);
 
     oc_dbres *r = list_channels(w, alice);
@@ -10130,6 +10148,37 @@ static void test_spoiler_excerpts(void) {
         oc_dbres_free(r);
     }
 
+    /* In a table cell: the channel's preview, and a search hit whichever side of
+     * the cover the word is on, where snippet() would otherwise cut a window. */
+    memset(idem, 0x5D, sizeof idem);
+    uint64_t cellmsg = send_msg(w, alice, idem, "| Who | Note |\n|---|---|\n| >!cellsecret!< | cellplain |");
+    CHECK(cellmsg);
+    r = list_channels(w, alice);
+    for (size_t i = 0; r && i < r->n_chlist; i++)
+        if (r->chlist[i].channel_id == OC_DEFAULT_CHANNEL)
+            /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+            CHECK(r->chlist[i].preview && !strstr(r->chlist[i].preview, "cellsecret") && strstr(r->chlist[i].preview, "Table: 1 row"));
+    oc_dbres_free(r);
+    static const char *const CQ[2] = { "cellsecret", "cellplain" };
+    for (int q = 0; q < 2; q++) {
+        r = search(w, alice, CQ[q], 10);
+        CHECK(r && r->n_search == 1);
+        /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+        if (r && r->n_search == 1) CHECK(r->search[0].body && !strstr((const char *)r->search[0].body, "cellsecret") && strstr((const char *)r->search[0].body, "Table: 1 row"));
+        oc_dbres_free(r);
+    }
+
+    /* In a cell past the table's columns: search on it or beside it, as above. */
+    memset(idem, 0x5E, sizeof idem);
+    CHECK(send_msg(w, alice, idem, "| A | B |\n|---|---|\n| extrax | extray | >!extrasecret!< |"));
+    static const char *const XQ[2] = { "extrasecret", "extrax" };
+    for (int q = 0; q < 2; q++) {
+        r = search(w, alice, XQ[q], 10);
+        CHECK(r && r->n_search == 1);
+        if (r && r->n_search == 1) CHECK(r->search[0].body && !strstr((const char *)r->search[0].body, "extrasecret"));
+        oc_dbres_free(r);
+    }
+
     oc_dbres *cr = create_channel(w, alice, "sp-dest", 1);
     uint64_t dest = cr ? cr->channel_id : 0;
     oc_dbres_free(cr);
@@ -10147,7 +10196,7 @@ static void test_spoiler_excerpts(void) {
     uint64_t bob = reg(w, "sp-bob", "pw", OC_ROLE_MEMBER);
     CHECK(bob);
     memset(idem, 0x5C, sizeof idem);
-    uint64_t men = send_msg(w, bob, idem, "@sp-alice it was ||the butler||");
+    uint64_t men = send_msg(w, bob, idem, "@sp-alice it was >!the butler!<");
     CHECK(men);
     r = list_activity(w, alice);
     int feed = 0;

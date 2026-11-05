@@ -20,14 +20,14 @@ construct shows its source legibly.
 | Strikethrough | `~struck~` | |
 | Inline code | `` `code` `` | Suppresses all other markup inside it. |
 | Code block | ` ```…``` ` | Fenced; may span lines. Suppresses everything inside. |
-| Blockquote | `> quoted` | At the start of a line. |
+| Blockquote | `> quoted` | At the start of a line. `>!` that closes on the line is a spoiler instead — see §1d. |
 | Bulleted list | `- item` | At the start of a line. **Not Slack** — see §4. |
 | Ordered list | `1. item` | At the start of a line. **Not Slack** — see §4. |
 | Link | `https://example.com` | Not typed as markup: a bare `http`/`https` address is **autolinked**. |
 | Labelled link | `[label](https://example.com)` | Text that links to an address. The reader always sees the address before it opens — see §4. |
 | Table | `\| a \| b \|` over `\|---\|---\|` | A pipe table, as GitHub writes it — see §1a. |
 | Time | `<time:2026-10-30T15:00Z>` | A moment, shown to each reader in their own zone — see §1c. |
-| Spoiler | `\|\|hidden\|\|`, or ` ```spoiler Label ` … ` ``` ` | Covered until each reader chooses to see it — see §1d. |
+| Spoiler | `>!hidden!<`, or ` ```spoiler Label ` … ` ``` ` | Covered until each reader chooses to see it — see §1d. |
 
 Emphasis nests (`*bold with _italic_ inside*`); code does not — everything inside
 a code span or block is literal, including other delimiters.
@@ -49,9 +49,10 @@ A table is GitHub's pipe table:
   header and the separator must have the same number of cells; a body row with
   fewer has empty ones, and extra cells are ignored, as GitHub does.
 - **Pipes.** Leading and trailing pipes are optional. `\|` is a literal pipe in
-  a cell — the escape works anywhere, but a table is where it is needed.
-- **Cells are inline text.** Emphasis, code, links, labelled links, emoji,
-  custom emoji, @mentions and #channels all work in a cell; block markers do
+  a cell — the escape works anywhere, but a table is where it is needed. A pipe
+  inside a spoiler is part of what it hides, not a separator (§1d).
+- **Cells are inline text.** Emphasis, code, links, labelled links, spoilers,
+  emoji, custom emoji, @mentions and #channels all work in a cell; block markers do
   not, and no inline construct reaches from one cell into the next.
 - **`<br>` is a line break in a cell** (`<br/>` and `<br />` too, in any case).
   It is GitHub's convention and the only piece of HTML the dialect accepts —
@@ -142,7 +143,7 @@ A push notification carries no message text, so it is unaffected.
 Text a reader sees only when they choose to:
 
 ```
-The killer is ||the butler||.
+The killer is >!the butler!<.
 ```
 
 ````
@@ -151,20 +152,74 @@ She lives.
 ```
 ````
 
-The inline form, `||hidden||`, is on one line and not empty: the opening bars
-come before a non-space and the closing ones after one, as emphasis does, so
-`a || b` is text. What it hides may carry emphasis. The block form is a fenced
-block whose opening fence is followed by the word `spoiler` and an optional
-label, for a longer or labelled one; its lines are text, not code, and may hold
-any of the dialect. Inside code, neither is a spoiler.
+The inline form, `>!hidden!<`, is on one line and not empty. What it hides may
+carry emphasis, code or a link. The block form is a fenced block whose opening
+fence is followed by the word `spoiler` and an optional label, for a longer or
+labelled one; its lines are text, not code, and may hold any of the dialect.
+Inside code, neither is a spoiler. `||text||` is not a spoiler: it is ordinary
+text, and in a table row its pipes separate cells as any pipes do.
+
+**At the start of a line,** `>` is a quote everywhere else, so the rule is
+explicit. A line that begins `>!` (after any indentation) and closes it on that
+line is a spoiler and not a quote; a table's first cell may begin that way too.
+A `>!` with no closer on the line, or with nothing but white space before the
+closer, is the quote it always was, and hides nothing:
+
+| Written | Reads as |
+|---|---|
+| `>!text!<` | A spoiler, with no quote. |
+| `>!text!< and more` | A spoiler, then text. |
+| `>!text` | A quote of `!text`. |
+| `>!!<` | A quote of `!!<`. |
+| `> >!text!<` | A spoiler inside a quote. |
+| `- >!text!<` | A spoiler inside a list item. |
+| `> !text!<` | A quote of `!text!<`. The `!` must follow the `>` directly. |
+
+**What is hidden is never cut short.** Where the syntax could be read two ways,
+the reading is the one that shows less:
+
+- `>!` opens anywhere, not only at a word's boundary, and spaces inside are
+  fine: `a>!b!<c` and `>! b !<` both hide `b`. So `x>!y` with a `!<` later on the
+  line hides what is between; `\>!` and `\!<` write them literally.
+- A nested `>!` is text, and the whole of `>!a >!b!< c!<` is hidden. With more
+  openers than closers, as in `>!a >!b!<`, it runs to the last closer.
+- A `!<` closes wherever it is, unless it is escaped or inside code or a link's
+  label, so hiding `!<` itself needs `\!<`.
+- Emphasis does not reach into one: in `*a >!b* c!<` the `*` inside is hidden
+  text, and the first `*` is literal.
+- Nor does a link's label: `[a >!b](https://example.com) c!<` is no link, and
+  everything from `b` to `c` is hidden. A whole link inside is a link.
+- Nor does a fence on the line: `>! ```a``` !<` hides `a`.
+- Code that starts first wins, as code always does: `` `a >!b` c!< `` is code and
+  text, and hides nothing. A closer inside code does not close.
+- **In a table row,** a spoiler is cut from the row before the pipes are: in
+  `| >!a|b!< | c |`, the pipe is hidden with `a` and `b` and the row has two
+  cells. In a `>!` that has no closer on the row, the pipes separate as usual.
+  A spoiler stays in one row, as it stays on one line. A cell past the table's
+  columns is ignored in the grid and still a cell: what it hides stays hidden
+  where the row shows as text, and a message with only that to hide offers no
+  "Show spoilers" where the grid is drawn.
+- A spoiler that does not close at all, or spans a line break, hides nothing;
+  it is literal text, like any unclosed delimiter (§2). The block form is what
+  hides several lines.
+- **In the composer,** a line break typed or pasted inside one splits it, so each
+  line stays hidden: `>!ab|cd!<` becomes `>!ab!<` and `>!cd!<`. An edit inside one
+  that would stop it being one, such as a `\` before its `!<`, is refused, and no
+  edit silently takes its delimiters away.
 
 Each client draws a spoiler **covered** — a block the size of what it hides,
 saying "Spoiler" or "Spoiler: Label" — until the reader reveals it with a click,
 with its button for assistive technology, or from the keyboard with the
 message's "Show spoilers" (Ctrl+Up to the message, Shift+F10, Enter), and covers
 it again the same way.
+**A spoiler in a table cell** is hidden like any other. In the grid it is drawn
+covered in its cell and reveals by the same click, button or menu, numbered among
+the message's spoilers; a table's row as read by assistive technology and Copy
+table say `[spoiler]` while it is covered. Covered, it takes no hover or click as
+a link or a channel, anywhere in a message.
 The terminal client shows `[spoiler]` or `[spoiler: Label]`, and `v` on a
-selected message (or its menu) shows and hides its spoilers. A reveal is this
+selected message (or its menu) shows and hides its spoilers. A `/me` action's
+spoiler is covered and revealed the same way in both. A reveal is this
 reader's, in this window: it is not stored or sent.
 
 **Nothing that sums a message up gives a spoiler away.** Every one-line excerpt
@@ -172,15 +227,19 @@ reader's, in this window: it is not stored or sent.
 preview, a forward's source — shows `[spoiler]` or `[spoiler: Label]` in its
 place (`oc_rt_plain_excerpt` and `oc_rt_flatten_at`, which the daemon's excerpts are built through
 too; a search whose words fall inside one shows the excerpt rather than a
-window into it). Read aloud, it is "spoiler", or "spoiler: Label". A push
-notification carries no message text.
+window into it, and past the 32nd table or spoiler it shows nothing more). A
+table's excerpt is its one line, and read aloud it is announced
+and not read, so what its cells hide does not come up. Read aloud, a spoiler is
+"spoiler", or "spoiler: Label". A push notification carries no message text, and
+the daemon fetches and stores no link card for an address inside a spoiler,
+whose card would show under the message, even with a fetch in flight when an edit
+wraps it.
 
 The parser reports `OC_RT_SPOILER` (inline) or `OC_RT_SPOILER_BLOCK` over the
-hidden text, with `OC_RT_DELIM` spans over the bars, the opening line and the
-closing fence; `oc_rt_spoilers` lists each one whole, with its label.
-
-In a table row a `|` separates cells, so `||text||` there is two empty cells and
-a cell of ordinary text, not a spoiler; the composer's preview shows it as such.
+hidden text, with `OC_RT_DELIM` spans over the `>!` and `!<`, the opening line and
+the closing fence; `oc_rt_spoilers` lists each one whole, with its label, those in
+a table's cells among them (`oc_rt_scan` reports a table as one span, so
+`oc_rt_scan_cell` is what gives a cell's own spans).
 
 ## 2. When a delimiter is *not* markup
 
@@ -195,10 +254,15 @@ meant literally. Three rules, in order:
 2. **It must close on the same line** (except a fenced block, which may not).
    An unclosed delimiter is literal text — a half-typed `*` never restyles the
    rest of the message.
-3. **Backslash escapes.** `\*` `\_` `\~` `` \` `` `\>` `\-` `\|` and `\\` produce the
+3. **Backslash escapes.** `\*` `\_` `\~` `` \` `` `\>` `\-` `\|` `\!` and `\\` produce the
    literal character. Slack has no escape at all; this is a deliberate addition,
    because without one there is no way to write a literal asterisk at a word
    boundary and the answer "you cannot" is not one.
+
+**Spoilers are the exception to rule 1** (§1d). `>!` opens anywhere and `!<` closes
+after anything, spaces included, because an inline spoiler that failed to open on
+a boundary would show what its author meant to hide. Rule 2 holds: `>!` with no
+closer on its line is literal, and at the start of a line it is a quote.
 
 Two clarifications the implementation forced, recorded because they are the
 difference between the rules above working and merely sounding right:

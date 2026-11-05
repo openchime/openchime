@@ -2027,7 +2027,7 @@ static void test_spoiler_preview(void) {
     e.body = strdup("room");
     oc_model_apply(&m, &e);
     memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 75; e.message_id = 6; e.author_id = 2;
-    e.body = strdup("it was ||the butler||");
+    e.body = strdup("it was >!the butler!<");
     oc_model_apply(&m, &e);
     const oc_channel *c = oc_model_channel(&m, 75);
     /* contract: the excerpt wording MARKDOWN.md §1d specifies */
@@ -2042,10 +2042,36 @@ static void test_spoiler_preview(void) {
     /* contract: the excerpt wording MARKDOWN.md §1d specifies */
     CHECK(c && strcmp(c->preview, "[spoiler: Ending]") == 0);
 
+    /* In a table cell, and in the old form, which hides nothing and needs no
+     * table to reach the excerpt. */
+    char cl[128];
+    oc_model_line(&m, 2, NULL, 0, "| a |\n|---|\n| >!the butler!< |", cl, sizeof cl);
+    CHECK(strstr(cl, "Table: 1 row") == cl && !strstr(cl, "butler"));
+    oc_model_line(&m, 2, NULL, 0, ">!the butler!<", cl, sizeof cl);
+    CHECK(strcmp(cl, "[spoiler]") == 0);
+    oc_model_line(&m, 2, NULL, 1, ">!the butler!< did it", cl, sizeof cl);
+    /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+    CHECK(!strstr(cl, "butler") && strstr(cl, "[spoiler] did it"));
+    /* The covered /me line the terminal client shows is this excerpt: a block
+     * holding the table the limit falls on is hidden whole there too. */
+    {
+        static char blk[2048];
+        size_t o = (size_t)snprintf(blk, sizeof blk, "```spoiler\nthe butler\n");
+        for (int i = 0; i < 33; i++) o += (size_t)snprintf(blk + o, sizeof blk - o, "| a |\n|---|\n| b |\n\n");
+        snprintf(blk + o, sizeof blk - o, "```");
+        char big[256];
+        oc_model_line(NULL, 2, "ada", 1, blk, big, sizeof big);
+        CHECK(!strstr(big, "butler"));
+        /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+        CHECK(strncmp(big, "ada [spoiler]", 13) == 0);
+    }
+    oc_model_line(&m, 2, NULL, 0, "||plain||", cl, sizeof cl);
+    CHECK(strcmp(cl, "||plain||") == 0);
+
     /* Each other surface, from what the model keeps to the line it is shown as
      * (oc_model_line, every excerpt's one path): a toast, the activity feed, a
      * thread's row, a pinned message and a saved one. */
-    const char *const hid = "it was ||the butler||";
+    const char *const hid = "it was >!the butler!<";
     /* contract: the excerpt wording MARKDOWN.md §1d specifies */
     const char *const want = "it was [spoiler]";
     memset(&e, 0, sizeof e); e.type = OC_EV_THREAD_REPLY; e.channel_id = 75; e.parent_id = 6;
