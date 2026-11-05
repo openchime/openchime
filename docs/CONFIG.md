@@ -414,6 +414,15 @@ destination — checked on every resolved address and re-checked per redirect)
 and is capped in bytes, redirects and time; an air-gapped box's fetches simply
 fail, bounded and silent.
 
+## Email (REQ-280, ARCH-126)
+
+Notification email (REQ-365/366) is sent through a provider the operator
+chooses: none, a provider that accepts and drops every message (for testing),
+or OpenChime's central service, for an enrolled box and always on a managed
+one. The setting that chooses it will be a feature row in the reference above,
+documented here with what it needs, when it is built; invitation mail keeps
+`OPENCHIME_INVITE_MAIL`. The design is [EMAIL.md](./EMAIL.md) §3.
+
 ---
 
 ## Database-held state

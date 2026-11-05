@@ -1390,6 +1390,17 @@ foreground **and** visible **and** not minimised. Asking only the first
 would suppress every toast while the window is closed to the tray, which is
 exactly the case this exists for.
 
+### Email notifications (REQ-365–367, ARCH-125)
+
+The Notifications pane will gain the mention email (on or off, and its delay)
+and the digest (on or off, its days and time), and the workspace settings an
+owner's or admin's switches and member defaults for both. Where a level above
+the person's has turned a kind off, the row says which ("this server sends no
+email", "your workspace has turned this off") rather than disappearing. A link
+in a notification email opens the app at a workspace, conversation and message
+(EMAIL.md §7). Each is specified here as it is built; the design is
+[EMAIL.md](./EMAIL.md).
+
 ### Two standing UI rules
 
 **No "…" on a command.** Not in menus, not on buttons, not in cue banners. The

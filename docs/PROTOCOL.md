@@ -2153,6 +2153,13 @@ feed and the reader's highlight all keep working unchanged — and it is matched
 notified on. Priority people pierce a level and a pause but never a mute
 (REQ-135/137).
 
+**Email notifications** (REQ-365–367, ARCH-125/126) will add frames beside
+these: reading and setting a person's mention email and digest, an owner's or
+admin's workspace switches and member defaults, and telling a client the state
+of each of the three levels so it can name the one that is off. They will be
+specified in a subsection of §5.16 of their own as they are built; the design
+they follow is [EMAIL.md](./EMAIL.md) §2.
+
 ### 5.16e Profile depth: custom status, title, timezone and avatar
 
 **`SET_STATUS` (C → S), `0x006F`** — Set or clear my transient custom status. (REQ-241, REQ-122)

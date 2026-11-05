@@ -953,35 +953,108 @@ where one exists.
 
   Slack's **saved custom views** are not adopted: they are a way to cope with a
   filter set larger than this one.
-- **REQ-280.** *(Excluded by decision)* **Email notifications have not been provided, in any deployment
-  model; the one message mailed to a person has been an invitation, which central
-  has delivered for an enrolled workspace that turned invitation mail on
-  (`OPENCHIME_INVITE_MAIL`, ARCH-85).** No digest, no "you were mentioned" mail,
-  no unread summary — no notification email of any kind, and no mail sent by the
-  daemon itself. (The outbound-mail paths in the product are that invitation,
-  sent by central, and REQ-276's opt-in compliance journaling, which is an
-  operator-configured compliance export, not a notification.) The invitation
-  meets both reasons below: no self-hoster runs a mail relay for it, since
-  central sends it, and it carries no message content — only the invited address,
-  for a workspace whose name and address central already holds, and central keeps
-  nothing once it is sent. Everywhere else an invitation is the copyable text the
-  inviter's client shows (REQ-033). Two reasons, both deliberate. **Operationally**, it
-  would oblige every self-hoster to run or rent a mail relay and inherit
-  deliverability, bounce, and unsubscribe handling — a second delivery system
-  with its own failure modes, for a product whose entire delivery story is
-  otherwise one TLS connection. **On principle**, an email notification puts
-  message content (or, at minimum, who is talking to whom) into a third-party
-  mail system, which is precisely what a self-hosted deployment exists to avoid;
-  "we email your messages to Gmail" would undercut REQ-040/041's whole claim.
+- **REQ-280.** **Email notifications have been provided, in every deployment
+  model, of two kinds and no others: the mention email (REQ-365) and the
+  digest (REQ-366).** Each has been switched on or off by the person, within
+  what the workspace and the operator allow (REQ-367, ARCH-125), and both have
+  been sent through the daemon's one email path (REQ-368, ARCH-126), which
+  invitation mail (`OPENCHIME_INVITE_MAIL`, ARCH-85) has used as well. Nothing
+  else has been mailed: not a reaction, not a thread reply that names no one,
+  not a reminder (REQ-283) and not a call (REQ-285) — those stay in the
+  activity feed (REQ-139), on the desktop (REQ-138) and in push (REQ-133).
+  The design is [EMAIL.md](./EMAIL.md).
 
-  **The consequence has been stated rather than discovered.** Push is a federated
-  function (REQ-133) — only the project can mint APNs/FCM credentials for the
-  published apps — so with email excluded, a **self-hosted stand-alone
-  deployment has no out-of-app notification path at all**. Not a degraded one:
-  none. A user who is not looking at a client is not reached, and their unread
-  state is waiting when they return. That is an acceptable, even coherent, trade
-  for an air-gappable deployment, but an operator has been told it up front
-  rather than inferring it after choosing stand-alone.
+  **This reverses an exclusion, and the two reasons for it have been answered
+  rather than dropped.** The exclusion rested on two costs. **Operationally**,
+  mail would oblige every self-hoster to run or rent a relay and inherit
+  deliverability, bounces and unsubscribe handling. That cost has been moved,
+  not imposed: an enrolled or managed workspace has relayed through central,
+  which has carried the relay, the confirmation of every address and the
+  unsubscribe (REQ-370), and an operator who wants no mail at all has had it by
+  choosing no provider. **On principle**, a notification mail put message
+  content into a third-party mail system. It has not here: relayed mail has
+  carried names and a link, **never message text** (REQ-369), so what central
+  and the recipient's mail provider learn is that someone was mentioned in a
+  named conversation, not what was said — the same class of fact push already
+  carries (REQ-133), and a narrower one than REQ-040/041 forbid.
+
+  **The consequence for stand-alone has been stated rather than discovered.**
+  Push is a federated function (REQ-133), and the relay that carries notification
+  mail is central's (REQ-368). A **self-hosted stand-alone deployment has had no
+  out-of-app notification path** until a provider that delivers without central
+  sits behind the same interface: a user who is not looking at a client is not
+  reached, and their unread state is waiting when they return. That is an
+  acceptable trade for an air-gappable deployment, and an operator has been told
+  it up front rather than inferring it after choosing stand-alone.
+- **REQ-365.** A person has been sent a **mention email** for an **@mention or a
+  DM still unread on every one of their devices after a delay they choose**:
+  10 minutes, **30 minutes by default**, 1 hour or 4 hours. It has been sent **at
+  most once per conversation per delay window** — a burst of mentions in one
+  channel is one email, not ten — and never for what the person has read in the
+  meantime on any device, since the read cursor is the server's (REQ-090/095).
+  **Muted conversations and people have been excluded**, by the one notification
+  evaluator (REQ-281) rather than a second rule written for mail. The person has
+  been able to switch it on or off (REQ-367).
+
+  **Unread on every device, because the mail is for someone who is away.** A
+  mention read on the phone has reached its reader; mailing it as well would
+  teach people to filter the mail, which is the failure that makes the feature
+  worthless. The delay is the person's because "away" differs: four hours suits
+  someone who checks in twice a day, ten minutes someone who wants to be found.
+- **REQ-366.** A person has been able to receive a **digest**: on the **days**
+  and at the **time** they choose — **Monday to Friday at 08:00 in their own
+  timezone by default** (REQ-240) — one email listing their **unread mentions
+  and DMs** and the **unread counts in their starred channels** (REQ-234) since
+  the last digest. The digest has been **off by default**.
+
+  **Off by default because it is a habit, not an alert.** A mention email
+  answers "someone needs me"; a digest is a routine, and one nobody chose is
+  mail nobody reads.
+- **REQ-367.** Every feature that can reach a person outside the product — the
+  mention email and the digest first — has been **switched on or off at three
+  levels, and has worked only where all three allow it** (ARCH-125):
+  - **system:** the operator's choice of email provider (REQ-368), fixed by
+    central on a managed box;
+  - **workspace:** an owner's or admin's switches, and the defaults members
+    start from, on the workspace's own settings;
+  - **person:** their own notification settings, the same on all their devices
+    (ARCH-72).
+
+  A level that is off has been **said by name** in the person's settings — "your
+  workspace has turned this off", "this server sends no email" — rather than the
+  switch simply missing or doing nothing. A member's own choice has overridden
+  the workspace's default, as REQ-279's do-not-disturb default is overridden; it
+  has never overridden the workspace's switch.
+- **REQ-368.** The daemon has sent email through **one provider interface**,
+  chosen by the operator, with three providers:
+  - **`none`:** no email is sent, and the features that need it say so
+    (REQ-367);
+  - **`null`:** every message is accepted and dropped, so the rest of the path —
+    the triggers, the outbox, the settings — can be built, run and tested with no
+    mail system at all;
+  - **`openchime`:** messages are relayed to OpenChime's central service, for a
+    **managed or federated** workspace with an active enrollment (ARCH-84), and
+    are the only provider on a managed box.
+
+  Further providers have been additions behind the same interface, not a second
+  mail path (ARCH-126).
+- **REQ-369.** Email relayed through central has carried **names and a link,
+  never message text**: the names of the people, the conversation and the
+  workspace ("Ana mentioned you in #ops"), counts, and a link — never a
+  message's body, an attachment, a preview or a quoted line (REQ-040/041). The
+  link has been **opaque**: central has kept a permanent map from a random id to
+  the destination the daemon reported, and the email has linked to that id on
+  OpenChime's domain, whose page has opened the installed app at the workspace
+  (by its id) or, failing that, the web client. A federated workspace's address
+  has been the one central recorded at enrollment, after the daemon proved it
+  holds the workspace's key, so a link can only ever open the workspace that
+  sent it.
+- **REQ-370.** Central has **confirmed every recipient address once** before
+  sending notification email to it, and has **honoured unsubscribe** itself: an
+  address that unsubscribed has not been mailed again whatever a daemon asks,
+  and the person has been able to switch the feature back on from their own
+  settings (REQ-367). A daemon has not been able to make central mail an address
+  that never confirmed.
 - **REQ-281.** The decision *whether to notify a given user about a given
   message* has been made in **exactly one evaluator**, with a **documented
   precedence order**, and covered by a **truth table** rather than case-by-case

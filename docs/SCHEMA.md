@@ -509,6 +509,13 @@ Server-authoritative notification settings, synced across a user's devices.
   query, the activity feed and the reader's highlight all keep working with no
   further change.
 
+**Email notifications** (REQ-365–370, ARCH-126) will add, in migrations of
+their own: a person's mention email and digest settings beside these, the
+workspace's switches and member defaults on its settings, the outbox, and what
+holds back the next mention email per conversation and the next digest. Their
+shape is [EMAIL.md](./EMAIL.md) §2, §4 and §6; each is documented here with its
+migration.
+
 ---
 
 ## 3k. Migration 0013 — synced client settings
