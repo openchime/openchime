@@ -1531,6 +1531,12 @@ static const char MIGRATION_0059[] =
     ");"
     "CREATE INDEX idx_sum_notices_user ON summary_notices(user_id, seen_at_ms);";
 
+static const char MIGRATION_0069[] =
+    /* When an invitation was made, so INVITE_LIST can say (PROTOCOL.md §5.8).
+     * Nullable, with no default: a row made before this has no recorded time,
+     * and none is invented for it; INVITE_LIST reports it as 0. */
+    "ALTER TABLE invites ADD COLUMN created_at_ms INTEGER;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1600,6 +1606,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 66, MIGRATION_0066 },
     { 67, MIGRATION_0067 },
     { 68, MIGRATION_0068 },
+    { 69, MIGRATION_0069 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

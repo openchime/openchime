@@ -2329,7 +2329,8 @@ client never offers an action that would fail.
 
     count (u16), then count x { invite_id (u64), role (u8), created_at (u64), expires_at (u64), created_by (u64), uses (u16), used (u16) }
 
-`created_at` is always `0`: the daemon does not store when an invite was made.
+`created_at` is when the invite was made, ms since epoch UTC as `expires_at` is;
+`0` for an invite made before the daemon recorded the time (SCHEMA.md §3bh).
 `uses` is how many may redeem it (`0`: no limit) and `used` how many have (REQ-026);
 an invite leaves the list when its last use is taken.
 

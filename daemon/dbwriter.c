@@ -2863,8 +2863,8 @@ static int mint_invite_for(sqlite3 *db, uint64_t created_by, uint8_t role, const
     uint64_t expiry = dbw_now_ms() + OC_INVITE_TTL_MS;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "INSERT INTO invites(token_hash,created_by,role,expires_at_ms,email,uses) "
-        "VALUES(?,?,?,?,lower(?),?);",
+        "INSERT INTO invites(token_hash,created_by,role,expires_at_ms,email,uses,created_at_ms) "
+        "VALUES(?,?,?,?,lower(?),?,?);",
         -1, &st, NULL);
     sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
     if (created_by) sqlite3_bind_int64(st, 2, (sqlite3_int64)created_by);
@@ -2874,6 +2874,7 @@ static int mint_invite_for(sqlite3 *db, uint64_t created_by, uint8_t role, const
     if (email && email[0]) sqlite3_bind_text(st, 5, email, -1, SQLITE_STATIC);
     else                   sqlite3_bind_null(st, 5);
     sqlite3_bind_int(st, 6, uses);
+    sqlite3_bind_int64(st, 7, (sqlite3_int64)dbw_now_ms());
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) return -1;
@@ -3154,8 +3155,8 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
 
     if (j->demo_invite) {
         /* Spent at once, as a consumed member invite of one use. */
-        sqlite3_prepare_v2(db, "INSERT INTO invites(token_hash, created_by, role, expires_at_ms, consumed_at_ms, uses, used) "
-                               "VALUES(?, NULL, 'member', ?, ?, 1, 1);", -1, &st, NULL);
+        sqlite3_prepare_v2(db, "INSERT INTO invites(token_hash, created_by, role, expires_at_ms, consumed_at_ms, uses, used, "
+                               "created_at_ms) VALUES(?, NULL, 'member', ?, ?, 1, 1, ?3);", -1, &st, NULL);
         sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)(di.exp * 1000u));
         sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
@@ -9498,7 +9499,7 @@ static oc_dbres *process_list_invites(sqlite3 *db, const oc_job *j) {
      * revoke needs. */
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT rowid, role, expires_at_ms, COALESCE(created_by,0), uses, used FROM invites "
+        "SELECT rowid, role, expires_at_ms, COALESCE(created_by,0), uses, used, COALESCE(created_at_ms,0) FROM invites "
         " WHERE consumed_at_ms IS NULL AND expires_at_ms > ?1 "
         " ORDER BY expires_at_ms ASC LIMIT ?2;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
@@ -9515,7 +9516,7 @@ static oc_dbres *process_list_invites(sqlite3 *db, const oc_job *j) {
         arr[n].created_by = (uint64_t)sqlite3_column_int64(st, 3);
         arr[n].uses       = (uint16_t)sqlite3_column_int(st, 4);
         arr[n].used       = (uint16_t)sqlite3_column_int(st, 5);
-        arr[n].created_at = 0;      /* not stored; the table has no created_at_ms */
+        arr[n].created_at = (uint64_t)sqlite3_column_int64(st, 6);   /* 0: made before the column */
         n++;
     }
     sqlite3_finalize(st);

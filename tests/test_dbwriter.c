@@ -2427,7 +2427,9 @@ static void test_index_mentions(void) {
                            /* 0067's own-schedule flag. */
                            "ALTER TABLE users DROP COLUMN dnd_own;"
                            /* 0068's read receipts. */
-                           "ALTER TABLE users DROP COLUMN share_receipts; ALTER TABLE users DROP COLUMN receipts_since_ms;",
+                           "ALTER TABLE users DROP COLUMN share_receipts; ALTER TABLE users DROP COLUMN receipts_since_ms;"
+                           /* 0069's invitation time. */
+                           "ALTER TABLE invites DROP COLUMN created_at_ms;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -5456,6 +5458,52 @@ static void test_shared_invite(void) {
         oc_dbres_free(r);
     }
     oc_dbwriter_stop(w);
+}
+
+/* When an invitation was made (PROTOCOL.md §5.8): INVITE_LIST carries it, in
+ * the unit of expires_at, from the moment it was minted; a row from before the
+ * column was added has none and lists as 0. */
+static void test_invite_created_at(void) {
+    const char *path = tdb("invite_created.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t owner = reg(w, "ic-owner", "pw", OC_ROLE_OWNER);
+    CHECK(owner != 0);
+    oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 1);
+    j->user_id = owner; j->role = OC_ROLE_MEMBER; j->uses = 1;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_INVITE_OK);
+    oc_dbres_free(r);
+    /* As an invitation made before the column: no creation time. */
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(sqlite3_exec(raw, "INSERT INTO invites(token_hash,created_by,role,expires_at_ms,uses) "
+                                "VALUES(x'00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff',"
+                                "NULL,'member',9000000000000,1);", NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+    j = oc_job_new(OC_JOB_LIST_INVITES, 2);
+    j->user_id = owner;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_INVITE_LIST && r->n_invites == 2);
+    int fresh = 0, old = 0;
+    for (size_t i = 0; r && i < r->n_invites; i++) {
+        const oc_invite_entry *e = &r->invites[i];
+        if (e->expires_at == 9000000000000ull) { old = 1; CHECK(e->created_at == 0); continue; }
+        /* Minted a moment before its expiry was set a week ahead. */
+        fresh = 1;
+        CHECK(e->created_at != 0 && e->created_at <= e->expires_at &&
+              e->created_at + 7ull * 24 * 60 * 60 * 1000 >= e->expires_at);
+    }
+    CHECK(fresh && old);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
 }
 
 static void test_invites_and_webhook_lifecycle(void) {
@@ -9889,6 +9937,7 @@ int run_dbwriter_tests(void) {
     test_attachments();
     test_webhooks();
     test_invites_and_webhook_lifecycle();
+    test_invite_created_at();
     test_shared_invite();
     test_status_and_profile();
     test_custom_emoji();
