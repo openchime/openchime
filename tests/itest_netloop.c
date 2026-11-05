@@ -6449,7 +6449,7 @@ static void test_send_rate_limit(int port, const uint8_t *pin) {
     /* Fire OC_SEND_RATE_MAX + 5 sends back-to-back (one window). The first
      * OC_SEND_RATE_MAX are accepted (each -> SEND_ACK + BROADCAST to us), the
      * rest are rejected (each -> one ERROR). */
-    const int max = 30;   /* mirrors OC_SEND_RATE_MAX in netloop.c */
+    const int max = (int)OC_SEND_RATE_MAX;   /* config.h */
     const int over = 5;
     for (int i = 0; i < max + over; i++) {
         uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
@@ -6476,6 +6476,57 @@ static void test_send_rate_limit(int port, const uint8_t *pin) {
     CHECK(acks == max && bcasts == max && limited == over);
 
     client_close(&a);
+}
+
+/* Development mode's OPENCHIME_DEV_SEND_RATE=0 lifts the send cap (a fixture
+ * that seeds many messages): a burst past OC_SEND_RATE_MAX is taken in full, on
+ * a loop of its own, which reads the setting when it starts. */
+static void test_send_rate_unlimited(void) {
+    oc_tls_server srv;
+    uint8_t pin[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0 && oc_tls_server_fingerprint(&srv, pin) == 0);
+    db_unlink("itest_sendrate.db");
+    oc_dbwriter *dbw = oc_dbwriter_start(tpath("itest_sendrate.db"));
+    CHECK(dbw != NULL);
+    if (!dbw) { oc_tls_server_free(&srv); return; }
+    oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
+    CHECK(oc_dbwriter_register_local(dbw, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
+    setenv("OPENCHIME_DEV_SEND_RATE", "0", 1);
+    struct loop_arg la; pthread_t th;
+    int port = start_loop(&la, &th, &srv, dbw, 0);
+    unsetenv("OPENCHIME_DEV_SEND_RATE");
+    CHECK(port != 0);
+    if (!port) { oc_dbwriter_stop(dbw); oc_tls_server_free(&srv); return; }
+    client a;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    const int n = (int)OC_SEND_RATE_MAX + 5;
+    for (int i = 0; i < n; i++) {
+        uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_send s = {0}; s.channel_id = 1;
+        memset(s.idem, 0, OC_IDEM_SIZE); s.idem[0] = (uint8_t)i; s.idem[1] = 0x6B;
+        s.body = oc_slice_str("seed");
+        CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+    }
+    int acks = 0, limited = 0;
+    for (int i = 0; i < n * 2; i++) {
+        oc_header hdr; oc_rbuf p;
+        if (read_frame(&a, &hdr, &p) != 0) break;
+        if (hdr.msg_type == OC_MSG_SEND_ACK) acks++;
+        else if (hdr.msg_type == OC_MSG_ERROR) {
+            oc_error e;
+            if (oc_decode_error(&p, &e) == OC_OK && e.code == OC_ERR_SEND_RATE_LIMITED) limited++;
+        }
+    }
+    CHECK(acks == n && limited == 0);
+    client_close(&a);
+    stop_loop(&la, th);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    db_unlink("itest_sendrate.db");
 }
 
 /* Count the frames `c` receives of `type` (for an ERROR, only those with
@@ -8049,6 +8100,7 @@ int run_netloop_tests(void) {
         test_login_bound(arg.port, pin);
         test_send_rate_limit(arg.port, pin);
         test_send_body_limit(arg.port, pin);
+        test_send_rate_unlimited();
         test_out_buffer_cap(arg.port, pin, dbw, flooder);
         test_admin_vertical(arg.port, pin);
         test_revoke_other_devices(arg.port, pin);

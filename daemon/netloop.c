@@ -107,8 +107,9 @@
  * fast one authenticated client can create messages (SEND / SEND_REPLY), which
  * the broadcast fan-out would otherwise amplify to every channel member. Excess
  * sends get a non-fatal SEND_RATE_LIMITED and are dropped. Generous for a human
- * (10/s sustained, 30 burst); a tight send loop trips it immediately. */
-#define OC_SEND_RATE_MAX       30u
+ * (10/s sustained, 30 burst); a tight send loop trips it immediately. The cap
+ * is OC_SEND_RATE_MAX (config.h); development mode may change it with
+ * OPENCHIME_DEV_SEND_RATE, 0 lifting it, for a fixture that seeds many. */
 #define OC_SEND_RATE_WINDOW_MS 3000u
 
 /* The other frames that fan out, bounded the same way, each by what a person
@@ -229,6 +230,7 @@ typedef struct conn_s {
     uint32_t     events;    /* current epoll interest */
     uint64_t     send_win_start; /* fixed-window start for the send rate limit */
     uint32_t     send_count;     /* sends counted in the current window */
+    uint32_t     send_rate_max;  /* sends a window allows (send_rate_cap); 0: no cap */
     struct rate_win { uint64_t start; uint32_t count; } presence_rl, typing_rl, react_rl, call_rl, pdm_rl;
     /* CALL_JOIN is answered after the reader's check, so a leave can arrive
      * first. Each join advances the counter and carries it (oc_job.gen), a leave
@@ -624,13 +626,14 @@ static char *slice_dup(oc_slice s) {
 /* Fixed-window send rate limit (REQ-190). Returns 1 if this send is within
  * budget for the current window, 0 if the cap is exceeded. */
 static int send_rate_ok(conn *c) {
+    if (c->send_rate_max == 0) return 1;   /* development mode, OPENCHIME_DEV_SEND_RATE=0 */
     uint64_t now = now_ms();
     if (now - c->send_win_start >= OC_SEND_RATE_WINDOW_MS) {
         c->send_win_start = now;
         c->send_count = 0;
     }
     c->send_count++;
-    return c->send_count <= OC_SEND_RATE_MAX;
+    return c->send_count <= c->send_rate_max;
 }
 
 /* One more event in a fixed window: 1 within `max` per `window_ms`, else 0. */
@@ -8934,7 +8937,7 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
  * the TLS port's, or the plaintext health port's (`plain`, ARCH-25). Both are
  * counted against their source under the same per-address cap. */
 static void accept_all(int lfd, int plain, conn **conns, const oc_trusted_proxies *trusted,
-                       int max_per_ip) {
+                       int max_per_ip, uint32_t send_rate_max) {
     for (;;) {
         struct sockaddr_storage ss;
         socklen_t sl = sizeof ss;
@@ -8958,6 +8961,7 @@ static void accept_all(int lfd, int plain, conn **conns, const oc_trusted_proxie
         if (!c) { close(cfd); continue; }
         c->fd = cfd;
         memcpy(c->source, src, sizeof c->source);
+        c->send_rate_max = send_rate_max;
         c->conn_id = g_next_conn_id++;
         c->accepted_ms = now_ms();
         c->state = CONN_OPENING;
@@ -9237,6 +9241,10 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
      * host while staying generous enough for a large office behind one NAT.
      * The global cap is OC_NETLOOP_MAX_FD. */
     int max_per_ip = oc_config_get()->max_conns_per_ip;
+    /* The send rate cap (REQ-190), read once as the per-address cap is, and
+     * given to each connection: OC_SEND_RATE_MAX unless development mode sets
+     * OPENCHIME_DEV_SEND_RATE (0: none). */
+    uint32_t send_rate_max = (uint32_t)oc_config_get()->send_rate_max;
     /* Parsed once; main refuses to start on a list it cannot read, so NULL here is
      * the empty list and nobody is trusted. */
     oc_trusted_proxies *trusted = oc_trusted_proxies_parse(oc_config_get()->trusted_proxies, NULL, 0);
@@ -9378,7 +9386,7 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
             int fd = events[i].data.fd;
 
             if (fd == lfd || (hfd >= 0 && fd == hfd)) {
-                accept_all(fd, fd == hfd, conns, trusted, max_per_ip);
+                accept_all(fd, fd == hfd, conns, trusted, max_per_ip, send_rate_max);
                 continue;
             }
 

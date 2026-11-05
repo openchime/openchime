@@ -60,6 +60,7 @@ typedef enum {
 #define OC_BLOB_SWEEP_AGE_MS   (30ull * 24 * 3600 * 1000)
 #define OC_MAX_CONNS_PER_IP    1024    /* connections one address may hold: a large office behind one NAT */
 #define OC_CALL_MAX            10      /* the most people in one call (REQ-305, CALLS.md) */
+#define OC_SEND_RATE_MAX       30u     /* sends one connection may make in OC_SEND_RATE_WINDOW_MS (REQ-190) */
 #define OC_TTS_QUEUE           256     /* renders that may wait */
 #define OC_TTS_IDLE_SECS       300     /* the voice model stays loaded this long with nothing to do */
 #define OC_TTS_GETS_PER_MIN    60      /* AUDIO_GETs one connection may make a minute */
@@ -186,6 +187,7 @@ typedef struct {
     int call_max;                       /* OC_CALL_MAX unless OPENCHIME_DEV_CALL_MAX */
     int file_page;                      /* the wire's maximum unless OPENCHIME_DEV_FILE_PAGE */
     int max_conns_per_ip;               /* OC_MAX_CONNS_PER_IP unless OPENCHIME_DEV_CONNS_PER_IP */
+    int send_rate_max;                  /* sends per 3 s per connection; 30 unless OPENCHIME_DEV_SEND_RATE (0: no cap) */
     struct {
         const char *users;              /* OPENCHIME_DEV_USERS: accounts made at first start */
         int         loopback;           /* OPENCHIME_DEV_LOOPBACK: listen on 127.0.0.1 only */

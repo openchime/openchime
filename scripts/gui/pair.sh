@@ -65,11 +65,13 @@ up)
   : > "$PIDS"
 
   if ! (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then
+    # No send cap (OPENCHIME_DEV_SEND_RATE=0): a fixture seeds back to back.
     env OPENCHIME_DATA_DIR="$DEV/data" \
         OPENCHIME_PORT="$PORT" OPENCHIME_HEALTH_PORT=0 \
         OPENCHIME_WORKSPACE_NAME="Acme HQ" \
         OPENCHIME_DEV_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member}" \
         OPENCHIME_DEV_CALL_MAX="${OC_TEST_CALL_MAX:-10}" \
+        OPENCHIME_DEV_SEND_RATE=0 \
         ${OC_TEST_ADVERTISE_PORT:+OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT="$OC_TEST_ADVERTISE_PORT"} \
         OPENCHIME_MANAGED_MAX_USERS=100 \
         setsid "$HERE/openchimed" > "$DEV/daemon.log" 2>&1 < /dev/null &

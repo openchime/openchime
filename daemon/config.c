@@ -580,6 +580,7 @@ static int validate(oc_config *c, char *err, size_t errcap) {
         c->file_page        = (int)OC_MAX_FILE_LIST;
         c->call_max         = OC_CALL_MAX;
         c->max_conns_per_ip = OC_MAX_CONNS_PER_IP;
+        c->send_rate_max    = (int)OC_SEND_RATE_MAX;
         memset(&c->dev, 0, sizeof c->dev);
     }
 

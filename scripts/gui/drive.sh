@@ -140,10 +140,13 @@ case "${1:-}" in
           done
         fi
         mkdir -p "$OC_TEST_DIR"
+        # No send cap (OPENCHIME_DEV_SEND_RATE=0): a fixture seeds its messages
+        # back to back, which the 30-in-3-seconds limit would throttle.
         env OPENCHIME_DATA_DIR="$OC_TEST_DIR/data" \
             OPENCHIME_PORT="${OC_TEST_PORT}" OPENCHIME_HEALTH_PORT="${OC_TEST_HEALTH_PORT:-8080}" \
             OPENCHIME_WORKSPACE_NAME="${OC_TEST_WS:-Acme HQ}" \
             OPENCHIME_DEV_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
+            OPENCHIME_DEV_SEND_RATE=0 \
             OPENCHIME_MANAGED_MAX_USERS=100 \
             setsid "$HERE/openchimed" > "$OC_TEST_DIR/daemon.log" 2>&1 < /dev/null &
         disown
