@@ -45,7 +45,7 @@ WEB_GUI_INC := -Ishared -Iclient/core -Iclient/core/media -Iclient/core/voice -I
                -I$(WEB_SDL3)/include -Ibuild/wasm/mbedtls/include \
                -Ibuild/wasm/libvpx/include -Ibuild/wasm/opus/include -Ibuild/wasm/speexdsp/include -Ithird_party/libfvad/include
 WEB_GUI_CFLAGS := -std=gnu11 -D_GNU_SOURCE -O2 $(WARN_CFLAGS) -pthread -Wno-typedef-redefinition
-WEB_GUI_OBJS := $(patsubst %.c,build/wasm/gui/%.o,$(WEB_GUI_SRC))
+WEB_GUI_OBJS := $(call oc_objs,build/wasm/gui,$(WEB_GUI_SRC))
 # The application says its build (About OpenChime): compiled with the id, and
 # again when the id changes.
 build/wasm/gui/client/gui/app/app.o: WEB_GUI_CFLAGS += $(VERSION_DEF)
@@ -53,13 +53,16 @@ build/wasm/gui/client/gui/app/app.o: $(BUILD_ID_STAMP)
 # The browser has no loopback listener for a sign-in's return: the core's
 # signin.c is replaced by signin_web.c, the same API over the page (WEB.md).
 WEB_CORE_SRC  := $(filter-out client/core/signin.c,$(CORE_SRC)) client/core/signin_web.c
-WEB_CORE_OBJS := $(patsubst %.c,build/wasm/core/%.o,$(WEB_CORE_SRC) $(SHARED_SRC))
-build/wasm/gui/%.o: %.c client/gui/platform/platform.h client/gui/app/keys.h $(WEB_SDL3)/lib/libSDL3.a $(WEB_MBEDTLS)/libmbedtls.a $(WEB_MEDIA_LIBS) $(EMCC)
-	@mkdir -p $(dir $@)
-	$(EMCC) $(WEB_GUI_CFLAGS) $(WEB_GUI_INC) -c $< -o $@
-build/wasm/core/%.o: %.c $(WEB_MBEDTLS)/libmbedtls.a $(EMCC)
-	@mkdir -p $(dir $@)
-	$(EMCC) $(WEB_CFLAGS) -Ishared $(CORE_INC) -Iclient/shared -Ithird_party/jsmn -Ibuild/wasm/mbedtls/include -c $< -o $@
+WEB_CORE_OBJS := $(call oc_objs,build/wasm/core,$(WEB_CORE_SRC) $(SHARED_SRC))
+# Two trees, the GUI's flags and the core's, each object writing its header
+# dependencies beside it (oc_obj_rules, mk/sources.mk): a header edit
+# recompiles every web object that includes it, and only those. A new compiler
+# recompiles everything; the wasm libraries need only exist first.
+WEB_GUI_CC  = $(EMCC) $(WEB_GUI_CFLAGS) $(WEB_GUI_INC)
+WEB_CORE_CC = $(EMCC) $(WEB_CFLAGS) -Ishared $(CORE_INC) -Iclient/shared -Ithird_party/jsmn -Ibuild/wasm/mbedtls/include
+$(eval $(call oc_obj_rules,build/wasm/gui,WEB_GUI_CC,$(EMCC),$(WEB_SDL3)/lib/libSDL3.a $(WEB_MBEDTLS)/libmbedtls.a $(WEB_MEDIA_LIBS)))
+$(eval $(call oc_obj_rules,build/wasm/core,WEB_CORE_CC,$(EMCC),$(WEB_MBEDTLS)/libmbedtls.a))
+-include $(WEB_GUI_OBJS:.o=.d) $(WEB_CORE_OBJS:.o=.d)
 $(WEB_DIR)/openchime.js: $(WEB_GUI_OBJS) $(WEB_CORE_OBJS) client/gui/platform/web/openchime.html $(EMCC)
 	mkdir -p $(WEB_DIR)
 	$(EMCC) $(WEB_GUI_OBJS) $(WEB_CORE_OBJS) $(WEB_MBEDTLS)/libmbedtls.a $(WEB_MBEDTLS)/libmbedx509.a $(WEB_MBEDTLS)/libmbedcrypto.a $(WEB_SDL3)/lib/libSDL3.a \

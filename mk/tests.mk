@@ -62,6 +62,7 @@ test-merge-plain:
 	+MAKE="$(MAKE) $(FULL_SWITCHES)" scripts/test/merge/release_cc.sh
 	scripts/test/lib/speech.sh ./$(BIN)
 	NODE="$(NODE)" scripts/test/merge/web.sh
+	+MAKE="$(MAKE) $(FULL_SWITCHES)" scripts/test/merge/web_deps.sh
 	NODE="$(NODE)" scripts/test/merge/gui_web_smoke.sh
 	scripts/test/merge/fuzz.sh
 test-merge-threads: $(TSAN_BIN)

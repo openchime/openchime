@@ -1118,7 +1118,7 @@ need and call them, and the workflows call only the targets.
 | Command | Where | Scripts | What it runs |
 |---|---|---|---|
 | `make test` | locally, before every push (`scripts/check/test.sh`, which the pre-push hook requires) | `scripts/test/local/` | the source checks and every suite but the slow ones (§2.4), on the default daemon; about a minute |
-| `make test-merge` | CI only: every pull request (`pr-tests.yml`, a required check) and the staging build, through `ci.yml` | `scripts/test/merge/` | every feature built; every suite, the threaded ones under ThreadSanitizer (§2.4); the static-link check; the end-to-end run (§3.2); the release's compiler; the speech round trip; the web client and the GUI smoke on the web (§3.4); each fuzzing harness for `FUZZ_SECONDS` (§2.2b) |
+| `make test-merge` | CI only: every pull request (`pr-tests.yml`, a required check) and the staging build, through `ci.yml` | `scripts/test/merge/` | every feature built; every suite, the threaded ones under ThreadSanitizer (§2.4); the static-link check; the end-to-end run (§3.2); the release's compiler; the speech round trip; the web client, its objects' header dependencies (`web_deps.sh`), and the GUI smoke on the web (§3.4); each fuzzing harness for `FUZZ_SECONDS` (§2.2b) |
 | `make test-release` | CI only: the staging build and the release, on the artifacts they make | `scripts/test/release/` | `PART=packages`: glibc floor, one binary in all three packages, the `.deb` installed and speaking, its unit file; `PART=image`: the image starts, its database replicates and restores (§3.2); `PART=windows`: the binaries' version resources, the installer and the MSIX |
 
 `make test-merge` and `make test-release` refuse to run unless `CI` is set (as
