@@ -86,6 +86,15 @@ static void set_quiet(oc_dbwriter *w, uint64_t user_id, int quiet_start, int qui
     oc_dbres_free(r);
 }
 
+/* No schedule at all: the window never silences `user_id`. */
+static void set_schedule_off(oc_dbwriter *w, uint64_t user_id) {
+    oc_job *j = oc_job_new(OC_JOB_SET_SCHEDULE, 0);
+    j->user_id = user_id; j->sched_mode = OC_DND_OFF;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    oc_dbres_free(r);
+}
+
 static int token_count(const char *path, const char *token) {
     sqlite3 *db = NULL;
     if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) { sqlite3_close(db); return -1; }
@@ -441,17 +450,13 @@ static void test_collect(void) {
     /* --- a PAUSE silences regardless of the window (REQ-278) --------
      * The window is periodic; a pause is one instant. At 01:40 bob is outside
      * his quiet hours and would be pushed — a pause has to reach him anyway,
-     * which is the whole reason the two mechanisms both exist. */
+     * which is the whole reason the two mechanisms both exist.
+     *
+     * The pause is stamped from the real clock, so the times below are the
+     * day's own and may fall in bob's 10:00-11:00 quiet hours. His schedule is
+     * turned off first: here only the pause may silence him. */
     {
-        /* The pause alone decides here: bob's quiet hours (10:00-11:00 above)
-         * go, or a run whose real clock puts the pause's end inside them
-         * would find him quiet for the other reason. */
-        {
-            oc_job *oj = oc_job_new(OC_JOB_SET_SCHEDULE, 0);
-            oj->user_id = bob; oj->sched_mode = OC_DND_OFF;
-            oc_dbwriter_submit(w, oj);
-            oc_dbres_free(wait_result(w));
-        }
+        set_schedule_off(w, bob);
         oc_job *sj = oc_job_new(OC_JOB_SET_SNOOZE, 0);
         sj->user_id = bob; sj->snooze_minutes = 60;
         oc_dbwriter_submit(w, sj);
