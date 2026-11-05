@@ -5974,6 +5974,28 @@ static void test_status_and_profile(void) {
     CHECK(r->st_emoji && r->st_emoji[0] == '\0');
     oc_dbres_free(r);
 
+    /* GET_PROFILE: alice's own, asked as 0, carries every field, the phone
+     * among them, so a client can send them back unchanged; bob asking for
+     * hers gets the same profile without the phone, which is hers alone. */
+    uint64_t bob = reg(w, "st-bob", "pw", OC_ROLE_MEMBER);
+    CHECK(bob);
+    j = oc_job_new(OC_JOB_GET_PROFILE, 6);
+    j->user_id = alice; j->message_id = 0;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && r->user_id == alice && r->conn_id == 6);
+    CHECK(r && r->pf_phone && strcmp(r->pf_phone, "+1 555 0100") == 0);
+    CHECK(r && r->pf_tz && strcmp(r->pf_tz, "America/New_York") == 0);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_GET_PROFILE, 7);
+    j->user_id = bob; j->message_id = alice;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && r->user_id == alice && r->conn_id == 7);
+    CHECK(r && r->pf_title && strcmp(r->pf_title, "Principal Engineer") == 0);
+    CHECK(r && (!r->pf_phone || !r->pf_phone[0]));
+    oc_dbres_free(r);
+
     /* An empty field CLEARS the column rather than leaving the old value: the
      * user deleted it, which is a thing they did. */
     j = oc_job_new(OC_JOB_SET_PROFILE, 5);

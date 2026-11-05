@@ -6078,6 +6078,24 @@ int run_client_core_tests(void) {
                                                    !strcmp(m->users[i].pronouns, "he/him") &&
                                                    !strcmp(m->users[i].timezone, "Europe/Oslo");
                                       ok; })));
+                /* Setting only the voice (REQ-292) keeps every other field, the
+                 * phone saved from the other device among them: the core
+                 * fetches the whole profile first and sends it back. */
+                oc_client_set_profile(b2, T_FULLNAME, "Engineer", "he/him", "+47 555 01 99", "Europe/Oslo", "");
+                CHECK(WAIT_FOR(b2, ({ int ok = 0;
+                                      for (size_t i = 0; i < m->n_users; i++)
+                                          if (m->users[i].user_id == m->user_id)
+                                              ok = !strcmp(m->users[i].phone, "+47 555 01 99");
+                                      ok; })));
+                oc_client_set_voice(b, "test-voice-f");
+                CHECK(WAIT_FOR(b2, ({ int ok = 0;
+                                      for (size_t i = 0; i < m->n_users; i++)
+                                          if (m->users[i].user_id == m->user_id)
+                                              ok = !strcmp(m->users[i].voice_id, "test-voice-f") &&
+                                                   !strcmp(m->users[i].phone, "+47 555 01 99") &&
+                                                   !strcmp(m->users[i].title, "Engineer") &&
+                                                   !strcmp(m->users[i].timezone, "Europe/Oslo");
+                                      ok; })));
                 oc_client_mark_read(b2, 1);
                 CHECK(channel_unread(oc_client_model(b2), 1) == 0);
                 oc_client_set_read_cursor(b, 1, 0);

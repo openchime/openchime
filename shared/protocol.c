@@ -2470,6 +2470,12 @@ oc_result oc_encode_enable_user(oc_wbuf *w, uint16_t version, const oc_enable_us
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_get_profile(oc_wbuf *w, uint16_t version, const oc_get_profile *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_GET_PROFILE);
+    oc_w_u64(w, m->user_id);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_revoke_session(oc_wbuf *w, uint16_t version, const oc_revoke_session *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_REVOKE_SESSION);
     oc_w_u64(w, m->session_id);
@@ -3699,6 +3705,11 @@ oc_result oc_decode_credential_reset(oc_rbuf *p, oc_credential_reset *m) {
 }
 
 oc_result oc_decode_enable_user(oc_rbuf *p, oc_enable_user *m) {
+    m->user_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_get_profile(oc_rbuf *p, oc_get_profile *m) {
     m->user_id = oc_r_u64(p);
     return r_done(p);
 }

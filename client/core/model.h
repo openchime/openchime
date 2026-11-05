@@ -621,6 +621,10 @@ typedef struct {
      * A frontend preference, told to the model (oc_model_set_clock12) so the
      * excerpts it builds read as the frontend does. */
     uint8_t   clock12;
+    /* How many times my own whole profile (PROFILE_INFO for me) has arrived: a
+     * form that asked for it (oc_client_get_profile) waits for this to move
+     * before it shows the fields, the phone among them. */
+    uint32_t  self_profile_seq;
     uint16_t  allow_start_min, allow_end_min;
     oc_schedule_day sched_days[OC_SCHEDULE_DAYS];
     uint8_t   n_sched_days;

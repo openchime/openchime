@@ -3072,6 +3072,18 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_GET_PROFILE) {
+            /* A member's whole profile, 0 for mine; the answer goes to this
+             * connection alone. */
+            oc_get_profile gp;
+            if (oc_decode_get_profile(&p, &gp) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_GET_PROFILE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->message_id = gp.user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_ENABLE_USER) {
             oc_enable_user eu;
             if (oc_decode_enable_user(&p, &eu) != OC_OK) return -1;

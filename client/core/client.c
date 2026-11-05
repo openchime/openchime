@@ -1497,6 +1497,22 @@ void oc_client_set_profile(oc_client *c, const char *full_name, const char *titl
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_get_profile(oc_client *c, uint64_t user_id) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_GET_PROFILE);
+    if (!cmd) return;
+    cmd->channel_id = user_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_voice(oc_client *c, const char *voice_id) {
+    if (!c || !voice_id || !voice_id[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_VOICE);
+    if (!cmd) return;
+    cmd->body = strdup(voice_id);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 uint64_t oc_client_upload(oc_client *c, uint64_t channel_id, const char *path) {
     if (!c || !channel_id || !path || !path[0]) return 0;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_UPLOAD);

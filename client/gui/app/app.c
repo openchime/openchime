@@ -33299,6 +33299,16 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         const oc_model *vm2 = model();
         int nfields = (vm2 && oc_model_tts_available(vm2)) ? 7 : 6;
         if (nfields == 7) f[6].hint = voice_options(vm2);
+        /* The whole profile, fresh, before the fields are filled: Save sends
+         * every field back (SET_PROFILE replaces them all), so a phone this
+         * device was never told would otherwise be saved as empty. Two seconds
+         * at most; offline, the form opens on what is held. */
+        if (g_client && vm2) {
+            uint32_t seq0 = vm2->self_profile_seq;
+            uint64_t until = now_ms() + 2000;
+            oc_client_get_profile(g_client, 0);
+            while (model() && model()->self_profile_seq == seq0 && model()->authed && now_ms() < until) pump();
+        }
         const oc_model *pm2 = model();
         const char *had_name = "";
         if (pm2) for (size_t i = 0; i < pm2->n_users; i++)

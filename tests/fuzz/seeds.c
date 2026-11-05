@@ -218,6 +218,7 @@ int main(int argc, char **argv) {
     { static oc_edit_poll m; FRAME("edit_poll", oc_encode_edit_poll(&w, V, &m)); }
     FRAME("poll_voters", oc_encode_poll_voters(&w, V, 0, NULL, 0));
     FRAME("deactivate_self", oc_encode_deactivate_self(&w, V));
+    { static oc_get_profile m; FRAME("get_profile", oc_encode_get_profile(&w, V, &m)); }
     { static oc_summarize m; FRAME("summarize", oc_encode_summarize(&w, V, &m)); }
     { static oc_summary m; FRAME("summary", oc_encode_summary(&w, V, &m)); }
     { static oc_summary_queued m; FRAME("summary_queued", oc_encode_summary_queued(&w, V, &m)); }

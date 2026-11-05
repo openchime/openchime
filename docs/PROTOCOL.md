@@ -2193,7 +2193,11 @@ thing they did, and is a different fact from never having set it.
 
     attachment_id (u64)
 
-**`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to any of SET_STATUS / SET_PROFILE / SET_AVATAR / SET_EMAIL. The reply to SET_PROFILE and SET_EMAIL goes to every connection of the person who saved it, so their other devices show the change at once. (REQ-240, REQ-241)
+**`GET_PROFILE` (C → S), `0x0116`** — A member's whole profile, `user_id` 0 for mine; answered with `PROFILE_INFO` to this connection alone. Any member may ask for any member's (the roster is everyone's, REQ-030), but `phone`, the one field the roster does not carry, is filled only in one's own. `SET_PROFILE` replaces every field, so a client that changes one — the terminal client setting its voice — fetches first and sends the rest back as they were.
+
+    user_id (u64)
+
+**`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to any of SET_STATUS / SET_PROFILE / SET_AVATAR / SET_EMAIL / GET_PROFILE. The reply to SET_PROFILE and SET_EMAIL goes to every connection of the person who saved it, so their other devices show the change at once. (REQ-240, REQ-241)
 
     user_id (u64), display_name (str), email (str), status_emoji (str), status_text (str), status_expires (u64), title (str), timezone (str), avatar_id (u64), role (u8), full_name (str), pronouns (str), phone (str), voice_id (str)
 
@@ -3491,6 +3495,7 @@ this table cannot silently gain a shared value.
 | `0x0113` | `POLL_VOTERS` | S → C | the answer; refused for an anonymous poll |
 | `0x0114` | `EDIT_POLL` | C → S | the author changes a poll: options and settings until the first vote, the deadline always |
 | `0x0115` | `DEACTIVATE_SELF` | C → S | deactivate my own account, as a removal does (REQ-033) |
+| `0x0116` | `GET_PROFILE` | C → S | a member's whole profile, 0 for mine; answered with `PROFILE_INFO`, the phone in one's own only |
 | `0x0119` | `WORKSPACE_SETTINGS` | S → C | read-only: the workspace's settings clients act on, after `WORKSPACE_INFO` |
 | `0x011A` | `READ_RECEIPTS` | both | whether I share my read receipts: set or ask, and told |
 

@@ -9022,8 +9022,11 @@ static oc_dbres *process_get_profile(sqlite3 *db, const oc_job *j) {
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     /* Any tenant member may read any member's profile — the roster is already
-     * visible to everyone (REQ-030), so this adds no exposure. */
-    build_profile(db, j->message_id ? j->message_id : j->user_id, r);
+     * visible to everyone (REQ-030), so this adds no exposure. The phone is the
+     * one field that is not on the roster: it goes to its owner only. */
+    uint64_t whose = j->message_id ? j->message_id : j->user_id;
+    build_profile(db, whose, r);
+    if (whose != j->user_id) { free(r->pf_phone); r->pf_phone = NULL; }
     return r;
 }
 

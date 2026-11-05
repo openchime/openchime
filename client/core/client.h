@@ -477,6 +477,13 @@ void oc_client_set_status(oc_client *c, const char *emoji, const char *text,
 void oc_client_set_profile(oc_client *c, const char *full_name, const char *title,
                            const char *pronouns, const char *phone,
                            const char *timezone, const char *voice_id);
+/* A member's whole profile, `user_id` 0 for mine; it arrives as PROFILE_INFO
+ * (the model's users[], and for mine the phone too). */
+void oc_client_get_profile(oc_client *c, uint64_t user_id);
+/* Set only my read-aloud voice (REQ-292). SET_PROFILE replaces every field,
+ * so the core fetches my whole profile first and sends it back with the voice
+ * changed: nothing else, the phone included, is touched. */
+void oc_client_set_voice(oc_client *c, const char *voice_id);
 void oc_client_set_read_cursor(oc_client *c, uint64_t channel_id, uint64_t message_id);
 
 /* Talking mode (REQ-291, ARCH-111): read this conversation aloud from now on.

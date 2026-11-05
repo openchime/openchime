@@ -2435,6 +2435,44 @@ static int sid_sessions_seen(sqlite3 *db) {
     return n;
 }
 
+/* GET_PROFILE over the wire: my own, asked as 0, comes back whole, the phone
+ * with it; someone else asking for mine gets it without the phone. Answered to
+ * the asking connection only. */
+static void test_get_profile(int port, const uint8_t *pin) {
+    client a, s;
+    uint64_t ua = 0, us = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 &&
+          do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(client_open(&s, port, pin) == 0 && do_handshake(&s) == 0 &&
+          do_auth(&s, "sid", "pw-sid", &us) == 0);
+    uint8_t buf[512]; oc_wbuf w; oc_header h; oc_rbuf p;
+    oc_set_profile sp;
+    memset(&sp, 0, sizeof sp);
+    sp.full_name = oc_slice_str("Alice Liddell");
+    sp.phone = oc_slice_str("+1 555 0100");
+    sp.timezone = oc_slice_str("Europe/London");
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_set_profile(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_PROFILE_INFO, &h, &p) == 0);          /* the save's own answer */
+
+    oc_get_profile gp = { 0 };
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_get_profile(&w, OC_PROTOCOL_VERSION, &gp) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
+    oc_profile_info pi;
+    CHECK(read_type(&a, OC_MSG_PROFILE_INFO, &h, &p) == 0 && oc_decode_profile_info(&p, &pi) == OC_OK);
+    CHECK(pi.user_id == ua && pi.phone.len == 11 && memcmp(pi.phone.ptr, "+1 555 0100", 11) == 0);
+    CHECK(pi.timezone.len == 13 && memcmp(pi.timezone.ptr, "Europe/London", 13) == 0);
+
+    gp.user_id = ua;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_get_profile(&w, OC_PROTOCOL_VERSION, &gp) == OC_OK && write_all(&s.conn, buf, w.len) == 0);
+    CHECK(read_type(&s, OC_MSG_PROFILE_INFO, &h, &p) == 0 && oc_decode_profile_info(&p, &pi) == OC_OK);
+    CHECK(pi.user_id == ua && pi.phone.len == 0);
+    CHECK(pi.full_name.len == 13 && memcmp(pi.full_name.ptr, "Alice Liddell", 13) == 0);
+    client_close(&s);
+    client_close(&a);
+}
+
 /* One device signed out on its own (REQ-182): its connection closes, the list
  * comes back without it, the asker's own goes on, and a session id that is not
  * the asker's does nothing. Sessions in use have last_seen_ms written in
@@ -8148,6 +8186,7 @@ int run_netloop_tests(void) {
         test_unauthed_closed(arg.port, pin);
         test_reset_frame(arg.port, pin);
         test_revoke_one_session(arg.port, pin);
+        test_get_profile(arg.port, pin);
         test_groups_vertical(arg.port, pin);
         test_groups_unasked(arg.port, pin);
         test_http_stack();

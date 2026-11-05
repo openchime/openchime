@@ -2353,6 +2353,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         mem->avatar_id      = e->message_id;
         if (e->op) mem->role = e->op;
         user_relabel(mem);
+        if (e->user_id == m->user_id) m->self_profile_seq++;
         break;
     }
     case OC_EV_INVITE_ROW: {

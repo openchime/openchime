@@ -1315,6 +1315,18 @@ static void test_admin_frames(void) {
         oc_enable_user out;
         CHECK(oc_decode_enable_user(&p, &out) == OC_OK && out.user_id == 43);
     }
+    {   /* A member's whole profile, 0 for mine (GET_PROFILE). */
+        oc_get_profile in = { 0 };
+        ROUNDTRIP(oc_encode_get_profile(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_GET_PROFILE, h, p);
+        oc_get_profile out = { 9 };
+        CHECK(oc_decode_get_profile(&p, &out) == OC_OK && out.user_id == 0);
+    }
+    {   /* ...and someone else's. */
+        oc_get_profile in = { 77 };
+        ROUNDTRIP(oc_encode_get_profile(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_GET_PROFILE, h, p);
+        oc_get_profile out;
+        CHECK(oc_decode_get_profile(&p, &out) == OC_OK && out.user_id == 77);
+    }
     {   /* An administrator's reset of a local account, and its link's token (AUTH.md §2). */
         oc_reset_credential in = { 42, 1 };
         ROUNDTRIP(oc_encode_reset_credential(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_RESET_CREDENTIAL, h, p);

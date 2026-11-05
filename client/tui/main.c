@@ -982,6 +982,9 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_PDM_ACCEPT, ACT_PDM_DECLINE, ACT_PDM_TRUST, ACT_PDM_CLOSE, ACT_PDM_FORGET,
        /* polls (REQ-225): who voted, and an option pressed */
        ACT_VOTERS, ACT_POLL_CLOSE, ACT_VOTE0, ACT_VOTE_LAST = ACT_VOTE0 + OC_POLL_MAX_OPTIONS - 1,
+       /* the read-aloud voices (REQ-292): before the summaries' notices, whose
+        * ids run on from ACT_SUM_NOTICE0 without an end */
+       ACT_VOICES, ACT_VOICE0, ACT_VOICE_LAST = ACT_VOICE0 + OC_VOICE_MAX - 1,
        /* summaries made while you were away: the list, then one of them */
        ACT_SUM_NOTICES,
        /* deactivate one's own account (REQ-033), behind a y/N */
@@ -1085,6 +1088,7 @@ static const tk_pal_item g_launcher_items[] = {
     { "You",     "Do not disturb",      NULL, NULL, ACT_DND },
     { "You",     "Share my read receipts (on/off)", NULL, NULL, ACT_RECEIPTS },
     { "You",     "Your profile",        NULL, NULL, ACT_PROFILE },
+    { "You",     "Read-aloud voice",    NULL, NULL, ACT_VOICES },
     { "You",     "Deactivate account",  NULL, NULL, ACT_DEACTIVATE },
     { "Admin",   "Invite a user",       NULL, NULL, ACT_INVITE },
     { "Admin",   "Storage usage",       NULL, NULL, ACT_STORAGE },
@@ -1115,6 +1119,7 @@ static int launcher_build(const oc_model *m, uint64_t cid) {
     for (size_t i = 0; i < sizeof g_launcher_items / sizeof *g_launcher_items; i++) {
         if (g_launcher_items[i].id == ACT_SUMMARIZE && (!oc_model_summarize_available(m) || e2e)) continue;
         if (g_launcher_items[i].id == ACT_UPLOAD && e2e) continue;
+        if (g_launcher_items[i].id == ACT_VOICES && !oc_model_tts_available(m)) continue;
         g_launcher_now[n++] = g_launcher_items[i];
     }
     if (m->summary_open && cid && m->summary_channel == cid)
@@ -1154,6 +1159,31 @@ static void menu_build_sum_notices(const oc_model *m) {
         g_nmenu++;
     }
 }
+/* The read-aloud voices (REQ-292), from TTS_INFO: each by its label and the
+ * language it speaks, the one this person is read in marked. The title carries
+ * the audition sentence, as text: this client plays no audio. Choosing one
+ * sets only the voice (oc_client_set_voice keeps every other field). */
+static char g_voice_labels[OC_VOICE_MAX][96];
+static char g_voice_title[240];
+static void menu_build_voices(const oc_model *m) {
+    const char *mine = "";
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == m->user_id) { mine = m->users[i].voice_id; break; }
+    g_nmenu = 0;
+    uint8_t nv = oc_model_tts_voice_count(m);
+    for (uint8_t k = 0; k < nv && k < OC_VOICE_MAX && g_nmenu < (int)(sizeof g_menu / sizeof *g_menu); k++) {
+        const oc_voice *v = oc_model_tts_voice(m, k);
+        if (!v) continue;
+        snprintf(g_voice_labels[k], sizeof g_voice_labels[k], "%s%s%s%s%s", v->label[0] ? v->label : v->id,
+                 v->lang[0] ? " (" : "", v->lang, v->lang[0] ? ")" : "",
+                 mine[0] && !strcmp(mine, v->id) ? "  \xe2\x9c\x93 current" : "");
+        g_menu[g_nmenu++] = (menuitem){ g_voice_labels[k], ACT_VOICE0 + k };
+    }
+    const char *say = oc_model_tts_preview(m);
+    if (say && say[0]) snprintf(g_voice_title, sizeof g_voice_title, "Read-aloud voice \xe2\x80\x94 each says \"%s\"", say);
+    else               snprintf(g_voice_title, sizeof g_voice_title, "Read-aloud voice");
+}
+
 /* The spans a summary can cover (PROTOCOL.md SUMMARIZE). */
 static void menu_build_summary_span(void) {
     g_nmenu = 0;
@@ -3635,6 +3665,12 @@ int main(int argc, char **argv) {
                     action_open = 1; tk_list_reset_filter(&action_menu);
                 }
                 else if (id == ACT_SUM_BACK) { summary_ui = 1; ssel = 0; }
+                else if (id == ACT_VOICES) {
+                    menu_build_voices(oc_client_model(cl));
+                    action_menu.sel = action_menu.top = 0;
+                    act_title = g_voice_title;
+                    action_open = g_nmenu > 0; tk_list_reset_filter(&action_menu);
+                }
                 else if (id == ACT_SUM_NOTICES) {
                     menu_build_sum_notices(oc_client_model(cl));
                     action_menu.sel = action_menu.top = 0;
@@ -3772,6 +3808,11 @@ int main(int argc, char **argv) {
                     else if (id == ACT_EMOTICONS)
                         oc_client_set_setting(cl, EMOTICONS_SETTING_KEY, emoticons_on(oc_client_model(cl)) ? "off" : "on");
                     else if (id == ACT_LOGOUT)  { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
+                    /* a read-aloud voice: only it changes */
+                    else if (id >= ACT_VOICE0 && id <= ACT_VOICE_LAST) {
+                        const oc_voice *v = oc_model_tts_voice(oc_client_model(cl), (uint8_t)(id - ACT_VOICE0));
+                        if (v) oc_client_set_voice(cl, v->id);
+                    }
                     /* summaries: the span, then the summary */
                     else if (id == ACT_SUMMARIZE) {
                         menu_build_summary_span();

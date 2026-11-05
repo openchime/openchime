@@ -593,6 +593,7 @@ typedef enum {
     OC_MSG_POLL_VOTERS          = 0x0113, /* S->C, the answer; refused for an anonymous poll */
     OC_MSG_EDIT_POLL            = 0x0114, /* C->S, the author changes a poll: options and settings until the first vote */
     OC_MSG_DEACTIVATE_SELF      = 0x0115, /* C->S, no payload: deactivate my own account, as a removal does */
+    OC_MSG_GET_PROFILE          = 0x0116, /* C->S, a member's whole profile, 0 for mine: answered with PROFILE_INFO */
     OC_MSG_WORKSPACE_SETTINGS   = 0x0119, /* S->C, read-only: the workspace settings clients act on, after WORKSPACE_INFO */
     OC_MSG_READ_RECEIPTS        = 0x011A, /* both: whether I share my read receipts; C->S sets or asks, S->C tells */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
@@ -1742,6 +1743,10 @@ typedef struct { uint64_t user_id; oc_slice token; } oc_credential_reset;
  * (disabled 0), and for a local account a CREDENTIAL_RESET too -- removal took
  * its password, so the link is how it gets one. */
 typedef struct { uint64_t user_id; } oc_enable_user;
+/* Ask for a member's whole profile, `user_id` 0 meaning mine; answered with
+ * PROFILE_INFO, whose phone is filled for one's own profile only. A client
+ * that changes one field fetches first, since SET_PROFILE replaces them all. */
+typedef struct { uint64_t user_id; } oc_get_profile;
 /* Sign one of your own sessions out (REQ-182): its row goes and its connection
  * closes. Answered with a fresh SESSION_LIST. */
 typedef struct { uint64_t session_id; } oc_revoke_session;
@@ -2097,6 +2102,7 @@ oc_result oc_encode_remove_user(oc_wbuf *w, uint16_t version, const oc_remove_us
 oc_result oc_encode_reset_credential(oc_wbuf *w, uint16_t version, const oc_reset_credential *m);
 oc_result oc_encode_credential_reset(oc_wbuf *w, uint16_t version, const oc_credential_reset *m);
 oc_result oc_encode_enable_user(oc_wbuf *w, uint16_t version, const oc_enable_user *m);
+oc_result oc_encode_get_profile(oc_wbuf *w, uint16_t version, const oc_get_profile *m);
 oc_result oc_encode_revoke_session(oc_wbuf *w, uint16_t version, const oc_revoke_session *m);
 oc_result oc_encode_set_email(oc_wbuf *w, uint16_t version, const oc_set_email *m);
 oc_result oc_encode_user_updated(oc_wbuf *w, uint16_t version, const oc_user_updated *m);
@@ -2313,6 +2319,7 @@ oc_result oc_decode_remove_user(oc_rbuf *p, oc_remove_user *m);
 oc_result oc_decode_reset_credential(oc_rbuf *p, oc_reset_credential *m);
 oc_result oc_decode_credential_reset(oc_rbuf *p, oc_credential_reset *m);
 oc_result oc_decode_enable_user(oc_rbuf *p, oc_enable_user *m);
+oc_result oc_decode_get_profile(oc_rbuf *p, oc_get_profile *m);
 oc_result oc_decode_revoke_session(oc_rbuf *p, oc_revoke_session *m);
 oc_result oc_decode_set_email(oc_rbuf *p, oc_set_email *m);
 oc_result oc_decode_user_updated(oc_rbuf *p, oc_user_updated *m);

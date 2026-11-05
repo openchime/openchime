@@ -533,6 +533,7 @@ enum {
     OC_CMD_DEACTIVATE_SELF, /* deactivate my own account (REQ-033) */
     OC_CMD_RESET_CREDENTIAL,/* a reset link for a local account: channel_id = user_id, op = clear its step */
     OC_CMD_ENABLE_USER,     /* bring a removed member back: channel_id = user_id */
+    OC_CMD_SET_VOICE,       /* my read-aloud voice, every other field kept: body = voice id */
     OC_CMD_CREATE_WEBHOOK,  /* mint an incoming webhook for `channel_id`: body = label */
     OC_CMD_LIST_WEBHOOKS,   /* list `channel_id`'s webhooks */
     OC_CMD_DELETE_WEBHOOK,  /* delete a webhook: message_id = webhook_id */
@@ -549,7 +550,7 @@ enum {
      * body2=timezone. */
     OC_CMD_SET_STATUS,
     OC_CMD_SET_PROFILE,
-    OC_CMD_GET_PROFILE,
+    OC_CMD_GET_PROFILE,          /* a member's whole profile: channel_id = user_id, 0 for mine */
     OC_CMD_LIST_FILE_CHANNELS,   /* */
     OC_CMD_LIST_SESSIONS,        /* REQ-182 */
     OC_CMD_REVOKE_SESSION,       /* sign one of your sessions out: message_id = its id */
