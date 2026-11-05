@@ -5774,6 +5774,7 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
             return;
         }
         if (r->type == OC_RES_WEB_OK) pg.done = 1;
+        else if (r->pw_verdict) pg.err = oc_page_err_pw(r->pw_verdict);   /* the form again, with its token */
         else pg.err = r->err_code == OC_ERR_AUTH_INVALID_TOKEN
                         ? OC_PERR_RESET_SPENT
                         : OC_PERR_INTERNAL;

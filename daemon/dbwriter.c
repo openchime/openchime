@@ -14,6 +14,7 @@
 #include "voice_pick.h"   /* a default read-aloud voice (REQ-292) */
 #include "dbwriter.h"
 #include "e2e_hpke.h"
+#include "pwpolicy.h"
 
 #include "config.h"   /* the page size a files listing answers with (REQ-143) */
 #include "unfurl.h"   /* OC_UNFURL_MAX_URLS: the store re-validates presence */
@@ -2606,6 +2607,30 @@ static oc_dbres *process_reset_redeem(oc_dbwriter *w, const oc_job *j) {
     oc_dbres *r = NULL;
     int live = reset_lookup(db, j->token, hash, &uid, &clear) && !user_disabled(db, uid);
     if (j->auth_stage == OC_AUTH_STAGE_NEW) {
+        /* The one rule the page cannot apply: whose account this is is known
+         * only here, from the token. A local account's new password may not be
+         * built on its username, as at sign-up and on a change (AUTH.md §2);
+         * refused, the token is not spent and nothing is hashed. */
+        if (live && j->pf_new_pw && j->pf_new_pw[0]) {
+            char subject[256] = "";
+            sqlite3_stmt *sq = NULL;
+            sqlite3_prepare_v2(db, "SELECT subject FROM users WHERE id=?;", -1, &sq, NULL);
+            sqlite3_bind_int64(sq, 1, (sqlite3_int64)uid);
+            if (sqlite3_step(sq) == SQLITE_ROW && sqlite3_column_text(sq, 0))
+                snprintf(subject, sizeof subject, "%s", (const char *)sqlite3_column_text(sq, 0));
+            sqlite3_finalize(sq);
+            if (strncmp(subject, "local:", 6) == 0) {
+                char norm[OC_PW_NORM_MAX];
+                oc_pw_verdict pv = oc_pw_check(j->pf_new_pw, subject + 6, NULL, norm, sizeof norm);
+                oc_e2e_wipe(norm, sizeof norm);
+                if (pv == OC_PW_PERSONAL) {
+                    if (!(r = calloc(1, sizeof *r))) return NULL;
+                    r->conn_id = j->conn_id;
+                    r->type = OC_RES_WEB_ERR; r->pw_verdict = pv;
+                    return r;
+                }
+            }
+        }
         oc_auth_check *chk = live && j->pf_new_pw && j->pf_new_pw[0] ? calloc(1, sizeof *chk) : NULL;
         if (chk && oc_rand_bytes(chk->new_salt, sizeof chk->new_salt) == 0) {
             chk->new_password = j->pf_new_pw;

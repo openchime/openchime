@@ -1020,6 +1020,7 @@ typedef struct oc_dbres {
     uint64_t       conn_id;
     uint32_t       gen;  /* the job's, echoed (oc_job) */
     uint16_t       err_code;  /* reason code for *_ERR */
+    int            pw_verdict; /* a reset's new password refused (oc_pw_verdict), 0 otherwise */
     /* WEB_STEP2: the credential version the password was checked against, and a
      * password change's new key, held for the step that finishes it. */
     uint64_t       step_version;

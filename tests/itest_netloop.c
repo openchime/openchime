@@ -3583,6 +3583,38 @@ static void test_web_signin(void) {
         CHECK(strstr(oc_page_err_text(OC_PERR_RESET_SPENT), "link") == NULL);
     }
 
+    /* A reset's new password may not be built on the account's username, as at
+     * sign-up and on a change (AUTH.md §2). Only the writer knows whose reset it
+     * is; refused, the token is not spent. A name of four or more characters,
+     * since shorter ones are not checked. */
+    {
+        uint8_t raw[32], hash[32];
+        char hex[65], body[256];
+        for (int i = 0; i < 32; i++) raw[i] = (uint8_t)(0xD0 + i);
+        for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", raw[i]);
+        mbedtls_sha256(raw, sizeof raw, hash, 0);
+        sqlite3 *db = NULL;
+        CHECK(sqlite3_open(tpath("itest_web.db"), &db) == SQLITE_OK);
+        sqlite3_busy_timeout(db, 5000);
+        CHECK(sqlite3_exec(db, "INSERT INTO users(subject, display_name, created_at_ms) "
+                               "VALUES('local:petra', 'petra', 1);", NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db, "INSERT INTO credential_resets(token_hash, user_id, created_by, created_at_ms, "
+                               "expires_at_ms) SELECT ?, id, id, 1, 9000000000000 FROM users WHERE subject='local:petra';",
+                           -1, &st, NULL);
+        sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
+        CHECK(sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1);
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+        snprintf(body, sizeof body, "t=%s&password=petra-ember-glacier&confirm=petra-ember-glacier", hex);
+        CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(oc_test_page_is(resp, "reset") && oc_test_page_error(resp, "pw-personal") && strstr(resp, hex) != NULL);
+        /* Not spent: the same token takes a good password. */
+        snprintf(body, sizeof body, "t=%s&password=quartz-meadow-lantern&confirm=quartz-meadow-lantern", hex);
+        CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(oc_test_page_is(resp, "reset-done") && oc_test_page_result(resp, "password-set"));
+    }
+
     /* Opened by the person's own client, the reset page carries its sign-in and,
      * the password set, goes on to it; a redirect not a sign-in's is no link. */
     {
