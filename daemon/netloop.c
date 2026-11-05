@@ -8991,6 +8991,13 @@ static void loop_state_free(conn **conns) {
 }
 
 /* The port `fd` is bound to, or 0. */
+/* Whether this daemon listens on 127.0.0.1 only: a development daemon with
+ * OPENCHIME_DEV_LOOPBACK on (`make run`), never a deployment. */
+static int dev_loopback(void) {
+    const oc_config *cfg = oc_config_get();
+    return cfg->mode == OC_MODE_DEVELOPMENT && cfg->dev.loopback;
+}
+
 static int bound_port(int fd) {
     struct sockaddr_storage ss;
     socklen_t sl = sizeof ss;
@@ -9046,7 +9053,7 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
      * is privileged and the unit lacks CAP_NET_BIND_SERVICE (ARCH-54) — and
      * lumping three calls under one message would hide which. */
     const char *op = "socket";
-    int lfd = oc_listen_bind(SOCK_STREAM, port, &op);
+    int lfd = oc_listen_bind(SOCK_STREAM, port, dev_loopback(), &op);
     if (lfd < 0) {
         if (strcmp(op, "bind") == 0)
             fprintf(stderr, "openchimed: cannot start: bind port %d: %s\n",
@@ -9242,7 +9249,7 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     int hport = __atomic_load_n(&g_health_port, __ATOMIC_RELAXED);
     if (hport >= 0) {
         const char *hop = "socket";
-        hfd = oc_listen_bind(SOCK_STREAM, hport, &hop);
+        hfd = oc_listen_bind(SOCK_STREAM, hport, dev_loopback(), &hop);
         if (hfd >= 0) {
             hop = NULL;
             if (listen(hfd, 16) < 0)          hop = "listen";

@@ -121,6 +121,7 @@ const cfg_row OC_CFG[] = {
     STR("OPENCHIME_DEV_USERS", CFG_DEV, G_DEV, NULL, "Accounts made at first start, `name:password:role,…`, for a fixture; a real deployment's first owner comes from the setup token.", F(dev.users), NULL, CFG_SECRET, 0),
     INT("OPENCHIME_DEV_FILE_PAGE", CFG_DEV, G_DEV, "200", 1, (int64_t)OC_MAX_FILE_LIST, "How many files one LIST_FILES page carries, so a test sees a second page.", file_page),
     INT("OPENCHIME_DEV_CALL_MAX", CFG_DEV, G_DEV, "10", 2, (int64_t)OC_MAX_CALL_PARTICIPANTS, "The most people in one call, so a test can fill one.", call_max),
+    BOOL("OPENCHIME_DEV_LOOPBACK", CFG_DEV, G_DEV, "off", "Listen on 127.0.0.1 only (the protocol, health and call-audio ports), as `make run` does, so a development daemon and its fixed passwords are not reachable from the network.", dev.loopback),
     INT("OPENCHIME_DEV_CONNS_PER_IP", CFG_DEV, G_DEV, "1024", 0, 1000000, "Connections one address may hold; 0 is no cap, for a load test from one host.", max_conns_per_ip),
     CLIENT("OPENCHIME_DEV_DIR", CFG_DEV, G_DEV, "GUI: the directory of the automation hook's command channel and dumps (TESTING.md)."),
     CLIENT("OPENCHIME_DEV_AUDIO", CFG_DEV, G_DEV, "Clients: `synthetic` audio devices, or `mic-denied`."),

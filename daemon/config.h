@@ -188,6 +188,7 @@ typedef struct {
     int max_conns_per_ip;               /* OC_MAX_CONNS_PER_IP unless OPENCHIME_DEV_CONNS_PER_IP */
     struct {
         const char *users;              /* OPENCHIME_DEV_USERS: accounts made at first start */
+        int         loopback;           /* OPENCHIME_DEV_LOOPBACK: listen on 127.0.0.1 only */
     } dev;
 } oc_config;
 

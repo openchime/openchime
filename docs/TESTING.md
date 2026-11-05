@@ -1385,7 +1385,7 @@ The loop's own turn is the figure to compare.
 
 ## 6. Running the daemon by hand
 
-`make run` starts a development daemon on port 8443 of every interface (health
+`make run` starts a development daemon on `127.0.0.1:8443`, loopback only (health
 `8080`, data `/tmp/openchime-dev`, users alice/pw and bob/pw).
 
 The federation wires — enrollment (ARCH-84), push (ARCH-85) and the OIDC relay

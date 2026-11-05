@@ -222,6 +222,7 @@ Read by the daemon or a client only when `OPENCHIME_MODE=development` (TESTING.m
 | `OPENCHIME_DEV_USERS` | *(unset)* | Accounts made at first start, `name:password:role,…`, for a fixture; a real deployment's first owner comes from the setup token. |
 | `OPENCHIME_DEV_FILE_PAGE` | `200` | How many files one LIST_FILES page carries, so a test sees a second page. Integer 1..200. |
 | `OPENCHIME_DEV_CALL_MAX` | `10` | The most people in one call, so a test can fill one. Integer 2..32. |
+| `OPENCHIME_DEV_LOOPBACK` | `off` | Listen on 127.0.0.1 only (the protocol, health and call-audio ports), as `make run` does, so a development daemon and its fixed passwords are not reachable from the network. `on` or `off`. |
 | `OPENCHIME_DEV_CONNS_PER_IP` | `1024` | Connections one address may hold; 0 is no cap, for a load test from one host. Integer 0..1000000. |
 | `OPENCHIME_DEV_DIR` | *(unset)* | GUI: the directory of the automation hook's command channel and dumps (TESTING.md). |
 | `OPENCHIME_DEV_AUDIO` | *(unset)* | Clients: `synthetic` audio devices, or `mic-denied`. |

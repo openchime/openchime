@@ -43,6 +43,7 @@ int run_storage_tests(void);
 int run_config_tests(void);
 int run_slow_blob_tests(void);
 int run_audio_tests(void);
+int run_listen_tests(void);
 int run_media_tests(void);
 int run_video_media_tests(void);
 int run_emoji_tests(void);
@@ -266,6 +267,7 @@ static const struct suite { const char *name; int (*fn)(void); } SUITES[] = {
     S(run_storage_tests),
     S(run_slow_blob_tests),
     S(run_audio_tests),
+    S(run_listen_tests),
     S(run_media_tests),
     S(run_video_media_tests),
     S(run_emoji_tests),

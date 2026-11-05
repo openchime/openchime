@@ -318,11 +318,9 @@ make run
 
 This builds the daemon and the TUI, then starts a dev daemon on port 8443
 (health on 8080) with its database and blobs under `/tmp/openchime-dev` and two
-bootstrap users (`alice/pw`, `bob/pw`). **It listens on every interface
-(`0.0.0.0` and `[::]`), not only on loopback**: the daemon has no bind-address
-setting, so anyone who can reach this machine on port 8443 can sign in with
-those passwords. Run it only on a trusted network, or behind a host firewall
-that blocks 8443 and 8080 from outside. Connect with the TUI it just built,
+bootstrap users (`alice/pw`, `bob/pw`). It listens on `127.0.0.1` only
+(`OPENCHIME_DEV_LOOPBACK=on`), so those fixed passwords are not reachable from
+the network. Connect with the TUI it just built,
 and sign in as `alice` / `pw` (in the browser or with a device code):
 
 ```

@@ -846,7 +846,7 @@ int main(int argc, char **argv) {
     {
         int uport = cfg->proto_port;   /* the same number as TLS, on UDP (AUDIO.md §4) */
         const char *op = "socket";
-        audio_udp = oc_listen_bind(SOCK_DGRAM, uport, &op);
+        audio_udp = oc_listen_bind(SOCK_DGRAM, uport, cfg->mode == OC_MODE_DEVELOPMENT && cfg->dev.loopback, &op);
         if (audio_udp >= 0) {
             struct sockaddr_storage ua; socklen_t sl = sizeof ua;
             getsockname(audio_udp, (struct sockaddr *)&ua, &sl);

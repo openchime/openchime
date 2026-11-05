@@ -11,10 +11,12 @@
 
 /* A socket of `type` (SOCK_STREAM or SOCK_DGRAM) bound to every address on
  * `port` (0: the kernel picks). IPv6 with IPv4 mapped in (IPV6_V6ONLY off),
- * falling back to IPv4 alone on a host with no IPv6. SO_REUSEADDR is set on a
+ * falling back to IPv4 alone on a host with no IPv6. With `loopback`, bound to
+ * IPv4 127.0.0.1 alone instead: a development daemon's choice
+ * (OPENCHIME_DEV_LOOPBACK), which its caller reads. SO_REUSEADDR is set on a
  * stream socket. Returns the descriptor, or -1 with errno set and `op` naming
  * the call that failed ("socket" or "bind"). */
-int oc_listen_bind(int type, int port, const char **op);
+int oc_listen_bind(int type, int port, int loopback, const char **op);
 
 /* An accepted or received peer address as text, an IPv4 address mapped into
  * IPv6 written as the IPv4 address it is ("192.0.2.7", not

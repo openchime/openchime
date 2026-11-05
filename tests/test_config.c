@@ -483,7 +483,7 @@ static void test_reload_and_registry(void) {
     }
     CHECK(operator_rows == 34);     /* OPENCHIME_MODE among them */
     CHECK(managed_rows == 7);
-    CHECK(dev_rows == 4 + 12);      /* the daemon's four, and the clients' */
+    CHECK(dev_rows == 5 + 12);      /* the daemon's five, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);
     /* No row is also a removed name. */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++)
