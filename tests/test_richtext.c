@@ -582,6 +582,76 @@ static void test_time_flatten(void) {
     CHECK(strcmp(out, "<time:2026-13-01T00:00Z>") == 0);
 }
 
+/* Spoilers (MARKDOWN.md §1d): both forms, and what is not one. */
+static void test_spoilers(void) {
+    oc_rt_spoiler sp[4];
+    const char *b = "The killer is ||the *butler*|| obviously";
+    CHECK(span_over(b, "the *butler*", OC_RT_SPOILER));
+    CHECK(span_over(b, "butler", OC_RT_BOLD));                 /* emphasis inside */
+    CHECK(oc_rt_spoilers(b, strlen(b), sp, 4) == 1);
+    CHECK(sp[0].start == 14 && sp[0].len == 16 && sp[0].hidden == 16 && sp[0].hidden_len == 12 &&
+          !sp[0].block && sp[0].label_len == 0);
+    /* Not a spoiler: empty, space inside the bars, across lines, unclosed,
+     * inside code, and the logical-or of a line of code-like prose. */
+    CHECK(content_spans("a |||| b", OC_RT_SPOILER) == 0);
+    CHECK(content_spans("a || b || c", OC_RT_SPOILER) == 0);
+    CHECK(content_spans("||one\ntwo||", OC_RT_SPOILER) == 0);
+    CHECK(content_spans("||never closed", OC_RT_SPOILER) == 0);
+    CHECK(content_spans("`||code||`", OC_RT_SPOILER) == 0);
+    CHECK(content_spans("```\n||code||\n```", OC_RT_SPOILER) == 0);
+    CHECK(oc_rt_spoilers("x || y", 6, sp, 4) == 0);
+    /* The block form, with a label and lines of text (not code) in it. */
+    const char *k = "Before\n```spoiler Ending\nShe *lives*.\nThe end.\n```\nAfter";
+    CHECK(span_over(k, "She *lives*.\nThe end.", OC_RT_SPOILER_BLOCK));
+    CHECK(span_over(k, "lives", OC_RT_BOLD));
+    CHECK(content_spans(k, OC_RT_CODEBLOCK) == 0);
+    CHECK(oc_rt_spoilers(k, strlen(k), sp, 4) == 1 && sp[0].block);
+    CHECK(sp[0].label_len == 6 && memcmp(k + sp[0].label, "Ending", 6) == 0);
+    CHECK(sp[0].start == 7 && k[sp[0].start + sp[0].len] == '\n');
+    /* No label; and a fence whose word is not "spoiler" stays code. */
+    const char *nl = "```spoiler\nhidden\n```";
+    CHECK(oc_rt_spoilers(nl, strlen(nl), sp, 4) == 1 && sp[0].block && sp[0].label_len == 0);
+    CHECK(content_spans("```spoilers\nx\n```", OC_RT_SPOILER_BLOCK) == 0);
+    CHECK(content_spans("```spoilers\nx\n```", OC_RT_CODEBLOCK) == 1);
+    /* A body is `len` bytes, not a C string: nothing past it is read. Here
+     * the bytes after the body would make it a spoiler if they were. */
+    const char buf[] = "plain text```spoiler\nx\n```";
+    CHECK(oc_rt_spoilers(buf, 10, sp, 4) == 0);
+}
+
+/* Every excerpt hides what a spoiler hides. */
+static void test_spoiler_excerpt(void) {
+    char out[160];
+    const char *b = "The killer is ||the butler|| obviously";
+    oc_rt_plain_excerpt(b, strlen(b), out, sizeof out);
+    /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+    CHECK(strcmp(out, "The killer is [spoiler] obviously") == 0);
+    const char *k = "Before\n```spoiler Ending\nShe lives.\n```\nAfter";
+    oc_rt_plain_excerpt(k, strlen(k), out, sizeof out);
+    /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+    CHECK(strcmp(out, "Before\n[spoiler: Ending]\nAfter") == 0);
+    /* A table inside the block goes with it; one outside stays a table line. */
+    const char *t = "| a |\n|---|\n| 1 |\n\n```spoiler\n| b |\n|---|\n| 2 |\n```";
+    oc_rt_plain_excerpt(t, strlen(t), out, sizeof out);
+    CHECK(strstr(out, "Table: 1 row") == out && strstr(out, "[spoiler]") && !strstr(out, "| 2 |"));
+    /* oc_rt_flatten, the older name, hides them too. */
+    oc_rt_flatten(b, strlen(b), out, sizeof out);
+    CHECK(!strstr(out, "butler"));
+    /* Cut short, the hidden text is never what is left. */
+    char small[20];
+    oc_rt_plain_excerpt(b, strlen(b), small, sizeof small);
+    CHECK(!strstr(small, "butler"));
+    /* A time inside a spoiler is hidden with it, and one outside still reads
+     * as its time. */
+    {
+        char ex[128];
+        const char *tb = "at <time:2026-10-30T15:00Z> ||then <time:2026-10-30T16:00Z>||";
+        oc_rt_clock k = { 0, 1, 1, 0 };
+        oc_rt_flatten_at(tb, strlen(tb), &k, ex, sizeof ex);
+        CHECK(strstr(ex, "[spoiler]") != NULL && strstr(ex, "16:00") == NULL && strstr(ex, "<time:") == NULL);
+    }
+}
+
 int run_richtext_tests(void) {
     failures = 0;
     test_emphasis();
@@ -601,8 +671,10 @@ int run_richtext_tests(void) {
     test_time_tokens();
     test_time_text();
     test_time_flatten();
+    test_spoilers();
+    test_spoiler_excerpt();
     printf("test_richtext: emphasis, literal delimiters, escapes, code, fenced blocks, labelled links, "
            "quotes and lists, nesting, byte offsets, autolinking, truncation, tables and their cells and excerpts, "
-           "time tokens in every zone\n");
+           "time tokens in every zone, spoilers\n");
     return failures;
 }

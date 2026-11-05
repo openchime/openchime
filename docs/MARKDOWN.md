@@ -27,6 +27,7 @@ construct shows its source legibly.
 | Labelled link | `[label](https://example.com)` | Text that links to an address. The reader always sees the address before it opens — see §4. |
 | Table | `\| a \| b \|` over `\|---\|---\|` | A pipe table, as GitHub writes it — see §1a. |
 | Time | `<time:2026-10-30T15:00Z>` | A moment, shown to each reader in their own zone — see §1c. |
+| Spoiler | `\|\|hidden\|\|`, or ` ```spoiler Label ` … ` ``` ` | Covered until each reader chooses to see it — see §1d. |
 
 Emphasis nests (`*bold with _italic_ inside*`); code does not — everything inside
 a code span or block is literal, including other delimiters.
@@ -135,6 +136,51 @@ its short text in the reader's zone (`oc_rt_flatten_at`). Where there is no
 reader — the daemon's excerpts and read-aloud — it is UTC and says so:
 "15:00 UTC", and read aloud in full, "Friday 30 October 2026, 15:00 UTC".
 A push notification carries no message text, so it is unaffected.
+
+## 1d. Spoilers
+
+Text a reader sees only when they choose to:
+
+```
+The killer is ||the butler||.
+```
+
+````
+```spoiler Ending
+She lives.
+```
+````
+
+The inline form, `||hidden||`, is on one line and not empty: the opening bars
+come before a non-space and the closing ones after one, as emphasis does, so
+`a || b` is text. What it hides may carry emphasis. The block form is a fenced
+block whose opening fence is followed by the word `spoiler` and an optional
+label, for a longer or labelled one; its lines are text, not code, and may hold
+any of the dialect. Inside code, neither is a spoiler.
+
+Each client draws a spoiler **covered** — a block the size of what it hides,
+saying "Spoiler" or "Spoiler: Label" — until the reader reveals it with a click,
+with its button for assistive technology, or from the keyboard with the
+message's "Show spoilers" (Ctrl+Up to the message, Shift+F10, Enter), and covers
+it again the same way.
+The terminal client shows `[spoiler]` or `[spoiler: Label]`, and `v` on a
+selected message (or its menu) shows and hides its spoilers. A reveal is this
+reader's, in this window: it is not stored or sent.
+
+**Nothing that sums a message up gives a spoiler away.** Every one-line excerpt
+— a sidebar preview, a toast, a search hit, an activity row, a thread's
+preview, a forward's source — shows `[spoiler]` or `[spoiler: Label]` in its
+place (`oc_rt_plain_excerpt` and `oc_rt_flatten_at`, which the daemon's excerpts are built through
+too; a search whose words fall inside one shows the excerpt rather than a
+window into it). Read aloud, it is "spoiler", or "spoiler: Label". A push
+notification carries no message text.
+
+The parser reports `OC_RT_SPOILER` (inline) or `OC_RT_SPOILER_BLOCK` over the
+hidden text, with `OC_RT_DELIM` spans over the bars, the opening line and the
+closing fence; `oc_rt_spoilers` lists each one whole, with its label.
+
+In a table row a `|` separates cells, so `||text||` there is two empty cells and
+a cell of ordinary text, not a spoiler; the composer's preview shows it as such.
 
 ## 2. When a delimiter is *not* markup
 

@@ -51,6 +51,13 @@ enum {
                                  * reader's zone (oc_rt_time_value,
                                  * oc_rt_time_text); no delimiter span */
 
+    OC_RT_SPOILER   = 0x2000,   /* ||hidden|| on one line: the hidden text, between
+                                 * two OC_RT_DELIM | OC_RT_SPOILER spans */
+    OC_RT_SPOILER_BLOCK = 0x4000, /* ```spoiler Label ... ```: the hidden lines,
+                                 * between the opening line (label included) and
+                                 * the closing fence, both OC_RT_DELIM |
+                                 * OC_RT_SPOILER_BLOCK; see oc_rt_spoilers */
+
     OC_RT_DELIM     = 0x8000    /* the delimiter bytes of the construct above */
 };
 
@@ -99,6 +106,11 @@ typedef struct {
  *     OC_RT_TIME span over the whole token, which a frontend draws as that
  *     moment in the reader's own zone. The date and time must be real ones and
  *     in UTC (the `Z`); anything else is literal text. Not inside code.
+ *   - `||hidden||` is a spoiler (MARKDOWN.md §1d): on one line, not empty,
+ *     opening before a non-space and closing after one, as emphasis does.
+ *     The text inside may carry emphasis. A fenced block whose opening fence
+ *     is followed by the word `spoiler` and an optional label (```spoiler
+ *     Label) is a spoiler block: its lines are scanned as text, not code.
  *   - `[label](https://address)` is a labelled link: an OC_RT_LABELLED span
  *     over the label, which may itself carry emphasis, with OC_RT_DELIM |
  *     OC_RT_LABELLED spans over the `[` and over `](address)`. The address
@@ -203,9 +215,35 @@ enum { OC_RT_TIME_SHORT = 0,   /* "15:00" today, else "Fri 30 Oct, 15:00", or
  * "today" by the system clock. */
 size_t oc_rt_time_text(int64_t ms, const oc_rt_clock *clock, int form, char *out, size_t cap);
 
+/* ---- spoilers (MARKDOWN.md §1d) ------------------------------------------- */
+
+/* One spoiler, the whole construct: [start, start+len) from its opening
+ * delimiter to the end of its closing one; [hidden, hidden+hidden_len) the
+ * text it hides; its label, empty for none (always for the inline form). */
+typedef struct {
+    size_t start, len;
+    size_t hidden, hidden_len;
+    size_t label, label_len;
+    int    block;
+} oc_rt_spoiler;
+
+/* The spoilers in `body`, in order, up to `max`; returns how many there are
+ * (which may exceed `max`). `out` may be NULL when `max` is 0. */
+size_t oc_rt_spoilers(const char *body, size_t len, oc_rt_spoiler *out, size_t max);
+
+/* `body` as a one-line excerpt shows it without giving anything away: each
+ * spoiler becomes "[spoiler]", or "[spoiler: Label]", each table its one line
+ * (as oc_rt_flatten), each time token its text in UTC, and every other byte
+ * is kept. At most `cap` bytes with the NUL, cut at a UTF-8 boundary; returns
+ * the length written. Every excerpt -- the client's previews and toasts, the
+ * daemon's excerpt fields -- hides spoilers this way (oc_rt_flatten_at, with
+ * the reader's clock where there is one). */
+size_t oc_rt_plain_excerpt(const char *body, size_t len, char *out, size_t cap);
+
 /* `body` on one line for an excerpt -- a sidebar preview, a toast, a search
  * hit: each table becomes "Table: N rows × M columns", each time token its
- * short text for `clock` (NULL: UTC, saying so), and every other byte is kept.
+ * short text for `clock` (NULL: UTC, saying so), each spoiler is hidden (as
+ * oc_rt_plain_excerpt), and every other byte is kept.
  * Writes at most `cap` bytes including the NUL, cutting only at a UTF-8
  * boundary, and returns the length written. */
 size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, char *out, size_t cap);
@@ -216,7 +254,7 @@ size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, 
  * string, or NULL when there is no token (show `body` as it is) or no memory. */
 char *oc_rt_local_times(const char *body, size_t len, const oc_rt_clock *clock);
 
-/* oc_rt_flatten_at for no reader: time tokens in UTC. */
+/* oc_rt_flatten_at for no reader: time tokens in UTC, spoilers hidden. */
 size_t oc_rt_flatten(const char *body, size_t len, char *out, size_t cap);
 
 #endif /* OC_RICHTEXT_H */

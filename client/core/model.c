@@ -223,14 +223,16 @@ size_t oc_model_time_text(const oc_model *m, int64_t at_ms, int form, char *out,
 }
 
 /* A body as an excerpt shows it: each table one line saying what it is
- * (MARKDOWN.md §1a), so a sidebar row or a toast never reads as pipes, and each
- * time token its time in this reader's zone (§1b). One clock for the line, at
- * the device's offset now: a token across a daylight-saving change can read an
- * hour out in an excerpt, never in the message itself, which asks per token. */
+ * (MARKDOWN.md §1a), so a sidebar row or a toast never reads as pipes, each
+ * time token its time in this reader's zone (§1c), and each spoiler
+ * "[spoiler]" (§1d), so no excerpt gives away what it hides. One clock for the
+ * line, at the device's offset now: a token across a daylight-saving change
+ * can read an hour out in an excerpt, never in the message itself, which asks
+ * per token. */
 static void preview_set(const oc_model *m, char *out, size_t cap, const char *text) {
     if (!out || !cap) return;
     if (!text) { out[0] = '\0'; return; }
-    if (!strchr(text, '|') && !strstr(text, "<time:")) { snprintf(out, cap, "%s", text); return; }
+    if (!strchr(text, '|') && !strstr(text, "<time:") && !strstr(text, "```spoiler")) { snprintf(out, cap, "%s", text); return; }
     oc_rt_clock k;
     oc_model_clock(m, (int64_t)time(NULL) * 1000, &k);
     oc_rt_flatten_at(text, strlen(text), &k, out, cap);
@@ -1833,7 +1835,7 @@ static void notice_push(oc_model *m, const oc_ev *e) {
         int act = e->action_known && e->action && e->action_len &&
                   e->action_start <= blen && e->action_len <= blen - e->action_start;
         n->action = (uint8_t)act;
-        snprintf(n->body, sizeof n->body, "%s", act ? e->body + e->action_start : e->body);
+        preview_set(m, n->body, sizeof n->body, act ? e->body + e->action_start : e->body);
     }
 }
 

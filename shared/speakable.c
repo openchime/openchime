@@ -84,11 +84,27 @@ static size_t speak(const char *body, size_t len, oc_speak_name_fn resolve, void
     size_t nm = oc_mention_scan(body, len, ments, OC_MENTION_MAX);
     if (nm > OC_MENTION_MAX) nm = OC_MENTION_MAX;
 
+    /* Spoilers (MARKDOWN.md §1d): said as the word, or with their label, and
+     * never what they hide. */
+    oc_rt_spoiler spl[32];
+    size_t nspl = oc_rt_spoilers(body, len, spl, 32);
+    if (nspl > 32) { len = spl[31].start + spl[31].len; nspl = 32; }   /* nothing past an unlisted one */
+
     int in_quote = 0;
     size_t i = 0;
     while (i < len && b.n + 1 < b.cap) {
         /* Constructs starting here, outermost first. */
         int handled = 0;
+        for (size_t k = 0; k < nspl && !handled; k++) {
+            if (spl[k].start != i) continue;
+            if (spl[k].block) full_stop(&b); else space(&b);   /* a block is its own sentence */
+            puts_(&b, "spoiler");
+            if (spl[k].label_len) { puts_(&b, ": "); put(&b, body + spl[k].label, spl[k].label_len); }
+            if (spl[k].block) full_stop(&b);
+            i = spl[k].start + spl[k].len;
+            handled = 1;
+        }
+        if (handled) continue;
         for (size_t k = 0; k < nsp && !handled; k++) {
             const oc_rt_span *s = &spans[k];
             if (s->start != i) continue;

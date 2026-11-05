@@ -5592,7 +5592,7 @@ static void apply_richtext(st_layout *lay, const char *u8, size_t blen, int edit
              * written -- the author sees where it goes -- and is hidden once
              * sent, where hovering shows it instead (MARKDOWN.md §4). */
             int block = (st & (OC_RT_BULLET | OC_RT_ORDERED | OC_RT_QUOTE)) != 0 ||
-                        (editing && (st & OC_RT_LABELLED));
+                        (editing && (st & (OC_RT_LABELLED | OC_RT_SPOILER | OC_RT_SPOILER_BLOCK)));
             if (!block) st_range_hide(lay, at, len);
             else        st_range_color(lay, at, len, OC_COL_FAINT, 1.0f);
             continue;
@@ -5614,6 +5614,48 @@ static void apply_richtext(st_layout *lay, const char *u8, size_t blen, int edit
             st_range_color(lay, at, len, OC_COL_FAINT, 1.0f);
     }
 }
+
+/* ---- spoilers (MARKDOWN.md §1d) ---------------------------------------------
+ * Covered until this reader reveals one, by a click on it or its button for
+ * assistive technology, and covered again the same way. Per reader and per
+ * view: kept here, never sent, and forgotten when the client closes. */
+enum { SPL_REVEALS = 1024 };
+static struct { uint64_t mid; int k; } g_spl_shown[SPL_REVEALS];
+static int g_n_spl_shown;
+static int spoiler_shown(uint64_t mid, int k) {
+    for (int i = 0; i < g_n_spl_shown; i++)
+        if (g_spl_shown[i].mid == mid && g_spl_shown[i].k == k) return 1;
+    return 0;
+}
+static void spoiler_toggle(uint64_t mid, int k) {
+    for (int i = 0; i < g_n_spl_shown; i++)
+        if (g_spl_shown[i].mid == mid && g_spl_shown[i].k == k) {
+            g_spl_shown[i] = g_spl_shown[--g_n_spl_shown];
+            return;
+        }
+    if (g_n_spl_shown == SPL_REVEALS) memmove(g_spl_shown, g_spl_shown + 1, sizeof g_spl_shown[0] * (SPL_REVEALS - 1)), g_n_spl_shown--;
+    g_spl_shown[g_n_spl_shown].mid = mid; g_spl_shown[g_n_spl_shown].k = k; g_n_spl_shown++;
+}
+/* `t` (`nt` tables of a body whose spoilers are `sv`) less those in a covered
+ * spoiler, which stay text under its cover: a grid would be drawn over it, for
+ * all to read. Returns how many are left. */
+static int tables_uncovered(uint64_t mid, const oc_rt_spoiler *sv, size_t nsv, oc_rt_table *t, int nt) {
+    int kept = 0;
+    for (int i = 0; i < nt; i++) {
+        int hid = 0;
+        for (size_t k = 0; k < nsv && !hid; k++)
+            hid = t[i].start >= sv[k].hidden && t[i].start < sv[k].hidden + sv[k].hidden_len &&
+                  !spoiler_shown(mid, (int)k);
+        if (!hid) t[kept++] = t[i];
+    }
+    return kept;
+}
+/* The spoilers drawn this frame, for a click, assistive technology and the dump.
+ * Every spoiler is covered whether or not it finds room here: past the bound one
+ * is revealed by the message's "Show spoilers". */
+enum { SPL_HITS = 256 };
+static struct { rectf r; uint64_t mid; int k; int shown; int lines; } g_splhits[SPL_HITS];
+static int g_n_splhits;
 
 /* ---- the message layout cache --------------------------------------------
  * One entry per recently drawn message: the styled st_layout (selection,
@@ -5692,6 +5734,11 @@ typedef struct {
     int64_t    box_ms[MLAY_BOXES];   /* a time token's moment (MARKDOWN.md §1c) */
     int        ntab;      /* tables drawn as grids (MARKDOWN.md §1a) */
     mtab      *tab;
+    /* spoilers (MARKDOWN.md §1d), however many: each one's lines, layout-relative,
+     * whether it was laid out covered, and a block's label (offset into
+     * body_text). Both are the entry's own, freed with it. */
+    int        nspl;
+    struct mspl { st_rect *r; int nr; int shown; size_t label, label_len; } *spl;
 } mlay_ent;
 static mlay_ent g_mlay[MLAY_CACHE];
 static unsigned g_mlay_stamp;
@@ -5739,6 +5786,12 @@ static uint64_t mlay_sig(const oc_msg *msg) {
         h = (h ^ *p) * 1099511628211ull;
     h = (h ^ (uint64_t)(msg->edited ? 2 : 0)) * 1099511628211ull;
     h = (h ^ (uint64_t)(msg->deleted ? 4 : 0)) * 1099511628211ull;
+    {   /* Which spoilers are shown, whatever order they were revealed in. */
+        uint64_t shown = 0;
+        for (int i = 0; i < g_n_spl_shown; i++)
+            if (g_spl_shown[i].mid == msg->message_id) shown += ((uint64_t)g_spl_shown[i].k + 1) * 0x9E3779B97F4A7C15ull;
+        h = (h ^ shown) * 1099511628211ull;
+    }
     const oc_model *km = model();
     if (km)
         for (uint8_t k = 0; k < km->n_kw_terms; k++)
@@ -5780,6 +5833,8 @@ static unsigned  g_tgrid_stamp;
 static void mlay_drop(mlay_ent *e) {
     if (e->lay) st_layout_destroy(e->lay);
     if (e->tex) gfx_tex_destroy(e->tex);
+    for (int k = 0; k < e->nspl; k++) free(e->spl[k].r);
+    free(e->spl);
     memset(e, 0, sizeof *e);             /* the grids are g_tgrid's */
 }
 
@@ -6086,9 +6141,18 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     int nt = 0;
     size_t tlead = body_lead(msg);
     if (tlead > blen) tlead = blen;
+    /* The spoilers (MARKDOWN.md §1d), every one of them, offsets past the lead. */
+    oc_rt_spoiler *spv = NULL;
+    size_t nspv = msg->deleted ? 0 : oc_rt_spoilers(b + tlead, blen - tlead, NULL, 0);
+    if (nspv) {
+        spv = malloc(nspv * sizeof *spv);
+        if (!spv) return NULL;
+        nspv = oc_rt_spoilers(b + tlead, blen - tlead, spv, nspv);
+    }
     if (!msg->deleted && memchr(b + tlead, '|', blen - tlead)) {
         size_t k = oc_rt_tables(b + tlead, blen - tlead, rts, MTAB_MAX);
         nt = (int)(k > MTAB_MAX ? MTAB_MAX : k);
+        nt = tables_uncovered(msg->message_id, spv, nspv, rts, nt);
     }
     /* The faint inline "(edited)" flows after the last word instead of
      * colliding with a header line that grouped messages don't have. */
@@ -6099,7 +6163,7 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     int edited = msg->edited && !msg->deleted;
     if (edited || nt) {
         own = malloc(blen + 16);
-        if (!own) return NULL;
+        if (!own) { free(spv); return NULL; }
         memcpy(own, b, blen);
         for (int k = 0; k < nt; k++) memset(own + tlead + rts[k].start, 'x', rts[k].len);
         if (edited) {
@@ -6117,7 +6181,7 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     st_layout *lay = st_layout_create(g_st, g_body->f, text, total, cw, 4000.0f,
                                       ST_ALIGN_LEFT);
     free(own);
-    if (!lay) return NULL;
+    if (!lay) { free(spv); return NULL; }
     if (edit_len)
         st_range_color(lay, edit_at, edit_len, OC_COL_FAINT, 1.0f);
     for (int k = 0; k < nt; k++) st_range_hide(lay, tlead + rts[k].start, rts[k].len);
@@ -6171,10 +6235,40 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
                 off = at + (hl ? hl : 1);
             }
         }
+        /* Spoilers (MARKDOWN.md §1d), last, over every colour above: a covered
+         * one's text takes the cover's colour, so that its edges do not show
+         * round the cover drawn over it -- not a mention's accent, not a
+         * keyword's. Their delimiters go too, past the spans the scan above
+         * keeps. */
+        if (nspv) {
+            best->spl = calloc(nspv, sizeof *best->spl);
+            if (!best->spl) { free(spv); st_layout_destroy(lay); return NULL; }
+        }
+        best->nspl = 0;
+        for (size_t k = 0; k < nspv; k++) {
+            st_range_hide(lay, lead + spv[k].start, spv[k].hidden - spv[k].start);
+            st_range_hide(lay, lead + spv[k].hidden + spv[k].hidden_len, spv[k].start + spv[k].len - spv[k].hidden - spv[k].hidden_len);
+            int shown = spoiler_shown(msg->message_id, (int)k);
+            if (!shown && spv[k].hidden_len)
+                st_range_color(lay, lead + spv[k].hidden, spv[k].hidden_len, OC_COL_MUTED, 1.0f);
+            best->spl[k].shown = shown;
+            best->spl[k].label = lead + spv[k].label; best->spl[k].label_len = spv[k].label_len;
+            best->nspl++;
+        }
         /* Custom emoji reserve REAL boxes in the flow (ARCH-106); the draw pass
          * composites the images at the rects the layout reports. */
         oc_emoji_run runs[MLAY_BOXES];
         int nr = emoji_runs(b, runs, MLAY_BOXES);
+        {   /* none inside a covered spoiler: its picture would show through */
+            int kk = 0;
+            for (int i = 0; i < nr; i++) {
+                int hid = 0;
+                for (size_t k = 0; k < nspv; k++)
+                    if (!best->spl[k].shown && runs[i].at >= spv[k].hidden && runs[i].at < spv[k].hidden + spv[k].hidden_len) hid = 1;
+                if (!hid) runs[kk++] = runs[i];
+            }
+            nr = kk;
+        }
         float side = g_body->line_h > 4 ? g_body->line_h - 4 : 18.0f;
         /* Not inside a table: a box there would reserve space in its band. */
         int kept = 0;
@@ -6228,6 +6322,25 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
             if (ids[k] >= 1 && (int)ids[k] <= best->nbox) byid[ids[k] - 1] = best->box[k];
         memcpy(best->box, byid, sizeof byid);
     }
+    /* Where each spoiler's hidden lines landed, all of them: the cover is drawn
+     * there. As many as the text wraps to, so the rects are asked for by lines. */
+    if (best->nspl) {
+        st_line *ln = malloc(((size_t)m.lines + 1) * sizeof *ln);
+        int nl = ln ? st_layout_lines(lay, ln, m.lines + 1) : 0, i0 = 0;
+        for (int k = 0; k < best->nspl; k++) {
+            if (!spv[k].hidden_len) continue;
+            size_t at = tlead + spv[k].hidden, end = at + spv[k].hidden_len;
+            int cap = 1;
+            while (i0 < nl && ln[i0].off + ln[i0].len <= at) i0++;
+            for (int i = i0; i < nl && ln[i].off < end; i++) cap++;
+            best->spl[k].r = malloc((size_t)cap * sizeof *best->spl[k].r);
+            if (!best->spl[k].r) continue;
+            int c = st_hit_range(lay, at, spv[k].hidden_len, best->spl[k].r, cap);
+            best->spl[k].nr = c > cap ? cap : c;
+        }
+        free(ln);
+    }
+    free(spv);
 
     /* Raster now, once; the texture is what frames blit. */
     best->rgb = msg->deleted ? OC_COL_FAINT : OC_COL_TEXT;
@@ -6584,11 +6697,51 @@ static void time_tip_draw(gfx *rt, float W) {
     draw_tip(rt, g_timehits[i].r, full, "", 0, W);
 }
 
+/* What a covered spoiler says on its cover: "Spoiler", or its label. */
+static void spoiler_caption(const oc_msg *msg, const mlay_ent *body, int k, char *out, size_t cap) {
+    if (body->spl[k].label_len)
+        snprintf(out, cap, "Spoiler: %.*s", (int)body->spl[k].label_len, body_text(msg) + body->spl[k].label);
+    else
+        snprintf(out, cap, "Spoiler");
+}
+
+/* The covers (MARKDOWN.md §1d) of the spoilers that are shown, or that are not:
+ * one rect a line, every line, each a click's and assistive technology's. */
+static void spoiler_covers(gfx *rt, const oc_msg *msg, const mlay_ent *body, float tx, float by, int shown) {
+    for (int k = 0; k < body->nspl; k++) {
+        if (!body->spl[k].shown != !shown) continue;
+        rectf hit = rf(0, 0, 0, 0);
+        char capt[96];
+        spoiler_caption(msg, body, k, capt, sizeof capt);
+        for (int q = 0; q < body->spl[k].nr; q++) {
+            float ry = mtab_down(body, body->spl[k].r[q].y);
+            rectf c = rf(tx + body->spl[k].r[q].x - 2, by + ry,
+                         tx + body->spl[k].r[q].x + body->spl[k].r[q].w + 2, by + ry + body->spl[k].r[q].h);
+            /* Wide enough for what the cover says. */
+            if (!q && !shown && c.right < c.left + text_width(capt, g_meta) + 10)
+                c.right = c.left + text_width(capt, g_meta) + 10;
+            if (shown) fill_round_a(rt, c, OC_R_CONTROL, OC_COL_MUTED, 0.16f);
+            else       fill_round(rt, c, OC_R_CONTROL, OC_COL_MUTED);
+            if (!q) hit = c;
+            else { if (c.left < hit.left) hit.left = c.left; if (c.right > hit.right) hit.right = c.right; hit.bottom = c.bottom; }
+        }
+        if (body->spl[k].nr && g_n_splhits < SPL_HITS) {
+            g_splhits[g_n_splhits].r = hit; g_splhits[g_n_splhits].mid = msg->message_id;
+            g_splhits[g_n_splhits].k = k; g_splhits[g_n_splhits].shown = shown;
+            g_splhits[g_n_splhits].lines = body->spl[k].nr;
+            g_n_splhits++;
+        }
+    }
+}
+
 /* A message body laid out by body_layout, drawn with its top left at tx,by:
- * the text (split round its tables when it has any) and its custom emoji. The
+ * spoilers' covers, the text (split round its tables when it has any), its
+ * custom emoji and time tokens, and a covered block's caption. The
  * transcript's, and the composer's Preview's. Returns the height it took. */
 static float body_draw(gfx *rt, const oc_msg *msg, mlay_ent *body, float tx, float by,
                        float content_w, float right) {
+    /* A shown spoiler's tint, under its text, so it still reads as one. */
+    spoiler_covers(rt, msg, body, tx, by, 1);
     if (body->ntab) {
         body_draw_split(rt, msg, body, tx, by, content_w, right);
     } else if (body->tex) {
@@ -6597,6 +6750,9 @@ static float body_draw(gfx *rt, const oc_msg *msg, mlay_ent *body, float tx, flo
         gfx_ink(rt, body->rgb, ST_RASTER_PAD, ST_RASTER_PAD);
         gfx_tex_draw(rt, body->tex, dst, 0.0f, 1.0f);
     }
+    /* A covered spoiler's cover, solid and over its text, so nothing in the
+     * layout can show through it. */
+    spoiler_covers(rt, msg, body, tx, by, 0);
     /* Custom emoji (REQ-072) composited into the boxes the layout
      * reserved for them (ARCH-106) — the layout knows where it
      * wrapped, so the rects are its own; below a table, moved down
@@ -6607,6 +6763,18 @@ static float body_draw(gfx *rt, const oc_msg *msg, mlay_ent *body, float tx, flo
                        tx + body->box[i].x + body->box[i].w,
                        by + bty + body->box[i].h);
         if (!body->box_aid[i]) {
+            /* Not over a covered spoiler: the cover hides the time too. */
+            int hidden = 0;
+            for (int k = 0; k < body->nspl && !hidden; k++) {
+                if (body->spl[k].shown) continue;
+                for (int q = 0; q < body->spl[k].nr; q++) {
+                    float ry = mtab_down(body, body->spl[k].r[q].y);
+                    rectf c = rf(tx + body->spl[k].r[q].x, by + ry,
+                                 tx + body->spl[k].r[q].x + body->spl[k].r[q].w, by + ry + body->spl[k].r[q].h);
+                    if (box.left < c.right && c.left < box.right && box.top < c.bottom && c.top < box.bottom) { hidden = 1; break; }
+                }
+            }
+            if (hidden) continue;
             time_box_draw(rt, msg, body->box_ms[i], box);
             continue;
         }
@@ -6616,6 +6784,15 @@ static float body_draw(gfx *rt, const oc_msg *msg, mlay_ent *body, float tx, flo
              * placeholder — a blank gap would look like a bug. */
             draw_text(rt, ":\u2026:", g_meta, box, OC_COL_FAINT);
         }
+    }
+    /* A covered block says what it hides, on its cover. */
+    for (int k = 0; k < body->nspl; k++) {
+        if (body->spl[k].shown || !body->spl[k].nr) continue;
+        char cap[96];
+        spoiler_caption(msg, body, k, cap, sizeof cap);
+        float ry = mtab_down(body, body->spl[k].r[0].y);
+        draw_text(rt, cap, g_meta, rf(tx + body->spl[k].r[0].x + 4, by + ry,
+                                      tx + content_w, by + ry + body->spl[k].r[0].h), 0xFFFFFF);
     }
     return body->mh;
 }
@@ -21209,6 +21386,7 @@ static void paint(oc_win *hwnd) {
     g_n_timehits = 0;
     /* The reader's clock, which the model's excerpts use too. */
     if (m) oc_model_set_clock12((oc_model *)m, !g_pref_time24);
+    g_n_splhits = 0;
     render_scene(rt, m, W, H);
     if (!g_caret_placed) ed_caret_kill();   /* no field drew a caret this frame */
     /* Boxes placed against chrome the scene just measured, so they can only be
@@ -24441,7 +24619,8 @@ enum {
     AT_EMOJIDEL,      /* payload: Admin > Custom emoji's Delete hit-box index */
     AT_EMOJIFIND,     /* Admin > Custom emoji's search box */
     AT_PICKMANAGE,    /* the emoji picker's Manage link */
-    AT_PREVIEW        /* the composer's Preview / Edit */
+    AT_PREVIEW,       /* the composer's Preview / Edit */
+    AT_SPOILER        /* payload: index into g_splhits -- reveal or cover it */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -24744,6 +24923,13 @@ static void a11y_publish_scene(const oc_model *m) {
     if (g_pick_open && g_pick_manage.right > g_pick_manage.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_BUTTON, "picker.manage", "Manage custom emoji",
                  g_pick_manage, ATOK(AT_PICKMANAGE, 0));
+    /* Spoilers: each one a button that reveals or covers it (MARKDOWN.md §1d). */
+    for (int i = 0; i < g_n_splhits && n < OC_ACC_MAX; i++) {
+        char aid[OC_ACC_AID_MAX];
+        snprintf(aid, sizeof aid, "message.%llu.spoiler.%d", (unsigned long long)g_splhits[i].mid, g_splhits[i].k);
+        acc_push(items, &n, OC_ACC_BUTTON, aid, g_splhits[i].shown ? "Hide spoiler" : "Show spoiler",
+                 g_splhits[i].r, ATOK(AT_SPOILER, (uint64_t)i));
+    }
 
     /* The notices: each toast's action and close, named by what they act on, so
      * a screen reader and the keyboard reach what the pointer does (REQ-290). */
@@ -27756,7 +27942,16 @@ static int msg_tables(const oc_msg *msg, oc_rt_table *out, int max) {
     if (lead > blen) lead = blen;
     if (!memchr(b + lead, '|', blen - lead)) return 0;
     size_t n = oc_rt_tables(b + lead, blen - lead, out, out ? (size_t)max : 0);
-    return (int)(n > (size_t)max && out ? (size_t)max : n);
+    int nt = (int)(n > (size_t)max && out ? (size_t)max : n);
+    /* The same tables the transcript draws, numbered as it numbers them. */
+    size_t ns = out ? oc_rt_spoilers(b + lead, blen - lead, NULL, 0) : 0;
+    oc_rt_spoiler *sv = ns ? malloc(ns * sizeof *sv) : NULL;
+    if (sv) {
+        ns = oc_rt_spoilers(b + lead, blen - lead, sv, ns);
+        nt = tables_uncovered(msg->message_id, sv, ns, out, nt);
+        free(sv);
+    }
+    return nt;
 }
 
 /* Table `idx` of `msg` as TSV, rows on CRLF as a Windows paste target expects;
@@ -27906,6 +28101,12 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
         mi_item(104, "Save for later");
     }
     mi_item(20,  "Copy text");
+    /* Spoilers (MARKDOWN.md §1d), from the keyboard: Ctrl+Up to the message,
+     * Shift+F10, and Enter on this reveals them all, or covers them again. */
+    if (!msg->deleted && msg->body) {
+        size_t nsp = oc_rt_spoilers(msg->body, strlen(msg->body), NULL, 0);
+        if (nsp) mi_item(110, spoiler_shown(mid, 0) ? "Hide spoilers" : "Show spoilers");
+    }
     if (msg_tables(msg, NULL, 0) > 0) {
         g_menu_tab = 0;
         for (int i = 0; i < g_n_tabhits; i++)
@@ -27978,6 +28179,12 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
         copy_to_clipboard(hwnd, msg->body ? msg->body : "");
     } else if (cmd == 109) {
         copy_table(hwnd, msg, g_menu_tab);
+    } else if (cmd == 110) {
+        /* All of the message's spoilers, to the state the first is not in. */
+        int n = (int)oc_rt_spoilers(msg->body, strlen(msg->body), NULL, 0), want = !spoiler_shown(mid, 0);
+        for (int k = 0; k < n; k++)
+            if (spoiler_shown(mid, k) != want) spoiler_toggle(mid, k);
+        invalidate();
     } else if (cmd == 21) {
         composer_begin_edit(msg);
     } else if (cmd == 108) {
@@ -28500,6 +28707,14 @@ static int emoji_admin_key(oc_win *hwnd, int vk) {
 
 static int on_click(oc_win *hwnd, int x, int y) {
     crumb("click %d %d view=%d", x, y, g_view);
+    /* A spoiler is revealed, or covered again, by a click on it. */
+    if (!modal_open())
+        for (int i = 0; i < g_n_splhits; i++)
+            if (in_rect(g_splhits[i].r, (float)x, (float)y)) {
+                spoiler_toggle(g_splhits[i].mid, g_splhits[i].k);
+                invalidate();
+                return 1;
+            }
     /* Toasts are painted above everything, a dialog included, so they are
      * hit-tested above everything too -- a toast over the composer or a
      * dialog's card would otherwise pass on a click it appears to own. */
@@ -34627,6 +34842,12 @@ static void test_dump(const char *path) {
                     g_timehits[i].r.left, g_timehits[i].r.top, g_timehits[i].r.right, g_timehits[i].r.bottom);
         }
     }
+    /* The spoilers the last frame drew, covered or shown (MARKDOWN.md §1d). */
+    fprintf(f, "spoilers n=%d\n", g_n_splhits);
+    for (int i = 0; i < g_n_splhits; i++)
+        fprintf(f, "  spoiler mid=%llu k=%d shown=%d lines=%d r=%.0f,%.0f,%.0f,%.0f\n",
+                (unsigned long long)g_splhits[i].mid, g_splhits[i].k, g_splhits[i].shown, g_splhits[i].lines,
+                g_splhits[i].r.left, g_splhits[i].r.top, g_splhits[i].r.right, g_splhits[i].r.bottom);
     for (size_t i = 0; i < m->n_cemoji; i++)
         fprintf(f, "  cemoji %s attach=%llu\n", m->cemoji[i].name,
                 (unsigned long long)m->cemoji[i].attachment_id);
@@ -38388,6 +38609,9 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
             }
             break;
         case AT_PASTECHOICE: pastechoice_pick(hwnd, (int)arg); break;
+        case AT_SPOILER:
+            if ((int)arg < g_n_splhits) { spoiler_toggle(g_splhits[arg].mid, g_splhits[arg].k); invalidate(); }
+            break;
         case AT_POLLCOMP:
             /* The same path a click takes, at the control's recorded centre. */
             if (g_pc_open) {

@@ -2017,6 +2017,82 @@ static void test_time_preview(void) {
     tzset();
 }
 
+/* A spoiler never shows in an excerpt (MARKDOWN.md §1d): the sidebar's
+ * preview, the one-line text a toast or a screen reader gets, and a thread
+ * reply's toast. */
+static void test_spoiler_preview(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 75; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("room");
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 75; e.message_id = 6; e.author_id = 2;
+    e.body = strdup("it was ||the butler||");
+    oc_model_apply(&m, &e);
+    const oc_channel *c = oc_model_channel(&m, 75);
+    /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+    CHECK(c && strcmp(c->preview, "it was [spoiler]") == 0);
+    char line[128];
+    oc_model_msg_preview(&m, c ? &c->msgs[0] : NULL, line, sizeof line);
+    CHECK(!strstr(line, "butler"));
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 75; e.message_id = 7; e.author_id = 2;
+    e.body = strdup("```spoiler Ending\nshe lives\n```");
+    oc_model_apply(&m, &e);
+    c = oc_model_channel(&m, 75);
+    /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+    CHECK(c && strcmp(c->preview, "[spoiler: Ending]") == 0);
+
+    /* Each other surface, from what the model keeps to the line it is shown as
+     * (oc_model_line, every excerpt's one path): a toast, the activity feed, a
+     * thread's row, a pinned message and a saved one. */
+    const char *const hid = "it was ||the butler||";
+    /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+    const char *const want = "it was [spoiler]";
+    memset(&e, 0, sizeof e); e.type = OC_EV_THREAD_REPLY; e.channel_id = 75; e.parent_id = 6;
+    e.message_id = 8; e.author_id = 2; e.server_time = 8; e.count = 1; e.participant = 1;
+    e.body = strdup(hid); oc_model_apply(&m, &e); free(e.body);
+    CHECK(m.n_notices == 1 && strcmp(m.notices[0].body, want) == 0);
+    oc_model_line(&m, m.notices[0].author_id, NULL, m.notices[0].action, m.notices[0].body, line, sizeof line);
+    CHECK(strcmp(line, want) == 0);
+
+    oc_model_activity_begin(&m);
+    memset(&e, 0, sizeof e); e.type = OC_EV_ACTIVITY; e.message_id = 6; e.channel_id = 75; e.user_id = 2;
+    e.body = strdup(hid); oc_model_apply(&m, &e); free(e.body);
+    CHECK(m.n_activity == 1);
+    if (m.n_activity == 1) {
+        oc_model_line(&m, m.activity[0].actor_id, NULL, m.activity[0].action, m.activity[0].text, line, sizeof line);
+        CHECK(strcmp(line, want) == 0);
+    }
+
+    oc_model_threads_begin(&m);
+    memset(&e, 0, sizeof e); e.type = OC_EV_THREAD_SUMMARY; e.channel_id = 75; e.message_id = 6; e.following = 1;
+    e.author_id = 2; e.body = strdup(hid); oc_model_apply(&m, &e); free(e.body);
+    CHECK(m.n_threads == 1 && m.threads && m.threads[0].preview);
+    if (m.n_threads == 1 && m.threads[0].preview) {
+        oc_model_line(&m, m.threads[0].root_author, NULL, m.threads[0].action, m.threads[0].preview, line, sizeof line);
+        CHECK(strcmp(line, want) == 0);
+    }
+
+    oc_model_pinlist_begin(&m, 75);
+    memset(&e, 0, sizeof e); e.type = OC_EV_PINNED_MSG; e.channel_id = 75; e.message_id = 6; e.author_id = 2;
+    e.body = strdup(hid); oc_model_apply(&m, &e); free(e.body);
+    CHECK(m.n_pins == 1);
+    if (m.n_pins == 1) {
+        oc_model_line(&m, m.pins[0].author_id, NULL, m.pins[0].action, m.pins[0].body, line, sizeof line);
+        CHECK(strcmp(line, want) == 0);
+    }
+
+    oc_model_saved_begin(&m);
+    memset(&e, 0, sizeof e); e.type = OC_EV_SAVED_MSG; e.channel_id = 75; e.message_id = 6; e.author_id = 2;
+    e.body = strdup(hid); oc_model_apply(&m, &e); free(e.body);
+    CHECK(m.n_saved == 1);
+    if (m.n_saved == 1) {
+        oc_model_line(&m, m.saved[0].author_id, NULL, m.saved[0].action, m.saved[0].body, line, sizeof line);
+        CHECK(strcmp(line, want) == 0);
+    }
+    oc_model_free(&m);
+}
+
 static void test_poll_model(void) {
     oc_model m; oc_model_init(&m);
     oc_ev e;
@@ -5770,6 +5846,7 @@ int run_client_core_tests(void) {
     test_broadcast_stored_model();
     test_workspace_sender_model();
     test_time_preview();
+    test_spoiler_preview();
     test_badge_tiers();
     test_osnotify_null();
     test_feedback();

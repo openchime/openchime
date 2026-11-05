@@ -232,6 +232,7 @@ static void scan_inline(rt_ctx *c, size_t s, size_t e, int depth) {
      * against 5 us for ordinary prose. With it, that case is 5 us as well.
      * Indexed [delimiter][run length]. */
     int hopeless[3][3] = { { 0 } };
+    int hopeless_spoiler = 0;
     if (depth > 6) return;            /* pathological nesting; the text still renders */
     while (i < e) {
         char ch = c->b[i];
@@ -289,6 +290,25 @@ static void scan_inline(rt_ctx *c, size_t s, size_t e, int depth) {
             } else {
                 while (i < e && c->b[i] == '`') i++;   /* a bare run is literal */
             }
+            continue;
+        }
+        /* A spoiler (MARKDOWN.md §1d): `||` opens before a non-space and
+         * closes after one, on the same line, as emphasis does; what it hides
+         * may itself carry emphasis. */
+        if (ch == '|' && i + 1 < e && c->b[i + 1] == '|') {
+            if (i + 2 < e && !rt_space(c->b[i + 2]) && c->b[i + 2] != '|' && !hopeless_spoiler) {
+                size_t j = find_close(c, i + 2, e, '|', 2);
+                if (j == RT_NONE) hopeless_spoiler = 1;
+                else {
+                    emit(c, i, 2, OC_RT_DELIM | OC_RT_SPOILER);
+                    emit(c, i + 2, j - (i + 2), OC_RT_SPOILER);
+                    scan_inline(c, i + 2, j, depth + 1);
+                    emit(c, j, 2, OC_RT_DELIM | OC_RT_SPOILER);
+                    i = j + 2;
+                    continue;
+                }
+            }
+            while (i < e && c->b[i] == '|') i++;   /* a bare run is literal */
             continue;
         }
         if      (ch == '*') { style = OC_RT_BOLD;   slot = 0; }
@@ -499,6 +519,27 @@ static void scan_body(rt_ctx *c) {
         if (close == RT_NONE) { i++; continue; }   /* unclosed fence: literal text */
 
         scan_text(c, seg, i);
+        /* ```spoiler Label (MARKDOWN.md §1d): the opening line, label and all,
+         * is the delimiter, and the lines up to the closing fence are TEXT,
+         * hidden, rather than code. It needs a line of its own to open. */
+        if (close >= i + 10 && memcmp(body + i + 3, "spoiler", 7) == 0 &&
+            (body[i + 10] == ' ' || body[i + 10] == '\t' || body[i + 10] == '\r' || body[i + 10] == '\n')) {
+            size_t eol = i + 10;
+            while (eol < close && body[eol] != '\n') eol++;
+            if (eol < close) {
+                cs = eol + 1; ce = close;
+                if (ce > cs && body[ce - 1] == '\n') {
+                    ce--;
+                    if (ce > cs && body[ce - 1] == '\r') ce--;
+                }
+                emit(c, i, cs - i, OC_RT_DELIM | OC_RT_SPOILER_BLOCK);
+                emit(c, cs, ce - cs, OC_RT_SPOILER_BLOCK);
+                scan_text(c, cs, ce);
+                emit(c, ce, close + 3 - ce, OC_RT_DELIM | OC_RT_SPOILER_BLOCK);
+                i = seg = close + 3;
+                continue;
+            }
+        }
         /* The newline after the opening fence and the one before the closing
          * fence belong to the fence, not to the code — otherwise every block
          * renders with a blank first line. */
@@ -632,37 +673,105 @@ size_t oc_rt_time_text(int64_t ms, const oc_rt_clock *clock, int form, char *out
     return (size_t)w < cap ? (size_t)w : cap - 1;
 }
 
-/* What an excerpt puts in place of a construct: a table's one line, or a time
- * token's text. */
-typedef struct { size_t start, len; int table; uint32_t rows, cols; int64_t ms; } rt_repl;
+/* Whether `body` holds a spoiler block's opening anywhere in its `len` bytes:
+ * bounded, since a body need not end in a NUL. */
+static int has_spoiler_fence(const char *body, size_t len) {
+    for (const char *p = body; (p = memchr(p, '`', len - (size_t)(p - body))) != NULL; p++)
+        if ((size_t)(body + len - p) >= 10 && memcmp(p, "```spoiler", 10) == 0) return 1;
+    return 0;
+}
+
+size_t oc_rt_spoilers(const char *body, size_t len, oc_rt_spoiler *out, size_t max) {
+    size_t ns, k, n = 0;
+    oc_rt_span *sp;
+    if (!body || len == 0 || (!memchr(body, '|', len) && !has_spoiler_fence(body, len))) return 0;
+    ns = oc_rt_scan(body, len, NULL, 0);
+    if (!ns) return 0;
+    sp = malloc(ns * sizeof *sp);
+    if (!sp) return 0;
+    oc_rt_scan(body, len, sp, ns);
+    for (k = 0; k < ns; k++) {
+        uint16_t kind = sp[k].style & (OC_RT_SPOILER | OC_RT_SPOILER_BLOCK);
+        size_t q, close = RT_NONE;
+        if (!kind || !(sp[k].style & OC_RT_DELIM)) continue;
+        /* An opener; its closer is the next delimiter of the same kind. */
+        for (q = k + 1; q < ns; q++)
+            if (sp[q].style == (OC_RT_DELIM | kind)) { close = q; break; }
+        if (close == RT_NONE) break;
+        if (n < max) {
+            oc_rt_spoiler *o = &out[n];
+            memset(o, 0, sizeof *o);
+            o->start = sp[k].start;
+            o->len = sp[close].start + sp[close].len - sp[k].start;
+            o->hidden = sp[k].start + sp[k].len;
+            o->hidden_len = sp[close].start - o->hidden;
+            o->block = kind == OC_RT_SPOILER_BLOCK;
+            if (o->block) {
+                size_t a = sp[k].start + 10, b = sp[k].start + sp[k].len;
+                while (a < b && (body[a] == ' ' || body[a] == '\t')) a++;
+                while (b > a && (body[b - 1] == '\n' || body[b - 1] == '\r' || body[b - 1] == ' ' || body[b - 1] == '\t')) b--;
+                o->label = a; o->label_len = b - a;
+            }
+        }
+        n++;
+        k = close;
+    }
+    free(sp);
+    return n;
+}
+
+/* What an excerpt puts in place of a construct: a table's one line, a time
+ * token's text, or a spoiler's word. */
+enum { RT_R_TABLE, RT_R_TIME, RT_R_SPOILER };
+typedef struct { size_t start, len; int kind; uint32_t rows, cols; int64_t ms; size_t label, label_len; } rt_repl;
 
 size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, char *out, size_t cap) {
     oc_rt_table t[32];
+    oc_rt_spoiler sv[32];
     oc_rt_span sp[OC_RT_MAX];
-    rt_repl r[32 + OC_RT_MAX];
-    size_t nt, ns, nr = 0, k, i = 0, o = 0;
+    rt_repl r[32 + 32 + OC_RT_MAX];
+    size_t nt, nv, ns, nr = 0, k, i = 0, o = 0;
     if (!out || cap == 0) return 0;
     out[0] = '\0';
     if (!body) return 0;
     nt = oc_rt_tables(body, len, t, 32);
     if (nt > 32) nt = 32;                     /* past that, the rest stay as written */
+    nv = oc_rt_spoilers(body, len, sv, 32);
+    if (nv > 32) {
+        /* More spoilers than are listed: the rest of the body is not shown at
+         * all rather than shown with something it hides. */
+        len = sv[31].start + sv[31].len;
+        nv = 32;
+    }
     ns = memchr(body, '<', len) ? oc_rt_scan(body, len, sp, OC_RT_MAX) : 0;
     if (ns > OC_RT_MAX) ns = OC_RT_MAX;
-    /* Both lists arrive sorted by start, and no span falls inside a table:
-     * merged, they are the excerpt's replacements in order. */
+    for (k = 0; k < nt; k++) {
+        if (t[k].start >= len) continue;
+        r[nr].start = t[k].start; r[nr].len = t[k].len; r[nr].kind = RT_R_TABLE;
+        r[nr].rows = t[k].rows; r[nr].cols = t[k].cols; nr++;
+    }
+    for (k = 0; k < nv; k++) {
+        r[nr].start = sv[k].start; r[nr].len = sv[k].len; r[nr].kind = RT_R_SPOILER;
+        r[nr].label = sv[k].label; r[nr].label_len = sv[k].label_len; nr++;
+    }
+    for (k = 0; k < ns; k++) {
+        if (sp[k].style != OC_RT_TIME || !oc_rt_time_value(body, len, &sp[k], &r[nr].ms)) continue;
+        r[nr].start = sp[k].start; r[nr].len = sp[k].len; r[nr].kind = RT_R_TIME; nr++;
+    }
+    /* In order of where each starts; one inside another goes with the outer
+     * (a table or a time inside a spoiler is hidden with it). */
+    for (k = 1; k < nr; k++) {
+        rt_repl x = r[k];
+        size_t q = k;
+        while (q > 0 && (r[q - 1].start > x.start ||
+                         (r[q - 1].start == x.start && r[q - 1].len < x.len))) { r[q] = r[q - 1]; q--; }
+        r[q] = x;
+    }
     {
-        size_t a = 0, b = 0;
-        while (a < nt || b < ns) {
-            if (b < ns && sp[b].style != OC_RT_TIME) { b++; continue; }
-            if (a < nt && (b >= ns || t[a].start <= sp[b].start)) {
-                r[nr].start = t[a].start; r[nr].len = t[a].len; r[nr].table = 1;
-                r[nr].rows = t[a].rows; r[nr].cols = t[a].cols; nr++; a++;
-            } else {
-                r[nr].start = sp[b].start; r[nr].len = sp[b].len; r[nr].table = 0;
-                if (!oc_rt_time_value(body, len, &sp[b], &r[nr].ms)) { b++; continue; }
-                nr++; b++;
-            }
-        }
+        size_t m = 0;
+        for (k = 0; k < nr; k++)
+            if (!m || r[k].start >= r[m - 1].start + r[m - 1].len) r[m++] = r[k];
+        nr = m;
     }
     for (k = 0; k <= nr && o + 1 < cap; k++) {
         size_t upto = k < nr ? r[k].start : len, n = upto - i;
@@ -671,12 +780,16 @@ size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, 
         o += n;
         if (k < nr && o + 1 < cap) {
             int w;
-            if (r[k].table)
+            if (r[k].kind == RT_R_TABLE)
                 w = snprintf(out + o, cap - o, "Table: %u row%s \xC3\x97 %u column%s",
                              (unsigned)r[k].rows, r[k].rows == 1 ? "" : "s",
                              (unsigned)r[k].cols, r[k].cols == 1 ? "" : "s");
-            else
+            else if (r[k].kind == RT_R_TIME)
                 w = (int)oc_rt_time_text(r[k].ms, clock, OC_RT_TIME_SHORT, out + o, cap - o);
+            else if (r[k].label_len)
+                w = snprintf(out + o, cap - o, "[spoiler: %.*s]", (int)r[k].label_len, body + r[k].label);
+            else
+                w = snprintf(out + o, cap - o, "[spoiler]");
             if (w > 0) o += (size_t)w < cap - o ? (size_t)w : cap - 1 - o;
             i = r[k].start + r[k].len;
         }
@@ -725,6 +838,10 @@ char *oc_rt_local_times(const char *body, size_t len, const oc_rt_clock *clock) 
 }
 
 size_t oc_rt_flatten(const char *body, size_t len, char *out, size_t cap) {
+    return oc_rt_flatten_at(body, len, NULL, out, cap);
+}
+
+size_t oc_rt_plain_excerpt(const char *body, size_t len, char *out, size_t cap) {
     return oc_rt_flatten_at(body, len, NULL, out, cap);
 }
 

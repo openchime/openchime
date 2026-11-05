@@ -18,7 +18,7 @@ static int said(const char *body, const char *want) {
 }
 
 int run_speakable_tests(void) {
-    printf("test_speakable: plain text, formatting, code, links, mentions, quotes, emoji, lines, not renderable, segments, time tokens\n");
+    printf("test_speakable: plain text, formatting, code, links, mentions, quotes, emoji, lines, not renderable, segments, time tokens, spoilers\n");
     CHECK(said("Can you look at the logs?", "Can you look at the logs?"));
     CHECK(said("this is *really* _important_ and ~not~ that", "this is really important and not that"));
     CHECK(said("run `make test` first", "run make test first"));
@@ -36,6 +36,9 @@ int run_speakable_tests(void) {
         oc_speakable("type `<time:2026-10-30T15:00Z>`", 32, names, NULL, out, sizeof out);
         CHECK(strstr(out, "October") == NULL);
     }
+    /* A spoiler is named, never read (MARKDOWN.md §1d). */
+    CHECK(said("the killer is ||the butler|| indeed", "the killer is spoiler indeed"));
+    CHECK(said("Before\n```spoiler Ending\nShe lives.\n```\nThe end.", "Before. spoiler: Ending. The end."));
     CHECK(said("see https://www.github.com/openchime/openchime/pull/285 for it", "see github.com for it"));
     CHECK(said("read [the release notes](https://example.com/notes) today", "read the release notes today"));
     CHECK(said("thanks @dana and @fox", "thanks Dana Scully and fox"));

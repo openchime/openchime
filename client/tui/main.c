@@ -47,7 +47,7 @@
 #include "client.h"
 #include "model.h"
 #include "mention.h"    /* OC_MENTION_NAME_MAX: a broadcast mention as written */
-#include "richtext.h"   /* time tokens, shown in this terminal's own zone */
+#include "richtext.h"   /* time tokens in this terminal's own zone; spoilers covered */
 #include "complete.h"
 #include "resolve.h"    /* workspace -> host:port (REQ-010/011) */
 #include "store.h"      /* peek a stored session token (skip the sign-in box) */
@@ -260,6 +260,45 @@ static void msg_nick(char *out, size_t cap, const oc_msg *m, uint64_t me, const 
     snprintf(out, cap, "user%llu", (unsigned long long)m->author_id);
 }
 
+/* Spoilers (MARKDOWN.md §1d): shown as "[spoiler]" or "[spoiler: Label]"
+ * until this reader reveals a message's with v (or its menu), per message and
+ * for this run only. */
+static uint64_t g_spl_shown[64];
+static int g_n_spl_shown;
+static int spoilers_shown(uint64_t mid) {
+    for (int i = 0; i < g_n_spl_shown; i++) if (g_spl_shown[i] == mid) return 1;
+    return 0;
+}
+static void spoilers_toggle(uint64_t mid) {
+    for (int i = 0; i < g_n_spl_shown; i++)
+        if (g_spl_shown[i] == mid) { g_spl_shown[i] = g_spl_shown[--g_n_spl_shown]; return; }
+    if (g_n_spl_shown == 64) memmove(g_spl_shown, g_spl_shown + 1, sizeof g_spl_shown[0] * 63), g_n_spl_shown--;
+    g_spl_shown[g_n_spl_shown++] = mid;
+}
+static int has_spoilers(const char *body) {
+    return body && oc_rt_spoilers(body, strlen(body), NULL, 0) > 0;
+}
+/* `body` with each spoiler in its covered form; NULL when there is none (or
+ * no memory), meaning show `body` as it is. A message past 32 spoilers shows
+ * nothing after the 32nd. */
+static char *spoilers_covered(const char *body) {
+    oc_rt_spoiler sp[32];
+    size_t len = strlen(body), n = oc_rt_spoilers(body, len, sp, 32), i = 0, o = 0;
+    if (!n) return NULL;
+    if (n > 32) { len = sp[31].start + sp[31].len; n = 32; }
+    char *out = malloc(len + n * 80 + 1);
+    if (!out) return NULL;
+    for (size_t k = 0; k < n; k++) {
+        memcpy(out + o, body + i, sp[k].start - i); o += sp[k].start - i;
+        if (sp[k].label_len) o += (size_t)sprintf(out + o, "[spoiler: %.*s]", (int)(sp[k].label_len > 64 ? 64 : sp[k].label_len), body + sp[k].label);
+        else                 o += (size_t)sprintf(out + o, "[spoiler]");
+        i = sp[k].start + sp[k].len;
+    }
+    memcpy(out + o, body + i, len - i); o += len - i;
+    out[o] = '\0';
+    return out;
+}
+
 /* Append the wrapped rows for one message: header, body (or tombstone),
  * reactions, and — when `show_replies` — a thread reply-count marker. `ch` is
  * used only to resolve author names. */
@@ -309,14 +348,18 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
             for (size_t k = rstart; k < r->n; k++) r->v[k].mi = mi;
             return;
         }
-        /* The source as written (MARKDOWN.md §5), except a time token, which
-         * is shown as its time here: the token itself reads in UTC (§1b). */
+        /* The source as written (MARKDOWN.md §5), except a spoiler, covered
+         * until it is shown (§1d), and a time token, which is shown as its
+         * time here: the token itself reads in UTC (§1c). */
+        char *cov = (m->body && !spoilers_shown(m->message_id)) ? spoilers_covered(m->body) : NULL;
+        const char *src = cov ? cov : m->body ? m->body : "";
         oc_rt_clock k;
         oc_model_clock(NULL, (int64_t)time(NULL) * 1000, &k);
         k.time24 = !(g_cfg && !g_cfg->time_24h);
-        char *loc = m->body ? oc_rt_local_times(m->body, strlen(m->body), &k) : NULL;
-        wrap_push(r, loc ? loc : m->body ? m->body : "", TB_DEFAULT, width, 4);
+        char *loc = oc_rt_local_times(src, strlen(src), &k);
+        wrap_push(r, loc ? loc : src, TB_DEFAULT, width, 4);
         free(loc);
+        free(cov);
     }
     for (uint8_t k = 0; k < m->n_attach; k++) {           /* attachments (REQ-140) */
         const oc_attachment *a = &m->attach[k];
@@ -872,7 +915,7 @@ static void draw_help(int W, int H) {
         { "Members",    "n  new DM · Enter for message / role / remove" },
         { "New DM",     "type to find a person · Space end-to-end encrypted · Enter opens" },
         { "Encrypted",  "Ctrl+K: accept or decline, trust a new key, end or forget it" },
-        { "Messages",   "t thread · r react · e edit · x delete" },
+        { "Messages",   "t thread · r react · e edit · x delete · v spoilers" },
         { "Search",     "Ctrl+O newest first · oldest first · best match first" },
         { NULL, NULL },
         { NULL, "Everything else" },
@@ -986,6 +1029,7 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
         * ids run on from ACT_SUM_NOTICE0 without an end */
        ACT_VOICES, ACT_VOICE0, ACT_VOICE_LAST = ACT_VOICE0 + OC_VOICE_MAX - 1,
        /* summaries made while you were away: the list, then one of them */
+       ACT_SPOILERS,
        ACT_SUM_NOTICES,
        /* deactivate one's own account (REQ-033), behind a y/N */
        ACT_DEACTIVATE,
@@ -1003,8 +1047,10 @@ static void menu_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
  * your vote: Tacos" when it is yours. The labels live here, not in the
  * model, which may move while the menu is open. */
 static char g_vote_labels[OC_POLL_MAX_OPTIONS][OC_POLL_OPTION_MAX + 32];
-static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int has_attach, const oc_poll_view *poll) {
+static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int has_attach, const oc_poll_view *poll, int spoilers) {
     g_nmenu = 0;
+    if (spoilers && !deleted)
+        g_menu[g_nmenu++] = (menuitem){ spoilers > 1 ? "Hide spoilers" : "Show spoilers", ACT_SPOILERS };
     if (!deleted) g_menu[g_nmenu++] = (menuitem){ "Reply in thread", ACT_THREAD };
     if (!deleted) g_menu[g_nmenu++] = (menuitem){ "Add reaction",    ACT_REACT };
     if (poll && !deleted && !(poll->close_at_ms && (uint64_t)time(NULL) * 1000u >= poll->close_at_ms))
@@ -3728,6 +3774,7 @@ int main(int argc, char **argv) {
                             oc_client_vote(cl, act_cid, act_mid, picks, np);
                         }
                     }
+                    else if (id == ACT_SPOILERS) spoilers_toggle(act_mid);
                     else if (id == ACT_UNREAD) {
                         /* The cursor names the last message READ, so this one is
                          * unread from the one before it; 0 when it is the first. */
@@ -3984,11 +4031,13 @@ int main(int argc, char **argv) {
                     for (uint8_t ak = 0; ak < sel->n_attach; ak++)
                         if (!sel->attach[ak].reclaimed) { has_attach = 1; break; }
                     if (ev.key == TB_KEY_ENTER) {   /* open the discoverable action menu */
-                        menu_build_msg(own, may_edit, may_del, sel->deleted || locked, has_attach && !ch->e2e, sel->poll);   /* no files in an encrypted DM */
+                        menu_build_msg(own, may_edit, may_del, sel->deleted || locked, has_attach && !ch->e2e, sel->poll,   /* no files in an encrypted DM */
+                                       has_spoilers(sel->body) ? 1 + spoilers_shown(mid) : 0);
                         act_cid = cid; act_mid = mid; act_uid = 0; act_title = "Message";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
                     else if (ev.ch == 't' && !locked) oc_client_open_thread(cl, cid, mid);
+                    else if (ev.ch == 'v' && has_spoilers(sel->body)) spoilers_toggle(mid);
                     else if (ev.ch == 'w') oc_client_list_reactions(cl, cid, mid);
                     else if ((ev.ch == 'x' || ev.ch == 'd') && may_del) oc_client_delete(cl, cid, mid);
                     else if (own && ((ev.ch == 'e' && !may_edit) ||                  /* the window has closed */

@@ -12,6 +12,7 @@
  *   - a URL is reduced to its host, without "www.";
  *   - a time token is its moment in full, in UTC: "Friday 30 October 2026,
  *     15:00 UTC";
+ *   - a spoiler is said as "spoiler", or "spoiler: Label", never what it hides;
  *   - @someone becomes their display name, through the caller's resolver;
  *     @here is "everyone here", @channel and @everyone "everyone";
  *   - formatting delimiters, list markers and escapes are dropped;

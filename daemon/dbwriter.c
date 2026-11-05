@@ -8,6 +8,7 @@
  */
 
 #include <stdarg.h>
+#include "richtext.h"   /* oc_rt_plain_excerpt: excerpts hide spoilers */
 #include "action.h"       /* what makes a message an action (ARCH-115) */
 #include "mention.h"      /* the shared @mention scanner (ARCH-89) */
 #include "speakable.h"    /* what read-aloud says for a body (ARCH-111) */
@@ -4736,14 +4737,8 @@ static void store_forward(sqlite3 *db, uint64_t mid, const oc_job *j) {
         n_attach = (uint64_t)sqlite3_column_int64(st, 2);
         const char *an = (const char *)sqlite3_column_text(st, 3);
         if (an) snprintf(aname, sizeof aname, "%s", an);
-        if (bl > OC_FORWARD_EXCERPT_MAX) {
-            bl = OC_FORWARD_EXCERPT_MAX;
-            /* Back off any trailing continuation bytes so the cut lands
-             * between characters. */
-            while (bl > 0 && (b[bl] & 0xC0) == 0x80) bl--;
-        }
-        if (bl && b) memcpy(excerpt, b, bl);
-        ex_len = bl;
+        /* Cut at a character, a spoiler hidden (MARKDOWN.md §1d). */
+        ex_len = b ? oc_rt_plain_excerpt((const char *)b, bl, excerpt, sizeof excerpt) : 0;
         found = 1;
     }
     sqlite3_finalize(st);
@@ -5599,7 +5594,7 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
          * skipped: "(deleted)" is not a useful thing to show as the latest
          * activity, and the row below it usually is. An action's preview is its
          * action text, flagged, so the client reads "<author> <text>" (REQ-058). */
-        "  (SELECT substr(CASE WHEN (SELECT e2e FROM channels WHERE id=x.channel_id)=1 THEN '' ELSE COALESCE(x.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=x.id),0),?2) FROM messages x "
+        "  (SELECT oc_excerpt(substr(CASE WHEN (SELECT e2e FROM channels WHERE id=x.channel_id)=1 THEN '' ELSE COALESCE(x.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=x.id),0)),?2) FROM messages x "
         "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.deleted_at_ms IS NULL "
         "     ORDER BY x.id DESC LIMIT 1), "
         "  COALESCE((SELECT x.author_id FROM messages x "
@@ -6641,7 +6636,7 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
     if (j->act_filter != OC_ACTF_INVOLVED) {
         static const char *USQL =
             "SELECT ?5 AS kind, m.id, m.channel_id, m.author_id, m.created_at_ms, "
-            "       substr(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0),?2) AS text, EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) AS act "
+            "       oc_excerpt(substr(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0)),?2) AS text, EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) AS act "
             "  FROM messages m "
             "  JOIN channel_members cm ON cm.channel_id = m.channel_id AND cm.user_id = ?1 "
             "  JOIN channels c ON c.id = m.channel_id "
@@ -6689,7 +6684,7 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
         /* --- mentions of me --- */
         "  SELECT 0 AS kind, mn.message_id AS message_id, mn.channel_id AS channel_id, "
         "         m.author_id AS actor_id, m.created_at_ms AS at, "
-        "         substr(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0),?2) AS text, EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) AS act "
+        "         oc_excerpt(substr(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0)),?2) AS text, EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) AS act "
         "    FROM mentions mn JOIN messages m ON m.id = mn.message_id "
         /* Mine -- by name, keyword or group (0, 4, 5) -- or a broadcast
          * (1, 2, 3), named as push.c names them: `kind <> 0` also let in
@@ -6718,7 +6713,7 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
         "  UNION ALL "
         /* --- replies under something I wrote --- */
         "  SELECT 2, c.id, c.channel_id, c.author_id, c.created_at_ms, "
-        "         substr(CASE WHEN (SELECT e2e FROM channels WHERE id=c.channel_id)=1 THEN '' ELSE COALESCE(c.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=c.id),0),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=c.id) "
+        "         oc_excerpt(substr(CASE WHEN (SELECT e2e FROM channels WHERE id=c.channel_id)=1 THEN '' ELSE COALESCE(c.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=c.id),0)),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=c.id) "
         "    FROM messages c JOIN messages p ON p.id = c.parent_id "
         "   WHERE p.author_id = ?1 AND c.author_id <> ?1 AND c.deleted_at_ms IS NULL "
         "     AND EXISTS(SELECT 1 FROM channel_members cm "
@@ -7468,7 +7463,12 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
         "  AND m.kind = 0 AND c.e2e = 0 "
         "  AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members cm "
         "       WHERE cm.channel_id=m.channel_id AND cm.user_id=?2)) ",
-        have_text ? "snippet(messages_fts, 0, '', '', ' ... ', 12)" : "substr(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,1,160)",
+        /* A snippet is a window on the body that could open or close inside
+         * a spoiler (MARKDOWN.md §1d): a body with one is excerpted whole,
+         * through the helper, instead. */
+        have_text ? "CASE WHEN oc_has_spoiler(m.body) THEN oc_excerpt(m.body,160) "
+                    "ELSE snippet(messages_fts, 0, '', '', ' ... ', 12) END"
+                  : "oc_excerpt(CASE WHEN (SELECT e2e FROM channels WHERE id=m.channel_id)=1 THEN '' ELSE COALESCE(m.body,'') END,160)",
         rank_sql,
         have_text ? "messages_fts JOIN" : "",
         have_text ? "ON m.id = messages_fts.rowid" : "");
@@ -9017,6 +9017,34 @@ static oc_dbres *process_set_avatar(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Every excerpt the daemon sends -- a channel's preview, a thread's, an
+ * activity row's, a search hit's -- is made by oc_rt_plain_excerpt, so what a
+ * spoiler hides is never in one (MARKDOWN.md §1d). They are built in SQL, so
+ * the helper is a function there: oc_excerpt(text, bytes), and
+ * oc_has_spoiler(text) for where FTS's snippet() would otherwise cut a window. */
+static void sql_excerpt(sqlite3_context *cx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    const char *t = (const char *)sqlite3_value_text(argv[0]);
+    int n = sqlite3_value_bytes(argv[0]);
+    sqlite3_int64 cap = sqlite3_value_int64(argv[1]);
+    if (!t) { sqlite3_result_null(cx); return; }
+    if (cap <= 0 || cap > 65536) cap = 65536;
+    char *out = malloc((size_t)cap + 1);
+    if (!out) { sqlite3_result_error_nomem(cx); return; }
+    size_t w = oc_rt_plain_excerpt(t, (size_t)n, out, (size_t)cap + 1);
+    sqlite3_result_text(cx, out, (int)w, free);
+}
+static void sql_has_spoiler(sqlite3_context *cx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    const char *t = (const char *)sqlite3_value_text(argv[0]);
+    int n = sqlite3_value_bytes(argv[0]);
+    sqlite3_result_int(cx, t && oc_rt_spoilers(t, (size_t)n, NULL, 0) > 0);
+}
+static void sql_functions(sqlite3 *db) {
+    sqlite3_create_function(db, "oc_excerpt", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_excerpt, NULL, NULL);
+    sqlite3_create_function(db, "oc_has_spoiler", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_has_spoiler, NULL, NULL);
+}
+
 static oc_dbres *process_get_profile(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -9150,7 +9178,7 @@ static oc_dbres *process_list_threads(sqlite3 *db, const oc_job *j) {
         "       COALESCE((SELECT tf.state FROM thread_follows tf "
         "                  WHERE tf.user_id = ?1 AND tf.root_id = r.id), 1) AS following, "
         /* An action root previews as its action text, flagged (REQ-058). */
-        "       substr(CASE WHEN (SELECT e2e FROM channels WHERE id=r.channel_id)=1 THEN '' ELSE COALESCE(r.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=r.id),0),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=r.id) "
+        "       oc_excerpt(substr(CASE WHEN (SELECT e2e FROM channels WHERE id=r.channel_id)=1 THEN '' ELSE COALESCE(r.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=r.id),0)),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=r.id) "
         "  FROM messages r "
         "  JOIN channel_members cm ON cm.channel_id = r.channel_id AND cm.user_id = ?1 "
         " WHERE r.parent_id IS NULL AND r.deleted_at_ms IS NULL "
@@ -9197,7 +9225,7 @@ static void build_thread_one(sqlite3 *db, uint64_t uid, uint64_t root_id, oc_dbr
         "       COALESCE((SELECT tf.state FROM thread_follows tf "
         "                  WHERE tf.user_id = ?1 AND tf.root_id = r.id), 1), "
         /* An action root previews as its action text, flagged (REQ-058). */
-        "       substr(CASE WHEN (SELECT e2e FROM channels WHERE id=r.channel_id)=1 THEN '' ELSE COALESCE(r.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=r.id),0),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=r.id) "
+        "       oc_excerpt(substr(CASE WHEN (SELECT e2e FROM channels WHERE id=r.channel_id)=1 THEN '' ELSE COALESCE(r.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=r.id),0)),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=r.id) "
         "  FROM messages r WHERE r.id = ?3;";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, SQL, -1, &st, NULL) != SQLITE_OK) return;
@@ -12513,6 +12541,7 @@ oc_dbwriter *oc_dbwriter_start_boot(const char *path, oc_dbwriter_boot *b) {
      * write lock for a moment at each checkpoint: the writer waits it out, as
      * the readers do, rather than failing a commit with SQLITE_BUSY. */
     sqlite3_busy_timeout(w->db, 5000);
+    sql_functions(w->db);
     char *err = NULL;
     if (sqlite3_exec(w->db, "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;",
                      NULL, NULL, &err) != SQLITE_OK) {
@@ -12584,6 +12613,7 @@ oc_dbwriter *oc_dbwriter_start_boot(const char *path, oc_dbwriter_boot *b) {
         }
         sqlite3_busy_timeout(rd->rdb, 5000);
         sqlite3_exec(rd->rdb, "PRAGMA query_only=1;", NULL, NULL, NULL);
+        sql_functions(rd->rdb);
     }
 
     pthread_mutex_init(&w->mu, NULL);

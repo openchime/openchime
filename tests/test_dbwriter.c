@@ -10092,6 +10092,82 @@ static void test_read_receipts(void) {
     cleanup_db(path);
 }
 
+/* No excerpt the daemon sends gives a spoiler away (MARKDOWN.md §1d): the
+ * channel list's preview, a search hit -- whether the words matched are
+ * outside the spoiler or inside it, where FTS's snippet() would show them --
+ * and a forward's source excerpt. */
+static void test_spoiler_excerpts(void) {
+    const char *path = tdb("spoiler.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "sp-alice", "pw", OC_ROLE_OWNER);
+    CHECK(alice);
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0x5A, sizeof idem);
+    uint64_t src = send_msg(w, alice, idem, "the killer is ||the butler|| indeed");
+    CHECK(src);
+
+    oc_dbres *r = list_channels(w, alice);
+    int seen = 0;
+    for (size_t i = 0; r && i < r->n_chlist; i++)
+        if (r->chlist[i].channel_id == OC_DEFAULT_CHANNEL) {
+            seen = 1;
+            /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+            CHECK(r->chlist[i].preview && strcmp(r->chlist[i].preview, "the killer is [spoiler] indeed") == 0);
+        }
+    CHECK(seen);
+    oc_dbres_free(r);
+
+    static const char *const Q[2] = { "killer", "butler" };
+    for (int q = 0; q < 2; q++) {
+        r = search(w, alice, Q[q], 10);
+        CHECK(r && r->n_search == 1);
+        if (r && r->n_search == 1) CHECK(r->search[0].body && !strstr((const char *)r->search[0].body, "butler") &&
+                                         strstr((const char *)r->search[0].body, "[spoiler]"));
+        oc_dbres_free(r);
+    }
+
+    oc_dbres *cr = create_channel(w, alice, "sp-dest", 1);
+    uint64_t dest = cr ? cr->channel_id : 0;
+    oc_dbres_free(cr);
+    memset(idem, 0x5B, sizeof idem);
+    uint64_t fwd = forward_msg(w, alice, dest, idem, "look", OC_DEFAULT_CHANNEL, src, 1);
+    CHECK(fwd != 0);
+    r = backfill(w, alice, dest, 0);
+    CHECK(r && r->n_rfwd == 1);
+    if (r && r->n_rfwd == 1) CHECK(r->rfwd[0].excerpt && !strstr(r->rfwd[0].excerpt, "butler"));
+    oc_dbres_free(r);
+
+    /* The activity feed's text for a mention, and a thread's row for its root:
+     * pinned and saved carry the body whole, and the client's excerpt covers
+     * them (test_spoiler_preview). */
+    uint64_t bob = reg(w, "sp-bob", "pw", OC_ROLE_MEMBER);
+    CHECK(bob);
+    memset(idem, 0x5C, sizeof idem);
+    uint64_t men = send_msg(w, bob, idem, "@sp-alice it was ||the butler||");
+    CHECK(men);
+    r = list_activity(w, alice);
+    int feed = 0;
+    for (size_t i = 0; r && i < r->n_alist; i++)
+        if (r->alist[i].message_id == men) {
+            feed = 1;
+            CHECK(r->alist[i].text && !strstr(r->alist[i].text, "butler") && strstr(r->alist[i].text, "[spoiler]"));
+        }
+    CHECK(feed);
+    oc_dbres_free(r);
+    r = send_reply(w, bob, OC_DEFAULT_CHANNEL, src, "a reply");
+    CHECK(r && r->type == OC_RES_REPLY_OK);
+    oc_dbres_free(r);
+    r = list_threads_r(w, alice, OC_THREADF_ALL);
+    const oc_thread_row *row = row_for(r, src);
+    CHECK(row && row->preview && !strstr(row->preview, "butler") && strstr(row->preview, "[spoiler]"));
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
@@ -10153,6 +10229,7 @@ int run_dbwriter_tests(void) {
     test_default_quiet_hours();
     test_read_receipts();
     test_default_channels();
+    test_spoiler_excerpts();
     test_search_orders();
     test_setup_invite();
     test_remove_user_integrations();
