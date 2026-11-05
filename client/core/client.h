@@ -263,6 +263,9 @@ void oc_client_get_channel_description(oc_client *c, uint64_t channel_id);
 void oc_client_history_around(oc_client *c, uint64_t channel_id, uint64_t message_id, uint16_t limit);
 
 void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op);
+/* Fold a message away for me on every device (on 1), or open it again (on 0).
+ * The model's msg->collapsed follows when the daemon answers. */
+void oc_client_set_collapsed(oc_client *c, uint64_t message_id, int on);
 void oc_client_list_saved(oc_client *c);
 void oc_client_close_saved(oc_client *c);
 

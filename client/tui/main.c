@@ -299,6 +299,34 @@ static char *spoilers_covered(const char *body) {
     return out;
 }
 
+/* Long messages (CLIENT.md "Long messages"): one this reader folded away shows
+ * its first row; one past 25 rows or 3,000 characters its first 10, for
+ * everyone. c folds or unfolds (on every device); m shows a long one whole,
+ * here only. */
+enum { TUI_COLLAPSE_ROWS = 25, TUI_COLLAPSE_CHARS = 3000, TUI_COLLAPSE_SHOW = 10 };
+static uint64_t g_tui_expanded[128];
+static int g_n_tui_expanded;
+static int tui_expanded(uint64_t mid) {
+    for (int i = 0; i < g_n_tui_expanded; i++) if (g_tui_expanded[i] == mid) return 1;
+    return 0;
+}
+static void tui_expand(uint64_t mid, int on) {
+    for (int i = 0; i < g_n_tui_expanded; i++)
+        if (g_tui_expanded[i] == mid) { if (!on) g_tui_expanded[i] = g_tui_expanded[--g_n_tui_expanded]; return; }
+    if (!on) return;
+    if (g_n_tui_expanded == 128) memmove(g_tui_expanded, g_tui_expanded + 1, sizeof g_tui_expanded[0] * 127), g_n_tui_expanded--;
+    g_tui_expanded[g_n_tui_expanded++] = mid;
+}
+/* Cut the rows a body wrapped to, from `first`, to `keep`, and say why. */
+static void rows_cut(rows_t *r, size_t first, size_t keep, const char *why) {
+    if (r->n > first + keep) {
+        for (size_t k = first + keep; k < r->n; k++) free(r->v[k].s);
+        r->n = first + keep;
+    }
+    char *m = malloc(strlen(why) + 1);
+    if (m) { strcpy(m, why); rows_push(r, m, TB_CYAN); }
+}
+
 /* Append the wrapped rows for one message: header, body (or tombstone),
  * reactions, and — when `show_replies` — a thread reply-count marker. `ch` is
  * used only to resolve author names. */
@@ -357,9 +385,22 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
         oc_model_clock(NULL, (int64_t)time(NULL) * 1000, &k);
         k.time24 = !(g_cfg && !g_cfg->time_24h);
         char *loc = oc_rt_local_times(src, strlen(src), &k);
+        size_t body_first = r->n;
         wrap_push(r, loc ? loc : src, TB_DEFAULT, width, 4);
         free(loc);
         free(cov);
+        if (!tui_expanded(m->message_id)) {
+            size_t chars = 0, rows = r->n - body_first;
+            for (const char *q = m->body ? m->body : ""; *q; q++) if (((unsigned char)*q & 0xC0) != 0x80) chars++;
+            if (m->collapsed)
+                rows_cut(r, body_first, 1, "    \xe2\x80\xa6 collapsed (c to expand)");
+            else if (rows > TUI_COLLAPSE_ROWS || chars > TUI_COLLAPSE_CHARS) {
+                char why[96];
+                snprintf(why, sizeof why, "    \xe2\x80\xa6 %zu more lines (m to show)",
+                         rows > TUI_COLLAPSE_SHOW ? rows - TUI_COLLAPSE_SHOW : 0);
+                rows_cut(r, body_first, TUI_COLLAPSE_SHOW, why);
+            }
+        }
     }
     for (uint8_t k = 0; k < m->n_attach; k++) {           /* attachments (REQ-140) */
         const oc_attachment *a = &m->attach[k];
@@ -915,7 +956,7 @@ static void draw_help(int W, int H) {
         { "Members",    "n  new DM · Enter for message / role / remove" },
         { "New DM",     "type to find a person · Space end-to-end encrypted · Enter opens" },
         { "Encrypted",  "Ctrl+K: accept or decline, trust a new key, end or forget it" },
-        { "Messages",   "t thread · r react · e edit · x delete · v spoilers" },
+        { "Messages",   "t thread · r react · e edit · x delete · v spoilers · c collapse · m more" },
         { "Search",     "Ctrl+O newest first · oldest first · best match first" },
         { NULL, NULL },
         { NULL, "Everything else" },
@@ -1030,6 +1071,8 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_VOICES, ACT_VOICE0, ACT_VOICE_LAST = ACT_VOICE0 + OC_VOICE_MAX - 1,
        /* summaries made while you were away: the list, then one of them */
        ACT_SPOILERS,
+       /* a long message folded away, and opened */
+       ACT_COLLAPSE, ACT_EXPAND,
        ACT_SUM_NOTICES,
        /* deactivate one's own account (REQ-033), behind a y/N */
        ACT_DEACTIVATE,
@@ -1047,8 +1090,9 @@ static void menu_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
  * your vote: Tacos" when it is yours. The labels live here, not in the
  * model, which may move while the menu is open. */
 static char g_vote_labels[OC_POLL_MAX_OPTIONS][OC_POLL_OPTION_MAX + 32];
-static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int has_attach, const oc_poll_view *poll, int spoilers) {
+static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int has_attach, const oc_poll_view *poll, int spoilers, int collapsed) {
     g_nmenu = 0;
+    if (!deleted) g_menu[g_nmenu++] = (menuitem){ collapsed ? "Expand" : "Collapse", collapsed ? ACT_EXPAND : ACT_COLLAPSE };
     if (spoilers && !deleted)
         g_menu[g_nmenu++] = (menuitem){ spoilers > 1 ? "Hide spoilers" : "Show spoilers", ACT_SPOILERS };
     if (!deleted) g_menu[g_nmenu++] = (menuitem){ "Reply in thread", ACT_THREAD };
@@ -3775,6 +3819,8 @@ int main(int argc, char **argv) {
                         }
                     }
                     else if (id == ACT_SPOILERS) spoilers_toggle(act_mid);
+                    else if (id == ACT_COLLAPSE) { tui_expand(act_mid, 0); oc_client_set_collapsed(cl, act_mid, 1); }
+                    else if (id == ACT_EXPAND)   { tui_expand(act_mid, 1); oc_client_set_collapsed(cl, act_mid, 0); }
                     else if (id == ACT_UNREAD) {
                         /* The cursor names the last message READ, so this one is
                          * unread from the one before it; 0 when it is the first. */
@@ -4032,12 +4078,18 @@ int main(int argc, char **argv) {
                         if (!sel->attach[ak].reclaimed) { has_attach = 1; break; }
                     if (ev.key == TB_KEY_ENTER) {   /* open the discoverable action menu */
                         menu_build_msg(own, may_edit, may_del, sel->deleted || locked, has_attach && !ch->e2e, sel->poll,   /* no files in an encrypted DM */
-                                       has_spoilers(sel->body) ? 1 + spoilers_shown(mid) : 0);
+                                       has_spoilers(sel->body) ? 1 + spoilers_shown(mid) : 0, sel->collapsed);
+
                         act_cid = cid; act_mid = mid; act_uid = 0; act_title = "Message";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
                     else if (ev.ch == 't' && !locked) oc_client_open_thread(cl, cid, mid);
                     else if (ev.ch == 'v' && has_spoilers(sel->body)) spoilers_toggle(mid);
+                    else if (ev.ch == 'c' && !sel->deleted) {   /* fold or unfold, on every device */
+                        tui_expand(mid, sel->collapsed);
+                        oc_client_set_collapsed(cl, mid, !sel->collapsed);
+                    }
+                    else if (ev.ch == 'm') tui_expand(mid, !tui_expanded(mid));
                     else if (ev.ch == 'w') oc_client_list_reactions(cl, cid, mid);
                     else if ((ev.ch == 'x' || ev.ch == 'd') && may_del) oc_client_delete(cl, cid, mid);
                     else if (own && ((ev.ch == 'e' && !may_edit) ||                  /* the window has closed */

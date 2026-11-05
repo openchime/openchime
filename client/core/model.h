@@ -109,6 +109,10 @@ typedef struct {
      * replayed after a reconnect so a bookmark survives a reload. */
     uint8_t      saved;
     uint64_t     saved_at;
+    /* Folded away by THIS user (SET_COLLAPSED): theirs on every device, from
+     * COLLAPSED_UPDATED, live and replayed. Shows its author, time and first
+     * line until it is opened again. */
+    uint8_t      collapsed;
     /* OC_MSG_KIND_*: a call event (a missed call, REQ-304) is drawn as a line of
      * history rather than as something its author said. */
     uint8_t      kind;

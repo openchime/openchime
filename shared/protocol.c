@@ -957,6 +957,19 @@ oc_result oc_encode_saved(oc_wbuf *w, uint16_t version, const oc_saved *m) {
     oc_w_u32(w, m->count);
     return oc_frame_end(w, off);
 }
+
+static oc_result encode_collapsed(oc_wbuf *w, uint16_t version, uint16_t type, const oc_set_collapsed *m) {
+    size_t off = oc_frame_begin(w, version, type);
+    oc_w_u64(w, m->message_id);
+    oc_w_u8(w, m->on ? 1 : 0);
+    return oc_frame_end(w, off);
+}
+oc_result oc_encode_set_collapsed(oc_wbuf *w, uint16_t version, const oc_set_collapsed *m) {
+    return encode_collapsed(w, version, OC_MSG_SET_COLLAPSED, m);
+}
+oc_result oc_encode_collapsed_updated(oc_wbuf *w, uint16_t version, const oc_set_collapsed *m) {
+    return encode_collapsed(w, version, OC_MSG_COLLAPSED_UPDATED, m);
+}
 oc_result oc_encode_list_activity(oc_wbuf *w, uint16_t version, uint8_t filter) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LIST_ACTIVITY);
     oc_w_u8(w, filter);
@@ -3218,6 +3231,12 @@ oc_result oc_decode_saved_msg(oc_rbuf *p, oc_saved_msg *m) {
 }
 oc_result oc_decode_saved(oc_rbuf *p, oc_saved *m) {
     m->count = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_set_collapsed(oc_rbuf *p, oc_set_collapsed *m) {
+    m->message_id = oc_r_u64(p);
+    m->on = oc_r_u8(p);
     return r_done(p);
 }
 oc_result oc_decode_activity_entry(oc_rbuf *p, oc_activity_entry *m) {

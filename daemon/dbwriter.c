@@ -613,6 +613,9 @@ static void store_poll(sqlite3 *db, uint64_t mid, uint64_t channel_id, const oc_
 /* A poll's rows go with its message: on a delete, in the caller's transaction. */
 static void drop_poll(sqlite3 *db, uint64_t mid) {
     static const char *const sql[] = {
+        /* Not a poll's, but a message's that goes with it on a delete too:
+         * whoever folded it away (migration 0070). */
+        "DELETE FROM collapsed_messages WHERE message_id=?1;",
         "DELETE FROM poll_votes WHERE message_id=?1;",
         "DELETE FROM poll_options WHERE message_id=?1;",
         "DELETE FROM polls WHERE message_id=?1;",
@@ -6552,6 +6555,38 @@ static oc_dbres *process_save_item(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Fold a message away for its reader, or open it again (PROTOCOL.md
+ * SET_COLLAPSED): a message in a channel they are a member of, not a tombstone.
+ * The answer is for every connection of theirs. Write. */
+static oc_dbres *process_set_collapsed(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+    r->message_id = j->message_id;
+    r->save_op = j->save_op ? 1 : 0;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT channel_id FROM messages WHERE id=? AND deleted_at_ms IS NULL;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    uint64_t cid = (sqlite3_step(st) == SQLITE_ROW) ? (uint64_t)sqlite3_column_int64(st, 0) : 0;
+    sqlite3_finalize(st);
+    if (!cid) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r; }
+    if (!is_member(db, cid, j->user_id)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    sqlite3_prepare_v2(db, r->save_op
+        ? "INSERT OR IGNORE INTO collapsed_messages(user_id,message_id,created_at_ms) VALUES(?1,?2,?3);"
+        : "DELETE FROM collapsed_messages WHERE user_id=?1 AND message_id=?2;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
+    if (r->save_op) sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    r->type = OC_RES_COLLAPSED;
+    return r;
+}
+
 /* My saved items, newest save first (REQ-231). Bodies travel with them, as with
  * pins: a saved message is usually far outside loaded history. */
 static oc_dbres *process_list_saved(sqlite3 *db, const oc_job *j) {
@@ -7881,7 +7916,9 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             /* And this user's saved-for-later state, for the same reason. LEFT
              * JOIN rather than EXISTS so the timestamp comes with it, and keyed on
              * the REQUESTING user because a saved item is private (REQ-231). */
-            "  COALESCE(s.created_at_ms,0), m.kind "
+            "  COALESCE(s.created_at_ms,0), m.kind, "
+            /* And whether this user folded it away, for the same reason. */
+            "  EXISTS(SELECT 1 FROM collapsed_messages cm WHERE cm.message_id = m.id AND cm.user_id = ?4) "
             "FROM messages m LEFT JOIN users u ON u.id = m.author_id "
             "                LEFT JOIN pins  p ON p.message_id = m.id "
             "                LEFT JOIN saved_items s ON s.message_id = m.id AND s.user_id = ?4 "
@@ -7925,6 +7962,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             m->saved     = m->saved_at != 0;
             m->kind      = (uint8_t)sqlite3_column_int(st, 10);
             m->broadcast_stored = broadcast_stored(db, m->message_id);
+            m->collapsed = (uint8_t)sqlite3_column_int(st, 11);
             /* Re-attach the message's linked attachments so a reconnecting client
              * sees them inline, not just live members (REQ-140). */
             load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
@@ -7995,14 +8033,15 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     "         COALESCE(p.pinned_by,0) AS pinned_by," \
     "         COALESCE(p.created_at_ms,0) AS pinned_at," \
     "         COALESCE(s.created_at_ms,0) AS saved_at," \
-    "         m.kind AS kind" \
+    "         m.kind AS kind," \
+    "         EXISTS(SELECT 1 FROM collapsed_messages cm WHERE cm.message_id = m.id AND cm.user_id = ?4) AS collapsed" \
     "    FROM messages m LEFT JOIN users u ON u.id = m.author_id" \
     "                    LEFT JOIN pins p ON p.message_id = m.id" \
     "                    LEFT JOIN saved_items s ON s.message_id = m.id AND s.user_id = ?4"
 
     const char *sql = j->hist_around
         ? "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name,"
-          "       pinned_by, pinned_at, saved_at, kind FROM ("
+          "       pinned_by, pinned_at, saved_at, kind, collapsed FROM ("
           "  SELECT * FROM (" OC_HIST_COLS
           "   WHERE m.channel_id=?1 AND m.parent_id IS NULL AND m.id<=?2"
           "   ORDER BY m.id DESC LIMIT ?3)"
@@ -8012,7 +8051,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
           "   ORDER BY m.id ASC LIMIT ?3)"
           ") ORDER BY id;"
         : "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name,"
-          "       pinned_by, pinned_at, saved_at, kind FROM ("
+          "       pinned_by, pinned_at, saved_at, kind, collapsed FROM ("
           OC_HIST_COLS
           "   WHERE m.channel_id=?1 AND m.id<?2 AND m.parent_id IS NULL"
           "   ORDER BY m.id DESC LIMIT ?3"
@@ -8058,6 +8097,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
         m->saved     = m->saved_at != 0;
         m->kind      = (uint8_t)sqlite3_column_int(st, 10);
         m->broadcast_stored = broadcast_stored(db, m->message_id);
+        m->collapsed = (uint8_t)sqlite3_column_int(st, 11);
         load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
         n++;
     }
@@ -11157,6 +11197,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_PIN)            return process_pin(w->db, j);
     if (j->type == OC_JOB_UPDATE_CHANNEL) return process_update_channel(w->db, j);
     if (j->type == OC_JOB_SAVE_ITEM)      return process_save_item(w->db, j);
+    if (j->type == OC_JOB_SET_COLLAPSED)  return process_set_collapsed(w->db, j);
     /* On the WRITER because it stamps the seen watermark; the read half would
      * otherwise be a reader job with a write in it. */
     if (j->type == OC_JOB_LIST_ACTIVITY)  return process_list_activity(w->db, j);

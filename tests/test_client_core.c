@@ -6173,6 +6173,25 @@ int run_client_core_tests(void) {
                                                    !strcmp(m->users[i].title, "Engineer") &&
                                                    !strcmp(m->users[i].timezone, "Europe/Oslo");
                                       ok; })));
+                /* A message folded away on one device is folded on the other,
+                 * and opened again the same way (SET_COLLAPSED). */
+                {
+                    const oc_channel *fc = oc_model_channel((oc_model *)oc_client_model(b2), 1);
+                    uint64_t fmid = (fc && fc->n_msgs) ? fc->msgs[fc->n_msgs - 1].message_id : 0;
+                    CHECK(fmid != 0);
+                    oc_client_set_collapsed(b, fmid, 1);
+                    CHECK(WAIT_FOR(b2, ({ const oc_channel *cc = oc_model_channel((oc_model *)m, 1);
+                                          int ok = 0;
+                                          for (size_t i = 0; cc && i < cc->n_msgs; i++)
+                                              if (cc->msgs[i].message_id == fmid) ok = cc->msgs[i].collapsed;
+                                          ok; })));
+                    oc_client_set_collapsed(b, fmid, 0);
+                    CHECK(WAIT_FOR(b2, ({ const oc_channel *cc = oc_model_channel((oc_model *)m, 1);
+                                          int open = 0;
+                                          for (size_t i = 0; cc && i < cc->n_msgs; i++)
+                                              if (cc->msgs[i].message_id == fmid) open = !cc->msgs[i].collapsed;
+                                          open; })));
+                }
                 oc_client_mark_read(b2, 1);
                 CHECK(channel_unread(oc_client_model(b2), 1) == 0);
                 oc_client_set_read_cursor(b, 1, 0);

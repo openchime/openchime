@@ -5657,6 +5657,31 @@ enum { SPL_HITS = 256 };
 static struct { rectf r; uint64_t mid; int k; int shown; int lines; } g_splhits[SPL_HITS];
 static int g_n_splhits;
 
+/* ---- collapsing (CLIENT.md "Long messages") --------------------------------
+ * A message this reader folded away (msg->collapsed, theirs on every device)
+ * shows its first line; one longer than COLLAPSE_LINES lines or COLLAPSE_CHARS
+ * characters as drawn shows its first COLLAPSE_SHOW, for everyone. Opening a
+ * long one is this view's alone: kept here, never sent. */
+enum { COLLAPSE_LINES = 25, COLLAPSE_CHARS = 3000, COLLAPSE_SHOW = 10, EXPANDED_MAX = 128 };
+static uint64_t g_expanded[EXPANDED_MAX];
+static int g_n_expanded;
+static int msg_expanded(uint64_t mid) {
+    for (int i = 0; i < g_n_expanded; i++) if (g_expanded[i] == mid) return 1;
+    return 0;
+}
+static void msg_expand(uint64_t mid, int on) {
+    for (int i = 0; i < g_n_expanded; i++)
+        if (g_expanded[i] == mid) { if (!on) g_expanded[i] = g_expanded[--g_n_expanded]; return; }
+    if (!on) return;
+    if (g_n_expanded == EXPANDED_MAX) memmove(g_expanded, g_expanded + 1, sizeof g_expanded[0] * (EXPANDED_MAX - 1)), g_n_expanded--;
+    g_expanded[g_n_expanded++] = mid;
+}
+static void msg_open_cut(uint64_t mid, int kind);   /* fwd */
+/* Each cut message's "Show more" (or "Show message") as drawn this frame. */
+enum { MORE_HITS = 32 };
+static struct { rectf r; uint64_t mid; int kind; } g_morehits[MORE_HITS];
+static int g_n_morehits;
+
 /* ---- the message layout cache --------------------------------------------
  * One entry per recently drawn message: the styled st_layout (selection,
  * links and copy hit-test against it) and its rasterized texture (the frame
@@ -5739,6 +5764,10 @@ typedef struct {
      * body_text). Both are the entry's own, freed with it. */
     int        nspl;
     struct mspl { st_rect *r; int nr; int shown; size_t label, label_len; } *spl;
+    /* cut short (CLIENT.md "Long messages"): 1 folded away by this reader, 2
+     * long, else 0; and where its "Show ..." line landed, layout-relative */
+    int        cutkind;
+    st_rect    more_r;
 } mlay_ent;
 static mlay_ent g_mlay[MLAY_CACHE];
 static unsigned g_mlay_stamp;
@@ -5792,6 +5821,7 @@ static uint64_t mlay_sig(const oc_msg *msg) {
             if (g_spl_shown[i].mid == msg->message_id) shown += ((uint64_t)g_spl_shown[i].k + 1) * 0x9E3779B97F4A7C15ull;
         h = (h ^ shown) * 1099511628211ull;
     }
+    h = (h ^ (uint64_t)(msg->collapsed ? 64 : 0) ^ (uint64_t)(msg_expanded(msg->message_id) ? 128 : 0)) * 1099511628211ull;
     const oc_model *km = model();
     if (km)
         for (uint8_t k = 0; k < km->n_kw_terms; k++)
@@ -6114,6 +6144,75 @@ static int in_tables(const oc_rt_table *t, int nt, size_t pos) {
  * The layout carries: markdown spans, the faint inline "(edited)", @mention
  * and keyword accents, and an inline BOX per custom emoji — the real
  * mechanism (ARCH-106) for the space the old transparent-glyph trick faked. */
+/* Where a long body is cut (CLIENT.md "Long messages"): the start of its line
+ * COLLAPSE_SHOW + 1 as it wraps at `cw`, when it runs past COLLAPSE_LINES lines
+ * or COLLAPSE_CHARS characters; else 0. Measured on the text as written. */
+static size_t long_cut(const char *b, size_t blen, float cw) {
+    size_t chars = 0;
+    for (size_t i = 0; i < blen; i++) if (((unsigned char)b[i] & 0xC0) != 0x80) chars++;
+    size_t nl = 0;
+    for (size_t i = 0; i < blen; i++) if (b[i] == '\n') nl++;
+    if (chars <= COLLAPSE_CHARS && nl + 1 <= COLLAPSE_SHOW) return 0;   /* cannot be long */
+    st_layout *l = st_layout_create(g_st, g_body->f, b, blen, cw, 4000.0f, ST_ALIGN_LEFT);
+    if (!l) return 0;
+    st_line ln[COLLAPSE_SHOW + 1];
+    st_metrics mt;
+    st_layout_metrics(l, &mt);
+    int n = st_layout_lines(l, ln, COLLAPSE_SHOW + 1);
+    st_layout_destroy(l);
+    if (mt.lines <= COLLAPSE_LINES && chars <= COLLAPSE_CHARS) return 0;
+    if (n <= COLLAPSE_SHOW) return 0;
+    size_t cut = ln[COLLAPSE_SHOW].off;
+    while (cut > 0 && (b[cut - 1] == '\n' || b[cut - 1] == '\r')) cut--;
+    return cut;
+}
+
+/* The body cut at `cut`, into `out` (OC_MAX_BODY_SIZE + 8 bytes), and its length.
+ * A cut inside a spoiler would leave its fence or its bars unclosed, and what
+ * they hide would read as text; so there the spoiler is closed where the cut
+ * falls, and stays covered (MARKDOWN.md §1d). `lead` is where the author's text
+ * starts, past an action's name. */
+static size_t cut_body(const char *b, size_t blen, size_t lead, size_t cut, char *out) {
+    size_t ns = oc_rt_spoilers(b + lead, blen - lead, NULL, 0), hit = ns;
+    oc_rt_spoiler *sv = ns ? malloc(ns * sizeof *sv) : NULL;
+    if (ns && !sv) return memcpy(out, b, lead), lead;   /* shows less, never more */
+    if (ns) ns = oc_rt_spoilers(b + lead, blen - lead, sv, ns);
+    for (size_t k = 0; k < ns; k++)
+        if (cut > lead + sv[k].start && cut < lead + sv[k].start + sv[k].len) { hit = k; break; }
+    if (hit >= ns) { free(sv); memcpy(out, b, cut); return cut; }
+    const oc_rt_spoiler s = sv[hit];
+    size_t start = lead + s.start, hid0 = lead + s.hidden, hid1 = hid0 + s.hidden_len, end = start + s.len, n;
+    const char *close = s.block ? "\n```" : "||";
+    if (cut >= hid1) {                          /* in its closing delimiter: the whole of it */
+        n = end <= OC_MAX_BODY_SIZE ? end : start;
+        memcpy(out, b, n);
+        free(sv);
+        return n;
+    }
+    if (cut <= hid0 && s.block) {               /* in its opening line: its first hidden line, covered */
+        const char *nl = memchr(b + hid0, '\n', hid1 - hid0);
+        cut = nl ? (size_t)(nl - b) : hid1;
+    }
+    n = cut;
+    while (n > hid0 && (b[n - 1] == '\n' || b[n - 1] == '\r' || b[n - 1] == ' ' || b[n - 1] == '\t')) n--;
+    if (n > hid0) {
+        memcpy(out, b, n);
+        memcpy(out + n, close, strlen(close));
+        n += strlen(close);
+        /* Closed as the scanner reads it, or not kept at all. */
+        oc_rt_spoiler *again = malloc((hit + 1) * sizeof *again);
+        int ok = again && oc_rt_spoilers(out + lead, n - lead, again, hit + 1) == hit + 1 &&
+                 again[hit].start == s.start && again[hit].hidden == s.hidden;
+        free(again);
+        if (ok) { free(sv); return n; }
+    }
+    /* Otherwise the cut goes back to where the spoiler starts, leaving it for
+     * Show more to open. */
+    memcpy(out, b, start);
+    free(sv);
+    return start;
+}
+
 static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     uint64_t sig = mlay_sig(msg);
     unsigned slot = (unsigned)(msg->message_id % MLAY_CACHE);
@@ -6132,6 +6231,26 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
 
     const char *b = body_text(msg);
     size_t blen = strlen(b);
+    /* Cut short (CLIENT.md "Long messages"): folded away, to its first line;
+     * long, to its first COLLAPSE_SHOW. What is laid out is the prefix, so
+     * every offset below means what it did. */
+    static char cutbuf[OC_MAX_BODY_SIZE + 8];
+    int cutkind = 0;
+    if (!msg->deleted && msg_has_body(msg) && !msg_expanded(msg->message_id)) {
+        size_t cut = 0, lead0 = body_lead(msg);
+        if (msg->collapsed) {
+            const char *nl = memchr(b + lead0, '\n', blen - lead0);
+            cut = nl ? (size_t)(nl - b) : blen;
+            cutkind = 1;
+        } else if ((cut = long_cut(b, blen, cw)) != 0) {
+            cutkind = 2;
+        }
+        if (cutkind && cut <= OC_MAX_BODY_SIZE) {
+            blen = cut_body(b, blen, lead0, cut, cutbuf);
+            cutbuf[blen] = '\0';
+            b = cutbuf;
+        } else cutkind = 0;
+    }
     /* The tables (MARKDOWN.md §1a), found before the layout is: their bytes
      * are laid out as one run of hidden filler, the same length, so the band
      * they leave is a line or so whatever the table's size -- a hidden byte
@@ -6161,8 +6280,10 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     const char *text = b;
     size_t edit_at = 0, edit_len = 0;
     int edited = msg->edited && !msg->deleted;
-    if (edited || nt) {
-        own = malloc(blen + 16);
+    static const char *const MORE[3] = { "", "  \xE2\x80\xA6 Show message", "\nShow more" };
+    size_t more_at = 0, more_len = cutkind ? strlen(MORE[cutkind]) : 0;
+    if (edited || nt || cutkind) {
+        own = malloc(blen + 16 + 32);
         if (!own) { free(spv); return NULL; }
         memcpy(own, b, blen);
         for (int k = 0; k < nt; k++) memset(own + tlead + rts[k].start, 'x', rts[k].len);
@@ -6175,6 +6296,12 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
             memcpy(own + total, "  (edited)", edit_len);
             total += edit_len;
         }
+        if (cutkind) {
+            if (nt && tlead + rts[nt - 1].start + rts[nt - 1].len >= blen && cutkind == 1) own[total++] = '\n';
+            more_at = total;
+            memcpy(own + total, MORE[cutkind], more_len);
+            total += more_len;
+        }
         own[total] = '\0';
         text = own;
     }
@@ -6184,6 +6311,10 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     if (!lay) { free(spv); return NULL; }
     if (edit_len)
         st_range_color(lay, edit_at, edit_len, OC_COL_FAINT, 1.0f);
+    if (more_len) {
+        st_range_color(lay, more_at, more_len, OC_COL_ACCENT, 1.0f);
+        st_range_weight(lay, more_at, more_len, 600);
+    }
     for (int k = 0; k < nt; k++) st_range_hide(lay, tlead + rts[k].start, rts[k].len);
     if (!msg->deleted) {
         /* An action (REQ-058) reads "<name> <text>": the name is bold, and the
@@ -6341,6 +6472,13 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
         free(ln);
     }
     free(spv);
+    best->cutkind = cutkind;
+    if (more_len) {
+        /* The words alone, past the newline or the ellipsis before them. */
+        size_t skip = cutkind == 2 ? 1 : 6;
+        st_rect mr[2];
+        if (st_hit_range(lay, more_at + skip, more_len - skip, mr, 2) >= 1) best->more_r = mr[0];
+    }
 
     /* Raster now, once; the texture is what frames blit. */
     best->rgb = msg->deleted ? OC_COL_FAINT : OC_COL_TEXT;
@@ -6850,8 +6988,19 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
         /* Both halves of the pair have to agree with msg_height: draw nothing and
          * advance nothing when there is no text, or the attachment lines below
          * would sit a line lower than the space reserved for them. */
-        if (msg_has_body(msg))
+        if (msg_has_body(msg)) {
+            float bby = by;
             by += body_draw(rt, msg, body, tx, by, content_w, x0 + content_w + AVA + 12);
+            /* A cut message's "Show more", which a click opens (on_click). */
+            if (body->cutkind && g_n_morehits < MORE_HITS && body->more_r.w > 0) {
+                float my = mtab_down(body, body->more_r.y);
+                g_morehits[g_n_morehits].r = rf(tx + body->more_r.x, bby + my,
+                                                tx + body->more_r.x + body->more_r.w, bby + my + body->more_r.h);
+                g_morehits[g_n_morehits].mid = msg->message_id;
+                g_morehits[g_n_morehits].kind = body->cutkind;
+                g_n_morehits++;
+            }
+        }
     }
 
     /* What this message forwards (REQ-057), directly under the forwarder's own
@@ -21387,6 +21536,7 @@ static void paint(oc_win *hwnd) {
     /* The reader's clock, which the model's excerpts use too. */
     if (m) oc_model_set_clock12((oc_model *)m, !g_pref_time24);
     g_n_splhits = 0;
+    g_n_morehits = 0;
     render_scene(rt, m, W, H);
     if (!g_caret_placed) ed_caret_kill();   /* no field drew a caret this frame */
     /* Boxes placed against chrome the scene just measured, so they can only be
@@ -24620,7 +24770,8 @@ enum {
     AT_EMOJIFIND,     /* Admin > Custom emoji's search box */
     AT_PICKMANAGE,    /* the emoji picker's Manage link */
     AT_PREVIEW,       /* the composer's Preview / Edit */
-    AT_SPOILER        /* payload: index into g_splhits -- reveal or cover it */
+    AT_SPOILER,       /* payload: index into g_splhits -- reveal or cover it */
+    AT_MORE           /* payload: index into g_morehits -- open that cut message */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -24929,6 +25080,14 @@ static void a11y_publish_scene(const oc_model *m) {
         snprintf(aid, sizeof aid, "message.%llu.spoiler.%d", (unsigned long long)g_splhits[i].mid, g_splhits[i].k);
         acc_push(items, &n, OC_ACC_BUTTON, aid, g_splhits[i].shown ? "Hide spoiler" : "Show spoiler",
                  g_splhits[i].r, ATOK(AT_SPOILER, (uint64_t)i));
+    }
+
+    /* A cut message's "Show more" or "Show message" (CLIENT.md "Long messages"). */
+    for (int i = 0; i < g_n_morehits && n < OC_ACC_MAX; i++) {
+        char aid[OC_ACC_AID_MAX];
+        snprintf(aid, sizeof aid, "message.%llu.expand", (unsigned long long)g_morehits[i].mid);
+        acc_push(items, &n, OC_ACC_BUTTON, aid, g_morehits[i].kind == 1 ? "Show message" : "Show more",
+                 g_morehits[i].r, ATOK(AT_MORE, (uint64_t)i));
     }
 
     /* The notices: each toast's action and close, named by what they act on, so
@@ -28107,6 +28266,14 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
         size_t nsp = oc_rt_spoilers(msg->body, strlen(msg->body), NULL, 0);
         if (nsp) mi_item(110, spoiler_shown(mid, 0) ? "Hide spoilers" : "Show spoilers");
     }
+    /* Folding (CLIENT.md "Long messages"): Collapse puts it away on every
+     * device; Expand opens a folded or a long one. */
+    if (!msg->deleted && msg_has_body(msg)) {
+        int cut_long = 0;
+        for (int i = 0; i < g_n_morehits; i++) if (g_morehits[i].mid == mid) cut_long = 1;
+        if (msg->collapsed || cut_long) mi_item(111, "Expand");
+        else                            mi_item(112, "Collapse");
+    }
     if (msg_tables(msg, NULL, 0) > 0) {
         g_menu_tab = 0;
         for (int i = 0; i < g_n_tabhits; i++)
@@ -28185,6 +28352,11 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
         for (int k = 0; k < n; k++)
             if (spoiler_shown(mid, k) != want) spoiler_toggle(mid, k);
         invalidate();
+    } else if (cmd == 111) {
+        msg_open_cut(mid, msg->collapsed ? 1 : 2);
+    } else if (cmd == 112) {
+        msg_expand(mid, 0);
+        if (g_client) oc_client_set_collapsed(g_client, mid, 1);
     } else if (cmd == 21) {
         composer_begin_edit(msg);
     } else if (cmd == 108) {
@@ -28705,6 +28877,14 @@ static int emoji_admin_key(oc_win *hwnd, int vk) {
     return 1;
 }
 
+/* Open a cut message: a folded one is unfolded on every device (and shown
+ * whole here); a long one is shown whole in this view. */
+static void msg_open_cut(uint64_t mid, int kind) {
+    if (kind == 1 && g_client) oc_client_set_collapsed(g_client, mid, 0);
+    msg_expand(mid, 1);
+    invalidate();
+}
+
 static int on_click(oc_win *hwnd, int x, int y) {
     crumb("click %d %d view=%d", x, y, g_view);
     /* A spoiler is revealed, or covered again, by a click on it. */
@@ -28715,6 +28895,9 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 invalidate();
                 return 1;
             }
+    if (!modal_open())
+        for (int i = 0; i < g_n_morehits; i++)
+            if (in_rect(g_morehits[i].r, (float)x, (float)y)) { msg_open_cut(g_morehits[i].mid, g_morehits[i].kind); return 1; }
     /* Toasts are painted above everything, a dialog included, so they are
      * hit-tested above everything too -- a toast over the composer or a
      * dialog's card would otherwise pass on a click it appears to own. */
@@ -34848,6 +35031,11 @@ static void test_dump(const char *path) {
         fprintf(f, "  spoiler mid=%llu k=%d shown=%d lines=%d r=%.0f,%.0f,%.0f,%.0f\n",
                 (unsigned long long)g_splhits[i].mid, g_splhits[i].k, g_splhits[i].shown, g_splhits[i].lines,
                 g_splhits[i].r.left, g_splhits[i].r.top, g_splhits[i].r.right, g_splhits[i].r.bottom);
+    /* Cut messages the last frame drew (CLIENT.md "Long messages"). */
+    fprintf(f, "cutmsgs n=%d\n", g_n_morehits);
+    for (int i = 0; i < g_n_morehits; i++)
+        fprintf(f, "  cutmsg mid=%llu kind=%d r=%.0f,%.0f,%.0f,%.0f\n", (unsigned long long)g_morehits[i].mid,
+                g_morehits[i].kind, g_morehits[i].r.left, g_morehits[i].r.top, g_morehits[i].r.right, g_morehits[i].r.bottom);
     for (size_t i = 0; i < m->n_cemoji; i++)
         fprintf(f, "  cemoji %s attach=%llu\n", m->cemoji[i].name,
                 (unsigned long long)m->cemoji[i].attachment_id);
@@ -38611,6 +38799,9 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
         case AT_PASTECHOICE: pastechoice_pick(hwnd, (int)arg); break;
         case AT_SPOILER:
             if ((int)arg < g_n_splhits) { spoiler_toggle(g_splhits[arg].mid, g_splhits[arg].k); invalidate(); }
+            break;
+        case AT_MORE:
+            if ((int)arg < g_n_morehits) msg_open_cut(g_morehits[arg].mid, g_morehits[arg].kind);
             break;
         case AT_POLLCOMP:
             /* The same path a click takes, at the control's recorded centre. */

@@ -1262,6 +1262,18 @@ usually far outside loaded history — and, last, an `action` byte (REQ-058,
 §5.16l): `1` when the message is an action, its body then being the action text. Entries whose channel you have since left are
 omitted: leaving a channel must stop it leaking through your saved list.
 
+**`SET_COLLAPSED` (client → server), msg_type `0x0117`** `{ message_id: u64, on: u8 }`
+folds a message away for you (`1`), or opens it again (`0`). A message in a
+channel you are a member of (`NOT_A_MEMBER` otherwise), not a tombstone
+(`UNKNOWN_MESSAGE`). The set is yours on every device: **`COLLAPSED_UPDATED`
+(`0x0118`)** `{ message_id: u64, on: u8 }` goes to **each of your connections**,
+the one that asked among them, and to nobody else. Backfill replays your folded
+messages among those it sends, as one `COLLAPSED_UPDATED` each, after their
+saved state. Folding twice, or opening one that is open, changes nothing and is
+answered the same. A delete takes the message's folds with it. (A message long
+enough to be folded *for everyone* is the client's rule, CLIENT.md, and is not
+on the wire.)
+
 **`LIST_ACTIVITY` (`0x0067`)** `{ filter: u8 }` streams **`ACTIVITY_ENTRY`
 (`0x0068`)** newest first, then **`ACTIVITY` (`0x0069`)** `{ count: u32,
 seen_at: u64 }`. `filter` is `0` involved-me (the original question) · `1` unread
@@ -3496,6 +3508,8 @@ this table cannot silently gain a shared value.
 | `0x0114` | `EDIT_POLL` | C → S | the author changes a poll: options and settings until the first vote, the deadline always |
 | `0x0115` | `DEACTIVATE_SELF` | C → S | deactivate my own account, as a removal does (REQ-033) |
 | `0x0116` | `GET_PROFILE` | C → S | a member's whole profile, 0 for mine; answered with `PROFILE_INFO`, the phone in one's own only |
+| `0x0117` | `SET_COLLAPSED` | C → S | fold a message away for me, or open it again |
+| `0x0118` | `COLLAPSED_UPDATED` | S → C | to each of my connections: a message folded or opened; replayed in backfill |
 | `0x0119` | `WORKSPACE_SETTINGS` | S → C | read-only: the workspace's settings clients act on, after `WORKSPACE_INFO` |
 | `0x011A` | `READ_RECEIPTS` | both | whether I share my read receipts: set or ask, and told |
 

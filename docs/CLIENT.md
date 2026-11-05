@@ -1518,6 +1518,27 @@ set. Consequences worth knowing before touching it:
   written ([MARKDOWN.md](./MARKDOWN.md) §5), so its message box is already
   what the conversation will show.
 
+### Long messages
+
+A message a reader **collapses** (its menu's Collapse, or `c` in the terminal
+client) shows its author, time and first line, and "… Show message". It is
+theirs on every device: the daemon keeps the set (`SET_COLLAPSED`,
+`collapsed_messages`) and replays it with history, and tells their other
+connections at once. Show message, or Expand in the menu, opens it and clears
+the flag.
+
+A message longer than **25 lines or 3,000 characters**, as drawn, is
+**auto-collapsed** for everyone: its first **10 lines** and "Show more". Opening
+it is this view's alone — nothing is stored or sent — and lasts until the
+client closes. The rule is the clients', the same in both: the graphical client
+measures lines at the width the message is drawn at; the terminal client counts
+the rows a body wraps to, and `m` shows it whole. A cut message is cut on its
+prefix, so formatting still applies to what shows.
+
+Both are reachable without a pointer: the message's menu (Ctrl+Up to the
+message, Shift+F10) offers Collapse or Expand, and each "Show …" is a button
+for assistive technology (`message.<id>.expand`).
+
 ### Typography (graphical clients) — ARCH-97
 
 The platform owns the **family**, we own the **scale**. Full reasoning is in

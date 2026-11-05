@@ -1309,6 +1309,18 @@ static void test_admin_frames(void) {
         oc_revoke_session out;
         CHECK(oc_decode_revoke_session(&p, &out) == OC_OK && out.session_id == 77);
     }
+    {   /* A message folded away, and the word to my other devices. */
+        oc_set_collapsed in = { 4242, 1 };
+        ROUNDTRIP(oc_encode_set_collapsed(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_COLLAPSED, h, p);
+        oc_set_collapsed out;
+        CHECK(oc_decode_set_collapsed(&p, &out) == OC_OK && out.message_id == 4242 && out.on == 1);
+    }
+    {
+        oc_set_collapsed in = { 4242, 0 };
+        ROUNDTRIP(oc_encode_collapsed_updated(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_COLLAPSED_UPDATED, h, p);
+        oc_set_collapsed out = { 0, 9 };
+        CHECK(oc_decode_set_collapsed(&p, &out) == OC_OK && out.message_id == 4242 && out.on == 0);
+    }
     {   /* A removed member brought back (REQ-033). */
         oc_enable_user in = { 43 };
         ROUNDTRIP(oc_encode_enable_user(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ENABLE_USER, h, p);

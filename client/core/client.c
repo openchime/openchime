@@ -618,6 +618,13 @@ void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op) {
     cmd->message_id = message_id; cmd->op = op;
     oc_queue_push(&c->cmds, cmd);
 }
+void oc_client_set_collapsed(oc_client *c, uint64_t message_id, int on) {
+    if (!c || !message_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_COLLAPSED);
+    if (!cmd) return;
+    cmd->message_id = message_id; cmd->op = on ? 1 : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
 void oc_client_list_saved(oc_client *c) {
     if (!c) return;
     oc_model_saved_begin(&c->model);

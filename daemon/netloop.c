@@ -3295,6 +3295,15 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_COLLAPSED) {
+            oc_set_collapsed sc;
+            if (oc_decode_set_collapsed(&p, &sc) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_COLLAPSED, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = sc.message_id; j->save_op = sc.on ? 1 : 0;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_ATTACH_MEDIA_SET) {
             oc_attach_media_set ms;
             if (oc_decode_attach_media_set(&p, &ms) != OC_OK) return -1;
@@ -6965,6 +6974,19 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
+    case OC_RES_COLLAPSED: {
+        /* The person's own set, so every device of theirs shows it; nobody
+         * else hears of it. */
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_set_collapsed sc = { r->message_id, r->save_op };
+        oc_encode_collapsed_updated(&w, OC_PROTOCOL_VERSION, &sc);
+        size_t len = w.len;
+        for (conn *t = user_head(r->user_id), *next; t; t = next) {
+            next = t->u_next;
+            send_bytes(ep, conns, t->fd, g_enc, len);
+        }
+        break;
+    }
     case OC_RES_SAVED_LIST: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
@@ -8402,7 +8424,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
  * link previews, the forwards, the actions and the polls for them -- a
  * BROADCAST carries none of those, so a replay without them loses each on
  * reload -- then BACKFILL_DONE. */
-enum { BF_MSG, BF_META, BF_PIN, BF_SAVED, BF_REACT, BF_UNFURL, BF_FWD, BF_ACT, BF_POLL, BF_DONE, BF_END };
+enum { BF_MSG, BF_META, BF_PIN, BF_SAVED, BF_COLLAPSED, BF_REACT, BF_UNFURL, BF_FWD, BF_ACT, BF_POLL, BF_DONE, BF_END };
 
 /* Encode the head result's next frame into g_enc: its length, or 0 when the
  * result has no frames left. */
@@ -8444,12 +8466,21 @@ static size_t backfill_next(conn *c) {
         }
         case BF_SAVED: {
             /* Private (REQ-231): only down this connection, keyed to the requester. */
-            if (i >= r->n_replay) { c->bf_phase = BF_REACT; c->bf_i = 0; continue; }
+            if (i >= r->n_replay) { c->bf_phase = BF_COLLAPSED; c->bf_i = 0; continue; }
             c->bf_i = i + 1;
             if (!r->replay[i].saved) continue;
             oc_saved_updated su = { r->replay[i].message_id, OC_SAVE_ADD,
                                     r->replay[i].saved_at };
             oc_encode_saved_updated(&w, OC_PROTOCOL_VERSION, &su);
+            return w.len;
+        }
+        case BF_COLLAPSED: {
+            /* As private as saved (migration 0070): this connection only. */
+            if (i >= r->n_replay) { c->bf_phase = BF_REACT; c->bf_i = 0; continue; }
+            c->bf_i = i + 1;
+            if (!r->replay[i].collapsed) continue;
+            oc_set_collapsed sc = { r->replay[i].message_id, 1 };
+            oc_encode_collapsed_updated(&w, OC_PROTOCOL_VERSION, &sc);
             return w.len;
         }
         case BF_REACT: {

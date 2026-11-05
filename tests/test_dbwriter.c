@@ -2429,7 +2429,9 @@ static void test_index_mentions(void) {
                            /* 0068's read receipts. */
                            "ALTER TABLE users DROP COLUMN share_receipts; ALTER TABLE users DROP COLUMN receipts_since_ms;"
                            /* 0069's invitation time. */
-                           "ALTER TABLE invites DROP COLUMN created_at_ms;",
+                           "ALTER TABLE invites DROP COLUMN created_at_ms;"
+                           /* 0070's collapsed messages. */
+                           "DROP TABLE collapsed_messages;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -10168,6 +10170,75 @@ static void test_spoiler_excerpts(void) {
     cleanup_db(path);
 }
 
+/* Collapsed messages (migration 0070): folded and opened, for the person who
+ * did it and nobody else, replayed in their backfill, and gone with the
+ * message. The fan-out to their other connections is itest_netloop's. */
+static oc_dbres *set_collapsed(oc_dbwriter *w, uint64_t uid, uint64_t mid, int on) {
+    oc_job *j = oc_job_new(OC_JOB_SET_COLLAPSED, 61);
+    j->user_id = uid; j->message_id = mid; j->save_op = (uint8_t)on;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static int replay_collapsed(oc_dbwriter *w, uint64_t uid, uint64_t mid) {
+    oc_dbres *r = backfill(w, uid, OC_DEFAULT_CHANNEL, 0);
+    int found = -1;
+    for (size_t i = 0; r && i < r->n_replay; i++)
+        if (r->replay[i].message_id == mid) found = r->replay[i].collapsed;
+    oc_dbres_free(r);
+    return found;
+}
+static void test_collapsed(void) {
+    const char *path = tdb("collapsed.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "co-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob = reg(w, "co-bob", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0x6C, sizeof idem);
+    uint64_t mid = send_msg(w, alice, idem, "a very long log paste");
+    CHECK(mid);
+
+    oc_dbres *r = set_collapsed(w, bob, mid, 1);
+    CHECK(r && r->type == OC_RES_COLLAPSED && r->user_id == bob && r->message_id == mid && r->save_op == 1);
+    oc_dbres_free(r);
+    CHECK(replay_collapsed(w, bob, mid) == 1);      /* his backfill carries it */
+    CHECK(replay_collapsed(w, alice, mid) == 0);    /* hers does not: it is his */
+    r = set_collapsed(w, bob, mid, 1);               /* again: no change, the same answer */
+    CHECK(r && r->type == OC_RES_COLLAPSED && r->save_op == 1);
+    oc_dbres_free(r);
+
+    r = set_collapsed(w, bob, mid, 0);
+    CHECK(r && r->type == OC_RES_COLLAPSED && r->save_op == 0);
+    oc_dbres_free(r);
+    CHECK(replay_collapsed(w, bob, mid) == 0);
+
+    /* Refused: no such message. */
+    r = set_collapsed(w, bob, mid + 1000, 1);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
+    oc_dbres_free(r);
+
+    /* Gone with the message. */
+    r = set_collapsed(w, bob, mid, 1);
+    oc_dbres_free(r);
+    oc_job *j = oc_job_new(OC_JOB_DELETE, 62);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = mid;
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    oc_dbwriter_stop(w);
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    int left = -1;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM collapsed_messages;", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) left = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    CHECK(left == 0);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
@@ -10207,6 +10278,7 @@ int run_dbwriter_tests(void) {
     test_invite_created_at();
     test_shared_invite();
     test_status_and_profile();
+    test_collapsed();
     test_custom_emoji();
     test_group_dm();
     test_avatar();

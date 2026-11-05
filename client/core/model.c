@@ -2388,6 +2388,16 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 break;
             }
         break;
+    case OC_EV_COLLAPSED:
+        /* Mine on every device: the message itself, wherever it is held. */
+        for (size_t ci = 0; ci < m->n_channels; ci++) {
+            oc_channel *c = &m->channels[ci];
+            for (size_t i = 0; i < c->n_msgs; i++)
+                if (c->msgs[i].message_id == e->message_id) { c->msgs[i].collapsed = e->op ? 1 : 0; break; }
+        }
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id) { m->thread_msgs[i].collapsed = e->op ? 1 : 0; break; }
+        break;
     case OC_EV_SAVED_UPDATED:
         /* Mark the message itself, in every list that can hold it, so the
          * transcript can show a bookmark without the Later view ever being

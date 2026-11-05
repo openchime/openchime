@@ -2473,6 +2473,48 @@ static void test_get_profile(int port, const uint8_t *pin) {
     client_close(&a);
 }
 
+/* A message folded away (SET_COLLAPSED) is told to every connection of the
+ * person who folded it -- the one that asked and their other device -- and to
+ * nobody else; opening it is told the same way. */
+static void test_collapsed_sync(int port, const uint8_t *pin) {
+    client a1, a2, other;
+    uint64_t ua = 0, uo = 0;
+    CHECK(client_open(&a1, port, pin) == 0 && do_handshake(&a1) == 0 && do_auth(&a1, "sid", "pw-sid", &ua) == 0);
+    CHECK(client_open(&a2, port, pin) == 0 && do_handshake(&a2) == 0 && do_auth(&a2, "sid", "pw-sid", &ua) == 0);
+    CHECK(client_open(&other, port, pin) == 0 && do_handshake(&other) == 0 &&
+          do_auth(&other, "alice", "pw-alice", &uo) == 0);
+    uint8_t idem[OC_IDEM_SIZE]; memset(idem, 0x6D, sizeof idem);
+    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send sd = {0}; sd.channel_id = 1; memcpy(sd.idem, idem, OC_IDEM_SIZE);
+    sd.body = oc_slice_str("a long log to fold");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK && write_all(&a1.conn, buf, w.len) == 0);
+    oc_header h; oc_rbuf p;
+    CHECK(read_type(&a1, OC_MSG_SEND_ACK, &h, &p) == 0);
+    oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK);
+
+    for (int on = 1; on >= 0; on--) {
+        oc_set_collapsed sc = { ack.message_id, (uint8_t)on }, got;
+        oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_set_collapsed(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK && write_all(&a1.conn, buf, w.len) == 0);
+        CHECK(read_type(&a1, OC_MSG_COLLAPSED_UPDATED, &h, &p) == 0 && oc_decode_set_collapsed(&p, &got) == OC_OK);
+        CHECK(got.message_id == ack.message_id && got.on == on);
+        CHECK(read_type(&a2, OC_MSG_COLLAPSED_UPDATED, &h, &p) == 0 && oc_decode_set_collapsed(&p, &got) == OC_OK);
+        CHECK(got.message_id == ack.message_id && got.on == on);
+    }
+    /* alice heard the message, and nothing of its folding: her next frame,
+     * asked for now, is the answer to her own question. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_list_saved(&w, OC_PROTOCOL_VERSION) == OC_OK && write_all(&other.conn, buf, w.len) == 0);
+    int heard = 0;
+    for (;;) {
+        if (read_frame(&other, &h, &p) != 0) break;
+        if (h.msg_type == OC_MSG_COLLAPSED_UPDATED) heard = 1;
+        if (h.msg_type == OC_MSG_SAVED) break;
+    }
+    CHECK(!heard);
+    client_close(&other); client_close(&a2); client_close(&a1);
+}
+
 /* One device signed out on its own (REQ-182): its connection closes, the list
  * comes back without it, the asker's own goes on, and a session id that is not
  * the asker's does nothing. Sessions in use have last_seen_ms written in
@@ -8187,6 +8229,7 @@ int run_netloop_tests(void) {
         test_reset_frame(arg.port, pin);
         test_revoke_one_session(arg.port, pin);
         test_get_profile(arg.port, pin);
+        test_collapsed_sync(arg.port, pin);
         test_groups_vertical(arg.port, pin);
         test_groups_unasked(arg.port, pin);
         test_http_stack();

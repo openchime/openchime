@@ -200,6 +200,7 @@ enum {
                               size/reclaimed + body=filename, emoji=mime */
     OC_EV_FILES_END,       /* the files list is complete: channel_id + count */
     OC_EV_SAVED_UPDATED,   /* a message was saved/unsaved: message_id + op (REQ-231) */
+    OC_EV_COLLAPSED,       /* a message folded away (op 1) or opened (op 0) for me: message_id + op */
     OC_EV_SAVED_MSG,       /* one saved item (streamed) */
     OC_EV_SAVED_END,       /* the saved list is complete: count */
     /* Drafts (REQ-223). One draft — a list entry AND the device-sync push, which
@@ -486,6 +487,7 @@ enum {
     OC_CMD_UPDATE_CHANNEL, /* set topic / rename / archive / unarchive `channel_id`:
                               op = OC_CHUP_*, body = the new topic or name (REQ-034/035/036) */
     OC_CMD_SAVE_ITEM,      /* save/unsave `message_id`: op = add/remove (REQ-231) */
+    OC_CMD_SET_COLLAPSED,  /* fold `message_id` away for me (op 1) or open it (op 0) */
     OC_CMD_LIST_SAVED,     /* my saved items */
     OC_CMD_LIST_ACTIVITY,  /* what involved me — or what I have not read: op = OC_ACTF_* (REQ-139) */
     OC_CMD_HISTORY_AROUND, /* the messages around `message_id` in `channel_id` (REQ-232) */

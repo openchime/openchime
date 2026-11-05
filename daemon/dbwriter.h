@@ -292,7 +292,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* READ_RECEIPTS (REQ-090): receipts_op 0/1 sets whether I share my
         * read position, OC_RECEIPTS_ASK asks. Answered OC_RES_READ_RECEIPTS. */
        OC_JOB_READ_RECEIPTS = 147,
-       OC_JOB_DEACTIVATE_SELF = 148 };   /* a person deactivates their own account */
+       OC_JOB_DEACTIVATE_SELF = 148,   /* a person deactivates their own account */
+       /* Fold a message away for its reader, or open it (message_id, save_op
+        * 1 or 0): a per-person set, told to all of their connections. */
+       OC_JOB_SET_COLLAPSED = 149 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -776,7 +779,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_READ_RECEIPTS = 122,
        /* A roster row everyone connected is told (its `ulist`, with `joined`),
         * and nothing else: the workspace's own sender, made by this job. */
-       OC_RES_ROSTER_ROW = 123 };
+       OC_RES_ROSTER_ROW = 123,
+       /* A message folded or opened (message_id, save_op): to every
+        * connection of user_id. */
+       OC_RES_COLLAPSED = 124 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -1006,6 +1012,9 @@ typedef struct {
      * into a SAVED_UPDATED, exactly as pins do above. */
     uint8_t  saved;
     uint64_t saved_at;
+    /* Folded away by the REQUESTING user, likewise private to them: the net
+     * thread replays it as a COLLAPSED_UPDATED down this connection. */
+    uint8_t  collapsed;
     uint8_t  kind;         /* OC_MSG_KIND_*: a call event is drawn as history (REQ-304) */
     /* Replays and THREAD: its send stored a broadcast mention row (REQ-221),
      * whatever the body says now; the byte BROADCAST and THREAD_REPLY carry. */

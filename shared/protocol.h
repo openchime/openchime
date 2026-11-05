@@ -594,6 +594,8 @@ typedef enum {
     OC_MSG_EDIT_POLL            = 0x0114, /* C->S, the author changes a poll: options and settings until the first vote */
     OC_MSG_DEACTIVATE_SELF      = 0x0115, /* C->S, no payload: deactivate my own account, as a removal does */
     OC_MSG_GET_PROFILE          = 0x0116, /* C->S, a member's whole profile, 0 for mine: answered with PROFILE_INFO */
+    OC_MSG_SET_COLLAPSED        = 0x0117, /* C->S, fold a message away for me, or open it again */
+    OC_MSG_COLLAPSED_UPDATED    = 0x0118, /* S->C, to my connections: a message folded or opened; and replayed */
     OC_MSG_WORKSPACE_SETTINGS   = 0x0119, /* S->C, read-only: the workspace settings clients act on, after WORKSPACE_INFO */
     OC_MSG_READ_RECEIPTS        = 0x011A, /* both: whether I share my read receipts; C->S sets or asks, S->C tells */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
@@ -1250,6 +1252,10 @@ typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id;
                  oc_slice attach_name;
                  uint8_t action;   /* as oc_pinned_msg's (REQ-058) */ } oc_saved_msg;
 typedef struct { uint32_t count; } oc_saved;
+/* Collapsed messages: one person's, on every device of theirs. SET_COLLAPSED
+ * folds a message away (on 1) or opens it (on 0); COLLAPSED_UPDATED says so to
+ * each of that person's connections, and backfill replays their folded ones. */
+typedef struct { uint64_t message_id; uint8_t on; } oc_set_collapsed;
 
 /* Activity (REQ-139). `actor_id` is who did the thing; `text` is the message
  * body for a mention or reply, and the emoji for a reaction. */
@@ -1894,6 +1900,8 @@ oc_result oc_encode_saved_updated(oc_wbuf *w, uint16_t version, const oc_saved_u
 oc_result oc_encode_list_saved(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_saved_msg(oc_wbuf *w, uint16_t version, const oc_saved_msg *m);
 oc_result oc_encode_saved(oc_wbuf *w, uint16_t version, const oc_saved *m);
+oc_result oc_encode_set_collapsed(oc_wbuf *w, uint16_t version, const oc_set_collapsed *m);
+oc_result oc_encode_collapsed_updated(oc_wbuf *w, uint16_t version, const oc_set_collapsed *m);
 oc_result oc_encode_list_activity(oc_wbuf *w, uint16_t version, uint8_t filter);
 oc_result oc_decode_list_activity(oc_rbuf *p, uint8_t *filter);
 oc_result oc_encode_activity_entry(oc_wbuf *w, uint16_t version, const oc_activity_entry *m);
@@ -2197,6 +2205,7 @@ oc_result oc_decode_save_item(oc_rbuf *p, oc_save_item *m);
 oc_result oc_decode_saved_updated(oc_rbuf *p, oc_saved_updated *m);
 oc_result oc_decode_saved_msg(oc_rbuf *p, oc_saved_msg *m);
 oc_result oc_decode_saved(oc_rbuf *p, oc_saved *m);
+oc_result oc_decode_set_collapsed(oc_rbuf *p, oc_set_collapsed *m);   /* both frames */
 oc_result oc_decode_activity_entry(oc_rbuf *p, oc_activity_entry *m);
 oc_result oc_decode_activity(oc_rbuf *p, oc_activity *m);
 oc_result oc_decode_channel_info(oc_rbuf *p, oc_channel_info *m);
