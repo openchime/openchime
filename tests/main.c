@@ -5,6 +5,7 @@
  * integration suites (TLS, event loop) live here too; the black-box,
  * the end-to-end run against a real daemon is the build job of ci.yml. */
 
+#include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 #include "config.h"
@@ -306,12 +307,43 @@ static const struct suite { const char *name; int (*fn)(void); } SUITES[] = {
 #undef S
 enum { N_SUITES = sizeof SUITES / sizeof SUITES[0] };
 
+/* Which suites start threads (TESTING.md §2.4). Only those on TSAN_SUITES
+ * (scripts/test/lib/common.sh) run under ThreadSanitizer, and whether a suite
+ * starts one depends on the code it calls, not on words in its file -- so the
+ * plain test binary is linked with -Wl,--wrap=pthread_create, and every thread
+ * a suite starts is seen here. The ThreadSanitizer binary is not wrapped: its
+ * __real_pthread_create stays unresolved (weak) and this is never called. */
+static volatile int g_thread_started;
+extern int __real_pthread_create(pthread_t *t, const pthread_attr_t *a,
+                                 void *(*fn)(void *), void *arg) __attribute__((weak));
+int __wrap_pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), void *arg);
+int __wrap_pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), void *arg) {
+    __atomic_store_n(&g_thread_started, 1, __ATOMIC_RELAXED);
+    return __real_pthread_create(t, a, fn, arg);
+}
+
+/* OC_TSAN_SUITES, the list the scripts pass in from TSAN_SUITES; unset, a
+ * suite's threads are not checked. */
+static const char *g_tsan_suites;
+
+/* A suite that started a thread and is not on the list would never run under
+ * the sanitizer: a failure, naming where to add it. */
+static int thread_unlisted(const char *name) {
+    if (!__atomic_load_n(&g_thread_started, __ATOMIC_RELAXED) || !g_tsan_suites || !*g_tsan_suites ||
+        listed(g_tsan_suites, name))
+        return 0;
+    printf("  FAIL %s starts a thread but is not on TSAN_SUITES (scripts/test/lib/common.sh)\n", name);
+    return 1;
+}
+
 /* One suite in this process, named first, so the output says what was running
  * when it died. */
 static int run_here(const struct suite *su) {
     g_suite = su->name;
     double t0 = elapsed_s();
+    __atomic_store_n(&g_thread_started, 0, __ATOMIC_RELAXED);
     int failed = su->fn();
+    failed += thread_unlisted(su->name);
     record_time(su->name, elapsed_s() - t0);
     return failed;
 }
@@ -418,6 +450,7 @@ int main(void) {
     oc_config_load(NULL, 0);   /* the writer reads its configuration */
     g_only = getenv("OC_TEST_ONLY");
     g_except = getenv("OC_TEST_EXCEPT");
+    g_tsan_suites = getenv("OC_TSAN_SUITES");
     const char *rep = getenv("OC_TEST_REPEAT");
     int rounds = rep && *rep ? atoi(rep) : 1;
     if (rounds < 1) rounds = 1;

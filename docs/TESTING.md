@@ -694,8 +694,10 @@ code runs threads (CI runs the halves in parallel jobs, `PART=threads` and
   player — under ThreadSanitizer (address randomization off, `tests/tsan.supp`
   for the one test-only reconfiguration). The list is `TSAN_SUITES`
   (`scripts/test/lib/common.sh`); a suite that starts a thread belongs on it.
-  Two that do are not on it yet, `run_relaykeys_tests` and `run_summary_tests`,
-  so they run only in the plain half and never under the sanitizer. The sanitizer run
+  That is checked at run time, not read from the source: the plain test binary
+  is linked with `-Wl,--wrap=pthread_create`, the scripts that run it pass the
+  list in `OC_TSAN_SUITES`, and a suite that starts a thread and is not on it
+  fails, naming itself and the list (`tests/main.c`). The sanitizer run
   judges races, never speed: a limit on how fast code runs — wall-clock time, or
   one timing against another — is a `CHECK_SPEED` (`tests/check.h`), asserted in
   the ordinary build and not under the sanitizer, which slows code five to
@@ -1160,7 +1162,7 @@ and on the stripped release binary and the installed `.deb`
 (`make test-release PART=packages`); the speech suites (`tts_worker`, `stt`,
 `ttskit`) run in `make test-merge`.
 
-A new suite is its declaration and one `S(run_<name>_tests)` line in `tests/main.c`; if its code starts a thread it also goes on `TSAN_SUITES` in `scripts/test/lib/common.sh`, and if it is slow, on `SLOW_SUITES`.
+A new suite is its declaration and one `S(run_<name>_tests)` line in `tests/main.c`; if its code starts a thread it also goes on `TSAN_SUITES` in `scripts/test/lib/common.sh` (`make test` fails it otherwise, §2.4), and if it is slow, on `SLOW_SUITES`.
 
 ---
 
