@@ -158,9 +158,9 @@ has moved (`scripts/check/toolchains.sh`).
 
 | Toolchain | Version | Script | Builds | License |
 |-----------|---------|--------|--------|---------|
-| **zig** (its bundled clang and lld) | 0.13.0 | `scripts/build/zig.sh` | the release's Linux daemon against glibc 2.34 (`make RELEASE=1`), the arm64 daemon cross-built from x86 (`make ARCH=aarch64`), and CI's second-compiler pass (`make test-merge`) | MIT |
-| **Emscripten** (emsdk) | 6.0.8 | `scripts/build/emsdk.sh` | the web client (`make web`) and the loader compiled into a `WEB=1` daemon; brings its own Node for the web client's checks (`make test-merge`) | MIT / NCSA |
-| **llvm-mingw** (clang, lld, LLVM binutils, mingw-w64 headers and CRT) | 20261006 | `scripts/build/llvm_mingw.sh` | the Windows GUI and TUI and their libraries (`make windows`), through the `x86_64-w64-mingw32-*` names | Apache-2.0 with LLVM exception; mingw-w64 under its own permissive terms |
+| **zig** (its bundled clang and lld) | 0.17.0 | `scripts/build/zig.sh` | the release's Linux daemon against glibc 2.34 (`make RELEASE=1`), the arm64 daemon cross-built from x86 (`make ARCH=aarch64`), and CI's second-compiler pass (`make test-merge`) | MIT |
+| **Emscripten** (emsdk) | 6.0.13 | `scripts/build/emsdk.sh` | the web client (`make web`) and the loader compiled into a `WEB=1` daemon; brings its own Node for the web client's checks (`make test-merge`) | MIT / NCSA |
+| **llvm-mingw** (clang, lld, LLVM binutils, mingw-w64 headers and CRT) | 20261020 | `scripts/build/llvm_mingw.sh` | the Windows GUI and TUI and their libraries (`make windows`), through the `x86_64-w64-mingw32-*` names | Apache-2.0 with LLVM exception; mingw-w64 under its own permissive terms |
 | **makemsix** (Microsoft msix-packaging, with CMake 3.31.6 to build it) | commit `25a65f5` | `scripts/build/makemsix.sh` | the Windows client's MSIX, on Linux (`packaging/build-windows.sh`); built from source because no release compiles with a current clang | MIT (makemsix); BSD-3-Clause (CMake) |
 | **WinShell** (NSIS plugin) | the NSIS wiki's `WinShell.zip`, SHA-256 pinned | `scripts/build/nsis_plugins.sh` | the installer's Start-menu shortcut AppUserModelID (`packaging/windows/openchime.nsi`); `makensis` itself is Ubuntu's `nsis` | zlib |
 | **jsign** | 7.6 | `scripts/build/jsign.sh` | Authenticode signing of the Windows binaries and installer against Azure Trusted Signing, on Linux (`scripts/release/sign_windows.sh`) | Apache-2.0 |
@@ -174,7 +174,7 @@ has moved (`scripts/check/toolchains.sh`).
 | **Kitten TTS mini** | 0.8 | The read-aloud voice model: `kitten_tts_mini_v0_8.onnx` and `voices.npz`, converted to `.ort` and **shipped beside the daemon** as data | Daemon (read-aloud, ARCH-111) | https://huggingface.co/KittenML/kitten-tts-mini-0.8 | Apache-2.0 |
 | **Moonshine Tiny Streaming (English)** | CDN directory `quantized_26_08_21` | The voice-input recognizer: nine files — the frontend (model and weights), encoder, adapter, cross-attention and decoder graphs as int8 `.ort`, `tokenizer.bin`, `streaming_config.json` and the licence, about 45 MB — **shipped beside the daemon** as data in `stt/` | Daemon (voice input, ARCH-112) | https://github.com/moonshine-ai/moonshine | MIT (English models; the legacy non-streaming models for other languages are under a non-commercial licence and are not used) |
 | **Phonetisaurus** (+ OpenFst, MITLM in its wheel) | 0.3.0 | Trains ttskit's guesser. **Build tool for maintainers only**: never linked, never shipped, not needed to build OpenChime | `scripts/build/ttskit_data.sh` | https://github.com/AdolfVonKleist/Phonetisaurus | BSD-3-Clause (OpenFst Apache-2.0, MITLM MIT) |
-| **libc++** (LLVM, zig's bundled copy) | zig 0.13.0's | The C++ runtime ONNX Runtime and llama.cpp are compiled against in a release build, linked statically | Daemon (release build, with read-aloud, voice input or summaries) | https://github.com/llvm/llvm-project | Apache-2.0 WITH LLVM-exception (no notice required in binary form) |
+| **libc++** (LLVM, zig's bundled copy) | zig 0.17.0's | The C++ runtime ONNX Runtime and llama.cpp are compiled against in a release build, linked statically | Daemon (release build, with read-aloud, voice input or summaries) | https://github.com/llvm/llvm-project | Apache-2.0 WITH LLVM-exception (no notice required in binary form) |
 | **CMUdict** | commit `74790861` | Source of ttskit's pronunciation data, which is generated from it and **committed** (`ttskit/data/en-US/`, its notice in `ttskit/data/CMUDICT-LICENSE`) | Daemon (read-aloud) | https://github.com/cmusphinx/cmudict | BSD-style (two clauses) |
 
 Fetched + built by `scripts/build/mbedtls.sh` from the official GitHub release
@@ -358,7 +358,7 @@ The Windows GUI is the portable application (`client/gui/app/`, ARCH-80) over
 
 | Item | Version | Note | License |
 |------|---------|------|---------|
-| `scripts/build/llvm_mingw.sh`, `third_party/llvm-mingw-20261006` | 20261006 | The toolchain itself (clang, lld, LLVM binutils, mingw-w64 headers and CRT, UCRT), fetched by make | Apache-2.0 with LLVM exception |
+| `scripts/build/llvm_mingw.sh`, `third_party/llvm-mingw-20261020` | 20261020 | The toolchain itself (clang, lld, LLVM binutils, mingw-w64 headers and CRT, UCRT), fetched by make | Apache-2.0 with LLVM exception |
 | `scripts/build/mbedtls_windows.sh`, `third_party/mbedtls-3.6.2-win` | 3.6.2 | Windows cross-compile; used by `make windows` | Apache-2.0 |
 | `scripts/build/sdl3_windows.sh`, `third_party/sdl3-3.4.14-win` | 3.4.14 | Windows cross-compile (static, CMake invoked by the script); used by `make windows` | zlib |
 | `scripts/build/libvpx.sh windows`, `third_party/libvpx-1.17.0-win` | 1.17.0 | Windows cross-compile (static, nasm); used by `make windows` | BSD-3-Clause |

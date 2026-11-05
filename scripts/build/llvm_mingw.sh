@@ -9,15 +9,15 @@
 # Windows ships. Needs curl and xz.
 set -euo pipefail
 
-LLVM_MINGW_VERSION="${LLVM_MINGW_VERSION:-20261006}"
+LLVM_MINGW_VERSION="${LLVM_MINGW_VERSION:-20261020}"
 HOST_ARCH="$(uname -m)"
 case "$HOST_ARCH" in x86_64|aarch64) ;; *) echo "llvm_mingw.sh: no pinned llvm-mingw for a $HOST_ARCH host" >&2; exit 1 ;; esac
 
 # Known-good SHA-256 of each host's tarball (the ucrt-ubuntu-22.04 builds run
 # on any glibc 2.35+ host). Bump with LLVM_MINGW_VERSION; a version without a
 # matching sum is refused rather than fetched unverified.
-LLVM_MINGW_SHA256_20261006_x86_64="5f9c6ed95b2d4bdb2869a488c5fd5857fbdabcf288a0aa3eb1da43f6a08d8ab4"
-LLVM_MINGW_SHA256_20261006_aarch64=""
+LLVM_MINGW_SHA256_20261020_x86_64="55064b60b991a1e1e8090b8c2f84e82b22cfe5903d12c159d65064cf5e8ae335"
+LLVM_MINGW_SHA256_20261020_aarch64=""
 _sum_var="LLVM_MINGW_SHA256_${LLVM_MINGW_VERSION}_${HOST_ARCH}"
 LLVM_MINGW_SHA256="${LLVM_MINGW_SHA256:-${!_sum_var:-}}"
 if [ -z "$LLVM_MINGW_SHA256" ]; then
