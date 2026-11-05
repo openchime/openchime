@@ -265,8 +265,14 @@ static int do_handshake(oc_tls_conn *c, int fd, atomic_int *stop) {
     }
 }
 
+/* Frames written, on every connection of this process: what a test checks to say
+ * nothing was sent (oc_net_frames_written). */
+static atomic_ullong g_frames_written;
+unsigned long long oc_net_frames_written(void) { return atomic_load(&g_frames_written); }
+
 /* Write all bytes, waiting on the socket as needed. 0 ok, -1 error. */
 static int write_all(oc_tls_conn *c, int fd, const uint8_t *buf, size_t len, atomic_int *stop) {
+    atomic_fetch_add(&g_frames_written, 1);
     size_t sent = 0;
     while (sent < len) {
         if (*stop) return -1;

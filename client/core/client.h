@@ -632,6 +632,10 @@ int oc_fingerprint_format(const char *hex, int per_line, char *out, size_t cap);
  * non-zero — otherwise the user silently loses what they typed. */
 int oc_client_outbox_pending(oc_client *c);
 
+/* Frames this process has written to its connections, for a test to say that
+ * nothing was sent. */
+unsigned long long oc_client_frames_written(void);
+
 /* Stop the network thread, drain remaining events, and free everything. */
 void oc_client_stop(oc_client *c);
 

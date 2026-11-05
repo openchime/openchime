@@ -31,6 +31,10 @@ typedef struct { char id[64]; char label[96]; uint8_t kind; } oc_signin_source;
  * sign-in connection names it; NULL names `host`. */
 int oc_net_probe(const char *workspace, const char *host, int port, oc_signin_source *out, int max);
 
+/* How many frames this process has written to its connections, counted as each
+ * write begins. */
+unsigned long long oc_net_frames_written(void);
+
 /* A certificate shown to the person to judge (ARCH-10): its fingerprint, and
  * the certificate itself for a frontend that shows it (der_len 0 if it was
  * larger than OC_CERT_DER_MAX). */

@@ -1502,6 +1502,21 @@ set. Consequences worth knowing before touching it:
   across whitespace — described with the dialect in
   [MARKDOWN.md](./MARKDOWN.md) §6, since it is a property of how the editor
   keeps markup out of sight rather than of this window plumbing.
+- **Preview shows the draft as it will read** (Ctrl+Shift+P, or Preview at the
+  right of the formatting row; in plain text, which has no such row, just before
+  Send). The text `ed_md_all()` would send — each table
+  card its Markdown — is laid out by `body_layout()` and drawn by `body_draw()`,
+  the transcript's own renderer, in place of the field, so what the preview
+  shows is what the conversation will. The field is only hidden: its text,
+  caret and selection stay as they were, and no key, paste or click edits it
+  until Edit (or Esc) brings it back. Enter or Send sends from the preview.
+  Previewing writes nothing to the connection: no typing notice, since nothing
+  is edited, and what would otherwise go out by itself waits for the preview to
+  close: the draft's save, a custom emoji's or an attachment's image not yet
+  fetched, older messages, and the read marker. A person's own action elsewhere
+  in the window (a reaction, say) still goes, being theirs. The terminal client has no preview: it shows a body as
+  written ([MARKDOWN.md](./MARKDOWN.md) §5), so its message box is already
+  what the conversation will show.
 
 ### Typography (graphical clients) — ARCH-97
 

@@ -2422,6 +2422,19 @@ static rectf g_at_btn;            /* composer mention button */
 /* The New message pane's own copies (REQ-229). */
 static rectf g_nm_send, g_nm_sched, g_nm_ed, g_nm_attach, g_nm_emoji, g_nm_at;
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
+/* The composer's Preview (Ctrl+Shift+P): the draft drawn as the transcript
+ * draws a message, by the same renderer, in place of the field. The field keeps
+ * its text, caret and selection underneath, and takes no edits until Edit;
+ * nothing is sent until Send. The conversation's composer only, and only while
+ * the conversation it was opened in is the one shown. */
+static int      g_preview;
+static uint64_t g_preview_ch;
+static rectf    g_preview_btn;
+static float    g_preview_h;            /* the rendered draft's height, lines and */
+static int      g_preview_lines, g_preview_tabs;   /* tables, for the dump */
+static int      g_preview_held;         /* images it did not ask for, for the dump */
+static void preview_set(oc_win *hwnd, int on);   /* fwd */
+static void preview_draw(gfx *rt, rectf box);     /* fwd */
 
 /* The formatting toolbar (REQ-220). One entry per button, in the order
  * they are drawn — emphasis, then code, then the block forms, which is both
@@ -4092,6 +4105,9 @@ static int  g_caret_placed;            /* set by ed_caret_sync, cleared each pai
 static void avatar_want(uint64_t aid) {
     if (!aid || g_thumbs_off || g_thumb_pending || !g_client) return;
     if (thumb_get(NULL, aid, NULL, NULL) || thumb_failed(aid)) return;
+    /* Previewing sends nothing (CLIENT.md): it stays a placeholder, and the draw
+     * after the preview closes asks. */
+    if (g_preview) { g_preview_held++; return; }
     g_thumb_pending = aid;
     g_thumb_deadline = now_ms() + 8000;
     oc_client_fetch_attachment(g_client, aid);
@@ -6448,6 +6464,38 @@ static void body_draw_split(gfx *rt, const oc_msg *msg, mlay_ent *e, float tx, f
     }
 }
 
+/* A message body laid out by body_layout, drawn with its top left at tx,by:
+ * the text (split round its tables when it has any) and its custom emoji. The
+ * transcript's, and the composer's Preview's. Returns the height it took. */
+static float body_draw(gfx *rt, const oc_msg *msg, mlay_ent *body, float tx, float by,
+                       float content_w, float right) {
+    if (body->ntab) {
+        body_draw_split(rt, msg, body, tx, by, content_w, right);
+    } else if (body->tex) {
+        float sc = gfx_scale(rt);
+        gfx_rect dst = { tx, by, body->pw / sc, body->ph / sc };
+        gfx_ink(rt, body->rgb, ST_RASTER_PAD, ST_RASTER_PAD);
+        gfx_tex_draw(rt, body->tex, dst, 0.0f, 1.0f);
+    }
+    /* Custom emoji (REQ-072) composited into the boxes the layout
+     * reserved for them (ARCH-106) — the layout knows where it
+     * wrapped, so the rects are its own; below a table, moved down
+     * with the text. */
+    for (int i = 0; i < body->nbox; i++) {
+        float bty = mtab_down(body, body->box[i].y);
+        rectf box = rf(tx + body->box[i].x, by + bty,
+                       tx + body->box[i].x + body->box[i].w,
+                       by + bty + body->box[i].h);
+        if (!draw_avatar_image(rt, body->box_aid[i], box, 3.0f, 1)) {
+            avatar_want(body->box_aid[i]);
+            /* Until the bytes arrive the shortcode is the honest
+             * placeholder — a blank gap would look like a bug. */
+            draw_text(rt, ":\u2026:", g_meta, box, OC_COL_FAINT);
+        }
+    }
+    return body->mh;
+}
+
 static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
                          mlay_ent *body, float x0, float y, float content_w,
                          int grouped) {
@@ -6501,33 +6549,8 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
         /* Both halves of the pair have to agree with msg_height: draw nothing and
          * advance nothing when there is no text, or the attachment lines below
          * would sit a line lower than the space reserved for them. */
-        if (msg_has_body(msg)) {
-            if (body->ntab) {
-                body_draw_split(rt, msg, body, tx, by, content_w, x0 + content_w + AVA + 12);
-            } else if (body->tex) {
-                float sc = gfx_scale(rt);
-                gfx_rect dst = { tx, by, body->pw / sc, body->ph / sc };
-                gfx_ink(rt, body->rgb, ST_RASTER_PAD, ST_RASTER_PAD);
-                gfx_tex_draw(rt, body->tex, dst, 0.0f, 1.0f);
-            }
-            /* Custom emoji (REQ-072) composited into the boxes the layout
-             * reserved for them (ARCH-106) — the layout knows where it
-             * wrapped, so the rects are its own; below a table, moved down
-             * with the text. */
-            for (int i = 0; i < body->nbox; i++) {
-                float bty = mtab_down(body, body->box[i].y);
-                rectf box = rf(tx + body->box[i].x, by + bty,
-                               tx + body->box[i].x + body->box[i].w,
-                               by + bty + body->box[i].h);
-                if (!draw_avatar_image(rt, body->box_aid[i], box, 3.0f, 1)) {
-                    avatar_want(body->box_aid[i]);
-                    /* Until the bytes arrive the shortcode is the honest
-                     * placeholder — a blank gap would look like a bug. */
-                    draw_text(rt, ":\u2026:", g_meta, box, OC_COL_FAINT);
-                }
-            }
-            by += body->mh;
-        }
+        if (msg_has_body(msg))
+            by += body_draw(rt, msg, body, tx, by, content_w, x0 + content_w + AVA + 12);
     }
 
     /* What this message forwards (REQ-057), directly under the forwarder's own
@@ -6672,7 +6695,7 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
             gfx_tex *pbmp = at->poster_id ? thumb_get(rt, at->poster_id, &iw, &ih) : NULL;
             fill_round(rt, area, OC_R_CONTROL, 0x101010);
             if (pbmp) gfx_tex_draw(rt, pbmp, gr(area), OC_R_CONTROL, 1.0f);
-            else if (at->poster_id && !g_thumbs_off && !thumb_failed(at->poster_id) && !g_thumb_pending && g_client) {
+            else if (at->poster_id && !g_preview && !g_thumbs_off && !thumb_failed(at->poster_id) && !g_thumb_pending && g_client) {
                 g_thumb_pending = at->poster_id;
                 g_thumb_deadline = now_ms() + 8000;
                 oc_client_fetch_attachment(g_client, at->poster_id);
@@ -6744,7 +6767,7 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
                  * harness: that render is not the user's screen, and treating
                  * its forced miss as "not fetched yet" re-requested every image
                  * on every shot. */
-                if (!g_thumbs_off && !thumb_failed(at->id) && !g_thumb_pending && g_client) {
+                if (!g_preview && !g_thumbs_off && !thumb_failed(at->id) && !g_thumb_pending && g_client) {
                     g_thumb_pending = at->id;
                     g_thumb_deadline = now_ms() + 8000;
                     oc_client_fetch_attachment(g_client, at->id);
@@ -7268,7 +7291,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
      * single in-flight request and by a per-channel "no more" mark, so this
      * cannot turn a scroll into a request storm. */
     if (capture && *scroll_max > 0.5f && *scroll >= *scroll_max - 1.0f &&
-        nmsgs > 0 && g_sel && !g_hist_pending_chan) {
+        nmsgs > 0 && g_sel && !g_hist_pending_chan && !g_preview) {
         int done = 0;
         for (int k = 0; k < g_n_hist_exhausted; k++) if (g_hist_exhausted[k] == g_sel) done = 1;
         if (!done) {
@@ -8462,7 +8485,7 @@ static void nav_conversation(oc_win *hwnd, int delta, int unread_only) {
 enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
        ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_PTT, ACC_FREETALK, ACC_QUIT, ACC_CALL_MUTE, ACC_CALL_SHARE,
-       ACC_MARK_ALL_READ, ACC_TOAST_ACTION, ACC_HIST_BACK, ACC_HIST_FWD };
+       ACC_MARK_ALL_READ, ACC_TOAST_ACTION, ACC_HIST_BACK, ACC_HIST_FWD, ACC_PREVIEW };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -8510,6 +8533,7 @@ static const struct {
     /* The newest toast's action -- Undo, most often -- without reaching for the
      * pointer (REQ-290); plain Esc dismisses the newest toast. */
     { AM_CTRL | AM_SHIFT, 'Z',        ACC_TOAST_ACTION, "Ctrl+Shift+Z", "Do what the newest notice offers (Undo)" },
+    { AM_CTRL | AM_SHIFT, 'P',        ACC_PREVIEW, "Ctrl+Shift+P",     "Preview the message you are writing, or go back to editing it" },
     /* Ctrl and a digit, as the reference client binds it: the digit is the
      * workspace's place in the rail, counting from 1. Handled in the dispatcher
      * below rather than as nine rows, so this one is the documentation. */
@@ -8563,6 +8587,9 @@ static void accel_run(oc_win *hwnd, int action) {
             }
         break;
     case ACC_SEARCH:  search_open(hwnd);  break;
+    case ACC_PREVIEW:
+        if (main_is_conversation() && g_view != VIEW_NEWMSG && g_sel) preview_set(hwnd, !g_preview);
+        break;
     case ACC_KEYS:    if (g_keys_open) modal_finish(0); else modal_enter(hwnd, &g_keys_open); break;
     case ACC_PREFS:   if (g_prefs_open) modal_finish(0); else modal_enter(hwnd, &g_prefs_open); break;
     case ACC_LISTEN: {
@@ -13956,6 +13983,18 @@ static int ftray_click(oc_win *hwnd, float x, float y) {
     return 0;
 }
 
+/* Preview, or Edit while previewing: in the formatting row, or without one in
+ * the action row. */
+static void preview_btn_draw(gfx *rt, const char *label) {
+    int hot = in_rect(g_preview_btn, g_mouse_x, g_mouse_y);
+    if (g_preview) fill_round(rt, g_preview_btn, OC_R_CONTROL, OC_COL_ACCENT);
+    else if (hot)  fill_round(rt, g_preview_btn, OC_R_CONTROL, OC_COL_HOVER);
+    g_meta->align = ST_ALIGN_CENTER;
+    draw_text(rt, label, g_meta, g_preview_btn,
+              g_preview ? 0xFFFFFF : hot ? OC_COL_TEXT : OC_COL_MUTED);
+    g_meta->align = ST_ALIGN_LEFT;
+}
+
 static void draw_composer(gfx *rt, float x0, float w, float h) {
     float top = h - g_composer_h;
     fill(rt, rf(x0, top, x0 + w, h), OC_COL_BASE);
@@ -13970,7 +14009,21 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
     stroke_round(rt, rf(bx0, by0, bx1, by1), OC_R_CONTROL, OC_COL_BORDER, 1.0f);
 
     if (composer_tray() > 0) ftray_draw(rt, bx0, by0, bx1);
-    if (composer_toolbar_on()) draw_fmt_toolbar(rt, bx0, by0 + composer_tray(), bx1);
+    /* A preview belongs to the conversation it was opened in. */
+    if (g_preview && g_preview_ch != g_sel) g_preview = 0;
+    g_preview_btn = rf(0, 0, 0, 0);
+    if (composer_toolbar_on()) {
+        /* Preview, or Edit while previewing, at the toolbar's right end. The
+         * formatting buttons act on the field, so while it is hidden they are
+         * not offered. */
+        const char *pl = g_preview ? "Edit" : "Preview";
+        float pw = text_width(pl, g_meta) + 20, sq = COMPOSER_BTN;
+        float py = by0 + composer_tray() + (COMPOSER_TB - sq) / 2;
+        g_preview_btn = rf(bx1 - COMPOSER_PAD - pw, py, bx1 - COMPOSER_PAD, py + sq);
+        preview_btn_draw(rt, pl);
+        if (g_preview) { for (int i = 0; i < FMT_COUNT; i++) g_fmt_btn[i] = rf(0, 0, 0, 0); g_fmt_hover = -1; }
+        else draw_fmt_toolbar(rt, bx0, by0 + composer_tray(), g_preview_btn.left - 8);
+    }
     else { for (int i = 0; i < FMT_COUNT; i++) g_fmt_btn[i] = rf(0, 0, 0, 0); g_fmt_hover = -1; }
 
     /* The ACTION ROW, along the bottom of the box under the text — Slack's
@@ -14003,6 +14056,17 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
      * composer.mention+composer.send. Send is the one that must always
      * be there, so the optional icons drop off from the right. */
     float left_limit = bx1 - COMPOSER_GUTTER - sq - UIS(30);
+    /* With no formatting row (plain text), Preview sits just before Send, and
+     * the left cluster yields to it as it does to Send. */
+    if (!composer_toolbar_on()) {
+        const char *pl = g_preview ? "Edit" : "Preview";
+        float pw = text_width(pl, g_meta) + 20;
+        if (left_limit - pw - UIS(4) > composer_row_x(bx0)) {
+            g_preview_btn = rf(left_limit - pw, cy, left_limit, cy + sq);
+            preview_btn_draw(rt, pl);
+            left_limit -= pw + UIS(4);
+        }
+    }
     g_at_btn = ACT_AT(2 + vk);
     if (g_at_btn.right > left_limit) g_at_btn = rf(0, 0, 0, 0);
     /* Voice input after @, and only where the daemon offers it: a button that can
@@ -14056,7 +14120,7 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
     /* THE FIELD. Between the left buttons and Send, at the rect
      * layout_composer computed — the same rect ed_hit tests against, so what you
      * click is what you see. */
-    if (cfield.right > cfield.left) ed_draw(rt, cfield);
+    if (cfield.right > cfield.left) { if (g_preview) preview_draw(rt, cfield); else ed_draw(rt, cfield); }
     g_cmp_hint_anchor = cbox;
     g_cmp_hint_below = 0;                  /* the conversation's composer is at the bottom */
     composer_hint_draw(rt);
@@ -23533,6 +23597,7 @@ static int ed_char(oc_win *hwnd, oc_wch ch) {
         return 1;
     }
     if (!g_ed_focus) return 0;
+    if (g_preview && g_view != VIEW_NEWMSG) return 1;   /* the field takes no edits while previewed */
     if (g_pch_open) pastechoice_close();     /* typing on answers the chooser: nothing pasted */
     if (ch == u'\t') return 1;               /* Tab is navigation, never text */
     if (ch < 0x20 && ch != u'\n') return 1;  /* control chars: eaten, not inserted */
@@ -23658,6 +23723,16 @@ static int ed_key(oc_win *hwnd, int vk) {
         return 1;
     }
     if (!g_ed_focus) return 0;
+    /* Previewing: Enter sends what is shown, Esc goes back to editing it, and
+     * nothing edits the hidden field -- not a key, not a paste. */
+    if (g_preview && g_view != VIEW_NEWMSG) {
+        if (vk == OCK_RETURN && !mod_down(OCK_SHIFT)) { composer_send(); invalidate(); return 1; }
+        if (vk == OCK_ESCAPE) { preview_set(hwnd, 0); return 1; }
+        if (vk == OCK_BACK || vk == OCK_DELETE || vk == OCK_RETURN) return 1;
+        if (mod_down(OCK_CONTROL) && (vk == 'V' || vk == 'X' || vk == 'Z' || vk == 'Y' ||
+                                      vk == 'v' || vk == 'x' || vk == 'z' || vk == 'y')) return 1;
+        return 0;
+    }
     int ctrl = mod_down(OCK_CONTROL);
     int shift = mod_down(OCK_SHIFT);
     int moved = 0, changed = 0;
@@ -23833,6 +23908,8 @@ static int ed_card_press(oc_win *hwnd, float x, float y, int dbl) {
 
 static int ed_mouse_down(oc_win *hwnd, float x, float y) {
     if (!in_rect(g_ed_box, x, y)) return 0;
+    /* Previewing, a click in the box is not a caret placed in hidden text. */
+    if (g_preview && g_view != VIEW_NEWMSG) { ed_focus(hwnd); return 1; }
     if (ed_card_press(hwnd, x, y, 0)) return 1;
     ed_focus(hwnd);
     /* A click in the body is the whole answer to which field has the keys. The
@@ -24191,7 +24268,8 @@ enum {
     AT_PASTECHOICE,   /* payload: the paste chooser's choice (PCH_*) */
     AT_EMOJIDEL,      /* payload: Admin > Custom emoji's Delete hit-box index */
     AT_EMOJIFIND,     /* Admin > Custom emoji's search box */
-    AT_PICKMANAGE     /* the emoji picker's Manage link */
+    AT_PICKMANAGE,    /* the emoji picker's Manage link */
+    AT_PREVIEW        /* the composer's Preview / Edit */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -24673,6 +24751,10 @@ static void a11y_publish_scene(const oc_model *m) {
             acc_push(items, &n, OC_ACC_BUTTON, aid, FMT_NAME[i], g_fmt_btn[i],
                      ATOK(AT_FMT, i));
         }
+        if (g_preview_btn.right > g_preview_btn.left && n < OC_ACC_MAX)
+            acc_push(items, &n, OC_ACC_BUTTON, "composer.preview",
+                     g_preview ? "Back to editing" : "Preview the message",
+                     g_preview_btn, ATOK(AT_PREVIEW, 0));
     }
 
     /* Admin > Groups' Add people: the same control as New message's To field,
@@ -25393,6 +25475,47 @@ static void composer_send(void) {
     }
     g_draft_sent_cid = g_sel; g_draft_sent[0] = 0; g_draft_dirty = 0;
     ed_clear();
+    g_preview = 0;                         /* sent: back to an empty field */
+}
+
+/* Into or out of Preview. Out puts the keys back in the field, whose caret and
+ * selection were never moved. */
+static void preview_set(oc_win *hwnd, int on) {
+    g_preview = on ? 1 : 0;
+    g_preview_ch = g_sel;
+    ac_close();
+    ed_focus(hwnd);
+    invalidate();
+}
+
+/* The draft as it would be sent (ed_md_all: each table card its Markdown),
+ * laid out and drawn by the transcript's own renderer, as a message from you. */
+static void preview_draw(gfx *rt, rectf box) {
+    g_ed_box = box;
+    g_preview_h = 0; g_preview_lines = 0; g_preview_tabs = 0;
+    const oc_model *m = model();
+    char *b = ed_md_all();
+    static oc_msg msg;
+    memset(&msg, 0, sizeof msg);
+    msg.message_id = ~0ull;                 /* no message has it: its own cache slot */
+    msg.author_id = m ? m->user_id : 0;
+    msg.body = b;
+    gfx_clip_push(rt, gr(box));
+    if (!b || !b[0]) {
+        draw_text(rt, "Nothing to preview yet.", g_meta, box, OC_COL_FAINT);
+    } else {
+        float cw = box.right - box.left;
+        mlay_ent *e = body_layout(&msg, cw);
+        if (e) {
+            g_preview_h = body_draw(rt, &msg, e, box.left, box.top, cw, box.right);
+            st_metrics mt;
+            if (e->lay) { st_layout_metrics(e->lay, &mt); g_preview_lines = mt.lines; }
+            g_preview_tabs = e->ntab;
+        }
+    }
+    gfx_clip_pop(rt);
+    msg.body = NULL;
+    free(b);
 }
 
 static void composer_begin_edit(const oc_msg *msg) {
@@ -29465,6 +29588,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
             }
     }
     if (in_rect(g_emoji_btn, x, y))  { picker_open(hwnd, 0); return 1; }
+    if (in_rect(g_preview_btn, x, y)) { preview_set(hwnd, !g_preview); return 1; }
     /* The formatting toolbar. Focus first: the button acts on the
      * field's selection, and clicking chrome must not be what takes the caret
      * away from the text it is about to wrap. */
@@ -34256,6 +34380,16 @@ static void test_dump(const char *path) {
                 g_ed_box.left, g_ed_box.top, g_ed_box.right, g_ed_box.bottom,
                 g_ed_comp_len, g_composer_h, box_w > 0 ? ed_lines(box_w) : 0,
                 ed_line_h() > 0 ? (int)((box_w > 0 ? g_ed_box.bottom - g_ed_box.top : 0) / ed_line_h() + 0.5f) : 0, ed8);
+        /* The composer's Preview: whether it is shown, what the renderer made of
+         * the draft, and where its button is. */
+        /* frames: what this process has written, which previewing must not move.
+         * held: the images it did not ask for. draft: 0 nothing to write, 1 waiting
+         * out the debounce, 2 due, and held back by the preview. */
+        fprintf(f, "cpreview on=%d frames=%llu held=%d draft=%d h=%.0f lines=%d tables=%d btn=%.0f,%.0f,%.0f,%.0f\n",
+                g_preview, oc_client_frames_written(), g_preview_held,
+                !g_draft_dirty ? 0 : now_ms() - g_draft_touch_ms >= DRAFT_DEBOUNCE_MS ? 2 : 1,
+                g_preview_h, g_preview_lines, g_preview_tabs,
+                g_preview_btn.left, g_preview_btn.top, g_preview_btn.right, g_preview_btn.bottom);
     }
     /* The About tab's admin buttons, so a test can click the one it means rather
      * than arithmetic that breaks the next time a button is added between them —
@@ -35643,6 +35777,10 @@ static void test_poll(oc_win *hwnd) {
          * group, 9 remove one). Ack first: some open a form. */
         test_ack(g_sel ? "ok" : "err");
         if (g_sel) { g_menu_target = g_sel; channel_menu_run(hwnd, atoi(arg)); }
+    } else if (!strcmp(verb, "preview")) {
+        /* `preview`: the composer's Preview toggle, as its button. */
+        if (g_sel && g_view != VIEW_NEWMSG) { preview_set(hwnd, !g_preview); test_ack("ok"); }
+        else test_ack("err");
     } else if (!strcmp(verb, "emoji_del")) {
         oc_client_delete_emoji(g_client, arg); test_ack("ok");
     } else if (!strcmp(verb, "emoji_add")) {
@@ -36553,7 +36691,7 @@ static int on_tick(oc_win *hwnd) {
              * arrived (nothing is loaded yet), so without this the history then
              * counted itself unread under the reader's eyes, and the row went
              * bold with a number while they were in it. */
-            if (g_sel && transcript_shell() && g_scroll == 0 && !g_edit_msg &&
+            if (g_sel && transcript_shell() && g_scroll == 0 && !g_edit_msg && !g_preview &&
                 win_front(hwnd)) {
                 const oc_model *vm = model();
                 const oc_channel *vc = vm && vm->authed ? oc_model_channel((oc_model *)vm, g_sel) : NULL;
@@ -36608,7 +36746,8 @@ static int on_tick(oc_win *hwnd) {
                 g_draft_dirty = 0;
                 invalidate();   /* the header says "Saved" */
             }
-            if (g_draft_dirty && g_sel && !g_edit_msg && g_view != VIEW_NEWMSG &&
+            /* Not while previewing, which sends nothing: it is still dirty after. */
+            if (g_draft_dirty && g_sel && !g_edit_msg && g_view != VIEW_NEWMSG && !g_preview &&
                 now_ms() - g_draft_touch_ms >= DRAFT_DEBOUNCE_MS) {
                 draft_flush(g_sel);
                 invalidate();   /* the marker is model-drawn */
@@ -38101,6 +38240,9 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
         case AT_PICKMANAGE:
             if (g_pick_open) emoji_manage_open(hwnd);
             break;
+        case AT_PREVIEW:
+            if (g_view != VIEW_NEWMSG && g_sel) preview_set(hwnd, !g_preview);
+            break;
         case AT_ALERTACK:
             if (g_view == VIEW_ADMIN && g_adm_tab == ADM_ALERTS && (int)arg < g_n_alertrows && g_client)
                 oc_client_srvalert_ack(g_client, g_alertrows[arg].id);
@@ -38222,8 +38364,9 @@ static int on_focus_lost(oc_win *hwnd) {
         if (g_dict_hold == DH_KEY) dict_ptt_up(hwnd, DH_KEY);
         /* Whatever you were typing is written now: losing focus is the
          * moment you stopped, and waiting out the debounce risks the app being
-         * closed or killed in between. */
-        if (g_sel) draft_flush(g_sel);
+         * closed or killed in between. Not while previewing, which sends nothing;
+         * it is written when the preview closes. */
+        if (g_sel && !g_preview) draft_flush(g_sel);
         /* Losing it to a child, or to another app: the caret must stop drawing, or
          * two carets blink at once and neither is where your keys go. */
         g_ed_focus = 0;

@@ -1638,6 +1638,8 @@ void oc_client_logout(oc_client *c, uint8_t scope) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+unsigned long long oc_client_frames_written(void) { return oc_net_frames_written(); }
+
 int oc_client_outbox_pending(oc_client *c) {
     return c ? oc_net_outbox_pending(c->net) : 0;
 }
