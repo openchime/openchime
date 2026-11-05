@@ -238,11 +238,19 @@ static int cmd_reply(client *c, uint64_t channel_id, uint64_t parent_id, const c
     if (oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &s) != OC_OK ||
         write_all(&c->conn, buf, w.len) != 0)
         FAIL("reply");
-    for (int i = 0; i < 4; i++) {
+    /* The sender is acked with a SEND_ACK carrying this reply's token
+     * (PROTOCOL.md §5.10); the THREAD_REPLY fan-out comes after it. The daemon
+     * may send other things first (what it pushes after sign-in): read past
+     * them to the acknowledgement, within a bound. */
+    for (int i = 0; i < 64; i++) {
         oc_header hdr; oc_rbuf p;
         if (read_frame(c, &hdr, &p) != 0) FAIL("read after reply");
-        if (hdr.msg_type == OC_MSG_THREAD_REPLY) {
-            printf("demo_client: replied in thread %llu\n", (unsigned long long)parent_id);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) {
+            oc_send_ack ack;
+            if (oc_decode_send_ack(&p, &ack) != OC_OK) FAIL("decode ack");
+            if (memcmp(ack.idem, idem, OC_IDEM_SIZE) != 0) continue;
+            printf("demo_client: replied in thread %llu as message %llu\n",
+                   (unsigned long long)parent_id, (unsigned long long)ack.message_id);
             return 0;
         }
         if (hdr.msg_type == OC_MSG_ERROR) FAIL("reply rejected");

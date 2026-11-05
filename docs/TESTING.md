@@ -736,7 +736,8 @@ exercised in the **in-process** integration suites (`itest_netloop`), not by thi
 client.
 The same job then registers a push token with `build/demo_client`
 (`tests/demo_client.c`) and requires its acknowledgement, which the daemon sends
-after whatever it pushes once a person signs in.
+after whatever it pushes once a person signs in; then it sends a message and
+replies to it in a thread, and requires the reply's acknowledgement too.
 
 **Client-side TLS.** The wire protocol runs over TLS, verified as ARCH-10 says
 (REQ-180); there is no plaintext fallback. The TLS library is mbedTLS (ARCH-51,
@@ -1413,7 +1414,7 @@ build/openchime-tui 127.0.0.1 8443             # <host> <port>: a device-code si
   default `/data` is neither, and the daemon exits before `netloop: listening`.
   `scripts/demo/tui.sh` sets it to a temp dir.
 - `demo_client` (`make build/demo_client`) is the flexible black-box tool:
-  `demo_client <host> <port> <user> <pass> token <apns|fcm> <tok> | send <channel> <text> | invite [uses]`
+  `demo_client <host> <port> <user> <pass> token <apns|fcm> <tok> | send <channel> <text> | reply <channel> <parent> <text> | invite [uses]`
   against a running daemon (its usage lists the rest).
 
 ## A death always leaves evidence
