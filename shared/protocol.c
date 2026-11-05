@@ -1692,12 +1692,18 @@ oc_result oc_encode_audit_query(oc_wbuf *w, uint16_t version, const oc_audit_que
     size_t off = oc_frame_begin(w, version, OC_MSG_AUDIT_QUERY);
     oc_w_u64(w, m->before_ms);
     oc_w_u16(w, m->limit);
+    oc_w_u8(w, m->family);
+    oc_w_u64(w, m->actor_id);
+    oc_w_str(w, m->action);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_decode_audit_query(oc_rbuf *r, oc_audit_query *m) {
     m->before_ms = oc_r_u64(r);
     m->limit = oc_r_u16(r);
+    m->family = oc_r_u8(r);
+    m->actor_id = oc_r_u64(r);
+    m->action = oc_r_str(r);
     return r_done(r);
 }
 

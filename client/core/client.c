@@ -1091,7 +1091,21 @@ void oc_client_toggle_storage(oc_client *c, int open) {
 void oc_client_audit_query(oc_client *c, uint64_t before_ms) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_AUDIT_QUERY);
-    if (cmd) { cmd->message_id = before_ms; oc_queue_push(&c->cmds, cmd); }
+    if (!cmd) return;
+    cmd->message_id = before_ms;
+    /* The filter the model holds goes with every page. */
+    cmd->op = c->model.audit_family;
+    cmd->channel_id = c->model.audit_actor;
+    if (c->model.audit_action[0]) cmd->body = strdup(c->model.audit_action);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_audit_filter(oc_client *c, uint8_t family, uint64_t actor_id, const char *action) {
+    if (!c) return;
+    c->model.audit_family = family;
+    c->model.audit_actor = actor_id;
+    snprintf(c->model.audit_action, sizeof c->model.audit_action, "%s", action ? action : "");
+    oc_client_audit_query(c, 0);
 }
 
 void oc_client_toggle_audit(oc_client *c, int open) {

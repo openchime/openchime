@@ -3467,8 +3467,10 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (rr == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_AUDIT_QUERY) {
-                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_audit_query aq = { c->message_id, 50 };   /* message_id = before_ms */
+                uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                /* message_id = before_ms; op, channel_id and body the filter */
+                oc_audit_query aq = { c->message_id, 50, (uint8_t)c->op, c->channel_id,
+                                      oc_slice_str(c->body ? c->body : "") };
                 if (oc_encode_audit_query(&w, OC_PROTOCOL_VERSION, &aq) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }

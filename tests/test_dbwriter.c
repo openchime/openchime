@@ -3622,6 +3622,83 @@ static void test_deactivate_self(void) {
     cleanup_db(path);
 }
 
+static oc_dbres *audit_q(oc_dbwriter *w, uint64_t who, uint64_t before, uint32_t limit,
+                         uint8_t family, uint64_t actor, const char *action) {
+    oc_job *j = oc_job_new(OC_JOB_AUDIT_QUERY, 902);
+    j->user_id = who; j->audit_before_ms = before; j->audit_limit = limit;
+    j->audit_family = family; j->audit_actor = actor;
+    if (action && action[0]) oc_job_set_body(j, action, strlen(action));
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* AUDIT_QUERY's filters are applied by the daemon (PROTOCOL.md): a family
+ * sparse in recent history still fills a page, paging back by time keeps the
+ * filter, and the actor and action narrow it alone or together. */
+static void test_audit_filters(void) {
+    const char *path = tdb("audit_filters.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t owner = reg(w, "af-owner", "pw", OC_ROLE_OWNER);
+    CHECK(owner != 0);
+    {
+        sqlite3 *db = NULL;
+        CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+        sqlite3_busy_timeout(db, 5000);
+        sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+        /* Six admin rows long ago, then 300 security rows since, two actors. */
+        for (int i = 0; i < 306; i++) {
+            char sql[256];
+            int admin = i < 6;
+            snprintf(sql, sizeof sql,
+                     "INSERT INTO audit_log(at_ms, family, action, actor_id, actor_name, outcome) "
+                     "VALUES(%d, %d, '%s', %d, '%s', 1);",
+                     1000 + i, admin ? 1 : 3, admin ? "user.remove" : (i % 2 ? "auth.failure" : "auth.success"),
+                     i % 3 ? 7 : 8, i % 3 ? "seven" : "eight");
+            CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+        }
+        sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+        sqlite3_close(db);
+    }
+    /* The sparse family: all six, behind 300 newer rows of another. */
+    oc_dbres *r = audit_q(w, owner, 0, 50, 1, 0, NULL);
+    CHECK(r && r->type == OC_RES_AUDIT_PAGE && r->n_audit == 6);
+    for (size_t i = 0; r && i < r->n_audit; i++) CHECK(r->audit[i].family == 1);
+    oc_dbres_free(r);
+    /* A full page of the dense family, then the next page back, still that family. */
+    r = audit_q(w, owner, 0, 50, 3, 0, NULL);
+    CHECK(r && r->n_audit == 50);
+    uint64_t oldest = r && r->n_audit ? r->audit[r->n_audit - 1].at_ms : 0;
+    oc_dbres_free(r);
+    r = audit_q(w, owner, oldest, 50, 3, 0, NULL);
+    CHECK(r && r->n_audit == 50);
+    for (size_t i = 0; r && i < r->n_audit; i++) CHECK(r->audit[i].family == 3 && r->audit[i].at_ms < oldest);
+    oc_dbres_free(r);
+    /* The actor alone. */
+    r = audit_q(w, owner, 0, 200, 0, 8, NULL);
+    CHECK(r && r->n_audit > 0);
+    for (size_t i = 0; r && i < r->n_audit; i++) CHECK(r->audit[i].actor_id == 8);
+    oc_dbres_free(r);
+    /* The action alone: an exact match, not a pattern. */
+    r = audit_q(w, owner, 0, 200, 0, 0, "auth.failure");
+    CHECK(r && r->n_audit > 0);
+    for (size_t i = 0; r && i < r->n_audit; i++) CHECK(r->audit[i].action && strcmp(r->audit[i].action, "auth.failure") == 0);
+    oc_dbres_free(r);
+    r = audit_q(w, owner, 0, 200, 0, 0, "auth.");
+    CHECK(r && r->n_audit == 0);
+    oc_dbres_free(r);
+    /* All three together. */
+    r = audit_q(w, owner, 0, 200, 3, 7, "auth.success");
+    CHECK(r && r->n_audit > 0);
+    for (size_t i = 0; r && i < r->n_audit; i++)
+        CHECK(r->audit[i].family == 3 && r->audit[i].actor_id == 7 && strcmp(r->audit[i].action, "auth.success") == 0);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_admin_ops(void) {
     const char *path = tdb("admin.db");
     cleanup_db(path);
@@ -10039,6 +10116,7 @@ int run_dbwriter_tests(void) {
     test_keyword_alerts();
     test_admin_ops();
     test_deactivate_self();
+    test_audit_filters();
     test_reactions();
     test_threads();
     test_thread_list();

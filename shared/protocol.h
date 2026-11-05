@@ -178,7 +178,7 @@
  * 30: each USER_LIST entry carries `flags`, OC_USER_SYSTEM marking the
  * workspace's own sender (the welcome a new member is sent), which a client
  * draws as the workspace and keeps out of its people lists. A byte appended
- * to a repeated entry. (29 is SEARCH's audit filters.)
+ * to a repeated entry. (29 was set aside and not used.)
  *
  * 31: BROADCAST (and MSG_RESTORED, its layout) and THREAD_REPLY carry
  * `broadcast_held`, 1 when the body's @here, @channel or @everyone got no
@@ -191,8 +191,13 @@
  * client counts a broadcast the current body holds only when it is 1. Held
  * depended on the body, which an edit changes without storing mentions, so a
  * client had to guess it from the text before the edit, and history loaded
- * after an edit could not say a row existed. Same layout, a new meaning. */
-#define OC_PROTOCOL_VERSION 32u
+ * after an edit could not say a row existed. Same layout, a new meaning.
+ *
+ * 33: AUDIT_QUERY carries `family`, `actor_id` and `action`, filters the daemon
+ * applies, so a page holds only matching entries however sparse they are and
+ * paging back by `before_ms` keeps the filter (REQ-251). Fields appended to a
+ * fixed layout. */
+#define OC_PROTOCOL_VERSION 33u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -1531,7 +1536,10 @@ typedef struct {
  * rather than by offset, so a boundary stays stable as new entries arrive;
  * 0 asks for the newest page. */
 #define OC_AUDIT_PAGE_MAX 200u
-typedef struct { uint64_t before_ms; uint16_t limit; } oc_audit_query;
+/* family 0, actor_id 0 and an empty action match any: each set filter narrows the
+ * page in the daemon, so a page holds only matching rows, paged by before_ms. */
+typedef struct { uint64_t before_ms; uint16_t limit;
+                 uint8_t family; uint64_t actor_id; oc_slice action; } oc_audit_query;
 
 typedef struct {
     uint64_t at_ms;

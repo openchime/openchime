@@ -582,6 +582,8 @@ typedef struct oc_job {
     uint32_t       maint_batch;       /* cap on rows reclaimed in one pass */
     uint32_t       audit_limit;       /* AUDIT_QUERY: rows per page */
     uint64_t       audit_before_ms;   /* AUDIT_QUERY: page backwards from here (0 = newest) */
+    uint8_t        audit_family;      /* AUDIT_QUERY: only this family (0 = any); the action is in body */
+    uint64_t       audit_actor;       /* AUDIT_QUERY: only this actor (0 = any) */
     /* LIST_FILES: the keyset cursor -- the created-at and id of the last row the
      * caller has, 0/0 for the first page (REQ-143). */
     uint64_t       files_before_ms, files_before_id;

@@ -274,6 +274,21 @@ static void test_auth_frames(void) {
         CHECK(out.session_token.len == OC_SESSION_TOKEN_LEN);
         CHECK(memcmp(out.session_token.ptr, token, sizeof token) == 0);
     }
+    {
+        /* AUDIT_QUERY — the page, and the family, actor and action it is narrowed to. */
+        oc_audit_query in = { 1760000000000ull, 50, 3, 42, oc_slice_str("auth.failure") };
+        ROUNDTRIP(oc_encode_audit_query(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUDIT_QUERY, h, p);
+        oc_audit_query out;
+        CHECK(oc_decode_audit_query(&p, &out) == OC_OK);
+        CHECK(out.before_ms == 1760000000000ull && out.limit == 50 && out.family == 3 && out.actor_id == 42);
+        CHECK(out.action.len == 12 && memcmp(out.action.ptr, "auth.failure", 12) == 0);
+    }
+    {
+        oc_audit_query any = { 0, 50, 0, 0, oc_slice_str("") };
+        oc_audit_query out;
+        ROUNDTRIP(oc_encode_audit_query(&w, OC_PROTOCOL_VERSION, &any), OC_MSG_AUDIT_QUERY, h, p);
+        CHECK(oc_decode_audit_query(&p, &out) == OC_OK && out.family == 0 && out.actor_id == 0 && out.action.len == 0);
+    }
 }
 
 static void test_messaging_frames(void) {

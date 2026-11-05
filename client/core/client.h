@@ -375,6 +375,10 @@ void oc_client_toggle_storage(oc_client *c, int open);
 /* Audit log (REQ-251; owner/admin only). Request a page ending before
  * `before_ms` (0 = newest); entries fold into the model, newest first. */
 void oc_client_audit_query(oc_client *c, uint64_t before_ms);
+/* Narrow the audit log to one family (0 any), actor (0 any) and action ("" or
+ * NULL any), and ask for its newest page again: the filter is the daemon's, so
+ * each page holds only matching rows. */
+void oc_client_audit_filter(oc_client *c, uint8_t family, uint64_t actor_id, const char *action);
 void oc_client_toggle_audit(oc_client *c, int open);
 
 /* Self-service profile (REQ-020). Change your own display name (fans to every

@@ -213,8 +213,10 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 32** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 33** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 33 appended `family`, `actor_id` and `action` to `AUDIT_QUERY`, filters the
+> daemon applies (§5.16c). Version
 > 32 gave the byte version 31 put in `BROADCAST` (and so `MSG_RESTORED`) and
 > `THREAD_REPLY`, ahead of the body, a new meaning: `broadcast_stored`, whether
 > the send stored a broadcast mention for the message, whatever its body says
@@ -2059,11 +2061,16 @@ retention/eviction policy, and cumulative reclamation counts **by reason** (orph
     last_reclaim_ms (u64), max_age_days (u64), reserve_bytes (u64),
     evict_enabled (u8), under_pressure (u8)
 
-**`AUDIT_QUERY` (C → S), `0x0099`** `{ before_ms: u64, limit: u16 }` — pages the
-audit log (REQ-251). `before_ms` pages **backwards from a timestamp** rather than
-by offset, so a page boundary stays stable as new entries arrive; `0` asks for the
-newest page. `limit` is the page size: `0` means 50, and more than
-`OC_AUDIT_PAGE_MAX` (200) is cut to 200.
+**`AUDIT_QUERY` (C → S), `0x0099`** `{ before_ms: u64, limit: u16, family: u8,
+actor_id: u64, action: str }` — pages the audit log (REQ-251). `before_ms` pages
+**backwards from a timestamp** rather than by offset, so a page boundary stays
+stable as new entries arrive; `0` asks for the newest page. `limit` is the page
+size: `0` means 50, and more than `OC_AUDIT_PAGE_MAX` (200) is cut to 200.
+`family` (`0` any, else 1–4 as on `AUDIT_PAGE`), `actor_id` (`0` any) and
+`action` (empty for any; an exact match, not a pattern) **narrow the page in the
+daemon**, so a page holds only matching entries however sparse they are, and
+paging back by `before_ms` keeps the filter. The three filter fields since
+protocol 33.
 
 **`AUDIT_PAGE` (S → C), `0x009A`** — a page of entries, newest first: time,
 family (admin / account / security / moderation), action, actor, target, outcome,

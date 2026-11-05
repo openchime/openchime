@@ -2007,9 +2007,14 @@ static struct { float top, bot; uint64_t wid; } g_webrows[64];
 static int g_n_webrows;
 
 /* Audit family filter: 0 = all, else the OC audit family id. */
-static int g_audit_family;
 static rectf g_audit_filters[5];
 static int g_n_audit_filters;
+/* The actor and action pickers: each row's actor and action narrow the log to
+ * them when clicked, and their chip clears that filter again. */
+static struct { rectf actor, action; uint64_t actor_id; char action_name[48]; } g_audit_rowhits[64];
+static int   g_n_audit_rowhits;
+static rectf g_audit_clear_actor, g_audit_clear_action;
+static char  g_audit_actor_name[64];
 static uint64_t g_audit_oldest;     /* the oldest entry paged in, for load-older */
 
 /* Command palette. Every action on the rail and in the menus is
@@ -7598,33 +7603,50 @@ static const char *audit_family(uint8_t f) {
 static void draw_audit(gfx *rt, const oc_model *m, rectf reg, int embedded) {
     rectf body = embedded ? reg : pane_header(rt, reg, "Audit log");
     ovl_use(OVL_AUDIT);
-    if (m->n_audit == 0) { overlay_empty(rt, body, "No audit entries."); return; }
 
-    /* Family filter. Client-side over what has been paged in, which is
-     * honest: it narrows what you are looking at, it does not re-query. */
+    /* The filters are the daemon's (AUDIT_QUERY): a chip asks for the newest
+     * page of that family, so a sparse family still fills a page, paged back by
+     * time. The actor and action set from a row show as chips that clear them. */
     static const char *FAMS[5] = { "All", "Admin", "Account", "Security", "Moderation" };
     float fx = body.left + 20;
     g_n_audit_filters = 0;
     for (int f = 0; f < 5; f++) {
         float fw = text_width(FAMS[f], g_meta) + 22;
         rectf b = rf(fx, body.top + 6, fx + fw, body.top + 30);
-        int on = (g_audit_family == f);
+        int on = (m->audit_family == f);
         draw_chip_r(rt, b, FAMS[f], on);
         if (g_n_audit_filters < 5) g_audit_filters[g_n_audit_filters++] = b;
         fx += fw + 6;
     }
+    g_audit_clear_actor = g_audit_clear_action = rf(0, 0, 0, 0);
+    if (m->audit_actor) {
+        char lab[96];
+        snprintf(lab, sizeof lab, "By %s  \u00d7", g_audit_actor_name[0] ? g_audit_actor_name : "one person");
+        float fw = text_width(lab, g_meta) + 22;
+        g_audit_clear_actor = rf(fx, body.top + 6, fx + fw, body.top + 30);
+        draw_chip_r(rt, g_audit_clear_actor, lab, 1);
+        fx += fw + 6;
+    }
+    if (m->audit_action[0]) {
+        char lab[96];
+        snprintf(lab, sizeof lab, "%s  \u00d7", m->audit_action);
+        float fw = text_width(lab, g_meta) + 22;
+        g_audit_clear_action = rf(fx, body.top + 6, fx + fw, body.top + 30);
+        draw_chip_r(rt, g_audit_clear_action, lab, 1);
+    }
     body.top += 36;
 
-    size_t shown = 0;
-    for (size_t i = 0; i < m->n_audit; i++)
-        if (!g_audit_family || m->audit[i].family == g_audit_family) shown++;
-    if (shown == 0) { overlay_empty(rt, body, "Nothing in that category yet."); return; }
+    g_n_audit_rowhits = 0;
+    if (m->n_audit == 0) {
+        int any = m->audit_family || m->audit_actor || m->audit_action[0];
+        overlay_empty(rt, body, any ? "Nothing matches these filters yet." : "No audit entries.");
+        return;
+    }
 
     float rowh = UIS(46);
-    float y = ovl_begin(rt, body, (float)shown * rowh + 34);
+    float y = ovl_begin(rt, body, (float)m->n_audit * rowh + 34);
     for (size_t i = 0; i < m->n_audit; i++) {
         const oc_audit_view *a = &m->audit[i];
-        if (g_audit_family && a->family != g_audit_family) continue;
         if (y + rowh < body.top) { y += rowh; continue; }
         if (y > body.bottom) break;
         char when[20] = "";
@@ -7636,6 +7658,25 @@ static void draw_audit(gfx *rt, const oc_model *m, rectf reg, int embedded) {
                  a->target[0] ? " → " : "", a->target);
         draw_text(rt, head, g_ui, rf(body.left + 20, y, body.right - 90, y + 24),
                   a->outcome ? OC_COL_TEXT : OC_COL_DANGER);
+        /* Where the actor and the action fall in the head, as clickable
+         * pickers: "<when>  ·  <actor>  ·  <action>". */
+        if (g_n_audit_rowhits < (int)(sizeof g_audit_rowhits / sizeof g_audit_rowhits[0])) {
+            char pre[96];
+            snprintf(pre, sizeof pre, "%s  \u00b7  ", when);
+            float ax = body.left + 20 + text_width(pre, g_ui);
+            const char *who = a->actor_name[0] ? a->actor_name : "system";
+            float aw = text_width(who, g_ui);
+            char mid[96];
+            snprintf(mid, sizeof mid, "%s  \u00b7  ", who);
+            float cx = body.left + 20 + text_width(pre, g_ui) + text_width(mid, g_ui);
+            float cw = text_width(a->action, g_ui);
+            g_audit_rowhits[g_n_audit_rowhits].actor = rf(ax, y, ax + aw, y + 24);
+            g_audit_rowhits[g_n_audit_rowhits].action = rf(cx, y, cx + cw, y + 24);
+            g_audit_rowhits[g_n_audit_rowhits].actor_id = a->actor_id;
+            snprintf(g_audit_rowhits[g_n_audit_rowhits].action_name,
+                     sizeof g_audit_rowhits[0].action_name, "%s", a->action);
+            g_n_audit_rowhits++;
+        }
         char meta[160];
         snprintf(meta, sizeof meta, "%s%s%s", audit_family(a->family),
                  a->detail[0] ? " · " : "", a->detail);
@@ -28032,8 +28073,34 @@ static int on_click(oc_win *hwnd, int x, int y) {
         if (om && om->audit_open) {
             for (int i = 0; i < g_n_audit_filters; i++)
                 if (in_rect(g_audit_filters[i], x, y)) {
-                    g_audit_family = i; g_ovl_scroll = 0; return 1;
+                    oc_client_audit_filter(g_client, (uint8_t)i, om->audit_actor, om->audit_action);
+                    g_ovl_scroll = 0; return 1;
                 }
+            if (in_rect(g_audit_clear_actor, x, y)) {
+                oc_client_audit_filter(g_client, om->audit_family, 0, om->audit_action);
+                g_ovl_scroll = 0; return 1;
+            }
+            if (in_rect(g_audit_clear_action, x, y)) {
+                oc_client_audit_filter(g_client, om->audit_family, om->audit_actor, "");
+                g_ovl_scroll = 0; return 1;
+            }
+            for (int i = 0; i < g_n_audit_rowhits; i++) {
+                if (g_audit_rowhits[i].actor_id && in_rect(g_audit_rowhits[i].actor, x, y)) {
+                    for (size_t k = 0; k < om->n_audit; k++)
+                        if (om->audit[k].actor_id == g_audit_rowhits[i].actor_id) {
+                            snprintf(g_audit_actor_name, sizeof g_audit_actor_name, "%s", om->audit[k].actor_name);
+                            break;
+                        }
+                    oc_client_audit_filter(g_client, om->audit_family, g_audit_rowhits[i].actor_id, om->audit_action);
+                    g_ovl_scroll = 0; return 1;
+                }
+                if (in_rect(g_audit_rowhits[i].action, x, y)) {
+                    char act[48];
+                    snprintf(act, sizeof act, "%s", g_audit_rowhits[i].action_name);
+                    oc_client_audit_filter(g_client, om->audit_family, om->audit_actor, act);
+                    g_ovl_scroll = 0; return 1;
+                }
+            }
         }
         if (g_status_open) {
             if (in_rect(g_status_emoji_btn, x, y)) {

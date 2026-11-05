@@ -699,6 +699,11 @@ typedef struct {
     oc_audit_view *audit;
     size_t    n_audit, cap_audit;
     uint8_t   audit_open;
+    /* What the audit pages are narrowed to, sent with every page asked for:
+     * 0, 0 and "" match any (PROTOCOL.md AUDIT_QUERY). */
+    uint8_t   audit_family;
+    uint64_t  audit_actor;
+    char      audit_action[64];
     char     status[160];             /* last status / error line */
     /* The last hard error (auth failed, unreachable, …). Unlike `status` it is
      * NOT overwritten by the "disconnected" line, so a login flow can read the

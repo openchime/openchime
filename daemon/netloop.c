@@ -4296,6 +4296,9 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->user_id = c->user_id;
             j->audit_limit = aq.limit ? aq.limit : 50;
             j->audit_before_ms = aq.before_ms;
+            j->audit_family = aq.family;
+            j->audit_actor = aq.actor_id;
+            if (aq.action.len && oc_job_set_body(j, aq.action.ptr, aq.action.len) != 0) { oc_job_free(j); return -1; }
             oc_dbwriter_submit(dbw, j);
             continue;
         }

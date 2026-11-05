@@ -11261,12 +11261,19 @@ static oc_dbres *process_audit_query(sqlite3 *db, const oc_job *j) {
     if (sqlite3_prepare_v2(db,
             "SELECT at_ms, family, action, actor_id, actor_name, target_id, target,"
             " outcome, detail FROM audit_log "
-            "WHERE (?1 = 0 OR at_ms < ?1) ORDER BY at_ms DESC, id DESC LIMIT ?2;",
+            "WHERE (?1 = 0 OR at_ms < ?1) AND (?3 = 0 OR family = ?3) AND (?4 = 0 OR actor_id = ?4)"
+            "  AND (?5 = '' OR action = ?5) "
+            "ORDER BY at_ms DESC, id DESC LIMIT ?2;",
             -1, &st, NULL) != SQLITE_OK) {
         r->type = OC_RES_AUDIT_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->audit_before_ms);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)lim);
+    /* The filters (PROTOCOL.md AUDIT_QUERY): applied here, so a page holds
+     * only matching rows however sparse they are in recent history. */
+    sqlite3_bind_int(st, 3, j->audit_family);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)j->audit_actor);
+    sqlite3_bind_text(st, 5, j->body ? (const char *)j->body : "", j->body ? (int)j->body_len : 0, SQLITE_TRANSIENT);
     while (sqlite3_step(st) == SQLITE_ROW && r->n_audit < lim) {
         oc_audit_row *a = &r->audit[r->n_audit];
         a->at_ms     = (uint64_t)sqlite3_column_int64(st, 0);
