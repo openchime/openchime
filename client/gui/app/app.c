@@ -2088,6 +2088,8 @@ static int g_about_open;
  * which fills the one and refocuses the other. */
 static int   g_status_open;
 static int   g_sch_open;              /* the send-later date and time card */
+static int   g_sch_insert;            /* ...opened by Insert a time: any moment, and
+                                       * Insert puts its token in the message */
 static int   g_sr_open;               /* a summary's custom date range (REQ-310) */
 static int   g_pc_open;               /* the poll composer, new or editing (REQ-225) */
 static int   g_te_open;               /* the table editor, a new table or a card's (MARKDOWN.md §6) */
@@ -2419,6 +2421,7 @@ static rectf g_send_btn;          /* composer send-button hit-box */
 static rectf g_sched_btn;         /* "send later" chevron beside it (REQ-224) */
 static rectf g_emoji_btn;         /* composer emoji-picker hit-box */
 static rectf g_at_btn;            /* composer mention button */
+static rectf g_time_btn;          /* composer Insert a time (MARKDOWN.md §1c) */
 /* The New message pane's own copies (REQ-229). */
 static rectf g_nm_send, g_nm_sched, g_nm_ed, g_nm_attach, g_nm_emoji, g_nm_at;
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
@@ -2455,6 +2458,7 @@ static int         g_fmt_tip_shown;     /* dwell crossed; repainted once */
  * on (ACT_*, -1 none) and since when. */
 enum { ACT_ATTACH = 0, ACT_VIDEO, ACT_EMOJI, ACT_MENTION, ACT_MIC, ACT_FREETALK, ACT_SEND,
        ACT_SCHEDULE, ACT_NM_ATTACH, ACT_NM_EMOJI, ACT_NM_MENTION, ACT_NM_SEND, ACT_NM_SCHEDULE,
+       ACT_TIME,
        ACT_COUNT };
 static int         g_act_hover = -1;
 static uint64_t   g_act_hover_since;
@@ -5636,7 +5640,7 @@ enum { MLAY_CACHE = 96, MLAY_BOXES = 16 };
  * laid out once per message signature and width and rasterized the first time
  * they are drawn, and a table is bounded (MTAB_ROWS, MTAB_CELLS, MCELL_BYTES)
  * so a 64 KiB one costs one bounded first frame and nothing after it. */
-enum { MTAB_MAX = 16, MTAB_ROWS = 200, MTAB_CELLS = 2400, MCELL_BYTES = 2048, MCELL_BOXES = 4 };
+enum { MTAB_MAX = 16, MTAB_ROWS = 200, MTAB_CELLS = 2400, MCELL_BYTES = 2048, MCELL_BOXES = 8 };
 #define TAB_PX    UIS(10.0f)    /* cell padding, across */
 #define TAB_PY    UIS(5.0f)     /* ... and down */
 #define TAB_MINW  UIS(40.0f)    /* a column's text width, at least */
@@ -5653,7 +5657,8 @@ typedef struct {
     size_t     start, len;   /* the cell's bytes in body_text */
     int        nbox;         /* custom emoji (REQ-072), as the body reserves them */
     st_rect    box[MCELL_BOXES];
-    uint64_t   box_aid[MCELL_BOXES];
+    uint64_t   box_aid[MCELL_BOXES];   /* a custom emoji's image, or 0 for a time */
+    int64_t    box_ms[MCELL_BOXES];    /* a time token's moment (MARKDOWN.md §1c) */
 } mcell;
 
 typedef struct {
@@ -5683,7 +5688,8 @@ typedef struct {
     /* the inline boxes (custom emoji): where they landed + which image */
     int        nbox;
     st_rect    box[MLAY_BOXES];
-    uint64_t   box_aid[MLAY_BOXES];
+    uint64_t   box_aid[MLAY_BOXES];  /* a custom emoji's image, or 0 for a time */
+    int64_t    box_ms[MLAY_BOXES];   /* a time token's moment (MARKDOWN.md §1c) */
     int        ntab;      /* tables drawn as grids (MARKDOWN.md §1a) */
     mtab      *tab;
 } mlay_ent;
@@ -5738,6 +5744,18 @@ static uint64_t mlay_sig(const oc_msg *msg) {
         for (uint8_t k = 0; k < km->n_kw_terms; k++)
             for (const char *t = km->kw_terms[k]; *t; t++)
                 h = (h ^ (unsigned char)*t) * 1099511628211ull;
+    /* A time token's text (and so its box) follows the clock preference, the
+     * zone and what "today" is: any of them changing lays the body out again. */
+    if (strstr(b, "<time:")) {
+        time_t now = time(NULL);
+        struct tm lt;
+        int yday = oc_localtime_r(&now, &lt) ? lt.tm_year * 400 + lt.tm_yday : 0;
+        oc_rt_clock k;
+        oc_model_clock(km, (int64_t)now * 1000, &k);
+        h = (h ^ (uint64_t)(g_pref_time24 ? 8 : 16)) * 1099511628211ull;
+        h = (h ^ (uint64_t)(uint32_t)yday) * 1099511628211ull;
+        h = (h ^ (uint64_t)(uint32_t)(k.tz_min + 100000)) * 1099511628211ull;
+    }
     return h ? h : 1;
 }
 
@@ -5778,8 +5796,8 @@ static void tgrid_drop(tgrid_ent *g) {
 
 /* A cell's layout at width `w`: its copy of the bytes, `<br>` a newline, and
  * the body's own treatment -- inline formatting with its delimiters and escapes
- * collapsed, links, @mentions, #channels, keywords and custom emoji boxes. The
- * header row is bold throughout. */
+ * collapsed, links, @mentions, #channels, keywords, and boxes for custom emoji
+ * and time tokens. The header row is bold throughout. */
 static st_layout *tcell_lay(mcell *c, const char *b, float w, int align, int header) {
     size_t n = c->len;
     char *t = malloc(n + 1);
@@ -5837,13 +5855,39 @@ static st_layout *tcell_lay(mcell *c, const char *b, float w, int align, int hea
     oc_emoji_run runs[MCELL_BOXES];
     int nr = emoji_runs(t, runs, MCELL_BOXES);
     float side = g_body->line_h > 4 ? g_body->line_h - 4 : 18.0f;
-    for (int i = 0; i < nr; i++) {
-        st_range_box(lay, runs[i].at, runs[i].len, side, side, side * 0.85f, (uint32_t)i + 1);
-        c->box_aid[i] = runs[i].aid;
+    /* Emoji and time tokens (MARKDOWN.md §1c) in one id sequence, in the order
+     * they come, as the body's boxes are. A token's box is as wide as its text
+     * in this reader's zone, which mtab_draw writes in. */
+    float lh = g_body->line_h > 4 ? g_body->line_h : 22.0f;
+    float base = g_body->baseline > 0 ? g_body->baseline : lh * 0.78f;
+    int nbx = 0, ei = 0;
+    size_t ti = 0;
+    while ((ei < nr || ti < ns) && nbx < MCELL_BOXES) {
+        int64_t ms = 0;
+        if (ti < ns && (sp[ti].style != OC_RT_TIME || !oc_rt_time_value(b, c->start + n, &sp[ti], &ms))) { ti++; continue; }
+        if (ei < nr && (ti >= ns || runs[ei].at < sp[ti].start - c->start)) {
+            st_range_box(lay, runs[ei].at, runs[ei].len, side, side, side * 0.85f, (uint32_t)nbx + 1);
+            c->box_aid[nbx] = runs[ei].aid; c->box_ms[nbx] = 0;
+            ei++;
+        } else {
+            char tt[64];
+            oc_model_time_text(model(), ms, OC_RT_TIME_SHORT, tt, sizeof tt);
+            st_range_box(lay, sp[ti].start - c->start, sp[ti].len, text_width(tt, g_body) + 2.0f, lh, base, (uint32_t)nbx + 1);
+            c->box_aid[nbx] = 0; c->box_ms[nbx] = ms;
+            ti++;
+        }
+        nbx++;
     }
     uint32_t ids[MCELL_BOXES];
     int nb = st_layout_boxes(lay, ids, c->box, MCELL_BOXES);
-    c->nbox = nr < nb ? nr : nb;
+    c->nbox = nbx < nb ? nbx : nb;
+    {   /* Each rect to the slot its id names, whatever order they come back in. */
+        st_rect byid[MCELL_BOXES];
+        memcpy(byid, c->box, sizeof byid);
+        for (int k = 0; k < nb; k++)
+            if (ids[k] >= 1 && (int)ids[k] <= c->nbox) byid[ids[k] - 1] = c->box[k];
+        memcpy(c->box, byid, sizeof byid);
+    }
     st_metrics m;
     st_layout_metrics(lay, &m);
     c->w = m.w; c->h = m.h;
@@ -6137,12 +6181,36 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
         for (int i = 0; i < nr; i++)
             if (!in_tables(rts, nt, runs[i].at)) runs[kept++] = runs[i];
         nr = kept;
-        for (int i = 0; i < nr; i++) {
-            st_range_box(lay, lead + runs[i].at, runs[i].len, side, side, side * 0.85f,
-                         (uint32_t)i + 1);
-            best->box_aid[i] = runs[i].aid;
+        /* Time tokens (MARKDOWN.md §1c) reserve a box as wide as their text in
+         * this reader's zone, which the draw pass writes in; one id sequence
+         * with the emoji, in the order they come in the text. */
+        oc_rt_span tsp[OC_RT_MAX];
+        size_t nts = strstr(b, "<time:") ? oc_rt_scan(b, blen, tsp, OC_RT_MAX) : 0;
+        if (nts > OC_RT_MAX) nts = OC_RT_MAX;
+        int nbx = 0, ei = 0;
+        size_t ti = 0;
+        float lh = g_body->line_h > 4 ? g_body->line_h : 22.0f;
+        float base = g_body->baseline > 0 ? g_body->baseline : lh * 0.78f;
+        while ((ei < nr || ti < nts) && nbx < MLAY_BOXES) {
+            int64_t ms = 0;
+            if (ti < nts && (tsp[ti].style != OC_RT_TIME || in_tables(rts, nt, tsp[ti].start) ||
+                             !oc_rt_time_value(b, blen, &tsp[ti], &ms))) { ti++; continue; }
+            if (ei < nr && (ti >= nts || runs[ei].at < tsp[ti].start)) {
+                st_range_box(lay, lead + runs[ei].at, runs[ei].len, side, side, side * 0.85f,
+                             (uint32_t)nbx + 1);
+                best->box_aid[nbx] = runs[ei].aid; best->box_ms[nbx] = 0;
+                ei++;
+            } else {
+                char tt[64];
+                oc_model_time_text(model(), ms, OC_RT_TIME_SHORT, tt, sizeof tt);
+                st_range_box(lay, lead + tsp[ti].start, tsp[ti].len, text_width(tt, g_body) + 2.0f,
+                             lh, base, (uint32_t)nbx + 1);
+                best->box_aid[nbx] = 0; best->box_ms[nbx] = ms;
+                ti++;
+            }
+            nbx++;
         }
-        best->nbox = nr;
+        best->nbox = nbx;
         b = ab;                 /* the whole line again, for what follows */
         blen += lead;
     }
@@ -6152,6 +6220,14 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     uint32_t ids[MLAY_BOXES];
     int nb = st_layout_boxes(lay, ids, best->box, MLAY_BOXES);
     if (nb < best->nbox) best->nbox = nb;
+    /* Each rect to the slot its id names, whatever order they come back in. */
+    {
+        st_rect byid[MLAY_BOXES];
+        memcpy(byid, best->box, sizeof byid);
+        for (int k = 0; k < nb; k++)
+            if (ids[k] >= 1 && (int)ids[k] <= best->nbox) byid[ids[k] - 1] = best->box[k];
+        memcpy(best->box, byid, sizeof byid);
+    }
 
     /* Raster now, once; the texture is what frames blit. */
     best->rgb = msg->deleted ? OC_COL_FAINT : OC_COL_TEXT;
@@ -6341,6 +6417,8 @@ static const tabhit *tabhit_find(uint64_t mid, int idx, int thr) {
     return NULL;
 }
 
+static void time_box_draw(gfx *rt, const oc_msg *msg, int64_t ms, rectf box);   /* fwd */
+
 /* Table `k` of `e` as a grid, its segment's top at `y`: a rounded frame of the
  * transcript's own border colour, the header row (when there is one) bold on a
  * faint fill, rules between rows and columns, each cell padded and aligned as
@@ -6390,6 +6468,7 @@ static void mtab_draw(gfx *rt, const oc_msg *msg, mlay_ent *e, int k, float x, f
             for (int i = 0; i < cl->nbox; i++) {
                 rectf box = rf(ox + cl->box[i].x, oy + cl->box[i].y,
                                ox + cl->box[i].x + cl->box[i].w, oy + cl->box[i].y + cl->box[i].h);
+                if (!cl->box_aid[i]) { time_box_draw(rt, msg, cl->box_ms[i], box); continue; }
                 if (!draw_avatar_image(rt, cl->box_aid[i], box, 3.0f, 1)) {
                     avatar_want(cl->box_aid[i]);
                     draw_text(rt, ":…:", g_meta, box, OC_COL_FAINT);
@@ -6464,6 +6543,47 @@ static void body_draw_split(gfx *rt, const oc_msg *msg, mlay_ent *e, float tx, f
     }
 }
 
+/* The time tokens drawn this frame, where and which moment: for the hover's
+ * full date and zone (time_tip_draw), keyboard focus's, and the dump. */
+enum { TIME_HITS = 64 };
+static struct { rectf r; uint64_t mid; int64_t ms; } g_timehits[TIME_HITS];
+static int g_n_timehits;
+static void time_hit_add(uint64_t mid, int64_t ms, rectf r) {
+    if (g_n_timehits < TIME_HITS) {
+        g_timehits[g_n_timehits].r = r; g_timehits[g_n_timehits].mid = mid;
+        g_timehits[g_n_timehits].ms = ms; g_n_timehits++;
+    }
+}
+
+/* A time token (MARKDOWN.md §1c), in its box: its time in this reader's zone, in
+ * the accent and dotted under, since hovering it says more (time_tip_draw). */
+static void time_box_draw(gfx *rt, const oc_msg *msg, int64_t ms, rectf box) {
+    char tt[64];
+    oc_model_time_text(model(), ms, OC_RT_TIME_SHORT, tt, sizeof tt);
+    draw_text(rt, tt, g_body, box, OC_COL_ACCENT);
+    for (float dx = box.left; dx < box.right - 2; dx += 4)
+        fill(rt, rf(dx, box.bottom - 2, dx + 2, box.bottom - 1), OC_COL_ACCENT);
+    time_hit_add(msg->message_id, ms, box);
+}
+
+/* Hovering a time token, or moving the keyboard onto its message, shows the
+ * whole of it: the date, the time and the zone it is shown in. */
+static void draw_tip(gfx *rt, rectf b, const char *name, const char *chord, float lim0, float lim1);   /* fwd */
+static int time_tip_index(void) {
+    for (int i = 0; i < g_n_timehits; i++)
+        if (in_rect(g_timehits[i].r, g_mouse_x, g_mouse_y)) return i;
+    for (int i = 0; i < g_n_timehits; i++)
+        if (g_kb_mid && g_timehits[i].mid == g_kb_mid) return i;
+    return -1;
+}
+static void time_tip_draw(gfx *rt, float W) {
+    int i = time_tip_index();
+    if (i < 0) return;
+    char full[96];
+    oc_model_time_text(model(), g_timehits[i].ms, OC_RT_TIME_FULL, full, sizeof full);
+    draw_tip(rt, g_timehits[i].r, full, "", 0, W);
+}
+
 /* A message body laid out by body_layout, drawn with its top left at tx,by:
  * the text (split round its tables when it has any) and its custom emoji. The
  * transcript's, and the composer's Preview's. Returns the height it took. */
@@ -6486,6 +6606,10 @@ static float body_draw(gfx *rt, const oc_msg *msg, mlay_ent *body, float tx, flo
         rectf box = rf(tx + body->box[i].x, by + bty,
                        tx + body->box[i].x + body->box[i].w,
                        by + bty + body->box[i].h);
+        if (!body->box_aid[i]) {
+            time_box_draw(rt, msg, body->box_ms[i], box);
+            continue;
+        }
         if (!draw_avatar_image(rt, body->box_aid[i], box, 3.0f, 1)) {
             avatar_want(body->box_aid[i]);
             /* Until the bytes arrive the shortcode is the honest
@@ -13344,11 +13468,13 @@ static const char *const FMT_CHORD[FMT_COUNT] = {
 static const char *const ACT_NAME[ACT_COUNT] = {
     "Attach a file", "Record a video message", "Emoji", "Mention someone", "Hold to talk",
     "Free talk", "Send", "Send later",
-    "Attach a file", "Emoji", "Mention someone", "Send", "Send later"
+    "Attach a file", "Emoji", "Mention someone", "Send", "Send later",
+    "Insert a time"
 };
 static const char *const ACT_CHORD[ACT_COUNT] = {
     "", "", "", "@", "Ctrl+Shift+Space", "Ctrl+Shift+T", "Enter", "",
-    "", "", "@", "Enter", ""
+    "", "", "@", "Enter", "",
+    ""
 };
 
 /* The rect each action button was last drawn at; empty when it is not drawn. */
@@ -13367,6 +13493,7 @@ static rectf act_rect(int i) {
     case ACT_NM_MENTION:  return g_nm_at;
     case ACT_NM_SEND:     return g_nm_send;
     case ACT_NM_SCHEDULE: return g_nm_sched;
+    case ACT_TIME:        return g_time_btn;
     default:              return rf(0, 0, 0, 0);
     }
 }
@@ -14072,10 +14199,13 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
     /* Voice input after @, and only where the daemon offers it: a button that can
      * only be refused is worse than none. Free talk also needs somewhere it may
      * post. They drop off before @ does, being further right. */
+    /* Insert a time (MARKDOWN.md §1c) after @: a time written so each reader
+     * sees it in their own zone. */
+    g_time_btn = ACT_AT(3 + vk);
     g_mic_btn = g_freetalk_btn = rf(0, 0, 0, 0);
     if (dict_offered()) {
-        g_mic_btn = ACT_AT(3 + vk);
-        if (dict_free_offered()) g_freetalk_btn = ACT_AT(4 + vk);
+        g_mic_btn = ACT_AT(4 + vk);
+        if (dict_free_offered()) g_freetalk_btn = ACT_AT(5 + vk);
     }
     /* An encrypted DM takes no file, no video and no voice input (the server
      * would hear it): emoji and @ only. */
@@ -14083,9 +14213,11 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
         g_attach_btn = g_video_btn = g_mic_btn = g_freetalk_btn = rf(0, 0, 0, 0);
         g_emoji_btn = ACT_AT(0);
         g_at_btn = ACT_AT(1);
+        g_time_btn = ACT_AT(2);
         if (g_at_btn.right > left_limit) g_at_btn = rf(0, 0, 0, 0);
     }
 #undef ACT_AT
+    if (g_time_btn.right > left_limit) g_time_btn = rf(0, 0, 0, 0);
     if (g_freetalk_btn.right > left_limit) g_freetalk_btn = rf(0, 0, 0, 0);
     if (g_mic_btn.right > left_limit) g_mic_btn = rf(0, 0, 0, 0);
     if (g_video_btn.right > left_limit) g_video_btn = rf(0, 0, 0, 0);
@@ -14111,6 +14243,10 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
         draw_lucide(rt, OC_ICON_SMILE, composer_glyph(g_emoji_btn), OC_COL_MUTED);
     if (g_at_btn.right > g_at_btn.left)
         draw_lucide(rt, OC_ICON_AT, composer_glyph(g_at_btn), OC_COL_MUTED);
+    if (g_time_btn.right > g_time_btn.left) {
+        if (in_rect(g_time_btn, g_mouse_x, g_mouse_y)) fill_round(rt, g_time_btn, OC_R_CONTROL, OC_COL_HOVER);
+        draw_lucide(rt, OC_ICON_CALENDAR, composer_glyph(g_time_btn), OC_COL_MUTED);
+    }
     {
         uint8_t dm = g_dict ? oc_dictate_mode(g_dict) : 0xFF;
         dict_draw_btn(rt, g_mic_btn, OC_ICON_MIC, dm == OC_STT_MODE_PTT, OC_COL_DANGER);
@@ -15205,6 +15341,7 @@ static uint64_t sch_ms(int y, int m, int d, int min) {
 /* Far enough ahead to be a schedule rather than a send: the daemon's sweep runs
  * every few seconds, so anything nearer would effectively go out at once. */
 static int sch_future(uint64_t at) {
+    if (g_sch_insert) return at > 0;          /* a time to write about may be past */
     return at > (uint64_t)time(NULL) * 1000ULL + 60000ULL;
 }
 
@@ -15320,7 +15457,36 @@ static void sched_custom_open(oc_win *hwnd) {
     g_sch_vy = g_sch_y; g_sch_vm = g_sch_m;
     g_sch_tscroll = (float)(min / 30) * SCH_ROW_H - 3 * SCH_ROW_H;
     if (g_sch_tscroll < 0) g_sch_tscroll = 0;
+    g_sch_insert = 0;
     modal_enter(hwnd, &g_sch_open);
+}
+
+/* Insert a time (MARKDOWN.md §1c): the same date and time card, in this
+ * person's own zone, opened on the next half hour; any day may be picked, and
+ * Insert puts the moment's token at the caret. */
+static void time_insert_open(oc_win *hwnd) {
+    time_t t = time(NULL); struct tm tv;
+    if (!oc_localtime_r(&t, &tv)) return;
+    int min = ((tv.tm_hour * 60 + tv.tm_min + 29) / 30) * 30;
+    if (min >= 1440) min = 1410;
+    g_sch_y = tv.tm_year + 1900; g_sch_m = tv.tm_mon; g_sch_d = tv.tm_mday;
+    g_sch_min = min; g_sch_err = 0;
+    g_sch_vy = g_sch_y; g_sch_vm = g_sch_m;
+    g_sch_tscroll = (float)(min / 30) * SCH_ROW_H - 3 * SCH_ROW_H;
+    if (g_sch_tscroll < 0) g_sch_tscroll = 0;
+    g_sch_insert = 1;
+    modal_enter(hwnd, &g_sch_open);
+}
+
+/* The token for the moment the card shows, at the caret. */
+static void time_insert_commit(oc_win *hwnd, uint64_t at) {
+    char tok[48];
+    oc_wch w[48];
+    if (!oc_rt_time_token((int64_t)at, tok, sizeof tok)) return;
+    to_w(tok, w, 48);
+    ed_focus(hwnd);
+    ed_insert(w);
+    ed_changed(hwnd);
 }
 
 static float sched_custom_body_h(void) {
@@ -15408,7 +15574,7 @@ static void draw_sched_custom(gfx *rt, rectf body) {
         draw_text(rt, line, g_ui, rf(body.left, sy, body.right, sy + UIS(24.0f)), OC_COL_DANGER);
     } else {
         char when[96]; sch_describe(at, when, sizeof when);
-        snprintf(line, sizeof line, "Sends %s", when);
+        snprintf(line, sizeof line, g_sch_insert ? "Each reader sees %s in their own time" : "Sends %s", when);
         draw_text(rt, line, g_ui, rf(body.left, sy, body.right, sy + UIS(24.0f)),
                   g_sch_err ? OC_COL_DANGER : OC_COL_TEXT);
     }
@@ -16480,11 +16646,12 @@ static const oc_modal_spec *modal_current(void) {
         /* Schedule is a COMMAND, not MODAL_OK: it validates first, and a time
          * that has passed keeps the card open with the reason, which a plain OK
          * (close, then commit) cannot do. Enter reaches it the same way. */
-        sp.title = "Schedule message";
+        sp.title = g_sch_insert ? "Insert a time" : "Schedule message";
         sp.size = MODAL_SM;
         sp.want_h = (MODAL_TITLE_H + sched_custom_body_h() + MODAL_FOOT_H + UIS(16.0f)) / g_text_scale;
         sp.buttons[0] = (oc_mbtn){ "Cancel",   MB_NORMAL,  MODAL_CANCEL };
-        sp.buttons[1] = (oc_mbtn){ "Schedule", MB_PRIMARY, 304 };
+        sp.buttons[1] = g_sch_insert ? (oc_mbtn){ "Insert", MB_PRIMARY, 305 }
+                                     : (oc_mbtn){ "Schedule", MB_PRIMARY, 304 };
         sp.n_buttons = 2;
     } else if (g_status_open) {
         sp.title = "Set a status";
@@ -20988,6 +21155,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
         mem_hits_clear();
     }
     draw_pastechoice(rt, W, H);   /* the paste chooser floats over the field it pastes into */
+    if (!modal_open()) time_tip_draw(rt, W);   /* a time token's full date, over what it is in */
     if (!si_over) draw_modal(rt, m, W, H);  /* your-account surfaces, over a dimmed shell */
     draw_video_overlay(rt, m, W, H);   /* the recording card and the player; menus float above */
     draw_share_full(rt, m, W, H);      /* a shared screen, full screen, when asked for */
@@ -21038,6 +21206,9 @@ static void paint(oc_win *hwnd) {
      * is empty unless this frame put something in it. */
     g_n_hrx = 0; g_hrx_mid = 0;
     g_caret_placed = 0;
+    g_n_timehits = 0;
+    /* The reader's clock, which the model's excerpts use too. */
+    if (m) oc_model_set_clock12((oc_model *)m, !g_pref_time24);
     render_scene(rt, m, W, H);
     if (!g_caret_placed) ed_caret_kill();   /* no field drew a caret this frame */
     /* Boxes placed against chrome the scene just measured, so they can only be
@@ -24242,6 +24413,7 @@ enum {
     AT_FMT,           /* payload: formatting-toolbar button index */
     AT_EMOJI,         /* the composer's emoji picker */
     AT_MENTION,       /* insert the @ trigger, as typing it does */
+    AT_TIMEINS,       /* the composer's Insert a time */
     AT_SCHEDMENU,     /* the send-later menu */
     AT_THREADFILTER,  /* the Threads pane's unreads-only toggle */
     AT_STATUSEMOJI,   /* the status dialog's emoji button */
@@ -24726,6 +24898,8 @@ static void a11y_publish_scene(const oc_model *m) {
                  ATOK(AT_EMOJI, 0));
         acc_push(items, &n, OC_ACC_BUTTON, "composer.mention", "Mention someone", g_at_btn,
                  ATOK(AT_MENTION, 0));
+        acc_push(items, &n, OC_ACC_BUTTON, "composer.time", "Insert a time", g_time_btn,
+                 ATOK(AT_TIMEINS, 0));
         /* Invoke cannot be held, so the microphone toggles for assistive
          * technology: invoke to talk, invoke again to stop. The state is in the
          * name, as the toggle's is. */
@@ -29599,6 +29773,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
             ed_changed(hwnd);
             return 1;
         }
+    if (in_rect(g_time_btn, x, y)) { time_insert_open(hwnd); return 1; }
     if (in_rect(g_at_btn, x, y)) {
         /* Insert the trigger at the caret and let the normal completion path
          * take over, so the button and typing "@" behave identically. */
@@ -33079,6 +33254,16 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
             summarize_start(hwnd, g_sr_cid, OC_SUM_RANGE, rs, re);
         }
         break;
+    case 305:   /* the same card's Insert, opened by Insert a time */
+        if (!g_sch_open || !g_sch_insert) break;
+        {
+            uint64_t at = sch_ms(g_sch_y, g_sch_m, g_sch_d, g_sch_min);
+            modal_finish(0);
+            g_modal_closed_by = "save";
+            g_sch_insert = 0;
+            time_insert_commit(hwnd, at);
+        }
+        break;
     case 304:   /* the custom send-later card's Schedule */
         if (!g_sch_open) break;
         {
@@ -34415,6 +34600,21 @@ static void test_dump(const char *path) {
                 if (!strcmp(g_emojirows[k].name, er[i]->name)) d = g_emojirows[k].r;
             fprintf(f, "  emojirow %s by=%llu del=%.0f,%.0f,%.0f,%.0f\n", er[i]->name,
                     (unsigned long long)er[i]->created_by, d.left, d.top, d.right, d.bottom);
+        }
+    }
+    /* The time tokens the last frame drew (MARKDOWN.md §1c): the text each
+     * reads as, its full form, and which one the tooltip shows. */
+    {
+        oc_rt_clock k;
+        oc_model_clock(m, (int64_t)time(NULL) * 1000, &k);
+        fprintf(f, "timetoks n=%d tz=%d time24=%d tip=%d\n", g_n_timehits, k.tz_min, k.time24, time_tip_index());
+        for (int i = 0; i < g_n_timehits; i++) {
+            char sh[64], full[96];
+            oc_model_time_text(m, g_timehits[i].ms, OC_RT_TIME_SHORT, sh, sizeof sh);
+            oc_model_time_text(m, g_timehits[i].ms, OC_RT_TIME_FULL, full, sizeof full);
+            fprintf(f, "  timetok mid=%llu ms=%lld text=\"%s\" full=\"%s\" r=%.0f,%.0f,%.0f,%.0f\n",
+                    (unsigned long long)g_timehits[i].mid, (long long)g_timehits[i].ms, sh, full,
+                    g_timehits[i].r.left, g_timehits[i].r.top, g_timehits[i].r.right, g_timehits[i].r.bottom);
         }
     }
     for (size_t i = 0; i < m->n_cemoji; i++)
@@ -35781,6 +35981,16 @@ static void test_poll(oc_win *hwnd) {
         /* `preview`: the composer's Preview toggle, as its button. */
         if (g_sel && g_view != VIEW_NEWMSG) { preview_set(hwnd, !g_preview); test_ack("ok"); }
         else test_ack("err");
+    } else if (!strcmp(verb, "timeinsert")) {
+        /* `timeinsert <YYYY>-<MM>-<DD> <HH>:<MM>`, in this machine's zone: Insert
+         * a time's card opened, that moment picked on it, and Insert pressed. */
+        int y = 0, mo = 0, d = 0, hh = 0, mi = 0;
+        if (g_sel && sscanf(arg, "%d-%d-%d %d:%d", &y, &mo, &d, &hh, &mi) == 5) {
+            time_insert_open(hwnd);
+            g_sch_y = y; g_sch_m = mo - 1; g_sch_d = d; g_sch_min = hh * 60 + mi;
+            menu_dispatch(hwnd, 305);
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "emoji_del")) {
         oc_client_delete_emoji(g_client, arg); test_ack("ok");
     } else if (!strcmp(verb, "emoji_add")) {
@@ -38327,6 +38537,7 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
                 menu_dispatch(hwnd, arg ? g_form_side.remove_cmd : g_form_side.upload_cmd);
             break;
         case AT_MENTION:   ed_focus(hwnd); ed_insert(u"@"); ac_rebuild(); break;
+        case AT_TIMEINS:   time_insert_open(hwnd); break;
         case AT_SCHEDMENU:
             /* The same menu the chevron opens, built where it is built — a second
              * copy of its items here would be a second thing to keep in step. */

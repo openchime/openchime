@@ -46,6 +46,10 @@ enum {
     OC_RT_BREAK     = 0x0800,   /* `<br>` in a table cell: a line break. Only
                                  * oc_rt_scan_cell reports it; the bytes are the
                                  * whole construct, drawn as a new line */
+    OC_RT_TIME      = 0x1000,   /* `<time:2026-10-30T15:00Z>`: a moment, the
+                                 * whole token, drawn as its time in the
+                                 * reader's zone (oc_rt_time_value,
+                                 * oc_rt_time_text); no delimiter span */
 
     OC_RT_DELIM     = 0x8000    /* the delimiter bytes of the construct above */
 };
@@ -91,6 +95,10 @@ typedef struct {
  *     not the full stop. Only those two schemes are recognised: a link span is
  *     what a frontend turns into something the OS opens, so widening the set is
  *     a security decision and it is taken HERE rather than per frontend.
+ *   - `<time:YYYY-MM-DDTHH:MM[:SS]Z>` is a time token (MARKDOWN.md §1c): one
+ *     OC_RT_TIME span over the whole token, which a frontend draws as that
+ *     moment in the reader's own zone. The date and time must be real ones and
+ *     in UTC (the `Z`); anything else is literal text. Not inside code.
  *   - `[label](https://address)` is a labelled link: an OC_RT_LABELLED span
  *     over the label, which may itself carry emphasis, with OC_RT_DELIM |
  *     OC_RT_LABELLED spans over the `[` and over `](address)`. The address
@@ -165,10 +173,50 @@ int  oc_rt_row_next(oc_rt_rowit *it, oc_rt_cell cells[OC_RT_TABLE_MAX_COLS], uin
  * one line of inline text. Returns the count, which may exceed `max`. */
 size_t oc_rt_scan_cell(const char *body, size_t off, size_t len, oc_rt_span *out, size_t max);
 
+/* ---- time tokens (MARKDOWN.md §1c) ---------------------------------------- */
+
+/* The moment an OC_RT_TIME span from oc_rt_scan over the same `body` names, in
+ * Unix milliseconds. Returns 1, or 0 when `span` is not a time token. */
+int oc_rt_time_value(const char *body, size_t len, const oc_rt_span *span, int64_t *ms);
+
+/* The token for `ms` (whole minutes; seconds are written when not zero) into
+ * `out`, NUL-terminated. Returns its length, or 0 if `cap` is too small. */
+size_t oc_rt_time_token(int64_t ms, char *out, size_t cap);
+
+/* How a reader is shown a moment. `tz_min` is the reader's offset from UTC, in
+ * minutes, AT that moment (a frontend asks its own clock); `utc` says there is
+ * no reader -- the daemon's excerpts and speech -- and the text is UTC's,
+ * saying so. `now_ms` decides "today". */
+typedef struct oc_rt_clock {
+    int     tz_min;
+    int     time24;     /* 24-hour clock, else 12-hour with AM/PM */
+    int     utc;
+    int64_t now_ms;
+} oc_rt_clock;
+
+enum { OC_RT_TIME_SHORT = 0,   /* "15:00" today, else "Fri 30 Oct, 15:00", or
+                                * with the year when it is not this year's */
+       OC_RT_TIME_FULL };      /* "Friday 30 October 2026, 15:00 (UTC+05:30)" */
+
+/* `ms` as `clock` shows it, in the form `form`, into `out` (NUL-terminated).
+ * Returns the length written. A `clock` of NULL is the daemon's: UTC, 24-hour,
+ * "today" by the system clock. */
+size_t oc_rt_time_text(int64_t ms, const oc_rt_clock *clock, int form, char *out, size_t cap);
+
 /* `body` on one line for an excerpt -- a sidebar preview, a toast, a search
- * hit: each table becomes "Table: N rows × M columns" and every other byte is
- * kept. Writes at most `cap` bytes including the NUL, cutting only at a UTF-8
+ * hit: each table becomes "Table: N rows × M columns", each time token its
+ * short text for `clock` (NULL: UTC, saying so), and every other byte is kept.
+ * Writes at most `cap` bytes including the NUL, cutting only at a UTF-8
  * boundary, and returns the length written. */
+size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, char *out, size_t cap);
+
+/* Only the time tokens of `body` replaced by their short text for `clock`,
+ * every other byte kept, tables included: a body as a frontend that shows the
+ * source shows it (the terminal client, MARKDOWN.md §5). Returns a malloc'd
+ * string, or NULL when there is no token (show `body` as it is) or no memory. */
+char *oc_rt_local_times(const char *body, size_t len, const oc_rt_clock *clock);
+
+/* oc_rt_flatten_at for no reader: time tokens in UTC. */
 size_t oc_rt_flatten(const char *body, size_t len, char *out, size_t cap);
 
 #endif /* OC_RICHTEXT_H */

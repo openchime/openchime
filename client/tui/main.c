@@ -47,6 +47,7 @@
 #include "client.h"
 #include "model.h"
 #include "mention.h"    /* OC_MENTION_NAME_MAX: a broadcast mention as written */
+#include "richtext.h"   /* time tokens, shown in this terminal's own zone */
 #include "complete.h"
 #include "resolve.h"    /* workspace -> host:port (REQ-010/011) */
 #include "store.h"      /* peek a stored session token (skip the sign-in box) */
@@ -308,7 +309,14 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
             for (size_t k = rstart; k < r->n; k++) r->v[k].mi = mi;
             return;
         }
-        wrap_push(r, m->body ? m->body : "", TB_DEFAULT, width, 4);
+        /* The source as written (MARKDOWN.md §5), except a time token, which
+         * is shown as its time here: the token itself reads in UTC (§1b). */
+        oc_rt_clock k;
+        oc_model_clock(NULL, (int64_t)time(NULL) * 1000, &k);
+        k.time24 = !(g_cfg && !g_cfg->time_24h);
+        char *loc = m->body ? oc_rt_local_times(m->body, strlen(m->body), &k) : NULL;
+        wrap_push(r, loc ? loc : m->body ? m->body : "", TB_DEFAULT, width, 4);
+        free(loc);
     }
     for (uint8_t k = 0; k < m->n_attach; k++) {           /* attachments (REQ-140) */
         const oc_attachment *a = &m->attach[k];

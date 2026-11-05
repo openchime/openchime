@@ -18,7 +18,7 @@ static int said(const char *body, const char *want) {
 }
 
 int run_speakable_tests(void) {
-    printf("test_speakable: plain text, formatting, code, links, mentions, quotes, emoji, lines, not renderable, segments\n");
+    printf("test_speakable: plain text, formatting, code, links, mentions, quotes, emoji, lines, not renderable, segments, time tokens\n");
     CHECK(said("Can you look at the logs?", "Can you look at the logs?"));
     CHECK(said("this is *really* _important_ and ~not~ that", "this is really important and not that"));
     CHECK(said("run `make test` first", "run make test first"));
@@ -27,6 +27,15 @@ int run_speakable_tests(void) {
     CHECK(said("numbers\n| who | n |\n|---|--:|\n| @alice | 1 |\n| bob | 2 |\nthanks",
                "numbers. Table, 2 rows. thanks"));
     CHECK(said("| a |\n|---|\n| 1 |", "Table, 1 row."));
+    /* A time token in full, in UTC: speech has no reader's zone. Inside code
+     * it is not a time, so no date is said. */
+    CHECK(said("standup at <time:2026-10-30T15:00Z> sharp",
+               "standup at Friday 30 October 2026, 15:00 UTC sharp"));
+    {
+        char out[OC_SPEAK_MAX + 1];
+        oc_speakable("type `<time:2026-10-30T15:00Z>`", 32, names, NULL, out, sizeof out);
+        CHECK(strstr(out, "October") == NULL);
+    }
     CHECK(said("see https://www.github.com/openchime/openchime/pull/285 for it", "see github.com for it"));
     CHECK(said("read [the release notes](https://example.com/notes) today", "read the release notes today"));
     CHECK(said("thanks @dana and @fox", "thanks Dana Scully and fox"));

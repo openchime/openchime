@@ -15,7 +15,9 @@
 #include "url.h"   /* shared/: the address rules the daemon must agree with */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define RT_NONE ((size_t)-1)
 
@@ -129,6 +131,68 @@ static size_t labelled_len(rt_ctx *c, size_t i, size_t e, size_t *close) {
     return j + 2 + L + 1 - i;
 }
 
+/* ---- time tokens (MARKDOWN.md §1c) ----------------------------------------
+ *
+ * `<time:YYYY-MM-DDTHH:MM[:SS]Z>`: a moment, stored in UTC and readable as
+ * written in a client that does not render it. The calendar is the proleptic
+ * Gregorian one, by Howard Hinnant's days-from-civil, so no C library time zone
+ * or range limit is involved. */
+static int64_t floor_div(int64_t a, int64_t b) { int64_t q = a / b; return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q; }
+
+static int64_t days_from_civil(int64_t y, int m, int d) {
+    y -= m <= 2;
+    int64_t era = floor_div(y, 400);
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+static void civil_from_days(int64_t z, int64_t *y, int *m, int *d) {
+    z += 719468;
+    int64_t era = floor_div(z, 146097);
+    int64_t doe = z - era * 146097;
+    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int64_t mp = (5 * doy + 2) / 153;
+    *d = (int)(doy - (153 * mp + 2) / 5 + 1);
+    *m = (int)(mp < 10 ? mp + 3 : mp - 9);
+    *y = yoe + era * 400 + (*m <= 2);
+}
+
+static int rt_digits(const char *b, size_t i, int n, int *v) {
+    int x = 0;
+    for (int k = 0; k < n; k++) {
+        char ch = b[i + (size_t)k];
+        if (ch < '0' || ch > '9') return 0;
+        x = x * 10 + (ch - '0');
+    }
+    *v = x;
+    return 1;
+}
+
+/* A time token at `i`, ending before `e`: its length, with the moment in *ms;
+ * else 0. A date that does not exist (30 February) is not a token. */
+static size_t time_len(const char *b, size_t e, size_t i, int64_t *ms) {
+    static const int MDAYS[12] = { 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    int Y, M, D, h, mi, sec = 0;
+    size_t j = i + 6;
+    if (i + 6 + 16 + 2 > e || memcmp(b + i, "<time:", 6) != 0) return 0;
+    if (!rt_digits(b, j, 4, &Y) || b[j + 4] != '-' || !rt_digits(b, j + 5, 2, &M) || b[j + 7] != '-' ||
+        !rt_digits(b, j + 8, 2, &D) || b[j + 10] != 'T' || !rt_digits(b, j + 11, 2, &h) ||
+        b[j + 13] != ':' || !rt_digits(b, j + 14, 2, &mi)) return 0;
+    j += 16;
+    if (b[j] == ':') {
+        if (j + 3 + 2 > e || !rt_digits(b, j + 1, 2, &sec) || sec > 59) return 0;
+        j += 3;
+    }
+    if (j + 2 > e || b[j] != 'Z' || b[j + 1] != '>') return 0;
+    if (Y < 1 || M < 1 || M > 12 || D < 1 || D > MDAYS[M - 1] || h > 23 || mi > 59) return 0;
+    if (M == 2 && D == 29 && !((Y % 4 == 0 && Y % 100 != 0) || Y % 400 == 0)) return 0;
+    if (ms) *ms = ((days_from_civil(Y, M, D) * 86400) + h * 3600 + mi * 60 + sec) * 1000;
+    return j + 2 - i;
+}
+
 /* The first valid closer for a `d`-byte run of `ch` in [from, e), or RT_NONE.
  * Escapes, code spans and URLs are stepped over rather than looked inside, so
  * the `*` in "*a `b*c` d*" closes at the end and not in the middle — and an
@@ -183,6 +247,11 @@ static void scan_inline(rt_ctx *c, size_t s, size_t e, int depth) {
         if (c->in_cell && ch == '<') {
             size_t L = br_len(c, i, e);
             if (L) { emit(c, i, L, OC_RT_BREAK); i += L; continue; }
+        }
+        /* A time token is one span, like a URL: nothing inside it is markup. */
+        if (ch == '<') {
+            size_t L = time_len(c->b, e, i, NULL);
+            if (L) { emit(c, i, L, OC_RT_TIME); i += L; continue; }
         }
         /* Before the delimiter forms, so a URL is one span rather than a
          * scattering of whatever punctuation it happens to contain. It carries
@@ -504,25 +573,112 @@ size_t oc_rt_scan_cell(const char *body, size_t off, size_t len, oc_rt_span *out
     return c.n;
 }
 
-size_t oc_rt_flatten(const char *body, size_t len, char *out, size_t cap) {
+int oc_rt_time_value(const char *body, size_t len, const oc_rt_span *span, int64_t *ms) {
+    if (!body || !span || span->style != OC_RT_TIME || span->start + span->len > len) return 0;
+    return time_len(body, span->start + span->len, span->start, ms) == span->len;
+}
+
+size_t oc_rt_time_token(int64_t ms, char *out, size_t cap) {
+    int64_t s = floor_div(ms, 1000), days = floor_div(s, 86400), y;
+    int64_t sod = s - days * 86400;
+    int m, d, w;
+    civil_from_days(days, &y, &m, &d);
+    if (y < 1 || y > 9999) return 0;
+    if (sod % 60)
+        w = snprintf(out, cap, "<time:%04d-%02d-%02dT%02d:%02d:%02dZ>", (int)y, m, d,
+                     (int)(sod / 3600), (int)(sod / 60 % 60), (int)(sod % 60));
+    else
+        w = snprintf(out, cap, "<time:%04d-%02d-%02dT%02d:%02dZ>", (int)y, m, d,
+                     (int)(sod / 3600), (int)(sod / 60 % 60));
+    if (w < 0 || (size_t)w >= cap) { if (cap) out[0] = '\0'; return 0; }
+    return (size_t)w;
+}
+
+size_t oc_rt_time_text(int64_t ms, const oc_rt_clock *clock, int form, char *out, size_t cap) {
+    static const char *const WD[7] = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+    static const char *const MO[12] = { "January", "February", "March", "April", "May", "June", "July",
+                                        "August", "September", "October", "November", "December" };
+    oc_rt_clock utc = { 0, 1, 1, 0 };
+    const oc_rt_clock *k = clock ? clock : &utc;
+    int tz = k->utc ? 0 : k->tz_min;
+    int64_t now = k->now_ms ? k->now_ms : (int64_t)time(NULL) * 1000;
+    int64_t ls = floor_div(ms, 1000) + (int64_t)tz * 60, days = floor_div(ls, 86400), sod = ls - days * 86400;
+    int64_t ndays = floor_div(floor_div(now, 1000) + (int64_t)tz * 60, 86400), y, ny;
+    int m, d, nm, nd, hh = (int)(sod / 3600), mi = (int)(sod / 60 % 60);
+    int wd = (int)(((days % 7) + 11) % 7);           /* 1970-01-01 was a Thursday */
+    char clk[16];
+    int w;
+    if (!out || !cap) return 0;
+    civil_from_days(days, &y, &m, &d);
+    civil_from_days(ndays, &ny, &nm, &nd);
+    if (k->time24) snprintf(clk, sizeof clk, "%02d:%02d", hh, mi);
+    else           snprintf(clk, sizeof clk, "%d:%02d %s", hh % 12 ? hh % 12 : 12, mi, hh < 12 ? "AM" : "PM");
+    if (form == OC_RT_TIME_FULL) {
+        char zone[24];
+        if (k->utc)   snprintf(zone, sizeof zone, " UTC");
+        else if (!tz) snprintf(zone, sizeof zone, " (UTC)");
+        else          snprintf(zone, sizeof zone, " (UTC%c%02d:%02d)", tz < 0 ? '-' : '+',
+                               (tz < 0 ? -tz : tz) / 60, (tz < 0 ? -tz : tz) % 60);
+        w = snprintf(out, cap, "%s %d %s %lld, %s%s", WD[wd], d, MO[m - 1], (long long)y, clk, zone);
+    } else if (days == ndays) {
+        w = snprintf(out, cap, "%s%s", clk, k->utc ? " UTC" : "");
+    } else if (y == ny) {
+        w = snprintf(out, cap, "%.3s %d %.3s, %s%s", WD[wd], d, MO[m - 1], clk, k->utc ? " UTC" : "");
+    } else {
+        w = snprintf(out, cap, "%.3s %d %.3s %lld, %s%s", WD[wd], d, MO[m - 1], (long long)y, clk,
+                     k->utc ? " UTC" : "");
+    }
+    if (w < 0) { out[0] = '\0'; return 0; }
+    return (size_t)w < cap ? (size_t)w : cap - 1;
+}
+
+/* What an excerpt puts in place of a construct: a table's one line, or a time
+ * token's text. */
+typedef struct { size_t start, len; int table; uint32_t rows, cols; int64_t ms; } rt_repl;
+
+size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, char *out, size_t cap) {
     oc_rt_table t[32];
-    size_t nt, k, i = 0, o = 0;
+    oc_rt_span sp[OC_RT_MAX];
+    rt_repl r[32 + OC_RT_MAX];
+    size_t nt, ns, nr = 0, k, i = 0, o = 0;
     if (!out || cap == 0) return 0;
     out[0] = '\0';
     if (!body) return 0;
     nt = oc_rt_tables(body, len, t, 32);
     if (nt > 32) nt = 32;                     /* past that, the rest stay as written */
-    for (k = 0; k <= nt && o + 1 < cap; k++) {
-        size_t upto = k < nt ? t[k].start : len, n = upto - i;
+    ns = memchr(body, '<', len) ? oc_rt_scan(body, len, sp, OC_RT_MAX) : 0;
+    if (ns > OC_RT_MAX) ns = OC_RT_MAX;
+    /* Both lists arrive sorted by start, and no span falls inside a table:
+     * merged, they are the excerpt's replacements in order. */
+    {
+        size_t a = 0, b = 0;
+        while (a < nt || b < ns) {
+            if (b < ns && sp[b].style != OC_RT_TIME) { b++; continue; }
+            if (a < nt && (b >= ns || t[a].start <= sp[b].start)) {
+                r[nr].start = t[a].start; r[nr].len = t[a].len; r[nr].table = 1;
+                r[nr].rows = t[a].rows; r[nr].cols = t[a].cols; nr++; a++;
+            } else {
+                r[nr].start = sp[b].start; r[nr].len = sp[b].len; r[nr].table = 0;
+                if (!oc_rt_time_value(body, len, &sp[b], &r[nr].ms)) { b++; continue; }
+                nr++; b++;
+            }
+        }
+    }
+    for (k = 0; k <= nr && o + 1 < cap; k++) {
+        size_t upto = k < nr ? r[k].start : len, n = upto - i;
         if (n > cap - 1 - o) n = cap - 1 - o;
         memcpy(out + o, body + i, n);
         o += n;
-        if (k < nt && o + 1 < cap) {
-            int w = snprintf(out + o, cap - o, "Table: %u row%s \xC3\x97 %u column%s",
-                             (unsigned)t[k].rows, t[k].rows == 1 ? "" : "s",
-                             (unsigned)t[k].cols, t[k].cols == 1 ? "" : "s");
+        if (k < nr && o + 1 < cap) {
+            int w;
+            if (r[k].table)
+                w = snprintf(out + o, cap - o, "Table: %u row%s \xC3\x97 %u column%s",
+                             (unsigned)r[k].rows, r[k].rows == 1 ? "" : "s",
+                             (unsigned)r[k].cols, r[k].cols == 1 ? "" : "s");
+            else
+                w = (int)oc_rt_time_text(r[k].ms, clock, OC_RT_TIME_SHORT, out + o, cap - o);
             if (w > 0) o += (size_t)w < cap - o ? (size_t)w : cap - 1 - o;
-            i = t[k].start + t[k].len;
+            i = r[k].start + r[k].len;
         }
     }
     /* Never end inside a character: if the last one is short of the bytes its
@@ -539,6 +695,37 @@ size_t oc_rt_flatten(const char *body, size_t len, char *out, size_t cap) {
     }
     out[o] = '\0';
     return o;
+}
+
+char *oc_rt_local_times(const char *body, size_t len, const oc_rt_clock *clock) {
+    oc_rt_span sp[OC_RT_MAX];
+    size_t ns, k, i = 0, o = 0, cap;
+    char *out;
+    if (!body || !memchr(body, '<', len)) return NULL;
+    ns = oc_rt_scan(body, len, sp, OC_RT_MAX);
+    if (ns > OC_RT_MAX) ns = OC_RT_MAX;
+    for (k = 0; k < ns && sp[k].style != OC_RT_TIME; k++) {}
+    if (k == ns) return NULL;
+    /* A token is at least 24 bytes and its text at most 40: room for each to grow. */
+    cap = len + ns * 48 + 1;
+    out = malloc(cap);
+    if (!out) return NULL;
+    for (k = 0; k < ns; k++) {
+        int64_t ms;
+        if (sp[k].style != OC_RT_TIME || !oc_rt_time_value(body, len, &sp[k], &ms)) continue;
+        memcpy(out + o, body + i, sp[k].start - i);
+        o += sp[k].start - i;
+        o += oc_rt_time_text(ms, clock, OC_RT_TIME_SHORT, out + o, cap - o);
+        i = sp[k].start + sp[k].len;
+    }
+    memcpy(out + o, body + i, len - i);
+    o += len - i;
+    out[o] = '\0';
+    return out;
+}
+
+size_t oc_rt_flatten(const char *body, size_t len, char *out, size_t cap) {
+    return oc_rt_flatten_at(body, len, NULL, out, cap);
 }
 
 int oc_rt_target(const char *body, size_t len, const oc_rt_span *span,

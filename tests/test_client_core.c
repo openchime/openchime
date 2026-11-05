@@ -10,6 +10,7 @@
 #include "testsignin.h" /* a person's sign-in, on the daemon's page */
 #include "model.h"
 #include "emoticon.h"
+#include "richtext.h"     /* time tokens: oc_rt_time_token, oc_rt_clock */
 #include "store.h"       /* to assert the persisted token/pin */
 #include "resolve.h"     /* workspace resolution (REQ-010/011) */
 #include "wellknown.h"   /* the optional `.well-known` half of REQ-010 */
@@ -1967,6 +1968,53 @@ static void test_broadcast_stored_model(void) {
     CHECK(bc_find(&m, 104) && bc_find(&m, 104)->broadcast_stored == 0);
     CHECK(bc_counts(&m, 104) == 0);
     oc_model_free(&m);
+}
+
+/* A time token in an excerpt reads in the reader's own zone and clock
+ * (MARKDOWN.md §1c). The zones are POSIX TZ rules, so no zone database is
+ * needed: UTC-8, UTC+5:30 and UTC+14, across the date line. The token is now,
+ * to the minute, so it is today in every zone and shows the time alone. */
+static void test_time_preview(void) {
+    const char *saved = getenv("TZ");
+    char keep[64] = "";
+    if (saved) snprintf(keep, sizeof keep, "%s", saved);
+    int64_t now = ((int64_t)time(NULL) / 60) * 60 * 1000;
+    char tok[48], body[96];
+    oc_rt_time_token(now, tok, sizeof tok);
+    snprintf(body, sizeof body, "standup %s", tok);
+    static const struct { const char *tz; int off; int h12; } Z[] = {
+        { "PST8", -480, 0 }, { "IST-5:30", 330, 1 }, { "LINT-14", 840, 0 }, { "UTC0", 0, 1 },
+    };
+    for (size_t k = 0; k < sizeof Z / sizeof Z[0]; k++) {
+        setenv("TZ", Z[k].tz, 1);
+        tzset();
+        oc_model m; oc_model_init(&m);
+        oc_model_set_clock12(&m, Z[k].h12);
+        oc_rt_clock want_clock = { Z[k].off, !Z[k].h12, 0, now };
+        char want[64], line[128];
+        int64_t lm = now / 1000 + Z[k].off * 60;
+        int hh = (int)(((lm % 86400) + 86400) % 86400 / 3600), mi = (int)(((lm % 3600) + 3600) % 3600 / 60);
+        if (Z[k].h12) snprintf(want, sizeof want, "standup %d:%02d %s", hh % 12 ? hh % 12 : 12, mi, hh < 12 ? "AM" : "PM");
+        else          snprintf(want, sizeof want, "standup %02d:%02d", hh, mi);
+        oc_rt_clock got_clock;
+        oc_model_clock(&m, now, &got_clock);
+        CHECK(got_clock.tz_min == want_clock.tz_min && got_clock.time24 == want_clock.time24);
+        oc_ev e;
+        memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 74; e.status = 1; e.op = OC_CHANNEL_KIND;
+        e.body = strdup("room");
+        oc_model_apply(&m, &e);
+        memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 74; e.message_id = 5; e.author_id = 2;
+        e.body = strdup(body);
+        oc_model_apply(&m, &e);
+        const oc_channel *c = oc_model_channel(&m, 74);
+        oc_model_msg_preview(&m, c ? &c->msgs[0] : NULL, line, sizeof line);
+        if (strcmp(line, want) != 0) printf("    %s: preview \"%s\", wanted \"%s\"\n", Z[k].tz, line, want);
+        CHECK(c && strcmp(c->preview, want) == 0);
+        CHECK(strcmp(line, want) == 0);
+        oc_model_free(&m);
+    }
+    if (saved) setenv("TZ", keep, 1); else unsetenv("TZ");
+    tzset();
 }
 
 static void test_poll_model(void) {
@@ -5721,6 +5769,7 @@ int run_client_core_tests(void) {
     test_broadcast_mentions_me();
     test_broadcast_stored_model();
     test_workspace_sender_model();
+    test_time_preview();
     test_badge_tiers();
     test_osnotify_null();
     test_feedback();

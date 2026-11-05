@@ -26,6 +26,7 @@ construct shows its source legibly.
 | Link | `https://example.com` | Not typed as markup: a bare `http`/`https` address is **autolinked**. |
 | Labelled link | `[label](https://example.com)` | Text that links to an address. The reader always sees the address before it opens — see §4. |
 | Table | `\| a \| b \|` over `\|---\|---\|` | A pipe table, as GitHub writes it — see §1a. |
+| Time | `<time:2026-10-30T15:00Z>` | A moment, shown to each reader in their own zone — see §1c. |
 
 Emphasis nests (`*bold with _italic_ inside*`); code does not — everything inside
 a code span or block is literal, including other delimiters.
@@ -101,6 +102,39 @@ An emoticon converts only as a word of its own: whitespace or the start before
 it, whitespace or the end after it, so `a:)b` and an address's `://` are left
 alone. Nothing inside inline code or a fenced block converts, including a code
 span still being typed.
+
+## 1c. Times
+
+A time written for people in several zones is a **time token**:
+
+```
+Standup moves to <time:2026-10-30T15:00Z>.
+```
+
+It is ISO 8601 in UTC: `<time:YYYY-MM-DDTHH:MM>` with optional `:SS`, ending
+in `Z`. The token is what is stored, sent and searched, so a client that does
+not render it, an export, or a notification still shows a time a person can
+read. Each client draws it as that moment **in the reader's own zone**, on
+their own 12- or 24-hour clock: the time alone when it is today for them, the
+day and date otherwise, and the year when it is not this year
+("15:00", "Fri 30 Oct, 07:00", "Fri 30 Oct 2026, 20:30"). Hovering it, or
+moving the keyboard onto its message, shows all of it with the zone used:
+"Friday 30 October 2026, 20:30 (UTC+05:30)". The terminal client shows the
+short form in place of the token.
+
+Only a real date and time are a token: `<time:2026-02-30T10:00Z>`, an hour past
+23, a missing `Z` or an offset in its place leave the text as typed. Inside
+code it is literal. The composer's **Insert a time** picks a date and time in
+your own zone and writes the token; typing one by hand works the same. The
+desktop client draws up to 16 in a message and 8 in a table cell, custom emoji
+included; any more stay as typed, which still says the moment in UTC.
+
+The parser reports one `OC_RT_TIME` span over the token, with no delimiter
+(`oc_rt_time_value` gives the moment). In a one-line excerpt the token becomes
+its short text in the reader's zone (`oc_rt_flatten_at`). Where there is no
+reader — the daemon's excerpts and read-aloud — it is UTC and says so:
+"15:00 UTC", and read aloud in full, "Friday 30 October 2026, 15:00 UTC".
+A push notification carries no message text, so it is unaffected.
 
 ## 2. When a delimiter is *not* markup
 

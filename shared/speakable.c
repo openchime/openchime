@@ -130,6 +130,17 @@ static size_t speak(const char *body, size_t len, oc_speak_name_fn resolve, void
                 say_host(&b, body + s->start, s->len);
                 i = s->start + s->len;
                 handled = 1;
+            } else if (st == OC_RT_TIME) {
+                /* A time token is said in full, in UTC and saying so: speech
+                 * is made for no one reader, so it has no reader's zone. */
+                int64_t at;
+                char when[96];
+                if (oc_rt_time_value(body, len, s, &at)) {
+                    space(&b);
+                    puts_(&b, oc_rt_time_text(at, NULL, OC_RT_TIME_FULL, when, sizeof when) ? when : "");
+                }
+                i = s->start + s->len;
+                handled = 1;
             }
         }
         if (handled) continue;

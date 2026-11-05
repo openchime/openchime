@@ -617,6 +617,10 @@ typedef struct {
      * followed because this person never set their own (OC_DND_FROM_DEFAULT). */
     uint8_t   dnd_default;
     int16_t   tz_offset_min;
+    /* The reader's clock for time tokens (MARKDOWN.md §1c): 12-hour when set.
+     * A frontend preference, told to the model (oc_model_set_clock12) so the
+     * excerpts it builds read as the frontend does. */
+    uint8_t   clock12;
     uint16_t  allow_start_min, allow_end_min;
     oc_schedule_day sched_days[OC_SCHEDULE_DAYS];
     uint8_t   n_sched_days;
@@ -1172,6 +1176,14 @@ int oc_model_has_default_quiet_hours(const oc_model *m);
 /* Whether the workspace has read receipts on (`read_receipts`, REQ-090): off,
  * nobody's position reaches anyone and no seen-by is drawn. */
 int oc_model_receipts_on(const oc_model *m);
+/* Time tokens (MARKDOWN.md §1c) as this reader sees them: in this device's own
+ * zone at that moment, on the clock the frontend set (12- or 24-hour).
+ * oc_model_clock fills a richtext clock for moment `at_ms`; oc_model_time_text
+ * writes `at_ms` in form OC_RT_TIME_SHORT or OC_RT_TIME_FULL. */
+struct oc_rt_clock;
+void   oc_model_set_clock12(oc_model *m, int on);
+void   oc_model_clock(const oc_model *m, int64_t at_ms, struct oc_rt_clock *out);
+size_t oc_model_time_text(const oc_model *m, int64_t at_ms, int form, char *out, size_t cap);
 
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);

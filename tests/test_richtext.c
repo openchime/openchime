@@ -466,6 +466,122 @@ static void test_table_flatten(void) {
     for (size_t i = 0; i < n; i++) CHECK((unsigned char)small[i] != 0xC3 || i + 1 < n);
 }
 
+/* Time tokens (MARKDOWN.md §1c): what is one, and what is not. */
+static void test_time_tokens(void) {
+    const char *b = "Meet at <time:2026-10-30T15:00Z> please";
+    int64_t ms = 0;
+    CHECK(span_over(b, "<time:2026-10-30T15:00Z>", OC_RT_TIME));
+    CHECK(content_spans(b, OC_RT_TIME) == 1);
+    {
+        size_t n = scan(b), i;
+        for (i = 0; i < n && g_sp[i].style != OC_RT_TIME; i++) {}
+        CHECK(i < n && oc_rt_time_value(b, strlen(b), &g_sp[i], &ms) && ms == 1793372400000LL);
+    }
+    /* Seconds, and a leap day that exists. */
+    CHECK(span_over("<time:2028-02-29T00:00:30Z>", "<time:2028-02-29T00:00:30Z>", OC_RT_TIME));
+    /* Not a token: a day that does not exist, an hour past 23, no Z, an
+     * offset instead of Z, a space for the T, a leap day in a common year. */
+    CHECK(content_spans("<time:2026-02-30T10:00Z>", OC_RT_TIME) == 0);
+    CHECK(content_spans("<time:2026-10-30T24:00Z>", OC_RT_TIME) == 0);
+    CHECK(content_spans("<time:2026-10-30T15:00>", OC_RT_TIME) == 0);
+    CHECK(content_spans("<time:2026-10-30T15:00+01:00>", OC_RT_TIME) == 0);
+    CHECK(content_spans("<time:2026-10-30 15:00Z>", OC_RT_TIME) == 0);
+    CHECK(content_spans("<time:2026-02-29T10:00Z>", OC_RT_TIME) == 0);
+    CHECK(content_spans("<time:2026-10-30T15:00Z", OC_RT_TIME) == 0);
+    /* Code is literal. */
+    CHECK(content_spans("`<time:2026-10-30T15:00Z>`", OC_RT_TIME) == 0);
+    CHECK(content_spans("```\n<time:2026-10-30T15:00Z>\n```", OC_RT_TIME) == 0);
+    /* Inside emphasis it is still one. */
+    CHECK(span_over("*by <time:2026-10-30T15:00Z>*", "<time:2026-10-30T15:00Z>", OC_RT_TIME));
+    /* The token for a moment, and back. */
+    {
+        char t[48];
+        CHECK(oc_rt_time_token(1793372400000LL, t, sizeof t) > 0 && strcmp(t, "<time:2026-10-30T15:00Z>") == 0);
+        CHECK(oc_rt_time_token(1835395230000LL, t, sizeof t) > 0 && strcmp(t, "<time:2028-02-29T00:00:30Z>") == 0);
+        CHECK(oc_rt_time_token(-60000LL, t, sizeof t) > 0 && strcmp(t, "<time:1969-12-31T23:59Z>") == 0);
+        CHECK(oc_rt_time_token(1793372400000LL, t, 8) == 0);
+    }
+}
+
+/* A moment as a reader is shown it: their zone, their clock, "today". */
+static void test_time_text(void) {
+    const int64_t at = 1793372400000LL;                 /* Friday 30 October 2026, 15:00 UTC */
+    char out[96];
+    /* The same day for the reader: the time alone. */
+    oc_rt_clock utc0 = { 0, 1, 0, at };
+    oc_rt_time_text(at, &utc0, OC_RT_TIME_SHORT, out, sizeof out);
+    CHECK(strcmp(out, "15:00") == 0);
+    /* UTC-8, same day there: 07:00. */
+    oc_rt_clock la = { -480, 1, 0, at };
+    oc_rt_time_text(at, &la, OC_RT_TIME_SHORT, out, sizeof out);
+    CHECK(strcmp(out, "07:00") == 0);
+    /* UTC+5:30, and the 12-hour clock. */
+    oc_rt_clock in = { 330, 0, 0, at };
+    oc_rt_time_text(at, &in, OC_RT_TIME_SHORT, out, sizeof out);
+    CHECK(strcmp(out, "8:30 PM") == 0);
+    /* UTC+14: across the date line it is Saturday there. "Now" is the same
+     * instant, so it is today -- the reader's today, not UTC's. */
+    oc_rt_clock kiri = { 840, 1, 0, at };
+    oc_rt_time_text(at, &kiri, OC_RT_TIME_SHORT, out, sizeof out);
+    CHECK(strcmp(out, "05:00") == 0);
+    oc_rt_time_text(at, &kiri, OC_RT_TIME_FULL, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Saturday 31 October 2026, 05:00 (UTC+14:00)") == 0);
+    /* A day earlier than now, in the reader's zone: with the date. */
+    oc_rt_clock later = { -480, 1, 0, at + 86400000LL };
+    oc_rt_time_text(at, &later, OC_RT_TIME_SHORT, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Fri 30 Oct, 07:00") == 0);
+    /* Another year: with the year. */
+    oc_rt_clock nextyear = { 0, 1, 0, at + 400LL * 86400000LL };
+    oc_rt_time_text(at, &nextyear, OC_RT_TIME_SHORT, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Fri 30 Oct 2026, 15:00") == 0);
+    /* The full form names the zone used. */
+    oc_rt_time_text(at, &in, OC_RT_TIME_FULL, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Friday 30 October 2026, 8:30 PM (UTC+05:30)") == 0);
+    oc_rt_time_text(at, &la, OC_RT_TIME_FULL, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Friday 30 October 2026, 07:00 (UTC-08:00)") == 0);
+    oc_rt_time_text(at, &utc0, OC_RT_TIME_FULL, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Friday 30 October 2026, 15:00 (UTC)") == 0);
+    /* Midnight and noon on the 12-hour clock. */
+    oc_rt_clock h12 = { 0, 0, 0, at };
+    oc_rt_time_text(at - 15LL * 3600000LL, &h12, OC_RT_TIME_SHORT, out, sizeof out);
+    CHECK(strcmp(out, "12:00 AM") == 0);
+    oc_rt_time_text(at - 3LL * 3600000LL, &h12, OC_RT_TIME_SHORT, out, sizeof out);
+    CHECK(strcmp(out, "12:00 PM") == 0);
+    /* No reader -- the daemon -- says UTC. */
+    oc_rt_clock daemon = { 330, 1, 1, at };
+    oc_rt_time_text(at, &daemon, OC_RT_TIME_SHORT, out, sizeof out);
+    CHECK(strcmp(out, "15:00 UTC") == 0);
+    oc_rt_time_text(at, &daemon, OC_RT_TIME_FULL, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Friday 30 October 2026, 15:00 UTC") == 0);
+}
+
+/* An excerpt carries the time as text, in the reader's zone or UTC. */
+static void test_time_flatten(void) {
+    const int64_t at = 1793372400000LL;
+    char out[160];
+    const char *b = "Standup <time:2026-10-30T15:00Z>, and `<time:2026-10-30T15:00Z>` stays";
+    oc_rt_clock in = { 330, 1, 0, at };
+    oc_rt_flatten_at(b, strlen(b), &in, out, sizeof out);
+    /* contract: the form MARKDOWN.md §1c specifies */
+    CHECK(strcmp(out, "Standup 20:30, and `<time:2026-10-30T15:00Z>` stays") == 0);
+    /* With a table before it, both are replaced, in order. */
+    const char *t = "| a |\n|---|\n| 1 |\nthen <time:2026-10-30T15:00Z>";
+    oc_rt_clock utc = { 0, 1, 1, at };
+    oc_rt_flatten_at(t, strlen(t), &utc, out, sizeof out);
+    /* contract: the excerpt wording is what MARKDOWN.md §1a and §1b specify */
+    CHECK(strcmp(out, "Table: 1 row \xC3\x97 1 column\nthen 15:00 UTC") == 0);
+    /* An invalid token is text, as written. */
+    oc_rt_flatten_at("<time:2026-13-01T00:00Z>", 24, &in, out, sizeof out);
+    CHECK(strcmp(out, "<time:2026-13-01T00:00Z>") == 0);
+}
+
 int run_richtext_tests(void) {
     failures = 0;
     test_emphasis();
@@ -482,7 +598,11 @@ int run_richtext_tests(void) {
     test_tables();
     test_table_cells();
     test_table_flatten();
+    test_time_tokens();
+    test_time_text();
+    test_time_flatten();
     printf("test_richtext: emphasis, literal delimiters, escapes, code, fenced blocks, labelled links, "
-           "quotes and lists, nesting, byte offsets, autolinking, truncation, tables and their cells and excerpts\n");
+           "quotes and lists, nesting, byte offsets, autolinking, truncation, tables and their cells and excerpts, "
+           "time tokens in every zone\n");
     return failures;
 }
