@@ -2255,6 +2255,9 @@ feature.*
   external DMs** have not been supported. Cross-tenant messaging is precluded by
   the island model (ARCH-4/REQ-040); federation between tenants is a separate
   deployment concern (ARCH-76), not an in-product shared-channel feature.
+  Reaffirmed on 2026-10-31: shared channels would reopen the island model
+  (ARCH-4, REQ-040) -- one daemon trusting another, identities from a foreign
+  workspace, and a question of where each copy of a message is stored.
 - **REQ-275.** *(Excluded by decision)* A **first-party bot/assistant and an MCP (Model Context Protocol)
   server surface** have not been provided beyond the third-party app platform
   (REQ-172). OpenChime ships no built-in assistant and exposes no MCP server; such
