@@ -384,20 +384,26 @@ jobs:
       # single directory as the path uploads its contents, so each job
       # downloads its own back to candidate/<platform>/, where the steps below
       # read it. The manifest has done its work by now and is not carried on.
+      # Every upload in this workflow is kept one day: a failed release is
+      # finished with Re-run failed jobs only while they last, since publish
+      # downloads them, and a re-run a day or more after the run fails there.
       - uses: actions/upload-artifact@v7
         with:
           name: candidate-linux-amd64
           path: candidate/linux-amd64
+          retention-days: 1
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
         with:
           name: candidate-linux-arm64
           path: candidate/linux-arm64
+          retention-days: 1
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
         with:
           name: candidate-windows-x64
           path: candidate/windows-x64
+          retention-days: 1
           if-no-files-found: error
 
   # The number is a label on the release-candidate's build id, and it is the
@@ -549,6 +555,7 @@ jobs:
             ${{ env.DIST }}/*.rpm
             ${{ env.DIST }}/*.tar.gz
             ${{ env.DIST }}/*.sha256
+          retention-days: 1
           if-no-files-found: error
 
 
@@ -672,6 +679,7 @@ jobs:
         with:
           name: ${{ env.PLATFORM }}
           path: ${{ env.DIST }}/*
+          retention-days: 1
           if-no-files-found: error
 
   # main takes the release here, once the number is reserved and everything is
