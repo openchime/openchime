@@ -2189,11 +2189,12 @@ a client that is not running cannot clear its own status.
 
 `SET_AVATAR` takes an **attachment id, never bytes**, so the upload path's dedup,
 size cap and reclamation all keep working. The id is validated rather than
-trusted: it must exist, have a non-zero size (the size declared at `UPLOAD_BEGIN`; the
-daemon does not check that the upload finished), carry an `image/*` MIME type, **and have
-been uploaded by the caller**. That last check is load-bearing — avatars are
-readable workspace-wide, so without it a member could point their avatar at
-somebody else's private-channel attachment.
+trusted: it must exist, be finished (its bytes arrived) and not reclaimed, carry an
+`image/*` MIME type, **and have been uploaded by the caller**. An unknown, unfinished,
+reclaimed, non-image or another person's attachment is refused with the non-fatal
+`UNKNOWN_ATTACHMENT` (3011), and the avatar is left as it was. The ownership check is
+load-bearing — avatars are readable workspace-wide, so without it a member could point
+their avatar at somebody else's private-channel attachment.
 
 ### 5.16f Drafts and scheduled messages
 

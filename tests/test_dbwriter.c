@@ -6552,7 +6552,7 @@ static void test_avatar(void) {
     CHECK(alice && bob);
 
     /* A private channel bob cannot read, holding an image alice uploaded, plus a
-     * non-image and an unfinalized row to reject. */
+     * non-image, an upload still in progress and a reclaimed image to reject. */
     oc_dbres *r = create_channel(w, alice, "avpriv", 0);
     CHECK(r && r->type == OC_RES_CHANNEL_INFO);
     uint64_t priv = r->channel_id;
@@ -6560,13 +6560,15 @@ static void test_avatar(void) {
     {
         sqlite3 *raw = NULL;
         CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
-        char sql[512];
+        char sql[768];
         snprintf(sql, sizeof sql,
             "INSERT INTO attachments(id,channel_id,message_id,uploader_id,storage_key,"
-            "  filename,mime,size,sha256,created_at_ms) VALUES"
-            "  (1,%llu,NULL,%llu,'k1','face.png','image/png',10,x'00',1),"      /* alice's image */
-            "  (2,%llu,NULL,%llu,'k2','doc.pdf','application/pdf',10,x'00',1)," /* not an image */
-            "  (3,%llu,NULL,%llu,'k3','half.png','image/png',0,NULL,1);",       /* not finalized */
+            "  filename,mime,size,sha256,created_at_ms,reclaimed_at_ms) VALUES"
+            "  (1,%llu,NULL,%llu,'k1','face.png','image/png',10,x'00',1,0),"      /* alice's image */
+            "  (2,%llu,NULL,%llu,'k2','doc.pdf','application/pdf',10,x'00',1,0)," /* not an image */
+            "  (3,%llu,NULL,%llu,'k3','half.png','image/png',10,NULL,1,0),"       /* in progress: size declared, bytes not here */
+            "  (4,%llu,NULL,%llu,'k4','gone.png','image/png',10,x'00',1,5);",     /* finished, then reclaimed */
+            (unsigned long long)priv, (unsigned long long)alice,
             (unsigned long long)priv, (unsigned long long)alice,
             (unsigned long long)priv, (unsigned long long)alice,
             (unsigned long long)priv, (unsigned long long)alice);
@@ -6582,13 +6584,13 @@ static void test_avatar(void) {
     CHECK(r && r->type == OC_RES_PROFILE_INFO && r->pf_avatar == 1);
     oc_dbres_free(r);
 
-    /* A non-image, an unfinalized upload, an id that does not exist, and — the
-     * important one — SOMEBODY ELSE'S attachment are all refused. Without the last
-     * check any member could publish a private channel's file to the whole
-     * workspace by pointing their avatar at it. */
-    uint64_t bad[4] = { 2, 3, 999, 1 };
-    uint64_t who[4] = { alice, alice, alice, bob };
-    for (int k = 0; k < 4; k++) {
+    /* A non-image, an upload still in progress, a reclaimed image, an id that
+     * does not exist, and — the important one — SOMEBODY ELSE'S attachment are
+     * all refused. Without the last check any member could publish a private
+     * channel's file to the whole workspace by pointing their avatar at it. */
+    uint64_t bad[5] = { 2, 3, 4, 999, 1 };
+    uint64_t who[5] = { alice, alice, alice, alice, bob };
+    for (int k = 0; k < 5; k++) {
         j = oc_job_new(OC_JOB_SET_AVATAR, 2);
         j->user_id = who[k]; j->message_id = bad[k];
         oc_dbwriter_submit(w, j);

@@ -8959,7 +8959,11 @@ static oc_dbres *process_set_avatar(sqlite3 *db, const oc_job *j) {
         int ok = 0;
         sqlite3_prepare_v2(db,
             "SELECT 1 FROM attachments WHERE id=?1 AND uploader_id=?2 "
-            "  AND size > 0 AND mime LIKE 'image/%';", -1, &ck, NULL);
+            "  AND size > 0 AND mime LIKE 'image/%' "
+            /* Finished (its bytes arrived: sha256 is set when they do, as
+             * link_attachments requires) and not reclaimed: an image that is
+             * there. */
+            "  AND sha256 IS NOT NULL AND reclaimed_at_ms = 0;", -1, &ck, NULL);
         sqlite3_bind_int64(ck, 1, (sqlite3_int64)aid);
         sqlite3_bind_int64(ck, 2, (sqlite3_int64)j->user_id);
         ok = (sqlite3_step(ck) == SQLITE_ROW);
