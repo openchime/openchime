@@ -18,4 +18,10 @@ const char *oc_env_dev(const char *name);
 /* Whether OPENCHIME_MODE is development. */
 int oc_env_is_dev(void);
 
+/* The credential store's service name: "openchime-dev" for a client the test
+ * harness drives (development mode with OPENCHIME_DEV_DIR, the hook's own
+ * condition), so a fixture never reads or writes the person's own saved
+ * sign-ins; "openchime" otherwise. */
+const char *oc_env_secret_service(void);
+
 #endif

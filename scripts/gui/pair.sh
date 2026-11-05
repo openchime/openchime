@@ -108,7 +108,7 @@ up)
     # Naming the host differently instead does NOT work, and it is worth
     # recording why: no 127.x address but 127.0.0.1 reaches it at all, because
     # the daemon runs under WSL and WSL forwards only 127.0.0.1.
-    powershell.exe -NoProfile -Command "cmdkey /delete:openchime:${host}:${PORT}" \
+    powershell.exe -NoProfile -Command "cmdkey /delete:openchime-dev:${host}:${PORT}" \
       >/dev/null 2>&1 || true
 
     # The test audio switches go through to the client as they do in

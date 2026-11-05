@@ -20572,7 +20572,14 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
      * Files view draws its own header with an Upload button where the listen
      * button sits, and the channel header's rect outlived the frame that drew
      * it -- so the fit check paired a button nobody could see with the one
-     * really there. A rect is a hit-box as much as a row is. */
+     * really there. A rect is a hit-box as much as a row is.
+     *
+     * THE RAIL IS THE FIFTH. The sign-in card draws no rail, so signing out of
+     * the only workspace left the last session's rows behind, Admin among them,
+     * and the published scene asked the model that had just gone about Admin's
+     * alerts: a crash on Windows, and a read of whatever is at that address on
+     * the web. */
+    g_n_navrows = 0;
     g_n_msgrows = 0;
     g_n_tabhits = 0;          /* the grids of tables (MARKDOWN.md §1a) */
     g_n_shelf = 0;
@@ -24042,8 +24049,11 @@ static void a11y_publish_scene(const oc_model *m) {
      * and buttons are unreachable by pointer and must be unreachable by AT and
      * by the harness alike — publishing them invited a screen reader to invoke
      * a message the user cannot see, and made chromefit compare a card's
-     * content against chrome underneath it. Skip straight to the modal block. */
-    if (modal_open()) goto modal_items;
+     * content against chrome underneath it. Skip straight to the modal block.
+     * Signed out, there is no model and no shell: render_scene drew the sign-in
+     * card and whatever it asks over itself, so only that block has anything
+     * true to say, and nothing above it may read `m`. */
+    if (modal_open() || !m) goto modal_items;
     /* An open MENU owns it for the same reason: the click handler consumes
      * every click while one is up. Menus were invisible to AT entirely — now
      * their rows (and the pause flyout's) are the tree while they are open. */
@@ -38261,7 +38271,7 @@ int main(int argc, char *argv[]) {
     crumbs_start();
     crumb("start");
 
-    g_secret = oc_secret_open_os("openchime");
+    g_secret = oc_secret_open_os(oc_env_secret_service());
     oc_sidebar_opts_defaults(&g_sb);
 
     /* Credential resolution, uniform with the TUI:
