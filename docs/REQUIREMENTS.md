@@ -2261,3 +2261,15 @@ feature.*
   a thing could be built as an installed app, but is not a core feature. Summaries
   of a channel or DM (REQ-310) are a core feature and are not an assistant: they
   answer no questions, take no actions and post nothing.
+- **REQ-315.** *(Excluded by decision)* **Translating the clients' interface** into other
+  languages has not been provided. It touches every string in three clients, and
+  is a separate project to be taken up as one, not a feature added piece by piece.
+- **REQ-316.** *(Excluded by decision)* **Public channels readable without an account** have
+  not been offered. Every reader is a member of the workspace (REQ-031); an
+  anonymous view is a large surface with security weight, for little demand in a
+  self-hosted product.
+- **REQ-317.** *(Excluded by decision)* **Topics as a second level within a channel** —
+  naming, renaming and resolving a topic, or requiring one on every message — have
+  not been supported. A channel's conversation is one stream with threads under
+  its messages (REQ-060); a second level would change how every message is placed,
+  read and searched.
