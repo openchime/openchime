@@ -2132,6 +2132,70 @@ messages (author name, ARCH-74).*
   DMs, no private channels, no API, deleted 10 days after download. Compliance
   capture is a differentiator in this segment, not table stakes.
 
+  **Settled by ARCH-122**, with the design in
+  [Plans/COMPLIANCE-CAPTURE.md](./Plans/COMPLIANCE-CAPTURE.md): the file drop is
+  built first, the pull API second and SMTP journaling after them, all three
+  reading one record of what changed. What a captured record holds, who may
+  read it and how a person becomes an email address are REQ-340–345.
+
+- **REQ-340.** Compliance capture has delivered **one extract schema** in every
+  mechanism: a captured **message, edit, deletion, draft, file, channel and
+  user** has each been a record with its own fields — the ids it concerns, the
+  server's timestamps (REQ-050), its author or actor, and its content as stored
+  — and a record has carried the same fields as `X-OpenChime-` headers of its
+  EML and as members of its pull-API JSON, so an archive fed by one mechanism
+  has held what an archive fed by the other holds. Every record has had a
+  **capture sequence number**, server-assigned and strictly increasing, which
+  is the cursor each mechanism keeps and the key the pull API pages by
+  (REQ-276's keyset cursor). Turning capture on has begun with a **baseline**:
+  every channel, user and stored message as it stands, marked as a baseline,
+  since what changed before capture was on was not recorded (ARCH-122).
+- **REQ-341.** The pull API has been read with a **capture credential**, never
+  a user session (REQ-182): **minted by an owner**, shown once and **stored
+  only as its hash** (as a session token is, ARCH-58), carrying a label and a
+  **scope**, **revocable** by any owner with effect on the next request,
+  **rate-limited** per credential, and **audited in a family of its own** —
+  each mint, grant, revocation and read recorded beside the four families of
+  REQ-251, never the credential itself. A credential has been able to read
+  through the pull API and nothing else: it has opened no session, sent
+  nothing and held no role.
+- **REQ-342.** A captured person has been given **an email address by one
+  rule**, the same in the EML and the pull API: the address a sign-in
+  provider **verified**, else the **address on the profile**, else
+  `<username>@<workspace address>`, **marked as synthetic** wherever it
+  appears, so an archive has never taken a made-up address for a mailbox
+  someone reads. A record has also carried the user's id, so the person stays
+  identifiable when the address changes.
+- **REQ-343.** **Private channels, DMs and group DMs have been a separate
+  grant.** A capture credential has read public channels, their messages and
+  files, and the workspace's users by default; private channels, DMs, group
+  DMs and drafts have been read only under a second scope granted by an owner
+  as **its own audited act**, never implied by the first. The file drop and
+  journaling have taken the same two scopes from the operator's configuration,
+  and the daemon has recorded in the same audit family which scopes were in
+  force whenever they changed. Records outside a reader's scope have been left
+  out, not blanked. An encrypted DM (REQ-314) has been captured as the
+  conversation, its participants and each message's id, author and time —
+  never its content, which the daemon has never been able to read.
+- **REQ-344.** **Edits, deletions and drafts have been captured as they
+  happened**, which is what REQ-276's "where retention preserved them" has
+  meant: the daemon keeps only a message's latest text (REQ-051) and nulls a
+  deleted one's (REQ-052), so capture has recorded each change when it was
+  made — an edit as a record with the new text and a reference to the record
+  holding the old, a deletion as a record of who deleted it and when,
+  author or moderator, and a restore inside REQ-052's two minutes as a record
+  of its own. A draft (REQ-223) has been captured as stored user content each
+  time its stored text changed and when it was cleared. What a DLP webhook
+  (REQ-277) rewrote has been captured as it was stored: the original was
+  never stored, so it has never been captured.
+- **REQ-345.** **A legal hold has widened what capture has, never narrowed
+  it.** Where a hold (REQ-252) has kept an original that would otherwise have
+  gone — a body retention (REQ-250) would have removed, or the prior text of
+  an edited or deleted message — capture has included it, marked as held, and
+  the record of its eventual release has been captured too. Capture has not
+  depended on a hold: it has recorded every change whether or not one was in
+  force, and lifting a hold has removed nothing from an archive.
+
 - **REQ-277.** A tenant has been able to apply **data-loss prevention to messages
   before they are stored** — content is offered to a configured **DLP webhook**, and
   what the webhook returns is what gets posted. A redaction therefore *replaces* the
