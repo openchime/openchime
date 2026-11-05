@@ -114,13 +114,15 @@ for _ in $(seq 1 100); do grep -q "healthz listening" "$W/daemon.log" 2>/dev/nul
     # Media (WEB.md): a video message recorded from the synthetic camera and the
     # browser's (fake) microphone through Web Audio, stopped, and the file taken
     # -- the same recorder, codecs and muxer the desktop runs, in wasm. The card
-    # opens and shows the camera; the stop comes once the recording has begun
-    # (after the countdown), and is followed until the file has bytes. How long
-    # it ran is the machine's business; that it was taken is the check.
+    # opens and shows the camera; once the recording has begun (after the
+    # countdown) the dump is polled through it until rec_elapsed has passed
+    # 3000 ms, since dumping while the recorder runs has trapped the page before;
+    # then the stop, followed until the file has bytes. A step's patterns take no
+    # "|" or space: the lookahead is "four digits or more, none of 0000-2999".
     # The card opens only in a selected channel, and a signed-in client may
     # not have selected one yet: the first step waits for one, so `vm open`
     # is never sent to a client that would drop it.
-    script='sttest~authed=1 sel=[1-9]|vm open~^vm=1 recphase=0 frame=[1-9]|vm record~^vm=1 recphase=2|vm stop~^vm=1 take_bytes=[1-9]|about'
+    script='sttest~authed=1 sel=[1-9]|vm open~^vm=1 recphase=0 frame=[1-9]|vm record~^vm=1 recphase=2 rec_elapsed=(?![0-2][0-9]{3}\b)[0-9]{4,}|vm stop~^vm=1 take_bytes=[1-9]|about'
     URL3="$APP&hook=1&env=OPENCHIME_DEV_CAPTURE%3Dsynthetic&script=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$script")"
     run_page "$URL3" media "$W/chrome-media.log" '"(DUMPALL|DUMP-ERR):' \
         --use-fake-device-for-media-stream --use-fake-ui-for-media-stream --autoplay-policy=no-user-gesture-required

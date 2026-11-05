@@ -28,6 +28,7 @@
 #include <emscripten/proxying.h>
 #include <emscripten/threading.h>
 #include <emscripten/webaudio.h>
+#include <pthread.h>
 #include <speex/speex_resampler.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -138,6 +139,11 @@ typedef struct {
     float        *fifo;                /* playback: context-rate frames resampled ahead */
     size_t        fifo_n, fifo_cap;
     int           state;               /* written by the page's thread: 0 opening, 1 open, <0 OC_AUDIO_* */
+    /* Set by web_close before anything is torn down: the rendering thread may
+     * be about to run one more quantum, and this is what it finds instead of
+     * a device being freed under it (closed_reap). */
+    atomic_int    closed;
+    uint64_t      closed_at_ms;
 } wdev;
 
 static inline int16_t f2i(float v) { return v >= 1.0f ? 32767 : v <= -1.0f ? -32768 : (int16_t)(v * 32767.0f); }
@@ -149,7 +155,16 @@ static bool process_cb(int n_in, const AudioSampleFrame *in, int n_out, AudioSam
                        int n_params, const AudioParamFrame *params, void *ud) {
     (void)n_params; (void)params;
     wdev *w = ud;
+    /* Closed: no more quanta. web_close used to free the device straight after
+     * asking the page to drop the node, and the rendering thread could still
+     * run a quantum on it -- one already scheduled when a recording was
+     * stopped a few milliseconds after it started. It then read the freed
+     * device, whose channel count came back 0, and the division by it below
+     * trapped the page ("divide by zero"). The flag ends it; closed_reap keeps
+     * the memory valid until no quantum can be in flight. */
+    if (atomic_load(&w->closed)) return false;
     int ch = w->channels;
+    if (ch < 1) return true;            /* a device with no channels has nothing to move */
     if (w->capture) {
         if (n_in < 1 || in[0].numberOfChannels < 1) return true;     /* nothing connected yet */
         int frames = in[0].samplesPerChannel, have = in[0].numberOfChannels;
@@ -340,14 +355,51 @@ static void close_main(void *arg) {
     if (w->node) { emscripten_destroy_web_audio_node(w->node); w->node = 0; }
 }
 
-static void web_close(oc_audio_dev *d) {
-    wdev *w = *oc_audio_dev_impl(d);
-    if (!w) return;
-    on_main(close_main, w);
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static void wdev_free(wdev *w) {
     if (w->rs) speex_resampler_destroy(w->rs);
     free(w->rs_buf); free(w->fifo); free(w->buf);
     free(w);
+}
+
+/* Closed devices, kept until no quantum of theirs can still be running: the
+ * rendering thread runs a quantum every few milliseconds, so two seconds is
+ * far past any that was in flight when the node was dropped. Freed by the next
+ * close, the oldest first when the list is full. */
+#define CLOSED_KEEP_MS 2000u
+static wdev *g_closed[16];
+static void closed_reap(wdev *add) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t now = mono_ms();
+    pthread_mutex_lock(&mu);
+    for (size_t i = 0; i < sizeof g_closed / sizeof g_closed[0]; i++)
+        if (g_closed[i] && now - g_closed[i]->closed_at_ms >= CLOSED_KEEP_MS) { wdev_free(g_closed[i]); g_closed[i] = NULL; }
+    if (add) {
+        size_t slot = 0, oldest = 0;
+        int found = 0;
+        for (size_t i = 0; i < sizeof g_closed / sizeof g_closed[0] && !found; i++)
+            if (!g_closed[i]) { slot = i; found = 1; }
+            else if (g_closed[i]->closed_at_ms < g_closed[oldest]->closed_at_ms) oldest = i;
+        if (!found) { wdev_free(g_closed[oldest]); slot = oldest; }
+        g_closed[slot] = add;
+    }
+    pthread_mutex_unlock(&mu);
+}
+
+static void web_close(oc_audio_dev *d) {
+    wdev *w = *oc_audio_dev_impl(d);
+    if (!w) return;
+    atomic_store(&w->closed, 1);         /* before the node goes: see process_cb */
+    w->closed_at_ms = mono_ms();
+    on_main(close_main, w);
     *oc_audio_dev_impl(d) = NULL;
+    if (w->worklet) closed_reap(w);      /* the rendering thread may hold it still */
+    else { wdev_free(w); closed_reap(NULL); }
 }
 
 struct open_args { wdev *w; wctx *c; int loopback; const char *id; };
