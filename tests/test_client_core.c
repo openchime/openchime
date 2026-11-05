@@ -9,6 +9,7 @@
 #include "client.h"     /* the core facade under test */
 #include "testsignin.h" /* a person's sign-in, on the daemon's page */
 #include "model.h"
+#include "emoticon.h"
 #include "store.h"       /* to assert the persisted token/pin */
 #include "resolve.h"     /* workspace resolution (REQ-010/011) */
 #include "wellknown.h"   /* the optional `.well-known` half of REQ-010 */
@@ -524,6 +525,75 @@ static void test_search_truncated(void) {
     CHECK(m.search_truncated == 1);
     search_ev(&m, 0, 0);                              /* an empty page */
     CHECK(m.search_truncated == 0 && m.n_search == 5);
+    oc_model_free(&m);
+}
+
+/* Typed emoticons (emoticon.h): a word of its own becomes its emoji; inside a
+ * longer word, inside code, or with the setting off, nothing changes. */
+static void test_emoticons(void) {
+    char out[256];
+    static const char *const PAIRS[][2] = {
+        { ":)", "\xF0\x9F\x99\x82" }, { ":-)", "\xF0\x9F\x99\x82" }, { ":(", "\xF0\x9F\x99\x81" },
+        { ":-(", "\xF0\x9F\x99\x81" }, { ":D", "\xF0\x9F\x98\x84" }, { ";)", "\xF0\x9F\x98\x89" },
+        { ";-)", "\xF0\x9F\x98\x89" }, { ":P", "\xF0\x9F\x98\x9B" }, { ":p", "\xF0\x9F\x98\x9B" },
+        { ":O", "\xF0\x9F\x98\xAE" }, { ":o", "\xF0\x9F\x98\xAE" }, { ":/", "\xF0\x9F\x98\x95" },
+        { ":|", "\xF0\x9F\x98\x90" }, { ":'(", "\xF0\x9F\x98\xA2" }, { "<3", "\xE2\x9D\xA4\xEF\xB8\x8F" },
+        { "</3", "\xF0\x9F\x92\x94" }, { "B)", "\xF0\x9F\x98\x8E" },
+    };
+    for (size_t i = 0; i < sizeof PAIRS / sizeof PAIRS[0]; i++) {
+        char in[32], want[64];
+        snprintf(in, sizeof in, "ok %s then", PAIRS[i][0]);
+        snprintf(want, sizeof want, "ok %s then", PAIRS[i][1]);
+        CHECK(oc_emoticon_convert(in, strlen(in), out, sizeof out) == 1 && strcmp(out, want) == 0);
+    }
+    /* At the start and the end of the text. */
+    CHECK(oc_emoticon_convert(":) hi <3", 8, out, sizeof out) == 2 &&
+          strcmp(out, "\xF0\x9F\x99\x82 hi \xE2\x9D\xA4\xEF\xB8\x8F") == 0);   /* contract: the converted bytes are the output */
+    /* Not part of a longer word, and never an address. */
+    CHECK(oc_emoticon_convert("a:)b x:) :)y", 12, out, sizeof out) == 0 && strcmp(out, "a:)b x:) :)y") == 0);
+    CHECK(oc_emoticon_convert("see http://x.example", 20, out, sizeof out) == 0);
+    /* Not in inline code, nor in a fenced block, closed or still being typed. */
+    const char *code = "run `:)` and\n```\n:) <3\n```\nthen :)";
+    CHECK(oc_emoticon_convert(code, strlen(code), out, sizeof out) == 1 &&
+          strstr(out, "`:)`") && strstr(out, "\n:) <3\n") && strstr(out, "then \xF0\x9F\x99\x82"));   /* contract: code left byte for byte */
+    const char *open_fence = "```\nx :)";
+    CHECK(oc_emoticon_convert(open_fence, strlen(open_fence), out, sizeof out) == 0);
+    const char *open_tick = "say `x :)";
+    CHECK(oc_emoticon_convert(open_tick, strlen(open_tick), out, sizeof out) == 0);
+    /* As a space is typed: the emoticon that ends at the caret, and its start. */
+    size_t st = 99;
+    const char *t = "well :-)";
+    CHECK(oc_emoticon_before(t, strlen(t), strlen(t), &st) != NULL && st == 5);
+    CHECK(oc_emoticon_before("x:)", 3, 3, &st) == NULL);
+    CHECK(oc_emoticon_before("`a :)", 5, 5, &st) == NULL);
+    /* Too small an output converts nothing. */
+    char tiny[4];
+    CHECK(oc_emoticon_convert("a :)", 4, tiny, sizeof tiny) == -1);
+    /* The setting: off by default, a person's own, read from the synced bucket. */
+    oc_model m; oc_model_init(&m);
+    CHECK(oc_model_setting(&m, "compose.emoticons") == NULL);   /* off unless set */
+    oc_ev e; memset(&e, 0, sizeof e);
+    e.type = OC_EV_SETTING;
+    snprintf(e.author_name, sizeof e.author_name, "compose.emoticons"); e.body = strdup("on");
+    oc_model_apply(&m, &e);
+    free(e.body);
+    const char *v = oc_model_setting(&m, "compose.emoticons");
+    CHECK(v && strcmp(v, "on") == 0);
+    /* With the setting off a typed emoticon stays as typed, on a space and on
+     * send; unset reads as off. Each composer asks these same calls. */
+    const char *typed = "ok :) then <3";
+    size_t tl = strlen(typed);
+    CHECK(oc_emoticon_setting_on(NULL) == 0 && oc_emoticon_setting_on("") == 0);
+    CHECK(oc_emoticon_setting_on("off") == 0 && oc_emoticon_setting_on(v) == 1);
+    CHECK(oc_emoticon_send(oc_emoticon_setting_on("off"), typed, tl, out, sizeof out) == 0 && strcmp(out, typed) == 0);
+    CHECK(oc_emoticon_send(oc_emoticon_setting_on(NULL), typed, tl, out, sizeof out) == 0 && strcmp(out, typed) == 0);
+    st = 99;
+    CHECK(oc_emoticon_typed(0, "ok :)", 5, 5, &st) == NULL && st == 99);
+    /* And on, the same calls convert. */
+    CHECK(oc_emoticon_send(1, typed, tl, out, sizeof out) == 2 && strcmp(out, typed) != 0);
+    CHECK(oc_emoticon_typed(1, "ok :)", 5, 5, &st) != NULL && st == 3);
+    /* Off, a body too long for the output is refused, as when on. */
+    CHECK(oc_emoticon_send(0, typed, tl, tiny, sizeof tiny) == -1);
     oc_model_free(&m);
 }
 
@@ -5662,6 +5732,7 @@ int run_client_core_tests(void) {
     test_invitation_text();
     test_reset_text();
     test_search_truncated();
+    test_emoticons();
     test_addressable_targets();
     test_pins();
     test_summary_model();

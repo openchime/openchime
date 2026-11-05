@@ -53,6 +53,7 @@
 #include "secret_os.h" /* OS keyring for the session token */
 #include "config.h"     /* machine-local prefs (mouse, panels, time) */
 #include "env.h"        /* the development inputs */
+#include "emoticon.h"   /* typed emoticons (compose.emoticons) */
 #include "protocol.h"   /* OC_PRESENCE_*, OC_SESSION_TOKEN_LEN */
 #include "net.h"        /* oc_net_probe: how a workspace signs people in */
 #include "build_id.h"   /* OC_BUILD_ID: --version */
@@ -977,6 +978,8 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_SUM_NOTICES,
        /* deactivate one's own account (REQ-033), behind a y/N */
        ACT_DEACTIVATE,
+       /* typed emoticons become emoji (compose.emoticons) */
+       ACT_EMOTICONS,
        ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
@@ -1086,8 +1089,15 @@ static const tk_pal_item g_launcher_items[] = {
 };
 /* The launcher as it is now: summaries only where the daemon makes them
  * (REQ-313), and a way back to the open one for this conversation. */
-static tk_pal_item g_launcher_now[sizeof g_launcher_items / sizeof *g_launcher_items + 2 + 2 + 3];
+static tk_pal_item g_launcher_now[sizeof g_launcher_items / sizeof *g_launcher_items + 2 + 2 + 3 + 1];   /* + the emoticons switch */
 static char g_sum_ready_label[48];
+
+/* Whether typed emoticons become emoji (emoticon.h): the person's synced
+ * compose.emoticons, off unless set. */
+#define EMOTICONS_SETTING_KEY "compose.emoticons"
+static int emoticons_on(const oc_model *m) {
+    return oc_emoticon_setting_on(m ? oc_model_setting(m, EMOTICONS_SETTING_KEY) : NULL);
+}
 
 static int launcher_build(const oc_model *m, uint64_t cid) {
     int n = 0;
@@ -1101,6 +1111,9 @@ static int launcher_build(const oc_model *m, uint64_t cid) {
     }
     if (m->summary_open && cid && m->summary_channel == cid)
         g_launcher_now[n++] = (tk_pal_item){ "Channel", "Back to the summary", NULL, NULL, ACT_SUM_BACK };
+    /* Typed emoticons, a person's own setting shared with the GUI. */
+    g_launcher_now[n++] = (tk_pal_item){ "You", emoticons_on(m) ? "Emoticons: turn off" : "Emoticons: turn on",
+                                         ":) becomes an emoji", NULL, ACT_EMOTICONS };
     if (m->n_sum_notices) {
         snprintf(g_sum_ready_label, sizeof g_sum_ready_label, "Summaries ready (%zu)", m->n_sum_notices);
         g_launcher_now[n++] = (tk_pal_item){ "You", g_sum_ready_label, NULL, NULL, ACT_SUM_NOTICES };
@@ -3604,6 +3617,8 @@ int main(int argc, char **argv) {
                 else if (id == ACT_ALERTS)  { oc_client_srvalerts_list(cl); alerts_open = 1; asel = 0; }
                 else if (id == ACT_WORKSPACES) { sw_build(); wsel = (g_active < g_nsw) ? g_active : 0; switcher_open = 1; }
                 else if (id == ACT_HELP)    help_open = 1;
+                else if (id == ACT_EMOTICONS)
+                    oc_client_set_setting(cl, EMOTICONS_SETTING_KEY, emoticons_on(oc_client_model(cl)) ? "off" : "on");
                 else if (id == ACT_LOGOUT)  { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
                 else if (id == ACT_SUMMARIZE && act_cid) {
                     menu_build_summary_span();
@@ -3746,6 +3761,8 @@ int main(int argc, char **argv) {
                     else if (id == ACT_ALERTS)  { oc_client_srvalerts_list(cl); alerts_open = 1; asel = 0; }
                     else if (id == ACT_WORKSPACES) { sw_build(); wsel = (g_active < g_nsw) ? g_active : 0; switcher_open = 1; }
                     else if (id == ACT_HELP)    help_open = 1;
+                    else if (id == ACT_EMOTICONS)
+                        oc_client_set_setting(cl, EMOTICONS_SETTING_KEY, emoticons_on(oc_client_model(cl)) ? "off" : "on");
                     else if (id == ACT_LOGOUT)  { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
                     /* summaries: the span, then the summary */
                     else if (id == ACT_SUMMARIZE) {
@@ -3987,8 +4004,12 @@ int main(int argc, char **argv) {
                     }
                     g_bc_ask[0] = '\0';
                     if (bv.act == OC_BC_NOTE) snprintf(g_bc_note, sizeof g_bc_note, "%s", bv.note);
-                    if (mm->thread_open) oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
-                    else                 oc_client_send(cl, cid, composer);
+                    /* The last emoticon, with no space after it, converts as it goes. */
+                    char conv[COMPOSER_CAP * 2];
+                    const char *body = composer;
+                    if (oc_emoticon_send(emoticons_on(mm), composer, clen, conv, sizeof conv) > 0) body = conv;
+                    if (mm->thread_open) oc_client_reply(cl, mm->thread_channel, mm->thread_parent, body);
+                    else                 oc_client_send(cl, cid, body);
                 }
                 clen = 0; composer[0] = '\0'; scroll = 0;
             }
@@ -4026,6 +4047,18 @@ int main(int argc, char **argv) {
             tk_palette_set(&launcher, g_launcher_now, launcher_build(mm, act_cid));
             launcher_open = 1;
         } else if (ev.ch != 0) {
+            /* A space after a typed emoticon turns it into its emoji, when the
+             * person has that on (emoticon.h); the composer types at its end. */
+            if (ev.ch == ' ') {
+                size_t st = 0;
+                const char *emoji = oc_emoticon_typed(emoticons_on(oc_client_model(cl)), composer, clen, clen, &st);
+                size_t el = emoji ? strlen(emoji) : 0;
+                if (emoji && st + el + 1 < sizeof composer) {
+                    memcpy(composer + st, emoji, el);
+                    clen = st + el;
+                    composer[clen] = '\0';
+                }
+            }
             /* A typed codepoint: append its UTF-8 encoding to the composer. */
             utf8proc_uint8_t enc[4];
             utf8proc_ssize_t k = utf8proc_encode_char((utf8proc_int32_t)ev.ch, enc);

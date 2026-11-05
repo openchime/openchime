@@ -78,6 +78,30 @@ into the unchanged body. Wherever a message is reduced to one line — a sidebar
 preview, a toast, a search hit, a screen reader's name for a row — a table reads
 **"Table: N rows × M columns"** (`oc_rt_flatten`).
 
+## 1b. Typed emoticons
+
+A person may turn on **Emoticons** (Preferences in the GUI, the `:` launcher in
+the terminal client; the synced setting `compose.emoticons`, off by default).
+Then the composer turns a typed emoticon into its emoji when a space follows it,
+and on send; Undo in the GUI puts the typed text back. It is the composer's
+doing, not the renderer's: what was sent is what everyone sees, and nothing
+changes for messages already sent or for anyone else. The table is
+`client/core/emoticon.c`:
+
+| Typed | Emoji | Typed | Emoji |
+|---|---|---|---|
+| `:)` `:-)` | 🙂 | `:O` `:o` | 😮 |
+| `:(` `:-(` | 🙁 | `:/` | 😕 |
+| `:D` | 😄 | `:\|` | 😐 |
+| `;)` `;-)` | 😉 | `:'(` | 😢 |
+| `:P` `:p` | 😛 | `<3` | ❤️ |
+| `B)` | 😎 | `</3` | 💔 |
+
+An emoticon converts only as a word of its own: whitespace or the start before
+it, whitespace or the end after it, so `a:)b` and an address's `://` are left
+alone. Nothing inside inline code or a fenced block converts, including a code
+span still being typed.
+
 ## 2. When a delimiter is *not* markup
 
 The single most common failure of an in-band dialect is eating text somebody

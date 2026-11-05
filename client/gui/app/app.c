@@ -75,6 +75,7 @@
 #include <SDL3/SDL.h>         /* the window + renderer (ARCH-80) */
 #include "gfx.h"              /* portable primitives over the SDL renderer (ARCH-107) */
 #include "env.h"            /* the development inputs */
+#include "emoticon.h"       /* typed emoticons (compose.emoticons) */
 #include "sdltext.h"          /* portable text layout/hit-testing (ARCH-106) */
 
 /* The scene's rectangle vocabulary, kept in left/top/right/bottom because every
@@ -1176,6 +1177,10 @@ static const char *cursor_kind_name(void) {
 }
 
 static int g_pref_richtext  = 1;
+/* Typed emoticons become emoji as a space follows them and on send
+ * (compose.emoticons, a setting of its own: the terminal client reads it too). */
+static int g_pref_emoticons = 0;
+#define EMOTICONS_SETTING_KEY "compose.emoticons"
 /* The formatting toolbar belongs to the rich editor. In plain text it would
  * offer buttons for markup already on screen, and the honest shape of that mode
  * is a plain box. */
@@ -9710,7 +9715,7 @@ enum { PREF_ROW_DELIVER = 90, PREF_ROW_SNDMUTE = 91,
 enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
        PREF_ROW_NOTIFY, PREF_ROW_QUICK, PREF_ROW_ACCENT, PREF_ROW_TEXTSIZE,
        PREF_ROW_DENSITY, PREF_ROW_RESET,
-       PREF_ROW_EDITOR, PREF_ROW_FLASH, PREF_ROW_TOASTPOS };
+       PREF_ROW_EDITOR, PREF_ROW_FLASH, PREF_ROW_TOASTPOS, PREF_ROW_EMOTICONS };
 
 /* Preferences is two-paned: categories left, one category's rows right.
  * A single scrolling list was fine at six rows and is not at fourteen — and the
@@ -9895,6 +9900,10 @@ static void draw_prefs(gfx *rt, rectf reg) {
                      "Rich text formats as you type. Plain text shows the markup "
                      "and never restyles it.",
                      EDITORS, 2, g_pref_richtext);
+        y = pref_row(rt, body, y, PREF_ROW_EMOTICONS, "Emoticons",
+                     "Typed faces such as :) and <3 become emoji when a space "
+                     "follows them, and when you send. Never inside code.",
+                     ONOFF, 2, g_pref_emoticons);
         /* The quick reactions: six slots you click, each opening the emoji
          * picker for that slot. A typed list of shortcodes asked people to
          * remember names and separators and showed them nothing until the menu
@@ -14993,6 +15002,7 @@ static struct {
     unsigned dpi;
     char quick[160];
     int  richtext;
+    int  emoticons;
     int  flash;
     int  toastpos;
 } g_prefs_snap;
@@ -15009,6 +15019,7 @@ static void prefs_snapshot(void) {
     g_prefs_snap.textsize = g_pref_textsize;
     g_prefs_snap.density  = g_pref_density;
     g_prefs_snap.richtext = g_pref_richtext;
+    g_prefs_snap.emoticons = g_pref_emoticons;
     g_prefs_snap.dpi      = g_dpi;
     snprintf(g_prefs_snap.quick, sizeof g_prefs_snap.quick, "%s", g_quick_names);
 }
@@ -15032,6 +15043,7 @@ static void prefs_restore(void) {
     g_pref_density = g_prefs_snap.density;
     g_density      = g_prefs_snap.density ? 1.0f : 0.6f;
     g_pref_richtext = g_prefs_snap.richtext;
+    g_pref_emoticons = g_prefs_snap.emoticons;
     ed_mode_changed();
     snprintf(g_quick_names, sizeof g_quick_names, "%s", g_prefs_snap.quick);
     quick_rebuild();
@@ -23347,6 +23359,24 @@ static int grp_pick_has_keys(void) {
            g_tgt_host == TGT_HOST_GROUP && g_grp_pick_focus;
 }
 
+/* A typed emoticon ending at the caret becomes its emoji (emoticon.h), as an
+ * edit of its own before the space that follows it: Undo puts the typed text
+ * back. The field holds its Markdown, so code is seen by its backticks. */
+static void ed_emoticon_at_caret(void) {
+    static char text[ED_MAX * 4 + 1], head[ED_MAX * 4 + 1];
+    int len = to_u8n(g_ed, g_ed_len, text, sizeof text);
+    int caret = to_u8n(g_ed, g_ed_caret, head, sizeof head);
+    size_t start = 0;
+    const char *emoji = oc_emoticon_typed(g_pref_emoticons, text, (size_t)len, (size_t)caret, &start);
+    if (!emoji) return;
+    int n = caret - (int)start;          /* an emoticon is ASCII: bytes are units */
+    oc_wch w[8];
+    int wn = to_w(emoji, w, 8);
+    ed_begin_edit();
+    ed_delete_range(g_ed_caret - n, g_ed_caret);
+    ed_insert_n(w, wn);
+}
+
 static int ed_char(oc_win *hwnd, oc_wch ch) {
     /* The group's Add people field keeps every character while it has the
      * keys: the composer is off screen, and must not collect them. */
@@ -23362,6 +23392,7 @@ static int ed_char(oc_win *hwnd, oc_wch ch) {
     if (ch == u'\t') return 1;               /* Tab is navigation, never text */
     if (ch < 0x20 && ch != u'\n') return 1;  /* control chars: eaten, not inserted */
     if (ed_tab_reserved(ch)) ch = 0xFFFD;    /* a table's character is never typed */
+    if (ch == u' ' && !ed_has_sel()) ed_emoticon_at_caret();
     oc_wch s[2] = { ch, 0 };
     if (!ed_has_sel() && g_pref_richtext) {
         if (ch == u' ' || ch == u'\n') {
@@ -25144,6 +25175,13 @@ static void composer_send(void) {
      * so the body is measured against the daemon's limit here, where the text
      * is still in the box to be shortened. */
     char *b = ed_md_all();
+    /* What is left of the typed emoticons -- the last one, with no space after
+     * it -- is converted as it goes. */
+    if (b) {
+        size_t bl = strlen(b), cap = bl * 2 + 16;
+        char *c = malloc(cap);
+        if (c && oc_emoticon_send(g_pref_emoticons, b, bl, c, cap) > 0) { free(b); b = c; } else free(c);
+    }
     if (b && strlen(b) > OC_MAX_BODY_SIZE) {
         free(b);
         composer_hint("This message is too long to send. Make a table smaller, or split it in two.", 1);
@@ -28482,6 +28520,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 if (composer_remeasure()) layout_composer(hwnd);
                 break;
             case PREF_ROW_NOTIFY:  g_pref_notify = v; break;
+            case PREF_ROW_EMOTICONS: g_pref_emoticons = v ? 1 : 0; break;
             case PREF_ROW_FLASH:   g_pref_flash = v; break;
             case PREF_ROW_TOASTPOS: g_pref_toastpos = v; break;
             case PREF_ROW_DELIVER: g_pref_deliver = v; break;
@@ -31441,9 +31480,12 @@ static void prefs_save(void) {
                  g_pref_toastpos);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
+    oc_client_set_setting(g_client, EMOTICONS_SETTING_KEY, g_pref_emoticons ? "on" : "off");
 }
 
 static void prefs_load(const oc_model *m) {
+    const char *ev = m ? oc_model_setting(m, EMOTICONS_SETTING_KEY) : NULL;
+    g_pref_emoticons = oc_emoticon_setting_on(ev);
     const char *v = m ? oc_model_setting(m, PREFS_SETTING_KEY) : NULL;
     if (!v || !v[0]) return;
     int t = oc_theme_mode(), h = g_pref_time24, mm = g_pref_members, d = g_pref_daysep;
