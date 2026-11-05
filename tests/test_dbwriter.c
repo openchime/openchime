@@ -3530,6 +3530,98 @@ static uint16_t remove_user(oc_dbwriter *w, uint64_t actor, uint64_t target) {
     return code;
 }
 
+static uint16_t deactivate_self(oc_dbwriter *w, uint64_t who) {
+    oc_job *j = oc_job_new(OC_JOB_DEACTIVATE_SELF, 95);
+    j->user_id = who;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint16_t code = (r && r->type == OC_RES_USER_UPDATED && r->disabled && r->user_id == who) ? 0
+                  : (r ? r->err_code : 0xFFFF);
+    oc_dbres_free(r);
+    return code;
+}
+
+/* What an account holds, one count per table a deactivation touches: equal for
+ * two accounts that started alike and ended alike. */
+static void account_footprint(const char *path, uint64_t uid, int out[8]) {
+    static const char *const Q[8] = {
+        "SELECT disabled FROM users WHERE id=?1;",
+        "SELECT COUNT(*) FROM sessions WHERE user_id=?1;",
+        "SELECT COUNT(*) FROM local_credentials WHERE user_id=?1;",
+        ("SELECT COUNT(*) FROM channel_members cm JOIN channels c ON c.id=cm.channel_id "
+         " WHERE cm.user_id=?1 AND c.kind <> 'dm';"),
+        "SELECT COUNT(*) FROM device_tokens WHERE user_id=?1;",
+        "SELECT COUNT(*) FROM drafts WHERE user_id=?1;",
+        "SELECT COUNT(*) FROM scheduled_messages WHERE user_id=?1;",
+        "SELECT COUNT(*) FROM user_group_members WHERE user_id=?1;",
+    };
+    sqlite3 *db = NULL;
+    for (int i = 0; i < 8; i++) out[i] = -1;
+    if (sqlite3_open(path, &db) != SQLITE_OK) { sqlite3_close(db); return; }
+    for (int i = 0; i < 8; i++) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, Q[i], -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+            out[i] = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+}
+
+/* A person deactivates their own account (REQ-033): exactly a removal's state,
+ * recorded as their own act; the last owner is refused; and the way back is a
+ * removed account's. */
+static void test_deactivate_self(void) {
+    const char *path = tdb("deactivate_self.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t owner = reg(w, "ds-owner", "pw", OC_ROLE_OWNER);
+    uint64_t ann   = reg(w, "ds-ann", "pw-ann", OC_ROLE_MEMBER);
+    uint64_t bea   = reg(w, "ds-bea", "pw-bea", OC_ROLE_MEMBER);
+    CHECK(owner && ann && bea);
+    /* The two alike: each signed in once. */
+    uint8_t tok[OC_SESSION_TOKEN_LEN];
+    CHECK(auth_local(w, 100, "ds-ann", "pw-ann", tok, NULL) == ann);
+    CHECK(auth_local(w, 101, "ds-bea", "pw-bea", tok, NULL) == bea);
+
+    /* The last active owner may not leave without another. */
+    CHECK(deactivate_self(w, owner) == OC_ERR_LAST_OWNER);
+
+    /* ann is removed by the owner; bea deactivates herself. */
+    CHECK(remove_user(w, owner, ann) == 0);
+    CHECK(deactivate_self(w, bea) == 0);
+    oc_dbwriter_stop(w);
+    int fa[8], fb[8];
+    account_footprint(path, ann, fa);
+    account_footprint(path, bea, fb);
+    CHECK(fb[0] == 1);                                  /* disabled */
+    CHECK(fb[1] == 0 && fb[2] == 0 && fb[4] == 0);      /* signed out, no password, no devices */
+    CHECK(memcmp(fa, fb, sizeof fa) == 0);              /* row for row, a removal's state */
+
+    w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    /* Her own act, beside the removal's. */
+    CHECK(audit_saw(w, owner, "account.deactivate_self"));
+    CHECK(audit_saw(w, owner, "user.remove"));
+    /* Signing in is refused. */
+    CHECK(auth_local(w, 102, "ds-bea", "pw-bea", tok, NULL) == 0);
+    /* Twice is refused: there is nobody left to deactivate. */
+    CHECK(deactivate_self(w, bea) == OC_ERR_FORBIDDEN);
+    /* The way back is a removed account's. */
+    oc_job *j = oc_job_new(OC_JOB_ENABLE_USER, 103);
+    j->user_id = owner; j->target_user_id = bea;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_USER_UPDATED && r->disabled == 0 && r->user_id == bea);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_admin_ops(void) {
     const char *path = tdb("admin.db");
     cleanup_db(path);
@@ -9946,6 +10038,7 @@ int run_dbwriter_tests(void) {
     test_notify_prefs();
     test_keyword_alerts();
     test_admin_ops();
+    test_deactivate_self();
     test_reactions();
     test_threads();
     test_thread_list();

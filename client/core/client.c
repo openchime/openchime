@@ -1161,6 +1161,13 @@ void oc_client_remove_user(oc_client *c, uint64_t user_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_deactivate_self(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_DEACTIVATE_SELF);
+    if (!cmd) return;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_reset_credential(oc_client *c, uint64_t user_id, int clear_step) {
     if (!c || !user_id) return;
     c->model.reset_token[0] = '\0';

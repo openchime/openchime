@@ -1017,6 +1017,11 @@ oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version) {
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_deactivate_self(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_DEACTIVATE_SELF);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_storage_status_req(oc_wbuf *w, uint16_t version) {
     size_t off = oc_frame_begin(w, version, OC_MSG_STORAGE_STATUS_REQ);
     return oc_frame_end(w, off);

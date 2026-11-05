@@ -974,7 +974,10 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        /* polls (REQ-225): who voted, and an option pressed */
        ACT_VOTERS, ACT_POLL_CLOSE, ACT_VOTE0, ACT_VOTE_LAST = ACT_VOTE0 + OC_POLL_MAX_OPTIONS - 1,
        /* summaries made while you were away: the list, then one of them */
-       ACT_SUM_NOTICES, ACT_SUM_NOTICE0 };
+       ACT_SUM_NOTICES,
+       /* deactivate one's own account (REQ-033), behind a y/N */
+       ACT_DEACTIVATE,
+       ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
 static int      g_nmenu;
@@ -1071,6 +1074,7 @@ static const tk_pal_item g_launcher_items[] = {
     { "You",     "Do not disturb",      NULL, NULL, ACT_DND },
     { "You",     "Share my read receipts (on/off)", NULL, NULL, ACT_RECEIPTS },
     { "You",     "Your profile",        NULL, NULL, ACT_PROFILE },
+    { "You",     "Deactivate account",  NULL, NULL, ACT_DEACTIVATE },
     { "Admin",   "Invite a user",       NULL, NULL, ACT_INVITE },
     { "Admin",   "Storage usage",       NULL, NULL, ACT_STORAGE },
     { "Admin",   "Audit log",           NULL, NULL, ACT_AUDIT },
@@ -3067,6 +3071,7 @@ int main(int argc, char **argv) {
     int jump_asked = 0;
     int help_open = 0;
     int profile_open = 0;                     /* /profile identity modal */
+    int deactivate_ask = 0;                   /* "Deactivate account": y/N before it is sent */
     int ac_idx = 0;                           /* autocomplete cycle index */
     int panel = 0;                            /* 0 composer · 1 channels · 2 messages · 3 members */
     int msg_sel = -1, mem_sel = 0;            /* selection within the messages / members panel */
@@ -3229,6 +3234,11 @@ int main(int argc, char **argv) {
          * buffer, then a single tb_present() below diffs it to the screen. (Two
          * presents per frame — base then overlay — flicker the overlay.) */
         render(cl, focus, composer, clen, scroll, help_open, ac_idx, panel, msg_sel, mem_sel, editing);
+        if (deactivate_ask)
+            tk_modal_confirm(tb_width(), tb_height(),
+                             "Deactivate your account? You will be signed out everywhere and "
+                             "cannot sign in; an owner or admin can bring it back. The only "
+                             "owner must make another first. [y/N]");
         if (action_open) {
             int mh = g_nmenu + 3; if (mh > tb_height() - 2) mh = tb_height() - 2;
             /* As wide as its longest item (a summary's line is long), within
@@ -3453,6 +3463,11 @@ int main(int argc, char **argv) {
             else storage_open = 0;
             continue;
         }
+        if (deactivate_ask) {                  /* y deactivates; anything else keeps the account */
+            deactivate_ask = 0;
+            if (ev.ch == 'y' || ev.ch == 'Y') oc_client_deactivate_self(cl);
+            continue;
+        }
         if (help_open) {                       /* help overlay: any key closes it */
             if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
             else help_open = 0;
@@ -3583,6 +3598,7 @@ int main(int argc, char **argv) {
                     } else await_invite = 1;
                 }
                 else if (id == ACT_PROFILE) profile_open = 1;
+                else if (id == ACT_DEACTIVATE) deactivate_ask = 1;
                 else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
                 else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
                 else if (id == ACT_ALERTS)  { oc_client_srvalerts_list(cl); alerts_open = 1; asel = 0; }
@@ -3724,6 +3740,7 @@ int main(int argc, char **argv) {
                         } else await_invite = 1;
                     }
                     else if (id == ACT_PROFILE) profile_open = 1;
+                    else if (id == ACT_DEACTIVATE) deactivate_ask = 1;
                     else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
                     else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
                     else if (id == ACT_ALERTS)  { oc_client_srvalerts_list(cl); alerts_open = 1; asel = 0; }

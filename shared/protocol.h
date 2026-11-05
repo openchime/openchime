@@ -587,6 +587,7 @@ typedef enum {
     OC_MSG_LIST_POLL_VOTERS     = 0x0112, /* C->S, who picked what */
     OC_MSG_POLL_VOTERS          = 0x0113, /* S->C, the answer; refused for an anonymous poll */
     OC_MSG_EDIT_POLL            = 0x0114, /* C->S, the author changes a poll: options and settings until the first vote */
+    OC_MSG_DEACTIVATE_SELF      = 0x0115, /* C->S, no payload: deactivate my own account, as a removal does */
     OC_MSG_WORKSPACE_SETTINGS   = 0x0119, /* S->C, read-only: the workspace settings clients act on, after WORKSPACE_INFO */
     OC_MSG_READ_RECEIPTS        = 0x011A, /* both: whether I share my read receipts; C->S sets or asks, S->C tells */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
@@ -1889,6 +1890,7 @@ oc_result oc_encode_mention_unresolved(oc_wbuf *w, uint16_t version, const oc_me
 oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version);
 /* Bodyless request for the storage report (REQ-214); owner/admin only. */
 oc_result oc_encode_storage_status_req(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_deactivate_self(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_channel_list(oc_wbuf *w, uint16_t version, const oc_channel_list *m);
 oc_result oc_encode_join_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m);
 oc_result oc_encode_leave_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m);

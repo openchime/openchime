@@ -401,6 +401,9 @@ void oc_client_invite_user(oc_client *c, uint8_t role);
  * a workspace refuses the other. */
 void oc_client_invite(oc_client *c, uint8_t role, const char *email, uint16_t uses);
 void oc_client_remove_user(oc_client *c, uint64_t user_id);
+/* Deactivate the signed-in account itself, as a removal would: every session
+ * ends and this connection is dropped. The last owner is refused (LAST_OWNER). */
+void oc_client_deactivate_self(oc_client *c);
 /* An owner's or admin's reset link for a local account (AUTH.md §2), with its
  * second step cleared too when `clear_step`; the model's reset_token is it. */
 void oc_client_reset_credential(oc_client *c, uint64_t user_id, int clear_step);

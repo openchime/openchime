@@ -3093,6 +3093,15 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_DEACTIVATE_SELF) {
+            /* A removal of oneself (REQ-033): the result drops this person's
+             * connections, this one among them, as a removal does. */
+            oc_job *j = oc_job_new(OC_JOB_DEACTIVATE_SELF, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_REMOVE_USER) {
             oc_remove_user ru;
             if (oc_decode_remove_user(&p, &ru) != OC_OK) return -1;

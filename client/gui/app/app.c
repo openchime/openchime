@@ -1158,7 +1158,7 @@ static rectf g_prof_dm_btn;
 /* The SELF card's action buttons — the commands the profile popover no longer
  * lists top-level. Each carries a menu_dispatch cmd; the bodies are all
  * self-contained. */
-static struct { rectf r; int cmd; } g_selfcard_btn[6];
+static struct { rectf r; int cmd; } g_selfcard_btn[8];
 static int g_n_selfcard_btn;
 static int g_pref_time24    = 1;   /* 24-hour timestamps */
 static int g_pref_members   = 1;   /* members pane shown by default */
@@ -1903,7 +1903,7 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
        CONF_PDM_TRUST, CONF_PDM_SAFETY,
        /* New ones go last: the dump's `confirm act=` is this number, and the
         * GUI harness reads it (CONF_CERT_TRUST is act=13 to scripts/gui). */
-       CONF_WS_FORGET_ALL, CONF_BROADCAST };
+       CONF_WS_FORGET_ALL, CONF_BROADCAST, CONF_DEACTIVATE_SELF };
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 static int      g_bc_confirmed;     /* CONF_BROADCAST: the send it confirmed is under way */
@@ -10011,19 +10011,21 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
          * the Edit profile screen (cmd 53), which is the whole point of
          * consolidating identity onto one card. Three slots per group; an
          * unshown slot is skipped. */
-        struct { const char *label; int cmd; int show; } B[6] = {
+        struct { const char *label; int cmd; int show; } B[8] = {
             { "Edit profile",        53, 1 },
+            { NULL,                   0, 0 },
             { NULL,                   0, 0 },
             { NULL,                   0, 0 },
             { "Change password",     31, 1 },
             { "Active sessions",     54, 1 },
             { "Two-step sign-in",    32, 1 },
+            { "Deactivate account",  34, 1 },   /* REQ-033: one's own, behind a confirmation */
         };
         for (int gi = 0; gi < 2; gi++) {
             draw_text(rt, gi == 0 ? "PROFILE" : "ACCOUNT", g_meta,
                       rf(reg.left + 24, y, reg.right - 12, y + 18), OC_COL_FAINT);
             y += 22;
-            for (int bi = gi * 3; bi < gi * 3 + 3; bi++) {
+            for (int bi = gi * 4; bi < gi * 4 + 4; bi++) {
                 if (!B[bi].show) continue;
                 rectf b = rf(reg.left + 24, y, reg.right - 24, y + 28);
                 int hov = in_rect(b, g_mouse_x, g_mouse_y);
@@ -14126,6 +14128,7 @@ static void confirm_run(oc_win *hwnd) {
     case CONF_WEBHOOK_ROTATE: oc_client_rotate_webhook(g_client, g_confirm_id);
                               g_await_webhook = 1; break;
     case CONF_INVITE_REVOKE:  oc_client_revoke_invite(g_client, g_confirm_id); break;
+    case CONF_DEACTIVATE_SELF: oc_client_deactivate_self(g_client); break;
     case CONF_CERT_TRUST: cert_trust_run(g_main); break;
     case CONF_PDM_TRUST:  oc_client_pdm_trust(g_client, g_confirm_id); break;
     case CONF_PDM_SAFETY: break;   /* shown, nothing to do */
@@ -32574,6 +32577,13 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
     case 11: oc_client_set_presence(g_client, OC_PRESENCE_AWAY); break;
     case 51:     /* the status dialog — bespoke modal, see status_open */
         status_open(hwnd);
+        break;
+    case 34:     /* deactivate your own account (REQ-033), said before it happens */
+        confirm_open(hwnd, CONF_DEACTIVATE_SELF, 0, "Deactivate your account?",
+                     "You will be signed out on every device, and you will not be able to sign in. "
+                     "Your messages stay. An owner or admin can bring your account back. If you are "
+                     "this workspace's only owner, make someone else an owner first.",
+                     "Deactivate");
         break;
     case 54:     /* REQ-182 */
         oc_client_list_sessions(g_client);

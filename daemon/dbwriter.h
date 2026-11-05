@@ -291,7 +291,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_EDIT_POLL = 146,
        /* READ_RECEIPTS (REQ-090): receipts_op 0/1 sets whether I share my
         * read position, OC_RECEIPTS_ASK asks. Answered OC_RES_READ_RECEIPTS. */
-       OC_JOB_READ_RECEIPTS = 147 };
+       OC_JOB_READ_RECEIPTS = 147,
+       OC_JOB_DEACTIVATE_SELF = 148 };   /* a person deactivates their own account */
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */

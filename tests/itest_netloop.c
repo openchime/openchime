@@ -2284,6 +2284,45 @@ static int peer_closed(client *c, int secs) {
     return closed;
 }
 
+/* A person deactivates their own account (REQ-033): every connection of
+ * theirs is dropped, this one among them, as a removal drops them, and signing
+ * in again is refused. On a loop of its own, so the suite's accounts stay. */
+static void test_deactivate_self_wire(void) {
+    oc_tls_server srv;
+    uint8_t pin[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0 && oc_tls_server_fingerprint(&srv, pin) == 0);
+    db_unlink("itest_deactivate.db");
+    oc_dbwriter *dbw = oc_dbwriter_start(tpath("itest_deactivate.db"));
+    CHECK(dbw != NULL);
+    if (!dbw) { oc_tls_server_free(&srv); return; }
+    oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
+    CHECK(oc_dbwriter_register_local(dbw, "olive", "pw-olive", OC_ROLE_OWNER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "dana", "pw-dana", OC_ROLE_MEMBER, 2048) != 0);
+    struct loop_arg la; pthread_t th;
+    int port = start_loop(&la, &th, &srv, dbw, 0);
+    CHECK(port != 0);
+    if (!port) { oc_dbwriter_stop(dbw); oc_tls_server_free(&srv); return; }
+    client a, b;
+    uint64_t ua = 0, ub = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "dana", "pw-dana", &ua) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "dana", "pw-dana", &ub) == 0);
+    uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_deactivate_self(&w, OC_PROTOCOL_VERSION) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(peer_closed(&a, PEER_CLOSES) == 1);
+    CHECK(peer_closed(&b, PEER_CLOSES) == 1);   /* her other device too */
+    client_close(&a);
+    client_close(&b);
+    client c2;
+    uint64_t uc = 0;
+    CHECK(client_open(&c2, port, pin) == 0 && do_handshake(&c2) == 0);
+    CHECK(do_auth(&c2, "dana", "pw-dana", &uc) != 0);   /* refused */
+    client_close(&c2);
+    stop_loop(&la, th);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    db_unlink("itest_deactivate.db");
+}
+
 /* How many sessions the signed-in `c` sees, or -1; `current` how many of them
  * it is told are its own. */
 static int session_count_of(client *c, int *current) {
@@ -8101,6 +8140,7 @@ int run_netloop_tests(void) {
         test_send_rate_limit(arg.port, pin);
         test_send_body_limit(arg.port, pin);
         test_send_rate_unlimited();
+        test_deactivate_self_wire();
         test_out_buffer_cap(arg.port, pin, dbw, flooder);
         test_admin_vertical(arg.port, pin);
         test_revoke_other_devices(arg.port, pin);

@@ -530,6 +530,7 @@ enum {
     OC_CMD_SET_ROLE,        /* set a user's tenant role: channel_id = user_id, op = role */
     OC_CMD_INVITE_USER,     /* invite: op = role, body = the address it is bound to (NULL = a token) */
     OC_CMD_REMOVE_USER,     /* remove/disable a user: channel_id = user_id */
+    OC_CMD_DEACTIVATE_SELF, /* deactivate my own account (REQ-033) */
     OC_CMD_RESET_CREDENTIAL,/* a reset link for a local account: channel_id = user_id, op = clear its step */
     OC_CMD_ENABLE_USER,     /* bring a removed member back: channel_id = user_id */
     OC_CMD_CREATE_WEBHOOK,  /* mint an incoming webhook for `channel_id`: body = label */

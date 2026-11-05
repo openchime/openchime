@@ -3829,6 +3829,11 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_reset_credential(&w, OC_PROTOCOL_VERSION, &rc) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_DEACTIVATE_SELF) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_deactivate_self(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_REMOVE_USER) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_remove_user ru = { c->channel_id };   /* channel_id reused as user id */

@@ -1058,8 +1058,17 @@ Clients show them as **(deactivated)**, from `USER_LIST`'s and `USER_UPDATED`'s
 the actor's as its ack; the removed user's live connections receive it and are
 then dropped.
 
-`SET_ROLE`/`INVITE_USER`/`REMOVE_USER` failures are non-fatal `ERROR` frames
-(`FORBIDDEN`, `LAST_OWNER`, `INVITE_UNREDEEMABLE`, `INTERNAL`).
+**`DEACTIVATE_SELF` (client → server), msg_type `0x0115`**, no payload — a
+person deactivates their own account. The result is exactly a removal's: the
+same rows dropped and kept, the same `USER_UPDATED` (`disabled=1`) to every
+signed-in connection, and every connection of theirs, this one among them,
+dropped. The audit log records it as their own act (`account.deactivate_self`,
+beside a removal's `user.remove`). The workspace's last active owner is refused
+with `LAST_OWNER`: another owner is needed first. The way back is a removed
+account's, `ENABLE_USER` by an owner or admin.
+
+`SET_ROLE`/`INVITE_USER`/`REMOVE_USER`/`DEACTIVATE_SELF` failures are non-fatal
+`ERROR` frames (`FORBIDDEN`, `LAST_OWNER`, `INVITE_UNREDEEMABLE`, `INTERNAL`).
 
 ### 5.9 Reactions (REQ-070, REQ-071)
 
@@ -3474,6 +3483,7 @@ this table cannot silently gain a shared value.
 | `0x0112` | `LIST_POLL_VOTERS` | C → S | who picked what on a poll |
 | `0x0113` | `POLL_VOTERS` | S → C | the answer; refused for an anonymous poll |
 | `0x0114` | `EDIT_POLL` | C → S | the author changes a poll: options and settings until the first vote, the deadline always |
+| `0x0115` | `DEACTIVATE_SELF` | C → S | deactivate my own account, as a removal does (REQ-033) |
 | `0x0119` | `WORKSPACE_SETTINGS` | S → C | read-only: the workspace's settings clients act on, after `WORKSPACE_INFO` |
 | `0x011A` | `READ_RECEIPTS` | both | whether I share my read receipts: set or ask, and told |
 

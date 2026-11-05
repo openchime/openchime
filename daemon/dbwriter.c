@@ -3447,6 +3447,52 @@ static void sum_purge_msg(sqlite3 *db, uint64_t message_id) {
  * the conversation and opening a DM with them again finds it. The row survives,
  * `disabled`, which clients show as deactivated. Owner/admin only; an admin
  * cannot remove an admin/owner, and the last owner cannot be removed. */
+/* An account deactivated (REQ-033): nothing is deleted. The person is marked
+ * disabled and signed out everywhere; out of every group and every channel but
+ * their DMs; their password, webhooks, devices, drafts and scheduled messages
+ * gone. A removal and a person's own deactivation are this one act, told apart
+ * in the audit log by `action`, done by `actor`. */
+static void deactivate_user(sqlite3 *db, uint64_t uid, uint64_t actor, const char *action) {
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE users SET disabled=1 WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "DELETE FROM sessions WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    /* Out of every group first, so the rule leaves them in no channel; then out
+     * of every channel but the DMs and group DMs, which keep them as a member so
+     * the conversation stays whole for everyone else in it. */
+    sqlite3_prepare_v2(db, "DELETE FROM user_group_members WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    {
+        size_t nch = 0;
+        uint64_t *chans = ids_of(db,
+            "SELECT cm.channel_id FROM channel_members cm JOIN channels c ON c.id = cm.channel_id "
+            " WHERE cm.user_id=?1 AND c.kind <> 'dm';",
+            uid, &nch);
+        for (size_t c = 0; c < nch; c++) membership_sync(db, chans[c], uid, 0);
+        free(chans);
+    }
+    sqlite3_prepare_v2(db, "DELETE FROM local_credentials WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    /* What acts for them when they are not there stops too: their webhooks post
+     * in their name, and their devices would keep being woken for the workspace. */
+    sqlite3_prepare_v2(db, "UPDATE webhooks SET disabled=1 WHERE creator_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "DELETE FROM device_tokens WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    /* Their drafts go with them (REQ-223, ARCH-101): unsent, so nobody else's. */
+    sqlite3_prepare_v2(db, "DELETE FROM drafts WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    /* And anything they had scheduled (REQ-224): the account is gone, so the
+     * promise cannot be kept and there is nobody left to tell. */
+    sqlite3_prepare_v2(db, "DELETE FROM scheduled_messages WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+
+    audit_actor(db, OC_AUDIT_ADMIN, action, actor, uid, NULL, 1, NULL);
+}
+
 static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -3467,48 +3513,33 @@ static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
         r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_LAST_OWNER; return r;
     }
 
-    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
-    sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db, "UPDATE users SET disabled=1 WHERE id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    sqlite3_prepare_v2(db, "DELETE FROM sessions WHERE user_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    /* Out of every group first, so the rule leaves them in no channel; then out
-     * of every channel but the DMs and group DMs, which keep them as a member so
-     * the conversation stays whole for everyone else in it. */
-    sqlite3_prepare_v2(db, "DELETE FROM user_group_members WHERE user_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    {
-        size_t nch = 0;
-        uint64_t *chans = ids_of(db,
-            "SELECT cm.channel_id FROM channel_members cm JOIN channels c ON c.id = cm.channel_id "
-            " WHERE cm.user_id=?1 AND c.kind <> 'dm';",
-            j->target_user_id, &nch);
-        for (size_t c = 0; c < nch; c++) membership_sync(db, chans[c], j->target_user_id, 0);
-        free(chans);
-    }
-    sqlite3_prepare_v2(db, "DELETE FROM local_credentials WHERE user_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    /* What acts for them when they are not there stops too: their webhooks post
-     * in their name, and their devices would keep being woken for the workspace. */
-    sqlite3_prepare_v2(db, "UPDATE webhooks SET disabled=1 WHERE creator_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    sqlite3_prepare_v2(db, "DELETE FROM device_tokens WHERE user_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    /* Their drafts go with them (REQ-223, ARCH-101): unsent, so nobody else's. */
-    sqlite3_prepare_v2(db, "DELETE FROM drafts WHERE user_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    /* And anything they had scheduled (REQ-224): the account is gone, so the
-     * promise cannot be kept and there is nobody left to tell. */
-    sqlite3_prepare_v2(db, "DELETE FROM scheduled_messages WHERE user_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
-    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    deactivate_user(db, j->target_user_id, j->user_id, "user.remove");
 
-    audit_actor(db, OC_AUDIT_ADMIN, "user.remove", j->user_id,
-                j->target_user_id, NULL, 1, NULL);
     r->type = OC_RES_USER_UPDATED;
     r->user_id = j->target_user_id;
     r->role = target_role;
+    r->disabled = 1;
+    return r;
+}
+
+/* A person deactivates their own account: a removal's state exactly, recorded
+ * as their own act. The last active owner may not leave the workspace without
+ * one (LAST_OWNER): another owner is needed first. */
+static oc_dbres *process_deactivate_self(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint8_t role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &role) || user_disabled(db, j->user_id)) {
+        r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    if (role == OC_ROLE_OWNER && count_active_owners(db) <= 1) {
+        r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_LAST_OWNER; return r;
+    }
+    deactivate_user(db, j->user_id, j->user_id, "account.deactivate_self");
+    r->type = OC_RES_USER_UPDATED;
+    r->user_id = j->user_id;
+    r->role = role;
     r->disabled = 1;
     return r;
 }
@@ -11129,6 +11160,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_PROFILE)     return process_set_profile(w->db, j);
     if (j->type == OC_JOB_SET_EMAIL)       return process_set_email(w->db, j);
     if (j->type == OC_JOB_SET_AVATAR)      return process_set_avatar(w->db, j);
+    if (j->type == OC_JOB_DEACTIVATE_SELF) return process_deactivate_self(w->db, j);
     if (j->type == OC_JOB_SET_READ_CURSOR) return process_set_read_cursor(w->db, j);
     if (j->type == OC_JOB_LIST_THREADS)    return process_list_threads(w->db, j);
     if (j->type == OC_JOB_SET_THREAD_FOLLOW) return process_set_thread_follow(w->db, j);
