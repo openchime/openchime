@@ -9,13 +9,14 @@
 # packaged environment file (config.sh); nothing that ships is a box in
 # development mode (release_lint.sh); the tests wait on outcomes and compare
 # markers, not words (tests_lint.sh); every third-party component the
-# daemon links has its licence notice (notices.sh); and the web harness keeps
-# one driver per client (web_driver.sh).
+# daemon links has its licence notice (notices.sh); the web harness keeps
+# one driver per client (web_driver.sh); and a release lists, closes and
+# sends the issues it shipped by the same rules (shipped_issues.sh).
 #
 # Needs: the daemon built (config.sh asks it for its registry).
 # Run by: make test.
 . "$(dirname "$0")/../lib/common.sh"
 scripts/test/local/opcodes.sh shared/protocol.h
-for check in refs make_targets config release_lint tests_lint notices web_driver; do
+for check in refs make_targets config release_lint tests_lint notices web_driver shipped_issues; do
     scripts/test/local/$check.sh
 done

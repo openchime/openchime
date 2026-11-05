@@ -36,7 +36,9 @@
 # which the main and release-* tag rulesets let through, and the GitHub release
 # is made with the job's own token. The shipped issues -- those of the
 # candidate's commits and of the documentation it carries onto main -- are
-# closed on openchime/openchime, the OC tracker, with PUBLIC_TOKEN. Last, sync-public
+# closed on openchime/openchime, the OC tracker, with PUBLIC_TOKEN, and sent to
+# the control plane for the release notes (the notes job, at CONTROL_PLANE_URL,
+# signed in with the job's OIDC token). Last, sync-public
 # copies main, staging, the tag and the release to the repository the
 # PUBLIC_REPO variable names, a convenience nothing here depends on.
 name: release
@@ -1208,6 +1210,36 @@ jobs:
           git fetch --tags --force --quiet || true
           [ -n "$GH_TOKEN" ] || { echo "::warning::PUBLIC_TOKEN is not set in the release environment; closed nothing"; exit 0; }
           scripts/release/close_shipped_issues.sh "release-${N}"
+
+  # Send the control plane what this release shipped, for its release notes:
+  # the issues close-issues closes, each as filed (scripts/release/send_notes.sh).
+  # It signs in with the job's GitHub OIDC token, so no secret is shared, at the
+  # address the CONTROL_PLANE_URL repository variable names. Like close-issues it
+  # never fails: by now the packages are live.
+  notes:
+    name: send release notes
+    needs: [resolve, version, candidate, publish]
+    if: ${{ always() && !inputs.dry_run && needs.publish.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+      - env:
+          N: ${{ needs.version.outputs.number }}
+          BUILD_ID: ${{ needs.candidate.outputs.build_id }}
+          GH_TOKEN: ${{ secrets.PUBLIC_TOKEN }}
+          CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL }}
+        run: |
+          git fetch --tags --force --quiet || true
+          [ -n "$GH_TOKEN" ] || { echo "::warning::PUBLIC_TOKEN is not set in the release environment; the release's notes were not sent"; exit 0; }
+          scripts/release/send_notes.sh "$N" "$BUILD_ID"
 
   # The release-candidates for this number, done with: once release-N is
   # published, every release-N-rcK prerelease and its tag is deleted, the one
