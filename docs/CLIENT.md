@@ -308,7 +308,9 @@ model; translate input to intents }, stop.
   unread), three **bordered, titled panels** — Channels │ Messages │ Members
   (the active one drawn in a bright border) — a status line, the always-ready
   composer, and a **context keybinding hint bar**; `?` opens a full
-  help overlay. Read-only overlays (thread, search, roster, who-reacted,
+  help overlay. (The GUI has no such bar, by decision: its actions are found in
+  its menus, its tooltips and the Ctrl+/ shortcuts sheet, and a permanent footer
+  would cost every view a line of height.) Read-only overlays (thread, search, roster, who-reacted,
   notification prefs, webhooks) render inside the Messages panel. Everything is
   drawn cell-by-cell, re-laid-out on resize, measuring glyph width with utf8proc.
   **Navigation mode** (Esc from the composer, or Tab on an empty composer): a
