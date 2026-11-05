@@ -545,14 +545,10 @@ connection before the first ack is therefore safely retryable with the same
 token.
 
 Errors: `UNKNOWN_CHANNEL`, `NOT_A_MEMBER` (REQ-031),
-`SEND_RATE_LIMITED` (REQ-190) — all non-fatal `ERROR` frames carrying the
+`SEND_RATE_LIMITED` (REQ-190), `BODY_TOO_LARGE` (a body longer than
+`MAX_BODY_SIZE`, refused before anything is stored, so no `SEND_ACK` or
+`BROADCAST` follows) — all non-fatal `ERROR` frames carrying the
 offending `idempotency_token` in `context` (§8) so the client can correlate.
-
-**The body's size is not checked on `SEND` today.** `BODY_TOO_LARGE` (3001) is
-defined but the daemon does not send it: a body longer than `MAX_BODY_SIZE` that
-still fits in a frame is stored and answered with `SEND_ACK`, and the
-`BROADCAST` encoder then refuses it, so the message reaches no other member. A
-client must not send a body over `MAX_BODY_SIZE`.
 
 ### 5.2 `SEND_ACK` (server → client), msg_type `0x0021`
 
@@ -1396,7 +1392,8 @@ thread:
 `SEND_REPLY`/`LIST_THREAD` failures are non-fatal `ERROR` frames:
 `UNKNOWN_MESSAGE` (no such parent, or, for `SEND_REPLY`, it is tombstoned —
 `LIST_THREAD` still lists the replies under a deleted root), `NOT_A_MEMBER` /
-`UNKNOWN_CHANNEL` (cannot post to / read the channel).
+`UNKNOWN_CHANNEL` (cannot post to / read the channel), and, for `SEND_REPLY`,
+`BODY_TOO_LARGE` with its `idempotency_token` in `context`, as on `SEND` (§5.1).
 
 A `THREAD_REPLY` also drives a notify decision (REQ-061): the reply's root goes
 to the push emitter with it, which notifies the thread's **participants** —
@@ -3169,7 +3166,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `2010` | `AUTH_DENIED` | auth   | no    | A device code refused on the page. |
 | `2011` | `AUTH_USE_PROVIDER` | auth | yes | A sign-in by emailed code for a person who signs in here with a provider; they sign in with that provider instead (AUTH.md §8.4). |
 | `2012` | `AUTH_SETUP_REQUIRED` | auth | — | Pages only: a local account with no second step where `OPENCHIME_MFA=required` (AUTH.md §8.6). |
-| `3001` | `BODY_TOO_LARGE`      | messaging  | no    | Defined for a `SEND` body over `MAX_BODY_SIZE`, but not sent by the daemon today: such a body is stored and acked, and not broadcast (§5.1). |
+| `3001` | `BODY_TOO_LARGE`      | messaging  | no    | A `SEND` or `SEND_REPLY` body over `MAX_BODY_SIZE`; nothing is stored, and the token is in `context` (§5.1). |
 | `3002` | `NOT_A_MEMBER`        | messaging  | no    | Sender is not a member of the target channel (REQ-031).        |
 | `3003` | `UNKNOWN_CHANNEL`     | messaging  | no    | `channel_id` does not exist in this tenant.                    |
 | `3004` | `SEND_RATE_LIMITED`   | messaging  | no    | Per-connection rate exceeded (REQ-190): sends; also reactions (§5.9), poll votes, encrypted-DM (`PDM_*`) frames, voice-input segments and call signalling (§5.17). |

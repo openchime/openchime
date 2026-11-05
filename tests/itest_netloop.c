@@ -6499,6 +6499,89 @@ static int count_frames(client *c, uint16_t type, uint16_t code, uint64_t from_u
 /* Everything `c` has sent so far has been handled: its fence is answered. */
 static int fenced(client *c) { return count_frames(c, 0, 0, 0, NULL, 1, 0) == 0; }
 
+/* A SEND or SEND_REPLY frame by hand (PROTOCOL.md §2, §5.1, §5.10), for a body
+ * past what oc_encode_send will write: `parent` != 0 makes it a SEND_REPLY.
+ * Returns the frame's length. */
+static size_t raw_send_frame(uint8_t *buf, uint64_t channel, const uint8_t idem[OC_IDEM_SIZE],
+                             uint64_t parent, size_t body_len) {
+    size_t n = 8;
+    for (int i = 7; i >= 0; i--) buf[n++] = (uint8_t)(channel >> (i * 8));
+    memcpy(buf + n, idem, OC_IDEM_SIZE); n += OC_IDEM_SIZE;
+    if (parent) for (int i = 7; i >= 0; i--) buf[n++] = (uint8_t)(parent >> (i * 8));
+    buf[n++] = (uint8_t)(body_len >> 24); buf[n++] = (uint8_t)(body_len >> 16);
+    buf[n++] = (uint8_t)(body_len >> 8);  buf[n++] = (uint8_t)body_len;
+    memset(buf + n, 'x', body_len); n += body_len;
+    if (!parent) { memset(buf + n, 0, 16); n += 16; }   /* SEND's forward source, 0/0 */
+    uint32_t len = (uint32_t)(n - 4);
+    uint16_t type = parent ? OC_MSG_SEND_REPLY : OC_MSG_SEND;
+    buf[0] = (uint8_t)(len >> 24); buf[1] = (uint8_t)(len >> 16); buf[2] = (uint8_t)(len >> 8); buf[3] = (uint8_t)len;
+    buf[4] = (uint8_t)(OC_PROTOCOL_VERSION >> 8); buf[5] = (uint8_t)OC_PROTOCOL_VERSION;
+    buf[6] = (uint8_t)(type >> 8); buf[7] = (uint8_t)type;
+    return n;
+}
+
+/* A body past OC_MAX_BODY_SIZE is refused with a non-fatal BODY_TOO_LARGE naming
+ * its idempotency token, and nothing is stored or broadcast; one of exactly the
+ * cap is taken; the connection goes on (PROTOCOL.md §5.1). */
+static void test_send_body_limit(int port, const uint8_t *pin) {
+    client a;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    static uint8_t big[OC_MAX_FRAME_SIZE];
+    uint8_t idem[OC_IDEM_SIZE];
+
+    /* One byte over, as SEND: one ERROR, nothing else. */
+    memset(idem, 0, sizeof idem); idem[0] = 0xB1;
+    CHECK(send_frame(&a, big, raw_send_frame(big, 1, idem, 0, OC_MAX_BODY_SIZE + 1)) == 0);
+    oc_header hdr; oc_rbuf p; oc_error e;
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+    CHECK(oc_decode_error(&p, &e) == OC_OK && e.code == OC_ERR_BODY_TOO_LARGE && e.fatal == 0 &&
+          e.context.len == OC_IDEM_SIZE && memcmp(e.context.ptr, idem, OC_IDEM_SIZE) == 0);
+    CHECK(fenced(&a));   /* no SEND_ACK, no BROADCAST */
+
+    /* Exactly the cap is taken: acknowledged and broadcast. */
+    memset(idem, 0, sizeof idem); idem[0] = 0xB2;
+    CHECK(send_frame(&a, big, raw_send_frame(big, 1, idem, 0, OC_MAX_BODY_SIZE)) == 0);
+    uint64_t parent = 0; int acked = 0, heard = 0;
+    for (int i = 0; i < 2; i++) {
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) {
+            oc_send_ack ack;
+            if (oc_decode_send_ack(&p, &ack) == OC_OK && memcmp(ack.idem, idem, OC_IDEM_SIZE) == 0) {
+                acked = 1; parent = ack.message_id;
+            }
+        } else if (hdr.msg_type == OC_MSG_BROADCAST) heard = 1;
+    }
+    CHECK(acked && heard && parent != 0);
+
+    /* One byte over, as SEND_REPLY to that message: the same refusal. */
+    memset(idem, 0, sizeof idem); idem[0] = 0xB3;
+    CHECK(send_frame(&a, big, raw_send_frame(big, 1, idem, parent, OC_MAX_BODY_SIZE + 1)) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+    CHECK(oc_decode_error(&p, &e) == OC_OK && e.code == OC_ERR_BODY_TOO_LARGE && e.fatal == 0 &&
+          e.context.len == OC_IDEM_SIZE && memcmp(e.context.ptr, idem, OC_IDEM_SIZE) == 0);
+    CHECK(fenced(&a));   /* no SEND_ACK, no THREAD_REPLY */
+
+    /* The connection goes on: a short SEND is acknowledged. */
+    memset(idem, 0, sizeof idem); idem[0] = 0xB4;
+    uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0}; s.channel_id = 1; memcpy(s.idem, idem, OC_IDEM_SIZE); s.body = oc_slice_str("after");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    acked = 0;
+    for (int i = 0; i < 2 && !acked; i++) {
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) {
+            oc_send_ack ack;
+            acked = oc_decode_send_ack(&p, &ack) == OC_OK && memcmp(ack.idem, idem, OC_IDEM_SIZE) == 0;
+        }
+    }
+    CHECK(acked);
+
+    client_close(&a);
+}
+
 static void set_read_timeout(client *c, int ms) {
     struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
     setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -7933,6 +8016,7 @@ int run_netloop_tests(void) {
         test_concurrent_load(arg.port, pin);
         test_login_bound(arg.port, pin);
         test_send_rate_limit(arg.port, pin);
+        test_send_body_limit(arg.port, pin);
         test_out_buffer_cap(arg.port, pin, dbw, flooder);
         test_admin_vertical(arg.port, pin);
         test_revoke_other_devices(arg.port, pin);

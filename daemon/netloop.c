@@ -2460,6 +2460,18 @@ static int reject_send_rate(conn *c, const uint8_t idem[OC_IDEM_LEN]) {
     return out_append(c, tmp, w.len);
 }
 
+/* A body past OC_MAX_BODY_SIZE that still fits in a frame decodes, but the
+ * BROADCAST encoder refuses it: taken, it would be stored and acknowledged and
+ * then reach nobody. So it is refused here, before any job, and the connection
+ * goes on (PROTOCOL.md §5.1). */
+static int reject_body_too_large(conn *c, const uint8_t idem[OC_IDEM_LEN]) {
+    uint8_t tmp[128]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
+    oc_slice ctx = { idem, OC_IDEM_LEN };
+    oc_error e = { OC_ERR_BODY_TOO_LARGE, 0, ctx, oc_slice_str(oc_error_text(OC_ERR_BODY_TOO_LARGE)) };
+    oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+    return out_append(c, tmp, w.len);
+}
+
 
 /* --- Voice input (REQ-296-300, ARCH-112) -------------------------------- */
 
@@ -2815,6 +2827,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_SEND) {
             oc_send s = {0};
             if (oc_decode_send(&p, &s) != OC_OK) return -1;
+            if (s.body.len > OC_MAX_BODY_SIZE) { if (reject_body_too_large(c, s.idem) != 0) return -1; continue; }
             if (pdm_refuses(c, s.channel_id)) { if (pdm_forbid(c, s.idem, OC_IDEM_LEN) != 0) return -1; continue; }
             if (!send_rate_ok(c)) { if (reject_send_rate(c, s.idem) != 0) return -1; continue; }
             if (!demo_ok(OC_DL_MESSAGE, c->user_id)) {
@@ -3314,6 +3327,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_SEND_REPLY) {
             oc_send_reply sr = {0};
             if (oc_decode_send_reply(&p, &sr) != OC_OK) return -1;
+            if (sr.body.len > OC_MAX_BODY_SIZE) { if (reject_body_too_large(c, sr.idem) != 0) return -1; continue; }
             if (pdm_refuses(c, sr.channel_id)) { if (pdm_forbid(c, sr.idem, OC_IDEM_LEN) != 0) return -1; continue; }
             if (!send_rate_ok(c)) { if (reject_send_rate(c, sr.idem) != 0) return -1; continue; }
             if (!demo_ok(OC_DL_MESSAGE, c->user_id)) {
