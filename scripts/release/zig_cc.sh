@@ -42,5 +42,5 @@ for a do
 done
 
 # shellcheck disable=SC2086 # $pre is a list of flags
-ZIG="${ZIG:-$(cd "$(dirname "$0")/../.." && pwd)/third_party/zig-0.17.0/zig}"
+ZIG="${ZIG:-$(cd "$(dirname "$0")/../.." && pwd)/third_party/zig-0.13.0/zig}"
 exec "$ZIG" "$tool" -target "$target" $pre "$@"

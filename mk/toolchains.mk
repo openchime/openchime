@@ -6,7 +6,7 @@
 # nasm (libvpx's x86 assembly). The directories go first on PATH for every
 # recipe and script, so a machine-wide install is never picked up by accident;
 # a bump is a version and a sum in the script.
-ZIG_VERSION        := 0.17.0
+ZIG_VERSION        := 0.13.0
 EMSDK_VERSION      := 6.0.13
 LLVM_MINGW_VERSION := 20261020
 

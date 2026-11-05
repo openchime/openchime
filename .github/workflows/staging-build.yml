@@ -399,7 +399,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: |
-            third_party/zig-0.17.0
+            third_party/zig-0.13.0
             third_party/emsdk-6.0.13
           key: toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
 
@@ -432,7 +432,7 @@ jobs:
             third_party/llamacpp-0.5.0-aarch64
             build/kitten
             build/moonshine
-          key: tts-release-${{ matrix.arch }}-zig0.17.0-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
 
       # mbedTLS and libopus as this job builds them: with zig's clang against
       # glibc 2.34 for the binary that ships (the arm64 job also builds the
@@ -455,7 +455,7 @@ jobs:
             third_party/mbedtls-3.6.2-aarch64
             third_party/opus-1.6.1
             third_party/opus-1.6.1-aarch64
-          key: vendor-release-${{ matrix.arch }}-zig0.17.0-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/opus.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
+          key: vendor-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/opus.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
 
       # The web client's libraries (docs/WEB.md): the daemon is never built
       # without the client it serves -- the page and loader are compiled into it
@@ -511,7 +511,7 @@ jobs:
             third_party/llamacpp-0.5.0-aarch64
             build/kitten
             build/moonshine
-          key: tts-release-${{ matrix.arch }}-zig0.17.0-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
 
       # The build-*.sh scripts take an output directory and default to a bare
       # dist/. They are deliberately left knowing nothing about the per-platform
