@@ -92,6 +92,15 @@ PY
     judge() {   # judge <what> <0|1>
         if [ "$2" = 1 ]; then echo "  ok   $1"; else echo "  FAIL $1"; bad=1; fi
     }
+    # A failed page's log, to stderr: in CI the runner's workspace is gone once
+    # the job ends, so its job log is the only place a failure's cause is kept.
+    show_log() {   # show_log <file>
+        {
+            echo "----- last 60 lines of $1 -----"
+            tail -n 60 "$1" 2>/dev/null || echo "(no log)"
+            echo "----- end of $1 -----"
+        } >&2
+    }
     # Run Chrome on the page until its log says one of the patterns, the page
     # gives up on the sign-in, or Chrome ends; the outer bound only stops a hang.
     run_page() {   # run_page <url> <profile> <log> <done-pattern> [chrome flags...]
@@ -144,12 +153,14 @@ PY
     audio=$(grep -oE 'oc-web: audio [a-z]+' "$W/chrome-media.log" | head -1)
     # About OpenChime: both builds on one line, the daemon's told by SERVER_BUILD.
     about=$(grep -oE '"ACK about: [^"]*' "$W/chrome-media.log" | head -1 | cut -c13-)
+    before=$bad; bad=0
     judge "text layer (sttest): ${sttest:-no answer}" "$(grep -q '^ok ' <<<"$sttest" && echo 1)"
     judge "video card opened on the camera" "$(grep -q '"UNTIL vm open: ok' "$W/chrome-media.log" && echo 1)"
     judge "recording began" "$(grep -q '"UNTIL vm record: ok' "$W/chrome-media.log" && echo 1)"
     judge "stopped and the file taken (take_bytes>0)" "$(grep -q '"UNTIL vm stop: ok' "$W/chrome-media.log" && grep -qE 'take_bytes=[1-9]' <<<"$vm" && echo 1)"
     judge "audio on the worklet: ${audio:-not reported}" "$([ "$audio" = "oc-web: audio worklet" ] && echo 1)"
     judge "about: ${about:-no answer}" "$(grep -qE '^OpenChime client [^ ]+ \(web\), server [0-9a-z]+, protocol [0-9]+$' <<<"$about" && echo 1)"
+    media_bad=$bad; [ "$before" = 1 ] && bad=1
 
     # The input method (plat_web.c): a composition played into the page's
     # hidden input ends in the composer, as a desktop IME's does. The page
@@ -158,12 +169,16 @@ PY
     ime=$(grep -m1 '"IME:' "$W/chrome-ime.log" | sed 's/.*"IME://; s/", source:.*//')
     composing=$(grep -m1 '"IME-COMPOSING:' "$W/chrome-ime.log" | sed 's/.*"IME-COMPOSING://; s/", source:.*//')
     echo "  ime: ${ime:-$(grep -m1 -oE '"IME-ERR:[^"]*' "$W/chrome-ime.log" | cut -c10-)}"
+    before=$bad; bad=0
     judge "composing: two units (comp=2)" "$(grep -q ' comp=2 ' <<<"$composing" && echo 1)"
     judge "committed: two characters in the composer (len=2, 日本)" "$(grep -q '^ed len=2 ' <<<"$ime" && grep -q '日本' <<<"$ime" && echo 1)"
+    ime_bad=$bad; [ "$before" = 1 ] && bad=1
 
     if [ $bad = 0 ]; then
         echo "webtest: PASS -- the client signed in, drew itself, recorded a video message and took a composition in the browser"; exit 0
     fi
+    [ "$media_bad" = 1 ] && show_log "$W/chrome-media.log"
+    [ "$ime_bad" = 1 ] && show_log "$W/chrome-ime.log"
     echo "webtest: FAIL -- see the FAIL lines above, and $W/chrome-media.log and $W/chrome-ime.log" >&2
     exit 1
 }
