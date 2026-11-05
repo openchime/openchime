@@ -1691,6 +1691,10 @@ static int      g_n_thumb_hits;
 static struct { rectf r; uint64_t chan, mid; } g_fwd_hits[32];
 static int      g_n_fwd_hits;
 static uint64_t g_lightbox;
+/* The expanded view pages through the open conversation's media: its place in
+ * that sequence as last drawn (0-based, of g_lb_n), and the arrows' rects. */
+static int      g_lb_i = -1, g_lb_n;
+static rectf    g_lb_prev, g_lb_next, g_lb_img;
 /* The video message overlay (recording card or player) is up; see draw_video_overlay. */
 static int g_vm;
 /* A screen recording is counting down, recording or finishing: the card and its
@@ -27797,14 +27801,106 @@ static int vm_key(oc_win *hwnd, int wp) {
  * backdrop. Drawn last so nothing overlaps it. */
 static gfx_tex *thumb_get(gfx *rt, uint64_t id, unsigned *w, unsigned *h);  /* fwd */
 
+/* The media the expanded view pages through: every attachment of the open
+ * conversation's loaded messages that the transcript draws as media -- an image
+ * or a video message, not reclaimed -- in posting order, and within a message
+ * in its order. Fills up to `max`; returns the count. */
+typedef struct { const oc_attachment *at; const oc_msg *msg; int video; } lb_item;
+static int lb_items(lb_item *out, int max) {
+    const oc_model *m = model();
+    const oc_channel *c = m ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+    int n = 0;
+    for (size_t i = 0; c && i < c->n_msgs; i++) {
+        const oc_msg *msg = &c->msgs[i];
+        if (msg->deleted) continue;
+        for (int k = 0; k < msg->n_attach && n < max; k++) {
+            const oc_attachment *a = &msg->attach[k];
+            if (a->reclaimed || !(mime_is_image(a->mime) || is_video_msg(a))) continue;
+            out[n].at = a; out[n].msg = msg; out[n].video = is_video_msg(a); n++;
+        }
+    }
+    return n;
+}
+static int lb_index(const lb_item *it, int n) {
+    for (int i = 0; i < n; i++) if (it[i].at->id == g_lightbox) return i;
+    return -1;
+}
+/* The previous (-1) or next (+1) item; at either end, nothing. */
+static void lb_step(int d) {
+    static lb_item it[512];
+    int n = lb_items(it, 512), i = lb_index(it, n);
+    if (i < 0 || i + d < 0 || i + d >= n) return;
+    g_lightbox = it[i + d].at->id;
+    invalidate();
+}
+/* A video message on screen in the view: the existing player opens it. */
+static void lb_play(oc_win *hwnd) {
+    static lb_item it[512];
+    int n = lb_items(it, 512), i = lb_index(it, n);
+    if (i >= 0 && it[i].video) { g_lightbox = 0; vm_open_player(hwnd, it[i].at); }
+}
+
 static void draw_lightbox(gfx *rt, float W, float H) {
+    g_lb_prev = g_lb_next = g_lb_img = rf(0, 0, 0, 0);
+    g_lb_i = -1; g_lb_n = 0;
     if (!g_lightbox) return;
+    static lb_item it[512];
+    int n = lb_items(it, 512), i = lb_index(it, n);
+    g_lb_i = i; g_lb_n = n;
+    const lb_item *cur = i >= 0 ? &it[i] : NULL;
+    /* A video shows its poster; an image itself. */
+    uint64_t want = cur && cur->video ? cur->at->poster_id : g_lightbox;
     unsigned iw = 0, ih = 0;
-    gfx_tex *bmp = thumb_get(rt, g_lightbox, &iw, &ih);
-    if (!bmp || !iw || !ih) { return; }
+    gfx_tex *bmp = want ? thumb_get(rt, want, &iw, &ih) : NULL;
 
     rectf all = rf(0, 0, W, H);
     gfx_fill(rt, gr(all), 0x000000, 0.82f);
+
+    /* Who posted it, when, and where it is in the conversation's media. */
+    if (cur) {
+        const oc_model *m = model();
+        const char *who = cur->msg->author_name[0] ? cur->msg->author_name
+                        : m ? oc_model_user_name((oc_model *)m, cur->msg->author_id) : "";
+        char when[40] = "", head[200];
+        time_t t = (time_t)(cur->msg->server_time / 1000); struct tm tv;
+        if (cur->msg->server_time && oc_localtime_r(&t, &tv))
+            strftime(when, sizeof when, g_pref_time24 ? "%a %d %b %H:%M" : "%a %d %b %I:%M %p", &tv);
+        snprintf(head, sizeof head, "%s  \xC2\xB7  %s  \xC2\xB7  %d of %d", who && who[0] ? who : "someone", when, i + 1, n);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, head, g_meta, rf(0, 14, W, 38), 0xFFFFFF);
+        g_meta->align = ST_ALIGN_LEFT;
+    }
+
+    /* The arrows at the window's edges, only where there is somewhere to go. */
+    float bw = UIS(44), bh = UIS(64);
+    if (i > 0)     g_lb_prev = rf(12, (H - bh) / 2, 12 + bw, (H + bh) / 2);
+    if (i >= 0 && i + 1 < n) g_lb_next = rf(W - 12 - bw, (H - bh) / 2, W - 12, (H + bh) / 2);
+    rectf arrows[2] = { g_lb_prev, g_lb_next };
+    static const char *const GLYPH[2] = { "\xE2\x80\xB9", "\xE2\x80\xBA" };   /* ‹ › */
+    for (int k = 0; k < 2; k++) {
+        if (arrows[k].right <= arrows[k].left) continue;
+        int hot = in_rect(arrows[k], g_mouse_x, g_mouse_y);
+        fill_round_a(rt, arrows[k], OC_R_CONTROL, 0x000000, hot ? 0.75f : 0.45f);
+        g_display->align = ST_ALIGN_CENTER;
+        draw_text(rt, GLYPH[k], g_display, rf(arrows[k].left, arrows[k].top + bh / 2 - UIS(18),
+                                               arrows[k].right, arrows[k].bottom), 0xFFFFFF);
+        g_display->align = ST_ALIGN_LEFT;
+    }
+
+    if (!bmp || !iw || !ih) {
+        /* Not here yet: ask for it -- this one, once -- and say so meanwhile,
+         * rather than show whatever was on screen before. */
+        if (want && !g_thumbs_off && !thumb_failed(want) && !g_thumb_pending && g_client) {
+            g_thumb_pending = want;
+            g_thumb_deadline = now_ms() + 8000;
+            oc_client_fetch_attachment(g_client, want);
+        }
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, thumb_failed(want) ? "This image could not be loaded." : "Loading\xE2\x80\xA6",
+                  g_meta, rf(0, H / 2 - 12, W, H / 2 + 12), OC_COL_MUTED);
+        g_meta->align = ST_ALIGN_LEFT;
+        return;
+    }
 
     /* Fit inside a margin, and never enlarge past 1:1 — blowing a small image
      * up to fill the window makes it look broken rather than bigger. */
@@ -27815,8 +27911,16 @@ static void draw_lightbox(gfx *rt, float W, float H) {
     float dw = (float)iw * sc, dh = (float)ih * sc;
     rectf dst = rf((W - dw) / 2, (H - dh) / 2, (W + dw) / 2, (H + dh) / 2);
     gfx_tex_draw(rt, bmp, gr(dst), 0.0f, 1.0f);
+    g_lb_img = dst;
+    if (cur && cur->video) {
+        /* A video message: its poster with a play mark; the player plays it. */
+        float pcx = (dst.left + dst.right) / 2, pcy = (dst.top + dst.bottom) / 2, pr = UIS(32);
+        gfx_ellipse(rt, pcx, pcy, pr, pr, 0x000000, 0.55f);
+        draw_lucide(rt, OC_ICON_PLAY, rf(pcx - pr / 2, pcy - pr / 2, pcx + pr / 2, pcy + pr / 2), 0xFFFFFF);
+    }
     g_meta->align = ST_ALIGN_CENTER;
-    draw_text(rt, "Click anywhere or press Esc to close", g_meta,
+    draw_text(rt, cur && cur->video ? "Enter or click to play \xC2\xB7 \xE2\x86\x90 \xE2\x86\x92 to move \xC2\xB7 Esc to close"
+                                    : "\xE2\x86\x90 \xE2\x86\x92 to move \xC2\xB7 Click outside or press Esc to close", g_meta,
               rf(0, dst.bottom + 10, W, dst.bottom + 32), OC_COL_MUTED);
     g_meta->align = ST_ALIGN_LEFT;
 }
@@ -28918,7 +29022,17 @@ static int on_click(oc_win *hwnd, int x, int y) {
     if (modal_frame_click(hwnd, x, y)) return 1;
     /* A shared screen full screen covers everything: only its own bar answers. */
     if (g_share_full && !g_menu && !modal_open()) { call_click(hwnd, x, y); return 1; }
-    if (g_lightbox) { g_lightbox = 0; return 1; }   /* any click dismisses it */
+    if (g_lightbox) {
+        /* The arrows page; a video's poster plays; anywhere else closes. */
+        if (in_rect(g_lb_prev, (float)x, (float)y)) { lb_step(-1); return 1; }
+        if (in_rect(g_lb_next, (float)x, (float)y)) { lb_step(+1); return 1; }
+        if (in_rect(g_lb_img, (float)x, (float)y) && g_lb_i >= 0) {
+            static lb_item it[512];
+            int n = lb_items(it, 512), i = lb_index(it, n);
+            if (i >= 0 && it[i].video) { lb_play(hwnd); return 1; }
+        }
+        g_lightbox = 0; return 1;
+    }
     /* A pane's ✕. One test for every pane, because there is one header:
      * they all occupy the middle column and only one can be up. Gated on a pane
      * ACTUALLY being open so a stale rect from the last one cannot swallow a click
@@ -35724,7 +35838,10 @@ static void test_dump(const char *path) {
     fprintf(f, "badge=%d flash_pref=%d flashes=%d taskbar=%d hr=0x%08lx\n",
             g_badge_shown < 0 ? 0 : g_badge_shown, g_pref_flash, g_flashes_raised,
             oc_plat_badge_status() ? -1 : (g_badge_shown >= 0 ? 1 : 0), (unsigned long)(unsigned)oc_plat_badge_status());
-    fprintf(f, "lightbox=%llu thumb_hits=%d\n", (unsigned long long)g_lightbox, g_n_thumb_hits);
+    fprintf(f, "lightbox=%llu lightbox_pos=%d/%d prev=%d next=%d next_r=%.0f,%.0f,%.0f,%.0f thumb_hits=%d\n",
+            (unsigned long long)g_lightbox, g_lb_i + 1, g_lb_n, g_lb_prev.right > g_lb_prev.left,
+            g_lb_next.right > g_lb_next.left, g_lb_next.left, g_lb_next.top, g_lb_next.right, g_lb_next.bottom,
+            g_n_thumb_hits);
     /* The video overlay (REQ-162/165): which card, its phase, and its buttons. */
     {
         oc_rec_status rs; memset(&rs, 0, sizeof rs);
@@ -38667,6 +38784,8 @@ static int on_key_down(oc_win *hwnd, int wp) {
         }
         if (VM_UP() && vm_key(hwnd, wp)) { invalidate(); return 0; }
         if (wp == OCK_ESCAPE && g_lightbox) { g_lightbox = 0; invalidate(); return 0; }
+        if (g_lightbox && (wp == OCK_LEFT || wp == OCK_RIGHT)) { lb_step(wp == OCK_LEFT ? -1 : +1); return 0; }
+        if (g_lightbox && wp == OCK_RETURN) { lb_play(hwnd); invalidate(); return 0; }
         /* Esc pops the context pane back to the member list before it reaches
          * the middle column's overlays — the pane is what you just opened. */
         if (wp == OCK_ESCAPE && g_rp_mode != RP_MEMBERS) {

@@ -1902,6 +1902,17 @@ The paging underneath is proven without a screen in `test_client_core.c`, which
 asks the daemon for pages of two and checks the second continues from the first
 rather than repeating it. Not in CI, for the smoke's reason.
 
+## Reading the lightbox harness
+
+`scripts/gui/lightbox.sh` drives the expanded image view against its own
+fixture daemon (port 9710). It uploads three images with a text file between
+them, opens one with a click, and pages with Left, Right and the next arrow,
+asserting the view's place from the dump's `lightbox=` line: `lightbox=` (the
+attachment on screen), `lightbox_pos=<i>/<n>` (its place in the conversation's
+media; the text file is never counted), `prev=` and `next=` (whether each arrow
+is drawn) and `next_r=` (the next arrow's rect). At the last image Right changes
+nothing; Esc closes the view. Run on both platforms, `--web` included.
+
 ## Reading the uploads harness
 
 `scripts/gui/uploads.sh` drives the Win32 message box's upload tray (REQ-140)
