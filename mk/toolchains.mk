@@ -6,7 +6,7 @@
 # nasm (libvpx's x86 assembly). The directories go first on PATH for every
 # recipe and script, so a machine-wide install is never picked up by accident;
 # a bump is a version and a sum in the script.
-ZIG_VERSION        := 0.13.0
+ZIG_VERSION        := 0.17.1
 EMSDK_VERSION      := 6.0.13
 LLVM_MINGW_VERSION := 20261020
 
@@ -34,12 +34,9 @@ CXX_WRAP    := build/cxx-$(ARCH)
 override CC := $(CURDIR)/$(CC_WRAP)
 CXX         := $(CURDIR)/$(CXX_WRAP)
 export CC CXX
-# ONNX Runtime's AVX-512 kernels enable the instructions per file and need
-# zig's clang told that 512-bit vectors are allowed; nothing else notices.
-ZIG_EXTRA   := $(if $(filter x86_64,$(ARCH)),-mevex512,)
 $(CC_WRAP) $(CXX_WRAP) &: $(ZIG) scripts/release/zig_cc.sh | build
-	@printf '#!/bin/sh\nexec %s/scripts/release/zig_cc.sh cc %s %s -- "$$@"\n' "$(CURDIR)" "$(TARGET)" "$(ZIG_EXTRA)" > $(CC_WRAP)
-	@printf '#!/bin/sh\nexec %s/scripts/release/zig_cc.sh c++ %s %s -- "$$@"\n' "$(CURDIR)" "$(TARGET)" "$(ZIG_EXTRA)" > $(CXX_WRAP)
+	@printf '#!/bin/sh\nexec %s/scripts/release/zig_cc.sh cc %s -- "$$@"\n' "$(CURDIR)" "$(TARGET)" > $(CC_WRAP)
+	@printf '#!/bin/sh\nexec %s/scripts/release/zig_cc.sh c++ %s -- "$$@"\n' "$(CURDIR)" "$(TARGET)" > $(CXX_WRAP)
 	@chmod +x $(CC_WRAP) $(CXX_WRAP)
 TOOLCHAIN_DEPS := $(CC_WRAP) $(CXX_WRAP)
 TTS_CXXLIB     := -lc++

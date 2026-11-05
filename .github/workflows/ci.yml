@@ -70,7 +70,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: |
-            third_party/zig-0.13.0
+            third_party/zig-0.17.1
             third_party/emsdk-6.0.13
           key: toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
       # Read-aloud's engine and model (ARCH-111): ONNX Runtime built minimal and
