@@ -525,7 +525,10 @@ them, each `tests/fuzz/<harness>.c`, built as `build/fuzz/<harness>`; the
 header of each file says what it fuzzes and what must hold. The dictionary a
 harness takes is `FUZZ_DICT_<harness>` beside the list (`tests/fuzz/*.dict`),
 none where unset. The full suite's pass is given both by make
-(`scripts/test/full/fuzz.sh`). A new harness is its file and a word in that
+(`scripts/test/full/fuzz.sh`). It runs each harness for `FUZZ_SECONDS` (60),
+`FUZZ_JOBS` of them at once (one per CPU): the harnesses are independent, so
+each still fuzzes for its full time, and the pass takes that time per round
+rather than per harness. A new harness is its file and a word in that
 list, and a line for its sources in `mk/tests.mk`.
 
 A harness that takes several inputs reads them with `oc_fuzz_split`
