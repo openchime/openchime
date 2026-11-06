@@ -3969,7 +3969,7 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     oc_client_call_share(a, 1, 1);
     CHECK(CALL_WAIT(3000, ma->call.sharer == ua && mb->call.sharer == ua));
     CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 2; })));
-    CHECK(share_frames(a, b, c, eb, &wb, 10, WAIT_MS(6000)));
+    CHECK(share_frames(a, b, c, eb, &wb, 10, 6000));
     CHECK(wb.f.width == 1280 && wb.f.height == 800 && wb.rising && wb.bad == 0);
     oc_call_engine_stats(ea, &st);
     printf("  dana shares: erik has %d frames at %dx%d; dana sends %dx%d at %d fps, %d kbps, %u keyframes\n",
@@ -4007,7 +4007,7 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     uint64_t joined = mono_ms();
     oc_client_call_join(c, 1);
     CHECK(CALL_WAIT(3000, mc->in_call && mc->call.sharer == ua));
-    CHECK(share_frames(a, b, c, ec, &wc, 1, WAIT_MS(6000)));
+    CHECK(share_frames(a, b, c, ec, &wc, 1, 6000));
     printf("  faye joined late: her first frame after %d ms, %dx%d, frame number %d\n", (int)(mono_ms() - joined),
            wc.f.width, wc.f.height, wc.last);
     /* The loss above halved the rate, which may have stepped the size down to
@@ -4019,7 +4019,7 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     oc_client_call_share(b, 1, 1);
     CHECK(CALL_WAIT(3000, ma->call.sharer == ub && mb->call.sharer == ub && mc->call.sharer == ub));
     CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 0 && st.share_taken; })));
-    CHECK(share_frames(a, b, c, ea, &wa, 5, WAIT_MS(6000)));
+    CHECK(share_frames(a, b, c, ea, &wa, 5, 6000));
     CHECK(wa.f.width * 800 == wa.f.height * 1280 && wa.rising && wa.bad == 0);
 
     /* erik stops: nobody shares, and the picture goes. */
@@ -4221,13 +4221,14 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     CHECK(st.peers[0].keyed);
     /* A joiner misses at most the grace (CALLS.md §5.3): the others go on with
      * the previous key for a second, which a joiner never gets. After that
-     * nothing fails to decrypt. */
-    {
+     * nothing fails to decrypt. The grace passing is a timer's test: the
+     * ordinary build only. */
+    if (!OC_UNDER_TSAN) {
         CALL_WAIT(3000, mono_ms() > joined_ms + 1000 + 300);   /* the grace (GRACE_MS), and a margin */
         oc_call_engine_stats(eb, &st);
         uint32_t u1 = st.n_peers ? st.peers[0].undecryptable : 0, p1 = st.n_peers ? st.peers[0].packets : 0;
-        CHECK(CALL_WAIT(600, 0) == 0);                          /* ~30 packets at 50 a second */
-        oc_call_engine_stats(eb, &st);
+        /* Twenty packets more, waited for as they come, not for a set time. */
+        CHECK(CALL_WAIT(3000, (oc_call_engine_stats(eb, &st), st.n_peers == 1 && st.peers[0].packets > p1 + 20)));
         CHECK(st.n_peers == 1 && st.peers[0].undecryptable == u1 && st.peers[0].packets > p1 + 20);
         printf("  erik's first second: %u packets he could not decrypt, none since\n", u1);
     }
@@ -4254,8 +4255,8 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     CHECK(CALL_WAIT(3000, !mc->in_call && ma->call.n_parts == 2));
     CHECK(ma->call.epoch > her_last);
     uint64_t after_leave = mono_ms() + 1100;          /* past the 1 s grace */
-    CHECK(CALL_WAIT(3000, mono_ms() > after_leave + 500));
-    {
+    if (!OC_UNDER_TSAN) {   /* the grace passing is a timer's test: the ordinary build only */
+        CHECK(CALL_WAIT(3000, mono_ms() > after_leave + 500));
         int later = 0, newer = 0;
         pthread_mutex_lock(&g_tap.mu);
         for (int i = 0; i < g_tap.n_seen; i++)
@@ -4508,7 +4509,8 @@ static void test_calls_rejoin(oc_client *a, oc_client *b, int port) {
     /* dana talks alone -- nothing comes back but the relay's answers to her
      * keep-alives -- for twice the lost-path time: her path is not lost, and
      * she stays put, on UDP. */
-    { uint32_t b0 = ma->call_back_seq;
+    if (!OC_UNDER_TSAN) {   /* time passing is what is tested: the ordinary build only */
+      uint32_t b0 = ma->call_back_seq;
       CALL_WAIT(1700, 0);
       oc_call_engine_stats(ea, &sa);
       CHECK(ma->in_call && ma->call_back_seq == b0 && !ma->call_rejoining && sa.transport == 0); }
@@ -5397,10 +5399,10 @@ static void test_device_client(void) {
         oc_dbwriter *dbw = web_daemon(tpath("test_core_dev1.db"), NULL);
         CHECK(dbw != NULL);
         if (!dbw) { oc_tls_server_free(&srv); return; }
-        /* A code lives far longer than two approvals over HTTPS take, however
-         * slow the host (WAIT_MS); the client asks once an interval. */
-        const int dev_interval_s = WAIT_MS(1);
-        const uint64_t dev_ttl_ms = WAIT_MS(4000);
+        /* A code lives far longer than two approvals over HTTPS take; the
+         * client asks once an interval, the shortest there is. */
+        const int dev_interval_s = 1;
+        const uint64_t dev_ttl_ms = 4000;
         oc_netloop_set_device_interval_s(dev_interval_s);
         oc_netloop_set_device_ttl_ms(dev_ttl_ms);
         struct core_loop_arg arg;
@@ -5431,11 +5433,13 @@ static void test_device_client(void) {
         oc_client_cancel_signin(c);
         CHECK(WAIT_FOR(c, strstr(m->last_error, "cancelled") != NULL));
         oc_client_stop(c);
-        c = oc_client_start_device(NULL, "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
-        CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
-        CHECK(WAIT_FOR_MS(c, strstr(m->last_error, "expired") != NULL, dev_ttl_ms + dev_interval_s * 1000 + 5000) &&
-              !oc_client_model(c)->authed);
-        oc_client_stop(c);
+        if (!OC_UNDER_TSAN) {   /* the code running out is a timer's test: ordinary build only */
+            c = oc_client_start_device(NULL, "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
+            CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
+            CHECK(WAIT_FOR_MS(c, strstr(m->last_error, "expired") != NULL, dev_ttl_ms + dev_interval_s * 1000 + 5000) &&
+                  !oc_client_model(c)->authed);
+            oc_client_stop(c);
+        }
 
         __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
         pthread_join(th, NULL);
@@ -5483,6 +5487,7 @@ static void test_device_client(void) {
          * is said meanwhile. The daemon used to close it, and the client called
          * that "could not reach the server", which ended a terminal's wait
          * though the code was still good. */
+        if (!OC_UNDER_TSAN) {   /* the limit passing is a timer's test: ordinary build only */
         oc_netloop_set_unauthed_ms(1500);
         c = oc_client_start_device("web.openchime.test", "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
         CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
@@ -5498,6 +5503,7 @@ static void test_device_client(void) {
         CHECK(oc_client_model(c)->error_seq == 0);                     /* nothing was said */
         oc_client_stop(c);
         oc_netloop_set_unauthed_ms(0);
+        }
 
         __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
         pthread_join(th, NULL);

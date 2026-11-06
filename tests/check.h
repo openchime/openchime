@@ -77,8 +77,26 @@ static inline int oc_test_timing(void) {
 /* How long to wait for work to be done -- frames encoded and decoded, say --
  * before calling it not done. Not a speed limit: what is checked is that it is
  * done. But the sanitizer slows the work as much as fifteen times, so under it
- * the wait is that much longer. */
+ * the wait is that much longer. A deadline only: never a timer the code under
+ * test is given, which a test would then sit out fifteen times over. */
 #define WAIT_MS(ms) ((ms) * (OC_UNDER_TSAN ? 15 : 1))
+
+/* A test whose subject is time passing -- a timer firing, a window closing, a
+ * code expiring -- runs in the ordinary build only. Under ThreadSanitizer it
+ * would sit out that time and check a timer, not our threads, so it returns at
+ * once, saying so. The first statement of such a test. */
+#define TIMER_ONLY()                                                         \
+    do {                                                                     \
+        if (OC_UNDER_TSAN) {                                                 \
+            printf("  %s: a timer's test, run plainly only\n", __func__);    \
+            return;                                                          \
+        }                                                                    \
+    } while (0)
+
+/* A loop's count: the full count in the ordinary build, a tenth (at least 2)
+ * under ThreadSanitizer, where a race needs the threads interleaved, not the
+ * volume, and every turn costs five to fifteen times as much. */
+#define TSAN_FEW(n) (OC_UNDER_TSAN ? ((n) / 10 > 2 ? (n) / 10 : 2) : (n))
 
 /* ---- Waiting: deadlines on the monotonic clock, never counts or sleeps -------
  *

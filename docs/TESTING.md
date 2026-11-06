@@ -61,8 +61,8 @@ steps CI runs one after another (`mk/full.mk`):
   dependencies and the GUI smoke on the web (§3.4); and each fuzzing harness
   for its fixed inputs, one at a time, inside 15 seconds in all (§2.2b);
 - `threads` — the suites that start threads, under ThreadSanitizer, their one
-  run in the full suite (§2.4), each in its own process, `TSAN_JOBS` at once
-  (one per CPU), so the pass takes about as long as its slowest suite;
+  run in the full suite (§2.4), in one process, one after another, nothing
+  beside it, inside a budget (`TSAN_BUDGET_S`, 180 seconds);
 - `packages` — the release's daemon for each architecture (zig, glibc 2.34)
   and its `.deb`, `.rpm` and tarball; then the glibc floor, one binary in all
   three, speech on the release binary, the `.deb` installed and speaking, and
@@ -223,7 +223,8 @@ a daemon built with `TTS=1 STT=1`.
   only (one too slow for the fast suite's budget); `THREADS` marks a suite
   whose code starts threads, which the full suite runs under ThreadSanitizer
   and only there, and `TIMED` one that the full suite also runs plainly, for
-  the speed verdicts the sanitizer does not judge (§2.4). The scripts never
+  the speed verdicts the sanitizer does not judge and the timer tests it does
+  not run (§2.4). The scripts never
   keep a list of their own: they ask the binary, `build/tests --list fast`,
   `--list full` (every suite), `--list plain` (the full suite's plain pass:
   all but `THREADS`) or `--list threads` (`THREADS` and `TIMED`).
@@ -782,9 +783,14 @@ same machine, the suites marked `THREADS` under ThreadSanitizer
 - the suites whose code runs threads — the loop and its I/O threads, the
   writer and readers, the worker pools, the client, the recorder and player —
   under ThreadSanitizer (address randomization off, `tests/tsan.supp` for the
-  one test-only reconfiguration), each suite in a process of its own, as many
-  at once as there are CPUs (`scripts/test/full/tsan.sh`, `TSAN_JOBS`): a race
-  is between one suite's threads, so nothing is lost by the split. A suite that starts a thread is marked
+  one test-only reconfiguration), in one process, one suite after another,
+  nothing beside it (`scripts/test/full/tsan.sh`). No test sits out a set time
+  under the sanitizer: a test whose subject is a timer firing or a window
+  closing returns at once there (`TIMER_ONLY()`, `tests/check.h`) and runs in
+  the ordinary build, and a long loop runs a tenth of its turns there
+  (`TSAN_FEW`). `WAIT_MS` stretches deadlines only, never a timer a test sets.
+  The pass has a budget, `TSAN_BUDGET_S` (180 seconds); over it, it fails,
+  naming the slowest suites. A suite that starts a thread is marked
   `THREADS`, and that is checked at run time, not read from the source: the
   plain test binary is linked with `-Wl,--wrap=pthread_create`, and a suite
   that starts a thread and is not marked fails, naming itself and the table

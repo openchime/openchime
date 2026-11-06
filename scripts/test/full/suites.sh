@@ -5,8 +5,10 @@
 # code starts no thread, the slow ones included, and media, as many at once as
 # there are CPUs, with every timing verdict judged (tests/check.h). The suites
 # that start threads run once, under ThreadSanitizer (full/tsan.sh), which does
-# not judge speed; media is marked TIMED in SUITES[] (tests/main.c), so it runs
-# here as well, for the speed verdicts nothing else judges.
+# not judge speed and skips timer tests (TIMER_ONLY, tests/check.h); the suites
+# marked TIMED in SUITES[] (tests/main.c) -- media, the database writer, the
+# network loop and the client core -- run here as well, for the speed verdicts
+# and timer tests nothing else judges.
 #
 # Needs: build/tests; ffprobe (the media suite's recording check, a SKIP and
 # so a failure in CI without it).

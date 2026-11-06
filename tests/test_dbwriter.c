@@ -4981,6 +4981,7 @@ static void test_setup_invite(void) {
  * retention window is dropped, so a much-later retry of the same token is no
  * longer deduplicated, while a recent token still is. */
 static void test_idem_pruning(void) {
+    TIMER_ONLY();   /* a token ageing past its window is what is tested */
     const char *path = tdb("prune.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
@@ -8538,7 +8539,9 @@ static void test_restore(void) {
     r = del_or_restore(w, OC_JOB_RESTORE, mod, mid);
     CHECK(r && r->type == OC_RES_RESTORE_OK);
     oc_dbres_free(r);
-    /* Past the window: gone for good, and nothing of it is kept. */
+    /* Past the window: gone for good, and nothing of it is kept. The window
+     * closing is a timer's test: the ordinary build only. */
+    if (OC_UNDER_TSAN) { oc_dbwriter_stop(w); cleanup_db(path); return; }
     oc_dbwriter_set_restore_window_ms(w, 50);
     oc_dbres_free(del_or_restore(w, OC_JOB_DELETE, alice, mid));
     oc_test_let_time_pass(120);   /* the window closing is what is tested */
@@ -8804,7 +8807,7 @@ static void test_actions(void) {
         if (other) { oc_dbwriter_set_restore_window_ms(other, 50); oc_dbwriter_stop(other); }
         cleanup_db(tdb("actions_other.db"));
     }
-    oc_test_let_time_pass(120);
+    if (!OC_UNDER_TSAN) oc_test_let_time_pass(120);   /* past the other's window: a timer's part */
     r = del_or_restore(w, OC_JOB_RESTORE, alice, act);
     CHECK(r && r->type == OC_RES_RESTORE_OK && live_action(r, act, 6, 7));
     oc_dbres_free(r);

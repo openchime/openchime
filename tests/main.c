@@ -246,9 +246,10 @@ static void print_times(void) {
  *            ThreadSanitizer, and only there; PLAIN, it does not, and the
  *            full suite runs it plainly. Checked at run time, not trusted
  *            (thread_unlisted, below). TIMED is THREADS and plainly as well,
- *            for a FULL suite whose speed verdicts (CHECK_SPEED, which the
- *            sanitizer does not judge) would otherwise be judged nowhere: a
- *            FAST suite's are judged by the fast suite. */
+ *            for a FULL suite whose speed verdicts (CHECK_SPEED) or timer
+ *            tests (TIMER_ONLY), which the sanitizer does not run, would
+ *            otherwise be judged nowhere: a FAST suite's are judged by the
+ *            fast suite. */
 enum suite_tier { FAST, FULL };
 enum { PLAIN = 0, THREADS = 1, TIMED = 2 };
 #define S(fn, tier, threads) { #fn, fn, tier, threads }
@@ -281,7 +282,7 @@ static const struct suite {
     S(run_authpool_tests,        FAST, THREADS),
     S(run_ioloop_tests,          FAST, THREADS),
     S(run_roles_tests,           FAST, PLAIN),
-    S(run_dbwriter_tests,        FULL, THREADS),
+    S(run_dbwriter_tests,        FULL, TIMED),
     S(run_http_tests,            FAST, PLAIN),
     S(run_sigv4_tests,           FAST, PLAIN),
     S(run_blob_s3_tests,         FAST, THREADS),
@@ -297,8 +298,8 @@ static const struct suite {
     S(run_emoji_tests,           FAST, PLAIN),
     S(run_tls_tests,             FAST, THREADS),
     S(run_acme_tests,            FAST, THREADS),
-    S(run_netloop_tests,         FULL, THREADS),
-    S(run_client_core_tests,     FULL, THREADS),
+    S(run_netloop_tests,         FULL, TIMED),
+    S(run_client_core_tests,     FULL, TIMED),
     S(run_callsig_tests,         FAST, PLAIN),
     S(run_enroll_tests,          FAST, THREADS),
     S(run_push_tests,            FAST, THREADS),

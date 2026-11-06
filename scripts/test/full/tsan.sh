@@ -10,36 +10,32 @@
 # memory at fixed addresses, and recent kernels' randomization places the
 # binary where it has to go.
 #
-# Each suite runs as its own process, TSAN_JOBS of them at once (default: one
-# per CPU): a race is between one suite's threads, so nothing is lost, and the
-# pass takes about as long as its slowest suite rather than all of them
-# together. Each suite's output is printed whole, in list order, once all have
-# finished; any failing fails the pass, named.
+# One process, the suites one after another, nothing beside it. Under the
+# sanitizer no test sits out a set time (tests/check.h, TIMER_ONLY) and loops
+# run fewer turns (TSAN_FEW), so the pass has a budget: TSAN_BUDGET_S seconds
+# (default 180: about 146 s here, CI's runners about a tenth slower). Over
+# it, the pass fails, naming the slowest suites.
 #
 # Needs: setarch; build/tests-tsan.
 # Run by: make test-all (PART=threads).
 . "$(dirname "$0")/../lib/common.sh"
 need setarch "util-linux"
 have build/tests-tsan "make build-all PART=threads builds it"
-only=${OC_TEST_ONLY:-$(suites threads setarch "$(uname -m)" -R ./build/tests-tsan)}
-jobs=${TSAN_JOBS:-$(nproc 2>/dev/null || echo 2)}
+budget=${TSAN_BUDGET_S:-180}
+if [ -z "${OC_TEST_ONLY:-}" ]; then OC_TEST_ONLY=$(suites threads setarch "$(uname -m)" -R ./build/tests-tsan); fi
+export OC_TEST_ONLY OC_TEST_JOBS=1
 export TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 suppressions=$PWD/tests/tsan.supp"
-scratch=$(mktemp -d)
-trap 'rm -rf "$scratch"' EXIT
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
 
-IFS=, read -r -a list <<<"$only"
-for s in "${list[@]}"; do
-    while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do wait -n || true; done
-    ( OC_TEST_ONLY="$s" setarch "$(uname -m)" -R ./build/tests-tsan >"$scratch/$s.log" 2>&1
-      echo $? >"$scratch/$s.status" ) &
-done
-wait
-
-failed=()
-for s in "${list[@]}"; do
-    echo "=== $s"
-    cat "$scratch/$s.log"
-    [ "$(cat "$scratch/$s.status" 2>/dev/null)" = 0 ] || failed+=("$s")
-done
-[ "${#failed[@]}" = 0 ] || fail "under ThreadSanitizer: ${failed[*]} failed"
-ok "${#list[@]} threaded suites passed under ThreadSanitizer, ${jobs} at a time"
+start=$(date +%s%N)
+rc=0
+setarch "$(uname -m)" -R ./build/tests-tsan 2>&1 | tee "$out" || rc=$?
+took_ms=$(( ($(date +%s%N) - start) / 1000000 ))
+took="$(( took_ms / 1000 )).$(( took_ms % 1000 / 100 ))s"
+[ "$rc" = 0 ] || fail "under ThreadSanitizer, a suite failed (above), after $took"
+if [ "$took_ms" -gt $(( budget * 1000 )) ]; then
+    slowest=$(sed -n '/^suite times/,/^$/p' "$out" | sed -n '2,4p' | sed 's/^ *//' | paste -sd, - | sed 's/,/, /g')
+    fail "the pass took $took, over its ${budget}s budget; slowest: $slowest"
+fi
+ok "the threaded suites passed under ThreadSanitizer, one after another, in $took (budget ${budget}s)"

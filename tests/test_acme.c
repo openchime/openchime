@@ -913,6 +913,10 @@ static void test_worker(void) {
     int got = 0;
     CHECK(WAIT_UNTIL((oc_certs_status(w, &got, NULL, NULL, 0), got >= 1), 10000));
     CHECK(got >= 1 && __atomic_load_n(&g_cert_stores, __ATOMIC_ACQUIRE) >= 1);
+    /* The first certificate was swapped in under the running server, which is
+     * the threads' part. Waiting for renewals is a timer's test: the ordinary
+     * build only. */
+    if (OC_UNDER_TSAN) { oc_certs_stop(w); g_ca_backdate_s = 60; return; }
     /* A connection up before a renewal, and the certificate it was given. The
      * worker swaps a certificate in and only then counts it, so the count read
      * after the handshake may lag a swap already made: two more are waited for,
@@ -1049,7 +1053,9 @@ static void test_worker_ari(void) {
 
     /* Later: a two-second life would renew within 1.3 s; the CA's window,
      * three seconds on, holds it -- the second order comes inside the window
-     * the CA gave, which is the clock ARI's times are in. */
+     * the CA gave, which is the clock ARI's times are in. Waiting for that
+     * window is a timer's test: the ordinary build only. */
+    if (OC_UNDER_TSAN) { g_fake.ari = 0; g_ca_backdate_s = 60; return; }
     pthread_mutex_lock(&g_fake.mu);
     g_fake.ari_open_once = 0; g_fake.ari_asked = 0;
     g_fake.ari_start_ms = wall_ms() + 3000; g_fake.ari_end_ms = g_fake.ari_start_ms + 400;
@@ -1082,6 +1088,7 @@ static void test_worker_ari(void) {
 /* A CA that fails every order is asked again after the base wait, ten times
  * it, a hundred times it, then at the ceiling -- not a doubling. */
 static void test_worker_retries(void) {
+    TIMER_ONLY();   /* the waits between orders are what is tested */
     char dir[128]; snprintf(dir, sizeof dir, "http://127.0.0.1:%d/dir", g_fake.port);
     pthread_mutex_lock(&g_fake.mu);
     g_fake.order_fail = 1; g_fake.n_orders = 0;
