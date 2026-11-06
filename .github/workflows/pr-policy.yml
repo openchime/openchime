@@ -10,8 +10,10 @@ name: pr-policy
 on:
   pull_request:
     # 'edited' matters: the title is a checked artifact and the default type
-    # list does not include it.
-    types: [opened, synchronize, reopened, edited]
+    # list does not include it. Not 'reopened': a reopened pull request's
+    # commit and title were checked when it was opened, pushed or edited, and
+    # every run is a billed minute.
+    types: [opened, synchronize, edited]
     # staging only: nothing takes a pull request into main.
     branches: [staging]
 

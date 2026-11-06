@@ -48,18 +48,20 @@ and `pr-policy` still checks it. Once merged, `promote.yml` can put it on
 - on a pass, the tree it passed on, recorded for the pre-push hook.
 
 **The full suite** (`make test-all`, `scripts/test/full/`), on what `make
-build-all` builds: everything a release ships. `PART=` splits both across
-CI's parallel jobs (`mk/full.mk`):
+build-all` builds: everything a release ships. `PART=` splits both into the
+steps CI runs one after another (`mk/full.mk`):
 
 - `plain` — the daemon with every feature and the web client in it, the
   Linux TUI, the e2e client and the fuzzing harnesses; then the fast suite's
-  source checks and actionlint; every suite, the `FULL` ones included, plainly
-  with timing judged; the static-link check; the end-to-end run against a
-  natively-run daemon (§3.2); every Linux source through the release's
-  compiler under `-Werror`; the speech round trip; the web client in a
-  headless Chrome, its objects' header dependencies and the GUI smoke on the
-  web (§3.4); and each fuzzing harness for `FUZZ_SECONDS` (§2.2b);
-- `threads` — the suites marked `THREADS`, under ThreadSanitizer (§2.4);
+  source checks and actionlint; every suite that starts no thread, the `FULL`
+  ones included, and `media`, plainly with timing judged (§2.4); the
+  static-link check; the end-to-end run against a natively-run daemon (§3.2);
+  every Linux source through the release's compiler under `-Werror`; the
+  speech round trip; the web client in a headless Chrome, its objects' header
+  dependencies and the GUI smoke on the web (§3.4); and each fuzzing harness
+  for `FUZZ_SECONDS` (§2.2b);
+- `threads` — the suites that start threads, under ThreadSanitizer, their one
+  run in the full suite (§2.4);
 - `packages` — the release's daemon for each architecture (zig, glibc 2.34)
   and its `.deb`, `.rpm` and tarball; then the glibc floor, one binary in all
   three, speech on the release binary, the `.deb` installed and speaking, and
@@ -69,11 +71,12 @@ CI's parallel jobs (`mk/full.mk`):
 - `windows` — the Windows binaries, the installer and the MSIX; then their
   version resources, the installer and the MSIX.
 
-The code tests (`plain`, `threads`) run in `test-all.yml`, which
-`release-candidate.yml` calls: they start the daemon in development mode,
-which no release-path workflow may (`scripts/test/fast/release_lint.sh`). The
-rest runs in `release-candidate.yml` itself, on the artifacts it then stores
-and publishes. A check on a binary or an image the runner cannot execute (the
+The code tests (`plain`, then `threads`, in one job) run in `test-all.yml`,
+which `release-candidate.yml` calls as its `test` job: they start the daemon
+in development mode, which no release-path workflow may
+(`scripts/test/fast/release_lint.sh`). The rest runs in
+`release-candidate.yml`'s `stage` job, on the artifacts it then stores and
+publishes. A check on a binary or an image the runner cannot execute (the
 arm64 ones on an x86 runner) says so and skips.
 
 **After a release publishes**, `release.yml` verifies what it published
@@ -215,11 +218,14 @@ a daemon built with `TTS=1 STT=1`.
 
 - **`SUITES[]` in `tests/main.c` is the one list of the suites and of where
   each runs**: a row per suite, `S(run_<subject>_tests, FAST|FULL,
-  PLAIN|THREADS)`. `FAST` runs in both suites, `FULL` in the full suite only
-  (one too slow for the fast suite's budget); `THREADS` marks a suite whose
-  code starts threads, which the full suite also runs under ThreadSanitizer
-  (§2.4). The scripts never keep a list of their own: they ask the binary,
-  `build/tests --list fast`, `--list full` (every suite) or `--list threads`.
+  PLAIN|THREADS|TIMED)`. `FAST` runs in both suites, `FULL` in the full suite
+  only (one too slow for the fast suite's budget); `THREADS` marks a suite
+  whose code starts threads, which the full suite runs under ThreadSanitizer
+  and only there, and `TIMED` one that the full suite also runs plainly, for
+  the speed verdicts the sanitizer does not judge (§2.4). The scripts never
+  keep a list of their own: they ask the binary, `build/tests --list fast`,
+  `--list full` (every suite), `--list plain` (the full suite's plain pass:
+  all but `THREADS`) or `--list threads` (`THREADS` and `TIMED`).
 
   Adding a suite is therefore two steps: drop in `tests/test_<subject>.c`
   exposing `run_<subject>_tests()`, and give it a row in `SUITES[]` (and a
@@ -697,7 +703,8 @@ the cache was hit) rather than the clock.
 **Timing.** A verdict that races the wall clock — work that must land inside a
 short real-time window, or a count that depends on where a window's edge falls
 — is a `CHECK_TIMING` (`tests/check.h`), and so is every `CHECK_SPEED`. Both
-suites judge them, the full one on CI's runners too; `OC_TEST_TIMING=0`
+suites judge them, the full one on CI's runners too (a `CHECK_SPEED` only
+outside the sanitizer, §2.4); `OC_TEST_TIMING=0`
 leaves them unjudged, an escape hatch for a machine too loaded to judge them,
 which no suite sets. (The web client's checks have none: they wait on the
 client's state, §3.4.)
@@ -759,9 +766,10 @@ unknown name gets and a new password's key, where production uses 19 MiB.
 Passwords a test sets on the pages must pass the policy (AUTH.md §2): fifteen
 characters or more, not common, not built on the username.
 
-The full suite runs every suite plainly, side by side as the fast suite does
-(`PART=plain`), and, on a machine of its own at the same time, the suites
-marked `THREADS` once more under ThreadSanitizer (`PART=threads`):
+The full suite runs every suite once: the suites that start no thread
+plainly, side by side as the fast suite does (`PART=plain`), and then, on the
+same machine, the suites marked `THREADS` under ThreadSanitizer
+(`PART=threads`):
 
 - the suites whose code runs threads — the loop and its I/O threads, the
   writer and readers, the worker pools, the client, the recorder and player —
@@ -779,9 +787,13 @@ marked `THREADS` once more under ThreadSanitizer (`PART=threads`):
   code does not promise — a count, a status or a flag taken to mean something
   happened before or after another thread's step — since the sanitizer's
   slowing is exactly what brings the other order out.
-- every suite plainly, the threaded ones included, with its timing verdicts
+- every suite that starts no thread plainly, with its timing verdicts
   judged. A suite with no thread cannot race, so instrumenting it would only
-  make it slower.
+  make it slower. A threaded suite is not run plainly as well: everything but
+  its `CHECK_SPEED`s is judged under the sanitizer, and the speed verdicts of
+  a `FAST` one are judged by the fast suite, before every push. The one
+  threaded `FULL` suite with speed verdicts, `media`, is marked `TIMED` and
+  runs in both passes, so its are judged too.
 
 ---
 
@@ -1195,8 +1207,9 @@ policy. The full suite runs in `release-candidate.yml`, once per
 release-candidate, the code tests through `test-all.yml`; the workflows and
 what each job covers are CONTRIBUTING.md "CI".
 
-Nothing is checked twice within a suite: each suite runs once plainly and the
-threaded ones once more under the sanitizer, which judges races and not speed;
+Nothing is checked twice within a suite: each suite runs once, plainly or,
+if it starts threads, under the sanitizer, which judges races and not speed
+(only `media` runs in both, for its speed verdicts, §2.4);
 one clang compile is both the release-compiler and the second-compiler check,
 and the end-to-end run (§3.2) is the one thing the in-process suites cannot
 show, since they link the daemon's code without its `main()`. Of the GUI
@@ -1227,7 +1240,8 @@ both suites with their stub engines.
 
 A new suite is its declaration and one row in `SUITES[]` in `tests/main.c`
 (§2.1): `FAST` unless it is too slow for the fast suite's budget, and
-`THREADS` if its code starts a thread (either suite fails it otherwise, §2.4).
+`THREADS` if its code starts a thread (either suite fails it otherwise, §2.4)
+-- `TIMED` instead if it is also `FULL` and has a `CHECK_SPEED`.
 
 ---
 

@@ -13,6 +13,11 @@ cd "$(dirname "$0")/../.."
 command -v emcc >/dev/null || { echo "build_media_wasm: emcc not on PATH (make fetches it: mk/toolchains.mk)" >&2; exit 1; }
 mkdir -p build/wasm
 J="$(nproc)"
+# opus and speexdsp ship generated autotools files older than the sources a
+# checkout writes beside them, so make would regenerate them with automake,
+# which nothing here needs or installs: the regeneration commands are no-ops,
+# as in scripts/build/opus.sh and speexdsp.sh. libvpx's configure is not autotools.
+NO_AUTOTOOLS="ACLOCAL=: AUTOCONF=: AUTOMAKE=: AUTOHEADER=:"
 
 OUT=build/wasm/opus
 if [ ! -f "$OUT/lib/libopus.a" ]; then
@@ -22,7 +27,7 @@ if [ ! -f "$OUT/lib/libopus.a" ]; then
     emconfigure "$OLDPWD/third_party/opus/configure" --host=wasm32-unknown-emscripten \
       --prefix="$(cd .. && pwd)" --disable-shared --enable-static --disable-doc --disable-extra-programs \
       --disable-intrinsics --disable-rtcd --disable-stack-protector CFLAGS="-O2 -pthread" >/dev/null
-    emmake make -j"$J" >/dev/null && emmake make install >/dev/null )
+    emmake make -j"$J" $NO_AUTOTOOLS >/dev/null && emmake make install $NO_AUTOTOOLS >/dev/null )
 fi
 
 OUT=build/wasm/speexdsp
@@ -33,7 +38,7 @@ if [ ! -f "$OUT/lib/libspeexdsp.a" ]; then
     emconfigure "$OLDPWD/third_party/speexdsp/configure" --host=wasm32-unknown-emscripten \
       --prefix="$(cd .. && pwd)" --disable-shared --enable-static --disable-examples \
       --disable-sse --disable-neon CFLAGS="-O2 -pthread" >/dev/null
-    emmake make -j"$J" >/dev/null && emmake make install >/dev/null )
+    emmake make -j"$J" $NO_AUTOTOOLS >/dev/null && emmake make install $NO_AUTOTOOLS >/dev/null )
 fi
 
 OUT=build/wasm/libvpx

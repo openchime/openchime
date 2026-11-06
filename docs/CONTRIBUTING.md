@@ -196,7 +196,12 @@ A compile error or a failing fast test is found locally, not in CI: `make
 test` runs before the commit, and `.githooks/pre-push` refuses a tree it did
 not pass on (a documentation-only change excepted). The hooks are on once per
 clone: `git config core.hooksPath .githooks` ("Starting a feature"). Every job
-has a timeout.
+has a timeout, set a little above its longest run, so a hang is stopped
+rather than billed.
+
+## Billed minutes
+
+GitHub bills every job rounded up to a whole minute, plus its set-up. So each workflow has the fewest jobs its environments allow: `release-candidate.yml` runs `test`, `stage` and `publish`; `release.yml` runs `prepare`, `deploy` and `finish`, and `unreserve` only after a failure; `pr-policy.yml` and `promote.yml` run one job each. There is no dry run: `prepare` refuses before anything changes. A failure is found locally first: the fast suite runs before every push.
 
 ## CI
 
@@ -213,32 +218,37 @@ it and approved it:
 
     gh workflow run release-candidate.yml --ref staging
 
-Its gate refuses any ref but staging's tip, a commit already released or
+It runs three jobs, each its steps one after another on one runner:
+
+| Job | Environment | What it does |
+|---|---|---|
+| `test` (`test-all.yml`) | none | The gate, then the full suite's code tests (below). |
+| `stage` | `release` | Reports the release credentials; builds what a release ships — both daemons with their data and packages, the images and their manifest list, and the Windows clients with their installer and MSIX — each checked by `make test-all` (PART=packages, image, windows); stores the daemon trees, the Windows binaries and the images by commit. |
+| `publish` | `release` | Reads the stored build back and verifies it, tags the commit `release-N-rcK`, tags the image, publishes the prerelease, and copies all of it to the public repository. |
+
+The gate refuses any ref but staging's tip, a commit already released or
 already a release-candidate, and one `main` cannot take next; it checks the
 commits since the last release (the attribution scan refuses; the commit
-policy warns). Then the full suite's code tests, by calling `test-all.yml`:
-two jobs on two machines at once.
+policy warns). Then the full suite's code tests, in the same job:
 
-- **`full suite (plain)`** — `make build-all PART=plain` and `make test-all
-  PART=plain`: the daemon with every feature; the source checks and
-  actionlint; every suite, with its timing judged; the static-link check; the
-  daemon started and driven over TLS with the e2e client; every Linux
-  translation unit through the release's clang under `-Werror`; the speech
-  round trip; the web client in a headless Chrome and the GUI smoke on the
-  web (TESTING.md §3.4); the fuzzing pass.
-- **`full suite (thread sanitizer)`** — PART=threads: the suites that start
-  threads, under ThreadSanitizer.
+- **`make build-all PART=plain` and `make test-all PART=plain`** — the daemon
+  with every feature; the source checks and actionlint; every suite that
+  starts no thread, and `media`, with its timing judged; the static-link
+  check; the daemon started and driven over TLS with the e2e client; every
+  Linux translation unit through the release's clang under `-Werror`; the
+  speech round trip; the web client in a headless Chrome and the GUI smoke on
+  the web (TESTING.md §3.4); the fuzzing pass.
+- **then PART=threads** — the suites that start threads, under
+  ThreadSanitizer, their one run (TESTING.md §2.4).
 
-Only when both pass does it build what a release ships — both daemons with
-their data and packages, the images, and the Windows clients with their
-installer and MSIX — each checked by `make test-all` (PART=packages, image,
-windows), and store the daemon trees, the Windows binaries and the images by
-commit; then it tags the commit `release-N-rcK` and publishes it as a
-prerelease. Everything runs on Linux, the Windows packaging included (NSIS,
-makemsix). Every vendored library and toolchain is cached by the script that
-builds it, and each run saves the caches the next one restores; a cache unused
-for seven days is evicted. `tools/toolchains.sh` says, when run by hand,
-whether a pinned toolchain is behind upstream.
+Only when both pass does `stage` build anything. Everything runs on Linux,
+the Windows packaging included (NSIS, makemsix). Every vendored library and
+toolchain is cached by the script that builds it, one cache per library keyed
+by its version, its own script and the compiler that builds it, so a change to
+one script rebuilds that library alone; a cache is saved as soon as the step
+that builds it has run, and a cache unused for seven days is evicted.
+`tools/toolchains.sh` says, when run by hand, whether a pinned toolchain is
+behind upstream.
 
 **A failure there holds back the release-candidate.** Find the commit, fix it
 on a branch like any other change, and dispatch the release-candidate again on
@@ -266,7 +276,7 @@ release (the tarballs and the Windows installer), appends a `Release N`
 snapshot to `main`, closes the issues it shipped, those of the
 documentation it carries included, and sends the list of them, each as filed,
 to the control plane for the release notes (`release-candidate.yml`,
-`release.yml`; the last's `notes` job sends to the
+`release.yml`; its `finish` job sends to the
 address the `CONTROL_PLANE_URL` repository variable names). Each release-candidate, release and
 promotion is then copied to the public repository (`openchime/openchime`): its
 `staging`, the tag, the GitHub release and `main`, fast-forward only. Between releases, `promote.yml`
@@ -275,6 +285,23 @@ after the release-candidate. A build is identified by its commit and a release b
 [UPGRADING.md](./UPGRADING.md) says how the two relate and how a self-hoster
 upgrades. A change that alters what an operator must do on upgrade adds a
 section to UPGRADING.md in the same pull request.
+
+A release takes one release-candidate, by its tag:
+
+    gh workflow run release.yml --ref release-N-rcK
+
+| Job | Environment | What it does |
+|---|---|---|
+| `prepare` | `release` | Refuses any ref but a release-candidate's tag; resolves it to its commit and number; checks every credential and the public tracker's token; fetches the stored build and verifies it; checks the number is the next one and that `main` can take the commit; then, last, reserves the number as the `release-N` tag. |
+| `deploy` | `release` | Packages the build under N (`.deb`, `.rpm`, tarballs), builds the Windows installer and MSIX (signed when configured), moves `main`, publishes the apt and dnf repositories to both buckets, the GitHub release and the images, then verifies what it published (`scripts/release/smoke.sh`). |
+| `finish` | `release` | Closes the shipped issues, sends the release notes, removes the release-candidates of N, and copies `main`, `staging`, the tag and the release to the public repository; a failure in any part is reported and the rest still run. |
+| `unreserve` | `release` | Only after a failure before anything was published: returns the number. |
+
+There is no dry run. Everything a release must be is checked in `prepare`
+before the number is reserved, so a release that cannot go ahead stops there
+with nothing changed; one that fails later, before the apt index is written,
+gives its number back, and one that fails after it is finished by re-running
+its failed jobs. The Store's `.msix` is the run's `windows-x64` artifact.
 
 ## Security
 
