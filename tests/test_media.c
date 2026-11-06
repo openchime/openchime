@@ -903,7 +903,7 @@ static void test_screen_recording(void) {
             size_t onset = 0;
             while (onset + 960 <= n && tone_amp(pcm + onset, 960, 440) < 8000 * 0.5) onset += 960;
             printf("  corner %d: the narrator starts %zu ms in\n", corner, onset / 48);
-            CHECK(onset >= 48000 / 5);                /* a fifth of a second of the room first */
+            CHECK_SPEED(onset >= 48000 / 5);          /* a fifth of a second of the room first: the host's speed */
             const int16_t *tail = pcm + n - 48000;
             CHECK(onset <= (size_t)(tail - pcm));     /* ...and talks through the last second */
             double a440 = tone_amp(tail, 48000, 440), a660 = tone_amp(tail, 48000, 660);
