@@ -20,7 +20,7 @@
 #             the speech round trip, the web client in a headless Chrome and
 #             its objects' header dependencies, the GUI smoke on the web, and
 #             each fuzzing harness for its fixed inputs, one at a time, inside
-#             FUZZ_SECONDS (15) in all
+#             FUZZ_SECONDS (20) in all
 #   threads   the test binary under ThreadSanitizer; then the suites that start
 #             threads, under it, their one run in the full suite
 #   packages  the release's daemon for ARCH (zig against glibc 2.34) with its

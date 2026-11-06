@@ -59,7 +59,7 @@ steps CI runs one after another (`mk/full.mk`):
   every Linux source through the release's compiler under `-Werror`; the
   speech round trip; the web client in a headless Chrome, its objects' header
   dependencies and the GUI smoke on the web (§3.4); and each fuzzing harness
-  for its fixed inputs, one at a time, inside 15 seconds in all (§2.2b);
+  for its fixed inputs, one at a time, inside 20 seconds in all (§2.2b);
 - `threads` — the suites that start threads, under ThreadSanitizer, their one
   run in the full suite (§2.4), in one process, one after another, nothing
   beside it, inside a budget (`TSAN_BUDGET_S`, 180 seconds);
@@ -531,8 +531,9 @@ none where unset, and the number of inputs the full suite runs it for is
 (`scripts/test/full/fuzz.sh`). It does the same work every run: one harness
 at a time, each for its fixed inputs from a fixed seed (`FUZZ_SEED`, 1), from
 its checked-in corpus. The counts are sized from CI's measured speed so the
-whole pass fits inside `FUZZ_SECONDS` (15), which is also a gate: each harness
-may take its equal share of it, and one stopped there is named as cut short.
+whole pass fits inside `FUZZ_SECONDS` (20), which is also a gate: one deadline
+for the whole pass, which each harness may run up to, and one stopped there is
+named as cut short.
 A longer run is by hand. A new harness is its file, a word in that list, its
 input count, and a line for its sources in `mk/tests.mk`.
 

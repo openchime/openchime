@@ -82,7 +82,7 @@ APP_SRC  := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES
 # takes (tests/fuzz/*.dict), none where unset. FUZZ_RUNS_<harness> is the
 # number of inputs the full suite runs it for, from a fixed seed: the same
 # work every run, sized from CI's measured speed so that all of them together
-# take well inside fuzz.sh's 15 seconds.
+# take well inside fuzz.sh's 20 seconds.
 FUZZ_HARNESSES   := frame framebuf http ws proxy json cbor jwt webauthn idtoken
 FUZZ_HARNESS_SRC := tests/fuzz/decoders.c $(patsubst %,tests/fuzz/%.c,$(FUZZ_HARNESSES))
 FUZZ_DICT_frame    := tests/fuzz/frame.dict

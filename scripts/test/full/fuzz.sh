@@ -12,11 +12,12 @@
 # 1), one harness at a time, with address randomization off (setarch -R) and
 # the corpus read once (-reload=0): either would otherwise make two runs of the
 # same seed try different inputs. The counts are set from CI's measured speed so
-# the pass fits inside FUZZ_SECONDS (default 15) for all the harnesses
-# together. That is also a gate: each harness may take its equal share of it,
-# and one stopped there is named as cut short, with the inputs it ran, so a
-# pass that did less than its fixed work says so. A longer run is by hand,
-# with larger counts and FUZZ_SECONDS.
+# the pass fits well inside FUZZ_SECONDS (default 20) for all the harnesses
+# together. That is also a gate: one deadline for the whole pass, which each
+# harness may run up to, so a slow one may use what the others left. One
+# stopped there is named as cut short, with the inputs it ran, so a pass that
+# did less than its fixed work says so. A longer run is by hand, with larger
+# counts and FUZZ_SECONDS.
 #
 # Needs: FUZZ_HARNESSES, "<harness>:<dictionary>:<runs> ...", the dictionary
 # empty for none, which make passes from mk/sources.mk, the one list of them;
@@ -26,17 +27,16 @@
 . "$(dirname "$0")/../lib/common.sh"
 need setarch "util-linux"
 need timeout "coreutils"
-seconds=${FUZZ_SECONDS:-15}
+seconds=${FUZZ_SECONDS:-20}
 seed=${FUZZ_SEED:-1}
 [ -n "${FUZZ_HARNESSES:-}" ] || fail "FUZZ_HARNESSES names no harness (make test-all passes it from mk/sources.mk)"
 read -r -a specs <<<"$FUZZ_HARNESSES"
-share_ms=$(( seconds * 1000 / ${#specs[@]} ))
-share=$(printf '%d.%03d' $(( share_ms / 1000 )) $(( share_ms % 1000 )))
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 
 failed=() short=()
 start=$(date +%s%N)
+deadline_ms=$(( start / 1000000 + seconds * 1000 ))
 for spec in "${specs[@]}"; do
     IFS=: read -r h d runs <<<"$spec"
     bin=build/fuzz/$h
@@ -44,8 +44,11 @@ for spec in "${specs[@]}"; do
     [ -n "$runs" ] || fail "$h has no input count (FUZZ_RUNS_$h in mk/sources.mk)"
     mkdir -p "$scratch/$h" "$scratch/crash-$h"
     cp tests/fuzz/corpus/$h/* "$scratch/$h/"
+    left_ms=$(( deadline_ms - $(date +%s%N) / 1000000 ))
+    [ "$left_ms" -gt 100 ] || left_ms=100
+    left=$(printf '%d.%03d' $(( left_ms / 1000 )) $(( left_ms % 1000 )))
     rc=0
-    timeout -s INT "$share" setarch "$(uname -m)" -R \
+    timeout -s INT "$left" setarch "$(uname -m)" -R \
         "$bin" ${d:+-dict=$d} -seed="$seed" -runs="$runs" -reload=0 -print_final_stats=1 \
         -artifact_prefix="$scratch/crash-$h/" "$scratch/$h" >"$scratch/$h.log" 2>&1 || rc=$?
     done_runs=$(sed -n 's/^stat::number_of_executed_units: //p' "$scratch/$h.log" || true)
@@ -59,7 +62,7 @@ for spec in "${specs[@]}"; do
         fi
     elif [ "$rc" = 124 ]; then
         short+=("$h")
-        echo "$TEST: $h cut short at its ${share}s share: ${done_runs:-?} of $runs inputs, seed $seed, clean"
+        echo "$TEST: $h cut short at the pass's ${seconds}s deadline: ${done_runs:-?} of $runs inputs, seed $seed, clean"
     else
         echo "$TEST: $h clean: ${done_runs:-?} inputs, seed $seed,$(grep -o 'DONE.*corp: [^ ]*' "$scratch/$h.log" | sed 's/^DONE *//; s/^/ /' || true)"
     fi

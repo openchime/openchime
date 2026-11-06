@@ -4269,7 +4269,9 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     /* What the network carried was ciphertext: every audio payload an SFrame
      * header and then bytes that do not repeat. In the clear the first byte
      * after it would be the high byte of the frame number -- the same for every
-     * packet of a call this short. */
+     * packet of a call this short, one or two values in all. Ciphertext spreads
+     * them: over 200 packets, more than 32 distinct is far past what plain audio
+     * makes, however short the call (a few hundred packets give some 190). */
     {
         int distinct = 0, seen_b[256] = {0};
         pthread_mutex_lock(&g_tap.mu);
@@ -4278,7 +4280,7 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
         pthread_mutex_unlock(&g_tap.mu);
         printf("  the relay saw %d audio packets: %d distinct leading bytes, %d without an SFrame header\n",
                n, distinct, bad);
-        CHECK(n > 200 && distinct > 200 && bad == 0);
+        CHECK(n > 200 && distinct > 32 && bad == 0);
     }
 
     /* erik mutes: dana stops hearing him. Push to talk, held, lets him through. */
