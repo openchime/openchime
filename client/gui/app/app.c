@@ -1920,7 +1920,7 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
        CONF_GROUP_DELETE, CONF_CHANNEL_GROUP_REMOVE, CONF_LINK_OPEN, CONF_CERT_TRUST,
        CONF_PDM_TRUST, CONF_PDM_SAFETY,
        /* New ones go last: the dump's `confirm act=` is this number, and the
-        * GUI harness reads it (CONF_CERT_TRUST is act=13 to scripts/gui). */
+        * GUI harness reads it (CONF_CERT_TRUST is act=13 to tools/gui). */
        CONF_WS_FORGET_ALL, CONF_BROADCAST, CONF_DEACTIVATE_SELF, CONF_EMOJI_DELETE };
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
@@ -31826,7 +31826,7 @@ static void boot_book_cb(void *ctx, const char *workspace, const char *label,
  * process, no window, no error, indistinguishable from a client that failed to
  * start at all. */
 /* How many clients connect_start has started this process. Observable by the
- * harness (scripts/gui/startup.sh, via test_dump): a startup given a workspace
+ * harness (tools/gui/startup.sh, via test_dump): a startup given a workspace
  * starts exactly one, and a second is the defect where two net threads shared a
  * workspace, each authenticating, with the first orphaned. */
 static int g_clients_started;
@@ -34798,7 +34798,7 @@ static void *devlist_thread(void *arg) {
 }
 
 /* The open confirmation, and which one: the harness answers some of them
- * (scripts/gui/drive.sh trust_dev_cert, lib.sh sign_in_card), signed in or not. */
+ * (tools/gui/drive.sh trust_dev_cert, lib.sh sign_in_card), signed in or not. */
 static void test_dump_confirm(FILE *f) {
     fprintf(f, "confirm open=%d act=%d url=\"%s\" emoji=\"%s\"\n", g_confirm_open, g_confirm_act, g_confirm_url, g_confirm_emoji);
 }
@@ -34859,7 +34859,7 @@ static void test_dump(const char *path) {
      * a person, and 500 names is not read by anyone. */
     /* The accessibility surface (ARCH-99). `avail` is whether the UIA entry
      * points resolved at all; `items` is what the last paint described. Neither
-     * proves a client can SEE the tree — scripts/gui/uia_probe.ps1 does that, from
+     * proves a client can SEE the tree — tools/gui/uia_probe.ps1 does that, from
      * outside the process — but a zero here localises the failure to this side. */
     fprintf(f, "unres seq=%u n=%u can_add=%u priv=%u names=\"%s\"\n",
             m->unresolved.seq, (unsigned)m->unresolved.n_peers,
@@ -35267,7 +35267,7 @@ static void test_dump(const char *path) {
                 g_preview_wait_ms, g_form_action_busy);
     }
     fprintf(f, "view=%d si_overlay=%d wsmgr=%d wsbook=%d\n", g_view, g_si_overlay, g_wsmgr_open, ws_book_count());
-    /* How the client started (scripts/gui/startup.sh). `visible` is whether the
+    /* How the client started (tools/gui/startup.sh). `visible` is whether the
      * window is on screen at all -- a client that started and showed nothing
      * looked, from here, exactly like one that never started. `started` counts
      * clients connect_start began, and `si_err` is the reason the sign-in view
@@ -35718,7 +35718,7 @@ static void test_dump(const char *path) {
             if (!sb[i].w) { fprintf(f, "searchbox %s made=0\n", sb[i].name); continue; }
             rectf er = sb[i].w->box;
             /* The fields are drawn with the UI format: its face and size are
-             * what the harness compares across the boxes (scripts/gui/search_boxes.sh). */
+             * what the harness compares across the boxes (tools/gui/search_boxes.sh). */
             fprintf(f, "searchbox %s made=1 vis=%d uifont=1 lf=%d face=\"%s\" lh=%d "
                        "edit=%d,%d,%d,%d box=%d,%d,%d,%d text=\"%s\"\n",
                     sb[i].name, sb[i].w->visible ? 1 : 0, PX(UIS(FONT_UI * g_text_scale)), ui_family(), PX(UIS(18.0f)),

@@ -97,7 +97,7 @@ and nothing to fetch.
   ttskit binary-searches its tables there, so they cost disk, and memory only for the pages a
   render touches — the same as when they were embedded, which is why moving them changed the
   binary's size and nothing else.
-- **A manifest, checked at startup.** A read-aloud build (`make TTS=1`) has the daemon write `manifest` into the data
+- **A manifest, checked at startup.** A read-aloud build (`make run TTS=1`, or `make openchimed tts/manifest TTS=1`) has the daemon write `manifest` into the data
   directory — `openchimed --tts-manifest DIR` — naming the model version it was built with and
   every file's SHA-256, so the version is exactly the one compiled in. At startup the daemon
   checks it; data that is absent, belongs to another build, or has been altered or partly
@@ -124,7 +124,7 @@ and nothing to fetch.
 - **Checking a build by ear:** `openchimed --tts-say VOICE TEXT OUT.wav` renders with the
   model in that binary and reports the real-time factor.
 
-**Building it** (`make TTS=1`, CONFIG.md "Build switches") builds ONNX Runtime once (`scripts/build/onnxruntime.sh`, about 20
+**Building it** (`make openchimed TTS=1`, CONFIG.md "Build switches") builds ONNX Runtime once (`scripts/build/onnxruntime.sh`, about 20
 minutes; CMake, a C++17 compiler and Python are build-time needs) and fetches and converts the
 model once (`scripts/build/kitten.sh`, pinned by SHA-256; the conversion uses the prebuilt
 full ONNX Runtime, a build tool only). The converted model is not byte-reproducible — the
@@ -216,6 +216,6 @@ Full layouts in PROTOCOL.md §5.14b.
 | `make test` — speakable | code blocks, links, mentions, markdown, emoji, quotes, not-renderable |
 | `make test` — render worker | with a stub synthesizer: queue order, a full queue, eventfd wake-up, idle release |
 | `make test` — daemon | cache hit and miss, in-flight de-duplication, handle stability and edit → new handle, reclaim first with no tombstone, the rate limit, round trips of the read-aloud frames at the current protocol version, a two-client vertical |
-| `make test` — client core | an audio-only MP4 round trip; the listen queue in order, skipping not-renderable |
-| Staging build (`staging-build.yml`) | the real daemon: links statically (only the C runtime dynamic); the release binary renders a sentence (`--tts-say`) that voice input hears back (`--stt-hear`); manual listening on model changes |
-| Win32 harness | no scripted Listen run. The harness's `voicepreview` verb asks for a voice's audition and reports how long it took (`preview wait_ms=`), and `scripts/gui/voice.sh` has the real daemon render a sentence (`--tts-say`) that the client's synthetic microphone then speaks |
+| Full suite — client core | an audio-only MP4 round trip; the listen queue in order, skipping not-renderable |
+| Full suite (`make test-all`, in the release-candidate) | the real daemon: links statically (only the C runtime dynamic); the release binary renders a sentence (`--tts-say`) that voice input hears back (`--stt-hear`); manual listening on model changes |
+| Win32 harness | no scripted Listen run. The harness's `voicepreview` verb asks for a voice's audition and reports how long it took (`preview wait_ms=`), and `tools/gui/voice.sh` has the real daemon render a sentence (`--tts-say`) that the client's synthetic microphone then speaks |

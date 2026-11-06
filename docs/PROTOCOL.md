@@ -3258,7 +3258,7 @@ frames (§4.2a, §4.2c).
 defines, in opcode order, 239 of them. The sections above specify the payload layouts; this
 table is the index and the authority on which values are taken.
 
-**Every opcode carries exactly one message type.** `scripts/test/local/opcodes.sh`
+**Every opcode carries exactly one message type.** `scripts/test/fast/opcodes.sh`
 (run by `make test` and CI) fails on any duplicate, with no exception list, so
 this table cannot silently gain a shared value.
 

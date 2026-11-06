@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The candidate's manifest: what a staging build made,
+# The candidate's manifest: what a release-candidate run built,
 # signed, so a release-candidate and a release can take exactly those files
 # and nothing else.
 #

@@ -7,8 +7,8 @@ reviewed; one that is taken is included in the next release candidate, with its
 author kept and their `Signed-off-by` beside the maintainer's, and its pull
 request is then closed, since its change reaches `staging` with that candidate.
 No automated check runs on a pull request on `openchime/openchime`: the checks
-under "CI" run where the maintainers integrate a change, so run the local
-checks below yourself before opening one.
+under "CI" run where the maintainers integrate a change, so run the fast suite
+(`make test`, below) yourself before opening one.
 Most of this document is the maintainers' own workflow; an outside contributor
 needs "Before a pull request" and "Commits" (and "Adding a setting" for a new
 setting).
@@ -18,7 +18,7 @@ setting).
 - **`staging` is the integration branch.** All feature work lands on `staging`
   through a pull request.
 - **`main` is what was released, and nothing else.** The path is feature →
-  `staging` → staging build → release-candidate → release. A contributor's
+  `staging` → release-candidate → release. A contributor's
   part ends at the merge into `staging`; the maintainers start every step
   after it by hand ("Releases", below). `main` is a line of snapshot commits
   the release pipeline writes, and only fast-forwards; `staging` holds the
@@ -33,14 +33,15 @@ setting).
   naming the release. A merge does not close it — merged
   is not shipped. The PR body stays **empty**: the issue and the commit already
   say everything ("Before a pull request").
-- **Merge with a squash merge** once the required checks pass ("CI") — no
+- **Merge with a squash merge** once the required check passes ("CI") — no
   merge commits, history stays linear. What stands between a change and
-  `staging` is the local test (below). Delete the branch, local and remote,
-  after.
+  `staging` is the fast suite, run locally (below). Delete the branch, local
+  and remote, after.
 - **Documentation and workflow changes take the same path**: a branch, a pull
-  request into `staging`, the same checks. Once merged, a documentation-only
-  commit (`*.md` and `docs/`, except `docs/CONFIG.md`, which follows the
-  daemon's settings, and `LICENSING.md`) can be put on `main` by the
+  request into `staging`, the same checks. A documentation-only change (`*.md`
+  and `docs/`, except `docs/CONFIG.md`, which follows the daemon's settings,
+  and `LICENSING.md`; the one rule is `scripts/policy/docs_only.sh`) can be
+  pushed without `make test`, and once merged can be put on `main` by the
   maintainers without a release (`promote.yml`); anything else, workflows
   included, goes out with the next release.
 - **Sign off every commit** (`git commit -s`) — the DCO applies to every path
@@ -74,7 +75,7 @@ resets or works around a dirty state.
    lowercase, the description a few words naming the change (the issue "The
    daemon exits 0, silently, when it cannot start" becomes
    `feature/oc-<n>-daemon-exit-nonzero`).
-7. `make clean && make`, so nothing built for other work is linked in
+7. `make clean && make build`, so nothing built for other work is linked in
    (`clean` keeps the downloaded speech models).
 
 Before writing code, read the `REQ-N` / `ARCH-N` entries the issue names and
@@ -84,50 +85,56 @@ migration, never an edit to an existing one (SCHEMA.md §1).
 
 ## Before a pull request — the minimal set
 
-Locally, and in about a minute, a pull request needs exactly this:
+Locally, within the fast suite's budget (TESTING.md), a pull request needs
+exactly this:
 
-1. `scripts/check/test.sh` — `make && make test`, then it records the tree it
-   passed on for the pre-push hook. Zero warnings, every suite passing
-   (`OK: all suites passed`), then `tested: tree … recorded`. Any change after
-   it means running it again; a change to `*.md`, `.gitignore` or `.claude/`
-   alone may skip it.
-2. `scripts/check/pr.sh "OC-<n>: <Capitalised imperative summary>"` — the
-   title's format and length, and that the issue is open.
-3. One commit ahead of `origin/staging`, signed off, no body. To squash:
+1. `make test` — the fast suite: it builds (`make build`), runs the source
+   checks, actionlint and the fast suites, and records the tree it passed on
+   for the pre-push hook. Zero warnings, every suite passing (`OK: all suites
+   passed`), then `tested: tree … recorded`. Any change after it means running
+   it again; a documentation-only change alone may skip it.
+2. One commit ahead of `origin/staging`, signed off, no body, its subject the
+   pull request's title: `OC-<n>: <Capitalised imperative summary>`
+   (`scripts/policy/subject.sh "<subject>"` checks it as `pr-policy` will).
+   To squash:
 
        git reset --soft $(git merge-base origin/staging HEAD)
-       git commit -s -m "OC-<n>: <the title from step 2>"
+       git commit -s -m "OC-<n>: <Capitalised imperative summary>"
 
-4. `git status --porcelain` prints nothing; push. `git push --force-with-lease`
-   only when step 3 rewrote a branch already pushed.
-5. `gh pr create --base staging --title "<the commit's subject>" --body ""`.
+3. `git status --porcelain` prints nothing; push. The pre-push hook refuses a
+   tree `make test` did not pass on, and a subject `pr-policy` would refuse.
+   `git push --force-with-lease` only when step 2 rewrote a branch already
+   pushed.
+4. `gh pr create --base staging --title "<the commit's subject>" --body ""`.
 
 After a policy failure on the pull request (`pr policy`), fix it, run
 step 1 again if anything but the title changed, and push once.
 
-That is all locally. **Every other test is CI's, and only CI's** ("CI"):
-`make test-merge` on the pull request, the required check, and
-`make test-release` on what the staging build and the release make. Both
-refuse to run outside CI. There are exactly three test commands, and every
-test runs through one of them (TESTING.md §4).
+That is all locally. **There are two test suites, and nothing else runs a
+test** (TESTING.md): the fast one, `make build` and `make test`, here, before
+every push; and the full one, `make build-all` and `make test-all`, in CI,
+once per release-candidate. Each refuses to run on the other side.
 
-**Before pushing a GUI change, run `scripts/gui/smoke.sh`** (TESTING.md
+**Before pushing a GUI change, run `tools/gui/smoke.sh`** (TESTING.md
 "Reading the GUI smoke").
 
 ## Commits
 
 - `OC-<issue>: Capitalised imperative summary` — **no trailing punctuation**, at
   most 72 characters once GitHub appends the pull request suffix on squash, and
-  **no body** beyond the sign-off. `pr-policy` enforces the title, which the
-  squash commits; `scripts/release/commit_policy.sh` checks the commits
-  themselves, those since the last release in the staging build and those
-  `promote` puts on `main`, and warns (a subject already on `staging` is fixed only by rewriting it).
+  **no body** beyond the sign-off. The rule is `scripts/policy/subject.sh`, and
+  everything that checks a subject runs it: the pre-push hook on the branch's
+  tip, `pr-policy` on the title, which the squash commits, and
+  `scripts/policy/commit_policy.sh` on the commits themselves, those since the
+  last release in the release-candidate's gate and those `promote` puts on
+  `main`, where it warns (a subject already on `staging` is fixed only by
+  rewriting it).
 - Cite decision ids inline where relevant: `ARCH-N`, `REQ-N`.
 - **Every commit cites its issue**, in the subject prefix: `OC-N` is issue N on
   `openchime/openchime`, the project's public issue tracker, whose numbers are
   stable identifiers.
   `pr-policy` checks N is open there, and the release closes it.
-  `scripts/test/local/refs.sh` refuses a tracker prefix with a number in any file.
+  `scripts/policy/refs.sh` refuses a tracker prefix with a number in any file.
 - **No file cites an issue number — a commit message is the only place one
   belongs.** Not source, not scripts, not the workflows, not the documents.
   Comments explain themselves, or cite a `REQ-N` / `ARCH-N`: REQUIREMENTS.md and
@@ -139,26 +146,26 @@ test runs through one of them (TESTING.md §4).
   Instead of pointing at an issue, say the thing: "the daemon exits 0 when it
   cannot start, which systemd reads as success". The prose survives the tracker.
 
-  **This is enforced.** `scripts/test/local/refs.sh` fails on a hash followed by
-  digits and on a tracker URL ending in a number. `make test` and the staging
-  build's tests run it before the suite.
+  **This is enforced.** `scripts/policy/refs.sh` fails on a hash followed by
+  digits and on a tracker URL ending in a number. Both suites run it before
+  their tests, and `pr-policy` over every pull request's tree.
   A bare link to the tracker carrying no number is fine — and note the rule
   applies to this file too, which is why the patterns above are described rather
   than written out.
 - **Never** add a `Co-Authored-By:` or any attribution trailer naming Claude /
-  Anthropic. The attribution scan (`scripts/release/attribution_scan.sh`)
+  Anthropic. The attribution scan (`scripts/policy/attribution_scan.sh`)
   checks author, committer, and message on every pull request (a step of
   `pr-policy`, so a match fails the required check `pr policy`), over the commits since
-  the last release in the staging build, and over what `promote` puts on
-  `main`, and **rejects** matches: the pull request cannot merge, and the staging
-  build or the promotion is refused. `main` is never force-pushed, and
+  the last release in the release-candidate's gate, and over what `promote` puts on
+  `main`, and **rejects** matches: the pull request cannot merge, and the
+  release-candidate or the promotion is refused. `main` is never force-pushed, and
   `staging` only in this one case: a violation on `staging` (the squash
   GitHub commits can add a trailer the title never had). An admin rewrites
   `staging` from the commit before it, keeping every later commit (an
   interactive rebase that rewords or drops only that commit), and pushes it
   with `git push --force-with-lease`, relaxing `staging`'s protection for that
-  push alone. No build of the violating commit can be made, so it cannot reach
-  `main`; documentation already promoted from rewritten commits is still
+  push alone. No release-candidate of the violating commit can be made, so it
+  cannot reach `main`; documentation already promoted from rewritten commits is still
   recognised by its patch-id.
 
 ## Adding a setting
@@ -167,7 +174,7 @@ A daemon setting is one row in `daemon/config_table.c`: its name, kind, range
 or values, default, class (operator, managed, or development) and one line of
 meaning. Nothing else: the loader reads it from the row, CONFIG.md's reference
 and `packaging/openchimed.env` are regenerated from it
-(`scripts/test/local/config.sh --write`), `openchimed --check-config` reports it, and
+(`scripts/test/fast/config.sh --write`), `openchimed --check-config` reports it, and
 `make test` fails if a `getenv` appears outside the loader or a name appears
 anywhere the registry does not know. A client setting goes through
 `client/core/env.c` and a `CLIENT` row, so the name is known. A test input is a
@@ -176,100 +183,95 @@ does nothing unless `OPENCHIME_MODE=development` (CONFIG.md "Mode").
 
 ## Keeping CI small
 
-Three test commands, and nothing else runs a test: `make test` locally before
-every push, `make test-merge` on every pull request and in the staging build,
-`make test-release` on the artifacts the staging build and the release make
-(TESTING.md §4). Each test is a script under `scripts/test/`; the targets call
-the scripts, and the workflows call only the targets. The smoke test of a
-published release is `scripts/smoketest.sh`, which runs every check in
-`scripts/smoke/` and runs only in the release.
+Two suites, and nothing else runs a test (TESTING.md): the fast one locally,
+before every push; the full one in CI, once per release-candidate, on the
+staging tip. Each test is a script under `scripts/test/fast/` or
+`scripts/test/full/`; the make targets call the scripts, and the workflows call
+only the targets. No test runs on a pull request, in a release or in a
+promotion. The release's check of what it published is release verification,
+not a test: `scripts/release/smoke.sh`, which runs every check in
+`scripts/release/smoke/`.
 
-A compile error or a failing fast test is found locally, not in CI:
-`scripts/check/test.sh` (`make && make test`) runs before the commit, and
-`.githooks/pre-push` refuses a tree it did not pass on (a change to `*.md`,
-`.gitignore` or `.claude/` alone excepted) and workflows `actionlint` rejects.
-The hooks are on once per clone: `git config core.hooksPath .githooks`
-("Starting a feature"). A pull request whose one commit changes documentation
-alone builds nothing in CI, and a newer push to a pull request cancels the
-run it replaces. Every job has a timeout.
+A compile error or a failing fast test is found locally, not in CI: `make
+test` runs before the commit, and `.githooks/pre-push` refuses a tree it did
+not pass on (a documentation-only change excepted). The hooks are on once per
+clone: `git config core.hooksPath .githooks` ("Starting a feature"). Every job
+has a timeout.
 
 ## CI
 
-Two workflows run on a pull request, and nothing runs on a push.
-`pr-policy.yml` checks the pull request's title and body, that the title
-names an open issue, and the tree's issue references (`scripts/test/local/refs.sh`,
-from the base branch), and its attribution scan is a step of the same job, so
-a banned reference fails it too. `pr-tests.yml` runs `make test-merge`
-(`ci.yml`, below) unless the pull request's commit changes documentation
-alone; its last job, `pr tests`, passes only when those tests passed or were
-skipped for documentation. `pr policy` and `pr tests` are the required checks
-on `staging`, and the branch need not be up to date to merge.
+One workflow runs on a pull request, and nothing runs on a push.
+`pr-policy.yml` runs the policy checks, not tests: the pull request's title
+(`scripts/policy/subject.sh`) and empty body, that the title names an open
+issue, the tree's issue references (`scripts/policy/refs.sh`, from the base
+branch), and the attribution scan, all steps of one job, `pr policy`, the
+required check on `staging`; the branch need not be up to date to merge.
 
-The build and the tests run in the **staging build** (`staging-build.yml`),
-dispatched by hand on `staging` for its tip, usually after a few changes have
-merged:
+The full suite runs in the **release-candidate** (`release-candidate.yml`),
+dispatched by hand on `staging` for its tip once the maintainers have graded
+it and approved it:
 
-    gh workflow run staging-build.yml --ref staging
+    gh workflow run release-candidate.yml --ref staging
 
-Its gate checks the commits since the last release (the attribution scan refuses; the
-commit policy warns) and refuses a commit already built. Then `make test-merge`
-again, on the merged tip, by calling `ci.yml`: two jobs on two machines at
-once.
+Its gate refuses any ref but staging's tip, a commit already released or
+already a release-candidate, and one `main` cannot take next; it checks the
+commits since the last release (the attribution scan refuses; the commit
+policy warns). Then the full suite's code tests, by calling `test-all.yml`:
+two jobs on two machines at once.
 
-- **`build + unit tests`** — `make test-merge PART=plain`: the daemon with
-  every feature; the source checks; the suites that start no threads; the
-  static-link check; the daemon started and driven over TLS with the e2e
-  client; every Linux translation unit through the release's clang under
-  `-Werror`; the speech round trip; the web client in a headless Chrome and
-  the GUI smoke on the web (TESTING.md §3.4).
-- **`thread sanitizer`** — `make test-merge PART=threads`: the suites that
-  start threads, under ThreadSanitizer.
+- **`full suite (plain)`** — `make build-all PART=plain` and `make test-all
+  PART=plain`: the daemon with every feature; the source checks and
+  actionlint; every suite, with its timing judged; the static-link check; the
+  daemon started and driven over TLS with the e2e client; every Linux
+  translation unit through the release's clang under `-Werror`; the speech
+  round trip; the web client in a headless Chrome and the GUI smoke on the
+  web (TESTING.md §3.4); the fuzzing pass.
+- **`full suite (thread sanitizer)`** — PART=threads: the suites that start
+  threads, under ThreadSanitizer.
 
 Only when both pass does it build what a release ships — both daemons with
-their data, the images, and the Windows clients (with the two Windows test
-programs) — and store the daemon trees, the Windows binaries and the images by
-commit; a stored build is what a release-candidate is made from. The packages,
-the Windows installer and the MSIX are built too, under a placeholder version,
-and `make test-release` checks each (PART=packages, image, windows); a release
-makes them again under its number and checks them the same way. Everything
-runs on Linux, the Windows packaging included (NSIS, makemsix). Every vendored library and
-toolchain is cached by the script that builds it, and the staging build's runs
-save the caches the next one restores; a cache unused for seven days is
-evicted. Once a month `toolchains.yml` files an issue when a pinned toolchain
-is behind upstream.
+their data and packages, the images, and the Windows clients with their
+installer and MSIX — each checked by `make test-all` (PART=packages, image,
+windows), and store the daemon trees, the Windows binaries and the images by
+commit; then it tags the commit `release-N-rcK` and publishes it as a
+prerelease. Everything runs on Linux, the Windows packaging included (NSIS,
+makemsix). Every vendored library and toolchain is cached by the script that
+builds it, and each run saves the caches the next one restores; a cache unused
+for seven days is evicted. `tools/toolchains.sh` says, when run by hand,
+whether a pinned toolchain is behind upstream.
 
-**A failure there is everyone's.** It holds back every change merged since the
-last staging build: find the commit, fix it on a branch like any other change,
-and run the staging build again on the new tip.
+**A failure there holds back the release-candidate.** Find the commit, fix it
+on a branch like any other change, and dispatch the release-candidate again on
+the new tip.
 
-See [TESTING.md](./TESTING.md) for the full test strategy.
+See [TESTING.md](./TESTING.md) for the two suites.
 
 **A library the daemon links needs its licence notice.** A component added to
 the daemon's build under `third_party/` needs an `emit` line in
 `packaging/licenses.sh`, under the same `TTS`, `STT` or `SUM` condition the
 build uses, so the notice travels with every binary that links it.
-`scripts/test/local/notices.sh`, one of `make test`'s source checks, compares the
+`scripts/test/fast/notices.sh`, one of the source checks both suites run, compares the
 two for all eight combinations and names any component without one.
 
 **Every network call retries a failed connection.** Every workflow sets `BASH_ENV` to `.github/net-retry.bash`, so every bash step, and every bash script it runs, gets it: `git`, `gh` and `ssh-keyscan` (GitHub); `skopeo`, `docker`, `buildah` and `flyctl` (Fly's registry, API and builder); `curl`; and `dotnet restore`, while `rclone`, `npm` and NuGet are told through their own settings to retry harder and give up on a stall. Each attempt is bounded, so a stalled connection fails instead of hanging, and a call that failed in the connection (a timeout, a dropped, reset or refused connection, a 5xx) is retried with backoff, up to four times. A real refusal, such as a rejected push, a missing ref or image, a 4xx or a failed health check, fails at once.
 
 ## Releases
 
-The maintainers cut releases; a contributor does nothing for one. A staging
-build tests the `staging` tip and stores what a release ships, by commit; a
-release-candidate is a stored build, tagged `release-N-rcK` and published as a
+The maintainers cut releases; a contributor does nothing for one. A
+release-candidate runs the full suite on the `staging` tip, builds and stores
+what a release ships, by commit, and tags it `release-N-rcK`, published as a
 prerelease; a release takes one release-candidate and publishes the same
 binaries, numbered N, to apt, dnf, the container registries and the GitHub
 release (the tarballs and the Windows installer), appends a `Release N`
 snapshot to `main`, closes the issues it shipped, those of the
 documentation it carries included, and sends the list of them, each as filed,
-to the control plane for the release notes (`staging-build.yml`,
-`release-candidate.yml`, `release.yml`; the last's `notes` job sends to the
+to the control plane for the release notes (`release-candidate.yml`,
+`release.yml`; the last's `notes` job sends to the
 address the `CONTROL_PLANE_URL` repository variable names). Each release-candidate, release and
 promotion is then copied to the public repository (`openchime/openchime`): its
 `staging`, the tag, the GitHub release and `main`, fast-forward only. Between releases, `promote.yml`
-appends `Documentation` snapshots to `main`. No compiler runs after the staging
-build. A build is identified by its commit and a release by its number;
+appends `Documentation` snapshots to `main`. No compiler and no test runs
+after the release-candidate. A build is identified by its commit and a release by its number;
 [UPGRADING.md](./UPGRADING.md) says how the two relate and how a self-hoster
 upgrades. A change that alters what an operator must do on upgrade adds a
 section to UPGRADING.md in the same pull request.

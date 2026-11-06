@@ -37,7 +37,7 @@
 #   scripts/release/main_next.sh docs <staging> [<main>]
 #       the Documentation snapshot of the documentation-only commits from the
 #       last release's candidate to <staging> that main has not taken yet
-#       (scripts/release/docs_only.sh), in staging's order; nothing when there
+#       (scripts/policy/docs_only.sh), in staging's order; nothing when there
 #       are none or they change nothing. One that does not apply, or that
 #       names an OPENCHIME_ setting main's daemon/config_table.c does not have,
 #       is skipped and named.
@@ -133,7 +133,7 @@ apply() {
   esac
 }
 # Does <docs commit> name an OPENCHIME_ setting <main>'s registry lacks? Prints
-# the first such name. A cheap stand-in for scripts/test/local/config.sh, which
+# the first such name. A cheap stand-in for scripts/test/fast/config.sh, which
 # needs the daemon built: documentation describing a setting reaches main with
 # the code that has it.
 unknown_setting() {  # <docs commit> <main>
@@ -229,7 +229,7 @@ case "$verb" in
     for d in $list; do
       grep -qxF -- "$d" <<<"$named_shas" && continue
       what=$(git log -1 --format='%h %s' "$d")
-      rc=0; other=$("$here/docs_only.sh" "$d") || rc=$?
+      rc=0; other=$("$here/../policy/docs_only.sh" "$d") || rc=$?
       case "$rc" in 0) ;; 1) say "skipped (changes ${other}): ${what}"; continue ;; *) exit 2 ;; esac
       pid=$(patch_id "$d")
       if [ -z "$pid" ]; then say "skipped (changes nothing): ${what}"; continue; fi

@@ -22,14 +22,14 @@ SQLITE_DEFS := -DSQLITE_ENABLE_FTS5 -DSQLITE_THREADSAFE=1 -DHAVE_USLEEP=1 \
                -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED \
                -DSQLITE_DQS=0 -DSQLITE_DEFAULT_MEMSTATUS=0 \
                -DSQLITE_LIKE_DOESNT_MATCH_BLOBS -DSQLITE_OMIT_SHARED_CACHE
-$(SQLITE_O): $(SQLITE_DIR)/sqlite3.c $(SQLITE_DIR)/sqlite3.h $(CC_STAMP) $(TOOLCHAIN_DEPS) | build
+$(SQLITE_O): $(SQLITE_DIR)/sqlite3.c $(SQLITE_DIR)/sqlite3.h $(CC_STAMP) $(TOOLCHAIN_DEPS) | build-dir
 	@mkdir -p $(dir $@)
 	$(CC) $(filter-out $(WARN_CFLAGS),$(CFLAGS)) -w $(SQLITE_DEFS) -c $< -o $@
 
 # Argon2, as released, in one unit (argon2_all.c) with its own flags: the
 # release compares an unsigned length with a zero minimum (-Wtype-limits), and
 # the daemon hashes with one lane, so no threads.
-$(ARGON2_O): $(wildcard $(ARGON2_DIR)/*.c $(ARGON2_DIR)/*.h $(ARGON2_DIR)/blake2/*) $(CC_STAMP) $(TOOLCHAIN_DEPS) | build
+$(ARGON2_O): $(wildcard $(ARGON2_DIR)/*.c $(ARGON2_DIR)/*.h $(ARGON2_DIR)/blake2/*) $(CC_STAMP) $(TOOLCHAIN_DEPS) | build-dir
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -Wno-type-limits -DARGON2_NO_THREADS -I$(ARGON2_DIR) -c $(ARGON2_DIR)/argon2_all.c -o $@
 

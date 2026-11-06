@@ -2,10 +2,10 @@
 # build-windows.sh <version> <bindir> <outdir>
 #
 # The Windows client's two packages, built on Linux from the binaries the
-# Linux build cross-compiled (make windows): the NSIS installer, the download
+# Linux build cross-compiled (make build): the NSIS installer, the download
 # channel (packaging/windows/openchime.nsi, makensis), and the MSIX, the Store
 # channel (packaging/windows/msix/, makemsix). <version> is the release number
-# (0 in the staging build); <bindir> holds openchime.exe and openchime-tui.exe.
+# (0 in the release-candidate); <bindir> holds openchime.exe and openchime-tui.exe.
 # Signing is the release's (scripts/release/sign_windows.sh).
 #
 # Needs makensis (apt: nsis), python3, and what scripts/build/makemsix.sh and
@@ -17,7 +17,7 @@ outdir=${3:?usage: build-windows.sh <version> <bindir> <outdir>}
 cd "$(dirname "$0")/.."
 command -v makensis >/dev/null || { echo "build-windows.sh: needs makensis (apt: nsis)" >&2; exit 1; }
 for f in openchime.exe openchime-tui.exe; do
-  [ -f "$bindir/$f" ] || { echo "build-windows.sh: $bindir/$f is missing (make windows)" >&2; exit 1; }
+  [ -f "$bindir/$f" ] || { echo "build-windows.sh: $bindir/$f is missing (make build)" >&2; exit 1; }
 done
 scripts/build/nsis_plugins.sh
 scripts/build/makemsix.sh

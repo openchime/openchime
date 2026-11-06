@@ -1,10 +1,10 @@
-# The tests (docs/TESTING.md), the release-compiler pass, and the tool
-# binaries a person builds by path. Every test is a script in scripts/test/; a
-# target here builds what the scripts need and calls them, and the workflows
-# call only these targets (docs/TESTING.md §4).
+# The test binaries and the fast suite (docs/TESTING.md), the release-compiler
+# pass, and the tool binaries a person builds by path. Every test is a script
+# in scripts/test/fast/ or scripts/test/full/; a target builds what the scripts
+# need and calls them, and the workflows call only the targets.
 
 # Unit + in-process integration tests, one binary (docs/TESTING.md §2). Built
-# -O0 -g; a non-zero exit fails the build and CI. The suites run side by side,
+# -O0 -g; a non-zero exit fails the run. The suites run side by side,
 # as many at once as there are CPUs (OC_TEST_JOBS, tests/main.c): they are nearly
 # all waiting, so the run takes about as long as its slowest suite. The binary
 # always carries read-aloud's and voice input's test paths (stub engines) and
@@ -24,82 +24,32 @@ TEST_OBJS   := $(call oc_objs,$(OBJ_DIR)/test,$(TEST_ALL_SRC))
 TEST_VENDOR := $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A)
 $(eval $(call oc_obj_rules,$(OBJ_DIR)/test,TEST_CC,$(CC_STAMP),$(TEST_VENDOR)))
 -include $(TEST_OBJS:.o=.d)
-# --- The three test commands (docs/TESTING.md §4) ----------------------------
-# Every test is a script under scripts/test/; these targets build what the
-# scripts need and call them, and nothing else runs a test. The workflows call
-# only these targets (and scripts/smoketest.sh, after a release publishes).
-#
-#   make test          local, before every push (scripts/check/test.sh, the
-#                      pre-push hook): the source checks and the fast suites,
-#                      on the default daemon. About a minute once built.
-#   make test-merge    CI only, on every pull request and in the staging
-#                      build: every feature built, every suite (the threaded
-#                      ones under ThreadSanitizer), the static-link check, the
-#                      end-to-end run, the release's compiler, the speech
-#                      round trip, the web client in a headless Chrome and the
-#                      GUI smoke on the web. PART=plain or PART=threads runs
-#                      one half, as CI's two jobs do; unset, both.
-#   make test-release  CI only, on what the release ships: PART=packages (on
-#                      DIST), PART=image (on IMAGE), PART=windows (on WIN_BIN
-#                      and WIN_DIST); unset, all three. A check on a binary or
-#                      image the runner cannot execute says so and skips it.
-test: $(TEST_BIN) $(BIN)
-	scripts/test/local/source.sh
-	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" scripts/test/local/suites.sh
+# --- The fast suite (docs/TESTING.md) -----------------------------------------
+# `make test` (Makefile) runs this in a make of the fast build's own: the fast
+# build and the test binary, then the source checks, actionlint on the
+# workflows and the suites SUITES[] marks FAST, and on a pass the tree it
+# passed on, recorded for the pre-push hook (scripts/test/lib/tested_tree.sh).
+# The full suite is mk/full.mk.
+fast-test: fast-build $(TEST_BIN)
+	scripts/test/fast/source.sh
+	scripts/test/fast/actionlint.sh
+	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" scripts/test/fast/suites.sh
+	@scripts/test/lib/tested_tree.sh record
 
-FULL_SWITCHES := TTS=1 STT=1 SUM=1 WEB=1
-TSAN_BIN      := build/tests-tsan
-test-merge:
-	@scripts/test/lib/require_ci.sh test-merge
-	+@$(foreach p,$(if $(PART),$(PART),plain threads),$(MAKE) --no-print-directory test-merge-$(p) &&) true
-test-merge-plain:
-	+@$(MAKE) --no-print-directory $(FULL_SWITCHES) all linux build/e2e_client build/demo_client $(TEST_BIN) $(WEB_DIR)/openchime.js \
-	    $(patsubst %,build/fuzz/%,$(FUZZ_HARNESSES))
-	scripts/test/local/source.sh
-	scripts/test/merge/suites.sh
-	scripts/test/merge/static_link.sh $(BIN)
-	scripts/test/merge/e2e.sh
-	+MAKE="$(MAKE) $(FULL_SWITCHES)" scripts/test/merge/release_cc.sh
-	scripts/test/lib/speech.sh ./$(BIN)
-	NODE="$(NODE)" scripts/test/merge/web.sh
-	+MAKE="$(MAKE) $(FULL_SWITCHES)" scripts/test/merge/web_deps.sh
-	NODE="$(NODE)" scripts/test/merge/gui_web_smoke.sh
-	scripts/test/merge/fuzz.sh
-test-merge-threads: $(TSAN_BIN)
-	scripts/test/merge/tsan.sh
+TSAN_BIN := build/tests-tsan
 # pthread_create is wrapped in the plain test binary, so the runner sees which
-# suites start threads and fails one not on TSAN_SUITES (tests/main.c).
-$(TEST_BIN): $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build
+# suites start threads and fails one SUITES[] does not mark THREADS
+# (tests/main.c).
+$(TEST_BIN): $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build-dir
 	$(CC) $(CFLAGS) -O0 -g $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -Wl,--wrap=pthread_create -lresolv -lpthread -lm -o $@
-# The same test binary under ThreadSanitizer (scripts/test/merge/tsan.sh runs
-# it; TSAN_BIN is set above, before the rule that needs it). The vendored
-# libraries are not instrumented.
+# The same test binary under ThreadSanitizer (scripts/test/full/tsan.sh runs
+# it). The vendored libraries are not instrumented.
 TSAN_CC   = $(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TEST_INC)
 TSAN_OBJS := $(call oc_objs,$(OBJ_DIR)/tsan,$(TEST_ALL_SRC))
 $(eval $(call oc_obj_rules,$(OBJ_DIR)/tsan,TSAN_CC,$(CC_STAMP),$(TEST_VENDOR)))
 -include $(TSAN_OBJS:.o=.d)
-$(TSAN_BIN): $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build
+$(TSAN_BIN): $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build-dir
 	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
-
-PKG_ARCH    ?= $(if $(filter aarch64,$(shell uname -m)),arm64,amd64)
-PKG_VERSION ?= 0
-DIST        ?= dist/linux-$(PKG_ARCH)
-WIN_BIN     ?= build
-WIN_DIST    ?= dist/windows-x64
-test-release:
-	@scripts/test/lib/require_ci.sh test-release
-	+@$(foreach p,$(if $(PART),$(PART),packages image windows),$(MAKE) --no-print-directory test-release-$(p) &&) true
-test-release-packages:
-	scripts/test/release/glibc_floor.sh $(DIST)/openchimed
-	scripts/test/release/same_binary.sh $(DIST) $(PKG_VERSION) $(PKG_ARCH)
-	scripts/test/lib/speech.sh $(DIST)/openchimed
-	scripts/test/release/package.sh $(DIST) $(PKG_VERSION) $(PKG_ARCH)
-	scripts/test/release/unit_file.sh $(DIST)/openchimed
-test-release-image:
-	scripts/test/release/image.sh $(IMAGE)
-	scripts/test/release/db_restore.sh $(IMAGE)
-test-release-windows:
-	scripts/test/release/windows.sh $(WIN_BIN) $(WIN_DIST) $(PKG_VERSION)
 
 # --- The release's compiler (CI) ----------------------------------------------
 # The daemon's sources through the RELEASE's compiler, with the release's flags,
@@ -119,7 +69,7 @@ RELEASE_CC_TEST_SRC := $(TEST_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_
 # The release compiler as a file, like $(CC_STAMP): a different one recompiles.
 RELCC_DIR   := build/relcc
 RELCC_STAMP := $(RELCC_DIR)/.cc
-$(RELCC_STAMP): FORCE | build
+$(RELCC_STAMP): FORCE | build-dir
 	@mkdir -p $(dir $@)
 	@echo '$(RELEASE_CC)' | cmp -s - $@ || echo '$(RELEASE_CC)' > $@
 RELCC_DAEMON_CC   = $(RELEASE_CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS)
@@ -127,23 +77,25 @@ RELCC_TEST_CC     = $(RELEASE_CC) $(CFLAGS) $(TEST_INC)
 RELCC_DAEMON_OBJS := $(call oc_objs,$(RELCC_DIR)/daemon,$(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC))
 RELCC_TEST_OBJS   := $(call oc_objs,$(RELCC_DIR)/test,$(RELEASE_CC_TEST_SRC))
 RELCC_VENDOR      := $(ZIG) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A)
-$(eval $(call oc_obj_rules,$(RELCC_DIR)/daemon,RELCC_DAEMON_CC,$(RELCC_STAMP) $(FEATURES) $(BUILD_ID_STAMP),$(RELCC_VENDOR),@))
+$(eval $(call oc_obj_rules,$(RELCC_DIR)/daemon,RELCC_DAEMON_CC,$(RELCC_STAMP) $(FEATURES_STAMP) $(BUILD_ID_STAMP),$(RELCC_VENDOR),@))
 $(eval $(call oc_obj_rules,$(RELCC_DIR)/test,RELCC_TEST_CC,$(RELCC_STAMP),$(RELCC_VENDOR),@))
 -include $(RELCC_DAEMON_OBJS:.o=.d) $(RELCC_TEST_OBJS:.o=.d)
 check-release-cc: $(RELCC_DAEMON_OBJS) $(RELCC_TEST_OBJS)
 	@echo "check-release-cc: $(words $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(RELEASE_CC_TEST_SRC)) sources clean"
 
 # --- Tool binaries, built by path ---------------------------------------------
-# The e2e client CI's build job drives against a natively-run daemon (docs/
-# TESTING.md §3); links only the shared wire modules (no daemon internals).
+# The e2e client the full suite drives against a natively-run daemon
+# (scripts/test/full/e2e.sh, docs/TESTING.md §3); links only the shared wire
+# modules (no daemon internals).
 # Every tool signs in as a person does, through the daemon's pages (tests/testsignin.c).
-build/e2e_client: tests/e2e_client.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build
+build/e2e_client: tests/e2e_client.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build-dir
 	$(CC) $(CFLAGS) -O0 -g -Ishared -Itests -I$(MBEDTLS_INC) \
 	    tests/e2e_client.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
 # The fuzzing tier (docs/TESTING.md, "Fuzzing"): one libFuzzer binary per
-# harness, build/fuzz/<harness>, from tests/fuzz/<harness>.c, under ASan and
-# UBSan. The host's clang, since zig's has no libFuzzer runtime: a prerequisite
-# for building a harness only, never for make or make test.
+# harness in FUZZ_HARNESSES (mk/sources.mk), build/fuzz/<harness>, from
+# tests/fuzz/<harness>.c, under ASan and UBSan. The host's clang, since zig's
+# has no libFuzzer runtime: a prerequisite for building a harness only, never
+# for the fast build or suite.
 # By path when it is in the usual places: make puts the pinned llvm-mingw first
 # on PATH (mk/toolchains.mk), and its clang has no Linux sanitizer runtimes.
 FUZZ_CC  ?= $(firstword $(wildcard /usr/bin/clang /usr/local/bin/clang) clang)
@@ -160,7 +112,7 @@ FUZZ_SRC_webauthn := daemon/webauthn.c daemon/cbor.c daemon/json.c daemon/jwt.c
 FUZZ_SRC_idtoken  := daemon/idtoken.c daemon/json.c daemon/jwt.c
 FUZZ_ALL_SRC := $(sort $(foreach h,$(FUZZ_HARNESSES),$(FUZZ_SRC_$(h))))
 build/fuzz/%: tests/fuzz/main.c tests/fuzz/%.c $(FUZZ_LIB) $(FUZZ_ALL_SRC) $(MBEDTLS_A) \
-              $(wildcard shared/*.h daemon/*.h tests/fuzz/*.h) | build
+              $(wildcard shared/*.h daemon/*.h tests/fuzz/*.h) | build-dir
 	@mkdir -p $(dir $@)
 	$(FUZZ_CC) $(CFLAGS) -O1 -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
 	    -Ishared -Idaemon -Itests -Ithird_party/jsmn -Ithird_party/picohttpparser -I$(MBEDTLS_INC) \
@@ -168,42 +120,31 @@ build/fuzz/%: tests/fuzz/main.c tests/fuzz/%.c $(FUZZ_LIB) $(FUZZ_ALL_SRC) $(MBE
 	    $(filter-out tests/fuzz/$*.c,$(FUZZ_LIB)) $(FUZZ_SRC_$*) $(MBEDTLS_LIBS) -o $@
 # Writes one valid frame per message type, and a few streams of them, as the
 # harnesses' seed corpora (tests/fuzz/corpus/): build/fuzz/seeds <dir>.
-build/fuzz/seeds: tests/fuzz/seeds.c shared/protocol.c $(wildcard shared/*.h) | build
+build/fuzz/seeds: tests/fuzz/seeds.c shared/protocol.c $(wildcard shared/*.h) | build-dir
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -O0 -g -Ishared tests/fuzz/seeds.c shared/protocol.c -o $@
 # Flexible black-box client for the local federated demo (register a device token /
 # send a message against a running daemon). Same shared-only linkage as e2e_client.
-build/demo_client: tests/demo_client.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build
+build/demo_client: tests/demo_client.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build-dir
 	$(CC) $(CFLAGS) -O0 -g -Ishared -Itests -I$(MBEDTLS_INC) \
 	    tests/demo_client.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
-# Capacity benchmark load client (REQ-210/211); driven by scripts/bench.sh.
-build/bench_load: tests/bench_load.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build
+# Capacity benchmark load client (REQ-210/211); driven by tools/bench.sh.
+build/bench_load: tests/bench_load.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build-dir
 	$(CC) $(CFLAGS) -O2 -Ishared -Itests -I$(MBEDTLS_INC) \
 	    tests/bench_load.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -lpthread -o $@
-# Event-loop load harness: the daemon in-process, driven by loopback clients,
-# printing the net loop's turn percentiles beside client latency. Optimised like
-# the daemon, so the numbers are the daemon's; not part of `make test`.
-build/bench_loop: tests/bench_loop.c tests/testsignin.c $(APP_SRC) $(HDRS) $(MBEDTLS_A) $(SQLITE_O) $(ARGON2_O) | build
-	$(CC) $(CFLAGS) $(INC) $(SQLITE_INC) -Itests \
-	    tests/bench_loop.c tests/testsignin.c $(APP_SRC) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) -ldl -lpthread -lm -o $@
 # The sign-in helper as a command, for the shell scripts: prints the token and
 # the verifier a client presents on AUTH, and presents one (`present`) for a
-# script that played the browser itself (scripts/test/merge/web.sh).
-build/signin: tests/testsignin_main.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build
+# script that played the browser itself (scripts/test/full/web.sh).
+build/signin: tests/testsignin_main.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build-dir
 	$(CC) $(CFLAGS) -O0 -g -Ishared -Itests -I$(MBEDTLS_INC) \
 	    tests/testsignin_main.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
-# Manual S3 smoke test (tests/manual/s3_smoke.c) -- NOT part of `make test`.
+# Manual S3 smoke test (tests/manual/s3_smoke.c) -- in neither suite.
 # Needs live S3 credentials in the environment; see the header of that file.
-build/s3_smoke: tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/sigv4.c daemon/config.c daemon/config_table.c daemon/proxyproto.c shared/url.c shared/tls.c third_party/ca-roots/ca_roots.c $(MBEDTLS_A) | build
+build/s3_smoke: tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/sigv4.c daemon/config.c daemon/config_table.c daemon/proxyproto.c shared/url.c shared/tls.c third_party/ca-roots/ca_roots.c $(MBEDTLS_A) | build-dir
 	$(CC) $(CFLAGS) $(INC) tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/sigv4.c \
 	    daemon/config.c daemon/config_table.c daemon/proxyproto.c shared/url.c shared/tls.c \
 	    third_party/ca-roots/ca_roots.c $(MBEDTLS_LIBS) -lpthread -o $@
 	@echo "built $@ -- needs OPENCHIME_S3 to run"
-# Standalone harness exercising every tuikit widget (ARCH-83) -- no core, no
-# daemon, no TLS. The toolbox's own smoke test.
-build/tuikit-demo: $(TUIKIT_SRC) tuikit/demo.c $(UTF8PROC) $(wildcard tuikit/*.h) | build
-	$(CC) $(CFLAGS) -Wno-unused-result $(TUIKIT_INC) -Ithird_party/termbox2 -Ithird_party/utf8proc \
-	    $(TUIKIT_SRC) tuikit/demo.c $(UTF8PROC) -o $@
 # ttskit's data tool (docs/TTSKIT.md).
-build/tts_pack: $(TTSKIT_SRC) ttskit/tts_pack.c $(wildcard ttskit/*.h) | build
+build/tts_pack: $(TTSKIT_SRC) ttskit/tts_pack.c $(wildcard ttskit/*.h) | build-dir
 	$(CC) $(CFLAGS) $(TTSKIT_INC) $(TTSKIT_SRC) ttskit/tts_pack.c -lm -o $@

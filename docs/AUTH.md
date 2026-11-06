@@ -1001,7 +1001,7 @@ heading: `data-oc-result` `signed-in`, `refused` or `pending`
 **No password in a frame** (§2). The test suites and the GUI harness sign in
 as a person does: a helper plays the
 browser against the page (`tests/testsignin.h`; `play_browser` in
-`scripts/gui/lib.sh`; `OPENCHIME_DEV_SIGNIN` for the web client) and the client
+`tools/gui/lib.sh`; `OPENCHIME_DEV_SIGNIN` for the web client) and the client
 presents the token the page ends with (TESTING.md).
 
 **The terminal client** signs in to a local account with a device code (§8.11),

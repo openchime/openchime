@@ -105,7 +105,7 @@ CROSS_ARGS=()
 if [ -n "${OC_ARCH:-}" ] && [ "${OC_ARCH}" != "$(uname -m)" ]; then
   # A cross build runs the host's protoc: the one the host build made. `protoc`
   # there is a symlink to the versioned binary beside it, so a cache of it must
-  # carry both (staging-build.yml lists protoc*).
+  # carry both (release-candidate.yml lists protoc*).
   HOST_PROTOC="$(pwd)/onnxruntime-${ORT_VERSION}-build/out/MinSizeRel/_deps/protobuf-build/protoc"
   if [ ! -x "${HOST_PROTOC}" ]; then
     # Built here and now, as the host's: protoc alone, with the host's own

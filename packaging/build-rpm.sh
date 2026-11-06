@@ -2,7 +2,7 @@
 # Assemble openchimed-<version>-1.<arch>.rpm from an already-built binary.
 #
 # Runs with rpmbuild for BOTH architectures on an x86 runner (the arm64 binary
-# is cross-built there, staging-build.yml), so the package's architecture is
+# is cross-built there, release-candidate.yml), so the package's architecture is
 # told, not taken from the machine; left to rpmbuild it would be the host's,
 # and the arm64 package would collide with the amd64 one in the pool.
 #

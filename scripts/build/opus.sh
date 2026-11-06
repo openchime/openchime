@@ -10,6 +10,7 @@
 # (ARCH-73), and links libopus only for read-aloud (TTS=1, mk/daemon.mk).
 # scripts/build/media_wasm.sh builds the same sources for the web.
 set -euo pipefail
+NO_AUTOTOOLS="ACLOCAL=: AUTOCONF=: AUTOMAKE=: AUTOHEADER=:"
 
 TARGET="${1:-native}"
 # The version committed in third_party/opus; the build directories carry it.
@@ -38,8 +39,11 @@ if [ ! -f "${DEST}/lib/libopus.a" ]; then
     "${SRC}/configure" ${HOST} --prefix="$(cd .. && pwd)" \
       --disable-shared --enable-static --with-pic \
       --disable-doc --disable-extra-programs >/dev/null
-    make -j"$(nproc)" >/dev/null
-    make install >/dev/null
+    # The tarball's generated files are older than the sources a checkout
+    # writes beside them, so make would regenerate them with automake, which
+    # nothing here needs or installs: the regeneration commands are no-ops.
+    make -j"$(nproc)" $NO_AUTOTOOLS >/dev/null
+    make install $NO_AUTOTOOLS >/dev/null
   )
 fi
 

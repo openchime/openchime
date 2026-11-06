@@ -285,7 +285,7 @@ model; translate input to intents }, stop.
   **notcurses is rejected on licensing** — it hard-depends on libunistring
   (LGPL); termbox2 + utf8proc keep the whole client permissive. **The TUI is
   text-only and never renders graphics — no images, ever.** Built on the host
-  like the daemon (`make linux`), with no dependency beyond termbox2, utf8proc
+  like the daemon (`make build/openchime-tui`), with no dependency beyond termbox2, utf8proc
   and the vendored mbedTLS except an optional link to libsecret-1 (and its glib stack) where
   `pkg-config` finds it, for the keyring. The widget/
   formatting layer above termbox2 is the in-tree **`tuikit`** toolbox (ARCH-83,
@@ -645,7 +645,7 @@ model; translate input to intents }, stop.
 - **Linux GUI (planned):** the **same portable client** (ARCH-80) — the shared
   app layer over SDL3, with a FreeType/fontconfig text backend and a small
   native shim (tray, AT-SPI accessibility, libsecret). Not a GTK app: the client self-draws everything a toolkit
-  would supply. Today `make linux` builds the TUI only.
+  would supply. Today the Linux build is the TUI only.
 - **macOS/iOS:** the portable client over SDL3 on macOS, with a
   CoreText backend and an Obj-C native shim where Apple leaves no C surface;
   UIKit on iOS is its own effort over the core.
@@ -657,7 +657,7 @@ model; translate input to intents }, stop.
   mirroring the accessibility tree, the credential store, notifications, file
   pickers and media capture. Nothing is installed: the browser loads it from the
   workspace. The application is the same sources as Windows over
-  `client/gui/platform/web/` (`make web`; checked by `make test-merge`); the design is
+  `client/gui/platform/web/` (`make build/web/openchime.js`; checked by the full suite); the design is
   [WEB.md](./WEB.md).
 
 **Across the graphical frontends.** Win32 is the reference client (ARCH-82): it
@@ -665,10 +665,10 @@ surfaces every engine feature, and a feature is surfaced there first.
 Accessibility (REQ-269) is a UIA provider over the self-drawn UI, a real system
 caret and UIA events (**ARCH-99**), with an `AutomationId` and an
 `InvokePattern` on every actionable element (**REQ-290**), verified from outside
-the process by `scripts/gui/uia_probe.ps1`. The recording and sharing bars are
+the process by `tools/gui/uia_probe.ps1`. The recording and sharing bars are
 windows of their own, so each is served as its own small tree (`recbar`,
 `sharebar`: the line as Text, the buttons invokable), read and pressed by
-`scripts/gui/uia_recbar.ps1`. Rich text and its toolbar
+`tools/gui/uia_recbar.ps1`. Rich text and its toolbar
 (**REQ-220**, ARCH-100) are a shared parser in `shared/richtext.c` plus sdltext
 byte ranges. Each platform has its own screen capture for sharing in calls; the
 codec and the transport are in the core (REQ-161, [CALLS.md](./CALLS.md) §6).
@@ -895,7 +895,7 @@ tell auth-failure from unreachable.
 
 ## 7. Build
 
-The core + TUI build on the host (a `make linux` target linking `client/core/*.c` +
+The core + TUI build on the host (`make build/openchime-tui`, linking `client/core/*.c` +
 `client/tui/*.c` + `tuikit/*.c` + `shared/*` + `third_party/utf8proc/utf8proc.c`, with
 `termbox2.h` compiled `TB_IMPL` in one TU), like the daemon — no cross-compile,
 no container, no external build system. termbox2 and utf8proc are **vendored as
@@ -903,12 +903,12 @@ committed single-file source** in `third_party/` (like jsmn, pinned to termbox2
 v2.5.0 / utf8proc v2.11.3), both MIT, so local and CI share identical sources with
 no transitive dependencies of their own (ARCH-75); the TUI's one optional
 system link is libsecret-1, for the keyring, where `pkg-config` finds it. The GUI is one application
-(`client/gui/app/`) compiled over a platform directory: `make windows`
+(`client/gui/app/`) compiled over a platform directory: `make build`
 cross-compiles it with the pinned llvm-mingw over `client/gui/platform/win32/`
 and the SDL3 and mbedTLS built for Windows; a Linux or macOS build is the same
 sources over their own platform directory once it exists. Release artifacts
 come from CI/CD, never a dev machine.
-The web build (`make web`, [WEB.md](./WEB.md)) fetches its pinned Emscripten and
+The web build (`make build/web/openchime.js`, [WEB.md](./WEB.md)) fetches its pinned Emscripten and
 builds mbedTLS, SDL3 and the codecs for wasm once into `build/wasm/`, beside the
 native trees.
 
@@ -1020,7 +1020,7 @@ focus.
 - **Shortcuts are suppressed while a modal is open** — a modal owns the window, and
   opening a second surface behind it would leave two things claiming the screen.
   Esc and Enter reach it through `modal_key`.
-- Test with `scripts/gui/drive.sh key ctrl+k` (also `alt+shift+up`, `ctrl+slash`, `esc`).
+- Test with `tools/gui/drive.sh key ctrl+k` (also `alt+shift+up`, `ctrl+slash`, `esc`).
   The verb says which modifiers it holds (`g_synth_mods`, which `mod_down` reads
   in place of the keyboard's state), because the shortcuts read the modifiers;
   posting a bare key proves nothing.
@@ -1273,7 +1273,7 @@ release number is a label on a build and is not in either binary, so the build
 is what is shown. **Copy** puts the whole as one line on the clipboard --
 `OpenChime client <build> (win32), server <build>, protocol <n>` -- for pasting
 into a report; the harness's `about` verb opens the dialog and answers that
-line, which `make test-merge` checks (TESTING.md §3.4).
+line, which the full suite checks (TESTING.md §3.4).
 
 ### What the window says, and where (REQ-263)
 

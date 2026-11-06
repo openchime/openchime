@@ -1,4 +1,4 @@
-"""What scripts/test/release/windows.sh reads in the Windows packages.
+"""What scripts/test/full/windows.sh reads in the Windows packages.
 
     windows_files.py pe <file> [file-version] [product-version]
         The file is a 64-bit x86 PE (PE32+, AMD64); with a version given, its

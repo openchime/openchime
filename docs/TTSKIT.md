@@ -328,9 +328,8 @@ it makes existing renders again rather than mixing them; it does not change by i
 - sentences, with weak forms, capitals and pause marks;
 - loading without data (everything spelled);
 - both data files against their SHA-256 pins;
-- the C guesser against Phonetisaurus's decoder on the reference words: every tenth of the
-  3,010 in `make test` (all but one identical), all 3,010 with `OC_TEST_FULL=1` (at least
-  999 in 1,000 identical);
+- the C guesser against Phonetisaurus's decoder on all 3,010 reference words (at least 999
+  in 1,000 identical; all but one are);
 - truncated files, a wrong magic and a newer version, each refused on load with a reason.
 
 ## 10. Limits

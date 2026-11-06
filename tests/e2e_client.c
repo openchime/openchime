@@ -1,4 +1,4 @@
-/* Black-box end-to-end client, driven by ci.yml's build job against a
+/* Black-box end-to-end client, driven by the full suite (scripts/test/full/e2e.sh) against a
  * natively-run daemon (TESTING.md §3.2). Connects over TLS and drives the real
  * vertical: two clients handshake, sign in on the daemon's page
  * (tests/testsignin.h) and present the token on AUTH, one SENDs, and both must

@@ -1,7 +1,7 @@
 # RPM packaging for the OpenChime daemon (ARCH-20).
 #
 # This spec packages an already-built binary rather than building one. The
-# staging build builds each architecture once against the oldest glibc it supports and
+# release-candidate builds each architecture once against the oldest glibc it supports and
 # feeds that same binary to the .deb, the .rpm and the tarball, so all three
 # carry an identical artifact instead of three builds that merely share a source
 # tree. %build is therefore empty on purpose.

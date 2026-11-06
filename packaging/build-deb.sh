@@ -6,7 +6,7 @@
 # rules file to produce the same archive, and the repo's posture is a
 # hand-written Makefile with no autotools (ARCH-35).
 #
-# It packages a binary rather than building one, deliberately. The staging build
+# It packages a binary rather than building one, deliberately. The release-candidate
 # builds each architecture once against the oldest glibc it supports and packages that
 # same binary as .deb, .rpm and .tar.gz -- so all three carry an identical
 # artifact rather than three builds that merely came from the same source.

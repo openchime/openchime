@@ -1,25 +1,26 @@
-# scripts/test/lib.sh: sourced by every test in scripts/test/, never run.
+# scripts/test/lib/common.sh: sourced by every test script, never run.
 #
-# Every test CI runs is one script in this directory, called by a make target;
-# the workflows call only the targets (docs/TESTING.md §4). Each script starts
-# with the same header: what it proves, its arguments, what it needs, and the
-# target that runs it.
+# The tests come in two suites (docs/TESTING.md): the fast one, scripts in
+# scripts/test/fast/, run by `make test` before every push; and the full one,
+# scripts in scripts/test/full/, run by `make test-all` in CI, once per
+# release-candidate. A make target calls the scripts; the workflows call only
+# the targets. Each script starts with the same header: what it proves, its
+# arguments, what it needs, and the target that runs it. Which suites of
+# build/tests belong to which is SUITES[] in tests/main.c, read back with
+# `build/tests --list fast|full|threads`.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 TEST=$(basename "$0" .sh)
 
-# The suites whose code runs threads -- the loop and its I/O threads, the
-# writer and readers, the worker pools, the client, the recorder and player.
-# `make test-merge` runs them under ThreadSanitizer (merge/tsan.sh) and the
-# others plainly (merge/suites.sh), so each runs once there. A suite with no
-# thread cannot race, and instrumenting it only makes it slower.
-TSAN_SUITES=run_netloop_tests,run_client_core_tests,run_dbwriter_tests,run_ioloop_tests,run_authpool_tests,run_xferpool_tests,run_slow_blob_tests,run_storage_tests,run_blob_s3_tests,run_blob_cache_tests,run_media_tests,run_video_media_tests,run_tts_worker_tests,run_stt_tests,run_push_tests,run_invite_mail_tests,run_enroll_tests,run_tls_tests,run_signin_tests,run_acme_tests,run_relaykeys_tests,run_summary_tests,run_share_media_tests
-
-# The suites too slow for the minute `make test` has (measured; the times
-# make test prints at the end, slowest first). They run in make test-merge on
-# every pull request; locally, local/suites.sh skips them.
-SLOW_SUITES=run_netloop_tests,run_client_core_tests,run_dbwriter_tests,run_media_tests
+# suites fast|full|threads <test binary command...>: the names the binary
+# lists (`--list`), comma-separated, as OC_TEST_ONLY takes them.
+suites() {
+    local which=$1 out; shift
+    out=$("$@" --list "$which") || fail "$* --list $which failed"
+    [ -n "$out" ] || fail "$* --list $which names no suite"
+    tr '\n' ',' <<<"$out" | sed 's/,$//'
+}
 
 # error <message>: say what failed -- as an annotation in GitHub Actions, as a
 # line on stderr anywhere else -- and go on. fail <message>: the same, then

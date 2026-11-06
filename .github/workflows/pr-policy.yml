@@ -1,7 +1,10 @@
-# Pull request policy. The title becomes the commit subject once merged
-# (squash-only merges, repo setting), so the title is checked here, beside
-# the attribution scan and the tree's issue references.
-# The body must be empty; the description lives in the issue, not the PR.
+# Pull request policy, and the only thing that runs on a pull request: policy,
+# not tests. The fast suite ran locally before the push (.githooks/pre-push),
+# and the full suite runs once per release-candidate (docs/TESTING.md). The
+# title becomes the commit subject once merged (squash-only merges, repo
+# setting), so the title is checked here, beside the attribution scan and the
+# tree's issue references, each by its one rule in scripts/policy/. The body
+# must be empty; the description lives in the issue, not the PR.
 name: pr-policy
 
 on:
@@ -46,11 +49,11 @@ jobs:
           REF: ${{ github.ref }}
           BEFORE: ""
           AFTER: ""
-        run: scripts/release/attribution_scan.sh
+        run: scripts/policy/attribution_scan.sh
       # A pull request that changes only documentation skips the local test run
       # (.githooks/pre-push), so the tree's no-issue-numbers rule is checked
       # here over the pull request's tree, with the base branch's copy of
-      # scripts/test/local/refs.sh: nothing of the pull request's runs.
+      # scripts/policy/refs.sh: nothing of the pull request's runs.
       - name: No issue numbers in the tree
         env:
           BASE: ${{ github.base_ref }}
@@ -58,10 +61,10 @@ jobs:
           set -euo pipefail
           git worktree add -q "$RUNNER_TEMP/base" "origin/${BASE}"
           git worktree add -q "$RUNNER_TEMP/head" HEAD
-          # A base from before the source checks moved to scripts/test/local/
-          # has its copy under scripts/check/.
-          refs="$RUNNER_TEMP/base/scripts/test/local/refs.sh"
-          [ -f "$refs" ] || refs="$RUNNER_TEMP/base/scripts/check/refs.sh"
+          # A base from before the policy checks moved to scripts/policy/ has
+          # its copy among the fast suite's old source checks.
+          refs="$RUNNER_TEMP/base/scripts/policy/refs.sh"
+          [ -f "$refs" ] || refs="$RUNNER_TEMP/base/scripts/test/local/refs.sh"
           cd "$RUNNER_TEMP/head" && sh "$refs"
       - name: Title and body
         env:
@@ -77,20 +80,9 @@ jobs:
           set -uo pipefail
           fail=0
 
-          # GitHub appends the pull request number in parentheses when it
-          # squashes, so the committed subject is longer than the title.
-          # Check what will actually be committed.
-          SUBJECT="${TITLE} (#${NUMBER})"
-
-          if ! grep -qE '^OC-[0-9]+: [A-Z]([^[:cntrl:]]*[^.,;:!?[:space:]])?$' <<<"$TITLE"; then
-            echo "::error::Title must read 'OC-<issue>: Capitalised description' with no trailing punctuation. Got: ${TITLE}"
-            fail=1
-          fi
-
-          if [ "${#SUBJECT}" -gt 72 ]; then
-            echo "::error::Subject will be ${#SUBJECT} chars once GitHub appends ' (#${NUMBER})', limit 72."
-            fail=1
-          fi
+          # The title by the one subject rule, measured as the squash will
+          # commit it, with this pull request's number appended.
+          scripts/policy/subject.sh "$TITLE" "$NUMBER" || fail=1
 
           if [ -n "${BODY//[$'\r\n\t ']/}" ]; then
             echo "::error::Pull request body must be empty. The description belongs in the issue."

@@ -10,6 +10,7 @@
 # out of the microphone for voice input (ARCH-112, docs/AUDIO.md §6). The daemon
 # never links it. scripts/build/media_wasm.sh builds the same sources for the web.
 set -euo pipefail
+NO_AUTOTOOLS="ACLOCAL=: AUTOCONF=: AUTOMAKE=: AUTOHEADER=:"
 
 TARGET="${1:-native}"
 # The version committed in third_party/speexdsp; the build directories carry it.
@@ -37,8 +38,11 @@ if [ ! -f "${DEST}/lib/libspeexdsp.a" ]; then
     # ships a generated configure, so no autotools are needed.
     "${SRC}/configure" ${HOST} --prefix="$(cd .. && pwd)" \
       --disable-shared --enable-static --with-pic --disable-examples >/dev/null
-    make -j"$(nproc)" >/dev/null
-    make install >/dev/null
+    # The tarball's generated files are older than the sources a checkout
+    # writes beside them, so make would regenerate them with automake, which
+    # nothing here needs or installs: the regeneration commands are no-ops.
+    make -j"$(nproc)" $NO_AUTOTOOLS >/dev/null
+    make install $NO_AUTOTOOLS >/dev/null
   )
 fi
 

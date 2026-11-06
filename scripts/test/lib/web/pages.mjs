@@ -2,7 +2,7 @@
 // pages from a browser"): a headless Chromium types into the forms as a person
 // does and submits them, so what the browser sends -- its Origin under the
 // pages' referrer policy, its handling of the 303 -- is what is proven, not
-// what a scripted client sends. scripts/test/merge/web.sh runs it.
+// what a scripted client sends. scripts/test/full/web.sh runs it.
 //
 //   node scripts/test/lib/web/pages.mjs <origin> <setup-token-hex> <challenge> <callback-url> [chromium]
 //

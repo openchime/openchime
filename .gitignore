@@ -1,7 +1,7 @@
 openchimed
 # Read-aloud's data directory, assembled by `make` beside the binary.
 /tts/
-# The web client the daemon serves, placed beside the binary by `make web`.
+# The web client the daemon serves, placed beside the binary by its build.
 /web/
 /build/
 # Release artefacts (.deb/.rpm/.tar.gz and the stripped binary they share),
@@ -39,7 +39,7 @@ dist/
 .playwright-mcp/
 __pycache__/
 /stt/
-# The web harness's Playwright library (package.json), installed by scripts/web/drive.sh.
+# The web harness's Playwright library (package.json), installed by tools/web/drive.sh.
 node_modules/
 package-lock.json
 
