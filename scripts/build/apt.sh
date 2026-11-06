@@ -23,7 +23,8 @@ set -euo pipefail
 [ "$#" -gt 0 ] || { echo "usage: apt.sh <package>..." >&2; exit 2; }
 missing=()
 for p in "$@"; do
-  dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' || missing+=("$p")
+  status=$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null || true)
+  [ "$status" = "install ok installed" ] || missing+=("$p")
 done
 if [ "${#missing[@]}" -eq 0 ]; then
   echo "apt.sh: $* already installed; nothing fetched"

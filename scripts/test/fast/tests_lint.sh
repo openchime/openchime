@@ -19,8 +19,8 @@
 #            line before: /* contract: <why> */
 #   tmp      a "/tmp/ literal: a path every run, every suite and every checkout
 #            shares. tests/testenv.h's oc_test_mkdtemp gives each its own.
-# In .github/workflows/*.yml, and in the scripts under scripts/test/ and
-# scripts/release/smoke/ that run under pipefail:
+# In .github/workflows/*.yml, and in the scripts under scripts/test/,
+# scripts/release/smoke/ and scripts/build/ that run under pipefail:
 #   pipe     `| grep -q` in a step that runs under pipefail: grep -q exits at
 #            its first match, the writer dies on the closed pipe, and pipefail
 #            turns a match into a failure. Capture first, then grep the
@@ -208,7 +208,7 @@ while IFS= read -r -d '' f; do
     if [ -n "$out" ]; then
         while IFS= read -r line; do report "tests_lint: $line"; done <<<"$out"
     fi
-done < <(list scripts/test '*.sh'; list scripts/release/smoke '*.sh')
+done < <(list scripts/test '*.sh'; list scripts/release/smoke '*.sh'; list scripts/build '*.sh')
 
 if [ $found != 0 ]; then
     echo "tests_lint: the tests wait on outcomes, compare markers rather than words, and share no paths (docs/TESTING.md \"Brittle tests\")" >&2

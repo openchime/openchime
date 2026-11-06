@@ -22,4 +22,7 @@ if [ ! -x "$dir/rclone" ]; then
   rm -f "$dir/r.zip"
 fi
 if [ -n "${GITHUB_PATH:-}" ]; then echo "$dir" >> "$GITHUB_PATH"; fi
-"$dir/rclone" version | head -1
+# The first line of its version, read whole first: a pipe into head would close
+# on rclone, and under pipefail its SIGPIPE fails the script.
+version=$("$dir/rclone" version)
+echo "${version%%$'\n'*}"
