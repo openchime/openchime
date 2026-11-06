@@ -63,6 +63,21 @@ WEB_CORE_CC = $(EMCC) $(WEB_CFLAGS) -Ishared $(CORE_INC) -Iclient/shared -Ithird
 $(eval $(call oc_obj_rules,build/wasm/gui,WEB_GUI_CC,$(EMCC),$(WEB_SDL3)/lib/libSDL3.a $(WEB_MBEDTLS)/libmbedtls.a $(WEB_MEDIA_LIBS)))
 $(eval $(call oc_obj_rules,build/wasm/core,WEB_CORE_CC,$(EMCC),$(WEB_MBEDTLS)/libmbedtls.a))
 -include $(WEB_GUI_OBJS:.o=.d) $(WEB_CORE_OBJS:.o=.d)
+# WEB_PREBUILT: a directory holding a web client already built for this build
+# id (build/web from another job, with its .build_id), taken as it is: no
+# Emscripten, no compile, no link. The release-candidate's stage takes the
+# test job's this way, so the client is built once (docs/CONTRIBUTING.md,
+# "Billed minutes"); one built for another id is refused.
+WEB_PREBUILT ?=
+ifneq ($(WEB_PREBUILT),)
+$(WEB_DIR)/openchime.js: $(WEB_PREBUILT)/openchime.js
+	@[ "$$(cat $(WEB_PREBUILT)/.build_id 2>/dev/null)" = "$(OC_BUILD_ID)" ] || \
+	    { echo "web: $(WEB_PREBUILT) was built for build '$$(cat $(WEB_PREBUILT)/.build_id 2>/dev/null)', not '$(OC_BUILD_ID)'" >&2; exit 1; }
+	mkdir -p $(WEB_DIR) web
+	cp -r $(WEB_PREBUILT)/. $(WEB_DIR)/
+	cp $(WEB_DIR)/openchime.wasm web/
+	gzip -9 -n -c web/openchime.wasm > web/openchime.wasm.gz
+else
 $(WEB_DIR)/openchime.js: $(WEB_GUI_OBJS) $(WEB_CORE_OBJS) client/gui/platform/web/openchime.html $(EMCC)
 	mkdir -p $(WEB_DIR)
 	$(EMCC) $(WEB_GUI_OBJS) $(WEB_CORE_OBJS) $(WEB_MBEDTLS)/libmbedtls.a $(WEB_MBEDTLS)/libmbedx509.a $(WEB_MBEDTLS)/libmbedcrypto.a $(WEB_SDL3)/lib/libSDL3.a \
@@ -80,6 +95,7 @@ $(WEB_DIR)/openchime.js: $(WEB_GUI_OBJS) $(WEB_CORE_OBJS) client/gui/platform/we
 	mkdir -p web
 	cp $(WEB_DIR)/openchime.wasm web/
 	gzip -9 -n -c web/openchime.wasm > web/openchime.wasm.gz
+endif
 web: $(WEB_DIR)/openchime.js
 
 # The page and the loader as C arrays for the daemon (daemon/webapp.h). The

@@ -18,6 +18,6 @@
 . "$(dirname "$0")/../lib/common.sh"
 scripts/test/fast/opcodes.sh shared/protocol.h
 scripts/policy/refs.sh
-for check in make_targets config release_lint tests_lint notices web_driver shipped_issues; do
+for check in make_targets config release_lint tests_lint notices web_driver shipped_issues workflow_rules; do
     scripts/test/fast/$check.sh
 done

@@ -72,16 +72,17 @@ RELCC_STAMP := $(RELCC_DIR)/.cc
 $(RELCC_STAMP): FORCE | build-dir
 	@mkdir -p $(dir $@)
 	@echo '$(RELEASE_CC)' | cmp -s - $@ || echo '$(RELEASE_CC)' > $@
-RELCC_DAEMON_CC   = $(RELEASE_CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS)
 RELCC_TEST_CC     = $(RELEASE_CC) $(CFLAGS) $(TEST_INC)
-RELCC_DAEMON_OBJS := $(call oc_objs,$(RELCC_DIR)/daemon,$(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC))
 RELCC_TEST_OBJS   := $(call oc_objs,$(RELCC_DIR)/test,$(RELEASE_CC_TEST_SRC))
 RELCC_VENDOR      := $(ZIG) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A)
-$(eval $(call oc_obj_rules,$(RELCC_DIR)/daemon,RELCC_DAEMON_CC,$(RELCC_STAMP) $(FEATURES_STAMP) $(BUILD_ID_STAMP),$(RELCC_VENDOR),@))
 $(eval $(call oc_obj_rules,$(RELCC_DIR)/test,RELCC_TEST_CC,$(RELCC_STAMP),$(RELCC_VENDOR),@))
--include $(RELCC_DAEMON_OBJS:.o=.d) $(RELCC_TEST_OBJS:.o=.d)
-check-release-cc: $(RELCC_DAEMON_OBJS) $(RELCC_TEST_OBJS)
-	@echo "check-release-cc: $(words $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(RELEASE_CC_TEST_SRC)) sources clean"
+-include $(RELCC_TEST_OBJS:.o=.d)
+# The daemon's own sources are not compiled here: the release-candidate's stage
+# compiles them with this compiler for the release (make RELEASE=1), and a
+# warning there fails it the same way (docs/CONTRIBUTING.md, "Billed minutes":
+# no check twice).
+check-release-cc: $(RELCC_TEST_OBJS)
+	@echo "check-release-cc: $(words $(RELEASE_CC_TEST_SRC)) sources clean"
 
 # --- Tool binaries, built by path ---------------------------------------------
 # The e2e client the full suite drives against a natively-run daemon

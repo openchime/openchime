@@ -58,7 +58,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - id: next
+      - timeout-minutes: 10
+        id: next
         name: Build the Documentation snapshot
         run: |
           set -euo pipefail
@@ -105,6 +106,7 @@ jobs:
       # A plain push: a fast-forward of the main the snapshot was built on, so
       # one that moved since refuses it.
       - name: Move main
+        timeout-minutes: 5
         if: steps.next.outputs.made == 'true'
         env:
           KEY: ${{ secrets.RELEASE_SSH_KEY }}
@@ -126,6 +128,7 @@ jobs:
       # A fast-forward only: a main there that is not an ancestor of main here
       # is never overwritten, and is reported as an error to put right by hand.
       - name: Copy main to the public repository
+        timeout-minutes: 10
         if: vars.PUBLIC_REPO != ''
         continue-on-error: true
         env:

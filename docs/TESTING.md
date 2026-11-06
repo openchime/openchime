@@ -56,7 +56,8 @@ steps CI runs one after another (`mk/full.mk`):
   source checks and actionlint; every suite that starts no thread, the `FULL`
   ones included, and `media`, plainly with timing judged (§2.4); the
   static-link check; the end-to-end run against a natively-run daemon (§3.2);
-  every Linux source through the release's compiler under `-Werror`; the
+  the client and test sources through the release's compiler under `-Werror`
+  (the daemon's are compiled with it by the release build in `stage`); the
   speech round trip; the web client in a headless Chrome, its objects' header
   dependencies and the GUI smoke on the web (§3.4); and each fuzzing harness
   for its fixed inputs, one at a time, inside 20 seconds in all (§2.2b);
@@ -1230,10 +1231,10 @@ policy. The full suite runs in `release-candidate.yml`, once per
 release-candidate, the code tests through `test-all.yml`; the workflows and
 what each job covers are CONTRIBUTING.md "CI".
 
-Nothing is checked twice within a suite: each suite runs once, plainly or,
-if it starts threads, under the sanitizer, which judges races and not speed
-(only `media` runs in both, for its speed verdicts, §2.4);
+Nothing is checked twice: each suite runs once, plainly or, if it starts
+threads, under the sanitizer, which judges races and not speed (§2.4);
 one clang compile is both the release-compiler and the second-compiler check,
+and the daemon's release compile is `stage`'s alone;
 and the end-to-end run (§3.2) is the one thing the in-process suites cannot
 show, since they link the daemon's code without its `main()`. Of the GUI
 scripts only the smoke runs in a suite, the full one, on the web platform

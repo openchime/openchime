@@ -203,6 +203,19 @@ rather than billed.
 
 GitHub bills every job rounded up to a whole minute, plus its set-up. So each workflow has the fewest jobs its environments allow: `release-candidate.yml` runs `test`, `stage` and `publish`; `release.yml` runs `prepare`, `deploy` and `finish`, and `unreserve` only after a failure; `pr-policy.yml` and `promote.yml` run one job each. There is no dry run: `prepare` refuses before anything changes. A failure is found locally first: the fast suite runs before every push.
 
+The same eight rules hold in all three repositories, in these words:
+
+1. **Build once, reuse by key.** What one job builds, a later job or run reuses by a key of what it was built from; nothing is built twice.
+2. **The release repeats no work the release-candidate did.** It checks what it was given, by digest, and publishes it.
+3. **No duplicate checks.** One step owns each check, and no other step repeats it.
+4. **Tools are pinned binaries in a cache.** An `apt` install is only for a package the runner image lacks, and says why on the line before (`# apt: …`).
+5. **The full suite stops at its first failure.** A failed run bills no further than the failure.
+6. **Every network step has a timeout.** Every job, and every step that reaches the network, has `timeout-minutes`; an advisory step has one attempt and a minute.
+7. **The same job shape in all three.** No job is merged across environments.
+8. **The full suite prints its parts' times**, so where the time goes is in its log.
+
+`scripts/test/fast/workflow_rules.sh`, in `make test`, holds rules 4 and 6.
+
 ## CI
 
 One workflow runs on a pull request, and nothing runs on a push.
@@ -293,7 +306,7 @@ A release takes one release-candidate, by its tag:
 | Job | Environment | What it does |
 |---|---|---|
 | `prepare` | `release` | Refuses any ref but a release-candidate's tag; resolves it to its commit and number; checks every credential and the public tracker's token; fetches the stored build and verifies it; checks the number is the next one and that `main` can take the commit; then, last, reserves the number as the `release-N` tag. |
-| `deploy` | `release` | Packages the build under N (`.deb`, `.rpm`, tarballs), builds the Windows installer and MSIX (signed when configured), moves `main`, publishes the apt and dnf repositories to both buckets, the GitHub release and the images, then verifies what it published (`scripts/release/smoke.sh`). |
+| `deploy` | `release` | Publishes the packages the release-candidate wrapped under N (`.deb`, `.rpm`, tarballs; `prepare` refuses a build wrapped under another number), builds the Windows installer and MSIX (signed when configured), moves `main`, publishes the apt and dnf repositories to both buckets, the GitHub release and the images, then verifies what it published (`scripts/release/smoke.sh`). |
 | `finish` | `release` | Closes the shipped issues, sends the release notes, removes the release-candidates of N, and copies `main`, `staging`, the tag and the release to the public repository; a failure in any part is reported and the rest still run. |
 | `unreserve` | `release` | Only after a failure before anything was published: returns the number. |
 

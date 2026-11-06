@@ -93,6 +93,12 @@ $(BIN): $(DAEMON_OBJS) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(SQLITE
 # that copy and ship without its client.
 ifeq ($(ARCH_SUFFIX),)
 MANIFEST_BIN := $(BIN)
+else ifneq ($(MANIFEST_HOST_BIN),)
+# MANIFEST_HOST_BIN: a daemon already built for this machine, which writes the
+# manifests instead of a host daemon built for the purpose. The
+# release-candidate's arm64 step passes the amd64 release binary it built
+# moments before (docs/CONTRIBUTING.md, "Billed minutes": nothing built twice).
+MANIFEST_BIN := $(MANIFEST_HOST_BIN)
 else
 MANIFEST_DIR := build/manifest-host
 MANIFEST_BIN := $(MANIFEST_DIR)/openchimed

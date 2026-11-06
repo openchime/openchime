@@ -64,6 +64,7 @@ jobs:
       # repository without it makes none. A called workflow sees its caller's
       # ref, commit, run number and variables.
       - name: Refuse any other ref or repository
+        timeout-minutes: 5
         env:
           REF: ${{ github.ref }}
           REPO: ${{ github.repository }}
@@ -102,6 +103,7 @@ jobs:
       # main applies on it). Asked again by publish, inside the `release`
       # group, before the number is taken.
       - name: The commit is staging's tip, and main can take it
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           git fetch --quiet --tags --force origin "+refs/heads/main:refs/remotes/origin/main" "+refs/heads/staging:refs/remotes/origin/staging"
@@ -162,6 +164,7 @@ jobs:
           # (scripts/test/full/fuzz.sh). ffmpeg only for ffprobe, which the
           # media suite runs over a recorded file as an independent validator
           # -- nothing links it; without it the check is a SKIP, a failure here.
+          # apt: nasm, gdb, libclang-rt-18-dev and ffmpeg are not on the runner image
           scripts/build/apt.sh bzip2 nasm gdb xz-utils libclang-rt-18-dev ffmpeg
       # Restored here and saved, each only when it missed, as soon as
       # `make build-all PART=plain` has built it: a cache saved at the end of
@@ -278,9 +281,22 @@ jobs:
       # package.json pins.
       - name: Install the browser driver
         run: npm install --no-audit --no-fund
+      # Built under the release's build id, so the web client built here is the
+      # one stage packages (WEB_PREBUILT, mk/web.mk): it is built once.
       - name: make build-all PART=plain
         timeout-minutes: 60
+        env:
+          OC_BUILD_ID: ${{ steps.id.outputs.build_id }}
         run: make build-all PART=plain
+      - name: Keep the web client for stage
+        run: printf '%s\n' "${{ steps.id.outputs.build_id }}" > build/web/.build_id
+      - uses: actions/upload-artifact@v7
+        with:
+          name: web-client
+          path: build/web
+          include-hidden-files: true
+          retention-days: 1
+          if-no-files-found: error
       - name: Save the toolchains
         if: steps.c-toolchains.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
