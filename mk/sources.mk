@@ -76,9 +76,20 @@ APP_SRC  := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES
 # The fuzzing tier's harnesses and decoder list (tests/fuzz/fuzz.h): in the test
 # binary, which replays their corpora, and in each libFuzzer binary
 # (mk/tests.mk, build/fuzz/%). tests/fuzz/main.c and seeds.c are the tools'.
+# This is the one list of them: the full suite runs each (scripts/test/full/
+# fuzz.sh, given the list and the dictionaries by make), and docs/TESTING.md
+# says what each fuzzes. FUZZ_DICT_<harness> is the dictionary a harness
+# takes (tests/fuzz/*.dict), none where unset.
 FUZZ_HARNESSES   := frame framebuf http ws proxy json cbor jwt webauthn idtoken
 FUZZ_HARNESS_SRC := tests/fuzz/decoders.c $(patsubst %,tests/fuzz/%.c,$(FUZZ_HARNESSES))
-TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/bench_loop.c tests/testsignin_main.c,$(wildcard tests/*.c)) \
+FUZZ_DICT_frame    := tests/fuzz/frame.dict
+FUZZ_DICT_framebuf := tests/fuzz/frame.dict
+FUZZ_DICT_http     := tests/fuzz/http.dict
+FUZZ_DICT_json     := tests/fuzz/json.dict
+FUZZ_DICT_jwt      := tests/fuzz/json.dict
+FUZZ_DICT_idtoken  := tests/fuzz/json.dict
+FUZZ_DICT_webauthn := tests/fuzz/json.dict
+TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/testsignin_main.c,$(wildcard tests/*.c)) \
             $(FUZZ_HARNESS_SRC)
 TEST_BIN := build/tests
 
@@ -169,7 +180,7 @@ TUI_SRC := $(wildcard client/tui/*.c) $(wildcard client/shared/secret_*.c)
 # both the POSIX and Windows TUI. The QR code the device-code sign-in shows
 # (tk_qr, AUTH.md §8.11): Nayuki's qrcodegen, MIT, vendored at v1.8.0.
 QRCODEGEN  := third_party/qrcodegen/qrcodegen.c
-TUIKIT_SRC := $(filter-out tuikit/demo.c,$(wildcard tuikit/*.c)) $(QRCODEGEN)
+TUIKIT_SRC := $(wildcard tuikit/*.c) $(QRCODEGEN)
 TUIKIT_INC := -Ituikit -Ithird_party/qrcodegen
 # The core's local store (client/core/store.c) embeds NO database engine
 # (ARCH-88/REQ-201): the credential store holds the token + pin and the workspace
@@ -178,7 +189,7 @@ TUIKIT_INC := -Ituikit -Ithird_party/qrcodegen
 # The platform credential backend (client/shared/secret_*.c, one entry point in
 # secret_os.h): libsecret on Linux when the dev package is present, Windows
 # Credential Manager on the Windows builds. Without libsecret it compiles a stub
-# that reports "no keyring" -- `make linux` still builds, but that machine then
+# that reports "no keyring" -- the Linux TUI still builds, but that machine then
 # persists no session token at all (a credential is never written to plaintext).
 ifeq ($(shell pkg-config --exists libsecret-1 && echo yes),yes)
   SECRET_CFLAGS := $(shell pkg-config --cflags libsecret-1) -DOC_HAVE_LIBSECRET

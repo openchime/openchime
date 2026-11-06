@@ -2,7 +2,7 @@
 // load screen counts the download in bytes, names each stage after it and
 // comes down when the client has drawn; the wasm and the loader arrive
 // gzipped; and a second load in the same browser downloads next to nothing,
-// every route revalidated to 304. scripts/test/merge/web.sh runs it.
+// every route revalidated to 304. scripts/test/full/web.sh runs it.
 //
 //   node scripts/test/lib/web/load.mjs <origin> <spki-sha256-base64> [chromium]
 //

@@ -5,9 +5,9 @@
 # the same binary the .deb, the .rpm and the tarball ship, read-aloud and
 # voice input included -- so nothing compiles here and no RUN step exists,
 # which is what lets `buildah build --arch arm64` produce the arm64 image on
-# an x86 machine with no emulation (.github/workflows/staging-build.yml).
+# an x86 machine with no emulation (.github/workflows/release-candidate.yml).
 #
-#   make full                                   # or: make RELEASE=1 ARCH=aarch64 ...
+#   make RELEASE=1 TTS=1 STT=1 SUM=1 WEB=1 openchimed tts/manifest stt/manifest   # ARCH=aarch64 for arm64
 #   packaging/build-tarball.sh <version> <arch> openchimed dist
 #   packaging/image-context.sh dist/openchimed-<version>-linux-<arch>.tar.gz image
 #   buildah build --arch <arch> -f Dockerfile -t openchime:<version> image

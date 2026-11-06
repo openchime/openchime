@@ -3,7 +3,7 @@
 # main is a line of snapshot commits, fast-forward only (scripts/release/
 # main_next.sh). This appends one, "Documentation": main's tree with every
 # documentation-only commit on staging that main has not taken yet
-# (scripts/release/docs_only.sh) applied on top, in staging's order, each named
+# (scripts/policy/docs_only.sh) applied on top, in staging's order, each named
 # with its patch-id in a "Docs:" trailer. One that does not apply to main, or
 # that names a setting main's daemon/config_table.c does not have, is skipped
 # and named, and the rest go on; it reaches main with the release that carries its
@@ -72,9 +72,9 @@ jobs:
       # What main is about to take, checked first: each documentation commit it
       # carries and the snapshot itself are scanned for a banned reference,
       # which refuses the promotion; each commit's subject is held to the
-      # commit policy, which only warns, as in the staging build; and the tree
+      # commit policy, which only warns, as in release-candidate's gate; and the tree
       # main would have is scanned for issue references by its own
-      # scripts/test/local/refs.sh, the one main will carry: staging's may be
+      # scripts/policy/refs.sh, the one main will carry: staging's may be
       # stricter, and the files that would fail it reach main only with the
       # next release. The documentation promoted met staging's in pr-policy.
       - name: Check what main takes
@@ -85,21 +85,21 @@ jobs:
           BASE_REF: ""
         run: |
           set -euo pipefail
-          BEFORE="$FROM" AFTER="$TO" scripts/release/attribution_scan.sh
+          BEFORE="$FROM" AFTER="$TO" scripts/policy/attribution_scan.sh
           docs=$(git log -1 --format='%(trailers:key=Docs,valueonly,separator=%x0A)' "$TO" | awk 'NF {print $1}')
           for d in $docs; do
-            BEFORE="${d}^" AFTER="$d" scripts/release/attribution_scan.sh
-            if ! BEFORE="${d}^" GITHUB_SHA="$d" scripts/release/commit_policy.sh 2>&1 | sed -u 's/^::error::/::warning::/'; then
+            BEFORE="${d}^" AFTER="$d" scripts/policy/attribution_scan.sh
+            if ! BEFORE="${d}^" GITHUB_SHA="$d" scripts/policy/commit_policy.sh 2>&1 | sed -u 's/^::error::/::warning::/'; then
               echo "::warning::$(git log -1 --format='%h %s' "$d") does not meet the commit policy; reported, not enforced"
             fi
           done
           tree="$RUNNER_TEMP/next-main"
           mkdir -p "$tree"
           git archive "$TO" | tar -x -C "$tree"
-          # A main from before the source checks moved to scripts/test/local/
-          # has its copy under scripts/check/.
-          refs=./scripts/test/local/refs.sh
-          [ -f "$tree/$refs" ] || refs=./scripts/check/refs.sh
+          # A main from before the policy checks moved to scripts/policy/ has
+          # its copy among the fast suite's old source checks.
+          refs=./scripts/policy/refs.sh
+          [ -f "$tree/$refs" ] || refs=./scripts/test/local/refs.sh
           (cd "$tree" && sh "$refs")
 
       # A plain push: a fast-forward of the main the snapshot was built on, so

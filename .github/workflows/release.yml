@@ -1,16 +1,18 @@
 # Publish a release of the daemon (ARCH-20).
 #
-# A release is a RELEASE-CANDIDATE given a number. staging-build.yml tests and
-# builds everything from a staging commit and stores it by its build id, the
-# short commit; release-candidate.yml publishes a stored build in this
+# A release is a RELEASE-CANDIDATE given a number. release-candidate.yml runs
+# the full suite on a staging commit, builds everything a release ships from
+# it, stores that by its build id, the short commit, and publishes it in this
 # repository as release-N-rcK; this workflow takes one release-candidate by
-# its tag, fetches what the staging build stored,
+# its tag, fetches what the release-candidate stored,
 # verifies the signed manifest, appends the Release N snapshot to main (the
 # candidate's tree with the documentation promoted since applied on top;
 # scripts/release/main_next.sh; fast-forward only), tags release-N on the
 # candidate's commit, packages the same binaries under N and publishes. No
-# compiler runs here: what was built and verified for the release-candidate is
-# what ships, and a release takes minutes. Five channels come out of one run,
+# compiler runs here and no test: what was built and verified for the
+# release-candidate is what ships, and a release takes minutes. The one check
+# after publishing is the release's verification of what it published
+# (scripts/release/smoke.sh). Five channels come out of one run,
 # all carrying the same number:
 #
 #   apt      Debian/Ubuntu, GPG-signed repository in object storage
@@ -316,7 +318,6 @@ jobs:
     environment: release
     outputs:
       build_id: ${{ steps.id.outputs.build_id }}
-      run_number: ${{ steps.id.outputs.run_number }}
     env:
       SHA: ${{ needs.resolve.outputs.sha }}
       DIST_S3_ENDPOINT:           ${{ vars.DIST_S3_ENDPOINT }}
@@ -353,33 +354,19 @@ jobs:
           endpoint = ${DIST_S3_ENDPOINT}
           region = ${DIST_S3_REGION}
           EOF
+      # The build, verified as release-candidate.yml verified it before it
+      # tagged it (scripts/release/verify_candidate.sh): the manifest's
+      # signature and every file, the commit, the build id the daemon reports
+      # and the image's digest.
       - name: Fetch and verify the candidate
         id: id
         env:
           IMAGE_REGISTRY_TOKEN_BUILD: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
         run: |
           set -euo pipefail
-          [ -n "$IMAGE_REGISTRY_TOKEN_BUILD" ] || { echo "::error::IMAGE_REGISTRY_TOKEN_BUILD is not set in the release environment"; exit 1; }
           id="${SHA:0:7}"
-          scripts/release/candidate_fetch.sh "$id" candidate
-          run=$(python3 -c 'import json; print(json.load(open("candidate/manifest.json"))["run_number"])')
-          sha=$(python3 -c 'import json; print(json.load(open("candidate/manifest.json"))["sha"])')
-          [ "$sha" = "$SHA" ] || { echo "::error::the build is for ${sha}, not the release-candidate's ${SHA}"; exit 1; }
+          scripts/release/verify_candidate.sh "$id" "$SHA" candidate
           echo "build_id=$id" >> "$GITHUB_OUTPUT"
-          echo "run_number=$run" >> "$GITHUB_OUTPUT"
-          # The binary says what it is: unpacked and asked, so the id in the
-          # manifest is the id the code carries, not merely the directory's name.
-          mkdir -p check && tar xzf "candidate/linux-amd64/openchimed-build-${id}-linux-amd64.tar.gz" -C check
-          got=$("check/openchimed-build-${id}-linux-amd64/openchimed" --version)
-          echo "$got"
-          grep -q "^openchimed ${id} " <<<"$got" || { echo "::error::the candidate's daemon reports '$got', not build ${id}"; exit 1; }
-          # And the image the release will re-tag exists, with the digest the
-          # manifest recorded.
-          want=$(python3 -c 'import json,sys; print(json.load(open("candidate/manifest.json"))["images"]["build-'"$id"'"])')
-          have="sha256:$(skopeo inspect --raw --creds "${IMAGE_REGISTRY_USER}:${IMAGE_REGISTRY_TOKEN_BUILD}" \
-                           "docker://${BUILD_IMAGE}:build-${id}" | sha256sum | cut -d' ' -f1)"
-          [ "$have" = "$want" ] || { echo "::error::${BUILD_IMAGE}:build-${id} is ${have}, the manifest says ${want}"; exit 1; }
-          echo "image ${BUILD_IMAGE}:build-${id} matches the manifest"
       # One artifact per platform, named candidate-<platform>, never
       # `linux-*` or `windows-*`: those names are the packaged files publish
       # downloads, and a candidate tree among them would be published. A
@@ -492,10 +479,9 @@ jobs:
           echo "reserved release-${N} on ${SHA:0:7}"
 
   # The candidate's tree, packaged under the release number: the .deb, the
-  # .rpm and the tarball from the one binary, with the identical-binary and
-  # install checks run again on the real ones (the staging build's other
-  # package checks -- glibc floor, unit file, speech -- are not repeated).
-  # Seconds, not the hour a build took.
+  # .rpm and the tarball from the one binary, by the scripts the
+  # release-candidate's full suite checked them with (under a placeholder
+  # version). Seconds, not the hour a build took.
   package:
     name: ${{ matrix.arch }} packages
     needs: [version, candidate, resolve]
@@ -539,12 +525,6 @@ jobs:
           # both architectures' files under one prefix, and two named alike
           # collide there.
 
-      # The packages carry the candidate's binary, and it is the build the
-      # candidate names, installs and speaks (scripts/test/release/, the same
-      # target the staging build ran on this binary).
-      - name: make test-release PART=packages
-        run: make test-release PART=packages DIST="$DIST" PKG_VERSION="$VERSION" PKG_ARCH="${{ matrix.arch }}"
-
       # The artifact is NAMED for the platform, and the publish job downloads
       # without merge-multiple. That combination is what rebuilds dist/<platform>/
       # on the other side: upload-artifact strips the common path prefix, so the
@@ -576,7 +556,6 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.number }}
       BUILD_ID: ${{ needs.candidate.outputs.build_id }}
-      BUILD_NUM: ${{ needs.candidate.outputs.run_number }}
       SIGN: ${{ !inputs.dry_run && secrets.TRUSTED_SIGNING_ENDPOINT != '' && secrets.TRUSTED_SIGNING_ACCOUNT != '' && secrets.TRUSTED_SIGNING_PROFILE != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' }}
       PLATFORM: windows-x64
       DIST: dist/windows-x64
@@ -596,7 +575,7 @@ jobs:
           ls -la build
       - name: Install the packaging tools
         timeout-minutes: 20
-        run: scripts/build/apt.sh nsis python3-pefile
+        run: scripts/build/apt.sh nsis
       # makemsix is built from pinned source on first use (scripts/build/
       # makemsix.sh); kept by that script's hash, so a release restores it.
       - name: Restore makemsix
@@ -662,12 +641,6 @@ jobs:
           else
             echo "Artifact Signing is partially set ($ts_set of 6; missing: $ts_missing), so signing was skipped. Set the missing ones to turn it back on; nothing else needs changing." >> "$GITHUB_STEP_SUMMARY"
           fi
-
-      # What ships, checked by the target a person runs too
-      # (scripts/test/release/windows.sh): the binaries name the candidate's
-      # build, and the installer and the MSIX carry the release number.
-      - name: make test-release PART=windows
-        run: make test-release PART=windows WIN_BIN=build WIN_DIST="$DIST" PKG_VERSION="$VERSION"
 
       # The GUI's DWARF, split out by the Makefile and referenced by a
       # .gnu_debuglink in the shipped .exe. It has to travel in THIS artifact:
@@ -1112,8 +1085,8 @@ jobs:
       - uses: actions/checkout@v7   # for scripts/build/apt.sh
         with:
           ref: ${{ needs.resolve.outputs.sha }}
-      # The smoke test of what this release published (scripts/smoketest.sh,
-      # every check in scripts/smoke/): the apt repository installs it, the dnf
+      # The release's verification of what it published
+      # (scripts/release/smoke.sh, every check in scripts/release/smoke/): the apt repository installs it, the dnf
       # repository installs it on rockylinux:9 (the oldest RHEL the glibc 2.34
       # floor exists to support), each index lists this release once more, and
       # the released image pulls and runs. Every check runs even when one
@@ -1123,7 +1096,7 @@ jobs:
       # mask a genuinely broken repository later.
       - name: Install podman and rclone
         run: scripts/build/apt.sh podman rclone
-      - name: scripts/smoketest.sh
+      - name: scripts/release/smoke.sh
         env:
           APT_EXPECT: ${{ needs.publish.outputs.apt_expect }}
           RPM_EXPECT: ${{ needs.publish.outputs.rpm_expect }}
@@ -1135,7 +1108,7 @@ jobs:
           DIST_S3_MIRROR_SECRET_KEY: ${{ secrets.DIST_S3_MIRROR_SECRET_KEY }}
           DIST_MIRROR_BUCKET:        ${{ vars.DIST_MIRROR_BUCKET }}
           IMAGE_REGISTRY_TOKEN: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
-        run: scripts/smoketest.sh ${{ inputs.skip_repo_smoke && '--skip-repos' || '' }}
+        run: scripts/release/smoke.sh ${{ inputs.skip_repo_smoke && '--skip-repos' || '' }}
 
       - name: Note the skipped smoke test
         if: ${{ inputs.skip_repo_smoke }}

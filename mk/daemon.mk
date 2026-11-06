@@ -70,9 +70,9 @@ endif
 # files like ours.
 DAEMON_CC   = $(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS)
 DAEMON_OBJS := $(call oc_objs,$(OBJ_DIR)/daemon,$(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC))
-$(eval $(call oc_obj_rules,$(OBJ_DIR)/daemon,DAEMON_CC,$(CC_STAMP) $(FEATURES) $(BUILD_ID_STAMP) $(TOOLCHAIN_DEPS),$(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS)))
+$(eval $(call oc_obj_rules,$(OBJ_DIR)/daemon,DAEMON_CC,$(CC_STAMP) $(FEATURES_STAMP) $(BUILD_ID_STAMP) $(TOOLCHAIN_DEPS),$(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS)))
 -include $(DAEMON_OBJS:.o=.d)
-$(BIN): $(DAEMON_OBJS) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP) $(FEATURES) $(TOOLCHAIN_DEPS)
+$(BIN): $(DAEMON_OBJS) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP) $(FEATURES_STAMP) $(TOOLCHAIN_DEPS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ $(DAEMON_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(SUM_LIBS) $(ORT_LIBS) $(SUM_CXX) $(LDFLAGS)
 
@@ -83,9 +83,10 @@ $(BIN): $(DAEMON_OBJS) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(SQLITE
 # writes them. It is built with NO features: the manifest names each model's
 # version, a constant of the sources, over hashes of the data, and neither
 # needs an engine linked in -- so the arm64 build no longer compiles the host's
-# ONNX Runtime and llama.cpp for a binary that only writes two files. Its own
-# features file and binary path, so a developer's remembered features and host
-# daemon are left as they were; and its own generated sources, objects,
+# ONNX Runtime and llama.cpp for a binary that only writes two files. Its
+# switches on its command line and nothing remembered (REMEMBER=0) and its own
+# binary path, so a developer's remembered features and host daemon are left
+# as they were; and its own generated sources, objects,
 # compiler stamp, build-id stamp and SQLite and Argon2 objects, because under
 # `make -j` it runs while this build does: sharing $(GEN_DIR) it would rewrite
 # webapp_res.c without the web client, and the cross-built daemon would link
@@ -98,7 +99,7 @@ MANIFEST_BIN := $(MANIFEST_DIR)/openchimed
 $(MANIFEST_BIN): FORCE
 	@mkdir -p $(dir $@)
 	@$(MAKE) --no-print-directory ARCH=$(HOST_ARCH) RELEASE=0 CC=cc CXX=c++ OC_ARCH= \
-	    TTS=0 STT=0 SUM=0 WEB=0 FEATURES=$(MANIFEST_DIR)/.features BIN=$@ \
+	    TTS=0 STT=0 SUM=0 WEB=0 REMEMBER=0 BIN=$@ \
 	    GEN_DIR=$(MANIFEST_DIR)/gen OBJ_DIR=$(MANIFEST_DIR)/obj CC_STAMP=$(MANIFEST_DIR)/.cc \
 	    BUILD_ID_STAMP=$(MANIFEST_DIR)/.build_id SQLITE_O=$(MANIFEST_DIR)/sqlite3.o ARGON2_O=$(MANIFEST_DIR)/argon2.o $@
 endif

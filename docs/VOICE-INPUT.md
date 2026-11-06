@@ -120,7 +120,7 @@ daemon holds 0.1 MB more with voice input built in than without it.
   the little-endian samples in host order before hearing them.
 - **Its own data directory and manifest** — `/usr/share/openchime/stt`, else
   `stt/` beside the executable — so missing data
-  turns voice input off without touching read-aloud. `make STT=1` builds it in
+  turns voice input off without touching read-aloud. `make openchimed STT=1` builds it in
   (CONFIG.md "Build switches").
 - **Spoken mentions:** before posting or returning, "at" followed by a name becomes
   `@name` when it names exactly one member of the channel; the daemon holds the
@@ -168,6 +168,6 @@ stays for clients that cannot carry a model.
 | `make test` — canceller | the ERLE harness: echo removed, re-convergence under drift, near-end speech kept in double-talk |
 | `make test` — recognition worker | stub engine: order, full queue, idle release, the token ceiling |
 | `make test` — daemon | the `STT_*` frames; the capability and cap; order, cap, rate, a chunk out of order, a failed recognition; off, and no engine as with missing data; free talk posts through the send path, idempotently, refused for an archived channel or a non-member, and never after its speaker has left; mention normalisation |
-| `make test` — client core | free talk arrives as `BROADCAST`s in order with no client `SEND`; push to talk's words wait for the composer they were spoken into, and nothing is sent; one microphone owner |
-| Staging build (`staging-build.yml`), stripped and packaged | read-aloud renders a sentence and `openchimed --stt-hear` must hear its words — built, stripped, and installed from the `.deb` |
-| GUI harness, Win32 and web (`scripts/gui/run.sh --web voice`) | `scripts/gui/voice.sh`: a synthetic microphone speaking a recorded sentence (`OPENCHIME_DEV_MIC`) — push to talk by key, mouse and UI Automation puts the words in the composer unsent; free talk posts them; leaving the conversation and opening the recorder end the session; a microphone the OS blocks is reported as that; absent with voice input off |
+| Full suite — client core | free talk arrives as `BROADCAST`s in order with no client `SEND`; push to talk's words wait for the composer they were spoken into, and nothing is sent; one microphone owner |
+| Full suite (`make test-all`, in the release-candidate), stripped and packaged | read-aloud renders a sentence and `openchimed --stt-hear` must hear its words — built, stripped, and installed from the `.deb` |
+| GUI harness, Win32 and web (`tools/gui/run.sh --web voice`) | `tools/gui/voice.sh`: a synthetic microphone speaking a recorded sentence (`OPENCHIME_DEV_MIC`) — push to talk by key, mouse and UI Automation puts the words in the composer unsent; free talk posts them; leaving the conversation and opening the recorder end the session; a microphone the OS blocks is reported as that; absent with voice input off |

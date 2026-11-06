@@ -44,7 +44,7 @@ or broken is not a document — it is the
 | [AUTH.md](docs/AUTH.md) | The two authentication modes — local Argon2id accounts and OIDC brokered by a central relay — and the daemon-issued session both converge on. |
 | [TLS.md](docs/TLS.md) | How the daemon terminates TLS and how a client trusts it: trust-on-first-use certificate pinning against a self-signed cert, with no CA anywhere on the client-facing path. |
 | [CONFIG.md](docs/CONFIG.md) | Every environment variable the daemon reads, with its default and meaning. There is no configuration file. |
-| [TESTING.md](docs/TESTING.md) | The test strategy and its two tiers, what CI runs, the measured capacity benchmark, and the GUI's harnesses, the boot check first among them. |
+| [TESTING.md](docs/TESTING.md) | The two test suites -- the fast one before every push, the full one once per release-candidate -- and what each runs, the measured capacity benchmark, and the GUI's harnesses, the boot check first among them. |
 | [MARKDOWN.md](docs/MARKDOWN.md) | The message-formatting dialect — a Slack-compatible subset plus real lists — where it is parsed, and the places it deliberately differs. |
 | [CALLS.md](docs/CALLS.md) | Calls: the Calls section, starting, inviting, ending and missed calls, the call view, and the end-to-end encryption — device keys, per-sender keys sealed with HPKE, packets in SFrame — with what it does and does not guarantee; and screen sharing in calls — the codec as a wire contract, fragments, NACKs and keyframe requests inside the encryption, rate control, and the Windows surfaces. |
 | [AUDIO.md](docs/AUDIO.md) | A call's audio: the relay that never decodes, the client engine — echo cancellation, noise suppression, Opus with FEC and DTX, the adaptive jitter buffer, the mixer — and the ERLE harness that measures the canceller. |
@@ -58,7 +58,7 @@ or broken is not a document — it is the
 | [SSO.md](docs/SSO.md) | Signing in with your own OpenID Connect provider (Google Workspace, Entra ID, Okta, Keycloak): the operator's half of AUTH.md §8.5. |
 | [TUIKIT.md](docs/TUIKIT.md) | The in-tree TUI widget toolbox the terminal client is built on — deliberately generic, and knowing nothing about chat. |
 | [VENDORS.md](docs/VENDORS.md) | Every third-party dependency, how it enters the build, and its licence. |
-| [CONTRIBUTING.md](docs/CONTRIBUTING.md) | Branch, commit and CI policy, including the attribution guard that runs on every pull request, in every staging build and before documentation is promoted to `main`. |
+| [CONTRIBUTING.md](docs/CONTRIBUTING.md) | Branch, commit and CI policy, including the attribution guard that runs on every pull request, in every release-candidate and before documentation is promoted to `main`. |
 | [UPGRADING.md](docs/UPGRADING.md) | For operators: build ids and release numbers, how to upgrade, and what an upgrade changes. |
 
 The daemon is the **chat core**. On the foundations — the
@@ -193,35 +193,43 @@ is statically linked. Debian bullseye (glibc 2.31) is too old.
   `PATH`. A release whose installer is not code-signed says so in its notes,
   and SmartScreen warns before running it.
 - **Terminal client on Linux:** not in the packages; build it from source
-  (`make linux`) and run `build/openchime-tui <workspace>`, or
+  (`make build/openchime-tui`) and run `build/openchime-tui <workspace>`, or
   `build/openchime-tui <host> <port>` to connect to an address directly.
 
 ## Local build (daemon)
 
 ```
-make          # the daemon alone, in a minute or two: no speech, no summaries, no web client
-make full     # everything: read-aloud, voice input, summaries, the web client, and every client
+make build      # the fast build (a bare `make`): the daemon alone, and the Windows clients
+make test       # the fast suite, before every push (docs/TESTING.md)
+make run TTS=1 STT=1 SUM=1 WEB=1   # every feature: read-aloud, voice input, summaries, the web client
 ```
 
 Requires a C toolchain, Python 3, bzip2, and curl with network access on the
 first build: SQLite is in `third_party/`, and mbedTLS is fetched pinned and
 checksummed by `scripts/build/mbedtls.sh` (a `.tar.bz2`); both are built once.
 Python 3 generates the sources the daemon embeds (its web page and password
-list).
-`make full` also needs CMake, a C++17 compiler, git, xz and nasm (libvpx's x86
-assembly); it fetches its own pinned Emscripten and llvm-mingw
-(`mk/toolchains.mk`), and its first run compiles ONNX Runtime (about 20
-minutes). The switches it turns
-on (`TTS`, `STT`, `SUM`, `WEB`) are remembered in `build/.features`, so a later
-`make` rebuilds the same daemon; one at a time works too (`make SUM=1`), and
-`make distclean` forgets them. `make ARCH=aarch64` cross-builds the daemon for
-arm64 into `build/aarch64/` (build only), and `make RELEASE=1` builds the host's
-as the release does, with zig against glibc 2.34; zig is fetched only for
-these two and for the release-compiler check in `make test-merge`.
-`make OC_BUILD_ID=<commit>` stamps the build id into `openchimed --version`;
-an unstamped build reports `dev`. There is one build: the tests, the GUI and
-web harness and the demo scripts run it with `OPENCHIME_MODE=development`,
-which a deployment never sets (CONFIG.md, "Mode").
+list). `make build` also cross-builds the Windows clients with the pinned
+llvm-mingw it fetches (`mk/toolchains.mk`); nasm builds libvpx's x86 assembly.
+`make build` and `make test` always build the one configuration, whatever was
+asked before, with a job per CPU.
+
+Anything else is built by its path. The daemon's switches (`TTS`, `STT`,
+`SUM`, `WEB`) need CMake, a C++17 compiler, git and xz besides; it fetches
+its own pinned Emscripten, and the first build with `TTS` or `STT` compiles
+ONNX Runtime (about 20 minutes). `make run` builds the daemon with the data
+read-aloud and voice input need beside it, and the Linux TUI, and starts it
+(below); `make openchimed` builds the daemon alone. The switches are
+remembered in `build/.features`, so a later `make openchimed` or `make run`
+builds the same daemon; `make distclean` forgets them. `make openchimed ARCH=aarch64`
+cross-builds the daemon for arm64 into `build/aarch64/` (build only), and
+`make openchimed RELEASE=1` builds the host's as the release does, with zig
+against glibc 2.34; zig is fetched only for these two and for the full suite's
+release-compiler check. `make openchimed OC_BUILD_ID=<commit>` stamps the build
+id into `openchimed --version`; an unstamped build reports `dev`. There is one
+build: the tests, the GUI and web harness and the demo scripts run it with
+`OPENCHIME_MODE=development`, which a deployment never sets (CONFIG.md,
+"Mode"). `make build-all` and `make test-all`, the full build and suite, run
+in CI only.
 
 To build the distributable packages from an already-built binary:
 
@@ -232,13 +240,13 @@ packaging/build-tarball.sh <version> amd64 ./openchimed dist
 ```
 
 Note the release binaries are **not** built with the host toolchain. The
-staging build compiles them with
+release-candidate compiles them with
 [`zig cc`](https://ziglang.org) targeting `glibc 2.34`, the oldest supported
 target, because a binary linked against a newer glibc will not start on an older
 one — and every hosted runner carries a newer one. Zig ships glibc stub
 libraries for each version and links against whichever it is told to, so the
 floor holds without a container, and the arm64 daemon comes off the same x86
-runner (`make RELEASE=1 ARCH=aarch64`). The staging build asserts the result rather
+runner (`make RELEASE=1 ARCH=aarch64`). The full suite asserts the result rather
 than trusting it: if the built binary needs a symbol above `GLIBC_2.34`, the
 build fails. Linux runners build everything, the Windows installer and MSIX
 included (NSIS and makemsix, signed with jsign when configured); nothing in the
@@ -250,7 +258,7 @@ The client ([docs/CLIENT.md](docs/CLIENT.md)) is **one shared C app-core with a
 native UI per platform** (the tdlib model, ARCH-74). The app-core
 (`client/core/`) is frontend-agnostic — it links the daemon's exact `shared/`
 wire code, owns the network thread and the view-model, and is driven headlessly
-by `make test` (`tests/test_client_core.c`).
+by the full suite (`tests/test_client_core.c`, `make test-all`).
 
 The **web client** (`docs/WEB.md`) is the same graphical client -- one
 portable application over a per-platform directory (`client/gui/app/`,
@@ -259,11 +267,11 @@ through a canvas backend and the protocol inside a WebSocket. **The daemon
 serves it**: open the workspace's address in a browser, sign in on the daemon's
 own page, and the client is there -- the page and loader are compiled into the
 daemon and the wasm ships beside it, so a daemon always serves the client that
-matches it. Building the web client needs Emscripten, which `make WEB=1` and
-`make full` fetch pinned; a plain `make` leaves the web client out, and the
+matches it. Building the web client needs Emscripten, which `make openchimed
+WEB=1` fetches pinned; `make build` leaves the web client out, and the
 released packages carry it.
 
-One frontend is a **TUI** (`make linux`, built on the in-tree `tuikit`
+One frontend is a **TUI** (`make build/openchime-tui`, built on the in-tree `tuikit`
 toolbox over termbox2 + utf8proc, ARCH-83), built on the host like the daemon and
 also shipping on Windows (ARCH-81). It is menu- and screen-driven — panels, context
 menus, dialogs, and a Ctrl+K command palette; there are no slash commands. It
@@ -292,7 +300,7 @@ toolbar (REQ-220/ARCH-100), drafts, scheduled send, the notification schedule
 with keywords and priority people, cross-channel threads, the People directory
 and link-unfurl cards all run end to end with their daemon halves.
 
-**The GUI smoke.** `scripts/gui/smoke.sh` asks whether the client boots and
+**The GUI smoke.** `tools/gui/smoke.sh` asks whether the client boots and
 runs, in about ten seconds, by hand before pushing a client change (TESTING.md
 "Reading the GUI smoke"). See [TESTING.md](docs/TESTING.md).
 
@@ -369,7 +377,7 @@ See [LICENSING.md](LICENSING.md) for the full map, including `third_party/`.
   profile's memory and CPU ceiling (ARCH-4, REQ-210) in a systemd user scope,
   but on this machine's disk, network and kernel, so constrained-resource
   behaviour is approximated rather than reproduced.
-- The container image is exercised by the staging build's image checks
+- The container image is exercised by the full suite's image checks
   (TESTING.md §3.2: started, asked `/healthz`, replicated and restored) and by
   the release's smoke, which pulls the released tag and asks it `--version`.
   The end-to-end suite drives a natively-built daemon, not the image.

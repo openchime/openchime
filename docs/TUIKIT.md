@@ -56,7 +56,7 @@ structs and drives them from its own event loop.
 ## Color model
 
 The toolbox runs in **256-color** mode (`tb_set_output_mode(TB_OUTPUT_256)`) — set by the app
-and the demo at startup. Widgets never hardcode palette indices; they draw through the semantic
+at startup. Widgets never hardcode palette indices; they draw through the semantic
 tokens `tk_theme_active()` returns.
 
 One gotcha is baked in: termbox2's named color constants (`TB_RED`, `TB_GREEN`, …) are
@@ -96,12 +96,9 @@ supplies a function that formats item *i* into a styled string. This is the rule
 ## Build
 
 Compiled into the TUI targets (repo style — one gcc invocation, no separate archive step):
-`TUIKIT_SRC := $(filter-out tuikit/demo.c,$(wildcard tuikit/*.c)) $(QRCODEGEN)` +
-`TUIKIT_INC` (`-Ituikit -Ithird_party/qrcodegen`), added to both
-`linux` and `windows` (`demo.c` is filtered out — it carries its own `main()`).
+`TUIKIT_SRC := $(wildcard tuikit/*.c) $(QRCODEGEN)` +
+`TUIKIT_INC` (`-Ituikit -Ithird_party/qrcodegen`), added to both the Linux
+and the Windows TUI.
 `tk_term` owns the Windows console backend. `termbox2.h`/`utf8proc`/`qrcodegen` stay
 vendored in `third_party/`. (An `ar` archive of `tuikit/*.o` would make it reusable
 elsewhere; no target builds one.)
-
-`tuikit/demo.c` (`make build/tuikit-demo`) exercises each widget standalone — the library's own
-smoke, no daemon needed.

@@ -1,8 +1,8 @@
 # The toolchains, pinned and fetched by make (docs/VENDORS.md §2, "Toolchains"):
 # zig for the release's Linux compiler and the arm64 cross-build, Emscripten
 # for the web client, llvm-mingw for the Windows clients. Each is a SHA-checked
-# download under third_party/ made by its script on first use, so `make full`
-# needs nothing installed beyond cc, cmake, python3, git, curl, xz, bzip2 and
+# download under third_party/ made by its script on first use, so the full
+# build needs nothing installed beyond cc, cmake, python3, git, curl, xz, bzip2 and
 # nasm (libvpx's x86 assembly). The directories go first on PATH for every
 # recipe and script, so a machine-wide install is never picked up by accident;
 # a bump is a version and a sum in the script.
@@ -34,7 +34,7 @@ CXX_WRAP    := build/cxx-$(ARCH)
 override CC := $(CURDIR)/$(CC_WRAP)
 CXX         := $(CURDIR)/$(CXX_WRAP)
 export CC CXX
-$(CC_WRAP) $(CXX_WRAP) &: $(ZIG) scripts/release/zig_cc.sh | build
+$(CC_WRAP) $(CXX_WRAP) &: $(ZIG) scripts/release/zig_cc.sh | build-dir
 	@printf '#!/bin/sh\nexec %s/scripts/release/zig_cc.sh cc %s -- "$$@"\n' "$(CURDIR)" "$(TARGET)" > $(CC_WRAP)
 	@printf '#!/bin/sh\nexec %s/scripts/release/zig_cc.sh c++ %s -- "$$@"\n' "$(CURDIR)" "$(TARGET)" > $(CXX_WRAP)
 	@chmod +x $(CC_WRAP) $(CXX_WRAP)

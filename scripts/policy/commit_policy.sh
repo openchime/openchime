@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# The commit policy for the commits <before>..<commit>: every commit has a house
+# subject (scripts/policy/subject.sh, the one rule), no body but its sign-off,
+# and no merge among them. pr-policy checks the title before the squash; this
+# checks what the squash committed, which is where a Co-authored-by trailer
+# GitHub adds shows up. Run, warning only, by release-candidate's gate and by
+# promote, on staging's commits; never on main's snapshot commits, which the
+# pipeline writes.
+#
+#   BEFORE=<before>  scripts/policy/commit_policy.sh   (on $GITHUB_SHA)
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+ZERO=0000000000000000000000000000000000000000
+
+if [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "$ZERO" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+  RANGE="${BEFORE}..${GITHUB_SHA}"
+elif [ -z "$(git log -1 --format=%P "$GITHUB_SHA")" ]; then
+  RANGE="$GITHUB_SHA"
+else
+  RANGE="${GITHUB_SHA}~1..${GITHUB_SHA}"
+fi
+echo "checking $RANGE"
+
+# Resolve the range ONCE, and fail if it cannot be resolved. The
+# fail-open trap: `if [ -n "$(git rev-list ...)" ]` and `for c in
+# $(git rev-list ...)` don't trip `set -e` on a failed command
+# substitution, so an unresolvable range yields an empty list, zero
+# loop iterations, and "commit policy ok" having checked nothing.
+if ! MERGE_LIST=$(git rev-list --merges "$RANGE"); then
+  echo "::error::could not resolve $RANGE; refusing to report success"
+  exit 1
+fi
+if ! COMMIT_LIST=$(git rev-list --no-merges "$RANGE"); then
+  echo "::error::could not resolve $RANGE; refusing to report success"
+  exit 1
+fi
+MERGES=()
+COMMITS=()
+[ -n "$MERGE_LIST" ] && mapfile -t MERGES <<<"$MERGE_LIST"
+[ -n "$COMMIT_LIST" ] && mapfile -t COMMITS <<<"$COMMIT_LIST"
+
+# A merge produces a tree no single commit produced, and the policy
+# below is keyed to one commit's subject. Reject them outright.
+if [ "${#MERGES[@]}" -gt 0 ]; then
+  echo "::error::This push contains merge commits. Squash, or fast-forward."
+  printf '  %s\n' "${MERGES[@]}"
+  exit 1
+fi
+
+echo "checking ${#COMMITS[@]} commit(s)"
+
+fail=0
+for c in "${COMMITS[@]}"; do
+  subject=$(git log -1 --format=%s "$c")
+
+  # A root commit predates any issue to scope it to.
+  [ -z "$(git log -1 --format=%P "$c")" ] && { echo "  ${c:0:8} root, exempt"; continue; }
+
+  # The subject, by the one rule; its reasons named with the commit.
+  if ! why=$(GITHUB_ACTIONS= "$here/subject.sh" "$subject" 2>&1); then
+    while IFS= read -r line; do echo "::error::${c:0:8}: ${line#subject: }"; done <<<"$why"
+    fail=1
+  fi
+
+  # THE REASON THIS CHECK EXISTS. The one line a body may hold is
+  # a DCO sign-off: every commit must carry one (CONTRIBUTING.md), and
+  # GitHub copies it into the squash even with a BLANK message. Anything
+  # else, a Co-authored-by trailer included, still fails. The `|| true`
+  # is load-bearing: a body that is ONLY the sign-off leaves grep with no
+  # output, grep exits 1, and under the runner's `bash -e` plus pipefail
+  # that kills the step silently -- a failure with no error printed.
+  body=$(git log -1 --format=%b "$c" \
+         | { grep -vE '^Signed-off-by: [^<]+ <[^>]+>$' || true; } \
+         | sed '/^[[:space:]]*$/d')
+  if [ -n "$body" ]; then
+    echo "::error::${c:0:8} has a commit body; subjects here stand alone."
+    printf '%s\n' "$body" | head -2 | sed 's/^/    /'
+    fail=1
+  fi
+done
+
+[ "$fail" = 0 ] && echo "commit policy ok" || exit 1

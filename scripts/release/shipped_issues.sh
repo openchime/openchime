@@ -51,7 +51,7 @@ else
 fi
 
 # Resolved ONCE, and a failure to resolve is reported rather than read as "no
-# commits" -- the fail-open trap scripts/release/commit_policy.sh documents.
+# commits" -- the fail-open trap scripts/policy/commit_policy.sh documents.
 if ! commits=$(git rev-list --no-merges --reverse "$range"); then
   warn "could not resolve $range"
   exit 1

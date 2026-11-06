@@ -49,7 +49,7 @@
  * IRawElementProviderSimple but not the fragment/text interfaces. Rather than
  * fail the cross-build on a toolchain nobody ships from, compile a stub that
  * says the feature is unavailable — and keep CI on a toolchain that has them, so
- * the real path is the one actually compiled (see .github/workflows/staging-build.yml). */
+ * the real path is the one actually compiled (see .github/workflows/release-candidate.yml). */
 #ifndef __IRawElementProviderFragment_INTERFACE_DEFINED__
 #warning "UIA provider interfaces missing from this toolchain - accessibility disabled"
 void oc_a11y_init(SDL_Window *w) { (void)w; }

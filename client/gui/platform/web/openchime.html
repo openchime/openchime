@@ -41,7 +41,7 @@ canvas{display:block;outline:none}
   const q = new URLSearchParams(location.search);
   // The mode (CONFIG.md "Mode"): `normal` as built, rewritten by the daemon
   // that serves this page when it runs in development mode (daemon/webapp.c),
-  // and by scripts/web/serve.py. Never read from the address: only on a page
+  // and by tools/web/serve.py. Never read from the address: only on a page
   // from a development daemon do the harness's inputs below (?hook=, ?shot=,
   // ?cmd=, ?env=, ?mic=) do anything, so a link cannot turn them on.
   const mode = /*OC_MODE*/'normal';
@@ -83,7 +83,7 @@ canvas{display:block;outline:none}
   // The test hook (OPENCHIME_DEV_DIR, TESTING.md), on the page's filesystem,
   // when the page is opened with ?hook=1: ocHook('verb args') answers the ack,
   // and ?shot=<ms> logs the client's own screenshot as SHOT:<base64 BMP> after
-  // that many milliseconds -- what scripts/test/merge/web.sh reads.
+  // that many milliseconds -- what scripts/test/full/web.sh reads.
   // ?hook=1 is kept for the tab: the sign-in leaves the page and comes back
   // to /app/ without the query, and the harness still wants the hook there.
   if (dev && q.get('hook') === '1') { try { sessionStorage.setItem('oc.hook', '1'); } catch (e) {} }

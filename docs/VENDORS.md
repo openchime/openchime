@@ -151,16 +151,16 @@ first use, pinned by version and SHA-256 in its script (Emscripten by its emsdk
 tag, whose own table pins the sum of everything it installs), into `third_party/`,
 and puts it first on `PATH` for every recipe and vendor script, so nothing
 depends on what a machine or a runner image happens to have installed.
-`make full` needs only cc and c++ (C++17), make, cmake, python3, git, curl, xz, bzip2 and nasm beyond them.
+The full build needs only cc and c++ (C++17), make, cmake, python3, git, curl, xz, bzip2 and nasm beyond them.
 A bump is the version and the sum in one script and a pull request, built and
-tested by the next staging build (dispatched by hand); `.github/workflows/toolchains.yml` files an issue monthly when upstream
-has moved (`scripts/check/toolchains.sh`).
+tested by the next release-candidate (dispatched by hand); `tools/toolchains.sh`, run by hand, says when upstream
+has moved.
 
 | Toolchain | Version | Script | Builds | License |
 |-----------|---------|--------|--------|---------|
-| **zig** (its bundled clang and lld) | 0.17.1 | `scripts/build/zig.sh` | the release's Linux daemon against glibc 2.34 (`make RELEASE=1`), the arm64 daemon cross-built from x86 (`make ARCH=aarch64`), and CI's second-compiler pass (`make test-merge`) | MIT |
-| **Emscripten** (emsdk) | 6.0.13 | `scripts/build/emsdk.sh` | the web client (`make web`) and the loader compiled into a `WEB=1` daemon; brings its own Node for the web client's checks (`make test-merge`) | MIT / NCSA |
-| **llvm-mingw** (clang, lld, LLVM binutils, mingw-w64 headers and CRT) | 20261020 | `scripts/build/llvm_mingw.sh` | the Windows GUI and TUI and their libraries (`make windows`), through the `x86_64-w64-mingw32-*` names | Apache-2.0 with LLVM exception; mingw-w64 under its own permissive terms |
+| **zig** (its bundled clang and lld) | 0.17.1 | `scripts/build/zig.sh` | the release's Linux daemon against glibc 2.34 (`make RELEASE=1`), the arm64 daemon cross-built from x86 (`make ARCH=aarch64`), and the full suite's second-compiler pass (`make test-all`) | MIT |
+| **Emscripten** (emsdk) | 6.0.13 | `scripts/build/emsdk.sh` | the web client (`make build/web/openchime.js`) and the loader compiled into a `WEB=1` daemon; brings its own Node for the web client's checks (`make test-all`) | MIT / NCSA |
+| **llvm-mingw** (clang, lld, LLVM binutils, mingw-w64 headers and CRT) | 20261020 | `scripts/build/llvm_mingw.sh` | the Windows GUI and TUI and their libraries (`make build`), through the `x86_64-w64-mingw32-*` names | Apache-2.0 with LLVM exception; mingw-w64 under its own permissive terms |
 | **makemsix** (Microsoft msix-packaging, with CMake 3.31.6 to build it) | commit `25a65f5` | `scripts/build/makemsix.sh` | the Windows client's MSIX, on Linux (`packaging/build-windows.sh`); built from source because no release compiles with a current clang | MIT (makemsix); BSD-3-Clause (CMake) |
 | **WinShell** (NSIS plugin) | the NSIS wiki's `WinShell.zip`, SHA-256 pinned | `scripts/build/nsis_plugins.sh` | the installer's Start-menu shortcut AppUserModelID (`packaging/windows/openchime.nsi`); `makensis` itself is Ubuntu's `nsis` | zlib |
 | **jsign** | 7.6 | `scripts/build/jsign.sh` | Authenticode signing of the Windows binaries and installer against Azure Trusted Signing, on Linux (`scripts/release/sign_windows.sh`) | Apache-2.0 |
@@ -195,7 +195,7 @@ exits. Override for a new version with `MBEDTLS_SHA256=<sum>`.
 `scripts/build/sdl3_windows.sh` fetches the pinned release tarball
 (SHA-256-verified, refuses an unpinned bump), cross-builds a **static-only**
 `libSDL3.a` with llvm-mingw into `third_party/sdl3-3.4.14-win/` (gitignored), and
-`make windows` links it. SDL's own build is CMake; the script invoking
+`make build` links it. SDL's own build is CMake; the script invoking
 it is the same arrangement as invoking mbedTLS's make — the dependency's build
 system stays its own business, and this tree's stays make. It is a
 large dependency, fetched pinned rather than committed. zlib-licensed: no notice needs to travel with a shipped
@@ -222,7 +222,7 @@ say because ONNX Runtime is the one C++ dependency and the model is large:
   linked against ONNX Runtime's **prebuilt** full release (also pinned; a build tool
   on the build machine only, `scripts/build/onnxruntime.sh converter`). The converted file is
   not byte-reproducible, so its input and the converter are what is pinned.
-- `make TTS=1` assembles the converted model, the voices and ttskit's data into
+- `make run TTS=1` (or `make tts/manifest TTS=1`) assembles the converted model, the voices and ttskit's data into
   `tts/` beside `openchimed` (CONFIG.md "Build switches").
 
 ONNX Runtime (MIT, with its ThirdPartyNotices), Kitten (Apache-2.0) and CMUdict
@@ -235,7 +235,7 @@ operator config (`daemon/ort.ops.config`) is the union of both models':
   dated CDN directory, and its licence from GitHub at a pinned commit, at pinned
   SHA-256s, refusing a mismatch. They load in ONNX
   Runtime 1.30.0 as published, so nothing is converted.
-- `make STT=1` assembles them into `stt/` beside `openchimed` with a manifest the
+- `make run STT=1` (or `make stt/manifest STT=1`) assembles them into `stt/` beside `openchimed` with a manifest the
   daemon checks at startup.
 
 Moonshine's MIT notice travels with every package through `packaging/licenses.sh`.
@@ -250,7 +250,7 @@ dependency, built the same way:
   baseline. The archives are merged into one
   `third_party/llamacpp-0.5.0/lib/libllamacpp.a` beside `llama.h` and the ggml
   headers. It needs CMake 3.14+ and a C++17 compiler, and takes a few minutes. The
-  daemon links it with the same static C++ runtime as ONNX Runtime. `make SUM=1`
+  daemon links it with the same static C++ runtime as ONNX Runtime. `make openchimed SUM=1`
   builds it in.
 - **The model is never shipped**: the daemon fetches it at the first start with
   summaries on, from its Hugging Face address, and checks a pinned SHA-256
@@ -260,7 +260,7 @@ dependency, built the same way:
 
 llama.cpp's MIT notice travels with every package through `packaging/licenses.sh`.
 
-**The web client** (`make web`) builds its own copies with Emscripten into
+**The web client** (`make build/web/openchime.js`) builds its own copies with Emscripten into
 `build/wasm/` (gitignored): `scripts/build/mbedtls_wasm.sh` from the fetched
 mbedTLS tree, `scripts/build/sdl3_wasm.sh` from the same pinned, SHA-256-verified
 SDL3 release, and `scripts/build/media_wasm.sh` for libvpx, libopus and speexdsp from
@@ -278,7 +278,7 @@ container image; their versions track the OS, not this repo.
 | **libsecret** *(optional)* | OS keyring (Secret Service) backend for the session token on Linux (`client/shared/secret_libsecret.c`); Windows uses Credential Manager via `advapi32`, no vendored dependency | Linux TUI/GUI credential store | `pkg-config libsecret-1`, gated by `-DOC_HAVE_LIBSECRET` | https://gitlab.gnome.org/GNOME/libsecret | LGPL-2.1 |
 | **GLib** *(optional)* | Pulled in transitively by libsecret | TUI (only when libsecret present) | via libsecret | https://gitlab.gnome.org/GNOME/glib | LGPL-2.1 |
 
-`libsecret`/`glib` are **optional and dynamically linked**: `make linux` detects
+`libsecret`/`glib` are **optional and dynamically linked**: the Linux TUI's build detects
 libsecret via `pkg-config` and compiles the keyring backend, else compiles a stub
 and that machine then persists no credential at all (headless / no D-Bus). They are
 *not* linked into the daemon or the test binary.
@@ -287,7 +287,7 @@ and that machine then persists no credential at all (headless / no D-Bus). They 
   none — it is compiled from the committed amalgamation.
 - **CI installs:** `bzip2`, `nasm` and `xz-utils` (and `gdb`, and `ffmpeg` for
   `ffprobe`, neither linked); every compiler but the runner's own gcc is
-  fetched by make (the toolchains above). The Windows TUI and GUI (`make windows`) need
+  fetched by make (the toolchains above). The Windows TUI and GUI (`make build`) need
   neither libsecret nor libresolv: the mingw build reaches DNS through
   `DnsQuery` and the credential store through Credential Manager.
 
@@ -318,7 +318,7 @@ Litestream's own `LITESTREAM_ACCESS_KEY_ID`/`LITESTREAM_SECRET_ACCESS_KEY`.
 Litestream is not in the packages or the tarball: only the image can be told
 to replicate.
 
-The staging build's image check (`staging-build.yml`) fetches one more tool, never shipped:
+The full suite's image check (`make test-all PART=image`, in `release-candidate.yml`) fetches one more tool, never shipped:
 **rclone** v1.75.2 (MIT, https://github.com/rclone/rclone), checked against its
 published SHA-256, whose `serve s3` is the bucket the image replicates to and
 restores from on the runner (TESTING.md §3.2). The workflows' other rclone steps
@@ -340,16 +340,16 @@ is the upstream's own stability contract for a base OS.
   llama.cpp's and SDL3's own builds.
 - **pkg-config** — detects libsecret for the TUI.
 - **zig, Emscripten, llvm-mingw** — fetched by make, pinned (§2, "Toolchains").
-  zig is the release's compiler and CI's second compiler; a plain `make` of the
-  host's daemon uses the system cc.
-- **buildah / podman / skopeo** — **staging build, release-candidate and
-  release only**. Build, start and push the OCI image (the staging build),
-  check its digest and copy it to `:N-rcK` and `:rc` (the release-candidate),
+  zig is the release's compiler and CI's second compiler; `make build` and a
+  `make openchimed` of the host's daemon use the system cc.
+- **buildah / podman / skopeo** — **release-candidate and release only**.
+  Build, start and push the OCI image, check its digest and copy it to
+  `:N-rcK` and `:rc` (the release-candidate),
   copy it to its released tags and move the `:latest` and `:rc` tags (the
   release), daemonlessly.
 - **Docker and Docker Compose are NOT used**, anywhere, by anything — not to
   build, not to test, not locally, not in CI. This is a standing constraint;
-  see ARCH-36 and the header of `.github/workflows/staging-build.yml`.
+  see ARCH-36 and the header of `.github/workflows/release-candidate.yml`.
 
 ## 6. Windows cross-compile artifacts
 
@@ -359,11 +359,11 @@ The Windows GUI is the portable application (`client/gui/app/`, ARCH-80) over
 | Item | Version | Note | License |
 |------|---------|------|---------|
 | `scripts/build/llvm_mingw.sh`, `third_party/llvm-mingw-20261020` | 20261020 | The toolchain itself (clang, lld, LLVM binutils, mingw-w64 headers and CRT, UCRT), fetched by make | Apache-2.0 with LLVM exception |
-| `scripts/build/mbedtls_windows.sh`, `third_party/mbedtls-3.6.2-win` | 3.6.2 | Windows cross-compile; used by `make windows` | Apache-2.0 |
-| `scripts/build/sdl3_windows.sh`, `third_party/sdl3-3.4.14-win` | 3.4.14 | Windows cross-compile (static, CMake invoked by the script); used by `make windows` | zlib |
-| `scripts/build/libvpx.sh windows`, `third_party/libvpx-1.17.0-win` | 1.17.0 | Windows cross-compile (static, nasm); used by `make windows` | BSD-3-Clause |
-| `scripts/build/opus.sh windows`, `third_party/opus-1.6.1-win` | 1.6.1 | Windows cross-compile (static); used by `make windows` | BSD-3-Clause |
-| `scripts/build/speexdsp.sh windows`, `third_party/speexdsp-1.2.1-win` | 1.2.1 | Windows cross-compile (static); used by `make windows` | BSD-3-Clause |
+| `scripts/build/mbedtls_windows.sh`, `third_party/mbedtls-3.6.2-win` | 3.6.2 | Windows cross-compile; used by `make build` | Apache-2.0 |
+| `scripts/build/sdl3_windows.sh`, `third_party/sdl3-3.4.14-win` | 3.4.14 | Windows cross-compile (static, CMake invoked by the script); used by `make build` | zlib |
+| `scripts/build/libvpx.sh windows`, `third_party/libvpx-1.17.0-win` | 1.17.0 | Windows cross-compile (static, nasm); used by `make build` | BSD-3-Clause |
+| `scripts/build/opus.sh windows`, `third_party/opus-1.6.1-win` | 1.6.1 | Windows cross-compile (static); used by `make build` | BSD-3-Clause |
+| `scripts/build/speexdsp.sh windows`, `third_party/speexdsp-1.2.1-win` | 1.2.1 | Windows cross-compile (static); used by `make build` | BSD-3-Clause |
 | Media Foundation (`mfplat`, `mfreadwrite`, `mf`, `mfuuid`) | OS | Camera capture for video messages (`client/core/media/cap_mf.c`) | Windows system libraries |
 
 ## 7. Why libvpx
@@ -416,7 +416,7 @@ paths ship; nothing is fetched at runtime.
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
 | **Unicode license** | utf8proc bundled data tables | Alongside utf8proc's MIT code |
 | **Apache-2.0 WITH LLVM-exception** | libc++ (zig's), llvm-mingw | Toolchain runtime; static in the release daemon; the exception waives binary attribution |
-| **GPL-3.0 with GCC Runtime Library Exception** | libstdc++, libgcc | Host builds only (`make` without `RELEASE=1`); the exception permits static linking into the daemon. Releases use zig's libc++ instead |
+| **GPL-3.0 with GCC Runtime Library Exception** | libstdc++, libgcc | Host builds only (without `RELEASE=1`); the exception permits static linking into the daemon. Releases use zig's libc++ instead |
 
 **Bottom line:** every third-party dependency in the shipped daemon and TUI is
 permissively licensed (MIT, BSD, Apache-2.0, CC0, ISC, zlib, Public Domain, plus

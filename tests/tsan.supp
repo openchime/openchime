@@ -1,4 +1,4 @@
-# ThreadSanitizer suppressions for `make test-merge PART=threads` (scripts/test/merge/tsan.sh).
+# ThreadSanitizer suppressions for `make test-all PART=threads` (scripts/test/full/tsan.sh).
 #
 # oc_config_load: a few suites start a second event loop with different
 # settings (a trusted forwarder, a token prefix, no voice input) while the

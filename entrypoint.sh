@@ -19,7 +19,7 @@ fi
 # --- Replication (ARCH-3, ARCH-39) --------------------------------------------
 # What the boot did with the replica is said on one line of stable tokens,
 # "entrypoint: <key>=<value>", beside the sentence for a person: a harness, a
-# log query or the staging build's image check reads the tokens, never the
+# log query or the full suite's image check reads the tokens, never the
 # words. They are:
 #   entrypoint: replica=off              no replication files; the daemon as before
 #   entrypoint: replica=misconfigured    files there but wrong; not started (exit 1)

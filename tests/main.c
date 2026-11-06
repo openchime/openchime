@@ -1,9 +1,13 @@
 /* Entry point for the single OpenChime test binary. Each suite lives in its own
  * translation unit under tests/, uses the shared CHECK macro (tests/check.h),
  * and exposes a run_<suite>_tests() returning its failure count. Built by
- * `make test`; a non-zero total exits non-zero and fails CI. In-process
- * integration suites (TLS, event loop) live here too; the black-box,
- * the end-to-end run against a real daemon is the build job of ci.yml. */
+ * `make test`; a non-zero total exits non-zero and fails the run. In-process
+ * integration suites (TLS, event loop) live here too; the black-box end-to-end
+ * run against a real daemon is the full suite's (scripts/test/full/e2e.sh).
+ *
+ * SUITES[] below is the one list of the suites and of where each runs
+ * (docs/TESTING.md, "The two suites"): `build/tests --list fast|full|threads`
+ * prints the names the scripts select by. */
 
 #include <pthread.h>
 #include <stddef.h>
@@ -184,10 +188,8 @@ static void crash_report_install(void) {
  * minute of unrelated suites per attempt. Unset, nothing changes. */
 static const char *g_only;
 
-/* OC_TEST_EXCEPT is the opposite list: the suites NOT to run. `make test`
- * leaves out the slow suites, and `make test-merge` runs every suite its
- * thread-sanitizer half does not, so each runs once there
- * (scripts/test/lib/common.sh). */
+/* OC_TEST_EXCEPT is the opposite list: the suites NOT to run. The scripts
+ * select by OC_TEST_ONLY and the table's own lists (--list, below). */
 static const char *g_except;
 
 static int listed(const char *list, const char *name) {
@@ -208,8 +210,9 @@ static int suite_wanted(const char *name) {
  * passing empty. */
 static int g_ran;
 
-/* How long each suite took, printed slowest first at the end: the budget is
- * two minutes for everything, and this says where it goes. */
+/* How long each suite took, printed slowest first at the end: the fast suite
+ * has a budget (docs/TESTING.md, "The two suites"), and this says where it
+ * goes. */
 static struct { const char *name; double s; } g_times[128];
 static int g_ntimes;
 
@@ -233,85 +236,101 @@ static void print_times(void) {
     for (int i = 0; i < g_ntimes; i++) printf("  %7.1fs  %s\n", g_times[i].s, g_times[i].name);
 }
 
-#define S(fn) { #fn, fn }
-static const struct suite { const char *name; int (*fn)(void); } SUITES[] = {
-    S(run_protocol_tests),
-    S(run_fuzz_tests),
-    S(run_fuzz_replay_tests),
-    S(run_framebuf_tests),
-    S(run_migrate_tests),
-    S(run_auth_tests),
-    S(run_jwt_tests),
-    S(run_demolimits_tests),
-    S(run_joinrules_tests),
-    S(run_idtoken_tests),
-    S(run_relaykeys_tests),
-    S(run_totp_tests),
-    S(run_webauthn_tests),
-    S(run_proxyproto_tests),
-    S(run_signin_tests),
-    S(run_tkqr_tests),
-    S(run_devicecodes_tests),
-    S(run_ratelimit_tests),
-    S(run_idmap_tests),
-    S(run_srccount_tests),
-    S(run_authpool_tests),
-    S(run_ioloop_tests),
-    S(run_roles_tests),
-    S(run_dbwriter_tests),
-    S(run_http_tests),
-    S(run_sigv4_tests),
-    S(run_blob_s3_tests),
-    S(run_blob_cache_tests),
-    S(run_xferpool_tests),
-    S(run_config_tests),
-    S(run_storage_tests),
-    S(run_slow_blob_tests),
-    S(run_audio_tests),
-    S(run_listen_tests),
-    S(run_media_tests),
-    S(run_video_media_tests),
-    S(run_emoji_tests),
-    S(run_tls_tests),
-    S(run_acme_tests),
-    S(run_netloop_tests),
-    S(run_client_core_tests),
-    S(run_callsig_tests),
-    S(run_enroll_tests),
-    S(run_push_tests),
-    S(run_invite_mail_tests),
-    S(run_mention_tests),
-    S(run_searchq_tests),
-    S(run_richtext_tests),
-    S(run_table_tests),
-    S(run_url_tests),
-    S(run_sock_tests),
-    S(run_speakable_tests),
-    S(run_action_tests),
-    S(run_ttskit_tests),
-    S(run_tts_worker_tests),
-    S(run_summary_tests),
-    S(run_voice_pick_tests),
-    S(run_tts_data_tests),
-    S(run_stt_tests),
-    S(run_voice_tests),
-    S(run_unfurl_tests),
-    S(run_sdltext_map_tests),
-    S(run_sdltext_unicode_tests),
-    S(run_theme_tests),
-    S(run_e2e_tests),
-    S(run_pdm_crypto_tests),
-    S(run_call_media_tests),
-    S(run_share_media_tests),
+/* Every suite, and where it runs:
+ *   FAST     in the fast suite (`make test`, before every push) and the full
+ *            one; FULL in the full suite only (`make test-all`, in CI, once
+ *            per release-candidate). A suite too slow for the fast suite's
+ *            budget -- `make test` prints each suite's time, slowest first --
+ *            is FULL.
+ *   THREADS  its code starts threads, so the full suite runs it under
+ *            ThreadSanitizer as well as plainly; PLAIN, it does not. Checked
+ *            at run time, not trusted (thread_unlisted, below). */
+enum suite_tier { FAST, FULL };
+enum { PLAIN = 0, THREADS = 1 };
+#define S(fn, tier, threads) { #fn, fn, tier, threads }
+static const struct suite {
+    const char *name;
+    int (*fn)(void);
+    enum suite_tier tier;
+    int threads;
+} SUITES[] = {
+    S(run_protocol_tests,        FAST, PLAIN),
+    S(run_fuzz_tests,            FAST, PLAIN),
+    S(run_fuzz_replay_tests,     FAST, PLAIN),
+    S(run_framebuf_tests,        FAST, PLAIN),
+    S(run_migrate_tests,         FAST, PLAIN),
+    S(run_auth_tests,            FAST, PLAIN),
+    S(run_jwt_tests,             FAST, PLAIN),
+    S(run_demolimits_tests,      FAST, PLAIN),
+    S(run_joinrules_tests,       FAST, PLAIN),
+    S(run_idtoken_tests,         FAST, PLAIN),
+    S(run_relaykeys_tests,       FAST, THREADS),
+    S(run_totp_tests,            FAST, PLAIN),
+    S(run_webauthn_tests,        FAST, PLAIN),
+    S(run_proxyproto_tests,      FAST, PLAIN),
+    S(run_signin_tests,          FAST, THREADS),
+    S(run_tkqr_tests,            FAST, PLAIN),
+    S(run_devicecodes_tests,     FAST, PLAIN),
+    S(run_ratelimit_tests,       FAST, PLAIN),
+    S(run_idmap_tests,           FAST, PLAIN),
+    S(run_srccount_tests,        FAST, PLAIN),
+    S(run_authpool_tests,        FAST, THREADS),
+    S(run_ioloop_tests,          FAST, THREADS),
+    S(run_roles_tests,           FAST, PLAIN),
+    S(run_dbwriter_tests,        FULL, THREADS),
+    S(run_http_tests,            FAST, PLAIN),
+    S(run_sigv4_tests,           FAST, PLAIN),
+    S(run_blob_s3_tests,         FAST, THREADS),
+    S(run_blob_cache_tests,      FAST, THREADS),
+    S(run_xferpool_tests,        FAST, THREADS),
+    S(run_config_tests,          FAST, PLAIN),
+    S(run_storage_tests,         FAST, THREADS),
+    S(run_slow_blob_tests,       FAST, THREADS),
+    S(run_audio_tests,           FAST, PLAIN),
+    S(run_listen_tests,          FAST, PLAIN),
+    S(run_media_tests,           FULL, THREADS),
+    S(run_video_media_tests,     FAST, THREADS),
+    S(run_emoji_tests,           FAST, PLAIN),
+    S(run_tls_tests,             FAST, THREADS),
+    S(run_acme_tests,            FAST, THREADS),
+    S(run_netloop_tests,         FULL, THREADS),
+    S(run_client_core_tests,     FULL, THREADS),
+    S(run_callsig_tests,         FAST, PLAIN),
+    S(run_enroll_tests,          FAST, THREADS),
+    S(run_push_tests,            FAST, THREADS),
+    S(run_invite_mail_tests,     FAST, THREADS),
+    S(run_mention_tests,         FAST, PLAIN),
+    S(run_searchq_tests,         FAST, PLAIN),
+    S(run_richtext_tests,        FAST, PLAIN),
+    S(run_table_tests,           FAST, PLAIN),
+    S(run_url_tests,             FAST, PLAIN),
+    S(run_sock_tests,            FAST, PLAIN),
+    S(run_speakable_tests,       FAST, PLAIN),
+    S(run_action_tests,          FAST, PLAIN),
+    S(run_ttskit_tests,          FAST, PLAIN),
+    S(run_tts_worker_tests,      FAST, THREADS),
+    S(run_summary_tests,         FAST, THREADS),
+    S(run_voice_pick_tests,      FAST, PLAIN),
+    S(run_tts_data_tests,        FAST, PLAIN),
+    S(run_stt_tests,             FAST, THREADS),
+    S(run_voice_tests,           FAST, PLAIN),
+    S(run_unfurl_tests,          FAST, PLAIN),
+    S(run_sdltext_map_tests,     FAST, PLAIN),
+    S(run_sdltext_unicode_tests, FAST, PLAIN),
+    S(run_theme_tests,           FAST, PLAIN),
+    S(run_e2e_tests,             FAST, PLAIN),
+    S(run_pdm_crypto_tests,      FAST, PLAIN),
+    S(run_call_media_tests,      FAST, PLAIN),
+    S(run_share_media_tests,     FAST, THREADS),
 };
 #undef S
 enum { N_SUITES = sizeof SUITES / sizeof SUITES[0] };
 
-/* Which suites start threads (TESTING.md §2.4). Only those on TSAN_SUITES
- * (scripts/test/lib/common.sh) run under ThreadSanitizer, and whether a suite
- * starts one depends on the code it calls, not on words in its file -- so the
- * plain test binary is linked with -Wl,--wrap=pthread_create, and every thread
- * a suite starts is seen here. The ThreadSanitizer binary is not wrapped: its
+/* Which suites start threads (TESTING.md §2.4). Only those marked THREADS in
+ * SUITES[] run under ThreadSanitizer, and whether a suite starts one depends
+ * on the code it calls, not on words in its file -- so the plain test binary
+ * is linked with -Wl,--wrap=pthread_create, and every thread a suite starts is
+ * seen here. The ThreadSanitizer binary is not wrapped: its
  * __real_pthread_create stays unresolved (weak) and this is never called. */
 static volatile int g_thread_started;
 extern int __real_pthread_create(pthread_t *t, const pthread_attr_t *a,
@@ -322,17 +341,11 @@ int __wrap_pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(voi
     return __real_pthread_create(t, a, fn, arg);
 }
 
-/* OC_TSAN_SUITES, the list the scripts pass in from TSAN_SUITES; unset, a
- * suite's threads are not checked. */
-static const char *g_tsan_suites;
-
-/* A suite that started a thread and is not on the list would never run under
- * the sanitizer: a failure, naming where to add it. */
-static int thread_unlisted(const char *name) {
-    if (!__atomic_load_n(&g_thread_started, __ATOMIC_RELAXED) || !g_tsan_suites || !*g_tsan_suites ||
-        listed(g_tsan_suites, name))
-        return 0;
-    printf("  FAIL %s starts a thread but is not on TSAN_SUITES (scripts/test/lib/common.sh)\n", name);
+/* A suite that started a thread and is not marked THREADS would never run
+ * under the sanitizer: a failure, naming where to mark it. */
+static int thread_unlisted(const struct suite *su) {
+    if (!__atomic_load_n(&g_thread_started, __ATOMIC_RELAXED) || su->threads) return 0;
+    printf("  FAIL %s starts a thread but is not marked THREADS in SUITES[] (tests/main.c)\n", su->name);
     return 1;
 }
 
@@ -343,7 +356,7 @@ static int run_here(const struct suite *su) {
     double t0 = elapsed_s();
     __atomic_store_n(&g_thread_started, 0, __ATOMIC_RELAXED);
     int failed = su->fn();
-    failed += thread_unlisted(su->name);
+    failed += thread_unlisted(su);
     record_time(su->name, elapsed_s() - t0);
     return failed;
 }
@@ -439,7 +452,27 @@ static int run_parallel(int max_jobs) {
     return total;
 }
 
-int main(void) {
+/* --list fast|full|threads: the names of the suites in the fast suite, the
+ * full suite (every one), or marked THREADS, one per line, from SUITES[]. */
+static int list_suites(const char *which) {
+    int fast = which && !strcmp(which, "fast"), full = which && !strcmp(which, "full"),
+        threads = which && !strcmp(which, "threads");
+    if (!fast && !full && !threads) {
+        fprintf(stderr, "usage: tests --list fast|full|threads\n");
+        return 2;
+    }
+    for (int i = 0; i < N_SUITES; i++)
+        if (full || (fast && SUITES[i].tier == FAST) || (threads && SUITES[i].threads))
+            printf("%s\n", SUITES[i].name);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--list")) return list_suites(argc > 2 ? argv[2] : NULL);
+    if (argc > 1) {
+        fprintf(stderr, "usage: tests [--list fast|full|threads]\n");
+        return 2;
+    }
     crash_report_install();
     /* The suites run in development mode (CONFIG.md "Mode"): the daemon's
      * OPENCHIME_DEV_* rows and the clients' inputs are read. Not overwritten,
@@ -450,7 +483,6 @@ int main(void) {
     oc_config_load(NULL, 0);   /* the writer reads its configuration */
     g_only = getenv("OC_TEST_ONLY");
     g_except = getenv("OC_TEST_EXCEPT");
-    g_tsan_suites = getenv("OC_TSAN_SUITES");
     const char *rep = getenv("OC_TEST_REPEAT");
     int rounds = rep && *rep ? atoi(rep) : 1;
     if (rounds < 1) rounds = 1;
@@ -467,7 +499,7 @@ int main(void) {
     print_times();
     g_skips += oc_test_skips;   /* the suites run in this process */
     const char *timing = getenv("OC_TEST_TIMING");
-    if (timing && strcmp(timing, "0") == 0) printf("\ntiming-dependent checks not judged (OC_TEST_TIMING=0): make test judges them\n");
+    if (timing && strcmp(timing, "0") == 0) printf("\ntiming-dependent checks not judged (OC_TEST_TIMING=0)\n");
     if (g_skips) printf("\n%d check(s) skipped: see the SKIP lines above (in CI each is a failure)\n", g_skips);
     if (total == 0) { printf("\nOK: all suites passed\n"); return 0; }
     printf("\nFAILED: %d check(s) across all suites\n", total);

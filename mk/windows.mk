@@ -53,7 +53,7 @@ WIN_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
 # Version metadata only -- no icon, which for a console program comes from the
 # host terminal window rather than the image.
 WIN_TUI_RES := build/openchime_tui_res.o
-$(WIN_TUI_RES): client/tui/res/openchime_tui.rc $(WIN_RES_SRC) $(MINGW_CC) | build
+$(WIN_TUI_RES): client/tui/res/openchime_tui.rc $(WIN_RES_SRC) $(MINGW_CC) | build-dir
 	$(WINDRES) $(WINDRES_ARGS) $< -O coff -o $@
 # Each Windows binary is linked from one object per source, in a tree of its
 # own per flag set (mk/sources.mk, "Objects"), so `make -j` spreads the
@@ -65,7 +65,7 @@ WIN_TUI_CC   = $(WINCC) $(WIN_CFLAGS) $(VERSION_DEF) -Wno-unused-result $(WIN_IN
 WIN_TUI_OBJS := $(call oc_objs,$(OBJ_DIR)/win-tui,$(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC))
 $(eval $(call oc_obj_rules,$(OBJ_DIR)/win-tui,WIN_TUI_CC,$(MINGW_CC) $(BUILD_ID_STAMP),$(WIN_MBEDLIBS)))
 -include $(WIN_TUI_OBJS:.o=.d)
-$(WIN_TUI_BIN): $(WIN_TUI_OBJS) $(WIN_TUI_RES) $(WIN_MBEDLIBS) | build
+$(WIN_TUI_BIN): $(WIN_TUI_OBJS) $(WIN_TUI_RES) $(WIN_MBEDLIBS) | build-dir
 	$(WINCC) $(WIN_CFLAGS) $(WIN_TUI_OBJS) $(WIN_TUI_RES) \
 	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lcrypt32 -lole32 -ladvapi32 -lshell32 -static $(WIN_REPRO_LDFLAGS) -o $@
 
@@ -115,13 +115,13 @@ WIN_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
 # Resources (app icon + VERSIONINFO). Regenerate the .ico with scripts/gen/appicon.py.
 WIN_GUI_RES := build/openchime_res.o
 $(WIN_GUI_RES): client/gui/platform/win32/res/openchime.rc client/gui/platform/win32/res/openchime.ico \
-                client/gui/platform/win32/res/openchime_res.h $(WIN_RES_SRC) $(MINGW_CC) | build
+                client/gui/platform/win32/res/openchime_res.h $(WIN_RES_SRC) $(MINGW_CC) | build-dir
 	$(WINDRES) -I client/gui/platform/win32/res $(WINDRES_ARGS) $< -O coff -o $@
 WIN_GUI_CC   = $(WINCC) $(WIN_CFLAGS) $(VERSION_DEF) -std=c11 -Wno-unused-result $(WIN_GUI_INC) $(WIN_MEDIA_INC) -Iclient/gui/platform/win32/res
 WIN_GUI_OBJS := $(call oc_objs,$(OBJ_DIR)/win-gui,$(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SHARED_SRC))
 $(eval $(call oc_obj_rules,$(OBJ_DIR)/win-gui,WIN_GUI_CC,$(MINGW_CC) $(BUILD_ID_STAMP),$(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A)))
 -include $(WIN_GUI_OBJS:.o=.d)
-$(WIN_GUI_BIN): $(WIN_GUI_OBJS) $(WIN_GUI_RES) $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A) | build
+$(WIN_GUI_BIN): $(WIN_GUI_OBJS) $(WIN_GUI_RES) $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A) | build-dir
 	$(WINCC) $(WIN_CFLAGS) -std=c11 -mwindows $(WIN_GUI_OBJS) $(WIN_GUI_RES) \
 	    $(WIN_MBEDLIBS) $(WIN_MEDIA_A) -L$(SDL3_WIN)/lib -lSDL3 -lws2_32 -ldnsapi -lbcrypt -lcrypt32 -lcomdlg32 \
 	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -limm32 $(WIN_MEDIA_SYSLIBS) $(WIN_SDL_SYSLIBS) -static $(WIN_REPRO_LDFLAGS) -o $@

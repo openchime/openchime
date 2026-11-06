@@ -7648,7 +7648,7 @@ static void test_http_stack(void) {
         oc_mkdir(tpath("itest_webapp/web"));
         FILE *f;
         f = fopen(tpath("itest_webapp/web/openchime.wasm"), "wb"); CHECK(f); if (f) { fwrite("\0asm", 1, 4, f); fclose(f); }
-        /* Its gzip copy, as `make web` writes it: sent to a browser that takes
+        /* Its gzip copy, as the web client's build writes it: sent to a browser that takes
          * gzip, when its trailer says it is of this wasm and no other. */
         static const unsigned char GZ[] = { 0x1f,0x8b,0x08,0x00,0x00,0x00,0x00,0x00,0x02,0x03,0x63,0x48,
                                             0x2c,0xce,0x05,0x00,0xdb,0x49,0x40,0x5f,0x04,0x00,0x00,0x00 };
@@ -8157,7 +8157,7 @@ int run_netloop_tests(void) {
     CHECK(flooder != 0);
 
     /* The shared loop, on a port the kernel picks (start_loop): no range to
-     * share with any other suite, or with bench_loop. */
+     * share with any other suite, or with another run. */
     static struct loop_arg arg;
     __atomic_store_n(&g_ready_calls, 0, __ATOMIC_RELEASE);   /* per run: OC_TEST_REPEAT runs this again */
     g_ready_connected = 0;

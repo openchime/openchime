@@ -5,7 +5,7 @@
 # and the codecs for wasm are built once beside the native ones
 # (scripts/build/*_wasm.sh), with the toolchain's directory on their PATH.
 #
-# `make web` builds it. WEB=1 (Makefile, "Features") also compiles its loader
+# `make build/web/openchime.js` builds it. WEB=1 (Makefile, "Features") also compiles its loader
 # into the daemon, which then serves the client at /app/.
 WEB_DIR     := build/web
 WEB_MBEDTLS := build/wasm/mbedtls/library
@@ -33,7 +33,7 @@ $(WEB_MEDIA_LIBS) &: $(EMCC)
 WEB_MEDIA_SRC := $(filter-out client/core/media/audio_ma.c client/core/media/cap_mf.c client/core/media/cap_wgc.c,$(MEDIA_SRC)) \
                  $(VOICE_SRC) $(CALL_SRC) client/gui/platform/web/cap_web.c client/gui/platform/web/audio_web.c \
                  client/gui/platform/web/devices_web.c
-# Extra link flags for a one-off build (`make web WEB_LDEXTRA=--profiling-funcs`
+# Extra link flags for a one-off build (`make build/web/openchime.js WEB_LDEXTRA=--profiling-funcs`
 # keeps the function names a browser's debugger shows in a wasm stack).
 WEB_LDEXTRA ?=
 WEB_GUI_SRC := $(APP_GUI_SRC) client/gui/platform/web/plat_web.c client/gui/platform/web/a11y_web.c \
@@ -85,13 +85,13 @@ web: $(WEB_DIR)/openchime.js
 # The page and the loader as C arrays for the daemon (daemon/webapp.h). The
 # page comes straight from the source and needs no Emscripten; the loader is
 # the built one when WEB=1 and empty otherwise, so the daemon still links and
-# reports that it has no client. Rebuilt when the switch changes ($(FEATURES)).
+# reports that it has no client. Rebuilt when the switch changes ($(FEATURES_STAMP)).
 ifeq ($(WEB),1)
 WEBAPP_JS := $(WEB_DIR)/openchime.js
 else
 WEBAPP_JS :=
 endif
-$(WEBAPP_RES): client/gui/platform/web/openchime.html $(WEBAPP_JS) scripts/build/embed_res.py $(FEATURES)
+$(WEBAPP_RES): client/gui/platform/web/openchime.html $(WEBAPP_JS) scripts/build/embed_res.py $(FEATURES_STAMP)
 	mkdir -p $(dir $@)
 	python3 scripts/build/embed_res.py $@ oc_webapp_html=client/gui/platform/web/openchime.html oc_webapp_js=$(WEBAPP_JS) \
 	    oc_webapp_js_gz=$(if $(WEBAPP_JS),gzip:$(WEBAPP_JS))
