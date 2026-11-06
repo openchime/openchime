@@ -61,7 +61,8 @@ steps CI runs one after another (`mk/full.mk`):
   dependencies and the GUI smoke on the web (§3.4); and each fuzzing harness
   for `FUZZ_SECONDS` (§2.2b);
 - `threads` — the suites that start threads, under ThreadSanitizer, their one
-  run in the full suite (§2.4);
+  run in the full suite (§2.4), each in its own process, `TSAN_JOBS` at once
+  (one per CPU), so the pass takes about as long as its slowest suite;
 - `packages` — the release's daemon for each architecture (zig, glibc 2.34)
   and its `.deb`, `.rpm` and tarball; then the glibc floor, one binary in all
   three, speech on the release binary, the `.deb` installed and speaking, and
@@ -777,7 +778,9 @@ same machine, the suites marked `THREADS` under ThreadSanitizer
 - the suites whose code runs threads — the loop and its I/O threads, the
   writer and readers, the worker pools, the client, the recorder and player —
   under ThreadSanitizer (address randomization off, `tests/tsan.supp` for the
-  one test-only reconfiguration). A suite that starts a thread is marked
+  one test-only reconfiguration), each suite in a process of its own, as many
+  at once as there are CPUs (`scripts/test/full/tsan.sh`, `TSAN_JOBS`): a race
+  is between one suite's threads, so nothing is lost by the split. A suite that starts a thread is marked
   `THREADS`, and that is checked at run time, not read from the source: the
   plain test binary is linked with `-Wl,--wrap=pthread_create`, and a suite
   that starts a thread and is not marked fails, naming itself and the table
