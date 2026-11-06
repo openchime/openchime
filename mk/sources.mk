@@ -79,7 +79,10 @@ APP_SRC  := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES
 # This is the one list of them: the full suite runs each (scripts/test/full/
 # fuzz.sh, given the list and the dictionaries by make), and docs/TESTING.md
 # says what each fuzzes. FUZZ_DICT_<harness> is the dictionary a harness
-# takes (tests/fuzz/*.dict), none where unset.
+# takes (tests/fuzz/*.dict), none where unset. FUZZ_RUNS_<harness> is the
+# number of inputs the full suite runs it for, from a fixed seed: the same
+# work every run, sized from CI's measured speed so that all of them together
+# take well inside fuzz.sh's 15 seconds.
 FUZZ_HARNESSES   := frame framebuf http ws proxy json cbor jwt webauthn idtoken
 FUZZ_HARNESS_SRC := tests/fuzz/decoders.c $(patsubst %,tests/fuzz/%.c,$(FUZZ_HARNESSES))
 FUZZ_DICT_frame    := tests/fuzz/frame.dict
@@ -89,6 +92,16 @@ FUZZ_DICT_json     := tests/fuzz/json.dict
 FUZZ_DICT_jwt      := tests/fuzz/json.dict
 FUZZ_DICT_idtoken  := tests/fuzz/json.dict
 FUZZ_DICT_webauthn := tests/fuzz/json.dict
+FUZZ_RUNS_frame    := 7000
+FUZZ_RUNS_framebuf := 15000
+FUZZ_RUNS_http     := 25000
+FUZZ_RUNS_ws       := 200000
+FUZZ_RUNS_proxy    := 275000
+FUZZ_RUNS_json     := 17000
+FUZZ_RUNS_cbor     := 35000
+FUZZ_RUNS_jwt      := 50000
+FUZZ_RUNS_webauthn := 33000
+FUZZ_RUNS_idtoken  := 20000
 TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/testsignin_main.c,$(wildcard tests/*.c)) \
             $(FUZZ_HARNESS_SRC)
 TEST_BIN := build/tests

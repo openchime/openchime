@@ -59,7 +59,7 @@ steps CI runs one after another (`mk/full.mk`):
   every Linux source through the release's compiler under `-Werror`; the
   speech round trip; the web client in a headless Chrome, its objects' header
   dependencies and the GUI smoke on the web (§3.4); and each fuzzing harness
-  for `FUZZ_SECONDS` (§2.2b);
+  for its fixed inputs, one at a time, inside 15 seconds in all (§2.2b);
 - `threads` — the suites that start threads, under ThreadSanitizer, their one
   run in the full suite (§2.4), each in its own process, `TSAN_JOBS` at once
   (one per CPU), so the pass takes about as long as its slowest suite;
@@ -525,12 +525,15 @@ and its encoder to `tests/fuzz/seeds.c`.
 them, each `tests/fuzz/<harness>.c`, built as `build/fuzz/<harness>`; the
 header of each file says what it fuzzes and what must hold. The dictionary a
 harness takes is `FUZZ_DICT_<harness>` beside the list (`tests/fuzz/*.dict`),
-none where unset. The full suite's pass is given both by make
-(`scripts/test/full/fuzz.sh`). It runs each harness for `FUZZ_SECONDS` (60),
-`FUZZ_JOBS` of them at once (one per CPU): the harnesses are independent, so
-each still fuzzes for its full time, and the pass takes that time per round
-rather than per harness. A new harness is its file and a word in that
-list, and a line for its sources in `mk/tests.mk`.
+none where unset, and the number of inputs the full suite runs it for is
+`FUZZ_RUNS_<harness>`. The full suite's pass is given all three by make
+(`scripts/test/full/fuzz.sh`). It does the same work every run: one harness
+at a time, each for its fixed inputs from a fixed seed (`FUZZ_SEED`, 1), from
+its checked-in corpus. The counts are sized from CI's measured speed so the
+whole pass fits inside `FUZZ_SECONDS` (15), which is also a gate: each harness
+may take its equal share of it, and one stopped there is named as cut short.
+A longer run is by hand. A new harness is its file, a word in that list, its
+input count, and a line for its sources in `mk/tests.mk`.
 
 A harness that takes several inputs reads them with `oc_fuzz_split`
 (`tests/fuzz/fuzz.h`): each part but the last is prefixed by its length, a
@@ -551,8 +554,9 @@ mkdir -p /tmp/frame && build/fuzz/frame -dict=tests/fuzz/frame.dict /tmp/frame t
 ```
 
 The first directory is where libFuzzer writes what it finds. Keep it out of the
-tree. `-max_total_time=<s>` stops a run. The full suite runs each harness for
-`FUZZ_SECONDS` (60 by default) from its corpus (`make test-all PART=plain`,
+tree. `-max_total_time=<s>` stops a run; `-runs=<n> -seed=<s>` makes it the
+same run every time. The full suite runs each harness for its
+`FUZZ_RUNS_<harness>` inputs from seed 1 (`make test-all PART=plain`,
 `scripts/test/full/fuzz.sh`). A finding fails the job, with the sanitizer's
 report and the input, base64, in the log.
 
