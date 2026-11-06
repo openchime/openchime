@@ -246,11 +246,16 @@ static void print_times(void) {
  *            ThreadSanitizer, and only there; PLAIN, it does not, and the
  *            full suite runs it plainly. Checked at run time, not trusted
  *            (thread_unlisted, below). TIMED is THREADS and plainly as well,
- *            for a FULL suite whose speed verdicts (CHECK_SPEED, which the
- *            sanitizer does not judge) would otherwise be judged nowhere: a
- *            FAST suite's are judged by the fast suite. */
+ *            for a FULL suite whose speed verdicts (CHECK_SPEED) or timer
+ *            tests (TIMER_ONLY), which the sanitizer does not run, would
+ *            otherwise be judged nowhere: a FAST suite's are judged by the
+ *            fast suite. WALK starts threads too, but the full suite runs it
+ *            plainly and not under ThreadSanitizer: an end-to-end walk of the
+ *            daemon or the client, or real-time media, whose sanitizer run
+ *            would cost minutes against the pass's 30 seconds; the suites that
+ *            test those threads directly keep theirs. */
 enum suite_tier { FAST, FULL };
-enum { PLAIN = 0, THREADS = 1, TIMED = 2 };
+enum { PLAIN = 0, THREADS = 1, TIMED = 2, WALK = 3 };
 #define S(fn, tier, threads) { #fn, fn, tier, threads }
 static const struct suite {
     const char *name;
@@ -281,7 +286,7 @@ static const struct suite {
     S(run_authpool_tests,        FAST, THREADS),
     S(run_ioloop_tests,          FAST, THREADS),
     S(run_roles_tests,           FAST, PLAIN),
-    S(run_dbwriter_tests,        FULL, THREADS),
+    S(run_dbwriter_tests,        FULL, WALK),
     S(run_http_tests,            FAST, PLAIN),
     S(run_sigv4_tests,           FAST, PLAIN),
     S(run_blob_s3_tests,         FAST, THREADS),
@@ -292,13 +297,13 @@ static const struct suite {
     S(run_slow_blob_tests,       FAST, THREADS),
     S(run_audio_tests,           FAST, PLAIN),
     S(run_listen_tests,          FAST, PLAIN),
-    S(run_media_tests,           FULL, TIMED),
+    S(run_media_tests,           FULL, WALK),
     S(run_video_media_tests,     FAST, THREADS),
     S(run_emoji_tests,           FAST, PLAIN),
     S(run_tls_tests,             FAST, THREADS),
     S(run_acme_tests,            FAST, THREADS),
-    S(run_netloop_tests,         FULL, THREADS),
-    S(run_client_core_tests,     FULL, THREADS),
+    S(run_netloop_tests,         FULL, WALK),
+    S(run_client_core_tests,     FULL, WALK),
     S(run_callsig_tests,         FAST, PLAIN),
     S(run_enroll_tests,          FAST, THREADS),
     S(run_push_tests,            FAST, THREADS),
@@ -313,7 +318,7 @@ static const struct suite {
     S(run_action_tests,          FAST, PLAIN),
     S(run_ttskit_tests,          FAST, PLAIN),
     S(run_tts_worker_tests,      FAST, THREADS),
-    S(run_summary_tests,         FAST, THREADS),
+    S(run_summary_tests,         FAST, WALK),
     S(run_voice_pick_tests,      FAST, PLAIN),
     S(run_tts_data_tests,        FAST, PLAIN),
     S(run_stt_tests,             FAST, THREADS),
@@ -458,7 +463,7 @@ static int run_parallel(int max_jobs) {
 
 /* --list fast|full|plain|threads: the names of the suites in the fast suite,
  * the full suite (every one), the full suite's plain pass (all but THREADS),
- * or its ThreadSanitizer pass (THREADS and TIMED), one per line, from
+ * or its ThreadSanitizer pass (THREADS and TIMED, not WALK), one per line, from
  * SUITES[]. */
 static int list_suites(const char *which) {
     int fast = which && !strcmp(which, "fast"), full = which && !strcmp(which, "full"),
@@ -469,7 +474,7 @@ static int list_suites(const char *which) {
     }
     for (int i = 0; i < N_SUITES; i++)
         if (full || (fast && SUITES[i].tier == FAST) || (plain && SUITES[i].threads != THREADS) ||
-            (threads && SUITES[i].threads != PLAIN))
+            (threads && SUITES[i].threads != PLAIN && SUITES[i].threads != WALK))
             printf("%s\n", SUITES[i].name);
     return 0;
 }

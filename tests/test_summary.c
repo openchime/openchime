@@ -1566,7 +1566,9 @@ static void test_cloud(void) {
     f.answers[1] = "{\"choices\":[{\"message\":{\"content\":\"- [1] a | b\"},\"finish_reason\":\"stop\"}]}";
     f.statuses[1] = 0;
     f.n = 2;
-    f.retry_after = "1";
+    /* A second's pause; none under ThreadSanitizer, where the retry is what
+     * runs and waiting the second out would check a clock, not our threads. */
+    f.retry_after = OC_UNDER_TSAN ? "0" : "1";
     f.served = 0;
     pthread_create(&t, NULL, fake_api_serve_n, &f);
     out = NULL;
@@ -1574,8 +1576,8 @@ static void test_cloud(void) {
     rc = e->run(h, "s", "u", NULL, 40, NULL, NULL, &out, &st, err, sizeof err);
     pthread_join(t, NULL);
     CHECK(rc == 0 && out && !strcmp(out, "- [1] a | b"));
-    CHECK(st.retries == 1 && st.wait_ms == 1000 && f.served == 2);
-    CHECK(oc_test_mono_ms() - t0 >= 990);   /* the wait named was waited (a floor, not a speed) */
+    CHECK(st.retries == 1 && st.wait_ms == (OC_UNDER_TSAN ? 0 : 1000) && f.served == 2);
+    if (!OC_UNDER_TSAN) CHECK(oc_test_mono_ms() - t0 >= 990);   /* the wait named was waited (a floor, not a speed) */
     free(out);
     /* A 503 the same way. */
     f.statuses[0] = 503;

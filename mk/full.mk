@@ -19,7 +19,8 @@
 #             static-link check, the end-to-end run, the release's compiler,
 #             the speech round trip, the web client in a headless Chrome and
 #             its objects' header dependencies, the GUI smoke on the web, and
-#             each fuzzing harness for FUZZ_SECONDS
+#             each fuzzing harness for its fixed inputs, one at a time, inside
+#             FUZZ_SECONDS (20) in all
 #   threads   the test binary under ThreadSanitizer; then the suites that start
 #             threads, under it, their one run in the full suite
 #   packages  the release's daemon for ARCH (zig against glibc 2.34) with its
@@ -70,7 +71,7 @@ test-all-plain:
 	NODE="$(NODE)" scripts/test/full/web.sh
 	+MAKE="$(MAKE) $(FULL_SWITCHES)" scripts/test/full/web_deps.sh
 	NODE="$(NODE)" scripts/test/full/gui_web_smoke.sh
-	FUZZ_HARNESSES="$(foreach h,$(FUZZ_HARNESSES),$(h):$(FUZZ_DICT_$(h)))" scripts/test/full/fuzz.sh
+	FUZZ_HARNESSES="$(foreach h,$(FUZZ_HARNESSES),$(h):$(FUZZ_DICT_$(h)):$(FUZZ_RUNS_$(h)))" scripts/test/full/fuzz.sh
 
 # --- threads ------------------------------------------------------------------
 build-all-threads:

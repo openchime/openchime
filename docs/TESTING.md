@@ -59,9 +59,11 @@ steps CI runs one after another (`mk/full.mk`):
   every Linux source through the release's compiler under `-Werror`; the
   speech round trip; the web client in a headless Chrome, its objects' header
   dependencies and the GUI smoke on the web (§3.4); and each fuzzing harness
-  for `FUZZ_SECONDS` (§2.2b);
+  for its fixed inputs, one at a time, inside 20 seconds in all (§2.2b);
 - `threads` — the suites that start threads, under ThreadSanitizer, their one
-  run in the full suite (§2.4);
+  run in the full suite (§2.4), in one process, one after another, nothing
+  beside it, about 30 seconds in CI; the end-to-end walks marked `WALK` run
+  in the plain pass instead;
 - `packages` — the release's daemon for each architecture (zig, glibc 2.34)
   and its `.deb`, `.rpm` and tarball; then the glibc floor, one binary in all
   three, speech on the release binary, the `.deb` installed and speaking, and
@@ -218,14 +220,17 @@ a daemon built with `TTS=1 STT=1`.
 
 - **`SUITES[]` in `tests/main.c` is the one list of the suites and of where
   each runs**: a row per suite, `S(run_<subject>_tests, FAST|FULL,
-  PLAIN|THREADS|TIMED)`. `FAST` runs in both suites, `FULL` in the full suite
+  PLAIN|THREADS|TIMED|WALK)`. `FAST` runs in both suites, `FULL` in the full suite
   only (one too slow for the fast suite's budget); `THREADS` marks a suite
   whose code starts threads, which the full suite runs under ThreadSanitizer
   and only there, and `TIMED` one that the full suite also runs plainly, for
-  the speed verdicts the sanitizer does not judge (§2.4). The scripts never
+  the speed verdicts the sanitizer does not judge and the timer tests it does
+  not run (§2.4), and `WALK` one that starts threads but which the full suite
+  runs plainly and not under ThreadSanitizer: an end-to-end walk of the daemon
+  or the client, or real-time media, whose sanitizer run would cost minutes. The scripts never
   keep a list of their own: they ask the binary, `build/tests --list fast`,
   `--list full` (every suite), `--list plain` (the full suite's plain pass:
-  all but `THREADS`) or `--list threads` (`THREADS` and `TIMED`).
+  all but `THREADS`) or `--list threads` (`THREADS` and `TIMED`, not `WALK`).
 
   Adding a suite is therefore two steps: drop in `tests/test_<subject>.c`
   exposing `run_<subject>_tests()`, and give it a row in `SUITES[]` (and a
@@ -524,12 +529,16 @@ and its encoder to `tests/fuzz/seeds.c`.
 them, each `tests/fuzz/<harness>.c`, built as `build/fuzz/<harness>`; the
 header of each file says what it fuzzes and what must hold. The dictionary a
 harness takes is `FUZZ_DICT_<harness>` beside the list (`tests/fuzz/*.dict`),
-none where unset. The full suite's pass is given both by make
-(`scripts/test/full/fuzz.sh`). It runs each harness for `FUZZ_SECONDS` (60),
-`FUZZ_JOBS` of them at once (one per CPU): the harnesses are independent, so
-each still fuzzes for its full time, and the pass takes that time per round
-rather than per harness. A new harness is its file and a word in that
-list, and a line for its sources in `mk/tests.mk`.
+none where unset, and the number of inputs the full suite runs it for is
+`FUZZ_RUNS_<harness>`. The full suite's pass is given all three by make
+(`scripts/test/full/fuzz.sh`). It does the same work every run: one harness
+at a time, each for its fixed inputs from a fixed seed (`FUZZ_SEED`, 1), from
+its checked-in corpus. The counts are sized from CI's measured speed so the
+whole pass fits inside `FUZZ_SECONDS` (20), which is also a gate: one deadline
+for the whole pass, which each harness may run up to, and one stopped there is
+named as cut short.
+A longer run is by hand. A new harness is its file, a word in that list, its
+input count, and a line for its sources in `mk/tests.mk`.
 
 A harness that takes several inputs reads them with `oc_fuzz_split`
 (`tests/fuzz/fuzz.h`): each part but the last is prefixed by its length, a
@@ -550,8 +559,9 @@ mkdir -p /tmp/frame && build/fuzz/frame -dict=tests/fuzz/frame.dict /tmp/frame t
 ```
 
 The first directory is where libFuzzer writes what it finds. Keep it out of the
-tree. `-max_total_time=<s>` stops a run. The full suite runs each harness for
-`FUZZ_SECONDS` (60 by default) from its corpus (`make test-all PART=plain`,
+tree. `-max_total_time=<s>` stops a run; `-runs=<n> -seed=<s>` makes it the
+same run every time. The full suite runs each harness for its
+`FUZZ_RUNS_<harness>` inputs from seed 1 (`make test-all PART=plain`,
 `scripts/test/full/fuzz.sh`). A finding fails the job, with the sanitizer's
 report and the input, base64, in the log.
 
@@ -777,7 +787,14 @@ same machine, the suites marked `THREADS` under ThreadSanitizer
 - the suites whose code runs threads — the loop and its I/O threads, the
   writer and readers, the worker pools, the client, the recorder and player —
   under ThreadSanitizer (address randomization off, `tests/tsan.supp` for the
-  one test-only reconfiguration). A suite that starts a thread is marked
+  one test-only reconfiguration), in one process, one suite after another,
+  nothing beside it (`scripts/test/full/tsan.sh`). No test sits out a set time
+  under the sanitizer: a test whose subject is a timer firing or a window
+  closing returns at once there (`TIMER_ONLY()`, `tests/check.h`) and runs in
+  the ordinary build, and a long loop runs a tenth of its turns there
+  (`TSAN_FEW`). `WAIT_MS` stretches deadlines only, never a timer a test sets.
+  The pass takes about 30 seconds in CI and prints its time; time never fails
+  it. A suite that starts a thread is marked
   `THREADS`, and that is checked at run time, not read from the source: the
   plain test binary is linked with `-Wl,--wrap=pthread_create`, and a suite
   that starts a thread and is not marked fails, naming itself and the table
@@ -795,8 +812,11 @@ same machine, the suites marked `THREADS` under ThreadSanitizer
   make it slower. A threaded suite is not run plainly as well: everything but
   its `CHECK_SPEED`s is judged under the sanitizer, and the speed verdicts of
   a `FAST` one are judged by the fast suite, before every push. The one
-  threaded `FULL` suite with speed verdicts, `media`, is marked `TIMED` and
-  runs in both passes, so its are judged too.
+  end-to-end walks -- netloop, client_core, dbwriter, summary and media -- are
+  marked `WALK`: they run in the plain pass only, with every speed verdict and
+  timer test judged, and not under the sanitizer, whose run of them cost
+  minutes. Their threads' parts are tested under it by the suites of those
+  threads (ioloop, authpool, xferpool, the workers).
 
 ---
 
@@ -1244,7 +1264,8 @@ both suites with their stub engines.
 A new suite is its declaration and one row in `SUITES[]` in `tests/main.c`
 (§2.1): `FAST` unless it is too slow for the fast suite's budget, and
 `THREADS` if its code starts a thread (either suite fails it otherwise, §2.4)
--- `TIMED` instead if it is also `FULL` and has a `CHECK_SPEED`.
+-- `TIMED` instead if it is also `FULL` and has a `CHECK_SPEED`, `WALK` if it
+is an end-to-end walk too slow for the sanitizer pass's 30 seconds.
 
 ---
 
