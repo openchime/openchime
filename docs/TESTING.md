@@ -23,6 +23,12 @@ the attribution scan, the issue references), in a release or in a promotion.
 `make build` and `make test` refuse to run in CI, and `make build-all` and
 `make test-all` anywhere else (`CI` unset).
 
+**A documentation-only change is the one exception to the fast suite.** A
+branch whose every change is documentation (`scripts/policy/docs_only.sh`, the
+one rule) may be pushed without `make test`: the pre-push hook lets it through,
+and `pr-policy` still checks it. Once merged, `promote.yml` can put it on
+`main` without a release.
+
 **The fast suite** (`make test`, `scripts/test/fast/`):
 
 - `make build`, the fast build: the daemon with no speech, summaries or web
