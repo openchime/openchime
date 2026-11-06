@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # scripts/test/full/tsan.sh
 #
-# The suites SUITES[] marks THREADS (tests/main.c, `--list threads`) under
-# ThreadSanitizer, one process, one suite after the other (docs/TESTING.md
-# §2.4); a data race between our threads fails it (tests/tsan.supp). The
+# The suites SUITES[] marks THREADS or TIMED (tests/main.c, `--list
+# threads`) under ThreadSanitizer, one process, one suite after the other
+# (docs/TESTING.md §2.4); a data race between our threads fails it
+# (tests/tsan.supp). This is the only run of a THREADS suite in the full
+# suite: the plain pass (full/suites.sh) leaves it out. The
 # vendored libraries are not instrumented, so a race inside one is not seen.
 # Address randomization is off (setarch -R): ThreadSanitizer maps its shadow
 # memory at fixed addresses, and recent kernels' randomization places the

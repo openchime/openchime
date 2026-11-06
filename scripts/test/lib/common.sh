@@ -7,13 +7,13 @@
 # the targets. Each script starts with the same header: what it proves, its
 # arguments, what it needs, and the target that runs it. Which suites of
 # build/tests belong to which is SUITES[] in tests/main.c, read back with
-# `build/tests --list fast|full|threads`.
+# `build/tests --list fast|full|plain|threads`.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 TEST=$(basename "$0" .sh)
 
-# suites fast|full|threads <test binary command...>: the names the binary
+# suites fast|full|plain|threads <test binary command...>: the names the binary
 # lists (`--list`), comma-separated, as OC_TEST_ONLY takes them.
 suites() {
     local which=$1 out; shift

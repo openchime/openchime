@@ -1,31 +1,42 @@
 name: test-all
 
-# The full suite's code tests (docs/TESTING.md), in two jobs on two machines at
-# once: `make build-all` and `make test-all` with PART=plain and PART=threads.
+# The release-candidate's gate and the full suite's code tests
+# (docs/TESTING.md), in one job on one machine: the gate first, then `make
+# build-all` and `make test-all` with PART=plain, then with PART=threads.
 # Called by release-candidate.yml, once per release-candidate, on the staging
 # tip it is cutting, before it builds anything a release ships; nothing else
-# runs it. Each job runs the targets a person could read and run the same way;
-# every test is a script in scripts/test/. Every vendored library and toolchain
-# is fetched pinned, or built from the committed sources, by the script that
-# builds it (mk/toolchains.mk) and cached by that script's hash. One runner
-# image everywhere, ubuntu-24.04, the same one the release builds on.
+# runs it. One job, because GitHub bills each job rounded up to a whole minute
+# plus its set-up, and the two parts share every tool and every cache: each is
+# installed and restored once. The job runs the targets a person could read
+# and run the same way; every test is a script in scripts/test/. Every
+# vendored library and toolchain is fetched pinned, or built from the
+# committed sources, by the script that builds it (mk/toolchains.mk) and
+# cached by that script's hash, one cache per library. One runner image
+# everywhere, ubuntu-24.04, the same one the release builds on.
 #
 # The end-to-end test (scripts/test/full/e2e.sh) and the web client's checks
-# run the daemon in development mode, so these jobs live here and not in a
+# run the daemon in development mode, so this job lives here and not in a
 # release-path workflow, which scripts/test/fast/release_lint.sh keeps free of
 # it. The rest of the full suite -- the checks on the packages, the images and
 # the Windows installers -- runs in release-candidate.yml on the artifacts it
 # builds.
 
 on:
-  # Called, never triggered: the release-candidate gates on these exact jobs.
+  # Called, never triggered: the release-candidate gates on this exact job.
   workflow_call:
+    outputs:
+      build_id:
+        description: The build id, the short commit
+        value: ${{ jobs.test.outputs.build_id }}
+      run_number:
+        description: The run number the Windows file version carries
+        value: ${{ jobs.test.outputs.run_number }}
 
 # No concurrency group of its own: a called workflow's group would be evaluated
 # with the caller's workflow and ref, so two release-candidate runs of
 # different commits would cancel each other's tests. The caller groups its runs.
 
-# Least privilege: the jobs read the tree and nothing else. A workflow calling
+# Least privilege: the job reads the tree and nothing else. A workflow calling
 # this one must grant at least that much, or GitHub refuses to start the call.
 permissions:
   contents: read
@@ -36,16 +47,106 @@ env:
   BASH_ENV: ${{ github.workspace }}/.github/net-retry.bash
 
 jobs:
-  plain:
-    name: full suite (plain)
+  test:
+    name: full suite
     runs-on: ubuntu-24.04
-    timeout-minutes: 120   # a cold cache builds the vendored libraries: ~44 min
+    # A warm run takes about 35 minutes; a cold cache builds the vendored
+    # libraries and ONNX Runtime first, about 70.
+    timeout-minutes: 80
+    outputs:
+      build_id: ${{ steps.id.outputs.build_id }}
+      run_number: ${{ steps.id.outputs.run_number }}
     steps:
+      # --- The gate: seconds, before anything is built ----------------------
+      # A release-candidate is staging's tip and nothing else: dispatched on
+      # another ref, the SHA below would be a feature branch. And it is made
+      # only in the repository the RELEASE_REPO variable names; a copy of this
+      # repository without it makes none. A called workflow sees its caller's
+      # ref, commit, run number and variables.
+      - name: Refuse any other ref or repository
+        env:
+          REF: ${{ github.ref }}
+          REPO: ${{ github.repository }}
+          RELEASE_REPO: ${{ vars.RELEASE_REPO }}
+        run: |
+          [ -n "$RELEASE_REPO" ] && [ "$REPO" = "$RELEASE_REPO" ] || {
+            echo "::error::release-candidates are made only in the repository the RELEASE_REPO variable names"; exit 1; }
+          [ "$REF" = "refs/heads/staging" ] || {
+            echo "::error::a release-candidate is made from staging only (this run is on $REF). Use: gh workflow run release-candidate.yml --ref staging"; exit 1; }
+      # The build id, and the run number the Windows file version carries (the
+      # one numeric, growing field Windows compares). The run number is this
+      # workflow's plus RUN_NUMBER_OFFSET, a repository variable (0 when
+      # unset): run numbers count from 1 again when the workflow that builds is
+      # renamed or moved, and the file version must keep growing past every
+      # build already shipped.
+      - id: id
+        name: build id
+        env:
+          OFFSET: ${{ vars.RUN_NUMBER_OFFSET }}
+        run: |
+          set -euo pipefail
+          offset="${OFFSET:-0}"
+          grep -qE '^[0-9]+$' <<<"$offset" || {
+            echo "::error::RUN_NUMBER_OFFSET is '${offset}', not a whole number"; exit 1; }
+          run=$(( GITHUB_RUN_NUMBER + offset ))
+          echo "build_id=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "run_number=${run}" >> "$GITHUB_OUTPUT"
+          echo "build ${GITHUB_SHA:0:7} (${GITHUB_SHA}), run ${run} (${GITHUB_RUN_NUMBER} + ${offset})"
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # The commit: still staging's tip, not already released or a
+      # release-candidate, and one main can take as its next release
+      # (scripts/release/main_next.sh: it descends from the last release's
+      # candidate and the newest release-N, and the documentation promoted to
+      # main applies on it). Asked again by publish, inside the `release`
+      # group, before the number is taken.
+      - name: The commit is staging's tip, and main can take it
+        run: |
+          set -euo pipefail
+          git fetch --quiet --tags --force origin "+refs/heads/main:refs/remotes/origin/main" "+refs/heads/staging:refs/remotes/origin/staging"
+          tip=$(git rev-parse origin/staging)
+          [ "$tip" = "$GITHUB_SHA" ] || {
+            echo "::error::${GITHUB_SHA:0:7} is not staging's tip (${tip:0:7}); dispatch again: gh workflow run release-candidate.yml --ref staging"; exit 1; }
+          released=$(git tag --points-at "$GITHUB_SHA" | grep -E '^release-[0-9]+$' || true)
+          [ -z "$released" ] || { echo "::error::${GITHUB_SHA:0:7} is already ${released}"; exit 1; }
+          rcs=$(git tag --points-at "$GITHUB_SHA" | grep -E '^release-[0-9]+-rc[0-9]+$' || true)
+          [ -z "$rcs" ] || { echo "::error::${GITHUB_SHA:0:7} is already $(echo $rcs)"; exit 1; }
+          rc=0; scripts/release/main_next.sh release "$GITHUB_SHA" "$(scripts/release/version.sh next)" >/dev/null || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::main cannot take ${GITHUB_SHA:0:7} as its next release (above)"; exit 1; }
+          # main holds snapshots, not staging's commits: what a release of this
+          # commit brings starts at the last release's candidate
+          # (scripts/release/main_next.sh base).
+          base=$(scripts/release/main_next.sh base "$GITHUB_SHA")
+          echo "MAIN=${base}" >> "$GITHUB_ENV"
+          echo "${base:0:7}..${GITHUB_SHA:0:7}:"
+          git log --format='  %h %s' "${base}..${GITHUB_SHA}"
+      # The attribution scan refuses: a commit naming the banned pattern must
+      # not be built, stored or released, and is removed from staging by hand
+      # (CONTRIBUTING.md). Scanned as a push of <last release>..tip, since the
+      # script judges only a push's or a pull request's commits.
+      - name: Attribution scan
+        env:
+          EVENT: push
+          AFTER: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          BASE_REF: ""
+        run: BEFORE="$MAIN" scripts/policy/attribution_scan.sh
+      # The commit policy warns and never refuses: a squash's subject or body is
+      # fixed only by rewriting staging, and a release-candidate refused for it
+      # would refuse every later one too, since <last release>..tip still holds it.
+      - name: Commit policy (warns)
+        run: |
+          set -uo pipefail
+          if ! BEFORE="$MAIN" scripts/policy/commit_policy.sh 2>&1 | sed -u 's/^::error::/::warning::/'; then
+            echo "::warning::the commits since the last release do not all meet the commit policy; reported, not enforced"
+          fi
+
+      # --- The tools and the caches, once for both parts ---------------------
       # Every CPU the runner has, for every make below and the makes they
       # start (the Makefile is safe under -j; locally nothing changes).
       - name: Use every CPU for make
         run: echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v7
       - name: Install build deps
         timeout-minutes: 20
         run: |
@@ -62,113 +163,213 @@ jobs:
           # media suite runs over a recorded file as an independent validator
           # -- nothing links it; without it the check is a SKIP, a failure here.
           scripts/build/apt.sh bzip2 nasm gdb xz-utils libclang-rt-18-dev ffmpeg
+      # Restored here and saved, each only when it missed, as soon as
+      # `make build-all PART=plain` has built it: a cache saved at the end of
+      # the job would be lost to any later failure, the sanitizer's included.
+      #
       # The toolchains make fetches pinned (mk/toolchains.mk): zig for the
       # release-compiler pass, Emscripten for the web client the daemon embeds.
       # Keyed by the scripts, which pin the versions and the checksums.
-      - name: Restore the toolchains
-        uses: actions/cache@v6
+      - id: c-toolchains
+        name: Restore the toolchains
+        uses: actions/cache/restore@v6
         with:
-          path: |
+          path: &toolchains-path |
             third_party/zig-0.17.1
             third_party/emsdk-6.0.13
-          key: toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
+          key: &toolchains-key toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
       # Read-aloud's engine and model (ARCH-111): ONNX Runtime built minimal and
       # static from source (about 20 minutes), the converted voice model, and
       # voice input's recognizer files (ARCH-112). All are pure functions of the
       # files in the key, so a hit skips the build and a change to any of them
       # rebuilds. The timeout allows for a miss.
-      - name: Restore the speech engine and models
-        uses: actions/cache@v6
+      - id: c-tts
+        name: Restore the speech engine and models
+        uses: actions/cache/restore@v6
         with:
-          path: |
+          path: &tts-path |
             third_party/onnxruntime-1.30.0
             build/kitten
             build/moonshine
-          key: tts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build/onnxruntime.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
-      # The vendored native libraries: each script builds only what is missing,
-      # so a hit skips the download and the build. Keyed by the scripts, which pin
-      # the versions and checksums, and by the compiler that builds them.
-      - name: Restore the vendored libraries
-        uses: actions/cache@v6
+          key: &tts-key tts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build/onnxruntime.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+      # The vendored native libraries, one cache each: each script builds only
+      # what is missing, so a hit skips the download and the build. Each is
+      # keyed by its version, its own script, which pins the version and the
+      # checksum, and the compiler that builds it (the runner's gcc), so a
+      # change to one script rebuilds that library alone. The host's mbedTLS
+      # is the same build release-candidate.yml's `stage` restores for the
+      # arm64 build's host daemon, under the same key.
+      - id: c-llamacpp
+        name: Restore llama.cpp
+        uses: actions/cache/restore@v6
         with:
-          path: |
-            third_party/mbedtls-3.6.2
-            third_party/libvpx-1.17.0
-            third_party/opus-1.6.1
-            third_party/speexdsp-1.2.1
-            third_party/llamacpp-0.5.0
-          key: vendor-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh', 'scripts/build/llamacpp.sh') }}
+          path: &llamacpp-path third_party/llamacpp-0.5.0
+          key: &llamacpp-key llamacpp-0.5.0-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/llamacpp.sh') }}
+      - id: c-mbedtls
+        name: Restore mbedTLS
+        uses: actions/cache/restore@v6
+        with:
+          path: &mbedtls-path third_party/mbedtls-3.6.2
+          key: &mbedtls-key mbedtls-3.6.2-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh') }}
+      - id: c-libvpx
+        name: Restore libvpx
+        uses: actions/cache/restore@v6
+        with:
+          path: &libvpx-path third_party/libvpx-1.17.0
+          key: &libvpx-key libvpx-1.17.0-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/libvpx.sh') }}
+      - id: c-opus
+        name: Restore opus
+        uses: actions/cache/restore@v6
+        with:
+          path: &opus-path third_party/opus-1.6.1
+          key: &opus-key opus-1.6.1-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/opus.sh') }}
+      - id: c-speexdsp
+        name: Restore speexdsp
+        uses: actions/cache/restore@v6
+        with:
+          path: &speexdsp-path third_party/speexdsp-1.2.1
+          key: &speexdsp-key speexdsp-1.2.1-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/speexdsp.sh') }}
       # The web client's libraries (docs/WEB.md): the release daemon carries the
-      # client (WEB=1), so this job builds it too. Built once by their scripts
-      # and cached, keyed by the scripts and the pinned Emscripten.
-      - name: Restore the wasm libraries
-        uses: actions/cache@v6
+      # client (WEB=1), so this job builds it too. One cache each, keyed by the
+      # pinned Emscripten, the script that builds it for wasm and the native
+      # script that pins its version; the same keys as release-candidate.yml's
+      # `stage`, which builds the same libraries. scripts/build/media_wasm.sh
+      # builds whichever of libvpx, opus and speexdsp is missing, alone.
+      - id: c-wasm-mbedtls
+        name: Restore mbedTLS for wasm
+        uses: actions/cache/restore@v6
         with:
-          path: |
-            build/wasm/mbedtls
-            build/wasm/sdl3
-            build/wasm/libvpx
-            build/wasm/opus
-            build/wasm/speexdsp
-          key: wasm-emsdk6.0.13-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/sdl3_wasm.sh', 'scripts/build/media_wasm.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
+          path: &wasm-mbedtls-path build/wasm/mbedtls
+          key: &wasm-mbedtls-key wasm-mbedtls-3.6.2-emsdk6.0.13-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/mbedtls.sh') }}
+      - id: c-wasm-sdl3
+        name: Restore SDL3 for wasm
+        uses: actions/cache/restore@v6
+        with:
+          path: &wasm-sdl3-path build/wasm/sdl3
+          key: &wasm-sdl3-key wasm-sdl3-3.4.14-emsdk6.0.13-${{ hashFiles('scripts/build/sdl3_wasm.sh') }}
+      - id: c-wasm-libvpx
+        name: Restore libvpx for wasm
+        uses: actions/cache/restore@v6
+        with:
+          path: &wasm-libvpx-path build/wasm/libvpx
+          key: &wasm-libvpx-key wasm-libvpx-1.17.0-emsdk6.0.13-${{ hashFiles('scripts/build/media_wasm.sh', 'scripts/build/libvpx.sh') }}
+      - id: c-wasm-opus
+        name: Restore opus for wasm
+        uses: actions/cache/restore@v6
+        with:
+          path: &wasm-opus-path build/wasm/opus
+          key: &wasm-opus-key wasm-opus-1.6.1-emsdk6.0.13-${{ hashFiles('scripts/build/media_wasm.sh', 'scripts/build/opus.sh') }}
+      - id: c-wasm-speexdsp
+        name: Restore speexdsp for wasm
+        uses: actions/cache/restore@v6
+        with:
+          path: &wasm-speexdsp-path build/wasm/speexdsp
+          key: &wasm-speexdsp-key wasm-speexdsp-1.2.1-emsdk6.0.13-${{ hashFiles('scripts/build/media_wasm.sh', 'scripts/build/speexdsp.sh') }}
+
+      # --- PART=plain -----------------------------------------------------------
       # The full suite but the sanitizer's half (mk/full.mk, PART=plain): the
       # daemon with every feature and the web client in it, the Linux TUI, the
       # e2e client and the fuzzing harnesses; then the source checks,
-      # actionlint, every suite plainly with its timing verdicts judged, the
-      # static-link check, the end-to-end run, the release's compiler, the
-      # speech round trip, the web client in a headless Chrome and the GUI
-      # smoke on the web, and the fuzzing pass. The runner's own Chrome,
-      # driven by playwright-core at the version package.json pins.
+      # actionlint, the suites that start no thread and media, plainly with
+      # their timing verdicts judged, the static-link check, the end-to-end
+      # run, the release's compiler, the speech round trip, the web client in a
+      # headless Chrome and the GUI smoke on the web, and the fuzzing pass. The
+      # runner's own Chrome, driven by playwright-core at the version
+      # package.json pins.
       - name: Install the browser driver
         run: npm install --no-audit --no-fund
       - name: make build-all PART=plain
         timeout-minutes: 60
         run: make build-all PART=plain
+      - name: Save the toolchains
+        if: steps.c-toolchains.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *toolchains-path
+          key: *toolchains-key
+      - name: Save the speech engine and models
+        if: steps.c-tts.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *tts-path
+          key: *tts-key
+      - name: Save llama.cpp
+        if: steps.c-llamacpp.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *llamacpp-path
+          key: *llamacpp-key
+      - name: Save mbedTLS
+        if: steps.c-mbedtls.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *mbedtls-path
+          key: *mbedtls-key
+      - name: Save libvpx
+        if: steps.c-libvpx.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *libvpx-path
+          key: *libvpx-key
+      - name: Save opus
+        if: steps.c-opus.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *opus-path
+          key: *opus-key
+      - name: Save speexdsp
+        if: steps.c-speexdsp.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *speexdsp-path
+          key: *speexdsp-key
+      - name: Save mbedTLS for wasm
+        if: steps.c-wasm-mbedtls.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *wasm-mbedtls-path
+          key: *wasm-mbedtls-key
+      - name: Save SDL3 for wasm
+        if: steps.c-wasm-sdl3.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *wasm-sdl3-path
+          key: *wasm-sdl3-key
+      - name: Save libvpx for wasm
+        if: steps.c-wasm-libvpx.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *wasm-libvpx-path
+          key: *wasm-libvpx-key
+      - name: Save opus for wasm
+        if: steps.c-wasm-opus.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *wasm-opus-path
+          key: *wasm-opus-key
+      - name: Save speexdsp for wasm
+        if: steps.c-wasm-speexdsp.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *wasm-speexdsp-path
+          key: *wasm-speexdsp-key
       - name: make test-all PART=plain
         timeout-minutes: 45
         env:
           CHROME: /usr/bin/google-chrome
         run: make test-all PART=plain
 
-  threads:
-    name: full suite (thread sanitizer)
-    # The daemon is threads -- the event loop, its I/O threads, the writer, the
-    # readers and the auth pool, the worker pools -- and so are the client, its
-    # call engine and its recorder. PART=threads runs the suites whose code
-    # runs threads (marked THREADS in tests/main.c) under ThreadSanitizer, and
-    # a data race between our threads fails it (tests/tsan.supp). The plain
-    # job runs the same suites as written.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      # Every CPU the runner has, for every make below and the makes they
-      # start (the Makefile is safe under -j; locally nothing changes).
-      - name: Use every CPU for make
-        run: echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v7
-      - name: Install build deps
-        timeout-minutes: 20
-        run: |
-          set -euo pipefail
-          # ffmpeg only for ffprobe, which the media suite runs over a recorded
-          # file as an independent validator -- nothing links it. gdb so that a
-          # crash prints every thread's stack (tests/main.c).
-          scripts/build/apt.sh bzip2 nasm ffmpeg gdb
-      # The vendored native libraries: each script builds only what is missing,
-      # so a hit skips the download and the build. Keyed by the scripts, which pin
-      # the versions and checksums, and by the compiler that builds them.
-      - name: Restore the vendored libraries
-        uses: actions/cache@v6
-        with:
-          path: |
-            third_party/mbedtls-3.6.2
-            third_party/libvpx-1.17.0
-            third_party/opus-1.6.1
-            third_party/speexdsp-1.2.1
-          key: vendor-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
-      # The test binary needs no Emscripten: the web client's page is embedded
-      # from source and its loader only into a daemon built with WEB=1.
+      # --- PART=threads ---------------------------------------------------------
+      # The daemon is threads -- the event loop, its I/O threads, the writer, the
+      # readers and the auth pool, the worker pools -- and so are the client, its
+      # call engine and its recorder. PART=threads runs the suites whose code
+      # runs threads (marked THREADS or TIMED in tests/main.c) under
+      # ThreadSanitizer, their one run in the full suite, and a data race
+      # between our threads fails it (tests/tsan.supp). The test binary needs
+      # no Emscripten, and links the vendored libraries the plain part built.
       - name: make build-all PART=threads
+        timeout-minutes: 20
         run: make build-all PART=threads
       - name: make test-all PART=threads
+        timeout-minutes: 30
         run: make test-all PART=threads

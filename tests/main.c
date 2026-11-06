@@ -6,8 +6,8 @@
  * run against a real daemon is the full suite's (scripts/test/full/e2e.sh).
  *
  * SUITES[] below is the one list of the suites and of where each runs
- * (docs/TESTING.md, "The two suites"): `build/tests --list fast|full|threads`
- * prints the names the scripts select by. */
+ * (docs/TESTING.md, "The two suites"): `build/tests --list
+ * fast|full|plain|threads` prints the names the scripts select by. */
 
 #include <pthread.h>
 #include <stddef.h>
@@ -243,10 +243,14 @@ static void print_times(void) {
  *            budget -- `make test` prints each suite's time, slowest first --
  *            is FULL.
  *   THREADS  its code starts threads, so the full suite runs it under
- *            ThreadSanitizer as well as plainly; PLAIN, it does not. Checked
- *            at run time, not trusted (thread_unlisted, below). */
+ *            ThreadSanitizer, and only there; PLAIN, it does not, and the
+ *            full suite runs it plainly. Checked at run time, not trusted
+ *            (thread_unlisted, below). TIMED is THREADS and plainly as well,
+ *            for a FULL suite whose speed verdicts (CHECK_SPEED, which the
+ *            sanitizer does not judge) would otherwise be judged nowhere: a
+ *            FAST suite's are judged by the fast suite. */
 enum suite_tier { FAST, FULL };
-enum { PLAIN = 0, THREADS = 1 };
+enum { PLAIN = 0, THREADS = 1, TIMED = 2 };
 #define S(fn, tier, threads) { #fn, fn, tier, threads }
 static const struct suite {
     const char *name;
@@ -288,7 +292,7 @@ static const struct suite {
     S(run_slow_blob_tests,       FAST, THREADS),
     S(run_audio_tests,           FAST, PLAIN),
     S(run_listen_tests,          FAST, PLAIN),
-    S(run_media_tests,           FULL, THREADS),
+    S(run_media_tests,           FULL, TIMED),
     S(run_video_media_tests,     FAST, THREADS),
     S(run_emoji_tests,           FAST, PLAIN),
     S(run_tls_tests,             FAST, THREADS),
@@ -452,17 +456,20 @@ static int run_parallel(int max_jobs) {
     return total;
 }
 
-/* --list fast|full|threads: the names of the suites in the fast suite, the
- * full suite (every one), or marked THREADS, one per line, from SUITES[]. */
+/* --list fast|full|plain|threads: the names of the suites in the fast suite,
+ * the full suite (every one), the full suite's plain pass (all but THREADS),
+ * or its ThreadSanitizer pass (THREADS and TIMED), one per line, from
+ * SUITES[]. */
 static int list_suites(const char *which) {
     int fast = which && !strcmp(which, "fast"), full = which && !strcmp(which, "full"),
-        threads = which && !strcmp(which, "threads");
-    if (!fast && !full && !threads) {
-        fprintf(stderr, "usage: tests --list fast|full|threads\n");
+        plain = which && !strcmp(which, "plain"), threads = which && !strcmp(which, "threads");
+    if (!fast && !full && !plain && !threads) {
+        fprintf(stderr, "usage: tests --list fast|full|plain|threads\n");
         return 2;
     }
     for (int i = 0; i < N_SUITES; i++)
-        if (full || (fast && SUITES[i].tier == FAST) || (threads && SUITES[i].threads))
+        if (full || (fast && SUITES[i].tier == FAST) || (plain && SUITES[i].threads != THREADS) ||
+            (threads && SUITES[i].threads != PLAIN))
             printf("%s\n", SUITES[i].name);
     return 0;
 }
@@ -470,7 +477,7 @@ static int list_suites(const char *which) {
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--list")) return list_suites(argc > 2 ? argv[2] : NULL);
     if (argc > 1) {
-        fprintf(stderr, "usage: tests [--list fast|full|threads]\n");
+        fprintf(stderr, "usage: tests [--list fast|full|plain|threads]\n");
         return 2;
     }
     crash_report_install();

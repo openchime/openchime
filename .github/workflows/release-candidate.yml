@@ -6,33 +6,36 @@
 #
 #   gh workflow run release-candidate.yml --ref staging
 #
-# It takes the staging tip, in this order:
-#   1. the gate: the run is on staging's tip, in the repository RELEASE_REPO
-#      names; main can take the commit as its next release
-#      (scripts/release/main_next.sh); it is not already released, nor already
-#      a release-candidate; then the commit checks over <last release>..tip --
-#      the attribution scan, which refuses, and the commit policy, which only
-#      warns, so one bad subject already on staging does not stop every later
-#      release-candidate;
-#   2. the full suite's code tests (test-all.yml, called: `make build-all` and
-#      `make test-all`, PART=plain and threads; docs/TESTING.md);
-#   3. only when they pass, everything a release ships -- both daemons with
+# Three jobs, each its steps in sequence on one runner: GitHub bills every job
+# rounded up to a whole minute plus its set-up, so a job is added only where
+# the environment changes. It takes the staging tip, in this order:
+#   1. `test` (test-all.yml, called; no secrets): the gate -- the run is on
+#      staging's tip, in the repository RELEASE_REPO names; main can take the
+#      commit as its next release (scripts/release/main_next.sh); it is not
+#      already released, nor already a release-candidate; then the commit
+#      checks over <last release>..tip, the attribution scan, which refuses,
+#      and the commit policy, which only warns, so one bad subject already on
+#      staging does not stop every later release-candidate -- and then the
+#      full suite's code tests (`make build-all` and `make test-all`,
+#      PART=plain then threads; docs/TESTING.md);
+#   2. `stage` (the `release` environment), only when they pass: the release
+#      credentials reported; everything a release ships -- both daemons with
 #      their data and their packages, the container images, the Windows
 #      clients and their installers -- with `make build-all` PART=packages,
-#      image and windows, each checked by `make test-all` with the same PART;
-#      stamped with the BUILD ID, the short commit;
-#   4. stored by that id: the trees and binaries in the mirror bucket
-#      (DIST_MIRROR_BUCKET, which holds the apt/dnf mirror and the stored
-#      builds) under candidates/<id>/ with a signed manifest, the images in
-#      the build repository (IMAGE_REPO_BUILD) as :build-<id>;
-#   5. published: read back from the bucket and verified
-#      (scripts/release/verify_candidate.sh), the commit tagged release-N-rcK
-#      (N the number the next release would take, K counting the
-#      release-candidates for it), the image tagged :N-rcK and, when it is the
-#      newest for N, :rc, and a prerelease of the tag made with the stored
+#      image and windows, each checked by `make test-all` with the same PART,
+#      stamped with the BUILD ID, the short commit; then stored by that id:
+#      the trees and binaries in the mirror bucket (DIST_MIRROR_BUCKET, which
+#      holds the apt/dnf mirror and the stored builds) under candidates/<id>/
+#      with a signed manifest, the images in the build repository
+#      (IMAGE_REPO_BUILD) as :build-<id>;
+#   3. `publish` (the `release` environment): read back from the bucket and
+#      verified (scripts/release/verify_candidate.sh), the commit tagged
+#      release-N-rcK (N the number the next release would take, K counting
+#      the release-candidates for it), the image tagged :N-rcK and, when it is
+#      the newest for N, :rc, and a prerelease of the tag made with the stored
 #      files; last, the commit, the tag and the prerelease copied to the
-#      repository the PUBLIC_REPO variable names (sync-public), a convenience
-#      nothing here depends on.
+#      repository the PUBLIC_REPO variable names, a convenience nothing here
+#      depends on.
 # A release (release.yml) takes exactly one release-candidate, assigns it
 # release-N, packages the same binaries under N and publishes them: no
 # compiler runs after this workflow, and what was verified here is what ships.
@@ -75,139 +78,69 @@ env:
   DIST_S3_REGION: ${{ vars.DIST_S3_REGION || 'auto' }}
 
 jobs:
-  # One job for what is seconds of work each, since a job costs a runner start:
-  # the guard, the build id and the commit checks.
-  gate:
-    name: gate
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    outputs:
-      build_id: ${{ steps.id.outputs.build_id }}
-      run_number: ${{ steps.id.outputs.run_number }}
-    steps:
-      # A release-candidate is staging's tip and nothing else: dispatched on
-      # another ref, the SHA below would be a feature branch. And it is made
-      # only in the repository the RELEASE_REPO variable names; a copy of this
-      # repository without it makes none.
-      - name: Refuse any other ref or repository
-        env:
-          REF: ${{ github.ref }}
-          REPO: ${{ github.repository }}
-          RELEASE_REPO: ${{ vars.RELEASE_REPO }}
-        run: |
-          [ -n "$RELEASE_REPO" ] && [ "$REPO" = "$RELEASE_REPO" ] || {
-            echo "::error::release-candidates are made only in the repository the RELEASE_REPO variable names"; exit 1; }
-          [ "$REF" = "refs/heads/staging" ] || {
-            echo "::error::a release-candidate is made from staging only (this run is on $REF). Use: gh workflow run release-candidate.yml --ref staging"; exit 1; }
-      # The build id, and the run number the Windows file version carries (the
-      # one numeric, growing field Windows compares). The run number is this
-      # workflow's plus RUN_NUMBER_OFFSET, a repository variable (0 when
-      # unset): run numbers count from 1 again when the workflow that builds is
-      # renamed or moved, and the file version must keep growing past every
-      # build already shipped.
-      - id: id
-        name: build id
-        env:
-          OFFSET: ${{ vars.RUN_NUMBER_OFFSET }}
-        run: |
-          set -euo pipefail
-          offset="${OFFSET:-0}"
-          grep -qE '^[0-9]+$' <<<"$offset" || {
-            echo "::error::RUN_NUMBER_OFFSET is '${offset}', not a whole number"; exit 1; }
-          run=$(( GITHUB_RUN_NUMBER + offset ))
-          echo "build_id=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
-          echo "run_number=${run}" >> "$GITHUB_OUTPUT"
-          echo "build ${GITHUB_SHA:0:7} (${GITHUB_SHA}), run ${run} (${GITHUB_RUN_NUMBER} + ${offset})"
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      # The commit: still staging's tip, not already released or a
-      # release-candidate, and one main can take as its next release
-      # (scripts/release/main_next.sh: it descends from the last release's
-      # candidate and the newest release-N, and the documentation promoted to
-      # main applies on it). Asked again by publish, inside the `release`
-      # group, before the number is taken.
-      - name: The commit is staging's tip, and main can take it
-        run: |
-          set -euo pipefail
-          git fetch --quiet --tags --force origin "+refs/heads/main:refs/remotes/origin/main" "+refs/heads/staging:refs/remotes/origin/staging"
-          tip=$(git rev-parse origin/staging)
-          [ "$tip" = "$GITHUB_SHA" ] || {
-            echo "::error::${GITHUB_SHA:0:7} is not staging's tip (${tip:0:7}); dispatch again: gh workflow run release-candidate.yml --ref staging"; exit 1; }
-          released=$(git tag --points-at "$GITHUB_SHA" | grep -E '^release-[0-9]+$' || true)
-          [ -z "$released" ] || { echo "::error::${GITHUB_SHA:0:7} is already ${released}"; exit 1; }
-          rcs=$(git tag --points-at "$GITHUB_SHA" | grep -E '^release-[0-9]+-rc[0-9]+$' || true)
-          [ -z "$rcs" ] || { echo "::error::${GITHUB_SHA:0:7} is already $(echo $rcs)"; exit 1; }
-          rc=0; scripts/release/main_next.sh release "$GITHUB_SHA" "$(scripts/release/version.sh next)" >/dev/null || rc=$?
-          [ "$rc" -eq 0 ] || { echo "::error::main cannot take ${GITHUB_SHA:0:7} as its next release (above)"; exit 1; }
-          # main holds snapshots, not staging's commits: what a release of this
-          # commit brings starts at the last release's candidate
-          # (scripts/release/main_next.sh base).
-          base=$(scripts/release/main_next.sh base "$GITHUB_SHA")
-          echo "MAIN=${base}" >> "$GITHUB_ENV"
-          echo "${base:0:7}..${GITHUB_SHA:0:7}:"
-          git log --format='  %h %s' "${base}..${GITHUB_SHA}"
-      # The attribution scan refuses: a commit naming the banned pattern must
-      # not be built, stored or released, and is removed from staging by hand
-      # (CONTRIBUTING.md). Scanned as a push of <last release>..tip, since the
-      # script judges only a push's or a pull request's commits.
-      - name: Attribution scan
-        env:
-          EVENT: push
-          AFTER: ${{ github.sha }}
-          REF: ${{ github.ref }}
-          BASE_REF: ""
-        run: BEFORE="$MAIN" scripts/policy/attribution_scan.sh
-      # The commit policy warns and never refuses: a squash's subject or body is
-      # fixed only by rewriting staging, and a release-candidate refused for it
-      # would refuse every later one too, since <last release>..tip still holds it.
-      - name: Commit policy (warns)
-        run: |
-          set -uo pipefail
-          if ! BEFORE="$MAIN" scripts/policy/commit_policy.sh 2>&1 | sed -u 's/^::error::/::warning::/'; then
-            echo "::warning::the commits since the last release do not all meet the commit policy; reported, not enforced"
-          fi
+  # The gate and the full suite's code tests, before anything a release ships
+  # is built: a failure here costs the tests' minutes, not the build's.
+  # test-all.yml is called rather than copied: its end-to-end and web checks
+  # run the daemon in development mode, which keeps them out of this file
+  # (scripts/test/fast/release_lint.sh). It hands on the build id and the run
+  # number.
+  test:
+    name: test
+    uses: ./.github/workflows/test-all.yml
+    permissions:
+      contents: read
 
-  # Reported here, in seconds, so a release-candidate says whether a release
-  # of it could publish.
-  #
-  # It REPORTS and never fails: what a release needs beyond what this run
-  # itself uses is the release's to have, and the gap is what the summary
-  # says. It runs beside the tests, so the gap is known before the build jobs
-  # start.
-  preflight:
-    name: check release credentials
-    needs: gate
+  # Everything a release ships, built, checked and stored, in one job: the
+  # release credentials reported; the amd64 and then the arm64 daemon with
+  # their packages; the two images and the manifest list that indexes them;
+  # the Windows clients and their installers; and the build stored by its id.
+  # In the `release` environment for the registry token and the signing key;
+  # each secret is mapped into the one step that uses it.
+  stage:
+    name: stage
+    needs: test
     runs-on: ubuntu-24.04
-    timeout-minutes: 2
-    # The signing key and the registry tokens are the release environment's
-    # secrets: a job outside it sees them as unset.
+    # A warm run takes about 15 minutes; a cold speech cache compiles ONNX
+    # Runtime, about 25 minutes for each architecture.
+    timeout-minutes: 75
     environment: release
+    permissions:
+      contents: read
     env:
-      # Mapped in rather than read inline: a secret cannot be tested in an `if:`
-      # at job level, and mapping makes the required set one readable list.
-      DIST_S3_ACCESS_KEY: ${{ secrets.DIST_S3_ACCESS_KEY }}
-      DIST_S3_SECRET_KEY: ${{ secrets.DIST_S3_SECRET_KEY }}
-      DIST_S3_ENDPOINT:   ${{ vars.DIST_S3_ENDPOINT }}
-      DIST_BUCKET:        ${{ vars.DIST_BUCKET }}
-      DIST_S3_MIRROR_ACCESS_KEY: ${{ secrets.DIST_S3_MIRROR_ACCESS_KEY }}
-      DIST_S3_MIRROR_SECRET_KEY: ${{ secrets.DIST_S3_MIRROR_SECRET_KEY }}
-      DIST_MIRROR_BUCKET:        ${{ vars.DIST_MIRROR_BUCKET }}
-      REPO_SIGNING_KEY:   ${{ secrets.REPO_SIGNING_KEY }}
-      IMAGE_REPO_BUILD:   ${{ vars.IMAGE_REPO_BUILD }}
-      IMAGE_REGISTRY_TOKEN_BUILD: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
-      TS_ENDPOINT:        ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
-      TS_ACCOUNT:         ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
-      TS_PROFILE:         ${{ secrets.TRUSTED_SIGNING_PROFILE }}
-      AZ_TENANT:          ${{ secrets.AZURE_TENANT_ID }}
-      AZ_CLIENT:          ${{ secrets.AZURE_CLIENT_ID }}
-      AZ_SECRET:          ${{ secrets.AZURE_CLIENT_SECRET }}
-      DRY: "true"   # a release-candidate reports a missing credential and goes on
-      # As in `publish`, which is where these values are defined and explained.
-      DIST_BASE_URL: ${{ vars.DIST_BASE_URL }}
-      DIST_VERIFY_URL: ${{ vars.DIST_VERIFY_URL }}
+      BUILD_ID: ${{ needs.test.outputs.build_id }}
+      OC_BUILD_ID: ${{ needs.test.outputs.build_id }}
+      # The offset run number from test-all.yml, which the Windows binaries
+      # carry and the release checks them against; not GITHUB_RUN_NUMBER.
+      BUILD_NUM: ${{ needs.test.outputs.run_number }}
+      RUN_NUMBER: ${{ needs.test.outputs.run_number }}
+      DIST_S3_ENDPOINT: ${{ vars.DIST_S3_ENDPOINT }}
+      DIST_MIRROR_BUCKET: ${{ vars.DIST_MIRROR_BUCKET }}
     steps:
+      # --- The release credentials ------------------------------------------------
+      # Reported first, in seconds, so a release-candidate says whether a
+      # release of it could publish. They REPORT and never fail: what a
+      # release needs beyond what this run itself uses is the release's to
+      # have, and the gap is what the summary says.
       - name: required credentials
+        env:
+          # Mapped in rather than read inline: a secret cannot be tested in an
+          # `if:`, and mapping makes the required set one readable list.
+          DIST_S3_ACCESS_KEY: ${{ secrets.DIST_S3_ACCESS_KEY }}
+          DIST_S3_SECRET_KEY: ${{ secrets.DIST_S3_SECRET_KEY }}
+          DIST_BUCKET:        ${{ vars.DIST_BUCKET }}
+          DIST_S3_MIRROR_ACCESS_KEY: ${{ secrets.DIST_S3_MIRROR_ACCESS_KEY }}
+          DIST_S3_MIRROR_SECRET_KEY: ${{ secrets.DIST_S3_MIRROR_SECRET_KEY }}
+          REPO_SIGNING_KEY:   ${{ secrets.REPO_SIGNING_KEY }}
+          IMAGE_REPO_BUILD:   ${{ vars.IMAGE_REPO_BUILD }}
+          IMAGE_REGISTRY_TOKEN_BUILD: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
+          TS_ENDPOINT:        ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          TS_ACCOUNT:         ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          TS_PROFILE:         ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+          AZ_TENANT:          ${{ secrets.AZURE_TENANT_ID }}
+          AZ_CLIENT:          ${{ secrets.AZURE_CLIENT_ID }}
+          AZ_SECRET:          ${{ secrets.AZURE_CLIENT_SECRET }}
+          DIST_BASE_URL: ${{ vars.DIST_BASE_URL }}
+          DIST_VERIFY_URL: ${{ vars.DIST_VERIFY_URL }}
         run: |
           set -u
           missing=""
@@ -260,12 +193,8 @@ jobs:
 
           # A release-candidate REPORTS and continues: it is made whether or
           # not a release could follow.
-          if [ "$DRY" = "true" ]; then
-            echo "::warning::missing release credentials:$missing (dry run — not failing)"
-            exit 0
-          fi
-          echo "::error::missing release credentials:$missing"
-          exit 1
+          echo "::warning::missing release credentials:$missing (a release-candidate reports them and goes on)"
+          exit 0
 
       # The release closes the OC issues it shipped on openchime/openchime with
       # PUBLIC_TOKEN. A token that cannot is found out here, not as a warning
@@ -291,6 +220,8 @@ jobs:
       # true -- so this REPORTS and never fails: a release is publishable
       # without it, only unreachable at the public URL.
       - name: probe the published base URL
+        env:
+          DIST_VERIFY_URL: ${{ vars.DIST_VERIFY_URL }}
         run: |
           set -u
           if curl -fsI --max-time 20 "$DIST_VERIFY_URL/openchime-archive-keyring.gpg" >/dev/null 2>&1; then
@@ -298,75 +229,41 @@ jobs:
             echo "Verification URL (\`$DIST_VERIFY_URL\`): serving." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "::warning::$DIST_VERIFY_URL does not serve the archive keyring -- \
-          a release would publish, and its smoke job would fail."
+          a release would publish, and its smoke would fail."
             {
               echo
               echo "**Verification URL (\`$DIST_VERIFY_URL\`): NOT serving.**"
               echo
-              echo "A release would publish, and its \`smoke\` job would fail."
+              echo "A release would publish, and its smoke would fail."
               echo "The URL is served outside this workflow."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-  # The full suite's code tests, before anything a release ships is built: a
-  # failure here costs the tests' minutes, not the build's. test-all.yml is
-  # called rather than copied: its end-to-end and web checks run the daemon
-  # in development mode, which keeps them out of this file
-  # (scripts/test/fast/release_lint.sh).
-  tests:
-    name: tests
-    needs: gate
-    uses: ./.github/workflows/test-all.yml
-    permissions:
-      contents: read
-
-  packages:
-    name: ${{ matrix.arch }} daemon
-    needs: [gate, tests]
-    runs-on: ubuntu-24.04
-    # Only once the tests passed. A cache miss compiles ONNX Runtime for
-    # read-aloud (below) before the daemon. `make build-all PART=packages`
-    # and `make test-all PART=packages` (mk/full.mk), for ARCH.
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            make_arch: x86_64
-            oc_arch: ""
-          # Cross-built with zig on the same x86 runner (make ARCH=aarch64).
-          # Build only: the binary is packaged and shipped, never run here;
-          # what runs below (the render, the install) runs for amd64 alone.
-          - arch: arm64
-            make_arch: aarch64
-            oc_arch: aarch64
-    env:
-      BUILD_ID: ${{ needs.gate.outputs.build_id }}
-      OC_BUILD_ID: ${{ needs.gate.outputs.build_id }}
-      # The packaging scripts are exercised here with a placeholder version so
-      # that a package that cannot be built or installed stops the run; the
-      # packages themselves are not kept. A release packages the same binary
-      # under the number it assigns (release.yml).
-      VERSION: "0"
-      MAKE_ARCH: ${{ matrix.make_arch }}
-      # What the vendored-library scripts call the architecture, for the
-      # licence file assembled outside make (packaging/licenses.sh): the
-      # arm64 job has only its own copies of the vendored texts.
-      OC_ARCH: ${{ matrix.oc_arch }}
-      # Every artifact this job produces lands under dist/<platform>/, which is
-      # also the artifact's name -- see the upload at the end of the job for why
-      # those two being the same string is what keeps the layout intact across
-      # the artifact round-trip.
-      PLATFORM: linux-${{ matrix.arch }}
-      DIST: dist/linux-${{ matrix.arch }}
-    steps:
+      # --- The tools and the shared caches -----------------------------------------
       # Every CPU the runner has, for every make below and the makes they
       # start (the Makefile is safe under -j; locally nothing changes).
       - name: Use every CPU for make
         run: echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # the release-* tags, for the prune at the end
+      - name: Install build dependencies
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          # scripts/build/apt.sh: the mirror rewritten, each apt-get bounded
+          # and retried, so a stall fails the step instead of holding the job.
+          # bzip2 for the mbedTLS tarball; nasm for libvpx's assembly; xz-utils
+          # for the toolchain tarballs; rpm supplies rpmbuild; nsis and
+          # python3-pefile for the Windows installer and its check; buildah for
+          # the images; rclone and gnupg to sign and store the build.
+          scripts/build/apt.sh bzip2 rpm nasm xz-utils nsis python3-pefile buildah rclone gnupg
+          buildah version
 
+      # Every cache is restored once and saved, only when it missed, as soon
+      # as the step that builds it has run: a cache saved at the end of the
+      # job would be lost to any later failure.
+      #
       # The toolchains make fetches pinned (mk/toolchains.mk): zig, whose
       # bundled clang ships glibc stub libraries for every version back to 2.17
       # and links against whichever one it is asked for, regardless of the
@@ -374,36 +271,65 @@ jobs:
       # with no container in the picture, and an arm64 one off an x86 runner;
       # and Emscripten for the web client the daemon embeds. Keyed by the
       # scripts, which pin the versions and the checksums.
-      - name: Restore the toolchains
-        uses: actions/cache@v6
+      - id: c-toolchains
+        name: Restore the toolchains
+        uses: actions/cache/restore@v6
         with:
-          path: |
+          path: &toolchains-path |
             third_party/zig-0.17.1
             third_party/emsdk-6.0.13
-          key: toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
+          key: &toolchains-key toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
+      # The web client's libraries (docs/WEB.md): the daemon is never built
+      # without the client it serves -- the page and loader are compiled into it
+      # (daemon/webapp.h). One cache each, keyed by the pinned Emscripten, the
+      # script that builds it for wasm and the native script that pins its
+      # version; the same keys as test-all.yml, which builds the same
+      # libraries.
+      - id: c-wasm-mbedtls
+        name: Restore mbedTLS for wasm
+        uses: actions/cache/restore@v6
+        with:
+          path: &wasm-mbedtls-path build/wasm/mbedtls
+          key: &wasm-mbedtls-key wasm-mbedtls-3.6.2-emsdk6.0.13-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/mbedtls.sh') }}
+      - id: c-wasm-sdl3
+        name: Restore SDL3 for wasm
+        uses: actions/cache/restore@v6
+        with:
+          path: &wasm-sdl3-path build/wasm/sdl3
+          key: &wasm-sdl3-key wasm-sdl3-3.4.14-emsdk6.0.13-${{ hashFiles('scripts/build/sdl3_wasm.sh') }}
+      - id: c-wasm-libvpx
+        name: Restore libvpx for wasm
+        uses: actions/cache/restore@v6
+        with:
+          path: &wasm-libvpx-path build/wasm/libvpx
+          key: &wasm-libvpx-key wasm-libvpx-1.17.0-emsdk6.0.13-${{ hashFiles('scripts/build/media_wasm.sh', 'scripts/build/libvpx.sh') }}
+      - id: c-wasm-opus
+        name: Restore opus for wasm
+        uses: actions/cache/restore@v6
+        with:
+          path: &wasm-opus-path build/wasm/opus
+          key: &wasm-opus-key wasm-opus-1.6.1-emsdk6.0.13-${{ hashFiles('scripts/build/media_wasm.sh', 'scripts/build/opus.sh') }}
+      - id: c-wasm-speexdsp
+        name: Restore speexdsp for wasm
+        uses: actions/cache/restore@v6
+        with:
+          path: &wasm-speexdsp-path build/wasm/speexdsp
+          key: &wasm-speexdsp-key wasm-speexdsp-1.2.1-emsdk6.0.13-${{ hashFiles('scripts/build/media_wasm.sh', 'scripts/build/speexdsp.sh') }}
 
-      - name: Install build dependencies
-        timeout-minutes: 20
-        run: |
-          set -euo pipefail
-          # scripts/build/apt.sh: the mirror rewritten, each apt-get bounded
-          # and retried, so a stall fails the step instead of holding the job.
-          # rpm supplies rpmbuild; bzip2 for the mbedTLS tarball; nasm for libvpx's assembly; xz-utils for the toolchain tarballs.
-          scripts/build/apt.sh bzip2 rpm nasm xz-utils
-
+      # --- The amd64 daemon and its packages ----------------------------------------
       # Read-aloud's engine and model (ARCH-111), built by make with the same
       # toolchain and glibc target as the daemon: ONNX Runtime compiled from
       # source as one minimal static archive, per architecture; the voice model
       # converted; and voice input's recognizer files, fetched as published
       # (ARCH-112). Functions of the files in the key, so a hit skips about 25
-      # minutes and a change rebuilds. The arm64 archive is cross-built with
-      # the host's protoc, which the script builds on its own, protoc alone,
-      # when the cache has none (it is in this cache too); the arm64 job
-      # never builds the host's archive.
-      - name: Restore the speech engine and models
-        uses: actions/cache@v6
+      # minutes and a change rebuilds. One cache per architecture, both with
+      # the same path list (a cache's path list is part of its version): what
+      # an architecture never builds is simply absent from what it saves.
+      - id: c-tts-amd64
+        name: Restore the amd64 speech engine and models
+        uses: actions/cache/restore@v6
         with:
-          path: |
+          path: &tts-release-path |
             third_party/onnxruntime-1.30.0
             third_party/onnxruntime-1.30.0-aarch64
             third_party/onnxruntime-1.30.0-build/out/MinSizeRel/_deps/protobuf-build/protoc*
@@ -411,227 +337,303 @@ jobs:
             third_party/llamacpp-0.5.0-aarch64
             build/kitten
             build/moonshine
-          key: tts-release-${{ matrix.arch }}-zig0.17.1-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
-
-      # mbedTLS and libopus as this job builds them: with zig's clang against
-      # glibc 2.34 for the binary that ships (the arm64 job also builds the
-      # host's mbedTLS, for the featureless host daemon that writes its data
-      # manifests, mk/daemon.mk). CI's copies are gcc-built for the host and
-      # cannot stand in, so these have a cache of their own, per architecture,
-      # keyed by the scripts that build them and the compiler wrapper and
-      # toolchain they build with. A hit is a no-op build: each script returns
-      # at once when its archive already exists. A path a job never builds is
-      # simply absent from what it saves.
-      #
-      # A step of its own, NOT more paths in tts-release-*: a cache's path
-      # list is part of its version, so adding to that one would miss it and
-      # pay the ONNX Runtime build from cold.
-      - name: Restore the release's vendored libraries
-        uses: actions/cache@v6
+          key: &tts-amd64-key tts-release-amd64-zig0.17.1-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+      # mbedTLS and libopus as the release builds them: with zig's clang
+      # against glibc 2.34 for the binary that ships. CI's copies are
+      # gcc-built for the host and cannot stand in, so these have caches of
+      # their own, one per library and architecture, keyed by the version, the
+      # script that builds it and the compiler wrapper and toolchain it builds
+      # with. A hit is a no-op build: each script returns at once when its
+      # archive already exists.
+      - id: c-mbedtls-amd64
+        name: Restore the amd64 release's mbedTLS
+        uses: actions/cache/restore@v6
         with:
-          path: |
-            third_party/mbedtls-3.6.2
-            third_party/mbedtls-3.6.2-aarch64
-            third_party/opus-1.6.1
-            third_party/opus-1.6.1-aarch64
-          key: vendor-release-${{ matrix.arch }}-zig0.17.1-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/opus.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
-
-      # The web client's libraries (docs/WEB.md): the daemon is never built
-      # without the client it serves -- the page and loader are compiled into it
-      # (daemon/webapp.h). Built once by their scripts and cached, keyed by the
-      # scripts and the pinned Emscripten.
-      - name: Restore the wasm libraries
-        uses: actions/cache@v6
+          path: &mbedtls-amd64-path third_party/mbedtls-3.6.2
+          key: &mbedtls-amd64-key mbedtls-3.6.2-release-amd64-zig0.17.1-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
+      - id: c-opus-amd64
+        name: Restore the amd64 release's opus
+        uses: actions/cache/restore@v6
         with:
-          path: |
-            build/wasm/mbedtls
-            build/wasm/sdl3
-            build/wasm/libvpx
-            build/wasm/opus
-            build/wasm/speexdsp
-          key: wasm-emsdk6.0.13-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/sdl3_wasm.sh', 'scripts/build/media_wasm.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
-      # RELEASE=1 ARCH=...: zig's clang against glibc 2.34 for the architecture
-      # asked for, every vendored library cross-built the same way (OC_ARCH to
-      # the scripts), the binary stripped at the link. No header comes from the
-      # host: libc's are zig's (the runner's glibc 2.39 headers would redirect
-      # strtol to __isoc23_strtol, a 2.38 symbol the 2.34 stubs do not have),
-      # and SQLite is vendored. One binary per architecture; everything
-      # downstream consumes this exact file, copied with its read-aloud and
-      # voice-input data and the web client's wasm into DIST, and packaged
-      # there: the .rpm, the .deb and the tarball. An arm64 build writes its
-      # data manifests with the host's daemon, built from the same sources
-      # (mk/daemon.mk).
-      - name: make build-all PART=packages
-        run: make build-all PART=packages ARCH="$MAKE_ARCH" DIST="$DIST" PKG_VERSION="$VERSION" OC_BUILD_ID="$BUILD_ID"
+          path: &opus-amd64-path third_party/opus-1.6.1
+          key: &opus-amd64-key opus-1.6.1-release-amd64-zig0.17.1-${{ hashFiles('scripts/build/opus.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
+      # RELEASE=1: zig's clang against glibc 2.34 for the host's architecture,
+      # every vendored library built the same way, the binary stripped at the
+      # link. No header comes from the host: libc's are zig's (the runner's
+      # glibc 2.39 headers would redirect strtol to __isoc23_strtol, a 2.38
+      # symbol the 2.34 stubs do not have), and SQLite is vendored. One binary
+      # per architecture; everything downstream consumes this exact file,
+      # copied with its read-aloud and voice-input data and the web client's
+      # wasm into DIST, and packaged there: the .rpm, the .deb and the tarball,
+      # under a placeholder version, which a release packages again under its
+      # number (release.yml).
+      - id: build-amd64
+        name: make build-all PART=packages (amd64)
+        env:
+          VERSION: "0"
+          DIST: dist/linux-amd64
+        run: make build-all PART=packages ARCH=x86_64 DIST="$DIST" PKG_VERSION="$VERSION" OC_BUILD_ID="$BUILD_ID"
       # Saved as soon as the build has run, whether or not the job goes on to
-      # pass: actions/cache saves only after a successful job, so every run
-      # that failed downstream of the engine build paid the twenty minutes
-      # again. The scripts leave a half-made archive or model in a .new
-      # directory, never under these paths, so what is saved is whole.
-      - name: Save the speech engine and models
-        if: always()
+      # pass: every run that failed downstream of the engine build used to
+      # pay the twenty minutes again. The scripts leave a half-made archive or
+      # model in a .new directory, never under these paths, so what is saved
+      # is whole.
+      - name: Save the amd64 speech engine and models
+        if: always() && steps.build-amd64.outcome != 'skipped' && steps.c-tts-amd64.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
-          path: |
-            third_party/onnxruntime-1.30.0
-            third_party/onnxruntime-1.30.0-aarch64
-            third_party/onnxruntime-1.30.0-build/out/MinSizeRel/_deps/protobuf-build/protoc*
-            third_party/llamacpp-0.5.0
-            third_party/llamacpp-0.5.0-aarch64
-            build/kitten
-            build/moonshine
-          key: tts-release-${{ matrix.arch }}-zig0.17.1-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
-
+          path: *tts-release-path
+          key: *tts-amd64-key
+      - name: Save the amd64 release's mbedTLS
+        if: steps.c-mbedtls-amd64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *mbedtls-amd64-path
+          key: *mbedtls-amd64-key
+      - name: Save the amd64 release's opus
+        if: steps.c-opus-amd64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *opus-amd64-path
+          key: *opus-amd64-key
+      - name: Save the toolchains
+        if: steps.c-toolchains.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *toolchains-path
+          key: *toolchains-key
+      - name: Save mbedTLS for wasm
+        if: steps.c-wasm-mbedtls.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *wasm-mbedtls-path
+          key: *wasm-mbedtls-key
+      - name: Save SDL3 for wasm
+        if: steps.c-wasm-sdl3.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *wasm-sdl3-path
+          key: *wasm-sdl3-key
+      - name: Save libvpx for wasm
+        if: steps.c-wasm-libvpx.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *wasm-libvpx-path
+          key: *wasm-libvpx-key
+      - name: Save opus for wasm
+        if: steps.c-wasm-opus.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *wasm-opus-path
+          key: *wasm-opus-key
+      - name: Save speexdsp for wasm
+        if: steps.c-wasm-speexdsp.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *wasm-speexdsp-path
+          key: *wasm-speexdsp-key
       # What the release ships, checked (scripts/test/full/, docs/TESTING.md):
       # the glibc floor, one binary in all three packages, speech on the
-      # release binary, the .deb installed and speaking, and its unit file. On
-      # the arm64 job, built on this x86 runner, the checks that run the binary
-      # say so and skip.
-      - name: make test-all PART=packages
-        run: make test-all PART=packages ARCH="$MAKE_ARCH" DIST="$DIST" PKG_VERSION="$VERSION"
-
+      # release binary, the .deb installed and speaking, and its unit file.
+      - name: make test-all PART=packages (amd64)
+        env:
+          VERSION: "0"
+          DIST: dist/linux-amd64
+        run: make test-all PART=packages ARCH=x86_64 DIST="$DIST" PKG_VERSION="$VERSION"
       # What the build keeps: the binary and the data beside it, as one
       # tree under a directory named for the build, which is what the image
       # is laid from (packaging/image-context.sh) and what a release packages
-      # under its number. The placeholder packages above are not kept.
-      - name: Keep the built tree
+      # under its number. The placeholder packages above are not kept. The
+      # licence file is assembled here, where the vendored texts are
+      # (packaging/licenses.sh); the release packages from this tree on a
+      # runner that has none.
+      - name: Keep the built tree (amd64)
+        env:
+          DIST: dist/linux-amd64
+          PLATFORM: linux-amd64
         run: |
           set -euo pipefail
-          name="openchimed-build-${BUILD_ID}-linux-${{ matrix.arch }}"
+          name="openchimed-build-${BUILD_ID}-${PLATFORM}"
           mkdir -p "tree/$name"
           cp -r "$DIST/openchimed" "$DIST/tts" "$DIST/stt" "$DIST/web" "tree/$name/"
-          # The licence file, assembled here where the vendored texts are
-          # (packaging/licenses.sh); the release packages from this tree on a
-          # runner that has none.
           packaging/licenses.sh third_party/mbedtls-3.6.2 > "tree/$name/copyright"
           mkdir -p "candidate/$PLATFORM"
           tar -C tree --sort=name --owner=0 --group=0 --numeric-owner --mtime="@0" \
             -czf "candidate/$PLATFORM/$name.tar.gz" "$name"
           ls -l "candidate/$PLATFORM"
-      # Named for the platform: the store job downloads without merge-multiple,
-      # which rebuilds candidate/<platform>/ on the other side. A hand-off to
-      # the jobs below and nothing more, so it is kept three days: what is kept
-      # is in the bucket.
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ${{ env.PLATFORM }}
-          path: candidate/${{ env.PLATFORM }}/*.tar.gz
-          retention-days: 3
-          if-no-files-found: error
 
-  # Built with buildah, not docker, from the packages job's tarball: the image
-  # is the released binary and its data laid onto a glibc base (Dockerfile),
-  # with no compile and no RUN step inside it, so an arm64 image comes off the
-  # x86 runner with `--arch arm64` and no emulation (`make build-all
-  # PART=image`, mk/full.mk). The per-arch images and the manifest list that
-  # indexes them are two jobs; the per-arch tags are an
-  # implementation detail, nothing is tagged as a release until a release
-  # copies the manifest list to :N (release.yml). Pushed under the build id to
-  # the build repository, IMAGE_REPO_BUILD, every time: a build is complete
-  # only with its image there. The registry takes basic auth, the
-  # IMAGE_REGISTRY_USER variable and IMAGE_REGISTRY_TOKEN_BUILD in the
-  # `release` environment.
-  image:
-    name: ${{ matrix.arch }} image
-    needs: [gate, packages]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    environment: release
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [amd64, arm64]
-    env:
-      BUILD_ID: ${{ needs.gate.outputs.build_id }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: linux-${{ matrix.arch }}
-          path: candidate/linux-${{ matrix.arch }}
-      - name: Install buildah
-        timeout-minutes: 20
+      # --- The arm64 daemon and its packages ----------------------------------------
+      # Cross-built with zig on this x86 runner (make ARCH=aarch64), into
+      # directories of its own (third_party/<name>-aarch64, build/aarch64).
+      # Build only: the binary is packaged and shipped, never run here; what
+      # runs (the render, the install) runs for amd64 alone. It writes its data
+      # manifests with a featureless HOST daemon, built with the runner's gcc
+      # (mk/daemon.mk), which links the host's mbedTLS from
+      # third_party/mbedtls-3.6.2 -- where the amd64 release's zig-built copy
+      # is now. So the amd64 release's own libraries are set aside first, and
+      # the gcc-built host mbedTLS restored in their place, from the cache
+      # test-all.yml saves under the same key: the arm64 build then sees
+      # exactly what it saw on a runner of its own, and the arm64 speech cache
+      # saves only what is its own.
+      - name: Set the amd64 release's libraries aside
         run: |
           set -euo pipefail
-          scripts/build/apt.sh buildah
-          buildah version
-      # The build context is the extracted tarball plus the entrypoint -- exactly
-      # what an operator extracting the release would have -- and the pinned
-      # Litestream for this architecture, checked against its published digest
-      # (packaging/image-context.sh, ARCH-3); the entrypoint writes its
-      # configuration at boot.
-      - name: make build-all PART=image
+          mkdir -p "$RUNNER_TEMP/amd64"
+          for d in mbedtls-3.6.2 onnxruntime-1.30.0 llamacpp-0.5.0; do
+            if [ -e "third_party/$d" ]; then mv "third_party/$d" "$RUNNER_TEMP/amd64/"; fi
+          done
+      - id: c-tts-arm64
+        name: Restore the arm64 speech engine and models
+        uses: actions/cache/restore@v6
+        with:
+          path: *tts-release-path
+          key: &tts-arm64-key tts-release-arm64-zig0.17.1-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+      - id: c-mbedtls-arm64
+        name: Restore the arm64 release's mbedTLS
+        uses: actions/cache/restore@v6
+        with:
+          path: &mbedtls-arm64-path third_party/mbedtls-3.6.2-aarch64
+          key: &mbedtls-arm64-key mbedtls-3.6.2-release-arm64-zig0.17.1-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
+      - id: c-opus-arm64
+        name: Restore the arm64 release's opus
+        uses: actions/cache/restore@v6
+        with:
+          path: &opus-arm64-path third_party/opus-1.6.1-aarch64
+          key: &opus-arm64-key opus-1.6.1-release-arm64-zig0.17.1-${{ hashFiles('scripts/build/opus.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
+      - id: c-mbedtls-host
+        name: Restore the host's mbedTLS
+        uses: actions/cache/restore@v6
+        with:
+          path: &mbedtls-host-path third_party/mbedtls-3.6.2
+          key: &mbedtls-host-key mbedtls-3.6.2-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh') }}
+      - id: build-arm64
+        name: make build-all PART=packages (arm64)
+        env:
+          VERSION: "0"
+          DIST: dist/linux-arm64
+          # What the vendored-library scripts call the architecture, for the
+          # licence file assembled outside make (packaging/licenses.sh).
+          OC_ARCH: aarch64
+        run: make build-all PART=packages ARCH=aarch64 DIST="$DIST" PKG_VERSION="$VERSION" OC_BUILD_ID="$BUILD_ID"
+      - name: Save the arm64 speech engine and models
+        if: always() && steps.build-arm64.outcome != 'skipped' && steps.c-tts-arm64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *tts-release-path
+          key: *tts-arm64-key
+      - name: Save the arm64 release's mbedTLS
+        if: steps.c-mbedtls-arm64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *mbedtls-arm64-path
+          key: *mbedtls-arm64-key
+      - name: Save the arm64 release's opus
+        if: steps.c-opus-arm64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *opus-arm64-path
+          key: *opus-arm64-key
+      - name: Save the host's mbedTLS
+        if: steps.c-mbedtls-host.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *mbedtls-host-path
+          key: *mbedtls-host-key
+      # On arm64, built on this x86 runner, the checks that run the binary say
+      # so and skip.
+      - name: make test-all PART=packages (arm64)
+        env:
+          VERSION: "0"
+          DIST: dist/linux-arm64
+          OC_ARCH: aarch64
+        run: make test-all PART=packages ARCH=aarch64 DIST="$DIST" PKG_VERSION="$VERSION"
+      # The licence file from the arm64 build's own copies of the vendored
+      # texts (OC_ARCH).
+      - name: Keep the built tree (arm64)
+        env:
+          DIST: dist/linux-arm64
+          PLATFORM: linux-arm64
+          OC_ARCH: aarch64
+        run: |
+          set -euo pipefail
+          name="openchimed-build-${BUILD_ID}-${PLATFORM}"
+          mkdir -p "tree/$name"
+          cp -r "$DIST/openchimed" "$DIST/tts" "$DIST/stt" "$DIST/web" "tree/$name/"
+          packaging/licenses.sh third_party/mbedtls-3.6.2 > "tree/$name/copyright"
+          mkdir -p "candidate/$PLATFORM"
+          tar -C tree --sort=name --owner=0 --group=0 --numeric-owner --mtime="@0" \
+            -czf "candidate/$PLATFORM/$name.tar.gz" "$name"
+          ls -l "candidate/$PLATFORM"
+
+      # --- The images ---------------------------------------------------------------
+      # Built with buildah, not docker, from each kept tree: the image is the
+      # released binary and its data laid onto a glibc base (Dockerfile), with
+      # no compile and no RUN step inside it, so the arm64 image comes off the
+      # x86 runner with `--arch arm64` and no emulation (`make build-all
+      # PART=image`, mk/full.mk). The context is the extracted tarball plus the
+      # entrypoint -- exactly what an operator extracting the release would
+      # have -- and the pinned Litestream for the architecture, checked against
+      # its published digest (packaging/image-context.sh, ARCH-3); the
+      # entrypoint writes its configuration at boot. The per-architecture tags
+      # are an implementation detail, and nothing is tagged as a release until
+      # a release copies the manifest list to :N (release.yml). Pushed under
+      # the build id to the build repository, IMAGE_REPO_BUILD, every time: a
+      # build is complete only with its image there. The registry takes basic
+      # auth, the IMAGE_REGISTRY_USER variable and IMAGE_REGISTRY_TOKEN_BUILD
+      # in the `release` environment. The image starts and answers /healthz,
+      # and its database replicates and restores (scripts/test/full/image.sh,
+      # db_restore.sh); the arm64 image is not for this runner, and the checks
+      # say so and skip. Each digest is buildah's own report of what it pushed
+      # (--digestfile): nothing reads the tag back, since a registry does not
+      # always serve a tag the moment its push finishes.
+      - name: Log in to the build repository
+        env:
+          TOKEN: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
         run: |
           set -euo pipefail
           [ -n "$BUILD_IMAGE" ] || { echo "::error::the IMAGE_REPO_BUILD variable is not set"; exit 1; }
-          make build-all PART=image PKG_ARCH="${{ matrix.arch }}" IMAGE="${BUILD_IMAGE}:build-${BUILD_ID}-${{ matrix.arch }}" \
-            IMAGE_TREE="candidate/linux-${{ matrix.arch }}/openchimed-build-${BUILD_ID}-linux-${{ matrix.arch }}.tar.gz"
-
-      # The image starts and answers /healthz, and its database replicates and
-      # restores (scripts/test/full/image.sh, db_restore.sh). On the arm64 job
-      # the image is not for this runner, and the checks say so and skip.
-      - name: make test-all PART=image
-        run: make test-all PART=image IMAGE="${BUILD_IMAGE}:build-${BUILD_ID}-${{ matrix.arch }}"
-
-      # The digest is buildah's own report of what it pushed (--digestfile),
-      # handed on as an artifact: no later job reads the tag back, since a
-      # registry does not always serve a tag the moment its push finishes.
-      - name: Push the per-architecture image
-        env:
-          TOKEN: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          set -euo pipefail
           [ -n "$TOKEN" ] || { echo "::error::IMAGE_REGISTRY_TOKEN_BUILD is not set in the release environment"; exit 1; }
           printf '%s' "$TOKEN" | buildah login -u "$IMAGE_REGISTRY_USER" --password-stdin "${BUILD_IMAGE%%/*}"
+      - name: make build-all PART=image (amd64)
+        env:
+          ARCH: amd64
+        run: |
+          set -euo pipefail
+          make build-all PART=image PKG_ARCH="$ARCH" IMAGE="${BUILD_IMAGE}:build-${BUILD_ID}-${ARCH}" \
+            IMAGE_TREE="candidate/linux-${ARCH}/openchimed-build-${BUILD_ID}-linux-${ARCH}.tar.gz"
+      - name: make test-all PART=image (amd64)
+        run: make test-all PART=image IMAGE="${BUILD_IMAGE}:build-${BUILD_ID}-amd64"
+      - name: Push the amd64 image
+        env:
+          ARCH: amd64
+        run: &push-image |
+          set -euo pipefail
           mkdir -p image-digest
           buildah push --digestfile "image-digest/${ARCH}" "${BUILD_IMAGE}:build-${BUILD_ID}-${ARCH}"
           d=$(tr -d '[:space:]' < "image-digest/${ARCH}")
           [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::buildah reported no digest for ${ARCH} (${d:-nothing})"; exit 1; }
           echo "pushed ${BUILD_IMAGE}:build-${BUILD_ID}-${ARCH}: ${d}"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: image-digest-${{ matrix.arch }}
-          path: image-digest/${{ matrix.arch }}
-          retention-days: 1
-          if-no-files-found: error
-
-  # :build-<id> only; a release copies it to :N and moves :latest, in the
-  # build repository and the optional second one (release.yml).
-  image-manifest:
-    name: container image manifest
-    needs: [gate, image]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    environment: release
-    env:
-      BUILD_ID: ${{ needs.gate.outputs.build_id }}
-    outputs:
-      amd64: ${{ steps.publish.outputs.amd64 }}
-      arm64: ${{ steps.publish.outputs.arm64 }}
-      list: ${{ steps.publish.outputs.list }}
-    steps:
-      - uses: actions/checkout@v7   # for scripts/build/apt.sh
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: image-digest-*
-          path: image-digest
-          merge-multiple: true
-      - name: Install buildah
-        timeout-minutes: 20
-        run: |
-          set -euo pipefail
-          scripts/build/apt.sh buildah
-      # Each architecture by the digest its push reported, never by the tag it
-      # just wrote; the list's own digest is buildah's report of what it pushed.
-      - id: publish
-        name: Publish the manifest list
+      - name: make build-all PART=image (arm64)
         env:
-          TOKEN: ${{ secrets.IMAGE_REGISTRY_TOKEN_BUILD }}
+          ARCH: arm64
         run: |
           set -euo pipefail
-          [ -n "$TOKEN" ] || { echo "::error::IMAGE_REGISTRY_TOKEN_BUILD is not set in the release environment"; exit 1; }
-          printf '%s' "$TOKEN" | buildah login -u "$IMAGE_REGISTRY_USER" --password-stdin "${BUILD_IMAGE%%/*}"
+          make build-all PART=image PKG_ARCH="$ARCH" IMAGE="${BUILD_IMAGE}:build-${BUILD_ID}-${ARCH}" \
+            IMAGE_TREE="candidate/linux-${ARCH}/openchimed-build-${BUILD_ID}-linux-${ARCH}.tar.gz"
+      - name: make test-all PART=image (arm64)
+        run: make test-all PART=image IMAGE="${BUILD_IMAGE}:build-${BUILD_ID}-arm64"
+      - name: Push the arm64 image
+        env:
+          ARCH: arm64
+        run: *push-image
+      # :build-<id> only; a release copies it to :N and moves :latest, in the
+      # build repository and the optional second one (release.yml). Each
+      # architecture by the digest its push reported, never by the tag it just
+      # wrote; the list's own digest is buildah's report of what it pushed.
+      - id: manifest
+        name: Publish the manifest list
+        run: |
+          set -euo pipefail
           buildah manifest create "${BUILD_IMAGE}:build-${BUILD_ID}"
           for a in amd64 arm64; do
             d=$(tr -d '[:space:]' < "image-digest/${a}")
@@ -645,125 +647,137 @@ jobs:
           echo "pushed ${BUILD_IMAGE}:build-${BUILD_ID}: ${list}"
           echo "list=${list}" >> "$GITHUB_OUTPUT"
 
-  # The Windows client (ARCH-80/81). It carries the same build id as the
-  # daemon even though it is a separate program, so a support question only
-  # ever needs one identifier. The binaries cross-compile on Linux with the
-  # pinned llvm-mingw make fetches (mk/toolchains.mk); the installer and the
-  # MSIX are built from them, on Linux too (NSIS and makemsix,
-  # packaging/build-windows.sh), unsigned, under a placeholder version, and
-  # not kept: they are built only to prove they build and carry what they
-  # should. A release signs the same binaries and wraps them under its number
-  # (release.yml), since the installer embeds the signed files.
-  windows:
-    name: windows
-    needs: [gate, tests]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60   # a cold cache builds the Windows libraries and makemsix
-    env:
-      BUILD_ID: ${{ needs.gate.outputs.build_id }}
-      BUILD_NUM: ${{ needs.gate.outputs.run_number }}
-      DIST: dist/windows-x64
-    steps:
-      # Every CPU the runner has, for every make below and the makes they
-      # start (the Makefile is safe under -j; locally nothing changes).
-      - name: Use every CPU for make
-        run: echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v7
-      - name: Install build dependencies
-        timeout-minutes: 20
-        run: |
-          set -euo pipefail
-          # bzip2 for the mbedTLS tarball, nasm for libvpx's assembly, xz-utils
-          # for the toolchain tarball; nsis and python3-pefile for the
-          # installer and its check.
-          scripts/build/apt.sh bzip2 nasm xz-utils nsis python3-pefile
-      - name: Restore the toolchain
-        uses: actions/cache@v6
+      # --- The Windows clients ------------------------------------------------------
+      # The Windows client (ARCH-80/81). It carries the same build id as the
+      # daemon even though it is a separate program, so a support question only
+      # ever needs one identifier. The binaries cross-compile on Linux with the
+      # pinned llvm-mingw make fetches (mk/toolchains.mk); the installer and the
+      # MSIX are built from them, on Linux too (NSIS and makemsix,
+      # packaging/build-windows.sh), unsigned, under a placeholder version, and
+      # not kept: they are built only to prove they build and carry what they
+      # should. A release signs the same binaries and wraps them under its
+      # number (release.yml), since the installer embeds the signed files. The
+      # Windows libraries have a cache each, keyed by the version, the script
+      # that builds it and the toolchain.
+      - id: c-mingw
+        name: Restore the Windows toolchain
+        uses: actions/cache/restore@v6
         with:
-          path: third_party/llvm-mingw-20261020
-          key: toolchain-mingw-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh') }}
-      - name: Restore the vendored Windows libraries
-        uses: actions/cache@v6
+          path: &mingw-path third_party/llvm-mingw-20261020
+          key: &mingw-key toolchain-mingw-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh') }}
+      - id: c-win-mbedtls
+        name: Restore mbedTLS for Windows
+        uses: actions/cache/restore@v6
         with:
-          path: |
-            third_party/mbedtls-3.6.2-win
-            third_party/libvpx-1.17.0-win
-            third_party/opus-1.6.1-win
-            third_party/speexdsp-1.2.1-win
-            third_party/sdl3-3.4.14-win
-            third_party/mbedtls-3.6.2
-          key: vendor-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh', 'scripts/build/mbedtls.sh', 'scripts/build/mbedtls_windows.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh', 'scripts/build/sdl3_windows.sh') }}
+          path: &win-mbedtls-path third_party/mbedtls-3.6.2-win
+          key: &win-mbedtls-key mbedtls-3.6.2-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/mbedtls_windows.sh', 'scripts/build/llvm_mingw.sh') }}
+      - id: c-win-libvpx
+        name: Restore libvpx for Windows
+        uses: actions/cache/restore@v6
+        with:
+          path: &win-libvpx-path third_party/libvpx-1.17.0-win
+          key: &win-libvpx-key libvpx-1.17.0-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/libvpx.sh', 'scripts/build/llvm_mingw.sh') }}
+      - id: c-win-opus
+        name: Restore opus for Windows
+        uses: actions/cache/restore@v6
+        with:
+          path: &win-opus-path third_party/opus-1.6.1-win
+          key: &win-opus-key opus-1.6.1-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/opus.sh', 'scripts/build/llvm_mingw.sh') }}
+      - id: c-win-speexdsp
+        name: Restore speexdsp for Windows
+        uses: actions/cache/restore@v6
+        with:
+          path: &win-speexdsp-path third_party/speexdsp-1.2.1-win
+          key: &win-speexdsp-key speexdsp-1.2.1-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/speexdsp.sh', 'scripts/build/llvm_mingw.sh') }}
+      - id: c-win-sdl3
+        name: Restore SDL3 for Windows
+        uses: actions/cache/restore@v6
+        with:
+          path: &win-sdl3-path third_party/sdl3-3.4.14-win
+          key: &win-sdl3-key sdl3-3.4.14-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/sdl3_windows.sh', 'scripts/build/llvm_mingw.sh') }}
       # makemsix is built from pinned source on first use (scripts/build/
-      # makemsix.sh), and kept by that script's hash.
-      - name: Restore makemsix
-        uses: actions/cache@v6
+      # makemsix.sh), and kept by that script's hash; release.yml restores it
+      # under the same key.
+      - id: c-makemsix
+        name: Restore makemsix
+        uses: actions/cache/restore@v6
         with:
-          path: third_party/makemsix-*
-          key: makemsix-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/makemsix.sh') }}
-
+          path: &makemsix-path third_party/makemsix-*
+          key: &makemsix-key makemsix-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/makemsix.sh') }}
       - name: make build-all PART=windows
+        env:
+          DIST: dist/windows-x64
         run: make build-all PART=windows OC_BUILD_ID="$BUILD_ID" OC_BUILD_NUM="$BUILD_NUM" PKG_VERSION=0 WIN_DIST="$DIST"
+      - name: Save the Windows toolchain
+        if: steps.c-mingw.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *mingw-path
+          key: *mingw-key
+      - name: Save mbedTLS for Windows
+        if: steps.c-win-mbedtls.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *win-mbedtls-path
+          key: *win-mbedtls-key
+      - name: Save libvpx for Windows
+        if: steps.c-win-libvpx.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *win-libvpx-path
+          key: *win-libvpx-key
+      - name: Save opus for Windows
+        if: steps.c-win-opus.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *win-opus-path
+          key: *win-opus-key
+      - name: Save speexdsp for Windows
+        if: steps.c-win-speexdsp.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *win-speexdsp-path
+          key: *win-speexdsp-key
+      - name: Save SDL3 for Windows
+        if: steps.c-win-sdl3.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *win-sdl3-path
+          key: *win-sdl3-key
+      - name: Save makemsix
+        if: steps.c-makemsix.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *makemsix-path
+          key: *makemsix-key
       # The binaries name this build (BUILD_ID and BUILD_NUM, above), and the
       # installer and the MSIX are what ships (scripts/test/full/windows.sh).
       - name: make test-all PART=windows
+        env:
+          DIST: dist/windows-x64
         run: make test-all PART=windows PKG_VERSION=0 WIN_DIST="$DIST"
+      # The unpackaged compiler outputs, beside the Linux trees for the store
+      # below; never a release artifact.
+      - name: Keep the Windows binaries
+        run: |
+          set -euo pipefail
+          mkdir -p candidate/windows-x64
+          cp build/openchime.exe build/openchime-tui.exe build/openchime.debug candidate/windows-x64/
+          ls -l candidate/windows-x64
 
-      # Named for the toolchain, not the platform: unpackaged compiler outputs
-      # handed to the store, never a release artifact.
-      - uses: actions/upload-artifact@v7
-        with:
-          name: mingw-binaries
-          path: |
-            build/openchime.exe
-            build/openchime-tui.exe
-            build/openchime.debug
-          retention-days: 3
-          if-no-files-found: error
-
-  # The build, stored by its build id: every tree and binary under
-  # candidates/<id>/ in the mirror bucket, with a manifest naming each file's
-  # sha256 and the images' digests, signed with the repository signing key.
-  # The manifest exists only once every job above passed, so a stored manifest
-  # is a build that passed the full suite: publish reads it back before it
-  # tags anything, and a release fetches this directory and verifies it before
-  # it packages anything (scripts/release/verify_candidate.sh). The bucket is
-  # the one copy; no workflow artifact of it is kept, so nothing about a build
-  # expires with a run. A second run of the same commit -- only possible when
-  # an earlier one stopped before its release-candidate was tagged, which the
-  # gate checks -- stores its build again over the first's.
-  store:
-    name: store the build
-    needs: [gate, packages, image-manifest, windows]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    # The `release` environment for REPO_SIGNING_KEY, which signs the manifest.
-    environment: release
-    permissions:
-      contents: read
-    env:
-      BUILD_ID: ${{ needs.gate.outputs.build_id }}
-      # The offset run number from `id`, which the Windows binaries carry and
-      # the release checks them against; not GITHUB_RUN_NUMBER.
-      RUN_NUMBER: ${{ needs.gate.outputs.run_number }}
-      DIST_S3_ENDPOINT:           ${{ vars.DIST_S3_ENDPOINT }}
-      DIST_S3_MIRROR_ACCESS_KEY: ${{ secrets.DIST_S3_MIRROR_ACCESS_KEY }}
-      DIST_S3_MIRROR_SECRET_KEY: ${{ secrets.DIST_S3_MIRROR_SECRET_KEY }}
-      DIST_MIRROR_BUCKET:        ${{ vars.DIST_MIRROR_BUCKET }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0   # the release-* tags, for the prune below
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: linux-*
-          path: candidate
-      - uses: actions/download-artifact@v8
-        with:
-          name: mingw-binaries
-          path: candidate/windows-x64
-      - name: Install tooling
-        timeout-minutes: 20
-        run: scripts/build/apt.sh rclone gnupg
+      # --- The build, stored ----------------------------------------------------------
+      # The build, stored by its build id: every tree and binary under
+      # candidates/<id>/ in the mirror bucket, with a manifest naming each
+      # file's sha256 and the images' digests, signed with the repository
+      # signing key. The manifest exists only once every step above passed, so
+      # a stored manifest is a build that passed the full suite: publish reads
+      # it back before it tags anything, and a release fetches this directory
+      # and verifies it before it packages anything
+      # (scripts/release/verify_candidate.sh). The bucket is the one copy; no
+      # workflow artifact of it is kept, so nothing about a build expires with
+      # a run. A second run of the same commit -- only possible when an
+      # earlier one stopped before its release-candidate was tagged, which the
+      # gate checks -- stores its build again over the first's.
       - name: Import the signing key
         env:
           GPG_PRIVATE_KEY: ${{ secrets.REPO_SIGNING_KEY }}
@@ -772,6 +786,9 @@ jobs:
           [ -n "$GPG_PRIVATE_KEY" ] || { echo "::error::REPO_SIGNING_KEY is not set; a build cannot be signed"; exit 1; }
           printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
       - name: Configure rclone for the mirror bucket
+        env:
+          DIST_S3_MIRROR_ACCESS_KEY: ${{ secrets.DIST_S3_MIRROR_ACCESS_KEY }}
+          DIST_S3_MIRROR_SECRET_KEY: ${{ secrets.DIST_S3_MIRROR_SECRET_KEY }}
         run: |
           set -euo pipefail
           for v in DIST_S3_ENDPOINT DIST_S3_MIRROR_ACCESS_KEY DIST_S3_MIRROR_SECRET_KEY DIST_MIRROR_BUCKET; do
@@ -787,17 +804,17 @@ jobs:
           endpoint = ${DIST_S3_ENDPOINT}
           region = ${DIST_S3_REGION}
           EOF
-      # The images' digests are the ones their pushes reported (the image and
-      # image-manifest jobs), not read back from the tags those jobs wrote.
+      # The images' digests are the ones their pushes reported, not read back
+      # from the tags those pushes wrote.
       - name: Write and sign the manifest
         env:
-          AMD64: ${{ needs.image-manifest.outputs.amd64 }}
-          ARM64: ${{ needs.image-manifest.outputs.arm64 }}
-          LIST: ${{ needs.image-manifest.outputs.list }}
+          AMD64: ${{ steps.manifest.outputs.amd64 }}
+          ARM64: ${{ steps.manifest.outputs.arm64 }}
+          LIST: ${{ steps.manifest.outputs.list }}
         run: |
           set -euo pipefail
           for d in "$AMD64" "$ARM64" "$LIST"; do
-            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::an image digest is missing from the image-manifest job (${d:-nothing})"; exit 1; }
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::an image digest is missing from the manifest list step (${d:-nothing})"; exit 1; }
           done
           find candidate -type f | sort
           images="build-${BUILD_ID}-amd64=${AMD64} build-${BUILD_ID}-arm64=${ARM64} build-${BUILD_ID}=${LIST}"
@@ -874,8 +891,8 @@ jobs:
   # stored. N is the number the next release would take
   # (scripts/release/version.sh, which counts release-N tags only); K is one
   # past the highest release-candidate already tagged for N. The tag is pushed
-  # with the deploy key and the prerelease made with the job's own token. One
-  # job: each step is seconds, and a job costs a runner start.
+  # with the deploy key and the prerelease made with the job's own token. Last,
+  # the copy to the public repository, as steps of the same job.
   #
   # Serialised with release.yml, whose runs share the `release` group: a
   # release removes the release-candidates of its number when it finishes, so
@@ -884,27 +901,23 @@ jobs:
   # commit is asked again inside the group, so a release that finished while
   # this run built is seen.
   publish:
-    name: publish the release-candidate
-    needs: [gate, store]
+    name: publish
+    needs: [test, stage]
     runs-on: ubuntu-24.04
     environment: release
-    timeout-minutes: 20
+    # About 3 minutes.
+    timeout-minutes: 10
     permissions:
       contents: write
     concurrency:
       group: release
       cancel-in-progress: false
-    outputs:
-      tag: ${{ steps.tag.outputs.tag }}
-      number: ${{ steps.tag.outputs.number }}
-      k: ${{ steps.tag.outputs.k }}
     env:
       SHA: ${{ github.sha }}
-      BUILD_ID: ${{ needs.gate.outputs.build_id }}
+      BUILD_ID: ${{ needs.test.outputs.build_id }}
       DIST_S3_ENDPOINT:          ${{ vars.DIST_S3_ENDPOINT }}
-      DIST_S3_MIRROR_ACCESS_KEY: ${{ secrets.DIST_S3_MIRROR_ACCESS_KEY }}
-      DIST_S3_MIRROR_SECRET_KEY: ${{ secrets.DIST_S3_MIRROR_SECRET_KEY }}
       DIST_MIRROR_BUCKET:        ${{ vars.DIST_MIRROR_BUCKET }}
+      PUBLIC_REPO: ${{ vars.PUBLIC_REPO }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -924,7 +937,7 @@ jobs:
           git remote set-url --push origin "git@github.com:${GITHUB_REPOSITORY}.git"
           echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/release_key -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
       - name: Install tooling
-        timeout-minutes: 20
+        timeout-minutes: 5
         run: scripts/build/apt.sh rclone gnupg skopeo
       - name: Import the signing key
         env:
@@ -934,6 +947,9 @@ jobs:
           [ -n "$GPG_PRIVATE_KEY" ] || { echo "::error::REPO_SIGNING_KEY is not set; the build cannot be verified"; exit 1; }
           printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
       - name: Configure rclone for the mirror bucket
+        env:
+          DIST_S3_MIRROR_ACCESS_KEY: ${{ secrets.DIST_S3_MIRROR_ACCESS_KEY }}
+          DIST_S3_MIRROR_SECRET_KEY: ${{ secrets.DIST_S3_MIRROR_SECRET_KEY }}
         run: |
           set -euo pipefail
           for v in DIST_S3_ENDPOINT DIST_S3_MIRROR_ACCESS_KEY DIST_S3_MIRROR_SECRET_KEY DIST_MIRROR_BUCKET; do
@@ -1073,38 +1089,24 @@ jobs:
             echo "- to release it: \`gh workflow run release.yml --ref ${TAG}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # The release-candidate, copied to the public repository (the PUBLIC_REPO
-  # variable; skipped when it is unset): the commit to its
-  # staging, the tag, and a prerelease with the same files, title and notes,
-  # read back from the prerelease just made here (`gh release download`).
-  # A copy and nothing more: nothing here or in release.yml reads it back, so a
-  # failure is a warning, never a failed run (continue-on-error). It reads
-  # nothing from that repository but whether the tag and the release are
-  # already there, so a re-run completes it. The staging push is plain, never
-  # forced: a push that is not a fast-forward is refused. Pushes use
-  # PUBLIC_DEPLOY_KEY, a write deploy key there; the release is
-  # made with PUBLIC_TOKEN (contents write there). Both are in the `release`
-  # environment.
-  sync-public:
-    name: copy to the public repository
-    needs: publish
-    if: ${{ success() && vars.PUBLIC_REPO != '' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    continue-on-error: true
-    environment: release
-    permissions:
-      contents: read
-    env:
-      PUBLIC_REPO: ${{ vars.PUBLIC_REPO }}
-      SHA: ${{ github.sha }}
-      TAG: ${{ needs.publish.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Set up the deploy key
+      # --- The copy to the public repository ------------------------------------------
+      # The release-candidate, copied to the public repository (the PUBLIC_REPO
+      # variable; skipped when it is unset): the commit to its staging, the
+      # tag, and a prerelease with the same files, title and notes, read back
+      # from the prerelease just made here (`gh release download`). A copy and
+      # nothing more: nothing here or in release.yml reads it back, so a
+      # failure is a warning, never a failed run (continue-on-error on each
+      # step, each step only after the one before it succeeded). It reads
+      # nothing from that repository but whether the tag and the release are
+      # already there, so a re-run completes it. The staging push is plain,
+      # never forced: a push that is not a fast-forward is refused. Pushes use
+      # PUBLIC_DEPLOY_KEY, a write deploy key there; the release is made with
+      # PUBLIC_TOKEN (contents write there). Both are in the `release`
+      # environment.
+      - id: pub-key
+        name: Set up the public deploy key
+        if: env.PUBLIC_REPO != ''
+        continue-on-error: true
         env:
           KEY: ${{ secrets.PUBLIC_DEPLOY_KEY }}
           TOKEN: ${{ secrets.PUBLIC_TOKEN }}
@@ -1118,7 +1120,12 @@ jobs:
           ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
           echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/public_key -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
 
-      - name: Push the commit to staging and the tag
+      - id: pub-push
+        name: Push the commit to staging and the tag there
+        if: steps.pub-key.outcome == 'success'
+        continue-on-error: true
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
           remote="git@github.com:${PUBLIC_REPO}.git"
@@ -1133,8 +1140,12 @@ jobs:
           fi
           echo "${PUBLIC_REPO}: staging and ${TAG} are ${SHA:0:7}"
 
-      - name: Copy the prerelease
+      - id: pub-release
+        name: Copy the prerelease
+        if: steps.pub-push.outcome == 'success'
+        continue-on-error: true
         env:
+          TAG: ${{ steps.tag.outputs.tag }}
           GH_TOKEN: ${{ github.token }}
           PUBLIC_TOKEN: ${{ secrets.PUBLIC_TOKEN }}
         run: |
@@ -1158,5 +1169,7 @@ jobs:
           echo "${TAG} published on ${PUBLIC_REPO}"
 
       - name: Report a failed copy
-        if: ${{ failure() }}
+        if: steps.pub-key.outcome == 'failure' || steps.pub-push.outcome == 'failure' || steps.pub-release.outcome == 'failure'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: echo "::warning::the copy to ${PUBLIC_REPO} did not complete; ${TAG} is published here regardless. Re-run this job to finish it."

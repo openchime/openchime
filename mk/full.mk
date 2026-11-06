@@ -8,18 +8,20 @@
 #   make test-all  [PART=<part>]   checks what build-all built, with the same
 #                                  variables; it builds nothing a release ships
 #
-# PART only splits the work across CI's parallel jobs, one part each; unset,
-# every part in turn:
+# PART only splits the work into the steps CI runs, one part each, in turn:
+# plain then threads in test-all.yml's one job, packages, image and windows in
+# release-candidate.yml's `stage`. Unset, every part in turn:
 #
 #   plain     the daemon with every feature, the Linux TUI, the web client, the
 #             test binary, the e2e and demo clients and the fuzzing harnesses;
-#             then the source checks, actionlint, every suite plainly with its
-#             timing judged, the static-link check, the end-to-end run, the
-#             release's compiler, the speech round trip, the web client in a
-#             headless Chrome and its objects' header dependencies, the GUI
-#             smoke on the web, and each fuzzing harness for FUZZ_SECONDS
+#             then the source checks, actionlint, the suites that start no
+#             thread, and media, plainly with their timing judged, the
+#             static-link check, the end-to-end run, the release's compiler,
+#             the speech round trip, the web client in a headless Chrome and
+#             its objects' header dependencies, the GUI smoke on the web, and
+#             each fuzzing harness for FUZZ_SECONDS
 #   threads   the test binary under ThreadSanitizer; then the suites that start
-#             threads, under it
+#             threads, under it, their one run in the full suite
 #   packages  the release's daemon for ARCH (zig against glibc 2.34) with its
 #             data, and the .deb, .rpm and tarball from it under PKG_VERSION, in
 #             DIST; then the glibc floor, one binary in all three, speech, the
