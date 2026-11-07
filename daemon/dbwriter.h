@@ -998,6 +998,9 @@ typedef struct {
     size_t   body_len;
     uint32_t reply_count;
     uint64_t last_reply_at;
+    /* Its most recent distinct repliers, newest first (THREAD_META, REQ-060). */
+    uint8_t  n_repliers;
+    uint64_t repliers[OC_THREAD_REPLIERS_MAX];
     oc_attach_meta attach[OC_MAX_ATTACH];  /* linked attachments (REQ-140) */
     size_t         n_attach;
     char    *author_name;  /* heap; override display name (webhooks), else NULL */
@@ -1249,6 +1252,12 @@ typedef struct oc_dbres {
      * THREAD carries the reply list. */
     uint64_t        parent_id;
     uint32_t        reply_count;
+    /* The parent's thread as it now stands, for the live THREAD_META a posted
+     * or deleted reply sends (REQ-060). A DELETE_OK of a top-level message
+     * leaves parent_id 0 and sends none. */
+    uint64_t        thread_last_reply_at;
+    uint8_t         n_repliers;
+    uint64_t        repliers[OC_THREAD_REPLIERS_MAX];
     oc_replay_msg  *thread;         /* heap array; THREAD replies */
     size_t          n_thread;
 

@@ -2207,6 +2207,9 @@ static struct { rectf r; uint64_t mid; char emoji[40]; uint8_t mine; } g_chips[1
 /* The "N replies" row under each thread parent on screen: a click opens the thread. */
 static struct { rectf r; uint64_t mid; } g_rephits[128];
 static int g_n_rephits;
+/* The repliers' faces on those rows, each hovered for the person's name. */
+static struct { rectf r; uint64_t uid; } g_replierhits[128];
+static int g_n_replierhits;
 static int g_n_chips;
 /* A poll's option rows on screen, each pressed to vote, and its "See who
  * voted" link (REQ-225); rebuilt every frame like the chips. */
@@ -7032,6 +7035,16 @@ static int time_tip_index(void) {
         if (g_kb_mid && g_timehits[i].mid == g_kb_mid) return i;
     return -1;
 }
+/* Hovering a replier's face on a thread's row names them (REQ-060). */
+static void replier_tip_draw(gfx *rt, float W) {
+    for (int i = 0; i < g_n_replierhits; i++) {
+        if (!in_rect(g_replierhits[i].r, g_mouse_x, g_mouse_y) || pointer_blocked()) continue;
+        const char *nm = oc_model_user_name(model(), g_replierhits[i].uid);
+        draw_tip(rt, g_replierhits[i].r, (nm && nm[0]) ? nm : "Someone", "", 0, W);
+        return;
+    }
+}
+
 static void time_tip_draw(gfx *rt, float W) {
     int i = time_tip_index();
     if (i < 0) return;
@@ -7496,22 +7509,47 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
     }
 
     if (msg->reply_count) {
-        /* The thread's row, as Slack draws it: a thread mark, the count in the
-         * link colour, and on hover the row lights and says what a click does.
-         * A click opens the thread (on_click); so does a double-click on the
-         * message itself (on_dblclk). */
+        /* The thread's row, as Slack draws it: the faces of its most recent
+         * repliers (up to three, newest first, each hovered for the name), or
+         * a thread mark when there are none to show; the count in the link
+         * colour; then when the last reply came -- and on hover the row lights
+         * and says what a click does instead. A click opens the thread
+         * (on_click); so does a double-click on the message itself (on_dblclk). */
         char line[64];
         snprintf(line, sizeof line, "%u %s", msg->reply_count, msg->reply_count == 1 ? "reply" : "replies");
         rectf row = rf(tx - UIS(6.0f), by + UIS(2.0f), x0 + content_w + AVA + 12, by + REPLY_ROW_H - UIS(2.0f));
         int hov = in_rect(row, g_mouse_x, g_mouse_y) && !pointer_blocked();
         if (hov) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
         float ic = UIS(16.0f), iy = row.top + ((row.bottom - row.top) - ic) / 2;
-        draw_lucide(rt, OC_ICON_MESSAGE, rf(row.left + UIS(6.0f), iy, row.left + UIS(6.0f) + ic, iy + ic), OC_COL_ACCENT);
-        float lx = row.left + UIS(6.0f) + ic + UIS(6.0f);
+        float lx = row.left + UIS(6.0f);
+        uint8_t nr = msg->n_repliers > OC_THREAD_REPLIERS_MAX ? OC_THREAD_REPLIERS_MAX : msg->n_repliers;
+        if (nr) {
+            float av = UIS(18.0f), ay = row.top + ((row.bottom - row.top) - av) / 2;
+            for (uint8_t k = 0; k < nr; k++) {
+                const char *nm = oc_model_user_name(m, msg->repliers[k]);
+                rectf box = rf(lx, ay, lx + av, ay + av);
+                draw_user_avatar(rt, m, msg->repliers[k], (nm && nm[0]) ? nm : "?", box, g_meta);
+                if (g_n_replierhits < (int)(sizeof g_replierhits / sizeof g_replierhits[0])) {
+                    g_replierhits[g_n_replierhits].r = box;
+                    g_replierhits[g_n_replierhits].uid = msg->repliers[k];
+                    g_n_replierhits++;
+                }
+                lx += av + UIS(3.0f);
+            }
+            lx += UIS(3.0f);
+        } else {
+            draw_lucide(rt, OC_ICON_MESSAGE, rf(lx, iy, lx + ic, iy + ic), OC_COL_ACCENT);
+            lx += ic + UIS(6.0f);
+        }
         draw_text(rt, line, g_ui_b, rf(lx, row.top, row.right, row.bottom), OC_COL_ACCENT);
+        float lw = text_width(line, g_ui_b);
         if (hov) {
-            float lw = text_width(line, g_ui_b);
             draw_text(rt, "View thread", g_meta, rf(lx + lw + UIS(10.0f), row.top, row.right, row.bottom), OC_COL_MUTED);
+        } else if (msg->last_reply_at) {
+            char when[48], last[64];
+            oc_model_time_text(m, (int64_t)msg->last_reply_at, OC_RT_TIME_SHORT, when, sizeof when);
+            snprintf(last, sizeof last, "Last reply %s", when);
+            draw_text(rt, last, g_meta, rf(lx + lw + UIS(10.0f), row.top, row.right, row.bottom), OC_COL_MUTED);
         }
         if (g_n_rephits < (int)(sizeof g_rephits / sizeof g_rephits[0])) {
             g_rephits[g_n_rephits].r = row;
@@ -21687,6 +21725,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
     }
     draw_pastechoice(rt, W, H);   /* the paste chooser floats over the field it pastes into */
     if (!modal_open()) time_tip_draw(rt, W);   /* a time token's full date, over what it is in */
+    if (!modal_open()) replier_tip_draw(rt, W);   /* a thread replier's name */
     if (!si_over) draw_modal(rt, m, W, H);  /* your-account surfaces, over a dimmed shell */
     draw_video_overlay(rt, m, W, H);   /* the recording card and the player; menus float above */
     draw_share_full(rt, m, W, H);      /* a shared screen, full screen, when asked for */
@@ -21738,6 +21777,7 @@ static void paint(oc_win *hwnd) {
     g_n_hrx = 0; g_hrx_mid = 0;
     g_caret_placed = 0;
     g_n_timehits = 0;
+    g_n_replierhits = 0;
     g_n_emojiboxes = 0;
     /* The reader's clock, which the model's excerpts use too. */
     if (m) oc_model_set_clock12((oc_model *)m, !g_pref_time24);

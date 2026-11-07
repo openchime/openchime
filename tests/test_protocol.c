@@ -549,11 +549,32 @@ static void test_thread_frames(void) {
         CHECK(out.parent_id == 500 && out.count == 3);
     }
     {
-        oc_thread_meta in = { 500, 3, 1751200500000ull };
+        oc_thread_meta in = { .message_id = 500, .reply_count = 3, .last_reply_at = 1751200500000ull };
         ROUNDTRIP(oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_META, h, p);
         oc_thread_meta out;
         CHECK(oc_decode_thread_meta(&p, &out) == OC_OK);
         CHECK(out.message_id == 500 && out.reply_count == 3 && out.last_reply_at == 1751200500000ull);
+        CHECK(out.n_repliers == 0);
+    }
+    {   /* The repliers, newest first (REQ-060): as many as there are, up to three. */
+        oc_thread_meta in = { 501, 7, 1751200600000ull, 3, { 42, 7, 9001 } };
+        ROUNDTRIP(oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_META, h, p);
+        oc_thread_meta out;
+        memset(&out, 0, sizeof out);
+        CHECK(oc_decode_thread_meta(&p, &out) == OC_OK);
+        CHECK(out.message_id == 501 && out.reply_count == 7 && out.n_repliers == 3);
+        CHECK(out.repliers[0] == 42 && out.repliers[1] == 7 && out.repliers[2] == 9001);
+    }
+    {   /* More than three are never sent, and a frame claiming more is refused. */
+        oc_thread_meta in = { 502, 9, 1, 5, { 1, 2, 3 } };
+        ROUNDTRIP(oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_META, h, p);
+        oc_thread_meta out;
+        CHECK(oc_decode_thread_meta(&p, &out) == OC_OK && out.n_repliers == 3);
+        uint8_t bad[8 + 4 + 8 + 1 + 8 * 4];
+        memset(bad, 0, sizeof bad);
+        bad[20] = 4;
+        oc_rbuf br; oc_rbuf_init(&br, bad, sizeof bad);
+        CHECK(oc_decode_thread_meta(&br, &out) == OC_E_MALFORMED);
     }
 }
 

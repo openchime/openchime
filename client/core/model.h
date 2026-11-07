@@ -101,6 +101,11 @@ typedef struct {
     uint8_t      edited;      /* body was edited (REQ-051) */
     uint8_t      deleted;     /* tombstoned (REQ-052) */
     uint32_t     reply_count; /* thread replies to this message (REQ-060) */
+    /* Its thread's last reply and most recent distinct repliers, newest first,
+     * from THREAD_META (REQ-060). */
+    uint64_t     last_reply_at;
+    uint8_t      n_repliers;
+    uint64_t     repliers[OC_THREAD_REPLIERS_MAX];
     uint8_t      pinned;      /* pinned to its channel (REQ-230) */
     uint64_t     pinned_by;   /* who pinned it (0 = unknown) */
     uint64_t     pinned_at;

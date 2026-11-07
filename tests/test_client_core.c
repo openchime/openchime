@@ -5783,8 +5783,62 @@ static size_t frame_of_forward(uint8_t *buf, size_t cap, uint64_t mid) {
 }
 static size_t frame_of_meta(uint8_t *buf, size_t cap, uint64_t mid) {
     oc_wbuf w; oc_wbuf_init(&w, buf, cap);
-    oc_thread_meta tm = { mid, 2, 2000 };
+    oc_thread_meta tm = { .message_id = mid, .reply_count = 2, .last_reply_at = 2000 };
     return oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &tm) == OC_OK ? w.len : 0;
+}
+
+/* A thread's repliers reach the parent from THREAD_META (REQ-060): through
+ * the frame layer into the model, live as well as in backfill, and a stale
+ * frame -- a backfill's, behind a live one -- changes nothing. */
+static size_t frame_of_meta_repliers(uint8_t *buf, size_t cap, uint64_t mid, uint32_t count,
+                                     uint64_t last, uint8_t n, uint64_t a, uint64_t b, uint64_t c) {
+    oc_wbuf w; oc_wbuf_init(&w, buf, cap);
+    oc_thread_meta tm = { .message_id = mid, .reply_count = count, .last_reply_at = last,
+                          .n_repliers = n, .repliers = { a, b, c } };
+    return oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &tm) == OC_OK ? w.len : 0;
+}
+
+static void apply_meta_frame(oc_model *m, oc_net_frames *f, oc_queue *q, const uint8_t *buf, size_t n) {
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    oc_ev *e = oc_queue_try_pop(q);
+    CHECK(e && e->type == OC_EV_THREAD_META);
+    if (e) { oc_model_apply(m, e); oc_ev_free(e); }
+}
+
+static void test_thread_meta_live(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 40; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("room");
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 40; e.message_id = 100; e.author_id = 1;
+    e.body = strdup("the parent");
+    oc_model_apply(&m, &e);
+
+    oc_queue q; oc_queue_init(&q);
+    oc_net_frames *f = oc_net_frames_new(&q);
+    CHECK(f != NULL);
+    uint8_t buf[256];
+    const oc_channel *c = oc_model_channel(&m, 40);
+    const oc_msg *p = c && c->n_msgs ? &c->msgs[0] : NULL;
+    CHECK(p && p->message_id == 100 && p->reply_count == 0 && p->n_repliers == 0);
+
+    /* A reply is posted: the count, its time and who replied. */
+    apply_meta_frame(&m, f, &q, buf, frame_of_meta_repliers(buf, sizeof buf, 100, 4, 5000, 3, 9, 8, 7));
+    CHECK(p && p->reply_count == 4 && p->last_reply_at == 5000 && p->n_repliers == 3 &&
+          p->repliers[0] == 9 && p->repliers[1] == 8 && p->repliers[2] == 7);
+
+    /* A backfill's frame from before it arrives late: nothing moves back. */
+    apply_meta_frame(&m, f, &q, buf, frame_of_meta_repliers(buf, sizeof buf, 100, 3, 4000, 2, 8, 7, 0));
+    CHECK(p && p->reply_count == 4 && p->last_reply_at == 5000 && p->n_repliers == 3 && p->repliers[0] == 9);
+
+    /* The newest reply is deleted: same count and time, the repliers anew. */
+    apply_meta_frame(&m, f, &q, buf, frame_of_meta_repliers(buf, sizeof buf, 100, 4, 5000, 2, 8, 7, 0));
+    CHECK(p && p->reply_count == 4 && p->n_repliers == 2 && p->repliers[0] == 8 && p->repliers[1] == 7);
+
+    oc_net_frames_free(f);
+    oc_model_free(&m);
 }
 
 static void test_action_pairing(void) {
@@ -5904,6 +5958,7 @@ int run_client_core_tests(void) {
     test_broadcast_check_dm();
     test_broadcast_mentions_me();
     test_id_mentions();
+    test_thread_meta_live();
     test_broadcast_stored_model();
     test_workspace_sender_model();
     test_time_preview();

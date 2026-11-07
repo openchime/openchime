@@ -4316,6 +4316,85 @@ static void test_badge_matches_evaluator(void) {
     cleanup_db(path);
 }
 
+/* A thread's repliers (REQ-060): the three most recent distinct authors of
+ * its replies, newest first -- in the backfill, on a posted reply, and after
+ * a reply is deleted, when they are worked out again from the replies left. */
+static void test_thread_repliers(void) {
+    const char *path = tdb("repliers.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t ana = reg(w, "rp-ana", "pw", OC_ROLE_OWNER);
+    uint64_t ben = reg(w, "rp-ben", "pw", OC_ROLE_MEMBER);
+    uint64_t cy  = reg(w, "rp-cy",  "pw", OC_ROLE_MEMBER);
+    uint64_t dee = reg(w, "rp-dee", "pw", OC_ROLE_MEMBER);
+    CHECK(ana && ben && cy && dee);
+    uint64_t root = send_id(w, ana, OC_DEFAULT_CHANNEL, "the parent");
+    CHECK(root != 0);
+
+    /* Ana twice, then Ben, Cy and Dee: four people, five replies. */
+    const uint64_t who[5] = { ana, ben, ana, cy, dee };
+    uint64_t last_reply = 0;
+    oc_dbres *r = NULL;
+    for (int i = 0; i < 5; i++) {
+        oc_dbres_free(r);
+        r = send_reply(w, who[i], OC_DEFAULT_CHANNEL, root, "a reply");
+        CHECK(r && r->type == OC_RES_REPLY_OK);
+        if (r) last_reply = r->message_id;
+    }
+    /* The live answer: newest first, distinct, three. */
+    CHECK(r && r->parent_id == root && r->reply_count == 5 && r->thread_last_reply_at == r->server_time);
+    CHECK(r && r->n_repliers == 3 && r->repliers[0] == dee && r->repliers[1] == cy && r->repliers[2] == ana);
+    oc_dbres_free(r);
+
+    /* The backfill says the same of the parent. */
+    r = backfill(w, ana, OC_DEFAULT_CHANNEL, 0);
+    int seen = 0;
+    for (size_t i = 0; r && i < r->n_replay; i++) {
+        const oc_replay_msg *m = &r->replay[i];
+        if (m->message_id != root) {
+            CHECK(m->reply_count != 0 || m->n_repliers == 0);
+            continue;
+        }
+        seen = 1;
+        CHECK(m->reply_count == 5 && m->n_repliers == 3);
+        CHECK(m->repliers[0] == dee && m->repliers[1] == cy && m->repliers[2] == ana);
+    }
+    CHECK(seen);
+    oc_dbres_free(r);
+
+    /* An edit changes none of it. */
+    r = do_edit(w, dee, OC_DEFAULT_CHANNEL, last_reply, "an edited reply");
+    CHECK(r && r->type == OC_RES_EDIT_OK);
+    oc_dbres_free(r);
+    r = backfill(w, ana, OC_DEFAULT_CHANNEL, 0);
+    for (size_t i = 0; r && i < r->n_replay; i++)
+        if (r->replay[i].message_id == root)
+            CHECK(r->replay[i].n_repliers == 3 && r->replay[i].repliers[0] == dee);
+    oc_dbres_free(r);
+
+    /* Deleting the newest reply, Dee's only one: the repliers are worked out
+     * again from what is left, and the parent's frame says so. */
+    r = do_delete(w, dee, OC_DEFAULT_CHANNEL, last_reply);
+    CHECK(r && r->type == OC_RES_DELETE_OK && r->parent_id == root);
+    CHECK(r && r->n_repliers == 3 && r->repliers[0] == cy && r->repliers[1] == ana && r->repliers[2] == ben);
+    oc_dbres_free(r);
+    r = backfill(w, ana, OC_DEFAULT_CHANNEL, 0);
+    for (size_t i = 0; r && i < r->n_replay; i++)
+        if (r->replay[i].message_id == root)
+            CHECK(r->replay[i].n_repliers == 3 && r->replay[i].repliers[0] == cy &&
+                  r->replay[i].repliers[1] == ana && r->replay[i].repliers[2] == ben);
+    oc_dbres_free(r);
+
+    /* A top-level message's delete is no thread's business. */
+    r = do_delete(w, ana, OC_DEFAULT_CHANNEL, send_id(w, ana, OC_DEFAULT_CHANNEL, "alone"));
+    CHECK(r && r->type == OC_RES_DELETE_OK && r->parent_id == 0 && r->n_repliers == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_threads(void) {
     const char *path = tdb("threads.db");
     cleanup_db(path);
@@ -10458,6 +10537,7 @@ int run_dbwriter_tests(void) {
     test_audit_filters();
     test_reactions();
     test_threads();
+    test_thread_repliers();
     test_thread_list();
     test_badge_matches_evaluator();
     test_search();

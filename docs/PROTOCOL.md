@@ -213,8 +213,10 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 33** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 34** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 34 appended `n_repliers` and the repliers' ids to `THREAD_META`, which is now
+> also sent live when a reply is posted or deleted (§5.10). Version
 > 33 appended `family`, `actor_id` and `action` to `AUDIT_QUERY`, filters the
 > daemon applies (§5.16c). Version
 > 32 gave the byte version 31 put in `BROADCAST` (and so `MSG_RESTORED`) and
@@ -1403,14 +1405,17 @@ channel.
 
 On reconnect backfill (§6) the main scroll replays only top-level messages; a
 parent that has replies is followed by a **`THREAD_META` (server → client),
-msg_type `0x0032`** so the client can show the reply count without opening the
-thread:
+msg_type `0x0032`** so the client can show the reply count, and who replied,
+without opening the thread. The same frame is sent live to the channel's members
+after a reply is posted or deleted, so an open transcript keeps it current:
 
 | Field          | Type | Notes                                       |
 |----------------|------|---------------------------------------------|
 | `message_id`   | u64  | The parent message.                         |
 | `reply_count`  | u32  | Its total reply count.                      |
 | `last_reply_at`| u64  | Timestamp of the most recent reply, ms UTC. |
+| `n_repliers`   | u8   | How many ids follow, at most 3.             |
+| `repliers`     | u64 × `n_repliers` | The most recent distinct authors of its replies that are not deleted, newest first. |
 
 `SEND_REPLY`/`LIST_THREAD` failures are non-fatal `ERROR` frames:
 `UNKNOWN_MESSAGE` (no such parent, or, for `SEND_REPLY`, it is tombstoned —
@@ -3301,7 +3306,7 @@ this table cannot silently gain a shared value.
 | `0x002F` | `THREAD` | S → C | a thread's replies |
 | `0x0030` | `BACKFILL_REQUEST` | C → S |  |
 | `0x0031` | `BACKFILL_DONE` | S → C |  |
-| `0x0032` | `THREAD_META` | S → C | a parent's reply count (backfill) |
+| `0x0032` | `THREAD_META` | S → C | a parent's reply count and repliers (backfill, live) |
 | `0x0033` | `READ_CURSOR` | S → C | a member's read cursor advanced (REQ-090 seen-by) |
 | `0x0034` | `HISTORY_REQUEST` | C → S | page BACKWARDS through a channel (§6.3) |
 | `0x0035` | `PIN` | C → S | (REQ-230), pin/unpin a message |

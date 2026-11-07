@@ -346,6 +346,15 @@ static void free_attach_meta(oc_attach_meta *a, size_t n) {
  * the defect class this replay exists to prevent, reintroduced by a second
  * copy that was never written. One filler, both callers, as the unfurl fill
  * below already does it. */
+/* Each replayed parent's repliers (THREAD_META, REQ-060), beside its count. */
+static uint8_t thread_repliers(sqlite3 *db, uint64_t root, uint64_t *out);   /* below */
+static void thread_stats(sqlite3 *db, uint64_t root, uint32_t *count, uint64_t *last);   /* below */
+static void fill_replay_repliers(sqlite3 *db, oc_dbres *r) {
+    for (size_t i = 0; i < r->n_replay; i++)
+        if (r->replay[i].reply_count)
+            r->replay[i].n_repliers = thread_repliers(db, r->replay[i].message_id, r->replay[i].repliers);
+}
+
 static void fill_replay_reactions(sqlite3 *db, oc_dbres *r, uint64_t for_user) {
     if (!r->n_replay) return;
     size_t cap = 16, n = 0;
@@ -5282,6 +5291,21 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
     r->author_id = author;
     r->user_id = j->user_id;   /* deleted_by */
     r->server_time = ts;       /* deleted_at_ms */
+    /* A reply's thread names its repliers afresh, without this one if it was
+     * their only reply (REQ-060): the net thread sends the parent's THREAD_META. */
+    {
+        sqlite3_stmt *pq = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT COALESCE(parent_id,0) FROM messages WHERE id=?1;",
+                               -1, &pq, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(pq, 1, (sqlite3_int64)j->message_id);
+            if (sqlite3_step(pq) == SQLITE_ROW) r->parent_id = (uint64_t)sqlite3_column_int64(pq, 0);
+            sqlite3_finalize(pq);
+        }
+        if (r->parent_id) {
+            thread_stats(db, r->parent_id, &r->reply_count, &r->thread_last_reply_at);
+            r->n_repliers = thread_repliers(db, r->parent_id, r->repliers);
+        }
+    }
     load_members(db, j->channel_id, r);
     return r;
 }
@@ -7260,6 +7284,24 @@ static void thread_stats(sqlite3 *db, uint64_t root, uint32_t *count, uint64_t *
     sqlite3_finalize(st);
 }
 
+/* The most recent distinct authors of `root`'s replies that are not deleted,
+ * newest first, at most OC_THREAD_REPLIERS_MAX (REQ-060). A deleted reply is
+ * still counted in the thread's reply count, but names nobody here. */
+static uint8_t thread_repliers(sqlite3 *db, uint64_t root, uint64_t *out) {
+    sqlite3_stmt *st = NULL;
+    uint8_t n = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT author_id FROM messages WHERE parent_id=?1 AND deleted_at_ms IS NULL "
+            " GROUP BY author_id ORDER BY MAX(created_at_ms) DESC, MAX(id) DESC LIMIT ?2;",
+            -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)root);
+    sqlite3_bind_int(st, 2, OC_THREAD_REPLIERS_MAX);
+    while (n < OC_THREAD_REPLIERS_MAX && sqlite3_step(st) == SQLITE_ROW)
+        out[n++] = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
 /* Post a threaded reply (REQ-060). The reply threads under a top-level root
  * (replying to a reply flattens to that reply's root) and is NOT delivered to
  * the channel's main scroll — the net thread fans it out as a THREAD_REPLY.
@@ -7372,7 +7414,8 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
     uint32_t count = 0;
-    thread_stats(db, root, &count, NULL);
+    thread_stats(db, root, &count, &r->thread_last_reply_at);
+    r->n_repliers = thread_repliers(db, root, r->repliers);
     r->type = OC_RES_REPLY_OK;
     r->message_id = mid;
     r->server_time = ts;
@@ -8015,6 +8058,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
 
     /* Reactions and unfurls for the window just built. Both are shared with the
      * history page (§6.3), so the two replay paths cannot drift. */
+    fill_replay_repliers(db, r);
     fill_replay_reactions(db, r, j->user_id);
     fill_replay_unfurls(db, r);
     fill_replay_forwards(db, r);
@@ -8159,6 +8203,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     /* The same two fills the reconnect replay runs. Reactions were absent here
      * entirely, which is what made a scroll-back or a permalink render messages
      * permanently without them. */
+    fill_replay_repliers(db, r);
     fill_replay_reactions(db, r, j->user_id);
     fill_replay_unfurls(db, r);
     fill_replay_forwards(db, r);

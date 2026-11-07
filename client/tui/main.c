@@ -469,9 +469,17 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
         if (rr) { memcpy(rr, rl, p); rr[p] = '\0'; rows_push(r, rr, TB_MAGENTA); }
     }
     if (show_replies && m->reply_count > 0) {
-        char rl[64];
-        snprintf(rl, sizeof rl, "    \xe2\x86\xb3 %u %s", m->reply_count,
-                 m->reply_count == 1 ? "reply" : "replies");
+        /* "N replies: Ana, Ben, Cy" -- the most recent repliers, newest first
+         * (REQ-060), by the roster's name, else the one a message carried. */
+        char rl[320];
+        int o = snprintf(rl, sizeof rl, "    \xe2\x86\xb3 %u %s", m->reply_count,
+                         m->reply_count == 1 ? "reply" : "replies");
+        uint8_t nr = m->n_repliers > OC_THREAD_REPLIERS_MAX ? OC_THREAD_REPLIERS_MAX : m->n_repliers;
+        for (uint8_t k = 0; k < nr && o > 0 && (size_t)o < sizeof rl; k++) {
+            const char *nm = oc_model_user_name(mdl, m->repliers[k]);
+            if (!nm || !nm[0]) nm = ch ? name_for(ch, m->repliers[k]) : "someone";
+            o += snprintf(rl + o, sizeof rl - (size_t)o, "%s%s", k ? ", " : ": ", nm);
+        }
         char *rr = malloc(strlen(rl) + 1);
         if (rr) { strcpy(rr, rl); rows_push(r, rr, TB_CYAN); }
     }

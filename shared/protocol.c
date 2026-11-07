@@ -912,6 +912,9 @@ oc_result oc_encode_thread_meta(oc_wbuf *w, uint16_t version, const oc_thread_me
     oc_w_u64(w, m->message_id);
     oc_w_u32(w, m->reply_count);
     oc_w_u64(w, m->last_reply_at);
+    uint8_t n = m->n_repliers > OC_THREAD_REPLIERS_MAX ? OC_THREAD_REPLIERS_MAX : m->n_repliers;
+    oc_w_u8(w, n);
+    for (uint8_t i = 0; i < n; i++) oc_w_u64(w, m->repliers[i]);
     return oc_frame_end(w, off);
 }
 
@@ -3198,6 +3201,9 @@ oc_result oc_decode_thread_meta(oc_rbuf *p, oc_thread_meta *m) {
     m->message_id = oc_r_u64(p);
     m->reply_count = oc_r_u32(p);
     m->last_reply_at = oc_r_u64(p);
+    m->n_repliers = oc_r_u8(p);
+    if (m->n_repliers > OC_THREAD_REPLIERS_MAX) return OC_E_MALFORMED;
+    for (uint8_t i = 0; i < m->n_repliers; i++) m->repliers[i] = oc_r_u64(p);
     return r_done(p);
 }
 
