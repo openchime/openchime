@@ -1887,6 +1887,32 @@ static void test_broadcast_mentions_me(void) {
     oc_model_free(&m);
 }
 
+/* The id form (<@U42>) mentions the reader whose id it is, whatever its label,
+ * and shows as the roster's name (REQ-221, ARCH-89). */
+static void test_id_mentions(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("ada"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(&m, &e);
+    const char *a = "standup <@U1> now";
+    CHECK(oc_model_mentions_me_in(&m, 0, a, strlen(a)) == 1);
+    CHECK(oc_model_mentions_me(&m, a, strlen(a)) == 1);
+    const char *b = "<@U2|ada> only";                 /* a label is not a name */
+    CHECK(oc_model_mentions_me_in(&m, 0, b, strlen(b)) == 0);
+    CHECK(oc_model_mentions_me(&m, b, strlen(b)) == 0);
+    const char *c = "<@U1|someone> hi";
+    CHECK(oc_model_mentions_me_in(&m, 0, c, strlen(c)) == 1);
+
+    const char *d = "<@U1> and <@U2|old> and <@U9>";
+    char *shown = oc_model_mention_display(&m, d, strlen(d));
+    /* contract: MARKDOWN.md, an id-form mention is shown as @ and the name */
+    CHECK(shown && strcmp(shown, "@ada and @bob and <@U9>") == 0);
+    free(shown);
+    CHECK(oc_model_mention_display(&m, "@ada plain", 10) == NULL);   /* nothing to change */
+    oc_model_free(&m);
+}
+
 /* The same answer where it is counted, in a channel whose member list is not
  * loaded -- every channel but the open one -- under a rule whose answer is the
  * channel's size: a stored broadcast is a mention (the badge's priority count,
@@ -5877,6 +5903,7 @@ int run_client_core_tests(void) {
     test_broadcast_check();
     test_broadcast_check_dm();
     test_broadcast_mentions_me();
+    test_id_mentions();
     test_broadcast_stored_model();
     test_workspace_sender_model();
     test_time_preview();

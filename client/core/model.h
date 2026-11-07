@@ -860,8 +860,13 @@ int oc_model_only_via_group(const oc_model *m, uint64_t channel_id, uint64_t use
 const oc_group_view *oc_model_group_by_handle(const oc_model *m, const char *handle);
 int      oc_model_in_group(const oc_group_view *g, uint64_t user_id);
 uint64_t oc_model_via_group(const oc_model *m, uint64_t channel_id, uint64_t user_id);
-/* Does `body` mention this user -- by their name, or by a group they are in
- * (REQ-308)? What a toast and a highlight ask. */
+/* `body` as it is shown: each id-form mention (<@U42>) as '@' and the roster's
+ * name for the id, an id the roster lacks as written (oc_mention_display).
+ * A malloc'd string, or NULL when nothing changed: show `body` as it is. */
+char    *oc_model_mention_display(const oc_model *m, const char *body, size_t len);
+/* Does `body` mention this user -- by their name, by their id in the id form
+ * (<@U42>), or by a group they are in (REQ-308)? What a toast and a highlight
+ * ask. */
 int      oc_model_mentions_me(const oc_model *m, const char *body, size_t len);
 /* The same, for a message whose send the daemon `broadcast_stored` a
  * broadcast mention row for or not (the message's own flag, REQ-221): a

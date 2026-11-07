@@ -4796,6 +4796,123 @@ static void test_search(void) {
     cleanup_db(path);
 }
 
+/* A mention in the id form, <@U42> (REQ-221, ARCH-89): resolved by id under
+ * the same rules as a name, and found by a search for the person's name. */
+static void test_mentions_by_id(void) {
+    const char *path = tdb("mentions_id.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+
+    uint64_t ida = reg(w, "ida",  "pw", OC_ROLE_OWNER);
+    uint64_t idb = reg(w, "idb",  "pw", OC_ROLE_MEMBER);
+    uint64_t idc = reg(w, "idc",  "pw", OC_ROLE_MEMBER);
+    uint64_t idd = reg(w, "idd",  "pw", OC_ROLE_MEMBER);
+    CHECK(ida && idb && idc && idd);
+    char body[160];
+
+    /* In the default channel, by id, with and without a label. */
+    snprintf(body, sizeof body, "standup <@U%llu> later", (unsigned long long)idb);
+    uint64_t m1 = send_id(w, ida, OC_DEFAULT_CHANNEL, body);
+    CHECK(m1 && mention_rows(path, m1, idb, OC_MENTION_USER) == 1);
+    CHECK(mention_rows(path, m1, 0, -1) == 1);
+    snprintf(body, sizeof body, "<@U%llu|Someone Else> look", (unsigned long long)idc);
+    uint64_t m2 = send_id(w, ida, OC_DEFAULT_CHANNEL, body);
+    CHECK(m2 && mention_rows(path, m2, idc, OC_MENTION_USER) == 1);
+
+    /* Named twice, once in each form: one row, so one notification. */
+    snprintf(body, sizeof body, "@idb and <@U%llu> again <@U%llu>",
+             (unsigned long long)idb, (unsigned long long)idb);
+    uint64_t m3 = send_id(w, ida, OC_DEFAULT_CHANNEL, body);
+    CHECK(m3 && mention_rows(path, m3, idb, -1) == 1 && mention_rows(path, m3, 0, -1) == 1);
+
+    /* An id nobody has, and a malformed token: no row. */
+    uint64_t m4 = send_id(w, ida, OC_DEFAULT_CHANNEL, "ping <@U987654> and <@U12");
+    CHECK(m4 && mention_rows(path, m4, 0, -1) == 0);
+
+    /* A public channel resolves against the roster (REQ-288): a non-member
+     * named by id is mentioned. A private one only against its members. */
+    oc_dbres *r = create_channel(w, ida, "id-public", 1);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t pub = r->channel_id;
+    oc_dbres_free(r);
+    snprintf(body, sizeof body, "<@U%llu> see this", (unsigned long long)idb);
+    uint64_t m5 = send_id(w, ida, pub, body);
+    CHECK(m5 && mention_rows(path, m5, idb, OC_MENTION_USER) == 1);
+
+    r = create_channel(w, ida, "id-private", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t priv = r->channel_id;
+    oc_dbres_free(r);
+    oc_dbres_free(chan_member(w, OC_JOB_INVITE_CHANNEL, ida, priv, idc));
+    snprintf(body, sizeof body, "<@U%llu> and <@U%llu>", (unsigned long long)idb, (unsigned long long)idc);
+    uint64_t m6 = send_id(w, ida, priv, body);
+    CHECK(m6 && mention_rows(path, m6, idb, -1) == 0);    /* not a member: text */
+    CHECK(mention_rows(path, m6, idc, OC_MENTION_USER) == 1);
+
+    /* A disabled person is nobody to notify. */
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        char sql[96];
+        snprintf(sql, sizeof sql, "UPDATE users SET disabled=1 WHERE id=%llu;", (unsigned long long)idd);
+        CHECK(sqlite3_exec(raw, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+    snprintf(body, sizeof body, "hello <@U%llu>", (unsigned long long)idd);
+    uint64_t m7 = send_id(w, ida, OC_DEFAULT_CHANNEL, body);
+    CHECK(m7 && mention_rows(path, m7, 0, -1) == 0);
+
+    /* The body is stored as typed (REQ-054). */
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(raw, "SELECT body FROM messages WHERE id=?1;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)m7);
+        CHECK(sqlite3_step(st) == SQLITE_ROW);
+        /* contract: data in, data out -- stored as given */
+        CHECK(sqlite3_column_bytes(st, 0) == (int)strlen(body) &&
+              memcmp(sqlite3_column_blob(st, 0), body, strlen(body)) == 0);
+        sqlite3_finalize(st);
+        sqlite3_close(raw);
+    }
+
+    /* Read aloud, the id is the person's name (READ-ALOUD.md §3). */
+    {
+        oc_job *j = oc_job_new(OC_JOB_TTS_LOOKUP, 78);
+        j->user_id = ida; j->message_id = m1;
+        j->tts_model_version = strdup("test");
+        j->tts_voices = strdup("v1");
+        j->tts_lang = strdup("en-US");
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        /* contract: what is read aloud -- the id said as the display name */
+        CHECK(r && r->type == OC_RES_TTS_META && r->tts_text && strcmp(r->tts_text, "standup idb later") == 0);
+        oc_dbres_free(r);
+    }
+
+    /* A search for a person's name finds a message that names them only by
+     * id, and still finds them by name; another term still narrows it. */
+    r = search(w, ida, "idc", 0);
+    int saw_m2 = 0, saw_m6 = 0;
+    for (size_t i = 0; r && i < r->n_search; i++) {
+        if (r->search[i].message_id == m2) saw_m2 = 1;
+        if (r->search[i].message_id == m6) saw_m6 = 1;
+    }
+    CHECK(r && r->type == OC_RES_SEARCH && saw_m2 && saw_m6);
+    oc_dbres_free(r);
+    r = search(w, ida, "standup IDB", 0);
+    CHECK(r && r->n_search == 1 && r->search[0].message_id == m1);
+    oc_dbres_free(r);
+    r = search(w, ida, "nosuchword idb", 0);
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_search == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* Persisted TLS identity (ARCH-66b): store + load round-trips through the DB so
  * a database restored onto a new box keeps the same trusted certificate. */
 static void test_tls_identity(void) {
@@ -10370,6 +10487,7 @@ int run_dbwriter_tests(void) {
     test_backfill();
     test_history_paging();
     test_mentions_stored();
+    test_mentions_by_id();
     test_pins();
     test_channel_details();
     test_drafts();

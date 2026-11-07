@@ -4494,6 +4494,8 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
         }
     }
 
+    uint64_t named[OC_MENTION_MAX];
+    size_t n_named = 0;
     for (size_t i = 0; i < n; i++) {
         int64_t uid = 0;
         /* A group's handle first (REQ-308): it wins a clash with a person's
@@ -4503,7 +4505,7 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
          * mentions, not this one. Who it cannot reach is told to the sender as
          * a person not in the channel is (REQ-287), and in a public channel
          * still gets the mention (REQ-288). */
-        uint64_t gid = m[i].kind == OC_MENTION_USER ? group_by_handle(db, m[i].name) : 0;
+        uint64_t gid = m[i].kind == OC_MENTION_USER && !m[i].user_id ? group_by_handle(db, m[i].name) : 0;
         if (gid) {
             oc_group_row g;
             if (!load_group(db, gid, &g)) continue;
@@ -4556,16 +4558,19 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
             continue;
         if (m[i].kind == OC_MENTION_USER) {
             /* Match the display name case-insensitively among this channel's
-             * members. Membership is asked first regardless of channel kind,
-             * because "are they in it" is also what REQ-287 reports. */
+             * members -- or, for the id form (<@U42>), the id itself, under
+             * the same rules. Membership is asked first regardless of channel
+             * kind, because "are they in it" is also what REQ-287 reports. */
             sqlite3_stmt *q = NULL;
             if (sqlite3_prepare_v2(db,
                     "SELECT u.id FROM users u JOIN channel_members cm ON cm.user_id = u.id "
                     "WHERE cm.channel_id = ?1 AND u.disabled = 0 AND u.is_system = 0 "
-                    "  AND lower(u.display_name) = lower(?2) LIMIT 1;", -1, &q, NULL) != SQLITE_OK)
+                    "  AND (CASE WHEN ?3 <> 0 THEN u.id = ?3 "
+                    "            ELSE lower(u.display_name) = lower(?2) END) LIMIT 1;", -1, &q, NULL) != SQLITE_OK)
                 continue;
             sqlite3_bind_int64(q, 1, (sqlite3_int64)channel_id);
             sqlite3_bind_text(q, 2, m[i].name, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(q, 3, (sqlite3_int64)m[i].user_id);
             if (sqlite3_step(q) == SQLITE_ROW) uid = sqlite3_column_int64(q, 0);
             sqlite3_finalize(q);
             if (!uid) {
@@ -4577,9 +4582,12 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
                 sqlite3_stmt *w = NULL;
                 if (sqlite3_prepare_v2(db,
                         "SELECT id, display_name FROM users "
-                        "WHERE disabled = 0 AND is_system = 0 AND lower(display_name) = lower(?1) LIMIT 1;",
+                        "WHERE disabled = 0 AND is_system = 0 "
+                        "  AND (CASE WHEN ?2 <> 0 THEN id = ?2 "
+                        "            ELSE lower(display_name) = lower(?1) END) LIMIT 1;",
                         -1, &w, NULL) == SQLITE_OK) {
                     sqlite3_bind_text(w, 1, m[i].name, -1, SQLITE_STATIC);
+                    sqlite3_bind_int64(w, 2, (sqlite3_int64)m[i].user_id);
                     if (sqlite3_step(w) == SQLITE_ROW) {
                         outsider = (uint64_t)sqlite3_column_int64(w, 0);
                         unreached_add(&unreached, outsider);
@@ -4619,6 +4627,13 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
                 if (outsider && chan_public) uid = (int64_t)outsider;
                 else continue;                     /* private, or not a person: just text */
             }
+            /* One row per person per message, however often and in whichever
+             * form they are named (`@ada` and `<@U42>`): one row is one
+             * notification. */
+            int again = 0;
+            for (size_t q2 = 0; q2 < n_named && !again; q2++) again = named[q2] == (uint64_t)uid;
+            if (again) continue;
+            if (n_named < OC_MENTION_MAX) named[n_named++] = (uint64_t)uid;
         }
         sqlite3_reset(ins);
         sqlite3_bind_int64(ins, 1, (sqlite3_int64)mid);
@@ -7430,26 +7445,47 @@ static oc_dbres *process_list_thread(sqlite3 *db, const oc_job *j) {
 
 /* Turn arbitrary user input into a safe FTS5 MATCH string: each whitespace-
  * separated token becomes a double-quoted phrase (internal quotes doubled per
- * FTS5), so query punctuation can never trip the FTS5 grammar. Multiple tokens
- * are implicitly ANDed. Returns the token count (0 = nothing to search). */
-static int build_fts_query(const char *in, size_t inlen, char *out, size_t outcap) {
+ * FTS5), so query punctuation can never trip the FTS5 grammar. Tokens are
+ * ANDed. A token that is a person's display name (case-insensitive) also
+ * matches their id-form mentions, `<@U42>`, which FTS5 indexes as the token
+ * `u42` (REQ-221): ("ada" OR "u42"). Returns the token count (0 = nothing to
+ * search). */
+static int build_fts_query(sqlite3 *db, const char *in, size_t inlen, char *out, size_t outcap) {
     size_t o = 0; int tokens = 0; size_t i = 0;
+    sqlite3_stmt *who = NULL;
+    if (db) sqlite3_prepare_v2(db,
+        "SELECT id FROM users WHERE is_system = 0 AND lower(display_name) = lower(?1) LIMIT 1;",
+        -1, &who, NULL);
     while (i < inlen) {
         while (i < inlen && (in[i] == ' ' || in[i] == '\t' || in[i] == '\n' || in[i] == '\r')) i++;
         if (i >= inlen) break;
-        /* One token spans until the next whitespace. */
-        if (o + 2 >= outcap) break;
-        if (tokens > 0) { if (o + 1 >= outcap) break; out[o++] = ' '; }
-        out[o++] = '"';
-        while (i < inlen && in[i] != ' ' && in[i] != '\t' && in[i] != '\n' && in[i] != '\r') {
-            if (in[i] == '"') { if (o + 2 >= outcap) break; out[o++] = '"'; out[o++] = '"'; }
-            else              { if (o + 1 >= outcap) break; out[o++] = in[i]; }
-            i++;
+        size_t s = i;
+        while (i < inlen && in[i] != ' ' && in[i] != '\t' && in[i] != '\n' && in[i] != '\r') i++;
+        uint64_t uid = 0;
+        if (who) {
+            sqlite3_reset(who);
+            sqlite3_bind_text(who, 1, in + s, (int)(i - s), SQLITE_STATIC);
+            if (sqlite3_step(who) == SQLITE_ROW) uid = (uint64_t)sqlite3_column_int64(who, 0);
         }
-        if (o + 1 >= outcap) break;
+        char idtok[32] = "";
+        if (uid) snprintf(idtok, sizeof idtok, " OR \"u%llu\")", (unsigned long long)uid);
+        /* The whole token, its quotes, the joiner and any id part, or none of it. */
+        size_t need = (tokens ? 5 : 0) + (uid ? 1 : 0) + 2 + strlen(idtok) + 1;
+        for (size_t q = s; q < i; q++) need += in[q] == '"' ? 2 : 1;
+        if (o + need >= outcap) break;
+        if (tokens) { memcpy(out + o, " AND ", 5); o += 5; }
+        if (uid) out[o++] = '(';
         out[o++] = '"';
+        for (size_t q = s; q < i; q++) {
+            if (in[q] == '"') out[o++] = '"';
+            out[o++] = in[q];
+        }
+        out[o++] = '"';
+        memcpy(out + o, idtok, strlen(idtok));
+        o += strlen(idtok);
         tokens++;
     }
+    sqlite3_finalize(who);
     out[o < outcap ? o : outcap - 1] = '\0';
     return tokens;
 }
@@ -7467,7 +7503,7 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
 
     char fts[1024];
     int have_text = (j->body && j->body_len > 0 &&
-                     build_fts_query((const char *)j->body, j->body_len, fts, sizeof fts) != 0);
+                     build_fts_query(db, (const char *)j->body, j->body_len, fts, sizeof fts) != 0);
     /* filters alone are a valid search — "everything alice posted in #design"
      * needs no words. Only a query with NEITHER text nor filters is empty. */
     int have_filter = (j->sq_from && j->sq_from[0]) || (j->sq_in && j->sq_in[0]) ||
@@ -10336,14 +10372,23 @@ typedef struct { sqlite3 *db; uint64_t channel_id; char name[64]; } speak_names;
 static const char *speak_resolve(void *ctx, const char *name) {
     speak_names *sn = ctx;
     sqlite3_stmt *st = NULL;
+    /* An id-form mention (<@U42>) comes as "U<digits>" (speakable.h). */
+    uint64_t id = 0;
+    if (name[0] == 'U' && name[1]) {
+        const char *p = name + 1;
+        while (*p >= '0' && *p <= '9') p++;
+        if (!*p) id = strtoull(name + 1, NULL, 10);
+    }
     if (sqlite3_prepare_v2(sn->db,
             "SELECT u.display_name FROM users u"
             "  JOIN channel_members cm ON cm.user_id = u.id"
             " WHERE cm.channel_id = ?1 AND u.disabled = 0"
-            "   AND lower(u.display_name) = lower(?2) LIMIT 1;", -1, &st, NULL) != SQLITE_OK)
+            "   AND (CASE WHEN ?3 <> 0 THEN u.id = ?3"
+            "             ELSE lower(u.display_name) = lower(?2) END) LIMIT 1;", -1, &st, NULL) != SQLITE_OK)
         return NULL;
     sqlite3_bind_int64(st, 1, (sqlite3_int64)sn->channel_id);
     sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)id);
     const char *out = NULL;
     if (sqlite3_step(st) == SQLITE_ROW) {
         const unsigned char *dn = sqlite3_column_text(st, 0);

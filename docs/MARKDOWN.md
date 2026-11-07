@@ -28,6 +28,7 @@ construct shows its source legibly.
 | Table | `\| a \| b \|` over `\|---\|---\|` | A pipe table, as GitHub writes it — see §1a. |
 | Time | `<time:2026-10-30T15:00Z>` | A moment, shown to each reader in their own zone — see §1c. |
 | Spoiler | `>!hidden!<`, or ` ```spoiler Label ` … ` ``` ` | Covered until each reader chooses to see it — see §1d. |
+| Mention by id | `<@U42>`, or `<@U42\|label>` | A person named by their id, shown as their name — see §1e. |
 
 Emphasis nests (`*bold with _italic_ inside*`); code does not — everything inside
 a code span or block is literal, including other delimiters.
@@ -238,6 +239,40 @@ hidden text, with `OC_RT_DELIM` spans over the `>!` and `!<`, the opening line a
 the closing fence; `oc_rt_spoilers` lists each one whole, with its label, those in
 a table's cells among them (`oc_rt_scan` reports a table as one span, so
 `oc_rt_scan_cell` is what gives a cell's own spans).
+
+## 1e. Mentions by id
+
+A person is mentioned by name, `@ada`, or by id, as apps written for other chat
+platforms post:
+
+```
+<@U42> can you review this?
+<@U42|Ada Lovelace> can you review this?
+```
+
+`U` and the person's numeric id, the same string the Web API and events use for
+them; after a `|`, an optional label. It notifies, highlights and counts as a
+mention of that person exactly as `@name` does, resolved by id under the same
+rules (REQ-221, REQ-288), and a person named both ways in one message is
+mentioned once.
+
+**The body keeps it as typed** (ARCH-89): it is what is stored, sent, exported
+and searched, so it survives a rename. Each client shows it as `@` and the
+person's current name, whatever the label says, and highlights it as any
+`@name`; the terminal client shows the name in place of the token. An id nobody
+has is left as written. Read aloud it is the person's spoken name, or the label
+when there is one. A search for a person's name also finds the messages that
+name them by id.
+
+Only a well-formed token is a mention: 1 to 20 digits, not 0, closed by `>`; a
+label with no newline and no `>`, shorter than 64 bytes. Anything that begins
+`<@U` and a digit, `>` or `|` but breaks those rules mentions nobody, not even
+someone called "U42". Only `U` is recognised; `<#C…>` and `<!here>` are text.
+The composer still inserts `@name`.
+
+`oc_mention_scan` reports it as an `OC_MENTION_USER` mention over the whole
+token, with the id in `user_id` and the label in `name`; `oc_mention_display`
+turns a body into what is shown.
 
 ## 2. When a delimiter is *not* markup
 

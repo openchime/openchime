@@ -1831,7 +1831,12 @@ keeps to its own share of the free space and gives it back under pressure
   the unchanged body. Full dialect, the escaping rules, and the places we
   deliberately diverge from Slack are in [MARKDOWN.md](./MARKDOWN.md).
 - **REQ-221.** A message has been able to **@mention** a user, and the broadcast
-  audiences `@here` / `@channel` / `@everyone`. A mention has been stored as a
+  audiences `@here` / `@channel` / `@everyone`. A mention has been written by
+  name (`@ada`) or by id (`<@U42>`, optionally `<@U42|label>`, the form apps
+  written for other chat platforms post; MARKDOWN.md §1e); both have been
+  resolved under the same rules, a person named both ways in one message has
+  been mentioned once, and every client has shown the id form as the person's
+  name. A mention has been stored as a
   stable reference (user id) that survives display-name changes, has highlighted
   for the mentioned party, and has driven notification delivery under the
   recipient's per-channel level (REQ-130) — the "mentions" notification level

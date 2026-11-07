@@ -5467,13 +5467,41 @@ static const char *action_line(const oc_msg *msg) {
 }
 
 /* The text of a message as the transcript shows it (tombstone / empty
- * handled). An action shows as its line, and everything that lays a body out,
+ * handled). An action shows as its line, an id-form mention as the person's
+ * name, and everything that lays a body out,
  * hit-tests it, selects in it or copies from it reads this one function, so
  * the positions they trade are the same text's. */
+/* A body with an id-form mention (<@U42>) as it is shown: each as '@' and the
+ * person's name, before anything scans it, so it lays out, highlights, hit-
+ * tests and copies as any @name (MARKDOWN.md §1e). Kept per message like an
+ * action's line, and handed back unchanged while what it shows is the same, so
+ * the pointer stays put; a rename changes what it shows, and so the layout's
+ * signature, which hashes this text. */
+enum { MENT_LINES = 32 };
+static struct { uint64_t mid; char *shown; } g_ment_line[MENT_LINES];
+static unsigned g_ment_next;
+
+static const char *mention_shown(const oc_msg *msg, const char *text) {
+    if (!strstr(text, "<@U")) return text;
+    char *shown = oc_model_mention_display(model(), text, strlen(text));
+    if (!shown) return text;
+    for (unsigned i = 0; i < MENT_LINES; i++)
+        if (g_ment_line[i].shown && g_ment_line[i].mid == msg->message_id &&
+            strcmp(g_ment_line[i].shown, shown) == 0) {
+            free(shown);
+            return g_ment_line[i].shown;
+        }
+    unsigned k = g_ment_next++ % MENT_LINES;
+    free(g_ment_line[k].shown);
+    g_ment_line[k].mid = msg->message_id;
+    g_ment_line[k].shown = shown;
+    return shown;
+}
+
 static const char *body_text(const oc_msg *msg) {
-    if (!msg->deleted && msg->action.present && msg->body) return action_line(msg);
+    if (!msg->deleted && msg->action.present && msg->body) return mention_shown(msg, action_line(msg));
     return msg->deleted ? "(message deleted)"
-         : (msg->body && msg->body[0]) ? msg->body : " ";
+         : (msg->body && msg->body[0]) ? mention_shown(msg, msg->body) : " ";
 }
 
 /* Bytes of body_text that are the actor's name and the space after it: the

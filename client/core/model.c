@@ -1528,6 +1528,8 @@ int oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_stored,
     const char *me = oc_model_user_name(m, m->user_id);
     for (size_t i = 0; i < n; i++) {
         if (mm[i].kind != OC_MENTION_USER) { bc = 1; continue; }
+        /* The id form (<@U42>) names whoever the id is; its label is no name. */
+        if (mm[i].user_id) { if (m->user_id && mm[i].user_id == m->user_id) return 1; continue; }
         if (me && me[0] && name_eq(mm[i].name, me)) return 1;
         for (size_t k = 0; k < m->n_groups; k++)
             if (oc_model_in_group(m->groups[k], m->user_id) && name_eq(mm[i].name, m->groups[k]->handle))
@@ -1538,11 +1540,24 @@ int oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_stored,
 
 int oc_model_mentions_me(const oc_model *m, const char *body, size_t len) {
     if (!m || !body) return 0;
-    if (oc_mention_targets(body, len, oc_model_user_name(m, m->user_id))) return 1;
+    if (oc_mention_targets(body, len, oc_model_user_name(m, m->user_id), m->user_id)) return 1;
     for (size_t i = 0; i < m->n_groups; i++)
-        if (oc_model_in_group(m->groups[i], m->user_id) && oc_mention_targets(body, len, m->groups[i]->handle))
+        if (oc_model_in_group(m->groups[i], m->user_id) && oc_mention_targets(body, len, m->groups[i]->handle, 0))
             return 1;
     return 0;
+}
+
+/* The roster's name for an id-form mention, or NULL for an id it lacks. */
+static const char *mention_roster_name(void *ctx, uint64_t user_id) {
+    const oc_model *m = ctx;
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == user_id) return m->users[i].name[0] ? m->users[i].name : NULL;
+    return NULL;
+}
+
+char *oc_model_mention_display(const oc_model *m, const char *body, size_t len) {
+    if (!m || !body) return NULL;
+    return oc_mention_display(body, len, mention_roster_name, (void *)m);
 }
 
 /* Take a GROUP event's group into the model, replacing the one with its id. */

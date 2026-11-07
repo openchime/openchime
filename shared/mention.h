@@ -20,7 +20,7 @@
 #include <stdint.h>
 
 enum {
-    OC_MENTION_USER = 0,    /* @someone — resolve `name` against the roster */
+    OC_MENTION_USER = 0,    /* @someone, or <@U42> — resolve `name`, or take `user_id` */
     OC_MENTION_HERE,        /* @here     — members currently online */
     OC_MENTION_CHANNEL,     /* @channel  — every member */
     OC_MENTION_EVERYONE,    /* @everyone — every member */
@@ -42,10 +42,11 @@ enum {
 #define OC_MENTION_MAX 32
 
 typedef struct {
-    size_t  start;                      /* byte offset of the '@' in the body */
-    size_t  len;                        /* bytes of the whole mention, '@' included */
-    uint8_t kind;                       /* OC_MENTION_* */
-    char    name[OC_MENTION_NAME_MAX];  /* text after '@', as written */
+    size_t   start;                     /* byte offset of the '@', or the '<' of the id form */
+    size_t   len;                       /* bytes of the whole mention, '@' (or '<' to '>') included */
+    uint8_t  kind;                      /* OC_MENTION_* */
+    uint64_t user_id;                   /* the id form's id; 0 for a mention by name */
+    char     name[OC_MENTION_NAME_MAX]; /* text after '@', as written; the id form's label, or empty */
 } oc_mention;
 
 /* Scan `body` (`len` bytes, not necessarily NUL-terminated) and write up to
@@ -60,6 +61,13 @@ typedef struct {
  *     ends the sentence.
  *   - @here / @channel / @everyone are reserved, matched case-insensitively,
  *     and never resolve to a user even if somebody is called that.
+ *   - The id form, `<@U42>` or `<@U42|label>`, names a person by id: the
+ *     convention apps written for other chat platforms post. The span is the
+ *     whole token, the kind OC_MENTION_USER, `user_id` the id and `name` the
+ *     label (empty without one). The id is 1 to 20 digits and not 0; the label
+ *     holds no newline and no '>', and is shorter than OC_MENTION_NAME_MAX.
+ *     Anything that begins `<@U` and a digit, '>' or '|' but breaks those rules
+ *     is not a mention at all -- not even of someone called "U42".
  */
 size_t oc_mention_scan(const char *body, size_t len, oc_mention *out, size_t max);
 
@@ -84,10 +92,21 @@ typedef struct {
 
 size_t oc_chanref_scan(const char *body, size_t len, oc_chanref *out, size_t max);
 
-/* Does `body` mention `name` (case-insensitive), or carry any broadcast
- * audience? A convenience for the common "is this for me" question; `name` may
- * be NULL to ask only about broadcasts. */
-int oc_mention_targets(const char *body, size_t len, const char *name);
+/* Does `body` mention `name` (case-insensitive), or the id `user_id` in the id
+ * form, or carry any broadcast audience? A convenience for the common "is this
+ * for me" question; `name` may be NULL and `user_id` 0 to ask only about
+ * broadcasts. An id form's label is never matched as a name. */
+int oc_mention_targets(const char *body, size_t len, const char *name, uint64_t user_id);
+
+/* The name an id-form mention shows as, or NULL when the id is unknown. */
+typedef const char *(*oc_mention_name_fn)(void *ctx, uint64_t user_id);
+
+/* `body` as a reader sees it: each id-form mention replaced by '@' and the
+ * name `resolve` gives for its id, so it reads, highlights and is scanned as
+ * any @name is. An unknown id is left as written. The body itself keeps the id
+ * form (ARCH-89); only what is shown changes. Returns a malloc'd string, or
+ * NULL when nothing was replaced (show `body` as it is) or there is no memory. */
+char *oc_mention_display(const char *body, size_t len, oc_mention_name_fn resolve, void *ctx);
 
 /* Does `body` contain `term` as a keyword (REQ-135)? Case-insensitive and EXACT:
  * "deploy" does not match "deployment", because a highlight-word that fires on
