@@ -69,6 +69,7 @@ jobs:
           [ -f "$refs" ] || refs="$RUNNER_TEMP/base/scripts/test/local/refs.sh"
           cd "$RUNNER_TEMP/head" && sh "$refs"
       - name: Title and body
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
           # Through env, never inline: an expression is substituted as text

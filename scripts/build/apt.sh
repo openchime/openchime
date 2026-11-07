@@ -15,8 +15,23 @@
 # transfer stops without an error), waits for dpkg's lock rather than
 # failing on it (unattended-upgrades holds it on a fresh runner), and prints
 # what it fetches, so a stall is visible in the log and bounded in time.
+#
+# Only what the runner image lacks is installed: a package already there is
+# left alone, and when every one is there nothing is fetched at all -- no
+# `apt-get update` (docs/CONTRIBUTING.md, "Billed minutes").
 set -euo pipefail
 [ "$#" -gt 0 ] || { echo "usage: apt.sh <package>..." >&2; exit 2; }
+missing=()
+for p in "$@"; do
+  status=$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null || true)
+  [ "$status" = "install ok installed" ] || missing+=("$p")
+done
+if [ "${#missing[@]}" -eq 0 ]; then
+  echo "apt.sh: $* already installed; nothing fetched"
+  exit 0
+fi
+echo "apt.sh: installing ${missing[*]} (already there: $(comm -23 <(printf '%s\n' "$@" | sort) <(printf '%s\n' "${missing[@]}" | sort) | tr '\n' ' '))"
+set -- "${missing[@]}"
 sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
   /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
 # The runner image's sources do not name the mirror: they point at a mirror
