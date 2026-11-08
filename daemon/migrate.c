@@ -1262,6 +1262,16 @@ static const char MIGRATION_0070[] =
     "  PRIMARY KEY (user_id, message_id)"
     ");";
 
+static const char MIGRATION_0071[] =
+    /* What kind of principal a user row is. Every row so far is a person
+     * ('human'). A web visitor ('visitor') is a row with subject
+     * visitor:<opaque>: outside the user cap, absent from the roster, and
+     * reaching nothing but its own conversation. 'agent' and 'bot' are allowed
+     * now, though nothing creates them yet, because SQLite cannot widen a CHECK
+     * without rebuilding users. */
+    "ALTER TABLE users ADD COLUMN kind TEXT NOT NULL DEFAULT 'human' "
+    "  CHECK (kind IN ('human','agent','bot','visitor'));";
+
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
      * author is doing, and the daemon records that as its own object beside the
@@ -1620,6 +1630,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 68, MIGRATION_0068 },
     { 69, MIGRATION_0069 },
     { 70, MIGRATION_0070 },
+    { 71, MIGRATION_0071 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

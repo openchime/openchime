@@ -1563,6 +1563,17 @@ where one exists.
   needed no identity source and no OpenChime-operated service, so agents have
   worked on a workspace with nothing else configured and on one that is
   air-gapped, in every deployment model (ARCH-76).
+- **REQ-375.** A **web visitor** has been a principal of its own: a `users` row
+  of kind `visitor` under the `visitor:` subject namespace, someone outside the
+  workspace who writes in through the embeddable widget. Its **membership has
+  been its only authority**, and it has reached nothing but its own
+  conversation. A visitor has **not counted against the registered-user cap**
+  (AUTH.md §2), which has counted people only. It has been absent from the
+  directory and roster (REQ-289), and from presence and typing. Nobody has been
+  able to open a DM or group DM with it, invite it to a channel or add it to a
+  user group, and it has opened, joined and invited nothing itself. A refusal
+  has read as one for an unknown user, so nothing has disclosed that a visitor
+  is there, and a name in a message has never resolved to one.
 - **REQ-323.** A person has been able to **connect their own AI client** to the
   workspace through the MCP surface, and that client has acted **as them, with
   exactly their access** — the channels and DMs they can read and post in, no

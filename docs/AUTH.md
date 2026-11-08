@@ -110,7 +110,8 @@ authority.
   = unlimited). Creating a *new* user past the cap — by signing up with an invite or
   the setup token, by a first-time provider sign-in, or by bringing a removed
   member back — is refused with `ERROR USER_LIMIT`; an existing user still logs in, and a removed member
-  (`disabled=1`) frees a seat (the count is active users only). It is a managed
+  (`disabled=1`) frees a seat (the count is active people only: a web visitor, an
+  agent or a bot takes no seat, SCHEMA.md §3bj). It is a managed
   box's setting, refused without `OPENCHIME_MANAGED_TICKET` outside development
   (CONFIG.md "A managed box"); only the daemon can enforce it, since only it
   holds the users table.

@@ -2431,7 +2431,9 @@ static void test_index_mentions(void) {
                            /* 0069's invitation time. */
                            "ALTER TABLE invites DROP COLUMN created_at_ms;"
                            /* 0070's collapsed messages. */
-                           "DROP TABLE collapsed_messages;",
+                           "DROP TABLE collapsed_messages;"
+                           /* 0071's kind of principal. */
+                           "ALTER TABLE users DROP COLUMN kind;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -10487,6 +10489,220 @@ static void test_collapsed(void) {
     cleanup_db(path);
 }
 
+/* A web visitor (SCHEMA.md §3bj): a users row of kind 'visitor', written
+ * directly here because nothing on the wire makes one yet. It takes no seat,
+ * is in no roster, and every way of reaching it -- a DM, a channel, a group, a
+ * mention, a typing relay -- is refused or skips it, as an unknown user's is. */
+static uint64_t add_visitor(const char *path, const char *subject, const char *name, uint64_t channel) {
+    sqlite3 *raw = NULL;
+    uint64_t id = 0;
+    if (sqlite3_open(path, &raw) != SQLITE_OK) return 0;
+    sqlite3_busy_timeout(raw, 5000);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(raw, "INSERT INTO users(subject,display_name,created_at_ms,kind) "
+                                "VALUES(?1,?2,1,'visitor');", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, subject, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, name, -1, SQLITE_STATIC);
+        if (sqlite3_step(st) == SQLITE_DONE) id = (uint64_t)sqlite3_last_insert_rowid(raw);
+    }
+    sqlite3_finalize(st);
+    if (id && channel) {
+        char sql[160];
+        snprintf(sql, sizeof sql, "INSERT INTO channel_members(channel_id,user_id,joined_at_ms) "
+                                  "VALUES(%llu,%llu,1);", (unsigned long long)channel, (unsigned long long)id);
+        if (sqlite3_exec(raw, sql, NULL, NULL, NULL) != SQLITE_OK) id = 0;
+    }
+    sqlite3_close(raw);
+    return id;
+}
+
+static void test_visitor_cap(void) {
+    const char *path = tdb("visitor_cap.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t owner = reg(w, "owner", "pw", OC_ROLE_OWNER);
+    oc_dbwriter_set_max_users(w, 2);
+    uint64_t v1 = add_visitor(path, "visitor:a1", "Vee", 0);
+    uint64_t v2 = add_visitor(path, "visitor:a2", "Vic", 0);
+    CHECK(owner && v1 && v2);
+    /* Two visitors and one person: a seat is still free for a second person... */
+    uint64_t bob = reg(w, "bob", "pw", OC_ROLE_MEMBER);
+    CHECK(bob != 0);
+    /* ...and with it the cap is full of people, visitors beside them. */
+    CHECK(reg(w, "carol", "pw", OC_ROLE_MEMBER) == 0);
+    CHECK(auth_local_code(w, 740, "bob", "pw") == 0);   /* an existing person still signs in */
+    CHECK(add_visitor(path, "visitor:a3", "Val", 0) != 0);
+    oc_dbwriter_set_max_users(w, 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_visitor_roster(void) {
+    const char *path = tdb("visitor_roster.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t owner = reg(w, "owner", "pw", OC_ROLE_OWNER);
+    uint64_t v = add_visitor(path, "visitor:r1", "Vee", 0);
+    CHECK(owner && v);
+    oc_dbres *r = list_users(w, owner);
+    CHECK(r && r->type == OC_RES_USER_LIST);
+    int saw_owner = 0, saw_v = 0;
+    for (size_t i = 0; r && i < r->n_ulist; i++) {
+        if (r->ulist[i].user_id == owner) saw_owner = 1;
+        if (r->ulist[i].user_id == v) saw_v = 1;
+    }
+    CHECK(saw_owner && !saw_v);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_visitor_dm(void) {
+    const char *path = tdb("visitor_dm.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t owner = reg(w, "owner", "pw", OC_ROLE_OWNER);
+    uint64_t bob = reg(w, "bob", "pw", OC_ROLE_MEMBER);
+    uint64_t v = add_visitor(path, "visitor:d1", "Vee", 0);
+    CHECK(owner && bob && v);
+    /* To a visitor, as to an unknown user. */
+    oc_job *j = oc_job_new(OC_JOB_OPEN_DM, 720);
+    j->user_id = owner; j->target_user_id = v;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    /* By a visitor, to a person or to itself. */
+    j = oc_job_new(OC_JOB_OPEN_DM, 721);
+    j->user_id = v; j->target_user_id = owner;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_OPEN_DM, 722);
+    j->user_id = v; j->target_user_id = v;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    /* A group DM with a visitor among the others, and one opened by a visitor. */
+    j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 723);
+    j->user_id = owner;
+    j->group_uids[0] = bob; j->group_uids[1] = v; j->n_group_uids = 2;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 724);
+    j->user_id = v;
+    j->group_uids[0] = owner; j->group_uids[1] = bob; j->n_group_uids = 2;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_visitor_channels(void) {
+    const char *path = tdb("visitor_channels.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t owner = reg(w, "owner", "pw", OC_ROLE_OWNER);
+    oc_dbres *r = create_channel(w, owner, "lobby", 1);
+    uint64_t pub = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    r = create_channel(w, owner, "desk", 0);
+    uint64_t priv = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    /* The visitor's own conversation: the private channel it writes in. */
+    uint64_t v = add_visitor(path, "visitor:c1", "Vee", priv);
+    CHECK(owner && pub && priv && v);
+    /* It cannot join a public channel... */
+    r = chan_ref(w, OC_JOB_JOIN_CHANNEL, v, pub);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    CHECK(stored_member(path, pub, v) < 0);
+    /* ...nor be invited to one, nor invite anyone into its own. */
+    r = chan_member(w, OC_JOB_INVITE_CHANNEL, owner, pub, v);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    CHECK(stored_member(path, pub, v) < 0);
+    uint64_t bob = reg(w, "bob", "pw", OC_ROLE_MEMBER);
+    r = chan_member(w, OC_JOB_INVITE_CHANNEL, v, priv, bob);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    CHECK(stored_member(path, priv, bob) < 0);
+    /* A group cannot carry it into channels. */
+    uint64_t g = grp_create(w, owner, "support");
+    CHECK(g != 0);
+    oc_dbres_free(chan_group(w, owner, pub, g, 1));
+    uint64_t vs[1] = { v };
+    oc_dbres_free(grp_members(w, owner, g, 1, vs, 1));
+    CHECK(stored_member(path, pub, v) < 0);
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        char sql[128];
+        snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM user_group_members WHERE user_id=%llu;",
+                 (unsigned long long)v);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(raw, sql, -1, &st, NULL);
+        CHECK(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 0);
+        sqlite3_finalize(st);
+        sqlite3_close(raw);
+    }
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_visitor_mention_typing(void) {
+    const char *path = tdb("visitor_mention.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t owner = reg(w, "owner", "pw", OC_ROLE_OWNER);
+    oc_dbres *r = create_channel(w, owner, "desk", 0);
+    uint64_t desk = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    uint64_t v = add_visitor(path, "visitor:m1", "Vera", desk);
+    CHECK(owner && desk && v);
+    /* Named in a channel it is not in: no outsider is reported. */
+    oc_job *j = oc_job_new(OC_JOB_SEND, 730);
+    j->user_id = owner; j->channel_id = OC_DEFAULT_CHANNEL;
+    memset(j->idem, 0x41, OC_IDEM_LEN);
+    oc_job_set_body(j, "ask @Vera", 9);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_SEND_OK && r->unres.count == 0);
+    oc_dbres_free(r);
+    /* The owner types in the visitor's conversation: the relay lists the owner,
+     * not the visitor. */
+    j = oc_job_new(OC_JOB_TYPING, 731);
+    j->user_id = owner; j->channel_id = desk;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_TYPING);
+    int saw_owner = 0, saw_v = 0;
+    for (size_t i = 0; r && i < r->n_members; i++) {
+        if (r->members[i] == owner) saw_owner = 1;
+        if (r->members[i] == v) saw_v = 1;
+    }
+    CHECK(saw_owner && !saw_v);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
@@ -10517,6 +10733,11 @@ int run_dbwriter_tests(void) {
     test_source_rate_limit();
     test_logout();
     test_role_enforcement();
+    test_visitor_cap();
+    test_visitor_roster();
+    test_visitor_dm();
+    test_visitor_channels();
+    test_visitor_mention_typing();
     test_edit_delete();
     test_channels();
     test_dm();

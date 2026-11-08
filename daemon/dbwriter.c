@@ -958,8 +958,9 @@ static oc_dbres *process_welcome_general(sqlite3 *db, const oc_job *j) {
 
 /* True when adding a NEW user `subject` would exceed the cap (AUTH.md §2,
  * OPENCHIME_MANAGED_MAX_USERS). max_users <= 0 is unlimited; an already-existing subject is
- * never capped (idempotent bootstrap / re-login). Counts active users only — a
- * removed member (disabled=1) frees a seat. */
+ * never capped (idempotent bootstrap / re-login). Counts active people only — a
+ * removed member (disabled=1) frees a seat, and a visitor, agent or bot never
+ * takes one (SCHEMA.md §3bj). */
 static int user_slots_full(sqlite3 *db, const char *subject, size_t sublen, int max_users) {
     if (max_users <= 0) return 0;
     sqlite3_stmt *st = NULL;
@@ -969,7 +970,7 @@ static int user_slots_full(sqlite3 *db, const char *subject, size_t sublen, int 
     sqlite3_finalize(st);
     if (exists) return 0;
     int count = 0;
-    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM users WHERE disabled=0 AND is_system=0;", -1, &st, NULL);
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM users WHERE disabled=0 AND is_system=0 AND kind='human';", -1, &st, NULL);
     if (sqlite3_step(st) == SQLITE_ROW) count = sqlite3_column_int(st, 0);
     sqlite3_finalize(st);
     return count >= max_users;
@@ -1432,6 +1433,19 @@ static int user_disabled(sqlite3 *db, uint64_t uid) {
     if (sqlite3_step(st) == SQLITE_ROW) disabled = sqlite3_column_int(st, 0) != 0;
     sqlite3_finalize(st);
     return disabled;
+}
+
+/* Is this user a web visitor (SCHEMA.md §3bj)? A visitor reaches nothing but
+ * its own conversation: it is no DM's participant, no channel's invitee and no
+ * group's member, and every refusal reads as an unknown user's does. */
+static int user_is_visitor(sqlite3 *db, uint64_t uid) {
+    sqlite3_stmt *st = NULL;
+    int visitor = 0;
+    sqlite3_prepare_v2(db, "SELECT kind='visitor' FROM users WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    if (sqlite3_step(st) == SQLITE_ROW) visitor = sqlite3_column_int(st, 0) != 0;
+    sqlite3_finalize(st);
+    return visitor;
 }
 
 /* Owners who can still sign in. A removed owner keeps the role on its row, and a
@@ -2803,7 +2817,8 @@ static oc_dbres *process_logout(sqlite3 *db, const oc_job *j) {
 
 /* --- Admin ops (REQ-033, tenant-level; owner/admin) --------------------- */
 
-/* The roster's rows: everyone, or (`only` non-zero) the one user. */
+/* The roster's rows: everyone but visitors (REQ-289; a visitor is no member,
+ * SCHEMA.md §3bj), or (`only` non-zero) the one user. */
 static void user_rows(sqlite3 *db, uint64_t only, oc_dbres *r) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
@@ -2811,7 +2826,7 @@ static void user_rows(sqlite3 *db, uint64_t only, oc_dbres *r) {
         "       COALESCE(avatar_attachment_id,0), COALESCE(title,''), COALESCE(timezone,''), "
         "       COALESCE(status_emoji,''), COALESCE(status_text,''), status_expires_ms, "
         "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(voice_id,''), is_system "
-        "FROM users WHERE ?1 = 0 OR id = ?1 ORDER BY id;", -1, &st, NULL);
+        "FROM users WHERE (?1 = 0 AND kind <> 'visitor') OR id = ?1 ORDER BY id;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)only);
     size_t cap = 8, n = 0;
     oc_user_row *arr = malloc(cap * sizeof *arr);
@@ -4062,7 +4077,9 @@ static oc_dbres *process_group_members(sqlite3 *db, const oc_job *j, int add) {
         uint64_t uid = j->grp_uids[i];
         sqlite3_stmt *st = NULL;
         if (add) {
-            if (user_disabled(db, uid)) continue;
+            /* A removed member, or a visitor, who would gain channels through
+             * the group (SCHEMA.md §3bj), is not added. */
+            if (user_disabled(db, uid) || user_is_visitor(db, uid)) continue;
             uint8_t role;
             if (!user_role(db, uid, &role)) continue;          /* no such person: nothing to add */
             sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO user_group_members(group_id,user_id,added_at_ms) "
@@ -4586,12 +4603,14 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
                 /* Not a member — but is it a PERSON? A typo and a colleague who
                  * is simply not in this channel look identical from here, and
                  * they are completely different situations for the sender
-                 * (REQ-287). Ask the tenant roster before deciding it was noise. */
+                 * (REQ-287). Ask the tenant roster before deciding it was noise.
+                 * A visitor is not on it (SCHEMA.md §3bj): naming one is noise,
+                 * and says nothing about who writes in through the widget. */
                 uint64_t outsider = 0;
                 sqlite3_stmt *w = NULL;
                 if (sqlite3_prepare_v2(db,
                         "SELECT id, display_name FROM users "
-                        "WHERE disabled = 0 AND is_system = 0 "
+                        "WHERE disabled = 0 AND is_system = 0 AND kind <> 'visitor' "
                         "  AND (CASE WHEN ?2 <> 0 THEN id = ?2 "
                         "            ELSE lower(display_name) = lower(?1) END) LIMIT 1;",
                         -1, &w, NULL) == SQLITE_OK) {
@@ -5739,6 +5758,10 @@ static oc_dbres *process_join_channel(sqlite3 *db, const oc_job *j) {
     if (!is_public && !is_member(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
+    /* A visitor reaches only its own conversation (SCHEMA.md §3bj). */
+    if (user_is_visitor(db, j->user_id)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
     add_membership(db, j->channel_id, j->user_id);
     r->type = OC_RES_CHANNEL_INFO;
     load_channel_info(db, j->channel_id, j->user_id, r);
@@ -5784,8 +5807,10 @@ static oc_dbres *process_invite_channel(sqlite3 *db, const oc_job *j) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
     }
     uint8_t trole = OC_ROLE_MEMBER;
-    if (!user_role(db, j->target_user_id, &trole) || user_disabled(db, j->target_user_id)) {
-        /* unknown or removed target: no disclosure */
+    if (!user_role(db, j->target_user_id, &trole) || user_disabled(db, j->target_user_id) ||
+        user_is_visitor(db, j->target_user_id) || user_is_visitor(db, j->user_id)) {
+        /* unknown or removed target, or a visitor on either side (SCHEMA.md
+         * §3bj): no disclosure */
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
     int was_in = is_member(db, j->channel_id, j->target_user_id);
@@ -5862,6 +5887,11 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
     if (!self_dm && !user_role(db, other, &trole)) {   /* unknown target: no disclosure */
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
+    /* A visitor is nobody's DM, and opens none (SCHEMA.md §3bj): answered as an
+     * unknown target is, so nothing says a visitor is there. */
+    if (user_is_visitor(db, self) || user_is_visitor(db, other)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
 
     /* A DM's IDENTITY is its participant set, stored as `dm_key` under a unique
      * index (migration 0019) — not its membership rows, which anything that
@@ -5935,7 +5965,8 @@ static oc_dbres *process_open_e2e_dm(sqlite3 *db, const oc_job *j) {
     r->ch_peer = j->target_user_id;
     uint64_t self = j->user_id, other = j->target_user_id;
     uint8_t trole = OC_ROLE_MEMBER;
-    if (!other || other == self || !user_role(db, other, &trole) || user_disabled(db, other)) return r;
+    if (!other || other == self || !user_role(db, other, &trole) || user_disabled(db, other) ||
+        user_is_visitor(db, self) || user_is_visitor(db, other)) return r;
     char key[96];
     snprintf(key, sizeof key, "e:%llu,%llu:%llu.%llu",
              (unsigned long long)(self < other ? self : other), (unsigned long long)(self < other ? other : self),
@@ -6216,6 +6247,10 @@ static oc_dbres *process_open_group_dm(sqlite3 *db, const oc_job *j) {
      * because the key must not depend on the order the client listed them in. */
     uint64_t ids[OC_MAX_GROUP_DM + 1];
     int n = 0;
+    /* A visitor opens no DM (SCHEMA.md §3bj). */
+    if (user_is_visitor(db, j->user_id)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
     ids[n++] = j->user_id;
     for (uint16_t i = 0; i < j->n_group_uids && n <= (int)OC_MAX_GROUP_DM; i++) {
         uint64_t u = j->group_uids[i];
@@ -6224,9 +6259,9 @@ static oc_dbres *process_open_group_dm(sqlite3 *db, const oc_job *j) {
         for (int k = 0; k < n; k++) if (ids[k] == u) dup = 1;
         if (dup) continue;
         uint8_t role = OC_ROLE_MEMBER;
-        /* An unknown or disabled user is refused without saying which — the same
-         * no-disclosure rule OPEN_DM follows. */
-        if (!user_role(db, u, &role) || user_disabled(db, u)) {
+        /* An unknown or disabled user, or a visitor, is refused without saying
+         * which — the same no-disclosure rule OPEN_DM follows. */
+        if (!user_role(db, u, &role) || user_disabled(db, u) || user_is_visitor(db, u)) {
             r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
         }
         ids[n++] = u;
@@ -8242,8 +8277,15 @@ static oc_dbres *process_typing(sqlite3 *db, const oc_job *j) {
     r->type = OC_RES_TYPING;
     r->channel_id = j->channel_id;
     r->author_id = j->user_id;   /* the user who is typing */
-    if (channel_read_access(db, j->channel_id, j->user_id))
+    if (channel_read_access(db, j->channel_id, j->user_id)) {
         load_members(db, j->channel_id, r);
+        /* A visitor is told nobody is typing (SCHEMA.md §3bj): the relay lists
+         * no visitor, so the team's typing stays the team's. */
+        size_t k = 0;
+        for (size_t i = 0; i < r->n_members; i++)
+            if (!user_is_visitor(db, r->members[i])) r->members[k++] = r->members[i];
+        r->n_members = k;
+    }
     return r;
 }
 
