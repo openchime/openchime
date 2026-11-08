@@ -16,11 +16,13 @@
 # Run by: scripts/test/fast/source.sh (make test; make test-all).
 . "$(dirname "$0")/../lib/common.sh"
 
-pattern='\bstand-?alone\b|federated (deployment|model|box|workspace|server)s?\b|self-hosted federated|hosted (tier|suffix)\b'
+pattern='\bstand-?alone\b|federated (deployment|model|box|workspace|server)s?\b|self-hosted federated|(?<!self-)\bhosted (tier|suffix|workspace|tenant|box|plan)s?\b'
 excluded=(':!third_party' ':!ttskit/data' ':!tests/data' ':!scripts/test/fast/words.sh')
 
 planted='A stand-alone box still reads its own settings.'
 grep -qiP "$pattern" <<<"$planted" || fail "the pattern no longer matches a planted 'stand-alone'"
+grep -qiP "$pattern" <<<'A hosted workspace moved.' || fail "the pattern no longer matches a planted 'hosted workspace'"
+! grep -qiP "$pattern" <<<'A self-hosted workspace stays.' || fail "the pattern matches 'self-hosted workspace'"
 
 found=$(git grep -n -I -i -P "$pattern" -- . "${excluded[@]}" || true)
 if [ -n "$found" ]; then

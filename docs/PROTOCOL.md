@@ -474,7 +474,7 @@ a bare host address. Clients that don't recognize the frame ignore it.
 ### 4.3b `WORKSPACE_ADDRESS` (server → client), msg_type `0x001C`
 
 Pushed right after `WORKSPACE_INFO`, and only where the deployment names the
-workspace's canonical address (`OPENCHIME_MANAGED_ADDRESS`). A hosted workspace
+workspace's canonical address (`OPENCHIME_MANAGED_ADDRESS`). A managed workspace
 that moved to a new address still answers at its former one for a while; a client
 that connected by it files the workspace under the new one (CLIENT.md
 §5) and dials that next time. A new frame, so no version bump.

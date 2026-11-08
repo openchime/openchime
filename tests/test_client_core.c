@@ -651,7 +651,7 @@ static void test_invitation_text(void) {
     oc_ev e;
     memset(&e, 0, sizeof e);
     e.type = OC_EV_SIGNIN_SOURCES;
-    e.count = 1u << OC_SOURCE_RELAY;                  /* hosted: the relay alone */
+    e.count = 1u << OC_SOURCE_RELAY;                  /* managed: the relay alone */
     oc_model_apply(&m, &e);
     CHECK(oc_model_offers_browser(&m) && !oc_model_offers_local(&m));
     e.count = (1u << OC_SOURCE_LOCAL) | (1u << OC_SOURCE_RELAY);

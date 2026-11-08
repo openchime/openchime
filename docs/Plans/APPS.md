@@ -121,7 +121,7 @@ silently narrowed.
   "version": "1.4.0",
   "developer": {"name": "Example Tools", "url": "https://tools.example"},
   "type": "external",
-  "scopes": ["chat:write", "commands", "channels:history", "users:read"],
+  "scopes": ["chat:write", "commands", "channels:history", "channels:read", "app_mentions:read", "users:read"],
   "commands": [
     {"name": "standup", "description": "Post your update", "usage_hint": "[text]", "scope": "channel"}
   ],
@@ -260,18 +260,18 @@ refused with the reason.
 
 Decided:
 
-- **Signing.** Each request carries `X-OpenChime-Request-Timestamp` (Unix
-  seconds) and `X-OpenChime-Signature`, which is `v0=` followed by the hex
+- **Signing.** Each request carries `X-Slack-Request-Timestamp` (Unix
+  seconds) and `X-Slack-Signature`, which is `v0=` followed by the hex
   HMAC-SHA-256, keyed with the install's signing secret (or the webhook's), of
   `v0:{timestamp}:{raw body}`. A receiver compares in constant time and rejects
-  a timestamp more than five minutes away from its own clock. Bolt's request
-  verification accepts this scheme ([BOLT.md](./BOLT.md) §1.3); the header
-  names a Bolt app reads are configured once in its receiver.
+  a timestamp more than five minutes away from its own clock. These are the
+  header names and the scheme Bolt's request verification reads
+  ([BOLT.md](./BOLT.md) §1.3), so a Bolt app verifies a request unchanged.
 - **At least once.** A delivery is done when the endpoint answers 2xx within
   three seconds. Anything else is retried with backoff (doubling from 1 s, up
   to eight attempts over about a day), each retry carrying
-  `X-OpenChime-Retry-Num` and `X-OpenChime-Retry-Reason`
-  (`http_timeout`, `http_error`, `connection_failed`).
+  `X-Slack-Retry-Num` and `X-Slack-Retry-Reason`
+  (`http_timeout`, `http_error`, `connection_failed`), the names Bolt reads.
 - **Off the net loop.** Delivery runs on its own worker, beside the outbound
   HTTPS client's other callers, with the queue in the database, so a restart
   loses nothing.
@@ -343,7 +343,8 @@ Decided:
   UI is written against.
 - **Every block has a defined text form**, so the TUI loses no app function: a
   button is a numbered choice, a select a list to pick from, an input a
-  prompt. The forms are written down in TUIKIT.md.
+  prompt. The forms are to be written down in TUIKIT.md with the first
+  release that draws blocks.
 - **An unsupported block falls back to its text**: its `text` field, or a line
   saying what it is.
 - One parser and validator in `shared/` reads blocks for the daemon and every

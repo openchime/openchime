@@ -120,8 +120,8 @@ Paths in the JavaScript packages are under `dist/` of the published package.
 ### 1.5 Socket Mode
 
 - **Opening a connection:** the app calls `apps.connections.open` with its app-level token, then opens the returned `url` as a WebSocket. It uses `undici`'s client, so `ws://` and `wss://` both work (`socket-mode` `SocketModeClient.js`, `SlackWebSocket.js`).
-- **The handshake:** the server sends `type: "hello"`, and the client counts itself connected only then. `type: "disconnect"` makes it reconnect, which it does on its own by default. The client sends pings and expects the server's within 30 s (`serverPingTimeout`).
-- **Envelopes and acknowledgement:** each message is an envelope with `envelope_id`, `type` (`events_api`, `slash_commands` or `interactive`), `payload` (the same body HTTP delivery would carry), `accepts_response_payload`, `retry_attempt` and `retry_reason`. The client acknowledges by sending back `{"envelope_id": ..., "payload": {...}}`.
+- **The handshake:** the server sends `type: "hello"`, and the client counts itself connected only then. `type: "disconnect"` makes it reconnect, which it does on its own by default. The client sends pings and expects the server's within 30 s (`serverPingTimeout`) (`socket-mode` `SocketModeClient.js` for `hello` and `disconnect`, `SlackWebSocket.js` for the pings).
+- **Envelopes and acknowledgement:** each message is an envelope with `envelope_id`, `type` (`events_api`, `slash_commands` or `interactive`), `payload` (the same body HTTP delivery would carry), `accepts_response_payload`, `retry_attempt` and `retry_reason`. The client acknowledges by sending back `{"envelope_id": ..., "payload": {...}}` (`socket-mode` `SocketModeClient.js`).
 
 ### 1.6 The OAuth install flow
 
@@ -131,7 +131,8 @@ Paths in the JavaScript packages are under `dist/` of the published package.
   constructor; `bolt` `HTTPReceiver.js`).
 - **State** is a signed value set as a cookie (`slack-app-oauth-state`, ten
   minutes) and checked on return. The installer is in `@slack/oauth`, and the
-  state store is its own.
+  state store is its own (`oauth` `install-provider.js` for the cookie's name
+  and life, `state-stores/clear-state-store.js` for the store).
 - **The code is exchanged with `oauth.v2.access`** through the Web API client, so it goes to the same configurable base URL (`installerOptions.clientOptions`). Bolt stores the following from the answer:
   - `access_token`, `token_type`, `scope`;
   - `bot_user_id`, `app_id`;
@@ -139,7 +140,7 @@ Paths in the JavaScript packages are under `dist/` of the published package.
   - `authed_user`;
   - optionally `refresh_token` and `expires_in`, for token rotation.
 - **After the exchange** the installer calls `auth.test` to fill in the bot's
-  ids.
+  ids (`oauth` `install-provider.js`, `handleCallback`).
 
 ## 2. A sample app, traced
 

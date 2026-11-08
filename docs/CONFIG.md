@@ -379,9 +379,11 @@ own, off by default:
 | `OPENCHIME_INVITE_MAIL=on` | Invitation mail (REQ-280, ARCH-85). |
 | `OPENCHIME_TLS=central` | The certificate for a name under the service suffix, through central (ARCH-14, TLS.md). |
 
-Every service needs `OPENCHIME_ENROLL_URL`: the relay, push and the central
-certificate refuse the start without it, and invitation mail without it says so
-in the log and leaves invitations to be shared by copying them. A box connected with every
+Every service needs `OPENCHIME_ENROLL_URL`: the relay, `OPENCHIME_PUSH=on` and
+the central certificate refuse the start without it; invitation mail without it
+says so in the log and leaves invitations to be shared by copying them; and
+push, with only `OPENCHIME_PUSH_URL`, starts only once the box has an active
+enrollment. A box connected with every
 service off is valid and gets nothing from the connection. A managed box is
 started with the services it needs (below).
 
