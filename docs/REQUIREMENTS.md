@@ -1467,13 +1467,22 @@ where one exists.
   and respond in channels under a **bot identity** distinct from human users,
   including **slash-command apps** invoked as `/command` from the composer and
   dispatched to a registered integration endpoint. Install has been role-gated to
-  owner/admin.
+  owner/admin. The design is [Plans/APPS.md](./Plans/APPS.md): an app is a
+  signed manifest (REQ-376, REQ-377) acting as a bot, a principal of its own
+  kind beside agents, either external (code on the developer's server) or
+  in-workspace (code the daemon runs, REQ-381), with scopes approved at install
+  (REQ-378), namespaced commands (REQ-379) and Block Kit UI (REQ-380)
+  (ARCH-130 to ARCH-133).
 - **REQ-173.** The system has supported **outgoing webhooks / event
   subscriptions**: a tenant-registered endpoint has received notifications of
   selected events (new message in a channel, mention, membership change) so
   external systems could react to activity — the outbound complement to the
   incoming webhooks of REQ-170. Delivery has been at-least-once with retry and a
-  signed payload so the receiver could verify origin.
+  signed payload so the receiver could verify origin. The **event catalog and
+  the signing scheme have been shared** by installed apps and plain outgoing
+  webhooks: one set of event names and payloads, following the common
+  chat-platform convention, and one `v0=` HMAC-SHA-256 signature over the
+  timestamp and body ([Plans/APPS.md](./Plans/APPS.md) §5, ARCH-131).
 - **REQ-174.** The system has offered **workflow automation** — declarative
   triggers (a message match, a schedule, a form submission) driving actions (post
   a message, call a webhook) — so common routines could run without an external
@@ -1484,7 +1493,11 @@ where one exists.
   **OpenChime services** (ARCH-76, cf. ARCH-56), not the daemon's — so the directory has been
   available to managed deployments and connected self-hosted ones, while a self-hosted
   box that is not connected has installed integrations by direct configuration
-  instead of browsing a curated catalog.
+  instead of browsing a curated catalog. Every deployment has had a **local
+  catalog** of the apps registered with its daemon; enrolled deployments have
+  also seen the **curated catalog** central serves, each entry's signature
+  verified by the daemon before it is offered, in the same package format as
+  the local one ([Plans/APPS.md](./Plans/APPS.md) §12).
 - **REQ-176.** The system has offered a **third-party API / SDK** — a documented
   programmatic surface for external tools to read and post on a user's or bot's
   (REQ-172) behalf — as the general-purpose complement to the single-purpose
@@ -1497,6 +1510,36 @@ where one exists.
   searching and posting, kept beside the MCP surface for agents rather than in
   place of it (ARCH-123, REQ-350–354); the proposal is
   [Plans/HTTP-API.md](./Plans/HTTP-API.md).
+- **REQ-376.** An app has been defined by **one manifest**, in OpenChime's own
+  schema, kept in the developer's repository: its identity, scopes, commands,
+  event subscriptions, endpoints or code, outbound hosts, secrets, schedules and
+  providers. No console, catalog or daemon has kept a separate copy of an app's
+  definition, and one validator has checked a manifest for both the daemon and
+  the developer's tools, with the same plain-language messages
+  ([Plans/APPS.md](./Plans/APPS.md) §3, ARCH-130).
+- **REQ-377.** **Nothing has loaded unsigned**, in any deployment model. An app
+  has been installed only when its package's signature verified against a key
+  the daemon trusts: the project's, the daemon's own identity key, or a
+  delegate key an admin added. Adding a delegate key has been audited (REQ-251)
+  and has taken effect only after a restart (ARCH-130).
+- **REQ-378.** An app has asked for named **scopes**, each with a plain-language
+  description, approved by an owner or admin at install, and every call and
+  every event has been checked against them and against the bot's channel
+  memberships. An update asking for a new scope has waited for approval again
+  ([Plans/APPS.md](./Plans/APPS.md) §4, ARCH-131).
+- **REQ-379.** Slash commands have been **namespaced by app**, `/<app>/<command>`,
+  with an unqualified alias only where exactly one app declares it, and a
+  channel-scoped command has resolved only where its app is a member
+  (ARCH-131).
+- **REQ-380.** An app's UI has been **block layouts** (Block Kit, tracked by its
+  spec version), drawn by each client with its own controls, and every block
+  has had a defined text form, so the terminal client has lost no app function
+  (ARCH-132).
+- **REQ-381.** An app has been able to run **inside the workspace**, as code the
+  daemon runs in its own process, sandboxed: no ambient authority, its own
+  memory, stack and CPU limits, quarantine for an app that keeps overrunning,
+  and a switch per workspace and per app, within the lean memory profile
+  (REQ-210) (ARCH-133).
 - **REQ-350.** The HTTP API has been a **stable, versioned contract**: served
   under a path that names its major version, documented as the reference an
   integration is written against, and changed within a version only by
