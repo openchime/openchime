@@ -3,7 +3,7 @@
 #
 # This is the channel for everyone apt and dnf do not reach: Arch, Alpine (glibc
 # variants), NixOS, SUSE, and -- the case that actually motivated it -- an
-# air-gapped operator. ARCH-20 tells a stand-alone operator wanting zero
+# air-gapped operator. ARCH-20 tells an operator wanting zero
 # dependency on the project to "build from source", but the source build runs
 # scripts/build/mbedtls.sh, which downloads mbedTLS from GitHub. So the
 # advertised offline path was not offline. This tarball is.

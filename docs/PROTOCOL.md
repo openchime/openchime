@@ -464,7 +464,7 @@ a bare host address. Clients that don't recognize the frame ignore it.
 
 | Field             | Type | Notes                                                       |
 |-------------------|------|-------------------------------------------------------------|
-| `deployment_mode` | u8   | `0` standalone, `1` federated, `2` managed (ARCH-76).       |
+| `deployment_mode` | u8   | `0` self-hosted, `1` managed (ARCH-76).                     |
 | `max_users`       | u32  | Registered-user cap; `0` = unlimited.                       |
 | `workspace_name`  | str  | Admin-set display name; **empty** ⇒ the client falls back to the connection host's subdomain (e.g. `acme.openchime.io` → "acme"). |
 | `call_max`        | u8   | The most people in one call, ten (`OC_CALL_MAX`, REQ-305) — so a client starting one in a large channel knows when the starter must pick (§5.17). |

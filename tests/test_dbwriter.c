@@ -7837,9 +7837,8 @@ static void test_welcome_general(void) {
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
     if (!w) return;
-    /* Self-hosted, either kind: nothing is made, nothing is written. */
-    CHECK(oc_dbwriter_welcome_general(w, OC_DEPLOY_STANDALONE, "Acme") == 0);
-    CHECK(oc_dbwriter_welcome_general(w, OC_DEPLOY_FEDERATED, "Acme") == 0);
+    /* Self-hosted: nothing is made, nothing is written. */
+    CHECK(oc_dbwriter_welcome_general(w, OC_DEPLOY_SELF_HOSTED, "Acme") == 0);
     CHECK(general_text(path, topic, sizeof topic, descr, sizeof descr) == 0);
     /* Managed, first boot: #general exists with its welcome. */
     CHECK(oc_dbwriter_welcome_general(w, OC_DEPLOY_MANAGED, "Acme") == 1);

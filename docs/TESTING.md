@@ -459,7 +459,7 @@ framework.
   resolves to its canonical host and port with **the SRV, DNS and `.well-known`
   counters (`oc_resolve_counts`) unmoved**, malformed forms are refused, keys fold
   spellings, and `oc_hostport`, `oc_addr_is_loopback` and
-  `oc_workspace_takes_suffix` — the hosted suffix beside a bare name or nothing
+  `oc_workspace_takes_suffix` — the managed suffix beside a bare name or nothing
   typed, never beside an address, a port, a dotted name or `localhost` — hold to
   their tables (`tools/gui/web_signin.sh` checks the Win32 field shows it for
   `acme` and not for the daemon's address); a
@@ -1223,7 +1223,7 @@ answer in frames, a ping's pong, and an unmasked frame ending the connection.
 ## 4. Continuous integration
 
 **Two suites, and every test runs through one of them** (§1). Each test is a
-standalone script under `scripts/test/fast/` or `scripts/test/full/`, shared
+self-contained script under `scripts/test/fast/` or `scripts/test/full/`, shared
 helpers in `scripts/test/lib/`; the make targets build what the scripts need
 and call them (`mk/tests.mk`, `mk/full.mk`), and the workflows call only the
 targets. Nothing runs a test on a pull request: `pr-policy.yml` checks

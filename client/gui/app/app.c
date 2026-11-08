@@ -2516,7 +2516,7 @@ static char  g_si_fp[96];         /* ... and the fingerprint it published, if an
 static int   g_si_port;
 static char  g_si_err[192];       /* inline error under the active field */
 static int   g_si_remember = 1;   /* gates whether the session token is persisted */
-/* Step 1 has two modes. The default is the hosted case — type just `acme` and
+/* Step 1 has two modes. The default is the managed case — type just `acme` and
  * the field shows a fixed `.openchime.io` suffix, exactly as Slack shows
  * `.slack.com` — because the short name is the common case. "Advanced
  * options" reveals the self-hosted case: a full domain, host:port, or an IP.
@@ -2527,7 +2527,7 @@ static rectf g_si_adv_link;
 static int   g_si_connecting;     /* awaiting auth: fields hidden, spinner text */
 static uint64_t g_si_started;    /* GetTickCount64 when the attempt began */
 static field *g_si_e_ws, *g_si_e_user, *g_si_e_pass;   /* the card's fields */
-static int   g_si_suffix_shown; /* the hosted suffix, drawn beside the field last frame */
+static int   g_si_suffix_shown; /* the managed suffix, drawn beside the field last frame */
 static rectf g_si_btn, g_si_remember_box, g_si_back;   /* hit-boxes */
 /* How the workspace signs people in (AUTH.md §8.1), asked of it at step 1: a
  * password form, a browser button, or both. */
@@ -2564,7 +2564,7 @@ static void signin_set_advanced(oc_win *hwnd, int on);
 static void signin_begin(oc_win *hwnd, const char *ws, const char *user);
 static void signin_poll(oc_win *hwnd);
 static void layout_signin(oc_win *hwnd);
-static int  si_suffix_applies(void);   /* fwd: the hosted suffix beside the field */
+static int  si_suffix_applies(void);   /* fwd: the managed suffix beside the field */
 typedef struct { float x0, y0, w, h, fx, fw, fields_y; } si_geom;
 static si_geom si_layout(float W, float H);
 
@@ -4443,7 +4443,7 @@ static void ws_display_name(const oc_model *m, char *out, size_t cap) {
 }
 
 static void ws_mode_line(const oc_model *m, char *out, size_t cap) {
-    const char *dn = m ? oc_model_deployment_name(m) : "standalone";
+    const char *dn = m ? oc_model_deployment_name(m) : "self-hosted";
     char cap_dn[24]; snprintf(cap_dn, sizeof cap_dn, "%s", dn);
     if (cap_dn[0] >= 'a' && cap_dn[0] <= 'z') cap_dn[0] -= 32;
     uint32_t mu = m ? oc_model_max_users(m) : 0;
@@ -13184,7 +13184,7 @@ static void draw_signin(gfx *rt, float W, float H) {
             float sw = (g_si_step == 1 && si_suffix_applies()) ? 8 + 7.0f * (float)(strlen(oc_default_suffix()) + 1) : 0;
             if (g_si_e_ws) field_draw(rt, g_si_e_ws, rf(box.left + 12, box.top, box.right - 12 - sw, box.bottom), OC_COL_TEXT);
         }
-        /* Hosted mode: the service suffix is chrome, not something to type --
+        /* Managed mode: the service suffix is chrome, not something to type --
          * and only beside what it would be added to. An address, a port or a
          * dotted name is reached as typed, and the suffix after it read as part
          * of the name. */
@@ -28349,7 +28349,7 @@ static int srch_key(field *f, int key, int ctrl, int shift) {
 
 /* Show or hide the sign-in fields drawn over the chrome draw_signin() paints
  * (layout_signin, below). */
-/* The hosted suffix beside the workspace field: not in advanced mode, and only
+/* The managed suffix beside the workspace field: not in advanced mode, and only
  * beside what it would be added to (oc_workspace_takes_suffix). */
 static void si_get(field *e, char *out, size_t cap);   /* fwd */
 static int si_suffix_applies(void) {
@@ -32086,7 +32086,7 @@ static void signin_back(oc_win *hwnd) {
     invalidate();
 }
 
-/* Switch step 1 between the hosted short-name field and the full-address field.
+/* Switch step 1 between the managed short-name field and the full-address field.
  * The cue banner and the field width change with it; what was typed is kept, so
  * flipping modes to correct a mistake never costs the user their input. */
 static void signin_set_advanced(oc_win *hwnd, int on) {

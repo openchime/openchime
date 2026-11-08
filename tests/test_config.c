@@ -222,8 +222,23 @@ static void test_cross_rules(void) {
     /* Transport: signed requests go over https, or http to loopback. */
     refuses("OPENCHIME_ENROLL_URL", "http://openchime.io");
     accepts("OPENCHIME_ENROLL_URL", "http://127.0.0.1:9000");
-    CHECK(oc_config_get()->deployment_mode == OC_DEPLOY_FEDERATED);    /* derived */
+    CHECK(oc_config_get()->deployment_mode == OC_DEPLOY_SELF_HOSTED);  /* connected, still self-hosted */
+    CHECK(!strcmp(oc_deploy_mode_name(OC_DEPLOY_SELF_HOSTED), "self-hosted"));
+    CHECK(!strcmp(oc_deploy_mode_name(OC_DEPLOY_MANAGED), "managed"));
     refuses("OPENCHIME_PUSH_URL", "ftp://x");
+    /* Push: on at the connection's origin, or where OPENCHIME_PUSH_URL says. */
+    unsetenv("OPENCHIME_ENROLL_URL");
+    refuses_as("OPENCHIME_PUSH", "on", OC_CFGF_NEEDS, "OPENCHIME_ENROLL_URL");
+    setenv("OPENCHIME_ENROLL_URL", "http://127.0.0.1:9000", 1);
+    accepts("OPENCHIME_PUSH", "on");
+    setenv("OPENCHIME_PUSH", "on", 1);
+    CHECK(oc_config_load(err, sizeof err) == 0 && !strcmp(oc_config_get()->push.url, "http://127.0.0.1:9000"));
+    setenv("OPENCHIME_PUSH_URL", "http://127.0.0.1:9100", 1);
+    CHECK(oc_config_load(err, sizeof err) == 0 && !strcmp(oc_config_get()->push.url, "http://127.0.0.1:9100"));
+    unsetenv("OPENCHIME_PUSH");
+    CHECK(oc_config_load(err, sizeof err) == 0 && !strcmp(oc_config_get()->push.url, "http://127.0.0.1:9100"));
+    unsetenv("OPENCHIME_PUSH_URL");
+    unsetenv("OPENCHIME_ENROLL_URL");
     /* A missing file is refused at load, not at first use. */
     refuses("OPENCHIME_EXTRA_CA", "/no/such/file.pem");
     /* Direct connections: 1..4, each complete. */
@@ -244,7 +259,7 @@ static void test_cross_rules(void) {
     CHECK(oc_config_get()->audio_token_prefix_len == 2 && oc_config_get()->audio_token_prefix[1] == 0x0b);
     accepts("OPENCHIME_MANAGED_MAX_USERS", "5");
     CHECK(oc_config_get()->max_users == 5);
-    CHECK(oc_config_get()->deployment_mode == OC_DEPLOY_STANDALONE);    /* a row is not a ticket */
+    CHECK(oc_config_get()->deployment_mode == OC_DEPLOY_SELF_HOSTED);  /* a row is not a ticket */
     /* The ticket comes with the rest of a managed start. */
     refuses_as("OPENCHIME_MANAGED_TICKET", "t", OC_CFGF_NEEDS, "OPENCHIME_ENROLL_URL");
     setenv("OPENCHIME_ENROLL_URL", "http://127.0.0.1:9000", 1);
@@ -481,7 +496,7 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 34);     /* OPENCHIME_MODE among them */
+    CHECK(operator_rows == 35);     /* OPENCHIME_MODE among them */
     CHECK(managed_rows == 7);
     CHECK(dev_rows == 6 + 12);      /* the daemon's six, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);

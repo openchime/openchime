@@ -416,7 +416,7 @@ typedef struct {
     bool     authed;
     uint64_t user_id;                 /* our own id, from AUTH_OK */
     /* Workspace facts from WORKSPACE_INFO (infra config the daemon serves). */
-    uint8_t  deployment_mode;         /* 0 standalone · 1 federated · 2 managed */
+    uint8_t  deployment_mode;         /* 0 self-hosted · 1 managed */
     uint8_t  workspace_mode;          /* OC_WS_MODE_*: a public demo says so (AUTH.md §8.12) */
     uint32_t max_users;               /* 0 = unlimited */
     char     workspace_name[64];      /* "" ⇒ frontend derives from the host subdomain */
@@ -1339,8 +1339,8 @@ size_t oc_model_invitation_text(const oc_model *m, const char *address, const ch
  * written (truncated to fit `cap`), 0 when there is no reset to describe. */
 size_t oc_model_reset_text(const oc_model *m, const char *address, const char *link, char *out, size_t cap);
 
-/* Workspace facts (WORKSPACE_INFO). deployment mode name: "standalone" /
- * "federated" / "managed". workspace_name is "" until a name is configured. */
+/* Workspace facts (WORKSPACE_INFO). deployment mode name: "self-hosted" or
+ * "managed". workspace_name is "" until a name is configured. */
 uint8_t     oc_model_deployment_mode(const oc_model *m);
 const char *oc_model_deployment_name(const oc_model *m);
 const char *oc_model_workspace_name(const oc_model *m);

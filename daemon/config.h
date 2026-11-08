@@ -39,11 +39,11 @@
 #include "storage.h"    /* oc_storage_policy */
 
 /* Deployment model (ARCH-76), derived: managed when started with
- * OPENCHIME_MANAGED_TICKET, federated when enrolled, else standalone. */
+ * OPENCHIME_MANAGED_TICKET, else self-hosted -- whether or not the box is
+ * connected to the OpenChime services, which is each service's own setting. */
 typedef enum {
-    OC_DEPLOY_STANDALONE = 0,
-    OC_DEPLOY_FEDERATED  = 1,
-    OC_DEPLOY_MANAGED    = 2,
+    OC_DEPLOY_SELF_HOSTED = 0,
+    OC_DEPLOY_MANAGED     = 1,
 } oc_deploy_mode;
 
 /* --- The constants that were once settings -----------------------------------
@@ -160,9 +160,9 @@ typedef struct {
     oc_oidc_connect connect[OC_OIDC_MAX_CONNECT];   /* direct connections, in order */
     int             n_connect;
 
-    /* Federated services (ARCH-84/85). */
+    /* The OpenChime services (ARCH-84/85): the connection, then each service. */
     struct { const char *url, *ticket; } enroll;
-    struct { const char *url; } push;
+    struct { const char *url; int on; } push;   /* OPENCHIME_PUSH, OPENCHIME_PUSH_URL */
     int invite_mail;                    /* REQ-280; needs an active enrollment */
 
     /* The certificate's source (OPENCHIME_TLS), and for ACME its names, CA and contact. */
@@ -223,10 +223,10 @@ const oc_cfg_fault *oc_config_fault(void);
 int oc_config_load(char *err, size_t errcap);
 
 /* The loaded config. Valid after a successful oc_config_load(); before that, all
- * fields are zero (deployment_mode = standalone, pointers NULL). */
+ * fields are zero (deployment_mode = self-hosted, pointers NULL). */
 const oc_config *oc_config_get(void);
 
-/* "standalone" | "federated" | "managed" -- for logs and the wire. */
+/* "self-hosted" | "managed" -- for logs. */
 const char *oc_deploy_mode_name(oc_deploy_mode m);
 
 /* "normal" | "development" | "demo" -- for logs and --check-config. */

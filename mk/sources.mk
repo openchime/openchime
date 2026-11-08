@@ -71,7 +71,7 @@ INC := -Ishared -Idaemon -I$(ARGON2_DIR) -Ithird_party/utf8proc -Ithird_party/js
 # Every source except the daemon entry point; the test binary links these and
 # calls their public APIs (no per-test binaries, no unity #include of .c).
 APP_SRC  := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES) $(PWLIST_RES)
-# e2e_client is a standalone black-box tool (its own main), not part of the
+# e2e_client is a black-box tool of its own (its own main), not part of the
 # single in-process test binary.
 # The fuzzing tier's harnesses and decoder list (tests/fuzz/fuzz.h): in the test
 # binary, which replays their corpora, and in each libFuzzer binary

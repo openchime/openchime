@@ -414,7 +414,7 @@ typedef struct oc_job {
     char          *key_pem;    /* heap */
     struct oc_tls_state *tls_state;   /* heap: STORE_ACME_ACCOUNT, STORE_TLS_CERT */
 
-    /* STORE_ENROLLMENT (ARCH-84): the federated keypair + audience + state. */
+    /* STORE_ENROLLMENT (ARCH-84): the enrollment keypair + audience + state. */
     char          *enroll_privkey;   /* heap */
     char          *enroll_audience;  /* heap */
     int            enroll_active;
@@ -1614,7 +1614,7 @@ void oc_dbwriter_store_acme_account(oc_dbwriter *w, const char *directory, const
 void oc_dbwriter_store_tls_cert(oc_dbwriter *w, const char *source, const char *names, const char *chain_pem,
                                 const char *key_pem, uint64_t issued_ms, uint64_t not_after_ms);
 
-/* Federated enrollment persistence (ARCH-84), setup-time only. Load returns 1 and
+/* Enrollment persistence (ARCH-84), setup-time only. Load returns 1 and
  * heap-allocates privkey_pem + audience (caller frees) + *active when a row
  * exists, else 0. Store persists the keypair + audience + state; returns 1 on
  * success. */
@@ -1628,7 +1628,7 @@ void oc_dbwriter_note_enrollment_active(oc_dbwriter *w, const char *privkey_pem,
 /* A managed workspace's welcome: no message, no system user. With
  * `deployment_mode` OC_DEPLOY_MANAGED (config.h), the first time #general is made
  * it is made with a welcome topic and description naming `workspace_name` (""
- * names none); any other mode does nothing at all. A #general that already
+ * names none); a self-hosted box does nothing at all. A #general that already
  * exists is left as it is, so this runs on every boot. Returns 1 when it wrote
  * the welcome, 0 otherwise. Setup-time only. */
 int oc_dbwriter_welcome_general(oc_dbwriter *w, int deployment_mode, const char *workspace_name);

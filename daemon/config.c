@@ -44,9 +44,8 @@ const char *oc_mode_name(oc_mode m) {
 
 const char *oc_deploy_mode_name(oc_deploy_mode m) {
     switch (m) {
-        case OC_DEPLOY_FEDERATED: return "federated";
         case OC_DEPLOY_MANAGED:   return "managed";
-        default:                  return "standalone";
+        default:                  return "self-hosted";
     }
 }
 
@@ -539,7 +538,7 @@ static int scan_unknown(char *err, size_t errcap) {
 static int validate(oc_config *c, char *err, size_t errcap) {
     /* The deployment model (ARCH-76): what the box was started with says it. */
     int ticket = c->enroll.ticket && *c->enroll.ticket;
-    c->deployment_mode = ticket ? OC_DEPLOY_MANAGED : c->enroll.url ? OC_DEPLOY_FEDERATED : OC_DEPLOY_STANDALONE;
+    c->deployment_mode = ticket ? OC_DEPLOY_MANAGED : OC_DEPLOY_SELF_HOSTED;
     if (ticket && !c->enroll.url) {
         snprintf(err, errcap, "OPENCHIME_MANAGED_TICKET: a managed box is started with OPENCHIME_ENROLL_URL as well");
         return fault(OC_CFGF_NEEDS, "OPENCHIME_MANAGED_TICKET", "OPENCHIME_ENROLL_URL");
@@ -604,6 +603,12 @@ static int validate(oc_config *c, char *err, size_t errcap) {
         snprintf(err, errcap, "OPENCHIME_ENROLL_URL=%s: must be https (plain http is for loopback only)", c->enroll.url);
         return fault(OC_CFGF_BAD_VALUE, "OPENCHIME_ENROLL_URL", NULL);
     }
+    /* Push at the connection's origin, unless OPENCHIME_PUSH_URL says where. */
+    if (c->push.on && !c->enroll.url) {
+        snprintf(err, errcap, "OPENCHIME_PUSH=on: push goes through the OpenChime services; needs OPENCHIME_ENROLL_URL");
+        return fault(OC_CFGF_NEEDS, "OPENCHIME_PUSH", "OPENCHIME_ENROLL_URL");
+    }
+    if (c->push.on && !c->push.url) c->push.url = c->enroll.url;
     if (c->push.url && !oc_url_transport_ok(c->push.url)) {
         snprintf(err, errcap, "OPENCHIME_PUSH_URL=%s: must be https (plain http is for loopback only)", c->push.url);
         return fault(OC_CFGF_BAD_VALUE, "OPENCHIME_PUSH_URL", NULL);

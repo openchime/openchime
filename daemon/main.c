@@ -121,7 +121,7 @@ static void bootstrap_users(oc_dbwriter *db, const char *spec) {
     free(dup);
 }
 
-/* --- the federated services, once the binding is active (ARCH-85) --------- */
+/* --- the OpenChime services, once the binding is active (ARCH-85) --------- */
 
 /* What runs on the enrollment: the push emitter and the invitation mail report.
  * Both start once the binding is active -- before the loop when it already was,
@@ -143,22 +143,22 @@ typedef struct {
     oc_certs       *certs;
     oc_tls_state    kept;
     int             active;
-} fed_services;
+} services;
 
 static void keep_account(void *ctx, const char *key_pem, const char *url) {
-    fed_services *f = ctx;
+    services *f = ctx;
     oc_dbwriter_store_acme_account(f->db, f->cfg->tls_src.directory, key_pem, url);
 }
 
 static void keep_cert(void *ctx, const oc_cert_issued *c) {
-    fed_services *f = ctx;
+    services *f = ctx;
     oc_dbwriter_store_tls_cert(f->db, f->cfg->tls_src.source == OC_TLS_SRC_ACME ? "acme" : "central",
                                c->names, c->chain_pem, c->key_pem, c->not_before_ms, c->not_after_ms);
 }
 
 /* What the certificate worker cannot fix alone, for owners and admins (REQ-263). */
 static void raise_alert(void *ctx, const char *key, const char *message) {
-    fed_services *f = ctx;
+    services *f = ctx;
     if (message) oc_dbwriter_alert(f->db, key, message);
     else         oc_dbwriter_alert_clear(f->db, key);
 }
@@ -166,7 +166,7 @@ static void raise_alert(void *ctx, const char *key, const char *message) {
 /* Start keeping the certificate CA-issued, for the source configured. ACME is
  * answered through the listener, so this waits for the daemon to be serving;
  * central needs an active binding. */
-static void start_certs(fed_services *f) {
+static void start_certs(services *f) {
     const oc_config *cfg = f->cfg;
     if (f->certs || !f->tls) return;
     oc_certs_opts o;
@@ -202,11 +202,11 @@ static void start_certs(fed_services *f) {
     if (!f->certs) fprintf(stderr, "openchimed: the certificate worker failed to start\n");
 }
 
-static void start_federated(fed_services *f) {
+static void start_services(services *f) {
     const oc_config *cfg = f->cfg;
-    /* Push (ARCH-85): only with OPENCHIME_PUSH_URL pointing at central's push
-     * gateway. It signs with the enrollment key and delivers offline mobile
-     * notifications; absent in self-hosted stand-alone. */
+    /* Push (ARCH-85): on with OPENCHIME_PUSH=on, at the connection's origin, or
+     * at OPENCHIME_PUSH_URL. It signs with the enrollment key and delivers
+     * offline mobile notifications; off unless this box turns push on. */
     if (cfg->push.url && *cfg->push.url) {
         f->push = oc_push_start(cfg->db_path, f->db, cfg->push.url, f->audience, f->privkey);
         if (f->push) {
@@ -240,7 +240,7 @@ static int nap(unsigned secs) {
  * that is true. Bounded in time -- central may still be coming up, or briefly
  * busy -- and a refused ticket is not retried, since it will be refused again. */
 static void *claim_thread(void *arg) {
-    fed_services *f = arg;
+    services *f = arg;
     const oc_config *cfg = f->cfg;
     time_t deadline = time(NULL) + OC_CLAIM_WAIT_SECS;
     unsigned pause = 2;
@@ -250,7 +250,7 @@ static void *claim_thread(void *arg) {
         if (er == OC_ENROLL_ACTIVE) {
             oc_dbwriter_note_enrollment_active(f->db, f->privkey, f->audience);
             fprintf(stderr, "openchimed: binding claimed (audience=%s)\n", f->audience);
-            start_federated(f);
+            start_services(f);
             f->active = 1;
             start_certs(f);
             break;
@@ -274,7 +274,7 @@ static void *claim_thread(void *arg) {
 /* The net loop's ready hook: the listener takes connections, so a certificate
  * can be validated through it, and a claim made. */
 static void on_serving(void *ctx) {
-    fed_services *f = ctx;
+    services *f = ctx;
     start_certs(f);
     if (!f->ticket || f->claiming) return;
     if (pthread_create(&f->claim, NULL, claim_thread, f) == 0) f->claiming = 1;
@@ -566,7 +566,8 @@ int main(int argc, char **argv) {
     /* Optionally provision local accounts before serving (AUTH.md §2). */
     bootstrap_users(db, cfg->dev.users);
 
-    /* Federated enrollment (ARCH-84, AUTH.md §3.6). Gated on OPENCHIME_ENROLL_URL — the
+    /* Enrollment, the connection to the OpenChime services (ARCH-84, AUTH.md
+     * §3.6). Gated on OPENCHIME_ENROLL_URL — the
      * operator opting this box into central. On first boot: generate a
      * keypair + opaque audience, persist them, and print an enrollment code to
      * enter on central's enrollment page. Then (if pending) call out to central to prove
@@ -729,31 +730,31 @@ int main(int argc, char **argv) {
                     cfg->connect[i].issuer, i + 1);
     }
 
-    /* The federated services on the enrollment (ARCH-85): started now when the
+    /* The OpenChime services on the enrollment (ARCH-85): started now when the
      * binding is already active, or by the claim once the daemon serves. A box
      * that is not enrolled has neither. */
-    fed_services fed;
-    memset(&fed, 0, sizeof fed);
-    fed.db = db;
-    fed.cfg = cfg;
-    fed.privkey = enroll_privkey;
-    fed.audience = enroll_audience;
-    enroll_privkey = enroll_audience = NULL;   /* fed owns them now */
-    fed.active = enroll_active;
+    services svc;
+    memset(&svc, 0, sizeof svc);
+    svc.db = db;
+    svc.cfg = cfg;
+    svc.privkey = enroll_privkey;
+    svc.audience = enroll_audience;
+    enroll_privkey = enroll_audience = NULL;   /* svc owns them now */
+    svc.active = enroll_active;
     /* A certificate through central needs a binding to ask with. */
-    if (cfg->tls_src.source == OC_TLS_SRC_CENTRAL && !(fed.privkey && fed.audience)) {
+    if (cfg->tls_src.source == OC_TLS_SRC_CENTRAL && !(svc.privkey && svc.audience)) {
         fprintf(stderr, "openchimed: OPENCHIME_TLS=central needs an enrollment "
                         "(OPENCHIME_ENROLL_URL); refusing to start without one\n");
         oc_dbwriter_stop(db); return 1;
     }
-    if (fed.privkey && fed.audience) {
-        if (enroll_active) start_federated(&fed);
-        else if (managed_claim) fed.ticket = ticket;
+    if (svc.privkey && svc.audience) {
+        if (enroll_active) start_services(&svc);
+        else if (managed_claim) svc.ticket = ticket;
     }
-    if (cfg->invite_mail && !enroll_active && !fed.ticket)
+    if (cfg->invite_mail && !enroll_active && !svc.ticket)
         fprintf(stderr, "openchimed: OPENCHIME_INVITE_MAIL is on, but this workspace has no "
                         "active enrollment; invitations are shared by copying them\n");
-    oc_netloop_set_ready(on_serving, &fed);
+    oc_netloop_set_ready(on_serving, &svc);
 
     /* Link unfurls (REQ-222, ARCH-105): always on, no switch. The worker
      * fetches previews off the hot path; its SSRF gate is what makes
@@ -813,10 +814,10 @@ int main(int argc, char **argv) {
      * once, if it is from the source now configured, for the names now
      * configured, and not run out; the worker renews it when due. Otherwise the
      * identity above is presented until the worker obtains one. */
-    fed.tls = &tls;
-    oc_dbwriter_load_tls_state(db, &fed.kept);
+    svc.tls = &tls;
+    oc_dbwriter_load_tls_state(db, &svc.kept);
     {
-        const oc_tls_state *k = &fed.kept;
+        const oc_tls_state *k = &svc.kept;
         const char *want = cfg->tls_src.source == OC_TLS_SRC_ACME ? "acme"
                          : cfg->tls_src.source == OC_TLS_SRC_CENTRAL ? "central" : NULL;
         struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
@@ -831,7 +832,7 @@ int main(int argc, char **argv) {
         if (usable && oc_tls_server_use(&tls, k->chain_pem, strlen(k->chain_pem), k->key_pem, strlen(k->key_pem)) == 0) {
             fprintf(stderr, "openchimed: TLS certificate for %s (kept)\n", k->names);
         } else {
-            fed.kept.issued_ms = fed.kept.not_after_ms = 0;    /* nothing to renew: obtain one */
+            svc.kept.issued_ms = svc.kept.not_after_ms = 0;    /* nothing to renew: obtain one */
         }
     }
 
@@ -896,15 +897,15 @@ int main(int argc, char **argv) {
      * trying sees the stop flag and ends; the emitters it may have started go
      * with the rest. */
     g_stop = 1;
-    if (fed.claiming) pthread_join(fed.claim, NULL);
-    oc_certs_stop(fed.certs);
-    oc_tls_state_free(&fed.kept);
+    if (svc.claiming) pthread_join(svc.claim, NULL);
+    oc_certs_stop(svc.certs);
+    oc_tls_state_free(&svc.kept);
     oc_netloop_set_push(NULL);
     oc_netloop_set_invite_mail(NULL);
-    oc_push_stop(fed.push);
-    oc_invite_mail_stop(fed.invite_mail);
-    free(fed.privkey);
-    free(fed.audience);
+    oc_push_stop(svc.push);
+    oc_invite_mail_stop(svc.invite_mail);
+    free(svc.privkey);
+    free(svc.audience);
     oc_unfurler_stop(unfurler);
     oc_oidcrp_stop(rp);
     oc_relaykeys_stop(relay_keys);

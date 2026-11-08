@@ -124,7 +124,7 @@ build/fuzz/%: tests/fuzz/main.c tests/fuzz/%.c $(FUZZ_LIB) $(FUZZ_ALL_SRC) $(MBE
 build/fuzz/seeds: tests/fuzz/seeds.c shared/protocol.c $(wildcard shared/*.h) | build-dir
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -O0 -g -Ishared tests/fuzz/seeds.c shared/protocol.c -o $@
-# Flexible black-box client for the local federated demo (register a device token /
+# Flexible black-box client for the local services demo (register a device token /
 # send a message against a running daemon). Same shared-only linkage as e2e_client.
 build/demo_client: tests/demo_client.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build-dir
 	$(CC) $(CFLAGS) -O0 -g -Ishared -Itests -I$(MBEDTLS_INC) \

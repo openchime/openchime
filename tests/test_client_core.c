@@ -482,6 +482,22 @@ static void test_server_build(void) {
     oc_model_free(&m);
 }
 
+/* The deployment model a WORKSPACE_INFO names: 0 self-hosted, 1 managed. */
+static void test_deployment_name(void) {
+    oc_model m; oc_model_init(&m);
+    CHECK(strcmp(oc_model_deployment_name(&m), "self-hosted") == 0);   /* nothing said yet */
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_WORKSPACE_INFO;
+    e.status = 1;
+    oc_model_apply(&m, &e);
+    CHECK(strcmp(oc_model_deployment_name(&m), "managed") == 0);
+    e.status = 0;
+    oc_model_apply(&m, &e);
+    CHECK(strcmp(oc_model_deployment_name(&m), "self-hosted") == 0);
+    oc_model_free(&m);
+}
+
 /* Invitations in the model (REQ-033): which kind a workspace can redeem, from
  * its sign-in sources, and the text an INVITE_CREATED becomes -- by address, or
  * with the token -- with the workspace, how to sign in and the expiry. */
@@ -1087,7 +1103,7 @@ static int csum_take(void *ctx, int64_t row) {
 }
 
 /* Pins folded into the model (REQ-230, ARCH-90): the inline flag on a message
- * and the standalone pins overlay, which is fed by its own frames because a
+ * and the separate pins overlay, which is fed by its own frames because a
  * pinned message is usually outside loaded history. */
 static void test_pins(void) {
     oc_model m; oc_model_init(&m);
@@ -3346,7 +3362,7 @@ static void test_sni_name(void) {
         CHECK(sent == (T[i].want != NULL));
         CHECK(T[i].want ? strcmp(out, T[i].want) == 0 : out[0] == '\0');
     }
-    /* A bare name resolves under the hosted suffix; in development mode OPENCHIME_DEV_SUFFIX wins. */
+    /* A bare name resolves under the managed suffix; in development mode OPENCHIME_DEV_SUFFIX wins. */
     char d[256];
     unsetenv("OPENCHIME_DEV_SUFFIX");
     CHECK(oc_resolve_domain("acme", oc_default_suffix(), d, sizeof d) == 0);
@@ -5971,6 +5987,7 @@ int run_client_core_tests(void) {
     test_unread_counts_what_notifies();
     test_capabilities();
     test_server_build();
+    test_deployment_name();
     test_invitation_text();
     test_reset_text();
     test_search_truncated();

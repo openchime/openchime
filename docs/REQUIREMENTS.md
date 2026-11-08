@@ -17,8 +17,8 @@ the cross-client UI-parity requirements a competitive analysis against Slack and
 Pumble surfaced; Section 16 records what the product deliberately excludes.
 
 This document is technical scope only. **Deployment topology is an
-architectural concern and is tracked here** — the three deployment models
-(self-hosted stand-alone, self-hosted federated, hosted; ARCH-76) determine
+architectural concern and is tracked here** — the two deployment models
+(self-hosted and managed, ARCH-76) and the services a self-hosted box turns on determine
 what a given deployment does and does not do, so requirements state which
 models they apply to. Pricing and go-to-market decisions remain out of scope
 and are not tracked in this repository; licensing is LICENSING.md's. Technical design decisions —
@@ -39,14 +39,14 @@ where one exists.
 - "The system" refers to the daemon and a client jointly. "The daemon" and
   "the client" are used when a requirement applies to only one side.
 - "Tenant" refers to one organization's workspace — one daemon, one SQLite
-  database (ARCH-4) — in any of the three deployment models (ARCH-76).
+  database (ARCH-4) — in either deployment model (ARCH-76).
   "Organization" and "tenant" are used interchangeably.
-- "Deployment model" means one of the three shapes defined in ARCH-76:
-  **self-hosted stand-alone** (no dependency on any OpenChime-operated
-  service), **self-hosted federated** (operator runs the daemon and owns all
-  message data, opting in to the OpenChime-operated services ARCH-76 lists), and **hosted**
-  (OpenChime operates the daemon and those services). A requirement that
-  applies to only some models says so.
+- "Deployment model" means one of the two shapes defined in ARCH-76:
+  **self-hosted** (the operator runs the daemon and owns all message data, and
+  turns on, one by one, whichever OpenChime-operated services ARCH-76 lists it
+  wants, or none) and **managed** (OpenChime operates the daemon and those
+  services). A requirement that applies to one model, or only where a service
+  is on, says so.
 - Cross-references cite the implementing decision as `(ARCH-N)`.
 
 ---
@@ -80,14 +80,14 @@ where one exists.
   address) and the user's **email** at sign-in, and has resolved the workspace
   to a daemon address by plain DNS before opening a connection — with no
   resolution *service* involved in any deployment model (ARCH-14/76). A
-  workspace given as a full domain (e.g. `chat.acme.com`) — the stand-alone
-  case, and the federated case where the operator keeps their own DNS — has
+  workspace given as a full domain (e.g. `chat.acme.com`) — a self-hosted
+  box on the operator's own DNS — has
   resolved via SRV records plus optional `.well-known` metadata — the document
   being `https://<domain>/.well-known/openchime`, a flat JSON object, fetched
   with a verified certificate chain or not at all (ARCH-10/14), carrying a
   `port` and optionally the daemon's certificate fingerprint; a workspace
-  given as a bare name (e.g. `acme`) — a hosted tenant, or a federated
-  self-hoster who took a vanity name under the service suffix — has had the
+  given as a bare name (e.g. `acme`) — a managed workspace, or a self-hosted
+  one that took a name under the service suffix — has had the
   service's known DNS suffix appended client-side (`acme` →
   `acme.workspace.openchime.io`) and then resolved by ordinary DNS. In every case
   the mapping has lived in static DNS records, so no lookup has reached an
@@ -137,10 +137,10 @@ where one exists.
   [AUTH.md](./AUTH.md)): **local** (daemon-managed username+password), the
   **relay** (social login via the project's central service), or a **direct
   connection** to an OIDC provider the operator names (REQ-027). Local accounts
-  and direct connections depend on no project-operated service, so self-hosted
-  stand-alone deployments have used either; the relay is a federated function
-  (ARCH-76), so self-hosted federated deployments have added it precisely by
-  opting in; hosted deployments have used the relay or a direct connection to
+  and direct connections depend on no project-operated service, so a self-hosted
+  box that is not connected has used either; the relay is one of the OpenChime
+  services (ARCH-76), so a connected self-hosted box has added it by turning it
+  on; managed deployments have used the relay or a direct connection to
   the customer's own provider. A deployment has enabled more than one source
   together. Through every source the login has been a client-driven browser flow using
   platform-native auth session APIs — `ASWebAuthenticationSession` on iOS/macOS,
@@ -349,8 +349,8 @@ where one exists.
   (ARCH-76).** Every message a tenant sends, stores, backfills, or searches has
   been handled by that tenant's own daemon and database (REQ-040), which has been
   the only store of record for it: no OpenChime-operated service has held a
-  tenant's message history, whether the deployment was stand-alone, federated,
-  or hosted. With nothing configured, no shared, always-on runtime component has
+  tenant's message history, whether the deployment was self-hosted, with any
+  services on or none, or managed. With nothing configured, no shared, always-on runtime component has
   sat in the message/data path and message content has left the daemon only
   toward that workspace's own members (apart from the URLs unfurling fetches,
   below). Workspace resolution has
@@ -372,24 +372,24 @@ where one exists.
   **storage and default behaviour**: where messages live, and that nothing reads
   them unless the tenant said so — not that content can never be inspected.
 
-  A **self-hosted federated** deployment has additionally depended on the
-  OpenChime-operated services it opted into (ARCH-76). Each of these has brokered only
+  A **self-hosted** deployment with services on has additionally depended on
+  the OpenChime-operated services it turned on (ARCH-76). Each of these has brokered only
   **identity, notification, discovery, or provisioning metadata**: which user
   signed in to which workspace, that a notification is due and for whom, which
   integrations exist, which accounts to provision. **None has carried message
-  content, and none has sat in the message path**, so federating has not, by
-  itself, moved any message content: a federated deployment has held exactly
-  the same data-sovereignty guarantee as a stand-alone one — it has traded
+  content, and none has sat in the message path**, so turning a service on has
+  not, by itself, moved any message content: a box with services on has held
+  exactly the same data-sovereignty guarantee as one with none — it has traded
   independence of *availability* (those functions stop when the project's
   services are unreachable) for capability, and message content has stayed
   subject to the tenant's own configuration and nothing else.
 
-  A **self-hosted stand-alone** deployment has depended on no OpenChime-operated
-  service at all at runtime, at the cost of the federated-only features — most
-  visibly mobile push (REQ-133). A **hosted** deployment has run the same daemon
+  A **self-hosted** deployment with every service off has depended on no
+  OpenChime-operated service at all at runtime, at the cost of what those
+  services do — most visibly mobile push (REQ-133). A **managed** deployment has run the same daemon
   with the same per-tenant isolation, operated by the project.
 
-  So multi-tenant *data* isolation has been unconditional across all three
+  So multi-tenant *data* isolation has been unconditional across both
   models; what has varied between them is only which non-message functions a
   deployment has delegated.
 
@@ -764,14 +764,14 @@ where one exists.
 - **REQ-132.** Push notifications have been delivered via APNs on iOS/macOS
   and FCM on Android (ARCH-16), at no per-notification cost, per the
   providers' free tiers.
-- **REQ-133.** Push delivery has been a **federated function** (ARCH-76): the
+- **REQ-133.** Push delivery has been one of the **OpenChime services** (ARCH-76): the
   published mobile clients are signed under the maintaining project's Apple and
   Google developer accounts, so only the project has been able to mint valid
   APNs/FCM credentials for them, and a self-hoster has not been able to register
   its own application identity for the published apps (ARCH-16). Consequently
-  push has been available in the **self-hosted federated** and **hosted** models
-  — routed through the project's push gateway — and **absent in self-hosted
-  stand-alone**, whose mobile clients have fallen back to in-app/foreground
+  push has been available to **managed** boxes and to **self-hosted** boxes that
+  turn it on — routed through the project's push gateway — and **absent on a
+  self-hosted box with push off**, whose mobile clients have fallen back to in-app/foreground
   notification only. Where the gateway has been used it has received only the
   fact that a notification is due and for whom, never message content (REQ-041).
   An operator unwilling to depend on the gateway and unwilling to lose push has
@@ -978,14 +978,14 @@ where one exists.
   named conversation, not what was said — the same class of fact push already
   carries (REQ-133), and a narrower one than REQ-040/041 forbid.
 
-  **The consequence for stand-alone has been stated rather than discovered.**
-  Push is a federated function (REQ-133), and the relay that carries notification
-  mail is central's (REQ-368). A **self-hosted stand-alone deployment has had no
+  **The consequence for a box with no services has been stated rather than discovered.**
+  Push is an OpenChime service (REQ-133), and the relay that carries notification
+  mail is central's (REQ-368). A **self-hosted box that is not connected has had no
   out-of-app notification path** until a provider that delivers without central
   sits behind the same interface: a user who is not looking at a client is not
   reached, and their unread state is waiting when they return. That is an
   acceptable trade for an air-gappable deployment, and an operator has been told
-  it up front rather than inferring it after choosing stand-alone.
+  it up front rather than inferring it after leaving every service off.
 - **REQ-365.** A person has been sent a **mention email** for an **@mention or a
   DM still unread on every one of their devices after a delay they choose**:
   10 minutes, **30 minutes by default**, 1 hour or 4 hours. It has been sent **at
@@ -1033,7 +1033,7 @@ where one exists.
     the triggers, the outbox, the settings — can be built, run and tested with no
     mail system at all;
   - **`openchime`:** messages are relayed to OpenChime's central service, for a
-    **managed or federated** workspace with an active enrollment (ARCH-84), and
+    **managed or connected self-hosted** workspace with an active enrollment (ARCH-84), and
     are the only provider on a managed box.
 
   Further providers have been additions behind the same interface, not a second
@@ -1045,7 +1045,7 @@ where one exists.
   link has been **opaque**: central has kept a permanent map from a random id to
   the destination the daemon reported, and the email has linked to that id on
   OpenChime's domain, whose page has opened the installed app at the workspace
-  (by its id) or, failing that, the web client. A federated workspace's address
+  (by its id) or, failing that, the web client. A self-hosted workspace's address
   has been the one central recorded at enrollment, after the daemon proved it
   holds the workspace's key, so a link can only ever open the workspace that
   sent it.
@@ -1087,9 +1087,9 @@ where one exists.
   server.
 
   **In scope, and narrower than Slack's.** Delivery has been **in-app and push
-  only** — never email (REQ-280) — so a stand-alone deployment's reminder waits
-  in the activity feed rather than chasing the user, consistent with that model's
-  stated trade. Slack routes reminders through Slackbot as a DM; a conversation
+  only** — never email (REQ-280) — so on a box with push off a reminder waits
+  in the activity feed rather than chasing the user, consistent with that
+  box's stated trade. Slack routes reminders through Slackbot as a DM; a conversation
   with a bot is not a thing this product has (REQ-275), so the reminder has
   surfaced as an activity-feed entry and a notification instead of a synthetic
   message from a fake user.
@@ -1480,10 +1480,10 @@ where one exists.
   app. This may reduce to a first-party consumer of the app platform (REQ-172).
 - **REQ-175.** Installable integrations have been discoverable through an **app
   directory** curated by the maintaining project, from which an owner/admin could
-  install an app into their tenant. Directory hosting has been a **federated
-  function** (ARCH-76, cf. ARCH-56), not the daemon's — so the directory has been
-  available to self-hosted federated and hosted deployments, while a self-hosted
-  stand-alone deployment has installed integrations by direct configuration
+  install an app into their tenant. Directory hosting has been one of the
+  **OpenChime services** (ARCH-76, cf. ARCH-56), not the daemon's — so the directory has been
+  available to managed deployments and connected self-hosted ones, while a self-hosted
+  box that is not connected has installed integrations by direct configuration
   instead of browsing a curated catalog.
 - **REQ-176.** The system has offered a **third-party API / SDK** — a documented
   programmatic surface for external tools to read and post on a user's or bot's
@@ -2194,10 +2194,10 @@ messages (author name, ARCH-74).*
   the other writes to other people's messages. Legal hold is this requirement.
 
 - **REQ-253.** A tenant has been able to **provision and deprovision
-  accounts via SCIM**, brokered as a **federated function** (ARCH-76): the
+  accounts via SCIM**, brokered as one of the **OpenChime services** (ARCH-76): the
   project-operated service carries provisioning metadata only — which accounts to
   create, update or disable — never message content (REQ-041). A self-hosted
-  stand-alone deployment, which federates nothing, manages accounts locally
+  box that is not connected manages accounts locally
   instead (REQ-024/033).
 
 - **REQ-276.** A tenant has been able to **capture its history for compliance** —
@@ -2253,7 +2253,7 @@ messages (author name, ARCH-74).*
   - **DMs and private channels are the point and the danger.** Including them is
     what makes it a compliance tool, so it is a deliberate, separately audited act.
   - **The self-hosted operator already has the database**, so this earns its keep in
-    the hosted model (ARCH-76) and wherever a connector is the requirement.
+    the managed model (ARCH-76) and wherever a connector is the requirement.
   - **A vendor is named as "supported" only once its ingest has been tested.**
 
   For contrast, **Pumble** offers a workspace-owner ZIP of PUBLIC channels only — no

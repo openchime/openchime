@@ -12,7 +12,7 @@ persisted server TLS identity; **0009** (§3g) attachments; **0010–0011** (§3
 incoming webhooks and the message display-name override; **0012** (§3j)
 notification preferences and the DND window; **0013** (§3k) synced client
 settings; **0014–0015** attachment tombstones and reclaim reason; **0016** (§3l)
-the audit log; **0017** (§3m) federated enrollment; **0018** (§3n) push device
+the audit log; **0017** (§3m) enrollment; **0018** (§3n) push device
 tokens; **0019** (§3o) the DM participant-set key; **0020** (§3p) the
 unique channel name; **0021** (§3q) resolved @mentions; **0022** (§3r) pinned messages; **0023** (§3s) the channel-files index; **0024** (§3t) channel topic + archive; **0025** (§3u) saved items;
 **0026** (§3v) channel mute + the delivery-cursor index; **0027** (§3w) profile
@@ -583,9 +583,9 @@ moderation actions, account changes) for owner/admin review — never message co
 - Indexes on `(family, at_ms)` and `(at_ms)`. Entries age out after 365 days on the
   maintenance pass, family by family (ARCH-79); the read path pages newest-first.
 
-## 3m. Migration 0017 — federated enrollment (ARCH-84)
+## 3m. Migration 0017 — enrollment (ARCH-84)
 
-A single-row table holding the box's enrollment identity, so an enrolled/federated box
+A single-row table holding the box's enrollment identity, so an enrolled box
 keeps its audience + key across restarts (the same key-survival pattern as the TLS
 identity, ARCH-66b).
 

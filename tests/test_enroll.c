@@ -1,4 +1,4 @@
-/* ARCH-84 federated enrollment client: keypair + audience generation, the "oce1."
+/* ARCH-84 enrollment client: keypair + audience generation, the "oce1."
  * enrollment code format (matching central's parser), the proof-of-
  * possession signature (verified with the public key — the exact check central
  * runs), and the persistence round-trip. */

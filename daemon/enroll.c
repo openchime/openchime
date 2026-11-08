@@ -1,4 +1,4 @@
-/* Federated enrollment client (ARCH-84). See enroll.h. Crypto is mbedTLS; the
+/* Enrollment client (ARCH-84). See enroll.h. Crypto is mbedTLS; the
  * outbound HTTP mirrors the S3 backend's blocking helpers (daemon/blob_s3.c) over
  * the CA-verifying TLS wrapper (shared/tls.c). JSON is emitted with snprintf and
  * parsed with the vendored jsmn (a self-contained static copy in this TU). */

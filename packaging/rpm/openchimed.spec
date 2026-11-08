@@ -55,9 +55,10 @@ The OpenChime server: a single-binary chat daemon holding one tenant's messages
 in a local SQLite database, speaking a binary protocol over TLS with certificate
 pinning.
 
-Runs stand-alone with no dependency on any external service, or federated,
-opting in per function to sign-in through central, mobile push delivery,
-invitation mail and certificates through central. In both cases the daemon
+Self-hosted, it depends on no external service until you connect it to the
+OpenChime services and turn on the ones you want, each on its own: sign-in
+through central, mobile push delivery, invitation mail and certificates
+through central. Either way the daemon
 holds all message data locally.
 
 Configuration is entirely by environment variable; the package ships an

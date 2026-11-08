@@ -16,7 +16,7 @@ roots, a direct connection's secret).
 where there is anything to configure (`OPENCHIME_TLS=acme:chat.example.com`,
 `OPENCHIME_S3=s3://…`, `OPENCHIME_SUMMARY=cloud:<url>,<model>`), and
 **settings**, values with no feature behind them (the name, the data
-directory, the ports, who may join, the mode). Twenty-two in all. Every path is under one
+directory, the ports, who may join, the mode). Twenty-three in all. Every path is under one
 `OPENCHIME_DATA_DIR` at a fixed name, the deployment model is derived from
 what the box was started with rather than declared, and everything nobody
 varies — session life, worker counts, queue depths, rate limits, the call
@@ -40,9 +40,9 @@ tarball's `install.sh` does not).
 
 Under systemd this is an `Environment=` / `EnvironmentFile=` block (ARCH-20);
 in the container image it is the container environment (ARCH-4). Nothing here is
-ever fetched from central at runtime, in any deployment model — a
-federated deployment contacts its opted-in services for their own function, never
-to learn how to run (ARCH-26/76).
+ever fetched from central at runtime, in either deployment model — a connected
+box contacts the services it turned on for their own function, never to learn
+how to run (ARCH-26/76).
 
 **The packages ship an `EnvironmentFile`.** The `.deb`, `.rpm` and tarball
 install `/etc/openchime/openchimed.env` and the unit reads it. It is marked as
@@ -191,8 +191,9 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_STT` | `on` | Voice input (ARCH-112), in a build that carries it. `on` or `off`. |
 | `OPENCHIME_SUMMARY` | `off` | Summaries (REQ-310): `off`, `local` (the model runs inside the daemon, fetched on first start), or `cloud:<url>,<model>` (a hosted API's base URL and the model there). |
 | `OPENCHIME_SUMMARY_API_KEY` | *(empty)* | The hosted API's key, for `cloud`. |
-| `OPENCHIME_ENROLL_URL` | *(unset)* | The central service to enrol with (ARCH-84), which makes the box federated: https, or http to loopback for a test. Prints an `oce1.` code to the log on first run. |
-| `OPENCHIME_PUSH_URL` | *(unset)* | The mobile push relay (ARCH-16/85), contentless; needs an enrollment. https, or http to loopback for a test. |
+| `OPENCHIME_ENROLL_URL` | *(unset)* | Connects this box to the OpenChime services at this origin (ARCH-84); each service is then turned on by its own setting. https, or http to loopback for a test. Prints an `oce1.` code to the log on first run. |
+| `OPENCHIME_PUSH` | `off` | Whether mobile push (ARCH-16/85), contentless, goes through the OpenChime services at the connection's origin; needs OPENCHIME_ENROLL_URL. One of `off`, `on`. |
+| `OPENCHIME_PUSH_URL` | *(unset)* | Where push goes instead of the connection's origin; set alone, it turns push on. https, or http to loopback for a test. |
 | `OPENCHIME_INVITE_MAIL` | `off` | Whether invitations bound to an address are reported to central for it to mail (REQ-280); needs an active enrollment. One of `off`, `on`. |
 
 ## Managed
@@ -244,7 +245,7 @@ A name that was a setting once. Set, it stops the daemon with the line below; th
 
 | Name | Instead |
 |---|---|
-| `OPENCHIME_DEPLOYMENT_MODE` | derived: managed with OPENCHIME_MANAGED_TICKET, federated with OPENCHIME_ENROLL_URL, else standalone |
+| `OPENCHIME_DEPLOYMENT_MODE` | derived: managed with OPENCHIME_MANAGED_TICKET, else self-hosted |
 | `OPENCHIME_DB_PATH` | the database is openchime.db under OPENCHIME_DATA_DIR |
 | `OPENCHIME_BLOB_DIR` | attachments are blobs/ under OPENCHIME_DATA_DIR |
 | `OPENCHIME_TLS_CERT` | cert.pem under OPENCHIME_DATA_DIR |
@@ -364,10 +365,30 @@ the replica's 14-day restore window, and keys are never reused), and says in the
 journal how many it deleted or that it could not. Nowhere else does it delete anything it did not
 write and then reclaim.
 
+## The OpenChime services
+
+A self-hosted box (ARCH-76) uses no OpenChime-operated service until its
+operator turns one on. Connecting is one setting, and each service is then its
+own, off by default:
+
+| Setting | What it does |
+|---|---|
+| `OPENCHIME_ENROLL_URL` | **Connects** the box to the OpenChime services at that origin (the enrollment, ARCH-84). On its own it turns nothing on. |
+| `OPENCHIME_AUTH=relay` (or `local,relay`) | Sign-in through the relay (ARCH-56). |
+| `OPENCHIME_PUSH=on` | Mobile push through the push gateway at the connection's origin (ARCH-16/85); `OPENCHIME_PUSH_URL` names another place for it, and set alone turns push on. |
+| `OPENCHIME_INVITE_MAIL=on` | Invitation mail (REQ-280, ARCH-85). |
+| `OPENCHIME_TLS=central` | The certificate for a name under the service suffix, through central (ARCH-14, TLS.md). |
+
+Every service needs `OPENCHIME_ENROLL_URL`: the relay, push and the central
+certificate refuse the start without it, and invitation mail without it says so
+in the log and leaves invitations to be shared by copying them. A box connected with every
+service off is valid and gets nothing from the connection. A managed box is
+started with the services it needs (below).
+
 ## A managed box
 
-The `OPENCHIME_MANAGED_*` rows above configure a managed box (ARCH-76, model
-3), one bound to a workspace at central by a one-time ticket. A box that is not
+The `OPENCHIME_MANAGED_*` rows above configure a managed box (ARCH-76, the
+managed model), one bound to a workspace at central by a one-time ticket. A box that is not
 managed leaves them unset; a daemon started with one of them and
 no ticket refuses to start, naming this section. What the rows carry, beyond the table:
 
@@ -388,8 +409,8 @@ does; `OPENCHIME_ENROLL_URL` is required with the ticket.
 
 **What is derived.**
 
-- **The deployment model** is `managed` when the ticket is set, `federated`
-  when only `OPENCHIME_ENROLL_URL` is, else `standalone`; nothing declares it.
+- **The deployment model** is `managed` when the ticket is set, else
+  `self-hosted`; nothing declares it.
 - **The relay** needs no issuer, key file or audience of its own: the issuer
   is the enroll URL's origin, the keys are fetched from it, and the audience is
   the enrollment's — which on a managed box is the one above.

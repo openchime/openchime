@@ -3409,7 +3409,7 @@ static oc_dbres *process_store_identity(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-/* Load the persisted federated-enrollment identity (ARCH-84); enroll_present=0 when
+/* Load the persisted enrollment identity (ARCH-84); enroll_present=0 when
  * none is stored yet (first run). */
 static oc_dbres *process_load_enrollment(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
@@ -12427,7 +12427,7 @@ int oc_dbwriter_store_identity(oc_dbwriter *w, const char *cert_pem, const char 
     return 0;
 }
 
-/* Load the persisted federated-enrollment identity (ARCH-84). Returns 1 (+ heap
+/* Load the persisted enrollment identity (ARCH-84). Returns 1 (+ heap
  * privkey/audience/active) if a row exists, else 0. Setup-time only. */
 int oc_dbwriter_load_enrollment(oc_dbwriter *w, char **privkey_out, char **audience_out, int *active_out) {
     *privkey_out = NULL; *audience_out = NULL; *active_out = 0;

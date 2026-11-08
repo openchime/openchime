@@ -782,9 +782,8 @@ uint64_t oc_model_listen_take_audio(oc_model *m, uint8_t **mp4, size_t *len) {
 }
 const char *oc_model_deployment_name(const oc_model *m) {
     switch (m->deployment_mode) {
-        case 1:  return "federated";
-        case 2:  return "managed";
-        default: return "standalone";
+        case 1:  return "managed";
+        default: return "self-hosted";
     }
 }
 

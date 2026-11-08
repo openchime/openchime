@@ -1,4 +1,4 @@
-/* Federated enrollment client (ARCH-84, the daemon side of central's
+/* Enrollment client (ARCH-84, the daemon side of central's
  * enrollment handshake). On first boot the daemon generates a P-256 keypair + an
  * opaque audience id, persists them, and prints an "oce1." enrollment code for an
  * operator to enter on central's enrollment page. It then calls out to central

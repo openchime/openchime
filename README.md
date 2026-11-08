@@ -3,25 +3,24 @@
 A self-hostable business chat system: a C daemon, a shared C client app-core,
 and native frontends.
 
-**Three deployment models** (ARCH-76 in
+**Two deployment models** (ARCH-76 in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
 
-| Model | Who runs the daemon | Depends on OpenChime-operated services |
+| Model | Who runs the daemon | OpenChime-operated services |
 |---|---|---|
-| **Self-hosted stand-alone** | you | **none** — fully independent, and air-gappable. Federated-only features are absent, most visibly mobile push. |
-| **Self-hosted federated** | you | opt-in, per function: OIDC login, push delivery, invitation mail, an optional DNS name, package distribution. (An app directory and SCIM are specified, REQ-175 and REQ-253, and not built.) You still run the daemon and own **all message data**. |
-| **Hosted** | OpenChime | all of the above, operated for you. |
+| **Self-hosted** | you | **none unless you turn them on.** With none, the box depends on nobody and can be air-gapped. Connect it to the OpenChime services (`OPENCHIME_ENROLL_URL`) and turn on each one you want, separately: sign-in through the relay, mobile push, invitation mail, a name and certificate under the service suffix. You run the daemon and own **all message data** either way. |
+| **Managed** | OpenChime | all of the above, operated for you. |
 
-In every model, **no OpenChime-operated service is ever in the message path** —
+In both models, **no OpenChime-operated service is ever in the message path** —
 the federated services broker identity, notification, discovery, and
-provisioning metadata, and none can read message content. Federating trades
-availability independence for capability, never message confidentiality
+provisioning metadata, and none can read message content. Turning a service on
+trades availability independence for capability, never message confidentiality
 (REQ-040/041).
 
 **Where this differs from the reference products.** Per-message read receipts
 ("seen by", REQ-095) exist here and in neither Slack nor Pumble, which both
-decline them deliberately. Self-hosting, data residency and the three deployment
-models are ours alone — both references are single-cloud and SaaS-only. The
+decline them deliberately. Self-hosting, data residency and the choice of
+self-hosted or managed are ours alone — both references are single-cloud and SaaS-only. The
 clients are native C rather than Electron or web-tech. One thing is **not** a
 differentiator and is recorded as such: unlimited history is matched by
 Pumble's free tier, so the argument there is data ownership rather than
@@ -77,7 +76,7 @@ send, custom emoji, **link unfurls** fetched in-daemon behind an SSRF gate,
 attachments proxied to object storage with per-channel file
 and member listings, incoming webhooks, an audit log, and reconnect backfill. The
 daemon also emits **mobile push** to the central push gateway (ARCH-85) and
-**enrolls** with central for federated deployments (ARCH-84). **Calls** are relayed by a
+**enrolls** with central when connected to the OpenChime services (ARCH-84). **Calls** are relayed by a
 UDP relay in the daemon that never decodes them and are encrypted end to end between the
 participants' devices ([docs/CALLS.md](docs/CALLS.md), [docs/AUDIO.md](docs/AUDIO.md)).
 

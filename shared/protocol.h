@@ -1028,7 +1028,7 @@ typedef struct { uint8_t step; } oc_auth_continue;
 typedef struct { uint64_t user_id; uint8_t role; uint64_t session_expiry; oc_slice session_token; } oc_auth_ok;
 typedef struct { uint8_t scope; oc_slice session_token; } oc_logout;
 /* Pushed after AUTH_OK: infra facts about this workspace, from the daemon's
- * static config. deployment_mode ∈ {0 standalone,1 federated,2 managed};
+ * static config. deployment_mode ∈ {0 self-hosted, 1 managed};
  * workspace_name may be empty (client falls back to the host subdomain). */
 /* call_max is the most people in one call (OC_CALL_MAX, REQ-305), so a
  * client starting one in a large channel knows when the starter has to pick.

@@ -1,8 +1,8 @@
 /*
  * OpenChime client — workspace resolution (REQ-010/011, ARCH-14). Turns a
  * user-typed *workspace* (a self-hosted domain like `chat.acme.com`, or a bare
- * hosted-tier name like `acme`) into a daemon `host:port` by **plain DNS**, with
- * no hosted resolution service: a bare name gets the configured DNS suffix
+ * managed-tier name like `acme`) into a daemon `host:port` by **plain DNS**, with
+ * no resolution service of ours: a bare name gets the configured DNS suffix
  * appended, then the domain is resolved via an SRV record
  * (`_openchime._tcp.<domain>`), falling back to the domain's A/AAAA record at
  * 443. Resolution failure is reported as a distinct status so the caller can tell
@@ -40,7 +40,7 @@ typedef enum {
  * empty otherwise. */
 typedef struct { char host[256]; int port; char domain[256]; char fingerprint[96]; } oc_endpoint;
 
-/* The service's own DNS suffix (ARCH-14). A hosted tenant is reached by bare
+/* The service's own DNS suffix (ARCH-14). A managed workspace is reached by bare
  * name — `acme` -> `acme.workspace.openchime.io` — which is what REQ-010 means by "the
  * client appends the service's known DNS suffix as a pure client-side string
  * convention". Self-hosted tenants type a full domain instead, which passes
@@ -52,7 +52,7 @@ typedef struct { char host[256]; int port; char domain[256]; char fingerprint[96
  * frontend agrees on the default instead of each calling getenv() and getting NULL. */
 const char *oc_default_suffix(void);
 
-/* Does the hosted suffix belong beside what has been typed so far? Only a bare
+/* Does the managed suffix belong beside what has been typed so far? Only a bare
  * name takes it (`acme` -> `acme.<suffix>`), so a frontend that shows the suffix
  * as a hint beside its workspace field shows it for that and for an empty field
  * -- never beside an address, a `:port`, a scheme or path, a dotted name or
@@ -89,7 +89,7 @@ void oc_resolve_counts(unsigned *srv, unsigned *dns, unsigned *wellknown);
  * in brackets, with or without `:port` -- is used as given, before anything
  * else: no SRV query, no DNS, no `.well-known` request; its port, or 443. The
  * host comes back in canonical form, IPv6 unbracketed; `domain` brackets it.
- * `suffix` is the hosted-tier DNS suffix for bare names (NULL/"" disables
+ * `suffix` is the managed-tier DNS suffix for bare names (NULL/"" disables
  * suffixing). See the header comment for the SRV -> A fallback order for names,
  * and the distinct failure statuses. */
 oc_resolve_status oc_resolve(const char *workspace, const char *suffix, oc_endpoint *out);
