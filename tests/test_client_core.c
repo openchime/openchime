@@ -482,6 +482,22 @@ static void test_server_build(void) {
     oc_model_free(&m);
 }
 
+/* The deployment model a WORKSPACE_INFO names: 0 self-hosted, 1 managed. */
+static void test_deployment_name(void) {
+    oc_model m; oc_model_init(&m);
+    CHECK(strcmp(oc_model_deployment_name(&m), "self-hosted") == 0);   /* nothing said yet */
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_WORKSPACE_INFO;
+    e.status = 1;
+    oc_model_apply(&m, &e);
+    CHECK(strcmp(oc_model_deployment_name(&m), "managed") == 0);
+    e.status = 0;
+    oc_model_apply(&m, &e);
+    CHECK(strcmp(oc_model_deployment_name(&m), "self-hosted") == 0);
+    oc_model_free(&m);
+}
+
 /* Invitations in the model (REQ-033): which kind a workspace can redeem, from
  * its sign-in sources, and the text an INVITE_CREATED becomes -- by address, or
  * with the token -- with the workspace, how to sign in and the expiry. */
@@ -635,7 +651,7 @@ static void test_invitation_text(void) {
     oc_ev e;
     memset(&e, 0, sizeof e);
     e.type = OC_EV_SIGNIN_SOURCES;
-    e.count = 1u << OC_SOURCE_RELAY;                  /* hosted: the relay alone */
+    e.count = 1u << OC_SOURCE_RELAY;                  /* managed: the relay alone */
     oc_model_apply(&m, &e);
     CHECK(oc_model_offers_browser(&m) && !oc_model_offers_local(&m));
     e.count = (1u << OC_SOURCE_LOCAL) | (1u << OC_SOURCE_RELAY);
@@ -1087,7 +1103,7 @@ static int csum_take(void *ctx, int64_t row) {
 }
 
 /* Pins folded into the model (REQ-230, ARCH-90): the inline flag on a message
- * and the standalone pins overlay, which is fed by its own frames because a
+ * and the separate pins overlay, which is fed by its own frames because a
  * pinned message is usually outside loaded history. */
 static void test_pins(void) {
     oc_model m; oc_model_init(&m);
@@ -1884,6 +1900,32 @@ static void test_broadcast_mentions_me(void) {
     CHECK(oc_model_mentions_me_in(&m, 0, p2, strlen(p2)) == 1);       /* by name, stored or not */
     const char *q = "@bob only";
     CHECK(oc_model_mentions_me_in(&m, 1, q, strlen(q)) == 0);         /* a row, but no broadcast now */
+    oc_model_free(&m);
+}
+
+/* The id form (<@U42>) mentions the reader whose id it is, whatever its label,
+ * and shows as the roster's name (REQ-221, ARCH-89). */
+static void test_id_mentions(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("ada"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(&m, &e);
+    const char *a = "standup <@U1> now";
+    CHECK(oc_model_mentions_me_in(&m, 0, a, strlen(a)) == 1);
+    CHECK(oc_model_mentions_me(&m, a, strlen(a)) == 1);
+    const char *b = "<@U2|ada> only";                 /* a label is not a name */
+    CHECK(oc_model_mentions_me_in(&m, 0, b, strlen(b)) == 0);
+    CHECK(oc_model_mentions_me(&m, b, strlen(b)) == 0);
+    const char *c = "<@U1|someone> hi";
+    CHECK(oc_model_mentions_me_in(&m, 0, c, strlen(c)) == 1);
+
+    const char *d = "<@U1> and <@U2|old> and <@U9>";
+    char *shown = oc_model_mention_display(&m, d, strlen(d));
+    /* contract: MARKDOWN.md, an id-form mention is shown as @ and the name */
+    CHECK(shown && strcmp(shown, "@ada and @bob and <@U9>") == 0);
+    free(shown);
+    CHECK(oc_model_mention_display(&m, "@ada plain", 10) == NULL);   /* nothing to change */
     oc_model_free(&m);
 }
 
@@ -3320,7 +3362,7 @@ static void test_sni_name(void) {
         CHECK(sent == (T[i].want != NULL));
         CHECK(T[i].want ? strcmp(out, T[i].want) == 0 : out[0] == '\0');
     }
-    /* A bare name resolves under the hosted suffix; in development mode OPENCHIME_DEV_SUFFIX wins. */
+    /* A bare name resolves under the managed suffix; in development mode OPENCHIME_DEV_SUFFIX wins. */
     char d[256];
     unsetenv("OPENCHIME_DEV_SUFFIX");
     CHECK(oc_resolve_domain("acme", oc_default_suffix(), d, sizeof d) == 0);
@@ -5757,8 +5799,62 @@ static size_t frame_of_forward(uint8_t *buf, size_t cap, uint64_t mid) {
 }
 static size_t frame_of_meta(uint8_t *buf, size_t cap, uint64_t mid) {
     oc_wbuf w; oc_wbuf_init(&w, buf, cap);
-    oc_thread_meta tm = { mid, 2, 2000 };
+    oc_thread_meta tm = { .message_id = mid, .reply_count = 2, .last_reply_at = 2000 };
     return oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &tm) == OC_OK ? w.len : 0;
+}
+
+/* A thread's repliers reach the parent from THREAD_META (REQ-060): through
+ * the frame layer into the model, live as well as in backfill, and a stale
+ * frame -- a backfill's, behind a live one -- changes nothing. */
+static size_t frame_of_meta_repliers(uint8_t *buf, size_t cap, uint64_t mid, uint32_t count,
+                                     uint64_t last, uint8_t n, uint64_t a, uint64_t b, uint64_t c) {
+    oc_wbuf w; oc_wbuf_init(&w, buf, cap);
+    oc_thread_meta tm = { .message_id = mid, .reply_count = count, .last_reply_at = last,
+                          .n_repliers = n, .repliers = { a, b, c } };
+    return oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &tm) == OC_OK ? w.len : 0;
+}
+
+static void apply_meta_frame(oc_model *m, oc_net_frames *f, oc_queue *q, const uint8_t *buf, size_t n) {
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    oc_ev *e = oc_queue_try_pop(q);
+    CHECK(e && e->type == OC_EV_THREAD_META);
+    if (e) { oc_model_apply(m, e); oc_ev_free(e); }
+}
+
+static void test_thread_meta_live(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 40; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("room");
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 40; e.message_id = 100; e.author_id = 1;
+    e.body = strdup("the parent");
+    oc_model_apply(&m, &e);
+
+    oc_queue q; oc_queue_init(&q);
+    oc_net_frames *f = oc_net_frames_new(&q);
+    CHECK(f != NULL);
+    uint8_t buf[256];
+    const oc_channel *c = oc_model_channel(&m, 40);
+    const oc_msg *p = c && c->n_msgs ? &c->msgs[0] : NULL;
+    CHECK(p && p->message_id == 100 && p->reply_count == 0 && p->n_repliers == 0);
+
+    /* A reply is posted: the count, its time and who replied. */
+    apply_meta_frame(&m, f, &q, buf, frame_of_meta_repliers(buf, sizeof buf, 100, 4, 5000, 3, 9, 8, 7));
+    CHECK(p && p->reply_count == 4 && p->last_reply_at == 5000 && p->n_repliers == 3 &&
+          p->repliers[0] == 9 && p->repliers[1] == 8 && p->repliers[2] == 7);
+
+    /* A backfill's frame from before it arrives late: nothing moves back. */
+    apply_meta_frame(&m, f, &q, buf, frame_of_meta_repliers(buf, sizeof buf, 100, 3, 4000, 2, 8, 7, 0));
+    CHECK(p && p->reply_count == 4 && p->last_reply_at == 5000 && p->n_repliers == 3 && p->repliers[0] == 9);
+
+    /* The newest reply is deleted: same count and time, the repliers anew. */
+    apply_meta_frame(&m, f, &q, buf, frame_of_meta_repliers(buf, sizeof buf, 100, 4, 5000, 2, 8, 7, 0));
+    CHECK(p && p->reply_count == 4 && p->n_repliers == 2 && p->repliers[0] == 8 && p->repliers[1] == 7);
+
+    oc_net_frames_free(f);
+    oc_model_free(&m);
 }
 
 static void test_action_pairing(void) {
@@ -5877,6 +5973,8 @@ int run_client_core_tests(void) {
     test_broadcast_check();
     test_broadcast_check_dm();
     test_broadcast_mentions_me();
+    test_id_mentions();
+    test_thread_meta_live();
     test_broadcast_stored_model();
     test_workspace_sender_model();
     test_time_preview();
@@ -5889,6 +5987,7 @@ int run_client_core_tests(void) {
     test_unread_counts_what_notifies();
     test_capabilities();
     test_server_build();
+    test_deployment_name();
     test_invitation_text();
     test_reset_text();
     test_search_truncated();

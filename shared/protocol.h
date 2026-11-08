@@ -196,8 +196,13 @@
  * 33: AUDIT_QUERY carries `family`, `actor_id` and `action`, filters the daemon
  * applies, so a page holds only matching entries however sparse they are and
  * paging back by `before_ms` keeps the filter (REQ-251). Fields appended to a
- * fixed layout. */
-#define OC_PROTOCOL_VERSION 33u
+ * fixed layout.
+ *
+ * 34: THREAD_META carries `n_repliers` (u8, at most 3) and that many u64 user
+ * ids, the thread's most recent distinct repliers, newest first, and is sent
+ * live to the channel's members when a reply is posted or deleted, not only in
+ * backfill (REQ-060). Fields appended to a fixed layout. */
+#define OC_PROTOCOL_VERSION 34u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -268,7 +273,7 @@ typedef enum {
     OC_MSG_THREAD_REPLY     = 0x002D, /* S->C, reply fan-out (not in main scroll) */
     OC_MSG_LIST_THREAD      = 0x002E, /* C->S, open a thread */
     OC_MSG_THREAD           = 0x002F, /* S->C, a thread's replies */
-    OC_MSG_THREAD_META      = 0x0032, /* S->C, a parent's reply count (backfill) */
+    OC_MSG_THREAD_META      = 0x0032, /* S->C, a parent's reply count and repliers (backfill, live) */
     OC_MSG_READ_CURSOR      = 0x0033, /* S->C, a member's read cursor advanced (REQ-090 seen-by) */
     OC_MSG_HISTORY_REQUEST  = 0x0034, /* C->S, page BACKWARDS through a channel (§6.3) */
     OC_MSG_HISTORY_AROUND   = 0x006A, /* C->S (REQ-232), the messages AROUND an id */
@@ -1023,7 +1028,7 @@ typedef struct { uint8_t step; } oc_auth_continue;
 typedef struct { uint64_t user_id; uint8_t role; uint64_t session_expiry; oc_slice session_token; } oc_auth_ok;
 typedef struct { uint8_t scope; oc_slice session_token; } oc_logout;
 /* Pushed after AUTH_OK: infra facts about this workspace, from the daemon's
- * static config. deployment_mode ∈ {0 standalone,1 federated,2 managed};
+ * static config. deployment_mode ∈ {0 self-hosted, 1 managed};
  * workspace_name may be empty (client falls back to the host subdomain). */
 /* call_max is the most people in one call (OC_CALL_MAX, REQ-305), so a
  * client starting one in a large channel knows when the starter has to pick.
@@ -1240,7 +1245,14 @@ typedef struct { uint64_t channel_id; uint64_t parent_id; } oc_list_thread;
  * replies as THREAD_REPLY frames (each self-framed, so a 64KB body is fine),
  * then this frame closes the stream — mirroring BACKFILL_DONE (§6.2). */
 typedef struct { uint64_t parent_id; uint32_t count; uint8_t truncated; } oc_thread;
-typedef struct { uint64_t message_id; uint32_t reply_count; uint64_t last_reply_at; } oc_thread_meta;
+/* THREAD_META: a parent's thread, in backfill and live after a reply is posted
+ * or deleted. `repliers` are the most recent distinct authors of its replies
+ * that are not deleted, newest first (REQ-060). */
+#define OC_THREAD_REPLIERS_MAX 3
+typedef struct {
+    uint64_t message_id; uint32_t reply_count; uint64_t last_reply_at;
+    uint8_t  n_repliers; uint64_t repliers[OC_THREAD_REPLIERS_MAX];
+} oc_thread_meta;
 typedef struct { oc_slice name; uint8_t is_public; } oc_create_channel;
 typedef struct { uint64_t channel_id; uint8_t op; oc_slice value; } oc_update_channel;
 

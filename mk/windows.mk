@@ -1,4 +1,4 @@
-# The Windows clients, cross-compiled to standalone .exe files: the GUI
+# The Windows clients, cross-compiled to self-contained .exe files: the GUI
 # (ARCH-80) and the TUI (ARCH-81). The toolchain is llvm-mingw (clang, lld,
 # LLVM's binutils, current mingw-w64 headers), fetched pinned on first use
 # (mk/toolchains.mk); the x86_64-w64-mingw32-* names below are its wrappers.

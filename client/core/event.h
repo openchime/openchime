@@ -357,6 +357,10 @@ typedef struct {
     uint32_t        srvalert_current; /* OC_EV_SRVALERTS: how many still hold */
     uint8_t  op;           /* REACTION: add/remove */
     uint32_t count;        /* REACTION: running aggregate count for the emoji */
+    /* THREAD_META: the thread's last reply time (in server_time) and its most
+     * recent distinct repliers, newest first (REQ-060). */
+    uint8_t  n_repliers;
+    uint64_t repliers[OC_THREAD_REPLIERS_MAX];
     uint16_t uses, used;   /* INVITE / INVITE_ROW: how many may redeem it (0 = no limit), how many have */
     uint64_t pinned_at;    /* PINNED_MSG: when it was pinned (REQ-230). Its own field
                               because a ms timestamp does not fit in `count`. */

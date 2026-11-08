@@ -119,7 +119,7 @@ Agents do not count against the registered-user cap (AUTH.md §2): they are not
 people, and a workspace at its cap can still add one.
 
 **Central-brokered agent identity** is not built here. When it is, an agent of a
-federated or hosted workspace will present an ES256 token central minted for
+connected self-hosted or managed workspace will present an ES256 token central minted for
 the workspace's ratified `aud`, verified as a relay sign-in is (ARCH-56/57),
 short-lived and refreshed by the agent from central, so the daemon still
 contacts no one. Daemon-minted tokens are complete without it.

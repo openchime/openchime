@@ -21,15 +21,14 @@ used.
 | **Relay** (§3) | The client signs in with Google, Microsoft or a code mailed to their address through the project's central service, which re-issues a token the daemon trusts. | The project's central service, at login time only. |
 | **Direct connection** (§8.5) | The client signs in at an OIDC provider the operator names, and the daemon is the relying party: it exchanges the code and checks the provider's ID token. | The operator's own provider, at login time only. No OpenChime-operated service. |
 
-What a deployment may enable follows from the three deployment models of
-ARCH-76, because the relay is one of the functions a deployment federates and
-the other two sources need nothing from the project.
+What a deployment may enable follows from the two deployment models of
+ARCH-76, because the relay is one of the OpenChime services a self-hosted box
+turns on or not, and the other two sources need nothing from the project.
 
 | Deployment model (ARCH-76) | Sources |
 |---|---|
-| **Self-hosted stand-alone** | **Local**, optionally with one or more **direct connections** beside it (a box that is not enrolled can only run `OPENCHIME_AUTH=local`: `relay` needs `OPENCHIME_ENROLL_URL`). No dependency on any OpenChime-operated service; on local accounts alone this model is fully air-gappable. |
-| **Self-hosted federated** | Any of the three. Opting in to the federated OIDC function is what adds the relay; a federated deployment may equally decline it and federate only push, invitation mail, certificates through central, a DNS name, or packages. |
-| **Hosted** | The **relay**, operated by the project alongside the daemons. |
+| **Self-hosted** | **Local**, optionally with one or more **direct connections** beside it; and the **relay** when the box is connected to the OpenChime services (`OPENCHIME_ENROLL_URL`) and turns it on (`OPENCHIME_AUTH=relay` or `local,relay`). A connected box may equally leave the relay off and turn on only push, invitation mail, or a name and certificate. A box that is not connected depends on no OpenChime-operated service; on local accounts alone it is fully air-gappable. |
+| **Managed** | The **relay**, operated by the project alongside the daemons. |
 
 The relay keeps the daemon lean on that path (it never handles multiple
 providers — it verifies one ES256 JWT against the relay's own keys, §3.3) and means a
@@ -37,7 +36,7 @@ self-hoster never registers provider apps or holds provider credentials; its
 price is a login-time dependency on the project, and the project seeing who
 signs in where (§3.4). A direct connection is for the operator who would rather
 hold those credentials than pay that price, and it is the only single sign-on a
-stand-alone deployment can have. **SAML is not a source** (REQ-027).
+box that is not connected can have. **SAML is not a source** (REQ-027).
 
 **Sources may be enabled together** — an organization's provider for staff
 beside local accounts for contractors or a break-glass owner.
@@ -110,7 +109,8 @@ authority.
   = unlimited). Creating a *new* user past the cap — by signing up with an invite or
   the setup token, by a first-time provider sign-in, or by bringing a removed
   member back — is refused with `ERROR USER_LIMIT`; an existing user still logs in, and a removed member
-  (`disabled=1`) frees a seat (the count is active users only). It is a managed
+  (`disabled=1`) frees a seat (the count is active people only: a web visitor, an
+  agent or a bot takes no seat, SCHEMA.md §3bj). It is a managed
   box's setting, refused without `OPENCHIME_MANAGED_TICKET` outside development
   (CONFIG.md "A managed box"); only the daemon can enforce it, since only it
   holds the users table.
@@ -332,13 +332,13 @@ targets the high-frequency message path, not the auth bootstrap.)
 - **Dependency is login-time only.** Once the daemon issues a session (§4), it
   never contacts central again; existing sessions survive a central outage. Only
   *new logins* need central up, and the message path never does. Local mode has
-  no central dependency at all — which is what makes self-hosted stand-alone
-  (ARCH-76) possible.
+  no central dependency at all — which is what lets a self-hosted box run with
+  every service off (ARCH-76).
 - **Privacy tradeoff:** in relay-OIDC the central service sees *who* logs into
   which workspace (identities, not message content — it never touches
   messages/channels). A self-hoster wanting zero project visibility declines the
-  relay and uses local accounts (§1); declining every federated function is exactly the self-hosted
-  stand-alone model (ARCH-76).
+  relay and uses local accounts (§1); a self-hosted box with every service off
+  (ARCH-76) gives the project nothing to see.
 
 ### 3.5 Reconciling with the island model (REQ-041)
 
@@ -347,13 +347,12 @@ by default go nowhere else, in any deployment model** — and that holds here: d
 isolation (REQ-040) is untouched. The central OIDC service is contacted at **login time only** (never
 per-message), brokers **identity only** (it never sees message or channel
 content), and is **absent entirely in local mode**, hence absent from every
-self-hosted stand-alone deployment.
+self-hosted box that leaves the relay off.
 
-OIDC is not the only federated function, though — a self-hosted federated
-deployment may also depend on the project for push (ARCH-16), invitation mail
-(ARCH-85), certificates and a DNS name under the service suffix (ARCH-14, §8.9),
-and packages (ARCH-20); the app directory (REQ-175) and SCIM (REQ-253) are
-requirements, not yet built. What unites them, and what REQ-041 actually guarantees, is
+OIDC is not the only OpenChime service, though — a connected self-hosted box
+may also turn on push (ARCH-16), invitation mail (ARCH-85), and a name and
+certificate under the service suffix (ARCH-14, §8.9), and may take packages
+(ARCH-20), the app directory (REQ-175) and SCIM (REQ-253). What unites them, and what REQ-041 actually guarantees, is
 that each brokers identity, notification, discovery, or provisioning metadata
 and **none carries message content**. So federating costs availability
 independence and moves no message content; content leaves a daemon only toward
@@ -377,7 +376,7 @@ generate an ECDSA-P256 keypair in the test, mint central-style ES256 JWTs, and
 hand the daemon the test public key as one of the relay's — the same faking approach as the
 existing TLS/netloop integration tests.
 
-**The daemon's enrollment client (ARCH-84).** How a federated box *obtains* its
+**The daemon's enrollment client (ARCH-84).** How a connected box *obtains* its
 audience id is implemented daemon-side in `daemon/enroll.c`, gated on
 `OPENCHIME_ENROLL_URL`. On first boot the daemon generates its own ECDSA-P256 keypair +
 a random `audience` (`ws_…`), persists them (so they survive restarts), and prints
@@ -389,8 +388,9 @@ client half is here. Activation is tried once at each start: the first prints th
 code and serves pending, and the boot after the operator reserves it comes up
 active.
 
-**The daemon's push emitter (ARCH-85).** An enrolled box additionally set with
-`OPENCHIME_PUSH_URL` (central's push gateway) delivers
+**The daemon's push emitter (ARCH-85).** An enrolled box with
+`OPENCHIME_PUSH=on` (central's push gateway at the connection's origin, or
+`OPENCHIME_PUSH_URL`) delivers
 mobile push (REQ-132/133). The daemon owns a device-token registry
 (`REGISTER_DEVICE_TOKEN`); a committed SEND drives an off-hot-path worker that selects
 recipients (members − author, past their notification level — ALL, or
@@ -398,8 +398,8 @@ MENTIONS when the message mentions them; a priority person pierces it — not
 muted, not in DND, holding a token), signs a
 **contentless** batch with the enrollment key — the same request-signature scheme
 central verifies (§8.7) — and POSTs it to
-the gateway, which relays to APNs/FCM and returns stale tokens to prune. Absent in
-self-hosted stand-alone (no enrollment / no `OPENCHIME_PUSH_URL`).
+the gateway, which relays to APNs/FCM and returns stale tokens to prune. Absent on
+a box with push off (no enrollment, or neither `OPENCHIME_PUSH=on` nor `OPENCHIME_PUSH_URL`).
 
 ---
 

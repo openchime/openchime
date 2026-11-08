@@ -309,7 +309,7 @@ static void rows_cut(rows_t *r, size_t first, size_t keep, const char *why) {
 /* Append the wrapped rows for one message: header, body (or tombstone),
  * reactions, and — when `show_replies` — a thread reply-count marker. `ch` is
  * used only to resolve author names. */
-static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
+static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uint64_t me, int width,
                             const oc_channel *ch, int show_replies, int mi) {
     size_t rstart = r->n;
     char line[256], nick[80];
@@ -360,8 +360,9 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
             return;
         }
         /* The source as written (MARKDOWN.md §5), except a spoiler, covered
-         * until it is shown (§1d), and a time token, which is shown as its
-         * time here: the token itself reads in UTC (§1c). */
+         * until it is shown (§1d), a time token, which is shown as its
+         * time here: the token itself reads in UTC (§1c), and an id-form
+         * mention, shown as the person's name (§1e). */
         int covering = m->body && !spoilers_shown(m->message_id) && has_spoilers(m->body);
         char *cov = covering ? oc_rt_spoilers_covered(m->body, strlen(m->body)) : NULL;
         const char *src = covering ? (cov ? cov : "") : m->body ? m->body : "";   /* no memory shows nothing */
@@ -369,8 +370,11 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
         oc_model_clock(NULL, (int64_t)time(NULL) * 1000, &k);
         k.time24 = !(g_cfg && !g_cfg->time_24h);
         char *loc = oc_rt_local_times(src, strlen(src), &k);
+        const char *shown = loc ? loc : src;
+        char *named = oc_model_mention_display(mdl, shown, strlen(shown));
         size_t body_first = r->n;
-        wrap_push(r, loc ? loc : src, TB_DEFAULT, width, 4);
+        wrap_push(r, named ? named : shown, TB_DEFAULT, width, 4);
+        free(named);
         free(loc);
         free(cov);
         if (!tui_expanded(m->message_id)) {
@@ -465,9 +469,17 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
         if (rr) { memcpy(rr, rl, p); rr[p] = '\0'; rows_push(r, rr, TB_MAGENTA); }
     }
     if (show_replies && m->reply_count > 0) {
-        char rl[64];
-        snprintf(rl, sizeof rl, "    \xe2\x86\xb3 %u %s", m->reply_count,
-                 m->reply_count == 1 ? "reply" : "replies");
+        /* "N replies: Ana, Ben, Cy" -- the most recent repliers, newest first
+         * (REQ-060), by the roster's name, else the one a message carried. */
+        char rl[320];
+        int o = snprintf(rl, sizeof rl, "    \xe2\x86\xb3 %u %s", m->reply_count,
+                         m->reply_count == 1 ? "reply" : "replies");
+        uint8_t nr = m->n_repliers > OC_THREAD_REPLIERS_MAX ? OC_THREAD_REPLIERS_MAX : m->n_repliers;
+        for (uint8_t k = 0; k < nr && o > 0 && (size_t)o < sizeof rl; k++) {
+            const char *nm = oc_model_user_name(mdl, m->repliers[k]);
+            if (!nm || !nm[0]) nm = ch ? name_for(ch, m->repliers[k]) : "someone";
+            o += snprintf(rl + o, sizeof rl - (size_t)o, "%s%s", k ? ", " : ": ", nm);
+        }
         char *rr = malloc(strlen(rl) + 1);
         if (rr) { strcpy(rr, rl); rows_push(r, rr, TB_CYAN); }
     }
@@ -479,7 +491,7 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
  * reached the last message. */
 static void build_rows(rows_t *r, const oc_model *m, const oc_channel *ch, uint64_t me, int width) {
     for (size_t i = 0; i < ch->n_msgs; i++)
-        append_msg_rows(r, &ch->msgs[i], me, width, ch, 1, (int)i);
+        append_msg_rows(r, m, &ch->msgs[i], me, width, ch, 1, (int)i);
     if (ch->n_msgs == 0 || !oc_model_receipts_on(m)) return;   /* the workspace has none (REQ-090) */
     uint64_t last = ch->msgs[ch->n_msgs - 1].message_id;
     char names[192]; size_t p = 0; int shown = 0;
@@ -563,11 +575,11 @@ static void build_thread_rows(rows_t *r, const oc_model *m, const oc_channel *ch
                               uint64_t me, int width) {
     if (ch) for (size_t i = 0; i < ch->n_msgs; i++)
         if (ch->msgs[i].message_id == m->thread_parent) {
-            append_msg_rows(r, &ch->msgs[i], me, width, ch, 0, -1);
+            append_msg_rows(r, m, &ch->msgs[i], me, width, ch, 0, -1);
             break;
         }
     for (size_t i = 0; i < m->n_thread_msgs; i++)
-        append_msg_rows(r, &m->thread_msgs[i], me, width, ch, 0, -1);
+        append_msg_rows(r, m, &m->thread_msgs[i], me, width, ch, 0, -1);
 }
 
 /* ---- rendering ------------------------------------------------------------- */

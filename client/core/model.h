@@ -101,6 +101,11 @@ typedef struct {
     uint8_t      edited;      /* body was edited (REQ-051) */
     uint8_t      deleted;     /* tombstoned (REQ-052) */
     uint32_t     reply_count; /* thread replies to this message (REQ-060) */
+    /* Its thread's last reply and most recent distinct repliers, newest first,
+     * from THREAD_META (REQ-060). */
+    uint64_t     last_reply_at;
+    uint8_t      n_repliers;
+    uint64_t     repliers[OC_THREAD_REPLIERS_MAX];
     uint8_t      pinned;      /* pinned to its channel (REQ-230) */
     uint64_t     pinned_by;   /* who pinned it (0 = unknown) */
     uint64_t     pinned_at;
@@ -411,7 +416,7 @@ typedef struct {
     bool     authed;
     uint64_t user_id;                 /* our own id, from AUTH_OK */
     /* Workspace facts from WORKSPACE_INFO (infra config the daemon serves). */
-    uint8_t  deployment_mode;         /* 0 standalone · 1 federated · 2 managed */
+    uint8_t  deployment_mode;         /* 0 self-hosted · 1 managed */
     uint8_t  workspace_mode;          /* OC_WS_MODE_*: a public demo says so (AUTH.md §8.12) */
     uint32_t max_users;               /* 0 = unlimited */
     char     workspace_name[64];      /* "" ⇒ frontend derives from the host subdomain */
@@ -860,8 +865,13 @@ int oc_model_only_via_group(const oc_model *m, uint64_t channel_id, uint64_t use
 const oc_group_view *oc_model_group_by_handle(const oc_model *m, const char *handle);
 int      oc_model_in_group(const oc_group_view *g, uint64_t user_id);
 uint64_t oc_model_via_group(const oc_model *m, uint64_t channel_id, uint64_t user_id);
-/* Does `body` mention this user -- by their name, or by a group they are in
- * (REQ-308)? What a toast and a highlight ask. */
+/* `body` as it is shown: each id-form mention (<@U42>) as '@' and the roster's
+ * name for the id, an id the roster lacks as written (oc_mention_display).
+ * A malloc'd string, or NULL when nothing changed: show `body` as it is. */
+char    *oc_model_mention_display(const oc_model *m, const char *body, size_t len);
+/* Does `body` mention this user -- by their name, by their id in the id form
+ * (<@U42>), or by a group they are in (REQ-308)? What a toast and a highlight
+ * ask. */
 int      oc_model_mentions_me(const oc_model *m, const char *body, size_t len);
 /* The same, for a message whose send the daemon `broadcast_stored` a
  * broadcast mention row for or not (the message's own flag, REQ-221): a
@@ -1329,8 +1339,8 @@ size_t oc_model_invitation_text(const oc_model *m, const char *address, const ch
  * written (truncated to fit `cap`), 0 when there is no reset to describe. */
 size_t oc_model_reset_text(const oc_model *m, const char *address, const char *link, char *out, size_t cap);
 
-/* Workspace facts (WORKSPACE_INFO). deployment mode name: "standalone" /
- * "federated" / "managed". workspace_name is "" until a name is configured. */
+/* Workspace facts (WORKSPACE_INFO). deployment mode name: "self-hosted" or
+ * "managed". workspace_name is "" until a name is configured. */
 uint8_t     oc_model_deployment_mode(const oc_model *m);
 const char *oc_model_deployment_name(const oc_model *m);
 const char *oc_model_workspace_name(const oc_model *m);

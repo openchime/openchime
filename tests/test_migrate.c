@@ -102,7 +102,7 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 70);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed */
+    CHECK(oc_schema_version(db) == 71);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind */
 
     const char *tables[] = { "drafts", "scheduled_messages", "users", "channels", "channel_members",
                              "messages", "sent_messages",
@@ -321,6 +321,25 @@ static void test_identity_copied_before_0064(void) {
 }
 
 /* A database a newer daemon wrote is refused before anything is written. */
+/* 0071: every existing row is a person, and a kind outside the four is
+ * refused. */
+static void test_user_kind(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 70, &err) == SQLITE_OK);
+    CHECK(sqlite3_exec(db, "INSERT INTO users(id,subject,created_at_ms) VALUES"
+                           "(1,'local:dana',1),(2,'oidc:x|y',2);", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM users WHERE kind='human';") == 2);
+    CHECK(sqlite3_exec(db, "INSERT INTO users(subject,created_at_ms,kind) VALUES"
+                           "('visitor:a',3,'visitor'),('agent:b',4,'agent'),('bot:c',5,'bot');",
+                       NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(sqlite3_exec(db, "INSERT INTO users(subject,created_at_ms,kind) VALUES('x:d',6,'robot');",
+                       NULL, NULL, NULL) != SQLITE_OK);
+    CHECK(sqlite3_exec(db, "UPDATE users SET kind=NULL WHERE id=1;", NULL, NULL, NULL) != SQLITE_OK);
+    sqlite3_close(db);
+}
+
 static void test_newer_database_refused(void) {
     sqlite3 *db = open_mem();
     char *err = NULL;
@@ -347,6 +366,7 @@ int run_migrate_tests(void) {
     test_identity_moves_out();
     test_kept_identity_wins();
     test_identity_copied_before_0064();
+    test_user_kind();
     test_newer_database_refused();
     return failures;
 }

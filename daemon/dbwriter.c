@@ -346,6 +346,15 @@ static void free_attach_meta(oc_attach_meta *a, size_t n) {
  * the defect class this replay exists to prevent, reintroduced by a second
  * copy that was never written. One filler, both callers, as the unfurl fill
  * below already does it. */
+/* Each replayed parent's repliers (THREAD_META, REQ-060), beside its count. */
+static uint8_t thread_repliers(sqlite3 *db, uint64_t root, uint64_t *out);   /* below */
+static void thread_stats(sqlite3 *db, uint64_t root, uint32_t *count, uint64_t *last);   /* below */
+static void fill_replay_repliers(sqlite3 *db, oc_dbres *r) {
+    for (size_t i = 0; i < r->n_replay; i++)
+        if (r->replay[i].reply_count)
+            r->replay[i].n_repliers = thread_repliers(db, r->replay[i].message_id, r->replay[i].repliers);
+}
+
 static void fill_replay_reactions(sqlite3 *db, oc_dbres *r, uint64_t for_user) {
     if (!r->n_replay) return;
     size_t cap = 16, n = 0;
@@ -949,8 +958,9 @@ static oc_dbres *process_welcome_general(sqlite3 *db, const oc_job *j) {
 
 /* True when adding a NEW user `subject` would exceed the cap (AUTH.md §2,
  * OPENCHIME_MANAGED_MAX_USERS). max_users <= 0 is unlimited; an already-existing subject is
- * never capped (idempotent bootstrap / re-login). Counts active users only — a
- * removed member (disabled=1) frees a seat. */
+ * never capped (idempotent bootstrap / re-login). Counts active people only — a
+ * removed member (disabled=1) frees a seat, and a visitor, agent or bot never
+ * takes one (SCHEMA.md §3bj). */
 static int user_slots_full(sqlite3 *db, const char *subject, size_t sublen, int max_users) {
     if (max_users <= 0) return 0;
     sqlite3_stmt *st = NULL;
@@ -960,7 +970,7 @@ static int user_slots_full(sqlite3 *db, const char *subject, size_t sublen, int 
     sqlite3_finalize(st);
     if (exists) return 0;
     int count = 0;
-    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM users WHERE disabled=0 AND is_system=0;", -1, &st, NULL);
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM users WHERE disabled=0 AND is_system=0 AND kind='human';", -1, &st, NULL);
     if (sqlite3_step(st) == SQLITE_ROW) count = sqlite3_column_int(st, 0);
     sqlite3_finalize(st);
     return count >= max_users;
@@ -1423,6 +1433,19 @@ static int user_disabled(sqlite3 *db, uint64_t uid) {
     if (sqlite3_step(st) == SQLITE_ROW) disabled = sqlite3_column_int(st, 0) != 0;
     sqlite3_finalize(st);
     return disabled;
+}
+
+/* Is this user a web visitor (SCHEMA.md §3bj)? A visitor reaches nothing but
+ * its own conversation: it is no DM's participant, no channel's invitee and no
+ * group's member, and every refusal reads as an unknown user's does. */
+static int user_is_visitor(sqlite3 *db, uint64_t uid) {
+    sqlite3_stmt *st = NULL;
+    int visitor = 0;
+    sqlite3_prepare_v2(db, "SELECT kind='visitor' FROM users WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    if (sqlite3_step(st) == SQLITE_ROW) visitor = sqlite3_column_int(st, 0) != 0;
+    sqlite3_finalize(st);
+    return visitor;
 }
 
 /* Owners who can still sign in. A removed owner keeps the role on its row, and a
@@ -2794,7 +2817,8 @@ static oc_dbres *process_logout(sqlite3 *db, const oc_job *j) {
 
 /* --- Admin ops (REQ-033, tenant-level; owner/admin) --------------------- */
 
-/* The roster's rows: everyone, or (`only` non-zero) the one user. */
+/* The roster's rows: everyone but visitors (REQ-289; a visitor is no member,
+ * SCHEMA.md §3bj), or (`only` non-zero) the one user. */
 static void user_rows(sqlite3 *db, uint64_t only, oc_dbres *r) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
@@ -2802,7 +2826,7 @@ static void user_rows(sqlite3 *db, uint64_t only, oc_dbres *r) {
         "       COALESCE(avatar_attachment_id,0), COALESCE(title,''), COALESCE(timezone,''), "
         "       COALESCE(status_emoji,''), COALESCE(status_text,''), status_expires_ms, "
         "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(voice_id,''), is_system "
-        "FROM users WHERE ?1 = 0 OR id = ?1 ORDER BY id;", -1, &st, NULL);
+        "FROM users WHERE (?1 = 0 AND kind <> 'visitor') OR id = ?1 ORDER BY id;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)only);
     size_t cap = 8, n = 0;
     oc_user_row *arr = malloc(cap * sizeof *arr);
@@ -3385,7 +3409,7 @@ static oc_dbres *process_store_identity(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-/* Load the persisted federated-enrollment identity (ARCH-84); enroll_present=0 when
+/* Load the persisted enrollment identity (ARCH-84); enroll_present=0 when
  * none is stored yet (first run). */
 static oc_dbres *process_load_enrollment(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
@@ -4053,7 +4077,9 @@ static oc_dbres *process_group_members(sqlite3 *db, const oc_job *j, int add) {
         uint64_t uid = j->grp_uids[i];
         sqlite3_stmt *st = NULL;
         if (add) {
-            if (user_disabled(db, uid)) continue;
+            /* A removed member, or a visitor, who would gain channels through
+             * the group (SCHEMA.md §3bj), is not added. */
+            if (user_disabled(db, uid) || user_is_visitor(db, uid)) continue;
             uint8_t role;
             if (!user_role(db, uid, &role)) continue;          /* no such person: nothing to add */
             sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO user_group_members(group_id,user_id,added_at_ms) "
@@ -4494,6 +4520,8 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
         }
     }
 
+    uint64_t named[OC_MENTION_MAX];
+    size_t n_named = 0;
     for (size_t i = 0; i < n; i++) {
         int64_t uid = 0;
         /* A group's handle first (REQ-308): it wins a clash with a person's
@@ -4503,7 +4531,7 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
          * mentions, not this one. Who it cannot reach is told to the sender as
          * a person not in the channel is (REQ-287), and in a public channel
          * still gets the mention (REQ-288). */
-        uint64_t gid = m[i].kind == OC_MENTION_USER ? group_by_handle(db, m[i].name) : 0;
+        uint64_t gid = m[i].kind == OC_MENTION_USER && !m[i].user_id ? group_by_handle(db, m[i].name) : 0;
         if (gid) {
             oc_group_row g;
             if (!load_group(db, gid, &g)) continue;
@@ -4556,30 +4584,38 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
             continue;
         if (m[i].kind == OC_MENTION_USER) {
             /* Match the display name case-insensitively among this channel's
-             * members. Membership is asked first regardless of channel kind,
-             * because "are they in it" is also what REQ-287 reports. */
+             * members -- or, for the id form (<@U42>), the id itself, under
+             * the same rules. Membership is asked first regardless of channel
+             * kind, because "are they in it" is also what REQ-287 reports. */
             sqlite3_stmt *q = NULL;
             if (sqlite3_prepare_v2(db,
                     "SELECT u.id FROM users u JOIN channel_members cm ON cm.user_id = u.id "
                     "WHERE cm.channel_id = ?1 AND u.disabled = 0 AND u.is_system = 0 "
-                    "  AND lower(u.display_name) = lower(?2) LIMIT 1;", -1, &q, NULL) != SQLITE_OK)
+                    "  AND (CASE WHEN ?3 <> 0 THEN u.id = ?3 "
+                    "            ELSE lower(u.display_name) = lower(?2) END) LIMIT 1;", -1, &q, NULL) != SQLITE_OK)
                 continue;
             sqlite3_bind_int64(q, 1, (sqlite3_int64)channel_id);
             sqlite3_bind_text(q, 2, m[i].name, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(q, 3, (sqlite3_int64)m[i].user_id);
             if (sqlite3_step(q) == SQLITE_ROW) uid = sqlite3_column_int64(q, 0);
             sqlite3_finalize(q);
             if (!uid) {
                 /* Not a member — but is it a PERSON? A typo and a colleague who
                  * is simply not in this channel look identical from here, and
                  * they are completely different situations for the sender
-                 * (REQ-287). Ask the tenant roster before deciding it was noise. */
+                 * (REQ-287). Ask the tenant roster before deciding it was noise.
+                 * A visitor is not on it (SCHEMA.md §3bj): naming one is noise,
+                 * and says nothing about who writes in through the widget. */
                 uint64_t outsider = 0;
                 sqlite3_stmt *w = NULL;
                 if (sqlite3_prepare_v2(db,
                         "SELECT id, display_name FROM users "
-                        "WHERE disabled = 0 AND is_system = 0 AND lower(display_name) = lower(?1) LIMIT 1;",
+                        "WHERE disabled = 0 AND is_system = 0 AND kind <> 'visitor' "
+                        "  AND (CASE WHEN ?2 <> 0 THEN id = ?2 "
+                        "            ELSE lower(display_name) = lower(?1) END) LIMIT 1;",
                         -1, &w, NULL) == SQLITE_OK) {
                     sqlite3_bind_text(w, 1, m[i].name, -1, SQLITE_STATIC);
+                    sqlite3_bind_int64(w, 2, (sqlite3_int64)m[i].user_id);
                     if (sqlite3_step(w) == SQLITE_ROW) {
                         outsider = (uint64_t)sqlite3_column_int64(w, 0);
                         unreached_add(&unreached, outsider);
@@ -4619,6 +4655,13 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
                 if (outsider && chan_public) uid = (int64_t)outsider;
                 else continue;                     /* private, or not a person: just text */
             }
+            /* One row per person per message, however often and in whichever
+             * form they are named (`@ada` and `<@U42>`): one row is one
+             * notification. */
+            int again = 0;
+            for (size_t q2 = 0; q2 < n_named && !again; q2++) again = named[q2] == (uint64_t)uid;
+            if (again) continue;
+            if (n_named < OC_MENTION_MAX) named[n_named++] = (uint64_t)uid;
         }
         sqlite3_reset(ins);
         sqlite3_bind_int64(ins, 1, (sqlite3_int64)mid);
@@ -5267,6 +5310,21 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
     r->author_id = author;
     r->user_id = j->user_id;   /* deleted_by */
     r->server_time = ts;       /* deleted_at_ms */
+    /* A reply's thread names its repliers afresh, without this one if it was
+     * their only reply (REQ-060): the net thread sends the parent's THREAD_META. */
+    {
+        sqlite3_stmt *pq = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT COALESCE(parent_id,0) FROM messages WHERE id=?1;",
+                               -1, &pq, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(pq, 1, (sqlite3_int64)j->message_id);
+            if (sqlite3_step(pq) == SQLITE_ROW) r->parent_id = (uint64_t)sqlite3_column_int64(pq, 0);
+            sqlite3_finalize(pq);
+        }
+        if (r->parent_id) {
+            thread_stats(db, r->parent_id, &r->reply_count, &r->thread_last_reply_at);
+            r->n_repliers = thread_repliers(db, r->parent_id, r->repliers);
+        }
+    }
     load_members(db, j->channel_id, r);
     return r;
 }
@@ -5700,6 +5758,10 @@ static oc_dbres *process_join_channel(sqlite3 *db, const oc_job *j) {
     if (!is_public && !is_member(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
+    /* A visitor reaches only its own conversation (SCHEMA.md §3bj). */
+    if (user_is_visitor(db, j->user_id)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
     add_membership(db, j->channel_id, j->user_id);
     r->type = OC_RES_CHANNEL_INFO;
     load_channel_info(db, j->channel_id, j->user_id, r);
@@ -5745,8 +5807,10 @@ static oc_dbres *process_invite_channel(sqlite3 *db, const oc_job *j) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
     }
     uint8_t trole = OC_ROLE_MEMBER;
-    if (!user_role(db, j->target_user_id, &trole) || user_disabled(db, j->target_user_id)) {
-        /* unknown or removed target: no disclosure */
+    if (!user_role(db, j->target_user_id, &trole) || user_disabled(db, j->target_user_id) ||
+        user_is_visitor(db, j->target_user_id) || user_is_visitor(db, j->user_id)) {
+        /* unknown or removed target, or a visitor on either side (SCHEMA.md
+         * §3bj): no disclosure */
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
     int was_in = is_member(db, j->channel_id, j->target_user_id);
@@ -5823,6 +5887,11 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
     if (!self_dm && !user_role(db, other, &trole)) {   /* unknown target: no disclosure */
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
+    /* A visitor is nobody's DM, and opens none (SCHEMA.md §3bj): answered as an
+     * unknown target is, so nothing says a visitor is there. */
+    if (user_is_visitor(db, self) || user_is_visitor(db, other)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
 
     /* A DM's IDENTITY is its participant set, stored as `dm_key` under a unique
      * index (migration 0019) — not its membership rows, which anything that
@@ -5896,7 +5965,8 @@ static oc_dbres *process_open_e2e_dm(sqlite3 *db, const oc_job *j) {
     r->ch_peer = j->target_user_id;
     uint64_t self = j->user_id, other = j->target_user_id;
     uint8_t trole = OC_ROLE_MEMBER;
-    if (!other || other == self || !user_role(db, other, &trole) || user_disabled(db, other)) return r;
+    if (!other || other == self || !user_role(db, other, &trole) || user_disabled(db, other) ||
+        user_is_visitor(db, self) || user_is_visitor(db, other)) return r;
     char key[96];
     snprintf(key, sizeof key, "e:%llu,%llu:%llu.%llu",
              (unsigned long long)(self < other ? self : other), (unsigned long long)(self < other ? other : self),
@@ -6177,6 +6247,10 @@ static oc_dbres *process_open_group_dm(sqlite3 *db, const oc_job *j) {
      * because the key must not depend on the order the client listed them in. */
     uint64_t ids[OC_MAX_GROUP_DM + 1];
     int n = 0;
+    /* A visitor opens no DM (SCHEMA.md §3bj). */
+    if (user_is_visitor(db, j->user_id)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
     ids[n++] = j->user_id;
     for (uint16_t i = 0; i < j->n_group_uids && n <= (int)OC_MAX_GROUP_DM; i++) {
         uint64_t u = j->group_uids[i];
@@ -6185,9 +6259,9 @@ static oc_dbres *process_open_group_dm(sqlite3 *db, const oc_job *j) {
         for (int k = 0; k < n; k++) if (ids[k] == u) dup = 1;
         if (dup) continue;
         uint8_t role = OC_ROLE_MEMBER;
-        /* An unknown or disabled user is refused without saying which — the same
-         * no-disclosure rule OPEN_DM follows. */
-        if (!user_role(db, u, &role) || user_disabled(db, u)) {
+        /* An unknown or disabled user, or a visitor, is refused without saying
+         * which — the same no-disclosure rule OPEN_DM follows. */
+        if (!user_role(db, u, &role) || user_disabled(db, u) || user_is_visitor(db, u)) {
             r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
         }
         ids[n++] = u;
@@ -7245,6 +7319,24 @@ static void thread_stats(sqlite3 *db, uint64_t root, uint32_t *count, uint64_t *
     sqlite3_finalize(st);
 }
 
+/* The most recent distinct authors of `root`'s replies that are not deleted,
+ * newest first, at most OC_THREAD_REPLIERS_MAX (REQ-060). A deleted reply is
+ * still counted in the thread's reply count, but names nobody here. */
+static uint8_t thread_repliers(sqlite3 *db, uint64_t root, uint64_t *out) {
+    sqlite3_stmt *st = NULL;
+    uint8_t n = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT author_id FROM messages WHERE parent_id=?1 AND deleted_at_ms IS NULL "
+            " GROUP BY author_id ORDER BY MAX(created_at_ms) DESC, MAX(id) DESC LIMIT ?2;",
+            -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)root);
+    sqlite3_bind_int(st, 2, OC_THREAD_REPLIERS_MAX);
+    while (n < OC_THREAD_REPLIERS_MAX && sqlite3_step(st) == SQLITE_ROW)
+        out[n++] = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
 /* Post a threaded reply (REQ-060). The reply threads under a top-level root
  * (replying to a reply flattens to that reply's root) and is NOT delivered to
  * the channel's main scroll — the net thread fans it out as a THREAD_REPLY.
@@ -7357,7 +7449,8 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
     uint32_t count = 0;
-    thread_stats(db, root, &count, NULL);
+    thread_stats(db, root, &count, &r->thread_last_reply_at);
+    r->n_repliers = thread_repliers(db, root, r->repliers);
     r->type = OC_RES_REPLY_OK;
     r->message_id = mid;
     r->server_time = ts;
@@ -7430,26 +7523,47 @@ static oc_dbres *process_list_thread(sqlite3 *db, const oc_job *j) {
 
 /* Turn arbitrary user input into a safe FTS5 MATCH string: each whitespace-
  * separated token becomes a double-quoted phrase (internal quotes doubled per
- * FTS5), so query punctuation can never trip the FTS5 grammar. Multiple tokens
- * are implicitly ANDed. Returns the token count (0 = nothing to search). */
-static int build_fts_query(const char *in, size_t inlen, char *out, size_t outcap) {
+ * FTS5), so query punctuation can never trip the FTS5 grammar. Tokens are
+ * ANDed. A token that is a person's display name (case-insensitive) also
+ * matches their id-form mentions, `<@U42>`, which FTS5 indexes as the token
+ * `u42` (REQ-221): ("ada" OR "u42"). Returns the token count (0 = nothing to
+ * search). */
+static int build_fts_query(sqlite3 *db, const char *in, size_t inlen, char *out, size_t outcap) {
     size_t o = 0; int tokens = 0; size_t i = 0;
+    sqlite3_stmt *who = NULL;
+    if (db) sqlite3_prepare_v2(db,
+        "SELECT id FROM users WHERE is_system = 0 AND lower(display_name) = lower(?1) LIMIT 1;",
+        -1, &who, NULL);
     while (i < inlen) {
         while (i < inlen && (in[i] == ' ' || in[i] == '\t' || in[i] == '\n' || in[i] == '\r')) i++;
         if (i >= inlen) break;
-        /* One token spans until the next whitespace. */
-        if (o + 2 >= outcap) break;
-        if (tokens > 0) { if (o + 1 >= outcap) break; out[o++] = ' '; }
-        out[o++] = '"';
-        while (i < inlen && in[i] != ' ' && in[i] != '\t' && in[i] != '\n' && in[i] != '\r') {
-            if (in[i] == '"') { if (o + 2 >= outcap) break; out[o++] = '"'; out[o++] = '"'; }
-            else              { if (o + 1 >= outcap) break; out[o++] = in[i]; }
-            i++;
+        size_t s = i;
+        while (i < inlen && in[i] != ' ' && in[i] != '\t' && in[i] != '\n' && in[i] != '\r') i++;
+        uint64_t uid = 0;
+        if (who) {
+            sqlite3_reset(who);
+            sqlite3_bind_text(who, 1, in + s, (int)(i - s), SQLITE_STATIC);
+            if (sqlite3_step(who) == SQLITE_ROW) uid = (uint64_t)sqlite3_column_int64(who, 0);
         }
-        if (o + 1 >= outcap) break;
+        char idtok[32] = "";
+        if (uid) snprintf(idtok, sizeof idtok, " OR \"u%llu\")", (unsigned long long)uid);
+        /* The whole token, its quotes, the joiner and any id part, or none of it. */
+        size_t need = (tokens ? 5 : 0) + (uid ? 1 : 0) + 2 + strlen(idtok) + 1;
+        for (size_t q = s; q < i; q++) need += in[q] == '"' ? 2 : 1;
+        if (o + need >= outcap) break;
+        if (tokens) { memcpy(out + o, " AND ", 5); o += 5; }
+        if (uid) out[o++] = '(';
         out[o++] = '"';
+        for (size_t q = s; q < i; q++) {
+            if (in[q] == '"') out[o++] = '"';
+            out[o++] = in[q];
+        }
+        out[o++] = '"';
+        memcpy(out + o, idtok, strlen(idtok));
+        o += strlen(idtok);
         tokens++;
     }
+    sqlite3_finalize(who);
     out[o < outcap ? o : outcap - 1] = '\0';
     return tokens;
 }
@@ -7467,7 +7581,7 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
 
     char fts[1024];
     int have_text = (j->body && j->body_len > 0 &&
-                     build_fts_query((const char *)j->body, j->body_len, fts, sizeof fts) != 0);
+                     build_fts_query(db, (const char *)j->body, j->body_len, fts, sizeof fts) != 0);
     /* filters alone are a valid search — "everything alice posted in #design"
      * needs no words. Only a query with NEITHER text nor filters is empty. */
     int have_filter = (j->sq_from && j->sq_from[0]) || (j->sq_in && j->sq_in[0]) ||
@@ -7979,6 +8093,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
 
     /* Reactions and unfurls for the window just built. Both are shared with the
      * history page (§6.3), so the two replay paths cannot drift. */
+    fill_replay_repliers(db, r);
     fill_replay_reactions(db, r, j->user_id);
     fill_replay_unfurls(db, r);
     fill_replay_forwards(db, r);
@@ -8123,6 +8238,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     /* The same two fills the reconnect replay runs. Reactions were absent here
      * entirely, which is what made a scroll-back or a permalink render messages
      * permanently without them. */
+    fill_replay_repliers(db, r);
     fill_replay_reactions(db, r, j->user_id);
     fill_replay_unfurls(db, r);
     fill_replay_forwards(db, r);
@@ -8161,8 +8277,15 @@ static oc_dbres *process_typing(sqlite3 *db, const oc_job *j) {
     r->type = OC_RES_TYPING;
     r->channel_id = j->channel_id;
     r->author_id = j->user_id;   /* the user who is typing */
-    if (channel_read_access(db, j->channel_id, j->user_id))
+    if (channel_read_access(db, j->channel_id, j->user_id)) {
         load_members(db, j->channel_id, r);
+        /* A visitor is told nobody is typing (SCHEMA.md §3bj): the relay lists
+         * no visitor, so the team's typing stays the team's. */
+        size_t k = 0;
+        for (size_t i = 0; i < r->n_members; i++)
+            if (!user_is_visitor(db, r->members[i])) r->members[k++] = r->members[i];
+        r->n_members = k;
+    }
     return r;
 }
 
@@ -10336,14 +10459,23 @@ typedef struct { sqlite3 *db; uint64_t channel_id; char name[64]; } speak_names;
 static const char *speak_resolve(void *ctx, const char *name) {
     speak_names *sn = ctx;
     sqlite3_stmt *st = NULL;
+    /* An id-form mention (<@U42>) comes as "U<digits>" (speakable.h). */
+    uint64_t id = 0;
+    if (name[0] == 'U' && name[1]) {
+        const char *p = name + 1;
+        while (*p >= '0' && *p <= '9') p++;
+        if (!*p) id = strtoull(name + 1, NULL, 10);
+    }
     if (sqlite3_prepare_v2(sn->db,
             "SELECT u.display_name FROM users u"
             "  JOIN channel_members cm ON cm.user_id = u.id"
             " WHERE cm.channel_id = ?1 AND u.disabled = 0"
-            "   AND lower(u.display_name) = lower(?2) LIMIT 1;", -1, &st, NULL) != SQLITE_OK)
+            "   AND (CASE WHEN ?3 <> 0 THEN u.id = ?3"
+            "             ELSE lower(u.display_name) = lower(?2) END) LIMIT 1;", -1, &st, NULL) != SQLITE_OK)
         return NULL;
     sqlite3_bind_int64(st, 1, (sqlite3_int64)sn->channel_id);
     sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)id);
     const char *out = NULL;
     if (sqlite3_step(st) == SQLITE_ROW) {
         const unsigned char *dn = sqlite3_column_text(st, 0);
@@ -12295,7 +12427,7 @@ int oc_dbwriter_store_identity(oc_dbwriter *w, const char *cert_pem, const char 
     return 0;
 }
 
-/* Load the persisted federated-enrollment identity (ARCH-84). Returns 1 (+ heap
+/* Load the persisted enrollment identity (ARCH-84). Returns 1 (+ heap
  * privkey/audience/active) if a row exists, else 0. Setup-time only. */
 int oc_dbwriter_load_enrollment(oc_dbwriter *w, char **privkey_out, char **audience_out, int *active_out) {
     *privkey_out = NULL; *audience_out = NULL; *active_out = 0;

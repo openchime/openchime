@@ -875,6 +875,20 @@ static void fanout_members(int ep, conn **conns, const uint64_t *m, size_t n,
     }
 }
 
+/* A parent's THREAD_META to every member, after a reply to it was posted or
+ * deleted (REQ-060): the count, the last reply's time and the repliers, so an
+ * open transcript keeps them without a reload. */
+static void fanout_thread_meta(int ep, conn **conns, const oc_dbres *r) {
+    if (!r->parent_id) return;
+    oc_thread_meta tm = { .message_id = r->parent_id, .reply_count = r->reply_count,
+                          .last_reply_at = r->thread_last_reply_at, .n_repliers = r->n_repliers };
+    memcpy(tm.repliers, r->repliers, sizeof tm.repliers);
+    oc_wbuf w;
+    oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+    if (oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &tm) == OC_OK)
+        fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, w.len);
+}
+
 /* Encode one action entry (REQ-058, ARCH-115) into `w`. */
 static int encode_action_entry(oc_wbuf *w, const struct oc_replay_action *a) {
     oc_action ac = { a->message_id, a->channel_id, a->actor_id,
@@ -6537,6 +6551,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         oc_encode_msg_deleted(&w, OC_PROTOCOL_VERSION, &m);
         size_t blen = w.len;
         fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
+        fanout_thread_meta(ep, conns, r);   /* a reply's: its thread's repliers (REQ-060) */
         break;
     }
     case OC_RES_RESTORE_OK: {
@@ -7168,6 +7183,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                 }
             fanout_actions(ep, conns, r);   /* REQ-058 */
             fanout_polls(ep, conns, r);     /* REQ-225 */
+            fanout_thread_meta(ep, conns, r);   /* the parent's count and repliers (REQ-060) */
             /* And the notify decision, which a reply never produced at all
              * (REQ-061): the root goes with it, so the emitter can notify the
              * thread's PARTICIPANTS and not merely whoever the channel level
@@ -8453,7 +8469,9 @@ static size_t backfill_next(conn *c) {
             oc_replay_msg *m = &r->replay[i];
             c->bf_phase = BF_MSG; c->bf_i = i + 1;
             if (m->reply_count <= 0) continue;
-            oc_thread_meta tm = { m->message_id, m->reply_count, m->last_reply_at };
+            oc_thread_meta tm = { .message_id = m->message_id, .reply_count = m->reply_count,
+                                   .last_reply_at = m->last_reply_at, .n_repliers = m->n_repliers };
+            memcpy(tm.repliers, m->repliers, sizeof tm.repliers);
             oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &tm);
             return w.len;
         }

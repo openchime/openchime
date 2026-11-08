@@ -2207,6 +2207,9 @@ static struct { rectf r; uint64_t mid; char emoji[40]; uint8_t mine; } g_chips[1
 /* The "N replies" row under each thread parent on screen: a click opens the thread. */
 static struct { rectf r; uint64_t mid; } g_rephits[128];
 static int g_n_rephits;
+/* The repliers' faces on those rows, each hovered for the person's name. */
+static struct { rectf r; uint64_t uid; } g_replierhits[128];
+static int g_n_replierhits;
 static int g_n_chips;
 /* A poll's option rows on screen, each pressed to vote, and its "See who
  * voted" link (REQ-225); rebuilt every frame like the chips. */
@@ -2513,7 +2516,7 @@ static char  g_si_fp[96];         /* ... and the fingerprint it published, if an
 static int   g_si_port;
 static char  g_si_err[192];       /* inline error under the active field */
 static int   g_si_remember = 1;   /* gates whether the session token is persisted */
-/* Step 1 has two modes. The default is the hosted case — type just `acme` and
+/* Step 1 has two modes. The default is the managed case — type just `acme` and
  * the field shows a fixed `.openchime.io` suffix, exactly as Slack shows
  * `.slack.com` — because the short name is the common case. "Advanced
  * options" reveals the self-hosted case: a full domain, host:port, or an IP.
@@ -2524,7 +2527,7 @@ static rectf g_si_adv_link;
 static int   g_si_connecting;     /* awaiting auth: fields hidden, spinner text */
 static uint64_t g_si_started;    /* GetTickCount64 when the attempt began */
 static field *g_si_e_ws, *g_si_e_user, *g_si_e_pass;   /* the card's fields */
-static int   g_si_suffix_shown; /* the hosted suffix, drawn beside the field last frame */
+static int   g_si_suffix_shown; /* the managed suffix, drawn beside the field last frame */
 static rectf g_si_btn, g_si_remember_box, g_si_back;   /* hit-boxes */
 /* How the workspace signs people in (AUTH.md §8.1), asked of it at step 1: a
  * password form, a browser button, or both. */
@@ -2561,7 +2564,7 @@ static void signin_set_advanced(oc_win *hwnd, int on);
 static void signin_begin(oc_win *hwnd, const char *ws, const char *user);
 static void signin_poll(oc_win *hwnd);
 static void layout_signin(oc_win *hwnd);
-static int  si_suffix_applies(void);   /* fwd: the hosted suffix beside the field */
+static int  si_suffix_applies(void);   /* fwd: the managed suffix beside the field */
 typedef struct { float x0, y0, w, h, fx, fw, fields_y; } si_geom;
 static si_geom si_layout(float W, float H);
 
@@ -4440,7 +4443,7 @@ static void ws_display_name(const oc_model *m, char *out, size_t cap) {
 }
 
 static void ws_mode_line(const oc_model *m, char *out, size_t cap) {
-    const char *dn = m ? oc_model_deployment_name(m) : "standalone";
+    const char *dn = m ? oc_model_deployment_name(m) : "self-hosted";
     char cap_dn[24]; snprintf(cap_dn, sizeof cap_dn, "%s", dn);
     if (cap_dn[0] >= 'a' && cap_dn[0] <= 'z') cap_dn[0] -= 32;
     uint32_t mu = m ? oc_model_max_users(m) : 0;
@@ -5467,13 +5470,41 @@ static const char *action_line(const oc_msg *msg) {
 }
 
 /* The text of a message as the transcript shows it (tombstone / empty
- * handled). An action shows as its line, and everything that lays a body out,
+ * handled). An action shows as its line, an id-form mention as the person's
+ * name, and everything that lays a body out,
  * hit-tests it, selects in it or copies from it reads this one function, so
  * the positions they trade are the same text's. */
+/* A body with an id-form mention (<@U42>) as it is shown: each as '@' and the
+ * person's name, before anything scans it, so it lays out, highlights, hit-
+ * tests and copies as any @name (MARKDOWN.md §1e). Kept per message like an
+ * action's line, and handed back unchanged while what it shows is the same, so
+ * the pointer stays put; a rename changes what it shows, and so the layout's
+ * signature, which hashes this text. */
+enum { MENT_LINES = 32 };
+static struct { uint64_t mid; char *shown; } g_ment_line[MENT_LINES];
+static unsigned g_ment_next;
+
+static const char *mention_shown(const oc_msg *msg, const char *text) {
+    if (!strstr(text, "<@U")) return text;
+    char *shown = oc_model_mention_display(model(), text, strlen(text));
+    if (!shown) return text;
+    for (unsigned i = 0; i < MENT_LINES; i++)
+        if (g_ment_line[i].shown && g_ment_line[i].mid == msg->message_id &&
+            strcmp(g_ment_line[i].shown, shown) == 0) {
+            free(shown);
+            return g_ment_line[i].shown;
+        }
+    unsigned k = g_ment_next++ % MENT_LINES;
+    free(g_ment_line[k].shown);
+    g_ment_line[k].mid = msg->message_id;
+    g_ment_line[k].shown = shown;
+    return shown;
+}
+
 static const char *body_text(const oc_msg *msg) {
-    if (!msg->deleted && msg->action.present && msg->body) return action_line(msg);
+    if (!msg->deleted && msg->action.present && msg->body) return mention_shown(msg, action_line(msg));
     return msg->deleted ? "(message deleted)"
-         : (msg->body && msg->body[0]) ? msg->body : " ";
+         : (msg->body && msg->body[0]) ? mention_shown(msg, msg->body) : " ";
 }
 
 /* Bytes of body_text that are the actor's name and the space after it: the
@@ -7004,6 +7035,16 @@ static int time_tip_index(void) {
         if (g_kb_mid && g_timehits[i].mid == g_kb_mid) return i;
     return -1;
 }
+/* Hovering a replier's face on a thread's row names them (REQ-060). */
+static void replier_tip_draw(gfx *rt, float W) {
+    for (int i = 0; i < g_n_replierhits; i++) {
+        if (!in_rect(g_replierhits[i].r, g_mouse_x, g_mouse_y) || pointer_blocked()) continue;
+        const char *nm = oc_model_user_name(model(), g_replierhits[i].uid);
+        draw_tip(rt, g_replierhits[i].r, (nm && nm[0]) ? nm : "Someone", "", 0, W);
+        return;
+    }
+}
+
 static void time_tip_draw(gfx *rt, float W) {
     int i = time_tip_index();
     if (i < 0) return;
@@ -7468,22 +7509,47 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
     }
 
     if (msg->reply_count) {
-        /* The thread's row, as Slack draws it: a thread mark, the count in the
-         * link colour, and on hover the row lights and says what a click does.
-         * A click opens the thread (on_click); so does a double-click on the
-         * message itself (on_dblclk). */
+        /* The thread's row, as Slack draws it: the faces of its most recent
+         * repliers (up to three, newest first, each hovered for the name), or
+         * a thread mark when there are none to show; the count in the link
+         * colour; then when the last reply came -- and on hover the row lights
+         * and says what a click does instead. A click opens the thread
+         * (on_click); so does a double-click on the message itself (on_dblclk). */
         char line[64];
         snprintf(line, sizeof line, "%u %s", msg->reply_count, msg->reply_count == 1 ? "reply" : "replies");
         rectf row = rf(tx - UIS(6.0f), by + UIS(2.0f), x0 + content_w + AVA + 12, by + REPLY_ROW_H - UIS(2.0f));
         int hov = in_rect(row, g_mouse_x, g_mouse_y) && !pointer_blocked();
         if (hov) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
         float ic = UIS(16.0f), iy = row.top + ((row.bottom - row.top) - ic) / 2;
-        draw_lucide(rt, OC_ICON_MESSAGE, rf(row.left + UIS(6.0f), iy, row.left + UIS(6.0f) + ic, iy + ic), OC_COL_ACCENT);
-        float lx = row.left + UIS(6.0f) + ic + UIS(6.0f);
+        float lx = row.left + UIS(6.0f);
+        uint8_t nr = msg->n_repliers > OC_THREAD_REPLIERS_MAX ? OC_THREAD_REPLIERS_MAX : msg->n_repliers;
+        if (nr) {
+            float av = UIS(18.0f), ay = row.top + ((row.bottom - row.top) - av) / 2;
+            for (uint8_t k = 0; k < nr; k++) {
+                const char *nm = oc_model_user_name(m, msg->repliers[k]);
+                rectf box = rf(lx, ay, lx + av, ay + av);
+                draw_user_avatar(rt, m, msg->repliers[k], (nm && nm[0]) ? nm : "?", box, g_meta);
+                if (g_n_replierhits < (int)(sizeof g_replierhits / sizeof g_replierhits[0])) {
+                    g_replierhits[g_n_replierhits].r = box;
+                    g_replierhits[g_n_replierhits].uid = msg->repliers[k];
+                    g_n_replierhits++;
+                }
+                lx += av + UIS(3.0f);
+            }
+            lx += UIS(3.0f);
+        } else {
+            draw_lucide(rt, OC_ICON_MESSAGE, rf(lx, iy, lx + ic, iy + ic), OC_COL_ACCENT);
+            lx += ic + UIS(6.0f);
+        }
         draw_text(rt, line, g_ui_b, rf(lx, row.top, row.right, row.bottom), OC_COL_ACCENT);
+        float lw = text_width(line, g_ui_b);
         if (hov) {
-            float lw = text_width(line, g_ui_b);
             draw_text(rt, "View thread", g_meta, rf(lx + lw + UIS(10.0f), row.top, row.right, row.bottom), OC_COL_MUTED);
+        } else if (msg->last_reply_at) {
+            char when[48], last[64];
+            oc_model_time_text(m, (int64_t)msg->last_reply_at, OC_RT_TIME_SHORT, when, sizeof when);
+            snprintf(last, sizeof last, "Last reply %s", when);
+            draw_text(rt, last, g_meta, rf(lx + lw + UIS(10.0f), row.top, row.right, row.bottom), OC_COL_MUTED);
         }
         if (g_n_rephits < (int)(sizeof g_rephits / sizeof g_rephits[0])) {
             g_rephits[g_n_rephits].r = row;
@@ -13118,7 +13184,7 @@ static void draw_signin(gfx *rt, float W, float H) {
             float sw = (g_si_step == 1 && si_suffix_applies()) ? 8 + 7.0f * (float)(strlen(oc_default_suffix()) + 1) : 0;
             if (g_si_e_ws) field_draw(rt, g_si_e_ws, rf(box.left + 12, box.top, box.right - 12 - sw, box.bottom), OC_COL_TEXT);
         }
-        /* Hosted mode: the service suffix is chrome, not something to type --
+        /* Managed mode: the service suffix is chrome, not something to type --
          * and only beside what it would be added to. An address, a port or a
          * dotted name is reached as typed, and the suffix after it read as part
          * of the name. */
@@ -21659,6 +21725,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
     }
     draw_pastechoice(rt, W, H);   /* the paste chooser floats over the field it pastes into */
     if (!modal_open()) time_tip_draw(rt, W);   /* a time token's full date, over what it is in */
+    if (!modal_open()) replier_tip_draw(rt, W);   /* a thread replier's name */
     if (!si_over) draw_modal(rt, m, W, H);  /* your-account surfaces, over a dimmed shell */
     draw_video_overlay(rt, m, W, H);   /* the recording card and the player; menus float above */
     draw_share_full(rt, m, W, H);      /* a shared screen, full screen, when asked for */
@@ -21710,6 +21777,7 @@ static void paint(oc_win *hwnd) {
     g_n_hrx = 0; g_hrx_mid = 0;
     g_caret_placed = 0;
     g_n_timehits = 0;
+    g_n_replierhits = 0;
     g_n_emojiboxes = 0;
     /* The reader's clock, which the model's excerpts use too. */
     if (m) oc_model_set_clock12((oc_model *)m, !g_pref_time24);
@@ -28281,7 +28349,7 @@ static int srch_key(field *f, int key, int ctrl, int shift) {
 
 /* Show or hide the sign-in fields drawn over the chrome draw_signin() paints
  * (layout_signin, below). */
-/* The hosted suffix beside the workspace field: not in advanced mode, and only
+/* The managed suffix beside the workspace field: not in advanced mode, and only
  * beside what it would be added to (oc_workspace_takes_suffix). */
 static void si_get(field *e, char *out, size_t cap);   /* fwd */
 static int si_suffix_applies(void) {
@@ -32018,7 +32086,7 @@ static void signin_back(oc_win *hwnd) {
     invalidate();
 }
 
-/* Switch step 1 between the hosted short-name field and the full-address field.
+/* Switch step 1 between the managed short-name field and the full-address field.
  * The cue banner and the field width change with it; what was typed is kept, so
  * flipping modes to correct a mistake never costs the user their input. */
 static void signin_set_advanced(oc_win *hwnd, int on) {

@@ -175,7 +175,16 @@ static size_t speak(const char *body, size_t len, oc_speak_name_fn resolve, void
             space(&b);
             if (m->kind == OC_MENTION_HERE) puts_(&b, "everyone here");
             else if (m->kind == OC_MENTION_CHANNEL || m->kind == OC_MENTION_EVERYONE) puts_(&b, "everyone");
-            else {
+            else if (m->user_id && m->name[0]) {
+                puts_(&b, m->name);               /* the id form's label */
+            } else if (m->user_id) {
+                /* The id form: the resolver is asked for "U<digits>", which no
+                 * name can be confused with, and says it as written without one. */
+                char id[24];
+                snprintf(id, sizeof id, "U%llu", (unsigned long long)m->user_id);
+                const char *said = resolve ? resolve(ctx, id) : NULL;
+                puts_(&b, said && said[0] ? said : id);
+            } else {
                 const char *said = resolve ? resolve(ctx, m->name) : NULL;
                 puts_(&b, said && said[0] ? said : m->name);
             }

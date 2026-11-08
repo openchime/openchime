@@ -78,6 +78,14 @@ can therefore fail to come up, by design. The packages run
 on install and print what the new daemon would refuse; run the same yourself
 after editing the file, before restarting.
 
+## Push has its own switch
+
+`OPENCHIME_PUSH=on` turns mobile push on, through the OpenChime services at the
+connection's origin (`OPENCHIME_ENROLL_URL`), like the other services
+(CONFIG.md "The OpenChime services"). A box that already sets
+`OPENCHIME_PUSH_URL` needs no change: set alone it still turns push on, and
+beside `OPENCHIME_PUSH=on` it names where push goes.
+
 ## Nothing that ships runs in development mode
 
 There is one build, and the tests run the binary that ships; what keeps a

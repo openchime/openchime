@@ -14,6 +14,8 @@
  *     15:00 UTC";
  *   - a spoiler is said as "spoiler", or "spoiler: Label", never what it hides;
  *   - @someone becomes their display name, through the caller's resolver;
+ *     the id form <@U42> is its label when it has one, else what the resolver
+ *     gives for "U42";
  *     @here is "everyone here", @channel and @everyone "everyone";
  *   - formatting delimiters, list markers and escapes are dropped;
  *   - a quoted line is introduced once per quote with "Quote:";
@@ -31,8 +33,8 @@
 /* The longest speakable text produced; longer bodies are cut at a sentence. */
 #define OC_SPEAK_MAX 4096
 
-/* Resolve a mention's name (as written, no '@') to what should be said, or NULL
- * to say the name as written. */
+/* Resolve a mention's name (as written, no '@'), or an id-form mention's id as
+ * "U<digits>", to what should be said, or NULL to say it as written. */
 typedef const char *(*oc_speak_name_fn)(void *ctx, const char *name);
 
 /* Write the speakable form of `body` (`len` bytes) into `out` (`cap` bytes,

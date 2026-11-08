@@ -102,8 +102,9 @@ const cfg_row OC_CFG[] = {
            "Summaries (REQ-310): `off`, `local` (the model runs inside the daemon, fetched on first start), or `cloud:<url>,<model>` (a hosted API's base URL and the model there).",
            cfg_parse_summary, 0),
     STR("OPENCHIME_SUMMARY_API_KEY", CFG_OPERATOR, G_FLAG, "", "The hosted API's key, for `cloud`.", F(summary.api_key), NULL, CFG_SECRET, 0),
-    STR("OPENCHIME_ENROLL_URL", CFG_OPERATOR, G_FLAG, NULL, "The central service to enrol with (ARCH-84), which makes the box federated: https, or http to loopback for a test. Prints an `oce1.` code to the log on first run.", F(enroll.url), NULL, 0, 0),
-    STR("OPENCHIME_PUSH_URL", CFG_OPERATOR, G_FLAG, NULL, "The mobile push relay (ARCH-16/85), contentless; needs an enrollment. https, or http to loopback for a test.", F(push.url), NULL, 0, 0),
+    STR("OPENCHIME_ENROLL_URL", CFG_OPERATOR, G_FLAG, NULL, "Connects this box to the OpenChime services at this origin (ARCH-84); each service is then turned on by its own setting. https, or http to loopback for a test. Prints an `oce1.` code to the log on first run.", F(enroll.url), NULL, 0, 0),
+    ENUM("OPENCHIME_PUSH", CFG_OPERATOR, G_FLAG, "off", "off|on", "Whether mobile push (ARCH-16/85), contentless, goes through the OpenChime services at the connection's origin; needs OPENCHIME_ENROLL_URL.", push.on),
+    STR("OPENCHIME_PUSH_URL", CFG_OPERATOR, G_FLAG, NULL, "Where push goes instead of the connection's origin; set alone, it turns push on. https, or http to loopback for a test.", F(push.url), NULL, 0, 0),
     ENUM("OPENCHIME_INVITE_MAIL", CFG_OPERATOR, G_FLAG, "off", "off|on", "Whether invitations bound to an address are reported to central for it to mail (REQ-280); needs an active enrollment.", invite_mail),
 
     /* --- Managed: set only with the box's ticket (CONFIG.md "A managed box") */
@@ -143,7 +144,7 @@ const cfg_row OC_CFG[] = {
 /* Every name that was a setting and is not: the replacement, or the constant
  * it became. A production value is in config.h. */
 const cfg_removed OC_CFG_REMOVED[] = {
-    { "OPENCHIME_DEPLOYMENT_MODE",   "derived: managed with OPENCHIME_MANAGED_TICKET, federated with OPENCHIME_ENROLL_URL, else standalone" },
+    { "OPENCHIME_DEPLOYMENT_MODE",   "derived: managed with OPENCHIME_MANAGED_TICKET, else self-hosted" },
     { "OPENCHIME_DB_PATH",           "the database is openchime.db under OPENCHIME_DATA_DIR" },
     { "OPENCHIME_BLOB_DIR",          "attachments are blobs/ under OPENCHIME_DATA_DIR" },
     { "OPENCHIME_TLS_CERT",          "cert.pem under OPENCHIME_DATA_DIR" },

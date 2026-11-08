@@ -732,7 +732,7 @@ name already holds. **Remember me** governs the session, not the trust: off
 and a certificate the person trusted still is — it is not a secret, and without it
 they would be asked about the same certificate every time (ARCH-10).
 
-**A workspace that moved is re-filed.** A hosted workspace can change its address,
+**A workspace that moved is re-filed.** A managed workspace can change its address,
 and answers at the former one for a while. Its daemon says where it is now
 (`WORKSPACE_ADDRESS`); when that is another key, the net thread moves what is kept
 to it (`oc_workspace_move`, which adopts as above), shows the new address in the

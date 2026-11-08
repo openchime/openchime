@@ -12,7 +12,7 @@ persisted server TLS identity; **0009** (§3g) attachments; **0010–0011** (§3
 incoming webhooks and the message display-name override; **0012** (§3j)
 notification preferences and the DND window; **0013** (§3k) synced client
 settings; **0014–0015** attachment tombstones and reclaim reason; **0016** (§3l)
-the audit log; **0017** (§3m) federated enrollment; **0018** (§3n) push device
+the audit log; **0017** (§3m) enrollment; **0018** (§3n) push device
 tokens; **0019** (§3o) the DM participant-set key; **0020** (§3p) the
 unique channel name; **0021** (§3q) resolved @mentions; **0022** (§3r) pinned messages; **0023** (§3s) the channel-files index; **0024** (§3t) channel topic + archive; **0025** (§3u) saved items;
 **0026** (§3v) channel mute + the delivery-cursor index; **0027** (§3w) profile
@@ -97,7 +97,7 @@ Foreign keys are declared for integrity; the daemon runs with
 ### `users`
 A tenant user, provisioned by **either** auth mode (REQ-023) — `subject` is the
 unique identity key, namespaced by source: `local:<username>` or
-`oidc:<issuer>|<sub>` (ARCH-19). `id` is the tenant-local
+`oidc:<issuer>|<sub>` (ARCH-19), or `visitor:<opaque>` for a web visitor (§3bj). `id` is the tenant-local
 `user_id` carried in `AUTH_OK` and `BROADCAST.author_id`. Columns added by later
 migrations (0002, 0003, 0012/0033/0034, 0025, 0027, 0028, 0039, 0042) are
 documented in their own sections below.
@@ -583,9 +583,9 @@ moderation actions, account changes) for owner/admin review — never message co
 - Indexes on `(family, at_ms)` and `(at_ms)`. Entries age out after 365 days on the
   maintenance pass, family by family (ARCH-79); the read path pages newest-first.
 
-## 3m. Migration 0017 — federated enrollment (ARCH-84)
+## 3m. Migration 0017 — enrollment (ARCH-84)
 
-A single-row table holding the box's enrollment identity, so an enrolled/federated box
+A single-row table holding the box's enrollment identity, so an enrolled box
 keeps its audience + key across restarts (the same key-survival pattern as the TLS
 identity, ARCH-66b).
 
@@ -1880,3 +1880,24 @@ collapse and expand themselves; *read* by backfill, which replays the
 requester's own as `COLLAPSED_UPDATED`. A delete removes the message's rows with
 its body, and the purge of a channel clears them as it clears every table
 holding a `message_id`.
+
+## 3bj. Migration 0071 — the kind of principal
+
+```sql
+ALTER TABLE users ADD COLUMN kind TEXT NOT NULL DEFAULT 'human'
+  CHECK (kind IN ('human','agent','bot','visitor'));
+```
+
+*What a user row is.* Every row before this is a person and reads `human`. A
+**web visitor** is a row with `kind` `visitor` and `subject` `visitor:<opaque>`:
+someone outside the workspace writing through the embeddable widget. Its
+membership is its only authority, and it reaches nothing but its own
+conversation. It takes no seat (the user cap counts `human` only, AUTH.md §2),
+`LIST_USERS` leaves it out, nobody can open a DM with it or put it in a channel
+or a user group, and it is never a mention's target or a typing relay's
+recipient.
+
+*`agent` and `bot` are allowed now*, though nothing creates either yet: the
+agent and bot principals use this column, and SQLite cannot widen a CHECK
+without rebuilding `users`. The cap counts `human` only, so neither takes a
+seat.

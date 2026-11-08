@@ -1590,7 +1590,13 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             oc_thread_meta tm;
             if (oc_decode_thread_meta(&p, &tm) == OC_OK) {
                 oc_ev *e = oc_ev_new(OC_EV_THREAD_META);
-                if (e) { e->message_id = tm.message_id; e->count = tm.reply_count; oc_queue_push(to_ui, e); }
+                if (e) {
+                    e->message_id = tm.message_id; e->count = tm.reply_count;
+                    e->server_time = tm.last_reply_at;
+                    e->n_repliers = tm.n_repliers;
+                    memcpy(e->repliers, tm.repliers, sizeof e->repliers);
+                    oc_queue_push(to_ui, e);
+                }
             }
         } else if (hdr.msg_type == OC_MSG_SEARCH_RESULTS) {
             oc_search_result_entry se[64]; uint16_t count = 0; uint8_t trunc = 0;

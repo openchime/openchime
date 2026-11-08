@@ -782,9 +782,8 @@ uint64_t oc_model_listen_take_audio(oc_model *m, uint8_t **mp4, size_t *len) {
 }
 const char *oc_model_deployment_name(const oc_model *m) {
     switch (m->deployment_mode) {
-        case 1:  return "federated";
-        case 2:  return "managed";
-        default: return "standalone";
+        case 1:  return "managed";
+        default: return "self-hosted";
     }
 }
 
@@ -1353,6 +1352,26 @@ static void bump_reply_count(oc_model *m, uint64_t message_id, uint32_t count) {
             }
 }
 
+/* A THREAD_META: the parent's count, last reply and repliers (REQ-060), taken
+ * as they stand unless they are older than what the model holds. A backfill's
+ * frame can arrive after a live one; a reply only ever adds to the count or
+ * moves the last reply on, and a delete leaves both as they are, so a frame
+ * with a lower count or an earlier last reply is the stale one. */
+static void set_thread_meta(oc_model *m, const oc_ev *e) {
+    for (size_t ci = 0; ci < m->n_channels; ci++)
+        for (size_t i = 0; i < m->channels[ci].n_msgs; i++) {
+            oc_msg *msg = &m->channels[ci].msgs[i];
+            if (msg->message_id != e->message_id) continue;
+            if (e->count < msg->reply_count ||
+                (e->count == msg->reply_count && e->server_time < msg->last_reply_at)) return;
+            msg->reply_count = e->count;
+            msg->last_reply_at = e->server_time;
+            msg->n_repliers = e->n_repliers > OC_THREAD_REPLIERS_MAX ? OC_THREAD_REPLIERS_MAX : e->n_repliers;
+            memcpy(msg->repliers, e->repliers, sizeof msg->repliers);
+            return;
+        }
+}
+
 /* Append an attachment to a message, deduped by id. Frees nothing; the caller
  * owns the source strings (copied in). */
 static void msg_add_attach(oc_msg *msg, const oc_ev *e) {
@@ -1528,6 +1547,8 @@ int oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_stored,
     const char *me = oc_model_user_name(m, m->user_id);
     for (size_t i = 0; i < n; i++) {
         if (mm[i].kind != OC_MENTION_USER) { bc = 1; continue; }
+        /* The id form (<@U42>) names whoever the id is; its label is no name. */
+        if (mm[i].user_id) { if (m->user_id && mm[i].user_id == m->user_id) return 1; continue; }
         if (me && me[0] && name_eq(mm[i].name, me)) return 1;
         for (size_t k = 0; k < m->n_groups; k++)
             if (oc_model_in_group(m->groups[k], m->user_id) && name_eq(mm[i].name, m->groups[k]->handle))
@@ -1538,11 +1559,24 @@ int oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_stored,
 
 int oc_model_mentions_me(const oc_model *m, const char *body, size_t len) {
     if (!m || !body) return 0;
-    if (oc_mention_targets(body, len, oc_model_user_name(m, m->user_id))) return 1;
+    if (oc_mention_targets(body, len, oc_model_user_name(m, m->user_id), m->user_id)) return 1;
     for (size_t i = 0; i < m->n_groups; i++)
-        if (oc_model_in_group(m->groups[i], m->user_id) && oc_mention_targets(body, len, m->groups[i]->handle))
+        if (oc_model_in_group(m->groups[i], m->user_id) && oc_mention_targets(body, len, m->groups[i]->handle, 0))
             return 1;
     return 0;
+}
+
+/* The roster's name for an id-form mention, or NULL for an id it lacks. */
+static const char *mention_roster_name(void *ctx, uint64_t user_id) {
+    const oc_model *m = ctx;
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == user_id) return m->users[i].name[0] ? m->users[i].name : NULL;
+    return NULL;
+}
+
+char *oc_model_mention_display(const oc_model *m, const char *body, size_t len) {
+    if (!m || !body) return NULL;
+    return oc_mention_display(body, len, mention_roster_name, (void *)m);
 }
 
 /* Take a GROUP event's group into the model, replacing the one with its id. */
@@ -2768,7 +2802,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (e->parent_id == m->thread_parent) m->thread_replay = 0;
         break;
     case OC_EV_THREAD_META:
-        bump_reply_count(m, e->message_id, e->count);
+        set_thread_meta(m, e);
         break;
     case OC_EV_SEARCH_RESULT:
         if (m->search_open) {

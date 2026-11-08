@@ -45,11 +45,11 @@ The daemon hands every message to one provider, chosen by the operator:
 |---|---|---|
 | `none` | sends nothing; the features that need mail say so (§2) | any box; **proposed** as the default off a managed box |
 | `null` | accepts every message and drops it | any box; for building and testing everything else without a mail system |
-| `openchime` | relays each message to central, signed with the enrollment key over the transport push already uses (ARCH-84/85) | a managed or federated box with an active enrollment; the only provider on a managed box |
+| `openchime` | relays each message to central, signed with the enrollment key over the transport push already uses (ARCH-84/85) | a managed or connected self-hosted box with an active enrollment; the only provider on a managed box |
 
 A provider that delivers without central — the operator's own relay — is a
-later addition behind the same interface; until there is one, a stand-alone box
-sends no notification email (REQ-280).
+later addition behind the same interface; until there is one, a box that is not
+connected sends no notification email (REQ-280).
 
 **The interface (proposed).** A provider is a small table of functions:
 `send` takes one message (§5) and answers *sent*, *retry later* or *refused*;
@@ -139,7 +139,7 @@ Every link in a notification email goes through central:
    points at.
 3. The page at that link opens the **installed app** at the workspace, found by
    its id, and failing that the **web client** at the workspace's address. A
-   federated workspace's address is the one central recorded at enrollment,
+   self-hosted workspace's address is the one central recorded at enrollment,
    after the daemon proved it holds the workspace's key; a managed one's is
    central's own record. So a link can only open the workspace that sent it.
 

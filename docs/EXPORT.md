@@ -118,7 +118,7 @@ Every message in an exported channel, thread replies included.
 | `channel` | The channel it is in. | `messages.channel_id` |
 | `author` | Who sent it. | `messages.author_id` |
 | `created_ms` | When the daemon accepted it; an edit does not change it. | `messages.created_at_ms` |
-| `body` | The text as typed, its formatting marks and `@names` as written (MARKDOWN.md), or `null` for a deleted message. | `messages.body` |
+| `body` | The text as typed, its formatting marks and `@names` as written (MARKDOWN.md), or `null` for a deleted message. A mention by id, `<@U<id>>` or `<@U<id>\|label>` (MARKDOWN.md §1e), names the user whose `id` in `users.jsonl` is `<id>`. | `messages.body` |
 | `edited_ms` | When it was last edited; `null` if never. | `messages.edited_at_ms` |
 | `thread_root` | The top-level message it replies to; `null` for a top-level message. | `messages.parent_id` |
 | `kind` | `message`, or `call` for the record the daemon writes of a missed call. | derived: `messages.kind` (`0`, `1`) |

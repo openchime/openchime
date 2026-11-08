@@ -414,7 +414,7 @@ typedef struct oc_job {
     char          *key_pem;    /* heap */
     struct oc_tls_state *tls_state;   /* heap: STORE_ACME_ACCOUNT, STORE_TLS_CERT */
 
-    /* STORE_ENROLLMENT (ARCH-84): the federated keypair + audience + state. */
+    /* STORE_ENROLLMENT (ARCH-84): the enrollment keypair + audience + state. */
     char          *enroll_privkey;   /* heap */
     char          *enroll_audience;  /* heap */
     int            enroll_active;
@@ -998,6 +998,9 @@ typedef struct {
     size_t   body_len;
     uint32_t reply_count;
     uint64_t last_reply_at;
+    /* Its most recent distinct repliers, newest first (THREAD_META, REQ-060). */
+    uint8_t  n_repliers;
+    uint64_t repliers[OC_THREAD_REPLIERS_MAX];
     oc_attach_meta attach[OC_MAX_ATTACH];  /* linked attachments (REQ-140) */
     size_t         n_attach;
     char    *author_name;  /* heap; override display name (webhooks), else NULL */
@@ -1249,6 +1252,12 @@ typedef struct oc_dbres {
      * THREAD carries the reply list. */
     uint64_t        parent_id;
     uint32_t        reply_count;
+    /* The parent's thread as it now stands, for the live THREAD_META a posted
+     * or deleted reply sends (REQ-060). A DELETE_OK of a top-level message
+     * leaves parent_id 0 and sends none. */
+    uint64_t        thread_last_reply_at;
+    uint8_t         n_repliers;
+    uint64_t        repliers[OC_THREAD_REPLIERS_MAX];
     oc_replay_msg  *thread;         /* heap array; THREAD replies */
     size_t          n_thread;
 
@@ -1605,7 +1614,7 @@ void oc_dbwriter_store_acme_account(oc_dbwriter *w, const char *directory, const
 void oc_dbwriter_store_tls_cert(oc_dbwriter *w, const char *source, const char *names, const char *chain_pem,
                                 const char *key_pem, uint64_t issued_ms, uint64_t not_after_ms);
 
-/* Federated enrollment persistence (ARCH-84), setup-time only. Load returns 1 and
+/* Enrollment persistence (ARCH-84), setup-time only. Load returns 1 and
  * heap-allocates privkey_pem + audience (caller frees) + *active when a row
  * exists, else 0. Store persists the keypair + audience + state; returns 1 on
  * success. */
@@ -1619,7 +1628,7 @@ void oc_dbwriter_note_enrollment_active(oc_dbwriter *w, const char *privkey_pem,
 /* A managed workspace's welcome: no message, no system user. With
  * `deployment_mode` OC_DEPLOY_MANAGED (config.h), the first time #general is made
  * it is made with a welcome topic and description naming `workspace_name` (""
- * names none); any other mode does nothing at all. A #general that already
+ * names none); a self-hosted box does nothing at all. A #general that already
  * exists is left as it is, so this runs on every boot. Returns 1 when it wrote
  * the welcome, 0 otherwise. Setup-time only. */
 int oc_dbwriter_welcome_general(oc_dbwriter *w, int deployment_mode, const char *workspace_name);

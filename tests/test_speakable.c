@@ -7,6 +7,7 @@
 
 static const char *names(void *ctx, const char *name) {
     (void)ctx;
+    if (strcmp(name, "U42") == 0) return "Fox Mulder";
     return strcmp(name, "dana") == 0 ? "Dana Scully" : NULL;
 }
 
@@ -18,7 +19,7 @@ static int said(const char *body, const char *want) {
 }
 
 int run_speakable_tests(void) {
-    printf("test_speakable: plain text, formatting, code, links, mentions, quotes, emoji, lines, not renderable, segments, time tokens, spoilers\n");
+    printf("test_speakable: plain text, formatting, code, links, mentions, id-form mentions, quotes, emoji, lines, not renderable, segments, time tokens, spoilers\n");
     CHECK(said("Can you look at the logs?", "Can you look at the logs?"));
     CHECK(said("this is *really* _important_ and ~not~ that", "this is really important and not that"));
     CHECK(said("run `make test` first", "run make test first"));
@@ -97,6 +98,18 @@ int run_speakable_tests(void) {
     CHECK(said("see https://www.github.com/openchime/openchime/pull/285 for it", "see github.com for it"));
     CHECK(said("read [the release notes](https://example.com/notes) today", "read the release notes today"));
     CHECK(said("thanks @dana and @fox", "thanks Dana Scully and fox"));
+    /* The id form: the resolver is asked for "U<digits>"; a label is said as
+     * it is; an id nobody resolves is said as its id. */
+    CHECK(said("thanks <@U42> and <@U42|Fox>", "thanks Fox Mulder and Fox"));
+    CHECK(said("ask <@U7|Walter Skinner> first", "ask Walter Skinner first"));
+    CHECK(said("ask <@U7> first", "ask U7 first"));
+    CHECK(said("<@U42", "<@U42"));
+    {
+        char out[64];
+        oc_speakable("hi <@U42>", 9, NULL, NULL, out, sizeof out);
+        /* contract: with no resolver the id is said as written, READ-ALOUD.md §3 */
+        CHECK(strcmp(out, "hi U42") == 0);
+    }
     CHECK(said("@here standup in 5", "everyone here standup in 5"));
     CHECK(said("@channel heads up", "everyone heads up"));
     CHECK(said("> the old plan\n> was wrong\nagreed", "Quote: the old plan. was wrong. agreed"));
