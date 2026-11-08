@@ -752,6 +752,18 @@ static void test_threads_vertical(int port, const uint8_t *pin) {
     CHECK(trc.participant == 0);
     CHECK(trc.body.len == 11 && memcmp(trc.body.ptr, "first reply", 11) == 0);   /* contract: the test's own input, echoed */
 
+    /* Then every member is sent the parent's THREAD_META (REQ-060): the new
+     * count, the reply's time and who replied, so an open transcript keeps
+     * them without a reload. Read past the reply's ACTION. */
+    client *members[3] = { &a, &b, &d };
+    for (int k = 0; k < 3; k++) {
+        CHECK(read_type(members[k], OC_MSG_THREAD_META, &hdr, &p) == 0);
+        oc_thread_meta tm; memset(&tm, 0, sizeof tm);
+        CHECK(oc_decode_thread_meta(&p, &tm) == OC_OK);
+        CHECK(tm.message_id == mid && tm.reply_count == 1 && tm.last_reply_at == tr.server_time);
+        CHECK(tm.n_repliers == 1 && tm.repliers[0] == ub);
+    }
+
     /* alice opens the thread: the reply is streamed, then a THREAD terminator. */
     oc_wbuf_init(&w, buf, sizeof buf);
     oc_list_thread lt = { 1, mid };
@@ -784,7 +796,7 @@ static void test_threads_vertical(int port, const uint8_t *pin) {
         if (hdr.msg_type == OC_MSG_BROADCAST) { oc_broadcast bx; CHECK(oc_decode_broadcast(&p, &bx) == OC_OK); }
         else if (hdr.msg_type == OC_MSG_THREAD_META) {
             oc_thread_meta tm; CHECK(oc_decode_thread_meta(&p, &tm) == OC_OK);
-            if (tm.message_id == mid) { saw_meta = 1; CHECK(tm.reply_count == 1); }
+            if (tm.message_id == mid) { saw_meta = 1; CHECK(tm.reply_count == 1 && tm.n_repliers == 1 && tm.repliers[0] == ub); }
         } else if (hdr.msg_type == OC_MSG_REACTION_UPDATED) {
             /* A backfill also carries the reaction state of what it replays, so
              * reactions survive a reload on a client that caches nothing. */
@@ -811,6 +823,132 @@ static int next_is_action(client *c, uint64_t mid, uint32_t start, uint32_t len)
     oc_action ac;
     if (oc_decode_action(&p, &ac) != OC_OK) return 0;
     return ac.message_id == mid && ac.text_start == start && ac.text_len == len;
+}
+
+/* Read `c`'s frames up to the answer to a request that must fail (LIST_THREAD
+ * for a message that does not exist): a fence, after which the connection has
+ * been sent everything earlier work produced for it. Returns how many
+ * THREAD_META frames came before the fence, or -1 when the fence never came. */
+static int metas_before_fence(client *c) {
+    uint8_t buf[64]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_list_thread lt = { 1, 0x7FFFFFFFFFFFull };
+    if (oc_encode_list_thread(&w, OC_PROTOCOL_VERSION, &lt) != OC_OK || send_frame(c, buf, w.len) != 0) return -1;
+    int metas = 0;
+    for (int i = 0; i < 256; i++) {
+        if (read_frame_raw(c, &hdr, &p) != 0) return -1;
+        if (hdr.msg_type == OC_MSG_THREAD_META) metas++;
+        if (hdr.msg_type == OC_MSG_ERROR) return metas;
+    }
+    return -1;
+}
+
+/* The parent's THREAD_META, live (REQ-060): every member of the channel is
+ * sent it after a reply is posted, after the reply's THREAD_REPLY and ACTION,
+ * and after a reply is deleted, after the MSG_DELETED, with the repliers worked
+ * out again. A member of another channel is sent neither, and a top-level
+ * message's delete sends none. */
+static void test_thread_meta_vertical(int port, const uint8_t *pin) {
+    client a, b, cc, r;
+    uint64_t ua = 0, ub = 0, uc = 0, ur = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    CHECK(client_open(&cc, port, pin) == 0 && do_handshake(&cc) == 0 && do_auth(&cc, "carol", "pw", &uc) == 0);
+    /* Someone in the workspace, not in the channel the thread is in. */
+    CHECK(client_open(&r, port, pin) == 0 && do_handshake(&r) == 0 && do_auth(&r, "tm-outsider", "pw-tmo", &ur) == 0);
+    uint8_t buf[256]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+
+    /* Alice's private channel, with Bob and Carol in it. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_channel cch = { oc_slice_str("repliers-room"), 0 };
+    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cch) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    oc_channel_info info; CHECK(oc_decode_channel_info(&p, &info) == OC_OK);
+    uint64_t cid = info.channel_id;
+    const uint64_t invitees[2] = { ub, uc };
+    client *invited[2] = { &b, &cc };
+    for (int k = 0; k < 2; k++) {
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_channel_member_op inv = { cid, invitees[k] };
+        CHECK(oc_encode_invite_to_channel(&w, OC_PROTOCOL_VERSION, &inv) == OC_OK && send_frame(&a, buf, w.len) == 0);
+        CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+        CHECK(read_type(invited[k], OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    }
+
+    /* The parent. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0}; s.channel_id = cid; memset(s.idem, 0x91, OC_IDEM_SIZE);
+    s.body = oc_slice_str("the parent");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_SEND_ACK, &hdr, &p) == 0);
+    oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK);
+    uint64_t root = ack.message_id;
+    CHECK(read_type(&b, OC_MSG_BROADCAST, &hdr, &p) == 0);
+    CHECK(read_type(&cc, OC_MSG_BROADCAST, &hdr, &p) == 0);
+
+    client *members[3] = { &a, &b, &cc };
+    /* A reply from Bob, then one from Carol: each member gets the reply, its
+     * ACTION, and next the parent's THREAD_META, newest replier first. */
+    const uint8_t idem[2] = { 0x92, 0x93 };
+    client *author[2] = { &b, &cc };
+    uint64_t reply[2] = { 0, 0 };
+    for (int n = 0; n < 2; n++) {
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_send_reply sr = {0}; sr.channel_id = cid; memset(sr.idem, idem[n], OC_IDEM_SIZE);
+        sr.parent_id = root; sr.body = oc_slice_str("a reply");
+        CHECK(oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &sr) == OC_OK && send_frame(author[n], buf, w.len) == 0);
+        for (int k = 0; k < 3; k++) {
+            CHECK(read_type(members[k], OC_MSG_THREAD_REPLY, &hdr, &p) == 0);
+            oc_thread_reply tr; memset(&tr, 0, sizeof tr);
+            CHECK(oc_decode_thread_reply(&p, &tr) == OC_OK && tr.parent_id == root);
+            reply[n] = tr.message_id;
+            CHECK(next_is_action(members[k], tr.message_id, 0, 0));
+            CHECK(read_frame_raw(members[k], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_THREAD_META);
+            oc_thread_meta tm; memset(&tm, 0, sizeof tm);
+            CHECK(oc_decode_thread_meta(&p, &tm) == OC_OK);
+            CHECK(tm.message_id == root && tm.reply_count == (uint32_t)(n + 1) && tm.last_reply_at == tr.server_time);
+            if (n == 0) CHECK(tm.n_repliers == 1 && tm.repliers[0] == ub);
+            else        CHECK(tm.n_repliers == 2 && tm.repliers[0] == uc && tm.repliers[1] == ub);
+        }
+    }
+
+    /* Carol deletes hers, her only one: each member gets the MSG_DELETED and
+     * next the parent's THREAD_META, with Carol gone from the repliers. The
+     * count still counts the deleted reply, as it always has. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_delete del = { cid, reply[1] };
+    CHECK(oc_encode_delete(&w, OC_PROTOCOL_VERSION, &del) == OC_OK && send_frame(&cc, buf, w.len) == 0);
+    for (int k = 0; k < 3; k++) {
+        CHECK(read_type(members[k], OC_MSG_MSG_DELETED, &hdr, &p) == 0);
+        oc_msg_deleted md; CHECK(oc_decode_msg_deleted(&p, &md) == OC_OK && md.message_id == reply[1]);
+        CHECK(read_frame_raw(members[k], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_THREAD_META);
+        oc_thread_meta tm; memset(&tm, 0, sizeof tm);
+        CHECK(oc_decode_thread_meta(&p, &tm) == OC_OK);
+        CHECK(tm.message_id == root && tm.reply_count == 2 && tm.n_repliers == 1 && tm.repliers[0] == ub);
+    }
+
+    /* A top-level message's delete is no thread's: no THREAD_META follows. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s2 = {0}; s2.channel_id = cid; memset(s2.idem, 0x94, OC_IDEM_SIZE);
+    s2.body = oc_slice_str("on its own");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s2) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_SEND_ACK, &hdr, &p) == 0);
+    CHECK(oc_decode_send_ack(&p, &ack) == OC_OK);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_delete del2 = { cid, ack.message_id };
+    CHECK(oc_encode_delete(&w, OC_PROTOCOL_VERSION, &del2) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    for (int k = 0; k < 3; k++) {
+        CHECK(read_type(members[k], OC_MSG_MSG_DELETED, &hdr, &p) == 0);
+        CHECK(metas_before_fence(members[k]) == 0);
+    }
+
+    /* The member of another channel was sent none of it. */
+    CHECK(metas_before_fence(&r) == 0);
+
+    client_close(&a);
+    client_close(&b);
+    client_close(&cc);
+    client_close(&r);
 }
 
 /* Actions over the wire (REQ-058, ARCH-115): a send, an edit that makes and
@@ -8164,6 +8302,8 @@ int run_netloop_tests(void) {
     CHECK(oc_dbwriter_register_local(dbw, "roy",       "pw-roy",   OC_ROLE_MEMBER, 2048) != 0);
     g_ned = oc_dbwriter_register_local(dbw, "ned",     "pw-ned",   OC_ROLE_MEMBER, 2048);
     CHECK(oc_dbwriter_register_local(dbw, "sid",       "pw-sid",   OC_ROLE_MEMBER, 2048) != 0);
+    /* In the workspace and out of every channel test_thread_meta_vertical makes. */
+    CHECK(oc_dbwriter_register_local(dbw, "tm-outsider", "pw-tmo", OC_ROLE_MEMBER, 2048) != 0);
     CHECK(g_ned != 0);
     uint64_t flooder = oc_dbwriter_register_local(dbw, "flooder", "pw", OC_ROLE_MEMBER, 2048);
     for (int i = 0; i < 100; i++) {   /* a crowd, for test_login_bound and the groups tests */
@@ -8197,6 +8337,7 @@ int run_netloop_tests(void) {
         test_edit_delete_vertical(arg.port, pin);
         test_channels_vertical(arg.port, pin);
         test_threads_vertical(arg.port, pin);
+        test_thread_meta_vertical(arg.port, pin);
         test_action_vertical(arg.port, pin);
         test_poll_vertical(arg.port, pin);
         test_dm_vertical(arg.port, pin);
