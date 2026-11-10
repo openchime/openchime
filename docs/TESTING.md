@@ -1923,6 +1923,20 @@ under it (the banner's top is the header's bottom); its New message opening
 the New message pane; and a group DM, once opened, showing its own header
 instead. It reads the dump's `hist` line, `header title=... r=... dm_index=...
 new=...`, the `banner ... r=` rectangle and `view=`.
+## Reading the mentions harness
+
+`tools/gui/mentions.sh` drives completion in the composer (REQ-221) over the
+pair (port 9730; on Win32, and in the browser with `tools/gui/run.sh --web
+mentions`). alice types the start of a name and takes the suggestion by Tab,
+by Enter and by a click, and each must leave the whole name and a space in the
+box -- the check a completion that dropped its last character (`@alic`) fails.
+Down then Enter takes the second row; `#gen` and Tab gives `#general `; a
+message sent with a completed mention reaches bob's Activity. After a click the
+draft is written, as after Tab or Enter; the client also saves what the box
+holds on its own, so that check shows the result is kept rather than which
+path marked it. It reads the dump's `ac` line and its `acrow` rows (each row's
+`repl` and rectangle), `composer ... text=`, `drafthere=` and bob's
+`actrows=`. Not in CI, for the smoke's reason.
 
 ## Reading the polls harness
 

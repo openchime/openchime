@@ -24633,6 +24633,13 @@ static int ed_key(oc_win *hwnd, int vk) {
         g_ed_caret = ctrl ? ed_canon(ed_word_right(g_ed_caret)) : ed_step(g_ed_caret, 1);
         moved = 1; break;
     case OCK_UP: case OCK_DOWN: {
+        /* With the completion popover open, Up and Down choose among its rows
+         * (wrapping), as Enter and Tab then take the chosen one. */
+        if (g_n_ac > 0) {
+            g_ac_sel = (g_ac_sel + (vk == OCK_DOWN ? 1 : g_n_ac - 1)) % g_n_ac;
+            invalidate();
+            return 1;
+        }
         /* Vertical movement goes through the LAYOUT, not the buffer: with wrapping,
          * "the line above" is a question only the sdltext layout can answer. */
         st_layout *tl = ed_layout(g_ed_box.right - g_ed_box.left);
@@ -26205,9 +26212,9 @@ static void ac_accept(void) {
     if (caret < 0) { ac_close(); return; }
 
     oc_wch repl[128];
-    int n = to_w(g_ac[g_ac_sel].repl, repl, 126);
+    int n = to_w(g_ac[g_ac_sel].repl, repl, 127);   /* the units, without the NUL */
     if (n <= 0) { ac_close(); return; }
-    repl[n - 1] = u' '; repl[n] = 0;             /* overwrite the NUL with a space */
+    repl[n] = u' '; repl[n + 1] = 0;             /* after the last unit: the space, then the NUL */
 
     ed_replace_range(ts, caret, repl);
     ac_close();
@@ -30047,7 +30054,11 @@ static int on_click(oc_win *hwnd, int x, int y) {
     if (g_n_ac > 0) {
         if (in_rect(g_ac_panel, x, y)) {
             for (int i = 0; i < g_n_ac; i++)
-                if (in_rect(g_ac_rows[i], x, y)) { g_ac_sel = i; ac_accept(); ed_focus(hwnd); break; }
+                if (in_rect(g_ac_rows[i], x, y)) {
+                    /* As Enter and Tab do: the draft changed, so it is saved and measured again. */
+                    g_ac_sel = i; ac_accept(); ed_focus(hwnd); ed_changed(hwnd);
+                    break;
+                }
             return 1;
         }
         ac_close();     /* a click anywhere else dismisses it, then falls through */
@@ -34794,6 +34805,12 @@ static void dump_tables_ui(FILE *f) {
     int nc = 0;
     for (int i = 0; i < g_ed_len; i++) if (ed_is_tab(g_ed[i])) nc++;
     /* The field's text as it reads: each card "[table]", never its pipes. */
+    /* The completion popover: its rows, the chosen one, and where each is, so a
+     * script can take one by Enter, Tab or a click and read what it inserts. */
+    fprintf(f, "ac n=%d sel=%d\n", g_n_ac, g_ac_sel);
+    for (int i = 0; i < g_n_ac; i++)
+        fprintf(f, "  acrow %d repl=\"%s\" r=%.0f,%.0f,%.0f,%.0f\n", i, g_ac[i].repl,
+                g_ac_rows[i].left, g_ac_rows[i].top, g_ac_rows[i].right, g_ac_rows[i].bottom);
     fprintf(f, "composer tables=%d text=", nc);
     {
         static char shown[ED_MAX * 3 + ED_TAB_SLOTS * 8 + 1];
