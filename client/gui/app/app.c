@@ -2606,6 +2606,8 @@ static uint32_t g_err_seq;
 static char g_err_seen[160];                 /* last `last_error` we turned into a toast */
 static rectf g_retry_btn;              /* banner action hit-box */
 static int  g_banner_on;                     /* banner drawn this frame (arms the hit-box) */
+static rectf g_banner_r;                     /* where it was drawn, for the test dump */
+static int  g_test_demo_banner;              /* test hook: the demo notice, without a demo daemon */
 static int  g_banner_action;           /* what the banner's button does (FBA_*) */
 /* The draft a Delete took away, so its toast's Undo can put it back. */
 static struct { uint64_t cid, root; char to[256]; char body[DRAFT_TEXT_MAX * 3]; int valid; } g_undo_draft;
@@ -2717,7 +2719,7 @@ static void toast_tick(const oc_model *m) {
         oc_fb_banner_clear(&g_fb, FBB_CONNECTION);
     }
     /* A public demo says so, all the time it is open (AUTH.md §8.12). */
-    if (m && m->authed && m->workspace_mode == OC_WS_MODE_DEMO)
+    if (m && m->authed && (m->workspace_mode == OC_WS_MODE_DEMO || g_test_demo_banner))
         oc_fb_banner_set(&g_fb, FBB_DEMO, OC_FB_INFO,
                          "This is a public demo: everyone here can read what you post, and it is all erased every night.",
                          NULL, 0);
@@ -11162,9 +11164,47 @@ static void draw_transcript(gfx *rt, const oc_model *m, rectf reg) {
 
 /* ---- header + composer --------------------------------------------------- */
 
+static int dm_index_view(void);   /* fwd */
+static rectf g_dms_new_btn;       /* the DMs list's header: New message */
+static char  g_hdr_title[160];    /* the header as last drawn, for the test dump */
+static rectf g_hdr_r;
+
+/* Back and forward, ahead of a header's title, as a browser's: dimmed while
+ * there is nowhere to go. Returns where the title starts. */
+static float hdr_hist_buttons(gfx *rt, float x0) {
+    float bs = UIS(26), by = (HEADER_H - bs) / 2, bx = x0 + UIS(10);
+    g_hist_back_btn = rf(bx, by, bx + bs, by + bs);
+    g_hist_fwd_btn  = rf(bx + bs + UIS(2), by, bx + 2 * bs + UIS(2), by + bs);
+    for (int k = 0; k < 2; k++) {
+        rectf b = k ? g_hist_fwd_btn : g_hist_back_btn;
+        int can = hist_can(k ? 1 : -1);
+        if (can && in_rect(b, g_mouse_x, g_mouse_y)) fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
+        const char *ar = k ? "\u2192" : "\u2190";
+        float aw = text_width(ar, g_ui), ax = (b.left + b.right - aw) / 2;
+        draw_text(rt, ar, g_ui, rf(ax, b.top, b.right, b.bottom), can ? OC_COL_TEXT : OC_COL_FAINT);
+    }
+    return g_hist_fwd_btn.right + UIS(10);
+}
+
+/* The DMs view's person list has a header of its own -- with none, a banner
+ * sat under an empty strip: its title, back and forward, and New message. None of a conversation's controls, so their hit-boxes go. */
+static void draw_dms_header(gfx *rt, float x0, float w) {
+    g_addppl_btn = g_call_hdr_btn = g_listen_btn = g_members_btn = g_memchip =
+        g_sum_hdr_btn = g_unread_jump = rf(0, 0, 0, 0);
+    float tx = hdr_hist_buttons(rt, x0);
+    float bh = UIS(30), by = (HEADER_H - bh) / 2, right = x0 + w - UIS(16);
+    g_dms_new_btn = rf(right - call_button_w("New message", OC_ICON_SQUARE_PEN), by, right, by + bh);
+    call_button(rt, g_dms_new_btn, OC_ICON_SQUARE_PEN, "New message", 0, 0);
+    draw_text(rt, "Direct messages", g_title, rf(tx, 0, g_dms_new_btn.left - UIS(12), HEADER_H), OC_COL_TEXT);
+    snprintf(g_hdr_title, sizeof g_hdr_title, "Direct messages");
+}
+
 static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
     fill(rt, rf(x0, 0, x0 + w, HEADER_H), OC_COL_HEADER);
     fill(rt, rf(x0, HEADER_H - 1, x0 + w, HEADER_H), OC_COL_BORDER);
+    g_dms_new_btn = rf(0, 0, 0, 0);
+    g_hdr_r = rf(x0, 0, x0 + w, HEADER_H);
+    if (dm_index_view()) { draw_dms_header(rt, x0, w); return; }
     const oc_channel *c = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
     char title[160] = "OpenChime";
     if (c) channel_label(m, c, title, sizeof title);
@@ -11202,6 +11242,7 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         snprintf(t2, sizeof t2, "%s  \u00B7  archived", title);
         snprintf(title, sizeof title, "%s", t2);
     }
+    snprintf(g_hdr_title, sizeof g_hdr_title, "%s", title);
     /* MEASURE the right-hand cluster before drawing the title, and reserve what it
      * actually needs. A flat 240 was fine at 100% and at Largest text left the
      * title a rect narrower than one word — the header rendered as a bare "#",
@@ -11226,18 +11267,7 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
      * is nowhere to go. The title starts after them. */
     float tx = x0 + 20;
     if (c) {
-        float bs = UIS(26), by = (HEADER_H - bs) / 2, bx = x0 + UIS(10);
-        g_hist_back_btn = rf(bx, by, bx + bs, by + bs);
-        g_hist_fwd_btn  = rf(bx + bs + UIS(2), by, bx + 2 * bs + UIS(2), by + bs);
-        for (int k = 0; k < 2; k++) {
-            rectf b = k ? g_hist_fwd_btn : g_hist_back_btn;
-            int can = hist_can(k ? 1 : -1);
-            if (can && in_rect(b, g_mouse_x, g_mouse_y)) fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
-            const char *ar = k ? "\u2192" : "\u2190";
-            float aw = text_width(ar, g_ui), ax = (b.left + b.right - aw) / 2;
-            draw_text(rt, ar, g_ui, rf(ax, b.top, b.right, b.bottom), can ? OC_COL_TEXT : OC_COL_FAINT);
-        }
-        tx = g_hist_fwd_btn.right + UIS(10);
+        tx = hdr_hist_buttons(rt, x0);
     } else {
         g_hist_back_btn = g_hist_fwd_btn = rf(0, 0, 0, 0);
     }
@@ -11488,11 +11518,13 @@ static float draw_tabbar(gfx *rt, const oc_model *m, float x0, float w) {
 static float draw_banner(gfx *rt, const oc_model *m, float x0, float w, float top_off) {
     (void)m;
     g_banner_on = 0;
+    g_banner_r = rf(0, 0, 0, 0);
     const oc_fb_banner *b = oc_fb_banner_top(&g_fb);
     if (!b) return 0;
     uint32_t accent = b->severity == OC_FB_ERROR ? OC_COL_DANGER
                     : b->severity == OC_FB_WARN  ? OC_COL_AWAY : OC_COL_NOTICE;
     rectf r = rf(x0, HEADER_H + top_off, x0 + w, HEADER_H + top_off + BANNER_H);
+    g_banner_r = r;
     fill(rt, r, OC_COL_SIDEBAR);
     fill(rt, rf(x0, r.top, x0 + 3, r.bottom), accent);          /* status edge */
     fill(rt, rf(x0, r.bottom - 1, x0 + w, r.bottom), OC_COL_BORDER);
@@ -21637,21 +21669,23 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
             default:           draw_sidebar(rt, m, H);       break;
         }
         int dm_index0 = dm_index_view();
-        if (!dm_index0) draw_header(rt, m, main_x, main_w);
+        /* A header in every state: the DMs person list draws its own. */
+        draw_header(rt, m, main_x, main_w);
         float th = dm_index0 ? 0 : draw_tabbar(rt, m, main_x, main_w);
         float bh = draw_banner(rt, m, main_x, main_w, th);  /* pushes the transcript down */
-        bh += draw_e2e_strip(rt, m, main_x, main_w, (dm_index0 ? 0 : HEADER_H) + th + bh);   /* and so does this */
+        bh += draw_e2e_strip(rt, m, main_x, main_w, HEADER_H + th + bh);   /* and so does this */
         g_toast_area_l = main_x; g_toast_area_r = main_x + main_w;
-        g_toast_area_t = (dm_index0 ? 0 : HEADER_H) + th + bh;
+        g_toast_area_t = HEADER_H + th + bh;
         {
             /* In the DMs view, the middle column is the PERSON list until a
              * conversation is picked — that is what makes it a destination
              * rather than Home with a section folded. */
             int dm_index = dm_index_view();
             if (dm_index) {
-                if (g_dm_compose) draw_dm_compose(rt, m, rf(main_x, 0, main_r, H - g_composer_h));
-                else overlay_empty(rt, rf(main_x, 0, main_r, H - g_composer_h),
-                                   "Pick a conversation, or start a new one.");
+                /* Under the header and any banner, as a conversation's transcript is. */
+                rectf below = rf(main_x, HEADER_H + th + bh, main_r, H - g_composer_h);
+                if (g_dm_compose) draw_dm_compose(rt, m, below);
+                else overlay_empty(rt, below, "Pick a conversation, or start a new one.");
             } else {
                 draw_transcript(rt, m, rf(main_x, HEADER_H + th + bh, main_r, H - g_composer_h));
             }
@@ -30398,6 +30432,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
         listen_set(hwnd, on ? 0 : 1);
         return 1;
     }
+    if (in_rect(g_dms_new_btn, x, y)) { open_new_message(hwnd); return 1; }
     if (in_rect(g_hist_back_btn, x, y)) { hist_go(-1); return 1; }
     if (in_rect(g_hist_fwd_btn, x, y))  { hist_go( 1); return 1; }
     /* Add people, beside the count: the pane, with the people picker. */
@@ -35337,7 +35372,13 @@ static void test_dump(const char *path) {
                 g_fb.t[i].kind, g_fb.t[i].action, g_fb.t[i].text);
     {
         const oc_fb_banner *bn = oc_fb_banner_top(&g_fb);
-        if (bn) fprintf(f, "banner id=%d severity=%d \"%s\"\n", bn->id, bn->severity, bn->text);
+        if (bn) fprintf(f, "banner id=%d severity=%d \"%s\" r=%.0f,%.0f,%.0f,%.0f\n", bn->id, bn->severity,
+                        bn->text, g_banner_r.left, g_banner_r.top, g_banner_r.right, g_banner_r.bottom);
+        /* The main pane's header: what it is titled and where, and whether it
+         * is the DMs view's person list (dm_index), which has a header of its own. */
+        fprintf(f, "header title=\"%s\" r=%.0f,%.0f,%.0f,%.0f dm_index=%d new=%.0f,%.0f,%.0f,%.0f\n",
+                g_hdr_title, g_hdr_r.left, g_hdr_r.top, g_hdr_r.right, g_hdr_r.bottom, dm_index_view(),
+                g_dms_new_btn.left, g_dms_new_btn.top, g_dms_new_btn.right, g_dms_new_btn.bottom);
     }
     if (g_cmp_hint[0]) fprintf(f, "hint error=%d \"%s\"\n", g_cmp_hint_err, g_cmp_hint);
     /* A voice's audition (REQ-292): whether one is playing, and whether audio
@@ -37052,6 +37093,12 @@ static void test_poll(oc_win *hwnd) {
     } else if (!strcmp(verb, "emoji")) {
         picker_open(hwnd, (uint64_t)strtoull(arg, NULL, 10));
         test_ack("ok");
+    } else if (!strcmp(verb, "banner")) {
+        /* "demo|off": the public demo's notice, as a demo daemon's sign-in
+         * raises it, so a script can see where a banner sits in any view. */
+        g_test_demo_banner = !strcmp(arg, "demo");
+        invalidate();
+        test_ack(!strcmp(arg, "demo") || !strcmp(arg, "off") ? "ok" : "err");
     } else if (!strcmp(verb, "actab")) {
         ac_accept(); test_ack("ok");
     } else if (!strcmp(verb, "search")) {

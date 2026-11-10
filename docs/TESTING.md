@@ -1910,6 +1910,20 @@ to 96 dpi so a scaled display does not make it narrower in layout. It runs on Wi
 in the browser (`tools/gui/run.sh --web reactions`). Not in CI, for the
 smoke's reason.
 
+## Reading the navigation-history harness
+
+`tools/gui/navhistory.sh` (port 9672; on Win32, and in the browser with
+`tools/gui/run.sh --web navhistory`) drives Back and Forward through the places
+you have been: a channel read scrolled up, a permalink away, Alt+Left back to
+the same message, Alt+Right forward, the header's Back button, and a new place
+dropping what was forward. It then opens the DMs view's person list and
+asserts its header: titled "Direct messages" with Back enabled; the demo
+notice, raised by the `banner demo|off` verb without a demo daemon, directly
+under it (the banner's top is the header's bottom); its New message opening
+the New message pane; and a group DM, once opened, showing its own header
+instead. It reads the dump's `hist` line, `header title=... r=... dm_index=...
+new=...`, the `banner ... r=` rectangle and `view=`.
+
 ## Reading the polls harness
 
 `tools/gui/polls.sh` drives polls (REQ-225) over the pair (port 9710; on Win32,
