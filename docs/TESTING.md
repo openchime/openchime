@@ -1624,7 +1624,9 @@ and `sysclip png <path>` put text or a picture on it, `syspaste` presses
 Ctrl+V through Playwright's keyboard so the browser itself pastes, and
 `sysclipread` acks `ok <text>` with what it holds. `tools/gui/uploads.sh`
 uses them on the web: a picture and then text copied outside the client
-paste into the box, and Ctrl+C leaves the box's text on the clipboard. The browser runs with
+paste into the box, Ctrl+C leaves the box's text on the clipboard, and a
+message's Copy text -- reached from the keyboard, Ctrl+Down, Shift+F10 and
+the highlight walked to it -- leaves the message there. The browser runs with
 Chromium's fake camera and microphone, its own permission prompts answered,
 its screen picker choosing the screen; `OPENCHIME_DEV_AUDIO`, `_MIC`,
 `_CAPTURE`, `_TONE` and the other switches reach the page as `?env=`, and a
@@ -1930,7 +1932,10 @@ pair (port 9730; on Win32, and in the browser with `tools/gui/run.sh --web
 mentions`). alice types the start of a name and takes the suggestion by Tab,
 by Enter and by a click, and each must leave the whole name and a space in the
 box -- the check a completion that dropped its last character (`@alic`) fails.
-Down then Enter takes the second row; `#gen` and Tab gives `#general `; a
+Down then Enter takes the second row, and Up from the first wraps to the
+last; `:grin` and Tab gives the whole emoji -- a surrogate pair in the box's
+UTF-16, the case a completion one unit short broke worst -- and a space;
+`#gen` and Tab gives `#general `; a
 message sent with a completed mention reaches bob's Activity. After a click the
 draft is written, as after Tab or Enter; the client also saves what the box
 holds on its own, so that check shows the result is kept rather than which

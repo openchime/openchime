@@ -16,8 +16,8 @@
 #   - Ctrl+V attaches what is not text: a copied file as itself, a copied image
 #     as a PNG chip with its picture, while text still pastes as text. In the
 #     browser, what was copied outside the client: an image, then text, through
-#     the browser's own paste; and Ctrl+C puts the box's text on the browser's
-#     clipboard.
+#     the browser's own paste; and Ctrl+C puts the box's text, and a message's
+#     Copy text puts the message, on the browser's clipboard.
 #
 # Its own daemon on its own port. The last step sends a large file so the bars
 # can be seen moving in the screenshot; that shot is for looking at, and asserts
@@ -163,6 +163,25 @@ say "== copying out of the client"
 copied_out() { "$DRIVE" sysclipread 2>/dev/null | grep -qx 'ack: ok plain words'; }
 check "Ctrl+C in the box leaves its text on the browser's clipboard" waitfor 5 copied_out
 "$DRIVE" key ctrl+a >/dev/null; "$DRIVE" key delete >/dev/null
+# A message's own Copy text, from its menu: Ctrl+Down to the newest message,
+# Shift+F10, the highlight walked to Copy text (command 20), Enter.
+"$DRIVE" send "copy this message" >/dev/null
+sent_it() { snap; grep -q '^  ch 1 .*prev="copy this message"' "$D"; }
+check "the message to copy is there" waitfor 10 sent_it
+"$DRIVE" move 20 20 >/dev/null
+"$DRIVE" key ctrl+down >/dev/null
+hovercmd() { snap; grep -m1 '^kbfocus ' "$D" | grep -o '\bmenuhovercmd=[0-9-]*' | cut -d= -f2; }
+"$DRIVE" key shift+f10 >/dev/null
+sleep 0.5
+found=0
+for _ in $(seq 1 30); do
+  [ "$(hovercmd)" = 20 ] && { found=1; break; }
+  "$DRIVE" key down >/dev/null
+done
+check "its menu offers Copy text" [ "$found" = 1 ]
+"$DRIVE" key enter >/dev/null
+msg_copied() { "$DRIVE" sysclipread 2>/dev/null | grep -qx 'ack: ok copy this message'; }
+check "Copy text leaves the message on the browser's clipboard" waitfor 5 msg_copied
 fi
 
 say "== a large one, to watch (not asserted)"

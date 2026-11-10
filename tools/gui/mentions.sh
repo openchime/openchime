@@ -12,7 +12,10 @@
 #   - after a pick made with the mouse the draft is written, as after Tab or
 #     Enter (the client also saves what the box holds on its own, so this shows
 #     the result is kept rather than which path marked it);
-#   - Down moves the choice to the next row and Enter takes that one;
+#   - Down moves the choice to the next row and Enter takes that one; Up from
+#     the first row wraps to the last;
+#   - an emoji outside the Basic Multilingual Plane (a surrogate pair in the
+#     box's UTF-16) completes whole;
 #   - a channel completes whole too;
 #   - a message sent with a completed mention reaches bob as a mention.
 #
@@ -89,6 +92,25 @@ sel_one() { snap_a; [ "$(ac_sel)" = 1 ]; }
 check "Down moves the choice to the second row" waitfor 5 sel_one
 "$PAIR" a key enter >/dev/null
 check "Enter takes the second: '$second '" waitfor 5 text_is "$second "
+clear_box
+"$PAIR" a typekeys "@" >/dev/null
+waitfor 5 ac_open 2 >/dev/null
+n_rows="$(ac_n)"
+"$PAIR" a key up >/dev/null
+wrapped() { snap_a; [ "$(ac_sel)" = $((n_rows - 1)) ]; }
+check "Up from the first row wraps to the last" waitfor 5 wrapped
+"$PAIR" a key esc >/dev/null
+clear_box
+
+say "== an emoji outside the Basic Multilingual Plane completes whole"
+"$PAIR" a typekeys ":grin" >/dev/null
+waitfor 5 ac_open >/dev/null
+emo="$(ac_repl 0)"
+# Four bytes in UTF-8 is a surrogate pair in the composer's UTF-16.
+wide() { [ "$(printf '%s' "$emo" | od -An -tx1 | tr -d ' \n' | cut -c1-2)" = f0 ]; }
+check "the first suggestion for :grin is a surrogate pair ($emo)" wide
+"$PAIR" a key tab >/dev/null
+check "Tab leaves the whole emoji and a space" waitfor 5 text_is "$emo "
 clear_box
 
 say "== a channel completes whole"
