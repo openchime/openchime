@@ -816,6 +816,7 @@ void oc_model_close_reactlist(oc_model *m) {
     m->n_reactors = m->cap_reactors = 0;
     m->reactlist_open = 0;
     m->reactlist_message = 0;
+    m->reactlist_resend = 0;
 }
 
 void oc_model_reactlist_begin(oc_model *m, uint64_t message_id) {
@@ -2610,6 +2611,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                     break;
                 }
             }
+        }
+        /* The open who-reacted list is a snapshot: a reaction to its message
+         * makes it stale, whoever made it. */
+        if (m->reactlist_open && e->message_id == m->reactlist_message) {
+            m->reactlist_resend = 1;
+            m->reactlist_resend_channel = e->channel_id;
         }
         break;
     }

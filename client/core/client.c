@@ -164,6 +164,11 @@ void oc_client_tick(oc_client *c) {
         oc_model_apply(&c->model, e);
         oc_ev_free(e);
     }
+    if (c->model.reactlist_resend) {
+        c->model.reactlist_resend = 0;
+        if (c->model.reactlist_open && c->model.authed)
+            oc_client_list_reactions(c, c->model.reactlist_resend_channel, c->model.reactlist_message);
+    }
     if (c->model.summary_resend && c->model.authed) {
         c->model.summary_resend = 0;
         if (c->model.summary_open && c->model.summary_loading) summary_send(c);

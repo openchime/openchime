@@ -10895,9 +10895,17 @@ static int g_n_rxn_chip;
  * beside the conversation rather than replacing it. Above them, one chip per
  * distinct emoji with its count: the same chip the message carries, so it can be
  * clicked to add yours or take it back without going back to the message. */
+static uint64_t msg_channel_of(uint64_t mid);   /* fwd */
+
 static void draw_reactors_list(gfx *rt, const oc_model *m, rectf reg) {
     g_n_rxn_chip = 0;
-    if (m->n_reactors == 0) {
+    /* The chips are the message's, as the client knows it now: the list below
+     * is a snapshot the daemon sent, which a reaction made since -- this
+     * client's own included -- does not update, while the message's own
+     * reactions follow every reaction event. The people come from the list. */
+    const oc_msg *rmsg = find_msg(oc_model_channel((oc_model *)m, msg_channel_of(m->reactlist_message)),
+                                  m->reactlist_message);
+    if (m->n_reactors == 0 && !(rmsg && rmsg->n_reactions)) {
         draw_text(rt, "No reactions.", g_meta,
                   rf(reg.left + 16, reg.top + 8, reg.right - 12, reg.top + 30), OC_COL_FAINT);
         return;
@@ -10907,17 +10915,24 @@ static void draw_reactors_list(gfx *rt, const oc_model *m, rectf reg) {
         /* Distinct emoji, in the order they first appear, with how many reacted
          * and whether you are one of them. */
         float cx = reg.left + 14, ch = 24, top = y;
-        for (size_t i = 0; i < m->n_reactors; i++) {
-            const char *e = m->reactors[i].emoji;
+        size_t nsrc = rmsg ? (size_t)rmsg->n_reactions : m->n_reactors;
+        for (size_t i = 0; i < nsrc; i++) {
+            const char *e = rmsg ? rmsg->reactions[i].emoji : m->reactors[i].emoji;
             int seen = 0;
             for (int k = 0; k < g_n_rxn_chip; k++) if (!strcmp(g_rxn_chip[k].emoji, e)) seen = 1;
             if (seen || g_n_rxn_chip >= (int)(sizeof g_rxn_chip / sizeof g_rxn_chip[0])) continue;
             int count = 0, mine = 0;
-            for (size_t j = 0; j < m->n_reactors; j++)
-                if (!strcmp(m->reactors[j].emoji, e)) {
-                    count++;
-                    if (m->reactors[j].user_id == m->user_id) mine = 1;
-                }
+            if (rmsg) {
+                count = (int)rmsg->reactions[i].count;
+                mine = reaction_is_mine(rmsg, e);
+            } else {
+                for (size_t j = 0; j < m->n_reactors; j++)
+                    if (!strcmp(m->reactors[j].emoji, e)) {
+                        count++;
+                        if (m->reactors[j].user_id == m->user_id) mine = 1;
+                    }
+            }
+            if (count <= 0) continue;
             char cnt[16];
             snprintf(cnt, sizeof cnt, "%d", count);
             float cw = 34 + text_width(cnt, g_meta);
@@ -40080,6 +40095,10 @@ int main(int argc, char *argv[]) {
     SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "1");
     if (!SDL_Init(SDL_INIT_VIDEO)) return 1;
     oc_plat_after_sdl_init();
+    /* The quick reactions from the start, the default set until preferences
+     * say otherwise: an account that has never saved any would otherwise have
+     * none, and the hover strip and the menu's emoji row with them. */
+    quick_rebuild();
     g_app_evtype = SDL_RegisterEvents(1);
     /* Created hidden: when auto-connecting it is held back until the settings
      * bucket arrives so it opens where it was left rather than snapping there a

@@ -507,6 +507,11 @@ typedef struct {
      * reactor list. reactlist_open is 0 when no such overlay is open. */
     uint8_t   reactlist_open;
     uint64_t  reactlist_message;
+    /* A reaction to that message arrived after the list was asked for: the
+     * list may have been read before it was stored, so it is asked for again
+     * (oc_client_tick), in the channel the reaction named. */
+    uint8_t   reactlist_resend;
+    uint64_t  reactlist_resend_channel;
     oc_reactor_row *reactors;
     size_t    n_reactors, cap_reactors;
     /* The open "who voted" view (REQ-225), on the who-reacted pattern: the

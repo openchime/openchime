@@ -1893,13 +1893,21 @@ confirmation is always dismissed.
 reaction to join. It asserts a chip per distinct emoji with its count, marked
 when it is yours; that pressing one adds your reaction and pressing it again
 takes it back, with the message agreeing; and that each chip is published to
-assistive technology saying which it would do. The take-back check requires the
+assistive technology saying which it would do. The pane's chips are the
+message's own reactions, which every reaction event updates, so the checks do
+not depend on whether the daemon's list answered before or after the reaction
+was saved. The take-back check requires the
 chip to have BEEN yours, or it would pass on a chip that was never pressed. It
 then covers the strip of quick reactions on the message under the pointer: six
-cells, published to assistive technology, one press to react and another to take
-it back, and gone once the pointer leaves the row. It reads the dump's
+cells on a fixture that has never saved preferences (the client builds the
+default set at start), published to assistive technology, one press to react
+and another to take it back -- each press a check of its own, so a strip with
+no cells fails rather than skipping the press -- and gone once the pointer
+leaves the row. It reads the dump's
 `reactors`, `rxnchip` and `hoverreact` lines. The window is sized wide enough
-for the context pane the list lives in, or nothing draws. Not in CI, for the
+for the context pane the list lives in, or nothing draws, and on Windows pinned
+to 96 dpi so a scaled display does not make it narrower in layout. It runs on Win32 and
+in the browser (`tools/gui/run.sh --web reactions`). Not in CI, for the
 smoke's reason.
 
 ## Reading the polls harness
