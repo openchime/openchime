@@ -14,7 +14,10 @@
 #   - a file that cannot be read stops the post: the chip comes back marked, the
 #     text comes back into the box, and nothing is posted;
 #   - Ctrl+V attaches what is not text: a copied file as itself, a copied image
-#     as a PNG chip with its picture, while text still pastes as text.
+#     as a PNG chip with its picture, while text still pastes as text. In the
+#     browser, what was copied outside the client: an image, then text, through
+#     the browser's own paste; and Ctrl+C puts the box's text on the browser's
+#     clipboard.
 #
 # Its own daemon on its own port. The last step sends a large file so the bars
 # can be seen moving in the screenshot; that shot is for looking at, and asserts
@@ -142,6 +145,24 @@ as_text() { [ "$(tray here)" = 0 ] && grep -Eq '^ed len=11 ' "$D"; }
 check "text still pastes as text, and adds no chip" waitfor 5 as_text
 "$DRIVE" key ctrl+a >/dev/null; "$DRIVE" key delete >/dev/null
 clip "[Windows.Forms.Clipboard]::Clear()"
+else   # the browser's clipboard, set from outside the client as another page or program sets it
+say "== pasting what was copied outside the client"
+# The keyboard's Ctrl+V, through the page: the browser's paste, not the hook's.
+"$DRIVE" sysclip png "$LIN_DIR/up-picture.png" >/dev/null
+"$DRIVE" syspaste >/dev/null
+pasted_image() { [ "$(tray here)" = 1 ] && chip 0 name | grep -Eq '^pasted-image-[0-9]{8}-[0-9]{6}\.png$' && [ "$(chip 0 pic)" = 1 ]; }
+check "a copied image pastes as a PNG with its picture" waitfor 5 pasted_image
+"$DRIVE" send "pasted" >/dev/null
+check "the pasted one lands" waitfor 20 landed
+"$DRIVE" sysclip text 'plain words' >/dev/null
+"$DRIVE" syspaste >/dev/null
+as_text() { [ "$(tray here)" = 0 ] && grep -Eq '^ed len=11 ' "$D"; }
+check "copied text pastes into the box as text, and adds no chip" waitfor 5 as_text
+say "== copying out of the client"
+"$DRIVE" key ctrl+a >/dev/null; "$DRIVE" key ctrl+c >/dev/null
+copied_out() { "$DRIVE" sysclipread 2>/dev/null | grep -qx 'ack: ok plain words'; }
+check "Ctrl+C in the box leaves its text on the browser's clipboard" waitfor 5 copied_out
+"$DRIVE" key ctrl+a >/dev/null; "$DRIVE" key delete >/dev/null
 fi
 
 say "== a large one, to watch (not asserted)"

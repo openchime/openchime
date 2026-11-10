@@ -168,6 +168,44 @@ async function serve(line) {
     writeAck('ok');
     return;
   }
+  // The browser's own clipboard, as another application leaves it and reads
+  // it -- not the client's hook, which would only reach the page's store:
+  //   sysclip text <words>   text on it (`\n` `\t` `\\` escaped, as clipset)
+  //   sysclip png <path>     a PNG of this machine's on it, and nothing else
+  //   syspaste               Ctrl+V as the keyboard sends it, so the browser pastes
+  //   sysclipread            "ok <text>": what is on it now, escaped the same way
+  if (verb === 'sysclip') {
+    const sp2 = arg.indexOf(' '), kind = sp2 < 0 ? arg : arg.slice(0, sp2), rest = sp2 < 0 ? '' : arg.slice(sp2 + 1);
+    await page.bringToFront();
+    if (kind === 'text') {
+      const txt = rest.replace(/\\(.)/g, (m, c) => (c === 'n' ? '\n' : c === 't' ? '\t' : c === 'r' ? '\r' : c));
+      const ok = await page.evaluate((t) => navigator.clipboard.writeText(t).then(() => true, () => false), txt);
+      writeAck(ok ? 'ok' : 'ERR sysclip: the browser refused the text');
+    } else if (kind === 'png' && rest && fs.existsSync(rest)) {
+      const b64 = fs.readFileSync(rest).toString('base64');
+      const ok = await page.evaluate(async (b64) => {
+        const bin = atob(b64), u = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+        try { await navigator.clipboard.write([new ClipboardItem({ 'image/png': new Blob([u], { type: 'image/png' }) })]); return true; }
+        catch (e) { return false; }
+      }, b64);
+      writeAck(ok ? 'ok' : 'ERR sysclip: the browser refused the picture');
+    } else writeAck('ERR sysclip: text <words> | png <path>');
+    return;
+  }
+  if (verb === 'syspaste') {
+    await page.bringToFront();
+    await page.keyboard.press('Control+V');
+    writeAck('ok');   // the client takes it on a frame of its own: poll for what it leads to
+    return;
+  }
+  if (verb === 'sysclipread') {
+    await page.bringToFront();
+    const t = await page.evaluate(() => navigator.clipboard.readText().then((s) => s, () => null));
+    writeAck(t === null ? 'ERR sysclipread: the browser refused'
+                        : 'ok ' + t.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\t/g, '\\t').replace(/\r/g, '\\r'));
+    return;
+  }
   let cmd = line, after = null;
   if ((verb === 'dump' || verb === 'shot' || verb === 'shotfull' || verb === 'ledger') && arg && !arg.includes('/') && !arg.includes('\\')) {
     // A bare name: the file comes out of the page as <dir>/<name>.<ext>.

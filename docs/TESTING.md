@@ -1603,7 +1603,9 @@ writes the verb to `$OC_TEST_DIR/web-<a|b>/cmd` and waits for `ack`, as it
 does with the Windows client's scratch directory; the Node side relays the
 verb to the page's hook, takes a `dump` or `shot` back out of the page's
 filesystem into that directory, and copies an `attach`ed file onto the page
-first so the verb names a path the client can read. One verb is the
+first so the verb names a path the client can read; the shell side waits up
+to 5 minutes for those verbs, rather than 16 seconds, since the copy takes as
+long as the file is large. One verb is the
 browser's own: `press <chord>` (`ctrl+comma`, `ctrl+shift+slash`, `esc`)
 dispatches the page's key events for the chord, every press and release in
 one task, so the client receives them as one batch, the way a quick
@@ -1615,7 +1617,14 @@ time: the client must read a key's modifiers from the key event, not from
 the keyboard's state when it gets to the key, by which time a quick
 Ctrl is already up. `press` acks once the events are dispatched, and the
 script polls the dump for the state each chord leads to, as the smoke's
-`wait_for` does. The browser runs with
+`wait_for` does. Three more are the browser's clipboard, as
+another program leaves and reads it, rather than the page's own store that
+`clipset` and `paste` reach: `sysclip text <words>` (escaped as `clipset`)
+and `sysclip png <path>` put text or a picture on it, `syspaste` presses
+Ctrl+V through Playwright's keyboard so the browser itself pastes, and
+`sysclipread` acks `ok <text>` with what it holds. `tools/gui/uploads.sh`
+uses them on the web: a picture and then text copied outside the client
+paste into the box, and Ctrl+C leaves the box's text on the clipboard. The browser runs with
 Chromium's fake camera and microphone, its own permission prompts answered,
 its screen picker choosing the screen; `OPENCHIME_DEV_AUDIO`, `_MIC`,
 `_CAPTURE`, `_TONE` and the other switches reach the page as `?env=`, and a
@@ -1626,7 +1635,7 @@ installed `google-chrome`).
 **What the ports skip in a browser**, by `PLAT`: UI Automation (`uia_*.ps1`),
 the recording bar's own window and its capture exclusion, a window as a
 recording source (the browser's picker is its own), the clipboard set from
-PowerShell, and the tray's notification counters. Everything else -- the
+PowerShell (the web run sets the browser's with `sysclip` instead), and the tray's notification counters. Everything else -- the
 dumps, the verbs, the media checks down to the tones in the recorded file --
 is the same code.
 

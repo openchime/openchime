@@ -19341,7 +19341,7 @@ static int field_key(field *f, int key, int ctrl, int shift) {
         if (fld_has_sel(f) && !f->password) {
             int a = fld_lo(f), n = fld_hi(f) - a;
             char *s = malloc((size_t)n + 1);
-            if (s) { memcpy(s, f->buf + a, (size_t)n); s[n] = 0; SDL_SetClipboardText(s); free(s); }
+            if (s) { memcpy(s, f->buf + a, (size_t)n); s[n] = 0; oc_plat_clipboard_set_text(s); free(s); }
         }
         if (key == 'X' && fld_has_sel(f)) { fld_del_range(f, fld_lo(f), fld_hi(f)); fld_notify(f); }
         return 1;
@@ -28501,7 +28501,7 @@ static char *g_clip_last;
 static void copy_to_clipboard(oc_win *hwnd, const char *utf8) {
     (void)hwnd;
     if (!utf8) return;
-    SDL_SetClipboardText(utf8);
+    oc_plat_clipboard_set_text(utf8);
     if (g_test_dir[0]) { free(g_clip_last); g_clip_last = strdup(utf8); }
 }
 
@@ -32298,7 +32298,7 @@ static void signin_open_url(const char *url) {
 static void signin_copy_link(void) {
     const oc_model *sm = g_si_client ? oc_client_model(g_si_client) : NULL;
     if (!sm || !sm->signin_url[0]) return;
-    SDL_SetClipboardText(sm->signin_url);
+    oc_plat_clipboard_set_text(sm->signin_url);
     g_si_copied_at = now_ms();
     invalidate();
 }
@@ -37251,7 +37251,8 @@ static void test_poll(oc_win *hwnd) {
         test_unesc(arg, txt, sizeof txt);
         free(g_test_clip_html); g_test_clip_html = NULL;
         g_test_clip_pic = 0;
-        test_ack(SDL_SetClipboardText(txt) ? "ok" : "err");
+        oc_plat_clipboard_set_text(txt);
+        test_ack("ok");
     } else if (!strcmp(verb, "cliphtml")) {
         /* "<html>": what a sheet puts on the clipboard as HTML beside its
          * text, which Paste as Table reads its links and bold from. */
