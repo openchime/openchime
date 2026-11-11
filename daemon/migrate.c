@@ -1264,6 +1264,12 @@ static const char MIGRATION_0070[] =
     "  PRIMARY KEY (user_id, message_id)"
     ");";
 
+static const char MIGRATION_0073[] =
+    /* A thread reply also posted to the channel's main scroll (REQ-062): one
+     * row, flagged, never copied. The main scroll's queries take
+     * `parent_id IS NULL OR also_channel=1`. Every row before this reads 0. */
+    "ALTER TABLE messages ADD COLUMN also_channel INTEGER NOT NULL DEFAULT 0;";
+
 static const char MIGRATION_0071[] =
     /* What kind of principal a user row is. Every row so far is a person
      * ('human'). A web visitor ('visitor') is a row with subject
@@ -1671,6 +1677,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 70, MIGRATION_0070 },
     { 71, MIGRATION_0071 },
     { 72, MIGRATION_0072 },
+    { 73, MIGRATION_0073 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

@@ -2433,7 +2433,9 @@ static void test_index_mentions(void) {
                            /* 0070's collapsed messages. */
                            "DROP TABLE collapsed_messages;"
                            /* 0071's kind of principal. */
-                           "ALTER TABLE users DROP COLUMN kind;",
+                           "ALTER TABLE users DROP COLUMN kind;"
+                           /* 0073's reply also in the channel. */
+                           "ALTER TABLE messages DROP COLUMN also_channel;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -3995,6 +3997,15 @@ static oc_dbres *send_reply(oc_dbwriter *w, uint64_t uid, uint64_t ch, uint64_t 
     return wait_result(w);
 }
 
+static oc_dbres *send_reply_also(oc_dbwriter *w, uint64_t uid, uint64_t ch, uint64_t parent, const char *body) {
+    oc_job *j = oc_job_new(OC_JOB_SEND_REPLY, 120);
+    j->user_id = uid; j->channel_id = ch; j->parent_id = parent; j->also_channel = 1;
+    memset(j->idem, ++g_send_seq, OC_IDEM_LEN);
+    oc_job_set_body(j, body, strlen(body));
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
 static oc_dbres *list_thread_r(oc_dbwriter *w, uint64_t uid, uint64_t ch, uint64_t parent) {
     oc_job *j = oc_job_new(OC_JOB_LIST_THREAD, 121);
     j->user_id = uid; j->channel_id = ch; j->parent_id = parent;
@@ -4393,6 +4404,84 @@ static void test_thread_repliers(void) {
     CHECK(r && r->type == OC_RES_DELETE_OK && r->parent_id == 0 && r->n_repliers == 0);
     oc_dbres_free(r);
 
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* A reply also posted to the channel (REQ-062): one row, in the thread and in
+ * the main scroll's replay and history with its parent, counted once in the
+ * channel list; one without the flag stays in the thread alone. */
+static void test_reply_also_channel(void) {
+    const char *path = tdb("also_channel.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "ac-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "ac-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+    uint8_t idem[OC_IDEM_LEN]; memset(idem, 0xE1, sizeof idem);
+    uint64_t root = send_msg(w, alice, idem, "root");
+    CHECK(root != 0);
+
+    oc_dbres *r = send_reply(w, bob, OC_DEFAULT_CHANNEL, root, "thread only");
+    CHECK(r && r->type == OC_RES_REPLY_OK && r->also_channel == 0);
+    uint64_t plain = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    r = send_reply_also(w, bob, OC_DEFAULT_CHANNEL, root, "both places");
+    CHECK(r && r->type == OC_RES_REPLY_OK && r->also_channel == 1 && r->parent_id == root);
+    CHECK(r && r->n_members == 2);                        /* every member gets the one frame */
+    uint64_t both = r ? r->message_id : 0;
+    oc_dbres_free(r);
+
+    /* One row, never a copy. */
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(raw, "SELECT COUNT(*), SUM(also_channel) FROM messages WHERE parent_id=?1;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)root);
+        CHECK(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 2 && sqlite3_column_int(st, 1) == 1);
+        sqlite3_finalize(st);
+        sqlite3_close(raw);
+    }
+    /* The thread holds both. */
+    r = list_thread_r(w, alice, OC_DEFAULT_CHANNEL, root);
+    CHECK(r && r->n_thread == 2);
+    oc_dbres_free(r);
+    /* The main scroll: the root and the flagged reply, with its parent, in id
+     * order; the plain reply is not there. */
+    r = backfill(w, alice, OC_DEFAULT_CHANNEL, root - 1);
+    int saw_root = 0, saw_both = 0, saw_plain = 0;
+    for (size_t i = 0; r && i < r->n_replay; i++) {
+        if (r->replay[i].message_id == root) saw_root = r->replay[i].parent_id == 0;
+        if (r->replay[i].message_id == both) saw_both = r->replay[i].parent_id == root;
+        if (r->replay[i].message_id == plain) saw_plain = 1;
+    }
+    CHECK(saw_root && saw_both && !saw_plain);
+    oc_dbres_free(r);
+    r = history(w, alice, OC_DEFAULT_CHANNEL, 0, 50);
+    saw_both = saw_plain = 0;
+    for (size_t i = 0; r && i < r->n_replay; i++) {
+        if (r->replay[i].message_id == both) saw_both = r->replay[i].parent_id == root;
+        if (r->replay[i].message_id == plain) saw_plain = 1;
+    }
+    CHECK(saw_both && !saw_plain);
+    oc_dbres_free(r);
+    /* The channel list counts it once, as its newest message. */
+    r = list_channels(w, alice);
+    int found = 0;
+    for (size_t i = 0; r && i < r->n_chlist; i++)
+        if (r->chlist[i].channel_id == OC_DEFAULT_CHANNEL) {
+            found = 1;
+            CHECK(r->chlist[i].preview_author == bob);
+            CHECK(r->chlist[i].preview && strstr(r->chlist[i].preview, "both") != NULL);
+        }
+    CHECK(found);
+    oc_dbres_free(r);
+    /* An edit reaches every member, as any message's does. */
+    r = do_edit(w, bob, OC_DEFAULT_CHANNEL, both, "both places, edited");
+    CHECK(r && r->type == OC_RES_EDIT_OK && r->n_members == 2);
+    oc_dbres_free(r);
     oc_dbwriter_stop(w);
     cleanup_db(path);
 }
@@ -10956,6 +11045,7 @@ int run_dbwriter_tests(void) {
     test_audit_filters();
     test_reactions();
     test_threads();
+    test_reply_also_channel();
     test_thread_repliers();
     test_thread_list();
     test_badge_matches_evaluator();

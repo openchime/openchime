@@ -1,7 +1,7 @@
 # OpenChime — Database Schema
 
 The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
-ARCH-27 (§1); the daemon applies migrations 0001–0072 (`daemon/migrate.c`,
+ARCH-27 (§1); the daemon applies migrations 0001–0073 (`daemon/migrate.c`,
 `OC_MIGRATIONS`), in order, and new tables/columns arrive as later numbered
 migrations, never as edits to an existing one. 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
@@ -36,7 +36,7 @@ credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
 **0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
-(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide.
+(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -1928,3 +1928,16 @@ must not touch `messages`; restore a backup instead.
 `SEARCH` already shows a message with a spoiler by its covered excerpt rather
 than by FTS's `snippet()`, which reads the stored body and would cut a window
 into the hidden text; it does so still.
+
+## 3bl. Migration 0073 — a reply also posted to the channel
+
+```sql
+ALTER TABLE messages ADD COLUMN also_channel INTEGER NOT NULL DEFAULT 0;
+```
+
+*A thread reply also in the channel's main scroll* (REQ-062): `1` on a reply
+sent with `SEND_REPLY`'s `also_channel` (PROTOCOL.md §5.10). It is one row, its
+`parent_id` its thread's root as any reply's is, never a copy. *Read* wherever
+the main scroll is: backfill, history pages, and the channel list's last
+message, unread count and preview take `parent_id IS NULL OR also_channel=1`
+where they took `parent_id IS NULL`. Every row before this reads `0`.

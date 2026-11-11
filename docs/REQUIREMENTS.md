@@ -548,7 +548,9 @@ where one exists.
   aggregating every thread they participate in or follow across channels, with
   unread reply counts — so keeping up with threads has not required revisiting
   each parent channel. A reply has optionally also been **posted to the channel's
-  main scroll** rather than only the thread.
+  main scroll** rather than only the thread: one message, stored once with a flag
+  and never copied, shown in both places, counted once in the channel's unread
+  and notifying once (PROTOCOL.md §5.10, SCHEMA.md §3bk).
 - **REQ-282.** A user has been able to **follow every thread in a chosen channel
   or DM** — a per-conversation setting distinct from following one thread
   (REQ-062) — so that every new thread started there, and every reply within it,

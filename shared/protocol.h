@@ -202,7 +202,7 @@
  * ids, the thread's most recent distinct repliers, newest first, and is sent
  * live to the channel's members when a reply is posted or deleted, not only in
  * backfill (REQ-060). Fields appended to a fixed layout. */
-#define OC_PROTOCOL_VERSION 35u
+#define OC_PROTOCOL_VERSION 36u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -1068,11 +1068,15 @@ typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; uint64_t messa
  * broadcast its body holds notifies (REQ-221); 0 otherwise, whatever the body.
  * Last in the struct, where it was added; on the wire it sits in the fixed
  * part, after `kind`. */
+/* `parent_id` is the thread a reply also posted to the channel belongs to
+ * (REQ-062), 0 for a message that is not a reply; on the wire it follows
+ * `broadcast_stored`, in the fixed part. */
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time;
                  uint8_t kind; oc_slice body;
                  uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH];
                  oc_slice author_name;   /* override name (webhooks); empty = use author_id */
-                 uint8_t broadcast_stored; } oc_broadcast;
+                 uint8_t broadcast_stored;
+                 uint64_t parent_id; } oc_broadcast;
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_client_ack;
 /* A member's read cursor in a channel advanced (REQ-090 seen-by). */
 typedef struct { uint64_t channel_id; uint64_t user_id; uint64_t message_id; } oc_read_cursor;
@@ -1231,17 +1235,23 @@ typedef struct {
 /* `more` is 1 when the daemon stopped at the page limit and rows remain. */
 typedef struct { uint64_t channel_id; uint32_t count; uint8_t more; } oc_files;
 
-typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; uint64_t parent_id; oc_slice body;
+/* `also_channel` 1 posts the reply to the channel's main scroll too (REQ-062):
+ * one message, in both places. In the fixed part, ahead of the attachment tail. */
+typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; uint64_t parent_id; uint8_t also_channel;
+                 oc_slice body;
                  uint16_t n_attach; uint64_t attach_ids[OC_MAX_ATTACH]; } oc_send_reply;
 /* `participant` is per-RECIPIENT, which no other field on a fan-out frame is:
  * it answers "are you in this thread" (REQ-061, ARCH-104) for the peer being
  * written to, so the daemon encodes the frame twice — once each way — and sends
  * whichever matches. It is the evaluator's thread_reply INPUT and not a verdict;
  * the recipient still decides with its own mute, level and schedule. */
-/* `broadcast_stored` as on BROADCAST (REQ-221): written after `participant`. */
+/* `broadcast_stored` as on BROADCAST (REQ-221): written after `participant`.
+ * `also_channel` 1: the reply is also in the channel's main scroll (REQ-062),
+ * written after `broadcast_stored` -- one frame, so a client shows it once. */
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t parent_id; uint64_t author_id; uint64_t server_time; uint32_t reply_count; uint8_t participant; oc_slice body;
                  uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH];
-                 uint8_t broadcast_stored; } oc_thread_reply;
+                 uint8_t broadcast_stored;
+                 uint8_t also_channel; } oc_thread_reply;
 typedef struct { uint64_t channel_id; uint64_t parent_id; } oc_list_thread;
 /* THREAD is the terminator of a LIST_THREAD response: the daemon streams the
  * replies as THREAD_REPLY frames (each self-framed, so a 64KB body is fine),

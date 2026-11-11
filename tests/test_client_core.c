@@ -5864,7 +5864,7 @@ static void test_browser_signin(void) {
  * it unpaired; an ACTION for something not held stands on its own. */
 static size_t frame_of_broadcast(uint8_t *buf, size_t cap, uint64_t mid, const char *body, int with_file) {
     oc_wbuf w; oc_wbuf_init(&w, buf, cap);
-    oc_broadcast b = { mid, 1, 42, 1000, OC_MSG_KIND_MESSAGE, oc_slice_str(body), 0, {{0}}, {0}, 0 };
+    oc_broadcast b = { mid, 1, 42, 1000, OC_MSG_KIND_MESSAGE, oc_slice_str(body), 0, {{0}}, {0}, 0, 0 };
     if (with_file) {
         b.n_attach = 1;
         b.attach[0].id = 9;

@@ -439,6 +439,7 @@ static oc_result encode_broadcast_as(oc_wbuf *w, uint16_t version, uint16_t type
     oc_w_u64(w, m->server_time);
     oc_w_u8(w, m->kind);
     oc_w_u8(w, m->broadcast_stored ? 1u : 0u);
+    oc_w_u64(w, m->parent_id);               /* a reply also in the channel (REQ-062), else 0 */
     oc_w_lstr(w, m->body);
     /* Optional trailing block (REQ-140/170): the attachment list, then an
      * optional author-name override. Both are self-describing — present only
@@ -856,6 +857,7 @@ oc_result oc_encode_send_reply(oc_wbuf *w, uint16_t version, const oc_send_reply
     oc_w_u64(w, m->channel_id);
     oc_w_idem(w, m->idem);
     oc_w_u64(w, m->parent_id);
+    oc_w_u8(w, m->also_channel ? 1u : 0u);   /* also to the channel (REQ-062) */
     oc_w_lstr(w, m->body);
     /* Optional trailing attachment-id list (REQ-140), as on SEND. */
     if (m->n_attach) {
@@ -880,6 +882,7 @@ oc_result oc_encode_thread_reply(oc_wbuf *w, uint16_t version, const oc_thread_r
      * its place. */
     oc_w_u8(w, m->participant ? 1u : 0u);
     oc_w_u8(w, m->broadcast_stored ? 1u : 0u);
+    oc_w_u8(w, m->also_channel ? 1u : 0u);
     oc_w_lstr(w, m->body);
     /* Optional trailing attachment metadata (REQ-140), as on BROADCAST. */
     if (m->n_attach) {
@@ -2777,6 +2780,7 @@ oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m) {
     if (m->kind > OC_MSG_KIND_CALL) return OC_E_MALFORMED;   /* a kind this version does not define */
     m->broadcast_stored = oc_r_u8(p);
     if (m->broadcast_stored > 1) return OC_E_MALFORMED;   /* a flag, nothing else */
+    m->parent_id = oc_r_u64(p);
     m->body = oc_r_lstr(p);
     /* Optional trailing block: attachment list, then an optional author name. */
     m->n_attach = 0;
@@ -3166,6 +3170,8 @@ oc_result oc_decode_send_reply(oc_rbuf *p, oc_send_reply *m) {
     m->channel_id = oc_r_u64(p);
     oc_r_idem(p, m->idem);
     m->parent_id = oc_r_u64(p);
+    m->also_channel = oc_r_u8(p);
+    if (m->also_channel > 1) return OC_E_MALFORMED;      /* a flag, nothing else */
     m->body = oc_r_lstr(p);
     m->n_attach = 0;
     if (!p->underflow && p->pos < p->len) {
@@ -3187,6 +3193,8 @@ oc_result oc_decode_thread_reply(oc_rbuf *p, oc_thread_reply *m) {
     m->participant = oc_r_u8(p);
     m->broadcast_stored = oc_r_u8(p);
     if (m->broadcast_stored > 1) return OC_E_MALFORMED;   /* a flag, nothing else */
+    m->also_channel = oc_r_u8(p);
+    if (m->also_channel > 1) return OC_E_MALFORMED;
     m->body = oc_r_lstr(p);
     m->n_attach = 0;
     if (!p->underflow && p->pos < p->len) {

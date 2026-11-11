@@ -341,7 +341,7 @@ static void test_messaging_frames(void) {
         CHECK(out.server_time == 1751200500000ull);
     }
     {
-        oc_broadcast in = { 1001, 7, 42, 1751200500000ull, 0, oc_slice_str("hello channel"), 0, {{0}}, {0}, 0 };
+        oc_broadcast in = { 1001, 7, 42, 1751200500000ull, 0, oc_slice_str("hello channel"), 0, {{0}}, {0}, 0, 0 };
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -399,7 +399,7 @@ static void test_broadcast_stored_frames(void) {
     for (uint8_t stored = 0; stored <= 1; stored++) {
         {
             oc_broadcast in = { 1001, 7, 42, 1751200500000ull, 0, oc_slice_str("@channel standup"),
-                                0, {{0}}, {0}, stored };
+                                0, {{0}}, {0}, stored, 0 };
             ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
             oc_broadcast out;
             CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -408,7 +408,7 @@ static void test_broadcast_stored_frames(void) {
         }
         {   /* The tail behind it: a name, so a zero attachment count first. */
             oc_broadcast in = { 1002, 7, 42, 1751200500000ull, 0, oc_slice_str("@here"),
-                                0, {{0}}, oc_slice_str("CI"), stored };
+                                0, {{0}}, oc_slice_str("CI"), stored, 0 };
             ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
             oc_broadcast out;
             CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -416,14 +416,14 @@ static void test_broadcast_stored_frames(void) {
             CHECK(slice_eq_str(out.author_name, "CI"));
         }
         {
-            oc_broadcast in = { 1003, 7, 42, 1000, 0, oc_slice_str("@everyone back"), 0, {{0}}, {0}, stored };
+            oc_broadcast in = { 1003, 7, 42, 1000, 0, oc_slice_str("@everyone back"), 0, {{0}}, {0}, stored, 0 };
             ROUNDTRIP(oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MSG_RESTORED, h, p);
             oc_broadcast out;
             CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
             CHECK(out.broadcast_stored == stored && slice_eq_str(out.body, "@everyone back"));
         }
         {   /* Not tied to the body: an edit may have taken the broadcast out. */
-            oc_broadcast in = { 1005, 7, 42, 1000, 0, oc_slice_str("standup moved"), 0, {{0}}, {0}, stored };
+            oc_broadcast in = { 1005, 7, 42, 1000, 0, oc_slice_str("standup moved"), 0, {{0}}, {0}, stored, 0 };
             ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
             oc_broadcast out;
             CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -446,7 +446,7 @@ static void test_broadcast_stored_frames(void) {
     /* A byte that is not a flag. BROADCAST's sits after four u64s and `kind`;
      * THREAD_REPLY's after five u64s, `reply_count` and `participant`. */
     {
-        oc_broadcast in = { 1, 7, 42, 1, 0, oc_slice_str("@here"), 0, {{0}}, {0}, 1 };
+        oc_broadcast in = { 1, 7, 42, 1, 0, oc_slice_str("@here"), 0, {{0}}, {0}, 1, 0 };
         oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
         CHECK(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in) == OC_OK);
         CHECK(frame[OC_HEADER_SIZE + 33] == 1);
@@ -483,6 +483,54 @@ static void test_thread_frames(void) {
         CHECK(memcmp(out.idem, idem, OC_IDEM_SIZE) == 0);
         CHECK(slice_eq_str(out.body, "a reply"));
         CHECK(out.n_attach == 1 && out.attach_ids[0] == 321);
+        CHECK(out.also_channel == 0);
+    }
+    /* Also to the channel (REQ-062): SEND_REPLY's flag, THREAD_REPLY's and
+     * BROADCAST's parent, each in the fixed part, ahead of the body and tail. */
+    {
+        oc_send_reply in = {0}; in.channel_id = 7; memcpy(in.idem, idem, OC_IDEM_SIZE);
+        in.parent_id = 500; in.also_channel = 1; in.body = oc_slice_str("both places");
+        in.n_attach = 1; in.attach_ids[0] = 9;
+        ROUNDTRIP(oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEND_REPLY, h, p);
+        oc_send_reply out = {0};
+        CHECK(oc_decode_send_reply(&p, &out) == OC_OK);
+        CHECK(out.also_channel == 1 && out.parent_id == 500 && slice_eq_str(out.body, "both places"));
+        CHECK(out.n_attach == 1 && out.attach_ids[0] == 9);
+    }
+    {
+        oc_thread_reply in = { .message_id = 1003, .channel_id = 7, .parent_id = 500,
+                               .author_id = 42, .server_time = 1, .reply_count = 4, .participant = 0,
+                               .body = oc_slice_str("both places"), .also_channel = 1 };
+        ROUNDTRIP(oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_REPLY, h, p);
+        oc_thread_reply out = {0};
+        CHECK(oc_decode_thread_reply(&p, &out) == OC_OK);
+        CHECK(out.also_channel == 1 && out.parent_id == 500 && out.reply_count == 4);
+    }
+    {
+        oc_broadcast in;
+        memset(&in, 0, sizeof in);
+        in.message_id = 1003; in.channel_id = 7; in.author_id = 42; in.server_time = 1;
+        in.body = oc_slice_str("both places"); in.parent_id = 500;
+        in.author_name = oc_slice_str("Bot");
+        ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
+        oc_broadcast out;
+        CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
+        CHECK(out.parent_id == 500 && slice_eq_str(out.body, "both places") && slice_eq_str(out.author_name, "Bot"));
+    }
+    /* A flag byte that is not a flag is malformed: SEND_REPLY's sits after
+     * the channel, the idempotency token and the parent. */
+    {
+        oc_send_reply in = {0}; in.channel_id = 7; memcpy(in.idem, idem, OC_IDEM_SIZE);
+        in.parent_id = 5; in.also_channel = 1; in.body = oc_slice_str("x");
+        uint8_t fr[256];
+        oc_wbuf w; oc_wbuf_init(&w, fr, sizeof fr);
+        CHECK(oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &in) == OC_OK);
+        size_t at = OC_HEADER_SIZE + 8 + OC_IDEM_SIZE + 8;
+        CHECK(fr[at] == 1);
+        fr[at] = 2;
+        oc_header h; oc_rbuf p; oc_send_reply out = {0};
+        CHECK(oc_parse_frame(fr, w.len, &h, &p) == OC_OK);
+        CHECK(oc_decode_send_reply(&p, &out) == OC_E_MALFORMED);
     }
     /* THREAD_REPLY, participant set, WITH the optional attachment tail behind
      * it. `participant` is a fixed field sitting in front of that tail, so both
@@ -2028,7 +2076,7 @@ static void test_group_frames(void) {
         CHECK(oc_decode_restore(&p, &out) == OC_OK && out.channel_id == 7 && out.message_id == 42);
     }
     {
-        oc_broadcast in = { 42, 7, 3, 1000, 0, oc_slice_str("back again"), 0, {{0}}, {0}, 0 };
+        oc_broadcast in = { 42, 7, 3, 1000, 0, oc_slice_str("back again"), 0, {{0}}, {0}, 0, 0 };
         ROUNDTRIP(oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MSG_RESTORED, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK && out.message_id == 42 && out.channel_id == 7 &&
@@ -2235,7 +2283,7 @@ static void test_attachment_frames(void) {
     }
     /* BROADCAST carrying attachment metadata AND a display-name override. */
     {
-        oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str("here"), 0, {{0}}, {0}, 0 };
+        oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str("here"), 0, {{0}}, {0}, 0, 0 };
         in.n_attach = 1;
         in.attach[0].id = 77; in.attach[0].filename = oc_slice_str("a.png");
         in.attach[0].mime = oc_slice_str("image/png"); in.attach[0].size = 4096;
@@ -2250,7 +2298,7 @@ static void test_attachment_frames(void) {
     /* Author name with NO attachments: a zero attachment count precedes the name
      * (REQ-170 display-name override, ARCH-71). */
     {
-        oc_broadcast in = { 6, 3, 42, 999, 0, oc_slice_str("hi"), 0, {{0}}, {0}, 0 };
+        oc_broadcast in = { 6, 3, 42, 999, 0, oc_slice_str("hi"), 0, {{0}}, {0}, 0, 0 };
         in.author_name = oc_slice_str("Zapier");
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
@@ -2260,7 +2308,7 @@ static void test_attachment_frames(void) {
     }
     /* No attachments and no name -> byte-identical to the original layout. */
     {
-        oc_broadcast in = { 7, 3, 42, 999, 0, oc_slice_str("plain"), 0, {{0}}, {0}, 0 };
+        oc_broadcast in = { 7, 3, 42, 999, 0, oc_slice_str("plain"), 0, {{0}}, {0}, 0, 0 };
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK);

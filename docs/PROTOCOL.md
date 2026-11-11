@@ -213,8 +213,11 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 35** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 36** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 36 put `also_channel` in `SEND_REPLY` and `THREAD_REPLY` and `parent_id` in
+> `BROADCAST`, each in the fixed part ahead of the body: a thread reply can also
+> be posted to the channel's main scroll (REQ-062, §5.10). Version
 > 35 appended `thread_root` to `TYPING` and `TYPING_UPDATE`, so typing shows in
 > the thread it is in (§5.13, REQ-121). Version
 > 34 appended `n_repliers` and the repliers' ids to `THREAD_META`, which is now
@@ -583,6 +586,7 @@ tenant-monotonic (ARCH-43).
 | `server_time`  | u64  | Server timestamp, ms since epoch UTC.        |
 | `kind`         | u8   | `0` something someone said; `1` a call event the daemon wrote — a missed call (REQ-304, §5.17). Any other value is malformed. |
 | `broadcast_stored` | u8 | `1` when the daemon stored a broadcast mention (`@here`, `@channel` or `@everyone`) for the message when it was sent, so a broadcast its body holds notifies (REQ-221); else `0`, whatever the body. Any other value is malformed. Since version 32 (version 31 carried `broadcast_held` here). |
+| `parent_id`    | u64  | The thread root of a reply also posted to the channel (REQ-062, §5.10), which a replay of the main scroll carries with it; `0` for a message that is not a reply. Since version 36. |
 | `body`         | lstr | Message body (§7).                           |
 
 `broadcast_stored` is the daemon's answer to whether a broadcast mention
@@ -1337,7 +1341,16 @@ anything else malformed.
 Any message can be replied to as a thread. A reply threads under a **top-level
 root** — replying to a reply flattens to that reply's root, so threads are one
 level deep. A reply is **not** delivered to the channel's main scroll (§5.3): it
-is fanned out as a `THREAD_REPLY`, and the parent shows a reply count.
+is fanned out as a `THREAD_REPLY`, and the parent shows a reply count -- unless
+it was sent with `also_channel` (REQ-062). Then it is **one message in both
+places**: stored once, flagged, never copied; live, one `THREAD_REPLY` with
+`also_channel` 1 to every member, which a client shows in the thread and in the
+channel without showing it twice; and in the main scroll's replay (§6) and
+history pages as a `BROADCAST` carrying its `parent_id`. It counts in the
+channel's unread, last message and preview as a top-level message does, once;
+it is one message for the mentions it stores and the notifications it makes;
+and an edit, delete, restore or reaction on it reaches every member, as on any
+message. An archived channel refuses it as it refuses any reply.
 
 **`SEND_REPLY` (client → server), msg_type `0x002C`:**
 
@@ -1346,6 +1359,7 @@ is fanned out as a `THREAD_REPLY`, and the parent shows a reply count.
 | `channel_id` | u64  | The channel.                                              |
 | `idem`       | 16 B | Idempotency token (§7), exactly as `SEND` (REQ-093).      |
 | `parent_id`  | u64  | The message being replied to (resolved to its root).      |
+| `also_channel` | u8 | `1` posts the reply to the channel's main scroll too (REQ-062); `0` as before. Any other value is malformed. Since version 36. |
 | `body`       | lstr | Reply body, `<= MAX_BODY_SIZE`.                           |
 
 The sender is acked with a normal `SEND_ACK` (§5.2). Then the daemon fans a
@@ -1362,6 +1376,7 @@ member of the channel:
 | `reply_count` | u32  | The root's total reply count after this reply (REQ-060). |
 | `participant` | u8   | 1 if **this recipient** is in the thread (REQ-061).      |
 | `broadcast_stored` | u8 | As on `BROADCAST` (§5.3): `1` when the reply's send stored a broadcast mention (REQ-221). Since version 32. |
+| `also_channel` | u8  | `1` when the reply is also in the channel's main scroll (REQ-062): the client shows it there too, from this one frame. Since version 36. |
 | `body`        | lstr | The reply body.                                          |
 
 `participant` is the only per-recipient field on a fan-out frame, so the daemon

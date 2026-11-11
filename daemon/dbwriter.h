@@ -502,6 +502,7 @@ typedef struct oc_job {
     uint64_t       channel_id;
     uint64_t       message_id; /* target message for EDIT / DELETE */
     uint64_t       parent_id;  /* thread parent for SEND_REPLY / LIST_THREAD */
+    uint8_t        also_channel; /* SEND_REPLY: also to the channel's main scroll (REQ-062) */
     uint64_t       sched_at_ms; /* SCHEDULE / UPDATE_SCHEDULED: when to send */
     uint8_t        act_filter;  /* LIST_ACTIVITY: OC_ACTF_* (REQ-139) */
     char          *recipients;  /* SET_DRAFT with no channel (REQ-229); heap */
@@ -1029,6 +1030,9 @@ typedef struct {
     /* Replays and THREAD: its send stored a broadcast mention row (REQ-221),
      * whatever the body says now; the byte BROADCAST and THREAD_REPLY carry. */
     uint8_t  broadcast_stored;
+    /* Replays: a thread reply also posted to the channel (REQ-062) is in the
+     * main scroll with its thread's root here; 0 for a top-level message. */
+    uint64_t parent_id;
     /* SEARCH only: the snippet in `body` is cut from an action's text
      * (REQ-058). A replay carries actions on their own frames instead. */
     uint8_t  action;
@@ -1263,6 +1267,7 @@ typedef struct oc_dbres {
      * THREAD carries the reply list. */
     uint64_t        parent_id;
     uint32_t        reply_count;
+    uint8_t         also_channel;   /* REPLY_OK: the reply is also in the channel (REQ-062) */
     /* The parent's thread as it now stands, for the live THREAD_META a posted
      * or deleted reply sends (REQ-060). A DELETE_OK of a top-level message
      * leaves parent_id 0 and sends none. */

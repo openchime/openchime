@@ -5623,14 +5623,15 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         /* Newest top-level message, and how many the user has not acked (REQ-090)
          * — so a cache-less client can sort and badge the sidebar immediately. */
         "  (SELECT COALESCE(MAX(x.created_at_ms),0) FROM messages x "
-        "     WHERE x.channel_id=c.id AND x.parent_id IS NULL), "
+        "     WHERE x.channel_id=c.id AND (x.parent_id IS NULL OR x.also_channel=1)), "
         /* A badge counts what WOULD HAVE NOTIFIED, with the schedule and the
          * pause left out: those govern when to interrupt you, not whether a
          * message mattered, so a night of quiet hours still leaves a count in
          * the morning. Everything else is the evaluator's — mute silences
          * absolutely, a priority person pierces the level, and MENTIONS is
          * satisfied by a mention or a keyword hit. Thread replies are not here
-         * by construction (parent_id IS NULL); they badge the Threads view.
+         * -- they badge the Threads view -- unless also posted to the channel
+         * (REQ-062), when they count here once, as a top-level message does.
          *
          * This is oc_notify_decide reduced for quiet=0, paused=0 and written as
          * SQL, because a badge is a COUNT over a channel's backlog rather than a
@@ -5638,7 +5639,7 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
          * is what stops it drifting: every state it can express is compared
          * against the evaluator's own answer. */
         "  (SELECT COUNT(*) FROM messages x "
-        "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.author_id<>?1 "
+        "     WHERE x.channel_id=c.id AND (x.parent_id IS NULL OR x.also_channel=1) AND x.author_id<>?1 "
         /* The workspace's notices are no one's unread (oc_notify_decide's `own`). */
         "       AND x.author_id NOT IN (SELECT su.id FROM users su WHERE su.is_system=1) "
         "       AND x.deleted_at_ms IS NULL "
@@ -5667,13 +5668,13 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
          * activity, and the row below it usually is. An action's preview is its
          * action text, flagged, so the client reads "<author> <text>" (REQ-058). */
         "  (SELECT oc_excerpt(substr(CASE WHEN (SELECT e2e FROM channels WHERE id=x.channel_id)=1 THEN '' ELSE COALESCE(x.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=x.id),0)),?2) FROM messages x "
-        "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.deleted_at_ms IS NULL "
+        "     WHERE x.channel_id=c.id AND (x.parent_id IS NULL OR x.also_channel=1) AND x.deleted_at_ms IS NULL "
         "     ORDER BY x.id DESC LIMIT 1), "
         "  COALESCE((SELECT x.author_id FROM messages x "
-        "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.deleted_at_ms IS NULL "
+        "     WHERE x.channel_id=c.id AND (x.parent_id IS NULL OR x.also_channel=1) AND x.deleted_at_ms IS NULL "
         "     ORDER BY x.id DESC LIMIT 1),0), "
         "  COALESCE((SELECT EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=x.id) FROM messages x "
-        "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.deleted_at_ms IS NULL "
+        "     WHERE x.channel_id=c.id AND (x.parent_id IS NULL OR x.also_channel=1) AND x.deleted_at_ms IS NULL "
         "     ORDER BY x.id DESC LIMIT 1),0), "
         "  c.e2e "
         "FROM channels c WHERE "
@@ -7361,7 +7362,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     /* Idempotent replay: a known (channel, token) re-acks the original id. */
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT s.message_id, m.created_at_ms, m.parent_id FROM sent_messages s "
+        "SELECT s.message_id, m.created_at_ms, m.parent_id, m.also_channel FROM sent_messages s "
         "JOIN messages m ON m.id = s.message_id "
         "WHERE s.channel_id=? AND s.idempotency_token=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
@@ -7371,6 +7372,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
         r->message_id = (uint64_t)sqlite3_column_int64(st, 0);
         r->server_time = (uint64_t)sqlite3_column_int64(st, 1);
         r->parent_id = (uint64_t)sqlite3_column_int64(st, 2);
+        r->also_channel = (uint8_t)sqlite3_column_int(st, 3);
         r->duplicate = 1;
         sqlite3_finalize(st);
         return r;
@@ -7401,14 +7403,17 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     uint64_t ts = dbw_now_ms();
     if (j->n_poll_opts && !poll_valid(j, ts)) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_INVALID_POLL; return r; }
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    /* Also to the channel (REQ-062): one row, flagged, never a copy -- the main
+     * scroll's queries take a flagged reply as they take a top-level message. */
     sqlite3_prepare_v2(db,
-        "INSERT INTO messages(channel_id, author_id, body, created_at_ms, parent_id) "
-        "VALUES(?, ?, ?, ?, ?);", -1, &st, NULL);
+        "INSERT INTO messages(channel_id, author_id, body, created_at_ms, parent_id, also_channel) "
+        "VALUES(?, ?, ?, ?, ?, ?);", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
     sqlite3_bind_blob(st, 3, j->body, (int)j->body_len, SQLITE_STATIC);
     sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
     sqlite3_bind_int64(st, 5, (sqlite3_int64)root);
+    sqlite3_bind_int(st, 6, j->also_channel ? 1 : 0);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
@@ -7465,6 +7470,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     r->server_time = ts;
     r->parent_id = root;
     r->reply_count = count;
+    r->also_channel = j->also_channel ? 1 : 0;
     append_action(db, r, mid, j->channel_id, 1);   /* always: the client pairs them (ARCH-115) */
     if (j->n_poll_opts) append_poll(db, r, mid, j->channel_id, 0);
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
@@ -8012,7 +8018,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             sqlite3_stmt *cst = NULL;
             if (sqlite3_prepare_v2(db,
                     "SELECT COALESCE(MIN(id),0) FROM "
-                    "  (SELECT id FROM messages WHERE channel_id=? AND parent_id IS NULL "
+                    "  (SELECT id FROM messages WHERE channel_id=? AND (parent_id IS NULL OR also_channel=1) "
                     "   ORDER BY id DESC LIMIT ?);", -1, &cst, NULL) == SQLITE_OK) {
                 sqlite3_bind_int64(cst, 1, (sqlite3_int64)ch);
                 sqlite3_bind_int64(cst, 2, (sqlite3_int64)OC_BACKFILL_TAIL);
@@ -8043,7 +8049,9 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
              * the REQUESTING user because a saved item is private (REQ-231). */
             "  COALESCE(s.created_at_ms,0), m.kind, "
             /* And whether this user folded it away, for the same reason. */
-            "  EXISTS(SELECT 1 FROM collapsed_messages cm WHERE cm.message_id = m.id AND cm.user_id = ?4) "
+            "  EXISTS(SELECT 1 FROM collapsed_messages cm WHERE cm.message_id = m.id AND cm.user_id = ?4), "
+            /* A reply also posted to the channel is here with its thread (REQ-062). */
+            "  COALESCE(m.parent_id,0) "
             "FROM messages m LEFT JOIN users u ON u.id = m.author_id "
             "                LEFT JOIN pins  p ON p.message_id = m.id "
             "                LEFT JOIN saved_items s ON s.message_id = m.id AND s.user_id = ?4 "
@@ -8052,7 +8060,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
              * to 5, 6 and 7 — the binds still succeeded, the query saw NULLs, and
              * backfill returned nothing. 36 tests caught it; reading would not
              * have. */
-            "WHERE m.channel_id=?1 AND m.id>?2 AND m.parent_id IS NULL "
+            "WHERE m.channel_id=?1 AND m.id>?2 AND (m.parent_id IS NULL OR m.also_channel=1) "
             "ORDER BY m.id LIMIT ?3;", -1, &st, NULL);
         sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)ch);
@@ -8088,6 +8096,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             m->kind      = (uint8_t)sqlite3_column_int(st, 10);
             m->broadcast_stored = broadcast_stored(db, m->message_id);
             m->collapsed = (uint8_t)sqlite3_column_int(st, 11);
+            m->parent_id = (uint64_t)sqlite3_column_int64(st, 12);
             /* Re-attach the message's linked attachments so a reconnecting client
              * sees them inline, not just live members (REQ-140). */
             load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
@@ -8206,26 +8215,27 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     "         COALESCE(p.created_at_ms,0) AS pinned_at," \
     "         COALESCE(s.created_at_ms,0) AS saved_at," \
     "         m.kind AS kind," \
-    "         EXISTS(SELECT 1 FROM collapsed_messages cm WHERE cm.message_id = m.id AND cm.user_id = ?4) AS collapsed" \
+    "         EXISTS(SELECT 1 FROM collapsed_messages cm WHERE cm.message_id = m.id AND cm.user_id = ?4) AS collapsed," \
+    "         COALESCE(m.parent_id,0) AS parent_id" \
     "    FROM messages m LEFT JOIN users u ON u.id = m.author_id" \
     "                    LEFT JOIN pins p ON p.message_id = m.id" \
     "                    LEFT JOIN saved_items s ON s.message_id = m.id AND s.user_id = ?4"
 
     const char *sql = j->hist_around
         ? "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name,"
-          "       pinned_by, pinned_at, saved_at, kind, collapsed FROM ("
+          "       pinned_by, pinned_at, saved_at, kind, collapsed, parent_id FROM ("
           "  SELECT * FROM (" OC_HIST_COLS
-          "   WHERE m.channel_id=?1 AND m.parent_id IS NULL AND m.id<=?2"
+          "   WHERE m.channel_id=?1 AND (m.parent_id IS NULL OR m.also_channel=1) AND m.id<=?2"
           "   ORDER BY m.id DESC LIMIT ?3)"
           "  UNION ALL"
           "  SELECT * FROM (" OC_HIST_COLS
-          "   WHERE m.channel_id=?1 AND m.parent_id IS NULL AND m.id>?2"
+          "   WHERE m.channel_id=?1 AND (m.parent_id IS NULL OR m.also_channel=1) AND m.id>?2"
           "   ORDER BY m.id ASC LIMIT ?3)"
           ") ORDER BY id;"
         : "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name,"
-          "       pinned_by, pinned_at, saved_at, kind, collapsed FROM ("
+          "       pinned_by, pinned_at, saved_at, kind, collapsed, parent_id FROM ("
           OC_HIST_COLS
-          "   WHERE m.channel_id=?1 AND m.id<?2 AND m.parent_id IS NULL"
+          "   WHERE m.channel_id=?1 AND m.id<?2 AND (m.parent_id IS NULL OR m.also_channel=1)"
           "   ORDER BY m.id DESC LIMIT ?3"
           ") ORDER BY id;";
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK)
@@ -8270,6 +8280,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
         m->kind      = (uint8_t)sqlite3_column_int(st, 10);
         m->broadcast_stored = broadcast_stored(db, m->message_id);
         m->collapsed = (uint8_t)sqlite3_column_int(st, 11);
+        m->parent_id = (uint64_t)sqlite3_column_int64(st, 12);
         load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
         n++;
     }
@@ -8282,7 +8293,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
         sqlite3_stmt *mt = NULL;
         if (sqlite3_prepare_v2(db,
                 "SELECT EXISTS(SELECT 1 FROM messages WHERE channel_id=?1 AND id<?2 "
-                "AND parent_id IS NULL);", -1, &mt, NULL) == SQLITE_OK) {
+                "AND (parent_id IS NULL OR also_channel=1));", -1, &mt, NULL) == SQLITE_OK) {
             sqlite3_bind_int64(mt, 1, (sqlite3_int64)j->channel_id);
             sqlite3_bind_int64(mt, 2, (sqlite3_int64)arr[0].message_id);
             if (sqlite3_step(mt) == SQLITE_ROW)
