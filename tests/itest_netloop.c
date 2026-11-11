@@ -2718,13 +2718,14 @@ static void test_collapsed_sync(int port, const uint8_t *pin) {
 }
 
 /* A message moved (REQ-053) is told to the readers of both channels, each of
- * them once: here Bob's message goes from the open channel to a private one of
- * Alice's, so Bob hears it leave and Alice, in both, hears it one time. */
+ * them once: here Sid's message goes from the open channel to a private one of
+ * Alice's, so Sid hears it leave and Alice, in both, hears it one time. (Not
+ * Bob: the admin test has removed him by now.) */
 static void test_move_message_live(int port, const uint8_t *pin) {
     client a, b;
     uint64_t ua = 0, ub = 0;
     CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
-    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "sid", "pw-sid", &ub) == 0);
     uint8_t buf[256]; oc_wbuf w; oc_header h; oc_rbuf p;
 
     oc_wbuf_init(&w, buf, sizeof buf);
@@ -2761,7 +2762,7 @@ static void test_move_message_live(int port, const uint8_t *pin) {
         if (h.msg_type == OC_MSG_SAVED) break;
     }
     CHECK(!again);
-    /* Bob may not move it back: it is in a channel he cannot post in. */
+    /* Sid may not move it back: it is in a channel he cannot post in. */
     oc_wbuf_init(&w, buf, sizeof buf);
     oc_move_message back = { ack.message_id, 1, 0, 0 };
     CHECK(oc_encode_move_message(&w, OC_PROTOCOL_VERSION, &back) == OC_OK && send_frame(&b, buf, w.len) == 0);
@@ -5196,7 +5197,8 @@ static void test_webhook_vertical(int port, const uint8_t *pin) {
  * channel level or DND on one connection pushes a fresh NOTIFY_PREFS snapshot to
  * all of the same user's connections. */
 /* One request answers with ALL of a user's notification state, in a fixed order:
- * NOTIFY_PREFS, then the pause, the schedule and the alert lists (REQ-135/136/278).
+ * NOTIFY_PREFS, then the pause, the schedule, the alert lists (REQ-135/136/278),
+ * whom I have muted and whom I block.
  * A test that read only the first would pass while three frames piled up in the
  * stream and desynchronised everything after it — which is exactly what happened. */
 static void read_notify_tail(client *c) {
@@ -5209,6 +5211,12 @@ static void read_notify_tail(client *c) {
     CHECK(read_frame(c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ALERT_PREFS);
     { oc_slice t[OC_MAX_KEYWORDS]; uint8_t nt = 0; uint64_t pe[OC_MAX_PRIORITY]; uint8_t np = 0;
       CHECK(oc_decode_alert_prefs(&p, t, OC_MAX_KEYWORDS, &nt, pe, OC_MAX_PRIORITY, &np) == OC_OK); }
+    CHECK(read_frame(c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_MUTED_USERS);
+    { uint64_t ids[OC_MAX_MUTED_USERS]; uint16_t n = 0;
+      CHECK(oc_decode_muted_users(&p, ids, &n) == OC_OK); }
+    CHECK(read_frame(c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BLOCKS);
+    { uint64_t ids[OC_MAX_BLOCKS]; uint16_t n = 0; uint8_t priv = 0;
+      CHECK(oc_decode_blocks(&p, &priv, ids, &n) == OC_OK); }
 }
 
 static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
@@ -7044,7 +7052,10 @@ static size_t raw_send_frame(uint8_t *buf, uint64_t channel, const uint8_t idem[
     size_t n = 8;
     for (int i = 7; i >= 0; i--) buf[n++] = (uint8_t)(channel >> (i * 8));
     memcpy(buf + n, idem, OC_IDEM_SIZE); n += OC_IDEM_SIZE;
-    if (parent) for (int i = 7; i >= 0; i--) buf[n++] = (uint8_t)(parent >> (i * 8));
+    if (parent) {
+        for (int i = 7; i >= 0; i--) buf[n++] = (uint8_t)(parent >> (i * 8));
+        buf[n++] = 0;                                      /* SEND_REPLY's also_channel */
+    }
     buf[n++] = (uint8_t)(body_len >> 24); buf[n++] = (uint8_t)(body_len >> 16);
     buf[n++] = (uint8_t)(body_len >> 8);  buf[n++] = (uint8_t)body_len;
     memset(buf + n, 'x', body_len); n += body_len;

@@ -67,6 +67,15 @@ static oc_dbres *wait_result(oc_dbwriter *w) {
 /* Every database is in the suite's own directory (tests/testenv.h), so nothing
  * another suite, run or checkout does can meet it. `tdb` names one there; the
  * names live as long as the suite. */
+/* A connection of the test's own, beside the daemon's: with the SQL functions
+ * the daemon registers on each of its connections (oc_migrate_functions),
+ * since the search index's triggers call one whenever `messages` is written. */
+static int raw_open(const char *path, sqlite3 **db) {
+    int rc = sqlite3_open(path, db);
+    if (rc == SQLITE_OK) oc_migrate_functions(*db);
+    return rc;
+}
+
 static char g_dir[256];
 static char *g_names[256];
 static int g_n_names;
@@ -88,7 +97,7 @@ static int make_template(void) {
     if (made) return made > 0;
     unlink(TEMPLATE_DB);
     sqlite3 *db = NULL; char *err = NULL;
-    made = sqlite3_open(TEMPLATE_DB, &db) == SQLITE_OK &&
+    made = raw_open(TEMPLATE_DB, &db) == SQLITE_OK &&
            sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL) == SQLITE_OK &&
            oc_migrate_default(db, &err) == SQLITE_OK ? 1 : -1;
     sqlite3_free(err);
@@ -729,7 +738,7 @@ static void test_pins(void) {
  * rows, which do not, and why. */
 static int mention_rows(const char *path, uint64_t mid, uint64_t user_id, int kind) {
     sqlite3 *raw = NULL;
-    if (sqlite3_open(path, &raw) != SQLITE_OK) return -1;
+    if (raw_open(path, &raw) != SQLITE_OK) return -1;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(raw,
         "SELECT COUNT(*) FROM mentions WHERE message_id=?1 "
@@ -793,7 +802,7 @@ static void test_mentions_stored(void) {
      * mentions at all. */
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         sqlite3_stmt *st = NULL;
         sqlite3_prepare_v2(raw, "SELECT body FROM messages WHERE id=?1;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)m1);
@@ -1348,7 +1357,7 @@ static void test_oidc_join_rules(void) {
      * said last, and the name a first sign-in set — not the later token's. */
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         sqlite3_stmt *st = NULL;
         sqlite3_prepare_v2(raw,
             "SELECT (SELECT COUNT(*) FROM user_identities WHERE subject NOT IN ('lee-again', 'kim-oid')),"
@@ -1454,7 +1463,7 @@ static void test_oidc_link(void) {
      * between. */
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         sqlite3_stmt *st = NULL;
         sqlite3_prepare_v2(raw,
             "SELECT (SELECT COUNT(*) FROM user_identities WHERE user_id=?1),"
@@ -1536,7 +1545,7 @@ static void test_oidc_limits_and_audit(void) {
 
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         sqlite3_stmt *st = NULL;
         sqlite3_prepare_v2(raw,
             "SELECT (SELECT COUNT(*) FROM audit_log WHERE action='auth.failed' AND outcome=0"
@@ -1970,7 +1979,7 @@ static void test_channel_details(void) {
      * the LISTING — its scope, its ordering, and what it leaves out. */
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         const char *ins =
             "INSERT INTO attachments(id,channel_id,message_id,uploader_id,storage_key,"
             "  filename,mime,size,created_at_ms,reclaimed_at_ms) VALUES(?,?,?,?,'k',?,?,?,?,?);";
@@ -2081,7 +2090,7 @@ static void test_delete_clears_message_extras(void) {
     /* An attachment on the message, and a pin, and reactions from both users. */
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         char sql[512];
         snprintf(sql, sizeof sql,
                  "INSERT INTO attachments(id,channel_id,message_id,uploader_id,storage_key,"
@@ -2113,7 +2122,7 @@ static void test_delete_clears_message_extras(void) {
 
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         sqlite3_stmt *st = NULL;
         /* The message row survives as a tombstone (thread linkage, REQ-052)... */
         sqlite3_prepare_v2(raw, "SELECT body IS NULL, deleted_at_ms IS NOT NULL "
@@ -2231,11 +2240,28 @@ static void test_history_around(void) {
     CHECK(r->replay[r->n_replay - 1].message_id == ids[40]);
     oc_dbres_free(r);
 
-    /* Read access still gates it — a permalink is not a way around membership. */
+    /* Read access still gates it — a permalink is not a way around membership,
+     * whichever channel the link names. */
     uint64_t outsider = reg(w, "mallory", "pw", OC_ROLE_MEMBER);
-    oc_dbres_free(create_channel(w, u, "secret", 0));
-    r = history_around(w, outsider, 4242, ids[20], 10);
+    r = create_channel(w, u, "secret", 0);
+    uint64_t secret = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(secret != 0);
+    oc_job *sj = oc_job_new(OC_JOB_SEND, 1);
+    sj->user_id = u; sj->channel_id = secret;
+    memset(sj->idem, 0x5E, OC_IDEM_LEN);
+    oc_job_set_body(sj, "behind the door", 15);
+    oc_dbwriter_submit(w, sj);
+    r = wait_result(w);
+    uint64_t hidden = (r && r->type == OC_RES_SEND_OK) ? r->message_id : 0;
+    oc_dbres_free(r);
+    CHECK(hidden != 0);
+    r = history_around(w, outsider, secret, hidden, 10);
     CHECK(r && r->n_replay == 0);
+    oc_dbres_free(r);
+    r = history_around(w, outsider, OC_DEFAULT_CHANNEL, hidden, 10);
+    CHECK(r && r->channel_id == OC_DEFAULT_CHANNEL);
+    for (size_t i = 0; r && i < r->n_replay; i++) CHECK(r->replay[i].message_id != hidden);
     oc_dbres_free(r);
 
     oc_dbwriter_stop(w);
@@ -2395,7 +2421,7 @@ static void test_index_mentions(void) {
     oc_dbwriter_stop(w);
 
     sqlite3 *db = NULL;
-    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    CHECK(raw_open(path, &db) == SQLITE_OK);
     /* Back to before step 60; the columns of steps 61 to 63 go too (with 63's
      * and 72's triggers, back to step 6's), so that they can run again. */
     CHECK(sqlite3_exec(db, "DELETE FROM mentions; DELETE FROM schema_version WHERE version >= 60;"
@@ -2467,7 +2493,7 @@ static void test_index_mentions(void) {
 
     w = start_db(path);
     CHECK(w != NULL);
-    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    CHECK(raw_open(path, &db) == SQLITE_OK);
     sqlite3_stmt *st = NULL;
     int rows = 0, chan = 0, named = 0, none = 0;
     sqlite3_prepare_v2(db, "SELECT message_id, user_id, kind FROM mentions;", -1, &st, NULL);
@@ -3589,7 +3615,7 @@ static void account_footprint(const char *path, uint64_t uid, int out[8]) {
     };
     sqlite3 *db = NULL;
     for (int i = 0; i < 8; i++) out[i] = -1;
-    if (sqlite3_open(path, &db) != SQLITE_OK) { sqlite3_close(db); return; }
+    if (raw_open(path, &db) != SQLITE_OK) { sqlite3_close(db); return; }
     for (int i = 0; i < 8; i++) {
         sqlite3_stmt *st = NULL;
         if (sqlite3_prepare_v2(db, Q[i], -1, &st, NULL) == SQLITE_OK) {
@@ -3677,7 +3703,7 @@ static void test_audit_filters(void) {
     CHECK(owner != 0);
     {
         sqlite3 *db = NULL;
-        CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+        CHECK(raw_open(path, &db) == SQLITE_OK);
         sqlite3_busy_timeout(db, 5000);
         sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
         /* Six admin rows long ago, then 300 security rows since, two actors. */
@@ -4287,7 +4313,7 @@ static void test_badge_matches_evaluator(void) {
     CHECK(alice && bob);
 
     sqlite3 *db = NULL;
-    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    CHECK(raw_open(path, &db) == SQLITE_OK);
 
     int idx = 0, mismatches = 0, counted = 0;
     for (int muted = 0; muted < 2; muted++)
@@ -4462,7 +4488,7 @@ static void test_reply_also_channel(void) {
     /* One row, never a copy. */
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         sqlite3_stmt *st = NULL;
         sqlite3_prepare_v2(raw, "SELECT COUNT(*), SUM(also_channel) FROM messages WHERE parent_id=?1;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)root);
@@ -5116,7 +5142,7 @@ static void test_mentions_by_id(void) {
     /* A disabled person is nobody to notify. */
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         char sql[96];
         snprintf(sql, sizeof sql, "UPDATE users SET disabled=1 WHERE id=%llu;", (unsigned long long)idd);
         CHECK(sqlite3_exec(raw, sql, NULL, NULL, NULL) == SQLITE_OK);
@@ -5129,7 +5155,7 @@ static void test_mentions_by_id(void) {
     /* The body is stored as typed (REQ-054). */
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         sqlite3_stmt *st = NULL;
         sqlite3_prepare_v2(raw, "SELECT body FROM messages WHERE id=?1;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)m7);
@@ -5248,7 +5274,7 @@ static void test_factor_key_in_identity(void) {
 
     /* Second steps sealed in the data, and the identity lost: no new key. */
     sqlite3 *raw = NULL;
-    CHECK(sqlite3_open(db, &raw) == SQLITE_OK);
+    CHECK(raw_open(db, &raw) == SQLITE_OK);
     CHECK(sqlite3_exec(raw,
         "INSERT INTO users(id,subject,created_at_ms) VALUES(77,'local|sealed',0);"
         "INSERT INTO local_totp(user_id,secret) VALUES(77,x'00');", NULL, NULL, NULL) == SQLITE_OK);
@@ -5275,7 +5301,7 @@ static void test_newer_database_refused_at_start(void) {
     CHECK(w != NULL);
     if (w) oc_dbwriter_stop(w);
     sqlite3 *raw = NULL;
-    CHECK(sqlite3_open(db, &raw) == SQLITE_OK);
+    CHECK(raw_open(db, &raw) == SQLITE_OK);
     CHECK(sqlite3_exec(raw, "INSERT INTO schema_version(version) VALUES(100000);", NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(raw);
     w = oc_dbwriter_start_boot(db, &b);
@@ -5343,7 +5369,7 @@ static void test_setup_invite(void) {
     CHECK(oc_dbwriter_setup_invite(w, tok) == 0);
     {
         sqlite3 *db = NULL;
-        CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+        CHECK(raw_open(path, &db) == SQLITE_OK);
         sqlite3_busy_timeout(db, 5000);
         CHECK(sqlite3_exec(db, "UPDATE users SET disabled=1;", NULL, NULL, NULL) == SQLITE_OK);
         sqlite3_close(db);
@@ -5484,7 +5510,7 @@ static void test_delivery_cursor(void) {
     oc_dbres_free(r);
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         sqlite3_stmt *st = NULL;
         sqlite3_prepare_v2(raw, "SELECT message_id FROM delivery_cursors WHERE user_id=?;",
                            -1, &st, NULL);
@@ -5543,7 +5569,7 @@ static void test_mark_all_read(void) {
      * ack guards against, and this op must not reintroduce it per channel. */
     {
         sqlite3 *raw = NULL; sqlite3_stmt *st = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         sqlite3_prepare_v2(raw, "SELECT MAX(id) FROM messages WHERE channel_id=?;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)c2);
         CHECK(sqlite3_step(st) == SQLITE_ROW);
@@ -5587,7 +5613,7 @@ static void test_mark_all_read(void) {
     /* Every cursor now sits at its channel's newest message. */
     {
         sqlite3 *raw = NULL; sqlite3_stmt *st = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         sqlite3_prepare_v2(raw,
             "SELECT COUNT(*) FROM channel_members cm "
             "JOIN messages m ON m.channel_id = cm.channel_id "
@@ -6032,7 +6058,7 @@ static void test_invite_created_at(void) {
     /* As an invitation made before the column: no creation time. */
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         CHECK(sqlite3_exec(raw, "INSERT INTO invites(token_hash,created_by,role,expires_at_ms,uses) "
                                 "VALUES(x'00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff',"
                                 "NULL,'member',9000000000000,1);", NULL, NULL, NULL) == SQLITE_OK);
@@ -6471,7 +6497,7 @@ static void test_reset_credential(void) {
 
     /* Clearing the second step: the secret and the recovery codes go with it. */
     sqlite3 *db = NULL;
-    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    CHECK(raw_open(path, &db) == SQLITE_OK);
     sqlite3_busy_timeout(db, 5000);
     char sql[200];
     snprintf(sql, sizeof sql, "INSERT INTO local_totp(user_id, secret, confirmed_at_ms) VALUES(%llu, x'00', 1);"
@@ -6565,7 +6591,7 @@ static void test_session_policy(void) {
     CHECK(auth_local(w, 90, "sp-user", "pw", t1, NULL) == u);
     CHECK(auth_local(w, 91, "sp-user", "pw", t2, NULL) == u);
     sqlite3 *db = NULL;
-    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    CHECK(raw_open(path, &db) == SQLITE_OK);
     sqlite3_busy_timeout(db, 5000);
     CHECK(count_rows(db, "SELECT COUNT(*) FROM sessions WHERE expires_at_ms - created_at_ms = 172800000;") == 2);
     /* Both four days unused; one is then marked in use. */
@@ -6601,7 +6627,7 @@ static void test_session_policy(void) {
 static int64_t rm_count(const char *path, const char *sql, uint64_t a) {
     sqlite3 *raw = NULL;
     int64_t n = -1;
-    if (sqlite3_open(path, &raw) != SQLITE_OK) return -1;
+    if (raw_open(path, &raw) != SQLITE_OK) return -1;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(raw, sql, -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_int64(st, 1, (sqlite3_int64)a);
@@ -7293,7 +7319,7 @@ static void test_remove_user_integrations(void) {
     oc_dbres_free(r);
 
     sqlite3 *db = NULL;
-    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    CHECK(raw_open(path, &db) == SQLITE_OK);
     sqlite3_busy_timeout(db, 5000);
     CHECK(count_rows(db, "SELECT COUNT(*) FROM device_tokens;") == 0);
     CHECK(count_rows(db, "SELECT COUNT(*) FROM webhooks WHERE disabled=1;") == 1);
@@ -7453,7 +7479,7 @@ static void test_emoji_rename(void) {
     CHECK(alice && bob && carol);
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         char sql[512];
         snprintf(sql, sizeof sql,
             "INSERT INTO attachments(id,channel_id,message_id,uploader_id,storage_key,"
@@ -7558,7 +7584,7 @@ static void test_custom_emoji(void) {
     CHECK(alice && bob && carol);
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         char sql[512];
         snprintf(sql, sizeof sql,
             "INSERT INTO attachments(id,channel_id,message_id,uploader_id,storage_key,"
@@ -7876,7 +7902,7 @@ static void test_avatar(void) {
     oc_dbres_free(r);
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         char sql[768];
         snprintf(sql, sizeof sql,
             "INSERT INTO attachments(id,channel_id,message_id,uploader_id,storage_key,"
@@ -8169,7 +8195,7 @@ static void test_dm(void) {
         /* Damage the membership behind the writer's back, the way an older
          * remove_user did, using a second connection to the same file. */
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         char sql[128];
         snprintf(sql, sizeof sql,
                  "DELETE FROM channel_members WHERE channel_id=%llu;",
@@ -8461,7 +8487,7 @@ static void test_forward(void) {
      * own, the source keeps the one row, and nothing shares its storage key. */
     {
         sqlite3 *db = NULL;
-        CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+        CHECK(raw_open(path, &db) == SQLITE_OK);
         sqlite3_stmt *st = NULL;
         sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM attachments WHERE message_id=?;",
                            -1, &st, NULL);
@@ -8627,7 +8653,7 @@ static void test_invite_by_address(void) {
     /* The id is the row's, not a moment's: re-derived from what is stored, it is
      * the same, which is what lets every retry of one report name one invite. */
     sqlite3 *db = NULL;
-    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    CHECK(raw_open(path, &db) == SQLITE_OK);
     sqlite3_stmt *st = NULL;
     CHECK(sqlite3_prepare_v2(db, "SELECT token_hash FROM invites WHERE email IS NOT NULL "
                                  "ORDER BY rowid LIMIT 1;", -1, &st, NULL) == SQLITE_OK);
@@ -8671,7 +8697,7 @@ static void test_invite_by_address(void) {
     uint64_t kai = direct_signin(w, 5, ISS[0], "kai", "kai@partner.example", 1, &err);
     CHECK(kai != 0);
     oc_dbwriter_stop(w);
-    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    CHECK(raw_open(path, &db) == SQLITE_OK);
     st = NULL;
     CHECK(sqlite3_prepare_v2(db, "SELECT role FROM users WHERE id=?1;", -1, &st, NULL) == SQLITE_OK);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)kai);
@@ -8692,7 +8718,7 @@ static void test_invite_by_address(void) {
 static int general_text(const char *path, char *topic, size_t tcap, char *descr, size_t dcap) {
     topic[0] = descr[0] = '\0';
     sqlite3 *db = NULL;
-    if (sqlite3_open(path, &db) != SQLITE_OK) { sqlite3_close(db); return -1; }
+    if (raw_open(path, &db) != SQLITE_OK) { sqlite3_close(db); return -1; }
     sqlite3_stmt *st = NULL;
     int found = 0;
     if (sqlite3_prepare_v2(db, "SELECT COALESCE(topic,''), COALESCE(description,'') "
@@ -8725,7 +8751,7 @@ static void test_welcome_general(void) {
     /* Every later boot leaves it alone, including a topic someone has cleared. */
     {
         sqlite3 *db = NULL;
-        CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+        CHECK(raw_open(path, &db) == SQLITE_OK);
         CHECK(sqlite3_exec(db, "UPDATE channels SET topic='' WHERE id=1;", NULL, NULL, NULL) == SQLITE_OK);
         sqlite3_close(db);
     }
@@ -8844,7 +8870,7 @@ static int stored_member(const char *path, uint64_t ch, uint64_t uid) {
         sqlite3_close(raw); raw = NULL;
         open_path[0] = '\0';
         if (!path) return 0;
-        if (sqlite3_open(path, &raw) != SQLITE_OK) return -2;
+        if (raw_open(path, &raw) != SQLITE_OK) return -2;
         snprintf(open_path, sizeof open_path, "%s", path);
         sqlite3_prepare_v2(raw, "SELECT direct FROM channel_members WHERE channel_id=? AND user_id=?;", -1, &st, NULL);
     }
@@ -8937,7 +8963,7 @@ static void test_groups_manage(void) {
     oc_dbres_free(r);
     /* Audited. */
     sqlite3 *raw = NULL;
-    CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+    CHECK(raw_open(path, &raw) == SQLITE_OK);
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(raw, "SELECT COUNT(*) FROM audit_log WHERE action LIKE 'group.%';", -1, &st, NULL);
     CHECK(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) >= 5);
@@ -9174,7 +9200,7 @@ static void test_groups_mentions(void) {
 
     /* A clash only an identity provider could make: the group wins. */
     sqlite3 *raw = NULL;
-    CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+    CHECK(raw_open(path, &raw) == SQLITE_OK);
     char sql[128];
     snprintf(sql, sizeof sql, "UPDATE users SET display_name='design' WHERE id=%llu;", (unsigned long long)c);
     CHECK(sqlite3_exec(raw, sql, NULL, NULL, NULL) == SQLITE_OK);
@@ -9372,7 +9398,7 @@ static void test_auth_pool(void) {
         CHECK(queued);
         if (change) {
             sqlite3 *db = NULL;
-            CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+            CHECK(raw_open(path, &db) == SQLITE_OK);
             sqlite3_busy_timeout(db, 5000);
             char sql[256];
             snprintf(sql, sizeof sql,
@@ -9536,7 +9562,7 @@ static void test_alerts(void) {
     oc_dbwriter_stop(w);
 
     sqlite3 *raw = NULL;
-    CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+    CHECK(raw_open(path, &raw) == SQLITE_OK);
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(raw, "SELECT (SELECT COUNT(*) FROM alerts),"
                             " (SELECT COUNT(*) FROM audit_log WHERE action='alert.ack'),"
@@ -9593,7 +9619,7 @@ static void test_restore(void) {
     oc_dbres_free(r);
     {   /* ...with bob's reaction, and searchable again. */
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         sqlite3_stmt *q = NULL;
         sqlite3_prepare_v2(raw, "SELECT (SELECT COUNT(*) FROM reactions WHERE message_id=?1 AND user_id=?2),"
                                 " (SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'rollback' AND rowid=?1);",
@@ -9625,7 +9651,7 @@ static void test_restore(void) {
     oc_dbwriter_stop(w);
 
     sqlite3 *raw = NULL;
-    CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+    CHECK(raw_open(path, &raw) == SQLITE_OK);
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(raw, "SELECT (SELECT COUNT(*) FROM deleted_holds), (SELECT COUNT(*) FROM deleted_hold_reactions),"
                             " (SELECT COUNT(*) FROM audit_log WHERE action='message.restore'),"
@@ -9646,7 +9672,7 @@ static void test_restore(void) {
 static int action_row(const char *path, uint64_t mid, uint32_t *start, uint32_t *len, char *name, size_t cap) {
     sqlite3 *raw = NULL;
     int found = 0;
-    if (sqlite3_open(path, &raw) != SQLITE_OK) return 0;
+    if (raw_open(path, &raw) != SQLITE_OK) return 0;
     sqlite3_stmt *q = NULL;
     sqlite3_prepare_v2(raw, "SELECT text_start, text_len, COALESCE(actor_name,'') FROM actions WHERE message_id=?1;",
                        -1, &q, NULL);
@@ -9761,7 +9787,7 @@ static void test_actions(void) {
     oc_dbres_free(r);
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         sqlite3_stmt *q = NULL;
         sqlite3_prepare_v2(raw, "SELECT COUNT(*) FROM actions a JOIN messages m ON m.id=a.message_id "
                                 "WHERE CAST(m.body AS TEXT)='/me is late' AND a.text_start=4 AND a.text_len=7;",
@@ -9851,7 +9877,7 @@ static void test_actions(void) {
     /* Read aloud: the actor, then the action. */
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         CHECK(sqlite3_exec(raw, "UPDATE users SET display_name='Ada Starr' WHERE subject='local:act-alice';",
                            NULL, NULL, NULL) == SQLITE_OK);
         sqlite3_close(raw);
@@ -9909,7 +9935,7 @@ static int demo_count(sqlite3 *db, const char *sql) {
  * it closed. */
 static int64_t e2e_scalar(const char *path, const char *sql, uint64_t arg) {
     sqlite3 *db = NULL; sqlite3_stmt *st = NULL; int64_t v = -1;
-    if (sqlite3_open(path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+    if (raw_open(path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
         if (sqlite3_bind_parameter_count(st) > 0) sqlite3_bind_int64(st, 1, (sqlite3_int64)arg);
         if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int64(st, 0);
     }
@@ -10015,7 +10041,7 @@ static void test_e2e_dms(void) {
      * every row of it, and keeps the one closed just now. */
     {
         sqlite3 *db = NULL;
-        CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+        CHECK(raw_open(path, &db) == SQLITE_OK);
         char sql[160];
         snprintf(sql, sizeof sql, "UPDATE channels SET archived_at_ms = archived_at_ms - 90000000 WHERE id=%llu;",
                  (unsigned long long)ch);
@@ -10123,7 +10149,7 @@ static void test_demo_mode(void) {
     CHECK(oc_dbwriter_seed_demo(w, "Demo") == 1);
     CHECK(oc_dbwriter_seed_demo(w, "Demo") == 0);
     sqlite3 *db = NULL;
-    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    CHECK(raw_open(path, &db) == SQLITE_OK);
     CHECK(demo_count(db, "SELECT COUNT(*) FROM channels WHERE name IN ('general','random','feedback');") == 3);
     CHECK(demo_count(db, "SELECT COUNT(*) FROM messages m JOIN users u ON u.id=m.author_id "
                           "WHERE u.subject='demo:openchime' AND u.disabled=1;") == 5);
@@ -10466,7 +10492,7 @@ static void test_default_channels(void) {
     oc_dbres_free(cr);
     CHECK(ann && old && sec);
     sqlite3 *db = NULL;
-    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    CHECK(raw_open(path, &db) == SQLITE_OK);
     sqlite3_busy_timeout(db, 5000);
     char upd[128];
     snprintf(upd, sizeof upd, "UPDATE channels SET archived_at_ms=1 WHERE id=%llu;", (unsigned long long)old);
@@ -10541,7 +10567,7 @@ static void age_message(const char *path, uint64_t mid, int64_t ago_ms) {
     char sql[160];
     snprintf(sql, sizeof sql, "UPDATE messages SET created_at_ms=%lld WHERE id=%llu;",
              (long long)((int64_t)time(NULL) * 1000 - ago_ms), (unsigned long long)mid);
-    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    CHECK(raw_open(path, &db) == SQLITE_OK);
     sqlite3_busy_timeout(db, 5000);
     CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
@@ -10609,7 +10635,7 @@ static int channel_size(const char *path, uint64_t cid) {
     sqlite3 *raw = NULL;
     sqlite3_stmt *st = NULL;
     int n = -1;
-    if (sqlite3_open(path, &raw) != SQLITE_OK) return -1;
+    if (raw_open(path, &raw) != SQLITE_OK) return -1;
     sqlite3_prepare_v2(raw, "SELECT COUNT(*) FROM channel_members WHERE channel_id=?1;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)cid);
     if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
@@ -10773,7 +10799,7 @@ static char *welcome_of(const char *path, uint64_t uid) {
     sqlite3 *db = NULL;
     sqlite3_stmt *st = NULL;
     char *out = NULL;
-    if (sqlite3_open(path, &db) != SQLITE_OK) return NULL;
+    if (raw_open(path, &db) != SQLITE_OK) return NULL;
     sqlite3_prepare_v2(db,
         "SELECT m.body FROM messages m JOIN users s ON s.id = m.author_id AND s.is_system = 1 "
         "JOIN channels c ON c.id = m.channel_id AND c.kind = 'dm' "
@@ -10914,7 +10940,7 @@ static char *last_notice(const char *path, uint64_t cid, int *count) {
     sqlite3_stmt *st = NULL;
     char *out = NULL;
     *count = 0;
-    if (sqlite3_open(path, &db) != SQLITE_OK) return NULL;
+    if (raw_open(path, &db) != SQLITE_OK) return NULL;
     sqlite3_prepare_v2(db, "SELECT m.body FROM messages m JOIN users s ON s.id=m.author_id AND s.is_system=1 "
                            "WHERE m.channel_id=?1 ORDER BY m.id;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)cid);
@@ -11295,7 +11321,7 @@ static void test_spoiler_hidden(void) {
     /* The index is consistent with its content after all of it. */
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         CHECK(sqlite3_exec(raw, "INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 0);",
                            NULL, NULL, NULL) == SQLITE_OK);
         sqlite3_close(raw);
@@ -11326,17 +11352,20 @@ static void test_spoiler_excerpts(void) {
     CHECK(seen);
     oc_dbres_free(r);
 
-    static const char *const Q[2] = { "killer", "butler" };
-    for (int q = 0; q < 2; q++) {
-        r = search(w, alice, Q[q], 10);
-        CHECK(r && r->n_search == 1);
-        if (r && r->n_search == 1) CHECK(r->search[0].body && !strstr((const char *)r->search[0].body, "butler") &&
-                                         strstr((const char *)r->search[0].body, "[spoiler]"));
-        oc_dbres_free(r);
-    }
+    /* A word outside the spoiler finds it, by its covered excerpt; the hidden
+     * word finds nothing (SCHEMA.md §3bk). */
+    r = search(w, alice, "killer", 10);
+    CHECK(r && r->n_search == 1);
+    if (r && r->n_search == 1) CHECK(r->search[0].body && !strstr((const char *)r->search[0].body, "butler") &&
+                                     strstr((const char *)r->search[0].body, "[spoiler]"));
+    oc_dbres_free(r);
+    r = search(w, alice, "butler", 10);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
 
-    /* In a table cell: the channel's preview, and a search hit whichever side of
-     * the cover the word is on, where snippet() would otherwise cut a window. */
+    /* In a table cell: the channel's preview, and a search hit by the word
+     * beside the cover, where snippet() would otherwise cut a window; the
+     * covered word finds nothing. */
     memset(idem, 0x5D, sizeof idem);
     uint64_t cellmsg = send_msg(w, alice, idem, "| Who | Note |\n|---|---|\n| >!cellsecret!< | cellplain |");
     CHECK(cellmsg);
@@ -11346,25 +11375,25 @@ static void test_spoiler_excerpts(void) {
             /* contract: the excerpt wording MARKDOWN.md §1d specifies */
             CHECK(r->chlist[i].preview && !strstr(r->chlist[i].preview, "cellsecret") && strstr(r->chlist[i].preview, "Table: 1 row"));
     oc_dbres_free(r);
-    static const char *const CQ[2] = { "cellsecret", "cellplain" };
-    for (int q = 0; q < 2; q++) {
-        r = search(w, alice, CQ[q], 10);
-        CHECK(r && r->n_search == 1);
-        /* contract: the excerpt wording MARKDOWN.md §1d specifies */
-        if (r && r->n_search == 1) CHECK(r->search[0].body && !strstr((const char *)r->search[0].body, "cellsecret") && strstr((const char *)r->search[0].body, "Table: 1 row"));
-        oc_dbres_free(r);
-    }
+    r = search(w, alice, "cellplain", 10);
+    CHECK(r && r->n_search == 1);
+    /* contract: the excerpt wording MARKDOWN.md §1d specifies */
+    if (r && r->n_search == 1) CHECK(r->search[0].body && !strstr((const char *)r->search[0].body, "cellsecret") && strstr((const char *)r->search[0].body, "Table: 1 row"));
+    oc_dbres_free(r);
+    r = search(w, alice, "cellsecret", 10);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
 
-    /* In a cell past the table's columns: search on it or beside it, as above. */
+    /* In a cell past the table's columns: found beside it, not by it, as above. */
     memset(idem, 0x5E, sizeof idem);
     CHECK(send_msg(w, alice, idem, "| A | B |\n|---|---|\n| extrax | extray | >!extrasecret!< |"));
-    static const char *const XQ[2] = { "extrasecret", "extrax" };
-    for (int q = 0; q < 2; q++) {
-        r = search(w, alice, XQ[q], 10);
-        CHECK(r && r->n_search == 1);
-        if (r && r->n_search == 1) CHECK(r->search[0].body && !strstr((const char *)r->search[0].body, "extrasecret"));
-        oc_dbres_free(r);
-    }
+    r = search(w, alice, "extrax", 10);
+    CHECK(r && r->n_search == 1);
+    if (r && r->n_search == 1) CHECK(r->search[0].body && !strstr((const char *)r->search[0].body, "extrasecret"));
+    oc_dbres_free(r);
+    r = search(w, alice, "extrasecret", 10);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
 
     oc_dbres *cr = create_channel(w, alice, "sp-dest", 1);
     uint64_t dest = cr ? cr->channel_id : 0;
@@ -11434,7 +11463,7 @@ static oc_dbres *find_at(oc_dbwriter *w, uint64_t uid, uint64_t ch, uint64_t par
 }
 static void set_time(const char *path, uint64_t mid, uint64_t ms) {
     sqlite3 *raw = NULL;
-    if (sqlite3_open(path, &raw) != SQLITE_OK) return;
+    if (raw_open(path, &raw) != SQLITE_OK) return;
     sqlite3_busy_timeout(raw, 2000);
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(raw, "UPDATE messages SET created_at_ms=?2 WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
@@ -11522,7 +11551,7 @@ static oc_dbres *move_msg(oc_dbwriter *w, uint64_t uid, uint64_t mid, uint64_t t
 /* One number from the file, by a query with one id bound. */
 static int64_t raw_num(const char *path, const char *sql, uint64_t id) {
     sqlite3 *raw = NULL;
-    if (sqlite3_open(path, &raw) != SQLITE_OK) return -1;
+    if (raw_open(path, &raw) != SQLITE_OK) return -1;
     sqlite3_stmt *st = NULL;
     int64_t v = -1;
     if (sqlite3_prepare_v2(raw, sql, -1, &st, NULL) == SQLITE_OK) {
@@ -11567,14 +11596,17 @@ static void test_move_message(void) {
     CHECK(r && r->type == OC_RES_MESSAGE_MOVED && r->message_id == m1 &&
           r->channel_id == OC_DEFAULT_CHANNEL && r->move_to == dest && r->parent_id == 0 &&
           r->reply_count == 1 && r->n_members > 0 && r->n_dest_members > 0);
-    /* The marker rides the same answer, for the source's readers. */
+    oc_dbres_free(r);
+    /* The marker follows the answer, a notice for the source's readers. */
     int marker = 0;
-    for (oc_dbres *n = r ? r->next : NULL; n; n = n->next)
+    for (oc_dbres *n; (n = oc_dbwriter_next_result(w)) != NULL; oc_dbres_free(n))
         if (n->type == OC_RES_NOTICE && n->channel_id == OC_DEFAULT_CHANNEL && n->body &&
             /* contract: the line left behind names the mover and the destination */
-            memmem(n->body, n->body_len, "moved a message to #mv-dest", 27)) marker = 1;
+            memmem(n->body, n->body_len, "moved a message to #mv-dest", 27)) marker = (int)n->message_id;
     CHECK(marker);
-    oc_dbres_free(r);
+    /* ...and is stored there, a message of the source channel. */
+    CHECK(raw_num(path, "SELECT channel_id FROM messages WHERE id=?1 AND deleted_at_ms IS NULL;",
+                  (uint64_t)marker) == OC_DEFAULT_CHANNEL);
     CHECK(raw_num(path, "SELECT channel_id FROM messages WHERE id=?1;", m1) == (int64_t)dest);
     CHECK(raw_num(path, "SELECT channel_id FROM mentions WHERE message_id=?1;", m1) == (int64_t)dest);
     CHECK(raw_num(path, "SELECT channel_id FROM pins WHERE message_id=?1;", m1) == (int64_t)dest);
@@ -11668,7 +11700,7 @@ static int activity_has(oc_dbwriter *w, uint64_t uid, uint8_t kind, uint64_t mid
 }
 static int raw_count(const char *path, const char *sql) {
     sqlite3 *raw = NULL;
-    if (sqlite3_open(path, &raw) != SQLITE_OK) return -1;
+    if (raw_open(path, &raw) != SQLITE_OK) return -1;
     int n = count_rows(raw, sql);
     sqlite3_close(raw);
     return n;
@@ -11741,7 +11773,7 @@ static void test_reminders(void) {
 static void snip_row(const char *path, uint64_t id, uint64_t uploader, uint64_t channel,
                      const char *mime, uint64_t size, int final) {
     sqlite3 *raw = NULL;
-    CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+    CHECK(raw_open(path, &raw) == SQLITE_OK);
     sqlite3_busy_timeout(raw, 5000);
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(raw,
@@ -11791,7 +11823,7 @@ static uint64_t snip_post(oc_dbwriter *w, uint64_t user, uint64_t channel, uint8
 }
 static int64_t snip_num(const char *path, const char *sql, uint64_t id) {
     sqlite3 *raw = NULL;
-    if (sqlite3_open(path, &raw) != SQLITE_OK) return -1;
+    if (raw_open(path, &raw) != SQLITE_OK) return -1;
     sqlite3_stmt *st = NULL;
     int64_t v = -1;
     if (sqlite3_prepare_v2(raw, sql, -1, &st, NULL) == SQLITE_OK) {
@@ -11903,7 +11935,7 @@ static void test_collapsed(void) {
     oc_dbres_free(wait_result(w));
     oc_dbwriter_stop(w);
     sqlite3 *db = NULL;
-    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    CHECK(raw_open(path, &db) == SQLITE_OK);
     sqlite3_stmt *st = NULL;
     int left = -1;
     if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM collapsed_messages;", -1, &st, NULL) == SQLITE_OK &&
@@ -11921,7 +11953,7 @@ static void test_collapsed(void) {
 static uint64_t add_visitor(const char *path, const char *subject, const char *name, uint64_t channel) {
     sqlite3 *raw = NULL;
     uint64_t id = 0;
-    if (sqlite3_open(path, &raw) != SQLITE_OK) return 0;
+    if (raw_open(path, &raw) != SQLITE_OK) return 0;
     sqlite3_busy_timeout(raw, 5000);
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(raw, "INSERT INTO users(subject,display_name,created_at_ms,kind) "
@@ -12075,7 +12107,7 @@ static void test_visitor_channels(void) {
     CHECK(stored_member(path, pub, v) < 0);
     {
         sqlite3 *raw = NULL;
-        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
         char sql[128];
         snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM user_group_members WHERE user_id=%llu;",
                  (unsigned long long)v);
@@ -12163,7 +12195,7 @@ static void test_usage(void) {
     CHECK(auth_local(w, 953, "us-member", "pw", NULL, NULL) == member);
     const uint64_t today = (uint64_t)time(NULL) / 86400;
     sqlite3 *db = NULL;
-    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    CHECK(raw_open(path, &db) == SQLITE_OK);
     sqlite3_busy_timeout(db, 5000);
     char sql[512];
     snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM user_active_days WHERE user_id=%llu AND day=%llu;",
