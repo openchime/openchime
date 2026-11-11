@@ -8929,7 +8929,7 @@ static void build_notify_prefs(sqlite3 *db, uint64_t user_id, oc_dbres *r) {
     sqlite3_finalize(st);
 
     sqlite3_prepare_v2(db,
-        "SELECT channel_id, level, muted FROM notification_prefs WHERE user_id=? "
+        "SELECT channel_id, level, muted, follow_threads FROM notification_prefs WHERE user_id=? "
         "ORDER BY channel_id LIMIT ?;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
@@ -8941,6 +8941,7 @@ static void build_notify_prefs(sqlite3 *db, uint64_t user_id, oc_dbres *r) {
         r->nprefs[r->n_nprefs].channel_id = (uint64_t)sqlite3_column_int64(st, 0);
         r->nprefs[r->n_nprefs].level = (uint8_t)sqlite3_column_int(st, 1);
         r->nprefs[r->n_nprefs].muted = (uint8_t)sqlite3_column_int(st, 2);
+        r->nprefs[r->n_nprefs].follow_threads = (uint8_t)sqlite3_column_int(st, 3);
         r->n_nprefs++;
     }
     sqlite3_finalize(st);
@@ -9021,6 +9022,34 @@ static oc_dbres *process_set_mute(sqlite3 *db, const oc_job *j) {
                              r->user_id = j->user_id; return r; }
     r->type = OC_RES_NOTIFY_PREFS;
     r->user_id = j->user_id;
+    build_notify_prefs(db, j->user_id, r);
+    return r;
+}
+
+/* Follow every thread in a conversation, or stop (REQ-282). The same upsert
+ * discipline as mute's: one column touched, the level and mute left as they
+ * were. Answers with the whole snapshot, which the net thread sends to each of
+ * the user's connections. */
+static oc_dbres *process_set_channel_thread_follow(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    if (!channel_read_access(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; r->user_id = j->user_id; return r;
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO notification_prefs(user_id, channel_id, level, follow_threads) "
+        "VALUES(?1, ?2, (SELECT notify_default FROM users WHERE id=?1), ?3) "
+        "ON CONFLICT(user_id, channel_id) DO UPDATE SET follow_threads=excluded.follow_threads;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int  (st, 3, j->follow_on ? 1 : 0);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_INTERNAL;
+                             r->user_id = j->user_id; return r; }
     build_notify_prefs(db, j->user_id, r);
     return r;
 }
@@ -11430,6 +11459,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_CALL_EVENT)      return process_call_event(w->db, j);
     if (j->type == OC_JOB_DELETE_WEBHOOK)  return process_delete_webhook(w->db, j);
     if (j->type == OC_JOB_SET_NOTIFY_PREF) return process_set_notify_pref(w->db, j);
+    if (j->type == OC_JOB_SET_CHANNEL_THREAD_FOLLOW) return process_set_channel_thread_follow(w->db, j);
     if (j->type == OC_JOB_SET_MUTE)        return process_set_mute(w->db, j);
     if (j->type == OC_JOB_SET_NOTIFY_DEFAULT) return process_set_notify_default(w->db, j);
     if (j->type == OC_JOB_SET_STATUS)      return process_set_status(w->db, j);

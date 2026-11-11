@@ -1710,6 +1710,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->channel_id = ne[i].channel_id;
                 e->op = ne[i].level;
                 e->status = ne[i].muted;      /* distinct from the level */
+                e->participant = ne[i].follow_threads;   /* every thread followed (REQ-282) */
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_THREAD_SUMMARY) {
@@ -3718,6 +3719,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_thread_follow tf = { c->message_id, c->channel_id, c->op };
                 if (oc_encode_set_thread_follow(&w, OC_PROTOCOL_VERSION, &tf) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_CHANNEL_THREAD_FOLLOW) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_channel_thread_follow sf = { c->channel_id, c->op };
+                if (oc_encode_set_channel_thread_follow(&w, OC_PROTOCOL_VERSION, &sf) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_MARK_THREAD_READ) {

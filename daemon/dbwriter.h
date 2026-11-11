@@ -33,7 +33,9 @@
  *
  * Participation is DERIVED, never stored: you are in a thread if you wrote its
  * root or a live reply to it. `thread_follows` carries only overrides — state 1
- * an explicit follow of one you never wrote in, state 0 an explicit unfollow.
+ * an explicit follow of one you never wrote in, state 0 an explicit unfollow --
+ * and `notification_prefs.follow_threads` follows every thread in a
+ * conversation at once (REQ-282).
  * The UNFOLLOW is an outer guard rather than an arm of the OR, because it
  * OUTRANKS having replied: that is the whole meaning of "turn off replies", and
  * it is the rule a plain OR silently loses.
@@ -57,7 +59,14 @@
     "                  AND rpx.deleted_at_ms IS NULL) "                         \
     "     OR EXISTS(SELECT 1 FROM thread_follows tfy "                          \
     "                WHERE tfy.user_id = " usr " AND tfy.root_id = " root " "   \
-    "                  AND tfy.state = 1) ) )"
+    "                  AND tfy.state = 1) "                                     \
+    /* Every thread in the conversation, followed (REQ-282): the per-thread     \
+     * unfollow above still outranks it for its thread, and mute, which the    \
+     * decision weighs, outranks both. */                                      \
+    "     OR EXISTS(SELECT 1 FROM messages rcx "                                \
+    "                JOIN notification_prefs npx "                              \
+    "                  ON npx.channel_id = rcx.channel_id AND npx.user_id = " usr " " \
+    "                WHERE rcx.id = " root " AND npx.follow_threads = 1) ) )"
 
 /* --- Jobs (net thread -> writer) ---------------------------------------- */
 
@@ -296,6 +305,9 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* Fold a message away for its reader, or open it (message_id, save_op
         * 1 or 0): a per-person set, told to all of their connections. */
        OC_JOB_SET_COLLAPSED = 149,
+       /* Follow every thread in a conversation, or stop (REQ-282): channel_id
+        * and follow_on; answered with the NOTIFY_PREFS snapshot. */
+       OC_JOB_SET_CHANNEL_THREAD_FOLLOW = 150,
        /* FIND_AT_TIME: the message at `find_at_ms` in channel_id, in the
         * thread parent_id or its main scroll (0). A read. */
        OC_JOB_FIND_AT_TIME = 152 };
@@ -907,7 +919,7 @@ typedef struct {
 } oc_channel_row;
 
 /* One row in a NOTIFY_PREFS result (REQ-130): a channel and its level. */
-typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; } oc_notify_pref_row;
+typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; uint8_t follow_threads; } oc_notify_pref_row;
 
 /* One row in a CLIENT_SETTINGS result: a synced key/value. */
 typedef struct { char *key; char *value; } oc_client_setting_row;

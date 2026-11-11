@@ -246,6 +246,9 @@ typedef struct {
      * unread badge, so a conversation can be quiet but still countable, or
      * countable but silent. */
     uint8_t  muted;
+    /* Every thread in it followed (REQ-282): a reply anywhere in it counts as a
+     * reply in a thread this reader is in, unless that thread is unfollowed. */
+    uint8_t  follow_threads;
     /* Per-member read cursors (REQ-090 seen-by): the highest message id each
      * member has read in this channel. Advance-only; drives "seen by …". */
     oc_read_cursor_view *readers;

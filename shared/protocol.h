@@ -202,7 +202,7 @@
  * ids, the thread's most recent distinct repliers, newest first, and is sent
  * live to the channel's members when a reply is posted or deleted, not only in
  * backfill (REQ-060). Fields appended to a fixed layout. */
-#define OC_PROTOCOL_VERSION 36u
+#define OC_PROTOCOL_VERSION 37u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -603,6 +603,9 @@ typedef enum {
     OC_MSG_COLLAPSED_UPDATED    = 0x0118, /* S->C, to my connections: a message folded or opened; and replayed */
     OC_MSG_WORKSPACE_SETTINGS   = 0x0119, /* S->C, read-only: the workspace settings clients act on, after WORKSPACE_INFO */
     OC_MSG_READ_RECEIPTS        = 0x011A, /* both: whether I share my read receipts; C->S sets or asks, S->C tells */
+    /* Follow every thread in a conversation (REQ-282): the answer is the
+     * setter's NOTIFY_PREFS, to each of their connections. */
+    OC_MSG_SET_CHANNEL_THREAD_FOLLOW = 0x011B, /* C->S {channel_id, on} */
     OC_MSG_FIND_AT_TIME         = 0x011E, /* C->S, the message at a time in a conversation or thread */
     OC_MSG_FOUND_AT_TIME        = 0x011F, /* S->C, its answer: the first at or after it, else the last before */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
@@ -1427,7 +1430,7 @@ typedef struct { uint8_t status; } oc_set_presence;
  * built before it existed still reads the frame it always read. */
 typedef struct { uint64_t user_id; uint8_t status; uint8_t dnd; } oc_presence_update;
 /* `thread_root` (REQ-121): the thread the typer is composing in, 0 for the
- * channel's main scroll. Appended to both: protocol 35. */
+ * channel's main scroll. Appended to both: protocol 36. */
 typedef struct { uint64_t channel_id; uint64_t thread_root; } oc_typing;
 typedef struct { uint64_t channel_id; uint64_t user_id; uint64_t thread_root; } oc_typing_update;
 /* Notification preferences (REQ-130/131). */
@@ -1512,7 +1515,12 @@ typedef struct { uint8_t ok; uint16_t code; } oc_device_token_ack;
  * is a repeated list, so an extra byte per entry shifts every entry after the first.
  * My first note here claimed otherwise. Hence the bump to protocol 3, which the
  * search cursor needs regardless. */
-typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; } oc_notify_pref_entry;
+/* `follow_threads` (REQ-282): every thread in the conversation is followed, as
+ * if each were, unless muted or one is unfollowed by itself. Appended per entry:
+ * a layout change, so protocol 37. */
+typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; uint8_t follow_threads; } oc_notify_pref_entry;
+/* SET_CHANNEL_THREAD_FOLLOW: follow every thread in a conversation, or stop. */
+typedef struct { uint64_t channel_id; uint8_t on; } oc_set_channel_thread_follow;
 typedef struct { uint8_t level; } oc_set_notify_default;
 /* `notify_default` (REQ-134) rides here so a client learns the fallback with the rest
  * of its notification state, rather than needing a second round trip. Appended at the
@@ -2061,6 +2069,7 @@ oc_result oc_encode_list_threads(oc_wbuf *w, uint16_t version, const oc_list_thr
 oc_result oc_encode_thread_summary(oc_wbuf *w, uint16_t version, const oc_thread_summary *m);
 oc_result oc_encode_threads(oc_wbuf *w, uint16_t version, const oc_threads *m);
 oc_result oc_encode_set_thread_follow(oc_wbuf *w, uint16_t version, const oc_set_thread_follow *m);
+oc_result oc_encode_set_channel_thread_follow(oc_wbuf *w, uint16_t version, const oc_set_channel_thread_follow *m);
 oc_result oc_encode_mark_thread_read(oc_wbuf *w, uint16_t version, const oc_mark_thread_read *m);
 oc_result oc_encode_register_device_token(oc_wbuf *w, uint16_t version, const oc_register_device_token *m);
 oc_result oc_encode_unregister_device_token(oc_wbuf *w, uint16_t version, oc_slice token);
@@ -2286,6 +2295,7 @@ oc_result oc_decode_list_threads(oc_rbuf *p, oc_list_threads *m);
 oc_result oc_decode_thread_summary(oc_rbuf *p, oc_thread_summary *m);
 oc_result oc_decode_threads(oc_rbuf *p, oc_threads *m);
 oc_result oc_decode_set_thread_follow(oc_rbuf *p, oc_set_thread_follow *m);
+oc_result oc_decode_set_channel_thread_follow(oc_rbuf *p, oc_set_channel_thread_follow *m);
 oc_result oc_decode_mark_thread_read(oc_rbuf *p, oc_mark_thread_read *m);
 oc_result oc_decode_register_device_token(oc_rbuf *p, oc_register_device_token *m);
 oc_result oc_decode_unregister_device_token(oc_rbuf *p, oc_slice *token);

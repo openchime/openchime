@@ -1062,6 +1062,7 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_DM, ACT_ROLE_ADMIN, ACT_ROLE_MEMBER, ACT_REMOVE,
        /* channel menu */
        ACT_OPEN, ACT_JOIN, ACT_NOTIFY_ALL, ACT_NOTIFY_MENTIONS, ACT_NOTIFY_NONE, ACT_WEBHOOK_CREATE,
+       ACT_FOLLOW_THREADS,
        /* global action launcher (Ctrl-K) — replaces the remaining slash commands */
        ACT_NEWCHAN, ACT_NEWDM, ACT_SEARCH, ACT_NICK, ACT_AWAY, ACT_ONLINE, ACT_DND, ACT_PASSWD, ACT_RECEIPTS,
        ACT_PREFS, ACT_WEBHOOKS, ACT_LEAVE, ACT_INVITE, ACT_PROFILE, ACT_UPLOAD,
@@ -1181,7 +1182,7 @@ static uint64_t tui_parse_day(const char *s) {
     return r == (time_t)-1 ? 0 : (uint64_t)r * 1000u;
 }
 /* `e2e`: the channel is an encrypted DM, whose session is in `state`. */
-static void menu_build_channel(int joined, int summarize, int e2e, uint8_t state) {
+static void menu_build_channel(int joined, int summarize, int e2e, uint8_t state, int follow_threads) {
     g_nmenu = 0;
     if (!joined) g_menu[g_nmenu++] = (menuitem){ "Join",              ACT_JOIN };
     g_menu[g_nmenu++] = (menuitem){ "Open",                ACT_OPEN };
@@ -1195,6 +1196,9 @@ static void menu_build_channel(int joined, int summarize, int e2e, uint8_t state
     g_menu[g_nmenu++] = (menuitem){ "Notify: all",         ACT_NOTIFY_ALL };
     g_menu[g_nmenu++] = (menuitem){ "Notify: mentions",    ACT_NOTIFY_MENTIONS };
     g_menu[g_nmenu++] = (menuitem){ "Notify: none",        ACT_NOTIFY_NONE };
+    /* Every thread in it followed (REQ-282); not in an encrypted DM. */
+    if (!e2e) g_menu[g_nmenu++] = (menuitem){ follow_threads ? "Stop following all threads" : "Follow all threads",
+                                              ACT_FOLLOW_THREADS };
     g_menu[g_nmenu++] = (menuitem){ "Webhooks",            ACT_WEBHOOKS };
     g_menu[g_nmenu++] = (menuitem){ "Create webhook",      ACT_WEBHOOK_CREATE };
     if (joined)  g_menu[g_nmenu++] = (menuitem){ "Leave",  ACT_LEAVE };
@@ -3951,6 +3955,10 @@ int main(int argc, char **argv) {
                     else if (id == ACT_NOTIFY_ALL)      oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_ALL);
                     else if (id == ACT_NOTIFY_MENTIONS) oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_MENTIONS);
                     else if (id == ACT_NOTIFY_NONE)     oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_NONE);
+                    else if (id == ACT_FOLLOW_THREADS) {
+                        const oc_channel *fc = oc_model_channel((oc_model *)oc_client_model(cl), act_cid);
+                        oc_client_channel_thread_follow(cl, act_cid, (uint8_t)!(fc && fc->follow_threads));
+                    }
                     /* global launcher actions */
                     else if (id == ACT_NEWCHAN) { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
                     else if (id == ACT_NEWDM)   { dmp_open(&dmpick, oc_client_model(cl)); dmpick_open = 1; }
@@ -4117,7 +4125,8 @@ int main(int argc, char **argv) {
                         sidebar_opts_save(cl);
                     } else if (focus < mm->n_channels) {                     /* channel action menu */
                         const oc_channel *mc = &mm->channels[focus];
-                        menu_build_channel(mc->joined, oc_model_summarize_available(mm), mc->e2e, e2e_state(mm, mc));
+                        menu_build_channel(mc->joined, oc_model_summarize_available(mm), mc->e2e, e2e_state(mm, mc),
+                                           mc->follow_threads);
                         act_cid = mm->channels[focus].channel_id; act_uid = 0; act_mid = 0; act_title = "Channel";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }

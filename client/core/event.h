@@ -511,6 +511,7 @@ enum {
     OC_CMD_SET_PRIORITY,    /* replace my priority-people list (REQ-135) */
     OC_CMD_LIST_THREADS,    /* threads I am in (REQ-062): op = filter */
     OC_CMD_THREAD_FOLLOW,   /* follow/unfollow: channel_id + message_id = root, op = on */
+    OC_CMD_CHANNEL_THREAD_FOLLOW,   /* every thread in channel_id: op = on (REQ-282) */
     OC_CMD_MARK_THREAD_READ,/* its replies are read: message_id = root, server_time = up to */
     OC_CMD_LIST_NOTIFY_PREFS, /* request all notification settings (DND + per-channel) */
     OC_CMD_SET_SETTING,     /* upsert a synced client setting: body=key, body2=value (empty value deletes) */

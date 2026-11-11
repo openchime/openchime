@@ -340,6 +340,9 @@ void oc_client_set_read_receipts(oc_client *c, int share);
 /* REQ-062: threads I am in, and the two acts the view offers. */
 void oc_client_list_threads(oc_client *c, uint8_t filter);
 void oc_client_thread_follow(oc_client *c, uint64_t channel_id, uint64_t root_id, uint8_t on);
+/* Follow every thread in a conversation, or stop (REQ-282). The answer is the
+ * whole NOTIFY_PREFS snapshot, which updates each channel's follow_threads. */
+void oc_client_channel_thread_follow(oc_client *c, uint64_t channel_id, uint8_t on);
 void oc_client_mark_thread_read(oc_client *c, uint64_t root_id, uint64_t up_to);
 void oc_client_list_notify_prefs(oc_client *c);
 void oc_client_toggle_prefs(oc_client *c, int open);

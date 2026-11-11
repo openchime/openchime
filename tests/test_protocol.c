@@ -1685,7 +1685,7 @@ static void test_notify_frames(void) {
     }
     {
         oc_notify_pref_entry ents[2] = {
-            { .channel_id = 7, .level = OC_NOTIFY_MENTIONS },
+            { .channel_id = 7, .level = OC_NOTIFY_MENTIONS, .follow_threads = 1 },
             { .channel_id = 9, .level = OC_NOTIFY_NONE },
         };
         oc_notify_prefs in;
@@ -1695,8 +1695,26 @@ static void test_notify_frames(void) {
         oc_notify_pref_entry got[4]; uint16_t n = 0; uint8_t dflt = 0xFF;
         CHECK(oc_decode_notify_prefs(&p, got, 4, &n, &dflt) == OC_OK && n == 2);
         CHECK(dflt == OC_NOTIFY_MENTIONS);
-        CHECK(got[0].channel_id == 7 && got[0].level == OC_NOTIFY_MENTIONS);
-        CHECK(got[1].channel_id == 9 && got[1].level == OC_NOTIFY_NONE);
+        CHECK(got[0].channel_id == 7 && got[0].level == OC_NOTIFY_MENTIONS && got[0].follow_threads == 1);
+        CHECK(got[1].channel_id == 9 && got[1].level == OC_NOTIFY_NONE && got[1].follow_threads == 0);
+    }
+    /* Follow every thread in a conversation (REQ-282). */
+    {
+        oc_set_channel_thread_follow in = { 7, 1 };
+        ROUNDTRIP(oc_encode_set_channel_thread_follow(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_SET_CHANNEL_THREAD_FOLLOW, h, p);
+        oc_set_channel_thread_follow out = { 0, 0 };
+        CHECK(oc_decode_set_channel_thread_follow(&p, &out) == OC_OK && out.channel_id == 7 && out.on == 1);
+    }
+    {
+        oc_set_channel_thread_follow in = { 7, 1 };
+        uint8_t fr[64];
+        oc_wbuf w; oc_wbuf_init(&w, fr, sizeof fr);
+        CHECK(oc_encode_set_channel_thread_follow(&w, OC_PROTOCOL_VERSION, &in) == OC_OK);
+        fr[OC_HEADER_SIZE + 8] = 2;                         /* not a flag */
+        oc_header h; oc_rbuf p; oc_set_channel_thread_follow out;
+        CHECK(oc_parse_frame(fr, w.len, &h, &p) == OC_OK);
+        CHECK(oc_decode_set_channel_thread_follow(&p, &out) == OC_E_MALFORMED);
     }
 }
 

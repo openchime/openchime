@@ -3828,6 +3828,17 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_CHANNEL_THREAD_FOLLOW) {
+            /* Every thread in a conversation (REQ-282); answered, as a level is,
+             * with the snapshot to each of the user's connections. */
+            oc_set_channel_thread_follow sf;
+            if (oc_decode_set_channel_thread_follow(&p, &sf) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_CHANNEL_THREAD_FOLLOW, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->channel_id = sf.channel_id; j->follow_on = sf.on;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_SCHEDULE) {
             oc_schedule sc; oc_schedule_day days[OC_SCHEDULE_DAYS];
             if (oc_decode_schedule(&p, &sc, days) != OC_OK) return -1;
@@ -8015,6 +8026,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             ents[n].channel_id = r->nprefs[i].channel_id;
             ents[n].level = r->nprefs[i].level;
             ents[n].muted = r->nprefs[i].muted;      /* */
+            ents[n].follow_threads = r->nprefs[i].follow_threads;   /* REQ-282 */
             n++;
         }
         /* Designated, not positional: adding `notify_default` before `count` silently

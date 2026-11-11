@@ -2850,7 +2850,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     case OC_EV_NOTIFY_PREF: {
         oc_channel *c = oc_model_channel(m, e->channel_id);
-        if (c) { c->notify_level = e->op; c->muted = e->status; }
+        /* `participant` carries follow_threads here (REQ-282): in every thread. */
+        if (c) { c->notify_level = e->op; c->muted = e->status; c->follow_threads = e->participant; }
         break;
     }
     case OC_EV_GROUP:

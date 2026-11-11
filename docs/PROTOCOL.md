@@ -213,8 +213,9 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 36** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 37** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 37 appended `follow_threads` to each `NOTIFY_PREFS` entry (§5.12, REQ-282). Version
 > 36 put `also_channel` in `SEND_REPLY` and `THREAD_REPLY` and `parent_id` in
 > `BROADCAST`, each in the fixed part ahead of the body: a thread reply can also
 > be posted to the channel's main scroll (REQ-062, §5.10). Version
@@ -1971,9 +1972,20 @@ differently.
 settings.
 
 **`NOTIFY_PREFS` (S → C), `0x0093`** `{ notify_default: u8, count: u16,
-count × { channel_id: u64, level: u8, muted: u8 } }` — the snapshot. It is sent both as the reply to `LIST_NOTIFY_PREFS` and, after any
+count × { channel_id: u64, level: u8, muted: u8, follow_threads: u8 } }` — the snapshot. It is sent both as the reply to `LIST_NOTIFY_PREFS` and, after any
 `SET_*`, **pushed to every one of the user's connections** so a change on one
-device updates the others.
+device updates the others. `follow_threads` (since version 37) is `1` when the
+person follows every thread in the conversation (REQ-282).
+
+**`SET_CHANNEL_THREAD_FOLLOW` (C → S), `0x011B`** `{ channel_id: u64, on: u8 }` —
+follow every thread in a conversation the caller can read, or stop (REQ-282);
+any `on` but `0` or `1` is malformed. Answered with `NOTIFY_PREFS` to each of the
+caller's connections. With it on, every reply in the conversation counts as one
+in a thread the person is in, for the push decision, the threads view
+(`LIST_THREADS`) and `THREAD_REPLY`'s per-recipient `participant` byte, which the
+clients' own decision reads -- one rule, `OC_THREAD_PARTICIPANT_SQL`. Mute still
+silences it, and an explicit unfollow of one thread (`SET_THREAD_FOLLOW` off)
+still wins for that thread. A new frame: no version change of its own.
 
 **`SET_SNOOZE` (C → S), `0x00CA`** `{ minutes: u32 }` — **pause** notifications
 for that many minutes from now; `0` ends the pause. More than a week (10,080

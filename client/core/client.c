@@ -972,6 +972,14 @@ void oc_client_thread_follow(oc_client *c, uint64_t channel_id, uint64_t root_id
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_channel_thread_follow(oc_client *c, uint64_t channel_id, uint8_t on) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CHANNEL_THREAD_FOLLOW);
+    if (!cmd) return;
+    cmd->channel_id = channel_id; cmd->op = on ? 1 : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 /* `up_to` 0 means every reply in it, which is what opening one means. */
 void oc_client_mark_thread_read(oc_client *c, uint64_t root_id, uint64_t up_to) {
     if (!c || !root_id) return;

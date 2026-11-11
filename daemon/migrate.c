@@ -1270,6 +1270,12 @@ static const char MIGRATION_0073[] =
      * `parent_id IS NULL OR also_channel=1`. Every row before this reads 0. */
     "ALTER TABLE messages ADD COLUMN also_channel INTEGER NOT NULL DEFAULT 0;";
 
+static const char MIGRATION_0074[] =
+    /* Follow every thread in a conversation (REQ-282): a per-person,
+     * per-conversation preference beside the level and mute. Every row before
+     * this reads 0. */
+    "ALTER TABLE notification_prefs ADD COLUMN follow_threads INTEGER NOT NULL DEFAULT 0;";
+
 static const char MIGRATION_0071[] =
     /* What kind of principal a user row is. Every row so far is a person
      * ('human'). A web visitor ('visitor') is a row with subject
@@ -1678,6 +1684,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 71, MIGRATION_0071 },
     { 72, MIGRATION_0072 },
     { 73, MIGRATION_0073 },
+    { 74, MIGRATION_0074 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

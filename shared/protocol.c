@@ -1418,8 +1418,23 @@ oc_result oc_encode_notify_prefs(oc_wbuf *w, uint16_t version, const oc_notify_p
         oc_w_u64(w, m->entries[i].channel_id);
         oc_w_u8(w, m->entries[i].level);
         oc_w_u8(w, m->entries[i].muted);
+        oc_w_u8(w, m->entries[i].follow_threads);   /* REQ-282 */
     }
     return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_set_channel_thread_follow(oc_wbuf *w, uint16_t version, const oc_set_channel_thread_follow *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_CHANNEL_THREAD_FOLLOW);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u8(w, m->on ? 1u : 0u);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_channel_thread_follow(oc_rbuf *p, oc_set_channel_thread_follow *m) {
+    m->channel_id = oc_r_u64(p);
+    m->on = oc_r_u8(p);
+    if (m->on > 1) return OC_E_MALFORMED;   /* a flag, nothing else */
+    return r_done(p);
 }
 
 oc_result oc_decode_set_notify_pref(oc_rbuf *p, oc_set_notify_pref *m) {
@@ -1556,8 +1571,9 @@ oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint
         uint64_t cid = oc_r_u64(p);
         uint8_t level = oc_r_u8(p);
         uint8_t muted = oc_r_u8(p);
+        uint8_t follow = oc_r_u8(p);
         if (i < cap) { entries[i].channel_id = cid; entries[i].level = level;
-                       entries[i].muted = muted; }
+                       entries[i].muted = muted; entries[i].follow_threads = follow; }
     }
     return r_done(p);
 }

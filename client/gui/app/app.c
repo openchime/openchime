@@ -35270,6 +35270,12 @@ static void show_channel_menu(oc_win *hwnd, const oc_model *m, uint64_t cid, flo
         snprintf(lbl, sizeof lbl, "%sNothing",
                  c->notify_level == OC_NOTIFY_NONE ? "\xE2\x9C\x93 " : "    ");
         mi_item(22, lbl);
+        /* Every thread in it followed (REQ-282), ticked when on. Not in an
+         * encrypted DM, whose replies the daemon cannot weigh. */
+        if (!c->e2e) {
+            snprintf(lbl, sizeof lbl, "%sFollow all threads", c->follow_threads ? "\xE2\x9C\x93 " : "    ");
+            mi_item(24, lbl);
+        }
         if (c->kind != OC_CHANNEL_KIND_DM) {
             mi_sep();
             /* both frames had always existed on the wire and reached no
@@ -35373,6 +35379,12 @@ static void channel_menu_run(oc_win *hwnd, int cmd) {
     case 31: {                                 /* */
         const oc_channel *mc = oc_model_channel((oc_model *)m, cid);
         oc_client_set_mute(g_client, cid, mc && mc->muted ? 0 : 1);
+        break; }
+    case 24: {   /* every thread in it followed, or not (REQ-282) */
+        const oc_channel *mc = oc_model_channel((oc_model *)m, cid);
+        int on = !(mc && mc->follow_threads);
+        oc_client_channel_thread_follow(g_client, cid, (uint8_t)on);
+        fb_confirm(on ? "Following every thread here." : "No longer following every thread here.");
         break; }
     case 30:                                   /* */
         if (oc_sidebar_toggle_star(&g_sb, cid)) sidebar_opts_save();

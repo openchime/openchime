@@ -2435,7 +2435,9 @@ static void test_index_mentions(void) {
                            /* 0071's kind of principal. */
                            "ALTER TABLE users DROP COLUMN kind;"
                            /* 0073's reply also in the channel. */
-                           "ALTER TABLE messages DROP COLUMN also_channel;",
+                           "ALTER TABLE messages DROP COLUMN also_channel;"
+                           /* 0074's following every thread. */
+                           "ALTER TABLE notification_prefs DROP COLUMN follow_threads;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -4481,6 +4483,73 @@ static void test_reply_also_channel(void) {
     /* An edit reaches every member, as any message's does. */
     r = do_edit(w, bob, OC_DEFAULT_CHANNEL, both, "both places, edited");
     CHECK(r && r->type == OC_RES_EDIT_OK && r->n_members == 2);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* Following every thread in a conversation (REQ-282): stored and listed, and it
+ * puts a person who never wrote in a thread into it -- the one rule the push
+ * audience and THREAD_REPLY's per-recipient byte share -- unless they unfollowed
+ * that thread. */
+static int participant_of(const oc_dbres *r, uint64_t uid) {
+    for (size_t i = 0; r && i < r->n_members; i++)
+        if (r->members[i] == uid) return r->member_participant ? r->member_participant[i] : -1;
+    return -1;
+}
+static void test_follow_all_threads(void) {
+    const char *path = tdb("follow_all.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "fa-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "fa-bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "fa-carol", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob && carol);
+    uint8_t idem[OC_IDEM_LEN]; memset(idem, 0xF1, sizeof idem);
+    uint64_t root = send_msg(w, alice, idem, "a thread");
+    CHECK(root != 0);
+
+    /* Before: carol never wrote in it, so a reply finds her outside it. */
+    oc_dbres *r = send_reply(w, bob, OC_DEFAULT_CHANNEL, root, "first");
+    CHECK(r && r->type == OC_RES_REPLY_OK && participant_of(r, carol) == 0);
+    oc_dbres_free(r);
+
+    /* carol follows every thread in the channel: stored, and listed. */
+    oc_job *j = oc_job_new(OC_JOB_SET_CHANNEL_THREAD_FOLLOW, 1);
+    j->user_id = carol; j->channel_id = OC_DEFAULT_CHANNEL; j->follow_on = 1;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->user_id == carol);
+    int listed = 0;
+    for (size_t i = 0; r && i < r->n_nprefs; i++)
+        if (r->nprefs[i].channel_id == OC_DEFAULT_CHANNEL) listed = r->nprefs[i].follow_threads;
+    CHECK(listed == 1);
+    oc_dbres_free(r);
+
+    /* Now a reply finds her in it. */
+    r = send_reply(w, bob, OC_DEFAULT_CHANNEL, root, "second");
+    CHECK(r && r->type == OC_RES_REPLY_OK && participant_of(r, carol) == 1);
+    oc_dbres_free(r);
+
+    /* An explicit unfollow of this thread wins for this thread. */
+    j = oc_job_new(OC_JOB_SET_THREAD_FOLLOW, 1);
+    j->user_id = carol; j->channel_id = OC_DEFAULT_CHANNEL; j->parent_id = root; j->follow_on = 0;
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    r = send_reply(w, bob, OC_DEFAULT_CHANNEL, root, "third");
+    CHECK(r && r->type == OC_RES_REPLY_OK && participant_of(r, carol) == 0);
+    oc_dbres_free(r);
+
+    /* Off again: a new thread finds her outside it once more. */
+    j = oc_job_new(OC_JOB_SET_CHANNEL_THREAD_FOLLOW, 1);
+    j->user_id = carol; j->channel_id = OC_DEFAULT_CHANNEL; j->follow_on = 0;
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    memset(idem, 0xF2, sizeof idem);
+    uint64_t root2 = send_msg(w, alice, idem, "another thread");
+    r = send_reply(w, bob, OC_DEFAULT_CHANNEL, root2, "reply");
+    CHECK(r && r->type == OC_RES_REPLY_OK && participant_of(r, carol) == 0);
     oc_dbres_free(r);
     oc_dbwriter_stop(w);
     cleanup_db(path);
@@ -11046,6 +11115,7 @@ int run_dbwriter_tests(void) {
     test_reactions();
     test_threads();
     test_reply_also_channel();
+    test_follow_all_threads();
     test_thread_repliers();
     test_thread_list();
     test_badge_matches_evaluator();
