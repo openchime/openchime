@@ -87,6 +87,20 @@ check(cold.enc['openchime.wasm'] === 'gzip' && cold.enc['openchime.js'] === 'gzi
 const wasmKB = (cold.wire['openchime.wasm'] || 0) / 1024;
 check(wasmKB > 100 && wasmKB < 4096, `the wasm came over the wire once, ${wasmKB.toFixed(0)} KB`);
 
+// The context menu is the client's own: a right-click on the canvas, or the
+// menu key on the input that holds the keyboard, opens no browser menu over it.
+// A menu the browser opens cannot be seen from the page, so what is checked is
+// that the event's default, which is that menu, was cancelled.
+const menus = await page.evaluate(() => ['canvas', 'oc-ime'].map((id) => {
+  const el = document.getElementById(id);
+  if (!el) return [id, 'missing'];
+  const ev = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 });
+  el.dispatchEvent(ev);
+  return [id, ev.defaultPrevented ? 'cancelled' : 'opened'];
+})).catch((e) => [['page', String(e)]]);
+check(menus.length === 2 && menus.every(([, r]) => r === 'cancelled'),
+      'a right-click opens no browser menu: ' + menus.map(([id, r]) => `${id} ${r}`).join(', '));
+
 const warm = await load();
 check(warm.gone && !warm.failed, 'a second load came up too');
 const again = ['page', 'openchime.js', 'openchime.wasm'].map((f) => [f, warm.wire[f] || 0]);

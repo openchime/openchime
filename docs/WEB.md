@@ -86,7 +86,9 @@ on SDL's clipboard and the application gets the Ctrl+V it would have had, so
 the paste takes the same path as on Windows. A copy goes to the browser's
 clipboard through `navigator.clipboard.writeText`
 (`oc_plat_clipboard_set_text`), and an image the client asks for outside a
-paste through the async clipboard API. The badge is
+paste through the async clipboard API. The context menu is the client's
+own: once it runs, the page cancels the browser's menu, so a right-click or the
+menu key opens only the client's. The badge is
 the tab's title; a permalink reaches the running client through the page's
 `?open=` query. Accessibility is an ARIA mirror (`a11y_web.c`): the tree the
 application publishes becomes a hidden layer of elements over the canvas,

@@ -232,6 +232,12 @@ void  oc_plat_window_attach(SDL_Window *w) {
         if (canvas) { canvas.addEventListener("pointerdown", grab); canvas.addEventListener("focus", grab); }
         window.addEventListener("focus", grab);
         grab();
+        /* The context menu is the application's: it opens its own from the
+         * right button and the menu key, and the browser would open its
+         * menu for the canvas (or the input above) on top of it. Only the
+         * browser's default is cancelled; the event still propagates, and the
+         * button reaches SDL through its own mouse events, untouched. */
+        document.addEventListener("contextmenu", (ev) => { ev.preventDefault(); });
         /* Paste is the browser's: SDL cancels every key held with Ctrl, which
          * would cancel the paste with it, so Ctrl+V (Cmd+V) is kept from SDL
          * here, ahead of its listeners, and its default left alone. The
