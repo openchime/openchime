@@ -602,6 +602,11 @@ typedef struct oc_job {
     uint32_t       media_duration_ms;
     uint16_t       media_width, media_height;
     uint64_t       media_poster_id;
+    /* ...or, for a snippet (REQ-226), its title, language and the first bytes
+     * of its text for search. All heap. */
+    char          *snip_title, *snip_lang;
+    char          *snip_text;
+    size_t         snip_text_len;
 
     /* Synced client settings. SET uses client_type + key + value (empty value
      * deletes); LIST uses client_type only. */
@@ -1063,6 +1068,7 @@ typedef struct {
     uint32_t duration_ms;
     uint16_t width, height;
     uint64_t poster_id;
+    char    *title, *language;   /* heap; a snippet's (REQ-226), else NULL */
 } oc_attach_meta;
 
 typedef struct {

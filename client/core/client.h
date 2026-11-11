@@ -624,6 +624,12 @@ uint64_t oc_client_post_video(oc_client *c, uint64_t channel_id, uint64_t thread
                               uint8_t *video, size_t video_len, uint8_t *poster, size_t poster_len,
                               uint32_t duration_ms, uint16_t width, uint16_t height,
                               const char *caption);
+/* Post a snippet (REQ-226): `text` (copied; at most OC_SNIPPET_MAX_SIZE) as a
+ * text/plain attachment with a title and a language (lexer.h names; "" for
+ * none), into the channel or the thread `thread_root`. Returns the job's tag,
+ * or 0 if nothing was queued. */
+uint64_t oc_client_post_snippet(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                                const char *title, const char *language, const char *text);
 /* Fetch a video message into memory for playing (REQ-165): like
  * oc_client_fetch_attachment, under the attachment ceiling rather than the
  * inline one, with progress. Returns the tag (the attachment id). */

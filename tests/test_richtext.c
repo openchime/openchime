@@ -7,6 +7,7 @@
 
 #include "check.h"
 #include "richtext.h"
+#include "lexer.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -949,6 +950,51 @@ static void test_spoiler_cell_excerpt(void) {
 }
 
 /* Every excerpt hides what a spoiler hides. */
+/* The snippet lexer (lexer.h, REQ-226): each language's keywords, strings,
+ * comments and numbers, as spans of exactly those bytes; an unknown language
+ * all plain. `want` lists the coloured spans in order as "kind:text" joined by
+ * '|'. */
+static int lexed_as(int lang, const char *src, const char *want) {
+    oc_lex_tok t[64];
+    size_t n = oc_lex(lang, src, strlen(src), t, 64);
+    char got[1024] = "";
+    size_t o = 0;
+    for (size_t i = 0; i < n && o < sizeof got - 64; i++)
+        o += (size_t)snprintf(got + o, sizeof got - o, "%s%c:%.*s", i ? "|" : "",
+                              "PKSCN"[t[i].kind], (int)t[i].len, src + t[i].start);
+    if (strcmp(got, want) != 0) { fprintf(stderr, "  lexed %d: got [%s] want [%s]\n", lang, got, want); return 0; }
+    return 1;
+}
+static void test_lexer(void) {
+    CHECK(oc_lex_language("python") == OC_LANG_PYTHON && oc_lex_language("PY") == OC_LANG_PYTHON);
+    CHECK(oc_lex_language("bash") == OC_LANG_SHELL && oc_lex_language("yml") == OC_LANG_YAML);
+    CHECK(oc_lex_language("cobol") == OC_LANG_NONE && oc_lex_language("") == OC_LANG_NONE);
+    /* contract: the stored name round-trips, and an unknown language is called plain text */
+    CHECK(strcmp(oc_lex_name(OC_LANG_GO), "go") == 0 && strcmp(oc_lex_label(OC_LANG_NONE), "Plain text") == 0);
+
+    CHECK(lexed_as(OC_LANG_C, "int x = 42; /* note */ return \"a\\\"b\"; // end",
+                   "K:int|N:42|C:/* note */|K:return|S:\"a\\\"b\"|C:// end"));
+    CHECK(lexed_as(OC_LANG_C, "#include <stdio.h>", "K:#include"));
+    CHECK(lexed_as(OC_LANG_PYTHON, "def f(x):  # why\n    return \"\"\"doc\nmore\"\"\" or None",
+                   "K:def|C:# why|K:return|S:\"\"\"doc\nmore\"\"\"|K:or|K:None"));
+    CHECK(lexed_as(OC_LANG_JS, "const s = `t ${a}`; let n = 3.5e2;",
+                   "K:const|S:`t ${a}`|K:let|N:3.5e2"));
+    CHECK(lexed_as(OC_LANG_SHELL, "echo 'hi' # note\nurl=a#b", "K:echo|S:'hi'|C:# note"));
+    CHECK(lexed_as(OC_LANG_JSON, "{\"a\": -1, \"b\": true, \"c\": null}",
+                   "S:\"a\"|N:-1|S:\"b\"|K:true|S:\"c\"|K:null"));
+    CHECK(lexed_as(OC_LANG_YAML, "key: \"v\"  # c\nflag: yes", "S:\"v\"|C:# c|K:yes"));
+    CHECK(lexed_as(OC_LANG_SQL, "SELECT id FROM t WHERE n = 'x' -- why",
+                   "K:SELECT|K:FROM|K:WHERE|S:'x'|C:-- why"));
+    CHECK(lexed_as(OC_LANG_GO, "func main() { var r = 'x'; fmt.Println(`raw`, 7) }",
+                   "K:func|K:var|S:'x'|S:`raw`|N:7"));
+    /* A digit inside a word is part of it; an unclosed string ends at its line. */
+    CHECK(lexed_as(OC_LANG_C, "x2 = \"open\ny", "S:\"open"));
+    /* Unknown: nothing coloured. A full array ends the pass rather than overrunning. */
+    oc_lex_tok one[1];
+    CHECK(oc_lex(OC_LANG_NONE, "int x", 5, one, 1) == 0);
+    CHECK(oc_lex(OC_LANG_C, "int long", 8, one, 1) == 1 && one[0].len == 3);
+}
+
 static void test_spoiler_excerpt(void) {
     char out[160];
     const char *b = "The killer is >!the butler!< obviously";
@@ -1075,8 +1121,9 @@ int run_richtext_tests(void) {
     test_spoiler_excerpt();
     test_spoiler_cell_excerpt();
     test_spoiler_hidden_text();
+    test_lexer();
     printf("test_richtext: emphasis, literal delimiters, escapes, code, fenced blocks, labelled links, "
            "quotes and lists, nesting, byte offsets, autolinking, truncation, tables and their cells and excerpts, "
-           "time tokens in every zone and however many, spoilers\n");
+           "time tokens in every zone and however many, spoilers, the snippet lexer in eight languages\n");
     return failures;
 }

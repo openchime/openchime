@@ -5980,6 +5980,23 @@ static void test_thread_meta_live(void) {
     oc_model_free(&m);
 }
 
+/* A paste is offered as a snippet (REQ-226) past 40 lines or 4 KiB, and not
+ * past 1 MiB, which no snippet can hold. A trailing newline is not a line. */
+static void test_snippet_offer(void) {
+    static char buf[OC_SNIPPET_MAX_SIZE + 2];
+    size_t n = 0;
+    for (int i = 0; i < 40; i++) n += (size_t)snprintf(buf + n, sizeof buf - n, "line %d\n", i);
+    CHECK(!oc_snippet_offer(buf, n));                      /* 40 lines, the last newline-ended */
+    n += (size_t)snprintf(buf + n, sizeof buf - n, "one more");
+    CHECK(oc_snippet_offer(buf, n));                       /* 41 */
+    memset(buf, 'a', 4096);
+    CHECK(!oc_snippet_offer(buf, 4096));
+    CHECK(oc_snippet_offer(buf, 4097));                    /* one line, but long */
+    memset(buf, 'a', sizeof buf);
+    CHECK(!oc_snippet_offer(buf, OC_SNIPPET_MAX_SIZE + 1));
+    CHECK(!oc_snippet_offer(NULL, 0) && !oc_snippet_offer("", 0));
+}
+
 static void test_action_pairing(void) {
     oc_queue q; oc_queue_init(&q);
     oc_net_frames *f = oc_net_frames_new(&q);
@@ -6078,6 +6095,7 @@ int run_client_core_tests(void) {
     }
 
     test_group_dm_title();
+    test_snippet_offer();
     test_action_pairing();
     test_groups_model();
     test_chanmem_overlap();

@@ -2389,3 +2389,14 @@ message the transcript has still to scroll to (0 once it is on it), and `seps`
 counts the date dividers drawn, each of which offers the jump when clicked.
 Today's date lands on today's first message, exact; a date after the newest
 lands on the newest, not exact, with a notice saying so.
+
+## Reading the snippets harness
+
+`tools/gui/snippets.sh` posts a snippet through the test hook's
+`snippet <title>|<language>|<text>` verb (`\n` for a newline), which is the
+path Create snippet takes. It reads the dump's `snipcard` lines, one per card
+drawn, with `loaded` 1 once its text has been fetched and `rect` the card to
+click, and the `snipview` line: `open`, the snippet it is on, the language
+(lexer.h's number) and `spans`, the coloured runs the lexer found. A card that
+loads, a click that opens the viewer, Python coloured into several spans, and
+Esc closing it make a pass.

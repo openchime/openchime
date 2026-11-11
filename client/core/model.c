@@ -1395,6 +1395,11 @@ static void msg_add_attach(oc_msg *msg, const oc_ev *e) {
     a->duration_ms = e->duration_ms;
     a->width = e->media_w; a->height = e->media_h;
     a->poster_id = e->poster_id;
+    /* A snippet's (REQ-226): the title in the spare heap slot, the language in
+     * the short one. */
+    snprintf(a->title, sizeof a->title, "%s", (e->media_kind == OC_MEDIA_SNIPPET && e->topic) ? e->topic : "");
+    snprintf(a->language, sizeof a->language, "%.*s", (int)(sizeof a->language - 1),
+             e->media_kind == OC_MEDIA_SNIPPET ? e->emoji : "");
 }
 
 /* Attach an attachment to the message with `message_id`, searching every channel
@@ -2000,6 +2005,15 @@ uint64_t oc_model_reminder(const oc_model *m, uint64_t message_id) {
             return m->thread_msgs[i].saved ? m->thread_msgs[i].remind_at : 0;
     for (size_t i = 0; i < m->n_saved; i++)
         if (m->saved[i].message_id == message_id) return m->saved[i].remind_at;
+    return 0;
+}
+
+int oc_snippet_offer(const char *text, size_t len) {
+    if (!text || len == 0 || len > OC_SNIPPET_MAX_SIZE) return 0;
+    if (len > OC_SNIPPET_PASTE_BYTES) return 1;
+    size_t lines = 1;
+    for (size_t i = 0; i < len; i++)
+        if (text[i] == '\n' && i + 1 < len && ++lines > OC_SNIPPET_PASTE_LINES) return 1;
     return 0;
 }
 

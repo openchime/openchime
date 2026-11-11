@@ -1703,6 +1703,38 @@ uint64_t oc_client_post_video(oc_client *c, uint64_t channel_id, uint64_t thread
     return tag;
 }
 
+uint64_t oc_client_post_snippet(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                                const char *title, const char *language, const char *text) {
+    size_t n = text ? strlen(text) : 0;
+    if (!c || !channel_id || n == 0 || n > OC_SNIPPET_MAX_SIZE) return 0;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_POST_SNIPPET);
+    if (!cmd) return 0;
+    cmd->blob = malloc(n);
+    if (!cmd->blob) { oc_cmd_free(cmd); return 0; }
+    memcpy(cmd->blob, text, n);
+    cmd->blob_len = n;
+    cmd->xfer_tag = next_xfer_tag();
+    cmd->channel_id = channel_id;
+    cmd->message_id = thread_root;
+    cmd->body = strdup("");
+    /* Cut to the caps on a character boundary; the daemon refuses longer. */
+    char t[OC_SNIPPET_TITLE_MAX + 1], l[OC_SNIPPET_LANG_MAX + 1];
+    const char *src = (title && title[0]) ? title : "Snippet";
+    snprintf(t, sizeof t, "%s", src);
+    if (strlen(src) > OC_SNIPPET_TITLE_MAX) {
+        /* Cut: back to the start of the character the cut fell in. */
+        size_t tl = OC_SNIPPET_TITLE_MAX;
+        while (tl > 0 && ((unsigned char)src[tl] & 0xC0) == 0x80) tl--;
+        t[tl] = '\0';
+    }
+    snprintf(l, sizeof l, "%s", language ? language : "");
+    cmd->body2 = strdup(t);
+    cmd->body3 = strdup(l);
+    uint64_t tag = cmd->xfer_tag;
+    oc_queue_push(&c->cmds, cmd);
+    return tag;
+}
+
 uint64_t oc_client_fetch_media(oc_client *c, uint64_t attachment_id) {
     if (!c || !attachment_id) return 0;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_FETCH);

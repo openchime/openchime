@@ -97,7 +97,7 @@ static void test_wire(void) {
     }
 
     /* ATTACH_MEDIA_SET / OK and FILE_ENTRY. */
-    oc_attach_media_set ms = { 71, OC_MEDIA_VIDEO_MESSAGE, 299999, 640, 360, 69 };
+    oc_attach_media_set ms = { 71, OC_MEDIA_VIDEO_MESSAGE, 299999, 640, 360, 69, {0}, {0}, {0} };
     oc_wbuf_init(&w, buf, sizeof buf);
     CHECK(oc_encode_attach_media_set(&w, OC_PROTOCOL_VERSION, &ms) == OC_OK);
     CHECK(oc_parse_frame(buf, w.len, &h, &p) == OC_OK && h.msg_type == OC_MSG_ATTACH_MEDIA_SET);

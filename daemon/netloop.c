@@ -1998,6 +1998,8 @@ static uint16_t fill_attach_entries(oc_attach_entry *out, const oc_attach_meta *
         out[i].width = att[i].width;
         out[i].height = att[i].height;
         out[i].poster_id = att[i].poster_id;
+        out[i].title = oc_slice_str(att[i].title ? att[i].title : "");
+        out[i].language = oc_slice_str(att[i].language ? att[i].language : "");
     }
     return (uint16_t)n;
 }
@@ -3350,6 +3352,18 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->media_width = ms.width;
             j->media_height = ms.height;
             j->media_poster_id = ms.poster_id;
+            if (ms.media_kind == OC_MEDIA_SNIPPET) {
+                j->att_size = OC_SNIPPET_MAX_SIZE;
+                j->snip_title = slice_dup(ms.title);
+                j->snip_lang  = slice_dup(ms.language);
+                j->snip_text  = malloc(ms.text.len + 1);
+                if (j->snip_text) {
+                    if (ms.text.len) memcpy(j->snip_text, ms.text.ptr, ms.text.len);
+                    j->snip_text[ms.text.len] = '\0';
+                }
+                j->snip_text_len = ms.text.len;
+                if (!j->snip_title || !j->snip_lang || !j->snip_text) { oc_job_free(j); return -1; }
+            }
             oc_dbwriter_submit(dbw, j);
             continue;
         }

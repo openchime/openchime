@@ -1747,6 +1747,39 @@ belongs to the cancelled transfer and is dropped, never taken for the new one's.
 
 ---
 
+### 5.14b Snippets (REQ-226)
+
+A snippet is an **ordinary attachment** too: a `text/plain` upload of at most
+1 MiB, marked with a title and an optional language, shown as a card with its
+first lines and opened whole with its words coloured (`shared/lexer.h`: C,
+Python, JavaScript, shell, JSON, YAML, SQL and Go; anything else plain). Posting
+it is three steps:
+
+1. Upload the text, `mime` `text/plain`.
+2. **`ATTACH_MEDIA_SET`** with `media_kind` `2` (protocol 39). After the kind
+   byte come `{ title: str, language: str, text: str }` in place of a video's
+   facts: the title (1 to 120 bytes), the language (at most 16 bytes of `a`–`z`,
+   `0`–`9`, `+`, `#`, `-`; empty for plain), and the text's first 64 KiB, for
+   search. Answered `ATTACH_MEDIA_OK`, or `UNKNOWN_ATTACHMENT` as for a video,
+   `MEDIA_TOO_LARGE` past 1 MiB, and `MEDIA_INVALID` for an upload that is not
+   `text/plain`, already sent, untitled, a language outside those characters, or
+   text that is not UTF-8.
+3. `SEND` (or `SEND_REPLY`) with its id in the attachment list.
+
+An attachment entry of kind `2` carries `{ title: str, language: str }` after the
+kind byte, where a video's carries its facts. Search (`SEARCH`) finds a
+message by its snippet's title or text: such hits follow the message hits on the
+first page of a search with words and no filters, newest first, under the same
+read gate, their excerpt "Snippet: <title>". Deleting the message, or the
+storage sweep reclaiming the bytes, takes the snippet out of search.
+
+The size cap is enforced at `ATTACH_MEDIA_SET`, when the daemon learns the
+upload is a snippet; `UPLOAD_BEGIN` carries no kind. Clients refuse a longer
+text before uploading it, and offer a paste of more than 40 lines or 4 KiB as
+one.
+
+---
+
 ### 5.14a Video messages (REQ-162–165, ARCH-110)
 
 A video message is an **ordinary attachment** — a VP9 and Opus MP4 recorded in the
@@ -3586,7 +3619,7 @@ this table cannot silently gain a shared value.
 | `0x00D7` | `UNFURL` | S → C | a URL's fetched preview (REQ-222); also replayed on backfill |
 | `0x00D8` | `SET_PROFILE` | C → S | my profile fields (REQ-240) |
 | `0x00D9` | `FORWARD` | S → C | what a forwarded message points at (REQ-057); also replayed on backfill |
-| `0x00DA` | `ATTACH_MEDIA_SET` | C → S | mark an upload as a video message, with its poster (REQ-162) |
+| `0x00DA` | `ATTACH_MEDIA_SET` | C → S | mark an upload as a video message, with its poster (REQ-162), or a snippet, with its title and language (REQ-226) |
 | `0x00DB` | `ATTACH_MEDIA_OK` | S → C | accepted |
 | `0x00DC` | `TTS_INFO` | S → C | read-aloud availability and voices (REQ-291/295) |
 | `0x00DD` | `AUDIO_GET` | C → S | the speech of one message (REQ-291) |

@@ -610,6 +610,10 @@ enum {
      * MP4, blob2 = the poster JPEG, media_*.
      * Uploads both, sends ATTACH_MEDIA_SET, then SEND or SEND_REPLY. */
     OC_CMD_POST_VIDEO,
+    /* Post a snippet (REQ-226): blob = its text (owned), body2 = title, body3 =
+     * language, channel_id, message_id = a thread root or 0. Uploaded as
+     * text/plain, marked OC_MEDIA_SNIPPET, then posted, as a video message. */
+    OC_CMD_POST_SNIPPET,
     /* Post files as ONE message (REQ-140): paths = the local files (or, with
      * mem, the names of in-memory items), body = the
      * text (may be empty), message_id = a thread root or 0. Uploads each in

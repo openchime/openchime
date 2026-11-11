@@ -599,6 +599,13 @@ static void push_attachments(oc_queue *to_ui, uint64_t channel_id, uint64_t mess
         size_t mn = att[i].mime.len < sizeof e->author_name - 1 ? att[i].mime.len : sizeof e->author_name - 1;
         memcpy(e->author_name, att[i].mime.ptr, mn); e->author_name[mn] = '\0';
         (void)fn;
+        if (att[i].media_kind == OC_MEDIA_SNIPPET) {   /* REQ-226 */
+            e->topic = malloc(att[i].title.len + 1);
+            if (e->topic) { if (att[i].title.len) memcpy(e->topic, att[i].title.ptr, att[i].title.len);
+                            e->topic[att[i].title.len] = '\0'; }
+            size_t ln = att[i].language.len < sizeof e->emoji - 1 ? att[i].language.len : sizeof e->emoji - 1;
+            memcpy(e->emoji, att[i].language.ptr, ln); e->emoji[ln] = '\0';
+        }
         oc_queue_push(to_ui, e);
     }
 }
@@ -837,6 +844,13 @@ static void xq_start(disp_ctx *ctx) {
         char pname[128];
         snprintf(pname, sizeof pname, "%s.jpg", c->body2 ? c->body2 : "video-message");
         begin_upload(ctx, c->channel_id, pname, "image/jpeg", c->blob2, c->blob2_len, 3);
+    } else if (c->type == OC_CMD_POST_SNIPPET) {
+        /* A snippet (REQ-226): its text, then its title and language, then the
+         * message carrying it -- the video message's last two steps. */
+        ctx->xq->vstage = 0; ctx->xq->vposter = ctx->xq->vvideo = 0;
+        char sname[OC_SNIPPET_TITLE_MAX + 8];
+        snprintf(sname, sizeof sname, "%s.txt", (c->body2 && c->body2[0]) ? c->body2 : "snippet");
+        begin_upload(ctx, c->channel_id, sname, "text/plain", c->blob, c->blob_len, 5);
     }
 }
 
@@ -2065,8 +2079,10 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                         q->vvideo = x->id;
                         xfer_reset(x);
                         uint8_t mf[64]; oc_wbuf mw; oc_wbuf_init(&mw, mf, sizeof mf);
-                        oc_attach_media_set ms = { q->vvideo, OC_MEDIA_VIDEO_MESSAGE, job->duration_ms,
-                                                   job->media_w, job->media_h, q->vposter };
+                        oc_attach_media_set ms; memset(&ms, 0, sizeof ms);
+                        ms.attachment_id = q->vvideo; ms.media_kind = OC_MEDIA_VIDEO_MESSAGE;
+                        ms.duration_ms = job->duration_ms;
+                        ms.width = job->media_w; ms.height = job->media_h; ms.poster_id = q->vposter;
                         if (oc_encode_attach_media_set(&mw, OC_PROTOCOL_VERSION, &ms) == OC_OK &&
                             write_all(ctx->conn, ctx->fd, mf, mw.len, ctx->stop) == 0) {
                             x->mode = 3;
@@ -2075,6 +2091,35 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                         } else {
                             xfer_notice(ctx, 2, "video message: could not send");
                         }
+                    }
+                    continue;
+                }
+                if (x->purpose == 5) {
+                    /* A snippet's text is up: mark it one, with its first bytes
+                     * for search; ATTACH_MEDIA_OK posts it as for a video. */
+                    oc_xqueue *q = ctx->xq;
+                    oc_cmd *job = q->active;
+                    q->vvideo = x->id;
+                    xfer_reset(x);
+                    static uint8_t sf[OC_MAX_FRAME_SIZE];
+                    oc_wbuf sw; oc_wbuf_init(&sw, sf, sizeof sf);
+                    oc_attach_media_set ms; memset(&ms, 0, sizeof ms);
+                    ms.attachment_id = q->vvideo;
+                    ms.media_kind = OC_MEDIA_SNIPPET;
+                    ms.title = oc_slice_str(job->body2 ? job->body2 : "");
+                    ms.language = oc_slice_str(job->body3 ? job->body3 : "");
+                    ms.text.ptr = job->blob;
+                    ms.text.len = job->blob_len < OC_SNIPPET_INDEX_MAX ? job->blob_len : OC_SNIPPET_INDEX_MAX;
+                    /* Not cut inside a character. */
+                    while (ms.text.len < job->blob_len && ms.text.len > 0 &&
+                           (job->blob[ms.text.len] & 0xC0) == 0x80) ms.text.len--;
+                    if (oc_encode_attach_media_set(&sw, OC_PROTOCOL_VERSION, &ms) == OC_OK &&
+                        write_all(ctx->conn, ctx->fd, sf, sw.len, ctx->stop) == 0) {
+                        x->mode = 3;
+                        x->id = q->vvideo;
+                        q->vstage = 2;
+                    } else {
+                        xfer_notice(ctx, 2, "snippet: could not send");
                     }
                     continue;
                 }
@@ -2191,9 +2236,10 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                         e->parent_id = job->message_id;
                         oc_queue_push(ctx->to_ui, e);
                     }
-                    xfer_notice(ctx, 1, "video message sent");
+                    xfer_notice(ctx, 1, job->type == OC_CMD_POST_SNIPPET ? "snippet posted" : "video message sent");
                 } else {
-                    xfer_notice(ctx, 2, "video message: could not send");
+                    xfer_notice(ctx, 2, job->type == OC_CMD_POST_SNIPPET ? "snippet: could not send"
+                                                                         : "video message: could not send");
                 }
                 xfer_reset(ctx->xfer);
             }
@@ -2626,10 +2672,14 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                  * a frontend following the tag must see. The status line above
                  * already says why, so the notice carries no text of its own. */
                 if (ctx && ctx->xfer->mode == 1 && about_transfer) xfer_notice(ctx, 2, NULL);
-                if (ctx && ctx->xfer->mode == 3 && about_transfer)
+                if (ctx && ctx->xfer->mode == 3 && about_transfer) {
+                    int snip = ctx->xq->active && ctx->xq->active->type == OC_CMD_POST_SNIPPET;
                     xfer_notice(ctx, 2, err.code == OC_ERR_MEDIA_TOO_LARGE
-                                        ? "video message: larger than this server accepts"
-                                        : "video message refused by the server");
+                                        ? (snip ? "snippet: larger than 1 MB"
+                                                : "video message: larger than this server accepts")
+                                        : (snip ? "snippet refused by the server"
+                                                : "video message refused by the server"));
+                }
                 /* Talking mode moves on: the queue is what matters, not this
                  * one message (ARCH-111). The reason travels so a frontend can
                  * say something once rather than for every message. */
@@ -4183,7 +4233,8 @@ static int run_connection(oc_net *n, int reconnecting,
                 (c->type == OC_CMD_UPLOAD && c->body) || c->type == OC_CMD_FETCH ||
                 (c->type == OC_CMD_POST_FILES && c->n_paths) ||
                 (c->type == OC_CMD_DOWNLOAD && c->body) ||
-                (c->type == OC_CMD_POST_VIDEO && c->blob && c->blob2)) {
+                (c->type == OC_CMD_POST_VIDEO && c->blob && c->blob2) ||
+                (c->type == OC_CMD_POST_SNIPPET && c->blob && c->blob_len)) {
                 xq_add(&n->xq, c);             /* owned by the queue now */
                 continue;
             }

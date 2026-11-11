@@ -1441,6 +1441,34 @@ static void test_admin_frames(void) {
         CHECK(oc_decode_message_moved(&p, &out) == OC_OK && out.message_id == 5150 &&
               out.from_channel == 30 && out.to_channel == 31 && out.to_parent == 0 && out.count == 4);
     }
+    {   /* A snippet (REQ-226): marked with its title, language and searchable text... */
+        oc_attach_media_set in; memset(&in, 0, sizeof in);
+        in.attachment_id = 81; in.media_kind = OC_MEDIA_SNIPPET;
+        in.title = oc_slice_str("deploy.sh"); in.language = oc_slice_str("shell");
+        in.text = oc_slice_str("echo hi\n");
+        ROUNDTRIP(oc_encode_attach_media_set(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ATTACH_MEDIA_SET, h, p);
+        oc_attach_media_set out;
+        CHECK(oc_decode_attach_media_set(&p, &out) == OC_OK && out.attachment_id == 81 &&
+              out.media_kind == OC_MEDIA_SNIPPET && out.duration_ms == 0 && out.poster_id == 0);
+        CHECK(slice_eq_str(out.title, "deploy.sh") && slice_eq_str(out.language, "shell") &&
+              slice_eq_str(out.text, "echo hi\n"));
+    }
+    {   /* ...and carried on a message with them, beside an ordinary file. */
+        oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str(""), 0, {{0}}, {0}, 0, 0 };
+        in.n_attach = 2;
+        in.attach[0].id = 81; in.attach[0].filename = oc_slice_str("deploy.sh.txt");
+        in.attach[0].mime = oc_slice_str("text/plain"); in.attach[0].size = 8;
+        in.attach[0].media_kind = OC_MEDIA_SNIPPET;
+        in.attach[0].title = oc_slice_str("deploy.sh"); in.attach[0].language = oc_slice_str("shell");
+        in.attach[1].id = 82; in.attach[1].filename = oc_slice_str("a.txt");
+        in.attach[1].mime = oc_slice_str("text/plain"); in.attach[1].size = 1;
+        ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
+        oc_broadcast out;
+        CHECK(oc_decode_broadcast(&p, &out) == OC_OK && out.n_attach == 2);
+        CHECK(out.attach[0].media_kind == OC_MEDIA_SNIPPET && slice_eq_str(out.attach[0].title, "deploy.sh") &&
+              slice_eq_str(out.attach[0].language, "shell"));
+        CHECK(out.attach[1].id == 82 && out.attach[1].media_kind == OC_MEDIA_NONE && out.attach[1].title.len == 0);
+    }
     {   /* A removed member brought back (REQ-033). */
         oc_enable_user in = { 43 };
         ROUNDTRIP(oc_encode_enable_user(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ENABLE_USER, h, p);

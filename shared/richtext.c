@@ -1253,3 +1253,157 @@ int oc_rt_target(const char *body, size_t len, const oc_rt_span *span,
     *off = o; *tlen = L;
     return 1;
 }
+
+/* --- the snippet lexer (lexer.h, REQ-226) --------------------------------- */
+
+#include "lexer.h"
+
+typedef struct {
+    const char *name, *label;
+    const char *line1;                /* a line comment ("" none) */
+    const char *bopen, *bclose;       /* a block comment ("" none) */
+    const char *quotes;               /* the characters a string opens with */
+    int         triple;               /* Python's """ and ''' */
+    int         nocase;               /* SQL's keywords in any case */
+    int         hash_word;            /* '#' starts a comment only at a word's start */
+    const char *const *kw;
+} lex_lang;
+
+static const char *const KW_C[] = { "auto","break","case","char","const","continue","default","do",
+    "double","else","enum","extern","float","for","goto","if","inline","int","long","register",
+    "restrict","return","short","signed","sizeof","static","struct","switch","typedef","union",
+    "unsigned","void","volatile","while","bool","true","false","NULL","#include","#define",
+    "#if","#ifdef","#ifndef","#endif","#else","#elif","#pragma", NULL };
+static const char *const KW_PY[] = { "False","None","True","and","as","assert","async","await",
+    "break","class","continue","def","del","elif","else","except","finally","for","from","global",
+    "if","import","in","is","lambda","nonlocal","not","or","pass","raise","return","try","while",
+    "with","yield","self", NULL };
+static const char *const KW_JS[] = { "await","break","case","catch","class","const","continue",
+    "debugger","default","delete","do","else","export","extends","false","finally","for","function",
+    "if","import","in","instanceof","let","new","null","of","return","super","switch","this","throw",
+    "true","try","typeof","undefined","var","void","while","with","yield","async","static", NULL };
+static const char *const KW_SH[] = { "if","then","else","elif","fi","case","esac","for","while",
+    "until","do","done","in","function","return","exit","export","local","readonly","set","unset",
+    "echo","cd","source","true","false", NULL };
+static const char *const KW_JSON[] = { "true","false","null", NULL };
+static const char *const KW_YAML[] = { "true","false","null","yes","no","on","off", NULL };
+static const char *const KW_SQL[] = { "select","from","where","insert","into","values","update",
+    "set","delete","create","table","index","view","drop","alter","add","column","primary","key",
+    "foreign","references","join","left","right","inner","outer","on","and","or","not","null","is",
+    "in","as","order","by","group","having","limit","offset","union","all","distinct","case","when",
+    "then","else","end","exists","begin","commit","rollback","with","default","unique","like", NULL };
+static const char *const KW_GO[] = { "break","case","chan","const","continue","default","defer",
+    "else","fallthrough","for","func","go","goto","if","import","interface","map","package","range",
+    "return","select","struct","switch","type","var","true","false","nil","iota", NULL };
+
+static const lex_lang LEX_LANGS[OC_LANG_COUNT] = {
+    [OC_LANG_NONE]   = { "",           "Plain text", "",   "",   "",   "",     0, 0, 0, NULL },
+    [OC_LANG_C]      = { "c",          "C",          "//", "/*", "*/", "\"'",  0, 0, 0, KW_C },
+    [OC_LANG_PYTHON] = { "python",     "Python",     "#",  "",   "",   "\"'",  1, 0, 0, KW_PY },
+    [OC_LANG_JS]     = { "javascript", "JavaScript", "//", "/*", "*/", "\"'`", 0, 0, 0, KW_JS },
+    [OC_LANG_SHELL]  = { "shell",      "Shell",      "#",  "",   "",   "\"'",  0, 0, 1, KW_SH },
+    [OC_LANG_JSON]   = { "json",       "JSON",       "",   "",   "",   "\"",   0, 0, 0, KW_JSON },
+    [OC_LANG_YAML]   = { "yaml",       "YAML",       "#",  "",   "",   "\"'",  0, 0, 1, KW_YAML },
+    [OC_LANG_SQL]    = { "sql",        "SQL",        "--", "/*", "*/", "'\"",  0, 1, 0, KW_SQL },
+    [OC_LANG_GO]     = { "go",         "Go",         "//", "/*", "*/", "\"'`", 0, 0, 0, KW_GO },
+};
+
+static int lex_ieq(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        char x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = (char)(y - 'A' + 'a');
+        if (x != y) return 0;
+    }
+    return *a == *b;
+}
+
+int oc_lex_language(const char *name) {
+    static const struct { const char *alias; int lang; } AL[] = {
+        { "h", OC_LANG_C }, { "py", OC_LANG_PYTHON }, { "python3", OC_LANG_PYTHON },
+        { "js", OC_LANG_JS }, { "ts", OC_LANG_JS }, { "typescript", OC_LANG_JS },
+        { "sh", OC_LANG_SHELL }, { "bash", OC_LANG_SHELL }, { "zsh", OC_LANG_SHELL },
+        { "yml", OC_LANG_YAML }, { "golang", OC_LANG_GO },
+    };
+    if (!name || !name[0]) return OC_LANG_NONE;
+    for (int i = 1; i < OC_LANG_COUNT; i++) if (lex_ieq(name, LEX_LANGS[i].name)) return i;
+    for (size_t i = 0; i < sizeof AL / sizeof AL[0]; i++) if (lex_ieq(name, AL[i].alias)) return AL[i].lang;
+    return OC_LANG_NONE;
+}
+
+const char *oc_lex_name(int lang)  { return (lang > 0 && lang < OC_LANG_COUNT) ? LEX_LANGS[lang].name : ""; }
+const char *oc_lex_label(int lang) { return LEX_LANGS[(lang > 0 && lang < OC_LANG_COUNT) ? lang : 0].label; }
+
+static int lex_word(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+           (unsigned char)c >= 0x80;
+}
+static int lex_at(const char *s, size_t n, size_t i, const char *m) {
+    size_t k = strlen(m);
+    return k && i + k <= n && memcmp(s + i, m, k) == 0;
+}
+
+size_t oc_lex(int lang, const char *s, size_t n, oc_lex_tok *out, size_t cap) {
+    if (lang <= 0 || lang >= OC_LANG_COUNT || !s || !out || !cap) return 0;
+    const lex_lang *L = &LEX_LANGS[lang];
+    size_t nt = 0, i = 0;
+#define LEX_EMIT(st, ln, kd) do { if (nt == cap) return nt; \
+        out[nt].start = (uint32_t)(st); out[nt].len = (uint32_t)(ln); out[nt].kind = (uint8_t)(kd); nt++; } while (0)
+    while (i < n) {
+        char c = s[i];
+        int word_start = i == 0 || !lex_word(s[i - 1]);
+        if (lex_at(s, n, i, L->bopen)) {                       /* a block comment */
+            size_t j = i + strlen(L->bopen);
+            while (j < n && !lex_at(s, n, j, L->bclose)) j++;
+            j = j < n ? j + strlen(L->bclose) : n;
+            LEX_EMIT(i, j - i, OC_LEX_COMMENT); i = j; continue;
+        }
+        if (lex_at(s, n, i, L->line1) &&                       /* a line comment */
+            !(L->hash_word && i > 0 && s[i - 1] != ' ' && s[i - 1] != '\t' && s[i - 1] != '\n')) {
+            size_t j = i;
+            while (j < n && s[j] != '\n') j++;
+            LEX_EMIT(i, j - i, OC_LEX_COMMENT); i = j; continue;
+        }
+        if (c && strchr(L->quotes, c)) {                       /* a string */
+            size_t j;
+            if (L->triple && i + 2 < n && s[i + 1] == c && s[i + 2] == c) {
+                j = i + 3;
+                while (j + 2 < n && !(s[j] == c && s[j + 1] == c && s[j + 2] == c)) j++;
+                j = j + 2 < n ? j + 3 : n;
+            } else {
+                j = i + 1;
+                while (j < n && s[j] != c) {
+                    if (s[j] == '\\' && c != '`' && j + 1 < n) j++;
+                    else if (s[j] == '\n' && c != '`') break;   /* unclosed: to the line's end */
+                    j++;
+                }
+                if (j < n && s[j] == c) j++;
+            }
+            LEX_EMIT(i, j - i, OC_LEX_STRING); i = j; continue;
+        }
+        /* A number: a digit that does not continue a word; JSON's may be signed. */
+        if (word_start && ((c >= '0' && c <= '9') ||
+                           (c == '-' && lang == OC_LANG_JSON && i + 1 < n && s[i + 1] >= '0' && s[i + 1] <= '9'))) {
+            size_t j = i + 1;
+            while (j < n && (lex_word(s[j]) || s[j] == '.' ||
+                             ((s[j] == '+' || s[j] == '-') && (s[j - 1] == 'e' || s[j - 1] == 'E')))) j++;
+            LEX_EMIT(i, j - i, OC_LEX_NUMBER); i = j; continue;
+        }
+        /* A word, coloured when it is a keyword. A C directive's '#' is part of it. */
+        if (word_start && (lex_word(c) || (c == '#' && lang == OC_LANG_C))) {
+            size_t j = i + 1;
+            while (j < n && lex_word(s[j])) j++;
+            char w[24];
+            size_t wl = j - i;
+            if (L->kw && wl < sizeof w) {
+                memcpy(w, s + i, wl); w[wl] = '\0';
+                for (const char *const *k = L->kw; *k; k++)
+                    if (L->nocase ? lex_ieq(w, *k) : strcmp(w, *k) == 0) { LEX_EMIT(i, wl, OC_LEX_KEYWORD); break; }
+            }
+            i = j; continue;
+        }
+        i++;
+    }
+#undef LEX_EMIT
+    return nt;
+}

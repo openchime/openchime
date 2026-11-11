@@ -54,6 +54,7 @@
 #include "complete.h"   /* shared @user / #channel / :emoji: completion */
 #include "mention.h"    /* the same @mention scanner the daemon resolves with */
 #include "richtext.h"   /* the shared *bold* / _italic_ / `code` parser (ARCH-100) */
+#include "lexer.h"      /* the snippet tokenizer (REQ-226) */
 #include "table.h"      /* a table as a grid: the composer's cards and the table editor (MARKDOWN.md §1a) */
 #include "searchq.h"    /* the same query parser the core sends to the daemon */
 #include "resolve.h"
@@ -1061,6 +1062,7 @@ static fmtw *g_fmt_bold;
 static fmtw *g_fmt_ital;
 static fmtw *g_fmt_quote;
 static fmtw *g_emoji;   /* Segoe UI Emoji, picker cells (22px) */
+static fmtw *g_code;    /* the code family at meta size: snippets (REQ-226) */
 static fmtw *g_emoji_s; /* the same, sized for reaction chips */
 /* Lucide icons draw through gfx_icon — tessellated in the gfx layer, no cached
  * geometry objects to own here. */
@@ -1739,6 +1741,62 @@ static int have_camera(void) {
 static int is_video_msg(const oc_attachment *a) {
     return a && !a->reclaimed && a->media_kind == OC_MEDIA_VIDEO_MESSAGE;
 }
+
+/* ---- snippets (REQ-226) ------------------------------------------------------
+ * A snippet's text is its attachment's bytes, fetched like a thumbnail -- one
+ * at a time, only for what is on screen -- and kept here, a few at once. The
+ * card shows its first lines; the viewer all of it, coloured by lexer.h. */
+static int is_snippet(const oc_attachment *a) {
+    return a && !a->reclaimed && a->media_kind == OC_MEDIA_SNIPPET;
+}
+enum { SNIP_CACHE = 16, SNIP_PREVIEW = 5 };
+#define SNIP_CARD_H (LINE_H * (SNIP_PREVIEW + 1) + UIS(14.0f))   /* title, then the first lines */
+static struct { uint64_t id; char *text; size_t len; } g_snip[SNIP_CACHE];
+static int       g_snip_next;
+static uint64_t  g_snip_pending, g_snip_deadline;
+static uint64_t  g_snip_failed[32];
+static int       g_n_snip_failed;
+/* The viewer: which snippet, and its tokens, lexed once when it opened. */
+static int        g_sv_open;
+static uint64_t   g_sv_aid;
+static char       g_sv_title[OC_SNIPPET_TITLE_MAX + 1], g_sv_file[128];
+static int        g_sv_lang;
+static oc_lex_tok *g_sv_toks;
+static size_t     g_sv_ntoks;
+enum { SV_CMD_COPY = 2711, SV_CMD_SAVE = 2712 };
+/* The text a long paste brought, held while the person is asked whether to
+ * make it a snippet; declined, it is pasted as it would have been. */
+static char *g_snip_paste;
+static void snippet_compose(oc_win *hwnd, const char *text);   /* fwd */
+static void ed_paste_text(const char *src);                    /* fwd */
+
+static const char *snip_text(uint64_t id, size_t *len) {
+    for (int i = 0; i < SNIP_CACHE; i++)
+        if (g_snip[i].id == id && g_snip[i].text) { if (len) *len = g_snip[i].len; return g_snip[i].text; }
+    return NULL;
+}
+static int snip_failed(uint64_t id) {
+    for (int i = 0; i < g_n_snip_failed; i++) if (g_snip_failed[i] == id) return 1;
+    return 0;
+}
+/* Keep fetched bytes as text: ownership of `d` passes here. */
+static void snip_store(uint64_t id, uint8_t *d, size_t n) {
+    char *t = malloc(n + 1);
+    if (t) { if (n) memcpy(t, d, n); t[n] = '\0'; }
+    free(d);
+    if (!t) return;
+    int slot = g_snip_next;
+    g_snip_next = (g_snip_next + 1) % SNIP_CACHE;
+    free(g_snip[slot].text);
+    g_snip[slot].id = id; g_snip[slot].text = t; g_snip[slot].len = n;
+}
+/* Ask for a snippet's text, unless it is here, asked for, or known lost. */
+static void snip_want(uint64_t id) {
+    if (!g_client || !id || snip_text(id, NULL) || snip_failed(id) || g_snip_pending) return;
+    g_snip_pending = id;
+    g_snip_deadline = now_ms() + 8000;
+    oc_client_fetch_attachment(g_client, id);
+}
 /* Slack's pattern: the image itself is the click target for a bigger view, and
  * saving it is a button that appears on hover — so the affordance is there when
  * you look for it and out of the way when you are reading. */
@@ -1940,7 +1998,8 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
        /* A call started in a channel asks first, saying how many it will ring;
         * End for everyone asks before it ends the call (CALLS.md §2). */
        CONF_CALL_START, CONF_CALL_END,
-       CONF_MESSAGE_MOVE };
+       CONF_MESSAGE_MOVE,
+       CONF_SNIPPET_PASTE };
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 static int      g_bc_confirmed;     /* CONF_BROADCAST: the send it confirmed is under way */
@@ -3466,7 +3525,7 @@ static void fonts_build(void) {
     const float k = g_text_scale;
     fmtw **all[] = { &g_display, &g_title, &g_body, &g_ui, &g_ui_b,
                      &g_meta, &g_meta_w, &g_meta_r, &g_avatar, &g_micro,
-                     &g_meta_i, &g_fmt_bold, &g_fmt_ital, &g_fmt_quote, &g_ui_w };
+                     &g_meta_i, &g_fmt_bold, &g_fmt_ital, &g_fmt_quote, &g_ui_w, &g_code };
     for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) fmt_release(all[i]);
     txt_drop_all();
 
@@ -3511,6 +3570,13 @@ static void fonts_build(void) {
     /* Oversized on purpose: a quotation mark occupies the top third of its em
      * box, so at text size it is a speck in the middle of a 24 px button. */
     g_fmt_quote = mk_fmt_s("Georgia", (FONT_UI + 9.0f) * k, 700, C, MID, 0, 0, 0.0f, 0.0f);
+    /* A snippet's text (REQ-226): the code family, at meta size, one line per
+     * draw, coloured span by span. */
+    {
+        float clh, cbl;
+        pin_metrics(FONT_META * k, &clh, &cbl);
+        g_code = mk_fmt_s("Consolas", FONT_META * k, REG, L, MID, 0, 0, clh, cbl);
+    }
 }
 
 /* The emoji formats, rebuilt on every scale change like the rest.
@@ -6936,7 +7002,9 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
         /* An image gets a thumbnail box instead of a text line — and the space
          * must be reserved whether or not the bitmap has arrived, or the
          * transcript jumps under the reader the moment one decodes. */
-        if (!msg->attach[i].reclaimed && (mime_is_image(msg->attach[i].mime) || is_video_msg(&msg->attach[i])))
+        if (is_snippet(&msg->attach[i]))
+            thumbs += SNIP_CARD_H + 6.0f;         /* its title and first lines (REQ-226) */
+        else if (!msg->attach[i].reclaimed && (mime_is_image(msg->attach[i].mime) || is_video_msg(&msg->attach[i])))
             thumbs += THUMB_H + 6.0f + LINE_H;   /* + the filename line above it */
         else
             extra++;
@@ -7323,6 +7391,98 @@ static float body_draw(gfx *rt, const oc_msg *msg, mlay_ent *body, float tx, flo
     return body->mh;
 }
 
+/* A snippet's colours by token kind (lexer.h): words the language keeps for
+ * itself, strings, comments, numbers. */
+static uint32_t snip_color(uint8_t kind) {
+    return kind == OC_LEX_KEYWORD ? OC_COL_ACCENT : kind == OC_LEX_STRING ? OC_COL_ONLINE
+         : kind == OC_LEX_COMMENT ? OC_COL_FAINT  : kind == OC_LEX_NUMBER ? OC_COL_AWAY : OC_COL_TEXT;
+}
+
+/* Draw lines of code from `first` (0-based), at most `max`, from `y` down, one
+ * `lh` each, cut at `right`; coloured by `toks`, which the whole text was lexed
+ * into. A tab is four spaces. Returns the number of lines in the text. */
+static int draw_code_lines(gfx *rt, const char *s, size_t n, const oc_lex_tok *toks, size_t nt,
+                           float x, float y, float right, float lh, int first, int max) {
+    int line = 0;
+    size_t i = 0, t = 0;
+    while (i <= n) {
+        size_t e = i;
+        while (e < n && s[e] != '\n') e++;
+        if (line >= first && line < first + max) {
+            float cx = x;
+            float ly = y + (float)(line - first) * lh;
+            size_t p = i;
+            while (p < e && cx < right) {
+                while (t < nt && toks[t].start + toks[t].len <= p) t++;
+                size_t q; uint8_t kind = OC_LEX_PLAIN;
+                if (t < nt && toks[t].start <= p) { q = toks[t].start + toks[t].len; kind = toks[t].kind; }
+                else q = (t < nt && toks[t].start < e) ? toks[t].start : e;
+                if (q > e) q = e;
+                if (q <= p) q = p + 1;
+                char seg[512]; size_t k = 0;
+                for (size_t r = p; r < q && k + 5 < sizeof seg; r++) {
+                    if (s[r] == '\t') { memcpy(seg + k, "    ", 4); k += 4; }
+                    else if (s[r] != '\r') seg[k++] = s[r];
+                }
+                seg[k] = '\0';
+                float w = text_width(seg, g_code);
+                if (k) draw_text(rt, seg, g_code, rf(cx, ly, right, ly + lh), snip_color(kind));
+                cx += w;
+                p = q;
+            }
+        } else {
+            while (t < nt && toks[t].start + toks[t].len <= e) t++;
+        }
+        line++;
+        if (e >= n) break;
+        i = e + 1;
+    }
+    return line;
+}
+
+static struct { rectf r; uint64_t aid; uint64_t mid; } g_snip_hits[24];
+static int g_n_snip_hits;
+
+/* A snippet in the transcript (REQ-226): a card with its title and language,
+ * then its first lines, coloured; a click opens the viewer. */
+static void draw_snippet_card(gfx *rt, const oc_msg *msg, const oc_attachment *at, rectf card) {
+    int hov = in_rect(card, g_mouse_x, g_mouse_y);
+    fill_round(rt, card, OC_R_CONTROL, hov ? OC_COL_HOVER : OC_COL_INPUT);
+    stroke_round(rt, card, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+    float x = card.left + UIS(10.0f), y = card.top + UIS(5.0f);
+    int lang = oc_lex_language(at->language);
+    char head[OC_SNIPPET_TITLE_MAX + 48];
+    snprintf(head, sizeof head, "%s", at->title[0] ? at->title : at->filename);
+    float hw = text_width(head, g_ui_b);
+    draw_text(rt, head, g_ui_b, rf(x, y, card.right - UIS(10.0f), y + LINE_H), OC_COL_TEXT);
+    char sub[64];
+    snprintf(sub, sizeof sub, "  \xC2\xB7  %s", oc_lex_label(lang));
+    draw_text(rt, sub, g_meta, rf(x + hw, y, card.right - UIS(10.0f), y + LINE_H), OC_COL_MUTED);
+    y += LINE_H + UIS(4.0f);
+    size_t len = 0;
+    const char *text = snip_text(at->id, &len);
+    if (text) {
+        /* Lexed as far as the preview goes: the end of its last line. */
+        size_t end = 0; int lines = 0;
+        while (end < len && lines < SNIP_PREVIEW) { if (text[end] == '\n') lines++; end++; }
+        oc_lex_tok toks[256];
+        size_t nt = oc_lex(lang, text, end, toks, sizeof toks / sizeof toks[0]);
+        gfx_clip_push(rt, gr(rf(card.left, y, card.right - UIS(8.0f), card.bottom - UIS(4.0f))));
+        draw_code_lines(rt, text, end, toks, nt, x, y, card.right - UIS(10.0f), LINE_H, 0, SNIP_PREVIEW);
+        gfx_clip_pop(rt);
+    } else {
+        draw_text(rt, snip_failed(at->id) ? "preview unavailable" : "loading\xE2\x80\xA6", g_meta,
+                  rf(x, y, card.right, y + LINE_H), OC_COL_FAINT);
+        if (!g_preview && !g_thumbs_off) snip_want(at->id);
+    }
+    if (g_n_snip_hits < (int)(sizeof g_snip_hits / sizeof g_snip_hits[0])) {
+        g_snip_hits[g_n_snip_hits].r = card;
+        g_snip_hits[g_n_snip_hits].aid = at->id;
+        g_snip_hits[g_n_snip_hits].mid = msg->message_id;
+        g_n_snip_hits++;
+    }
+}
+
 static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
                          mlay_ent *body, float x0, float y, float content_w,
                          int grouped) {
@@ -7514,6 +7674,13 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
     /* Meta lines: attachments, thread, then reactions LAST — see below. */
     for (int i = 0; i < msg->n_attach; i++) {
         const oc_attachment *at = &msg->attach[i];
+        if (is_snippet(at)) {
+            float right = x0 + content_w + AVA + 12;
+            if (right - tx > UIS(560.0f)) right = tx + UIS(560.0f);
+            draw_snippet_card(rt, msg, at, rf(tx, by + 3, right, by + 3 + SNIP_CARD_H));
+            by += SNIP_CARD_H + 6.0f;
+            continue;
+        }
         if (is_video_msg(at)) {
             /* A video message (REQ-165): its poster in the thumbnail's place, a
              * play mark, and the length. Clicking plays it. */
@@ -8248,7 +8415,7 @@ static void ovl_end(gfx *rt, rectf body) {
     gfx_clip_pop(rt);
 }
 
-enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS, OVL_WSMGR, OVL_GROUPS, OVL_ALERTS, OVL_EMOJI };
+enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS, OVL_WSMGR, OVL_GROUPS, OVL_ALERTS, OVL_EMOJI, OVL_SNIPPET };
 
 /* Measured from the previous frame's draw, for the same reason the notifications
  * card's is: computing it means restating every row's height a second time. */
@@ -12028,6 +12195,7 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Manage custom emoji",     94 },
     { "Summarize this conversation", 88 },
     { "Create a poll",           90 },
+    { "Create a snippet",        96 },
     { "Toggle unreads only in the sidebar", 85 },
     { "Reconnect now",           2  },
     { "Add a workspace",         80 },
@@ -15455,7 +15623,7 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
 static int modal_open(void) {
     return g_prefs_open || g_keys_open || g_about_open || g_wsmgr_open || g_notify_open ||
            g_browse_open || g_confirm_open || g_sessions_open || g_form_open ||
-           g_status_open || g_sch_open || g_sr_open || g_pc_open || g_te_open;
+           g_status_open || g_sch_open || g_sr_open || g_pc_open || g_te_open || g_sv_open;
 }
 
 static rectf g_modal_card;
@@ -15514,6 +15682,11 @@ static void confirm_run(oc_win *hwnd) {
     case CONF_DEACTIVATE_SELF: oc_client_deactivate_self(g_client); break;
     case CONF_EMOJI_DELETE:   oc_client_delete_emoji(g_client, g_confirm_emoji); break;
     case CONF_MESSAGE_MOVE:   move_send(g_confirm_id, g_move_to); break;
+    case CONF_SNIPPET_PASTE: {         /* REQ-226: the paste, as a snippet */
+        char *t = g_snip_paste; g_snip_paste = NULL;
+        snippet_compose(g_main, t);
+        free(t);
+        break; }
     case CONF_CERT_TRUST: cert_trust_run(g_main); break;
     case CONF_PDM_TRUST:  oc_client_pdm_trust(g_client, g_confirm_id); break;
     case CONF_PDM_SAFETY: break;   /* shown, nothing to do */
@@ -16253,6 +16426,54 @@ static void draw_form_side(gfx *rt, const oc_model *m, rectf col) {
     }
 }
 
+/* Open the viewer on a snippet (REQ-226): its text, lexed once, whole. */
+static void snippet_view_open(oc_win *hwnd, const oc_attachment *at) {
+    if (!at) return;
+    g_sv_aid = at->id;
+    snprintf(g_sv_title, sizeof g_sv_title, "%s", at->title[0] ? at->title : at->filename);
+    snprintf(g_sv_file, sizeof g_sv_file, "%s", at->filename);
+    g_sv_lang = oc_lex_language(at->language);
+    free(g_sv_toks); g_sv_toks = NULL; g_sv_ntoks = 0;
+    snip_want(at->id);
+    modal_enter(hwnd, &g_sv_open);
+    ovl_use(OVL_SNIPPET);
+}
+
+/* The viewer's body: every line, numbered, scrolled with the wheel. */
+static void draw_snippet_view(gfx *rt, rectf body) {
+    size_t len = 0;
+    const char *text = snip_text(g_sv_aid, &len);
+    if (!text) {
+        draw_text(rt, snip_failed(g_sv_aid) ? "This snippet could not be loaded." : "Loading\xE2\x80\xA6",
+                  g_ui, rf(body.left + 16, body.top + 8, body.right - 16, body.top + 32), OC_COL_MUTED);
+        return;
+    }
+    if (!g_sv_toks && len) {
+        size_t cap = len / 2 + 16;
+        g_sv_toks = malloc(cap * sizeof *g_sv_toks);
+        g_sv_ntoks = g_sv_toks ? oc_lex(g_sv_lang, text, len, g_sv_toks, cap) : 0;
+    }
+    int lines = 1;
+    for (size_t i = 0; i < len; i++) if (text[i] == '\n') lines++;
+    float lh = LINE_H;
+    ovl_use(OVL_SNIPPET);
+    float y = ovl_begin(rt, body, (float)lines * lh + 12);
+    int first = (int)((body.top + 6 - y) / lh);
+    if (first < 0) first = 0;
+    int show = (int)((body.bottom - body.top) / lh) + 2;
+    float gutter = text_width("00000", g_code) + UIS(12.0f);
+    for (int l = first; l < first + show && l < lines; l++) {
+        char num[16]; snprintf(num, sizeof num, "%d", l + 1);
+        g_code->align = ST_ALIGN_RIGHT;
+        draw_text(rt, num, g_code, rf(body.left + 8, y + (float)l * lh, body.left + gutter - 8, y + (float)(l + 1) * lh),
+                  OC_COL_FAINT);
+        g_code->align = ST_ALIGN_LEFT;
+    }
+    draw_code_lines(rt, text, len, g_sv_toks, g_sv_ntoks, body.left + gutter, y + (float)first * lh,
+                    body.right - 16, lh, first, show);
+    ovl_end(rt, body);
+}
+
 static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
     if (!modal_open()) {
         g_modal_card = rf(0, 0, 0, 0);
@@ -16292,6 +16513,7 @@ static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
     else if (g_sr_open)     draw_sumrange(rt, body);
     else if (g_pc_open)     draw_poll_compose(rt, body);
     else if (g_te_open)     draw_table_editor(rt, body);
+    else if (g_sv_open)     draw_snippet_view(rt, body);
     else if (g_form_open && g_form_side.on) {
         /* Two columns: the fields get everything left of the photo column. The
          * column is drawn first, though an open select list is bounded by the
@@ -17868,6 +18090,15 @@ static const oc_modal_spec *modal_current(void) {
         sp.buttons[0] = (oc_mbtn){ "Open on openchime.io", MB_NORMAL, WN_CMD_OPEN };
         sp.buttons[1] = (oc_mbtn){ "Close", MB_PRIMARY, MODAL_OK };
         sp.n_buttons = 2;
+    } else if (g_sv_open) {
+        /* A snippet (REQ-226): its title, the whole text, copy and save. */
+        sp.title = g_sv_title;
+        sp.subtitle = oc_lex_label(g_sv_lang);
+        sp.size = MODAL_LG;
+        sp.buttons[0] = (oc_mbtn){ "Copy",     MB_NORMAL,  SV_CMD_COPY };
+        sp.buttons[1] = (oc_mbtn){ "Download", MB_NORMAL,  SV_CMD_SAVE };
+        sp.buttons[2] = (oc_mbtn){ "Close",    MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 3;
     } else if (g_about_open) {
         sp.title = "About OpenChime";
         sp.size = MODAL_SM;
@@ -17981,11 +18212,18 @@ static void modal_finish(int save) {
      * spec->commit so the action can take the window handle. */
     if (g_form_open) { form_collect(save); g_form_open = 0; }
     if (save && g_confirm_open) { g_confirm_open = 0; confirm_run(g_main); }
+    /* A long paste not made a snippet is pasted as it would have been (REQ-226). */
+    if (!save && g_confirm_open && g_confirm_act == CONF_SNIPPET_PASTE && g_snip_paste) {
+        char *t = g_snip_paste; g_snip_paste = NULL;
+        ed_paste_text(t);
+        free(t);
+    }
     if (save) { if (s->commit) s->commit(); }
     else      { if (s->restore) s->restore(); }
     g_prefs_open = g_keys_open = g_about_open = g_wsmgr_open = g_notify_open = g_browse_open = 0;
     g_confirm_open = g_sessions_open = g_status_open = g_sch_open = g_sr_open = g_pc_open = 0;
     g_te_open = 0;
+    g_sv_open = 0;
     if (te_was) te_closed();
     g_modal_closed_by = save ? "save" : "cancel";
     if (g_view == VIEW_SIGNIN) layout_signin(g_main);   /* its fields, back */
@@ -22500,6 +22738,7 @@ static void paint(oc_win *hwnd) {
     g_n_splhits = 0;
     g_n_morehits = 0;
     g_n_sephits = 0;
+    g_n_snip_hits = 0;
     render_scene(rt, m, W, H);
     if (!g_caret_placed) ed_caret_kill();   /* no field drew a caret this frame */
     /* Boxes placed against chrome the scene just measured, so they can only be
@@ -24456,6 +24695,30 @@ static void draw_pastechoice(gfx *rt, float W, float H) {
     }
 }
 
+/* Ask for a snippet's title and language, then post `text` as one into the
+ * open conversation, where a file would go. */
+static void snippet_compose(oc_win *hwnd, const char *text) {
+    if (!g_client || !g_sel || !text || !text[0]) return;
+    size_t n = strlen(text);
+    if (n > OC_SNIPPET_MAX_SIZE) { fb_failed("A snippet can be at most 1 MB."); return; }
+    oc_field f[2] = {
+        { FF_TEXT,   "Title", "What it is, for the card and for search.", "" },
+        { FF_CHOICE, "Language", "Plain text|C|Python|JavaScript|Shell|JSON|YAML|SQL|Go", "0" },
+    };
+    /* A first line that is short names it well enough to start from. */
+    const char *nl = strchr(text, '\n');
+    size_t fl = nl ? (size_t)(nl - text) : n;
+    if (fl > 0 && fl <= 60) { memcpy(f[0].value, text, fl); f[0].value[fl] = '\0'; }
+    else snprintf(f[0].value, sizeof f[0].value, "Snippet");
+    if (!form_dialog(hwnd, "Create snippet", f, 2)) return;
+    if (!f[0].value[0]) snprintf(f[0].value, sizeof f[0].value, "Snippet");
+    int lang = atoi(f[1].value);
+    if (lang < 0 || lang >= OC_LANG_COUNT) lang = OC_LANG_NONE;
+    if (oc_client_post_snippet(g_client, g_sel, 0, f[0].value, oc_lex_name(lang), text))
+        fb_confirm("Posting the snippet\xE2\x80\xA6");
+    else fb_failed("The snippet could not be posted.");
+}
+
 static void ed_clip_paste(oc_win *hwnd) {
     pastechoice_close();
     if (clip_paste_attach(hwnd)) return;
@@ -24464,6 +24727,18 @@ static void ed_clip_paste(oc_win *hwnd) {
         /* Cells from a sheet ask first. */
         oc_table *t = oc_table_from_tsv(src, strlen(src));
         if (t) pastechoice_open(src, t);
+        else if (g_sel && oc_snippet_offer(src, strlen(src))) {
+            /* Long enough to read better as a snippet (REQ-226): asked first. */
+            free(g_snip_paste);
+            g_snip_paste = strdup(src);
+            int lines = 1;
+            for (const char *q = src; *q; q++) if (*q == '\n' && q[1]) lines++;
+            char body[200];
+            snprintf(body, sizeof body,
+                     "That is %d lines. As a snippet it shows its first few lines, opens whole "
+                     "with its colours, and stays searchable.", lines);
+            confirm_open(hwnd, CONF_SNIPPET_PASTE, 0, "Make it a snippet?", body, "Make a snippet");
+        }
         else ed_paste_text(src);
     }
     SDL_free(src);
@@ -29992,7 +30267,8 @@ static int files_click(oc_win *hwnd, int x, int y) {
         if ((size_t)g_filerows[i].ix >= fm->n_files) continue;
         const oc_file_view *f = &fm->files[g_filerows[i].ix];
         if (in_rect(g_filerows[i].dl, (float)x, (float)y)) {
-            oc_attachment at = { f->id, {0}, {0}, f->size, f->reclaimed, f->media_kind, f->duration_ms, 0, 0, 0 };
+            oc_attachment at = { f->id, {0}, {0}, f->size, f->reclaimed, f->media_kind, f->duration_ms, 0, 0, 0,
+                                 {0}, {0} };
             snprintf(at.filename, sizeof at.filename, "%s", f->filename);
             snprintf(at.mime, sizeof at.mime, "%s", f->mime);
             download_attachment(hwnd, &at);
@@ -30330,6 +30606,24 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 jump_menu_open(hwnd, g_sel, (float)x - 110, (float)y + 8);
                 invalidate();
                 return 1;
+            }
+    /* A snippet's card opens it whole (REQ-226). */
+    if (!modal_open() && !g_menu)
+        for (int i = 0; i < g_n_snip_hits; i++)
+            if (in_rect(g_snip_hits[i].r, (float)x, (float)y)) {
+                const oc_model *sm = model();
+                const oc_attachment *sa = NULL;
+                for (size_t ci = 0; sm && !sa && ci < sm->n_channels; ci++)
+                    for (size_t k = 0; !sa && k < sm->channels[ci].n_msgs; k++) {
+                        const oc_msg *mm = &sm->channels[ci].msgs[k];
+                        if (mm->message_id != g_snip_hits[i].mid) continue;
+                        for (int q = 0; q < mm->n_attach; q++)
+                            if (mm->attach[q].id == g_snip_hits[i].aid) sa = &mm->attach[q];
+                    }
+                for (size_t k = 0; sm && !sa && k < sm->n_thread_msgs; k++)
+                    for (int q = 0; q < sm->thread_msgs[k].n_attach; q++)
+                        if (sm->thread_msgs[k].attach[q].id == g_snip_hits[i].aid) sa = &sm->thread_msgs[k].attach[q];
+                if (sa) { snippet_view_open(hwnd, sa); invalidate(); return 1; }
             }
     /* Toasts are painted above everything, a dialog included, so they are
      * hit-tested above everything too -- a toast over the composer or a
@@ -33903,6 +34197,7 @@ static void open_new_menu(oc_win *hwnd) {
     mi_item(6, "New direct message");
     mi_item(83, "New group message");   /* REQ-056 */
     if (poll_offered(model())) mi_item(90, "New poll");   /* REQ-225 */
+    if (g_sel) mi_item(96, "New snippet");               /* REQ-226 */
     mi_item(7, "Upload a file");
     mi_sep();
     mi_item(4, "Search messages");
@@ -35089,6 +35384,13 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         }
         break;
     case 90: poll_compose_open(hwnd, g_sel, 0); break;   /* REQ-225 */
+    case 96: {   /* REQ-226: what is in the message box, as a snippet */
+        char *t = ed_md_all();
+        if (!g_sel) fb_failed("Open a conversation first.");
+        else if (!t || !t[0]) fb_failed("Write or paste the snippet's text in the message box first.");
+        else { snippet_compose(hwnd, t); ed_clear(); }
+        free(t);
+        break; }
     case 91:     /* the poll composer's Post poll / Save */
         if (g_pc_open && poll_compose_submit()) g_modal_closed_by = "save";
         break;
@@ -35487,6 +35789,18 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         about_text(model(), t, sizeof t);
         copy_to_clipboard(hwnd, t);
         fb_confirm("Copied");
+        break; }
+    case SV_CMD_COPY: {                /* a snippet's whole text (REQ-226) */
+        const char *t = snip_text(g_sv_aid, NULL);
+        if (t) { copy_to_clipboard(hwnd, t); fb_confirm("Snippet copied."); }
+        else fb_failed("The snippet has not loaded yet.");
+        break; }
+    case SV_CMD_SAVE: {                /* ...or its file, as any download */
+        oc_attachment a; memset(&a, 0, sizeof a);
+        a.id = g_sv_aid;
+        snprintf(a.filename, sizeof a.filename, "%s", g_sv_file);
+        snprintf(a.mime, sizeof a.mime, "text/plain");
+        download_attachment(hwnd, &a);
         break; }
     /* "Add a workspace…" drops the current session and goes to the same sign-in
      * view the app starts on — one sign-in implementation, not two. */
@@ -37447,6 +37761,15 @@ static void test_dump(const char *path) {
                 (unsigned long long)(dm ? dm->found_mid : 0), dm ? dm->found_exact : 0,
                 (unsigned long long)g_sel, (unsigned long long)g_jump_mid, g_n_sephits);
     }
+    /* Snippets (REQ-226): each card drawn, whether its text is here, and the
+     * viewer -- open, on which, and how many coloured spans it holds. */
+    for (int i = 0; i < g_n_snip_hits; i++)
+        fprintf(f, "snipcard aid=%llu mid=%llu loaded=%d rect=%.0f,%.0f,%.0f,%.0f\n",
+                (unsigned long long)g_snip_hits[i].aid, (unsigned long long)g_snip_hits[i].mid,
+                snip_text(g_snip_hits[i].aid, NULL) != NULL,
+                g_snip_hits[i].r.left, g_snip_hits[i].r.top, g_snip_hits[i].r.right, g_snip_hits[i].r.bottom);
+    fprintf(f, "snipview open=%d aid=%llu lang=%d spans=%zu\n", g_sv_open,
+            (unsigned long long)g_sv_aid, g_sv_lang, g_sv_ntoks);
     /* Where the KEYBOARD is, and what an open menu is highlighting: both had to
      * be readable for the keyboard route to the context menu to be testable at
      * all (REQ-264). */
@@ -37843,6 +38166,25 @@ static void test_poll(oc_win *hwnd) {
         uint64_t day = parse_day(arg);
         if (g_sel && day) { date_jump(g_sel, day); test_ack("ok"); }
         else test_ack("err");
+    } else if (!strcmp(verb, "snippet")) {
+        /* "<title>|<language>|<text>", \n for a newline: a snippet into the
+         * open conversation, as Create snippet posts one (REQ-226). */
+        char t[OC_SNIPPET_TITLE_MAX + 1] = "", l[OC_SNIPPET_LANG_MAX + 1] = "";
+        const char *a = strchr(arg, '|'), *b = a ? strchr(a + 1, '|') : NULL;
+        if (!a || !b || !g_client || !g_sel) { test_ack("err"); }
+        else {
+            snprintf(t, sizeof t, "%.*s", (int)(a - arg), arg);
+            snprintf(l, sizeof l, "%.*s", (int)(b - a - 1), a + 1);
+            char *body = malloc(strlen(b) + 1);
+            size_t k = 0;
+            for (const char *q = b + 1; body && *q; q++) {
+                if (q[0] == '\\' && q[1] == 'n') { body[k++] = '\n'; q++; }
+                else body[k++] = *q;
+            }
+            if (body) body[k] = '\0';
+            test_ack(body && oc_client_post_snippet(g_client, g_sel, 0, t, l, body) ? "ok" : "err");
+            free(body);
+        }
     } else if (!strcmp(verb, "palette")) {
         palette_open(hwnd);
         if (arg[0] && g_pal_edit) field_set(g_pal_edit, arg);
@@ -39703,6 +40045,10 @@ static int on_tick(oc_win *hwnd) {
                 uint8_t *fd = oc_model_take_attachment((oc_model *)m, &fid, &flen);
                 if (fd && vm_take_bytes(fid, fd, flen)) {
                     invalidate();   /* a video, now owned by the cache */
+                } else if (fd && fid == g_snip_pending) {
+                    snip_store(fid, fd, flen);   /* a snippet's text (REQ-226) */
+                    g_snip_pending = 0;
+                    invalidate();
                 } else if (fd) {
                     thumb_decode(fid, fd, flen);
                     free(fd);
@@ -39722,6 +40068,12 @@ static int on_tick(oc_win *hwnd) {
             if (g_thumb_pending && m->xfer_phase == 0 && m->xfer_tag && m->xfer_tag != g_thumb_pending &&
                 m->xfer_done < m->xfer_total)
                 g_thumb_deadline = now_ms() + 8000;
+            if (g_snip_pending && now_ms() > g_snip_deadline) {   /* a snippet that never came */
+                if (g_n_snip_failed < (int)(sizeof g_snip_failed / sizeof g_snip_failed[0]))
+                    g_snip_failed[g_n_snip_failed++] = g_snip_pending;
+                g_snip_pending = 0;
+                invalidate();
+            }
             if (g_thumb_pending && now_ms() > g_thumb_deadline) {
                 if (g_n_thumb_missing < THUMB_CACHE) g_thumb_missing[g_n_thumb_missing++] = g_thumb_pending;
                 g_thumb_pending = 0;

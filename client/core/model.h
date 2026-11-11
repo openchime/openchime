@@ -57,6 +57,10 @@ typedef struct {
     uint32_t duration_ms;
     uint16_t width, height;
     uint64_t poster_id;
+    /* A snippet (REQ-226): media_kind OC_MEDIA_SNIPPET, its title and its
+     * language (lexer.h's name, "" for plain); its text is the download. */
+    char     title[OC_SNIPPET_TITLE_MAX + 1];
+    char     language[OC_SNIPPET_LANG_MAX + 1];
 } oc_attachment;
 
 /* One link preview under a message (REQ-222, ARCH-105): the daemon's fetched
@@ -893,6 +897,10 @@ void oc_model_apply(oc_model *m, oc_ev *e);
 /* The reminder this person has on a message (REQ-283), as the model holds it
  * -- on the loaded message or the Saved list -- or 0. */
 uint64_t oc_model_reminder(const oc_model *m, uint64_t message_id);
+/* Whether pasted text is long enough to offer as a snippet (REQ-226): more
+ * than OC_SNIPPET_PASTE_LINES lines or OC_SNIPPET_PASTE_BYTES bytes. A paste
+ * past OC_SNIPPET_MAX_SIZE is not offered: it cannot be one. */
+int oc_snippet_offer(const char *text, size_t len);
 
 /* Find a channel by id, or NULL. */
 oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id);

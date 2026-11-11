@@ -2445,7 +2445,11 @@ static void test_index_mentions(void) {
                            /* 0076's active days. */
                            "DROP TABLE user_active_days;"
                            /* 0077's muted people. */
-                           "DROP TABLE muted_users;",
+                           "DROP TABLE muted_users;"
+                           /* 0078's snippets. */
+                           "DROP TABLE snippets_fts;"
+                           "ALTER TABLE attachment_media DROP COLUMN title;"
+                           "ALTER TABLE attachment_media DROP COLUMN language;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -11023,6 +11027,134 @@ static void test_reminders(void) {
     cleanup_db(path);
 }
 
+/* Snippets (REQ-226): a finished text/plain upload marked one, with its title
+ * and language; refused past 1 MiB, unfinished, someone else's, or not text;
+ * found by title and by body on the first page of a search, only where it can
+ * be read; and gone from search with its message. */
+static void snip_row(const char *path, uint64_t id, uint64_t uploader, uint64_t channel,
+                     const char *mime, uint64_t size, int final) {
+    sqlite3 *raw = NULL;
+    CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+    sqlite3_busy_timeout(raw, 5000);
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(raw,
+        "INSERT INTO attachments(id, channel_id, message_id, uploader_id, storage_key, "
+        " filename, mime, size, sha256, created_at_ms) "
+        "VALUES(?1, ?2, NULL, ?3, printf('%016x', ?1), 'snip.txt', ?4, ?5, ?6, 1);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)channel);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)uploader);
+    sqlite3_bind_text (st, 4, mime, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)size);
+    if (final) sqlite3_bind_blob(st, 6, "x", 1, SQLITE_STATIC); else sqlite3_bind_null(st, 6);
+    CHECK(sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st);
+    sqlite3_close(raw);
+}
+static int snip_mark(oc_dbwriter *w, uint64_t user, uint64_t aid, const char *title,
+                     const char *lang, const char *text) {
+    oc_job *j = oc_job_new(OC_JOB_ATTACH_MEDIA_SET, 67);
+    j->user_id = user; j->attachment_id = aid; j->att_size = OC_SNIPPET_MAX_SIZE;
+    j->media_kind = OC_MEDIA_SNIPPET;
+    j->snip_title = strdup(title); j->snip_lang = strdup(lang);
+    j->snip_text = strdup(text); j->snip_text_len = strlen(text);
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    int out = !r ? -9999 : r->type == OC_RES_MEDIA_OK ? 0 : (int)r->err_code;
+    oc_dbres_free(r);
+    return out;
+}
+static uint64_t snip_post(oc_dbwriter *w, uint64_t user, uint64_t channel, uint8_t tag, uint64_t aid) {
+    oc_job *j = oc_job_new(OC_JOB_SEND, 68);
+    j->user_id = user; j->channel_id = channel;
+    memset(j->idem, tag, OC_IDEM_LEN);
+    oc_job_set_body(j, "", 0);
+    j->attach_ids[0] = aid; j->n_attach = 1;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint64_t mid = 0;
+    if (r && r->type == OC_RES_SEND_OK) {
+        mid = r->message_id;
+        /* The message carries it as a snippet, title and language with it. */
+        CHECK(r->n_attach == 1 && r->attach[0].media_kind == OC_MEDIA_SNIPPET &&
+              r->attach[0].title && r->attach[0].language);
+    }
+    oc_dbres_free(r);
+    return mid;
+}
+static int64_t snip_num(const char *path, const char *sql, uint64_t id) {
+    sqlite3 *raw = NULL;
+    if (sqlite3_open(path, &raw) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = NULL;
+    int64_t v = -1;
+    if (sqlite3_prepare_v2(raw, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(raw);
+    return v;
+}
+static int search_finds(oc_dbwriter *w, uint64_t uid, const char *q, uint64_t mid) {
+    oc_dbres *r = search(w, uid, q, 20);
+    int found = 0;
+    for (size_t i = 0; r && i < r->n_search; i++) if (r->search[i].message_id == mid) found = 1;
+    oc_dbres_free(r);
+    return found;
+}
+static void test_snippets(void) {
+    const char *path = tdb("snippets.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "sn-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob = reg(w, "sn-bob", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+    oc_dbres *r = create_channel(w, alice, "sn-private", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t priv = r->channel_id;
+    oc_dbres_free(r);
+
+    snip_row(path, 900, alice, OC_DEFAULT_CHANNEL, "text/plain", 120, 1);
+    snip_row(path, 901, alice, OC_DEFAULT_CHANNEL, "text/plain", OC_SNIPPET_MAX_SIZE + 1, 1);
+    snip_row(path, 902, alice, OC_DEFAULT_CHANNEL, "text/plain", 10, 0);
+    snip_row(path, 903, alice, OC_DEFAULT_CHANNEL, "image/png", 10, 1);
+    snip_row(path, 904, alice, priv, "text/plain", 50, 1);
+
+    /* Refused: too big, unfinished, someone else's, not text, no title. */
+    CHECK(snip_mark(w, alice, 901, "big", "", "x") == OC_ERR_MEDIA_TOO_LARGE);
+    CHECK(snip_mark(w, alice, 902, "half", "", "x") == OC_ERR_UNKNOWN_ATTACHMENT);
+    CHECK(snip_mark(w, bob, 900, "theirs", "", "x") == OC_ERR_UNKNOWN_ATTACHMENT);
+    CHECK(snip_mark(w, alice, 903, "picture", "", "x") == OC_ERR_MEDIA_INVALID);
+    CHECK(snip_mark(w, alice, 900, "", "", "x") == OC_ERR_MEDIA_INVALID);
+    CHECK(snip_mark(w, alice, 900, "t", "Py thon", "x") == OC_ERR_MEDIA_INVALID);
+    /* Made, and posted. */
+    CHECK(snip_mark(w, alice, 900, "rotate keys runbook", "shell", "openssl genpkey quokkaword\n") == 0);
+    uint64_t mid = snip_post(w, alice, OC_DEFAULT_CHANNEL, 0x71, 900);
+    CHECK(mid);
+    CHECK(snip_num(path, "SELECT COUNT(*) FROM attachment_media WHERE attachment_id=?1 AND kind=2 "
+                        "AND title='rotate keys runbook' AND language='shell';", 900) == 1);
+    /* Found by its title and by its body, by anyone who can read it. */
+    CHECK(search_finds(w, bob, "runbook", mid));
+    CHECK(search_finds(w, bob, "quokkaword", mid));
+    /* One in a private channel is found by its members only. */
+    CHECK(snip_mark(w, alice, 904, "private wombatword", "", "nothing here") == 0);
+    uint64_t pmid = snip_post(w, alice, priv, 0x72, 904);
+    CHECK(pmid);
+    CHECK(search_finds(w, alice, "wombatword", pmid));
+    CHECK(!search_finds(w, bob, "wombatword", pmid));
+    /* Deleted, it is found no more. */
+    oc_job *dj = oc_job_new(OC_JOB_DELETE, 69);
+    dj->user_id = alice; dj->channel_id = OC_DEFAULT_CHANNEL; dj->message_id = mid;
+    oc_dbwriter_submit(w, dj);
+    oc_dbres_free(wait_result(w));
+    CHECK(!search_finds(w, bob, "quokkaword", mid));
+    CHECK(snip_num(path, "SELECT COUNT(*) FROM snippets_fts WHERE rowid=?1;", 900) == 0);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_collapsed(void) {
     const char *path = tdb("collapsed.db");
     cleanup_db(path);
@@ -11551,6 +11683,7 @@ int run_dbwriter_tests(void) {
     test_find_at_time();
     test_move_message();
     test_reminders();
+    test_snippets();
     test_custom_emoji();
     test_group_dm();
     test_avatar();

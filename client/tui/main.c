@@ -124,6 +124,106 @@ static uintattr_t nick_color(uint64_t uid) {
 /* The width-correct draw primitives (tk_cp_width/tk_text/tk_fill) now live in
  * tuikit as tk_cp_width/tk_text/tk_fill; panels/frames as tk_panel/tk_box. */
 
+/* ---- snippets (REQ-226) ------------------------------------------------------
+ * A snippet's text is its attachment's bytes, fetched one at a time for what is
+ * shown and kept here, a few at once. The main loop hands the fetched bytes in
+ * (tui_snip_take); `o` on a message opens its snippet whole. */
+#include "lexer.h"
+enum { TUI_SNIPS = 8 };
+static struct { uint64_t id; char *text; size_t len; } g_tsnip[TUI_SNIPS];
+static int      g_tsnip_next;
+static uint64_t g_tsnip_pending, g_tsnip_lost[16];
+static time_t   g_tsnip_since;
+static int      g_n_tsnip_lost;
+static oc_client *g_tsnip_cl;   /* the client the fetches go through */
+
+static const char *tui_snip_text(uint64_t id, size_t *len) {
+    for (int i = 0; i < TUI_SNIPS; i++)
+        if (g_tsnip[i].id == id && g_tsnip[i].text) { *len = g_tsnip[i].len; return g_tsnip[i].text; }
+    return NULL;
+}
+static void tui_snip_want(uint64_t id) {
+    if (!g_tsnip_cl || g_tsnip_pending) return;
+    for (int i = 0; i < g_n_tsnip_lost; i++) if (g_tsnip_lost[i] == id) return;
+    g_tsnip_pending = id;
+    g_tsnip_since = time(NULL);
+    oc_client_fetch_attachment(g_tsnip_cl, id);
+}
+/* Fetched bytes: kept when they are the snippet asked for. Takes `d`. Returns
+ * 1 when it took them. */
+static int tui_snip_take(uint64_t id, uint8_t *d, size_t n) {
+    if (!id || id != g_tsnip_pending) return 0;
+    g_tsnip_pending = 0;
+    char *t = malloc(n + 1);
+    if (t) { if (n) memcpy(t, d, n); t[n] = '\0'; }
+    free(d);
+    if (!t) return 1;
+    int s = g_tsnip_next; g_tsnip_next = (g_tsnip_next + 1) % TUI_SNIPS;
+    free(g_tsnip[s].text);
+    g_tsnip[s].id = id; g_tsnip[s].text = t; g_tsnip[s].len = n;
+    return 1;
+}
+static uintattr_t tui_lex_color(uint8_t kind) {
+    return kind == OC_LEX_KEYWORD ? (TB_BLUE | TB_BOLD) : kind == OC_LEX_STRING ? TB_GREEN
+         : kind == OC_LEX_COMMENT ? (TB_BLACK | TB_BOLD) : kind == OC_LEX_NUMBER ? TB_YELLOW : TB_DEFAULT;
+}
+
+/* The snippet viewer: the whole text, coloured, from line `top`, over the
+ * screen; its title and the keys on the first row. Returns the line count. */
+static int tui_snip_view_draw(uint64_t id, const char *title, int lang, int top) {
+    int W = tb_width(), H = tb_height();
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) tb_set_cell(x, y, ' ', TB_DEFAULT, TB_DEFAULT);
+    char head[256];
+    snprintf(head, sizeof head, " %s \xc2\xb7 %s    j/k scroll, space page, q close", title, oc_lex_label(lang));
+    tk_text(0, 0, W, head, TB_BOLD, TB_DEFAULT);
+    size_t n = 0;
+    const char *s = tui_snip_text(id, &n);
+    if (!s) { tk_text(1, 2, W, "loading\xe2\x80\xa6", TB_DEFAULT, TB_DEFAULT); return 0; }
+    static oc_lex_tok toks[8192];
+    size_t nt = oc_lex(lang, s, n, toks, sizeof toks / sizeof toks[0]);
+    int line = 0, row = 2;
+    size_t i = 0, t = 0;
+    while (i <= n) {
+        size_t e = i; while (e < n && s[e] != '\n') e++;
+        if (line >= top && row < H) {
+            char num[16]; snprintf(num, sizeof num, "%5d ", line + 1);
+            int x = tk_text(0, row, W, num, TB_BLACK | TB_BOLD, TB_DEFAULT);
+            size_t p = i;
+            while (p < e && x < W) {
+                while (t < nt && toks[t].start + toks[t].len <= p) t++;
+                size_t q; uint8_t kind = OC_LEX_PLAIN;
+                if (t < nt && toks[t].start <= p) { q = toks[t].start + toks[t].len; kind = toks[t].kind; }
+                else q = (t < nt && toks[t].start < e) ? toks[t].start : e;
+                if (q > e) q = e;
+                if (q <= p) q = p + 1;
+                char seg[512]; size_t k = 0;
+                for (size_t r = p; r < q && k + 5 < sizeof seg; r++) {
+                    if (s[r] == '\t') { memcpy(seg + k, "    ", 4); k += 4; }
+                    else if (s[r] != '\r') seg[k++] = s[r];
+                }
+                seg[k] = '\0';
+                x = tk_text(x, row, W, seg, tui_lex_color(kind), TB_DEFAULT);
+                p = q;
+            }
+            row++;
+        } else {
+            while (t < nt && toks[t].start + toks[t].len <= e) t++;
+        }
+        line++;
+        if (e >= n) break;
+        i = e + 1;
+    }
+    return line;
+}
+
+/* A fetch that never came back is not asked for again. */
+static void tui_snip_tick(void) {
+    if (g_tsnip_pending && time(NULL) - g_tsnip_since > 10) {
+        if (g_n_tsnip_lost < 16) g_tsnip_lost[g_n_tsnip_lost++] = g_tsnip_pending;
+        g_tsnip_pending = 0;
+    }
+}
+
 /* ---- a rebuilt-each-frame list of wrapped display rows for the message pane -- */
 
 typedef struct { char *s; uintattr_t fg; int mi; } row_t;   /* mi = message index (-1 = none) */
@@ -421,6 +521,33 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
             snprintf(al, sizeof al, "    \xf0\x9f\x93\x8e %s (no longer available)",
                      a->filename[0] ? a->filename : "file");
             acol = TB_BLACK | TB_BOLD;
+        } else if (a->media_kind == OC_MEDIA_SNIPPET) {
+            /* A snippet (REQ-226): its title and language, then its first
+             * lines once fetched; o opens it whole. */
+            snprintf(al, sizeof al, "    [snippet] %s \xc2\xb7 %s  (o to open)",
+                     a->title[0] ? a->title : a->filename, oc_lex_label(oc_lex_language(a->language)));
+            char *own = strdup(al);
+            if (own) rows_push(r, own, acol);
+            size_t sl = 0;
+            const char *st = tui_snip_text(a->id, &sl);
+            if (!st) {
+                tui_snip_want(a->id);
+                char *ld = strdup("      loading\xe2\x80\xa6");
+                if (ld) rows_push(r, ld, TB_BLACK | TB_BOLD);
+                continue;
+            }
+            size_t p = 0;
+            for (int ln = 0; ln < 3 && p < sl; ln++) {
+                size_t e = p; while (e < sl && st[e] != '\n') e++;
+                char lb[200]; size_t k = 0;
+                lb[k++] = ' '; lb[k++] = ' '; lb[k++] = ' '; lb[k++] = ' '; lb[k++] = ' '; lb[k++] = ' ';
+                for (size_t q = p; q < e && k + 5 < sizeof lb; q++) lb[k++] = st[q] == '\t' ? ' ' : st[q];
+                lb[k] = '\0';
+                char *ol = strdup(lb);
+                if (ol) rows_push(r, ol, TB_DEFAULT);
+                p = e + 1;
+            }
+            continue;
         } else if (a->media_kind == OC_MEDIA_VIDEO_MESSAGE) {
             /* A video message (REQ-165). A terminal plays nothing (ARCH-75): say
              * what it is and how long, and keep the download. */
@@ -3312,6 +3439,10 @@ int main(int argc, char **argv) {
     int help_open = 0;
     int profile_open = 0;                     /* /profile identity modal */
     int deactivate_ask = 0;                   /* "Deactivate account": y/N before it is sent */
+    /* The snippet open over the screen (REQ-226): which, its title and
+     * language, and the first line shown. */
+    uint64_t sv_id = 0; int sv_top = 0, sv_lang = 0, sv_lines = 0;
+    char sv_title[OC_SNIPPET_TITLE_MAX + 1] = "";
     int ac_idx = 0;                           /* autocomplete cycle index */
     int panel = 0;                            /* 0 composer · 1 channels · 2 messages · 3 members */
     int msg_sel = -1, mem_sel = 0;            /* selection within the messages / members panel */
@@ -3366,6 +3497,12 @@ int main(int argc, char **argv) {
         }
         for (int i = 0; i < g_nws; i++) {
             oc_client_tick(g_ws[i].cl);
+            /* Fetched bytes: a snippet's text (REQ-226); nothing else here asks. */
+            {
+                uint64_t fid = 0; size_t flen = 0; uint8_t *fd;
+                while ((fd = oc_model_take_attachment((oc_model *)oc_client_model(g_ws[i].cl), &fid, &flen)))
+                    if (!tui_snip_take(fid, fd, flen)) free(fd);
+            }
             /* Each session pulls its own synced settings bucket once per
              * authenticated connection (a reconnect re-pulls). */
             const oc_model *wm = oc_client_model(g_ws[i].cl);
@@ -3489,6 +3626,8 @@ int main(int argc, char **argv) {
             else
                 snprintf(g_closed_note, sizeof g_closed_note, "Reminder: a message you saved.");
         }
+        g_tsnip_cl = cl;
+        tui_snip_tick();
         /* Lazy backfill + keep the focused channel marked read. */
         if (focus < m->n_channels) {
             uint64_t cid = m->channels[focus].channel_id;
@@ -3517,6 +3656,10 @@ int main(int argc, char **argv) {
          * buffer, then a single tb_present() below diffs it to the screen. (Two
          * presents per frame — base then overlay — flicker the overlay.) */
         render(cl, focus, composer, clen, scroll, help_open, ac_idx, panel, msg_sel, mem_sel, editing);
+        if (sv_id) {
+            if (!tui_snip_text(sv_id, &(size_t){0})) tui_snip_want(sv_id);
+            sv_lines = tui_snip_view_draw(sv_id, sv_title, sv_lang, sv_top);
+        }
         if (deactivate_ask)
             tk_modal_confirm(tb_width(), tb_height(),
                              "Deactivate your account? You will be signed out everywhere and "
@@ -3745,6 +3888,19 @@ int main(int argc, char **argv) {
         if (storage_open) {                    /* storage overlay: any key closes */
             if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
             else storage_open = 0;
+            continue;
+        }
+        if (sv_id) {                           /* the snippet viewer (REQ-226) */
+            int page = tb_height() - 3; if (page < 1) page = 1;
+            if (ev.ch == 'q' || ev.key == TB_KEY_ESC) sv_id = 0;
+            else if (ev.ch == 'j' || ev.key == TB_KEY_ARROW_DOWN) sv_top++;
+            else if (ev.ch == 'k' || ev.key == TB_KEY_ARROW_UP) sv_top--;
+            else if (ev.ch == ' ' || ev.key == TB_KEY_PGDN) sv_top += page;
+            else if (ev.key == TB_KEY_PGUP) sv_top -= page;
+            else if (ev.ch == 'g') sv_top = 0;
+            else if (ev.ch == 'G') sv_top = sv_lines - page;
+            if (sv_top > sv_lines - page) sv_top = sv_lines - page;
+            if (sv_top < 0) sv_top = 0;
             continue;
         }
         if (deactivate_ask) {                  /* y deactivates; anything else keeps the account */
@@ -4289,6 +4445,16 @@ int main(int argc, char **argv) {
                     }
                     else if (ev.ch == 't' && !locked) oc_client_open_thread(cl, cid, mid);
                     else if (ev.ch == 'v' && has_spoilers(sel->body)) spoilers_toggle(mid);
+                    else if (ev.ch == 'o' && !sel->deleted) {   /* open its snippet whole (REQ-226) */
+                        for (uint8_t ak = 0; ak < sel->n_attach; ak++)
+                            if (sel->attach[ak].media_kind == OC_MEDIA_SNIPPET && !sel->attach[ak].reclaimed) {
+                                sv_id = sel->attach[ak].id; sv_top = 0;
+                                sv_lang = oc_lex_language(sel->attach[ak].language);
+                                snprintf(sv_title, sizeof sv_title, "%s",
+                                         sel->attach[ak].title[0] ? sel->attach[ak].title : sel->attach[ak].filename);
+                                break;
+                            }
+                    }
                     else if (ev.ch == 'c' && !sel->deleted) {   /* fold or unfold, on every device */
                         tui_expand(mid, sel->collapsed);
                         oc_client_set_collapsed(cl, mid, !sel->collapsed);

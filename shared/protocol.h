@@ -205,8 +205,13 @@
  *
  * 38: SAVE_ITEM, SAVED_UPDATED and SAVED_MSG carry `remind_at_ms` (u64, 0 for
  * none), a saved item's reminder (REQ-283), and activity has a new kind,
- * OC_ACT_REMINDER, for one that fired. Fields appended to fixed layouts. */
-#define OC_PROTOCOL_VERSION 38u
+ * OC_ACT_REMINDER, for one that fired. Fields appended to fixed layouts.
+ *
+ * 39: an attachment entry may be a snippet (media kind 2, REQ-226), which
+ * carries `title` and `language` where a video carries its facts, and
+ * ATTACH_MEDIA_SET marks one with them and its searchable text. A client of 38
+ * would refuse a message carrying the new kind, so the version moves. */
+#define OC_PROTOCOL_VERSION 39u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -993,6 +998,7 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 /* `media_kind` is OC_MEDIA_NONE for an ordinary file. For OC_MEDIA_VIDEO_MESSAGE
  * the four fields after it are on the wire too (REQ-165, ARCH-110); otherwise
  * they are absent and read as zero. */
+/* For OC_MEDIA_SNIPPET, `title` and `language` follow instead (REQ-226). */
 typedef struct {
     uint64_t id;
     oc_slice filename;
@@ -1003,18 +1009,33 @@ typedef struct {
     uint32_t duration_ms;
     uint16_t width, height;
     uint64_t poster_id;
+    oc_slice title, language;
 } oc_attach_entry;
 
 /* Media kinds and the bounds ATTACH_MEDIA_SET enforces (REQ-162/164). */
 #define OC_MEDIA_NONE             0u
 #define OC_MEDIA_VIDEO_MESSAGE    1u
+/* A snippet (REQ-226): a text/plain upload with a title and an optional
+ * language, shown highlighted. Its bytes ride the attachment path; the first
+ * OC_SNIPPET_INDEX_MAX of them come with ATTACH_MEDIA_SET to be searchable. */
+#define OC_MEDIA_SNIPPET          2u
+#define OC_SNIPPET_MAX_SIZE       (1024u * 1024u)
+#define OC_SNIPPET_TITLE_MAX      120u
+#define OC_SNIPPET_LANG_MAX       16u
+#define OC_SNIPPET_INDEX_MAX      65536u
+/* Past either, a paste is offered as a snippet. */
+#define OC_SNIPPET_PASTE_LINES    40u
+#define OC_SNIPPET_PASTE_BYTES    4096u
 #define OC_MEDIA_MAX_DURATION_MS  300000u      /* five minutes, the recording cap */
 #define OC_MEDIA_MAX_WIDTH        1920u
 #define OC_MEDIA_MAX_HEIGHT       1080u
 #define OC_MEDIA_MAX_POSTER_SIZE  (1024u * 1024u)
 
+/* For OC_MEDIA_SNIPPET the video fields are absent and `title`, `language` and
+ * `text` (the body's first OC_SNIPPET_INDEX_MAX bytes, for search) follow. */
 typedef struct { uint64_t attachment_id; uint8_t media_kind; uint32_t duration_ms;
-                 uint16_t width, height; uint64_t poster_id; } oc_attach_media_set;
+                 uint16_t width, height; uint64_t poster_id;
+                 oc_slice title, language, text; } oc_attach_media_set;
 typedef struct { uint64_t attachment_id; } oc_attach_media_ok;
 
 typedef struct { uint16_t min_version; uint16_t max_version; oc_slice client_info; } oc_hello;

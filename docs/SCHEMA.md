@@ -1,7 +1,7 @@
 # OpenChime — Database Schema
 
 The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
-ARCH-27 (§1); the daemon applies migrations 0001–0077 (`daemon/migrate.c`,
+ARCH-27 (§1); the daemon applies migrations 0001–0078 (`daemon/migrate.c`,
 `OC_MIGRATIONS`), in order, and new tables/columns arrive as later numbered
 migrations, never as edits to an existing one. 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
@@ -36,7 +36,7 @@ credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
 **0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
-(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people.
+(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -2014,3 +2014,23 @@ unmute themselves, one person at a time. *Read* by the push audience query
 count and by the activity feed, which leave a muted author's messages, mentions,
 reactions and replies out, and by `LIST_NOTIFY_PREFS`, which sends the list as
 `MUTED_USERS`. The muted person's own rows and counts are untouched.
+
+## 3bq. Migration 0078 — snippets (REQ-226)
+
+```sql
+ALTER TABLE attachment_media ADD COLUMN title TEXT;
+ALTER TABLE attachment_media ADD COLUMN language TEXT;
+CREATE VIRTUAL TABLE snippets_fts USING fts5(title, body);
+```
+
+*A snippet is an attachment with a media row*, as a video message is (§3af):
+`kind` 2, its `duration_ms`, `width` and `height` zero, no poster, and a `title`
+and `language` (NULL for every other kind). Its bytes, placement, permissions,
+retention and reclaim are an attachment's, unchanged.
+
+*`snippets_fts` holds what search finds*: its title and the first 64 KiB of
+its text, keyed on the attachment id, written when the upload is marked a
+snippet. It is a table of its own rather than more of `messages_fts`, whose
+rows are the messages' bodies and kept by triggers on `messages`. A row is
+deleted when its message is deleted and when the storage sweep reclaims its
+bytes.

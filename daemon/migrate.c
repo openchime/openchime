@@ -1357,6 +1357,15 @@ static const char MIGRATION_0077[] =
     "  PRIMARY KEY (user_id, muted_id)"
     ") WITHOUT ROWID;";
 
+static const char MIGRATION_0078[] =
+    /* Snippets (REQ-226): an attachment of media kind 2, with a title and an
+     * optional language beside a video's facts, and an index of its title and
+     * first 64 KiB, keyed on the attachment, for search. The index row goes
+     * when the message is deleted or the bytes are reclaimed. */
+    "ALTER TABLE attachment_media ADD COLUMN title TEXT;"
+    "ALTER TABLE attachment_media ADD COLUMN language TEXT;"
+    "CREATE VIRTUAL TABLE snippets_fts USING fts5(title, body);";
+
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
      * author is doing, and the daemon records that as its own object beside the
@@ -1722,6 +1731,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 75, MIGRATION_0075 },
     { 76, MIGRATION_0076 },
     { 77, MIGRATION_0077 },
+    { 78, MIGRATION_0078 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

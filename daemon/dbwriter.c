@@ -283,6 +283,7 @@ static void job_free(oc_job *j) {
     free(j->pri_people);
     free(j->sched_days);
     free(j->alert_key); free(j->alert_message);
+    free(j->snip_title); free(j->snip_lang); free(j->snip_text);
     free(j->token);
     free(j->proof);
     free(j->email);
@@ -333,7 +334,9 @@ static void job_free(oc_job *j) {
 
 /* Free the heap metadata of an attachment list (filename/mime per entry). */
 static void free_attach_meta(oc_attach_meta *a, size_t n) {
-    for (size_t i = 0; i < n; i++) { free(a[i].filename); free(a[i].mime); }
+    for (size_t i = 0; i < n; i++) {
+        free(a[i].filename); free(a[i].mime); free(a[i].title); free(a[i].language);
+    }
 }
 
 /* Reaction aggregates for a replayed window (REQ-070/071). A BROADCAST has no
@@ -4307,7 +4310,7 @@ static void load_message_attachments(sqlite3 *db, uint64_t mid, oc_attach_meta *
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "SELECT a.id, a.filename, a.mime, a.size, a.reclaimed_at_ms, "
-        "       m.kind, m.duration_ms, m.width, m.height, m.poster_id "
+        "       m.kind, m.duration_ms, m.width, m.height, m.poster_id, m.title, m.language "
         "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id "
         " WHERE a.message_id=? ORDER BY a.id LIMIT ?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
@@ -4329,6 +4332,10 @@ static void load_message_attachments(sqlite3 *db, uint64_t mid, oc_attach_meta *
         a->width       = (uint16_t)sqlite3_column_int(st, 7);
         a->height      = (uint16_t)sqlite3_column_int(st, 8);
         a->poster_id   = (uint64_t)sqlite3_column_int64(st, 9);
+        /* A snippet's title and language (REQ-226). */
+        const unsigned char *tt = sqlite3_column_text(st, 10), *lg = sqlite3_column_text(st, 11);
+        a->title    = (a->media_kind == OC_MEDIA_SNIPPET && tt) ? strdup((const char *)tt) : NULL;
+        a->language = (a->media_kind == OC_MEDIA_SNIPPET && lg) ? strdup((const char *)lg) : NULL;
     }
     sqlite3_finalize(st);
 }
@@ -5328,7 +5335,11 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
      * (ARCH-78) — so the bytes are reclaimed by a path that is already written
      * and tested, on its own schedule, off the writer thread. What matters for
      * correctness is that they leave the message immediately: a tombstone that
-     * still lists a file is offering something it no longer has. */
+     * still lists a file is offering something it no longer has. A snippet's
+     * words leave the search index with it (REQ-226). */
+    sqlite3_prepare_v2(db, "DELETE FROM snippets_fts WHERE rowid IN "
+                           "(SELECT id FROM attachments WHERE message_id=?);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_prepare_v2(db, "UPDATE attachments SET message_id=NULL WHERE message_id=?;",
                        -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
@@ -7996,6 +8007,49 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
         n++;
     }
     sqlite3_finalize(st);
+    /* Snippets (REQ-226): a title or the first OC_SNIPPET_INDEX_MAX bytes of
+     * one find the message carrying it, read under the same gate. They join
+     * the first page of a plain text search, newest first, after the message
+     * hits and without repeating one; a filtered or later page is the
+     * messages' alone, since those filters and cursors are the messages'. */
+    if (arr && have_text && !have_filter && !j->message_id && n < lim &&
+        sqlite3_prepare_v2(db,
+            "SELECT m.id, m.channel_id, m.author_id, m.created_at_ms, md.title "
+            "  FROM snippets_fts s JOIN attachments a ON a.id = s.rowid "
+            "  JOIN attachment_media md ON md.attachment_id = a.id "
+            "  JOIN messages m ON m.id = a.message_id "
+            "  JOIN channels c ON c.id = m.channel_id "
+            " WHERE snippets_fts MATCH ?1 AND m.deleted_at_ms IS NULL AND a.reclaimed_at_ms = 0 "
+            "   AND c.e2e = 0 "
+            "   AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members cm "
+            "        WHERE cm.channel_id=m.channel_id AND cm.user_id=?2)) "
+            " ORDER BY m.id DESC LIMIT ?3;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, fts, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)lim);
+        while (n < lim && sqlite3_step(st) == SQLITE_ROW) {
+            uint64_t id = (uint64_t)sqlite3_column_int64(st, 0);
+            int dup = 0;
+            for (size_t q = 0; q < n && !dup; q++) dup = arr[q].message_id == id;
+            if (dup) continue;
+            if (n == cap) { cap *= 2; oc_replay_msg *g = realloc(arr, cap * sizeof *arr); if (!g) break; arr = g; }
+            oc_replay_msg *m = &arr[n];
+            memset(m, 0, sizeof *m);
+            m->message_id  = id;
+            m->channel_id  = (uint64_t)sqlite3_column_int64(st, 1);
+            m->author_id   = (uint64_t)sqlite3_column_int64(st, 2);
+            m->server_time = (uint64_t)sqlite3_column_int64(st, 3);
+            const char *tt = (const char *)sqlite3_column_text(st, 4);
+            char line[OC_SNIPPET_TITLE_MAX + 16];
+            int ll = snprintf(line, sizeof line, "Snippet: %s", tt ? tt : "");
+            if (ll > 0) {
+                m->body = malloc((size_t)ll);
+                if (m->body) { memcpy(m->body, line, (size_t)ll); m->body_len = (size_t)ll; }
+            }
+            n++;
+        }
+        sqlite3_finalize(st);
+    }
     r->search = arr;
     r->n_search = n;
     r->truncated = (n >= lim);   /* filled the requested limit -> maybe more */
@@ -8850,12 +8904,96 @@ static oc_dbres *process_attach_finalize(sqlite3 *db, const oc_job *j) {
  * channel read gate on the attachment's own channel (process_attach_lookup), and
  * the two share a channel by construction, so no exception to that gate is
  * needed. Write. */
+/* Whether `n` bytes at `s` are whole UTF-8 with no NUL: what goes into the
+ * text index has to be text. */
+static int utf8_whole(const char *s, size_t n) {
+    const unsigned char *u = (const unsigned char *)s;
+    size_t i = 0;
+    while (i < n) {
+        unsigned c = u[i];
+        size_t k = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
+        if (c == 0 || k == 0 || i + k > n) return 0;
+        uint32_t cp = k == 1 ? c : k == 2 ? (c & 0x1F) : k == 3 ? (c & 0x0F) : (c & 0x07);
+        for (size_t q = 1; q < k; q++) {
+            if ((u[i + q] & 0xC0) != 0x80) return 0;
+            cp = (cp << 6) | (u[i + q] & 0x3F);
+        }
+        /* Overlong forms, surrogates and past the last code point. */
+        if ((k == 2 && cp < 0x80) || (k == 3 && cp < 0x800) || (k == 4 && cp < 0x10000) ||
+            (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF) return 0;
+        i += k;
+    }
+    return 1;
+}
+
 static oc_dbres *process_attach_media_set(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     r->attachment_id = j->attachment_id;
     r->type = OC_RES_MEDIA_ERR;
+
+    if (j->media_kind == OC_MEDIA_SNIPPET) {
+        /* A snippet (REQ-226): the caller's finished, unlinked text/plain
+         * upload, at most OC_SNIPPET_MAX_SIZE, with a title. Its title and the
+         * first bytes of its text go into snippets_fts, so a search finds the
+         * message carrying it; the row goes when the attachment does. */
+        if (!j->snip_title || !j->snip_title[0] || !j->snip_lang || !j->snip_text ||
+            !utf8_whole(j->snip_title, strlen(j->snip_title)) ||
+            !utf8_whole(j->snip_text, j->snip_text_len)) {
+            r->err_code = OC_ERR_MEDIA_INVALID; return r;
+        }
+        for (const char *q = j->snip_lang; *q; q++)
+            if (!((*q >= 'a' && *q <= 'z') || (*q >= '0' && *q <= '9') || *q == '+' || *q == '#' || *q == '-')) {
+                r->err_code = OC_ERR_MEDIA_INVALID; return r;
+            }
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db,
+            "SELECT uploader_id, message_id, sha256 IS NOT NULL, reclaimed_at_ms, mime, size "
+            "  FROM attachments WHERE id=?;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+        int found = sqlite3_step(st) == SQLITE_ROW;
+        uint64_t up = found ? (uint64_t)sqlite3_column_int64(st, 0) : 0;
+        int linked  = found && sqlite3_column_type(st, 1) != SQLITE_NULL;
+        int final   = found && sqlite3_column_int(st, 2);
+        int gone    = found && sqlite3_column_int64(st, 3) != 0;
+        const unsigned char *mm = found ? sqlite3_column_text(st, 4) : NULL;
+        int plain   = mm && strcmp((const char *)mm, "text/plain") == 0;
+        uint64_t sz = found ? (uint64_t)sqlite3_column_int64(st, 5) : 0;
+        sqlite3_finalize(st);
+        if (!found || up != j->user_id || !final || gone) { r->err_code = OC_ERR_UNKNOWN_ATTACHMENT; return r; }
+        if (linked || !plain) { r->err_code = OC_ERR_MEDIA_INVALID; return r; }
+        if (sz > OC_SNIPPET_MAX_SIZE) { r->err_code = OC_ERR_MEDIA_TOO_LARGE; return r; }
+        sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+        int ok = 1;
+        sqlite3_prepare_v2(db,
+            "INSERT INTO attachment_media(attachment_id, kind, duration_ms, width, height, poster_id, "
+            "  created_at_ms, title, language) VALUES(?1, ?2, 0, 0, 0, NULL, ?3, ?4, ?5) "
+            "ON CONFLICT(attachment_id) DO UPDATE SET kind=?2, title=?4, language=?5;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+        sqlite3_bind_int  (st, 2, (int)OC_MEDIA_SNIPPET);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        sqlite3_bind_text (st, 4, j->snip_title, -1, SQLITE_STATIC);
+        sqlite3_bind_text (st, 5, j->snip_lang, -1, SQLITE_STATIC);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+        if (ok) {
+            sqlite3_prepare_v2(db, "DELETE FROM snippets_fts WHERE rowid=?1;", -1, &st, NULL);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+            sqlite3_step(st); sqlite3_finalize(st);
+            sqlite3_prepare_v2(db, "INSERT INTO snippets_fts(rowid, title, body) VALUES(?1, ?2, ?3);",
+                               -1, &st, NULL);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+            sqlite3_bind_text (st, 2, j->snip_title, -1, SQLITE_STATIC);
+            sqlite3_bind_text (st, 3, j->snip_text, (int)j->snip_text_len, SQLITE_STATIC);
+            ok = sqlite3_step(st) == SQLITE_DONE;
+            sqlite3_finalize(st);
+        }
+        sqlite3_exec(db, ok ? "COMMIT;" : "ROLLBACK;", NULL, NULL, NULL);
+        if (!ok) { r->err_code = OC_ERR_INTERNAL; return r; }
+        r->type = OC_RES_MEDIA_OK;
+        return r;
+    }
 
     if (j->media_kind != OC_MEDIA_VIDEO_MESSAGE ||
         j->media_duration_ms == 0 || j->media_duration_ms > OC_MEDIA_MAX_DURATION_MS ||
@@ -12148,6 +12286,12 @@ static int reclaim_add(sqlite3 *db, oc_dbres *r, size_t cap,
     int done = (sqlite3_step(st) == SQLITE_DONE) && sqlite3_changes(db) > 0;
     sqlite3_finalize(st);
     if (!done) { free(dup); return 0; }          /* someone else got there first */
+    /* A snippet whose bytes go is no longer anything to find (REQ-226). */
+    if (sqlite3_prepare_v2(db, "DELETE FROM snippets_fts WHERE rowid=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)aid);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
     r->reclaim[r->n_reclaim].storage_key = dup;
     r->reclaim[r->n_reclaim].attachment_id = aid;
     r->n_reclaim++;

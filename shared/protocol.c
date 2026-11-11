@@ -401,6 +401,9 @@ static void w_attach_entry(oc_wbuf *w, const oc_attach_entry *a) {
         oc_w_u16(w, a->width);
         oc_w_u16(w, a->height);
         oc_w_u64(w, a->poster_id);
+    } else if (a->media_kind == OC_MEDIA_SNIPPET) {
+        oc_w_str(w, a->title);
+        oc_w_str(w, a->language);
     }
 }
 
@@ -412,11 +415,16 @@ static oc_result r_attach_entry(oc_rbuf *p, oc_attach_entry *a) {
     a->reclaimed = oc_r_u8(p);
     a->media_kind = oc_r_u8(p);
     a->duration_ms = 0; a->width = a->height = 0; a->poster_id = 0;
+    a->title.ptr = a->language.ptr = NULL; a->title.len = a->language.len = 0;
     if (a->media_kind == OC_MEDIA_VIDEO_MESSAGE) {
         a->duration_ms = oc_r_u32(p);
         a->width = oc_r_u16(p);
         a->height = oc_r_u16(p);
         a->poster_id = oc_r_u64(p);
+    } else if (a->media_kind == OC_MEDIA_SNIPPET) {
+        a->title = oc_r_str(p);
+        a->language = oc_r_str(p);
+        if (a->title.len > OC_SNIPPET_TITLE_MAX || a->language.len > OC_SNIPPET_LANG_MAX) return OC_E_MALFORMED;
     } else if (a->media_kind != OC_MEDIA_NONE) {
         return OC_E_MALFORMED;               /* a kind this version does not define */
     }
@@ -599,6 +607,12 @@ oc_result oc_encode_attach_media_set(oc_wbuf *w, uint16_t version, const oc_atta
     size_t off = oc_frame_begin(w, version, OC_MSG_ATTACH_MEDIA_SET);
     oc_w_u64(w, m->attachment_id);
     oc_w_u8(w, m->media_kind);
+    if (m->media_kind == OC_MEDIA_SNIPPET) {
+        oc_w_str(w, m->title);
+        oc_w_str(w, m->language);
+        oc_w_str(w, m->text);
+        return oc_frame_end(w, off);
+    }
     oc_w_u32(w, m->duration_ms);
     oc_w_u16(w, m->width);
     oc_w_u16(w, m->height);
@@ -3041,6 +3055,17 @@ oc_result oc_decode_unfurl(oc_rbuf *p, oc_unfurl *m) {
 oc_result oc_decode_attach_media_set(oc_rbuf *p, oc_attach_media_set *m) {
     m->attachment_id = oc_r_u64(p);
     m->media_kind    = oc_r_u8(p);
+    m->title.ptr = m->language.ptr = m->text.ptr = NULL;
+    m->title.len = m->language.len = m->text.len = 0;
+    if (m->media_kind == OC_MEDIA_SNIPPET) {
+        m->duration_ms = 0; m->width = m->height = 0; m->poster_id = 0;
+        m->title    = oc_r_str(p);
+        m->language = oc_r_str(p);
+        m->text     = oc_r_str(p);
+        if (m->title.len > OC_SNIPPET_TITLE_MAX || m->language.len > OC_SNIPPET_LANG_MAX ||
+            m->text.len > OC_SNIPPET_INDEX_MAX) return OC_E_MALFORMED;
+        return r_done(p);
+    }
     m->duration_ms   = oc_r_u32(p);
     m->width         = oc_r_u16(p);
     m->height        = oc_r_u16(p);
