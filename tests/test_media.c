@@ -290,6 +290,44 @@ static void test_synthetic_camera_pacing(void) {
     oc_capture_close(cam);
 }
 
+/* The screen front end paces still frames out at the frame rate, and stamps
+ * each at the time it was due, as the camera does. A reader a period and a half
+ * late, then on time again -- a sender's capture thread held up for a moment --
+ * once got a frame stamped late and the next stamped on time, half a period
+ * apart; the receiving player shows frames by their stamps and drops one of two
+ * that fall due together, so a share showed fewer frames than were sent. */
+static void test_screen_pacing(void) {
+    setenv("OPENCHIME_DEV_CAPTURE", "synthetic", 1);
+    int err;
+    oc_capture *c = oc_capture_open_screen("screen:synthetic", 640, 400, 30, &err);
+    CHECK(c != NULL && err == OC_CAP_OK);
+    if (!c) return;
+    CHECK(oc_capture_start(c) == OC_CAP_OK);
+    const int64_t period = 1000000 / 30;
+    oc_frame f;
+    CHECK(oc_capture_next(c, &f, 500) == 1);
+    CHECK(oc_capture_next(c, &f, 500) == 1);
+    int64_t prev = f.pts_us, min_gap = INT64_MAX;
+    oc_test_let_time_pass((uint64_t)(period * 3 / 2 / 1000));   /* the sender, held up */
+    for (int i = 0; i < 4; i++) {
+        if (oc_capture_next(c, &f, 500) != 1) { CHECK(0); break; }
+        if (f.pts_us - prev < min_gap) min_gap = f.pts_us - prev;
+        prev = f.pts_us;
+    }
+    printf("  screen source, read late: closest stamps %lld us apart (a period is %lld)\n",
+           (long long)min_gap, (long long)period);
+    CHECK(min_gap >= period);
+    /* Held up for whole periods: no burst of catch-up frames, and never a stamp
+     * that goes back. */
+    oc_test_let_time_pass((uint64_t)(period * 4 / 1000));
+    int64_t before = prev;
+    CHECK(oc_capture_next(c, &f, 500) == 1 && f.pts_us > before);
+    prev = f.pts_us;
+    CHECK(oc_capture_next(c, &f, 500) == 1 && f.pts_us - prev >= period);
+    oc_capture_stop(c);
+    oc_capture_close(c);
+}
+
 static void test_vp9_roundtrip(void) {
     setenv("OPENCHIME_DEV_CAPTURE", "synthetic", 1);
     int err;
@@ -1024,6 +1062,7 @@ int run_media_tests(void) {
     test_player_audio_only();
     test_mp4_fuzz();
     test_synthetic_camera_pacing();
+    test_screen_pacing();
     test_vp9_roundtrip();
     test_opus_roundtrip();
     test_recorder();

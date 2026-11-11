@@ -115,9 +115,18 @@ static int screen_next(oc_capture *c, oc_frame *f, int timeout_ms) {
         }
         now = oc_media_clock_us();
         if (c->have_last && now >= c->due_us) {
-            c->due_us += c->period_us;
-            if (c->due_us < now) c->due_us = now + c->period_us;   /* no burst after a stall */
-            c->last.pts_us = now;
+            /* Stamped at the time it was due, as the synthetic camera stamps its
+             * frames, not when a late reader took it. Stamped "now", a reader
+             * a period and a half behind got a frame stamped late and the next
+             * stamped on time, half a period after it; a player shows frames by
+             * their stamps and drops one of two that fall due together, which is
+             * how a share delivered fewer frames than were sent. After a whole
+             * period or more unread there is no burst: those frames were never
+             * taken, and this one is stamped now. */
+            int64_t at = c->due_us;
+            if (now - at >= c->period_us) at = now;
+            c->due_us = at + c->period_us;
+            c->last.pts_us = at;
             *f = c->last;
             return 1;
         }
