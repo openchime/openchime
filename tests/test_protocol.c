@@ -3033,6 +3033,43 @@ static void test_out_of_office_frames(void) {
     }
 }
 
+/* A channel's managers (REQ-036b): the two frames, and CHANNEL_INFO naming the
+ * creator and managers after its encrypted-DM byte. */
+static void test_channel_manager_frames(void) {
+    {
+        oc_channel_member_op in = { 7, 42 };
+        ROUNDTRIP(oc_encode_channel_add_manager(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_ADD_MANAGER, h, p);
+        oc_channel_member_op out;
+        CHECK(oc_decode_channel_manager_op(&p, &out) == OC_OK && out.channel_id == 7 && out.user_id == 42);
+    }
+    {
+        oc_channel_member_op in = { 7, 43 };
+        ROUNDTRIP(oc_encode_channel_remove_manager(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_REMOVE_MANAGER, h, p);
+        oc_channel_member_op out;
+        CHECK(oc_decode_channel_manager_op(&p, &out) == OC_OK && out.channel_id == 7 && out.user_id == 43);
+    }
+    {
+        static oc_channel_info in;
+        memset(&in, 0, sizeof in);
+        in.channel_id = 9; in.name = oc_slice_str("crew"); in.topic = oc_slice_str("");
+        in.creator_id = 5; in.n_managers = 2; in.managers[0] = 5; in.managers[1] = 11;
+        ROUNDTRIP(oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_INFO, h, p);
+        static oc_channel_info out;
+        CHECK(oc_decode_channel_info(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 9 && out.creator_id == 5 && out.n_managers == 2 &&
+              out.managers[0] == 5 && out.managers[1] == 11);
+    }
+    {
+        /* None, and unknown: zero and zero. */
+        static oc_channel_info in;
+        memset(&in, 0, sizeof in);
+        in.channel_id = 1; in.name = oc_slice_str("general"); in.topic = oc_slice_str("");
+        ROUNDTRIP(oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_INFO, h, p);
+        static oc_channel_info out;
+        CHECK(oc_decode_channel_info(&p, &out) == OC_OK && out.creator_id == 0 && out.n_managers == 0);
+    }
+}
+
 static void test_reason_codes_unique(void) {
     static const struct { const char *name; int code; } codes[] = {
         { "MALFORMED_FRAME",        OC_ERR_MALFORMED_FRAME },
@@ -3150,6 +3187,7 @@ int run_protocol_tests(void) {
     test_block_frames();
     test_profile_field_frames();
     test_out_of_office_frames();
+    test_channel_manager_frames();
     test_backfill_and_error();
     test_size_limits();
     test_malformed();

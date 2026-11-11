@@ -2457,7 +2457,9 @@ static void test_index_mentions(void) {
                            "DROP TABLE profile_field_values; DROP TABLE profile_fields;"
                            /* 0081's out of office. */
                            "ALTER TABLE users DROP COLUMN ooo_start_ms; ALTER TABLE users DROP COLUMN ooo_end_ms;"
-                           "ALTER TABLE users DROP COLUMN ooo_message;",
+                           "ALTER TABLE users DROP COLUMN ooo_message;"
+                           /* 0082's channel managers. */
+                           "DROP TABLE channel_managers; ALTER TABLE channels DROP COLUMN created_by;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -7106,6 +7108,147 @@ static void test_out_of_office(void) {
         CHECK(r && r->st_text && strcmp(r->st_text, "In a meeting") == 0 && r->pf_ooo_end == end);
         oc_dbres_free(r);
     }
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* A channel's managers (REQ-036b, ARCH-134). */
+static oc_dbres *chan_manager(oc_dbwriter *w, int grant, uint64_t actor, uint64_t ch, uint64_t target) {
+    return chan_member(w, grant ? OC_JOB_CHANNEL_ADD_MANAGER : OC_JOB_CHANNEL_REMOVE_MANAGER, actor, ch, target);
+}
+
+static int has_manager(const oc_dbres *r, uint64_t uid) {
+    for (uint16_t i = 0; r && i < r->n_ch_managers; i++) if (r->ch_managers[i] == uid) return 1;
+    return 0;
+}
+
+static void test_channel_managers(void) {
+    const char *path = tdb("chan_managers.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t owner = reg(w, "cm-owner", "pw", OC_ROLE_OWNER);
+    uint64_t admin = reg(w, "cm-admin", "pw", OC_ROLE_ADMIN);
+    uint64_t ann   = reg(w, "cm-ann",   "pw", OC_ROLE_MEMBER);
+    uint64_t ben   = reg(w, "cm-ben",   "pw", OC_ROLE_MEMBER);
+    uint64_t cy    = reg(w, "cm-cy",    "pw", OC_ROLE_MEMBER);
+    uint64_t dee   = reg(w, "cm-dee",   "pw", OC_ROLE_MEMBER);
+    CHECK(owner && admin && ann && ben && cy && dee);
+
+    /* A channel made before the role (general) has no creator and no managers. */
+    oc_dbres *r = chan_ref(w, OC_JOB_JOIN_CHANNEL, ann, OC_DEFAULT_CHANNEL);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_creator == 0 && r->n_ch_managers == 0);
+    oc_dbres_free(r);
+
+    /* Ann makes a channel: she is its creator and its manager. */
+    r = create_channel(w, ann, "cm-team", 1);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_creator == ann && r->n_ch_managers == 1 && has_manager(r, ann));
+    uint64_t ch = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(ch != 0);
+    oc_dbres_free(chan_ref(w, OC_JOB_JOIN_CHANNEL, ben, ch));
+    oc_dbres_free(chan_ref(w, OC_JOB_JOIN_CHANNEL, cy, ch));
+
+    /* A manager renames, archives and unarchives; a plain member may not. */
+    r = chan_update(w, ben, ch, OC_CHUP_RENAME, "cm-nope");
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    r = chan_update(w, ben, ch, OC_CHUP_ARCHIVE, "");
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    r = chan_update(w, ann, ch, OC_CHUP_RENAME, "cm-crew");
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_name && strcmp(r->ch_name, "cm-crew") == 0);
+    oc_dbres_free(r);
+    r = chan_update(w, ann, ch, OC_CHUP_ARCHIVE, "");
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_archived == 1);
+    oc_dbres_free(r);
+    r = chan_update(w, ann, ch, OC_CHUP_UNARCHIVE, "");
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_archived == 0);
+    oc_dbres_free(r);
+    /* Visibility stays the owners' and admins'. */
+    r = chan_update(w, ann, ch, OC_CHUP_PRIVATE, "");
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* A member may not name a manager. */
+    r = chan_manager(w, 1, ben, ch, cy);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    /* A manager names one, told to every member. */
+    r = chan_manager(w, 1, ann, ch, ben);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_fanout && has_manager(r, ben) && r->n_ch_managers == 2);
+    CHECK(r && r->n_members >= 3);
+    oc_dbres_free(r);
+    /* Again: nothing changes, still a success, and no second audit row. */
+    r = chan_manager(w, 1, ann, ch, ben);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->n_ch_managers == 2);
+    oc_dbres_free(r);
+    CHECK(audit_count(w, owner, "channel.manager.grant") == 1);
+    /* Someone outside the channel cannot be named. */
+    r = chan_manager(w, 1, ann, ch, dee);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+    /* The new manager may now rename it too. */
+    r = chan_update(w, ben, ch, OC_CHUP_RENAME, "cm-crew2");
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    oc_dbres_free(r);
+    /* An admin and an owner each grant and revoke, in the channel or not. */
+    r = chan_manager(w, 1, admin, ch, cy);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && has_manager(r, cy));
+    oc_dbres_free(r);
+    r = chan_manager(w, 0, owner, ch, cy);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && !has_manager(r, cy));
+    oc_dbres_free(r);
+    r = chan_manager(w, 1, owner, ch, cy);
+    CHECK(r && has_manager(r, cy));
+    oc_dbres_free(r);
+    r = chan_manager(w, 0, admin, ch, cy);
+    CHECK(r && !has_manager(r, cy));
+    oc_dbres_free(r);
+    /* Revoking one who holds nothing: success, no change. */
+    r = chan_manager(w, 0, ann, ch, cy);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->n_ch_managers == 2);
+    oc_dbres_free(r);
+    /* A manager may take it from the creator, and the last can go. */
+    r = chan_manager(w, 0, ben, ch, ann);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && !has_manager(r, ann) && r->n_ch_managers == 1);
+    oc_dbres_free(r);
+    r = chan_manager(w, 0, ben, ch, ben);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->n_ch_managers == 0);
+    oc_dbres_free(r);
+    CHECK(audit_count(w, owner, "channel.manager.revoke") == 4);
+    /* With none, its owners and admins still run it, once in it. */
+    oc_dbres_free(chan_ref(w, OC_JOB_JOIN_CHANNEL, admin, ch));
+    r = chan_update(w, admin, ch, OC_CHUP_ARCHIVE, "");
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    oc_dbres_free(r);
+    oc_dbres_free(chan_update(w, admin, ch, OC_CHUP_UNARCHIVE, ""));
+    /* And the creator, no longer a manager, is refused like any member. */
+    r = chan_update(w, ann, ch, OC_CHUP_RENAME, "cm-ann");
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* Leaving ends the role, and rejoining does not restore it. */
+    oc_dbres_free(chan_manager(w, 1, owner, ch, cy));
+    oc_dbres_free(chan_ref(w, OC_JOB_LEAVE_CHANNEL, cy, ch));
+    CHECK(rm_count(path, "SELECT COUNT(*) FROM channel_managers WHERE user_id=?1;", cy) == 0);
+    r = chan_ref(w, OC_JOB_JOIN_CHANNEL, cy, ch);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && !has_manager(r, cy));
+    oc_dbres_free(r);
+    /* So does being removed. */
+    oc_dbres_free(chan_manager(w, 1, owner, ch, cy));
+    oc_dbres_free(chan_member(w, OC_JOB_REMOVE_CHANNEL, ben, ch, cy));
+    CHECK(rm_count(path, "SELECT COUNT(*) FROM channel_managers WHERE user_id=?1;", cy) == 0);
+
+    /* A DM has no managers. */
+    r = open_dm(w, ann, ben);
+    uint64_t dm = (r && r->type == OC_RES_CHANNEL_INFO) ? r->channel_id : 0;
+    CHECK(r && r->ch_creator == 0 && r->n_ch_managers == 0);
+    oc_dbres_free(r);
+    r = chan_manager(w, 1, owner, dm, ann);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_INVALID_CHANNEL);
+    oc_dbres_free(r);
 
     oc_dbwriter_stop(w);
     cleanup_db(path);
@@ -12158,6 +12301,7 @@ int run_dbwriter_tests(void) {
     test_blocks();
     test_profile_fields();
     test_out_of_office();
+    test_channel_managers();
     test_reset_credential();
     test_enable_user();
     test_session_policy();

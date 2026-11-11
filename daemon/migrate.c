@@ -1414,6 +1414,21 @@ static const char MIGRATION_0081[] =
     "ALTER TABLE users ADD COLUMN ooo_end_ms INTEGER NOT NULL DEFAULT 0;"
     "ALTER TABLE users ADD COLUMN ooo_message TEXT NOT NULL DEFAULT '';";
 
+static const char MIGRATION_0082[] =
+    /* A channel's creator (NULL for every channel made before this, and for a
+     * DM), and its managers: members who may rename, archive and unarchive it,
+     * beside the workspace's owners and admins. The creator is the first; any
+     * manager, admin or owner names and removes others. Leaving the channel ends
+     * the role. A channel may have none. */
+    "ALTER TABLE channels ADD COLUMN created_by INTEGER REFERENCES users(id);"
+    "CREATE TABLE channel_managers ("
+    "  channel_id    INTEGER NOT NULL REFERENCES channels(id),"
+    "  user_id       INTEGER NOT NULL REFERENCES users(id),"
+    "  granted_by    INTEGER REFERENCES users(id),"
+    "  granted_at_ms INTEGER NOT NULL,"
+    "  PRIMARY KEY (channel_id, user_id)"
+    ") WITHOUT ROWID;";
+
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
      * author is doing, and the daemon records that as its own object beside the
@@ -1783,6 +1798,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 79, MIGRATION_0079 },
     { 80, MIGRATION_0080 },
     { 81, MIGRATION_0081 },
+    { 82, MIGRATION_0082 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

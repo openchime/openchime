@@ -604,6 +604,53 @@ static int send_frame(client *c, const uint8_t *buf, size_t len) {
  * the private channel in LIST_CHANNELS. */
 static int read_type(client *c, uint16_t type, oc_header *hdr, oc_rbuf *p);   /* below */
 
+/* A channel's managers over the wire (REQ-036b): the creator is named in the
+ * channel's state, and a grant reaches the channel's other members as a
+ * CHANNEL_INFO naming the new manager. */
+static void test_channel_managers_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    uint8_t buf[256]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_channel cch = { oc_slice_str("mgr-room"), 1 };
+    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cch) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    static oc_channel_info info;
+    CHECK(oc_decode_channel_info(&p, &info) == OC_OK);
+    CHECK(info.creator_id == ua && info.n_managers == 1 && info.managers[0] == ua);
+    uint64_t cid = info.channel_id;
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_channel_ref jr = { cid };
+    CHECK(oc_encode_join_channel(&w, OC_PROTOCOL_VERSION, &jr) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+
+    /* alice names bob: her ack and his push both name him. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_channel_member_op mo = { cid, ub };
+    CHECK(oc_encode_channel_add_manager(&w, OC_PROTOCOL_VERSION, &mo) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    CHECK(oc_decode_channel_info(&p, &info) == OC_OK && info.channel_id == cid && info.n_managers == 2);
+    CHECK(read_type(&b, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    CHECK(oc_decode_channel_info(&p, &info) == OC_OK && info.channel_id == cid);
+    int named = 0;
+    for (uint16_t i = 0; i < info.n_managers; i++) if (info.managers[i] == ub) named = 1;
+    CHECK(named);
+
+    client_close(&a);
+    client_close(&b);
+}
+
 static void test_channels_vertical(int port, const uint8_t *pin) {
     client a, b, cc;
     CHECK(client_open(&a, port, pin) == 0);
@@ -8565,6 +8612,7 @@ int run_netloop_tests(void) {
         test_unexpected_msg_type(arg.port, pin);
         test_edit_delete_vertical(arg.port, pin);
         test_channels_vertical(arg.port, pin);
+        test_channel_managers_vertical(arg.port, pin);
         test_threads_vertical(arg.port, pin);
         test_thread_meta_vertical(arg.port, pin);
         test_action_vertical(arg.port, pin);

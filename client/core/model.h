@@ -262,6 +262,12 @@ typedef struct {
      * them. From CHANNEL_GROUPS; a deleted group is taken out here too. */
     uint64_t groups[OC_MAX_CHANNEL_GROUPS];
     uint16_t n_groups;
+    /* Who made it (0 unknown) and who runs it (REQ-036b), from CHANNEL_INFO;
+     * `managers_known` once one has said. */
+    uint64_t creator_id;
+    uint64_t managers[OC_MAX_CHANNEL_MANAGERS];
+    uint16_t n_managers;
+    uint8_t  managers_known;
 } oc_channel;
 
 /* `dnd` is a SECOND AXIS beside status, not a status value (REQ-122): a person
@@ -942,6 +948,8 @@ const oc_group_view *oc_model_group(const oc_model *m, uint64_t group_id);
 int oc_model_only_via_group(const oc_model *m, uint64_t channel_id, uint64_t user_id);
 const oc_group_view *oc_model_group_by_handle(const oc_model *m, const char *handle);
 int      oc_model_in_group(const oc_group_view *g, uint64_t user_id);
+/* Is `user_id` a manager of channel `c` (REQ-036b), as its last CHANNEL_INFO said? */
+int      oc_model_is_channel_manager(const oc_channel *c, uint64_t user_id);
 uint64_t oc_model_via_group(const oc_model *m, uint64_t channel_id, uint64_t user_id);
 /* `body` as it is shown: each id-form mention (<@U42>) as '@' and the roster's
  * name for the id, an id the roster lacks as written (oc_mention_display).

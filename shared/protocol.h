@@ -219,8 +219,13 @@
  *
  * 41: out of office (REQ-122). Each USER_LIST entry and PROFILE_INFO (after its field list) carry
  * `ooo_start` (u64), `ooo_end` (u64) and `ooo_message` (str): fields appended to
- * a repeated entry and to a fixed layout. SET_OUT_OF_OFFICE (0x013A) is new. */
-#define OC_PROTOCOL_VERSION 41u
+ * a repeated entry and to a fixed layout. SET_OUT_OF_OFFICE (0x013A) is new.
+ *
+ * 42: channel managers (REQ-036b). CHANNEL_INFO carries `creator_id` (u64) and
+ * `n_managers` (u16) with that many u64 user ids: fields appended to a fixed
+ * layout. CHANNEL_ADD_MANAGER and CHANNEL_REMOVE_MANAGER (0x013B, 0x013C) are
+ * new. */
+#define OC_PROTOCOL_VERSION 42u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -643,6 +648,8 @@ typedef enum {
     OC_MSG_PROFILE_FIELDS       = 0x0138, /* S->C, the workspace's profile fields: at sign-in, and to everyone on a change */
     OC_MSG_SET_PROFILE_FIELD_VALUE = 0x0139, /* C->S, my value for one profile field; empty clears it */
     OC_MSG_SET_OUT_OF_OFFICE    = 0x013A, /* C->S, my out-of-office span and message; an end of 0 or past clears it */
+    OC_MSG_CHANNEL_ADD_MANAGER    = 0x013B, /* C->S, a manager, admin or owner names a member of the channel its manager */
+    OC_MSG_CHANNEL_REMOVE_MANAGER = 0x013C, /* C->S, and takes the role from any manager, the creator included */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -1375,10 +1382,17 @@ typedef struct { uint32_t count; uint64_t seen_at; } oc_activity;
 /* `peers` carries a GROUP DM's participants (REQ-056), so a client can title the
  * conversation on first paint instead of fetching a roster per group. Empty for a
  * channel and for a 1:1 DM, whose single other participant is `peer_id`. */
+/* A channel's managers (REQ-036b): members who may rename, archive and
+ * unarchive it, beside owners and admins. At most this many. */
+#define OC_MAX_CHANNEL_MANAGERS 64u
 typedef struct { uint64_t channel_id; uint8_t kind; oc_slice name; uint8_t is_public; uint8_t joined; uint64_t created_at;
                  uint64_t peer_id; oc_slice topic; uint8_t archived;
                  uint16_t n_peers; uint64_t peers[OC_MAX_GROUP_DM + 1];
-                 uint8_t e2e; } oc_channel_info;   /* 1: an end-to-end encrypted DM (PRIVATE-DM.md) */
+                 uint8_t e2e;   /* 1: an end-to-end encrypted DM (PRIVATE-DM.md) */
+                 /* As of protocol 42: who made the channel (0 when unknown, and
+                  * for a DM), and its managers (REQ-036b). */
+                 uint64_t creator_id;
+                 uint16_t n_managers; uint64_t managers[OC_MAX_CHANNEL_MANAGERS]; } oc_channel_info;
 typedef struct { uint64_t channel_id; } oc_channel_ref;                       /* JOIN / LEAVE */
 typedef struct { uint64_t channel_id; uint64_t user_id; } oc_channel_member_op; /* INVITE / REMOVE */
 /* CHANNEL_LIST entry. `last_message_at`/`unread` were added 2026-07-27 so a
@@ -2099,6 +2113,9 @@ oc_result oc_decode_list_activity(oc_rbuf *p, uint8_t *filter);
 oc_result oc_encode_activity_entry(oc_wbuf *w, uint16_t version, const oc_activity_entry *m);
 oc_result oc_encode_activity(oc_wbuf *w, uint16_t version, const oc_activity *m);
 oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m);
+oc_result oc_encode_channel_add_manager(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
+oc_result oc_encode_channel_remove_manager(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
+oc_result oc_decode_channel_manager_op(oc_rbuf *p, oc_channel_member_op *m);   /* both frames */
 oc_result oc_encode_mention_unresolved(oc_wbuf *w, uint16_t version, const oc_mention_unresolved *m);
 oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version);
 /* Bodyless request for the storage report (REQ-214); owner/admin only. */

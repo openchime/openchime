@@ -301,7 +301,8 @@ where one exists.
   line cannot hold. Any member may set it, on the same reasoning; it is up to
   1,000 bytes, may run to several lines, and is shown in the channel's About. It
   is readable by exactly the people who may read the channel (ARCH-93).
-- **REQ-035.** A channel has been **archivable** by an owner or admin: an
+- **REQ-035.** A channel has been **archivable** by an owner or admin, or by one
+  of the channel's managers (REQ-036b): an
   archived channel has become read-only and hidden from the default channel list
   while its history remained searchable and retrievable (REQ-031/080), and it has
   been restorable. Archiving (reversible) is distinct from deletion, which is not
@@ -321,10 +322,22 @@ where one exists.
   private, which flipping it back does not undo. The client confirms that in those
   words, and the daemon audits the two as distinct actions so an audit reader can see
   which way it went without opening the row.
-- **REQ-036.** A channel has been **renamable** by an owner/admin, the rename applying everywhere the
+- **REQ-036.** A channel has been **renamable** by an owner/admin, or by one of the
+  channel's managers (REQ-036b), the rename applying everywhere the
   channel is shown without breaking membership, history, or permalinks (REQ-232).
   The name is distinct from the topic (REQ-034). A rename keeps the channel id
   and is refused on a name already taken (ARCH-93).
+- **REQ-036b.** A channel has had **managers**: members who run it. The person who
+  created a channel has been its first manager; any of its managers, an admin or
+  an owner has been able to name another member of the channel a manager, and to
+  take the role from any manager, the creator included. Managers are peers: none
+  outranks another. Leaving the channel, or being removed from it, has ended the
+  role, and rejoining has not restored it. A channel has been able to have no
+  managers — every channel made before the role existed starts with none — and
+  its owners and admins have managed it then as always. A manager has renamed,
+  archived and unarchived the channel (REQ-035/036); its visibility (REQ-036a)
+  has stayed with owners and admins, and its topic, description, membership and
+  webhooks with every member, as before (ARCH-134).
 - **REQ-037.** A deployment has been able to admit **guest accounts** — users
   restricted to one channel (single-channel guest) or an explicit set
   (multi-channel guest) rather than the whole tenant — created and scoped by an

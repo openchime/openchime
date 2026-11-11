@@ -794,6 +794,8 @@ msg_type `0x0051`** describing the channel and the caller's membership:
 | `archived`   | u8   | `1` when the channel is archived and read-only (REQ-035). |
 | `n_peers`    | u16  | Participant count, then that many `u64` ids — a group DM's people (REQ-056). `0` for a named channel. |
 | `e2e`        | u8   | `1` for an encrypted DM (§5.19, PRIVATE-DM.md), whose message bodies the daemon cannot read; `0` otherwise. |
+| `creator_id` | u64  | Who created the channel (since version 42); `0` when not known — every channel made before then, and every DM. |
+| `n_managers` | u16  | The channel's managers (since version 42, REQ-036b), then that many `u64` ids, at most 64. `0` when it has none. |
 
 Failures are non-fatal `ERROR` frames carrying the `channel_id` (8 bytes,
 big-endian) in `context`: `UNKNOWN_CHANNEL`, `NOT_A_MEMBER`, `FORBIDDEN`,
@@ -871,6 +873,20 @@ client learns of the new channel immediately. An actor who is not a member gets
 (REQ-033). Replies `CHANNEL_INFO` to the actor. An actor who is not a member
 gets `NOT_A_MEMBER`.
 
+**`CHANNEL_ADD_MANAGER` (client → server), msg_type `0x013B`** and
+**`CHANNEL_REMOVE_MANAGER` (client → server), msg_type `0x013C`**
+`{ channel_id: u64, user_id: u64 }` — a channel's **managers** (REQ-036b, ARCH-134).
+The creator is the first, made so by `CREATE_CHANNEL`. A manager of the channel,
+an admin or an owner names another and takes the role from any manager, the
+creator included; anyone else is refused with `FORBIDDEN`. Only a member of the
+channel can be named (`NOT_A_MEMBER` otherwise), and at most 64
+(`INVALID_CHANNEL` past that). Naming someone already a manager, or removing
+someone who is not, succeeds and changes nothing. Leaving the channel or being
+removed from it ends the role; rejoining does not restore it. A DM has no
+managers (`INVALID_CHANNEL`). On success the actor gets `CHANNEL_INFO`, and every
+other member the same frame, naming the managers now. Each change is audited
+(`channel.manager.grant`, `channel.manager.revoke`).
+
 Every tenant has one auto-provisioned public **`general`** channel (id `1`) that
 every user joins at authentication, so the messaging path always has a channel
 to deliver to. On a managed deployment (started with `OPENCHIME_MANAGED_TICKET`) the
@@ -892,9 +908,10 @@ One frame for every verb because they all mutate one row and all fan out the sam
 state — the op *is* the difference.
 
 **Authority** splits on blast radius: **any member may set the topic or the
-description** (already visible to the channel, corrected in seconds); **owner/admin
-only** for rename, archive, unarchive and a change of visibility, which change what
-people *not* looking at the channel see. On a public demo (AUTH.md §8.12) the topic
+description** (already visible to the channel, corrected in seconds); **owner/admin,
+or a manager of the channel** (§5.7), for rename, archive and unarchive, and
+**owner/admin only** for a change of visibility: they change what people *not*
+looking at the channel see. On a public demo (AUTH.md §8.12) the topic
 and the description are an owner's or admin's too — a demo's channels say what the
 demo is — and a member's attempt is `FORBIDDEN`.
 
@@ -935,7 +952,8 @@ History, search and membership are untouched — archiving is the reversible
 alternative to a deletion that is not offered for channels holding history.
 
 Failures are non-fatal `ERROR` frames: `UNKNOWN_CHANNEL`, `NOT_A_MEMBER`,
-`FORBIDDEN` (rename/archive by a non-admin), `CHANNEL_EXISTS` (the new name is
+`FORBIDDEN` (rename/archive by someone neither an admin nor a manager of the
+channel, or a change of visibility by a non-admin), `CHANNEL_EXISTS` (the new name is
 taken — the same unique-name rule as create, §5.7), or `INVALID_CHANNEL` (empty
 or oversized name, oversized topic, or **any of these attempted on a DM** — a DM
 has no name to rename and archiving one is a different feature).
@@ -3800,6 +3818,8 @@ this table cannot silently gain a shared value.
 | `0x0138` | `PROFILE_FIELDS` | S → C | the workspace's profile fields: after sign-in, and to everyone on a change |
 | `0x0139` | `SET_PROFILE_FIELD_VALUE` | C → S | my value for one profile field; empty clears it; answered with `PROFILE_INFO` |
 | `0x013A` | `SET_OUT_OF_OFFICE` | C → S | my out-of-office span and message; an end of 0 or past clears it (§5.20) |
+| `0x013B` | `CHANNEL_ADD_MANAGER` | C → S | a manager, admin or owner names a member of the channel a manager (§5.7) |
+| `0x013C` | `CHANNEL_REMOVE_MANAGER` | C → S | and takes the role from any manager, the creator included |
 
 ## 10. Connection state machine
 

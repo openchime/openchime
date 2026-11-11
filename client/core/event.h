@@ -503,6 +503,11 @@ typedef struct {
     /* USER and PROFILE_INFO: out of office (REQ-122), as stored. */
     uint64_t ooo_start, ooo_end;
     char     ooo_message[OC_OOO_MESSAGE_MAX + 1];
+    /* CHANNEL from CHANNEL_INFO (REQ-036b): the creator, and the managers in
+     * `ids`/`n_ids`; `ch_managers_known` says this event carries them, since a
+     * CHANNEL_LIST entry does not. */
+    uint8_t  ch_managers_known;
+    uint64_t ch_creator;
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);

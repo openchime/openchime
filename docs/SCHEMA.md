@@ -1,7 +1,7 @@
 # OpenChime — Database Schema
 
 The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
-ARCH-27 (§1); the daemon applies migrations 0001–0081 (`daemon/migrate.c`,
+ARCH-27 (§1); the daemon applies migrations 0001–0082 (`daemon/migrate.c`,
 `OC_MIGRATIONS`), in order, and new tables/columns arrive as later numbered
 migrations, never as edits to an existing one. 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
@@ -36,7 +36,7 @@ credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
 **0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
-(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets; **0079** (§3br) blocks and DM privacy; **0080** (§3bs) profile fields; **0081** (§3bt) out of office.
+(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets; **0079** (§3br) blocks and DM privacy; **0080** (§3bs) profile fields; **0081** (§3bt) out of office; **0082** (§3bu) channel managers.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -2113,3 +2113,26 @@ end of 0 or already past writes all three back to their defaults. *Read* by
 `USER_LIST` and `PROFILE_INFO`, which carry the stored values; whether it is in
 force (`ooo_start_ms` ≤ now < `ooo_end_ms`) is the reader's question, so nothing
 runs when it ends.
+
+## 3bu. Migration 0082 — channel managers
+
+```sql
+ALTER TABLE channels ADD COLUMN created_by INTEGER REFERENCES users(id);
+CREATE TABLE channel_managers (
+  channel_id    INTEGER NOT NULL REFERENCES channels(id),
+  user_id       INTEGER NOT NULL REFERENCES users(id),
+  granted_by    INTEGER REFERENCES users(id),
+  granted_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (channel_id, user_id)) WITHOUT ROWID;
+```
+
+A channel's **creator** and its **managers** (REQ-036b, ARCH-134). `created_by` is
+NULL for every channel made before this migration and for every DM.
+*Written*: `created_by` and the creator's own `channel_managers` row by
+`CREATE_CHANNEL`; further rows by `CHANNEL_ADD_MANAGER` and removed by
+`CHANNEL_REMOVE_MANAGER` (PROTOCOL.md §5.7), each audited. A person's row goes with
+their membership, in `membership_sync`, the one place a `channel_members` row is
+deleted, so leaving, being removed or losing the group that put them in all end
+it. At most 64 per channel. *Read* by `UPDATE_CHANNEL`'s rename, archive and
+unarchive checks and by `CHANNEL_INFO`, which names the creator and the managers.
+A channel purge clears the table with every one holding a `channel_id`.

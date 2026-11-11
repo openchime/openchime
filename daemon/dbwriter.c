@@ -784,6 +784,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->flist);
     free(r->ch_name);
     free(r->ch_topic);
+    free(r->ch_managers);
     for (size_t i = 0; i < r->n_groups; i++) group_row_free(&r->groups[i]);
     free(r->groups);
     for (size_t i = 0; i < r->n_mchan; i++) { free(r->mchan[i].name); free(r->mchan[i].topic); free(r->mchan[i].members); }
@@ -3820,6 +3821,13 @@ static int membership_sync(sqlite3 *db, uint64_t channel_id, uint64_t user_id, i
         sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
         sqlite3_step(st);
         sqlite3_finalize(st);
+        /* Out of the channel is out of its management too (REQ-036b), and
+         * coming back does not bring the role back. */
+        sqlite3_prepare_v2(db, "DELETE FROM channel_managers WHERE channel_id=? AND user_id=?;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
         return -1;
     }
     return 0;
@@ -5424,7 +5432,7 @@ static int load_channel_info(sqlite3 *db, uint64_t channel_id, uint64_t actor, o
     sqlite3_stmt *st = NULL;
     int found = 0;
     sqlite3_prepare_v2(db,
-        "SELECT kind, name, is_public, created_at_ms, topic, archived_at_ms, e2e "
+        "SELECT kind, name, is_public, created_at_ms, topic, archived_at_ms, e2e, COALESCE(created_by,0) "
         "  FROM channels WHERE id=?;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
@@ -5439,10 +5447,22 @@ static int load_channel_info(sqlite3 *db, uint64_t channel_id, uint64_t actor, o
         r->ch_topic      = (tp && tp[0]) ? strdup((const char *)tp) : NULL;
         r->ch_archived   = (uint8_t)(sqlite3_column_type(st, 5) != SQLITE_NULL);
         r->ch_e2e        = (uint8_t)(sqlite3_column_int(st, 6) != 0);
+        r->ch_creator    = (uint64_t)sqlite3_column_int64(st, 7);
         r->channel_id    = channel_id;
         found = 1;
     }
     sqlite3_finalize(st);
+    /* Its managers (REQ-036b), in the order they were named. */
+    free(r->ch_managers); r->ch_managers = NULL; r->n_ch_managers = 0;
+    if (found && (r->ch_managers = calloc(OC_MAX_CHANNEL_MANAGERS, sizeof *r->ch_managers)) != NULL) {
+        sqlite3_prepare_v2(db, "SELECT user_id FROM channel_managers WHERE channel_id=?1 "
+                               "ORDER BY granted_at_ms, user_id LIMIT ?2;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        sqlite3_bind_int(st, 2, (int)OC_MAX_CHANNEL_MANAGERS);
+        while (r->n_ch_managers < OC_MAX_CHANNEL_MANAGERS && sqlite3_step(st) == SQLITE_ROW)
+            r->ch_managers[r->n_ch_managers++] = (uint64_t)sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+    }
     if (found) r->ch_joined = (uint8_t)(is_member(db, channel_id, actor) ? 1 : 0);
     if (found) r->n_ch_groups = channel_group_ids(db, channel_id, r->ch_groups, OC_MAX_CHANNEL_GROUPS);
     /* A DM with more than two participants is a GROUP DM (REQ-056) — the same
@@ -5481,6 +5501,86 @@ static void channel_change_notice(sqlite3 *db, const oc_job *j, const char *what
     char *who = audit_name_of(db, j->user_id);
     notice_channel(db, j->channel_id, "@%s %s", who ? who : "someone", what);
     free(who);
+}
+
+/* Is `user_id` a manager of `channel_id` (REQ-036b)? */
+static int is_channel_manager(sqlite3 *db, uint64_t channel_id, uint64_t user_id) {
+    sqlite3_stmt *st = NULL;
+    int yes = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM channel_managers WHERE channel_id=?1 AND user_id=?2;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
+        yes = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return yes;
+}
+
+/* Grant (`grant` 1) or revoke a channel's manager role (REQ-036b, ARCH-134):
+ * by a manager of the channel, an admin or an owner; granted only to a member,
+ * revoked from anyone holding it. Holding it already, or not holding it, is a
+ * success that changes nothing. Told to every member as CHANNEL_INFO. */
+static oc_dbres *process_channel_manager(sqlite3 *db, const oc_job *j, int grant) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+    sqlite3_stmt *st = NULL;
+    int exists = 0, is_dm = 0;
+    sqlite3_prepare_v2(db, "SELECT kind='dm' FROM channels WHERE id=?1;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    if (sqlite3_step(st) == SQLITE_ROW) { exists = 1; is_dm = sqlite3_column_int(st, 0); }
+    sqlite3_finalize(st);
+    if (!exists) { r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    if (is_dm)   { r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INVALID_CHANNEL; return r; }
+    uint8_t role = OC_ROLE_MEMBER;
+    user_role(db, j->user_id, &role);
+    if (!oc_role_can_moderate(role) && !is_channel_manager(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    uint64_t who = j->target_user_id;
+    int changed = 0;
+    if (grant) {
+        if (!who || !is_member(db, j->channel_id, who)) {
+            r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+        }
+        if (!is_channel_manager(db, j->channel_id, who)) {
+            int n = 0;
+            sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM channel_managers WHERE channel_id=?1;", -1, &st, NULL);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+            if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+            sqlite3_finalize(st);
+            if (n >= (int)OC_MAX_CHANNEL_MANAGERS) {
+                r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INVALID_CHANNEL; return r;
+            }
+            sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO channel_managers(channel_id, user_id, granted_by, granted_at_ms) "
+                                   "VALUES(?1, ?2, ?3, ?4);", -1, &st, NULL);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)who);
+            sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+            sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+            changed = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+            sqlite3_finalize(st);
+        }
+    } else {
+        sqlite3_prepare_v2(db, "DELETE FROM channel_managers WHERE channel_id=?1 AND user_id=?2;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)who);
+        changed = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+        sqlite3_finalize(st);
+    }
+    if (changed) {
+        char cid[24];
+        snprintf(cid, sizeof cid, "%llu", (unsigned long long)j->channel_id);
+        audit_actor(db, OC_AUDIT_ADMIN, grant ? "channel.manager.grant" : "channel.manager.revoke",
+                    j->user_id, who, cid, 1, NULL);
+    }
+    r->type = OC_RES_CHANNEL_INFO;
+    load_channel_info(db, j->channel_id, j->user_id, r);
+    r->ch_fanout = 1;              /* every member's view of who runs it */
+    load_members(db, j->channel_id, r);
+    return r;
 }
 
 static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
@@ -5551,7 +5651,8 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         load_members(db, j->channel_id, r);
         return r;
     } else if (j->chup_op == OC_CHUP_RENAME) {
-        if (!oc_role_can_moderate(role)) {
+        /* An owner or admin, or a manager of this channel (REQ-036b). */
+        if (!oc_role_can_moderate(role) && !is_channel_manager(db, j->channel_id, j->user_id)) {
             r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
         }
         if (vlen == 0 || vlen > OC_MAX_CHANNEL_NAME) {
@@ -5612,7 +5713,7 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
                     j->user_id, 0, NULL, 1, NULL);
         channel_change_notice(db, j, pub ? "made this channel public." : "made this channel private.");
     } else if (j->chup_op == OC_CHUP_ARCHIVE || j->chup_op == OC_CHUP_UNARCHIVE) {
-        if (!oc_role_can_moderate(role)) {
+        if (!oc_role_can_moderate(role) && !is_channel_manager(db, j->channel_id, j->user_id)) {
             r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
         }
         int on = (j->chup_op == OC_CHUP_ARCHIVE);
@@ -5660,11 +5761,12 @@ static oc_dbres *process_create_channel(sqlite3 *db, const oc_job *j) {
     }
 
     sqlite3_prepare_v2(db,
-        "INSERT INTO channels(kind,name,is_public,created_at_ms) VALUES('channel',?,?,?);",
+        "INSERT INTO channels(kind,name,is_public,created_at_ms,created_by) VALUES('channel',?,?,?,?);",
         -1, &st, NULL);
     sqlite3_bind_text(st, 1, j->ch_name, (int)nlen, SQLITE_STATIC);
     sqlite3_bind_int64(st, 2, j->ch_is_public ? 1 : 0);
     sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
@@ -5672,6 +5774,14 @@ static oc_dbres *process_create_channel(sqlite3 *db, const oc_job *j) {
     }
     uint64_t cid = (uint64_t)sqlite3_last_insert_rowid(db);
     add_membership(db, cid, j->user_id);
+    /* Its creator is its first manager (REQ-036b). */
+    sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO channel_managers(channel_id, user_id, granted_by, granted_at_ms) "
+                           "VALUES(?1, ?2, ?2, ?3);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)cid);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
     /* A new public channel, said where the workspace is told to say it. */
     if (j->ch_is_public) {
         char *who = audit_name_of(db, j->user_id);
@@ -12333,6 +12443,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_EDIT_POLL)      return process_edit_poll(w->db, j);
     if (j->type == OC_JOB_PIN)            return process_pin(w->db, j);
     if (j->type == OC_JOB_UPDATE_CHANNEL) return process_update_channel(w->db, j);
+    if (j->type == OC_JOB_CHANNEL_ADD_MANAGER)    return process_channel_manager(w->db, j, 1);
+    if (j->type == OC_JOB_CHANNEL_REMOVE_MANAGER) return process_channel_manager(w->db, j, 0);
     if (j->type == OC_JOB_SAVE_ITEM)      return process_save_item(w->db, j);
     if (j->type == OC_JOB_SET_COLLAPSED)  return process_set_collapsed(w->db, j);
     if (j->type == OC_JOB_FIND_AT_TIME)   return process_find_at_time(w->db, j);

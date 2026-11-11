@@ -3294,6 +3294,19 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_CHANNEL_ADD_MANAGER || hdr.msg_type == OC_MSG_CHANNEL_REMOVE_MANAGER) {
+            oc_channel_member_op mo;
+            if (oc_decode_channel_manager_op(&p, &mo) != OC_OK) return -1;
+            oc_job *j = oc_job_new(hdr.msg_type == OC_MSG_CHANNEL_ADD_MANAGER ? OC_JOB_CHANNEL_ADD_MANAGER
+                                                                              : OC_JOB_CHANNEL_REMOVE_MANAGER,
+                                   c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = mo.channel_id;
+            j->target_user_id = mo.user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_UPDATE_CHANNEL) {
             oc_update_channel uc;
             if (oc_decode_update_channel(&p, &uc) != OC_OK) return -1;
@@ -6805,6 +6818,10 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             (dst).e2e        = r->ch_e2e;                                            \
             for (uint16_t pi = 0; pi < r->n_ch_peers; pi++)                          \
                 (dst).peers[pi] = r->ch_peers[pi];                                   \
+            (dst).creator_id = r->ch_creator;                                        \
+            for (uint16_t mi = 0; mi < r->n_ch_managers &&                           \
+                                  mi < OC_MAX_CHANNEL_MANAGERS; mi++)                \
+                (dst).managers[(dst).n_managers++] = r->ch_managers[mi];             \
         } while (0)
         /* Ack the actor with the channel's state. For a DM, peer_id is the other
          * participant (from the actor's view). */

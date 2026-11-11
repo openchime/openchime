@@ -1128,6 +1128,14 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->created_at = ci.created_at;
                     e->topic = malloc(ci.topic.len + 1);
                     if (e->topic) { memcpy(e->topic, ci.topic.ptr, ci.topic.len); e->topic[ci.topic.len] = '\0'; }
+                    /* Who made it and who runs it (REQ-036b): only this frame
+                     * says, so only it sets them. */
+                    e->ch_managers_known = 1;
+                    e->ch_creator = ci.creator_id;
+                    if (ci.n_managers && (e->ids = calloc(ci.n_managers, sizeof *e->ids)) != NULL) {
+                        for (uint16_t k = 0; k < ci.n_managers; k++) e->ids[k] = ci.managers[k];
+                        e->n_ids = ci.n_managers;
+                    }
                     oc_queue_push(to_ui, e);
                 }
             }

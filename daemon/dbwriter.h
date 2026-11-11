@@ -339,7 +339,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* Out of office (REQ-122): ooo_start/ooo_end, pf_name the message; an
         * end of 0 or past clears it. Answered PROFILE_INFO to the person's
         * connections, with their roster row (ulist, `joined`) for everyone. */
-       OC_JOB_SET_OUT_OF_OFFICE = 240 };
+       OC_JOB_SET_OUT_OF_OFFICE = 240,
+       /* A channel's managers (REQ-036b): channel_id, target_user_id; a
+        * manager, admin or owner. Answered CHANNEL_INFO, to every member. */
+       OC_JOB_CHANNEL_ADD_MANAGER = 241, OC_JOB_CHANNEL_REMOVE_MANAGER = 242 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -1305,6 +1308,11 @@ typedef struct oc_dbres {
     /* CHANNEL_INFO: the channel's groups (REQ-309), sent beside it. */
     uint64_t       ch_groups[OC_MAX_CHANNEL_GROUPS];
     uint16_t       n_ch_groups;
+    /* CHANNEL_INFO: who made the channel (0 unknown) and its managers
+     * (REQ-036b), heap, at most OC_MAX_CHANNEL_MANAGERS. */
+    uint64_t       ch_creator;
+    uint64_t      *ch_managers;
+    uint16_t       n_ch_managers;
 
     /* User groups (REQ-307-309): the groups a LIST or a change carries, and who
      * gained or lost which channel by a change (heap arrays). */

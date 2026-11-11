@@ -1589,6 +1589,12 @@ const oc_group_view *oc_model_group_by_handle(const oc_model *m, const char *han
     return NULL;
 }
 
+int oc_model_is_channel_manager(const oc_channel *c, uint64_t user_id) {
+    for (uint16_t i = 0; c && user_id && i < c->n_managers; i++)
+        if (c->managers[i] == user_id) return 1;
+    return 0;
+}
+
 int oc_model_in_group(const oc_group_view *g, uint64_t user_id) {
     for (uint16_t i = 0; g && i < g->n_members; i++) if (g->members[i] == user_id) return 1;
     return 0;
@@ -2176,6 +2182,13 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             }
             free(c->topic);
             c->topic = (e->topic && e->topic[0]) ? strdup(e->topic) : NULL;
+            if (e->ch_managers_known) {
+                c->creator_id = e->ch_creator;
+                c->n_managers = 0;
+                for (size_t k = 0; k < e->n_ids && k < OC_MAX_CHANNEL_MANAGERS; k++)
+                    c->managers[c->n_managers++] = e->ids[k];
+                c->managers_known = 1;
+            }
         }
         break;
     }
