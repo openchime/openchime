@@ -683,8 +683,13 @@ static int form_dialog(oc_win *owner, const char *title, oc_field *f, int n);
 /* Seven since Edit profile gained the voice a person is read aloud in
  * (REQ-292): the identity screen owns every field that is one screen's worth of
  * a person, and the voice is one of them. */
-#define FORM_MAX_FIELDS 7
+/* And twenty more: a workspace's own profile fields (PROFILE_FIELDS), shown
+ * on the same screen after the built-in seven; a form taller than its card
+ * scrolls (draw_form). */
+#define FORM_MAX_FIELDS (7 + (int)OC_MAX_PROFILE_FIELDS)
 static int        g_form_open;                       /* a form is on the frame */
+static float      g_form_scroll, g_form_scroll_max;  /* rows scrolled past, and how far they can be */
+static int        g_form_scroll_focus = -1;          /* the row last brought into view */
 /* What the last form returned, for the harness: a form's answer is consumed by its
  * caller and leaves no trace on screen, so "Cancel did not commit" is otherwise
  * unassertable. Diagnosis only. */
@@ -1159,6 +1164,10 @@ static int g_prefs_open;
  * roster actually knows today rather than inventing placeholders for them. */
 static uint64_t g_profile_uid;
 static rectf g_prof_dm_btn, g_prof_mute_btn, g_prof_block_btn;
+/* The card's links, from the workspace's own fields: where each was drawn. */
+static struct { rectf r; uint64_t field_id; } g_prof_link[OC_MAX_PROFILE_FIELDS];
+static int g_n_prof_link;
+static void link_open(const char *url);   /* fwd */
 /* The SELF card's action buttons — the commands the profile popover no longer
  * lists top-level. Each carries a menu_dispatch cmd; the bodies are all
  * self-contained. */
@@ -1999,7 +2008,8 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
         * End for everyone asks before it ends the call (CALLS.md §2). */
        CONF_CALL_START, CONF_CALL_END,
        CONF_MESSAGE_MOVE,
-       CONF_SNIPPET_PASTE };
+       CONF_SNIPPET_PASTE,
+       CONF_PFIELD_DELETE };
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 static int      g_bc_confirmed;     /* CONF_BROADCAST: the send it confirmed is under way */
@@ -11432,6 +11442,7 @@ static void draw_prefs(gfx *rt, rectf reg) {
  * which does not fit 300px and would fit less as REQ-240/241 add fields. */
 static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
     g_n_selfcard_btn = 0;
+    g_n_prof_link = 0;
     const char *nm = oc_model_user_name(m, g_profile_uid);
     if (!nm || !nm[0]) nm = "user";
     float cx = (reg.left + reg.right) / 2, y = reg.top + 18;
@@ -11559,6 +11570,24 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
             draw_text(rt, pm->timezone, g_meta, rf(reg.left + 16, y + 4, reg.right - 16, y + 26),
                       OC_COL_FAINT);
             y += 24; any = 1;
+        }
+        /* The workspace's own fields, in its order: a label, then what they
+         * gave it. A link shows its real address (MARKDOWN.md), never a name. */
+        for (uint8_t k = 0; k < m->n_pfields; k++) {
+            const char *v = oc_model_profile_value(m, g_profile_uid, m->pfields[k].id);
+            if (!v[0]) continue;
+            draw_text(rt, m->pfields[k].label, g_meta, rf(reg.left + 16, y + 4, reg.right - 16, y + 22),
+                      OC_COL_FAINT);
+            float vh = text_height(v, g_meta_w, reg.right - reg.left - 32);
+            rectf vr = rf(reg.left + 16, y + 22, reg.right - 16, y + 22 + vh);
+            int link = m->pfields[k].kind == OC_PROFILE_FIELD_LINK;
+            draw_text(rt, v, g_meta_w, vr, link ? OC_COL_ACCENT : OC_COL_TEXT);
+            if (link && g_n_prof_link < (int)OC_MAX_PROFILE_FIELDS) {
+                g_prof_link[g_n_prof_link].r = vr;
+                g_prof_link[g_n_prof_link].field_id = m->pfields[k].id;
+                g_n_prof_link++;
+            }
+            y += 26 + vh; any = 1;
         }
         if (!any) {
             draw_text(rt, "No title, timezone or status set.", g_meta_w,
@@ -13506,6 +13535,9 @@ static int profile_open(uint64_t uid) {
     }
     g_profile_uid = uid;
     rp_push(RP_PROFILE);
+    /* The workspace's own fields ride only the whole profile, so the card asks
+     * for it; the fields appear when it lands. */
+    if (g_client && m && m->n_pfields) oc_client_get_profile(g_client, uid);
     return 1;
 }
 
@@ -15777,6 +15809,9 @@ static void confirm_run(oc_win *hwnd) {
         snippet_compose(g_main, t);
         free(t);
         break; }
+    case CONF_PFIELD_DELETE:
+        oc_client_set_profile_field(g_client, g_confirm_id, OC_PROFILE_FIELD_DELETE, 0, 0, "");
+        break;
     case CONF_CERT_TRUST: cert_trust_run(g_main); break;
     case CONF_PDM_TRUST:  oc_client_pdm_trust(g_client, g_confirm_id); break;
     case CONF_PDM_SAFETY: break;   /* shown, nothing to do */
@@ -16246,10 +16281,32 @@ static void draw_form(gfx *rt, rectf body) {
     g_form_sel_panel = rf(0, 0, 0, 0);
     for (int i = 0; i < FORM_MAX_FIELDS; i++) g_form_sel_box[i] = rf(0, 0, 0, 0);
     if (!g_form_f) return;
-    float y = body.top + 4;
+    /* Rows that do not fit the card scroll (the wheel moves g_form_scroll).
+     * A row is drawn whole or not at all, so a text field is never half
+     * under the edge with its keyboard still in it; and when the keyboard
+     * moves to a row out of sight, the rows move to show it. */
+    for (int i = 0; i < FORM_MAX_FIELDS; i++) g_form_erect[i] = rf(0, 0, 0, 0);
+    float tops[FORM_MAX_FIELDS], total = 4, view = body.bottom - body.top;
+    for (int i = 0; i < g_form_n; i++) { tops[i] = total; total += form_rowh(&g_form_f[i], body.right - body.left); }
+    g_form_scroll_max = total > view ? total - view : 0;
+    {
+        int fk = -1;
+        for (int i = 0; i < g_form_n && fk < 0; i++)
+            if ((g_form_edit[i] && g_focus == g_form_edit[i]) || g_form_focus == i) fk = i;
+        if (fk >= 0 && fk != g_form_scroll_focus) {
+            float rb = (fk + 1 < g_form_n ? tops[fk + 1] : total);
+            if (tops[fk] - 4 < g_form_scroll) g_form_scroll = tops[fk] - 4;
+            else if (rb > g_form_scroll + view) g_form_scroll = rb - view;
+        }
+        g_form_scroll_focus = fk;
+    }
+    if (g_form_scroll > g_form_scroll_max) g_form_scroll = g_form_scroll_max;
+    if (g_form_scroll < 0) g_form_scroll = 0;
+    float y = body.top + 4 - g_form_scroll;
     for (int i = 0; i < g_form_n; i++) {
         const oc_field *f = &g_form_f[i];
         float rh = form_rowh(f, body.right - body.left);
+        if (g_form_scroll_max > 0 && (y < body.top - 0.5f || y + rh > body.bottom + 4.5f)) { y += rh; continue; }
         if (f->kind == FF_CHECK) {
             rectf box = rf(body.left, y + 4, body.left + 20, y + 24);
             int on = atoi(f->value) != 0;
@@ -16369,6 +16426,13 @@ static void draw_form(gfx *rt, rectf body) {
                           i == g_form_err_field ? OC_COL_DANGER : OC_COL_FAINT);
         }
         y += rh;
+    }
+    /* Where the rows are, when there are more than fit: a thin bar on the
+     * right edge, as long as the share that shows. */
+    if (g_form_scroll_max > 0) {
+        float th = view * view / total;
+        float ty = body.top + (view - th) * (g_form_scroll / g_form_scroll_max);
+        fill_round(rt, rf(body.right - 3, ty, body.right, ty + th), 1.5f, OC_COL_BORDER);
     }
 
     /* The open list, drawn after every field so it covers the ones below it
@@ -18657,7 +18721,7 @@ static int shell_visible(void) {
  * before it keep their places. */
 /* adds Custom emoji (REQ-072), the one tab a member is shown too: the
  * catalogue is everyone's, and its creator may delete an emoji they added. */
-enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_EMOJI, ADM_USAGE, ADM_BLOCKS, ADM_COUNT };
+enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_EMOJI, ADM_USAGE, ADM_BLOCKS, ADM_PFIELDS, ADM_COUNT };
 static int g_adm_tab;
 static rectf g_adm_tabs[ADM_COUNT];
 
@@ -19076,6 +19140,128 @@ static void draw_emoji_admin(gfx *rt, const oc_model *m, rectf body) {
     ovl_end(rt, body);
 }
 
+/* Admin > Profile fields: the workspace's own fields on everyone's profile
+ * (department, location, manager), in order. Add one; rename it, move it up or
+ * down, or delete it with every value people gave it. Live: the rows are the
+ * model's, which every PROFILE_FIELDS push replaces. */
+enum { PFA_RENAME = 1, PFA_UP, PFA_DOWN, PFA_DELETE };
+static struct { rectf r; uint64_t id; int act; } g_pfacts[OC_MAX_PROFILE_FIELDS * 4];
+static int g_n_pfacts;
+static rectf g_pf_new_btn;
+
+static void pf_btn(gfx *rt, rectf b, const char *label, int danger, uint64_t id, int act) {
+    int hot = in_rect(b, g_mouse_x, g_mouse_y);
+    fill_round(rt, b, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+    stroke_round(rt, b, OC_R_CONTROL, danger ? OC_COL_DANGER : OC_COL_BORDER, 1.0f);
+    g_meta->align = ST_ALIGN_CENTER;
+    draw_text(rt, label, g_meta, b, danger ? OC_COL_DANGER : OC_COL_TEXT);
+    g_meta->align = ST_ALIGN_LEFT;
+    if (g_n_pfacts < (int)(sizeof g_pfacts / sizeof g_pfacts[0])) {
+        g_pfacts[g_n_pfacts].r = b; g_pfacts[g_n_pfacts].id = id; g_pfacts[g_n_pfacts].act = act;
+        g_n_pfacts++;
+    }
+}
+
+static void draw_pfields_admin(gfx *rt, const oc_model *m, rectf body) {
+    g_n_pfacts = 0;
+    float y = body.top + 12;
+    draw_text(rt, "Fields every profile shows, beside name, title and pronouns. People fill in "
+                  "their own. At most 20.", g_meta_w,
+              rf(body.left + 20, y, body.right - 160, y + 40), OC_COL_MUTED);
+    g_pf_new_btn = rf(0, 0, 0, 0);
+    if (m->n_pfields < OC_MAX_PROFILE_FIELDS) {
+        g_pf_new_btn = rf(body.right - 140, y, body.right - 20, y + 30);
+        fill_round(rt, g_pf_new_btn, OC_R_CONTROL, OC_COL_ACCENT);
+        g_ui->align = ST_ALIGN_CENTER;
+        draw_text(rt, "New field", g_ui, g_pf_new_btn, 0xFFFFFF);
+        g_ui->align = ST_ALIGN_LEFT;
+    }
+    y += 48;
+    if (!m->n_pfields) {
+        overlay_empty(rt, rf(body.left, y, body.right, body.bottom), "No profile fields yet.");
+        return;
+    }
+    float rowh = UIS(44);
+    for (uint8_t k = 0; k < m->n_pfields && y + rowh <= body.bottom; k++) {
+        const oc_pfield *f = &m->pfields[k];
+        draw_text(rt, f->label, g_ui, rf(body.left + 20, y + 2, body.right - 380, y + 22), OC_COL_TEXT);
+        draw_text(rt, f->kind == OC_PROFILE_FIELD_LINK ? "Link" : "Text", g_meta,
+                  rf(body.left + 20, y + 20, body.right - 380, y + 40), OC_COL_FAINT);
+        float bx = body.right - 20;
+        rectf del = rf(bx - 80, y + 8, bx, y + 34);           bx = del.left - 8;
+        rectf dn  = rf(bx - 60, y + 8, bx, y + 34);           bx = dn.left - 8;
+        rectf up  = rf(bx - 50, y + 8, bx, y + 34);           bx = up.left - 8;
+        rectf rn  = rf(bx - 80, y + 8, bx, y + 34);
+        pf_btn(rt, rn, "Rename", 0, f->id, PFA_RENAME);
+        if (k > 0)                  pf_btn(rt, up, "Up", 0, f->id, PFA_UP);
+        if (k + 1 < m->n_pfields)   pf_btn(rt, dn, "Down", 0, f->id, PFA_DOWN);
+        pf_btn(rt, del, "Delete", 1, f->id, PFA_DELETE);
+        fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
+        y += rowh;
+    }
+}
+
+/* Swap field `id` with its neighbour above (dir -1) or below (+1): each takes
+ * the other's position, two renames that keep their labels. */
+static void pf_move(const oc_model *m, uint64_t id, int dir) {
+    for (uint8_t k = 0; k < m->n_pfields; k++) {
+        if (m->pfields[k].id != id) continue;
+        int o = (int)k + dir;
+        if (o < 0 || o >= m->n_pfields) return;
+        const oc_pfield *a = &m->pfields[k], *b = &m->pfields[o];
+        uint16_t pa = a->position, pb = b->position;
+        /* Equal positions (both made with the same number) are split, so the
+         * order the list shows is the order that is stored. */
+        if (pa == pb) pb = (uint16_t)(dir < 0 ? pa - 1 : pa + 1);
+        if (pb == 0) { pb = 1; pa = 2; }
+        oc_client_set_profile_field(g_client, a->id, OC_PROFILE_FIELD_SET, a->kind, pb, a->label);
+        oc_client_set_profile_field(g_client, b->id, OC_PROFILE_FIELD_SET, b->kind, pa, b->label);
+        return;
+    }
+}
+
+static int pfields_click(oc_win *hwnd, const oc_model *m, int x, int y) {
+    if (!g_client) return 0;
+    if (in_rect(g_pf_new_btn, x, y)) {
+        oc_field f[2] = {
+            { FF_TEXT,   "Label", "What the field is called, such as Department or Location.", "" },
+            { FF_CHOICE, "Kind",  "Text|Link", "0" },
+        };
+        if (form_dialog(hwnd, "New profile field", f, 2) && f[0].value[0])
+            oc_client_set_profile_field(g_client, 0, OC_PROFILE_FIELD_SET,
+                                        atoi(f[1].value) == 1 ? OC_PROFILE_FIELD_LINK : OC_PROFILE_FIELD_TEXT,
+                                        0, f[0].value);
+        return 1;
+    }
+    for (int i = 0; i < g_n_pfacts; i++) {
+        if (!in_rect(g_pfacts[i].r, x, y)) continue;
+        uint64_t id = g_pfacts[i].id;
+        const oc_pfield *pf = NULL;
+        for (uint8_t k = 0; k < m->n_pfields; k++) if (m->pfields[k].id == id) pf = &m->pfields[k];
+        if (!pf) return 1;
+        switch (g_pfacts[i].act) {
+        case PFA_RENAME: {
+            oc_field f[1] = { { FF_TEXT, "Label", "", "" } };
+            snprintf(f[0].value, sizeof f[0].value, "%s", pf->label);
+            uint8_t kind = pf->kind;
+            if (form_dialog(hwnd, "Rename profile field", f, 1) && f[0].value[0])
+                oc_client_set_profile_field(g_client, id, OC_PROFILE_FIELD_SET, kind, 0, f[0].value);
+            break;
+        }
+        case PFA_UP:   pf_move(m, id, -1); break;
+        case PFA_DOWN: pf_move(m, id, +1); break;
+        case PFA_DELETE: {
+            char body[240];
+            snprintf(body, sizeof body, "%.64s goes from every profile, with what everyone wrote in it.", pf->label);
+            confirm_open(hwnd, CONF_PFIELD_DELETE, id, "Delete profile field?", body, "Delete");
+            break;
+        }
+        }
+        return 1;
+    }
+    return 0;
+}
+
 /* Ask before deleting `name`: the messages that used it keep the shortcode. */
 static void emoji_delete_ask(oc_win *hwnd, const char *name) {
     char title[80], body[200];
@@ -19102,6 +19288,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
         { "Custom emoji", OC_ICON_SMILE },
         { "Usage",     OC_ICON_USER },
         { "Blocks",    OC_ICON_USER },
+        { "Profile fields", OC_ICON_USER },
     };
     float tx = reg.left + 16, ty = reg.top + HEADER_H;
     int admin = self_role(m) >= OC_ROLE_ADMIN;
@@ -19129,6 +19316,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
     if (g_adm_tab == ADM_STORAGE)     draw_storage(rt, m, body, 1);
     else if (g_adm_tab == ADM_INVITES) draw_invites(rt, m, body);
     else if (g_adm_tab == ADM_GROUPS)  draw_groups(rt, m, body);
+    else if (g_adm_tab == ADM_PFIELDS) draw_pfields_admin(rt, m, body);
     else if (g_adm_tab == ADM_ALERTS)  draw_alerts_admin(rt, m, body);
     else if (g_adm_tab == ADM_USAGE)   draw_usage(rt, m, body);
     else if (g_adm_tab == ADM_BLOCKS)  draw_blocks_admin(rt, m, body);
@@ -20340,14 +20528,14 @@ static void field_draw(gfx *rt, field *f, rectf box, uint32_t ink) {
  * modal covers the window. A press outside every field returns the keyboard
  * to the window, as clicking a native window did. */
 static int fields_mouse(int kind, float x, float y) {
-    field *modal[24]; int nm = 0;
+    field *modal[24 + FORM_MAX_FIELDS]; int nm = 0;
     if (g_status_edit) modal[nm++] = g_status_edit;
     for (int k = 0; k < 2; k++) if (g_sr_edit[k]) modal[nm++] = g_sr_edit[k];
     if (g_pc_q) modal[nm++] = g_pc_q;
     if (g_pc_time) modal[nm++] = g_pc_time;
     if (g_te_open) modal[nm++] = &g_te_field;
     for (int i = 0; i < OC_POLL_MAX_OPTIONS; i++) if (g_pc_opt[i]) modal[nm++] = g_pc_opt[i];
-    for (int i = 0; i < FORM_MAX_FIELDS && nm < 24; i++) if (g_form_edit[i]) modal[nm++] = g_form_edit[i];
+    for (int i = 0; i < FORM_MAX_FIELDS && nm < 24 + FORM_MAX_FIELDS; i++) if (g_form_edit[i]) modal[nm++] = g_form_edit[i];
     field *shell[9] = { g_pal_edit, g_pick_edit, g_srch, g_find, g_ffind, g_dir_edit, g_si_e_ws, g_si_e_user, g_efind };
     if (kind == 1 || kind == 2) {
         /* A drag or a release belongs to the field that took the press. */
@@ -26495,7 +26683,8 @@ static void a11y_publish_scene(const oc_model *m) {
 
     /* Admin's tabs, and Alerts' Acknowledge buttons, named for what they act on. */
     if (g_view == VIEW_ADMIN) {
-        static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts", "emoji", "usage", "blocks" };
+        static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts", "emoji", "usage", "blocks",
+                                                       "profile-fields" };
         int admin = self_role(m) >= OC_ROLE_ADMIN;
         for (int t = 0; t < ADM_COUNT && n < OC_ACC_MAX; t++) {
             if (!admin && t != ADM_EMOJI) continue;
@@ -31263,6 +31452,13 @@ static int on_click(oc_win *hwnd, int x, int y) {
         invalidate();
         return 1;
     }
+    /* A link a workspace field holds: shown as its address, so opened at once. */
+    if (g_profile_uid && model())
+        for (int i = 0; i < g_n_prof_link; i++)
+            if (in_rect(g_prof_link[i].r, x, y)) {
+                link_open(oc_model_profile_value(model(), g_profile_uid, g_prof_link[i].field_id));
+                return 1;
+            }
     if (g_profile_uid && in_rect(g_prof_dm_btn, x, y)) {
         uint64_t uid = g_profile_uid;
         close_overlays();
@@ -31307,6 +31503,9 @@ static int on_click(oc_win *hwnd, int x, int y) {
     if (g_view == VIEW_ADMIN && g_adm_tab == ADM_EMOJI)
         for (int i = 0; i < g_n_emojirows; i++)
             if (in_rect(g_emojirows[i].r, x, y)) { emoji_delete_ask(hwnd, g_emojirows[i].name); return 1; }
+    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_PFIELDS && model() && self_role(model()) >= OC_ROLE_ADMIN &&
+        pfields_click(hwnd, model(), x, y))
+        return 1;
     if (g_view == VIEW_ADMIN && g_adm_tab == ADM_INVITES)
         for (int i = 0; i < g_n_invrows; i++)
             if (in_rect(g_invrows[i].r, x, y)) {
@@ -33986,6 +34185,7 @@ static int form_dialog(oc_win *owner, const char *title, oc_field *f, int n) {
      * fields — the same class of bug as a predicate whose default is a real
      * answer. */
     g_form_sel_field = -1; g_form_sel_scroll = 0;
+    g_form_scroll = 0; g_form_scroll_max = 0; g_form_scroll_focus = -1;
     memset(g_form_lines, 0, sizeof g_form_lines);
     modal_enter(owner, &g_form_open);      /* paints once, so the rects exist */
     layout_natives(owner);
@@ -35814,6 +36014,24 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
                 had_name = pm2->users[i].name;
                 break;
             }
+        /* Then the workspace's own fields (department, location...), in its
+         * order, each with what I gave it. Copied out of the model: the form
+         * pumps the loop, and the model may change under it. */
+        static char pf_lbl[OC_MAX_PROFILE_FIELDS][OC_PROFILE_FIELD_LABEL_MAX + 1];
+        static char pf_had[OC_MAX_PROFILE_FIELDS][OC_PROFILE_FIELD_VALUE_MAX + 1];
+        uint64_t pf_ids[OC_MAX_PROFILE_FIELDS];
+        int nbuilt = nfields, npf = 0;
+        if (pm2) for (uint8_t k = 0; k < pm2->n_pfields && nfields < FORM_MAX_FIELDS; k++) {
+            const oc_pfield *pf = &pm2->pfields[k];
+            snprintf(pf_lbl[npf], sizeof pf_lbl[npf], "%s", pf->label);
+            snprintf(pf_had[npf], sizeof pf_had[npf], "%s", oc_model_profile_value(pm2, pm2->user_id, pf->id));
+            pf_ids[npf] = pf->id;
+            f[nfields].kind  = FF_TEXT;
+            f[nfields].label = pf_lbl[npf];
+            f[nfields].hint  = pf->kind == OC_PROFILE_FIELD_LINK ? "A link, starting https://" : "";
+            snprintf(f[nfields].value, sizeof f[nfields].value, "%s", pf_had[npf]);
+            nfields++; npf++;
+        }
         /* The photo sits beside the fields rather than behind a separate action:
          * one screen owns identity, and identity includes the picture. Not armed
          * over a form that is already open — that one would inherit the column. */
@@ -35825,8 +36043,8 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         }
         /* Hear each voice as it is picked, rather than choosing a name blind and
          * finding out on every message afterwards. */
-        g_form_on_pick = nfields == 7 ? profile_voice_picked : NULL;
-        if (nfields == 7) {
+        g_form_on_pick = nbuilt == 7 ? profile_voice_picked : NULL;
+        if (nbuilt == 7) {
             g_form_action_field = 6;
             g_form_action_label = "Play";
             g_form_action_busy_label = "Playing\u2026";
@@ -35845,8 +36063,13 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         /* An empty voice keeps whatever is set, which is exactly what
          * "Automatic" means to the daemon: it picks, once, and that choice then
          * shows here as the voice it chose. */
-        const char *voice = nfields == 7 ? voice_id_at(model(), atoi(f[6].value)) : "";
+        const char *voice = nbuilt == 7 ? voice_id_at(model(), atoi(f[6].value)) : "";
         oc_client_set_profile(g_client, f[0].value, f[2].value, f[3].value, f[4].value, tz, voice);
+        /* The workspace's fields are one value each on the wire: only those that
+         * changed are sent, each answered by my whole profile. */
+        for (int k = 0; k < npf; k++)
+            if (strcmp(f[nbuilt + k].value, pf_had[k]))
+                oc_client_set_profile_field_value(g_client, pf_ids[k], f[nbuilt + k].value);
         /* The display name is its own op on the wire (SET_DISPLAY_NAME), so the
          * one screen makes two calls — and only when it CHANGED, because a
          * rename fans a PROFILE_UPDATED to every connection in the workspace and
@@ -40521,6 +40744,13 @@ static int on_wheel(oc_win *hwnd, int px_x, int px_y, float units, int notches) 
         if (g_form_sel_field >= 0) {
             g_form_sel_scroll -= (units > 0) ? 3 : -3;
             if (g_form_sel_scroll < 0) g_form_sel_scroll = 0;
+            invalidate();
+            return 0;
+        }
+        /* A form taller than its card -- Edit profile with a workspace's own
+         * fields -- scrolls its rows; draw_form keeps the offset in range. */
+        if (g_form_open && g_form_scroll_max > 0) {
+            g_form_scroll -= dy;
             invalidate();
             return 0;
         }

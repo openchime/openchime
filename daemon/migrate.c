@@ -1387,6 +1387,25 @@ static const char MIGRATION_0079[] =
     "ALTER TABLE users ADD COLUMN dm_privacy TEXT NOT NULL DEFAULT 'anyone' "
     "  CHECK (dm_privacy IN ('anyone','nobody'));";
 
+static const char MIGRATION_0080[] =
+    /* A workspace's own profile fields -- department, location, manager --
+     * defined by its owners and admins, at most 20, each plain text or a link;
+     * and each person's value for each, at most 200 bytes. A field's values go
+     * with it when it is deleted. */
+    "CREATE TABLE profile_fields ("
+    "  id            INTEGER PRIMARY KEY,"
+    "  label         TEXT NOT NULL,"
+    "  kind          TEXT NOT NULL CHECK (kind IN ('text','link')),"
+    "  position      INTEGER NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL"
+    ");"
+    "CREATE TABLE profile_field_values ("
+    "  user_id  INTEGER NOT NULL REFERENCES users(id),"
+    "  field_id INTEGER NOT NULL REFERENCES profile_fields(id),"
+    "  value    TEXT NOT NULL,"
+    "  PRIMARY KEY (user_id, field_id)"
+    ") WITHOUT ROWID;";
+
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
      * author is doing, and the daemon records that as its own object beside the
@@ -1754,6 +1773,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 77, MIGRATION_0077 },
     { 78, MIGRATION_0078 },
     { 79, MIGRATION_0079 },
+    { 80, MIGRATION_0080 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

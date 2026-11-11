@@ -2946,6 +2946,67 @@ static void test_block_frames(void) {
     }
 }
 
+/* A workspace's own profile fields, and the values PROFILE_INFO carries. */
+static void test_profile_field_frames(void) {
+    {
+        oc_set_profile_field in = { 9, OC_PROFILE_FIELD_SET, OC_PROFILE_FIELD_LINK, 3, oc_slice_str("Homepage") };
+        ROUNDTRIP(oc_encode_set_profile_field(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_PROFILE_FIELD, h, p);
+        oc_set_profile_field out;
+        CHECK(oc_decode_set_profile_field(&p, &out) == OC_OK);
+        CHECK(out.field_id == 9 && out.op == OC_PROFILE_FIELD_SET && out.kind == OC_PROFILE_FIELD_LINK &&
+              out.position == 3 && slice_eq_str(out.label, "Homepage"));
+    }
+    {
+        oc_profile_field fs[2] = { { 1, OC_PROFILE_FIELD_TEXT, 1, oc_slice_str("Department") },
+                                   { 2, OC_PROFILE_FIELD_LINK, 2, oc_slice_str("Homepage") } };
+        oc_profile_fields in = { 2, fs };
+        ROUNDTRIP(oc_encode_profile_fields(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PROFILE_FIELDS, h, p);
+        oc_profile_field out[OC_MAX_PROFILE_FIELDS]; uint8_t n = 0;
+        CHECK(oc_decode_profile_fields(&p, out, &n) == OC_OK);
+        CHECK(n == 2 && out[0].field_id == 1 && slice_eq_str(out[0].label, "Department"));
+        CHECK(out[1].kind == OC_PROFILE_FIELD_LINK && out[1].position == 2);
+    }
+    {
+        /* More than twenty is refused both ways. */
+        oc_profile_fields in = { OC_MAX_PROFILE_FIELDS + 1, NULL };
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        CHECK(oc_encode_profile_fields(&w, OC_PROTOCOL_VERSION, &in) == OC_E_OVERFLOW);
+        uint8_t bad[1] = { OC_MAX_PROFILE_FIELDS + 1 };
+        oc_rbuf br; oc_rbuf_init(&br, bad, sizeof bad);
+        oc_profile_field out[OC_MAX_PROFILE_FIELDS]; uint8_t n = 0;
+        CHECK(oc_decode_profile_fields(&br, out, &n) == OC_E_MALFORMED);
+    }
+    {
+        oc_profile_field_value in = { 4, oc_slice_str("Platform") };
+        ROUNDTRIP(oc_encode_set_profile_field_value(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_PROFILE_FIELD_VALUE, h, p);
+        oc_profile_field_value out;
+        CHECK(oc_decode_set_profile_field_value(&p, &out) == OC_OK);
+        CHECK(out.field_id == 4 && slice_eq_str(out.value, "Platform"));
+    }
+    {
+        /* PROFILE_INFO's values ride after the voice, as of protocol 40. */
+        static oc_profile_info in;
+        memset(&in, 0, sizeof in);
+        in.user_id = 7; in.display_name = oc_slice_str("bob"); in.voice_id = oc_slice_str("v1");
+        in.n_fields = 2;
+        in.fields[0] = (oc_profile_field_value){ 2, oc_slice_str("https://example.com") };
+        in.fields[1] = (oc_profile_field_value){ 1, oc_slice_str("Platform") };
+        ROUNDTRIP(oc_encode_profile_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PROFILE_INFO, h, p);
+        static oc_profile_info out;
+        CHECK(oc_decode_profile_info(&p, &out) == OC_OK);
+        CHECK(out.user_id == 7 && slice_eq_str(out.voice_id, "v1") && out.n_fields == 2);
+        CHECK(out.fields[0].field_id == 2 && slice_eq_str(out.fields[0].value, "https://example.com"));
+        CHECK(out.fields[1].field_id == 1 && slice_eq_str(out.fields[1].value, "Platform"));
+    }
+    {
+        static oc_profile_info in;
+        memset(&in, 0, sizeof in);
+        in.n_fields = OC_MAX_PROFILE_FIELDS + 1;
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        CHECK(oc_encode_profile_info(&w, OC_PROTOCOL_VERSION, &in) == OC_E_OVERFLOW);
+    }
+}
+
 static void test_reason_codes_unique(void) {
     static const struct { const char *name; int code; } codes[] = {
         { "MALFORMED_FRAME",        OC_ERR_MALFORMED_FRAME },
@@ -2981,6 +3042,7 @@ static void test_reason_codes_unique(void) {
         { "CHANNEL_ARCHIVED",       OC_ERR_CHANNEL_ARCHIVED },
         { "INVALID_MESSAGE",        OC_ERR_INVALID_MESSAGE },
         { "DM_REFUSED",             OC_ERR_DM_REFUSED },
+        { "INVALID_PROFILE_FIELD",  OC_ERR_INVALID_PROFILE_FIELD },
         { "INTERNAL",               OC_ERR_INTERNAL },
     };
     const size_t n = sizeof codes / sizeof codes[0];
@@ -3059,6 +3121,7 @@ int run_protocol_tests(void) {
     test_tts_frames();
     test_call_frames();
     test_block_frames();
+    test_profile_field_frames();
     test_backfill_and_error();
     test_size_limits();
     test_malformed();

@@ -327,6 +327,12 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * user_id. LIST_BLOCKS (owner/admin, read-only) answered
         * OC_RES_BLOCK_LIST, or OC_RES_BLOCK_LIST_ERR. */
        OC_JOB_SET_BLOCK = 155, OC_JOB_LIST_BLOCKS = 156, OC_JOB_SET_DM_PRIVACY = 157,
+       /* The workspace's own profile fields. SET_PROFILE_FIELD: message_id the
+        * field (0 adds), pfd_op/pfd_kind/pfd_position, pf_name the label;
+        * owner or admin; answered OC_RES_PROFILE_FIELDS. SET_PROFILE_FIELD_VALUE:
+        * message_id the field, pf_name the value, for user_id; answered
+        * PROFILE_INFO. The definitions also ride AUTH_OK (pfd). */
+       OC_JOB_SET_PROFILE_FIELD = 158, OC_JOB_SET_PROFILE_FIELD_VALUE = 159,
        /* Reminders come due (REQ-283), on the scheduled-message tick: each
         * fires once, answered as one OC_RES_REMINDER_DUE apiece. Write. */
        OC_JOB_FIRE_REMINDERS = 160 };
@@ -672,6 +678,9 @@ typedef struct oc_job {
     uint64_t       sum_notice;
     char          *sum_version;
     struct oc_sum_batch *sum_batch;
+    /* SET_PROFILE_FIELD: OC_PROFILE_FIELD_SET/DELETE, the kind, the position. */
+    uint8_t        pfd_op, pfd_kind;
+    uint16_t       pfd_position;
 } oc_job;
 
 /* CALL_AUTH's question: a join (perhaps starting, with invitations) or an
@@ -853,6 +862,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * connection of theirs; the workspace's blocks (blk_entries) to an admin,
         * or why not (err_code). */
        OC_RES_BLOCKS = 131, OC_RES_BLOCK_LIST = 132, OC_RES_BLOCK_LIST_ERR = 133,
+       /* The workspace's profile fields (pfd): to conn_id, or to everyone
+        * signed in when they changed (ch_fanout). */
+       OC_RES_PROFILE_FIELDS = 134,
        /* A reminder fired: user_id's, on message_id in channel_id, at
         * server_time; saved_at and remind_at the item's. To that person's
         * connections and their devices' push. A chain, one per reminder; an
@@ -1564,6 +1576,14 @@ typedef struct oc_dbres {
     struct oc_sum_notice_row { uint64_t id, channel_id, start_ms, end_ms, made_at_ms; uint8_t scope, status; }
                            *sum_notices;
     size_t                  n_sum_notices;
+    /* OC_RES_PROFILE_FIELDS and AUTH_OK: the definitions, in position order. On
+     * OC_RES_PROFILE_INFO: the person's values. Heap, at most
+     * OC_MAX_PROFILE_FIELDS each. */
+    struct oc_pfd_row { uint64_t id; uint8_t kind; uint16_t position;
+                        char label[OC_PROFILE_FIELD_LABEL_MAX + 1]; } *pfd;
+    size_t                  n_pfd;
+    struct oc_pfv_row { uint64_t field_id; char value[OC_PROFILE_FIELD_VALUE_MAX + 1]; } *pfv;
+    size_t                  n_pfv;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;

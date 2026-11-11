@@ -1,7 +1,7 @@
 # OpenChime — Database Schema
 
 The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
-ARCH-27 (§1); the daemon applies migrations 0001–0079 (`daemon/migrate.c`,
+ARCH-27 (§1); the daemon applies migrations 0001–0080 (`daemon/migrate.c`,
 `OC_MIGRATIONS`), in order, and new tables/columns arrive as later numbered
 migrations, never as edits to an existing one. 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
@@ -36,7 +36,7 @@ credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
 **0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
-(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets; **0079** (§3br) blocks and DM privacy.
+(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets; **0079** (§3br) blocks and DM privacy; **0080** (§3bs) profile fields.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -2071,3 +2071,30 @@ workspace's own sender cannot be blocked.
 family), `SET_DM_PRIVACY` and the send; *read* by the DM openers and every
 reader above, and by `LIST_BLOCKS` for an owner or admin. A channel purge
 clears `withheld_messages` with every table holding a `message_id`.
+
+## 3bs. Migration 0080 — a workspace's own profile fields
+
+```sql
+CREATE TABLE profile_fields (
+  id            INTEGER PRIMARY KEY,
+  label         TEXT NOT NULL,
+  kind          TEXT NOT NULL CHECK (kind IN ('text','link')),
+  position      INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL);
+CREATE TABLE profile_field_values (
+  user_id  INTEGER NOT NULL REFERENCES users(id),
+  field_id INTEGER NOT NULL REFERENCES profile_fields(id),
+  value    TEXT NOT NULL,
+  PRIMARY KEY (user_id, field_id)) WITHOUT ROWID;
+```
+
+The profile's fixed fields live on `users`; these are the ones a workspace adds
+for itself, such as department, location or manager. A table of their own rather
+than workspace settings, because they are a list with values attached.
+*Written*: `profile_fields` by an owner or admin (`SET_PROFILE_FIELD`,
+PROTOCOL.md), at most 20, a label of 1–64 bytes; `profile_field_values` by each
+person for themselves (`SET_PROFILE_FIELD_VALUE`), at most 200 bytes, a `link`
+value starting `https://`, an empty value deleting the row. Deleting a field
+deletes its values in the same transaction. *Read* by `PROFILE_FIELDS`, sent
+after sign-in and on every change, and by `PROFILE_INFO`, which carries a
+person's values.

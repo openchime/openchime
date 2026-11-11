@@ -304,6 +304,11 @@ typedef struct {
     char     phone[40];
 } oc_member;
 
+/* A workspace's own profile field, and one person's value for one. */
+typedef struct { uint64_t id; uint8_t kind; uint16_t position;
+                 char label[OC_PROFILE_FIELD_LABEL_MAX + 1]; } oc_pfield;
+typedef struct { uint64_t user_id, field_id; char value[OC_PROFILE_FIELD_VALUE_MAX + 1]; } oc_pfvalue;
+
 /* An ephemeral "user is typing in channel" mark, expiring on a timeout. */
 /* `thread_root`: the thread they type in, 0 for the main scroll (REQ-121). */
 typedef struct { uint64_t channel_id; uint64_t user_id; long long seen; uint64_t thread_root; } oc_typing_row;
@@ -667,6 +672,14 @@ typedef struct {
      * form that asked for it (oc_client_get_profile) waits for this to move
      * before it shows the fields, the phone among them. */
     uint32_t  self_profile_seq;
+    /* The workspace's own profile fields (PROFILE_FIELDS), in position order;
+     * `pfields_seq` moves on every change. Each person's values, from the
+     * PROFILE_INFO that carried them (heap, one row per person and field). */
+    oc_pfield pfields[OC_MAX_PROFILE_FIELDS];
+    uint8_t   n_pfields;
+    uint32_t  pfields_seq;
+    oc_pfvalue *pfvals;
+    size_t    n_pfvals, cap_pfvals;
     uint16_t  allow_start_min, allow_end_min;
     oc_schedule_day sched_days[OC_SCHEDULE_DAYS];
     uint8_t   n_sched_days;
@@ -1364,6 +1377,9 @@ const char *oc_model_user_name(const oc_model *m, uint64_t user_id);
 /* Whether `user_id` is the workspace's own sender, not a person: its messages
  * are the workspace's, and it is offered nowhere a person is. */
 int oc_model_is_workspace_sender(const oc_model *m, uint64_t user_id);
+/* `user_id`'s value for the workspace profile field `field_id`, as their last
+ * PROFILE_INFO carried it; "" when they gave none or no card has been fetched. */
+const char *oc_model_profile_value(const oc_model *m, uint64_t user_id, uint64_t field_id);
 /* 1 when the user has been removed from the workspace (REQ-033): shown as
  * deactivated, their avatar dimmed. */
 int         oc_model_user_disabled(const oc_model *m, uint64_t user_id);

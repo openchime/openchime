@@ -1142,27 +1142,54 @@ static void draw_help(int W, int H) {
     }
 }
 
-/* The /profile modal (REQ-020): your identity + how to change it. Drawn over the
+/* The key that edits the workspace field at `i` on one's own profile: 1-9,
+ * then a-k; and back. */
+static int pf_key(int i) { return i < 9 ? '1' + i : 'a' + (i - 9); }
+static int pf_index(uint32_t ch) {
+    if (ch >= '1' && ch <= '9') return (int)(ch - '1');
+    if (ch >= 'a' && ch <= 'k') return 9 + (int)(ch - 'a');
+    return -1;
+}
+
+/* The /profile modal (REQ-020): a person's identity -- yours with how to change
+ * it -- and the workspace's own fields with what they gave each. Drawn over the
  * presented frame like the palette/picker, so it self-presents. */
-static void draw_profile(const oc_model *m, int W, int H) {
-    const char *me = m->user_id ? oc_model_user_name(m, m->user_id) : "";
+static void draw_profile(const oc_model *m, uint64_t uid, int W, int H) {
+    if (!uid) uid = m->user_id;
+    int self = uid == m->user_id;
+    const char *me = uid ? oc_model_user_name(m, uid) : "";
     uint8_t role = OC_ROLE_MEMBER;
+    const oc_member *pm = NULL;
     for (size_t i = 0; i < m->n_users; i++)
-        if (m->users[i].user_id == m->user_id) { role = m->users[i].role; break; }
-    uint8_t pr = oc_model_presence_of(m, m->user_id);
+        if (m->users[i].user_id == uid) { role = m->users[i].role; pm = &m->users[i]; break; }
+    uint8_t pr = oc_model_presence_of(m, uid);
     const char *rn = role == OC_ROLE_OWNER ? "owner" : role == OC_ROLE_ADMIN ? "admin" : "member";
     const char *pn = pr == OC_PRESENCE_ONLINE ? "online" : pr == OC_PRESENCE_AWAY ? "away" : "offline";
     const tk_theme *th = tk_theme_active();
     char idbuf[32];
-    snprintf(idbuf, sizeof idbuf, "%llu", (unsigned long long)m->user_id);
-    struct { const char *label, *value; } R[] = {
-        { "Name",     me[0] ? me : "(unknown)" },
-        { "User ID",  idbuf },
-        { "Role",     rn },
-        { "Presence", pn },
-    };
-    int n = (int)(sizeof R / sizeof R[0]);
-    const char *hint = "Change your name or password from the action menu (Ctrl+K).";
+    snprintf(idbuf, sizeof idbuf, "%llu", (unsigned long long)uid);
+    struct { const char *label, *value; } R[4 + 2 + OC_MAX_PROFILE_FIELDS];
+    static char lbl[OC_MAX_PROFILE_FIELDS][OC_PROFILE_FIELD_LABEL_MAX + 8];
+    int n = 0;
+    R[n].label = "Name";     R[n++].value = me[0] ? me : "(unknown)";
+    R[n].label = "User ID";  R[n++].value = idbuf;
+    R[n].label = "Role";     R[n++].value = rn;
+    R[n].label = "Presence"; R[n++].value = pn;
+    if (pm && pm->title[0])    { R[n].label = "Title";    R[n++].value = pm->title; }
+    if (pm && pm->pronouns[0]) { R[n].label = "Pronouns"; R[n++].value = pm->pronouns; }
+    /* The workspace's fields, in its order; on your own, each with the key
+     * that fills it in. A link is its address, as the reader sees it. */
+    for (uint8_t k = 0; k < m->n_pfields; k++) {
+        const char *v = oc_model_profile_value(m, uid, m->pfields[k].id);
+        if (!self && !v[0]) continue;
+        if (self) snprintf(lbl[k], sizeof lbl[k], "%c %s", pf_key(k), m->pfields[k].label);
+        else      snprintf(lbl[k], sizeof lbl[k], "%s", m->pfields[k].label);
+        R[n].label = lbl[k];
+        R[n++].value = v[0] ? v : "-";
+    }
+    const char *hint = !self ? "Esc closes."
+                     : m->n_pfields ? "A key above fills in that field. Name and password: the action menu (Ctrl+K)."
+                                    : "Change your name or password from the action menu (Ctrl+K).";
 
     int labelw = 0, cw = tk_str_width(hint);
     for (int i = 0; i < n; i++) { int w = tk_str_width(R[i].label); if (w > labelw) labelw = w; }
@@ -1231,6 +1258,8 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
         * with me, my blocked people (each an Unblock), and an admin's list */
        ACT_BLOCK, ACT_UNBLOCK, ACT_DMPRIV, ACT_BLOCKED, ACT_BLOCKS_ADMIN,
        ACT_UNBLOCK0, ACT_UNBLOCK_LAST = ACT_UNBLOCK0 + 27,
+       /* a member's profile, the workspace's own fields with it */
+       ACT_PROFILE_OF,
        ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
@@ -1312,6 +1341,7 @@ static void menu_build_member(int is_self, int blocked) {
     g_nmenu = 0;
     if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Message",     ACT_DM };
     if (!is_self) g_menu[g_nmenu++] = (menuitem){ blocked ? "Unblock" : "Block", blocked ? ACT_UNBLOCK : ACT_BLOCK };
+    g_menu[g_nmenu++] = (menuitem){ "Profile",     ACT_PROFILE_OF };
     g_menu[g_nmenu++] = (menuitem){ "Make admin",  ACT_ROLE_ADMIN };
     g_menu[g_nmenu++] = (menuitem){ "Make member", ACT_ROLE_MEMBER };
     if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Remove",      ACT_REMOVE };
@@ -3493,6 +3523,8 @@ int main(int argc, char **argv) {
     uint32_t found_seen = 0;
     int help_open = 0;
     int profile_open = 0;                     /* /profile identity modal */
+    uint64_t profile_uid = 0;                 /* whose: 0 for mine */
+    uint64_t prompt_pf = 0;                   /* the workspace field PROMPT_PFVALUE fills */
     int deactivate_ask = 0;                   /* "Deactivate account": y/N before it is sent */
     /* The snippet open over the screen (REQ-226): which, its title and
      * language, and the first line shown. */
@@ -3520,7 +3552,7 @@ int main(int argc, char **argv) {
     /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
      * /nick with a discoverable text prompt. */
     enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_NICK, PROMPT_UPLOAD,
-           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE, PROMPT_DATE, PROMPT_MOVE, PROMPT_REMIND };
+           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE, PROMPT_DATE, PROMPT_MOVE, PROMPT_REMIND, PROMPT_PFVALUE };
     /* A move into a private channel (REQ-053): y/N, naming who will no longer
      * see it, before it is sent. */
     uint64_t move_ask_mid = 0, move_ask_to = 0;
@@ -3753,7 +3785,7 @@ int main(int argc, char **argv) {
         if (launcher_open) tk_palette_draw(&launcher, tb_width(), tb_height());
         if (dmpick_open) tk_palette_draw(&dmpick, tb_width(), tb_height());
         if (picker_open) draw_picker(eq, esel);
-        if (profile_open) draw_profile(oc_client_model(cl), tb_width(), tb_height());
+        if (profile_open) draw_profile(oc_client_model(cl), profile_uid, tb_width(), tb_height());
         if (switcher_open) draw_switcher(wsel);
         if (storage_open) draw_storage(oc_client_model(cl), tb_width(), tb_height());
         if (blocks_open) draw_blocks(oc_client_model(cl), tb_width(), tb_height());
@@ -3983,8 +4015,21 @@ int main(int argc, char **argv) {
             continue;
         }
         if (profile_open) {                    /* profile modal: any key closes it */
-            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
-            else profile_open = 0;
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) { running = 0; continue; }
+            /* On my own, a field's key fills it in instead. */
+            const oc_model *qm = oc_client_model(cl);
+            int k = (!profile_uid || profile_uid == qm->user_id) ? pf_index(ev.ch) : -1;
+            if (k >= 0 && k < qm->n_pfields) {
+                static char ptitle[OC_PROFILE_FIELD_LABEL_MAX + 40];
+                const oc_pfield *pf = &qm->pfields[k];
+                prompt_pf = pf->id;
+                snprintf(ptitle, sizeof ptitle, "%s%s", pf->label,
+                         pf->kind == OC_PROFILE_FIELD_LINK ? " (a link, https://...; empty clears)" : " (empty clears)");
+                prompt_kind = PROMPT_PFVALUE; prompt_title = ptitle;
+                tk_input_init(&prompt_input, 0, "");
+                tk_input_set(&prompt_input, oc_model_profile_value(qm, qm->user_id, pf->id));
+            }
+            profile_open = 0;
             continue;
         }
         if (prompt_kind) {                     /* text prompt dialog (tuikit) */
@@ -4036,6 +4081,11 @@ int main(int argc, char **argv) {
                             snprintf(g_closed_note, sizeof g_closed_note, "Saved. You'll be reminded %s.", w);
                         } else snprintf(g_closed_note, sizeof g_closed_note, "Reminder cleared. The message stays saved.");
                     }
+                }
+                else if (k == PROMPT_PFVALUE) {
+                    /* Then the profile again, showing what was saved. */
+                    oc_client_set_profile_field_value(cl, prompt_pf, v);
+                    profile_uid = 0; profile_open = 1;
                 }
                 else if (k == PROMPT_INVITE) {
                     /* An address where the workspace signs people in through a
@@ -4145,7 +4195,7 @@ int main(int argc, char **argv) {
                         tk_input_init(&prompt_input, 0, oc_model_offers_browser(oc_client_model(cl)) ? "name@example.com" : "");
                     } else await_invite = 1;
                 }
-                else if (id == ACT_PROFILE) profile_open = 1;
+                else if (id == ACT_PROFILE) { oc_client_get_profile(cl, 0); profile_uid = 0; profile_open = 1; }
                 else if (id == ACT_DEACTIVATE) deactivate_ask = 1;
                 else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
                 else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
@@ -4276,6 +4326,12 @@ int main(int argc, char **argv) {
                     else if (id == ACT_ROLE_ADMIN)  oc_client_set_role(cl, act_uid, OC_ROLE_ADMIN);
                     else if (id == ACT_ROLE_MEMBER) oc_client_set_role(cl, act_uid, OC_ROLE_MEMBER);
                     else if (id == ACT_REMOVE)      oc_client_remove_user(cl, act_uid);
+                    else if (id == ACT_PROFILE_OF) {
+                        /* Their whole profile, which is what carries the
+                         * workspace's fields; shown as it lands. */
+                        oc_client_get_profile(cl, act_uid);
+                        profile_uid = act_uid; profile_open = 1;
+                    }
                     else if (id == ACT_REACT)       { picker_open = 1; eq[0] = '\0'; eqlen = 0; esel = 0; picker_cid = act_cid; picker_mid = act_mid; }
                     else if (id == ACT_EDIT) {
                         const oc_channel *ec = focused_channel(oc_client_model(cl), act_cid);
@@ -4330,7 +4386,7 @@ int main(int argc, char **argv) {
                             tk_input_init(&prompt_input, 0, oc_model_offers_browser(oc_client_model(cl)) ? "name@example.com" : "");
                         } else await_invite = 1;
                     }
-                    else if (id == ACT_PROFILE) profile_open = 1;
+                    else if (id == ACT_PROFILE) { oc_client_get_profile(cl, 0); profile_uid = 0; profile_open = 1; }
                     else if (id == ACT_DEACTIVATE) deactivate_ask = 1;
                     else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
                     else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }

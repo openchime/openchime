@@ -1596,6 +1596,28 @@ void oc_client_set_profile(oc_client *c, const char *full_name, const char *titl
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_set_profile_field(oc_client *c, uint64_t field_id, int op, int kind,
+                                 uint16_t position, const char *label) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PROFILE_FIELD);
+    if (!cmd) return;
+    cmd->message_id = field_id;
+    cmd->op = (uint8_t)op;
+    cmd->scope = (uint8_t)kind;
+    cmd->uses = position;
+    cmd->body = strdup(label ? label : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_profile_field_value(oc_client *c, uint64_t field_id, const char *value) {
+    if (!c || !field_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PROFILE_FIELD_VALUE);
+    if (!cmd) return;
+    cmd->message_id = field_id;
+    cmd->body = strdup(value ? value : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_get_profile(oc_client *c, uint64_t user_id) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_GET_PROFILE);

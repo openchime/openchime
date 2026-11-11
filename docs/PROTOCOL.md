@@ -459,7 +459,8 @@ A freshly-authenticated client typically follows `AUTH_OK` with a
 
 After `AUTH_OK` the daemon sends, in order: `WORKSPACE_INFO`,
 `WORKSPACE_ADDRESS` (when set), `SERVER_BUILD`, `CAPABILITIES`, `TTS_INFO`,
-`STT_INFO`, `SNOOZE`, `ALERTS_SUMMARY` (owner/admin), any `SUMMARY_READY`
+`STT_INFO`, `SNOOZE`, `ALERTS_SUMMARY` (owner/admin), `PROFILE_FIELDS`
+(always, empty when the workspace has none), any `SUMMARY_READY`
 notices, one `CALL_STATE` per call, the caller's encrypted-DM state, then the
 presence snapshot.
 
@@ -2380,9 +2381,43 @@ thing they did, and is a different fact from never having set it.
 
     user_id (u64)
 
-**`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to any of SET_STATUS / SET_PROFILE / SET_AVATAR / SET_EMAIL / GET_PROFILE. The reply to SET_PROFILE and SET_EMAIL goes to every connection of the person who saved it, so their other devices show the change at once. (REQ-240, REQ-241)
+**`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to any of SET_STATUS / SET_PROFILE / SET_AVATAR / SET_EMAIL / SET_PROFILE_FIELD_VALUE / GET_PROFILE. The reply to SET_PROFILE, SET_EMAIL and SET_PROFILE_FIELD_VALUE goes to every connection of the person who saved it, so their other devices show the change at once. (REQ-240, REQ-241)
 
-    user_id (u64), display_name (str), email (str), status_emoji (str), status_text (str), status_expires (u64), title (str), timezone (str), avatar_id (u64), role (u8), full_name (str), pronouns (str), phone (str), voice_id (str)
+    user_id (u64), display_name (str), email (str), status_emoji (str), status_text (str), status_expires (u64), title (str), timezone (str), avatar_id (u64), role (u8), full_name (str), pronouns (str), phone (str), voice_id (str),
+    n_fields (u8), n_fields × { field_id (u64), value (str) }
+
+The trailing list (protocol 40) is the person's values for the workspace's own
+profile fields, those they filled, at most 20; a client shows them in the order
+`PROFILE_FIELDS` gives and ignores an id it does not know.
+
+**`SET_PROFILE_FIELD` (C → S), `0x0137`** — An owner or admin adds, renames or
+deletes one of the workspace's profile fields (department, location, manager).
+
+    field_id (u64), op (u8: 0 set, 1 delete), kind (u8: 0 text, 1 link), position (u16), label (str)
+
+`field_id` 0 with op 0 adds a field; otherwise op 0 renames it, and moves it when
+`position` is not 0. Its kind stays what it was made, because the values already
+given were checked against it. Op 1 deletes it with every value anyone gave it.
+`position` 0 puts a new field last. A label is 1–64
+bytes; a workspace has at most 20 fields. Refused with `FORBIDDEN` to a member,
+and `INVALID_PROFILE_FIELD` for a missing label, a kind outside the two, a
+twenty-first field, or an unknown id. On success every signed-in connection is
+sent `PROFILE_FIELDS`.
+
+**`PROFILE_FIELDS` (S → C), `0x0138`** — The workspace's profile fields, in
+`position` order: sent after sign-in, and to everyone when one changes.
+
+    count (u8), count × { field_id (u64), kind (u8), position (u16), label (str) }
+
+**`SET_PROFILE_FIELD_VALUE` (C → S), `0x0139`** — My value for one field; empty
+clears it.
+
+    field_id (u64), value (str)
+
+At most 200 bytes, and a `link` field's value starts `https://`; anything else,
+or a field the workspace does not have, is refused with
+`INVALID_PROFILE_FIELD`. Answered with `PROFILE_INFO` to each of my connections.
+A client shows a link's real address, as MARKDOWN.md has it for every link.
 
 An **empty `text` on `SET_STATUS` clears all three fields together** — emoji,
 text and expiry — because "no status" is one state rather than two, and a client
@@ -3451,6 +3486,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3042` | `WORKSPACE_SENDER`    | messaging  | no    | A message, reply or file sent into a DM with the workspace's own sender (`USER_LIST` `flags`), whose DMs nobody reads. |
 | `3043` | `CANNOT_MOVE`         | messaging  | no    | A `MOVE_MESSAGE` that cannot be made: into or out of a DM or encrypted DM, a thread root with replies into a thread, into a thread that is itself a reply, or to where it already is (REQ-053). |
 | `3070` | `DM_REFUSED`          | messaging  | no    | An `OPEN_DM` or `OPEN_GROUP_DM` naming someone who blocks the asker, or a new one naming someone whose DM privacy is `nobody`. It says neither, so a block is never announced. |
+| `3071` | `INVALID_PROFILE_FIELD` | admin    | no    | A profile field without a label, of an unknown kind or id, past the 20 a workspace may have; or a value over 200 bytes, for a field it does not have, or for a link not starting `https://`. |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing
@@ -3734,6 +3770,9 @@ this table cannot silently gain a shared value.
 | `0x0134` | `LIST_BLOCKS` | C → S | owner or admin: every block in the workspace |
 | `0x0135` | `BLOCK_LIST` | S → C | the answer: blocker, blocked and since, per block |
 | `0x0136` | `SET_DM_PRIVACY` | C → S | who may start a new direct conversation with me: anyone or nobody |
+| `0x0137` | `SET_PROFILE_FIELD` | C → S | owner or admin: add, rename or delete a workspace profile field |
+| `0x0138` | `PROFILE_FIELDS` | S → C | the workspace's profile fields: after sign-in, and to everyone on a change |
+| `0x0139` | `SET_PROFILE_FIELD_VALUE` | C → S | my value for one profile field; empty clears it; answered with `PROFILE_INFO` |
 
 ## 10. Connection state machine
 

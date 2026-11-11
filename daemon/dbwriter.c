@@ -737,6 +737,7 @@ void oc_dbres_free(oc_dbres *r) {
     /* 53's profile strings, alongside every other heap field. */
     free(r->st_emoji); free(r->st_text); free(r->pf_title); free(r->pf_tz);
     free(r->pf_full_name); free(r->pf_pronouns); free(r->pf_phone); free(r->pf_voice_id);
+    free(r->pfd); free(r->pfv);
     free(r->tts_text); free(r->tts_blob_key);
     free(r->sum_body); free(r->sum_version); free(r->sum_places); free(r->sum_notices);
     for (size_t i = 0; i < r->n_stt_names; i++) free(r->stt_names[i]);
@@ -1319,6 +1320,8 @@ static void notices_on_auth(sqlite3 *db, uint64_t uid, oc_dbres *r) {
     }
     sqlite3_finalize(st);
 }
+
+static void load_profile_fields(sqlite3 *db, oc_dbres *r);   /* with the profile, below */
 
 static void alerts_on_auth(sqlite3 *db, oc_dbres *r) {
     if (!oc_role_can_manage_members(r->role)) return;
@@ -2028,6 +2031,7 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
     r->session_id = sess_id;   /* REQ-182: which row this connection is using */
     alerts_on_auth(db, r);
     notices_on_auth(db, uid, r);
+    load_profile_fields(db, r);   /* the workspace's own fields, told at sign-in */
     /* Do-not-disturb rides along, BOTH halves: the net thread keeps the FACT in
      * memory so presence fan-out can carry it, and it has no database of its
      * own. The pause is an instant (REQ-278); the schedule is a rule the net
@@ -9705,6 +9709,51 @@ static oc_dbres *process_set_read_cursor(sqlite3 *db, const oc_job *j) {
  * has to stop being true whether or not you are online.
  */
 
+/* The workspace's own profile fields, in position order, onto `r`: the
+ * PROFILE_FIELDS a change answers, or the sign-in that tells them. */
+static void load_profile_fields(sqlite3 *db, oc_dbres *r) {
+    r->pfd = calloc(OC_MAX_PROFILE_FIELDS, sizeof *r->pfd);
+    if (!r->pfd) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT id, kind='link', position, label FROM profile_fields "
+                               "ORDER BY position, id LIMIT ?1;", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int(st, 1, (int)OC_MAX_PROFILE_FIELDS);
+    while (r->n_pfd < OC_MAX_PROFILE_FIELDS && sqlite3_step(st) == SQLITE_ROW) {
+        struct oc_pfd_row *f = &r->pfd[r->n_pfd++];
+        f->id       = (uint64_t)sqlite3_column_int64(st, 0);
+        f->kind     = sqlite3_column_int(st, 1) ? OC_PROFILE_FIELD_LINK : OC_PROFILE_FIELD_TEXT;
+        f->position = (uint16_t)sqlite3_column_int(st, 2);
+        const unsigned char *l = sqlite3_column_text(st, 3);
+        snprintf(f->label, sizeof f->label, "%s", l ? (const char *)l : "");
+    }
+    sqlite3_finalize(st);
+}
+
+static void fill_profile_fields(sqlite3 *db, oc_dbres *r) {
+    r->type = OC_RES_PROFILE_FIELDS;
+    load_profile_fields(db, r);
+}
+
+/* `uid`'s values for the workspace's profile fields, in the fields' order. */
+static void load_profile_values(sqlite3 *db, uint64_t uid, oc_dbres *r) {
+    r->pfv = calloc(OC_MAX_PROFILE_FIELDS, sizeof *r->pfv);
+    if (!r->pfv) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT v.field_id, v.value FROM profile_field_values v "
+            "  JOIN profile_fields f ON f.id = v.field_id "
+            " WHERE v.user_id = ?1 ORDER BY f.position, f.id LIMIT ?2;", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    sqlite3_bind_int(st, 2, (int)OC_MAX_PROFILE_FIELDS);
+    while (r->n_pfv < OC_MAX_PROFILE_FIELDS && sqlite3_step(st) == SQLITE_ROW) {
+        struct oc_pfv_row *v = &r->pfv[r->n_pfv++];
+        v->field_id = (uint64_t)sqlite3_column_int64(st, 0);
+        const unsigned char *t = sqlite3_column_text(st, 1);
+        snprintf(v->value, sizeof v->value, "%s", t ? (const char *)t : "");
+    }
+    sqlite3_finalize(st);
+}
+
 /* Fill a PROFILE_INFO result for `uid`. Expired status reads as absent: the row is
  * left alone (a lazy sweep beats a timer thread) and every reader applies the same
  * rule, so nobody sees a stale status even before it is cleaned up. */
@@ -9755,6 +9804,7 @@ static void build_profile(sqlite3 *db, uint64_t uid, oc_dbres *r) {
         r->pf_voice_id  = strdup(vc ? (const char *)vc : "");
     }
     sqlite3_finalize(st);
+    load_profile_values(db, uid, r);
 }
 
 static oc_dbres *process_set_status(sqlite3 *db, const oc_job *j) {
@@ -9921,6 +9971,118 @@ static oc_dbres *process_get_profile(sqlite3 *db, const oc_job *j) {
     uint64_t whose = j->message_id ? j->message_id : j->user_id;
     build_profile(db, whose, r);
     if (whose != j->user_id) { free(r->pf_phone); r->pf_phone = NULL; }
+    return r;
+}
+
+/* ---- the workspace's own profile fields (SCHEMA.md §3bs) ---------------------
+ *
+ * Defined by an owner or admin, at most OC_MAX_PROFILE_FIELDS, each text or a
+ * link; each person fills their own. A value is never more than 200 bytes, and a
+ * link's starts https:// so a card never offers a script or a local file. */
+
+static int pf_text_ok(const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) if ((unsigned char)s[i] < 0x20 || s[i] == 0x7f) return 0;
+    return 1;
+}
+
+static oc_dbres *process_set_profile_field(sqlite3 *db, const oc_job *j) {
+    uint8_t role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &role) || !oc_role_can_manage_members(role))
+        return profile_err(j, OC_ERR_FORBIDDEN);
+    uint64_t id = j->message_id;
+    const char *label = j->pf_name ? j->pf_name : "";
+    size_t n = strlen(label);
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (j->pfd_op == OC_PROFILE_FIELD_DELETE) {
+        if (!id) return profile_err(j, OC_ERR_INVALID_PROFILE_FIELD);
+        sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+        if (sqlite3_prepare_v2(db, "DELETE FROM profile_field_values WHERE field_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st); st = NULL;
+        if (sqlite3_prepare_v2(db, "DELETE FROM profile_fields WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+            ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+        }
+        sqlite3_finalize(st);
+        sqlite3_exec(db, ok ? "COMMIT;" : "ROLLBACK;", NULL, NULL, NULL);
+        if (!ok) return profile_err(j, OC_ERR_INVALID_PROFILE_FIELD);
+        audit_actor(db, OC_AUDIT_ADMIN, "profile_field.delete", j->user_id, 0, NULL, 1, NULL);
+    } else {
+        if (j->pfd_op != OC_PROFILE_FIELD_SET || n == 0 || n > OC_PROFILE_FIELD_LABEL_MAX ||
+            !pf_text_ok(label, n) || j->pfd_kind > OC_PROFILE_FIELD_LINK)
+            return profile_err(j, OC_ERR_INVALID_PROFILE_FIELD);
+        if (id == 0) {
+            /* A new one, within the cap, last unless a place is asked for. */
+            if (sqlite3_prepare_v2(db,
+                    "INSERT INTO profile_fields(label, kind, position, created_at_ms) "
+                    "SELECT ?1, ?2, CASE WHEN ?3 > 0 THEN ?3 "
+                    "                    ELSE (SELECT COALESCE(MAX(position), 0) + 1 FROM profile_fields) END, ?4 "
+                    " WHERE (SELECT COUNT(*) FROM profile_fields) < ?5;", -1, &st, NULL) == SQLITE_OK) {
+                sqlite3_bind_text (st, 1, label, (int)n, SQLITE_TRANSIENT);
+                sqlite3_bind_text (st, 2, j->pfd_kind == OC_PROFILE_FIELD_LINK ? "link" : "text", -1, SQLITE_STATIC);
+                sqlite3_bind_int  (st, 3, (int)j->pfd_position);
+                sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+                sqlite3_bind_int  (st, 5, (int)OC_MAX_PROFILE_FIELDS);
+                ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+            }
+        } else {
+            /* A rename, and a move when a place is given. The kind stays what it
+             * was made: values already given were checked against it. */
+            if (sqlite3_prepare_v2(db,
+                    "UPDATE profile_fields SET label=?1, "
+                    "       position=CASE WHEN ?2 > 0 THEN ?2 ELSE position END WHERE id=?3;",
+                    -1, &st, NULL) == SQLITE_OK) {
+                sqlite3_bind_text (st, 1, label, (int)n, SQLITE_TRANSIENT);
+                sqlite3_bind_int  (st, 2, (int)j->pfd_position);
+                sqlite3_bind_int64(st, 3, (sqlite3_int64)id);
+                ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+            }
+        }
+        sqlite3_finalize(st);
+        if (!ok) return profile_err(j, OC_ERR_INVALID_PROFILE_FIELD);
+        audit_actor(db, OC_AUDIT_ADMIN, "profile_field.set", j->user_id, 0, NULL, 1, NULL);
+    }
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+    fill_profile_fields(db, r);
+    r->ch_fanout = 1;   /* every client's cards and editors change with it */
+    return r;
+}
+
+static oc_dbres *process_set_profile_field_value(sqlite3 *db, const oc_job *j) {
+    const char *v = j->pf_name ? j->pf_name : "";
+    size_t n = strlen(v);
+    sqlite3_stmt *st = NULL;
+    int kind = -1;
+    if (sqlite3_prepare_v2(db, "SELECT kind='link' FROM profile_fields WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        if (sqlite3_step(st) == SQLITE_ROW) kind = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st); st = NULL;
+    if (kind < 0 || n > OC_PROFILE_FIELD_VALUE_MAX || !pf_text_ok(v, n) ||
+        (kind == 1 && n && (strncmp(v, "https://", 8) != 0 || n == 8 || strpbrk(v, " <>\"'`"))))
+        return profile_err(j, OC_ERR_INVALID_PROFILE_FIELD);
+    if (n == 0)
+        sqlite3_prepare_v2(db, "DELETE FROM profile_field_values WHERE user_id=?1 AND field_id=?2;", -1, &st, NULL);
+    else
+        sqlite3_prepare_v2(db,
+            "INSERT INTO profile_field_values(user_id, field_id, value) VALUES(?1, ?2, ?3) "
+            "ON CONFLICT(user_id, field_id) DO UPDATE SET value=excluded.value;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
+    if (n) sqlite3_bind_text(st, 3, v, (int)n, SQLITE_TRANSIENT);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    build_profile(db, j->user_id, r);
+    r->pf_fanout = 1;   /* every device of theirs, as SET_PROFILE */
     return r;
 }
 
@@ -12168,6 +12330,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_NOTIFY_DEFAULT) return process_set_notify_default(w->db, j);
     if (j->type == OC_JOB_SET_STATUS)      return process_set_status(w->db, j);
     if (j->type == OC_JOB_SET_PROFILE)     return process_set_profile(w->db, j);
+    if (j->type == OC_JOB_SET_PROFILE_FIELD)       return process_set_profile_field(w->db, j);
+    if (j->type == OC_JOB_SET_PROFILE_FIELD_VALUE) return process_set_profile_field_value(w->db, j);
     if (j->type == OC_JOB_SET_EMAIL)       return process_set_email(w->db, j);
     if (j->type == OC_JOB_SET_AVATAR)      return process_set_avatar(w->db, j);
     if (j->type == OC_JOB_DEACTIVATE_SELF) return process_deactivate_self(w->db, j);

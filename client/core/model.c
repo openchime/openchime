@@ -470,6 +470,7 @@ void oc_model_free(oc_model *m) {
     free(m->threads);
     free(m->files);
     free(m->users);
+    free(m->pfvals);
     free(m->webhooks);
     free(m->settings);
     free(m->audit);
@@ -699,6 +700,12 @@ const char *oc_model_user_name(const oc_model *m, uint64_t user_id) {
 
 int oc_model_is_workspace_sender(const oc_model *m, uint64_t user_id) {
     return m && user_id && user_id == m->ws_sender;
+}
+
+const char *oc_model_profile_value(const oc_model *m, uint64_t user_id, uint64_t field_id) {
+    for (size_t i = 0; m && i < m->n_pfvals; i++)
+        if (m->pfvals[i].user_id == user_id && m->pfvals[i].field_id == field_id) return m->pfvals[i].value;
+    return "";
 }
 
 int oc_model_user_disabled(const oc_model *m, uint64_t user_id) {
@@ -2469,7 +2476,47 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         mem->avatar_id      = e->message_id;
         if (e->op) mem->role = e->op;
         user_relabel(mem);
+        /* Their values for the workspace's fields: the frame carries all of
+         * them, so theirs are replaced whole. */
+        {
+            size_t keep = 0;
+            for (size_t i = 0; i < m->n_pfvals; i++)
+                if (m->pfvals[i].user_id != e->user_id) m->pfvals[keep++] = m->pfvals[i];
+            m->n_pfvals = keep;
+            for (uint8_t i = 0; i < e->n_pfs; i++) {
+                if (m->n_pfvals == m->cap_pfvals) {
+                    size_t nc = m->cap_pfvals ? m->cap_pfvals * 2 : 32;
+                    oc_pfvalue *g = realloc(m->pfvals, nc * sizeof *g);
+                    if (!g) break;
+                    m->pfvals = g; m->cap_pfvals = nc;
+                }
+                oc_pfvalue *v = &m->pfvals[m->n_pfvals++];
+                v->user_id = e->user_id;
+                v->field_id = e->pfs[i].id;
+                snprintf(v->value, sizeof v->value, "%s", e->pfs[i].text);
+            }
+        }
         if (e->user_id == m->user_id) m->self_profile_seq++;
+        break;
+    }
+    case OC_EV_PROFILE_FIELDS: {
+        m->n_pfields = 0;
+        for (uint8_t i = 0; i < e->n_pfs && m->n_pfields < OC_MAX_PROFILE_FIELDS; i++) {
+            oc_pfield *f = &m->pfields[m->n_pfields++];
+            f->id = e->pfs[i].id;
+            f->kind = e->pfs[i].kind;
+            f->position = e->pfs[i].position;
+            snprintf(f->label, sizeof f->label, "%.*s", (int)OC_PROFILE_FIELD_LABEL_MAX, e->pfs[i].text);
+        }
+        /* A value for a field that is gone goes with it. */
+        size_t keep = 0;
+        for (size_t i = 0; i < m->n_pfvals; i++) {
+            int known = 0;
+            for (uint8_t k = 0; k < m->n_pfields; k++) if (m->pfields[k].id == m->pfvals[i].field_id) known = 1;
+            if (known) m->pfvals[keep++] = m->pfvals[i];
+        }
+        m->n_pfvals = keep;
+        m->pfields_seq++;
         break;
     }
     case OC_EV_INVITE_ROW: {

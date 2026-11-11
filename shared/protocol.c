@@ -1576,6 +1576,8 @@ const char *oc_error_text(uint16_t code) {
     case OC_ERR_WORKSPACE_SENDER: return "messages from the workspace take no replies";
     case OC_ERR_CANNOT_MOVE:      return "that message can't be moved there";
     case OC_ERR_DM_REFUSED:       return "you can't start a conversation with this person";
+    case OC_ERR_INVALID_PROFILE_FIELD:
+        return "a profile field needs a label and there can be 20; a value is at most 200 bytes, a link starting https://";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
@@ -4314,6 +4316,7 @@ oc_result oc_decode_set_profile(oc_rbuf *p, oc_set_profile *m) {
 /* One frame per PERSON, not per field: a roster wants everything it shows about
  * somebody in a single message, and it doubles as the push when any of it changes. */
 oc_result oc_encode_profile_info(oc_wbuf *w, uint16_t version, const oc_profile_info *m) {
+    if (m->n_fields > OC_MAX_PROFILE_FIELDS) return OC_E_OVERFLOW;
     size_t off = oc_frame_begin(w, version, OC_MSG_PROFILE_INFO);
     oc_w_u64(w, m->user_id);
     oc_w_str(w, m->display_name);
@@ -4329,7 +4332,72 @@ oc_result oc_encode_profile_info(oc_wbuf *w, uint16_t version, const oc_profile_
     oc_w_str(w, m->pronouns);
     oc_w_str(w, m->phone);
     oc_w_str(w, m->voice_id);
+    oc_w_u8(w, m->n_fields);
+    for (uint8_t i = 0; i < m->n_fields; i++) {
+        oc_w_u64(w, m->fields[i].field_id);
+        oc_w_str(w, m->fields[i].value);
+    }
     return oc_frame_end(w, off);
+}
+
+/* The workspace's profile fields (SET_PROFILE_FIELD, PROFILE_FIELDS) and a
+ * person's value for one (SET_PROFILE_FIELD_VALUE). */
+oc_result oc_encode_set_profile_field(oc_wbuf *w, uint16_t version, const oc_set_profile_field *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_PROFILE_FIELD);
+    oc_w_u64(w, m->field_id);
+    oc_w_u8(w, m->op);
+    oc_w_u8(w, m->kind);
+    oc_w_u16(w, m->position);
+    oc_w_str(w, m->label);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_profile_field(oc_rbuf *p, oc_set_profile_field *m) {
+    m->field_id = oc_r_u64(p);
+    m->op       = oc_r_u8(p);
+    m->kind     = oc_r_u8(p);
+    m->position = oc_r_u16(p);
+    m->label    = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_profile_fields(oc_wbuf *w, uint16_t version, const oc_profile_fields *m) {
+    if (m->count > OC_MAX_PROFILE_FIELDS) return OC_E_OVERFLOW;
+    size_t off = oc_frame_begin(w, version, OC_MSG_PROFILE_FIELDS);
+    oc_w_u8(w, m->count);
+    for (uint8_t i = 0; i < m->count; i++) {
+        oc_w_u64(w, m->fields[i].field_id);
+        oc_w_u8(w, m->fields[i].kind);
+        oc_w_u16(w, m->fields[i].position);
+        oc_w_str(w, m->fields[i].label);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_profile_fields(oc_rbuf *p, oc_profile_field *out, uint8_t *out_n) {
+    uint8_t n = oc_r_u8(p);
+    if (n > OC_MAX_PROFILE_FIELDS) return OC_E_MALFORMED;
+    for (uint8_t i = 0; i < n; i++) {
+        out[i].field_id = oc_r_u64(p);
+        out[i].kind     = oc_r_u8(p);
+        out[i].position = oc_r_u16(p);
+        out[i].label    = oc_r_str(p);
+    }
+    *out_n = n;
+    return r_done(p);
+}
+
+oc_result oc_encode_set_profile_field_value(oc_wbuf *w, uint16_t version, const oc_profile_field_value *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_PROFILE_FIELD_VALUE);
+    oc_w_u64(w, m->field_id);
+    oc_w_str(w, m->value);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_profile_field_value(oc_rbuf *p, oc_profile_field_value *m) {
+    m->field_id = oc_r_u64(p);
+    m->value    = oc_r_str(p);
+    return r_done(p);
 }
 
 oc_result oc_decode_profile_info(oc_rbuf *p, oc_profile_info *m) {
@@ -4347,6 +4415,12 @@ oc_result oc_decode_profile_info(oc_rbuf *p, oc_profile_info *m) {
     m->pronouns       = oc_r_str(p);
     m->phone          = oc_r_str(p);
     m->voice_id       = oc_r_str(p);
+    m->n_fields       = oc_r_u8(p);
+    if (m->n_fields > OC_MAX_PROFILE_FIELDS) return OC_E_MALFORMED;
+    for (uint8_t i = 0; i < m->n_fields; i++) {
+        m->fields[i].field_id = oc_r_u64(p);
+        m->fields[i].value    = oc_r_str(p);
+    }
     return r_done(p);
 }
 

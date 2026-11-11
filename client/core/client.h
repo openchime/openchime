@@ -518,6 +518,13 @@ void oc_client_set_profile(oc_client *c, const char *full_name, const char *titl
 /* A member's whole profile, `user_id` 0 for mine; it arrives as PROFILE_INFO
  * (the model's users[], and for mine the phone too). */
 void oc_client_get_profile(oc_client *c, uint64_t user_id);
+/* An owner or admin adds (`field_id` 0), renames or moves (`position` not 0),
+ * or deletes (`op` OC_PROFILE_FIELD_DELETE) one of the workspace's own profile
+ * fields, `kind` OC_PROFILE_FIELD_TEXT or _LINK. Everyone is told PROFILE_FIELDS. */
+void oc_client_set_profile_field(oc_client *c, uint64_t field_id, int op, int kind,
+                                 uint16_t position, const char *label);
+/* My value for one profile field, "" to clear it; it comes back as PROFILE_INFO. */
+void oc_client_set_profile_field_value(oc_client *c, uint64_t field_id, const char *value);
 /* Set only my read-aloud voice (REQ-292). SET_PROFILE replaces every field,
  * so the core fetches my whole profile first and sends it back with the voice
  * changed: nothing else, the phone included, is touched. */

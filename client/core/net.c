@@ -1912,6 +1912,23 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (e->body) { memcpy(e->body, ee[i].name.ptr, ee[i].name.len); e->body[ee[i].name.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_PROFILE_FIELDS) {
+            oc_profile_field pf[OC_MAX_PROFILE_FIELDS]; uint8_t count = 0;
+            if (oc_decode_profile_fields(&p, pf, &count) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_PROFILE_FIELDS);
+            if (e) {
+                if (count && (e->pfs = calloc(count, sizeof *e->pfs)) != NULL) {
+                    for (uint8_t i = 0; i < count; i++) {
+                        e->pfs[i].id = pf[i].field_id;
+                        e->pfs[i].kind = pf[i].kind;
+                        e->pfs[i].position = pf[i].position;
+                        snprintf(e->pfs[i].text, sizeof e->pfs[i].text, "%.*s",
+                                 (int)pf[i].label.len, (const char *)pf[i].label.ptr);
+                    }
+                    e->n_pfs = count;
+                }
+                oc_queue_push(to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_CLIENT_SETTINGS) {
             enum { CS_CAP = OC_MAX_CLIENT_SETTINGS };
             oc_client_setting_entry ce[CS_CAP];
@@ -2540,6 +2557,15 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                                      (int)pi.phone.len,        (const char *)pi.phone.ptr,
                                      (int)pi.voice_id.len,     (const char *)pi.voice_id.ptr);
                     (void)k;
+                }
+                /* The values for the workspace's own fields, beside the rest. */
+                if (pi.n_fields && (e->pfs = calloc(pi.n_fields, sizeof *e->pfs)) != NULL) {
+                    for (uint8_t i = 0; i < pi.n_fields; i++) {
+                        e->pfs[i].id = pi.fields[i].field_id;
+                        snprintf(e->pfs[i].text, sizeof e->pfs[i].text, "%.*s",
+                                 (int)pi.fields[i].value.len, (const char *)pi.fields[i].value.ptr);
+                    }
+                    e->n_pfs = pi.n_fields;
                 }
                 oc_queue_push(to_ui, e);
             }
@@ -4054,6 +4080,19 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_get_profile gp = { c->type == OC_CMD_SET_VOICE ? 0 : c->channel_id };
                 if (oc_encode_get_profile(&w, OC_PROTOCOL_VERSION, &gp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_PROFILE_FIELD) {
+                uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_profile_field sf = { c->message_id, c->op, c->scope, c->uses,
+                                            oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_set_profile_field(&w, OC_PROTOCOL_VERSION, &sf) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_PROFILE_FIELD_VALUE) {
+                uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_profile_field_value fv = { c->message_id, oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_set_profile_field_value(&w, OC_PROTOCOL_VERSION, &fv) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_ENABLE_USER) {

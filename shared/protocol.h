@@ -210,8 +210,13 @@
  * 39: an attachment entry may be a snippet (media kind 2, REQ-226), which
  * carries `title` and `language` where a video carries its facts, and
  * ATTACH_MEDIA_SET marks one with them and its searchable text. A client of 38
- * would refuse a message carrying the new kind, so the version moves. */
-#define OC_PROTOCOL_VERSION 39u
+ * would refuse a message carrying the new kind, so the version moves.
+ *
+ * 40: PROFILE_INFO carries the person's values for the workspace's own profile
+ * fields: a count (u8) and that many { field_id (u64), value (str) }. Fields
+ * appended to a fixed layout. SET_PROFILE_FIELD, PROFILE_FIELDS and
+ * SET_PROFILE_FIELD_VALUE (0x0137-0x0139) are new. */
+#define OC_PROTOCOL_VERSION 40u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -630,6 +635,9 @@ typedef enum {
     OC_MSG_LIST_BLOCKS          = 0x0134, /* C->S, owner/admin: every block in the workspace */
     OC_MSG_BLOCK_LIST           = 0x0135, /* S->C, the answer: blocker, blocked and since, per block */
     OC_MSG_SET_DM_PRIVACY       = 0x0136, /* C->S, who may start a new direct conversation with me */
+    OC_MSG_SET_PROFILE_FIELD    = 0x0137, /* C->S, owner/admin: add, rename or delete one of the workspace's profile fields */
+    OC_MSG_PROFILE_FIELDS       = 0x0138, /* S->C, the workspace's profile fields: at sign-in, and to everyone on a change */
+    OC_MSG_SET_PROFILE_FIELD_VALUE = 0x0139, /* C->S, my value for one profile field; empty clears it */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -737,6 +745,7 @@ typedef enum {
     OC_ERR_CANNOT_MOVE         = 3043, /* a move that cannot be made: into or out of an encrypted DM, a thread's
                                         * root into a thread, into a thread elsewhere, or to where it already is */
     OC_ERR_DM_REFUSED          = 3070, /* a new direct conversation this person does not take: never says why */
+    OC_ERR_INVALID_PROFILE_FIELD = 3071, /* a profile field without a label, past the cap, or a value too long or not a link */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -1460,11 +1469,31 @@ typedef struct { uint16_t count; const oc_emoji_entry *entries; } oc_emoji_list;
 /* Everything a card shows about one person. `phone` is here and NOT on
  * USER_LIST: this frame goes to the one person who asked for the card, where a
  * roster fan-out would hand every member's number to everybody. */
+/* A workspace's own profile fields (department, location, manager): defined by
+ * an owner or admin, each plain text or a link, in `position` order. A person's
+ * values ride PROFILE_INFO; one for a field the workspace no longer has is not
+ * sent. A link value starts https://. */
+#define OC_MAX_PROFILE_FIELDS      20u
+#define OC_PROFILE_FIELD_LABEL_MAX 64u
+#define OC_PROFILE_FIELD_VALUE_MAX 200u
+#define OC_PROFILE_FIELD_TEXT      0u
+#define OC_PROFILE_FIELD_LINK      1u
+#define OC_PROFILE_FIELD_SET       0u   /* field_id 0 adds one; otherwise renames it */
+#define OC_PROFILE_FIELD_DELETE    1u   /* and every value anyone gave it */
+/* `position` 0 on an add puts the field last, on a rename keeps where it is. */
+typedef struct { uint64_t field_id; uint8_t op; uint8_t kind; uint16_t position; oc_slice label; } oc_set_profile_field;
+typedef struct { uint64_t field_id; uint8_t kind; uint16_t position; oc_slice label; } oc_profile_field;
+typedef struct { uint8_t count; const oc_profile_field *fields; } oc_profile_fields;
+/* SET_PROFILE_FIELD_VALUE, and each value PROFILE_INFO carries. */
+typedef struct { uint64_t field_id; oc_slice value; } oc_profile_field_value;
 typedef struct { uint64_t user_id; oc_slice display_name; oc_slice email;
                  oc_slice status_emoji; oc_slice status_text; uint64_t status_expires;
                  oc_slice title; oc_slice timezone; uint64_t avatar_id;
                  uint8_t role; oc_slice full_name; oc_slice pronouns;
-                 oc_slice phone; oc_slice voice_id; } oc_profile_info;
+                 oc_slice phone; oc_slice voice_id;
+                 /* As of protocol 40: the person's values for the workspace's
+                  * profile fields, those they filled. */
+                 uint8_t n_fields; oc_profile_field_value fields[OC_MAX_PROFILE_FIELDS]; } oc_profile_info;
 /* Counts, not rows: the column shows "#design 12", so the wire carries
  * exactly that and nothing more. */
 /* REQ-182. `current` marks the connection asking — you should be able to tell which
@@ -2039,6 +2068,13 @@ oc_result oc_encode_list_saved(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_saved_msg(oc_wbuf *w, uint16_t version, const oc_saved_msg *m);
 oc_result oc_encode_saved(oc_wbuf *w, uint16_t version, const oc_saved *m);
 oc_result oc_encode_set_collapsed(oc_wbuf *w, uint16_t version, const oc_set_collapsed *m);
+oc_result oc_encode_set_profile_field(oc_wbuf *w, uint16_t version, const oc_set_profile_field *m);
+oc_result oc_decode_set_profile_field(oc_rbuf *p, oc_set_profile_field *m);
+oc_result oc_encode_profile_fields(oc_wbuf *w, uint16_t version, const oc_profile_fields *m);
+/* Into `out`, which holds OC_MAX_PROFILE_FIELDS; more is refused. */
+oc_result oc_decode_profile_fields(oc_rbuf *p, oc_profile_field *out, uint8_t *out_n);
+oc_result oc_encode_set_profile_field_value(oc_wbuf *w, uint16_t version, const oc_profile_field_value *m);
+oc_result oc_decode_set_profile_field_value(oc_rbuf *p, oc_profile_field_value *m);
 oc_result oc_encode_collapsed_updated(oc_wbuf *w, uint16_t version, const oc_set_collapsed *m);
 oc_result oc_encode_list_activity(oc_wbuf *w, uint16_t version, uint8_t filter);
 oc_result oc_decode_list_activity(oc_rbuf *p, uint8_t *filter);

@@ -354,6 +354,7 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
             hdr->msg_type != OC_MSG_GROUP_INFO &&      /* the groups, unasked after a sign-in's */
             hdr->msg_type != OC_MSG_GROUPS_END &&      /*   user list (REQ-307) */
             hdr->msg_type != OC_MSG_ALERTS_SUMMARY &&  /* an owner's or admin's, at sign-in (REQ-263) */
+            hdr->msg_type != OC_MSG_PROFILE_FIELDS &&  /* the workspace's own, at sign-in and on a change */
             /* Every live message frame is followed by its ACTION (REQ-058,
              * ARCH-115); the action verticals read them with read_frame_raw. */
             hdr->msg_type != OC_MSG_ACTION)
@@ -476,6 +477,12 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
         oc_alerts_summary sm;
         if (oc_decode_alerts_summary(&p, &sm) != OC_OK) return -1;
         g_auth_alerts = sm;
+    }
+    /* Then the workspace's own profile fields, always, empty when it has none. */
+    if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_PROFILE_FIELDS) return -1;
+    {
+        oc_profile_field pf[OC_MAX_PROFILE_FIELDS]; uint8_t npf = 0;
+        if (oc_decode_profile_fields(&p, pf, &npf) != OC_OK) return -1;
     }
     return 0;
 }

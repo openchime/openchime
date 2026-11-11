@@ -2452,7 +2452,9 @@ static void test_index_mentions(void) {
                            "ALTER TABLE attachment_media DROP COLUMN language;"
                            /* 0079's blocks and DM privacy. */
                            "DROP TABLE blocks; DROP TABLE withheld_messages;"
-                           "ALTER TABLE users DROP COLUMN dm_privacy;",
+                           "ALTER TABLE users DROP COLUMN dm_privacy;"
+                           /* 0080's profile fields. */
+                           "DROP TABLE profile_field_values; DROP TABLE profile_fields;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -6844,6 +6846,163 @@ static void test_blocks(void) {
     CHECK(r && r->type == OC_RES_BLOCK_LIST && r->n_blk == 1);
     CHECK(r && r->n_blk == 1 && r->blk_entries[0].blocker_id == carol && r->blk_entries[0].blocked_id == dave);
     oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* A workspace's own profile fields: owners and admins define them, at most 20;
+ * each person fills their own, 200 bytes at most, a link starting https://; the
+ * values ride PROFILE_INFO to every device of theirs; deleting a field deletes
+ * its values. */
+static oc_dbres *pf_set(oc_dbwriter *w, uint64_t uid, uint64_t id, uint8_t op, uint8_t kind,
+                        uint16_t pos, const char *label) {
+    oc_job *j = oc_job_new(OC_JOB_SET_PROFILE_FIELD, 80);
+    j->user_id = uid; j->message_id = id;
+    j->pfd_op = op; j->pfd_kind = kind; j->pfd_position = pos;
+    j->pf_name = strdup(label);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *pf_value(oc_dbwriter *w, uint64_t uid, uint64_t id, const char *value) {
+    oc_job *j = oc_job_new(OC_JOB_SET_PROFILE_FIELD_VALUE, 81);
+    j->user_id = uid; j->message_id = id;
+    j->pf_name = strdup(value);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static const char *pfv_of(const oc_dbres *r, uint64_t field_id) {
+    for (size_t i = 0; r && i < r->n_pfv; i++) if (r->pfv[i].field_id == field_id) return r->pfv[i].value;
+    return NULL;
+}
+
+static void test_profile_fields(void) {
+    const char *path = tdb("profile_fields.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t owner = reg(w, "pf-owner", "pw", OC_ROLE_OWNER);
+    uint64_t admin = reg(w, "pf-admin", "pw", OC_ROLE_ADMIN);
+    uint64_t bob   = reg(w, "pf-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(owner && admin && bob);
+
+    /* A member defines nothing. */
+    oc_dbres *r = pf_set(w, bob, 0, OC_PROFILE_FIELD_SET, OC_PROFILE_FIELD_TEXT, 0, "Department");
+    CHECK(r && r->type == OC_RES_PROFILE_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* An owner and an admin do; each answer is the whole list, for everyone. */
+    r = pf_set(w, owner, 0, OC_PROFILE_FIELD_SET, OC_PROFILE_FIELD_TEXT, 0, "Department");
+    CHECK(r && r->type == OC_RES_PROFILE_FIELDS && r->ch_fanout == 1 && r->n_pfd == 1);
+    uint64_t dept = (r && r->n_pfd) ? r->pfd[0].id : 0;
+    oc_dbres_free(r);
+    r = pf_set(w, admin, 0, OC_PROFILE_FIELD_SET, OC_PROFILE_FIELD_LINK, 0, "Homepage");
+    CHECK(r && r->type == OC_RES_PROFILE_FIELDS && r->n_pfd == 2);
+    uint64_t home = (r && r->n_pfd == 2) ? r->pfd[1].id : 0;
+    CHECK(r && r->n_pfd == 2 && r->pfd[1].kind == OC_PROFILE_FIELD_LINK && !strcmp(r->pfd[1].label, "Homepage"));
+    CHECK(r && r->n_pfd == 2 && r->pfd[0].position < r->pfd[1].position);   /* a new one goes last */
+    oc_dbres_free(r);
+    CHECK(dept && home);
+
+    /* No label, a label too long, an unknown kind or id: refused. */
+    r = pf_set(w, owner, 0, OC_PROFILE_FIELD_SET, OC_PROFILE_FIELD_TEXT, 0, "");
+    CHECK(r && r->type == OC_RES_PROFILE_ERR && r->err_code == OC_ERR_INVALID_PROFILE_FIELD);
+    oc_dbres_free(r);
+    char longl[OC_PROFILE_FIELD_LABEL_MAX + 2];
+    memset(longl, 'x', sizeof longl - 1); longl[sizeof longl - 1] = '\0';
+    r = pf_set(w, owner, 0, OC_PROFILE_FIELD_SET, OC_PROFILE_FIELD_TEXT, 0, longl);
+    CHECK(r && r->err_code == OC_ERR_INVALID_PROFILE_FIELD);
+    oc_dbres_free(r);
+    r = pf_set(w, owner, 0, OC_PROFILE_FIELD_SET, 7, 0, "Odd");
+    CHECK(r && r->err_code == OC_ERR_INVALID_PROFILE_FIELD);
+    oc_dbres_free(r);
+    r = pf_set(w, owner, 999999, OC_PROFILE_FIELD_SET, OC_PROFILE_FIELD_TEXT, 0, "Nowhere");
+    CHECK(r && r->err_code == OC_ERR_INVALID_PROFILE_FIELD);
+    oc_dbres_free(r);
+
+    /* A rename keeps the kind; a position moves it. */
+    r = pf_set(w, owner, dept, OC_PROFILE_FIELD_SET, OC_PROFILE_FIELD_LINK, 50, "Team");
+    CHECK(r && r->type == OC_RES_PROFILE_FIELDS && r->n_pfd == 2);
+    CHECK(r && r->n_pfd == 2 && r->pfd[1].id == dept && !strcmp(r->pfd[1].label, "Team") &&
+          r->pfd[1].kind == OC_PROFILE_FIELD_TEXT);
+    oc_dbres_free(r);
+
+    /* Values: text up to 200 bytes; a link only https://. */
+    r = pf_value(w, bob, dept, "Platform");
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && r->pf_fanout == 1 && r->user_id == bob);
+    CHECK(r && pfv_of(r, dept) && !strcmp(pfv_of(r, dept), "Platform"));
+    oc_dbres_free(r);
+    char longv[OC_PROFILE_FIELD_VALUE_MAX + 2];
+    memset(longv, 'v', sizeof longv - 1); longv[sizeof longv - 1] = '\0';
+    r = pf_value(w, bob, dept, longv);
+    CHECK(r && r->type == OC_RES_PROFILE_ERR && r->err_code == OC_ERR_INVALID_PROFILE_FIELD);
+    oc_dbres_free(r);
+    longv[OC_PROFILE_FIELD_VALUE_MAX] = '\0';   /* exactly 200 is fine */
+    r = pf_value(w, bob, dept, longv);
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && pfv_of(r, dept) && strlen(pfv_of(r, dept)) == OC_PROFILE_FIELD_VALUE_MAX);
+    oc_dbres_free(r);
+    r = pf_value(w, bob, home, "javascript:alert(1)");
+    CHECK(r && r->err_code == OC_ERR_INVALID_PROFILE_FIELD);
+    oc_dbres_free(r);
+    r = pf_value(w, bob, home, "http://example.com");
+    CHECK(r && r->err_code == OC_ERR_INVALID_PROFILE_FIELD);
+    oc_dbres_free(r);
+    r = pf_value(w, bob, home, "https://example.com/bob");
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && pfv_of(r, home) && !strcmp(pfv_of(r, home), "https://example.com/bob"));
+    oc_dbres_free(r);
+    r = pf_value(w, bob, 999999, "x");
+    CHECK(r && r->err_code == OC_ERR_INVALID_PROFILE_FIELD);
+    oc_dbres_free(r);
+
+    /* Anyone reading bob's card sees his values, in the fields' order. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_GET_PROFILE, 82);
+        j->user_id = owner; j->message_id = bob;
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_PROFILE_INFO && r->n_pfv == 2);
+        CHECK(r && r->n_pfv == 2 && r->pfv[0].field_id == home && r->pfv[1].field_id == dept);
+        oc_dbres_free(r);
+    }
+
+    /* An empty value clears it. */
+    r = pf_value(w, bob, home, "");
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && pfv_of(r, home) == NULL && r->n_pfv == 1);
+    oc_dbres_free(r);
+
+    /* Deleting a field deletes every value it had. */
+    r = pf_set(w, admin, dept, OC_PROFILE_FIELD_DELETE, 0, 0, "");
+    CHECK(r && r->type == OC_RES_PROFILE_FIELDS && r->n_pfd == 1 && r->pfd[0].id == home);
+    oc_dbres_free(r);
+    CHECK(rm_count(path, "SELECT COUNT(*) FROM profile_field_values WHERE field_id=?1;", dept) == 0);
+    r = pf_set(w, admin, dept, OC_PROFILE_FIELD_DELETE, 0, 0, "");   /* gone already */
+    CHECK(r && r->err_code == OC_ERR_INVALID_PROFILE_FIELD);
+    oc_dbres_free(r);
+    CHECK(audit_count(w, admin, "profile_field.delete") == 1);
+
+    /* At most twenty. */
+    for (int i = 0; i < (int)OC_MAX_PROFILE_FIELDS - 1; i++) {
+        char lb[16]; snprintf(lb, sizeof lb, "F%d", i);
+        r = pf_set(w, owner, 0, OC_PROFILE_FIELD_SET, OC_PROFILE_FIELD_TEXT, 0, lb);
+        CHECK(r && r->type == OC_RES_PROFILE_FIELDS);
+        oc_dbres_free(r);
+    }
+    r = pf_set(w, owner, 0, OC_PROFILE_FIELD_SET, OC_PROFILE_FIELD_TEXT, 0, "One too many");
+    CHECK(r && r->type == OC_RES_PROFILE_ERR && r->err_code == OC_ERR_INVALID_PROFILE_FIELD);
+    oc_dbres_free(r);
+
+    /* A sign-in carries them all, in their order. */
+    {
+        char *tok = page_signin(w, 83, "pf-bob", "pw", NULL, NULL);
+        CHECK(tok != NULL);
+        r = tok ? token_auth(w, 83, tok, NULL) : NULL;
+        free(tok);
+        CHECK(r && r->type == OC_RES_AUTH_OK && r->user_id == bob && r->n_pfd == OC_MAX_PROFILE_FIELDS);
+        CHECK(r && r->n_pfd && r->pfd[0].id == home);
+        oc_dbres_free(r);
+    }
 
     oc_dbwriter_stop(w);
     cleanup_db(path);
@@ -11894,6 +12053,7 @@ int run_dbwriter_tests(void) {
     test_remove_user_integrations();
     test_remove_keeps_history();
     test_blocks();
+    test_profile_fields();
     test_reset_credential();
     test_enable_user();
     test_session_policy();

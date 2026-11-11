@@ -3792,6 +3792,27 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_PROFILE_FIELD) {
+            oc_set_profile_field sf;
+            if (oc_decode_set_profile_field(&p, &sf) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_PROFILE_FIELD, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = sf.field_id;
+            j->pfd_op = sf.op; j->pfd_kind = sf.kind; j->pfd_position = sf.position;
+            j->pf_name = slice_dup(sf.label);
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_PROFILE_FIELD_VALUE) {
+            oc_profile_field_value fv;
+            if (oc_decode_set_profile_field_value(&p, &fv) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_PROFILE_FIELD_VALUE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = fv.field_id;
+            j->pf_name = slice_dup(fv.value);
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_MUTE) {
             oc_set_mute sm;
             if (oc_decode_set_mute(&p, &sm) != OC_OK) return -1;
@@ -6485,6 +6506,24 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (!conns[fd]) break;
         }
+        /* The workspace's own profile fields, which every card and the profile
+         * editor show. Always, empty when there are none: a client never has
+         * to infer "none" from silence. */
+        {
+            oc_profile_field pf[OC_MAX_PROFILE_FIELDS];
+            uint8_t npf = 0;
+            for (size_t i = 0; i < r->n_pfd && npf < OC_MAX_PROFILE_FIELDS; i++, npf++) {
+                pf[npf].field_id = r->pfd[i].id;
+                pf[npf].kind     = r->pfd[i].kind;
+                pf[npf].position = r->pfd[i].position;
+                pf[npf].label    = oc_slice_str(r->pfd[i].label);
+            }
+            oc_profile_fields fl = { npf, pf };
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            if (oc_encode_profile_fields(&w, OC_PROTOCOL_VERSION, &fl) == OC_OK)
+                send_bytes(ep, conns, fd, g_enc, w.len);
+            if (!conns[fd]) break;
+        }
         /* Summaries made while they were away, not yet seen (REQ-310). */
         for (size_t i = 0; i < r->n_sum_notices && conns[fd]; i++) {
             const struct oc_sum_notice_row *sn = &r->sum_notices[i];
@@ -8043,6 +8082,28 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         if (oc_encode_error(&w, OC_PROTOCOL_VERSION, &e) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
+    case OC_RES_PROFILE_FIELDS: {
+        /* The definitions changed: to everyone, whose editors and cards follow
+         * them (ch_fanout); otherwise to the asker. */
+        oc_profile_field pf[OC_MAX_PROFILE_FIELDS];
+        uint8_t n = 0;
+        for (size_t i = 0; i < r->n_pfd && n < OC_MAX_PROFILE_FIELDS; i++, n++) {
+            pf[n].field_id = r->pfd[i].id;
+            pf[n].kind     = r->pfd[i].kind;
+            pf[n].position = r->pfd[i].position;
+            pf[n].label    = oc_slice_str(r->pfd[i].label);
+        }
+        oc_profile_fields fl = { n, pf };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_profile_fields(&w, OC_PROTOCOL_VERSION, &fl) != OC_OK) break;
+        if (r->ch_fanout) {
+            send_to_all_authed(ep, conns, g_enc, w.len);
+        } else {
+            conn *c = find_by_id(conns, r->conn_id);
+            if (c) send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        break;
+    }
     case OC_RES_EMOJI_LIST: {
         /* To the asker, and — when the catalogue CHANGED (ch_fanout) — to everyone
          * else too: an emoji nobody else's picker knows about is one they cannot use,
@@ -8110,6 +8171,11 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         pi.pronouns       = oc_slice_str(r->pf_pronouns ? r->pf_pronouns : "");
         pi.voice_id       = oc_slice_str(r->pf_voice_id ? r->pf_voice_id : "");
         pi.phone          = oc_slice_str(r->pf_phone ? r->pf_phone : "");
+        for (size_t i = 0; i < r->n_pfv && pi.n_fields < OC_MAX_PROFILE_FIELDS; i++) {
+            pi.fields[pi.n_fields].field_id = r->pfv[i].field_id;
+            pi.fields[pi.n_fields].value    = oc_slice_str(r->pfv[i].value);
+            pi.n_fields++;
+        }
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_profile_info(&w, OC_PROTOCOL_VERSION, &pi);
         if (r->pf_fanout) {

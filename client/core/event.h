@@ -351,8 +351,16 @@ enum {
      * `channel_id` is the DM's channel, `user_id` the other person, `pdm_kind`
      * what happened, `pdm_safety` the safety number, `pdm_reason` why it ended.
      * What is said in it comes as in any DM (OC_EV_MESSAGE and the rest). */
-    OC_EV_PDM
+    OC_EV_PDM,
+    /* PROFILE_FIELDS: the workspace's own profile fields, `pfs[0..n_pfs)`
+     * with `text` the label, in position order. */
+    OC_EV_PROFILE_FIELDS
 };
+
+/* A workspace profile field (OC_EV_PROFILE_FIELDS: `text` the label), or a
+ * person's value for one (OC_EV_PROFILE_INFO: `id` the field, `text` the value). */
+typedef struct { uint64_t id; uint8_t kind; uint16_t position;
+                 char text[OC_PROFILE_FIELD_VALUE_MAX + 1]; } oc_ev_pf;
 
 /* What OC_EV_PDM reports, in its pdm_kind. The DM's id is `channel_id`, the other
  * person `user_id`. */
@@ -490,6 +498,8 @@ typedef struct {
     uint8_t  err_kind;               /* ERROR: OC_CERR_* */
     uint16_t err_code;               /* ERROR: the daemon's OC_ERR_* it answers, 0 if none */
     int64_t  rank;                   /* SEARCH_RESULT: the row's relevance (protocol.h, oc_search) */
+    oc_ev_pf *pfs;                   /* heap; PROFILE_FIELDS, and PROFILE_INFO's values */
+    uint8_t   n_pfs;
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);
@@ -676,6 +686,12 @@ enum {
     OC_CMD_PDM_DECLINE,
     OC_CMD_PDM_CLOSE,
     OC_CMD_PDM_TRUST,      /* go on with the other device's changed key */
+    /* The workspace's own profile fields. SET_PROFILE_FIELD: message_id = the
+     * field (0 adds), op = OC_PROFILE_FIELD_SET/DELETE, scope = kind, uses =
+     * position, body = label. SET_PROFILE_FIELD_VALUE: message_id = the
+     * field, body = my value ("" clears it). */
+    OC_CMD_SET_PROFILE_FIELD,
+    OC_CMD_SET_PROFILE_FIELD_VALUE,
     OC_CMD_QUIT
 };
 
