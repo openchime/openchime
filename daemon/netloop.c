@@ -3813,6 +3813,17 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_OUT_OF_OFFICE) {
+            oc_set_out_of_office so;
+            if (oc_decode_set_out_of_office(&p, &so) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_OUT_OF_OFFICE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->ooo_start = so.start_ms; j->ooo_end = so.end_ms;
+            j->pf_name = slice_dup(so.message);
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_MUTE) {
             oc_set_mute sm;
             if (oc_decode_set_mute(&p, &sm) != OC_OK) return -1;
@@ -6298,6 +6309,9 @@ static size_t encode_user_list(const oc_dbres *r) {
         ents[i].pronouns = oc_slice_str(r->ulist[i].pronouns ? r->ulist[i].pronouns : "");
         ents[i].voice_id = oc_slice_str(r->ulist[i].voice_id ? r->ulist[i].voice_id : "");
         ents[i].flags = r->ulist[i].flags;
+        ents[i].ooo_start = r->ulist[i].ooo_start;
+        ents[i].ooo_end = r->ulist[i].ooo_end;
+        ents[i].ooo_message = oc_slice_str(r->ulist[i].ooo_message ? r->ulist[i].ooo_message : "");
     }
     oc_wbuf w;
     oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
@@ -8176,6 +8190,9 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             pi.fields[pi.n_fields].value    = oc_slice_str(r->pfv[i].value);
             pi.n_fields++;
         }
+        pi.ooo_start      = r->pf_ooo_start;
+        pi.ooo_end        = r->pf_ooo_end;
+        pi.ooo_message    = oc_slice_str(r->pf_ooo_message ? r->pf_ooo_message : "");
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_profile_info(&w, OC_PROTOCOL_VERSION, &pi);
         if (r->pf_fanout) {

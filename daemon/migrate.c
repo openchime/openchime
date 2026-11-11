@@ -1406,6 +1406,14 @@ static const char MIGRATION_0080[] =
     "  PRIMARY KEY (user_id, field_id)"
     ") WITHOUT ROWID;";
 
+static const char MIGRATION_0081[] =
+    /* Out of office: a span and a message, apart from the custom status. Stored
+     * as given; whether it is in force (start <= now < end) is decided by
+     * whoever reads it, so nothing has to fire when it ends. */
+    "ALTER TABLE users ADD COLUMN ooo_start_ms INTEGER NOT NULL DEFAULT 0;"
+    "ALTER TABLE users ADD COLUMN ooo_end_ms INTEGER NOT NULL DEFAULT 0;"
+    "ALTER TABLE users ADD COLUMN ooo_message TEXT NOT NULL DEFAULT '';";
+
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
      * author is doing, and the daemon records that as its own object beside the
@@ -1774,6 +1782,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 78, MIGRATION_0078 },
     { 79, MIGRATION_0079 },
     { 80, MIGRATION_0080 },
+    { 81, MIGRATION_0081 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

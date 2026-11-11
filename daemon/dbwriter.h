@@ -335,7 +335,11 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_SET_PROFILE_FIELD = 158, OC_JOB_SET_PROFILE_FIELD_VALUE = 159,
        /* Reminders come due (REQ-283), on the scheduled-message tick: each
         * fires once, answered as one OC_RES_REMINDER_DUE apiece. Write. */
-       OC_JOB_FIRE_REMINDERS = 160 };
+       OC_JOB_FIRE_REMINDERS = 160,
+       /* Out of office (REQ-122): ooo_start/ooo_end, pf_name the message; an
+        * end of 0 or past clears it. Answered PROFILE_INFO to the person's
+        * connections, with their roster row (ulist, `joined`) for everyone. */
+       OC_JOB_SET_OUT_OF_OFFICE = 240 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -681,6 +685,7 @@ typedef struct oc_job {
     /* SET_PROFILE_FIELD: OC_PROFILE_FIELD_SET/DELETE, the kind, the position. */
     uint8_t        pfd_op, pfd_kind;
     uint16_t       pfd_position;
+    uint64_t       ooo_start, ooo_end;   /* SET_OUT_OF_OFFICE */
 } oc_job;
 
 /* CALL_AUTH's question: a join (perhaps starting, with invitations) or an
@@ -1076,6 +1081,9 @@ typedef struct {
      * one for the same author, so the roster carries it like a name decoration. */
     char    *voice_id;      /* heap; may be "" */
     uint8_t  flags;         /* OC_USER_SYSTEM: the workspace's own sender */
+    /* Out of office (REQ-122), as stored: the reader decides whether it is in force. */
+    uint64_t ooo_start, ooo_end;
+    char    *ooo_message;   /* heap; may be "" */
 } oc_user_row;
 
 /* One message to replay on reconnect (rendered as a BROADCAST by the net thread),
@@ -1472,6 +1480,9 @@ typedef struct oc_dbres {
      * the pairing a reader relies on. */
     char                   *st_emoji, *st_text, *pf_title, *pf_tz;
     char                   *pf_full_name, *pf_pronouns, *pf_phone, *pf_voice_id;
+    /* Out of office (REQ-122), as stored. */
+    uint64_t                pf_ooo_start, pf_ooo_end;
+    char                   *pf_ooo_message;
     /* The profile was just changed by its owner (SET_PROFILE, SET_EMAIL): it
      * goes to every one of their connections, not only the one that saved it,
      * so their other devices show it too (REQ-240). */

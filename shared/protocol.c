@@ -1578,6 +1578,8 @@ const char *oc_error_text(uint16_t code) {
     case OC_ERR_DM_REFUSED:       return "you can't start a conversation with this person";
     case OC_ERR_INVALID_PROFILE_FIELD:
         return "a profile field needs a label and there can be 20; a value is at most 200 bytes, a link starting https://";
+    case OC_ERR_INVALID_OUT_OF_OFFICE:
+        return "out of office needs an end after its start, and a message of at most 280 bytes";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
@@ -2702,8 +2704,26 @@ oc_result oc_encode_user_list(oc_wbuf *w, uint16_t version, const oc_user_list *
         oc_w_str(w, m->entries[i].pronouns);
         oc_w_str(w, m->entries[i].voice_id);       /* REQ-292 */
         oc_w_u8(w, m->entries[i].flags);           /* OC_USER_SYSTEM */
+        oc_w_u64(w, m->entries[i].ooo_start);      /* REQ-122, as stored */
+        oc_w_u64(w, m->entries[i].ooo_end);
+        oc_w_str(w, m->entries[i].ooo_message);
     }
     return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_set_out_of_office(oc_wbuf *w, uint16_t version, const oc_set_out_of_office *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_OUT_OF_OFFICE);
+    oc_w_u64(w, m->start_ms);
+    oc_w_u64(w, m->end_ms);
+    oc_w_str(w, m->message);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_out_of_office(oc_rbuf *p, oc_set_out_of_office *m) {
+    m->start_ms = oc_r_u64(p);
+    m->end_ms   = oc_r_u64(p);
+    m->message  = oc_r_str(p);
+    return r_done(p);
 }
 
 oc_result oc_encode_set_role(oc_wbuf *w, uint16_t version, const oc_set_role *m) {
@@ -3939,7 +3959,13 @@ oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries,
         oc_slice prn = oc_r_str(p);
         oc_slice voice = oc_r_str(p);
         uint8_t flags = oc_r_u8(p);
+        uint64_t ooo_start = oc_r_u64(p);
+        uint64_t ooo_end = oc_r_u64(p);
+        oc_slice ooo_msg = oc_r_str(p);
         if (i < cap) {
+            entries[i].ooo_start = ooo_start;
+            entries[i].ooo_end = ooo_end;
+            entries[i].ooo_message = ooo_msg;
             entries[i].user_id = uid;
             entries[i].role = role;
             entries[i].disabled = disabled;
@@ -4337,6 +4363,9 @@ oc_result oc_encode_profile_info(oc_wbuf *w, uint16_t version, const oc_profile_
         oc_w_u64(w, m->fields[i].field_id);
         oc_w_str(w, m->fields[i].value);
     }
+    oc_w_u64(w, m->ooo_start);
+    oc_w_u64(w, m->ooo_end);
+    oc_w_str(w, m->ooo_message);
     return oc_frame_end(w, off);
 }
 
@@ -4421,6 +4450,9 @@ oc_result oc_decode_profile_info(oc_rbuf *p, oc_profile_info *m) {
         m->fields[i].field_id = oc_r_u64(p);
         m->fields[i].value    = oc_r_str(p);
     }
+    m->ooo_start      = oc_r_u64(p);
+    m->ooo_end        = oc_r_u64(p);
+    m->ooo_message    = oc_r_str(p);
     return r_done(p);
 }
 

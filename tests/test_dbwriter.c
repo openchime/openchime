@@ -2454,7 +2454,10 @@ static void test_index_mentions(void) {
                            "DROP TABLE blocks; DROP TABLE withheld_messages;"
                            "ALTER TABLE users DROP COLUMN dm_privacy;"
                            /* 0080's profile fields. */
-                           "DROP TABLE profile_field_values; DROP TABLE profile_fields;",
+                           "DROP TABLE profile_field_values; DROP TABLE profile_fields;"
+                           /* 0081's out of office. */
+                           "ALTER TABLE users DROP COLUMN ooo_start_ms; ALTER TABLE users DROP COLUMN ooo_end_ms;"
+                           "ALTER TABLE users DROP COLUMN ooo_message;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -7001,6 +7004,106 @@ static void test_profile_fields(void) {
         free(tok);
         CHECK(r && r->type == OC_RES_AUTH_OK && r->user_id == bob && r->n_pfd == OC_MAX_PROFILE_FIELDS);
         CHECK(r && r->n_pfd && r->pfd[0].id == home);
+        oc_dbres_free(r);
+    }
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* Out of office (REQ-122): stored as given and served as stored, in both
+ * PROFILE_INFO and the roster; the setter's devices told, and everyone given
+ * their row; an end of 0 or past clears it; nonsense refused. */
+static oc_dbres *ooo_set(oc_dbwriter *w, uint64_t uid, uint64_t start, uint64_t end, const char *msg) {
+    oc_job *j = oc_job_new(OC_JOB_SET_OUT_OF_OFFICE, 90);
+    j->user_id = uid; j->ooo_start = start; j->ooo_end = end;
+    j->pf_name = strdup(msg);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_out_of_office(void) {
+    const char *path = tdb("ooo.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "oo-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "oo-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+    uint64_t now = (uint64_t)time(NULL) * 1000u;
+    uint64_t start = now + 3600000u, end = now + 7u * 86400000u;   /* starting in an hour */
+
+    oc_dbres *r = ooo_set(w, bob, start, end, "Back Monday");
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && r->user_id == bob && r->pf_fanout == 1);
+    CHECK(r && r->pf_ooo_start == start && r->pf_ooo_end == end && r->pf_ooo_message &&
+          strcmp(r->pf_ooo_message, "Back Monday") == 0);
+    /* And the row everyone is told: one, his, the same values. */
+    CHECK(r && r->joined && r->n_ulist == 1 && r->ulist[0].user_id == bob);
+    CHECK(r && r->n_ulist == 1 && r->ulist[0].ooo_start == start && r->ulist[0].ooo_end == end &&
+          strcmp(r->ulist[0].ooo_message, "Back Monday") == 0);
+    oc_dbres_free(r);
+
+    /* The roster carries it for everyone, as stored (not yet in force). */
+    {
+        oc_job *j = oc_job_new(OC_JOB_LIST_USERS, 91);
+        j->user_id = alice;
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_USER_LIST);
+        int saw = 0;
+        for (size_t i = 0; r && i < r->n_ulist; i++)
+            if (r->ulist[i].user_id == bob) {
+                saw = 1;
+                CHECK(r->ulist[i].ooo_start == start && r->ulist[i].ooo_end == end);
+            } else {
+                CHECK(r->ulist[i].ooo_end == 0 && r->ulist[i].ooo_message[0] == '\0');
+            }
+        CHECK(saw);
+        oc_dbres_free(r);
+    }
+    /* So does his card, to anyone. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_GET_PROFILE, 92);
+        j->user_id = alice; j->message_id = bob;
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_PROFILE_INFO && r->pf_ooo_end == end &&
+              r->pf_ooo_message && strcmp(r->pf_ooo_message, "Back Monday") == 0);
+        oc_dbres_free(r);
+    }
+
+    /* Nonsense is refused, and leaves it as it was. */
+    r = ooo_set(w, bob, end, start, "backwards");
+    CHECK(r && r->type == OC_RES_PROFILE_ERR && r->err_code == OC_ERR_INVALID_OUT_OF_OFFICE);
+    oc_dbres_free(r);
+    char longm[OC_OOO_MESSAGE_MAX + 2];
+    memset(longm, 'm', sizeof longm - 1); longm[sizeof longm - 1] = '\0';
+    r = ooo_set(w, bob, start, end, longm);
+    CHECK(r && r->err_code == OC_ERR_INVALID_OUT_OF_OFFICE);
+    oc_dbres_free(r);
+    CHECK(rm_count(path, "SELECT ooo_end_ms FROM users WHERE id=?1;", bob) == (int64_t)end);
+
+    /* An end already past clears it, message and all; so does 0. */
+    r = ooo_set(w, bob, now - 7200000u, now - 3600000u, "gone");
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && r->pf_ooo_end == 0 && r->pf_ooo_start == 0 &&
+          r->pf_ooo_message && r->pf_ooo_message[0] == '\0');
+    CHECK(r && r->n_ulist == 1 && r->ulist[0].ooo_end == 0);
+    oc_dbres_free(r);
+    r = ooo_set(w, bob, start, end, "");
+    oc_dbres_free(r);
+    r = ooo_set(w, bob, 0, 0, "");
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && r->pf_ooo_end == 0);
+    oc_dbres_free(r);
+    CHECK(rm_count(path, "SELECT ooo_end_ms FROM users WHERE id=?1;", bob) == 0);
+
+    /* The custom status is its own and untouched by any of it. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_SET_STATUS, 93);
+        j->user_id = bob; j->ch_name = strdup("In a meeting");
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+        r = ooo_set(w, bob, start, end, "Away");
+        CHECK(r && r->st_text && strcmp(r->st_text, "In a meeting") == 0 && r->pf_ooo_end == end);
         oc_dbres_free(r);
     }
 
@@ -12054,6 +12157,7 @@ int run_dbwriter_tests(void) {
     test_remove_keeps_history();
     test_blocks();
     test_profile_fields();
+    test_out_of_office();
     test_reset_credential();
     test_enable_user();
     test_session_policy();

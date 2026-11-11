@@ -1,7 +1,7 @@
 # OpenChime — Database Schema
 
 The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
-ARCH-27 (§1); the daemon applies migrations 0001–0080 (`daemon/migrate.c`,
+ARCH-27 (§1); the daemon applies migrations 0001–0081 (`daemon/migrate.c`,
 `OC_MIGRATIONS`), in order, and new tables/columns arrive as later numbered
 migrations, never as edits to an existing one. 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
@@ -36,7 +36,7 @@ credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
 **0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
-(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets; **0079** (§3br) blocks and DM privacy; **0080** (§3bs) profile fields.
+(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets; **0079** (§3br) blocks and DM privacy; **0080** (§3bs) profile fields; **0081** (§3bt) out of office.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -2098,3 +2098,18 @@ value starting `https://`, an empty value deleting the row. Deleting a field
 deletes its values in the same transaction. *Read* by `PROFILE_FIELDS`, sent
 after sign-in and on every change, and by `PROFILE_INFO`, which carries a
 person's values.
+
+## 3bt. Migration 0081 — out of office
+
+```sql
+ALTER TABLE users ADD COLUMN ooo_start_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN ooo_end_ms   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN ooo_message  TEXT    NOT NULL DEFAULT '';
+```
+
+A person's absence (REQ-122), apart from the custom status (`status_*`),
+which shows beside it. *Written* by `SET_OUT_OF_OFFICE` (PROTOCOL.md §5.20): an
+end of 0 or already past writes all three back to their defaults. *Read* by
+`USER_LIST` and `PROFILE_INFO`, which carry the stored values; whether it is in
+force (`ooo_start_ms` ≤ now < `ooo_end_ms`) is the reader's question, so nothing
+runs when it ends.

@@ -1366,6 +1366,81 @@ static void test_group_dm_title(void) {
     oc_model_free(&m);
 }
 
+/* Out of office (REQ-122): in force from its start to just before its end,
+ * decided from the times, so it ends with nothing sent; and the composer's
+ * notice names the other person of a DM, or someone mentioned, while it holds. */
+static void ooo_user(oc_model *m, uint64_t uid, const char *name, uint64_t start, uint64_t end, const char *msg) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = uid; e.body = strdup(name);
+    e.ooo_start = start; e.ooo_end = end;
+    snprintf(e.ooo_message, sizeof e.ooo_message, "%s", msg);
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+static void test_out_of_office(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    ooo_user(&m, 1, "alice", 1000, 9000, "me, away");
+    ooo_user(&m, 2, "bob", 1000, 5000, "Back Monday");
+    ooo_user(&m, 3, "carol", 0, 0, "");
+
+    /* The boundaries: start counts, end does not. */
+    CHECK(oc_model_ooo_active(&m, 2, 999) == NULL);
+    CHECK(oc_model_ooo_active(&m, 2, 1000) != NULL);
+    CHECK(oc_model_ooo_active(&m, 2, 4999) != NULL);
+    CHECK(oc_model_ooo_active(&m, 2, 5000) == NULL);
+    CHECK(oc_model_ooo_active(&m, 3, 2000) == NULL);   /* none set */
+    CHECK(oc_model_ooo_active(&m, 99, 2000) == NULL);  /* nobody */
+    {
+        const oc_member *b = oc_model_ooo_active(&m, 2, 2000);
+        CHECK(b && strcmp(b->ooo_message, "Back Monday") == 0);
+        char lbl[96];
+        oc_model_ooo_label(b, lbl, sizeof lbl);
+        /* contract: the plan's own words, which both frontends show and cut at "until " */
+        CHECK(strncmp(lbl, "Out of office until ", 20) == 0);
+    }
+
+    /* A DM with bob, a DM with carol, and a channel. */
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 30; e.status = 1; e.op = OC_CHANNEL_KIND_DM; e.user_id = 2;
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 31; e.status = 1; e.op = OC_CHANNEL_KIND_DM; e.user_id = 3;
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 32; e.status = 1; e.op = OC_CHANNEL_KIND; e.is_public = 1;
+    e.body = strdup("general");
+    oc_model_apply(&m, &e);
+    free(e.body);
+
+    /* Writing to bob in your DM: said while he is away, not after. */
+    const oc_member *u = oc_model_ooo_for_compose(&m, 30, "", 2000);
+    CHECK(u && u->user_id == 2);
+    CHECK(oc_model_ooo_for_compose(&m, 30, "", 5000) == NULL);
+    /* Carol is in; a channel with no mention says nothing. */
+    CHECK(oc_model_ooo_for_compose(&m, 31, "hello", 2000) == NULL);
+    CHECK(oc_model_ooo_for_compose(&m, 32, "hello all", 2000) == NULL);
+    /* Mentioning bob, by name in any case or by id, anywhere. */
+    u = oc_model_ooo_for_compose(&m, 32, "can @Bob look at this", 2000);
+    CHECK(u && u->user_id == 2);
+    u = oc_model_ooo_for_compose(&m, 31, "ask <@U2> about it", 2000);
+    CHECK(u && u->user_id == 2);
+    /* Not a broadcast, not someone in, and never me. */
+    CHECK(oc_model_ooo_for_compose(&m, 32, "@here @carol", 2000) == NULL);
+    CHECK(oc_model_ooo_for_compose(&m, 32, "@alice note to self", 2000) == NULL);
+    /* An address is not a mention. */
+    CHECK(oc_model_ooo_for_compose(&m, 32, "mail bob@example.com", 2000) == NULL);
+
+    /* Cleared by a later row with no end. */
+    ooo_user(&m, 2, "bob", 0, 0, "");
+    CHECK(oc_model_ooo_active(&m, 2, 2000) == NULL);
+    CHECK(oc_model_ooo_for_compose(&m, 30, "", 2000) == NULL);
+    oc_model_free(&m);
+}
+
 /* A channel that appears AFTER the settings sync starts at the user's global
  * default (REQ-134), not at whatever zeroed memory means.
  *
@@ -7571,6 +7646,7 @@ int run_client_core_tests(void) {
     test_big_channel_list();
     test_published_fingerprint();
     test_cert_trust();
+    test_out_of_office();
     test_local_browser();
     test_device_client();
     oc_test_rmtree(g_dir);

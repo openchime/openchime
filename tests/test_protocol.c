@@ -1239,12 +1239,14 @@ static void test_admin_frames(void) {
             { 1, OC_ROLE_OWNER,  0, oc_slice_str("a@x.io"), oc_slice_str("Alice"), 9,
               oc_slice_str("Principal Engineer"), oc_slice_str("America/New_York"),
               oc_slice_str("\xf0\x9f\x8c\xb4"), oc_slice_str("On holiday"),
-              oc_slice_str("Alice Liddell"), oc_slice_str("she/her"), oc_slice_str("expr-voice-2-f"), 0 },
+              oc_slice_str("Alice Liddell"), oc_slice_str("she/her"), oc_slice_str("expr-voice-2-f"), 0,
+              1000, 2000, oc_slice_str("Back on the 3rd") },
             /* Every string empty, which is the common case and the one where an
              * off-by-one in the stride is easiest to miss. */
             { 2, OC_ROLE_MEMBER, 0, oc_slice_str(""), oc_slice_str("Bob"), 0,
               oc_slice_str(""), oc_slice_str(""), oc_slice_str(""), oc_slice_str(""),
-              oc_slice_str(""), oc_slice_str(""), oc_slice_str(""), OC_USER_SYSTEM },
+              oc_slice_str(""), oc_slice_str(""), oc_slice_str(""), OC_USER_SYSTEM,
+              0, 0, oc_slice_str("") },
         };
         oc_user_list in = { 2, ents };
         ROUNDTRIP(oc_encode_user_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_USER_LIST, h, p);
@@ -1259,6 +1261,9 @@ static void test_admin_frames(void) {
         CHECK(out[1].full_name.len == 0 && out[1].pronouns.len == 0 && out[1].voice_id.len == 0);
         /* The workspace's own sender is marked, on the entry after the first. */
         CHECK(out[0].flags == 0 && out[1].flags == OC_USER_SYSTEM);
+        /* Out of office, appended in protocol 41, read back on both entries. */
+        CHECK(out[0].ooo_start == 1000 && out[0].ooo_end == 2000 && slice_eq_str(out[0].ooo_message, "Back on the 3rd"));
+        CHECK(out[1].ooo_start == 0 && out[1].ooo_end == 0 && out[1].ooo_message.len == 0);
     }
     {
         /* READ_RECEIPTS (REQ-090): set, ask, and nothing past ask. */
@@ -1319,9 +1324,13 @@ static void test_admin_frames(void) {
         in.pronouns = oc_slice_str("she/her");
         in.phone = oc_slice_str("+1 555 0100");
         in.voice_id = oc_slice_str("expr-voice-5-f");
+        in.ooo_start = 1700000000000ull; in.ooo_end = 1700600000000ull;
+        in.ooo_message = oc_slice_str("Back Monday");
         ROUNDTRIP(oc_encode_profile_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PROFILE_INFO, h, p);
         oc_profile_info out;
         CHECK(oc_decode_profile_info(&p, &out) == OC_OK);
+        CHECK(out.ooo_start == 1700000000000ull && out.ooo_end == 1700600000000ull &&
+              slice_eq_str(out.ooo_message, "Back Monday"));
         CHECK(out.user_id == 4 && out.avatar_id == 11 && out.role == OC_ROLE_ADMIN);
         CHECK(slice_eq_str(out.full_name, "Alice Liddell"));
         CHECK(slice_eq_str(out.pronouns, "she/her"));
@@ -3007,6 +3016,23 @@ static void test_profile_field_frames(void) {
     }
 }
 
+/* Out of office (REQ-122). */
+static void test_out_of_office_frames(void) {
+    {
+        oc_set_out_of_office in = { 1000, 2000, oc_slice_str("Back on the 3rd") };
+        ROUNDTRIP(oc_encode_set_out_of_office(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_OUT_OF_OFFICE, h, p);
+        oc_set_out_of_office out;
+        CHECK(oc_decode_set_out_of_office(&p, &out) == OC_OK);
+        CHECK(out.start_ms == 1000 && out.end_ms == 2000 && slice_eq_str(out.message, "Back on the 3rd"));
+    }
+    {
+        oc_set_out_of_office in = { 0, 0, oc_slice_str("") };   /* the clear */
+        ROUNDTRIP(oc_encode_set_out_of_office(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_OUT_OF_OFFICE, h, p);
+        oc_set_out_of_office out;
+        CHECK(oc_decode_set_out_of_office(&p, &out) == OC_OK && out.end_ms == 0 && out.message.len == 0);
+    }
+}
+
 static void test_reason_codes_unique(void) {
     static const struct { const char *name; int code; } codes[] = {
         { "MALFORMED_FRAME",        OC_ERR_MALFORMED_FRAME },
@@ -3043,6 +3069,7 @@ static void test_reason_codes_unique(void) {
         { "INVALID_MESSAGE",        OC_ERR_INVALID_MESSAGE },
         { "DM_REFUSED",             OC_ERR_DM_REFUSED },
         { "INVALID_PROFILE_FIELD",  OC_ERR_INVALID_PROFILE_FIELD },
+        { "INVALID_OUT_OF_OFFICE",  OC_ERR_INVALID_OUT_OF_OFFICE },
         { "INTERNAL",               OC_ERR_INTERNAL },
     };
     const size_t n = sizeof codes / sizeof codes[0];
@@ -3122,6 +3149,7 @@ int run_protocol_tests(void) {
     test_call_frames();
     test_block_frames();
     test_profile_field_frames();
+    test_out_of_office_frames();
     test_backfill_and_error();
     test_size_limits();
     test_malformed();

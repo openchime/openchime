@@ -500,6 +500,9 @@ typedef struct {
     int64_t  rank;                   /* SEARCH_RESULT: the row's relevance (protocol.h, oc_search) */
     oc_ev_pf *pfs;                   /* heap; PROFILE_FIELDS, and PROFILE_INFO's values */
     uint8_t   n_pfs;
+    /* USER and PROFILE_INFO: out of office (REQ-122), as stored. */
+    uint64_t ooo_start, ooo_end;
+    char     ooo_message[OC_OOO_MESSAGE_MAX + 1];
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);
@@ -692,6 +695,9 @@ enum {
      * field, body = my value ("" clears it). */
     OC_CMD_SET_PROFILE_FIELD,
     OC_CMD_SET_PROFILE_FIELD_VALUE,
+    /* Out of office (REQ-122): start_ms/end_ms, body = the message; an end of
+     * 0 clears it. */
+    OC_CMD_SET_OUT_OF_OFFICE,
     OC_CMD_QUIT
 };
 

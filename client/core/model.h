@@ -302,6 +302,10 @@ typedef struct {
      * the person who opened the card, not every roster fan-out. Empty until a
      * card is fetched, which is what "not on the roster" means here. */
     char     phone[40];
+    /* Out of office (REQ-122), as stored: in force while start <= now < end
+     * (oc_model_ooo_active), so it goes at its end with nothing sent. */
+    uint64_t ooo_start, ooo_end;
+    char     ooo_message[OC_OOO_MESSAGE_MAX + 1];
 } oc_member;
 
 /* A workspace's own profile field, and one person's value for one. */
@@ -1380,6 +1384,18 @@ int oc_model_is_workspace_sender(const oc_model *m, uint64_t user_id);
 /* `user_id`'s value for the workspace profile field `field_id`, as their last
  * PROFILE_INFO carried it; "" when they gave none or no card has been fetched. */
 const char *oc_model_profile_value(const oc_model *m, uint64_t user_id, uint64_t field_id);
+/* Is `user_id` out of office at `now_ms` (start <= now < end)? Their member
+ * row, or NULL when they are not. */
+const oc_member *oc_model_ooo_active(const oc_model *m, uint64_t user_id, uint64_t now_ms);
+/* Who a message being written in `channel_id` would reach that is out of office
+ * at `now_ms`: the other person of a DM, or anyone `draft` mentions by name or
+ * id (not @here and the like, and never me). The first such person, or NULL;
+ * a composer says so before sending. */
+const oc_member *oc_model_ooo_for_compose(const oc_model *m, uint64_t channel_id,
+                                          const char *draft, uint64_t now_ms);
+/* "Out of office until <date>" for `mem`, the date in the reader's local
+ * time ("until 3 Dec"; with the year when it is not this one). */
+void oc_model_ooo_label(const oc_member *mem, char *out, size_t cap);
 /* 1 when the user has been removed from the workspace (REQ-033): shown as
  * deactivated, their avatar dimmed. */
 int         oc_model_user_disabled(const oc_model *m, uint64_t user_id);

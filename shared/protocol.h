@@ -215,8 +215,12 @@
  * 40: PROFILE_INFO carries the person's values for the workspace's own profile
  * fields: a count (u8) and that many { field_id (u64), value (str) }. Fields
  * appended to a fixed layout. SET_PROFILE_FIELD, PROFILE_FIELDS and
- * SET_PROFILE_FIELD_VALUE (0x0137-0x0139) are new. */
-#define OC_PROTOCOL_VERSION 40u
+ * SET_PROFILE_FIELD_VALUE (0x0137-0x0139) are new.
+ *
+ * 41: out of office (REQ-122). Each USER_LIST entry and PROFILE_INFO (after its field list) carry
+ * `ooo_start` (u64), `ooo_end` (u64) and `ooo_message` (str): fields appended to
+ * a repeated entry and to a fixed layout. SET_OUT_OF_OFFICE (0x013A) is new. */
+#define OC_PROTOCOL_VERSION 41u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -638,6 +642,7 @@ typedef enum {
     OC_MSG_SET_PROFILE_FIELD    = 0x0137, /* C->S, owner/admin: add, rename or delete one of the workspace's profile fields */
     OC_MSG_PROFILE_FIELDS       = 0x0138, /* S->C, the workspace's profile fields: at sign-in, and to everyone on a change */
     OC_MSG_SET_PROFILE_FIELD_VALUE = 0x0139, /* C->S, my value for one profile field; empty clears it */
+    OC_MSG_SET_OUT_OF_OFFICE    = 0x013A, /* C->S, my out-of-office span and message; an end of 0 or past clears it */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -746,6 +751,7 @@ typedef enum {
                                         * root into a thread, into a thread elsewhere, or to where it already is */
     OC_ERR_DM_REFUSED          = 3070, /* a new direct conversation this person does not take: never says why */
     OC_ERR_INVALID_PROFILE_FIELD = 3071, /* a profile field without a label, past the cap, or a value too long or not a link */
+    OC_ERR_INVALID_OUT_OF_OFFICE = 3072, /* an out-of-office ending before it starts, or its message too long */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -1493,7 +1499,14 @@ typedef struct { uint64_t user_id; oc_slice display_name; oc_slice email;
                  oc_slice phone; oc_slice voice_id;
                  /* As of protocol 40: the person's values for the workspace's
                   * profile fields, those they filled. */
-                 uint8_t n_fields; oc_profile_field_value fields[OC_MAX_PROFILE_FIELDS]; } oc_profile_info;
+                 uint8_t n_fields; oc_profile_field_value fields[OC_MAX_PROFILE_FIELDS];
+                 /* As of protocol 41: out of office, as on USER_LIST. */
+                 uint64_t ooo_start, ooo_end; oc_slice ooo_message; } oc_profile_info;
+/* Out of office (REQ-122): apart from the custom status, which shows beside
+ * it. `end_ms` 0, or a time already past, clears it; a message is at most
+ * OC_OOO_MESSAGE_MAX bytes. */
+#define OC_OOO_MESSAGE_MAX 280u
+typedef struct { uint64_t start_ms, end_ms; oc_slice message; } oc_set_out_of_office;
 /* Counts, not rows: the column shows "#design 12", so the wire carries
  * exactly that and nothing more. */
 /* REQ-182. `current` marks the connection asking — you should be able to tell which
@@ -1884,7 +1897,10 @@ typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice emai
                  oc_slice voice_id;
                  /* OC_USER_SYSTEM: the workspace's own sender, which posts
                   * what the workspace says (its welcome); not a person. */
-                 uint8_t flags; } oc_user_list_entry;
+                 uint8_t flags;
+                 /* As of protocol 41: out of office, as stored. In force while
+                  * start <= now < end; the reader decides. */
+                 uint64_t ooo_start, ooo_end; oc_slice ooo_message; } oc_user_list_entry;
 #define OC_USER_SYSTEM 0x01u
 typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
 typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;
@@ -2075,6 +2091,8 @@ oc_result oc_encode_profile_fields(oc_wbuf *w, uint16_t version, const oc_profil
 oc_result oc_decode_profile_fields(oc_rbuf *p, oc_profile_field *out, uint8_t *out_n);
 oc_result oc_encode_set_profile_field_value(oc_wbuf *w, uint16_t version, const oc_profile_field_value *m);
 oc_result oc_decode_set_profile_field_value(oc_rbuf *p, oc_profile_field_value *m);
+oc_result oc_encode_set_out_of_office(oc_wbuf *w, uint16_t version, const oc_set_out_of_office *m);
+oc_result oc_decode_set_out_of_office(oc_rbuf *p, oc_set_out_of_office *m);
 oc_result oc_encode_collapsed_updated(oc_wbuf *w, uint16_t version, const oc_set_collapsed *m);
 oc_result oc_encode_list_activity(oc_wbuf *w, uint16_t version, uint8_t filter);
 oc_result oc_decode_list_activity(oc_rbuf *p, uint8_t *filter);

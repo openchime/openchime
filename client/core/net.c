@@ -1241,6 +1241,10 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->pf_voice[n2] = '\0';
                 }
                 e->user_system = (ue[i].flags & OC_USER_SYSTEM) != 0;
+                e->ooo_start = ue[i].ooo_start;
+                e->ooo_end = ue[i].ooo_end;
+                snprintf(e->ooo_message, sizeof e->ooo_message, "%.*s",
+                         (int)ue[i].ooo_message.len, (const char *)ue[i].ooo_message.ptr);
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_PRESENCE_UPDATE) {
@@ -2567,6 +2571,10 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     }
                     e->n_pfs = pi.n_fields;
                 }
+                e->ooo_start = pi.ooo_start;
+                e->ooo_end = pi.ooo_end;
+                snprintf(e->ooo_message, sizeof e->ooo_message, "%.*s",
+                         (int)pi.ooo_message.len, (const char *)pi.ooo_message.ptr);
                 oc_queue_push(to_ui, e);
             }
             /* My whole profile, asked for so one field can change: sent back
@@ -4093,6 +4101,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_profile_field_value fv = { c->message_id, oc_slice_str(c->body ? c->body : "") };
                 if (oc_encode_set_profile_field_value(&w, OC_PROTOCOL_VERSION, &fv) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_OUT_OF_OFFICE) {
+                uint8_t buf[OC_OOO_MESSAGE_MAX + 64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_out_of_office so = { c->start_ms, c->end_ms, oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_set_out_of_office(&w, OC_PROTOCOL_VERSION, &so) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_ENABLE_USER) {

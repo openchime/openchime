@@ -803,8 +803,13 @@ static void build_roster_rows(rows_t *r, const oc_model *m, int width) {
                                                    : "\xe2\x97\x8b";   /* ○ */
         const char *role = u->role == OC_ROLE_OWNER ? "  (owner)"
                          : u->role == OC_ROLE_ADMIN ? "  (admin)" : "";
-        snprintf(line, sizeof line, "%s %s%s%s", dot, u->name[0] ? u->name : "?",
-                 role, u->disabled ? "  (deactivated)" : "");
+        char oo[100] = "";
+        if (oc_model_ooo_active(m, u->user_id, (uint64_t)time(NULL) * 1000u)) {
+            char ol[96]; oc_model_ooo_label(u, ol, sizeof ol);
+            snprintf(oo, sizeof oo, "  (%s)", ol);
+        }
+        snprintf(line, sizeof line, "%s %s%s%s%s", dot, u->name[0] ? u->name : "?",
+                 role, u->disabled ? "  (deactivated)" : "", oo);
         uintattr_t col = pr == OC_PRESENCE_ONLINE ? TB_GREEN
                        : pr == OC_PRESENCE_AWAY   ? TB_YELLOW : TB_DEFAULT;
         char *rr = malloc(strlen(line) + 1);
@@ -1142,6 +1147,24 @@ static void draw_help(int W, int H) {
     }
 }
 
+/* "2026-12-15 Back on Monday": that day's local midnight in ms, `*rest` the
+ * words after it; 0 when it does not start with a day. */
+static uint64_t ooo_day_ms(const char *v, const char **rest) {
+    int y = 0, mo = 0, d = 0, used = 0;
+    if (sscanf(v, "%d-%d-%d%n", &y, &mo, &d, &used) != 3) return 0;
+    if (y < 2000 || y > 2200 || mo < 1 || mo > 12 || d < 1 || d > 31) return 0;
+    if (v[used] && v[used] != ' ') return 0;
+    struct tm tm;
+    memset(&tm, 0, sizeof tm);
+    tm.tm_year = y - 1900; tm.tm_mon = mo - 1; tm.tm_mday = d; tm.tm_isdst = -1;
+    time_t t = mktime(&tm);
+    if (t == (time_t)-1 || tm.tm_mday != d) return 0;
+    const char *r = v + used;
+    while (*r == ' ') r++;
+    *rest = r;
+    return (uint64_t)t * 1000u;
+}
+
 /* The key that edits the workspace field at `i` on one's own profile: 1-9,
  * then a-k; and back. */
 static int pf_key(int i) { return i < 9 ? '1' + i : 'a' + (i - 9); }
@@ -1168,7 +1191,7 @@ static void draw_profile(const oc_model *m, uint64_t uid, int W, int H) {
     const tk_theme *th = tk_theme_active();
     char idbuf[32];
     snprintf(idbuf, sizeof idbuf, "%llu", (unsigned long long)uid);
-    struct { const char *label, *value; } R[4 + 2 + OC_MAX_PROFILE_FIELDS];
+    struct { const char *label, *value; } R[4 + 2 + 2 + OC_MAX_PROFILE_FIELDS];
     static char lbl[OC_MAX_PROFILE_FIELDS][OC_PROFILE_FIELD_LABEL_MAX + 8];
     int n = 0;
     R[n].label = "Name";     R[n++].value = me[0] ? me : "(unknown)";
@@ -1177,6 +1200,14 @@ static void draw_profile(const oc_model *m, uint64_t uid, int W, int H) {
     R[n].label = "Presence"; R[n++].value = pn;
     if (pm && pm->title[0])    { R[n].label = "Title";    R[n++].value = pm->title; }
     if (pm && pm->pronouns[0]) { R[n].label = "Pronouns"; R[n++].value = pm->pronouns; }
+    /* Out of office (REQ-122), while it is in force, and its message. */
+    char oo[96];
+    const oc_member *om = oc_model_ooo_active(m, uid, (uint64_t)time(NULL) * 1000u);
+    if (om) {
+        oc_model_ooo_label(om, oo, sizeof oo);
+        R[n].label = "Away"; R[n++].value = oo;
+        if (om->ooo_message[0]) { R[n].label = "Message"; R[n++].value = om->ooo_message; }
+    }
     /* The workspace's fields, in its order; on your own, each with the key
      * that fills it in. A link is its address, as the reader sees it. */
     for (uint8_t k = 0; k < m->n_pfields; k++) {
@@ -1188,8 +1219,8 @@ static void draw_profile(const oc_model *m, uint64_t uid, int W, int H) {
         R[n++].value = v[0] ? v : "-";
     }
     const char *hint = !self ? "Esc closes."
-                     : m->n_pfields ? "A key above fills in that field. Name and password: the action menu (Ctrl+K)."
-                                    : "Change your name or password from the action menu (Ctrl+K).";
+                     : m->n_pfields ? "A key above fills in that field. Name, password and out of office: the action menu (Ctrl+K)."
+                                    : "Change your name, password or out of office from the action menu (Ctrl+K).";
 
     int labelw = 0, cw = tk_str_width(hint);
     for (int i = 0; i < n; i++) { int w = tk_str_width(R[i].label); if (w > labelw) labelw = w; }
@@ -1260,6 +1291,8 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_UNBLOCK0, ACT_UNBLOCK_LAST = ACT_UNBLOCK0 + 27,
        /* a member's profile, the workspace's own fields with it */
        ACT_PROFILE_OF,
+       /* out of office (REQ-122): set or clear */
+       ACT_OOO,
        ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
@@ -1432,6 +1465,7 @@ static const tk_pal_item g_launcher_items[] = {
     { "You",     "Change password",     NULL, NULL, ACT_PASSWD },
     { "You",     "Two-step sign-in",    NULL, NULL, ACT_SECURITY },
     { "You",     "Do not disturb",      NULL, NULL, ACT_DND },
+    { "You",     "Out of office",       NULL, NULL, ACT_OOO },
     { "You",     "Share my read receipts (on/off)", NULL, NULL, ACT_RECEIPTS },
     { "You",     "Your profile",        NULL, NULL, ACT_PROFILE },
     { "You",     "Read-aloud voice",    NULL, NULL, ACT_VOICES },
@@ -1876,7 +1910,11 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     else if (fc && fc->kind == OC_CHANNEL_KIND_DM) {
         /* An encrypted DM is the same title behind a lock. */
         const char *pn = oc_model_user_name(m, fc->peer_id);
-        snprintf(mt, sizeof mt, "%s@%s", fc->e2e ? "\xf0\x9f\x94\x92 " : "", pn[0] ? pn : "dm");
+        /* And until when they are out of office (REQ-122), where they are. */
+        char oo[96] = "";
+        const oc_member *om = oc_model_ooo_active(m, fc->peer_id, (uint64_t)time(NULL) * 1000u);
+        if (om) { char ol[96]; oc_model_ooo_label(om, ol, sizeof ol); snprintf(oo, sizeof oo, " \xc2\xb7 %s", ol); }
+        snprintf(mt, sizeof mt, "%s@%s%s", fc->e2e ? "\xf0\x9f\x94\x92 " : "", pn[0] ? pn : "dm", oo);
     } else if (fc && !fc->is_public)
         snprintf(mt, sizeof mt, "\xf0\x9f\x94\x92 %s", fc->name ? fc->name : "…");  /* 🔒 private */
     else if (fc)                 snprintf(mt, sizeof mt, "#%s", fc->name ? fc->name : "…");
@@ -1959,7 +1997,14 @@ static void render(oc_client *cl, size_t focus, const char *composer,
                            : u->disabled ? th->muted
                            : p == OC_PRESENCE_ONLINE ? th->presence_on : p == OC_PRESENCE_AWAY ? th->presence_away : th->fg;
             const char *role = u->role == OC_ROLE_OWNER ? " *" : u->role == OC_ROLE_ADMIN ? " +" : "";
-            char line[80]; snprintf(line, sizeof line, "%s %s%s", d, u->name[0] ? u->name : "?", role);
+            /* Out of office (REQ-122): "away until 3 Dec" after the name. */
+            char oo[64] = "";
+            if (oc_model_ooo_active(m, u->user_id, (uint64_t)time(NULL) * 1000u)) {
+                char ol[96]; oc_model_ooo_label(u, ol, sizeof ol);
+                const char *until = strstr(ol, "until ");
+                snprintf(oo, sizeof oo, " (away %s)", until ? until : "");
+            }
+            char line[160]; snprintf(line, sizeof line, "%s %s%s%s", d, u->name[0] ? u->name : "?", role, oo);
             if (sel) tk_fill((int)iy, mx + 1, mx + mem_w - 1, bg);
             tk_text(mx + 1, (int)iy, mx + mem_w - 1, line, col, bg);
         }
@@ -2015,6 +2060,20 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             oc_summary_notice_title(sn->status, sn->scope, sn->start_ms, sn->end_ms, where, t, sizeof t);
             snprintf(line, sizeof line, "   \xe2\x9c\xa6 %s \xc2\xb7 Ctrl+K to open", t);
             sx = tk_text(sx, H - 3, W, line, th->accent, TB_DEFAULT);
+        }
+        /* Before sending (REQ-122): the other person of this DM, or someone the
+         * text mentions, is out of office -- until when, and what they said. */
+        if (fc) {
+            const oc_member *ou = oc_model_ooo_for_compose(m, fc->channel_id, composer,
+                                                           (uint64_t)time(NULL) * 1000u);
+            if (ou) {
+                char ol[96], on[OC_OOO_MESSAGE_MAX + 200];
+                oc_model_ooo_label(ou, ol, sizeof ol);
+                const char *until = strstr(ol, "until ");
+                snprintf(on, sizeof on, "   %s is out of office %s%s%s", ou->name[0] ? ou->name : "they",
+                         until ? until : "", ou->ooo_message[0] ? ": " : "", ou->ooo_message);
+                sx = tk_text(sx, H - 3, W, on, TB_YELLOW, TB_DEFAULT);
+            }
         }
         if (fc) {
             /* Where this person is writing: the open thread, whose replies the
@@ -3552,12 +3611,13 @@ int main(int argc, char **argv) {
     /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
      * /nick with a discoverable text prompt. */
     enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_NICK, PROMPT_UPLOAD,
-           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE, PROMPT_DATE, PROMPT_MOVE, PROMPT_REMIND, PROMPT_PFVALUE };
+           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE, PROMPT_DATE, PROMPT_MOVE, PROMPT_REMIND, PROMPT_PFVALUE, PROMPT_OOO };
     /* A move into a private channel (REQ-053): y/N, naming who will no longer
      * see it, before it is sent. */
     uint64_t move_ask_mid = 0, move_ask_to = 0;
     char move_ask_text[400] = "";
     uint32_t reminder_seen = 0;               /* the model's reminder_seq, told (REQ-283) */
+    const char *ooo_err = NULL;               /* why the out-of-office prompt asks again */
     int await_invite = 0;   /* open the roster on the invitation once it is made */
     /* The invite prompt's explanation, which names the provider, and what was
      * wrong with the last answer ("" when nothing was). */
@@ -3778,6 +3838,12 @@ int main(int argc, char **argv) {
             if (invite_err[0]) tk_text(in.x, in.y + 1, in.x + in.w, invite_err, TB_RED | TB_BOLD, pth->bg);
             tk_text(in.x, in.y + 2, in.x + in.w, invite_note, pth->muted, pth->bg);
             tk_text(in.x, in.y + 3, in.x + in.w, invite_note2, pth->muted, pth->bg);
+        } else if (prompt_kind == PROMPT_OOO) {
+            /* The input, and what was wrong with the last answer. */
+            const tk_theme *pth = tk_theme_active();
+            tk_rect in = tk_modal_begin(tb_width(), tb_height(), 76, 4, prompt_title);
+            tk_input_draw(&prompt_input, (tk_rect){ in.x, in.y, in.w, 1 }, 1);
+            if (ooo_err) tk_text(in.x, in.y + 1, in.x + in.w, ooo_err, TB_RED | TB_BOLD, pth->bg);
         } else if (prompt_kind) {
             tk_rect in = tk_modal_begin(tb_width(), tb_height(), 46, 3, prompt_title);
             tk_input_draw(&prompt_input, (tk_rect){ in.x, in.y, in.w, 1 }, 1);
@@ -4087,6 +4153,23 @@ int main(int argc, char **argv) {
                     oc_client_set_profile_field_value(cl, prompt_pf, v);
                     profile_uid = 0; profile_open = 1;
                 }
+                else if (k == PROMPT_OOO) {
+                    /* "off" clears; otherwise the day back, from now until that
+                     * morning, and the rest is the message. Wrong: asked again. */
+                    uint64_t back = 0;
+                    const char *msg = "";
+                    if (strcmp(v, "off") == 0) oc_client_set_out_of_office(cl, 0, 0, "");
+                    else if ((back = ooo_day_ms(v, &msg)) == 0 ||
+                             back <= (uint64_t)time(NULL) * 1000u) {
+                        prompt_kind = PROMPT_OOO;
+                        ooo_err = "That is not a day still to come, as 2026-12-15.";
+                    } else if (strlen(msg) > OC_OOO_MESSAGE_MAX) {
+                        prompt_kind = PROMPT_OOO;
+                        ooo_err = "The message can be at most 280 bytes.";
+                    } else {
+                        oc_client_set_out_of_office(cl, (uint64_t)time(NULL) * 1000u, back, msg);
+                    }
+                }
                 else if (k == PROMPT_INVITE) {
                     /* An address where the workspace signs people in through a
                      * provider; blank for a token, where it has password accounts.
@@ -4168,6 +4251,12 @@ int main(int argc, char **argv) {
                 if      (id == ACT_NEWCHAN) { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
                 else if (id == ACT_NEWDM)   { dmp_open(&dmpick, oc_client_model(cl)); dmpick_open = 1; }
                 else if (e2e_act(cl, id, act_cid, &focus)) {}
+                else if (id == ACT_OOO) {
+                    ooo_err = NULL;
+                    prompt_kind = PROMPT_OOO;
+                    prompt_title = "Out of office: the day you are back (YYYY-MM-DD), then a message; 'off' clears";
+                    tk_input_init(&prompt_input, 0, "e.g. 2026-12-15 Back on Monday");
+                }
                 else if (id == ACT_SEARCH)  { prompt_kind = PROMPT_SEARCH; prompt_title = "Search messages"; tk_input_init(&prompt_input, 0, "query"); }
                 else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
                 else if (id == ACT_UPLOAD)  { prompt_kind = PROMPT_UPLOAD; prompt_title = "Upload a file"; tk_input_init(&prompt_input, 0, "path"); }

@@ -11554,6 +11554,19 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
         for (size_t i = 0; i < m->n_users; i++)
             if (m->users[i].user_id == g_profile_uid) { pm = &m->users[i]; break; }
         int any = 0;
+        /* Out of office (REQ-122): its end, then the message, above the status. */
+        if (pm && oc_model_ooo_active(m, pm->user_id, wall_ms())) {
+            char oo[96];
+            oc_model_ooo_label(pm, oo, sizeof oo);
+            draw_text(rt, oo, g_ui_b, rf(reg.left + 16, y + 4, reg.right - 16, y + 26), OC_COL_TEXT);
+            y += 26; any = 1;
+            if (pm->ooo_message[0]) {
+                float mh = text_height(pm->ooo_message, g_meta_w, reg.right - reg.left - 32);
+                draw_text(rt, pm->ooo_message, g_meta_w, rf(reg.left + 16, y + 2, reg.right - 16, y + 2 + mh),
+                          OC_COL_MUTED);
+                y += mh + 8;
+            }
+        }
         if (pm && pm->status_text[0]) {
             char st[128];
             snprintf(st, sizeof st, "%s%s%s", pm->status_emoji,
@@ -11962,6 +11975,18 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
     /* The topic sits on the header's second line, where Slack puts it — and it
      * yields to a typing indicator, which is transient and more urgent. */
     const char *topic = (c && c->topic && c->topic[0]) ? c->topic : NULL;
+    /* A DM with someone out of office (REQ-122) says so where the topic goes. */
+    char oo_sub[400];
+    if (c && c->kind == OC_CHANNEL_KIND_DM && c->peer_id && c->peer_id != m->user_id) {
+        const oc_member *om = oc_model_ooo_active(m, c->peer_id, wall_ms());
+        if (om) {
+            char ol[96];
+            oc_model_ooo_label(om, ol, sizeof ol);
+            snprintf(oo_sub, sizeof oo_sub, "%s%s%s", ol, om->ooo_message[0] ? " \xE2\x80\x94 " : "",
+                     om->ooo_message);
+            topic = oo_sub;
+        }
+    }
     if (c && c->archived) {
         char t2[200];
         snprintf(t2, sizeof t2, "%s  \u00B7  archived", title);
@@ -13747,11 +13772,15 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
             const oc_member *mu = NULL;
             for (size_t k = 0; k < m->n_users; k++)
                 if (m->users[k].user_id == cm->user_id) { mu = &m->users[k]; break; }
-            if (mu && (mu->status_emoji[0] || mu->status_text[0])) {
+            /* Out of office (REQ-122) comes first: it says who will not answer. */
+            char oo[96] = "";
+            if (mu && oc_model_ooo_active(m, mu->user_id, wall_ms())) oc_model_ooo_label(mu, oo, sizeof oo);
+            if (mu && (mu->status_emoji[0] || mu->status_text[0] || oo[0])) {
                 float sx = x0 + 34 + text_width(disp, g_ui) + 8;
                 if (cm->role >= OC_ROLE_ADMIN) sx += 18;
-                char st[112];
-                snprintf(st, sizeof st, "%s%s%s", mu->status_emoji,
+                char st[220];
+                snprintf(st, sizeof st, "%s%s%s%s%s", oo, oo[0] && (mu->status_emoji[0] || mu->status_text[0]) ? " \xC2\xB7 " : "",
+                         mu->status_emoji,
                          mu->status_emoji[0] && mu->status_text[0] ? " " : "",
                          mu->status_text);
                 if (sx + 20 < W - 14)
@@ -15458,9 +15487,38 @@ static void ftray_draw(gfx *rt, float bx0, float by0, float bx1) {
     }
 }
 
+/* Out of office (REQ-122), said at the composer before sending: the other
+ * person of the DM, or someone the text mentions, is away. Worked out again
+ * when the text or the conversation changes, and each second, so the note
+ * goes when the absence ends with nothing sent. Under any hint, which says
+ * something more pressing. */
+static char     g_ooo_note[420];
+static int      g_ooo_note_dirty = 1;
+static uint64_t g_ooo_note_sel, g_ooo_note_at;
+static void ooo_note_refresh(void) {
+    uint64_t now = (uint64_t)time(NULL) * 1000u;
+    if (!g_ooo_note_dirty && g_ooo_note_sel == g_sel && now - g_ooo_note_at < 1000) return;
+    g_ooo_note_dirty = 0; g_ooo_note_sel = g_sel; g_ooo_note_at = now;
+    g_ooo_note[0] = '\0';
+    const oc_model *m = model();
+    if (!m || !g_sel || g_view == VIEW_NEWMSG) return;
+    char *draft = ed_md_all();
+    const oc_member *u = oc_model_ooo_for_compose(m, g_sel, draft ? draft : "", now);
+    free(draft);
+    if (!u) return;
+    char lbl[96];
+    oc_model_ooo_label(u, lbl, sizeof lbl);
+    const char *until = strstr(lbl, "until ");
+    snprintf(g_ooo_note, sizeof g_ooo_note, "%s is out of office %s.%s%s",
+             u->label[0] ? u->label : u->name, until ? until : "", u->ooo_message[0] ? " " : "", u->ooo_message);
+}
+
 static void composer_hint_draw(gfx *rt) {
-    if (!g_cmp_hint[0] || g_cmp_hint_anchor.right <= g_cmp_hint_anchor.left) return;
-    float th = text_height(g_cmp_hint, g_meta_w, g_cmp_hint_anchor.right - g_cmp_hint_anchor.left - UIS(40.0f));
+    if (g_cmp_hint_anchor.right <= g_cmp_hint_anchor.left) return;
+    if (!g_cmp_hint[0]) ooo_note_refresh();
+    const char *say = g_cmp_hint[0] ? g_cmp_hint : g_ooo_note;
+    if (!say[0]) return;
+    float th = text_height(say, g_meta_w, g_cmp_hint_anchor.right - g_cmp_hint_anchor.left - UIS(40.0f));
     rectf r = g_cmp_hint_below
             ? rf(g_cmp_hint_anchor.left, g_cmp_hint_anchor.bottom + UIS(6.0f), g_cmp_hint_anchor.right,
                  g_cmp_hint_anchor.bottom + th + UIS(16.0f))
@@ -15472,8 +15530,8 @@ static void composer_hint_draw(gfx *rt) {
     draw_lucide(rt, g_cmp_hint_err ? OC_ICON_ALERT : OC_ICON_INFO,
                 rf(r.left + UIS(10.0f), r.top + (r.bottom - r.top - UIS(16.0f)) / 2, r.left + UIS(26.0f),
                    r.top + (r.bottom - r.top + UIS(16.0f)) / 2), col);
-    draw_text(rt, g_cmp_hint, g_meta_w, rf(r.left + UIS(34.0f), r.top + UIS(5.0f), r.right - UIS(8.0f),
-                                           r.bottom - UIS(5.0f)), OC_COL_TEXT);
+    draw_text(rt, say, g_meta_w, rf(r.left + UIS(34.0f), r.top + UIS(5.0f), r.right - UIS(8.0f),
+                                    r.bottom - UIS(5.0f)), OC_COL_TEXT);
 }
 
 /* A press on a chip's × . Returns 1 if it took the click. */
@@ -20579,6 +20637,18 @@ static float g_tgt_qx, g_tgt_qy;            /* where the query's text starts */
 static int   g_tgt_top;                     /* first visible match, for the wheel */
 static rectf g_tgt_list;                    /* the floating list, for hit-testing */
 static rectf g_tgt_chip_r[TGT_CHIPS_MAX];   /* each chip's whole rect, wrapped */
+/* A chip's words: #channel, or @person -- and, for a person out of office
+ * (REQ-122), until when, so who will not answer is seen as they are picked. */
+static void tgt_chip_label(int i, char *out, size_t cap) {
+    const oc_model *m = model();
+    const oc_member *u = (!g_tgt_chip[i].is_channel && m)
+                       ? oc_model_ooo_active(m, g_tgt_chip[i].id, (uint64_t)time(NULL) * 1000u) : NULL;
+    char ol[96] = "";
+    if (u) oc_model_ooo_label(u, ol, sizeof ol);
+    const char *until = u ? strstr(ol, "until ") : NULL;
+    snprintf(out, cap, "%s%s%s%s", g_tgt_chip[i].is_channel ? "#" : "@", g_tgt_chip[i].name,
+             until ? " \xC2\xB7 away " : "", until ? until : "");
+}
 static oc_target g_tgt[TGT_MAX];
 static int   g_n_tgt, g_tgt_sel;
 static rectf g_tgt_rows[TGT_MAX], g_tgt_chip_x[TGT_CHIPS_MAX], g_tgt_box;
@@ -20770,9 +20840,8 @@ static float tgt_draw(gfx *rt, rectf box, int focused) {
     float x = x0, y = box.top + ipad;
     int rows = 1;
     for (int i = 0; i < g_n_tgt_chip; i++) {
-        char label[96];
-        snprintf(label, sizeof label, "%s%s", g_tgt_chip[i].is_channel ? "#" : "@",
-                 g_tgt_chip[i].name);
+        char label[128];
+        tgt_chip_label(i, label, sizeof label);
         float w = text_width(label, g_meta) + UIS(9) * 2 + UIS(16);
         if (w > right - x0) w = right - x0;                 /* a very long name */
         if (x > x0 && x + w > right) { x = x0; y += rowh + UIS(4); rows++; }
@@ -20795,9 +20864,8 @@ static float tgt_draw(gfx *rt, rectf box, int focused) {
               OC_INK_ON(TH_MUTED, TH_INPUT));
 
     for (int i = 0; i < g_n_tgt_chip; i++) {
-        char label[96];
-        snprintf(label, sizeof label, "%s%s", g_tgt_chip[i].is_channel ? "#" : "@",
-                 g_tgt_chip[i].name);
+        char label[128];
+        tgt_chip_label(i, label, sizeof label);
         rectf chip = g_tgt_chip_r[i];
         rectf close = rf(chip.right - UIS(9) - UIS(16), chip.top, chip.right - UIS(9), chip.bottom);
         int hot = in_rect(close, g_mouse_x, g_mouse_y);
@@ -21647,6 +21715,7 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
          * in its place, because it is the more current of the two. */
         char sub[160];
         if (u->disabled) snprintf(sub, sizeof sub, "Removed \xE2\x80\x94 right-click to bring them back");
+        else if (oc_model_ooo_active(m, u->user_id, wall_ms())) oc_model_ooo_label(u, sub, sizeof sub);
         else if (u->status_text[0])
             snprintf(sub, sizeof sub, "%s%s%s", u->status_emoji,
                      u->status_emoji[0] ? "  " : "", u->status_text);
@@ -25647,6 +25716,7 @@ static void layout_composer(oc_win *hwnd);     /* fwd */
  * popover and repaint. One place, so no key handler can forget a step. */
 static void ed_changed(oc_win *hwnd) {
     g_cmp_hint[0] = '\0';                 /* an edit answers the hint */
+    g_ooo_note_dirty = 1;                 /* and may mention someone away */
     /* The typing indicator used to ride EN_CHANGE from the RichEdit. This is that
      * notification's replacement, and the rate limit is the same 2s. */
     uint32_t now = (uint32_t)now_ms();
@@ -34535,6 +34605,56 @@ static uint32_t minutes_until_local(int hh, int mm, int force_tomorrow) {
     return (uint32_t)delta;
 }
 
+/* "2026-12-03" as local midnight, in ms; 0 when it is not a date. */
+static uint64_t ooo_parse_day(const char *s) {
+    int y = 0, mo = 0, d = 0;
+    char tail = 0;
+    if (!s || sscanf(s, "%d-%d-%d%c", &y, &mo, &d, &tail) != 3) return 0;
+    if (y < 2000 || y > 2200 || mo < 1 || mo > 12 || d < 1 || d > 31) return 0;
+    struct tm tm;
+    memset(&tm, 0, sizeof tm);
+    tm.tm_year = y - 1900; tm.tm_mon = mo - 1; tm.tm_mday = d; tm.tm_isdst = -1;
+    time_t t = mktime(&tm);
+    if (t == (time_t)-1 || tm.tm_mday != d) return 0;   /* 31 February is not a day */
+    return (uint64_t)t * 1000u;
+}
+
+static void ooo_format_day(uint64_t ms, char *out, size_t cap) {
+    time_t t = (time_t)(ms / 1000);
+    struct tm lt;
+    if (!ms || !oc_localtime_r(&t, &lt)) { out[0] = '\0'; return; }
+    snprintf(out, cap, "%04d-%02d-%02d", lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday);
+}
+
+/* Out of office (REQ-122): from a day (empty for now) until a day, which is the
+ * day they are back, and a message for whoever writes to them. Asked again,
+ * the field in red, until the days make sense. */
+static void ooo_dialog(oc_win *hwnd) {
+    const oc_model *m = model();
+    if (!m || !g_client) return;
+    oc_field f[3] = {
+        { FF_TEXT, "From",     "A day as 2026-12-01, or empty for now.", "" },
+        { FF_TEXT, "Back on",  "The day you are back, as 2026-12-15. Out of office ends that morning.", "" },
+        { FF_TEXT, "Message",  "Shown to anyone who writes to you or mentions you. Optional.", "" },
+    };
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == m->user_id && m->users[i].ooo_end > wall_ms()) {
+            if (m->users[i].ooo_start > wall_ms()) ooo_format_day(m->users[i].ooo_start, f[0].value, sizeof f[0].value);
+            ooo_format_day(m->users[i].ooo_end, f[1].value, sizeof f[1].value);
+            snprintf(f[2].value, sizeof f[2].value, "%s", m->users[i].ooo_message);
+        }
+    for (;;) {
+        if (!form_dialog(hwnd, "Out of office", f, 3)) return;
+        uint64_t start = f[0].value[0] ? ooo_parse_day(f[0].value) : wall_ms();
+        uint64_t end = ooo_parse_day(f[1].value);
+        if (f[0].value[0] && !start) { g_form_err_field = 0; continue; }
+        if (!end || end <= start || end <= wall_ms()) { g_form_err_field = 1; continue; }
+        if (strlen(f[2].value) > OC_OOO_MESSAGE_MAX) { g_form_err_field = 2; continue; }
+        oc_client_set_out_of_office(g_client, start, end, f[2].value);
+        return;
+    }
+}
+
 static void open_profile_menu(oc_win *hwnd) {
     /* The reference's profile popover, item for item (its shape, not a copy):
      * identity header, an input-look status row, ONE away/active toggle worded
@@ -34548,6 +34668,19 @@ static void open_profile_menu(oc_win *hwnd) {
     g_n_mi = 0;
     mi_userheader();
     mi_statusrow(51);
+    /* Out of office (REQ-122), beside the status rather than in it: set, or
+     * when set, its end and the way to clear it. */
+    {
+        static char ool[96];
+        const oc_member *me = pm ? oc_model_ooo_active(pm, pm->user_id, wall_ms()) : NULL;
+        if (me) {
+            oc_model_ooo_label(me, ool, sizeof ool);
+            mi_item(66, ool);
+            mi_item(67, "Clear out of office");
+        } else {
+            mi_item(66, "Set out of office\xE2\x80\xA6");
+        }
+    }
     mi_item(pres == OC_PRESENCE_ONLINE ? 11 : 10,
             pres == OC_PRESENCE_ONLINE ? "Set yourself as away"
                                        : "Set yourself as active");
@@ -35911,6 +36044,12 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
     case 11: oc_client_set_presence(g_client, OC_PRESENCE_AWAY); break;
     case 51:     /* the status dialog — bespoke modal, see status_open */
         status_open(hwnd);
+        break;
+    case 66:     /* out of office (REQ-122): dates and a message */
+        ooo_dialog(hwnd);
+        break;
+    case 67:
+        if (g_client) oc_client_set_out_of_office(g_client, 0, 0, "");
         break;
     case 34:     /* deactivate your own account (REQ-033), said before it happens */
         confirm_open(hwnd, CONF_DEACTIVATE_SELF, 0, "Deactivate your account?",

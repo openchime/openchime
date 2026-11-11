@@ -525,6 +525,10 @@ void oc_client_set_profile_field(oc_client *c, uint64_t field_id, int op, int ki
                                  uint16_t position, const char *label);
 /* My value for one profile field, "" to clear it; it comes back as PROFILE_INFO. */
 void oc_client_set_profile_field_value(oc_client *c, uint64_t field_id, const char *value);
+/* My out of office (REQ-122), from `start_ms` until `end_ms`, with a message
+ * ("" for none); `end_ms` 0 clears it. Comes back as PROFILE_INFO, and to
+ * everyone as my roster row. */
+void oc_client_set_out_of_office(oc_client *c, uint64_t start_ms, uint64_t end_ms, const char *message);
 /* Set only my read-aloud voice (REQ-292). SET_PROFILE replaces every field,
  * so the core fetches my whole profile first and sends it back with the voice
  * changed: nothing else, the phone included, is touched. */

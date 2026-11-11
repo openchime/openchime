@@ -960,7 +960,13 @@ Each entry, in wire order:
 `user_id` (u64) · `role` (u8) · `disabled` (u8) · `email` (str) ·
 `display_name` (str) · `avatar_id` (u64) · `title` (str) · `timezone` (str) ·
 `status_emoji` (str) · `status_text` (str) · `full_name` (str) ·
-`pronouns` (str) · `voice_id` (str) · `flags` (u8, since version 30).
+`pronouns` (str) · `voice_id` (str) · `flags` (u8, since version 30) ·
+`ooo_start` (u64) · `ooo_end` (u64) · `ooo_message` (str) (the three since
+version 41).
+
+`ooo_*` is the person's **out of office** (`SET_OUT_OF_OFFICE`, §5.20), as
+stored: in force while `ooo_start` ≤ now < `ooo_end`, which the client decides,
+so the mark goes at the end time with nothing sent. `ooo_end` 0 means none.
 
 `flags` bit `0x01` (`OC_USER_SYSTEM`) marks **the workspace's own sender**: the
 account that posts what the workspace says, such as the welcome a new member is
@@ -2384,11 +2390,13 @@ thing they did, and is a different fact from never having set it.
 **`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to any of SET_STATUS / SET_PROFILE / SET_AVATAR / SET_EMAIL / SET_PROFILE_FIELD_VALUE / GET_PROFILE. The reply to SET_PROFILE, SET_EMAIL and SET_PROFILE_FIELD_VALUE goes to every connection of the person who saved it, so their other devices show the change at once. (REQ-240, REQ-241)
 
     user_id (u64), display_name (str), email (str), status_emoji (str), status_text (str), status_expires (u64), title (str), timezone (str), avatar_id (u64), role (u8), full_name (str), pronouns (str), phone (str), voice_id (str),
-    n_fields (u8), n_fields × { field_id (u64), value (str) }
+    n_fields (u8), n_fields × { field_id (u64), value (str) },
+    ooo_start (u64), ooo_end (u64), ooo_message (str)
 
-The trailing list (protocol 40) is the person's values for the workspace's own
+The list (protocol 40) is the person's values for the workspace's own
 profile fields, those they filled, at most 20; a client shows them in the order
-`PROFILE_FIELDS` gives and ignores an id it does not know.
+`PROFILE_FIELDS` gives and ignores an id it does not know. The out-of-office
+three after it (protocol 41) are as on `USER_LIST`.
 
 **`SET_PROFILE_FIELD` (C → S), `0x0137`** — An owner or admin adds, renames or
 deletes one of the workspace's profile fields (department, location, manager).
@@ -3254,6 +3262,23 @@ owner or admin (`FORBIDDEN` otherwise).
 
 Adding these frames needed no protocol-version bump.
 
+### 5.20 Out of office (REQ-122)
+
+**`SET_OUT_OF_OFFICE` (C → S), `0x013A`** — my absence, apart from the custom
+status, which shows beside it.
+
+    start_ms (u64), end_ms (u64), message (str)
+
+In force while `start_ms` ≤ now < `end_ms`. An `end_ms` of 0, or one already
+past, clears it (start, end and message all go). Refused with the non-fatal
+`INVALID_OUT_OF_OFFICE` for an end not after its start or a message over 280
+bytes. On success the person's connections are sent `PROFILE_INFO`, and every
+signed-in connection a `USER_LIST` of one, their row: everyone's marks and
+composer notices follow it. Nothing is sent when it ends; a client compares the
+times with its clock. While it is in force a client marks the person "Out of
+office until <date>" wherever they appear, and someone writing them a DM or
+mentioning them is told so, with the message, before sending.
+
 ## 6. Reconnect backfill (resolves REQ-101)
 
 A client that reconnects (REQ-100) requests everything it missed since its
@@ -3487,6 +3512,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3043` | `CANNOT_MOVE`         | messaging  | no    | A `MOVE_MESSAGE` that cannot be made: into or out of a DM or encrypted DM, a thread root with replies into a thread, into a thread that is itself a reply, or to where it already is (REQ-053). |
 | `3070` | `DM_REFUSED`          | messaging  | no    | An `OPEN_DM` or `OPEN_GROUP_DM` naming someone who blocks the asker, or a new one naming someone whose DM privacy is `nobody`. It says neither, so a block is never announced. |
 | `3071` | `INVALID_PROFILE_FIELD` | admin    | no    | A profile field without a label, of an unknown kind or id, past the 20 a workspace may have; or a value over 200 bytes, for a field it does not have, or for a link not starting `https://`. |
+| `3072` | `INVALID_OUT_OF_OFFICE` | profile  | no    | An out-of-office whose end is not after its start, or whose message is over 280 bytes. |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing
@@ -3773,6 +3799,7 @@ this table cannot silently gain a shared value.
 | `0x0137` | `SET_PROFILE_FIELD` | C → S | owner or admin: add, rename or delete a workspace profile field |
 | `0x0138` | `PROFILE_FIELDS` | S → C | the workspace's profile fields: after sign-in, and to everyone on a change |
 | `0x0139` | `SET_PROFILE_FIELD_VALUE` | C → S | my value for one profile field; empty clears it; answered with `PROFILE_INFO` |
+| `0x013A` | `SET_OUT_OF_OFFICE` | C → S | my out-of-office span and message; an end of 0 or past clears it (§5.20) |
 
 ## 10. Connection state machine
 

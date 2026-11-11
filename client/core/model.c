@@ -708,6 +708,71 @@ const char *oc_model_profile_value(const oc_model *m, uint64_t user_id, uint64_t
     return "";
 }
 
+static int ci_eq(const char *a, const char *b) {
+    for (; *a && *b; a++, b++)
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+    return *a == *b;
+}
+
+const oc_member *oc_model_ooo_active(const oc_model *m, uint64_t user_id, uint64_t now_ms) {
+    if (!m || !user_id) return NULL;
+    for (size_t i = 0; i < m->n_users; i++) {
+        const oc_member *u = &m->users[i];
+        if (u->user_id != user_id) continue;
+        return (u->ooo_end && u->ooo_start <= now_ms && now_ms < u->ooo_end) ? u : NULL;
+    }
+    return NULL;
+}
+
+const oc_member *oc_model_ooo_for_compose(const oc_model *m, uint64_t channel_id,
+                                          const char *draft, uint64_t now_ms) {
+    if (!m) return NULL;
+    /* The other person of a one-to-one DM. */
+    for (size_t i = 0; i < m->n_channels; i++) {
+        const oc_channel *c = &m->channels[i];
+        if (c->channel_id != channel_id) continue;
+        if (c->kind == OC_CHANNEL_KIND_DM && c->peer_id && c->peer_id != m->user_id) {
+            const oc_member *u = oc_model_ooo_active(m, c->peer_id, now_ms);
+            if (u) return u;
+        }
+        break;
+    }
+    /* Anyone mentioned, by id or by the name the roster shows. */
+    if (!draft || !draft[0]) return NULL;
+    oc_mention ms[OC_MENTION_MAX];
+    size_t n = oc_mention_scan(draft, strlen(draft), ms, OC_MENTION_MAX);
+    if (n > OC_MENTION_MAX) n = OC_MENTION_MAX;
+    for (size_t k = 0; k < n; k++) {
+        if (ms[k].kind != OC_MENTION_USER) continue;
+        for (size_t i = 0; i < m->n_users; i++) {
+            const oc_member *u = &m->users[i];
+            if (u->user_id == m->user_id) continue;
+            int hit = ms[k].user_id ? ms[k].user_id == u->user_id
+                                    : (ci_eq(ms[k].name, u->name) || ci_eq(ms[k].name, u->label));
+            if (hit && oc_model_ooo_active(m, u->user_id, now_ms)) return u;
+        }
+    }
+    return NULL;
+}
+
+void oc_model_ooo_label(const oc_member *mem, char *out, size_t cap) {
+    if (!out || !cap) return;
+    out[0] = '\0';
+    if (!mem || !mem->ooo_end) return;
+    static const char *MON[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    /* The last moment it holds, so an end at midnight reads as the day before. */
+    time_t t = (time_t)((mem->ooo_end - 1) / 1000);
+    time_t nowt = time(NULL);
+    struct tm lt, nt;
+    oc_localtime_r(&t, &lt);
+    oc_localtime_r(&nowt, &nt);
+    if (lt.tm_year == nt.tm_year)
+        snprintf(out, cap, "Out of office until %d %s", lt.tm_mday, MON[lt.tm_mon]);
+    else
+        snprintf(out, cap, "Out of office until %d %s %d", lt.tm_mday, MON[lt.tm_mon], lt.tm_year + 1900);
+}
+
 int oc_model_user_disabled(const oc_model *m, uint64_t user_id) {
     for (size_t i = 0; i < m->n_users; i++)
         if (m->users[i].user_id == user_id) return m->users[i].disabled;
@@ -2474,6 +2539,9 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
 #undef FOLD_FIELD
         mem->status_expires = e->server_time;
         mem->avatar_id      = e->message_id;
+        mem->ooo_start      = e->ooo_start;
+        mem->ooo_end        = e->ooo_end;
+        snprintf(mem->ooo_message, sizeof mem->ooo_message, "%s", e->ooo_message);
         if (e->op) mem->role = e->op;
         user_relabel(mem);
         /* Their values for the workspace's fields: the frame carries all of
@@ -3255,6 +3323,9 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 snprintf(m->users[i].full_name, sizeof m->users[i].full_name, "%s", e->pf_full_name);
                 snprintf(m->users[i].pronouns, sizeof m->users[i].pronouns, "%s", e->pf_pronouns);
                 snprintf(m->users[i].voice_id, sizeof m->users[i].voice_id, "%s", e->pf_voice);
+                m->users[i].ooo_start = e->ooo_start;
+                m->users[i].ooo_end = e->ooo_end;
+                snprintf(m->users[i].ooo_message, sizeof m->users[i].ooo_message, "%s", e->ooo_message);
                 break;
             }
         break;

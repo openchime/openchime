@@ -1618,6 +1618,18 @@ void oc_client_set_profile_field_value(oc_client *c, uint64_t field_id, const ch
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_set_out_of_office(oc_client *c, uint64_t start_ms, uint64_t end_ms, const char *message) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_OUT_OF_OFFICE);
+    if (!cmd) return;
+    cmd->start_ms = start_ms;
+    cmd->end_ms = end_ms;
+    char m[OC_OOO_MESSAGE_MAX + 1];
+    snprintf(m, sizeof m, "%s", message ? message : "");   /* the wire's bound */
+    cmd->body = strdup(m);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_get_profile(oc_client *c, uint64_t user_id) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_GET_PROFILE);

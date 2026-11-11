@@ -738,6 +738,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->st_emoji); free(r->st_text); free(r->pf_title); free(r->pf_tz);
     free(r->pf_full_name); free(r->pf_pronouns); free(r->pf_phone); free(r->pf_voice_id);
     free(r->pfd); free(r->pfv);
+    free(r->pf_ooo_message);
     free(r->tts_text); free(r->tts_blob_key);
     free(r->sum_body); free(r->sum_version); free(r->sum_places); free(r->sum_notices);
     for (size_t i = 0; i < r->n_stt_names; i++) free(r->stt_names[i]);
@@ -795,6 +796,7 @@ void oc_dbres_free(oc_dbres *r) {
         free(r->ulist[i].title); free(r->ulist[i].timezone);
         free(r->ulist[i].status_emoji); free(r->ulist[i].status_text);
         free(r->ulist[i].full_name); free(r->ulist[i].pronouns); free(r->ulist[i].voice_id);
+        free(r->ulist[i].ooo_message);
     }
     free(r->ulist);
     free(r->emoji);
@@ -2880,7 +2882,8 @@ static void user_rows(sqlite3 *db, uint64_t only, oc_dbres *r) {
         "SELECT id, role, disabled, COALESCE(email,''), COALESCE(display_name,''), "
         "       COALESCE(avatar_attachment_id,0), COALESCE(title,''), COALESCE(timezone,''), "
         "       COALESCE(status_emoji,''), COALESCE(status_text,''), status_expires_ms, "
-        "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(voice_id,''), is_system "
+        "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(voice_id,''), is_system, "
+        "       ooo_start_ms, ooo_end_ms, ooo_message "
         "FROM users WHERE (?1 = 0 AND kind <> 'visitor') OR id = ?1 ORDER BY id;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)only);
     size_t cap = 8, n = 0;
@@ -2910,6 +2913,9 @@ static void user_rows(sqlite3 *db, uint64_t only, oc_dbres *r) {
         arr[n].pronouns     = strdup((const char *)sqlite3_column_text(st, 12));
         arr[n].voice_id     = strdup((const char *)sqlite3_column_text(st, 13));
         arr[n].flags        = sqlite3_column_int(st, 14) ? OC_USER_SYSTEM : 0;
+        arr[n].ooo_start    = (uint64_t)sqlite3_column_int64(st, 15);
+        arr[n].ooo_end      = (uint64_t)sqlite3_column_int64(st, 16);
+        arr[n].ooo_message  = strdup((const char *)sqlite3_column_text(st, 17));
         n++;
     }
     sqlite3_finalize(st);
@@ -9766,7 +9772,7 @@ static void build_profile(sqlite3 *db, uint64_t uid, oc_dbres *r) {
         "       COALESCE(status_text,''), status_expires_ms, COALESCE(title,''), "
         "       COALESCE(timezone,''), COALESCE(avatar_attachment_id,0), role, "
         "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(phone,''), "
-        "       COALESCE(voice_id,'') "
+        "       COALESCE(voice_id,''), ooo_start_ms, ooo_end_ms, ooo_message "
         "  FROM users WHERE id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
     if (sqlite3_step(st) == SQLITE_ROW) {
@@ -9802,6 +9808,10 @@ static void build_profile(sqlite3 *db, uint64_t uid, oc_dbres *r) {
         r->pf_phone     = strdup(ph ? (const char *)ph : "");
         const unsigned char *vc = sqlite3_column_text(st, 12);
         r->pf_voice_id  = strdup(vc ? (const char *)vc : "");
+        r->pf_ooo_start = (uint64_t)sqlite3_column_int64(st, 13);
+        r->pf_ooo_end   = (uint64_t)sqlite3_column_int64(st, 14);
+        const unsigned char *om = sqlite3_column_text(st, 15);
+        r->pf_ooo_message = strdup(om ? (const char *)om : "");
     }
     sqlite3_finalize(st);
     load_profile_values(db, uid, r);
@@ -9959,6 +9969,36 @@ static void sql_functions(sqlite3 *db) {
     sqlite3_create_function(db, "oc_has_spoiler", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_has_spoiler, NULL, NULL);
     /* oc_unspoiled, which the search index's triggers call (migrate.c, 0072). */
     oc_migrate_functions(db);
+}
+
+/* Out of office (REQ-122). Stored as given; an end of 0 or already past clears
+ * all three. The answer is the person's whole profile to their connections,
+ * and their roster row to everyone, whose marks and composer notices follow. */
+static oc_dbres *process_set_out_of_office(sqlite3 *db, const oc_job *j) {
+    const char *msg = j->pf_name ? j->pf_name : "";
+    size_t n = strlen(msg);
+    uint64_t now = dbw_now_ms();
+    int clear = j->ooo_end == 0 || j->ooo_end <= now;
+    if (!clear && (j->ooo_end <= j->ooo_start || n > OC_OOO_MESSAGE_MAX))
+        return profile_err(j, OC_ERR_INVALID_OUT_OF_OFFICE);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE users SET ooo_start_ms=?1, ooo_end_ms=?2, ooo_message=?3 WHERE id=?4;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, clear ? 0 : (sqlite3_int64)j->ooo_start);
+        sqlite3_bind_int64(st, 2, clear ? 0 : (sqlite3_int64)j->ooo_end);
+        sqlite3_bind_text (st, 3, clear ? "" : msg, clear ? 0 : (int)n, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    build_profile(db, j->user_id, r);
+    r->pf_fanout = 1;
+    user_rows(db, j->user_id, r);
+    r->joined = r->n_ulist != 0;   /* the row, to everyone signed in */
+    return r;
 }
 
 static oc_dbres *process_get_profile(sqlite3 *db, const oc_job *j) {
@@ -12332,6 +12372,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_PROFILE)     return process_set_profile(w->db, j);
     if (j->type == OC_JOB_SET_PROFILE_FIELD)       return process_set_profile_field(w->db, j);
     if (j->type == OC_JOB_SET_PROFILE_FIELD_VALUE) return process_set_profile_field_value(w->db, j);
+    if (j->type == OC_JOB_SET_OUT_OF_OFFICE) return process_set_out_of_office(w->db, j);
     if (j->type == OC_JOB_SET_EMAIL)       return process_set_email(w->db, j);
     if (j->type == OC_JOB_SET_AVATAR)      return process_set_avatar(w->db, j);
     if (j->type == OC_JOB_DEACTIVATE_SELF) return process_deactivate_self(w->db, j);
