@@ -333,11 +333,21 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
             else snprintf(who, sizeof who, "user%llu", (unsigned long long)m->author_id);
         }
         char said[1024];
-        /* Its spoilers read as their words, or, shown, as written (§1d). */
-        if (spoilers_shown(m->message_id) && has_spoilers(m->body + m->action.start))
-            snprintf(said, sizeof said, "%s %s", who, m->body + m->action.start);
-        else
-            oc_model_line(NULL, m->author_id, who, 1, m->body + m->action.start, said, sizeof said);
+        /* Its time tokens read in this reader's zone and clock, as a body's do
+         * (§1c); its spoilers read as their words, or, shown, as written (§1d). */
+        oc_rt_clock ak;
+        oc_model_clock(NULL, (int64_t)time(NULL) * 1000, &ak);
+        ak.time24 = !(g_cfg && !g_cfg->time_24h);
+        const char *atext = m->body + m->action.start;
+        if (spoilers_shown(m->message_id) && has_spoilers(atext)) {
+            char *loc = oc_rt_local_times(atext, strlen(atext), &ak);
+            snprintf(said, sizeof said, "%s %s", who, loc ? loc : atext);
+            free(loc);
+        } else {
+            size_t wl = (size_t)snprintf(said, sizeof said, "%s ", who);
+            if (wl >= sizeof said) wl = sizeof said - 1;
+            oc_rt_flatten_at(atext, strlen(atext), &ak, said + wl, sizeof said - wl);
+        }
         char *al = malloc(strlen(stamp) + strlen(said) + 16);
         if (al) {
             sprintf(al, "%s  * %s%s", stamp, said, m->edited ? " (edited)" : "");

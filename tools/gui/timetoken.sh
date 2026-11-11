@@ -155,6 +155,23 @@ check "twenty in one table cell all read in the reader's zone, in order" waitfor
 check "and its five custom emoji are drawn, beside the message's ten" waitfor 10 emoji_drawn 15
 "$DRIVE" shot timetoken_many_cell >/dev/null
 rm -rf "$M" "$LIN_DIR/tt-emoji.png"
+
+say "== in a table past those drawn as grids, and in a /me line"
+# Each drawn token is a hit with its tip (the dump's timetok line), so a new one
+# reading "$SHORT" is one shown in the reader's zone, with its tip.
+count_short() { snap; grep -c "^  timetok .*text=\"$SHORT\"" "$D"; }
+before="$(count_short)"
+b=""; for i in $(seq 1 16); do b="$b| h$i |\n|---|\n| $i |\n\n"; done
+"$DRIVE" sendraw "$b| When |\n|---|\n| $TOKEN |" >/dev/null
+past16() { [ "$(count_short)" -gt "$before" ]; }
+check "a token in the seventeenth table reads \"$SHORT\", with its tip" waitfor 15 past16
+"$DRIVE" shot timetoken_past_grids >/dev/null
+before="$(count_short)"
+"$DRIVE" sendraw "/me starts at $TOKEN" >/dev/null
+in_me() { [ "$(count_short)" -gt "$before" ]; }
+check "a token in a /me line reads \"$SHORT\", with its tip" waitfor 10 in_me
+check "and the /me line's preview reads it too" grep -q "prev=\"[^\"]*starts at $SHORT\"" "$D"
+"$DRIVE" shot timetoken_action >/dev/null
 rm -f "$D"
 
 say ""

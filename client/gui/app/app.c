@@ -5459,10 +5459,12 @@ static const char *action_line(const oc_msg *msg) {
     size_t cap = strlen(nm) + 1 + msg->action.len + 1;
     char *line = malloc(cap), *copy = strdup(text);
     if (!line || !copy) { free(line); free(copy); return "(message unavailable)"; }
-    /* With a spoiler, as written: the layout covers it, and it reveals like any
-     * other (MARKDOWN.md §1d). An excerpt's word in its place could not be. */
-    if (oc_rt_spoilers(text, strlen(text), NULL, 0)) snprintf(line, cap, "%s %s", nm, text);
-    else oc_model_line(model(), msg->author_id, nm, 1, text, line, cap);
+    /* As written, always, as a body is: the layout covers a spoiler, which reveals
+     * like any other (MARKDOWN.md §1d), and draws a time token in this reader's
+     * zone and clock with its tip (§1c), laid out again when the clock, the zone
+     * or the day changes, as a body's are. Text made here instead kept the clock
+     * and the "today" it was made with, and a token's tip went with it. */
+    snprintf(line, cap, "%s %s", nm, text);
     free(g_act_line[k].line);
     free(g_act_line[k].text);
     g_act_line[k].mid = msg->message_id;
@@ -6439,6 +6441,54 @@ static size_t cut_body(const char *b, size_t blen, size_t lead, size_t cut, char
     return start;
 }
 
+/* The time tokens in the cells of `b`'s tables that are not drawn as grids
+ * (`rts`, `nt`): those past MTAB_MAX, laid out as text like the rest of the body.
+ * Each is a box and a tip as a token anywhere else is (MARKDOWN.md §1c). A
+ * malloc'd list in *out, offsets into `b`; returns how many, 0 on none or no
+ * memory, when they show as typed. */
+static size_t text_table_times(const char *b, size_t blen, const oc_rt_table *rts, int nt, oc_rt_span **out) {
+    size_t ntab, n = 0, cap = 0;
+    oc_rt_table *t;
+    oc_rt_span *v = NULL;
+    *out = NULL;
+    if (!memchr(b, '|', blen) || !strstr(b, "<time:")) return 0;
+    ntab = oc_rt_tables(b, blen, NULL, 0);
+    if (ntab <= (size_t)nt) return 0;
+    t = malloc(ntab * sizeof *t);
+    if (!t) return 0;
+    ntab = oc_rt_tables(b, blen, t, ntab);
+    for (size_t q = 0; q < ntab; q++) {
+        int grid = 0;
+        for (int k = 0; k < nt && !grid; k++) grid = rts[k].start == t[q].start;
+        if (grid) continue;
+        oc_rt_rowit it;
+        oc_rt_cell cells[OC_RT_TABLE_MAX_COLS];
+        uint32_t row;
+        oc_rt_rows_begin(&it, b, blen, &t[q]);
+        while (oc_rt_row_next(&it, cells, &row)) {
+            for (uint8_t c = 0; c < t[q].cols; c++) {
+                oc_rt_span cs[32];
+                if (!cells[c].len || !memchr(b + cells[c].start, '<', cells[c].len)) continue;
+                size_t m = oc_rt_scan_cell(b, cells[c].start, cells[c].len, cs, 32);
+                if (m > 32) m = 32;
+                for (size_t i = 0; i < m; i++) {
+                    if (cs[i].style != OC_RT_TIME) continue;
+                    if (n == cap) {
+                        size_t nc = cap ? cap * 2 : 16;
+                        oc_rt_span *g = realloc(v, nc * sizeof *g);
+                        if (!g) { free(v); free(t); return 0; }
+                        v = g; cap = nc;
+                    }
+                    v[n++] = cs[i];
+                }
+            }
+        }
+    }
+    free(t);
+    *out = v;
+    return n;
+}
+
 static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     uint64_t sig = mlay_sig(msg);
     unsigned slot = (unsigned)(msg->message_id % MLAY_CACHE);
@@ -6631,7 +6681,9 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
             if (all) { tsp = all; nts = oc_rt_scan(b, blen, all, nts); }
             else nts = OC_RT_MAX;          /* past these, a token shows as typed */
         }
-        ibox_src *src = (ne || nts) ? malloc(((size_t)ne + nts) * sizeof *src) : NULL;
+        oc_rt_span *ttk = NULL;
+        size_t ntt = text_table_times(b, blen, rts, nt, &ttk);
+        ibox_src *src = (ne || nts || ntt) ? malloc(((size_t)ne + nts + ntt) * sizeof *src) : NULL;
         for (int i = 0; src && i < ne; i++) {
             /* Not inside a table, where a box would reserve space in its band,
              * nor in a covered spoiler, where its picture would show through. */
@@ -6646,6 +6698,17 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
                 !oc_rt_time_value(b, blen, &tsp[i], &ms)) continue;
             src[nsrc++] = (ibox_src){ lead + tsp[i].start, tsp[i].len, 0, ms };
         }
+        /* In a table drawn as text, past MTAB_MAX: as in the body, unless a
+         * covered spoiler hides it, where its box would show through. */
+        for (size_t i = 0; src && i < ntt; i++) {
+            int64_t ms = 0;
+            int hid = 0;
+            for (size_t k = 0; k < nspv && !hid; k++)
+                hid = !best->spl[k].shown && ttk[i].start >= spv[k].hidden && ttk[i].start < spv[k].hidden + spv[k].hidden_len;
+            if (hid || !oc_rt_time_value(b, blen, &ttk[i], &ms)) continue;
+            src[nsrc++] = (ibox_src){ lead + ttk[i].start, ttk[i].len, 0, ms };
+        }
+        free(ttk);
         best->nbox = ibox_place(lay, src, nsrc, &best->box);
         free(src);
         free(runs);

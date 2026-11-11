@@ -1140,37 +1140,97 @@ size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, 
     return o;
 }
 
+/* Append the time tokens among `n` spans to the growing list *tk (count *nt,
+ * room *cap). 0 on no memory. */
+static int time_spans_add(const oc_rt_span *sp, size_t n, oc_rt_span **tk, size_t *nt, size_t *cap) {
+    for (size_t k = 0; k < n; k++) {
+        if (sp[k].style != OC_RT_TIME) continue;
+        if (*nt == *cap) {
+            size_t c = *cap ? *cap * 2 : 16;
+            oc_rt_span *g = realloc(*tk, c * sizeof *g);
+            if (!g) return 0;
+            *tk = g; *cap = c;
+        }
+        (*tk)[(*nt)++] = sp[k];
+    }
+    return 1;
+}
+
+/* The time tokens in `body`'s table cells, which oc_rt_scan reports a table
+ * round as one span, appended to *tk. 0 on no memory. */
+static int cell_time_spans(const char *body, size_t len, oc_rt_span **tk, size_t *nt, size_t *cap) {
+    size_t ntab = oc_rt_tables(body, len, NULL, 0);
+    oc_rt_table *t;
+    int ok = 1;
+    if (!ntab) return 1;
+    t = malloc(ntab * sizeof *t);
+    if (!t) return 0;
+    ntab = oc_rt_tables(body, len, t, ntab);
+    for (size_t q = 0; q < ntab && ok; q++) {
+        oc_rt_rowit it;
+        oc_rt_cell cells[OC_RT_TABLE_MAX_COLS];
+        uint32_t row;
+        oc_rt_rows_begin(&it, body, len, &t[q]);
+        while (ok && oc_rt_row_next(&it, cells, &row)) {
+            for (uint8_t c = 0; c < t[q].cols && ok; c++) {
+                size_t n;
+                oc_rt_span *cs;
+                if (!cells[c].len || !memchr(body + cells[c].start, '<', cells[c].len)) continue;
+                n = oc_rt_scan_cell(body, cells[c].start, cells[c].len, NULL, 0);
+                if (!n) continue;
+                cs = malloc(n * sizeof *cs);
+                if (!cs) { ok = 0; break; }
+                n = oc_rt_scan_cell(body, cells[c].start, cells[c].len, cs, n);
+                ok = time_spans_add(cs, n, tk, nt, cap);
+                free(cs);
+            }
+        }
+    }
+    free(t);
+    return ok;
+}
+
 char *oc_rt_local_times(const char *body, size_t len, const oc_rt_clock *clock) {
-    oc_rt_span sps[OC_RT_MAX], *sp = sps;
-    size_t ns, k, i = 0, o = 0, cap;
+    oc_rt_span *sp = NULL, *tk = NULL;
+    size_t ns, nt = 0, tcap = 0, k, i = 0, o = 0, cap;
     char *out;
     if (!body || !memchr(body, '<', len)) return NULL;
-    ns = oc_rt_scan(body, len, sps, OC_RT_MAX);
-    if (ns > OC_RT_MAX) {
-        /* Every token, however many spans there are; short of memory, those
-         * in the first OC_RT_MAX, and the rest as typed. */
-        oc_rt_span *all = malloc(ns * sizeof *all);
-        if (all) { sp = all; ns = oc_rt_scan(body, len, sp, ns); }
-        else ns = OC_RT_MAX;
+    /* Every token, however many spans there are, those in a table's cells too
+     * (MARKDOWN.md §1c); short of memory, the body as typed. */
+    ns = oc_rt_scan(body, len, NULL, 0);
+    if (ns) {
+        sp = malloc(ns * sizeof *sp);
+        if (!sp) return NULL;
+        ns = oc_rt_scan(body, len, sp, ns);
     }
-    for (k = 0; k < ns && sp[k].style != OC_RT_TIME; k++) {}
-    if (k == ns) { if (sp != sps) free(sp); return NULL; }
+    if (!time_spans_add(sp, ns, &tk, &nt, &tcap) || !cell_time_spans(body, len, &tk, &nt, &tcap)) {
+        free(sp); free(tk); return NULL;
+    }
+    free(sp);
+    if (!nt) { free(tk); return NULL; }
+    /* In the order they are in the body: those in cells came after the rest. */
+    for (k = 1; k < nt; k++) {
+        oc_rt_span x = tk[k];
+        size_t q = k;
+        while (q > 0 && tk[q - 1].start > x.start) { tk[q] = tk[q - 1]; q--; }
+        tk[q] = x;
+    }
     /* A token is at least 24 bytes and its text at most 40: room for each to grow. */
-    cap = len + ns * 48 + 1;
+    cap = len + nt * 48 + 1;
     out = malloc(cap);
-    if (!out) { if (sp != sps) free(sp); return NULL; }
-    for (k = 0; k < ns; k++) {
+    if (!out) { free(tk); return NULL; }
+    for (k = 0; k < nt; k++) {
         int64_t ms;
-        if (sp[k].style != OC_RT_TIME || !oc_rt_time_value(body, len, &sp[k], &ms)) continue;
-        memcpy(out + o, body + i, sp[k].start - i);
-        o += sp[k].start - i;
+        if (tk[k].start < i || !oc_rt_time_value(body, len, &tk[k], &ms)) continue;
+        memcpy(out + o, body + i, tk[k].start - i);
+        o += tk[k].start - i;
         o += oc_rt_time_text(ms, clock, OC_RT_TIME_SHORT, out + o, cap - o);
-        i = sp[k].start + sp[k].len;
+        i = tk[k].start + tk[k].len;
     }
     memcpy(out + o, body + i, len - i);
     o += len - i;
     out[o] = '\0';
-    if (sp != sps) free(sp);
+    free(tk);
     return out;
 }
 

@@ -607,6 +607,47 @@ static void test_time_every_token(void) {
     free(loc);
 }
 
+/* A token in a table's cell reads as one anywhere else does (MARKDOWN.md §1c),
+ * every other byte of the table as written; and a /me line's excerpt takes the
+ * reader's 12-hour clock with its spoiler hidden. */
+static void test_time_in_tables(void) {
+    const int64_t at = 1793372400000LL;                 /* Friday 30 October 2026, 15:00 UTC */
+    oc_rt_clock utc0 = { 0, 1, 0, at };
+    const char *t = "| When <time:2026-10-30T15:00Z> | Note |\n"
+                    "|:---|---:|\n"
+                    "| <time:2026-10-30T15:00Z> and <time:2026-10-30T16:30Z> | a<br>b |\n"
+                    "| <time:2026-02-30T10:00Z> | x \\| y |";
+    char *loc = oc_rt_local_times(t, strlen(t), &utc0);
+    CHECK(loc != NULL);
+    if (loc) {
+        /* contract: the short form §1c specifies, and the table's own bytes kept */
+        CHECK(strcmp(loc, "| When 15:00 | Note |\n"
+                          "|:---|---:|\n"
+                          "| 15:00 and 16:30 | a<br>b |\n"
+                          "| <time:2026-02-30T10:00Z> | x \\| y |") == 0);
+        free(loc);
+    }
+    /* A token outside the table and one in it, in order. */
+    const char *mix = "Before <time:2026-10-30T15:00Z>\n\n| a |\n|---|\n| <time:2026-10-30T16:30Z> |";
+    loc = oc_rt_local_times(mix, strlen(mix), &utc0);
+    /* contract: the short form §1c specifies, in a table and out of one */
+    CHECK(loc && strstr(loc, "Before 15:00") && strstr(loc, "| 16:30 |") && !strstr(loc, "<time:"));
+    free(loc);
+    /* A table with no token: nothing to change. */
+    const char *none = "| a |\n|---|\n| <b> |";
+    CHECK(oc_rt_local_times(none, strlen(none), &utc0) == NULL);
+
+    /* A /me line's text on a 12-hour clock, its spoiler hidden. */
+    oc_rt_clock twelve = { 0, 0, 0, at };
+    char out[160];
+    const char *me = "leaves at <time:2026-10-30T15:00Z> for >!the airport!<";
+    oc_rt_flatten_at(me, strlen(me), &twelve, out, sizeof out);
+    /* contract: the 12-hour form §1c specifies */
+    CHECK(strstr(out, "3:00") && strstr(out, "PM") && !strstr(out, "15:00"));
+    /* contract: the covered form §1d specifies */
+    CHECK(!strstr(out, "airport") && strstr(out, "[spoiler]"));
+}
+
 /* Spoilers (MARKDOWN.md §1d): both forms, and what is not one. */
 static void test_spoilers(void) {
     oc_rt_spoiler sp[4];
@@ -1026,6 +1067,7 @@ int run_richtext_tests(void) {
     test_time_text();
     test_time_flatten();
     test_time_every_token();
+    test_time_in_tables();
     test_spoilers();
     test_spoiler_line_start();
     test_spoiler_edges();

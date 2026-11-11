@@ -125,6 +125,13 @@ moving the keyboard onto its message, shows all of it with the zone used:
 "Friday 30 October 2026, 20:30 (UTC+05:30)". The terminal client shows the
 short form in place of the token.
 
+This holds wherever a token is: in body text, in a table's cell (in the
+desktop client's grid, and in a table past those it draws as grids, which
+shows as text), and in a `/me` action's line, whether its spoilers are covered
+or shown. A covered spoiler stays covered, the token in it with it. Each takes
+the reader's zone and clock, and, in the desktop client, the hover and focus
+tip; when the clock setting or the day changes, each shows the new form.
+
 Only a real date and time are a token: `<time:2026-02-30T10:00Z>`, an hour past
 23, a missing `Z` or an offset in its place leave the text as typed. Inside
 code it is literal. The composer's **Insert a time** picks a date and time in

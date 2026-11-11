@@ -299,9 +299,10 @@ size_t oc_rt_plain_excerpt(const char *body, size_t len, char *out, size_t cap);
 size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, char *out, size_t cap);
 
 /* Only the time tokens of `body` replaced by their short text for `clock`,
- * every other byte kept, tables included: a body as a frontend that shows the
- * source shows it (the terminal client, MARKDOWN.md §5). Returns a malloc'd
- * string, or NULL when there is no token (show `body` as it is) or no memory. */
+ * those in a table's cells too, and every other byte kept, a table's pipes,
+ * alignment row and `<br>` included: a body as a frontend that shows the source
+ * shows it (the terminal client, MARKDOWN.md §5). Returns a malloc'd string, or
+ * NULL when there is no token (show `body` as it is) or no memory. */
 char *oc_rt_local_times(const char *body, size_t len, const oc_rt_clock *clock);
 
 /* oc_rt_flatten_at for no reader: time tokens in UTC, spoilers hidden. */
