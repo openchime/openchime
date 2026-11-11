@@ -155,6 +155,15 @@ void *oc_plat_tray_notify_handle(unsigned *tray_id);
  * paths picked are written NUL-separated and double-NUL-terminated; returns how
  * many, 0 when cancelled or when the platform has no picker. */
 int   oc_plat_pick_files(SDL_Window *owner, const char *filter, int multi, char *out, size_t cap);
+/* What runs while a native file dialog's own modal loop holds the thread, so the
+ * test hook still answers (TESTING.md, "Driving the Win32 GUI"); NULL for
+ * nothing. Only that: the rest of the client waits for the dialog as before. */
+void  oc_plat_set_modal_tick(void (*fn)(void));
+/* 1 while the file picker is open. */
+int   oc_plat_picker_open(void);
+/* Answer the open file picker as a person would: `path` into its file name box
+ * and OK, or, NULL, its Cancel. 1 when there was one to answer, else 0. */
+int   oc_plat_picker_answer(const char *path);
 /* A save-as picker; `suggested` is the file name offered. 1 with the path in `out`. */
 int   oc_plat_pick_save(SDL_Window *owner, const char *suggested, char *out, size_t cap);
 /* The application has finished writing the file a save-as picker named: a

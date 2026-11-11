@@ -454,6 +454,12 @@ int oc_plat_pick_files(SDL_Window *owner, const char *filter, int multi, char *o
     return n;
 }
 
+/* The browser's picker is the page's, not a modal loop on this thread: nothing
+ * to tick through, and nothing the hook answers. */
+void oc_plat_set_modal_tick(void (*fn)(void)) { (void)fn; }
+int  oc_plat_picker_open(void) { return 0; }
+int  oc_plat_picker_answer(const char *path) { (void)path; return 0; }
+
 /* Saving: the application writes to a path on the page's filesystem, and
  * tells the platform when it has (oc_plat_file_saved); the browser then
  * downloads it, which is the only "save as" a page has. */

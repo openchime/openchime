@@ -35801,11 +35801,12 @@ static void test_dump(const char *path) {
             g_modal_card.right, g_modal_card.bottom,
             g_modal_close_btn.left, g_modal_close_btn.top,
             g_modal_close_btn.right, g_modal_close_btn.bottom, g_n_modal_btns);
-    fprintf(f, "modal=%s theme=%d time24=%d members=%d daysep=%d notify=%d\n",
+    fprintf(f, "modal=%s picker=%d theme=%d time24=%d members=%d daysep=%d notify=%d\n",
             g_prefs_open ? "prefs" : g_keys_open ? "keys" : g_about_open ? "about" :
             g_wsmgr_open ? "wsmgr" : g_notify_open ? "notify" :
             g_browse_open ? "browse" : g_confirm_open ? "confirm" :
             g_sessions_open ? "sessions" : g_form_open ? "form" : "none",
+            oc_plat_picker_open(),
             oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep, g_pref_notify);
     /* The form's shape and its values, so a driven form is checkable: a
      * screenshot of a field proves only that it is there. */
@@ -36548,6 +36549,10 @@ static void test_dump(const char *path) {
 }
 
 /* Poll <OPENCHIME_DEV_DIR>/cmd for one command per tick; write <dir>/ack. */
+static void test_poll(oc_win *hwnd);
+/* The hook alone, from inside a native dialog's modal loop (oc_plat_set_modal_tick). */
+static void test_modal_tick(void) { test_poll(g_main); }
+
 static void test_poll(oc_win *hwnd) {
     if (!g_test_dir[0]) return;
     char cmdpath[600]; snprintf(cmdpath, sizeof cmdpath, "%s\\cmd", g_test_dir);
@@ -36745,11 +36750,20 @@ static void test_poll(oc_win *hwnd) {
         if (g_dir_edit) { field_set(g_dir_edit, arg); test_ack("ok"); }
         else test_ack("err");
     } else if (!strcmp(verb, "attach")) {
-        /* Into the upload tray, as picking the file would: the dialog cannot be
-         * driven, the tray can. */
+        /* Into the upload tray, as picking the file would, without the dialog. */
         int had = g_n_ftray;
         ftray_add(hwnd, arg);
         test_ack(g_n_ftray > had ? "ok" : "err");
+    } else if (!strcmp(verb, "picker")) {
+        /* "cancel" | "pick <path>": answer the real file dialog the composer's
+         * "+" opened, as a person would, so what it returns goes through the
+         * same path as theirs. The hook is answered while the dialog is up
+         * because the dialog's modal loop runs it (test_modal_tick). "none"
+         * when no dialog is open. */
+        if (!oc_plat_picker_open()) test_ack("none");
+        else if (!strcmp(arg, "cancel")) test_ack(oc_plat_picker_answer(NULL) ? "ok" : "err");
+        else if (!strncmp(arg, "pick ", 5) && arg[5]) test_ack(oc_plat_picker_answer(arg + 5) ? "ok" : "err");
+        else test_ack("err");
     } else if (!strcmp(verb, "upload")) {
         /* Bypass the file dialog so an attachment can be posted from the harness. */
         if (g_client && g_sel && arg[0]) { oc_client_upload(g_client, g_sel, arg); test_ack("ok"); }
@@ -40207,6 +40221,9 @@ int main(int argc, char *argv[]) {
      * file command channel. Any other client has no hook to enable. */
     { const char *td = oc_env_dev("OPENCHIME_DEV_DIR");
       if (td) snprintf(g_test_dir, sizeof g_test_dir, "%s", td); }
+    /* While a native file dialog holds the thread in its own loop, the hook
+     * still answers (the picker verb drives that dialog). */
+    if (g_test_dir[0]) oc_plat_set_modal_tick(test_modal_tick);
 
     /* AFTER the test dir is known, because that is where a report belongs when
      * the harness is driving -- and reporting the last run has to happen before

@@ -2099,8 +2099,17 @@ nothing; Esc closes the view. Run on both platforms, `--web` included.
 ## Reading the uploads harness
 
 `tools/gui/uploads.sh` drives the Win32 message box's upload tray (REQ-140)
-against its own fixture daemon (port 9630). It attaches files through the
-`attach` verb — the file dialog cannot be driven, the tray can — and asserts
+against its own fixture daemon (port 9630). On the Windows client it first
+drives the real file dialog: `clickform` on "+" opens the system's Open dialog,
+whose modal loop holds the client's thread, and the hook still answers because a
+thread timer that loop dispatches runs it (`oc_plat_set_modal_tick`; the dump's
+`modal=` line says `picker=1` while the dialog is up). The `picker` verb answers
+the dialog as a person would: `picker cancel` presses its Cancel, and `picker
+pick <path>` puts the path in its file name box and presses OK, so the file
+comes back through the same call a person's pick does; with no dialog open
+either acks `none`. It asserts that Cancel adds nothing and a picked file comes
+back as a chip. Then it attaches files through the `attach` verb, into the tray
+without the dialog, and asserts
 that they wait as chips, an image with its picture, each chip's button published
 to assistive technology, with nothing uploaded; that a chip's × takes it out;
 that Send posts what is left and the text as ONE message and the tray empties;

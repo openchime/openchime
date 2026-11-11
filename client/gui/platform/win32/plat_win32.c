@@ -574,9 +574,57 @@ static void filter_w(const char *filter, WCHAR *out, int cap) {
     out[n + 1] = 0;
 }
 
+/* The file dialog's modal loop is the system's, not the client's pump, so the
+ * test hook (polled from the client's tick) would go unanswered while it is
+ * open. A thread timer is dispatched by any modal loop on this thread, the
+ * dialog's included, and runs the tick the application set. No hook procedure
+ * on the dialog: OFN_ENABLEHOOK brings back the pre-Vista dialog. */
+static void (*g_modal_tick)(void);
+static int  g_picker_up;
+static HWND g_picker_owner;
+
+void oc_plat_set_modal_tick(void (*fn)(void)) { g_modal_tick = fn; }
+int  oc_plat_picker_open(void) { return g_picker_up; }
+
+static void CALLBACK modal_tick_proc(HWND h, UINT msg, UINT_PTR id, DWORD t) {
+    (void)h; (void)msg; (void)id; (void)t;
+    if (g_modal_tick) g_modal_tick();
+}
+
+/* The open file dialog: the dialog-class window on this thread its owner owns. */
+typedef struct { HWND owner, found; } picker_find;
+static BOOL CALLBACK picker_enum(HWND h, LPARAM lp) {
+    picker_find *pf = (picker_find *)lp;
+    WCHAR cls[16];
+    if (!IsWindowVisible(h) || !GetClassNameW(h, cls, 16) || wcscmp(cls, L"#32770") != 0) return TRUE;
+    if (GetWindow(h, GW_OWNER) != pf->owner) return TRUE;
+    pf->found = h;
+    return FALSE;
+}
+
+int oc_plat_picker_answer(const char *path) {
+    if (!g_picker_up) return 0;
+    picker_find pf = { g_picker_owner, NULL };
+    EnumThreadWindows(GetCurrentThreadId(), picker_enum, (LPARAM)&pf);
+    if (!pf.found) return 0;
+    if (!path) {
+        PostMessageW(pf.found, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+        return 1;
+    }
+    /* The file name box (cmb13, 0x47C, the combo box's edit), as typed, then OK:
+     * the path comes back through GetOpenFileNameW as a person's pick does. */
+    WCHAR w[MAX_PATH];
+    to_w(path, w, MAX_PATH);
+    SetDlgItemTextW(pf.found, 0x47C, w);
+    PostMessageW(pf.found, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+    return 1;
+}
+
 int oc_plat_pick_files(SDL_Window *owner, const char *filter, int multi, char *out, size_t cap) {
     static WCHAR file[32 * MAX_PATH];
     WCHAR flt[400];
+    /* One at a time: a tick inside the dialog must not open a second. */
+    if (g_picker_up) return 0;
     file[0] = 0;
     filter_w(filter, flt, 400);
     OPENFILENAMEW ofn; ZeroMemory(&ofn, sizeof ofn);
@@ -586,7 +634,13 @@ int oc_plat_pick_files(SDL_Window *owner, const char *filter, int multi, char *o
     ofn.nMaxFile = sizeof file / sizeof file[0];
     ofn.lpstrFilter = flt[0] ? flt : NULL;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER | (multi ? OFN_ALLOWMULTISELECT : 0);
-    if (!GetOpenFileNameW(&ofn)) return 0;
+    UINT_PTR tick = g_modal_tick ? SetTimer(NULL, 0, 50, modal_tick_proc) : 0;
+    g_picker_owner = ofn.hwndOwner;
+    g_picker_up = 1;
+    BOOL picked = GetOpenFileNameW(&ofn);
+    g_picker_up = 0;
+    if (tick) KillTimer(NULL, tick);
+    if (!picked) return 0;
     size_t o = 0; int n = 0;
     const WCHAR *first = file, *next = file + wcslen(file) + 1;
     char path[1024];
