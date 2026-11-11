@@ -1894,6 +1894,9 @@ static int       g_jump_quiet;
  * destination. The palette picks the destination — it already lists every
  * conversation, so a forward needs no new picker. */
 static uint64_t  g_fwd_mid, g_fwd_cid;
+/* Moving (REQ-053) the same way: the message and where it is, waiting for the
+ * palette's choice, then the choice while the narrowing confirmation asks. */
+static uint64_t  g_move_mid, g_move_cid, g_move_to;
 /* The channel directory (REQ-038). No daemon work: LIST_CHANNELS already
  * returns every PUBLIC channel plus a `joined` flag — the client simply never gave
  * you a place to see them together. */
@@ -1932,7 +1935,8 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
        CONF_WS_FORGET_ALL, CONF_BROADCAST, CONF_DEACTIVATE_SELF, CONF_EMOJI_DELETE,
        /* A call started in a channel asks first, saying how many it will ring;
         * End for everyone asks before it ends the call (CALLS.md §2). */
-       CONF_CALL_START, CONF_CALL_END };
+       CONF_CALL_START, CONF_CALL_END,
+       CONF_MESSAGE_MOVE };
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 static int      g_bc_confirmed;     /* CONF_BROADCAST: the send it confirmed is under way */
@@ -11896,7 +11900,8 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
      * a channel" under the selection — and choosing an action mid-forward can only
      * cancel it. A list whose top item undoes the thing you started is worse than a
      * shorter list. */
-    for (size_t i = 0; !g_fwd_mid && i < sizeof PALETTE / sizeof PALETTE[0] && nh < 12; i++)
+    int picking = g_fwd_mid || g_move_mid;
+    for (size_t i = 0; !picking && i < sizeof PALETTE / sizeof PALETTE[0] && nh < 12; i++)
         if (PALETTE[i].cmd == 88 && !(m && g_sel && oc_model_summarize_available(m))) continue;   /* REQ-313 */
         else if (PALETTE[i].cmd == 90 && !poll_offered(m)) continue;   /* REQ-225 */
         else if (pal_match(PALETTE[i].label, q)) {
@@ -11905,9 +11910,14 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
         }
     static char names[12][96];
     if (m) for (size_t i = 0; i < m->n_channels && nh < 12; i++) {
+        /* A move goes to another channel: never a direct conversation, never
+         * where it already is, never an archived one (REQ-053). */
+        if (g_move_mid && (m->channels[i].kind == OC_CHANNEL_KIND_DM || m->channels[i].archived ||
+                           m->channels[i].channel_id == g_move_cid)) continue;
         channel_label(m, &m->channels[i], names[nh], sizeof names[nh]);
         if (!pal_match(names[nh], q)) continue;
-        hit[nh].label = names[nh]; hit[nh].kind = g_fwd_mid ? "Forward to" : "Go to";
+        hit[nh].label = names[nh];
+        hit[nh].kind = g_move_mid ? "Move to" : g_fwd_mid ? "Forward to" : "Go to";
         hit[nh].cmd = 0; hit[nh].cid = m->channels[i].channel_id; nh++;
     }
     if (nh > (int)maxrows) nh = (int)maxrows;
@@ -11916,7 +11926,7 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
 
     /* The mode label needs its own band, or it collides with the first row — which
      * it did. Panel height and row origin both account for it. */
-    float hint_h = g_fwd_mid ? 18.0f : 0.0f;
+    float hint_h = picking ? 18.0f : 0.0f;
     /* Everything below the search box is measured from its bottom, since the box
      * follows the text scale. */
     float pb = 12 + SEARCH_BOX_H;
@@ -11953,14 +11963,15 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
     if (g_pal_edit) field_draw(rt, g_pal_edit, search_text_box(g_pal_box), OC_COL_TEXT);
     /* Name the mode: the same panel means two things now, and a picker that does
      * not say which is a trap. */
-    if (g_fwd_mid)
-        draw_text(rt, "Forward to", g_meta,
+    if (picking)
+        draw_text(rt, g_move_mid ? "Move to" : "Forward to", g_meta,
                   rf(px + 16, py + pb + 4, px + pw - 12, py + pb + 22), OC_COL_ACCENT);
 
     float y = py + pb + 8 + hint_h;
     if (nh == 0) {
-        draw_text(rt, g_fwd_mid ? "No matching conversation to forward to."
-                                : "No matching action or conversation.", g_ui,
+        draw_text(rt, g_move_mid ? "No matching channel to move it to."
+                      : g_fwd_mid ? "No matching conversation to forward to."
+                                  : "No matching action or conversation.", g_ui,
                   rf(px + 20, y, px + pw - 20, y + rowh), OC_COL_FAINT);
         return;
     }
@@ -15311,6 +15322,7 @@ static void confirm_open(oc_win *hwnd, int act, uint64_t id, const char *title,
 }
 
 static void link_open(const char *url);   /* fwd */
+static void move_send(uint64_t mid, uint64_t to);   /* fwd */
 static void cert_trust_run(oc_win *hwnd);    /* fwd */
 static void bc_resume(int path, bc_held h);  /* fwd */
 static void call_start_confirmed(oc_win *hwnd, uint64_t ch);   /* fwd */
@@ -15330,6 +15342,7 @@ static void confirm_run(oc_win *hwnd) {
     case CONF_INVITE_REVOKE:  oc_client_revoke_invite(g_client, g_confirm_id); break;
     case CONF_DEACTIVATE_SELF: oc_client_deactivate_self(g_client); break;
     case CONF_EMOJI_DELETE:   oc_client_delete_emoji(g_client, g_confirm_emoji); break;
+    case CONF_MESSAGE_MOVE:   move_send(g_confirm_id, g_move_to); break;
     case CONF_CERT_TRUST: cert_trust_run(g_main); break;
     case CONF_PDM_TRUST:  oc_client_pdm_trust(g_client, g_confirm_id); break;
     case CONF_PDM_SAFETY: break;   /* shown, nothing to do */
@@ -27256,6 +27269,7 @@ static void palette_close(oc_win *hwnd) {
     /* Dismissing the picker cancels the forward. Leaving g_fwd_mid set would turn
      * the NEXT palette open — a plain jump-to — into a silent forward. */
     if (g_fwd_mid && !g_pal_accepting) { g_fwd_mid = g_fwd_cid = 0; }
+    if (g_move_mid && !g_pal_accepting) { g_move_mid = g_move_cid = 0; }
     g_pal_open = 0; g_pal_sel = 0;
     if (g_pal_edit) field_show(g_pal_edit, 0);
     ed_focus(g_main);
@@ -27277,6 +27291,7 @@ static void palette_open(oc_win *hwnd) {
  * form, and the palette must not still be on screen behind it. */
 static int  permalink_follow(oc_win *hwnd, const char *text);   /* fwd */
 static void forward_send(oc_win *hwnd, uint64_t to_cid);        /* fwd */
+static void move_pick(oc_win *hwnd, uint64_t to_cid);           /* fwd */
 
 static void palette_accept(oc_win *hwnd) {
     g_pal_accepting = 1;
@@ -27304,6 +27319,12 @@ static void palette_accept(oc_win *hwnd) {
     if (g_fwd_mid) {
         if (cid) forward_send(hwnd, cid);
         else     { g_fwd_mid = g_fwd_cid = 0; fb_confirm("Forward cancelled."); }
+        g_pal_accepting = 0;
+        return;
+    }
+    if (g_move_mid) {
+        if (cid) move_pick(hwnd, cid);
+        else     { g_move_mid = g_move_cid = 0; fb_confirm("Move cancelled."); }
         g_pal_accepting = 0;
         return;
     }
@@ -29324,6 +29345,10 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
     if (may_edit && !msg->deleted && !locked) mi_item(21, "Edit");
     if (own && msg->poll && !msg->deleted && !locked) mi_item(108, "Edit poll");   /* REQ-225 */
     if (may_del && !msg->deleted && !locked) mi_item_d(22, "Delete");
+    /* Move (REQ-053): an author's own, or anything for an admin or owner, out
+     * of a channel -- a direct conversation's messages stay where they were said. */
+    if (canmod && !msg->deleted && !e2e && !locked && c && c->kind != OC_CHANNEL_KIND_DM && !c->archived)
+        mi_item(113, "Move…");
 
     g_menu = MENU_MSG; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 248;
     g_menu_target = mid; g_menu_target2 = chan;
@@ -29451,6 +29476,11 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
         /* The palette picks the destination: it already lists every conversation
          * with a filter, so a forward needs no picker of its own. */
         g_fwd_mid = mid; g_fwd_cid = chan;
+        palette_open(hwnd);
+    } else if (cmd == 113) {
+        /* The palette picks where it goes, as for a forward (REQ-053). */
+        g_fwd_mid = g_fwd_cid = 0;
+        g_move_mid = mid; g_move_cid = chan;
         palette_open(hwnd);
     } else if (cmd == 104) {
         /* Private, so there is no "unsave" state to reflect here — the Later view
@@ -29702,6 +29732,43 @@ static int permalink_parse(const char *text, char *host, size_t hostcap,
     p = end + 3;
     *msg = strtoull(p, &end, 10);
     return (*chan && *msg) ? 1 : 0;
+}
+
+/* The move's destination is chosen (REQ-053). A move into a private channel
+ * can put the message in front of fewer people than read it now, so that is
+ * said, in words, before anything is sent; into a public one it simply goes. */
+static void move_send(uint64_t mid, uint64_t to) {
+    if (!g_client || !mid || !to) return;
+    const oc_model *m = model();
+    const oc_channel *dst = m ? oc_model_channel((oc_model *)m, to) : NULL;
+    oc_client_move_message(g_client, mid, to, 0, 1);
+    char note[160];
+    snprintf(note, sizeof note, "Moved to #%s.", (dst && dst->name && dst->name[0]) ? dst->name : "channel");
+    fb_confirm(note);
+    invalidate();
+}
+
+static void move_pick(oc_win *hwnd, uint64_t to_cid) {
+    const oc_model *m = model();
+    if (!m || !g_client || !g_move_mid || !to_cid) return;
+    const oc_channel *src = oc_model_channel((oc_model *)m, g_move_cid);
+    const oc_channel *dst = oc_model_channel((oc_model *)m, to_cid);
+    uint64_t mid = g_move_mid;
+    g_move_mid = g_move_cid = 0;   /* the palette's next opening is a plain one */
+    if (!dst) return;
+    g_move_to = to_cid;
+    if (!dst->is_public) {
+        const oc_msg *msg = find_msg(src, mid);
+        char body[400];
+        snprintf(body, sizeof body,
+                 "#%s is private. Only its members will be able to read this %s, "
+                 "and people in #%s who are not members of #%s will no longer see it.",
+                 dst->name ? dst->name : "", (msg && msg->reply_count) ? "thread" : "message",
+                 (src && src->name) ? src->name : "", dst->name ? dst->name : "");
+        confirm_open(hwnd, CONF_MESSAGE_MOVE, mid, "Move to a private channel?", body, "Move");
+        return;
+    }
+    move_send(mid, to_cid);
 }
 
 /* Send `mid` on to another conversation as a structured reference (REQ-057,

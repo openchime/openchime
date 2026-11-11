@@ -606,6 +606,10 @@ typedef enum {
     /* Follow every thread in a conversation (REQ-282): the answer is the
      * setter's NOTIFY_PREFS, to each of their connections. */
     OC_MSG_SET_CHANNEL_THREAD_FOLLOW = 0x011B, /* C->S {channel_id, on} */
+    /* Moving a message, or a whole thread, to another channel or into a
+     * thread (REQ-053). Its id, history and replies go with it. */
+    OC_MSG_MOVE_MESSAGE         = 0x011C, /* C->S {message_id, dest_channel_id, dest_parent_id, leave_marker} */
+    OC_MSG_MESSAGE_MOVED        = 0x011D, /* S->C {message_id, from_channel, to_channel, to_parent, count} */
     OC_MSG_FIND_AT_TIME         = 0x011E, /* C->S, the message at a time in a conversation or thread */
     OC_MSG_FOUND_AT_TIME        = 0x011F, /* S->C, its answer: the first at or after it, else the last before */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
@@ -712,6 +716,8 @@ typedef enum {
     OC_ERR_POLL_HAS_VOTES      = 3040, /* a poll's options or settings, once anyone has voted (REQ-225) */
     OC_ERR_EDIT_WINDOW_CLOSED  = 3041, /* an author's edit or delete of their own message, past the workspace's window (REQ-051/052) */
     OC_ERR_WORKSPACE_SENDER    = 3042, /* a message to the workspace's own sender, whose DMs nobody reads */
+    OC_ERR_CANNOT_MOVE         = 3043, /* a move that cannot be made: into or out of an encrypted DM, a thread's
+                                        * root into a thread, into a thread elsewhere, or to where it already is */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -1097,6 +1103,13 @@ typedef struct { uint64_t message_id; uint16_t count; const oc_reaction_entry *e
  * body is fine — terminated by PINS, exactly as LIST_THREAD does, because a
  * pinned message is often scrolled out of a client's loaded history. */
 typedef struct { uint64_t channel_id; uint64_t message_id; uint8_t op; } oc_pin;
+/* MOVE_MESSAGE: `dest_parent_id` 0 moves it to the destination's top level, else
+ * into that thread there; `leave_marker` 1 leaves a line where it was. A root
+ * moves with its replies. */
+typedef struct { uint64_t message_id, dest_channel_id, dest_parent_id; uint8_t leave_marker; } oc_move_message;
+/* MESSAGE_MOVED: to the readers of both channels. `count` is how many messages
+ * moved -- a root and its replies -- and `to_parent` 0 means its top level. */
+typedef struct { uint64_t message_id, from_channel, to_channel, to_parent; uint32_t count; } oc_message_moved;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t user_id; uint8_t op; uint64_t pinned_at; } oc_pin_updated;
 typedef struct { uint64_t channel_id; } oc_list_pins;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time;
@@ -2207,6 +2220,10 @@ oc_result oc_decode_react(oc_rbuf *p, oc_react *m);
 oc_result oc_decode_reaction_updated(oc_rbuf *p, oc_reaction_updated *m);
 oc_result oc_decode_list_reactions(oc_rbuf *p, oc_list_reactions *m);
 oc_result oc_decode_pin(oc_rbuf *p, oc_pin *m);
+oc_result oc_encode_move_message(oc_wbuf *w, uint16_t version, const oc_move_message *m);
+oc_result oc_decode_move_message(oc_rbuf *p, oc_move_message *m);
+oc_result oc_encode_message_moved(oc_wbuf *w, uint16_t version, const oc_message_moved *m);
+oc_result oc_decode_message_moved(oc_rbuf *p, oc_message_moved *m);
 oc_result oc_decode_pin_updated(oc_rbuf *p, oc_pin_updated *m);
 oc_result oc_decode_unfurl(oc_rbuf *p, oc_unfurl *m);
 oc_result oc_decode_forward(oc_rbuf *p, oc_forward *m);

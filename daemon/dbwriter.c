@@ -707,6 +707,7 @@ void oc_job_free(oc_job *j) { job_free(j); }
 
 void oc_dbres_free(oc_dbres *r) {
     if (!r) return;
+    free(r->dest_members);
     free(r->alert_rows);
     free(r->body);
     free(r->pk_creds);
@@ -6644,6 +6645,179 @@ static oc_dbres *process_save_item(sqlite3 *db, const oc_job *j) {
 /* Fold a message away for its reader, or open it again (PROTOCOL.md
  * SET_COLLAPSED): a message in a channel they are a member of, not a tombstone.
  * The answer is for every connection of theirs. Write. */
+/* Whether `channel_id` is a direct conversation: nothing moves into or out of
+ * one, since its readers never chose to share it with a channel. */
+static int channel_is_dm(sqlite3 *db, uint64_t channel_id) {
+    sqlite3_stmt *st = NULL;
+    int yes = 0;
+    if (sqlite3_prepare_v2(db, "SELECT kind='dm' FROM channels WHERE id=?1;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+    if (sqlite3_step(st) == SQLITE_ROW) yes = sqlite3_column_int(st, 0) != 0;
+    sqlite3_finalize(st);
+    return yes;
+}
+
+/* Move a message (REQ-053): a top-level message, or a thread with all of its
+ * replies, to another channel's top level; a message with no replies into a
+ * thread; a reply out to a top level. The ids, authors, times, edits,
+ * reactions, attachments and pins stay; the rows that name a message's
+ * channel besides `messages` follow it, in one transaction. An owner or admin
+ * moves anything, an author their own, and the mover must be able to post in
+ * the destination. A line is left where it was unless the mover said not to.
+ *
+ * The result is MESSAGE_MOVED for both channels' members; each client reads
+ * the moved rows back as it reads any others, so what a reader is shown is
+ * keyed on the reader (saved, collapsed) and not on the mover. */
+static oc_dbres *process_move_message(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->message_id = j->message_id;
+    r->type = OC_RES_MOVE_ERR;
+
+    uint64_t src = 0, author = 0, parent = 0;
+    int deleted = 0, found = 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT channel_id, author_id, deleted_at_ms, COALESCE(parent_id,0) FROM messages WHERE id=?1;",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            src     = (uint64_t)sqlite3_column_int64(st, 0);
+            author  = (uint64_t)sqlite3_column_int64(st, 1);
+            deleted = sqlite3_column_type(st, 2) != SQLITE_NULL;
+            parent  = (uint64_t)sqlite3_column_int64(st, 3);
+            found = 1;
+        }
+        sqlite3_finalize(st);
+    }
+    r->channel_id = src;
+    if (!found || deleted || !channel_read_access(db, src, j->user_id)) {
+        r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r;
+    }
+    uint8_t role = 0;
+    int can = author == j->user_id ||
+              (user_role(db, j->user_id, &role) && (role == OC_ROLE_ADMIN || role == OC_ROLE_OWNER));
+    if (!can) { r->err_code = OC_ERR_FORBIDDEN; return r; }
+    if (channel_is_archived(db, src)) { r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
+    uint8_t dest_public = 0;
+    if (!channel_exists(db, j->channel_id, &dest_public)) { r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    if (channel_is_e2e(db, src) || channel_is_e2e(db, j->channel_id) ||
+        channel_is_dm(db, src) || channel_is_dm(db, j->channel_id)) {
+        r->err_code = OC_ERR_CANNOT_MOVE; return r;
+    }
+
+    uint32_t replies = 0; uint64_t last = 0;
+    thread_stats(db, j->message_id, &replies, &last);
+    if (j->parent_id) {
+        /* Into a thread: a top-level, living message in the destination, and
+         * never one's own thread. A root with replies cannot become a reply --
+         * there is no thread inside a thread. */
+        uint64_t pa = 0; int pd = 0;
+        if (j->parent_id == j->message_id || replies > 0) { r->err_code = OC_ERR_CANNOT_MOVE; return r; }
+        if (!message_lookup(db, j->channel_id, j->parent_id, &pa, &pd) || pd) {
+            r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r;
+        }
+        uint64_t pp = 0;
+        if (sqlite3_prepare_v2(db, "SELECT COALESCE(parent_id,0) FROM messages WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->parent_id);
+            if (sqlite3_step(st) == SQLITE_ROW) pp = (uint64_t)sqlite3_column_int64(st, 0);
+            sqlite3_finalize(st);
+        }
+        if (pp) { r->err_code = OC_ERR_CANNOT_MOVE; return r; }
+    }
+    if (src == j->channel_id && parent == j->parent_id) { r->err_code = OC_ERR_CANNOT_MOVE; return r; }
+    /* Last, as it is the one check that writes: a public destination joins the
+     * mover, as a send there would. */
+    int acc = channel_post_access(db, j->channel_id, j->user_id);
+    if (acc == CH_ARCHIVED) { r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
+    if (acc != CH_OK)       { r->err_code = OC_ERR_FORBIDDEN; return r; }
+
+    sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+    /* The moved set: the message and, when it is a root, its replies. */
+    sqlite3_exec(db, "CREATE TEMP TABLE IF NOT EXISTS move_set(id INTEGER PRIMARY KEY); DELETE FROM move_set;",
+                 NULL, NULL, NULL);
+    int ok = 1;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO temp.move_set(id) SELECT id FROM messages WHERE id=?1 OR (?2 AND parent_id=?1);",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        sqlite3_bind_int(st, 2, parent == 0);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    } else ok = 0;
+    static const char *const follow[] = {
+        "UPDATE messages SET channel_id=?1 WHERE id IN (SELECT id FROM temp.move_set);",
+        "UPDATE mentions SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE pins SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE attachments SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE unfurls SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE polls SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE actions SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE thread_follows SET channel_id=?1 WHERE root_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE sent_messages SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+    };
+    for (size_t i = 0; ok && i < sizeof follow / sizeof follow[0]; i++) {
+        if (sqlite3_prepare_v2(db, follow[i], -1, &st, NULL) != SQLITE_OK) { ok = 0; break; }
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    if (ok && sqlite3_prepare_v2(db, "UPDATE messages SET parent_id=NULLIF(?2,0) WHERE id=?1;",
+                                 -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->parent_id);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    uint32_t count = 0;
+    if (ok && sqlite3_prepare_v2(db, "SELECT id FROM temp.move_set;", -1, &st, NULL) == SQLITE_OK) {
+        /* A summary that read it there no longer describes that channel. */
+        while (sqlite3_step(st) == SQLITE_ROW) { sum_purge_msg(db, (uint64_t)sqlite3_column_int64(st, 0)); count++; }
+        sqlite3_finalize(st);
+    }
+    if (!ok) {
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        r->err_code = OC_ERR_INTERNAL; return r;
+    }
+
+    char detail[96];
+    snprintf(detail, sizeof detail, "from %llu to %llu, %u message%s",
+             (unsigned long long)src, (unsigned long long)j->channel_id, count, count == 1 ? "" : "s");
+    audit_actor(db, OC_AUDIT_MODERATION, "message.move", j->user_id, j->message_id, NULL, 1, detail);
+    if (j->move_marker) {
+        char *who = audit_name_of(db, j->user_id);
+        char *dn = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT name FROM channels WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0))
+                dn = strdup((const char *)sqlite3_column_text(st, 0));
+            sqlite3_finalize(st);
+        }
+        char line[OC_MAX_BODY_SIZE < 512 ? OC_MAX_BODY_SIZE : 512];
+        int len = snprintf(line, sizeof line, "%s moved %s to #%s.", who ? who : "Someone",
+                           count > 1 ? "a thread" : "a message", dn ? dn : "another channel");
+        if (len > 0) notice_post(db, src, line, (size_t)len < sizeof line ? (size_t)len : sizeof line - 1);
+        free(who); free(dn);
+    }
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+
+    r->type = OC_RES_MESSAGE_MOVED;
+    r->user_id = j->user_id;
+    r->move_to = j->channel_id;
+    r->parent_id = j->parent_id;
+    r->reply_count = count;
+    load_members(db, src, r);
+    {
+        oc_dbres d; memset(&d, 0, sizeof d);
+        load_members(db, j->channel_id, &d);
+        r->dest_members = d.members;
+        r->n_dest_members = d.n_members;
+    }
+    return r;
+}
+
 static oc_dbres *process_set_collapsed(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -8179,7 +8353,20 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     r->conn_id = j->conn_id;
     r->type = OC_RES_BACKFILL_OK;
     r->channel_id = j->channel_id;
-    if (!channel_read_access(db, j->channel_id, j->user_id)) return r;
+    /* A link names the channel a message was in when it was copied; a moved
+     * message (REQ-053) is read where it is now, for a reader who may. */
+    uint64_t chan = j->channel_id;
+    if (j->hist_around && j->message_id) {
+        sqlite3_stmt *ls = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT channel_id FROM messages WHERE id=?1;", -1, &ls, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(ls, 1, (sqlite3_int64)j->message_id);
+            if (sqlite3_step(ls) == SQLITE_ROW) chan = (uint64_t)sqlite3_column_int64(ls, 0);
+            sqlite3_finalize(ls);
+        }
+        if (chan != j->channel_id && channel_read_access(db, chan, j->user_id)) r->channel_id = chan;
+        else chan = j->channel_id;
+    }
+    if (!channel_read_access(db, chan, j->user_id)) return r;
 
     uint16_t lim = j->search_limit;
     if (lim == 0 || lim > OC_BACKFILL_TAIL) lim = OC_BACKFILL_TAIL;
@@ -8240,7 +8427,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
           ") ORDER BY id;";
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK)
         return r;
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)chan);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)before);
     sqlite3_bind_int64(st, 3, (sqlite3_int64)lim);
     /* Numbered explicitly, like the backfill query: an anonymous marker takes
@@ -8260,7 +8447,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
         oc_replay_msg *m = &arr[n];
         memset(m, 0, sizeof *m);
         m->message_id  = (uint64_t)sqlite3_column_int64(st, 0);
-        m->channel_id  = j->channel_id;
+        m->channel_id  = chan;
         m->author_id   = (uint64_t)sqlite3_column_int64(st, 1);
         m->server_time = (uint64_t)sqlite3_column_int64(st, 2);
         const void *b = sqlite3_column_blob(st, 3);
@@ -8294,7 +8481,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
         if (sqlite3_prepare_v2(db,
                 "SELECT EXISTS(SELECT 1 FROM messages WHERE channel_id=?1 AND id<?2 "
                 "AND (parent_id IS NULL OR also_channel=1));", -1, &mt, NULL) == SQLITE_OK) {
-            sqlite3_bind_int64(mt, 1, (sqlite3_int64)j->channel_id);
+            sqlite3_bind_int64(mt, 1, (sqlite3_int64)chan);
             sqlite3_bind_int64(mt, 2, (sqlite3_int64)arr[0].message_id);
             if (sqlite3_step(mt) == SQLITE_ROW)
                 r->truncated = (uint8_t)sqlite3_column_int(mt, 0);
@@ -11431,6 +11618,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SAVE_ITEM)      return process_save_item(w->db, j);
     if (j->type == OC_JOB_SET_COLLAPSED)  return process_set_collapsed(w->db, j);
     if (j->type == OC_JOB_FIND_AT_TIME)   return process_find_at_time(w->db, j);
+    if (j->type == OC_JOB_MOVE_MESSAGE)   return process_move_message(w->db, j);
     /* On the WRITER because it stamps the seen watermark; the read half would
      * otherwise be a reader job with a write in it. */
     if (j->type == OC_JOB_LIST_ACTIVITY)  return process_list_activity(w->db, j);

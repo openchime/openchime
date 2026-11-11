@@ -3321,6 +3321,17 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_MOVE_MESSAGE) {   /* REQ-053 */
+            oc_move_message mm;
+            if (oc_decode_move_message(&p, &mm) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_MOVE_MESSAGE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = mm.message_id;
+            j->channel_id = mm.dest_channel_id; j->parent_id = mm.dest_parent_id;
+            j->move_marker = mm.leave_marker ? 1 : 0;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_ATTACH_MEDIA_SET) {
             oc_attach_media_set ms;
             if (oc_decode_attach_media_set(&p, &ms) != OC_OK) return -1;
@@ -6602,6 +6613,35 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, w.len);
             fanout_actions(ep, conns, r);   /* the action came back with its body (REQ-058) */
         }
+        break;
+    }
+    case OC_RES_MESSAGE_MOVED: {
+        /* To the readers of both channels, each once: the source's drop it, the
+         * destination's read it back as they read any message (REQ-053). */
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_message_moved m = { r->message_id, r->channel_id, r->move_to, r->parent_id, r->reply_count };
+        if (oc_encode_message_moved(&w, OC_PROTOCOL_VERSION, &m) != OC_OK) break;
+        size_t blen = w.len;
+        fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
+        size_t k = 0;
+        for (size_t i = 0; i < r->n_dest_members; i++) {
+            int seen = 0;
+            for (size_t s = 0; s < r->n_members && !seen; s++) seen = r->members[s] == r->dest_members[i];
+            if (!seen) r->dest_members[k++] = r->dest_members[i];
+        }
+        fanout_members(ep, conns, r->dest_members, k, 0, g_enc, blen);
+        break;
+    }
+    case OC_RES_MOVE_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        uint8_t ctx[8];
+        for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->message_id >> (56 - 8 * i));
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_slice cs = { ctx, sizeof ctx };
+        oc_error e = { r->err_code, 0, cs, oc_slice_str("move rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
     case OC_RES_EDIT_ERR:

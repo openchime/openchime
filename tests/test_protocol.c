@@ -1407,6 +1407,24 @@ static void test_admin_frames(void) {
         CHECK(oc_parse_frame(frame, w.len, &h, &p) == OC_OK);
         CHECK(oc_decode_found_at_time(&p, &out) == OC_E_MALFORMED);
     }
+    {   /* A message moved (REQ-053): asked for, into a thread, leaving a line. */
+        oc_move_message in = { 5150, 31, 4400, 1 };
+        ROUNDTRIP(oc_encode_move_message(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MOVE_MESSAGE, h, p);
+        oc_move_message out;
+        CHECK(oc_decode_move_message(&p, &out) == OC_OK && out.message_id == 5150 &&
+              out.dest_channel_id == 31 && out.dest_parent_id == 4400 && out.leave_marker == 1);
+        /* The marker is a yes or a no: anything else is refused. */
+        frame[w.len - 1] = 2;
+        CHECK(oc_parse_frame(frame, w.len, &h, &p) == OC_OK);
+        CHECK(oc_decode_move_message(&p, &out) == OC_E_MALFORMED);
+    }
+    {   /* ...and told to both channels' readers. */
+        oc_message_moved in = { 5150, 30, 31, 0, 4 };
+        ROUNDTRIP(oc_encode_message_moved(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MESSAGE_MOVED, h, p);
+        oc_message_moved out;
+        CHECK(oc_decode_message_moved(&p, &out) == OC_OK && out.message_id == 5150 &&
+              out.from_channel == 30 && out.to_channel == 31 && out.to_parent == 0 && out.count == 4);
+    }
     {   /* A removed member brought back (REQ-033). */
         oc_enable_user in = { 43 };
         ROUNDTRIP(oc_encode_enable_user(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ENABLE_USER, h, p);

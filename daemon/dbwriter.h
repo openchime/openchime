@@ -308,6 +308,9 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* Follow every thread in a conversation, or stop (REQ-282): channel_id
         * and follow_on; answered with the NOTIFY_PREFS snapshot. */
        OC_JOB_SET_CHANNEL_THREAD_FOLLOW = 150,
+       /* MOVE_MESSAGE (REQ-053). Answered OC_RES_MESSAGE_MOVED to both
+        * channels, or OC_RES_MOVE_ERR to the mover. */
+       OC_JOB_MOVE_MESSAGE = 151,
        /* FIND_AT_TIME: the message at `find_at_ms` in channel_id, in the
         * thread parent_id or its main scroll (0). A read. */
        OC_JOB_FIND_AT_TIME = 152 };
@@ -515,6 +518,9 @@ typedef struct oc_job {
     uint64_t       message_id; /* target message for EDIT / DELETE */
     uint64_t       parent_id;  /* thread parent for SEND_REPLY / LIST_THREAD */
     uint8_t        also_channel; /* SEND_REPLY: also to the channel's main scroll (REQ-062) */
+    /* MOVE_MESSAGE (REQ-053): message_id, channel_id the destination, parent_id
+     * the destination thread (0 its top level), and whether to leave a line. */
+    uint8_t        move_marker;
     uint64_t       sched_at_ms; /* SCHEDULE / UPDATE_SCHEDULED: when to send */
     uint8_t        act_filter;  /* LIST_ACTIVITY: OC_ACTF_* (REQ-139) */
     char          *recipients;  /* SET_DRAFT with no channel (REQ-229); heap */
@@ -800,6 +806,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* A message folded or opened (message_id, save_op): to every
         * connection of user_id. */
        OC_RES_COLLAPSED = 124,
+       /* A message, or a thread, moved (REQ-053): MESSAGE_MOVED to both
+        * channels' members, and the moved rows to the destination's. */
+       OC_RES_MESSAGE_MOVED = 125, OC_RES_MOVE_ERR = 126,
        /* FOUND_AT_TIME to the asker: channel_id, parent_id, message_id (0 for
         * none), server_time, and found_exact. */
        OC_RES_FOUND_AT_TIME = 127 };
@@ -1085,6 +1094,13 @@ typedef struct oc_dbres {
     /* FOUND_AT_TIME: 1 when message_id is at or after the time asked, 0 when
      * it is the last before it. */
     uint8_t        found_exact;
+    /* MESSAGE_MOVED (REQ-053): where it went -- channel_id is where it was,
+     * parent_id the thread it went into (0 the top level), reply_count how many
+     * moved -- and the destination's members, besides `members`, the source's.
+     * The moved rows ride `replay`. */
+    uint64_t       move_to;
+    uint64_t      *dest_members;   /* heap */
+    size_t         n_dest_members;
 
     /* SEND_OK */
     uint64_t       message_id;

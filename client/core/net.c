@@ -1570,6 +1570,16 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     oc_queue_push(to_ui, e);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_MESSAGE_MOVED) {   /* REQ-053 */
+            oc_message_moved mv;
+            if (oc_decode_message_moved(&p, &mv) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_MESSAGE_MOVED);
+                if (e) {
+                    e->message_id = mv.message_id; e->channel_id = mv.from_channel;
+                    e->to_channel = mv.to_channel; e->parent_id = mv.to_parent; e->count = mv.count;
+                    oc_queue_push(to_ui, e);
+                }
+            }
         } else if (hdr.msg_type == OC_MSG_THREAD_REPLY) {
             oc_thread_reply tr;
             if (oc_decode_thread_reply(&p, &tr) == OC_OK) {
@@ -3611,6 +3621,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_collapsed sc = { c->message_id, c->op };
                 if (oc_encode_set_collapsed(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_MOVE_MESSAGE) {
+                uint8_t buf[48]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_move_message mm = { c->message_id, c->channel_id, c->parent_id, c->op };
+                if (oc_encode_move_message(&w, OC_PROTOCOL_VERSION, &mm) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_LIST_SAVED) {

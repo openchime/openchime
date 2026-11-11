@@ -1283,6 +1283,34 @@ answered the same. A delete takes the message's folds with it. (A message long
 enough to be folded *for everyone* is the client's rule, CLIENT.md, and is not
 on the wire.)
 
+**`MOVE_MESSAGE` (client → server), msg_type `0x011C`** `{ message_id: u64,
+dest_channel_id: u64, dest_parent_id: u64, leave_marker: u8 }` moves a message
+(REQ-053): to `dest_channel_id`'s top level when `dest_parent_id` is `0`, or
+into the thread of that top-level message there. A thread root moves with all
+of its replies, so a thread is never split, and it cannot become a reply
+(`CANNOT_MOVE`); a reply can move out to a top level. An owner or admin may move
+any message, an author their own (`FORBIDDEN`). The mover must be able to read
+the source (`UNKNOWN_MESSAGE` otherwise) and post in the destination
+(`FORBIDDEN`; a public one joins them, as a send does). Neither channel may be
+archived (`CHANNEL_ARCHIVED`), a DM or an encrypted DM (`CANNOT_MOVE`).
+`leave_marker` is `0` or `1`, anything else malformed.
+
+The message keeps its id, author, time, edits, reactions, attachments and pin;
+its mentions, pin, files, previews and poll follow it, all in one transaction,
+and the move is audited (`message.move`). With `leave_marker` `1`, the
+workspace's own sender says in the source "<mover> moved a message to #dest"
+(or "a thread"), as a `BROADCAST` like its other notices.
+
+**`MESSAGE_MOVED` (`0x011D`)** `{ message_id: u64, from_channel: u64,
+to_channel: u64, to_parent: u64, count: u32 }` goes to the members of both
+channels, each connection once; `count` is how many messages moved. A client
+drops the message (and a thread's replies) from where it was, and reads the
+moved rows where they now are as it reads any others: `HISTORY_AROUND` the
+message at a top level, the thread again when it went into an open one. A
+`HISTORY_AROUND` naming the channel a moved message used to be in answers from
+the channel it is in now, for a reader who may read that one, so a copied link
+still finds it.
+
 **`LIST_ACTIVITY` (`0x0067`)** `{ filter: u8 }` streams **`ACTIVITY_ENTRY`
 (`0x0068`)** newest first, then **`ACTIVITY` (`0x0069`)** `{ count: u32,
 seen_at: u64 }`. `filter` is `0` involved-me (the original question) · `1` unread
@@ -3299,6 +3327,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3040` | `POLL_HAS_VOTES`      | messaging  | no    | An `EDIT_POLL` changing a poll's options or settings after someone voted; only its deadline can change now (REQ-225). |
 | `3041` | `EDIT_WINDOW_CLOSED`  | messaging  | no    | An author's `EDIT`, or `DELETE` of their own message, past the window the workspace's configuration sets (`OPENCHIME_EDIT_WINDOW`, `OPENCHIME_DELETE_WINDOW`, which clients are told as `edit_window` and `delete_window`). An admin's or owner's delete of someone else's message is never limited (REQ-051, REQ-052). |
 | `3042` | `WORKSPACE_SENDER`    | messaging  | no    | A message, reply or file sent into a DM with the workspace's own sender (`USER_LIST` `flags`), whose DMs nobody reads. |
+| `3043` | `CANNOT_MOVE`         | messaging  | no    | A `MOVE_MESSAGE` that cannot be made: into or out of a DM or encrypted DM, a thread root with replies into a thread, into a thread that is itself a reply, or to where it already is (REQ-053). |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing
@@ -3569,6 +3598,8 @@ this table cannot silently gain a shared value.
 | `0x0118` | `COLLAPSED_UPDATED` | S → C | to each of my connections: a message folded or opened; replayed in backfill |
 | `0x0119` | `WORKSPACE_SETTINGS` | S → C | read-only: the workspace's settings clients act on, after `WORKSPACE_INFO` |
 | `0x011A` | `READ_RECEIPTS` | both | whether I share my read receipts: set or ask, and told |
+| `0x011C` | `MOVE_MESSAGE` | C → S | move a message, or a thread whole, to another channel or into a thread (REQ-053) |
+| `0x011D` | `MESSAGE_MOVED` | S → C | to the readers of both channels, once each: a message moved |
 | `0x011E` | `FIND_AT_TIME` | C → S | the message at a moment in a conversation or one thread of it (jump to a date) |
 | `0x011F` | `FOUND_AT_TIME` | S → C | its answer: the first at or after the moment, else the last before |
 

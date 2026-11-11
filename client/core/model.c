@@ -2773,6 +2773,45 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             }
         break;
     }
+    case OC_EV_MESSAGE_MOVED: {
+        /* Gone from where it was (REQ-053): out of the channel's scroll, or out
+         * of the open thread with its root counting one fewer. A thread moved
+         * whole takes the open thread's view with it. */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        for (size_t i = 0; c && i < c->n_msgs; i++)
+            if (c->msgs[i].message_id == e->message_id) {
+                msg_free(&c->msgs[i]);
+                memmove(&c->msgs[i], &c->msgs[i + 1], (c->n_msgs - i - 1) * sizeof *c->msgs);
+                c->n_msgs--;
+                break;
+            }
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id && m->thread_parent != e->message_id) {
+                msg_free(&m->thread_msgs[i]);
+                memmove(&m->thread_msgs[i], &m->thread_msgs[i + 1],
+                        (m->n_thread_msgs - i - 1) * sizeof *m->thread_msgs);
+                m->n_thread_msgs--;
+                for (size_t k = 0; c && k < c->n_msgs; k++)
+                    if (c->msgs[k].message_id == m->thread_parent) {
+                        if (c->msgs[k].reply_count) c->msgs[k].reply_count--;
+                        break;
+                    }
+                break;
+            }
+        if (m->thread_open && m->thread_parent == e->message_id) m->thread_channel = e->to_channel;
+        /* Where it went: read back as any other rows, if this client holds that
+         * conversation at all. */
+        oc_channel *d = oc_model_channel(m, e->to_channel);
+        if (e->parent_id) {
+            for (size_t k = 0; d && k < d->n_msgs; k++)
+                if (d->msgs[k].message_id == e->parent_id) { d->msgs[k].reply_count++; break; }
+            if (m->thread_open && m->thread_parent == e->parent_id) m->moved_fetch_thread = 1;
+        } else if (d && d->n_msgs) {
+            m->moved_fetch_channel = e->to_channel;
+            m->moved_fetch_message = e->message_id;
+        }
+        break;
+    }
     case OC_EV_RESTORE: {
         /* Back over its tombstone, in both lists it may be in; its files follow
          * as ATTACH events and fold on as for any message. */

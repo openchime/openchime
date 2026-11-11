@@ -273,6 +273,12 @@ void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op);
 /* Fold a message away for me on every device (on 1), or open it again (on 0).
  * The model's msg->collapsed follows when the daemon answers. */
 void oc_client_set_collapsed(oc_client *c, uint64_t message_id, int on);
+/* Move a message (REQ-053): to `dest_channel`'s top level, or into the thread
+ * `dest_parent` there. A thread root moves with its replies. `leave_marker`
+ * leaves a line where it was. Both channels' readers are told (MESSAGE_MOVED);
+ * a refusal comes back as an error carrying the message id. */
+void oc_client_move_message(oc_client *c, uint64_t message_id, uint64_t dest_channel,
+                            uint64_t dest_parent, int leave_marker);
 void oc_client_list_saved(oc_client *c);
 void oc_client_close_saved(oc_client *c);
 

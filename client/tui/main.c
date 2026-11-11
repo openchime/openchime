@@ -1087,6 +1087,8 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_EMOTICONS,
        /* open a conversation at a date, typed */
        ACT_JUMP_DATE,
+       /* move a message to another channel (REQ-053) */
+       ACT_MOVE,
        ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
@@ -3287,7 +3289,11 @@ int main(int argc, char **argv) {
     /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
      * /nick with a discoverable text prompt. */
     enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_NICK, PROMPT_UPLOAD,
-           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE, PROMPT_DATE };
+           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE, PROMPT_DATE, PROMPT_MOVE };
+    /* A move into a private channel (REQ-053): y/N, naming who will no longer
+     * see it, before it is sent. */
+    uint64_t move_ask_mid = 0, move_ask_to = 0;
+    char move_ask_text[400] = "";
     int await_invite = 0;   /* open the roster on the invitation once it is made */
     /* The invite prompt's explanation, which names the provider, and what was
      * wrong with the last answer ("" when nothing was). */
@@ -3458,6 +3464,7 @@ int main(int argc, char **argv) {
                              "Deactivate your account? You will be signed out everywhere and "
                              "cannot sign in; an owner or admin can bring it back. The only "
                              "owner must make another first. [y/N]");
+        if (move_ask_mid) tk_modal_confirm(tb_width(), tb_height(), move_ask_text);
         if (action_open) {
             int mh = g_nmenu + 3; if (mh > tb_height() - 2) mh = tb_height() - 2;
             /* As wide as its longest item (a summary's line is long), within
@@ -3687,6 +3694,11 @@ int main(int argc, char **argv) {
             if (ev.ch == 'y' || ev.ch == 'Y') oc_client_deactivate_self(cl);
             continue;
         }
+        if (move_ask_mid) {                    /* y moves it; anything else leaves it */
+            if (ev.ch == 'y' || ev.ch == 'Y') oc_client_move_message(cl, move_ask_mid, move_ask_to, 0, 1);
+            move_ask_mid = move_ask_to = 0;
+            continue;
+        }
         if (help_open) {                       /* help overlay: any key closes it */
             if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
             else help_open = 0;
@@ -3712,6 +3724,27 @@ int main(int argc, char **argv) {
                     uint64_t day = tui_parse_day(v);
                     if (day) { date_cid = act_cid; date_day = day; oc_client_find_at_time(cl, act_cid, 0, day); }
                     else snprintf(g_closed_note, sizeof g_closed_note, "Not a date: try 2026-05-03, today or yesterday.");
+                }
+                else if (k == PROMPT_MOVE && *v) {
+                    /* The destination by name, with or without its '#': another
+                     * channel, not a direct conversation (REQ-053). */
+                    const oc_model *mv = oc_client_model(cl);
+                    const char *nm = v[0] == '#' ? v + 1 : v;
+                    const oc_channel *src = oc_model_channel((oc_model *)mv, act_cid), *dst = NULL;
+                    for (size_t q = 0; q < mv->n_channels; q++)
+                        if (mv->channels[q].kind != OC_CHANNEL_KIND_DM && mv->channels[q].name &&
+                            !strcmp(mv->channels[q].name, nm)) { dst = &mv->channels[q]; break; }
+                    if (!dst || dst->channel_id == act_cid) {
+                        snprintf(g_closed_note, sizeof g_closed_note, "No other channel is called #%s.", nm);
+                    } else if (!dst->is_public) {
+                        snprintf(move_ask_text, sizeof move_ask_text,
+                                 "Move it to #%s? It is private: only its members will be able to "
+                                 "read it, and people in #%s who are not will no longer see it. [y/N]",
+                                 dst->name, (src && src->name) ? src->name : "");
+                        move_ask_mid = act_mid; move_ask_to = dst->channel_id;
+                    } else {
+                        oc_client_move_message(cl, act_mid, dst->channel_id, 0, 1);
+                    }
                 }
                 else if (k == PROMPT_INVITE) {
                     /* An address where the workspace signs people in through a
@@ -3917,6 +3950,7 @@ int main(int argc, char **argv) {
                         g_hold_unread = act_cid;
                     }
                     else if (id == ACT_DELETE)      oc_client_delete(cl, act_cid, act_mid);
+                    else if (id == ACT_MOVE) { prompt_kind = PROMPT_MOVE; prompt_title = "Move to channel (name)"; tk_input_init(&prompt_input, 0, "#channel"); }
                     else if (id == ACT_DM) {
                         oc_client_open_dm(cl, act_uid, 0);
                         g_dm_asked = act_uid; g_dm_asked_e2e = 0;
@@ -4168,6 +4202,15 @@ int main(int argc, char **argv) {
                     if (ev.key == TB_KEY_ENTER) {   /* open the discoverable action menu */
                         menu_build_msg(own, may_edit, may_del, sel->deleted || locked, has_attach && !ch->e2e, sel->poll,   /* no files in an encrypted DM */
                                        has_spoilers(sel->body) ? 1 + spoilers_shown(mid) : 0, sel->collapsed);
+                        /* Move (REQ-053): one's own, or anything for an admin or
+                         * owner, out of a channel that is not archived. */
+                        uint8_t role = OC_ROLE_MEMBER;
+                        for (size_t u = 0; u < mm->n_users; u++)
+                            if (mm->users[u].user_id == mm->user_id) { role = mm->users[u].role; break; }
+                        if (!sel->deleted && !ch->e2e && ch->kind != OC_CHANNEL_KIND_DM && !ch->archived &&
+                            (sel->author_id == mm->user_id || role >= OC_ROLE_ADMIN) &&
+                            g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+                            g_menu[g_nmenu++] = (menuitem){ "Move to another channel", ACT_MOVE };
 
                         act_cid = cid; act_mid = mid; act_uid = 0; act_title = "Message";
                         action_open = 1; tk_list_reset_filter(&action_menu);

@@ -530,6 +530,43 @@ oc_result oc_encode_reaction_updated(oc_wbuf *w, uint16_t version, const oc_reac
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_move_message(oc_wbuf *w, uint16_t version, const oc_move_message *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_MOVE_MESSAGE);
+    oc_w_u64(w, m->message_id);
+    oc_w_u64(w, m->dest_channel_id);
+    oc_w_u64(w, m->dest_parent_id);
+    oc_w_u8(w, m->leave_marker ? 1u : 0u);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_move_message(oc_rbuf *p, oc_move_message *m) {
+    m->message_id = oc_r_u64(p);
+    m->dest_channel_id = oc_r_u64(p);
+    m->dest_parent_id = oc_r_u64(p);
+    m->leave_marker = oc_r_u8(p);
+    if (m->leave_marker > 1) return OC_E_MALFORMED;
+    return r_done(p);
+}
+
+oc_result oc_encode_message_moved(oc_wbuf *w, uint16_t version, const oc_message_moved *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_MESSAGE_MOVED);
+    oc_w_u64(w, m->message_id);
+    oc_w_u64(w, m->from_channel);
+    oc_w_u64(w, m->to_channel);
+    oc_w_u64(w, m->to_parent);
+    oc_w_u32(w, m->count);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_message_moved(oc_rbuf *p, oc_message_moved *m) {
+    m->message_id = oc_r_u64(p);
+    m->from_channel = oc_r_u64(p);
+    m->to_channel = oc_r_u64(p);
+    m->to_parent = oc_r_u64(p);
+    m->count = oc_r_u32(p);
+    return r_done(p);
+}
+
 oc_result oc_encode_pin(oc_wbuf *w, uint16_t version, const oc_pin *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_PIN);
     oc_w_u64(w, m->channel_id);
@@ -1521,6 +1558,7 @@ const char *oc_error_text(uint16_t code) {
     case OC_ERR_POLL_HAS_VOTES: return "people have voted, so the options and settings can no longer change";
     case OC_ERR_EDIT_WINDOW_CLOSED: return "this workspace no longer lets you change or delete that message";
     case OC_ERR_WORKSPACE_SENDER: return "messages from the workspace take no replies";
+    case OC_ERR_CANNOT_MOVE:      return "that message can't be moved there";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;

@@ -2663,6 +2663,59 @@ static void test_collapsed_sync(int port, const uint8_t *pin) {
     client_close(&other); client_close(&a2); client_close(&a1);
 }
 
+/* A message moved (REQ-053) is told to the readers of both channels, each of
+ * them once: here Bob's message goes from the open channel to a private one of
+ * Alice's, so Bob hears it leave and Alice, in both, hears it one time. */
+static void test_move_message_live(int port, const uint8_t *pin) {
+    client a, b;
+    uint64_t ua = 0, ub = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    uint8_t buf[256]; oc_wbuf w; oc_header h; oc_rbuf p;
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_channel cch = { oc_slice_str("move-room"), 0 };
+    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cch) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &h, &p) == 0);
+    oc_channel_info info; CHECK(oc_decode_channel_info(&p, &info) == OC_OK);
+    uint64_t room = info.channel_id;
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send sd = {0}; sd.channel_id = 1; memset(sd.idem, 0x7A, OC_IDEM_SIZE);
+    sd.body = oc_slice_str("this belongs in move-room");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_SEND_ACK, &h, &p) == 0);
+    oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK);
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_move_message mm = { ack.message_id, room, 0, 1 };
+    CHECK(oc_encode_move_message(&w, OC_PROTOCOL_VERSION, &mm) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    oc_message_moved got;
+    CHECK(read_type(&a, OC_MSG_MESSAGE_MOVED, &h, &p) == 0 && oc_decode_message_moved(&p, &got) == OC_OK);
+    CHECK(got.message_id == ack.message_id && got.from_channel == 1 && got.to_channel == room &&
+          got.to_parent == 0 && got.count == 1);
+    CHECK(read_type(&b, OC_MSG_MESSAGE_MOVED, &h, &p) == 0 && oc_decode_message_moved(&p, &got) == OC_OK);
+    CHECK(got.message_id == ack.message_id && got.to_channel == room);
+    /* Alice heard it once: her next frames, up to the answer to a question
+     * asked now, hold no second one. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_list_saved(&w, OC_PROTOCOL_VERSION) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    int again = 0;
+    for (;;) {
+        if (read_frame(&a, &h, &p) != 0) break;
+        if (h.msg_type == OC_MSG_MESSAGE_MOVED) again = 1;
+        if (h.msg_type == OC_MSG_SAVED) break;
+    }
+    CHECK(!again);
+    /* Bob may not move it back: it is in a channel he cannot post in. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_move_message back = { ack.message_id, 1, 0, 0 };
+    CHECK(oc_encode_move_message(&w, OC_PROTOCOL_VERSION, &back) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_ERROR, &h, &p) == 0);
+    oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_UNKNOWN_MESSAGE);
+    client_close(&b); client_close(&a);
+}
+
 /* One device signed out on its own (REQ-182): its connection closes, the list
  * comes back without it, the asker's own goes on, and a session id that is not
  * the asker's does nothing. Sessions in use have last_seen_ms written in
@@ -8487,6 +8540,7 @@ int run_netloop_tests(void) {
         test_revoke_one_session(arg.port, pin);
         test_get_profile(arg.port, pin);
         test_collapsed_sync(arg.port, pin);
+        test_move_message_live(arg.port, pin);
         test_groups_vertical(arg.port, pin);
         test_groups_unasked(arg.port, pin);
         test_http_stack();

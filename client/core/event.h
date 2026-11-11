@@ -203,6 +203,9 @@ enum {
     OC_EV_COLLAPSED,       /* a message folded away (op 1) or opened (op 0) for me: message_id + op */
     OC_EV_FOUND_AT_TIME,   /* the message at a time (jump to a date): channel_id, parent_id,
                               message_id (0 none), server_time, op = 1 at or after the time */
+    OC_EV_MESSAGE_MOVED,   /* a MESSAGE_MOVED (REQ-053): message_id, channel_id = where it was,
+                              to_channel, parent_id = the thread it went into (0 a top
+                              level), count = how many moved */
     OC_EV_SAVED_MSG,       /* one saved item (streamed) */
     OC_EV_SAVED_END,       /* the saved list is complete: count */
     /* Drafts (REQ-223). One draft — a list entry AND the device-sync push, which
@@ -350,6 +353,7 @@ typedef struct {
     uint64_t author_id;
     uint64_t message_id;
     uint64_t parent_id;    /* THREAD_REPLY: the parent message this replies to */
+    uint64_t to_channel;   /* MESSAGE_MOVED: the channel it went to */
     uint64_t server_time;
     uint8_t  status;       /* PRESENCE: online/away/offline; CHANNEL: joined flag */
     uint8_t  is_public;    /* CHANNEL: 1 public, 0 private/DM */
@@ -496,6 +500,8 @@ enum {
     OC_CMD_SET_COLLAPSED,  /* fold `message_id` away for me (op 1) or open it (op 0) */
     OC_CMD_FIND_AT_TIME,   /* the message at `server_time` (ms) in `channel_id`, in the thread
                               `message_id` or its main scroll (0) */
+    OC_CMD_MOVE_MESSAGE,   /* move `message_id` to `channel_id`, into thread `parent_id`
+                              (0 its top level); op 1 leaves a line where it was (REQ-053) */
     OC_CMD_LIST_SAVED,     /* my saved items */
     OC_CMD_LIST_ACTIVITY,  /* what involved me — or what I have not read: op = OC_ACTF_* (REQ-139) */
     OC_CMD_HISTORY_AROUND, /* the messages around `message_id` in `channel_id` (REQ-232) */
@@ -704,6 +710,7 @@ typedef struct {
     /* SEARCH: the order is `op` (OC_SEARCH_*), the cursor `message_id` and, by
      * relevance, this rank beside it. */
     int64_t  rank;
+    uint64_t parent_id;    /* MOVE_MESSAGE: the destination thread, 0 its top level */
 } oc_cmd;
 
 oc_cmd *oc_cmd_new(int type);

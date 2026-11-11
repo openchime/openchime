@@ -173,6 +173,15 @@ void oc_client_tick(oc_client *c) {
         c->model.summary_resend = 0;
         if (c->model.summary_open && c->model.summary_loading) summary_send(c);
     }
+    if (c->model.moved_fetch_channel) {
+        oc_client_history_around(c, c->model.moved_fetch_channel, c->model.moved_fetch_message, 50);
+        c->model.moved_fetch_channel = c->model.moved_fetch_message = 0;
+    }
+    if (c->model.moved_fetch_thread) {
+        c->model.moved_fetch_thread = 0;
+        if (c->model.thread_open)
+            oc_client_open_thread(c, c->model.thread_channel, c->model.thread_parent);
+    }
     listen_pump(c);
 }
 
@@ -639,6 +648,15 @@ void oc_client_set_collapsed(oc_client *c, uint64_t message_id, int on) {
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_COLLAPSED);
     if (!cmd) return;
     cmd->message_id = message_id; cmd->op = on ? 1 : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_move_message(oc_client *c, uint64_t message_id, uint64_t dest_channel,
+                            uint64_t dest_parent, int leave_marker) {
+    if (!c || !message_id || !dest_channel) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_MOVE_MESSAGE);
+    if (!cmd) return;
+    cmd->message_id = message_id; cmd->channel_id = dest_channel;
+    cmd->parent_id = dest_parent; cmd->op = leave_marker ? 1 : 0;
     oc_queue_push(&c->cmds, cmd);
 }
 void oc_client_list_saved(oc_client *c) {

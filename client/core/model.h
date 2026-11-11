@@ -523,6 +523,11 @@ typedef struct {
     uint32_t  found_seq;
     uint64_t  found_channel, found_parent, found_mid, found_time;
     uint8_t   found_exact;
+    /* A message moved into a conversation this client holds (REQ-053): the
+     * rows are read back there (oc_client_tick) as any others are -- around
+     * the message at a top level, or the open thread again. */
+    uint64_t  moved_fetch_channel, moved_fetch_message;
+    uint8_t   moved_fetch_thread;
     oc_reactor_row *reactors;
     size_t    n_reactors, cap_reactors;
     /* The open "who voted" view (REQ-225), on the who-reacted pattern: the

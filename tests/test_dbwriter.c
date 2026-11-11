@@ -10792,6 +10792,132 @@ static void test_find_at_time(void) {
     cleanup_db(path);
 }
 
+/* Moving a message (REQ-053). */
+static oc_dbres *move_msg(oc_dbwriter *w, uint64_t uid, uint64_t mid, uint64_t to, uint64_t parent, int marker) {
+    oc_job *j = oc_job_new(OC_JOB_MOVE_MESSAGE, 63);
+    j->user_id = uid; j->message_id = mid; j->channel_id = to; j->parent_id = parent;
+    j->move_marker = (uint8_t)marker;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+/* One number from the file, by a query with one id bound. */
+static int64_t raw_num(const char *path, const char *sql, uint64_t id) {
+    sqlite3 *raw = NULL;
+    if (sqlite3_open(path, &raw) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = NULL;
+    int64_t v = -1;
+    if (sqlite3_prepare_v2(raw, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(raw);
+    return v;
+}
+static uint16_t move_err(oc_dbres *r) {
+    uint16_t e = (r && r->type == OC_RES_MOVE_ERR) ? r->err_code : 0xFFFF;
+    oc_dbres_free(r);
+    return e;
+}
+static void test_move_message(void) {
+    const char *path = tdb("move.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "mv-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob = reg(w, "mv-bob", "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "mv-carol", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob && carol);
+    oc_dbres *r = create_channel(w, alice, "mv-dest", 1);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t dest = r->channel_id;
+    oc_dbres_free(r);
+    r = create_channel(w, alice, "mv-priv", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t priv = r->channel_id;
+    oc_dbres_free(r);
+
+    /* One message to another channel's top level, by its author: its id,
+     * mention and pin go with it, and a line is left where it was. */
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0x4D, sizeof idem);
+    uint64_t m1 = send_msg(w, bob, idem, "@mv-carol in the wrong room");
+    CHECK(m1);
+    oc_dbres_free(pin(w, bob, OC_DEFAULT_CHANNEL, m1, OC_PIN_ADD));
+    r = move_msg(w, bob, m1, dest, 0, 1);
+    CHECK(r && r->type == OC_RES_MESSAGE_MOVED && r->message_id == m1 &&
+          r->channel_id == OC_DEFAULT_CHANNEL && r->move_to == dest && r->parent_id == 0 &&
+          r->reply_count == 1 && r->n_members > 0 && r->n_dest_members > 0);
+    /* The marker rides the same answer, for the source's readers. */
+    int marker = 0;
+    for (oc_dbres *n = r ? r->next : NULL; n; n = n->next)
+        if (n->type == OC_RES_NOTICE && n->channel_id == OC_DEFAULT_CHANNEL && n->body &&
+            /* contract: the line left behind names the mover and the destination */
+            memmem(n->body, n->body_len, "moved a message to #mv-dest", 27)) marker = 1;
+    CHECK(marker);
+    oc_dbres_free(r);
+    CHECK(raw_num(path, "SELECT channel_id FROM messages WHERE id=?1;", m1) == (int64_t)dest);
+    CHECK(raw_num(path, "SELECT channel_id FROM mentions WHERE message_id=?1;", m1) == (int64_t)dest);
+    CHECK(raw_num(path, "SELECT channel_id FROM pins WHERE message_id=?1;", m1) == (int64_t)dest);
+    CHECK(raw_num(path, "SELECT COUNT(*) FROM audit_log WHERE action='message.move' AND target_id=?1;", m1) == 1);
+    /* A link that names the old channel finds it where it is now. */
+    r = history_around(w, carol, OC_DEFAULT_CHANNEL, m1, 10);
+    int seen = 0;
+    for (size_t i = 0; r && i < r->n_replay; i++) if (r->replay[i].message_id == m1) seen = 1;
+    CHECK(r && r->channel_id == dest && seen);
+    oc_dbres_free(r);
+
+    /* A thread moves whole, with no line left. */
+    memset(idem, 0x4E, sizeof idem);
+    uint64_t root = send_msg(w, alice, idem, "a thread");
+    CHECK(root);
+    r = send_reply(w, bob, OC_DEFAULT_CHANNEL, root, "one");
+    CHECK(r && r->type == OC_RES_REPLY_OK);
+    uint64_t rep = r->message_id;
+    oc_dbres_free(r);
+    oc_dbres_free(send_reply(w, carol, OC_DEFAULT_CHANNEL, root, "two"));
+    int64_t before = raw_num(path, "SELECT COUNT(*) FROM messages WHERE channel_id=?1;", OC_DEFAULT_CHANNEL);
+    r = move_msg(w, alice, root, dest, 0, 0);
+    CHECK(r && r->type == OC_RES_MESSAGE_MOVED && r->reply_count == 3 && r->next == NULL);
+    oc_dbres_free(r);
+    CHECK(raw_num(path, "SELECT channel_id FROM messages WHERE id=?1;", rep) == (int64_t)dest);
+    CHECK(raw_num(path, "SELECT parent_id FROM messages WHERE id=?1;", rep) == (int64_t)root);
+    CHECK(raw_num(path, "SELECT COUNT(*) FROM messages WHERE channel_id=?1;", OC_DEFAULT_CHANNEL) == before - 3);
+
+    /* A top-level message into a thread, and a reply back out to a top level. */
+    memset(idem, 0x4F, sizeof idem);
+    uint64_t m3 = send_msg(w, bob, idem, "belongs in that thread");
+    CHECK(m3);
+    r = move_msg(w, bob, m3, dest, root, 1);
+    CHECK(r && r->type == OC_RES_MESSAGE_MOVED && r->parent_id == root);
+    oc_dbres_free(r);
+    CHECK(raw_num(path, "SELECT parent_id FROM messages WHERE id=?1;", m3) == (int64_t)root);
+    r = move_msg(w, bob, m3, OC_DEFAULT_CHANNEL, 0, 0);
+    CHECK(r && r->type == OC_RES_MESSAGE_MOVED);
+    oc_dbres_free(r);
+    CHECK(raw_num(path, "SELECT parent_id IS NULL FROM messages WHERE id=?1;", m3) == 1);
+    CHECK(raw_num(path, "SELECT channel_id FROM messages WHERE id=?1;", m3) == OC_DEFAULT_CHANNEL);
+
+    /* Refused: someone else's, for a member; a root with replies into a thread;
+     * where it already is; a private channel the mover is not in; nothing. */
+    CHECK(move_err(move_msg(w, carol, m3, dest, 0, 1)) == OC_ERR_FORBIDDEN);
+    CHECK(move_err(move_msg(w, alice, root, dest, m1, 1)) == OC_ERR_CANNOT_MOVE);
+    CHECK(move_err(move_msg(w, bob, m3, OC_DEFAULT_CHANNEL, 0, 1)) == OC_ERR_CANNOT_MOVE);
+    CHECK(move_err(move_msg(w, bob, m3, priv, 0, 1)) == OC_ERR_FORBIDDEN);
+    CHECK(move_err(move_msg(w, bob, m3 + 1000, dest, 0, 1)) == OC_ERR_UNKNOWN_MESSAGE);
+    CHECK(raw_num(path, "SELECT channel_id FROM messages WHERE id=?1;", m3) == OC_DEFAULT_CHANNEL);
+    /* An owner moves anyone's, here into a private channel she is in. */
+    r = move_msg(w, alice, m3, priv, 0, 0);
+    CHECK(r && r->type == OC_RES_MESSAGE_MOVED && r->move_to == priv);
+    oc_dbres_free(r);
+    /* Nothing leaves an archived channel. */
+    oc_dbres_free(chan_update(w, alice, dest, OC_CHUP_ARCHIVE, ""));
+    CHECK(move_err(move_msg(w, alice, m1, OC_DEFAULT_CHANNEL, 0, 1)) == OC_ERR_CHANNEL_ARCHIVED);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_collapsed(void) {
     const char *path = tdb("collapsed.db");
     cleanup_db(path);
@@ -11104,6 +11230,7 @@ int run_dbwriter_tests(void) {
     test_status_and_profile();
     test_collapsed();
     test_find_at_time();
+    test_move_message();
     test_custom_emoji();
     test_group_dm();
     test_avatar();
