@@ -1,7 +1,7 @@
 # OpenChime — Database Schema
 
 The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
-ARCH-27 (§1); the daemon applies migrations 0001–0082 (`daemon/migrate.c`,
+ARCH-27 (§1); the daemon applies migrations 0001–0083 (`daemon/migrate.c`,
 `OC_MIGRATIONS`), in order, and new tables/columns arrive as later numbered
 migrations, never as edits to an existing one. 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
@@ -36,7 +36,7 @@ credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
 **0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
-(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets; **0079** (§3br) blocks and DM privacy; **0080** (§3bs) profile fields; **0081** (§3bt) out of office; **0082** (§3bu) channel managers.
+(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets; **0079** (§3br) blocks and DM privacy; **0080** (§3bs) profile fields; **0081** (§3bt) out of office; **0082** (§3bu) channel managers; **0083** (§3bv) custom emoji aliases.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -2136,3 +2136,21 @@ deleted, so leaving, being removed or losing the group that put them in all end
 it. At most 64 per channel. *Read* by `UPDATE_CHANNEL`'s rename, archive and
 unarchive checks and by `CHANNEL_INFO`, which names the creator and the managers.
 A channel purge clears the table with every one holding a `channel_id`.
+
+## 3bv. Migration 0083 — custom emoji aliases
+
+```sql
+CREATE TABLE custom_emoji_aliases (
+  alias TEXT PRIMARY KEY,
+  name  TEXT NOT NULL REFERENCES custom_emoji(name) ON UPDATE CASCADE ON DELETE CASCADE);
+CREATE INDEX custom_emoji_aliases_name ON custom_emoji_aliases(name);
+```
+
+A custom emoji's **old names** (REQ-072). Messages and reactions name an emoji by
+its shortcode, so a rename that only changed `custom_emoji.name` would break every
+use; instead the old name stays here, resolving to the same row. *Written* by
+`RENAME_EMOJI` (PROTOCOL.md §5.16g): the row's `name` changes, the cascade carries
+the aliases it had along, and the old name is added. At most 8 per emoji and 256 in
+a workspace. *Read* by `EMOJI_LIST`, and by `ADD_EMOJI` and `RENAME_EMOJI`, which
+refuse a name an alias holds. Deleting the emoji deletes its aliases (the cascade,
+and the delete itself).

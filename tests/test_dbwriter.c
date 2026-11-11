@@ -2459,7 +2459,9 @@ static void test_index_mentions(void) {
                            "ALTER TABLE users DROP COLUMN ooo_start_ms; ALTER TABLE users DROP COLUMN ooo_end_ms;"
                            "ALTER TABLE users DROP COLUMN ooo_message;"
                            /* 0082's channel managers. */
-                           "DROP TABLE channel_managers; ALTER TABLE channels DROP COLUMN created_by;",
+                           "DROP TABLE channel_managers; ALTER TABLE channels DROP COLUMN created_by;"
+                           /* 0083's emoji aliases. */
+                           "DROP TABLE custom_emoji_aliases;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -7423,6 +7425,128 @@ static void test_webhooks(void) {
  * image must be one the caller uploaded (it becomes readable workspace-wide), a
  * duplicate is refused rather than silently replacing what every existing message
  * containing that shortcode means, and only the creator or an admin can delete one. */
+/* Renaming a custom emoji (REQ-072): the old name becomes an alias of the same
+ * image, aliases follow a later rename, an alias holds its name, and a delete
+ * takes them all. */
+static oc_dbres *emoji_job(oc_dbwriter *w, int type, uint64_t uid, const char *name, const char *to, uint64_t aid) {
+    oc_job *j = oc_job_new(type, 20);
+    j->user_id = uid; j->message_id = aid;
+    j->ch_name = strdup(name);
+    if (to) j->pf_name = strdup(to);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static const oc_emoji_row *emoji_in(const oc_dbres *r, const char *name) {
+    for (size_t i = 0; r && i < r->n_elist; i++) if (strcmp(r->elist[i].name, name) == 0) return &r->elist[i];
+    return NULL;
+}
+
+static void test_emoji_rename(void) {
+    const char *path = tdb("emoji_rename.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "er-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "er-bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "er-carol", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob && carol);
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        char sql[512];
+        snprintf(sql, sizeof sql,
+            "INSERT INTO attachments(id,channel_id,message_id,uploader_id,storage_key,"
+            "  filename,mime,size,sha256,created_at_ms) VALUES"
+            "  (11,1,NULL,%llu,'k11','a.png','image/png',10,x'00',1),"
+            "  (12,1,NULL,%llu,'k12','b.png','image/png',10,x'00',1);",
+            (unsigned long long)bob, (unsigned long long)carol);
+        CHECK(sqlite3_exec(raw, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+    oc_dbres *r = emoji_job(w, OC_JOB_ADD_EMOJI, bob, "shipit", NULL, 11);
+    CHECK(r && r->type == OC_RES_EMOJI_LIST && r->n_elist == 1 && r->elist[0].created_at > 0 &&
+          r->elist[0].n_aliases == 0);
+    oc_dbres_free(r);
+    oc_dbres_free(emoji_job(w, OC_JOB_ADD_EMOJI, carol, "party", NULL, 12));
+
+    /* Someone else may not rename it; its creator may. */
+    r = emoji_job(w, OC_JOB_RENAME_EMOJI, carol, "shipit", "launch", 0);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    r = emoji_job(w, OC_JOB_RENAME_EMOJI, bob, "shipit", "Launch", 0);
+    CHECK(r && r->type == OC_RES_EMOJI_LIST && r->ch_fanout);
+    {
+        const oc_emoji_row *e = emoji_in(r, "launch");
+        CHECK(e && e->attachment_id == 11 && e->created_by == bob && e->n_aliases == 1 &&
+              strcmp(e->aliases[0], "shipit") == 0);
+        CHECK(emoji_in(r, "shipit") == NULL);
+    }
+    oc_dbres_free(r);
+
+    /* A taken name -- an emoji's or an alias's -- is refused. */
+    r = emoji_job(w, OC_JOB_RENAME_EMOJI, bob, "launch", "party", 0);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_CHANNEL_EXISTS);
+    oc_dbres_free(r);
+    r = emoji_job(w, OC_JOB_RENAME_EMOJI, carol, "party", "shipit", 0);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_CHANNEL_EXISTS);
+    oc_dbres_free(r);
+    /* An invalid one too. */
+    r = emoji_job(w, OC_JOB_RENAME_EMOJI, bob, "launch", "no:colon", 0);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_MALFORMED_FRAME);
+    oc_dbres_free(r);
+    /* An alias holds its name against a new emoji. */
+    r = emoji_job(w, OC_JOB_ADD_EMOJI, carol, "shipit", NULL, 12);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_CHANNEL_EXISTS);
+    oc_dbres_free(r);
+
+    /* An admin renames it again: both old names now point at the new one. */
+    r = emoji_job(w, OC_JOB_RENAME_EMOJI, alice, "launch", "liftoff", 0);
+    {
+        const oc_emoji_row *e = emoji_in(r, "liftoff");
+        CHECK(r && r->type == OC_RES_EMOJI_LIST && e && e->n_aliases == 2);
+        int a1 = 0, a2 = 0;
+        for (uint8_t k = 0; e && k < e->n_aliases; k++) {
+            if (!strcmp(e->aliases[k], "shipit")) a1 = 1;
+            if (!strcmp(e->aliases[k], "launch")) a2 = 1;
+        }
+        CHECK(a1 && a2);
+    }
+    oc_dbres_free(r);
+    CHECK(rm_count(path, "SELECT COUNT(*) FROM custom_emoji_aliases WHERE name='liftoff' AND ?1 > 0;", 1) == 2);
+
+    /* At most eight old names on one emoji. */
+    {
+        char from[16] = "liftoff", to[16];
+        int refused = 0;
+        for (int k = 0; k < 10 && !refused; k++) {
+            snprintf(to, sizeof to, "lift%d", k);
+            r = emoji_job(w, OC_JOB_RENAME_EMOJI, bob, from, to, 0);
+            if (r && r->type == OC_RES_LIST_ERR) {
+                CHECK(r->err_code == OC_ERR_EMOJI_ALIAS_LIMIT);
+                refused = 1;
+            } else {
+                snprintf(from, sizeof from, "%s", to);
+            }
+            oc_dbres_free(r);
+        }
+        CHECK(refused);
+        CHECK(rm_count(path, "SELECT COUNT(*) FROM custom_emoji_aliases WHERE ?1 > 0;", 1) == (int64_t)OC_MAX_EMOJI_ALIASES);
+        /* Deleting it takes its old names with it. */
+        r = emoji_job(w, OC_JOB_DELETE_EMOJI, bob, from, NULL, 0);
+        CHECK(r && r->type == OC_RES_EMOJI_LIST && emoji_in(r, from) == NULL);
+        oc_dbres_free(r);
+        CHECK(rm_count(path, "SELECT COUNT(*) FROM custom_emoji_aliases WHERE ?1 > 0;", 1) == 0);
+    }
+    /* Free again, so a new emoji may take an old name. */
+    r = emoji_job(w, OC_JOB_RENAME_EMOJI, carol, "party", "shipit", 0);
+    CHECK(r && r->type == OC_RES_EMOJI_LIST && emoji_in(r, "shipit"));
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_custom_emoji(void) {
     const char *path = tdb("emoji.db");
     cleanup_db(path);
@@ -12268,6 +12392,7 @@ int run_dbwriter_tests(void) {
     test_reminders();
     test_snippets();
     test_custom_emoji();
+    test_emoji_rename();
     test_group_dm();
     test_avatar();
     test_notify_prefs();

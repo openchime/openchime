@@ -1429,6 +1429,17 @@ static const char MIGRATION_0082[] =
     "  PRIMARY KEY (channel_id, user_id)"
     ") WITHOUT ROWID;";
 
+static const char MIGRATION_0083[] =
+    /* A custom emoji's old names (REQ-072). A rename keeps the old shortcode as
+     * an alias of the same image, so the messages and reactions that used it
+     * still show it; an alias holds its name against a new emoji. Aliases
+     * follow their emoji through a later rename and go with it on a delete. */
+    "CREATE TABLE custom_emoji_aliases ("
+    "  alias TEXT PRIMARY KEY,"
+    "  name  TEXT NOT NULL REFERENCES custom_emoji(name) ON UPDATE CASCADE ON DELETE CASCADE"
+    ");"
+    "CREATE INDEX custom_emoji_aliases_name ON custom_emoji_aliases(name);";
+
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
      * author is doing, and the daemon records that as its own object beside the
@@ -1799,6 +1810,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 80, MIGRATION_0080 },
     { 81, MIGRATION_0081 },
     { 82, MIGRATION_0082 },
+    { 83, MIGRATION_0083 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

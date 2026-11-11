@@ -601,6 +601,13 @@ where one exists.
   is additive and cheap); **deleting** is the creator or an admin, because deletion
   breaks every message that used the shortcode. The TUI shows the shortcode, as this
   requirement always said it would.
+  **Rename** is allowed to whoever may delete it, and breaks nothing: the old name
+  becomes an **alias** resolving to the same image, so every message and reaction
+  that used it still shows it, aliases already pointing at the old name follow to
+  the new one, and an alias holds its name against a new emoji. Deleting an emoji
+  deletes its aliases. An emoji keeps at most 8 old names and a workspace 256, which
+  keeps the whole catalogue in one frame; past that a rename is refused and the
+  emoji can be added again under the new name.
 - **REQ-073.** A user has had **one-click quick reactions** — a small,
   per-user-configurable set of frequently-used emoji offered inline on a message
   as a shortcut over the full picker (REQ-070/265). The set has been a per-user

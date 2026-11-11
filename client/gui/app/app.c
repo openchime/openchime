@@ -2082,6 +2082,8 @@ static int g_n_invrows;
 /* Admin > Custom emoji (REQ-072): each row's Delete, where it is offered, and
  * the row's name; and the picker's Manage link, which opens it. */
 static struct { rectf r; char name[48]; } g_emojirows[128];
+static struct { rectf r; char name[48]; } g_emojiren[128];   /* each Rename (REQ-072) */
+static int g_n_emojiren;
 static int g_n_emojirows;
 static rectf g_pick_manage;
 static char g_emoji_q[48];             /* its search box's text */
@@ -19138,6 +19140,7 @@ static int emoji_admin_rows(const oc_model *m, const oc_custom_emoji **out, int 
 
 static void draw_emoji_admin(gfx *rt, const oc_model *m, rectf body) {
     g_n_emojirows = 0;
+    g_n_emojiren = 0;
     float y = body.top + 8;
     g_emoji_search_box = rf(body.left + 20, y, body.right - 20, y + SEARCH_BOX_H);
     search_box_draw(rt, g_emoji_search_box, OC_COL_INPUT);
@@ -19175,10 +19178,34 @@ static void draw_emoji_admin(gfx *rt, const oc_model *m, rectf body) {
         snprintf(nm, sizeof nm, ":%s:", e->name);
         draw_text(rt, nm, g_ui, rf(tx, yy + 2, body.right - 130, yy + 22), OC_COL_TEXT);
         const char *by = oc_model_user_name((oc_model *)m, e->created_by);
-        char sub[160];
-        snprintf(sub, sizeof sub, "Added by %s", (by && by[0]) ? by : "someone no longer here");
-        draw_text(rt, sub, g_meta, rf(tx, yy + 20, body.right - 130, yy + 40), OC_COL_FAINT);
+        /* Who added it and when, and the old names it still answers to. */
+        char sub[400], when[40] = "", was[200] = "";
+        if (e->created_at) {
+            time_t t = (time_t)(e->created_at / 1000);
+            struct tm lt;
+            if (oc_localtime_r(&t, &lt)) strftime(when, sizeof when, " on %d %b %Y", &lt);
+        }
+        for (uint8_t k = 0; k < e->n_aliases; k++) {
+            size_t u = strlen(was);
+            snprintf(was + u, sizeof was - u, "%s:%s:", k ? " " : " \xC2\xB7 was ", e->aliases[k]);
+        }
+        snprintf(sub, sizeof sub, "Added by %s%s%s", (by && by[0]) ? by : "someone no longer here", when, was);
+        float lim = body.right - (emoji_admin_can_delete(m, e) ? 220 : 130);
+        draw_text(rt, sub, g_meta, rf(tx, yy + 20, lim, yy + 40), OC_COL_FAINT);
         if (emoji_admin_can_delete(m, e)) {
+            /* Rename, beside Delete and by the same rule. */
+            rectf rb = rf(body.right - 212, yy + 8, body.right - 124, yy + 34);
+            int rhot = in_rect(rb, g_mouse_x, g_mouse_y);
+            fill_round(rt, rb, OC_R_CONTROL, rhot ? OC_COL_HOVER : OC_COL_INPUT);
+            stroke_round(rt, rb, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+            g_meta->align = ST_ALIGN_CENTER;
+            draw_text(rt, "Rename", g_meta, rb, OC_COL_TEXT);
+            g_meta->align = ST_ALIGN_LEFT;
+            if (g_n_emojiren < (int)(sizeof g_emojiren / sizeof g_emojiren[0])) {
+                g_emojiren[g_n_emojiren].r = rb;
+                snprintf(g_emojiren[g_n_emojiren].name, sizeof g_emojiren[0].name, "%s", e->name);
+                g_n_emojiren++;
+            }
             rectf b = rf(body.right - 116, yy + 8, body.right - 20, yy + 34);
             int hot = in_rect(b, g_mouse_x, g_mouse_y);
             fill_round(rt, b, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
@@ -19321,6 +19348,19 @@ static int pfields_click(oc_win *hwnd, const oc_model *m, int x, int y) {
 }
 
 /* Ask before deleting `name`: the messages that used it keep the shortcode. */
+/* Rename `name` (REQ-072): the old name keeps showing the image. */
+static void emoji_rename_ask(oc_win *hwnd, const char *name) {
+    if (!g_client || !name || !name[0]) return;
+    static char hint[160];
+    snprintf(hint, sizeof hint, "Letters, digits, _ - and +. Messages that used :%s: keep showing it.", name);
+    oc_field f[1] = { { FF_TEXT, "New name", hint, "" } };
+    snprintf(f[0].value, sizeof f[0].value, "%s", name);
+    char old[48];
+    snprintf(old, sizeof old, "%s", name);   /* the row's buffer is repainted under the form */
+    if (form_dialog(hwnd, "Rename custom emoji", f, 1) && f[0].value[0] && strcmp(f[0].value, old))
+        oc_client_rename_emoji(g_client, old, f[0].value[0] == ':' ? f[0].value + 1 : f[0].value);
+}
+
 static void emoji_delete_ask(oc_win *hwnd, const char *name) {
     char title[80], body[200];
     snprintf(g_confirm_emoji, sizeof g_confirm_emoji, "%s", name);
@@ -26482,6 +26522,7 @@ enum {
     AT_CTABLE,        /* payload: a composer card's slot * 2, + 1 for its Remove (else its Edit) */
     AT_PASTECHOICE,   /* payload: the paste chooser's choice (PCH_*) */
     AT_EMOJIDEL,      /* payload: Admin > Custom emoji's Delete hit-box index */
+    AT_EMOJIREN,      /* payload: its Rename hit-box index (REQ-072) */
     AT_EMOJIFIND,     /* Admin > Custom emoji's search box */
     AT_PICKMANAGE,    /* the emoji picker's Manage link */
     AT_PREVIEW,       /* the composer's Preview / Edit */
@@ -26783,6 +26824,12 @@ static void a11y_publish_scene(const oc_model *m) {
                 snprintf(aid, sizeof aid, "admin.emoji.%s.delete", g_emojirows[i].name);
                 snprintf(nm, sizeof nm, "Delete :%s:", g_emojirows[i].name);
                 acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_emojirows[i].r, ATOK(AT_EMOJIDEL, (uint64_t)i));
+            }
+            for (int i = 0; i < g_n_emojiren && n < OC_ACC_MAX; i++) {
+                char aid[OC_ACC_AID_MAX], nm[64];
+                snprintf(aid, sizeof aid, "admin.emoji.%s.rename", g_emojiren[i].name);
+                snprintf(nm, sizeof nm, "Rename :%s:", g_emojiren[i].name);
+                acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_emojiren[i].r, ATOK(AT_EMOJIREN, (uint64_t)i));
             }
         }
     }
@@ -31576,6 +31623,9 @@ static int on_click(oc_win *hwnd, int x, int y) {
     if (g_view == VIEW_ADMIN && g_adm_tab == ADM_PFIELDS && model() && self_role(model()) >= OC_ROLE_ADMIN &&
         pfields_click(hwnd, model(), x, y))
         return 1;
+    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_EMOJI)
+        for (int i = 0; i < g_n_emojiren; i++)
+            if (in_rect(g_emojiren[i].r, x, y)) { emoji_rename_ask(hwnd, g_emojiren[i].name); return 1; }
     if (g_view == VIEW_ADMIN && g_adm_tab == ADM_INVITES)
         for (int i = 0; i < g_n_invrows; i++)
             if (in_rect(g_invrows[i].r, x, y)) {
@@ -41662,6 +41712,10 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
         case AT_EMOJIDEL:
             if (g_view == VIEW_ADMIN && g_adm_tab == ADM_EMOJI && (int)arg < g_n_emojirows)
                 emoji_delete_ask(hwnd, g_emojirows[arg].name);
+            break;
+        case AT_EMOJIREN:
+            if (g_view == VIEW_ADMIN && g_adm_tab == ADM_EMOJI && (int)arg < g_n_emojiren)
+                emoji_rename_ask(hwnd, g_emojiren[arg].name);
             break;
         case AT_EMOJIFIND:
             if (g_efind && g_efind->visible) focus_set(g_efind);

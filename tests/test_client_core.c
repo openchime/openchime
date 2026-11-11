@@ -443,6 +443,39 @@ static int caps_fold(oc_model *m, const char *names) {
     return oc_model_tts_available(m);
 }
 
+/* A renamed custom emoji (REQ-072): the catalogue's old names resolve to the
+ * same image, so a message body or a reaction naming `:shipit:` still shows it
+ * after the emoji is called `:liftoff:`. Both go through oc_model_custom_emoji,
+ * the one lookup every surface uses for a shortcode. */
+static void emoji_ev(oc_model *m, const char *name, uint64_t aid, const char *aliases) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_EMOJI; e.message_id = aid; e.user_id = 2; e.created_at = 7;
+    e.body = strdup(name);
+    e.topic = aliases ? strdup(aliases) : NULL;
+    oc_model_apply(m, &e);
+    free(e.body); free(e.topic);
+}
+
+static void test_emoji_aliases(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev b; memset(&b, 0, sizeof b); b.type = OC_EV_EMOJI_BEGIN; oc_model_apply(&m, &b);
+    emoji_ev(&m, "liftoff", 11, "shipit launch");
+    emoji_ev(&m, "party", 12, NULL);
+    CHECK(m.n_cemoji == 2 && m.cemoji[0].n_aliases == 2 && m.cemoji[0].created_at == 7);
+    /* The name, and each old name, show the same image; another emoji's do not. */
+    CHECK(oc_model_custom_emoji(&m, "liftoff") == 11);
+    CHECK(oc_model_custom_emoji(&m, "shipit") == 11);   /* a message body's :shipit: */
+    CHECK(oc_model_custom_emoji(&m, "launch") == 11);   /* a reaction stored as :launch: */
+    CHECK(oc_model_custom_emoji(&m, "party") == 12);
+    CHECK(oc_model_custom_emoji(&m, "nothing") == 0);
+    /* A new catalogue replaces the old: a deleted emoji's old names go with it. */
+    oc_model_apply(&m, &b);
+    emoji_ev(&m, "party", 12, NULL);
+    CHECK(oc_model_custom_emoji(&m, "shipit") == 0);
+    oc_model_free(&m);
+}
+
 static void test_capabilities(void) {
     oc_model m; oc_model_init(&m);
     CHECK(oc_model_tts_available(&m) == 0);                 /* nothing said yet: nothing shown */
@@ -6204,6 +6237,7 @@ int run_client_core_tests(void) {
     test_thread_notices();
     test_unread_counts_what_notifies();
     test_capabilities();
+    test_emoji_aliases();
     test_server_build();
     test_deployment_name();
     test_invitation_text();

@@ -1607,6 +1607,8 @@ const char *oc_error_text(uint16_t code) {
         return "a profile field needs a label and there can be 20; a value is at most 200 bytes, a link starting https://";
     case OC_ERR_INVALID_OUT_OF_OFFICE:
         return "out of office needs an end after its start, and a message of at most 280 bytes";
+    case OC_ERR_EMOJI_ALIAS_LIMIT:
+        return "that emoji has kept as many old names as it can: add it again under the new name instead";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
@@ -4916,8 +4918,26 @@ oc_result oc_encode_emoji_list(oc_wbuf *w, uint16_t version, const oc_emoji_list
         oc_w_str(w, m->entries[i].name);
         oc_w_u64(w, m->entries[i].attachment_id);
         oc_w_u64(w, m->entries[i].created_by);
+        oc_w_u64(w, m->entries[i].created_at);
+        uint8_t na = m->entries[i].n_aliases > OC_MAX_EMOJI_ALIASES ? (uint8_t)OC_MAX_EMOJI_ALIASES
+                                                                    : m->entries[i].n_aliases;
+        oc_w_u8(w, na);
+        for (uint8_t k = 0; k < na; k++) oc_w_str(w, m->entries[i].aliases[k]);
     }
     return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_rename_emoji(oc_wbuf *w, uint16_t version, const oc_rename_emoji *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_RENAME_EMOJI);
+    oc_w_str(w, m->name);
+    oc_w_str(w, m->new_name);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_rename_emoji(oc_rbuf *p, oc_rename_emoji *m) {
+    m->name     = oc_r_str(p);
+    m->new_name = oc_r_str(p);
+    return r_done(p);
 }
 
 oc_result oc_decode_emoji_list(oc_rbuf *p, oc_emoji_entry *entries, uint16_t cap,
@@ -4928,10 +4948,18 @@ oc_result oc_decode_emoji_list(oc_rbuf *p, oc_emoji_entry *entries, uint16_t cap
         oc_slice nm = oc_r_str(p);
         uint64_t aid = oc_r_u64(p);
         uint64_t by = oc_r_u64(p);
+        uint64_t at = oc_r_u64(p);
+        uint8_t na = oc_r_u8(p);
+        if (na > OC_MAX_EMOJI_ALIASES) return OC_E_MALFORMED;
+        oc_slice al[OC_MAX_EMOJI_ALIASES];
+        for (uint8_t k = 0; k < na; k++) al[k] = oc_r_str(p);
         if (i < cap) {
             entries[i].name = nm;
             entries[i].attachment_id = aid;
             entries[i].created_by = by;
+            entries[i].created_at = at;
+            entries[i].n_aliases = na;
+            for (uint8_t k = 0; k < na; k++) entries[i].aliases[k] = al[k];
         }
     }
     return r_done(p);

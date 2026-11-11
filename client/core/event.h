@@ -620,6 +620,7 @@ enum {
     OC_CMD_OPEN_GROUP_DM,        /* REQ-056: gids[0..n_gids) */
     OC_CMD_ADD_EMOJI,            /* REQ-072: body = name, message_id = attachment */
     OC_CMD_DELETE_EMOJI,         /* REQ-072: body = name */
+    OC_CMD_RENAME_EMOJI,         /* REQ-072: body = name, body2 = the new name */
     OC_CMD_LIST_EMOJI,
     OC_CMD_UPLOAD,          /* upload+post a file to `channel_id`: body = local path */
     OC_CMD_DOWNLOAD,        /* download an attachment: message_id = attachment_id, body = dest path */

@@ -2555,9 +2555,26 @@ belongs to the scheduling request.
 
     (empty)
 
-**`EMOJI_LIST` (S → C), `0x007D`** — The whole custom-emoji catalogue — a reply to LIST_EMOJI and also the push after any add or delete. (REQ-072)
+**`RENAME_EMOJI` (C → S), `0x013D`** — Give a custom emoji a new name; the old one stays as an alias of the same image, so the messages and reactions that used it still show it. (REQ-072)
 
-    count (u16), then count repetitions of: name (str), attachment_id (u64), created_by (u64)
+    name (str), new_name (str)
+
+Allowed to the emoji's creator, an admin and an owner, as a delete is
+(`FORBIDDEN` otherwise, and for a name that is no emoji). `new_name` follows the
+names' rules (`MALFORMED_FRAME` otherwise) and must not be an emoji's or an
+alias's already (`CHANNEL_EXISTS`, as `ADD_EMOJI` answers a taken name). The old
+name becomes an alias of the emoji and the aliases it had come with it; past 8 on
+the emoji or 256 in the workspace the rename is refused with `EMOJI_ALIAS_LIMIT`.
+`ADD_EMOJI` is refused a name an alias holds. Answered, like an add, with
+`EMOJI_LIST` to every connection.
+
+**`EMOJI_LIST` (S → C), `0x007D`** — The whole custom-emoji catalogue — a reply to LIST_EMOJI and also the push after any add, rename or delete. (REQ-072)
+
+    count (u16), then count repetitions of: name (str), attachment_id (u64), created_by (u64),
+    created_at (u64), n_aliases (u8), n_aliases × alias (str)
+
+`created_at` and the aliases are as of protocol 43. A client resolves `:alias:`
+in a message or a reaction to the emoji the alias belongs to.
 
 **`OPEN_GROUP_DM` (C → S), `0x0079`** — Open — or reopen — the group DM whose participant set is the caller plus the named users. (REQ-056)
 
@@ -3531,6 +3548,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3070` | `DM_REFUSED`          | messaging  | no    | An `OPEN_DM` or `OPEN_GROUP_DM` naming someone who blocks the asker, or a new one naming someone whose DM privacy is `nobody`. It says neither, so a block is never announced. |
 | `3071` | `INVALID_PROFILE_FIELD` | admin    | no    | A profile field without a label, of an unknown kind or id, past the 20 a workspace may have; or a value over 200 bytes, for a field it does not have, or for a link not starting `https://`. |
 | `3072` | `INVALID_OUT_OF_OFFICE` | profile  | no    | An out-of-office whose end is not after its start, or whose message is over 280 bytes. |
+| `3073` | `EMOJI_ALIAS_LIMIT`   | emoji      | no    | A `RENAME_EMOJI` past the 8 old names an emoji keeps, or the 256 a workspace does. |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing
@@ -3820,6 +3838,7 @@ this table cannot silently gain a shared value.
 | `0x013A` | `SET_OUT_OF_OFFICE` | C → S | my out-of-office span and message; an end of 0 or past clears it (§5.20) |
 | `0x013B` | `CHANNEL_ADD_MANAGER` | C → S | a manager, admin or owner names a member of the channel a manager (§5.7) |
 | `0x013C` | `CHANNEL_REMOVE_MANAGER` | C → S | and takes the role from any manager, the creator included |
+| `0x013D` | `RENAME_EMOJI` | C → S | a custom emoji's new name; the old one stays as an alias (§5.16g) |
 
 ## 10. Connection state machine
 

@@ -1484,6 +1484,15 @@ void oc_client_delete_emoji(oc_client *c, const char *name) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_rename_emoji(oc_client *c, const char *name, const char *new_name) {
+    if (!c || !name || !name[0] || !new_name || !new_name[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_RENAME_EMOJI);
+    if (!cmd) return;
+    cmd->body = strdup(name);
+    cmd->body2 = strdup(new_name);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_upload_emoji(oc_client *c, uint64_t channel_id, const char *name, const char *path) {
     if (!c || !name || !name[0] || !path || !path[0]) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_UPLOAD);

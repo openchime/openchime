@@ -3155,6 +3155,14 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         snprintf(ce->name, sizeof ce->name, "%s", e->body ? e->body : "");
         ce->attachment_id = e->message_id;
         ce->created_by = e->user_id;
+        ce->created_at = e->created_at;
+        /* The old names, space-separated by the net thread. */
+        for (const char *a = e->topic; a && *a && ce->n_aliases < OC_MAX_EMOJI_ALIASES; ) {
+            size_t n = strcspn(a, " ");
+            if (n) snprintf(ce->aliases[ce->n_aliases++], sizeof ce->aliases[0], "%.*s", (int)n, a);
+            a += n;
+            while (*a == ' ') a++;
+        }
         break;
     }
     case OC_EV_SETTINGS_BEGIN:
@@ -3866,6 +3874,10 @@ uint64_t oc_model_custom_emoji(const oc_model *m, const char *name) {
     if (!m || !name || !name[0]) return 0;
     for (size_t i = 0; i < m->n_cemoji; i++)
         if (strcmp(m->cemoji[i].name, name) == 0) return m->cemoji[i].attachment_id;
+    /* An old name a rename kept still shows the image (REQ-072). */
+    for (size_t i = 0; i < m->n_cemoji; i++)
+        for (uint8_t k = 0; k < m->cemoji[i].n_aliases; k++)
+            if (strcmp(m->cemoji[i].aliases[k], name) == 0) return m->cemoji[i].attachment_id;
     return 0;
 }
 

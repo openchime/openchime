@@ -3070,6 +3070,36 @@ static void test_channel_manager_frames(void) {
     }
 }
 
+/* A custom emoji's rename, and the catalogue carrying when each was added and
+ * its old names (REQ-072). */
+static void test_emoji_rename_frames(void) {
+    {
+        oc_rename_emoji in = { oc_slice_str("shipit"), oc_slice_str("launch") };
+        ROUNDTRIP(oc_encode_rename_emoji(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_RENAME_EMOJI, h, p);
+        oc_rename_emoji out;
+        CHECK(oc_decode_rename_emoji(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.name, "shipit") && slice_eq_str(out.new_name, "launch"));
+    }
+    {
+        static oc_emoji_entry ents[2];
+        memset(ents, 0, sizeof ents);
+        ents[0].name = oc_slice_str("launch"); ents[0].attachment_id = 11; ents[0].created_by = 2;
+        ents[0].created_at = 1700000000000ull; ents[0].n_aliases = 2;
+        ents[0].aliases[0] = oc_slice_str("shipit"); ents[0].aliases[1] = oc_slice_str("go");
+        ents[1].name = oc_slice_str("party"); ents[1].attachment_id = 12; ents[1].created_by = 3;
+        ents[1].created_at = 5;
+        oc_emoji_list in = { 2, ents };
+        ROUNDTRIP(oc_encode_emoji_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_EMOJI_LIST, h, p);
+        static oc_emoji_entry out[2]; uint16_t n = 0;
+        CHECK(oc_decode_emoji_list(&p, out, 2, &n) == OC_OK && n == 2);
+        CHECK(slice_eq_str(out[0].name, "launch") && out[0].created_at == 1700000000000ull && out[0].n_aliases == 2);
+        CHECK(slice_eq_str(out[0].aliases[0], "shipit") && slice_eq_str(out[0].aliases[1], "go"));
+        /* The entry after one with aliases reads back whole: the stride holds. */
+        CHECK(slice_eq_str(out[1].name, "party") && out[1].attachment_id == 12 && out[1].created_at == 5 &&
+              out[1].n_aliases == 0);
+    }
+}
+
 static void test_reason_codes_unique(void) {
     static const struct { const char *name; int code; } codes[] = {
         { "MALFORMED_FRAME",        OC_ERR_MALFORMED_FRAME },
@@ -3107,6 +3137,7 @@ static void test_reason_codes_unique(void) {
         { "DM_REFUSED",             OC_ERR_DM_REFUSED },
         { "INVALID_PROFILE_FIELD",  OC_ERR_INVALID_PROFILE_FIELD },
         { "INVALID_OUT_OF_OFFICE",  OC_ERR_INVALID_OUT_OF_OFFICE },
+        { "EMOJI_ALIAS_LIMIT",      OC_ERR_EMOJI_ALIAS_LIMIT },
         { "INTERNAL",               OC_ERR_INTERNAL },
     };
     const size_t n = sizeof codes / sizeof codes[0];
@@ -3188,6 +3219,7 @@ int run_protocol_tests(void) {
     test_profile_field_frames();
     test_out_of_office_frames();
     test_channel_manager_frames();
+    test_emoji_rename_frames();
     test_backfill_and_error();
     test_size_limits();
     test_malformed();

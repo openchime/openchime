@@ -1910,7 +1910,9 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (e) { e->channel_id = um.channel_id; e->message_id = um.message_id; e->count = um.total;
                      oc_queue_push(to_ui, e); }
         } else if (hdr.msg_type == OC_MSG_EMOJI_LIST) {
-            oc_emoji_entry ee[OC_MAX_CUSTOM_EMOJI]; uint16_t count = 0;
+            /* Static: with each entry's old names it is ~90 KB, too much for a
+             * thread's stack. Only the net thread decodes here. */
+            static oc_emoji_entry ee[OC_MAX_CUSTOM_EMOJI]; uint16_t count = 0;
             if (oc_decode_emoji_list(&p, ee, OC_MAX_CUSTOM_EMOJI, &count) != OC_OK) return -1;
             if (count > OC_MAX_CUSTOM_EMOJI) count = OC_MAX_CUSTOM_EMOJI;
             oc_ev *b = oc_ev_new(OC_EV_EMOJI_BEGIN);
@@ -1922,6 +1924,21 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->user_id = ee[i].created_by;
                 e->body = malloc(ee[i].name.len + 1);
                 if (e->body) { memcpy(e->body, ee[i].name.ptr, ee[i].name.len); e->body[ee[i].name.len] = '\0'; }
+                e->created_at = ee[i].created_at;
+                /* Its old names, space-separated (a name holds no space). */
+                if (ee[i].n_aliases) {
+                    size_t need = 1;
+                    for (uint8_t k = 0; k < ee[i].n_aliases; k++) need += ee[i].aliases[k].len + 1;
+                    if ((e->topic = malloc(need)) != NULL) {
+                        size_t at = 0;
+                        for (uint8_t k = 0; k < ee[i].n_aliases; k++) {
+                            if (at) e->topic[at++] = ' ';
+                            memcpy(e->topic + at, ee[i].aliases[k].ptr, ee[i].aliases[k].len);
+                            at += ee[i].aliases[k].len;
+                        }
+                        e->topic[at] = '\0';
+                    }
+                }
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_PROFILE_FIELDS) {
@@ -4245,6 +4262,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_delete_emoji de = { oc_slice_str(c->body) };
                 if (oc_encode_delete_emoji(&w, OC_PROTOCOL_VERSION, &de) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_RENAME_EMOJI && c->body && c->body2) {
+                uint8_t buf[192]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_rename_emoji re = { oc_slice_str(c->body), oc_slice_str(c->body2) };
+                if (oc_encode_rename_emoji(&w, OC_PROTOCOL_VERSION, &re) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             /* User groups (REQ-307-309). */

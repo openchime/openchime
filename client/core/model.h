@@ -35,7 +35,11 @@ typedef struct { char key[65]; char value[513]; } oc_setting;
 /* Custom emoji (REQ-072): the workspace catalogue, replaced wholesale by each
  * EMOJI_LIST — a partial catalogue means a shortcode that renders on one client and
  * not another. The image is an attachment id, which is what a frontend fetches. */
-typedef struct { char name[48]; uint64_t attachment_id; uint64_t created_by; } oc_custom_emoji;
+typedef struct { char name[48]; uint64_t attachment_id; uint64_t created_by;
+                 /* When it was added, and the old names a rename kept: each
+                  * still shows this image (REQ-072). */
+                 uint64_t created_at;
+                 char aliases[OC_MAX_EMOJI_ALIASES][48]; uint8_t n_aliases; } oc_custom_emoji;
 
 /* One member's read cursor in a channel (REQ-090 seen-by). */
 typedef struct { uint64_t user_id; uint64_t message_id; } oc_read_cursor_view;

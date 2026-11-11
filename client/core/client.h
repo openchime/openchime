@@ -502,6 +502,9 @@ void oc_client_channel_group(oc_client *c, uint64_t channel_id, uint64_t group_i
 void oc_client_list_emoji(oc_client *c);
 void oc_client_add_emoji(oc_client *c, const char *name, uint64_t attachment_id);
 void oc_client_delete_emoji(oc_client *c, const char *name);
+/* Rename a custom emoji (REQ-072); the old name keeps showing it, as an alias.
+ * Whoever may delete it may. The catalogue comes back as EMOJI_LIST. */
+void oc_client_rename_emoji(oc_client *c, const char *name, const char *new_name);
 /* Upload an image and register it as `name` in one step. */
 void oc_client_upload_emoji(oc_client *c, uint64_t channel_id, const char *name, const char *path);
 /* Custom status (REQ-241/122) and profile fields (REQ-240). Empty status text clears

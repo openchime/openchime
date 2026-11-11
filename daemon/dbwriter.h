@@ -342,7 +342,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_SET_OUT_OF_OFFICE = 240,
        /* A channel's managers (REQ-036b): channel_id, target_user_id; a
         * manager, admin or owner. Answered CHANNEL_INFO, to every member. */
-       OC_JOB_CHANNEL_ADD_MANAGER = 241, OC_JOB_CHANNEL_REMOVE_MANAGER = 242 };
+       OC_JOB_CHANNEL_ADD_MANAGER = 241, OC_JOB_CHANNEL_REMOVE_MANAGER = 242,
+       /* Rename a custom emoji (REQ-072): ch_name the name, pf_name the new
+        * one. Answered EMOJI_LIST, to everyone. */
+       OC_JOB_RENAME_EMOJI = 243 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -935,6 +938,9 @@ typedef struct oc_emoji_row {
     char    *name;          /* heap; lowercase, no colons */
     uint64_t attachment_id;
     uint64_t created_by;
+    uint64_t created_at;
+    char    *aliases[OC_MAX_EMOJI_ALIASES];   /* heap; its old names */
+    uint8_t  n_aliases;
 } oc_emoji_row;
 
 /* One saved message (REQ-231). Carries its body for the same reason a pin does:

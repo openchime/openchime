@@ -3631,6 +3631,17 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_RENAME_EMOJI) {
+            oc_rename_emoji re;
+            if (oc_decode_rename_emoji(&p, &re) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_RENAME_EMOJI, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->ch_name = slice_dup(re.name);
+            j->pf_name = slice_dup(re.new_name);
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_DELETE_EMOJI) {
             oc_delete_emoji de;
             if (oc_decode_delete_emoji(&p, &de) != OC_OK) return -1;
@@ -8145,6 +8156,10 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             ents[n].name = oc_slice_str(r->elist[i].name ? r->elist[i].name : "");
             ents[n].attachment_id = r->elist[i].attachment_id;
             ents[n].created_by = r->elist[i].created_by;
+            ents[n].created_at = r->elist[i].created_at;
+            ents[n].n_aliases = 0;
+            for (uint8_t k = 0; k < r->elist[i].n_aliases && k < OC_MAX_EMOJI_ALIASES; k++)
+                ents[n].aliases[ents[n].n_aliases++] = oc_slice_str(r->elist[i].aliases[k] ? r->elist[i].aliases[k] : "");
             n++;
         }
         oc_emoji_list el = { n, ents };

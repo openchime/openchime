@@ -732,6 +732,12 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->bl_ids);
     free(r->blk_entries);
     free(r->alert_rows);
+    /* The emoji catalogue (REQ-072): each name, and each old name. */
+    for (size_t i = 0; i < r->n_elist; i++) {
+        free(r->elist[i].name);
+        for (uint8_t k = 0; k < r->elist[i].n_aliases; k++) free(r->elist[i].aliases[k]);
+    }
+    free(r->elist);
     free(r->body);
     free(r->pk_creds);
     /* 53's profile strings, alongside every other heap field. */
@@ -6483,22 +6489,57 @@ static int emoji_name_ok(const char *n, char *out, size_t cap) {
     return at > 0;
 }
 
+/* Is `name` an old name some emoji keeps? */
+static int emoji_alias_taken(sqlite3 *db, const char *name) {
+    sqlite3_stmt *st = NULL;
+    int yes = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM custom_emoji_aliases WHERE alias=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+        yes = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return yes;
+}
+
+static int64_t emoji_count(sqlite3 *db, const char *sql, const char *arg) {
+    sqlite3_stmt *st = NULL;
+    int64_t n = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        if (arg) sqlite3_bind_text(st, 1, arg, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
 static void build_emoji_list(sqlite3 *db, oc_dbres *r) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT name, attachment_id, created_by FROM custom_emoji ORDER BY name LIMIT ?;",
+        "SELECT name, attachment_id, created_by, created_at_ms FROM custom_emoji ORDER BY name LIMIT ?;",
         -1, &st, NULL);
     sqlite3_bind_int(st, 1, (int)OC_MAX_CUSTOM_EMOJI);
     size_t cap = 16, n = 0;
     oc_emoji_row *arr = malloc(cap * sizeof *arr);
     while (arr && sqlite3_step(st) == SQLITE_ROW) {
         if (n == cap) { cap *= 2; oc_emoji_row *g = realloc(arr, cap * sizeof *arr); if (!g) break; arr = g; }
+        memset(&arr[n], 0, sizeof arr[n]);
         arr[n].name          = strdup((const char *)sqlite3_column_text(st, 0));
         arr[n].attachment_id = (uint64_t)sqlite3_column_int64(st, 1);
         arr[n].created_by    = (uint64_t)sqlite3_column_int64(st, 2);
+        arr[n].created_at    = (uint64_t)sqlite3_column_int64(st, 3);
         n++;
     }
     sqlite3_finalize(st);
+    /* Each one's old names, oldest first (REQ-072). */
+    for (size_t i = 0; i < n; i++) {
+        if (sqlite3_prepare_v2(db, "SELECT alias FROM custom_emoji_aliases WHERE name=?1 ORDER BY rowid LIMIT ?2;",
+                               -1, &st, NULL) != SQLITE_OK) break;
+        sqlite3_bind_text(st, 1, arr[i].name ? arr[i].name : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, (int)OC_MAX_EMOJI_ALIASES);
+        while (arr[i].n_aliases < OC_MAX_EMOJI_ALIASES && sqlite3_step(st) == SQLITE_ROW)
+            arr[i].aliases[arr[i].n_aliases++] = strdup((const char *)sqlite3_column_text(st, 0));
+        sqlite3_finalize(st);
+    }
     r->elist = arr;
     r->n_elist = n;
     r->type = OC_RES_EMOJI_LIST;
@@ -6546,9 +6587,14 @@ static oc_dbres *process_add_emoji(sqlite3 *db, const oc_job *j) {
     if (!ok) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_UNKNOWN_ATTACHMENT; return r; }
 
     sqlite3_stmt *st = NULL;
+    /* An old name an emoji keeps (REQ-072) is taken: it already shows that
+     * emoji's image in the messages that used it. */
+    if (emoji_alias_taken(db, name)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_CHANNEL_EXISTS; return r;
+    }
     /* INSERT, not upsert: silently replacing an existing emoji changes what every
-     * message already containing that shortcode means. Renaming is delete then add,
-     * which is a decision somebody makes on purpose. */
+     * message already containing that shortcode means. A rename keeps the old
+     * name as an alias (RENAME_EMOJI). */
     sqlite3_prepare_v2(db,
         "INSERT INTO custom_emoji(name, attachment_id, created_by, created_at_ms) "
         "VALUES(?1, ?2, ?3, ?4);", -1, &st, NULL);
@@ -6580,6 +6626,16 @@ static oc_dbres *process_delete_emoji(sqlite3 *db, const oc_job *j) {
     uint8_t role = OC_ROLE_MEMBER;
     user_role(db, j->user_id, &role);
     sqlite3_stmt *st = NULL;
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_prepare_v2(db,
+        "DELETE FROM custom_emoji_aliases WHERE name IN "
+        "  (SELECT name FROM custom_emoji WHERE name=?1 AND (?2 = 1 OR created_by=?3));",
+        -1, &st, NULL);
+    sqlite3_bind_text (st, 1, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int  (st, 2, role >= OC_ROLE_ADMIN ? 1 : 0);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
     sqlite3_prepare_v2(db,
         "DELETE FROM custom_emoji WHERE name=?1 AND (?2 = 1 OR created_by=?3);",
         -1, &st, NULL);
@@ -6589,10 +6645,68 @@ static oc_dbres *process_delete_emoji(sqlite3 *db, const oc_job *j) {
     sqlite3_step(st);
     sqlite3_finalize(st);
     if (sqlite3_changes(db) == 0) {
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
         r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
     build_emoji_list(db, r);
     r->ch_fanout = 1;
+    return r;
+}
+
+/* Rename a custom emoji (REQ-072): whoever may delete it. The old name becomes
+ * an alias of the same image, and the aliases it had follow it, so nothing that
+ * used any of them breaks. A name an emoji or an alias holds is taken. */
+static oc_dbres *process_rename_emoji(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+    char from[OC_EMOJI_NAME_MAX], to[OC_EMOJI_NAME_MAX];
+    if (!emoji_name_ok(j->ch_name, from, sizeof from) || !emoji_name_ok(j->pf_name, to, sizeof to)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_MALFORMED_FRAME; return r;
+    }
+    uint8_t role = OC_ROLE_MEMBER;
+    user_role(db, j->user_id, &role);
+    sqlite3_stmt *st = NULL;
+    int may = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM custom_emoji WHERE name=?1 AND (?2 = 1 OR created_by=?3);",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text (st, 1, from, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int  (st, 2, role >= OC_ROLE_ADMIN ? 1 : 0);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+        may = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    if (!may) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
+    if (strcmp(from, to) == 0) { build_emoji_list(db, r); return r; }   /* nothing to do */
+    if (emoji_count(db, "SELECT COUNT(*) FROM custom_emoji WHERE name=?1;", to) || emoji_alias_taken(db, to)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_CHANNEL_EXISTS; return r;
+    }
+    if (emoji_count(db, "SELECT COUNT(*) FROM custom_emoji_aliases WHERE name=?1;", from) + 1 > OC_MAX_EMOJI_ALIASES ||
+        emoji_count(db, "SELECT COUNT(*) FROM custom_emoji_aliases;", NULL) + 1 > OC_MAX_EMOJI_ALIASES_TOTAL) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_EMOJI_ALIAS_LIMIT; return r;
+    }
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    int ok = 1;
+    static const char *const sql[] = {
+        "UPDATE custom_emoji SET name=?2 WHERE name=?1;",
+        /* The cascade already moved them; said again so it holds without it. */
+        "UPDATE custom_emoji_aliases SET name=?2 WHERE name=?1;",
+        "INSERT INTO custom_emoji_aliases(alias, name) VALUES(?1, ?2);",
+    };
+    for (size_t i = 0; ok && i < sizeof sql / sizeof sql[0]; i++) {
+        st = NULL;
+        if (sqlite3_prepare_v2(db, sql[i], -1, &st, NULL) != SQLITE_OK) { ok = 0; break; }
+        sqlite3_bind_text(st, 1, from, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, to, -1, SQLITE_TRANSIENT);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    sqlite3_exec(db, ok ? "COMMIT;" : "ROLLBACK;", NULL, NULL, NULL);
+    if (!ok) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    build_emoji_list(db, r);
+    r->ch_fanout = 1;          /* every picker and every message follows the name */
     return r;
 }
 
@@ -12420,6 +12534,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_OPEN_GROUP_DM) return process_open_group_dm(w->db, j);
     if (j->type == OC_JOB_ADD_EMOJI)      return process_add_emoji(w->db, j);
     if (j->type == OC_JOB_DELETE_EMOJI)   return process_delete_emoji(w->db, j);
+    if (j->type == OC_JOB_RENAME_EMOJI)   return process_rename_emoji(w->db, j);
     if (j->type == OC_JOB_CREATE_GROUP)   return process_create_group(w->db, j);
     if (j->type == OC_JOB_UPDATE_GROUP)   return process_update_group(w->db, j);
     if (j->type == OC_JOB_DELETE_GROUP)   return process_delete_group(w->db, j);

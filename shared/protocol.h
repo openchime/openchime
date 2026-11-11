@@ -224,8 +224,12 @@
  * 42: channel managers (REQ-036b). CHANNEL_INFO carries `creator_id` (u64) and
  * `n_managers` (u16) with that many u64 user ids: fields appended to a fixed
  * layout. CHANNEL_ADD_MANAGER and CHANNEL_REMOVE_MANAGER (0x013B, 0x013C) are
- * new. */
-#define OC_PROTOCOL_VERSION 42u
+ * new.
+ *
+ * 43: each EMOJI_LIST entry carries `created_at` (u64), `n_aliases` (u8) and
+ * that many old names (str), which a rename keeps resolving (REQ-072). Fields
+ * appended to a repeated entry. RENAME_EMOJI (0x013D) is new. */
+#define OC_PROTOCOL_VERSION 43u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -650,6 +654,7 @@ typedef enum {
     OC_MSG_SET_OUT_OF_OFFICE    = 0x013A, /* C->S, my out-of-office span and message; an end of 0 or past clears it */
     OC_MSG_CHANNEL_ADD_MANAGER    = 0x013B, /* C->S, a manager, admin or owner names a member of the channel its manager */
     OC_MSG_CHANNEL_REMOVE_MANAGER = 0x013C, /* C->S, and takes the role from any manager, the creator included */
+    OC_MSG_RENAME_EMOJI         = 0x013D, /* C->S, a custom emoji's new name; the old one stays as an alias */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -759,6 +764,7 @@ typedef enum {
     OC_ERR_DM_REFUSED          = 3070, /* a new direct conversation this person does not take: never says why */
     OC_ERR_INVALID_PROFILE_FIELD = 3071, /* a profile field without a label, past the cap, or a value too long or not a link */
     OC_ERR_INVALID_OUT_OF_OFFICE = 3072, /* an out-of-office ending before it starts, or its message too long */
+    OC_ERR_EMOJI_ALIAS_LIMIT   = 3073, /* a rename past the old names an emoji, or the workspace, may keep */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -1484,7 +1490,16 @@ typedef struct { uint16_t count; uint64_t user_ids[OC_MAX_GROUP_DM]; } oc_open_g
 #define OC_MAX_CUSTOM_EMOJI 512u
 typedef struct { oc_slice name; uint64_t attachment_id; } oc_add_emoji;
 typedef struct { oc_slice name; } oc_delete_emoji;
-typedef struct { oc_slice name; uint64_t attachment_id; uint64_t created_by; } oc_emoji_entry;
+/* A rename keeps the old name as an alias of the same image (REQ-072): at most
+ * OC_MAX_EMOJI_ALIASES per emoji and OC_MAX_EMOJI_ALIASES_TOTAL in a workspace,
+ * which keeps the whole catalogue inside one EMOJI_LIST frame. */
+#define OC_MAX_EMOJI_ALIASES        8u
+#define OC_MAX_EMOJI_ALIASES_TOTAL  256u
+typedef struct { oc_slice name; uint64_t attachment_id; uint64_t created_by;
+                 /* As of protocol 43: when it was added, and its old names. */
+                 uint64_t created_at;
+                 uint8_t n_aliases; oc_slice aliases[OC_MAX_EMOJI_ALIASES]; } oc_emoji_entry;
+typedef struct { oc_slice name; oc_slice new_name; } oc_rename_emoji;
 typedef struct { uint16_t count; const oc_emoji_entry *entries; } oc_emoji_list;
 /* Everything a card shows about one person. `phone` is here and NOT on
  * USER_LIST: this frame goes to the one person who asked for the card, where a
@@ -2160,6 +2175,8 @@ oc_result oc_encode_alerts(oc_wbuf *w, uint16_t version, const oc_alerts *m);
 oc_result oc_encode_alert_ack(oc_wbuf *w, uint16_t version, const oc_alert_ack *m);
 oc_result oc_encode_add_emoji(oc_wbuf *w, uint16_t version, const oc_add_emoji *m);
 oc_result oc_encode_delete_emoji(oc_wbuf *w, uint16_t version, const oc_delete_emoji *m);
+oc_result oc_encode_rename_emoji(oc_wbuf *w, uint16_t version, const oc_rename_emoji *m);
+oc_result oc_decode_rename_emoji(oc_rbuf *p, oc_rename_emoji *m);
 oc_result oc_encode_list_emoji(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_emoji_list(oc_wbuf *w, uint16_t version, const oc_emoji_list *m);
 oc_result oc_decode_set_notify_default(oc_rbuf *p, oc_set_notify_default *m);
