@@ -314,6 +314,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* FIND_AT_TIME: the message at `find_at_ms` in channel_id, in the
         * thread parent_id or its main scroll (0). A read. */
        OC_JOB_FIND_AT_TIME = 152,
+       /* USAGE_REQ (REQ-043): the workspace's usage over the last usage_days
+        * UTC days, for an owner or admin. Answered OC_RES_USAGE, or
+        * OC_RES_USAGE_ERR (FORBIDDEN, INVALID). Read-only. */
+       OC_JOB_USAGE = 153,
        /* Reminders come due (REQ-283), on the scheduled-message tick: each
         * fires once, answered as one OC_RES_REMINDER_DUE apiece. Write. */
        OC_JOB_FIRE_REMINDERS = 160 };
@@ -506,6 +510,9 @@ typedef struct oc_job {
     /* HISTORY: 0 pages backwards from message_id, 1 fetches AROUND it (ARCH-96). */
     uint8_t        hist_around;
     uint64_t       find_at_ms;  /* FIND_AT_TIME: the moment asked for */
+
+    /* USAGE: how many UTC days, today included (1..OC_USAGE_MAX_DAYS). */
+    uint16_t       usage_days;
 
     /* SEARCH: query text is carried in body/body_len; this bounds the result.
      * `search_sort` is OC_SEARCH_*, and `search_cursor_rank` the relevance
@@ -817,11 +824,29 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* FOUND_AT_TIME to the asker: channel_id, parent_id, message_id (0 for
         * none), server_time, and found_exact. */
        OC_RES_FOUND_AT_TIME = 127,
+       /* The usage figures (`usage`) to the asker, or why not (err_code). */
+       OC_RES_USAGE = 128, OC_RES_USAGE_ERR = 129,
        /* A reminder fired: user_id's, on message_id in channel_id, at
         * server_time; saved_at and remind_at the item's. To that person's
         * connections and their devices' push. A chain, one per reminder; an
         * empty one (user_id 0) when none was due. */
        OC_RES_REMINDER_DUE = 135 };
+
+/* The usage figures (REQ-043), as USAGE carries them; the channels' names are
+ * held here, since the frame only points at them. */
+typedef struct oc_usage_report {
+    uint16_t         days, n_days, n_weeks, n_channels;
+    oc_usage_day     day[OC_USAGE_MAX_DAYS];
+    oc_usage_week    week[OC_USAGE_MAX_WEEKS];
+    uint64_t         ch_id[OC_USAGE_TOP_CHANNELS];
+    uint32_t         ch_messages[OC_USAGE_TOP_CHANNELS];
+    uint8_t          ch_private[OC_USAGE_TOP_CHANNELS];
+    char             ch_name[OC_USAGE_TOP_CHANNELS][128];
+} oc_usage_report;
+
+/* The ISO week `day` (days since the epoch, UTC) falls in, as yyyyww, and the
+ * day its Monday is (`monday`, optional). */
+uint32_t oc_usage_iso_week(uint32_t day, uint32_t *monday);
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -1432,6 +1457,7 @@ typedef struct oc_dbres {
     /* Audit page (REQ-251). `audit` is a heap array of rows, newest first. */
     struct oc_audit_row    *audit;
     size_t                  n_audit;
+    struct oc_usage_report *usage;   /* OC_RES_USAGE; heap */
 
     /* PROFILE_UPDATED: the (possibly unchanged) display name to broadcast; the
      * subject user is `user_id` above. */

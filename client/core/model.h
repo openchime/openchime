@@ -731,6 +731,11 @@ typedef struct {
     uint8_t   storage_have;
     uint8_t   storage_open;
 
+    /* Usage figures (REQ-043), owner/admin only: the last USAGE answered, kept
+     * for the console's Usage tab; `usage_have` once one has come. */
+    oc_usage_view usage;
+    uint8_t   usage_have;
+
     /* The daemon's critical failures (REQ-263), owner/admin only. `srvalerts_have`
      * once a summary has come -- which only an owner's or admin's sign-in
      * brings: how many are unacknowledged and how many still hold. The list,

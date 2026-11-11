@@ -3054,6 +3054,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->storage_have = 1;
         set_status(m, "storage report updated");
         break;
+    case OC_EV_USAGE:
+        if (!e->usage) break;
+        m->usage = *e->usage;
+        m->usage_have = 1;
+        set_status(m, "usage figures updated");
+        break;
     case OC_EV_PROFILE:
         /* A display-name change (REQ-020): update the roster entry's name in place
          * (role/disabled untouched). For our own id it doubles as the change ack. */

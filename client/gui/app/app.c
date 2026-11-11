@@ -8536,6 +8536,118 @@ static void draw_storage(gfx *rt, const oc_model *m, rectf reg, int embedded) {
     draw_kv(rt, body, &y, "Attachments", v, s->rec_evicted ? OC_COL_DANGER : OC_COL_TEXT);
 }
 
+/* Usage (REQ-043): the console's Usage tab. Daily and weekly active members and
+ * messages per day as bar charts, then the busiest channels; a private channel
+ * the reader is not in comes with no name. The period is picked from three
+ * chips, and each pick asks the daemon again. */
+static const unsigned USAGE_PERIODS[3] = { 7, 30, 90 };
+static unsigned g_usage_days = 30;
+static rectf g_usage_chips[3];
+
+/* One bar chart: a caption, then `n` bars scaled to the largest, each labelled
+ * below by `labels` (every `every`-th, so they never collide), its value above
+ * the tallest. Returns the y below it. */
+static float usage_bars(gfx *rt, rectf body, float y, const char *caption, const uint32_t *vals,
+                        char labels[][12], int n, int every) {
+    draw_text(rt, caption, g_meta, rf(body.left + 24, y, body.right - 20, y + 18), OC_COL_FAINT);
+    y += 22;
+    uint32_t top = 0;
+    for (int i = 0; i < n; i++) if (vals[i] > top) top = vals[i];
+    char peak[32];
+    snprintf(peak, sizeof peak, "most: %u", (unsigned)top);
+    draw_text(rt, peak, g_micro, rf(body.left + 24, y, body.right - 20, y + 14), OC_COL_MUTED);
+    y += 16;
+    const float h = 72, left = body.left + 24, width = body.right - 20 - left;
+    float slot = n > 0 ? width / (float)n : width, gap = slot > 6 ? 2 : 0;
+    fill(rt, rf(left, y + h, left + width, y + h + 1), OC_COL_BORDER);
+    for (int i = 0; i < n; i++) {
+        float bh = top ? h * (float)vals[i] / (float)top : 0;
+        if (vals[i] && bh < 2) bh = 2;
+        float x = left + slot * (float)i;
+        if (bh > 0) fill(rt, rf(x, y + h - bh, x + slot - gap, y + h), OC_COL_ACCENT);
+        if (labels && (i % every == 0 || i == n - 1))
+            draw_text(rt, labels[i], g_micro, rf(x, y + h + 3, x + slot * (float)every, y + h + 17), OC_COL_MUTED);
+    }
+    return y + h + 24;
+}
+
+/* "Nov 11" for a day since the epoch (UTC), with no C library date call:
+ * Windows' has no gmtime_r. H. Hinnant's civil_from_days. */
+static void usage_day_label(uint32_t day, char out[12]) {
+    static const char *const MON[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    int64_t z = (int64_t)day + 719468;
+    int64_t era = z / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned mp = (5 * doy + 2) / 153;
+    unsigned d = doy - (153 * mp + 2) / 5 + 1;
+    unsigned mo = mp < 10 ? mp + 3 : mp - 9;
+    snprintf(out, 12, "%s %u", MON[mo - 1], d);
+}
+
+static void draw_usage(gfx *rt, const oc_model *m, rectf body) {
+    float cx = body.left + 20;
+    for (int i = 0; i < 3; i++) {
+        char lab[24];
+        snprintf(lab, sizeof lab, "Last %u days", USAGE_PERIODS[i]);
+        float cw = text_width(lab, g_meta) + 22;
+        g_usage_chips[i] = rf(cx, body.top + 6, cx + cw, body.top + 30);
+        draw_chip_r(rt, g_usage_chips[i], lab, g_usage_days == USAGE_PERIODS[i]);
+        cx += cw + 6;
+    }
+    if (!m->usage_have) { overlay_empty(rt, body, "Loading…"); return; }
+    const oc_usage_view *u = &m->usage;
+    static uint32_t vals[OC_USAGE_MAX_DAYS];
+    static char labels[OC_USAGE_MAX_DAYS][12];
+    float y = body.top + 42;
+    int every = u->n_days > 45 ? 14 : u->n_days > 10 ? 7 : 1;
+
+    for (int i = 0; i < u->n_days; i++) {
+        usage_day_label(u->day[i].day, labels[i]);
+        vals[i] = u->day[i].active;
+    }
+    y = usage_bars(rt, body, y, "ACTIVE MEMBERS, BY DAY", vals, labels, u->n_days, every);
+    for (int i = 0; i < u->n_weeks; i++) {
+        snprintf(labels[i], sizeof labels[i], "W%02u", (unsigned)(u->week[i].week % 100));
+        vals[i] = u->week[i].active;
+    }
+    y = usage_bars(rt, body, y, "ACTIVE MEMBERS, BY WEEK", vals, labels, u->n_weeks, 1);
+    for (int i = 0; i < u->n_days; i++) {
+        usage_day_label(u->day[i].day, labels[i]);
+        vals[i] = u->day[i].messages;
+    }
+    y = usage_bars(rt, body, y, "MESSAGES POSTED, BY DAY", vals, labels, u->n_days, every);
+
+    draw_text(rt, "BUSIEST CHANNELS", g_meta, rf(body.left + 24, y, body.right - 20, y + 18), OC_COL_FAINT);
+    y += 22;
+    if (!u->n_channels) {
+        draw_text(rt, "No messages in channels in this period.", g_ui, rf(body.left + 24, y, body.right - 20, y + 22),
+                  OC_COL_MUTED);
+        return;
+    }
+    for (int i = 0; i < u->n_channels && y < body.bottom - 22; i++) {
+        char name[160], cnt[48];
+        if (u->channel[i].name[0]) snprintf(name, sizeof name, "#%s", u->channel[i].name);
+        else                       snprintf(name, sizeof name, "private channel");
+        snprintf(cnt, sizeof cnt, "%u message%s", (unsigned)u->channel[i].messages,
+                 u->channel[i].messages == 1 ? "" : "s");
+        draw_kv(rt, body, &y, name, cnt, OC_COL_TEXT);
+    }
+}
+
+/* A click on a period chip: ask again for that period. */
+static int usage_click(float x, float y) {
+    for (int i = 0; i < 3; i++)
+        if (in_rect(g_usage_chips[i], x, y)) {
+            g_usage_days = USAGE_PERIODS[i];
+            if (g_client) oc_client_usage(g_client, g_usage_days);
+            return 1;
+        }
+    return 0;
+}
+
 static const char *audit_family(uint8_t f) {
     return f == 1 ? "admin" : f == 2 ? "account" : f == 3 ? "security" : f == 4 ? "moderation" : "";
 }
@@ -18162,7 +18274,7 @@ static int shell_visible(void) {
  * before it keep their places. */
 /* adds Custom emoji (REQ-072), the one tab a member is shown too: the
  * catalogue is everyone's, and its creator may delete an emoji they added. */
-enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_EMOJI, ADM_COUNT };
+enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_EMOJI, ADM_USAGE, ADM_COUNT };
 static int g_adm_tab;
 static rectf g_adm_tabs[ADM_COUNT];
 
@@ -18178,6 +18290,7 @@ static void admin_select(int t) {
     else if (t == ADM_GROUPS)  { g_grp_sel = 0; oc_client_list_groups(g_client); }
     else if (t == ADM_ALERTS)   oc_client_srvalerts_list(g_client);
     else if (t == ADM_AUDIT)   { oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); }
+    else if (t == ADM_USAGE)    oc_client_usage(g_client, g_usage_days);
 }
 
 /* The picker's Manage link: Admin > Custom emoji, which a member is shown too. */
@@ -18603,6 +18716,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
         { "Groups",    OC_ICON_USER },
         { "Alerts",    OC_ICON_ALERT },
         { "Custom emoji", OC_ICON_SMILE },
+        { "Usage",     OC_ICON_USER },
     };
     float tx = reg.left + 16, ty = reg.top + HEADER_H;
     int admin = self_role(m) >= OC_ROLE_ADMIN;
@@ -18631,6 +18745,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
     else if (g_adm_tab == ADM_INVITES) draw_invites(rt, m, body);
     else if (g_adm_tab == ADM_GROUPS)  draw_groups(rt, m, body);
     else if (g_adm_tab == ADM_ALERTS)  draw_alerts_admin(rt, m, body);
+    else if (g_adm_tab == ADM_USAGE)   draw_usage(rt, m, body);
     else                              draw_audit(rt, m, body, 1);
 }
 
@@ -25957,7 +26072,7 @@ static void a11y_publish_scene(const oc_model *m) {
 
     /* Admin's tabs, and Alerts' Acknowledge buttons, named for what they act on. */
     if (g_view == VIEW_ADMIN) {
-        static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts", "emoji" };
+        static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts", "emoji", "usage" };
         int admin = self_role(m) >= OC_ROLE_ADMIN;
         for (int t = 0; t < ADM_COUNT && n < OC_ACC_MAX; t++) {
             if (!admin && t != ADM_EMOJI) continue;
@@ -30939,6 +31054,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
     if (g_view == VIEW_ADMIN)
         for (int i = 0; i < ADM_COUNT; i++)
             if (in_rect(g_adm_tabs[i], x, y)) { admin_select(i); return 1; }
+    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_USAGE && usage_click(x, y)) return 1;
     /* The Files view has no sidebar, so its clicks must be served before the
      * transcript-only guard below. */
     if (g_view == VIEW_FILES && files_click(hwnd, x, y)) return 1;

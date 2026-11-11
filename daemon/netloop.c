@@ -1229,7 +1229,11 @@ static void sessions_seen(conn **conns, oc_dbwriter *dbw) {
     uint16_t n = 0, cap = 0;
     for (size_t i = 0; i < g_nlive; i++) {
         conn *c = g_live[i];
-        if (!c || !c->authed || !c->used || !c->session_id || now - c->seen_ms < every) continue;
+        if (!c || !c->authed || !c->used || !c->session_id) continue;
+        /* Within the interval, unless a UTC day has turned since: the first use
+         * in a new day is marked at once, so the member counts as active that
+         * day (REQ-043's usage figures). */
+        if (now - c->seen_ms < every && now / 86400000ull == c->seen_ms / 86400000ull) continue;
         if (n == cap) {
             if (cap == 4096) break;   /* the rest go next second */
             uint16_t nc = cap ? (uint16_t)(cap * 2) : 64;
@@ -4390,6 +4394,18 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (!j) return -1;
             j->user_id = c->user_id;
             j->alert_id = ack.alert_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_USAGE_REQ) {
+            /* Owner/admin only (REQ-043), checked in the writer on the current
+             * role, as the storage report is. */
+            oc_usage_req ur;
+            if (oc_decode_usage_req(&p, &ur) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_USAGE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->usage_days = ur.days;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -7796,6 +7812,27 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         if (!c) break;
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("alerts are for owners and admins") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_USAGE: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c || !r->usage) break;
+        const oc_usage_report *u = r->usage;
+        oc_usage_channel ch[OC_USAGE_TOP_CHANNELS];
+        for (uint16_t i = 0; i < u->n_channels; i++)
+            ch[i] = (oc_usage_channel){ u->ch_id[i], u->ch_messages[i], u->ch_private[i], oc_slice_str(u->ch_name[i]) };
+        oc_usage us = { u->days, u->n_days, u->day, u->n_weeks, u->week, u->n_channels, ch };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_usage(&w, OC_PROTOCOL_VERSION, &us) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_USAGE_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("usage is for owners and admins") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;

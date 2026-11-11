@@ -616,6 +616,8 @@ typedef enum {
     OC_MSG_MESSAGE_MOVED        = 0x011D, /* S->C {message_id, from_channel, to_channel, to_parent, count} */
     OC_MSG_FIND_AT_TIME         = 0x011E, /* C->S, the message at a time in a conversation or thread */
     OC_MSG_FOUND_AT_TIME        = 0x011F, /* S->C, its answer: the first at or after it, else the last before */
+    OC_MSG_USAGE_REQ            = 0x0120, /* C->S, owner/admin: the workspace's usage over the last days */
+    OC_MSG_USAGE                = 0x0121, /* S->C, active members by day and week, messages by day, busiest channels */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -1597,6 +1599,26 @@ typedef struct {
     uint8_t  under_pressure;
 } oc_storage_status;
 
+/* Usage (REQ-043, the console's usage figures): how much the workspace is used, and where, over the last
+ * `days` UTC days (1..OC_USAGE_MAX_DAYS), today included. Sent only to an
+ * owner/admin. A day is days since the epoch in UTC; a week is an ISO week,
+ * written yyyyww (202645). Active members are those who signed in or used a
+ * session that day (or week); messages are those people posted: the
+ * workspace's own messages and call events are not counted. A private channel's name is sent only to someone who can read it. */
+#define OC_USAGE_MAX_DAYS      90
+#define OC_USAGE_MAX_WEEKS     15   /* 90 days span at most 14 ISO weeks; one spare */
+#define OC_USAGE_TOP_CHANNELS  10
+typedef struct { uint16_t days; } oc_usage_req;
+typedef struct { uint32_t day; uint32_t active; uint32_t messages; } oc_usage_day;
+typedef struct { uint32_t week; uint32_t active; } oc_usage_week;
+typedef struct { uint64_t channel_id; uint32_t messages; uint8_t is_private; oc_slice name; } oc_usage_channel;
+typedef struct {
+    uint16_t days;
+    uint16_t n_days;      const oc_usage_day     *day;      /* oldest first */
+    uint16_t n_weeks;     const oc_usage_week    *week;     /* oldest first */
+    uint16_t n_channels;  const oc_usage_channel *channel;  /* busiest first */
+} oc_usage;
+
 /* Audit log paging (REQ-251). `before_ms` pages backwards from a timestamp
  * rather than by offset, so a boundary stays stable as new entries arrive;
  * 0 asks for the newest page. */
@@ -2120,6 +2142,13 @@ oc_result oc_decode_audit_page(oc_rbuf *r, oc_audit_entry *out, uint16_t cap, ui
 
 oc_result oc_encode_storage_status(oc_wbuf *w, uint16_t ver, const oc_storage_status *m);
 oc_result oc_decode_storage_status(oc_rbuf *r, oc_storage_status *m);
+oc_result oc_encode_usage_req(oc_wbuf *w, uint16_t ver, const oc_usage_req *m);
+oc_result oc_decode_usage_req(oc_rbuf *r, oc_usage_req *m);
+oc_result oc_encode_usage(oc_wbuf *w, uint16_t ver, const oc_usage *m);
+/* Into the caller's arrays, which hold OC_USAGE_MAX_DAYS, OC_USAGE_MAX_WEEKS and
+ * OC_USAGE_TOP_CHANNELS entries; a frame claiming more is refused. */
+oc_result oc_decode_usage(oc_rbuf *r, oc_usage *m, oc_usage_day *days, oc_usage_week *weeks,
+                          oc_usage_channel *channels);
 
 oc_result oc_encode_client_settings(oc_wbuf *w, uint16_t version, const oc_client_settings *m);
 oc_result oc_encode_call_join(oc_wbuf *w, uint16_t version, const oc_call_join *m);

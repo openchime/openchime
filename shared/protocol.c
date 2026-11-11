@@ -1867,6 +1867,75 @@ oc_result oc_decode_storage_status(oc_rbuf *r, oc_storage_status *m) {
     return r_done(r);
 }
 
+oc_result oc_encode_usage_req(oc_wbuf *w, uint16_t version, const oc_usage_req *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_USAGE_REQ);
+    oc_w_u16(w, m->days);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_usage_req(oc_rbuf *r, oc_usage_req *m) {
+    m->days = oc_r_u16(r);
+    return r_done(r);
+}
+
+oc_result oc_encode_usage(oc_wbuf *w, uint16_t version, const oc_usage *m) {
+    if (m->n_days > OC_USAGE_MAX_DAYS || m->n_weeks > OC_USAGE_MAX_WEEKS ||
+        m->n_channels > OC_USAGE_TOP_CHANNELS)
+        return OC_E_OVERFLOW;
+    size_t off = oc_frame_begin(w, version, OC_MSG_USAGE);
+    oc_w_u16(w, m->days);
+    oc_w_u16(w, m->n_days);
+    for (uint16_t i = 0; i < m->n_days; i++) {
+        oc_w_u32(w, m->day[i].day);
+        oc_w_u32(w, m->day[i].active);
+        oc_w_u32(w, m->day[i].messages);
+    }
+    oc_w_u16(w, m->n_weeks);
+    for (uint16_t i = 0; i < m->n_weeks; i++) {
+        oc_w_u32(w, m->week[i].week);
+        oc_w_u32(w, m->week[i].active);
+    }
+    oc_w_u16(w, m->n_channels);
+    for (uint16_t i = 0; i < m->n_channels; i++) {
+        oc_w_u64(w, m->channel[i].channel_id);
+        oc_w_u32(w, m->channel[i].messages);
+        oc_w_u8(w, m->channel[i].is_private);
+        oc_w_str(w, m->channel[i].name);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_usage(oc_rbuf *r, oc_usage *m, oc_usage_day *days, oc_usage_week *weeks,
+                          oc_usage_channel *channels) {
+    memset(m, 0, sizeof *m);
+    m->days = oc_r_u16(r);
+    uint16_t n = oc_r_u16(r);
+    if (n > OC_USAGE_MAX_DAYS) return OC_E_MALFORMED;
+    for (uint16_t i = 0; i < n; i++) {
+        days[i].day      = oc_r_u32(r);
+        days[i].active   = oc_r_u32(r);
+        days[i].messages = oc_r_u32(r);
+    }
+    m->n_days = n; m->day = days;
+    n = oc_r_u16(r);
+    if (n > OC_USAGE_MAX_WEEKS) return OC_E_MALFORMED;
+    for (uint16_t i = 0; i < n; i++) {
+        weeks[i].week   = oc_r_u32(r);
+        weeks[i].active = oc_r_u32(r);
+    }
+    m->n_weeks = n; m->week = weeks;
+    n = oc_r_u16(r);
+    if (n > OC_USAGE_TOP_CHANNELS) return OC_E_MALFORMED;
+    for (uint16_t i = 0; i < n; i++) {
+        channels[i].channel_id = oc_r_u64(r);
+        channels[i].messages   = oc_r_u32(r);
+        channels[i].is_private = oc_r_u8(r);
+        channels[i].name       = oc_r_str(r);
+    }
+    m->n_channels = n; m->channel = channels;
+    return r_done(r);
+}
+
 oc_result oc_encode_client_settings(oc_wbuf *w, uint16_t version, const oc_client_settings *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CLIENT_SETTINGS);
     oc_w_str(w, m->client_type);

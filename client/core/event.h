@@ -46,6 +46,21 @@ typedef struct {
     uint8_t  evict_enabled, under_pressure;
 } oc_storage_view;
 
+/* The workspace's usage (REQ-043), carried on OC_EV_USAGE and kept in the model
+ * for the console's Usage tab. Owner/admin only. A channel with an empty name is
+ * a private one the reader is not in: shown as "private channel". */
+typedef struct {
+    uint16_t       days, n_days, n_weeks, n_channels;
+    oc_usage_day   day[OC_USAGE_MAX_DAYS];     /* oldest first */
+    oc_usage_week  week[OC_USAGE_MAX_WEEKS];   /* oldest first */
+    struct {
+        uint64_t id;
+        uint32_t messages;
+        uint8_t  is_private;
+        char     name[128];
+    } channel[OC_USAGE_TOP_CHANNELS];          /* busiest first */
+} oc_usage_view;
+
 /* One audit entry as the frontend sees it (REQ-251). Fixed-size strings: a page
  * is bounded and short-lived, so this avoids per-entry heap churn. */
 typedef struct {
@@ -183,6 +198,7 @@ enum {
     OC_EV_PROFILE,         /* a PROFILE_UPDATED: user_id + body=display_name (own = the change ack) */
     OC_EV_READ_CURSOR,     /* a READ_CURSOR: user_id read up to message_id in channel_id (seen-by) */
     OC_EV_STORAGE,         /* a STORAGE_STATUS: usage + policy report (REQ-214) */
+    OC_EV_USAGE,           /* a USAGE: the workspace's usage figures (REQ-043): `usage` */
     OC_EV_AUDIT_BEGIN,     /* an AUDIT_PAGE starts: clears the model's page */
     OC_EV_AUDIT,           /* one audit entry (REQ-251) */
     OC_EV_SRVALERTS,       /* an ALERTS_SUMMARY (REQ-263): count = unacknowledged, srvalert_current */
@@ -361,6 +377,7 @@ typedef struct {
     oc_storage_view storage;  /* OC_EV_STORAGE */
     oc_audit_view   audit;    /* OC_EV_AUDIT */
     oc_srvalert_view *srvalert; /* heap; OC_EV_SRVALERT */
+    oc_usage_view   *usage;     /* heap; OC_EV_USAGE */
     uint32_t        srvalert_current; /* OC_EV_SRVALERTS: how many still hold */
     uint8_t  op;           /* REACTION: add/remove */
     uint32_t count;        /* REACTION: running aggregate count for the emoji */
@@ -541,6 +558,7 @@ enum {
     OC_CMD_MARK_ALL_READ,   /* MARK_ALL_READ: every membership, in one frame; no fields */
     OC_CMD_GET_CHANNEL_DESCRIPTION, /* ask for `channel_id`'s description (REQ-034) */
     OC_CMD_STORAGE_STATUS,  /* ask for the storage usage report (owner/admin) */
+    OC_CMD_USAGE,           /* ask for the usage figures over `usage_days` days (owner/admin) */
     OC_CMD_SRVALERTS_LIST,  /* ask for the daemon's critical failures (owner/admin) */
     OC_CMD_RESTORE,         /* take a delete back: channel_id, message_id (REQ-052) */
     OC_CMD_SRVALERT_ACK,    /* acknowledge one: message_id = its id, 0 = every one */
@@ -712,6 +730,8 @@ typedef struct {
      * relevance, this rank beside it. */
     int64_t  rank;
     uint64_t parent_id;    /* MOVE_MESSAGE: the destination thread, 0 its top level */
+    /* USAGE: over how many UTC days (1..OC_USAGE_MAX_DAYS). */
+    uint16_t usage_days;
 } oc_cmd;
 
 oc_cmd *oc_cmd_new(int type);

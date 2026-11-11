@@ -1931,6 +1931,30 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 slice_to_buf(rows[i].message, v->message, sizeof v->message);
                 oc_queue_push(ctx->to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_USAGE) {
+            static __thread oc_usage_day days[OC_USAGE_MAX_DAYS];
+            static __thread oc_usage_week weeks[OC_USAGE_MAX_WEEKS];
+            static __thread oc_usage_channel chans[OC_USAGE_TOP_CHANNELS];
+            oc_usage us;
+            if (oc_decode_usage(&p, &us, days, weeks, chans) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_USAGE);
+            oc_usage_view *v = e ? calloc(1, sizeof *v) : NULL;
+            if (e && v) {
+                v->days = us.days; v->n_days = us.n_days; v->n_weeks = us.n_weeks; v->n_channels = us.n_channels;
+                memcpy(v->day, us.day, (size_t)us.n_days * sizeof *v->day);
+                memcpy(v->week, us.week, (size_t)us.n_weeks * sizeof *v->week);
+                for (uint16_t i = 0; i < us.n_channels; i++) {
+                    v->channel[i].id = us.channel[i].channel_id;
+                    v->channel[i].messages = us.channel[i].messages;
+                    v->channel[i].is_private = us.channel[i].is_private;
+                    slice_to_buf(us.channel[i].name, v->channel[i].name, sizeof v->channel[i].name);
+                }
+                e->usage = v;
+                oc_queue_push(ctx->to_ui, e);
+            } else {
+                free(v);
+                if (e) oc_ev_free(e);
+            }
         } else if (hdr.msg_type == OC_MSG_STORAGE_STATUS) {
             oc_storage_status ss;
             if (oc_decode_storage_status(&p, &ss) != OC_OK) return -1;
@@ -3564,6 +3588,12 @@ static int run_connection(oc_net *n, int reconnecting,
             if (c->type == OC_CMD_STORAGE_STATUS) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 if (oc_encode_storage_status_req(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_USAGE) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_usage_req ur = { c->usage_days };
+                if (oc_encode_usage_req(&w, OC_PROTOCOL_VERSION, &ur) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_LIST_CHANNELS) {

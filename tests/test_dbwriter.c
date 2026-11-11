@@ -2441,7 +2441,9 @@ static void test_index_mentions(void) {
                            /* 0075's reminders on saved items. */
                            "DROP INDEX idx_saved_remind;"
                            "ALTER TABLE saved_items DROP COLUMN remind_at_ms;"
-                           "ALTER TABLE saved_items DROP COLUMN reminded_at_ms;",
+                           "ALTER TABLE saved_items DROP COLUMN reminded_at_ms;"
+                           /* 0076's active days. */
+                           "DROP TABLE user_active_days;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -11285,10 +11287,147 @@ static void test_visitor_mention_typing(void) {
     cleanup_db(path);
 }
 
+/* Usage (REQ-043): active days recorded once a member a day, the figures over a
+ * fixture spanning days and ISO weeks, the workspace's own messages and those
+ * before the period not counted, a private channel named only to someone in it,
+ * and a member refused. */
+static oc_dbres *usage_q(oc_dbwriter *w, uint64_t uid, uint16_t days) {
+    oc_job *j = oc_job_new(OC_JOB_USAGE, 950);
+    j->user_id = uid; j->usage_days = days;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_usage(void) {
+    /* The ISO weeks first, at year ends: 2026-01-01 was a Thursday (week 1 of
+     * 2026), 2027-01-01 a Friday (week 53 of 2026), and 2024-12-30, a Monday,
+     * began week 1 of 2025. */
+    uint32_t mon = 0;
+    CHECK(oc_usage_iso_week(20454, &mon) == 202601 && mon == 20451);
+    CHECK(oc_usage_iso_week(20819, NULL) == 202653);
+    CHECK(oc_usage_iso_week(20087, &mon) == 202501 && mon == 20087);
+
+    const char *path = tdb("usage.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t owner = reg(w, "us-owner", "pw", OC_ROLE_OWNER);
+    uint64_t member = reg(w, "us-member", "pw", OC_ROLE_MEMBER);
+    uint64_t admin = reg(w, "us-admin", "pw", OC_ROLE_ADMIN);
+    CHECK(owner && member && admin);
+    /* Two sign-ins by the owner today, one by the member: one row each. */
+    CHECK(auth_local(w, 951, "us-owner", "pw", NULL, NULL) == owner);
+    CHECK(auth_local(w, 952, "us-owner", "pw", NULL, NULL) == owner);
+    CHECK(auth_local(w, 953, "us-member", "pw", NULL, NULL) == member);
+    const uint64_t today = (uint64_t)time(NULL) / 86400;
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_busy_timeout(db, 5000);
+    char sql[512];
+    snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM user_active_days WHERE user_id=%llu AND day=%llu;",
+             (unsigned long long)owner, (unsigned long long)today);
+    CHECK(count_rows(db, sql) == 1);
+    snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM user_active_days WHERE user_id=%llu;", (unsigned long long)member);
+    CHECK(count_rows(db, sql) == 1);
+
+    /* A public channel the owner is in, and a private one only the member and
+     * the admin are in. */
+    oc_dbres *r = create_channel(w, owner, "busy", 1);
+    uint64_t busy = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    r = create_channel(w, member, "hushed", 0);
+    uint64_t hushed = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    oc_dbres_free(chan_member(w, OC_JOB_INVITE_CHANNEL, member, hushed, admin));
+    CHECK(busy && hushed);
+    /* Yesterday the owner alone; eight days ago (another ISO week) the owner
+     * alone. Messages: today 3 in busy and 2 in hushed, yesterday 1 in busy, one
+     * by the workspace's own sender today, and one 40 days ago -- the last two
+     * never counted over 30 days. */
+    uint64_t ms = today * 86400000ull + 1000;
+    snprintf(sql, sizeof sql,
+             "INSERT INTO user_active_days VALUES(%llu,%llu),(%llu,%llu);"
+             "INSERT INTO users(subject, created_at_ms, is_system) VALUES('us-system', 0, 1);",
+             (unsigned long long)owner, (unsigned long long)(today - 1),
+             (unsigned long long)owner, (unsigned long long)(today - 8));
+    CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+    const struct { uint64_t ch, author; int64_t at; } M[] = {
+        { busy, owner, 0 }, { busy, owner, 0 }, { busy, member, 0 },
+        { hushed, member, 0 }, { hushed, admin, 0 },
+        { busy, owner, -86400000LL },
+        { busy, 0, 0 },                       /* the workspace's own sender */
+        { busy, owner, -40LL * 86400000LL },  /* before the period */
+    };
+    /* And a missed call in busy today: a call event, which the daemon writes. */
+    snprintf(sql, sizeof sql, "INSERT INTO messages(channel_id, author_id, body, created_at_ms, kind) "
+             "VALUES(%llu, %llu, 'Missed call', %lld, 1);", (unsigned long long)busy,
+             (unsigned long long)owner, (long long)ms);
+    CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+    for (size_t i = 0; i < sizeof M / sizeof M[0]; i++) {
+        if (M[i].author)
+            snprintf(sql, sizeof sql, "INSERT INTO messages(channel_id, author_id, body, created_at_ms) "
+                     "VALUES(%llu, %llu, 'x', %lld);", (unsigned long long)M[i].ch,
+                     (unsigned long long)M[i].author, (long long)ms + M[i].at);
+        else
+            snprintf(sql, sizeof sql, "INSERT INTO messages(channel_id, author_id, body, created_at_ms) "
+                     "SELECT %llu, id, 'x', %lld FROM users WHERE subject='us-system';",
+                     (unsigned long long)M[i].ch, (long long)ms);
+        CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+    }
+    sqlite3_close(db);
+
+    r = usage_q(w, owner, 30);
+    CHECK(r && r->type == OC_RES_USAGE && r->usage);
+    if (r && r->usage) {
+        const oc_usage_report *u = r->usage;
+        CHECK(u->days == 30 && u->n_days == 30);
+        CHECK(u->day[29].day == today && u->day[28].day == today - 1);
+        CHECK(u->day[29].active == 2 && u->day[29].messages == 5);
+        CHECK(u->day[28].active == 1 && u->day[28].messages == 1);
+        CHECK(u->day[21].active == 1 && u->day[21].messages == 0);   /* eight days ago */
+        uint32_t total = 0;
+        for (int i = 0; i < u->n_days; i++) total += u->day[i].messages;
+        CHECK(total == 6);
+        /* The weeks: oldest first, today's last and holding both, and the week
+         * of eight days ago the owner alone. */
+        CHECK(u->n_weeks >= 5 && u->n_weeks <= 6);
+        CHECK(u->week[u->n_weeks - 1].week == oc_usage_iso_week((uint32_t)today, NULL));
+        CHECK(u->week[u->n_weeks - 1].active == 2);
+        uint32_t wk8 = oc_usage_iso_week((uint32_t)(today - 8), NULL);
+        int found = 0;
+        for (int i = 0; i < u->n_weeks; i++)
+            if (u->week[i].week == wk8) { found = 1; CHECK(u->week[i].active == 1); }
+        CHECK(found);
+        /* The channels: busy (4) before hushed (2); hushed is private, and the
+         * owner is not in it, so it comes with no name. */
+        CHECK(u->n_channels == 2);
+        CHECK(u->ch_id[0] == busy && u->ch_messages[0] == 4 && !u->ch_private[0] && !strcmp(u->ch_name[0], "busy"));
+        CHECK(u->ch_id[1] == hushed && u->ch_messages[1] == 2 && u->ch_private[1] && u->ch_name[1][0] == '\0');
+    }
+    oc_dbres_free(r);
+    /* The admin is in hushed, and is told its name. */
+    r = usage_q(w, admin, 30);
+    CHECK(r && r->type == OC_RES_USAGE && r->usage && r->usage->n_channels == 2 &&
+          !strcmp(r->usage->ch_name[1], "hushed"));
+    oc_dbres_free(r);
+    /* Out of range asks for the nearest the daemon allows. */
+    r = usage_q(w, owner, 500);
+    CHECK(r && r->usage && r->usage->days == OC_USAGE_MAX_DAYS && r->usage->n_days == OC_USAGE_MAX_DAYS);
+    oc_dbres_free(r);
+    /* A member is refused. */
+    r = usage_q(w, member, 30);
+    CHECK(r && r->type == OC_RES_USAGE_ERR && r->err_code == OC_ERR_FORBIDDEN && !r->usage);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_auth_pool();
+    test_usage();
     test_change_password();
     test_groups_manage();
     test_groups_membership();

@@ -385,6 +385,9 @@ void oc_client_list_settings(oc_client *c);
  * member). The answer folds into the model as `storage`/`storage_have`. Toggle
  * the overlay is frontend view state. */
 void oc_client_storage_status(oc_client *c);
+/* The workspace's usage over the last `days` UTC days (REQ-043; owner/admin
+ * only, 1..OC_USAGE_MAX_DAYS): into the model's `usage`, `usage_have`. */
+void oc_client_usage(oc_client *c, unsigned days);
 /* The daemon's critical failures (REQ-263), owner/admin only: ask for the list
  * (into the model's `srvalerts`), or acknowledge one -- `id` 0 for every one --
  * after which the list is asked for again. */

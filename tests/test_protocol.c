@@ -2574,6 +2574,53 @@ static void test_storage_status_frames(void) {
     CHECK(h.msg_type == OC_MSG_STORAGE_STATUS_REQ);
 }
 
+/* USAGE_REQ and USAGE (REQ-043): the period asked, and the figures round-trip,
+ * a private channel's empty name included; a frame claiming more rows than the
+ * caps is refused rather than written past the caller's arrays. */
+static void test_usage_frames(void) {
+    static uint8_t buf[4096];
+    oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_usage_req rq = { 30 };
+    CHECK(oc_encode_usage_req(&w, OC_PROTOCOL_VERSION, &rq) == OC_OK);
+    oc_header h; oc_rbuf r;
+    CHECK(oc_parse_frame(buf, w.len, &h, &r) == OC_OK && h.msg_type == OC_MSG_USAGE_REQ);
+    oc_usage_req rq2 = { 0 };
+    CHECK(oc_decode_usage_req(&r, &rq2) == OC_OK && rq2.days == 30);
+
+    oc_usage_day days[3] = { { 20403, 4, 17 }, { 20404, 0, 0 }, { 20405, 6, 41 } };
+    oc_usage_week weeks[2] = { { 202645, 7 }, { 202646, 6 } };
+    oc_usage_channel ch[2] = { { 11, 30, 0, oc_slice_str("general") }, { 12, 9, 1, oc_slice_str("") } };
+    oc_usage in = { 3, 3, days, 2, weeks, 2, ch };
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_usage(&w, OC_PROTOCOL_VERSION, &in) == OC_OK);
+    CHECK(oc_parse_frame(buf, w.len, &h, &r) == OC_OK && h.msg_type == OC_MSG_USAGE);
+    oc_usage_day od[OC_USAGE_MAX_DAYS]; oc_usage_week ow[OC_USAGE_MAX_WEEKS];
+    oc_usage_channel oc[OC_USAGE_TOP_CHANNELS];
+    oc_usage out;
+    CHECK(oc_decode_usage(&r, &out, od, ow, oc) == OC_OK);
+    CHECK(out.days == 3 && out.n_days == 3 && out.n_weeks == 2 && out.n_channels == 2);
+    CHECK(out.day[0].day == 20403 && out.day[0].active == 4 && out.day[0].messages == 17);
+    CHECK(out.day[2].active == 6 && out.day[2].messages == 41);
+    CHECK(out.week[0].week == 202645 && out.week[1].active == 6);
+    CHECK(out.channel[0].channel_id == 11 && out.channel[0].messages == 30 && !out.channel[0].is_private &&
+          slice_eq_str(out.channel[0].name, "general"));
+    CHECK(out.channel[1].is_private && out.channel[1].name.len == 0);
+
+    /* More rows than the caps: refused at both ends. */
+    static oc_usage_day many[OC_USAGE_MAX_DAYS + 1];
+    oc_usage big = { 91, OC_USAGE_MAX_DAYS + 1, many, 0, NULL, 0, NULL };
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_usage(&w, OC_PROTOCOL_VERSION, &big) != OC_OK);
+    /* An empty USAGE is 8 bytes of payload (days, then three counts); one whose
+     * day count is forged to 65535 is refused before a row is read. */
+    oc_usage none = { 1, 0, NULL, 0, NULL, 0, NULL };
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_usage(&w, OC_PROTOCOL_VERSION, &none) == OC_OK);
+    buf[w.len - 6] = 0xFF; buf[w.len - 5] = 0xFF;
+    CHECK(oc_parse_frame(buf, w.len, &h, &r) == OC_OK);
+    CHECK(oc_decode_usage(&r, &out, od, ow, oc) == OC_E_MALFORMED);
+}
+
 /* Every reason code is distinct.
  *
  * This exists because they were not. INVALID_MESSAGE (REQ-224) was added in
@@ -2876,6 +2923,7 @@ int run_protocol_tests(void) {
     test_client_settings_frames();
     test_read_cursor_frames();
     test_storage_status_frames();
+    test_usage_frames();
     test_profile_frames();
     test_tts_frames();
     test_call_frames();

@@ -18,6 +18,7 @@ void oc_ev_free(oc_ev *e) {
     free(e->ids);
     free(e->der);
     free(e->srvalert);
+    free(e->usage);
     free(e);
 }
 

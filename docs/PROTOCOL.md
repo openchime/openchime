@@ -2173,6 +2173,30 @@ retention/eviction policy, and cumulative reclamation counts **by reason** (orph
     last_reclaim_ms (u64), max_age_days (u64), reserve_bytes (u64),
     evict_enabled (u8), under_pressure (u8)
 
+**`USAGE_REQ` (C → S), `0x0120`** `{ days: u16 }` — asks for the workspace's
+usage over the last `days` UTC days, today included (REQ-043, the console's usage
+figures). `days` is 1 to `OC_USAGE_MAX_DAYS` (90); 0 is taken as 1 and more as 90.
+Owner and admin only: a member's request is refused with `ERROR FORBIDDEN`.
+
+**`USAGE` (S → C), `0x0121`** — the figures, counted and never read from anything
+anyone wrote:
+
+    days (u16),
+    n_days (u16), then per day, oldest first: day (u32), active (u32), messages (u32),
+    n_weeks (u16), then per ISO week, oldest first: week (u32), active (u32),
+    n_channels (u16), then per channel, busiest first:
+        channel_id (u64), messages (u32), is_private (u8), name (str)
+
+A `day` is days since the epoch in UTC; a `week` is an ISO week written `yyyyww`
+(`202645`), its members counted once over the days of it inside the period.
+`active` is how many members signed in, came back to a session, or used one that
+day or week (migration 0072); `messages` how many messages people posted, the
+workspace's own messages and call events not counted. The channels are the ten
+(`OC_USAGE_TOP_CHANNELS`) with the most messages in the period, channels only,
+never a direct message. A private channel's `name` is sent only to someone who is
+in it, and is otherwise empty: a client shows "private channel". A frame with more
+than 90 days, 15 weeks or 10 channels is malformed.
+
 **`AUDIT_QUERY` (C → S), `0x0099`** `{ before_ms: u64, limit: u16, family: u8,
 actor_id: u64, action: str }` — pages the audit log (REQ-251). `before_ms` pages
 **backwards from a timestamp** rather than by offset, so a page boundary stays
@@ -3617,6 +3641,8 @@ this table cannot silently gain a shared value.
 | `0x011D` | `MESSAGE_MOVED` | S → C | to the readers of both channels, once each: a message moved |
 | `0x011E` | `FIND_AT_TIME` | C → S | the message at a moment in a conversation or one thread of it (jump to a date) |
 | `0x011F` | `FOUND_AT_TIME` | S → C | its answer: the first at or after the moment, else the last before |
+| `0x0120` | `USAGE_REQ` | C → S | owner/admin: the workspace's usage over the last days (REQ-043) |
+| `0x0121` | `USAGE` | S → C | active members by day and week, messages by day, the busiest channels |
 
 ## 10. Connection state machine
 

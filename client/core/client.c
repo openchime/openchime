@@ -1143,6 +1143,14 @@ void oc_client_storage_status(oc_client *c) {
     if (cmd) oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_usage(oc_client *c, unsigned days) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_USAGE);
+    if (!cmd) return;
+    cmd->usage_days = (uint16_t)(days < 1 ? 1 : days > OC_USAGE_MAX_DAYS ? OC_USAGE_MAX_DAYS : days);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_toggle_storage(oc_client *c, int open) {
     if (c) c->model.storage_open = open ? 1 : 0;
 }

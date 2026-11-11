@@ -724,6 +724,7 @@ void oc_job_free(oc_job *j) { job_free(j); }
 void oc_dbres_free(oc_dbres *r) {
     if (!r) return;
     free(r->dest_members);
+    free(r->usage);
     free(r->alert_rows);
     free(r->body);
     free(r->pk_creds);
@@ -1149,6 +1150,18 @@ static int credential_current(sqlite3 *db, uint64_t uid, uint64_t version, uint8
 
 /* Mint a session: random 32-byte token to the caller, only its SHA-256 stored
  * (AUTH.md §4). Returns 0 and fills token/expiry, or -1. */
+/* A member was active today (REQ-043's usage figures): one row a member a UTC
+ * day, written the first time and ignored after. */
+static void mark_active_day(sqlite3 *db, uint64_t user_id) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO user_active_days(user_id, day) VALUES(?, ?);",
+                           -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)(dbw_now_ms() / 86400000ull));
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
 /* `out_session_id` (optional) reports the row created, so a SESSION_LIST can mark
  * which entry is the connection asking (REQ-182). */
 static int mint_session(sqlite3 *db, uint64_t user_id,
@@ -1173,6 +1186,7 @@ static int mint_session(sqlite3 *db, uint64_t user_id,
         *out_session_id = (uint64_t)sqlite3_last_insert_rowid(db);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) return -1;
+    mark_active_day(db, user_id);   /* signing in is using the workspace today */
 
     memcpy(token_out, token, sizeof token);
     if (expiry_out) *expiry_out = expiry;
@@ -1223,6 +1237,7 @@ static uint64_t lookup_session(sqlite3 *db, const uint8_t *token, size_t tlen,
     sqlite3_bind_blob(st, 2, hash, sizeof hash, SQLITE_STATIC);
     sqlite3_step(st);
     sqlite3_finalize(st);
+    mark_active_day(db, uid);       /* and so is coming back to a session */
 
     if (role_out) *role_out = role;
     if (expiry_out) *expiry_out = exp;
@@ -2613,6 +2628,19 @@ static oc_dbres *process_sessions_seen(sqlite3 *db, const oc_job *j) {
         sqlite3_reset(st);
     }
     sqlite3_finalize(st);
+    /* Each one's member was active today (REQ-043): the net loop sends this at
+     * least once in every UTC day a connection is used. */
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO user_active_days(user_id, day) "
+                               "SELECT user_id, ? FROM sessions WHERE id=?;", -1, &st, NULL) == SQLITE_OK) {
+        for (uint16_t i = 0; i < j->n_grp_uids; i++) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)(now / 86400000ull));
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)j->grp_uids[i]);
+            sqlite3_step(st);
+            sqlite3_reset(st);
+        }
+        sqlite3_finalize(st);
+    }
     return NULL;
 }
 
@@ -11133,6 +11161,7 @@ static oc_dbres *process_tts_voice_set(sqlite3 *db, const oc_job *j) {
  * thread, so a heavy search/backfill can't stall message sends or auth. */
 static oc_dbres *process_storage_status(sqlite3 *db, const oc_job *j);
 static oc_dbres *process_audit_query(sqlite3 *db, const oc_job *j);
+static oc_dbres *process_usage(sqlite3 *db, const oc_job *j);
 
 static int is_read_job(int type) {
     return type == OC_JOB_BACKFILL || type == OC_JOB_HISTORY || type == OC_JOB_SEARCH ||
@@ -11150,7 +11179,7 @@ static int is_read_job(int type) {
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
            type == OC_JOB_CALL_AUTH ||
            type == OC_JOB_STORAGE_STATUS || type == OC_JOB_ALERTS_LIST ||
-           type == OC_JOB_AUDIT_QUERY ||
+           type == OC_JOB_AUDIT_QUERY || type == OC_JOB_USAGE ||
            type == OC_JOB_TTS_LOOKUP || type == OC_JOB_TTS_PREVIEW ||
            type == OC_JOB_STT_PREP || type == OC_JOB_LIST_GROUPS ||
            type == OC_JOB_SUMMARY_LOOKUP || type == OC_JOB_LIST_POLL_VOTERS;
@@ -11179,6 +11208,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_STORAGE_STATUS) return process_storage_status(rdb, j);
     if (j->type == OC_JOB_ALERTS_LIST)    return process_alerts_list(rdb, j);
     if (j->type == OC_JOB_AUDIT_QUERY)    return process_audit_query(rdb, j);
+    if (j->type == OC_JOB_USAGE)          return process_usage(rdb, j);
     if (j->type == OC_JOB_TTS_LOOKUP)     return process_tts_lookup(rdb, j);
     if (j->type == OC_JOB_TTS_PREVIEW)    return process_tts_preview(rdb, j);
     if (j->type == OC_JOB_STT_PREP)       return process_stt_prep(rdb, j);
@@ -11827,6 +11857,137 @@ static oc_dbres *process_storage_status(sqlite3 *db, const oc_job *j) {
 }
 
 
+
+/* Days since the epoch from a civil date, and back (H. Hinnant's algorithms),
+ * for the ISO weeks of the usage figures. */
+static int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+static int64_t year_of_day(int64_t z) {
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    const unsigned m = mp < 10 ? mp + 3 : mp - 9;
+    return (int64_t)yoe + era * 400 + (m <= 2);
+}
+
+/* The ISO week a day falls in, as yyyyww, and the Monday it starts on: the week
+ * belongs to the year its Thursday is in (ISO 8601). Day 0, 1970-01-01, was a
+ * Thursday. */
+uint32_t oc_usage_iso_week(uint32_t day, uint32_t *monday) {
+    int64_t d = (int64_t)day;
+    int64_t wd = ((d + 3) % 7 + 7) % 7;              /* Monday 0 .. Sunday 6 */
+    int64_t thu = d - wd + 3;
+    int64_t y = year_of_day(thu);
+    int64_t week = (thu - days_from_civil(y, 1, 1)) / 7 + 1;
+    if (monday) *monday = (uint32_t)(d - wd);
+    return (uint32_t)(y * 100 + week);
+}
+
+/* The workspace's usage for an owner or admin (REQ-043): active members per day
+ * and per ISO week, messages posted per day (the workspace's own messages and
+ * the call events the daemon writes not counted), and the ten busiest channels -- all counted, nothing anyone wrote
+ * read. A private channel's name goes only to someone who is in it. Authorized
+ * on the CURRENT role, like the storage report. */
+static oc_dbres *process_usage(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_USAGE;
+    r->conn_id = j->conn_id;
+    uint8_t role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &role) || !oc_role_can_manage_members(role)) {
+        r->type = OC_RES_USAGE_ERR;
+        r->err_code = OC_ERR_FORBIDDEN;
+        return r;
+    }
+    oc_usage_report *u = calloc(1, sizeof *u);
+    if (!u) { r->type = OC_RES_USAGE_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    r->usage = u;
+    uint16_t days = j->usage_days;
+    if (days < 1) days = 1;
+    if (days > OC_USAGE_MAX_DAYS) days = OC_USAGE_MAX_DAYS;
+    const uint32_t today = (uint32_t)(dbw_now_ms() / 86400000ull);
+    const uint32_t first = today - (uint32_t)days + 1;
+    u->days = days;
+    u->n_days = days;
+    for (uint16_t i = 0; i < days; i++) u->day[i].day = first + i;
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT day, COUNT(*) FROM user_active_days WHERE day BETWEEN ?1 AND ?2 GROUP BY day;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, first);
+        sqlite3_bind_int64(st, 2, today);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            int64_t d = sqlite3_column_int64(st, 0);
+            if (d >= first && d <= today) u->day[d - first].active = (uint32_t)sqlite3_column_int64(st, 1);
+        }
+        sqlite3_finalize(st);
+    }
+    st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT m.created_at_ms / 86400000, COUNT(*) FROM messages m JOIN users u ON u.id = m.author_id"
+            " WHERE m.created_at_ms >= ?1 AND m.created_at_ms < ?2 AND u.is_system = 0 AND m.kind = 0"
+            " GROUP BY m.created_at_ms / 86400000;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)first * 86400000);
+        sqlite3_bind_int64(st, 2, ((sqlite3_int64)today + 1) * 86400000);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            int64_t d = sqlite3_column_int64(st, 0);
+            if (d >= first && d <= today) u->day[d - first].messages = (uint32_t)sqlite3_column_int64(st, 1);
+        }
+        sqlite3_finalize(st);
+    }
+    /* Each ISO week the period touches, its members counted once, over the days
+     * of it inside the period. */
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(DISTINCT user_id) FROM user_active_days WHERE day BETWEEN ?1 AND ?2;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        uint32_t d = first;
+        while (d <= today && u->n_weeks < OC_USAGE_MAX_WEEKS) {
+            uint32_t monday = 0, wk = oc_usage_iso_week(d, &monday);
+            uint32_t end = monday + 6 < today ? monday + 6 : today;
+            sqlite3_bind_int64(st, 1, d);
+            sqlite3_bind_int64(st, 2, end);
+            uint32_t n = sqlite3_step(st) == SQLITE_ROW ? (uint32_t)sqlite3_column_int64(st, 0) : 0;
+            sqlite3_reset(st);
+            u->week[u->n_weeks++] = (oc_usage_week){ wk, n };
+            d = end + 1;
+        }
+        sqlite3_finalize(st);
+    }
+    /* The busiest channels: channels only, never a DM, by messages in the period. */
+    st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT c.id, COALESCE(c.name, ''), c.is_public, COUNT(*) AS n,"
+            "  EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.user_id = ?3)"
+            " FROM messages m JOIN channels c ON c.id = m.channel_id JOIN users u ON u.id = m.author_id"
+            " WHERE c.kind = 'channel' AND m.created_at_ms >= ?1 AND m.created_at_ms < ?2 AND u.is_system = 0"
+            "   AND m.kind = 0"
+            " GROUP BY c.id ORDER BY n DESC, c.id LIMIT ?4;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)first * 86400000);
+        sqlite3_bind_int64(st, 2, ((sqlite3_int64)today + 1) * 86400000);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int(st, 4, OC_USAGE_TOP_CHANNELS);
+        while (sqlite3_step(st) == SQLITE_ROW && u->n_channels < OC_USAGE_TOP_CHANNELS) {
+            uint16_t k = u->n_channels++;
+            int is_public = sqlite3_column_int(st, 2), member = sqlite3_column_int(st, 4);
+            u->ch_id[k] = (uint64_t)sqlite3_column_int64(st, 0);
+            u->ch_messages[k] = (uint32_t)sqlite3_column_int64(st, 3);
+            u->ch_private[k] = (uint8_t)!is_public;
+            if (is_public || member)
+                snprintf(u->ch_name[k], sizeof u->ch_name[k], "%s", (const char *)sqlite3_column_text(st, 1));
+        }
+        sqlite3_finalize(st);
+    }
+    return r;
+}
 
 /* Read a page of the audit log, newest first (REQ-251). Paging is by
  * `audit_before_ms` rather than an offset so a page boundary stays stable while
