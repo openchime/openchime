@@ -2191,7 +2191,13 @@ there and a call's audio is UDP. It asserts the start and bob's invitation (his
 Calls section and a notification), both in the call hearing each other with
 every packet decrypting once the keys are in, noise suppression taking a steady
 hum out, bob muted and seen muted, push to talk, a per-person volume, only the
-starter ending, the missed-call line, and screen sharing — alice shares the
+starter ending and End for everyone asking first (Esc keeps the call, Enter ends
+it), the Calls section gone with no call, the call's banner in #general with Join
+and Decline and bob joining from it, the Calls row's own Join, the header phone's
+and Mute's tooltip words, the conversation beside the call view (a message sent
+from it reaching alice, folded away and back) and its Settings panel, the
+missed-call line read from bob's side with Call back starting a call, and screen
+sharing — alice shares the
 synthetic screen (`OPENCHIME_DEV_CAPTURE=synthetic`), bob's view shows it with
 readable, rising frame numbers, full screen and Esc, actual size, the
 accessibility names, bob taking over and stopping. It reads the dump's `call` line — `in=
@@ -2199,8 +2205,11 @@ parts= epoch= sent= keepalives= tx_epoch= self= slot=` — its `call.peer` lines
 `packets= lost= level= keyed= muted= undecryptable= volume=` — its `share` line —
 `sharer= on= state= bar= view_frames= tex= px_fno= full= actual=`, `px_fno` being
 the synthetic screen's frame number read from the decoded pixels — and `calls[n]`
-and `callevents`. The `call` verb drives it: `call start|join|open|leave|end|decline
-[ch]`, `call mute|unmute|ptt-down|ptt-up`, `call ns on|off`, `call invite <uid...>`,
+and `callevents`, and its `callui` line — `banner= chat= settings= hdrtip= mutetip=
+missed=`. The `call` verb drives it: `call start|join|open|leave|end|decline
+[ch]` (`end` is the request End for everyone's confirmation makes; `end-press` presses
+the button, which asks), `call banner-join|banner-decline|settings|chat|callback|row-join
+<i>`, `call mute|unmute|ptt-down|ptt-up`, `call ns on|off`, `call invite <uid...>`,
 `call volume <uid> <percent>`, `call share <device id or name>|pick|stop|full|actual`.
 Not in CI, for the smoke's reason.
 
