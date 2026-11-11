@@ -3948,6 +3948,35 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_BLOCK) {
+            oc_set_block sb;
+            if (oc_decode_set_block(&p, &sb) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_BLOCK, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->target_user_id = sb.blocked_id;
+            j->block_on = sb.on ? 1 : 0;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_DM_PRIVACY) {
+            uint8_t v = 0;
+            if (oc_decode_set_dm_privacy(&p, &v) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_DM_PRIVACY, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->dm_privacy = v == OC_DM_PRIVACY_NOBODY ? OC_DM_PRIVACY_NOBODY : OC_DM_PRIVACY_ANYONE;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_BLOCKS) {
+            /* Owner/admin only, checked in the reader on the current role. */
+            oc_job *j = oc_job_new(OC_JOB_LIST_BLOCKS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_PRIORITY) {
             uint64_t people[OC_MAX_PRIORITY]; uint8_t n = 0;
             if (oc_decode_set_priority(&p, people, OC_MAX_PRIORITY, &n) != OC_OK) return -1;
@@ -8207,6 +8236,13 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             if (oc_encode_muted_users(&w, OC_PROTOCOL_VERSION, &mu) == OC_OK)
                 send_to_user(ep, conns, r->user_id, 0, g_enc, w.len);
         }
+        if (r->bl_have) {
+            /* And whom they block, with who may start a DM with them. */
+            oc_blocks bl = { r->bl_privacy, r->bl_n, r->bl_ids };
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            if (oc_encode_blocks(&w, OC_PROTOCOL_VERSION, &bl) == OC_OK)
+                send_to_user(ep, conns, r->user_id, 0, g_enc, w.len);
+        }
         break;
     }
     case OC_RES_THREAD_LIST: {
@@ -8265,6 +8301,31 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         if (oc_encode_muted_users(&w, OC_PROTOCOL_VERSION, &mu) == OC_OK)
             send_to_user(ep, conns, r->user_id, 0, g_enc, w.len);
+        break;
+    }
+    case OC_RES_BLOCKS: {
+        /* To every connection of the blocker; nothing to the person blocked. */
+        oc_blocks bl = { r->bl_privacy, r->bl_n, r->bl_ids };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_blocks(&w, OC_PROTOCOL_VERSION, &bl) == OC_OK)
+            send_to_user(ep, conns, r->user_id, 0, g_enc, w.len);
+        break;
+    }
+    case OC_RES_BLOCK_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_block_list bl = { r->n_blk, r->blk_entries };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_block_list(&w, OC_PROTOCOL_VERSION, &bl) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_BLOCK_LIST_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("blocks are for owners and admins") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
     case OC_RES_ALERT_PREFS: {

@@ -3183,6 +3183,42 @@ The session is held in memory only. When it ends its channel is closed
 closes every encrypted DM; and the storage maintenance pass deletes one closed
 more than 24 hours ago, with every row about it (PRIVATE-DM.md §2).
 
+### 5.20 Blocks and DM privacy
+
+A block is its blocker's alone, and nothing tells the person blocked
+(SCHEMA.md §3br). While it holds, the blocked person can start no direct
+conversation naming the blocker: `OPEN_DM` and `OPEN_GROUP_DM` are refused with
+the non-fatal `DM_REFUSED`, and `PDM_OPEN` with `PDM_END` reason 5. In a direct
+conversation the two already share, what the blocked person sends is stored and
+reaches every other member, but never the blocker: not live, not by push, not in
+backfill or history, not in unread counts or activity, and not after the block
+is lifted. Channels are untouched. DM privacy `nobody` refuses every new direct
+conversation naming that person the same way; one that exists carries on.
+
+**`SET_BLOCK` (C → S), `0x0132`** `{ blocked_id: u64, on: u8 }` — block (`on` 1) or
+unblock (0) one person. Oneself, the workspace's own sender, or nobody is
+ignored. Answered with `BLOCKS`.
+
+**`BLOCKS` (S → C), `0x0133`** — whom I block, and my DM privacy.
+
+    dm_privacy (u8: 0 anyone, 1 nobody), count (u16), count × user_id (u64)
+
+Sent to each of my connections after `SET_BLOCK` or `SET_DM_PRIVACY`, and with
+the answer to `LIST_NOTIFY_PREFS`. At most 256 people; a frame with more is
+malformed.
+
+**`SET_DM_PRIVACY` (C → S), `0x0136`** `{ dm_privacy: u8 }` — who may start a
+new direct conversation with me. Answered with `BLOCKS`.
+
+**`LIST_BLOCKS` (C → S), `0x0134`** — empty; every block in the workspace, for an
+owner or admin (`FORBIDDEN` otherwise).
+
+**`BLOCK_LIST` (S → C), `0x0135`** — the answer, newest first, at most 500.
+
+    count (u16), count × { blocker_id (u64), blocked_id (u64), since_ms (u64) }
+
+Adding these frames needed no protocol-version bump.
+
 ## 6. Reconnect backfill (resolves REQ-101)
 
 A client that reconnects (REQ-100) requests everything it missed since its
@@ -3414,6 +3450,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3041` | `EDIT_WINDOW_CLOSED`  | messaging  | no    | An author's `EDIT`, or `DELETE` of their own message, past the window the workspace's configuration sets (`OPENCHIME_EDIT_WINDOW`, `OPENCHIME_DELETE_WINDOW`, which clients are told as `edit_window` and `delete_window`). An admin's or owner's delete of someone else's message is never limited (REQ-051, REQ-052). |
 | `3042` | `WORKSPACE_SENDER`    | messaging  | no    | A message, reply or file sent into a DM with the workspace's own sender (`USER_LIST` `flags`), whose DMs nobody reads. |
 | `3043` | `CANNOT_MOVE`         | messaging  | no    | A `MOVE_MESSAGE` that cannot be made: into or out of a DM or encrypted DM, a thread root with replies into a thread, into a thread that is itself a reply, or to where it already is (REQ-053). |
+| `3070` | `DM_REFUSED`          | messaging  | no    | An `OPEN_DM` or `OPEN_GROUP_DM` naming someone who blocks the asker, or a new one naming someone whose DM privacy is `nobody`. It says neither, so a block is never announced. |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing
@@ -3692,6 +3729,11 @@ this table cannot silently gain a shared value.
 | `0x0121` | `USAGE` | S → C | active members by day and week, messages by day, the busiest channels |
 | `0x0130` | `SET_USER_MUTE` | C → S | mute or unmute one person, for me alone |
 | `0x0131` | `MUTED_USERS` | S → C | to my connections: everyone I have muted, on change and with `LIST_NOTIFY_PREFS` |
+| `0x0132` | `SET_BLOCK` | C → S | block or unblock one person, for me alone (§5.20) |
+| `0x0133` | `BLOCKS` | S → C | to each of my connections: whom I block, and who may start a DM with me |
+| `0x0134` | `LIST_BLOCKS` | C → S | owner or admin: every block in the workspace |
+| `0x0135` | `BLOCK_LIST` | S → C | the answer: blocker, blocked and since, per block |
+| `0x0136` | `SET_DM_PRIVACY` | C → S | who may start a new direct conversation with me: anyone or nobody |
 
 ## 10. Connection state machine
 

@@ -625,6 +625,11 @@ typedef enum {
     OC_MSG_USAGE                = 0x0121, /* S->C, active members by day and week, messages by day, busiest channels */
     OC_MSG_SET_USER_MUTE        = 0x0130, /* C->S, mute or unmute one person, for me alone */
     OC_MSG_MUTED_USERS          = 0x0131, /* S->C, to my connections: everyone I have muted, at sign-in and on change */
+    OC_MSG_SET_BLOCK            = 0x0132, /* C->S, block or unblock one person, for me alone */
+    OC_MSG_BLOCKS               = 0x0133, /* S->C, to my connections: whom I block, and who may start a DM with me */
+    OC_MSG_LIST_BLOCKS          = 0x0134, /* C->S, owner/admin: every block in the workspace */
+    OC_MSG_BLOCK_LIST           = 0x0135, /* S->C, the answer: blocker, blocked and since, per block */
+    OC_MSG_SET_DM_PRIVACY       = 0x0136, /* C->S, who may start a new direct conversation with me */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -731,6 +736,7 @@ typedef enum {
     OC_ERR_WORKSPACE_SENDER    = 3042, /* a message to the workspace's own sender, whose DMs nobody reads */
     OC_ERR_CANNOT_MOVE         = 3043, /* a move that cannot be made: into or out of an encrypted DM, a thread's
                                         * root into a thread, into a thread elsewhere, or to where it already is */
+    OC_ERR_DM_REFUSED          = 3070, /* a new direct conversation this person does not take: never says why */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -1521,6 +1527,20 @@ typedef struct { uint8_t n_terms; const oc_slice *terms;
 #define OC_MAX_MUTED_USERS 256u
 typedef struct { uint64_t muted_id; uint8_t on; } oc_set_user_mute;
 typedef struct { uint16_t count; const uint64_t *ids; } oc_muted_users;
+/* Blocks and DM privacy. A block is its blocker's alone and is never shown to
+ * the person blocked: they cannot start a direct conversation with the blocker,
+ * and what they send into one they already share is kept for its other members
+ * but withheld from the blocker, live and in backfill, for good. DM privacy
+ * says who may start a new direct conversation with a person: anyone, or
+ * nobody. A refusal of either kind is the same OC_ERR_DM_REFUSED. */
+#define OC_MAX_BLOCKS        256u
+#define OC_BLOCK_LIST_MAX    500u
+#define OC_DM_PRIVACY_ANYONE 0u
+#define OC_DM_PRIVACY_NOBODY 1u
+typedef struct { uint64_t blocked_id; uint8_t on; } oc_set_block;
+typedef struct { uint8_t dm_privacy; uint16_t count; const uint64_t *ids; } oc_blocks;
+typedef struct { uint64_t blocker_id, blocked_id, since_ms; } oc_block_entry;
+typedef struct { uint16_t count; const oc_block_entry *entries; } oc_block_list;
 
 /* One thread in the aggregated view (REQ-062). `unread` counts replies by other
  * people past my per-thread cursor — a channel cursor cannot answer this, since
@@ -2146,6 +2166,17 @@ oc_result oc_decode_set_user_mute(oc_rbuf *r, oc_set_user_mute *m);
 oc_result oc_encode_muted_users(oc_wbuf *w, uint16_t version, const oc_muted_users *m);
 /* Into `ids`, which holds OC_MAX_MUTED_USERS; a frame with more is refused. */
 oc_result oc_decode_muted_users(oc_rbuf *r, uint64_t *ids, uint16_t *out_n);
+oc_result oc_encode_set_block(oc_wbuf *w, uint16_t version, const oc_set_block *m);
+oc_result oc_decode_set_block(oc_rbuf *r, oc_set_block *m);
+oc_result oc_encode_blocks(oc_wbuf *w, uint16_t version, const oc_blocks *m);
+/* Into `ids`, which holds OC_MAX_BLOCKS; more is refused. */
+oc_result oc_decode_blocks(oc_rbuf *r, uint8_t *dm_privacy, uint64_t *ids, uint16_t *out_n);
+oc_result oc_encode_list_blocks(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_block_list(oc_wbuf *w, uint16_t version, const oc_block_list *m);
+/* Into `out`, which holds OC_BLOCK_LIST_MAX; more is refused. */
+oc_result oc_decode_block_list(oc_rbuf *r, oc_block_entry *out, uint16_t *out_n);
+oc_result oc_encode_set_dm_privacy(oc_wbuf *w, uint16_t version, uint8_t value);
+oc_result oc_decode_set_dm_privacy(oc_rbuf *r, uint8_t *value);
 oc_result oc_encode_alert_prefs(oc_wbuf *w, uint16_t version, const oc_alert_prefs *m);
 oc_result oc_encode_list_threads(oc_wbuf *w, uint16_t version, const oc_list_threads *m);
 oc_result oc_encode_thread_summary(oc_wbuf *w, uint16_t version, const oc_thread_summary *m);

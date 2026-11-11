@@ -347,6 +347,13 @@ void oc_client_set_priority(oc_client *c, const uint64_t *people, uint8_t n);
  * list (the model's `muted_users`); a frontend asks for the channel list again
  * when it does, so the daemon's unread counts follow. */
 void oc_client_set_user_mute(oc_client *c, uint64_t user_id, int on);
+/* Block (`on`) or unblock one person, for me alone; never told to them. The
+ * answer is the whole list (the model's `blocks`). */
+void oc_client_set_block(oc_client *c, uint64_t user_id, int on);
+/* Who may start a new direct conversation with me: anyone (0) or nobody (1). */
+void oc_client_set_dm_privacy(oc_client *c, int nobody);
+/* Owner/admin: every block in the workspace, into the model's `block_list`. */
+void oc_client_list_blocks(oc_client *c);
 /* REQ-278: pause notifications for `minutes` from now; 0 ends the pause. */
 void oc_client_set_snooze(oc_client *c, uint32_t minutes);
 /* Share my read receipts, or stop (REQ-090). Mine only: I still see the

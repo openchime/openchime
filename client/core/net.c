@@ -1789,6 +1789,29 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             oc_ev *e = oc_ev_new(OC_EV_MUTED_USERS);
             if (e) { e->ids = ids; e->n_ids = n; oc_queue_push(to_ui, e); }
             else free(ids);
+        } else if (hdr.msg_type == OC_MSG_BLOCKS) {
+            uint64_t *ids = calloc(OC_MAX_BLOCKS, sizeof *ids);
+            uint16_t n = 0; uint8_t priv = 0;
+            if (!ids) return -1;
+            if (oc_decode_blocks(&p, &priv, ids, &n) != OC_OK) { free(ids); return -1; }
+            oc_ev *e = oc_ev_new(OC_EV_BLOCKS);
+            if (e) { e->ids = ids; e->n_ids = n; e->status = priv; oc_queue_push(to_ui, e); }
+            else free(ids);
+        } else if (hdr.msg_type == OC_MSG_BLOCK_LIST) {
+            oc_block_entry *ents = calloc(OC_BLOCK_LIST_MAX, sizeof *ents);
+            uint16_t n = 0;
+            if (!ents) return -1;
+            if (oc_decode_block_list(&p, ents, &n) != OC_OK) { free(ents); return -1; }
+            uint64_t *flat = calloc((size_t)n * 3 + 1, sizeof *flat);
+            oc_ev *e = flat ? oc_ev_new(OC_EV_BLOCK_LIST) : NULL;
+            if (e) {
+                for (uint16_t i = 0; i < n; i++) {
+                    flat[3 * i] = ents[i].blocker_id; flat[3 * i + 1] = ents[i].blocked_id; flat[3 * i + 2] = ents[i].since_ms;
+                }
+                e->ids = flat; e->n_ids = (size_t)n * 3;
+                oc_queue_push(to_ui, e);
+            } else free(flat);
+            free(ents);
         } else if (hdr.msg_type == OC_MSG_ALERT_PREFS) {
             oc_slice terms[OC_MAX_KEYWORDS]; uint8_t nt = 0;
             uint64_t people[OC_MAX_PRIORITY]; uint8_t np = 0;
@@ -3859,6 +3882,22 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_user_mute sm = { c->mute_user_id, (uint8_t)(c->op ? 1 : 0) };
                 if (oc_encode_set_user_mute(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_BLOCK) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_block sb = { c->block_user_id, (uint8_t)(c->op ? 1 : 0) };
+                if (oc_encode_set_block(&w, OC_PROTOCOL_VERSION, &sb) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_DM_PRIVACY) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_set_dm_privacy(&w, OC_PROTOCOL_VERSION, c->op) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_BLOCKS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_blocks(&w, OC_PROTOCOL_VERSION) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SET_READ_RECEIPTS) {

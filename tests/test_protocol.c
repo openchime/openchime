@@ -2880,6 +2880,72 @@ static void test_tts_frames(void) {
     }
 }
 
+/* Blocks and DM privacy. */
+static void test_block_frames(void) {
+    {
+        oc_set_block in = { 77, 1 };
+        ROUNDTRIP(oc_encode_set_block(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_BLOCK, h, p);
+        oc_set_block out;
+        CHECK(oc_decode_set_block(&p, &out) == OC_OK);
+        CHECK(out.blocked_id == 77 && out.on == 1);
+    }
+    {
+        uint64_t ids[3] = { 5, 9, 12 };
+        oc_blocks in = { OC_DM_PRIVACY_NOBODY, 3, ids };
+        ROUNDTRIP(oc_encode_blocks(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BLOCKS, h, p);
+        uint64_t out[OC_MAX_BLOCKS]; uint8_t priv = 0; uint16_t n = 0;
+        CHECK(oc_decode_blocks(&p, &priv, out, &n) == OC_OK);
+        CHECK(priv == OC_DM_PRIVACY_NOBODY && n == 3 && out[0] == 5 && out[2] == 12);
+    }
+    {
+        oc_blocks in = { OC_DM_PRIVACY_ANYONE, 0, NULL };   /* nobody blocked */
+        ROUNDTRIP(oc_encode_blocks(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BLOCKS, h, p);
+        uint64_t out[OC_MAX_BLOCKS]; uint8_t priv = 9; uint16_t n = 9;
+        CHECK(oc_decode_blocks(&p, &priv, out, &n) == OC_OK);
+        CHECK(priv == OC_DM_PRIVACY_ANYONE && n == 0);
+    }
+    {
+        /* More than the limit is refused both ways. */
+        oc_blocks in = { 0, OC_MAX_BLOCKS + 1, NULL };
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        CHECK(oc_encode_blocks(&w, OC_PROTOCOL_VERSION, &in) == OC_E_OVERFLOW);
+        uint8_t bad[3] = { 0, 0, 0 };
+        oc_wbuf bw; oc_wbuf_init(&bw, bad, sizeof bad);
+        oc_w_u8(&bw, 0); oc_w_u16(&bw, OC_MAX_BLOCKS + 1);
+        oc_rbuf br; oc_rbuf_init(&br, bad, sizeof bad);
+        uint64_t out[OC_MAX_BLOCKS]; uint8_t priv = 0; uint16_t n = 0;
+        CHECK(oc_decode_blocks(&br, &priv, out, &n) == OC_E_MALFORMED);
+    }
+    {
+        ROUNDTRIP(oc_encode_list_blocks(&w, OC_PROTOCOL_VERSION), OC_MSG_LIST_BLOCKS, h, p);
+        CHECK(p.len == 0);
+    }
+    {
+        oc_block_entry ents[2] = { { 1, 2, 1700000000000ull }, { 3, 4, 5 } };
+        oc_block_list in = { 2, ents };
+        ROUNDTRIP(oc_encode_block_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BLOCK_LIST, h, p);
+        static oc_block_entry out[OC_BLOCK_LIST_MAX]; uint16_t n = 0;
+        CHECK(oc_decode_block_list(&p, out, &n) == OC_OK);
+        CHECK(n == 2 && out[0].blocker_id == 1 && out[0].blocked_id == 2 && out[0].since_ms == 1700000000000ull);
+        CHECK(out[1].blocker_id == 3 && out[1].since_ms == 5);
+    }
+    {
+        oc_block_list in = { OC_BLOCK_LIST_MAX + 1, NULL };
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        CHECK(oc_encode_block_list(&w, OC_PROTOCOL_VERSION, &in) == OC_E_OVERFLOW);
+    }
+    {
+        ROUNDTRIP(oc_encode_set_dm_privacy(&w, OC_PROTOCOL_VERSION, OC_DM_PRIVACY_NOBODY), OC_MSG_SET_DM_PRIVACY, h, p);
+        uint8_t v = 0;
+        CHECK(oc_decode_set_dm_privacy(&p, &v) == OC_OK && v == OC_DM_PRIVACY_NOBODY);
+    }
+    /* The refusal says nothing about why. */
+    {
+        const char *t = oc_error_text(OC_ERR_DM_REFUSED);
+        CHECK(t && strstr(t, "block") == NULL && strstr(t, "privacy") == NULL);
+    }
+}
+
 static void test_reason_codes_unique(void) {
     static const struct { const char *name; int code; } codes[] = {
         { "MALFORMED_FRAME",        OC_ERR_MALFORMED_FRAME },
@@ -2914,6 +2980,7 @@ static void test_reason_codes_unique(void) {
         { "TOO_MANY_PINS",          OC_ERR_TOO_MANY_PINS },
         { "CHANNEL_ARCHIVED",       OC_ERR_CHANNEL_ARCHIVED },
         { "INVALID_MESSAGE",        OC_ERR_INVALID_MESSAGE },
+        { "DM_REFUSED",             OC_ERR_DM_REFUSED },
         { "INTERNAL",               OC_ERR_INTERNAL },
     };
     const size_t n = sizeof codes / sizeof codes[0];
@@ -2991,6 +3058,7 @@ int run_protocol_tests(void) {
     test_profile_frames();
     test_tts_frames();
     test_call_frames();
+    test_block_frames();
     test_backfill_and_error();
     test_size_limits();
     test_malformed();

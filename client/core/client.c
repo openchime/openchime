@@ -959,6 +959,29 @@ void oc_client_set_user_mute(oc_client *c, uint64_t user_id, int on) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_set_block(oc_client *c, uint64_t user_id, int on) {
+    if (!c || !user_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_BLOCK);
+    if (!cmd) return;
+    cmd->block_user_id = user_id;
+    cmd->op = (uint8_t)(on ? 1 : 0);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_dm_privacy(oc_client *c, int nobody) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_DM_PRIVACY);
+    if (!cmd) return;
+    cmd->op = (uint8_t)(nobody ? OC_DM_PRIVACY_NOBODY : OC_DM_PRIVACY_ANYONE);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_blocks(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_BLOCKS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_set_priority(oc_client *c, const uint64_t *people, uint8_t n) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PRIORITY);

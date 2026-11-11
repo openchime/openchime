@@ -446,7 +446,11 @@ static int collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
              * to be stated twice, once in SQL and once in each client, and the
              * two had already drifted. */
             "WHERE cm.channel_id = ?1 AND cm.user_id <> ?2 AND u.disabled = 0 "
-            "  AND (?6 = 0 OR cm.user_id = ?6);",
+            "  AND (?6 = 0 OR cm.user_id = ?6) "
+            /* Addressing too: a message a block withheld from this member was
+             * never delivered to them, so there is nothing to tell their phone. */
+            "  AND NOT EXISTS(SELECT 1 FROM withheld_messages wm "
+            "                  WHERE wm.user_id = cm.user_id AND wm.message_id = ?3);",
             -1, &st, NULL) != SQLITE_OK) {
         return 0;
     }

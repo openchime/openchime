@@ -1820,6 +1820,13 @@ int oc_model_is_muted_user(const oc_model *m, uint64_t user_id) {
     return 0;
 }
 
+int oc_model_is_blocked(const oc_model *m, uint64_t user_id) {
+    if (!m || !user_id) return 0;
+    for (uint16_t i = 0; i < m->n_blocks; i++)
+        if (m->blocks[i] == user_id) return 1;
+    return 0;
+}
+
 const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
                                    uint64_t since_id, int quiet, int paused,
                                    int *mentioned, int *keyword_hit, int *vip) {
@@ -2274,6 +2281,23 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         for (size_t i = 0; i < n; i++) m->muted_users[i] = e->ids[i];
         m->n_muted_users = (uint16_t)n;
         m->muted_seq++;
+        break;
+    }
+    case OC_EV_BLOCKS: {
+        size_t n = e->n_ids < OC_MAX_BLOCKS ? e->n_ids : OC_MAX_BLOCKS;
+        for (size_t i = 0; i < n; i++) m->blocks[i] = e->ids[i];
+        m->n_blocks = (uint16_t)n;
+        m->dm_privacy = e->status == OC_DM_PRIVACY_NOBODY ? OC_DM_PRIVACY_NOBODY : OC_DM_PRIVACY_ANYONE;
+        m->blocks_seq++;
+        break;
+    }
+    case OC_EV_BLOCK_LIST: {
+        size_t n = e->n_ids / 3;
+        if (n > OC_BLOCK_LIST_MAX) n = OC_BLOCK_LIST_MAX;
+        for (size_t i = 0; i < n; i++)
+            m->block_list[i] = (oc_block_entry){ e->ids[3 * i], e->ids[3 * i + 1], e->ids[3 * i + 2] };
+        m->n_block_list = (uint16_t)n;
+        m->block_list_have = 1;
         break;
     }
     case OC_EV_READ_RECEIPTS:

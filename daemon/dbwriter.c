@@ -729,6 +729,8 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->dest_members);
     free(r->usage);
     free(r->mu_ids);
+    free(r->bl_ids);
+    free(r->blk_entries);
     free(r->alert_rows);
     free(r->body);
     free(r->pk_creds);
@@ -3632,6 +3634,9 @@ static int is_member(sqlite3 *db, uint64_t channel_id, uint64_t user_id) {
     return found;
 }
 
+static void withhold_from_blockers(sqlite3 *db, uint64_t channel_id, uint64_t author, uint64_t mid,
+                                   oc_dbres *r);   /* below, with the blocks */
+
 /* Collect the channel's member user ids into r->members. */
 static void load_members(sqlite3 *db, uint64_t channel_id, oc_dbres *r) {
     sqlite3_stmt *st = NULL;
@@ -4979,6 +4984,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
     r->broadcast_stored = broadcast_stored(db, mid);
     load_members(db, j->channel_id, r);
+    withhold_from_blockers(db, j->channel_id, j->user_id, mid, r);   /* in a DM, not to whoever blocks the author */
     return r;
 }
 
@@ -5714,6 +5720,8 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         /* Nor is a person the reader muted (`muted_author`), whoever else they are. */
         "       AND NOT EXISTS(SELECT 1 FROM muted_users mu "
         "                       WHERE mu.user_id=?1 AND mu.muted_id=x.author_id) "
+        /* Nor what a block withheld from them, which they never receive. */
+        "       AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?1 AND wm.message_id=x.id) "
         "       AND ( EXISTS(SELECT 1 FROM priority_people pp "
         "                     WHERE pp.user_id=?1 AND pp.person_id=x.author_id) "
         "          OR COALESCE((SELECT np.level FROM notification_prefs np "
@@ -5950,6 +5958,158 @@ static oc_dbres *process_remove_channel(sqlite3 *db, const oc_job *j) {
  * Replies CHANNEL_INFO (kind=DM), pushed to the peer (not for a self-DM).
  * Messaging/backfill/search then work through the normal membership path. */
 static oc_dbres *process_open_e2e_dm(sqlite3 *db, const oc_job *j);
+/* --- Blocks and DM privacy ---------------------------------------------------
+ * A block is its blocker's alone. The blocked person cannot start a direct
+ * conversation with the blocker, and what they still send into one the two share
+ * is kept for its other members but withheld from the blocker: a row in
+ * withheld_messages per message, so lifting the block brings none of it back.
+ * DM privacy 'nobody' refuses every new direct conversation naming that person.
+ * Both refusals are the same OC_ERR_DM_REFUSED, which says neither. Channels are
+ * untouched: there, muting a person is the tool. */
+static int is_blocked(sqlite3 *db, uint64_t blocker, uint64_t who) {
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM blocks WHERE user_id=?1 AND blocked_id=?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)blocker);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)who);
+        found = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+static int dm_closed(sqlite3 *db, uint64_t uid) {
+    sqlite3_stmt *st = NULL;
+    int closed = 0;
+    if (sqlite3_prepare_v2(db, "SELECT dm_privacy='nobody' FROM users WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+        closed = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return closed;
+}
+
+/* A message `author` just wrote in `channel_id`: when that is a direct
+ * conversation, every member who blocks the author is taken out of the fan-out
+ * in r->members, and the message is recorded as withheld from them. */
+static void withhold_from_blockers(sqlite3 *db, uint64_t channel_id, uint64_t author, uint64_t mid, oc_dbres *r) {
+    sqlite3_stmt *st = NULL;
+    int dm = 0;
+    if (sqlite3_prepare_v2(db, "SELECT kind='dm' FROM channels WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        dm = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (!dm || !r->members) return;
+    size_t keep = 0;
+    for (size_t i = 0; i < r->n_members; i++) {
+        uint64_t m = r->members[i];
+        if (m != author && is_blocked(db, m, author)) {
+            st = NULL;
+            if (sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO withheld_messages(user_id, message_id) VALUES(?1, ?2);",
+                                   -1, &st, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(st, 1, (sqlite3_int64)m);
+                sqlite3_bind_int64(st, 2, (sqlite3_int64)mid);
+                sqlite3_step(st);
+            }
+            sqlite3_finalize(st);
+            continue;
+        }
+        r->members[keep++] = m;
+    }
+    r->n_members = keep;
+}
+
+/* Whom `uid` blocks and their DM privacy, as BLOCKS carries them. */
+static void fill_blocks(sqlite3 *db, uint64_t uid, oc_dbres *r) {
+    sqlite3_stmt *st = NULL;
+    r->bl_ids = calloc(OC_MAX_BLOCKS, sizeof *r->bl_ids);
+    if (!r->bl_ids) return;
+    sqlite3_prepare_v2(db, "SELECT blocked_id FROM blocks WHERE user_id=?1 ORDER BY blocked_id;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    while (r->bl_n < OC_MAX_BLOCKS && sqlite3_step(st) == SQLITE_ROW)
+        r->bl_ids[r->bl_n++] = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    r->bl_privacy = dm_closed(db, uid) ? OC_DM_PRIVACY_NOBODY : OC_DM_PRIVACY_ANYONE;
+    r->bl_have = 1;
+}
+
+/* Block or unblock one person (SET_BLOCK), audited in the moderation family.
+ * Yourself, nobody, the workspace's own sender or no one at all is ignored. */
+static oc_dbres *process_set_block(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_BLOCKS;
+    r->user_id = j->user_id;
+    uint64_t who = j->target_user_id;
+    if (who && who != j->user_id) {
+        sqlite3_stmt *st = NULL;
+        if (j->block_on)
+            sqlite3_prepare_v2(db,
+                "INSERT OR IGNORE INTO blocks(user_id, blocked_id, created_at_ms) "
+                "SELECT ?1, ?2, ?3 WHERE EXISTS(SELECT 1 FROM users WHERE id=?2 AND is_system=0);", -1, &st, NULL);
+        else
+            sqlite3_prepare_v2(db, "DELETE FROM blocks WHERE user_id=?1 AND blocked_id=?2;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)who);
+        if (j->block_on) sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        int changed = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+        sqlite3_finalize(st);
+        if (changed)
+            audit_actor(db, OC_AUDIT_MODERATION, j->block_on ? "block.place" : "block.lift",
+                        j->user_id, who, NULL, 1, NULL);
+    }
+    fill_blocks(db, j->user_id, r);
+    return r;
+}
+
+static oc_dbres *process_set_dm_privacy(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_BLOCKS;
+    r->user_id = j->user_id;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE users SET dm_privacy=?2 WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_text(st, 2, j->dm_privacy == OC_DM_PRIVACY_NOBODY ? "nobody" : "anyone", -1, SQLITE_STATIC);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    fill_blocks(db, j->user_id, r);
+    return r;
+}
+
+/* Every block in the workspace, for an owner or admin (LIST_BLOCKS), newest
+ * first. Authorized on the CURRENT role. */
+static oc_dbres *process_list_blocks(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_BLOCK_LIST;
+    uint8_t role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &role) || !oc_role_can_manage_members(role)) {
+        r->type = OC_RES_BLOCK_LIST_ERR;
+        r->err_code = OC_ERR_FORBIDDEN;
+        return r;
+    }
+    r->blk_entries = calloc(OC_BLOCK_LIST_MAX, sizeof *r->blk_entries);
+    if (!r->blk_entries) { r->type = OC_RES_BLOCK_LIST_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT user_id, blocked_id, created_at_ms FROM blocks ORDER BY created_at_ms DESC LIMIT ?1;",
+                       -1, &st, NULL);
+    sqlite3_bind_int(st, 1, (int)OC_BLOCK_LIST_MAX);
+    while (r->n_blk < OC_BLOCK_LIST_MAX && sqlite3_step(st) == SQLITE_ROW) {
+        oc_block_entry *e = &r->blk_entries[r->n_blk++];
+        e->blocker_id = (uint64_t)sqlite3_column_int64(st, 0);
+        e->blocked_id = (uint64_t)sqlite3_column_int64(st, 1);
+        e->since_ms   = (uint64_t)sqlite3_column_int64(st, 2);
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
 static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
     if (j->e2e) return process_open_e2e_dm(db, j);
     oc_dbres *r = calloc(1, sizeof *r);
@@ -5968,6 +6128,11 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
      * unknown target is, so nothing says a visitor is there. */
     if (user_is_visitor(db, self) || user_is_visitor(db, other)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    /* Blocked by them: no conversation, new or old, is opened, and the answer
+     * says no more than a closed door does. */
+    if (!self_dm && is_blocked(db, other, self)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_DM_REFUSED; return r;
     }
 
     /* A DM's IDENTITY is its participant set, stored as `dm_key` under a unique
@@ -5998,6 +6163,11 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
      * them is refused, as an unknown user is. */
     if (cid == 0 && !self_dm && user_disabled(db, other)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    /* Taking no new direct conversations: refused, the same way; one that
+     * already exists stands. */
+    if (cid == 0 && !self_dm && dm_closed(db, other)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_DM_REFUSED; return r;
     }
 
     if (cid == 0) {
@@ -6044,6 +6214,9 @@ static oc_dbres *process_open_e2e_dm(sqlite3 *db, const oc_job *j) {
     uint8_t trole = OC_ROLE_MEMBER;
     if (!other || other == self || !user_role(db, other, &trole) || user_disabled(db, other) ||
         user_is_visitor(db, self) || user_is_visitor(db, other)) return r;
+    /* Always a new conversation: refused, as plainly as any other, to someone
+     * the peer blocks or when the peer takes no new ones. */
+    if (is_blocked(db, other, self) || dm_closed(db, other)) return r;
     char key[96];
     snprintf(key, sizeof key, "e:%llu,%llu:%llu.%llu",
              (unsigned long long)(self < other ? self : other), (unsigned long long)(self < other ? other : self),
@@ -6341,6 +6514,10 @@ static oc_dbres *process_open_group_dm(sqlite3 *db, const oc_job *j) {
         if (!user_role(db, u, &role) || user_disabled(db, u) || user_is_visitor(db, u)) {
             r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
         }
+        /* Anyone named who blocks the caller: refused, as a 1:1 is. */
+        if (is_blocked(db, u, j->user_id)) {
+            r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_DM_REFUSED; return r;
+        }
         ids[n++] = u;
     }
     /* Three is the floor: two participants is a 1:1 DM and must reuse that path, or
@@ -6363,6 +6540,12 @@ static oc_dbres *process_open_group_dm(sqlite3 *db, const oc_job *j) {
     if (sqlite3_step(st) == SQLITE_ROW) cid = (uint64_t)sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
 
+    /* A new one naming anyone who takes no new direct conversations is refused. */
+    if (cid == 0)
+        for (int i = 0; i < n; i++)
+            if (ids[i] != j->user_id && dm_closed(db, ids[i])) {
+                r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_DM_REFUSED; return r;
+            }
     if (cid == 0) {
         sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
         sqlite3_prepare_v2(db,
@@ -7024,6 +7207,7 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
             "   AND COALESCE(np.muted, 0) = 0 "
             /* Nor from a person I muted: their messages are unread for nobody here. */
             "   AND NOT EXISTS(SELECT 1 FROM muted_users mu WHERE mu.user_id = ?1 AND mu.muted_id = m.author_id) "
+            "   AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id = ?1 AND wm.message_id = m.id) "
             "   AND ( ?4 = 1 "
             "         OR (?4 = 2 AND c.kind = 'dm') "
             "         OR (?4 = 3 AND c.kind <> 'dm' "
@@ -7111,7 +7295,10 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
         "                 WHERE cm.channel_id = m.channel_id AND cm.user_id = ?1) "
         /* A person I muted mentions, reacts and replies to nobody's feed of mine;
          * my own reminders stay, whoever wrote the message they are on. */
-        ") WHERE kind = 5 OR actor_id NOT IN (SELECT mu.muted_id FROM muted_users mu WHERE mu.user_id = ?1) "
+        /* What a block withheld from me -- a mention, a reply -- is not mine to see. */
+        ") act_all WHERE (kind = 5 OR actor_id NOT IN (SELECT mu.muted_id FROM muted_users mu WHERE mu.user_id = ?1)) "
+        "  AND NOT EXISTS(SELECT 1 FROM withheld_messages wm "
+        "                  WHERE wm.user_id = ?1 AND wm.message_id = act_all.message_id) "
         "  ORDER BY at DESC LIMIT ?3;";
 
     sqlite3_prepare_v2(db, SQL, -1, &st, NULL);
@@ -7744,6 +7931,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
     r->broadcast_stored = broadcast_stored(db, mid);
     load_members(db, j->channel_id, r);
+    withhold_from_blockers(db, j->channel_id, j->user_id, mid, r);   /* in a DM, not to whoever blocks the author */
     /* Asked AFTER the reply is committed, so the author of the reply being
      * fanned out counts as a participant on the strength of it. */
     load_thread_participation(db, root, r);
@@ -8372,6 +8560,8 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
              * backfill returned nothing. 36 tests caught it; reading would not
              * have. */
             "WHERE m.channel_id=?1 AND m.id>?2 AND (m.parent_id IS NULL OR m.also_channel=1) "
+            /* Not what was withheld from this reader by a block, ever. */
+            "  AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?4 AND wm.message_id=m.id) "
             "ORDER BY m.id LIMIT ?3;", -1, &st, NULL);
         sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)ch);
@@ -8545,22 +8735,25 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     "    FROM messages m LEFT JOIN users u ON u.id = m.author_id" \
     "                    LEFT JOIN pins p ON p.message_id = m.id" \
     "                    LEFT JOIN saved_items s ON s.message_id = m.id AND s.user_id = ?4"
+    /* What a block withheld from this reader stays out of every page of it. */
+#define OC_HIST_NOT_WITHHELD \
+    " AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id = ?4 AND wm.message_id = m.id)"
 
     const char *sql = j->hist_around
         ? "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name,"
           "       pinned_by, pinned_at, saved_at, kind, collapsed, parent_id FROM ("
           "  SELECT * FROM (" OC_HIST_COLS
-          "   WHERE m.channel_id=?1 AND (m.parent_id IS NULL OR m.also_channel=1) AND m.id<=?2"
+          "   WHERE m.channel_id=?1 AND (m.parent_id IS NULL OR m.also_channel=1) AND m.id<=?2" OC_HIST_NOT_WITHHELD
           "   ORDER BY m.id DESC LIMIT ?3)"
           "  UNION ALL"
           "  SELECT * FROM (" OC_HIST_COLS
-          "   WHERE m.channel_id=?1 AND (m.parent_id IS NULL OR m.also_channel=1) AND m.id>?2"
+          "   WHERE m.channel_id=?1 AND (m.parent_id IS NULL OR m.also_channel=1) AND m.id>?2" OC_HIST_NOT_WITHHELD
           "   ORDER BY m.id ASC LIMIT ?3)"
           ") ORDER BY id;"
         : "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name,"
           "       pinned_by, pinned_at, saved_at, kind, collapsed, parent_id FROM ("
           OC_HIST_COLS
-          "   WHERE m.channel_id=?1 AND m.id<?2 AND (m.parent_id IS NULL OR m.also_channel=1)"
+          "   WHERE m.channel_id=?1 AND m.id<?2 AND (m.parent_id IS NULL OR m.also_channel=1)" OC_HIST_NOT_WITHHELD
           "   ORDER BY m.id DESC LIMIT ?3"
           ") ORDER BY id;";
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK)
@@ -10126,6 +10319,7 @@ static void fill_alert_prefs(sqlite3 *db, uint64_t uid, oc_dbres *r) {
         r->al_people[r->al_n_people++] = (uint64_t)sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
     fill_muted_users(db, uid, r);
+    fill_blocks(db, uid, r);   /* whom I block, and who may start a DM with me */
 }
 
 static void build_alert_prefs(sqlite3 *db, uint64_t uid, oc_dbres *r) {
@@ -11371,7 +11565,7 @@ static int is_read_job(int type) {
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
            type == OC_JOB_CALL_AUTH ||
            type == OC_JOB_STORAGE_STATUS || type == OC_JOB_ALERTS_LIST ||
-           type == OC_JOB_AUDIT_QUERY || type == OC_JOB_USAGE ||
+           type == OC_JOB_AUDIT_QUERY || type == OC_JOB_USAGE || type == OC_JOB_LIST_BLOCKS ||
            type == OC_JOB_TTS_LOOKUP || type == OC_JOB_TTS_PREVIEW ||
            type == OC_JOB_STT_PREP || type == OC_JOB_LIST_GROUPS ||
            type == OC_JOB_SUMMARY_LOOKUP || type == OC_JOB_LIST_POLL_VOTERS;
@@ -11401,6 +11595,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_ALERTS_LIST)    return process_alerts_list(rdb, j);
     if (j->type == OC_JOB_AUDIT_QUERY)    return process_audit_query(rdb, j);
     if (j->type == OC_JOB_USAGE)          return process_usage(rdb, j);
+    if (j->type == OC_JOB_LIST_BLOCKS)    return process_list_blocks(rdb, j);
     if (j->type == OC_JOB_TTS_LOOKUP)     return process_tts_lookup(rdb, j);
     if (j->type == OC_JOB_TTS_PREVIEW)    return process_tts_preview(rdb, j);
     if (j->type == OC_JOB_STT_PREP)       return process_stt_prep(rdb, j);
@@ -11984,6 +12179,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_KEYWORDS)    return process_set_keywords(w->db, j);
     if (j->type == OC_JOB_SET_PRIORITY)    return process_set_priority(w->db, j);
     if (j->type == OC_JOB_SET_USER_MUTE)   return process_set_user_mute(w->db, j);
+    if (j->type == OC_JOB_SET_BLOCK)       return process_set_block(w->db, j);
+    if (j->type == OC_JOB_SET_DM_PRIVACY)  return process_set_dm_privacy(w->db, j);
     if (j->type == OC_JOB_SET_SNOOZE)      return process_set_snooze(w->db, j);
     if (j->type == OC_JOB_SET_TZ_OFFSET)   return process_set_tz_offset(w->db, j);
     if (j->type == OC_JOB_READ_RECEIPTS)   return process_read_receipts(w->db, j);

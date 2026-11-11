@@ -1,7 +1,7 @@
 # OpenChime — Database Schema
 
 The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
-ARCH-27 (§1); the daemon applies migrations 0001–0078 (`daemon/migrate.c`,
+ARCH-27 (§1); the daemon applies migrations 0001–0079 (`daemon/migrate.c`,
 `OC_MIGRATIONS`), in order, and new tables/columns arrive as later numbered
 migrations, never as edits to an existing one. 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
@@ -36,7 +36,7 @@ credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
 **0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
-(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets.
+(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets; **0079** (§3br) blocks and DM privacy.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -2034,3 +2034,40 @@ snippet. It is a table of its own rather than more of `messages_fts`, whose
 rows are the messages' bodies and kept by triggers on `messages`. A row is
 deleted when its message is deleted and when the storage sweep reclaims its
 bytes.
+
+## 3br. Migration 0079 — blocks and DM privacy
+
+```sql
+CREATE TABLE blocks (
+  user_id       INTEGER NOT NULL REFERENCES users(id),
+  blocked_id    INTEGER NOT NULL REFERENCES users(id),
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (user_id, blocked_id)) WITHOUT ROWID;
+CREATE TABLE withheld_messages (
+  user_id    INTEGER NOT NULL REFERENCES users(id),
+  message_id INTEGER NOT NULL REFERENCES messages(id),
+  PRIMARY KEY (user_id, message_id)) WITHOUT ROWID;
+ALTER TABLE users ADD COLUMN dm_privacy TEXT NOT NULL DEFAULT 'anyone'
+  CHECK (dm_privacy IN ('anyone','nobody'));
+```
+
+*A block is its blocker's alone* (`SET_BLOCK`, PROTOCOL.md §5.20), and nothing
+tells the person blocked. While `blocks` holds (`user_id`, `blocked_id`), the
+blocked person can open no direct conversation, one-to-one or group, that names
+the blocker: `OPEN_DM` and `OPEN_GROUP_DM` answer `DM_REFUSED`. A conversation
+the two already share stays, and what the blocked person writes into it is
+stored and reaches its other members, but not the blocker: the send writes a
+`withheld_messages` row for the blocker, and the fan-out, push, backfill,
+history, unread counts and activity all leave those messages out for that
+reader. The rows outlive the block, so lifting it brings back nothing that was
+withheld. Channels are untouched: there, muting a person is the tool. The
+workspace's own sender cannot be blocked.
+
+*`dm_privacy`* says who may start a new direct conversation with a person:
+`anyone`, or `nobody`, which refuses every new one naming them with the same
+`DM_REFUSED`. One that already exists carries on.
+
+*Written* by `SET_BLOCK` (audited `block.place` and `block.lift`, moderation
+family), `SET_DM_PRIVACY` and the send; *read* by the DM openers and every
+reader above, and by `LIST_BLOCKS` for an owner or admin. A channel purge
+clears `withheld_messages` with every table holding a `message_id`.

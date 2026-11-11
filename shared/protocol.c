@@ -1575,6 +1575,7 @@ const char *oc_error_text(uint16_t code) {
     case OC_ERR_EDIT_WINDOW_CLOSED: return "this workspace no longer lets you change or delete that message";
     case OC_ERR_WORKSPACE_SENDER: return "messages from the workspace take no replies";
     case OC_ERR_CANNOT_MOVE:      return "that message can't be moved there";
+    case OC_ERR_DM_REFUSED:       return "you can't start a conversation with this person";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
@@ -1976,6 +1977,77 @@ oc_result oc_decode_muted_users(oc_rbuf *r, uint64_t *ids, uint16_t *out_n) {
     if (n > OC_MAX_MUTED_USERS) return OC_E_MALFORMED;
     for (uint16_t i = 0; i < n; i++) ids[i] = oc_r_u64(r);
     *out_n = n;
+    return r_done(r);
+}
+
+oc_result oc_encode_set_block(oc_wbuf *w, uint16_t version, const oc_set_block *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_BLOCK);
+    oc_w_u64(w, m->blocked_id);
+    oc_w_u8(w, m->on ? 1 : 0);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_block(oc_rbuf *r, oc_set_block *m) {
+    m->blocked_id = oc_r_u64(r);
+    m->on = oc_r_u8(r);
+    return r_done(r);
+}
+
+oc_result oc_encode_blocks(oc_wbuf *w, uint16_t version, const oc_blocks *m) {
+    if (m->count > OC_MAX_BLOCKS) return OC_E_OVERFLOW;
+    size_t off = oc_frame_begin(w, version, OC_MSG_BLOCKS);
+    oc_w_u8(w, m->dm_privacy);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) oc_w_u64(w, m->ids[i]);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_blocks(oc_rbuf *r, uint8_t *dm_privacy, uint64_t *ids, uint16_t *out_n) {
+    *dm_privacy = oc_r_u8(r);
+    uint16_t n = oc_r_u16(r);
+    if (n > OC_MAX_BLOCKS) return OC_E_MALFORMED;
+    for (uint16_t i = 0; i < n; i++) ids[i] = oc_r_u64(r);
+    *out_n = n;
+    return r_done(r);
+}
+
+oc_result oc_encode_list_blocks(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_BLOCKS);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_block_list(oc_wbuf *w, uint16_t version, const oc_block_list *m) {
+    if (m->count > OC_BLOCK_LIST_MAX) return OC_E_OVERFLOW;
+    size_t off = oc_frame_begin(w, version, OC_MSG_BLOCK_LIST);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        oc_w_u64(w, m->entries[i].blocker_id);
+        oc_w_u64(w, m->entries[i].blocked_id);
+        oc_w_u64(w, m->entries[i].since_ms);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_block_list(oc_rbuf *r, oc_block_entry *out, uint16_t *out_n) {
+    uint16_t n = oc_r_u16(r);
+    if (n > OC_BLOCK_LIST_MAX) return OC_E_MALFORMED;
+    for (uint16_t i = 0; i < n; i++) {
+        out[i].blocker_id = oc_r_u64(r);
+        out[i].blocked_id = oc_r_u64(r);
+        out[i].since_ms   = oc_r_u64(r);
+    }
+    *out_n = n;
+    return r_done(r);
+}
+
+oc_result oc_encode_set_dm_privacy(oc_wbuf *w, uint16_t version, uint8_t value) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_DM_PRIVACY);
+    oc_w_u8(w, value);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_dm_privacy(oc_rbuf *r, uint8_t *value) {
+    *value = oc_r_u8(r);
     return r_done(r);
 }
 

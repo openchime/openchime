@@ -683,6 +683,16 @@ typedef struct {
     uint64_t  muted_users[OC_MAX_MUTED_USERS];
     uint16_t  n_muted_users;
     uint32_t  muted_seq;          /* moves with every change */
+    /* Whom I block and who may start a DM with me (BLOCKS), as the daemon last
+     * said; `blocks_seq` moves with every change. `block_list` is the
+     * workspace's blocks, an admin's, once asked (BLOCK_LIST). */
+    uint64_t  blocks[OC_MAX_BLOCKS];
+    uint16_t  n_blocks;
+    uint8_t   dm_privacy;
+    uint32_t  blocks_seq;
+    oc_block_entry block_list[OC_BLOCK_LIST_MAX];
+    uint16_t  n_block_list;
+    uint8_t   block_list_have;
     /* REQ-278: when the manual PAUSE ends, 0 for none. Distinct from the window
      * above in type as well as in name — one instant against a daily range. */
     uint64_t  snooze_until_ms;
@@ -1276,6 +1286,8 @@ int oc_model_keyword_hit(const oc_model *m, const char *body, size_t len,
 int oc_model_is_priority(const oc_model *m, uint64_t user_id);
 /* Have I muted `user_id`? */
 int oc_model_is_muted_user(const oc_model *m, uint64_t user_id);
+/* Do I block `user_id`? */
+int oc_model_is_blocked(const oc_model *m, uint64_t user_id);
 
 /* Which of a channel's NEW messages should interrupt me, if any?
  *

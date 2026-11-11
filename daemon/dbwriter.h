@@ -321,6 +321,12 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* SET_USER_MUTE: mute (mute_on 1) or unmute target_user_id for user_id
         * alone. Answered OC_RES_MUTED_USERS to every connection of user_id. */
        OC_JOB_SET_USER_MUTE = 154,
+       /* Blocks and DM privacy. SET_BLOCK blocks (block_on 1) or unblocks
+        * target_user_id for user_id; SET_DM_PRIVACY sets user_id's dm_privacy
+        * (OC_DM_PRIVACY_*). Both answered OC_RES_BLOCKS to every connection of
+        * user_id. LIST_BLOCKS (owner/admin, read-only) answered
+        * OC_RES_BLOCK_LIST, or OC_RES_BLOCK_LIST_ERR. */
+       OC_JOB_SET_BLOCK = 155, OC_JOB_LIST_BLOCKS = 156, OC_JOB_SET_DM_PRIVACY = 157,
        /* Reminders come due (REQ-283), on the scheduled-message tick: each
         * fires once, answered as one OC_RES_REMINDER_DUE apiece. Write. */
        OC_JOB_FIRE_REMINDERS = 160 };
@@ -519,6 +525,10 @@ typedef struct oc_job {
 
     /* SET_USER_MUTE: 1 mutes target_user_id, 0 unmutes. */
     uint8_t        mute_on;
+
+    /* SET_BLOCK: 1 blocks target_user_id, 0 unblocks. SET_DM_PRIVACY: the value. */
+    uint8_t        block_on;
+    uint8_t        dm_privacy;
 
     /* SEARCH: query text is carried in body/body_len; this bounds the result.
      * `search_sort` is OC_SEARCH_*, and `search_cursor_rank` the relevance
@@ -839,6 +849,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_USAGE = 128, OC_RES_USAGE_ERR = 129,
        /* Everyone user_id has muted (mu_ids), to every connection of theirs. */
        OC_RES_MUTED_USERS = 130,
+       /* Whom user_id blocks (bl_ids) and their dm_privacy (bl_privacy), to every
+        * connection of theirs; the workspace's blocks (blk_entries) to an admin,
+        * or why not (err_code). */
+       OC_RES_BLOCKS = 131, OC_RES_BLOCK_LIST = 132, OC_RES_BLOCK_LIST_ERR = 133,
        /* A reminder fired: user_id's, on message_id in channel_id, at
         * server_time; saved_at and remind_at the item's. To that person's
         * connections and their devices' push. A chain, one per reminder; an
@@ -1413,6 +1427,14 @@ typedef struct oc_dbres {
     uint64_t           *mu_ids;        /* heap */
     uint16_t            mu_n;
     uint8_t             mu_have;
+    /* OC_RES_BLOCKS, and with the alert preferences: whom user_id blocks and who
+     * may start a DM with them. `bl_have` once read, so an empty list is sent. */
+    uint64_t           *bl_ids;        /* heap */
+    uint16_t            bl_n;
+    uint8_t             bl_privacy, bl_have;
+    /* OC_RES_BLOCK_LIST: every block in the workspace, for an admin. */
+    oc_block_entry     *blk_entries;   /* heap */
+    uint16_t            n_blk;
     /* OC_RES_SNOOZE, and carried on AUTH_OK so the net thread can seed its
      * in-memory copy without a second round trip. Already expiry-checked. */
     uint64_t            snooze_until_ms;

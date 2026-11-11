@@ -6570,6 +6570,74 @@ static void test_dm_vertical(int port, const uint8_t *pin) {
     client_close(&c);
 }
 
+/* A block over the wire: carol blocks bob, who shares a DM with her. His
+ * OPEN_DM is refused with DM_REFUSED, and what he still writes into the DM is
+ * acknowledged to him but never reaches her connection. */
+static void test_block_vertical(int port, const uint8_t *pin) {
+    client b, c;
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(client_open(&c, port, pin) == 0);
+    CHECK(do_handshake(&b) == 0);
+    CHECK(do_handshake(&c) == 0);
+    uint64_t ub = 0, uc = 0;
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
+
+    uint8_t buf[256]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+
+    /* carol opens a DM with bob; bob is pushed it. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_open_dm od = { ub };
+    CHECK(oc_encode_open_dm(&w, OC_PROTOCOL_VERSION, &od) == OC_OK);
+    CHECK(send_frame(&c, buf, w.len) == 0);
+    CHECK(read_frame(&c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+    uint64_t dm = ci.channel_id;
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+
+    /* carol blocks bob: BLOCKS comes back to her, naming him. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_block sb = { ub, 1 };
+    CHECK(oc_encode_set_block(&w, OC_PROTOCOL_VERSION, &sb) == OC_OK);
+    CHECK(send_frame(&c, buf, w.len) == 0);
+    CHECK(read_frame(&c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BLOCKS);
+    uint64_t ids[OC_MAX_BLOCKS]; uint8_t priv = 9; uint16_t n = 0;
+    CHECK(oc_decode_blocks(&p, &priv, ids, &n) == OC_OK);
+    CHECK(n == 1 && ids[0] == ub && priv == OC_DM_PRIVACY_ANYONE);
+
+    /* bob cannot open the DM again. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_open_dm back = { uc };
+    CHECK(oc_encode_open_dm(&w, OC_PROTOCOL_VERSION, &back) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+    oc_error e; CHECK(oc_decode_error(&p, &e) == OC_OK);
+    CHECK(e.code == OC_ERR_DM_REFUSED && e.fatal == 0);
+
+    /* bob writes into the DM: his ACK and own BROADCAST arrive... */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0}; s.channel_id = dm; memset(s.idem, 0x7B, OC_IDEM_SIZE);
+    s.body = oc_slice_str("are you there");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    int got_ack = 0;
+    for (int i = 0; i < 2; i++) {
+        CHECK(read_frame(&b, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) got_ack = 1;
+    }
+    CHECK(got_ack);
+    /* ...and carol's next frame is the answer to her unblock, not his message. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_block un = { ub, 0 };
+    CHECK(oc_encode_set_block(&w, OC_PROTOCOL_VERSION, &un) == OC_OK);
+    CHECK(send_frame(&c, buf, w.len) == 0);
+    CHECK(read_frame(&c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BLOCKS);
+    CHECK(oc_decode_blocks(&p, &priv, ids, &n) == OC_OK && n == 0);
+
+    client_close(&b);
+    client_close(&c);
+}
+
 /* Tenant admin ops over the wire (REQ-033): an owner mints an invite, a fresh
  * client redeems it to create + authenticate an account, the owner promotes that
  * user (SET_ROLE pushes USER_UPDATED to them), lists users, and removes a member
@@ -8495,6 +8563,7 @@ int run_netloop_tests(void) {
         test_action_vertical(arg.port, pin);
         test_poll_vertical(arg.port, pin);
         test_dm_vertical(arg.port, pin);
+        test_block_vertical(arg.port, pin);
         test_drafts_vertical(arg.port, pin);
         test_presence_typing(arg.port, pin);
         test_fanout_limits(arg.port, pin);

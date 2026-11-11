@@ -158,6 +158,8 @@ enum {
     OC_EV_SCHEDULE,        /* a SCHEDULE frame: the recurring allowed-hours schedule (REQ-136) */
     OC_EV_ALERT_PREFS,     /* an ALERT_PREFS frame: my keywords + priority people (REQ-135) */
     OC_EV_MUTED_USERS,     /* a MUTED_USERS frame: everyone I have muted, in `ids`/`n_ids` */
+    OC_EV_BLOCKS,          /* a BLOCKS frame: whom I block (`ids`/`n_ids`), my DM privacy in `status` */
+    OC_EV_BLOCK_LIST,      /* a BLOCK_LIST: per block, blocker, blocked and since, three to an entry in `ids` */
     OC_EV_THREAD_SUMMARY,  /* one aggregated thread (REQ-062): a list entry AND the push */
     OC_EV_THREADS_END,     /* the thread list's terminator */
     OC_EV_NOTIFY_PREF,     /* a NOTIFY_PREFS entry: channel_id + level(op) */
@@ -535,6 +537,9 @@ enum {
     OC_CMD_SET_KEYWORDS,    /* replace my keyword list (REQ-135), carried in cmd->list */
     OC_CMD_SET_PRIORITY,    /* replace my priority-people list (REQ-135) */
     OC_CMD_SET_USER_MUTE,   /* mute or unmute one person, for me (mute_user_id, op) */
+    OC_CMD_SET_BLOCK,       /* block or unblock one person (block_user_id, op) */
+    OC_CMD_SET_DM_PRIVACY,  /* who may start a new DM with me (op) */
+    OC_CMD_LIST_BLOCKS,     /* owner/admin: every block in the workspace */
     OC_CMD_LIST_THREADS,    /* threads I am in (REQ-062): op = filter */
     OC_CMD_THREAD_FOLLOW,   /* follow/unfollow: channel_id + message_id = root, op = on */
     OC_CMD_CHANNEL_THREAD_FOLLOW,   /* every thread in channel_id: op = on (REQ-282) */
@@ -740,6 +745,9 @@ typedef struct {
     uint16_t usage_days;
     /* SET_USER_MUTE: the person; `op` 1 mutes, 0 unmutes. */
     uint64_t mute_user_id;
+    /* SET_BLOCK: the person, `op` 1 blocks and 0 unblocks; SET_DM_PRIVACY: `op`
+     * is the value (OC_DM_PRIVACY_*). */
+    uint64_t block_user_id;
 } oc_cmd;
 
 oc_cmd *oc_cmd_new(int type);

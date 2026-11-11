@@ -2449,7 +2449,10 @@ static void test_index_mentions(void) {
                            /* 0078's snippets. */
                            "DROP TABLE snippets_fts;"
                            "ALTER TABLE attachment_media DROP COLUMN title;"
-                           "ALTER TABLE attachment_media DROP COLUMN language;",
+                           "ALTER TABLE attachment_media DROP COLUMN language;"
+                           /* 0079's blocks and DM privacy. */
+                           "DROP TABLE blocks; DROP TABLE withheld_messages;"
+                           "ALTER TABLE users DROP COLUMN dm_privacy;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -6665,6 +6668,181 @@ static void test_remove_keeps_history(void) {
     oc_dbres_free(r);
     r = chan_member(w, OC_JOB_INVITE_CHANNEL, owner, OC_DEFAULT_CHANNEL, bob);
     CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* Blocks and DM privacy. A block is the blocker's alone: the blocked
+ * person can start no direct conversation with them, and what they still write
+ * into one the two already share reaches its other members but never the
+ * blocker -- live, on backfill, or in history -- even after the block is lifted.
+ * Privacy 'nobody' refuses every new direct conversation; an existing one stays. */
+static oc_dbres *set_block(oc_dbwriter *w, uint64_t uid, uint64_t who, int on) {
+    oc_job *j = oc_job_new(OC_JOB_SET_BLOCK, 70);
+    j->user_id = uid; j->target_user_id = who; j->block_on = (uint8_t)on;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *set_dm_privacy(oc_dbwriter *w, uint64_t uid, uint8_t privacy) {
+    oc_job *j = oc_job_new(OC_JOB_SET_DM_PRIVACY, 71);
+    j->user_id = uid; j->dm_privacy = privacy;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *open_group(oc_dbwriter *w, uint64_t actor, uint64_t a, uint64_t b) {
+    oc_job *j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 72);
+    j->user_id = actor;
+    j->group_uids[0] = a; j->group_uids[1] = b; j->n_group_uids = 2;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* Send, and report whether `who` is in the live fan-out. */
+static uint64_t send_fanout(oc_dbwriter *w, uint64_t uid, uint64_t ch, const char *body,
+                            uint64_t who, int *reached) {
+    oc_job *j = oc_job_new(OC_JOB_SEND, 73);
+    j->user_id = uid; j->channel_id = ch;
+    memset(j->idem, ++g_send_seq, OC_IDEM_LEN);
+    oc_job_set_body(j, body, strlen(body));
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint64_t id = (r && r->type == OC_RES_SEND_OK) ? r->message_id : 0;
+    *reached = 0;
+    for (size_t i = 0; r && i < r->n_members; i++) if (r->members[i] == who) *reached = 1;
+    oc_dbres_free(r);
+    return id;
+}
+
+static int replay_has(const oc_dbres *r, uint64_t mid) {
+    for (size_t i = 0; r && i < r->n_replay; i++) if (r->replay[i].message_id == mid) return 1;
+    return 0;
+}
+
+static void test_blocks(void) {
+    const char *path = tdb("blocks.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t owner = reg(w, "bk-owner", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "bk-bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "bk-carol", "pw", OC_ROLE_MEMBER);
+    uint64_t dave  = reg(w, "bk-dave",  "pw", OC_ROLE_MEMBER);
+    CHECK(owner && bob && carol && dave);
+
+    /* carol and bob share a DM, and a group DM with dave, before any block. */
+    oc_dbres *r = open_dm(w, carol, bob);
+    uint64_t dm = (r && r->type == OC_RES_CHANNEL_INFO) ? r->channel_id : 0;
+    oc_dbres_free(r);
+    r = open_group(w, carol, bob, dave);
+    uint64_t gdm = (r && r->type == OC_RES_CHANNEL_INFO) ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(dm && gdm);
+    int reached = 0;
+    uint64_t before = send_fanout(w, carol, dm, "before", bob, &reached);
+    CHECK(before && reached);
+
+    /* bob blocks carol: the answer lists her, and it is audited once. */
+    r = set_block(w, bob, carol, 1);
+    CHECK(r && r->type == OC_RES_BLOCKS && r->bl_have && r->bl_n == 1 && r->bl_ids[0] == carol);
+    CHECK(r && r->bl_privacy == OC_DM_PRIVACY_ANYONE);
+    oc_dbres_free(r);
+    r = set_block(w, bob, carol, 1);   /* again: no second row, no second audit */
+    CHECK(r && r->bl_n == 1);
+    oc_dbres_free(r);
+    CHECK(audit_count(w, owner, "block.place") == 1);
+    /* Nobody blocks themselves, or the workspace's own sender. */
+    r = set_block(w, bob, bob, 1);
+    CHECK(r && r->type == OC_RES_BLOCKS && r->bl_n == 1);
+    oc_dbres_free(r);
+
+    /* carol can open no conversation with bob, old or new, 1:1 or group. */
+    r = open_dm(w, carol, bob);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_DM_REFUSED);
+    oc_dbres_free(r);
+    r = open_group(w, carol, bob, owner);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_DM_REFUSED);
+    oc_dbres_free(r);
+    /* bob, who blocks, still can: the block is his, not hers. */
+    r = open_dm(w, bob, carol);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->channel_id == dm);
+    oc_dbres_free(r);
+
+    /* What carol writes into the shared DM and group DM is stored, reaches dave,
+     * and never reaches bob. */
+    uint64_t after = send_fanout(w, carol, dm, "after", bob, &reached);
+    CHECK(after && !reached);
+    uint64_t gafter = send_fanout(w, carol, gdm, "group after", bob, &reached);
+    CHECK(gafter && !reached);
+    send_fanout(w, carol, gdm, "group after two", dave, &reached);
+    CHECK(reached);
+    CHECK(rm_count(path, "SELECT COUNT(*) FROM withheld_messages WHERE user_id=?1;", bob) == 3);
+    /* bob's own messages still reach carol. */
+    CHECK(send_fanout(w, bob, dm, "from bob", carol, &reached) != 0 && reached);
+    /* And in a channel nothing is withheld: muting is the tool there. */
+    CHECK(send_fanout(w, carol, OC_DEFAULT_CHANNEL, "channel", bob, &reached) != 0 && reached);
+
+    /* Backfill and history leave the withheld messages out for bob, not for dave. */
+    r = backfill(w, bob, dm, 0);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && replay_has(r, before) && !replay_has(r, after));
+    oc_dbres_free(r);
+    r = history(w, bob, gdm, 0, 50);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && !replay_has(r, gafter));
+    oc_dbres_free(r);
+    r = history(w, dave, gdm, 0, 50);
+    CHECK(r && replay_has(r, gafter));
+    oc_dbres_free(r);
+
+    /* Lifting the block reopens the door but brings nothing back. */
+    r = set_block(w, bob, carol, 0);
+    CHECK(r && r->type == OC_RES_BLOCKS && r->bl_n == 0);
+    oc_dbres_free(r);
+    CHECK(audit_count(w, owner, "block.lift") == 1);
+    r = open_dm(w, carol, bob);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->channel_id == dm);
+    oc_dbres_free(r);
+    r = backfill(w, bob, dm, 0);
+    CHECK(r && !replay_has(r, after));
+    oc_dbres_free(r);
+    CHECK(send_fanout(w, carol, dm, "lifted", bob, &reached) != 0 && reached);
+
+    /* dave closes his DMs: nobody starts a new conversation with him... */
+    r = set_dm_privacy(w, dave, OC_DM_PRIVACY_NOBODY);
+    CHECK(r && r->type == OC_RES_BLOCKS && r->bl_privacy == OC_DM_PRIVACY_NOBODY);
+    oc_dbres_free(r);
+    r = open_dm(w, owner, dave);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_DM_REFUSED);
+    oc_dbres_free(r);
+    r = open_group(w, owner, dave, bob);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_DM_REFUSED);
+    oc_dbres_free(r);
+    /* ...but the group DM he is already in carries on. */
+    CHECK(send_fanout(w, bob, gdm, "still here", dave, &reached) != 0 && reached);
+    r = set_dm_privacy(w, dave, OC_DM_PRIVACY_ANYONE);
+    CHECK(r && r->bl_privacy == OC_DM_PRIVACY_ANYONE);
+    oc_dbres_free(r);
+    r = open_dm(w, owner, dave);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    oc_dbres_free(r);
+
+    /* The workspace list of blocks is for an owner or admin only. */
+    r = set_block(w, carol, dave, 1);
+    oc_dbres_free(r);
+    oc_job *j = oc_job_new(OC_JOB_LIST_BLOCKS, 74);
+    j->user_id = bob;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_BLOCK_LIST_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_LIST_BLOCKS, 75);
+    j->user_id = owner;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_BLOCK_LIST && r->n_blk == 1);
+    CHECK(r && r->n_blk == 1 && r->blk_entries[0].blocker_id == carol && r->blk_entries[0].blocked_id == dave);
     oc_dbres_free(r);
 
     oc_dbwriter_stop(w);
@@ -11715,6 +11893,7 @@ int run_dbwriter_tests(void) {
     test_setup_invite();
     test_remove_user_integrations();
     test_remove_keeps_history();
+    test_blocks();
     test_reset_credential();
     test_enable_user();
     test_session_policy();

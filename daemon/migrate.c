@@ -1366,6 +1366,27 @@ static const char MIGRATION_0078[] =
     "ALTER TABLE attachment_media ADD COLUMN language TEXT;"
     "CREATE VIRTUAL TABLE snippets_fts USING fts5(title, body);";
 
+static const char MIGRATION_0079[] =
+    /* Blocks and DM privacy. A block is the blocker's alone: the blocked person
+     * cannot start a direct conversation with them, and what the blocked person
+     * still sends into one they share is kept for its other members but
+     * withheld from the blocker -- recorded per message, so lifting the block
+     * brings back nothing that was withheld. `dm_privacy` 'nobody' refuses every
+     * new direct conversation naming that person. */
+    "CREATE TABLE blocks ("
+    "  user_id       INTEGER NOT NULL REFERENCES users(id),"
+    "  blocked_id    INTEGER NOT NULL REFERENCES users(id),"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  PRIMARY KEY (user_id, blocked_id)"
+    ") WITHOUT ROWID;"
+    "CREATE TABLE withheld_messages ("
+    "  user_id    INTEGER NOT NULL REFERENCES users(id),"
+    "  message_id INTEGER NOT NULL REFERENCES messages(id),"
+    "  PRIMARY KEY (user_id, message_id)"
+    ") WITHOUT ROWID;"
+    "ALTER TABLE users ADD COLUMN dm_privacy TEXT NOT NULL DEFAULT 'anyone' "
+    "  CHECK (dm_privacy IN ('anyone','nobody'));";
+
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
      * author is doing, and the daemon records that as its own object beside the
@@ -1732,6 +1753,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 76, MIGRATION_0076 },
     { 77, MIGRATION_0077 },
     { 78, MIGRATION_0078 },
+    { 79, MIGRATION_0079 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

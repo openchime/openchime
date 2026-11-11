@@ -1227,6 +1227,10 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_MOVE,
        /* a reminder on a message, which saves it (REQ-283) */
        ACT_REMIND,
+       /* blocks and DM privacy: block or unblock a person, who may start a DM
+        * with me, my blocked people (each an Unblock), and an admin's list */
+       ACT_BLOCK, ACT_UNBLOCK, ACT_DMPRIV, ACT_BLOCKED, ACT_BLOCKS_ADMIN,
+       ACT_UNBLOCK0, ACT_UNBLOCK_LAST = ACT_UNBLOCK0 + 27,
        ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
@@ -1239,8 +1243,12 @@ static void menu_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
  * your vote: Tacos" when it is yours. The labels live here, not in the
  * model, which may move while the menu is open. */
 static char g_vote_labels[OC_POLL_MAX_OPTIONS][OC_POLL_OPTION_MAX + 32];
-static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int has_attach, const oc_poll_view *poll, int spoilers, int collapsed) {
+/* `block`: 0 no Block item (my own message, or the workspace's), 1 Block the
+ * author, 2 Unblock them. */
+static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int has_attach, const oc_poll_view *poll, int spoilers, int collapsed, int block) {
     g_nmenu = 0;
+    if (block) g_menu[g_nmenu++] = (menuitem){ block == 2 ? "Unblock the author" : "Block the author",
+                                               block == 2 ? ACT_UNBLOCK : ACT_BLOCK };
     if (!deleted) g_menu[g_nmenu++] = (menuitem){ collapsed ? "Expand" : "Collapse", collapsed ? ACT_EXPAND : ACT_COLLAPSE };
     if (spoilers && !deleted)
         g_menu[g_nmenu++] = (menuitem){ spoilers > 1 ? "Hide spoilers" : "Show spoilers", ACT_SPOILERS };
@@ -1300,9 +1308,10 @@ static int tui_parse_remind(const char *s, uint64_t *at) {
  * keep-it-read step leaves it alone until focus moves, or it would read it again
  * on the next frame. */
 static uint64_t g_hold_unread;
-static void menu_build_member(int is_self) {
+static void menu_build_member(int is_self, int blocked) {
     g_nmenu = 0;
     if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Message",     ACT_DM };
+    if (!is_self) g_menu[g_nmenu++] = (menuitem){ blocked ? "Unblock" : "Block", blocked ? ACT_UNBLOCK : ACT_BLOCK };
     g_menu[g_nmenu++] = (menuitem){ "Make admin",  ACT_ROLE_ADMIN };
     g_menu[g_nmenu++] = (menuitem){ "Make member", ACT_ROLE_MEMBER };
     if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Remove",      ACT_REMOVE };
@@ -1397,7 +1406,10 @@ static const tk_pal_item g_launcher_items[] = {
     { "You",     "Your profile",        NULL, NULL, ACT_PROFILE },
     { "You",     "Read-aloud voice",    NULL, NULL, ACT_VOICES },
     { "You",     "Deactivate account",  NULL, NULL, ACT_DEACTIVATE },
+    { "You",     "Blocked people",      NULL, NULL, ACT_BLOCKED },
+    { "You",     "Who can start a DM with you (anyone/nobody)", NULL, NULL, ACT_DMPRIV },
     { "Admin",   "Invite a user",       NULL, NULL, ACT_INVITE },
+    { "Admin",   "Blocks",              NULL, NULL, ACT_BLOCKS_ADMIN },
     { "Admin",   "Storage usage",       NULL, NULL, ACT_STORAGE },
     { "Admin",   "Audit log",           NULL, NULL, ACT_AUDIT },
     { "Admin",   "Daemon alerts",       NULL, NULL, ACT_ALERTS },
@@ -2088,6 +2100,48 @@ static void draw_storage(const oc_model *m, int W, int H) {
     tb_present();
 }
 
+
+/* My blocked people as menu items, each "Unblock <name>". */
+static char g_unblock_labels[28][96];
+static void menu_build_blocked(const oc_model *m) {
+    g_nmenu = 0;
+    for (uint16_t i = 0; i < m->n_blocks && g_nmenu < 28; i++) {
+        const char *nm = oc_model_user_name((oc_model *)m, m->blocks[i]);
+        snprintf(g_unblock_labels[g_nmenu], sizeof g_unblock_labels[g_nmenu], "Unblock %s",
+                 nm && nm[0] ? nm : "someone");
+        g_menu[g_nmenu] = (menuitem){ g_unblock_labels[g_nmenu], ACT_UNBLOCK0 + g_nmenu };
+        g_nmenu++;
+    }
+}
+
+/* The workspace's blocks, for an owner or admin: who blocks whom, and since. */
+static void draw_blocks(const oc_model *m, int W, int H) {
+    const tk_theme *th = tk_theme_active();
+    if (!m->block_list_have || !m->n_block_list) {
+        const char *e = !m->block_list_have ? "No list yet: owner/admin only." : "Nobody has blocked anyone.";
+        tk_rect r = modal_frame(W, H, tk_str_width(e), 1, "Blocks  ·  Esc closes");
+        tk_text(r.x, r.y, r.x + r.w, e, th->muted, th->bg);
+        tb_present();
+        return;
+    }
+    static char L[OC_BLOCK_LIST_MAX][160];
+    int n = 0, cw = 0;
+    for (uint16_t i = 0; i < m->n_block_list && n < (int)OC_BLOCK_LIST_MAX; i++, n++) {
+        const oc_block_entry *b = &m->block_list[i];
+        const char *a = oc_model_user_name((oc_model *)m, b->blocker_id);
+        const char *t = oc_model_user_name((oc_model *)m, b->blocked_id);
+        time_t since = (time_t)(b->since_ms / 1000);
+        char day[32] = "";
+        const struct tm *tm = gmtime(&since);   /* the UI thread's alone */
+        if (tm) strftime(day, sizeof day, "%Y-%m-%d", tm);
+        snprintf(L[n], sizeof L[n], "%s blocks %s  since %s", a && a[0] ? a : "someone", t && t[0] ? t : "someone", day);
+        int w = tk_str_width(L[n]);
+        if (w > cw) cw = w;
+    }
+    tk_rect r = modal_frame(W, H, cw, n, "Blocks  ·  Esc closes");
+    for (int i = 0; i < n && i < r.h; i++) tk_text(r.x, r.y + i, r.x + r.w, L[i], th->fg, th->bg);
+    tb_present();
+}
 
 /* The /audit overlay (REQ-251): administrative and security-relevant actions,
  * newest first. Owner/admin only — a member's request is refused server-side.
@@ -3426,6 +3480,7 @@ int main(int argc, char **argv) {
     int scroll = 0;
     int switcher_open = 0, wsel = 0;          /* workspace switcher (Ctrl+W) */
     int storage_open = 0;                     /* /storage overlay (REQ-214) */
+    int blocks_open = 0;                      /* an admin's list of blocks */
     int audit_open = 0;                       /* /audit overlay (REQ-251) */
     int alerts_open = 0, asel = 0;            /* the daemon's critical failures (REQ-263) */
     int summary_ui = 0, ssel = 0;             /* the open summary's overlay (REQ-310) */
@@ -3511,6 +3566,9 @@ int main(int argc, char **argv) {
                 oc_client_list_settings(g_ws[i].cl);
                 /* And the notification state, which carries whom this person
                  * has muted: their messages show folded away here too. */
+                oc_client_list_notify_prefs(g_ws[i].cl);
+                /* And the notification state, which carries whom this person
+                 * blocks and who may start a DM with them. */
                 oc_client_list_notify_prefs(g_ws[i].cl);
                 g_ws[i].settings_req = 1;
             }
@@ -3698,6 +3756,7 @@ int main(int argc, char **argv) {
         if (profile_open) draw_profile(oc_client_model(cl), tb_width(), tb_height());
         if (switcher_open) draw_switcher(wsel);
         if (storage_open) draw_storage(oc_client_model(cl), tb_width(), tb_height());
+        if (blocks_open) draw_blocks(oc_client_model(cl), tb_width(), tb_height());
         if (audit_open) draw_audit(oc_client_model(cl), tb_width(), tb_height());
         if (alerts_open) draw_alerts(oc_client_model(cl), tb_width(), tb_height(), asel);
         if (summary_ui && oc_client_model(cl)->summary_open) draw_summary(oc_client_model(cl), tb_width(), tb_height(), ssel);
@@ -3903,6 +3962,11 @@ int main(int argc, char **argv) {
             if (sv_top < 0) sv_top = 0;
             continue;
         }
+        if (blocks_open) {                     /* the blocks overlay: any key closes */
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else blocks_open = 0;
+            continue;
+        }
         if (deactivate_ask) {                  /* y deactivates; anything else keeps the account */
             deactivate_ask = 0;
             if (ev.ch == 'y' || ev.ch == 'Y') oc_client_deactivate_self(cl);
@@ -4086,6 +4150,15 @@ int main(int argc, char **argv) {
                 else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
                 else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
                 else if (id == ACT_ALERTS)  { oc_client_srvalerts_list(cl); alerts_open = 1; asel = 0; }
+                else if (id == ACT_BLOCKS_ADMIN) { oc_client_list_blocks(cl); blocks_open = 1; }
+                else if (id == ACT_DMPRIV)
+                    oc_client_set_dm_privacy(cl, oc_client_model(cl)->dm_privacy != OC_DM_PRIVACY_NOBODY);
+                else if (id == ACT_BLOCKED) {
+                    menu_build_blocked(oc_client_model(cl));
+                    action_menu.sel = action_menu.top = 0;
+                    act_title = "Blocked people";
+                    action_open = 1; tk_list_reset_filter(&action_menu);
+                }
                 else if (id == ACT_WORKSPACES) { sw_build(); wsel = (g_active < g_nsw) ? g_active : 0; switcher_open = 1; }
                 else if (id == ACT_HELP)    help_open = 1;
                 else if (id == ACT_EMOTICONS)
@@ -4183,6 +4256,22 @@ int main(int argc, char **argv) {
                         oc_client_open_dm(cl, act_uid, 0);
                         g_dm_asked = act_uid; g_dm_asked_e2e = 0;
                         panel = 0;
+                    }
+                    else if (id == ACT_BLOCK)       { if (act_uid) oc_client_set_block(cl, act_uid, 1); }
+                    else if (id == ACT_UNBLOCK)     { if (act_uid) oc_client_set_block(cl, act_uid, 0); }
+                    else if (id >= ACT_UNBLOCK0 && id <= ACT_UNBLOCK_LAST) {
+                        const oc_model *bm = oc_client_model(cl);
+                        int k = id - ACT_UNBLOCK0;
+                        if (k < bm->n_blocks) oc_client_set_block(cl, bm->blocks[k], 0);
+                    }
+                    else if (id == ACT_DMPRIV)
+                        oc_client_set_dm_privacy(cl, oc_client_model(cl)->dm_privacy != OC_DM_PRIVACY_NOBODY);
+                    else if (id == ACT_BLOCKS_ADMIN) { oc_client_list_blocks(cl); blocks_open = 1; }
+                    else if (id == ACT_BLOCKED) {
+                        menu_build_blocked(oc_client_model(cl));
+                        action_menu.sel = action_menu.top = 0;
+                        act_title = "Blocked people";
+                        action_open = 1; tk_list_reset_filter(&action_menu);
                     }
                     else if (id == ACT_ROLE_ADMIN)  oc_client_set_role(cl, act_uid, OC_ROLE_ADMIN);
                     else if (id == ACT_ROLE_MEMBER) oc_client_set_role(cl, act_uid, OC_ROLE_MEMBER);
@@ -4401,7 +4490,7 @@ int main(int argc, char **argv) {
                 else if (ev.key == TB_KEY_ENTER && mem_sel < (int)mm->n_users) {
                     /* discoverable member action menu (Message / role / remove) */
                     uint64_t uid = mm->users[mem_sel].user_id;
-                    menu_build_member(uid == mm->user_id);
+                    menu_build_member(uid == mm->user_id, oc_model_is_blocked(mm, uid));
                     act_uid = uid; act_cid = 0; act_mid = 0; act_title = "Member";
                     action_open = 1; tk_list_reset_filter(&action_menu);
                 }
@@ -4428,8 +4517,13 @@ int main(int argc, char **argv) {
                     for (uint8_t ak = 0; ak < sel->n_attach; ak++)
                         if (!sel->attach[ak].reclaimed) { has_attach = 1; break; }
                     if (ev.key == TB_KEY_ENTER) {   /* open the discoverable action menu */
+                        /* Block the author: someone else, never the workspace itself. */
+                        int blk = 0;
+                        if (sel->author_id && sel->author_id != mm->user_id &&
+                            !oc_model_is_workspace_sender(mm, sel->author_id))
+                            blk = oc_model_is_blocked(mm, sel->author_id) ? 2 : 1;
                         menu_build_msg(own, may_edit, may_del, sel->deleted || locked, has_attach && !ch->e2e, sel->poll,   /* no files in an encrypted DM */
-                                       has_spoilers(sel->body) ? 1 + spoilers_shown(mid) : 0, sel->collapsed);
+                                       has_spoilers(sel->body) ? 1 + spoilers_shown(mid) : 0, sel->collapsed, blk);
                         /* Move (REQ-053): one's own, or anything for an admin or
                          * owner, out of a channel that is not archived. */
                         uint8_t role = OC_ROLE_MEMBER;
@@ -4440,7 +4534,7 @@ int main(int argc, char **argv) {
                             g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
                             g_menu[g_nmenu++] = (menuitem){ "Move to another channel", ACT_MOVE };
 
-                        act_cid = cid; act_mid = mid; act_uid = 0; act_title = "Message";
+                        act_cid = cid; act_mid = mid; act_uid = sel->author_id; act_title = "Message";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
                     else if (ev.ch == 't' && !locked) oc_client_open_thread(cl, cid, mid);

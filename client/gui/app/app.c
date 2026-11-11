@@ -1158,7 +1158,7 @@ static int g_prefs_open;
  * image, email, timezone, title) are REQ-240; this shows what the
  * roster actually knows today rather than inventing placeholders for them. */
 static uint64_t g_profile_uid;
-static rectf g_prof_dm_btn, g_prof_mute_btn;
+static rectf g_prof_dm_btn, g_prof_mute_btn, g_prof_block_btn;
 /* The SELF card's action buttons — the commands the profile popover no longer
  * lists top-level. Each carries a menu_dispatch cmd; the bodies are all
  * self-contained. */
@@ -2193,7 +2193,7 @@ static struct { char emoji[24]; char text[80]; uint8_t clear; rectf r; } g_statu
 static int   g_n_status_suggs;
 static struct { rectf r; uint64_t cid; uint8_t level; } g_notify_hits[128];
 /* The two Edit buttons on the notifications overlay (REQ-135). */
-static rectf g_notify_kw_btn, g_notify_vip_btn, g_notify_mute_btn;
+static rectf g_notify_kw_btn, g_notify_vip_btn, g_notify_mute_btn, g_notify_block_btn, g_notify_dmpriv_btn;
 /* The schedule section (REQ-136): mode chips, the base window's two time fields,
  * and — in custom mode — a checkbox and two time fields per weekday. */
 /* The Threads pane (REQ-062): its unread-only toggle and the per-card
@@ -8827,6 +8827,34 @@ static int usage_click(float x, float y) {
     return 0;
 }
 
+/* The workspace's blocks, for an owner or admin: who blocks whom, and since
+ * when. Nobody else sees a block, the person blocked included. */
+static void draw_blocks_admin(gfx *rt, const oc_model *m, rectf body) {
+    if (!m->block_list_have) { overlay_empty(rt, body, "Loading…"); return; }
+    if (!m->n_block_list) { overlay_empty(rt, body, "Nobody has blocked anyone."); return; }
+    static const char *const MON[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    float y = body.top + 12;
+    for (uint16_t i = 0; i < m->n_block_list && y < body.bottom - 22; i++) {
+        const oc_block_entry *b = &m->block_list[i];
+        const char *a = oc_model_user_name((oc_model *)m, b->blocker_id);
+        const char *t = oc_model_user_name((oc_model *)m, b->blocked_id);
+        /* The day, from days since the epoch (H. Hinnant's civil_from_days):
+         * Windows' C library has no gmtime_r. */
+        int64_t z = (int64_t)(b->since_ms / 86400000ull) + 719468;
+        int64_t era = z / 146097;
+        unsigned doe = (unsigned)(z - era * 146097);
+        unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        unsigned mp = (5 * doy + 2) / 153, d = doy - (153 * mp + 2) / 5 + 1, mo = mp < 10 ? mp + 3 : mp - 9;
+        long yr = (long)((int64_t)yoe + era * 400 + (mo <= 2));
+        char who[200], since[48];
+        snprintf(who, sizeof who, "%s blocks %s", a && a[0] ? a : "someone", t && t[0] ? t : "someone");
+        snprintf(since, sizeof since, "since %s %u, %ld", MON[mo - 1], d, yr);
+        draw_kv(rt, body, &y, who, since, OC_COL_TEXT);
+    }
+}
+
 static const char *audit_family(uint8_t f) {
     return f == 1 ? "admin" : f == 2 ? "account" : f == 3 ? "security" : f == 4 ? "moderation" : "";
 }
@@ -9331,8 +9359,56 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
         draw_text(rt, "Edit", g_meta, g_notify_mute_btn, OC_COL_TEXT);
         g_meta->align = ST_ALIGN_LEFT;
 
-        fill(rt, rf(body.left + 20, y2 + muteblk, body.right - 20, y2 + muteblk + 1), OC_COL_BORDER);
-        body.top = y2 + muteblk + 10;
+        /* Blocked people: who cannot start a conversation with me, and whose
+         * direct messages I do not get. Edit takes a name off to unblock. */
+        float yb = y2 + muteblk;
+        char blocked[256] = "";
+        for (uint16_t i = 0; i < m->n_blocks; i++) {
+            const char *nm = oc_model_user_name((oc_model *)m, m->blocks[i]);
+            if (!nm || !nm[0]) continue;
+            if (blocked[0]) strncat(blocked, ", ", sizeof blocked - strlen(blocked) - 1);
+            strncat(blocked, nm, sizeof blocked - strlen(blocked) - 1);
+        }
+        const char *bltext = blocked[0] ? blocked
+            : "None: block someone from their profile or a message of theirs.";
+        float blh = text_height(bltext, g_meta_w, dw);
+        if (blh < 20) blh = 20;
+        float blblk = estack ? 18 + blh + 34 : 18 + blh + 6;
+        draw_text(rt, "Blocked people", g_ui_b, rf(body.left + 20, yb, er, yb + 20), OC_COL_TEXT);
+        draw_text(rt, bltext, g_meta_w, rf(body.left + 20, yb + 18, er, yb + 18 + blh),
+                  blocked[0] ? OC_COL_MUTED : OC_COL_FAINT);
+        g_notify_block_btn = estack
+            ? rf(body.left + 20, yb + 22 + blh, body.left + 20 + UIS(96), yb + 48 + blh)
+            : rf(body.right - UIS(120), yb + 2, body.right - UIS(24), yb + 28);
+        fill_round(rt, g_notify_block_btn, OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, g_notify_block_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, "Edit", g_meta, g_notify_block_btn, OC_COL_TEXT);
+        g_meta->align = ST_ALIGN_LEFT;
+
+        /* Who may start a new direct conversation with me: one switch, which
+         * leaves every conversation already started as it is. */
+        float y3 = yb + blblk;
+        const char *dptext = m->dm_privacy == OC_DM_PRIVACY_NOBODY
+            ? "Nobody: no one can start a new direct conversation with you."
+            : "Anyone in the workspace can start a direct conversation with you.";
+        float dph = text_height(dptext, g_meta_w, dw);
+        if (dph < 20) dph = 20;
+        float dpblk = estack ? 18 + dph + 34 : 18 + dph + 6;
+        draw_text(rt, "Direct messages", g_ui_b, rf(body.left + 20, y3, er, y3 + 20), OC_COL_TEXT);
+        draw_text(rt, dptext, g_meta_w, rf(body.left + 20, y3 + 18, er, y3 + 18 + dph), OC_COL_MUTED);
+        g_notify_dmpriv_btn = estack
+            ? rf(body.left + 20, y3 + 22 + dph, body.left + 20 + UIS(120), y3 + 48 + dph)
+            : rf(body.right - UIS(120), y3 + 2, body.right - UIS(24), y3 + 28);
+        fill_round(rt, g_notify_dmpriv_btn, OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, g_notify_dmpriv_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, m->dm_privacy == OC_DM_PRIVACY_NOBODY ? "Allow anyone" : "Allow nobody", g_meta,
+                  g_notify_dmpriv_btn, OC_COL_TEXT);
+        g_meta->align = ST_ALIGN_LEFT;
+
+        fill(rt, rf(body.left + 20, y3 + dpblk, body.right - 20, y3 + dpblk + 1), OC_COL_BORDER);
+        body.top = y3 + dpblk + 10;
     }
 
     /* Read receipts (REQ-090): whether others see what I have read. Mine
@@ -9508,6 +9584,8 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
     g_notify_kw_btn  = hit_visible(g_notify_kw_btn,  reg);
     g_notify_vip_btn = hit_visible(g_notify_vip_btn, reg);
     g_notify_mute_btn = hit_visible(g_notify_mute_btn, reg);
+    g_notify_block_btn = hit_visible(g_notify_block_btn, reg);
+    g_notify_dmpriv_btn = hit_visible(g_notify_dmpriv_btn, reg);
     for (int i = 0; i < 4; i++) g_sched_mode_hit[i] = hit_visible(g_sched_mode_hit[i], reg);
     g_sched_default_hit = hit_visible(g_sched_default_hit, reg);
     g_receipts_hit = hit_visible(g_receipts_hit, reg);
@@ -11400,9 +11478,21 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
             g_ui->align = ST_ALIGN_LEFT;
             y += 38;
         } else g_prof_mute_btn = rf(0, 0, 0, 0);
+        /* Block them, for me alone; the button says which way it goes. */
+        if (!oc_model_is_workspace_sender(m, g_profile_uid)) {
+            g_prof_block_btn = rf(reg.left + 24, y, reg.right - 24, y + 30);
+            fill_round(rt, g_prof_block_btn, OC_R_CONTROL, OC_COL_INPUT);
+            stroke_round(rt, g_prof_block_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+            g_ui->align = ST_ALIGN_CENTER;
+            draw_text(rt, oc_model_is_blocked(m, g_profile_uid) ? "Unblock" : "Block", g_ui, g_prof_block_btn,
+                      OC_COL_TEXT);
+            g_ui->align = ST_ALIGN_LEFT;
+            y += 38;
+        } else g_prof_block_btn = rf(0, 0, 0, 0);
     } else {
         g_prof_dm_btn = rf(0, 0, 0, 0);
         g_prof_mute_btn = rf(0, 0, 0, 0);
+        g_prof_block_btn = rf(0, 0, 0, 0);
         /* Your own card is where the profile-shaped ACTIONS live — the popover
          * points here with "Profile", and photo/name/password/sessions moved
          * off its top level. Two labelled groups of stacked bordered buttons,
@@ -18567,7 +18657,7 @@ static int shell_visible(void) {
  * before it keep their places. */
 /* adds Custom emoji (REQ-072), the one tab a member is shown too: the
  * catalogue is everyone's, and its creator may delete an emoji they added. */
-enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_EMOJI, ADM_USAGE, ADM_COUNT };
+enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_EMOJI, ADM_USAGE, ADM_BLOCKS, ADM_COUNT };
 static int g_adm_tab;
 static rectf g_adm_tabs[ADM_COUNT];
 
@@ -18584,6 +18674,7 @@ static void admin_select(int t) {
     else if (t == ADM_ALERTS)   oc_client_srvalerts_list(g_client);
     else if (t == ADM_AUDIT)   { oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); }
     else if (t == ADM_USAGE)    oc_client_usage(g_client, g_usage_days);
+    else if (t == ADM_BLOCKS)   oc_client_list_blocks(g_client);
 }
 
 /* The picker's Manage link: Admin > Custom emoji, which a member is shown too. */
@@ -19010,6 +19101,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
         { "Alerts",    OC_ICON_ALERT },
         { "Custom emoji", OC_ICON_SMILE },
         { "Usage",     OC_ICON_USER },
+        { "Blocks",    OC_ICON_USER },
     };
     float tx = reg.left + 16, ty = reg.top + HEADER_H;
     int admin = self_role(m) >= OC_ROLE_ADMIN;
@@ -19039,6 +19131,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
     else if (g_adm_tab == ADM_GROUPS)  draw_groups(rt, m, body);
     else if (g_adm_tab == ADM_ALERTS)  draw_alerts_admin(rt, m, body);
     else if (g_adm_tab == ADM_USAGE)   draw_usage(rt, m, body);
+    else if (g_adm_tab == ADM_BLOCKS)  draw_blocks_admin(rt, m, body);
     else                              draw_audit(rt, m, body, 1);
 }
 
@@ -26402,7 +26495,7 @@ static void a11y_publish_scene(const oc_model *m) {
 
     /* Admin's tabs, and Alerts' Acknowledge buttons, named for what they act on. */
     if (g_view == VIEW_ADMIN) {
-        static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts", "emoji", "usage" };
+        static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts", "emoji", "usage", "blocks" };
         int admin = self_role(m) >= OC_ROLE_ADMIN;
         for (int t = 0; t < ADM_COUNT && n < OC_ACC_MAX; t++) {
             if (!admin && t != ADM_EMOJI) continue;
@@ -29816,6 +29909,14 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
                  an && an[0] ? an : "this person");
         mi_item(113, lbl);
     }
+    /* Block the author, for me alone: someone else, never the workspace itself. */
+    if (!own && msg->author_id && !oc_model_is_workspace_sender(m, msg->author_id)) {
+        char lbl[120];
+        const char *an = oc_model_user_name((oc_model *)m, msg->author_id);
+        snprintf(lbl, sizeof lbl, "%s %s", oc_model_is_blocked(m, msg->author_id) ? "Unblock" : "Block",
+                 an && an[0] ? an : "this person");
+        mi_item(114, lbl);
+    }
     int canmod = own || self_role(m) >= OC_ROLE_ADMIN;
     /* The workspace's windows (REQ-051/052): an author's own message stops
      * offering Edit or Delete once the daemon would refuse it; a moderator's
@@ -30005,6 +30106,11 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
         if (g_client) oc_client_set_user_mute(g_client, msg->author_id, on);
         fb_confirm(on ? "Muted. Their messages stay folded away and no longer notify you."
                       : "Unmuted.");
+    } else if (cmd == 114) {
+        int on = !oc_model_is_blocked(m, msg->author_id);
+        if (g_client) oc_client_set_block(g_client, msg->author_id, on);
+        fb_confirm(on ? "Blocked. They can't start a conversation with you, and you won't get their direct messages."
+                      : "Unblocked.");
     } else if (cmd == 21) {
         composer_begin_edit(msg);
     } else if (cmd == 108) {
@@ -30107,6 +30213,7 @@ static void show_member_menu(oc_win *hwnd, const oc_model *m, uint64_t uid, floa
     mi_item(2, "View profile");
     if (!self) mi_item(1, "Message");
     if (!self) mi_item(18, oc_model_is_muted_user(m, uid) ? "Unmute" : "Mute");
+    if (!self) mi_item(19, oc_model_is_blocked(m, uid) ? "Unblock" : "Block");
     /* Out of the open channel (REQ-309), as the pane's row offers -- or, for
      * someone a group keeps in, why not, as Leave does for yourself. */
     uint64_t chan = 0;
@@ -30195,6 +30302,14 @@ static void member_menu_run(oc_win *hwnd, int cmd) {
         int on = !(m && oc_model_is_muted_user(m, uid));
         if (g_client) oc_client_set_user_mute(g_client, uid, on);
         fb_confirm(on ? "Muted. Their messages stay folded away and no longer notify you." : "Unmuted.");
+        break;
+    }
+    case 19: {   /* block or unblock them, for me alone */
+        const oc_model *m = model();
+        int on = !(m && oc_model_is_blocked(m, uid));
+        if (g_client) oc_client_set_block(g_client, uid, on);
+        fb_confirm(on ? "Blocked. They can't start a conversation with you, and you won't get their direct messages."
+                      : "Unblocked.");
         break;
     }
     default: break;
@@ -31053,6 +31168,66 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 } else fb_confirm(nk ? "Muted people saved." : "Nobody is muted now.");
                 return 1;
             }
+            /* Who may start a new direct conversation with me. */
+            if (in_rect(g_notify_dmpriv_btn, x, y)) {
+                const oc_model *km = model();
+                int nobody = !(km && km->dm_privacy == OC_DM_PRIVACY_NOBODY);
+                oc_client_set_dm_privacy(g_client, nobody);
+                fb_confirm(nobody ? "No one can start a new direct conversation with you now."
+                                  : "Anyone can start a direct conversation with you again.");
+                return 1;
+            }
+            /* Blocked people, by display name: a name taken off is unblocked, a
+             * name added is blocked, one at a time, as the daemon takes them. */
+            if (in_rect(g_notify_block_btn, x, y)) {
+                const oc_model *km = model();
+                oc_field f[1] = { { FF_TEXT, "Blocked people",
+                                    "Separate with commas. Take a name off to unblock them.", "" } };
+                if (km) for (uint16_t i = 0; i < km->n_blocks; i++) {
+                    const char *nm = oc_model_user_name((oc_model *)km, km->blocks[i]);
+                    if (!nm || !nm[0]) continue;
+                    if (f[0].value[0]) strncat(f[0].value, ", ", sizeof f[0].value - strlen(f[0].value) - 1);
+                    strncat(f[0].value, nm, sizeof f[0].value - strlen(f[0].value) - 1);
+                }
+                if (!form_dialog(hwnd, "Blocked people", f, 1)) return 1;
+                static uint64_t keep[OC_MAX_BLOCKS];
+                uint16_t nk = 0;
+                char missing[128] = "";
+                for (char *p2 = f[0].value; *p2 && nk < OC_MAX_BLOCKS; ) {
+                    while (*p2 == ' ' || *p2 == ',') p2++;
+                    char *e = strchr(p2, ',');
+                    size_t len = e ? (size_t)(e - p2) : strlen(p2);
+                    while (len && p2[len - 1] == ' ') len--;
+                    if (len) {
+                        char nm[80];
+                        if (len > sizeof nm - 1) len = sizeof nm - 1;
+                        memcpy(nm, p2, len); nm[len] = '\0';
+                        uint64_t uid = km ? oc_model_user_id(km, nm) : 0;
+                        if (uid) keep[nk++] = uid;
+                        else if (strlen(missing) + len + 2 < sizeof missing) {
+                            if (missing[0]) strncat(missing, ", ", sizeof missing - strlen(missing) - 1);
+                            strncat(missing, nm, sizeof missing - strlen(missing) - 1);
+                        }
+                    }
+                    if (!e) break;
+                    p2 = e + 1;
+                }
+                if (km) {
+                    for (uint16_t i = 0; i < km->n_blocks; i++) {
+                        int still = 0;
+                        for (uint16_t k = 0; k < nk; k++) if (keep[k] == km->blocks[i]) still = 1;
+                        if (!still) oc_client_set_block(g_client, km->blocks[i], 0);
+                    }
+                    for (uint16_t k = 0; k < nk; k++)
+                        if (!oc_model_is_blocked(km, keep[k])) oc_client_set_block(g_client, keep[k], 1);
+                }
+                if (missing[0]) {
+                    char msg[160];
+                    snprintf(msg, sizeof msg, "No such person: %s", missing);
+                    fb_failed(msg);
+                } else fb_confirm(nk ? "Blocked people saved." : "Nobody is blocked now.");
+                return 1;
+            }
             for (int i = 0; i < g_n_notify_hits; i++)
                 if (in_rect(g_notify_hits[i].r, x, y)) {
                     if (g_notify_hits[i].cid == 0)      /* REQ-134: the global default */
@@ -31076,6 +31251,15 @@ static int on_click(oc_win *hwnd, int x, int y) {
         int on = !(pm && oc_model_is_muted_user(pm, g_profile_uid));
         if (g_client) oc_client_set_user_mute(g_client, g_profile_uid, on);
         fb_confirm(on ? "Muted. Their messages stay folded away and no longer notify you." : "Unmuted.");
+        invalidate();
+        return 1;
+    }
+    if (g_profile_uid && in_rect(g_prof_block_btn, x, y)) {
+        const oc_model *pm = model();
+        int on = !(pm && oc_model_is_blocked(pm, g_profile_uid));
+        if (g_client) oc_client_set_block(g_client, g_profile_uid, on);
+        fb_confirm(on ? "Blocked. They can't start a conversation with you, and you won't get their direct messages."
+                      : "Unblocked.");
         invalidate();
         return 1;
     }
