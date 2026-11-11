@@ -1323,6 +1323,16 @@ static const char MIGRATION_0072[] =
     "  SELECT id, oc_unspoiled(body) FROM spoiler_reindex;"
     "DROP TABLE spoiler_reindex;";
 
+static const char MIGRATION_0075[] =
+    /* Reminders on saved items (REQ-283): when to remind, and when it fired, so
+     * it fires once. Setting a new time clears reminded_at_ms; clearing the
+     * reminder clears both. The index holds only reminders still to fire, which
+     * is what the scheduled tick reads. */
+    "ALTER TABLE saved_items ADD COLUMN remind_at_ms INTEGER;"
+    "ALTER TABLE saved_items ADD COLUMN reminded_at_ms INTEGER;"
+    "CREATE INDEX idx_saved_remind ON saved_items(remind_at_ms) "
+    "  WHERE remind_at_ms IS NOT NULL AND reminded_at_ms IS NULL;";
+
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
      * author is doing, and the daemon records that as its own object beside the
@@ -1685,6 +1695,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 72, MIGRATION_0072 },
     { 73, MIGRATION_0073 },
     { 74, MIGRATION_0074 },
+    { 75, MIGRATION_0075 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

@@ -1024,11 +1024,27 @@ static void test_action_frames(void) {
         CHECK(out.action == 1 && slice_eq_str(out.body, "is away") && out.pinned_by == 43);
     }
     {
-        oc_saved_msg in = { 1001, 7, 42, 5, 6, oc_slice_str("is away"), oc_slice_str("a.txt"), 1 };
+        oc_saved_msg in = { 1001, 7, 42, 5, 6, oc_slice_str("is away"), oc_slice_str("a.txt"), 1,
+                            1746230400000ull };
         ROUNDTRIP(oc_encode_saved_msg(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SAVED_MSG, h, p);
         oc_saved_msg out;
         CHECK(oc_decode_saved_msg(&p, &out) == OC_OK);
         CHECK(out.action == 1 && slice_eq_str(out.body, "is away") && slice_eq_str(out.attach_name, "a.txt"));
+        CHECK(out.remind_at_ms == 1746230400000ull);   /* its reminder (REQ-283) */
+    }
+    {   /* A reminder asked for, and told to every device (REQ-283). */
+        oc_save_item in = { 1001, OC_SAVE_ADD, 1746230400000ull };
+        ROUNDTRIP(oc_encode_save_item(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SAVE_ITEM, h, p);
+        oc_save_item out;
+        CHECK(oc_decode_save_item(&p, &out) == OC_OK && out.message_id == 1001 &&
+              out.op == OC_SAVE_ADD && out.remind_at_ms == 1746230400000ull);
+    }
+    {
+        oc_saved_updated in = { 1001, OC_SAVE_ADD, 6, 1746230400000ull };
+        ROUNDTRIP(oc_encode_saved_updated(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SAVED_UPDATED, h, p);
+        oc_saved_updated out;
+        CHECK(oc_decode_saved_updated(&p, &out) == OC_OK && out.message_id == 1001 &&
+              out.saved_at == 6 && out.remind_at_ms == 1746230400000ull);
     }
     {
         oc_activity_entry in = { 1, 1001, 7, 42, 5, oc_slice_str("waves at @dana"), 1 };

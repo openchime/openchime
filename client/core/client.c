@@ -641,6 +641,16 @@ void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op) {
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SAVE_ITEM);
     if (!cmd) return;
     cmd->message_id = message_id; cmd->op = op;
+    /* The frame is the item's whole state: a save again keeps its reminder. */
+    cmd->server_time = op ? oc_model_reminder(&c->model, message_id) : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_set_reminder(oc_client *c, uint64_t message_id, uint64_t at_ms) {
+    if (!c || !message_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SAVE_ITEM);
+    if (!cmd) return;
+    cmd->message_id = message_id; cmd->op = OC_SAVE_ADD;
+    cmd->server_time = at_ms;
     oc_queue_push(&c->cmds, cmd);
 }
 void oc_client_set_collapsed(oc_client *c, uint64_t message_id, int on) {

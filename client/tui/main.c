@@ -1089,6 +1089,8 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_JUMP_DATE,
        /* move a message to another channel (REQ-053) */
        ACT_MOVE,
+       /* a reminder on a message, which saves it (REQ-283) */
+       ACT_REMIND,
        ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
@@ -1123,6 +1125,40 @@ static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int 
     if (may_del)  g_menu[g_nmenu++] = (menuitem){ "Delete",          ACT_DELETE };
     g_menu[g_nmenu++] = (menuitem){ "Who reacted", ACT_REACTORS };
     g_menu[g_nmenu++] = (menuitem){ "Mark unread from here", ACT_UNREAD };
+    if (!deleted && g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+        g_menu[g_nmenu++] = (menuitem){ "Remind me...", ACT_REMIND };
+}
+
+/* A reminder typed (REQ-283): "20m", "1h", "tomorrow" (09:00), "14:30" (today,
+ * or tomorrow once past), "2026-05-03 14:30", or "clear" (returns 1, *at 0).
+ * The moment in ms into *at; 0 when it is none of them. */
+static int tui_parse_remind(const char *s, uint64_t *at) {
+    time_t now = time(NULL);
+    struct tm t;
+    int n, y, mo, d, hh, mm;
+    char unit = 0;
+    *at = 0;
+    while (*s == ' ') s++;
+    if (!strncmp(s, "clear", 5)) return 1;
+    if (!oc_localtime_r(&now, &t)) return 0;
+    if (sscanf(s, "%d%c", &n, &unit) == 2 && n > 0 && (unit == 'm' || unit == 'h') && !strchr(s, ':')) {
+        *at = ((uint64_t)now + (uint64_t)n * (unit == 'm' ? 60u : 3600u)) * 1000u;
+        return 1;
+    }
+    struct tm q = t;
+    q.tm_sec = 0; q.tm_isdst = -1;
+    if (!strncmp(s, "tomorrow", 8)) { q.tm_mday += 1; q.tm_hour = 9; q.tm_min = 0; }
+    else if (sscanf(s, "%d-%d-%d %d:%d", &y, &mo, &d, &hh, &mm) == 5) {
+        if (mo < 1 || mo > 12 || d < 1 || d > 31 || hh > 23 || mm > 59 || hh < 0 || mm < 0) return 0;
+        q.tm_year = y - 1900; q.tm_mon = mo - 1; q.tm_mday = d; q.tm_hour = hh; q.tm_min = mm;
+    } else if (sscanf(s, "%d:%d", &hh, &mm) == 2 && hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+        q.tm_hour = hh; q.tm_min = mm;
+        if (mktime(&q) <= now) { q = t; q.tm_sec = 0; q.tm_isdst = -1; q.tm_mday += 1; q.tm_hour = hh; q.tm_min = mm; }
+    } else return 0;
+    time_t r = mktime(&q);
+    if (r == (time_t)-1 || r <= now) return 0;
+    *at = (uint64_t)r * 1000u;
+    return 1;
 }
 /* The conversation marked unread (REQ-235) and still in focus: the loop's
  * keep-it-read step leaves it alone until focus moves, or it would read it again
@@ -3289,11 +3325,12 @@ int main(int argc, char **argv) {
     /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
      * /nick with a discoverable text prompt. */
     enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_NICK, PROMPT_UPLOAD,
-           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE, PROMPT_DATE, PROMPT_MOVE };
+           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE, PROMPT_DATE, PROMPT_MOVE, PROMPT_REMIND };
     /* A move into a private channel (REQ-053): y/N, naming who will no longer
      * see it, before it is sent. */
     uint64_t move_ask_mid = 0, move_ask_to = 0;
     char move_ask_text[400] = "";
+    uint32_t reminder_seen = 0;               /* the model's reminder_seq, told (REQ-283) */
     int await_invite = 0;   /* open the roster on the invitation once it is made */
     /* The invite prompt's explanation, which names the provider, and what was
      * wrong with the last answer ("" when nothing was). */
@@ -3430,6 +3467,15 @@ int main(int argc, char **argv) {
                 }
                 date_cid = date_day = 0;
             }
+        }
+        /* A reminder come due (REQ-283): said once, on the status line. */
+        if (m->reminder_seq != reminder_seen) {
+            reminder_seen = m->reminder_seq;
+            const oc_channel *rc = oc_model_channel((oc_model *)m, m->reminder_channel);
+            if (rc && rc->kind != OC_CHANNEL_KIND_DM && rc->name && rc->name[0])
+                snprintf(g_closed_note, sizeof g_closed_note, "Reminder: a message you saved in #%s.", rc->name);
+            else
+                snprintf(g_closed_note, sizeof g_closed_note, "Reminder: a message you saved.");
         }
         /* Lazy backfill + keep the focused channel marked read. */
         if (focus < m->n_channels) {
@@ -3746,6 +3792,19 @@ int main(int argc, char **argv) {
                         oc_client_move_message(cl, act_mid, dst->channel_id, 0, 1);
                     }
                 }
+                else if (k == PROMPT_REMIND && *v) {
+                    uint64_t at = 0;
+                    if (!tui_parse_remind(v, &at))
+                        snprintf(g_closed_note, sizeof g_closed_note, "Not a time to come: try 20m, 1h, tomorrow, 14:30 or clear.");
+                    else {
+                        oc_client_set_reminder(cl, act_mid, at);
+                        if (at) {
+                            time_t ts = (time_t)(at / 1000); struct tm tv; char w[40] = "then";
+                            if (oc_localtime_r(&ts, &tv)) strftime(w, sizeof w, "%a %d %b at %H:%M", &tv);
+                            snprintf(g_closed_note, sizeof g_closed_note, "Saved. You'll be reminded %s.", w);
+                        } else snprintf(g_closed_note, sizeof g_closed_note, "Reminder cleared. The message stays saved.");
+                    }
+                }
                 else if (k == PROMPT_INVITE) {
                     /* An address where the workspace signs people in through a
                      * provider; blank for a token, where it has password accounts.
@@ -3951,6 +4010,7 @@ int main(int argc, char **argv) {
                     }
                     else if (id == ACT_DELETE)      oc_client_delete(cl, act_cid, act_mid);
                     else if (id == ACT_MOVE) { prompt_kind = PROMPT_MOVE; prompt_title = "Move to channel (name)"; tk_input_init(&prompt_input, 0, "#channel"); }
+                    else if (id == ACT_REMIND) { prompt_kind = PROMPT_REMIND; prompt_title = "Remind me (20m, 1h, tomorrow, 14:30, 2026-05-03 14:30, clear)"; tk_input_init(&prompt_input, 0, "when"); }
                     else if (id == ACT_DM) {
                         oc_client_open_dm(cl, act_uid, 0);
                         g_dm_asked = act_uid; g_dm_asked_e2e = 0;

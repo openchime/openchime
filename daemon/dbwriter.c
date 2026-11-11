@@ -696,6 +696,22 @@ static void append_poll(sqlite3 *db, oc_dbres *r, uint64_t mid, uint64_t channel
 }
 
 /* Polls for a replayed window, each with the asker's own selection (REQ-225). */
+/* The reader's reminders on the saved rows of a replay (REQ-283), so the
+ * SAVED_UPDATED it turns into carries them rather than reading as none. */
+static void fill_replay_reminders(sqlite3 *db, oc_dbres *r, uint64_t viewer) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT COALESCE(remind_at_ms,0) FROM saved_items WHERE user_id=?1 AND message_id=?2;",
+                           -1, &st, NULL) != SQLITE_OK) return;
+    for (size_t i = 0; i < r->n_replay; i++) {
+        if (!r->replay[i].saved) continue;
+        sqlite3_reset(st);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)viewer);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)r->replay[i].message_id);
+        if (sqlite3_step(st) == SQLITE_ROW) r->replay[i].remind_at = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+}
+
 static void fill_replay_polls(sqlite3 *db, oc_dbres *r, uint64_t viewer) {
     for (size_t i = 0; i < r->n_replay; i++)
         append_poll(db, r, r->replay[i].message_id, r->replay[i].channel_id, viewer);
@@ -5293,6 +5309,13 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
     sqlite3_prepare_v2(db, "DELETE FROM pins WHERE message_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
 
+    /* Nor anything to be reminded of (REQ-283): the reminders go now, so a
+     * restore does not bring one back to fire late. The saved rows stay hidden
+     * behind the tombstone, as they always have, for a restore to show again. */
+    sqlite3_prepare_v2(db, "UPDATE saved_items SET remind_at_ms=NULL, reminded_at_ms=NULL WHERE message_id=?;",
+                       -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
+
     /* A tombstone has no links to preview either (REQ-052/222). */
     sqlite3_prepare_v2(db, "DELETE FROM unfurls WHERE message_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
@@ -6597,6 +6620,7 @@ static oc_dbres *process_save_item(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
+    r->user_id = j->user_id;   /* told to every connection of theirs */
     r->message_id = j->message_id;
     r->save_op = j->save_op;
 
@@ -6623,6 +6647,17 @@ static oc_dbres *process_save_item(sqlite3 *db, const oc_job *j) {
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
         sqlite3_bind_int64(st, 3, (sqlite3_int64)now);
         sqlite3_step(st); sqlite3_finalize(st);
+        /* The reminder (REQ-283) is what this ADD says it is: a time sets it
+         * afresh, to fire once more; 0 clears it. The frame is the item's whole
+         * state, so a client re-saving one sends the reminder it holds. */
+        sqlite3_prepare_v2(db,
+            "UPDATE saved_items SET remind_at_ms=NULLIF(?3,0), reminded_at_ms=NULL "
+            " WHERE user_id=?1 AND message_id=?2;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->remind_at_ms);
+        sqlite3_step(st); sqlite3_finalize(st);
+        r->remind_at = j->remind_at_ms;
         /* Report the ORIGINAL save time, so a re-save does not appear to move the
          * item to the top of a list ordered by when you saved it. */
         sqlite3_prepare_v2(db, "SELECT created_at_ms FROM saved_items WHERE user_id=? AND message_id=?;",
@@ -6860,7 +6895,8 @@ static oc_dbres *process_list_saved(sqlite3 *db, const oc_job *j) {
         /* An action travels as its action text, flagged (REQ-058). */
         "SELECT s.message_id, m.channel_id, m.author_id, m.created_at_ms, s.created_at_ms, substr(m.body,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0)), "
         "       (SELECT a.filename FROM attachments a WHERE a.message_id = m.id ORDER BY a.id LIMIT 1), "
-        "       EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) "
+        "       EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id), "
+        "       COALESCE(s.remind_at_ms, 0) "
         "  FROM saved_items s JOIN messages m ON m.id = s.message_id "
         " WHERE s.user_id=?1 AND m.deleted_at_ms IS NULL "
         /* Still gated on membership: leaving a channel should not keep leaking
@@ -6884,6 +6920,7 @@ static oc_dbres *process_list_saved(sqlite3 *db, const oc_job *j) {
         arr[n].body = b ? strdup((const char *)b) : NULL;
         arr[n].attach_name = an ? strdup((const char *)an) : NULL;
         arr[n].action = (uint8_t)(sqlite3_column_int(st, 7) != 0);
+        arr[n].remind_at = (uint64_t)sqlite3_column_int64(st, 8);
         n++;
     }
     sqlite3_finalize(st);
@@ -7018,6 +7055,15 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
          * the notice in message_id, its scope as text, its status as action --- */
         "  SELECT 4, sn.id, sn.channel_id, 0, sn.made_at_ms, CAST(sn.scope AS TEXT), sn.status "
         "    FROM summary_notices sn WHERE sn.user_id = ?1 "
+        "  UNION ALL "
+        /* --- my reminders that fired (REQ-283): the message, at the moment it
+         * fired, by its author; gone with the reminder or the save --- */
+        "  SELECT 5, s.message_id, m.channel_id, m.author_id, s.reminded_at_ms, "
+        "         oc_excerpt(substr(COALESCE(m.body,''),1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0)),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) "
+        "    FROM saved_items s JOIN messages m ON m.id = s.message_id "
+        "   WHERE s.user_id = ?1 AND s.reminded_at_ms IS NOT NULL AND m.deleted_at_ms IS NULL "
+        "     AND EXISTS(SELECT 1 FROM channel_members cm "
+        "                 WHERE cm.channel_id = m.channel_id AND cm.user_id = ?1) "
         ") ORDER BY at DESC LIMIT ?3;";
 
     sqlite3_prepare_v2(db, SQL, -1, &st, NULL);
@@ -8291,6 +8337,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
     fill_replay_forwards(db, r);
     fill_replay_actions(db, r);
     fill_replay_polls(db, r, j->user_id);   /* REQ-225 */
+    fill_replay_reminders(db, r, j->user_id);   /* REQ-283 */
     return r;
 }
 
@@ -8497,6 +8544,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     fill_replay_forwards(db, r);
     fill_replay_actions(db, r);
     fill_replay_polls(db, r, j->user_id);   /* REQ-225 */
+    fill_replay_reminders(db, r, j->user_id);   /* REQ-283 */
     return r;
 }
 
@@ -10462,6 +10510,56 @@ static oc_dbres *process_update_scheduled(sqlite3 *db, const oc_job *j) {
  * One at a time because the result IS the send: the netloop raises another job
  * as soon as one fires (see maybe_fire_scheduled), so a backlog drains at queue
  * speed rather than one per tick. */
+/* Reminders come due (REQ-283): every saved item whose time has passed and
+ * that has not fired, still the owner's to read, is marked fired and answered
+ * as one OC_RES_REMINDER_DUE each, for the owner's connections and push. Run on
+ * the scheduled-message tick, so a reminder lands within that tick of its
+ * time. A batch at a time; the rest on the next tick. */
+static oc_dbres *process_fire_reminders(sqlite3 *db, const oc_job *j) {
+    (void)j;
+    uint64_t now = dbw_now_ms();
+    oc_dbres *head = NULL, **tail = &head;
+    sqlite3_stmt *st = NULL;
+    sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+    if (sqlite3_prepare_v2(db,
+            "SELECT s.user_id, s.message_id, m.channel_id, s.created_at_ms, s.remind_at_ms "
+            "  FROM saved_items s JOIN messages m ON m.id = s.message_id "
+            " WHERE s.remind_at_ms IS NOT NULL AND s.reminded_at_ms IS NULL AND s.remind_at_ms <= ?1 "
+            "   AND m.deleted_at_ms IS NULL "
+            "   AND EXISTS(SELECT 1 FROM channel_members cm "
+            "               WHERE cm.channel_id = m.channel_id AND cm.user_id = s.user_id) "
+            " ORDER BY s.remind_at_ms LIMIT 64;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)now);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            oc_dbres *r = calloc(1, sizeof *r);
+            if (!r) break;
+            r->type = OC_RES_REMINDER_DUE;
+            r->user_id    = (uint64_t)sqlite3_column_int64(st, 0);
+            r->message_id = (uint64_t)sqlite3_column_int64(st, 1);
+            r->channel_id = (uint64_t)sqlite3_column_int64(st, 2);
+            r->saved_at   = (uint64_t)sqlite3_column_int64(st, 3);
+            r->remind_at  = (uint64_t)sqlite3_column_int64(st, 4);
+            r->server_time = now;
+            *tail = r; tail = &r->next;
+        }
+        sqlite3_finalize(st);
+    }
+    for (oc_dbres *r = head; r; r = r->next) {
+        if (sqlite3_prepare_v2(db, "UPDATE saved_items SET reminded_at_ms=?3 WHERE user_id=?1 AND message_id=?2;",
+                               -1, &st, NULL) != SQLITE_OK) break;
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)r->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)r->message_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)now);
+        sqlite3_step(st); sqlite3_finalize(st);
+    }
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    if (!head) {                                /* nothing due: a benign no-op */
+        head = calloc(1, sizeof *head);
+        if (head) head->type = OC_RES_REMINDER_DUE;
+    }
+    return head;
+}
+
 static oc_dbres *process_fire_scheduled(sqlite3 *db, const oc_job *j) {
     (void)j;
     uint64_t id = 0, uid = 0, cid = 0, root = 0;
@@ -11602,6 +11700,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_CHANNEL_REMOVE_GROUP) return process_channel_group(w->db, j, 0);
     if (j->type == OC_JOB_INVITE_USER)    return process_invite_user(w, j);
     if (j->type == OC_JOB_FIRE_SCHEDULED)    return process_fire_scheduled(w->db, j);
+    if (j->type == OC_JOB_FIRE_REMINDERS)    return process_fire_reminders(w->db, j);
     if (j->type == OC_JOB_SCHEDULE)          return process_schedule(w->db, j);
     if (j->type == OC_JOB_LIST_SCHEDULED)    return process_list_scheduled(w->db, j);
     if (j->type == OC_JOB_CANCEL_SCHEDULED)  return process_cancel_scheduled(w->db, j);

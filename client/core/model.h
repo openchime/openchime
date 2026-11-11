@@ -114,6 +114,7 @@ typedef struct {
      * replayed after a reconnect so a bookmark survives a reload. */
     uint8_t      saved;
     uint64_t     saved_at;
+    uint64_t     remind_at;   /* its reminder (REQ-283), 0 for none; with saved */
     /* Folded away by THIS user (SET_COLLAPSED): theirs on every device, from
      * COLLAPSED_UPDATED, live and replayed. Shows its author, time and first
      * line until it is opened again. */
@@ -357,6 +358,7 @@ typedef struct {
     char    *body;                 /* heap */
     char     attach_name[128];
     uint8_t  action;               /* body is an action's text (REQ-058) */
+    uint64_t remind_at;            /* its reminder (REQ-283), 0 for none */
 } oc_saved_view;
 
 /* One draft (REQ-223, ARCH-101). Keyed by the conversation, not by time: there
@@ -528,6 +530,12 @@ typedef struct {
      * the message at a top level, or the open thread again. */
     uint64_t  moved_fetch_channel, moved_fetch_message;
     uint8_t   moved_fetch_thread;
+    /* A reminder come due while connected (REQ-283): reminder_seq moves on with
+     * each, so a frontend tells the person once; the message and its
+     * conversation. Reminders known on saved items are on each message
+     * (oc_msg.remind_at) and saved row; oc_model_reminder finds one. */
+    uint32_t  reminder_seq;
+    uint64_t  reminder_mid, reminder_channel;
     oc_reactor_row *reactors;
     size_t    n_reactors, cap_reactors;
     /* The open "who voted" view (REQ-225), on the who-reacted pattern: the
@@ -871,6 +879,9 @@ void oc_model_free(oc_model *m);
 /* Fold one net event into the model. Takes ownership of `e->body` (moves it into
  * the model and clears it); the caller still frees the event struct itself. */
 void oc_model_apply(oc_model *m, oc_ev *e);
+/* The reminder this person has on a message (REQ-283), as the model holds it
+ * -- on the loaded message or the Saved list -- or 0. */
+uint64_t oc_model_reminder(const oc_model *m, uint64_t message_id);
 
 /* Find a channel by id, or NULL. */
 oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id);

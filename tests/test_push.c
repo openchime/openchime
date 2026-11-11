@@ -1233,6 +1233,9 @@ static void test_call_invite(void) {
     CHECK(oc_push_build_body_kind(7, 1, t, 1, body, sizeof body) == 0);
     CHECK(strstr(body, "\"kind\":\"call\"") && strstr(body, "\"channelId\":\"7\"") && !strstr(body, "c-alice"));
     CHECK(oc_push_build_body_kind(7, 0, t, 1, body, sizeof body) == 0 && !strstr(body, "kind"));
+    /* A reminder come due says so, and still nothing of the message (REQ-283). */
+    CHECK(oc_push_build_body_kind(7, OC_PUSH_KIND_REMINDER, t, 1, body, sizeof body) == 0);
+    CHECK(strstr(body, "\"kind\":\"reminder\"") && !strstr(body, "\"kind\":\"call\""));
     cleanup_db(path);
 }
 

@@ -270,6 +270,10 @@ void oc_client_history_around(oc_client *c, uint64_t channel_id, uint64_t messag
 void oc_client_find_at_time(oc_client *c, uint64_t channel_id, uint64_t parent_id, uint64_t at_ms);
 
 void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op);
+/* Remind me of a message at `at_ms` (REQ-283), saving it if it is not; 0
+ * clears the reminder and leaves it saved. Every device of mine is told
+ * (SAVED_UPDATED); when it comes due the model's reminder_seq moves on. */
+void oc_client_set_reminder(oc_client *c, uint64_t message_id, uint64_t at_ms);
 /* Fold a message away for me on every device (on 1), or open it again (on 0).
  * The model's msg->collapsed follows when the daemon answers. */
 void oc_client_set_collapsed(oc_client *c, uint64_t message_id, int on);

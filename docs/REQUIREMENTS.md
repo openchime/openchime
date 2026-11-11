@@ -1096,12 +1096,17 @@ where one exists.
   surfaced as an activity-feed entry and a notification instead of a synthetic
   message from a fake user.
 
-  **Storage and delivery.** Storage is small — saved items
-  (ARCH-95, migration 0025) already hold (user, message) and want only a
-  `remind_at_ms` beside the existing stamp — and **delivery has a precedent**: the
-  daemon already runs a bounded periodic maintenance pass off the net loop's tick
-  (ARCH-78), which is the natural place for a due-reminder sweep and means no new
-  scheduler, thread, or timer subsystem.
+  **Storage and delivery, as built.** A reminder is a saved item with a time
+  (migration 0072: `remind_at_ms` and `reminded_at_ms` on `saved_items`), set
+  through `SAVE_ITEM` and told to the owner's devices in `SAVED_UPDATED`; a
+  reminder on an unsaved message saves it. It fires once, within the
+  scheduled-message tick of its time (fifteen seconds, the tick scheduled
+  messages already use, not the five-minute maintenance pass): an activity entry
+  of its own kind, sent live to the owner's connections, and a push held back by
+  a mute, quiet hours or a pause like any other. Clearing it, unsaving, or
+  deleting the message removes it. The desktop client offers "Remind me…" on a
+  message and in Saved (in 20 minutes, in 1 hour, tomorrow at 9:00, next Monday
+  at 9:00, or a chosen time); the terminal client takes a typed time.
 - **REQ-284.** What the **unread badge counts** has been defined
   rather than left implicit: a conversation's badge has counted the messages that
   **would have notified** the user under their settings (REQ-130/134/135/137) —

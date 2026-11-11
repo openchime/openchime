@@ -354,6 +354,7 @@ typedef struct {
     uint64_t message_id;
     uint64_t parent_id;    /* THREAD_REPLY: the parent message this replies to */
     uint64_t to_channel;   /* MESSAGE_MOVED: the channel it went to */
+    uint64_t remind_at;    /* SAVED_UPDATED, SAVED_MSG: the reminder (REQ-283), 0 for none */
     uint64_t server_time;
     uint8_t  status;       /* PRESENCE: online/away/offline; CHANNEL: joined flag */
     uint8_t  is_public;    /* CHANNEL: 1 public, 0 private/DM */

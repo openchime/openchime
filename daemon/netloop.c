@@ -3309,6 +3309,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_job *j = oc_job_new(OC_JOB_SAVE_ITEM, c->conn_id);
             if (!j) return -1;
             j->user_id = c->user_id; j->message_id = si.message_id; j->save_op = si.op;
+            j->remind_at_ms = si.op == OC_SAVE_ADD ? si.remind_at_ms : 0;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -7060,14 +7061,38 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         break;
     }
     case OC_RES_SAVED_OK: {
-        /* Private: the ack goes to the actor and stops. There is no one to fan
-         * a personal bookmark to. */
-        conn *c = find_by_id(conns, r->conn_id);
-        if (!c) return;
+        /* Private: to the actor's own connections and nobody else's, so a
+         * reminder set on one device shows on the others (REQ-283). */
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
-        oc_saved_updated su = { r->message_id, r->save_op, r->saved_at };
+        oc_saved_updated su = { r->message_id, r->save_op, r->saved_at, r->remind_at };
         oc_encode_saved_updated(&w, OC_PROTOCOL_VERSION, &su);
-        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        size_t len = w.len;
+        if (!r->user_id) {
+            conn *c = find_by_id(conns, r->conn_id);
+            if (c) send_bytes(ep, conns, c->fd, g_enc, len);
+            break;
+        }
+        for (conn *t = user_head(r->user_id), *next; t; t = next) {
+            next = t->u_next;
+            send_bytes(ep, conns, t->fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_REMINDER_DUE: {
+        /* A reminder come due (REQ-283): the owner's connections hear it as an
+         * activity entry of its own kind, and their devices are woken through
+         * push as for a mention, so a pause or quiet hours hold it back. */
+        if (!r->user_id) break;
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_activity_entry ae = { OC_ACT_REMINDER, r->message_id, r->channel_id, 0, r->server_time,
+                                 { NULL, 0 }, 0 };
+        if (oc_encode_activity_entry(&w, OC_PROTOCOL_VERSION, &ae) != OC_OK) break;
+        size_t len = w.len;
+        for (conn *t = user_head(r->user_id), *next; t; t = next) {
+            next = t->u_next;
+            send_bytes(ep, conns, t->fd, g_enc, len);
+        }
+        if (demo_ok(OC_DL_PUSH, 0)) oc_push_notify_reminder(cur_push(), r->channel_id, r->user_id);
         break;
     }
     case OC_RES_COLLAPSED: {
@@ -7092,7 +7117,8 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             oc_saved_msg sm = { sr->message_id, sr->channel_id, sr->author_id,
                                 sr->created_at, sr->saved_at,
                                 oc_slice_str(sr->body ? sr->body : ""),
-                                oc_slice_str(sr->attach_name ? sr->attach_name : ""), sr->action };
+                                oc_slice_str(sr->attach_name ? sr->attach_name : ""), sr->action,
+                                sr->remind_at };
             oc_encode_saved_msg(&w, OC_PROTOCOL_VERSION, &sm);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
@@ -8584,7 +8610,7 @@ static size_t backfill_next(conn *c) {
             c->bf_i = i + 1;
             if (!r->replay[i].saved) continue;
             oc_saved_updated su = { r->replay[i].message_id, OC_SAVE_ADD,
-                                    r->replay[i].saved_at };
+                                    r->replay[i].saved_at, r->replay[i].remind_at };
             oc_encode_saved_updated(&w, OC_PROTOCOL_VERSION, &su);
             return w.len;
         }
@@ -8741,6 +8767,9 @@ static void maybe_fire_scheduled(oc_dbwriter *dbw) {
     g_sched_more = 0;
     oc_job *j = oc_job_new(OC_JOB_FIRE_SCHEDULED, 0);   /* no connection owns this */
     if (j) oc_dbwriter_submit(dbw, j);
+    /* Reminders on the same tick (REQ-283): within it of their time. */
+    oc_job *rj = oc_job_new(OC_JOB_FIRE_REMINDERS, 0);
+    if (rj) oc_dbwriter_submit(dbw, rj);
 }
 
 /* Do-not-disturb changing with no frame to hang it on.

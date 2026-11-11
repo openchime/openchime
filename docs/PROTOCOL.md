@@ -213,8 +213,10 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 37** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 38** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 38 appended `remind_at_ms` to `SAVE_ITEM`, `SAVED_UPDATED` and `SAVED_MSG`, a
+> saved item's reminder, and added the activity kind for one that fired (REQ-283). Version
 > 37 appended `follow_threads` to each `NOTIFY_PREFS` entry (§5.12, REQ-282). Version
 > 36 put `also_channel` in `SEND_REPLY` and `THREAD_REPLY` and `parent_id` in
 > `BROADCAST`, each in the fixed part ahead of the body: a thread reply can also
@@ -1254,21 +1256,34 @@ disk (ARCH-88), and both change from other clients.
 
 Both are **per-user** surfaces, and neither fans out to anyone else.
 
-**`SAVE_ITEM` (client → server), msg_type `0x0062`** `{ message_id: u64, op: u8 }`
+**`SAVE_ITEM` (client → server), msg_type `0x0062`** `{ message_id: u64, op: u8, remind_at_ms: u64 }`
 (`1` save, `0` unsave). You may save anything in a channel you are a member of
 (`NOT_A_MEMBER` otherwise, even for a public channel you can read; `FORBIDDEN`
-in an encrypted DM); a tombstone cannot be saved. Replies **`SAVED_UPDATED` (`0x0063`)** `{ message_id, op, saved_at }` **to
-the actor only** — a personal bookmark has no one to announce it to. Saving twice
-is a no-op and reports the **original** `saved_at`, so a list ordered by when you
-saved does not reshuffle when you click again.
+in an encrypted DM); a tombstone cannot be saved. Replies **`SAVED_UPDATED` (`0x0063`)** `{ message_id, op, saved_at, remind_at_ms: u64 }` **to
+each of the actor's connections and nobody else's** — a personal bookmark has no
+one else to announce it to, and their other devices show it. Saving twice
+reports the **original** `saved_at`, so a list ordered by when you saved does not
+reshuffle when you click again.
+
+`remind_at_ms` is the item's **reminder** (REQ-283), `0` for none (protocol
+35). With op `1` it is the item's whole state: a time sets the reminder, to fire
+once more even if an earlier one had fired; `0` clears it and leaves the item
+saved. A client saving again sends the reminder it holds. A reminder on an
+unsaved message saves it; unsaving takes the reminder with it, as does deleting
+the message. On the scheduled-message tick (fifteen seconds) every reminder whose time has passed fires once: the owner's
+connections are sent an **`ACTIVITY_ENTRY`** of kind `5` (`OC_ACT_REMINDER`:
+`message_id`, `channel_id`, `at` the moment it fired, no text), and their
+devices are woken through push as for a mention, held back by a mute, quiet
+hours or a pause; never mail. The fired reminder stays in `LIST_ACTIVITY` until
+it is cleared or set again. Backfill's replayed `SAVED_UPDATED` carries it too.
 
 **`LIST_SAVED` (`0x0064`)** (no body) streams **`SAVED_MSG` (`0x0065`)** newest
 save first, then **`SAVED` (`0x0066`)** `{ count: u32 }`. Each entry is
 `{ message_id: u64, channel_id: u64, author_id: u64, server_time: u64,
-saved_at: u64, body: str, attach_name: str, action: u8 }` — the body and first
+saved_at: u64, body: str, attach_name: str, action: u8, remind_at_ms: u64 }` — the body and first
 attachment's name, like a pin — a saved message is
 usually far outside loaded history — and, last, an `action` byte (REQ-058,
-§5.16l): `1` when the message is an action, its body then being the action text. Entries whose channel you have since left are
+§5.16l): `1` when the message is an action, its body then being the action text, then its reminder, `0` for none. Entries whose channel you have since left are
 omitted: leaving a channel must stop it leaking through your saved list.
 
 **`SET_COLLAPSED` (client → server), msg_type `0x0117`** `{ message_id: u64, on: u8 }`

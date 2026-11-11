@@ -201,8 +201,12 @@
  * 34: THREAD_META carries `n_repliers` (u8, at most 3) and that many u64 user
  * ids, the thread's most recent distinct repliers, newest first, and is sent
  * live to the channel's members when a reply is posted or deleted, not only in
- * backfill (REQ-060). Fields appended to a fixed layout. */
-#define OC_PROTOCOL_VERSION 37u
+ * backfill (REQ-060). Fields appended to a fixed layout.
+ *
+ * 38: SAVE_ITEM, SAVED_UPDATED and SAVED_MSG carry `remind_at_ms` (u64, 0 for
+ * none), a saved item's reminder (REQ-283), and activity has a new kind,
+ * OC_ACT_REMINDER, for one that fired. Fields appended to fixed layouts. */
+#define OC_PROTOCOL_VERSION 38u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -904,6 +908,9 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
  * is the notice (SUMMARY_OPEN), text its scope (OC_SUM_*) in digits, action
  * its status. */
 #define OC_ACT_SUMMARY  4u
+/* A reminder I set on a saved message, come due (REQ-283): message_id is the
+ * message, created_at the moment it fired. Mine alone. */
+#define OC_ACT_REMINDER 5u
 #define OC_MAX_SAVED    200u
 #define OC_MAX_ACTIVITY 200u
 
@@ -1284,13 +1291,17 @@ typedef struct {
 typedef struct { oc_slice name; uint8_t is_public; } oc_create_channel;
 typedef struct { uint64_t channel_id; uint8_t op; oc_slice value; } oc_update_channel;
 
-/* Saved items (REQ-231) — private, so SAVED_UPDATED goes to the actor only. */
-typedef struct { uint64_t message_id; uint8_t op; } oc_save_item;
-typedef struct { uint64_t message_id; uint8_t op; uint64_t saved_at; } oc_saved_updated;
+/* Saved items (REQ-231) — private, so SAVED_UPDATED goes to the actor only.
+ * `remind_at_ms` is the item's reminder (REQ-283), 0 for none: on SAVE_ITEM with
+ * op ADD it is set (a reminder on an unsaved message saves it), and 0 clears
+ * it; REMOVE takes the reminder with the item. */
+typedef struct { uint64_t message_id; uint8_t op; uint64_t remind_at_ms; } oc_save_item;
+typedef struct { uint64_t message_id; uint8_t op; uint64_t saved_at; uint64_t remind_at_ms; } oc_saved_updated;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id;
                  uint64_t server_time; uint64_t saved_at; oc_slice body;
                  oc_slice attach_name;
-                 uint8_t action;   /* as oc_pinned_msg's (REQ-058) */ } oc_saved_msg;
+                 uint8_t action;   /* as oc_pinned_msg's (REQ-058) */
+                 uint64_t remind_at_ms; } oc_saved_msg;
 typedef struct { uint32_t count; } oc_saved;
 /* Collapsed messages: one person's, on every device of theirs. SET_COLLAPSED
  * folds a message away (on 1) or opens it (on 0); COLLAPSED_UPDATED says so to

@@ -1,7 +1,7 @@
 # OpenChime — Database Schema
 
 The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
-ARCH-27 (§1); the daemon applies migrations 0001–0074 (`daemon/migrate.c`,
+ARCH-27 (§1); the daemon applies migrations 0001–0075 (`daemon/migrate.c`,
 `OC_MIGRATIONS`), in order, and new tables/columns arrive as later numbered
 migrations, never as edits to an existing one. 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
@@ -36,7 +36,7 @@ credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
 **0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
-(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation.
+(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -1955,3 +1955,26 @@ upsert touches one; *read* by `OC_THREAD_PARTICIPANT_SQL` (`daemon/dbwriter.h`),
 which the push audience, the threads view and `THREAD_REPLY`'s per-recipient
 byte all ask, under the explicit per-thread unfollow, and listed in
 `NOTIFY_PREFS`. Every row before this reads `0`.
+
+## 3bn. Migration 0075 — reminders on saved items (REQ-283)
+
+```sql
+ALTER TABLE saved_items ADD COLUMN remind_at_ms INTEGER;
+ALTER TABLE saved_items ADD COLUMN reminded_at_ms INTEGER;
+CREATE INDEX idx_saved_remind ON saved_items(remind_at_ms)
+  WHERE remind_at_ms IS NOT NULL AND reminded_at_ms IS NULL;
+```
+
+*A reminder is a saved item with a time.* It is as private as the item: keyed
+on (user, message), told only to its owner's devices. `remind_at_ms` is when,
+NULL for none; `reminded_at_ms` is when it fired, so it fires once. Setting a
+new time clears `reminded_at_ms`; clearing the reminder clears both; unsaving
+deletes the row and the reminder with it. A deleted message's reminders are
+cleared at once, so a restore cannot bring one back to fire late.
+
+*Fired on the scheduled-message tick*, not the maintenance pass: within fifteen
+seconds of its time rather than five minutes. The partial index holds only the
+reminders still to fire, which is all the tick reads. A fired reminder is an
+activity entry (`OC_ACT_REMINDER`) by the same query-over-rows design as the
+rest of the feed (§3u): a row with `reminded_at_ms` set, while it is saved, the
+message stands and its owner is still in the conversation.

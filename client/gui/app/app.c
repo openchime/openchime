@@ -1887,6 +1887,10 @@ static uint64_t  g_date_cid, g_date_day;
 static uint32_t  g_found_seen;
 static struct { rectf r; uint64_t ms; } g_sephits[48];
 static int       g_n_sephits;
+/* The Later view's reminder buttons as drawn (REQ-283): each row's message,
+ * conversation and reminder. */
+static struct { rectf r; uint64_t mid, cid, at; } g_remhits[64];
+static int       g_n_remhits;
 /* The jump is going BACK to a place (navigation history): the message goes to
  * the top of the pane, where it was, and nothing flashes -- it is not news. */
 static int       g_jump_quiet;
@@ -19098,7 +19102,7 @@ static void draw_activity_list(gfx *rt, const oc_model *m, float h) {
         const oc_channel *ch = oc_model_channel((oc_model *)m, a->channel_id);
         int icon = a->kind == OC_ACT_MENTION ? OC_ICON_AT
                  : a->kind == OC_ACT_REACTION ? OC_ICON_SMILE
-                 : a->kind == OC_ACT_UNREAD ? OC_ICON_BELL : OC_ICON_DMS;
+                 : (a->kind == OC_ACT_UNREAD || a->kind == OC_ACT_REMINDER) ? OC_ICON_BELL : OC_ICON_DMS;
         draw_lucide(rt, icon, rf(row.left + 46, y + 25, row.left + 60, y + 39), OC_COL_FAINT);
         char whereline[128];
         /* A DM has no name, so "in a conversation" would be the whole answer for
@@ -19108,7 +19112,8 @@ static void draw_activity_list(gfx *rt, const oc_model *m, float h) {
         snprintf(whereline, sizeof whereline, "%s in %s%s",
                  a->kind == OC_ACT_MENTION ? "Mention" :
                  a->kind == OC_ACT_REACTION ? "Reaction" :
-                 a->kind == OC_ACT_UNREAD ? "Unread" : "Thread",
+                 a->kind == OC_ACT_UNREAD ? "Unread" :
+                 a->kind == OC_ACT_REMINDER ? "Reminder" : "Thread",
                  (ch && ch->name && ch->name[0]) ? "#" : (peer && peer[0]) ? "@" : "",
                  (ch && ch->name && ch->name[0]) ? ch->name
                                                  : (peer && peer[0]) ? peer : "a conversation");
@@ -21988,6 +21993,7 @@ static void draw_later(gfx *rt, const oc_model *m, rectf reg) {
     }
     ovl_use(OVL_LATER);
     float y = ovl_begin(rt, body, (float)shown_total * rowh + 16);
+    g_n_remhits = 0;
     for (size_t i = 0; i < m->n_saved; i++) {
         const oc_saved_view *sv = &m->saved[i];
         if (g_later_chan && sv->channel_id != g_later_chan) continue;
@@ -22018,7 +22024,27 @@ static void draw_later(gfx *rt, const oc_model *m, rectf reg) {
         stroke_round(rt, rm, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
         g_meta->align = ST_ALIGN_CENTER;
         draw_text(rt, "Remove", g_meta, rm, OC_COL_MUTED);
+        /* Its reminder (REQ-283): when, or the offer of one. */
+        char rlbl[48] = "Remind me";
+        if (sv->remind_at) {
+            time_t rt_s = (time_t)(sv->remind_at / 1000);
+            struct tm rtv;
+            if (oc_localtime_r(&rt_s, &rtv)) strftime(rlbl, sizeof rlbl, "%a %H:%M", &rtv);
+        }
+        float rw = text_width(rlbl, g_meta) + 36;
+        rectf rr = rf(rm.left - 8 - rw, y + 14, rm.left - 8, y + 38);
+        stroke_round(rt, rr, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        draw_lucide(rt, OC_ICON_BELL, rf(rr.left + 8, y + 19, rr.left + 22, y + 33),
+                    sv->remind_at ? OC_COL_ACCENT : OC_COL_MUTED);
+        draw_text(rt, rlbl, g_meta, rf(rr.left + 18, rr.top, rr.right, rr.bottom),
+                  sv->remind_at ? OC_COL_TEXT : OC_COL_MUTED);
         g_meta->align = ST_ALIGN_LEFT;
+        if (g_n_remhits < (int)(sizeof g_remhits / sizeof g_remhits[0])) {
+            g_remhits[g_n_remhits].r = rr;
+            g_remhits[g_n_remhits].mid = sv->message_id;
+            g_remhits[g_n_remhits].cid = sv->channel_id;
+            g_remhits[g_n_remhits++].at = sv->remind_at;
+        }
 
         if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
             g_listrows[g_n_listrows].row = row;
@@ -29312,6 +29338,8 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
         mi_item(106, "Forward");
         mi_item(105, "Copy link");
         mi_item(104, "Save for later");
+        /* Reminders (REQ-283): on a saved message, which this saves. */
+        if (!msg->deleted) mi_item(114, (msg->saved && msg->remind_at) ? "Reminder\xE2\x80\xA6" : "Remind me\xE2\x80\xA6");
     }
     mi_item(20,  "Copy text");
     /* Spoilers (MARKDOWN.md §1d), from the keyboard: Ctrl+Up to the message,
@@ -29386,9 +29414,110 @@ static void thumb_menu_run(oc_win *hwnd, int cmd) {
 static void member_menu_run(oc_win *hwnd, int cmd);    /* fwd */
 static void channel_menu_run(oc_win *hwnd, int cmd);   /* fwd */
 
+/* The reader's local time `days` days from today at hh:mm, in ms; 0 if the
+ * clock cannot be read. */
+static uint64_t local_at(int days, int hh, int mm) {
+    time_t now = time(NULL);
+    struct tm tv;
+    if (!oc_localtime_r(&now, &tv)) return 0;
+    tv.tm_mday += days; tv.tm_hour = hh; tv.tm_min = mm; tv.tm_sec = 0; tv.tm_isdst = -1;
+    time_t t = mktime(&tv);
+    return t == (time_t)-1 ? 0 : (uint64_t)t * 1000u;
+}
+
+/* "14:30" today (tomorrow once it has passed), or "2026-05-03 14:30": the
+ * moment, or 0 for neither. */
+static uint64_t parse_when(const char *s) {
+    int y, mo, d, hh, mm;
+    if (sscanf(s, "%d-%d-%d %d:%d", &y, &mo, &d, &hh, &mm) == 5) {
+        if (mo < 1 || mo > 12 || d < 1 || d > 31 || hh < 0 || hh > 23 || mm < 0 || mm > 59) return 0;
+        struct tm t = {0};
+        t.tm_year = y - 1900; t.tm_mon = mo - 1; t.tm_mday = d; t.tm_hour = hh; t.tm_min = mm; t.tm_isdst = -1;
+        time_t r = mktime(&t);
+        return r == (time_t)-1 ? 0 : (uint64_t)r * 1000u;
+    }
+    if (sscanf(s, "%d:%d", &hh, &mm) == 2 && hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+        uint64_t at = local_at(0, hh, mm);
+        if (at && at <= (uint64_t)time(NULL) * 1000u) at = local_at(1, hh, mm);
+        return at;
+    }
+    return 0;
+}
+
+/* "Remind me…" (REQ-283): the usual moments, any other, and a clear when one
+ * is set. A menu of its own about the same message. */
+static void remind_menu_open(oc_win *hwnd, uint64_t mid, uint64_t chan, float x, float y, uint64_t current) {
+    g_n_mi = 0;
+    if (current) {
+        char when[64], lbl[96];
+        time_t t = (time_t)(current / 1000);
+        struct tm tv;
+        if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%a %d %b, %H:%M", &tv);
+        else snprintf(when, sizeof when, "set");
+        snprintf(lbl, sizeof lbl, "REMINDER: %s", when);
+        mi_section(lbl);
+    } else mi_section("REMIND ME");
+    mi_item(115, "In 20 minutes");
+    mi_item(116, "In 1 hour");
+    mi_item(117, "Tomorrow at 9:00");
+    mi_item(118, "Next Monday at 9:00");
+    mi_item(119, "At a time\xE2\x80\xA6");
+    if (current) mi_item_d(120, "Clear reminder");
+    g_menu = MENU_MSG; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 240;
+    g_menu_target = mid; g_menu_target2 = chan;
+    g_menu_x = x; g_menu_y = y;
+    irect rc; client_rect(hwnd, &rc);
+    float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
+    float H = DIPF(rc.bottom), W = DIPF(rc.right);
+    if (g_menu_y + h > H - 8) g_menu_y = H - 8 - h;
+    if (g_menu_y < 8) g_menu_y = 8;
+    if (g_menu_x + g_menu_w > W - 8) g_menu_x = W - 8 - g_menu_w;
+    invalidate();
+}
+
+/* Set a reminder and say when, in the reader's words. */
+static void remind_set(uint64_t mid, uint64_t at) {
+    if (!g_client || !mid || !at) return;
+    oc_client_set_reminder(g_client, mid, at);
+    char when[64], note[96];
+    time_t t = (time_t)(at / 1000);
+    struct tm tv;
+    if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%a %d %b at %H:%M", &tv);
+    else snprintf(when, sizeof when, "then");
+    snprintf(note, sizeof note, "Saved. You'll be reminded %s.", when);
+    fb_confirm(note);
+}
+
 static void msg_menu_run(oc_win *hwnd, int cmd) {
     const oc_model *m = model();
     if (!m || !cmd) return;
+    /* The reminder menu's choices need only the message's id: it may be a
+     * saved one that is not loaded. */
+    if (cmd >= 115 && cmd <= 120) {
+        uint64_t rid = g_menu_target;
+        uint64_t now = (uint64_t)time(NULL) * 1000u;
+        if (cmd == 115) remind_set(rid, now + 20u * 60u * 1000u);
+        else if (cmd == 116) remind_set(rid, now + 60u * 60u * 1000u);
+        else if (cmd == 117) remind_set(rid, local_at(1, 9, 0));
+        else if (cmd == 118) {
+            time_t tn = time(NULL); struct tm tv;
+            int wd = oc_localtime_r(&tn, &tv) ? tv.tm_wday : 1;
+            int ahead = (8 - wd) % 7; if (ahead == 0) ahead = 7;   /* Monday is 1 */
+            remind_set(rid, local_at(ahead, 9, 0));
+        } else if (cmd == 119) {
+            oc_field f[1] = { { FF_TEXT, "When",
+                                "As 14:30 (today, or tomorrow once it has passed), or 2026-05-03 14:30.", "" } };
+            if (form_dialog(hwnd, "Remind me", f, 1) && f[0].value[0]) {
+                uint64_t at = parse_when(f[0].value);
+                if (at > now) remind_set(rid, at);
+                else fb_failed("That is not a time to come. Try 14:30 or 2026-05-03 14:30.");
+            }
+        } else if (cmd == 120 && g_client) {
+            oc_client_set_reminder(g_client, rid, 0);
+            fb_confirm("Reminder cleared. The message stays saved.");
+        }
+        return;
+    }
     uint64_t mid = g_menu_target, chan = g_menu_target2;
     const oc_channel *c = oc_model_channel((oc_model *)m, chan);
     const oc_msg *msg = find_msg(c, mid);
@@ -29487,6 +29616,8 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
          * is where you remove one. */
         oc_client_save_item(g_client, mid, OC_SAVE_ADD);
         fb_confirm("Saved to Later.");
+    } else if (cmd == 114) {
+        remind_menu_open(hwnd, mid, chan, g_menu_x, g_menu_y, msg->saved ? msg->remind_at : 0);
     } else if (cmd == 103) {
         oc_client_pin(g_client, chan, mid, msg->pinned ? OC_PIN_REMOVE : OC_PIN_ADD);
     } else if (cmd >= 30 && cmd - 30 < msg->n_attach) {
@@ -30908,6 +31039,14 @@ static int on_click(oc_win *hwnd, int x, int y) {
             if (in_rect(g_lchan_rows[i], x, y)) {
                 uint64_t want = (i == 0) ? 0 : g_lchan[i - 1].id;
                 if (want != g_later_chan) { g_later_chan = want; g_ovl_scroll = 0; }
+                return 1;
+            }
+    /* A Later row's reminder: its menu (REQ-283). */
+    if (g_view == VIEW_LATER)
+        for (int i = 0; i < g_n_remhits; i++)
+            if (in_rect(g_remhits[i].r, x, y)) {
+                remind_menu_open(hwnd, g_remhits[i].mid, g_remhits[i].cid,
+                                 g_remhits[i].r.left, g_remhits[i].r.bottom + 4, g_remhits[i].at);
                 return 1;
             }
     /* Later rows: the action button first, then the row itself. */
@@ -39358,6 +39497,20 @@ static int on_tick(oc_win *hwnd) {
             }
             if (!g_jump_mid) g_jump_fetched = 0;
             date_jump_land(hwnd, m);
+            /* A reminder come due (REQ-283): said once, naming where it is. */
+            {
+                static uint32_t rem_seen;
+                if (m->reminder_seq != rem_seen) {
+                    rem_seen = m->reminder_seq;
+                    const oc_channel *rc = oc_model_channel((oc_model *)m, m->reminder_channel);
+                    char note[160];
+                    if (rc && rc->kind != OC_CHANNEL_KIND_DM && rc->name && rc->name[0])
+                        snprintf(note, sizeof note, "Reminder: a message you saved in #%s.", rc->name);
+                    else
+                        snprintf(note, sizeof note, "Reminder: a message you saved. It is in Activity.");
+                    fb_confirm(note);
+                }
+            }
             hist_track();
             /* The settings bucket arrives a beat after auth; fold it in once. */
             if (g_sb_settings_pending && oc_model_setting(m, SB_SETTING_KEY)) {

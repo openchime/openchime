@@ -313,7 +313,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_MOVE_MESSAGE = 151,
        /* FIND_AT_TIME: the message at `find_at_ms` in channel_id, in the
         * thread parent_id or its main scroll (0). A read. */
-       OC_JOB_FIND_AT_TIME = 152 };
+       OC_JOB_FIND_AT_TIME = 152,
+       /* Reminders come due (REQ-283), on the scheduled-message tick: each
+        * fires once, answered as one OC_RES_REMINDER_DUE apiece. Write. */
+       OC_JOB_FIRE_REMINDERS = 160 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -484,8 +487,10 @@ typedef struct oc_job {
     /* UPDATE_CHANNEL (channel_id above): op + the new topic/name in ch_name. */
     uint8_t        chup_op;
 
-    /* SAVE_ITEM (message_id above): add/remove. */
+    /* SAVE_ITEM (message_id above): add/remove, and with add the reminder
+     * (REQ-283), 0 for none. */
     uint8_t        save_op;
+    uint64_t       remind_at_ms;
     /* SET_WEBHOOK_STATE's desired state. Its own field rather than reusing
      * one of the *_op flags above: a reader should not have to know that "save_op"
      * secretly means "disabled" for a different job type. */
@@ -811,7 +816,12 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_MESSAGE_MOVED = 125, OC_RES_MOVE_ERR = 126,
        /* FOUND_AT_TIME to the asker: channel_id, parent_id, message_id (0 for
         * none), server_time, and found_exact. */
-       OC_RES_FOUND_AT_TIME = 127 };
+       OC_RES_FOUND_AT_TIME = 127,
+       /* A reminder fired: user_id's, on message_id in channel_id, at
+        * server_time; saved_at and remind_at the item's. To that person's
+        * connections and their devices' push. A chain, one per reminder; an
+        * empty one (user_id 0) when none was due. */
+       OC_RES_REMINDER_DUE = 135 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -861,6 +871,7 @@ typedef struct {
     uint64_t message_id, channel_id, author_id, created_at, saved_at;
     char    *body, *attach_name;   /* heap */
     uint8_t  action;               /* body is the action text (REQ-058) */
+    uint64_t remind_at;            /* its reminder (REQ-283), 0 for none */
 } oc_saved_row;
 
 /* One activity item (REQ-139). `text` is the message body for a mention or a
@@ -1044,6 +1055,7 @@ typedef struct {
      * into a SAVED_UPDATED, exactly as pins do above. */
     uint8_t  saved;
     uint64_t saved_at;
+    uint64_t remind_at;   /* the saved item's reminder (REQ-283), 0 for none */
     /* Folded away by the REQUESTING user, likewise private to them: the net
      * thread replays it as a COLLAPSED_UPDATED down this connection. */
     uint8_t  collapsed;
@@ -1284,6 +1296,7 @@ typedef struct oc_dbres {
     /* Saved items + activity (REQ-231/139). */
     uint8_t          save_op;
     uint64_t         saved_at;
+    uint64_t         remind_at;     /* SAVED_OK and REMINDER_DUE: the reminder, 0 for none */
     oc_saved_row    *slist;
     size_t           n_slist;
     oc_activity_row *alist;

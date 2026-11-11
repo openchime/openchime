@@ -975,12 +975,13 @@ oc_result oc_encode_update_channel(oc_wbuf *w, uint16_t version, const oc_update
 
 oc_result oc_encode_save_item(oc_wbuf *w, uint16_t version, const oc_save_item *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_SAVE_ITEM);
-    oc_w_u64(w, m->message_id); oc_w_u8(w, m->op);
+    oc_w_u64(w, m->message_id); oc_w_u8(w, m->op); oc_w_u64(w, m->remind_at_ms);
     return oc_frame_end(w, off);
 }
 oc_result oc_encode_saved_updated(oc_wbuf *w, uint16_t version, const oc_saved_updated *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_SAVED_UPDATED);
     oc_w_u64(w, m->message_id); oc_w_u8(w, m->op); oc_w_u64(w, m->saved_at);
+    oc_w_u64(w, m->remind_at_ms);
     return oc_frame_end(w, off);
 }
 oc_result oc_encode_list_saved(oc_wbuf *w, uint16_t version) {
@@ -993,6 +994,7 @@ oc_result oc_encode_saved_msg(oc_wbuf *w, uint16_t version, const oc_saved_msg *
     oc_w_u64(w, m->server_time); oc_w_u64(w, m->saved_at);
     oc_w_str(w, m->body); oc_w_str(w, m->attach_name);
     oc_w_u8(w, m->action);
+    oc_w_u64(w, m->remind_at_ms);
     return oc_frame_end(w, off);
 }
 oc_result oc_encode_saved(oc_wbuf *w, uint16_t version, const oc_saved *m) {
@@ -3299,11 +3301,12 @@ oc_result oc_decode_update_channel(oc_rbuf *p, oc_update_channel *m) {
 }
 
 oc_result oc_decode_save_item(oc_rbuf *p, oc_save_item *m) {
-    m->message_id = oc_r_u64(p); m->op = oc_r_u8(p);
+    m->message_id = oc_r_u64(p); m->op = oc_r_u8(p); m->remind_at_ms = oc_r_u64(p);
     return r_done(p);
 }
 oc_result oc_decode_saved_updated(oc_rbuf *p, oc_saved_updated *m) {
     m->message_id = oc_r_u64(p); m->op = oc_r_u8(p); m->saved_at = oc_r_u64(p);
+    m->remind_at_ms = oc_r_u64(p);
     return r_done(p);
 }
 oc_result oc_decode_saved_msg(oc_rbuf *p, oc_saved_msg *m) {
@@ -3311,6 +3314,7 @@ oc_result oc_decode_saved_msg(oc_rbuf *p, oc_saved_msg *m) {
     m->server_time = oc_r_u64(p); m->saved_at = oc_r_u64(p);
     m->body = oc_r_str(p); m->attach_name = oc_r_str(p);
     m->action = oc_r_u8(p);
+    m->remind_at_ms = oc_r_u64(p);
     return r_done(p);
 }
 oc_result oc_decode_saved(oc_rbuf *p, oc_saved *m) {

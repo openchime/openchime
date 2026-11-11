@@ -116,6 +116,7 @@ static void msg_untombstone(oc_msg *msg, const char *body) {
 static void msg_set_saved(oc_msg *msg, const oc_ev *e) {
     msg->saved    = (e->op == 1);
     msg->saved_at = (e->op == 1) ? e->pinned_at : 0;   /* the ev's timestamp slot */
+    msg->remind_at = (e->op == 1) ? e->remind_at : 0;  /* REQ-283 */
 }
 
 static void msg_set_pinned(oc_msg *msg, const oc_ev *e) {
@@ -1979,6 +1980,20 @@ static void set_status(oc_model *m, const char *s) {
     snprintf(m->status, sizeof m->status, "%s", s ? s : "");
 }
 
+uint64_t oc_model_reminder(const oc_model *m, uint64_t message_id) {
+    if (!m || !message_id) return 0;
+    for (size_t ci = 0; ci < m->n_channels; ci++)
+        for (size_t i = 0; i < m->channels[ci].n_msgs; i++)
+            if (m->channels[ci].msgs[i].message_id == message_id)
+                return m->channels[ci].msgs[i].saved ? m->channels[ci].msgs[i].remind_at : 0;
+    for (size_t i = 0; i < m->n_thread_msgs; i++)
+        if (m->thread_msgs[i].message_id == message_id)
+            return m->thread_msgs[i].saved ? m->thread_msgs[i].remind_at : 0;
+    for (size_t i = 0; i < m->n_saved; i++)
+        if (m->saved[i].message_id == message_id) return m->saved[i].remind_at;
+    return 0;
+}
+
 void oc_model_apply(oc_model *m, oc_ev *e) {
     switch (e->type) {
     case OC_EV_CONNECTED:
@@ -2315,6 +2330,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         sv->message_id = e->message_id; sv->channel_id = e->channel_id;
         sv->author_id  = e->author_id;  sv->server_time = e->server_time;
         sv->saved_at   = e->pinned_at;
+        sv->remind_at  = e->remind_at;   /* REQ-283 */
         sv->body = e->body ? strdup(e->body) : NULL;
         sv->action = e->action;   /* REQ-058 */
         snprintf(sv->attach_name, sizeof sv->attach_name, "%s", e->author_name);
@@ -2470,8 +2486,20 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                     m->n_saved--;
                     break;
                 }
+        /* A reminder set, changed or cleared (REQ-283) on any device. */
+        if (e->op == 1)
+            for (size_t i = 0; i < m->n_saved; i++)
+                if (m->saved[i].message_id == e->message_id) { m->saved[i].remind_at = e->remind_at; break; }
         break;
     case OC_EV_ACTIVITY: {
+        /* A reminder that comes due while connected arrives as one entry, not
+         * as part of a list: the frontend is told, once (REQ-283). */
+        if (e->status == OC_ACT_REMINDER && !(m->activity_open && m->activity_loading)) {
+            m->reminder_mid = e->message_id;
+            m->reminder_channel = e->channel_id;
+            m->reminder_seq++;
+            break;
+        }
         if (!m->activity_open || !m->activity_loading) break;
         if (m->n_activity == m->cap_activity) {
             size_t nc = m->cap_activity ? m->cap_activity * 2 : 32;

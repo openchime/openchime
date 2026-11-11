@@ -2437,7 +2437,11 @@ static void test_index_mentions(void) {
                            /* 0073's reply also in the channel. */
                            "ALTER TABLE messages DROP COLUMN also_channel;"
                            /* 0074's following every thread. */
-                           "ALTER TABLE notification_prefs DROP COLUMN follow_threads;",
+                           "ALTER TABLE notification_prefs DROP COLUMN follow_threads;"
+                           /* 0075's reminders on saved items. */
+                           "DROP INDEX idx_saved_remind;"
+                           "ALTER TABLE saved_items DROP COLUMN remind_at_ms;"
+                           "ALTER TABLE saved_items DROP COLUMN reminded_at_ms;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -10918,6 +10922,103 @@ static void test_move_message(void) {
     cleanup_db(path);
 }
 
+/* Reminders on saved items (REQ-283): set, changed, cleared; fired once on the
+ * scheduled tick at or after their time and not before; an activity entry for
+ * the owner alone; gone with the message. The clock is the real one, so "due"
+ * is a moment just past and "not yet" an hour ahead. */
+static oc_dbres *remind(oc_dbwriter *w, uint64_t uid, uint64_t mid, uint64_t at) {
+    oc_job *j = oc_job_new(OC_JOB_SAVE_ITEM, 65);
+    j->user_id = uid; j->message_id = mid; j->save_op = OC_SAVE_ADD; j->remind_at_ms = at;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static oc_dbres *fire_reminders(oc_dbwriter *w) {
+    oc_dbwriter_submit(w, oc_job_new(OC_JOB_FIRE_REMINDERS, 0));
+    return wait_result(w);
+}
+static int fired_for(oc_dbres *r, uint64_t uid, uint64_t mid) {   /* frees r */
+    int n = 0;
+    for (oc_dbres *t = r; t; t = t->next)
+        if (t->type == OC_RES_REMINDER_DUE && t->user_id == uid && t->message_id == mid) n++;
+    oc_dbres_free(r);
+    return n;
+}
+static int activity_has(oc_dbwriter *w, uint64_t uid, uint8_t kind, uint64_t mid) {
+    oc_dbres *r = list_activity(w, uid);
+    int found = 0;
+    for (size_t i = 0; r && i < r->n_alist; i++)
+        if (r->alist[i].kind == kind && r->alist[i].message_id == mid) found = 1;
+    oc_dbres_free(r);
+    return found;
+}
+static int raw_count(const char *path, const char *sql) {
+    sqlite3 *raw = NULL;
+    if (sqlite3_open(path, &raw) != SQLITE_OK) return -1;
+    int n = count_rows(raw, sql);
+    sqlite3_close(raw);
+    return n;
+}
+static void test_reminders(void) {
+    const char *path = tdb("remind.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "rm-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob = reg(w, "rm-bob", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0x61, sizeof idem);
+    uint64_t mid = send_msg(w, bob, idem, "call the plumber");
+    CHECK(mid);
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+
+    /* Set on an unsaved message: saved, with its reminder, for every device. */
+    oc_dbres *r = remind(w, alice, mid, now + 3600000u);
+    CHECK(r && r->type == OC_RES_SAVED_OK && r->user_id == alice && r->save_op == OC_SAVE_ADD &&
+          r->remind_at == now + 3600000u && r->saved_at != 0);
+    oc_dbres_free(r);
+    r = list_saved(w, alice);
+    CHECK(r && r->n_slist == 1 && r->slist[0].message_id == mid && r->slist[0].remind_at == now + 3600000u);
+    oc_dbres_free(r);
+    /* Not before its time. */
+    CHECK(fired_for(fire_reminders(w), alice, mid) == 0);
+    /* Changed to now: due at the boundary, fired once, and not again. */
+    oc_dbres_free(remind(w, alice, mid, now));
+    CHECK(fired_for(fire_reminders(w), alice, mid) == 1);
+    CHECK(fired_for(fire_reminders(w), alice, mid) == 0);
+    /* An activity entry of its own kind, for her and not for him. */
+    CHECK(activity_has(w, alice, OC_ACT_REMINDER, mid));
+    CHECK(!activity_has(w, bob, OC_ACT_REMINDER, mid));
+    /* Set again, it fires again; cleared, it does not, and the item stays. */
+    oc_dbres_free(remind(w, alice, mid, now - 1));
+    CHECK(fired_for(fire_reminders(w), alice, mid) == 1);
+    oc_dbres_free(remind(w, alice, mid, now - 1));
+    r = remind(w, alice, mid, 0);
+    CHECK(r && r->type == OC_RES_SAVED_OK && r->remind_at == 0);
+    oc_dbres_free(r);
+    CHECK(fired_for(fire_reminders(w), alice, mid) == 0);
+    CHECK(!activity_has(w, alice, OC_ACT_REMINDER, mid));
+    r = list_saved(w, alice);
+    CHECK(r && r->n_slist == 1 && r->slist[0].remind_at == 0);
+    oc_dbres_free(r);
+    /* Unsaving takes the reminder with it. */
+    oc_dbres_free(remind(w, alice, mid, now + 3600000u));
+    oc_dbres_free(save_item(w, alice, mid, OC_SAVE_REMOVE));
+    CHECK(raw_count(path, "SELECT COUNT(*) FROM saved_items WHERE remind_at_ms IS NOT NULL;") == 0);
+    /* Deleting the message takes it too. */
+    oc_dbres_free(remind(w, alice, mid, now - 1));
+    oc_job *dj = oc_job_new(OC_JOB_DELETE, 66);
+    dj->user_id = bob; dj->channel_id = OC_DEFAULT_CHANNEL; dj->message_id = mid;
+    oc_dbwriter_submit(w, dj);
+    oc_dbres_free(wait_result(w));
+    CHECK(fired_for(fire_reminders(w), alice, mid) == 0);
+    CHECK(raw_count(path, "SELECT COUNT(*) FROM saved_items WHERE remind_at_ms IS NOT NULL;") == 0);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_collapsed(void) {
     const char *path = tdb("collapsed.db");
     cleanup_db(path);
@@ -11231,6 +11332,7 @@ int run_dbwriter_tests(void) {
     test_collapsed();
     test_find_at_time();
     test_move_message();
+    test_reminders();
     test_custom_emoji();
     test_group_dm();
     test_avatar();

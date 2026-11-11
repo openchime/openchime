@@ -1319,7 +1319,8 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (oc_decode_saved_updated(&p, &su) == OC_OK) {
                 oc_ev *e = oc_ev_new(OC_EV_SAVED_UPDATED);
                 if (e) { e->message_id = su.message_id; e->op = su.op;
-                         e->pinned_at = su.saved_at; oc_queue_push(to_ui, e); }
+                         e->pinned_at = su.saved_at; e->remind_at = su.remind_at_ms;
+                         oc_queue_push(to_ui, e); }
             }
         } else if (hdr.msg_type == OC_MSG_COLLAPSED_UPDATED) {
             oc_set_collapsed sc;
@@ -1335,6 +1336,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->message_id = sm.message_id; e->channel_id = sm.channel_id;
                     e->author_id = sm.author_id;   e->server_time = sm.server_time;
                     e->pinned_at = sm.saved_at;
+                    e->remind_at = sm.remind_at_ms;   /* REQ-283 */
                     e->action = sm.action;   /* REQ-058 */
                     size_t an = sm.attach_name.len < sizeof e->author_name - 1
                               ? sm.attach_name.len : sizeof e->author_name - 1;
@@ -3613,7 +3615,7 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             if (c->type == OC_CMD_SAVE_ITEM) {
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_save_item si = { c->message_id, c->op };
+                oc_save_item si = { c->message_id, c->op, c->op ? c->server_time : 0 };
                 if (oc_encode_save_item(&w, OC_PROTOCOL_VERSION, &si) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
