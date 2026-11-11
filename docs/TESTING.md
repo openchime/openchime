@@ -1487,6 +1487,35 @@ The loop's own turn is the figure to compare.
 - The memory table reports **requested vs connected** and divides by the
   connections that actually established.
 
+### Speech models' memory
+
+Read-aloud and voice input each load a model on first use and release it after
+five idle minutes (`OC_TTS_IDLE_SECS`, `OC_STT_IDLE_SECS`). While one is loaded it
+is most of the daemon's memory. Measured on a 256 MB Fly machine (about 210 MB
+usable once the kernel takes its share), on the full build's daemon, sampling
+`VmRSS` every 0.2 s; summaries are off by default and were not loaded:
+
+| What the daemon did | Peak RSS | Free on the machine at the worst | Time |
+|---|---|---|---|
+| Idle | 23 MB | | |
+| Read aloud a 138-character message | 145 MB | 33 MB | 12.7 s |
+| Read aloud three full 120-character pieces | 168 MB | 23 MB | 100 s for 20 s of speech |
+| Heard a 5 s segment | 147 MB | 22 MB | 1.1 s |
+| Heard a 20 s segment, in one piece | 156 MB | 3 MB | 40 s |
+| Heard a 30 s segment, in one piece | 162 MB | 3 MB | 413 s |
+
+Both models are mapped from their files and used in place (`daemon/tts_data.c`,
+`session.use_ort_model_bytes_directly`), so under pressure the kernel drops their
+pages and reads them back rather than killing the daemon: memory stays under the
+machine's, and the time goes instead. Nothing was killed in these runs. The
+recognizer's working memory grows with what it hears at once, which is why the
+long segments left nothing free; the daemon now hears a segment longer than
+`OC_STT_WINDOW_SECS` (6 s) in windows of at most that, each cut at the quietest
+moment within `OC_STT_CUT_SEARCH_MS` of its limit (`daemon/stt_worker.c`), so a
+30 s segment holds no more at once than a 6 s one; the windowed figures are
+not yet measured on the 256 MB machine. Read-aloud already renders a message in
+pieces of at most 120 characters (`OC_TTS_SEGMENT_CHARS`).
+
 ---
 
 ## 6. Running the daemon by hand

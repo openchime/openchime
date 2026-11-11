@@ -52,4 +52,17 @@ int oc_stt_worker_next_result(oc_stt_worker *w, oc_stt_result *out);
 /* Whether the engine is open right now (for tests and the log). */
 int oc_stt_worker_engine_open(oc_stt_worker *w);
 
+/* Where the first window of `samples` (16 kHz, host order) ends: all of them
+ * when they fit in `max`, otherwise the middle of the quietest 20 ms within
+ * `search` samples before `max`. Always more than 0 and at most `max`. */
+size_t oc_stt_window(const int16_t *pcm, size_t samples, size_t max, size_t search);
+
+/* Hear a whole segment through `engine` (opened from `e`), in windows of at most
+ * OC_STT_WINDOW_SECS cut by oc_stt_window, the words of each joined with one
+ * space: the model's working memory is that of one window, whatever the
+ * segment's length. A window that fails fails the segment, with its reason. As
+ * the engine's own hear: 0 with `*text` malloc'd, or -1. */
+int oc_stt_hear_windowed(const oc_stt_engine *e, void *engine, const int16_t *pcm, size_t samples,
+                         char **text, char *err, size_t errcap);
+
 #endif

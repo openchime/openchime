@@ -109,6 +109,14 @@ segment; recognition takes 0.09–0.12× the length of the speech; peak memory i
 175 MB for a short sentence, 190 MB for six seconds and 360 MB for twenty. An idle
 daemon holds 0.1 MB more with voice input built in than without it.
 
+**Long segments are heard in windows.** The working memory grows with what the model
+hears at once, and on a 256 MB machine a 20 s segment left 3 MB free and a 30 s one took
+413 s, the kernel re-reading the model from disk (TESTING.md, "Speech models' memory").
+So a segment longer than `OC_STT_WINDOW_SECS` (6 s) is heard in windows of at most that,
+each ending at the quietest 20 ms within `OC_STT_CUT_SEARCH_MS` (1.5 s) of its limit, and
+the windows' words are joined with one space (`oc_stt_hear_windowed`,
+`daemon/stt_worker.c`). The daemon's worker and `openchimed --stt-hear` hear the same way.
+
 - **In C, on the runtime read-aloud links** (ARCH-111): the daemon runs the graph chain
   through ONNX Runtime's C API, as it runs Kitten, sharing one `OrtEnv`; the operator
   config is the union of both models'. `tokenizer.bin` is read in place; decoding

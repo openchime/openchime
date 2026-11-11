@@ -4,6 +4,7 @@
 
 #include "stt_moonshine.h"
 #include "stt_render.h"
+#include "stt_worker.h"
 #include "tts_data.h"
 #include "config.h"
 
@@ -176,7 +177,8 @@ int oc_stt_hear(const char *path) {
     if (!engine) { free(pcm); fprintf(stderr, "openchimed: %s\n", err); return 1; }
     double t1 = now_s();
     char *text = NULL;
-    int rc = engine_hear(engine, pcm, n, &text, err, sizeof err);
+    err[0] = '\0';
+    int rc = oc_stt_hear_windowed(&MOONSHINE_ENGINE, engine, pcm, n, &text, err, sizeof err);   /* as the daemon hears */
     double t2 = now_s();
     engine_close(engine);
     free(pcm);

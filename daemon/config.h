@@ -68,6 +68,9 @@ typedef enum {
 #define OC_STT_IDLE_SECS       300
 #define OC_STT_SEGS_PER_MIN    60      /* segments one connection may send a minute */
 #define OC_STT_MAX_SECS        30      /* the longest segment: the model's own limit */
+#define OC_STT_WINDOW_SECS     6       /* a longer segment is heard in windows this long at most:
+                                        * the model's working memory grows with what it hears at once */
+#define OC_STT_CUT_SEARCH_MS   1500    /* a window ends at the quietest moment this close to its limit */
 #define OC_CLAIM_WAIT_SECS     120     /* how long a managed box's first start waits for central */
 
 /* A direct connection (AUTH.md §8.5), from OPENCHIME_OIDC_CONNECT_<n>:
