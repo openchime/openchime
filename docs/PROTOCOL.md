@@ -213,8 +213,10 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 34** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 35** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 35 appended `thread_root` to `TYPING` and `TYPING_UPDATE`, so typing shows in
+> the thread it is in (§5.13, REQ-121). Version
 > 34 appended `n_repliers` and the repliers' ids to `THREAD_META`, which is now
 > also sent live when a reply is posted or deleted (§5.10). Version
 > 33 appended `family`, `actor_id` and `action` to `AUDIT_QUERY`, filters the
@@ -1542,18 +1544,24 @@ a maintenance tick re-announces a user whose answer differs from what they were
 last announced as. Only a frame can untell the people who were told, and
 comparing rather than re-announcing keeps an idle deployment silent.
 
-**`TYPING` (client → server), msg_type `0x007E`** `{ channel_id: u64 }` — the
-caller signals they are composing in `channel_id`. The server resolves the
+**`TYPING` (client → server), msg_type `0x007E`** `{ channel_id: u64,
+thread_root: u64 }` — the caller signals they are composing in `channel_id`: in
+the thread whose root is `thread_root`, or in the main scroll when it is `0`
+(REQ-121; since version 35). The server resolves the
 channel's members (on the read connection, ARCH-66) and, if the caller has access,
 relays to the other connected members only — private-channel and DM typing never
 leaks to non-members. A connection's signals past 3 per 2 seconds are dropped
 without reply; the next says the same.
 
 **`TYPING_UPDATE` (server → client), msg_type `0x007F`** `{ channel_id: u64,
-user_id: u64 }` — delivered to each connected member of `channel_id` except the
-sender. There is **no expiry frame and no "stopped typing" signal**: the client
-displays the indicator and expires it locally after **~6 seconds**, refreshed by
-each new `TYPING_UPDATE` for that `(channel, user)`.
+user_id: u64, thread_root: u64 }` — delivered to each connected member of
+`channel_id` except the sender, with the `thread_root` it was sent with,
+relayed as it came: it reaches only the channel's members, and a client shows
+it only in that thread's pane (or the main scroll's, for `0`), so a wrong one
+shows nowhere. There is **no expiry frame and no "stopped typing" signal**: the
+client displays the indicator and expires it locally after **~6 seconds**,
+refreshed by each new `TYPING_UPDATE` for that `(channel, user)`, which also
+moves it to the thread that update names.
 
 ---
 

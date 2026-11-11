@@ -1499,17 +1499,23 @@ static void test_presence_frames(void) {
         CHECK(oc_decode_snooze(&p, &out) == OC_OK && out.until_ms == 1785620669000ull);
     }
     {
-        oc_typing in = { 7 };
+        oc_typing in = { 7, 500 };   /* in a thread (REQ-121) */
         ROUNDTRIP(oc_encode_typing(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TYPING, h, p);
         oc_typing out;
-        CHECK(oc_decode_typing(&p, &out) == OC_OK && out.channel_id == 7);
+        CHECK(oc_decode_typing(&p, &out) == OC_OK && out.channel_id == 7 && out.thread_root == 500);
     }
     {
-        oc_typing_update in = { 7, 42 };
+        oc_typing_update in = { 7, 42, 500 };
         ROUNDTRIP(oc_encode_typing_update(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TYPING_UPDATE, h, p);
         oc_typing_update out;
         CHECK(oc_decode_typing_update(&p, &out) == OC_OK);
-        CHECK(out.channel_id == 7 && out.user_id == 42);
+        CHECK(out.channel_id == 7 && out.user_id == 42 && out.thread_root == 500);
+    }
+    {
+        oc_typing_update in = { 7, 42, 0 };   /* the main scroll */
+        ROUNDTRIP(oc_encode_typing_update(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TYPING_UPDATE, h, p);
+        oc_typing_update out;
+        CHECK(oc_decode_typing_update(&p, &out) == OC_OK && out.thread_root == 0);
     }
 }
 

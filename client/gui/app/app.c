@@ -8278,8 +8278,23 @@ static void draw_thread(gfx *rt, const oc_model *m, rectf reg) {
         gfx_clip_pop(rt);
         top += ph + 4;
     }
-    char rc[48];
+    char rc[240];
     snprintf(rc, sizeof rc, "%zu %s", m->n_thread_msgs, m->n_thread_msgs == 1 ? "reply" : "replies");
+    {   /* Who is typing a reply in THIS thread (REQ-121), beside the count. */
+        uint64_t who[4];
+        size_t nt = oc_model_typing(m, m->thread_channel, m->thread_parent, m->user_id, who, 4);
+        size_t at = strlen(rc);
+        if (nt == 1) {
+            const char *n1 = oc_model_user_name(m, who[0]);
+            snprintf(rc + at, sizeof rc - at, "  ·  %s is typing…", (n1 && n1[0]) ? n1 : "someone");
+        } else if (nt == 2) {
+            const char *n1 = oc_model_user_name(m, who[0]), *n2 = oc_model_user_name(m, who[1]);
+            snprintf(rc + at, sizeof rc - at, "  ·  %s and %s are typing…",
+                     (n1 && n1[0]) ? n1 : "someone", (n2 && n2[0]) ? n2 : "someone");
+        } else if (nt > 2) {
+            snprintf(rc + at, sizeof rc - at, "  ·  several people are typing…");
+        }
+    }
     fill(rt, rf(body.left, top, body.right, top + 1), OC_COL_BORDER);
     draw_text(rt, rc, g_meta, rf(body.left + 20, top + 2, body.right - 16, top + 22), OC_COL_FAINT);
     rectf replies = rf(body.left, top + 24, body.right, body.bottom);
@@ -11368,11 +11383,12 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         snprintf(title, sizeof title, "%s", t2);
     }
 
-    /* Someone typing in this channel? -> a subtitle under the title. */
+    /* Someone typing in this channel's main scroll? -> a subtitle under the
+     * title. Typing in one of its threads shows in that thread's pane. */
     char typing[192] = "";
     if (c) {
         uint64_t who[4];
-        size_t nt = oc_model_typing(m, g_sel, m->user_id, who, 4);
+        size_t nt = oc_model_typing(m, g_sel, 0, m->user_id, who, 4);
         if (nt == 1) {
             const char *n1 = oc_model_user_name(m, who[0]);
             snprintf(typing, sizeof typing, "%s is typing…", (n1 && n1[0]) ? n1 : "someone");
@@ -24766,7 +24782,11 @@ static void ed_changed(oc_win *hwnd) {
         /* Not from the New message pane: its text is for somebody who is not in
          * the channel g_sel names, and they would see you typing into theirs. */
         if (g_view != VIEW_NEWMSG) {
-            oc_client_typing(g_client, g_sel);
+            /* In a thread when the box replies in one (composer_send), so it
+             * shows in that thread's pane and not in the main scroll (REQ-121). */
+            const oc_model *tm = model();
+            if (tm && tm->thread_open) oc_client_typing(g_client, tm->thread_channel, tm->thread_parent);
+            else oc_client_typing(g_client, g_sel, 0);
             g_last_typing = now;
         }
     }

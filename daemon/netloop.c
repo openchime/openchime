@@ -3451,6 +3451,10 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (!j) return -1;
             j->user_id = c->user_id;
             j->channel_id = t.channel_id;
+            /* The thread being replied in, relayed as it came (REQ-121): it
+             * reaches only the channel's members, and a client shows it only in
+             * that thread's pane, so a wrong one shows nowhere. */
+            j->parent_id = t.thread_root;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -7297,7 +7301,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         /* Relay to every connected member except the typer (REQ-121). Members is
          * empty if the typer couldn't read the channel, so nothing leaks. */
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
-        oc_typing_update tu = { r->channel_id, r->author_id };
+        oc_typing_update tu = { r->channel_id, r->author_id, r->parent_id };
         oc_encode_typing_update(&w, OC_PROTOCOL_VERSION, &tu);
         size_t len = w.len;
         fanout_members(ep, conns, r->members, r->n_members, r->author_id, g_enc, len);

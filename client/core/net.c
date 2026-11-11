@@ -1538,7 +1538,9 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             oc_typing_update tu;
             if (oc_decode_typing_update(&p, &tu) == OC_OK) {
                 oc_ev *e = oc_ev_new(OC_EV_TYPING);
-                if (e) { e->channel_id = tu.channel_id; e->user_id = tu.user_id; oc_queue_push(to_ui, e); }
+                if (e) { e->channel_id = tu.channel_id; e->user_id = tu.user_id;
+                         e->parent_id = tu.thread_root;   /* the thread, 0 the main scroll (REQ-121) */
+                         oc_queue_push(to_ui, e); }
             }
         } else if (hdr.msg_type == OC_MSG_MSG_EDITED) {
             oc_msg_edited me;
@@ -3449,7 +3451,7 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             if (c->type == OC_CMD_TYPING) {
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_typing ty = { c->channel_id };
+                oc_typing ty = { c->channel_id, c->message_id };   /* message_id: the thread root */
                 if (oc_encode_typing(&w, OC_PROTOCOL_VERSION, &ty) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }

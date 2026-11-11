@@ -8286,6 +8286,7 @@ static oc_dbres *process_typing(sqlite3 *db, const oc_job *j) {
     r->type = OC_RES_TYPING;
     r->channel_id = j->channel_id;
     r->author_id = j->user_id;   /* the user who is typing */
+    r->parent_id = j->parent_id; /* ...and in which thread, 0 the main scroll (REQ-121) */
     if (channel_read_access(db, j->channel_id, j->user_id)) {
         load_members(db, j->channel_id, r);
         /* A visitor is told nobody is typing (SCHEMA.md §3bj): the relay lists

@@ -158,9 +158,11 @@ void oc_client_react(oc_client *c, uint64_t channel_id, uint64_t message_id,
 void oc_client_edit(oc_client *c, uint64_t channel_id, uint64_t message_id, const char *body);
 void oc_client_delete(oc_client *c, uint64_t channel_id, uint64_t message_id);
 
-/* Signal "I am typing" in `channel_id`. The frontend calls this (throttled) as
- * the user composes; the server relays a TYPING_UPDATE to other members. */
-void oc_client_typing(oc_client *c, uint64_t channel_id);
+/* Signal "I am typing" in `channel_id`, in the thread `thread_root` the composer
+ * is replying in, or 0 for the main scroll (REQ-121). The frontend calls this
+ * (throttled) as the user composes; the server relays a TYPING_UPDATE to other
+ * members. */
+void oc_client_typing(oc_client *c, uint64_t channel_id, uint64_t thread_root);
 
 /* Open a thread on `parent_id` (requests its replies), post a reply to it, or
  * close the thread view. Replies stream into the model's thread buffer. */

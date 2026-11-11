@@ -1451,7 +1451,10 @@ static void attach_to_msg(oc_model *m, const oc_ev *e) {
 }
 
 /* Record that `user_id` is typing in `channel_id` now, pruning stale marks. */
-static void typing_touch(oc_model *m, uint64_t channel_id, uint64_t user_id) {
+/* A typing mark: who, where, and in which thread (0 the main scroll, REQ-121).
+ * One mark per person per conversation -- someone types in one place at a time,
+ * so a mark from them elsewhere in it moves it there. */
+static void typing_touch(oc_model *m, uint64_t channel_id, uint64_t user_id, uint64_t thread_root) {
     long long now = (long long)time(NULL);
     size_t w = 0, found = (size_t)-1;
     for (size_t i = 0; i < m->n_typing; i++) {
@@ -1460,7 +1463,7 @@ static void typing_touch(oc_model *m, uint64_t channel_id, uint64_t user_id) {
         m->typing[w++] = m->typing[i];
     }
     m->n_typing = w;
-    if (found != (size_t)-1) { m->typing[found].seen = now; return; }
+    if (found != (size_t)-1) { m->typing[found].seen = now; m->typing[found].thread_root = thread_root; return; }
     if (m->n_typing == m->cap_typing) {
         size_t cap = m->cap_typing ? m->cap_typing * 2 : 8;
         oc_typing_row *nt = realloc(m->typing, cap * sizeof *nt);
@@ -1469,16 +1472,18 @@ static void typing_touch(oc_model *m, uint64_t channel_id, uint64_t user_id) {
     }
     m->typing[m->n_typing].channel_id = channel_id;
     m->typing[m->n_typing].user_id = user_id;
+    m->typing[m->n_typing].thread_root = thread_root;
     m->typing[m->n_typing].seen = now;
     m->n_typing++;
 }
 
-size_t oc_model_typing(const oc_model *m, uint64_t channel_id, uint64_t exclude,
+size_t oc_model_typing(const oc_model *m, uint64_t channel_id, uint64_t thread_root, uint64_t exclude,
                        uint64_t *out, size_t cap) {
     long long now = (long long)time(NULL);
     size_t n = 0;
     for (size_t i = 0; i < m->n_typing && n < cap; i++) {
         if (m->typing[i].channel_id != channel_id) continue;
+        if (m->typing[i].thread_root != thread_root) continue;   /* that thread, or the main scroll */
         if (m->typing[i].user_id == exclude) continue;
         if (now - m->typing[i].seen > OC_TYPING_TIMEOUT) continue;
         out[n++] = m->typing[i].user_id;
@@ -2233,7 +2238,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                      e->server_time != 0);
         break;
     case OC_EV_TYPING:
-        typing_touch(m, e->channel_id, e->user_id);
+        typing_touch(m, e->channel_id, e->user_id, e->parent_id);
         break;
     case OC_EV_CHAN_MEMBER: {
         /* Only for the roster currently being loaded — a late frame from a

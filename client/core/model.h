@@ -297,7 +297,8 @@ typedef struct {
 } oc_member;
 
 /* An ephemeral "user is typing in channel" mark, expiring on a timeout. */
-typedef struct { uint64_t channel_id; uint64_t user_id; long long seen; } oc_typing_row;
+/* `thread_root`: the thread they type in, 0 for the main scroll (REQ-121). */
+typedef struct { uint64_t channel_id; uint64_t user_id; long long seen; uint64_t thread_root; } oc_typing_row;
 
 /* One full-text search hit (REQ-080). */
 typedef struct { uint64_t message_id, channel_id, author_id, server_time; char *snippet;
@@ -1399,9 +1400,10 @@ uint64_t oc_model_listen_take_audio(oc_model *m, uint8_t **mp4, size_t *len);
  * last chosen is worth hearing. */
 int      oc_model_preview_take_audio(oc_model *m, uint8_t **mp4, size_t *len);
 
-/* User ids currently typing in `channel_id` (last seen within the timeout),
- * excluding `exclude` (typically self). Fills `out` up to `cap`; returns count. */
-size_t oc_model_typing(const oc_model *m, uint64_t channel_id, uint64_t exclude,
+/* User ids currently typing in `channel_id` (last seen within the timeout), in
+ * the thread `thread_root` -- 0 for the main scroll (REQ-121) -- excluding
+ * `exclude` (typically self). Fills `out` up to `cap`; returns count. */
+size_t oc_model_typing(const oc_model *m, uint64_t channel_id, uint64_t thread_root, uint64_t exclude,
                        uint64_t *out, size_t cap);
 
 #endif /* OC_MODEL_H */

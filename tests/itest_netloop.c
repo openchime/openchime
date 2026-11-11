@@ -1326,12 +1326,22 @@ static void test_presence_typing(int port, const uint8_t *pin) {
 
     /* bob types in the shared channel -> alice (a member) gets TYPING_UPDATE. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_typing ty = { 1 };
+    oc_typing ty = { 1, 0 };
     CHECK(oc_encode_typing(&w, OC_PROTOCOL_VERSION, &ty) == OC_OK);
     CHECK(send_frame(&b, buf, w.len) == 0);
     CHECK(read_frame_raw(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_TYPING_UPDATE);
     oc_typing_update tu; CHECK(oc_decode_typing_update(&p, &tu) == OC_OK);
-    CHECK(tu.channel_id == 1 && tu.user_id == ub);
+    CHECK(tu.channel_id == 1 && tu.user_id == ub && tu.thread_root == 0);   /* the main scroll */
+
+    /* ...and in a thread: the root comes through as sent (REQ-121). The rate
+     * limit allows this second one well inside its window. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_typing tth = { 1, 777 };
+    CHECK(oc_encode_typing(&w, OC_PROTOCOL_VERSION, &tth) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_frame_raw(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_TYPING_UPDATE);
+    CHECK(oc_decode_typing_update(&p, &tu) == OC_OK);
+    CHECK(tu.channel_id == 1 && tu.user_id == ub && tu.thread_root == 777);
 
     /* alice disconnects -> bob sees her offline. */
     client_close(&a);
@@ -6964,7 +6974,7 @@ static void test_fanout_limits(int port, const uint8_t *pin) {
     /* Typing: ten in a burst, three reach the other member. */
     for (int i = 0; i < 10; i++) {
         oc_wbuf_init(&w, buf, sizeof buf);
-        oc_typing ty = { 1 };
+        oc_typing ty = { 1, 0 };
         CHECK(oc_encode_typing(&w, OC_PROTOCOL_VERSION, &ty) == OC_OK);
         CHECK(send_frame(&b, buf, w.len) == 0);
     }
@@ -7017,7 +7027,7 @@ static void test_fanout_limits(int port, const uint8_t *pin) {
      * past their limit they cost the daemon nothing but the read. */
     {
         oc_wbuf_init(&w, buf, sizeof buf);
-        oc_typing ty = { 1 };
+        oc_typing ty = { 1, 0 };
         CHECK(oc_encode_typing(&w, OC_PROTOCOL_VERSION, &ty) == OC_OK);
         size_t one = w.len, total = 2u << 20, n = total / one;
         uint8_t *burst = malloc(n * one);

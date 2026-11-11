@@ -202,7 +202,7 @@
  * ids, the thread's most recent distinct repliers, newest first, and is sent
  * live to the channel's members when a reply is posted or deleted, not only in
  * backfill (REQ-060). Fields appended to a fixed layout. */
-#define OC_PROTOCOL_VERSION 34u
+#define OC_PROTOCOL_VERSION 35u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -1414,8 +1414,10 @@ typedef struct { uint8_t status; } oc_set_presence;
  * never the end time. Appended after `status`, and decoded tolerantly, so a peer
  * built before it existed still reads the frame it always read. */
 typedef struct { uint64_t user_id; uint8_t status; uint8_t dnd; } oc_presence_update;
-typedef struct { uint64_t channel_id; } oc_typing;
-typedef struct { uint64_t channel_id; uint64_t user_id; } oc_typing_update;
+/* `thread_root` (REQ-121): the thread the typer is composing in, 0 for the
+ * channel's main scroll. Appended to both: protocol 35. */
+typedef struct { uint64_t channel_id; uint64_t thread_root; } oc_typing;
+typedef struct { uint64_t channel_id; uint64_t user_id; uint64_t thread_root; } oc_typing_update;
 /* Notification preferences (REQ-130/131). */
 typedef struct { uint64_t channel_id; uint8_t level; } oc_set_notify_pref;
 /* The notification schedule (REQ-136, ARCH-103). `mode`: 0 off, 1 every day,

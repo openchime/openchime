@@ -1764,7 +1764,12 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             sx = tk_text(sx, H - 3, W, line, th->accent, TB_DEFAULT);
         }
         if (fc) {
-            uint64_t tp[8]; size_t nt = oc_model_typing(m, fc->channel_id, m->user_id, tp, 8);
+            /* Where this person is writing: the open thread, whose replies the
+             * composer sends, or the main scroll (REQ-121). */
+            uint64_t tp[8];
+            size_t nt = m->thread_open
+                ? oc_model_typing(m, m->thread_channel, m->thread_parent, m->user_id, tp, 8)
+                : oc_model_typing(m, fc->channel_id, 0, m->user_id, tp, 8);
             if (nt) {
                 char tl[140];
                 if (nt == 1) snprintf(tl, sizeof tl, "  ✎ %s is typing…", name_for(fc, tp[0]));
@@ -4237,7 +4242,9 @@ int main(int argc, char **argv) {
             /* Signal typing while composing a message (not a /command), throttled. */
             time_t now = time(NULL);
             if (focus < nch && composer[0] != '/' && now - last_typing >= 3) {
-                oc_client_typing(cl, oc_client_model(cl)->channels[focus].channel_id);
+                const oc_model *tm = oc_client_model(cl);
+                if (tm->thread_open) oc_client_typing(cl, tm->thread_channel, tm->thread_parent);
+                else                 oc_client_typing(cl, tm->channels[focus].channel_id, 0);
                 last_typing = now;
             }
         }

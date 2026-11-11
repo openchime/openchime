@@ -416,11 +416,12 @@ size_t oc_client_call_notify_take(oc_client *c, int quiet, int paused,
     return c ? oc_model_call_notify_take(&c->model, quiet, paused, out, max) : 0;
 }
 
-void oc_client_typing(oc_client *c, uint64_t channel_id) {
+void oc_client_typing(oc_client *c, uint64_t channel_id, uint64_t thread_root) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_TYPING);
     if (!cmd) return;
     cmd->channel_id = channel_id;
+    cmd->message_id = thread_root;   /* the thread the composer is in, 0 the main scroll */
     oc_queue_push(&c->cmds, cmd);
 }
 

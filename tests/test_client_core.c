@@ -6254,9 +6254,14 @@ int run_client_core_tests(void) {
         /* erik signals typing in channel 1; dana sees erik (and only erik) typing
          * (the server relays to other members, so dana's own view excludes her). */
         uint64_t erik_id = oc_client_model(b)->user_id;
-        oc_client_typing(b, 1);
+        oc_client_typing(b, 1, 0);
         uint64_t typers[4];
-        CHECK(WAIT_FOR(a, oc_model_typing(m, 1, m->user_id, typers, 4) == 1));
+        CHECK(WAIT_FOR(a, oc_model_typing(m, 1, 0, m->user_id, typers, 4) == 1));
+        CHECK(typers[0] == erik_id);
+        /* In a thread (REQ-121): shown there, and no longer in the main scroll. */
+        oc_client_typing(b, 1, 4242);
+        CHECK(WAIT_FOR(a, oc_model_typing(m, 1, 4242, m->user_id, typers, 4) == 1 &&
+                          oc_model_typing(m, 1, 0, m->user_id, typers + 1, 3) == 0));
         CHECK(typers[0] == erik_id);
 
         /* erik reacts to dana's message: both see the aggregate (count 1), erik

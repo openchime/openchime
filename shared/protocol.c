@@ -1367,6 +1367,7 @@ oc_result oc_decode_snooze(oc_rbuf *p, oc_snooze *m) {
 oc_result oc_encode_typing(oc_wbuf *w, uint16_t version, const oc_typing *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_TYPING);
     oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->thread_root);
     return oc_frame_end(w, off);
 }
 
@@ -1374,6 +1375,7 @@ oc_result oc_encode_typing_update(oc_wbuf *w, uint16_t version, const oc_typing_
     size_t off = oc_frame_begin(w, version, OC_MSG_TYPING_UPDATE);
     oc_w_u64(w, m->channel_id);
     oc_w_u64(w, m->user_id);
+    oc_w_u64(w, m->thread_root);
     return oc_frame_end(w, off);
 }
 
@@ -3406,12 +3408,14 @@ oc_result oc_decode_presence_update(oc_rbuf *p, oc_presence_update *m) {
 
 oc_result oc_decode_typing(oc_rbuf *p, oc_typing *m) {
     m->channel_id = oc_r_u64(p);
+    m->thread_root = oc_r_u64(p);   /* REQ-121: 0 is the main scroll */
     return r_done(p);
 }
 
 oc_result oc_decode_typing_update(oc_rbuf *p, oc_typing_update *m) {
     m->channel_id = oc_r_u64(p);
     m->user_id = oc_r_u64(p);
+    m->thread_root = oc_r_u64(p);
     return r_done(p);
 }
 
