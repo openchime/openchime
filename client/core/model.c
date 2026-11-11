@@ -1547,6 +1547,8 @@ int oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_stored,
     if (n > OC_MENTION_MAX) n = OC_MENTION_MAX;
     const char *me = oc_model_user_name(m, m->user_id);
     for (size_t i = 0; i < n; i++) {
+        /* A mention inside a spoiler notifies nobody (MARKDOWN.md §1d). */
+        if (oc_rt_in_spoiler(body, len, mm[i].start)) continue;
         if (mm[i].kind != OC_MENTION_USER) { bc = 1; continue; }
         /* The id form (<@U42>) names whoever the id is; its label is no name. */
         if (mm[i].user_id) { if (m->user_id && mm[i].user_id == m->user_id) return 1; continue; }
@@ -1560,11 +1562,9 @@ int oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_stored,
 
 int oc_model_mentions_me(const oc_model *m, const char *body, size_t len) {
     if (!m || !body) return 0;
-    if (oc_mention_targets(body, len, oc_model_user_name(m, m->user_id), m->user_id)) return 1;
-    for (size_t i = 0; i < m->n_groups; i++)
-        if (oc_model_in_group(m->groups[i], m->user_id) && oc_mention_targets(body, len, m->groups[i]->handle, 0))
-            return 1;
-    return 0;
+    /* Any broadcast counts here, as oc_mention_targets counts one; what is in a
+     * spoiler counts for nothing (MARKDOWN.md §1d). */
+    return oc_model_mentions_me_in(m, 1, body, len);
 }
 
 /* The roster's name for an id-form mention, or NULL for an id it lacks. */
@@ -1790,7 +1790,7 @@ int oc_model_keyword_hit(const oc_model *m, const char *body, size_t len,
                          size_t *span_start, size_t *span_len) {
     if (!m || !body || !len) return 0;
     for (uint8_t i = 0; i < m->n_kw_terms; i++)
-        if (oc_keyword_match(body, len, m->kw_terms[i], span_start, span_len)) return 1;
+        if (oc_rt_keyword_match(body, len, m->kw_terms[i], span_start, span_len)) return 1;
     return 0;
 }
 

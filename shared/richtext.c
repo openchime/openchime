@@ -18,6 +18,7 @@
 #include "richtext.h"
 
 #include "url.h"   /* shared/: the address rules the daemon must agree with */
+#include "mention.h"   /* oc_keyword_match, which oc_rt_keyword_match keeps out of spoilers */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -908,6 +909,114 @@ char *oc_rt_spoilers_covered(const char *body, size_t len) {
     o += len - i;
     out[o] = '\0';
     return out;
+}
+
+/* Every spoiler in `body`, however many: a malloc'd list in *out, or NULL with
+ * none (or no memory, which *nomem says). */
+static size_t all_spoilers(const char *body, size_t len, oc_rt_spoiler **out, int *nomem) {
+    size_t n = oc_rt_spoilers(body, len, NULL, 0);
+    *out = NULL;
+    if (nomem) *nomem = 0;
+    if (!n) return 0;
+    *out = malloc(n * sizeof **out);
+    if (!*out) { if (nomem) *nomem = 1; return 0; }
+    return oc_rt_spoilers(body, len, *out, n);
+}
+
+size_t oc_rt_unspoiled(const char *body, size_t len, char *out, size_t cap) {
+    oc_rt_spoiler *sp;
+    size_t n, i = 0, o = 0;
+    int nomem;
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    if (!body) return 0;
+    n = all_spoilers(body, len, &sp, &nomem);
+    /* Short of memory, nothing rather than something hidden. */
+    if (nomem) return 0;
+    for (size_t k = 0; k <= n && o + 1 < cap; k++) {
+        size_t upto = k < n ? sp[k].hidden : len, m = upto > i ? upto - i : 0;
+        if (m > cap - 1 - o) m = cap - 1 - o;
+        memcpy(out + o, body + i, m);
+        o += m;
+        if (k < n) i = sp[k].hidden + sp[k].hidden_len;
+    }
+    free(sp);
+    /* Never end inside a character. */
+    {
+        size_t j = o, want;
+        unsigned char lead;
+        while (j > 0 && ((unsigned char)out[j - 1] & 0xC0) == 0x80) j--;
+        if (j > 0) {
+            lead = (unsigned char)out[j - 1];
+            want = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+            if (o - (j - 1) < want) o = j - 1;
+        }
+    }
+    out[o] = '\0';
+    return o;
+}
+
+int oc_rt_in_spoiler(const char *body, size_t len, size_t offset) {
+    oc_rt_spoiler *sp;
+    size_t n;
+    int in = 0, nomem;
+    if (!body || offset >= len) return 0;
+    n = all_spoilers(body, len, &sp, &nomem);
+    if (nomem) return 1;   /* cannot tell: treat as hidden, the side that shows less */
+    for (size_t k = 0; k < n && !in; k++)
+        in = offset >= sp[k].hidden && offset < sp[k].hidden + sp[k].hidden_len;
+    free(sp);
+    return in;
+}
+
+size_t oc_rt_open_spoiler(const char *body, size_t len) {
+    oc_rt_spoiler *sv = NULL;
+    oc_rt_span *sp = NULL;
+    size_t nsv, ns, at = RT_NONE;
+    int nomem;
+    if (!body || len < 2 || !memchr(body, '>', len)) return RT_NONE;
+    nsv = all_spoilers(body, len, &sv, &nomem);
+    if (nomem) return RT_NONE;
+    ns = oc_rt_scan(body, len, NULL, 0);
+    if (ns) {
+        sp = malloc(ns * sizeof *sp);
+        if (!sp) { free(sv); return RT_NONE; }
+        ns = oc_rt_scan(body, len, sp, ns);
+    }
+    for (size_t i = 0; i + 1 < len && at == RT_NONE; i++) {
+        int skip = 0;
+        if (body[i] != '>' || body[i + 1] != '!') continue;
+        if (i && body[i - 1] == '\\') continue;                 /* written literally */
+        for (size_t k = 0; k < nsv && !skip; k++)
+            skip = i >= sv[k].start && i < sv[k].start + sv[k].len;
+        for (size_t k = 0; k < ns && !skip; k++)
+            skip = (sp[k].style & (OC_RT_CODE | OC_RT_CODEBLOCK)) &&
+                   i >= sp[k].start && i < sp[k].start + sp[k].len;
+        if (!skip) at = i;
+    }
+    free(sp);
+    free(sv);
+    return at;
+}
+
+int oc_rt_keyword_match(const char *body, size_t len, const char *term,
+                        size_t *span_start, size_t *span_len) {
+    size_t from = 0, at = 0, n = 0;
+    if (!body || !term) return 0;
+    while (from < len && oc_keyword_match(body + from, len - from, term, &at, &n)) {
+        /* A match at the start of what is left: the byte before it decides the
+         * boundary oc_keyword_match could not see. */
+        unsigned char left = from && at == 0 ? (unsigned char)body[from - 1] : ' ';
+        int wordish = (left >= 'a' && left <= 'z') || (left >= 'A' && left <= 'Z') ||
+                      (left >= '0' && left <= '9') || left == '_';
+        if (!wordish && !oc_rt_in_spoiler(body, len, from + at)) {
+            if (span_start) *span_start = from + at;
+            if (span_len)   *span_len = n;
+            return 1;
+        }
+        from += at + 1;
+    }
+    return 0;
 }
 
 size_t oc_rt_visible_urls(const char *body, size_t len, oc_url_span *out, size_t max) {

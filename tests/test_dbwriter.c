@@ -2397,7 +2397,7 @@ static void test_index_mentions(void) {
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
     /* Back to before step 60; the columns of steps 61 to 63 go too (with 63's
-     * triggers, back to step 6's), so that they can run again. */
+     * and 72's triggers, back to step 6's), so that they can run again. */
     CHECK(sqlite3_exec(db, "DELETE FROM mentions; DELETE FROM schema_version WHERE version >= 60;"
                            "DROP TRIGGER messages_fts_ai; DROP TRIGGER messages_fts_ad; DROP TRIGGER messages_fts_au;"
                            "CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN"
@@ -10316,6 +10316,116 @@ static void test_read_receipts(void) {
  * channel list's preview, a search hit -- whether the words matched are
  * outside the spoiler or inside it, where FTS's snippet() would show them --
  * and a forward's source excerpt. */
+/* What a spoiler hides notifies nobody and is not searchable, for anyone
+ * (MARKDOWN.md §1d); the same words outside it still do and still are. */
+static void test_spoiler_hidden(void) {
+    const char *path = tdb("spoiler_hidden.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+    {   /* alice watches for "deploy". */
+        oc_job *j = oc_job_new(OC_JOB_SET_KEYWORDS, 1);
+        j->user_id = alice;
+        j->kw_terms = calloc(1, sizeof *j->kw_terms);
+        j->kw_terms[0] = strdup("deploy");
+        j->n_kw_terms = 1;
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    uint8_t idem[OC_IDEM_LEN];
+
+    /* Mentions and a keyword inside a spoiler: no row of any kind. */
+    memset(idem, 0xB1, sizeof idem);
+    uint64_t hid = send_msg(w, bob, idem, "guess >!@alice and @channel deploy it!< now");
+    CHECK(hid != 0);
+    CHECK(mention_rows(path, hid, 0, -1) == 0);
+    /* The same outside it, in the same message: they do. */
+    memset(idem, 0xB2, sizeof idem);
+    uint64_t seen = send_msg(w, bob, idem, ">!@alice deploy!< then @alice and deploy");
+    CHECK(seen != 0);
+    CHECK(mention_rows(path, seen, alice, OC_MENTION_USER) == 1);
+    /* A keyword alone outside it: the keyword's row. */
+    memset(idem, 0xB3, sizeof idem);
+    uint64_t kw = send_msg(w, bob, idem, ">!deploy!< later, deploy");
+    CHECK(kw != 0);
+    CHECK(mention_rows(path, kw, alice, OC_MENTION_KEYWORD) == 1);
+    memset(idem, 0xB4, sizeof idem);
+    uint64_t kw_hid = send_msg(w, bob, idem, "nothing but >!deploy!<");
+    CHECK(kw_hid != 0);
+    CHECK(mention_rows(path, kw_hid, 0, -1) == 0);
+    {   /* the activity feed, which notifications follow, has none of the hidden */
+        oc_dbres *r = activity(w, alice, OC_ACTF_INVOLVED);
+        int saw_hid = 0, saw_seen = 0;
+        for (size_t i = 0; r && i < r->n_alist; i++) {
+            if (r->alist[i].message_id == hid || r->alist[i].message_id == kw_hid) saw_hid = 1;
+            if (r->alist[i].message_id == seen) saw_seen = 1;
+        }
+        CHECK(!saw_hid && saw_seen);
+        oc_dbres_free(r);
+    }
+
+    /* Search: a word only inside one finds nothing, for the author too; a word
+     * outside it finds the message. */
+    memset(idem, 0xB5, sizeof idem);
+    uint64_t m = send_msg(w, alice, idem, "the killer is >!the butler!< obviously");
+    CHECK(m != 0);
+    oc_dbres *r = search(w, alice, "butler", 0);
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_search == 0);
+    oc_dbres_free(r);
+    r = search(w, bob, "butler", 0);
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_search == 0);
+    oc_dbres_free(r);
+    r = search(w, bob, "killer", 0);
+    CHECK(r && r->n_search == 1 && r->search[0].message_id == m);
+    if (r && r->n_search == 1) {
+        /* contract: the covered excerpt MARKDOWN.md §1d specifies */
+        char ex[512];
+        size_t el = r->search[0].body_len < sizeof ex - 1 ? r->search[0].body_len : sizeof ex - 1;
+        memcpy(ex, r->search[0].body, el); ex[el] = '\0';
+        CHECK(strstr(ex, "butler") == NULL && strstr(ex, "[spoiler]") != NULL);
+    }
+    oc_dbres_free(r);
+    /* An edit that moves a word into it drops the word from the index, and one
+     * that takes it out puts it back. */
+    r = do_edit(w, alice, OC_DEFAULT_CHANNEL, m, "the killer is >!the butler obviously!<");
+    CHECK(r && r->type == OC_RES_EDIT_OK);
+    oc_dbres_free(r);
+    r = search(w, alice, "obviously", 0);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
+    r = do_edit(w, alice, OC_DEFAULT_CHANNEL, m, "the killer is the butler");
+    CHECK(r && r->type == OC_RES_EDIT_OK);
+    oc_dbres_free(r);
+    r = search(w, alice, "butler", 0);
+    CHECK(r && r->n_search == 1 && r->search[0].message_id == m);
+    oc_dbres_free(r);
+    /* A deleted message with a spoiler leaves the index cleanly: its 'delete'
+     * was given what was indexed, so a later search does not fail. */
+    memset(idem, 0xB6, sizeof idem);
+    uint64_t gone = send_msg(w, alice, idem, "temporary >!secretword!< note");
+    CHECK(gone != 0);
+    r = do_delete(w, alice, OC_DEFAULT_CHANNEL, gone);
+    CHECK(r && r->type == OC_RES_DELETE_OK);
+    oc_dbres_free(r);
+    r = search(w, alice, "temporary", 0);
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_search == 0);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+
+    /* The index is consistent with its content after all of it. */
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(sqlite3_exec(raw, "INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 0);",
+                           NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+    cleanup_db(path);
+}
+
 static void test_spoiler_excerpts(void) {
     const char *path = tdb("spoiler.db");
     cleanup_db(path);
@@ -10771,6 +10881,7 @@ int run_dbwriter_tests(void) {
     test_read_receipts();
     test_default_channels();
     test_spoiler_excerpts();
+    test_spoiler_hidden();
     test_search_orders();
     test_setup_invite();
     test_remove_user_integrations();

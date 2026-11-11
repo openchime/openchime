@@ -102,7 +102,7 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 71);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind */
+    CHECK(oc_schema_version(db) == 72);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search */
 
     const char *tables[] = { "drafts", "scheduled_messages", "users", "channels", "channel_members",
                              "messages", "sent_messages",
@@ -340,6 +340,49 @@ static void test_user_kind(void) {
     sqlite3_close(db);
 }
 
+static int fts_hits(sqlite3 *db, const char *word) {
+    char *sql = sqlite3_mprintf("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH %Q;", word);
+    int n = scalar(db, sql);
+    sqlite3_free(sql);
+    return n;
+}
+
+/* 0072: the index leaves out what a spoiler hides, and messages written before
+ * it are indexed again that way; the rest are found as before, and the index
+ * stays whole through later writes. */
+static void test_spoilers_reindexed(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 71, &err) == SQLITE_OK);
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(1,'channel','general',1,1);"
+        "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms) VALUES"
+        "(1,1,1,'the killer is >!the butler!< obviously',1),"
+        "(2,1,1,'Before\n```spoiler Ending\nShe survives.\n```\nAfter',2),"
+        "(3,1,1,'plain words about a gardener',3),"
+        "(4,1,1,'an arrow >! with no closer gardener',4);", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(fts_hits(db, "butler") == 1);                  /* before: hidden text found */
+    CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
+    CHECK(fts_hits(db, "butler") == 0);
+    CHECK(fts_hits(db, "survives") == 0);
+    CHECK(fts_hits(db, "killer") == 1);
+    CHECK(fts_hits(db, "obviously") == 1);
+    CHECK(fts_hits(db, "Ending") == 1);                  /* a label is shown, so found */
+    CHECK(fts_hits(db, "After") == 1);
+    CHECK(fts_hits(db, "gardener") == 2);                /* picked by the test, no spoiler */
+    /* Later writes, on this connection, keep it whole. */
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms) VALUES(5,1,1,'new >!secret!< text',5);"
+        "UPDATE messages SET body='the killer is the butler' WHERE id=1;"
+        "DELETE FROM messages WHERE id=2;", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(fts_hits(db, "secret") == 0 && fts_hits(db, "text") == 1);
+    CHECK(fts_hits(db, "butler") == 1 && fts_hits(db, "obviously") == 0);
+    CHECK(fts_hits(db, "Ending") == 0);
+    CHECK(sqlite3_exec(db, "INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 0);",
+                       NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+}
+
 static void test_newer_database_refused(void) {
     sqlite3 *db = open_mem();
     char *err = NULL;
@@ -367,6 +410,7 @@ int run_migrate_tests(void) {
     test_kept_identity_wins();
     test_identity_copied_before_0064();
     test_user_kind();
+    test_spoilers_reindexed();
     test_newer_database_refused();
     return failures;
 }

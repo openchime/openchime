@@ -1947,6 +1947,7 @@ static void bc_drop_box(void) {
     bc_held_clear(&g_bc_wait[BCS_NEWMSG]);
 }
 static void composer_send(void);    /* fwd */
+static int ed_refuse_open_spoiler(const char *b);   /* fwd */
 static void bc_opened_back(const bc_held *h);   /* fwd */
 static void pc_say(const char *note);           /* fwd */
 
@@ -5689,6 +5690,47 @@ static void spoiler_toggle(uint64_t mid, int k) {
     if (g_n_spl_shown == SPL_REVEALS) memmove(g_spl_shown, g_spl_shown + 1, sizeof g_spl_shown[0] * (SPL_REVEALS - 1)), g_n_spl_shown--;
     g_spl_shown[g_n_spl_shown].mid = mid; g_spl_shown[g_n_spl_shown].k = k; g_n_spl_shown++;
 }
+/* `t` from byte `s` to byte `e`, for the clipboard (MARKDOWN.md §1d): each spoiler
+ * of message `mid` this reader has not revealed is its covered form, "[spoiler]"
+ * or "[spoiler: Label]" as oc_rt_plain_excerpt writes it, however little of it
+ * the range takes in; one revealed is copied as written. The spoilers are those
+ * of `t` past `lead` bytes (an action's name), numbered as the transcript numbers
+ * them (msg_spoilers). A malloc'd string, or NULL on no memory. Every copy of a
+ * message's text goes through here. */
+static char *copy_covered(uint64_t mid, const char *t, size_t lead, size_t s, size_t e) {
+    size_t n = strlen(t), nsv, cap, o = 0, i;
+    oc_rt_spoiler *sv = NULL;
+    char *out;
+    if (lead > n) lead = n;
+    if (e > n) e = n;
+    if (s > e) s = e;
+    nsv = oc_rt_spoilers(t + lead, n - lead, NULL, 0);
+    if (nsv) {
+        sv = malloc(nsv * sizeof *sv);
+        if (!sv) return NULL;
+        nsv = oc_rt_spoilers(t + lead, n - lead, sv, nsv);
+    }
+    cap = (e - s) + nsv * 80 + 1;
+    out = malloc(cap);
+    if (!out) { free(sv); return NULL; }
+    i = s;
+    for (size_t k = 0; k < nsv; k++) {
+        size_t a = sv[k].start + lead, z = a + sv[k].len;
+        if (z <= s || a >= e || z <= i || spoiler_shown(mid, (int)k)) continue;
+        if (a > i) { memcpy(out + o, t + i, a - i); o += a - i; }
+        if (sv[k].label_len)
+            o += (size_t)snprintf(out + o, cap - o, "[spoiler: %.*s]",
+                                  (int)(sv[k].label_len > 64 ? 64 : sv[k].label_len), t + lead + sv[k].label);
+        else
+            o += (size_t)snprintf(out + o, cap - o, "[spoiler]");
+        i = z < e ? z : e;
+    }
+    if (e > i) { memcpy(out + o, t + i, e - i); o += e - i; }
+    out[o] = '\0';
+    free(sv);
+    return out;
+}
+
 /* `t` (`nt` tables of a body whose spoilers are `sv`) less those in a covered
  * spoiler, which stay text under its cover: a grid would be drawn over it, for
  * all to read. Returns how many are left. */
@@ -20364,6 +20406,7 @@ static void newmsg_send_at(oc_win *hwnd, uint64_t at) {
         composer_hint("This message is too long to send. Make a table smaller, or split it in two.", 1);
         return;
     }
+    if (ed_refuse_open_spoiler(b)) { free(b); return; }
     /* Into a channel or a DM that exists, checked as its own composer's send
      * is (bc_gate, REQ-221): held, the text stays in the pane with its
      * recipients. */
@@ -22109,84 +22152,85 @@ static int ed_is_space(oc_wch c);   /* fwd */
 static void ed_insert_n(const oc_wch *s, int n);   /* fwd */
 static int ed_spoiler_edit(int p, int so, int sn) {
     static char u8[ED_MAX * 3 + 1];
-    static oc_wch out[ED_MAX + 1];
-    oc_rt_spoiler sv[64];
+    static oc_wch out[ED_MAX + 32];
+    static const oc_wch OPEN[] = { u'`', u'`', u'`', u's', u'p', u'o', u'i', u'l', u'e', u'r', u'\n' };
     int bytes = to_u8n(g_ed_prev, g_ed_prev_len, u8, (int)sizeof u8 - 1);
     if (bytes <= 0) return 0;
-    size_t nv = oc_rt_spoilers(u8, (size_t)bytes, sv, 64);
-    if (nv > 64) nv = 64;
-    for (size_t k = 0; k < nv; k++) {
+    /* Every spoiler in the draft, however many: past a bound one used to come
+     * apart in the open. */
+    size_t nv = oc_rt_spoilers(u8, (size_t)bytes, NULL, 0);
+    oc_rt_spoiler *sv = nv ? malloc(nv * sizeof *sv) : NULL;
+    if (!sv) return 0;
+    nv = oc_rt_spoilers(u8, (size_t)bytes, sv, nv);
+    int dealt = 0;
+    for (size_t k = 0; k < nv && !dealt; k++) {
         if (sv[k].block || sv[k].cell) continue;
         int os = to_w_count(u8, (int)sv[k].start), oe = to_w_count(u8, (int)(sv[k].start + sv[k].len));
         if (p < os + 2 || so > oe - 2) continue;
         int ne = oe + (sn - so), nl = 0;
         for (int i = p; i < sn; i++) if (g_ed[i] == u'\n') nl = 1;
         if (!nl) {
+            /* Plain text shows the markup, which the writer edits as they like. */
+            if (!g_pref_richtext) break;
             int text = 0;
             for (int i = os + 2; i < ne - 2; i++) if (!ed_is_space(g_ed[i])) text = 1;
-            if (g_ed_hidden[os] || !text) return 0;
+            if (g_ed_hidden[os] || !text) break;
             memcpy(g_ed, g_ed_prev, (size_t)(g_ed_prev_len + 1) * sizeof(oc_wch));
             g_ed_len = g_ed_prev_len;
             g_ed_caret = g_ed_anchor = p;
             ed_invalidate_layout();
-            return 1;
+            dealt = 1;
+            break;
         }
-        /* Rebuilt line by line, each with text in its own delimiters. */
-        int o = 0, caret = -1, at = os + 2, fits = 1, first = 1;
-        while (at <= ne - 2 && fits) {
-            int le = at, m = at, text = 0;
-            while (le < ne - 2 && g_ed[le] != u'\n') le++;
-            if (!first) {
-                for (;;) {
-                    int q = m;
-                    while (q < le && g_ed[q] >= u'0' && g_ed[q] <= u'9') q++;
-                    if (q > m && q + 1 < le && g_ed[q] == u'.' && g_ed[q + 1] == u' ') m = q + 2;
-                    else if (m + 1 < le && (g_ed[m] == u'>' || g_ed[m] == u'-') && g_ed[m + 1] == u' ') m += 2;
-                    else break;
-                }
-            }
-            for (int i = m; i < le; i++) if (!ed_is_space(g_ed[i])) text = 1;
-            if (o + (le - at) + 5 > ED_MAX) { fits = 0; break; }
-            for (int i = at; i < m; i++) out[o++] = g_ed[i];
-            if (text) { out[o++] = u'>'; out[o++] = u'!'; }
-            if (g_ed_caret >= m && g_ed_caret <= le) caret = o + (g_ed_caret - m);
-            for (int i = m; i < le; i++) out[o++] = g_ed[i];
-            if (text) { out[o++] = u'!'; out[o++] = u'<'; }
-            if (le < ne - 2) out[o++] = u'\n';
-            first = 0;
-            at = le + 1;
-        }
-        if (fits && g_ed_len - (ne - os) + o <= ED_MAX) {
+        /* A line break inside one, in either mode: the spoiler stays whole, as a
+         * block (MARKDOWN.md §1d), its fences on lines of their own, so what it
+         * hides goes on hiding all of it. */
+        int lead = os > 0 && g_ed[os - 1] != u'\n', tail = ne < g_ed_len && g_ed[ne] != u'\n';
+        int body = (ne - 2) - (os + 2), o = 0, caret = -1;
+        if (body < 0) body = 0;
+        if (g_ed_len - (ne - os) + lead + 11 + body + 4 + tail <= ED_MAX) {
+            if (lead) out[o++] = u'\n';
+            memcpy(out + o, OPEN, sizeof OPEN); o += 11;
+            if (g_ed_caret >= os + 2 && g_ed_caret <= ne - 2) caret = o + (g_ed_caret - (os + 2));
+            memcpy(out + o, g_ed + os + 2, (size_t)body * sizeof(oc_wch)); o += body;
+            out[o++] = u'\n'; out[o++] = u'`'; out[o++] = u'`'; out[o++] = u'`';
+            if (tail) out[o++] = u'\n';
             ed_delete_range(os, ne);
             g_ed_caret = g_ed_anchor = os;
             ed_insert_n(out, o);
             if (caret >= 0) g_ed_caret = g_ed_anchor = os + caret;
-            g_ed_hidden_valid = 0;
-            ed_hidden_build();
-            g_ed_caret = g_ed_anchor = ed_canon(g_ed_caret);
-        } else {                       /* no room to split it: the edit is not made */
+            if (g_pref_richtext) {
+                g_ed_hidden_valid = 0;
+                ed_hidden_build();
+                g_ed_caret = g_ed_anchor = ed_canon(g_ed_caret);
+            }
+        } else {                       /* no room for the fences: the edit is not made */
             memcpy(g_ed, g_ed_prev, (size_t)(g_ed_prev_len + 1) * sizeof(oc_wch));
             g_ed_len = g_ed_prev_len;
             g_ed_caret = g_ed_anchor = p;
             ed_invalidate_layout();
         }
-        return 1;
+        dealt = 1;
     }
-    return 0;
+    free(sv);
+    return dealt;
 }
 
 static void ed_repair_orphans(void) {
     int p = 0, so, sn, i, drop[64], n = 0, caret = g_ed_caret, anchor = g_ed_anchor;
-    /* Plain text hides nothing, so there is nothing that can stop being hidden.
-     * Belt as well as braces: ed_mode_changed() re-baselines the snapshot, and
-     * this makes the pass inert in the mode it has no business running in. */
-    if (!g_pref_richtext) return;
     if (g_ed_prev_len <= 0) return;
     while (p < g_ed_prev_len && p < g_ed_len && g_ed_prev[p] == g_ed[p]) p++;
     so = g_ed_prev_len; sn = g_ed_len;
     while (so > p && sn > p && g_ed_prev[so - 1] == g_ed[sn - 1]) { so--; sn--; }
-    if (!g_ed_hidden_valid) ed_hidden_build();
+    if (g_pref_richtext && !g_ed_hidden_valid) ed_hidden_build();
+    /* A line break inside a spoiler, in either mode: it would otherwise go out
+     * as an unclosed `>!` and a stray `!<`, in the open. */
     if (ed_spoiler_edit(p, so, sn)) return;
+    /* Plain text hides nothing else, so there is nothing that can stop being
+     * hidden. Belt as well as braces: ed_mode_changed() re-baselines the
+     * snapshot, and this makes the rest inert in the mode it has no business
+     * running in. */
+    if (!g_pref_richtext) return;
     /* Untouched head, then untouched tail at its new offset. Anything inside the
      * edit itself is the user's own typing and is never second-guessed. */
     /* Not a spoiler's `>!` or `!<`, whatever broke it: without them what it hid
@@ -22240,6 +22284,26 @@ static void ed_mode_changed(void) {
     ed_invalidate_layout();
     ed_hidden_build();
     ed_remember();
+}
+
+/* A body about to be sent that opens a spoiler and never closes it would show
+ * what its writer meant to hide (MARKDOWN.md §1d): it is not sent, and the caret
+ * goes to where the spoiler opens. Returns 1 when it refused `b`. */
+static int ed_refuse_open_spoiler(const char *b) {
+    size_t at = b ? oc_rt_open_spoiler(b, strlen(b)) : (size_t)-1;
+    if (at == (size_t)-1) return 0;
+    /* The offset is in the Markdown sent; it is the field's own only when no
+     * table card stands for more text than its one character. */
+    if (!ed_has_tab()) {
+        int w = to_w_count(b, (int)at);
+        if (w >= 0 && w <= g_ed_len) {
+            g_ed_caret = g_ed_anchor = w;
+            ed_invalidate_layout();
+        }
+    }
+    composer_hint("This spoiler is never closed, so it would be sent readable. "
+                  "Add !< where it ends, or write \\>! for the characters themselves.", 1);
+    return 1;
 }
 
 /* One step left/right, crossing any invisible run in the same keypress —
@@ -26259,6 +26323,7 @@ static void sched_at(oc_win *hwnd, uint64_t at) {
         composer_hint("This message is too long to send. Make a table smaller, or split it in two.", 1);
         return;
     }
+    if (ed_refuse_open_spoiler(b)) { free(b); return; }
     /* Into the thread when the composer is replying in one, exactly as a send
      * would be (composer_send): the root rides the schedule, and the daemon posts
      * it as a reply when it fires. */
@@ -26337,6 +26402,7 @@ static void composer_send(void) {
      * so the body is measured against the daemon's limit here, where the text
      * is still in the box to be shortened. */
     char *b = ed_md_all();
+    if (ed_refuse_open_spoiler(b)) { free(b); return; }
     /* What is left of the typed emoticons -- the last one, with no space after
      * it -- is converted as it goes. */
     if (b) {
@@ -28882,7 +28948,11 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
     if (cmd == 7) {
         picker_open(hwnd, mid);
     } else if (cmd == 20) {
-        copy_to_clipboard(hwnd, msg->body ? msg->body : "");
+        /* What a covered spoiler hides stays covered (MARKDOWN.md §1d), in a
+         * message and in a /me action alike. */
+        const char *t = msg->body ? msg->body : "";
+        char *cv = copy_covered(mid, t, 0, 0, strlen(t));
+        if (cv) { copy_to_clipboard(hwnd, cv); free(cv); }
     } else if (cmd == 109) {
         copy_table(hwnd, msg, g_menu_tab);
     } else if (cmd == 110) {
@@ -31292,13 +31362,12 @@ static void copy_selection(oc_win *hwnd) {
      * byte positions cut every selection after a non-ASCII character short,
      * and a table -- one unit of a selection, copied as its Markdown -- is
      * where "×" and emoji turn up. Each end is kept off a continuation byte. */
-    size_t cap = 0;
-    for (long gi = lo; gi <= hi; gi++) cap += strlen(body_text(&c->msgs[gi])) + 2;
-    char *u8 = malloc(cap + 1);
-    if (!u8) return;
+    /* Each message's part with its covered spoilers covered (copy_covered). */
+    char *u8 = NULL;
     size_t bl = 0;
     for (long gi = lo; gi <= hi; gi++) {
-        const char *b = body_text(&c->msgs[gi]);
+        const oc_msg *gm = &c->msgs[gi];
+        const char *b = body_text(gm);
         size_t n = strlen(b);
         size_t s = (gi == lo) ? lop : 0;
         size_t e = (gi == hi) ? hip : n;
@@ -31306,12 +31375,19 @@ static void copy_selection(oc_win *hwnd) {
         if (s > e) s = e;
         while (s > 0 && ((unsigned char)b[s] & 0xC0) == 0x80) s--;
         while (e < n && ((unsigned char)b[e] & 0xC0) == 0x80) e++;
+        char *part = copy_covered(gm->message_id, b, body_lead(gm), s, e);
+        if (!part) { free(u8); return; }
+        size_t pl = strlen(part);
+        char *g = realloc(u8, bl + pl + 3);
+        if (!g) { free(part); free(u8); return; }
+        u8 = g;
         if (gi > lo) { u8[bl++] = '\r'; u8[bl++] = '\n'; }
-        memcpy(u8 + bl, b + s, e - s);
-        bl += e - s;
+        memcpy(u8 + bl, part, pl);
+        bl += pl;
+        u8[bl] = '\0';
+        free(part);
     }
-    u8[bl] = '\0';
-    if (bl) copy_to_clipboard(hwnd, u8);
+    if (u8 && bl) copy_to_clipboard(hwnd, u8);
     free(u8);
 }
 

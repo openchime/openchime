@@ -1,7 +1,7 @@
 # OpenChime — Database Schema
 
 The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
-ARCH-27 (§1); the daemon applies migrations 0001–0070 (`daemon/migrate.c`,
+ARCH-27 (§1); the daemon applies migrations 0001–0072 (`daemon/migrate.c`,
 `OC_MIGRATIONS`), in order, and new tables/columns arrive as later numbered
 migrations, never as edits to an existing one. 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
@@ -36,7 +36,7 @@ credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
 **0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
-(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages.
+(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -321,7 +321,8 @@ bodies. Three triggers keep it in sync:
   tombstone (body → NULL);
 - `messages_fts_ad` (after delete) removes the entry.
 
-Since migration 0063 (§3bb) all three skip a message in an encrypted DM.
+Since migration 0063 (§3bb) all three skip a message in an encrypted DM, and
+since 0072 (§3bk) they index the body without what its spoilers hide.
 
 The migration seeds the index from existing rows. `SEARCH` (PROTOCOL.md §5.11)
 joins `messages_fts MATCH ?` back to `messages`/`channels`, filters tombstones
@@ -1901,3 +1902,29 @@ recipient.
 agent and bot principals use this column, and SQLite cannot widen a CHECK
 without rebuilding `users`. The cap counts `human` only, so neither takes a
 seat.
+
+## 3bk. Migration 0072 — search leaves out what a spoiler hides
+
+No table changes. The three `messages_fts` triggers (§3d) are made again to
+index `oc_unspoiled(body)` rather than `body`: the body with the text each
+spoiler hides removed and everything else kept (`oc_rt_unspoiled`,
+MARKDOWN.md §1d). A word that appears only inside a spoiler finds nothing, for
+everyone, its author included; a word outside one still finds the message. An
+FTS5 `'delete'` must be given what was indexed, so the delete and update
+triggers give it `oc_unspoiled(old.body)` too.
+
+Then each existing message that may hold a spoiler (a body containing `>!` or
+```` ```spoiler ````, outside an encrypted DM) is indexed again: its old entry,
+the whole body, is deleted, and `oc_unspoiled(body)` indexed in its place. A
+body the test picks that holds no spoiler is indexed as it was.
+
+*`oc_unspoiled` is a function the daemon registers* (`oc_migrate_functions`,
+`daemon/migrate.c`), on every connection it migrates and on its own reader and
+writer connections. A connection without it cannot write `messages`: an
+insert, update or delete fails with "no such function: oc_unspoiled". So a
+change made to a stopped daemon's database by hand, with the `sqlite3` shell,
+must not touch `messages`; restore a backup instead.
+
+`SEARCH` already shows a message with a spoiler by its covered excerpt rather
+than by FTS's `snippet()`, which reads the stored body and would cut a window
+into the hidden text; it does so still.

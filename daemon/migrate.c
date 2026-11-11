@@ -4,8 +4,10 @@
  */
 
 #include "migrate.h"
+#include "richtext.h"   /* oc_rt_unspoiled: what the search index holds */
 
 #include <stddef.h>
+#include <stdlib.h>
 
 /* --- Embedded migrations ------------------------------------------------ */
 
@@ -1272,6 +1274,43 @@ static const char MIGRATION_0071[] =
     "ALTER TABLE users ADD COLUMN kind TEXT NOT NULL DEFAULT 'human' "
     "  CHECK (kind IN ('human','agent','bot','visitor'));";
 
+static const char MIGRATION_0072[] =
+    /* Search leaves out what a spoiler hides, for everyone, its author too
+     * (MARKDOWN.md §1d): the index holds oc_unspoiled(body), the body with each
+     * spoiler's hidden text removed, so a word that appears only inside one finds
+     * nothing and a guess cannot be confirmed. The triggers index that instead of
+     * the body; an FTS5 'delete' must be given what was indexed, so it is given
+     * the same. Then each existing message that may hold a spoiler is indexed
+     * again: its entry was the whole body, which is what its 'delete' is given.
+     * A body without one is unchanged by oc_unspoiled, so the cheap test that
+     * picks them may pick too many but never too few. */
+    "DROP TRIGGER messages_fts_ai;"
+    "DROP TRIGGER messages_fts_ad;"
+    "DROP TRIGGER messages_fts_au;"
+    "CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages"
+    "  WHEN (SELECT e2e FROM channels WHERE id=new.channel_id) IS NOT 1 BEGIN"
+    "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, oc_unspoiled(new.body));"
+    "END;"
+    "CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages"
+    "  WHEN (SELECT e2e FROM channels WHERE id=old.channel_id) IS NOT 1 BEGIN"
+    "  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, oc_unspoiled(old.body));"
+    "END;"
+    "CREATE TRIGGER messages_fts_au AFTER UPDATE ON messages"
+    "  WHEN (SELECT e2e FROM channels WHERE id=new.channel_id) IS NOT 1 BEGIN"
+    "  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, oc_unspoiled(old.body));"
+    "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, oc_unspoiled(new.body));"
+    "END;"
+    "CREATE TEMP TABLE spoiler_reindex AS"
+    "  SELECT m.id, m.body FROM messages m"
+    "   WHERE m.body IS NOT NULL"
+    "     AND (instr(m.body, '>!') > 0 OR instr(m.body, '```spoiler') > 0)"
+    "     AND (SELECT e2e FROM channels WHERE id=m.channel_id) IS NOT 1;"
+    "INSERT INTO messages_fts(messages_fts, rowid, body)"
+    "  SELECT 'delete', id, body FROM spoiler_reindex;"
+    "INSERT INTO messages_fts(rowid, body)"
+    "  SELECT id, oc_unspoiled(body) FROM spoiler_reindex;"
+    "DROP TABLE spoiler_reindex;";
+
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
      * author is doing, and the daemon records that as its own object beside the
@@ -1631,6 +1670,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 69, MIGRATION_0069 },
     { 70, MIGRATION_0070 },
     { 71, MIGRATION_0071 },
+    { 72, MIGRATION_0072 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 
@@ -1680,8 +1720,27 @@ static int identity_attached(sqlite3 *db) {
     return found;
 }
 
+/* oc_unspoiled(body): the body with what its spoilers hide removed (oc_rt_unspoiled),
+ * NULL for NULL. Its result is as long as the body at most. */
+static void sql_unspoiled(sqlite3_context *cx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    const char *t = (const char *)sqlite3_value_text(argv[0]);
+    int n = sqlite3_value_bytes(argv[0]);
+    if (!t) { sqlite3_result_null(cx); return; }
+    char *out = malloc((size_t)n + 1);
+    if (!out) { sqlite3_result_error_nomem(cx); return; }
+    size_t w = oc_rt_unspoiled(t, (size_t)n, out, (size_t)n + 1);
+    sqlite3_result_text(cx, out, (int)w, free);
+}
+
+void oc_migrate_functions(sqlite3 *db) {
+    sqlite3_create_function(db, "oc_unspoiled", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS,
+                            NULL, sql_unspoiled, NULL, NULL);
+}
+
 int oc_migrate(sqlite3 *db, const oc_migration *set, int n, char **errmsg) {
     if (errmsg) *errmsg = NULL;
+    oc_migrate_functions(db);
 
     int rc = sqlite3_exec(db,
         "CREATE TABLE IF NOT EXISTS schema_version ("

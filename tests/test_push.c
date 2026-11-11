@@ -300,6 +300,7 @@ static void test_collect(void) {
     {
         sqlite3 *wdb = NULL;
         CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        oc_migrate_functions(wdb);   /* what the search index's triggers call */
         char sql[256];
         snprintf(sql, sizeof sql,
                  "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
@@ -328,6 +329,7 @@ static void test_collect(void) {
     {
         sqlite3 *wdb = NULL;
         CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        oc_migrate_functions(wdb);   /* what the search index's triggers call */
         char sql[320];
         snprintf(sql, sizeof sql,
                  "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
@@ -350,6 +352,7 @@ static void test_collect(void) {
     {
         sqlite3 *wdb = NULL;
         CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        oc_migrate_functions(wdb);   /* what the search index's triggers call */
         CHECK(sqlite3_exec(wdb,
             "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
             " VALUES(4244,1,NULL,2,0,8,1);", NULL, NULL, NULL) == SQLITE_OK);
@@ -377,6 +380,7 @@ static void test_collect(void) {
     {
         sqlite3 *wdb = NULL;
         CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        oc_migrate_functions(wdb);   /* what the search index's triggers call */
         char sql[512];
         /* A root dave wrote, and a reply from alice under it. */
         snprintf(sql, sizeof sql,
@@ -414,6 +418,7 @@ static void test_collect(void) {
     {
         sqlite3 *wdb = NULL;
         CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        oc_migrate_functions(wdb);   /* what the search index's triggers call */
         char sql[256];
         snprintf(sql, sizeof sql,
                  "INSERT INTO thread_follows(user_id,root_id,channel_id,state)"
@@ -432,6 +437,7 @@ static void test_collect(void) {
     {
         sqlite3 *wdb = NULL;
         CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        oc_migrate_functions(wdb);   /* what the search index's triggers call */
         char sql[256];
         snprintf(sql, sizeof sql,
                  "UPDATE thread_follows SET state=1 WHERE user_id=%llu AND root_id=5000;"
@@ -692,6 +698,7 @@ static void test_default_and_mute(void) {
     {
         sqlite3 *wdb = NULL;
         CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        oc_migrate_functions(wdb);   /* what the search index's triggers call */
         char sql[256];
         snprintf(sql, sizeof sql,
                  "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
@@ -723,6 +730,7 @@ static void test_default_and_mute(void) {
     {
         sqlite3 *wdb = NULL;
         CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        oc_migrate_functions(wdb);   /* what the search index's triggers call */
         char sql[256];
         snprintf(sql, sizeof sql,
                  "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
@@ -896,6 +904,7 @@ static void test_keyword_is_not_a_broadcast(void) {
     {
         sqlite3 *wdb = NULL;
         CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        oc_migrate_functions(wdb);   /* what the search index's triggers call */
         char sql[256];
         snprintf(sql, sizeof sql,
                  "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
@@ -923,6 +932,7 @@ static void test_keyword_is_not_a_broadcast(void) {
     {
         sqlite3 *wdb = NULL;
         CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        oc_migrate_functions(wdb);   /* what the search index's triggers call */
         CHECK(sqlite3_exec(wdb,
             "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
             " VALUES(7002,1,NULL,2,0,8,1);", NULL, NULL, NULL) == SQLITE_OK);
@@ -1042,6 +1052,7 @@ static void test_collect_matches_evaluator(void) {
 
     sqlite3 *wdb = NULL;
     CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+    oc_migrate_functions(wdb);   /* what the search index's triggers call */
 
     /* The thread the swept replies hang off: bob wrote the root, so he is a
      * participant by derivation (ARCH-104) and zoe is not. Written once — the

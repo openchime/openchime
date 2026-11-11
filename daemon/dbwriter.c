@@ -4400,8 +4400,9 @@ static void store_keyword_hits(sqlite3 *db, uint64_t mid, uint64_t channel_id,
         uint64_t uid = (uint64_t)sqlite3_column_int64(q, 0);
         const unsigned char *term = sqlite3_column_text(q, 1);
         size_t st_off = 0, st_len = 0;
-        if (!term || !oc_keyword_match((const char *)body, body_len,
-                                       (const char *)term, &st_off, &st_len)) continue;
+        /* A keyword inside a spoiler alerts nobody (MARKDOWN.md §1d). */
+        if (!term || !oc_rt_keyword_match((const char *)body, body_len,
+                                          (const char *)term, &st_off, &st_len)) continue;
         sqlite3_reset(ins);
         sqlite3_bind_int64(ins, 1, (sqlite3_int64)mid);
         sqlite3_bind_int64(ins, 2, (sqlite3_int64)channel_id);
@@ -4465,6 +4466,14 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
     oc_mention m[OC_MENTION_MAX];
     size_t n = oc_mention_scan((const char *)body, body_len, m, OC_MENTION_MAX);
     if (n > OC_MENTION_MAX) n = OC_MENTION_MAX;   /* the rest are ignored, not an error */
+    /* A mention inside a spoiler notifies nobody (MARKDOWN.md §1d): it gets no
+     * row, of any kind, broadcasts and groups included. */
+    {
+        size_t k = 0;
+        for (size_t i = 0; i < n; i++)
+            if (!oc_rt_in_spoiler((const char *)body, body_len, m[i].start)) m[k++] = m[i];
+        n = k;
+    }
 
     sqlite3_stmt *ins = NULL;
     if (sqlite3_prepare_v2(db,
@@ -9208,6 +9217,8 @@ static void sql_has_spoiler(sqlite3_context *cx, int argc, sqlite3_value **argv)
 static void sql_functions(sqlite3 *db) {
     sqlite3_create_function(db, "oc_excerpt", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_excerpt, NULL, NULL);
     sqlite3_create_function(db, "oc_has_spoiler", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_has_spoiler, NULL, NULL);
+    /* oc_unspoiled, which the search index's triggers call (migrate.c, 0072). */
+    oc_migrate_functions(db);
 }
 
 static oc_dbres *process_get_profile(sqlite3 *db, const oc_job *j) {

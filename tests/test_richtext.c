@@ -940,6 +940,72 @@ static void test_spoiler_excerpt(void) {
     }
 }
 
+/* What search indexes, what a mention or keyword may be read from, and what a
+ * composer refuses to send: hidden text goes into none of them. */
+static void test_spoiler_hidden_text(void) {
+    char out[512];
+    /* Inline: the hidden text goes, its delimiters and everything else stay. */
+    const char *b = "The killer is >!the butler!< obviously";
+    size_t w = oc_rt_unspoiled(b, strlen(b), out, sizeof out);
+    /* contract: every byte is kept but the hidden ones (MARKDOWN.md §1d) */
+    CHECK(strcmp(out, "The killer is >!!< obviously") == 0 && w == strlen(out));
+    /* Labelled block: the label is shown, so it stays; the lines go. */
+    const char *k = "Before\n```spoiler Ending\nShe lives.\n```\nAfter";
+    oc_rt_unspoiled(k, strlen(k), out, sizeof out);
+    CHECK(!strstr(out, "lives") && strstr(out, "Ending") && strstr(out, "Before") && strstr(out, "After"));
+    /* No spoiler: the body as it is. */
+    /* contract: a body with no spoiler is indexed as written */
+    CHECK(oc_rt_unspoiled("plain words", 11, out, sizeof out) == 11 && strcmp(out, "plain words") == 0);
+    /* Seventy spoilers, past any bound an excerpt has: every one emptied. */
+    {
+        static char many[4096], big[4096];
+        size_t o = 0;
+        for (int i = 0; i < 70; i++) o += (size_t)snprintf(many + o, sizeof many - o, "w%02d >!H%02d!< ", i, i);
+        oc_rt_unspoiled(many, o, big, sizeof big);
+        CHECK(!strstr(big, "H0") && !strstr(big, "H69") && strstr(big, "w00") && strstr(big, "w69"));
+        CHECK(oc_rt_in_spoiler(many, o, (size_t)(strstr(many, "H69") - many)) == 1);
+    }
+    /* Cut short, never inside a character. */
+    {
+        char small[6];
+        oc_rt_unspoiled("ab\xC3\xA9xyz", 7, small, sizeof small);
+        CHECK(strcmp(small, "ab\xC3\xA9x") == 0);
+        oc_rt_unspoiled("abc\xC3\xA9", 5, small, 5);
+        CHECK(strcmp(small, "abc") == 0);
+    }
+
+    /* oc_rt_in_spoiler at the edges: the delimiters are not hidden, the first and
+     * last hidden bytes are. */
+    const char *e = "a >!bc!< d";
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 0) == 0);
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 2) == 0);          /* '>' */
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 3) == 0);          /* '!' */
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 4) == 1);          /* 'b' */
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 5) == 1);          /* 'c' */
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 6) == 0);          /* '!' of the closer */
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 9) == 0);
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 99) == 0);
+
+    /* A keyword inside one is no match; the same word outside it, after it, is. */
+    size_t at = 0, n = 0;
+    const char *kw = "the >!deploy!< is done, deploy now";
+    CHECK(oc_rt_keyword_match(kw, strlen(kw), "deploy", &at, &n) == 1 && at == 24 && n == 6);
+    CHECK(oc_rt_keyword_match("only >!deploy!< here", 20, "deploy", &at, &n) == 0);
+    /* The boundary still holds past a hidden match: "redeploy" is no "deploy". */
+    CHECK(oc_rt_keyword_match(">!deploy!< redeploy", 19, "deploy", &at, &n) == 0);
+
+    /* A `>!` that opens nothing it closes. */
+    CHECK(oc_rt_open_spoiler("fine >!x!< here", 15) == (size_t)-1);
+    CHECK(oc_rt_open_spoiler("oops >!x and more", 17) == 5);
+    CHECK(oc_rt_open_spoiler(">!line one\nline two!<", 21) == 0);
+    CHECK(oc_rt_open_spoiler("escaped \\>!x", 12) == (size_t)-1);
+    CHECK(oc_rt_open_spoiler("code `>!x` here", 15) == (size_t)-1);
+    CHECK(oc_rt_open_spoiler("```\n>!x\n```", 11) == (size_t)-1);
+    CHECK(oc_rt_open_spoiler("```spoiler\nhid >!den\n```", 24) == (size_t)-1);
+    CHECK(oc_rt_open_spoiler(">!a!< then >!b", 14) == 11);
+    CHECK(oc_rt_open_spoiler("no markup at all", 16) == (size_t)-1);
+}
+
 int run_richtext_tests(void) {
     failures = 0;
     test_emphasis();
@@ -966,6 +1032,7 @@ int run_richtext_tests(void) {
     test_spoiler_cells();
     test_spoiler_excerpt();
     test_spoiler_cell_excerpt();
+    test_spoiler_hidden_text();
     printf("test_richtext: emphasis, literal delimiters, escapes, code, fenced blocks, labelled links, "
            "quotes and lists, nesting, byte offsets, autolinking, truncation, tables and their cells and excerpts, "
            "time tokens in every zone and however many, spoilers\n");

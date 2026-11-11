@@ -4114,6 +4114,17 @@ int main(int argc, char **argv) {
             if (editing) { editing = 0; composer[0] = '\0'; clen = 0; }
             else { panel = 2; if (focus < nch) msg_sel = m->channels[focus].n_msgs ? (int)m->channels[focus].n_msgs - 1 : -1; }
         } else if (ev.key == TB_KEY_ENTER) {
+            /* A spoiler opened and never closed would go out readable
+             * (MARKDOWN.md §1d): the text stays here, and the note says where. */
+            size_t open_at = clen > 0 ? oc_rt_open_spoiler(composer, clen) : (size_t)-1;
+            if (open_at != (size_t)-1) {
+                size_t chars = 1;
+                for (size_t q = 0; q < open_at; q++) if (((unsigned char)composer[q] & 0xC0) != 0x80) chars++;
+                snprintf(g_bc_note, sizeof g_bc_note,
+                         "The spoiler at character %zu is never closed: add !< where it ends, or write \\>!",
+                         chars);
+                continue;
+            }
             if (editing) {                     /* apply the edit (or cancel if emptied) */
                 if (clen > 0 && focus < nch) oc_client_edit(cl, m->channels[focus].channel_id, editing, composer);
                 editing = 0; clen = 0; composer[0] = '\0'; scroll = 0;

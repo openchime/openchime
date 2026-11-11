@@ -1903,6 +1903,35 @@ static void test_broadcast_mentions_me(void) {
     oc_model_free(&m);
 }
 
+/* A mention or a keyword inside a spoiler counts for nothing; the same outside
+ * it, in the same message, still does (MARKDOWN.md §1d). */
+static void test_spoiler_mentions_me(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("ada"); oc_model_apply(&m, &e);
+    const char *hid[] = { "guess >!@ada!< now", "guess >!<@U1>!< now", ">!@channel!< standup",
+                          "```spoiler\n@ada and @everyone\n```" };
+    for (size_t i = 0; i < sizeof hid / sizeof hid[0]; i++) {
+        CHECK(oc_model_mentions_me(&m, hid[i], strlen(hid[i])) == 0);
+        CHECK(oc_model_mentions_me_in(&m, 1, hid[i], strlen(hid[i])) == 0);
+    }
+    const char *seen = ">!@ada!< and @ada";
+    CHECK(oc_model_mentions_me(&m, seen, strlen(seen)) == 1);
+    CHECK(oc_model_mentions_me_in(&m, 0, seen, strlen(seen)) == 1);
+    const char *bc = ">!@ada!< and @channel";
+    CHECK(oc_model_mentions_me(&m, bc, strlen(bc)) == 1);         /* any broadcast, as before */
+    CHECK(oc_model_mentions_me_in(&m, 1, bc, strlen(bc)) == 1);
+    CHECK(oc_model_mentions_me_in(&m, 0, bc, strlen(bc)) == 0);
+
+    snprintf(m.kw_terms[0], sizeof m.kw_terms[0], "%s", "deploy");
+    m.n_kw_terms = 1;
+    size_t at = 0, n = 0;
+    CHECK(oc_model_keyword_hit(&m, "only >!deploy!<", 15, &at, &n) == 0);
+    CHECK(oc_model_keyword_hit(&m, ">!deploy!< and deploy", 21, &at, &n) == 1 && at == 15 && n == 6);
+    oc_model_free(&m);
+}
+
 /* The id form (<@U42>) mentions the reader whose id it is, whatever its label,
  * and shows as the roster's name (REQ-221, ARCH-89). */
 static void test_id_mentions(void) {
@@ -5974,6 +6003,7 @@ int run_client_core_tests(void) {
     test_broadcast_check_dm();
     test_broadcast_mentions_me();
     test_id_mentions();
+    test_spoiler_mentions_me();
     test_thread_meta_live();
     test_broadcast_stored_model();
     test_workspace_sender_model();
