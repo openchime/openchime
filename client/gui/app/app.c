@@ -1156,7 +1156,7 @@ static int g_prefs_open;
  * image, email, timezone, title) are REQ-240; this shows what the
  * roster actually knows today rather than inventing placeholders for them. */
 static uint64_t g_profile_uid;
-static rectf g_prof_dm_btn;
+static rectf g_prof_dm_btn, g_prof_mute_btn;
 /* The SELF card's action buttons — the commands the profile popover no longer
  * lists top-level. Each carries a menu_dispatch cmd; the bodies are all
  * self-contained. */
@@ -2134,7 +2134,7 @@ static struct { char emoji[24]; char text[80]; uint8_t clear; rectf r; } g_statu
 static int   g_n_status_suggs;
 static struct { rectf r; uint64_t cid; uint8_t level; } g_notify_hits[128];
 /* The two Edit buttons on the notifications overlay (REQ-135). */
-static rectf g_notify_kw_btn, g_notify_vip_btn;
+static rectf g_notify_kw_btn, g_notify_vip_btn, g_notify_mute_btn;
 /* The schedule section (REQ-136): mode chips, the base window's two time fields,
  * and — in custom mode — a checkbox and two time fields per weekday. */
 /* The Threads pane (REQ-062): its unread-only toggle and the per-card
@@ -6047,6 +6047,7 @@ static uint64_t mlay_sig(const oc_msg *msg) {
     }
     h = (h ^ (uint64_t)(msg->collapsed ? 64 : 0) ^ (uint64_t)(msg_expanded(msg->message_id) ? 128 : 0)) * 1099511628211ull;
     const oc_model *km = model();
+    if (km && oc_model_is_muted_user(km, msg->author_id)) h = (h ^ 256u) * 1099511628211ull;   /* folded as muted */
     if (km)
         for (uint8_t k = 0; k < km->n_kw_terms; k++)
             for (const char *t = km->kw_terms[k]; *t; t++)
@@ -6563,7 +6564,17 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
      * every offset below means what it did. */
     static char cutbuf[OC_MAX_BODY_SIZE + 8];
     int cutkind = 0;
-    if (!msg->deleted && msg_has_body(msg) && !msg_expanded(msg->message_id)) {
+    /* A person this reader muted: folded to one line saying so, whatever it
+     * says, until revealed -- one message at a time, here alone (OC_MSG_MUTED_USERS). */
+    const oc_model *mm = model();
+    if (!msg->deleted && msg_has_body(msg) && !msg_expanded(msg->message_id) &&
+        mm && oc_model_is_muted_user(mm, msg->author_id)) {
+        snprintf(cutbuf, sizeof cutbuf, "Message from a muted person");
+        b = cutbuf;
+        blen = strlen(cutbuf);
+        cutkind = 3;
+    }
+    if (!cutkind && !msg->deleted && msg_has_body(msg) && !msg_expanded(msg->message_id)) {
         size_t cut = 0, lead0 = body_lead(msg);
         if (msg->collapsed) {
             const char *nl = memchr(b + lead0, '\n', blen - lead0);
@@ -6585,7 +6596,7 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
      * otherwise each leave an empty line behind. */
     oc_rt_table rts[MTAB_MAX];
     int nt = 0;
-    size_t tlead = body_lead(msg);
+    size_t tlead = cutkind == 3 ? 0 : body_lead(msg);   /* the muted line has no lead */
     if (tlead > blen) tlead = blen;
     /* The spoilers (MARKDOWN.md §1d), every one of them, offsets past the lead. */
     oc_rt_spoiler *spv = NULL;
@@ -6607,7 +6618,7 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     const char *text = b;
     size_t edit_at = 0, edit_len = 0;
     int edited = msg->edited && !msg->deleted;
-    static const char *const MORE[3] = { "", "  \xE2\x80\xA6 Show message", "\nShow more" };
+    static const char *const MORE[4] = { "", "  \xE2\x80\xA6 Show message", "\nShow more", "  \xE2\x80\xA6 Show message" };
     size_t more_at = 0, more_len = cutkind ? strlen(MORE[cutkind]) : 0;
     if (edited || nt || cutkind) {
         own = malloc(blen + 16 + 32);
@@ -6647,9 +6658,10 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
         /* An action (REQ-058) reads "<name> <text>": the name is bold, and the
          * markup scanners below see only the author's text, past it -- `lead`
          * is that one offset, added wherever a span lands in the layout. */
-        size_t lead = body_lead(msg);
+        size_t lead = cutkind == 3 ? 0 : body_lead(msg);
         if (lead > blen) lead = blen;
         if (lead) st_range_weight(lay, 0, lead - 1, 700);
+        if (cutkind == 3) st_range_color(lay, 0, blen, OC_COL_FAINT, 1.0f);   /* the muted line */
         const char *ab = b;
         b += lead;
         blen -= lead;
@@ -6792,7 +6804,7 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     best->cutkind = cutkind;
     if (more_len) {
         /* The words alone, past the newline or the ellipsis before them. */
-        size_t skip = cutkind == 2 ? 1 : 6;
+        size_t skip = cutkind == 2 ? 1 : 6;   /* 1 and 3: past "  …" */
         st_rect mr[2];
         if (st_hit_range(lay, more_at + skip, more_len - skip, mr, 2) >= 1) best->more_r = mr[0];
     }
@@ -9124,8 +9136,36 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
         draw_text(rt, "Edit", g_meta, g_notify_vip_btn, OC_COL_TEXT);
         g_meta->align = ST_ALIGN_LEFT;
 
-        fill(rt, rf(body.left + 20, y1 + vipblk, body.right - 20, y1 + vipblk + 1), OC_COL_BORDER);
-        body.top = y1 + vipblk + 10;
+        /* Muted people: whom I have stopped hearing from. Nothing of theirs
+         * notifies me or counts as unread, and their messages show folded away;
+         * Edit takes a name off to unmute them. */
+        float y2 = y1 + vipblk;
+        char muted[256] = "";
+        for (uint16_t i = 0; i < m->n_muted_users; i++) {
+            const char *nm = oc_model_user_name((oc_model *)m, m->muted_users[i]);
+            if (!nm || !nm[0]) continue;
+            if (muted[0]) strncat(muted, ", ", sizeof muted - strlen(muted) - 1);
+            strncat(muted, nm, sizeof muted - strlen(muted) - 1);
+        }
+        const char *mutetext = muted[0] ? muted
+            : "None: mute someone from their profile or a message of theirs.";
+        float muteh = text_height(mutetext, g_meta_w, dw);
+        if (muteh < 20) muteh = 20;
+        float muteblk = estack ? 18 + muteh + 34 : 18 + muteh + 6;
+        draw_text(rt, "Muted people", g_ui_b, rf(body.left + 20, y2, er, y2 + 20), OC_COL_TEXT);
+        draw_text(rt, mutetext, g_meta_w, rf(body.left + 20, y2 + 18, er, y2 + 18 + muteh),
+                  muted[0] ? OC_COL_MUTED : OC_COL_FAINT);
+        g_notify_mute_btn = estack
+            ? rf(body.left + 20, y2 + 22 + muteh, body.left + 20 + UIS(96), y2 + 48 + muteh)
+            : rf(body.right - UIS(120), y2 + 2, body.right - UIS(24), y2 + 28);
+        fill_round(rt, g_notify_mute_btn, OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, g_notify_mute_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, "Edit", g_meta, g_notify_mute_btn, OC_COL_TEXT);
+        g_meta->align = ST_ALIGN_LEFT;
+
+        fill(rt, rf(body.left + 20, y2 + muteblk, body.right - 20, y2 + muteblk + 1), OC_COL_BORDER);
+        body.top = y2 + muteblk + 10;
     }
 
     /* Read receipts (REQ-090): whether others see what I have read. Mine
@@ -9300,6 +9340,7 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
      * silent mis-set this item is about. */
     g_notify_kw_btn  = hit_visible(g_notify_kw_btn,  reg);
     g_notify_vip_btn = hit_visible(g_notify_vip_btn, reg);
+    g_notify_mute_btn = hit_visible(g_notify_mute_btn, reg);
     for (int i = 0; i < 4; i++) g_sched_mode_hit[i] = hit_visible(g_sched_mode_hit[i], reg);
     g_sched_default_hit = hit_visible(g_sched_default_hit, reg);
     g_receipts_hit = hit_visible(g_receipts_hit, reg);
@@ -11181,8 +11222,20 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
         draw_text(rt, "Message", g_ui, g_prof_dm_btn, 0xFFFFFF);
         g_ui->align = ST_ALIGN_LEFT;
         y += 40;
+        /* Mute them, for me alone; the button says which way it goes. */
+        if (!oc_model_is_workspace_sender(m, g_profile_uid)) {
+            g_prof_mute_btn = rf(reg.left + 24, y, reg.right - 24, y + 30);
+            fill_round(rt, g_prof_mute_btn, OC_R_CONTROL, OC_COL_INPUT);
+            stroke_round(rt, g_prof_mute_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+            g_ui->align = ST_ALIGN_CENTER;
+            draw_text(rt, oc_model_is_muted_user(m, g_profile_uid) ? "Unmute" : "Mute", g_ui, g_prof_mute_btn,
+                      OC_COL_TEXT);
+            g_ui->align = ST_ALIGN_LEFT;
+            y += 38;
+        } else g_prof_mute_btn = rf(0, 0, 0, 0);
     } else {
         g_prof_dm_btn = rf(0, 0, 0, 0);
+        g_prof_mute_btn = rf(0, 0, 0, 0);
         /* Your own card is where the profile-shaped ACTIONS live — the popover
          * points here with "Profile", and photo/name/password/sessions moved
          * off its top level. Two labelled groups of stacked bordered buttons,
@@ -11349,9 +11402,11 @@ static void draw_reactors_list(gfx *rt, const oc_model *m, rectf reg) {
     for (size_t i = 0; i < m->n_reactors && y < reg.bottom; i++) {
         const oc_reactor_row *rr = &m->reactors[i];
         draw_emoji_fmt(rt, rr->emoji, rf(reg.left + 14, y, reg.left + 38, y + ROW_H), g_emoji_s);
-        const char *nm = oc_model_user_name(m, rr->user_id);
+        /* A person this reader muted reacts as no one in particular. */
+        int muted = oc_model_is_muted_user(m, rr->user_id);
+        const char *nm = muted ? "A muted person" : oc_model_user_name(m, rr->user_id);
         draw_text(rt, (nm && nm[0]) ? nm : "user", g_ui,
-                  rf(reg.left + 44, y, reg.right - 12, y + ROW_H), OC_COL_TEXT);
+                  rf(reg.left + 44, y, reg.right - 12, y + ROW_H), muted ? OC_COL_FAINT : OC_COL_TEXT);
         y += ROW_H;
     }
 }
@@ -26120,7 +26175,7 @@ static void a11y_publish_scene(const oc_model *m) {
     for (int i = 0; i < g_n_morehits && n < OC_ACC_MAX; i++) {
         char aid[OC_ACC_AID_MAX];
         snprintf(aid, sizeof aid, "message.%llu.expand", (unsigned long long)g_morehits[i].mid);
-        acc_push(items, &n, OC_ACC_BUTTON, aid, g_morehits[i].kind == 1 ? "Show message" : "Show more",
+        acc_push(items, &n, OC_ACC_BUTTON, aid, g_morehits[i].kind == 2 ? "Show more" : "Show message",
                  g_morehits[i].r, ATOK(AT_MORE, (uint64_t)i));
     }
 
@@ -29478,6 +29533,14 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
         mi_item(109, "Copy table");
     }
     int own = (msg->author_id == m->user_id);
+    /* Mute the author, for me alone: someone else, never the workspace itself. */
+    if (!own && msg->author_id && !oc_model_is_workspace_sender(m, msg->author_id)) {
+        char lbl[120];
+        const char *an = oc_model_user_name((oc_model *)m, msg->author_id);
+        snprintf(lbl, sizeof lbl, "%s %s", oc_model_is_muted_user(m, msg->author_id) ? "Unmute" : "Mute",
+                 an && an[0] ? an : "this person");
+        mi_item(113, lbl);
+    }
     int canmod = own || self_role(m) >= OC_ROLE_ADMIN;
     /* The workspace's windows (REQ-051/052): an author's own message stops
      * offering Edit or Delete once the daemon would refuse it; a moderator's
@@ -29662,6 +29725,11 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
     } else if (cmd == 112) {
         msg_expand(mid, 0);
         if (g_client) oc_client_set_collapsed(g_client, mid, 1);
+    } else if (cmd == 113) {
+        int on = !oc_model_is_muted_user(m, msg->author_id);
+        if (g_client) oc_client_set_user_mute(g_client, msg->author_id, on);
+        fb_confirm(on ? "Muted. Their messages stay folded away and no longer notify you."
+                      : "Unmuted.");
     } else if (cmd == 21) {
         composer_begin_edit(msg);
     } else if (cmd == 108) {
@@ -29763,6 +29831,7 @@ static void show_member_menu(oc_win *hwnd, const oc_model *m, uint64_t uid, floa
     g_n_mi = 0;
     mi_item(2, "View profile");
     if (!self) mi_item(1, "Message");
+    if (!self) mi_item(18, oc_model_is_muted_user(m, uid) ? "Unmute" : "Mute");
     /* Out of the open channel (REQ-309), as the pane's row offers -- or, for
      * someone a group keeps in, why not, as Leave does for yourself. */
     uint64_t chan = 0;
@@ -29846,6 +29915,13 @@ static void member_menu_run(oc_win *hwnd, int cmd) {
         oc_client_reset_credential(g_client, uid, cmd == 16);
         break;
     case 14: if (g_menu_target2) oc_client_channel_kick(g_client, g_menu_target2, uid); break;
+    case 18: {   /* mute or unmute them, for me alone */
+        const oc_model *m = model();
+        int on = !(m && oc_model_is_muted_user(m, uid));
+        if (g_client) oc_client_set_user_mute(g_client, uid, on);
+        fb_confirm(on ? "Muted. Their messages stay folded away and no longer notify you." : "Unmuted.");
+        break;
+    }
     default: break;
     }
 }
@@ -30632,6 +30708,57 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 } else fb_confirm(n ? "Priority people saved." : "Priority people cleared.");
                 return 1;
             }
+            /* Muted people, by display name: a name taken off is unmuted, a name
+             * added is muted, each one at a time, as the daemon takes them. */
+            if (in_rect(g_notify_mute_btn, x, y)) {
+                const oc_model *km = model();
+                oc_field f[1] = { { FF_TEXT, "Muted people",
+                                    "Separate with commas. Take a name off to hear from them again.", "" } };
+                if (km) for (uint16_t i = 0; i < km->n_muted_users; i++) {
+                    const char *nm = oc_model_user_name((oc_model *)km, km->muted_users[i]);
+                    if (!nm || !nm[0]) continue;
+                    if (f[0].value[0]) strncat(f[0].value, ", ", sizeof f[0].value - strlen(f[0].value) - 1);
+                    strncat(f[0].value, nm, sizeof f[0].value - strlen(f[0].value) - 1);
+                }
+                if (!form_dialog(hwnd, "Muted people", f, 1)) return 1;
+                static uint64_t keep[OC_MAX_MUTED_USERS];
+                uint16_t nk = 0;
+                char missing[128] = "";
+                for (char *p2 = f[0].value; *p2 && nk < OC_MAX_MUTED_USERS; ) {
+                    while (*p2 == ' ' || *p2 == ',') p2++;
+                    char *e = strchr(p2, ',');
+                    size_t len = e ? (size_t)(e - p2) : strlen(p2);
+                    while (len && p2[len - 1] == ' ') len--;
+                    if (len) {
+                        char nm[80];
+                        if (len > sizeof nm - 1) len = sizeof nm - 1;
+                        memcpy(nm, p2, len); nm[len] = '\0';
+                        uint64_t uid = km ? oc_model_user_id(km, nm) : 0;
+                        if (uid) keep[nk++] = uid;
+                        else if (strlen(missing) + len + 2 < sizeof missing) {
+                            if (missing[0]) strncat(missing, ", ", sizeof missing - strlen(missing) - 1);
+                            strncat(missing, nm, sizeof missing - strlen(missing) - 1);
+                        }
+                    }
+                    if (!e) break;
+                    p2 = e + 1;
+                }
+                if (km) {
+                    for (uint16_t i = 0; i < km->n_muted_users; i++) {
+                        int still = 0;
+                        for (uint16_t k = 0; k < nk; k++) if (keep[k] == km->muted_users[i]) still = 1;
+                        if (!still) oc_client_set_user_mute(g_client, km->muted_users[i], 0);
+                    }
+                    for (uint16_t k = 0; k < nk; k++)
+                        if (!oc_model_is_muted_user(km, keep[k])) oc_client_set_user_mute(g_client, keep[k], 1);
+                }
+                if (missing[0]) {
+                    char msg[160];
+                    snprintf(msg, sizeof msg, "No such person: %s", missing);
+                    fb_failed(msg);
+                } else fb_confirm(nk ? "Muted people saved." : "Nobody is muted now.");
+                return 1;
+            }
             for (int i = 0; i < g_n_notify_hits; i++)
                 if (in_rect(g_notify_hits[i].r, x, y)) {
                     if (g_notify_hits[i].cid == 0)      /* REQ-134: the global default */
@@ -30650,6 +30777,14 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 menu_dispatch(hwnd, g_selfcard_btn[i].cmd);
                 return 1;
             }
+    if (g_profile_uid && in_rect(g_prof_mute_btn, x, y)) {
+        const oc_model *pm = model();
+        int on = !(pm && oc_model_is_muted_user(pm, g_profile_uid));
+        if (g_client) oc_client_set_user_mute(g_client, g_profile_uid, on);
+        fb_confirm(on ? "Muted. Their messages stay folded away and no longer notify you." : "Unmuted.");
+        invalidate();
+        return 1;
+    }
     if (g_profile_uid && in_rect(g_prof_dm_btn, x, y)) {
         uint64_t uid = g_profile_uid;
         close_overlays();
@@ -39140,6 +39275,19 @@ static int on_tick(oc_win *hwnd) {
             remember_tick(m);
             if (m) groups_roster_tick(m);
             osn_withdraw_read();
+            /* The muted list changed (MUTED_USERS): repaint, so their messages fold
+             * or open, and ask the daemon for the channel list again, whose unread
+             * counts are its to redo. The first list, at sign-in, asks nothing. */
+            {
+                static uint32_t seen_muted;
+                static oc_client *muted_for;
+                if (muted_for != g_client) { muted_for = g_client; seen_muted = m ? m->muted_seq : 0; }
+                if (m && m->muted_seq != seen_muted) {
+                    if (seen_muted && g_client) oc_client_list_channels(g_client);
+                    seen_muted = m->muted_seq;
+                    invalidate();
+                }
+            }
             /* The daemon's alerts (REQ-263): repaint on any change, and fetch the
              * list again when the counts move while it is on screen. */
             {

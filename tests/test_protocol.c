@@ -2621,6 +2621,41 @@ static void test_usage_frames(void) {
     CHECK(oc_decode_usage(&r, &out, od, ow, oc) == OC_E_MALFORMED);
 }
 
+/* SET_USER_MUTE and MUTED_USERS: one person muted or not, and the whole list
+ * back, an empty one included; a list longer than the cap is refused. */
+static void test_user_mute_frames(void) {
+    static uint8_t buf[4096];
+    oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_user_mute sm = { 42, 1 };
+    CHECK(oc_encode_set_user_mute(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK);
+    oc_header h; oc_rbuf r;
+    CHECK(oc_parse_frame(buf, w.len, &h, &r) == OC_OK && h.msg_type == OC_MSG_SET_USER_MUTE);
+    oc_set_user_mute out = { 0, 0 };
+    CHECK(oc_decode_set_user_mute(&r, &out) == OC_OK && out.muted_id == 42 && out.on == 1);
+
+    uint64_t ids[3] = { 7, 9, 11 }, got[OC_MAX_MUTED_USERS];
+    uint16_t n = 0;
+    oc_muted_users mu = { 3, ids };
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_muted_users(&w, OC_PROTOCOL_VERSION, &mu) == OC_OK);
+    CHECK(oc_parse_frame(buf, w.len, &h, &r) == OC_OK && h.msg_type == OC_MSG_MUTED_USERS);
+    CHECK(oc_decode_muted_users(&r, got, &n) == OC_OK && n == 3 && got[0] == 7 && got[2] == 11);
+
+    oc_muted_users none = { 0, NULL };
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_muted_users(&w, OC_PROTOCOL_VERSION, &none) == OC_OK);
+    CHECK(oc_parse_frame(buf, w.len, &h, &r) == OC_OK);
+    CHECK(oc_decode_muted_users(&r, got, &n) == OC_OK && n == 0);
+    /* The empty list is a 2-byte count; forged to 65535 it is refused before a
+     * row is read. */
+    buf[w.len - 2] = 0xFF; buf[w.len - 1] = 0xFF;
+    CHECK(oc_parse_frame(buf, w.len, &h, &r) == OC_OK);
+    CHECK(oc_decode_muted_users(&r, got, &n) == OC_E_MALFORMED);
+    oc_muted_users big = { OC_MAX_MUTED_USERS + 1, ids };
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_muted_users(&w, OC_PROTOCOL_VERSION, &big) != OC_OK);
+}
+
 /* Every reason code is distinct.
  *
  * This exists because they were not. INVALID_MESSAGE (REQ-224) was added in
@@ -2924,6 +2959,7 @@ int run_protocol_tests(void) {
     test_read_cursor_frames();
     test_storage_status_frames();
     test_usage_frames();
+    test_user_mute_frames();
     test_profile_frames();
     test_tts_frames();
     test_call_frames();

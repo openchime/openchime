@@ -534,46 +534,53 @@ static void test_collect(void) {
      * precedence against real rows; this exercises the shared statement of it
      * that a client's toast gate feeds, where the order is exactly the part
      * that had drifted. Arguments read:
-     *   (own, muted, vip, level, mentioned, keyword, thread_reply, quiet,
-     *    paused). */
+     *   (own, muted, muted_author, vip, level, mentioned, keyword,
+     *    thread_reply, quiet, paused). */
     {
         /* Plain traffic: ALL notifies, NONE does not, MENTIONS needs a reason. */
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_ALL, 0, 0, 0, 0, 0) == 1);
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_NONE, 0, 0, 0, 0, 0) == 0);
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 0, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, 0, OC_NOTIFY_ALL, 0, 0, 0, 0, 0) == 1);
+        CHECK(oc_notify_decide(0, 0, 0, 0, OC_NOTIFY_NONE, 0, 0, 0, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 0, 0, 0) == 0);
         /* At MENTIONS an @-mention and a keyword hit are the same event:
          * REQ-135 makes keywords part of the level, not a separate switch. */
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 1, 0, 0, 0, 0) == 1);
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 0, 1, 0, 0, 0) == 1);
+        CHECK(oc_notify_decide(0, 0, 0, 0, OC_NOTIFY_MENTIONS, 1, 0, 0, 0, 0) == 1);
+        CHECK(oc_notify_decide(0, 0, 0, 0, OC_NOTIFY_MENTIONS, 0, 1, 0, 0, 0) == 1);
         /* And so is a reply in a thread you are in (REQ-061): participants are
          * notified per their level, "independent of whether they were
          * @mentioned" — the same shape keywords have, one input further. */
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 1, 0, 0) == 1);
+        CHECK(oc_notify_decide(0, 0, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 1, 0, 0) == 1);
         /* But it satisfies the LEVEL rather than bypassing anything: NONE still
          * passes nothing, mute still wins, and the schedule still silences. */
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_NONE,     0, 0, 1, 0, 0) == 0);
-        CHECK(oc_notify_decide(0, 1, 0, OC_NOTIFY_MENTIONS, 0, 0, 1, 0, 0) == 0);
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 1, 1, 0) == 0);
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 1, 0, 1) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, 0, OC_NOTIFY_NONE,     0, 0, 1, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 1, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 1, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 1, 1, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 1, 0, 1) == 0);
         /* Your own reply is still not news. */
-        CHECK(oc_notify_decide(1, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 1, 0, 0) == 0);
+        CHECK(oc_notify_decide(1, 0, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 1, 0, 0) == 0);
         /* NONE means none: a mention does not pierce it. Only a person does. */
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_NONE, 1, 1, 0, 0, 0) == 0);
-        CHECK(oc_notify_decide(0, 0, 1, OC_NOTIFY_NONE, 0, 0, 0, 0, 0) == 1);
+        CHECK(oc_notify_decide(0, 0, 0, 0, OC_NOTIFY_NONE, 1, 1, 0, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, 1, OC_NOTIFY_NONE, 0, 0, 0, 0, 0) == 1);
         /* Nor is the workspace's notice: its callers pass it as `own`. */
-        CHECK(oc_notify_decide(1, 0, 1, OC_NOTIFY_ALL, 1, 0, 0, 0, 0) == 0);
+        CHECK(oc_notify_decide(1, 0, 0, 1, OC_NOTIFY_ALL, 1, 0, 0, 0, 0) == 0);
         /* Your own message is not news, whoever you are to yourself. */
-        CHECK(oc_notify_decide(1, 0, 1, OC_NOTIFY_ALL, 1, 1, 0, 0, 0) == 0);
+        CHECK(oc_notify_decide(1, 0, 0, 1, OC_NOTIFY_ALL, 1, 1, 0, 0, 0) == 0);
         /* Mute is absolute (REQ-137): not even a priority person pierces it. */
-        CHECK(oc_notify_decide(0, 1, 1, OC_NOTIFY_ALL, 1, 1, 0, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 1, 0, 1, OC_NOTIFY_ALL, 1, 1, 0, 0, 0) == 0);
+        /* A muted person reaches you by nothing: not ALL, not a mention or a
+         * keyword, not a reply in your thread, not being a priority person too.
+         * The same message from anyone else does. */
+        CHECK(oc_notify_decide(0, 0, 1, 0, OC_NOTIFY_ALL, 0, 0, 0, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 1, 0, OC_NOTIFY_MENTIONS, 1, 1, 1, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 1, 1, OC_NOTIFY_ALL, 1, 1, 1, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, 0, OC_NOTIFY_MENTIONS, 1, 1, 1, 0, 0) == 1);
         /* A priority person pierces the schedule and the pause alike:
          * both say WHEN, and a priority person is a WHO. */
-        CHECK(oc_notify_decide(0, 0, 1, OC_NOTIFY_MENTIONS, 0, 0, 0, 1, 1) == 1);
+        CHECK(oc_notify_decide(0, 0, 0, 1, OC_NOTIFY_MENTIONS, 0, 0, 0, 1, 1) == 1);
         /* For everyone else the schedule and the pause each silence
          * everything, a mention included (REQ-136, REQ-278). */
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_ALL, 0, 0, 0, 1, 0) == 0);
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_ALL, 0, 0, 0, 0, 1) == 0);
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 1, 0, 0, 0, 1) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, 0, OC_NOTIFY_ALL, 0, 0, 0, 1, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, 0, OC_NOTIFY_ALL, 0, 0, 0, 0, 1) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, 0, OC_NOTIFY_MENTIONS, 1, 0, 0, 0, 1) == 0);
     }
 
     /* --- a PRIORITY person pierces the level and the pause (REQ-135) --------
@@ -986,10 +993,11 @@ static void test_keyword_is_not_a_broadcast(void) {
  * here would test nothing the model would ever see. */
 static int client_would_toast(uint64_t me, uint64_t author,
                               uint64_t message_id, uint64_t root_id, int participant,
-                              int muted, unsigned level, int vip,
+                              int muted, int muted_author, unsigned level, int vip,
                               int mentioned, int keyword, int quiet, int paused) {
     oc_model m; oc_model_init(&m);
     m.user_id = me;
+    if (muted_author) { m.n_muted_users = 1; m.muted_users[0] = author; }
 
     oc_ev e;
     memset(&e, 0, sizeof e);
@@ -1070,6 +1078,7 @@ static void test_collect_matches_evaluator(void) {
     int idx = 0, mismatches = 0, notified = 0, client_mismatches = 0;
     for (int thread = 0; thread < 2; thread++)
     for (int muted = 0; muted < 2; muted++)
+    for (int mauthor = 0; mauthor < 2; mauthor++)
     for (unsigned level = 0; level < 3; level++)
     for (int vip = 0; vip < 2; vip++)
     for (int mentioned = 0; mentioned < 2; mentioned++)
@@ -1094,10 +1103,12 @@ static void test_collect_matches_evaluator(void) {
             "DELETE FROM notification_prefs WHERE user_id=%llu AND channel_id=1;"
             "INSERT INTO notification_prefs(user_id,channel_id,level,muted) VALUES(%llu,1,%u,%d);"
             "DELETE FROM priority_people WHERE user_id=%llu;"
+            "DELETE FROM muted_users WHERE user_id=%llu;"
             "UPDATE users SET dnd_mode=%d, allow_start_min=%d, allow_end_min=%d,"
             "                 dnd_until_ms=%llu, tz_offset_min=0 WHERE id=%llu;",
             (unsigned long long)bob,
             (unsigned long long)bob, level, muted,
+            (unsigned long long)bob,
             (unsigned long long)bob,
             quiet ? OC_DND_EVERY_DAY : OC_DND_OFF, allow_start, allow_end,
             (unsigned long long)(paused ? now_ms + 60000ull : 0ull),
@@ -1106,6 +1117,12 @@ static void test_collect_matches_evaluator(void) {
         if (vip) {
             snprintf(sql, sizeof sql,
                 "INSERT INTO priority_people(user_id,person_id) VALUES(%llu,%llu);",
+                (unsigned long long)bob, (unsigned long long)alice);
+            CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+        }
+        if (mauthor) {   /* bob has muted alice, the author */
+            snprintf(sql, sizeof sql,
+                "INSERT INTO muted_users(user_id,muted_id,created_at_ms) VALUES(%llu,%llu,1);",
                 (unsigned long long)bob, (unsigned long long)alice);
             CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
         }
@@ -1138,7 +1155,7 @@ static void test_collect_matches_evaluator(void) {
                                          0, 0, 0, 0,
                                          (int)((now_ms / 60000) % 1440),
                                          (int)((((now_ms / 60000) / 1440) + 4) % 7));
-        int want = oc_notify_decide(0, muted, vip, level,
+        int want = oc_notify_decide(0, muted, mauthor, vip, level,
                                     mentioned, keyword, thread, want_quiet, paused);
         /* Bob if and only if the rule says so, and the bystander never. */
         int got_bob = 0, got_zoe = 0;
@@ -1148,9 +1165,9 @@ static void test_collect_matches_evaluator(void) {
         }
         if (got_bob != want || got_zoe || n != want) {
             mismatches++;
-            printf("  parity: thread=%d muted=%d level=%u vip=%d men=%d kw=%d quiet=%d paused=%d"
+            printf("  parity: thread=%d muted=%d mauthor=%d level=%u vip=%d men=%d kw=%d quiet=%d paused=%d"
                    " -> bob %d (rule says %d), bystander %d, total %d\n",
-                   thread, muted, level, vip, mentioned, keyword, quiet, paused,
+                   thread, muted, mauthor, level, vip, mentioned, keyword, quiet, paused,
                    got_bob, want, got_zoe, n);
         }
 
@@ -1162,7 +1179,7 @@ static void test_collect_matches_evaluator(void) {
          * raise. Bob is the recipient here, so the model is bob's. */
         if (thread) {
             int client_says = client_would_toast(bob, alice, msg, root, got_bob,
-                                                 muted, level, vip, mentioned, keyword,
+                                                 muted, mauthor, level, vip, mentioned, keyword,
                                                  want_quiet, paused);
             if (client_says != want) {
                 client_mismatches++;
@@ -1176,7 +1193,7 @@ static void test_collect_matches_evaluator(void) {
     }
     sqlite3_close(wdb);
 
-    CHECK(idx == 384);
+    CHECK(idx == 768);
     CHECK(mismatches == 0);
     CHECK(client_mismatches == 0);
     /* Both answers occur across the sweep: a rule that says no to everything

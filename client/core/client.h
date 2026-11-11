@@ -342,6 +342,11 @@ void oc_client_set_schedule(oc_client *c, uint8_t mode, int16_t tz_offset_min,
 /* REQ-135: replace my keyword list / my priority people, wholesale. */
 void oc_client_set_keywords(oc_client *c, const char terms[][OC_KEYWORD_MAX], uint8_t n);
 void oc_client_set_priority(oc_client *c, const uint64_t *people, uint8_t n);
+/* Mute (`on`) or unmute one person, for me alone: their messages stop notifying
+ * me and counting as unread, on every device. The answer comes back as the whole
+ * list (the model's `muted_users`); a frontend asks for the channel list again
+ * when it does, so the daemon's unread counts follow. */
+void oc_client_set_user_mute(oc_client *c, uint64_t user_id, int on);
 /* REQ-278: pause notifications for `minutes` from now; 0 ends the pause. */
 void oc_client_set_snooze(oc_client *c, uint32_t minutes);
 /* Share my read receipts, or stop (REQ-090). Mine only: I still see the

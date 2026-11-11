@@ -422,7 +422,12 @@ static int collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
              * 0 for an ordinary send: the ?5 <> 0 test makes this false, so a
              * channel message keeps exactly the audience it had. */
             "       ( ?5 <> 0 AND "
-                    OC_THREAD_PARTICIPANT_SQL("cm.user_id", "?5") " ) "
+                    OC_THREAD_PARTICIPANT_SQL("cm.user_id", "?5") " ), "
+            /* MUTED_AUTHOR: has this recipient muted the author? Nothing from a
+             * muted person reaches them, a call's starter included (?2 is the
+             * starter for an invitation). */
+            "       EXISTS(SELECT 1 FROM muted_users mu "
+            "               WHERE mu.user_id = cm.user_id AND mu.muted_id = ?2) "
             "FROM channel_members cm "
             "JOIN device_tokens dt ON dt.user_id = cm.user_id "
             "JOIN users u ON u.id = cm.user_id "
@@ -478,6 +483,7 @@ static int collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
         int mentioned   = sqlite3_column_int(st, 14);
         int keyword_hit = sqlite3_column_int(st, 15);
         int thread_reply= sqlite3_column_int(st, 16);
+        int muted_author= sqlite3_column_int(st, 17);
         /* The recipient's own clock, not the server's (REQ-136). */
         long long lmin  = (long long)(now_ms / 60000) + tz_off;
         int local_min   = (int)(((lmin % 1440) + 1440) % 1440);
@@ -497,7 +503,7 @@ static int collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
          * not policy: an author has no device row to push to in this audience
          * at all. The argument stays in the call so the shape of the decision
          * is the same one the clients make, where the author IS in the model. */
-        if (!oc_notify_decide(0, muted, vip, level,
+        if (!oc_notify_decide(0, muted, muted_author, vip, level,
                               mentioned, keyword_hit, thread_reply,
                               quiet, paused)) continue;
 

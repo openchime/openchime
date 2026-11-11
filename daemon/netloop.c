@@ -3923,6 +3923,17 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_USER_MUTE) {
+            oc_set_user_mute sm;
+            if (oc_decode_set_user_mute(&p, &sm) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_USER_MUTE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->target_user_id = sm.muted_id;
+            j->mute_on = sm.on ? 1 : 0;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_PRIORITY) {
             uint64_t people[OC_MAX_PRIORITY]; uint8_t n = 0;
             if (oc_decode_set_priority(&p, people, OC_MAX_PRIORITY, &n) != OC_OK) return -1;
@@ -8175,6 +8186,13 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             size_t al = w.len;
             send_to_user(ep, conns, r->user_id, 0, g_enc, al);
         }
+        if (r->mu_have) {
+            /* And whom they have muted, the other list about WHO. */
+            oc_muted_users mu = { r->mu_n, r->mu_ids };
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            if (oc_encode_muted_users(&w, OC_PROTOCOL_VERSION, &mu) == OC_OK)
+                send_to_user(ep, conns, r->user_id, 0, g_enc, w.len);
+        }
         break;
     }
     case OC_RES_THREAD_LIST: {
@@ -8224,6 +8242,15 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         /* And into the net thread's own copy, which is what other people's DND
          * badge is computed from. The tick below announces the change. */
         cache_schedule(conns, r->user_id, r);
+        break;
+    }
+    case OC_RES_MUTED_USERS: {
+        /* To every connection of theirs: a mute set on one device holds on all.
+         * The muted person is sent nothing. */
+        oc_muted_users mu = { r->mu_n, r->mu_ids };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_muted_users(&w, OC_PROTOCOL_VERSION, &mu) == OC_OK)
+            send_to_user(ep, conns, r->user_id, 0, g_enc, w.len);
         break;
     }
     case OC_RES_ALERT_PREFS: {

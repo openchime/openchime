@@ -369,6 +369,15 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
             for (size_t k = rstart; k < r->n; k++) r->v[k].mi = mi;
             return;
         }
+        /* A person this reader muted: one line saying so, its body, files and
+         * reactions folded away until `m` shows this one message. */
+        if (oc_model_is_muted_user(mdl, m->author_id) && !tui_expanded(m->message_id)) {
+            static const char MUTED[] = "    Message from a muted person (m to show)";
+            char *d = malloc(sizeof MUTED);
+            if (d) { strcpy(d, MUTED); rows_push(r, d, TB_BLACK | TB_BOLD); }
+            for (size_t k = rstart; k < r->n; k++) r->v[k].mi = mi;
+            return;
+        }
         /* The source as written (MARKDOWN.md §5), except a spoiler, covered
          * until it is shown (§1d), a time token, which is shown as its
          * time here: the token itself reads in UTC (§1c), and an id-form
@@ -3363,6 +3372,9 @@ int main(int argc, char **argv) {
             if (!wm->connected) g_ws[i].settings_req = 0;
             else if (wm->authed && !g_ws[i].settings_req) {
                 oc_client_list_settings(g_ws[i].cl);
+                /* And the notification state, which carries whom this person
+                 * has muted: their messages show folded away here too. */
+                oc_client_list_notify_prefs(g_ws[i].cl);
                 g_ws[i].settings_req = 1;
             }
         }

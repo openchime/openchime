@@ -1675,7 +1675,8 @@ void oc_model_set_read_marker(oc_model *m, uint64_t channel_id, uint64_t message
         }
         int vip = oc_model_is_priority(m, msg->author_id);
         if (oc_notify_decide(msg->author_id == m->user_id || oc_model_is_workspace_sender(m, msg->author_id),
-                             c->muted, vip, c->notify_level, men, kw, 0, 0, 0)) {
+                             c->muted, oc_model_is_muted_user(m, msg->author_id), vip, c->notify_level,
+                             men, kw, 0, 0, 0)) {
             n++;
             if (men || kw || vip) pri++;
         }
@@ -1807,6 +1808,13 @@ int oc_model_is_priority(const oc_model *m, uint64_t user_id) {
     return 0;
 }
 
+int oc_model_is_muted_user(const oc_model *m, uint64_t user_id) {
+    if (!m || !user_id) return 0;
+    for (uint16_t i = 0; i < m->n_muted_users; i++)
+        if (m->muted_users[i] == user_id) return 1;
+    return 0;
+}
+
 const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
                                    uint64_t since_id, int quiet, int paused,
                                    int *mentioned, int *keyword_hit, int *vip) {
@@ -1837,7 +1845,8 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
         /* thread_reply is 0: this watches a channel's main scroll, and a thread
          * reply is deliberately not in it (REQ-060), so it never sees one.
          * Replies are answered by oc_model_thread_notify_take instead. */
-        if (!oc_notify_decide(oc_model_is_workspace_sender(m, msg->author_id), c->muted, is_vip,
+        if (!oc_notify_decide(oc_model_is_workspace_sender(m, msg->author_id), c->muted,
+                              oc_model_is_muted_user(m, msg->author_id), is_vip,
                               c->notify_level, men, kw, 0, quiet, paused)) continue;
 
         pick = msg;                      /* ascending ids: the newest wins */
@@ -1896,7 +1905,7 @@ size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
          * else is ours to supply, and mute, the schedule and the pause still
          * silence it — participation satisfies the mentions LEVEL, it does not
          * step around it. */
-        if (!oc_notify_decide(0, c->muted, is_vip, c->notify_level,
+        if (!oc_notify_decide(0, c->muted, oc_model_is_muted_user(m, n->author_id), is_vip, c->notify_level,
                               n->mentioned, n->keyword_hit, 1, quiet, paused)) continue;
         if (out && kept < max) out[kept++] = *n;
     }
@@ -1928,8 +1937,8 @@ size_t oc_model_call_notify_take(oc_model *m, int quiet, int paused,
         if (!v || v->call_id != n->call_id || !oc_model_call_invited(v, m->user_id)) continue;
         int muted = c ? c->muted : 0;
         unsigned level = c ? c->notify_level : OC_NOTIFY_ALL;
-        if (!oc_notify_decide(0, muted, oc_model_is_priority(m, n->starter), level,
-                              1, 0, 0, quiet, paused)) continue;
+        if (!oc_notify_decide(0, muted, oc_model_is_muted_user(m, n->starter), oc_model_is_priority(m, n->starter),
+                              level, 1, 0, 0, quiet, paused)) continue;
         if (out && kept < max) out[kept++] = *n;
     }
     m->n_call_notices = 0;
@@ -2128,7 +2137,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             int vip = oc_model_is_priority(m, e->author_id);
             if (e->message_id > c->read_marker &&
                 oc_notify_decide(e->author_id == m->user_id || oc_model_is_workspace_sender(m, e->author_id),
-                                 c->muted, vip, c->notify_level, men, kw, 0, 0, 0)) {
+                                 c->muted, oc_model_is_muted_user(m, e->author_id), vip, c->notify_level,
+                                 men, kw, 0, 0, 0)) {
                 c->unread++;
                 if (men || kw || vip) c->priority_unread++;   /* the badge's count, not its dot */
             }
@@ -2242,6 +2252,16 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->n_pri_people = e->n_pri_people;
         for (uint8_t i = 0; i < e->n_pri_people; i++) m->pri_people[i] = e->pri_people[i];
         break;
+    case OC_EV_MUTED_USERS: {
+        /* The whole list, as the daemon holds it. Live counting uses it from
+         * now on; the counts already standing are the daemon's to redo, which
+         * oc_client_set_user_mute asks for with the channel list. */
+        size_t n = e->n_ids < OC_MAX_MUTED_USERS ? e->n_ids : OC_MAX_MUTED_USERS;
+        for (size_t i = 0; i < n; i++) m->muted_users[i] = e->ids[i];
+        m->n_muted_users = (uint16_t)n;
+        m->muted_seq++;
+        break;
+    }
     case OC_EV_READ_RECEIPTS:
         m->share_receipts = e->status ? 1 : 0;
         break;

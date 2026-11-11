@@ -1988,6 +1988,41 @@ static int bc_counts(oc_model *m, uint64_t mid) {
     const oc_msg *x = bc_find(m, mid);
     return x && x->body && oc_model_mentions_me_in(m, x->broadcast_stored, x->body, strlen(x->body));
 }
+/* A muted person (MUTED_USERS): the list folds into the model, and their
+ * messages -- a mention of me included -- count as unread for nothing here,
+ * while the same from someone else still does. Unmuting puts them back. */
+static void test_muted_people_model(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("ada"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 40; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("room"); oc_model_apply(&m, &e);
+
+    /* bob muted: the event carries the whole list, and the model takes it. */
+    uint32_t seq0 = m.muted_seq;
+    memset(&e, 0, sizeof e); e.type = OC_EV_MUTED_USERS;
+    e.ids = calloc(1, sizeof *e.ids); e.ids[0] = 2; e.n_ids = 1;
+    oc_model_apply(&m, &e);
+    free(e.ids);
+    CHECK(oc_model_is_muted_user(&m, 2) && !oc_model_is_muted_user(&m, 1) && m.muted_seq != seq0);
+
+    bc_message(&m, 200, "hello there", 0);
+    bc_message(&m, 201, "@ada look at this", 0);
+    const oc_channel *c = oc_model_channel(&m, 40);
+    CHECK(c && c->unread == 0 && c->priority_unread == 0);
+
+    /* Unmuted: the next message from bob counts again, the mention as priority. */
+    memset(&e, 0, sizeof e); e.type = OC_EV_MUTED_USERS; e.ids = NULL; e.n_ids = 0;
+    oc_model_apply(&m, &e);
+    CHECK(!oc_model_is_muted_user(&m, 2));
+    bc_message(&m, 202, "@ada again", 0);
+    c = oc_model_channel(&m, 40);
+    CHECK(c && c->unread == 1 && c->priority_unread == 1);
+    oc_model_free(&m);
+}
+
 static void test_broadcast_stored_model(void) {
     oc_model m; oc_model_init(&m);
     m.user_id = 1;
@@ -6065,6 +6100,7 @@ int run_client_core_tests(void) {
     test_spoiler_mentions_me();
     test_thread_meta_live();
     test_broadcast_stored_model();
+    test_muted_people_model();
     test_workspace_sender_model();
     test_time_preview();
     test_spoiler_preview();

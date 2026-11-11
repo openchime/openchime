@@ -950,6 +950,15 @@ void oc_client_set_keywords(oc_client *c, const char terms[][OC_KEYWORD_MAX], ui
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_set_user_mute(oc_client *c, uint64_t user_id, int on) {
+    if (!c || !user_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_USER_MUTE);
+    if (!cmd) return;
+    cmd->mute_user_id = user_id;
+    cmd->op = (uint8_t)(on ? 1 : 0);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_set_priority(oc_client *c, const uint64_t *people, uint8_t n) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PRIORITY);

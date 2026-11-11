@@ -1345,6 +1345,18 @@ static const char MIGRATION_0076[] =
     ") WITHOUT ROWID;"
     "CREATE INDEX user_active_days_day ON user_active_days(day);";
 
+static const char MIGRATION_0077[] =
+    /* Muted people: whom each person has chosen to stop hearing from. Their
+     * messages, replies, reactions and mentions notify that person nowhere and
+     * count as unread for them nowhere; the muted person is told nothing. A set
+     * per person, as priority_people (0035) is, the other list about WHO. */
+    "CREATE TABLE muted_users ("
+    "  user_id       INTEGER NOT NULL REFERENCES users(id),"
+    "  muted_id      INTEGER NOT NULL REFERENCES users(id),"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  PRIMARY KEY (user_id, muted_id)"
+    ") WITHOUT ROWID;";
+
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
      * author is doing, and the daemon records that as its own object beside the
@@ -1709,6 +1721,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 74, MIGRATION_0074 },
     { 75, MIGRATION_0075 },
     { 76, MIGRATION_0076 },
+    { 77, MIGRATION_0077 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

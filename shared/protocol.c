@@ -1936,6 +1936,35 @@ oc_result oc_decode_usage(oc_rbuf *r, oc_usage *m, oc_usage_day *days, oc_usage_
     return r_done(r);
 }
 
+oc_result oc_encode_set_user_mute(oc_wbuf *w, uint16_t version, const oc_set_user_mute *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_USER_MUTE);
+    oc_w_u64(w, m->muted_id);
+    oc_w_u8(w, m->on ? 1 : 0);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_user_mute(oc_rbuf *r, oc_set_user_mute *m) {
+    m->muted_id = oc_r_u64(r);
+    m->on = oc_r_u8(r);
+    return r_done(r);
+}
+
+oc_result oc_encode_muted_users(oc_wbuf *w, uint16_t version, const oc_muted_users *m) {
+    if (m->count > OC_MAX_MUTED_USERS) return OC_E_OVERFLOW;
+    size_t off = oc_frame_begin(w, version, OC_MSG_MUTED_USERS);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) oc_w_u64(w, m->ids[i]);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_muted_users(oc_rbuf *r, uint64_t *ids, uint16_t *out_n) {
+    uint16_t n = oc_r_u16(r);
+    if (n > OC_MAX_MUTED_USERS) return OC_E_MALFORMED;
+    for (uint16_t i = 0; i < n; i++) ids[i] = oc_r_u64(r);
+    *out_n = n;
+    return r_done(r);
+}
+
 oc_result oc_encode_client_settings(oc_wbuf *w, uint16_t version, const oc_client_settings *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CLIENT_SETTINGS);
     oc_w_str(w, m->client_type);

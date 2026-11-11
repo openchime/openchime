@@ -318,6 +318,9 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * UTC days, for an owner or admin. Answered OC_RES_USAGE, or
         * OC_RES_USAGE_ERR (FORBIDDEN, INVALID). Read-only. */
        OC_JOB_USAGE = 153,
+       /* SET_USER_MUTE: mute (mute_on 1) or unmute target_user_id for user_id
+        * alone. Answered OC_RES_MUTED_USERS to every connection of user_id. */
+       OC_JOB_SET_USER_MUTE = 154,
        /* Reminders come due (REQ-283), on the scheduled-message tick: each
         * fires once, answered as one OC_RES_REMINDER_DUE apiece. Write. */
        OC_JOB_FIRE_REMINDERS = 160 };
@@ -513,6 +516,9 @@ typedef struct oc_job {
 
     /* USAGE: how many UTC days, today included (1..OC_USAGE_MAX_DAYS). */
     uint16_t       usage_days;
+
+    /* SET_USER_MUTE: 1 mutes target_user_id, 0 unmutes. */
+    uint8_t        mute_on;
 
     /* SEARCH: query text is carried in body/body_len; this bounds the result.
      * `search_sort` is OC_SEARCH_*, and `search_cursor_rank` the relevance
@@ -826,6 +832,8 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_FOUND_AT_TIME = 127,
        /* The usage figures (`usage`) to the asker, or why not (err_code). */
        OC_RES_USAGE = 128, OC_RES_USAGE_ERR = 129,
+       /* Everyone user_id has muted (mu_ids), to every connection of theirs. */
+       OC_RES_MUTED_USERS = 130,
        /* A reminder fired: user_id's, on message_id in channel_id, at
         * server_time; saved_at and remind_at the item's. To that person's
         * connections and their devices' push. A chain, one per reminder; an
@@ -1394,6 +1402,11 @@ typedef struct oc_dbres {
     uint8_t             al_n_terms;
     uint64_t           *al_people;     /* heap */
     uint8_t             al_n_people;
+    /* OC_RES_MUTED_USERS, and with the alert preferences at sign-in: everyone
+     * user_id has muted. `mu_have` once read, so an empty list is still sent. */
+    uint64_t           *mu_ids;        /* heap */
+    uint16_t            mu_n;
+    uint8_t             mu_have;
     /* OC_RES_SNOOZE, and carried on AUTH_OK so the net thread can seed its
      * in-memory copy without a second round trip. Already expiry-checked. */
     uint64_t            snooze_until_ms;

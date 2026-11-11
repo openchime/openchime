@@ -2086,9 +2086,23 @@ identity — there is nothing an add/remove pair could name. **`ALERT_PREFS`
 (S → C), `0x00D0`** `{ n_terms: u8, terms…, n_people: u8, people… }` returns both.
 
 *One request, all of it.* `LIST_NOTIFY_PREFS` answers with `NOTIFY_PREFS`, then
-`SNOOZE`, `SCHEDULE` and `ALERT_PREFS`, in that order — so a client never has to
-assemble its notification settings from four round trips or decide what to show
-while half of them are outstanding.
+`SNOOZE`, `SCHEDULE`, `ALERT_PREFS` and `MUTED_USERS`, in that order — so a client
+never has to assemble its notification settings from five round trips or decide
+what to show while half of them are outstanding. Both clients ask for it as soon
+as they are signed in.
+
+**`SET_USER_MUTE` (C → S), `0x0130`** `{ muted_id: u64, on: u8 }` — mute (`on` 1)
+or unmute one person, for me alone. Nothing a muted person writes notifies me —
+not a message, a reply, a reaction, a mention or a call, at any level, even when
+they are also one of my priority people (`oc_notify_decide`'s `muted_author`, which
+push and both clients ask alike) — and none of it counts as unread for me or
+appears in my activity. A direct message from them is still delivered. Muting
+myself, nobody, the workspace's own sender or an id that is no one is ignored.
+The muted person is sent nothing and sees no change. **`MUTED_USERS` (S → C),
+`0x0131`** `{ count: u16, count × u64 }` — everyone I have muted, at most
+`OC_MAX_MUTED_USERS` (256): answering `SET_USER_MUTE`, to every connection of mine,
+and in the `LIST_NOTIFY_PREFS` answer. A client shows a muted person's messages
+folded to one line until revealed, one at a time, on that device alone.
 
 *Why separate frames.* `NOTIFY_PREFS` ends in a repeated list, so anything added
 to its fixed part shifts every entry after the first — the repeated-list trap that
@@ -3643,6 +3657,8 @@ this table cannot silently gain a shared value.
 | `0x011F` | `FOUND_AT_TIME` | S → C | its answer: the first at or after the moment, else the last before |
 | `0x0120` | `USAGE_REQ` | C → S | owner/admin: the workspace's usage over the last days (REQ-043) |
 | `0x0121` | `USAGE` | S → C | active members by day and week, messages by day, the busiest channels |
+| `0x0130` | `SET_USER_MUTE` | C → S | mute or unmute one person, for me alone |
+| `0x0131` | `MUTED_USERS` | S → C | to my connections: everyone I have muted, on change and with `LIST_NOTIFY_PREFS` |
 
 ## 10. Connection state machine
 

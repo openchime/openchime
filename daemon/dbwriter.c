@@ -725,6 +725,7 @@ void oc_dbres_free(oc_dbres *r) {
     if (!r) return;
     free(r->dest_members);
     free(r->usage);
+    free(r->mu_ids);
     free(r->alert_rows);
     free(r->body);
     free(r->pk_creds);
@@ -5699,6 +5700,9 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         "                             WHERE dc.user_id=?1 AND dc.channel_id=c.id),0) "
         "       AND COALESCE((SELECT np.muted FROM notification_prefs np "
         "                      WHERE np.user_id=?1 AND np.channel_id=c.id),0) = 0 "
+        /* Nor is a person the reader muted (`muted_author`), whoever else they are. */
+        "       AND NOT EXISTS(SELECT 1 FROM muted_users mu "
+        "                       WHERE mu.user_id=?1 AND mu.muted_id=x.author_id) "
         "       AND ( EXISTS(SELECT 1 FROM priority_people pp "
         "                     WHERE pp.user_id=?1 AND pp.person_id=x.author_id) "
         "          OR COALESCE((SELECT np.level FROM notification_prefs np "
@@ -7007,6 +7011,8 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
             "   AND m.author_id NOT IN (SELECT su.id FROM users su WHERE su.is_system=1) "
             "   AND m.id > COALESCE(dc.message_id, 0) "
             "   AND COALESCE(np.muted, 0) = 0 "
+            /* Nor from a person I muted: their messages are unread for nobody here. */
+            "   AND NOT EXISTS(SELECT 1 FROM muted_users mu WHERE mu.user_id = ?1 AND mu.muted_id = m.author_id) "
             "   AND ( ?4 = 1 "
             "         OR (?4 = 2 AND c.kind = 'dm') "
             "         OR (?4 = 3 AND c.kind <> 'dm' "
@@ -7092,7 +7098,10 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
         "   WHERE s.user_id = ?1 AND s.reminded_at_ms IS NOT NULL AND m.deleted_at_ms IS NULL "
         "     AND EXISTS(SELECT 1 FROM channel_members cm "
         "                 WHERE cm.channel_id = m.channel_id AND cm.user_id = ?1) "
-        ") ORDER BY at DESC LIMIT ?3;";
+        /* A person I muted mentions, reacts and replies to nobody's feed of mine;
+         * my own reminders stay, whoever wrote the message they are on. */
+        ") WHERE kind = 5 OR actor_id NOT IN (SELECT mu.muted_id FROM muted_users mu WHERE mu.user_id = ?1) "
+        "  ORDER BY at DESC LIMIT ?3;";
 
     sqlite3_prepare_v2(db, SQL, -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
@@ -9913,6 +9922,50 @@ static oc_dbres *process_set_schedule(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* The people `uid` has muted, as MUTED_USERS carries them: read with the alert
+ * preferences, so a sign-in tells the client both lists about WHO at once. */
+static void fill_muted_users(sqlite3 *db, uint64_t uid, oc_dbres *r) {
+    sqlite3_stmt *st = NULL;
+    r->mu_ids = calloc(OC_MAX_MUTED_USERS, sizeof *r->mu_ids);
+    if (!r->mu_ids) return;
+    sqlite3_prepare_v2(db, "SELECT muted_id FROM muted_users WHERE user_id=? ORDER BY muted_id;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    while (r->mu_n < OC_MAX_MUTED_USERS && sqlite3_step(st) == SQLITE_ROW)
+        r->mu_ids[r->mu_n++] = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    r->mu_have = 1;
+}
+
+/* Mute or unmute one person, for the asker alone (SET_USER_MUTE). Muting
+ * yourself, the workspace's own sender or nobody is refused by doing nothing;
+ * the muted person is told nothing. Answered with the whole list, to every
+ * connection of the asker. */
+static oc_dbres *process_set_user_mute(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_MUTED_USERS;
+    r->user_id = j->user_id;
+    uint64_t who = j->target_user_id;
+    if (who && who != j->user_id) {
+        sqlite3_stmt *st = NULL;
+        if (j->mute_on)
+            sqlite3_prepare_v2(db,
+                "INSERT OR IGNORE INTO muted_users(user_id, muted_id, created_at_ms) "
+                "SELECT ?1, ?2, ?3 WHERE EXISTS(SELECT 1 FROM users WHERE id=?2 AND is_system=0);",
+                -1, &st, NULL);
+        else
+            sqlite3_prepare_v2(db, "DELETE FROM muted_users WHERE user_id=?1 AND muted_id=?2;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)who);
+        if (j->mute_on) sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    fill_muted_users(db, j->user_id, r);
+    return r;
+}
+
 /* My keywords and my priority people (REQ-135). Read together because they are
  * one idea in the product — "what reaches me regardless of level" — and a client
  * that showed one without the other would be showing half a setting. */
@@ -9934,6 +9987,7 @@ static void fill_alert_prefs(sqlite3 *db, uint64_t uid, oc_dbres *r) {
     while (r->al_people && r->al_n_people < OC_MAX_PRIORITY && sqlite3_step(st) == SQLITE_ROW)
         r->al_people[r->al_n_people++] = (uint64_t)sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
+    fill_muted_users(db, uid, r);
 }
 
 static void build_alert_prefs(sqlite3 *db, uint64_t uid, oc_dbres *r) {
@@ -11791,6 +11845,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_SCHEDULE)    return process_set_schedule(w->db, j);
     if (j->type == OC_JOB_SET_KEYWORDS)    return process_set_keywords(w->db, j);
     if (j->type == OC_JOB_SET_PRIORITY)    return process_set_priority(w->db, j);
+    if (j->type == OC_JOB_SET_USER_MUTE)   return process_set_user_mute(w->db, j);
     if (j->type == OC_JOB_SET_SNOOZE)      return process_set_snooze(w->db, j);
     if (j->type == OC_JOB_SET_TZ_OFFSET)   return process_set_tz_offset(w->db, j);
     if (j->type == OC_JOB_READ_RECEIPTS)   return process_read_receipts(w->db, j);

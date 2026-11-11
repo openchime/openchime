@@ -1767,6 +1767,14 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     oc_queue_push(to_ui, e);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_MUTED_USERS) {
+            uint64_t *ids = calloc(OC_MAX_MUTED_USERS, sizeof *ids);
+            uint16_t n = 0;
+            if (!ids) return -1;
+            if (oc_decode_muted_users(&p, ids, &n) != OC_OK) { free(ids); return -1; }
+            oc_ev *e = oc_ev_new(OC_EV_MUTED_USERS);
+            if (e) { e->ids = ids; e->n_ids = n; oc_queue_push(to_ui, e); }
+            else free(ids);
         } else if (hdr.msg_type == OC_MSG_ALERT_PREFS) {
             oc_slice terms[OC_MAX_KEYWORDS]; uint8_t nt = 0;
             uint64_t people[OC_MAX_PRIORITY]; uint8_t np = 0;
@@ -3795,6 +3803,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_priority sp = { c->n_pri_people, c->pri_people };
                 if (oc_encode_set_priority(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_USER_MUTE) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_user_mute sm = { c->mute_user_id, (uint8_t)(c->op ? 1 : 0) };
+                if (oc_encode_set_user_mute(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SET_READ_RECEIPTS) {

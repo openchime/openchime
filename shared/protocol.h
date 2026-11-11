@@ -618,6 +618,8 @@ typedef enum {
     OC_MSG_FOUND_AT_TIME        = 0x011F, /* S->C, its answer: the first at or after it, else the last before */
     OC_MSG_USAGE_REQ            = 0x0120, /* C->S, owner/admin: the workspace's usage over the last days */
     OC_MSG_USAGE                = 0x0121, /* S->C, active members by day and week, messages by day, busiest channels */
+    OC_MSG_SET_USER_MUTE        = 0x0130, /* C->S, mute or unmute one person, for me alone */
+    OC_MSG_MUTED_USERS          = 0x0131, /* S->C, to my connections: everyone I have muted, at sign-in and on change */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -1490,6 +1492,14 @@ typedef struct { uint8_t count; const oc_slice *terms; } oc_set_keywords;
 typedef struct { uint8_t count; const uint64_t *people; } oc_set_priority;
 typedef struct { uint8_t n_terms; const oc_slice *terms;
                  uint8_t n_people; const uint64_t *people; } oc_alert_prefs;
+/* Muted people: the people one person has chosen to stop hearing from. Their
+ * messages, replies, reactions and mentions notify that person nowhere and count
+ * as unread for nobody who muted them, and a client shows them folded away until
+ * revealed. Kept by the daemon so every device and push agree; the muted person
+ * is told nothing and sees no change. */
+#define OC_MAX_MUTED_USERS 256u
+typedef struct { uint64_t muted_id; uint8_t on; } oc_set_user_mute;
+typedef struct { uint16_t count; const uint64_t *ids; } oc_muted_users;
 
 /* One thread in the aggregated view (REQ-062). `unread` counts replies by other
  * people past my per-thread cursor — a channel cursor cannot answer this, since
@@ -2110,6 +2120,11 @@ oc_result oc_encode_set_schedule(oc_wbuf *w, uint16_t version, const oc_schedule
 oc_result oc_encode_schedule(oc_wbuf *w, uint16_t version, const oc_schedule *m);
 oc_result oc_encode_set_keywords(oc_wbuf *w, uint16_t version, const oc_set_keywords *m);
 oc_result oc_encode_set_priority(oc_wbuf *w, uint16_t version, const oc_set_priority *m);
+oc_result oc_encode_set_user_mute(oc_wbuf *w, uint16_t version, const oc_set_user_mute *m);
+oc_result oc_decode_set_user_mute(oc_rbuf *r, oc_set_user_mute *m);
+oc_result oc_encode_muted_users(oc_wbuf *w, uint16_t version, const oc_muted_users *m);
+/* Into `ids`, which holds OC_MAX_MUTED_USERS; a frame with more is refused. */
+oc_result oc_decode_muted_users(oc_rbuf *r, uint64_t *ids, uint16_t *out_n);
 oc_result oc_encode_alert_prefs(oc_wbuf *w, uint16_t version, const oc_alert_prefs *m);
 oc_result oc_encode_list_threads(oc_wbuf *w, uint16_t version, const oc_list_threads *m);
 oc_result oc_encode_thread_summary(oc_wbuf *w, uint16_t version, const oc_thread_summary *m);

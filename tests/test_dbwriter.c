@@ -2443,7 +2443,9 @@ static void test_index_mentions(void) {
                            "ALTER TABLE saved_items DROP COLUMN remind_at_ms;"
                            "ALTER TABLE saved_items DROP COLUMN reminded_at_ms;"
                            /* 0076's active days. */
-                           "DROP TABLE user_active_days;",
+                           "DROP TABLE user_active_days;"
+                           /* 0077's muted people. */
+                           "DROP TABLE muted_users;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -4312,7 +4314,7 @@ static void test_badge_matches_evaluator(void) {
             CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
         }
 
-        int want = oc_notify_decide(0, muted, vip, level, mentioned, keyword, 0, 0, 0);
+        int want = oc_notify_decide(0, muted, 0, vip, level, mentioned, keyword, 0, 0, 0);
         oc_dbres *r = list_channels(w, bob);
         int got = -1;
         if (r) {
@@ -11423,11 +11425,88 @@ static void test_usage(void) {
     cleanup_db(path);
 }
 
+/* Muted people: set, cleared and answered with the whole list; a muted
+ * author's messages and mention count as unread for nothing and leave the
+ * activity feed, someone else's still do; the muted person's own counts are as
+ * they were; yourself, the workspace and nobody cannot be muted. */
+static oc_dbres *mute_q(oc_dbwriter *w, uint64_t uid, uint64_t who, int on) {
+    oc_job *j = oc_job_new(OC_JOB_SET_USER_MUTE, 960);
+    j->user_id = uid; j->target_user_id = who; j->mute_on = (uint8_t)on;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static void mute_send(oc_dbwriter *w, uint64_t uid, const char *body, uint8_t tag) {
+    oc_job *j = oc_job_new(OC_JOB_SEND, 961);
+    j->user_id = uid; j->channel_id = OC_DEFAULT_CHANNEL;
+    memset(j->idem, tag, sizeof j->idem);
+    oc_job_set_body(j, body, strlen(body));
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_SEND_OK);
+    oc_dbres_free(r);
+}
+static int mute_unread(oc_dbwriter *w, uint64_t uid) {
+    oc_dbres *r = list_channels(w, uid);
+    int got = -1;
+    for (size_t i = 0; r && i < r->n_chlist; i++)
+        if (r->chlist[i].channel_id == OC_DEFAULT_CHANNEL) got = (int)r->chlist[i].unread;
+    oc_dbres_free(r);
+    return got;
+}
+
+static void test_muted_people(void) {
+    const char *path = tdb("muted.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t ada = reg(w, "mu-ada", "pw", OC_ROLE_OWNER);
+    uint64_t bob = reg(w, "mu-bob", "pw", OC_ROLE_MEMBER);
+    uint64_t cy  = reg(w, "mu-cy", "pw", OC_ROLE_MEMBER);
+    CHECK(ada && bob && cy);
+
+    oc_dbres *r = mute_q(w, ada, bob, 1);
+    CHECK(r && r->type == OC_RES_MUTED_USERS && r->user_id == ada && r->mu_n == 1 && r->mu_ids[0] == bob);
+    oc_dbres_free(r);
+    /* Twice is once. */
+    r = mute_q(w, ada, bob, 1);
+    CHECK(r && r->mu_n == 1);
+    oc_dbres_free(r);
+
+    mute_send(w, bob, "hello there", 0x41);
+    mute_send(w, bob, "@mu-ada look", 0x42);
+    mute_send(w, cy, "from cy", 0x43);
+    mute_send(w, ada, "from ada", 0x44);
+    /* ada: only cy's counts; bob's two, his mention of her included, do not. */
+    CHECK(mute_unread(w, ada) == 1);
+    /* bob, who is muted, sees no change: ada's and cy's both count for him. */
+    CHECK(mute_unread(w, bob) == 2);
+    /* ada's activity feed leaves bob's mention out. */
+    r = list_activity(w, ada);
+    CHECK(r != NULL);
+    for (size_t i = 0; r && i < r->n_alist; i++) CHECK(r->alist[i].actor_id != bob);
+    oc_dbres_free(r);
+
+    /* Unmuted: bob's count again, and the list says nobody. */
+    r = mute_q(w, ada, bob, 0);
+    CHECK(r && r->type == OC_RES_MUTED_USERS && r->mu_n == 0 && r->mu_have);
+    oc_dbres_free(r);
+    CHECK(mute_unread(w, ada) == 3);
+
+    /* Yourself, nobody, and someone who does not exist: nothing is stored. */
+    r = mute_q(w, ada, ada, 1);  CHECK(r && r->mu_n == 0); oc_dbres_free(r);
+    r = mute_q(w, ada, 0, 1);    CHECK(r && r->mu_n == 0); oc_dbres_free(r);
+    r = mute_q(w, ada, 999999, 1); CHECK(r && r->mu_n == 0); oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_auth_pool();
     test_usage();
+    test_muted_people();
     test_change_password();
     test_groups_manage();
     test_groups_membership();

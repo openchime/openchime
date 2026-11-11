@@ -673,6 +673,12 @@ typedef struct {
     uint8_t   n_kw_terms;
     uint64_t  pri_people[OC_MAX_PRIORITY];
     uint8_t   n_pri_people;
+    /* The people I have muted (MUTED_USERS), as the daemon last said: their
+     * messages notify me nowhere, count as unread for nobody here, and show
+     * folded away until revealed, which is each frontend's own view state. */
+    uint64_t  muted_users[OC_MAX_MUTED_USERS];
+    uint16_t  n_muted_users;
+    uint32_t  muted_seq;          /* moves with every change */
     /* REQ-278: when the manual PAUSE ends, 0 for none. Distinct from the window
      * above in type as well as in name — one instant against a daily range. */
     uint64_t  snooze_until_ms;
@@ -1260,6 +1266,8 @@ int oc_model_keyword_hit(const oc_model *m, const char *body, size_t len,
                          size_t *span_start, size_t *span_len);
 /* Is `user_id` one of my priority people? */
 int oc_model_is_priority(const oc_model *m, uint64_t user_id);
+/* Have I muted `user_id`? */
+int oc_model_is_muted_user(const oc_model *m, uint64_t user_id);
 
 /* Which of a channel's NEW messages should interrupt me, if any?
  *
