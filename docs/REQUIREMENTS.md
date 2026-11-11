@@ -1733,7 +1733,10 @@ where one exists.
   network** — an IP allowlist / CIDR restriction enforced at connection accept,
   refusing a connection from outside the permitted ranges before authentication —
   for organizations requiring network-level access control. The default has been
-  unrestricted.
+  unrestricted. Delivered as `OPENCHIME_ALLOWED_NETWORKS` (CONFIG.md): the TLS
+  port closes a client outside it before TLS, judging a proxied client by the
+  address its trusted forwarder names; the health port is never restricted
+  (ARCH-22, ARCH-25).
 
 ---
 

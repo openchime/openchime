@@ -63,6 +63,10 @@ void oc_netloop_set_blob_cache_floor(uint64_t bytes);
  * none. Call before oc_netloop_run. */
 void oc_netloop_set_health_port(int port);
 
+/* Connections the TLS port has closed, since the process started, because their
+ * client is outside OPENCHIME_ALLOWED_NETWORKS (REQ-192). For tests and the log. */
+uint64_t oc_netloop_refused_networks(void);
+
 /* Wire call media (REQ-150, ARCH-18/73): the bound UDP socket the loop's relay
  * runs on (relay.h), and the port it is bound to. The caller keeps the socket.
  * A loop takes it when it starts and gives it back when it stops, so set it

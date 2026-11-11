@@ -8251,6 +8251,97 @@ static void test_proxy_header(void) {
     db_unlink("itest_proxy.db");
 }
 
+/* The allowed networks (REQ-192): a client outside OPENCHIME_ALLOWED_NETWORKS is
+ * closed before TLS, whether it reaches the port directly or through a trusted
+ * forwarder, and counted; the health port answers everyone. Each case is a loop
+ * of its own, started with the setting it is about. */
+static int allowed_loop(struct loop_arg *a, pthread_t *th, oc_tls_server *srv, oc_dbwriter **dbw,
+                        const char *nets, const char *trusted, int health) {
+    if (nets) setenv("OPENCHIME_ALLOWED_NETWORKS", nets, 1); else unsetenv("OPENCHIME_ALLOWED_NETWORKS");
+    if (trusted) setenv("OPENCHIME_TRUSTED_PROXIES", trusted, 1); else unsetenv("OPENCHIME_TRUSTED_PROXIES");
+    db_unlink("itest_allowed.db");
+    *dbw = oc_dbwriter_start(tpath("itest_allowed.db"));
+    if (*dbw) oc_dbwriter_set_pw_mem(*dbw, 2048);
+    if (health) oc_netloop_set_health_port(0);
+    int port = *dbw ? start_loop(a, th, srv, *dbw, health) : 0;
+    if (health) oc_netloop_set_health_port(-1);
+    return port;
+}
+
+static void allowed_loop_end(struct loop_arg *a, pthread_t th, oc_dbwriter *dbw, int port) {
+    if (port) stop_loop(a, th);
+    if (dbw) oc_dbwriter_stop(dbw);
+    db_unlink("itest_allowed.db");
+    unsetenv("OPENCHIME_ALLOWED_NETWORKS");
+    unsetenv("OPENCHIME_TRUSTED_PROXIES");
+}
+
+static void test_allowed_networks(void) {
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
+    struct loop_arg arg2;
+    pthread_t th2;
+    oc_dbwriter *dbw2 = NULL;
+    client a;
+
+    /* Loopback outside the list: the TLS port closes it, counted; the health
+     * port, which is never restricted, still answers it. */
+    uint64_t before = oc_netloop_refused_networks();
+    int port = allowed_loop(&arg2, &th2, &srv2, &dbw2, "203.0.113.0/24, 2001:db8::/32", NULL, 1);
+    int hport = __atomic_load_n(&arg2.view.health_port, __ATOMIC_ACQUIRE);
+    CHECK(port != 0 && hport != 0);
+    int refused = client_open(&a, port, pin2);
+    CHECK(refused != 0);
+    if (refused == 0) client_close(&a);
+    CHECK(oc_netloop_refused_networks() == before + 1);
+    static char resp[4096];
+    CHECK(hport && plain_exchange(hport, "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof resp) > 0 &&
+          strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0);
+    allowed_loop_end(&arg2, th2, dbw2, port);
+
+    /* Loopback inside the list: served as ever. */
+    port = allowed_loop(&arg2, &th2, &srv2, &dbw2, "127.0.0.0/8,::1", NULL, 0);
+    CHECK(port != 0);
+    CHECK(client_open(&a, port, pin2) == 0 && do_handshake(&a) == 0);
+    client_close(&a);
+    allowed_loop_end(&arg2, th2, dbw2, port);
+
+    /* Through a trusted forwarder the client its header names is judged, still
+     * before TLS: 203.0.113.7 is in, 198.51.100.7 is out, and a LOCAL header
+     * (the forwarder's own probe) is judged by the forwarder, here outside. */
+    static const uint8_t SIG[12] = { 0x0D,0x0A,0x0D,0x0A,0x00,0x0D,0x0A,0x51,0x55,0x49,0x54,0x0A };
+    uint8_t in[28], out[28], local[16];
+    memcpy(in, SIG, 12); in[12] = 0x21; in[13] = 0x11; in[14] = 0; in[15] = 12;
+    memset(in + 16, 0, 12);
+    in[16] = 203; in[17] = 0; in[18] = 113; in[19] = 7;
+    memcpy(out, in, sizeof out); out[16] = 198; out[17] = 51; out[18] = 100;
+    memcpy(local, SIG, 12); local[12] = 0x20; local[13] = 0x00; local[14] = 0; local[15] = 0;
+    before = oc_netloop_refused_networks();
+    port = allowed_loop(&arg2, &th2, &srv2, &dbw2, "203.0.113.0/24", "127.0.0.0/8", 0);
+    CHECK(port != 0);
+    CHECK(client_open_with(&a, port, pin2, in, sizeof in) == 0 && do_handshake(&a) == 0);
+    client_close(&a);
+    refused = client_open_with(&a, port, pin2, out, sizeof out);
+    CHECK(refused != 0);
+    if (refused == 0) client_close(&a);
+    refused = client_open_with(&a, port, pin2, local, sizeof local);
+    CHECK(refused != 0);
+    if (refused == 0) client_close(&a);
+    CHECK(oc_netloop_refused_networks() == before + 2);
+    allowed_loop_end(&arg2, th2, dbw2, port);
+
+    /* Unset: everyone, as every other test here already shows; once more, so the
+     * case is named. */
+    port = allowed_loop(&arg2, &th2, &srv2, &dbw2, NULL, NULL, 0);
+    CHECK(port != 0);
+    CHECK(client_open(&a, port, pin2) == 0 && do_handshake(&a) == 0);
+    client_close(&a);
+    allowed_loop_end(&arg2, th2, dbw2, port);
+    oc_tls_server_free(&srv2);
+}
+
 int run_netloop_tests(void) {
     printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, dm, drafts across two devices, load, rate-limit, out-cap, throttle, admin, logout\n");
 
@@ -8401,6 +8492,7 @@ int run_netloop_tests(void) {
         test_http_stack();
         test_auth_begin();
         test_proxy_header();
+        test_allowed_networks();
     }
 
     if (up) stop_loop(&arg, th);

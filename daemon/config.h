@@ -145,6 +145,7 @@ typedef struct {
 
     int         max_users;              /* OPENCHIME_MANAGED_MAX_USERS; 0 = unlimited */
     const char *trusted_proxies;        /* peers whose PROXY v2 header is believed; NULL = none */
+    const char *allowed_networks;       /* client addresses the TLS port serves (REQ-192); NULL or "" = all */
     const char *extra_ca;               /* PEM roots added to the built-in ones; NULL = none */
 
     oc_s3_config      s3;               /* endpoint NULL: local disk under data_dir/blobs */

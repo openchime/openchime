@@ -177,6 +177,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_OIDC_CONNECT_<n>` | *(unset)* | A direct connection to your own provider, 1 to 4 (SSO.md): `label=…;issuer=https://…;client_id=…;secret_file=…;subject=sub|oid;redirect=127.0.0.1|localhost`. |
 | `OPENCHIME_EXTRA_CA` | *(unset)* | PEM roots the daemon trusts beside the built-in ones for its own outbound connections (push, enrollment, unfurls, S3): a service behind a private CA. No client reads it: a client trusts a private CA only through the operating system's store. |
 | `OPENCHIME_TRUSTED_PROXIES` | *(unset)* | Addresses or CIDRs whose PROXY protocol v2 header is believed, comma-separated; the connection's address is then the one the proxy saw. |
+| `OPENCHIME_ALLOWED_NETWORKS` | *(unset)* | Addresses or CIDRs, IPv4 or IPv6, comma-separated, that may connect to the TLS port (REQ-192): any other client is closed before TLS or sign-in, judged by the address a trusted proxy's header names. Unset or empty: everyone. The health port is never restricted. |
 
 ### Features
 

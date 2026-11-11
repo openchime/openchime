@@ -5915,8 +5915,12 @@ static int on_http_req(conn *c, const oc_io_event *e, oc_dbwriter *dbw) {
     return on_web_page(c, &req, dbw);
 }
 
+static int network_allowed_text(const oc_trusted_proxies *allowed, const char *src);   /* below, by accept_all */
+static void network_refused(const char *src);
+
 /* One event from the I/O threads (ioloop.h). */
-static void on_io_event(int ep, conn **conns, oc_dbwriter *dbw, oc_io_event *e, int max_per_ip) {
+static void on_io_event(int ep, conn **conns, oc_dbwriter *dbw, oc_io_event *e, int max_per_ip,
+                        const oc_trusted_proxies *allowed) {
     conn *c = find_by_id(conns, e->conn_id);
     if (!c || c->fd != e->fd) { oc_io_event_free(e); return; }   /* closed meanwhile */
     int fd = c->fd;
@@ -5930,7 +5934,13 @@ static void on_io_event(int ep, conn **conns, oc_dbwriter *dbw, oc_io_event *e, 
             src_count_add(c);
         }
         oc_io_event_free(e);
-        if (max_per_ip > 0 && conns_from_ip(conns, c->source) > max_per_ip) conn_close(ep, conns, fd);
+        /* The client the header named is held to the allowed networks, still
+         * before TLS; a LOCAL header (the forwarder's own health check) left the
+         * forwarder's address, and the forwarder is judged. */
+        if (!network_allowed_text(allowed, c->source)) {
+            network_refused(c->source);
+            conn_close(ep, conns, fd);
+        } else if (max_per_ip > 0 && conns_from_ip(conns, c->source) > max_per_ip) conn_close(ep, conns, fd);
         else oc_ioloop_proceed(g_io, c->conn_id, fd);
         return;
     case OC_IO_OPENED:
@@ -9013,11 +9023,54 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
     if (conns[fd]) update_interest(ep, c);
 }
 
+/* --- Allowed networks (REQ-192) ----------------------------------------------
+ * With OPENCHIME_ALLOWED_NETWORKS set, the TLS port closes a client outside it
+ * before any TLS or sign-in work: a direct peer at accept, a proxied one as soon
+ * as its forwarder's header names it. The health port is never restricted, so a
+ * platform's probe is never refused. Refusals are counted, and said at most once
+ * a minute with how many and the last address, so a scan cannot flood the log. */
+static uint64_t g_net_refused;          /* every refusal since start; atomic */
+static uint64_t g_net_refused_said;     /* the count when it was last said */
+static uint64_t g_net_refused_said_ms;  /* when; 0: never */
+
+uint64_t oc_netloop_refused_networks(void) { return __atomic_load_n(&g_net_refused, __ATOMIC_RELAXED); }
+
+/* NULL `allowed` is no list: everyone. */
+static int network_allowed(const oc_trusted_proxies *allowed, const struct sockaddr_storage *ss) {
+    return !allowed || oc_trusted_proxies_match(allowed, ss);
+}
+
+/* The same for an address as text, as a forwarder's header gives it; one that
+ * does not parse is outside any list. */
+static int network_allowed_text(const oc_trusted_proxies *allowed, const char *src) {
+    if (!allowed) return 1;
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof ss);
+    struct sockaddr_in *v4 = (struct sockaddr_in *)&ss;
+    struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&ss;
+    if (inet_pton(AF_INET, src, &v4->sin_addr) == 1) v4->sin_family = AF_INET;
+    else if (inet_pton(AF_INET6, src, &v6->sin6_addr) == 1) v6->sin6_family = AF_INET6;
+    else return 0;
+    return oc_trusted_proxies_match(allowed, &ss);
+}
+
+static void network_refused(const char *src) {
+    uint64_t total = __atomic_add_fetch(&g_net_refused, 1, __ATOMIC_RELAXED);
+    uint64_t now = now_ms();
+    if (g_net_refused_said_ms && now - g_net_refused_said_ms < 60000) return;
+    fprintf(stderr, "openchimed: closed %llu connection(s) from outside OPENCHIME_ALLOWED_NETWORKS "
+                    "since this was last said; the last from %s\n",
+            (unsigned long long)(total - g_net_refused_said), src[0] ? src : "an unknown address");
+    g_net_refused_said = total;
+    g_net_refused_said_ms = now;
+}
+
 /* Take every connection waiting on a listener and hand each to the I/O threads:
  * the TLS port's, or the plaintext health port's (`plain`, ARCH-25). Both are
- * counted against their source under the same per-address cap. */
+ * counted against their source under the same per-address cap; only the TLS
+ * port's are held to the allowed networks. */
 static void accept_all(int lfd, int plain, conn **conns, const oc_trusted_proxies *trusted,
-                       int max_per_ip, uint32_t send_rate_max) {
+                       const oc_trusted_proxies *allowed, int max_per_ip, uint32_t send_rate_max) {
     for (;;) {
         struct sockaddr_storage ss;
         socklen_t sl = sizeof ss;
@@ -9032,6 +9085,13 @@ static void accept_all(int lfd, int plain, conn **conns, const oc_trusted_proxie
          * it names rather than to the forwarder. The health port reads no
          * header: an orchestrator probes it directly. */
         int via_proxy = !plain && oc_trusted_proxies_match(trusted, &ss);
+        /* A direct client outside the allowed networks is closed here, before
+         * anything is spent on it; a proxied one once its header is read. */
+        if (!plain && !via_proxy && !network_allowed(allowed, &ss)) {
+            network_refused(src);
+            close(cfd);
+            continue;
+        }
         /* Throttle a single IP before spending a conn/TLS context on it. */
         if (!via_proxy && max_per_ip > 0 && conns_from_ip(conns, src) >= max_per_ip) {
             close(cfd);
@@ -9328,6 +9388,10 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     /* Parsed once; main refuses to start on a list it cannot read, so NULL here is
      * the empty list and nobody is trusted. */
     oc_trusted_proxies *trusted = oc_trusted_proxies_parse(oc_config_get()->trusted_proxies, NULL, 0);
+    /* The allowed networks (REQ-192), likewise read once; unset or empty is no
+     * list, and everyone is served. */
+    const char *nets = oc_config_get()->allowed_networks;
+    oc_trusted_proxies *allowed = nets && nets[0] ? oc_trusted_proxies_parse(nets, NULL, 0) : NULL;
 
     /* The plaintext health port (ARCH-25), served by the same HTTP stack on the
      * same I/O threads. It answers only while this loop serves: a daemon that
@@ -9466,7 +9530,7 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
             int fd = events[i].data.fd;
 
             if (fd == lfd || (hfd >= 0 && fd == hfd)) {
-                accept_all(fd, fd == hfd, conns, trusted, max_per_ip, send_rate_max);
+                accept_all(fd, fd == hfd, conns, trusted, allowed, max_per_ip, send_rate_max);
                 continue;
             }
 
@@ -9521,7 +9585,7 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
             oc_io_event *e = NULL;
             while (k < OC_IO_BUDGET && (e = oc_ioloop_next(g_io)) != NULL) {
                 k++;
-                on_io_event(ep, conns, dbw, e, max_per_ip);
+                on_io_event(ep, conns, dbw, e, max_per_ip, allowed);
             }
             io_more = k == OC_IO_BUDGET;
         }
@@ -9594,6 +9658,7 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     g_device_rl = NULL;
     g_webhook_rl = NULL;
     oc_trusted_proxies_free(trusted);
+    oc_trusted_proxies_free(allowed);
     oc_relay_close(g_relay);
     g_relay = NULL;
     if (g_loop_udp >= 0) {   /* give the socket back, unless another was set meanwhile */

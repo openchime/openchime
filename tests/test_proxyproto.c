@@ -105,6 +105,20 @@ int run_proxyproto_tests(void) {
         p = peer6("::ffff:8.8.8.8");    CHECK(oc_trusted_proxies_match(t, &p) == 0);
         oc_trusted_proxies_free(t);
     }
+    /* The same list read as the allowed networks (REQ-192): a single address of
+     * each family is that address alone, and an IPv4 client on a dual-stack
+     * socket is judged as itself. */
+    t = oc_trusted_proxies_parse("198.51.100.0/24,2001:db8::5", err, sizeof err);
+    CHECK(t != NULL);
+    if (t) {
+        p = peer4("198.51.100.200");         CHECK(oc_trusted_proxies_match(t, &p) == 1);
+        p = peer4("198.51.101.1");           CHECK(oc_trusted_proxies_match(t, &p) == 0);
+        p = peer6("::ffff:198.51.100.9");    CHECK(oc_trusted_proxies_match(t, &p) == 1);
+        p = peer6("::ffff:198.51.101.9");    CHECK(oc_trusted_proxies_match(t, &p) == 0);
+        p = peer6("2001:db8::5");            CHECK(oc_trusted_proxies_match(t, &p) == 1);
+        p = peer6("2001:db8::6");            CHECK(oc_trusted_proxies_match(t, &p) == 0);
+        oc_trusted_proxies_free(t);
+    }
     /* /0 is everybody, and is what somebody means when they write it. */
     t = oc_trusted_proxies_parse("0.0.0.0/0", err, sizeof err);
     p = peer4("8.8.8.8");

@@ -22,6 +22,7 @@ int cfg_parse_summary(oc_config *c, const cfg_row *r, const char *name, const ch
 int cfg_parse_connect(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_token_prefix(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_trusted_proxies(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
+int cfg_parse_allowed_networks(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_window(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_quiet(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 
@@ -81,6 +82,9 @@ const cfg_row OC_CFG[] = {
     CUSTOM("OPENCHIME_TRUSTED_PROXIES", CFG_OPERATOR, G_SET, NULL,
            "Addresses or CIDRs whose PROXY protocol v2 header is believed, comma-separated; the connection's address is then the one the proxy saw.",
            cfg_parse_trusted_proxies, 0),
+    CUSTOM("OPENCHIME_ALLOWED_NETWORKS", CFG_OPERATOR, G_SET, NULL,
+           "Addresses or CIDRs, IPv4 or IPv6, comma-separated, that may connect to the TLS port (REQ-192): any other client is closed before TLS or sign-in, judged by the address a trusted proxy's header names. Unset or empty: everyone. The health port is never restricted.",
+           cfg_parse_allowed_networks, 0),
 
     /* --- Features: each turns a capability on or off, with its one value ------- */
     CUSTOM("OPENCHIME_TLS", CFG_OPERATOR, G_FLAG, "self",
