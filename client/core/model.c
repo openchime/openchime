@@ -2428,6 +2428,13 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 break;
             }
         break;
+    case OC_EV_FOUND_AT_TIME:
+        /* Where a jump to a date lands: the frontend opens it as a permalink. */
+        m->found_channel = e->channel_id; m->found_parent = e->parent_id;
+        m->found_mid = e->message_id; m->found_time = e->server_time;
+        m->found_exact = e->op;
+        m->found_seq++;
+        break;
     case OC_EV_COLLAPSED:
         /* Mine on every device: the message itself, wherever it is held. */
         for (size_t ci = 0; ci < m->n_channels; ci++) {

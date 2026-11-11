@@ -263,6 +263,11 @@ void oc_client_get_channel_description(oc_client *c, uint64_t channel_id);
  * file or an activity item needs to reach something outside the loaded window.
  * Arrives as an ordinary backfill replay. */
 void oc_client_history_around(oc_client *c, uint64_t channel_id, uint64_t message_id, uint16_t limit);
+/* Jump to a date: ask for the message at `at_ms` in a conversation (parent_id
+ * 0) or one thread of it. The answer lands in the model's found_* fields
+ * (found_seq moves on); the frontend opens it as a permalink, with
+ * oc_client_history_around. */
+void oc_client_find_at_time(oc_client *c, uint64_t channel_id, uint64_t parent_id, uint64_t at_ms);
 
 void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op);
 /* Fold a message away for me on every device (on 1), or open it again (on 0).

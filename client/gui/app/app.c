@@ -1879,6 +1879,13 @@ static int g_n_searchrows;
  * usually still in flight when the click lands — `g_jump_deadline` is what turns
  * "not loaded yet" into an honest failure instead of a silent no-op. */
 static uint64_t  g_jump_mid;            /* message to scroll to, 0 = none */
+/* Jump to a date: the conversation and the local midnight asked for, until the
+ * daemon's answer (the model's found_seq past g_found_seen) is opened. The date
+ * dividers drawn this frame, each its day, so a click on one offers it. */
+static uint64_t  g_date_cid, g_date_day;
+static uint32_t  g_found_seen;
+static struct { rectf r; uint64_t ms; } g_sephits[48];
+static int       g_n_sephits;
 /* The jump is going BACK to a place (navigation history): the message goes to
  * the top of the pane, where it was, and nothing flashes -- it is not news. */
 static int       g_jump_quiet;
@@ -7948,8 +7955,13 @@ static void draw_msglist(gfx *rt, const oc_model *m,
     for (size_t i = 0; i < n; i++) {
         int divided = 0;   /* a day or "New" divider sits right above this row */
         if (sep[i]) {
-            if (y + SEP_H >= reg.top && y <= reg.bottom)
+            if (y + SEP_H >= reg.top && y <= reg.bottom) {
                 draw_day_sep(rt, msgs[first + i].server_time, reg, y);
+                if (capture && g_n_sephits < (int)(sizeof g_sephits / sizeof g_sephits[0])) {
+                    g_sephits[g_n_sephits].r = rf(reg.left, y, reg.right, y + SEP_H);
+                    g_sephits[g_n_sephits++].ms = msgs[first + i].server_time;
+                }
+            }
             y += SEP_H;
             divided = 1;
         }
@@ -9345,7 +9357,7 @@ static void nav_conversation(oc_win *hwnd, int delta, int unread_only) {
 enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
        ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_PTT, ACC_FREETALK, ACC_QUIT, ACC_CALL_MUTE, ACC_CALL_SHARE,
-       ACC_MARK_ALL_READ, ACC_TOAST_ACTION, ACC_HIST_BACK, ACC_HIST_FWD, ACC_PREVIEW };
+       ACC_MARK_ALL_READ, ACC_TOAST_ACTION, ACC_HIST_BACK, ACC_HIST_FWD, ACC_PREVIEW, ACC_JUMP_DATE };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -9394,6 +9406,7 @@ static const struct {
      * pointer (REQ-290); plain Esc dismisses the newest toast. */
     { AM_CTRL | AM_SHIFT, 'Z',        ACC_TOAST_ACTION, "Ctrl+Shift+Z", "Do what the newest notice offers (Undo)" },
     { AM_CTRL | AM_SHIFT, 'P',        ACC_PREVIEW, "Ctrl+Shift+P",     "Preview the message you are writing, or go back to editing it" },
+    { AM_CTRL | AM_SHIFT, 'J',        ACC_JUMP_DATE, "Ctrl+Shift+J",   "Jump to a date in this conversation" },
     /* Ctrl and a digit, as the reference client binds it: the digit is the
      * workspace's place in the rail, counting from 1. Handled in the dispatcher
      * below rather than as nine rows, so this one is the documentation. */
@@ -9433,9 +9446,16 @@ static void menu_run_kind(oc_win *hwnd, int kind, int cmd);  /* fwd — a menu i
 static int  transcript_shell(void);             /* fwd — is the chat shell on screen */
 static void kb_row_move(oc_win *hwnd, int d);      /* fwd — Ctrl+Up / Ctrl+Down */
 static void kb_context_menu(oc_win *hwnd);         /* fwd — Shift+F10 / the Menu key */
+static void jump_menu_open(oc_win *hwnd, uint64_t cid, float x, float y);   /* fwd */
 static void accel_run(oc_win *hwnd, int action) {
     switch (action) {
     case ACC_QUIT:    app_quit(hwnd);     break;
+    case ACC_JUMP_DATE:
+        if (main_is_conversation() && g_view != VIEW_NEWMSG && g_sel) {
+            irect rc; client_rect(hwnd, &rc);
+            jump_menu_open(hwnd, g_sel, DIPF(rc.right) / 2 - 110, 96);
+        }
+        break;
     case ACC_PALETTE: palette_open(hwnd); break;
     case ACC_TOAST_ACTION:
         for (int i = g_fb.n - 1; i >= 0; i--)
@@ -22184,6 +22204,7 @@ static void paint(oc_win *hwnd) {
     if (m) oc_model_set_clock12((oc_model *)m, !g_pref_time24);
     g_n_splhits = 0;
     g_n_morehits = 0;
+    g_n_sephits = 0;
     render_scene(rt, m, W, H);
     if (!g_caret_placed) ed_caret_kill();   /* no field drew a caret this frame */
     /* Boxes placed against chrome the scene just measured, so they can only be
@@ -29827,6 +29848,14 @@ static int on_click(oc_win *hwnd, int x, int y) {
     if (!modal_open())
         for (int i = 0; i < g_n_morehits; i++)
             if (in_rect(g_morehits[i].r, (float)x, (float)y)) { msg_open_cut(g_morehits[i].mid, g_morehits[i].kind); return 1; }
+    /* A date divider offers the jump to another date. */
+    if (!modal_open() && !g_menu && g_sel)
+        for (int i = 0; i < g_n_sephits; i++)
+            if (in_rect(g_sephits[i].r, (float)x, (float)y)) {
+                jump_menu_open(hwnd, g_sel, (float)x - 110, (float)y + 8);
+                invalidate();
+                return 1;
+            }
     /* Toasts are painted above everything, a dialog included, so they are
      * hit-tested above everything too -- a toast over the composer or a
      * dialog's card would otherwise pass on a click it appears to own. */
@@ -35006,6 +35035,108 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
     invalidate();
 }
 
+/* Jump to a date: the four common ones as single choices, and any date. Run
+ * through the channel menu (41..45), as it is about one conversation. */
+static void jump_menu_open(oc_win *hwnd, uint64_t cid, float x, float y) {
+    if (!cid) return;
+    g_n_mi = 0;
+    mi_section("JUMP TO");
+    mi_item(41, "Today");
+    mi_item(42, "Yesterday");
+    mi_item(43, "Last week");
+    mi_item(44, "Last month");
+    mi_item(45, "A date\xE2\x80\xA6");
+    g_menu = MENU_CHANNEL; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 200;
+    g_menu_target = cid; g_menu_target2 = 0;
+    g_menu_x = x; g_menu_y = y;
+    irect rc; client_rect(hwnd, &rc);
+    float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
+    float H = DIPF(rc.bottom), W = DIPF(rc.right);
+    if (g_menu_y + h > H - 8) g_menu_y = H - 8 - h;
+    if (g_menu_y < 8) g_menu_y = 8;
+    if (g_menu_x + g_menu_w > W - 8) g_menu_x = W - 8 - g_menu_w;
+    if (g_menu_x < 8) g_menu_x = 8;
+    invalidate();
+}
+
+/* The reader's local midnight `days_back` days before today, in ms. */
+static uint64_t local_day_start(int days_back) {
+    time_t now = time(NULL);
+    struct tm tv;
+    if (!oc_localtime_r(&now, &tv)) return 0;
+    tv.tm_mday -= days_back;
+    tv.tm_hour = tv.tm_min = tv.tm_sec = 0;
+    tv.tm_isdst = -1;
+    time_t t = mktime(&tv);
+    return t == (time_t)-1 ? 0 : (uint64_t)t * 1000u;
+}
+
+/* "2026-05-03", "3 May" or "May 3 2026": the local midnight of that day, or 0. */
+static uint64_t parse_day(const char *s) {
+    static const char *const MON[12] = { "jan", "feb", "mar", "apr", "may", "jun",
+                                         "jul", "aug", "sep", "oct", "nov", "dec" };
+    int y = 0, mo = 0, d = 0;
+    char w[16] = "";
+    time_t now = time(NULL);
+    struct tm tv;
+    if (!oc_localtime_r(&now, &tv)) return 0;
+    if (sscanf(s, "%d-%d-%d", &y, &mo, &d) == 3) {
+        /* ISO */
+    } else if (sscanf(s, "%d %15s %d", &d, w, &y) >= 2 || sscanf(s, "%15s %d %d", w, &d, &y) >= 2) {
+        mo = 0;
+        for (int i = 0; i < 12; i++)
+            if (!SDL_strncasecmp(w, MON[i], 3)) { mo = i + 1; break; }
+        if (!y) y = tv.tm_year + 1900;
+    } else return 0;
+    if (mo < 1 || mo > 12 || d < 1 || d > 31 || y < 1970 || y > 9999) return 0;
+    struct tm t = {0};
+    t.tm_year = y - 1900; t.tm_mon = mo - 1; t.tm_mday = d; t.tm_isdst = -1;
+    time_t r = mktime(&t);
+    if (r == (time_t)-1 || t.tm_mday != d) return 0;   /* 31 April and the like */
+    return (uint64_t)r * 1000u;
+}
+
+/* Ask where `day_ms` falls in conversation `cid`; the tick opens the answer. */
+static void date_jump(uint64_t cid, uint64_t day_ms) {
+    if (!g_client || !cid || !day_ms) return;
+    g_date_cid = cid; g_date_day = day_ms;
+    oc_client_find_at_time(g_client, cid, 0, day_ms);
+}
+
+/* The daemon has answered a jump to a date: open the conversation at that
+ * message, as a permalink does, and say so when it is not on the day asked. */
+static void date_jump_land(oc_win *hwnd, const oc_model *m) {
+    if (!m || m->found_seq == g_found_seen) return;
+    g_found_seen = m->found_seq;
+    if (!g_date_cid || m->found_channel != g_date_cid || m->found_parent) return;
+    uint64_t cid = g_date_cid, day = g_date_day;
+    g_date_cid = g_date_day = 0;
+    if (!m->found_mid) { fb_failed("There are no messages here yet."); return; }
+    g_view = VIEW_HOME;
+    close_overlays();
+    if (g_sel != cid) select_channel(cid);
+    g_jump_mid = m->found_mid;
+    g_jump_deadline = now_ms() + 4000;
+    hist_jump(cid, m->found_mid);
+    select_tab(TAB_MESSAGES);
+    layout_composer(hwnd);
+    if (!same_day(m->found_time, day)) {
+        char asked[32], got[32], note[120];
+        time_t ta = (time_t)(day / 1000), tg = (time_t)(m->found_time / 1000);
+        struct tm va, vg;
+        if (oc_localtime_r(&ta, &va) && oc_localtime_r(&tg, &vg)) {
+            /* %d, not %e: the Windows runtime has no %e. */
+            strftime(asked, sizeof asked, "%d %B", &va);
+            strftime(got, sizeof got, "%d %B", &vg);
+            snprintf(note, sizeof note, "No messages on %s; showing the %s, %s.",
+                     asked[0] == '0' ? asked + 1 : asked, m->found_exact ? "next" : "last before it",
+                     got[0] == '0' ? got + 1 : got);
+            fb_confirm(note);
+        }
+    }
+    invalidate();
+}
+
 static void show_channel_menu(oc_win *hwnd, const oc_model *m, uint64_t cid, float cx, float cy) {
     const oc_channel *c = oc_model_channel((oc_model *)m, cid);
     if (!c) return;
@@ -35017,6 +35148,7 @@ static void show_channel_menu(oc_win *hwnd, const oc_model *m, uint64_t cid, flo
                                                       : "Add to Starred");
         mi_item(31, c->muted ? "Unmute" : "Mute");
         mi_item(2, "Mark as read");
+        mi_item(40, "Jump to date");
         if (oc_model_summarize_available(m)) mi_item(23, "Summarize");   /* REQ-310 */
         /* Notification levels FLATTENED out of a submenu, with the current
          * one ticked — the same reasoning as the member role: the useful part of a
@@ -35168,6 +35300,21 @@ static void channel_menu_run(oc_win *hwnd, int cmd) {
     case 21: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_MENTIONS); break;
     case 22: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_NONE); break;
     case 23: sum_menu_open(rf(g_menu_x, g_menu_y - 4, g_menu_x + 220, g_menu_y - 4), cid); break;
+    case 40: jump_menu_open(hwnd, cid, g_menu_x, g_menu_y); break;
+    case 41: date_jump(cid, local_day_start(0)); break;
+    case 42: date_jump(cid, local_day_start(1)); break;
+    case 43: date_jump(cid, local_day_start(7)); break;
+    case 44: date_jump(cid, local_day_start(30)); break;
+    case 45: {
+        oc_field f[1] = { { FF_TEXT, "Date",
+                            "As 2026-05-03, or 3 May. The day starts at your midnight.", "" } };
+        if (form_dialog(hwnd, "Jump to date", f, 1) && f[0].value[0]) {
+            uint64_t day = parse_day(f[0].value);
+            if (day) date_jump(cid, day);
+            else fb_failed("That is not a date OpenChime can read. Try 2026-05-03.");
+        }
+        break;
+    }
     default:
         if (cmd >= 300 && cmd < 300 + (int)OC_SB_CUSTOM_MAX) {
             if (oc_sidebar_assign(&g_sb, cid, cmd - 300)) sidebar_opts_save();
@@ -36708,6 +36855,16 @@ static void test_dump(const char *path) {
         fprintf(f, " %s:%d@%.0f,%.0f,%.0f,%.0f", g_hrx[i].emoji, g_hrx[i].mine,
                 g_hrx[i].r.left, g_hrx[i].r.top, g_hrx[i].r.right, g_hrx[i].r.bottom);
     fprintf(f, "\n");
+    /* Jump to a date: what is asked, the daemon's last answer, and the message
+     * the transcript is still to scroll to (0 once it has); the date dividers
+     * on screen, each its day's first time. */
+    {
+        const oc_model *dm = model();
+        fprintf(f, "datejump pending=%llu found=%llu exact=%d sel=%llu jump=%llu seps=%d\n",
+                (unsigned long long)g_date_cid,
+                (unsigned long long)(dm ? dm->found_mid : 0), dm ? dm->found_exact : 0,
+                (unsigned long long)g_sel, (unsigned long long)g_jump_mid, g_n_sephits);
+    }
     /* Where the KEYBOARD is, and what an open menu is highlighting: both had to
      * be readable for the keyboard route to the context menu to be testable at
      * all (REQ-264). */
@@ -37097,6 +37254,12 @@ static void test_poll(oc_win *hwnd) {
     } else if (!strcmp(verb, "upload")) {
         /* Bypass the file dialog so an attachment can be posted from the harness. */
         if (g_client && g_sel && arg[0]) { oc_client_upload(g_client, g_sel, arg); test_ack("ok"); }
+        else test_ack("err");
+    } else if (!strcmp(verb, "jumpdate")) {
+        /* "<date>": jump the open conversation to that day, as the menu's
+         * "A date..." does with the same words typed. */
+        uint64_t day = parse_day(arg);
+        if (g_sel && day) { date_jump(g_sel, day); test_ack("ok"); }
         else test_ack("err");
     } else if (!strcmp(verb, "palette")) {
         palette_open(hwnd);
@@ -38994,6 +39157,7 @@ static int on_tick(oc_win *hwnd) {
                 }
             }
             if (!g_jump_mid) g_jump_fetched = 0;
+            date_jump_land(hwnd, m);
             hist_track();
             /* The settings bucket arrives a beat after auth; fold it in once. */
             if (g_sb_settings_pending && oc_model_setting(m, SB_SETTING_KEY)) {

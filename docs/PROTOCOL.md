@@ -1315,6 +1315,23 @@ marks, reactions, unfurls, forwards, actions, polls), so the client's high-water
 unchanged — only the `WHERE` differs from the backwards paging. Read access is
 checked exactly as it is there: a permalink is not a way around membership.
 
+**`FIND_AT_TIME` (client → server), msg_type `0x011E`**
+`{ channel_id: u64, parent_id: u64, at_ms: u64 }` finds where a date falls in a
+conversation: its main scroll when `parent_id` is `0`, else the thread of that
+top-level message (its root and replies). Read access is checked as for
+history: `UNKNOWN_CHANNEL` for no such conversation, `NOT_A_MEMBER` for one the
+asker cannot read. The client sends the reader's local midnight; the daemon
+knows nothing of time zones.
+
+**`FOUND_AT_TIME` (server → client), msg_type `0x011F`**
+`{ channel_id: u64, parent_id: u64, message_id: u64, server_time: u64, exact: u8 }`,
+to the asker alone: the first message at or after `at_ms` (`exact` `1`); when
+none is later, the last one before it (`exact` `0`); `message_id` `0` when the
+conversation has none. The client then opens it as a permalink does, with
+`HISTORY_AROUND`, and says so when the message found is not on the day asked
+("No messages on 3 May; showing the next, 5 May"). `exact` is `0` or `1`,
+anything else malformed.
+
 ### 5.10 Threads (REQ-060)
 
 Any message can be replied to as a thread. A reply threads under a **top-level
@@ -3525,6 +3542,8 @@ this table cannot silently gain a shared value.
 | `0x0118` | `COLLAPSED_UPDATED` | S → C | to each of my connections: a message folded or opened; replayed in backfill |
 | `0x0119` | `WORKSPACE_SETTINGS` | S → C | read-only: the workspace's settings clients act on, after `WORKSPACE_INFO` |
 | `0x011A` | `READ_RECEIPTS` | both | whether I share my read receipts: set or ask, and told |
+| `0x011E` | `FIND_AT_TIME` | C → S | the message at a moment in a conversation or one thread of it (jump to a date) |
+| `0x011F` | `FOUND_AT_TIME` | S → C | its answer: the first at or after the moment, else the last before |
 
 ## 10. Connection state machine
 

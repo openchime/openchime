@@ -8118,6 +8118,52 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
  *
  * `truncated` here means "there is more above this page", which is what lets a
  * client stop asking at the top of the channel instead of retrying forever. */
+/* Jump to a date: the first message at or after `find_at_ms` in a conversation's
+ * main scroll, or in one thread of it; the last before it when none is later
+ * (found_exact 0); none at all, message_id 0. Read under the gate history uses,
+ * so it finds nothing a reader could not scroll to. */
+static oc_dbres *process_find_at_time(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint8_t pub = 0;
+    if (!channel_exists(db, j->channel_id, &pub)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r;
+    }
+    if (!channel_read_access(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    r->type = OC_RES_FOUND_AT_TIME;
+    r->channel_id = j->channel_id;
+    r->parent_id = j->parent_id;
+    /* A thread is its root and its replies: the root is where it begins. */
+    static const char *const q[2][2] = {
+        { "SELECT id, created_at_ms FROM messages WHERE channel_id=?1 AND parent_id IS NULL "
+          "AND created_at_ms>=?2 ORDER BY created_at_ms, id LIMIT 1;",
+          "SELECT id, created_at_ms FROM messages WHERE channel_id=?1 AND parent_id IS NULL "
+          "AND created_at_ms<?2 ORDER BY created_at_ms DESC, id DESC LIMIT 1;" },
+        { "SELECT id, created_at_ms FROM messages WHERE channel_id=?1 AND (id=?3 OR parent_id=?3) "
+          "AND created_at_ms>=?2 ORDER BY created_at_ms, id LIMIT 1;",
+          "SELECT id, created_at_ms FROM messages WHERE channel_id=?1 AND (id=?3 OR parent_id=?3) "
+          "AND created_at_ms<?2 ORDER BY created_at_ms DESC, id DESC LIMIT 1;" },
+    };
+    int th = j->parent_id != 0;
+    for (int k = 0; k < 2 && !r->message_id; k++) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, q[th][k], -1, &st, NULL) != SQLITE_OK) break;
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->find_at_ms);
+        if (th) sqlite3_bind_int64(st, 3, (sqlite3_int64)j->parent_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            r->message_id  = (uint64_t)sqlite3_column_int64(st, 0);
+            r->server_time = (uint64_t)sqlite3_column_int64(st, 1);
+            r->found_exact = (uint8_t)(k == 0);
+        }
+        sqlite3_finalize(st);
+    }
+    return r;
+}
+
 static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -11344,6 +11390,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_UPDATE_CHANNEL) return process_update_channel(w->db, j);
     if (j->type == OC_JOB_SAVE_ITEM)      return process_save_item(w->db, j);
     if (j->type == OC_JOB_SET_COLLAPSED)  return process_set_collapsed(w->db, j);
+    if (j->type == OC_JOB_FIND_AT_TIME)   return process_find_at_time(w->db, j);
     /* On the WRITER because it stamps the seen watermark; the read half would
      * otherwise be a reader job with a write in it. */
     if (j->type == OC_JOB_LIST_ACTIVITY)  return process_list_activity(w->db, j);

@@ -617,6 +617,16 @@ void oc_client_history_around(oc_client *c, uint64_t channel_id, uint64_t messag
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_find_at_time(oc_client *c, uint64_t channel_id, uint64_t parent_id, uint64_t at_ms) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_FIND_AT_TIME);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = parent_id;
+    cmd->server_time = at_ms;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op) {
     if (!c || !message_id) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SAVE_ITEM);

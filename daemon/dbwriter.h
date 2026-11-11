@@ -295,7 +295,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_DEACTIVATE_SELF = 148,   /* a person deactivates their own account */
        /* Fold a message away for its reader, or open it (message_id, save_op
         * 1 or 0): a per-person set, told to all of their connections. */
-       OC_JOB_SET_COLLAPSED = 149 };
+       OC_JOB_SET_COLLAPSED = 149,
+       /* FIND_AT_TIME: the message at `find_at_ms` in channel_id, in the
+        * thread parent_id or its main scroll (0). A read. */
+       OC_JOB_FIND_AT_TIME = 152 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -482,6 +485,7 @@ typedef struct oc_job {
 
     /* HISTORY: 0 pages backwards from message_id, 1 fetches AROUND it (ARCH-96). */
     uint8_t        hist_around;
+    uint64_t       find_at_ms;  /* FIND_AT_TIME: the moment asked for */
 
     /* SEARCH: query text is carried in body/body_len; this bounds the result.
      * `search_sort` is OC_SEARCH_*, and `search_cursor_rank` the relevance
@@ -782,7 +786,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_ROSTER_ROW = 123,
        /* A message folded or opened (message_id, save_op): to every
         * connection of user_id. */
-       OC_RES_COLLAPSED = 124 };
+       OC_RES_COLLAPSED = 124,
+       /* FOUND_AT_TIME to the asker: channel_id, parent_id, message_id (0 for
+        * none), server_time, and found_exact. */
+       OC_RES_FOUND_AT_TIME = 127 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -1058,6 +1065,10 @@ typedef struct oc_dbres {
     uint64_t       session_expiry;                    /* ms since epoch */
     uint8_t        session_token[OC_SESSION_TOKEN_LEN];
     int            has_session_token;                 /* 0 on session re-auth */
+
+    /* FOUND_AT_TIME: 1 when message_id is at or after the time asked, 0 when
+     * it is the last before it. */
+    uint8_t        found_exact;
 
     /* SEND_OK */
     uint64_t       message_id;

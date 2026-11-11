@@ -1342,6 +1342,23 @@ static void test_admin_frames(void) {
         oc_set_collapsed out = { 0, 9 };
         CHECK(oc_decode_set_collapsed(&p, &out) == OC_OK && out.message_id == 4242 && out.on == 0);
     }
+    {   /* Jump to a date: asked in a thread, and answered. */
+        oc_find_at_time in = { 31, 4400, 1746230400000ull };
+        ROUNDTRIP(oc_encode_find_at_time(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FIND_AT_TIME, h, p);
+        oc_find_at_time out;
+        CHECK(oc_decode_find_at_time(&p, &out) == OC_OK && out.channel_id == 31 &&
+              out.parent_id == 4400 && out.at_ms == 1746230400000ull);
+    }
+    {
+        oc_found_at_time in = { 31, 0, 5150, 1746300000000ull, 0 };
+        ROUNDTRIP(oc_encode_found_at_time(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FOUND_AT_TIME, h, p);
+        oc_found_at_time out;
+        CHECK(oc_decode_found_at_time(&p, &out) == OC_OK && out.channel_id == 31 && out.parent_id == 0 &&
+              out.message_id == 5150 && out.server_time == 1746300000000ull && out.exact == 0);
+        frame[w.len - 1] = 2;   /* `exact` is a yes or a no */
+        CHECK(oc_parse_frame(frame, w.len, &h, &p) == OC_OK);
+        CHECK(oc_decode_found_at_time(&p, &out) == OC_E_MALFORMED);
+    }
     {   /* A removed member brought back (REQ-033). */
         oc_enable_user in = { 43 };
         ROUNDTRIP(oc_encode_enable_user(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ENABLE_USER, h, p);

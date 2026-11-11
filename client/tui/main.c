@@ -1084,6 +1084,8 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_DEACTIVATE,
        /* typed emoticons become emoji (compose.emoticons) */
        ACT_EMOTICONS,
+       /* open a conversation at a date, typed */
+       ACT_JUMP_DATE,
        ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
@@ -1148,6 +1150,36 @@ static uint8_t e2e_state(const oc_model *m, const oc_channel *c) {
     const oc_pdm_view *v = c && !c->forgotten ? oc_model_pdm((oc_model *)m, c->channel_id) : NULL;
     return v ? v->state : 0;
 }
+/* A typed date for "Jump to date": "today", "yesterday", "2026-05-03", or
+ * "3 may" (this year); the reader's local midnight that day, in ms, or 0. */
+static int ci_prefix(const char *s, const char *p, size_t n) {   /* case-blind, the first n */
+    for (size_t i = 0; i < n; i++) {
+        int a = tolower((unsigned char)s[i]), b = tolower((unsigned char)p[i]);
+        if (a != b) return 0;
+        if (!a) return 1;
+    }
+    return 1;
+}
+static uint64_t tui_parse_day(const char *s) {
+    static const char *const MON[12] = { "jan", "feb", "mar", "apr", "may", "jun",
+                                         "jul", "aug", "sep", "oct", "nov", "dec" };
+    time_t now = time(NULL);
+    struct tm t;
+    if (!oc_localtime_r(&now, &t)) return 0;
+    int y = t.tm_year + 1900, mo = 0, d = 0;
+    char w[16] = "";
+    if (ci_prefix(s, "today", 6)) { mo = t.tm_mon + 1; d = t.tm_mday; }
+    else if (ci_prefix(s, "yesterday", 10)) { mo = t.tm_mon + 1; d = t.tm_mday - 1; }
+    else if (sscanf(s, "%d-%d-%d", &y, &mo, &d) == 3) { /* ISO */ }
+    else if (sscanf(s, "%d %15s %d", &d, w, &y) >= 2 || sscanf(s, "%15s %d %d", w, &d, &y) >= 2) {
+        for (int i = 0; i < 12; i++) if (ci_prefix(w, MON[i], 3)) { mo = i + 1; break; }
+    } else return 0;
+    if (mo < 1 || mo > 12 || d > 31 || y < 1970 || y > 9999) return 0;
+    struct tm q = {0};
+    q.tm_year = y - 1900; q.tm_mon = mo - 1; q.tm_mday = d; q.tm_isdst = -1;   /* day 0 is the day before the 1st */
+    time_t r = mktime(&q);
+    return r == (time_t)-1 ? 0 : (uint64_t)r * 1000u;
+}
 /* `e2e`: the channel is an encrypted DM, whose session is in `state`. */
 static void menu_build_channel(int joined, int summarize, int e2e, uint8_t state) {
     g_nmenu = 0;
@@ -1159,6 +1191,7 @@ static void menu_build_channel(int joined, int summarize, int e2e, uint8_t state
         for (int i = 0; i < k; i++) g_menu[g_nmenu++] = (menuitem){ it[i].label, it[i].id };
     }
     if (summarize && !e2e) g_menu[g_nmenu++] = (menuitem){ "Summarize",   ACT_SUMMARIZE };
+    if (joined) g_menu[g_nmenu++] = (menuitem){ "Jump to date",   ACT_JUMP_DATE };
     g_menu[g_nmenu++] = (menuitem){ "Notify: all",         ACT_NOTIFY_ALL };
     g_menu[g_nmenu++] = (menuitem){ "Notify: mentions",    ACT_NOTIFY_MENTIONS };
     g_menu[g_nmenu++] = (menuitem){ "Notify: none",        ACT_NOTIFY_NONE };
@@ -3221,6 +3254,10 @@ int main(int argc, char **argv) {
     uint64_t jump_mid = 0;                    /* a summary item's message, being found */
     time_t jump_since = 0;
     int jump_asked = 0;
+    /* Jump to a date: the conversation and the local midnight asked for, until
+     * the daemon's answer (the model's found_seq past found_seen) arrives. */
+    uint64_t date_cid = 0, date_day = 0;
+    uint32_t found_seen = 0;
     int help_open = 0;
     int profile_open = 0;                     /* /profile identity modal */
     int deactivate_ask = 0;                   /* "Deactivate account": y/N before it is sent */
@@ -3246,7 +3283,7 @@ int main(int argc, char **argv) {
     /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
      * /nick with a discoverable text prompt. */
     enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_NICK, PROMPT_UPLOAD,
-           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE };
+           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE, PROMPT_DATE };
     int await_invite = 0;   /* open the roster on the invitation once it is made */
     /* The invite prompt's explanation, which names the provider, and what was
      * wrong with the last answer ("" when nothing was). */
@@ -3358,6 +3395,32 @@ int main(int argc, char **argv) {
             if (focus >= m->n_channels) focus = m->n_channels ? m->n_channels - 1 : 0;
         }
 
+        /* A jump to a date answered: open that conversation at the message, as
+         * a summary item's is, and say so when it is not on the day asked. */
+        if (date_cid && m->found_seq != found_seen) {
+            found_seen = m->found_seq;
+            if (m->found_channel == date_cid && !m->found_parent) {
+                size_t idx = m->n_channels;
+                for (size_t k = 0; k < m->n_channels; k++) if (m->channels[k].channel_id == date_cid) idx = k;
+                if (!m->found_mid) snprintf(g_closed_note, sizeof g_closed_note, "There are no messages here yet.");
+                else if (idx < m->n_channels) {
+                    focus = idx; scroll = 0; msg_sel = -1; last_focus_cid = date_cid; g_hold_unread = 0;
+                    jump_mid = m->found_mid; jump_asked = 0; jump_since = time(NULL);
+                    time_t ta = (time_t)(date_day / 1000), tg = (time_t)(m->found_time / 1000);
+                    struct tm va, vg;
+                    if (oc_localtime_r(&ta, &va) && oc_localtime_r(&tg, &vg) &&
+                        (va.tm_year != vg.tm_year || va.tm_yday != vg.tm_yday)) {
+                        char a[24], g[24];
+                        strftime(a, sizeof a, "%d %B", &va);
+                        strftime(g, sizeof g, "%d %B", &vg);
+                        snprintf(g_closed_note, sizeof g_closed_note, "No messages on %s; showing the %s, %s.",
+                                 a[0] == '0' ? a + 1 : a, m->found_exact ? "next" : "last before it",
+                                 g[0] == '0' ? g + 1 : g);
+                    }
+                }
+                date_cid = date_day = 0;
+            }
+        }
         /* Lazy backfill + keep the focused channel marked read. */
         if (focus < m->n_channels) {
             uint64_t cid = m->channels[focus].channel_id;
@@ -3641,6 +3704,11 @@ int main(int argc, char **argv) {
                 else if (k == PROMPT_SEARCH  && *v) oc_client_search(cl, v, g_search_sort);
                 else if (k == PROMPT_NICK    && *v) oc_client_set_display_name(cl, v);
                 else if (k == PROMPT_WEBHOOK && *v) oc_client_create_webhook(cl, act_cid, v);
+                else if (k == PROMPT_DATE && *v) {
+                    uint64_t day = tui_parse_day(v);
+                    if (day) { date_cid = act_cid; date_day = day; oc_client_find_at_time(cl, act_cid, 0, day); }
+                    else snprintf(g_closed_note, sizeof g_closed_note, "Not a date: try 2026-05-03, today or yesterday.");
+                }
                 else if (k == PROMPT_INVITE) {
                     /* An address where the workspace signs people in through a
                      * provider; blank for a token, where it has password accounts.
@@ -3878,6 +3946,7 @@ int main(int argc, char **argv) {
                     /* channel menu actions */
                     else if (id == ACT_OPEN)  panel = 0;
                     else if (id == ACT_JOIN)  { oc_client_join_channel(cl, act_cid); panel = 0; }
+                    else if (id == ACT_JUMP_DATE) { prompt_kind = PROMPT_DATE; prompt_title = "Jump to date (2026-05-03, 3 May, today)"; tk_input_init(&prompt_input, 0, "date"); }
                     else if (id == ACT_WEBHOOK_CREATE) { prompt_kind = PROMPT_WEBHOOK; prompt_title = "Create webhook (label)"; tk_input_init(&prompt_input, 0, "label"); }
                     else if (id == ACT_NOTIFY_ALL)      oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_ALL);
                     else if (id == ACT_NOTIFY_MENTIONS) oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_MENTIONS);

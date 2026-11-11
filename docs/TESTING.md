@@ -2377,3 +2377,15 @@ text on the two lines under it — the shape a real message produces, since the
 run sends one through `notify_deliver` rather than calling the balloon directly.
 A disconnected session is what the blank case is for and is not a failure of the
 client: the first two runs of this script hit exactly that.
+
+## Reading the jump-to-date harness
+
+`tools/gui/jumpdate.sh` sends a few messages into a fresh channel and jumps to
+them by date through the test hook's `jumpdate <date>` verb, which runs the
+same path as typing that date into "Jump to date". It reads the dump's
+`datejump` line: `pending` is the conversation still waiting for the daemon's
+answer (0 once it has come), `found` and `exact` are that answer, `jump` is the
+message the transcript has still to scroll to (0 once it is on it), and `seps`
+counts the date dividers drawn, each of which offers the jump when clicked.
+Today's date lands on today's first message, exact; a date after the newest
+lands on the newest, not exact, with a notice saying so.

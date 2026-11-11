@@ -1560,6 +1560,16 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 oc_ev *e = oc_ev_new(OC_EV_DELETE);
                 if (e) { e->channel_id = md.channel_id; e->message_id = md.message_id; oc_queue_push(to_ui, e); }
             }
+        } else if (hdr.msg_type == OC_MSG_FOUND_AT_TIME) {
+            oc_found_at_time fa;
+            if (oc_decode_found_at_time(&p, &fa) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_FOUND_AT_TIME);
+                if (e) {
+                    e->channel_id = fa.channel_id; e->parent_id = fa.parent_id;
+                    e->message_id = fa.message_id; e->server_time = fa.server_time; e->op = fa.exact;
+                    oc_queue_push(to_ui, e);
+                }
+            }
         } else if (hdr.msg_type == OC_MSG_THREAD_REPLY) {
             oc_thread_reply tr;
             if (oc_decode_thread_reply(&p, &tr) == OC_OK) {
@@ -3582,6 +3592,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_history_around ha = { c->channel_id, c->message_id, (uint16_t)c->op };
                 if (oc_encode_history_around(&w, OC_PROTOCOL_VERSION, &ha) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_FIND_AT_TIME) {
+                uint8_t buf[40]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_find_at_time fa = { c->channel_id, c->message_id, c->server_time };
+                if (oc_encode_find_at_time(&w, OC_PROTOCOL_VERSION, &fa) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SAVE_ITEM) {

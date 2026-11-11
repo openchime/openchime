@@ -603,6 +603,8 @@ typedef enum {
     OC_MSG_COLLAPSED_UPDATED    = 0x0118, /* S->C, to my connections: a message folded or opened; and replayed */
     OC_MSG_WORKSPACE_SETTINGS   = 0x0119, /* S->C, read-only: the workspace settings clients act on, after WORKSPACE_INFO */
     OC_MSG_READ_RECEIPTS        = 0x011A, /* both: whether I share my read receipts; C->S sets or asks, S->C tells */
+    OC_MSG_FIND_AT_TIME         = 0x011E, /* C->S, the message at a time in a conversation or thread */
+    OC_MSG_FOUND_AT_TIME        = 0x011F, /* S->C, its answer: the first at or after it, else the last before */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -1832,6 +1834,13 @@ typedef struct { uint64_t channel_id; uint64_t before_message_id; uint16_t limit
  * Replies as a BACKFILL replay — same rows, same encoding, only the WHERE
  * differs, so nothing downstream needs a second code path. */
 typedef struct { uint64_t channel_id; uint64_t message_id; uint16_t limit; } oc_history_around;
+/* Jump to a date: FIND_AT_TIME asks for the message at `at_ms` in a conversation
+ * (`parent_id` 0) or a thread. FOUND_AT_TIME answers with the first message at
+ * or after it, `exact` 1; with the last before it, `exact` 0, when none is
+ * later; `message_id` 0 when the conversation has none. The client then opens
+ * it as a permalink does (HISTORY_AROUND). */
+typedef struct { uint64_t channel_id, parent_id, at_ms; } oc_find_at_time;
+typedef struct { uint64_t channel_id, parent_id, message_id, server_time; uint8_t exact; } oc_found_at_time;
 typedef struct { uint64_t high_water; uint8_t more; } oc_backfill_done;
 typedef struct { uint16_t code; uint8_t fatal; oc_slice context; oc_slice message; } oc_error;
 
@@ -2136,6 +2145,8 @@ oc_result oc_encode_search_results(oc_wbuf *w, uint16_t version, const oc_search
 oc_result oc_encode_backfill_request(oc_wbuf *w, uint16_t version, const oc_backfill_request *m);
 oc_result oc_encode_history_request(oc_wbuf *w, uint16_t version, const oc_history_request *m);
 oc_result oc_encode_history_around(oc_wbuf *w, uint16_t version, const oc_history_around *m);
+oc_result oc_encode_find_at_time(oc_wbuf *w, uint16_t version, const oc_find_at_time *m);
+oc_result oc_encode_found_at_time(oc_wbuf *w, uint16_t version, const oc_found_at_time *m);
 oc_result oc_encode_backfill_done(oc_wbuf *w, uint16_t version, const oc_backfill_done *m);
 oc_result oc_encode_error(oc_wbuf *w, uint16_t version, const oc_error *m);
 
@@ -2353,6 +2364,8 @@ oc_result oc_decode_search(oc_rbuf *p, oc_search *m);
 oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries, uint16_t cap, uint16_t *out_count, uint8_t *out_truncated);
 oc_result oc_decode_history_request(oc_rbuf *p, oc_history_request *m);
 oc_result oc_decode_history_around(oc_rbuf *p, oc_history_around *m);
+oc_result oc_decode_find_at_time(oc_rbuf *p, oc_find_at_time *m);
+oc_result oc_decode_found_at_time(oc_rbuf *p, oc_found_at_time *m);
 oc_result oc_decode_backfill_request(oc_rbuf *p, oc_cursor *cursors, uint16_t cap, uint16_t *out_count);
 oc_result oc_decode_backfill_done(oc_rbuf *p, oc_backfill_done *m);
 oc_result oc_decode_error(oc_rbuf *p, oc_error *m);

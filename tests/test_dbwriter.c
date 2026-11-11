@@ -10546,6 +10546,94 @@ static int replay_collapsed(oc_dbwriter *w, uint64_t uid, uint64_t mid) {
     oc_dbres_free(r);
     return found;
 }
+/* Jump to a date (FIND_AT_TIME): the first message at or after a moment, the
+ * last before it when none is later, in the main scroll or one thread, and
+ * only where the asker may read. */
+static oc_dbres *find_at(oc_dbwriter *w, uint64_t uid, uint64_t ch, uint64_t parent, uint64_t at) {
+    oc_job *j = oc_job_new(OC_JOB_FIND_AT_TIME, 64);
+    j->user_id = uid; j->channel_id = ch; j->parent_id = parent; j->find_at_ms = at;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static void set_time(const char *path, uint64_t mid, uint64_t ms) {
+    sqlite3 *raw = NULL;
+    if (sqlite3_open(path, &raw) != SQLITE_OK) return;
+    sqlite3_busy_timeout(raw, 2000);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(raw, "UPDATE messages SET created_at_ms=?2 WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)ms);
+        CHECK(sqlite3_step(st) == SQLITE_DONE);
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(raw);
+}
+/* 1 when the answer is `mid`, found at or after the moment (exact) or not. */
+static int found_is(oc_dbres *r, uint64_t mid, int exact) {
+    int ok = r && r->type == OC_RES_FOUND_AT_TIME && r->message_id == mid && r->found_exact == exact;
+    oc_dbres_free(r);
+    return ok;
+}
+static void test_find_at_time(void) {
+    const char *path = tdb("findat.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "fa-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob = reg(w, "fa-bob", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+    /* Later than anything the workspace itself has said here, so its notices
+     * all fall before. */
+    const uint64_t base = 4000000000000ull;
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0x51, sizeof idem); uint64_t m1 = send_msg(w, alice, idem, "the first");
+    memset(idem, 0x52, sizeof idem); uint64_t m2 = send_msg(w, alice, idem, "a thread");
+    memset(idem, 0x53, sizeof idem); uint64_t m3 = send_msg(w, alice, idem, "the last");
+    CHECK(m1 && m2 && m3);
+    oc_dbres *r = send_reply(w, bob, OC_DEFAULT_CHANNEL, m2, "a reply");
+    CHECK(r && r->type == OC_RES_REPLY_OK);
+    uint64_t r1 = r->message_id;
+    oc_dbres_free(r);
+    set_time(path, m1, base + 1000);
+    set_time(path, m2, base + 5000);
+    set_time(path, r1, base + 6000);
+    set_time(path, m3, base + 9000);
+
+    /* An empty day gives the next; a message at the moment is the moment's. */
+    CHECK(found_is(find_at(w, bob, OC_DEFAULT_CHANNEL, 0, base + 2000), m2, 1));
+    CHECK(found_is(find_at(w, bob, OC_DEFAULT_CHANNEL, 0, base + 5000), m2, 1));
+    CHECK(found_is(find_at(w, bob, OC_DEFAULT_CHANNEL, 0, base + 500), m1, 1));
+    /* The reply is in its thread, not the main scroll. */
+    CHECK(found_is(find_at(w, bob, OC_DEFAULT_CHANNEL, 0, base + 5500), m3, 1));
+    /* After the last message: the last, not exact. */
+    r = find_at(w, bob, OC_DEFAULT_CHANNEL, 0, base + 9500);
+    CHECK(r && r->channel_id == OC_DEFAULT_CHANNEL && r->parent_id == 0 && r->server_time == base + 9000);
+    CHECK(found_is(r, m3, 0));
+    /* In a thread: its root, then its replies. */
+    CHECK(found_is(find_at(w, bob, OC_DEFAULT_CHANNEL, m2, base + 100), m2, 1));
+    CHECK(found_is(find_at(w, bob, OC_DEFAULT_CHANNEL, m2, base + 5500), r1, 1));
+    CHECK(found_is(find_at(w, bob, OC_DEFAULT_CHANNEL, m2, base + 7000), r1, 0));
+
+    /* Refused where the asker cannot read, and for no such conversation. */
+    r = create_channel(w, alice, "fa-private", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t priv = r->channel_id;
+    oc_dbres_free(r);
+    r = find_at(w, bob, priv, 0, base);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+    r = find_at(w, bob, 987654, 0, base);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_UNKNOWN_CHANNEL);
+    oc_dbres_free(r);
+    /* An empty conversation: nothing, which is not an error. */
+    r = find_at(w, alice, priv, 0, base);
+    CHECK(r && r->type == OC_RES_FOUND_AT_TIME);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_collapsed(void) {
     const char *path = tdb("collapsed.db");
     cleanup_db(path);
@@ -10857,6 +10945,7 @@ int run_dbwriter_tests(void) {
     test_shared_invite();
     test_status_and_profile();
     test_collapsed();
+    test_find_at_time();
     test_custom_emoji();
     test_group_dm();
     test_avatar();

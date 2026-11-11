@@ -3494,6 +3494,18 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_FIND_AT_TIME) {
+            oc_find_at_time fa;
+            if (oc_decode_find_at_time(&p, &fa) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_FIND_AT_TIME, c->conn_id);
+            if (!j) return -1;
+            j->user_id    = c->user_id;
+            j->channel_id = fa.channel_id;
+            j->parent_id  = fa.parent_id;
+            j->find_at_ms = fa.at_ms;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_HISTORY_REQUEST) {
             oc_history_request hr;
             if (oc_decode_history_request(&p, &hr) != OC_OK) return -1;
@@ -7123,6 +7135,15 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         if (c) send_bytes(ep, conns, c->fd, g_enc, len);
         if (r->ch_fanout)
             fanout_members(ep, conns, r->members, r->n_members, actor, g_enc, len);
+        break;
+    }
+    case OC_RES_FOUND_AT_TIME: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_found_at_time f = { r->channel_id, r->parent_id, r->message_id, r->server_time, r->found_exact };
+        if (oc_encode_found_at_time(&w, OC_PROTOCOL_VERSION, &f) == OC_OK)
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
     case OC_RES_LIST_ERR: {

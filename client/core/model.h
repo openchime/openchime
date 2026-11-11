@@ -513,6 +513,13 @@ typedef struct {
      * (oc_client_tick), in the channel the reaction named. */
     uint8_t   reactlist_resend;
     uint64_t  reactlist_resend_channel;
+    /* The last answer to a jump to a date (oc_client_find_at_time): found_seq
+     * moves on each one, so a frontend acts on it once. found_mid 0 means the
+     * conversation has no messages; found_exact 0 that it is the last before
+     * the time asked, none being later. */
+    uint32_t  found_seq;
+    uint64_t  found_channel, found_parent, found_mid, found_time;
+    uint8_t   found_exact;
     oc_reactor_row *reactors;
     size_t    n_reactors, cap_reactors;
     /* The open "who voted" view (REQ-225), on the who-reacted pattern: the

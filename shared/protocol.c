@@ -1006,6 +1006,20 @@ oc_result oc_encode_history_around(oc_wbuf *w, uint16_t version, const oc_histor
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_find_at_time(oc_wbuf *w, uint16_t version, const oc_find_at_time *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_FIND_AT_TIME);
+    oc_w_u64(w, m->channel_id); oc_w_u64(w, m->parent_id); oc_w_u64(w, m->at_ms);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_found_at_time(oc_wbuf *w, uint16_t version, const oc_found_at_time *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_FOUND_AT_TIME);
+    oc_w_u64(w, m->channel_id); oc_w_u64(w, m->parent_id);
+    oc_w_u64(w, m->message_id); oc_w_u64(w, m->server_time);
+    oc_w_u8(w, m->exact ? 1u : 0u);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CHANNEL_INFO);
     oc_w_u64(w, m->channel_id);
@@ -3260,6 +3274,19 @@ oc_result oc_decode_activity(oc_rbuf *p, oc_activity *m) {
 
 oc_result oc_decode_history_around(oc_rbuf *p, oc_history_around *m) {
     m->channel_id = oc_r_u64(p); m->message_id = oc_r_u64(p); m->limit = oc_r_u16(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_find_at_time(oc_rbuf *p, oc_find_at_time *m) {
+    m->channel_id = oc_r_u64(p); m->parent_id = oc_r_u64(p); m->at_ms = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_found_at_time(oc_rbuf *p, oc_found_at_time *m) {
+    m->channel_id = oc_r_u64(p); m->parent_id = oc_r_u64(p);
+    m->message_id = oc_r_u64(p); m->server_time = oc_r_u64(p);
+    m->exact = oc_r_u8(p);
+    if (m->exact > 1) return OC_E_MALFORMED;
     return r_done(p);
 }
 
