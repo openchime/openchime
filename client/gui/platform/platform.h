@@ -164,6 +164,13 @@ int   oc_plat_picker_open(void);
 /* Answer the open file picker as a person would: `path` into its file name box
  * and OK, or, NULL, its Cancel. 1 when there was one to answer, else 0. */
 int   oc_plat_picker_answer(const char *path);
+/* This build's release notes (releasenotes.h), fetched without holding the
+ * window: started once, then polled each tick. The Windows client fetches on a
+ * thread of its own through the client's verifying TLS; the browser, with its
+ * own fetch. Poll returns -1 while waiting, else an OC_RN_* result with `out`
+ * filled; a start while one is running is ignored. */
+void  oc_plat_releasenotes_start(const char *build_id);
+int   oc_plat_releasenotes_poll(void *out /* oc_releasenotes */);
 /* A save-as picker; `suggested` is the file name offered. 1 with the path in `out`. */
 int   oc_plat_pick_save(SDL_Window *owner, const char *suggested, char *out, size_t cap);
 /* The application has finished writing the file a save-as picker named: a

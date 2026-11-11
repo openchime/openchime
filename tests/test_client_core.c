@@ -14,6 +14,7 @@
 #include "store.h"       /* to assert the persisted token/pin */
 #include "resolve.h"     /* workspace resolution (REQ-010/011) */
 #include "wellknown.h"   /* the optional `.well-known` half of REQ-010 */
+#include "releasenotes.h" /* What's new: the release notes for a build */
 #include "complete.h"    /* who the New message pane may address (REQ-229) */
 
 #include "netloop.h"
@@ -2764,6 +2765,64 @@ static void test_sidebar(void) {
  * where the distinction lives: a document that is absent, or served by something
  * that is not a workspace, is "no metadata"; one that is present and wrong is a
  * failure with its own name. */
+/* What's new: the control plane's notes for a build, read from its answer --
+ * every refusal leaving nothing half-read. */
+static void test_releasenotes(void) {
+    static oc_releasenotes rn;
+    const char *ok =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+        "{\"release\":16,\"build_id\":\"abc1234\",\"published_at\":\"2026-11-11T09:30:00+00:00\","
+        "\"sections\":[{\"title\":\"New\",\"items\":[{\"title\":\"Calls show how they work\","
+        "\"url\":\"https://openchime.io/docs/calls\"},{\"title\":\"Caf\\u00e9 \\\"quoted\\\"\","
+        "\"url\":\"javascript:alert(1)\"}]},{\"title\":\"Fixed\",\"items\":[{\"title\":\"A fix\",\"url\":\"\"}]}]}";
+    CHECK(oc_releasenotes_read_response(ok, strlen(ok), &rn) == OC_RN_OK);
+    CHECK(rn.release == 16 && rn.n_sections == 2);
+    /* contract: the date as published, the titles as the control plane wrote them */
+    CHECK(strcmp(rn.date, "2026-11-11") == 0);
+    CHECK(rn.sections[0].n_items == 2 && rn.sections[1].n_items == 1);
+    /* contract: the control plane's section and item titles, unescaped */
+    CHECK(strcmp(rn.sections[0].title, "New") == 0 && strcmp(rn.sections[0].items[1].title, "Caf\xC3\xA9 \"quoted\"") == 0);
+    CHECK(strncmp(rn.sections[0].items[0].url, "https://", 8) == 0);
+    CHECK(rn.sections[0].items[1].url[0] == '\0');                 /* not https: no link */
+
+    const char *nf = "HTTP/1.1 404 Not Found\r\n\r\n{\"error\":\"not found\"}";
+    CHECK(oc_releasenotes_read_response(nf, strlen(nf), &rn) == OC_RN_NOT_RELEASE && rn.n_sections == 0);
+    const char *err = "HTTP/1.1 500 Internal\r\n\r\noops";
+    CHECK(oc_releasenotes_read_response(err, strlen(err), &rn) == OC_RN_FAILED);
+    const char *cut = "HTTP/1.1 200 OK\r\n\r\n{\"release\":16,\"sections\":[{\"title\":\"New\",\"it";
+    CHECK(oc_releasenotes_read_response(cut, strlen(cut), &rn) == OC_RN_FAILED && rn.n_sections == 0);
+    const char *wrong = "HTTP/1.1 200 OK\r\n\r\n{\"release\":\"sixteen\",\"sections\":[]}";
+    CHECK(oc_releasenotes_read_response(wrong, strlen(wrong), &rn) == OC_RN_FAILED);
+    const char *noheads = "HTTP/1.1 200 OK\r\nContent-Type: application/json";
+    CHECK(oc_releasenotes_read_response(noheads, strlen(noheads), &rn) == OC_RN_FAILED);
+    CHECK(oc_releasenotes_read_response("garbage", 7, &rn) == OC_RN_FAILED);
+    /* More items than the room holds: refused, never read past the room. */
+    {
+        static char big[64 * 1024];
+        int o = snprintf(big, sizeof big, "{\"release\":3,\"sections\":[{\"title\":\"New\",\"items\":[");
+        for (int i = 0; i < OC_RN_ITEMS + 5; i++)
+            o += snprintf(big + o, sizeof big - (size_t)o, "%s{\"title\":\"t%d\"}", i ? "," : "", i);
+        o += snprintf(big + o, sizeof big - (size_t)o, "]}]}");
+        CHECK(oc_releasenotes_read(200, big, (size_t)o, &rn) == OC_RN_FAILED && rn.n_sections == 0);
+    }
+    /* A title past its room: refused rather than cut. */
+    {
+        static char longt[OC_RN_TEXT + 200];
+        int o = snprintf(longt, sizeof longt, "{\"release\":3,\"sections\":[{\"title\":\"");
+        memset(longt + o, 'a', OC_RN_TEXT + 10);
+        o += OC_RN_TEXT + 10;
+        o += snprintf(longt + o, sizeof longt - (size_t)o, "\",\"items\":[]}]}");
+        CHECK(oc_releasenotes_read(200, longt, (size_t)o, &rn) == OC_RN_FAILED);
+    }
+    /* A browser's answer: status and body apart. */
+    const char *body = "{\"release\":2,\"sections\":[]}";
+    CHECK(oc_releasenotes_read(200, body, strlen(body), &rn) == OC_RN_OK && rn.release == 2 && rn.n_sections == 0);
+    CHECK(oc_releasenotes_read(0, "", 0, &rn) == OC_RN_FAILED);
+    /* Which builds are asked about: never a source build. */
+    CHECK(!oc_releasenotes_askable("dev") && !oc_releasenotes_askable("") && !oc_releasenotes_askable("a/b"));
+    CHECK(oc_releasenotes_askable("abc1234"));
+}
+
 static void test_wellknown_parse(void) {
     oc_wellknown wk;
 
@@ -6028,6 +6087,7 @@ int run_client_core_tests(void) {
     test_resolve();
     test_resolve_literals();
     test_wellknown_parse();
+    test_releasenotes();
     test_last_error();
     test_xfer_table();
     test_workspace_key();

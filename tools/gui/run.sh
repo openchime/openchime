@@ -15,7 +15,7 @@
 # are skipped by name.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ALL="smoke startup composer mentions drafts links keymenu members newmsg shortcuts chords reactions polls tables groups files uploads voice screenrec search_boxes calls calls_tcp balloon pdm workspaces navhistory cursor emoji_admin preview timetoken spoiler collapse lightbox jumpdate"
+ALL="smoke startup composer mentions drafts links keymenu members newmsg shortcuts chords reactions polls tables groups files uploads voice screenrec search_boxes calls calls_tcp balloon pdm workspaces navhistory cursor emoji_admin preview timetoken spoiler collapse lightbox jumpdate whatsnew"
 WEB_OK="smoke mentions reactions voice screenrec uploads files calls calls_tcp search_boxes pdm chords polls tables workspaces navhistory cursor emoji_admin preview timetoken spoiler collapse lightbox"
 plat=win32
 case "${1:-}" in --win32) plat=win32; shift ;; --web) plat=web; shift ;; esac

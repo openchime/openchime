@@ -1279,6 +1279,30 @@ is what is shown. **Copy** puts the whole as one line on the clipboard --
 into a report; the harness's `about` verb opens the dialog and answers that
 line, which the full suite checks (TESTING.md §3.4).
 
+### What's new: this build's release notes
+
+**What's new** is in the workspace menu after About OpenChime, in the palette
+beside it, and a button on the About card. It turns the card into the notes of
+the release this client is: the control plane writes them once from what the
+release shipped, and the client asks for them by its build id,
+`GET https://openchime.io/api/releases/build/<build id>`
+(`client/core/releasenotes.{h,c}`), which answers the release's number, date
+and sections of items, each with its link. The card says "Loading…" while it
+asks -- the window never waits on it: the Windows client fetches on a thread of
+its own, through the client's verifying TLS with the built-in roots only
+(`client/core/https_get.{h,c}`, which the `.well-known` fetch uses too), and
+the web client with the browser's `fetch` -- then "What's new in release N", its
+date and each section's items; an item with a link opens it in the browser.
+**Open on openchime.io** opens the same notes as a page,
+`https://openchime.io/releases/build/<build id>`. A build that is not a release
+says "This build is not a release." with a link to every release -- a source
+build ("dev") is never asked about -- and a fetch that fails or times out says
+"Could not load the release notes." with the page's link. Under the hook, a URL
+to open is written where every URL the hook opens is (`signin_url.txt`), and the
+dump's `whatsnew=` line gives the card's state (`loading`, `shown`,
+`notrelease`, `failed`), the release and how many items it lists
+(`tools/gui/whatsnew.sh`).
+
 ### What the window says, and where (REQ-263)
 
 Each kind of message has one surface, decided by what it is

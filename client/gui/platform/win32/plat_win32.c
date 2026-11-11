@@ -32,6 +32,7 @@
 #include <string.h>
 
 #include "platform.h"
+#include "releasenotes.h"   /* what's new: fetched on a thread (oc_plat_releasenotes_*) */
 #include "a11y_win32.h"
 #include "openchime_res.h"
 #include "st_dwrite.h"
@@ -618,6 +619,35 @@ int oc_plat_picker_answer(const char *path) {
     SetDlgItemTextW(pf.found, 0x47C, w);
     PostMessageW(pf.found, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
     return 1;
+}
+
+/* The release notes, on a thread of their own: the fetch blocks for as long as
+ * the network takes (releasenotes.h), and the window must not. The thread fills
+ * the result and then says so; the tick reads it once. */
+static oc_releasenotes g_rn_result;
+static char            g_rn_build[80];
+static volatile LONG   g_rn_state;       /* 0 idle, 1 running, 2 done */
+static int             g_rn_rc;
+
+static DWORD WINAPI rn_thread(LPVOID arg) {
+    (void)arg;
+    g_rn_rc = oc_releasenotes_fetch(g_rn_build, &g_rn_result);
+    InterlockedExchange(&g_rn_state, 2);
+    return 0;
+}
+
+void oc_plat_releasenotes_start(const char *build_id) {
+    if (InterlockedCompareExchange(&g_rn_state, 1, 0) != 0) return;
+    snprintf(g_rn_build, sizeof g_rn_build, "%s", build_id ? build_id : "");
+    HANDLE h = CreateThread(NULL, 0, rn_thread, NULL, 0, NULL);
+    if (!h) { g_rn_rc = OC_RN_FAILED; InterlockedExchange(&g_rn_state, 2); return; }
+    CloseHandle(h);
+}
+
+int oc_plat_releasenotes_poll(void *out) {
+    if (InterlockedCompareExchange(&g_rn_state, 0, 2) != 2) return -1;
+    memcpy(out, &g_rn_result, sizeof g_rn_result);
+    return g_rn_rc;
 }
 
 int oc_plat_pick_files(SDL_Window *owner, const char *filter, int multi, char *out, size_t cap) {

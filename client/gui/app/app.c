@@ -61,6 +61,7 @@
 #include "oc_port.h"          /* oc_mkdir, oc_localtime_r */
 #include "protocol.h"         /* OC_CHANNEL_KIND_DM, OC_PRESENCE_* */
 #include "build_id.h"         /* OC_BUILD_ID: About OpenChime */
+#include "releasenotes.h"     /* What's new: this build's release notes */
 #include "theme.h"
 #include "osnotify.h"    /* OS notifications, per platform (REQ-138) */
 #include "feedback.h"    /* in-app toasts and banners (REQ-263) */
@@ -1985,6 +1986,9 @@ static struct {
 /* Copy fingerprint, and View certificate: the question's two footer actions. */
 enum { CERT_CMD_COPY = 2700, CERT_CMD_VIEW = 2701 };
 enum { ABOUT_CMD_COPY = 2702 };
+/* What's new: opened from About, the workspace menu and the palette; and its
+ * card's "Open on openchime.io". */
+enum { ABOUT_CMD_WHATSNEW = 2704, WN_CMD_OPEN = 2705 };
 enum { WSM_CMD_REMOVE_ALL = 2703 };   /* the Workspaces footer's Remove all */
 static float cert_q_body(gfx *rt, rectf body);   /* fwd */
 
@@ -2097,6 +2101,12 @@ static int g_notify_open, g_keys_open;
 /* About OpenChime: which build this client is and which the daemon is, to read
  * off one screen and copy into a report. */
 static int g_about_open;
+/* What's new (CLIENT.md): the About card showing this build's release notes
+ * instead of its rows, fetched from the control plane without holding the
+ * window (oc_plat_releasenotes_*). The state is the card's, and the dump's. */
+enum { WN_NONE = 0, WN_LOADING, WN_SHOWN, WN_NOTRELEASE, WN_FAILED };
+static int g_whatsnew;                 /* the About card shows What's new */
+static int g_wn_state;
 /* The status dialog (bespoke modal body, not the generic form): its emoji is
  * PICKED, its text suggested, its clear-after chip prefilled from the live
  * expiry. g_status_emoji and g_status_edit are declared beside the picker,
@@ -9749,7 +9759,75 @@ static void about_text(const oc_model *m, char *out, size_t cap) {
              OC_BUILD_ID, oc_plat_name(), about_server(m), (unsigned)OC_PROTOCOL_VERSION);
 }
 
+static void signin_open_url(const char *url);   /* fwd: every URL the client opens */
+
+/* What's new: the notes, and what each item links to, drawn this frame. */
+static oc_releasenotes g_wn;
+static struct { rectf r; char url[OC_RN_URL]; } g_wn_links[64];
+static int g_n_wn_links;
+
+static void whatsnew_draw(gfx *rt, rectf reg) {
+    g_n_wn_links = 0;
+    float x = reg.left + 24, w = reg.right - reg.left - 48, y = reg.top + 8;
+    if (g_wn_state == WN_LOADING) {
+        draw_text(rt, "Loading…", g_ui, rf(x, y, x + w, y + UIS(28)), OC_COL_MUTED);
+        return;
+    }
+    if (g_wn_state == WN_NOTRELEASE || g_wn_state == WN_FAILED) {
+        draw_text(rt, g_wn_state == WN_NOTRELEASE ? "This build is not a release." : "Could not load the release notes.",
+                  g_ui, rf(x, y, x + w, y + UIS(28)), OC_COL_TEXT);
+        y += UIS(32);
+        const char *lk = g_wn_state == WN_NOTRELEASE ? "See every release on openchime.io" : "Open them on openchime.io";
+        rectf lr = rf(x, y, x + text_width(lk, g_ui) + 4, y + UIS(26));
+        draw_text(rt, lk, g_ui, lr, OC_COL_ACCENT);
+        fill(rt, rf(lr.left, lr.bottom - 4, lr.right - 4, lr.bottom - 3), OC_COL_ACCENT);
+        snprintf(g_wn_links[0].url, sizeof g_wn_links[0].url, "%s",
+                 g_wn_state == WN_NOTRELEASE ? OC_RN_INDEX_URL : "");
+        if (g_wn_state == WN_FAILED)
+            snprintf(g_wn_links[0].url, sizeof g_wn_links[0].url, "%s%s", OC_RN_PAGE_URL, OC_BUILD_ID);
+        g_wn_links[0].r = lr;
+        g_n_wn_links = 1;
+        return;
+    }
+    char head[96];
+    snprintf(head, sizeof head, "What's new in release %d", g_wn.release);
+    draw_text(rt, head, g_ui_b, rf(x, y, x + w, y + UIS(28)), OC_COL_TEXT);
+    y += UIS(26);
+    if (g_wn.date[0]) { draw_text(rt, g_wn.date, g_meta, rf(x, y, x + w, y + UIS(22)), OC_COL_MUTED); y += UIS(26); }
+    for (int s = 0; s < g_wn.n_sections && y < reg.bottom; s++) {
+        y += UIS(6);
+        draw_text(rt, g_wn.sections[s].title, g_ui_b, rf(x, y, x + w, y + UIS(26)), OC_COL_TEXT);
+        y += UIS(26);
+        for (int k = 0; k < g_wn.sections[s].n_items && y < reg.bottom; k++) {
+            const oc_rn_item *it = &g_wn.sections[s].items[k];
+            float th = text_height(it->title, g_ui, w - UIS(18));
+            if (th < UIS(22)) th = UIS(22);
+            draw_text(rt, "•", g_ui, rf(x, y, x + UIS(14), y + UIS(22)), OC_COL_MUTED);
+            rectf tr = rf(x + UIS(18), y, x + w, y + th);
+            /* An item with a link opens it in the browser. */
+            draw_text(rt, it->title, g_ui, tr, it->url[0] ? OC_COL_ACCENT : OC_COL_TEXT);
+            if (it->url[0] && g_n_wn_links < (int)(sizeof g_wn_links / sizeof g_wn_links[0])) {
+                g_wn_links[g_n_wn_links].r = tr;
+                snprintf(g_wn_links[g_n_wn_links].url, sizeof g_wn_links[0].url, "%s", it->url);
+                g_n_wn_links++;
+            }
+            y += th + UIS(4);
+        }
+    }
+}
+
+/* Once a tick: the fetch's answer, when it has come. */
+static void whatsnew_tick(void) {
+    if (g_wn_state != WN_LOADING) return;
+    int rc = oc_plat_releasenotes_poll(&g_wn);
+    if (rc < 0) return;
+    g_wn_state = rc == OC_RN_OK ? WN_SHOWN : rc == OC_RN_NOT_RELEASE ? WN_NOTRELEASE : WN_FAILED;
+    invalidate();
+}
+
 static void draw_about_app(gfx *rt, rectf reg) {
+    if (g_whatsnew) { whatsnew_draw(rt, reg); return; }
+    g_n_wn_links = 0;
     const oc_model *m = model();
     char client[64], proto[16];
     snprintf(client, sizeof client, "%s (%s)", OC_BUILD_ID,
@@ -11750,6 +11828,7 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Notifications",           71 },
     { "Keyboard shortcuts",      72 },
     { "About OpenChime",         89 },
+    { "What's new",              ABOUT_CMD_WHATSNEW },
     { "Mark all as read",        73 },
     { "Edit profile",            53 },
     { "Change password",         31 },
@@ -17599,14 +17678,21 @@ static const oc_modal_spec *modal_current(void) {
         sp.size = MODAL_LG;
         sp.buttons[0] = (oc_mbtn){ "Done", MB_PRIMARY, MODAL_OK };
         sp.n_buttons = 1;
+    } else if (g_about_open && g_whatsnew) {
+        sp.title = "What's new";
+        sp.size = MODAL_LG;
+        sp.buttons[0] = (oc_mbtn){ "Open on openchime.io", MB_NORMAL, WN_CMD_OPEN };
+        sp.buttons[1] = (oc_mbtn){ "Close", MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 2;
     } else if (g_about_open) {
         sp.title = "About OpenChime";
         sp.size = MODAL_SM;
         sp.want_h = (MODAL_TITLE_H + ABOUT_ROWS * UIS(32.0f) + UIS(16.0f) + MODAL_FOOT_H + UIS(16.0f))
                     / g_text_scale;
         sp.buttons[0] = (oc_mbtn){ "Copy",  MB_NORMAL,  ABOUT_CMD_COPY };
-        sp.buttons[1] = (oc_mbtn){ "Close", MB_PRIMARY, MODAL_OK };
-        sp.n_buttons = 2;
+        sp.buttons[1] = (oc_mbtn){ "What's new", MB_NORMAL, ABOUT_CMD_WHATSNEW };
+        sp.buttons[2] = (oc_mbtn){ "Close", MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 3;
     } else if (g_keys_open) {
         sp.title = "Keyboard shortcuts";
         sp.size = MODAL_LG;
@@ -30264,6 +30350,11 @@ static int on_click(oc_win *hwnd, int x, int y) {
         open_dm_go(uid);
         return 1;
     }
+    /* What's new: an item's link, or the card's own, opens in the browser. */
+    if (g_about_open && g_whatsnew) {
+        for (int i = 0; i < g_n_wn_links; i++)
+            if (in_rect(g_wn_links[i].r, x, y) && g_wn_links[i].url[0]) { signin_open_url(g_wn_links[i].url); return 1; }
+    }
     if (g_wsmgr_open) {
         for (int i = 0; i < g_n_wsmgr_hits; i++) {
             /* Inside the LIST as well as inside the button: a row scrolled under
@@ -33249,6 +33340,7 @@ static void open_ws_menu(oc_win *hwnd) {
     mi_item(73, "Mark all as read");
     mi_item(72, "Keyboard shortcuts");
     mi_item(89, "About OpenChime");
+    mi_item(ABOUT_CMD_WHATSNEW, "What's new");
     if (admin) { mi_section("TOOLS & SETTINGS"); mi_item(60, "Storage usage"); mi_item(61, "Audit log");
                  mi_item(87, "Groups"); }
     mi_sep();
@@ -34906,7 +34998,21 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         break; }
     case 71: oc_client_list_notify_prefs(g_client); modal_enter(hwnd, &g_notify_open); break;   /* */
     case 72: modal_enter(hwnd, &g_keys_open); break;   /* */
-    case 89: modal_enter(hwnd, &g_about_open); break;
+    case 89: g_whatsnew = 0; modal_enter(hwnd, &g_about_open); break;
+    case ABOUT_CMD_WHATSNEW:
+        /* This build's notes, asked of the control plane by its build id; a
+         * source build is not a release and is not asked about. */
+        g_whatsnew = 1;
+        if (!oc_releasenotes_askable(OC_BUILD_ID)) g_wn_state = WN_NOTRELEASE;
+        else { g_wn_state = WN_LOADING; oc_plat_releasenotes_start(OC_BUILD_ID); }
+        if (!g_about_open) modal_enter(hwnd, &g_about_open);
+        invalidate();
+        break;
+    case WN_CMD_OPEN: {
+        char url[200];
+        snprintf(url, sizeof url, "%s%s", OC_RN_PAGE_URL, OC_BUILD_ID);
+        signin_open_url(oc_releasenotes_askable(OC_BUILD_ID) ? url : OC_RN_INDEX_URL);
+        break; }
     case WSM_CMD_REMOVE_ALL: {
         if (g_n_sw <= 0) break;
         char what[48], body[320];
@@ -36285,6 +36391,13 @@ static void test_dump(const char *path) {
             g_sessions_open ? "sessions" : g_form_open ? "form" : "none",
             oc_plat_picker_open(),
             oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep, g_pref_notify);
+    {   /* What's new: its card's state, the release, and how many items it lists. */
+        static const char *const WN[] = { "none", "loading", "shown", "notrelease", "failed" };
+        int items = 0;
+        for (int s = 0; g_wn_state == WN_SHOWN && s < g_wn.n_sections; s++) items += g_wn.sections[s].n_items;
+        fprintf(f, "whatsnew=%s open=%d release=%d items=%d\n", WN[g_wn_state], g_about_open && g_whatsnew,
+                g_wn_state == WN_SHOWN ? g_wn.release : 0, items);
+    }
     /* The form's shape and its values, so a driven form is checkable: a
      * screenshot of a field proves only that it is there. */
     fprintf(f, "paneclose=%.0f,%.0f,%.0f,%.0f\n", g_pane_close.left, g_pane_close.top,
@@ -37522,7 +37635,14 @@ static void test_poll(oc_win *hwnd) {
         /* About OpenChime; the ack is the text Copy puts on the clipboard. */
         char t[256];
         about_text(model(), t, sizeof t);
+        g_whatsnew = 0;
         modal_enter(hwnd, &g_about_open); test_ack(t);
+    } else if (!strcmp(verb, "whatsnew")) {
+        /* What's new, as its menu item opens it; "open" presses its "Open on
+         * openchime.io", whose address goes where every URL the hook opens goes. */
+        if (!strcmp(arg, "open")) menu_dispatch(hwnd, WN_CMD_OPEN);
+        else menu_dispatch(hwnd, ABOUT_CMD_WHATSNEW);
+        test_ack("ok");
     } else if (!strcmp(verb, "open")) {
         /* `open <cmd>` -- `menu`, acked FIRST, as `clickform` is: a command that
          * opens a dialog runs its nested loop inside the dispatch, and the verbs
@@ -38600,6 +38720,7 @@ static int on_tick(oc_win *hwnd) {
             nt_tick();               /* the notification window expires on this tick too */
             call_tick(hwnd);         /* a start waiting on a member list */
             bc_tick();               /* and a broadcast send (REQ-221) */
+            whatsnew_tick();         /* What's new: the release notes, once they are in */
             pdm_tick(hwnd);          /* private DMs: invitations, arrivals, endings */
             /* The call view's duration, levels and speaking rings move without
              * any event to repaint on. */

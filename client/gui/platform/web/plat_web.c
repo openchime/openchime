@@ -28,6 +28,7 @@
 #include <string.h>
 
 #include "platform.h"
+#include "releasenotes.h"   /* what's new: read from the browser's fetch */
 #include "env.h"        /* oc_env_dev: the harness's inputs, development mode only */
 #include "st_canvas.h"
 
@@ -459,6 +460,45 @@ int oc_plat_pick_files(SDL_Window *owner, const char *filter, int multi, char *o
 void oc_plat_set_modal_tick(void (*fn)(void)) { (void)fn; }
 int  oc_plat_picker_open(void) { return 0; }
 int  oc_plat_picker_answer(const char *path) { (void)path; return 0; }
+
+/* The release notes, with the browser's own fetch: started, and answered into
+ * the page's state, which the tick polls -- the page never waits on it. The
+ * control plane answers any origin for these reads. A network failure is
+ * status 0. */
+EM_JS(void, web_rn_start, (const char *url), {
+    var u = UTF8ToString(url);
+    Module.__ocRn = null;
+    fetch(u, { headers: { "Accept": "application/json" } })
+        .then(function (r) { return r.text().then(function (t) { Module.__ocRn = { s: r.status, b: t }; }); })
+        .catch(function () { Module.__ocRn = { s: 0, b: "" }; });
+});
+EM_JS(char *, web_rn_poll, (int *status), {
+    var a = Module.__ocRn;
+    if (!a) return 0;
+    Module.__ocRn = null;
+    HEAP32[status >> 2] = a.s;
+    return stringToNewUTF8(a.b);
+});
+static int g_rn_running;
+
+void oc_plat_releasenotes_start(const char *build_id) {
+    if (g_rn_running) return;
+    char url[200];
+    snprintf(url, sizeof url, "https://%s%s%s", OC_RN_HOST, OC_RN_API_PATH, build_id ? build_id : "");
+    g_rn_running = 1;
+    web_rn_start(url);
+}
+
+int oc_plat_releasenotes_poll(void *out) {
+    if (!g_rn_running) return -1;
+    int status = 0;
+    char *body = web_rn_poll(&status);
+    if (!body) return -1;
+    g_rn_running = 0;
+    int rc = oc_releasenotes_read(status, body, strlen(body), (oc_releasenotes *)out);
+    free(body);
+    return rc;
+}
 
 /* Saving: the application writes to a path on the page's filesystem, and
  * tells the platform when it has (oc_plat_file_saved); the browser then
