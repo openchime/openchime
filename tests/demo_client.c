@@ -8,8 +8,15 @@
  *   demo_client <host> <port> <user> <pass> reply <channel_id> <parent_id> <text...>
  *   demo_client <host> <port> <user> <pass> summarize <channel_id> <start_ms> <end_ms>
  *   demo_client <host> <port> <user> <pass> invite [uses]   (0 = no limit)
+ *   demo_client <host> <port> <user> <pass> speak <channel_id> <text...>
+ *   demo_client <host> <port> <user> <pass> listen <channel_id> <pcm-file>...
  *   demo_client <host> <port> --oidc <jwt> whoami | send <channel_id> <text...>
  *
+ * `speak` posts the text and fetches its speech (AUDIO_GET) to the end; `listen`
+ * sends each file (16 kHz mono 16-bit little-endian PCM) as a push-to-talk
+ * segment and waits for its words. Each prints one line per piece with the wall
+ * clock when it started and ended, so a script sampling the daemon's memory can
+ * tell which case it is in (tools/mem_speech.sh).
  * `token` registers a push device token (so a later SEND has someone to notify);
  * `send` posts a message (which, if the daemon is enrolled + OPENCHIME_PUSH_URL is set,
  * drives the push emitter); `summarize` asks for a summary of a custom range and
@@ -292,6 +299,102 @@ static int cmd_summarize(client *c, uint64_t channel_id, uint64_t start_ms, uint
     }
 }
 
+/* The wall clock, to the millisecond: what a memory sampler's lines carry too. */
+static double wall_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+/* Post `text`, then fetch its speech to AUDIO_END. */
+static int cmd_speak(client *c, uint64_t channel_id, const char *text) {
+    uint8_t idem[OC_IDEM_SIZE];
+    double t0 = wall_s();
+    for (size_t i = 0; i < sizeof idem; i++) idem[i] = (uint8_t)((uint64_t)(t0 * 1000) >> (i % 8 * 8) ^ (i * 29));
+    uint8_t buf[8192]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0};
+    s.channel_id = channel_id;
+    memcpy(s.idem, idem, OC_IDEM_SIZE);
+    s.body = oc_slice_str(text);
+    if (oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) != OC_OK || write_all(&c->conn, buf, w.len) != 0) FAIL("send");
+    uint64_t mid = 0;
+    for (int i = 0; i < 64 && !mid; i++) {
+        oc_header hdr; oc_rbuf p;
+        if (read_frame(c, &hdr, &p) != 0) FAIL("read after send");
+        if (hdr.msg_type == OC_MSG_SEND_ACK) {
+            oc_send_ack a;
+            if (oc_decode_send_ack(&p, &a) == OC_OK && memcmp(a.idem, idem, OC_IDEM_SIZE) == 0) mid = a.message_id;
+        }
+        if (hdr.msg_type == OC_MSG_ERROR) FAIL("send rejected");
+    }
+    if (!mid) FAIL("no send ack");
+    double t1 = wall_s();
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_audio_get g = { mid };
+    if (oc_encode_audio_get(&w, OC_PROTOCOL_VERSION, &g) != OC_OK || write_all(&c->conn, buf, w.len) != 0) FAIL("audio get");
+    uint64_t got = 0;
+    for (;;) {
+        oc_header hdr; oc_rbuf p;
+        if (read_frame(c, &hdr, &p) != 0) FAIL("read audio");
+        if (hdr.msg_type == OC_MSG_AUDIO_CHUNK) {
+            oc_audio_chunk ch;
+            if (oc_decode_audio_chunk(&p, &ch) == OC_OK && ch.message_id == mid) got += ch.data.len;
+        } else if (hdr.msg_type == OC_MSG_AUDIO_END) {
+            oc_audio_end e;
+            if (oc_decode_audio_end(&p, &e) != OC_OK || e.message_id != mid) continue;
+            printf("speak start %.3f end %.3f chars %zu bytes %llu\n", t1, wall_s(), strlen(text), (unsigned long long)got);
+            return 0;
+        } else if (hdr.msg_type == OC_MSG_ERROR) {
+            FAIL("speech refused");
+        }
+    }
+}
+
+/* Each file a push-to-talk segment, sent whole, its words waited for. */
+static int cmd_listen(client *c, uint64_t channel_id, int n, char **files) {
+    static uint8_t pcm[OC_STT_RATE * 2 * 31], buf[40000];
+    for (int i = 0; i < n; i++) {
+        FILE *f = fopen(files[i], "rb");
+        if (!f) FAIL("open the segment");
+        size_t len = fread(pcm, 1, sizeof pcm, f) & ~(size_t)1;
+        fclose(f);
+        double t0 = wall_s();
+        oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_stt_begin b = {0};
+        b.segment_id = (uint32_t)(i + 1);
+        b.mode = OC_STT_MODE_PTT;
+        b.channel_id = channel_id;
+        for (size_t k = 0; k < OC_IDEM_SIZE; k++) b.idem[k] = (uint8_t)((uint64_t)(t0 * 1000) >> (k % 8 * 8) ^ (k * 13 + i));
+        b.sample_count = (uint32_t)(len / 2);
+        if (oc_encode_stt_begin(&w, OC_PROTOCOL_VERSION, &b) != OC_OK || write_all(&c->conn, buf, w.len) != 0) FAIL("stt begin");
+        uint32_t seq = 0;
+        for (size_t off = 0; off < len; off += 32000) {
+            size_t m = len - off < 32000 ? len - off : 32000;
+            oc_wbuf_init(&w, buf, sizeof buf);
+            oc_stt_chunk ch = { b.segment_id, seq++, { pcm + off, m } };
+            if (oc_encode_stt_chunk(&w, OC_PROTOCOL_VERSION, &ch) != OC_OK || write_all(&c->conn, buf, w.len) != 0) FAIL("stt chunk");
+        }
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_stt_end e = { b.segment_id };
+        if (oc_encode_stt_end(&w, OC_PROTOCOL_VERSION, &e) != OC_OK || write_all(&c->conn, buf, w.len) != 0) FAIL("stt end");
+        for (;;) {
+            oc_header hdr; oc_rbuf p;
+            if (read_frame(c, &hdr, &p) != 0) FAIL("read while waiting for the words");
+            if (hdr.msg_type == OC_MSG_STT_TEXT) {
+                oc_stt_text t;
+                if (oc_decode_stt_text(&p, &t) != OC_OK || t.segment_id != b.segment_id) continue;
+                printf("listen %s start %.3f end %.3f seconds %.1f chars %zu: %.*s\n", files[i], t0, wall_s(),
+                       (double)len / 2 / OC_STT_RATE, t.text.len, (int)(t.text.len < 60 ? t.text.len : 60),
+                       (const char *)t.text.ptr);
+                fflush(stdout);
+                break;
+            }
+            if (hdr.msg_type == OC_MSG_ERROR) FAIL("segment refused");
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr,
@@ -300,9 +403,11 @@ int main(int argc, char **argv) {
             "       %s <host> <port> <user> <pass> reply <channel_id> <parent> <text...>\n"
             "       %s <host> <port> <user> <pass> summarize <channel_id> <start_ms> <end_ms>\n"
             "       %s <host> <port> <user> <pass> invite [uses]   (a member invite; 0 = no limit)\n"
+            "       %s <host> <port> <user> <pass> speak <channel_id> <text...>\n"
+            "       %s <host> <port> <user> <pass> listen <channel_id> <pcm-file>...\n"
             "       %s <host> <port> --oidc <jwt>   whoami\n"
             "       %s <host> <port> --oidc <jwt>   send <channel_id> <text...>\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
     const char *host = argv[1]; int port = atoi(argv[2]);
@@ -333,6 +438,10 @@ int main(int argc, char **argv) {
         rc = cmd_send(&c, strtoull(argv[6], NULL, 10), argv[7]);
     } else if (strcmp(cmd, "reply") == 0 && argc >= 9) {
         rc = cmd_reply(&c, strtoull(argv[6], NULL, 10), strtoull(argv[7], NULL, 10), argv[8]);
+    } else if (strcmp(cmd, "speak") == 0 && argc >= 8) {
+        rc = cmd_speak(&c, strtoull(argv[6], NULL, 10), argv[7]);
+    } else if (strcmp(cmd, "listen") == 0 && argc >= 8) {
+        rc = cmd_listen(&c, strtoull(argv[6], NULL, 10), argc - 7, argv + 7);
     } else if (strcmp(cmd, "summarize") == 0 && argc >= 9) {
         rc = cmd_summarize(&c, strtoull(argv[6], NULL, 10), strtoull(argv[7], NULL, 10),
                            strtoull(argv[8], NULL, 10));
