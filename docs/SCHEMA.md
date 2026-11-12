@@ -2060,8 +2060,9 @@ the blocker: `OPEN_DM` and `OPEN_GROUP_DM` answer `DM_REFUSED`. A conversation
 the two already share stays, and what the blocked person writes into it is
 stored and reaches its other members, but not the blocker: the send writes a
 `withheld_messages` row for the blocker, and the fan-out, push, backfill,
-history, unread counts and activity all leave those messages out for that
-reader. The rows outlive the block, so lifting it brings back nothing that was
+history, an opened thread, the thread list's and every other unread count,
+activity, search (messages and snippets), pins and files all leave those
+messages out for that reader. The rows outlive the block, so lifting it brings back nothing that was
 withheld. Channels are untouched: there, muting a person is the tool. The
 workspace's own sender cannot be blocked.
 

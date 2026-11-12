@@ -7022,11 +7022,13 @@ static oc_dbres *process_list_files(sqlite3 *db, const oc_job *j) {
           "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id "
           " WHERE a.channel_id=?1 AND a.message_id IS NOT NULL "
           "   AND (a.created_at_ms, a.id) < (?3, ?4) "
+          "   AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?5 AND wm.message_id=a.message_id) "
           " ORDER BY a.created_at_ms DESC, a.id DESC LIMIT ?2;"
         : "SELECT a.id, a.channel_id, a.message_id, a.uploader_id, a.size, "
           "       a.created_at_ms, a.reclaimed_at_ms, a.filename, a.mime, m.kind, m.duration_ms "
           "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id "
           " WHERE a.channel_id=?1 AND a.message_id IS NOT NULL "
+          "   AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?5 AND wm.message_id=a.message_id) "
           " ORDER BY a.created_at_ms DESC, a.id DESC LIMIT ?2;")
         : (paged
         ? "SELECT a.id, a.channel_id, a.message_id, a.uploader_id, a.size, "
@@ -7035,16 +7037,20 @@ static oc_dbres *process_list_files(sqlite3 *db, const oc_job *j) {
           " WHERE a.message_id IS NOT NULL AND a.channel_id IN "
           "       (SELECT channel_id FROM channel_members WHERE user_id=?1) "
           "   AND (a.created_at_ms, a.id) < (?3, ?4) "
+          "   AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?5 AND wm.message_id=a.message_id) "
           " ORDER BY a.created_at_ms DESC, a.id DESC LIMIT ?2;"
         : "SELECT a.id, a.channel_id, a.message_id, a.uploader_id, a.size, "
           "       a.created_at_ms, a.reclaimed_at_ms, a.filename, a.mime, m.kind, m.duration_ms "
           "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id "
           " WHERE a.message_id IS NOT NULL AND a.channel_id IN "
           "       (SELECT channel_id FROM channel_members WHERE user_id=?1) "
+          "   AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?5 AND wm.message_id=a.message_id) "
           " ORDER BY a.created_at_ms DESC, a.id DESC LIMIT ?2;");
     sqlite3_prepare_v2(db, sql, -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)(j->channel_id ? j->channel_id : j->user_id));
     sqlite3_bind_int64(st, 2, (sqlite3_int64)(page + 1));
+    /* The asker: a file on a message a block withheld from them is not theirs to list. */
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)j->user_id);
     if (paged) {
         sqlite3_bind_int64(st, 3, (sqlite3_int64)j->files_before_ms);
         sqlite3_bind_int64(st, 4, (sqlite3_int64)j->files_before_id);
@@ -7690,10 +7696,13 @@ static oc_dbres *process_list_pins(sqlite3 *db, const oc_job *j) {
         /* An action travels as its action text, flagged (REQ-058). */
         "       EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) "
         "  FROM pins p JOIN messages m ON m.id = p.message_id "
-        " WHERE p.channel_id=? AND m.deleted_at_ms IS NULL "
-        " ORDER BY p.created_at_ms DESC LIMIT ?;", -1, &st, NULL);
+        " WHERE p.channel_id=?1 AND m.deleted_at_ms IS NULL "
+        /* Not a message a block withheld from the asker. */
+        "   AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?3 AND wm.message_id=m.id) "
+        " ORDER BY p.created_at_ms DESC LIMIT ?2;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)OC_MAX_PINS);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
 
     oc_pin_row *arr = calloc(OC_MAX_PINS, sizeof *arr);
     size_t n = 0;
@@ -8230,9 +8239,13 @@ static oc_dbres *process_list_thread(sqlite3 *db, const oc_job *j) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "SELECT id, author_id, created_at_ms, body FROM messages "
-        "WHERE parent_id=? ORDER BY id LIMIT ?;", -1, &st, NULL);
+        "WHERE parent_id=?1 "
+        /* Not a reply a block withheld from this reader, as backfill leaves it out. */
+        "  AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?3 AND wm.message_id=messages.id) "
+        "ORDER BY id LIMIT ?2;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->parent_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)OC_BACKFILL_MAX);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
     size_t cap = 8, n = 0;
     oc_replay_msg *arr = malloc(cap * sizeof *arr);
     while (arr && sqlite3_step(st) == SQLITE_ROW) {
@@ -8355,7 +8368,9 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
         /* A call event (REQ-304) is history, not something anyone said. */
         "  AND m.kind = 0 AND c.e2e = 0 "
         "  AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members cm "
-        "       WHERE cm.channel_id=m.channel_id AND cm.user_id=?2)) ",
+        "       WHERE cm.channel_id=m.channel_id AND cm.user_id=?2)) "
+        /* Not what a block withheld from the searcher: search is no way round it. */
+        "  AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?2 AND wm.message_id=m.id) ",
         /* A snippet is a window on the body that could open or close inside
          * a spoiler (MARKDOWN.md §1d): a body with one is excerpted whole,
          * through the helper, instead. */
@@ -8482,6 +8497,7 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
             "   AND c.e2e = 0 "
             "   AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members cm "
             "        WHERE cm.channel_id=m.channel_id AND cm.user_id=?2)) "
+            "   AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?2 AND wm.message_id=m.id) "
             " ORDER BY m.id DESC LIMIT ?3;", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, fts, -1, SQLITE_STATIC);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
@@ -10499,12 +10515,14 @@ static oc_dbres *process_list_threads(sqlite3 *db, const oc_job *j) {
         "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL) AS last_at, "
         "       (SELECT COUNT(*) FROM messages x "
         "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL) AS replies, "
-        /* A muted person's replies are no badge (REQ-284), as in the channel's
-         * unread; the same test in build_thread_one below. */
+        /* A muted person's replies are no badge (REQ-284), nor what a block
+         * withheld from me, as in the channel's unread; the same tests in
+         * build_thread_one below. */
         "       (SELECT COUNT(*) FROM messages x "
         "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL "
         "           AND x.author_id <> ?1 "
         "           AND NOT EXISTS(SELECT 1 FROM muted_users mu WHERE mu.user_id = ?1 AND mu.muted_id = x.author_id) "
+        "           AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id = ?1 AND wm.message_id = x.id) "
         "           AND x.id > COALESCE((SELECT tr.last_read_reply_id FROM thread_reads tr "
         "                                 WHERE tr.user_id = ?1 AND tr.root_id = r.id), 0)) AS unread, "
         "       COALESCE((SELECT tf.state FROM thread_follows tf "
@@ -10553,6 +10571,7 @@ static void build_thread_one(sqlite3 *db, uint64_t uid, uint64_t root_id, oc_dbr
         "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL "
         "           AND x.author_id <> ?1 "
         "           AND NOT EXISTS(SELECT 1 FROM muted_users mu WHERE mu.user_id = ?1 AND mu.muted_id = x.author_id) "
+        "           AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id = ?1 AND wm.message_id = x.id) "
         "           AND x.id > COALESCE((SELECT tr.last_read_reply_id FROM thread_reads tr "
         "                                 WHERE tr.user_id = ?1 AND tr.root_id = r.id), 0)), "
         "       COALESCE((SELECT tf.state FROM thread_follows tf "
