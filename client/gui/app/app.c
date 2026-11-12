@@ -30226,7 +30226,7 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
         const char *an = oc_model_user_name((oc_model *)m, msg->author_id);
         snprintf(lbl, sizeof lbl, "%s %s", oc_model_is_blocked(m, msg->author_id) ? "Unblock" : "Block",
                  an && an[0] ? an : "this person");
-        mi_item(114, lbl);
+        mi_item(122, lbl);
     }
     int canmod = own || self_role(m) >= OC_ROLE_ADMIN;
     /* The workspace's windows (REQ-051/052): an author's own message stops
@@ -30417,7 +30417,7 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
         if (g_client) oc_client_set_user_mute(g_client, msg->author_id, on);
         fb_confirm(on ? "Muted. Their messages stay folded away and no longer notify you."
                       : "Unmuted.");
-    } else if (cmd == 114) {
+    } else if (cmd == 122) {
         int on = !oc_model_is_blocked(m, msg->author_id);
         if (g_client) oc_client_set_block(g_client, msg->author_id, on);
         fb_confirm(on ? "Blocked. They can't start a conversation with you, and you won't get their direct messages."

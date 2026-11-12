@@ -614,6 +614,18 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
         char *rr = malloc(p + 1);
         if (rr) { memcpy(rr, rl, p); rr[p] = '\0'; rows_push(r, rr, TB_MAGENTA); }
     }
+    if (m->saved && m->remind_at && !m->deleted) {
+        /* Its reminder (REQ-283), as the desktop client's Saved view shows it:
+         * when it is set for, or that it went off. */
+        time_t rt = (time_t)(m->remind_at / 1000);
+        struct tm rv; char when[48] = "set";
+        if (oc_localtime_r(&rt, &rv)) strftime(when, sizeof when, "%a %d %b at %H:%M", &rv);
+        char rl[96];
+        snprintf(rl, sizeof rl, "    \xe2\x8f\xb0 Reminder %s %s",
+                 (uint64_t)time(NULL) * 1000u >= m->remind_at ? "was" : "for", when);
+        char *rr = strdup(rl);
+        if (rr) rows_push(r, rr, TB_YELLOW);
+    }
     if (show_replies && m->reply_count > 0) {
         /* "N replies: Ana, Ben, Cy" -- the most recent repliers, newest first
          * (REQ-060), by the roster's name, else the one a message carried. */
@@ -1307,7 +1319,7 @@ static void menu_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
 static char g_vote_labels[OC_POLL_MAX_OPTIONS][OC_POLL_OPTION_MAX + 32];
 /* `block`: 0 no Block item (my own message, or the workspace's), 1 Block the
  * author, 2 Unblock them. */
-static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int has_attach, const oc_poll_view *poll, int spoilers, int collapsed, int block) {
+static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int has_attach, const oc_poll_view *poll, int spoilers, int collapsed, int block, int reminded) {
     g_nmenu = 0;
     if (block) g_menu[g_nmenu++] = (menuitem){ block == 2 ? "Unblock the author" : "Block the author",
                                                block == 2 ? ACT_UNBLOCK : ACT_BLOCK };
@@ -1332,7 +1344,7 @@ static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int 
     g_menu[g_nmenu++] = (menuitem){ "Who reacted", ACT_REACTORS };
     g_menu[g_nmenu++] = (menuitem){ "Mark unread from here", ACT_UNREAD };
     if (!deleted && g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
-        g_menu[g_nmenu++] = (menuitem){ "Remind me...", ACT_REMIND };
+        g_menu[g_nmenu++] = (menuitem){ reminded ? "Reminder (change or clear)..." : "Remind me...", ACT_REMIND };
 }
 
 /* A reminder typed (REQ-283): "20m", "1h", "tomorrow" (09:00), "14:30" (today,
@@ -4668,7 +4680,8 @@ int main(int argc, char **argv) {
                             !oc_model_is_workspace_sender(mm, sel->author_id))
                             blk = oc_model_is_blocked(mm, sel->author_id) ? 2 : 1;
                         menu_build_msg(own, may_edit, may_del, sel->deleted || locked, has_attach && !ch->e2e, sel->poll,   /* no files in an encrypted DM */
-                                       has_spoilers(sel->body) ? 1 + spoilers_shown(mid) : 0, sel->collapsed, blk);
+                                       has_spoilers(sel->body) ? 1 + spoilers_shown(mid) : 0, sel->collapsed, blk,
+                                       sel->saved && sel->remind_at);
                         /* Move (REQ-053): one's own, or anything for an admin or
                          * owner, out of a channel that is not archived. */
                         uint8_t role = OC_ROLE_MEMBER;
