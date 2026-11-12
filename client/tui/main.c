@@ -728,7 +728,15 @@ static void e2e_status(oc_model *m, const oc_channel *c, char *out, size_t cap, 
                  "decline (Ctrl+K).", who);
 }
 
-/* Build the rows for the open thread: the parent (found in `ch`) then replies. */
+/* The reply a jump to a date found in the open thread (its index in
+ * thread_msgs, and that thread's root): marked and kept in view until the
+ * reader scrolls or the thread changes. -1 for none. */
+static int      g_thread_mark = -1;
+static uint64_t g_thread_mark_root;
+
+/* Build the rows for the open thread: the parent (found in `ch`) then replies.
+ * Each reply's rows are tagged with its index in thread_msgs, so the marked
+ * one can be found; the parent's are not. */
 static void build_thread_rows(rows_t *r, const oc_model *m, const oc_channel *ch,
                               uint64_t me, int width) {
     if (ch) for (size_t i = 0; i < ch->n_msgs; i++)
@@ -737,7 +745,7 @@ static void build_thread_rows(rows_t *r, const oc_model *m, const oc_channel *ch
             break;
         }
     for (size_t i = 0; i < m->n_thread_msgs; i++)
-        append_msg_rows(r, m, &m->thread_msgs[i], me, width, ch, 0, -1);
+        append_msg_rows(r, m, &m->thread_msgs[i], me, width, ch, 0, (int)i);
 }
 
 /* ---- rendering ------------------------------------------------------------- */
@@ -1291,8 +1299,8 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_DEACTIVATE,
        /* typed emoticons become emoji (compose.emoticons) */
        ACT_EMOTICONS,
-       /* open a conversation at a date, typed */
-       ACT_JUMP_DATE,
+       /* open a conversation at a date, typed; or the open thread's replies */
+       ACT_JUMP_DATE, ACT_JUMP_DATE_THREAD,
        /* move a message to another channel (REQ-053) */
        ACT_MOVE,
        /* a reminder on a message, which saves it (REQ-283) */
@@ -1439,8 +1447,10 @@ static uint64_t tui_parse_day(const char *s) {
     time_t r = mktime(&q);
     return r == (time_t)-1 ? 0 : (uint64_t)r * 1000u;
 }
-/* `e2e`: the channel is an encrypted DM, whose session is in `state`. */
-static void menu_build_channel(int joined, int summarize, int e2e, uint8_t state, int follow_threads) {
+/* `e2e`: the channel is an encrypted DM, whose session is in `state`.
+ * `in_thread`: one of its threads is open, so its replies can be jumped in. */
+static void menu_build_channel(int joined, int summarize, int e2e, uint8_t state, int follow_threads,
+                               int in_thread) {
     g_nmenu = 0;
     if (!joined) g_menu[g_nmenu++] = (menuitem){ "Join",              ACT_JOIN };
     g_menu[g_nmenu++] = (menuitem){ "Open",                ACT_OPEN };
@@ -1451,6 +1461,7 @@ static void menu_build_channel(int joined, int summarize, int e2e, uint8_t state
     }
     if (summarize && !e2e) g_menu[g_nmenu++] = (menuitem){ "Summarize",   ACT_SUMMARIZE };
     if (joined) g_menu[g_nmenu++] = (menuitem){ "Jump to date",   ACT_JUMP_DATE };
+    if (joined && in_thread) g_menu[g_nmenu++] = (menuitem){ "Jump to date in the open thread", ACT_JUMP_DATE_THREAD };
     g_menu[g_nmenu++] = (menuitem){ "Notify: all",         ACT_NOTIFY_ALL };
     g_menu[g_nmenu++] = (menuitem){ "Notify: mentions",    ACT_NOTIFY_MENTIONS };
     g_menu[g_nmenu++] = (menuitem){ "Notify: none",        ACT_NOTIFY_NONE };
@@ -1971,7 +1982,16 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             else if (m->thread_open)    build_thread_rows(&rows, m, fc, m->user_id, iw);
             else                        build_rows(&rows, m, fc, m->user_id, iw);
             int total = (int)rows.n, end;
-            if (panel == 2 && normal && msg_sel >= 0) {   /* keep the selection visible */
+            /* The reply a jump to a date found, in the thread it was found in. */
+            int thr_mark = (m->thread_open && g_thread_mark >= 0 && g_thread_mark_root == m->thread_parent)
+                         ? g_thread_mark : -1;
+            if (thr_mark >= 0) {                          /* keep the found reply visible */
+                int last = -1;
+                for (int i = 0; i < total; i++) if (rows.v[i].mi == thr_mark) last = i;
+                end = (last < 0) ? total : last + 1;
+                if (end < ih) end = ih;
+                if (end > total) end = total;
+            } else if (panel == 2 && normal && msg_sel >= 0) {   /* keep the selection visible */
                 int last = -1;
                 for (int i = 0; i < total; i++) if (rows.v[i].mi == msg_sel) last = i;
                 end = (last < 0) ? total : last + 1;
@@ -1986,7 +2006,8 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             if (start < 0) start = 0;
             int y = iy + (ih - (end - start));
             for (int i = start; i < end; i++, y++) {
-                int selrow = (panel == 2 && normal && rows.v[i].mi >= 0 && rows.v[i].mi == msg_sel);
+                int selrow = (panel == 2 && normal && rows.v[i].mi >= 0 && rows.v[i].mi == msg_sel) ||
+                             (thr_mark >= 0 && rows.v[i].mi == thr_mark);
                 uintattr_t bg = selrow ? th->sel_bg : th->bg;
                 if (selrow) tk_fill(y, ix, ix + iw, bg);
                 tk_text(ix, y, ix + iw, rows.v[i].s, selrow ? (th->sel_fg | TB_BOLD) : rows.v[i].fg, bg);
@@ -3588,9 +3609,12 @@ int main(int argc, char **argv) {
     uint64_t jump_mid = 0;                    /* a summary item's message, being found */
     time_t jump_since = 0;
     int jump_asked = 0;
-    /* Jump to a date: the conversation and the local midnight asked for, until
-     * the daemon's answer (the model's found_seq past found_seen) arrives. */
-    uint64_t date_cid = 0, date_day = 0;
+    /* Jump to a date: the conversation, the thread in it (0 for the main
+     * scroll) and the local midnight asked for, until the daemon's answer (the
+     * model's found_seq past found_seen) arrives. date_thread: the prompt open
+     * is for the open thread's replies. */
+    uint64_t date_cid = 0, date_parent = 0, date_day = 0;
+    int date_thread = 0;
     uint32_t found_seen = 0;
     int help_open = 0;
     int profile_open = 0;                     /* /profile identity modal */
@@ -3755,15 +3779,31 @@ int main(int argc, char **argv) {
 
         /* A jump to a date answered: open that conversation at the message, as
          * a summary item's is, and say so when it is not on the day asked. */
+        /* The thread the mark was in is gone, or another is open: no mark. */
+        if (g_thread_mark >= 0 && (!m->thread_open || m->thread_parent != g_thread_mark_root)) g_thread_mark = -1;
         if (date_cid && m->found_seq != found_seen) {
             found_seen = m->found_seq;
-            if (m->found_channel == date_cid && !m->found_parent) {
+            if (m->found_channel == date_cid && m->found_parent == date_parent) {
                 size_t idx = m->n_channels;
                 for (size_t k = 0; k < m->n_channels; k++) if (m->channels[k].channel_id == date_cid) idx = k;
-                if (!m->found_mid) snprintf(g_closed_note, sizeof g_closed_note, "There are no messages here yet.");
+                int landed = 0;
+                if (date_parent) {
+                    /* In the open thread: the reply is marked and kept in view. */
+                    if (!m->found_mid) snprintf(g_closed_note, sizeof g_closed_note, "There are no replies here yet.");
+                    else if (m->thread_open && m->thread_channel == date_cid && m->thread_parent == date_parent) {
+                        for (size_t k = 0; k < m->n_thread_msgs; k++)
+                            if (m->thread_msgs[k].message_id == m->found_mid) {
+                                g_thread_mark = (int)k; g_thread_mark_root = date_parent; scroll = 0; landed = 1;
+                            }
+                        if (!landed) snprintf(g_closed_note, sizeof g_closed_note, "That reply is not loaded in this thread.");
+                    }
+                } else if (!m->found_mid) snprintf(g_closed_note, sizeof g_closed_note, "There are no messages here yet.");
                 else if (idx < m->n_channels) {
                     focus = idx; scroll = 0; msg_sel = -1; last_focus_cid = date_cid; g_hold_unread = 0;
                     jump_mid = m->found_mid; jump_asked = 0; jump_since = time(NULL);
+                    landed = 1;
+                }
+                if (landed) {
                     time_t ta = (time_t)(date_day / 1000), tg = (time_t)(m->found_time / 1000);
                     struct tm va, vg;
                     if (oc_localtime_r(&ta, &va) && oc_localtime_r(&tg, &vg) &&
@@ -3771,12 +3811,13 @@ int main(int argc, char **argv) {
                         char a[24], g[24];
                         strftime(a, sizeof a, "%d %B", &va);
                         strftime(g, sizeof g, "%d %B", &vg);
-                        snprintf(g_closed_note, sizeof g_closed_note, "No messages on %s; showing the %s, %s.",
+                        snprintf(g_closed_note, sizeof g_closed_note, "No %s on %s; showing the %s, %s.",
+                                 date_parent ? "replies" : "messages",
                                  a[0] == '0' ? a + 1 : a, m->found_exact ? "next" : "last before it",
                                  g[0] == '0' ? g + 1 : g);
                     }
                 }
-                date_cid = date_day = 0;
+                date_cid = date_parent = date_day = 0;
             }
         }
         /* A reminder come due (REQ-283): said once, on the status line. */
@@ -3877,6 +3918,11 @@ int main(int argc, char **argv) {
         int rc = tb_peek_event(&ev, 30);
         if (rc != TB_OK) continue;               /* timeout: loop to re-tick + redraw */
         if (ev.type == TB_EVENT_RESIZE) continue;
+        /* Scrolling lets go of a reply a jump to a date marked in the thread. */
+        if ((ev.type == TB_EVENT_MOUSE && (ev.key == TB_KEY_MOUSE_WHEEL_UP || ev.key == TB_KEY_MOUSE_WHEEL_DOWN)) ||
+            (ev.type == TB_EVENT_KEY && (ev.key == TB_KEY_ARROW_UP || ev.key == TB_KEY_ARROW_DOWN ||
+                                         ev.key == TB_KEY_PGUP || ev.key == TB_KEY_PGDN)))
+            g_thread_mark = -1;
         if (ev.type == TB_EVENT_MOUSE) {       /* wheel scrolls; click focuses a channel/member */
             if (ev.key == TB_KEY_MOUSE_WHEEL_UP) scroll += 3;
             else if (ev.key == TB_KEY_MOUSE_WHEEL_DOWN) { scroll -= 3; if (scroll < 0) scroll = 0; }
@@ -4123,7 +4169,16 @@ int main(int argc, char **argv) {
                 else if (k == PROMPT_WEBHOOK && *v) oc_client_create_webhook(cl, act_cid, v);
                 else if (k == PROMPT_DATE && *v) {
                     uint64_t day = tui_parse_day(v);
-                    if (day) { date_cid = act_cid; date_day = day; oc_client_find_at_time(cl, act_cid, 0, day); }
+                    /* In the thread only while it is still the one open here. */
+                    const oc_model *dm = oc_client_model(cl);
+                    uint64_t parent = date_thread && dm->thread_open && dm->thread_channel == act_cid
+                                    ? dm->thread_parent : 0;
+                    if (date_thread && !parent)
+                        snprintf(g_closed_note, sizeof g_closed_note, "That thread is no longer open.");
+                    else if (day) {
+                        date_cid = act_cid; date_parent = parent; date_day = day;
+                        oc_client_find_at_time(cl, act_cid, parent, day);
+                    }
                     else snprintf(g_closed_note, sizeof g_closed_note, "Not a date: try 2026-05-03, today or yesterday.");
                 }
                 else if (k == PROMPT_MOVE && *v) {
@@ -4458,7 +4513,13 @@ int main(int argc, char **argv) {
                     /* channel menu actions */
                     else if (id == ACT_OPEN)  panel = 0;
                     else if (id == ACT_JOIN)  { oc_client_join_channel(cl, act_cid); panel = 0; }
-                    else if (id == ACT_JUMP_DATE) { prompt_kind = PROMPT_DATE; prompt_title = "Jump to date (2026-05-03, 3 May, today)"; tk_input_init(&prompt_input, 0, "date"); }
+                    else if (id == ACT_JUMP_DATE || id == ACT_JUMP_DATE_THREAD) {
+                        date_thread = id == ACT_JUMP_DATE_THREAD;
+                        prompt_kind = PROMPT_DATE;
+                        prompt_title = date_thread ? "Jump to date in the thread (2026-05-03, 3 May, today)"
+                                                   : "Jump to date (2026-05-03, 3 May, today)";
+                        tk_input_init(&prompt_input, 0, "date");
+                    }
                     else if (id == ACT_WEBHOOK_CREATE) { prompt_kind = PROMPT_WEBHOOK; prompt_title = "Create webhook (label)"; tk_input_init(&prompt_input, 0, "label"); }
                     else if (id == ACT_NOTIFY_ALL)      oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_ALL);
                     else if (id == ACT_NOTIFY_MENTIONS) oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_MENTIONS);
@@ -4634,7 +4695,8 @@ int main(int argc, char **argv) {
                     } else if (focus < mm->n_channels) {                     /* channel action menu */
                         const oc_channel *mc = &mm->channels[focus];
                         menu_build_channel(mc->joined, oc_model_summarize_available(mm), mc->e2e, e2e_state(mm, mc),
-                                           mc->follow_threads);
+                                           mc->follow_threads,
+                                           mm->thread_open && mm->thread_channel == mc->channel_id);
                         act_cid = mm->channels[focus].channel_id; act_uid = 0; act_mid = 0; act_title = "Channel";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }

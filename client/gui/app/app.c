@@ -1947,11 +1947,17 @@ static int g_n_searchrows;
  * usually still in flight when the click lands — `g_jump_deadline` is what turns
  * "not loaded yet" into an honest failure instead of a silent no-op. */
 static uint64_t  g_jump_mid;            /* message to scroll to, 0 = none */
-/* Jump to a date: the conversation and the local midnight asked for, until the
- * daemon's answer (the model's found_seq past g_found_seen) is opened. The date
- * dividers drawn this frame, each its day, so a click on one offers it. */
-static uint64_t  g_date_cid, g_date_day;
+/* Jump to a date: the conversation, the thread in it (0 for the main scroll)
+ * and the local midnight asked for, until the daemon's answer (the model's
+ * found_seq past g_found_seen) is opened. The date dividers drawn this frame,
+ * each its day, so a click on one offers it. */
+static uint64_t  g_date_cid, g_date_parent, g_date_day;
 static uint32_t  g_found_seen;
+/* The reply the thread pane is to scroll to and flash, once it is drawn there;
+ * given up at the deadline when the thread never shows it. */
+static uint64_t  g_thr_jump_mid, g_thr_jump_deadline;
+/* The thread pane's "Jump to date" button, as drawn. */
+static rectf     g_thr_date_btn;
 static struct { rectf r; uint64_t ms; } g_sephits[48];
 static int       g_n_sephits;
 /* The Later view's reminder buttons as drawn (REQ-283): each row's message,
@@ -2195,7 +2201,8 @@ static int   g_sch_open;              /* the send-later date and time card */
 static int   g_sch_insert;            /* ...opened by Insert a time: any moment, and
                                        * Insert puts its token in the message */
 static int   g_sr_open;               /* a summary's custom date range (REQ-310) */
-static int   g_pc_open;               /* the poll composer, new or editing (REQ-225) */
+static int   g_jc_open;               /* Jump to date's calendar: one day to open at */
+static int   g_pc_open;              /* the poll composer, new or editing (REQ-225) */
 static int   g_te_open;               /* the table editor, a new table or a card's (MARKDOWN.md §6) */
 static int   g_pch_open;              /* the paste chooser: Table, Image or Text (MARKDOWN.md §6) */
 static int   g_status_clear;                 /* chip index 0..4 */
@@ -3680,6 +3687,9 @@ static int *g_modal_stack[4];
 static int  g_n_modal_stack;
 static int  g_modal_entering;
 
+/* Set while a dialog that is about the open thread is being entered (the
+ * jump-to-date calendar), so the thread stays open under it. */
+static int g_modal_keep_thread;
 static void close_overlays(void) {
     const oc_model *mm = model();
     if (!g_modal_entering) g_n_modal_stack = 0;
@@ -3692,7 +3702,7 @@ static void close_overlays(void) {
     g_about_open = 0;
     g_wsmgr_open = 0;
     if (!mm) return;
-    if (mm->thread_open)    oc_client_close_thread(g_client);
+    if (mm->thread_open && !g_modal_keep_thread) oc_client_close_thread(g_client);
     if (mm->search_open)    oc_client_close_search(g_client);
     if (mm->reactlist_open) oc_client_close_reactions(g_client);
     if (mm->voterlist_open) oc_client_close_poll_voters(g_client);
@@ -8044,6 +8054,7 @@ static void draw_call_event(gfx *rt, const oc_model *m, const oc_msg *msg, rectf
 static void draw_msglist(gfx *rt, const oc_model *m,
                          const oc_msg *msgs, size_t nmsgs, rectf reg, int mode) {
     int capture = (mode == MSGLIST_MAIN);
+    int thr     = (mode == MSGLIST_THREAD);
     int hits    = (mode != 0);
     float *scroll     = capture ? &g_scroll     : &g_thr_scroll;
     float *scroll_max = capture ? &g_scroll_max : &g_thr_scroll_max;
@@ -8091,6 +8102,10 @@ static void draw_msglist(gfx *rt, const oc_model *m,
         if (capture && g_jump_mid && msgs[first + i].message_id == g_jump_mid) {
             jump_i = (long)i; jump_off = total;      /* distance from content top */
         }
+        /* A jump to a date inside the thread lands on its reply here. */
+        if (thr && g_thr_jump_mid && msgs[first + i].message_id == g_thr_jump_mid) {
+            jump_i = (long)i; jump_off = total;
+        }
         total += heights[i];
     }
 
@@ -8112,6 +8127,12 @@ static void draw_msglist(gfx *rt, const oc_model *m,
         }
         g_jump_mid = 0;
         g_jump_quiet = 0;
+    }
+    if (thr && jump_i >= 0) {
+        *scroll = total - jump_off - visible * 0.66f;
+        g_flash_mid = g_thr_jump_mid;
+        g_flash_until = now_ms() + 1600;
+        g_thr_jump_mid = 0;
     }
 
     if (*scroll > *scroll_max) *scroll = *scroll_max;
@@ -8291,7 +8312,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
                 fill(rt, rf(reg.left, y, reg.left + 3, y + heights[i]), OC_COL_ACCENT);
             }
             /* Jump flash — fades out so it reads as "here it is", not as state. */
-            if (capture && g_flash_mid == msgs[first + i].message_id) {
+            if ((capture || thr) && g_flash_mid == msgs[first + i].message_id) {
                 uint64_t now = now_ms();
                 if (now < g_flash_until) {
                     float a = (float)(g_flash_until - now) / 1600.0f;
@@ -8483,6 +8504,17 @@ static void overlay_empty(gfx *rt, rectf body, const char *text) {
 
 static void draw_thread(gfx *rt, const oc_model *m, rectf reg) {
     rectf body = pane_header(rt, reg, "Thread");
+    /* Jump to a date in this thread, beside the close: the same choices the
+     * conversation's menu offers, asked of the thread's replies. */
+    g_thr_date_btn = rf(reg.right - 72, reg.top + 5, reg.right - 48, reg.top + 29);
+    {
+        int hot = in_rect(g_thr_date_btn, g_mouse_x, g_mouse_y);
+        if (hot) fill_round(rt, g_thr_date_btn, OC_R_CONTROL, OC_COL_HOVER);
+        float ic = UIS(16.0f), cx = (g_thr_date_btn.left + g_thr_date_btn.right) / 2,
+              cy = (g_thr_date_btn.top + g_thr_date_btn.bottom) / 2;
+        draw_lucide(rt, OC_ICON_CALENDAR, rf(cx - ic / 2, cy - ic / 2, cx + ic / 2, cy + ic / 2),
+                    hot ? OC_COL_TEXT : OC_COL_MUTED);
+    }
     const oc_channel *pc = oc_model_channel((oc_model *)m, m->thread_channel);
     const oc_msg *parent = find_msg(pc, m->thread_parent);
     float top = body.top + 6;
@@ -9874,14 +9906,17 @@ static void menu_run_kind(oc_win *hwnd, int kind, int cmd);  /* fwd — a menu i
 static int  transcript_shell(void);             /* fwd — is the chat shell on screen */
 static void kb_row_move(oc_win *hwnd, int d);      /* fwd — Ctrl+Up / Ctrl+Down */
 static void kb_context_menu(oc_win *hwnd);         /* fwd — Shift+F10 / the Menu key */
-static void jump_menu_open(oc_win *hwnd, uint64_t cid, float x, float y);   /* fwd */
+static void jump_menu_open(oc_win *hwnd, uint64_t cid, uint64_t parent, float x, float y);   /* fwd */
 static void accel_run(oc_win *hwnd, int action) {
     switch (action) {
     case ACC_QUIT:    app_quit(hwnd);     break;
     case ACC_JUMP_DATE:
         if (main_is_conversation() && g_view != VIEW_NEWMSG && g_sel) {
+            /* In the thread when one is open: its pane is where you are reading. */
+            const oc_model *jm = model();
+            int in_thr = jm && jm->thread_open && jm->thread_channel == g_sel;
             irect rc; client_rect(hwnd, &rc);
-            jump_menu_open(hwnd, g_sel, DIPF(rc.right) / 2 - 110, 96);
+            jump_menu_open(hwnd, g_sel, in_thr ? jm->thread_parent : 0, DIPF(rc.right) / 2 - 110, 96);
         }
         break;
     case ACC_PALETTE: palette_open(hwnd); break;
@@ -15805,7 +15840,7 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
 static int modal_open(void) {
     return g_prefs_open || g_keys_open || g_about_open || g_wsmgr_open || g_notify_open ||
            g_browse_open || g_confirm_open || g_sessions_open || g_form_open ||
-           g_status_open || g_sch_open || g_sr_open || g_pc_open || g_te_open || g_sv_open;
+           g_status_open || g_sch_open || g_sr_open || g_jc_open || g_pc_open || g_te_open || g_sv_open;
 }
 
 static rectf g_modal_card;
@@ -16597,6 +16632,7 @@ static void form_collect(int save) {
 static void draw_browse(gfx *rt, const oc_model *m, rectf body);   /* fwd */
 static void draw_sched_custom(gfx *rt, rectf body);                /* fwd */
 static void draw_sumrange(gfx *rt, rectf body);                    /* fwd */
+static void draw_jumpcal(gfx *rt, rectf body);                     /* fwd */
 static void draw_poll_compose(gfx *rt, rectf body);                /* fwd */
 static void draw_table_editor(gfx *rt, rectf body);                /* fwd */
 static void draw_sessions(gfx *rt, const oc_model *m, rectf body); /* fwd */
@@ -16725,6 +16761,7 @@ static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
     else if (g_status_open) draw_status_body(rt, body);
     else if (g_sch_open)    draw_sched_custom(rt, body);
     else if (g_sr_open)     draw_sumrange(rt, body);
+    else if (g_jc_open)     draw_jumpcal(rt, body);
     else if (g_pc_open)     draw_poll_compose(rt, body);
     else if (g_te_open)     draw_table_editor(rt, body);
     else if (g_sv_open)     draw_snippet_view(rt, body);
@@ -17359,6 +17396,173 @@ static int sumrange_click(oc_win *hwnd, int x, int y) {
             oc_sumcal_pick(&g_sr_cal, sr_day(g_sr_days[i].y, g_sr_days[i].m, g_sr_days[i].d));
             g_sr_err = NULL;
             sr_fields_show();
+            invalidate();
+            return 1;
+        }
+    return in_rect(g_modal_card, x, y);
+}
+
+/* ---- Jump to date: the day, on a calendar ------------------------------------
+ *
+ * "A date..." in the jump menu: a field that takes a typed date and one month
+ * to pick from, with the arrows to page it. Days after today are faint and take
+ * no click: nothing has been said on them yet. The day opens at the reader's
+ * local midnight; Jump stays grey until a day is picked or typed. Opened over
+ * a thread, the thread stays open under it and the jump is in its replies. */
+static uint64_t  g_jc_cid, g_jc_parent;
+static int       g_jc_vy, g_jc_vm;             /* the month on view: year, 0-11 */
+static int       g_jc_y, g_jc_m, g_jc_d;       /* the day picked; g_jc_d 0 for none */
+static field    *g_jc_edit;
+static rectf     g_jc_erect, g_jc_prev, g_jc_next;
+static calday    g_jc_days[42];
+static int       g_n_jc_days;
+static const char *g_jc_err;
+
+static uint64_t parse_day(const char *s);                               /* fwd */
+static void date_jump(uint64_t cid, uint64_t parent, uint64_t day_ms);  /* fwd */
+
+/* Today's local midnight, and today's month. */
+static uint64_t jc_today(int *y, int *m) {
+    time_t t = time(NULL); struct tm tv;
+    if (!oc_localtime_r(&t, &tv)) return 0;
+    if (y) *y = tv.tm_year + 1900;
+    if (m) *m = tv.tm_mon;
+    return sch_ms(tv.tm_year + 1900, tv.tm_mon, tv.tm_mday, 0);
+}
+
+static int jc_look(int y, int m, int d, int *on, void *ctx) {
+    (void)ctx;
+    uint64_t day = sch_ms(y, m, d, 0);
+    *on = day && day <= jc_today(NULL, NULL);
+    return g_jc_d && y == g_jc_y && m == g_jc_m && d == g_jc_d ? 2 : 0;
+}
+
+/* Pick `day` (a local midnight): the calendar turns to its month. */
+static void jc_pick(uint64_t day) {
+    time_t t = (time_t)(day / 1000); struct tm tv;
+    if (!oc_localtime_r(&t, &tv)) return;
+    g_jc_y = tv.tm_year + 1900; g_jc_m = tv.tm_mon; g_jc_d = tv.tm_mday;
+    g_jc_vy = g_jc_y; g_jc_vm = g_jc_m;
+}
+
+/* The field as typed, taken as the day picked where it is one. What cannot be
+ * read is said when Jump is pressed, not at every key. */
+static void jc_field_read(void) {
+    g_jc_err = NULL;
+    if (!g_jc_edit || !g_jc_edit->buf[0]) { g_jc_d = 0; return; }
+    uint64_t day = parse_day(g_jc_edit->buf);
+    if (!day) { g_jc_d = 0; return; }
+    if (day > jc_today(NULL, NULL)) { g_jc_d = 0; g_jc_err = "That day has not happened yet."; return; }
+    jc_pick(day);
+}
+
+static int jc_key(field *f, int key, int ctrl, int shift) {
+    (void)f; (void)ctrl; (void)shift;
+    if (!modal_open()) return 0;
+    if (key == OCK_RETURN) { jc_field_read(); menu_dispatch(g_main, 311); return 1; }
+    if (key == OCK_ESCAPE) { modal_finish(0); return 1; }
+    return 0;
+}
+static void jc_changed(field *f) { (void)f; jc_field_read(); invalidate(); }
+
+static void jumpcal_open(oc_win *hwnd, uint64_t cid, uint64_t parent) {
+    if (!cid) return;
+    g_jc_cid = cid; g_jc_parent = parent;
+    g_jc_d = 0; g_jc_err = NULL;
+    jc_today(&g_jc_vy, &g_jc_vm);
+    static field fld;
+    if (!g_jc_edit) {
+        field_init(&fld, "Date (ex. 2026-05-03, or 3 May)", 0, 0);
+        fld.key = jc_key; fld.changed = jc_changed;
+        g_jc_edit = &fld;
+    }
+    field_set(g_jc_edit, "");
+    modal_enter(hwnd, &g_jc_open);
+    field_show(g_jc_edit, 1);
+    focus_set(g_jc_edit);
+}
+
+static float jumpcal_body_h(void) {
+    return UIS(2.0f) + SR_LABEL_H + SR_FIELD_H + SR_GAP_H + SR_TITLE_H + UIS(6.0f) + SR_WDAY_H
+         + cal_rows(g_jc_vy, g_jc_vm) * SCH_CELL_H + UIS(12.0f) + SR_LINE_H + UIS(4.0f);
+}
+
+static void draw_jumpcal(gfx *rt, rectf body) {
+    g_n_jc_days = 0;
+    float mw = 7 * SCH_CELL_W, y = body.top + UIS(2.0f);
+    float x0 = body.left + ((body.right - body.left) - mw) / 2;
+    if (x0 < body.left) x0 = body.left;
+    /* The field, as the range card's: its label over it, the text right of the icon. */
+    draw_text(rt, "Date", g_meta, rf(x0 + UIS(2.0f), y, x0 + mw, y + SR_LABEL_H), OC_COL_MUTED);
+    rectf b = rf(x0, y + SR_LABEL_H, x0 + mw, y + SR_LABEL_H + SR_FIELD_H);
+    int focused = g_jc_edit && g_focus == g_jc_edit;
+    fill_round(rt, b, OC_R_CONTROL, OC_COL_INPUT);
+    stroke_round(rt, b, OC_R_CONTROL, focused ? OC_COL_ACCENT : OC_COL_BORDER, focused ? 2.0f : 1.0f);
+    float ih = UIS(16.0f), iy = (b.top + b.bottom) / 2 - ih / 2;
+    draw_lucide(rt, OC_ICON_CALENDAR, rf(b.left + UIS(11.0f), iy, b.left + UIS(11.0f) + ih, iy + ih), OC_COL_MUTED);
+    g_jc_erect = rf(b.left + UIS(34.0f), b.top, b.right, b.bottom);
+    if (g_jc_edit) field_draw(rt, g_jc_edit, rf(g_jc_erect.left + 2, b.top, b.right - 10, b.bottom), OC_COL_TEXT);
+    y += SR_LABEL_H + SR_FIELD_H + SR_GAP_H;
+    /* The month's title between its arrows; no later than this month. */
+    int ty = 0, tmo = 0;
+    jc_today(&ty, &tmo);
+    int can_next = g_jc_vy < ty || (g_jc_vy == ty && g_jc_vm < tmo);
+    char title[40]; snprintf(title, sizeof title, "%s %d", SCH_MONTHS[g_jc_vm], g_jc_vy);
+    int oa = g_ui_b->align;
+    g_ui_b->align = ST_ALIGN_CENTER;
+    draw_text(rt, title, g_ui_b, rf(x0 + SCH_CELL_W, y, x0 + mw - SCH_CELL_W, y + SR_TITLE_H), OC_COL_TEXT);
+    g_ui_b->align = oa;
+    float d = SCH_CELL_H - UIS(4.0f), ay = y + (SR_TITLE_H - d) / 2;
+    g_jc_prev = rf(x0 + UIS(2.0f), ay, x0 + UIS(2.0f) + d, ay + d);
+    g_jc_next = can_next ? rf(x0 + mw - UIS(2.0f) - d, ay, x0 + mw - UIS(2.0f), ay + d) : rf(0, 0, 0, 0);
+    for (int k = 0; k < 2; k++) {
+        rectf ab = k ? rf(x0 + mw - UIS(2.0f) - d, ay, x0 + mw - UIS(2.0f), ay + d) : g_jc_prev;
+        int live = k ? can_next : 1;
+        int hov = live && in_rect(ab, g_mouse_x, g_mouse_y);
+        if (hov) fill_round(rt, ab, d / 2, OC_COL_HOVER);
+        stroke_round(rt, ab, d / 2, OC_COL_BORDER, 1.0f);
+        g_ui_b->align = ST_ALIGN_CENTER;
+        draw_text(rt, k ? "\xE2\x80\xBA" : "\xE2\x80\xB9", g_ui_b, rf(ab.left, ab.top - UIS(1.0f), ab.right, ab.bottom - UIS(1.0f)),
+                  !live ? OC_COL_FAINT : hov ? OC_COL_TEXT : OC_COL_MUTED);
+        g_ui_b->align = oa;
+    }
+    static const char *const INI[7] = { "Su", "Mo", "Tu", "We", "Th", "Fr", "Sa" };
+    cal_month_draw(rt, x0, y + SR_TITLE_H + UIS(6.0f), g_jc_vy, g_jc_vm, INI, jc_look, NULL, g_jc_days, &g_n_jc_days);
+    y += SR_TITLE_H + UIS(6.0f) + SR_WDAY_H + cal_rows(g_jc_vy, g_jc_vm) * SCH_CELL_H + UIS(12.0f);
+    /* What Jump will do, the hint before a day is picked, or what is wrong. */
+    rectf line = rf(body.left + UIS(2.0f), y, body.right - UIS(2.0f), y + SR_LINE_H);
+    if (g_jc_err) draw_text(rt, g_jc_err, g_ui, line, OC_COL_DANGER);
+    else if (!g_jc_d) draw_text(rt, "Pick a day, or type it.", g_meta, line, OC_COL_MUTED);
+    else {
+        time_t t = (time_t)(sch_ms(g_jc_y, g_jc_m, g_jc_d, 0) / 1000); struct tm tv;
+        char l[128];
+        if (oc_localtime_r(&t, &tv))
+            snprintf(l, sizeof l, "Opens at the first %s on %s, %s %d, %d", g_jc_parent ? "reply" : "message",
+                     SCH_WDAYS[tv.tm_wday], SCH_MONTHS[tv.tm_mon], tv.tm_mday, tv.tm_year + 1900);
+        else l[0] = 0;
+        draw_text(rt, l, g_ui, line, OC_COL_TEXT);
+    }
+}
+
+/* A click on the card. Returns 1 for any click inside it. */
+static int jumpcal_click(oc_win *hwnd, int x, int y) {
+    (void)hwnd;
+    if (in_rect(g_jc_prev, x, y)) {
+        if (--g_jc_vm < 0) { g_jc_vm = 11; g_jc_vy--; }
+        invalidate(); return 1;
+    }
+    if (in_rect(g_jc_next, x, y)) {
+        if (++g_jc_vm > 11) { g_jc_vm = 0; g_jc_vy++; }
+        invalidate(); return 1;
+    }
+    if (in_rect(g_jc_erect, x, y) && g_jc_edit) { focus_set(g_jc_edit); return 1; }
+    for (int i = 0; i < g_n_jc_days; i++)
+        if (g_jc_days[i].on && in_rect(g_jc_days[i].r, x, y)) {
+            g_jc_y = g_jc_days[i].y; g_jc_m = g_jc_days[i].m; g_jc_d = g_jc_days[i].d;
+            g_jc_err = NULL;
+            char t[16];
+            snprintf(t, sizeof t, "%04d-%02d-%02d", g_jc_y, g_jc_m + 1, g_jc_d);
+            if (g_jc_edit) field_set(g_jc_edit, t);
             invalidate();
             return 1;
         }
@@ -18172,6 +18376,15 @@ static const oc_modal_spec *modal_current(void) {
         sp.buttons[1] = (oc_mbtn){ "Summarize", MB_PRIMARY, 310 };
         if (oc_sumcal_range(&g_sr_cal, &rs, &re) != 0) g_modal_off_cmd = 310;
         sp.n_buttons = 2;
+    } else if (g_jc_open) {
+        /* Jump is a COMMAND, as Summarize is, and grey until a day is picked. */
+        sp.title = g_jc_parent ? "Jump to date in this thread" : "Jump to date";
+        sp.size = MODAL_SM;
+        sp.want_h = (MODAL_TITLE_H + jumpcal_body_h() + MODAL_FOOT_H + UIS(16.0f)) / g_text_scale;
+        sp.buttons[0] = (oc_mbtn){ "Cancel", MB_NORMAL,  MODAL_CANCEL };
+        sp.buttons[1] = (oc_mbtn){ "Jump",   MB_PRIMARY, 311 };
+        if (!g_jc_d) g_modal_off_cmd = 311;
+        sp.n_buttons = 2;
     } else if (g_sch_open) {
         /* Schedule is a COMMAND, not MODAL_OK: it validates first, and a time
          * that has passed keeps the card open with the reason, which a plain OK
@@ -18353,7 +18566,7 @@ static void modal_enter(oc_win *hwnd, int *flag) {
      * with an attempt nobody watched: no browser, an empty Home, and a client
      * still waiting on the browser. */
     int keep_view = (flag == &g_confirm_open) || (flag == &g_sch_open) || (flag == &g_sr_open) ||
-                    (flag == &g_pc_open) ||
+                    (flag == &g_jc_open) || (flag == &g_pc_open) ||
                     g_view == VIEW_SIGNIN;
     int prev_view = g_view;
     /* A modal covers the window; it is not about the profile beside it. Edit
@@ -18371,7 +18584,10 @@ static void modal_enter(oc_win *hwnd, int *flag) {
      * comes back under it: put away here, since close_overlays() leaves it. */
     if (opener == &g_pc_open) { g_pc_open = 0; pc_fields_hide(); }
     g_modal_entering = 1;
+    /* The jump calendar opened over a thread is about that thread: it stays. */
+    g_modal_keep_thread = (flag == &g_jc_open) && g_jc_parent;
     close_overlays();
+    g_modal_keep_thread = 0;
     g_modal_entering = 0;
     if (opener && g_n_modal_stack < (int)(sizeof g_modal_stack / sizeof g_modal_stack[0]))
         g_modal_stack[g_n_modal_stack++] = opener;
@@ -18419,6 +18635,7 @@ static void modal_finish(int save) {
     if (g_pick_open && picker_floats()) picker_close(NULL);
     if (g_status_edit) field_show(g_status_edit, 0);
     for (int k = 0; k < 2; k++) if (g_sr_edit[k]) field_show(g_sr_edit[k], 0);
+    if (g_jc_edit) field_show(g_jc_edit, 0);
     pc_fields_hide();
     int te_was = g_te_open;
     const oc_modal_spec *s = modal_current();
@@ -18436,6 +18653,7 @@ static void modal_finish(int save) {
     else      { if (s->restore) s->restore(); }
     g_prefs_open = g_keys_open = g_about_open = g_wsmgr_open = g_notify_open = g_browse_open = 0;
     g_confirm_open = g_sessions_open = g_status_open = g_sch_open = g_sr_open = g_pc_open = 0;
+    g_jc_open = 0;
     g_te_open = 0;
     g_sv_open = 0;
     if (te_was) te_closed();
@@ -18674,6 +18892,7 @@ static void layout_natives(oc_win *hwnd) {
     /* The range card's fields, as the status field: the card owns them. */
     for (int k = 0; k < 2; k++)
         if (g_sr_edit[k]) field_show(g_sr_edit[k], g_sr_open && g_sr_erect[k].right > g_sr_erect[k].left);
+    if (g_jc_edit) field_show(g_jc_edit, g_jc_open && g_jc_erect.right > g_jc_erect.left);
     /* The poll composer's: a row past the last is hidden, as is a row that
      * cannot change once the poll has votes (it takes no keyboard then). */
     if (g_pc_q) field_show(g_pc_q, g_pc_open && g_pc_qrect.right > g_pc_qrect.left);
@@ -26532,7 +26751,9 @@ enum {
     AT_PICKMANAGE,    /* the emoji picker's Manage link */
     AT_PREVIEW,       /* the composer's Preview / Edit */
     AT_SPOILER,       /* payload: index into g_splhits -- reveal or cover it */
-    AT_MORE           /* payload: index into g_morehits -- open that cut message */
+    AT_MORE,          /* payload: index into g_morehits -- open that cut message */
+    AT_THRDATE,       /* the thread pane's Jump to date */
+    AT_JUMPCAL        /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the jump-to-date calendar */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -26856,6 +27077,13 @@ static void a11y_publish_scene(const oc_model *m) {
         snprintf(aid, sizeof aid, "message.%llu.expand", (unsigned long long)g_morehits[i].mid);
         acc_push(items, &n, OC_ACC_BUTTON, aid, g_morehits[i].kind == 2 ? "Show more" : "Show message",
                  g_morehits[i].r, ATOK(AT_MORE, (uint64_t)i));
+    }
+    /* The thread pane's Jump to date, while that pane is up. */
+    {
+        const oc_model *tm = model();
+        if (tm && tm->thread_open && !modal_open() && g_thr_date_btn.right > g_thr_date_btn.left && n < OC_ACC_MAX)
+            acc_push(items, &n, OC_ACC_BUTTON, "thread.jumpdate", "Jump to date in this thread",
+                     g_thr_date_btn, ATOK(AT_THRDATE, 0));
     }
 
     /* The notices: each toast's action and close, named by what they act on, so
@@ -27421,6 +27649,20 @@ modal_items:
                 snprintf(aid, sizeof aid, "sumrange.day.%d", ymd);
                 snprintf(nm, sizeof nm, "%s %d", SCH_MONTHS[g_sr_days[i].m], g_sr_days[i].d);
                 acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_sr_days[i].r, ATOK(AT_SUMCAL, (uint64_t)ymd));
+            }
+        }
+        /* The jump-to-date calendar: ids from the date, as the range card's are. */
+        if (g_jc_open) {
+            acc_push(items, &n, OC_ACC_BUTTON, "jumpcal.prev", "Previous month", g_jc_prev, ATOK(AT_JUMPCAL, 1));
+            if (g_jc_next.right > g_jc_next.left)
+                acc_push(items, &n, OC_ACC_BUTTON, "jumpcal.next", "Next month", g_jc_next, ATOK(AT_JUMPCAL, 2));
+            for (int i = 0; i < g_n_jc_days && n < OC_ACC_MAX; i++) {
+                if (!g_jc_days[i].on) continue;
+                char aid[OC_ACC_AID_MAX], nm[48];
+                int ymd = g_jc_days[i].y * 10000 + (g_jc_days[i].m + 1) * 100 + g_jc_days[i].d;
+                snprintf(aid, sizeof aid, "jumpcal.day.%d", ymd);
+                snprintf(nm, sizeof nm, "%s %d", SCH_MONTHS[g_jc_days[i].m], g_jc_days[i].d);
+                acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_jc_days[i].r, ATOK(AT_JUMPCAL, (uint64_t)ymd));
             }
         }
         /* The table editor (MARKDOWN.md §6): the column count, the header
@@ -31029,7 +31271,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
     if (!modal_open() && !g_menu && g_sel)
         for (int i = 0; i < g_n_sephits; i++)
             if (in_rect(g_sephits[i].r, (float)x, (float)y)) {
-                jump_menu_open(hwnd, g_sel, (float)x - 110, (float)y + 8);
+                jump_menu_open(hwnd, g_sel, 0, (float)x - 110, (float)y + 8);
                 invalidate();
                 return 1;
             }
@@ -31092,6 +31334,13 @@ static int on_click(oc_win *hwnd, int x, int y) {
             if (g_dm_compose) { g_dm_compose = 0; pick_clear(); }
             else              close_overlays();
             layout_composer(hwnd);
+            invalidate();
+            return 1;
+        }
+        /* The thread pane's Jump to date: the choices, for this thread. */
+        if (!g_dm_compose && pm && pm->thread_open && !modal_open() && in_rect(g_thr_date_btn, x, y)) {
+            jump_menu_open(hwnd, pm->thread_channel, pm->thread_parent,
+                           g_thr_date_btn.right - 200, g_thr_date_btn.bottom + 4);
             invalidate();
             return 1;
         }
@@ -31269,6 +31518,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
         }
         if (g_sch_open && sched_custom_click(hwnd, x, y)) return 1;
         if (g_sr_open && sumrange_click(hwnd, x, y)) return 1;
+        if (g_jc_open && jumpcal_click(hwnd, x, y)) return 1;
         if (g_pc_open && poll_compose_click(hwnd, x, y)) return 1;
         if (g_te_open && te_click(hwnd, x, y)) return 1;
         if (g_notify_open) {
@@ -36127,6 +36377,22 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         const oc_model *m65 = model();
         if (m65) { g_view = VIEW_HOME; profile_open(m65->user_id); }
         break; }
+    case 311:   /* the jump-to-date calendar's Jump: the day picked, where it was opened */
+        if (!g_jc_open) break;
+        if (!g_jc_d) {
+            if (!g_jc_err)
+                g_jc_err = g_jc_edit && g_jc_edit->buf[0] ? "That is not a date OpenChime can read. Try 2026-05-03."
+                                                          : "Pick a day first.";
+            invalidate();
+            break;
+        }
+        {
+            uint64_t cid = g_jc_cid, parent = g_jc_parent, day = sch_ms(g_jc_y, g_jc_m, g_jc_d, 0);
+            modal_finish(0);
+            g_modal_closed_by = "save";
+            date_jump(cid, parent, day);
+        }
+        break;
     case 310:   /* the custom range card's Summarize (REQ-310) */
         if (!g_sr_open) break;
         {
@@ -36519,9 +36785,10 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
     invalidate();
 }
 
-/* Jump to a date: the four common ones as single choices, and any date. Run
- * through the channel menu (41..45), as it is about one conversation. */
-static void jump_menu_open(oc_win *hwnd, uint64_t cid, float x, float y) {
+/* Jump to a date: the four common ones as single choices, and any date on a
+ * calendar. Run through the channel menu (41..45), as it is about one
+ * conversation; `parent` is the thread in it to search, 0 for the main scroll. */
+static void jump_menu_open(oc_win *hwnd, uint64_t cid, uint64_t parent, float x, float y) {
     if (!cid) return;
     g_n_mi = 0;
     mi_section("JUMP TO");
@@ -36531,7 +36798,7 @@ static void jump_menu_open(oc_win *hwnd, uint64_t cid, float x, float y) {
     mi_item(44, "Last month");
     mi_item(45, "A date\xE2\x80\xA6");
     g_menu = MENU_CHANNEL; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 200;
-    g_menu_target = cid; g_menu_target2 = 0;
+    g_menu_target = cid; g_menu_target2 = parent;
     g_menu_x = x; g_menu_y = y;
     irect rc; client_rect(hwnd, &rc);
     float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
@@ -36580,30 +36847,41 @@ static uint64_t parse_day(const char *s) {
     return (uint64_t)r * 1000u;
 }
 
-/* Ask where `day_ms` falls in conversation `cid`; the tick opens the answer. */
-static void date_jump(uint64_t cid, uint64_t day_ms) {
+/* Ask where `day_ms` falls in conversation `cid`, or in its thread `parent`
+ * (0 for the main scroll); the tick opens the answer. */
+static void date_jump(uint64_t cid, uint64_t parent, uint64_t day_ms) {
     if (!g_client || !cid || !day_ms) return;
-    g_date_cid = cid; g_date_day = day_ms;
-    oc_client_find_at_time(g_client, cid, 0, day_ms);
+    g_date_cid = cid; g_date_parent = parent; g_date_day = day_ms;
+    oc_client_find_at_time(g_client, cid, parent, day_ms);
 }
 
 /* The daemon has answered a jump to a date: open the conversation at that
- * message, as a permalink does, and say so when it is not on the day asked. */
+ * message, as a permalink does, or scroll the open thread to that reply, and
+ * say so when it is not on the day asked. */
 static void date_jump_land(oc_win *hwnd, const oc_model *m) {
     if (!m || m->found_seq == g_found_seen) return;
     g_found_seen = m->found_seq;
-    if (!g_date_cid || m->found_channel != g_date_cid || m->found_parent) return;
-    uint64_t cid = g_date_cid, day = g_date_day;
-    g_date_cid = g_date_day = 0;
-    if (!m->found_mid) { fb_failed("There are no messages here yet."); return; }
-    g_view = VIEW_HOME;
-    close_overlays();
-    if (g_sel != cid) select_channel(cid);
-    g_jump_mid = m->found_mid;
-    g_jump_deadline = now_ms() + 4000;
-    hist_jump(cid, m->found_mid);
-    select_tab(TAB_MESSAGES);
-    layout_composer(hwnd);
+    if (!g_date_cid || m->found_channel != g_date_cid || m->found_parent != g_date_parent) return;
+    uint64_t cid = g_date_cid, parent = g_date_parent, day = g_date_day;
+    g_date_cid = g_date_parent = g_date_day = 0;
+    if (parent) {
+        /* In the thread, which must still be the one open: its pane scrolls to
+         * the reply and flashes it, as the transcript does a message. */
+        if (!m->thread_open || m->thread_channel != cid || m->thread_parent != parent) return;
+        if (!m->found_mid) { fb_failed("There are no replies here yet."); return; }
+        g_thr_jump_mid = m->found_mid;
+        g_thr_jump_deadline = now_ms() + 4000;
+    } else {
+        if (!m->found_mid) { fb_failed("There are no messages here yet."); return; }
+        g_view = VIEW_HOME;
+        close_overlays();
+        if (g_sel != cid) select_channel(cid);
+        g_jump_mid = m->found_mid;
+        g_jump_deadline = now_ms() + 4000;
+        hist_jump(cid, m->found_mid);
+        select_tab(TAB_MESSAGES);
+        layout_composer(hwnd);
+    }
     if (!same_day(m->found_time, day)) {
         char asked[32], got[32], note[120];
         time_t ta = (time_t)(day / 1000), tg = (time_t)(m->found_time / 1000);
@@ -36796,21 +37074,14 @@ static void channel_menu_run(oc_win *hwnd, int cmd) {
     case 21: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_MENTIONS); break;
     case 22: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_NONE); break;
     case 23: sum_menu_open(rf(g_menu_x, g_menu_y - 4, g_menu_x + 220, g_menu_y - 4), cid); break;
-    case 40: jump_menu_open(hwnd, cid, g_menu_x, g_menu_y); break;
-    case 41: date_jump(cid, local_day_start(0)); break;
-    case 42: date_jump(cid, local_day_start(1)); break;
-    case 43: date_jump(cid, local_day_start(7)); break;
-    case 44: date_jump(cid, local_day_start(30)); break;
-    case 45: {
-        oc_field f[1] = { { FF_TEXT, "Date",
-                            "As 2026-05-03, or 3 May. The day starts at your midnight.", "" } };
-        if (form_dialog(hwnd, "Jump to date", f, 1) && f[0].value[0]) {
-            uint64_t day = parse_day(f[0].value);
-            if (day) date_jump(cid, day);
-            else fb_failed("That is not a date OpenChime can read. Try 2026-05-03.");
-        }
-        break;
-    }
+    case 40: jump_menu_open(hwnd, cid, 0, g_menu_x, g_menu_y); break;
+    /* g_menu_target2: the thread the jump menu was opened for, 0 for the
+     * conversation's main scroll. */
+    case 41: date_jump(cid, g_menu_target2, local_day_start(0)); break;
+    case 42: date_jump(cid, g_menu_target2, local_day_start(1)); break;
+    case 43: date_jump(cid, g_menu_target2, local_day_start(7)); break;
+    case 44: date_jump(cid, g_menu_target2, local_day_start(30)); break;
+    case 45: jumpcal_open(hwnd, cid, g_menu_target2); break;
     default:
         if (cmd >= 300 && cmd < 300 + (int)OC_SB_CUSTOM_MAX) {
             if (oc_sidebar_assign(&g_sb, cid, cmd - 300)) sidebar_opts_save();
@@ -38366,10 +38637,11 @@ static void test_dump(const char *path) {
      * on screen, each its day's first time. */
     {
         const oc_model *dm = model();
-        fprintf(f, "datejump pending=%llu found=%llu exact=%d sel=%llu jump=%llu seps=%d\n",
+        fprintf(f, "datejump pending=%llu found=%llu exact=%d sel=%llu jump=%llu seps=%d parent=%llu thrjump=%llu cal=%d\n",
                 (unsigned long long)g_date_cid,
                 (unsigned long long)(dm ? dm->found_mid : 0), dm ? dm->found_exact : 0,
-                (unsigned long long)g_sel, (unsigned long long)g_jump_mid, g_n_sephits);
+                (unsigned long long)g_sel, (unsigned long long)g_jump_mid, g_n_sephits,
+                (unsigned long long)g_date_parent, (unsigned long long)g_thr_jump_mid, g_jc_open);
     }
     /* Snippets (REQ-226): each card drawn, whether its text is here, and the
      * viewer -- open, on which, and how many coloured spans it holds. */
@@ -38771,10 +39043,13 @@ static void test_poll(oc_win *hwnd) {
         if (g_client && g_sel && arg[0]) { oc_client_upload(g_client, g_sel, arg); test_ack("ok"); }
         else test_ack("err");
     } else if (!strcmp(verb, "jumpdate")) {
-        /* "<date>": jump the open conversation to that day, as the menu's
-         * "A date..." does with the same words typed. */
+        /* "<date>": jump the open conversation to that day, as the calendar's
+         * field does with the same words typed; in the open thread when one is,
+         * as Ctrl+Shift+J does. */
         uint64_t day = parse_day(arg);
-        if (g_sel && day) { date_jump(g_sel, day); test_ack("ok"); }
+        const oc_model *jm = model();
+        uint64_t parent = jm && jm->thread_open && jm->thread_channel == g_sel ? jm->thread_parent : 0;
+        if (g_sel && day) { date_jump(g_sel, parent, day); test_ack("ok"); }
         else test_ack("err");
     } else if (!strcmp(verb, "snippet")) {
         /* "<title>|<language>|<text>", \n for a newline: a snippet into the
@@ -40723,6 +40998,9 @@ static int on_tick(oc_win *hwnd) {
             }
             if (!g_jump_mid) g_jump_fetched = 0;
             date_jump_land(hwnd, m);
+            /* A reply the thread pane never drew (closed, or another thread
+             * opened) is given up rather than flashed later out of nowhere. */
+            if (g_thr_jump_mid && (now_ms() > g_thr_jump_deadline || !m->thread_open)) g_thr_jump_mid = 0;
             /* A reminder come due (REQ-283): said once, naming where it is. */
             {
                 static uint32_t rem_seen;
@@ -41779,6 +42057,23 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
             if (g_status_open && (int)arg < 5) {
                 g_status_clear = (int)arg;
                 invalidate();
+            }
+            break;
+        case AT_THRDATE: {
+            const oc_model *tm = model();
+            if (tm && tm->thread_open)
+                jump_menu_open(hwnd, tm->thread_channel, tm->thread_parent,
+                               g_thr_date_btn.right - 200, g_thr_date_btn.bottom + 4);
+            break;
+        }
+        case AT_JUMPCAL:
+            /* The same path a click takes, at the control's recorded centre. */
+            if (g_jc_open) {
+                rectf r = arg == 1 ? g_jc_prev : arg == 2 ? g_jc_next : rf(0, 0, 0, 0);
+                for (int i = 0; arg > 2 && i < g_n_jc_days; i++)
+                    if ((uint64_t)(g_jc_days[i].y * 10000 + (g_jc_days[i].m + 1) * 100 + g_jc_days[i].d) == arg)
+                        r = g_jc_days[i].r;
+                if (r.right > r.left) jumpcal_click(hwnd, (int)((r.left + r.right) / 2), (int)((r.top + r.bottom) / 2));
             }
             break;
         case AT_SUMCAL:

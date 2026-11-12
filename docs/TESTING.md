@@ -2382,11 +2382,15 @@ client: the first two runs of this script hit exactly that.
 
 `tools/gui/jumpdate.sh` sends a few messages into a fresh channel and jumps to
 them by date through the test hook's `jumpdate <date>` verb, which runs the
-same path as typing that date into "Jump to date". It reads the dump's
+same path as typing that date into the calendar of "Jump to date", in the open
+thread when one is. It reads the dump's
 `datejump` line: `pending` is the conversation still waiting for the daemon's
 answer (0 once it has come), `found` and `exact` are that answer, `jump` is the
 message the transcript has still to scroll to (0 once it is on it), and `seps`
 counts the date dividers drawn, each of which offers the jump when clicked.
+`parent` is the thread a pending jump is in (0 for the main scroll), `thrjump`
+the reply the thread pane has still to scroll to, and `cal` whether the
+calendar card is open.
 Today's date lands on today's first message, exact; a date after the newest
 lands on the newest, not exact, with a notice saying so.
 
