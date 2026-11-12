@@ -4534,6 +4534,22 @@ static void test_reply_also_channel(void) {
     r = do_edit(w, bob, OC_DEFAULT_CHANNEL, both, "both places, edited");
     CHECK(r && r->type == OC_RES_EDIT_OK && r->n_members == 2);
     oc_dbres_free(r);
+    /* So do a reaction, a delete and a restore: one row, told to both places'
+     * readers, so each can be updated. */
+    r = react(w, alice, OC_DEFAULT_CHANNEL, both, "\xF0\x9F\x91\x8D", OC_REACT_ADD);
+    CHECK(r && r->type == OC_RES_REACTION_OK && r->n_members == 2);
+    oc_dbres_free(r);
+    r = do_delete(w, bob, OC_DEFAULT_CHANNEL, both);
+    CHECK(r && r->type == OC_RES_DELETE_OK && r->n_members == 2);
+    oc_dbres_free(r);
+    {
+        oc_job *rj = oc_job_new(OC_JOB_RESTORE, 9);
+        rj->user_id = bob; rj->channel_id = OC_DEFAULT_CHANNEL; rj->message_id = both;
+        oc_dbwriter_submit(w, rj);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_RESTORE_OK && r->message_id == both && r->n_members == 2);
+        oc_dbres_free(r);
+    }
     oc_dbwriter_stop(w);
     cleanup_db(path);
 }

@@ -207,6 +207,11 @@
  * scroll), so typing shows in the thread it is in (REQ-121). Fields appended to
  * fixed layouts.
  *
+ * 36: SEND_REPLY and THREAD_REPLY carry `also_channel` (u8) and BROADCAST
+ * carries `parent_id` (u64, 0 for an ordinary message), each in the fixed part
+ * ahead of the body: a thread reply can also be posted to the channel's main
+ * scroll (REQ-062).
+ *
  * 38: SAVE_ITEM, SAVED_UPDATED and SAVED_MSG carry `remind_at_ms` (u64, 0 for
  * none), a saved item's reminder (REQ-283), and activity has a new kind,
  * OC_ACT_REMINDER, for one that fired. Fields appended to fixed layouts.
