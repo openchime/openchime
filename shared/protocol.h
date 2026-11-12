@@ -203,6 +203,10 @@
  * live to the channel's members when a reply is posted or deleted, not only in
  * backfill (REQ-060). Fields appended to a fixed layout.
  *
+ * 35: TYPING and TYPING_UPDATE carry `thread_root` (u64, 0 for the main
+ * scroll), so typing shows in the thread it is in (REQ-121). Fields appended to
+ * fixed layouts.
+ *
  * 38: SAVE_ITEM, SAVED_UPDATED and SAVED_MSG carry `remind_at_ms` (u64, 0 for
  * none), a saved item's reminder (REQ-283), and activity has a new kind,
  * OC_ACT_REMINDER, for one that fired. Fields appended to fixed layouts.
