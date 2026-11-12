@@ -116,13 +116,13 @@ static int screen_next(oc_capture *c, oc_frame *f, int timeout_ms) {
         now = oc_media_clock_us();
         if (c->have_last && now >= c->due_us) {
             /* Stamped at the time it was due, as the synthetic camera stamps its
-             * frames, not when a late reader took it. Stamped "now", a reader
-             * a period and a half behind got a frame stamped late and the next
-             * stamped on time, half a period after it; a player shows frames by
-             * their stamps and drops one of two that fall due together, which is
-             * how a share delivered fewer frames than were sent. After a whole
-             * period or more unread there is no burst: those frames were never
-             * taken, and this one is stamped now. */
+             * frames, not when a late reader took it: stamped "now", a reader a
+             * period and a half behind got a frame stamped late and the next on
+             * time, half a period after it. After a whole period or more unread
+             * there is no burst: those frames were never taken, and this one is
+             * stamped now. (This is not what made the share test see too few
+             * frames: that was its own fixed window, tests/test_client_core.c,
+             * test_share_e2e.) */
             int64_t at = c->due_us;
             if (now - at >= c->period_us) at = now;
             c->due_us = at + c->period_us;

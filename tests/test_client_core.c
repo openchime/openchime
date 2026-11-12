@@ -4258,6 +4258,12 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     oc_client_call_share(a, 1, 1);
     CHECK(CALL_WAIT(3000, ma->call.sharer == ua && mb->call.sharer == ua));
     CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 2; })));
+    /* Ten frames, with no gap of six seconds. This once counted ten frames
+     * within six seconds of the start, and failed once that way on a loaded
+     * machine: a real-time source at 5 fps needs two seconds for ten frames
+     * after an encoder that can be slow to start, so the window measured the
+     * machine, not the share. Nothing was lost; a first keyframe that is lost
+     * is asked for again (tests/test_share_media.c, test_first_keyframe_lost). */
     CHECK(share_frames(a, b, c, eb, &wb, 10, 6000));
     CHECK(wb.f.width == 1280 && wb.f.height == 800 && wb.rising && wb.bad == 0);
     oc_call_engine_stats(ea, &st);
