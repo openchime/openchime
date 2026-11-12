@@ -1303,8 +1303,10 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_JUMP_DATE, ACT_JUMP_DATE_THREAD,
        /* move a message to another channel (REQ-053) */
        ACT_MOVE,
-       /* a reminder on a message, which saves it (REQ-283) */
-       ACT_REMIND,
+       /* a reminder on a message, which saves it (REQ-283): the choices, as
+        * the desktop client's reminder menu has them, and a time typed */
+       ACT_REMIND, ACT_REMIND_20M, ACT_REMIND_1H, ACT_REMIND_TOMORROW, ACT_REMIND_MONDAY,
+       ACT_REMIND_AT, ACT_REMIND_CLEAR,
        /* blocks and DM privacy: block or unblock a person, who may start a DM
         * with me, my blocked people (each an Unblock), and an admin's list */
        ACT_BLOCK, ACT_UNBLOCK, ACT_DMPRIV, ACT_BLOCKED, ACT_BLOCKS_ADMIN,
@@ -1355,8 +1357,53 @@ static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int 
         g_menu[g_nmenu++] = (menuitem){ reminded ? "Reminder (change or clear)..." : "Remind me...", ACT_REMIND };
 }
 
-/* A reminder typed (REQ-283): "20m", "1h", "tomorrow" (09:00), "14:30" (today,
- * or tomorrow once past), "2026-05-03 14:30", or "clear" (returns 1, *at 0).
+/* "Remind me..." (REQ-283): in 20 minutes, in 1 hour, tomorrow at 9:00, next
+ * Monday at 9:00, or a time typed, and Clear when one is set -- the desktop
+ * client's reminder menu, item for item. */
+static void menu_build_remind(int reminded) {
+    g_nmenu = 0;
+    g_menu[g_nmenu++] = (menuitem){ "In 20 minutes",       ACT_REMIND_20M };
+    g_menu[g_nmenu++] = (menuitem){ "In 1 hour",           ACT_REMIND_1H };
+    g_menu[g_nmenu++] = (menuitem){ "Tomorrow at 9:00",    ACT_REMIND_TOMORROW };
+    g_menu[g_nmenu++] = (menuitem){ "Next Monday at 9:00", ACT_REMIND_MONDAY };
+    g_menu[g_nmenu++] = (menuitem){ "At a time...",        ACT_REMIND_AT };
+    if (reminded) g_menu[g_nmenu++] = (menuitem){ "Clear reminder", ACT_REMIND_CLEAR };
+}
+
+/* `days` from today at `hh`:`mm`, local time, in ms; 0 when it cannot be had. */
+static uint64_t tui_local_at(int days, int hh, int mm) {
+    time_t now = time(NULL);
+    struct tm q;
+    if (!oc_localtime_r(&now, &q)) return 0;
+    q.tm_mday += days; q.tm_hour = hh; q.tm_min = mm; q.tm_sec = 0; q.tm_isdst = -1;
+    time_t r = mktime(&q);
+    return r == (time_t)-1 ? 0 : (uint64_t)r * 1000u;
+}
+
+/* Set message `mid`'s reminder to `at` (0 clears it) and say so on the status
+ * line, in the reader's words. */
+static void tui_remind_set(oc_client *cl, uint64_t mid, uint64_t at) {
+    oc_client_set_reminder(cl, mid, at);
+    if (at) {
+        time_t ts = (time_t)(at / 1000); struct tm tv; char w[40] = "then";
+        if (oc_localtime_r(&ts, &tv)) strftime(w, sizeof w, "%a %d %b at %H:%M", &tv);
+        snprintf(g_closed_note, sizeof g_closed_note, "Saved. You'll be reminded %s.", w);
+    } else snprintf(g_closed_note, sizeof g_closed_note, "Reminder cleared. The message stays saved.");
+}
+
+/* The next Monday at 9:00: a week on when today is Monday. */
+static uint64_t tui_next_monday_9(void) {
+    time_t now = time(NULL);
+    struct tm t;
+    int wd = oc_localtime_r(&now, &t) ? t.tm_wday : 1;
+    int ahead = (8 - wd) % 7;                    /* Monday is 1 */
+    if (ahead == 0) ahead = 7;
+    return tui_local_at(ahead, 9, 0);
+}
+
+/* A reminder typed (REQ-283): "20m", "1h", "tomorrow" (09:00), "monday" (the
+ * next, 09:00), "14:30" (today, or tomorrow once past), "2026-05-03 14:30", or
+ * "clear" (returns 1, *at 0).
  * The moment in ms into *at; 0 when it is none of them. */
 static int tui_parse_remind(const char *s, uint64_t *at) {
     time_t now = time(NULL);
@@ -1374,6 +1421,10 @@ static int tui_parse_remind(const char *s, uint64_t *at) {
     struct tm q = t;
     q.tm_sec = 0; q.tm_isdst = -1;
     if (!strncmp(s, "tomorrow", 8)) { q.tm_mday += 1; q.tm_hour = 9; q.tm_min = 0; }
+    else if (!strncmp(s, "monday", 6) || !strncmp(s, "next monday", 11)) {
+        *at = tui_next_monday_9();
+        return *at != 0;
+    }
     else if (sscanf(s, "%d-%d-%d %d:%d", &y, &mo, &d, &hh, &mm) == 5) {
         if (mo < 1 || mo > 12 || d < 1 || d > 31 || hh > 23 || mm > 59 || hh < 0 || mm < 0) return 0;
         q.tm_year = y - 1900; q.tm_mon = mo - 1; q.tm_mday = d; q.tm_hour = hh; q.tm_min = mm;
@@ -4205,15 +4256,8 @@ int main(int argc, char **argv) {
                 else if (k == PROMPT_REMIND && *v) {
                     uint64_t at = 0;
                     if (!tui_parse_remind(v, &at))
-                        snprintf(g_closed_note, sizeof g_closed_note, "Not a time to come: try 20m, 1h, tomorrow, 14:30 or clear.");
-                    else {
-                        oc_client_set_reminder(cl, act_mid, at);
-                        if (at) {
-                            time_t ts = (time_t)(at / 1000); struct tm tv; char w[40] = "then";
-                            if (oc_localtime_r(&ts, &tv)) strftime(w, sizeof w, "%a %d %b at %H:%M", &tv);
-                            snprintf(g_closed_note, sizeof g_closed_note, "Saved. You'll be reminded %s.", w);
-                        } else snprintf(g_closed_note, sizeof g_closed_note, "Reminder cleared. The message stays saved.");
-                    }
+                        snprintf(g_closed_note, sizeof g_closed_note, "Not a time to come: try 20m, 1h, tomorrow, monday, 14:30 or clear.");
+                    else tui_remind_set(cl, act_mid, at);
                 }
                 else if (k == PROMPT_PFVALUE) {
                     /* Then the profile again, showing what was saved. */
@@ -4457,7 +4501,22 @@ int main(int argc, char **argv) {
                     }
                     else if (id == ACT_DELETE)      oc_client_delete(cl, act_cid, act_mid);
                     else if (id == ACT_MOVE) { prompt_kind = PROMPT_MOVE; prompt_title = "Move to channel (name)"; tk_input_init(&prompt_input, 0, "#channel"); }
-                    else if (id == ACT_REMIND) { prompt_kind = PROMPT_REMIND; prompt_title = "Remind me (20m, 1h, tomorrow, 14:30, 2026-05-03 14:30, clear)"; tk_input_init(&prompt_input, 0, "when"); }
+                    else if (id == ACT_REMIND) {
+                        /* The choices, then: Clear among them when one is set. */
+                        int reminded = 0;
+                        const oc_channel *rc = focused_channel(oc_client_model(cl), act_cid);
+                        if (rc) for (size_t k = 0; k < rc->n_msgs; k++)
+                            if (rc->msgs[k].message_id == act_mid) { reminded = rc->msgs[k].saved && rc->msgs[k].remind_at; break; }
+                        menu_build_remind(reminded);
+                        act_title = reminded ? "Reminder" : "Remind me";
+                        action_open = 1; tk_list_reset_filter(&action_menu);
+                    }
+                    else if (id == ACT_REMIND_20M)      tui_remind_set(cl, act_mid, ((uint64_t)time(NULL) + 20u * 60u) * 1000u);
+                    else if (id == ACT_REMIND_1H)       tui_remind_set(cl, act_mid, ((uint64_t)time(NULL) + 60u * 60u) * 1000u);
+                    else if (id == ACT_REMIND_TOMORROW) { uint64_t t9 = tui_local_at(1, 9, 0); if (t9) tui_remind_set(cl, act_mid, t9); }
+                    else if (id == ACT_REMIND_MONDAY)   { uint64_t m9 = tui_next_monday_9(); if (m9) tui_remind_set(cl, act_mid, m9); }
+                    else if (id == ACT_REMIND_CLEAR)    tui_remind_set(cl, act_mid, 0);
+                    else if (id == ACT_REMIND_AT) { prompt_kind = PROMPT_REMIND; prompt_title = "Remind me at (14:30, 2026-05-03 14:30, tomorrow, monday, 20m, 1h)"; tk_input_init(&prompt_input, 0, "when"); }
                     else if (id == ACT_DM) {
                         oc_client_open_dm(cl, act_uid, 0);
                         g_dm_asked = act_uid; g_dm_asked_e2e = 0;

@@ -1126,7 +1126,8 @@ where one exists.
   a mute, quiet hours or a pause like any other. Clearing it, unsaving, or
   deleting the message removes it. The desktop client offers "Remind me…" on a
   message and in Saved (in 20 minutes, in 1 hour, tomorrow at 9:00, next Monday
-  at 9:00, or a chosen time); the terminal client takes a typed time.
+  at 9:00, or a chosen time); the terminal client offers the same choices in
+  its message menu, with the chosen time typed.
 - **REQ-284.** What the **unread badge counts** has been defined
   rather than left implicit: a conversation's badge has counted the messages that
   **would have notified** the user under their settings (REQ-130/134/135/137) —
