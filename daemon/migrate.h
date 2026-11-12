@@ -25,11 +25,13 @@ extern const int OC_MIGRATIONS_COUNT;
 /* Highest applied migration version, or 0 if the database has none. */
 int oc_schema_version(sqlite3 *db);
 
-/* Register the SQL functions the schema itself calls, on `db`: oc_unspoiled(body),
- * the body with what its spoilers hide removed, which the full-text index's
- * triggers index (SCHEMA.md §3d). Every connection that writes `messages` needs
- * it, or the write fails with "no such function"; oc_migrate registers it on
- * the connection it is given. */
+/* Register the SQL functions the daemon's queries and the schema call, on `db`:
+ * oc_unspoiled(body), the body with what its spoilers hide removed, which the
+ * full-text index's triggers index (SCHEMA.md §3d); oc_excerpt(text, bytes) and
+ * oc_has_spoiler(text), which every excerpt is built with (MARKDOWN.md §1d).
+ * Every connection that writes `messages` or reads an excerpt needs them, or it
+ * fails with "no such function"; the daemon registers them on each of its
+ * connections, a test on its own, and oc_migrate on the connection it is given. */
 void oc_migrate_functions(sqlite3 *db);
 
 /* Apply every migration in `set` (ascending `version`, `n` entries) whose

@@ -1873,9 +1873,37 @@ static void sql_unspoiled(sqlite3_context *cx, int argc, sqlite3_value **argv) {
     sqlite3_result_text(cx, out, (int)w, free);
 }
 
+/* Every excerpt the daemon sends -- a channel's preview, a thread's, an
+ * activity row's, a search hit's -- is made by oc_rt_plain_excerpt, so what a
+ * spoiler hides is never in one (MARKDOWN.md §1d). They are built in SQL, so
+ * the helper is a function there: oc_excerpt(text, bytes), and
+ * oc_has_spoiler(text) for where FTS's snippet() would otherwise cut a window. */
+static void sql_excerpt(sqlite3_context *cx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    const char *t = (const char *)sqlite3_value_text(argv[0]);
+    int n = sqlite3_value_bytes(argv[0]);
+    sqlite3_int64 cap = sqlite3_value_int64(argv[1]);
+    if (!t) { sqlite3_result_null(cx); return; }
+    if (cap <= 0 || cap > 65536) cap = 65536;
+    char *out = malloc((size_t)cap + 1);
+    if (!out) { sqlite3_result_error_nomem(cx); return; }
+    size_t w = oc_rt_plain_excerpt(t, (size_t)n, out, (size_t)cap + 1);
+    sqlite3_result_text(cx, out, (int)w, free);
+}
+static void sql_has_spoiler(sqlite3_context *cx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    const char *t = (const char *)sqlite3_value_text(argv[0]);
+    int n = sqlite3_value_bytes(argv[0]);
+    sqlite3_result_int(cx, t && oc_rt_spoilers(t, (size_t)n, NULL, 0) > 0);
+}
+
+/* All three, on every connection that registers them: the daemon's own and a
+ * test's alike, so a query or trigger that runs on one runs on the other. */
 void oc_migrate_functions(sqlite3 *db) {
     sqlite3_create_function(db, "oc_unspoiled", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS,
                             NULL, sql_unspoiled, NULL, NULL);
+    sqlite3_create_function(db, "oc_excerpt", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_excerpt, NULL, NULL);
+    sqlite3_create_function(db, "oc_has_spoiler", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_has_spoiler, NULL, NULL);
 }
 
 int oc_migrate(sqlite3 *db, const oc_migration *set, int n, char **errmsg) {

@@ -406,6 +406,35 @@ static void test_also_channel(void) {
     sqlite3_close(db);
 }
 
+/* The first column of `sql`'s first row, as text, into `out`. */
+static void text_of(sqlite3 *db, const char *sql, char *out, size_t cap) {
+    out[0] = '\0';
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *t = sqlite3_column_text(st, 0);
+        snprintf(out, cap, "%s", t ? (const char *)t : "");
+    }
+    sqlite3_finalize(st);
+}
+
+/* A connection of a test's own, given oc_migrate_functions and nothing else,
+ * has every SQL function the daemon's connections have: the excerpt helper,
+ * the spoiler test and the search index's oc_unspoiled, each answering as the
+ * daemon's does. */
+static void test_sql_functions(void) {
+    sqlite3 *db = open_mem();
+    oc_migrate_functions(db);
+    char t[256];
+    CHECK(scalar(db, "SELECT oc_has_spoiler('a >!secret!< c');") == 1);
+    CHECK(scalar(db, "SELECT oc_has_spoiler('nothing hidden');") == 0);
+    text_of(db, "SELECT oc_excerpt('before >!secret!< after', 160);", t, sizeof t);
+    CHECK(strstr(t, "before") != NULL && strstr(t, "after") != NULL && strstr(t, "secret") == NULL);
+    text_of(db, "SELECT oc_unspoiled('before >!secret!< after');", t, sizeof t);
+    CHECK(strstr(t, "before") != NULL && strstr(t, "secret") == NULL);
+    CHECK(scalar(db, "SELECT oc_excerpt(NULL, 10) IS NULL;") == 1);
+    sqlite3_close(db);
+}
+
 static void test_newer_database_refused(void) {
     sqlite3 *db = open_mem();
     char *err = NULL;
@@ -435,6 +464,7 @@ int run_migrate_tests(void) {
     test_user_kind();
     test_spoilers_reindexed();
     test_also_channel();
+    test_sql_functions();
     test_newer_database_refused();
     return failures;
 }

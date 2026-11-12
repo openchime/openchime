@@ -67,9 +67,10 @@ static oc_dbres *wait_result(oc_dbwriter *w) {
 /* Every database is in the suite's own directory (tests/testenv.h), so nothing
  * another suite, run or checkout does can meet it. `tdb` names one there; the
  * names live as long as the suite. */
-/* A connection of the test's own, beside the daemon's: with the SQL functions
- * the daemon registers on each of its connections (oc_migrate_functions),
- * since the search index's triggers call one whenever `messages` is written. */
+/* A connection of the test's own, beside the daemon's: with every SQL function
+ * the daemon registers on each of its connections (oc_migrate_functions: the
+ * excerpt helpers its queries use, and what the search index's triggers call
+ * whenever `messages` is written). */
 static int raw_open(const char *path, sqlite3 **db) {
     int rc = sqlite3_open(path, db);
     if (rc == SQLITE_OK) oc_migrate_functions(*db);
