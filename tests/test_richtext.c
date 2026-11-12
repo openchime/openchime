@@ -210,7 +210,10 @@ static void test_autolink(void) {
     CHECK(content_spans("javascript:alert(1)", OC_RT_LINK) == 0);
     CHECK(content_spans("mailto:a@b.com", OC_RT_LINK) == 0);
     CHECK(content_spans("ftp://example.com", OC_RT_LINK) == 0);
-    CHECK(content_spans("openchime://host/c/1/m/2", OC_RT_LINK) == 0);
+    /* An OpenChime permalink links, for the client to follow in the app. */
+    CHECK(span_over("see openchime:///c/3/m/4 now", "openchime:///c/3/m/4", OC_RT_LINK));
+    CHECK(content_spans("openchime:///c/3/evil", OC_RT_LINK) == 0);
+    CHECK(content_spans("openchime://host/c/1/m/2", OC_RT_LINK) == 1);     /* with a host too */
     /* A scheme with no address is not a link. */
     CHECK(content_spans("https://", OC_RT_LINK) == 0);
     /* Not at a word boundary — the guard against a scheme inside a longer token. */
@@ -293,6 +296,16 @@ static void test_labelled_links(void) {
     CHECK(content_spans("[click](javascript:alert(1))", OC_RT_LABELLED) == 0);
     CHECK(content_spans("[f](file:///etc/passwd)", OC_RT_LABELLED) == 0);
     CHECK(content_spans("[m](mailto:a@b.com)", OC_RT_LABELLED) == 0);
+    /* A permalink is a labelled link's address too, the line a move leaves. */
+    CHECK(span_over("x moved [a message](openchime:///c/7/m/9) to #b.", "a message", OC_RT_LABELLED));
+    {
+        const char *mv = "x moved [a message](openchime:///c/7/m/9) to #b.";
+        oc_rt_span sp[16]; size_t n = oc_rt_scan(mv, strlen(mv), sp, 16), off = 0, tl = 0; int got = 0;
+        for (size_t k = 0; k < n && k < 16; k++)
+            if (sp[k].style == OC_RT_LABELLED && oc_rt_target(mv, strlen(mv), &sp[k], &off, &tl))
+                got = tl == 20 && !memcmp(mv + off, "openchime:///c/7/m/9", 20);
+        CHECK(got);
+    }
 
     /* Not quite a link: literal, and a bare address inside still autolinks. */
     CHECK(content_spans("[x] (https://a.com)", OC_RT_LABELLED) == 0);

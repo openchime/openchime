@@ -79,6 +79,35 @@ size_t oc_url_len(const char *b, size_t end, size_t i) {
     return n;
 }
 
+/* An OpenChime permalink opening at `i` (ARCH-96): `openchime://<host>/c/<id>`,
+ * then optionally `/m/<id>`, the host possibly empty for "this workspace". Its
+ * whole length, or 0. Strict on purpose: nothing but that shape is one, so the
+ * scheme cannot carry anything a client would hand elsewhere -- a client opens
+ * one itself, in the app, and never passes it to the system. */
+size_t oc_url_permalink_len(const char *b, size_t end, size_t i) {
+    static const char *sch = "openchime://";
+    size_t j = i, k, d;
+    if (!b || !u_boundary_ok(b, i)) return 0;
+    for (k = 0; k < 12; k++) if (j + k >= end || u_lower(b[j + k]) != sch[k]) return 0;
+    j += 12;
+    while (j < end && ((b[j] >= 'a' && b[j] <= 'z') || (b[j] >= 'A' && b[j] <= 'Z') ||
+                       (b[j] >= '0' && b[j] <= '9') || b[j] == '.' || b[j] == '-' ||
+                       b[j] == ':' || b[j] == '[' || b[j] == ']')) j++;
+    if (j + 3 > end || b[j] != '/' || b[j + 1] != 'c' || b[j + 2] != '/') return 0;
+    j += 3;
+    for (d = j; j < end && b[j] >= '0' && b[j] <= '9'; j++) { }
+    if (j == d) return 0;
+    if (j + 3 <= end && b[j] == '/' && b[j + 1] == 'm' && b[j + 2] == '/') {
+        size_t m = j + 3, e2 = m;
+        while (e2 < end && b[e2] >= '0' && b[e2] <= '9') e2++;
+        if (e2 > m) j = e2;
+    }
+    /* It ends where the shape does: what follows is the sentence's, or the
+     * end of a labelled link's address. */
+    if (j < end && !u_stop(b[j]) && !u_trim(b[j]) && b[j] != ')' && b[j] != ']' && b[j] != '}') return 0;
+    return j - i;
+}
+
 /* An inline `code` span opening at `i`: its total length including both
  * backticks, or 0. The same acceptance rules as the formatting parser's, so
  * both walks skip the same bytes: not a run of backticks, opens at a word

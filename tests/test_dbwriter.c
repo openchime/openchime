@@ -11617,12 +11617,27 @@ static void test_move_message(void) {
     int marker = 0;
     for (oc_dbres *n; (n = oc_dbwriter_next_result(w)) != NULL; oc_dbres_free(n))
         if (n->type == OC_RES_NOTICE && n->channel_id == OC_DEFAULT_CHANNEL && n->body &&
-            /* contract: the line left behind names the mover and the destination */
-            memmem(n->body, n->body_len, "moved a message to #mv-dest", 27)) marker = (int)n->message_id;
+            /* contract: the line left behind names the destination, linking to the message there */
+            memmem(n->body, n->body_len, "to #mv-dest", 11) && memmem(n->body, n->body_len, "[a message](openchime:///c/", 27))
+            marker = (int)n->message_id;
     CHECK(marker);
     /* ...and is stored there, a message of the source channel. */
     CHECK(raw_num(path, "SELECT channel_id FROM messages WHERE id=?1 AND deleted_at_ms IS NULL;",
                   (uint64_t)marker) == OC_DEFAULT_CHANNEL);
+    {   /* The link is the moved message's, in its new place. */
+        char want[96];
+        int wl = snprintf(want, sizeof want, "(openchime:///c/%llu/m/%llu)", (unsigned long long)dest,
+                          (unsigned long long)m1);
+        sqlite3 *raw = NULL; sqlite3_stmt *st = NULL; int has = 0;
+        if (raw_open(path, &raw) == SQLITE_OK &&
+            sqlite3_prepare_v2(raw, "SELECT body FROM messages WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)marker);
+            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_blob(st, 0))
+                has = memmem(sqlite3_column_blob(st, 0), (size_t)sqlite3_column_bytes(st, 0), want, (size_t)wl) != NULL;
+        }
+        sqlite3_finalize(st); sqlite3_close(raw);
+        CHECK(has);
+    }
     CHECK(raw_num(path, "SELECT channel_id FROM messages WHERE id=?1;", m1) == (int64_t)dest);
     CHECK(raw_num(path, "SELECT channel_id FROM mentions WHERE message_id=?1;", m1) == (int64_t)dest);
     CHECK(raw_num(path, "SELECT channel_id FROM pins WHERE message_id=?1;", m1) == (int64_t)dest);
@@ -11673,10 +11688,41 @@ static void test_move_message(void) {
     CHECK(move_err(move_msg(w, bob, m3, priv, 0, 1)) == OC_ERR_FORBIDDEN);
     CHECK(move_err(move_msg(w, bob, m3 + 1000, dest, 0, 1)) == OC_ERR_UNKNOWN_MESSAGE);
     CHECK(raw_num(path, "SELECT channel_id FROM messages WHERE id=?1;", m3) == OC_DEFAULT_CHANNEL);
+    /* Nothing moves into or out of a direct conversation, encrypted or not: an
+     * encrypted one's bodies are ciphertext only its two ends can read. */
+    r = e2e_open(w, alice, bob);
+    uint64_t sealed = (r && r->type == OC_RES_CHANNEL_INFO) ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(sealed != 0);
+    r = open_dm(w, alice, carol);
+    uint64_t plain_dm = (r && r->type == OC_RES_CHANNEL_INFO) ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(plain_dm != 0);
+    CHECK(move_err(move_msg(w, alice, m3, sealed, 0, 1)) == OC_ERR_CANNOT_MOVE);
+    CHECK(move_err(move_msg(w, alice, m3, plain_dm, 0, 1)) == OC_ERR_CANNOT_MOVE);
+    r = e2e_send(w, alice, sealed, "sealed words", 0x6E, 0);
+    uint64_t in_sealed = (r && r->type == OC_RES_SEND_OK) ? r->message_id : 0;
+    oc_dbres_free(r);
+    CHECK(in_sealed != 0);
+    CHECK(move_err(move_msg(w, alice, in_sealed, dest, 0, 1)) == OC_ERR_CANNOT_MOVE);
+    CHECK(raw_num(path, "SELECT channel_id FROM messages WHERE id=?1;", in_sealed) == (int64_t)sealed);
+    /* A file on the message goes with it. */
+    {
+        sqlite3 *raw = NULL;
+        CHECK(raw_open(path, &raw) == SQLITE_OK);
+        char sql[400];
+        snprintf(sql, sizeof sql,
+                 "INSERT INTO attachments(id, channel_id, message_id, uploader_id, storage_key, filename, mime,"
+                 " size, sha256, created_at_ms) VALUES(7701, %d, %llu, %llu, 'mv-key', 'mv.txt', 'text/plain',"
+                 " 3, x'00', 1);", (int)OC_DEFAULT_CHANNEL, (unsigned long long)m3, (unsigned long long)bob);
+        CHECK(sqlite3_exec(raw, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
     /* An owner moves anyone's, here into a private channel she is in. */
     r = move_msg(w, alice, m3, priv, 0, 0);
     CHECK(r && r->type == OC_RES_MESSAGE_MOVED && r->move_to == priv);
     oc_dbres_free(r);
+    CHECK(raw_num(path, "SELECT channel_id FROM attachments WHERE id=?1;", 7701) == (int64_t)priv);
     /* Nothing leaves an archived channel. */
     oc_dbres_free(chan_update(w, alice, dest, OC_CHUP_ARCHIVE, ""));
     CHECK(move_err(move_msg(w, alice, m1, OC_DEFAULT_CHANNEL, 0, 1)) == OC_ERR_CHANNEL_ARCHIVED);

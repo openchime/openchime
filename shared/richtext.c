@@ -173,7 +173,8 @@ static size_t code_span_len(rt_ctx *c, size_t i, size_t e) {
  * impossible rather than merely unlikely. url_len below is the thin adapter
  * onto it. */
 static size_t url_len(rt_ctx *c, size_t i, size_t e) {
-    return oc_url_len(c->b, e, i);
+    size_t L = oc_url_len(c->b, e, i);
+    return L ? L : oc_url_permalink_len(c->b, e, i);   /* and an OpenChime permalink */
 }
 
 /* A labelled link `[label](https://address)` opening at `i` and ending before
@@ -1249,6 +1250,7 @@ int oc_rt_target(const char *body, size_t len, const oc_rt_span *span,
     o = span->start + span->len + 2;                  /* past "](" */
     if (o > len || body[o - 2] != ']' || body[o - 1] != '(') return 0;
     L = oc_url_len(body, len, o);
+    if (!L) L = oc_url_permalink_len(body, len, o);
     if (!L) return 0;
     *off = o; *tlen = L;
     return 1;

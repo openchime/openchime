@@ -7291,8 +7291,12 @@ static oc_dbres *process_move_message(sqlite3 *db, const oc_job *j) {
             sqlite3_finalize(st);
         }
         char line[OC_MAX_BODY_SIZE < 512 ? OC_MAX_BODY_SIZE : 512];
-        int len = snprintf(line, sizeof line, "%s moved %s to #%s.", who ? who : "Someone",
-                           count > 1 ? "a thread" : "a message", dn ? dn : "another channel");
+        /* The words name where it went and link to it there: a permalink with no
+         * host is this workspace's, which a client follows in the app (ARCH-96). */
+        int len = snprintf(line, sizeof line, "%s moved [%s](openchime:///c/%llu/m/%llu) to #%s.",
+                           who ? who : "Someone", count > 1 ? "a thread" : "a message",
+                           (unsigned long long)j->channel_id, (unsigned long long)j->message_id,
+                           dn ? dn : "another channel");
         if (len > 0) notice_post(db, src, line, (size_t)len < sizeof line ? (size_t)len : sizeof line - 1);
         free(who); free(dn);
     }

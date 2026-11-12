@@ -417,10 +417,17 @@ trustworthy part: a frontend shows it on hover and asks before opening a
 labelled link, naming its host and the full address (§6). A bare address needs
 no such step; it is its own label.
 
-**Only `http` and `https`.** A link span is what a frontend hands to the
-operating system, so this list is the set of things a message can ask a reader's
-machine to open. `file://`, `javascript:`, `mailto:` and anything else stay
-ordinary text. The restriction lives in the shared parser rather than in each
+**Only `http` and `https`, and OpenChime's own permalinks.** A link span is
+what a frontend hands to the operating system, so this list is the set of things
+a message can ask a reader's machine to open. `file://`, `javascript:`,
+`mailto:` and anything else stay ordinary text. The one exception is a
+permalink, `openchime://<host>/c/<channel>` or `.../c/<channel>/m/<message>`
+(the host may be empty, meaning this workspace), bare or as a labelled link's
+address: it is never handed to the system. The client follows it itself, as it
+follows one pasted into the palette, checking the workspace and what the reader
+may see; a labelled one asks nothing first, since it can go nowhere outside the
+app. Only that exact shape is one (`oc_url_permalink_len`), and the daemon never
+fetches it for a preview. The line a move leaves behind is written this way. The restriction lives in the shared parser rather than in each
 frontend, which is what stops two clients answering a security question
 differently — the same argument ARCH-89 makes for the mention scanner.
 

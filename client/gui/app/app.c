@@ -30218,7 +30218,7 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
         const char *an = oc_model_user_name((oc_model *)m, msg->author_id);
         snprintf(lbl, sizeof lbl, "%s %s", oc_model_is_muted_user(m, msg->author_id) ? "Unmute" : "Mute",
                  an && an[0] ? an : "this person");
-        mi_item(113, lbl);
+        mi_item(121, lbl);
     }
     /* Block the author, for me alone: someone else, never the workspace itself. */
     if (!own && msg->author_id && !oc_model_is_workspace_sender(m, msg->author_id)) {
@@ -30412,7 +30412,7 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
     } else if (cmd == 112) {
         msg_expand(mid, 0);
         if (g_client) oc_client_set_collapsed(g_client, mid, 1);
-    } else if (cmd == 113) {
+    } else if (cmd == 121) {
         int on = !oc_model_is_muted_user(m, msg->author_id);
         if (g_client) oc_client_set_user_mute(g_client, msg->author_id, on);
         fb_confirm(on ? "Muted. Their messages stay folded away and no longer notify you."
@@ -32953,6 +32953,9 @@ static int link_under(int x, int y, char *out, size_t cap) {
 static void link_open(const char *url) {
     if (!url || !url[0]) return;
     g_confirm_url[0] = 0;
+    /* An OpenChime permalink is followed here, in the app, and never handed to
+     * the system: it names a message, not a page (MARKDOWN.md §4, ARCH-96). */
+    if (!SDL_strncasecmp(url, "openchime://", 12)) { permalink_follow(g_main, url); return; }
     if (SDL_strncasecmp(url, "http://", 7) && SDL_strncasecmp(url, "https://", 8)) return;
     SDL_OpenURL(url);
 }
@@ -32963,6 +32966,9 @@ static void link_open(const char *url) {
  * bare address needs none of this -- it is its own label. */
 static void link_open_labelled(oc_win *hwnd, const char *url) {
     if (!url || !url[0]) return;
+    /* A labelled permalink goes nowhere outside the app, and following one
+     * checks the workspace and what the reader may see, so it asks nothing. */
+    if (!SDL_strncasecmp(url, "openchime://", 12)) { permalink_follow(hwnd, url); return; }
     if (SDL_strncasecmp(url, "http://", 7) && SDL_strncasecmp(url, "https://", 8)) return;
     snprintf(g_confirm_url, sizeof g_confirm_url, "%s", url);
     const char *h = strstr(url, "://");

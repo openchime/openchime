@@ -50,6 +50,33 @@ static int test_extent(void) {
     CHECK(len_at("javascript:alert(1)", 0) == 0);
     CHECK(len_at("mailto:a@b.com", 0) == 0);
 
+    /* An OpenChime permalink is not a web address: oc_url_len and the
+     * extractor (what the daemon would fetch) leave it alone... */
+    CHECK(len_at("openchime://ws.example/c/3/m/4", 0) == 0);
+    {
+        oc_url_span sp[2];
+        const char *t = "see openchime:///c/3/m/4 and https://a.com";
+        CHECK(oc_url_extract(t, strlen(t), sp, 2) == 1);
+    }
+    /* ...and oc_url_permalink_len takes exactly its shape, host or none. */
+    {
+        static const struct { const char *s; size_t i, want; } P[] = {
+            { "openchime:///c/3/m/4", 0, 20 },
+            { "openchime://ws.example:8443/c/3", 0, 31 },
+            { "go openchime:///c/3/m/4.", 3, 20 },            /* the full stop is the sentence's */
+            { "(openchime:///c/3/m/4)", 1, 20 },
+            { "OpenChime:///C/3", 0, 0 },                      /* the path is exact */
+            { "openchime:///c/", 0, 0 },
+            { "openchime:///c/3/x", 0, 0 },
+            { "openchime://h/c/3?x=1", 0, 17 },                /* a "?" ends the sentence, not the link */
+            { "openchime://h/../c/3", 0, 0 },
+            { "xopenchime:///c/3", 1, 0 },                      /* not at a boundary */
+            { "javascript:openchime:///c/3", 11, 0 },
+        };
+        for (size_t k = 0; k < sizeof P / sizeof P[0]; k++)
+            CHECK(oc_url_permalink_len(P[k].s, strlen(P[k].s), P[k].i) == P[k].want);
+    }
+
     /* The opening boundary: start, whitespace, opening bracket, or a run of
      * formatting delimiters looked through to one of those — never a word. */
     CHECK(len_at("xhttps://example.com", 1) == 0);
