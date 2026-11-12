@@ -38,8 +38,9 @@ say "== What's new is offered"
 for _ in $(seq 1 80); do snap; grep -q 'authed=1' "$D" && break; sleep 0.25; done
 "$DRIVE" size 1200 820 >/dev/null
 "$DRIVE" about >/dev/null
-snap
-check "the About card offers What's new" grep -q "^a11yitem .*What's new" "$D"
+# Its buttons are published when the card is first drawn, a frame or two on.
+offered() { snap; grep -qi "^a11yitem .*what's new" "$D"; }   # the id is lower case
+check "the About card offers What's new" waitfor 5 offered
 "$DRIVE" key esc >/dev/null
 "$DRIVE" palette "What's new" >/dev/null
 snap
