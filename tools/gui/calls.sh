@@ -129,7 +129,7 @@ banner() { [ "$(field b 'callui ' banner)" = 1 ] && grep -q '^a11yitem call.bann
            grep -q '^a11yitem call.banner.decline ' /tmp/oc-calls-dump-b.txt; }
 check "bob's #general shows the call's banner, with Join and Decline" waitfor b 10 banner
 check "...and the Calls row has its own Join" bash -c "grep -q '^a11yitem calls.row.join.$CH ' /tmp/oc-calls-dump-b.txt"
-hdrtip() { field b 'callui ' hdrtip | grep -qx "Join the call"; }
+hdrtip() { grep -q '^callui .*hdrtip="Join the call"' /tmp/oc-calls-dump-b.txt; }
 check "the header's phone says \"Join the call\"" hdrtip
 "$PAIR" b shot calls_banner >/dev/null
 "$PAIR" b call banner-join >/dev/null
@@ -202,6 +202,9 @@ click_rect b hdr
 check "the header's call button opens the call going on" waitfor b 4 b_inview
 
 say "== the conversation beside the call"
+# Wide enough for the call and the conversation side by side: narrower, the
+# panel gives the call the room, as it is meant to.
+"$PAIR" b size 1600 900 >/dev/null
 "$PAIR" b call open $CH >/dev/null
 chat_on()  { [ "$(field b 'callui ' chat)" = 1 ]; }
 chat_off() { [ "$(field b 'callui ' chat)" = 0 ]; }
@@ -237,7 +240,9 @@ has_aid() { grep -q "^a11yitem $2 " "/tmp/oc-calls-dump-$1.txt"; }
 check "alice's call view offers Share screen (call.share)" has_aid a call.share
 "$PAIR" a call share "screen:synthetic" >/dev/null
 sfield() { field "$1" 'share ' "$2"; }
-a_sharing()   { [ "$(sfield a state)" = 2 ] && [ "$(sfield a bar)" = 1 ]; }
+# The floating bar is a second window, which a web page has none of (WEB.md):
+# there the call view's own banner is the sharer's control.
+a_sharing()   { [ "$(sfield a state)" = 2 ] && [ "$(sfield a bar)" = "$([ "$PLAT" = web ] && echo 0 || echo 1)" ]; }
 b_sees_a()    { [ "$(sfield b sharer)" = "$(field a 'call ' self)" ] && ge "$(sfield b view_frames)" 10; }
 b_picture()   { [ "$(sfield b tex)" = "$SHARE_WH" ] && ge "$(sfield b px_fno)" 1; }
 check "alice's share is confirmed, and her bar is up" waitfor a 10 a_sharing
@@ -321,7 +326,10 @@ waitfor b 8 b_left >/dev/null
 say "== an invitation's Join"
 "$PAIR" a call start $CH >/dev/null
 waitfor b 10 b_invited >/dev/null
-"$PAIR" b toastaction "join|0|$CH|" >/dev/null
+# The toast names the workspace the call is in, as a real one does: bob's active
+# one, which on a Windows client with saved workspaces need not be the first.
+BWS="$(grep -m1 '^workspaces=' /tmp/oc-calls-dump-b.txt | grep -o 'active=[0-9]*' | cut -d= -f2)"
+"$PAIR" b toastaction "join|${BWS:-0}|$CH|" >/dev/null
 check "the toast's Join puts bob in the call" waitfor b 10 two_b
 "$PAIR" a call end >/dev/null
 waitfor b 8 b_out >/dev/null
