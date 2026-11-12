@@ -3814,6 +3814,22 @@ static void test_thread_notices(void) {
         CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 1);
         oc_model_free(&m);
     }
+    {   /* Every thread in the conversation followed (REQ-282): the daemon's
+         * participation byte carries it, so a thread never written in toasts,
+         * and the conversation's mute still silences it, as the push does. */
+        oc_model m; notice_fixture(&m);
+        oc_channel *c = oc_model_channel(&m, 10);
+        CHECK(c != NULL);
+        if (c) {
+            c->follow_threads = 1;
+            feed_reply(&m, 1, 2, 1, "a thread never written in");
+            CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 1);
+            c->muted = 1;
+            feed_reply(&m, 2, 2, 1, "and muted");
+            CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 0);
+        }
+        oc_model_free(&m);
+    }
     {   /* Taking DRAINS: a reply is considered once, whatever the verdict, or a
          * timer that runs every tick would toast it every tick. */
         oc_model m; notice_fixture(&m);

@@ -451,6 +451,34 @@ static void test_collect(void) {
     for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-dave") == 0) saw_d = 1;
     CHECK(saw_d);
 
+    /* FOLLOWING EVERY THREAD in the conversation (REQ-282) reaches him in a
+     * thread he never wrote in and never followed; mute outranks it, and so
+     * does an explicit unfollow of the one thread. The override row goes first,
+     * so only the conversation's setting is left to carry him. */
+    {
+        static const struct { const char *sql; int pushed; } steps[] = {
+            { "DELETE FROM thread_follows WHERE user_id=%llu AND root_id=5000;", 0 },
+            { "UPDATE notification_prefs SET follow_threads=1 WHERE user_id=%llu AND channel_id=1;", 1 },
+            { "UPDATE notification_prefs SET muted=1 WHERE user_id=%llu AND channel_id=1;", 0 },
+            { "UPDATE notification_prefs SET muted=0 WHERE user_id=%llu AND channel_id=1;", 1 },
+            { "INSERT INTO thread_follows(user_id,root_id,channel_id,state) VALUES(%llu,5000,1,0);", 0 },
+        };
+        for (size_t k = 0; k < sizeof steps / sizeof steps[0]; k++) {
+            sqlite3 *wdb = NULL;
+            CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+            oc_migrate_functions(wdb);
+            char sql[256];
+            snprintf(sql, sizeof sql, steps[k].sql, (unsigned long long)dave);
+            CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+            CHECK(sqlite3_changes(wdb) == 1);
+            sqlite3_close(wdb);
+            n = oc_push_collect(rdb, 1, alice, 5001, 5000, 100, (uint64_t)100 * 60000ull, t, 8);
+            saw_d = 0;
+            for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-dave") == 0) saw_d = 1;
+            CHECK(saw_d == steps[k].pushed);
+        }
+    }
+
     sqlite3_close(rdb);
 
     /* --- a PAUSE silences regardless of the window (REQ-278) --------

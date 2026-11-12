@@ -212,6 +212,9 @@
  * ahead of the body: a thread reply can also be posted to the channel's main
  * scroll (REQ-062).
  *
+ * 37: each NOTIFY_PREFS entry carries `follow_threads` (u8), every thread in
+ * the conversation followed (REQ-282). Fields appended to a repeated entry.
+ *
  * 38: SAVE_ITEM, SAVED_UPDATED and SAVED_MSG carry `remind_at_ms` (u64, 0 for
  * none), a saved item's reminder (REQ-283), and activity has a new kind,
  * OC_ACT_REMINDER, for one that fired. Fields appended to fixed layouts.
