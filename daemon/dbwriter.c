@@ -369,7 +369,11 @@ static void fill_replay_reactions(sqlite3 *db, oc_dbres *r, uint64_t for_user) {
                 /* Prefer the requesting user's own id so the client can mark
                  * the chip as theirs; MIN() just picks a stable stand-in. */
                 "  COALESCE(MAX(CASE WHEN user_id=?2 THEN user_id END), MIN(user_id)) "
-                "FROM reactions WHERE message_id=?1 GROUP BY emoji ORDER BY emoji;",
+                /* Not the people this user has muted (SET_USER_MUTE): their reactions
+                 * are no part of the chips, as REACTION_UPDATED leaves them out. */
+                "FROM reactions WHERE message_id=?1 "
+                "  AND user_id NOT IN (SELECT muted_id FROM muted_users WHERE user_id=?2) "
+                "GROUP BY emoji ORDER BY emoji;",
                 -1, &st, NULL) != SQLITE_OK) break;
         sqlite3_bind_int64(st, 1, (sqlite3_int64)r->replay[i].message_id);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)for_user);
@@ -807,6 +811,8 @@ void oc_dbres_free(oc_dbres *r) {
     }
     free(r->ulist);
     free(r->emoji);
+    free(r->react_adj_user);
+    free(r->react_adj_minus);
     for (size_t i = 0; i < r->n_rlist; i++) free(r->rlist[i].emoji);
     free(r->rlist);
     for (size_t i = 0; i < r->n_thread; i++) { free(r->thread[i].body); free(r->thread[i].author_name); free_attach_meta(r->thread[i].attach, r->thread[i].n_attach); }
@@ -7767,6 +7773,33 @@ static oc_dbres *process_react(sqlite3 *db, const oc_job *j) {
     r->react_op = j->react_op;
     r->react_count = count;
     load_members(db, j->channel_id, r);
+    /* Whoever has muted someone who reacted with this emoji is sent the count
+     * without them (SET_USER_MUTE): a muted person's reactions stay out of the chips
+     * they see, as their messages stay out of the badges. */
+    if (sqlite3_prepare_v2(db,
+            "SELECT mu.user_id, COUNT(*) FROM reactions rx "
+            "  JOIN muted_users mu ON mu.muted_id = rx.user_id "
+            " WHERE rx.message_id=?1 AND rx.emoji=?2 GROUP BY mu.user_id;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        sqlite3_bind_text(st, 2, j->emoji, (int)elen, SQLITE_STATIC);
+        size_t cap = 0;
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            if (r->n_react_adj == cap) {
+                size_t nc = cap ? cap * 2 : 4;
+                uint64_t *u = realloc(r->react_adj_user, nc * sizeof *u);
+                if (!u) break;
+                r->react_adj_user = u;
+                uint64_t *k = realloc(r->react_adj_minus, nc * sizeof *k);
+                if (!k) break;
+                r->react_adj_minus = k;
+                cap = nc;
+            }
+            r->react_adj_user[r->n_react_adj] = (uint64_t)sqlite3_column_int64(st, 0);
+            r->react_adj_minus[r->n_react_adj] = (uint64_t)sqlite3_column_int64(st, 1);
+            r->n_react_adj++;
+        }
+        sqlite3_finalize(st);
+    }
     return r;
 }
 
@@ -10466,9 +10499,12 @@ static oc_dbres *process_list_threads(sqlite3 *db, const oc_job *j) {
         "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL) AS last_at, "
         "       (SELECT COUNT(*) FROM messages x "
         "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL) AS replies, "
+        /* A muted person's replies are no badge (REQ-284), as in the channel's
+         * unread; the same test in build_thread_one below. */
         "       (SELECT COUNT(*) FROM messages x "
         "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL "
         "           AND x.author_id <> ?1 "
+        "           AND NOT EXISTS(SELECT 1 FROM muted_users mu WHERE mu.user_id = ?1 AND mu.muted_id = x.author_id) "
         "           AND x.id > COALESCE((SELECT tr.last_read_reply_id FROM thread_reads tr "
         "                                 WHERE tr.user_id = ?1 AND tr.root_id = r.id), 0)) AS unread, "
         "       COALESCE((SELECT tf.state FROM thread_follows tf "
@@ -10516,6 +10552,7 @@ static void build_thread_one(sqlite3 *db, uint64_t uid, uint64_t root_id, oc_dbr
         "       (SELECT COUNT(*) FROM messages x "
         "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL "
         "           AND x.author_id <> ?1 "
+        "           AND NOT EXISTS(SELECT 1 FROM muted_users mu WHERE mu.user_id = ?1 AND mu.muted_id = x.author_id) "
         "           AND x.id > COALESCE((SELECT tr.last_read_reply_id FROM thread_reads tr "
         "                                 WHERE tr.user_id = ?1 AND tr.root_id = r.id), 0)), "
         "       COALESCE((SELECT tf.state FROM thread_follows tf "

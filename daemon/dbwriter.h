@@ -1355,6 +1355,13 @@ typedef struct oc_dbres {
     char           *emoji;          /* heap; REACTION_OK */
     uint8_t         react_op;
     uint64_t        react_count;
+    /* REACTION_OK: the members who have muted someone who reacted with this
+     * emoji (SET_USER_MUTE), each with how many of those reactions to leave out of
+     * the count they are sent, so a muted person's reactions are no part of
+     * a chip they see. Parallel heap arrays. */
+    uint64_t       *react_adj_user;
+    uint64_t       *react_adj_minus;
+    size_t          n_react_adj;
     oc_reaction_row *rlist;         /* heap array; REACTIONS */
     size_t           n_rlist;
 

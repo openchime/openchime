@@ -7079,7 +7079,36 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                                   r->react_op, r->react_count };
         oc_encode_reaction_updated(&w, OC_PROTOCOL_VERSION, &m);
         size_t len = w.len;
-        fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, len);
+        if (!r->n_react_adj) {
+            fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, len);
+            break;
+        }
+        /* Someone here has muted a reactor (SET_USER_MUTE): they are sent the count
+         * without that person's reactions, everyone else the count as it is. */
+        uint64_t *rest = malloc((r->n_members ? r->n_members : 1) * sizeof *rest);
+        size_t nrest = 0;
+        for (size_t i = 0; rest && i < r->n_members; i++) {
+            int adj = 0;
+            for (size_t k = 0; k < r->n_react_adj; k++)
+                if (r->react_adj_user[k] == r->members[i]) { adj = 1; break; }
+            if (!adj) rest[nrest++] = r->members[i];
+        }
+        fanout_members(ep, conns, rest ? rest : r->members, rest ? nrest : r->n_members, 0, g_enc, len);
+        free(rest);
+        for (size_t k = 0; k < r->n_react_adj; k++) {
+            int member = 0;
+            for (size_t i = 0; i < r->n_members; i++) if (r->members[i] == r->react_adj_user[k]) { member = 1; break; }
+            if (!member) continue;
+            oc_reaction_updated mk = m;
+            mk.count = r->react_count > r->react_adj_minus[k] ? r->react_count - r->react_adj_minus[k] : 0;
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            oc_encode_reaction_updated(&w, OC_PROTOCOL_VERSION, &mk);
+            for (conn *c = user_head(r->react_adj_user[k]), *next; c; c = next) {
+                next = c->u_next;
+                if (g_fan_only && !pdm_conn_bound(g_fan_only, c->conn_id)) continue;
+                send_bytes(ep, conns, c->fd, g_enc, w.len);
+            }
+        }
         break;
     }
     case OC_RES_REACTION_ERR: {

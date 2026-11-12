@@ -2158,13 +2158,17 @@ as they are signed in.
 or unmute one person, for me alone. Nothing a muted person writes notifies me —
 not a message, a reply, a reaction, a mention or a call, at any level, even when
 they are also one of my priority people (`oc_notify_decide`'s `muted_author`, which
-push and both clients ask alike) — and none of it counts as unread for me or
-appears in my activity. A direct message from them is still delivered. Muting
+push and both clients ask alike) — and none of it counts as unread for me, in a
+conversation or in a thread's count in `THREAD_LIST`, or appears in my activity.
+Their reactions are no part of the counts I am sent: a replay's reaction entries
+and `REACTION_UPDATED` give me each emoji's count without the people I have
+muted. A direct message from them is still delivered. Muting
 myself, nobody, the workspace's own sender or an id that is no one is ignored.
 The muted person is sent nothing and sees no change. **`MUTED_USERS` (S → C),
 `0x0131`** `{ count: u16, count × u64 }` — everyone I have muted, at most
 `OC_MAX_MUTED_USERS` (256): answering `SET_USER_MUTE`, to every connection of mine,
-and in the `LIST_NOTIFY_PREFS` answer. A client shows a muted person's messages
+and in the `LIST_NOTIFY_PREFS` answer. A client shows a muted person's messages,
+and their rows in a who-reacted list (`REACTIONS`, which still names them),
 folded to one line until revealed, one at a time, on that device alone.
 
 *Why separate frames.* `NOTIFY_PREFS` ends in a repeated list, so anything added

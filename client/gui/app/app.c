@@ -11664,6 +11664,26 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
  * (g_chips), so a chip here and a chip on the message run one rule. */
 static struct { rectf r; char emoji[40]; int count; uint8_t mine; } g_rxn_chip[24];
 static int g_n_rxn_chip;
+/* A muted person's reactions (SET_USER_MUTE): each row folded to "Reaction from a
+ * muted person" with its own Show, revealed one at a time and remembered for
+ * as long as the client runs. The Show buttons drawn this frame. */
+static struct { uint64_t mid, uid; char emoji[40]; } g_rx_shown[64];
+static int g_n_rx_shown;
+static struct { rectf r; uint64_t mid, uid; char emoji[40]; } g_rx_show_hits[16];
+static int g_n_rx_show_hits;
+static int rx_revealed(uint64_t mid, uint64_t uid, const char *emoji) {
+    for (int i = 0; i < g_n_rx_shown; i++)
+        if (g_rx_shown[i].mid == mid && g_rx_shown[i].uid == uid && !strcmp(g_rx_shown[i].emoji, emoji)) return 1;
+    return 0;
+}
+static void rx_reveal(int hit) {
+    if (hit < 0 || hit >= g_n_rx_show_hits) return;
+    int k = g_n_rx_shown < (int)(sizeof g_rx_shown / sizeof g_rx_shown[0]) ? g_n_rx_shown++
+                                                                          : (int)(sizeof g_rx_shown / sizeof g_rx_shown[0]) - 1;
+    g_rx_shown[k].mid = g_rx_show_hits[hit].mid;
+    g_rx_shown[k].uid = g_rx_show_hits[hit].uid;
+    snprintf(g_rx_shown[k].emoji, sizeof g_rx_shown[k].emoji, "%s", g_rx_show_hits[hit].emoji);
+}
 
 /* Who reacted (REQ-071) — a list of PEOPLE, so it belongs in the context pane
  * beside the conversation rather than replacing it. Above them, one chip per
@@ -11673,6 +11693,7 @@ static uint64_t msg_channel_of(uint64_t mid);   /* fwd */
 
 static void draw_reactors_list(gfx *rt, const oc_model *m, rectf reg) {
     g_n_rxn_chip = 0;
+    g_n_rx_show_hits = 0;
     /* The chips are the message's, as the client knows it now: the list below
      * is a snapshot the daemon sent, which a reaction made since -- this
      * client's own included -- does not update, while the message's own
@@ -11700,8 +11721,10 @@ static void draw_reactors_list(gfx *rt, const oc_model *m, rectf reg) {
                 count = (int)rmsg->reactions[i].count;
                 mine = reaction_is_mine(rmsg, e);
             } else {
+                /* A muted person's reactions are no part of the count, as the
+                 * daemon leaves them out of the message's own chips (SET_USER_MUTE). */
                 for (size_t j = 0; j < m->n_reactors; j++)
-                    if (!strcmp(m->reactors[j].emoji, e)) {
+                    if (!strcmp(m->reactors[j].emoji, e) && !oc_model_is_muted_user(m, m->reactors[j].user_id)) {
                         count++;
                         if (m->reactors[j].user_id == m->user_id) mine = 1;
                     }
@@ -11738,11 +11761,34 @@ static void draw_reactors_list(gfx *rt, const oc_model *m, rectf reg) {
     for (size_t i = 0; i < m->n_reactors && y < reg.bottom; i++) {
         const oc_reactor_row *rr = &m->reactors[i];
         draw_emoji_fmt(rt, rr->emoji, rf(reg.left + 14, y, reg.left + 38, y + ROW_H), g_emoji_s);
-        /* A person this reader muted reacts as no one in particular. */
-        int muted = oc_model_is_muted_user(m, rr->user_id);
-        const char *nm = muted ? "A muted person" : oc_model_user_name(m, rr->user_id);
+        /* A person this reader muted: folded, as their messages are, until
+         * this one reaction is shown (SET_USER_MUTE). */
+        int folded = oc_model_is_muted_user(m, rr->user_id) &&
+                     !rx_revealed(m->reactlist_message, rr->user_id, rr->emoji);
+        const char *nm = folded ? "Reaction from a muted person" : oc_model_user_name(m, rr->user_id);
+        float right = reg.right - 12;
+        if (folded) {
+            const char *sl = "Show";
+            float bw = text_width(sl, g_meta) + 16;
+            rectf b = rf(reg.right - 12 - bw, y + 4, reg.right - 12, y + ROW_H - 4);
+            int hot = in_rect(b, g_mouse_x, g_mouse_y);
+            fill_round(rt, b, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+            stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+            int oa = g_meta->align;
+            g_meta->align = ST_ALIGN_CENTER;
+            draw_text(rt, sl, g_meta, b, OC_COL_TEXT);
+            g_meta->align = oa;
+            if (g_n_rx_show_hits < (int)(sizeof g_rx_show_hits / sizeof g_rx_show_hits[0])) {
+                g_rx_show_hits[g_n_rx_show_hits].r = b;
+                g_rx_show_hits[g_n_rx_show_hits].mid = m->reactlist_message;
+                g_rx_show_hits[g_n_rx_show_hits].uid = rr->user_id;
+                snprintf(g_rx_show_hits[g_n_rx_show_hits].emoji, sizeof g_rx_show_hits[0].emoji, "%s", rr->emoji);
+                g_n_rx_show_hits++;
+            }
+            right = b.left - 8;
+        }
         draw_text(rt, (nm && nm[0]) ? nm : "user", g_ui,
-                  rf(reg.left + 44, y, reg.right - 12, y + ROW_H), muted ? OC_COL_FAINT : OC_COL_TEXT);
+                  rf(reg.left + 44, y, right, y + ROW_H), folded ? OC_COL_FAINT : OC_COL_TEXT);
         y += ROW_H;
     }
 }
@@ -26753,6 +26799,7 @@ enum {
     AT_SPOILER,       /* payload: index into g_splhits -- reveal or cover it */
     AT_MORE,          /* payload: index into g_morehits -- open that cut message */
     AT_THRDATE,       /* the thread pane's Jump to date */
+    AT_RXSHOW,        /* payload: index into g_rx_show_hits -- show that muted person's reaction */
     AT_JUMPCAL        /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the jump-to-date calendar */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
@@ -27417,6 +27464,14 @@ static void a11y_publish_scene(const oc_model *m) {
         snprintf(nm, sizeof nm, "%s %d, %s", g_rxn_chip[i].emoji, g_rxn_chip[i].count,
                  g_rxn_chip[i].mine ? "yours: press to take it back" : "press to react");
         acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_rxn_chip[i].r, ATOK(AT_REACTCHIP, (uint64_t)i));
+    }
+    /* A muted person's folded reactions there, each its own Show (SET_USER_MUTE). */
+    const oc_model *rxa = model();
+    for (int i = 0; rxa && rxa->reactlist_open && i < g_n_rx_show_hits && n < OC_ACC_MAX; i++) {
+        char aid[OC_ACC_AID_MAX];
+        snprintf(aid, sizeof aid, "reactors.show.%d", i);
+        acc_push(items, &n, OC_ACC_BUTTON, aid, "Show this reaction from a muted person",
+                 g_rx_show_hits[i].r, ATOK(AT_RXSHOW, (uint64_t)i));
     }
     /* Each poll's options (REQ-225), named by what they say, how many chose
      * them and whether you did; and its "See who voted". By identity -- the
@@ -32545,6 +32600,13 @@ static int on_click(oc_win *hwnd, int x, int y) {
             }
             return 1;
         }
+    }
+    /* A muted person's reaction in the who-reacted pane: Show, this one (SET_USER_MUTE). */
+    {
+        const oc_model *rxm = model();
+        if (rxm && rxm->reactlist_open && !modal_open())
+            for (int i = 0; i < g_n_rx_show_hits; i++)
+                if (in_rect(g_rx_show_hits[i].r, x, y)) { rx_reveal(i); invalidate(); return 1; }
     }
     /* The replies row under a thread's parent opens the thread (REQ-060).
      * Tested before the message rows, which cover the same pixels. */
@@ -42058,6 +42120,10 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
                 g_status_clear = (int)arg;
                 invalidate();
             }
+            break;
+        case AT_RXSHOW:
+            rx_reveal((int)arg);
+            invalidate();
             break;
         case AT_THRDATE: {
             const oc_model *tm = model();

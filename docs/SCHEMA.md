@@ -2011,8 +2011,10 @@ Whom each person has muted (`SET_USER_MUTE`, PROTOCOL.md): a set per person, as
 `priority_people` (0035) is, the other list about who. *Written* by the mute and
 unmute themselves, one person at a time. *Read* by the push audience query
 (`muted_author`, beside the conversation's mute), by the channel list's unread
-count and by the activity feed, which leave a muted author's messages, mentions,
-reactions and replies out, and by `LIST_NOTIFY_PREFS`, which sends the list as
+count, the thread list's unread count and the activity feed, which leave a muted
+author's messages, mentions, reactions and replies out, by the reaction counts a
+person is sent (a replay's and each reaction's fan-out), which leave out the
+reactions of the people they muted, and by `LIST_NOTIFY_PREFS`, which sends the list as
 `MUTED_USERS`. The muted person's own rows and counts are untouched.
 
 ## 3bq. Migration 0078 — snippets (REQ-226)

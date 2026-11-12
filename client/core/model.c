@@ -3056,9 +3056,11 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             notice_push(m, e);
             /* The Threads view's unread is server-supplied and refreshed only by
              * a list (REQ-062), so move it here too: the badge should follow the
-             * toast, not wait for the next LIST_THREADS. */
-            for (size_t i = 0; i < m->n_threads; i++)
-                if (m->threads[i].root_id == e->parent_id) { m->threads[i].unread++; break; }
+             * toast, not wait for the next LIST_THREADS. A muted person's reply
+             * is no badge, as the daemon's count leaves it out (REQ-284). */
+            if (!oc_model_is_muted_user(m, e->author_id))
+                for (size_t i = 0; i < m->n_threads; i++)
+                    if (m->threads[i].root_id == e->parent_id) { m->threads[i].unread++; break; }
         }
         if (m->thread_open && e->parent_id == m->thread_parent) {
             size_t before = m->n_thread_msgs;

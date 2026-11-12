@@ -839,6 +839,35 @@ static void build_roster_rows(rows_t *r, const oc_model *m, int width) {
 
 /* Build the rows for the "who reacted" overlay: each reactor as "<emoji> name",
  * grouped in the emoji-then-user order the server returns. */
+/* A muted person's reactions in the reactions list (SET_USER_MUTE): folded to
+ * "Reaction from a muted person", each shown on its own with the digit beside
+ * it, and remembered for as long as the client runs. */
+static struct { uint64_t mid, uid; char emoji[40]; } g_rxt_shown[64];
+static int g_n_rxt_shown;
+static int rxt_revealed(uint64_t mid, uint64_t uid, const char *emoji) {
+    for (int i = 0; i < g_n_rxt_shown; i++)
+        if (g_rxt_shown[i].mid == mid && g_rxt_shown[i].uid == uid && !strcmp(g_rxt_shown[i].emoji, emoji)) return 1;
+    return 0;
+}
+static int rxt_folded(const oc_model *m, const oc_reactor_row *rr) {
+    return oc_model_is_muted_user(m, rr->user_id) && !rxt_revealed(m->reactlist_message, rr->user_id, rr->emoji);
+}
+/* Show the `nth` folded reaction (1-based), as listed; 0 if there is none. */
+static int rxt_reveal_nth(const oc_model *m, int nth) {
+    int k = 0;
+    for (size_t i = 0; i < m->n_reactors; i++) {
+        const oc_reactor_row *rr = &m->reactors[i];
+        if (!rxt_folded(m, rr) || ++k != nth) continue;
+        int at = g_n_rxt_shown < (int)(sizeof g_rxt_shown / sizeof g_rxt_shown[0]) ? g_n_rxt_shown++
+                                                                                  : (int)(sizeof g_rxt_shown / sizeof g_rxt_shown[0]) - 1;
+        g_rxt_shown[at].mid = m->reactlist_message;
+        g_rxt_shown[at].uid = rr->user_id;
+        snprintf(g_rxt_shown[at].emoji, sizeof g_rxt_shown[at].emoji, "%s", rr->emoji);
+        return 1;
+    }
+    return 0;
+}
+
 static void build_reactlist_rows(rows_t *r, const oc_model *m, int width) {
     (void)width;
     char line[160];
@@ -846,14 +875,23 @@ static void build_reactlist_rows(rows_t *r, const oc_model *m, int width) {
              m->n_reactors == 1 ? "" : "s");
     char *h = malloc(strlen(line) + 1);
     if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+    int folded = 0;
     for (size_t i = 0; i < m->n_reactors; i++) {
         const oc_reactor_row *rr = &m->reactors[i];
-        const char *nm = oc_model_user_name(m, rr->user_id);
-        if (nm[0]) snprintf(line, sizeof line, "%s  %s", rr->emoji, nm);
-        else       snprintf(line, sizeof line, "%s  user%llu", rr->emoji,
-                            (unsigned long long)rr->user_id);
+        uintattr_t fg = TB_DEFAULT;
+        if (rxt_folded(m, rr)) {
+            /* The digit shows this one, with the message box empty. */
+            if (++folded <= 9) snprintf(line, sizeof line, "%s  Reaction from a muted person (%d to show)", rr->emoji, folded);
+            else               snprintf(line, sizeof line, "%s  Reaction from a muted person", rr->emoji);
+            fg = TB_BLACK | TB_BOLD;              /* as a muted person's message folds */
+        } else {
+            const char *nm = oc_model_user_name(m, rr->user_id);
+            if (nm[0]) snprintf(line, sizeof line, "%s  %s", rr->emoji, nm);
+            else       snprintf(line, sizeof line, "%s  user%llu", rr->emoji,
+                                (unsigned long long)rr->user_id);
+        }
         char *rw = malloc(strlen(line) + 1);
-        if (rw) { strcpy(rw, line); rows_push(r, rw, TB_DEFAULT); }
+        if (rw) { strcpy(rw, line); rows_push(r, rw, fg); }
     }
 }
 
@@ -4031,6 +4069,14 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* In the reactions list, with the message box empty, a digit shows that
+         * folded reaction from a muted person, the one numbered so (SET_USER_MUTE). */
+        {
+            const oc_model *rxm = oc_client_model(cl);
+            if (rxm->reactlist_open && clen == 0 && !prompt_kind && !action_open && !launcher_open &&
+                !picker_open && !help_open && ev.ch >= '1' && ev.ch <= '9' && rxt_reveal_nth(rxm, (int)(ev.ch - '0')))
+                continue;
+        }
         /* Ctrl+O on open results: the next order, and the search again in it --
          * a page in one order is no cursor in another. */
         if (ev.key == TB_KEY_CTRL_O && oc_client_model(cl)->search_open && !prompt_kind) {
