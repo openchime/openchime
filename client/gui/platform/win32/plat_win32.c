@@ -842,6 +842,9 @@ static uint8_t *clip_image(size_t *len, char ext[8], int with_text) {
 uint8_t *oc_plat_clipboard_image(size_t *len, char ext[8])   { return clip_image(len, ext, 0); }
 uint8_t *oc_plat_clipboard_picture(size_t *len, char ext[8]) { return clip_image(len, ext, 1); }
 
+/* SDL's clipboard is Windows' own. */
+void oc_plat_clipboard_set_text(const char *utf8) { SDL_SetClipboardText(utf8 ? utf8 : ""); }
+
 /* "HTML Format" is UTF-8 behind a header of offsets ("StartHTML:0000000105");
  * the document runs from StartHTML to EndHTML. An offset of -1, or none, is
  * read as the whole of what follows the header. */

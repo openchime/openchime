@@ -46,7 +46,7 @@ over it unchanged.
 **The application in a browser.** `make build/web/openchime.js` compiles the application
 layer -- `client/gui/app/`, the same sources the Windows build compiles --
 over the browser's platform directory (`client/gui/platform/web/`). The
-window, its events, timers, cursors and clipboard text are SDL3 on both; what
+window, its events, timers and cursors are SDL3 on both; what
 only a platform can do is the contract in `client/gui/platform/platform.h`,
 and the browser's implementation (`plat_web.c`) answers "not available" for
 what a page cannot do (a tray, a crash dump, a second process to hand a URL
@@ -78,8 +78,17 @@ focuses the page and hands the notification's URL to the application as a
 second launch would; the file picker is an `<input type=file>` whose files
 are copied onto the page's filesystem and answered as paths; a download is
 written to the page's filesystem and then downloaded by the browser
-(`oc_plat_file_saved`); a dropped file arrives through SDL's drop event; an
-image on the clipboard comes through the async clipboard API; the badge is
+(`oc_plat_file_saved`); a dropped file arrives through SDL's drop event. The
+clipboard is the browser's, which SDL's driver does not reach: Ctrl+V is kept
+from SDL, which would cancel it, so the browser pastes, and its `paste` event
+carries the text, HTML and any picture with no permission asked; the text goes
+on SDL's clipboard and the application gets the Ctrl+V it would have had, so
+the paste takes the same path as on Windows. A copy goes to the browser's
+clipboard through `navigator.clipboard.writeText`
+(`oc_plat_clipboard_set_text`), and an image the client asks for outside a
+paste through the async clipboard API. The context menu is the client's
+own: once it runs, the page cancels the browser's menu, so a right-click or the
+menu key opens only the client's. The badge is
 the tab's title; a permalink reaches the running client through the page's
 `?open=` query. Accessibility is an ARIA mirror (`a11y_web.c`): the tree the
 application publishes becomes a hidden layer of elements over the canvas,
@@ -233,7 +242,8 @@ desktop IME. `scripts/test/full/web.sh` plays a Japanese composition into it.
 Rough edges: fonts are the browser's, so layouts are near-identical to
 Windows, not pixel-identical, and the harness compares state, not pixels. The picker and the clipboard need a
 user gesture, as the browser requires, so the harness drives uploads through
-the composer's file tray and the test hook instead; a crash leaves nothing but the console.
+the composer's file tray and the test hook instead, and sets and reads the
+browser's clipboard from the driver (`sysclip`, `syspaste`, `sysclipread`, TESTING.md); a crash leaves nothing but the console.
 
 What a page cannot have, and the application lives without: a tray, the
 taskbar's flash and progress, the platform's certificate viewer, autostart,

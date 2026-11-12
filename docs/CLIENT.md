@@ -949,7 +949,11 @@ the harness's screenshot sees it, and the web client draws it the same way.
   `transcript_shell()`, which only says whether the middle column is the
   conversation shell.
 - `main_is_conversation()` -- whether the middle column is something you can type
-  into. The DMs view has a sidebar but shows an index until you pick someone.
+  into. The DMs view has a sidebar but shows an index until you pick someone;
+  the index has a header of its own ("Direct messages", Back and Forward, New
+  message, which opens the New message pane as the sidebar's compose button
+  does), so a banner -- the demo notice, a lost connection -- sits under a
+  header there as it does over a conversation, never under an empty strip.
 - `window_is_covered()` -- whether a modal, the palette, the lightbox, a menu or
   the sign-in card owns the whole window.
 

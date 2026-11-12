@@ -12,7 +12,9 @@
  *   files           <input type=file> -> the page's filesystem -> a path
  *   saving          a path on the page's filesystem; when the application has
  *                   written it, the browser downloads it (oc_plat_file_saved)
- *   clipboard       navigator.clipboard.read() for an image
+ *   clipboard       the browser's paste event for what is pasted (Ctrl+V kept
+ *                   from SDL so the browser pastes), writeText for a copy, and
+ *                   navigator.clipboard.read() for an image otherwise
  *   the badge       the tab's title
  *   notifications   client/shared/osnotify_web.c
  *   credentials     localStorage (client/gui/platform/web/secret_mem.c)
@@ -230,7 +232,105 @@ void  oc_plat_window_attach(SDL_Window *w) {
         if (canvas) { canvas.addEventListener("pointerdown", grab); canvas.addEventListener("focus", grab); }
         window.addEventListener("focus", grab);
         grab();
+        /* The context menu is the application's: it opens its own from the
+         * right button and the menu key, and the browser would open its
+         * menu for the canvas (or the input above) on top of it. Only the
+         * browser's default is cancelled; the event still propagates, and the
+         * button reaches SDL through its own mouse events, untouched. */
+        document.addEventListener("contextmenu", (ev) => { ev.preventDefault(); });
+        /* Paste is the browser's: SDL cancels every key held with Ctrl, which
+         * would cancel the paste with it, so Ctrl+V (Cmd+V) is kept from SDL
+         * here, ahead of its listeners, and its default left alone. The
+         * browser then fires `paste`, which carries what was copied with no
+         * permission to ask for, and the application is handed it with the
+         * key it would have seen (oc_web_paste). */
+        window.addEventListener("keydown", (ev) => {
+            if ((ev.ctrlKey || ev.metaKey) && !ev.altKey && (ev.key === "v" || ev.key === "V")) {
+                ev.stopImmediatePropagation();
+                if (document.activeElement !== ime) { try { ime.focus({ preventScroll: true }); } catch (e) {} }
+            }
+        }, true);
+        document.addEventListener("paste", (ev) => {
+            const cd = ev.clipboardData;
+            if (!cd) return;
+            ev.preventDefault();
+            const text = cd.getData("text/plain") || "";
+            const html = cd.getData("text/html") || "";
+            let img = null;
+            for (const f of Array.from(cd.files || []))
+                if (f.type === "image/png" || f.type === "image/gif") { img = f; break; }
+            const hand = (bytes, ext) => {
+                let p = 0, n = 0;
+                if (bytes && bytes.length) { n = bytes.length; p = _malloc(n); HEAPU8.set(bytes, p); }
+                Module.ccall("oc_web_paste", null, ["string", "string", "number", "number", "string"],
+                             [text, html, p, n, ext || ""]);
+            };
+            if (!img) { hand(null, ""); return; }
+            img.arrayBuffer().then((b) => hand(new Uint8Array(b), img.type === "image/gif" ? "gif" : "png"),
+                                   () => hand(null, ""));
+        });
     });
+}
+
+/* ---- what a paste carried --------------------------------------------------
+ * The browser hands over a paste's contents in its event and nowhere else
+ * without asking: SDL's clipboard on a page is the page's own. The text goes
+ * onto SDL's clipboard, where the application's paste reads it; the HTML and a
+ * picture are kept here for oc_plat_clipboard_html / _image / _picture, until
+ * the next paste or the application copies something itself. Then the key the
+ * application would have had: Ctrl+V, into whatever has the keyboard. */
+static char    *g_paste_html;
+static uint8_t *g_paste_img;
+static size_t   g_paste_img_len;
+static char     g_paste_img_ext[8];
+static int      g_paste_held;           /* the above answer for the clipboard */
+
+static void paste_forget(void) {
+    free(g_paste_html); g_paste_html = NULL;
+    free(g_paste_img);  g_paste_img = NULL; g_paste_img_len = 0; g_paste_img_ext[0] = 0;
+    g_paste_held = 0;
+}
+
+static void push_key(int down) {
+    SDL_Event e;
+    memset(&e, 0, sizeof e);
+    e.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+    e.common.timestamp = SDL_GetTicksNS();
+    e.key.windowID = g_ime_win ? SDL_GetWindowID(g_ime_win) : 0;
+    e.key.scancode = SDL_SCANCODE_V;
+    e.key.key = SDLK_V;
+    e.key.mod = SDL_KMOD_LCTRL;
+    e.key.down = down;
+    SDL_PushEvent(&e);
+}
+
+EMSCRIPTEN_KEEPALIVE void oc_web_paste(const char *text, const char *html, uint8_t *img, int img_len, const char *ext) {
+    paste_forget();
+    if (text && text[0]) SDL_SetClipboardText(text);
+    else                 SDL_ClearClipboardData();
+    if (html && html[0]) g_paste_html = strdup(html);
+    if (img && img_len > 0) {
+        g_paste_img = img; g_paste_img_len = (size_t)img_len;
+        snprintf(g_paste_img_ext, sizeof g_paste_img_ext, "%s", ext && ext[0] ? ext : "png");
+    } else free(img);
+    g_paste_held = 1;
+    push_key(1);
+    push_key(0);
+}
+
+/* The application's own copy: SDL's clipboard, as the application reads it
+ * back, and the browser's, so it can be pasted anywhere. The browser takes it
+ * while the key or click that asked is recent, which it is: the application
+ * handles input on the next frame. */
+void oc_plat_clipboard_set_text(const char *utf8) {
+    paste_forget();
+    SDL_SetClipboardText(utf8 ? utf8 : "");
+    EM_ASM({
+        try {
+            if (navigator.clipboard && navigator.clipboard.writeText)
+                navigator.clipboard.writeText(UTF8ToString($0)).catch(() => {});
+        } catch (e) {}
+    }, utf8 ? utf8 : "");
 }
 
 void  oc_plat_text_input_area(SDL_Window *w, const SDL_Rect *r) {
@@ -416,7 +516,22 @@ EM_ASYNC_JS(uint8_t *, web_clipboard_image, (int *len, char *ext, int with_text)
     } catch (e) { return 0; }
 });
 
+/* A paste's own picture, copied: the paste may be asked for it more than once
+ * (the chooser offers it as an image after the text). `with_text` 0 is the
+ * plain image paste, which a paste carrying words does not make. */
+static uint8_t *paste_image(size_t *len, char ext[8], int with_text) {
+    *len = 0; ext[0] = 0;
+    if (!g_paste_img || (!with_text && SDL_HasClipboardText())) return NULL;
+    uint8_t *d = malloc(g_paste_img_len);
+    if (!d) return NULL;
+    memcpy(d, g_paste_img, g_paste_img_len);
+    *len = g_paste_img_len;
+    snprintf(ext, 8, "%s", g_paste_img_ext);
+    return d;
+}
+
 uint8_t *oc_plat_clipboard_image(size_t *len, char ext[8]) {
+    if (g_paste_held) return paste_image(len, ext, 0);
     int n = 0; ext[0] = 0;
     uint8_t *d = web_clipboard_image(&n, ext, 0);
     *len = d ? (size_t)n : 0;
@@ -424,6 +539,7 @@ uint8_t *oc_plat_clipboard_image(size_t *len, char ext[8]) {
 }
 
 uint8_t *oc_plat_clipboard_picture(size_t *len, char ext[8]) {
+    if (g_paste_held) return paste_image(len, ext, 1);
     int n = 0; ext[0] = 0;
     uint8_t *d = web_clipboard_image(&n, ext, 1);
     *len = d ? (size_t)n : 0;
@@ -444,7 +560,10 @@ EM_ASYNC_JS(char *, web_clipboard_html, (void), {
     } catch (e) { return 0; }
 });
 
-char *oc_plat_clipboard_html(void) { return web_clipboard_html(); }
+char *oc_plat_clipboard_html(void) {
+    if (g_paste_held) return g_paste_html ? strdup(g_paste_html) : NULL;
+    return web_clipboard_html();
+}
 
 /* ---- images ---------------------------------------------------------------- */
 

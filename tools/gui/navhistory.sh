@@ -12,7 +12,10 @@
 #   - Alt+Left returns to the first at that same message, and Alt+Right goes
 #     forward to the second;
 #   - the header's Back button does what Alt+Left does;
-#   - going somewhere new after going back drops the forward entry.
+#   - going somewhere new after going back drops the forward entry;
+#   - the DMs view's person list has a header of its own ("Direct messages",
+#     Back, New message), a banner sits directly under it, and opening a
+#     conversation shows that conversation's header instead.
 #
 # Its own daemon on its own port.
 set -uo pipefail
@@ -94,6 +97,43 @@ say "== somewhere new drops what was forward"
 check "third is the newest place" waitfor 10 at $((POS0 + 1)) "$C"
 nofwd() { snap; [ "$(hist fwd)" = 0 ] && [ "$(hist n)" = $((POS0 + 2)) ]; }
 check "...and there is nothing forward" waitfor 5 nofwd
+
+say "== the DMs person list has a header of its own"
+# The header line and the banner's rectangle, from the dump.
+hdr_line() { grep -m1 '^header ' "$D"; }
+hdr_r()    { hdr_line | grep -o ' r=[0-9,.-]*' | cut -d= -f2; }
+hdr_new()  { hdr_line | grep -o ' new=[0-9,.-]*' | cut -d= -f2; }
+ban_r()    { grep -m1 '^banner ' "$D" | grep -o ' r=[0-9,.-]*' | cut -d= -f2; }
+"$DRIVE" view dms >/dev/null
+"$DRIVE" dmcompose 0 >/dev/null
+dms_header() { snap; hdr_line | grep -q '^header title="Direct messages" .* dm_index=1 '; }
+check "the DMs list is headed 'Direct messages'" waitfor 10 dms_header
+can_back() { snap; [ "$(hist back)" = 1 ]; }
+check "...with Back to go where you were" waitfor 5 can_back
+"$DRIVE" banner demo >/dev/null
+under() {
+  snap
+  local hb bt
+  hb="$(hdr_r | cut -d, -f4)"; bt="$(ban_r | cut -d, -f2)"
+  [ -n "$hb" ] && [ -n "$bt" ] && [ "$hb" -gt 0 ] && [ "$bt" = "$hb" ]
+}
+check "a banner sits directly under that header, nothing blank above it" waitfor 10 under
+"$DRIVE" shot navhist_dms_banner >/dev/null
+"$DRIVE" banner off >/dev/null
+IFS=, read -r nl nt nr nb <<< "$(hdr_new)"
+"$DRIVE" click $(( (nl + nr) / 2 )) $(( (nt + nb) / 2 )) >/dev/null
+# New message, as the sidebar's compose button does: the New message pane (view 6).
+newmsg() { snap; grep -m1 '^view=' "$D" | grep -q '^view=6 '; }
+check "its New message opens the New message pane" waitfor 10 newmsg
+"$DRIVE" view dms >/dev/null
+"$DRIVE" groupdm bob,carol >/dev/null
+# A group DM has no name: it is the conversation newer than every channel made here.
+newest_id() { grep '^  ch [0-9]' "$D" | awk '{print $2}' | sort -n | tail -1; }
+made_dm() { snap; [ "$(newest_id)" -gt "$C" ] 2>/dev/null; }
+check "the group DM exists" waitfor 15 made_dm
+"$DRIVE" channel "$(newest_id)" >/dev/null
+in_dm() { snap; hdr_line | grep -q ' dm_index=0 ' && ! hdr_line | grep -q 'title="Direct messages"'; }
+check "opening a conversation shows its own header instead" waitfor 15 in_dm
 rm -f "$D"
 
 say ""

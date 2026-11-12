@@ -9,6 +9,8 @@
 #   tools/web/drive.sh launch [ws] [user:pass]   # the daemon, then a page signed in as alice
 #   tools/web/drive.sh devaddr                   # the workspace `launch` defaults to
 #   tools/web/drive.sh <cmd...>                  # one verb, wait for its ack
+#   tools/web/drive.sh sysclip text <w>|png <p>  # the browser's clipboard, as another program sets it
+#   tools/web/drive.sh syspaste | sysclipread    # the keyboard's Ctrl+V; what the clipboard holds
 #   tools/web/drive.sh shot <name> | dump <name> # into $GUI_DRIVE_OUT / to stdout
 #   tools/web/drive.sh kill                      # every driver for this client, and its browser
 #   tools/web/drive.sh held                      # 1 and the pids if a driver still serves it
@@ -157,12 +159,17 @@ cmd="$*"
 rm -f "$DIR/ack"
 printf '%s' "$cmd" > "$DIR/cmd.tmp"
 mv "$DIR/cmd.tmp" "$DIR/cmd"
-t=0
-while [ ! -f "$DIR/ack" ] && [ "$t" -lt 800 ]; do sleep 0.02; t=$((t + 1)); done
+# 16 s for a verb; a file carried onto the page first (attach, upload,
+# emoji_add) gets 5 minutes, since the copy takes as long as the file is large
+# -- a 120 MB one well over 16 s -- and a verb given up on while the driver is
+# still copying is overwritten by the next, which is then all the client sees.
+t=0; limit=800
+case "${1:-}" in attach|upload|emoji_add) limit=15000 ;; esac
+while [ ! -f "$DIR/ack" ] && [ "$t" -lt "$limit" ]; do sleep 0.02; t=$((t + 1)); done
 ack="$(cat "$DIR/ack" 2>/dev/null || echo TIMEOUT)"
 echo "ack: $ack"
 if [ "$ack" = TIMEOUT ]; then
-  echo "web_drive: no ack for '$1' after 16s: the client did not answer" >&2
+  echo "web_drive: no ack for '$1' after $((limit / 50))s: the client did not answer" >&2
   exit 1
 fi
 if { [ "$1" = "shot" ] || [ "$1" = "shotfull" ]; } && [ $# -eq 2 ]; then

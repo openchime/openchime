@@ -2606,6 +2606,8 @@ static uint32_t g_err_seq;
 static char g_err_seen[160];                 /* last `last_error` we turned into a toast */
 static rectf g_retry_btn;              /* banner action hit-box */
 static int  g_banner_on;                     /* banner drawn this frame (arms the hit-box) */
+static rectf g_banner_r;                     /* where it was drawn, for the test dump */
+static int  g_test_demo_banner;              /* test hook: the demo notice, without a demo daemon */
 static int  g_banner_action;           /* what the banner's button does (FBA_*) */
 /* The draft a Delete took away, so its toast's Undo can put it back. */
 static struct { uint64_t cid, root; char to[256]; char body[DRAFT_TEXT_MAX * 3]; int valid; } g_undo_draft;
@@ -2717,7 +2719,7 @@ static void toast_tick(const oc_model *m) {
         oc_fb_banner_clear(&g_fb, FBB_CONNECTION);
     }
     /* A public demo says so, all the time it is open (AUTH.md §8.12). */
-    if (m && m->authed && m->workspace_mode == OC_WS_MODE_DEMO)
+    if (m && m->authed && (m->workspace_mode == OC_WS_MODE_DEMO || g_test_demo_banner))
         oc_fb_banner_set(&g_fb, FBB_DEMO, OC_FB_INFO,
                          "This is a public demo: everyone here can read what you post, and it is all erased every night.",
                          NULL, 0);
@@ -10895,9 +10897,17 @@ static int g_n_rxn_chip;
  * beside the conversation rather than replacing it. Above them, one chip per
  * distinct emoji with its count: the same chip the message carries, so it can be
  * clicked to add yours or take it back without going back to the message. */
+static uint64_t msg_channel_of(uint64_t mid);   /* fwd */
+
 static void draw_reactors_list(gfx *rt, const oc_model *m, rectf reg) {
     g_n_rxn_chip = 0;
-    if (m->n_reactors == 0) {
+    /* The chips are the message's, as the client knows it now: the list below
+     * is a snapshot the daemon sent, which a reaction made since -- this
+     * client's own included -- does not update, while the message's own
+     * reactions follow every reaction event. The people come from the list. */
+    const oc_msg *rmsg = find_msg(oc_model_channel((oc_model *)m, msg_channel_of(m->reactlist_message)),
+                                  m->reactlist_message);
+    if (m->n_reactors == 0 && !(rmsg && rmsg->n_reactions)) {
         draw_text(rt, "No reactions.", g_meta,
                   rf(reg.left + 16, reg.top + 8, reg.right - 12, reg.top + 30), OC_COL_FAINT);
         return;
@@ -10907,17 +10917,24 @@ static void draw_reactors_list(gfx *rt, const oc_model *m, rectf reg) {
         /* Distinct emoji, in the order they first appear, with how many reacted
          * and whether you are one of them. */
         float cx = reg.left + 14, ch = 24, top = y;
-        for (size_t i = 0; i < m->n_reactors; i++) {
-            const char *e = m->reactors[i].emoji;
+        size_t nsrc = rmsg ? (size_t)rmsg->n_reactions : m->n_reactors;
+        for (size_t i = 0; i < nsrc; i++) {
+            const char *e = rmsg ? rmsg->reactions[i].emoji : m->reactors[i].emoji;
             int seen = 0;
             for (int k = 0; k < g_n_rxn_chip; k++) if (!strcmp(g_rxn_chip[k].emoji, e)) seen = 1;
             if (seen || g_n_rxn_chip >= (int)(sizeof g_rxn_chip / sizeof g_rxn_chip[0])) continue;
             int count = 0, mine = 0;
-            for (size_t j = 0; j < m->n_reactors; j++)
-                if (!strcmp(m->reactors[j].emoji, e)) {
-                    count++;
-                    if (m->reactors[j].user_id == m->user_id) mine = 1;
-                }
+            if (rmsg) {
+                count = (int)rmsg->reactions[i].count;
+                mine = reaction_is_mine(rmsg, e);
+            } else {
+                for (size_t j = 0; j < m->n_reactors; j++)
+                    if (!strcmp(m->reactors[j].emoji, e)) {
+                        count++;
+                        if (m->reactors[j].user_id == m->user_id) mine = 1;
+                    }
+            }
+            if (count <= 0) continue;
             char cnt[16];
             snprintf(cnt, sizeof cnt, "%d", count);
             float cw = 34 + text_width(cnt, g_meta);
@@ -11147,9 +11164,47 @@ static void draw_transcript(gfx *rt, const oc_model *m, rectf reg) {
 
 /* ---- header + composer --------------------------------------------------- */
 
+static int dm_index_view(void);   /* fwd */
+static rectf g_dms_new_btn;       /* the DMs list's header: New message */
+static char  g_hdr_title[160];    /* the header as last drawn, for the test dump */
+static rectf g_hdr_r;
+
+/* Back and forward, ahead of a header's title, as a browser's: dimmed while
+ * there is nowhere to go. Returns where the title starts. */
+static float hdr_hist_buttons(gfx *rt, float x0) {
+    float bs = UIS(26), by = (HEADER_H - bs) / 2, bx = x0 + UIS(10);
+    g_hist_back_btn = rf(bx, by, bx + bs, by + bs);
+    g_hist_fwd_btn  = rf(bx + bs + UIS(2), by, bx + 2 * bs + UIS(2), by + bs);
+    for (int k = 0; k < 2; k++) {
+        rectf b = k ? g_hist_fwd_btn : g_hist_back_btn;
+        int can = hist_can(k ? 1 : -1);
+        if (can && in_rect(b, g_mouse_x, g_mouse_y)) fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
+        const char *ar = k ? "\u2192" : "\u2190";
+        float aw = text_width(ar, g_ui), ax = (b.left + b.right - aw) / 2;
+        draw_text(rt, ar, g_ui, rf(ax, b.top, b.right, b.bottom), can ? OC_COL_TEXT : OC_COL_FAINT);
+    }
+    return g_hist_fwd_btn.right + UIS(10);
+}
+
+/* The DMs view's person list has a header of its own -- with none, a banner
+ * sat under an empty strip: its title, back and forward, and New message. None of a conversation's controls, so their hit-boxes go. */
+static void draw_dms_header(gfx *rt, float x0, float w) {
+    g_addppl_btn = g_call_hdr_btn = g_listen_btn = g_members_btn = g_memchip =
+        g_sum_hdr_btn = g_unread_jump = rf(0, 0, 0, 0);
+    float tx = hdr_hist_buttons(rt, x0);
+    float bh = UIS(30), by = (HEADER_H - bh) / 2, right = x0 + w - UIS(16);
+    g_dms_new_btn = rf(right - call_button_w("New message", OC_ICON_SQUARE_PEN), by, right, by + bh);
+    call_button(rt, g_dms_new_btn, OC_ICON_SQUARE_PEN, "New message", 0, 0);
+    draw_text(rt, "Direct messages", g_title, rf(tx, 0, g_dms_new_btn.left - UIS(12), HEADER_H), OC_COL_TEXT);
+    snprintf(g_hdr_title, sizeof g_hdr_title, "Direct messages");
+}
+
 static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
     fill(rt, rf(x0, 0, x0 + w, HEADER_H), OC_COL_HEADER);
     fill(rt, rf(x0, HEADER_H - 1, x0 + w, HEADER_H), OC_COL_BORDER);
+    g_dms_new_btn = rf(0, 0, 0, 0);
+    g_hdr_r = rf(x0, 0, x0 + w, HEADER_H);
+    if (dm_index_view()) { draw_dms_header(rt, x0, w); return; }
     const oc_channel *c = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
     char title[160] = "OpenChime";
     if (c) channel_label(m, c, title, sizeof title);
@@ -11187,6 +11242,7 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         snprintf(t2, sizeof t2, "%s  \u00B7  archived", title);
         snprintf(title, sizeof title, "%s", t2);
     }
+    snprintf(g_hdr_title, sizeof g_hdr_title, "%s", title);
     /* MEASURE the right-hand cluster before drawing the title, and reserve what it
      * actually needs. A flat 240 was fine at 100% and at Largest text left the
      * title a rect narrower than one word — the header rendered as a bare "#",
@@ -11211,18 +11267,7 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
      * is nowhere to go. The title starts after them. */
     float tx = x0 + 20;
     if (c) {
-        float bs = UIS(26), by = (HEADER_H - bs) / 2, bx = x0 + UIS(10);
-        g_hist_back_btn = rf(bx, by, bx + bs, by + bs);
-        g_hist_fwd_btn  = rf(bx + bs + UIS(2), by, bx + 2 * bs + UIS(2), by + bs);
-        for (int k = 0; k < 2; k++) {
-            rectf b = k ? g_hist_fwd_btn : g_hist_back_btn;
-            int can = hist_can(k ? 1 : -1);
-            if (can && in_rect(b, g_mouse_x, g_mouse_y)) fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
-            const char *ar = k ? "\u2192" : "\u2190";
-            float aw = text_width(ar, g_ui), ax = (b.left + b.right - aw) / 2;
-            draw_text(rt, ar, g_ui, rf(ax, b.top, b.right, b.bottom), can ? OC_COL_TEXT : OC_COL_FAINT);
-        }
-        tx = g_hist_fwd_btn.right + UIS(10);
+        tx = hdr_hist_buttons(rt, x0);
     } else {
         g_hist_back_btn = g_hist_fwd_btn = rf(0, 0, 0, 0);
     }
@@ -11473,11 +11518,13 @@ static float draw_tabbar(gfx *rt, const oc_model *m, float x0, float w) {
 static float draw_banner(gfx *rt, const oc_model *m, float x0, float w, float top_off) {
     (void)m;
     g_banner_on = 0;
+    g_banner_r = rf(0, 0, 0, 0);
     const oc_fb_banner *b = oc_fb_banner_top(&g_fb);
     if (!b) return 0;
     uint32_t accent = b->severity == OC_FB_ERROR ? OC_COL_DANGER
                     : b->severity == OC_FB_WARN  ? OC_COL_AWAY : OC_COL_NOTICE;
     rectf r = rf(x0, HEADER_H + top_off, x0 + w, HEADER_H + top_off + BANNER_H);
+    g_banner_r = r;
     fill(rt, r, OC_COL_SIDEBAR);
     fill(rt, rf(x0, r.top, x0 + 3, r.bottom), accent);          /* status edge */
     fill(rt, rf(x0, r.bottom - 1, x0 + w, r.bottom), OC_COL_BORDER);
@@ -19341,7 +19388,7 @@ static int field_key(field *f, int key, int ctrl, int shift) {
         if (fld_has_sel(f) && !f->password) {
             int a = fld_lo(f), n = fld_hi(f) - a;
             char *s = malloc((size_t)n + 1);
-            if (s) { memcpy(s, f->buf + a, (size_t)n); s[n] = 0; SDL_SetClipboardText(s); free(s); }
+            if (s) { memcpy(s, f->buf + a, (size_t)n); s[n] = 0; oc_plat_clipboard_set_text(s); free(s); }
         }
         if (key == 'X' && fld_has_sel(f)) { fld_del_range(f, fld_lo(f), fld_hi(f)); fld_notify(f); }
         return 1;
@@ -21622,21 +21669,23 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
             default:           draw_sidebar(rt, m, H);       break;
         }
         int dm_index0 = dm_index_view();
-        if (!dm_index0) draw_header(rt, m, main_x, main_w);
+        /* A header in every state: the DMs person list draws its own. */
+        draw_header(rt, m, main_x, main_w);
         float th = dm_index0 ? 0 : draw_tabbar(rt, m, main_x, main_w);
         float bh = draw_banner(rt, m, main_x, main_w, th);  /* pushes the transcript down */
-        bh += draw_e2e_strip(rt, m, main_x, main_w, (dm_index0 ? 0 : HEADER_H) + th + bh);   /* and so does this */
+        bh += draw_e2e_strip(rt, m, main_x, main_w, HEADER_H + th + bh);   /* and so does this */
         g_toast_area_l = main_x; g_toast_area_r = main_x + main_w;
-        g_toast_area_t = (dm_index0 ? 0 : HEADER_H) + th + bh;
+        g_toast_area_t = HEADER_H + th + bh;
         {
             /* In the DMs view, the middle column is the PERSON list until a
              * conversation is picked — that is what makes it a destination
              * rather than Home with a section folded. */
             int dm_index = dm_index_view();
             if (dm_index) {
-                if (g_dm_compose) draw_dm_compose(rt, m, rf(main_x, 0, main_r, H - g_composer_h));
-                else overlay_empty(rt, rf(main_x, 0, main_r, H - g_composer_h),
-                                   "Pick a conversation, or start a new one.");
+                /* Under the header and any banner, as a conversation's transcript is. */
+                rectf below = rf(main_x, HEADER_H + th + bh, main_r, H - g_composer_h);
+                if (g_dm_compose) draw_dm_compose(rt, m, below);
+                else overlay_empty(rt, below, "Pick a conversation, or start a new one.");
             } else {
                 draw_transcript(rt, m, rf(main_x, HEADER_H + th + bh, main_r, H - g_composer_h));
             }
@@ -24584,6 +24633,13 @@ static int ed_key(oc_win *hwnd, int vk) {
         g_ed_caret = ctrl ? ed_canon(ed_word_right(g_ed_caret)) : ed_step(g_ed_caret, 1);
         moved = 1; break;
     case OCK_UP: case OCK_DOWN: {
+        /* With the completion popover open, Up and Down choose among its rows
+         * (wrapping), as Enter and Tab then take the chosen one. */
+        if (g_n_ac > 0) {
+            g_ac_sel = (g_ac_sel + (vk == OCK_DOWN ? 1 : g_n_ac - 1)) % g_n_ac;
+            invalidate();
+            return 1;
+        }
         /* Vertical movement goes through the LAYOUT, not the buffer: with wrapping,
          * "the line above" is a question only the sdltext layout can answer. */
         st_layout *tl = ed_layout(g_ed_box.right - g_ed_box.left);
@@ -26156,9 +26212,9 @@ static void ac_accept(void) {
     if (caret < 0) { ac_close(); return; }
 
     oc_wch repl[128];
-    int n = to_w(g_ac[g_ac_sel].repl, repl, 126);
+    int n = to_w(g_ac[g_ac_sel].repl, repl, 127);   /* the units, without the NUL */
     if (n <= 0) { ac_close(); return; }
-    repl[n - 1] = u' '; repl[n] = 0;             /* overwrite the NUL with a space */
+    repl[n] = u' '; repl[n + 1] = 0;             /* after the last unit: the space, then the NUL */
 
     ed_replace_range(ts, caret, repl);
     ac_close();
@@ -28501,7 +28557,7 @@ static char *g_clip_last;
 static void copy_to_clipboard(oc_win *hwnd, const char *utf8) {
     (void)hwnd;
     if (!utf8) return;
-    SDL_SetClipboardText(utf8);
+    oc_plat_clipboard_set_text(utf8);
     if (g_test_dir[0]) { free(g_clip_last); g_clip_last = strdup(utf8); }
 }
 
@@ -29998,7 +30054,11 @@ static int on_click(oc_win *hwnd, int x, int y) {
     if (g_n_ac > 0) {
         if (in_rect(g_ac_panel, x, y)) {
             for (int i = 0; i < g_n_ac; i++)
-                if (in_rect(g_ac_rows[i], x, y)) { g_ac_sel = i; ac_accept(); ed_focus(hwnd); break; }
+                if (in_rect(g_ac_rows[i], x, y)) {
+                    /* As Enter and Tab do: the draft changed, so it is saved and measured again. */
+                    g_ac_sel = i; ac_accept(); ed_focus(hwnd); ed_changed(hwnd);
+                    break;
+                }
             return 1;
         }
         ac_close();     /* a click anywhere else dismisses it, then falls through */
@@ -30383,6 +30443,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
         listen_set(hwnd, on ? 0 : 1);
         return 1;
     }
+    if (in_rect(g_dms_new_btn, x, y)) { open_new_message(hwnd); return 1; }
     if (in_rect(g_hist_back_btn, x, y)) { hist_go(-1); return 1; }
     if (in_rect(g_hist_fwd_btn, x, y))  { hist_go( 1); return 1; }
     /* Add people, beside the count: the pane, with the people picker. */
@@ -32298,7 +32359,7 @@ static void signin_open_url(const char *url) {
 static void signin_copy_link(void) {
     const oc_model *sm = g_si_client ? oc_client_model(g_si_client) : NULL;
     if (!sm || !sm->signin_url[0]) return;
-    SDL_SetClipboardText(sm->signin_url);
+    oc_plat_clipboard_set_text(sm->signin_url);
     g_si_copied_at = now_ms();
     invalidate();
 }
@@ -34744,6 +34805,12 @@ static void dump_tables_ui(FILE *f) {
     int nc = 0;
     for (int i = 0; i < g_ed_len; i++) if (ed_is_tab(g_ed[i])) nc++;
     /* The field's text as it reads: each card "[table]", never its pipes. */
+    /* The completion popover: its rows, the chosen one, and where each is, so a
+     * script can take one by Enter, Tab or a click and read what it inserts. */
+    fprintf(f, "ac n=%d sel=%d\n", g_n_ac, g_ac_sel);
+    for (int i = 0; i < g_n_ac; i++)
+        fprintf(f, "  acrow %d repl=\"%s\" r=%.0f,%.0f,%.0f,%.0f\n", i, g_ac[i].repl,
+                g_ac_rows[i].left, g_ac_rows[i].top, g_ac_rows[i].right, g_ac_rows[i].bottom);
     fprintf(f, "composer tables=%d text=", nc);
     {
         static char shown[ED_MAX * 3 + ED_TAB_SLOTS * 8 + 1];
@@ -35322,7 +35389,13 @@ static void test_dump(const char *path) {
                 g_fb.t[i].kind, g_fb.t[i].action, g_fb.t[i].text);
     {
         const oc_fb_banner *bn = oc_fb_banner_top(&g_fb);
-        if (bn) fprintf(f, "banner id=%d severity=%d \"%s\"\n", bn->id, bn->severity, bn->text);
+        if (bn) fprintf(f, "banner id=%d severity=%d \"%s\" r=%.0f,%.0f,%.0f,%.0f\n", bn->id, bn->severity,
+                        bn->text, g_banner_r.left, g_banner_r.top, g_banner_r.right, g_banner_r.bottom);
+        /* The main pane's header: what it is titled and where, and whether it
+         * is the DMs view's person list (dm_index), which has a header of its own. */
+        fprintf(f, "header title=\"%s\" r=%.0f,%.0f,%.0f,%.0f dm_index=%d new=%.0f,%.0f,%.0f,%.0f\n",
+                g_hdr_title, g_hdr_r.left, g_hdr_r.top, g_hdr_r.right, g_hdr_r.bottom, dm_index_view(),
+                g_dms_new_btn.left, g_dms_new_btn.top, g_dms_new_btn.right, g_dms_new_btn.bottom);
     }
     if (g_cmp_hint[0]) fprintf(f, "hint error=%d \"%s\"\n", g_cmp_hint_err, g_cmp_hint);
     /* A voice's audition (REQ-292): whether one is playing, and whether audio
@@ -37037,6 +37110,12 @@ static void test_poll(oc_win *hwnd) {
     } else if (!strcmp(verb, "emoji")) {
         picker_open(hwnd, (uint64_t)strtoull(arg, NULL, 10));
         test_ack("ok");
+    } else if (!strcmp(verb, "banner")) {
+        /* "demo|off": the public demo's notice, as a demo daemon's sign-in
+         * raises it, so a script can see where a banner sits in any view. */
+        g_test_demo_banner = !strcmp(arg, "demo");
+        invalidate();
+        test_ack(!strcmp(arg, "demo") || !strcmp(arg, "off") ? "ok" : "err");
     } else if (!strcmp(verb, "actab")) {
         ac_accept(); test_ack("ok");
     } else if (!strcmp(verb, "search")) {
@@ -37251,7 +37330,8 @@ static void test_poll(oc_win *hwnd) {
         test_unesc(arg, txt, sizeof txt);
         free(g_test_clip_html); g_test_clip_html = NULL;
         g_test_clip_pic = 0;
-        test_ack(SDL_SetClipboardText(txt) ? "ok" : "err");
+        oc_plat_clipboard_set_text(txt);
+        test_ack("ok");
     } else if (!strcmp(verb, "cliphtml")) {
         /* "<html>": what a sheet puts on the clipboard as HTML beside its
          * text, which Paste as Table reads its links and bold from. */
@@ -40079,6 +40159,10 @@ int main(int argc, char *argv[]) {
     SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "1");
     if (!SDL_Init(SDL_INIT_VIDEO)) return 1;
     oc_plat_after_sdl_init();
+    /* The quick reactions from the start, the default set until preferences
+     * say otherwise: an account that has never saved any would otherwise have
+     * none, and the hover strip and the menu's emoji row with them. */
+    quick_rebuild();
     g_app_evtype = SDL_RegisterEvents(1);
     /* Created hidden: when auto-connecting it is held back until the settings
      * bucket arrives so it opens where it was left rather than snapping there a

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Reacting from the who-reacted pane in the Win32 client (REQ-070/071).
+# Reacting from the who-reacted pane, in the Win32 client or the browser's
+# (OC_TEST_PLATFORM=web) (REQ-070/071).
 #
 #   tools/gui/reactions.sh          # run, and leave the pair running
 #   tools/gui/reactions.sh --down   # ... and take it down afterwards
@@ -52,6 +53,9 @@ rm -rf "$OC_TEST_DIR"
 "$PAIR" up || { say "pair did not come up"; exit 1; }
 # Wide enough for the context pane the who-reacted list lives in.
 "$PAIR" a size 1200 820 >/dev/null
+# At 96 dpi, so the window is that wide in layout too: a scaled Windows display
+# (144 dpi makes it 800) leaves no room for the pane, which then draws nothing.
+[ "$PLAT" = win32 ] && "$PAIR" a dpi 96 >/dev/null
 "$PAIR" a channel $CH >/dev/null
 "$PAIR" b channel $CH >/dev/null
 "$PAIR" a send "react to this" >/dev/null
@@ -103,16 +107,18 @@ snap
 BY="$(grep -m1 '^  msgrow ' "$D" | grep -o 'body=[0-9,]*' | cut -d, -f2)"
 "$PAIR" a move 600 "$BY" >/dev/null
 six() { [ "$(hrx n)" = 6 ]; }
-check "six quick reactions on the row under the pointer" waitfor 5 six
+# A fresh fixture: neither client has ever saved preferences, so this is the
+# default set the client builds at start, not one a saved setting supplied.
+check "six quick reactions on the row under the pointer, with no preferences ever saved" waitfor 5 six
 "$PAIR" a shot reactions_hoverstrip >/dev/null
 check "each is published to assistive technology" bash -c "grep -q '^a11yitem msg.react.0 ' $D"
 not_mine_yet() { [ "$(cell0_mine)" = 0 ]; }
 check "...and the first is not yours yet" not_mine_yet
-click_cell0
+check "the first one can be pressed" click_cell0
 "$PAIR" a move 600 "$BY" >/dev/null
 now_mine() { [ "$(cell0_mine)" = 1 ]; }
 check "pressing the first one reacts" waitfor 10 now_mine
-click_cell0
+check "...and pressed again" click_cell0
 "$PAIR" a move 600 "$BY" >/dev/null
 check "pressing it again takes it back" waitfor 10 not_mine_yet
 "$PAIR" a move 200 300 >/dev/null

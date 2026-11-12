@@ -172,7 +172,12 @@ void  oc_plat_sound(const char *name);
 /* Milliseconds since the last keyboard or pointer input anywhere; 0 if unknown. */
 uint32_t oc_plat_idle_ms(void);
 
-/* ---- the clipboard beyond text (text is SDL's) ---------------------------- */
+/* ---- the clipboard beyond reading text (that is SDL's) --------------------- */
+
+/* Put text on the clipboard, as Copy does. On a desktop SDL's clipboard is the
+ * system's; in a browser the page's is its own, so this also hands the text to
+ * the browser's. A paste is read with SDL_GetClipboardText on both. */
+void     oc_plat_clipboard_set_text(const char *utf8);
 
 /* Files on the clipboard: malloc'd, NUL-separated, double-NUL-terminated; NULL none. */
 char    *oc_plat_clipboard_files(void);
