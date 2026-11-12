@@ -4541,6 +4541,12 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 if (send_transfer_error(c, 0, OC_ERR_ATTACHMENT_TOO_LARGE) != 0) return -1;
                 continue;
             }
+            /* A snippet's text (REQ-226) is held to its own cap here, before a
+             * byte of it is sent; ATTACH_MEDIA_SET checks it again when marked. */
+            if (ub.media_kind == OC_MEDIA_SNIPPET && ub.total_size > OC_SNIPPET_MAX_SIZE) {
+                if (send_transfer_error(c, 0, OC_ERR_ATTACHMENT_TOO_LARGE) != 0) return -1;
+                continue;
+            }
             /* A demo's files are small and few (demolimits.h). */
             if (g_demo_limits && (ub.total_size > OC_DEMO_MAX_UPLOAD || !demo_ok(OC_DL_UPLOAD, c->user_id))) {
                 if (send_transfer_error(c, 0, OC_ERR_DEMO_LIMIT) != 0) return -1;

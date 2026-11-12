@@ -213,8 +213,10 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 38** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 44** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 44 appended `media_kind` to `UPLOAD_BEGIN`, so a snippet's text past its cap is
+> refused before it is sent (REQ-226). Version
 > 38 appended `remind_at_ms` to `SAVE_ITEM`, `SAVED_UPDATED` and `SAVED_MSG`, a
 > saved item's reminder, and added the activity kind for one that fired (REQ-283). Version
 > 37 appended `follow_threads` to each `NOTIFY_PREFS` entry (§5.12, REQ-282). Version
@@ -1684,9 +1686,11 @@ with `TRANSFER_CANCEL`. Chunk `data` is bounded so each frame stays
 **Upload (client → server bytes):**
 
 1. **`UPLOAD_BEGIN` (C → S), `0x0080`** `{ channel_id: u64, idempotency_token:
-   16B, filename: str, mime: str, total_size: u64 }` — the client declares an
-   upload targeting a channel/DM it can post to. The server authorizes
-   membership, checks `total_size <= MAX_ATTACHMENT_SIZE`, allocates an
+   16B, filename: str, mime: str, total_size: u64, media_kind: u8 }` — the client
+   declares an upload targeting a channel/DM it can post to. `media_kind` is 2 for
+   a snippet's text (§5.14b) and 0 otherwise (protocol 44). The server authorizes
+   membership, checks `total_size <= MAX_ATTACHMENT_SIZE` (and, for a snippet,
+   at most 1 MiB), allocates an
    `attachment_id` + opaque storage key, and opens a streaming write to object
    storage. **Idempotent on `(channel_id, uploader, idempotency_token)`** — as `SEND` is,
    but keyed on the uploader too, so one member is never handed another's row: a
@@ -1798,8 +1802,9 @@ first page of a search with words and no filters, newest first, under the same
 read gate, their excerpt "Snippet: <title>". Deleting the message, or the
 storage sweep reclaiming the bytes, takes the snippet out of search.
 
-The size cap is enforced at `ATTACH_MEDIA_SET`, when the daemon learns the
-upload is a snippet; `UPLOAD_BEGIN` carries no kind. Clients refuse a longer
+The size cap is enforced at `UPLOAD_BEGIN`, whose `media_kind` says the upload
+is a snippet, before any of its bytes are sent (`ATTACHMENT_TOO_LARGE`), and again
+at `ATTACH_MEDIA_SET` when it is marked. Clients refuse a longer
 text before uploading it, and offer a paste of more than 40 lines or 4 KiB as
 one.
 

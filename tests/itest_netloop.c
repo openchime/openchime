@@ -1647,7 +1647,7 @@ static void test_upload_abandoned(int port, const uint8_t *pin) {
 
         oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
         oc_upload_begin ub = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("gone.bin"),
-                               oc_slice_str("application/octet-stream"), total };
+                               oc_slice_str("application/octet-stream"), total, 0 };
         memcpy(ub.idem, idem, OC_IDEM_SIZE);
         CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) == OC_OK);
         CHECK(send_frame(&a, fbuf, w.len) == 0);
@@ -1690,7 +1690,7 @@ static void test_upload_abandoned(int port, const uint8_t *pin) {
         uint8_t idem2[OC_IDEM_SIZE]; memset(idem2, 0xD9, sizeof idem2);
         oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
         oc_upload_begin ub2 = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("after.bin"),
-                                oc_slice_str("application/octet-stream"), small };
+                                oc_slice_str("application/octet-stream"), small, 0 };
         memcpy(ub2.idem, idem2, OC_IDEM_SIZE);
         CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub2) == OC_OK);
         CHECK(send_frame(&b, fbuf, w.len) == 0);
@@ -1722,6 +1722,32 @@ static void test_upload_abandoned(int port, const uint8_t *pin) {
  * upload's -- and the second upload streams, finishes and downloads under its
  * own attachment: its name, its size. Taken for the second's, the upload would
  * be streaming into the first's row, promised 1000 bytes, and 3000 are refused. */
+/* A snippet's text (REQ-226) is held to its cap at UPLOAD_BEGIN, before a byte
+ * of it is sent: one byte over is refused there, while the same size declared
+ * as an ordinary file is taken (protocol 44's `media_kind`). */
+static void test_snippet_upload_cap(int port, const uint8_t *pin) {
+    client a;
+    uint64_t ua = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    uint8_t buf[512]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+    oc_upload_begin big = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("big.txt"), oc_slice_str("text/plain"),
+                            OC_SNIPPET_MAX_SIZE + 1, OC_MEDIA_SNIPPET };
+    memset(big.idem, 0x5C, OC_IDEM_SIZE);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &big) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+    oc_error e;
+    CHECK(oc_decode_error(&p, &e) == OC_OK && e.code == OC_ERR_ATTACHMENT_TOO_LARGE && e.fatal == 0);
+    /* The same size as a file is an ordinary upload. */
+    oc_upload_begin file = big;
+    file.media_kind = 0;
+    memset(file.idem, 0x5D, OC_IDEM_SIZE);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &file) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_READY);
+    client_close(&a);
+}
+
 static void test_upload_restarted(int port, const uint8_t *pin, oc_dbwriter *dbw) {
     client a;
     uint64_t ua = 0;
@@ -1733,14 +1759,14 @@ static void test_upload_restarted(int port, const uint8_t *pin, oc_dbwriter *dbw
     oc_header hdr; oc_rbuf p; oc_wbuf w;
 
     oc_dbwriter_hold(dbw, OC_DBW_HOLD_ALL);
-    oc_upload_begin first = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("first.bin"), oc_slice_str("application/octet-stream"), 1000 };
+    oc_upload_begin first = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("first.bin"), oc_slice_str("application/octet-stream"), 1000, 0 };
     memset(first.idem, 0xA1, OC_IDEM_SIZE);
     oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
     CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &first) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
     oc_transfer_cancel tc = { 0 };
     oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
     CHECK(oc_encode_transfer_cancel(&w, OC_PROTOCOL_VERSION, &tc) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
-    oc_upload_begin second = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("second.bin"), oc_slice_str("application/octet-stream"), 3000 };
+    oc_upload_begin second = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("second.bin"), oc_slice_str("application/octet-stream"), 3000, 0 };
     memset(second.idem, 0xB2, OC_IDEM_SIZE);
     oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
     CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &second) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
@@ -5708,7 +5734,7 @@ static void test_pdm_relay(int port, const uint8_t *pin) {
     /* No file in it. */
     {
         uint8_t fbuf[256]; oc_wbuf w; oc_wbuf_init(&w, fbuf, sizeof fbuf);
-        oc_upload_begin ub = { id, {0}, oc_slice_str("x.bin"), oc_slice_str("application/octet-stream"), 10 };
+        oc_upload_begin ub = { id, {0}, oc_slice_str("x.bin"), oc_slice_str("application/octet-stream"), 10, 0 };
         memset(ub.idem, 0x55, OC_IDEM_SIZE);
         CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
         CHECK(read_error(&a, &code) == 0 && code == OC_ERR_FORBIDDEN);
@@ -8641,6 +8667,7 @@ int run_netloop_tests(void) {
         test_voice_input_rate(arg.port, pin);
         test_upload_abandoned(arg.port, pin);
         test_upload_restarted(arg.port, pin, dbw);
+        test_snippet_upload_cap(arg.port, pin);
         test_webhook_vertical(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
         /* The call group: a held seat goes quickly for every one of them, and

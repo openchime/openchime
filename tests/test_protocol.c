@@ -2270,12 +2270,13 @@ static void test_attachment_frames(void) {
         oc_upload_begin in; in.channel_id = 5; memcpy(in.idem, idem, OC_IDEM_SIZE);
         in.filename = oc_slice_str("report.pdf"); in.mime = oc_slice_str("application/pdf");
         in.total_size = 1048576;
+        in.media_kind = OC_MEDIA_SNIPPET;   /* as of 44: a snippet says so */
         ROUNDTRIP(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UPLOAD_BEGIN, h, p);
         oc_upload_begin out;
         CHECK(oc_decode_upload_begin(&p, &out) == OC_OK);
         CHECK(out.channel_id == 5 && memcmp(out.idem, idem, OC_IDEM_SIZE) == 0);
         CHECK(slice_eq_str(out.filename, "report.pdf") && slice_eq_str(out.mime, "application/pdf"));
-        CHECK(out.total_size == 1048576);
+        CHECK(out.total_size == 1048576 && out.media_kind == OC_MEDIA_SNIPPET);
     }
     {
         oc_upload_ready in = { 99, OC_ATTACH_CHUNK_SIZE, 262144 };

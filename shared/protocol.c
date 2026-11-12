@@ -2497,6 +2497,7 @@ oc_result oc_encode_upload_begin(oc_wbuf *w, uint16_t version, const oc_upload_b
     oc_w_str(w, m->filename);
     oc_w_str(w, m->mime);
     oc_w_u64(w, m->total_size);
+    oc_w_u8(w, m->media_kind);
     return oc_frame_end(w, off);
 }
 
@@ -3768,6 +3769,7 @@ oc_result oc_decode_upload_begin(oc_rbuf *p, oc_upload_begin *m) {
     m->filename = oc_r_str(p);
     m->mime = oc_r_str(p);
     m->total_size = oc_r_u64(p);
+    m->media_kind = oc_r_u8(p);
     return r_done(p);
 }
 

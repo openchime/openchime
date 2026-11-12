@@ -240,8 +240,12 @@
  *
  * 43: each EMOJI_LIST entry carries `created_at` (u64), `n_aliases` (u8) and
  * that many old names (str), which a rename keeps resolving (REQ-072). Fields
- * appended to a repeated entry. RENAME_EMOJI (0x013D) is new. */
-#define OC_PROTOCOL_VERSION 43u
+ * appended to a repeated entry. RENAME_EMOJI (0x013D) is new.
+ *
+ * 44: UPLOAD_BEGIN carries `media_kind` (u8), so a snippet's text past
+ * OC_SNIPPET_MAX_SIZE is refused before its bytes are sent (REQ-226). A field
+ * appended to a fixed layout. */
+#define OC_PROTOCOL_VERSION 44u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -1851,7 +1855,10 @@ typedef struct { uint64_t pdm_id; uint8_t reason; } oc_pdm_end;
 
 /* Attachment transfer (REQ-140/141, ARCH-69). `data` chunks are zero-copy views.
  * sha256 is a 32-byte digest carried as `bytes`. */
-typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice filename; oc_slice mime; uint64_t total_size; } oc_upload_begin;
+/* `media_kind` (as of 44): OC_MEDIA_SNIPPET declares a snippet's text, which the
+ * daemon refuses here past OC_SNIPPET_MAX_SIZE; 0 for any other upload. */
+typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice filename; oc_slice mime; uint64_t total_size;
+                 uint8_t media_kind; } oc_upload_begin;
 typedef struct { uint64_t attachment_id; uint32_t chunk_size; uint32_t window_bytes; } oc_upload_ready;
 typedef struct { uint64_t attachment_id; uint32_t seq; oc_slice data; } oc_upload_chunk;
 typedef struct { uint64_t attachment_id; uint32_t acked_through; } oc_upload_ack;

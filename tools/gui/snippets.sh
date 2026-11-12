@@ -48,6 +48,15 @@ check "the viewer opens on it" waitfor 5 opened
 check "its words are coloured (spans $(view spans))" [ "$(view spans)" -ge 4 ]
 check "as Python" [ "$(view lang)" = 2 ]
 "$DRIVE" shot snippets_view >/dev/null
+# Its Copy puts the whole text on the clipboard, read back from outside the
+# client as another program reads it (Windows: snippets are not run on the web).
+if [ "$PLAT" = win32 ]; then
+  powershell.exe -NoProfile -STA -Command "Set-Clipboard -Value 'before'" >/dev/null 2>&1
+  read -r l t r b <<< "$(grep -m1 '^a11yitem modal.button.copy ' "$D" | cut -d' ' -f3-)"
+  [ -n "${b:-}" ] && "$DRIVE" click $(( (l + r) / 2 )) $(( (t + b) / 2 )) >/dev/null
+  copied() { powershell.exe -NoProfile -STA -Command "Get-Clipboard -Raw" 2>/dev/null | tr -d '\r' | grep -q '^def rotate(n):$'; }
+  check "Copy puts its whole text on the clipboard" waitfor 5 copied
+fi
 "$DRIVE" key escape >/dev/null
 closed() { snap; [ "$(view open)" = 0 ]; }
 check "Esc closes it" waitfor 5 closed

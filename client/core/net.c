@@ -660,6 +660,7 @@ static void begin_upload(disp_ctx *ctx, uint64_t channel, const char *name, cons
     ub.filename = oc_slice_str(x->name);
     ub.mime = oc_slice_str(mime);
     ub.total_size = total;
+    ub.media_kind = purpose == 5 ? OC_MEDIA_SNIPPET : 0;   /* a snippet says so, and is held to its cap */
     if (oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) == OC_OK &&
         write_all(ctx->conn, ctx->fd, buf, w.len, ctx->stop) == 0) {
         char msg[200]; snprintf(msg, sizeof msg, "uploading %s…", x->name);
