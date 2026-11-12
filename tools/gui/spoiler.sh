@@ -199,8 +199,10 @@ send_plain() {  # send_plain <body> <preview starts>: sends it, waits for the pr
 check "a block quote is sent" send_plain '> PLAINQUOTE stays a quote' '> PLAINQUOTE stays a quote'
 check "it stays a quote, with no spoiler" marks "$LAST" 1 0
 "$DRIVE" shot spoiler_quote >/dev/null
-check "an unclosed one at a line's start is sent" send_plain '>!UNCLOSED stays a quote' '>!UNCLOSED stays a quote'
-check "it stays a quote too, and hides nothing" marks "$LAST" 1 0
+# Typed bare, one that never closes is held back (below, "a spoiler never
+# closed is not sent"); written \>!, it is the characters, sent as text.
+check "an unclosed one, escaped, is sent" send_plain '\\>!UNCLOSED stays text' '\>!UNCLOSED stays text'
+check "it is text: no quote, and it hides nothing" marks "$LAST" 0 0
 check "the old form in a line is sent" send_plain '||OLDFORM|| is ordinary text' '||OLDFORM|| is ordinary text'
 check "it is ordinary text, and hides nothing" marks "$LAST" 0 0
 check "a quote holding one is sent" send_plain '> >!INQUOTE!< said it' '> [spoiler] said it'
@@ -294,6 +296,9 @@ check "sent, it is one spoiler" waitfor 10 sents
 # Past a draft's 64th spoiler as before it.
 many=""; for i in $(seq 1 66); do many="${many}>!s$i!< "; done
 "$DRIVE" typekeys "${many}>!LATEAB!<" >/dev/null
+# All of it typed before the caret moves: the keys otherwise land mid-typing.
+typed() { snap; grep -q "^ed len=$(( ${#many} + 10 )) " "$D"; }
+waitfor 15 typed
 "$DRIVE" key left >/dev/null; "$DRIVE" key left >/dev/null
 "$DRIVE" key shift+enter >/dev/null
 late() { snap; grep -q '^```spoiler$' "$D" && grep -qx 'LATEA' "$D"; }

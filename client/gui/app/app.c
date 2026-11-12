@@ -23285,7 +23285,7 @@ static void ed_invalidate_layout(void) {
 
 static void ed_hidden_build(void) {
     static char u8[ED_MAX * 3 + 1];
-    oc_rt_span sp[OC_RT_MAX];
+    oc_rt_span *sp = NULL;
     size_t n, i;
     int bytes;
     g_ed_hidden_valid = 1;
@@ -23301,8 +23301,12 @@ static void ed_hidden_build(void) {
     bytes = to_u8n(g_ed, g_ed_len, u8, (int)sizeof u8 - 1);
     if (bytes <= 0) return;
     u8[bytes] = 0;
-    n = oc_rt_scan(u8, (size_t)bytes, sp, OC_RT_MAX);
-    if (n > OC_RT_MAX) n = OC_RT_MAX;
+    /* Every span, however many: read at a fixed 128, a draft's delimiters
+     * past its 42nd spoiler or so stayed in view, and the caret stepped over
+     * them as text (MARKDOWN.md §1d, "however many spoilers the draft holds"). */
+    n = oc_rt_scan(u8, (size_t)bytes, NULL, 0);
+    if (!n || !(sp = malloc(n * sizeof *sp))) return;
+    n = oc_rt_scan(u8, (size_t)bytes, sp, n);
     for (i = 0; i < n; i++) {
         int at, len, k;
         /* Only INLINE delimiters vanish. A list marker or a quote's `> ` is the
@@ -23325,6 +23329,7 @@ static void ed_hidden_build(void) {
         if (at < 0 || len <= 0) continue;
         for (k = at; k < at + len && k < g_ed_len; k++) g_ed_hidden[k] = kind;
     }
+    free(sp);
 }
 
 static void ed_delete_range(int a, int b);   /* fwd */
@@ -37651,9 +37656,12 @@ static void test_dump(const char *path) {
             (unsigned long long)g_profile_uid, g_rp_mode,
             g_prof_dm_btn.left, g_prof_dm_btn.top, g_prof_dm_btn.right, g_prof_dm_btn.bottom);
     {
-        char ed8[1024] = "";
-        oc_wch edw[512];
-        int n = ed_get(edw, 512);
+        /* The whole draft, however long: a check that reads past its first few
+         * hundred characters (a draft of 66 spoilers) found nothing there. */
+        static char ed8[ED_MAX * 3 + 1];
+        ed8[0] = '\0';
+        static oc_wch edw[ED_MAX + 1];
+        int n = ed_get(edw, ED_MAX + 1);
         if (n > 0) to_u8(edw, ed8, sizeof ed8);
         {   /* The caret's own rect, so "is the caret on the text line" is a
              * question the harness can ask. It could not, which is how a caret

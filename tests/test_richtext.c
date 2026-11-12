@@ -663,6 +663,13 @@ static void test_spoilers(void) {
     CHECK(content_spans("a >!   !< b", OC_RT_SPOILER) == 0);
     CHECK(content_spans(">!one\ntwo!<", OC_RT_SPOILER) == 0);
     CHECK(content_spans("a >!never closed", OC_RT_SPOILER) == 0);
+    /* At a line's start, one that never closes is a quote of the rest, and
+     * hides nothing: what arrives so is read as written. (The composer will
+     * not send it; written `\>!`, it is the characters.) */
+    CHECK(content_spans(">!UNCLOSED stays a quote", OC_RT_SPOILER) == 0);
+    CHECK(content_spans(">!UNCLOSED stays a quote", OC_RT_QUOTE) == 1);
+    CHECK(oc_rt_open_spoiler(">!UNCLOSED", 10) == 0);
+    CHECK(oc_rt_open_spoiler("\\>!UNCLOSED", 11) == (size_t)-1);
     CHECK(content_spans("`>!code!<`", OC_RT_SPOILER) == 0);
     CHECK(content_spans("```\n>!code!<\n```", OC_RT_SPOILER) == 0);
     CHECK(oc_rt_spoilers("x >! y", 6, sp, 4) == 0);
