@@ -12,7 +12,21 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <sqlite3.h>
 #include "config.h"
+#include "migrate.h"
+
+/* Every connection this binary opens -- a suite's own beside the daemon's --
+ * is given the SQL functions the daemon registers on each of its own
+ * (oc_migrate_functions), as SQLite opens it: a suite that writes `messages`
+ * or reads an excerpt on a connection of its own runs the same triggers and
+ * queries the daemon does. The daemon's code still registers them itself on
+ * its connections (dbwriter.c, sql_functions), as it does in production. */
+static int test_sql_functions_ext(sqlite3 *db, char **err, const sqlite3_api_routines *api) {
+    (void)err; (void)api;
+    oc_migrate_functions(db);
+    return SQLITE_OK;
+}
 
 int run_protocol_tests(void);
 int run_callsig_tests(void);
@@ -486,6 +500,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     crash_report_install();
+    sqlite3_auto_extension((void (*)(void))test_sql_functions_ext);
     /* The suites run in development mode (CONFIG.md "Mode"): the daemon's
      * OPENCHIME_DEV_* rows and the clients' inputs are read. Not overwritten,
      * so a run may try another mode. */

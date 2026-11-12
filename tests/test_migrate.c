@@ -433,6 +433,15 @@ static void test_sql_functions(void) {
     CHECK(strstr(t, "before") != NULL && strstr(t, "secret") == NULL);
     CHECK(scalar(db, "SELECT oc_excerpt(NULL, 10) IS NULL;") == 1);
     sqlite3_close(db);
+    /* And any connection a suite opens has them without asking (tests/main.c),
+     * so a write or a query on one runs as on the daemon's. */
+    sqlite3 *plain = open_mem();
+    CHECK(scalar(plain, "SELECT oc_has_spoiler('>!x!<');") == 1);
+    text_of(plain, "SELECT oc_excerpt('seen >!hidden!<', 160);", t, sizeof t);
+    CHECK(strstr(t, "seen") != NULL && strstr(t, "hidden") == NULL);
+    text_of(plain, "SELECT oc_unspoiled('seen >!hidden!<');", t, sizeof t);
+    CHECK(strstr(t, "hidden") == NULL);
+    sqlite3_close(plain);
 }
 
 static void test_newer_database_refused(void) {

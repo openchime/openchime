@@ -70,7 +70,8 @@ static oc_dbres *wait_result(oc_dbwriter *w) {
 /* A connection of the test's own, beside the daemon's: with every SQL function
  * the daemon registers on each of its connections (oc_migrate_functions: the
  * excerpt helpers its queries use, and what the search index's triggers call
- * whenever `messages` is written). */
+ * whenever `messages` is written). Every connection the test binary opens has
+ * them already (tests/main.c); registered here too, as this helper says. */
 static int raw_open(const char *path, sqlite3 **db) {
     int rc = sqlite3_open(path, db);
     if (rc == SQLITE_OK) oc_migrate_functions(*db);
