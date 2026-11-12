@@ -15578,15 +15578,21 @@ static void ftray_draw(gfx *rt, float bx0, float by0, float bx1) {
 static char     g_ooo_note[420];
 static int      g_ooo_note_dirty = 1;
 static uint64_t g_ooo_note_sel, g_ooo_note_at;
+static const oc_member *tgt_ooo_member(const oc_model *m, uint64_t now);   /* fwd: the new message's people */
 static void ooo_note_refresh(void) {
     uint64_t now = (uint64_t)time(NULL) * 1000u;
     if (!g_ooo_note_dirty && g_ooo_note_sel == g_sel && now - g_ooo_note_at < 1000) return;
     g_ooo_note_dirty = 0; g_ooo_note_sel = g_sel; g_ooo_note_at = now;
     g_ooo_note[0] = '\0';
     const oc_model *m = model();
-    if (!m || !g_sel || g_view == VIEW_NEWMSG) return;
+    if (!m) return;
+    int newmsg = g_view == VIEW_NEWMSG;
+    if (!newmsg && !g_sel) return;
     char *draft = ed_md_all();
-    const oc_member *u = oc_model_ooo_for_compose(m, g_sel, draft ? draft : "", now);
+    /* A new message: whoever it is to, from its chips, before anyone it
+     * mentions; a conversation: its other person, or someone mentioned. */
+    const oc_member *u = newmsg ? tgt_ooo_member(m, now) : NULL;
+    if (!u) u = oc_model_ooo_for_compose(m, newmsg ? 0 : g_sel, draft ? draft : "", now);
     free(draft);
     if (!u) return;
     char lbl[96];
@@ -20950,9 +20956,19 @@ static void tgt_chip_label(int i, char *out, size_t cap) {
                        ? oc_model_ooo_active(m, g_tgt_chip[i].id, (uint64_t)time(NULL) * 1000u) : NULL;
     char ol[96] = "";
     if (u) oc_model_ooo_label(u, ol, sizeof ol);
-    const char *until = u ? strstr(ol, "until ") : NULL;
+    /* The same words as everywhere else: "Out of office until 3 Dec". */
     snprintf(out, cap, "%s%s%s%s", g_tgt_chip[i].is_channel ? "#" : "@", g_tgt_chip[i].name,
-             until ? " \xC2\xB7 away " : "", until ? until : "");
+             ol[0] ? " \xC2\xB7 " : "", ol);
+}
+/* The first person among the new message's chips who is out of office now,
+ * for the composer's notice (REQ-122). */
+static const oc_member *tgt_ooo_member(const oc_model *m, uint64_t now) {
+    for (int i = 0; m && i < g_n_tgt_chip; i++) {
+        if (g_tgt_chip[i].is_channel || g_tgt_chip[i].id == m->user_id) continue;
+        const oc_member *u = oc_model_ooo_active(m, g_tgt_chip[i].id, now);
+        if (u) return u;
+    }
+    return NULL;
 }
 static oc_target g_tgt[TGT_MAX];
 static int   g_n_tgt, g_tgt_sel;
@@ -22018,9 +22034,18 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
                              oc_model_dnd_of(m, u->user_id));
         /* Title, or the custom status when there is one — Slack shows the status
          * in its place, because it is the more current of the two. */
-        char sub[160];
+        char sub[320];
         if (u->disabled) snprintf(sub, sizeof sub, "Removed \xE2\x80\x94 right-click to bring them back");
-        else if (oc_model_ooo_active(m, u->user_id, wall_ms())) oc_model_ooo_label(u, sub, sizeof sub);
+        else if (oc_model_ooo_active(m, u->user_id, wall_ms())) {
+            /* Out of office, with the custom status beside it, not in its
+             * place: the two are separate, and both are said (REQ-122). */
+            char ol[96];
+            oc_model_ooo_label(u, ol, sizeof ol);
+            if (u->status_text[0] || u->status_emoji[0])
+                snprintf(sub, sizeof sub, "%s  \xC2\xB7  %s%s%s", ol, u->status_emoji,
+                         u->status_emoji[0] && u->status_text[0] ? "  " : "", u->status_text);
+            else snprintf(sub, sizeof sub, "%s", ol);
+        }
         else if (u->status_text[0])
             snprintf(sub, sizeof sub, "%s%s%s", u->status_emoji,
                      u->status_emoji[0] ? "  " : "", u->status_text);
@@ -35007,7 +35032,7 @@ static void ooo_dialog(oc_win *hwnd) {
     if (!m || !g_client) return;
     oc_field f[3] = {
         { FF_TEXT, "From",     "A day as 2026-12-01, or empty for now.", "" },
-        { FF_TEXT, "Back on",  "The day you are back, as 2026-12-15. Out of office ends that morning.", "" },
+        { FF_TEXT, "Back on",  "The day you are back, as 2026-12-15. Out of office ends that morning. Both days empty clears it.", "" },
         { FF_TEXT, "Message",  "Shown to anyone who writes to you or mentions you. Optional.", "" },
     };
     for (size_t i = 0; i < m->n_users; i++)
@@ -35018,6 +35043,8 @@ static void ooo_dialog(oc_win *hwnd) {
         }
     for (;;) {
         if (!form_dialog(hwnd, "Out of office", f, 3)) return;
+        /* Both days left empty: no absence, now or to come. */
+        if (!f[0].value[0] && !f[1].value[0]) { oc_client_set_out_of_office(g_client, 0, 0, ""); return; }
         uint64_t start = f[0].value[0] ? ooo_parse_day(f[0].value) : wall_ms();
         uint64_t end = ooo_parse_day(f[1].value);
         if (f[0].value[0] && !start) { g_form_err_field = 0; continue; }
@@ -35046,8 +35073,22 @@ static void open_profile_menu(oc_win *hwnd) {
     {
         static char ool[96];
         const oc_member *me = pm ? oc_model_ooo_active(pm, pm->user_id, wall_ms()) : NULL;
+        /* One set to start later is cleared the same way, before it starts. */
+        const oc_member *later = NULL;
+        for (size_t i = 0; pm && !me && i < pm->n_users; i++)
+            if (pm->users[i].user_id == pm->user_id && pm->users[i].ooo_end > wall_ms() &&
+                pm->users[i].ooo_start > wall_ms())
+                later = &pm->users[i];
         if (me) {
             oc_model_ooo_label(me, ool, sizeof ool);
+            mi_item(66, ool);
+            mi_item(67, "Clear out of office");
+        } else if (later) {
+            time_t ts = (time_t)(later->ooo_start / 1000);
+            struct tm lt;
+            char from[32] = "";
+            if (oc_localtime_r(&ts, &lt)) strftime(from, sizeof from, "%d %b", &lt);
+            snprintf(ool, sizeof ool, "Out of office from %s\xE2\x80\xA6", from[0] == '0' ? from + 1 : from);
             mi_item(66, ool);
             mi_item(67, "Clear out of office");
         } else {

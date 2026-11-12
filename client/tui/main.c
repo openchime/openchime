@@ -2119,14 +2119,14 @@ static void render(oc_client *cl, size_t focus, const char *composer,
                            : u->disabled ? th->muted
                            : p == OC_PRESENCE_ONLINE ? th->presence_on : p == OC_PRESENCE_AWAY ? th->presence_away : th->fg;
             const char *role = u->role == OC_ROLE_OWNER ? " *" : u->role == OC_ROLE_ADMIN ? " +" : "";
-            /* Out of office (REQ-122): "away until 3 Dec" after the name. */
-            char oo[64] = "";
+            /* Out of office (REQ-122): "Out of office until 3 Dec" after the
+             * name, the words every other place uses. */
+            char oo[112] = "";
             if (oc_model_ooo_active(m, u->user_id, (uint64_t)time(NULL) * 1000u)) {
                 char ol[96]; oc_model_ooo_label(u, ol, sizeof ol);
-                const char *until = strstr(ol, "until ");
-                snprintf(oo, sizeof oo, " (away %s)", until ? until : "");
+                snprintf(oo, sizeof oo, " (%s)", ol);
             }
-            char line[160]; snprintf(line, sizeof line, "%s %s%s%s", d, u->name[0] ? u->name : "?", role, oo);
+            char line[288]; snprintf(line, sizeof line, "%s %s%s%s", d, u->name[0] ? u->name : "?", role, oo);
             if (sel) tk_fill((int)iy, mx + 1, mx + mem_w - 1, bg);
             tk_text(mx + 1, (int)iy, mx + mem_w - 1, line, col, bg);
         }
@@ -4311,20 +4311,30 @@ int main(int argc, char **argv) {
                     profile_uid = 0; profile_open = 1;
                 }
                 else if (k == PROMPT_OOO) {
-                    /* "off" clears; otherwise the day back, from now until that
-                     * morning, and the rest is the message. Wrong: asked again. */
-                    uint64_t back = 0;
-                    const char *msg = "";
+                    /* "off" clears, now or one set to start later; otherwise
+                     * the day it starts (left out: now), the day back -- it
+                     * holds until that morning -- and the rest is the message.
+                     * Wrong: asked again. */
+                    uint64_t now_ms = (uint64_t)time(NULL) * 1000u;
+                    uint64_t first = 0, second = 0, start = now_ms, back = 0;
+                    const char *msg = "", *rest2 = "";
                     if (strcmp(v, "off") == 0) oc_client_set_out_of_office(cl, 0, 0, "");
-                    else if ((back = ooo_day_ms(v, &msg)) == 0 ||
-                             back <= (uint64_t)time(NULL) * 1000u) {
+                    else if ((first = ooo_day_ms(v, &msg)) == 0) {
                         prompt_kind = PROMPT_OOO;
-                        ooo_err = "That is not a day still to come, as 2026-12-15.";
-                    } else if (strlen(msg) > OC_OOO_MESSAGE_MAX) {
-                        prompt_kind = PROMPT_OOO;
-                        ooo_err = "The message can be at most 280 bytes.";
+                        ooo_err = "Start with a day, as 2026-12-15 (or two: from, then back).";
                     } else {
-                        oc_client_set_out_of_office(cl, (uint64_t)time(NULL) * 1000u, back, msg);
+                        if ((second = ooo_day_ms(msg, &rest2)) != 0) { start = first; back = second; msg = rest2; }
+                        else back = first;
+                        if (back <= now_ms || back <= start) {
+                            prompt_kind = PROMPT_OOO;
+                            ooo_err = second ? "The day back has to come after the day it starts, and be still to come."
+                                             : "That is not a day still to come, as 2026-12-15.";
+                        } else if (strlen(msg) > OC_OOO_MESSAGE_MAX) {
+                            prompt_kind = PROMPT_OOO;
+                            ooo_err = "The message can be at most 280 bytes.";
+                        } else {
+                            oc_client_set_out_of_office(cl, start, back, msg);
+                        }
                     }
                 }
                 else if (k == PROMPT_INVITE) {
@@ -4411,8 +4421,8 @@ int main(int argc, char **argv) {
                 else if (id == ACT_OOO) {
                     ooo_err = NULL;
                     prompt_kind = PROMPT_OOO;
-                    prompt_title = "Out of office: the day you are back (YYYY-MM-DD), then a message; 'off' clears";
-                    tk_input_init(&prompt_input, 0, "e.g. 2026-12-15 Back on Monday");
+                    prompt_title = "Out of office: [from YYYY-MM-DD] back YYYY-MM-DD, then a message; 'off' clears";
+                    tk_input_init(&prompt_input, 0, "e.g. 2026-12-08 2026-12-15 Back on Monday");
                 }
                 else if (id == ACT_SEARCH)  { prompt_kind = PROMPT_SEARCH; prompt_title = "Search messages"; tk_input_init(&prompt_input, 0, "query"); }
                 else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
