@@ -91,7 +91,7 @@ plus() {  # click the composer's "+", by the rect it publishes, in scene units
   "$DRIVE" clickform "$(( (l + r) * 48 / dpi ))" "$(( (t + b) * 48 / dpi ))" >/dev/null
 }
 picker_is() { snap; grep -q "^modal=[^ ]* picker=$1 " "$D"; }
-no_dialog() { [ "$("$DRIVE" picker cancel 2>/dev/null)" = none ]; }
+no_dialog() { [ "$("$DRIVE" picker cancel 2>/dev/null)" = "ack: none" ]; }
 empty_tray() { [ "$(tray here)" = 0 ]; }
 check "with no dialog open, the picker verb changes nothing" no_dialog
 check "\"+\" opens the file dialog" plus
