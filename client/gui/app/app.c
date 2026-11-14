@@ -2016,7 +2016,8 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
        CONF_CALL_START, CONF_CALL_END,
        CONF_MESSAGE_MOVE,
        CONF_SNIPPET_PASTE,
-       CONF_PFIELD_DELETE };
+       CONF_PFIELD_DELETE,
+       CONF_WS_FORGET_SET };
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 static int      g_bc_confirmed;     /* CONF_BROADCAST: the send it confirmed is under way */
@@ -2074,9 +2075,12 @@ enum { ABOUT_CMD_COPY = 2702 };
  * card's "Open on openchime.io". */
 enum { ABOUT_CMD_WHATSNEW = 2704, WN_CMD_OPEN = 2705 };
 enum { WSM_CMD_REMOVE_ALL = 2703 };   /* the Workspaces footer's Remove all */
+/* ...its Remove unused (the day dialog), and that dialog's Continue; its
+ * Remove unreachable. */
+enum { WSM_CMD_UNUSED = 2720, WSM_CMD_UNUSED_GO = 2721, WSM_CMD_UNREACH = 2722 };
 static float cert_q_body(gfx *rt, rectf body);   /* fwd */
 
-static char     g_confirm_body[640];
+static char     g_confirm_body[2048];
 static char     g_confirm_ok[32];
 static char     g_confirm_ws[160];   /* CONF_WS_FORGET's target, by address */
 
@@ -2502,7 +2506,10 @@ static struct { float top, bot; int cmd; char label[48]; } g_subrows[8];
 static int   g_n_subrows;
 static void  submenu_close(void);           /* defined beside draw_menu */
 /* Workspace switcher list (built from the store book at open time). */
-enum { WS_MAX = 8 };
+/* At most this many workspaces are connected at once (the slots below). The
+ * book, what this device remembers, has no ceiling: it is read from the store
+ * into storage that grows (g_sw, ws_book). */
+enum { WS_OPEN_MAX = 8 };
 typedef struct {
     oc_client *client;
     char     ws[256];
@@ -2517,7 +2524,7 @@ typedef struct {
     int      n_backfilled;
     char     aud[132];      /* the audience last kept in the book for it (CLIENT.md "Links") */
 } oc_ws_slot;
-static oc_ws_slot g_wss[WS_MAX];
+static oc_ws_slot g_wss[WS_OPEN_MAX];
 static int g_n_wss, g_ws_active = -1;
 static int ws_find(const char *ws);   /* fwd */
 static int g_logging_out;            /* a LOGOUT is in flight */
@@ -2529,9 +2536,30 @@ static void sw_book_load(void);      /* fwd */
 static void ws_forget(const char *ws);   /* fwd */
 static void ws_forget_begin(const char *ws);   /* fwd */
 static void ws_forget_all(void);   /* fwd */
+static void ws_forget_set(void);   /* fwd */
 
-static struct { char ws[256], label[80], user[80]; int current; } g_sw[16];
-static int   g_n_sw;
+/* The book as last read (sw_book_load), one entry per remembered workspace,
+ * grown as the store has more; last_used is the store's stamp, in ms. */
+typedef struct { char ws[256], label[80], user[80]; int current; uint64_t last_used; } sw_entry;
+static sw_entry *g_sw;
+static int   g_n_sw, g_cap_sw;
+/* The Workspaces dialog's rows: indexes into g_sw, those its filter box admits,
+ * the signed-in first and then the most recently used (wsmgr_view). */
+static int  *g_swv;
+static int   g_n_swv, g_cap_swv;
+static field *g_wsm_q;                /* the dialog's filter box */
+static rectf g_wsm_qbox;              /* its chrome, as last painted */
+/* Remove unused: the dialog that takes the day, over the Workspaces dialog. */
+static int    g_wsu_open;
+static field *g_wsu_edit;
+static rectf  g_wsu_erect;
+static const char *g_wsu_err;
+/* The workspaces a bulk removal's confirmation is about (CONF_WS_FORGET_SET),
+ * by address: the list can be reloaded between asking and answering. */
+static char (*g_wsx)[256];
+static int    g_n_wsx;
+static int    wsp_busy(void);         /* fwd: Remove unreachable is still checking */
+static void   draw_wsunused(gfx *rt, rectf body);   /* fwd */
 
 static rectf g_attach_btn;        /* composer attach (+) hit-box */
 static rectf g_send_btn;          /* composer send-button hit-box */
@@ -11840,6 +11868,61 @@ static void draw_voters_list(gfx *rt, const oc_model *m, rectf reg) {
 }
 
 static void sw_book_load(void);       /* fwd */
+static int  tgt_ci_has(const char *s, const char *needle);   /* fwd */
+
+/* Whether g_sw[i] has a connection open on this device. */
+static int sw_live(int i) {
+    int slot = ws_find(g_sw[i].ws);
+    return slot >= 0 && g_wss[slot].client != NULL;
+}
+
+/* Signed in first, then the most recently used, then by name. */
+static int swv_cmp(const void *a, const void *b) {
+    int i = *(const int *)a, j = *(const int *)b;
+    int li = sw_live(i), lj = sw_live(j);
+    if (li != lj) return lj - li;
+    if (g_sw[i].last_used != g_sw[j].last_used) return g_sw[i].last_used < g_sw[j].last_used ? 1 : -1;
+    return strcmp(g_sw[i].label, g_sw[j].label);
+}
+
+/* The dialog's rows from the book as last read: those whose name or address
+ * holds the filter's text, ignoring case, in swv_cmp's order. */
+static void wsmgr_view(void) {
+    const char *q = g_wsm_q ? g_wsm_q->buf : "";
+    g_n_swv = 0;
+    if (g_cap_swv < g_n_sw) {
+        int *v = realloc(g_swv, (size_t)g_n_sw * sizeof *v);
+        if (!v) return;
+        g_swv = v; g_cap_swv = g_n_sw;
+    }
+    for (int i = 0; i < g_n_sw; i++)
+        if (tgt_ci_has(g_sw[i].label, q) || tgt_ci_has(g_sw[i].ws, q)) g_swv[g_n_swv++] = i;
+    qsort(g_swv, (size_t)g_n_swv, sizeof *g_swv, swv_cmp);
+}
+
+/* The row of g_sw[i] in the dialog's view, or -1 when the filter hides it. */
+static int wsmgr_row_of(int i) {
+    for (int v = 0; v < g_n_swv; v++) if (g_swv[v] == i) return v;
+    return -1;
+}
+
+/* Where g_sw[i] is reached: its host and port. The port is the connection's
+ * when one is open, else the one its address names, else the default the
+ * client dials first. */
+static void sw_addr(int i, char *out, size_t cap) {
+    const char *ws = g_sw[i].ws;
+    const char *colon = strrchr(ws, ':'), *br = strrchr(ws, ']');
+    int has_port = colon && (!br || colon > br) && colon[1];
+    int slot = ws_find(ws);
+    if (slot >= 0 && g_wss[slot].client && g_wss[slot].port > 0) {
+        int n = has_port ? (int)(colon - ws) : (int)strlen(ws);
+        snprintf(out, cap, "%.*s:%d", n, ws, g_wss[slot].port);
+    } else if (has_port) {
+        snprintf(out, cap, "%s", ws);
+    } else {
+        snprintf(out, cap, "%s:%d", ws, OC_DEFAULT_PORT);
+    }
+}
 
 static void draw_wsmgr(gfx *rt, rectf reg) {
     rectf body = reg;   /* the frame drew the title bar (modal_frame) */
@@ -11852,10 +11935,16 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
      * belongs to this list until another one claims it -- a confirmation does
      * not, which is what keeps the position across Remove. It starts under the
      * header: the frame's subtitle is the dialog's only header. */
+    /* The filter box heads the list, and does not scroll with it. */
+    g_wsm_qbox = rf(body.left + UIS(20), body.top + UIS(8), body.right - UIS(20), body.top + UIS(8) + SEARCH_BOX_H);
+    search_box_draw(rt, g_wsm_qbox, OC_COL_INPUT);
+    if (g_wsm_q) field_draw(rt, g_wsm_q, search_text_box(g_wsm_qbox), OC_COL_TEXT);
+    wsmgr_view();
     rectf list = body;
+    list.top = g_wsm_qbox.bottom + UIS(6);
     if (list.bottom < list.top) list.bottom = list.top;
     g_wsmgr_list = list;
-    if (g_wsmgr_focus >= g_n_sw) g_wsmgr_focus = g_n_sw - 1;
+    if (g_wsmgr_focus >= g_n_swv) g_wsmgr_focus = g_n_swv - 1;
     ovl_use(OVL_WSMGR);
     if (g_wsmgr_reveal && g_wsmgr_focus >= 0) {
         float top = 6 + (float)g_wsmgr_focus * rowh, visible = list.bottom - list.top;
@@ -11863,7 +11952,7 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
         if (top + rowh + 6 > g_ovl_scroll + visible) g_ovl_scroll = top + rowh + 6 - visible;
     }
     g_wsmgr_reveal = 0;
-    float y = ovl_begin(rt, list, (float)g_n_sw * rowh + 12);
+    float y = ovl_begin(rt, list, (float)g_n_swv * rowh + 12);
 
     /* A row is laid out from what it holds, not from fixed offsets: the
      * highlight, and the divider under it, span the same width; the two lines
@@ -11873,10 +11962,10 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
     float hl_l = body.left + UIS(8), hl_r = body.right - UIS(12);
     float pad = UIS(12), bh = 32;   /* bh: the footer's button height */
     float l1 = g_ui_b->line_h, l2 = g_meta->line_h;
-    for (int i = 0; i < g_n_sw; i++) {
-        int slot = ws_find(g_sw[i].ws);
-        int live = (slot >= 0 && g_wss[slot].client);
-        if (i == g_wsmgr_focus)
+    for (int v = 0; v < g_n_swv; v++) {
+        int i = g_swv[v];
+        int live = sw_live(i);
+        if (v == g_wsmgr_focus)
             fill_round(rt, rf(hl_l, y + 2, hl_r, y + rowh - 2), OC_R_CONTROL, OC_COL_HOVER);
 
         /* Buttons right-aligned, built right-to-left so widths can vary: the
@@ -11913,8 +12002,9 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
         rectf nrect = rf(tx, ty, nr, ty + l1);
         draw_text(rt, g_sw[i].label, g_ui_b, nrect, OC_COL_TEXT);
         draw_text(rt, state, g_meta, baseline_align(nrect, g_ui_b, g_meta, nr + gap, nr + gap + sw + 1), sc);
-        char sub[320];
-        snprintf(sub, sizeof sub, "%s%s%s", g_sw[i].ws,
+        char sub[400], addr[300];
+        sw_addr(i, addr, sizeof addr);
+        snprintf(sub, sizeof sub, "%s%s%s", addr,
                  g_sw[i].user[0] ? "  \u00b7  " : "", g_sw[i].user);
         draw_text(rt, sub, g_meta, rf(tx, ty + l1, tr, ty + l1 + l2), OC_COL_FAINT);
 
@@ -11922,7 +12012,8 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
         y += rowh;
     }
     ovl_end(rt, list);
-    if (g_n_sw == 0) overlay_empty(rt, body, "No workspaces remembered on this device.");
+    if (g_n_sw == 0) overlay_empty(rt, list, "No workspaces remembered on this device.");
+    else if (g_n_swv == 0) overlay_empty(rt, list, "No remembered workspace matches the filter.");
 }
 
 static void draw_transcript(gfx *rt, const oc_model *m, rectf reg) {
@@ -15895,7 +15986,8 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
 static int modal_open(void) {
     return g_prefs_open || g_keys_open || g_about_open || g_wsmgr_open || g_notify_open ||
            g_browse_open || g_confirm_open || g_sessions_open || g_form_open ||
-           g_status_open || g_sch_open || g_sr_open || g_jc_open || g_pc_open || g_te_open || g_sv_open;
+           g_status_open || g_sch_open || g_sr_open || g_jc_open || g_pc_open || g_te_open || g_sv_open ||
+           g_wsu_open;
 }
 
 static rectf g_modal_card;
@@ -15995,6 +16087,7 @@ static void confirm_run(oc_win *hwnd) {
      * a refactor. */
     case CONF_WS_FORGET: ws_forget_begin(g_confirm_ws); break;
     case CONF_WS_FORGET_ALL: ws_forget_all(); break;
+    case CONF_WS_FORGET_SET: ws_forget_set(); break;
     case CONF_DRAFT_DELETE: draft_delete(g_confirm_id, g_confirm_root); break;
     case CONF_CHANNEL_ARCHIVE: oc_client_update_channel(g_client, g_confirm_id,
                                                         OC_CHUP_ARCHIVE, ""); break;
@@ -16817,6 +16910,7 @@ static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
     else if (g_sch_open)    draw_sched_custom(rt, body);
     else if (g_sr_open)     draw_sumrange(rt, body);
     else if (g_jc_open)     draw_jumpcal(rt, body);
+    else if (g_wsu_open)    draw_wsunused(rt, body);
     else if (g_pc_open)     draw_poll_compose(rt, body);
     else if (g_te_open)     draw_table_editor(rt, body);
     else if (g_sv_open)     draw_snippet_view(rt, body);
@@ -18431,6 +18525,12 @@ static const oc_modal_spec *modal_current(void) {
         sp.buttons[1] = (oc_mbtn){ "Summarize", MB_PRIMARY, 310 };
         if (oc_sumcal_range(&g_sr_cal, &rs, &re) != 0) g_modal_off_cmd = 310;
         sp.n_buttons = 2;
+    } else if (g_wsu_open) {
+        sp.title = "Remove unused workspaces";
+        sp.size = MODAL_SM;
+        sp.buttons[0] = (oc_mbtn){ "Cancel",   MB_NORMAL,  MODAL_CANCEL };
+        sp.buttons[1] = (oc_mbtn){ "Continue", MB_PRIMARY, WSM_CMD_UNUSED_GO };
+        sp.n_buttons = 2;
     } else if (g_jc_open) {
         /* Jump is a COMMAND, as Summarize is, and grey until a day is picked. */
         sp.title = g_jc_parent ? "Jump to date in this thread" : "Jump to date";
@@ -18510,6 +18610,7 @@ static const oc_modal_spec *modal_current(void) {
         sp.buttons[0] = (oc_mbtn){ "Cancel",     MB_NORMAL,         MODAL_CANCEL };
         sp.buttons[1] = (oc_mbtn){ g_confirm_ok, MB_DANGER_PRIMARY, MODAL_OK };
         sp.n_buttons = 2;
+        if (g_confirm_act == CONF_WS_FORGET_SET) sp.size = MODAL_LG;   /* it names every one */
         if (g_confirm_act == CONF_PDM_SAFETY) {
             sp.buttons[0] = (oc_mbtn){ "Done", MB_PRIMARY, MODAL_OK };
             sp.n_buttons = 1;
@@ -18601,8 +18702,14 @@ static const oc_modal_spec *modal_current(void) {
         sp.size = MODAL_LG;
         sp.buttons[0] = (oc_mbtn){ "Done", MB_PRIMARY, MODAL_OK };
         sp.n_buttons = 1;
-        if (g_n_sw > 0)   /* danger: the frame puts it on the left, away from Done */
+        if (g_n_sw > 0) {   /* danger: the frame puts it on the left, away from Done */
             sp.buttons[sp.n_buttons++] = (oc_mbtn){ "Remove all", MB_DANGER, WSM_CMD_REMOVE_ALL };
+            sp.buttons[sp.n_buttons++] = (oc_mbtn){ "Remove unused\xE2\x80\xA6", MB_NORMAL, WSM_CMD_UNUSED };
+            /* Grey while it checks: one check at a time. */
+            sp.buttons[sp.n_buttons++] = (oc_mbtn){ wsp_busy() ? "Checking\xE2\x80\xA6" : "Remove unreachable",
+                                                    MB_NORMAL, WSM_CMD_UNREACH };
+            if (wsp_busy()) g_modal_off_cmd = WSM_CMD_UNREACH;
+        }
     }
     return &sp;
 }
@@ -18621,7 +18728,7 @@ static void modal_enter(oc_win *hwnd, int *flag) {
      * with an attempt nobody watched: no browser, an empty Home, and a client
      * still waiting on the browser. */
     int keep_view = (flag == &g_confirm_open) || (flag == &g_sch_open) || (flag == &g_sr_open) ||
-                    (flag == &g_jc_open) || (flag == &g_pc_open) ||
+                    (flag == &g_jc_open) || (flag == &g_pc_open) || (flag == &g_wsu_open) ||
                     g_view == VIEW_SIGNIN;
     int prev_view = g_view;
     /* A modal covers the window; it is not about the profile beside it. Edit
@@ -18691,6 +18798,8 @@ static void modal_finish(int save) {
     if (g_status_edit) field_show(g_status_edit, 0);
     for (int k = 0; k < 2; k++) if (g_sr_edit[k]) field_show(g_sr_edit[k], 0);
     if (g_jc_edit) field_show(g_jc_edit, 0);
+    if (g_wsm_q) field_show(g_wsm_q, 0);
+    if (g_wsu_edit) field_show(g_wsu_edit, 0);
     pc_fields_hide();
     int te_was = g_te_open;
     const oc_modal_spec *s = modal_current();
@@ -18709,6 +18818,7 @@ static void modal_finish(int save) {
     g_prefs_open = g_keys_open = g_about_open = g_wsmgr_open = g_notify_open = g_browse_open = 0;
     g_confirm_open = g_sessions_open = g_status_open = g_sch_open = g_sr_open = g_pc_open = 0;
     g_jc_open = 0;
+    g_wsu_open = 0;
     g_te_open = 0;
     g_sv_open = 0;
     if (te_was) te_closed();
@@ -18722,7 +18832,10 @@ static void modal_finish(int save) {
     if (g_n_modal_stack > 0) {
         int *back = g_modal_stack[--g_n_modal_stack];
         *back = 1;
-        if (back == &g_wsmgr_open) sw_book_load();
+        if (back == &g_wsmgr_open) {
+            sw_book_load();
+            if (g_wsm_q) { field_show(g_wsm_q, 1); focus_set(g_wsm_q); }
+        }
     }
     if (bc_no) bc_unconfirmed();
 }
@@ -18948,6 +19061,8 @@ static void layout_natives(oc_win *hwnd) {
     for (int k = 0; k < 2; k++)
         if (g_sr_edit[k]) field_show(g_sr_edit[k], g_sr_open && g_sr_erect[k].right > g_sr_erect[k].left);
     if (g_jc_edit) field_show(g_jc_edit, g_jc_open && g_jc_erect.right > g_jc_erect.left);
+    if (g_wsm_q) field_show(g_wsm_q, g_wsmgr_open && g_wsm_qbox.right > g_wsm_qbox.left);
+    if (g_wsu_edit) field_show(g_wsu_edit, g_wsu_open && g_wsu_erect.right > g_wsu_erect.left);
     /* The poll composer's: a row past the last is hidden, as is a row that
      * cannot change once the poll has votes (it takes no keyboard then). */
     if (g_pc_q) field_show(g_pc_q, g_pc_open && g_pc_qrect.right > g_pc_qrect.left);
@@ -20905,6 +21020,8 @@ static int fields_mouse(int kind, float x, float y) {
     for (int k = 0; k < 2; k++) if (g_sr_edit[k]) modal[nm++] = g_sr_edit[k];
     if (g_pc_q) modal[nm++] = g_pc_q;
     if (g_pc_time) modal[nm++] = g_pc_time;
+    if (g_wsm_q) modal[nm++] = g_wsm_q;
+    if (g_wsu_edit) modal[nm++] = g_wsu_edit;
     if (g_te_open) modal[nm++] = &g_te_field;
     for (int i = 0; i < OC_POLL_MAX_OPTIONS; i++) if (g_pc_opt[i]) modal[nm++] = g_pc_opt[i];
     for (int i = 0; i < FORM_MAX_FIELDS && nm < 24 + FORM_MAX_FIELDS; i++) if (g_form_edit[i]) modal[nm++] = g_form_edit[i];
@@ -31251,7 +31368,7 @@ static void wsmgr_ask_forget(oc_win *hwnd, int row) {
 /* One row's button, pressed -- by a click or by an invoke through the tree. */
 static void wsmgr_act(oc_win *hwnd, int row, int act) {
     if (row < 0 || row >= g_n_sw) return;
-    g_wsmgr_focus = row;
+    g_wsmgr_focus = wsmgr_row_of(row);
     char ws[256], user[80];
     snprintf(ws, sizeof ws, "%s", g_sw[row].ws);
     snprintf(user, sizeof user, "%s", g_sw[row].user);
@@ -31274,32 +31391,73 @@ static void wsmgr_act(oc_win *hwnd, int row, int act) {
 }
 
 /* The Workspaces dialog's keys: the arrows, Page Up/Down, Home and End move a row
- * focus that the paint keeps in view, and Delete asks to remove that row. Enter
- * and Esc stay the frame's. Returns 1 when the key was the list's. */
+ * focus that the paint keeps in view, Enter opens that row's workspace (or signs
+ * in to it), and Delete asks to remove it. With no row chosen, Enter and Esc stay
+ * the frame's. Returns 1 when the key was the list's. Rows are the filtered,
+ * ordered view (wsmgr_view). */
 static int wsmgr_key(oc_win *hwnd, int vk) {
-    if (!g_wsmgr_open || g_n_sw <= 0) return 0;
+    if (!g_wsmgr_open) return 0;
+    wsmgr_view();
+    if (g_n_swv <= 0) return 0;
     float rowh = UIS(54), visible = g_wsmgr_list.bottom - g_wsmgr_list.top;
     int page = rowh > 0 ? (int)(visible / rowh) : 1;
     if (page < 1) page = 1;
     int at = g_wsmgr_focus;
+    if (at >= g_n_swv) at = g_n_swv - 1;
     switch (vk) {
     case OCK_DOWN:  at = at < 0 ? 0 : at + 1; break;
     case OCK_UP:    at = at < 0 ? 0 : at - 1; break;
     case OCK_NEXT:  at = at < 0 ? 0 : at + page; break;
     case OCK_PRIOR: at = at < 0 ? 0 : at - page; break;
     case OCK_HOME:  at = 0; break;
-    case OCK_END:   at = g_n_sw - 1; break;
+    case OCK_END:   at = g_n_swv - 1; break;
+    case OCK_RETURN:
+        if (at < 0) return 0;
+        wsmgr_act(hwnd, g_swv[at], WSM_GO);
+        return 1;
     case OCK_DELETE:
         if (at < 0) return 0;
-        wsmgr_ask_forget(hwnd, at);
+        wsmgr_ask_forget(hwnd, g_swv[at]);
         return 1;
     default: return 0;
     }
     if (at < 0) at = 0;
-    if (at >= g_n_sw) at = g_n_sw - 1;
+    if (at >= g_n_swv) at = g_n_swv - 1;
     g_wsmgr_focus = at;
     g_wsmgr_reveal = 1;
     return 1;
+}
+
+/* The filter box's keys. Typing filters; Up, Down, Page Up and Page Down move
+ * through the rows without leaving the box; Enter opens the row chosen, or the
+ * first that matches once something is typed; Delete at the end of the text,
+ * where it would delete nothing, removes the row chosen. Esc is the frame's. */
+static int wsm_q_key(field *f, int key, int ctrl, int shift) {
+    (void)ctrl; (void)shift;
+    if (!g_wsmgr_open) return 0;
+    switch (key) {
+    case OCK_UP: case OCK_DOWN: case OCK_PRIOR: case OCK_NEXT:
+        return wsmgr_key(g_main, key);
+    case OCK_RETURN:
+        wsmgr_view();
+        if (g_wsmgr_focus < 0 && f->buf[0] && g_n_swv > 0) g_wsmgr_focus = 0;
+        return wsmgr_key(g_main, key);
+    case OCK_DELETE:
+        if (f->caret < f->len || f->anchor != f->caret) return 0;
+        return wsmgr_key(g_main, key);
+    }
+    return 0;
+}
+/* A new filter is a new list: from its top, with no row chosen. */
+/* Typing in the Workspaces dialog filters, wherever the keyboard was in it: a
+ * key typed with no field focused (after a click on a row) goes to the box. */
+static void wsm_claim_text(void) {
+    if (!g_focus && g_wsmgr_open && g_wsm_q && g_wsm_q->visible) focus_set(g_wsm_q);
+}
+static void wsm_q_changed(field *f) {
+    (void)f;
+    g_wsmgr_focus = -1;
+    if (g_wsmgr_open) g_ovl_scroll = 0;
 }
 
 /* Admin > Custom emoji's keys while no field has them, on the Workspaces
@@ -33906,7 +34064,7 @@ static int ws_find(const char *ws) {
  * tick loop's "other workspaces" pass, and to the unread badge. */
 static void ws_register(void) {
     int slot = ws_find(g_cur_ws);
-    if (slot < 0 && g_n_wss < WS_MAX) {
+    if (slot < 0 && g_n_wss < WS_OPEN_MAX) {
         slot = g_n_wss++;
         memset(&g_wss[slot], 0, sizeof g_wss[slot]);
         snprintf(g_wss[slot].ws, sizeof g_wss[slot].ws, "%s", g_cur_ws);
@@ -33976,16 +34134,287 @@ static void ws_forget_begin(const char *ws) {
  * Remove all): each as Remove takes one, background ones first, the one on
  * screen last, since that one is forgotten once its sign-out lands. By address,
  * from a copy: each removal reloads the list. */
-static void ws_forget_all(void) {
-    char ws[16][256];
-    int n = 0, cur = -1;
-    for (int i = 0; i < g_n_sw && n < 16; i++) {
-        int slot = ws_find(g_sw[i].ws);
-        if (slot >= 0 && slot == g_ws_active && g_wss[slot].client) cur = n;
-        snprintf(ws[n++], sizeof ws[0], "%s", g_sw[i].ws);
+static void ws_forget_list(char (*ws)[256], int n) {
+    int cur = -1;
+    for (int i = 0; i < n; i++) {
+        int slot = ws_find(ws[i]);
+        if (slot >= 0 && slot == g_ws_active && g_wss[slot].client) cur = i;
     }
     for (int i = 0; i < n; i++) if (i != cur) ws_forget_begin(ws[i]);
     if (cur >= 0) ws_forget_begin(ws[cur]);
+}
+
+static void ws_forget_all(void) {
+    if (g_n_sw <= 0) return;
+    char (*ws)[256] = malloc((size_t)g_n_sw * sizeof *ws);
+    if (!ws) return;
+    for (int i = 0; i < g_n_sw; i++) snprintf(ws[i], sizeof ws[0], "%s", g_sw[i].ws);
+    ws_forget_list(ws, g_n_sw);
+    free(ws);
+}
+
+/* The set a bulk removal's confirmation named (g_wsx), each as Remove takes one. */
+static void ws_forget_set(void) {
+    ws_forget_list(g_wsx, g_n_wsx);
+    free(g_wsx); g_wsx = NULL; g_n_wsx = 0;
+}
+
+/* Room for `n` addresses in g_wsx, emptied. 0 when there is none. */
+static int wsx_reset(int n) {
+    free(g_wsx); g_wsx = NULL; g_n_wsx = 0;
+    if (n <= 0) return 1;
+    g_wsx = malloc((size_t)n * sizeof *g_wsx);
+    return g_wsx != NULL;
+}
+
+/* Ask about the set in g_wsx, saying how many and naming each one. `why` is
+ * what they have in common, between commas: ", not used since 3 May 2026,". */
+static void wsx_ask(oc_win *hwnd, const char *why) {
+    char names[1500];
+    size_t at = 0;
+    int cur = 0;
+    names[0] = '\0';
+    for (int k = 0; k < g_n_wsx; k++) {
+        const char *nm = g_wsx[k];
+        for (int i = 0; i < g_n_sw; i++)
+            if (!strcmp(g_sw[i].ws, g_wsx[k])) { if (g_sw[i].label[0]) nm = g_sw[i].label; break; }
+        int slot = ws_find(g_wsx[k]);
+        if (slot >= 0 && slot == g_ws_active && g_wss[slot].client) cur = 1;
+        /* Each name, while there is room for it and for the count of the rest. */
+        size_t room = sizeof names - at;
+        int w = room > 40 ? snprintf(names + at, room - 40, "%s%s", k ? ", " : "", nm) : -1;
+        if (w < 0 || (size_t)w >= room - 40) {
+            names[at] = '\0';
+            snprintf(names + at, sizeof names - at, " and %d more", g_n_wsx - k);
+            break;
+        }
+        at += (size_t)w;
+    }
+    char title[80], ok[32], body[2048];
+    if (g_n_wsx == 1) {
+        snprintf(title, sizeof title, "Remove 1 workspace?");
+        snprintf(ok, sizeof ok, "Remove");
+    } else {
+        snprintf(title, sizeof title, "Remove %d workspaces?", g_n_wsx);
+        snprintf(ok, sizeof ok, "Remove %d", g_n_wsx);
+    }
+    snprintf(body, sizeof body,
+             "Remove %s%s from this device?\n\n%s.\n\n"
+             "Each one's saved sign-in is deleted. You can add any of them again by "
+             "entering its address.%s",
+             g_n_wsx == 1 ? "this workspace" : "these workspaces", why, names,
+             cur ? "\n\nYou are signed in to one of them; this signs you out first." : "");
+    confirm_open(hwnd, CONF_WS_FORGET_SET, 0, title, body, ok);
+}
+
+/* ---- Remove unused: the day ------------------------------------------------ */
+
+/* The day typed, as its local midnight; 0 with g_wsu_err saying why when it
+ * is not one. */
+static uint64_t wsu_day(void) {
+    g_wsu_err = NULL;
+    const char *t = g_wsu_edit ? g_wsu_edit->buf : "";
+    if (!t[0]) { g_wsu_err = "Enter a day first."; return 0; }
+    uint64_t day = parse_day(t);
+    if (!day) { g_wsu_err = "That is not a date OpenChime can read. Try 2026-05-03."; return 0; }
+    if (day > (uint64_t)time(NULL) * 1000) { g_wsu_err = "That day has not happened yet."; return 0; }
+    return day;
+}
+
+/* How many remembered workspaces were last used before `day`. */
+static int wsu_count(uint64_t day) {
+    int n = 0;
+    for (int i = 0; i < g_n_sw; i++) if (g_sw[i].last_used < day) n++;
+    return n;
+}
+
+static int wsu_key(field *f, int key, int ctrl, int shift) {
+    (void)f; (void)ctrl; (void)shift;
+    if (!g_wsu_open) return 0;
+    if (key == OCK_RETURN) { menu_dispatch(g_main, WSM_CMD_UNUSED_GO); return 1; }
+    return 0;
+}
+static void wsu_changed(field *f) { (void)f; g_wsu_err = NULL; invalidate(); }
+
+/* Remove unused, from the Workspaces dialog: it comes back to that dialog. */
+static void wsu_open(oc_win *hwnd) {
+    static field fld;
+    if (!g_wsu_edit) {
+        field_init(&fld, "Date (ex. 2026-05-03, or 3 May)", 0, 0);
+        fld.key = wsu_key; fld.changed = wsu_changed; fld.maxlen = 47;
+        g_wsu_edit = &fld;
+    }
+    field_set(g_wsu_edit, "");
+    g_wsu_err = NULL;
+    modal_enter(hwnd, &g_wsu_open);
+    field_show(g_wsu_edit, 1);
+    focus_set(g_wsu_edit);
+}
+
+static void draw_wsunused(gfx *rt, rectf body) {
+    float x0 = body.left + UIS(4.0f), x1 = body.right - UIS(4.0f), y = body.top + UIS(2.0f);
+    draw_text(rt, "Not used since", g_meta, rf(x0 + UIS(2.0f), y, x1, y + SR_LABEL_H), OC_COL_MUTED);
+    y += SR_LABEL_H;
+    rectf b = rf(x0, y, x1, y + SR_FIELD_H);
+    int focused = g_wsu_edit && g_focus == g_wsu_edit;
+    fill_round(rt, b, OC_R_CONTROL, OC_COL_INPUT);
+    stroke_round(rt, b, OC_R_CONTROL, focused ? OC_COL_ACCENT : OC_COL_BORDER, focused ? 2.0f : 1.0f);
+    float ih = UIS(16.0f), iy = (b.top + b.bottom) / 2 - ih / 2;
+    draw_lucide(rt, OC_ICON_CALENDAR, rf(b.left + UIS(11.0f), iy, b.left + UIS(11.0f) + ih, iy + ih), OC_COL_MUTED);
+    g_wsu_erect = rf(b.left + UIS(34.0f), b.top, b.right, b.bottom);
+    if (g_wsu_edit) field_draw(rt, g_wsu_edit, rf(g_wsu_erect.left + 2, b.top, b.right - 10, b.bottom), OC_COL_TEXT);
+    y = b.bottom + UIS(10.0f);
+    rectf line = rf(x0 + UIS(2.0f), y, x1, body.bottom);
+    if (g_wsu_err) { draw_text(rt, g_wsu_err, g_meta_w, line, OC_COL_DANGER); return; }
+    char t[160];
+    uint64_t day = g_wsu_edit && g_wsu_edit->buf[0] ? parse_day(g_wsu_edit->buf) : 0;
+    if (day) snprintf(t, sizeof t, "%d of the %d remembered workspaces were last used before that day.",
+                      wsu_count(day), g_n_sw);
+    else     snprintf(t, sizeof t, "Every workspace last used before that day is removed, once you confirm.");
+    draw_text(rt, t, g_meta_w, line, OC_COL_MUTED);
+}
+
+/* Continue: the workspaces last used before the day, to be confirmed. */
+static void wsu_continue(oc_win *hwnd) {
+    if (!g_wsu_open) return;
+    uint64_t day = wsu_day();
+    if (!day) { invalidate(); return; }
+    sw_book_load();
+    int n = wsu_count(day);
+    if (n == 0) { g_wsu_err = "No remembered workspace was last used before that day."; invalidate(); return; }
+    if (!wsx_reset(n)) return;
+    for (int i = 0; i < g_n_sw; i++)
+        if (g_sw[i].last_used < day) snprintf(g_wsx[g_n_wsx++], sizeof g_wsx[0], "%s", g_sw[i].ws);
+    char why[96] = ", not used since that day,";
+    time_t tt = (time_t)(day / 1000); struct tm tv;
+    if (oc_localtime_r(&tt, &tv)) {
+        char d[48];
+        strftime(d, sizeof d, "%B %Y", &tv);
+        snprintf(why, sizeof why, ", not used since %d %s,", tv.tm_mday, d);
+    }
+    /* This dialog gives way to the confirmation, which goes back to the
+     * Workspaces dialog under it. */
+    g_wsu_open = 0;
+    if (g_wsu_edit) field_show(g_wsu_edit, 0);
+    focus_set(NULL);
+    wsx_ask(hwnd, why);
+}
+
+/* ---- Remove unreachable: who answers ----------------------------------------
+ *
+ * Each remembered workspace not connected now is asked how it signs people in
+ * (oc_net_probe_ex, as the sign-in card asks), off the UI thread, a few at a
+ * time. One that has not answered within WSP_WAIT_MS of being asked is
+ * unreachable. The workers are joined once they have all finished; until then
+ * the button stays grey. */
+#define WSP_WORKERS 6
+#define WSP_WAIT_MS 5000
+enum { WSP_WAITING, WSP_ASKING, WSP_ANSWERED, WSP_SILENT };
+typedef struct { char ws[256]; unsigned char fp[32]; int have_fp; uint64_t asked; int state; } wsp_item;
+static struct {
+    oc_mutex_t  mu;
+    int         mu_ready;
+    wsp_item   *it;
+    int         n, next;
+    oc_thread_t th[WSP_WORKERS];
+    int         n_th, n_ended;
+    int         judged;             /* the UI has had its answer */
+} g_wsp;
+
+static int wsp_busy(void) { return g_wsp.n_th > 0; }
+
+static void *wsp_worker(void *arg) {
+    (void)arg;
+    oc_cert_seen *seen = malloc(sizeof *seen);
+    oc_signin_source src[4];
+    for (;;) {
+        wsp_item item;
+        oc_mutex_lock(&g_wsp.mu);
+        int k = g_wsp.next < g_wsp.n ? g_wsp.next++ : -1;
+        if (k >= 0) {
+            g_wsp.it[k].state = WSP_ASKING;
+            g_wsp.it[k].asked = now_ms();
+            item = g_wsp.it[k];
+        }
+        oc_mutex_unlock(&g_wsp.mu);
+        if (k < 0) break;
+        int answered = 0;
+        oc_endpoint ep;
+        if (seen && oc_resolve(item.ws, oc_default_suffix(), &ep) == OC_RESOLVE_OK)
+            answered = oc_net_probe_ex(ep.domain, ep.host, ep.port, item.have_fp ? item.fp : NULL,
+                                       src, 4, seen) != OC_PROBE_UNREACHABLE;
+        oc_mutex_lock(&g_wsp.mu);
+        /* Too late is no answer: the UI has judged it already. */
+        if (g_wsp.it[k].state == WSP_ASKING) g_wsp.it[k].state = answered ? WSP_ANSWERED : WSP_SILENT;
+        oc_mutex_unlock(&g_wsp.mu);
+    }
+    free(seen);
+    oc_mutex_lock(&g_wsp.mu);
+    g_wsp.n_ended++;
+    oc_mutex_unlock(&g_wsp.mu);
+    return NULL;
+}
+
+/* Remove unreachable, pressed. */
+static void wsp_start(void) {
+    if (wsp_busy()) return;
+    sw_book_load();
+    if (!g_wsp.mu_ready) { oc_mutex_init(&g_wsp.mu); g_wsp.mu_ready = 1; }
+    free(g_wsp.it); g_wsp.it = NULL; g_wsp.n = 0; g_wsp.next = 0;
+    g_wsp.n_ended = 0; g_wsp.judged = 0;
+    if (g_n_sw > 0) g_wsp.it = calloc((size_t)g_n_sw, sizeof *g_wsp.it);
+    if (g_n_sw > 0 && !g_wsp.it) return;
+    for (int i = 0; i < g_n_sw; i++) {
+        /* One connected now has answered. */
+        int slot = ws_find(g_sw[i].ws);
+        oc_client *c = slot < 0 ? NULL : slot == g_ws_active && g_client ? g_client : g_wss[slot].client;
+        const oc_model *wm = c ? oc_client_model(c) : NULL;
+        if (wm && wm->connected) continue;
+        wsp_item *it = &g_wsp.it[g_wsp.n++];
+        snprintf(it->ws, sizeof it->ws, "%s", g_sw[i].ws);
+        it->have_fp = trust_load(it->ws, it->fp);
+    }
+    if (g_wsp.n == 0) { fb_confirm("Every remembered workspace is connected."); return; }
+    int want = g_wsp.n < WSP_WORKERS ? g_wsp.n : WSP_WORKERS;
+    for (int t = 0; t < want; t++) {
+        if (oc_thread_create(&g_wsp.th[g_wsp.n_th], wsp_worker, NULL) != 0) break;
+        g_wsp.n_th++;
+    }
+    if (g_wsp.n_th == 0) fb_failed("The workspaces could not be checked.");
+    invalidate();
+}
+
+/* Every one has answered or run out of time: the unreachable, to be confirmed,
+ * if the Workspaces dialog is still the one open. */
+static void wsp_judge(oc_win *hwnd) {
+    int n = 0;
+    for (int k = 0; k < g_wsp.n; k++) if (g_wsp.it[k].state == WSP_SILENT) n++;
+    if (!g_wsmgr_open) return;
+    if (n == 0) { fb_confirm("Every remembered workspace answered."); return; }
+    if (!wsx_reset(n)) return;
+    for (int k = 0; k < g_wsp.n; k++)
+        if (g_wsp.it[k].state == WSP_SILENT) snprintf(g_wsx[g_n_wsx++], sizeof g_wsx[0], "%s", g_wsp.it[k].ws);
+    wsx_ask(hwnd, ", which did not answer within 5 seconds,");
+}
+
+static void wsp_tick(oc_win *hwnd) {
+    if (!wsp_busy()) return;
+    uint64_t now = now_ms();
+    int open = 0;
+    oc_mutex_lock(&g_wsp.mu);
+    for (int k = 0; k < g_wsp.n; k++) {
+        wsp_item *it = &g_wsp.it[k];
+        if (it->state == WSP_ASKING && now - it->asked >= WSP_WAIT_MS) it->state = WSP_SILENT;
+        if (it->state == WSP_WAITING || it->state == WSP_ASKING) open++;
+    }
+    int ended = g_wsp.n_ended;
+    oc_mutex_unlock(&g_wsp.mu);
+    if (!open && !g_wsp.judged) { g_wsp.judged = 1; wsp_judge(hwnd); invalidate(); }
+    if (ended == g_wsp.n_th) {
+        for (int t = 0; t < g_wsp.n_th; t++) oc_thread_join(g_wsp.th[t]);
+        g_wsp.n_th = 0;
+        invalidate();
+    }
 }
 
 static void ws_forget(const char *ws) {
@@ -34073,13 +34502,19 @@ static void ws_load(int i) {
 }
 
 /* Collect the remembered workspaces, so boot can connect them all. */
-typedef struct { char ws[WS_MAX][256]; int n; } ws_book;
+typedef struct { char (*ws)[256]; int n, cap; } ws_book;
 
 static void boot_book_cb(void *ctx, const char *workspace, const char *label,
                          const char *username, uint64_t last) {
     (void)label; (void)username; (void)last;
     ws_book *b = ctx;
-    if (!workspace || !workspace[0] || b->n >= WS_MAX) return;
+    if (!workspace || !workspace[0]) return;
+    if (b->n == b->cap) {
+        int cap = b->cap ? b->cap * 2 : 16;
+        char (*ws)[256] = realloc(b->ws, (size_t)cap * sizeof *ws);
+        if (!ws) return;
+        b->ws = ws; b->cap = cap;
+    }
     snprintf(b->ws[b->n++], 256, "%s", workspace);
 }
 
@@ -34133,12 +34568,12 @@ static void boot_other_workspaces(const char *skip) {
     oc_store *s = sp ? oc_store_open(sp) : NULL;
     if (!s) return;
     oc_store_set_secret(s, g_secret);
-    ws_book b; b.n = 0;
+    ws_book b = { NULL, 0, 0 };
     oc_store_workspace_each(s, boot_book_cb, &b);
     oc_store_close(s);
 
     int keep = g_ws_active;      /* -1 when nothing is up yet; ws_load handles it */
-    for (int i = 0; i < b.n && g_n_wss < WS_MAX; i++) {
+    for (int i = 0; i < b.n && g_n_wss < WS_OPEN_MAX; i++) {
         if (skip && strcmp(b.ws[i], skip) == 0) continue;
         if (ws_find(b.ws[i]) >= 0) continue;
         if (!have_stored_token(b.ws[i])) continue;
@@ -34146,6 +34581,7 @@ static void boot_other_workspaces(const char *skip) {
         g_client = NULL; g_sel = 0; g_scroll = 0; g_post_auth = 0; g_n_backfilled = 0;
         connect_start(b.ws[i], "");
     }
+    free(b.ws);
     /* Back to the one the user last used: the extras are background. */
     ws_save_active();
     if (keep >= 0) ws_load(keep);
@@ -34905,14 +35341,20 @@ static void switch_workspace(oc_win *hwnd, const char *ws, const char *cred) {
 
 static void sw_book_cb(void *ctx, const char *workspace, const char *label,
                        const char *username, uint64_t last) {
-    (void)ctx; (void)last;
-    if (g_n_sw >= (int)(sizeof g_sw / sizeof g_sw[0])) return;
+    (void)ctx;
+    if (g_n_sw == g_cap_sw) {
+        int cap = g_cap_sw ? g_cap_sw * 2 : 16;
+        sw_entry *sw = realloc(g_sw, (size_t)cap * sizeof *sw);
+        if (!sw) return;
+        g_sw = sw; g_cap_sw = cap;
+    }
     snprintf(g_sw[g_n_sw].ws, sizeof g_sw[g_n_sw].ws, "%s", workspace ? workspace : "");
     snprintf(g_sw[g_n_sw].label, sizeof g_sw[g_n_sw].label, "%s",
              (label && label[0]) ? label : (workspace ? workspace : "?"));
     /* Kept so a signed-out workspace can go straight to its password. */
     snprintf(g_sw[g_n_sw].user, sizeof g_sw[g_n_sw].user, "%s", username ? username : "");
     g_sw[g_n_sw].current = (g_client != NULL && strcmp(g_sw[g_n_sw].ws, g_cur_ws) == 0);
+    g_sw[g_n_sw].last_used = last;
     g_n_sw++;
 }
 
@@ -35382,10 +35824,16 @@ static void open_switcher(oc_win *hwnd) {
     sw_book_load();
     g_n_mi = 0;
     mi_section("WORKSPACES");
+    /* The menu holds a few more than sixteen rows, and Add and Manage come
+     * after the list: the signed-in workspaces always, and the rest up to
+     * sixteen rows. Manage workspaces lists every one. */
+    int shown = 0;
     for (int i = 0; i < g_n_sw; i++) {
         /* Say which are actually connected and what is waiting in them — the
          * point of holding N clients is that you can see it without switching. */
         int slot = ws_find(g_sw[i].ws);
+        if (!(slot >= 0 && g_wss[slot].client) && shown >= 16) continue;
+        shown++;
         int unread = 0;
         if (slot >= 0 && g_wss[slot].client) {
             const oc_model *wm = oc_client_model(g_wss[slot].client);
@@ -36764,6 +37212,9 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         snprintf(url, sizeof url, "%s%s", OC_RN_PAGE_URL, OC_BUILD_ID);
         signin_open_url(oc_releasenotes_askable(OC_BUILD_ID) ? url : OC_RN_INDEX_URL);
         break; }
+    case WSM_CMD_UNUSED:    wsu_open(hwnd); break;
+    case WSM_CMD_UNUSED_GO: wsu_continue(hwnd); break;
+    case WSM_CMD_UNREACH:   wsp_start(); break;
     case WSM_CMD_REMOVE_ALL: {
         if (g_n_sw <= 0) break;
         char what[48], body[320];
@@ -36862,7 +37313,11 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         /* A fresh opening starts at the top with no row chosen; coming BACK to it
          * from a confirmation keeps both (modal_finish). */
         sw_book_load(); g_wsmgr_focus = -1; g_ovl_kind = 0;
-        modal_enter(hwnd, &g_wsmgr_open); break;
+        if (g_wsm_q) field_set(g_wsm_q, "");
+        modal_enter(hwnd, &g_wsmgr_open);
+        /* The keyboard starts in the filter box: typing filters at once. */
+        if (g_wsm_q) { field_show(g_wsm_q, 1); focus_set(g_wsm_q); }
+        break;
     default:
         /* Section Filter/Sort (see SEC_CMD). */
         /* The range covers the custom sections too (numbered from
@@ -37415,7 +37870,8 @@ static void *devlist_thread(void *arg) {
 /* The open confirmation, and which one: the harness answers some of them
  * (tools/gui/drive.sh trust_dev_cert, lib.sh sign_in_card), signed in or not. */
 static void test_dump_confirm(FILE *f) {
-    fprintf(f, "confirm open=%d act=%d url=\"%s\" emoji=\"%s\"\n", g_confirm_open, g_confirm_act, g_confirm_url, g_confirm_emoji);
+    fprintf(f, "confirm open=%d act=%d url=\"%s\" emoji=\"%s\" title=\"%s\"\n", g_confirm_open, g_confirm_act,
+            g_confirm_url, g_confirm_emoji, g_confirm_title);
 }
 
 /* THE TREE ITSELF, one line per element, so a check outside the client
@@ -37910,6 +38366,20 @@ static void test_dump(const char *path) {
                 g_preview_wait_ms, g_form_action_busy);
     }
     fprintf(f, "view=%d si_overlay=%d wsmgr=%d wsbook=%d\n", g_view, g_si_overlay, g_wsmgr_open, ws_book_count());
+    /* The Workspaces dialog's rows as they are listed: the filter's text, how
+     * many it admits of how many remembered, then each in order. */
+    fprintf(f, "wsunused open=%d err=\"%s\"\n", g_wsu_open, g_wsu_err ? g_wsu_err : "");
+    if (g_wsmgr_open) {
+        wsmgr_view();
+        fprintf(f, "wsmgr rows=%d of=%d focus=%d checking=%d filter=\"%s\"\n", g_n_swv, g_n_sw,
+                g_wsmgr_focus, wsp_busy(), g_wsm_q ? g_wsm_q->buf : "");
+        for (int v = 0; v < g_n_swv; v++) {
+            int i = g_swv[v];
+            char addr[300]; sw_addr(i, addr, sizeof addr);
+            fprintf(f, "  wsrow %d live=%d last=%llu addr=%s user=%s ws=%s\n", v, sw_live(i),
+                    (unsigned long long)g_sw[i].last_used, addr, g_sw[i].user[0] ? g_sw[i].user : "-", g_sw[i].ws);
+        }
+    }
     /* How the client started (tools/gui/startup.sh). `visible` is whether the
      * window is on screen at all -- a client that started and showed nothing
      * looked, from here, exactly like one that never started. `started` counts
@@ -38364,6 +38834,7 @@ static void test_dump(const char *path) {
             { "srch",  g_srch,      g_srch_box },
             { "files", g_ffind,     g_file_search_box },
             { "emoji", g_efind,     g_emoji_search_box },
+            { "wsmgr", g_wsm_q,     g_wsm_qbox },
             { "people", g_dir_edit, g_dir_search_box },
             { "pal",   g_pal_edit,  g_pal_box },
             { "pick",  g_pick_edit, g_pick_box },
@@ -39383,15 +39854,18 @@ static void test_poll(oc_win *hwnd) {
         ws_forget_begin(arg);
         test_ack("ok");
     } else if (!strcmp(verb, "wsbook")) {
-        /* "<workspace> <user>" — a book entry with no sign-in behind it, so the
-         * Workspaces dialog can be given more rows than fit. */
+        /* "<workspace> <user> [<days>]" — a book entry with no sign-in behind it,
+         * so the Workspaces dialog can be given more rows than fit; last used
+         * <days> ago, now when not given. */
         char ws[256] = "", user[80] = "";
-        sscanf(arg, "%255s %79s", ws, user);
+        int days = 0;
+        sscanf(arg, "%255s %79s %d", ws, user, &days);
+        if (days < 0) days = 0;
         const char *sp = store_path();
         oc_store *st = (sp && ws[0]) ? oc_store_open(sp) : NULL;
         if (st) {
             oc_store_set_secret(st, g_secret);
-            oc_store_workspace_remember(st, ws, NULL, user, (uint64_t)time(NULL) * 1000);
+            oc_store_workspace_remember(st, ws, NULL, user, ((uint64_t)time(NULL) - (uint64_t)days * 86400) * 1000);
             oc_store_close(st);
             test_ack("ok");
         } else test_ack("err");
@@ -40443,6 +40917,9 @@ static void fields_create(void) {
     ffind.changed = ffind_changed; ffind.maxlen = 63; g_ffind = &ffind;
     field_init(&efind, "Search custom emoji", 0, 0);
     efind.key = efind_key; efind.changed = efind_changed; efind.maxlen = 47; g_efind = &efind;
+    static field wsmq;
+    field_init(&wsmq, "Filter by name or address", 0, 0);
+    wsmq.key = wsm_q_key; wsmq.changed = wsm_q_changed; wsmq.maxlen = 79; g_wsm_q = &wsmq;
     field_init(&dir, "Search people", 0, 0);
     dir.changed = dir_changed; dir.maxlen = 79; g_dir_edit = &dir;
     field_init(&srch, "Search messages", 0, 0);
@@ -40479,6 +40956,7 @@ static int on_tick(oc_win *hwnd) {
                     oc_client_tick(g_wss[wi].client);
             /* And the sign-in attempt, which is not in a slot yet. */
             if (g_si_client) oc_client_tick(g_si_client);
+            wsp_tick(hwnd);
             /* The toolbar tooltip's dwell: nothing repaints while the pointer
              * rests, so the tick fires the one paint that reveals it. */
             if (g_fmt_hover >= 0 && !g_fmt_tip_shown &&
@@ -42626,6 +43104,7 @@ static void handle_event(const SDL_Event *e) {
     }
     case SDL_EVENT_TEXT_INPUT: {
         if (g_claimed_text) { g_claimed_text = 0; return; }
+        wsm_claim_text();
         if (g_focus) { field_text_input(g_focus, e->text.text); return; }
         oc_wch w[64];
         int n = to_w(e->text.text, w, 64);
@@ -42732,6 +43211,7 @@ static void synth_wheel(oc_win *hwnd, int x_dip, int y_dip, int delta) {
     on_wheel(hwnd, PX(x_dip), PX(y_dip), (float)delta / 120.0f, delta / 120);
 }
 static void synth_char(oc_win *hwnd, oc_wch ch) {
+    wsm_claim_text();
     if (g_focus) {
         char u8[8]; oc_wch w[2] = { ch, 0 };
         to_u8(w, u8, sizeof u8);

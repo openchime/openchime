@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# The Workspaces dialog (REQ-012/013): its rows fit, and Remove all empties it.
+# The Workspaces dialog (REQ-012/013): its rows fit, thirty more are listed,
+# ordered and filtered, Remove unused takes those not used since a day, Remove
+# unreachable names those that do not answer, and Remove all empties it.
 #
 #   tools/gui/workspaces.sh            # run, and leave the client running
 #   tools/gui/workspaces.sh --down     # ... and take it down afterwards
@@ -92,6 +94,90 @@ check "nothing in it is clipped" [ "$(clipped)" = 0 ]
 # By its start: an id is cut at the accessibility tree's limit (OC_ACC_AID_MAX).
 check "each row's Remove is published" has_item_prefix "wsmgr.remove.${LONG_WS:0:20}"
 check "...and Remove all, by its name" has_item "modal.button.remove all workspaces"
+
+say "== thirty more: listed, ordered, filtered, and the unused removed by date"
+# fixture-01..15 last used forty days ago, fixture-16..30 two days ago; the
+# cut-off is thirty days ago, so the first fifteen go and the rest stay.
+"$DRIVE" key esc >/dev/null
+check "the dialog closes" wait_key wsmgr 0
+for i in $(seq -w 1 30); do
+  age=2; [ "$((10#$i))" -le 15 ] && age=40
+  "$DRIVE" wsbook "fixture-$i.example.invalid:443" "user$i" "$age" >/dev/null
+done
+n30=$((n0 + 30))
+check "the book holds all of them ($n30)" wait_key wsbook "$n30"
+"$DRIVE" open 81 >/dev/null
+check "the Workspaces dialog is open again" wait_key wsmgr 1
+# Each reads one whole dump first: under pipefail, grep -q or -m1 stopping
+# early would fail the pipe it reads from even on a match.
+wsrows() { local S; S="$(snap)"; grep -m1 '^wsmgr rows=' <<<"$S" | grep -o '\brows=[0-9]*' | cut -d= -f2; }
+wait_rows() {                      # wait_rows <n>
+  local t=0
+  while :; do
+    [ "$(wsrows)" = "$1" ] && return 0
+    [ "$t" -ge "$WAIT_MS" ] && return 1
+    sleep 0.1; t=$((t + 100))
+  done
+}
+fixtures() { local S; S="$(snap)"; grep -c '^  wsrow .* ws=fixture-' <<<"$S"; }
+first_signed_in() { local S; S="$(snap)"; grep -q '^  wsrow 0 live=1 ' <<<"$S"; }
+last_is_old() { local S; S="$(snap)"; grep '^  wsrow ' <<<"$S" | tail -1 | grep -q 'ws=fixture-\(0[1-9]\|1[0-5]\)\.'; }
+focus_is() {                       # focus_is <row>, once the key has landed
+  local S t=0
+  while :; do
+    S="$(snap)"; grep -q "^wsmgr rows=[0-9]* of=[0-9]* focus=$1 " <<<"$S" && return 0
+    [ "$t" -ge "$WAIT_MS" ] && return 1
+    sleep 0.1; t=$((t + 100))
+  done
+}
+title_is() { local S; S="$(snap)"; grep -m1 '^confirm open=' <<<"$S" | grep -qF "title=\"$1\""; }
+check "every workspace is listed ($n30)" wait_rows "$n30"
+check "...the thirty fixtures among them" [ "$(fixtures)" = 30 ]
+check "the signed-in workspace comes first" first_signed_in
+check "...and the least recently used last" last_is_old
+"$DRIVE" typekeys "fixture-0" >/dev/null
+check "typing filters: fixture-0 leaves nine" wait_rows 9
+"$DRIVE" key down >/dev/null
+check "Down chooses the first row" focus_is 0
+"$DRIVE" key esc >/dev/null
+check "Esc closes the dialog" wait_key wsmgr 0
+"$DRIVE" open 81 >/dev/null
+check "reopened, the filter is empty again" wait_rows "$n30"
+press "modal.button.remove unused…"
+asks_day() {
+  local t=0
+  while :; do
+    local S; S="$(snap)"; grep -q '^wsunused open=1 ' <<<"$S" && return 0
+    [ "$t" -ge "$WAIT_MS" ] && return 1
+    sleep 0.1; t=$((t + 100))
+  done
+}
+check "Remove unused asks for a day" asks_day
+"$DRIVE" typekeys "$(date -d '30 days ago' +%F)" >/dev/null
+press "modal.button.continue"
+check "a confirmation asks" confirm_is 1
+check "...naming fifteen" title_is "Remove 15 workspaces?"
+press "modal.button.remove 15"
+check "fifteen are removed" wait_key wsbook "$((n30 - 15))"
+check "...back in the Workspaces dialog" wait_key wsmgr 1
+old_left=0; new_left=0
+S="$(snap)"
+for i in $(seq -w 1 30); do
+  grep -q "^  wsrow .* ws=fixture-$i\." <<<"$S" || continue
+  if [ "$((10#$i))" -le 15 ]; then old_left=$((old_left + 1)); else new_left=$((new_left + 1)); fi
+done
+check "...fixture-01 to 15, the unused ones, gone ($old_left left)" [ "$old_left" = 0 ]
+check "...and fixture-16 to 30 kept ($new_left of 15)" [ "$new_left" = 15 ]
+n0=$((n30 - 15))
+
+say "== Remove unreachable"
+# Every one left but alice's is an .invalid address no connection reaches;
+# alice's is connected, so it is not asked.
+press "modal.button.remove unreachable"
+check "a confirmation asks, once the check is done" confirm_is 1
+check "...naming the $((n0 - 1)) that did not answer" title_is "Remove $((n0 - 1)) workspaces?"
+press "modal.button.cancel"
+check "...and Cancel removes nothing" wait_key wsbook "$n0"
 
 say "== Remove all, then Cancel"
 press "modal.button.remove all workspaces"
