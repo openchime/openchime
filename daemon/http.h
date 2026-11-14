@@ -57,10 +57,23 @@ int oc_http_parse_head(const char *buf, size_t len, oc_http_req *req);
  * `max_body`. */
 int oc_http_parse(const char *buf, size_t len, size_t max_body, oc_http_req *req);
 
-/* The webhook message text for a parsed request: the JSON `"text"` field when
- * the body is JSON, otherwise the raw body. Writes a view (into the body) to
- * `out` and `outlen`. Returns 1 on success, 0 if there is no usable text. */
-int oc_http_webhook_text(const oc_http_req *req, const char **out, size_t *outlen);
+/* The webhook message text for a parsed request (ARCH-71), composed into `out`
+ * (at most `cap` - 1 bytes and a NUL, never ending inside a character), its
+ * length in *outlen:
+ *   - a body that is neither JSON nor a form: posted as sent;
+ *   - a form (application/x-www-form-urlencoded): its `payload` field,
+ *     URL-decoded, read as the JSON below;
+ *   - JSON, in the common chat-webhook format: the text of its `blocks` (header,
+ *     section with its fields, context), a block to a line, or else its `text`;
+ *     then each attachment's pretext, title (a link with its title_link), text
+ *     and fields (`*title*: value`), or its fallback when it has none of them.
+ *     Every string is JSON-unescaped and its link syntax converted (`<url|label>`
+ *     a labelled link, `<!here>` @here, `<#ID|name>` #name, `&lt;` `&gt;`
+ *     `&amp;`); `<@ID>` is left as written. `username`, the icons, `channel`,
+ *     `mrkdwn` and the unfurl flags are read past.
+ * Returns 1 with text, 0 with none: no body, a form with no `payload`, JSON that
+ * does not parse or has more tokens than the reader takes, or nothing to say. */
+int oc_http_webhook_payload(const oc_http_req *req, char *out, size_t cap, size_t *outlen);
 
 /* --- routes ------------------------------------------------------------------ */
 

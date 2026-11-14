@@ -2,11 +2,11 @@
 
 #include "http.h"
 #include "picohttpparser.h"
-#define JSMN_HEADER   /* jwt.c carries the jsmn implementation; we take declarations */
-#include "jsmn.h"
+#include "json.h"     /* jwt.c carries the jsmn implementation; this, the reader */
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int ci_eq(const char *a, size_t alen, const char *b) {
@@ -111,27 +111,284 @@ int oc_http_parse(const char *buf, size_t len, size_t max_body, oc_http_req *req
     return 1;
 }
 
-int oc_http_webhook_text(const oc_http_req *req, const char **out, size_t *outlen) {
-    if (!req->body || req->body_len == 0) return 0;
-    if (!req->is_json) { *out = req->body; *outlen = req->body_len; return *outlen > 0; }
+/* --- the webhook payload (ARCH-71) -------------------------------------------- */
 
-    /* JSON: pull the top-level "text" string value. */
-    jsmn_parser P; jsmn_init(&P);
-    jsmntok_t toks[64];
-    int n = jsmn_parse(&P, req->body, req->body_len, toks, (unsigned)(sizeof toks / sizeof toks[0]));
-    if (n < 1 || toks[0].type != JSMN_OBJECT) return 0;
-    for (int i = 1; i < n - 1; i++) {
-        if (toks[i].type == JSMN_STRING) {
-            size_t klen = (size_t)(toks[i].end - toks[i].start);
-            if (klen == 4 && memcmp(req->body + toks[i].start, "text", 4) == 0 &&
-                toks[i + 1].type == JSMN_STRING) {
-                *out = req->body + toks[i + 1].start;
-                *outlen = (size_t)(toks[i + 1].end - toks[i + 1].start);
-                return *outlen > 0;
+/* What is composed so far: at most `cap` - 1 bytes, then a NUL. Past the cap
+ * nothing more is taken, as a body past OC_MAX_BODY_SIZE never was. */
+typedef struct { char *p; size_t n, cap; int full; } wh_out;
+
+static void wh_put(wh_out *o, const char *s, size_t n) {
+    if (o->full) return;
+    if (n > o->cap - 1 - o->n) {
+        /* What fits, never ending inside a character; and nothing after it, so
+         * the text is cut short rather than missing a piece in its middle. */
+        n = o->cap - 1 - o->n;
+        while (n && ((unsigned char)s[n] & 0xC0) == 0x80) n--;
+        o->full = 1;
+    }
+    memcpy(o->p + o->n, s, n);
+    o->n += n;
+    o->p[o->n] = '\0';
+}
+
+/* The bytes of the UTF-8 character starting at s[0], at most `n`. */
+static size_t wh_char(const char *s, size_t n) {
+    unsigned char c = (unsigned char)s[0];
+    size_t l = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+    return l < n ? l : n;
+}
+static void wh_puts(wh_out *o, const char *s) { wh_put(o, s, strlen(s)); }
+
+static int starts(const char *s, size_t n, const char *pfx) {
+    size_t l = strlen(pfx);
+    return n >= l && memcmp(s, pfx, l) == 0;
+}
+
+/* The common chat-webhook format's markup in `s`, as the message format writes
+ * it (MARKDOWN.md): `<url|label>` a labelled link, `<url>` the address,
+ * `<!here>` and its kind @here, `<#ID|name>` #name, and the three entities it
+ * escapes. A mention by id, `<@ID>`, and anything else is left as written. */
+static void wh_convert(wh_out *o, const char *s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        if (s[i] == '&') {
+            if (starts(s + i, n - i, "&lt;"))  { wh_puts(o, "<"); i += 4; continue; }
+            if (starts(s + i, n - i, "&gt;"))  { wh_puts(o, ">"); i += 4; continue; }
+            if (starts(s + i, n - i, "&amp;")) { wh_puts(o, "&"); i += 5; continue; }
+        }
+        if (s[i] == '<') {
+            size_t j = i + 1;
+            while (j < n && s[j] != '>' && s[j] != '<' && s[j] != '\n') j++;
+            if (j < n && s[j] == '>' && j > i + 1) {
+                const char *in = s + i + 1;
+                size_t il = j - i - 1;
+                const char *bar = memchr(in, '|', il);
+                size_t vl = bar ? (size_t)(bar - in) : il;              /* before the bar */
+                const char *lab = bar ? bar + 1 : NULL;
+                size_t ll = bar ? il - vl - 1 : 0;
+                if (starts(in, il, "!here") || starts(in, il, "!channel") || starts(in, il, "!everyone")) {
+                    wh_puts(o, "@");
+                    wh_put(o, in + 1, vl - 1);
+                    i = j + 1;
+                    continue;
+                }
+                if (in[0] == '#' && lab && ll) {
+                    wh_puts(o, "#");
+                    wh_put(o, lab, ll);
+                    i = j + 1;
+                    continue;
+                }
+                if (starts(in, vl, "http://") || starts(in, vl, "https://")) {
+                    int plain = !lab || !ll || memchr(lab, '[', ll) || memchr(lab, ']', ll);
+                    if (lab && ll && !plain) {
+                        wh_puts(o, "[");
+                        wh_put(o, lab, ll);
+                        wh_puts(o, "](");
+                        wh_put(o, in, vl);
+                        wh_puts(o, ")");
+                    } else if (lab && ll) {                   /* a label the format cannot hold */
+                        wh_put(o, lab, ll);
+                        wh_puts(o, " (");
+                        wh_put(o, in, vl);
+                        wh_puts(o, ")");
+                    } else {
+                        wh_put(o, in, vl);
+                    }
+                    i = j + 1;
+                    continue;
+                }
+                if (starts(in, vl, "mailto:")) {
+                    /* Not an address the format links: the address, as text. */
+                    if (lab && ll) wh_put(o, lab, ll);
+                    else wh_put(o, in + 7, vl - 7);
+                    i = j + 1;
+                    continue;
+                }
             }
         }
+        size_t cl = wh_char(s + i, n - i);
+        wh_put(o, s + i, cl);
+        i += cl;
     }
-    return 0;
+}
+
+/* One string from the payload, unescaped and converted, on a line of its own. */
+static void wh_line(wh_out *o, const oc_json *d, int t) {
+    if (t < 0 || t >= d->n || d->t[t].type != JSMN_STRING) return;
+    size_t rl = (size_t)(d->t[t].end - d->t[t].start);
+    char *u = malloc(rl + 1);
+    if (!u) return;
+    if (oc_json_str(d, t, u, rl + 1) == 0 && u[0]) {
+        if (o->n) wh_puts(o, "\n");
+        wh_convert(o, u, strlen(u));
+    }
+    free(u);
+}
+
+/* The string at `key` of the object `obj`'s object `sub`: `text.text`. */
+static int wh_sub(const oc_json *d, int obj, const char *sub, const char *key) {
+    int s = oc_json_get(d, obj, sub);
+    return s >= 0 && d->t[s].type == JSMN_OBJECT ? oc_json_get(d, s, key) : -1;
+}
+
+/* Each element of the array at `arr`, by index: -1 past the last. */
+static int wh_elem(const oc_json *d, int arr, int k) {
+    if (arr < 0 || arr >= d->n || d->t[arr].type != JSMN_ARRAY || k >= d->t[arr].size) return -1;
+    int i = arr + 1;
+    for (int q = 0; q < k && i < d->n; q++) i = oc_json_skip(d, i);
+    return i < d->n ? i : -1;
+}
+
+static int wh_is(const oc_json *d, int t, const char *s) {
+    size_t l = strlen(s);
+    return t >= 0 && d->t[t].type == JSMN_STRING && (size_t)(d->t[t].end - d->t[t].start) == l &&
+           memcmp(d->js + d->t[t].start, s, l) == 0;
+}
+
+/* The blocks' text: header, section (its text and each field) and context (each
+ * element's text), a block to a line; any other kind is passed over. */
+static void wh_blocks(wh_out *o, const oc_json *d, int arr) {
+    for (int k = 0, b; (b = wh_elem(d, arr, k)) >= 0; k++) {
+        if (d->t[b].type != JSMN_OBJECT) continue;
+        int ty = oc_json_get(d, b, "type");
+        if (wh_is(d, ty, "header") || wh_is(d, ty, "section")) {
+            wh_line(o, d, wh_sub(d, b, "text", "text"));
+            if (wh_is(d, ty, "section")) {
+                int fs = oc_json_get(d, b, "fields");
+                for (int q = 0, f; (f = wh_elem(d, fs, q)) >= 0; q++)
+                    if (d->t[f].type == JSMN_OBJECT) wh_line(o, d, oc_json_get(d, f, "text"));
+            }
+        } else if (wh_is(d, ty, "context")) {
+            int es = oc_json_get(d, b, "elements");
+            for (int q = 0, e; (e = wh_elem(d, es, q)) >= 0; q++)
+                if (d->t[e].type == JSMN_OBJECT) wh_line(o, d, oc_json_get(d, e, "text"));
+        }
+    }
+}
+
+/* The string at `t` decoded into a malloc'd C string, or NULL. */
+static char *wh_str(const oc_json *d, int t) {
+    if (t < 0 || t >= d->n || d->t[t].type != JSMN_STRING) return NULL;
+    size_t rl = (size_t)(d->t[t].end - d->t[t].start);
+    char *u = malloc(rl + 1);
+    if (u && (oc_json_str(d, t, u, rl + 1) != 0 || !u[0])) { free(u); u = NULL; }
+    return u;
+}
+
+/* Each attachment: its pretext, title (a labelled link with its title_link),
+ * text and fields (`*title*: value`), each on its lines; with none of those, its
+ * fallback. */
+static void wh_attachments(wh_out *o, const oc_json *d, int arr) {
+    for (int k = 0, a; (a = wh_elem(d, arr, k)) >= 0; k++) {
+        if (d->t[a].type != JSMN_OBJECT) continue;
+        size_t before = o->n;
+        wh_line(o, d, oc_json_get(d, a, "pretext"));
+        char *title = wh_str(d, oc_json_get(d, a, "title"));
+        if (title) {
+            char *link = wh_str(d, oc_json_get(d, a, "title_link"));
+            /* As the format writes a link, so it converts as one. */
+            size_t cl = strlen(title) + (link ? strlen(link) : 0) + 4;
+            char *c = malloc(cl);
+            if (c) {
+                if (link) snprintf(c, cl, "<%s|%s>", link, title);
+                else      snprintf(c, cl, "%s", title);
+                if (o->n) wh_puts(o, "\n");
+                wh_convert(o, c, strlen(c));
+                free(c);
+            }
+            free(link);
+            free(title);
+        }
+        wh_line(o, d, oc_json_get(d, a, "text"));
+        int fs = oc_json_get(d, a, "fields");
+        for (int q = 0, f; (f = wh_elem(d, fs, q)) >= 0; q++) {
+            if (d->t[f].type != JSMN_OBJECT) continue;
+            char *ft = wh_str(d, oc_json_get(d, f, "title"));
+            char *fv = wh_str(d, oc_json_get(d, f, "value"));
+            if (ft || fv) {
+                if (o->n) wh_puts(o, "\n");
+                if (ft) { wh_puts(o, "*"); wh_convert(o, ft, strlen(ft)); wh_puts(o, "*"); }
+                if (ft && fv) wh_puts(o, ": ");
+                if (fv) wh_convert(o, fv, strlen(fv));
+            }
+            free(ft);
+            free(fv);
+        }
+        if (o->n == before) wh_line(o, d, oc_json_get(d, a, "fallback"));
+    }
+}
+
+static int hexv(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* A form body's `payload` field, URL-decoded into a malloc'd string, or NULL. */
+static char *form_payload(const char *b, size_t n, size_t *len) {
+    size_t i = 0;
+    while (i < n) {
+        size_t e = i;
+        while (e < n && b[e] != '&') e++;
+        if (e - i >= 8 && memcmp(b + i, "payload=", 8) == 0) {
+            char *out = malloc(e - i + 1);
+            size_t o = 0;
+            if (!out) return NULL;
+            for (size_t k = i + 8; k < e; k++) {
+                if (b[k] == '+') out[o++] = ' ';
+                else if (b[k] == '%' && k + 2 < e && hexv(b[k + 1]) >= 0 && hexv(b[k + 2]) >= 0) {
+                    out[o++] = (char)(hexv(b[k + 1]) * 16 + hexv(b[k + 2]));
+                    k += 2;
+                } else out[o++] = b[k];
+            }
+            out[o] = '\0';
+            *len = o;
+            return out;
+        }
+        i = e + 1;
+    }
+    return NULL;
+}
+
+int oc_http_webhook_payload(const oc_http_req *req, char *out, size_t cap, size_t *outlen) {
+    *outlen = 0;
+    if (!out || cap < 2) return 0;
+    out[0] = '\0';
+    if (!req->body || req->body_len == 0) return 0;
+    if (!req->is_json && !req->is_form) {
+        /* Plain text is posted as sent, as far as it fits. */
+        wh_out o = { out, 0, cap, 0 };
+        wh_put(&o, req->body, req->body_len);
+        *outlen = o.n;
+        return o.n > 0;
+    }
+    const char *js = req->body;
+    size_t jl = req->body_len;
+    char *form = NULL;
+    if (req->is_form) {
+        form = form_payload(req->body, req->body_len, &jl);
+        if (!form) return 0;
+        js = form;
+    }
+    oc_json d;
+    /* Past the reader's token limit the payload is refused, never cut short. */
+    if (oc_json_parse(&d, js, jl) != 0) { free(form); return 0; }
+    wh_out o = { out, 0, cap, 0 };
+    if (d.n > 0 && d.t[0].type == JSMN_OBJECT) {
+        /* Blocks win over text, which that format sends as the notification's
+         * fallback; then the attachments. `username`, the icons, `channel`,
+         * `mrkdwn` and the unfurl flags are read past: the webhook's label is
+         * its author (ARCH-71). */
+        int blocks = oc_json_get(&d, 0, "blocks");
+        if (blocks >= 0 && d.t[blocks].type == JSMN_ARRAY && d.t[blocks].size > 0) wh_blocks(&o, &d, blocks);
+        else wh_line(&o, &d, oc_json_get(&d, 0, "text"));
+        wh_attachments(&o, &d, oc_json_get(&d, 0, "attachments"));
+    }
+    oc_json_free(&d);
+    free(form);
+    *outlen = o.n;
+    return o.n > 0;
 }
 
 /* --- routes ------------------------------------------------------------------ */

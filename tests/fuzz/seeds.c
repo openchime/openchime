@@ -85,6 +85,16 @@ static void preauth_seeds(void) {
     seed_str("http", "webhook-json", "POST /hooks/abc HTTP/1.1\r\nHost: acme.example\r\nContent-Type: application/json\r\n"
                                      "Content-Length: 27\r\n\r\n{\"text\":\"deploy \\u00e9 done\"}");
     seed_str("http", "webhook-plain", "POST /hooks/abc HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello");
+    /* The common chat-webhook format (ARCH-71): blocks, attachments, and a form. */
+    seed_str("http", "webhook-blocks", "POST /hooks/abc HTTP/1.1\r\nContent-Type: application/json\r\n"
+                                       "Content-Length: 74\r\n\r\n"
+                                       "{\"blocks\":[{\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\"Alert\"}}]}");
+    seed_str("http", "webhook-attachments", "POST /hooks/abc HTTP/1.1\r\nContent-Type: application/json\r\n"
+                                            "Content-Length: 99\r\n\r\n"
+                                            "{\"attachments\":[{\"title\":\"Build 41\",\"title_link\":\"https://ci.example/41\","
+                                            "\"text\":\"<!here> failed\"}]}");
+    seed_str("http", "webhook-form", "POST /hooks/abc HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\n"
+                                     "Content-Length: 35\r\n\r\npayload=%7B%22text%22%3A%22hi%22%7D");
     seed_str("http", "form", "POST /signin HTTP/1.1\r\nHost: acme.example\r\nOrigin: https://acme.example\r\n"
                              "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 19\r\n\r\nuser=ada&pass=x%20y");
     seed_str("http", "upgrade", "GET /ws HTTP/1.1\r\nHost: acme.example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"

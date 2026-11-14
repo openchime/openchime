@@ -5085,18 +5085,25 @@ static int on_http_request(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
         http_reply(c, 404, "text/plain", "not found\n", 10);
         return -1;
     }
-    const char *text = NULL; size_t tlen = 0;
-    if (!oc_http_webhook_text(req, &text, &tlen) || tlen == 0) {
+    /* What the payload says, composed and capped at a message's size (ARCH-71). */
+    char *text = malloc(OC_MAX_BODY_SIZE + 1);
+    size_t tlen = 0;
+    if (!text) {
+        http_reply(c, 500, "text/plain", "error\n", 6);
+        return -1;
+    }
+    if (!oc_http_webhook_payload(req, text, OC_MAX_BODY_SIZE + 1, &tlen) || tlen == 0) {
+        free(text);
         http_reply(c, 400, "text/plain", "empty message\n", 14);
         return -1;
     }
-    if (tlen > OC_MAX_BODY_SIZE) tlen = OC_MAX_BODY_SIZE;
 
     char key[2 * OC_SESSION_TOKEN_LEN + 1];
     size_t klen = tokhexlen < sizeof key - 1 ? tokhexlen : sizeof key - 1;
     memcpy(key, tokhex, klen); key[klen] = '\0';
     uint64_t now = now_ms();
     if (g_webhook_rl && oc_ratelimit_blocked(g_webhook_rl, key, now)) {
+        free(text);
         http_reply(c, 429, "text/plain", "rate limited\n", 13);
         return -1;
     }
@@ -5105,9 +5112,11 @@ static int on_http_request(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     oc_job *j = oc_job_new(OC_JOB_WEBHOOK_POST, c->conn_id);
     if (!j || oc_job_set_token(j, token, sizeof token) != 0 ||
         oc_job_set_body(j, text, tlen) != 0) {
+        free(text);
         http_reply(c, 500, "text/plain", "error\n", 6);
         return -1;
     }
+    free(text);                /* the job holds its own copy */
     oc_dbwriter_submit(dbw, j);
     c->http_pending = 1;       /* response written when the post result returns */
     return 0;

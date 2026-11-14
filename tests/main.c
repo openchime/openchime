@@ -54,6 +54,7 @@ int run_ioloop_tests(void);
 int run_roles_tests(void);
 int run_dbwriter_tests(void);
 int run_http_tests(void);
+int run_webhook_payload_tests(void);
 int run_sigv4_tests(void);
 int run_blob_s3_tests(void);
 int run_blob_cache_tests(void);
@@ -302,6 +303,7 @@ static const struct suite {
     S(run_roles_tests,           FAST, PLAIN),
     S(run_dbwriter_tests,        FULL, WALK),
     S(run_http_tests,            FAST, PLAIN),
+    S(run_webhook_payload_tests, FAST, PLAIN),
     S(run_sigv4_tests,           FAST, PLAIN),
     S(run_blob_s3_tests,         FAST, THREADS),
     S(run_blob_cache_tests,      FAST, THREADS),
