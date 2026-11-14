@@ -2145,7 +2145,12 @@ static rectf g_audit_filters[5];
 static int g_n_audit_filters;
 /* The actor and action pickers: each row's actor and action narrow the log to
  * them when clicked, and their chip clears that filter again. */
-static struct { rectf actor, action; uint64_t actor_id; char action_name[48]; } g_audit_rowhits[64];
+static struct { rectf actor, action, row; uint64_t actor_id; char action_name[48]; int idx; } g_audit_rowhits[64];
+/* The audit row the keyboard is on (an index into the model's page), -1 for
+ * none; and the entry an open row menu is about, copied, since a page can
+ * arrive between opening the menu and choosing from it. */
+static int   g_audit_focus = -1, g_audit_reveal;
+static oc_audit_view g_audit_menu;
 static int   g_n_audit_rowhits;
 static rectf g_audit_clear_actor, g_audit_clear_action;
 static char  g_audit_actor_name[64];
@@ -2442,7 +2447,7 @@ static int g_n_moreflyrows;
  * level. `g_menu_target` carries what the menu is about. */
 enum { MENU_NONE = 0, MENU_WS, MENU_PROFILE, MENU_NEW, MENU_SWITCHER, MENU_SECTION,
        MENU_MSG, MENU_MEMBER, MENU_CHANNEL, MENU_THUMB, MENU_SCHED, MENU_THREAD, MENU_DRAFT,
-       MENU_SUMMARIZE };
+       MENU_SUMMARIZE, MENU_AUDIT };
 /* MK_EMOJIROW is one row holding the quick reactions side by side, each its own
  * hit-box (it predates the flyout below and stays a row — six separate rows
  * would bury the rest of the message actions).
@@ -8978,11 +8983,20 @@ static void draw_audit(gfx *rt, const oc_model *m, rectf reg, int embedded) {
     }
 
     float rowh = UIS(46);
+    if (g_audit_focus >= (int)m->n_audit) g_audit_focus = (int)m->n_audit - 1;
+    if (g_audit_reveal && g_audit_focus >= 0) {
+        float top = (float)g_audit_focus * rowh, visible = body.bottom - body.top;
+        if (top < g_ovl_scroll)                 g_ovl_scroll = top;
+        if (top + rowh > g_ovl_scroll + visible) g_ovl_scroll = top + rowh - visible;
+    }
+    g_audit_reveal = 0;
     float y = ovl_begin(rt, body, (float)m->n_audit * rowh + 34);
     for (size_t i = 0; i < m->n_audit; i++) {
         const oc_audit_view *a = &m->audit[i];
         if (y + rowh < body.top) { y += rowh; continue; }
         if (y > body.bottom) break;
+        if ((int)i == g_audit_focus)
+            fill_round(rt, rf(body.left + 12, y + 1, body.right - 12, y + rowh - 1), OC_R_CONTROL, OC_COL_HOVER);
         char when[20] = "";
         if (a->at_ms) { time_t t = (time_t)(a->at_ms / 1000); struct tm tv;
             if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tv); }
@@ -9007,6 +9021,8 @@ static void draw_audit(gfx *rt, const oc_model *m, rectf reg, int embedded) {
             g_audit_rowhits[g_n_audit_rowhits].actor = rf(ax, y, ax + aw, y + 24);
             g_audit_rowhits[g_n_audit_rowhits].action = rf(cx, y, cx + cw, y + 24);
             g_audit_rowhits[g_n_audit_rowhits].actor_id = a->actor_id;
+            g_audit_rowhits[g_n_audit_rowhits].row = rf(body.left + 12, y, body.right - 12, y + rowh);
+            g_audit_rowhits[g_n_audit_rowhits].idx = (int)i;
             snprintf(g_audit_rowhits[g_n_audit_rowhits].action_name,
                      sizeof g_audit_rowhits[0].action_name, "%s", a->action);
             g_n_audit_rowhits++;
@@ -19185,7 +19201,7 @@ static void admin_select(int t) {
     else if (t == ADM_INVITES)  oc_client_list_invites(g_client);
     else if (t == ADM_GROUPS)  { g_grp_sel = 0; oc_client_list_groups(g_client); }
     else if (t == ADM_ALERTS)   oc_client_srvalerts_list(g_client);
-    else if (t == ADM_AUDIT)   { oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); }
+    else if (t == ADM_AUDIT)   { g_audit_focus = -1; oc_client_toggle_audit(g_client, 1); oc_client_audit_query(g_client, 0); }
     else if (t == ADM_USAGE)    oc_client_usage(g_client, g_usage_days);
     else if (t == ADM_BLOCKS)   oc_client_list_blocks(g_client);
 }
@@ -30719,6 +30735,7 @@ static void thumb_menu_run(oc_win *hwnd, int cmd) {
 }
 
 static void member_menu_run(oc_win *hwnd, int cmd);    /* fwd */
+static void audit_menu_run(oc_win *hwnd, int cmd);     /* fwd */
 static void channel_menu_run(oc_win *hwnd, int cmd);   /* fwd */
 
 /* The reader's local time `days` days from today at hh:mm, in ms; 0 if the
@@ -31251,6 +31268,28 @@ static void forward_send(oc_win *hwnd, uint64_t to_cid) {
     invalidate();
 }
 
+/* Open conversation `chan` and, where `mid` is not 0, the message `mid` in it:
+ * what a link and an audit entry's Go to do. The caller has checked the
+ * conversation is one the person can see. */
+static void open_conversation_at(oc_win *hwnd, uint64_t chan, uint64_t mid) {
+    g_view = VIEW_HOME;
+    close_overlays();
+    select_channel(chan);
+    /* The same arming the Activity and Files rows use: if the message is outside
+     * the loaded window the tick fetches around it (ARCH-96) and the flash lands
+     * when it arrives. */
+    /* Zero means the link named a conversation and not a line in it, so there
+     * is nothing to arm and nothing to flash. */
+    if (mid) {
+        g_jump_mid = mid;
+        g_jump_deadline = now_ms() + 4000;
+        hist_jump(chan, mid);
+    }
+    select_tab(TAB_MESSAGES);
+    layout_composer(hwnd);
+    invalidate();
+}
+
 /* Follow one. Returns 0 with a toast when it cannot, rather than failing quietly:
  * a link that does nothing is indistinguishable from a broken app. */
 static int permalink_follow(oc_win *hwnd, const char *text) {
@@ -31310,22 +31349,7 @@ static int permalink_follow(oc_win *hwnd, const char *text) {
         fb_failed("That conversation is not one you can see.");
         return 1;
     }
-    g_view = VIEW_HOME;
-    close_overlays();
-    select_channel(chan);
-    /* The same arming the Activity and Files rows use: if the message is outside
-     * the loaded window the tick fetches around it (ARCH-96) and the flash lands
-     * when it arrives. */
-    /* Zero means the link named a conversation and not a line in it, so there
-     * is nothing to arm and nothing to flash. */
-    if (mid) {
-        g_jump_mid = mid;
-        g_jump_deadline = now_ms() + 4000;
-        hist_jump(chan, mid);
-    }
-    select_tab(TAB_MESSAGES);
-    layout_composer(hwnd);
-    invalidate();
+    open_conversation_at(hwnd, chan, mid);
     return 1;
 }
 
@@ -31339,6 +31363,7 @@ static void menu_run_kind(oc_win *hwnd, int kind, int cmd) {
     else if (kind == MENU_SUMMARIZE) sum_menu_run(hwnd, cmd);
     else if (kind == MENU_MSG)     msg_menu_run(hwnd, cmd);
     else if (kind == MENU_MEMBER)  member_menu_run(hwnd, cmd);
+    else if (kind == MENU_AUDIT)   audit_menu_run(hwnd, cmd);
     else if (kind == MENU_CHANNEL) channel_menu_run(hwnd, cmd);
     else if (kind == MENU_THUMB)   thumb_menu_run(hwnd, cmd);
     else                           menu_dispatch(hwnd, cmd);
@@ -33611,6 +33636,99 @@ static void copy_selection(oc_win *hwnd) {
 enum { DRAFT_CMD_OPEN = 2600, DRAFT_CMD_DELETE = 2601 };
 static uint64_t g_dmenu_cid, g_dmenu_root;
 
+/* ---- an audit entry's menu (REQ-251) ----------------------------------------
+ *
+ * Where the entry leads, and the filters it suggests. Each item is offered only
+ * when it can work: the actor is someone this workspace still has, the channel
+ * is one the reader can see, a message entry names its message and its channel
+ * (entries written before the daemon kept the channel name none), and a filter
+ * is not the one already set. */
+enum { AUDIT_CMD_MEMBER = 1, AUDIT_CMD_CHANNEL, AUDIT_CMD_MESSAGE,
+       AUDIT_CMD_BY_ACTOR, AUDIT_CMD_BY_ACTION };
+
+static int audit_is_message(const oc_audit_view *a) { return !strncmp(a->action, "message.", 8); }
+
+/* The menu for entry `idx` of the page, at (x, y). 0 when it offers nothing. */
+static int audit_menu_open(oc_win *hwnd, const oc_model *m, int idx, float x, float y) {
+    if (!m || idx < 0 || (size_t)idx >= m->n_audit) return 0;
+    g_audit_menu = m->audit[idx];
+    const oc_audit_view *a = &g_audit_menu;
+    int seen = a->channel_id && oc_model_channel((oc_model *)m, a->channel_id);
+    const char *who = a->actor_id ? oc_model_user_name(m, a->actor_id) : NULL;
+    g_n_mi = 0;
+    mi_section("AUDIT ENTRY");
+    if (who && who[0] && !oc_model_is_workspace_sender(m, a->actor_id))
+        mi_item(AUDIT_CMD_MEMBER, "Open member");
+    if (seen) mi_item(AUDIT_CMD_CHANNEL, "Go to channel");
+    if (seen && audit_is_message(a) && a->target_id) mi_item(AUDIT_CMD_MESSAGE, "Go to message");
+    if (a->actor_id && m->audit_actor != a->actor_id) mi_item(AUDIT_CMD_BY_ACTOR, "Filter by this actor");
+    if (a->action[0] && strcmp(m->audit_action, a->action) != 0)
+        mi_item(AUDIT_CMD_BY_ACTION, "Filter by this action");
+    if (g_n_mi <= 1) { g_n_mi = 0; return 0; }
+    g_menu = MENU_AUDIT; g_menu_headerblock = 0; g_menu_hover = -1;
+    g_menu_w = UIS(220);
+    g_menu_x = x; g_menu_y = y;
+    float mh = 12; for (int k = 0; k < g_n_mi; k++) mh += menu_item_h(g_mi[k].kind);
+    irect rc; client_rect(hwnd, &rc);
+    float H = DIPF(rc.bottom), W = DIPF(rc.right);
+    if (g_menu_y + mh > H - 8) g_menu_y = H - 8 - mh;
+    if (g_menu_x + g_menu_w > W - 8) g_menu_x = W - 8 - g_menu_w;
+    invalidate();
+    return 1;
+}
+
+static void audit_menu_run(oc_win *hwnd, int cmd) {
+    const oc_model *m = model();
+    const oc_audit_view *a = &g_audit_menu;
+    if (!m || !g_client) return;
+    switch (cmd) {
+    case AUDIT_CMD_MEMBER:
+        g_view = VIEW_HOME; close_overlays();
+        profile_open(a->actor_id);
+        break;
+    case AUDIT_CMD_CHANNEL:
+    case AUDIT_CMD_MESSAGE:
+        if (!a->channel_id || !oc_model_channel((oc_model *)m, a->channel_id)) {
+            fb_failed("That conversation is not one you can see.");
+            break;
+        }
+        open_conversation_at(hwnd, a->channel_id, cmd == AUDIT_CMD_MESSAGE ? a->target_id : 0);
+        break;
+    case AUDIT_CMD_BY_ACTOR:
+        snprintf(g_audit_actor_name, sizeof g_audit_actor_name, "%s", a->actor_name);
+        oc_client_audit_filter(g_client, m->audit_family, a->actor_id, m->audit_action);
+        g_ovl_scroll = 0; g_audit_focus = -1;
+        break;
+    case AUDIT_CMD_BY_ACTION:
+        oc_client_audit_filter(g_client, m->audit_family, m->audit_actor, a->action);
+        g_ovl_scroll = 0; g_audit_focus = -1;
+        break;
+    }
+    invalidate();
+}
+
+/* The audit pane's keys while the keyboard is in no field: Up, Down, Home and
+ * End move a row focus the paint keeps in view; Shift+F10 or the Menu key then
+ * opens that row's menu (kb_context_menu). Returns 1 when the key was the pane's. */
+static int audit_key(oc_win *hwnd, int vk) {
+    (void)hwnd;
+    const oc_model *m = model();
+    if (!m || !m->audit_open || m->n_audit == 0 || g_ed_focus || g_menu || modal_open()) return 0;
+    int n = (int)m->n_audit, at = g_audit_focus;
+    switch (vk) {
+    case OCK_DOWN: at = at < 0 ? 0 : at + 1; break;
+    case OCK_UP:   at = at < 0 ? 0 : at - 1; break;
+    case OCK_HOME: at = 0; break;
+    case OCK_END:  at = n - 1; break;
+    default: return 0;
+    }
+    if (at < 0) at = 0;
+    if (at >= n) at = n - 1;
+    g_audit_focus = at;
+    g_audit_reveal = 1;
+    return 1;
+}
+
 static void on_rclick(oc_win *hwnd, int x, int y) {
     const oc_model *m = model();
     if (!m) return;
@@ -33651,6 +33769,14 @@ static void on_rclick(oc_win *hwnd, int x, int y) {
             }
         return;
     }
+    /* An audit entry's row: where it leads, and the filters it suggests. */
+    if (m->audit_open)
+        for (int i = 0; i < g_n_audit_rowhits; i++)
+            if (in_rect(g_audit_rowhits[i].row, (float)x, (float)y)) {
+                g_audit_focus = g_audit_rowhits[i].idx;
+                audit_menu_open(hwnd, m, g_audit_rowhits[i].idx, (float)x, (float)y);
+                return;
+            }
     /* Members pane first (it overlaps the right edge). */
     for (int i = 0; i < g_n_memrows; i++)
         if (in_rect(g_memrows[i].r, (float)x, (float)y)) {
@@ -37149,7 +37275,8 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
     case 40: invite_people(hwnd, OC_ROLE_MEMBER); break;
     case 41: invite_people(hwnd, OC_ROLE_ADMIN);  break;
     case 60: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_storage(g_client, 1); oc_client_storage_status(g_client); break;
-    case 61: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_audit(g_client, 1); oc_client_audit_query(g_client, 0); break;
+    case 61: g_view = VIEW_HOME; close_overlays(); g_audit_focus = -1;   /* a fresh opening: no row chosen */
+        oc_client_toggle_audit(g_client, 1); oc_client_audit_query(g_client, 0); break;
     case 87:   /* Admin > Groups (REQ-307) */
         close_overlays();
         g_view = VIEW_ADMIN; layout_composer(hwnd);
@@ -37580,6 +37707,17 @@ static void kb_row_move(oc_win *hwnd, int d) {
 static void kb_context_menu(oc_win *hwnd) {
     const oc_model *m = model();
     if (!m) return;
+    /* The audit row the keyboard is on: its menu, where a right-click opens it. */
+    if (m->audit_open && g_audit_focus >= 0) {
+        for (int i = 0; i < g_n_audit_rowhits; i++)
+            if (g_audit_rowhits[i].idx == g_audit_focus) {
+                if (audit_menu_open(hwnd, m, g_audit_focus, g_audit_rowhits[i].row.left + UIS(60),
+                                    g_audit_rowhits[i].row.top + UIS(20)))
+                    menu_move(1);
+                return;
+            }
+        return;
+    }
     if (g_kb_mid) {
         for (int i = 0; i < g_n_msgrows; i++)
             if (g_msgrows[i].mid == g_kb_mid) {
@@ -38445,6 +38583,23 @@ static void test_dump(const char *path) {
                     ? oc_model_user_name((oc_model *)m, g_memrows[i].uid) : "",
                 g_memrows[i].rm.left, g_memrows[i].rm.top, g_memrows[i].rm.right, g_memrows[i].rm.bottom,
                 g_memrows[i].via);
+    {   /* The audit pane: its filters, the row the keyboard is on, and each row
+         * drawn with what it names and where it is (DIPs, as `rclick` takes). */
+        const oc_model *am = model();
+        if (am && am->audit_open) {
+            fprintf(f, "audit open=1 n=%zu focus=%d family=%d actor=%llu action=\"%s\"\n", am->n_audit,
+                    g_audit_focus, am->audit_family, (unsigned long long)am->audit_actor, am->audit_action);
+            for (int i = 0; i < g_n_audit_rowhits; i++) {
+                int k = g_audit_rowhits[i].idx;
+                if (k < 0 || (size_t)k >= am->n_audit) continue;
+                const oc_audit_view *a = &am->audit[k];
+                rectf r = g_audit_rowhits[i].row;
+                fprintf(f, "  auditrow %d actor=%llu channel=%llu target=%llu action=%s rect=%.0f,%.0f,%.0f,%.0f\n", k,
+                        (unsigned long long)a->actor_id, (unsigned long long)a->channel_id,
+                        (unsigned long long)a->target_id, a->action, r.left, r.top, r.right, r.bottom);
+            }
+        }
+    }
     fprintf(f, "menu=%d more=%d lightbox=%llu\n", g_menu, g_more_open,
             (unsigned long long)g_lightbox);
     /* The summary (REQ-310): the pane's state, what it drew, and the range card. */
@@ -42432,6 +42587,7 @@ static int on_key_down(oc_win *hwnd, int wp) {
         if (wp == OCK_ESCAPE && g_more_open) { g_more_open = 0; invalidate(); return 0; }
         if (wp == OCK_ESCAPE && g_has_sel) { g_has_sel = 0; invalidate(); return 0; }
         if (emoji_admin_key(hwnd, wp)) { invalidate(); return 0; }
+        if (audit_key(hwnd, wp)) { invalidate(); return 0; }
         /* The composer LAST among the specific cases and before the shell's
          * fall-through: the overlays above own Esc while they are open, and the
          * field owns every other key while it has focus. The field is not a

@@ -73,6 +73,7 @@ typedef struct {
     char     detail[96];
     uint8_t  family;    /* 1 admin, 2 account, 3 security, 4 moderation */
     uint8_t  outcome;   /* 1 ok, 0 denied/failed */
+    uint64_t channel_id; /* the channel it happened in; 0 none */
 } oc_audit_view;
 
 /* One of the daemon's critical failures as an owner or admin sees it (REQ-263). */

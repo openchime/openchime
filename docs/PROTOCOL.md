@@ -215,8 +215,11 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 44** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 46** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 46 appended `channel_id` to each `AUDIT_PAGE` entry, the channel the entry
+> happened in (REQ-251). Version 45 appended `audience` to `WORKSPACE_INFO`
+> (CLIENT.md, "Links"). Version
 > 44 appended `media_kind` to `UPLOAD_BEGIN`, so a snippet's text past its cap is
 > refused before it is sent (REQ-226). Version
 > 38 appended `remind_at_ms` to `SAVE_ITEM`, `SAVED_UPDATED` and `SAVED_MSG`, a
@@ -2299,7 +2302,14 @@ detail:
     count (u16), then count × { at_ms (u64), actor_id (u64), target_id (u64),
     family (u8 — 1 admin · 2 account · 3 security · 4 moderation),
     outcome (u8 — 1 ok, 0 denied/failed), actor_name (str), action (str),
-    target (str), detail (str) }
+    target (str), detail (str), channel_id (u64) }
+
+`channel_id` is the channel the entry happened in, `0` for none: set for a
+channel's own changes (`channel.*`) and for a moderated message or member in one
+(`message.delete`, `message.restore`, `message.move`, where it is the channel the
+message was moved to, and `channel.member.remove`), so an admin can go there;
+for a message, `target_id` is the message. Entries written before SCHEMA.md
+migration 0084 carry `0`. Appended in protocol 46.
 
 It **never carries the secret involved** — that a password changed, never
 the password; that an invite was redeemed, never the token (ARCH-79).

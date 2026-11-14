@@ -1999,6 +1999,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->audit.target_id = ents[i].target_id;
                 e->audit.family    = ents[i].family;
                 e->audit.outcome   = ents[i].outcome;
+                e->audit.channel_id = ents[i].channel_id;
                 slice_to_buf(ents[i].actor_name, e->audit.actor_name, sizeof e->audit.actor_name);
                 slice_to_buf(ents[i].action,     e->audit.action,     sizeof e->audit.action);
                 slice_to_buf(ents[i].target,     e->audit.target,     sizeof e->audit.target);

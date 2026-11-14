@@ -1752,6 +1752,8 @@ static oc_dbres *do_delete(oc_dbwriter *w, uint64_t uid, uint64_t channel, uint6
     return wait_result(w);
 }
 
+static uint64_t audit_channel(oc_dbwriter *w, uint64_t actor, const char *action);   /* fwd */
+
 /* Message management (REQ-032/051/052): author-only edit, self- and
  * moderator-delete tombstones, and the not-found / forbidden gates. */
 static void test_edit_delete(void) {
@@ -1832,6 +1834,8 @@ static void test_edit_delete(void) {
     CHECK(r && r->type == OC_RES_DELETE_OK);
     CHECK(r->author_id == author && r->user_id == owner);   /* self vs moderator */
     oc_dbres_free(r);
+    /* Audited with the message's channel, so an admin can go to it. */
+    CHECK(audit_channel(w, owner, "message.delete") == OC_DEFAULT_CHANNEL);
 
     oc_dbwriter_stop(w);
     cleanup_db(path);
@@ -1888,6 +1892,20 @@ static int audit_count(oc_dbwriter *w, uint64_t actor, const char *action) {
 }
 static int audit_saw(oc_dbwriter *w, uint64_t actor, const char *action) {
     return audit_count(w, actor, action) > 0;
+}
+/* The channel the newest `action` row names (0 for none, or no such row): what
+ * lets an admin go from the entry to where it happened. */
+static uint64_t audit_channel(oc_dbwriter *w, uint64_t actor, const char *action) {
+    oc_job *j = oc_job_new(OC_JOB_AUDIT_QUERY, 902);
+    j->user_id = actor; j->audit_limit = 100;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint64_t ch = 0;
+    if (r && r->type == OC_RES_AUDIT_PAGE)
+        for (size_t i = 0; i < r->n_audit; i++)
+            if (r->audit[i].action && !strcmp(r->audit[i].action, action)) { ch = r->audit[i].channel_id; break; }
+    oc_dbres_free(r);
+    return ch;
 }
 
 /* A channel's member roster (REQ-031) and its shared files (REQ-143, ARCH-91).
@@ -2489,7 +2507,9 @@ static void test_index_mentions(void) {
                            /* 0082's channel managers. */
                            "DROP TABLE channel_managers; ALTER TABLE channels DROP COLUMN created_by;"
                            /* 0083's emoji aliases. */
-                           "DROP TABLE custom_emoji_aliases;",
+                           "DROP TABLE custom_emoji_aliases;"
+                           /* 0084's audit channel. */
+                           "ALTER TABLE audit_log DROP COLUMN channel_id;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -3312,6 +3332,8 @@ static void test_channel_mutability(void) {
             CHECK(saw_priv && saw_pub);
         }
         oc_dbres_free(ar);
+        CHECK(audit_channel(w, alice, "channel.private") == ch);
+        CHECK(audit_channel(w, alice, "channel.public") == ch);
     }
 
     /* Archive: owner/admin only, and then genuinely read-only. */
@@ -3882,6 +3904,8 @@ static void test_admin_ops(void) {
     oc_dbres_free(chan_member(w, OC_JOB_INVITE_CHANNEL, owner, adminonly, admin));
     oc_dbres_free(chan_member(w, OC_JOB_REMOVE_CHANNEL, owner, adminonly, admin));
     CHECK(audit_saw(w, owner, "channel.member.remove"));
+    CHECK(audit_channel(w, owner, "channel.member.remove") == adminonly);   /* where it happened */
+    CHECK(audit_channel(w, owner, "user.remove") == 0);                     /* in no channel */
 
     oc_dbwriter_stop(w);
     cleanup_db(path);
@@ -7231,6 +7255,7 @@ static void test_channel_managers(void) {
     CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->n_ch_managers == 2);
     oc_dbres_free(r);
     CHECK(audit_count(w, owner, "channel.manager.grant") == 1);
+    CHECK(audit_channel(w, owner, "channel.manager.grant") == ch);
     /* Someone outside the channel cannot be named. */
     r = chan_manager(w, 1, ann, ch, dee);
     CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);

@@ -248,8 +248,13 @@
  *
  * 45: WORKSPACE_INFO carries `audience` (str), the workspace's audience id
  * with OpenChime's services, empty when it is not enrolled: an email link names
- * a workspace by it (CLIENT.md, "Links"). A field appended to a fixed layout. */
-#define OC_PROTOCOL_VERSION 45u
+ * a workspace by it (CLIENT.md, "Links"). A field appended to a fixed layout.
+ *
+ * 46: each AUDIT_PAGE entry carries `channel_id` (u64, 0 for none), the channel
+ * the entry happened in: a channel's own changes, and a moderated message or
+ * member in it, so a reader can go there (REQ-251). A field appended to a
+ * repeated entry. */
+#define OC_PROTOCOL_VERSION 46u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -1782,6 +1787,7 @@ typedef struct {
     oc_slice detail;      /* never the secret involved (ARCH-79) */
     uint8_t  family;      /* 1 admin, 2 account, 3 security, 4 moderation */
     uint8_t  outcome;     /* 1 ok, 0 denied/failed */
+    uint64_t channel_id;  /* the channel it happened in, 0 for none (protocol 46) */
 } oc_audit_entry;
 
 typedef struct {

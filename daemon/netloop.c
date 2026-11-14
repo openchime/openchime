@@ -8018,6 +8018,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             ents[n].action     = oc_slice_str(a->action ? a->action : "");
             ents[n].target     = oc_slice_str(a->target ? a->target : "");
             ents[n].detail     = oc_slice_str(a->detail ? a->detail : "");
+            ents[n].channel_id = a->channel_id;
         }
         oc_audit_page pg = { n, ents };
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);

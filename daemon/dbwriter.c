@@ -161,15 +161,15 @@ static uint64_t dbw_now_ms(void) {
  *
  * `detail` must never carry the secret involved (ARCH-79): that a password
  * changed, never the password. */
-static void audit_log(sqlite3 *db, int family, const char *action,
-                      uint64_t actor_id, const char *actor_name,
-                      uint64_t target_id, const char *target,
-                      int outcome, const char *detail) {
+static void audit_log_in(sqlite3 *db, int family, const char *action,
+                         uint64_t actor_id, const char *actor_name, uint64_t channel_id,
+                         uint64_t target_id, const char *target,
+                         int outcome, const char *detail) {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
             "INSERT INTO audit_log(at_ms, family, action, actor_id, actor_name,"
-            " target_id, target, outcome, detail) "
-            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);", -1, &st, NULL) != SQLITE_OK) return;
+            " target_id, target, outcome, detail, channel_id) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);", -1, &st, NULL) != SQLITE_OK) return;
     sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
     sqlite3_bind_int(st, 2, family);
     sqlite3_bind_text(st, 3, action, -1, SQLITE_TRANSIENT);
@@ -184,8 +184,18 @@ static void audit_log(sqlite3 *db, int family, const char *action,
     sqlite3_bind_int(st, 8, outcome ? 1 : 0);
     if (detail) sqlite3_bind_text(st, 9, detail, -1, SQLITE_TRANSIENT);
     else        sqlite3_bind_null(st, 9);
+    if (channel_id) sqlite3_bind_int64(st, 10, (sqlite3_int64)channel_id);
+    else            sqlite3_bind_null(st, 10);
     sqlite3_step(st);
     sqlite3_finalize(st);
+}
+
+/* An entry that happened in no conversation. */
+static void audit_log(sqlite3 *db, int family, const char *action,
+                      uint64_t actor_id, const char *actor_name,
+                      uint64_t target_id, const char *target,
+                      int outcome, const char *detail) {
+    audit_log_in(db, family, action, actor_id, actor_name, 0, target_id, target, outcome, detail);
 }
 
 /* Resolve a user's display name for denormalizing into an entry, so the log
@@ -212,6 +222,16 @@ static void audit_actor(sqlite3 *db, int family, const char *action,
                         int outcome, const char *detail) {
     char *nm = audit_name_of(db, actor_id);
     audit_log(db, family, action, actor_id, nm, target_id, target, outcome, detail);
+    free(nm);
+}
+
+/* ...for an entry in channel `channel_id`: a change to the channel, or to a
+ * message or member in it, which a reader can then go to. */
+static void audit_actor_in(sqlite3 *db, int family, const char *action, uint64_t actor_id,
+                           uint64_t channel_id, uint64_t target_id, const char *target,
+                           int outcome, const char *detail) {
+    char *nm = audit_name_of(db, actor_id);
+    audit_log_in(db, family, action, actor_id, nm, channel_id, target_id, target, outcome, detail);
     free(nm);
 }
 
@@ -4274,8 +4294,8 @@ static oc_dbres *process_channel_group(sqlite3 *db, const oc_job *j, int add) {
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
     free(users);
     if (changed)
-        audit_actor(db, OC_AUDIT_ADMIN, add ? "channel.group.add" : "channel.group.remove", j->user_id, 0,
-                    NULL, 1, NULL);
+        audit_actor_in(db, OC_AUDIT_ADMIN, add ? "channel.group.add" : "channel.group.remove", j->user_id,
+                       j->channel_id, 0, NULL, 1, NULL);
     r->type = OC_RES_CHANNEL_INFO;
     load_channel_info(db, j->channel_id, j->user_id, r);
     fill_briefs(db, r);
@@ -5306,8 +5326,8 @@ static oc_dbres *process_restore(oc_dbwriter *w, const oc_job *j) {
     /* The action comes back with the body that made it (REQ-058). */
     store_action(db, j->message_id);
     if (author != j->user_id)
-        audit_actor(db, OC_AUDIT_MODERATION, "message.restore", j->user_id, j->message_id, NULL, 1,
-                    "moderator delete undone");
+        audit_actor_in(db, OC_AUDIT_MODERATION, "message.restore", j->user_id, j->channel_id,
+                       j->message_id, NULL, 1, "moderator delete undone");
     r->type = OC_RES_RESTORE_OK;
     r->author_id = author;
     r->body = (uint8_t *)body;
@@ -5412,8 +5432,8 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
      * own message is ordinary use and would drown the log (REQ-032 already
      * distinguishes the two via deleted_by). */
     if (author != j->user_id)
-        audit_actor(db, OC_AUDIT_MODERATION, "message.delete", j->user_id,
-                    j->message_id, NULL, 1, "moderator delete");
+        audit_actor_in(db, OC_AUDIT_MODERATION, "message.delete", j->user_id, j->channel_id,
+                       j->message_id, NULL, 1, "moderator delete");
 
     r->type = OC_RES_DELETE_OK;
     r->author_id = author;
@@ -5585,8 +5605,8 @@ static oc_dbres *process_channel_manager(sqlite3 *db, const oc_job *j, int grant
     if (changed) {
         char cid[24];
         snprintf(cid, sizeof cid, "%llu", (unsigned long long)j->channel_id);
-        audit_actor(db, OC_AUDIT_ADMIN, grant ? "channel.manager.grant" : "channel.manager.revoke",
-                    j->user_id, who, cid, 1, NULL);
+        audit_actor_in(db, OC_AUDIT_ADMIN, grant ? "channel.manager.grant" : "channel.manager.revoke",
+                       j->user_id, j->channel_id, who, cid, 1, NULL);
     }
     r->type = OC_RES_CHANNEL_INFO;
     load_channel_info(db, j->channel_id, j->user_id, r);
@@ -5637,7 +5657,7 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         else      sqlite3_bind_null(st, 1);          /* "" clears the topic */
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
         sqlite3_step(st); sqlite3_finalize(st);
-        audit_actor(db, OC_AUDIT_ADMIN, "channel.topic", j->user_id, 0, NULL, 1, NULL);
+        audit_actor_in(db, OC_AUDIT_ADMIN, "channel.topic", j->user_id, j->channel_id, 0, NULL, 1, NULL);
     } else if (j->chup_op == OC_CHUP_DESCRIPTION) {
         /* Any member, on the topic's reasoning (ARCH-93): it is visible to
          * everyone in the channel and a wrong one is corrected in seconds. */
@@ -5649,7 +5669,7 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         else      sqlite3_bind_null(st, 1);          /* "" clears it */
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
         sqlite3_step(st); sqlite3_finalize(st);
-        audit_actor(db, OC_AUDIT_ADMIN, "channel.description", j->user_id, 0, NULL, 1, NULL);
+        audit_actor_in(db, OC_AUDIT_ADMIN, "channel.description", j->user_id, j->channel_id, 0, NULL, 1, NULL);
         channel_change_notice(db, j, vlen ? "changed this channel's description." : "cleared this channel's description.");
         /* Announced on its own frame, not CHANNEL_INFO: the text does not ride
          * the channel-state frame, so a sidebar has nothing to redraw -- only a
@@ -5687,7 +5707,7 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         sqlite3_step(st); sqlite3_finalize(st);
         /* The id is untouched, so membership, history and cursors all follow the
          * rename for free — nothing durable was ever keyed on the name. */
-        audit_actor(db, OC_AUDIT_ADMIN, "channel.rename", j->user_id, 0, j->ch_name, 1, NULL);
+        audit_actor_in(db, OC_AUDIT_ADMIN, "channel.rename", j->user_id, j->channel_id, 0, j->ch_name, 1, NULL);
         {
             char what[OC_MAX_CHANNEL_NAME + 48];
             snprintf(what, sizeof what, "renamed this channel to #%.*s.", (int)vlen, j->ch_name);
@@ -5721,8 +5741,8 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         /* Audited as two distinct actions rather than one "visibility changed": going
          * public is a disclosure of everything said in there while it was private, and
          * an audit reader should not have to open the row to see which way it went. */
-        audit_actor(db, OC_AUDIT_ADMIN, pub ? "channel.public" : "channel.private",
-                    j->user_id, 0, NULL, 1, NULL);
+        audit_actor_in(db, OC_AUDIT_ADMIN, pub ? "channel.public" : "channel.private",
+                       j->user_id, j->channel_id, 0, NULL, 1, NULL);
         channel_change_notice(db, j, pub ? "made this channel public." : "made this channel private.");
     } else if (j->chup_op == OC_CHUP_ARCHIVE || j->chup_op == OC_CHUP_UNARCHIVE) {
         if (!oc_role_can_moderate(role) && !is_channel_manager(db, j->channel_id, j->user_id)) {
@@ -5734,8 +5754,8 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         else    sqlite3_bind_null(st, 1);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
         sqlite3_step(st); sqlite3_finalize(st);
-        audit_actor(db, OC_AUDIT_ADMIN, on ? "channel.archive" : "channel.unarchive",
-                    j->user_id, 0, NULL, 1, NULL);
+        audit_actor_in(db, OC_AUDIT_ADMIN, on ? "channel.archive" : "channel.unarchive",
+                       j->user_id, j->channel_id, 0, NULL, 1, NULL);
         channel_change_notice(db, j, on ? "archived this channel." : "unarchived this channel.");
     } else {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INVALID_CHANNEL; return r;
@@ -6072,8 +6092,8 @@ static oc_dbres *process_remove_channel(sqlite3 *db, const oc_job *j) {
     if (membership_sync(db, j->channel_id, j->target_user_id, 0) < 0) {
         /* REQ-251's moderation family names this explicitly: removing a member
          * from a channel, alongside a moderator deleting another user's message. */
-        audit_actor(db, OC_AUDIT_MODERATION, "channel.member.remove", j->user_id,
-                    j->target_user_id, NULL, 1, NULL);
+        audit_actor_in(db, OC_AUDIT_MODERATION, "channel.member.remove", j->user_id, j->channel_id,
+                       j->target_user_id, NULL, 1, NULL);
         note_change(db, r, j->channel_id, j->target_user_id, 0);   /* they are told */
     }
 
@@ -7292,7 +7312,9 @@ static oc_dbres *process_move_message(sqlite3 *db, const oc_job *j) {
     char detail[96];
     snprintf(detail, sizeof detail, "from %llu to %llu, %u message%s",
              (unsigned long long)src, (unsigned long long)j->channel_id, count, count == 1 ? "" : "s");
-    audit_actor(db, OC_AUDIT_MODERATION, "message.move", j->user_id, j->message_id, NULL, 1, detail);
+    /* In the channel it was moved to, where it now is. */
+    audit_actor_in(db, OC_AUDIT_MODERATION, "message.move", j->user_id, j->channel_id, j->message_id,
+                   NULL, 1, detail);
     if (j->move_marker) {
         char *who = audit_name_of(db, j->user_id);
         char *dn = NULL;
@@ -12874,7 +12896,7 @@ static oc_dbres *process_audit_query(sqlite3 *db, const oc_job *j) {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
             "SELECT at_ms, family, action, actor_id, actor_name, target_id, target,"
-            " outcome, detail FROM audit_log "
+            " outcome, detail, channel_id FROM audit_log "
             "WHERE (?1 = 0 OR at_ms < ?1) AND (?3 = 0 OR family = ?3) AND (?4 = 0 OR actor_id = ?4)"
             "  AND (?5 = '' OR action = ?5) "
             "ORDER BY at_ms DESC, id DESC LIMIT ?2;",
@@ -12900,6 +12922,7 @@ static oc_dbres *process_audit_query(sqlite3 *db, const oc_job *j) {
         v = (const char *)sqlite3_column_text(st, 6); a->target     = v ? strdup(v) : NULL;
         a->outcome   = (uint8_t)sqlite3_column_int(st, 7);
         v = (const char *)sqlite3_column_text(st, 8); a->detail     = v ? strdup(v) : NULL;
+        a->channel_id = (uint64_t)sqlite3_column_int64(st, 9);   /* NULL reads 0 */
         r->n_audit++;
     }
     sqlite3_finalize(st);

@@ -1053,6 +1053,7 @@ typedef struct oc_audit_row {
     char    *detail;       /* heap; never carries the secret involved */
     uint8_t  family;
     uint8_t  outcome;      /* 1 ok, 0 denied/failed */
+    uint64_t channel_id;   /* the channel it happened in; 0 none, or written before 0084 */
 } oc_audit_row;
 
 /* One row in a READ_CURSOR result: a member's read position in the channel. */

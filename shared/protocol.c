@@ -1861,6 +1861,7 @@ oc_result oc_encode_audit_page(oc_wbuf *w, uint16_t version, const oc_audit_page
         oc_w_str(w, e->action);
         oc_w_str(w, e->target);
         oc_w_str(w, e->detail);
+        oc_w_u64(w, e->channel_id);
     }
     return oc_frame_end(w, off);
 }
@@ -1878,6 +1879,7 @@ oc_result oc_decode_audit_page(oc_rbuf *r, oc_audit_entry *out, uint16_t cap, ui
         out[i].action     = oc_r_str(r);
         out[i].target     = oc_r_str(r);
         out[i].detail     = oc_r_str(r);
+        out[i].channel_id = oc_r_u64(r);
     }
     *n = count;
     return r_done(r);

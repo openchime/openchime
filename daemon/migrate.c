@@ -1440,6 +1440,12 @@ static const char MIGRATION_0083[] =
     ");"
     "CREATE INDEX custom_emoji_aliases_name ON custom_emoji_aliases(name);";
 
+/* 0084: the conversation an audit entry happened in (REQ-251), so a reader can
+ * go to it: the channel for a channel's changes, and the channel a moderated
+ * message is in. NULL for the rest, and for every entry written before. */
+static const char MIGRATION_0084[] =
+    "ALTER TABLE audit_log ADD COLUMN channel_id INTEGER;";
+
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
      * author is doing, and the daemon records that as its own object beside the
@@ -1811,6 +1817,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 81, MIGRATION_0081 },
     { 82, MIGRATION_0082 },
     { 83, MIGRATION_0083 },
+    { 84, MIGRATION_0084 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

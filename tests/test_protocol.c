@@ -286,6 +286,26 @@ static void test_auth_frames(void) {
         CHECK(out.action.len == 12 && memcmp(out.action.ptr, "auth.failure", 12) == 0);
     }
     {
+        /* AUDIT_PAGE — each entry whole, its channel included (protocol 46). */
+        oc_audit_entry in[2];
+        memset(in, 0, sizeof in);
+        in[0].at_ms = 1760000000001ull; in[0].actor_id = 7; in[0].target_id = 99;
+        in[0].actor_name = oc_slice_str("ann"); in[0].action = oc_slice_str("message.delete");
+        in[0].target = oc_slice_str(""); in[0].detail = oc_slice_str("moderator delete");
+        in[0].family = 4; in[0].outcome = 1; in[0].channel_id = 12;
+        in[1].at_ms = 1760000000000ull; in[1].actor_id = 7;
+        in[1].actor_name = oc_slice_str("ann"); in[1].action = oc_slice_str("user.invite");
+        in[1].target = oc_slice_str("bob"); in[1].detail = oc_slice_str("");
+        in[1].family = 1; in[1].outcome = 1;
+        oc_audit_page pg = { 2, in };
+        ROUNDTRIP(oc_encode_audit_page(&w, OC_PROTOCOL_VERSION, &pg), OC_MSG_AUDIT_PAGE, h, p);
+        oc_audit_entry out[4]; uint16_t n = 0;
+        CHECK(oc_decode_audit_page(&p, out, 4, &n) == OC_OK && n == 2);
+        CHECK(out[0].channel_id == 12 && out[0].target_id == 99 && out[0].family == 4);
+        CHECK(out[0].action.len == 14 && memcmp(out[0].action.ptr, "message.delete", 14) == 0);
+        CHECK(out[1].channel_id == 0 && out[1].target.len == 3);
+    }
+    {
         oc_audit_query any = { 0, 50, 0, 0, oc_slice_str("") };
         oc_audit_query out;
         ROUNDTRIP(oc_encode_audit_query(&w, OC_PROTOCOL_VERSION, &any), OC_MSG_AUDIT_QUERY, h, p);
