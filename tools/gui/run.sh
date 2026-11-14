@@ -21,6 +21,29 @@ plat=win32
 case "${1:-}" in --win32) plat=win32; shift ;; --web) plat=web; shift ;; esac
 [ $# -gt 0 ] || { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 names="$*"; [ "$names" = all ] && names="$ALL"
+# Take down what a script left running, whatever its own flag: the Windows
+# client, every fixture daemon of this checkout (each carries OC_TEST_PORT),
+# and every web driver with its browser. Left up, they hold memory the next
+# build shares, and a build then crawls under the memory limit.
+take_down() {
+  "$HERE/tools/gui/drive.sh" kill >/dev/null 2>&1 || true
+  local p pids="" i
+  for p in $(pgrep -x openchimed 2>/dev/null); do
+    [ "$(readlink "/proc/$p/exe" 2>/dev/null)" = "$HERE/openchimed" ] || continue
+    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -q '^OC_TEST_PORT=' && pids="$pids $p"
+  done
+  pids="$pids $(pgrep -f "$HERE/tools/web/drive.mjs " 2>/dev/null) $(pgrep -f 'openchime-webdrive/' 2>/dev/null)"
+  for p in $pids; do kill "$p" 2>/dev/null; done
+  # Gone before the next script or build starts: asked, then up to 5 s, then
+  # killed. A daemon's orderly shutdown takes a moment.
+  for i in $(seq 1 50); do
+    p=""; for p in $pids; do kill -0 "$p" 2>/dev/null && break; p=""; done
+    [ -z "$p" ] && return 0
+    sleep 0.1
+  done
+  for p in $pids; do kill -9 "$p" 2>/dev/null; done
+  return 0
+}
 passed=0; failed=0; skipped=0; bad=""
 for n in $names; do
   n="${n%.sh}"; n="${n#gui_}"
@@ -31,6 +54,7 @@ for n in $names; do
   fi
   echo "== $n ($plat)"
   if OC_TEST_PLATFORM=$plat OC_TEST_NO_BUILD="${OC_TEST_NO_BUILD:-1}" "$s"; then passed=$((passed + 1)); else failed=$((failed + 1)); bad="$bad $n"; fi
+  take_down
 done
 echo "run.sh ($plat): $passed passed, $failed failed, $skipped skipped${bad:+ --$bad}"
 [ $failed = 0 ]
