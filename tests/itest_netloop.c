@@ -5,6 +5,7 @@
  * thread and drives it with blocking TLS clients. */
 
 #include "netloop.h"
+#include "enroll.h"        /* the address proof (AUTH.md §3.6) */
 #include "webapp.h"
 #include "webpages.h"     /* the pages' markers and error kinds */
 #include "pwpolicy.h"     /* OC_PW_RULE_TEXT, said beside a new password */
@@ -37,6 +38,9 @@
 #include "jwt.h"           /* oc_base64url_encode */
 #include "wa_fixture.h"    /* a passkey, as a browser's authenticator answers */
 #include <mbedtls/base64.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
 
 #include <arpa/inet.h>
 #include <math.h>
@@ -5097,6 +5101,73 @@ static void test_summaries(void) {
     db_unlink("itest_sum.db");
 }
 
+/* One POST of `body` to /enroll-proof over a non-oc/1 connection; the answer
+ * whole into `resp`. */
+static void proof_post(int port, const uint8_t *pin, const char *body, char *resp, size_t cap) {
+    client h;
+    resp[0] = '\0';
+    CHECK(http_client_open(&h, port, pin) == 0);
+    char req[512];
+    int rn = snprintf(req, sizeof req,
+        "POST /enroll-proof HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        "Content-Length: %zu\r\nConnection: close\r\n\r\n%s", strlen(body), body);
+    CHECK(write_all(&h.conn, (const uint8_t *)req, (size_t)rn) == 0);
+    http_read_response(&h, resp, cap);
+    client_close(&h);
+}
+
+/* Central's check of the address a workspace reported (AUTH.md §3.6): refused
+ * until the binding is active, then the nonce is signed with the enrollment key
+ * under the address proof's prefix -- verified here as central verifies it -- and
+ * a nonce of any other shape is refused. */
+static void test_address_proof_route(int port, const uint8_t *pin) {
+    const char *nonce = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+    char body[128], resp[2048];
+    snprintf(body, sizeof body, "{\"nonce\":\"%s\"}", nonce);
+
+    oc_netloop_set_enrollment(NULL, NULL);
+    proof_post(port, pin, body, resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 404", 12) == 0);
+
+    static char pk[1024], aud[128];
+    CHECK(oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0);
+    oc_netloop_set_enrollment(aud, pk);
+
+    proof_post(port, pin, body, resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 200", 12) == 0);
+    const char *json = strstr(resp, "\r\n\r\n");
+    char sig_b64[256] = "";
+    if (json) {
+        oc_json d;
+        if (oc_json_parse(&d, json + 4, strlen(json + 4)) == 0) {
+            CHECK(oc_json_get_str(&d, 0, "signature", sig_b64, sizeof sig_b64) == 0);
+            oc_json_free(&d);
+        }
+    }
+    CHECK(sig_b64[0] != '\0');
+
+    mbedtls_entropy_context ent; mbedtls_ctr_drbg_context rng; mbedtls_pk_context key;
+    mbedtls_entropy_init(&ent); mbedtls_ctr_drbg_init(&rng); mbedtls_pk_init(&key);
+    CHECK(mbedtls_ctr_drbg_seed(&rng, mbedtls_entropy_func, &ent, (const unsigned char *)"proof", 5) == 0);
+    CHECK(mbedtls_pk_parse_key(&key, (const unsigned char *)pk, strlen(pk) + 1, NULL, 0,
+                               mbedtls_ctr_drbg_random, &rng) == 0);
+    uint8_t sig[128]; size_t siglen = 0;
+    CHECK(mbedtls_base64_decode(sig, sizeof sig, &siglen, (const unsigned char *)sig_b64, strlen(sig_b64)) == 0);
+    char msg[256];
+    int mn = snprintf(msg, sizeof msg, "openchime-address-proof-v1|%s|%s", aud, nonce);
+    uint8_t hash[32];
+    mbedtls_sha256((const unsigned char *)msg, (size_t)mn, hash, 0);
+    CHECK(mbedtls_pk_verify(&key, MBEDTLS_MD_SHA256, hash, sizeof hash, sig, siglen) == 0);
+    mbedtls_pk_free(&key); mbedtls_ctr_drbg_free(&rng); mbedtls_entropy_free(&ent);
+
+    proof_post(port, pin, "{\"nonce\":\"short\"}", resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 400", 12) == 0);
+    proof_post(port, pin, "not json", resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 400", 12) == 0);
+
+    oc_netloop_set_enrollment(NULL, NULL);
+}
+
 /* Incoming webhooks over the wire (REQ-170, ARCH-32/54): a client mints a
  * per-channel token; a separate non-oc/1 (HTTP) TLS connection POSTs JSON to
  * /webhook/<token>; the channel member receives the message as a BROADCAST and
@@ -8669,6 +8740,7 @@ int run_netloop_tests(void) {
         test_upload_restarted(arg.port, pin, dbw);
         test_snippet_upload_cap(arg.port, pin);
         test_webhook_vertical(arg.port, pin);
+        test_address_proof_route(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
         /* The call group: a held seat goes quickly for every one of them, and
          * the knob is put back after the group, whatever it found. */

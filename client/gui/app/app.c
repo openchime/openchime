@@ -59,6 +59,7 @@
 #include "searchq.h"    /* the same query parser the core sends to the daemon */
 #include "resolve.h"
 #include "store.h"            /* peek a stored session token (skip the sign-in box) */
+#include "permalink.h"        /* openchime:// links, both forms (CLIENT.md "Links") */
 #include "oc_port.h"          /* oc_mkdir, oc_localtime_r */
 #include "protocol.h"         /* OC_CHANNEL_KIND_DM, OC_PRESENCE_* */
 #include "build_id.h"         /* OC_BUILD_ID: About OpenChime */
@@ -2514,6 +2515,7 @@ typedef struct {
     int      post_auth;
     uint64_t backfilled[64];
     int      n_backfilled;
+    char     aud[132];      /* the audience last kept in the book for it (CLIENT.md "Links") */
 } oc_ws_slot;
 static oc_ws_slot g_wss[WS_MAX];
 static int g_n_wss, g_ws_active = -1;
@@ -2521,6 +2523,7 @@ static int ws_find(const char *ws);   /* fwd */
 static int g_logging_out;            /* a LOGOUT is in flight */
 static int g_forget_after_logout;    /* remove the entry once that sign-out lands */
 static void switch_workspace(oc_win *hwnd, const char *ws, const char *cred);   /* fwd */
+static const char *store_path(void);  /* fwd */
 static void signin_begin_known(oc_win *hwnd, const char *ws, const char *user); /* fwd */
 static void sw_book_load(void);      /* fwd */
 static void ws_forget(const char *ws);   /* fwd */
@@ -31049,36 +31052,15 @@ static int files_click(oc_win *hwnd, int x, int y) {
  * Copying a link and HISTORY_AROUND both existed; PASTING one did nothing, so a
  * link was write-only. This is the other half.
  *
- * `openchime://<host>/c/<channel_id>/m/<message_id>`. The ids are the durable
- * reference (ARCH-96 chose them over names precisely because a channel can be
- * renamed), so the host is only used to check you are pointed at the right
- * workspace — following a link into a workspace you are not signed in to is not
- * something to do silently, and it is recorded as unbuilt rather than half-done.
+ * `openchime://<host>/c/<channel_id>/m/<message_id>`, and an email's
+ * `openchime://w/<audience>/c/<channel>[/m/<message>][/t/<thread>]`
+ * (client/core/permalink.h). The ids are the durable reference (ARCH-96 chose
+ * them over names precisely because a channel can be renamed). The host form's
+ * host is only used to check you are pointed at the right workspace. The email
+ * form names the workspace by its audience id and opens only one this device is
+ * signed into or remembers: following a link never connects to a server the
+ * link names.
  */
-static int permalink_parse(const char *text, char *host, size_t hostcap,
-                           uint64_t *chan, uint64_t *msg) {
-    const char *p = text;
-    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-    if (strncmp(p, "openchime://", 12) != 0) return 0;
-    p += 12;
-    size_t hn = 0;
-    while (*p && *p != '/' && hn + 1 < hostcap) host[hn++] = *p++;
-    host[hn] = 0;
-    if (strncmp(p, "/c/", 3) != 0) return 0;
-    p += 3;
-    char *end = NULL;
-    *chan = strtoull(p, &end, 10);
-    if (!end || end == p) return 0;
-    /* A CHANNEL-ONLY link is legal: "/c/7" means open the conversation, with no
-     * message to jump to. A notification points at one of these -- it is about a
-     * conversation having something new, not about a particular line -- and
-     * without this form it would need a second, parallel way of saying where to
-     * go. */
-    if (strncmp(end, "/m/", 3) != 0) { *msg = 0; return *chan ? 1 : 0; }
-    p = end + 3;
-    *msg = strtoull(p, &end, 10);
-    return (*chan && *msg) ? 1 : 0;
-}
 
 /* The move's destination is chosen (REQ-053). A move into a private channel
  * can put the message in front of fewer people than read it now, so that is
@@ -31155,22 +31137,56 @@ static void forward_send(oc_win *hwnd, uint64_t to_cid) {
 /* Follow one. Returns 0 with a toast when it cannot, rather than failing quietly:
  * a link that does nothing is indistinguishable from a broken app. */
 static int permalink_follow(oc_win *hwnd, const char *text) {
-    char host[256]; uint64_t chan = 0, mid = 0;
-    if (!permalink_parse(text, host, sizeof host, &chan, &mid)) return 0;
-    if (!g_client) { fb_failed("Sign in to open a link."); return 1; }
-    /* A different workspace is a real case and we do not guess: switching would
-     * drop what you are reading, and we may not even hold that workspace. */
-    char self[288];
-    if (g_port && g_port != OC_DEFAULT_PORT) oc_hostport(g_host, g_port, self, sizeof self);
-    else snprintf(self, sizeof self, strchr(g_host, ':') ? "[%s]" : "%s", g_host);
-    /* Compared against the same string the copy path builds, so the two halves
-     * cannot disagree about whether a port is part of the identity. A bare host is
-     * accepted too: a link written before the port was included is still ours. */
-    if (host[0] && self[0] && SDL_strcasecmp(host, self) != 0 && SDL_strcasecmp(host, g_host) != 0) {
-        char msg[256];
-        snprintf(msg, sizeof msg, "That link is for %s. Switch workspace first.", host);
-        fb_failed(msg);
-        return 1;
+    oc_permalink pl;
+    if (!oc_permalink_parse(text, &pl)) return 0;
+    /* A thread's link opens at its root, which is in the conversation's own
+     * scroll; a reply's line is reached from there. */
+    uint64_t chan = pl.channel, mid = pl.thread ? pl.thread : pl.message;
+    if (pl.kind == OC_PERMALINK_AUDIENCE) {
+        /* The workspace the link means, by its audience: this one, or another
+         * this device knows, which is switched to and the link followed there
+         * once it is ready -- never a server the link itself could name. */
+        const oc_model *cm = g_client ? model() : NULL;
+        const char *here = cm ? oc_model_workspace_audience(cm) : "";
+        if (!here[0] || strcmp(here, pl.where) != 0) {
+            char ws[256] = "";
+            const char *sp = store_path();
+            oc_store *st = sp ? oc_store_open(sp) : NULL;
+            int found = 0;
+            if (st) {
+                oc_store_set_secret(st, g_secret);
+                found = oc_store_workspace_by_audience(st, pl.where, ws, sizeof ws);
+                oc_store_close(st);
+            }
+            const char *active = g_ws_active >= 0 ? g_wss[g_ws_active].ws : "";
+            if (!found) {
+                fb_failed("This link is for a workspace you're not signed into");
+                return 1;
+            }
+            if (strcmp(ws, active) != 0) {
+                snprintf(g_pending_url, sizeof g_pending_url, "%s", text);
+                switch_workspace(hwnd, ws, "");
+                return 1;
+            }
+        }
+        if (!g_client) { fb_failed("Sign in to open a link."); return 1; }
+    } else {
+        char *host = pl.where;
+        if (!g_client) { fb_failed("Sign in to open a link."); return 1; }
+        /* A different workspace is a real case and we do not guess: switching would
+         * drop what you are reading, and we may not even hold that workspace. */
+        char self[288];
+        if (g_port && g_port != OC_DEFAULT_PORT) oc_hostport(g_host, g_port, self, sizeof self);
+        else snprintf(self, sizeof self, strchr(g_host, ':') ? "[%s]" : "%s", g_host);
+        /* Compared against the same string the copy path builds, so the two halves
+         * cannot disagree about whether a port is part of the identity. A bare host is
+         * accepted too: a link written before the port was included is still ours. */
+        if (host[0] && self[0] && SDL_strcasecmp(host, self) != 0 && SDL_strcasecmp(host, g_host) != 0) {
+            char msg[256];
+            snprintf(msg, sizeof msg, "That link is for %s. Switch workspace first.", host);
+            fb_failed(msg);
+            return 1;
+        }
     }
     const oc_model *m = model();
     if (!m || !oc_model_channel((oc_model *)m, chan)) {
@@ -40528,6 +40544,22 @@ static int on_tick(oc_win *hwnd) {
              * something to follow it into: selecting a channel before the model
              * knows any is a no-op that looks like the link failing. */
             const oc_model *pm = model();
+            /* Keep the workspace's audience beside its book entry, so an email
+             * link naming it finds it later even while it is not the one open. */
+            if (pm && pm->authed && g_ws_active >= 0) {
+                oc_ws_slot *ws = &g_wss[g_ws_active];
+                const char *aud = oc_model_workspace_audience(pm);
+                if (strcmp(ws->aud, aud) != 0) {
+                    const char *sp = store_path();
+                    oc_store *st = sp ? oc_store_open(sp) : NULL;
+                    if (st) {
+                        oc_store_set_secret(st, g_secret);
+                        oc_store_workspace_note_audience(st, ws->ws, aud);
+                        oc_store_close(st);
+                    }
+                    snprintf(ws->aud, sizeof ws->aud, "%s", aud);
+                }
+            }
             if (g_pending_url[0] && pm && pm->authed && pm->n_channels) {
                 char u[512]; snprintf(u, sizeof u, "%s", g_pending_url);
                 g_pending_url[0] = '\0';
@@ -42747,6 +42779,11 @@ int main(int argc, char *argv[]) {
         if (oc_plat_handoff("url", argv[1])) return 0;
         snprintf(g_pending_url, sizeof g_pending_url, "%s", argv[1]);
     }
+    /* `--open <url>` anywhere after: the web client's ?open= (WEB.md), a link
+     * followed once the page has signed in, as one given first is. */
+    for (int i = 1; i + 1 < argc; i++)
+        if (!strcmp(argv[i], "--open") && !strncmp(argv[i + 1], OC_URL_SCHEME "://", sizeof OC_URL_SCHEME + 1))
+            snprintf(g_pending_url, sizeof g_pending_url, "%s", argv[i + 1]);
     /* A browser sign-in's result (oc_plat_signin_result): the web client,
      * served again after the daemon's sign-in page sent the person back with
      * the token. The workspace is the one the page was served for (argv[1])

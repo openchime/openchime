@@ -40,7 +40,7 @@ static uint64_t get_u64(const uint8_t *p) {
  * but it is integrity-sensitive — rewriting a pin is how a MITM gets accepted
  * (ARCH-10) — so it belongs beside the credential, not in a file anyone can
  * edit. The book fields ride along so the credential IS the book entry. */
-#define SEC_VER    4
+#define SEC_VER    5
 #define SEC_LABEL  128
 #define SEC_USER   128
 #define SEC_OWNER  128
@@ -73,15 +73,21 @@ static uint64_t get_u64(const uint8_t *p) {
  * Version 4 appends the PEERS of private DMs (PRIVATE-DM.md §5): for each person
  * this account has had one with, their user id and a 16-byte fingerprint of the
  * device key they used, so a later handshake with another key is noticed. 16 of
- * them, oldest dropped first; a user id of 0 is an empty slot. */
+ * them, oldest dropped first; a user id of 0 is an empty slot.
+ *
+ * Version 5 appends the workspace's AUDIENCE id (WORKSPACE_INFO, CLIENT.md
+ * "Links"), by the same rule: what an email link names the workspace by, so the
+ * app can open the one it means without the link naming a server. */
+#define SEC_AUD_LEN  132
 #define SEC_PEER_N   16
 #define SEC_PEER_LEN (8 + OC_STORE_PEER_FP)
 #define SEC_BLOB_V1 (2 + 8 + OC_SESSION_TOKEN_LEN + OC_TLS_FINGERPRINT_LEN + 8 + SEC_LABEL + SEC_USER)
 #define SEC_BLOB_V2 (SEC_BLOB_V1 + SEC_OWNER)
 #define SEC_BLOB_V3 (SEC_BLOB_V2 + OC_X25519_LEN)
-#define SEC_BLOB    (SEC_BLOB_V3 + SEC_PEER_N * SEC_PEER_LEN)
+#define SEC_BLOB_V4 (SEC_BLOB_V3 + SEC_PEER_N * SEC_PEER_LEN)
+#define SEC_BLOB    (SEC_BLOB_V4 + SEC_AUD_LEN)
 enum { SEC_HAS_TOKEN = 1, SEC_HAS_PIN = 2, SEC_HAS_BOOK = 4, SEC_HAS_OWNER = 8, SEC_HAS_DEVKEY = 16,
-       SEC_HAS_PEERS = 32 };
+       SEC_HAS_PEERS = 32, SEC_HAS_AUD = 64 };
 #define SEC_EXPIRY(b) ((b) + 2)
 #define SEC_TOKEN(b)  ((b) + 10)
 #define SEC_PIN(b)    ((b) + 10 + OC_SESSION_TOKEN_LEN)
@@ -91,6 +97,7 @@ enum { SEC_HAS_TOKEN = 1, SEC_HAS_PIN = 2, SEC_HAS_BOOK = 4, SEC_HAS_OWNER = 8, 
 #define SEC_OWN(b)    (SEC_USR(b) + SEC_USER)
 #define SEC_DEVKEY(b) ((uint8_t *)SEC_OWN(b) + SEC_OWNER)
 #define SEC_PEER(b, i) (SEC_DEVKEY(b) + OC_X25519_LEN + (size_t)(i) * SEC_PEER_LEN)
+#define SEC_AUD(b)    ((char *)SEC_PEER(b, SEC_PEER_N))
 
 static int sec_load(oc_store *s, const char *ws, uint8_t *blob) {
     size_t got = 0;
@@ -106,13 +113,16 @@ static int sec_load(oc_store *s, const char *ws, uint8_t *blob) {
     int v1 = (got == SEC_BLOB_V1 && blob[0] == 1);
     int v2 = (got == SEC_BLOB_V2 && blob[0] == 2);
     int v3 = (got == SEC_BLOB_V3 && blob[0] == 3);
-    if (!v1 && !v2 && !v3 && (got != SEC_BLOB || blob[0] != SEC_VER)) { memset(blob, 0, SEC_BLOB); return 0; }
+    int v4 = (got == SEC_BLOB_V4 && blob[0] == 4);
+    if (!v1 && !v2 && !v3 && !v4 && (got != SEC_BLOB || blob[0] != SEC_VER)) { memset(blob, 0, SEC_BLOB); return 0; }
     if (v1) blob[1] &= (uint8_t)~SEC_HAS_OWNER;   /* bits that did not exist then */
     if (v1 || v2) blob[1] &= (uint8_t)~SEC_HAS_DEVKEY;
     if (v1 || v2 || v3) blob[1] &= (uint8_t)~SEC_HAS_PEERS;
+    if (v1 || v2 || v3 || v4) blob[1] &= (uint8_t)~SEC_HAS_AUD;
     SEC_LBL(blob)[SEC_LABEL - 1] = '\0';   /* fixed-width fields; never trust the tail */
     SEC_USR(blob)[SEC_USER - 1]  = '\0';
     SEC_OWN(blob)[SEC_OWNER - 1] = '\0';
+    SEC_AUD(blob)[SEC_AUD_LEN - 1] = '\0';
     return 1;
 }
 /* Returns 0 when the backend refused the write. A store that quietly declines
@@ -370,6 +380,51 @@ void oc_store_workspace_remember(oc_store *s, const char *workspace,
     if (label && label[0])       snprintf(SEC_LBL(b), SEC_LABEL, "%s", label);
     if (username && username[0]) snprintf(SEC_USR(b), SEC_USER, "%s", username);
     sec_store(s, workspace, b);
+}
+
+void oc_store_workspace_note_audience(oc_store *s, const char *workspace, const char *audience) {
+    if (!s || !workspace || !workspace[0] || !audience || !s->secret) return;
+    uint8_t b[SEC_BLOB];
+    /* Only beside a book entry: the audience is what finds a workspace this
+     * device already knows, and is never the reason to keep an entry. */
+    if (!sec_load(s, workspace, b) || !(b[1] & SEC_HAS_BOOK)) { oc_e2e_wipe(b, sizeof b); return; }
+    int same = (b[1] & SEC_HAS_AUD) && !strcmp(SEC_AUD(b), audience);
+    if (!same) {
+        memset(SEC_AUD(b), 0, SEC_AUD_LEN);
+        if (audience[0] && strlen(audience) < SEC_AUD_LEN) {
+            memcpy(SEC_AUD(b), audience, strlen(audience));
+            b[1] |= SEC_HAS_AUD;
+        } else {
+            b[1] &= (uint8_t)~SEC_HAS_AUD;
+        }
+        sec_store(s, workspace, b);
+    }
+    oc_e2e_wipe(b, sizeof b);
+}
+
+typedef struct { oc_store *s; const char *aud; char *ws; size_t cap; uint64_t used; int found; } afind;
+
+static void audience_find(void *ud, const char *account) {
+    afind *f = ud;
+    uint8_t b[SEC_BLOB];
+    if (sec_load(f->s, account, b) && (b[1] & SEC_HAS_BOOK) && (b[1] & SEC_HAS_AUD) &&
+        !strcmp(SEC_AUD(b), f->aud)) {
+        uint64_t used = get_u64(SEC_USED(b));
+        /* Two entries for one workspace (it moved, both kept): the one used last. */
+        if (!f->found || used > f->used) {
+            snprintf(f->ws, f->cap, "%s", account);
+            f->used = used;
+            f->found = 1;
+        }
+    }
+    oc_e2e_wipe(b, sizeof b);
+}
+
+int oc_store_workspace_by_audience(oc_store *s, const char *audience, char *ws, size_t cap) {
+    if (!s || !s->secret || !audience || !audience[0] || !ws || cap == 0) return 0;
+    afind f = { s, audience, ws, cap, 0, 0 };
+    if (!oc_secret_each(s->secret, audience_find, &f)) return 0;
+    return f.found;
 }
 
 void oc_store_workspace_forget(oc_store *s, const char *workspace) {

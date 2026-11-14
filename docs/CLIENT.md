@@ -1431,6 +1431,31 @@ in a notification email opens the app at a workspace, conversation and message
 (EMAIL.md §7). Each is specified here as it is built; the design is
 [EMAIL.md](./EMAIL.md).
 
+### Links
+
+An `openchime://` link opens a conversation, and a line in it, in the app. It
+comes in two forms (`client/core/permalink.h`):
+
+- **A copied permalink**, `openchime://<host>/c/<channel>[/m/<message>]`, names
+  its workspace by the address it was copied from. It opens in the workspace
+  open now when that is the one it names; otherwise the app says which
+  workspace it is for and asks you to switch to it first.
+- **An email link**, `openchime://w/<audience>/c/<channel>[/m/<message>][/t/<thread>]`,
+  names its workspace by its **audience id** with OpenChime's services: the id
+  the daemon gives a signed-in client in `WORKSPACE_INFO` (PROTOCOL.md §4.3a),
+  which the app keeps beside the workspace in its book (`store.h`). The app
+  opens the workspace this device is signed into, or remembers, with that id:
+  the one open now, or another, switched to and the link followed there once it
+  has signed in. A link for any other id says "This link is for a workspace
+  you're not signed into" and connects nowhere. The link never names a server,
+  so an email cannot send the app anywhere it has not been. `/t/<thread>` is the
+  thread's root, which the link opens at.
+
+A link arrives by a click (a message's link, a toast) or on the command line, as
+the first argument or after `--open`; the web client takes it as `?open=`
+(WEB.md). One that arrives before there is anything to open it into waits until
+the workspace is signed in.
+
 ### Two standing UI rules
 
 **No "…" on a command.** Not in menus, not on buttons, not in cue banners. The

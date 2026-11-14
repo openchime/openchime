@@ -229,22 +229,24 @@ static void test_auth_frames(void) {
     {
         /* WORKSPACE_INFO — deployment mode + user cap + (optional) name. */
         oc_workspace_info in = { 1 /* managed */, 500, oc_slice_str("Acme HQ"), 10, OC_WS_MODE_DEMO,
-                                 160ull * 1024 * 1024 };
+                                 160ull * 1024 * 1024, oc_slice_str("ws_AbC-12_xyz") };
         ROUNDTRIP(oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WORKSPACE_INFO, h, p);
         oc_workspace_info out;
         CHECK(oc_decode_workspace_info(&p, &out) == OC_OK);
         CHECK(out.deployment_mode == 1 && out.max_users == 500 && out.call_max == 10 && out.mode == OC_WS_MODE_DEMO);
         CHECK(out.max_video_size == 160ull * 1024 * 1024);
         CHECK(slice_eq_str(out.workspace_name, "Acme HQ"));
+        CHECK(slice_eq_str(out.audience, "ws_AbC-12_xyz"));
     }
     {
         /* WORKSPACE_INFO — empty name (client derives from the host subdomain). */
-        oc_workspace_info in = { 0, 0, oc_slice_str(""), 0, 0, 0 };
+        oc_workspace_info in = { 0, 0, oc_slice_str(""), 0, 0, 0, oc_slice_str("") };
         ROUNDTRIP(oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WORKSPACE_INFO, h, p);
         oc_workspace_info out;
         CHECK(oc_decode_workspace_info(&p, &out) == OC_OK);
         CHECK(out.deployment_mode == 0 && out.max_users == 0);
         CHECK(slice_eq_str(out.workspace_name, ""));
+        CHECK(slice_eq_str(out.audience, ""));   /* not enrolled */
     }
     {
         /* WORKSPACE_ADDRESS — where a workspace that moved is now. */

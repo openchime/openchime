@@ -164,7 +164,17 @@ canvas{display:block;outline:none}
     // (three base64url segments, AUTH.md §8.12), which the daemon checks.
     const inv = q.get('invite') || '';
     if (/^[0-9a-f]{64}$/.test(inv) || (inv.length <= 1000 && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(inv)))
-      args.push('--invite', inv); }
+      args.push('--invite', inv);
+    // A link to follow once signed in (CLIENT.md "Links"): ?open=<openchime://
+    // link>, kept across the daemon's sign-in page, which sends the person back
+    // to /app/ without it. The client follows only openchime:// links, and an
+    // email's opens only a workspace the device already knows.
+    let open = q.get('open') || '';
+    try {
+      if (open) sessionStorage.setItem('oc.open', open);
+      else { open = sessionStorage.getItem('oc.open') || ''; sessionStorage.removeItem('oc.open'); }
+    } catch (e) {}
+    if (open.startsWith('openchime://') && open.length < 512) args.push('--open', open); }
   // An invitation goes to the sign-up page before the client loads (WEB.md,
   // "An invitation"): the client is only needed once the account exists, so
   // the page makes the sign-in's verifier and challenge itself (AUTH.md §8.2),

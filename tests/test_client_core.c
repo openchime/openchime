@@ -3387,6 +3387,42 @@ static void test_store_no_persistence_without_keyring(void) {
     oc_store_close(s);
 }
 
+/* The audience id kept beside a book entry (WORKSPACE_INFO): an email link finds
+ * the workspace it means among those this device knows, and no other. */
+static void test_workspace_audience(void) {
+    mock_reset();
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open(tpath("itest_core_audience"));
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &sec);
+    char ws[256];
+
+    /* Not kept for a workspace the book does not have. */
+    oc_store_workspace_note_audience(s, "acme:443", "ws_acme000000");
+    CHECK(!oc_store_workspace_by_audience(s, "ws_acme000000", ws, sizeof ws));
+
+    oc_store_workspace_remember(s, "acme:443",   "acme.example.com",   "dana", 1000);
+    oc_store_workspace_remember(s, "globex:443", "globex.example.com", "dana", 2000);
+    oc_store_workspace_note_audience(s, "acme:443", "ws_acme000000");
+    oc_store_workspace_note_audience(s, "globex:443", "ws_globex0000");
+    CHECK(oc_store_workspace_by_audience(s, "ws_acme000000", ws, sizeof ws) && !strcmp(ws, "acme:443"));
+    CHECK(oc_store_workspace_by_audience(s, "ws_globex0000", ws, sizeof ws) && !strcmp(ws, "globex:443"));
+    CHECK(!oc_store_workspace_by_audience(s, "ws_initech000", ws, sizeof ws));
+
+    /* Re-signing in keeps it; clearing it ("" -- the workspace left the services)
+     * stops the link finding it. */
+    oc_store_workspace_remember(s, "acme:443", NULL, NULL, 3000);
+    CHECK(oc_store_workspace_by_audience(s, "ws_acme000000", ws, sizeof ws) && !strcmp(ws, "acme:443"));
+    oc_store_workspace_note_audience(s, "acme:443", "");
+    CHECK(!oc_store_workspace_by_audience(s, "ws_acme000000", ws, sizeof ws));
+
+    /* Forgetting the workspace forgets its audience with it. */
+    oc_store_workspace_forget(s, "globex:443");
+    CHECK(!oc_store_workspace_by_audience(s, "ws_globex0000", ws, sizeof ws));
+    oc_store_close(s);
+}
+
 static void test_workspace_book(void) {
     /* The book IS the credential store's contents now (one entry per workspace),
      * so it needs the keyring attached from the start. */
@@ -6282,6 +6318,7 @@ int run_client_core_tests(void) {
     test_secret_routing();
     test_store_no_persistence_without_keyring();
     test_workspace_book();
+    test_workspace_audience();
     test_session_owner();
     test_store_legacy_entry();
     test_device_key();

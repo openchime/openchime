@@ -105,6 +105,66 @@ static void test_code_and_signature(void) {
     mbedtls_pk_free(&pub);
 }
 
+/* The address proof (AUTH.md §3.6): central's nonce, signed under the address
+ * proof's own prefix and checked the way central checks it; a signature made for
+ * the enrollment handshake does not pass for it, nor the other way round. */
+static int verify_line(mbedtls_pk_context *key, const char *prefix, const char *aud,
+                       const char *nonce, const char *sig_b64) {
+    uint8_t sig[128];
+    size_t siglen = 0;
+    if (mbedtls_base64_decode(sig, sizeof sig, &siglen, (const unsigned char *)sig_b64, strlen(sig_b64)) != 0)
+        return 0;
+    char msg[512];
+    int mn = snprintf(msg, sizeof msg, "%s|%s|%s", prefix, aud, nonce);
+    uint8_t hash[32];
+    mbedtls_sha256((const unsigned char *)msg, (size_t)mn, hash, 0);
+    return mbedtls_pk_verify(key, MBEDTLS_MD_SHA256, hash, sizeof hash, sig, siglen) == 0;
+}
+
+static void test_address_proof(mbedtls_ctr_drbg_context *rng) {
+    char pk[1024], aud[128];
+    CHECK(oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0);
+    mbedtls_pk_context key;
+    mbedtls_pk_init(&key);
+    CHECK(mbedtls_pk_parse_key(&key, (const unsigned char *)pk, strlen(pk) + 1, NULL, 0,
+                               mbedtls_ctr_drbg_random, rng) == 0);
+
+    const char *nonce = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+    CHECK(oc_enroll_nonce_ok(nonce, strlen(nonce)));
+    char sig[256];
+    CHECK(oc_enroll_sign_address_proof(pk, aud, nonce, sig, sizeof sig) == 0);
+    CHECK(verify_line(&key, "openchime-address-proof-v1", aud, nonce, sig));
+    CHECK(!verify_line(&key, "openchime-address-proof-v1", aud, "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh9", sig));
+    CHECK(!verify_line(&key, "openchime-enroll-v1", aud, nonce, sig));
+
+    char esig[256];
+    CHECK(oc_enroll_sign_proof(pk, aud, nonce, esig, sizeof esig) == 0);
+    CHECK(!verify_line(&key, "openchime-address-proof-v1", aud, nonce, esig));
+    mbedtls_pk_free(&key);
+}
+
+/* What central is sent: a nonce of the one shape it makes, and the address as a
+ * DNS name with its port unless that is 443. */
+static void test_address_and_nonce(void) {
+    CHECK(!oc_enroll_nonce_ok("short", 5));
+    CHECK(!oc_enroll_nonce_ok("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", 44));
+    CHECK(!oc_enroll_nonce_ok("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdH+8", 43));
+
+    char a[300];
+    CHECK(oc_enroll_address(NULL, "Chat.Acme.Example,other.example", 443, a, sizeof a) == 0 &&
+          strcmp(a, "chat.acme.example") == 0);
+    CHECK(oc_enroll_address(NULL, "chat.acme.example", 8443, a, sizeof a) == 0 &&
+          strcmp(a, "chat.acme.example:8443") == 0);
+    CHECK(oc_enroll_address("moved.acme.example", "chat.acme.example", 443, a, sizeof a) == 0 &&
+          strcmp(a, "moved.acme.example") == 0);
+    CHECK(oc_enroll_address("", "chat.acme.example", 443, a, sizeof a) == 0 &&
+          strcmp(a, "chat.acme.example") == 0);
+    CHECK(oc_enroll_address(NULL, NULL, 443, a, sizeof a) != 0);
+    CHECK(oc_enroll_address(NULL, "localhost", 443, a, sizeof a) != 0);
+    CHECK(oc_enroll_address(NULL, "-bad.example", 443, a, sizeof a) != 0);
+    CHECK(oc_enroll_address(NULL, "bad_name.example", 443, a, sizeof a) != 0);
+}
+
 /* A managed box's claim (AUTH.md §8.7): the signature covers the audience and the
  * hashes of the ticket and of the public key — checked here the way central does. */
 static void test_claim_signature(void) {
@@ -333,6 +393,8 @@ int run_enroll_tests(void) {
     test_generate(&rng);
     test_code_and_signature();
     test_claim_signature();
+    test_address_proof(&rng);
+    test_address_and_nonce();
     test_plain_http_refused();
     test_claim_answers();
     test_persistence();

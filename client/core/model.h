@@ -449,6 +449,7 @@ typedef struct {
     uint8_t  workspace_mode;          /* OC_WS_MODE_*: a public demo says so (AUTH.md §8.12) */
     uint32_t max_users;               /* 0 = unlimited */
     char     workspace_name[64];      /* "" ⇒ frontend derives from the host subdomain */
+    char     workspace_audience[132]; /* its audience id with OpenChime's services; "" ⇒ not enrolled */
     char     server_build[48];        /* the daemon's build id (SERVER_BUILD); "" from a daemon that does not say */
 
     /* Read-aloud (REQ-291-295, ARCH-111), from TTS_INFO after auth and replaced
@@ -1452,6 +1453,9 @@ size_t oc_model_reset_text(const oc_model *m, const char *address, const char *l
  * "managed". workspace_name is "" until a name is configured. */
 uint8_t     oc_model_deployment_mode(const oc_model *m);
 const char *oc_model_deployment_name(const oc_model *m);
+/* The workspace's audience id (WORKSPACE_INFO): what an email link names it by
+ * (CLIENT.md, "Links"). "" when it is not enrolled. */
+const char *oc_model_workspace_audience(const oc_model *m);
 const char *oc_model_workspace_name(const oc_model *m);
 uint32_t    oc_model_max_users(const oc_model *m);
 /* The daemon's build id (SERVER_BUILD), "" until it says -- a daemon older than

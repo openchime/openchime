@@ -336,6 +336,7 @@ oc_result oc_encode_workspace_info(oc_wbuf *w, uint16_t version, const oc_worksp
     oc_w_u8(w, m->call_max);
     oc_w_u8(w, m->mode);
     oc_w_u64(w, m->max_video_size);
+    oc_w_str(w, m->audience);
     return oc_frame_end(w, off);
 }
 
@@ -3018,6 +3019,7 @@ oc_result oc_decode_workspace_info(oc_rbuf *p, oc_workspace_info *m) {
     m->call_max = oc_r_u8(p);
     m->mode = oc_r_u8(p);
     m->max_video_size = oc_r_u64(p);
+    m->audience = oc_r_str(p);
     return r_done(p);
 }
 

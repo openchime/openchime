@@ -244,8 +244,12 @@
  *
  * 44: UPLOAD_BEGIN carries `media_kind` (u8), so a snippet's text past
  * OC_SNIPPET_MAX_SIZE is refused before its bytes are sent (REQ-226). A field
- * appended to a fixed layout. */
-#define OC_PROTOCOL_VERSION 44u
+ * appended to a fixed layout.
+ *
+ * 45: WORKSPACE_INFO carries `audience` (str), the workspace's audience id
+ * with OpenChime's services, empty when it is not enrolled: an email link names
+ * a workspace by it (CLIENT.md, "Links"). A field appended to a fixed layout. */
+#define OC_PROTOCOL_VERSION 45u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -1132,8 +1136,10 @@ typedef struct { uint8_t scope; oc_slice session_token; } oc_logout;
 #define OC_WS_MODE_NORMAL      0
 #define OC_WS_MODE_DEVELOPMENT 1
 #define OC_WS_MODE_DEMO        2
+/* audience is the workspace's audience id with OpenChime's services (AUTH.md
+ * §3.3), empty when it is not enrolled: what an email link names it by. */
 typedef struct { uint8_t deployment_mode; uint32_t max_users; oc_slice workspace_name;
-                 uint8_t call_max; uint8_t mode; uint64_t max_video_size; } oc_workspace_info;
+                 uint8_t call_max; uint8_t mode; uint64_t max_video_size; oc_slice audience; } oc_workspace_info;
 /* Pushed after WORKSPACE_INFO, only where the deployment names the workspace's
  * canonical address (OPENCHIME_MANAGED_ADDRESS): a workspace moved to a new
  * address still answers at the old one for a while, and a client that connected

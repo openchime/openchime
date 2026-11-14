@@ -164,6 +164,12 @@ for the person:
 `?env=OPENCHIME_DEV_SIGNIN=user:password` has the page post the daemon's
 sign-in form itself and follow the redirect back (`plat_web.c`).
 
+**A link to open.** `/app/?open=<openchime:// link>` (CLIENT.md, "Links") is
+followed once the client has signed in, as a link given on the command line is.
+The page keeps it in the tab's session storage across the daemon's sign-in page,
+which sends the person back to `/app/` without it. Only an `openchime://` link
+is passed on, and an email's opens only a workspace this browser already knows.
+
 **An invitation link.** `/app/?invite=<hex>` is the page opened with an
 invitation (REQ-026). The client is needed only once the account exists, so the
 page does not load it first: it makes the sign-in's verifier and challenge with

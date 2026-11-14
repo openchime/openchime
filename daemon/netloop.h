@@ -130,6 +130,12 @@ void oc_netloop_set_push(struct oc_push *push);
 struct oc_invite_mail;
 void oc_netloop_set_invite_mail(struct oc_invite_mail *m);
 
+/* The enrollment the address proof signs with (AUTH.md §3.6): set once the
+ * binding is active, after which POST /enroll-proof answers central's check of
+ * the address this workspace reported. NULL (the default) answers 404. Both
+ * strings must outlive the loop. May be called while the loop runs. */
+void oc_netloop_set_enrollment(const char *audience, const char *privkey_pem);
+
 /* Called once, on the loop's thread, when the listener is bound and taking
  * connections and the loop is about to serve: the moment a workspace is up. It
  * must return promptly -- anything slow belongs on a thread it starts. NULL (the

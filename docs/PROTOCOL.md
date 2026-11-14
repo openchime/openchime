@@ -115,7 +115,9 @@ during the TLS handshake:
 Both sides exist. A connection that negotiates `oc/1` reaches the binary
 protocol; one that does not is read by the daemon's HTTP/1.1 stack (ARCH-32),
 which serves `POST /webhook/<token>` (§5.15), the WebSocket upgrade `GET /ws`
-(§1.2), the daemon's own sign-in pages (AUTH.md §8.10/§8.11) and, when its wasm
+(§1.2), `POST /enroll-proof` (central's check of the address an enrolled
+workspace reported, AUTH.md §3.6), the daemon's own sign-in pages (AUTH.md
+§8.10/§8.11) and, when its wasm
 is beside the binary, the web client under `/app/` (WEB.md): any other path is
 `404`, and a served path under another method `405`.
 `/healthz` and the landing page are on the separate plaintext health port
@@ -481,6 +483,7 @@ a bare host address. Clients that don't recognize the frame ignore it.
 | `call_max`        | u8   | The most people in one call, ten (`OC_CALL_MAX`, REQ-305) — so a client starting one in a large channel knows when the starter must pick (§5.17). |
 | `mode`            | u8   | `OPENCHIME_MODE`: `0` normal, `1` development, `2` demo. A client in a public demo (`2`) says so for as long as it is open (AUTH.md §8.12). Appended in version 25. |
 | `max_video_size`  | u64  | The most bytes a video message may hold (`OPENCHIME_MAX_VIDEO_SIZE`, 160 MiB by default, at most `MAX_ATTACHMENT_SIZE`; REQ-164). A client's recorder stops 5 MiB short of it, and `ATTACH_MEDIA_SET` refuses a larger video with `MEDIA_TOO_LARGE` (§5.14a). Appended in version 27. |
+| `audience`        | str  | The workspace's audience id with OpenChime's services (AUTH.md §3.3), **empty** when it is not enrolled. An email link names the workspace by it (CLIENT.md, "Links"). Appended in version 45. |
 
 ### 4.3b `WORKSPACE_ADDRESS` (server → client), msg_type `0x001C`
 

@@ -11,6 +11,8 @@
 #include "config.h"
 #include "push.h"
 #include "invite_mail.h"
+#include "enroll.h"    /* the address proof (AUTH.md §3.6) */
+#include "json.h"
 #include "unfurl.h"
 #include "richtext.h"   /* oc_rt_visible_urls: what is hidden is not unfurled */
 #include "url.h"
@@ -448,6 +450,7 @@ static __thread uint64_t      g_max_video  = 0;   /* OPENCHIME_MAX_VIDEO_SIZE, s
  * fixed window keyed by the token, so one noisy integration can't flood a
  * channel. Created in oc_netloop_run. */
 static __thread oc_ratelimit *g_webhook_rl;
+static __thread oc_ratelimit *g_proof_rl;   /* /enroll-proof, per caller */
 /* Device codes (AUTH.md §8.11): the pending requests, and how often one source
  * may look a code up on the /device page -- a guessed code is the attack. */
 static __thread oc_devcodes  *g_devcodes;
@@ -467,6 +470,10 @@ void oc_netloop_set_device_ttl_ms(uint64_t ms) { __atomic_store_n(&g_device_ttl_
 void oc_netloop_set_device_interval_s(unsigned s) { __atomic_store_n(&g_device_interval_s, s, __ATOMIC_RELAXED); }
 #define OC_WEBHOOK_RATE_MAX     60u
 #define OC_WEBHOOK_RATE_WINDOW  60000u
+/* Address proofs per caller a minute (AUTH.md §3.6). Central asks once a minute
+ * at most for a workspace, so a few is generous; each one costs a signature. */
+#define OC_PROOF_RATE_MAX       5u
+#define OC_PROOF_RATE_WINDOW    60000u
 
 /* Release any transfer state on a connection and reset it. A still-open upload
  * writer is aborted (its staged bytes discarded), so an interrupted upload never
@@ -1300,6 +1307,22 @@ void oc_netloop_set_push(struct oc_push *push) {
 
 void oc_netloop_set_invite_mail(struct oc_invite_mail *m) {
     __atomic_store_n(&g_invite_mail, m, __ATOMIC_RELEASE);
+}
+
+/* The enrollment the address proof signs with (AUTH.md §3.6), published once
+ * the binding is active, like push; until then /enroll-proof answers 404. */
+typedef struct { const char *audience, *privkey; } enroll_ident;
+static enroll_ident  g_enroll_slot;
+static enroll_ident *g_enroll;
+
+void oc_netloop_set_enrollment(const char *audience, const char *privkey_pem) {
+    if (!audience || !privkey_pem) {
+        __atomic_store_n(&g_enroll, NULL, __ATOMIC_RELEASE);
+        return;
+    }
+    g_enroll_slot.audience = audience;
+    g_enroll_slot.privkey = privkey_pem;
+    __atomic_store_n(&g_enroll, &g_enroll_slot, __ATOMIC_RELEASE);
 }
 
 static oc_push *cur_push(void) { return __atomic_load_n(&g_push, __ATOMIC_ACQUIRE); }
@@ -4958,6 +4981,8 @@ static void http_reply(conn *c, int status, const char *ctype, const char *body,
 static const oc_http_route TLS_ROUTES[] = {
     { "GET",  WS_PATH, 0, OC_HTTP_WS, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
     { "POST", WEBHOOK_PREFIX, 1, OC_HTTP_LOOP, OC_MAX_BODY_SIZE, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    /* Central's check of the address this workspace reported (AUTH.md §3.6). */
+    { "POST", OC_ADDRESS_PROOF_PATH, 0, OC_HTTP_LOOP, 256, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
     { "GET",  "/signin", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
     { "POST", "/signin", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
     { "POST", "/signin/verify", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
@@ -6071,6 +6096,44 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
     conn_close(ep, conns, c->fd);
 }
 
+/* Central's check of the address this workspace reported (AUTH.md §3.6): it
+ * posts {"nonce": <base64url of 32 bytes>} and gets back the enrollment key's
+ * signature over openchime-address-proof-v1|<aud>|<nonce>. Answered only once
+ * the binding is active, and a few times a minute per caller. Returns -1: the
+ * answer is queued and the connection closes. */
+static int on_address_proof(conn *c, const oc_http_req *req) {
+    const enroll_ident *e = __atomic_load_n(&g_enroll, __ATOMIC_ACQUIRE);
+    if (!e) { http_reply(c, 404, "text/plain", "not found\n", 10); return -1; }
+    uint64_t now = now_ms();
+    if (g_proof_rl && oc_ratelimit_blocked(g_proof_rl, c->source, now)) {
+        http_reply(c, 429, "text/plain", "rate limited\n", 13);
+        return -1;
+    }
+    if (g_proof_rl) oc_ratelimit_record(g_proof_rl, c->source, now);
+
+    char nonce[OC_ADDRESS_NONCE_LEN + 2];
+    oc_json d;
+    int ok = req->body && req->body_len && oc_json_parse(&d, req->body, req->body_len) == 0;
+    if (ok) {
+        ok = d.n > 0 && d.t[0].type == JSMN_OBJECT &&
+             oc_json_get_str(&d, 0, "nonce", nonce, sizeof nonce) == 0 &&
+             oc_enroll_nonce_ok(nonce, strlen(nonce));
+        oc_json_free(&d);
+    }
+    if (!ok) { http_reply(c, 400, "text/plain", "bad nonce\n", 10); return -1; }
+
+    char sig[256];
+    if (oc_enroll_sign_address_proof(e->privkey, e->audience, nonce, sig, sizeof sig) != 0) {
+        http_reply(c, 500, "text/plain", "error\n", 6);
+        return -1;
+    }
+    char body[320];
+    int n = snprintf(body, sizeof body, "{\"signature\":\"%s\"}", sig);
+    if (n <= 0 || (size_t)n >= sizeof body) { http_reply(c, 500, "text/plain", "error\n", 6); return -1; }
+    http_reply(c, 200, "application/json", body, (size_t)n);
+    return -1;
+}
+
 /* An HTTP connection's request for a loop route, parsed and routed by its I/O
  * thread; every refusal was answered there. Returns 0 to keep, -1 to close. */
 static int on_http_req(conn *c, const oc_io_event *e, oc_dbwriter *dbw) {
@@ -6089,6 +6152,9 @@ static int on_http_req(conn *c, const oc_io_event *e, oc_dbwriter *dbw) {
     static const char PFX[] = WEBHOOK_PREFIX;
     if (req.path_len >= sizeof PFX - 1 && memcmp(req.path, PFX, sizeof PFX - 1) == 0)
         return on_http_request(c, &req, dbw);
+    if (req.path_len == sizeof OC_ADDRESS_PROOF_PATH - 1 &&
+        memcmp(req.path, OC_ADDRESS_PROOF_PATH, req.path_len) == 0)
+        return on_address_proof(c, &req);
     return on_web_page(c, &req, dbw);
 }
 
@@ -6406,6 +6472,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
          * so the client can render a branded header instead of a bare host. */
         {
             const oc_config *cfg = oc_config_get();
+            const enroll_ident *ei = __atomic_load_n(&g_enroll, __ATOMIC_ACQUIRE);
             oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_workspace_info wi = { (uint8_t)cfg->deployment_mode,
                                      (uint32_t)(cfg->max_users > 0 ? cfg->max_users : 0),
@@ -6414,7 +6481,12 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                                      (uint8_t)(cfg->mode == OC_MODE_DEMO ? OC_WS_MODE_DEMO
                                                : cfg->mode == OC_MODE_DEVELOPMENT ? OC_WS_MODE_DEVELOPMENT
                                                : OC_WS_MODE_NORMAL),
-                                     cfg->max_video_size };
+                                     cfg->max_video_size,
+                                     /* What an email link names this workspace by
+                                      * (CLIENT.md, "Links"): its enrollment's audience,
+                                      * else the one it was started with (a managed box's). */
+                                     oc_slice_str(ei ? ei->audience
+                                                  : cfg->oidc.audience ? cfg->oidc.audience : "") };
             oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &wi);
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (!conns[fd]) break;   /* dropped on the WORKSPACE_INFO write */
@@ -9774,6 +9846,7 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     /* Per-webhook rate limit (REQ-170); best-effort — if allocation fails the
      * endpoint still works, just unthrottled. */
     g_webhook_rl = oc_ratelimit_new(OC_WEBHOOK_RATE_MAX, OC_WEBHOOK_RATE_WINDOW, 1024);
+    g_proof_rl = oc_ratelimit_new(OC_PROOF_RATE_MAX, OC_PROOF_RATE_WINDOW, 256);
     g_devcodes = oc_devcodes_new();
     g_websteps = oc_websteps_new();
     if (g_devcodes) {
@@ -10062,6 +10135,8 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     g_websteps = NULL;
     oc_ratelimit_free(g_device_rl);
     g_device_rl = NULL;
+    oc_ratelimit_free(g_proof_rl);
+    g_proof_rl = NULL;
     g_webhook_rl = NULL;
     oc_trusted_proxies_free(trusted);
     oc_trusted_proxies_free(allowed);

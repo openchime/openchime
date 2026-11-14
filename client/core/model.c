@@ -781,6 +781,10 @@ int oc_model_user_disabled(const oc_model *m, uint64_t user_id) {
 
 uint8_t     oc_model_deployment_mode(const oc_model *m) { return m->deployment_mode; }
 uint32_t    oc_model_max_users(const oc_model *m)       { return m->max_users; }
+const char *oc_model_workspace_audience(const oc_model *m) {
+    return m ? m->workspace_audience : "";
+}
+
 const char *oc_model_workspace_name(const oc_model *m)  { return m->workspace_name; }
 const char *oc_model_server_build(const oc_model *m)    { return m->server_build; }
 
@@ -2142,6 +2146,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->workspace_mode = e->ws_mode;
         m->max_video_size = e->size;
         snprintf(m->workspace_name, sizeof m->workspace_name, "%s", e->body ? e->body : "");
+        snprintf(m->workspace_audience, sizeof m->workspace_audience, "%s", e->ws_audience);
         /* SERVER_BUILD follows on this connection; a daemon too old to send it
          * leaves the field empty rather than showing the last daemon's build. */
         m->server_build[0] = '\0';
