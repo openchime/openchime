@@ -34649,7 +34649,8 @@ static void boot_book_cb(void *ctx, const char *workspace, const char *label,
  * command-line path that meant a window created hidden and never shown -- a live
  * process, no window, no error, indistinguishable from a client that failed to
  * start at all. */
-/* How many clients connect_start has started this process. Observable by the
+/* How many clients this process has started: connect_start, and the sign-in
+ * card's attempts (signin_start, and the web client's resumed one). Observable by the
  * harness (tools/gui/startup.sh, via test_dump): a startup given a workspace
  * starts exactly one, and a second is the defect where two net threads shared a
  * workspace, each authenticating, with the first orphaned. */
@@ -34970,6 +34971,7 @@ static void signin_start(oc_win *hwnd, const char *source_id, const char *invite
         invalidate();
         return;
     }
+    g_clients_started++;
     g_si_browser = 1;
     g_si_opened_seq = 0;
     g_si_connecting = 1;
@@ -35020,6 +35022,7 @@ static void signin_resume(oc_win *hwnd, const char *ws, const char *token) {
                                                 g_si_remember, g_si_fp);
     oc_signin_wipe(verifier, sizeof verifier);
     if (!g_si_client) { snprintf(g_si_err, sizeof g_si_err, "could not start the client"); invalidate(); return; }
+    g_clients_started++;
     g_si_browser = 0;
     g_si_opened_seq = 0;
     g_si_connecting = 1;
@@ -38039,10 +38042,15 @@ static void test_dump(const char *path) {
          * dump without them left every Windows script stuck at launch. */
         fprintf(f, "no model\nview=%d wsbook=%d dpi=%u\nsignin step=%d browser=%d connecting=%d err=%s\n",
                 g_view, ws_book_count(), g_dpi, g_si_step, g_si_browser, g_si_connecting, g_si_err);
-        if (g_si_client) {
-            const oc_model *sm = oc_client_model(g_si_client);
-            if (sm) fprintf(f, "signin last_error=%s signin_url=%.120s\n", sm->last_error, sm->signin_url);
-        }
+        const oc_model *sm = g_si_client ? oc_client_model(g_si_client) : NULL;
+        if (sm) fprintf(f, "signin last_error=%s signin_url=%.120s\n", sm->last_error, sm->signin_url);
+        /* The two lines a signed-in dump has that say how a start went, here
+         * too: a start that never signed in is the case they are most needed
+         * for (tools/gui/startup.sh). The error is the sign-in attempt's. */
+        fprintf(f, "startup visible=%d started=%d si_ws=\"%s\" si_err=\"%s\"\n",
+                win_visible(g_main), g_clients_started, g_si_ws, g_si_err);
+        fprintf(f, "error_seq=%u last_error=\"%s\"\n",
+                sm ? (unsigned)sm->error_seq : 0u, sm ? sm->last_error : "");
         fprintf(f, "cursor kind=%s\n", cursor_kind_name());
         test_dump_confirm(f);
         test_dump_a11y(f);
