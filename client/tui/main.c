@@ -2061,7 +2061,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         /* An encrypted DM is the same title behind a lock. */
         const char *pn = oc_model_user_name(m, fc->peer_id);
         /* And until when they are out of office (REQ-122), where they are. */
-        char oo[96] = "";
+        char oo[sizeof " \xc2\xb7 " - 1 + 96] = "";   /* the separator and the label */
         const oc_member *om = oc_model_ooo_active(m, fc->peer_id, (uint64_t)time(NULL) * 1000u);
         if (om) { char ol[96]; oc_model_ooo_label(om, ol, sizeof ol); snprintf(oo, sizeof oo, " \xc2\xb7 %s", ol); }
         snprintf(mt, sizeof mt, "%s@%s%s", fc->e2e ? "\xf0\x9f\x94\x92 " : "", pn[0] ? pn : "dm", oo);
@@ -3751,7 +3751,9 @@ int main(int argc, char **argv) {
     /* The snippet open over the screen (REQ-226): which, its title and
      * language, and the first line shown. */
     uint64_t sv_id = 0; int sv_top = 0, sv_lang = 0, sv_lines = 0;
-    char sv_title[OC_SNIPPET_TITLE_MAX + 1] = "";
+    /* A snippet's title, or its file name when it has none: room for either. */
+    char sv_title[sizeof ((oc_attachment *)0)->filename > sizeof ((oc_attachment *)0)->title
+                  ? sizeof ((oc_attachment *)0)->filename : sizeof ((oc_attachment *)0)->title] = "";
     int ac_idx = 0;                           /* autocomplete cycle index */
     int panel = 0;                            /* 0 composer · 1 channels · 2 messages · 3 members */
     int msg_sel = -1, mem_sel = 0;            /* selection within the messages / members panel */
