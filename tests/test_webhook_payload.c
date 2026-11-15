@@ -35,6 +35,19 @@ static void test_plain(void) {
     /* contract: a text/plain body is the message, unchanged */
     CHECK(is(posted("text/plain", "raw <https://x.example|x> &amp; body"), "raw <https://x.example|x> &amp; body"));
     CHECK(posted("text/plain", "") == NULL);
+    /* contract: a NUL byte in the body is dropped, so the text is the C string
+     * of the length it says */
+    static const char rq[] = "POST /webhook/x HTTP/1.1\r\nContent-Type: text/plain\r\n"
+                             "Content-Length: 5\r\n\r\na\0b\0c";
+    oc_http_req r;
+    char out[16];
+    size_t tl = 0;
+    CHECK(oc_http_parse(rq, sizeof rq - 1, MAXB, &r) == 1);
+    CHECK(oc_http_webhook_payload(&r, out, sizeof out, &tl) == 1 && tl == 3 && strcmp(out, "abc") == 0);
+    static const char nul[] = "POST /webhook/x HTTP/1.1\r\nContent-Type: text/plain\r\n"
+                              "Content-Length: 1\r\n\r\n\0";
+    CHECK(oc_http_parse(nul, sizeof nul - 1, MAXB, &r) == 1);
+    CHECK(oc_http_webhook_payload(&r, out, sizeof out, &tl) == 0 && tl == 0);
 }
 
 /* Criterion 1: a JSON string is decoded. */

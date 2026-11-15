@@ -357,9 +357,15 @@ int oc_http_webhook_payload(const oc_http_req *req, char *out, size_t cap, size_
     out[0] = '\0';
     if (!req->body || req->body_len == 0) return 0;
     if (!req->is_json && !req->is_form) {
-        /* Plain text is posted as sent, as far as it fits. */
+        /* Plain text is posted as sent, as far as it fits, less any NUL byte:
+         * the text is a C string of the length it says. */
         wh_out o = { out, 0, cap, 0 };
-        wh_put(&o, req->body, req->body_len);
+        for (size_t i = 0; i < req->body_len; ) {
+            const char *z = memchr(req->body + i, '\0', req->body_len - i);
+            size_t n = z ? (size_t)(z - (req->body + i)) : req->body_len - i;
+            wh_put(&o, req->body + i, n);
+            i += n + (z != NULL);
+        }
         *outlen = o.n;
         return o.n > 0;
     }
