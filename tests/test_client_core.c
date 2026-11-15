@@ -3561,7 +3561,7 @@ static void test_store_legacy_entry(void) {
 
     /* The next write of anything upgrades the entry in place, keeping the rest. */
     oc_store_save_pin(s, "acme:443", pin);
-    CHECK(mock_len_of("acme:443") > (size_t)V1_BLOB && mock_ver_of("acme:443") == 4);
+    CHECK(mock_len_of("acme:443") > (size_t)V1_BLOB && mock_ver_of("acme:443") == 5);
     CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1 && tok[0] == 1);
     memset(&b, 0, sizeof b);
     oc_store_workspace_each(s, book_cb, &b);
@@ -4914,7 +4914,7 @@ static void test_device_key(void) {
     CHECK(oc_x25519_public(sk, pkc) == 0 && memcmp(pkc, pk, 32) == 0);
     CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1);
     CHECK(memcmp(sk, sk2, 32) == 0 && memcmp(pk, pk2, 32) == 0);
-    CHECK(mock_ver_of("acme:443") == 4);
+    CHECK(mock_ver_of("acme:443") == 5);
 
     /* The people of private DMs (PRIVATE-DM.md §5): the first key is remembered,
      * the same is known, a different one is reported and changes nothing until
