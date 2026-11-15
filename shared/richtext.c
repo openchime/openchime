@@ -1409,3 +1409,55 @@ size_t oc_lex(int lang, const char *s, size_t n, oc_lex_tok *out, size_t cap) {
 #undef LEX_EMIT
     return nt;
 }
+
+/* --- to-do lists (todo.h) -------------------------------------------------- */
+
+#include "todo.h"
+
+int oc_todo_blank(const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) if (s[i] != ' ' && s[i] != '\t' && s[i] != '\r') return 0;
+    return 1;
+}
+
+/* [a, b) trimmed of spaces, tabs and a CR. */
+static oc_todo_span todo_trim(const char *s, size_t a, size_t b) {
+    while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r')) a++;
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r')) b--;
+    oc_todo_span sp = { (uint32_t)a, (uint32_t)(b - a) };
+    return sp;
+}
+
+int oc_todo_parse(const char *body, size_t n, oc_todo_parsed *out) {
+    if (!body || !out || n < 5 || memcmp(body, "/todo", 5) != 0) return OC_TODO_NONE;
+    if (n > 5 && body[5] != ' ' && body[5] != '\t' && body[5] != '\n' && body[5] != '\r') return OC_TODO_NONE;
+    memset(out, 0, sizeof *out);
+    size_t e = 5;
+    while (e < n && body[e] != '\n') e++;
+    out->title = todo_trim(body, 5, e);
+    if (out->title.len == 0 || out->title.len > OC_TODO_TITLE_MAX) return OC_TODO_BAD;
+    size_t i = e < n ? e + 1 : n;
+    while (i < n) {
+        size_t le = i;
+        while (le < n && body[le] != '\n') le++;
+        oc_todo_span line = todo_trim(body, i, le);
+        size_t a = line.off, b = line.off + line.len;
+        if (a < b && (body[a] == '-' || body[a] == '*')) { line = todo_trim(body, a + 1, b); a = line.off; }
+        if (line.len) {
+            if (out->n_tasks == OC_TODO_MAX_TASKS) return OC_TODO_BAD;
+            size_t colon = a;
+            while (colon + 1 < b && !(body[colon] == ':' && body[colon + 1] == ' ')) colon++;
+            oc_todo_span nm, ds = { 0, 0 };
+            if (colon + 1 < b) { nm = todo_trim(body, a, colon); ds = todo_trim(body, colon + 2, b); }
+            else nm = todo_trim(body, a, b);
+            if (nm.len == 0 || nm.len > OC_TODO_NAME_MAX || ds.len > OC_TODO_DESC_MAX) return OC_TODO_BAD;
+            for (uint16_t k = 0; k < out->n_tasks; k++)
+                if (out->name[k].len == nm.len && memcmp(body + out->name[k].off, body + nm.off, nm.len) == 0)
+                    return OC_TODO_DUP;
+            out->name[out->n_tasks] = nm;
+            out->desc[out->n_tasks] = ds;
+            out->n_tasks++;
+        }
+        i = le + 1;
+    }
+    return OC_TODO_OK;
+}

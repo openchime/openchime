@@ -492,7 +492,9 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
         const char *shown = loc ? loc : src;
         char *named = oc_model_mention_display(mdl, shown, strlen(shown));
         size_t body_first = r->n;
-        wrap_push(r, named ? named : shown, TB_DEFAULT, width, 4);
+        /* A to-do list is drawn as its list, below; the "/todo" text that
+         * made it is what a client without one shows. */
+        if (!m->todo) wrap_push(r, named ? named : shown, TB_DEFAULT, width, 4);
         free(named);
         free(loc);
         free(cov);
@@ -597,6 +599,40 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
                 snprintf(fl + fp, sizeof fl - fp, " \xc2\xb7 closes %s", when);
             }
         }
+        char *fr = malloc(strlen(fl) + 1);
+        if (fr) { strcpy(fr, fl); rows_push(r, fr, TB_DEFAULT); }
+    }
+    /* A to-do list: its title, then a task to a line -- "[x]" when done, its
+     * number, name and description, and who marked it done -- then how many
+     * are done and the keys that work it. */
+    if (m->todo && !m->deleted) {
+        const oc_todo_view *tv = m->todo;
+        char *tl = malloc(OC_TODO_TITLE_MAX + 16);
+        if (tl) {
+            snprintf(tl, OC_TODO_TITLE_MAX + 16, "    To-do: %s", tv->title ? tv->title : "");
+            wrap_push(r, tl, TB_CYAN | TB_BOLD, width, 10);
+            free(tl);
+        }
+        unsigned done = 0;
+        size_t cap = OC_TODO_NAME_MAX + OC_TODO_DESC_MAX + 160;
+        char *kl = malloc(cap);
+        for (uint16_t k = 0; kl && k < tv->total && k < tv->cap; k++) {
+            const oc_todo_task_view *tk = &tv->tasks[k];
+            size_t p = (size_t)snprintf(kl, cap, "    %s %u. %s", tk->done ? "[x]" : "[ ]", (unsigned)k + 1u,
+                                        tk->name ? tk->name : "");
+            if (p < cap && tk->desc && tk->desc[0])
+                p += (size_t)snprintf(kl + p, cap - p, " \xe2\x80\x94 %s", tk->desc);
+            if (tk->done) {
+                done++;
+                const char *who = tk->done_by ? oc_model_user_name(mdl, tk->done_by) : NULL;
+                if (p < cap) snprintf(kl + p, cap - p, "  (done by %s)", (who && who[0]) ? who : "someone");
+            }
+            wrap_push(r, kl, tk->done ? TB_CYAN : TB_DEFAULT, width, 10);
+        }
+        free(kl);
+        char fl[160];
+        snprintf(fl, sizeof fl, "    %u of %u done  (D marks a task; Enter adds one%s)", done, (unsigned)tv->total,
+                 tv->author_id == me ? " or renames the list" : "");
         char *fr = malloc(strlen(fl) + 1);
         if (fr) { strcpy(fr, fl); rows_push(r, fr, TB_DEFAULT); }
     }
@@ -1161,7 +1197,7 @@ static void draw_help(int W, int H) {
         { "Members",    "n  new DM · Enter for message / role / remove" },
         { "New DM",     "type to find a person · Space end-to-end encrypted · Enter opens" },
         { "Encrypted",  "Ctrl+K: accept or decline, trust a new key, end or forget it" },
-        { "Messages",   "t thread · r react · e edit · x delete · v spoilers · c collapse · m more" },
+        { "Messages",   "t thread · r react · e edit · x delete · v spoilers · c collapse · m more · D mark a to-do" },
         { "Search",     "Ctrl+O newest first · oldest first · best match first" },
         { NULL, NULL },
         { NULL, "Everything else" },
@@ -1353,6 +1389,8 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_PROFILE_OF,
        /* out of office (REQ-122): set or clear */
        ACT_OOO,
+       /* a to-do list: mark a task, add one, or (its author) rename it */
+       ACT_TODO_MARK, ACT_TODO_ADD, ACT_TODO_RENAME,
        ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
@@ -3736,7 +3774,8 @@ int main(int argc, char **argv) {
     /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
      * /nick with a discoverable text prompt. */
     enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_NICK, PROMPT_UPLOAD,
-           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE, PROMPT_DATE, PROMPT_MOVE, PROMPT_REMIND, PROMPT_PFVALUE, PROMPT_OOO };
+           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE, PROMPT_DATE, PROMPT_MOVE, PROMPT_REMIND, PROMPT_PFVALUE, PROMPT_OOO,
+           PROMPT_TODO_MARK, PROMPT_TODO_ADD, PROMPT_TODO_RENAME };
     /* A move into a private channel (REQ-053): y/N, naming who will no longer
      * see it, before it is sent. */
     uint64_t move_ask_mid = 0, move_ask_to = 0;
@@ -4299,6 +4338,28 @@ int main(int argc, char **argv) {
                         oc_client_move_message(cl, act_mid, dst->channel_id, 0, 1);
                     }
                 }
+                else if (k == PROMPT_TODO_MARK && *v) {
+                    /* A task by its number, from 1: marked the other way from
+                     * how it stands. The daemon takes the state wanted. */
+                    const oc_todo_view *tv = oc_model_todo(oc_client_model(cl), act_cid, act_mid);
+                    char *end = NULL;
+                    unsigned long n = strtoul(v, &end, 10);
+                    if (!tv) snprintf(g_closed_note, sizeof g_closed_note, "That list is no longer here.");
+                    else if (!end || *end || n < 1 || n > tv->total || n > tv->cap)
+                        snprintf(g_closed_note, sizeof g_closed_note, "The list has no task %s.", v);
+                    else oc_client_todo_mark(cl, act_cid, act_mid, (uint16_t)(n - 1), !tv->tasks[n - 1].done);
+                }
+                else if (k == PROMPT_TODO_ADD && *v) {
+                    /* "name: description", as a line of a "/todo" body. */
+                    char *line = strdup(v);
+                    if (line) {
+                        char *sep = strstr(line, ": ");
+                        if (sep) { *sep = '\0'; oc_client_todo_add(cl, act_cid, act_mid, line, sep + 2); }
+                        else oc_client_todo_add(cl, act_cid, act_mid, line, "");
+                        free(line);
+                    }
+                }
+                else if (k == PROMPT_TODO_RENAME && *v) oc_client_todo_rename(cl, act_cid, act_mid, v);
                 else if (k == PROMPT_REMIND && *v) {
                     uint64_t at = 0;
                     if (!tui_parse_remind(v, &at))
@@ -4556,6 +4617,9 @@ int main(int argc, char **argv) {
                         g_hold_unread = act_cid;
                     }
                     else if (id == ACT_DELETE)      oc_client_delete(cl, act_cid, act_mid);
+                    else if (id == ACT_TODO_MARK) { prompt_kind = PROMPT_TODO_MARK; prompt_title = "Mark task (its number)"; tk_input_init(&prompt_input, 0, "number"); }
+                    else if (id == ACT_TODO_ADD) { prompt_kind = PROMPT_TODO_ADD; prompt_title = "Add a task (name, or name: description)"; tk_input_init(&prompt_input, 0, "task"); }
+                    else if (id == ACT_TODO_RENAME) { prompt_kind = PROMPT_TODO_RENAME; prompt_title = "Rename the list"; tk_input_init(&prompt_input, 0, "title"); }
                     else if (id == ACT_MOVE) { prompt_kind = PROMPT_MOVE; prompt_title = "Move to channel (name)"; tk_input_init(&prompt_input, 0, "#channel"); }
                     else if (id == ACT_REMIND) {
                         /* The choices, then: Clear among them when one is set. */
@@ -4845,7 +4909,7 @@ int main(int argc, char **argv) {
                     /* The workspace's windows (REQ-051/052): past them the
                      * daemon refuses an author's own edit or delete. */
                     uint64_t now = (uint64_t)time(NULL) * 1000u;
-                    int may_edit = own && oc_model_may_change_own(mm, sel->server_time, 1, now);
+                    int may_edit = own && !sel->todo && oc_model_may_change_own(mm, sel->server_time, 1, now);   /* a list is not edited */
                     int may_del = own && oc_model_may_change_own(mm, sel->server_time, 0, now);
                     int has_attach = 0;
                     for (uint8_t ak = 0; ak < sel->n_attach; ak++)
@@ -4868,11 +4932,26 @@ int main(int argc, char **argv) {
                             (sel->author_id == mm->user_id || role >= OC_ROLE_ADMIN) &&
                             g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
                             g_menu[g_nmenu++] = (menuitem){ "Move to another channel", ACT_MOVE };
+                        /* A to-do list: anyone who reads it marks and adds;
+                         * its author renames it. Not in an archived channel. */
+                        if (sel->todo && !sel->deleted && !locked && !ch->archived) {
+                            if (g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+                                g_menu[g_nmenu++] = (menuitem){ "Mark a task done or not done...", ACT_TODO_MARK };
+                            if (sel->todo->total < OC_TODO_MAX_TASKS && g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+                                g_menu[g_nmenu++] = (menuitem){ "Add a task...", ACT_TODO_ADD };
+                            if (sel->todo->author_id == mm->user_id && g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+                                g_menu[g_nmenu++] = (menuitem){ "Rename the list...", ACT_TODO_RENAME };
+                        }
 
                         act_cid = cid; act_mid = mid; act_uid = sel->author_id; act_title = "Message";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
                     else if (ev.ch == 't' && !locked) oc_client_open_thread(cl, cid, mid);
+                    else if (ev.ch == 'D' && sel->todo && !sel->deleted && !locked && !ch->archived) {
+                        act_cid = cid; act_mid = mid;   /* mark a task of this list */
+                        prompt_kind = PROMPT_TODO_MARK; prompt_title = "Mark task (its number)";
+                        tk_input_init(&prompt_input, 0, "number");
+                    }
                     else if (ev.ch == 'v' && has_spoilers(sel->body)) spoilers_toggle(mid);
                     else if (ev.ch == 'o' && !sel->deleted) {   /* open its snippet whole (REQ-226) */
                         for (uint8_t ak = 0; ak < sel->n_attach; ak++)

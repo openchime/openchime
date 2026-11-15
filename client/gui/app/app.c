@@ -55,6 +55,7 @@
 #include "mention.h"    /* the same @mention scanner the daemon resolves with */
 #include "richtext.h"   /* the shared *bold* / _italic_ / `code` parser (ARCH-100) */
 #include "lexer.h"      /* the snippet tokenizer (REQ-226) */
+#include "todo.h"       /* what a "/todo" message makes */
 #include "table.h"      /* a table as a grid: the composer's cards and the table editor (MARKDOWN.md §1a) */
 #include "searchq.h"    /* the same query parser the core sends to the daemon */
 #include "resolve.h"
@@ -5712,6 +5713,9 @@ static size_t msg_spoilers(const oc_msg *msg) {
  * nor reserved. A tombstone DOES have text — "(message deleted)" — so it keeps
  * its line. */
 static int msg_has_body(const oc_msg *msg) {
+    /* A to-do list is drawn as its card: the "/todo" text that made it is
+     * what a client without one shows. */
+    if (msg->todo && !msg->deleted) return 0;
     return msg->deleted || (msg->body && msg->body[0]);
 }
 
@@ -7014,6 +7018,24 @@ static float poll_card_h(const oc_poll_view *p) {
     return POLL_TOP + (float)p->n_options * (POLL_ROW_H + POLL_ROW_GAP) + LINE_H;
 }
 
+/* A to-do list's card: its title (and Rename, for its author), a row per task
+ * -- a box to mark it, its name and description, and who marked it done --
+ * then "Add a task" and how many are done. One height for both passes. */
+#define TODO_ROW_H   UIS(24.0f)
+#define TODO_CARD_W  UIS(520.0f)
+static float todo_card_h(const oc_todo_view *t) {
+    return POLL_TOP + LINE_H + (float)t->total * TODO_ROW_H + LINE_H + UIS(4.0f);
+}
+/* Every task of a full list, and its Add and Rename, with room for a few lists on screen. */
+static struct { rectf r; uint64_t mid, cid; int task; } g_todohits[4 * (OC_TODO_MAX_TASKS + 2)];   /* task -1: Add, -2: Rename */
+static int g_n_todohits;
+static void todo_hit(rectf r, uint64_t mid, uint64_t cid, int task) {
+    if (g_n_todohits >= (int)(sizeof g_todohits / sizeof g_todohits[0])) return;
+    g_todohits[g_n_todohits].r = r; g_todohits[g_n_todohits].mid = mid;
+    g_todohits[g_n_todohits].cid = cid; g_todohits[g_n_todohits].task = task;
+    g_n_todohits++;
+}
+
 /* Past its deadline, by this machine's clock; the daemon's is the one that
  * refuses a late vote, so a few seconds' disagreement costs only a refusal. */
 static int poll_closed(const oc_poll_view *p) {
@@ -7072,6 +7094,7 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
         thumbs += unfurl_card_h(&msg->unfurls[i]) + UNFURL_GAP;
     if (msg->forward) thumbs += forward_card_h(msg->forward) + FWD_GAP;
     if (msg->poll) thumbs += poll_card_h(msg->poll) + POLL_GAP;
+    if (msg->todo && !msg->deleted) thumbs += todo_card_h(msg->todo) + POLL_GAP;
     return MSG_PIN(msg) + MSG_BODY_DY(grouped) + body_h +
            (float)extra * LINE_H + thumbs + MSG_BOT(next_grouped);
 }
@@ -7726,6 +7749,62 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
         }
         draw_text(rt, foot, g_meta, rf(tx, ly, fr, ly + LINE_H), OC_COL_MUTED);
         by += poll_card_h(p) + POLL_GAP;
+    }
+    /* A to-do list: a box per task, pressed to mark it done or not; "Add a
+     * task" for anyone who can read it; Rename for its author. */
+    if (msg->todo && !msg->deleted) {
+        const oc_todo_view *t = msg->todo;
+        float right = x0 + content_w + AVA + 12;
+        float cr = tx + TODO_CARD_W < right ? tx + TODO_CARD_W : right;
+        float ly = by + POLL_TOP;
+        uint64_t chan = g_sel;
+        int mine = m && t->author_id == m->user_id;
+        float rw = mine ? text_width("Rename", g_meta) : 0;
+        draw_text(rt, t->title ? t->title : "", g_ui_b, rf(tx, ly, cr - rw - UIS(12.0f), ly + LINE_H), OC_COL_TEXT);
+        if (mine) {
+            rectf lr = rf(cr - rw, ly, cr, ly + LINE_H);
+            draw_text(rt, "Rename", g_meta, lr, OC_COL_ACCENT);
+            todo_hit(lr, msg->message_id, chan, -2);
+        }
+        ly += LINE_H;
+        unsigned done = 0;
+        for (uint16_t i = 0; i < t->total; i++) {
+            const oc_todo_task_view *k = &t->tasks[i];
+            rectf row = rf(tx, ly, cr, ly + TODO_ROW_H);
+            float mk = UIS(14.0f), mx = row.left + UIS(4.0f), my = row.top + (TODO_ROW_H - mk) / 2.0f;
+            rectf box = rf(mx, my, mx + mk, my + mk);
+            if (k->done) { fill_round(rt, box, UIS(3.0f), OC_COL_ACCENT); done++; }
+            stroke_round(rt, box, UIS(3.0f), k->done ? OC_COL_ACCENT : OC_COL_MUTED, 1.0f);
+            if (k->done) draw_lucide(rt, OC_ICON_CHECK, rf(box.left + 2, box.top + 2, box.right - 2, box.bottom - 2), 0xFFFFFF);
+            char who[96] = "";
+            if (k->done && k->done_by) {
+                const char *nm = oc_model_user_name((oc_model *)m, k->done_by);
+                snprintf(who, sizeof who, "done by %s", (nm && nm[0]) ? nm : "someone");
+            }
+            float ww = who[0] ? text_width(who, g_meta) : 0;
+            float nx = mx + mk + UIS(8.0f);
+            float nw = text_width(k->name ? k->name : "", g_ui);
+            float nr = cr - ww - UIS(12.0f);
+            draw_text(rt, k->name ? k->name : "", g_ui, rf(nx, row.top, nr, row.bottom),
+                      k->done ? OC_COL_MUTED : OC_COL_TEXT);
+            if (k->desc && k->desc[0] && nx + nw + UIS(10.0f) < nr)
+                draw_text(rt, k->desc, g_meta, rf(nx + nw + UIS(10.0f), row.top, nr, row.bottom), OC_COL_FAINT);
+            if (who[0]) draw_text(rt, who, g_meta, rf(cr - ww, row.top, cr, row.bottom), OC_COL_MUTED);
+            todo_hit(rf(box.left - 2, row.top, nr, row.bottom), msg->message_id, chan, (int)i);
+            ly += TODO_ROW_H;
+        }
+        const char *add = "Add a task";
+        float aw = text_width(add, g_meta);
+        rectf ar = rf(tx, ly, tx + aw, ly + LINE_H);
+        if (t->total < OC_TODO_MAX_TASKS) {
+            draw_text(rt, add, g_meta, ar, OC_COL_ACCENT);
+            todo_hit(ar, msg->message_id, chan, -1);
+        }
+        char tally[48];
+        snprintf(tally, sizeof tally, "%u of %u done", done, (unsigned)t->total);
+        float tw = text_width(tally, g_meta);
+        draw_text(rt, tally, g_meta, rf(cr - tw, ly, cr, ly + LINE_H), OC_COL_MUTED);
+        by += todo_card_h(t) + POLL_GAP;
     }
     /* "(edited)" is drawn inline by body_layout (faint, after the last word). */
 
@@ -12533,6 +12612,7 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Summarize this conversation", 88 },
     { "Create a poll",           90 },
     { "Create a snippet",        96 },
+    { "Create a to-do list",     97 },
     { "Toggle unreads only in the sidebar", 85 },
     { "Reconnect now",           2  },
     { "Add a workspace",         80 },
@@ -23555,6 +23635,7 @@ static void paint(oc_win *hwnd) {
     g_n_morehits = 0;
     g_n_sephits = 0;
     g_n_snip_hits = 0;
+    g_n_todohits = 0;
     render_scene(rt, m, W, H);
     if (!g_caret_placed) ed_caret_kill();   /* no field drew a caret this frame */
     /* Boxes placed against chrome the scene just measured, so they can only be
@@ -30693,7 +30774,7 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
     int may_edit = own && oc_model_may_change_own(m, msg->server_time, 1, wall_ms());
     int may_del = own ? oc_model_may_change_own(m, msg->server_time, 0, wall_ms()) : canmod;
     if ((may_edit || may_del || (own && msg->poll)) && !msg->deleted && !locked) mi_sep();
-    if (may_edit && !msg->deleted && !locked) mi_item(21, "Edit");
+    if (may_edit && !msg->deleted && !locked && !msg->todo) mi_item(21, "Edit");   /* a list is not edited */
     if (own && msg->poll && !msg->deleted && !locked) mi_item(108, "Edit poll");   /* REQ-225 */
     if (may_del && !msg->deleted && !locked) mi_item_d(22, "Delete");
     /* Move (REQ-053): an author's own, or anything for an admin or owner, out
@@ -31572,6 +31653,33 @@ static int on_click(oc_win *hwnd, int x, int y) {
                         if (sm->thread_msgs[k].attach[q].id == g_snip_hits[i].aid) sa = &sm->thread_msgs[k].attach[q];
                 if (sa) { snippet_view_open(hwnd, sa); invalidate(); return 1; }
             }
+    /* A to-do list: a task's box marks it, "Add a task" and Rename ask first. */
+    if (!modal_open() && !g_menu && g_client)
+        for (int i = 0; i < g_n_todohits; i++) {
+            if (!in_rect(g_todohits[i].r, (float)x, (float)y)) continue;
+            uint64_t mid = g_todohits[i].mid, cid = g_todohits[i].cid;
+            int task = g_todohits[i].task;
+            const oc_model *tm = model();
+            const oc_msg *msg = tm ? find_msg(oc_model_channel((oc_model *)tm, cid), mid) : NULL;
+            for (size_t k = 0; tm && !msg && k < tm->n_thread_msgs; k++)
+                if (tm->thread_msgs[k].message_id == mid) msg = &tm->thread_msgs[k];
+            if (!msg || !msg->todo) return 1;
+            if (task >= 0 && task < msg->todo->total) {
+                oc_client_todo_mark(g_client, cid, mid, (uint16_t)task, !msg->todo->tasks[task].done);
+            } else if (task == -1) {
+                oc_field f[2] = { { FF_TEXT, "Task", "Its name, unique in the list.", "" },
+                                  { FF_TEXT, "Description", "Optional.", "" } };
+                if (form_dialog(hwnd, "Add a task", f, 2) && f[0].value[0])
+                    oc_client_todo_add(g_client, cid, mid, f[0].value, f[1].value);
+            } else if (task == -2) {
+                oc_field f[1] = { { FF_TEXT, "Title", "", "" } };
+                snprintf(f[0].value, sizeof f[0].value, "%s", msg->todo->title ? msg->todo->title : "");
+                if (form_dialog(hwnd, "Rename list", f, 1) && f[0].value[0])
+                    oc_client_todo_rename(g_client, cid, mid, f[0].value);
+            }
+            invalidate();
+            return 1;
+        }
     /* Toasts are painted above everything, a dialog included, so they are
      * hit-tested above everything too -- a toast over the composer or a
      * dialog's card would otherwise pass on a click it appears to own. */
@@ -35716,6 +35824,7 @@ static void open_new_menu(oc_win *hwnd) {
     mi_item(83, "New group message");   /* REQ-056 */
     if (poll_offered(model())) mi_item(90, "New poll");   /* REQ-225 */
     if (g_sel) mi_item(96, "New snippet");               /* REQ-226 */
+    if (poll_offered(model())) mi_item(97, "New to-do list");
     mi_item(7, "Upload a file");
     mi_sep();
     mi_item(4, "Search messages");
@@ -36914,6 +37023,33 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         else if (!t || !t[0]) fb_failed("Write or paste the snippet's text in the message box first.");
         else { snippet_compose(hwnd, t); ed_clear(); }
         free(t);
+        break; }
+    case 97: {   /* a to-do list: its title and tasks, sent as the "/todo" message that makes it */
+        if (!g_client || !g_sel) { fb_failed("Open a conversation first."); break; }
+        oc_field f[2] = {
+            { FF_TEXT, "Title", "What the list is for.", "" },
+            { FF_MULTILINE, "Tasks", "One a line, in order. \"name: description\" gives one a description.", "" },
+        };
+        if (!form_dialog(hwnd, "New to-do list", f, 2) || !f[0].value[0]) break;
+        size_t cap = strlen(f[0].value) + strlen(f[1].value) * 2 + 32;
+        char *body = malloc(cap);
+        if (!body) break;
+        size_t k = (size_t)snprintf(body, cap, "/todo %s", f[0].value);
+        for (const char *q = f[1].value; *q; ) {
+            const char *e = strchr(q, '\n');
+            size_t n = e ? (size_t)(e - q) : strlen(q);
+            const char *t = q; size_t tn = n;   /* a line typed as "- name" is the task "name" */
+            while (tn && (*t == ' ' || *t == '\t')) { t++; tn--; }
+            if (tn && (*t == '-' || *t == '*')) { t++; tn--; }
+            if (tn && !oc_todo_blank(t, tn)) k += (size_t)snprintf(body + k, cap - k, "\n- %.*s", (int)tn, t);
+            q += n + (e ? 1 : 0);
+        }
+        oc_todo_parsed tp;
+        int pr = oc_todo_parse(body, k, &tp);
+        if (pr == OC_TODO_DUP) fb_failed("Two tasks have the same name.");
+        else if (pr != OC_TODO_OK) fb_failed("A title or a task is too long, or there are more than 200 tasks.");
+        else oc_client_send(g_client, g_sel, body);
+        free(body);
         break; }
     case 91:     /* the poll composer's Post poll / Save */
         if (g_pc_open && poll_compose_submit()) g_modal_closed_by = "save";
@@ -38220,6 +38356,41 @@ static void test_dump(const char *path) {
                 fprintf(f, "    pollopt msg=%llu i=%u label=\"%s\" count=%u mine=%d r=%.0f,%.0f,%.0f,%.0f\n",
                         (unsigned long long)mid, (unsigned)o, pv->labels[o], (unsigned)pv->counts[o],
                         (pv->mine >> o) & 1, r.left, r.top, r.right, r.bottom);
+            }
+        }
+    }
+    /* To-do lists in the open conversation: what the daemon said, and where
+     * each part is drawn -- a task's box, "Add a task" and Rename, each r= where
+     * to press, 0,0,0,0 when it is not drawn -- and whether the body shows. */
+    {
+        const oc_channel *dc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+        if (dc) for (size_t i = 0; i < dc->n_msgs; i++) {
+            const oc_todo_view *tv = dc->msgs[i].deleted ? NULL : dc->msgs[i].todo;
+            if (!tv) continue;
+            uint64_t mid = dc->msgs[i].message_id;
+            rectf add = rf(0, 0, 0, 0), ren = rf(0, 0, 0, 0);
+            unsigned done = 0;
+            for (int k = 0; k < g_n_todohits; k++) {
+                if (g_todohits[k].mid != mid) continue;
+                if (g_todohits[k].task == -1) add = g_todohits[k].r;
+                if (g_todohits[k].task == -2) ren = g_todohits[k].r;
+            }
+            for (uint16_t t = 0; t < tv->total && t < tv->cap; t++) done += tv->tasks[t].done != 0;
+            fprintf(f, "  todo msg=%llu author=%llu total=%u done=%u body=%d add=%.0f,%.0f,%.0f,%.0f "
+                       "rename=%.0f,%.0f,%.0f,%.0f title=\"%s\"\n",
+                    (unsigned long long)mid, (unsigned long long)tv->author_id, (unsigned)tv->total, done,
+                    msg_has_body(&dc->msgs[i]), add.left, add.top, add.right, add.bottom,
+                    ren.left, ren.top, ren.right, ren.bottom, tv->title ? tv->title : "");
+            for (uint16_t t = 0; t < tv->total && t < tv->cap; t++) {
+                const oc_todo_task_view *tk = &tv->tasks[t];
+                rectf r = rf(0, 0, 0, 0);
+                for (int k = 0; k < g_n_todohits; k++)
+                    if (g_todohits[k].mid == mid && g_todohits[k].task == (int)t) r = g_todohits[k].r;
+                const char *by = tk->done_by ? oc_model_user_name((oc_model *)m, tk->done_by) : "";
+                fprintf(f, "    todotask msg=%llu i=%u done=%d by=%llu byname=\"%s\" r=%.0f,%.0f,%.0f,%.0f "
+                           "name=\"%s\" desc=\"%s\"\n",
+                        (unsigned long long)mid, (unsigned)t, tk->done != 0, (unsigned long long)tk->done_by,
+                        by ? by : "", r.left, r.top, r.right, r.bottom, tk->name ? tk->name : "", tk->desc ? tk->desc : "");
             }
         }
     }
@@ -40595,7 +40766,7 @@ static void test_poll(oc_win *hwnd) {
         const oc_msg *em = NULL;
         for (size_t i = ec ? ec->n_msgs : 0; i > 0 && !em; i--) {
             const oc_msg *c = &ec->msgs[i - 1];
-            if (c->deleted || c->author_id != m->user_id || c->poll) continue;
+            if (c->deleted || c->author_id != m->user_id || c->poll || c->todo) continue;   /* a list is not edited */
             if (!mid || c->message_id == mid) em = c;
         }
         if (em) { composer_begin_edit(em); invalidate(); test_ack("ok"); } else test_ack("err");

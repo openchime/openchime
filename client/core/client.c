@@ -893,6 +893,33 @@ void oc_client_vote(oc_client *c, uint64_t channel_id, uint64_t message_id, cons
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_todo_add(oc_client *c, uint64_t channel_id, uint64_t message_id,
+                        const char *name, const char *description) {
+    if (!c || !message_id || !name) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_TODO_ADD);
+    if (!cmd) return;
+    cmd->channel_id = channel_id; cmd->message_id = message_id;
+    cmd->body = strdup(name);
+    cmd->body2 = strdup(description ? description : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_todo_mark(oc_client *c, uint64_t channel_id, uint64_t message_id, uint16_t task, int done) {
+    if (!c || !message_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_TODO_MARK);
+    if (!cmd) return;
+    cmd->channel_id = channel_id; cmd->message_id = message_id;
+    cmd->uses = task; cmd->op = done ? 1 : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_todo_rename(oc_client *c, uint64_t channel_id, uint64_t message_id, const char *title) {
+    if (!c || !message_id || !title) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_TODO_RENAME);
+    if (!cmd) return;
+    cmd->channel_id = channel_id; cmd->message_id = message_id;
+    cmd->body = strdup(title);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_list_poll_voters(oc_client *c, uint64_t channel_id, uint64_t message_id) {
     if (!c || !message_id) return;
     oc_model_voterlist_begin(&c->model, message_id);

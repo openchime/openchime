@@ -1446,6 +1446,33 @@ static const char MIGRATION_0083[] =
 static const char MIGRATION_0084[] =
     "ALTER TABLE audit_log ADD COLUMN channel_id INTEGER;";
 
+static const char MIGRATION_0085[] =
+    /* To-do lists in messages: a list beside the message whose "/todo" body
+     * made it, and its tasks in the order they were added. A task is named by
+     * its place, which never changes. The rows stay when the message is
+     * deleted -- every read requires a message that stands -- so a restore
+     * brings the list back as it was. Both tables reference messages(id)
+     * directly, as the poll tables do, so a channel's purge can clear them in
+     * any order. */
+    "CREATE TABLE todo_lists ("
+    "  message_id    INTEGER PRIMARY KEY REFERENCES messages(id),"
+    "  channel_id    INTEGER NOT NULL REFERENCES channels(id),"
+    "  author_id     INTEGER NOT NULL REFERENCES users(id),"
+    "  title         TEXT    NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL"
+    ");"
+    "CREATE TABLE todo_tasks ("
+    "  message_id    INTEGER NOT NULL REFERENCES messages(id),"
+    "  idx           INTEGER NOT NULL,"
+    "  name          TEXT    NOT NULL,"
+    "  description   TEXT    NOT NULL DEFAULT '',"
+    "  done          INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0,1)),"
+    "  done_by       INTEGER REFERENCES users(id),"
+    "  done_at_ms    INTEGER,"
+    "  PRIMARY KEY (message_id, idx),"
+    "  UNIQUE (message_id, name)"
+    ");";
+
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
      * author is doing, and the daemon records that as its own object beside the
@@ -1818,6 +1845,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 82, MIGRATION_0082 },
     { 83, MIGRATION_0083 },
     { 84, MIGRATION_0084 },
+    { 85, MIGRATION_0085 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

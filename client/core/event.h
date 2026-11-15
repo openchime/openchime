@@ -124,6 +124,19 @@ typedef struct {
     char     labels[OC_POLL_MAX_OPTIONS][OC_POLL_OPTION_MAX + 1];
     uint32_t counts[OC_POLL_MAX_OPTIONS];
 } oc_poll_view;
+/* A to-do list as the daemon last told it: its author, title and every task,
+ * in order. Strings heap; oc_todo_view_free releases it all. On an event it is
+ * one TODO frame's range: tasks[0, todo_n) are tasks [todo_first, ...) of
+ * `total`. */
+typedef struct { char *name, *desc; uint8_t done; uint64_t done_by, done_at_ms; } oc_todo_task_view;
+typedef struct {
+    uint64_t author_id;
+    char    *title;
+    uint16_t total;
+    uint16_t cap;                /* entries in `tasks` */
+    oc_todo_task_view *tasks;
+} oc_todo_view;
+void oc_todo_view_free(oc_todo_view *t);
 
 /* net thread -> UI thread */
 enum {
@@ -260,6 +273,7 @@ enum {
     /* A poll's definition and tallies (REQ-225): channel_id + message_id, the
      * poll in `poll`. After the message it belongs to, live or replayed. */
     OC_EV_POLL,
+    OC_EV_TODO,            /* a to-do list's state: channel_id, message_id, todo (one range) */
     /* One row of a who-voted answer: message_id, user_id, `poll_option`. */
     OC_EV_POLL_VOTERS,
     /* Read-aloud (REQ-291-295, ARCH-111). TTS_INFO replaces what the client knows
@@ -482,6 +496,9 @@ typedef struct {
     oc_call_view *call;   /* heap; the CALL_* events */
     oc_group_view *group; /* heap; OC_EV_GROUP */
     oc_poll_view *poll;   /* heap; OC_EV_POLL */
+    oc_todo_view *todo;   /* heap; OC_EV_TODO: one frame's range of a list */
+    uint16_t todo_first;
+    uint8_t  todo_n;
     uint8_t  poll_option; /* POLL_VOTERS */
     uint64_t groups[OC_MAX_CHANNEL_GROUPS];   /* CHANNEL_GROUPS */
     uint16_t n_groups;
@@ -688,6 +705,10 @@ enum {
      * withdraw. LIST_POLL_VOTERS: who picked what on `message_id`. */
     OC_CMD_POST_POLL,
     OC_CMD_VOTE,
+    /* To-do lists, each about `message_id` in `channel_id`: a task added
+     * (body = name, body2 = description), marked (uses = the task, op = done),
+     * or the list renamed (body = the title). */
+    OC_CMD_TODO_ADD, OC_CMD_TODO_MARK, OC_CMD_TODO_RENAME,
     OC_CMD_LIST_POLL_VOTERS,
     OC_CMD_EDIT_POLL,      /* the author's poll `message_id`: poll_opts/poll_flags/poll_close_at_ms, all of it */
     /* Encrypted DMs (client/core/pdm.h), a range of their own; what is said in

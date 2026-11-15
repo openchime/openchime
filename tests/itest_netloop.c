@@ -1256,6 +1256,142 @@ static void test_poll_vertical(int port, const uint8_t *pin) {
     client_close(&b2);
 }
 
+/* Whether wire string `s` is `t`. */
+static int todo_is(oc_slice s, const char *t) {
+    return s.len == strlen(t) && (s.len == 0 || memcmp(s.ptr, t, s.len) == 0);
+}
+
+/* A TODO frame from `c`, skipping others, decoded into *out (static: a frame
+ * holds up to OC_TODO_CHUNK tasks). 0 when the next TODO is `mid`'s. */
+static int read_todo(client *c, uint64_t mid, oc_todo_msg *out) {
+    oc_header hdr; oc_rbuf p;
+    if (read_type(c, OC_MSG_TODO, &hdr, &p) != 0 || oc_decode_todo(&p, out) != OC_OK) return -1;
+    return out->message_id == mid ? 0 : -1;
+}
+
+/* Send a to-do change from `c`: TODO_ADD (name, desc), TODO_MARK (task, done)
+ * or TODO_RENAME (name). */
+static int send_todo(client *c, uint16_t type, uint64_t mid, const char *name, const char *desc,
+                     uint16_t task, uint8_t done) {
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_result r;
+    if (type == OC_MSG_TODO_ADD) {
+        oc_todo_add m = { 1, mid, oc_slice_str(name), oc_slice_str(desc ? desc : "") };
+        r = oc_encode_todo_add(&w, OC_PROTOCOL_VERSION, &m);
+    } else if (type == OC_MSG_TODO_MARK) {
+        oc_todo_mark m = { 1, mid, task, done };
+        r = oc_encode_todo_mark(&w, OC_PROTOCOL_VERSION, &m);
+    } else {
+        oc_todo_rename m = { 1, mid, oc_slice_str(name) };
+        r = oc_encode_todo_rename(&w, OC_PROTOCOL_VERSION, &m);
+    }
+    return r == OC_OK ? send_frame(c, buf, w.len) : -1;
+}
+
+/* To-do lists over the wire: a "/todo" message reaches every reader with its
+ * list after its ACTION; each change reaches them all live; a refusal goes to
+ * its sender alone; an edit is refused; and a backfill carries the list as it
+ * stands. */
+static void test_todo_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    uint8_t buf[512]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+    static oc_todo_msg tm;
+
+    /* alice sends a "/todo" body: bob gets the BROADCAST as written, its
+     * ACTION, then the TODO, nothing done. */
+    const char *body = "/todo Launch\n- Write the notes: for the release\n- Tag it";
+    oc_send s; memset(&s, 0, sizeof s);
+    s.channel_id = 1; memset(s.idem, 0x9A, OC_IDEM_SIZE);
+    s.body = oc_slice_str(body);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_SEND_ACK, &hdr, &p) == 0);
+    CHECK(read_type(&b, OC_MSG_BROADCAST, &hdr, &p) == 0);
+    oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+    uint64_t list = bc.message_id;
+    CHECK(bc.body.len == strlen(body) && memcmp(bc.body.ptr, body, bc.body.len) == 0);
+    CHECK(next_is_action(&b, list, 0, 0));
+    CHECK(read_todo(&b, list, &tm) == 0);
+    CHECK(tm.author_id == ua && tm.total == 2 && tm.first == 0 && tm.n == 2 && todo_is(tm.title, "Launch"));
+    CHECK(todo_is(tm.tasks[0].name, "Write the notes") && todo_is(tm.tasks[0].description, "for the release"));
+    CHECK(todo_is(tm.tasks[1].name, "Tag it") && !tm.tasks[1].done);
+    CHECK(read_todo(&a, list, &tm) == 0);
+
+    /* bob marks Tag it done: both get the list, saying bob did. */
+    CHECK(send_todo(&b, OC_MSG_TODO_MARK, list, NULL, NULL, 1, 1) == 0);
+    CHECK(read_todo(&a, list, &tm) == 0 && tm.tasks[1].done && tm.tasks[1].done_by == ub && tm.tasks[1].done_at_ms);
+    CHECK(read_todo(&b, list, &tm) == 0 && tm.tasks[1].done_by == ub);
+
+    /* alice marks it done too, as if at once: nothing changes, bob still
+     * marked it, and both are told so. */
+    CHECK(send_todo(&a, OC_MSG_TODO_MARK, list, NULL, NULL, 1, 1) == 0);
+    CHECK(read_todo(&b, list, &tm) == 0 && tm.tasks[1].done && tm.tasks[1].done_by == ub);
+    CHECK(read_todo(&a, list, &tm) == 0);
+
+    /* bob adds a task: at the end, for both. A name the list has: refused,
+     * to bob alone, the message id the context. */
+    CHECK(send_todo(&b, OC_MSG_TODO_ADD, list, "Book the room", "the big one", 0, 0) == 0);
+    CHECK(read_todo(&a, list, &tm) == 0 && tm.total == 3 && todo_is(tm.tasks[2].name, "Book the room"));
+    CHECK(read_todo(&b, list, &tm) == 0 && tm.total == 3);
+    CHECK(send_todo(&b, OC_MSG_TODO_ADD, list, "Tag it", "", 0, 0) == 0);
+    CHECK(read_type(&b, OC_MSG_ERROR, &hdr, &p) == 0);
+    oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_TODO_DUPLICATE);
+    CHECK(er.context.len == 8);
+
+    /* Only alice renames it. */
+    CHECK(send_todo(&b, OC_MSG_TODO_RENAME, list, "Mine now", NULL, 0, 0) == 0);
+    CHECK(read_type(&b, OC_MSG_ERROR, &hdr, &p) == 0);
+    CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_FORBIDDEN);
+    CHECK(send_todo(&a, OC_MSG_TODO_RENAME, list, "Launch day", NULL, 0, 0) == 0);
+    CHECK(read_todo(&b, list, &tm) == 0 && todo_is(tm.title, "Launch day") && tm.total == 3);
+    CHECK(read_todo(&a, list, &tm) == 0);
+
+    /* Not edited. */
+    oc_edit ed; memset(&ed, 0, sizeof ed);
+    ed.channel_id = 1; ed.message_id = list; ed.body = oc_slice_str("/todo Something else");
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_edit(&w, OC_PROTOCOL_VERSION, &ed) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_ERROR, &hdr, &p) == 0);
+    CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_TODO_NO_EDIT);
+
+    /* bob again, on a second connection: the backfill carries the list as it
+     * stands -- renamed, three tasks, Tag it done by bob. */
+    client b2;
+    CHECK(client_open(&b2, port, pin) == 0);
+    CHECK(do_handshake(&b2) == 0);
+    uint64_t ub2 = 0;
+    CHECK(do_auth(&b2, "bob", "pw-bob", &ub2) == 0 && ub2 == ub);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_cursor cur = { 1, 0 };
+    oc_backfill_request req = { 1, &cur };
+    CHECK(oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &req) == OC_OK);
+    CHECK(send_frame(&b2, buf, w.len) == 0);
+    int saw = 0;
+    for (int i = 0; i < 3000; i++) {
+        CHECK(read_frame_raw(&b2, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_TODO) {
+            CHECK(oc_decode_todo(&p, &tm) == OC_OK);
+            if (tm.message_id == list)
+                saw = todo_is(tm.title, "Launch day") && tm.total == 3 && tm.n == 3
+                      && tm.tasks[1].done && tm.tasks[1].done_by == ub && !tm.tasks[0].done;
+        } else if (hdr.msg_type == OC_MSG_BACKFILL_DONE) break;
+    }
+    CHECK(saw == 1);
+
+    client_close(&a);
+    client_close(&b);
+    client_close(&b2);
+}
+
 /* Presence + typing over the wire (REQ-120/121): a connecting user is announced
  * online (and gets a snapshot of who's online), an away change propagates, a
  * typing signal reaches other channel members, and a disconnect announces
@@ -8725,6 +8861,7 @@ int run_netloop_tests(void) {
         test_thread_meta_vertical(arg.port, pin);
         test_action_vertical(arg.port, pin);
         test_poll_vertical(arg.port, pin);
+        test_todo_vertical(arg.port, pin);
         test_dm_vertical(arg.port, pin);
         test_block_vertical(arg.port, pin);
         test_drafts_vertical(arg.port, pin);

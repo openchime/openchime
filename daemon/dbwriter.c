@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include "richtext.h"   /* oc_rt_plain_excerpt: excerpts hide spoilers */
 #include "action.h"       /* what makes a message an action (ARCH-115) */
+#include "todo.h"         /* what makes a message a to-do list */
 #include "mention.h"      /* the shared @mention scanner (ARCH-89) */
 #include "speakable.h"    /* what read-aloud says for a body (ARCH-111) */
 #include "voice_pick.h"   /* a default read-aloud voice (REQ-292) */
@@ -304,6 +305,7 @@ static void job_free(oc_job *j) {
     free(j->sched_days);
     free(j->alert_key); free(j->alert_message);
     free(j->snip_title); free(j->snip_lang); free(j->snip_text);
+    free(j->todo_name); free(j->todo_desc);
     free(j->token);
     free(j->proof);
     free(j->email);
@@ -744,6 +746,107 @@ static void fill_replay_polls(sqlite3 *db, oc_dbres *r, uint64_t viewer) {
         append_poll(db, r, r->replay[i].message_id, r->replay[i].channel_id, viewer);
 }
 
+/* --- To-do lists (todo.h) -------------------------------------------------- */
+
+/* Whether body `b` makes a to-do list, and if it is one the daemon refuses, why:
+ * 0 for an ordinary message or a good list (*is_list set for the latter), else
+ * the error to answer the send with. */
+static uint16_t todo_check(const uint8_t *b, size_t n, oc_todo_parsed *tp, int *is_list) {
+    *is_list = 0;
+    int k = oc_todo_parse((const char *)b, n, tp);
+    if (k == OC_TODO_NONE) return 0;
+    if (k == OC_TODO_DUP) return OC_ERR_TODO_DUPLICATE;
+    if (k != OC_TODO_OK) return OC_ERR_TODO_INVALID;
+    *is_list = 1;
+    return 0;
+}
+
+/* The list body `b` makes, beside message `mid`, in the caller's transaction. */
+static void store_todo(sqlite3 *db, uint64_t mid, uint64_t channel_id, uint64_t author,
+                       const uint8_t *b, const oc_todo_parsed *tp, uint64_t ts) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO todo_lists(message_id, channel_id, author_id, title, created_at_ms) "
+            "VALUES(?1, ?2, ?3, ?4, ?5);", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)channel_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)author);
+    sqlite3_bind_text (st, 4, (const char *)b + tp->title.off, (int)tp->title.len, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)ts);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO todo_tasks(message_id, idx, name, description) VALUES(?1, ?2, ?3, ?4);",
+            -1, &st, NULL) != SQLITE_OK) return;
+    for (uint16_t i = 0; i < tp->n_tasks; i++) {
+        sqlite3_reset(st);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+        sqlite3_bind_int  (st, 2, i);
+        sqlite3_bind_text (st, 3, (const char *)b + tp->name[i].off, (int)tp->name[i].len, SQLITE_STATIC);
+        sqlite3_bind_text (st, 4, (const char *)b + tp->desc[i].off, (int)tp->desc[i].len, SQLITE_STATIC);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+}
+
+/* Append message `mid`'s list -- its whole state, read back from the tables --
+ * if it has one and the message stands: one entry per OC_TODO_CHUNK tasks. One
+ * function for the send, every change and every replay, as append_poll is. */
+static void append_todo(sqlite3 *db, oc_dbres *r, uint64_t mid) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT t.channel_id, t.author_id, t.title, (SELECT COUNT(*) FROM todo_tasks k WHERE k.message_id=t.message_id) "
+            "  FROM todo_lists t JOIN messages m ON m.id = t.message_id "
+            " WHERE t.message_id=?1 AND m.deleted_at_ms IS NULL;", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+    if (sqlite3_step(st) != SQLITE_ROW) { sqlite3_finalize(st); return; }
+    uint64_t ch = (uint64_t)sqlite3_column_int64(st, 0), au = (uint64_t)sqlite3_column_int64(st, 1);
+    const char *tt = (const char *)sqlite3_column_text(st, 2);
+    char *title = strdup(tt ? tt : "");
+    int total = sqlite3_column_int(st, 3);
+    sqlite3_finalize(st);
+    if (!title) return;
+    if (total > (int)OC_TODO_MAX_TASKS) total = (int)OC_TODO_MAX_TASKS;
+    size_t chunks = total ? ((size_t)total + OC_TODO_CHUNK - 1) / OC_TODO_CHUNK : 1;
+    struct oc_replay_todo *g = realloc(r->rtodo, (r->n_rtodo + chunks) * sizeof *g);
+    if (!g) { free(title); return; }
+    r->rtodo = g;
+    size_t base = r->n_rtodo;
+    for (size_t c = 0; c < chunks; c++) {
+        struct oc_replay_todo *e = &g[base + c];
+        memset(e, 0, sizeof *e);
+        e->message_id = mid; e->channel_id = ch; e->author_id = au;
+        e->title = c == 0 ? title : strdup(title);
+        e->total = (uint16_t)total;
+        e->first = (uint16_t)(c * OC_TODO_CHUNK);
+    }
+    r->n_rtodo += chunks;
+    if (sqlite3_prepare_v2(db,
+            "SELECT idx, name, description, done, COALESCE(done_by,0), COALESCE(done_at_ms,0) "
+            "  FROM todo_tasks WHERE message_id=?1 ORDER BY idx LIMIT ?2;", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+    sqlite3_bind_int  (st, 2, total);
+    int i = 0;
+    while (i < total && sqlite3_step(st) == SQLITE_ROW) {
+        struct oc_replay_todo *e = &g[base + (size_t)i / OC_TODO_CHUNK];
+        const char *nm = (const char *)sqlite3_column_text(st, 1);
+        const char *ds = (const char *)sqlite3_column_text(st, 2);
+        e->tasks[e->n].name = strdup(nm ? nm : "");
+        e->tasks[e->n].desc = strdup(ds ? ds : "");
+        e->tasks[e->n].done = (uint8_t)(sqlite3_column_int(st, 3) != 0);
+        e->tasks[e->n].done_by = (uint64_t)sqlite3_column_int64(st, 4);
+        e->tasks[e->n].done_at_ms = (uint64_t)sqlite3_column_int64(st, 5);
+        e->n++;
+        i++;
+    }
+    sqlite3_finalize(st);
+}
+
+/* Lists for a replayed window. */
+static void fill_replay_todos(sqlite3 *db, oc_dbres *r) {
+    for (size_t i = 0; i < r->n_replay; i++) append_todo(db, r, r->replay[i].message_id);
+}
+
 static void group_row_free(oc_group_row *g);
 
 void oc_job_free(oc_job *j) { job_free(j); }
@@ -796,6 +899,11 @@ void oc_dbres_free(oc_dbres *r) {
     for (size_t i = 0; i < r->n_rpoll; i++)
         for (uint8_t k = 0; k < r->rpoll[i].n_options; k++) free(r->rpoll[i].labels[k]);
     free(r->rpoll);
+    for (size_t i = 0; i < r->n_rtodo; i++) {
+        free(r->rtodo[i].title);
+        for (uint8_t k = 0; k < r->rtodo[i].n; k++) { free(r->rtodo[i].tasks[k].name); free(r->rtodo[i].tasks[k].desc); }
+    }
+    free(r->rtodo);
     free(r->pvoters);
     free(r->unf_url);
     free(r->unf_title);
@@ -4962,6 +5070,14 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     uint64_t ts = dbw_now_ms();
     /* A poll (REQ-225): its options are checked here, where it is stored. */
     if (j->n_poll_opts && !poll_valid(j, ts)) { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_INVALID_POLL; return r; }
+    /* A "/todo" body makes a to-do list, checked here against its limits. An
+     * encrypted DM's body is not the daemon's to read, and a poll is a poll. */
+    oc_todo_parsed tp;
+    int is_todo = 0;
+    if (!r->ch_e2e && !j->n_poll_opts) {
+        uint16_t te = todo_check(j->body, j->body_len, &tp, &is_todo);
+        if (te) { r->type = OC_RES_SEND_ERR; r->err_code = te; return r; }
+    }
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
 
     sqlite3_prepare_v2(db,
@@ -5008,6 +5124,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     store_forward(db, mid, j);
     store_action(db, mid);   /* REQ-058 */
     if (j->n_poll_opts) store_poll(db, mid, j->channel_id, j, ts);   /* REQ-225 */
+    if (is_todo) store_todo(db, mid, j->channel_id, j->user_id, j->body, &tp, ts);
 
     /* The draft this message came from is gone (REQ-223, ARCH-101), in the same
      * transaction as the send. Server-side rather than a client courtesy: a
@@ -5031,6 +5148,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     append_action(db, r, mid, j->channel_id, 1);
     /* The poll, read back as the forward is, for the frame after the ACTION. */
     if (j->n_poll_opts) append_poll(db, r, mid, j->channel_id, 0);
+    if (is_todo) append_todo(db, r, mid);   /* and the list, after it */
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
     r->broadcast_stored = broadcast_stored(db, mid);
     load_members(db, j->channel_id, r);
@@ -5091,6 +5209,17 @@ static oc_dbres *process_edit(sqlite3 *db, const oc_job *j) {
     uint64_t author = 0; int deleted = 0;
     if (!message_lookup(db, j->channel_id, j->message_id, &author, &deleted) || deleted) {
         r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r;
+    }
+    {   /* A to-do list's message is not edited: its title is renamed and its
+         * tasks added, and the body that made them stays as it was written. */
+        sqlite3_stmt *tq = NULL;
+        int is_todo = 0;
+        if (sqlite3_prepare_v2(db, "SELECT 1 FROM todo_lists WHERE message_id=?1;", -1, &tq, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(tq, 1, (sqlite3_int64)j->message_id);
+            is_todo = sqlite3_step(tq) == SQLITE_ROW;
+            sqlite3_finalize(tq);
+        }
+        if (is_todo) { r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_TODO_NO_EDIT; return r; }
     }
     if (author != j->user_id) {   /* no moderator edit — author only (REQ-032) */
         r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
@@ -5339,6 +5468,7 @@ static oc_dbres *process_restore(oc_dbwriter *w, const oc_job *j) {
     sqlite3_finalize(st);
     load_message_attachments(db, j->message_id, r->attach, &r->n_attach);
     append_action(db, r, j->message_id, j->channel_id, 1);
+    append_todo(db, r, j->message_id);   /* its list, as it stood when deleted */
     load_members(db, j->channel_id, r);
     return r;
 }
@@ -7281,6 +7411,7 @@ static oc_dbres *process_move_message(sqlite3 *db, const oc_job *j) {
         "UPDATE attachments SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
         "UPDATE unfurls SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
         "UPDATE polls SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE todo_lists SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
         "UPDATE actions SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
         "UPDATE thread_follows SET channel_id=?1 WHERE root_id IN (SELECT id FROM temp.move_set);",
         "UPDATE sent_messages SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
@@ -8159,6 +8290,12 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
 
     uint64_t ts = dbw_now_ms();
     if (j->n_poll_opts && !poll_valid(j, ts)) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_INVALID_POLL; return r; }
+    oc_todo_parsed tp;   /* a reply can be a to-do list, as a channel message can */
+    int is_todo = 0;
+    if (!r->ch_e2e && !j->n_poll_opts) {
+        uint16_t te = todo_check(j->body, j->body_len, &tp, &is_todo);
+        if (te) { r->type = OC_RES_REPLY_ERR; r->err_code = te; return r; }
+    }
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
     /* Also to the channel (REQ-062): one row, flagged, never a copy -- the main
      * scroll's queries take a flagged reply as they take a top-level message. */
@@ -8215,6 +8352,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     drop_draft(db, j->user_id, j->channel_id, j->parent_id);
     store_action(db, mid);   /* a reply can be an action too (REQ-058) */
     if (j->n_poll_opts) store_poll(db, mid, j->channel_id, j, ts);   /* and a poll (REQ-225) */
+    if (is_todo) store_todo(db, mid, j->channel_id, j->user_id, j->body, &tp, ts);
 
     sum_purge_msg(db, mid);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
@@ -8230,6 +8368,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     r->also_channel = j->also_channel ? 1 : 0;
     append_action(db, r, mid, j->channel_id, 1);   /* always: the client pairs them (ARCH-115) */
     if (j->n_poll_opts) append_poll(db, r, mid, j->channel_id, 0);
+    if (is_todo) append_todo(db, r, mid);
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
     r->broadcast_stored = broadcast_stored(db, mid);
     load_members(db, j->channel_id, r);
@@ -8237,6 +8376,117 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     /* Asked AFTER the reply is committed, so the author of the reply being
      * fanned out counts as a participant on the strength of it. */
     load_thread_participation(db, root, r);
+    return r;
+}
+
+/* --- working a to-do list -------------------------------------------------- *
+ * Anyone who can read the message adds a task or marks one; only its author
+ * renames the list. Nothing changes in an archived channel. Each answers the
+ * whole list to the conversation, so every reader converges on the daemon's
+ * state, whatever order changes arrive in. */
+
+/* The checks every change makes: the message stands in the channel named, has
+ * a list, and the asker may read it there, which is not archived. 0 when it
+ * may go ahead, filling *list_author; else the error. */
+static uint16_t todo_target(sqlite3 *db, const oc_job *j, uint64_t *list_author, uint16_t *count) {
+    uint64_t author = 0; int deleted = 0;
+    if (!message_lookup(db, j->channel_id, j->message_id, &author, &deleted) || deleted)
+        return OC_ERR_UNKNOWN_MESSAGE;
+    if (!channel_read_access(db, j->channel_id, j->user_id)) return OC_ERR_UNKNOWN_MESSAGE;
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT author_id, (SELECT COUNT(*) FROM todo_tasks k WHERE k.message_id=t.message_id) "
+            "  FROM todo_lists t WHERE message_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            *list_author = (uint64_t)sqlite3_column_int64(st, 0);
+            *count = (uint16_t)sqlite3_column_int(st, 1);
+            found = 1;
+        }
+        sqlite3_finalize(st);
+    }
+    if (!found) return OC_ERR_UNKNOWN_MESSAGE;
+    if (channel_is_archived(db, j->channel_id) || e2e_closed(db, j->channel_id)) return OC_ERR_CHANNEL_ARCHIVED;
+    return 0;
+}
+
+/* A string as a list keeps it: spaces and tabs off both ends. */
+static size_t todo_trimmed(const char *s, size_t *start) {
+    size_t a = 0, b = s ? strlen(s) : 0;
+    while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n')) a++;
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n')) b--;
+    *start = a;
+    return b - a;
+}
+
+static oc_dbres *process_todo(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+    r->message_id = j->message_id;
+    r->type = OC_RES_TODO_ERR;
+    uint64_t list_author = 0;
+    uint16_t count = 0;
+    uint16_t err = todo_target(db, j, &list_author, &count);
+    if (err) { r->err_code = err; return r; }
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (j->type == OC_JOB_TODO_ADD) {
+        size_t na, da, nl = todo_trimmed(j->todo_name, &na), dl = todo_trimmed(j->todo_desc, &da);
+        if (nl == 0 || nl > OC_TODO_NAME_MAX || dl > OC_TODO_DESC_MAX) { r->err_code = OC_ERR_TODO_INVALID; return r; }
+        if (count >= OC_TODO_MAX_TASKS) { r->err_code = OC_ERR_TODO_FULL; return r; }
+        int dup = 0;
+        if (sqlite3_prepare_v2(db, "SELECT 1 FROM todo_tasks WHERE message_id=?1 AND name=?2;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+            sqlite3_bind_text (st, 2, j->todo_name + na, (int)nl, SQLITE_STATIC);
+            dup = sqlite3_step(st) == SQLITE_ROW;
+            sqlite3_finalize(st);
+        }
+        if (dup) { r->err_code = OC_ERR_TODO_DUPLICATE; return r; }
+        if (sqlite3_prepare_v2(db,
+                "INSERT INTO todo_tasks(message_id, idx, name, description) "
+                "VALUES(?1, (SELECT COUNT(*) FROM todo_tasks WHERE message_id=?1), ?2, ?3);",
+                -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+            sqlite3_bind_text (st, 2, j->todo_name + na, (int)nl, SQLITE_STATIC);
+            sqlite3_bind_text (st, 3, j->todo_desc ? j->todo_desc + da : "", (int)dl, SQLITE_STATIC);
+            ok = sqlite3_step(st) == SQLITE_DONE;
+            sqlite3_finalize(st);
+        }
+    } else if (j->type == OC_JOB_TODO_MARK) {
+        if (j->todo_task >= count) { r->err_code = OC_ERR_TODO_INVALID; return r; }
+        /* The state wanted, not a toggle: already there, nothing changes --
+         * not even who marked it -- so concurrent marks agree. */
+        if (sqlite3_prepare_v2(db,
+                "UPDATE todo_tasks SET done=?3, done_by=CASE WHEN ?3 THEN ?4 END, "
+                "  done_at_ms=CASE WHEN ?3 THEN ?5 END "
+                " WHERE message_id=?1 AND idx=?2 AND done<>?3;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+            sqlite3_bind_int  (st, 2, j->todo_task);
+            sqlite3_bind_int  (st, 3, j->todo_done ? 1 : 0);
+            sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
+            sqlite3_bind_int64(st, 5, (sqlite3_int64)dbw_now_ms());
+            ok = sqlite3_step(st) == SQLITE_DONE;
+            sqlite3_finalize(st);
+        }
+    } else {   /* OC_JOB_TODO_RENAME */
+        if (list_author != j->user_id) { r->err_code = OC_ERR_FORBIDDEN; return r; }
+        size_t ta, tl = todo_trimmed(j->todo_name, &ta);
+        if (tl == 0 || tl > OC_TODO_TITLE_MAX) { r->err_code = OC_ERR_TODO_INVALID; return r; }
+        if (sqlite3_prepare_v2(db, "UPDATE todo_lists SET title=?2 WHERE message_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+            sqlite3_bind_text (st, 2, j->todo_name + ta, (int)tl, SQLITE_STATIC);
+            ok = sqlite3_step(st) == SQLITE_DONE;
+            sqlite3_finalize(st);
+        }
+    }
+    if (!ok) { r->err_code = OC_ERR_INTERNAL; return r; }
+    r->type = OC_RES_TODO;
+    r->user_id = j->user_id;
+    append_todo(db, r, j->message_id);
+    load_members(db, j->channel_id, r);
     return r;
 }
 
@@ -8291,6 +8541,7 @@ static oc_dbres *process_list_thread(sqlite3 *db, const oc_job *j) {
     r->truncated = (n >= OC_BACKFILL_MAX);
     for (size_t i = 0; i < n; i++) append_action(db, r, arr[i].message_id, j->channel_id, 0);   /* REQ-058 */
     for (size_t i = 0; i < n; i++) append_poll(db, r, arr[i].message_id, j->channel_id, j->user_id);   /* REQ-225 */
+    for (size_t i = 0; i < n; i++) append_todo(db, r, arr[i].message_id);
     return r;
 }
 
@@ -8550,6 +8801,7 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
     r->search = arr;
     r->n_search = n;
     r->truncated = (n >= lim);   /* filled the requested limit -> maybe more */
+    for (size_t i = 0; i < n; i++) append_todo(db, r, arr[i].message_id);   /* each list as it stands */
     return r;
 }
 
@@ -8928,6 +9180,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
     fill_replay_actions(db, r);
     fill_replay_polls(db, r, j->user_id);   /* REQ-225 */
     fill_replay_reminders(db, r, j->user_id);   /* REQ-283 */
+    fill_replay_todos(db, r);
     return r;
 }
 
@@ -9138,6 +9391,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     fill_replay_actions(db, r);
     fill_replay_polls(db, r, j->user_id);   /* REQ-225 */
     fill_replay_reminders(db, r, j->user_id);   /* REQ-283 */
+    fill_replay_todos(db, r);
     return r;
 }
 
@@ -12624,6 +12878,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_COLLAPSED)  return process_set_collapsed(w->db, j);
     if (j->type == OC_JOB_FIND_AT_TIME)   return process_find_at_time(w->db, j);
     if (j->type == OC_JOB_MOVE_MESSAGE)   return process_move_message(w->db, j);
+    if (j->type == OC_JOB_TODO_ADD || j->type == OC_JOB_TODO_MARK || j->type == OC_JOB_TODO_RENAME)
+        return process_todo(w->db, j);
     /* On the WRITER because it stamps the seen watermark; the read half would
      * otherwise be a reader job with a write in it. */
     if (j->type == OC_JOB_LIST_ACTIVITY)  return process_list_activity(w->db, j);

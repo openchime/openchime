@@ -2509,7 +2509,9 @@ static void test_index_mentions(void) {
                            /* 0083's emoji aliases. */
                            "DROP TABLE custom_emoji_aliases;"
                            /* 0084's audit channel. */
-                           "ALTER TABLE audit_log DROP COLUMN channel_id;",
+                           "ALTER TABLE audit_log DROP COLUMN channel_id;"
+                           /* 0085's to-do lists. */
+                           "DROP TABLE todo_tasks; DROP TABLE todo_lists;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -10282,6 +10284,291 @@ static const struct oc_replay_poll *poll_of(const oc_dbres *r, uint64_t mid) {
     return NULL;
 }
 
+/* To-do lists: a "/todo" body makes one, stored beside its message; anyone who
+ * reads it adds and marks tasks, only its author renames it; limits, no edit,
+ * delete and restore, and an archived channel's lists read-only. */
+static oc_dbres *todo_send(oc_dbwriter *w, uint64_t uid, uint64_t ch, const char *body) {
+    oc_job *j = oc_job_new(OC_JOB_SEND, 112);
+    j->user_id = uid; j->channel_id = ch;
+    memset(j->idem, ++g_send_seq, OC_IDEM_LEN);
+    oc_job_set_body(j, body, strlen(body));
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *todo_op(oc_dbwriter *w, int type, uint64_t uid, uint64_t ch, uint64_t mid,
+                         const char *name, const char *desc, uint16_t task, uint8_t done) {
+    oc_job *j = oc_job_new(type, 140);
+    j->user_id = uid; j->channel_id = ch; j->message_id = mid;
+    if (name) j->todo_name = strdup(name);
+    j->todo_desc = strdup(desc ? desc : "");
+    j->todo_task = task; j->todo_done = done;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+#define todo_add(w, u, c, m, n, d)  todo_op(w, OC_JOB_TODO_ADD, u, c, m, n, d, 0, 0)
+#define todo_mark(w, u, c, m, t, d) todo_op(w, OC_JOB_TODO_MARK, u, c, m, NULL, NULL, t, d)
+#define todo_rename(w, u, c, m, n)  todo_op(w, OC_JOB_TODO_RENAME, u, c, m, n, NULL, 0, 0)
+
+/* The first entry of `mid`'s list in a result -- tasks [0, n) -- or NULL. */
+static const struct oc_replay_todo *todo_of(const oc_dbres *r, uint64_t mid) {
+    for (size_t i = 0; r && i < r->n_rtodo; i++)
+        if (r->rtodo[i].message_id == mid && r->rtodo[i].first == 0) return &r->rtodo[i];
+    return NULL;
+}
+
+static void test_todos(void) {
+    const char *path = tdb("todos.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "td-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "td-bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "td-carol", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob && carol);
+    const uint64_t ch = OC_DEFAULT_CHANNEL;
+
+    /* Made by its body: the title, then a task a line, a leading - or *
+     * dropped, a description after the first ": ", blank lines skipped. The
+     * body is stored as written, and the list comes back for the frame after
+     * the ACTION. */
+    const char *body = "/todo  Launch checklist \n- Write the notes: for the release\n\n* Tag it\nTell people:  everyone \n";
+    oc_dbres *r = todo_send(w, alice, ch, body);
+    CHECK(r && r->type == OC_RES_SEND_OK && r->message_id);
+    uint64_t list = r ? r->message_id : 0;
+    const struct oc_replay_todo *t = todo_of(r, list);
+    CHECK(t && strcmp(t->title, "Launch checklist") == 0 && t->author_id == alice && t->channel_id == ch);
+    CHECK(t && t->total == 3 && t->n == 3);
+    CHECK(t && strcmp(t->tasks[0].name, "Write the notes") == 0 && strcmp(t->tasks[0].desc, "for the release") == 0);
+    CHECK(t && strcmp(t->tasks[1].name, "Tag it") == 0 && t->tasks[1].desc[0] == '\0');
+    CHECK(t && strcmp(t->tasks[2].name, "Tell people") == 0 && strcmp(t->tasks[2].desc, "everyone") == 0);
+    CHECK(t && !t->tasks[0].done && !t->tasks[0].done_by && !t->tasks[0].done_at_ms);
+    CHECK(r && r->body_len == strlen(body) && memcmp(r->body, body, r->body_len) == 0);
+    oc_dbres_free(r);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM todo_tasks WHERE message_id=?", list) == 3);
+
+    /* Not a list: "/todo" must be the whole first word, and "/todo" alone has
+     * no title. An ordinary message carries no list. */
+    r = todo_send(w, alice, ch, "/todos are fun");
+    CHECK(r && r->type == OC_RES_SEND_OK && r->n_rtodo == 0);
+    uint64_t plain = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    r = todo_send(w, alice, ch, "/todo\n- a task");
+    CHECK(r && r->type == OC_RES_SEND_ERR && r->err_code == OC_ERR_TODO_INVALID);
+    oc_dbres_free(r);
+
+    /* The limits, each refused at send with nothing stored: a title past 250
+     * bytes, a name past 250, a description past 1,000, 201 tasks; and a task
+     * named twice. At each limit, taken. */
+    char *big = malloc(OC_TODO_MAX_TASKS * 8 + OC_TODO_DESC_MAX + 64);
+    CHECK(big != NULL);
+    if (big) {
+        int64_t before = e2e_scalar(path, "SELECT COUNT(*) FROM messages WHERE channel_id=?", ch);
+        size_t k = (size_t)sprintf(big, "/todo ");
+        memset(big + k, 't', OC_TODO_TITLE_MAX + 1); k += OC_TODO_TITLE_MAX + 1; big[k] = '\0';
+        r = todo_send(w, alice, ch, big);
+        CHECK(r && r->type == OC_RES_SEND_ERR && r->err_code == OC_ERR_TODO_INVALID);
+        oc_dbres_free(r);
+        big[k - 1] = '\0';   /* 250: taken */
+        r = todo_send(w, alice, ch, big);
+        CHECK(r && r->type == OC_RES_SEND_OK && todo_of(r, r->message_id) && strlen(todo_of(r, r->message_id)->title) == OC_TODO_TITLE_MAX);
+        oc_dbres_free(r);
+        k = (size_t)sprintf(big, "/todo Names\n- ");
+        memset(big + k, 'n', OC_TODO_NAME_MAX + 1); k += OC_TODO_NAME_MAX + 1; big[k] = '\0';
+        r = todo_send(w, alice, ch, big);
+        CHECK(r && r->type == OC_RES_SEND_ERR && r->err_code == OC_ERR_TODO_INVALID);
+        oc_dbres_free(r);
+        k = (size_t)sprintf(big, "/todo Descriptions\n- d: ");
+        memset(big + k, 'd', OC_TODO_DESC_MAX + 1); k += OC_TODO_DESC_MAX + 1; big[k] = '\0';
+        r = todo_send(w, alice, ch, big);
+        CHECK(r && r->type == OC_RES_SEND_ERR && r->err_code == OC_ERR_TODO_INVALID);
+        oc_dbres_free(r);
+        k = (size_t)sprintf(big, "/todo Many");
+        for (unsigned i = 0; i <= OC_TODO_MAX_TASKS; i++) k += (size_t)sprintf(big + k, "\n%u", i);
+        r = todo_send(w, alice, ch, big);
+        CHECK(r && r->type == OC_RES_SEND_ERR && r->err_code == OC_ERR_TODO_INVALID);
+        oc_dbres_free(r);
+        r = todo_send(w, alice, ch, "/todo Twice\n- Same\n- Same: again");
+        CHECK(r && r->type == OC_RES_SEND_ERR && r->err_code == OC_ERR_TODO_DUPLICATE);
+        oc_dbres_free(r);
+        CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM messages WHERE channel_id=?", ch) == before + 1);
+        /* 200 tasks: taken, and told in frames of OC_TODO_CHUNK, in order. */
+        k = (size_t)sprintf(big, "/todo Full");
+        for (unsigned i = 0; i < OC_TODO_MAX_TASKS; i++) k += (size_t)sprintf(big + k, "\n%u", i);
+        r = todo_send(w, alice, ch, big);
+        CHECK(r && r->type == OC_RES_SEND_OK);
+        uint64_t full = r ? r->message_id : 0;
+        CHECK(r && r->n_rtodo == (OC_TODO_MAX_TASKS + OC_TODO_CHUNK - 1) / OC_TODO_CHUNK);
+        CHECK(r && r->n_rtodo >= 2 && r->rtodo[1].first == OC_TODO_CHUNK && r->rtodo[1].total == OC_TODO_MAX_TASKS
+              && strcmp(r->rtodo[1].tasks[0].name, "40") == 0);
+        oc_dbres_free(r);
+        r = todo_add(w, bob, ch, full, "one more", "");
+        CHECK(r && r->type == OC_RES_TODO_ERR && r->err_code == OC_ERR_TODO_FULL);
+        oc_dbres_free(r);
+        free(big);
+    }
+
+    /* Adding: anyone who reads it, at the end, trimmed; a blank name, a name
+     * the list has, a name or description past its limit, refused. */
+    r = todo_add(w, bob, ch, list, "  Book the room ", "the big one");
+    CHECK(r && r->type == OC_RES_TODO && r->n_members == 3);
+    t = todo_of(r, list);
+    CHECK(t && t->total == 4 && strcmp(t->tasks[3].name, "Book the room") == 0 && strcmp(t->tasks[3].desc, "the big one") == 0);
+    CHECK(t && strcmp(t->tasks[0].name, "Write the notes") == 0);   /* the order kept */
+    oc_dbres_free(r);
+    r = todo_add(w, carol, ch, list, " \t ", "");
+    CHECK(r && r->type == OC_RES_TODO_ERR && r->err_code == OC_ERR_TODO_INVALID && r->message_id == list);
+    oc_dbres_free(r);
+    r = todo_add(w, carol, ch, list, "Tag it", "");
+    CHECK(r && r->type == OC_RES_TODO_ERR && r->err_code == OC_ERR_TODO_DUPLICATE);
+    oc_dbres_free(r);
+    char lname[OC_TODO_NAME_MAX + 2], ldesc[OC_TODO_DESC_MAX + 2];
+    memset(lname, 'n', sizeof lname - 1); lname[sizeof lname - 1] = '\0';
+    memset(ldesc, 'd', sizeof ldesc - 1); ldesc[sizeof ldesc - 1] = '\0';
+    r = todo_add(w, carol, ch, list, lname, "");
+    CHECK(r && r->type == OC_RES_TODO_ERR && r->err_code == OC_ERR_TODO_INVALID);
+    oc_dbres_free(r);
+    r = todo_add(w, carol, ch, list, "Fine", ldesc);
+    CHECK(r && r->type == OC_RES_TODO_ERR && r->err_code == OC_ERR_TODO_INVALID);
+    oc_dbres_free(r);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM todo_tasks WHERE message_id=?", list) == 4);
+    r = todo_add(w, carol, ch, plain, "Not a list", "");
+    CHECK(r && r->type == OC_RES_TODO_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
+    oc_dbres_free(r);
+
+    /* Marking: the state wanted. Done records who and when; marking it done
+     * again, by someone else at once, changes nothing -- so two marks agree
+     * rather than cancel out; not done clears who. */
+    r = todo_mark(w, bob, ch, list, 1, 1);
+    t = todo_of(r, list);
+    CHECK(r && r->type == OC_RES_TODO && t && t->tasks[1].done && t->tasks[1].done_by == bob && t->tasks[1].done_at_ms);
+    uint64_t at = t ? t->tasks[1].done_at_ms : 0;
+    oc_dbres_free(r);
+    r = todo_mark(w, carol, ch, list, 1, 1);
+    t = todo_of(r, list);
+    CHECK(r && r->type == OC_RES_TODO && t && t->tasks[1].done && t->tasks[1].done_by == bob && t->tasks[1].done_at_ms == at);
+    oc_dbres_free(r);
+    r = todo_mark(w, carol, ch, list, 1, 0);
+    t = todo_of(r, list);
+    CHECK(t && !t->tasks[1].done && !t->tasks[1].done_by && !t->tasks[1].done_at_ms);
+    oc_dbres_free(r);
+    r = todo_mark(w, alice, ch, list, 1, 0);   /* not done, again: still not done */
+    t = todo_of(r, list);
+    CHECK(r && r->type == OC_RES_TODO && t && !t->tasks[1].done);
+    oc_dbres_free(r);
+    r = todo_mark(w, carol, ch, list, 2, 1);
+    oc_dbres_free(r);
+    r = todo_mark(w, bob, ch, list, 9, 1);
+    CHECK(r && r->type == OC_RES_TODO_ERR && r->err_code == OC_ERR_TODO_INVALID);
+    oc_dbres_free(r);
+
+    /* Renaming: its author only, the title trimmed and within its limit. */
+    r = todo_rename(w, bob, ch, list, "Bob's now");
+    CHECK(r && r->type == OC_RES_TODO_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    r = todo_rename(w, alice, ch, list, "   ");
+    CHECK(r && r->type == OC_RES_TODO_ERR && r->err_code == OC_ERR_TODO_INVALID);
+    oc_dbres_free(r);
+    char ltitle[OC_TODO_TITLE_MAX + 2];
+    memset(ltitle, 't', sizeof ltitle - 1); ltitle[sizeof ltitle - 1] = '\0';
+    r = todo_rename(w, alice, ch, list, ltitle);
+    CHECK(r && r->type == OC_RES_TODO_ERR && r->err_code == OC_ERR_TODO_INVALID);
+    oc_dbres_free(r);
+    r = todo_rename(w, alice, ch, list, " Launch day ");
+    t = todo_of(r, list);
+    CHECK(r && r->type == OC_RES_TODO && t && strcmp(t->title, "Launch day") == 0 && t->total == 4);
+    oc_dbres_free(r);
+
+    /* Not edited: the body stays as written, whoever asks. */
+    r = do_edit(w, alice, ch, list, "/todo Something else");
+    CHECK(r && r->type == OC_RES_EDIT_ERR && r->err_code == OC_ERR_TODO_NO_EDIT);
+    oc_dbres_free(r);
+
+    /* Replayed as it stands: backfill and history carry the list, an ordinary
+     * message none; search carries the list of a result that is one. */
+    r = backfill(w, carol, ch, 0);
+    t = todo_of(r, list);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && t && strcmp(t->title, "Launch day") == 0 && t->total == 4);
+    CHECK(t && t->tasks[2].done && t->tasks[2].done_by == carol && !t->tasks[1].done);
+    CHECK(todo_of(r, plain) == NULL);
+    oc_dbres_free(r);
+    r = search(w, bob, "launch", 20);
+    CHECK(r && r->type == OC_RES_SEARCH && todo_of(r, list) && todo_of(r, list)->total == 4);
+    oc_dbres_free(r);
+
+    /* Deleted: the list goes from every read, and takes no change; restored,
+     * it comes back as it stood, with its message. */
+    r = do_delete(w, alice, ch, list);
+    CHECK(r && r->type == OC_RES_DELETE_OK);
+    oc_dbres_free(r);
+    r = todo_mark(w, bob, ch, list, 0, 1);
+    CHECK(r && r->type == OC_RES_TODO_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
+    oc_dbres_free(r);
+    r = backfill(w, carol, ch, 0);
+    CHECK(r && todo_of(r, list) == NULL);
+    oc_dbres_free(r);
+    r = del_or_restore(w, OC_JOB_RESTORE, alice, list);
+    t = todo_of(r, list);
+    CHECK(r && r->type == OC_RES_RESTORE_OK && t && strcmp(t->title, "Launch day") == 0 && t->total == 4 && t->tasks[2].done);
+    oc_dbres_free(r);
+
+    /* A thread reply can be a list, and the thread carries it. */
+    r = send_reply(w, bob, ch, plain, "/todo In a thread\n- one");
+    CHECK(r && r->type == OC_RES_REPLY_OK && todo_of(r, r->message_id));
+    uint64_t inthread = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    oc_job *j = oc_job_new(OC_JOB_LIST_THREAD, 141);
+    j->user_id = alice; j->channel_id = ch; j->parent_id = plain;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_THREAD && todo_of(r, inthread));
+    oc_dbres_free(r);
+
+    /* A DM and a group DM: lists too, worked only by those who read them. */
+    r = open_dm(w, alice, bob);
+    uint64_t dm = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(dm != 0);
+    r = todo_send(w, alice, dm, "/todo Between us\n- Lunch");
+    CHECK(r && r->type == OC_RES_SEND_OK && todo_of(r, r->message_id));
+    uint64_t dml = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    r = todo_mark(w, bob, dm, dml, 0, 1);
+    CHECK(r && r->type == OC_RES_TODO);
+    oc_dbres_free(r);
+    r = todo_add(w, carol, dm, dml, "Me too", "");
+    CHECK(r && r->type == OC_RES_TODO_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 142);
+    j->user_id = alice; j->group_uids[0] = bob; j->group_uids[1] = carol; j->n_group_uids = 2;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    uint64_t gdm = (r && r->type == OC_RES_CHANNEL_INFO) ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(gdm != 0);
+    r = todo_send(w, carol, gdm, "/todo Three of us\n- Plan");
+    CHECK(r && r->type == OC_RES_SEND_OK && todo_of(r, r->message_id));
+    oc_dbres_free(r);
+
+    /* Archived: the list is read, and changes are refused. */
+    e2e_scalar(path, "UPDATE channels SET archived_at_ms=1 WHERE id=?", ch);
+    r = todo_mark(w, bob, ch, list, 0, 1);
+    CHECK(r && r->type == OC_RES_TODO_ERR && r->err_code == OC_ERR_CHANNEL_ARCHIVED);
+    oc_dbres_free(r);
+    r = todo_add(w, bob, ch, list, "Late", "");
+    CHECK(r && r->type == OC_RES_TODO_ERR && r->err_code == OC_ERR_CHANNEL_ARCHIVED);
+    oc_dbres_free(r);
+    r = todo_rename(w, alice, ch, list, "Too late");
+    CHECK(r && r->type == OC_RES_TODO_ERR && r->err_code == OC_ERR_CHANNEL_ARCHIVED);
+    oc_dbres_free(r);
+    r = backfill(w, carol, ch, 0);
+    CHECK(r && todo_of(r, list) && !todo_of(r, list)->tasks[0].done);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_polls(void) {
     const char *path = tdb("polls.db");
     cleanup_db(path);
@@ -12488,6 +12775,7 @@ int run_dbwriter_tests(void) {
     test_restore();
     test_actions();
     test_polls();
+    test_todos();
     test_oidc_limits_and_audit();
     test_auth_rate_limit();
     test_source_rate_limit();

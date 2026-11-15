@@ -708,6 +708,54 @@ oc_result oc_encode_edit_poll(oc_wbuf *w, uint16_t version, const oc_edit_poll *
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_todo_add(oc_wbuf *w, uint16_t version, const oc_todo_add *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_TODO_ADD);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->message_id);
+    oc_w_str(w, m->name);
+    oc_w_str(w, m->description);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_todo_mark(oc_wbuf *w, uint16_t version, const oc_todo_mark *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_TODO_MARK);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->message_id);
+    oc_w_u16(w, m->task);
+    oc_w_u8(w, m->done ? 1u : 0u);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_todo_rename(oc_wbuf *w, uint16_t version, const oc_todo_rename *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_TODO_RENAME);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->message_id);
+    oc_w_str(w, m->title);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_todo(oc_wbuf *w, uint16_t version, const oc_todo_msg *m) {
+    if (m->n > OC_TODO_CHUNK || m->total > OC_TODO_MAX_TASKS || (uint32_t)m->first + m->n > m->total)
+        return OC_E_MALFORMED;
+    size_t off = oc_frame_begin(w, version, OC_MSG_TODO);
+    oc_w_u64(w, m->message_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->author_id);
+    oc_w_str(w, m->title);
+    oc_w_u16(w, m->total);
+    oc_w_u16(w, m->first);
+    oc_w_u8(w, m->n);
+    for (uint8_t i = 0; i < m->n; i++) {
+        const oc_todo_task *t = &m->tasks[i];
+        oc_w_str(w, t->name);
+        oc_w_str(w, t->description);
+        oc_w_u8(w, t->done ? 1u : 0u);
+        oc_w_u64(w, t->done_by);
+        oc_w_u64(w, t->done_at_ms);
+    }
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_list_poll_voters(oc_wbuf *w, uint16_t version, const oc_list_poll_voters *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LIST_POLL_VOTERS);
     oc_w_u64(w, m->channel_id);
@@ -1600,6 +1648,10 @@ const char *oc_error_text(uint16_t code) {
     case OC_ERR_INVALID_POLL: return "a poll needs a question and two to ten options, and a vote only options it has";
     case OC_ERR_POLL_CLOSED: return "the poll has closed";
     case OC_ERR_POLL_HAS_VOTES: return "people have voted, so the options and settings can no longer change";
+    case OC_ERR_TODO_NO_EDIT:   return "a message with a to-do list can't be edited";
+    case OC_ERR_TODO_INVALID:   return "that title or task is blank or too long";
+    case OC_ERR_TODO_DUPLICATE: return "the list already has a task with that name";
+    case OC_ERR_TODO_FULL:      return "the list already has 200 tasks";
     case OC_ERR_EDIT_WINDOW_CLOSED: return "this workspace no longer lets you change or delete that message";
     case OC_ERR_WORKSPACE_SENDER: return "messages from the workspace take no replies";
     case OC_ERR_CANNOT_MOVE:      return "that message can't be moved there";
@@ -3283,6 +3335,54 @@ oc_result oc_decode_edit_poll(oc_rbuf *p, oc_edit_poll *m) {
     if (n > OC_POLL_MAX_OPTIONS) return OC_E_MALFORMED;
     m->n_options = n;
     for (uint8_t i = 0; i < n; i++) m->options[i] = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_todo_add(oc_rbuf *p, oc_todo_add *m) {
+    m->channel_id = oc_r_u64(p);
+    m->message_id = oc_r_u64(p);
+    m->name = oc_r_str(p);
+    m->description = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_todo_mark(oc_rbuf *p, oc_todo_mark *m) {
+    m->channel_id = oc_r_u64(p);
+    m->message_id = oc_r_u64(p);
+    m->task = oc_r_u16(p);
+    m->done = oc_r_u8(p);
+    if (m->done > 1) return OC_E_MALFORMED;
+    return r_done(p);
+}
+
+oc_result oc_decode_todo_rename(oc_rbuf *p, oc_todo_rename *m) {
+    m->channel_id = oc_r_u64(p);
+    m->message_id = oc_r_u64(p);
+    m->title = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_todo(oc_rbuf *p, oc_todo_msg *m) {
+    memset(m, 0, sizeof *m);
+    m->message_id = oc_r_u64(p);
+    m->channel_id = oc_r_u64(p);
+    m->author_id = oc_r_u64(p);
+    m->title = oc_r_str(p);
+    m->total = oc_r_u16(p);
+    m->first = oc_r_u16(p);
+    uint8_t n = oc_r_u8(p);
+    if (n > OC_TODO_CHUNK || m->total > OC_TODO_MAX_TASKS || (uint32_t)m->first + n > m->total)
+        return OC_E_MALFORMED;
+    m->n = n;
+    for (uint8_t i = 0; i < n; i++) {
+        oc_todo_task *t = &m->tasks[i];
+        t->name = oc_r_str(p);
+        t->description = oc_r_str(p);
+        t->done = oc_r_u8(p);
+        t->done_by = oc_r_u64(p);
+        t->done_at_ms = oc_r_u64(p);
+        if (t->done > 1) return OC_E_MALFORMED;
+    }
     return r_done(p);
 }
 

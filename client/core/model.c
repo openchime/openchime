@@ -41,6 +41,7 @@ static void msg_free(oc_msg *m) {
                       free(m->forward); m->forward = NULL; }
     free(m->body); free(m->reactions); free(m->attach);
     free(m->poll); m->poll = NULL;
+    oc_todo_view_free(m->todo); m->todo = NULL;
     msg_clear_unfurls(m);
 }
 
@@ -81,6 +82,38 @@ static void msg_tombstone(oc_msg *msg) {
     memset(&msg->action, 0, sizeof msg->action);   /* no body, no action (REQ-058) */
     free(msg->poll);   /* nor a question to vote on: the daemon drops it too (REQ-225) */
     msg->poll = NULL;
+    oc_todo_view_free(msg->todo);   /* nor a list: a restore sends it back */
+    msg->todo = NULL;
+}
+
+/* Fold one TODO frame's range into a message's list. The range from 0 starts
+ * the list afresh -- every task's slot, the title and author -- so a list is
+ * always exactly what the daemon last sent, never a mix. */
+static void msg_set_todo(oc_msg *msg, const oc_ev *e) {
+    const oc_todo_view *v = e->todo;
+    if (msg->deleted || !v) return;
+    if (e->todo_first == 0 || !msg->todo || msg->todo->total != v->total) {
+        oc_todo_view *n = calloc(1, sizeof *n);
+        if (!n) return;
+        n->tasks = calloc(v->total ? v->total : 1, sizeof *n->tasks);
+        if (!n->tasks) { free(n); return; }
+        n->cap = v->total;
+        n->total = v->total;
+        oc_todo_view_free(msg->todo);
+        msg->todo = n;
+    }
+    oc_todo_view *t = msg->todo;
+    t->author_id = v->author_id;
+    free(t->title);
+    t->title = strdup(v->title ? v->title : "");
+    for (uint8_t i = 0; i < e->todo_n; i++) {
+        uint32_t at = (uint32_t)e->todo_first + i;
+        if (at >= t->cap) break;
+        free(t->tasks[at].name); free(t->tasks[at].desc);
+        t->tasks[at] = v->tasks[i];
+        t->tasks[at].name = strdup(v->tasks[i].name ? v->tasks[i].name : "");
+        t->tasks[at].desc = strdup(v->tasks[i].desc ? v->tasks[i].desc : "");
+    }
 }
 
 /* Set a message's action from what the daemon sent (REQ-058, ARCH-115): an
@@ -922,6 +955,15 @@ const oc_poll_view *oc_model_poll(const oc_model *m, uint64_t channel_id, uint64
         if (c->msgs[i].message_id == message_id) return c->msgs[i].poll;
     for (size_t i = 0; i < m->n_thread_msgs; i++)
         if (m->thread_msgs[i].message_id == message_id) return m->thread_msgs[i].poll;
+    return NULL;
+}
+
+const oc_todo_view *oc_model_todo(const oc_model *m, uint64_t channel_id, uint64_t message_id) {
+    const oc_channel *c = oc_model_channel((oc_model *)m, channel_id);
+    for (size_t i = 0; c && i < c->n_msgs; i++)
+        if (c->msgs[i].message_id == message_id) return c->msgs[i].deleted ? NULL : c->msgs[i].todo;
+    for (size_t i = 0; i < m->n_thread_msgs; i++)
+        if (m->thread_msgs[i].message_id == message_id) return m->thread_msgs[i].deleted ? NULL : m->thread_msgs[i].todo;
     return NULL;
 }
 
@@ -2880,6 +2922,15 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             if (c->msgs[i].message_id == e->message_id) { msg_set_poll(&c->msgs[i], e->poll); break; }
         for (size_t i = 0; i < m->n_thread_msgs; i++)
             if (m->thread_msgs[i].message_id == e->message_id) { msg_set_poll(&m->thread_msgs[i], e->poll); break; }
+        break;
+    }
+    case OC_EV_TODO: {
+        /* A to-do list, wherever its message is held, as a poll is. */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        for (size_t i = 0; c && i < c->n_msgs; i++)
+            if (c->msgs[i].message_id == e->message_id) { msg_set_todo(&c->msgs[i], e); break; }
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id) { msg_set_todo(&m->thread_msgs[i], e); break; }
         break;
     }
     case OC_EV_POLL_VOTERS:

@@ -345,7 +345,11 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_CHANNEL_ADD_MANAGER = 241, OC_JOB_CHANNEL_REMOVE_MANAGER = 242,
        /* Rename a custom emoji (REQ-072): ch_name the name, pf_name the new
         * one. Answered EMOJI_LIST, to everyone. */
-       OC_JOB_RENAME_EMOJI = 243 };
+       OC_JOB_RENAME_EMOJI = 243,
+       /* To-do lists: a task added (todo_name, todo_desc), marked (todo_task,
+        * todo_done), or the list renamed by its author (todo_name). Writes;
+        * answered OC_RES_TODO to the conversation, or OC_RES_TODO_ERR. */
+       OC_JOB_TODO_ADD = 161, OC_JOB_TODO_MARK = 162, OC_JOB_TODO_RENAME = 163 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -520,6 +524,10 @@ typedef struct oc_job {
      * (REQ-283), 0 for none. */
     uint8_t        save_op;
     uint64_t       remind_at_ms;
+    /* TODO_ADD / TODO_MARK / TODO_RENAME (channel_id, message_id above). */
+    char          *todo_name, *todo_desc;   /* heap */
+    uint16_t       todo_task;
+    uint8_t        todo_done;
     /* SET_WEBHOOK_STATE's desired state. Its own field rather than reusing
      * one of the *_op flags above: a reader should not have to know that "save_op"
      * secretly means "disabled" for a different job type. */
@@ -845,6 +853,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* The author changed a poll: rpoll[0] for the conversation, nobody's
         * selection in it. */
        OC_RES_POLL_EDITED = 120,
+       /* A to-do list changed: rtodo is its state, for the conversation's
+        * members; or refused, OC_RES_TODO_ERR, to the asker with message_id. */
+       OC_RES_TODO = 136, OC_RES_TODO_ERR = 137,
        /* A notice the workspace's own sender posted (its welcome, a member
         * joined, a channel made or changed, a person added or given a role):
         * the SEND-shaped fields and `members`, broadcast as an ordinary
@@ -1279,6 +1290,15 @@ typedef struct oc_dbres {
                             uint32_t counts[OC_POLL_MAX_OPTIONS]; }
                   *rpoll;
     size_t         n_rpoll;
+    /* To-do lists: each entry one TODO frame, tasks [first, first + n) of
+     * `total`; a list past OC_TODO_CHUNK tasks is several entries in order.
+     * Strings heap. */
+    struct oc_replay_todo { uint64_t message_id, channel_id, author_id;
+                            char *title; uint16_t total, first; uint8_t n;
+                            struct { char *name, *desc; uint8_t done; uint64_t done_by, done_at_ms; }
+                                tasks[OC_TODO_CHUNK]; }
+                  *rtodo;
+    size_t         n_rtodo;
     /* POLL_VOTERS: who picked which option, ordered by option then user. */
     oc_poll_voter *pvoters;
     size_t         n_pvoters;

@@ -145,6 +145,10 @@ typedef struct {
     /* The poll (REQ-225), NULL unless this message is one: its body is the
      * question. Set and updated only by what the daemon sends. */
     oc_poll_view   *poll;
+    /* The to-do list, NULL unless this message is one: its title, tasks and
+     * who marked each done, as the daemon last said. A frontend shows it in
+     * place of the "/todo" body. */
+    oc_todo_view   *todo;
 } oc_msg;
 
 /* How many live thread replies can be waiting for the toast pass at once. The
@@ -1474,6 +1478,8 @@ void            oc_model_voterlist_begin(oc_model *m, uint64_t message_id);
 void            oc_model_close_voterlist(oc_model *m);
 /* A message's poll, by id, in `channel_id` or the open thread; NULL if none. */
 const oc_poll_view *oc_model_poll(const oc_model *m, uint64_t channel_id, uint64_t message_id);
+/* A message's to-do list, by id, in `channel_id` or the open thread; NULL if none. */
+const oc_todo_view *oc_model_todo(const oc_model *m, uint64_t channel_id, uint64_t message_id);
 /* Read-aloud is offered: the "tts" capability. */
 uint8_t         oc_model_tts_available(const oc_model *m);
 /* Voice input is offered on this connection (the "stt" capability). */

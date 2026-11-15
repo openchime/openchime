@@ -1016,6 +1016,99 @@ static void test_poll_frames(void) {
     }
 }
 
+/* To-do lists: the three requests, and TODO, a range of a list's tasks a
+ * frame -- a full range of the longest tasks within a frame -- with the
+ * bounds a decoder holds to. */
+static void test_todo_frames(void) {
+    {
+        oc_todo_add in = { 7, 1001, oc_slice_str("Book the room"), oc_slice_str("the big one") };
+        ROUNDTRIP(oc_encode_todo_add(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TODO_ADD, h, p);
+        oc_todo_add out;
+        CHECK(oc_decode_todo_add(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.message_id == 1001);
+        CHECK(slice_eq_str(out.name, "Book the room") && slice_eq_str(out.description, "the big one"));
+    }
+    {
+        oc_todo_mark in = { 7, 1001, 199, 1 };
+        ROUNDTRIP(oc_encode_todo_mark(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TODO_MARK, h, p);
+        oc_todo_mark out;
+        CHECK(oc_decode_todo_mark(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.message_id == 1001 && out.task == 199 && out.done == 1);
+    }
+    {
+        oc_todo_rename in = { 7, 1001, oc_slice_str("Launch day") };
+        ROUNDTRIP(oc_encode_todo_rename(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TODO_RENAME, h, p);
+        oc_todo_rename out;
+        CHECK(oc_decode_todo_rename(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.message_id == 1001 && slice_eq_str(out.title, "Launch day"));
+    }
+    {
+        static oc_todo_msg in, out;
+        memset(&in, 0, sizeof in);
+        in.message_id = 1001; in.channel_id = 7; in.author_id = 42; in.title = oc_slice_str("Launch day");
+        in.total = 45; in.first = 40; in.n = 2;
+        in.tasks[0] = (oc_todo_task){ oc_slice_str("Tag it"), oc_slice_str(""), 1, 43, 1700000000000ull };
+        in.tasks[1] = (oc_todo_task){ oc_slice_str("Tell people"), oc_slice_str("everyone"), 0, 0, 0 };
+        ROUNDTRIP(oc_encode_todo(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TODO, h, p);
+        CHECK(oc_decode_todo(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1001 && out.channel_id == 7 && out.author_id == 42 && slice_eq_str(out.title, "Launch day"));
+        CHECK(out.total == 45 && out.first == 40 && out.n == 2);
+        CHECK(slice_eq_str(out.tasks[0].name, "Tag it") && out.tasks[0].description.len == 0);
+        CHECK(out.tasks[0].done == 1 && out.tasks[0].done_by == 43 && out.tasks[0].done_at_ms == 1700000000000ull);
+        CHECK(slice_eq_str(out.tasks[1].description, "everyone") && out.tasks[1].done == 0 && out.tasks[1].done_by == 0);
+    }
+    {
+        /* The largest frame there is: a full range, every name and description
+         * at its limit, inside OC_MAX_FRAME_SIZE. */
+        static char nm[OC_TODO_NAME_MAX], ds[OC_TODO_DESC_MAX], tt[OC_TODO_TITLE_MAX];
+        memset(nm, 'n', sizeof nm); memset(ds, 'd', sizeof ds); memset(tt, 't', sizeof tt);
+        static oc_todo_msg in, out;
+        memset(&in, 0, sizeof in);
+        in.message_id = 1; in.channel_id = 2; in.author_id = 3;
+        in.title = (oc_slice){ (const uint8_t *)tt, sizeof tt };
+        in.total = OC_TODO_MAX_TASKS; in.first = OC_TODO_MAX_TASKS - OC_TODO_CHUNK; in.n = OC_TODO_CHUNK;
+        for (unsigned i = 0; i < OC_TODO_CHUNK; i++)
+            in.tasks[i] = (oc_todo_task){ { (const uint8_t *)nm, sizeof nm }, { (const uint8_t *)ds, sizeof ds }, 1, 9, 9 };
+        ROUNDTRIP(oc_encode_todo(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TODO, h, p);
+        CHECK(w.len <= OC_MAX_FRAME_SIZE);
+        CHECK(oc_decode_todo(&p, &out) == OC_OK);
+        CHECK(out.n == OC_TODO_CHUNK && out.tasks[OC_TODO_CHUNK - 1].description.len == OC_TODO_DESC_MAX);
+    }
+    {
+        /* A range past the list, more than a frame's worth, or a list past the
+         * cap: the encoder refuses to write one. */
+        static oc_todo_msg in;
+        memset(&in, 0, sizeof in);
+        uint8_t raw[256]; oc_wbuf w2;
+        in.total = 3; in.first = 2; in.n = 2;
+        oc_wbuf_init(&w2, raw, sizeof raw);
+        CHECK(oc_encode_todo(&w2, OC_PROTOCOL_VERSION, &in) == OC_E_MALFORMED);
+        in.total = OC_TODO_MAX_TASKS + 1; in.first = 0; in.n = 0;
+        oc_wbuf_init(&w2, raw, sizeof raw);
+        CHECK(oc_encode_todo(&w2, OC_PROTOCOL_VERSION, &in) == OC_E_MALFORMED);
+        in.total = OC_TODO_MAX_TASKS; in.n = OC_TODO_CHUNK + 1;
+        oc_wbuf_init(&w2, raw, sizeof raw);
+        CHECK(oc_encode_todo(&w2, OC_PROTOCOL_VERSION, &in) == OC_E_MALFORMED);
+    }
+    {
+        /* ...and a frame that claims one is refused by the decoder. */
+        uint8_t raw[128]; oc_wbuf w2; oc_wbuf_init(&w2, raw, sizeof raw);
+        oc_w_u64(&w2, 1); oc_w_u64(&w2, 2); oc_w_u64(&w2, 3); oc_w_str(&w2, oc_slice_str("t"));
+        oc_w_u16(&w2, 1); oc_w_u16(&w2, 1); oc_w_u8(&w2, 1);
+        oc_rbuf p2; oc_rbuf_init(&p2, raw, w2.len);
+        static oc_todo_msg out;
+        CHECK(oc_decode_todo(&p2, &out) == OC_E_MALFORMED);
+    }
+    {
+        /* A mark's state is 0 or 1: anything else is malformed. */
+        uint8_t raw[32]; oc_wbuf w2; oc_wbuf_init(&w2, raw, sizeof raw);
+        oc_w_u64(&w2, 7); oc_w_u64(&w2, 1001); oc_w_u16(&w2, 0); oc_w_u8(&w2, 2);
+        oc_rbuf p2; oc_rbuf_init(&p2, raw, w2.len);
+        oc_todo_mark out;
+        CHECK(oc_decode_todo_mark(&p2, &out) == OC_E_MALFORMED);
+    }
+}
+
 /* ACTION (REQ-058, ARCH-115), and the action byte every excerpt frame carries.
  * Each excerpt's flag is the LAST field it writes, so the cases set it to 1:
  * a decoder that forgot it would read short and fail rather than pass on a 0
@@ -3214,6 +3307,7 @@ int run_protocol_tests(void) {
     test_forward_frame();
     test_action_frames();
     test_poll_frames();
+    test_todo_frames();
     test_thread_frames();
     test_broadcast_stored_frames();
     test_thread_list_frames();

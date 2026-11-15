@@ -3032,6 +3032,75 @@ for options out of bounds. On success every member gets a `POLL` without anyone'
 selection, keeping the one they hold. Adding these frames needed no
 protocol-version bump.
 
+### 5.16o To-do lists
+
+A to-do list is a message whose **body starts `/todo`** followed by a title; each
+following line that is not blank is a task, a leading `-` or `*` ignored, and
+the text after a line's first `: ` its description. The daemon reads the body
+when it stores the message and keeps the list in its own rows from then on
+(`todo_lists`, `todo_tasks`: SCHEMA.md §3bx); the body stays the author's plain
+text, so a client that draws no list still shows it readably. It goes anywhere
+a message goes, by `SEND` or `SEND_REPLY`: a channel, a DM, a group DM, a
+thread. An encrypted DM's body is not the daemon's to read, so it makes no list.
+
+Limits: a title of at most 250 bytes, a task name of at most 250, a description
+of at most 1,000, and at most 200 tasks. A send past one is refused with
+`TODO_INVALID`, and one naming a task twice with `TODO_DUPLICATE`; the message is
+not stored. **A to-do message cannot be edited** (`EDIT` is refused with
+`TODO_NO_EDIT`): its title is renamed and its tasks added instead. Deleting the
+message takes its list from every reader; a restore sends it back as it stood.
+Nothing in an archived channel's lists changes (`CHANNEL_ARCHIVED`).
+
+A task is named by its place in the list, from 0. Tasks are only ever added at
+the end, never removed, reordered or changed, so a place always names the same
+task.
+
+**`TODO_ADD` (C → S), `0x0122`** — add a task, for anyone who can read the
+message.
+
+    channel_id (u64), message_id (u64), name (str), description (str)
+
+Spaces and tabs are trimmed from both ends. Refused with `TODO_INVALID` for a
+blank name or one past its limit, `TODO_DUPLICATE` for a name the list already
+has, `TODO_FULL` at 200 tasks.
+
+**`TODO_MARK` (C → S), `0x0123`** — mark a task done or not done.
+
+    channel_id (u64), message_id (u64), task (u16), done (u8)
+
+`done` is the state wanted, not a toggle: a task already in it is left as it is,
+who marked it included, so two people marking the same task at once agree.
+Refused with `TODO_INVALID` for a task the list does not have. A `done` above 1
+is malformed.
+
+**`TODO_RENAME` (C → S), `0x0124`** — the author renames the list.
+
+    channel_id (u64), message_id (u64), title (str)
+
+Refused with `FORBIDDEN` to anyone but the list's author, and `TODO_INVALID`
+for a blank title or one past 250 bytes.
+
+Each of the three is refused with `UNKNOWN_MESSAGE` for a message that is not a
+list, is deleted, or the sender cannot read. A refusal goes to the sender alone
+as an `ERROR` whose context is the message id.
+
+**`TODO` (S → C), `0x0125`** — a list's whole state, a range of its tasks a
+frame.
+
+    message_id (u64), channel_id (u64), author_id (u64), title (str),
+    total (u16), first (u16), count (u8),
+    count × { name (str), description (str), done (u8), done_by (u64), done_at_ms (u64) }
+
+The frame carries tasks `[first, first + count)` of `total`, at most 40 a frame;
+a list is sent as its frames in order from `first` 0, which replaces whatever a
+client held for it. `done_by` and `done_at_ms` are 0 for a task not done. Sent
+live after the message's `ACTION` and on every change, to the whole
+conversation; after `MESSAGE_RESTORED` for a restored list; replayed by backfill
+(§6.2) and history (§6.3) after the polls, by `LIST_THREAD` (§5.10) before its
+`THREAD` terminator, and ahead of `SEARCH_RESULTS` for each result that is a
+list, so every one carries the list's current state. Adding these frames needed
+no protocol-version bump.
+
 ### 5.17 Calls (REQ-150-152, REQ-161, REQ-301-305, ARCH-73, ARCH-86/87, ARCH-113)
 
 Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media flows over UDP to
@@ -3406,7 +3475,8 @@ its own reactions as such without a second round trip.
 
 After the reactions come the link previews, forwards and actions of the messages
 replayed, then their **polls** (§5.16n): one `POLL` per poll, carrying the
-requesting user's own selection, so a reload shows what they picked.
+requesting user's own selection, so a reload shows what they picked; then their
+**to-do lists** (§5.16o): each list's `TODO` frames, as the list stands now.
 
 `BACKFILL_DONE` payload:
 
@@ -3444,7 +3514,8 @@ attachments, reply counts and author-name overrides — followed by the same
 side-state a reconnect carries, in this order: `PIN_UPDATED` for each pinned
 message, `SAVED_UPDATED` for the requester's own saved marks, `REACTION_UPDATED`
 per (message, emoji), the matching `UNFURL`, `FORWARD` and `ACTION` frames, one
-`POLL` per poll (with the requester's selection), then `BACKFILL_DONE`.
+`POLL` per poll (with the requester's selection), each to-do list's `TODO`
+frames (§5.16o), then `BACKFILL_DONE`.
 
 That list is the point of the path, not a detail of it. A client stores nothing
 (ARCH-88), so state which travels only on a live fan-out is lost on any reload
@@ -3567,6 +3638,10 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3041` | `EDIT_WINDOW_CLOSED`  | messaging  | no    | An author's `EDIT`, or `DELETE` of their own message, past the window the workspace's configuration sets (`OPENCHIME_EDIT_WINDOW`, `OPENCHIME_DELETE_WINDOW`, which clients are told as `edit_window` and `delete_window`). An admin's or owner's delete of someone else's message is never limited (REQ-051, REQ-052). |
 | `3042` | `WORKSPACE_SENDER`    | messaging  | no    | A message, reply or file sent into a DM with the workspace's own sender (`USER_LIST` `flags`), whose DMs nobody reads. |
 | `3043` | `CANNOT_MOVE`         | messaging  | no    | A `MOVE_MESSAGE` that cannot be made: into or out of a DM or encrypted DM, a thread root with replies into a thread, into a thread that is itself a reply, or to where it already is (REQ-053). |
+| `3044` | `TODO_NO_EDIT`        | messaging  | no    | An `EDIT` of a message that carries a to-do list; its title is renamed and its tasks added instead (§5.16o). |
+| `3045` | `TODO_INVALID`        | messaging  | no    | A to-do list's title, or a task's name or description, blank or past its limit; or a task the list does not have (§5.16o). |
+| `3046` | `TODO_DUPLICATE`      | messaging  | no    | A task named as one already in the list, or a `/todo` body naming one twice (§5.16o). |
+| `3047` | `TODO_FULL`           | messaging  | no    | A `TODO_ADD` to a list that already holds 200 tasks (§5.16o). |
 | `3070` | `DM_REFUSED`          | messaging  | no    | An `OPEN_DM` or `OPEN_GROUP_DM` naming someone who blocks the asker, or a new one naming someone whose DM privacy is `nobody`. It says neither, so a block is never announced. |
 | `3071` | `INVALID_PROFILE_FIELD` | admin    | no    | A profile field without a label, of an unknown kind or id, past the 20 a workspace may have; or a value over 200 bytes, for a field it does not have, or for a link not starting `https://`. |
 | `3072` | `INVALID_OUT_OF_OFFICE` | profile  | no    | An out-of-office whose end is not after its start, or whose message is over 280 bytes. |
@@ -3847,6 +3922,10 @@ this table cannot silently gain a shared value.
 | `0x011F` | `FOUND_AT_TIME` | S → C | its answer: the first at or after the moment, else the last before |
 | `0x0120` | `USAGE_REQ` | C → S | owner/admin: the workspace's usage over the last days (REQ-043) |
 | `0x0121` | `USAGE` | S → C | active members by day and week, messages by day, the busiest channels |
+| `0x0122` | `TODO_ADD` | C → S | add a task to a to-do list (§5.16o) |
+| `0x0123` | `TODO_MARK` | C → S | mark a task done or not done: the state wanted, not a toggle |
+| `0x0124` | `TODO_RENAME` | C → S | the author renames a to-do list |
+| `0x0125` | `TODO` | S → C | a to-do list's state, a range of its tasks a frame; live, replayed and with search results |
 | `0x0130` | `SET_USER_MUTE` | C → S | mute or unmute one person, for me alone |
 | `0x0131` | `MUTED_USERS` | S → C | to my connections: everyone I have muted, on change and with `LIST_NOTIFY_PREFS` |
 | `0x0132` | `SET_BLOCK` | C → S | block or unblock one person, for me alone (§5.20) |

@@ -680,6 +680,12 @@ typedef enum {
     OC_MSG_CHANNEL_ADD_MANAGER    = 0x013B, /* C->S, a manager, admin or owner names a member of the channel its manager */
     OC_MSG_CHANNEL_REMOVE_MANAGER = 0x013C, /* C->S, and takes the role from any manager, the creator included */
     OC_MSG_RENAME_EMOJI         = 0x013D, /* C->S, a custom emoji's new name; the old one stays as an alias */
+    /* To-do lists in messages: made by a "/todo" body, worked by
+     * these, and told as TODO, a list's whole state in one or more frames. */
+    OC_MSG_TODO_ADD             = 0x0122, /* C->S, a task added to a list */
+    OC_MSG_TODO_MARK            = 0x0123, /* C->S, a task marked done or not done */
+    OC_MSG_TODO_RENAME          = 0x0124, /* C->S, the author renames a list */
+    OC_MSG_TODO                 = 0x0125, /* S->C, a list's state, a range of its tasks per frame */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -782,6 +788,10 @@ typedef enum {
     OC_ERR_INVALID_POLL        = 3038, /* a poll's options or a vote out of bounds (REQ-225) */
     OC_ERR_POLL_CLOSED         = 3039, /* the poll is past its deadline: no more votes (REQ-225) */
     OC_ERR_POLL_HAS_VOTES      = 3040, /* a poll's options or settings, once anyone has voted (REQ-225) */
+    OC_ERR_TODO_NO_EDIT        = 3044, /* a message carrying a to-do list is not edited */
+    OC_ERR_TODO_INVALID        = 3045, /* a list's title or a task blank, too long, or no such task */
+    OC_ERR_TODO_DUPLICATE      = 3046, /* a task named as one already in the list */
+    OC_ERR_TODO_FULL           = 3047, /* a list already holding OC_TODO_MAX_TASKS tasks */
     OC_ERR_EDIT_WINDOW_CLOSED  = 3041, /* an author's edit or delete of their own message, past the workspace's window (REQ-051/052) */
     OC_ERR_WORKSPACE_SENDER    = 3042, /* a message to the workspace's own sender, whose DMs nobody reads */
     OC_ERR_CANNOT_MOVE         = 3043, /* a move that cannot be made: into or out of an encrypted DM, a thread's
@@ -1266,6 +1276,24 @@ typedef struct { uint64_t channel_id; uint64_t message_id; } oc_list_poll_voters
 typedef struct { uint64_t channel_id; uint64_t message_id; uint8_t flags; uint64_t close_at_ms;
                  uint8_t n_options; oc_slice options[OC_POLL_MAX_OPTIONS]; } oc_edit_poll;
 typedef struct { uint8_t option; uint64_t user_id; } oc_poll_voter;
+/* To-do lists. The title and the tasks are a message's, kept by the daemon in
+ * their own rows; the body that made them stays as written. A task is named
+ * by its place in the list, which never changes: tasks are added at the end
+ * and never removed or reordered. */
+#define OC_TODO_TITLE_MAX  250u
+#define OC_TODO_NAME_MAX   250u
+#define OC_TODO_DESC_MAX   1000u
+#define OC_TODO_MAX_TASKS  200u
+#define OC_TODO_CHUNK      40u        /* the most tasks one TODO frame carries */
+typedef struct { uint64_t channel_id; uint64_t message_id; oc_slice name; oc_slice description; } oc_todo_add;
+/* `done` is the state wanted, not a toggle: two people marking at once agree. */
+typedef struct { uint64_t channel_id; uint64_t message_id; uint16_t task; uint8_t done; } oc_todo_mark;
+typedef struct { uint64_t channel_id; uint64_t message_id; oc_slice title; } oc_todo_rename;
+typedef struct { oc_slice name; oc_slice description; uint8_t done; uint64_t done_by; uint64_t done_at_ms; } oc_todo_task;
+/* TODO: tasks [first, first + n) of a list of `total`. A list is told in
+ * frames from first 0 up; the one with first 0 replaces what a client held. */
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; oc_slice title;
+                 uint16_t total; uint16_t first; uint8_t n; oc_todo_task tasks[OC_TODO_CHUNK]; } oc_todo_msg;
 /* SUMMARIZE (REQ-310): which span of a channel or DM to summarize. scope
  * OC_SUM_UNREAD (from the reader's place to now), OC_SUM_TODAY (today so far),
  * OC_SUM_DAILY (since yesterday: yesterday and today so far), OC_SUM_WEEK (the
@@ -2110,6 +2138,10 @@ oc_result oc_encode_vote(oc_wbuf *w, uint16_t version, const oc_vote *m);
 oc_result oc_encode_poll(oc_wbuf *w, uint16_t version, const oc_poll_msg *m);
 oc_result oc_encode_list_poll_voters(oc_wbuf *w, uint16_t version, const oc_list_poll_voters *m);
 oc_result oc_encode_edit_poll(oc_wbuf *w, uint16_t version, const oc_edit_poll *m);
+oc_result oc_encode_todo_add(oc_wbuf *w, uint16_t version, const oc_todo_add *m);
+oc_result oc_encode_todo_mark(oc_wbuf *w, uint16_t version, const oc_todo_mark *m);
+oc_result oc_encode_todo_rename(oc_wbuf *w, uint16_t version, const oc_todo_rename *m);
+oc_result oc_encode_todo(oc_wbuf *w, uint16_t version, const oc_todo_msg *m);
 oc_result oc_encode_poll_voters(oc_wbuf *w, uint16_t version, uint64_t message_id,
                                 const oc_poll_voter *voters, uint16_t count);
 oc_result oc_encode_summarize(oc_wbuf *w, uint16_t version, const oc_summarize *m);
@@ -2459,6 +2491,10 @@ oc_result oc_decode_vote(oc_rbuf *p, oc_vote *m);
 oc_result oc_decode_poll(oc_rbuf *p, oc_poll_msg *m);
 oc_result oc_decode_list_poll_voters(oc_rbuf *p, oc_list_poll_voters *m);
 oc_result oc_decode_edit_poll(oc_rbuf *p, oc_edit_poll *m);
+oc_result oc_decode_todo_add(oc_rbuf *p, oc_todo_add *m);
+oc_result oc_decode_todo_mark(oc_rbuf *p, oc_todo_mark *m);
+oc_result oc_decode_todo_rename(oc_rbuf *p, oc_todo_rename *m);
+oc_result oc_decode_todo(oc_rbuf *p, oc_todo_msg *m);
 /* Fills up to `cap` entries; *out_count is how many the frame said. */
 oc_result oc_decode_poll_voters(oc_rbuf *p, oc_poll_voter *voters, uint16_t cap,
                                 uint16_t *out_count, uint64_t *out_message_id);

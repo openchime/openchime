@@ -946,6 +946,37 @@ static void fanout_polls(int ep, conn **conns, const oc_dbres *r) {
     }
 }
 
+/* Encode one to-do entry: a TODO frame for its range of the list's tasks. */
+static int encode_todo_entry(oc_wbuf *w, const struct oc_replay_todo *e) {
+    static oc_todo_msg m;
+    memset(&m, 0, sizeof m);
+    m.message_id = e->message_id;
+    m.channel_id = e->channel_id;
+    m.author_id = e->author_id;
+    m.title = oc_slice_str(e->title ? e->title : "");
+    m.total = e->total;
+    m.first = e->first;
+    m.n = e->n;
+    for (uint8_t i = 0; i < e->n; i++) {
+        m.tasks[i].name = oc_slice_str(e->tasks[i].name ? e->tasks[i].name : "");
+        m.tasks[i].description = oc_slice_str(e->tasks[i].desc ? e->tasks[i].desc : "");
+        m.tasks[i].done = e->tasks[i].done;
+        m.tasks[i].done_by = e->tasks[i].done_by;
+        m.tasks[i].done_at_ms = e->tasks[i].done_at_ms;
+    }
+    return oc_encode_todo(w, OC_PROTOCOL_VERSION, &m) == OC_OK;
+}
+
+/* A result's to-do lists, to its members, after its polls. */
+static void fanout_todos(int ep, conn **conns, const oc_dbres *r) {
+    for (size_t i = 0; i < r->n_rtodo; i++) {
+        oc_wbuf w;
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (!encode_todo_entry(&w, &r->rtodo[i])) break;
+        fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, w.len);
+    }
+}
+
 /* Write `buf` to every connection `uid` holds but the one `except_conn` names. */
 static void send_to_user(int ep, conn **conns, uint64_t uid, uint64_t except_conn,
                          const uint8_t *buf, size_t len) {
@@ -3259,6 +3290,35 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->message_id = v.message_id;
             memcpy(j->poll_picks, v.picks, v.count);
             j->n_poll_picks = v.count;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_TODO_ADD || hdr.msg_type == OC_MSG_TODO_MARK ||
+            hdr.msg_type == OC_MSG_TODO_RENAME) {
+            /* Working a to-do list: every rule is the writer's (process_todo). */
+            oc_job *j = NULL;
+            if (hdr.msg_type == OC_MSG_TODO_ADD) {
+                oc_todo_add ta;
+                if (oc_decode_todo_add(&p, &ta) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_TODO_ADD, c->conn_id))) return -1;
+                j->channel_id = ta.channel_id; j->message_id = ta.message_id;
+                j->todo_name = slice_dup(ta.name); j->todo_desc = slice_dup(ta.description);
+                if (!j->todo_name || !j->todo_desc) { oc_job_free(j); return -1; }
+            } else if (hdr.msg_type == OC_MSG_TODO_MARK) {
+                oc_todo_mark tm;
+                if (oc_decode_todo_mark(&p, &tm) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_TODO_MARK, c->conn_id))) return -1;
+                j->channel_id = tm.channel_id; j->message_id = tm.message_id;
+                j->todo_task = tm.task; j->todo_done = tm.done;
+            } else {
+                oc_todo_rename tr;
+                if (oc_decode_todo_rename(&p, &tr) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_TODO_RENAME, c->conn_id))) return -1;
+                j->channel_id = tr.channel_id; j->message_id = tr.message_id;
+                j->todo_name = slice_dup(tr.title);
+                if (!j->todo_name) { oc_job_free(j); return -1; }
+            }
+            j->user_id = c->user_id;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -6777,6 +6837,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             }
             fanout_actions(ep, conns, r);   /* REQ-058 */
             fanout_polls(ep, conns, r);     /* REQ-225 */
+            fanout_todos(ep, conns, r);     /* a "/todo" message's list */
             if (demo_ok(OC_DL_PUSH, 0)) oc_push_notify(cur_push(), r->channel_id, r->author_id, r->message_id, 0);
             /* Link previews (REQ-222): queue this body's URLs for fetching.
              * Off the hot path — the fetch completes as an UNFURL_STORED
@@ -6847,6 +6908,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         if (oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &b) == OC_OK) {
             fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, w.len);
             fanout_actions(ep, conns, r);   /* the action came back with its body (REQ-058) */
+            fanout_todos(ep, conns, r);     /* and a list with its message */
         }
         break;
     }
@@ -7240,6 +7302,22 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
          * member keeping the selection they had (REQ-225). */
         fanout_polls(ep, conns, r);
         break;
+    case OC_RES_TODO:
+        /* A list changed: its whole state to the conversation. */
+        fanout_todos(ep, conns, r);
+        break;
+    case OC_RES_TODO_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        uint8_t ctx[8];
+        for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->message_id >> (56 - 8 * i));
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_slice cs = { ctx, sizeof ctx };
+        oc_error e = { r->err_code, 0, cs, oc_slice_str("to-do change refused") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
     case OC_RES_POLL_VOTERS: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
@@ -7567,6 +7645,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                 }
             fanout_actions(ep, conns, r);   /* REQ-058 */
             fanout_polls(ep, conns, r);     /* REQ-225 */
+            fanout_todos(ep, conns, r);
             fanout_thread_meta(ep, conns, r);   /* the parent's count and repliers (REQ-060) */
             /* And the notify decision, which a reply never produced at all
              * (REQ-061): the root goes with it, so the emitter can notify the
@@ -7647,6 +7726,11 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             if (encode_poll_entry(&w, &r->rpoll[i], 1)) send_bytes(ep, conns, fd, g_enc, w.len);
         }
+        /* And their to-do lists. */
+        for (size_t i = 0; i < r->n_rtodo && conns[fd]; i++) {
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            if (encode_todo_entry(&w, &r->rtodo[i])) send_bytes(ep, conns, fd, g_enc, w.len);
+        }
         if (!conns[fd]) break;
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_thread th = { r->parent_id, (uint32_t)r->n_thread, r->truncated };
@@ -7670,6 +7754,14 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             ents[i].action = r->search[i].action;   /* REQ-058 */
             ents[i].rank = r->search[i].rank;
         }
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        /* A result that is a to-do list carries its state, ahead of the
+         * results, so a client has it by the time it shows them. */
+        for (size_t i = 0; i < r->n_rtodo && conns[c->fd]; i++) {
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            if (encode_todo_entry(&w, &r->rtodo[i])) send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (!conns[c->fd]) { free(ents); break; }
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_search_results sr = { (uint16_t)n, ents, r->truncated };
         oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &sr);
@@ -8932,7 +9024,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
  * link previews, the forwards, the actions and the polls for them -- a
  * BROADCAST carries none of those, so a replay without them loses each on
  * reload -- then BACKFILL_DONE. */
-enum { BF_MSG, BF_META, BF_PIN, BF_SAVED, BF_COLLAPSED, BF_REACT, BF_UNFURL, BF_FWD, BF_ACT, BF_POLL, BF_DONE, BF_END };
+enum { BF_MSG, BF_META, BF_PIN, BF_SAVED, BF_COLLAPSED, BF_REACT, BF_UNFURL, BF_FWD, BF_ACT, BF_POLL, BF_TODO, BF_DONE, BF_END };
 
 /* Encode the head result's next frame into g_enc: its length, or 0 when the
  * result has no frames left. */
@@ -9038,9 +9130,16 @@ static size_t backfill_next(conn *c) {
         case BF_POLL: {
             /* Polls (REQ-225), down this connection only, so each carries the
              * requester's own selection. */
-            if (i >= r->n_rpoll) { c->bf_phase = BF_DONE; c->bf_i = 0; continue; }
+            if (i >= r->n_rpoll) { c->bf_phase = BF_TODO; c->bf_i = 0; continue; }
             c->bf_i = i + 1;
             if (!encode_poll_entry(&w, &r->rpoll[i], 1)) continue;
+            return w.len;
+        }
+        case BF_TODO: {
+            /* To-do lists, each as it stands now. */
+            if (i >= r->n_rtodo) { c->bf_phase = BF_DONE; c->bf_i = 0; continue; }
+            c->bf_i = i + 1;
+            if (!encode_todo_entry(&w, &r->rtodo[i])) continue;
             return w.len;
         }
         case BF_DONE: {

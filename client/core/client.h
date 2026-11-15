@@ -316,6 +316,15 @@ int  oc_client_post_poll(oc_client *c, uint64_t channel_id, uint64_t parent_id, 
                          const char *const *options, uint8_t n, uint8_t flags, uint64_t close_at_ms);
 /* Vote: `picks` is the whole selection, option indexes; n 0 withdraws it. */
 void oc_client_vote(oc_client *c, uint64_t channel_id, uint64_t message_id, const uint8_t *picks, uint8_t n);
+/* To-do lists (todo.h): a message whose body is "/todo <title>" and a task per
+ * line is one; these work it. The daemon answers with the list's new state to
+ * the whole conversation (the model's msg->todo), or an error. Marking states
+ * the result wanted, so marks made at once by two people agree. Only the
+ * list's author may rename it. */
+void oc_client_todo_add(oc_client *c, uint64_t channel_id, uint64_t message_id,
+                        const char *name, const char *description);
+void oc_client_todo_mark(oc_client *c, uint64_t channel_id, uint64_t message_id, uint16_t task, int done);
+void oc_client_todo_rename(oc_client *c, uint64_t channel_id, uint64_t message_id, const char *title);
 /* Who voted (refused by the daemon for an anonymous poll): fills the model's
  * voterlist, as the who-reacted list is filled. */
 void oc_client_list_poll_voters(oc_client *c, uint64_t channel_id, uint64_t message_id);

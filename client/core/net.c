@@ -577,6 +577,15 @@ static void xfer_reset(oc_xfer *x) {
 
 /* Emit OC_EV_ATTACHMENT events for a message's attachment list (BROADCAST /
  * THREAD_REPLY), each folded onto its message by the model. */
+/* A wire string as a heap C string (never NULL on success). */
+static char *slice_text(oc_slice s) {
+    char *t = malloc(s.len + 1);
+    if (!t) return NULL;
+    if (s.len) memcpy(t, s.ptr, s.len);
+    t[s.len] = '\0';
+    return t;
+}
+
 static void push_attachments(oc_queue *to_ui, uint64_t channel_id, uint64_t message_id,
                              const oc_attach_entry *att, uint16_t n) {
     for (uint16_t i = 0; i < n && i < OC_MAX_ATTACH; i++) {
@@ -1702,6 +1711,36 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     }
                     oc_queue_push(to_ui, e);
                 } else {
+                    oc_ev_free(e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_TODO) {
+            /* A to-do list's state, one range of its tasks per frame. */
+            static oc_todo_msg tm;
+            if (oc_decode_todo(&p, &tm) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_TODO);
+                oc_todo_view *v = e ? calloc(1, sizeof *v) : NULL;
+                if (v) v->tasks = calloc(tm.n ? tm.n : 1, sizeof *v->tasks);
+                if (e && v && v->tasks) {
+                    e->todo = v;
+                    e->channel_id = tm.channel_id;
+                    e->message_id = tm.message_id;
+                    e->todo_first = tm.first;
+                    e->todo_n = tm.n;
+                    v->author_id = tm.author_id;
+                    v->total = tm.total;
+                    v->cap = tm.n;
+                    v->title = slice_text(tm.title);
+                    for (uint8_t i = 0; i < tm.n; i++) {
+                        v->tasks[i].name = slice_text(tm.tasks[i].name);
+                        v->tasks[i].desc = slice_text(tm.tasks[i].description);
+                        v->tasks[i].done = tm.tasks[i].done;
+                        v->tasks[i].done_by = tm.tasks[i].done_by;
+                        v->tasks[i].done_at_ms = tm.tasks[i].done_at_ms;
+                    }
+                    oc_queue_push(to_ui, e);
+                } else {
+                    if (v) { free(v->tasks); free(v); }
                     oc_ev_free(e);
                 }
             }
@@ -3860,6 +3899,23 @@ static int run_connection(oc_net *n, int reconnecting,
                 memcpy(v.picks, c->poll_picks, v.count);
                 if (oc_encode_vote(&w, OC_PROTOCOL_VERSION, &v) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_TODO_ADD || c->type == OC_CMD_TODO_MARK || c->type == OC_CMD_TODO_RENAME) {
+                uint8_t buf[OC_TODO_NAME_MAX + OC_TODO_DESC_MAX + 64];
+                oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_result er;
+                if (c->type == OC_CMD_TODO_ADD) {
+                    oc_todo_add ta = { c->channel_id, c->message_id, oc_slice_str(c->body ? c->body : ""),
+                                       oc_slice_str(c->body2 ? c->body2 : "") };
+                    er = oc_encode_todo_add(&w, OC_PROTOCOL_VERSION, &ta);
+                } else if (c->type == OC_CMD_TODO_MARK) {
+                    oc_todo_mark tm = { c->channel_id, c->message_id, c->uses, c->op ? 1 : 0 };
+                    er = oc_encode_todo_mark(&w, OC_PROTOCOL_VERSION, &tm);
+                } else {
+                    oc_todo_rename tr = { c->channel_id, c->message_id, oc_slice_str(c->body ? c->body : "") };
+                    er = oc_encode_todo_rename(&w, OC_PROTOCOL_VERSION, &tr);
+                }
+                if (er == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_EDIT_POLL) {
                 uint8_t *buf = malloc(OC_MAX_FRAME_SIZE);

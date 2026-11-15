@@ -36,7 +36,7 @@ credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
 **0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
-(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets; **0079** (§3br) blocks and DM privacy; **0080** (§3bs) profile fields; **0081** (§3bt) out of office; **0082** (§3bu) channel managers; **0083** (§3bv) custom emoji aliases; **0084** (§3bw) the channel of an audit entry.
+(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets; **0079** (§3br) blocks and DM privacy; **0080** (§3bs) profile fields; **0081** (§3bt) out of office; **0082** (§3bu) channel managers; **0083** (§3bv) custom emoji aliases; **0084** (§3bw) the channel of an audit entry; **0085** (§3bx) to-do lists.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -2172,3 +2172,49 @@ moderated message or member in it (`message.delete`, `message.restore`,
 `message.move`, the channel the message moved to, and `channel.member.remove`).
 NULL for every other entry and for every entry written before. *Read* by
 `AUDIT_QUERY`, whose `AUDIT_PAGE` entries carry it (PROTOCOL.md, protocol 46).
+
+## 3bx. Migration 0085 — to-do lists
+
+```sql
+CREATE TABLE todo_lists (
+  message_id    INTEGER PRIMARY KEY REFERENCES messages(id),
+  channel_id    INTEGER NOT NULL REFERENCES channels(id),
+  author_id     INTEGER NOT NULL REFERENCES users(id),
+  title         TEXT    NOT NULL,
+  created_at_ms INTEGER NOT NULL);
+CREATE TABLE todo_tasks (
+  message_id    INTEGER NOT NULL REFERENCES messages(id),
+  idx           INTEGER NOT NULL,
+  name          TEXT    NOT NULL,
+  description   TEXT    NOT NULL DEFAULT '',
+  done          INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0,1)),
+  done_by       INTEGER REFERENCES users(id),
+  done_at_ms    INTEGER,
+  PRIMARY KEY (message_id, idx),
+  UNIQUE (message_id, name));
+```
+
+A to-do list is a message whose body starts `/todo` and a title, each following
+line a task (PROTOCOL.md §5.16o). *Keyed on the message*, as `polls` (§3bd) is:
+the list is placed, permissioned, moved and deleted as its message is. One
+`todo_lists` row per list; `title` is the author's to rename, at most 250 bytes,
+and starts as the body's first line. `todo_tasks` holds a row per task, numbered
+from 0 in the order added: a task is named by `idx`, which never changes, since
+tasks are only ever added at the end. `name` (at most 250 bytes, not blank) is
+unique in its list, `description` at most 1,000 bytes; neither changes once
+added. At most 200 tasks a list. `done_by` and `done_at_ms` are who marked a
+task done and when, NULL while it is not done.
+
+*Both tables reference `messages(id)` directly*, not each other, for the reason
+`polls` gives: the purge of a channel (§3bb) clears each table holding a
+`message_id` in creation order. `channel_id` follows a moved message (`MOVE_MESSAGE`), as `polls.channel_id`
+does.
+
+*Written* in the send's own transaction: the writer parses a `SEND` or
+`SEND_REPLY` body that starts `/todo` and stores the list beside the message, or
+refuses the send. Adding, marking and renaming are each one statement of their
+own. Marking writes the state asked for and changes nothing when the task is
+already in it, so two people marking a task at once agree. *A delete leaves the
+rows*: every read joins a message that stands, so a deleted message's list is
+never sent, and a restore brings it back as it was. An encrypted DM's body is not
+the daemon's to read, so it never holds a list.
