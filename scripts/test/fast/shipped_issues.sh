@@ -4,9 +4,10 @@
 # exactly the issues the commits between them name, each once, with the pull
 # request's squash suffix not mistaken for one, plus the issue of the
 # documentation the Release N snapshot carried; close_shipped_issues.sh would
-# close that list; and send_notes.sh --dry-run, with the tracker replaced by a
-# fixture, prints the payload the control plane takes, its types following
-# the labels.
+# close the open ones of that list, and would remove each workflow label an
+# issue of it carries, closed already or not, leaving its type and `parked`;
+# and send_notes.sh --dry-run, with the tracker replaced by a fixture, prints
+# the payload the control plane takes, its types following the labels.
 #
 # Needs: git and jq. Run by: scripts/test/fast/source.sh (make test).
 set -uo pipefail
@@ -49,11 +50,23 @@ got=$(run "$root/scripts/release/shipped_issues.sh" release-1 2>/dev/null | tr '
 run "$root/scripts/release/shipped_issues.sh" release-9 >/dev/null 2>&1 \
   && fail "an unknown tag was read as nothing shipped"
 
-# The tracker: 2 is a bug, 3 an enhancement, 4 neither; all open.
+# The tracker: 2 is a bug in review, 3 an enhancement with no workflow label,
+# 4 neither, parked and waiting for a release, and closed already. An issue is
+# answered as the API gives it and read with the caller's own --jq, so the
+# script's choice of labels is what is tested.
 cat > "$tmp/gh" <<'EOF'
 #!/usr/bin/env bash
 case "$1 $2" in
-  "api repos/"*) printf 'open\tfalse\n'; exit 0 ;;
+  "api repos/"*)
+    case "${2##*/}" in
+      2) j='{"state":"open","labels":[{"name":"bug"},{"name":"in-review"}]}' ;;
+      3) j='{"state":"open","labels":[{"name":"enhancement"}]}' ;;
+      *) j='{"state":"closed","labels":[{"name":"parked"},{"name":"pending-deployment"}]}' ;;
+    esac
+    q=.
+    while [ $# -gt 0 ]; do [ "$1" = --jq ] && q="$2"; shift; done
+    jq -r "$q" <<<"$j"
+    exit 0 ;;
 esac
 case "$3" in
   2) l='[{"name":"bug"},{"name":"in-review"}]' ;;
@@ -64,9 +77,12 @@ printf '{"title":"Issue %s \\"quoted\\"","labels":%s}\n' "$3" "$l"
 EOF
 chmod +x "$tmp/gh"
 
-got=$(run env PATH="$tmp:$PATH" "$root/scripts/release/close_shipped_issues.sh" release-2 --dry-run 2>/dev/null \
-      | sed -n 's/^would close //p' | tr '\n' ' ')
-[ "$got" = "${p}-2 ${p}-3 ${p}-4 " ] || fail "close_shipped_issues would close '$got'"
+dry=$(run env PATH="$tmp:$PATH" "$root/scripts/release/close_shipped_issues.sh" release-2 --dry-run 2>/dev/null)
+got=$(sed -n 's/^would close //p' <<<"$dry" | tr '\n' ' ')
+[ "$got" = "${p}-2 ${p}-3 " ] || fail "close_shipped_issues would close '$got', not the two open issues"
+got=$(sed -n 's/^would remove //p' <<<"$dry" | tr '\n' ',')
+[ "$got" = "in-review from ${p}-2,pending-deployment from ${p}-4," ] \
+  || fail "close_shipped_issues would remove '$got': the workflow label of each issue that carries one, and no type or parked"
 
 payload=$(run env GH="$tmp/gh" "$root/scripts/release/send_notes.sh" 2 abc1234 --dry-run 2>/dev/null)
 shape=$(jq -c '[.release, .build_id, (.published_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$")),

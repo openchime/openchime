@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Close the issues a release shipped.
+# Close the issues a release shipped, and remove each workflow label they carry.
 #
 #   scripts/release/close_shipped_issues.sh <release-tag> [--dry-run]
 #   scripts/release/close_shipped_issues.sh --range <from>..<to> [--dry-run]
@@ -19,6 +19,11 @@
 # A subject names its issue by its prefix: OC-N is an issue on
 # openchime/openchime, closed with GH_TOKEN (which must be able to close issues
 # there; ISSUES_REPO overrides the repository).
+#
+# A shipped issue is no longer in review or waiting for a release, so its
+# workflow label goes when it closes, and from one that is closed already; its
+# type and `parked` stay. A label that cannot be removed is a warning, and the
+# issue is closed all the same.
 #
 # NOTHING HERE FAILS THE RELEASE. By the time this runs the packages are live, and
 # an API hiccup must not brand a good release failed -- every path warns and exits 0.
@@ -59,6 +64,8 @@ fi
 
 oc_repo="${ISSUES_REPO:-openchime/openchime}"
 token="${GH_TOKEN:-}"
+# The workflow labels (docs/CONTRIBUTING.md); type labels and parked stay.
+workflow_labels='in-review|pending-deployment|in-progress|ready|needs-grooming'
 
 echo "closing issues shipped in $what ($(printf '%s\n' "$issues" | wc -l) issues)"
 while read -r num; do
@@ -66,7 +73,7 @@ while read -r num; do
   ref="OC-${num}"
   repo="$oc_repo"
 
-  if ! meta=$(GH_TOKEN="$token" gh api "repos/${repo}/issues/${num}" --jq '[.state, (.pull_request != null)] | @tsv' 2>/dev/null); then
+  if ! meta=$(GH_TOKEN="$token" gh api "repos/${repo}/issues/${num}" --jq "[.state, (.pull_request != null), ([.labels[].name | select(test(\"^(${workflow_labels})\$\"))] | join(\" \"))] | @tsv" 2>/dev/null); then
     warn "${ref}: could not read the issue; left open"
     continue
   fi
@@ -76,6 +83,16 @@ while read -r num; do
     warn "${ref} is a pull request, not an issue; left alone"
     continue
   fi
+  # Its workflow label goes with it, closed already or not.
+  for label in $(printf '%s' "$meta" | cut -f3); do
+    if [ "$dry" = 1 ]; then
+      echo "would remove ${label} from ${ref}"
+    elif GH_TOKEN="$token" gh issue edit "$num" --repo "$repo" --remove-label "$label" >/dev/null 2>&1; then
+      echo "removed ${label} from ${ref}"
+    else
+      warn "${ref}: could not remove ${label}"
+    fi
+  done
   if [ "$state" = "closed" ]; then
     echo "${ref} already closed"
     continue

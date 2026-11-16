@@ -30,7 +30,8 @@ setting).
   commit whose subject names the issue. The issue **closes when its release
   ships**: the release reads the issue from each shipped commit's subject, and
   from the documentation it carries onto `main`, and closes it with a comment
-  naming the release. A merge does not close it — merged
+  naming the release, removing its workflow label (`in-review`,
+  `pending-deployment`) as it does. A merge does not close it — merged
   is not shipped. The PR body stays **empty**: the issue and the commit already
   say everything ("Before a pull request").
 - **Merge with a squash merge** once the required check passes ("CI") — no
@@ -287,7 +288,8 @@ prerelease; a release takes one release-candidate and publishes the same
 binaries, numbered N, to apt, dnf, the container registries and the GitHub
 release (the tarballs and the Windows installer), appends a `Release N`
 snapshot to `main`, closes the issues it shipped, those of the
-documentation it carries included, and sends the list of them, each as filed,
+documentation it carries included, removes the workflow label each one
+carries (from one closed already too; its type and `parked` stay), and sends the list of them, each as filed,
 to the control plane for the release notes (`release-candidate.yml`,
 `release.yml`; its `finish` job sends to the
 address the `CONTROL_PLANE_URL` repository variable names). Each release-candidate, release and
@@ -307,7 +309,7 @@ A release takes one release-candidate, by its tag:
 |---|---|---|
 | `prepare` | `release` | Refuses any ref but a release-candidate's tag; resolves it to its commit and number; checks every credential and the public tracker's token; fetches the stored build and verifies it; checks the number is the next one and that `main` can take the commit; then, last, reserves the number as the `release-N` tag. |
 | `deploy` | `release` | Publishes the packages the release-candidate wrapped under N (`.deb`, `.rpm`, tarballs; `prepare` refuses a build wrapped under another number), builds the Windows installer and MSIX (signed when configured), moves `main`, publishes the apt and dnf repositories to both buckets, the GitHub release and the images, then verifies what it published (`scripts/release/smoke.sh`). |
-| `finish` | `release` | Closes the shipped issues, sends the release notes, removes the release-candidates of N, and copies `main`, `staging`, the tag and the release to the public repository; a failure in any part is reported and the rest still run. |
+| `finish` | `release` | Closes the shipped issues and removes their workflow labels, sends the release notes, removes the release-candidates of N, and copies `main`, `staging`, the tag and the release to the public repository; a failure in any part is reported and the rest still run. |
 | `unreserve` | `release` | Only after a failure before anything was published: returns the number. |
 
 There is no dry run. Everything a release must be is checked in `prepare`
