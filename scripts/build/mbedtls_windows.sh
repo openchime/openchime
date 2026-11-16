@@ -4,6 +4,10 @@
 # separate tree from the native build so the two don't clobber each other.
 # Nothing is downloaded. Gitignored output; reproduced by this script.
 set -euo pipefail
+# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# is given a literal one on its own command line, and no -j of a calling make
+# reaches it through the environment.
+unset MAKEFLAGS MFLAGS
 
 # The version committed in third_party/mbedtls; the build directory carries it.
 MBEDTLS_VERSION=3.6.7
@@ -47,7 +51,7 @@ if [ ! -f "${SRC}/library/libmbedtls.a" ]; then
     mv "${SRC}.new" "${SRC}"
   fi
   echo "build_mbedtls_windows: cross-building static libraries (mingw)"
-  make -C "${SRC}" -j"$(nproc)" CC="${CC}" AR="${AR}" WINDOWS_BUILD=1 lib
+  make -C "${SRC}" -j1 CC="${CC}" AR="${AR}" WINDOWS_BUILD=1 lib
 fi
 
 echo "build_mbedtls_windows: done: libs in third_party/${SRC}/library"

@@ -4,12 +4,11 @@
 # need and calls them, and the workflows call only the targets.
 
 # Unit + in-process integration tests, one binary (docs/TESTING.md §2). Built
-# -O0 -g; a non-zero exit fails the run. The suites run side by side,
-# as many at once as there are CPUs (OC_TEST_JOBS, tests/main.c): they are nearly
-# all waiting, so the run takes about as long as its slowest suite. The binary
+# -O0 -g; a non-zero exit fails the run. The suites run one after another, in
+# one process (scripts/test/fast/suites.sh sets OC_TEST_JOBS=1; docs/TESTING.md,
+# "One build at a time"). The binary
 # always carries read-aloud's and voice input's test paths (stub engines) and
 # never needs ONNX Runtime, llama.cpp or Emscripten, whatever the switches say.
-TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 TEST_INC  := $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT \
              -Itests -Iclient/gui/app -Iclient/gui/platform -Iclient/shared -Ituikit -Ithird_party/qrcodegen
 # Sorted: the daemon and the text layout both carry utf8proc, compiled once.
@@ -33,7 +32,7 @@ $(eval $(call oc_obj_rules,$(OBJ_DIR)/test,TEST_CC,$(CC_STAMP),$(TEST_VENDOR)))
 fast-test: fast-build $(TEST_BIN)
 	scripts/test/fast/source.sh
 	scripts/test/fast/actionlint.sh
-	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" scripts/test/fast/suites.sh
+	scripts/test/fast/suites.sh
 	@scripts/test/lib/tested_tree.sh record
 
 TSAN_BIN := build/tests-tsan

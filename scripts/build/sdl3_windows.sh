@@ -7,6 +7,10 @@
 # the dependency's build system stays the dependency's business, and this
 # tree's stays make.
 set -euo pipefail
+# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# is given a literal one on its own command line, and no -j of a calling make
+# reaches it through the environment.
+unset MAKEFLAGS MFLAGS
 
 SDL3_VERSION="${SDL3_VERSION:-3.4.14}"
 
@@ -79,7 +83,7 @@ EOF
     -DCMAKE_BUILD_TYPE=Release \
     -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST_LIBRARY=OFF \
     -DCMAKE_INSTALL_PREFIX="$(pwd)/${DEST}" >/dev/null
-  cmake --build "${DEST}/build" -j"$(nproc)" >/dev/null
+  cmake --build "${DEST}/build" -j1 >/dev/null
   cmake --install "${DEST}/build" >/dev/null
 fi
 

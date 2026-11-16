@@ -4,6 +4,13 @@
 # build/wasm/sdl3. Run by make (mk/web.mk), which puts the pinned Emscripten
 # on PATH; needs cmake.
 set -euo pipefail
+# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# is given a literal one on its own command line, and no -j of a calling make
+# reaches it through the environment.
+unset MAKEFLAGS MFLAGS
+# Emscripten compiles its own system libraries on first use, several at once
+# unless told: one.
+export EMCC_CORES=1
 SDL3_VERSION="${SDL3_VERSION:-3.4.14}"
 SDL3_SHA256_3_4_14="30d4aa2b3037718142b32dffd4e72f917ebb6cc5227150e7bb9c45efb2153aeb"
 _sum_var="SDL3_SHA256_${SDL3_VERSION//./_}"
@@ -24,6 +31,6 @@ fi
 emcmake cmake -S "SDL3-${SDL3_VERSION}" -B cmake-build -DCMAKE_BUILD_TYPE=Release \
   -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_INSTALL_TESTS=OFF \
   -DSDL_PTHREADS=ON -DCMAKE_INSTALL_PREFIX="$OUT" -DCMAKE_C_FLAGS="-pthread" > cmake.log 2>&1
-cmake --build cmake-build -j"$(nproc)" >> cmake.log 2>&1
+cmake --build cmake-build -j1 >> cmake.log 2>&1
 cmake --install cmake-build >> cmake.log 2>&1
 echo "build_sdl3_wasm: built $OUT/lib/libSDL3.a"

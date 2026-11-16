@@ -101,9 +101,11 @@ jobs:
     name: stage
     needs: test
     runs-on: ubuntu-24.04
-    # A warm run takes about 15 minutes; a cold speech cache compiles ONNX
-    # Runtime, about 25 minutes for each architecture.
-    timeout-minutes: 75
+    # With both of the runner's CPUs compiling, a warm run took about 15
+    # minutes and a cold speech cache, which compiles ONNX Runtime, about 25
+    # more for each architecture. One file at a time, on one CPU, is allowed
+    # twice that.
+    timeout-minutes: 150
     environment: release
     permissions:
       contents: read
@@ -246,10 +248,8 @@ jobs:
           fi
 
       # --- The tools and the shared caches -----------------------------------------
-      # Every CPU the runner has, for every make below and the makes they
-      # start (the Makefile is safe under -j; locally nothing changes).
-      - name: Use every CPU for make
-        run: echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
+      # No MAKEFLAGS: every build compiles one file at a time here as anywhere
+      # (docs/TESTING.md, "One build at a time").
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0   # the release-* tags: the number below, and the prune at the end

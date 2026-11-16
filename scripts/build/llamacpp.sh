@@ -13,9 +13,13 @@
 #
 # On x86-64 the CPU code targets x86-64-v3 (AVX2, FMA, F16C: Intel Haswell and AMD
 # Excavator, 2013-2015, onwards); on arm64 it uses the ARMv8 baseline (NEON).
-# Needs CMake 3.14+, a C++17 compiler and curl. A few minutes with four jobs.
+# Needs CMake 3.14+, a C++17 compiler and curl. Built one file at a time.
 # CC and CXX are honoured.
 set -euo pipefail
+# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# is given a literal one on its own command line, and no -j of a calling make
+# reaches it through the environment.
+unset MAKEFLAGS MFLAGS
 
 LLAMA_VERSION="0.5.0"
 LLAMA_SRC_SHA256="fef9ed754f4e031fb5c663c29260feda4ebc241abb68d64a81c0f1df5f1748e2"
@@ -61,7 +65,6 @@ esac
 # Cross-compiling: tell CMake the target, so ggml picks its CPU code by it.
 [ -z "${OC_ARCH:-}" ] || [ "${OC_ARCH}" = "$(uname -m)" ] || CPU_FLAGS+=(-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR="${OC_ARCH}")
 
-JOBS="${LLAMA_JOBS:-4}"
 cmake -S "${SRC}" -B "${SRC}/build" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
@@ -72,7 +75,7 @@ cmake -S "${SRC}" -B "${SRC}/build" \
   -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF \
   -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
   -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF
-cmake --build "${SRC}/build" --target llama -j "${JOBS}"
+cmake --build "${SRC}/build" --target llama -j1
 
 rm -rf "${DEST}" && mkdir -p "${DEST}/lib" "${DEST}/include"
 # One archive: every object of libllama and the ggml archives it needs.

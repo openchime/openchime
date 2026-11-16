@@ -16,10 +16,15 @@
 #
 # Needs CMake 3.28+, a C++17 compiler, python3 and curl. Its own dependencies
 # (abseil, flatbuffers, protobuf-lite, Eigen, ...) are downloaded by its CMake at
-# the URLs and hashes pinned in its cmake/deps.txt. About 22 minutes with three
-# jobs on an i5-1335U; peak memory is roughly 1 GB per job, so ORT_JOBS defaults to
-# what the machine's memory allows. CC and CXX are honoured.
+# the URLs and hashes pinned in its cmake/deps.txt. Built one file at a time
+# (peak memory is roughly 1 GB a compile), which is slow: about 22 minutes with
+# three at once on an i5-1335U, so about three times that. CC and CXX are
+# honoured.
 set -euo pipefail
+# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# is given a literal one on its own command line, and no -j of a calling make
+# reaches it through the environment.
+unset MAKEFLAGS MFLAGS
 
 MODE="${1:-static}"
 ORT_VERSION="1.30.0"
@@ -133,23 +138,17 @@ if [ ! -d "${WORK}/py/flatbuffers" ]; then
   python3 -m zipfile -e "${WORK}/${FLATBUFFERS_WHEEL}" "${WORK}/py"
 fi
 
-if [ -z "${ORT_JOBS:-}" ]; then
-  mem_gb=$(awk '/MemTotal/ { printf "%d", $2 / 1048576 }' /proc/meminfo)
-  ORT_JOBS=$(( mem_gb > 1 ? mem_gb - 1 : 1 ))
-  [ "${ORT_JOBS}" -le "$(nproc)" ] || ORT_JOBS="$(nproc)"
-fi
-
 TARGET_ARGS=()
 if [ "${PROTOC_ONLY}" = 1 ]; then
   TARGET_ARGS=(--target protoc)
-  echo "build_onnxruntime: building protoc (host) with ${ORT_JOBS} jobs"
+  echo "build_onnxruntime: building protoc (host), one file at a time"
 else
-  echo "build_onnxruntime: building ONNX Runtime ${ORT_VERSION} (minimal, static) with ${ORT_JOBS} jobs"
+  echo "build_onnxruntime: building ONNX Runtime ${ORT_VERSION} (minimal, static), one file at a time"
 fi
 (
   cd "${WORK}/src"
   PYTHONPATH="$(cd ../py && pwd)" python3 tools/ci_build/build.py \
-    --build_dir "$(cd .. && pwd)/out" --config MinSizeRel --update --build --parallel "${ORT_JOBS}" "${TARGET_ARGS[@]}" \
+    --build_dir "$(cd .. && pwd)/out" --config MinSizeRel --update --build --parallel 1 "${TARGET_ARGS[@]}" \
     --skip_tests --skip_pip_install --skip_submodule_sync --compile_no_warning_as_error \
     --cmake_generator "Unix Makefiles" \
     --minimal_build --include_ops_by_config "${OPS}" --enable_reduced_operator_type_support \

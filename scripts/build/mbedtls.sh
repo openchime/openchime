@@ -15,6 +15,10 @@
 # tree is only read. The copy under third_party/ is gitignored; this script
 # reproduces it.
 set -euo pipefail
+# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# is given a literal one on its own command line, and no -j of a calling make
+# reaches it through the environment.
+unset MAKEFLAGS MFLAGS
 
 # The version committed in third_party/mbedtls; the build directories carry it.
 MBEDTLS_VERSION=3.6.7
@@ -71,7 +75,7 @@ if [ ! -f "${SRC}/library/libmbedtls.a" ]; then
   # `sources`: the configured copy alone, for another toolchain's build
   # (scripts/build/mbedtls_wasm.sh); the native libraries are not needed there.
   if [ "${1:-}" = sources ]; then echo "build_mbedtls: sources in third_party/${SRC}"; exit 0; fi
-  make -C "${SRC}" -j"$(nproc)" lib ${CC:+CC="$CC"} ${AR:+AR="$AR"}
+  make -C "${SRC}" -j1 lib ${CC:+CC="$CC"} ${AR:+AR="$AR"}
 fi
 
 echo "build_mbedtls: done: libs in third_party/${SRC}/library, headers in third_party/${SRC}/include"

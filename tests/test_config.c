@@ -511,6 +511,34 @@ static void test_reload_and_registry(void) {
         for (const cfg_row *r = OC_CFG; r->name; r++) CHECK(strcmp(r->name, x->name) != 0);
 }
 
+/* The environment's value of every row, kept and put back. Applying an
+ * EnvironmentFile sets rows in this process, and the suites after this one
+ * run in it too when they run one after another (OC_TEST_JOBS=1): they are
+ * owed the mode and the settings tests/main.c gave the run, not whatever the
+ * packaged file names, and not an environment with every row unset. */
+static char **env_keep(void) {
+    size_t n = 0;
+    for (const cfg_row *r = OC_CFG; r->name; r++) n++;
+    char **kept = calloc(n + 1, sizeof *kept);
+    if (!kept) return NULL;
+    size_t i = 0;
+    for (const cfg_row *r = OC_CFG; r->name; r++, i++) {
+        const char *v = (r->flags & CFG_PATTERN) ? NULL : getenv(r->name);
+        kept[i] = v ? strdup(v) : NULL;
+    }
+    return kept;
+}
+static void env_put_back(char **kept) {
+    size_t i = 0;
+    for (const cfg_row *r = OC_CFG; r->name; r++, i++) {
+        if (r->flags & CFG_PATTERN) continue;
+        if (kept && kept[i]) setenv(r->name, kept[i], 1);
+        else unsetenv(r->name);
+        if (kept) free(kept[i]);
+    }
+    free(kept);
+}
+
 static void test_env_file(void) {
     char err[512];
     char dir[256], pathb[320], pkg[1024];
@@ -524,6 +552,7 @@ static void test_env_file(void) {
           "  OPENCHIME_MANAGED_MAX_USERS='12'  \n"
           "export OPENCHIME_HEALTH_PORT=0\n", f);
     fclose(f);
+    char **kept = env_keep();
     unsetenv("OPENCHIME_WORKSPACE_NAME"); unsetenv("OPENCHIME_MANAGED_MAX_USERS"); unsetenv("OPENCHIME_HEALTH_PORT");
     CHECK(oc_config_apply_env_file(path, err, sizeof err) == 0);
     CHECK(oc_config_load(err, sizeof err) == 0);
@@ -541,7 +570,7 @@ static void test_env_file(void) {
     CHECK(oc_config_load(err, sizeof err) == 0);
     if (oc_config_load(err, sizeof err) != 0) printf("    packaged env: %s\n", err);
     CHECK(!strcmp(oc_config_get()->db_path, "/var/lib/openchime/openchime.db"));
-    for (const cfg_row *r = OC_CFG; r->name; r++) if (!(r->flags & CFG_PATTERN)) unsetenv(r->name);
+    env_put_back(kept);
     remove(path);
     oc_test_rmtree(dir);
     /* Back to the suite's own configuration (tests/main.c). */

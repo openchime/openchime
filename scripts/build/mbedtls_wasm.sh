@@ -5,6 +5,13 @@
 # not touch. Nothing is downloaded. Run by make (mk/web.mk), which puts the
 # pinned Emscripten on PATH.
 set -euo pipefail
+# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# is given a literal one on its own command line, and no -j of a calling make
+# reaches it through the environment.
+unset MAKEFLAGS MFLAGS
+# Emscripten compiles its own system libraries on first use, several at once
+# unless told: one.
+export EMCC_CORES=1
 cd "$(dirname "$0")/../.."
 # The version committed in third_party/mbedtls (scripts/build/mbedtls.sh).
 MBEDTLS_VERSION=3.6.7
@@ -26,5 +33,5 @@ fi
 rm -rf "$OUT"
 rsync -a --exclude '*.o' --exclude '*.a' --exclude '*.d' "$SRC/" "$OUT/"
 if [ -n "${lock_fd:-}" ]; then exec {lock_fd}>&-; fi
-emmake make -C "$OUT/library" -j"$(nproc)" static CC=emcc AR=emar CFLAGS="-O2 -pthread"
+emmake make -C "$OUT/library" -j1 static CC=emcc AR=emar CFLAGS="-O2 -pthread"
 echo "build_mbedtls_wasm: built $OUT/library/libmbed{tls,x509,crypto}.a"
