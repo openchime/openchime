@@ -130,7 +130,7 @@ static void test_limits(void) {
     if (!body) { CHECK(0); return; }
     int o = snprintf(body, BIG + 64, "{\"text\":\"");
     for (int i = 0; i < BIG; i++) body[o++] = (i % 50 == 49) ? ' ' : 'a';
-    snprintf(body + o, 64, "\"}");
+    snprintf(body + o, (size_t)(BIG + 64 - o), "\"}");
     char *req = malloc(BIG + 256);
     if (!req) { free(body); CHECK(0); return; }
     int n = snprintf(req, BIG + 256, "POST /webhook/x HTTP/1.1\r\nContent-Type: application/json\r\n"
