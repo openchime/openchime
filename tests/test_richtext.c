@@ -7,6 +7,7 @@
 
 #include "check.h"
 #include "richtext.h"
+#include "lexer.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -209,7 +210,10 @@ static void test_autolink(void) {
     CHECK(content_spans("javascript:alert(1)", OC_RT_LINK) == 0);
     CHECK(content_spans("mailto:a@b.com", OC_RT_LINK) == 0);
     CHECK(content_spans("ftp://example.com", OC_RT_LINK) == 0);
-    CHECK(content_spans("openchime://host/c/1/m/2", OC_RT_LINK) == 0);
+    /* An OpenChime permalink links, for the client to follow in the app. */
+    CHECK(span_over("see openchime:///c/3/m/4 now", "openchime:///c/3/m/4", OC_RT_LINK));
+    CHECK(content_spans("openchime:///c/3/evil", OC_RT_LINK) == 0);
+    CHECK(content_spans("openchime://host/c/1/m/2", OC_RT_LINK) == 1);     /* with a host too */
     /* A scheme with no address is not a link. */
     CHECK(content_spans("https://", OC_RT_LINK) == 0);
     /* Not at a word boundary — the guard against a scheme inside a longer token. */
@@ -292,6 +296,16 @@ static void test_labelled_links(void) {
     CHECK(content_spans("[click](javascript:alert(1))", OC_RT_LABELLED) == 0);
     CHECK(content_spans("[f](file:///etc/passwd)", OC_RT_LABELLED) == 0);
     CHECK(content_spans("[m](mailto:a@b.com)", OC_RT_LABELLED) == 0);
+    /* A permalink is a labelled link's address too, the line a move leaves. */
+    CHECK(span_over("x moved [a message](openchime:///c/7/m/9) to #b.", "a message", OC_RT_LABELLED));
+    {
+        const char *mv = "x moved [a message](openchime:///c/7/m/9) to #b.";
+        oc_rt_span sp[16]; size_t n = oc_rt_scan(mv, strlen(mv), sp, 16), off = 0, tl = 0; int got = 0;
+        for (size_t k = 0; k < n && k < 16; k++)
+            if (sp[k].style == OC_RT_LABELLED && oc_rt_target(mv, strlen(mv), &sp[k], &off, &tl))
+                got = tl == 20 && !memcmp(mv + off, "openchime:///c/7/m/9", 20);
+        CHECK(got);
+    }
 
     /* Not quite a link: literal, and a bare address inside still autolinks. */
     CHECK(content_spans("[x] (https://a.com)", OC_RT_LABELLED) == 0);
@@ -607,6 +621,47 @@ static void test_time_every_token(void) {
     free(loc);
 }
 
+/* A token in a table's cell reads as one anywhere else does (MARKDOWN.md §1c),
+ * every other byte of the table as written; and a /me line's excerpt takes the
+ * reader's 12-hour clock with its spoiler hidden. */
+static void test_time_in_tables(void) {
+    const int64_t at = 1793372400000LL;                 /* Friday 30 October 2026, 15:00 UTC */
+    oc_rt_clock utc0 = { 0, 1, 0, at };
+    const char *t = "| When <time:2026-10-30T15:00Z> | Note |\n"
+                    "|:---|---:|\n"
+                    "| <time:2026-10-30T15:00Z> and <time:2026-10-30T16:30Z> | a<br>b |\n"
+                    "| <time:2026-02-30T10:00Z> | x \\| y |";
+    char *loc = oc_rt_local_times(t, strlen(t), &utc0);
+    CHECK(loc != NULL);
+    if (loc) {
+        /* contract: the short form §1c specifies, and the table's own bytes kept */
+        CHECK(strcmp(loc, "| When 15:00 | Note |\n"
+                          "|:---|---:|\n"
+                          "| 15:00 and 16:30 | a<br>b |\n"
+                          "| <time:2026-02-30T10:00Z> | x \\| y |") == 0);
+        free(loc);
+    }
+    /* A token outside the table and one in it, in order. */
+    const char *mix = "Before <time:2026-10-30T15:00Z>\n\n| a |\n|---|\n| <time:2026-10-30T16:30Z> |";
+    loc = oc_rt_local_times(mix, strlen(mix), &utc0);
+    /* contract: the short form §1c specifies, in a table and out of one */
+    CHECK(loc && strstr(loc, "Before 15:00") && strstr(loc, "| 16:30 |") && !strstr(loc, "<time:"));
+    free(loc);
+    /* A table with no token: nothing to change. */
+    const char *none = "| a |\n|---|\n| <b> |";
+    CHECK(oc_rt_local_times(none, strlen(none), &utc0) == NULL);
+
+    /* A /me line's text on a 12-hour clock, its spoiler hidden. */
+    oc_rt_clock twelve = { 0, 0, 0, at };
+    char out[160];
+    const char *me = "leaves at <time:2026-10-30T15:00Z> for >!the airport!<";
+    oc_rt_flatten_at(me, strlen(me), &twelve, out, sizeof out);
+    /* contract: the 12-hour form §1c specifies */
+    CHECK(strstr(out, "3:00") && strstr(out, "PM") && !strstr(out, "15:00"));
+    /* contract: the covered form §1d specifies */
+    CHECK(!strstr(out, "airport") && strstr(out, "[spoiler]"));
+}
+
 /* Spoilers (MARKDOWN.md §1d): both forms, and what is not one. */
 static void test_spoilers(void) {
     oc_rt_spoiler sp[4];
@@ -621,6 +676,13 @@ static void test_spoilers(void) {
     CHECK(content_spans("a >!   !< b", OC_RT_SPOILER) == 0);
     CHECK(content_spans(">!one\ntwo!<", OC_RT_SPOILER) == 0);
     CHECK(content_spans("a >!never closed", OC_RT_SPOILER) == 0);
+    /* At a line's start, one that never closes is a quote of the rest, and
+     * hides nothing: what arrives so is read as written. (The composer will
+     * not send it; written `\>!`, it is the characters.) */
+    CHECK(content_spans(">!UNCLOSED stays a quote", OC_RT_SPOILER) == 0);
+    CHECK(content_spans(">!UNCLOSED stays a quote", OC_RT_QUOTE) == 1);
+    CHECK(oc_rt_open_spoiler(">!UNCLOSED", 10) == 0);
+    CHECK(oc_rt_open_spoiler("\\>!UNCLOSED", 11) == (size_t)-1);
     CHECK(content_spans("`>!code!<`", OC_RT_SPOILER) == 0);
     CHECK(content_spans("```\n>!code!<\n```", OC_RT_SPOILER) == 0);
     CHECK(oc_rt_spoilers("x >! y", 6, sp, 4) == 0);
@@ -908,6 +970,51 @@ static void test_spoiler_cell_excerpt(void) {
 }
 
 /* Every excerpt hides what a spoiler hides. */
+/* The snippet lexer (lexer.h, REQ-226): each language's keywords, strings,
+ * comments and numbers, as spans of exactly those bytes; an unknown language
+ * all plain. `want` lists the coloured spans in order as "kind:text" joined by
+ * '|'. */
+static int lexed_as(int lang, const char *src, const char *want) {
+    oc_lex_tok t[64];
+    size_t n = oc_lex(lang, src, strlen(src), t, 64);
+    char got[1024] = "";
+    size_t o = 0;
+    for (size_t i = 0; i < n && o < sizeof got - 64; i++)
+        o += (size_t)snprintf(got + o, sizeof got - o, "%s%c:%.*s", i ? "|" : "",
+                              "PKSCN"[t[i].kind], (int)t[i].len, src + t[i].start);
+    if (strcmp(got, want) != 0) { fprintf(stderr, "  lexed %d: got [%s] want [%s]\n", lang, got, want); return 0; }
+    return 1;
+}
+static void test_lexer(void) {
+    CHECK(oc_lex_language("python") == OC_LANG_PYTHON && oc_lex_language("PY") == OC_LANG_PYTHON);
+    CHECK(oc_lex_language("bash") == OC_LANG_SHELL && oc_lex_language("yml") == OC_LANG_YAML);
+    CHECK(oc_lex_language("cobol") == OC_LANG_NONE && oc_lex_language("") == OC_LANG_NONE);
+    /* contract: the stored name round-trips, and an unknown language is called plain text */
+    CHECK(strcmp(oc_lex_name(OC_LANG_GO), "go") == 0 && strcmp(oc_lex_label(OC_LANG_NONE), "Plain text") == 0);
+
+    CHECK(lexed_as(OC_LANG_C, "int x = 42; /* note */ return \"a\\\"b\"; // end",
+                   "K:int|N:42|C:/* note */|K:return|S:\"a\\\"b\"|C:// end"));
+    CHECK(lexed_as(OC_LANG_C, "#include <stdio.h>", "K:#include"));
+    CHECK(lexed_as(OC_LANG_PYTHON, "def f(x):  # why\n    return \"\"\"doc\nmore\"\"\" or None",
+                   "K:def|C:# why|K:return|S:\"\"\"doc\nmore\"\"\"|K:or|K:None"));
+    CHECK(lexed_as(OC_LANG_JS, "const s = `t ${a}`; let n = 3.5e2;",
+                   "K:const|S:`t ${a}`|K:let|N:3.5e2"));
+    CHECK(lexed_as(OC_LANG_SHELL, "echo 'hi' # note\nurl=a#b", "K:echo|S:'hi'|C:# note"));
+    CHECK(lexed_as(OC_LANG_JSON, "{\"a\": -1, \"b\": true, \"c\": null}",
+                   "S:\"a\"|N:-1|S:\"b\"|K:true|S:\"c\"|K:null"));
+    CHECK(lexed_as(OC_LANG_YAML, "key: \"v\"  # c\nflag: yes", "S:\"v\"|C:# c|K:yes"));
+    CHECK(lexed_as(OC_LANG_SQL, "SELECT id FROM t WHERE n = 'x' -- why",
+                   "K:SELECT|K:FROM|K:WHERE|S:'x'|C:-- why"));
+    CHECK(lexed_as(OC_LANG_GO, "func main() { var r = 'x'; fmt.Println(`raw`, 7) }",
+                   "K:func|K:var|S:'x'|S:`raw`|N:7"));
+    /* A digit inside a word is part of it; an unclosed string ends at its line. */
+    CHECK(lexed_as(OC_LANG_C, "x2 = \"open\ny", "S:\"open"));
+    /* Unknown: nothing coloured. A full array ends the pass rather than overrunning. */
+    oc_lex_tok one[1];
+    CHECK(oc_lex(OC_LANG_NONE, "int x", 5, one, 1) == 0);
+    CHECK(oc_lex(OC_LANG_C, "int long", 8, one, 1) == 1 && one[0].len == 3);
+}
+
 static void test_spoiler_excerpt(void) {
     char out[160];
     const char *b = "The killer is >!the butler!< obviously";
@@ -940,6 +1047,72 @@ static void test_spoiler_excerpt(void) {
     }
 }
 
+/* What search indexes, what a mention or keyword may be read from, and what a
+ * composer refuses to send: hidden text goes into none of them. */
+static void test_spoiler_hidden_text(void) {
+    char out[512];
+    /* Inline: the hidden text goes, its delimiters and everything else stay. */
+    const char *b = "The killer is >!the butler!< obviously";
+    size_t w = oc_rt_unspoiled(b, strlen(b), out, sizeof out);
+    /* contract: every byte is kept but the hidden ones (MARKDOWN.md §1d) */
+    CHECK(strcmp(out, "The killer is >!!< obviously") == 0 && w == strlen(out));
+    /* Labelled block: the label is shown, so it stays; the lines go. */
+    const char *k = "Before\n```spoiler Ending\nShe lives.\n```\nAfter";
+    oc_rt_unspoiled(k, strlen(k), out, sizeof out);
+    CHECK(!strstr(out, "lives") && strstr(out, "Ending") && strstr(out, "Before") && strstr(out, "After"));
+    /* No spoiler: the body as it is. */
+    /* contract: a body with no spoiler is indexed as written */
+    CHECK(oc_rt_unspoiled("plain words", 11, out, sizeof out) == 11 && strcmp(out, "plain words") == 0);
+    /* Seventy spoilers, past any bound an excerpt has: every one emptied. */
+    {
+        static char many[4096], big[4096];
+        size_t o = 0;
+        for (int i = 0; i < 70; i++) o += (size_t)snprintf(many + o, sizeof many - o, "w%02d >!H%02d!< ", i, i);
+        oc_rt_unspoiled(many, o, big, sizeof big);
+        CHECK(!strstr(big, "H0") && !strstr(big, "H69") && strstr(big, "w00") && strstr(big, "w69"));
+        CHECK(oc_rt_in_spoiler(many, o, (size_t)(strstr(many, "H69") - many)) == 1);
+    }
+    /* Cut short, never inside a character. */
+    {
+        char small[6];
+        oc_rt_unspoiled("ab\xC3\xA9xyz", 7, small, sizeof small);
+        CHECK(strcmp(small, "ab\xC3\xA9x") == 0);
+        oc_rt_unspoiled("abc\xC3\xA9", 5, small, 5);
+        CHECK(strcmp(small, "abc") == 0);
+    }
+
+    /* oc_rt_in_spoiler at the edges: the delimiters are not hidden, the first and
+     * last hidden bytes are. */
+    const char *e = "a >!bc!< d";
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 0) == 0);
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 2) == 0);          /* '>' */
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 3) == 0);          /* '!' */
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 4) == 1);          /* 'b' */
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 5) == 1);          /* 'c' */
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 6) == 0);          /* '!' of the closer */
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 9) == 0);
+    CHECK(oc_rt_in_spoiler(e, strlen(e), 99) == 0);
+
+    /* A keyword inside one is no match; the same word outside it, after it, is. */
+    size_t at = 0, n = 0;
+    const char *kw = "the >!deploy!< is done, deploy now";
+    CHECK(oc_rt_keyword_match(kw, strlen(kw), "deploy", &at, &n) == 1 && at == 24 && n == 6);
+    CHECK(oc_rt_keyword_match("only >!deploy!< here", 20, "deploy", &at, &n) == 0);
+    /* The boundary still holds past a hidden match: "redeploy" is no "deploy". */
+    CHECK(oc_rt_keyword_match(">!deploy!< redeploy", 19, "deploy", &at, &n) == 0);
+
+    /* A `>!` that opens nothing it closes. */
+    CHECK(oc_rt_open_spoiler("fine >!x!< here", 15) == (size_t)-1);
+    CHECK(oc_rt_open_spoiler("oops >!x and more", 17) == 5);
+    CHECK(oc_rt_open_spoiler(">!line one\nline two!<", 21) == 0);
+    CHECK(oc_rt_open_spoiler("escaped \\>!x", 12) == (size_t)-1);
+    CHECK(oc_rt_open_spoiler("code `>!x` here", 15) == (size_t)-1);
+    CHECK(oc_rt_open_spoiler("```\n>!x\n```", 11) == (size_t)-1);
+    CHECK(oc_rt_open_spoiler("```spoiler\nhid >!den\n```", 24) == (size_t)-1);
+    CHECK(oc_rt_open_spoiler(">!a!< then >!b", 14) == 11);
+    CHECK(oc_rt_open_spoiler("no markup at all", 16) == (size_t)-1);
+}
+
 int run_richtext_tests(void) {
     failures = 0;
     test_emphasis();
@@ -960,14 +1133,17 @@ int run_richtext_tests(void) {
     test_time_text();
     test_time_flatten();
     test_time_every_token();
+    test_time_in_tables();
     test_spoilers();
     test_spoiler_line_start();
     test_spoiler_edges();
     test_spoiler_cells();
     test_spoiler_excerpt();
     test_spoiler_cell_excerpt();
+    test_spoiler_hidden_text();
+    test_lexer();
     printf("test_richtext: emphasis, literal delimiters, escapes, code, fenced blocks, labelled links, "
            "quotes and lists, nesting, byte offsets, autolinking, truncation, tables and their cells and excerpts, "
-           "time tokens in every zone and however many, spoilers\n");
+           "time tokens in every zone and however many, spoilers, the snippet lexer in eight languages\n");
     return failures;
 }

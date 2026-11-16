@@ -63,6 +63,10 @@ void oc_netloop_set_blob_cache_floor(uint64_t bytes);
  * none. Call before oc_netloop_run. */
 void oc_netloop_set_health_port(int port);
 
+/* Connections the TLS port has closed, since the process started, because their
+ * client is outside OPENCHIME_ALLOWED_NETWORKS (REQ-192). For tests and the log. */
+uint64_t oc_netloop_refused_networks(void);
+
 /* Wire call media (REQ-150, ARCH-18/73): the bound UDP socket the loop's relay
  * runs on (relay.h), and the port it is bound to. The caller keeps the socket.
  * A loop takes it when it starts and gives it back when it stops, so set it
@@ -125,6 +129,12 @@ void oc_netloop_set_push(struct oc_push *push);
  * reports nothing. May be called while the loop runs. */
 struct oc_invite_mail;
 void oc_netloop_set_invite_mail(struct oc_invite_mail *m);
+
+/* The enrollment the address proof signs with (AUTH.md §3.6): set once the
+ * binding is active, after which POST /enroll-proof answers central's check of
+ * the address this workspace reported. NULL (the default) answers 404. Both
+ * strings must outlive the loop. May be called while the loop runs. */
+void oc_netloop_set_enrollment(const char *audience, const char *privkey_pem);
 
 /* Called once, on the loop's thread, when the listener is bound and taking
  * connections and the loop is about to serve: the moment a workspace is up. It

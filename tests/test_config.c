@@ -250,6 +250,12 @@ static void test_cross_rules(void) {
     /* The trusted proxies parse. */
     refuses("OPENCHIME_TRUSTED_PROXIES", "not an address");
     accepts("OPENCHIME_TRUSTED_PROXIES", "127.0.0.0/8");
+    /* The allowed networks (REQ-192) parse the same way, and a list that does not
+     * stops the boot; empty is everyone. */
+    refuses("OPENCHIME_ALLOWED_NETWORKS", "10.0.0.0/33");
+    refuses("OPENCHIME_ALLOWED_NETWORKS", "10.0.0.1,office");
+    accepts("OPENCHIME_ALLOWED_NETWORKS", "10.0.0.0/8, 2001:db8::/32");
+    accepts("OPENCHIME_ALLOWED_NETWORKS", "");
 
     /* The managed rows (the tests run in development mode, which takes them
      * without the ticket: the fixtures stand in for a managed box). */
@@ -496,7 +502,7 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 35);     /* OPENCHIME_MODE among them */
+    CHECK(operator_rows == 36);     /* OPENCHIME_MODE among them */
     CHECK(managed_rows == 7);
     CHECK(dev_rows == 6 + 12);      /* the daemon's six, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);

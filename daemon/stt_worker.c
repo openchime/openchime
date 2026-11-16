@@ -1,7 +1,9 @@
 /* The voice-input recognition worker (stt_worker.h). */
 #define _POSIX_C_SOURCE 200809L
 #include "stt_worker.h"
+#include "config.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -42,6 +44,62 @@ struct oc_stt_worker {
 
 static double ms_between(const struct timespec *a, const struct timespec *b) {
     return (double)(b->tv_sec - a->tv_sec) * 1000.0 + (double)(b->tv_nsec - a->tv_nsec) / 1e6;
+}
+
+#define WINDOW_RATE 16000u   /* samples a second, as the wire carries them */
+
+size_t oc_stt_window(const int16_t *pcm, size_t samples, size_t max, size_t search) {
+    if (samples <= max) return samples;
+    const size_t frame = WINDOW_RATE / 50;                   /* 20 ms */
+    if (max < frame) return max ? max : 1;
+    size_t lo = max - (search < max - frame ? search : max - frame);
+    size_t best = max;
+    uint64_t best_energy = UINT64_MAX;
+    for (size_t at = lo; at + frame <= max; at += frame / 2) {
+        uint64_t energy = 0;
+        for (size_t i = at; i < at + frame; i++) energy += (uint64_t)((int64_t)pcm[i] * pcm[i]);
+        if (energy < best_energy) { best_energy = energy; best = at + frame / 2; }
+    }
+    return best;
+}
+
+int oc_stt_hear_windowed(const oc_stt_engine *e, void *engine, const int16_t *pcm, size_t samples,
+                         char **text, char *err, size_t errcap) {
+    const size_t max = (size_t)OC_STT_WINDOW_SECS * WINDOW_RATE;
+    const size_t search = (size_t)OC_STT_CUT_SEARCH_MS * WINDOW_RATE / 1000;
+    *text = NULL;
+    if (samples <= max) return e->hear(engine, pcm, samples, text, err, errcap);
+    char *all = NULL;
+    size_t len = 0;
+    for (size_t off = 0; off < samples; ) {
+        size_t n = oc_stt_window(pcm + off, samples - off, max, search);
+        char *part = NULL;
+        if (e->hear(engine, pcm + off, n, &part, err, errcap) != 0 || !part) {
+            if (!err[0]) snprintf(err, errcap, "recognition failed");
+            free(part);
+            free(all);
+            return -1;
+        }
+        off += n;
+        /* The window's words, without the space at either end. */
+        const char *s = part;
+        size_t k = strlen(s);
+        while (*s && isspace((unsigned char)*s)) { s++; k--; }
+        while (k && isspace((unsigned char)s[k - 1])) k--;
+        if (k) {
+            char *grown = realloc(all, len + (len ? 1 : 0) + k + 1);
+            if (!grown) { free(part); free(all); snprintf(err, errcap, "out of memory"); return -1; }
+            all = grown;
+            if (len) all[len++] = ' ';
+            memcpy(all + len, s, k);
+            len += k;
+            all[len] = '\0';
+        }
+        free(part);
+    }
+    *text = all ? all : strdup("");
+    if (!*text) { snprintf(err, errcap, "out of memory"); return -1; }
+    return 0;
 }
 
 static void post(oc_stt_worker *w, result_node *n) {
@@ -113,7 +171,8 @@ static void *run(void *arg) {
                 j->pcm[i] = (int16_t)(uint16_t)(le[2 * i] | le[2 * i + 1] << 8);
             struct timespec t0, t1;
             clock_gettime(CLOCK_MONOTONIC, &t0);
-            int rc = w->engine->hear(engine, j->pcm, j->samples, &n->r.text, err, sizeof err);
+            err[0] = '\0';
+            int rc = oc_stt_hear_windowed(w->engine, engine, j->pcm, j->samples, &n->r.text, err, sizeof err);
             clock_gettime(CLOCK_MONOTONIC, &t1);
             if (rc == 0 && n->r.text) {
                 n->r.ok = 1;

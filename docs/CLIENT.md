@@ -1279,6 +1279,30 @@ is what is shown. **Copy** puts the whole as one line on the clipboard --
 into a report; the harness's `about` verb opens the dialog and answers that
 line, which the full suite checks (TESTING.md §3.4).
 
+### What's new: this build's release notes
+
+**What's new** is in the workspace menu after About OpenChime, in the palette
+beside it, and a button on the About card. It turns the card into the notes of
+the release this client is: the control plane writes them once from what the
+release shipped, and the client asks for them by its build id,
+`GET https://openchime.io/api/releases/build/<build id>`
+(`client/core/releasenotes.{h,c}`), which answers the release's number, date
+and sections of items, each with its link. The card says "Loading…" while it
+asks -- the window never waits on it: the Windows client fetches on a thread of
+its own, through the client's verifying TLS with the built-in roots only
+(`client/core/https_get.{h,c}`, which the `.well-known` fetch uses too), and
+the web client with the browser's `fetch` -- then "What's new in release N", its
+date and each section's items; an item with a link opens it in the browser.
+**Open on openchime.io** opens the same notes as a page,
+`https://openchime.io/releases/build/<build id>`. A build that is not a release
+says "This build is not a release." with a link to every release -- a source
+build ("dev") is never asked about -- and a fetch that fails or times out says
+"Could not load the release notes." with the page's link. Under the hook, a URL
+to open is written where every URL the hook opens is (`signin_url.txt`), and the
+dump's `whatsnew=` line gives the card's state (`loading`, `shown`,
+`notrelease`, `failed`), the release and how many items it lists
+(`tools/gui/whatsnew.sh`).
+
 ### What the window says, and where (REQ-263)
 
 Each kind of message has one surface, decided by what it is
@@ -1406,6 +1430,31 @@ email", "your workspace has turned this off") rather than disappearing. A link
 in a notification email opens the app at a workspace, conversation and message
 (EMAIL.md §7). Each is specified here as it is built; the design is
 [EMAIL.md](./EMAIL.md).
+
+### Links
+
+An `openchime://` link opens a conversation, and a line in it, in the app. It
+comes in two forms (`client/core/permalink.h`):
+
+- **A copied permalink**, `openchime://<host>/c/<channel>[/m/<message>]`, names
+  its workspace by the address it was copied from. It opens in the workspace
+  open now when that is the one it names; otherwise the app says which
+  workspace it is for and asks you to switch to it first.
+- **An email link**, `openchime://w/<audience>/c/<channel>[/m/<message>][/t/<thread>]`,
+  names its workspace by its **audience id** with OpenChime's services: the id
+  the daemon gives a signed-in client in `WORKSPACE_INFO` (PROTOCOL.md §4.3a),
+  which the app keeps beside the workspace in its book (`store.h`). The app
+  opens the workspace this device is signed into, or remembers, with that id:
+  the one open now, or another, switched to and the link followed there once it
+  has signed in. A link for any other id says "This link is for a workspace
+  you're not signed into" and connects nowhere. The link never names a server,
+  so an email cannot send the app anywhere it has not been. `/t/<thread>` is the
+  thread's root, which the link opens at.
+
+A link arrives by a click (a message's link, a toast) or on the command line, as
+the first argument or after `--open`; the web client takes it as `?open=`
+(WEB.md). One that arrives before there is anything to open it into waits until
+the workspace is signed in.
 
 ### Two standing UI rules
 

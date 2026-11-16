@@ -155,6 +155,55 @@ check "twenty in one table cell all read in the reader's zone, in order" waitfor
 check "and its five custom emoji are drawn, beside the message's ten" waitfor 10 emoji_drawn 15
 "$DRIVE" shot timetoken_many_cell >/dev/null
 rm -rf "$M" "$LIN_DIR/tt-emoji.png"
+
+say "== in a table past those drawn as grids, and in a /me line"
+# Each drawn token is a hit with its tip (the dump's timetok line), so a new one
+# reading "$SHORT" is one shown in the reader's zone, with its tip.
+count_short() { snap; grep -c "^  timetok .*text=\"$SHORT\"" "$D"; }
+# By the message it is on, not a count of those on screen: a message of
+# seventeen tables is tall, and sending it scrolls earlier tokens out of view.
+newest_mid() { snap; grep '^  msgrow ' "$D" | grep -o 'mid=[0-9]*' | cut -d= -f2 | sort -n | tail -1; }
+before_mid="$(newest_mid)"
+b=""; for i in $(seq 1 16); do b="$b| h$i |\n|---|\n| $i |\n\n"; done
+"$DRIVE" sendraw "$b| When |\n|---|\n| $TOKEN |" >/dev/null
+# A message that long is drawn cut, its seventeenth table behind "Show more":
+# opened, as a reader opens it.
+cut_new() { snap; NEWM="$(newest_mid)"; [ "${NEWM:-0}" -gt "${before_mid:-0}" ] && grep -q "^  cutmsg mid=$NEWM " "$D"; }
+if waitfor 10 cut_new; then
+  IFS=, read -r l t r b2 <<< "$(grep -m1 "^  cutmsg mid=$NEWM " "$D" | grep -o 'r=[-0-9,]*' | cut -d= -f2)"
+  [ -n "${b2:-}" ] && "$DRIVE" click $(( (l + r) / 2 )) $(( (t + b2) / 2 )) >/dev/null
+fi
+past16() { snap; grep "^  timetok .*text=\"$SHORT\"" "$D" | grep -o 'mid=[0-9]*' | cut -d= -f2 |
+           while read -r m; do [ "$m" -gt "${before_mid:-0}" ] && echo y; done | grep -q y; }
+check "a token in the seventeenth table reads \"$SHORT\", with its tip" waitfor 15 past16
+"$DRIVE" shot timetoken_past_grids >/dev/null
+before="$(count_short)"
+"$DRIVE" sendraw "/me starts at $TOKEN" >/dev/null
+in_me() { [ "$(count_short)" -gt "$before" ]; }
+check "a token in a /me line reads \"$SHORT\", with its tip" waitfor 10 in_me
+check "and the /me line's preview reads it too" grep -q "prev=\"[^\"]*starts at $SHORT\"" "$D"
+"$DRIVE" shot timetoken_action >/dev/null
+
+say "== the clock setting, changed, changes both"
+ME_MID="$(newest_mid)"
+# Preferences > Messages, then the Time format row's choice, as a person clicks it.
+set_clock() {  # set_clock <0 12-hour | 1 24-hour>
+  "$DRIVE" prefs 1 >/dev/null; snap
+  local l t r b
+  IFS=, read -r l t r b <<< "$(grep -m1 "^  prefhit row=1 val=$1 " "$D" | grep -o 'r=[-0-9,]*' | cut -d= -f2)"
+  [ -n "${b:-}" ] && "$DRIVE" click $(( (l + r) / 2 )) $(( (t + b) / 2 )) >/dev/null
+  "$DRIVE" key escape >/dev/null
+}
+reads() {  # reads <pattern>: the seventeenth table's token and the /me line's both match
+  snap
+  for m in "$NEWM" "$ME_MID"; do grep "^  timetok mid=$m " "$D" | grep -q "text=\"$1\"" || return 1; done
+}
+set_clock 0
+twelve() { reads '[^"]*[0-9] [AP]M'; }
+check "on a 12-hour clock, both read in it" waitfor 10 twelve
+set_clock 1
+back() { reads "$SHORT"; }
+check "and back on 24 hours, both read \"$SHORT\" again" waitfor 10 back
 rm -f "$D"
 
 say ""

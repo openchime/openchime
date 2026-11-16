@@ -49,25 +49,44 @@ restart ends them.
 
 The Home sidebar has a **Calls** section above Channels and Direct messages. It lists the
 active calls in conversations you belong to, and every call you are invited to, one row
-each: the conversation, who is in it, how many, and an **Invited** mark. Selecting a row
-opens the **call view**. With nothing to list it says "No calls".
+each: the conversation, how many are in it, and its own **Join** — accented when you were
+asked, and **Open** once you are in it. Selecting a row opens the **call view**. With
+nothing to list the section is not drawn at all.
 
-**The call view** shows the conversation's name and how long the call has run, the roster —
-each person's avatar, a ring while they speak, a mark when they are muted, and a volume for
-each — and the controls: **Mute**, the push-to-talk hint, the **microphone** and
-**speaker** pickers with a live level, **Noise suppression**, **Invite**, **Share screen**,
-**Leave** and, for the starter, **End for everyone**. Before joining it shows who is in the call and **Join**
-(and **Decline** for an invitation). The conversation's messages are a click away.
+**In the conversation**, a call going on shows as a banner under its header: who is in it
+and for how long, with **Join** (**Open** once you are in it) and, when you were asked,
+**Decline**. The header's phone button says what it will do on hover — "Start a call" or
+"Join the call". Starting a call in a channel with more than one other member asks first,
+saying how many it will ring; in a DM it rings at once.
+
+**The call view** shows the conversation's name and how long the call has run, and the
+roster: each person's card, sized to fill the stage, with their avatar, a ring while they
+speak (the accent colour, not the presence dot's green), a mark when they are muted, and a
+volume for each, with its value as a percentage. The conversation's messages and composer
+are in a panel on the right, open by default and folded away with **Hide conversation**; a
+message sent there goes to the conversation. The controls are one bar: **Mute** (with the
+microphone's level on it, and a tooltip saying "You are currently muted" or "You are
+currently not muted", and Ctrl+Shift+M), **Share screen**, **Invite**, **Settings** and
+**Leave**; **End for everyone**, for the starter alone, sits apart at the far end and asks
+for confirmation before it ends the call. **Settings** opens a panel holding the
+**microphone** and **speaker** pickers, the microphone's level and **Noise suppression**.
+Above the bar is the push-to-talk hint, whatever route the audio takes. Before joining the
+view shows who is in the call and **Join** (and **Decline** for an invitation).
 
 **While in a call elsewhere**, a strip at the foot of the sidebar shows the conversation and
-the call's length — or who is sharing a screen — with Mute, Leave, and a way back to the
-call view.
+the call's length — or who is sharing a screen — with Mute (and its tooltip), Leave, and a
+way back to the call view.
+
+**A missed call** is a line in the conversation's history read from your side: "You missed
+a call from alice", or, to the one who started it, "Nobody joined your call", with **Call
+back**, which starts a call in that conversation.
 
 **Sharing a screen** (REQ-161): anyone in the call can share a screen or a window, one
 person at a time — starting a share takes over from whoever was sharing. The others see it
-on the call view's stage, fitted, or full screen, or at actual size; the sharer sees a bar
-saying so, with Stop sharing, and a green frame around what is shared. §6
-is the design.
+on the call view's stage, fitted, or full screen, or at actual size, with each person in the
+call under it by face and name and the ring on whoever is speaking; the sharer's view says
+"You're sharing", with **Stop sharing** on that banner, and a bar and a green frame around
+what is shared. §6 is the design.
 
 **Keys.** Ctrl+Shift+M mutes and unmutes. Holding **Ctrl+Shift+Space** talks while muted
 (push to talk) — voice input's chord; in a call the call owns the microphone, so the two

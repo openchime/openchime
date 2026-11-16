@@ -577,6 +577,15 @@ static void xfer_reset(oc_xfer *x) {
 
 /* Emit OC_EV_ATTACHMENT events for a message's attachment list (BROADCAST /
  * THREAD_REPLY), each folded onto its message by the model. */
+/* A wire string as a heap C string (never NULL on success). */
+static char *slice_text(oc_slice s) {
+    char *t = malloc(s.len + 1);
+    if (!t) return NULL;
+    if (s.len) memcpy(t, s.ptr, s.len);
+    t[s.len] = '\0';
+    return t;
+}
+
 static void push_attachments(oc_queue *to_ui, uint64_t channel_id, uint64_t message_id,
                              const oc_attach_entry *att, uint16_t n) {
     for (uint16_t i = 0; i < n && i < OC_MAX_ATTACH; i++) {
@@ -599,6 +608,13 @@ static void push_attachments(oc_queue *to_ui, uint64_t channel_id, uint64_t mess
         size_t mn = att[i].mime.len < sizeof e->author_name - 1 ? att[i].mime.len : sizeof e->author_name - 1;
         memcpy(e->author_name, att[i].mime.ptr, mn); e->author_name[mn] = '\0';
         (void)fn;
+        if (att[i].media_kind == OC_MEDIA_SNIPPET) {   /* REQ-226 */
+            e->topic = malloc(att[i].title.len + 1);
+            if (e->topic) { if (att[i].title.len) memcpy(e->topic, att[i].title.ptr, att[i].title.len);
+                            e->topic[att[i].title.len] = '\0'; }
+            size_t ln = att[i].language.len < sizeof e->emoji - 1 ? att[i].language.len : sizeof e->emoji - 1;
+            memcpy(e->emoji, att[i].language.ptr, ln); e->emoji[ln] = '\0';
+        }
         oc_queue_push(to_ui, e);
     }
 }
@@ -653,6 +669,7 @@ static void begin_upload(disp_ctx *ctx, uint64_t channel, const char *name, cons
     ub.filename = oc_slice_str(x->name);
     ub.mime = oc_slice_str(mime);
     ub.total_size = total;
+    ub.media_kind = purpose == 5 ? OC_MEDIA_SNIPPET : 0;   /* a snippet says so, and is held to its cap */
     if (oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) == OC_OK &&
         write_all(ctx->conn, ctx->fd, buf, w.len, ctx->stop) == 0) {
         char msg[200]; snprintf(msg, sizeof msg, "uploading %s…", x->name);
@@ -837,6 +854,13 @@ static void xq_start(disp_ctx *ctx) {
         char pname[128];
         snprintf(pname, sizeof pname, "%s.jpg", c->body2 ? c->body2 : "video-message");
         begin_upload(ctx, c->channel_id, pname, "image/jpeg", c->blob2, c->blob2_len, 3);
+    } else if (c->type == OC_CMD_POST_SNIPPET) {
+        /* A snippet (REQ-226): its text, then its title and language, then the
+         * message carrying it -- the video message's last two steps. */
+        ctx->xq->vstage = 0; ctx->xq->vposter = ctx->xq->vvideo = 0;
+        char sname[OC_SNIPPET_TITLE_MAX + 8];
+        snprintf(sname, sizeof sname, "%s.txt", (c->body2 && c->body2[0]) ? c->body2 : "snippet");
+        begin_upload(ctx, c->channel_id, sname, "text/plain", c->blob, c->blob_len, 5);
     }
 }
 
@@ -1064,6 +1088,10 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->op     = wi.call_max;
                 e->ws_mode = wi.mode;
                 e->size    = wi.max_video_size;
+                if (wi.audience.len < sizeof e->ws_audience) {
+                    memcpy(e->ws_audience, wi.audience.ptr, wi.audience.len);
+                    e->ws_audience[wi.audience.len] = '\0';
+                }
                 e->body = malloc(wi.workspace_name.len + 1);
                 if (e->body) { memcpy(e->body, wi.workspace_name.ptr, wi.workspace_name.len); e->body[wi.workspace_name.len] = '\0'; }
                 oc_queue_push(to_ui, e);
@@ -1114,6 +1142,14 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->created_at = ci.created_at;
                     e->topic = malloc(ci.topic.len + 1);
                     if (e->topic) { memcpy(e->topic, ci.topic.ptr, ci.topic.len); e->topic[ci.topic.len] = '\0'; }
+                    /* Who made it and who runs it (REQ-036b): only this frame
+                     * says, so only it sets them. */
+                    e->ch_managers_known = 1;
+                    e->ch_creator = ci.creator_id;
+                    if (ci.n_managers && (e->ids = calloc(ci.n_managers, sizeof *e->ids)) != NULL) {
+                        for (uint16_t k = 0; k < ci.n_managers; k++) e->ids[k] = ci.managers[k];
+                        e->n_ids = ci.n_managers;
+                    }
                     oc_queue_push(to_ui, e);
                 }
             }
@@ -1227,6 +1263,10 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->pf_voice[n2] = '\0';
                 }
                 e->user_system = (ue[i].flags & OC_USER_SYSTEM) != 0;
+                e->ooo_start = ue[i].ooo_start;
+                e->ooo_end = ue[i].ooo_end;
+                snprintf(e->ooo_message, sizeof e->ooo_message, "%.*s",
+                         (int)ue[i].ooo_message.len, (const char *)ue[i].ooo_message.ptr);
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_PRESENCE_UPDATE) {
@@ -1319,7 +1359,8 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (oc_decode_saved_updated(&p, &su) == OC_OK) {
                 oc_ev *e = oc_ev_new(OC_EV_SAVED_UPDATED);
                 if (e) { e->message_id = su.message_id; e->op = su.op;
-                         e->pinned_at = su.saved_at; oc_queue_push(to_ui, e); }
+                         e->pinned_at = su.saved_at; e->remind_at = su.remind_at_ms;
+                         oc_queue_push(to_ui, e); }
             }
         } else if (hdr.msg_type == OC_MSG_COLLAPSED_UPDATED) {
             oc_set_collapsed sc;
@@ -1335,6 +1376,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->message_id = sm.message_id; e->channel_id = sm.channel_id;
                     e->author_id = sm.author_id;   e->server_time = sm.server_time;
                     e->pinned_at = sm.saved_at;
+                    e->remind_at = sm.remind_at_ms;   /* REQ-283 */
                     e->action = sm.action;   /* REQ-058 */
                     size_t an = sm.attach_name.len < sizeof e->author_name - 1
                               ? sm.attach_name.len : sizeof e->author_name - 1;
@@ -1538,7 +1580,9 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             oc_typing_update tu;
             if (oc_decode_typing_update(&p, &tu) == OC_OK) {
                 oc_ev *e = oc_ev_new(OC_EV_TYPING);
-                if (e) { e->channel_id = tu.channel_id; e->user_id = tu.user_id; oc_queue_push(to_ui, e); }
+                if (e) { e->channel_id = tu.channel_id; e->user_id = tu.user_id;
+                         e->parent_id = tu.thread_root;   /* the thread, 0 the main scroll (REQ-121) */
+                         oc_queue_push(to_ui, e); }
             }
         } else if (hdr.msg_type == OC_MSG_MSG_EDITED) {
             oc_msg_edited me;
@@ -1557,6 +1601,26 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (oc_decode_msg_deleted(&p, &md) == OC_OK) {
                 oc_ev *e = oc_ev_new(OC_EV_DELETE);
                 if (e) { e->channel_id = md.channel_id; e->message_id = md.message_id; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_FOUND_AT_TIME) {
+            oc_found_at_time fa;
+            if (oc_decode_found_at_time(&p, &fa) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_FOUND_AT_TIME);
+                if (e) {
+                    e->channel_id = fa.channel_id; e->parent_id = fa.parent_id;
+                    e->message_id = fa.message_id; e->server_time = fa.server_time; e->op = fa.exact;
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_MESSAGE_MOVED) {   /* REQ-053 */
+            oc_message_moved mv;
+            if (oc_decode_message_moved(&p, &mv) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_MESSAGE_MOVED);
+                if (e) {
+                    e->message_id = mv.message_id; e->channel_id = mv.from_channel;
+                    e->to_channel = mv.to_channel; e->parent_id = mv.to_parent; e->count = mv.count;
+                    oc_queue_push(to_ui, e);
+                }
             }
         } else if (hdr.msg_type == OC_MSG_THREAD_REPLY) {
             oc_thread_reply tr;
@@ -1650,6 +1714,36 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     oc_ev_free(e);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_TODO) {
+            /* A to-do list's state, one range of its tasks per frame. */
+            static oc_todo_msg tm;
+            if (oc_decode_todo(&p, &tm) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_TODO);
+                oc_todo_view *v = e ? calloc(1, sizeof *v) : NULL;
+                if (v) v->tasks = calloc(tm.n ? tm.n : 1, sizeof *v->tasks);
+                if (e && v && v->tasks) {
+                    e->todo = v;
+                    e->channel_id = tm.channel_id;
+                    e->message_id = tm.message_id;
+                    e->todo_first = tm.first;
+                    e->todo_n = tm.n;
+                    v->author_id = tm.author_id;
+                    v->total = tm.total;
+                    v->cap = tm.n;
+                    v->title = slice_text(tm.title);
+                    for (uint8_t i = 0; i < tm.n; i++) {
+                        v->tasks[i].name = slice_text(tm.tasks[i].name);
+                        v->tasks[i].desc = slice_text(tm.tasks[i].description);
+                        v->tasks[i].done = tm.tasks[i].done;
+                        v->tasks[i].done_by = tm.tasks[i].done_by;
+                        v->tasks[i].done_at_ms = tm.tasks[i].done_at_ms;
+                    }
+                    oc_queue_push(to_ui, e);
+                } else {
+                    if (v) { free(v->tasks); free(v); }
+                    oc_ev_free(e);
+                }
+            }
         } else if (hdr.msg_type == OC_MSG_POLL_VOTERS) {
             enum { VOTERS_CAP = 4096 };
             oc_poll_voter *vs = malloc(VOTERS_CAP * sizeof *vs);
@@ -1698,6 +1792,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->channel_id = ne[i].channel_id;
                 e->op = ne[i].level;
                 e->status = ne[i].muted;      /* distinct from the level */
+                e->participant = ne[i].follow_threads;   /* every thread followed (REQ-282) */
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_THREAD_SUMMARY) {
@@ -1742,6 +1837,37 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     oc_queue_push(to_ui, e);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_MUTED_USERS) {
+            uint64_t *ids = calloc(OC_MAX_MUTED_USERS, sizeof *ids);
+            uint16_t n = 0;
+            if (!ids) return -1;
+            if (oc_decode_muted_users(&p, ids, &n) != OC_OK) { free(ids); return -1; }
+            oc_ev *e = oc_ev_new(OC_EV_MUTED_USERS);
+            if (e) { e->ids = ids; e->n_ids = n; oc_queue_push(to_ui, e); }
+            else free(ids);
+        } else if (hdr.msg_type == OC_MSG_BLOCKS) {
+            uint64_t *ids = calloc(OC_MAX_BLOCKS, sizeof *ids);
+            uint16_t n = 0; uint8_t priv = 0;
+            if (!ids) return -1;
+            if (oc_decode_blocks(&p, &priv, ids, &n) != OC_OK) { free(ids); return -1; }
+            oc_ev *e = oc_ev_new(OC_EV_BLOCKS);
+            if (e) { e->ids = ids; e->n_ids = n; e->status = priv; oc_queue_push(to_ui, e); }
+            else free(ids);
+        } else if (hdr.msg_type == OC_MSG_BLOCK_LIST) {
+            oc_block_entry *ents = calloc(OC_BLOCK_LIST_MAX, sizeof *ents);
+            uint16_t n = 0;
+            if (!ents) return -1;
+            if (oc_decode_block_list(&p, ents, &n) != OC_OK) { free(ents); return -1; }
+            uint64_t *flat = calloc((size_t)n * 3 + 1, sizeof *flat);
+            oc_ev *e = flat ? oc_ev_new(OC_EV_BLOCK_LIST) : NULL;
+            if (e) {
+                for (uint16_t i = 0; i < n; i++) {
+                    flat[3 * i] = ents[i].blocker_id; flat[3 * i + 1] = ents[i].blocked_id; flat[3 * i + 2] = ents[i].since_ms;
+                }
+                e->ids = flat; e->n_ids = (size_t)n * 3;
+                oc_queue_push(to_ui, e);
+            } else free(flat);
+            free(ents);
         } else if (hdr.msg_type == OC_MSG_ALERT_PREFS) {
             oc_slice terms[OC_MAX_KEYWORDS]; uint8_t nt = 0;
             uint64_t people[OC_MAX_PRIORITY]; uint8_t np = 0;
@@ -1828,7 +1954,9 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (e) { e->channel_id = um.channel_id; e->message_id = um.message_id; e->count = um.total;
                      oc_queue_push(to_ui, e); }
         } else if (hdr.msg_type == OC_MSG_EMOJI_LIST) {
-            oc_emoji_entry ee[OC_MAX_CUSTOM_EMOJI]; uint16_t count = 0;
+            /* Static: with each entry's old names it is ~90 KB, too much for a
+             * thread's stack. Only the net thread decodes here. */
+            static oc_emoji_entry ee[OC_MAX_CUSTOM_EMOJI]; uint16_t count = 0;
             if (oc_decode_emoji_list(&p, ee, OC_MAX_CUSTOM_EMOJI, &count) != OC_OK) return -1;
             if (count > OC_MAX_CUSTOM_EMOJI) count = OC_MAX_CUSTOM_EMOJI;
             oc_ev *b = oc_ev_new(OC_EV_EMOJI_BEGIN);
@@ -1840,6 +1968,38 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->user_id = ee[i].created_by;
                 e->body = malloc(ee[i].name.len + 1);
                 if (e->body) { memcpy(e->body, ee[i].name.ptr, ee[i].name.len); e->body[ee[i].name.len] = '\0'; }
+                e->created_at = ee[i].created_at;
+                /* Its old names, space-separated (a name holds no space). */
+                if (ee[i].n_aliases) {
+                    size_t need = 1;
+                    for (uint8_t k = 0; k < ee[i].n_aliases; k++) need += ee[i].aliases[k].len + 1;
+                    if ((e->topic = malloc(need)) != NULL) {
+                        size_t at = 0;
+                        for (uint8_t k = 0; k < ee[i].n_aliases; k++) {
+                            if (at) e->topic[at++] = ' ';
+                            memcpy(e->topic + at, ee[i].aliases[k].ptr, ee[i].aliases[k].len);
+                            at += ee[i].aliases[k].len;
+                        }
+                        e->topic[at] = '\0';
+                    }
+                }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_PROFILE_FIELDS) {
+            oc_profile_field pf[OC_MAX_PROFILE_FIELDS]; uint8_t count = 0;
+            if (oc_decode_profile_fields(&p, pf, &count) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_PROFILE_FIELDS);
+            if (e) {
+                if (count && (e->pfs = calloc(count, sizeof *e->pfs)) != NULL) {
+                    for (uint8_t i = 0; i < count; i++) {
+                        e->pfs[i].id = pf[i].field_id;
+                        e->pfs[i].kind = pf[i].kind;
+                        e->pfs[i].position = pf[i].position;
+                        snprintf(e->pfs[i].text, sizeof e->pfs[i].text, "%.*s",
+                                 (int)pf[i].label.len, (const char *)pf[i].label.ptr);
+                    }
+                    e->n_pfs = count;
+                }
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_CLIENT_SETTINGS) {
@@ -1878,6 +2038,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->audit.target_id = ents[i].target_id;
                 e->audit.family    = ents[i].family;
                 e->audit.outcome   = ents[i].outcome;
+                e->audit.channel_id = ents[i].channel_id;
                 slice_to_buf(ents[i].actor_name, e->audit.actor_name, sizeof e->audit.actor_name);
                 slice_to_buf(ents[i].action,     e->audit.action,     sizeof e->audit.action);
                 slice_to_buf(ents[i].target,     e->audit.target,     sizeof e->audit.target);
@@ -1905,6 +2066,30 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 slice_to_buf(rows[i].key, v->key, sizeof v->key);
                 slice_to_buf(rows[i].message, v->message, sizeof v->message);
                 oc_queue_push(ctx->to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_USAGE) {
+            static __thread oc_usage_day days[OC_USAGE_MAX_DAYS];
+            static __thread oc_usage_week weeks[OC_USAGE_MAX_WEEKS];
+            static __thread oc_usage_channel chans[OC_USAGE_TOP_CHANNELS];
+            oc_usage us;
+            if (oc_decode_usage(&p, &us, days, weeks, chans) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_USAGE);
+            oc_usage_view *v = e ? calloc(1, sizeof *v) : NULL;
+            if (e && v) {
+                v->days = us.days; v->n_days = us.n_days; v->n_weeks = us.n_weeks; v->n_channels = us.n_channels;
+                memcpy(v->day, us.day, (size_t)us.n_days * sizeof *v->day);
+                memcpy(v->week, us.week, (size_t)us.n_weeks * sizeof *v->week);
+                for (uint16_t i = 0; i < us.n_channels; i++) {
+                    v->channel[i].id = us.channel[i].channel_id;
+                    v->channel[i].messages = us.channel[i].messages;
+                    v->channel[i].is_private = us.channel[i].is_private;
+                    slice_to_buf(us.channel[i].name, v->channel[i].name, sizeof v->channel[i].name);
+                }
+                e->usage = v;
+                oc_queue_push(ctx->to_ui, e);
+            } else {
+                free(v);
+                if (e) oc_ev_free(e);
             }
         } else if (hdr.msg_type == OC_MSG_STORAGE_STATUS) {
             oc_storage_status ss;
@@ -2008,8 +2193,10 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                         q->vvideo = x->id;
                         xfer_reset(x);
                         uint8_t mf[64]; oc_wbuf mw; oc_wbuf_init(&mw, mf, sizeof mf);
-                        oc_attach_media_set ms = { q->vvideo, OC_MEDIA_VIDEO_MESSAGE, job->duration_ms,
-                                                   job->media_w, job->media_h, q->vposter };
+                        oc_attach_media_set ms; memset(&ms, 0, sizeof ms);
+                        ms.attachment_id = q->vvideo; ms.media_kind = OC_MEDIA_VIDEO_MESSAGE;
+                        ms.duration_ms = job->duration_ms;
+                        ms.width = job->media_w; ms.height = job->media_h; ms.poster_id = q->vposter;
                         if (oc_encode_attach_media_set(&mw, OC_PROTOCOL_VERSION, &ms) == OC_OK &&
                             write_all(ctx->conn, ctx->fd, mf, mw.len, ctx->stop) == 0) {
                             x->mode = 3;
@@ -2018,6 +2205,35 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                         } else {
                             xfer_notice(ctx, 2, "video message: could not send");
                         }
+                    }
+                    continue;
+                }
+                if (x->purpose == 5) {
+                    /* A snippet's text is up: mark it one, with its first bytes
+                     * for search; ATTACH_MEDIA_OK posts it as for a video. */
+                    oc_xqueue *q = ctx->xq;
+                    oc_cmd *job = q->active;
+                    q->vvideo = x->id;
+                    xfer_reset(x);
+                    static uint8_t sf[OC_MAX_FRAME_SIZE];
+                    oc_wbuf sw; oc_wbuf_init(&sw, sf, sizeof sf);
+                    oc_attach_media_set ms; memset(&ms, 0, sizeof ms);
+                    ms.attachment_id = q->vvideo;
+                    ms.media_kind = OC_MEDIA_SNIPPET;
+                    ms.title = oc_slice_str(job->body2 ? job->body2 : "");
+                    ms.language = oc_slice_str(job->body3 ? job->body3 : "");
+                    ms.text.ptr = job->blob;
+                    ms.text.len = job->blob_len < OC_SNIPPET_INDEX_MAX ? job->blob_len : OC_SNIPPET_INDEX_MAX;
+                    /* Not cut inside a character. */
+                    while (ms.text.len < job->blob_len && ms.text.len > 0 &&
+                           (job->blob[ms.text.len] & 0xC0) == 0x80) ms.text.len--;
+                    if (oc_encode_attach_media_set(&sw, OC_PROTOCOL_VERSION, &ms) == OC_OK &&
+                        write_all(ctx->conn, ctx->fd, sf, sw.len, ctx->stop) == 0) {
+                        x->mode = 3;
+                        x->id = q->vvideo;
+                        q->vstage = 2;
+                    } else {
+                        xfer_notice(ctx, 2, "snippet: could not send");
                     }
                     continue;
                 }
@@ -2134,9 +2350,10 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                         e->parent_id = job->message_id;
                         oc_queue_push(ctx->to_ui, e);
                     }
-                    xfer_notice(ctx, 1, "video message sent");
+                    xfer_notice(ctx, 1, job->type == OC_CMD_POST_SNIPPET ? "snippet posted" : "video message sent");
                 } else {
-                    xfer_notice(ctx, 2, "video message: could not send");
+                    xfer_notice(ctx, 2, job->type == OC_CMD_POST_SNIPPET ? "snippet: could not send"
+                                                                         : "video message: could not send");
                 }
                 xfer_reset(ctx->xfer);
             }
@@ -2415,6 +2632,19 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                                      (int)pi.voice_id.len,     (const char *)pi.voice_id.ptr);
                     (void)k;
                 }
+                /* The values for the workspace's own fields, beside the rest. */
+                if (pi.n_fields && (e->pfs = calloc(pi.n_fields, sizeof *e->pfs)) != NULL) {
+                    for (uint8_t i = 0; i < pi.n_fields; i++) {
+                        e->pfs[i].id = pi.fields[i].field_id;
+                        snprintf(e->pfs[i].text, sizeof e->pfs[i].text, "%.*s",
+                                 (int)pi.fields[i].value.len, (const char *)pi.fields[i].value.ptr);
+                    }
+                    e->n_pfs = pi.n_fields;
+                }
+                e->ooo_start = pi.ooo_start;
+                e->ooo_end = pi.ooo_end;
+                snprintf(e->ooo_message, sizeof e->ooo_message, "%.*s",
+                         (int)pi.ooo_message.len, (const char *)pi.ooo_message.ptr);
                 oc_queue_push(to_ui, e);
             }
             /* My whole profile, asked for so one field can change: sent back
@@ -2569,10 +2799,14 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                  * a frontend following the tag must see. The status line above
                  * already says why, so the notice carries no text of its own. */
                 if (ctx && ctx->xfer->mode == 1 && about_transfer) xfer_notice(ctx, 2, NULL);
-                if (ctx && ctx->xfer->mode == 3 && about_transfer)
+                if (ctx && ctx->xfer->mode == 3 && about_transfer) {
+                    int snip = ctx->xq->active && ctx->xq->active->type == OC_CMD_POST_SNIPPET;
                     xfer_notice(ctx, 2, err.code == OC_ERR_MEDIA_TOO_LARGE
-                                        ? "video message: larger than this server accepts"
-                                        : "video message refused by the server");
+                                        ? (snip ? "snippet: larger than 1 MB"
+                                                : "video message: larger than this server accepts")
+                                        : (snip ? "snippet refused by the server"
+                                                : "video message refused by the server"));
+                }
                 /* Talking mode moves on: the queue is what matters, not this
                  * one message (ARCH-111). The reason travels so a frontend can
                  * say something once rather than for every message. */
@@ -3449,7 +3683,7 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             if (c->type == OC_CMD_TYPING) {
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_typing ty = { c->channel_id };
+                oc_typing ty = { c->channel_id, c->message_id };   /* message_id: the thread root */
                 if (oc_encode_typing(&w, OC_PROTOCOL_VERSION, &ty) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
@@ -3541,6 +3775,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_storage_status_req(&w, OC_PROTOCOL_VERSION) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_USAGE) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_usage_req ur = { c->usage_days };
+                if (oc_encode_usage_req(&w, OC_PROTOCOL_VERSION, &ur) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_LIST_CHANNELS) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 if (oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK)
@@ -3582,9 +3822,15 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_history_around(&w, OC_PROTOCOL_VERSION, &ha) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_FIND_AT_TIME) {
+                uint8_t buf[40]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_find_at_time fa = { c->channel_id, c->message_id, c->server_time };
+                if (oc_encode_find_at_time(&w, OC_PROTOCOL_VERSION, &fa) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_SAVE_ITEM) {
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_save_item si = { c->message_id, c->op };
+                oc_save_item si = { c->message_id, c->op, c->op ? c->server_time : 0 };
                 if (oc_encode_save_item(&w, OC_PROTOCOL_VERSION, &si) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
@@ -3592,6 +3838,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_collapsed sc = { c->message_id, c->op };
                 if (oc_encode_set_collapsed(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_MOVE_MESSAGE) {
+                uint8_t buf[48]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_move_message mm = { c->message_id, c->channel_id, c->parent_id, c->op };
+                if (oc_encode_move_message(&w, OC_PROTOCOL_VERSION, &mm) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_LIST_SAVED) {
@@ -3648,6 +3900,23 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_vote(&w, OC_PROTOCOL_VERSION, &v) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_TODO_ADD || c->type == OC_CMD_TODO_MARK || c->type == OC_CMD_TODO_RENAME) {
+                uint8_t buf[OC_TODO_NAME_MAX + OC_TODO_DESC_MAX + 64];
+                oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_result er;
+                if (c->type == OC_CMD_TODO_ADD) {
+                    oc_todo_add ta = { c->channel_id, c->message_id, oc_slice_str(c->body ? c->body : ""),
+                                       oc_slice_str(c->body2 ? c->body2 : "") };
+                    er = oc_encode_todo_add(&w, OC_PROTOCOL_VERSION, &ta);
+                } else if (c->type == OC_CMD_TODO_MARK) {
+                    oc_todo_mark tm = { c->channel_id, c->message_id, c->uses, c->op ? 1 : 0 };
+                    er = oc_encode_todo_mark(&w, OC_PROTOCOL_VERSION, &tm);
+                } else {
+                    oc_todo_rename tr = { c->channel_id, c->message_id, oc_slice_str(c->body ? c->body : "") };
+                    er = oc_encode_todo_rename(&w, OC_PROTOCOL_VERSION, &tr);
+                }
+                if (er == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_EDIT_POLL) {
                 uint8_t *buf = malloc(OC_MAX_FRAME_SIZE);
                 if (buf) {
@@ -3702,6 +3971,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_set_thread_follow(&w, OC_PROTOCOL_VERSION, &tf) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_CHANNEL_THREAD_FOLLOW) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_channel_thread_follow sf = { c->channel_id, c->op };
+                if (oc_encode_set_channel_thread_follow(&w, OC_PROTOCOL_VERSION, &sf) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_MARK_THREAD_READ) {
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_mark_thread_read mr = { c->message_id, c->server_time };
@@ -3722,6 +3997,28 @@ static int run_connection(oc_net *n, int reconnecting,
                 oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_priority sp = { c->n_pri_people, c->pri_people };
                 if (oc_encode_set_priority(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_USER_MUTE) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_user_mute sm = { c->mute_user_id, (uint8_t)(c->op ? 1 : 0) };
+                if (oc_encode_set_user_mute(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_BLOCK) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_block sb = { c->block_user_id, (uint8_t)(c->op ? 1 : 0) };
+                if (oc_encode_set_block(&w, OC_PROTOCOL_VERSION, &sb) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_DM_PRIVACY) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_set_dm_privacy(&w, OC_PROTOCOL_VERSION, c->op) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_BLOCKS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_blocks(&w, OC_PROTOCOL_VERSION) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SET_READ_RECEIPTS) {
@@ -3880,6 +4177,25 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_get_profile(&w, OC_PROTOCOL_VERSION, &gp) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_SET_PROFILE_FIELD) {
+                uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_profile_field sf = { c->message_id, c->op, c->scope, c->uses,
+                                            oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_set_profile_field(&w, OC_PROTOCOL_VERSION, &sf) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_PROFILE_FIELD_VALUE) {
+                uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_profile_field_value fv = { c->message_id, oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_set_profile_field_value(&w, OC_PROTOCOL_VERSION, &fv) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_OUT_OF_OFFICE) {
+                uint8_t buf[OC_OOO_MESSAGE_MAX + 64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_out_of_office so = { c->start_ms, c->end_ms, oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_set_out_of_office(&w, OC_PROTOCOL_VERSION, &so) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_ENABLE_USER) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_enable_user eu = { c->channel_id };
@@ -4010,6 +4326,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_delete_emoji(&w, OC_PROTOCOL_VERSION, &de) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_RENAME_EMOJI && c->body && c->body2) {
+                uint8_t buf[192]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_rename_emoji re = { oc_slice_str(c->body), oc_slice_str(c->body2) };
+                if (oc_encode_rename_emoji(&w, OC_PROTOCOL_VERSION, &re) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             /* User groups (REQ-307-309). */
             if (c->type == OC_CMD_LIST_GROUPS) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
@@ -4096,7 +4418,8 @@ static int run_connection(oc_net *n, int reconnecting,
                 (c->type == OC_CMD_UPLOAD && c->body) || c->type == OC_CMD_FETCH ||
                 (c->type == OC_CMD_POST_FILES && c->n_paths) ||
                 (c->type == OC_CMD_DOWNLOAD && c->body) ||
-                (c->type == OC_CMD_POST_VIDEO && c->blob && c->blob2)) {
+                (c->type == OC_CMD_POST_VIDEO && c->blob && c->blob2) ||
+                (c->type == OC_CMD_POST_SNIPPET && c->blob && c->blob_len)) {
                 xq_add(&n->xq, c);             /* owned by the queue now */
                 continue;
             }

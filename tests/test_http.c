@@ -1,8 +1,8 @@
 /* Unit tests for the daemon's HTTP stack (daemon/http.c, ARCH-32): parsing over
  * picohttpparser -- request line, headers, body framing by Content-Length,
  * partial input, size limits, and what is refused (a chunked body, two lengths
- * that disagree, a head too long or with too many headers) -- the JSON-vs-plain
- * webhook text (REQ-170), the router, and the response writer. */
+ * that disagree, a head too long or with too many headers) -- the router, and
+ * the response writer. The webhook payload's text is test_webhook_payload.c's. */
 
 #include "http.h"
 #include "check.h"
@@ -30,9 +30,7 @@ static void test_parse_json(void) {
     CHECK(req.method_len == 4 && memcmp(req.method, "POST", 4) == 0);
     CHECK(req.path_len == 17 && memcmp(req.path, "/webhook/deadbeef", 17) == 0);
     CHECK(req.is_json == 1);
-    const char *text = NULL; size_t tlen = 0;
-    CHECK(oc_http_webhook_text(&req, &text, &tlen) == 1);
-    CHECK(tlen == 11 && memcmp(text, "hello world", 11) == 0);
+    CHECK(req.body_len == strlen("{\"text\":\"hello world\"}"));
 }
 
 static void test_parse_plain(void) {
@@ -40,10 +38,8 @@ static void test_parse_plain(void) {
     size_t n = build(buf, sizeof buf, "POST", "/webhook/abcd", "text/plain", "raw body");
     oc_http_req req;
     CHECK(oc_http_parse(buf, n, MAXB, &req) == 1);
-    CHECK(req.is_json == 0);
-    const char *text = NULL; size_t tlen = 0;
-    CHECK(oc_http_webhook_text(&req, &text, &tlen) == 1);
-    CHECK(tlen == 8 && memcmp(text, "raw body", 8) == 0);
+    CHECK(req.is_json == 0 && req.is_form == 0);
+    CHECK(req.body_len == 8 && memcmp(req.body, "raw body", 8) == 0);
 }
 
 static void test_incomplete(void) {
@@ -75,16 +71,6 @@ static void test_case_insensitive_headers(void) {
     oc_http_req req;
     CHECK(oc_http_parse(buf, (size_t)n, MAXB, &req) == 1);
     CHECK(req.is_json == 1);
-}
-
-static void test_json_no_text_field(void) {
-    char buf[256];
-    size_t n = build(buf, sizeof buf, "POST", "/webhook/x",
-                     "application/json", "{\"other\":\"v\"}");
-    oc_http_req req;
-    CHECK(oc_http_parse(buf, n, MAXB, &req) == 1);
-    const char *text = NULL; size_t tlen = 0;
-    CHECK(oc_http_webhook_text(&req, &text, &tlen) == 0);   /* no usable text */
 }
 
 static void test_get_and_paths(void) {
@@ -267,7 +253,7 @@ static void test_ws_parse(void) {
 
 int run_http_tests(void) {
     printf("test_http: request line, headers, body framing, partial input, size limits,\n");
-    printf("           refusals, JSON/plain webhook text, the router, the response writer,\n");
+    printf("           refusals, the router, the response writer,\n");
     printf("           a static route's gzip copy and ETag\n");
     test_parse_json();
     test_parse_plain();
@@ -275,7 +261,6 @@ int run_http_tests(void) {
     test_incomplete();
     test_body_too_large();
     test_case_insensitive_headers();
-    test_json_no_text_field();
     test_get_and_paths();
     test_refused();
     test_head_fields();

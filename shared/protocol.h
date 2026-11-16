@@ -201,8 +201,60 @@
  * 34: THREAD_META carries `n_repliers` (u8, at most 3) and that many u64 user
  * ids, the thread's most recent distinct repliers, newest first, and is sent
  * live to the channel's members when a reply is posted or deleted, not only in
- * backfill (REQ-060). Fields appended to a fixed layout. */
-#define OC_PROTOCOL_VERSION 34u
+ * backfill (REQ-060). Fields appended to a fixed layout.
+ *
+ * 35: TYPING and TYPING_UPDATE carry `thread_root` (u64, 0 for the main
+ * scroll), so typing shows in the thread it is in (REQ-121). Fields appended to
+ * fixed layouts.
+ *
+ * 36: SEND_REPLY and THREAD_REPLY carry `also_channel` (u8) and BROADCAST
+ * carries `parent_id` (u64, 0 for an ordinary message), each in the fixed part
+ * ahead of the body: a thread reply can also be posted to the channel's main
+ * scroll (REQ-062).
+ *
+ * 37: each NOTIFY_PREFS entry carries `follow_threads` (u8), every thread in
+ * the conversation followed (REQ-282). Fields appended to a repeated entry.
+ *
+ * 38: SAVE_ITEM, SAVED_UPDATED and SAVED_MSG carry `remind_at_ms` (u64, 0 for
+ * none), a saved item's reminder (REQ-283), and activity has a new kind,
+ * OC_ACT_REMINDER, for one that fired. Fields appended to fixed layouts.
+ *
+ * 39: an attachment entry may be a snippet (media kind 2, REQ-226), which
+ * carries `title` and `language` where a video carries its facts, and
+ * ATTACH_MEDIA_SET marks one with them and its searchable text. A client of 38
+ * would refuse a message carrying the new kind, so the version moves.
+ *
+ * 40: PROFILE_INFO carries the person's values for the workspace's own profile
+ * fields: a count (u8) and that many { field_id (u64), value (str) }. Fields
+ * appended to a fixed layout. SET_PROFILE_FIELD, PROFILE_FIELDS and
+ * SET_PROFILE_FIELD_VALUE (0x0137-0x0139) are new.
+ *
+ * 41: out of office (REQ-122). Each USER_LIST entry and PROFILE_INFO (after its field list) carry
+ * `ooo_start` (u64), `ooo_end` (u64) and `ooo_message` (str): fields appended to
+ * a repeated entry and to a fixed layout. SET_OUT_OF_OFFICE (0x013A) is new.
+ *
+ * 42: channel managers (REQ-036b). CHANNEL_INFO carries `creator_id` (u64) and
+ * `n_managers` (u16) with that many u64 user ids: fields appended to a fixed
+ * layout. CHANNEL_ADD_MANAGER and CHANNEL_REMOVE_MANAGER (0x013B, 0x013C) are
+ * new.
+ *
+ * 43: each EMOJI_LIST entry carries `created_at` (u64), `n_aliases` (u8) and
+ * that many old names (str), which a rename keeps resolving (REQ-072). Fields
+ * appended to a repeated entry. RENAME_EMOJI (0x013D) is new.
+ *
+ * 44: UPLOAD_BEGIN carries `media_kind` (u8), so a snippet's text past
+ * OC_SNIPPET_MAX_SIZE is refused before its bytes are sent (REQ-226). A field
+ * appended to a fixed layout.
+ *
+ * 45: WORKSPACE_INFO carries `audience` (str), the workspace's audience id
+ * with OpenChime's services, empty when it is not enrolled: an email link names
+ * a workspace by it (CLIENT.md, "Links"). A field appended to a fixed layout.
+ *
+ * 46: each AUDIT_PAGE entry carries `channel_id` (u64, 0 for none), the channel
+ * the entry happened in: a channel's own changes, and a moderated message or
+ * member in it, so a reader can go there (REQ-251). A field appended to a
+ * repeated entry. */
+#define OC_PROTOCOL_VERSION 46u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -603,6 +655,37 @@ typedef enum {
     OC_MSG_COLLAPSED_UPDATED    = 0x0118, /* S->C, to my connections: a message folded or opened; and replayed */
     OC_MSG_WORKSPACE_SETTINGS   = 0x0119, /* S->C, read-only: the workspace settings clients act on, after WORKSPACE_INFO */
     OC_MSG_READ_RECEIPTS        = 0x011A, /* both: whether I share my read receipts; C->S sets or asks, S->C tells */
+    /* Follow every thread in a conversation (REQ-282): the answer is the
+     * setter's NOTIFY_PREFS, to each of their connections. */
+    OC_MSG_SET_CHANNEL_THREAD_FOLLOW = 0x011B, /* C->S {channel_id, on} */
+    /* Moving a message, or a whole thread, to another channel or into a
+     * thread (REQ-053). Its id, history and replies go with it. */
+    OC_MSG_MOVE_MESSAGE         = 0x011C, /* C->S {message_id, dest_channel_id, dest_parent_id, leave_marker} */
+    OC_MSG_MESSAGE_MOVED        = 0x011D, /* S->C {message_id, from_channel, to_channel, to_parent, count} */
+    OC_MSG_FIND_AT_TIME         = 0x011E, /* C->S, the message at a time in a conversation or thread */
+    OC_MSG_FOUND_AT_TIME        = 0x011F, /* S->C, its answer: the first at or after it, else the last before */
+    OC_MSG_USAGE_REQ            = 0x0120, /* C->S, owner/admin: the workspace's usage over the last days */
+    OC_MSG_USAGE                = 0x0121, /* S->C, active members by day and week, messages by day, busiest channels */
+    OC_MSG_SET_USER_MUTE        = 0x0130, /* C->S, mute or unmute one person, for me alone */
+    OC_MSG_MUTED_USERS          = 0x0131, /* S->C, to my connections: everyone I have muted, at sign-in and on change */
+    OC_MSG_SET_BLOCK            = 0x0132, /* C->S, block or unblock one person, for me alone */
+    OC_MSG_BLOCKS               = 0x0133, /* S->C, to my connections: whom I block, and who may start a DM with me */
+    OC_MSG_LIST_BLOCKS          = 0x0134, /* C->S, owner/admin: every block in the workspace */
+    OC_MSG_BLOCK_LIST           = 0x0135, /* S->C, the answer: blocker, blocked and since, per block */
+    OC_MSG_SET_DM_PRIVACY       = 0x0136, /* C->S, who may start a new direct conversation with me */
+    OC_MSG_SET_PROFILE_FIELD    = 0x0137, /* C->S, owner/admin: add, rename or delete one of the workspace's profile fields */
+    OC_MSG_PROFILE_FIELDS       = 0x0138, /* S->C, the workspace's profile fields: at sign-in, and to everyone on a change */
+    OC_MSG_SET_PROFILE_FIELD_VALUE = 0x0139, /* C->S, my value for one profile field; empty clears it */
+    OC_MSG_SET_OUT_OF_OFFICE    = 0x013A, /* C->S, my out-of-office span and message; an end of 0 or past clears it */
+    OC_MSG_CHANNEL_ADD_MANAGER    = 0x013B, /* C->S, a manager, admin or owner names a member of the channel its manager */
+    OC_MSG_CHANNEL_REMOVE_MANAGER = 0x013C, /* C->S, and takes the role from any manager, the creator included */
+    OC_MSG_RENAME_EMOJI         = 0x013D, /* C->S, a custom emoji's new name; the old one stays as an alias */
+    /* To-do lists in messages: made by a "/todo" body, worked by
+     * these, and told as TODO, a list's whole state in one or more frames. */
+    OC_MSG_TODO_ADD             = 0x0122, /* C->S, a task added to a list */
+    OC_MSG_TODO_MARK            = 0x0123, /* C->S, a task marked done or not done */
+    OC_MSG_TODO_RENAME          = 0x0124, /* C->S, the author renames a list */
+    OC_MSG_TODO                 = 0x0125, /* S->C, a list's state, a range of its tasks per frame */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -705,8 +788,18 @@ typedef enum {
     OC_ERR_INVALID_POLL        = 3038, /* a poll's options or a vote out of bounds (REQ-225) */
     OC_ERR_POLL_CLOSED         = 3039, /* the poll is past its deadline: no more votes (REQ-225) */
     OC_ERR_POLL_HAS_VOTES      = 3040, /* a poll's options or settings, once anyone has voted (REQ-225) */
+    OC_ERR_TODO_NO_EDIT        = 3044, /* a message carrying a to-do list is not edited */
+    OC_ERR_TODO_INVALID        = 3045, /* a list's title or a task blank, too long, or no such task */
+    OC_ERR_TODO_DUPLICATE      = 3046, /* a task named as one already in the list */
+    OC_ERR_TODO_FULL           = 3047, /* a list already holding OC_TODO_MAX_TASKS tasks */
     OC_ERR_EDIT_WINDOW_CLOSED  = 3041, /* an author's edit or delete of their own message, past the workspace's window (REQ-051/052) */
     OC_ERR_WORKSPACE_SENDER    = 3042, /* a message to the workspace's own sender, whose DMs nobody reads */
+    OC_ERR_CANNOT_MOVE         = 3043, /* a move that cannot be made: into or out of an encrypted DM, a thread's
+                                        * root into a thread, into a thread elsewhere, or to where it already is */
+    OC_ERR_DM_REFUSED          = 3070, /* a new direct conversation this person does not take: never says why */
+    OC_ERR_INVALID_PROFILE_FIELD = 3071, /* a profile field without a label, past the cap, or a value too long or not a link */
+    OC_ERR_INVALID_OUT_OF_OFFICE = 3072, /* an out-of-office ending before it starts, or its message too long */
+    OC_ERR_EMOJI_ALIAS_LIMIT   = 3073, /* a rename past the old names an emoji, or the workspace, may keep */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -893,6 +986,9 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
  * is the notice (SUMMARY_OPEN), text its scope (OC_SUM_*) in digits, action
  * its status. */
 #define OC_ACT_SUMMARY  4u
+/* A reminder I set on a saved message, come due (REQ-283): message_id is the
+ * message, created_at the moment it fired. Mine alone. */
+#define OC_ACT_REMINDER 5u
 #define OC_MAX_SAVED    200u
 #define OC_MAX_ACTIVITY 200u
 
@@ -971,6 +1067,7 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 /* `media_kind` is OC_MEDIA_NONE for an ordinary file. For OC_MEDIA_VIDEO_MESSAGE
  * the four fields after it are on the wire too (REQ-165, ARCH-110); otherwise
  * they are absent and read as zero. */
+/* For OC_MEDIA_SNIPPET, `title` and `language` follow instead (REQ-226). */
 typedef struct {
     uint64_t id;
     oc_slice filename;
@@ -981,18 +1078,33 @@ typedef struct {
     uint32_t duration_ms;
     uint16_t width, height;
     uint64_t poster_id;
+    oc_slice title, language;
 } oc_attach_entry;
 
 /* Media kinds and the bounds ATTACH_MEDIA_SET enforces (REQ-162/164). */
 #define OC_MEDIA_NONE             0u
 #define OC_MEDIA_VIDEO_MESSAGE    1u
+/* A snippet (REQ-226): a text/plain upload with a title and an optional
+ * language, shown highlighted. Its bytes ride the attachment path; the first
+ * OC_SNIPPET_INDEX_MAX of them come with ATTACH_MEDIA_SET to be searchable. */
+#define OC_MEDIA_SNIPPET          2u
+#define OC_SNIPPET_MAX_SIZE       (1024u * 1024u)
+#define OC_SNIPPET_TITLE_MAX      120u
+#define OC_SNIPPET_LANG_MAX       16u
+#define OC_SNIPPET_INDEX_MAX      65536u
+/* Past either, a paste is offered as a snippet. */
+#define OC_SNIPPET_PASTE_LINES    40u
+#define OC_SNIPPET_PASTE_BYTES    4096u
 #define OC_MEDIA_MAX_DURATION_MS  300000u      /* five minutes, the recording cap */
 #define OC_MEDIA_MAX_WIDTH        1920u
 #define OC_MEDIA_MAX_HEIGHT       1080u
 #define OC_MEDIA_MAX_POSTER_SIZE  (1024u * 1024u)
 
+/* For OC_MEDIA_SNIPPET the video fields are absent and `title`, `language` and
+ * `text` (the body's first OC_SNIPPET_INDEX_MAX bytes, for search) follow. */
 typedef struct { uint64_t attachment_id; uint8_t media_kind; uint32_t duration_ms;
-                 uint16_t width, height; uint64_t poster_id; } oc_attach_media_set;
+                 uint16_t width, height; uint64_t poster_id;
+                 oc_slice title, language, text; } oc_attach_media_set;
 typedef struct { uint64_t attachment_id; } oc_attach_media_ok;
 
 typedef struct { uint16_t min_version; uint16_t max_version; oc_slice client_info; } oc_hello;
@@ -1039,8 +1151,10 @@ typedef struct { uint8_t scope; oc_slice session_token; } oc_logout;
 #define OC_WS_MODE_NORMAL      0
 #define OC_WS_MODE_DEVELOPMENT 1
 #define OC_WS_MODE_DEMO        2
+/* audience is the workspace's audience id with OpenChime's services (AUTH.md
+ * §3.3), empty when it is not enrolled: what an email link names it by. */
 typedef struct { uint8_t deployment_mode; uint32_t max_users; oc_slice workspace_name;
-                 uint8_t call_max; uint8_t mode; uint64_t max_video_size; } oc_workspace_info;
+                 uint8_t call_max; uint8_t mode; uint64_t max_video_size; oc_slice audience; } oc_workspace_info;
 /* Pushed after WORKSPACE_INFO, only where the deployment names the workspace's
  * canonical address (OPENCHIME_MANAGED_ADDRESS): a workspace moved to a new
  * address still answers at the old one for a while, and a client that connected
@@ -1066,11 +1180,15 @@ typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; uint64_t messa
  * broadcast its body holds notifies (REQ-221); 0 otherwise, whatever the body.
  * Last in the struct, where it was added; on the wire it sits in the fixed
  * part, after `kind`. */
+/* `parent_id` is the thread a reply also posted to the channel belongs to
+ * (REQ-062), 0 for a message that is not a reply; on the wire it follows
+ * `broadcast_stored`, in the fixed part. */
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time;
                  uint8_t kind; oc_slice body;
                  uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH];
                  oc_slice author_name;   /* override name (webhooks); empty = use author_id */
-                 uint8_t broadcast_stored; } oc_broadcast;
+                 uint8_t broadcast_stored;
+                 uint64_t parent_id; } oc_broadcast;
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_client_ack;
 /* A member's read cursor in a channel advanced (REQ-090 seen-by). */
 typedef struct { uint64_t channel_id; uint64_t user_id; uint64_t message_id; } oc_read_cursor;
@@ -1088,6 +1206,13 @@ typedef struct { uint64_t message_id; uint16_t count; const oc_reaction_entry *e
  * body is fine — terminated by PINS, exactly as LIST_THREAD does, because a
  * pinned message is often scrolled out of a client's loaded history. */
 typedef struct { uint64_t channel_id; uint64_t message_id; uint8_t op; } oc_pin;
+/* MOVE_MESSAGE: `dest_parent_id` 0 moves it to the destination's top level, else
+ * into that thread there; `leave_marker` 1 leaves a line where it was. A root
+ * moves with its replies. */
+typedef struct { uint64_t message_id, dest_channel_id, dest_parent_id; uint8_t leave_marker; } oc_move_message;
+/* MESSAGE_MOVED: to the readers of both channels. `count` is how many messages
+ * moved -- a root and its replies -- and `to_parent` 0 means its top level. */
+typedef struct { uint64_t message_id, from_channel, to_channel, to_parent; uint32_t count; } oc_message_moved;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t user_id; uint8_t op; uint64_t pinned_at; } oc_pin_updated;
 typedef struct { uint64_t channel_id; } oc_list_pins;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time;
@@ -1151,6 +1276,24 @@ typedef struct { uint64_t channel_id; uint64_t message_id; } oc_list_poll_voters
 typedef struct { uint64_t channel_id; uint64_t message_id; uint8_t flags; uint64_t close_at_ms;
                  uint8_t n_options; oc_slice options[OC_POLL_MAX_OPTIONS]; } oc_edit_poll;
 typedef struct { uint8_t option; uint64_t user_id; } oc_poll_voter;
+/* To-do lists. The title and the tasks are a message's, kept by the daemon in
+ * their own rows; the body that made them stays as written. A task is named
+ * by its place in the list, which never changes: tasks are added at the end
+ * and never removed or reordered. */
+#define OC_TODO_TITLE_MAX  250u
+#define OC_TODO_NAME_MAX   250u
+#define OC_TODO_DESC_MAX   1000u
+#define OC_TODO_MAX_TASKS  200u
+#define OC_TODO_CHUNK      40u        /* the most tasks one TODO frame carries */
+typedef struct { uint64_t channel_id; uint64_t message_id; oc_slice name; oc_slice description; } oc_todo_add;
+/* `done` is the state wanted, not a toggle: two people marking at once agree. */
+typedef struct { uint64_t channel_id; uint64_t message_id; uint16_t task; uint8_t done; } oc_todo_mark;
+typedef struct { uint64_t channel_id; uint64_t message_id; oc_slice title; } oc_todo_rename;
+typedef struct { oc_slice name; oc_slice description; uint8_t done; uint64_t done_by; uint64_t done_at_ms; } oc_todo_task;
+/* TODO: tasks [first, first + n) of a list of `total`. A list is told in
+ * frames from first 0 up; the one with first 0 replaces what a client held. */
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; oc_slice title;
+                 uint16_t total; uint16_t first; uint8_t n; oc_todo_task tasks[OC_TODO_CHUNK]; } oc_todo_msg;
 /* SUMMARIZE (REQ-310): which span of a channel or DM to summarize. scope
  * OC_SUM_UNREAD (from the reader's place to now), OC_SUM_TODAY (today so far),
  * OC_SUM_DAILY (since yesterday: yesterday and today so far), OC_SUM_WEEK (the
@@ -1229,17 +1372,23 @@ typedef struct {
 /* `more` is 1 when the daemon stopped at the page limit and rows remain. */
 typedef struct { uint64_t channel_id; uint32_t count; uint8_t more; } oc_files;
 
-typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; uint64_t parent_id; oc_slice body;
+/* `also_channel` 1 posts the reply to the channel's main scroll too (REQ-062):
+ * one message, in both places. In the fixed part, ahead of the attachment tail. */
+typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; uint64_t parent_id; uint8_t also_channel;
+                 oc_slice body;
                  uint16_t n_attach; uint64_t attach_ids[OC_MAX_ATTACH]; } oc_send_reply;
 /* `participant` is per-RECIPIENT, which no other field on a fan-out frame is:
  * it answers "are you in this thread" (REQ-061, ARCH-104) for the peer being
  * written to, so the daemon encodes the frame twice — once each way — and sends
  * whichever matches. It is the evaluator's thread_reply INPUT and not a verdict;
  * the recipient still decides with its own mute, level and schedule. */
-/* `broadcast_stored` as on BROADCAST (REQ-221): written after `participant`. */
+/* `broadcast_stored` as on BROADCAST (REQ-221): written after `participant`.
+ * `also_channel` 1: the reply is also in the channel's main scroll (REQ-062),
+ * written after `broadcast_stored` -- one frame, so a client shows it once. */
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t parent_id; uint64_t author_id; uint64_t server_time; uint32_t reply_count; uint8_t participant; oc_slice body;
                  uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH];
-                 uint8_t broadcast_stored; } oc_thread_reply;
+                 uint8_t broadcast_stored;
+                 uint8_t also_channel; } oc_thread_reply;
 typedef struct { uint64_t channel_id; uint64_t parent_id; } oc_list_thread;
 /* THREAD is the terminator of a LIST_THREAD response: the daemon streams the
  * replies as THREAD_REPLY frames (each self-framed, so a 64KB body is fine),
@@ -1256,13 +1405,17 @@ typedef struct {
 typedef struct { oc_slice name; uint8_t is_public; } oc_create_channel;
 typedef struct { uint64_t channel_id; uint8_t op; oc_slice value; } oc_update_channel;
 
-/* Saved items (REQ-231) — private, so SAVED_UPDATED goes to the actor only. */
-typedef struct { uint64_t message_id; uint8_t op; } oc_save_item;
-typedef struct { uint64_t message_id; uint8_t op; uint64_t saved_at; } oc_saved_updated;
+/* Saved items (REQ-231) — private, so SAVED_UPDATED goes to the actor only.
+ * `remind_at_ms` is the item's reminder (REQ-283), 0 for none: on SAVE_ITEM with
+ * op ADD it is set (a reminder on an unsaved message saves it), and 0 clears
+ * it; REMOVE takes the reminder with the item. */
+typedef struct { uint64_t message_id; uint8_t op; uint64_t remind_at_ms; } oc_save_item;
+typedef struct { uint64_t message_id; uint8_t op; uint64_t saved_at; uint64_t remind_at_ms; } oc_saved_updated;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id;
                  uint64_t server_time; uint64_t saved_at; oc_slice body;
                  oc_slice attach_name;
-                 uint8_t action;   /* as oc_pinned_msg's (REQ-058) */ } oc_saved_msg;
+                 uint8_t action;   /* as oc_pinned_msg's (REQ-058) */
+                 uint64_t remind_at_ms; } oc_saved_msg;
 typedef struct { uint32_t count; } oc_saved;
 /* Collapsed messages: one person's, on every device of theirs. SET_COLLAPSED
  * folds a message away (on 1) or opens it (on 0); COLLAPSED_UPDATED says so to
@@ -1290,10 +1443,17 @@ typedef struct { uint32_t count; uint64_t seen_at; } oc_activity;
 /* `peers` carries a GROUP DM's participants (REQ-056), so a client can title the
  * conversation on first paint instead of fetching a roster per group. Empty for a
  * channel and for a 1:1 DM, whose single other participant is `peer_id`. */
+/* A channel's managers (REQ-036b): members who may rename, archive and
+ * unarchive it, beside owners and admins. At most this many. */
+#define OC_MAX_CHANNEL_MANAGERS 64u
 typedef struct { uint64_t channel_id; uint8_t kind; oc_slice name; uint8_t is_public; uint8_t joined; uint64_t created_at;
                  uint64_t peer_id; oc_slice topic; uint8_t archived;
                  uint16_t n_peers; uint64_t peers[OC_MAX_GROUP_DM + 1];
-                 uint8_t e2e; } oc_channel_info;   /* 1: an end-to-end encrypted DM (PRIVATE-DM.md) */
+                 uint8_t e2e;   /* 1: an end-to-end encrypted DM (PRIVATE-DM.md) */
+                 /* As of protocol 42: who made the channel (0 when unknown, and
+                  * for a DM), and its managers (REQ-036b). */
+                 uint64_t creator_id;
+                 uint16_t n_managers; uint64_t managers[OC_MAX_CHANNEL_MANAGERS]; } oc_channel_info;
 typedef struct { uint64_t channel_id; } oc_channel_ref;                       /* JOIN / LEAVE */
 typedef struct { uint64_t channel_id; uint64_t user_id; } oc_channel_member_op; /* INVITE / REMOVE */
 /* CHANNEL_LIST entry. `last_message_at`/`unread` were added 2026-07-27 so a
@@ -1385,16 +1545,52 @@ typedef struct { uint16_t count; uint64_t user_ids[OC_MAX_GROUP_DM]; } oc_open_g
 #define OC_MAX_CUSTOM_EMOJI 512u
 typedef struct { oc_slice name; uint64_t attachment_id; } oc_add_emoji;
 typedef struct { oc_slice name; } oc_delete_emoji;
-typedef struct { oc_slice name; uint64_t attachment_id; uint64_t created_by; } oc_emoji_entry;
+/* A rename keeps the old name as an alias of the same image (REQ-072): at most
+ * OC_MAX_EMOJI_ALIASES per emoji and OC_MAX_EMOJI_ALIASES_TOTAL in a workspace,
+ * which keeps the whole catalogue inside one EMOJI_LIST frame. */
+#define OC_MAX_EMOJI_ALIASES        8u
+#define OC_MAX_EMOJI_ALIASES_TOTAL  256u
+typedef struct { oc_slice name; uint64_t attachment_id; uint64_t created_by;
+                 /* As of protocol 43: when it was added, and its old names. */
+                 uint64_t created_at;
+                 uint8_t n_aliases; oc_slice aliases[OC_MAX_EMOJI_ALIASES]; } oc_emoji_entry;
+typedef struct { oc_slice name; oc_slice new_name; } oc_rename_emoji;
 typedef struct { uint16_t count; const oc_emoji_entry *entries; } oc_emoji_list;
 /* Everything a card shows about one person. `phone` is here and NOT on
  * USER_LIST: this frame goes to the one person who asked for the card, where a
  * roster fan-out would hand every member's number to everybody. */
+/* A workspace's own profile fields (department, location, manager): defined by
+ * an owner or admin, each plain text or a link, in `position` order. A person's
+ * values ride PROFILE_INFO; one for a field the workspace no longer has is not
+ * sent. A link value starts https://. */
+#define OC_MAX_PROFILE_FIELDS      20u
+#define OC_PROFILE_FIELD_LABEL_MAX 64u
+#define OC_PROFILE_FIELD_VALUE_MAX 200u
+#define OC_PROFILE_FIELD_TEXT      0u
+#define OC_PROFILE_FIELD_LINK      1u
+#define OC_PROFILE_FIELD_SET       0u   /* field_id 0 adds one; otherwise renames it */
+#define OC_PROFILE_FIELD_DELETE    1u   /* and every value anyone gave it */
+/* `position` 0 on an add puts the field last, on a rename keeps where it is. */
+typedef struct { uint64_t field_id; uint8_t op; uint8_t kind; uint16_t position; oc_slice label; } oc_set_profile_field;
+typedef struct { uint64_t field_id; uint8_t kind; uint16_t position; oc_slice label; } oc_profile_field;
+typedef struct { uint8_t count; const oc_profile_field *fields; } oc_profile_fields;
+/* SET_PROFILE_FIELD_VALUE, and each value PROFILE_INFO carries. */
+typedef struct { uint64_t field_id; oc_slice value; } oc_profile_field_value;
 typedef struct { uint64_t user_id; oc_slice display_name; oc_slice email;
                  oc_slice status_emoji; oc_slice status_text; uint64_t status_expires;
                  oc_slice title; oc_slice timezone; uint64_t avatar_id;
                  uint8_t role; oc_slice full_name; oc_slice pronouns;
-                 oc_slice phone; oc_slice voice_id; } oc_profile_info;
+                 oc_slice phone; oc_slice voice_id;
+                 /* As of protocol 40: the person's values for the workspace's
+                  * profile fields, those they filled. */
+                 uint8_t n_fields; oc_profile_field_value fields[OC_MAX_PROFILE_FIELDS];
+                 /* As of protocol 41: out of office, as on USER_LIST. */
+                 uint64_t ooo_start, ooo_end; oc_slice ooo_message; } oc_profile_info;
+/* Out of office (REQ-122): apart from the custom status, which shows beside
+ * it. `end_ms` 0, or a time already past, clears it; a message is at most
+ * OC_OOO_MESSAGE_MAX bytes. */
+#define OC_OOO_MESSAGE_MAX 280u
+typedef struct { uint64_t start_ms, end_ms; oc_slice message; } oc_set_out_of_office;
 /* Counts, not rows: the column shows "#design 12", so the wire carries
  * exactly that and nothing more. */
 /* REQ-182. `current` marks the connection asking — you should be able to tell which
@@ -1414,8 +1610,10 @@ typedef struct { uint8_t status; } oc_set_presence;
  * never the end time. Appended after `status`, and decoded tolerantly, so a peer
  * built before it existed still reads the frame it always read. */
 typedef struct { uint64_t user_id; uint8_t status; uint8_t dnd; } oc_presence_update;
-typedef struct { uint64_t channel_id; } oc_typing;
-typedef struct { uint64_t channel_id; uint64_t user_id; } oc_typing_update;
+/* `thread_root` (REQ-121): the thread the typer is composing in, 0 for the
+ * channel's main scroll. Appended to both: protocol 36. */
+typedef struct { uint64_t channel_id; uint64_t thread_root; } oc_typing;
+typedef struct { uint64_t channel_id; uint64_t user_id; uint64_t thread_root; } oc_typing_update;
 /* Notification preferences (REQ-130/131). */
 typedef struct { uint64_t channel_id; uint8_t level; } oc_set_notify_pref;
 /* The notification schedule (REQ-136, ARCH-103). `mode`: 0 off, 1 every day,
@@ -1447,6 +1645,28 @@ typedef struct { uint8_t count; const oc_slice *terms; } oc_set_keywords;
 typedef struct { uint8_t count; const uint64_t *people; } oc_set_priority;
 typedef struct { uint8_t n_terms; const oc_slice *terms;
                  uint8_t n_people; const uint64_t *people; } oc_alert_prefs;
+/* Muted people: the people one person has chosen to stop hearing from. Their
+ * messages, replies, reactions and mentions notify that person nowhere and count
+ * as unread for nobody who muted them, and a client shows them folded away until
+ * revealed. Kept by the daemon so every device and push agree; the muted person
+ * is told nothing and sees no change. */
+#define OC_MAX_MUTED_USERS 256u
+typedef struct { uint64_t muted_id; uint8_t on; } oc_set_user_mute;
+typedef struct { uint16_t count; const uint64_t *ids; } oc_muted_users;
+/* Blocks and DM privacy. A block is its blocker's alone and is never shown to
+ * the person blocked: they cannot start a direct conversation with the blocker,
+ * and what they send into one they already share is kept for its other members
+ * but withheld from the blocker, live and in backfill, for good. DM privacy
+ * says who may start a new direct conversation with a person: anyone, or
+ * nobody. A refusal of either kind is the same OC_ERR_DM_REFUSED. */
+#define OC_MAX_BLOCKS        256u
+#define OC_BLOCK_LIST_MAX    500u
+#define OC_DM_PRIVACY_ANYONE 0u
+#define OC_DM_PRIVACY_NOBODY 1u
+typedef struct { uint64_t blocked_id; uint8_t on; } oc_set_block;
+typedef struct { uint8_t dm_privacy; uint16_t count; const uint64_t *ids; } oc_blocks;
+typedef struct { uint64_t blocker_id, blocked_id, since_ms; } oc_block_entry;
+typedef struct { uint16_t count; const oc_block_entry *entries; } oc_block_list;
 
 /* One thread in the aggregated view (REQ-062). `unread` counts replies by other
  * people past my per-thread cursor — a channel cursor cannot answer this, since
@@ -1498,7 +1718,12 @@ typedef struct { uint8_t ok; uint16_t code; } oc_device_token_ack;
  * is a repeated list, so an extra byte per entry shifts every entry after the first.
  * My first note here claimed otherwise. Hence the bump to protocol 3, which the
  * search cursor needs regardless. */
-typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; } oc_notify_pref_entry;
+/* `follow_threads` (REQ-282): every thread in the conversation is followed, as
+ * if each were, unless muted or one is unfollowed by itself. Appended per entry:
+ * a layout change, so protocol 37. */
+typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; uint8_t follow_threads; } oc_notify_pref_entry;
+/* SET_CHANNEL_THREAD_FOLLOW: follow every thread in a conversation, or stop. */
+typedef struct { uint64_t channel_id; uint8_t on; } oc_set_channel_thread_follow;
 typedef struct { uint8_t level; } oc_set_notify_default;
 /* `notify_default` (REQ-134) rides here so a client learns the fallback with the rest
  * of its notification state, rather than needing a second round trip. Appended at the
@@ -1551,6 +1776,26 @@ typedef struct {
     uint8_t  under_pressure;
 } oc_storage_status;
 
+/* Usage (REQ-043, the console's usage figures): how much the workspace is used, and where, over the last
+ * `days` UTC days (1..OC_USAGE_MAX_DAYS), today included. Sent only to an
+ * owner/admin. A day is days since the epoch in UTC; a week is an ISO week,
+ * written yyyyww (202645). Active members are those who signed in or used a
+ * session that day (or week); messages are those people posted: the
+ * workspace's own messages and call events are not counted. A private channel's name is sent only to someone who can read it. */
+#define OC_USAGE_MAX_DAYS      90
+#define OC_USAGE_MAX_WEEKS     15   /* 90 days span at most 14 ISO weeks; one spare */
+#define OC_USAGE_TOP_CHANNELS  10
+typedef struct { uint16_t days; } oc_usage_req;
+typedef struct { uint32_t day; uint32_t active; uint32_t messages; } oc_usage_day;
+typedef struct { uint32_t week; uint32_t active; } oc_usage_week;
+typedef struct { uint64_t channel_id; uint32_t messages; uint8_t is_private; oc_slice name; } oc_usage_channel;
+typedef struct {
+    uint16_t days;
+    uint16_t n_days;      const oc_usage_day     *day;      /* oldest first */
+    uint16_t n_weeks;     const oc_usage_week    *week;     /* oldest first */
+    uint16_t n_channels;  const oc_usage_channel *channel;  /* busiest first */
+} oc_usage;
+
 /* Audit log paging (REQ-251). `before_ms` pages backwards from a timestamp
  * rather than by offset, so a boundary stays stable as new entries arrive;
  * 0 asks for the newest page. */
@@ -1570,6 +1815,7 @@ typedef struct {
     oc_slice detail;      /* never the secret involved (ARCH-79) */
     uint8_t  family;      /* 1 admin, 2 account, 3 security, 4 moderation */
     uint8_t  outcome;     /* 1 ok, 0 denied/failed */
+    uint64_t channel_id;  /* the channel it happened in, 0 for none (protocol 46) */
 } oc_audit_entry;
 
 typedef struct {
@@ -1649,7 +1895,10 @@ typedef struct { uint64_t pdm_id; uint8_t reason; } oc_pdm_end;
 
 /* Attachment transfer (REQ-140/141, ARCH-69). `data` chunks are zero-copy views.
  * sha256 is a 32-byte digest carried as `bytes`. */
-typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice filename; oc_slice mime; uint64_t total_size; } oc_upload_begin;
+/* `media_kind` (as of 44): OC_MEDIA_SNIPPET declares a snippet's text, which the
+ * daemon refuses here past OC_SNIPPET_MAX_SIZE; 0 for any other upload. */
+typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice filename; oc_slice mime; uint64_t total_size;
+                 uint8_t media_kind; } oc_upload_begin;
 typedef struct { uint64_t attachment_id; uint32_t chunk_size; uint32_t window_bytes; } oc_upload_ready;
 typedef struct { uint64_t attachment_id; uint32_t seq; oc_slice data; } oc_upload_chunk;
 typedef struct { uint64_t attachment_id; uint32_t acked_through; } oc_upload_ack;
@@ -1736,7 +1985,10 @@ typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice emai
                  oc_slice voice_id;
                  /* OC_USER_SYSTEM: the workspace's own sender, which posts
                   * what the workspace says (its welcome); not a person. */
-                 uint8_t flags; } oc_user_list_entry;
+                 uint8_t flags;
+                 /* As of protocol 41: out of office, as stored. In force while
+                  * start <= now < end; the reader decides. */
+                 uint64_t ooo_start, ooo_end; oc_slice ooo_message; } oc_user_list_entry;
 #define OC_USER_SYSTEM 0x01u
 typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
 typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;
@@ -1830,6 +2082,13 @@ typedef struct { uint64_t channel_id; uint64_t before_message_id; uint16_t limit
  * Replies as a BACKFILL replay — same rows, same encoding, only the WHERE
  * differs, so nothing downstream needs a second code path. */
 typedef struct { uint64_t channel_id; uint64_t message_id; uint16_t limit; } oc_history_around;
+/* Jump to a date: FIND_AT_TIME asks for the message at `at_ms` in a conversation
+ * (`parent_id` 0) or a thread. FOUND_AT_TIME answers with the first message at
+ * or after it, `exact` 1; with the last before it, `exact` 0, when none is
+ * later; `message_id` 0 when the conversation has none. The client then opens
+ * it as a permalink does (HISTORY_AROUND). */
+typedef struct { uint64_t channel_id, parent_id, at_ms; } oc_find_at_time;
+typedef struct { uint64_t channel_id, parent_id, message_id, server_time; uint8_t exact; } oc_found_at_time;
 typedef struct { uint64_t high_water; uint8_t more; } oc_backfill_done;
 typedef struct { uint16_t code; uint8_t fatal; oc_slice context; oc_slice message; } oc_error;
 
@@ -1879,6 +2138,10 @@ oc_result oc_encode_vote(oc_wbuf *w, uint16_t version, const oc_vote *m);
 oc_result oc_encode_poll(oc_wbuf *w, uint16_t version, const oc_poll_msg *m);
 oc_result oc_encode_list_poll_voters(oc_wbuf *w, uint16_t version, const oc_list_poll_voters *m);
 oc_result oc_encode_edit_poll(oc_wbuf *w, uint16_t version, const oc_edit_poll *m);
+oc_result oc_encode_todo_add(oc_wbuf *w, uint16_t version, const oc_todo_add *m);
+oc_result oc_encode_todo_mark(oc_wbuf *w, uint16_t version, const oc_todo_mark *m);
+oc_result oc_encode_todo_rename(oc_wbuf *w, uint16_t version, const oc_todo_rename *m);
+oc_result oc_encode_todo(oc_wbuf *w, uint16_t version, const oc_todo_msg *m);
 oc_result oc_encode_poll_voters(oc_wbuf *w, uint16_t version, uint64_t message_id,
                                 const oc_poll_voter *voters, uint16_t count);
 oc_result oc_encode_summarize(oc_wbuf *w, uint16_t version, const oc_summarize *m);
@@ -1913,12 +2176,24 @@ oc_result oc_encode_list_saved(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_saved_msg(oc_wbuf *w, uint16_t version, const oc_saved_msg *m);
 oc_result oc_encode_saved(oc_wbuf *w, uint16_t version, const oc_saved *m);
 oc_result oc_encode_set_collapsed(oc_wbuf *w, uint16_t version, const oc_set_collapsed *m);
+oc_result oc_encode_set_profile_field(oc_wbuf *w, uint16_t version, const oc_set_profile_field *m);
+oc_result oc_decode_set_profile_field(oc_rbuf *p, oc_set_profile_field *m);
+oc_result oc_encode_profile_fields(oc_wbuf *w, uint16_t version, const oc_profile_fields *m);
+/* Into `out`, which holds OC_MAX_PROFILE_FIELDS; more is refused. */
+oc_result oc_decode_profile_fields(oc_rbuf *p, oc_profile_field *out, uint8_t *out_n);
+oc_result oc_encode_set_profile_field_value(oc_wbuf *w, uint16_t version, const oc_profile_field_value *m);
+oc_result oc_decode_set_profile_field_value(oc_rbuf *p, oc_profile_field_value *m);
+oc_result oc_encode_set_out_of_office(oc_wbuf *w, uint16_t version, const oc_set_out_of_office *m);
+oc_result oc_decode_set_out_of_office(oc_rbuf *p, oc_set_out_of_office *m);
 oc_result oc_encode_collapsed_updated(oc_wbuf *w, uint16_t version, const oc_set_collapsed *m);
 oc_result oc_encode_list_activity(oc_wbuf *w, uint16_t version, uint8_t filter);
 oc_result oc_decode_list_activity(oc_rbuf *p, uint8_t *filter);
 oc_result oc_encode_activity_entry(oc_wbuf *w, uint16_t version, const oc_activity_entry *m);
 oc_result oc_encode_activity(oc_wbuf *w, uint16_t version, const oc_activity *m);
 oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m);
+oc_result oc_encode_channel_add_manager(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
+oc_result oc_encode_channel_remove_manager(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
+oc_result oc_decode_channel_manager_op(oc_rbuf *p, oc_channel_member_op *m);   /* both frames */
 oc_result oc_encode_mention_unresolved(oc_wbuf *w, uint16_t version, const oc_mention_unresolved *m);
 oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version);
 /* Bodyless request for the storage report (REQ-214); owner/admin only. */
@@ -1963,6 +2238,8 @@ oc_result oc_encode_alerts(oc_wbuf *w, uint16_t version, const oc_alerts *m);
 oc_result oc_encode_alert_ack(oc_wbuf *w, uint16_t version, const oc_alert_ack *m);
 oc_result oc_encode_add_emoji(oc_wbuf *w, uint16_t version, const oc_add_emoji *m);
 oc_result oc_encode_delete_emoji(oc_wbuf *w, uint16_t version, const oc_delete_emoji *m);
+oc_result oc_encode_rename_emoji(oc_wbuf *w, uint16_t version, const oc_rename_emoji *m);
+oc_result oc_decode_rename_emoji(oc_rbuf *p, oc_rename_emoji *m);
 oc_result oc_encode_list_emoji(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_emoji_list(oc_wbuf *w, uint16_t version, const oc_emoji_list *m);
 oc_result oc_decode_set_notify_default(oc_rbuf *p, oc_set_notify_default *m);
@@ -2035,11 +2312,28 @@ oc_result oc_encode_set_schedule(oc_wbuf *w, uint16_t version, const oc_schedule
 oc_result oc_encode_schedule(oc_wbuf *w, uint16_t version, const oc_schedule *m);
 oc_result oc_encode_set_keywords(oc_wbuf *w, uint16_t version, const oc_set_keywords *m);
 oc_result oc_encode_set_priority(oc_wbuf *w, uint16_t version, const oc_set_priority *m);
+oc_result oc_encode_set_user_mute(oc_wbuf *w, uint16_t version, const oc_set_user_mute *m);
+oc_result oc_decode_set_user_mute(oc_rbuf *r, oc_set_user_mute *m);
+oc_result oc_encode_muted_users(oc_wbuf *w, uint16_t version, const oc_muted_users *m);
+/* Into `ids`, which holds OC_MAX_MUTED_USERS; a frame with more is refused. */
+oc_result oc_decode_muted_users(oc_rbuf *r, uint64_t *ids, uint16_t *out_n);
+oc_result oc_encode_set_block(oc_wbuf *w, uint16_t version, const oc_set_block *m);
+oc_result oc_decode_set_block(oc_rbuf *r, oc_set_block *m);
+oc_result oc_encode_blocks(oc_wbuf *w, uint16_t version, const oc_blocks *m);
+/* Into `ids`, which holds OC_MAX_BLOCKS; more is refused. */
+oc_result oc_decode_blocks(oc_rbuf *r, uint8_t *dm_privacy, uint64_t *ids, uint16_t *out_n);
+oc_result oc_encode_list_blocks(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_block_list(oc_wbuf *w, uint16_t version, const oc_block_list *m);
+/* Into `out`, which holds OC_BLOCK_LIST_MAX; more is refused. */
+oc_result oc_decode_block_list(oc_rbuf *r, oc_block_entry *out, uint16_t *out_n);
+oc_result oc_encode_set_dm_privacy(oc_wbuf *w, uint16_t version, uint8_t value);
+oc_result oc_decode_set_dm_privacy(oc_rbuf *r, uint8_t *value);
 oc_result oc_encode_alert_prefs(oc_wbuf *w, uint16_t version, const oc_alert_prefs *m);
 oc_result oc_encode_list_threads(oc_wbuf *w, uint16_t version, const oc_list_threads *m);
 oc_result oc_encode_thread_summary(oc_wbuf *w, uint16_t version, const oc_thread_summary *m);
 oc_result oc_encode_threads(oc_wbuf *w, uint16_t version, const oc_threads *m);
 oc_result oc_encode_set_thread_follow(oc_wbuf *w, uint16_t version, const oc_set_thread_follow *m);
+oc_result oc_encode_set_channel_thread_follow(oc_wbuf *w, uint16_t version, const oc_set_channel_thread_follow *m);
 oc_result oc_encode_mark_thread_read(oc_wbuf *w, uint16_t version, const oc_mark_thread_read *m);
 oc_result oc_encode_register_device_token(oc_wbuf *w, uint16_t version, const oc_register_device_token *m);
 oc_result oc_encode_unregister_device_token(oc_wbuf *w, uint16_t version, oc_slice token);
@@ -2066,6 +2360,13 @@ oc_result oc_decode_audit_page(oc_rbuf *r, oc_audit_entry *out, uint16_t cap, ui
 
 oc_result oc_encode_storage_status(oc_wbuf *w, uint16_t ver, const oc_storage_status *m);
 oc_result oc_decode_storage_status(oc_rbuf *r, oc_storage_status *m);
+oc_result oc_encode_usage_req(oc_wbuf *w, uint16_t ver, const oc_usage_req *m);
+oc_result oc_decode_usage_req(oc_rbuf *r, oc_usage_req *m);
+oc_result oc_encode_usage(oc_wbuf *w, uint16_t ver, const oc_usage *m);
+/* Into the caller's arrays, which hold OC_USAGE_MAX_DAYS, OC_USAGE_MAX_WEEKS and
+ * OC_USAGE_TOP_CHANNELS entries; a frame claiming more is refused. */
+oc_result oc_decode_usage(oc_rbuf *r, oc_usage *m, oc_usage_day *days, oc_usage_week *weeks,
+                          oc_usage_channel *channels);
 
 oc_result oc_encode_client_settings(oc_wbuf *w, uint16_t version, const oc_client_settings *m);
 oc_result oc_encode_call_join(oc_wbuf *w, uint16_t version, const oc_call_join *m);
@@ -2134,6 +2435,8 @@ oc_result oc_encode_search_results(oc_wbuf *w, uint16_t version, const oc_search
 oc_result oc_encode_backfill_request(oc_wbuf *w, uint16_t version, const oc_backfill_request *m);
 oc_result oc_encode_history_request(oc_wbuf *w, uint16_t version, const oc_history_request *m);
 oc_result oc_encode_history_around(oc_wbuf *w, uint16_t version, const oc_history_around *m);
+oc_result oc_encode_find_at_time(oc_wbuf *w, uint16_t version, const oc_find_at_time *m);
+oc_result oc_encode_found_at_time(oc_wbuf *w, uint16_t version, const oc_found_at_time *m);
 oc_result oc_encode_backfill_done(oc_wbuf *w, uint16_t version, const oc_backfill_done *m);
 oc_result oc_encode_error(oc_wbuf *w, uint16_t version, const oc_error *m);
 
@@ -2175,6 +2478,10 @@ oc_result oc_decode_react(oc_rbuf *p, oc_react *m);
 oc_result oc_decode_reaction_updated(oc_rbuf *p, oc_reaction_updated *m);
 oc_result oc_decode_list_reactions(oc_rbuf *p, oc_list_reactions *m);
 oc_result oc_decode_pin(oc_rbuf *p, oc_pin *m);
+oc_result oc_encode_move_message(oc_wbuf *w, uint16_t version, const oc_move_message *m);
+oc_result oc_decode_move_message(oc_rbuf *p, oc_move_message *m);
+oc_result oc_encode_message_moved(oc_wbuf *w, uint16_t version, const oc_message_moved *m);
+oc_result oc_decode_message_moved(oc_rbuf *p, oc_message_moved *m);
 oc_result oc_decode_pin_updated(oc_rbuf *p, oc_pin_updated *m);
 oc_result oc_decode_unfurl(oc_rbuf *p, oc_unfurl *m);
 oc_result oc_decode_forward(oc_rbuf *p, oc_forward *m);
@@ -2184,6 +2491,10 @@ oc_result oc_decode_vote(oc_rbuf *p, oc_vote *m);
 oc_result oc_decode_poll(oc_rbuf *p, oc_poll_msg *m);
 oc_result oc_decode_list_poll_voters(oc_rbuf *p, oc_list_poll_voters *m);
 oc_result oc_decode_edit_poll(oc_rbuf *p, oc_edit_poll *m);
+oc_result oc_decode_todo_add(oc_rbuf *p, oc_todo_add *m);
+oc_result oc_decode_todo_mark(oc_rbuf *p, oc_todo_mark *m);
+oc_result oc_decode_todo_rename(oc_rbuf *p, oc_todo_rename *m);
+oc_result oc_decode_todo(oc_rbuf *p, oc_todo_msg *m);
 /* Fills up to `cap` entries; *out_count is how many the frame said. */
 oc_result oc_decode_poll_voters(oc_rbuf *p, oc_poll_voter *voters, uint16_t cap,
                                 uint16_t *out_count, uint64_t *out_message_id);
@@ -2263,6 +2574,7 @@ oc_result oc_decode_list_threads(oc_rbuf *p, oc_list_threads *m);
 oc_result oc_decode_thread_summary(oc_rbuf *p, oc_thread_summary *m);
 oc_result oc_decode_threads(oc_rbuf *p, oc_threads *m);
 oc_result oc_decode_set_thread_follow(oc_rbuf *p, oc_set_thread_follow *m);
+oc_result oc_decode_set_channel_thread_follow(oc_rbuf *p, oc_set_channel_thread_follow *m);
 oc_result oc_decode_mark_thread_read(oc_rbuf *p, oc_mark_thread_read *m);
 oc_result oc_decode_register_device_token(oc_rbuf *p, oc_register_device_token *m);
 oc_result oc_decode_unregister_device_token(oc_rbuf *p, oc_slice *token);
@@ -2351,6 +2663,8 @@ oc_result oc_decode_search(oc_rbuf *p, oc_search *m);
 oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries, uint16_t cap, uint16_t *out_count, uint8_t *out_truncated);
 oc_result oc_decode_history_request(oc_rbuf *p, oc_history_request *m);
 oc_result oc_decode_history_around(oc_rbuf *p, oc_history_around *m);
+oc_result oc_decode_find_at_time(oc_rbuf *p, oc_find_at_time *m);
+oc_result oc_decode_found_at_time(oc_rbuf *p, oc_found_at_time *m);
 oc_result oc_decode_backfill_request(oc_rbuf *p, oc_cursor *cursors, uint16_t cap, uint16_t *out_count);
 oc_result oc_decode_backfill_done(oc_rbuf *p, oc_backfill_done *m);
 oc_result oc_decode_error(oc_rbuf *p, oc_error *m);

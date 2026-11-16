@@ -1,7 +1,7 @@
 # OpenChime — Database Schema
 
 The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
-ARCH-27 (§1); the daemon applies migrations 0001–0070 (`daemon/migrate.c`,
+ARCH-27 (§1); the daemon applies migrations 0001–0084 (`daemon/migrate.c`,
 `OC_MIGRATIONS`), in order, and new tables/columns arrive as later numbered
 migrations, never as edits to an existing one. 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
@@ -36,7 +36,7 @@ credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
 **0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
-(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages.
+(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets; **0079** (§3br) blocks and DM privacy; **0080** (§3bs) profile fields; **0081** (§3bt) out of office; **0082** (§3bu) channel managers; **0083** (§3bv) custom emoji aliases; **0084** (§3bw) the channel of an audit entry; **0085** (§3bx) to-do lists.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -321,7 +321,8 @@ bodies. Three triggers keep it in sync:
   tombstone (body → NULL);
 - `messages_fts_ad` (after delete) removes the entry.
 
-Since migration 0063 (§3bb) all three skip a message in an encrypted DM.
+Since migration 0063 (§3bb) all three skip a message in an encrypted DM, and
+since 0072 (§3bk) they index the body without what its spoilers hide.
 
 The migration seeds the index from existing rows. `SEARCH` (PROTOCOL.md §5.11)
 joins `messages_fts MATCH ?` back to `messages`/`channels`, filters tombstones
@@ -580,6 +581,8 @@ moderation actions, account changes) for owner/admin review — never message co
 - `actor_id` / `actor_name` — the actor (NULL id for an unauthenticated event; the name
   is denormalized so a later-removed actor is still legible).
 - `target_id` / `target`; `outcome` (1 ok, 0 denied/failed); `detail` (TEXT).
+- `channel_id` (INTEGER, nullable; migration 0084, §3bw) — the channel the entry
+  happened in.
 - Indexes on `(family, at_ms)` and `(at_ms)`. Entries age out after 365 days on the
   maintenance pass, family by family (ARCH-79); the read path pages newest-first.
 
@@ -1901,3 +1904,317 @@ recipient.
 agent and bot principals use this column, and SQLite cannot widen a CHECK
 without rebuilding `users`. The cap counts `human` only, so neither takes a
 seat.
+
+## 3bk. Migration 0072 — search leaves out what a spoiler hides
+
+No table changes. The three `messages_fts` triggers (§3d) are made again to
+index `oc_unspoiled(body)` rather than `body`: the body with the text each
+spoiler hides removed and everything else kept (`oc_rt_unspoiled`,
+MARKDOWN.md §1d). A word that appears only inside a spoiler finds nothing, for
+everyone, its author included; a word outside one still finds the message. An
+FTS5 `'delete'` must be given what was indexed, so the delete and update
+triggers give it `oc_unspoiled(old.body)` too.
+
+Then each existing message that may hold a spoiler (a body containing `>!` or
+```` ```spoiler ````, outside an encrypted DM) is indexed again: its old entry,
+the whole body, is deleted, and `oc_unspoiled(body)` indexed in its place. A
+body the test picks that holds no spoiler is indexed as it was.
+
+*`oc_unspoiled` is a function the daemon registers* (`oc_migrate_functions`,
+`daemon/migrate.c`), on every connection it migrates and on its own reader and
+writer connections. A connection without it cannot write `messages`: an
+insert, update or delete fails with "no such function: oc_unspoiled". So a
+change made to a stopped daemon's database by hand, with the `sqlite3` shell,
+must not touch `messages`; restore a backup instead.
+
+`SEARCH` already shows a message with a spoiler by its covered excerpt rather
+than by FTS's `snippet()`, which reads the stored body and would cut a window
+into the hidden text; it does so still.
+
+## 3bl. Migration 0073 — a reply also posted to the channel
+
+```sql
+ALTER TABLE messages ADD COLUMN also_channel INTEGER NOT NULL DEFAULT 0;
+```
+
+*A thread reply also in the channel's main scroll* (REQ-062): `1` on a reply
+sent with `SEND_REPLY`'s `also_channel` (PROTOCOL.md §5.10). It is one row, its
+`parent_id` its thread's root as any reply's is, never a copy. *Read* wherever
+the main scroll is: backfill, history pages, and the channel list's last
+message, unread count and preview take `parent_id IS NULL OR also_channel=1`
+where they took `parent_id IS NULL`. Every row before this reads `0`.
+
+## 3bm. Migration 0074 — following every thread in a conversation
+
+```sql
+ALTER TABLE notification_prefs ADD COLUMN follow_threads INTEGER NOT NULL DEFAULT 0;
+```
+
+*Follow every thread in a conversation* (REQ-282): `1` makes every reply in it
+count as one in a thread this person is in. *Written* by
+`SET_CHANNEL_THREAD_FOLLOW` (PROTOCOL.md §5.12), one column touched as mute's
+upsert touches one; *read* by `OC_THREAD_PARTICIPANT_SQL` (`daemon/dbwriter.h`),
+which the push audience, the threads view and `THREAD_REPLY`'s per-recipient
+byte all ask, under the explicit per-thread unfollow, and listed in
+`NOTIFY_PREFS`. Every row before this reads `0`.
+
+## 3bn. Migration 0075 — reminders on saved items (REQ-283)
+
+```sql
+ALTER TABLE saved_items ADD COLUMN remind_at_ms INTEGER;
+ALTER TABLE saved_items ADD COLUMN reminded_at_ms INTEGER;
+CREATE INDEX idx_saved_remind ON saved_items(remind_at_ms)
+  WHERE remind_at_ms IS NOT NULL AND reminded_at_ms IS NULL;
+```
+
+*A reminder is a saved item with a time.* It is as private as the item: keyed
+on (user, message), told only to its owner's devices. `remind_at_ms` is when,
+NULL for none; `reminded_at_ms` is when it fired, so it fires once. Setting a
+new time clears `reminded_at_ms`; clearing the reminder clears both; unsaving
+deletes the row and the reminder with it. A deleted message's reminders are
+cleared at once, so a restore cannot bring one back to fire late.
+
+*Fired on the scheduled-message tick*, not the maintenance pass: within fifteen
+seconds of its time rather than five minutes. The partial index holds only the
+reminders still to fire, which is all the tick reads. A fired reminder is an
+activity entry (`OC_ACT_REMINDER`) by the same query-over-rows design as the
+rest of the feed (§3u): a row with `reminded_at_ms` set, while it is saved, the
+message stands and its owner is still in the conversation.
+
+## 3bo. Migration 0076 — active days
+
+```sql
+CREATE TABLE user_active_days (
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  day     INTEGER NOT NULL,
+  PRIMARY KEY (user_id, day)) WITHOUT ROWID;
+CREATE INDEX user_active_days_day ON user_active_days(day);
+```
+
+The days a member was active, for the console's usage figures (`USAGE`,
+PROTOCOL.md; REQ-043): one row a member a day, `day` being days since the epoch
+in UTC. *Written*, insert-or-ignore, when a member signs in, when a session is
+resumed, and when a session in use is marked seen, which the net loop does at
+least once in each UTC day a connection sends anything. It holds nothing the
+member wrote. *Read* by `USAGE_REQ` for daily and weekly active members; the
+message counts come from `messages` itself, so no counter is kept.
+
+## 3bp. Migration 0077 — muted people
+
+```sql
+CREATE TABLE muted_users (
+  user_id       INTEGER NOT NULL REFERENCES users(id),
+  muted_id      INTEGER NOT NULL REFERENCES users(id),
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (user_id, muted_id)) WITHOUT ROWID;
+```
+
+Whom each person has muted (`SET_USER_MUTE`, PROTOCOL.md): a set per person, as
+`priority_people` (0035) is, the other list about who. *Written* by the mute and
+unmute themselves, one person at a time. *Read* by the push audience query
+(`muted_author`, beside the conversation's mute), by the channel list's unread
+count, the thread list's unread count and the activity feed, which leave a muted
+author's messages, mentions, reactions and replies out, by the reaction counts a
+person is sent (a replay's and each reaction's fan-out), which leave out the
+reactions of the people they muted, and by `LIST_NOTIFY_PREFS`, which sends the list as
+`MUTED_USERS`. The muted person's own rows and counts are untouched.
+
+## 3bq. Migration 0078 — snippets (REQ-226)
+
+```sql
+ALTER TABLE attachment_media ADD COLUMN title TEXT;
+ALTER TABLE attachment_media ADD COLUMN language TEXT;
+CREATE VIRTUAL TABLE snippets_fts USING fts5(title, body);
+```
+
+*A snippet is an attachment with a media row*, as a video message is (§3af):
+`kind` 2, its `duration_ms`, `width` and `height` zero, no poster, and a `title`
+and `language` (NULL for every other kind). Its bytes, placement, permissions,
+retention and reclaim are an attachment's, unchanged.
+
+*`snippets_fts` holds what search finds*: its title and the first 64 KiB of
+its text, keyed on the attachment id, written when the upload is marked a
+snippet. It is a table of its own rather than more of `messages_fts`, whose
+rows are the messages' bodies and kept by triggers on `messages`. A row is
+deleted when its message is deleted and when the storage sweep reclaims its
+bytes.
+
+## 3br. Migration 0079 — blocks and DM privacy
+
+```sql
+CREATE TABLE blocks (
+  user_id       INTEGER NOT NULL REFERENCES users(id),
+  blocked_id    INTEGER NOT NULL REFERENCES users(id),
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (user_id, blocked_id)) WITHOUT ROWID;
+CREATE TABLE withheld_messages (
+  user_id    INTEGER NOT NULL REFERENCES users(id),
+  message_id INTEGER NOT NULL REFERENCES messages(id),
+  PRIMARY KEY (user_id, message_id)) WITHOUT ROWID;
+ALTER TABLE users ADD COLUMN dm_privacy TEXT NOT NULL DEFAULT 'anyone'
+  CHECK (dm_privacy IN ('anyone','nobody'));
+```
+
+*A block is its blocker's alone* (`SET_BLOCK`, PROTOCOL.md §5.20), and nothing
+tells the person blocked. While `blocks` holds (`user_id`, `blocked_id`), the
+blocked person can open no direct conversation, one-to-one or group, that names
+the blocker: `OPEN_DM` and `OPEN_GROUP_DM` answer `DM_REFUSED`. A conversation
+the two already share stays, and what the blocked person writes into it is
+stored and reaches its other members, but not the blocker: the send writes a
+`withheld_messages` row for the blocker, and the fan-out, push, backfill,
+history, an opened thread, the thread list's and every other unread count,
+activity, search (messages and snippets), pins and files all leave those
+messages out for that reader. The rows outlive the block, so lifting it brings back nothing that was
+withheld. Channels are untouched: there, muting a person is the tool. The
+workspace's own sender cannot be blocked.
+
+*`dm_privacy`* says who may start a new direct conversation with a person:
+`anyone`, or `nobody`, which refuses every new one naming them with the same
+`DM_REFUSED`. One that already exists carries on.
+
+*Written* by `SET_BLOCK` (audited `block.place` and `block.lift`, moderation
+family), `SET_DM_PRIVACY` and the send; *read* by the DM openers and every
+reader above, and by `LIST_BLOCKS` for an owner or admin. A channel purge
+clears `withheld_messages` with every table holding a `message_id`.
+
+## 3bs. Migration 0080 — a workspace's own profile fields
+
+```sql
+CREATE TABLE profile_fields (
+  id            INTEGER PRIMARY KEY,
+  label         TEXT NOT NULL,
+  kind          TEXT NOT NULL CHECK (kind IN ('text','link')),
+  position      INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL);
+CREATE TABLE profile_field_values (
+  user_id  INTEGER NOT NULL REFERENCES users(id),
+  field_id INTEGER NOT NULL REFERENCES profile_fields(id),
+  value    TEXT NOT NULL,
+  PRIMARY KEY (user_id, field_id)) WITHOUT ROWID;
+```
+
+The profile's fixed fields live on `users`; these are the ones a workspace adds
+for itself, such as department, location or manager. A table of their own rather
+than workspace settings, because they are a list with values attached.
+*Written*: `profile_fields` by an owner or admin (`SET_PROFILE_FIELD`,
+PROTOCOL.md), at most 20, a label of 1–64 bytes; `profile_field_values` by each
+person for themselves (`SET_PROFILE_FIELD_VALUE`), at most 200 bytes, a `link`
+value starting `https://`, an empty value deleting the row. Deleting a field
+deletes its values in the same transaction. *Read* by `PROFILE_FIELDS`, sent
+after sign-in and on every change, and by `PROFILE_INFO`, which carries a
+person's values.
+
+## 3bt. Migration 0081 — out of office
+
+```sql
+ALTER TABLE users ADD COLUMN ooo_start_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN ooo_end_ms   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN ooo_message  TEXT    NOT NULL DEFAULT '';
+```
+
+A person's absence (REQ-122), apart from the custom status (`status_*`),
+which shows beside it. *Written* by `SET_OUT_OF_OFFICE` (PROTOCOL.md §5.20): an
+end of 0 or already past writes all three back to their defaults. *Read* by
+`USER_LIST` and `PROFILE_INFO`, which carry the stored values; whether it is in
+force (`ooo_start_ms` ≤ now < `ooo_end_ms`) is the reader's question, so nothing
+runs when it ends.
+
+## 3bu. Migration 0082 — channel managers
+
+```sql
+ALTER TABLE channels ADD COLUMN created_by INTEGER REFERENCES users(id);
+CREATE TABLE channel_managers (
+  channel_id    INTEGER NOT NULL REFERENCES channels(id),
+  user_id       INTEGER NOT NULL REFERENCES users(id),
+  granted_by    INTEGER REFERENCES users(id),
+  granted_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (channel_id, user_id)) WITHOUT ROWID;
+```
+
+A channel's **creator** and its **managers** (REQ-036b, ARCH-134). `created_by` is
+NULL for every channel made before this migration and for every DM.
+*Written*: `created_by` and the creator's own `channel_managers` row by
+`CREATE_CHANNEL`; further rows by `CHANNEL_ADD_MANAGER` and removed by
+`CHANNEL_REMOVE_MANAGER` (PROTOCOL.md §5.7), each audited. A person's row goes with
+their membership, in `membership_sync`, the one place a `channel_members` row is
+deleted, so leaving, being removed or losing the group that put them in all end
+it. At most 64 per channel. *Read* by `UPDATE_CHANNEL`'s rename, archive and
+unarchive checks and by `CHANNEL_INFO`, which names the creator and the managers.
+A channel purge clears the table with every one holding a `channel_id`.
+
+## 3bv. Migration 0083 — custom emoji aliases
+
+```sql
+CREATE TABLE custom_emoji_aliases (
+  alias TEXT PRIMARY KEY,
+  name  TEXT NOT NULL REFERENCES custom_emoji(name) ON UPDATE CASCADE ON DELETE CASCADE);
+CREATE INDEX custom_emoji_aliases_name ON custom_emoji_aliases(name);
+```
+
+A custom emoji's **old names** (REQ-072). Messages and reactions name an emoji by
+its shortcode, so a rename that only changed `custom_emoji.name` would break every
+use; instead the old name stays here, resolving to the same row. *Written* by
+`RENAME_EMOJI` (PROTOCOL.md §5.16g): the row's `name` changes, the cascade carries
+the aliases it had along, and the old name is added. At most 8 per emoji and 256 in
+a workspace. *Read* by `EMOJI_LIST`, and by `ADD_EMOJI` and `RENAME_EMOJI`, which
+refuse a name an alias holds. Deleting the emoji deletes its aliases (the cascade,
+and the delete itself).
+
+## 3bw. Migration 0084 — the channel of an audit entry
+
+```sql
+ALTER TABLE audit_log ADD COLUMN channel_id INTEGER;
+```
+
+The channel an audit entry happened in (REQ-251), so an admin reading the log can
+go there. *Written* with the entry: a channel's own changes (`channel.*`) and a
+moderated message or member in it (`message.delete`, `message.restore`,
+`message.move`, the channel the message moved to, and `channel.member.remove`).
+NULL for every other entry and for every entry written before. *Read* by
+`AUDIT_QUERY`, whose `AUDIT_PAGE` entries carry it (PROTOCOL.md, protocol 46).
+
+## 3bx. Migration 0085 — to-do lists
+
+```sql
+CREATE TABLE todo_lists (
+  message_id    INTEGER PRIMARY KEY REFERENCES messages(id),
+  channel_id    INTEGER NOT NULL REFERENCES channels(id),
+  author_id     INTEGER NOT NULL REFERENCES users(id),
+  title         TEXT    NOT NULL,
+  created_at_ms INTEGER NOT NULL);
+CREATE TABLE todo_tasks (
+  message_id    INTEGER NOT NULL REFERENCES messages(id),
+  idx           INTEGER NOT NULL,
+  name          TEXT    NOT NULL,
+  description   TEXT    NOT NULL DEFAULT '',
+  done          INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0,1)),
+  done_by       INTEGER REFERENCES users(id),
+  done_at_ms    INTEGER,
+  PRIMARY KEY (message_id, idx),
+  UNIQUE (message_id, name));
+```
+
+A to-do list is a message whose body starts `/todo` and a title, each following
+line a task (PROTOCOL.md §5.16o). *Keyed on the message*, as `polls` (§3bd) is:
+the list is placed, permissioned, moved and deleted as its message is. One
+`todo_lists` row per list; `title` is the author's to rename, at most 250 bytes,
+and starts as the body's first line. `todo_tasks` holds a row per task, numbered
+from 0 in the order added: a task is named by `idx`, which never changes, since
+tasks are only ever added at the end. `name` (at most 250 bytes, not blank) is
+unique in its list, `description` at most 1,000 bytes; neither changes once
+added. At most 200 tasks a list. `done_by` and `done_at_ms` are who marked a
+task done and when, NULL while it is not done.
+
+*Both tables reference `messages(id)` directly*, not each other, for the reason
+`polls` gives: the purge of a channel (§3bb) clears each table holding a
+`message_id` in creation order. `channel_id` follows a moved message (`MOVE_MESSAGE`), as `polls.channel_id`
+does.
+
+*Written* in the send's own transaction: the writer parses a `SEND` or
+`SEND_REPLY` body that starts `/todo` and stores the list beside the message, or
+refuses the send. Adding, marking and renaming are each one statement of their
+own. Marking writes the state asked for and changes nothing when the task is
+already in it, so two people marking a task at once agree. *A delete leaves the
+rows*: every read joins a message that stands, so a deleted message's list is
+never sent, and a restore brings it back as it was. An encrypted DM's body is not
+the daemon's to read, so it never holds a list.

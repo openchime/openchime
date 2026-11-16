@@ -22,6 +22,7 @@ int cfg_parse_summary(oc_config *c, const cfg_row *r, const char *name, const ch
 int cfg_parse_connect(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_token_prefix(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_trusted_proxies(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
+int cfg_parse_allowed_networks(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_window(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 int cfg_parse_quiet(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap);
 
@@ -81,6 +82,9 @@ const cfg_row OC_CFG[] = {
     CUSTOM("OPENCHIME_TRUSTED_PROXIES", CFG_OPERATOR, G_SET, NULL,
            "Addresses or CIDRs whose PROXY protocol v2 header is believed, comma-separated; the connection's address is then the one the proxy saw.",
            cfg_parse_trusted_proxies, 0),
+    CUSTOM("OPENCHIME_ALLOWED_NETWORKS", CFG_OPERATOR, G_SET, NULL,
+           "Addresses or CIDRs, IPv4 or IPv6, comma-separated, that may connect to the TLS port (REQ-192): any other client is closed before TLS or sign-in, judged by the address a trusted proxy's header names. Unset or empty: everyone. The health port is never restricted.",
+           cfg_parse_allowed_networks, 0),
 
     /* --- Features: each turns a capability on or off, with its one value ------- */
     CUSTOM("OPENCHIME_TLS", CFG_OPERATOR, G_FLAG, "self",
@@ -96,8 +100,8 @@ const cfg_row OC_CFG[] = {
     CUSTOM("OPENCHIME_S3_FILE", CFG_OPERATOR, G_FLAG, NULL,
            "`OPENCHIME_S3`'s value, read from this file instead (mode 0600; a trailing newline is ignored), so the key and secret are not in the environment. Set one or the other, not both.",
            cfg_parse_s3_file, 0),
-    BOOL("OPENCHIME_TTS", CFG_OPERATOR, G_FLAG, "on", "Read-aloud (ARCH-111), in a build that carries it; off saves the voice model's memory.", tts.enabled),
-    BOOL("OPENCHIME_STT", CFG_OPERATOR, G_FLAG, "on", "Voice input (ARCH-112), in a build that carries it.", stt.enabled),
+    BOOL("OPENCHIME_TTS", CFG_OPERATOR, G_FLAG, "on", "Read-aloud (ARCH-111), in a build that carries it. While it reads aloud the daemon holds up to 170 MB, against about 25 MB idle (TESTING.md, \"Speech models' memory\"); off saves that.", tts.enabled),
+    BOOL("OPENCHIME_STT", CFG_OPERATOR, G_FLAG, "on", "Voice input (ARCH-112), in a build that carries it. While it hears a segment the daemon holds about 150 MB, against about 25 MB idle (TESTING.md, \"Speech models' memory\"); off saves that.", stt.enabled),
     CUSTOM("OPENCHIME_SUMMARY", CFG_OPERATOR, G_FLAG, "off",
            "Summaries (REQ-310): `off`, `local` (the model runs inside the daemon, fetched on first start), or `cloud:<url>,<model>` (a hosted API's base URL and the model there).",
            cfg_parse_summary, 0),

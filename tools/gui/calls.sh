@@ -10,7 +10,16 @@
 # daemon and its relay. It asserts that
 #
 #   - a call started in #general invites bob, who sees it in his Calls section
-#     and gets an invitation notification;
+#     and gets an invitation notification; his #general shows the call's banner
+#     with Join and Decline, the Calls row has its own Join, the header's phone
+#     says "Join the call", and he joins from the banner;
+#   - Mute's tooltip says "You are currently muted" or "...not muted";
+#   - the call view shows the conversation beside it, a message sent there
+#     reaches alice, and it folds away and back; Settings holds the devices;
+#   - End for everyone asks first: Cancel keeps the call, Confirm ends it; with
+#     no call left, the Calls section is gone;
+#   - the missed call reads "You missed a call from alice" on bob's side, and its
+#     Call back starts a call;
 #   - bob joins: each receives the other's audio, every packet decrypting once
 #     the first second's keys are in, with both keyed for the current epoch;
 #   - noise suppression takes a steady hum out -- which is what a test tone is
@@ -112,7 +121,18 @@ say "== bob joins"
 # audio checks below turn it off, and one check turns it on to see it do that.
 "$PAIR" a call ns off >/dev/null
 "$PAIR" b call ns off >/dev/null
-"$PAIR" b call join $CH >/dev/null
+# From the conversation: its banner names who is in the call, with Join, and
+# Decline since bob was asked; the Calls row has its own Join.
+"$PAIR" b view home >/dev/null
+"$PAIR" b channel $CH >/dev/null
+banner() { [ "$(field b 'callui ' banner)" = 1 ] && grep -q '^a11yitem call.banner.join ' /tmp/oc-calls-dump-b.txt &&
+           grep -q '^a11yitem call.banner.decline ' /tmp/oc-calls-dump-b.txt; }
+check "bob's #general shows the call's banner, with Join and Decline" waitfor b 10 banner
+check "...and the Calls row has its own Join" bash -c "grep -q '^a11yitem calls.row.join.$CH ' /tmp/oc-calls-dump-b.txt"
+hdrtip() { grep -q '^callui .*hdrtip="Join the call"' /tmp/oc-calls-dump-b.txt; }
+check "the header's phone says \"Join the call\"" hdrtip
+"$PAIR" b shot calls_banner >/dev/null
+"$PAIR" b call banner-join >/dev/null
 two_a()     { [ "$(field a 'call ' parts)" = 2 ]; }
 two_b()     { [ "$(field b 'call ' parts)" = 2 ]; }
 a_hears_b() { gt "$(peer a packets)" 50 && gt "$(peer a level)" 2000; }
@@ -150,6 +170,8 @@ say "== the keys"
 b_muted() { [ "$(field b 'call ' muted)" = 1 ]; }
 b_unmuted() { [ "$(field b 'call ' muted)" = 0 ]; }
 check "Ctrl+Shift+M mutes" waitfor b 4 b_muted
+tip_muted() { grep -q '^callui .*mutetip="You are currently muted"' /tmp/oc-calls-dump-b.txt; }
+check "Mute's tooltip says \"You are currently muted\"" tip_muted
 "$PAIR" b key ctrl+shift+space >/dev/null
 check "Ctrl+Shift+Space held, bob is heard though muted" waitfor a 8 a_hears_ptt
 "$PAIR" b keyup ctrl+shift+space >/dev/null
@@ -157,6 +179,8 @@ a_silent() { lt "$(peer a level)" 300; }
 check "let go, he is not" waitfor a 8 a_silent
 "$PAIR" b key ctrl+shift+m >/dev/null
 check "Ctrl+Shift+M again unmutes" waitfor b 4 b_unmuted
+tip_unmuted() { grep -q '^callui .*mutetip="You are currently not muted"' /tmp/oc-calls-dump-b.txt; }
+check "...and the tooltip says \"You are currently not muted\"" tip_unmuted
 
 say "== away from the call"
 "$PAIR" b view home >/dev/null
@@ -177,6 +201,29 @@ dump b
 click_rect b hdr
 check "the header's call button opens the call going on" waitfor b 4 b_inview
 
+say "== the conversation beside the call"
+# Wide enough for the call and the conversation side by side: narrower, the
+# panel gives the call the room, as it is meant to.
+"$PAIR" b size 1600 900 >/dev/null
+"$PAIR" b call open $CH >/dev/null
+chat_on()  { [ "$(field b 'callui ' chat)" = 1 ]; }
+chat_off() { [ "$(field b 'callui ' chat)" = 0 ]; }
+check "bob's call view shows the conversation beside it" waitfor b 5 chat_on
+"$PAIR" b shot calls_view_chat >/dev/null
+"$PAIR" b send "said from the call view" >/dev/null
+a_got() { grep -q '^  ch 1 .*prev="said from the call view"' /tmp/oc-calls-dump-a.txt; }
+check "a message sent from it reaches alice's #general" waitfor a 10 a_got
+"$PAIR" b call chat >/dev/null
+check "folded away, it is gone" waitfor b 5 chat_off
+"$PAIR" b call chat >/dev/null
+check "...and back" waitfor b 5 chat_on
+"$PAIR" b call settings >/dev/null
+settings_up() { [ "$(field b 'callui ' settings)" = 1 ] && grep -q '^a11yitem call.mic ' /tmp/oc-calls-dump-b.txt &&
+                grep -q '^a11yitem call.noise ' /tmp/oc-calls-dump-b.txt; }
+check "Settings holds the microphone, the speaker and noise suppression" waitfor b 5 settings_up
+"$PAIR" b shot calls_settings >/dev/null
+"$PAIR" b call settings >/dev/null
+
 say "== alice turns bob down"
 bob_id="$(peer a uid)"
 "$PAIR" a call volume "$bob_id" 25 >/dev/null
@@ -193,7 +240,9 @@ has_aid() { grep -q "^a11yitem $2 " "/tmp/oc-calls-dump-$1.txt"; }
 check "alice's call view offers Share screen (call.share)" has_aid a call.share
 "$PAIR" a call share "screen:synthetic" >/dev/null
 sfield() { field "$1" 'share ' "$2"; }
-a_sharing()   { [ "$(sfield a state)" = 2 ] && [ "$(sfield a bar)" = 1 ]; }
+# The floating bar is a second window, which a web page has none of (WEB.md):
+# there the call view's own banner is the sharer's control.
+a_sharing()   { [ "$(sfield a state)" = 2 ] && [ "$(sfield a bar)" = "$([ "$PLAT" = web ] && echo 0 || echo 1)" ]; }
 b_sees_a()    { [ "$(sfield b sharer)" = "$(field a 'call ' self)" ] && ge "$(sfield b view_frames)" 10; }
 b_picture()   { [ "$(sfield b tex)" = "$SHARE_WH" ] && ge "$(sfield b px_fno)" 1; }
 check "alice's share is confirmed, and her bar is up" waitfor a 10 a_sharing
@@ -234,11 +283,24 @@ say "== ending"
 "$PAIR" b call end >/dev/null
 refused() { [ "$(field b 'call ' err)" = 3029 ]; }
 check "bob may not end it for everyone" waitfor b 5 refused
-"$PAIR" a call end >/dev/null
+# End for everyone asks first: Cancel keeps the call, Confirm ends it.
+"$PAIR" a call open $CH >/dev/null
+"$PAIR" a call end-press >/dev/null
+asks() { [ "$(field "$1" 'modal=' modal)" = confirm ]; }
+check "alice's End for everyone asks before it acts" waitfor a 5 asks a
+"$PAIR" a shot calls_end_confirm >/dev/null
+"$PAIR" a key esc >/dev/null
+still_in() { [ "$(field a 'call ' in)" = 1 ] && [ "$(field a 'modal=' modal)" = none ]; }
+check "Cancel keeps the call" waitfor a 5 still_in
+"$PAIR" a call end-press >/dev/null
+waitfor a 5 asks a >/dev/null
+"$PAIR" a key enter >/dev/null
 a_out() { [ "$(field a 'call ' in)" = 0 ] && [ "$(field a calls n)" = 0 ]; }
 b_out() { [ "$(field b 'call ' in)" = 0 ] && [ "$(field b calls n)" = 0 ]; }
-check "alice ends it: she is in no call and lists none" waitfor a 8 a_out
+check "confirmed, alice ends it: she is in no call and lists none" waitfor a 8 a_out
 check "...and neither is bob" waitfor b 8 b_out
+no_section() { ! grep -q '^a11yitem sidebar.calls' /tmp/oc-calls-dump-b.txt; }
+check "with no call to list, bob's sidebar has no Calls section" waitfor b 5 no_section
 
 say "== a call nobody takes"
 "$PAIR" a call start $CH >/dev/null
@@ -249,13 +311,25 @@ missed() { ge "$(field b callevents n)" 1 && grep -q '^callevents .*last="Missed
 check "bob's history has a missed call" waitfor b 10 missed
 "$PAIR" b view home >/dev/null
 "$PAIR" b channel $CH >/dev/null
-sleep 0.5
+said_b() { grep -q '^callui .*missed="You missed a call from alice"' /tmp/oc-calls-dump-b.txt; }
+check "it reads from bob's side: \"You missed a call from alice\"" waitfor b 5 said_b
+callback_offered() { grep -q '^a11yitem call.event.[0-9]*.callback ' /tmp/oc-calls-dump-b.txt; }
+check "...and offers Call back" waitfor b 5 callback_offered
 "$PAIR" b shot calls_missed >/dev/null
+"$PAIR" b call callback >/dev/null
+b_called() { [ "$(field b 'call ' in)" = 1 ]; }
+check "Call back starts a call in that conversation" waitfor b 10 b_called
+"$PAIR" b call leave >/dev/null
+b_left() { [ "$(field b 'call ' in)" = 0 ]; }
+waitfor b 8 b_left >/dev/null
 
 say "== an invitation's Join"
 "$PAIR" a call start $CH >/dev/null
 waitfor b 10 b_invited >/dev/null
-"$PAIR" b toastaction "join|0|$CH|" >/dev/null
+# The toast names the workspace the call is in, as a real one does: bob's active
+# one, which on a Windows client with saved workspaces need not be the first.
+BWS="$(grep -m1 '^workspaces=' /tmp/oc-calls-dump-b.txt | grep -o 'active=[0-9]*' | cut -d= -f2)"
+"$PAIR" b toastaction "join|${BWS:-0}|$CH|" >/dev/null
 check "the toast's Join puts bob in the call" waitfor b 10 two_b
 "$PAIR" a call end >/dev/null
 waitfor b 8 b_out >/dev/null

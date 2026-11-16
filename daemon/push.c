@@ -422,7 +422,12 @@ static int collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
              * 0 for an ordinary send: the ?5 <> 0 test makes this false, so a
              * channel message keeps exactly the audience it had. */
             "       ( ?5 <> 0 AND "
-                    OC_THREAD_PARTICIPANT_SQL("cm.user_id", "?5") " ) "
+                    OC_THREAD_PARTICIPANT_SQL("cm.user_id", "?5") " ), "
+            /* MUTED_AUTHOR: has this recipient muted the author? Nothing from a
+             * muted person reaches them, a call's starter included (?2 is the
+             * starter for an invitation). */
+            "       EXISTS(SELECT 1 FROM muted_users mu "
+            "               WHERE mu.user_id = cm.user_id AND mu.muted_id = ?2) "
             "FROM channel_members cm "
             "JOIN device_tokens dt ON dt.user_id = cm.user_id "
             "JOIN users u ON u.id = cm.user_id "
@@ -441,7 +446,11 @@ static int collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
              * to be stated twice, once in SQL and once in each client, and the
              * two had already drifted. */
             "WHERE cm.channel_id = ?1 AND cm.user_id <> ?2 AND u.disabled = 0 "
-            "  AND (?6 = 0 OR cm.user_id = ?6);",
+            "  AND (?6 = 0 OR cm.user_id = ?6) "
+            /* Addressing too: a message a block withheld from this member was
+             * never delivered to them, so there is nothing to tell their phone. */
+            "  AND NOT EXISTS(SELECT 1 FROM withheld_messages wm "
+            "                  WHERE wm.user_id = cm.user_id AND wm.message_id = ?3);",
             -1, &st, NULL) != SQLITE_OK) {
         return 0;
     }
@@ -478,6 +487,7 @@ static int collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
         int mentioned   = sqlite3_column_int(st, 14);
         int keyword_hit = sqlite3_column_int(st, 15);
         int thread_reply= sqlite3_column_int(st, 16);
+        int muted_author= sqlite3_column_int(st, 17);
         /* The recipient's own clock, not the server's (REQ-136). */
         long long lmin  = (long long)(now_ms / 60000) + tz_off;
         int local_min   = (int)(((lmin % 1440) + 1440) % 1440);
@@ -497,7 +507,7 @@ static int collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
          * not policy: an author has no device row to push to in this audience
          * at all. The argument stays in the call so the shape of the decision
          * is the same one the clients make, where the author IS in the model. */
-        if (!oc_notify_decide(0, muted, vip, level,
+        if (!oc_notify_decide(0, muted, muted_author, vip, level,
                               mentioned, keyword_hit, thread_reply,
                               quiet, paused)) continue;
 
@@ -584,7 +594,9 @@ int oc_push_build_body_kind(uint64_t channel_id, int call, const oc_push_target 
         const char *plat = targets[i].platform == OC_PUSH_FCM ? "fcm" : "apns";
         w = snprintf(out + off, cap - off,
                      "%s{\"platform\":\"%s\",\"token\":\"%s\",\"channelId\":\"%s\"%s}",
-                     sent++ ? "," : "", plat, targets[i].token, chbuf, call ? ",\"kind\":\"call\"" : "");
+                     sent++ ? "," : "", plat, targets[i].token, chbuf,
+                     call == OC_PUSH_KIND_REMINDER ? ",\"kind\":\"reminder\""
+                     : call ? ",\"kind\":\"call\"" : "");
         if (w < 0 || (size_t)w >= cap - off) return -1;
         off += (size_t)w;
     }
@@ -601,7 +613,8 @@ typedef struct pnode {
     uint64_t author_id;
     uint64_t message_id;   /* what makes the MENTIONS level answerable */
     uint64_t root_id;      /* thread root for a reply, 0 for a channel send */
-    uint64_t invitee;      /* a call invitation's invitee; 0 for a message */
+    uint64_t invitee;      /* a call invitation's invitee, or a reminder's owner; 0 for a message */
+    int      kind;         /* with invitee: OC_PUSH_KIND_CALL or OC_PUSH_KIND_REMINDER */
     struct pnode *next;
 } pnode;
 
@@ -627,7 +640,7 @@ static void prune_cb(void *ud, const char *token) {
 }
 
 static void do_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
-                      uint64_t message_id, uint64_t root_id, uint64_t invitee) {
+                      uint64_t message_id, uint64_t root_id, uint64_t invitee, int kind) {
     time_t nowsec = time(NULL);
     int now_min = (int)((nowsec / 60) % 1440);      /* minutes-of-day UTC */
 
@@ -643,7 +656,7 @@ static void do_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
     size_t cap = (size_t)n * (OC_DEVICE_TOKEN_MAX + 112) + 64;
     char *body = malloc(cap);
     if (!body) return;
-    if (oc_push_build_body_kind(channel_id, invitee != 0, targets, n, body, cap) != 0) { free(body); return; }
+    if (oc_push_build_body_kind(channel_id, invitee ? kind : 0, targets, n, body, cap) != 0) { free(body); return; }
 
     long ts = (long)nowsec;
     char sig[512];
@@ -675,7 +688,8 @@ static void *worker(void *arg) {
         p->qlen--;
         pthread_mutex_unlock(&p->mu);
 
-        do_notify(p, node->channel_id, node->author_id, node->message_id, node->root_id, node->invitee);
+        do_notify(p, node->channel_id, node->author_id, node->message_id, node->root_id, node->invitee,
+                  node->kind);
         free(node);
     }
     return NULL;
@@ -721,7 +735,7 @@ fail:
 }
 
 static void enqueue(oc_push *p, uint64_t channel_id, uint64_t author_id,
-                    uint64_t message_id, uint64_t root_id, uint64_t invitee) {
+                    uint64_t message_id, uint64_t root_id, uint64_t invitee, int kind) {
     if (!p) return;
     pthread_mutex_lock(&p->mu);
     if (p->stopping || p->qlen >= OC_PUSH_MAX_QUEUE) { pthread_mutex_unlock(&p->mu); return; }
@@ -732,6 +746,7 @@ static void enqueue(oc_push *p, uint64_t channel_id, uint64_t author_id,
     node->message_id = message_id;
     node->root_id = root_id;
     node->invitee = invitee;
+    node->kind = kind;
     if (p->tail) p->tail->next = node; else p->head = node;
     p->tail = node;
     p->qlen++;
@@ -741,11 +756,15 @@ static void enqueue(oc_push *p, uint64_t channel_id, uint64_t author_id,
 
 void oc_push_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
                     uint64_t message_id, uint64_t root_id) {
-    enqueue(p, channel_id, author_id, message_id, root_id, 0);
+    enqueue(p, channel_id, author_id, message_id, root_id, 0, 0);
 }
 
 void oc_push_notify_call(oc_push *p, uint64_t channel_id, uint64_t inviter, uint64_t invitee) {
-    if (invitee) enqueue(p, channel_id, inviter, 0, 0, invitee);
+    if (invitee) enqueue(p, channel_id, inviter, 0, 0, invitee, OC_PUSH_KIND_CALL);
+}
+
+void oc_push_notify_reminder(oc_push *p, uint64_t channel_id, uint64_t user_id) {
+    if (user_id) enqueue(p, channel_id, 0, 0, 0, user_id, OC_PUSH_KIND_REMINDER);
 }
 
 void oc_push_stop(oc_push *p) {

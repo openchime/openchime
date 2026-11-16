@@ -388,6 +388,28 @@ client half is here. Activation is tried once at each start: the first prints th
 code and serves pending, and the boot after the operator reserves it comes up
 active.
 
+**The address proof.** Central records the address a connected self-hosted
+workspace answers at, so it can mail the workspace's invitations and open it
+from a link in a notification email, and records it only once the server there
+has shown it holds the enrollment key. Once the binding is active and the
+daemon is serving, it reports the address in a signed machine request (§8.7's
+scheme), `POST /api/machine/address` `{"address": "<host>[:<port>]"}`. The
+address is `OPENCHIME_MANAGED_ADDRESS` when set, otherwise the first name in
+`OPENCHIME_TLS=acme:<names>`, lower-cased, with `:<port>` unless the daemon
+serves on 443; a box with neither reports nothing, and a managed box reports
+nothing (its address is central's own). Central then POSTs
+`{"nonce": "<base64url of 32 bytes>"}` to `https://<address>/enroll-proof`, and
+the daemon answers `{"signature": "<base64>"}`: the enrollment key's ASN.1 DER
+ECDSA signature over SHA-256 of `openchime-address-proof-v1|<aud>|<nonce>`. The
+prefix is fixed and versioned, so the signature is good for this check and for
+nothing else, and the handshake's `openchime-enroll-v1` signature does not pass
+for it. `/enroll-proof` answers `404` until the binding is active, `400` for a
+nonce of any other shape, and `429` past five a minute from one address. This
+is the one connection central makes to the daemon, and the daemon asks for it.
+The report is tried again while central cannot be reached, asks it to wait
+(`429`), could not check the address (`422`) or fails (`5xx`), for up to fifteen
+minutes; any other answer ends it, and the next start reports again.
+
 **The daemon's push emitter (ARCH-85).** An enrolled box with
 `OPENCHIME_PUSH=on` (central's push gateway at the connection's origin, or
 `OPENCHIME_PUSH_URL`) delivers

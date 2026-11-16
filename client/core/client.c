@@ -173,6 +173,15 @@ void oc_client_tick(oc_client *c) {
         c->model.summary_resend = 0;
         if (c->model.summary_open && c->model.summary_loading) summary_send(c);
     }
+    if (c->model.moved_fetch_channel) {
+        oc_client_history_around(c, c->model.moved_fetch_channel, c->model.moved_fetch_message, 50);
+        c->model.moved_fetch_channel = c->model.moved_fetch_message = 0;
+    }
+    if (c->model.moved_fetch_thread) {
+        c->model.moved_fetch_thread = 0;
+        if (c->model.thread_open)
+            oc_client_open_thread(c, c->model.thread_channel, c->model.thread_parent);
+    }
     listen_pump(c);
 }
 
@@ -416,11 +425,12 @@ size_t oc_client_call_notify_take(oc_client *c, int quiet, int paused,
     return c ? oc_model_call_notify_take(&c->model, quiet, paused, out, max) : 0;
 }
 
-void oc_client_typing(oc_client *c, uint64_t channel_id) {
+void oc_client_typing(oc_client *c, uint64_t channel_id, uint64_t thread_root) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_TYPING);
     if (!cmd) return;
     cmd->channel_id = channel_id;
+    cmd->message_id = thread_root;   /* the thread the composer is in, 0 the main scroll */
     oc_queue_push(&c->cmds, cmd);
 }
 
@@ -616,11 +626,31 @@ void oc_client_history_around(oc_client *c, uint64_t channel_id, uint64_t messag
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_find_at_time(oc_client *c, uint64_t channel_id, uint64_t parent_id, uint64_t at_ms) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_FIND_AT_TIME);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = parent_id;
+    cmd->server_time = at_ms;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op) {
     if (!c || !message_id) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SAVE_ITEM);
     if (!cmd) return;
     cmd->message_id = message_id; cmd->op = op;
+    /* The frame is the item's whole state: a save again keeps its reminder. */
+    cmd->server_time = op ? oc_model_reminder(&c->model, message_id) : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_set_reminder(oc_client *c, uint64_t message_id, uint64_t at_ms) {
+    if (!c || !message_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SAVE_ITEM);
+    if (!cmd) return;
+    cmd->message_id = message_id; cmd->op = OC_SAVE_ADD;
+    cmd->server_time = at_ms;
     oc_queue_push(&c->cmds, cmd);
 }
 void oc_client_set_collapsed(oc_client *c, uint64_t message_id, int on) {
@@ -628,6 +658,15 @@ void oc_client_set_collapsed(oc_client *c, uint64_t message_id, int on) {
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_COLLAPSED);
     if (!cmd) return;
     cmd->message_id = message_id; cmd->op = on ? 1 : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_move_message(oc_client *c, uint64_t message_id, uint64_t dest_channel,
+                            uint64_t dest_parent, int leave_marker) {
+    if (!c || !message_id || !dest_channel) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_MOVE_MESSAGE);
+    if (!cmd) return;
+    cmd->message_id = message_id; cmd->channel_id = dest_channel;
+    cmd->parent_id = dest_parent; cmd->op = leave_marker ? 1 : 0;
     oc_queue_push(&c->cmds, cmd);
 }
 void oc_client_list_saved(oc_client *c) {
@@ -854,6 +893,33 @@ void oc_client_vote(oc_client *c, uint64_t channel_id, uint64_t message_id, cons
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_todo_add(oc_client *c, uint64_t channel_id, uint64_t message_id,
+                        const char *name, const char *description) {
+    if (!c || !message_id || !name) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_TODO_ADD);
+    if (!cmd) return;
+    cmd->channel_id = channel_id; cmd->message_id = message_id;
+    cmd->body = strdup(name);
+    cmd->body2 = strdup(description ? description : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_todo_mark(oc_client *c, uint64_t channel_id, uint64_t message_id, uint16_t task, int done) {
+    if (!c || !message_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_TODO_MARK);
+    if (!cmd) return;
+    cmd->channel_id = channel_id; cmd->message_id = message_id;
+    cmd->uses = task; cmd->op = done ? 1 : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_todo_rename(oc_client *c, uint64_t channel_id, uint64_t message_id, const char *title) {
+    if (!c || !message_id || !title) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_TODO_RENAME);
+    if (!cmd) return;
+    cmd->channel_id = channel_id; cmd->message_id = message_id;
+    cmd->body = strdup(title);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_list_poll_voters(oc_client *c, uint64_t channel_id, uint64_t message_id) {
     if (!c || !message_id) return;
     oc_model_voterlist_begin(&c->model, message_id);
@@ -911,6 +977,38 @@ void oc_client_set_keywords(oc_client *c, const char terms[][OC_KEYWORD_MAX], ui
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_set_user_mute(oc_client *c, uint64_t user_id, int on) {
+    if (!c || !user_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_USER_MUTE);
+    if (!cmd) return;
+    cmd->mute_user_id = user_id;
+    cmd->op = (uint8_t)(on ? 1 : 0);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_block(oc_client *c, uint64_t user_id, int on) {
+    if (!c || !user_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_BLOCK);
+    if (!cmd) return;
+    cmd->block_user_id = user_id;
+    cmd->op = (uint8_t)(on ? 1 : 0);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_dm_privacy(oc_client *c, int nobody) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_DM_PRIVACY);
+    if (!cmd) return;
+    cmd->op = (uint8_t)(nobody ? OC_DM_PRIVACY_NOBODY : OC_DM_PRIVACY_ANYONE);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_blocks(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_BLOCKS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_set_priority(oc_client *c, const uint64_t *people, uint8_t n) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PRIORITY);
@@ -958,6 +1056,14 @@ void oc_client_thread_follow(oc_client *c, uint64_t channel_id, uint64_t root_id
     oc_cmd *cmd = oc_cmd_new(OC_CMD_THREAD_FOLLOW);
     if (!cmd) return;
     cmd->channel_id = channel_id; cmd->message_id = root_id; cmd->op = on;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_channel_thread_follow(oc_client *c, uint64_t channel_id, uint8_t on) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CHANNEL_THREAD_FOLLOW);
+    if (!cmd) return;
+    cmd->channel_id = channel_id; cmd->op = on ? 1 : 0;
     oc_queue_push(&c->cmds, cmd);
 }
 
@@ -1094,6 +1200,14 @@ void oc_client_storage_status(oc_client *c) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_STORAGE_STATUS);
     if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_usage(oc_client *c, unsigned days) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_USAGE);
+    if (!cmd) return;
+    cmd->usage_days = (uint16_t)(days < 1 ? 1 : days > OC_USAGE_MAX_DAYS ? OC_USAGE_MAX_DAYS : days);
+    oc_queue_push(&c->cmds, cmd);
 }
 
 void oc_client_toggle_storage(oc_client *c, int open) {
@@ -1397,6 +1511,15 @@ void oc_client_delete_emoji(oc_client *c, const char *name) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_rename_emoji(oc_client *c, const char *name, const char *new_name) {
+    if (!c || !name || !name[0] || !new_name || !new_name[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_RENAME_EMOJI);
+    if (!cmd) return;
+    cmd->body = strdup(name);
+    cmd->body2 = strdup(new_name);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_upload_emoji(oc_client *c, uint64_t channel_id, const char *name, const char *path) {
     if (!c || !name || !name[0] || !path || !path[0]) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_UPLOAD);
@@ -1506,6 +1629,40 @@ void oc_client_set_profile(oc_client *c, const char *full_name, const char *titl
              pronouns ? pronouns : "", phone ? phone : "",
              timezone ? timezone : "", voice_id ? voice_id : "");
     cmd->body = strdup(packed);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_profile_field(oc_client *c, uint64_t field_id, int op, int kind,
+                                 uint16_t position, const char *label) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PROFILE_FIELD);
+    if (!cmd) return;
+    cmd->message_id = field_id;
+    cmd->op = (uint8_t)op;
+    cmd->scope = (uint8_t)kind;
+    cmd->uses = position;
+    cmd->body = strdup(label ? label : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_profile_field_value(oc_client *c, uint64_t field_id, const char *value) {
+    if (!c || !field_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PROFILE_FIELD_VALUE);
+    if (!cmd) return;
+    cmd->message_id = field_id;
+    cmd->body = strdup(value ? value : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_out_of_office(oc_client *c, uint64_t start_ms, uint64_t end_ms, const char *message) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_OUT_OF_OFFICE);
+    if (!cmd) return;
+    cmd->start_ms = start_ms;
+    cmd->end_ms = end_ms;
+    char m[OC_OOO_MESSAGE_MAX + 1];
+    snprintf(m, sizeof m, "%s", message ? message : "");   /* the wire's bound */
+    cmd->body = strdup(m);
     oc_queue_push(&c->cmds, cmd);
 }
 
@@ -1634,6 +1791,38 @@ uint64_t oc_client_post_video(oc_client *c, uint64_t channel_id, uint64_t thread
     cmd->blob2 = poster; cmd->blob2_len = poster_len;
     cmd->duration_ms = duration_ms;
     cmd->media_w = width; cmd->media_h = height;
+    uint64_t tag = cmd->xfer_tag;
+    oc_queue_push(&c->cmds, cmd);
+    return tag;
+}
+
+uint64_t oc_client_post_snippet(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                                const char *title, const char *language, const char *text) {
+    size_t n = text ? strlen(text) : 0;
+    if (!c || !channel_id || n == 0 || n > OC_SNIPPET_MAX_SIZE) return 0;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_POST_SNIPPET);
+    if (!cmd) return 0;
+    cmd->blob = malloc(n);
+    if (!cmd->blob) { oc_cmd_free(cmd); return 0; }
+    memcpy(cmd->blob, text, n);
+    cmd->blob_len = n;
+    cmd->xfer_tag = next_xfer_tag();
+    cmd->channel_id = channel_id;
+    cmd->message_id = thread_root;
+    cmd->body = strdup("");
+    /* Cut to the caps on a character boundary; the daemon refuses longer. */
+    char t[OC_SNIPPET_TITLE_MAX + 1], l[OC_SNIPPET_LANG_MAX + 1];
+    const char *src = (title && title[0]) ? title : "Snippet";
+    snprintf(t, sizeof t, "%s", src);
+    if (strlen(src) > OC_SNIPPET_TITLE_MAX) {
+        /* Cut: back to the start of the character the cut fell in. */
+        size_t tl = OC_SNIPPET_TITLE_MAX;
+        while (tl > 0 && ((unsigned char)src[tl] & 0xC0) == 0x80) tl--;
+        t[tl] = '\0';
+    }
+    snprintf(l, sizeof l, "%s", language ? language : "");
+    cmd->body2 = strdup(t);
+    cmd->body3 = strdup(l);
     uint64_t tag = cmd->xfer_tag;
     oc_queue_push(&c->cmds, cmd);
     return tag;

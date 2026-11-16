@@ -95,7 +95,8 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
                  * black-box test does not exercise, and letting it through would
                  * desync every expectation after the login. */
                 hdr->msg_type == OC_MSG_SNOOZE || hdr->msg_type == OC_MSG_SCHEDULE ||
-                hdr->msg_type == OC_MSG_ALERT_PREFS)
+                hdr->msg_type == OC_MSG_ALERT_PREFS ||
+                hdr->msg_type == OC_MSG_PROFILE_FIELDS)   /* the workspace's own, at sign-in */
                 continue;
             return 0;
         }

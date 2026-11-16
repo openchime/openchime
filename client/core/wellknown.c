@@ -4,9 +4,7 @@
 
 #include "wellknown.h"
 
-#include "sock.h"      /* the POSIX/Winsock shim, and getaddrinfo with it */
-#include "tls.h"
-#include "model.h"    /* oc_model_now_ms: the core's one monotonic clock */
+#include "https_get.h"   /* the verified GET it shares with the release notes */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -187,99 +185,13 @@ int oc_wellknown_fingerprint_bytes(const char *hex, unsigned char out[32]) {
 
 /* --- fetching ------------------------------------------------------------ */
 
-static int wk_dial(const char *host, int port, int timeout_ms) {
-    /* Each address bounded (sock.h), and never longer than the fetch itself. */
-    int per = timeout_ms > 0 && timeout_ms < OC_CONNECT_PER_ADDR_MS ? timeout_ms : OC_CONNECT_PER_ADDR_MS;
-    int fd = oc_connect_any(host, port, per);
-    if (fd >= 0) oc_sock_setnonblock(fd);
-    return fd;
-}
-
-/* Drive one TLS step, waiting on the socket while it asks to. Returns 0 when
- * the step completed, -1 on error or past `deadline`. */
-static int wk_pump(int fd, oc_tls_status st, uint64_t now, uint64_t deadline) {
-    if (st == OC_TLS_OK) return 0;
-    if (st != OC_TLS_WANT_READ && st != OC_TLS_WANT_WRITE) return -1;
-    if (now >= deadline) return -1;
-    int wait = (int)(deadline - now);
-    if (wait > 250) wait = 250;
-    oc_poll(fd, st == OC_TLS_WANT_WRITE, wait);
-    return 1;                                   /* call again */
-}
-
 int oc_wellknown_fetch(const char *domain, oc_wellknown *out) {
     if (!domain || !domain[0] || !out) return OC_WK_NONE;
     memset(out, 0, sizeof *out);
-
-    oc_tls_client tls;
-    /* No verifier, no metadata. Refusing here rather than falling back to an
-     * unverified fetch is the whole point (wellknown.h). */
-    if (oc_tls_client_init_ca(&tls) != 0) return OC_WK_NONE;
-
-    int rc = OC_WK_NONE;
-    int fd = wk_dial(domain, 443, WK_DEADLINE_MS);
-    if (fd < 0) { oc_tls_client_free(&tls); return OC_WK_NONE; }
-
-    uint64_t deadline = oc_model_now_ms() + WK_DEADLINE_MS;
-    oc_tls_conn conn;
-    if (oc_tls_conn_init(&conn, &tls.conf, fd) != 0) goto done_fd;
-    if (oc_tls_conn_set_hostname(&conn, domain) != 0) goto done_conn;
-
-    for (;;) {
-        int step = wk_pump(fd, oc_tls_handshake(&conn), oc_model_now_ms(), deadline);
-        if (step == 0) break;
-        if (step < 0) goto done_conn;
-    }
-
-    {
-        char req[512];
-        /* HTTP/1.0, deliberately. A 1.1 server may answer with chunked transfer
-         * encoding, whose framing would arrive inside the body and read as a
-         * malformed document -- reporting a workspace as misconfigured because
-         * its web server chose an encoding. 1.0 has no chunked encoding to
-         * choose, and the response ends when the connection closes, which is
-         * what this reads anyway. Host is sent regardless, because name-based
-         * virtual hosts need it and every server accepts it. */
-        int rn = snprintf(req, sizeof req,
-                          "GET %s HTTP/1.0\r\nHost: %s\r\n"
-                          "User-Agent: openchime-client\r\nAccept: application/json\r\n"
-                          "Connection: close\r\n\r\n", OC_WK_PATH, domain);
-        if (rn <= 0 || (size_t)rn >= sizeof req) goto done_conn;
-        size_t sent = 0;
-        while (sent < (size_t)rn) {
-            size_t w = 0;
-            oc_tls_status st = oc_tls_write(&conn, req + sent, (size_t)rn - sent, &w);
-            sent += w;
-            if (st == OC_TLS_OK) continue;
-            int step = wk_pump(fd, st, oc_model_now_ms(), deadline);
-            if (step < 0) goto done_conn;
-        }
-    }
-
-    {
-        char buf[OC_WK_MAX + 1024];             /* the body's cap, plus headers */
-        size_t len = 0;
-        for (;;) {
-            if (len >= sizeof buf - 1) break;   /* more than a document can be */
-            size_t got = 0;
-            oc_tls_status st = oc_tls_read(&conn, buf + len, sizeof buf - 1 - len, &got);
-            len += got;
-            if (st == OC_TLS_OK) {
-                if (got == 0) break;            /* peer closed */
-                continue;
-            }
-            if (st == OC_TLS_CLOSED) break;
-            int step = wk_pump(fd, st, oc_model_now_ms(), deadline);
-            if (step < 0) break;
-        }
-        buf[len] = '\0';
-        rc = oc_wellknown_read_response(buf, len, out);
-    }
-
-done_conn:
-    oc_tls_conn_free(&conn);
-done_fd:
-    oc_closesock(fd);
-    oc_tls_client_free(&tls);
-    return rc;
+    /* Verified against the built-in roots or not fetched at all: no verifier,
+     * no metadata (wellknown.h). The body's cap, plus headers. */
+    char buf[OC_WK_MAX + 1024];
+    long len = oc_https_get(domain, OC_WK_PATH, "application/json", WK_DEADLINE_MS, buf, sizeof buf);
+    if (len <= 0) return OC_WK_NONE;
+    return oc_wellknown_read_response(buf, (size_t)len, out);
 }

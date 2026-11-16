@@ -161,9 +161,14 @@ include mk/full.mk
 # speech, summaries or web client, and the Windows clients; the Linux TUI is
 # the full build's. A make of its own, with the switches on its command line
 # and REMEMBER=0, so build/.features is neither read nor rewritten, and with
-# one job per CPU unless the caller already chose (-j).
+# BUILD_JOBS compiles at once unless the caller already chose (-j). A fixed
+# number, not one per CPU: compiles use memory the whole time they run, and one
+# per CPU on a machine with a memory limit runs past it and is throttled, for
+# no gain, since the Windows app.c, compiled alone, is most of the time. The
+# test suites' own side-by-side count is TEST_JOBS, a different thing.
+BUILD_JOBS ?= 4
 FAST_MAKE = $(MAKE) --no-print-directory REMEMBER=0 TTS=0 STT=0 SUM=0 WEB=0 \
-            $(if $(filter -j%,$(MAKEFLAGS)),,-j$(TEST_JOBS))
+            $(if $(filter -j%,$(MAKEFLAGS)),,-j$(BUILD_JOBS))
 # A switch given to them is not taken, and they say so.
 FAST_IGNORED = $(strip $(foreach v,TTS STT SUM WEB,$(if $(filter command line,$(origin $(v))),$(v))))
 build test:

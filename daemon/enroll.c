@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -365,9 +366,10 @@ done:
     return rc;
 }
 
-/* Sign SHA-256("openchime-enroll-v1|<aud>|<nonce>") → ASN.1 DER → base64. */
-int oc_enroll_sign_proof(const char *privkey_pem, const char *audience, const char *nonce,
-                         char *sig_b64, size_t sig_cap) {
+/* Sign SHA-256("<prefix>|<aud>|<nonce>") → ASN.1 DER → base64. The prefix says
+ * which proof it is, so a signature is good for that one and no other. */
+static int sign_line(const char *privkey_pem, const char *prefix, const char *audience,
+                     const char *nonce, char *sig_b64, size_t sig_cap) {
     enroll_rng rng;
     if (rng_init(&rng) != 0) { rng_free(&rng); return -1; }
 
@@ -378,7 +380,7 @@ int oc_enroll_sign_proof(const char *privkey_pem, const char *audience, const ch
                              NULL, 0, mbedtls_ctr_drbg_random, &rng.drbg) != 0) goto done;
 
     char msg[768];
-    int mn = snprintf(msg, sizeof msg, "openchime-enroll-v1|%s|%s", audience, nonce);
+    int mn = snprintf(msg, sizeof msg, "%s|%s|%s", prefix, audience, nonce);
     if (mn < 0 || mn >= (int)sizeof msg) goto done;
 
     uint8_t hash[32];
@@ -397,6 +399,49 @@ done:
     mbedtls_pk_free(&pk);
     rng_free(&rng);
     return rc;
+}
+
+int oc_enroll_sign_proof(const char *privkey_pem, const char *audience, const char *nonce,
+                         char *sig_b64, size_t sig_cap) {
+    return sign_line(privkey_pem, "openchime-enroll-v1", audience, nonce, sig_b64, sig_cap);
+}
+
+int oc_enroll_sign_address_proof(const char *privkey_pem, const char *audience, const char *nonce,
+                                 char *sig_b64, size_t sig_cap) {
+    return sign_line(privkey_pem, OC_ADDRESS_PROOF_PREFIX, audience, nonce, sig_b64, sig_cap);
+}
+
+int oc_enroll_nonce_ok(const char *nonce, size_t len) {
+    if (len != OC_ADDRESS_NONCE_LEN) return 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = nonce[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+              c == '-' || c == '_')) return 0;
+    }
+    return 1;
+}
+
+int oc_enroll_address(const char *workspace_address, const char *tls_names, int port,
+                      char *out, size_t cap) {
+    const char *from = workspace_address && workspace_address[0] ? workspace_address : tls_names;
+    if (!from || !out || cap == 0) return -1;
+    while (*from == ' ') from++;
+    size_t n = 0;
+    while (from[n] && from[n] != ',' && from[n] != ' ') n++;
+    if (n == 0 || n > 253) return -1;
+    int dot = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = from[i];
+        if (c == '.') dot = 1;
+        else if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'))
+            return -1;
+    }
+    if (!dot || from[0] == '-' || from[0] == '.' || from[n - 1] == '.' || from[n - 1] == '-') return -1;
+    char host[254];
+    for (size_t i = 0; i < n; i++) host[i] = (char)tolower((unsigned char)from[i]);
+    host[n] = '\0';
+    int w = port > 0 && port != 443 ? snprintf(out, cap, "%s:%d", host, port) : snprintf(out, cap, "%s", host);
+    return w > 0 && (size_t)w < cap ? 0 : -1;
 }
 
 /* base64url (no padding) -> bytes. Returns the count, or -1. */

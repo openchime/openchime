@@ -23,6 +23,12 @@
  * bracket-balance rules of MARKDOWN.md §4. */
 size_t oc_url_len(const char *b, size_t end, size_t i);
 
+/* The length of an OpenChime permalink starting at `i` --
+ * `openchime://<host>/c/<channel>[/m/<message>]`, the host possibly empty --
+ * or 0. A link the reader's client opens itself (ARCH-96), never handed to
+ * the system, and never fetched: oc_url_extract does not include it. */
+size_t oc_url_permalink_len(const char *b, size_t end, size_t i);
+
 typedef struct { size_t start, len; } oc_url_span;
 
 /* Every address in `b[0..len)`, in order, up to `max` — the daemon-facing

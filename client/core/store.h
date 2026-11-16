@@ -120,6 +120,13 @@ void oc_store_workspace_remember(oc_store *s, const char *workspace,
                                  uint64_t now_ms);
 void oc_store_workspace_forget(oc_store *s, const char *workspace);
 
+/* The workspace's audience id (WORKSPACE_INFO), kept beside its book entry: what
+ * an email link names it by (CLIENT.md, "Links"). Written only where the book
+ * already has the workspace; "" clears it. by_audience finds the workspace key a
+ * link means among those this device knows: 1 with it in `ws`, else 0. */
+void oc_store_workspace_note_audience(oc_store *s, const char *workspace, const char *audience);
+int  oc_store_workspace_by_audience(oc_store *s, const char *audience, char *ws, size_t cap);
+
 typedef void (*oc_store_workspace_cb)(void *ctx, const char *workspace,
                                       const char *label, const char *username,
                                       uint64_t last_used_ms);

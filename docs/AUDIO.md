@@ -342,7 +342,8 @@ participant's packets to each other participant by that participant's own
 transport. While media goes by the connection, the call engine's threads queue
 each packet (64 at most, the oldest dropped) and wake the network thread, which
 writes queued media first in each turn, ahead of an upload's chunks or a voice
-segment. The call view says when audio is going through the server connection.
+segment. The call view does not say which route the audio takes: the route is
+the call's business, and it shows the usual push-to-talk hint either way.
 Over TCP a lost segment holds up the ones behind it, which the jitter buffer
 absorbs up to its 240 ms ceiling; on a lossy network the call is less clear than
 over UDP, and on an ordinary one the same.

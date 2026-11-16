@@ -14,8 +14,10 @@
 # "[spoiler]" meanwhile; a quote stays a quote, an unclosed `>!` is one, and
 # `||text||` is no spoiler in a line or in a row. A cell past a table's columns,
 # a table past those drawn as grids and a /me action hide theirs too, and the
-# composer's Quote button keeps a spoiler whole. Its own daemon on its own port,
-# wiped each run.
+# composer's Quote button keeps a spoiler whole. Shift+Enter inside one makes it
+# a block, past a draft's 64th as before it; a draft with a spoiler never closed
+# is not sent; Copy text, on a message and on a /me action, gives "[spoiler]"
+# until it is revealed. Its own daemon on its own port, wiped each run.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$HERE/tools/gui/lib.sh"
@@ -197,8 +199,10 @@ send_plain() {  # send_plain <body> <preview starts>: sends it, waits for the pr
 check "a block quote is sent" send_plain '> PLAINQUOTE stays a quote' '> PLAINQUOTE stays a quote'
 check "it stays a quote, with no spoiler" marks "$LAST" 1 0
 "$DRIVE" shot spoiler_quote >/dev/null
-check "an unclosed one at a line's start is sent" send_plain '>!UNCLOSED stays a quote' '>!UNCLOSED stays a quote'
-check "it stays a quote too, and hides nothing" marks "$LAST" 1 0
+# Typed bare, one that never closes is held back (below, "a spoiler never
+# closed is not sent"); written \>!, it is the characters, sent as text.
+check "an unclosed one, escaped, is sent" send_plain '\\>!UNCLOSED stays text' '\>!UNCLOSED stays text'
+check "it is text: no quote, and it hides nothing" marks "$LAST" 0 0
 check "the old form in a line is sent" send_plain '||OLDFORM|| is ordinary text' '||OLDFORM|| is ordinary text'
 check "it is ordinary text, and hides nothing" marks "$LAST" 0 0
 check "a quote holding one is sent" send_plain '> >!INQUOTE!< said it' '> [spoiler] said it'
@@ -284,11 +288,70 @@ say "== Shift+Enter inside one in the composer"
 check "the spoiler is in the draft" waitfor 5 draft_is '>!SHIFTAB!<'
 "$DRIVE" key left >/dev/null; "$DRIVE" key left >/dev/null
 "$DRIVE" key shift+enter >/dev/null
-split() { snap; grep -q '^ed len=.*text=">!SHIFTA!<$' "$D" && grep -q '^>!B!<"$' "$D"; }
-check "it splits into two spoilers, hiding both halves" waitfor 5 split
+block() { snap; grep -q '^ed len=.*text="```spoiler$' "$D" && grep -qx 'SHIFTA' "$D" && grep -qx 'B' "$D" && grep -q '^```"$' "$D"; }
+check "it becomes one block spoiler, hiding both lines" waitfor 5 block
 "$DRIVE" key enter >/dev/null
-sents() { snap; L3="$(sent_mid)"; [ "$L3" != "$L2" ] && grep -q "^  marks msg=$L3 quotes=0 spoilers=2\$" "$D"; }
-check "sent, both are spoilers" waitfor 10 sents
+sents() { snap; L3="$(sent_mid)"; [ "$L3" != "$L2" ] && grep -q "^  marks msg=$L3 quotes=0 spoilers=1\$" "$D"; }
+check "sent, it is one spoiler" waitfor 10 sents
+# Past a draft's 64th spoiler as before it.
+many=""; for i in $(seq 1 66); do many="${many}>!s$i!< "; done
+"$DRIVE" typekeys "${many}>!LATEAB!<" >/dev/null
+# All of it typed before the caret moves: the keys otherwise land mid-typing.
+typed() { snap; grep -q "^ed len=$(( ${#many} + 10 )) " "$D"; }
+waitfor 15 typed
+"$DRIVE" key left >/dev/null; "$DRIVE" key left >/dev/null
+"$DRIVE" key shift+enter >/dev/null
+late() { snap; grep -q '^```spoiler$' "$D" && grep -qx 'LATEA' "$D"; }
+check "past the 64th spoiler, a line break keeps it whole too" waitfor 5 late
+"$DRIVE" key enter >/dev/null
+sentl() { snap; L5="$(sent_mid)"; [ "$L5" != "$L3" ] && grep -q "^  marks msg=$L5 quotes=0 spoilers=67\$" "$D"; }
+check "sent, every one is a spoiler" waitfor 10 sentl
+L3="$L5"
+
+say "== a spoiler never closed is not sent"
+"$DRIVE" typekeys 'tell >!OPENONLY and nothing' >/dev/null
+"$DRIVE" key enter >/dev/null
+refused() { snap; grep -q 'OPENONLY' <(grep '^ed len=' "$D"); }
+check "the draft stays in the box" waitfor 5 refused
+notsent() { snap; [ "$(sent_mid)" = "$L3" ]; }
+check "and nothing was sent" notsent
+clear_draft
+
+say "== copying gives the covered form"
+menu_cmd() {  # focus the newest message, open its menu, stop on command $1
+  local n
+  "$DRIVE" move 20 20 >/dev/null
+  for n in $(seq 1 20); do [ "$(kb mid)" = "$NEW" ] && break; "$DRIVE" key ctrl+down >/dev/null; done
+  "$DRIVE" key shift+f10 >/dev/null
+  for n in $(seq 1 30); do
+    [ "$(kb menuhovercmd)" = "$1" ] && return 0
+    "$DRIVE" key down >/dev/null
+  done
+  return 1
+}
+paste_draft() { "$DRIVE" move 20 20 >/dev/null; "$DRIVE" key escape >/dev/null; clear_draft; "$DRIVE" key ctrl+v >/dev/null; }
+pasted() { snap; grep '^ed len=' "$D" | grep -qF "$1"; }
+send_new 'copy me >!COPYHIDDEN!< done'
+check "a message to copy is sent" [ -n "$NEW" ]
+check "Copy text is offered" menu_cmd 20
+"$DRIVE" key enter >/dev/null
+paste_draft
+check "Copy text gives [spoiler], not what it hides" waitfor 5 pasted 'copy me [spoiler] done'
+clear_draft
+click_rect "$(mspl "$NEW" 0 r)"
+check "Copy text is offered again" menu_cmd 20
+"$DRIVE" key enter >/dev/null
+paste_draft
+check "revealed, Copy text gives what it hid" waitfor 5 pasted 'COPYHIDDEN'
+clear_draft
+send_new '/me >!MECOPY!< waves'
+check "an action to copy is sent" [ -n "$NEW" ]
+check "its Copy text is offered" menu_cmd 20
+"$DRIVE" key enter >/dev/null
+paste_draft
+coveredme() { pasted '[spoiler] waves' && ! grep '^ed len=' "$D" | grep -q MECOPY; }
+check "an action's Copy text gives [spoiler] too" waitfor 5 coveredme
+clear_draft
 "$DRIVE" typekeys '>!QUIETNL!<' >/dev/null
 "$DRIVE" key left >/dev/null; "$DRIVE" key right >/dev/null
 "$DRIVE" typekeys '\' >/dev/null

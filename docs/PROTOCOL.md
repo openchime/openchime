@@ -115,7 +115,9 @@ during the TLS handshake:
 Both sides exist. A connection that negotiates `oc/1` reaches the binary
 protocol; one that does not is read by the daemon's HTTP/1.1 stack (ARCH-32),
 which serves `POST /webhook/<token>` (§5.15), the WebSocket upgrade `GET /ws`
-(§1.2), the daemon's own sign-in pages (AUTH.md §8.10/§8.11) and, when its wasm
+(§1.2), `POST /enroll-proof` (central's check of the address an enrolled
+workspace reported, AUTH.md §3.6), the daemon's own sign-in pages (AUTH.md
+§8.10/§8.11) and, when its wasm
 is beside the binary, the web client under `/app/` (WEB.md): any other path is
 `404`, and a served path under another method `405`.
 `/healthz` and the landing page are on the separate plaintext health port
@@ -213,8 +215,21 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 34** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 46** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 46 appended `channel_id` to each `AUDIT_PAGE` entry, the channel the entry
+> happened in (REQ-251). Version 45 appended `audience` to `WORKSPACE_INFO`
+> (CLIENT.md, "Links"). Version
+> 44 appended `media_kind` to `UPLOAD_BEGIN`, so a snippet's text past its cap is
+> refused before it is sent (REQ-226). Version
+> 38 appended `remind_at_ms` to `SAVE_ITEM`, `SAVED_UPDATED` and `SAVED_MSG`, a
+> saved item's reminder, and added the activity kind for one that fired (REQ-283). Version
+> 37 appended `follow_threads` to each `NOTIFY_PREFS` entry (§5.12, REQ-282). Version
+> 36 put `also_channel` in `SEND_REPLY` and `THREAD_REPLY` and `parent_id` in
+> `BROADCAST`, each in the fixed part ahead of the body: a thread reply can also
+> be posted to the channel's main scroll (REQ-062, §5.10). Version
+> 35 appended `thread_root` to `TYPING` and `TYPING_UPDATE`, so typing shows in
+> the thread it is in (§5.13, REQ-121). Version
 > 34 appended `n_repliers` and the repliers' ids to `THREAD_META`, which is now
 > also sent live when a reply is posted or deleted (§5.10). Version
 > 33 appended `family`, `actor_id` and `action` to `AUDIT_QUERY`, filters the
@@ -451,7 +466,8 @@ A freshly-authenticated client typically follows `AUTH_OK` with a
 
 After `AUTH_OK` the daemon sends, in order: `WORKSPACE_INFO`,
 `WORKSPACE_ADDRESS` (when set), `SERVER_BUILD`, `CAPABILITIES`, `TTS_INFO`,
-`STT_INFO`, `SNOOZE`, `ALERTS_SUMMARY` (owner/admin), any `SUMMARY_READY`
+`STT_INFO`, `SNOOZE`, `ALERTS_SUMMARY` (owner/admin), `PROFILE_FIELDS`
+(always, empty when the workspace has none), any `SUMMARY_READY`
 notices, one `CALL_STATE` per call, the caller's encrypted-DM state, then the
 presence snapshot.
 
@@ -470,6 +486,7 @@ a bare host address. Clients that don't recognize the frame ignore it.
 | `call_max`        | u8   | The most people in one call, ten (`OC_CALL_MAX`, REQ-305) — so a client starting one in a large channel knows when the starter must pick (§5.17). |
 | `mode`            | u8   | `OPENCHIME_MODE`: `0` normal, `1` development, `2` demo. A client in a public demo (`2`) says so for as long as it is open (AUTH.md §8.12). Appended in version 25. |
 | `max_video_size`  | u64  | The most bytes a video message may hold (`OPENCHIME_MAX_VIDEO_SIZE`, 160 MiB by default, at most `MAX_ATTACHMENT_SIZE`; REQ-164). A client's recorder stops 5 MiB short of it, and `ATTACH_MEDIA_SET` refuses a larger video with `MEDIA_TOO_LARGE` (§5.14a). Appended in version 27. |
+| `audience`        | str  | The workspace's audience id with OpenChime's services (AUTH.md §3.3), **empty** when it is not enrolled. An email link names the workspace by it (CLIENT.md, "Links"). Appended in version 45. |
 
 ### 4.3b `WORKSPACE_ADDRESS` (server → client), msg_type `0x001C`
 
@@ -581,6 +598,7 @@ tenant-monotonic (ARCH-43).
 | `server_time`  | u64  | Server timestamp, ms since epoch UTC.        |
 | `kind`         | u8   | `0` something someone said; `1` a call event the daemon wrote — a missed call (REQ-304, §5.17). Any other value is malformed. |
 | `broadcast_stored` | u8 | `1` when the daemon stored a broadcast mention (`@here`, `@channel` or `@everyone`) for the message when it was sent, so a broadcast its body holds notifies (REQ-221); else `0`, whatever the body. Any other value is malformed. Since version 32 (version 31 carried `broadcast_held` here). |
+| `parent_id`    | u64  | The thread root of a reply also posted to the channel (REQ-062, §5.10), which a replay of the main scroll carries with it; `0` for a message that is not a reply. Since version 36. |
 | `body`         | lstr | Message body (§7).                           |
 
 `broadcast_stored` is the daemon's answer to whether a broadcast mention
@@ -784,6 +802,8 @@ msg_type `0x0051`** describing the channel and the caller's membership:
 | `archived`   | u8   | `1` when the channel is archived and read-only (REQ-035). |
 | `n_peers`    | u16  | Participant count, then that many `u64` ids — a group DM's people (REQ-056). `0` for a named channel. |
 | `e2e`        | u8   | `1` for an encrypted DM (§5.19, PRIVATE-DM.md), whose message bodies the daemon cannot read; `0` otherwise. |
+| `creator_id` | u64  | Who created the channel (since version 42); `0` when not known — every channel made before then, and every DM. |
+| `n_managers` | u16  | The channel's managers (since version 42, REQ-036b), then that many `u64` ids, at most 64. `0` when it has none. |
 
 Failures are non-fatal `ERROR` frames carrying the `channel_id` (8 bytes,
 big-endian) in `context`: `UNKNOWN_CHANNEL`, `NOT_A_MEMBER`, `FORBIDDEN`,
@@ -861,6 +881,20 @@ client learns of the new channel immediately. An actor who is not a member gets
 (REQ-033). Replies `CHANNEL_INFO` to the actor. An actor who is not a member
 gets `NOT_A_MEMBER`.
 
+**`CHANNEL_ADD_MANAGER` (client → server), msg_type `0x013B`** and
+**`CHANNEL_REMOVE_MANAGER` (client → server), msg_type `0x013C`**
+`{ channel_id: u64, user_id: u64 }` — a channel's **managers** (REQ-036b, ARCH-134).
+The creator is the first, made so by `CREATE_CHANNEL`. A manager of the channel,
+an admin or an owner names another and takes the role from any manager, the
+creator included; anyone else is refused with `FORBIDDEN`. Only a member of the
+channel can be named (`NOT_A_MEMBER` otherwise), and at most 64
+(`INVALID_CHANNEL` past that). Naming someone already a manager, or removing
+someone who is not, succeeds and changes nothing. Leaving the channel or being
+removed from it ends the role; rejoining does not restore it. A DM has no
+managers (`INVALID_CHANNEL`). On success the actor gets `CHANNEL_INFO`, and every
+other member the same frame, naming the managers now. Each change is audited
+(`channel.manager.grant`, `channel.manager.revoke`).
+
 Every tenant has one auto-provisioned public **`general`** channel (id `1`) that
 every user joins at authentication, so the messaging path always has a channel
 to deliver to. On a managed deployment (started with `OPENCHIME_MANAGED_TICKET`) the
@@ -882,9 +916,10 @@ One frame for every verb because they all mutate one row and all fan out the sam
 state — the op *is* the difference.
 
 **Authority** splits on blast radius: **any member may set the topic or the
-description** (already visible to the channel, corrected in seconds); **owner/admin
-only** for rename, archive, unarchive and a change of visibility, which change what
-people *not* looking at the channel see. On a public demo (AUTH.md §8.12) the topic
+description** (already visible to the channel, corrected in seconds); **owner/admin,
+or a manager of the channel** (§5.7), for rename, archive and unarchive, and
+**owner/admin only** for a change of visibility: they change what people *not*
+looking at the channel see. On a public demo (AUTH.md §8.12) the topic
 and the description are an owner's or admin's too — a demo's channels say what the
 demo is — and a member's attempt is `FORBIDDEN`.
 
@@ -925,7 +960,8 @@ History, search and membership are untouched — archiving is the reversible
 alternative to a deletion that is not offered for channels holding history.
 
 Failures are non-fatal `ERROR` frames: `UNKNOWN_CHANNEL`, `NOT_A_MEMBER`,
-`FORBIDDEN` (rename/archive by a non-admin), `CHANNEL_EXISTS` (the new name is
+`FORBIDDEN` (rename/archive by someone neither an admin nor a manager of the
+channel, or a change of visibility by a non-admin), `CHANNEL_EXISTS` (the new name is
 taken — the same unique-name rule as create, §5.7), or `INVALID_CHANNEL` (empty
 or oversized name, oversized topic, or **any of these attempted on a DM** — a DM
 has no name to rename and archiving one is a different feature).
@@ -950,7 +986,13 @@ Each entry, in wire order:
 `user_id` (u64) · `role` (u8) · `disabled` (u8) · `email` (str) ·
 `display_name` (str) · `avatar_id` (u64) · `title` (str) · `timezone` (str) ·
 `status_emoji` (str) · `status_text` (str) · `full_name` (str) ·
-`pronouns` (str) · `voice_id` (str) · `flags` (u8, since version 30).
+`pronouns` (str) · `voice_id` (str) · `flags` (u8, since version 30) ·
+`ooo_start` (u64) · `ooo_end` (u64) · `ooo_message` (str) (the three since
+version 41).
+
+`ooo_*` is the person's **out of office** (`SET_OUT_OF_OFFICE`, §5.20), as
+stored: in force while `ooo_start` ≤ now < `ooo_end`, which the client decides,
+so the mark goes at the end time with nothing sent. `ooo_end` 0 means none.
 
 `flags` bit `0x01` (`OC_USER_SYSTEM`) marks **the workspace's own sender**: the
 account that posts what the workspace says, such as the welcome a new member is
@@ -1247,21 +1289,34 @@ disk (ARCH-88), and both change from other clients.
 
 Both are **per-user** surfaces, and neither fans out to anyone else.
 
-**`SAVE_ITEM` (client → server), msg_type `0x0062`** `{ message_id: u64, op: u8 }`
+**`SAVE_ITEM` (client → server), msg_type `0x0062`** `{ message_id: u64, op: u8, remind_at_ms: u64 }`
 (`1` save, `0` unsave). You may save anything in a channel you are a member of
 (`NOT_A_MEMBER` otherwise, even for a public channel you can read; `FORBIDDEN`
-in an encrypted DM); a tombstone cannot be saved. Replies **`SAVED_UPDATED` (`0x0063`)** `{ message_id, op, saved_at }` **to
-the actor only** — a personal bookmark has no one to announce it to. Saving twice
-is a no-op and reports the **original** `saved_at`, so a list ordered by when you
-saved does not reshuffle when you click again.
+in an encrypted DM); a tombstone cannot be saved. Replies **`SAVED_UPDATED` (`0x0063`)** `{ message_id, op, saved_at, remind_at_ms: u64 }` **to
+each of the actor's connections and nobody else's** — a personal bookmark has no
+one else to announce it to, and their other devices show it. Saving twice
+reports the **original** `saved_at`, so a list ordered by when you saved does not
+reshuffle when you click again.
+
+`remind_at_ms` is the item's **reminder** (REQ-283), `0` for none (protocol
+35). With op `1` it is the item's whole state: a time sets the reminder, to fire
+once more even if an earlier one had fired; `0` clears it and leaves the item
+saved. A client saving again sends the reminder it holds. A reminder on an
+unsaved message saves it; unsaving takes the reminder with it, as does deleting
+the message. On the scheduled-message tick (fifteen seconds) every reminder whose time has passed fires once: the owner's
+connections are sent an **`ACTIVITY_ENTRY`** of kind `5` (`OC_ACT_REMINDER`:
+`message_id`, `channel_id`, `at` the moment it fired, no text), and their
+devices are woken through push as for a mention, held back by a mute, quiet
+hours or a pause; never mail. The fired reminder stays in `LIST_ACTIVITY` until
+it is cleared or set again. Backfill's replayed `SAVED_UPDATED` carries it too.
 
 **`LIST_SAVED` (`0x0064`)** (no body) streams **`SAVED_MSG` (`0x0065`)** newest
 save first, then **`SAVED` (`0x0066`)** `{ count: u32 }`. Each entry is
 `{ message_id: u64, channel_id: u64, author_id: u64, server_time: u64,
-saved_at: u64, body: str, attach_name: str, action: u8 }` — the body and first
+saved_at: u64, body: str, attach_name: str, action: u8, remind_at_ms: u64 }` — the body and first
 attachment's name, like a pin — a saved message is
 usually far outside loaded history — and, last, an `action` byte (REQ-058,
-§5.16l): `1` when the message is an action, its body then being the action text. Entries whose channel you have since left are
+§5.16l): `1` when the message is an action, its body then being the action text, then its reminder, `0` for none. Entries whose channel you have since left are
 omitted: leaving a channel must stop it leaking through your saved list.
 
 **`SET_COLLAPSED` (client → server), msg_type `0x0117`** `{ message_id: u64, on: u8 }`
@@ -1275,6 +1330,34 @@ saved state. Folding twice, or opening one that is open, changes nothing and is
 answered the same. A delete takes the message's folds with it. (A message long
 enough to be folded *for everyone* is the client's rule, CLIENT.md, and is not
 on the wire.)
+
+**`MOVE_MESSAGE` (client → server), msg_type `0x011C`** `{ message_id: u64,
+dest_channel_id: u64, dest_parent_id: u64, leave_marker: u8 }` moves a message
+(REQ-053): to `dest_channel_id`'s top level when `dest_parent_id` is `0`, or
+into the thread of that top-level message there. A thread root moves with all
+of its replies, so a thread is never split, and it cannot become a reply
+(`CANNOT_MOVE`); a reply can move out to a top level. An owner or admin may move
+any message, an author their own (`FORBIDDEN`). The mover must be able to read
+the source (`UNKNOWN_MESSAGE` otherwise) and post in the destination
+(`FORBIDDEN`; a public one joins them, as a send does). Neither channel may be
+archived (`CHANNEL_ARCHIVED`), a DM or an encrypted DM (`CANNOT_MOVE`).
+`leave_marker` is `0` or `1`, anything else malformed.
+
+The message keeps its id, author, time, edits, reactions, attachments and pin;
+its mentions, pin, files, previews and poll follow it, all in one transaction,
+and the move is audited (`message.move`). With `leave_marker` `1`, the
+workspace's own sender says in the source "<mover> moved a message to #dest"
+(or "a thread"), as a `BROADCAST` like its other notices.
+
+**`MESSAGE_MOVED` (`0x011D`)** `{ message_id: u64, from_channel: u64,
+to_channel: u64, to_parent: u64, count: u32 }` goes to the members of both
+channels, each connection once; `count` is how many messages moved. A client
+drops the message (and a thread's replies) from where it was, and reads the
+moved rows where they now are as it reads any others: `HISTORY_AROUND` the
+message at a top level, the thread again when it went into an open one. A
+`HISTORY_AROUND` naming the channel a moved message used to be in answers from
+the channel it is in now, for a reader who may read that one, so a copied link
+still finds it.
 
 **`LIST_ACTIVITY` (`0x0067`)** `{ filter: u8 }` streams **`ACTIVITY_ENTRY`
 (`0x0068`)** newest first, then **`ACTIVITY` (`0x0069`)** `{ count: u32,
@@ -1313,12 +1396,38 @@ marks, reactions, unfurls, forwards, actions, polls), so the client's high-water
 unchanged — only the `WHERE` differs from the backwards paging. Read access is
 checked exactly as it is there: a permalink is not a way around membership.
 
+**`FIND_AT_TIME` (client → server), msg_type `0x011E`**
+`{ channel_id: u64, parent_id: u64, at_ms: u64 }` finds where a date falls in a
+conversation: its main scroll when `parent_id` is `0`, else the thread of that
+top-level message (its root and replies). Read access is checked as for
+history: `UNKNOWN_CHANNEL` for no such conversation, `NOT_A_MEMBER` for one the
+asker cannot read. The client sends the reader's local midnight; the daemon
+knows nothing of time zones.
+
+**`FOUND_AT_TIME` (server → client), msg_type `0x011F`**
+`{ channel_id: u64, parent_id: u64, message_id: u64, server_time: u64, exact: u8 }`,
+to the asker alone: the first message at or after `at_ms` (`exact` `1`); when
+none is later, the last one before it (`exact` `0`); `message_id` `0` when the
+conversation has none. The client then opens it as a permalink does, with
+`HISTORY_AROUND`, and says so when the message found is not on the day asked
+("No messages on 3 May; showing the next, 5 May"). `exact` is `0` or `1`,
+anything else malformed.
+
 ### 5.10 Threads (REQ-060)
 
 Any message can be replied to as a thread. A reply threads under a **top-level
 root** — replying to a reply flattens to that reply's root, so threads are one
 level deep. A reply is **not** delivered to the channel's main scroll (§5.3): it
-is fanned out as a `THREAD_REPLY`, and the parent shows a reply count.
+is fanned out as a `THREAD_REPLY`, and the parent shows a reply count -- unless
+it was sent with `also_channel` (REQ-062). Then it is **one message in both
+places**: stored once, flagged, never copied; live, one `THREAD_REPLY` with
+`also_channel` 1 to every member, which a client shows in the thread and in the
+channel without showing it twice; and in the main scroll's replay (§6) and
+history pages as a `BROADCAST` carrying its `parent_id`. It counts in the
+channel's unread, last message and preview as a top-level message does, once;
+it is one message for the mentions it stores and the notifications it makes;
+and an edit, delete, restore or reaction on it reaches every member, as on any
+message. An archived channel refuses it as it refuses any reply.
 
 **`SEND_REPLY` (client → server), msg_type `0x002C`:**
 
@@ -1327,6 +1436,7 @@ is fanned out as a `THREAD_REPLY`, and the parent shows a reply count.
 | `channel_id` | u64  | The channel.                                              |
 | `idem`       | 16 B | Idempotency token (§7), exactly as `SEND` (REQ-093).      |
 | `parent_id`  | u64  | The message being replied to (resolved to its root).      |
+| `also_channel` | u8 | `1` posts the reply to the channel's main scroll too (REQ-062); `0` as before. Any other value is malformed. Since version 36. |
 | `body`       | lstr | Reply body, `<= MAX_BODY_SIZE`.                           |
 
 The sender is acked with a normal `SEND_ACK` (§5.2). Then the daemon fans a
@@ -1343,6 +1453,7 @@ member of the channel:
 | `reply_count` | u32  | The root's total reply count after this reply (REQ-060). |
 | `participant` | u8   | 1 if **this recipient** is in the thread (REQ-061).      |
 | `broadcast_stored` | u8 | As on `BROADCAST` (§5.3): `1` when the reply's send stored a broadcast mention (REQ-221). Since version 32. |
+| `also_channel` | u8  | `1` when the reply is also in the channel's main scroll (REQ-062): the client shows it there too, from this one frame. Since version 36. |
 | `body`        | lstr | The reply body.                                          |
 
 `participant` is the only per-recipient field on a fan-out frame, so the daemon
@@ -1542,18 +1653,24 @@ a maintenance tick re-announces a user whose answer differs from what they were
 last announced as. Only a frame can untell the people who were told, and
 comparing rather than re-announcing keeps an idle deployment silent.
 
-**`TYPING` (client → server), msg_type `0x007E`** `{ channel_id: u64 }` — the
-caller signals they are composing in `channel_id`. The server resolves the
+**`TYPING` (client → server), msg_type `0x007E`** `{ channel_id: u64,
+thread_root: u64 }` — the caller signals they are composing in `channel_id`: in
+the thread whose root is `thread_root`, or in the main scroll when it is `0`
+(REQ-121; since version 35). The server resolves the
 channel's members (on the read connection, ARCH-66) and, if the caller has access,
 relays to the other connected members only — private-channel and DM typing never
 leaks to non-members. A connection's signals past 3 per 2 seconds are dropped
 without reply; the next says the same.
 
 **`TYPING_UPDATE` (server → client), msg_type `0x007F`** `{ channel_id: u64,
-user_id: u64 }` — delivered to each connected member of `channel_id` except the
-sender. There is **no expiry frame and no "stopped typing" signal**: the client
-displays the indicator and expires it locally after **~6 seconds**, refreshed by
-each new `TYPING_UPDATE` for that `(channel, user)`.
+user_id: u64, thread_root: u64 }` — delivered to each connected member of
+`channel_id` except the sender, with the `thread_root` it was sent with,
+relayed as it came: it reaches only the channel's members, and a client shows
+it only in that thread's pane (or the main scroll's, for `0`), so a wrong one
+shows nowhere. There is **no expiry frame and no "stopped typing" signal**: the
+client displays the indicator and expires it locally after **~6 seconds**,
+refreshed by each new `TYPING_UPDATE` for that `(channel, user)`, which also
+moves it to the thread that update names.
 
 ---
 
@@ -1575,9 +1692,11 @@ with `TRANSFER_CANCEL`. Chunk `data` is bounded so each frame stays
 **Upload (client → server bytes):**
 
 1. **`UPLOAD_BEGIN` (C → S), `0x0080`** `{ channel_id: u64, idempotency_token:
-   16B, filename: str, mime: str, total_size: u64 }` — the client declares an
-   upload targeting a channel/DM it can post to. The server authorizes
-   membership, checks `total_size <= MAX_ATTACHMENT_SIZE`, allocates an
+   16B, filename: str, mime: str, total_size: u64, media_kind: u8 }` — the client
+   declares an upload targeting a channel/DM it can post to. `media_kind` is 2 for
+   a snippet's text (§5.14b) and 0 otherwise (protocol 44). The server authorizes
+   membership, checks `total_size <= MAX_ATTACHMENT_SIZE` (and, for a snippet,
+   at most 1 MiB), allocates an
    `attachment_id` + opaque storage key, and opens a streaming write to object
    storage. **Idempotent on `(channel_id, uploader, idempotency_token)`** — as `SEND` is,
    but keyed on the uploader too, so one member is never handed another's row: a
@@ -1660,6 +1779,40 @@ finalize are swept by a time-gated cleanup (ARCH-70). A new transfer may begin
 at once, even while the cancelled one's `UPLOAD_BEGIN` or `DOWNLOAD_BEGIN` is still
 being answered: whatever that answer is — its attachment, or a refusal — it
 belongs to the cancelled transfer and is dropped, never taken for the new one's.
+
+---
+
+### 5.14b Snippets (REQ-226)
+
+A snippet is an **ordinary attachment** too: a `text/plain` upload of at most
+1 MiB, marked with a title and an optional language, shown as a card with its
+first lines and opened whole with its words coloured (`shared/lexer.h`: C,
+Python, JavaScript, shell, JSON, YAML, SQL and Go; anything else plain). Posting
+it is three steps:
+
+1. Upload the text, `mime` `text/plain`.
+2. **`ATTACH_MEDIA_SET`** with `media_kind` `2` (protocol 39). After the kind
+   byte come `{ title: str, language: str, text: str }` in place of a video's
+   facts: the title (1 to 120 bytes), the language (at most 16 bytes of `a`–`z`,
+   `0`–`9`, `+`, `#`, `-`; empty for plain), and the text's first 64 KiB, for
+   search. Answered `ATTACH_MEDIA_OK`, or `UNKNOWN_ATTACHMENT` as for a video,
+   `MEDIA_TOO_LARGE` past 1 MiB, and `MEDIA_INVALID` for an upload that is not
+   `text/plain`, already sent, untitled, a language outside those characters, or
+   text that is not UTF-8.
+3. `SEND` (or `SEND_REPLY`) with its id in the attachment list.
+
+An attachment entry of kind `2` carries `{ title: str, language: str }` after the
+kind byte, where a video's carries its facts. Search (`SEARCH`) finds a
+message by its snippet's title or text: such hits follow the message hits on the
+first page of a search with words and no filters, newest first, under the same
+read gate, their excerpt "Snippet: <title>". Deleting the message, or the
+storage sweep reclaiming the bytes, takes the snippet out of search.
+
+The size cap is enforced at `UPLOAD_BEGIN`, whose `media_kind` says the upload
+is a snippet, before any of its bytes are sent (`ATTACHMENT_TOO_LARGE`), and again
+at `ATTACH_MEDIA_SET` when it is marked. Clients refuse a longer
+text before uploading it, and offer a paste of more than 40 lines or 4 KiB as
+one.
 
 ---
 
@@ -1931,9 +2084,20 @@ differently.
 settings.
 
 **`NOTIFY_PREFS` (S → C), `0x0093`** `{ notify_default: u8, count: u16,
-count × { channel_id: u64, level: u8, muted: u8 } }` — the snapshot. It is sent both as the reply to `LIST_NOTIFY_PREFS` and, after any
+count × { channel_id: u64, level: u8, muted: u8, follow_threads: u8 } }` — the snapshot. It is sent both as the reply to `LIST_NOTIFY_PREFS` and, after any
 `SET_*`, **pushed to every one of the user's connections** so a change on one
-device updates the others.
+device updates the others. `follow_threads` (since version 37) is `1` when the
+person follows every thread in the conversation (REQ-282).
+
+**`SET_CHANNEL_THREAD_FOLLOW` (C → S), `0x011B`** `{ channel_id: u64, on: u8 }` —
+follow every thread in a conversation the caller can read, or stop (REQ-282);
+any `on` but `0` or `1` is malformed. Answered with `NOTIFY_PREFS` to each of the
+caller's connections. With it on, every reply in the conversation counts as one
+in a thread the person is in, for the push decision, the threads view
+(`LIST_THREADS`) and `THREAD_REPLY`'s per-recipient `participant` byte, which the
+clients' own decision reads -- one rule, `OC_THREAD_PARTICIPANT_SQL`. Mute still
+silences it, and an explicit unfollow of one thread (`SET_THREAD_FOLLOW` off)
+still wins for that thread. A new frame: no version change of its own.
 
 **`SET_SNOOZE` (C → S), `0x00CA`** `{ minutes: u32 }` — **pause** notifications
 for that many minutes from now; `0` ends the pause. More than a week (10,080
@@ -1991,9 +2155,27 @@ identity — there is nothing an add/remove pair could name. **`ALERT_PREFS`
 (S → C), `0x00D0`** `{ n_terms: u8, terms…, n_people: u8, people… }` returns both.
 
 *One request, all of it.* `LIST_NOTIFY_PREFS` answers with `NOTIFY_PREFS`, then
-`SNOOZE`, `SCHEDULE` and `ALERT_PREFS`, in that order — so a client never has to
-assemble its notification settings from four round trips or decide what to show
-while half of them are outstanding.
+`SNOOZE`, `SCHEDULE`, `ALERT_PREFS` and `MUTED_USERS`, in that order — so a client
+never has to assemble its notification settings from five round trips or decide
+what to show while half of them are outstanding. Both clients ask for it as soon
+as they are signed in.
+
+**`SET_USER_MUTE` (C → S), `0x0130`** `{ muted_id: u64, on: u8 }` — mute (`on` 1)
+or unmute one person, for me alone. Nothing a muted person writes notifies me —
+not a message, a reply, a reaction, a mention or a call, at any level, even when
+they are also one of my priority people (`oc_notify_decide`'s `muted_author`, which
+push and both clients ask alike) — and none of it counts as unread for me, in a
+conversation or in a thread's count in `THREAD_LIST`, or appears in my activity.
+Their reactions are no part of the counts I am sent: a replay's reaction entries
+and `REACTION_UPDATED` give me each emoji's count without the people I have
+muted. A direct message from them is still delivered. Muting
+myself, nobody, the workspace's own sender or an id that is no one is ignored.
+The muted person is sent nothing and sees no change. **`MUTED_USERS` (S → C),
+`0x0131`** `{ count: u16, count × u64 }` — everyone I have muted, at most
+`OC_MAX_MUTED_USERS` (256): answering `SET_USER_MUTE`, to every connection of mine,
+and in the `LIST_NOTIFY_PREFS` answer. A client shows a muted person's messages,
+and their rows in a who-reacted list (`REACTIONS`, which still names them),
+folded to one line until revealed, one at a time, on that device alone.
 
 *Why separate frames.* `NOTIFY_PREFS` ends in a repeated list, so anything added
 to its fixed part shifts every entry after the first — the repeated-list trap that
@@ -2078,6 +2260,30 @@ retention/eviction policy, and cumulative reclamation counts **by reason** (orph
     last_reclaim_ms (u64), max_age_days (u64), reserve_bytes (u64),
     evict_enabled (u8), under_pressure (u8)
 
+**`USAGE_REQ` (C → S), `0x0120`** `{ days: u16 }` — asks for the workspace's
+usage over the last `days` UTC days, today included (REQ-043, the console's usage
+figures). `days` is 1 to `OC_USAGE_MAX_DAYS` (90); 0 is taken as 1 and more as 90.
+Owner and admin only: a member's request is refused with `ERROR FORBIDDEN`.
+
+**`USAGE` (S → C), `0x0121`** — the figures, counted and never read from anything
+anyone wrote:
+
+    days (u16),
+    n_days (u16), then per day, oldest first: day (u32), active (u32), messages (u32),
+    n_weeks (u16), then per ISO week, oldest first: week (u32), active (u32),
+    n_channels (u16), then per channel, busiest first:
+        channel_id (u64), messages (u32), is_private (u8), name (str)
+
+A `day` is days since the epoch in UTC; a `week` is an ISO week written `yyyyww`
+(`202645`), its members counted once over the days of it inside the period.
+`active` is how many members signed in, came back to a session, or used one that
+day or week (migration 0072); `messages` how many messages people posted, the
+workspace's own messages and call events not counted. The channels are the ten
+(`OC_USAGE_TOP_CHANNELS`) with the most messages in the period, channels only,
+never a direct message. A private channel's `name` is sent only to someone who is
+in it, and is otherwise empty: a client shows "private channel". A frame with more
+than 90 days, 15 weeks or 10 channels is malformed.
+
 **`AUDIT_QUERY` (C → S), `0x0099`** `{ before_ms: u64, limit: u16, family: u8,
 actor_id: u64, action: str }` — pages the audit log (REQ-251). `before_ms` pages
 **backwards from a timestamp** rather than by offset, so a page boundary stays
@@ -2096,7 +2302,14 @@ detail:
     count (u16), then count × { at_ms (u64), actor_id (u64), target_id (u64),
     family (u8 — 1 admin · 2 account · 3 security · 4 moderation),
     outcome (u8 — 1 ok, 0 denied/failed), actor_name (str), action (str),
-    target (str), detail (str) }
+    target (str), detail (str), channel_id (u64) }
+
+`channel_id` is the channel the entry happened in, `0` for none: set for a
+channel's own changes (`channel.*`) and for a moderated message or member in one
+(`message.delete`, `message.restore`, `message.move`, where it is the channel the
+message was moved to, and `channel.member.remove`), so an admin can go there;
+for a message, `target_id` is the message. Entries written before SCHEMA.md
+migration 0084 carry `0`. Appended in protocol 46.
 
 It **never carries the secret involved** — that a password changed, never
 the password; that an invite was redeemed, never the token (ARCH-79).
@@ -2214,9 +2427,45 @@ thing they did, and is a different fact from never having set it.
 
     user_id (u64)
 
-**`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to any of SET_STATUS / SET_PROFILE / SET_AVATAR / SET_EMAIL / GET_PROFILE. The reply to SET_PROFILE and SET_EMAIL goes to every connection of the person who saved it, so their other devices show the change at once. (REQ-240, REQ-241)
+**`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to any of SET_STATUS / SET_PROFILE / SET_AVATAR / SET_EMAIL / SET_PROFILE_FIELD_VALUE / GET_PROFILE. The reply to SET_PROFILE, SET_EMAIL and SET_PROFILE_FIELD_VALUE goes to every connection of the person who saved it, so their other devices show the change at once. (REQ-240, REQ-241)
 
-    user_id (u64), display_name (str), email (str), status_emoji (str), status_text (str), status_expires (u64), title (str), timezone (str), avatar_id (u64), role (u8), full_name (str), pronouns (str), phone (str), voice_id (str)
+    user_id (u64), display_name (str), email (str), status_emoji (str), status_text (str), status_expires (u64), title (str), timezone (str), avatar_id (u64), role (u8), full_name (str), pronouns (str), phone (str), voice_id (str),
+    n_fields (u8), n_fields × { field_id (u64), value (str) },
+    ooo_start (u64), ooo_end (u64), ooo_message (str)
+
+The list (protocol 40) is the person's values for the workspace's own
+profile fields, those they filled, at most 20; a client shows them in the order
+`PROFILE_FIELDS` gives and ignores an id it does not know. The out-of-office
+three after it (protocol 41) are as on `USER_LIST`.
+
+**`SET_PROFILE_FIELD` (C → S), `0x0137`** — An owner or admin adds, renames or
+deletes one of the workspace's profile fields (department, location, manager).
+
+    field_id (u64), op (u8: 0 set, 1 delete), kind (u8: 0 text, 1 link), position (u16), label (str)
+
+`field_id` 0 with op 0 adds a field; otherwise op 0 renames it, and moves it when
+`position` is not 0. Its kind stays what it was made, because the values already
+given were checked against it. Op 1 deletes it with every value anyone gave it.
+`position` 0 puts a new field last. A label is 1–64
+bytes; a workspace has at most 20 fields. Refused with `FORBIDDEN` to a member,
+and `INVALID_PROFILE_FIELD` for a missing label, a kind outside the two, a
+twenty-first field, or an unknown id. On success every signed-in connection is
+sent `PROFILE_FIELDS`.
+
+**`PROFILE_FIELDS` (S → C), `0x0138`** — The workspace's profile fields, in
+`position` order: sent after sign-in, and to everyone when one changes.
+
+    count (u8), count × { field_id (u64), kind (u8), position (u16), label (str) }
+
+**`SET_PROFILE_FIELD_VALUE` (C → S), `0x0139`** — My value for one field; empty
+clears it.
+
+    field_id (u64), value (str)
+
+At most 200 bytes, and a `link` field's value starts `https://`; anything else,
+or a field the workspace does not have, is refused with
+`INVALID_PROFILE_FIELD`. Answered with `PROFILE_INFO` to each of my connections.
+A client shows a link's real address, as MARKDOWN.md has it for every link.
 
 An **empty `text` on `SET_STATUS` clears all three fields together** — emoji,
 text and expiry — because "no status" is one state rather than two, and a client
@@ -2328,9 +2577,26 @@ belongs to the scheduling request.
 
     (empty)
 
-**`EMOJI_LIST` (S → C), `0x007D`** — The whole custom-emoji catalogue — a reply to LIST_EMOJI and also the push after any add or delete. (REQ-072)
+**`RENAME_EMOJI` (C → S), `0x013D`** — Give a custom emoji a new name; the old one stays as an alias of the same image, so the messages and reactions that used it still show it. (REQ-072)
 
-    count (u16), then count repetitions of: name (str), attachment_id (u64), created_by (u64)
+    name (str), new_name (str)
+
+Allowed to the emoji's creator, an admin and an owner, as a delete is
+(`FORBIDDEN` otherwise, and for a name that is no emoji). `new_name` follows the
+names' rules (`MALFORMED_FRAME` otherwise) and must not be an emoji's or an
+alias's already (`CHANNEL_EXISTS`, as `ADD_EMOJI` answers a taken name). The old
+name becomes an alias of the emoji and the aliases it had come with it; past 8 on
+the emoji or 256 in the workspace the rename is refused with `EMOJI_ALIAS_LIMIT`.
+`ADD_EMOJI` is refused a name an alias holds. Answered, like an add, with
+`EMOJI_LIST` to every connection.
+
+**`EMOJI_LIST` (S → C), `0x007D`** — The whole custom-emoji catalogue — a reply to LIST_EMOJI and also the push after any add, rename or delete. (REQ-072)
+
+    count (u16), then count repetitions of: name (str), attachment_id (u64), created_by (u64),
+    created_at (u64), n_aliases (u8), n_aliases × alias (str)
+
+`created_at` and the aliases are as of protocol 43. A client resolves `:alias:`
+in a message or a reaction to the emoji the alias belongs to.
 
 **`OPEN_GROUP_DM` (C → S), `0x0079`** — Open — or reopen — the group DM whose participant set is the caller plus the named users. (REQ-056)
 
@@ -2766,6 +3032,75 @@ for options out of bounds. On success every member gets a `POLL` without anyone'
 selection, keeping the one they hold. Adding these frames needed no
 protocol-version bump.
 
+### 5.16o To-do lists
+
+A to-do list is a message whose **body starts `/todo`** followed by a title; each
+following line that is not blank is a task, a leading `-` or `*` ignored, and
+the text after a line's first `: ` its description. The daemon reads the body
+when it stores the message and keeps the list in its own rows from then on
+(`todo_lists`, `todo_tasks`: SCHEMA.md §3bx); the body stays the author's plain
+text, so a client that draws no list still shows it readably. It goes anywhere
+a message goes, by `SEND` or `SEND_REPLY`: a channel, a DM, a group DM, a
+thread. An encrypted DM's body is not the daemon's to read, so it makes no list.
+
+Limits: a title of at most 250 bytes, a task name of at most 250, a description
+of at most 1,000, and at most 200 tasks. A send past one is refused with
+`TODO_INVALID`, and one naming a task twice with `TODO_DUPLICATE`; the message is
+not stored. **A to-do message cannot be edited** (`EDIT` is refused with
+`TODO_NO_EDIT`): its title is renamed and its tasks added instead. Deleting the
+message takes its list from every reader; a restore sends it back as it stood.
+Nothing in an archived channel's lists changes (`CHANNEL_ARCHIVED`).
+
+A task is named by its place in the list, from 0. Tasks are only ever added at
+the end, never removed, reordered or changed, so a place always names the same
+task.
+
+**`TODO_ADD` (C → S), `0x0122`** — add a task, for anyone who can read the
+message.
+
+    channel_id (u64), message_id (u64), name (str), description (str)
+
+Spaces and tabs are trimmed from both ends. Refused with `TODO_INVALID` for a
+blank name or one past its limit, `TODO_DUPLICATE` for a name the list already
+has, `TODO_FULL` at 200 tasks.
+
+**`TODO_MARK` (C → S), `0x0123`** — mark a task done or not done.
+
+    channel_id (u64), message_id (u64), task (u16), done (u8)
+
+`done` is the state wanted, not a toggle: a task already in it is left as it is,
+who marked it included, so two people marking the same task at once agree.
+Refused with `TODO_INVALID` for a task the list does not have. A `done` above 1
+is malformed.
+
+**`TODO_RENAME` (C → S), `0x0124`** — the author renames the list.
+
+    channel_id (u64), message_id (u64), title (str)
+
+Refused with `FORBIDDEN` to anyone but the list's author, and `TODO_INVALID`
+for a blank title or one past 250 bytes.
+
+Each of the three is refused with `UNKNOWN_MESSAGE` for a message that is not a
+list, is deleted, or the sender cannot read. A refusal goes to the sender alone
+as an `ERROR` whose context is the message id.
+
+**`TODO` (S → C), `0x0125`** — a list's whole state, a range of its tasks a
+frame.
+
+    message_id (u64), channel_id (u64), author_id (u64), title (str),
+    total (u16), first (u16), count (u8),
+    count × { name (str), description (str), done (u8), done_by (u64), done_at_ms (u64) }
+
+The frame carries tasks `[first, first + count)` of `total`, at most 40 a frame;
+a list is sent as its frames in order from `first` 0, which replaces whatever a
+client held for it. `done_by` and `done_at_ms` are 0 for a task not done. Sent
+live after the message's `ACTION` and on every change, to the whole
+conversation; after `MESSAGE_RESTORED` for a restored list; replayed by backfill
+(§6.2) and history (§6.3) after the polls, by `LIST_THREAD` (§5.10) before its
+`THREAD` terminator, and ahead of `SEARCH_RESULTS` for each result that is a
+list, so every one carries the list's current state. Adding these frames needed
+no protocol-version bump.
+
 ### 5.17 Calls (REQ-150-152, REQ-161, REQ-301-305, ARCH-73, ARCH-86/87, ARCH-113)
 
 Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media flows over UDP to
@@ -3017,6 +3352,59 @@ The session is held in memory only. When it ends its channel is closed
 closes every encrypted DM; and the storage maintenance pass deletes one closed
 more than 24 hours ago, with every row about it (PRIVATE-DM.md §2).
 
+### 5.20 Blocks and DM privacy
+
+A block is its blocker's alone, and nothing tells the person blocked
+(SCHEMA.md §3br). While it holds, the blocked person can start no direct
+conversation naming the blocker: `OPEN_DM` and `OPEN_GROUP_DM` are refused with
+the non-fatal `DM_REFUSED`, and `PDM_OPEN` with `PDM_END` reason 5. In a direct
+conversation the two already share, what the blocked person sends is stored and
+reaches every other member, but never the blocker: not live, not by push, not in
+backfill or history, not in unread counts or activity, and not after the block
+is lifted. Channels are untouched. DM privacy `nobody` refuses every new direct
+conversation naming that person the same way; one that exists carries on.
+
+**`SET_BLOCK` (C → S), `0x0132`** `{ blocked_id: u64, on: u8 }` — block (`on` 1) or
+unblock (0) one person. Oneself, the workspace's own sender, or nobody is
+ignored. Answered with `BLOCKS`.
+
+**`BLOCKS` (S → C), `0x0133`** — whom I block, and my DM privacy.
+
+    dm_privacy (u8: 0 anyone, 1 nobody), count (u16), count × user_id (u64)
+
+Sent to each of my connections after `SET_BLOCK` or `SET_DM_PRIVACY`, and with
+the answer to `LIST_NOTIFY_PREFS`. At most 256 people; a frame with more is
+malformed.
+
+**`SET_DM_PRIVACY` (C → S), `0x0136`** `{ dm_privacy: u8 }` — who may start a
+new direct conversation with me. Answered with `BLOCKS`.
+
+**`LIST_BLOCKS` (C → S), `0x0134`** — empty; every block in the workspace, for an
+owner or admin (`FORBIDDEN` otherwise).
+
+**`BLOCK_LIST` (S → C), `0x0135`** — the answer, newest first, at most 500.
+
+    count (u16), count × { blocker_id (u64), blocked_id (u64), since_ms (u64) }
+
+Adding these frames needed no protocol-version bump.
+
+### 5.20 Out of office (REQ-122)
+
+**`SET_OUT_OF_OFFICE` (C → S), `0x013A`** — my absence, apart from the custom
+status, which shows beside it.
+
+    start_ms (u64), end_ms (u64), message (str)
+
+In force while `start_ms` ≤ now < `end_ms`. An `end_ms` of 0, or one already
+past, clears it (start, end and message all go). Refused with the non-fatal
+`INVALID_OUT_OF_OFFICE` for an end not after its start or a message over 280
+bytes. On success the person's connections are sent `PROFILE_INFO`, and every
+signed-in connection a `USER_LIST` of one, their row: everyone's marks and
+composer notices follow it. Nothing is sent when it ends; a client compares the
+times with its clock. While it is in force a client marks the person "Out of
+office until <date>" wherever they appear, and someone writing them a DM or
+mentioning them is told so, with the message, before sending.
+
 ## 6. Reconnect backfill (resolves REQ-101)
 
 A client that reconnects (REQ-100) requests everything it missed since its
@@ -3087,7 +3475,8 @@ its own reactions as such without a second round trip.
 
 After the reactions come the link previews, forwards and actions of the messages
 replayed, then their **polls** (§5.16n): one `POLL` per poll, carrying the
-requesting user's own selection, so a reload shows what they picked.
+requesting user's own selection, so a reload shows what they picked; then their
+**to-do lists** (§5.16o): each list's `TODO` frames, as the list stands now.
 
 `BACKFILL_DONE` payload:
 
@@ -3125,7 +3514,8 @@ attachments, reply counts and author-name overrides — followed by the same
 side-state a reconnect carries, in this order: `PIN_UPDATED` for each pinned
 message, `SAVED_UPDATED` for the requester's own saved marks, `REACTION_UPDATED`
 per (message, emoji), the matching `UNFURL`, `FORWARD` and `ACTION` frames, one
-`POLL` per poll (with the requester's selection), then `BACKFILL_DONE`.
+`POLL` per poll (with the requester's selection), each to-do list's `TODO`
+frames (§5.16o), then `BACKFILL_DONE`.
 
 That list is the point of the path, not a detail of it. A client stores nothing
 (ARCH-88), so state which travels only on a live fan-out is lost on any reload
@@ -3247,6 +3637,15 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3040` | `POLL_HAS_VOTES`      | messaging  | no    | An `EDIT_POLL` changing a poll's options or settings after someone voted; only its deadline can change now (REQ-225). |
 | `3041` | `EDIT_WINDOW_CLOSED`  | messaging  | no    | An author's `EDIT`, or `DELETE` of their own message, past the window the workspace's configuration sets (`OPENCHIME_EDIT_WINDOW`, `OPENCHIME_DELETE_WINDOW`, which clients are told as `edit_window` and `delete_window`). An admin's or owner's delete of someone else's message is never limited (REQ-051, REQ-052). |
 | `3042` | `WORKSPACE_SENDER`    | messaging  | no    | A message, reply or file sent into a DM with the workspace's own sender (`USER_LIST` `flags`), whose DMs nobody reads. |
+| `3043` | `CANNOT_MOVE`         | messaging  | no    | A `MOVE_MESSAGE` that cannot be made: into or out of a DM or encrypted DM, a thread root with replies into a thread, into a thread that is itself a reply, or to where it already is (REQ-053). |
+| `3044` | `TODO_NO_EDIT`        | messaging  | no    | An `EDIT` of a message that carries a to-do list; its title is renamed and its tasks added instead (§5.16o). |
+| `3045` | `TODO_INVALID`        | messaging  | no    | A to-do list's title, or a task's name or description, blank or past its limit; or a task the list does not have (§5.16o). |
+| `3046` | `TODO_DUPLICATE`      | messaging  | no    | A task named as one already in the list, or a `/todo` body naming one twice (§5.16o). |
+| `3047` | `TODO_FULL`           | messaging  | no    | A `TODO_ADD` to a list that already holds 200 tasks (§5.16o). |
+| `3070` | `DM_REFUSED`          | messaging  | no    | An `OPEN_DM` or `OPEN_GROUP_DM` naming someone who blocks the asker, or a new one naming someone whose DM privacy is `nobody`. It says neither, so a block is never announced. |
+| `3071` | `INVALID_PROFILE_FIELD` | admin    | no    | A profile field without a label, of an unknown kind or id, past the 20 a workspace may have; or a value over 200 bytes, for a field it does not have, or for a link not starting `https://`. |
+| `3072` | `INVALID_OUT_OF_OFFICE` | profile  | no    | An out-of-office whose end is not after its start, or whose message is over 280 bytes. |
+| `3073` | `EMOJI_ALIAS_LIMIT`   | emoji      | no    | A `RENAME_EMOJI` past the 8 old names an emoji keeps, or the 256 a workspace does. |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing
@@ -3452,7 +3851,7 @@ this table cannot silently gain a shared value.
 | `0x00D7` | `UNFURL` | S → C | a URL's fetched preview (REQ-222); also replayed on backfill |
 | `0x00D8` | `SET_PROFILE` | C → S | my profile fields (REQ-240) |
 | `0x00D9` | `FORWARD` | S → C | what a forwarded message points at (REQ-057); also replayed on backfill |
-| `0x00DA` | `ATTACH_MEDIA_SET` | C → S | mark an upload as a video message, with its poster (REQ-162) |
+| `0x00DA` | `ATTACH_MEDIA_SET` | C → S | mark an upload as a video message, with its poster (REQ-162), or a snippet, with its title and language (REQ-226) |
 | `0x00DB` | `ATTACH_MEDIA_OK` | S → C | accepted |
 | `0x00DC` | `TTS_INFO` | S → C | read-aloud availability and voices (REQ-291/295) |
 | `0x00DD` | `AUDIO_GET` | C → S | the speech of one message (REQ-291) |
@@ -3517,6 +3916,30 @@ this table cannot silently gain a shared value.
 | `0x0118` | `COLLAPSED_UPDATED` | S → C | to each of my connections: a message folded or opened; replayed in backfill |
 | `0x0119` | `WORKSPACE_SETTINGS` | S → C | read-only: the workspace's settings clients act on, after `WORKSPACE_INFO` |
 | `0x011A` | `READ_RECEIPTS` | both | whether I share my read receipts: set or ask, and told |
+| `0x011C` | `MOVE_MESSAGE` | C → S | move a message, or a thread whole, to another channel or into a thread (REQ-053) |
+| `0x011D` | `MESSAGE_MOVED` | S → C | to the readers of both channels, once each: a message moved |
+| `0x011E` | `FIND_AT_TIME` | C → S | the message at a moment in a conversation or one thread of it (jump to a date) |
+| `0x011F` | `FOUND_AT_TIME` | S → C | its answer: the first at or after the moment, else the last before |
+| `0x0120` | `USAGE_REQ` | C → S | owner/admin: the workspace's usage over the last days (REQ-043) |
+| `0x0121` | `USAGE` | S → C | active members by day and week, messages by day, the busiest channels |
+| `0x0122` | `TODO_ADD` | C → S | add a task to a to-do list (§5.16o) |
+| `0x0123` | `TODO_MARK` | C → S | mark a task done or not done: the state wanted, not a toggle |
+| `0x0124` | `TODO_RENAME` | C → S | the author renames a to-do list |
+| `0x0125` | `TODO` | S → C | a to-do list's state, a range of its tasks a frame; live, replayed and with search results |
+| `0x0130` | `SET_USER_MUTE` | C → S | mute or unmute one person, for me alone |
+| `0x0131` | `MUTED_USERS` | S → C | to my connections: everyone I have muted, on change and with `LIST_NOTIFY_PREFS` |
+| `0x0132` | `SET_BLOCK` | C → S | block or unblock one person, for me alone (§5.20) |
+| `0x0133` | `BLOCKS` | S → C | to each of my connections: whom I block, and who may start a DM with me |
+| `0x0134` | `LIST_BLOCKS` | C → S | owner or admin: every block in the workspace |
+| `0x0135` | `BLOCK_LIST` | S → C | the answer: blocker, blocked and since, per block |
+| `0x0136` | `SET_DM_PRIVACY` | C → S | who may start a new direct conversation with me: anyone or nobody |
+| `0x0137` | `SET_PROFILE_FIELD` | C → S | owner or admin: add, rename or delete a workspace profile field |
+| `0x0138` | `PROFILE_FIELDS` | S → C | the workspace's profile fields: after sign-in, and to everyone on a change |
+| `0x0139` | `SET_PROFILE_FIELD_VALUE` | C → S | my value for one profile field; empty clears it; answered with `PROFILE_INFO` |
+| `0x013A` | `SET_OUT_OF_OFFICE` | C → S | my out-of-office span and message; an end of 0 or past clears it (§5.20) |
+| `0x013B` | `CHANNEL_ADD_MANAGER` | C → S | a manager, admin or owner names a member of the channel a manager (§5.7) |
+| `0x013C` | `CHANNEL_REMOVE_MANAGER` | C → S | and takes the role from any manager, the creator included |
+| `0x013D` | `RENAME_EMOJI` | C → S | a custom emoji's new name; the old one stays as an alias (§5.16g) |
 
 ## 10. Connection state machine
 

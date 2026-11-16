@@ -15,10 +15,21 @@ void oc_ev_free(oc_ev *e) {
     free(e->call);
     free(e->group);
     free(e->poll);
+    oc_todo_view_free(e->todo);
     free(e->ids);
     free(e->der);
     free(e->srvalert);
+    free(e->usage);
+    free(e->pfs);
     free(e);
+}
+
+void oc_todo_view_free(oc_todo_view *t) {
+    if (!t) return;
+    for (uint16_t i = 0; i < t->cap && t->tasks; i++) { free(t->tasks[i].name); free(t->tasks[i].desc); }
+    free(t->tasks);
+    free(t->title);
+    free(t);
 }
 
 oc_cmd *oc_cmd_new(int type) {

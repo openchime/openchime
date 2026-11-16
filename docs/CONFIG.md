@@ -177,6 +177,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_OIDC_CONNECT_<n>` | *(unset)* | A direct connection to your own provider, 1 to 4 (SSO.md): `label=…;issuer=https://…;client_id=…;secret_file=…;subject=sub|oid;redirect=127.0.0.1|localhost`. |
 | `OPENCHIME_EXTRA_CA` | *(unset)* | PEM roots the daemon trusts beside the built-in ones for its own outbound connections (push, enrollment, unfurls, S3): a service behind a private CA. No client reads it: a client trusts a private CA only through the operating system's store. |
 | `OPENCHIME_TRUSTED_PROXIES` | *(unset)* | Addresses or CIDRs whose PROXY protocol v2 header is believed, comma-separated; the connection's address is then the one the proxy saw. |
+| `OPENCHIME_ALLOWED_NETWORKS` | *(unset)* | Addresses or CIDRs, IPv4 or IPv6, comma-separated, that may connect to the TLS port (REQ-192): any other client is closed before TLS or sign-in, judged by the address a trusted proxy's header names. Unset or empty: everyone. The health port is never restricted. |
 
 ### Features
 
@@ -187,8 +188,8 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_MFA` | `optional` | Whether local accounts are asked for a second step (AUTH.md §8.6). One of `off`, `optional`, `required`. |
 | `OPENCHIME_S3` | *(unset)* | Attachments in S3, with `blobs/` under the data directory as their disk cache (ARCH-70): `s3://KEY:SECRET@host[:port]/bucket[/prefix][?region=…]`, or `http+s3://` for a plaintext endpoint; percent-encode `/`, `+` and `@` in the key and secret. Uploads are accepted onto the disk and sent to S3 in the background, retried until it takes them; the cache keeps to half the free space above the low-space point. A prefix puts the keys under it, so several daemons can share a bucket. Unset: local disk. |
 | `OPENCHIME_S3_FILE` | *(unset)* | `OPENCHIME_S3`'s value, read from this file instead (mode 0600; a trailing newline is ignored), so the key and secret are not in the environment. Set one or the other, not both. |
-| `OPENCHIME_TTS` | `on` | Read-aloud (ARCH-111), in a build that carries it; off saves the voice model's memory. `on` or `off`. |
-| `OPENCHIME_STT` | `on` | Voice input (ARCH-112), in a build that carries it. `on` or `off`. |
+| `OPENCHIME_TTS` | `on` | Read-aloud (ARCH-111), in a build that carries it. While it reads aloud the daemon holds up to 170 MB, against about 25 MB idle (TESTING.md, "Speech models' memory"); off saves that. `on` or `off`. |
+| `OPENCHIME_STT` | `on` | Voice input (ARCH-112), in a build that carries it. While it hears a segment the daemon holds about 150 MB, against about 25 MB idle (TESTING.md, "Speech models' memory"); off saves that. `on` or `off`. |
 | `OPENCHIME_SUMMARY` | `off` | Summaries (REQ-310): `off`, `local` (the model runs inside the daemon, fetched on first start), or `cloud:<url>,<model>` (a hosted API's base URL and the model there). |
 | `OPENCHIME_SUMMARY_API_KEY` | *(empty)* | The hosted API's key, for `cloud`. |
 | `OPENCHIME_ENROLL_URL` | *(unset)* | Connects this box to the OpenChime services at this origin (ARCH-84); each service is then turned on by its own setting. https, or http to loopback for a test. Prints an `oce1.` code to the log on first run. |

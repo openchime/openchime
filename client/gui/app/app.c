@@ -54,13 +54,17 @@
 #include "complete.h"   /* shared @user / #channel / :emoji: completion */
 #include "mention.h"    /* the same @mention scanner the daemon resolves with */
 #include "richtext.h"   /* the shared *bold* / _italic_ / `code` parser (ARCH-100) */
+#include "lexer.h"      /* the snippet tokenizer (REQ-226) */
+#include "todo.h"       /* what a "/todo" message makes */
 #include "table.h"      /* a table as a grid: the composer's cards and the table editor (MARKDOWN.md §1a) */
 #include "searchq.h"    /* the same query parser the core sends to the daemon */
 #include "resolve.h"
 #include "store.h"            /* peek a stored session token (skip the sign-in box) */
+#include "permalink.h"        /* openchime:// links, both forms (CLIENT.md "Links") */
 #include "oc_port.h"          /* oc_mkdir, oc_localtime_r */
 #include "protocol.h"         /* OC_CHANNEL_KIND_DM, OC_PRESENCE_* */
 #include "build_id.h"         /* OC_BUILD_ID: About OpenChime */
+#include "releasenotes.h"     /* What's new: this build's release notes */
 #include "theme.h"
 #include "osnotify.h"    /* OS notifications, per platform (REQ-138) */
 #include "feedback.h"    /* in-app toasts and banners (REQ-263) */
@@ -681,8 +685,13 @@ static int form_dialog(oc_win *owner, const char *title, oc_field *f, int n);
 /* Seven since Edit profile gained the voice a person is read aloud in
  * (REQ-292): the identity screen owns every field that is one screen's worth of
  * a person, and the voice is one of them. */
-#define FORM_MAX_FIELDS 7
+/* And twenty more: a workspace's own profile fields (PROFILE_FIELDS), shown
+ * on the same screen after the built-in seven; a form taller than its card
+ * scrolls (draw_form). */
+#define FORM_MAX_FIELDS (7 + (int)OC_MAX_PROFILE_FIELDS)
 static int        g_form_open;                       /* a form is on the frame */
+static float      g_form_scroll, g_form_scroll_max;  /* rows scrolled past, and how far they can be */
+static int        g_form_scroll_focus = -1;          /* the row last brought into view */
 /* What the last form returned, for the harness: a form's answer is consumed by its
  * caller and leaves no trace on screen, so "Cancel did not commit" is otherwise
  * unassertable. Diagnosis only. */
@@ -1060,6 +1069,7 @@ static fmtw *g_fmt_bold;
 static fmtw *g_fmt_ital;
 static fmtw *g_fmt_quote;
 static fmtw *g_emoji;   /* Segoe UI Emoji, picker cells (22px) */
+static fmtw *g_code;    /* the code family at meta size: snippets (REQ-226) */
 static fmtw *g_emoji_s; /* the same, sized for reaction chips */
 /* Lucide icons draw through gfx_icon — tessellated in the gfx layer, no cached
  * geometry objects to own here. */
@@ -1155,7 +1165,11 @@ static int g_prefs_open;
  * image, email, timezone, title) are REQ-240; this shows what the
  * roster actually knows today rather than inventing placeholders for them. */
 static uint64_t g_profile_uid;
-static rectf g_prof_dm_btn;
+static rectf g_prof_dm_btn, g_prof_mute_btn, g_prof_block_btn;
+/* The card's links, from the workspace's own fields: where each was drawn. */
+static struct { rectf r; uint64_t field_id; } g_prof_link[OC_MAX_PROFILE_FIELDS];
+static int g_n_prof_link;
+static void link_open(const char *url);   /* fwd */
 /* The SELF card's action buttons — the commands the profile popover no longer
  * lists top-level. Each carries a menu_dispatch cmd; the bodies are all
  * self-contained. */
@@ -1738,6 +1752,62 @@ static int have_camera(void) {
 static int is_video_msg(const oc_attachment *a) {
     return a && !a->reclaimed && a->media_kind == OC_MEDIA_VIDEO_MESSAGE;
 }
+
+/* ---- snippets (REQ-226) ------------------------------------------------------
+ * A snippet's text is its attachment's bytes, fetched like a thumbnail -- one
+ * at a time, only for what is on screen -- and kept here, a few at once. The
+ * card shows its first lines; the viewer all of it, coloured by lexer.h. */
+static int is_snippet(const oc_attachment *a) {
+    return a && !a->reclaimed && a->media_kind == OC_MEDIA_SNIPPET;
+}
+enum { SNIP_CACHE = 16, SNIP_PREVIEW = 5 };
+#define SNIP_CARD_H (LINE_H * (SNIP_PREVIEW + 1) + UIS(14.0f))   /* title, then the first lines */
+static struct { uint64_t id; char *text; size_t len; } g_snip[SNIP_CACHE];
+static int       g_snip_next;
+static uint64_t  g_snip_pending, g_snip_deadline;
+static uint64_t  g_snip_failed[32];
+static int       g_n_snip_failed;
+/* The viewer: which snippet, and its tokens, lexed once when it opened. */
+static int        g_sv_open;
+static uint64_t   g_sv_aid;
+static char       g_sv_title[OC_SNIPPET_TITLE_MAX + 1], g_sv_file[128];
+static int        g_sv_lang;
+static oc_lex_tok *g_sv_toks;
+static size_t     g_sv_ntoks;
+enum { SV_CMD_COPY = 2711, SV_CMD_SAVE = 2712 };
+/* The text a long paste brought, held while the person is asked whether to
+ * make it a snippet; declined, it is pasted as it would have been. */
+static char *g_snip_paste;
+static void snippet_compose(oc_win *hwnd, const char *text);   /* fwd */
+static void ed_paste_text(const char *src);                    /* fwd */
+
+static const char *snip_text(uint64_t id, size_t *len) {
+    for (int i = 0; i < SNIP_CACHE; i++)
+        if (g_snip[i].id == id && g_snip[i].text) { if (len) *len = g_snip[i].len; return g_snip[i].text; }
+    return NULL;
+}
+static int snip_failed(uint64_t id) {
+    for (int i = 0; i < g_n_snip_failed; i++) if (g_snip_failed[i] == id) return 1;
+    return 0;
+}
+/* Keep fetched bytes as text: ownership of `d` passes here. */
+static void snip_store(uint64_t id, uint8_t *d, size_t n) {
+    char *t = malloc(n + 1);
+    if (t) { if (n) memcpy(t, d, n); t[n] = '\0'; }
+    free(d);
+    if (!t) return;
+    int slot = g_snip_next;
+    g_snip_next = (g_snip_next + 1) % SNIP_CACHE;
+    free(g_snip[slot].text);
+    g_snip[slot].id = id; g_snip[slot].text = t; g_snip[slot].len = n;
+}
+/* Ask for a snippet's text, unless it is here, asked for, or known lost. */
+static void snip_want(uint64_t id) {
+    if (!g_client || !id || snip_text(id, NULL) || snip_failed(id) || g_snip_pending) return;
+    g_snip_pending = id;
+    g_snip_deadline = now_ms() + 8000;
+    oc_client_fetch_attachment(g_client, id);
+}
 /* Slack's pattern: the image itself is the click target for a bigger view, and
  * saving it is a button that appears on hover — so the affordance is there when
  * you look for it and out of the way when you are reading. */
@@ -1879,6 +1949,23 @@ static int g_n_searchrows;
  * usually still in flight when the click lands — `g_jump_deadline` is what turns
  * "not loaded yet" into an honest failure instead of a silent no-op. */
 static uint64_t  g_jump_mid;            /* message to scroll to, 0 = none */
+/* Jump to a date: the conversation, the thread in it (0 for the main scroll)
+ * and the local midnight asked for, until the daemon's answer (the model's
+ * found_seq past g_found_seen) is opened. The date dividers drawn this frame,
+ * each its day, so a click on one offers it. */
+static uint64_t  g_date_cid, g_date_parent, g_date_day;
+static uint32_t  g_found_seen;
+/* The reply the thread pane is to scroll to and flash, once it is drawn there;
+ * given up at the deadline when the thread never shows it. */
+static uint64_t  g_thr_jump_mid, g_thr_jump_deadline;
+/* The thread pane's "Jump to date" button, as drawn. */
+static rectf     g_thr_date_btn;
+static struct { rectf r; uint64_t ms; } g_sephits[48];
+static int       g_n_sephits;
+/* The Later view's reminder buttons as drawn (REQ-283): each row's message,
+ * conversation and reminder. */
+static struct { rectf r; uint64_t mid, cid, at; } g_remhits[64];
+static int       g_n_remhits;
 /* The jump is going BACK to a place (navigation history): the message goes to
  * the top of the pane, where it was, and nothing flashes -- it is not news. */
 static int       g_jump_quiet;
@@ -1886,6 +1973,9 @@ static int       g_jump_quiet;
  * destination. The palette picks the destination — it already lists every
  * conversation, so a forward needs no new picker. */
 static uint64_t  g_fwd_mid, g_fwd_cid;
+/* Moving (REQ-053) the same way: the message and where it is, waiting for the
+ * palette's choice, then the choice while the narrowing confirmation asks. */
+static uint64_t  g_move_mid, g_move_cid, g_move_to;
 /* The channel directory (REQ-038). No daemon work: LIST_CHANNELS already
  * returns every PUBLIC channel plus a `joined` flag — the client simply never gave
  * you a place to see them together. */
@@ -1921,7 +2011,14 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
        CONF_PDM_TRUST, CONF_PDM_SAFETY,
        /* New ones go last: the dump's `confirm act=` is this number, and the
         * GUI harness reads it (CONF_CERT_TRUST is act=13 to tools/gui). */
-       CONF_WS_FORGET_ALL, CONF_BROADCAST, CONF_DEACTIVATE_SELF, CONF_EMOJI_DELETE };
+       CONF_WS_FORGET_ALL, CONF_BROADCAST, CONF_DEACTIVATE_SELF, CONF_EMOJI_DELETE,
+       /* A call started in a channel asks first, saying how many it will ring;
+        * End for everyone asks before it ends the call (CALLS.md §2). */
+       CONF_CALL_START, CONF_CALL_END,
+       CONF_MESSAGE_MOVE,
+       CONF_SNIPPET_PASTE,
+       CONF_PFIELD_DELETE,
+       CONF_WS_FORGET_SET };
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 static int      g_bc_confirmed;     /* CONF_BROADCAST: the send it confirmed is under way */
@@ -1947,6 +2044,7 @@ static void bc_drop_box(void) {
     bc_held_clear(&g_bc_wait[BCS_NEWMSG]);
 }
 static void composer_send(void);    /* fwd */
+static int ed_refuse_open_spoiler(const char *b);   /* fwd */
 static void bc_opened_back(const bc_held *h);   /* fwd */
 static void pc_say(const char *note);           /* fwd */
 
@@ -1974,10 +2072,16 @@ static struct {
 /* Copy fingerprint, and View certificate: the question's two footer actions. */
 enum { CERT_CMD_COPY = 2700, CERT_CMD_VIEW = 2701 };
 enum { ABOUT_CMD_COPY = 2702 };
+/* What's new: opened from About, the workspace menu and the palette; and its
+ * card's "Open on openchime.io". */
+enum { ABOUT_CMD_WHATSNEW = 2704, WN_CMD_OPEN = 2705 };
 enum { WSM_CMD_REMOVE_ALL = 2703 };   /* the Workspaces footer's Remove all */
+/* ...its Remove unused (the day dialog), and that dialog's Continue; its
+ * Remove unreachable. */
+enum { WSM_CMD_UNUSED = 2720, WSM_CMD_UNUSED_GO = 2721, WSM_CMD_UNREACH = 2722 };
 static float cert_q_body(gfx *rt, rectf body);   /* fwd */
 
-static char     g_confirm_body[640];
+static char     g_confirm_body[2048];
 static char     g_confirm_ok[32];
 static char     g_confirm_ws[160];   /* CONF_WS_FORGET's target, by address */
 
@@ -1990,6 +2094,8 @@ static int g_n_invrows;
 /* Admin > Custom emoji (REQ-072): each row's Delete, where it is offered, and
  * the row's name; and the picker's Manage link, which opens it. */
 static struct { rectf r; char name[48]; } g_emojirows[128];
+static struct { rectf r; char name[48]; } g_emojiren[128];   /* each Rename (REQ-072) */
+static int g_n_emojiren;
 static int g_n_emojirows;
 static rectf g_pick_manage;
 static char g_emoji_q[48];             /* its search box's text */
@@ -2040,7 +2146,12 @@ static rectf g_audit_filters[5];
 static int g_n_audit_filters;
 /* The actor and action pickers: each row's actor and action narrow the log to
  * them when clicked, and their chip clears that filter again. */
-static struct { rectf actor, action; uint64_t actor_id; char action_name[48]; } g_audit_rowhits[64];
+static struct { rectf actor, action, row; uint64_t actor_id; char action_name[48]; int idx; } g_audit_rowhits[64];
+/* The audit row the keyboard is on (an index into the model's page), -1 for
+ * none; and the entry an open row menu is about, copied, since a page can
+ * arrive between opening the menu and choosing from it. */
+static int   g_audit_focus = -1, g_audit_reveal;
+static oc_audit_view g_audit_menu;
 static int   g_n_audit_rowhits;
 static rectf g_audit_clear_actor, g_audit_clear_action;
 static char  g_audit_actor_name[64];
@@ -2086,6 +2197,12 @@ static int g_notify_open, g_keys_open;
 /* About OpenChime: which build this client is and which the daemon is, to read
  * off one screen and copy into a report. */
 static int g_about_open;
+/* What's new (CLIENT.md): the About card showing this build's release notes
+ * instead of its rows, fetched from the control plane without holding the
+ * window (oc_plat_releasenotes_*). The state is the card's, and the dump's. */
+enum { WN_NONE = 0, WN_LOADING, WN_SHOWN, WN_NOTRELEASE, WN_FAILED };
+static int g_whatsnew;                 /* the About card shows What's new */
+static int g_wn_state;
 /* The status dialog (bespoke modal body, not the generic form): its emoji is
  * PICKED, its text suggested, its clear-after chip prefilled from the live
  * expiry. g_status_emoji and g_status_edit are declared beside the picker,
@@ -2095,7 +2212,8 @@ static int   g_sch_open;              /* the send-later date and time card */
 static int   g_sch_insert;            /* ...opened by Insert a time: any moment, and
                                        * Insert puts its token in the message */
 static int   g_sr_open;               /* a summary's custom date range (REQ-310) */
-static int   g_pc_open;               /* the poll composer, new or editing (REQ-225) */
+static int   g_jc_open;               /* Jump to date's calendar: one day to open at */
+static int   g_pc_open;              /* the poll composer, new or editing (REQ-225) */
 static int   g_te_open;               /* the table editor, a new table or a card's (MARKDOWN.md §6) */
 static int   g_pch_open;              /* the paste chooser: Table, Image or Text (MARKDOWN.md §6) */
 static int   g_status_clear;                 /* chip index 0..4 */
@@ -2105,7 +2223,7 @@ static struct { char emoji[24]; char text[80]; uint8_t clear; rectf r; } g_statu
 static int   g_n_status_suggs;
 static struct { rectf r; uint64_t cid; uint8_t level; } g_notify_hits[128];
 /* The two Edit buttons on the notifications overlay (REQ-135). */
-static rectf g_notify_kw_btn, g_notify_vip_btn;
+static rectf g_notify_kw_btn, g_notify_vip_btn, g_notify_mute_btn, g_notify_block_btn, g_notify_dmpriv_btn;
 /* The schedule section (REQ-136): mode chips, the base window's two time fields,
  * and — in custom mode — a checkbox and two time fields per weekday. */
 /* The Threads pane (REQ-062): its unread-only toggle and the per-card
@@ -2330,7 +2448,7 @@ static int g_n_moreflyrows;
  * level. `g_menu_target` carries what the menu is about. */
 enum { MENU_NONE = 0, MENU_WS, MENU_PROFILE, MENU_NEW, MENU_SWITCHER, MENU_SECTION,
        MENU_MSG, MENU_MEMBER, MENU_CHANNEL, MENU_THUMB, MENU_SCHED, MENU_THREAD, MENU_DRAFT,
-       MENU_SUMMARIZE };
+       MENU_SUMMARIZE, MENU_AUDIT };
 /* MK_EMOJIROW is one row holding the quick reactions side by side, each its own
  * hit-box (it predates the flyout below and stays a row — six separate rows
  * would bury the rest of the message actions).
@@ -2394,7 +2512,10 @@ static struct { float top, bot; int cmd; char label[48]; } g_subrows[8];
 static int   g_n_subrows;
 static void  submenu_close(void);           /* defined beside draw_menu */
 /* Workspace switcher list (built from the store book at open time). */
-enum { WS_MAX = 8 };
+/* At most this many workspaces are connected at once (the slots below). The
+ * book, what this device remembers, has no ceiling: it is read from the store
+ * into storage that grows (g_sw, ws_book). */
+enum { WS_OPEN_MAX = 8 };
 typedef struct {
     oc_client *client;
     char     ws[256];
@@ -2407,21 +2528,44 @@ typedef struct {
     int      post_auth;
     uint64_t backfilled[64];
     int      n_backfilled;
+    char     aud[132];      /* the audience last kept in the book for it (CLIENT.md "Links") */
 } oc_ws_slot;
-static oc_ws_slot g_wss[WS_MAX];
+static oc_ws_slot g_wss[WS_OPEN_MAX];
 static int g_n_wss, g_ws_active = -1;
 static int ws_find(const char *ws);   /* fwd */
 static int g_logging_out;            /* a LOGOUT is in flight */
 static int g_forget_after_logout;    /* remove the entry once that sign-out lands */
 static void switch_workspace(oc_win *hwnd, const char *ws, const char *cred);   /* fwd */
+static const char *store_path(void);  /* fwd */
 static void signin_begin_known(oc_win *hwnd, const char *ws, const char *user); /* fwd */
 static void sw_book_load(void);      /* fwd */
 static void ws_forget(const char *ws);   /* fwd */
 static void ws_forget_begin(const char *ws);   /* fwd */
 static void ws_forget_all(void);   /* fwd */
+static void ws_forget_set(void);   /* fwd */
 
-static struct { char ws[256], label[80], user[80]; int current; } g_sw[16];
-static int   g_n_sw;
+/* The book as last read (sw_book_load), one entry per remembered workspace,
+ * grown as the store has more; last_used is the store's stamp, in ms. */
+typedef struct { char ws[256], label[80], user[80]; int current; uint64_t last_used; } sw_entry;
+static sw_entry *g_sw;
+static int   g_n_sw, g_cap_sw;
+/* The Workspaces dialog's rows: indexes into g_sw, those its filter box admits,
+ * the signed-in first and then the most recently used (wsmgr_view). */
+static int  *g_swv;
+static int   g_n_swv, g_cap_swv;
+static field *g_wsm_q;                /* the dialog's filter box */
+static rectf g_wsm_qbox;              /* its chrome, as last painted */
+/* Remove unused: the dialog that takes the day, over the Workspaces dialog. */
+static int    g_wsu_open;
+static field *g_wsu_edit;
+static rectf  g_wsu_erect;
+static const char *g_wsu_err;
+/* The workspaces a bulk removal's confirmation is about (CONF_WS_FORGET_SET),
+ * by address: the list can be reloaded between asking and answering. */
+static char (*g_wsx)[256];
+static int    g_n_wsx;
+static int    wsp_busy(void);         /* fwd: Remove unreachable is still checking */
+static void   draw_wsunused(gfx *rt, rectf body);   /* fwd */
 
 static rectf g_attach_btn;        /* composer attach (+) hit-box */
 static rectf g_send_btn;          /* composer send-button hit-box */
@@ -3437,7 +3581,7 @@ static void fonts_build(void) {
     const float k = g_text_scale;
     fmtw **all[] = { &g_display, &g_title, &g_body, &g_ui, &g_ui_b,
                      &g_meta, &g_meta_w, &g_meta_r, &g_avatar, &g_micro,
-                     &g_meta_i, &g_fmt_bold, &g_fmt_ital, &g_fmt_quote, &g_ui_w };
+                     &g_meta_i, &g_fmt_bold, &g_fmt_ital, &g_fmt_quote, &g_ui_w, &g_code };
     for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) fmt_release(all[i]);
     txt_drop_all();
 
@@ -3482,6 +3626,13 @@ static void fonts_build(void) {
     /* Oversized on purpose: a quotation mark occupies the top third of its em
      * box, so at text size it is a speck in the middle of a 24 px button. */
     g_fmt_quote = mk_fmt_s("Georgia", (FONT_UI + 9.0f) * k, 700, C, MID, 0, 0, 0.0f, 0.0f);
+    /* A snippet's text (REQ-226): the code family, at meta size, one line per
+     * draw, coloured span by span. */
+    {
+        float clh, cbl;
+        pin_metrics(FONT_META * k, &clh, &cbl);
+        g_code = mk_fmt_s("Consolas", FONT_META * k, REG, L, MID, 0, 0, clh, cbl);
+    }
 }
 
 /* The emoji formats, rebuilt on every scale change like the rest.
@@ -3573,6 +3724,9 @@ static int *g_modal_stack[4];
 static int  g_n_modal_stack;
 static int  g_modal_entering;
 
+/* Set while a dialog that is about the open thread is being entered (the
+ * jump-to-date calendar), so the thread stays open under it. */
+static int g_modal_keep_thread;
 static void close_overlays(void) {
     const oc_model *mm = model();
     if (!g_modal_entering) g_n_modal_stack = 0;
@@ -3585,7 +3739,7 @@ static void close_overlays(void) {
     g_about_open = 0;
     g_wsmgr_open = 0;
     if (!mm) return;
-    if (mm->thread_open)    oc_client_close_thread(g_client);
+    if (mm->thread_open && !g_modal_keep_thread) oc_client_close_thread(g_client);
     if (mm->search_open)    oc_client_close_search(g_client);
     if (mm->reactlist_open) oc_client_close_reactions(g_client);
     if (mm->voterlist_open) oc_client_close_poll_voters(g_client);
@@ -4729,6 +4883,11 @@ static void sidebar_surface(gfx *rt, float h) {
 
 enum { CC_MUTE = 2100, CC_LEAVE, CC_END, CC_JOIN, CC_DECLINE, CC_INVITE, CC_NS,
        CC_MICMENU, CC_SPKMENU, CC_HDR, CC_PLUS, CC_OPEN, CC_PICK_GO, CC_PICK_CANCEL,
+       /* The conversation's banner (its Join and Decline act on the conversation
+        * shown, not on the call view's), the call view's settings and side panel,
+        * and a missed call's Call back; a Calls row's own Join. */
+       CC_BANNER_JOIN, CC_BANNER_DECLINE, CC_SETTINGS, CC_CHAT, CC_CALLBACK,
+       CC_ROWJOIN0 = 2190,
        CC_MIC0 = 2200, CC_SPK0 = 2220, CC_CONV0 = 2240, CC_VOLDN0 = 2300, CC_VOLUP0 = 2340,
        CC_ROW0 = 2380, CC_PICK0 = 2420,
        CC_SHARE = 2500, CC_SHARE_STOP, CC_SHARE_FULL, CC_SHARE_ACTUAL, CC_SRC0 = 2520,
@@ -4755,6 +4914,11 @@ static uint64_t        g_call_convs[CC_MAX_CONV];    /* the "+" menu's conversat
 static rectf           g_call_hdr_btn, g_calls_plus, g_cstrip, g_cstrip_mute, g_cstrip_leave;
 static struct { rectf r; uint64_t ch; } g_call_rows[8];
 static int             g_n_call_rows;
+static int             g_call_settings;     /* the call's settings panel is open */
+static int             g_call_start_ok;     /* a start's confirmation said yes (call_start_confirmed) */
+static int             g_call_banner_on;    /* the conversation shown has its call's banner */
+static int             g_call_chat_hidden;  /* the call view's conversation panel is folded away */
+static rectf           g_call_mute_btn;     /* the call view's Mute, for its tip */
 static uint32_t        g_call_err_seq;      /* the refusal last seen arrive, and when */
 static uint64_t       g_call_err_at;
 typedef struct { rectf r; int cmd; char aid[40]; char name[96]; } call_btn;
@@ -4815,6 +4979,8 @@ static void call_rects_reset(void) {
     g_n_call_btns = 0;
     g_n_call_rows = 0;
     g_call_hdr_btn = g_calls_plus = g_cstrip = g_cstrip_mute = g_cstrip_leave = rf(0, 0, 0, 0);
+    g_call_mute_btn = rf(0, 0, 0, 0);
+    g_call_banner_on = 0;
     g_share_stage = rf(0, 0, 0, 0);
 }
 
@@ -4938,10 +5104,12 @@ static float call_button_w(const char *label, int icon) {
 
 /* ---- the Calls section, in the Home sidebar ---------------------------------------- */
 
-/* Height the section takes: a header and a row per call, or one "No calls". */
+/* Height the section takes: a header and a row per call; nothing at all when
+ * there is no call to list, rather than a heading over "No calls" -- a call is
+ * started from the conversation's header, where its people are. */
 static float calls_section_h(const oc_model *m) {
-    if (!m || !oc_model_calls_available(m)) return 0;
-    size_t n = m->n_calls ? m->n_calls : 1;
+    if (!m || !oc_model_calls_available(m) || !m->n_calls) return 0;
+    size_t n = m->n_calls;
     if (n > 6) n = 6;
     return ROW_H * (float)(1 + n) + 6;
 }
@@ -4949,17 +5117,13 @@ static float calls_section_h(const oc_model *m) {
 static float draw_calls_section(gfx *rt, const oc_model *m, float sy, float sx0, float sx1) {
     g_n_call_rows = 0;
     g_calls_plus = rf(0, 0, 0, 0);
-    if (!m || !oc_model_calls_available(m)) return sy;
+    if (!m || !oc_model_calls_available(m) || !m->n_calls) return sy;
     draw_text(rt, "Calls", g_meta, rf(sx0 + UIS(10), sy, sx1 - 30, sy + ROW_H), OC_COL_FAINT);
     g_calls_plus = rf(sx1 - UIS(28), sy + (ROW_H - UIS(22)) / 2, sx1 - UIS(6), sy + (ROW_H + UIS(22)) / 2);
     if (in_rect(g_calls_plus, g_mouse_x, g_mouse_y)) fill_round(rt, g_calls_plus, OC_R_CONTROL, OC_COL_HOVER);
     draw_lucide(rt, OC_ICON_PLUS, rf(g_calls_plus.left + 3, g_calls_plus.top + 3,
                                      g_calls_plus.right - 3, g_calls_plus.bottom - 3), OC_COL_MUTED);
     sy += ROW_H;
-    if (!m->n_calls) {
-        draw_text(rt, "No calls", g_ui, rf(sx0 + UIS(34), sy, sx1 - 12, sy + ROW_H), OC_COL_FAINT);
-        return sy + ROW_H + 6;
-    }
     for (size_t i = 0; i < m->n_calls && i < 6; i++) {
         const oc_call_view *v = &m->calls[i];
         int mine = call_here(m) && m->call.channel_id == v->channel_id;
@@ -4977,18 +5141,31 @@ static float draw_calls_section(gfx *rt, const oc_model *m, float sy, float sx0,
         call_conv_label(m, v->channel_id, lbl, sizeof lbl);
         snprintf(count, sizeof count, "%u", (unsigned)v->n_parts);
         float cw = text_width(count, g_meta) + UIS(6);
-        float pw = invited ? text_width("Invited", g_micro) + UIS(14) : 0;
+        /* Its own way in: Join, or Open once you are in it. An invitation is
+         * the accented Join rather than a pill beside a row you must find the
+         * meaning of. */
+        const char *jl = mine ? "Open" : "Join";
+        float jh = ROW_H - UIS(10), jw = text_width(jl, g_meta) + UIS(18);
+        rectf jb = rf(sx1 - UIS(12) - cw - UIS(6) - jw, sy + (ROW_H - jh) / 2, sx1 - UIS(12) - cw - UIS(6),
+                      sy + (ROW_H + jh) / 2);
         draw_text(rt, lbl, on || mine ? g_ui_b : g_ui,
-                  rf(sx0 + UIS(34), sy, sx1 - UIS(12) - cw - (pw ? pw + UIS(6) : 0), sy + ROW_H),
+                  rf(sx0 + UIS(34), sy, jb.left - UIS(6), sy + ROW_H),
                   on || mine || invited ? OC_COL_TEXT : OC_COL_MUTED);
-        if (invited) {
-            float ph = UIS(18.0f), py = sy + (ROW_H - ph) / 2;
-            rectf pill = rf(sx1 - UIS(12) - cw - pw - UIS(4), py, sx1 - UIS(12) - cw - UIS(4), py + ph);
-            fill_round(rt, pill, ph / 2, OC_COL_ACCENT);
-            int oa = g_micro->align;
-            g_micro->align = ST_ALIGN_CENTER;
-            draw_text(rt, "Invited", g_micro, pill, 0xFFFFFF);
-            g_micro->align = oa;
+        {
+            int jhov = in_rect(jb, g_mouse_x, g_mouse_y);
+            if (invited) fill_round(rt, jb, OC_R_CONTROL, OC_COL_ACCENT);
+            else {
+                fill_round(rt, jb, OC_R_CONTROL, jhov ? OC_COL_HOVER : OC_COL_INPUT);
+                stroke_round(rt, jb, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+            }
+            int oa = g_meta->align;
+            g_meta->align = ST_ALIGN_CENTER;
+            draw_text(rt, jl, g_meta, jb, invited ? 0xFFFFFF : OC_COL_TEXT);
+            g_meta->align = oa;
+            char aid[48], an[140];
+            snprintf(aid, sizeof aid, "calls.row.join.%llu", (unsigned long long)v->channel_id);
+            snprintf(an, sizeof an, "%s the call in %s", jl, lbl);
+            call_btn_add(jb, CC_ROWJOIN0 + (int)i, aid, an);
         }
         g_meta->align = ST_ALIGN_RIGHT;
         draw_text(rt, count, g_meta, rf(sx1 - UIS(12) - cw, sy, sx1 - UIS(12), sy + ROW_H), OC_COL_MUTED);
@@ -5458,10 +5635,12 @@ static const char *action_line(const oc_msg *msg) {
     size_t cap = strlen(nm) + 1 + msg->action.len + 1;
     char *line = malloc(cap), *copy = strdup(text);
     if (!line || !copy) { free(line); free(copy); return "(message unavailable)"; }
-    /* With a spoiler, as written: the layout covers it, and it reveals like any
-     * other (MARKDOWN.md §1d). An excerpt's word in its place could not be. */
-    if (oc_rt_spoilers(text, strlen(text), NULL, 0)) snprintf(line, cap, "%s %s", nm, text);
-    else oc_model_line(model(), msg->author_id, nm, 1, text, line, cap);
+    /* As written, always, as a body is: the layout covers a spoiler, which reveals
+     * like any other (MARKDOWN.md §1d), and draws a time token in this reader's
+     * zone and clock with its tip (§1c), laid out again when the clock, the zone
+     * or the day changes, as a body's are. Text made here instead kept the clock
+     * and the "today" it was made with, and a token's tip went with it. */
+    snprintf(line, cap, "%s %s", nm, text);
     free(g_act_line[k].line);
     free(g_act_line[k].text);
     g_act_line[k].mid = msg->message_id;
@@ -5534,6 +5713,9 @@ static size_t msg_spoilers(const oc_msg *msg) {
  * nor reserved. A tombstone DOES have text — "(message deleted)" — so it keeps
  * its line. */
 static int msg_has_body(const oc_msg *msg) {
+    /* A to-do list is drawn as its card: the "/todo" text that made it is
+     * what a client without one shows. */
+    if (msg->todo && !msg->deleted) return 0;
     return msg->deleted || (msg->body && msg->body[0]);
 }
 
@@ -5689,6 +5871,47 @@ static void spoiler_toggle(uint64_t mid, int k) {
     if (g_n_spl_shown == SPL_REVEALS) memmove(g_spl_shown, g_spl_shown + 1, sizeof g_spl_shown[0] * (SPL_REVEALS - 1)), g_n_spl_shown--;
     g_spl_shown[g_n_spl_shown].mid = mid; g_spl_shown[g_n_spl_shown].k = k; g_n_spl_shown++;
 }
+/* `t` from byte `s` to byte `e`, for the clipboard (MARKDOWN.md §1d): each spoiler
+ * of message `mid` this reader has not revealed is its covered form, "[spoiler]"
+ * or "[spoiler: Label]" as oc_rt_plain_excerpt writes it, however little of it
+ * the range takes in; one revealed is copied as written. The spoilers are those
+ * of `t` past `lead` bytes (an action's name), numbered as the transcript numbers
+ * them (msg_spoilers). A malloc'd string, or NULL on no memory. Every copy of a
+ * message's text goes through here. */
+static char *copy_covered(uint64_t mid, const char *t, size_t lead, size_t s, size_t e) {
+    size_t n = strlen(t), nsv, cap, o = 0, i;
+    oc_rt_spoiler *sv = NULL;
+    char *out;
+    if (lead > n) lead = n;
+    if (e > n) e = n;
+    if (s > e) s = e;
+    nsv = oc_rt_spoilers(t + lead, n - lead, NULL, 0);
+    if (nsv) {
+        sv = malloc(nsv * sizeof *sv);
+        if (!sv) return NULL;
+        nsv = oc_rt_spoilers(t + lead, n - lead, sv, nsv);
+    }
+    cap = (e - s) + nsv * 80 + 1;
+    out = malloc(cap);
+    if (!out) { free(sv); return NULL; }
+    i = s;
+    for (size_t k = 0; k < nsv; k++) {
+        size_t a = sv[k].start + lead, z = a + sv[k].len;
+        if (z <= s || a >= e || z <= i || spoiler_shown(mid, (int)k)) continue;
+        if (a > i) { memcpy(out + o, t + i, a - i); o += a - i; }
+        if (sv[k].label_len)
+            o += (size_t)snprintf(out + o, cap - o, "[spoiler: %.*s]",
+                                  (int)(sv[k].label_len > 64 ? 64 : sv[k].label_len), t + lead + sv[k].label);
+        else
+            o += (size_t)snprintf(out + o, cap - o, "[spoiler]");
+        i = z < e ? z : e;
+    }
+    if (e > i) { memcpy(out + o, t + i, e - i); o += e - i; }
+    out[o] = '\0';
+    free(sv);
+    return out;
+}
+
 /* `t` (`nt` tables of a body whose spoilers are `sv`) less those in a covered
  * spoiler, which stay text under its cover: a grid would be drawn over it, for
  * all to read. Returns how many are left. */
@@ -5952,6 +6175,7 @@ static uint64_t mlay_sig(const oc_msg *msg) {
     }
     h = (h ^ (uint64_t)(msg->collapsed ? 64 : 0) ^ (uint64_t)(msg_expanded(msg->message_id) ? 128 : 0)) * 1099511628211ull;
     const oc_model *km = model();
+    if (km && oc_model_is_muted_user(km, msg->author_id)) h = (h ^ 256u) * 1099511628211ull;   /* folded as muted */
     if (km)
         for (uint8_t k = 0; k < km->n_kw_terms; k++)
             for (const char *t = km->kw_terms[k]; *t; t++)
@@ -6397,6 +6621,54 @@ static size_t cut_body(const char *b, size_t blen, size_t lead, size_t cut, char
     return start;
 }
 
+/* The time tokens in the cells of `b`'s tables that are not drawn as grids
+ * (`rts`, `nt`): those past MTAB_MAX, laid out as text like the rest of the body.
+ * Each is a box and a tip as a token anywhere else is (MARKDOWN.md §1c). A
+ * malloc'd list in *out, offsets into `b`; returns how many, 0 on none or no
+ * memory, when they show as typed. */
+static size_t text_table_times(const char *b, size_t blen, const oc_rt_table *rts, int nt, oc_rt_span **out) {
+    size_t ntab, n = 0, cap = 0;
+    oc_rt_table *t;
+    oc_rt_span *v = NULL;
+    *out = NULL;
+    if (!memchr(b, '|', blen) || !strstr(b, "<time:")) return 0;
+    ntab = oc_rt_tables(b, blen, NULL, 0);
+    if (ntab <= (size_t)nt) return 0;
+    t = malloc(ntab * sizeof *t);
+    if (!t) return 0;
+    ntab = oc_rt_tables(b, blen, t, ntab);
+    for (size_t q = 0; q < ntab; q++) {
+        int grid = 0;
+        for (int k = 0; k < nt && !grid; k++) grid = rts[k].start == t[q].start;
+        if (grid) continue;
+        oc_rt_rowit it;
+        oc_rt_cell cells[OC_RT_TABLE_MAX_COLS];
+        uint32_t row;
+        oc_rt_rows_begin(&it, b, blen, &t[q]);
+        while (oc_rt_row_next(&it, cells, &row)) {
+            for (uint8_t c = 0; c < t[q].cols; c++) {
+                oc_rt_span cs[32];
+                if (!cells[c].len || !memchr(b + cells[c].start, '<', cells[c].len)) continue;
+                size_t m = oc_rt_scan_cell(b, cells[c].start, cells[c].len, cs, 32);
+                if (m > 32) m = 32;
+                for (size_t i = 0; i < m; i++) {
+                    if (cs[i].style != OC_RT_TIME) continue;
+                    if (n == cap) {
+                        size_t nc = cap ? cap * 2 : 16;
+                        oc_rt_span *g = realloc(v, nc * sizeof *g);
+                        if (!g) { free(v); free(t); return 0; }
+                        v = g; cap = nc;
+                    }
+                    v[n++] = cs[i];
+                }
+            }
+        }
+    }
+    free(t);
+    *out = v;
+    return n;
+}
+
 static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     uint64_t sig = mlay_sig(msg);
     unsigned slot = (unsigned)(msg->message_id % MLAY_CACHE);
@@ -6420,7 +6692,17 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
      * every offset below means what it did. */
     static char cutbuf[OC_MAX_BODY_SIZE + 8];
     int cutkind = 0;
-    if (!msg->deleted && msg_has_body(msg) && !msg_expanded(msg->message_id)) {
+    /* A person this reader muted: folded to one line saying so, whatever it
+     * says, until revealed -- one message at a time, here alone (OC_MSG_MUTED_USERS). */
+    const oc_model *mm = model();
+    if (!msg->deleted && msg_has_body(msg) && !msg_expanded(msg->message_id) &&
+        mm && oc_model_is_muted_user(mm, msg->author_id)) {
+        snprintf(cutbuf, sizeof cutbuf, "Message from a muted person");
+        b = cutbuf;
+        blen = strlen(cutbuf);
+        cutkind = 3;
+    }
+    if (!cutkind && !msg->deleted && msg_has_body(msg) && !msg_expanded(msg->message_id)) {
         size_t cut = 0, lead0 = body_lead(msg);
         if (msg->collapsed) {
             const char *nl = memchr(b + lead0, '\n', blen - lead0);
@@ -6442,7 +6724,7 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
      * otherwise each leave an empty line behind. */
     oc_rt_table rts[MTAB_MAX];
     int nt = 0;
-    size_t tlead = body_lead(msg);
+    size_t tlead = cutkind == 3 ? 0 : body_lead(msg);   /* the muted line has no lead */
     if (tlead > blen) tlead = blen;
     /* The spoilers (MARKDOWN.md §1d), every one of them, offsets past the lead. */
     oc_rt_spoiler *spv = NULL;
@@ -6464,7 +6746,7 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     const char *text = b;
     size_t edit_at = 0, edit_len = 0;
     int edited = msg->edited && !msg->deleted;
-    static const char *const MORE[3] = { "", "  \xE2\x80\xA6 Show message", "\nShow more" };
+    static const char *const MORE[4] = { "", "  \xE2\x80\xA6 Show message", "\nShow more", "  \xE2\x80\xA6 Show message" };
     size_t more_at = 0, more_len = cutkind ? strlen(MORE[cutkind]) : 0;
     if (edited || nt || cutkind) {
         own = malloc(blen + 16 + 32);
@@ -6504,9 +6786,10 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
         /* An action (REQ-058) reads "<name> <text>": the name is bold, and the
          * markup scanners below see only the author's text, past it -- `lead`
          * is that one offset, added wherever a span lands in the layout. */
-        size_t lead = body_lead(msg);
+        size_t lead = cutkind == 3 ? 0 : body_lead(msg);
         if (lead > blen) lead = blen;
         if (lead) st_range_weight(lay, 0, lead - 1, 700);
+        if (cutkind == 3) st_range_color(lay, 0, blen, OC_COL_FAINT, 1.0f);   /* the muted line */
         const char *ab = b;
         b += lead;
         blen -= lead;
@@ -6589,7 +6872,9 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
             if (all) { tsp = all; nts = oc_rt_scan(b, blen, all, nts); }
             else nts = OC_RT_MAX;          /* past these, a token shows as typed */
         }
-        ibox_src *src = (ne || nts) ? malloc(((size_t)ne + nts) * sizeof *src) : NULL;
+        oc_rt_span *ttk = NULL;
+        size_t ntt = text_table_times(b, blen, rts, nt, &ttk);
+        ibox_src *src = (ne || nts || ntt) ? malloc(((size_t)ne + nts + ntt) * sizeof *src) : NULL;
         for (int i = 0; src && i < ne; i++) {
             /* Not inside a table, where a box would reserve space in its band,
              * nor in a covered spoiler, where its picture would show through. */
@@ -6604,6 +6889,17 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
                 !oc_rt_time_value(b, blen, &tsp[i], &ms)) continue;
             src[nsrc++] = (ibox_src){ lead + tsp[i].start, tsp[i].len, 0, ms };
         }
+        /* In a table drawn as text, past MTAB_MAX: as in the body, unless a
+         * covered spoiler hides it, where its box would show through. */
+        for (size_t i = 0; src && i < ntt; i++) {
+            int64_t ms = 0;
+            int hid = 0;
+            for (size_t k = 0; k < nspv && !hid; k++)
+                hid = !best->spl[k].shown && ttk[i].start >= spv[k].hidden && ttk[i].start < spv[k].hidden + spv[k].hidden_len;
+            if (hid || !oc_rt_time_value(b, blen, &ttk[i], &ms)) continue;
+            src[nsrc++] = (ibox_src){ lead + ttk[i].start, ttk[i].len, 0, ms };
+        }
+        free(ttk);
         best->nbox = ibox_place(lay, src, nsrc, &best->box);
         free(src);
         free(runs);
@@ -6636,7 +6932,7 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     best->cutkind = cutkind;
     if (more_len) {
         /* The words alone, past the newline or the ellipsis before them. */
-        size_t skip = cutkind == 2 ? 1 : 6;
+        size_t skip = cutkind == 2 ? 1 : 6;   /* 1 and 3: past "  …" */
         st_rect mr[2];
         if (st_hit_range(lay, more_at + skip, more_len - skip, mr, 2) >= 1) best->more_r = mr[0];
     }
@@ -6722,6 +7018,24 @@ static float poll_card_h(const oc_poll_view *p) {
     return POLL_TOP + (float)p->n_options * (POLL_ROW_H + POLL_ROW_GAP) + LINE_H;
 }
 
+/* A to-do list's card: its title (and Rename, for its author), a row per task
+ * -- a box to mark it, its name and description, and who marked it done --
+ * then "Add a task" and how many are done. One height for both passes. */
+#define TODO_ROW_H   UIS(24.0f)
+#define TODO_CARD_W  UIS(520.0f)
+static float todo_card_h(const oc_todo_view *t) {
+    return POLL_TOP + LINE_H + (float)t->total * TODO_ROW_H + LINE_H + UIS(4.0f);
+}
+/* Every task of a full list, and its Add and Rename, with room for a few lists on screen. */
+static struct { rectf r; uint64_t mid, cid; int task; } g_todohits[4 * (OC_TODO_MAX_TASKS + 2)];   /* task -1: Add, -2: Rename */
+static int g_n_todohits;
+static void todo_hit(rectf r, uint64_t mid, uint64_t cid, int task) {
+    if (g_n_todohits >= (int)(sizeof g_todohits / sizeof g_todohits[0])) return;
+    g_todohits[g_n_todohits].r = r; g_todohits[g_n_todohits].mid = mid;
+    g_todohits[g_n_todohits].cid = cid; g_todohits[g_n_todohits].task = task;
+    g_n_todohits++;
+}
+
 /* Past its deadline, by this machine's clock; the daemon's is the one that
  * refuses a late vote, so a few seconds' disagreement costs only a refusal. */
 static int poll_closed(const oc_poll_view *p) {
@@ -6768,7 +7082,9 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
         /* An image gets a thumbnail box instead of a text line — and the space
          * must be reserved whether or not the bitmap has arrived, or the
          * transcript jumps under the reader the moment one decodes. */
-        if (!msg->attach[i].reclaimed && (mime_is_image(msg->attach[i].mime) || is_video_msg(&msg->attach[i])))
+        if (is_snippet(&msg->attach[i]))
+            thumbs += SNIP_CARD_H + 6.0f;         /* its title and first lines (REQ-226) */
+        else if (!msg->attach[i].reclaimed && (mime_is_image(msg->attach[i].mime) || is_video_msg(&msg->attach[i])))
             thumbs += THUMB_H + 6.0f + LINE_H;   /* + the filename line above it */
         else
             extra++;
@@ -6778,6 +7094,7 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
         thumbs += unfurl_card_h(&msg->unfurls[i]) + UNFURL_GAP;
     if (msg->forward) thumbs += forward_card_h(msg->forward) + FWD_GAP;
     if (msg->poll) thumbs += poll_card_h(msg->poll) + POLL_GAP;
+    if (msg->todo && !msg->deleted) thumbs += todo_card_h(msg->todo) + POLL_GAP;
     return MSG_PIN(msg) + MSG_BODY_DY(grouped) + body_h +
            (float)extra * LINE_H + thumbs + MSG_BOT(next_grouped);
 }
@@ -7155,6 +7472,98 @@ static float body_draw(gfx *rt, const oc_msg *msg, mlay_ent *body, float tx, flo
     return body->mh;
 }
 
+/* A snippet's colours by token kind (lexer.h): words the language keeps for
+ * itself, strings, comments, numbers. */
+static uint32_t snip_color(uint8_t kind) {
+    return kind == OC_LEX_KEYWORD ? OC_COL_ACCENT : kind == OC_LEX_STRING ? OC_COL_ONLINE
+         : kind == OC_LEX_COMMENT ? OC_COL_FAINT  : kind == OC_LEX_NUMBER ? OC_COL_AWAY : OC_COL_TEXT;
+}
+
+/* Draw lines of code from `first` (0-based), at most `max`, from `y` down, one
+ * `lh` each, cut at `right`; coloured by `toks`, which the whole text was lexed
+ * into. A tab is four spaces. Returns the number of lines in the text. */
+static int draw_code_lines(gfx *rt, const char *s, size_t n, const oc_lex_tok *toks, size_t nt,
+                           float x, float y, float right, float lh, int first, int max) {
+    int line = 0;
+    size_t i = 0, t = 0;
+    while (i <= n) {
+        size_t e = i;
+        while (e < n && s[e] != '\n') e++;
+        if (line >= first && line < first + max) {
+            float cx = x;
+            float ly = y + (float)(line - first) * lh;
+            size_t p = i;
+            while (p < e && cx < right) {
+                while (t < nt && toks[t].start + toks[t].len <= p) t++;
+                size_t q; uint8_t kind = OC_LEX_PLAIN;
+                if (t < nt && toks[t].start <= p) { q = toks[t].start + toks[t].len; kind = toks[t].kind; }
+                else q = (t < nt && toks[t].start < e) ? toks[t].start : e;
+                if (q > e) q = e;
+                if (q <= p) q = p + 1;
+                char seg[512]; size_t k = 0;
+                for (size_t r = p; r < q && k + 5 < sizeof seg; r++) {
+                    if (s[r] == '\t') { memcpy(seg + k, "    ", 4); k += 4; }
+                    else if (s[r] != '\r') seg[k++] = s[r];
+                }
+                seg[k] = '\0';
+                float w = text_width(seg, g_code);
+                if (k) draw_text(rt, seg, g_code, rf(cx, ly, right, ly + lh), snip_color(kind));
+                cx += w;
+                p = q;
+            }
+        } else {
+            while (t < nt && toks[t].start + toks[t].len <= e) t++;
+        }
+        line++;
+        if (e >= n) break;
+        i = e + 1;
+    }
+    return line;
+}
+
+static struct { rectf r; uint64_t aid; uint64_t mid; } g_snip_hits[24];
+static int g_n_snip_hits;
+
+/* A snippet in the transcript (REQ-226): a card with its title and language,
+ * then its first lines, coloured; a click opens the viewer. */
+static void draw_snippet_card(gfx *rt, const oc_msg *msg, const oc_attachment *at, rectf card) {
+    int hov = in_rect(card, g_mouse_x, g_mouse_y);
+    fill_round(rt, card, OC_R_CONTROL, hov ? OC_COL_HOVER : OC_COL_INPUT);
+    stroke_round(rt, card, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+    float x = card.left + UIS(10.0f), y = card.top + UIS(5.0f);
+    int lang = oc_lex_language(at->language);
+    char head[OC_SNIPPET_TITLE_MAX + 48];
+    snprintf(head, sizeof head, "%s", at->title[0] ? at->title : at->filename);
+    float hw = text_width(head, g_ui_b);
+    draw_text(rt, head, g_ui_b, rf(x, y, card.right - UIS(10.0f), y + LINE_H), OC_COL_TEXT);
+    char sub[64];
+    snprintf(sub, sizeof sub, "  \xC2\xB7  %s", oc_lex_label(lang));
+    draw_text(rt, sub, g_meta, rf(x + hw, y, card.right - UIS(10.0f), y + LINE_H), OC_COL_MUTED);
+    y += LINE_H + UIS(4.0f);
+    size_t len = 0;
+    const char *text = snip_text(at->id, &len);
+    if (text) {
+        /* Lexed as far as the preview goes: the end of its last line. */
+        size_t end = 0; int lines = 0;
+        while (end < len && lines < SNIP_PREVIEW) { if (text[end] == '\n') lines++; end++; }
+        oc_lex_tok toks[256];
+        size_t nt = oc_lex(lang, text, end, toks, sizeof toks / sizeof toks[0]);
+        gfx_clip_push(rt, gr(rf(card.left, y, card.right - UIS(8.0f), card.bottom - UIS(4.0f))));
+        draw_code_lines(rt, text, end, toks, nt, x, y, card.right - UIS(10.0f), LINE_H, 0, SNIP_PREVIEW);
+        gfx_clip_pop(rt);
+    } else {
+        draw_text(rt, snip_failed(at->id) ? "preview unavailable" : "loading\xE2\x80\xA6", g_meta,
+                  rf(x, y, card.right, y + LINE_H), OC_COL_FAINT);
+        if (!g_preview && !g_thumbs_off) snip_want(at->id);
+    }
+    if (g_n_snip_hits < (int)(sizeof g_snip_hits / sizeof g_snip_hits[0])) {
+        g_snip_hits[g_n_snip_hits].r = card;
+        g_snip_hits[g_n_snip_hits].aid = at->id;
+        g_snip_hits[g_n_snip_hits].mid = msg->message_id;
+        g_n_snip_hits++;
+    }
+}
+
 static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
                          mlay_ent *body, float x0, float y, float content_w,
                          int grouped) {
@@ -7341,11 +7750,74 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
         draw_text(rt, foot, g_meta, rf(tx, ly, fr, ly + LINE_H), OC_COL_MUTED);
         by += poll_card_h(p) + POLL_GAP;
     }
+    /* A to-do list: a box per task, pressed to mark it done or not; "Add a
+     * task" for anyone who can read it; Rename for its author. */
+    if (msg->todo && !msg->deleted) {
+        const oc_todo_view *t = msg->todo;
+        float right = x0 + content_w + AVA + 12;
+        float cr = tx + TODO_CARD_W < right ? tx + TODO_CARD_W : right;
+        float ly = by + POLL_TOP;
+        uint64_t chan = g_sel;
+        int mine = m && t->author_id == m->user_id;
+        float rw = mine ? text_width("Rename", g_meta) : 0;
+        draw_text(rt, t->title ? t->title : "", g_ui_b, rf(tx, ly, cr - rw - UIS(12.0f), ly + LINE_H), OC_COL_TEXT);
+        if (mine) {
+            rectf lr = rf(cr - rw, ly, cr, ly + LINE_H);
+            draw_text(rt, "Rename", g_meta, lr, OC_COL_ACCENT);
+            todo_hit(lr, msg->message_id, chan, -2);
+        }
+        ly += LINE_H;
+        unsigned done = 0;
+        for (uint16_t i = 0; i < t->total; i++) {
+            const oc_todo_task_view *k = &t->tasks[i];
+            rectf row = rf(tx, ly, cr, ly + TODO_ROW_H);
+            float mk = UIS(14.0f), mx = row.left + UIS(4.0f), my = row.top + (TODO_ROW_H - mk) / 2.0f;
+            rectf box = rf(mx, my, mx + mk, my + mk);
+            if (k->done) { fill_round(rt, box, UIS(3.0f), OC_COL_ACCENT); done++; }
+            stroke_round(rt, box, UIS(3.0f), k->done ? OC_COL_ACCENT : OC_COL_MUTED, 1.0f);
+            if (k->done) draw_lucide(rt, OC_ICON_CHECK, rf(box.left + 2, box.top + 2, box.right - 2, box.bottom - 2), 0xFFFFFF);
+            char who[96] = "";
+            if (k->done && k->done_by) {
+                const char *nm = oc_model_user_name((oc_model *)m, k->done_by);
+                snprintf(who, sizeof who, "done by %s", (nm && nm[0]) ? nm : "someone");
+            }
+            float ww = who[0] ? text_width(who, g_meta) : 0;
+            float nx = mx + mk + UIS(8.0f);
+            float nw = text_width(k->name ? k->name : "", g_ui);
+            float nr = cr - ww - UIS(12.0f);
+            draw_text(rt, k->name ? k->name : "", g_ui, rf(nx, row.top, nr, row.bottom),
+                      k->done ? OC_COL_MUTED : OC_COL_TEXT);
+            if (k->desc && k->desc[0] && nx + nw + UIS(10.0f) < nr)
+                draw_text(rt, k->desc, g_meta, rf(nx + nw + UIS(10.0f), row.top, nr, row.bottom), OC_COL_FAINT);
+            if (who[0]) draw_text(rt, who, g_meta, rf(cr - ww, row.top, cr, row.bottom), OC_COL_MUTED);
+            todo_hit(rf(box.left - 2, row.top, nr, row.bottom), msg->message_id, chan, (int)i);
+            ly += TODO_ROW_H;
+        }
+        const char *add = "Add a task";
+        float aw = text_width(add, g_meta);
+        rectf ar = rf(tx, ly, tx + aw, ly + LINE_H);
+        if (t->total < OC_TODO_MAX_TASKS) {
+            draw_text(rt, add, g_meta, ar, OC_COL_ACCENT);
+            todo_hit(ar, msg->message_id, chan, -1);
+        }
+        char tally[48];
+        snprintf(tally, sizeof tally, "%u of %u done", done, (unsigned)t->total);
+        float tw = text_width(tally, g_meta);
+        draw_text(rt, tally, g_meta, rf(cr - tw, ly, cr, ly + LINE_H), OC_COL_MUTED);
+        by += todo_card_h(t) + POLL_GAP;
+    }
     /* "(edited)" is drawn inline by body_layout (faint, after the last word). */
 
     /* Meta lines: attachments, thread, then reactions LAST — see below. */
     for (int i = 0; i < msg->n_attach; i++) {
         const oc_attachment *at = &msg->attach[i];
+        if (is_snippet(at)) {
+            float right = x0 + content_w + AVA + 12;
+            if (right - tx > UIS(560.0f)) right = tx + UIS(560.0f);
+            draw_snippet_card(rt, msg, at, rf(tx, by + 3, right, by + 3 + SNIP_CARD_H));
+            by += SNIP_CARD_H + 6.0f;
+            continue;
+        }
         if (is_video_msg(at)) {
             /* A video message (REQ-165): its poster in the thumbnail's place, a
              * play mark, and the length. Clicking plays it. */
@@ -7661,23 +8133,43 @@ enum { MSGLIST_MAIN = 1, MSGLIST_THREAD = 2 };
  * history with the phone, who started it and when -- not a message bubble,
  * because nobody said it. */
 #define CALL_EVENT_H UIS(34.0f)
+static int call_btn_add(rectf r, int cmd, const char *aid, const char *name);   /* fwd */
 static void draw_call_event(gfx *rt, const oc_model *m, const oc_msg *msg, rectf row) {
+    /* Said from the reader's side: who missed whom. The event is the starter's;
+     * to them it is a call nobody came to. */
     const char *who = oc_model_user_name(m, msg->author_id);
-    char when[24] = "", line[200];
+    int mine = m && msg->author_id == m->user_id;
+    char when[24] = "", what[160], line[220];
     rel_time(msg->server_time, when, sizeof when);
-    snprintf(line, sizeof line, "%s  \u00B7  %s  \u00B7  %s",
-             msg->body && msg->body[0] ? msg->body : "Missed call",
-             (who && who[0]) ? who : "someone", when);
-    float tw = text_width(line, g_meta), ic = UIS(16.0f);
-    float cx = (row.left + row.right) / 2, x = cx - (tw + ic + UIS(8)) / 2;
+    if (mine) snprintf(what, sizeof what, "Nobody joined your call");
+    else      snprintf(what, sizeof what, "You missed a call from %s", (who && who[0]) ? who : "someone");
+    snprintf(line, sizeof line, "%s  \u00B7  %s", what, when);
+    const char *cb = "Call back";
+    float tw = text_width(line, g_meta), ic = UIS(16.0f), bw = text_width(cb, g_meta) + UIS(18);
+    float total = ic + UIS(8) + tw + UIS(12) + bw;
+    float cx = (row.left + row.right) / 2, x = cx - total / 2;
+    if (x < row.left + 20) x = row.left + 20;
     float cy = (row.top + row.bottom) / 2;
     draw_lucide(rt, OC_ICON_PHONE_OFF, rf(x, cy - ic / 2, x + ic, cy + ic / 2), OC_COL_MUTED);
-    draw_text(rt, line, g_meta, rf(x + ic + UIS(8), row.top, row.right - 20, row.bottom), OC_COL_MUTED);
+    draw_text(rt, line, g_meta, rf(x + ic + UIS(8), row.top, x + ic + UIS(8) + tw, row.bottom), OC_COL_MUTED);
+    /* Call back: a call in this conversation, from here. */
+    rectf b = rf(x + ic + UIS(8) + tw + UIS(12), cy - UIS(12), x + ic + UIS(8) + tw + UIS(12) + bw, cy + UIS(12));
+    if (b.right > row.right - 8) return;
+    fill_round(rt, b, OC_R_CONTROL, in_rect(b, g_mouse_x, g_mouse_y) ? OC_COL_HOVER : OC_COL_INPUT);
+    stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+    int oa = g_meta->align;
+    g_meta->align = ST_ALIGN_CENTER;
+    draw_text(rt, cb, g_meta, b, OC_COL_TEXT);
+    g_meta->align = oa;
+    char aid[48];
+    snprintf(aid, sizeof aid, "call.event.%llu.callback", (unsigned long long)msg->message_id);
+    call_btn_add(b, CC_CALLBACK, aid, "Call back");
 }
 
 static void draw_msglist(gfx *rt, const oc_model *m,
                          const oc_msg *msgs, size_t nmsgs, rectf reg, int mode) {
     int capture = (mode == MSGLIST_MAIN);
+    int thr     = (mode == MSGLIST_THREAD);
     int hits    = (mode != 0);
     float *scroll     = capture ? &g_scroll     : &g_thr_scroll;
     float *scroll_max = capture ? &g_scroll_max : &g_thr_scroll_max;
@@ -7725,6 +8217,10 @@ static void draw_msglist(gfx *rt, const oc_model *m,
         if (capture && g_jump_mid && msgs[first + i].message_id == g_jump_mid) {
             jump_i = (long)i; jump_off = total;      /* distance from content top */
         }
+        /* A jump to a date inside the thread lands on its reply here. */
+        if (thr && g_thr_jump_mid && msgs[first + i].message_id == g_thr_jump_mid) {
+            jump_i = (long)i; jump_off = total;
+        }
         total += heights[i];
     }
 
@@ -7746,6 +8242,12 @@ static void draw_msglist(gfx *rt, const oc_model *m,
         }
         g_jump_mid = 0;
         g_jump_quiet = 0;
+    }
+    if (thr && jump_i >= 0) {
+        *scroll = total - jump_off - visible * 0.66f;
+        g_flash_mid = g_thr_jump_mid;
+        g_flash_until = now_ms() + 1600;
+        g_thr_jump_mid = 0;
     }
 
     if (*scroll > *scroll_max) *scroll = *scroll_max;
@@ -7798,8 +8300,13 @@ static void draw_msglist(gfx *rt, const oc_model *m,
     for (size_t i = 0; i < n; i++) {
         int divided = 0;   /* a day or "New" divider sits right above this row */
         if (sep[i]) {
-            if (y + SEP_H >= reg.top && y <= reg.bottom)
+            if (y + SEP_H >= reg.top && y <= reg.bottom) {
                 draw_day_sep(rt, msgs[first + i].server_time, reg, y);
+                if (capture && g_n_sephits < (int)(sizeof g_sephits / sizeof g_sephits[0])) {
+                    g_sephits[g_n_sephits].r = rf(reg.left, y, reg.right, y + SEP_H);
+                    g_sephits[g_n_sephits++].ms = msgs[first + i].server_time;
+                }
+            }
             y += SEP_H;
             divided = 1;
         }
@@ -7920,7 +8427,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
                 fill(rt, rf(reg.left, y, reg.left + 3, y + heights[i]), OC_COL_ACCENT);
             }
             /* Jump flash — fades out so it reads as "here it is", not as state. */
-            if (capture && g_flash_mid == msgs[first + i].message_id) {
+            if ((capture || thr) && g_flash_mid == msgs[first + i].message_id) {
                 uint64_t now = now_ms();
                 if (now < g_flash_until) {
                     float a = (float)(g_flash_until - now) / 1600.0f;
@@ -8056,7 +8563,7 @@ static void ovl_end(gfx *rt, rectf body) {
     gfx_clip_pop(rt);
 }
 
-enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS, OVL_WSMGR, OVL_GROUPS, OVL_ALERTS, OVL_EMOJI };
+enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS, OVL_WSMGR, OVL_GROUPS, OVL_ALERTS, OVL_EMOJI, OVL_SNIPPET };
 
 /* Measured from the previous frame's draw, for the same reason the notifications
  * card's is: computing it means restating every row's height a second time. */
@@ -8112,6 +8619,17 @@ static void overlay_empty(gfx *rt, rectf body, const char *text) {
 
 static void draw_thread(gfx *rt, const oc_model *m, rectf reg) {
     rectf body = pane_header(rt, reg, "Thread");
+    /* Jump to a date in this thread, beside the close: the same choices the
+     * conversation's menu offers, asked of the thread's replies. */
+    g_thr_date_btn = rf(reg.right - 72, reg.top + 5, reg.right - 48, reg.top + 29);
+    {
+        int hot = in_rect(g_thr_date_btn, g_mouse_x, g_mouse_y);
+        if (hot) fill_round(rt, g_thr_date_btn, OC_R_CONTROL, OC_COL_HOVER);
+        float ic = UIS(16.0f), cx = (g_thr_date_btn.left + g_thr_date_btn.right) / 2,
+              cy = (g_thr_date_btn.top + g_thr_date_btn.bottom) / 2;
+        draw_lucide(rt, OC_ICON_CALENDAR, rf(cx - ic / 2, cy - ic / 2, cx + ic / 2, cy + ic / 2),
+                    hot ? OC_COL_TEXT : OC_COL_MUTED);
+    }
     const oc_channel *pc = oc_model_channel((oc_model *)m, m->thread_channel);
     const oc_msg *parent = find_msg(pc, m->thread_parent);
     float top = body.top + 6;
@@ -8128,8 +8646,23 @@ static void draw_thread(gfx *rt, const oc_model *m, rectf reg) {
         gfx_clip_pop(rt);
         top += ph + 4;
     }
-    char rc[48];
+    char rc[240];
     snprintf(rc, sizeof rc, "%zu %s", m->n_thread_msgs, m->n_thread_msgs == 1 ? "reply" : "replies");
+    {   /* Who is typing a reply in THIS thread (REQ-121), beside the count. */
+        uint64_t who[4];
+        size_t nt = oc_model_typing(m, m->thread_channel, m->thread_parent, m->user_id, who, 4);
+        size_t at = strlen(rc);
+        if (nt == 1) {
+            const char *n1 = oc_model_user_name(m, who[0]);
+            snprintf(rc + at, sizeof rc - at, "  ·  %s is typing…", (n1 && n1[0]) ? n1 : "someone");
+        } else if (nt == 2) {
+            const char *n1 = oc_model_user_name(m, who[0]), *n2 = oc_model_user_name(m, who[1]);
+            snprintf(rc + at, sizeof rc - at, "  ·  %s and %s are typing…",
+                     (n1 && n1[0]) ? n1 : "someone", (n2 && n2[0]) ? n2 : "someone");
+        } else if (nt > 2) {
+            snprintf(rc + at, sizeof rc - at, "  ·  several people are typing…");
+        }
+    }
     fill(rt, rf(body.left, top, body.right, top + 1), OC_COL_BORDER);
     draw_text(rt, rc, g_meta, rf(body.left + 20, top + 2, body.right - 16, top + 22), OC_COL_FAINT);
     rectf replies = rf(body.left, top + 24, body.right, body.bottom);
@@ -8341,6 +8874,146 @@ static void draw_storage(gfx *rt, const oc_model *m, rectf reg, int embedded) {
     draw_kv(rt, body, &y, "Attachments", v, s->rec_evicted ? OC_COL_DANGER : OC_COL_TEXT);
 }
 
+/* Usage (REQ-043): the console's Usage tab. Daily and weekly active members and
+ * messages per day as bar charts, then the busiest channels; a private channel
+ * the reader is not in comes with no name. The period is picked from three
+ * chips, and each pick asks the daemon again. */
+static const unsigned USAGE_PERIODS[3] = { 7, 30, 90 };
+static unsigned g_usage_days = 30;
+static rectf g_usage_chips[3];
+
+/* One bar chart: a caption, then `n` bars scaled to the largest, each labelled
+ * below by `labels` (every `every`-th, so they never collide), its value above
+ * the tallest. Returns the y below it. */
+static float usage_bars(gfx *rt, rectf body, float y, const char *caption, const uint32_t *vals,
+                        char labels[][12], int n, int every) {
+    draw_text(rt, caption, g_meta, rf(body.left + 24, y, body.right - 20, y + 18), OC_COL_FAINT);
+    y += 22;
+    uint32_t top = 0;
+    for (int i = 0; i < n; i++) if (vals[i] > top) top = vals[i];
+    char peak[32];
+    snprintf(peak, sizeof peak, "most: %u", (unsigned)top);
+    draw_text(rt, peak, g_micro, rf(body.left + 24, y, body.right - 20, y + 14), OC_COL_MUTED);
+    y += 16;
+    const float h = 72, left = body.left + 24, width = body.right - 20 - left;
+    float slot = n > 0 ? width / (float)n : width, gap = slot > 6 ? 2 : 0;
+    fill(rt, rf(left, y + h, left + width, y + h + 1), OC_COL_BORDER);
+    for (int i = 0; i < n; i++) {
+        float bh = top ? h * (float)vals[i] / (float)top : 0;
+        if (vals[i] && bh < 2) bh = 2;
+        float x = left + slot * (float)i;
+        if (bh > 0) fill(rt, rf(x, y + h - bh, x + slot - gap, y + h), OC_COL_ACCENT);
+        if (labels && (i % every == 0 || i == n - 1))
+            draw_text(rt, labels[i], g_micro, rf(x, y + h + 3, x + slot * (float)every, y + h + 17), OC_COL_MUTED);
+    }
+    return y + h + 24;
+}
+
+/* "Nov 11" for a day since the epoch (UTC), with no C library date call:
+ * Windows' has no gmtime_r. H. Hinnant's civil_from_days. */
+static void usage_day_label(uint32_t day, char out[12]) {
+    static const char *const MON[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    int64_t z = (int64_t)day + 719468;
+    int64_t era = z / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned mp = (5 * doy + 2) / 153;
+    unsigned d = doy - (153 * mp + 2) / 5 + 1;
+    unsigned mo = mp < 10 ? mp + 3 : mp - 9;
+    snprintf(out, 12, "%s %u", MON[mo - 1], d);
+}
+
+static void draw_usage(gfx *rt, const oc_model *m, rectf body) {
+    float cx = body.left + 20;
+    for (int i = 0; i < 3; i++) {
+        char lab[24];
+        snprintf(lab, sizeof lab, "Last %u days", USAGE_PERIODS[i]);
+        float cw = text_width(lab, g_meta) + 22;
+        g_usage_chips[i] = rf(cx, body.top + 6, cx + cw, body.top + 30);
+        draw_chip_r(rt, g_usage_chips[i], lab, g_usage_days == USAGE_PERIODS[i]);
+        cx += cw + 6;
+    }
+    if (!m->usage_have) { overlay_empty(rt, body, "Loading…"); return; }
+    const oc_usage_view *u = &m->usage;
+    static uint32_t vals[OC_USAGE_MAX_DAYS];
+    static char labels[OC_USAGE_MAX_DAYS][12];
+    float y = body.top + 42;
+    int every = u->n_days > 45 ? 14 : u->n_days > 10 ? 7 : 1;
+
+    for (int i = 0; i < u->n_days; i++) {
+        usage_day_label(u->day[i].day, labels[i]);
+        vals[i] = u->day[i].active;
+    }
+    y = usage_bars(rt, body, y, "ACTIVE MEMBERS, BY DAY", vals, labels, u->n_days, every);
+    for (int i = 0; i < u->n_weeks; i++) {
+        snprintf(labels[i], sizeof labels[i], "W%02u", (unsigned)(u->week[i].week % 100));
+        vals[i] = u->week[i].active;
+    }
+    y = usage_bars(rt, body, y, "ACTIVE MEMBERS, BY WEEK", vals, labels, u->n_weeks, 1);
+    for (int i = 0; i < u->n_days; i++) {
+        usage_day_label(u->day[i].day, labels[i]);
+        vals[i] = u->day[i].messages;
+    }
+    y = usage_bars(rt, body, y, "MESSAGES POSTED, BY DAY", vals, labels, u->n_days, every);
+
+    draw_text(rt, "BUSIEST CHANNELS", g_meta, rf(body.left + 24, y, body.right - 20, y + 18), OC_COL_FAINT);
+    y += 22;
+    if (!u->n_channels) {
+        draw_text(rt, "No messages in channels in this period.", g_ui, rf(body.left + 24, y, body.right - 20, y + 22),
+                  OC_COL_MUTED);
+        return;
+    }
+    for (int i = 0; i < u->n_channels && y < body.bottom - 22; i++) {
+        char name[160], cnt[48];
+        if (u->channel[i].name[0]) snprintf(name, sizeof name, "#%s", u->channel[i].name);
+        else                       snprintf(name, sizeof name, "private channel");
+        snprintf(cnt, sizeof cnt, "%u message%s", (unsigned)u->channel[i].messages,
+                 u->channel[i].messages == 1 ? "" : "s");
+        draw_kv(rt, body, &y, name, cnt, OC_COL_TEXT);
+    }
+}
+
+/* A click on a period chip: ask again for that period. */
+static int usage_click(float x, float y) {
+    for (int i = 0; i < 3; i++)
+        if (in_rect(g_usage_chips[i], x, y)) {
+            g_usage_days = USAGE_PERIODS[i];
+            if (g_client) oc_client_usage(g_client, g_usage_days);
+            return 1;
+        }
+    return 0;
+}
+
+/* The workspace's blocks, for an owner or admin: who blocks whom, and since
+ * when. Nobody else sees a block, the person blocked included. */
+static void draw_blocks_admin(gfx *rt, const oc_model *m, rectf body) {
+    if (!m->block_list_have) { overlay_empty(rt, body, "Loading…"); return; }
+    if (!m->n_block_list) { overlay_empty(rt, body, "Nobody has blocked anyone."); return; }
+    static const char *const MON[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    float y = body.top + 12;
+    for (uint16_t i = 0; i < m->n_block_list && y < body.bottom - 22; i++) {
+        const oc_block_entry *b = &m->block_list[i];
+        const char *a = oc_model_user_name((oc_model *)m, b->blocker_id);
+        const char *t = oc_model_user_name((oc_model *)m, b->blocked_id);
+        /* The day, from days since the epoch (H. Hinnant's civil_from_days):
+         * Windows' C library has no gmtime_r. */
+        int64_t z = (int64_t)(b->since_ms / 86400000ull) + 719468;
+        int64_t era = z / 146097;
+        unsigned doe = (unsigned)(z - era * 146097);
+        unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        unsigned mp = (5 * doy + 2) / 153, d = doy - (153 * mp + 2) / 5 + 1, mo = mp < 10 ? mp + 3 : mp - 9;
+        long yr = (long)((int64_t)yoe + era * 400 + (mo <= 2));
+        char who[200], since[48];
+        snprintf(who, sizeof who, "%s blocks %s", a && a[0] ? a : "someone", t && t[0] ? t : "someone");
+        snprintf(since, sizeof since, "since %s %u, %ld", MON[mo - 1], d, yr);
+        draw_kv(rt, body, &y, who, since, OC_COL_TEXT);
+    }
+}
+
 static const char *audit_family(uint8_t f) {
     return f == 1 ? "admin" : f == 2 ? "account" : f == 3 ? "security" : f == 4 ? "moderation" : "";
 }
@@ -8389,11 +9062,20 @@ static void draw_audit(gfx *rt, const oc_model *m, rectf reg, int embedded) {
     }
 
     float rowh = UIS(46);
+    if (g_audit_focus >= (int)m->n_audit) g_audit_focus = (int)m->n_audit - 1;
+    if (g_audit_reveal && g_audit_focus >= 0) {
+        float top = (float)g_audit_focus * rowh, visible = body.bottom - body.top;
+        if (top < g_ovl_scroll)                 g_ovl_scroll = top;
+        if (top + rowh > g_ovl_scroll + visible) g_ovl_scroll = top + rowh - visible;
+    }
+    g_audit_reveal = 0;
     float y = ovl_begin(rt, body, (float)m->n_audit * rowh + 34);
     for (size_t i = 0; i < m->n_audit; i++) {
         const oc_audit_view *a = &m->audit[i];
         if (y + rowh < body.top) { y += rowh; continue; }
         if (y > body.bottom) break;
+        if ((int)i == g_audit_focus)
+            fill_round(rt, rf(body.left + 12, y + 1, body.right - 12, y + rowh - 1), OC_R_CONTROL, OC_COL_HOVER);
         char when[20] = "";
         if (a->at_ms) { time_t t = (time_t)(a->at_ms / 1000); struct tm tv;
             if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tv); }
@@ -8418,6 +9100,8 @@ static void draw_audit(gfx *rt, const oc_model *m, rectf reg, int embedded) {
             g_audit_rowhits[g_n_audit_rowhits].actor = rf(ax, y, ax + aw, y + 24);
             g_audit_rowhits[g_n_audit_rowhits].action = rf(cx, y, cx + cw, y + 24);
             g_audit_rowhits[g_n_audit_rowhits].actor_id = a->actor_id;
+            g_audit_rowhits[g_n_audit_rowhits].row = rf(body.left + 12, y, body.right - 12, y + rowh);
+            g_audit_rowhits[g_n_audit_rowhits].idx = (int)i;
             snprintf(g_audit_rowhits[g_n_audit_rowhits].action_name,
                      sizeof g_audit_rowhits[0].action_name, "%s", a->action);
             g_n_audit_rowhits++;
@@ -8817,8 +9501,84 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
         draw_text(rt, "Edit", g_meta, g_notify_vip_btn, OC_COL_TEXT);
         g_meta->align = ST_ALIGN_LEFT;
 
-        fill(rt, rf(body.left + 20, y1 + vipblk, body.right - 20, y1 + vipblk + 1), OC_COL_BORDER);
-        body.top = y1 + vipblk + 10;
+        /* Muted people: whom I have stopped hearing from. Nothing of theirs
+         * notifies me or counts as unread, and their messages show folded away;
+         * Edit takes a name off to unmute them. */
+        float y2 = y1 + vipblk;
+        char muted[256] = "";
+        for (uint16_t i = 0; i < m->n_muted_users; i++) {
+            const char *nm = oc_model_user_name((oc_model *)m, m->muted_users[i]);
+            if (!nm || !nm[0]) continue;
+            if (muted[0]) strncat(muted, ", ", sizeof muted - strlen(muted) - 1);
+            strncat(muted, nm, sizeof muted - strlen(muted) - 1);
+        }
+        const char *mutetext = muted[0] ? muted
+            : "None: mute someone from their profile or a message of theirs.";
+        float muteh = text_height(mutetext, g_meta_w, dw);
+        if (muteh < 20) muteh = 20;
+        float muteblk = estack ? 18 + muteh + 34 : 18 + muteh + 6;
+        draw_text(rt, "Muted people", g_ui_b, rf(body.left + 20, y2, er, y2 + 20), OC_COL_TEXT);
+        draw_text(rt, mutetext, g_meta_w, rf(body.left + 20, y2 + 18, er, y2 + 18 + muteh),
+                  muted[0] ? OC_COL_MUTED : OC_COL_FAINT);
+        g_notify_mute_btn = estack
+            ? rf(body.left + 20, y2 + 22 + muteh, body.left + 20 + UIS(96), y2 + 48 + muteh)
+            : rf(body.right - UIS(120), y2 + 2, body.right - UIS(24), y2 + 28);
+        fill_round(rt, g_notify_mute_btn, OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, g_notify_mute_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, "Edit", g_meta, g_notify_mute_btn, OC_COL_TEXT);
+        g_meta->align = ST_ALIGN_LEFT;
+
+        /* Blocked people: who cannot start a conversation with me, and whose
+         * direct messages I do not get. Edit takes a name off to unblock. */
+        float yb = y2 + muteblk;
+        char blocked[256] = "";
+        for (uint16_t i = 0; i < m->n_blocks; i++) {
+            const char *nm = oc_model_user_name((oc_model *)m, m->blocks[i]);
+            if (!nm || !nm[0]) continue;
+            if (blocked[0]) strncat(blocked, ", ", sizeof blocked - strlen(blocked) - 1);
+            strncat(blocked, nm, sizeof blocked - strlen(blocked) - 1);
+        }
+        const char *bltext = blocked[0] ? blocked
+            : "None: block someone from their profile or a message of theirs.";
+        float blh = text_height(bltext, g_meta_w, dw);
+        if (blh < 20) blh = 20;
+        float blblk = estack ? 18 + blh + 34 : 18 + blh + 6;
+        draw_text(rt, "Blocked people", g_ui_b, rf(body.left + 20, yb, er, yb + 20), OC_COL_TEXT);
+        draw_text(rt, bltext, g_meta_w, rf(body.left + 20, yb + 18, er, yb + 18 + blh),
+                  blocked[0] ? OC_COL_MUTED : OC_COL_FAINT);
+        g_notify_block_btn = estack
+            ? rf(body.left + 20, yb + 22 + blh, body.left + 20 + UIS(96), yb + 48 + blh)
+            : rf(body.right - UIS(120), yb + 2, body.right - UIS(24), yb + 28);
+        fill_round(rt, g_notify_block_btn, OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, g_notify_block_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, "Edit", g_meta, g_notify_block_btn, OC_COL_TEXT);
+        g_meta->align = ST_ALIGN_LEFT;
+
+        /* Who may start a new direct conversation with me: one switch, which
+         * leaves every conversation already started as it is. */
+        float y3 = yb + blblk;
+        const char *dptext = m->dm_privacy == OC_DM_PRIVACY_NOBODY
+            ? "Nobody: no one can start a new direct conversation with you."
+            : "Anyone in the workspace can start a direct conversation with you.";
+        float dph = text_height(dptext, g_meta_w, dw);
+        if (dph < 20) dph = 20;
+        float dpblk = estack ? 18 + dph + 34 : 18 + dph + 6;
+        draw_text(rt, "Direct messages", g_ui_b, rf(body.left + 20, y3, er, y3 + 20), OC_COL_TEXT);
+        draw_text(rt, dptext, g_meta_w, rf(body.left + 20, y3 + 18, er, y3 + 18 + dph), OC_COL_MUTED);
+        g_notify_dmpriv_btn = estack
+            ? rf(body.left + 20, y3 + 22 + dph, body.left + 20 + UIS(120), y3 + 48 + dph)
+            : rf(body.right - UIS(120), y3 + 2, body.right - UIS(24), y3 + 28);
+        fill_round(rt, g_notify_dmpriv_btn, OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, g_notify_dmpriv_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, m->dm_privacy == OC_DM_PRIVACY_NOBODY ? "Allow anyone" : "Allow nobody", g_meta,
+                  g_notify_dmpriv_btn, OC_COL_TEXT);
+        g_meta->align = ST_ALIGN_LEFT;
+
+        fill(rt, rf(body.left + 20, y3 + dpblk, body.right - 20, y3 + dpblk + 1), OC_COL_BORDER);
+        body.top = y3 + dpblk + 10;
     }
 
     /* Read receipts (REQ-090): whether others see what I have read. Mine
@@ -8993,6 +9753,9 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
      * silent mis-set this item is about. */
     g_notify_kw_btn  = hit_visible(g_notify_kw_btn,  reg);
     g_notify_vip_btn = hit_visible(g_notify_vip_btn, reg);
+    g_notify_mute_btn = hit_visible(g_notify_mute_btn, reg);
+    g_notify_block_btn = hit_visible(g_notify_block_btn, reg);
+    g_notify_dmpriv_btn = hit_visible(g_notify_dmpriv_btn, reg);
     for (int i = 0; i < 4; i++) g_sched_mode_hit[i] = hit_visible(g_sched_mode_hit[i], reg);
     g_sched_default_hit = hit_visible(g_sched_default_hit, reg);
     g_receipts_hit = hit_visible(g_receipts_hit, reg);
@@ -9180,7 +9943,7 @@ static void nav_conversation(oc_win *hwnd, int delta, int unread_only) {
 enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
        ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_PTT, ACC_FREETALK, ACC_QUIT, ACC_CALL_MUTE, ACC_CALL_SHARE,
-       ACC_MARK_ALL_READ, ACC_TOAST_ACTION, ACC_HIST_BACK, ACC_HIST_FWD, ACC_PREVIEW };
+       ACC_MARK_ALL_READ, ACC_TOAST_ACTION, ACC_HIST_BACK, ACC_HIST_FWD, ACC_PREVIEW, ACC_JUMP_DATE };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -9229,6 +9992,7 @@ static const struct {
      * pointer (REQ-290); plain Esc dismisses the newest toast. */
     { AM_CTRL | AM_SHIFT, 'Z',        ACC_TOAST_ACTION, "Ctrl+Shift+Z", "Do what the newest notice offers (Undo)" },
     { AM_CTRL | AM_SHIFT, 'P',        ACC_PREVIEW, "Ctrl+Shift+P",     "Preview the message you are writing, or go back to editing it" },
+    { AM_CTRL | AM_SHIFT, 'J',        ACC_JUMP_DATE, "Ctrl+Shift+J",   "Jump to a date in this conversation" },
     /* Ctrl and a digit, as the reference client binds it: the digit is the
      * workspace's place in the rail, counting from 1. Handled in the dispatcher
      * below rather than as nine rows, so this one is the documentation. */
@@ -9268,9 +10032,19 @@ static void menu_run_kind(oc_win *hwnd, int kind, int cmd);  /* fwd — a menu i
 static int  transcript_shell(void);             /* fwd — is the chat shell on screen */
 static void kb_row_move(oc_win *hwnd, int d);      /* fwd — Ctrl+Up / Ctrl+Down */
 static void kb_context_menu(oc_win *hwnd);         /* fwd — Shift+F10 / the Menu key */
+static void jump_menu_open(oc_win *hwnd, uint64_t cid, uint64_t parent, float x, float y);   /* fwd */
 static void accel_run(oc_win *hwnd, int action) {
     switch (action) {
     case ACC_QUIT:    app_quit(hwnd);     break;
+    case ACC_JUMP_DATE:
+        if (main_is_conversation() && g_view != VIEW_NEWMSG && g_sel) {
+            /* In the thread when one is open: its pane is where you are reading. */
+            const oc_model *jm = model();
+            int in_thr = jm && jm->thread_open && jm->thread_channel == g_sel;
+            irect rc; client_rect(hwnd, &rc);
+            jump_menu_open(hwnd, g_sel, in_thr ? jm->thread_parent : 0, DIPF(rc.right) / 2 - 110, 96);
+        }
+        break;
     case ACC_PALETTE: palette_open(hwnd); break;
     case ACC_TOAST_ACTION:
         for (int i = g_fb.n - 1; i >= 0; i--)
@@ -9564,7 +10338,75 @@ static void about_text(const oc_model *m, char *out, size_t cap) {
              OC_BUILD_ID, oc_plat_name(), about_server(m), (unsigned)OC_PROTOCOL_VERSION);
 }
 
+static void signin_open_url(const char *url);   /* fwd: every URL the client opens */
+
+/* What's new: the notes, and what each item links to, drawn this frame. */
+static oc_releasenotes g_wn;
+static struct { rectf r; char url[OC_RN_URL]; } g_wn_links[64];
+static int g_n_wn_links;
+
+static void whatsnew_draw(gfx *rt, rectf reg) {
+    g_n_wn_links = 0;
+    float x = reg.left + 24, w = reg.right - reg.left - 48, y = reg.top + 8;
+    if (g_wn_state == WN_LOADING) {
+        draw_text(rt, "Loading…", g_ui, rf(x, y, x + w, y + UIS(28)), OC_COL_MUTED);
+        return;
+    }
+    if (g_wn_state == WN_NOTRELEASE || g_wn_state == WN_FAILED) {
+        draw_text(rt, g_wn_state == WN_NOTRELEASE ? "This build is not a release." : "Could not load the release notes.",
+                  g_ui, rf(x, y, x + w, y + UIS(28)), OC_COL_TEXT);
+        y += UIS(32);
+        const char *lk = g_wn_state == WN_NOTRELEASE ? "See every release on openchime.io" : "Open them on openchime.io";
+        rectf lr = rf(x, y, x + text_width(lk, g_ui) + 4, y + UIS(26));
+        draw_text(rt, lk, g_ui, lr, OC_COL_ACCENT);
+        fill(rt, rf(lr.left, lr.bottom - 4, lr.right - 4, lr.bottom - 3), OC_COL_ACCENT);
+        snprintf(g_wn_links[0].url, sizeof g_wn_links[0].url, "%s",
+                 g_wn_state == WN_NOTRELEASE ? OC_RN_INDEX_URL : "");
+        if (g_wn_state == WN_FAILED)
+            snprintf(g_wn_links[0].url, sizeof g_wn_links[0].url, "%s%s", OC_RN_PAGE_URL, OC_BUILD_ID);
+        g_wn_links[0].r = lr;
+        g_n_wn_links = 1;
+        return;
+    }
+    char head[96];
+    snprintf(head, sizeof head, "What's new in release %d", g_wn.release);
+    draw_text(rt, head, g_ui_b, rf(x, y, x + w, y + UIS(28)), OC_COL_TEXT);
+    y += UIS(26);
+    if (g_wn.date[0]) { draw_text(rt, g_wn.date, g_meta, rf(x, y, x + w, y + UIS(22)), OC_COL_MUTED); y += UIS(26); }
+    for (int s = 0; s < g_wn.n_sections && y < reg.bottom; s++) {
+        y += UIS(6);
+        draw_text(rt, g_wn.sections[s].title, g_ui_b, rf(x, y, x + w, y + UIS(26)), OC_COL_TEXT);
+        y += UIS(26);
+        for (int k = 0; k < g_wn.sections[s].n_items && y < reg.bottom; k++) {
+            const oc_rn_item *it = &g_wn.sections[s].items[k];
+            float th = text_height(it->title, g_ui, w - UIS(18));
+            if (th < UIS(22)) th = UIS(22);
+            draw_text(rt, "•", g_ui, rf(x, y, x + UIS(14), y + UIS(22)), OC_COL_MUTED);
+            rectf tr = rf(x + UIS(18), y, x + w, y + th);
+            /* An item with a link opens it in the browser. */
+            draw_text(rt, it->title, g_ui, tr, it->url[0] ? OC_COL_ACCENT : OC_COL_TEXT);
+            if (it->url[0] && g_n_wn_links < (int)(sizeof g_wn_links / sizeof g_wn_links[0])) {
+                g_wn_links[g_n_wn_links].r = tr;
+                snprintf(g_wn_links[g_n_wn_links].url, sizeof g_wn_links[0].url, "%s", it->url);
+                g_n_wn_links++;
+            }
+            y += th + UIS(4);
+        }
+    }
+}
+
+/* Once a tick: the fetch's answer, when it has come. */
+static void whatsnew_tick(void) {
+    if (g_wn_state != WN_LOADING) return;
+    int rc = oc_plat_releasenotes_poll(&g_wn);
+    if (rc < 0) return;
+    g_wn_state = rc == OC_RN_OK ? WN_SHOWN : rc == OC_RN_NOT_RELEASE ? WN_NOTRELEASE : WN_FAILED;
+    invalidate();
+}
+
 static void draw_about_app(gfx *rt, rectf reg) {
+    if (g_whatsnew) { whatsnew_draw(rt, reg); return; }
+    g_n_wn_links = 0;
     const oc_model *m = model();
     char client[64], proto[16];
     snprintf(client, sizeof client, "%s (%s)", OC_BUILD_ID,
@@ -10763,6 +11605,7 @@ static void draw_prefs(gfx *rt, rectf reg) {
  * which does not fit 300px and would fit less as REQ-240/241 add fields. */
 static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
     g_n_selfcard_btn = 0;
+    g_n_prof_link = 0;
     const char *nm = oc_model_user_name(m, g_profile_uid);
     if (!nm || !nm[0]) nm = "user";
     float cx = (reg.left + reg.right) / 2, y = reg.top + 18;
@@ -10798,8 +11641,32 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
         draw_text(rt, "Message", g_ui, g_prof_dm_btn, 0xFFFFFF);
         g_ui->align = ST_ALIGN_LEFT;
         y += 40;
+        /* Mute them, for me alone; the button says which way it goes. */
+        if (!oc_model_is_workspace_sender(m, g_profile_uid)) {
+            g_prof_mute_btn = rf(reg.left + 24, y, reg.right - 24, y + 30);
+            fill_round(rt, g_prof_mute_btn, OC_R_CONTROL, OC_COL_INPUT);
+            stroke_round(rt, g_prof_mute_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+            g_ui->align = ST_ALIGN_CENTER;
+            draw_text(rt, oc_model_is_muted_user(m, g_profile_uid) ? "Unmute" : "Mute", g_ui, g_prof_mute_btn,
+                      OC_COL_TEXT);
+            g_ui->align = ST_ALIGN_LEFT;
+            y += 38;
+        } else g_prof_mute_btn = rf(0, 0, 0, 0);
+        /* Block them, for me alone; the button says which way it goes. */
+        if (!oc_model_is_workspace_sender(m, g_profile_uid)) {
+            g_prof_block_btn = rf(reg.left + 24, y, reg.right - 24, y + 30);
+            fill_round(rt, g_prof_block_btn, OC_R_CONTROL, OC_COL_INPUT);
+            stroke_round(rt, g_prof_block_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+            g_ui->align = ST_ALIGN_CENTER;
+            draw_text(rt, oc_model_is_blocked(m, g_profile_uid) ? "Unblock" : "Block", g_ui, g_prof_block_btn,
+                      OC_COL_TEXT);
+            g_ui->align = ST_ALIGN_LEFT;
+            y += 38;
+        } else g_prof_block_btn = rf(0, 0, 0, 0);
     } else {
         g_prof_dm_btn = rf(0, 0, 0, 0);
+        g_prof_mute_btn = rf(0, 0, 0, 0);
+        g_prof_block_btn = rf(0, 0, 0, 0);
         /* Your own card is where the profile-shaped ACTIONS live — the popover
          * points here with "Profile", and photo/name/password/sessions moved
          * off its top level. Two labelled groups of stacked bordered buttons,
@@ -10850,6 +11717,19 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
         for (size_t i = 0; i < m->n_users; i++)
             if (m->users[i].user_id == g_profile_uid) { pm = &m->users[i]; break; }
         int any = 0;
+        /* Out of office (REQ-122): its end, then the message, above the status. */
+        if (pm && oc_model_ooo_active(m, pm->user_id, wall_ms())) {
+            char oo[96];
+            oc_model_ooo_label(pm, oo, sizeof oo);
+            draw_text(rt, oo, g_ui_b, rf(reg.left + 16, y + 4, reg.right - 16, y + 26), OC_COL_TEXT);
+            y += 26; any = 1;
+            if (pm->ooo_message[0]) {
+                float mh = text_height(pm->ooo_message, g_meta_w, reg.right - reg.left - 32);
+                draw_text(rt, pm->ooo_message, g_meta_w, rf(reg.left + 16, y + 2, reg.right - 16, y + 2 + mh),
+                          OC_COL_MUTED);
+                y += mh + 8;
+            }
+        }
         if (pm && pm->status_text[0]) {
             char st[128];
             snprintf(st, sizeof st, "%s%s%s", pm->status_emoji,
@@ -10866,6 +11746,24 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
             draw_text(rt, pm->timezone, g_meta, rf(reg.left + 16, y + 4, reg.right - 16, y + 26),
                       OC_COL_FAINT);
             y += 24; any = 1;
+        }
+        /* The workspace's own fields, in its order: a label, then what they
+         * gave it. A link shows its real address (MARKDOWN.md), never a name. */
+        for (uint8_t k = 0; k < m->n_pfields; k++) {
+            const char *v = oc_model_profile_value(m, g_profile_uid, m->pfields[k].id);
+            if (!v[0]) continue;
+            draw_text(rt, m->pfields[k].label, g_meta, rf(reg.left + 16, y + 4, reg.right - 16, y + 22),
+                      OC_COL_FAINT);
+            float vh = text_height(v, g_meta_w, reg.right - reg.left - 32);
+            rectf vr = rf(reg.left + 16, y + 22, reg.right - 16, y + 22 + vh);
+            int link = m->pfields[k].kind == OC_PROFILE_FIELD_LINK;
+            draw_text(rt, v, g_meta_w, vr, link ? OC_COL_ACCENT : OC_COL_TEXT);
+            if (link && g_n_prof_link < (int)OC_MAX_PROFILE_FIELDS) {
+                g_prof_link[g_n_prof_link].r = vr;
+                g_prof_link[g_n_prof_link].field_id = m->pfields[k].id;
+                g_n_prof_link++;
+            }
+            y += 26 + vh; any = 1;
         }
         if (!any) {
             draw_text(rt, "No title, timezone or status set.", g_meta_w,
@@ -10892,6 +11790,26 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
  * (g_chips), so a chip here and a chip on the message run one rule. */
 static struct { rectf r; char emoji[40]; int count; uint8_t mine; } g_rxn_chip[24];
 static int g_n_rxn_chip;
+/* A muted person's reactions (SET_USER_MUTE): each row folded to "Reaction from a
+ * muted person" with its own Show, revealed one at a time and remembered for
+ * as long as the client runs. The Show buttons drawn this frame. */
+static struct { uint64_t mid, uid; char emoji[40]; } g_rx_shown[64];
+static int g_n_rx_shown;
+static struct { rectf r; uint64_t mid, uid; char emoji[40]; } g_rx_show_hits[16];
+static int g_n_rx_show_hits;
+static int rx_revealed(uint64_t mid, uint64_t uid, const char *emoji) {
+    for (int i = 0; i < g_n_rx_shown; i++)
+        if (g_rx_shown[i].mid == mid && g_rx_shown[i].uid == uid && !strcmp(g_rx_shown[i].emoji, emoji)) return 1;
+    return 0;
+}
+static void rx_reveal(int hit) {
+    if (hit < 0 || hit >= g_n_rx_show_hits) return;
+    int k = g_n_rx_shown < (int)(sizeof g_rx_shown / sizeof g_rx_shown[0]) ? g_n_rx_shown++
+                                                                          : (int)(sizeof g_rx_shown / sizeof g_rx_shown[0]) - 1;
+    g_rx_shown[k].mid = g_rx_show_hits[hit].mid;
+    g_rx_shown[k].uid = g_rx_show_hits[hit].uid;
+    snprintf(g_rx_shown[k].emoji, sizeof g_rx_shown[k].emoji, "%s", g_rx_show_hits[hit].emoji);
+}
 
 /* Who reacted (REQ-071) — a list of PEOPLE, so it belongs in the context pane
  * beside the conversation rather than replacing it. Above them, one chip per
@@ -10901,6 +11819,7 @@ static uint64_t msg_channel_of(uint64_t mid);   /* fwd */
 
 static void draw_reactors_list(gfx *rt, const oc_model *m, rectf reg) {
     g_n_rxn_chip = 0;
+    g_n_rx_show_hits = 0;
     /* The chips are the message's, as the client knows it now: the list below
      * is a snapshot the daemon sent, which a reaction made since -- this
      * client's own included -- does not update, while the message's own
@@ -10928,8 +11847,10 @@ static void draw_reactors_list(gfx *rt, const oc_model *m, rectf reg) {
                 count = (int)rmsg->reactions[i].count;
                 mine = reaction_is_mine(rmsg, e);
             } else {
+                /* A muted person's reactions are no part of the count, as the
+                 * daemon leaves them out of the message's own chips (SET_USER_MUTE). */
                 for (size_t j = 0; j < m->n_reactors; j++)
-                    if (!strcmp(m->reactors[j].emoji, e)) {
+                    if (!strcmp(m->reactors[j].emoji, e) && !oc_model_is_muted_user(m, m->reactors[j].user_id)) {
                         count++;
                         if (m->reactors[j].user_id == m->user_id) mine = 1;
                     }
@@ -10966,9 +11887,34 @@ static void draw_reactors_list(gfx *rt, const oc_model *m, rectf reg) {
     for (size_t i = 0; i < m->n_reactors && y < reg.bottom; i++) {
         const oc_reactor_row *rr = &m->reactors[i];
         draw_emoji_fmt(rt, rr->emoji, rf(reg.left + 14, y, reg.left + 38, y + ROW_H), g_emoji_s);
-        const char *nm = oc_model_user_name(m, rr->user_id);
+        /* A person this reader muted: folded, as their messages are, until
+         * this one reaction is shown (SET_USER_MUTE). */
+        int folded = oc_model_is_muted_user(m, rr->user_id) &&
+                     !rx_revealed(m->reactlist_message, rr->user_id, rr->emoji);
+        const char *nm = folded ? "Reaction from a muted person" : oc_model_user_name(m, rr->user_id);
+        float right = reg.right - 12;
+        if (folded) {
+            const char *sl = "Show";
+            float bw = text_width(sl, g_meta) + 16;
+            rectf b = rf(reg.right - 12 - bw, y + 4, reg.right - 12, y + ROW_H - 4);
+            int hot = in_rect(b, g_mouse_x, g_mouse_y);
+            fill_round(rt, b, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+            stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+            int oa = g_meta->align;
+            g_meta->align = ST_ALIGN_CENTER;
+            draw_text(rt, sl, g_meta, b, OC_COL_TEXT);
+            g_meta->align = oa;
+            if (g_n_rx_show_hits < (int)(sizeof g_rx_show_hits / sizeof g_rx_show_hits[0])) {
+                g_rx_show_hits[g_n_rx_show_hits].r = b;
+                g_rx_show_hits[g_n_rx_show_hits].mid = m->reactlist_message;
+                g_rx_show_hits[g_n_rx_show_hits].uid = rr->user_id;
+                snprintf(g_rx_show_hits[g_n_rx_show_hits].emoji, sizeof g_rx_show_hits[0].emoji, "%s", rr->emoji);
+                g_n_rx_show_hits++;
+            }
+            right = b.left - 8;
+        }
         draw_text(rt, (nm && nm[0]) ? nm : "user", g_ui,
-                  rf(reg.left + 44, y, reg.right - 12, y + ROW_H), OC_COL_TEXT);
+                  rf(reg.left + 44, y, right, y + ROW_H), folded ? OC_COL_FAINT : OC_COL_TEXT);
         y += ROW_H;
     }
 }
@@ -11017,6 +11963,61 @@ static void draw_voters_list(gfx *rt, const oc_model *m, rectf reg) {
 }
 
 static void sw_book_load(void);       /* fwd */
+static int  tgt_ci_has(const char *s, const char *needle);   /* fwd */
+
+/* Whether g_sw[i] has a connection open on this device. */
+static int sw_live(int i) {
+    int slot = ws_find(g_sw[i].ws);
+    return slot >= 0 && g_wss[slot].client != NULL;
+}
+
+/* Signed in first, then the most recently used, then by name. */
+static int swv_cmp(const void *a, const void *b) {
+    int i = *(const int *)a, j = *(const int *)b;
+    int li = sw_live(i), lj = sw_live(j);
+    if (li != lj) return lj - li;
+    if (g_sw[i].last_used != g_sw[j].last_used) return g_sw[i].last_used < g_sw[j].last_used ? 1 : -1;
+    return strcmp(g_sw[i].label, g_sw[j].label);
+}
+
+/* The dialog's rows from the book as last read: those whose name or address
+ * holds the filter's text, ignoring case, in swv_cmp's order. */
+static void wsmgr_view(void) {
+    const char *q = g_wsm_q ? g_wsm_q->buf : "";
+    g_n_swv = 0;
+    if (g_cap_swv < g_n_sw) {
+        int *v = realloc(g_swv, (size_t)g_n_sw * sizeof *v);
+        if (!v) return;
+        g_swv = v; g_cap_swv = g_n_sw;
+    }
+    for (int i = 0; i < g_n_sw; i++)
+        if (tgt_ci_has(g_sw[i].label, q) || tgt_ci_has(g_sw[i].ws, q)) g_swv[g_n_swv++] = i;
+    qsort(g_swv, (size_t)g_n_swv, sizeof *g_swv, swv_cmp);
+}
+
+/* The row of g_sw[i] in the dialog's view, or -1 when the filter hides it. */
+static int wsmgr_row_of(int i) {
+    for (int v = 0; v < g_n_swv; v++) if (g_swv[v] == i) return v;
+    return -1;
+}
+
+/* Where g_sw[i] is reached: its host and port. The port is the connection's
+ * when one is open, else the one its address names, else the default the
+ * client dials first. */
+static void sw_addr(int i, char *out, size_t cap) {
+    const char *ws = g_sw[i].ws;
+    const char *colon = strrchr(ws, ':'), *br = strrchr(ws, ']');
+    int has_port = colon && (!br || colon > br) && colon[1];
+    int slot = ws_find(ws);
+    if (slot >= 0 && g_wss[slot].client && g_wss[slot].port > 0) {
+        int n = has_port ? (int)(colon - ws) : (int)strlen(ws);
+        snprintf(out, cap, "%.*s:%d", n, ws, g_wss[slot].port);
+    } else if (has_port) {
+        snprintf(out, cap, "%s", ws);
+    } else {
+        snprintf(out, cap, "%s:%d", ws, OC_DEFAULT_PORT);
+    }
+}
 
 static void draw_wsmgr(gfx *rt, rectf reg) {
     rectf body = reg;   /* the frame drew the title bar (modal_frame) */
@@ -11029,10 +12030,16 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
      * belongs to this list until another one claims it -- a confirmation does
      * not, which is what keeps the position across Remove. It starts under the
      * header: the frame's subtitle is the dialog's only header. */
+    /* The filter box heads the list, and does not scroll with it. */
+    g_wsm_qbox = rf(body.left + UIS(20), body.top + UIS(8), body.right - UIS(20), body.top + UIS(8) + SEARCH_BOX_H);
+    search_box_draw(rt, g_wsm_qbox, OC_COL_INPUT);
+    if (g_wsm_q) field_draw(rt, g_wsm_q, search_text_box(g_wsm_qbox), OC_COL_TEXT);
+    wsmgr_view();
     rectf list = body;
+    list.top = g_wsm_qbox.bottom + UIS(6);
     if (list.bottom < list.top) list.bottom = list.top;
     g_wsmgr_list = list;
-    if (g_wsmgr_focus >= g_n_sw) g_wsmgr_focus = g_n_sw - 1;
+    if (g_wsmgr_focus >= g_n_swv) g_wsmgr_focus = g_n_swv - 1;
     ovl_use(OVL_WSMGR);
     if (g_wsmgr_reveal && g_wsmgr_focus >= 0) {
         float top = 6 + (float)g_wsmgr_focus * rowh, visible = list.bottom - list.top;
@@ -11040,7 +12047,7 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
         if (top + rowh + 6 > g_ovl_scroll + visible) g_ovl_scroll = top + rowh + 6 - visible;
     }
     g_wsmgr_reveal = 0;
-    float y = ovl_begin(rt, list, (float)g_n_sw * rowh + 12);
+    float y = ovl_begin(rt, list, (float)g_n_swv * rowh + 12);
 
     /* A row is laid out from what it holds, not from fixed offsets: the
      * highlight, and the divider under it, span the same width; the two lines
@@ -11050,10 +12057,10 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
     float hl_l = body.left + UIS(8), hl_r = body.right - UIS(12);
     float pad = UIS(12), bh = 32;   /* bh: the footer's button height */
     float l1 = g_ui_b->line_h, l2 = g_meta->line_h;
-    for (int i = 0; i < g_n_sw; i++) {
-        int slot = ws_find(g_sw[i].ws);
-        int live = (slot >= 0 && g_wss[slot].client);
-        if (i == g_wsmgr_focus)
+    for (int v = 0; v < g_n_swv; v++) {
+        int i = g_swv[v];
+        int live = sw_live(i);
+        if (v == g_wsmgr_focus)
             fill_round(rt, rf(hl_l, y + 2, hl_r, y + rowh - 2), OC_R_CONTROL, OC_COL_HOVER);
 
         /* Buttons right-aligned, built right-to-left so widths can vary: the
@@ -11090,8 +12097,9 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
         rectf nrect = rf(tx, ty, nr, ty + l1);
         draw_text(rt, g_sw[i].label, g_ui_b, nrect, OC_COL_TEXT);
         draw_text(rt, state, g_meta, baseline_align(nrect, g_ui_b, g_meta, nr + gap, nr + gap + sw + 1), sc);
-        char sub[320];
-        snprintf(sub, sizeof sub, "%s%s%s", g_sw[i].ws,
+        char sub[400], addr[300];
+        sw_addr(i, addr, sizeof addr);
+        snprintf(sub, sizeof sub, "%s%s%s", addr,
                  g_sw[i].user[0] ? "  \u00b7  " : "", g_sw[i].user);
         draw_text(rt, sub, g_meta, rf(tx, ty + l1, tr, ty + l1 + l2), OC_COL_FAINT);
 
@@ -11099,7 +12107,8 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
         y += rowh;
     }
     ovl_end(rt, list);
-    if (g_n_sw == 0) overlay_empty(rt, body, "No workspaces remembered on this device.");
+    if (g_n_sw == 0) overlay_empty(rt, list, "No workspaces remembered on this device.");
+    else if (g_n_swv == 0) overlay_empty(rt, list, "No remembered workspace matches the filter.");
 }
 
 static void draw_transcript(gfx *rt, const oc_model *m, rectf reg) {
@@ -11218,11 +12227,12 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         snprintf(title, sizeof title, "%s", t2);
     }
 
-    /* Someone typing in this channel? -> a subtitle under the title. */
+    /* Someone typing in this channel's main scroll? -> a subtitle under the
+     * title. Typing in one of its threads shows in that thread's pane. */
     char typing[192] = "";
     if (c) {
         uint64_t who[4];
-        size_t nt = oc_model_typing(m, g_sel, m->user_id, who, 4);
+        size_t nt = oc_model_typing(m, g_sel, 0, m->user_id, who, 4);
         if (nt == 1) {
             const char *n1 = oc_model_user_name(m, who[0]);
             snprintf(typing, sizeof typing, "%s is typing…", (n1 && n1[0]) ? n1 : "someone");
@@ -11237,6 +12247,18 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
     /* The topic sits on the header's second line, where Slack puts it — and it
      * yields to a typing indicator, which is transient and more urgent. */
     const char *topic = (c && c->topic && c->topic[0]) ? c->topic : NULL;
+    /* A DM with someone out of office (REQ-122) says so where the topic goes. */
+    char oo_sub[400];
+    if (c && c->kind == OC_CHANNEL_KIND_DM && c->peer_id && c->peer_id != m->user_id) {
+        const oc_member *om = oc_model_ooo_active(m, c->peer_id, wall_ms());
+        if (om) {
+            char ol[96];
+            oc_model_ooo_label(om, ol, sizeof ol);
+            snprintf(oo_sub, sizeof oo_sub, "%s%s%s", ol, om->ooo_message[0] ? " \xE2\x80\x94 " : "",
+                     om->ooo_message);
+            topic = oo_sub;
+        }
+    }
     if (c && c->archived) {
         char t2[200];
         snprintf(t2, sizeof t2, "%s  \u00B7  archived", title);
@@ -11564,6 +12586,7 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Notifications",           71 },
     { "Keyboard shortcuts",      72 },
     { "About OpenChime",         89 },
+    { "What's new",              ABOUT_CMD_WHATSNEW },
     { "Mark all as read",        73 },
     { "Edit profile",            53 },
     { "Change password",         31 },
@@ -11588,6 +12611,8 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Manage custom emoji",     94 },
     { "Summarize this conversation", 88 },
     { "Create a poll",           90 },
+    { "Create a snippet",        96 },
+    { "Create a to-do list",     97 },
     { "Toggle unreads only in the sidebar", 85 },
     { "Reconnect now",           2  },
     { "Add a workspace",         80 },
@@ -11631,7 +12656,8 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
      * a channel" under the selection — and choosing an action mid-forward can only
      * cancel it. A list whose top item undoes the thing you started is worse than a
      * shorter list. */
-    for (size_t i = 0; !g_fwd_mid && i < sizeof PALETTE / sizeof PALETTE[0] && nh < 12; i++)
+    int picking = g_fwd_mid || g_move_mid;
+    for (size_t i = 0; !picking && i < sizeof PALETTE / sizeof PALETTE[0] && nh < 12; i++)
         if (PALETTE[i].cmd == 88 && !(m && g_sel && oc_model_summarize_available(m))) continue;   /* REQ-313 */
         else if (PALETTE[i].cmd == 90 && !poll_offered(m)) continue;   /* REQ-225 */
         else if (pal_match(PALETTE[i].label, q)) {
@@ -11640,9 +12666,14 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
         }
     static char names[12][96];
     if (m) for (size_t i = 0; i < m->n_channels && nh < 12; i++) {
+        /* A move goes to another channel: never a direct conversation, never
+         * where it already is, never an archived one (REQ-053). */
+        if (g_move_mid && (m->channels[i].kind == OC_CHANNEL_KIND_DM || m->channels[i].archived ||
+                           m->channels[i].channel_id == g_move_cid)) continue;
         channel_label(m, &m->channels[i], names[nh], sizeof names[nh]);
         if (!pal_match(names[nh], q)) continue;
-        hit[nh].label = names[nh]; hit[nh].kind = g_fwd_mid ? "Forward to" : "Go to";
+        hit[nh].label = names[nh];
+        hit[nh].kind = g_move_mid ? "Move to" : g_fwd_mid ? "Forward to" : "Go to";
         hit[nh].cmd = 0; hit[nh].cid = m->channels[i].channel_id; nh++;
     }
     if (nh > (int)maxrows) nh = (int)maxrows;
@@ -11651,7 +12682,7 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
 
     /* The mode label needs its own band, or it collides with the first row — which
      * it did. Panel height and row origin both account for it. */
-    float hint_h = g_fwd_mid ? 18.0f : 0.0f;
+    float hint_h = picking ? 18.0f : 0.0f;
     /* Everything below the search box is measured from its bottom, since the box
      * follows the text scale. */
     float pb = 12 + SEARCH_BOX_H;
@@ -11688,14 +12719,15 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
     if (g_pal_edit) field_draw(rt, g_pal_edit, search_text_box(g_pal_box), OC_COL_TEXT);
     /* Name the mode: the same panel means two things now, and a picker that does
      * not say which is a trap. */
-    if (g_fwd_mid)
-        draw_text(rt, "Forward to", g_meta,
+    if (picking)
+        draw_text(rt, g_move_mid ? "Move to" : "Forward to", g_meta,
                   rf(px + 16, py + pb + 4, px + pw - 12, py + pb + 22), OC_COL_ACCENT);
 
     float y = py + pb + 8 + hint_h;
     if (nh == 0) {
-        draw_text(rt, g_fwd_mid ? "No matching conversation to forward to."
-                                : "No matching action or conversation.", g_ui,
+        draw_text(rt, g_move_mid ? "No matching channel to move it to."
+                      : g_fwd_mid ? "No matching conversation to forward to."
+                                  : "No matching action or conversation.", g_ui,
                   rf(px + 20, y, px + pw - 20, y + rowh), OC_COL_FAINT);
         return;
     }
@@ -12801,6 +13833,9 @@ static int profile_open(uint64_t uid) {
     }
     g_profile_uid = uid;
     rp_push(RP_PROFILE);
+    /* The workspace's own fields ride only the whole profile, so the card asks
+     * for it; the fields appear when it lands. */
+    if (g_client && m && m->n_pfields) oc_client_get_profile(g_client, uid);
     return 1;
 }
 
@@ -13010,11 +14045,15 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
             const oc_member *mu = NULL;
             for (size_t k = 0; k < m->n_users; k++)
                 if (m->users[k].user_id == cm->user_id) { mu = &m->users[k]; break; }
-            if (mu && (mu->status_emoji[0] || mu->status_text[0])) {
+            /* Out of office (REQ-122) comes first: it says who will not answer. */
+            char oo[96] = "";
+            if (mu && oc_model_ooo_active(m, mu->user_id, wall_ms())) oc_model_ooo_label(mu, oo, sizeof oo);
+            if (mu && (mu->status_emoji[0] || mu->status_text[0] || oo[0])) {
                 float sx = x0 + 34 + text_width(disp, g_ui) + 8;
                 if (cm->role >= OC_ROLE_ADMIN) sx += 18;
-                char st[112];
-                snprintf(st, sizeof st, "%s%s%s", mu->status_emoji,
+                char st[220];
+                snprintf(st, sizeof st, "%s%s%s%s%s", oo, oo[0] && (mu->status_emoji[0] || mu->status_text[0]) ? " \xC2\xB7 " : "",
+                         mu->status_emoji,
                          mu->status_emoji[0] && mu->status_text[0] ? " " : "",
                          mu->status_text);
                 if (sx + 20 < W - 14)
@@ -14160,6 +15199,28 @@ static void draw_tip_below(gfx *rt, rectf b, const char *name, float lim0, float
     draw_text(rt, name, g_meta, rf(tip.left + 12, tip.top, tip.right, tip.bottom), 0xFFFFFF);
 }
 
+/* What the header's phone does here, as its tooltip and its published name. */
+static const char *call_hdr_words(const oc_model *m) {
+    if (m && g_sel && call_here(m) && m->call.channel_id == g_sel) return "Open the call";
+    return m && g_sel && oc_model_call_in(m, g_sel) ? "Join the call" : "Start a call";
+}
+
+/* Mute's tooltip, in the call view and on the sidebar's strip: the state you are
+ * in, not the action (a button reading "Mute" while you are muted says nothing
+ * about which you are), and its key. */
+static const char *call_mute_words(void) {
+    return g_call_engine && oc_call_engine_muted(g_call_engine) ? "You are currently muted"
+                                                                 : "You are currently not muted";
+}
+static void call_tips_draw(gfx *rt, const oc_model *m, float W) {
+    if (pointer_blocked()) return;
+    rectf b = in_rect(g_call_mute_btn, g_mouse_x, g_mouse_y) ? g_call_mute_btn
+            : in_rect(g_cstrip_mute, g_mouse_x, g_mouse_y) ? g_cstrip_mute : rf(0, 0, 0, 0);
+    if (b.right > b.left) { draw_tip(rt, b, call_mute_words(), "Ctrl+Shift+M", 0, W); return; }
+    if (in_rect(g_call_hdr_btn, g_mouse_x, g_mouse_y))
+        draw_tip_below(rt, g_call_hdr_btn, call_hdr_words(m), 0, W);
+}
+
 /* The action row's tooltip, if the pointer has rested on one of `first`..`last`. */
 static void draw_act_tip(gfx *rt, int first, int last, float lim0, float lim1) {
     if (g_act_hover < first || g_act_hover > last) return;
@@ -14699,9 +15760,44 @@ static void ftray_draw(gfx *rt, float bx0, float by0, float bx1) {
     }
 }
 
+/* Out of office (REQ-122), said at the composer before sending: the other
+ * person of the DM, or someone the text mentions, is away. Worked out again
+ * when the text or the conversation changes, and each second, so the note
+ * goes when the absence ends with nothing sent. Under any hint, which says
+ * something more pressing. */
+static char     g_ooo_note[420];
+static int      g_ooo_note_dirty = 1;
+static uint64_t g_ooo_note_sel, g_ooo_note_at;
+static const oc_member *tgt_ooo_member(const oc_model *m, uint64_t now);   /* fwd: the new message's people */
+static void ooo_note_refresh(void) {
+    uint64_t now = (uint64_t)time(NULL) * 1000u;
+    if (!g_ooo_note_dirty && g_ooo_note_sel == g_sel && now - g_ooo_note_at < 1000) return;
+    g_ooo_note_dirty = 0; g_ooo_note_sel = g_sel; g_ooo_note_at = now;
+    g_ooo_note[0] = '\0';
+    const oc_model *m = model();
+    if (!m) return;
+    int newmsg = g_view == VIEW_NEWMSG;
+    if (!newmsg && !g_sel) return;
+    char *draft = ed_md_all();
+    /* A new message: whoever it is to, from its chips, before anyone it
+     * mentions; a conversation: its other person, or someone mentioned. */
+    const oc_member *u = newmsg ? tgt_ooo_member(m, now) : NULL;
+    if (!u) u = oc_model_ooo_for_compose(m, newmsg ? 0 : g_sel, draft ? draft : "", now);
+    free(draft);
+    if (!u) return;
+    char lbl[96];
+    oc_model_ooo_label(u, lbl, sizeof lbl);
+    const char *until = strstr(lbl, "until ");
+    snprintf(g_ooo_note, sizeof g_ooo_note, "%s is out of office %s.%s%s",
+             u->label[0] ? u->label : u->name, until ? until : "", u->ooo_message[0] ? " " : "", u->ooo_message);
+}
+
 static void composer_hint_draw(gfx *rt) {
-    if (!g_cmp_hint[0] || g_cmp_hint_anchor.right <= g_cmp_hint_anchor.left) return;
-    float th = text_height(g_cmp_hint, g_meta_w, g_cmp_hint_anchor.right - g_cmp_hint_anchor.left - UIS(40.0f));
+    if (g_cmp_hint_anchor.right <= g_cmp_hint_anchor.left) return;
+    if (!g_cmp_hint[0]) ooo_note_refresh();
+    const char *say = g_cmp_hint[0] ? g_cmp_hint : g_ooo_note;
+    if (!say[0]) return;
+    float th = text_height(say, g_meta_w, g_cmp_hint_anchor.right - g_cmp_hint_anchor.left - UIS(40.0f));
     rectf r = g_cmp_hint_below
             ? rf(g_cmp_hint_anchor.left, g_cmp_hint_anchor.bottom + UIS(6.0f), g_cmp_hint_anchor.right,
                  g_cmp_hint_anchor.bottom + th + UIS(16.0f))
@@ -14713,8 +15809,8 @@ static void composer_hint_draw(gfx *rt) {
     draw_lucide(rt, g_cmp_hint_err ? OC_ICON_ALERT : OC_ICON_INFO,
                 rf(r.left + UIS(10.0f), r.top + (r.bottom - r.top - UIS(16.0f)) / 2, r.left + UIS(26.0f),
                    r.top + (r.bottom - r.top + UIS(16.0f)) / 2), col);
-    draw_text(rt, g_cmp_hint, g_meta_w, rf(r.left + UIS(34.0f), r.top + UIS(5.0f), r.right - UIS(8.0f),
-                                           r.bottom - UIS(5.0f)), OC_COL_TEXT);
+    draw_text(rt, say, g_meta_w, rf(r.left + UIS(34.0f), r.top + UIS(5.0f), r.right - UIS(8.0f),
+                                    r.bottom - UIS(5.0f)), OC_COL_TEXT);
 }
 
 /* A press on a chip's × . Returns 1 if it took the click. */
@@ -14986,7 +16082,8 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
 static int modal_open(void) {
     return g_prefs_open || g_keys_open || g_about_open || g_wsmgr_open || g_notify_open ||
            g_browse_open || g_confirm_open || g_sessions_open || g_form_open ||
-           g_status_open || g_sch_open || g_sr_open || g_pc_open || g_te_open;
+           g_status_open || g_sch_open || g_sr_open || g_jc_open || g_pc_open || g_te_open || g_sv_open ||
+           g_wsu_open;
 }
 
 static rectf g_modal_card;
@@ -15024,18 +16121,35 @@ static void confirm_open(oc_win *hwnd, int act, uint64_t id, const char *title,
 }
 
 static void link_open(const char *url);   /* fwd */
+static void move_send(uint64_t mid, uint64_t to);   /* fwd */
 static void cert_trust_run(oc_win *hwnd);    /* fwd */
 static void bc_resume(int path, bc_held h);  /* fwd */
+static void call_start_confirmed(oc_win *hwnd, uint64_t ch);   /* fwd */
 
 static void confirm_run(oc_win *hwnd) {
     (void)hwnd;
     switch (g_confirm_act) {
     case CONF_WEBHOOK_DELETE: oc_client_delete_webhook(g_client, g_confirm_id); break;
+    case CONF_CALL_START: call_start_confirmed(hwnd, g_confirm_id); break;
+    case CONF_CALL_END: {
+        const oc_model *cm = model();
+        if (cm && call_here(cm) && cm->call.channel_id == g_confirm_id) oc_client_call_end(g_client, g_confirm_id);
+        break;
+    }
     case CONF_WEBHOOK_ROTATE: oc_client_rotate_webhook(g_client, g_confirm_id);
                               g_await_webhook = 1; break;
     case CONF_INVITE_REVOKE:  oc_client_revoke_invite(g_client, g_confirm_id); break;
     case CONF_DEACTIVATE_SELF: oc_client_deactivate_self(g_client); break;
     case CONF_EMOJI_DELETE:   oc_client_delete_emoji(g_client, g_confirm_emoji); break;
+    case CONF_MESSAGE_MOVE:   move_send(g_confirm_id, g_move_to); break;
+    case CONF_SNIPPET_PASTE: {         /* REQ-226: the paste, as a snippet */
+        char *t = g_snip_paste; g_snip_paste = NULL;
+        snippet_compose(g_main, t);
+        free(t);
+        break; }
+    case CONF_PFIELD_DELETE:
+        oc_client_set_profile_field(g_client, g_confirm_id, OC_PROFILE_FIELD_DELETE, 0, 0, "");
+        break;
     case CONF_CERT_TRUST: cert_trust_run(g_main); break;
     case CONF_PDM_TRUST:  oc_client_pdm_trust(g_client, g_confirm_id); break;
     case CONF_PDM_SAFETY: break;   /* shown, nothing to do */
@@ -15069,6 +16183,7 @@ static void confirm_run(oc_win *hwnd) {
      * a refactor. */
     case CONF_WS_FORGET: ws_forget_begin(g_confirm_ws); break;
     case CONF_WS_FORGET_ALL: ws_forget_all(); break;
+    case CONF_WS_FORGET_SET: ws_forget_set(); break;
     case CONF_DRAFT_DELETE: draft_delete(g_confirm_id, g_confirm_root); break;
     case CONF_CHANNEL_ARCHIVE: oc_client_update_channel(g_client, g_confirm_id,
                                                         OC_CHUP_ARCHIVE, ""); break;
@@ -15505,10 +16620,32 @@ static void draw_form(gfx *rt, rectf body) {
     g_form_sel_panel = rf(0, 0, 0, 0);
     for (int i = 0; i < FORM_MAX_FIELDS; i++) g_form_sel_box[i] = rf(0, 0, 0, 0);
     if (!g_form_f) return;
-    float y = body.top + 4;
+    /* Rows that do not fit the card scroll (the wheel moves g_form_scroll).
+     * A row is drawn whole or not at all, so a text field is never half
+     * under the edge with its keyboard still in it; and when the keyboard
+     * moves to a row out of sight, the rows move to show it. */
+    for (int i = 0; i < FORM_MAX_FIELDS; i++) g_form_erect[i] = rf(0, 0, 0, 0);
+    float tops[FORM_MAX_FIELDS], total = 4, view = body.bottom - body.top;
+    for (int i = 0; i < g_form_n; i++) { tops[i] = total; total += form_rowh(&g_form_f[i], body.right - body.left); }
+    g_form_scroll_max = total > view ? total - view : 0;
+    {
+        int fk = -1;
+        for (int i = 0; i < g_form_n && fk < 0; i++)
+            if ((g_form_edit[i] && g_focus == g_form_edit[i]) || g_form_focus == i) fk = i;
+        if (fk >= 0 && fk != g_form_scroll_focus) {
+            float rb = (fk + 1 < g_form_n ? tops[fk + 1] : total);
+            if (tops[fk] - 4 < g_form_scroll) g_form_scroll = tops[fk] - 4;
+            else if (rb > g_form_scroll + view) g_form_scroll = rb - view;
+        }
+        g_form_scroll_focus = fk;
+    }
+    if (g_form_scroll > g_form_scroll_max) g_form_scroll = g_form_scroll_max;
+    if (g_form_scroll < 0) g_form_scroll = 0;
+    float y = body.top + 4 - g_form_scroll;
     for (int i = 0; i < g_form_n; i++) {
         const oc_field *f = &g_form_f[i];
         float rh = form_rowh(f, body.right - body.left);
+        if (g_form_scroll_max > 0 && (y < body.top - 0.5f || y + rh > body.bottom + 4.5f)) { y += rh; continue; }
         if (f->kind == FF_CHECK) {
             rectf box = rf(body.left, y + 4, body.left + 20, y + 24);
             int on = atoi(f->value) != 0;
@@ -15629,6 +16766,13 @@ static void draw_form(gfx *rt, rectf body) {
         }
         y += rh;
     }
+    /* Where the rows are, when there are more than fit: a thin bar on the
+     * right edge, as long as the share that shows. */
+    if (g_form_scroll_max > 0) {
+        float th = view * view / total;
+        float ty = body.top + (view - th) * (g_form_scroll / g_form_scroll_max);
+        fill_round(rt, rf(body.right - 3, ty, body.right, ty + th), 1.5f, OC_COL_BORDER);
+    }
 
     /* The open list, drawn after every field so it covers the ones below it
      * rather than being covered by them — the whole reason it is a second pass
@@ -15732,6 +16876,7 @@ static void form_collect(int save) {
 static void draw_browse(gfx *rt, const oc_model *m, rectf body);   /* fwd */
 static void draw_sched_custom(gfx *rt, rectf body);                /* fwd */
 static void draw_sumrange(gfx *rt, rectf body);                    /* fwd */
+static void draw_jumpcal(gfx *rt, rectf body);                     /* fwd */
 static void draw_poll_compose(gfx *rt, rectf body);                /* fwd */
 static void draw_table_editor(gfx *rt, rectf body);                /* fwd */
 static void draw_sessions(gfx *rt, const oc_model *m, rectf body); /* fwd */
@@ -15775,6 +16920,54 @@ static void draw_form_side(gfx *rt, const oc_model *m, rectf col) {
     }
 }
 
+/* Open the viewer on a snippet (REQ-226): its text, lexed once, whole. */
+static void snippet_view_open(oc_win *hwnd, const oc_attachment *at) {
+    if (!at) return;
+    g_sv_aid = at->id;
+    snprintf(g_sv_title, sizeof g_sv_title, "%s", at->title[0] ? at->title : at->filename);
+    snprintf(g_sv_file, sizeof g_sv_file, "%s", at->filename);
+    g_sv_lang = oc_lex_language(at->language);
+    free(g_sv_toks); g_sv_toks = NULL; g_sv_ntoks = 0;
+    snip_want(at->id);
+    modal_enter(hwnd, &g_sv_open);
+    ovl_use(OVL_SNIPPET);
+}
+
+/* The viewer's body: every line, numbered, scrolled with the wheel. */
+static void draw_snippet_view(gfx *rt, rectf body) {
+    size_t len = 0;
+    const char *text = snip_text(g_sv_aid, &len);
+    if (!text) {
+        draw_text(rt, snip_failed(g_sv_aid) ? "This snippet could not be loaded." : "Loading\xE2\x80\xA6",
+                  g_ui, rf(body.left + 16, body.top + 8, body.right - 16, body.top + 32), OC_COL_MUTED);
+        return;
+    }
+    if (!g_sv_toks && len) {
+        size_t cap = len / 2 + 16;
+        g_sv_toks = malloc(cap * sizeof *g_sv_toks);
+        g_sv_ntoks = g_sv_toks ? oc_lex(g_sv_lang, text, len, g_sv_toks, cap) : 0;
+    }
+    int lines = 1;
+    for (size_t i = 0; i < len; i++) if (text[i] == '\n') lines++;
+    float lh = LINE_H;
+    ovl_use(OVL_SNIPPET);
+    float y = ovl_begin(rt, body, (float)lines * lh + 12);
+    int first = (int)((body.top + 6 - y) / lh);
+    if (first < 0) first = 0;
+    int show = (int)((body.bottom - body.top) / lh) + 2;
+    float gutter = text_width("00000", g_code) + UIS(12.0f);
+    for (int l = first; l < first + show && l < lines; l++) {
+        char num[16]; snprintf(num, sizeof num, "%d", l + 1);
+        g_code->align = ST_ALIGN_RIGHT;
+        draw_text(rt, num, g_code, rf(body.left + 8, y + (float)l * lh, body.left + gutter - 8, y + (float)(l + 1) * lh),
+                  OC_COL_FAINT);
+        g_code->align = ST_ALIGN_LEFT;
+    }
+    draw_code_lines(rt, text, len, g_sv_toks, g_sv_ntoks, body.left + gutter, y + (float)first * lh,
+                    body.right - 16, lh, first, show);
+    ovl_end(rt, body);
+}
+
 static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
     if (!modal_open()) {
         g_modal_card = rf(0, 0, 0, 0);
@@ -15812,8 +17005,11 @@ static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
     else if (g_status_open) draw_status_body(rt, body);
     else if (g_sch_open)    draw_sched_custom(rt, body);
     else if (g_sr_open)     draw_sumrange(rt, body);
+    else if (g_jc_open)     draw_jumpcal(rt, body);
+    else if (g_wsu_open)    draw_wsunused(rt, body);
     else if (g_pc_open)     draw_poll_compose(rt, body);
     else if (g_te_open)     draw_table_editor(rt, body);
+    else if (g_sv_open)     draw_snippet_view(rt, body);
     else if (g_form_open && g_form_side.on) {
         /* Two columns: the fields get everything left of the photo column. The
          * column is drawn first, though an open select list is bounded by the
@@ -16445,6 +17641,173 @@ static int sumrange_click(oc_win *hwnd, int x, int y) {
             oc_sumcal_pick(&g_sr_cal, sr_day(g_sr_days[i].y, g_sr_days[i].m, g_sr_days[i].d));
             g_sr_err = NULL;
             sr_fields_show();
+            invalidate();
+            return 1;
+        }
+    return in_rect(g_modal_card, x, y);
+}
+
+/* ---- Jump to date: the day, on a calendar ------------------------------------
+ *
+ * "A date..." in the jump menu: a field that takes a typed date and one month
+ * to pick from, with the arrows to page it. Days after today are faint and take
+ * no click: nothing has been said on them yet. The day opens at the reader's
+ * local midnight; Jump stays grey until a day is picked or typed. Opened over
+ * a thread, the thread stays open under it and the jump is in its replies. */
+static uint64_t  g_jc_cid, g_jc_parent;
+static int       g_jc_vy, g_jc_vm;             /* the month on view: year, 0-11 */
+static int       g_jc_y, g_jc_m, g_jc_d;       /* the day picked; g_jc_d 0 for none */
+static field    *g_jc_edit;
+static rectf     g_jc_erect, g_jc_prev, g_jc_next;
+static calday    g_jc_days[42];
+static int       g_n_jc_days;
+static const char *g_jc_err;
+
+static uint64_t parse_day(const char *s);                               /* fwd */
+static void date_jump(uint64_t cid, uint64_t parent, uint64_t day_ms);  /* fwd */
+
+/* Today's local midnight, and today's month. */
+static uint64_t jc_today(int *y, int *m) {
+    time_t t = time(NULL); struct tm tv;
+    if (!oc_localtime_r(&t, &tv)) return 0;
+    if (y) *y = tv.tm_year + 1900;
+    if (m) *m = tv.tm_mon;
+    return sch_ms(tv.tm_year + 1900, tv.tm_mon, tv.tm_mday, 0);
+}
+
+static int jc_look(int y, int m, int d, int *on, void *ctx) {
+    (void)ctx;
+    uint64_t day = sch_ms(y, m, d, 0);
+    *on = day && day <= jc_today(NULL, NULL);
+    return g_jc_d && y == g_jc_y && m == g_jc_m && d == g_jc_d ? 2 : 0;
+}
+
+/* Pick `day` (a local midnight): the calendar turns to its month. */
+static void jc_pick(uint64_t day) {
+    time_t t = (time_t)(day / 1000); struct tm tv;
+    if (!oc_localtime_r(&t, &tv)) return;
+    g_jc_y = tv.tm_year + 1900; g_jc_m = tv.tm_mon; g_jc_d = tv.tm_mday;
+    g_jc_vy = g_jc_y; g_jc_vm = g_jc_m;
+}
+
+/* The field as typed, taken as the day picked where it is one. What cannot be
+ * read is said when Jump is pressed, not at every key. */
+static void jc_field_read(void) {
+    g_jc_err = NULL;
+    if (!g_jc_edit || !g_jc_edit->buf[0]) { g_jc_d = 0; return; }
+    uint64_t day = parse_day(g_jc_edit->buf);
+    if (!day) { g_jc_d = 0; return; }
+    if (day > jc_today(NULL, NULL)) { g_jc_d = 0; g_jc_err = "That day has not happened yet."; return; }
+    jc_pick(day);
+}
+
+static int jc_key(field *f, int key, int ctrl, int shift) {
+    (void)f; (void)ctrl; (void)shift;
+    if (!modal_open()) return 0;
+    if (key == OCK_RETURN) { jc_field_read(); menu_dispatch(g_main, 311); return 1; }
+    if (key == OCK_ESCAPE) { modal_finish(0); return 1; }
+    return 0;
+}
+static void jc_changed(field *f) { (void)f; jc_field_read(); invalidate(); }
+
+static void jumpcal_open(oc_win *hwnd, uint64_t cid, uint64_t parent) {
+    if (!cid) return;
+    g_jc_cid = cid; g_jc_parent = parent;
+    g_jc_d = 0; g_jc_err = NULL;
+    jc_today(&g_jc_vy, &g_jc_vm);
+    static field fld;
+    if (!g_jc_edit) {
+        field_init(&fld, "Date (ex. 2026-05-03, or 3 May)", 0, 0);
+        fld.key = jc_key; fld.changed = jc_changed;
+        g_jc_edit = &fld;
+    }
+    field_set(g_jc_edit, "");
+    modal_enter(hwnd, &g_jc_open);
+    field_show(g_jc_edit, 1);
+    focus_set(g_jc_edit);
+}
+
+static float jumpcal_body_h(void) {
+    return UIS(2.0f) + SR_LABEL_H + SR_FIELD_H + SR_GAP_H + SR_TITLE_H + UIS(6.0f) + SR_WDAY_H
+         + cal_rows(g_jc_vy, g_jc_vm) * SCH_CELL_H + UIS(12.0f) + SR_LINE_H + UIS(4.0f);
+}
+
+static void draw_jumpcal(gfx *rt, rectf body) {
+    g_n_jc_days = 0;
+    float mw = 7 * SCH_CELL_W, y = body.top + UIS(2.0f);
+    float x0 = body.left + ((body.right - body.left) - mw) / 2;
+    if (x0 < body.left) x0 = body.left;
+    /* The field, as the range card's: its label over it, the text right of the icon. */
+    draw_text(rt, "Date", g_meta, rf(x0 + UIS(2.0f), y, x0 + mw, y + SR_LABEL_H), OC_COL_MUTED);
+    rectf b = rf(x0, y + SR_LABEL_H, x0 + mw, y + SR_LABEL_H + SR_FIELD_H);
+    int focused = g_jc_edit && g_focus == g_jc_edit;
+    fill_round(rt, b, OC_R_CONTROL, OC_COL_INPUT);
+    stroke_round(rt, b, OC_R_CONTROL, focused ? OC_COL_ACCENT : OC_COL_BORDER, focused ? 2.0f : 1.0f);
+    float ih = UIS(16.0f), iy = (b.top + b.bottom) / 2 - ih / 2;
+    draw_lucide(rt, OC_ICON_CALENDAR, rf(b.left + UIS(11.0f), iy, b.left + UIS(11.0f) + ih, iy + ih), OC_COL_MUTED);
+    g_jc_erect = rf(b.left + UIS(34.0f), b.top, b.right, b.bottom);
+    if (g_jc_edit) field_draw(rt, g_jc_edit, rf(g_jc_erect.left + 2, b.top, b.right - 10, b.bottom), OC_COL_TEXT);
+    y += SR_LABEL_H + SR_FIELD_H + SR_GAP_H;
+    /* The month's title between its arrows; no later than this month. */
+    int ty = 0, tmo = 0;
+    jc_today(&ty, &tmo);
+    int can_next = g_jc_vy < ty || (g_jc_vy == ty && g_jc_vm < tmo);
+    char title[40]; snprintf(title, sizeof title, "%s %d", SCH_MONTHS[g_jc_vm], g_jc_vy);
+    int oa = g_ui_b->align;
+    g_ui_b->align = ST_ALIGN_CENTER;
+    draw_text(rt, title, g_ui_b, rf(x0 + SCH_CELL_W, y, x0 + mw - SCH_CELL_W, y + SR_TITLE_H), OC_COL_TEXT);
+    g_ui_b->align = oa;
+    float d = SCH_CELL_H - UIS(4.0f), ay = y + (SR_TITLE_H - d) / 2;
+    g_jc_prev = rf(x0 + UIS(2.0f), ay, x0 + UIS(2.0f) + d, ay + d);
+    g_jc_next = can_next ? rf(x0 + mw - UIS(2.0f) - d, ay, x0 + mw - UIS(2.0f), ay + d) : rf(0, 0, 0, 0);
+    for (int k = 0; k < 2; k++) {
+        rectf ab = k ? rf(x0 + mw - UIS(2.0f) - d, ay, x0 + mw - UIS(2.0f), ay + d) : g_jc_prev;
+        int live = k ? can_next : 1;
+        int hov = live && in_rect(ab, g_mouse_x, g_mouse_y);
+        if (hov) fill_round(rt, ab, d / 2, OC_COL_HOVER);
+        stroke_round(rt, ab, d / 2, OC_COL_BORDER, 1.0f);
+        g_ui_b->align = ST_ALIGN_CENTER;
+        draw_text(rt, k ? "\xE2\x80\xBA" : "\xE2\x80\xB9", g_ui_b, rf(ab.left, ab.top - UIS(1.0f), ab.right, ab.bottom - UIS(1.0f)),
+                  !live ? OC_COL_FAINT : hov ? OC_COL_TEXT : OC_COL_MUTED);
+        g_ui_b->align = oa;
+    }
+    static const char *const INI[7] = { "Su", "Mo", "Tu", "We", "Th", "Fr", "Sa" };
+    cal_month_draw(rt, x0, y + SR_TITLE_H + UIS(6.0f), g_jc_vy, g_jc_vm, INI, jc_look, NULL, g_jc_days, &g_n_jc_days);
+    y += SR_TITLE_H + UIS(6.0f) + SR_WDAY_H + cal_rows(g_jc_vy, g_jc_vm) * SCH_CELL_H + UIS(12.0f);
+    /* What Jump will do, the hint before a day is picked, or what is wrong. */
+    rectf line = rf(body.left + UIS(2.0f), y, body.right - UIS(2.0f), y + SR_LINE_H);
+    if (g_jc_err) draw_text(rt, g_jc_err, g_ui, line, OC_COL_DANGER);
+    else if (!g_jc_d) draw_text(rt, "Pick a day, or type it.", g_meta, line, OC_COL_MUTED);
+    else {
+        time_t t = (time_t)(sch_ms(g_jc_y, g_jc_m, g_jc_d, 0) / 1000); struct tm tv;
+        char l[128];
+        if (oc_localtime_r(&t, &tv))
+            snprintf(l, sizeof l, "Opens at the first %s on %s, %s %d, %d", g_jc_parent ? "reply" : "message",
+                     SCH_WDAYS[tv.tm_wday], SCH_MONTHS[tv.tm_mon], tv.tm_mday, tv.tm_year + 1900);
+        else l[0] = 0;
+        draw_text(rt, l, g_ui, line, OC_COL_TEXT);
+    }
+}
+
+/* A click on the card. Returns 1 for any click inside it. */
+static int jumpcal_click(oc_win *hwnd, int x, int y) {
+    (void)hwnd;
+    if (in_rect(g_jc_prev, x, y)) {
+        if (--g_jc_vm < 0) { g_jc_vm = 11; g_jc_vy--; }
+        invalidate(); return 1;
+    }
+    if (in_rect(g_jc_next, x, y)) {
+        if (++g_jc_vm > 11) { g_jc_vm = 0; g_jc_vy++; }
+        invalidate(); return 1;
+    }
+    if (in_rect(g_jc_erect, x, y) && g_jc_edit) { focus_set(g_jc_edit); return 1; }
+    for (int i = 0; i < g_n_jc_days; i++)
+        if (g_jc_days[i].on && in_rect(g_jc_days[i].r, x, y)) {
+            g_jc_y = g_jc_days[i].y; g_jc_m = g_jc_days[i].m; g_jc_d = g_jc_days[i].d;
+            g_jc_err = NULL;
+            char t[16];
+            snprintf(t, sizeof t, "%04d-%02d-%02d", g_jc_y, g_jc_m + 1, g_jc_d);
+            if (g_jc_edit) field_set(g_jc_edit, t);
             invalidate();
             return 1;
         }
@@ -17258,6 +18621,21 @@ static const oc_modal_spec *modal_current(void) {
         sp.buttons[1] = (oc_mbtn){ "Summarize", MB_PRIMARY, 310 };
         if (oc_sumcal_range(&g_sr_cal, &rs, &re) != 0) g_modal_off_cmd = 310;
         sp.n_buttons = 2;
+    } else if (g_wsu_open) {
+        sp.title = "Remove unused workspaces";
+        sp.size = MODAL_SM;
+        sp.buttons[0] = (oc_mbtn){ "Cancel",   MB_NORMAL,  MODAL_CANCEL };
+        sp.buttons[1] = (oc_mbtn){ "Continue", MB_PRIMARY, WSM_CMD_UNUSED_GO };
+        sp.n_buttons = 2;
+    } else if (g_jc_open) {
+        /* Jump is a COMMAND, as Summarize is, and grey until a day is picked. */
+        sp.title = g_jc_parent ? "Jump to date in this thread" : "Jump to date";
+        sp.size = MODAL_SM;
+        sp.want_h = (MODAL_TITLE_H + jumpcal_body_h() + MODAL_FOOT_H + UIS(16.0f)) / g_text_scale;
+        sp.buttons[0] = (oc_mbtn){ "Cancel", MB_NORMAL,  MODAL_CANCEL };
+        sp.buttons[1] = (oc_mbtn){ "Jump",   MB_PRIMARY, 311 };
+        if (!g_jc_d) g_modal_off_cmd = 311;
+        sp.n_buttons = 2;
     } else if (g_sch_open) {
         /* Schedule is a COMMAND, not MODAL_OK: it validates first, and a time
          * that has passed keeps the card open with the reason, which a plain OK
@@ -17328,6 +18706,7 @@ static const oc_modal_spec *modal_current(void) {
         sp.buttons[0] = (oc_mbtn){ "Cancel",     MB_NORMAL,         MODAL_CANCEL };
         sp.buttons[1] = (oc_mbtn){ g_confirm_ok, MB_DANGER_PRIMARY, MODAL_OK };
         sp.n_buttons = 2;
+        if (g_confirm_act == CONF_WS_FORGET_SET) sp.size = MODAL_LG;   /* it names every one */
         if (g_confirm_act == CONF_PDM_SAFETY) {
             sp.buttons[0] = (oc_mbtn){ "Done", MB_PRIMARY, MODAL_OK };
             sp.n_buttons = 1;
@@ -17384,14 +18763,30 @@ static const oc_modal_spec *modal_current(void) {
         sp.size = MODAL_LG;
         sp.buttons[0] = (oc_mbtn){ "Done", MB_PRIMARY, MODAL_OK };
         sp.n_buttons = 1;
+    } else if (g_about_open && g_whatsnew) {
+        sp.title = "What's new";
+        sp.size = MODAL_LG;
+        sp.buttons[0] = (oc_mbtn){ "Open on openchime.io", MB_NORMAL, WN_CMD_OPEN };
+        sp.buttons[1] = (oc_mbtn){ "Close", MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 2;
+    } else if (g_sv_open) {
+        /* A snippet (REQ-226): its title, the whole text, copy and save. */
+        sp.title = g_sv_title;
+        sp.subtitle = oc_lex_label(g_sv_lang);
+        sp.size = MODAL_LG;
+        sp.buttons[0] = (oc_mbtn){ "Copy",     MB_NORMAL,  SV_CMD_COPY };
+        sp.buttons[1] = (oc_mbtn){ "Download", MB_NORMAL,  SV_CMD_SAVE };
+        sp.buttons[2] = (oc_mbtn){ "Close",    MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 3;
     } else if (g_about_open) {
         sp.title = "About OpenChime";
         sp.size = MODAL_SM;
         sp.want_h = (MODAL_TITLE_H + ABOUT_ROWS * UIS(32.0f) + UIS(16.0f) + MODAL_FOOT_H + UIS(16.0f))
                     / g_text_scale;
         sp.buttons[0] = (oc_mbtn){ "Copy",  MB_NORMAL,  ABOUT_CMD_COPY };
-        sp.buttons[1] = (oc_mbtn){ "Close", MB_PRIMARY, MODAL_OK };
-        sp.n_buttons = 2;
+        sp.buttons[1] = (oc_mbtn){ "What's new", MB_NORMAL, ABOUT_CMD_WHATSNEW };
+        sp.buttons[2] = (oc_mbtn){ "Close", MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 3;
     } else if (g_keys_open) {
         sp.title = "Keyboard shortcuts";
         sp.size = MODAL_LG;
@@ -17403,8 +18798,14 @@ static const oc_modal_spec *modal_current(void) {
         sp.size = MODAL_LG;
         sp.buttons[0] = (oc_mbtn){ "Done", MB_PRIMARY, MODAL_OK };
         sp.n_buttons = 1;
-        if (g_n_sw > 0)   /* danger: the frame puts it on the left, away from Done */
+        if (g_n_sw > 0) {   /* danger: the frame puts it on the left, away from Done */
             sp.buttons[sp.n_buttons++] = (oc_mbtn){ "Remove all", MB_DANGER, WSM_CMD_REMOVE_ALL };
+            sp.buttons[sp.n_buttons++] = (oc_mbtn){ "Remove unused\xE2\x80\xA6", MB_NORMAL, WSM_CMD_UNUSED };
+            /* Grey while it checks: one check at a time. */
+            sp.buttons[sp.n_buttons++] = (oc_mbtn){ wsp_busy() ? "Checking\xE2\x80\xA6" : "Remove unreachable",
+                                                    MB_NORMAL, WSM_CMD_UNREACH };
+            if (wsp_busy()) g_modal_off_cmd = WSM_CMD_UNREACH;
+        }
     }
     return &sp;
 }
@@ -17423,7 +18824,7 @@ static void modal_enter(oc_win *hwnd, int *flag) {
      * with an attempt nobody watched: no browser, an empty Home, and a client
      * still waiting on the browser. */
     int keep_view = (flag == &g_confirm_open) || (flag == &g_sch_open) || (flag == &g_sr_open) ||
-                    (flag == &g_pc_open) ||
+                    (flag == &g_jc_open) || (flag == &g_pc_open) || (flag == &g_wsu_open) ||
                     g_view == VIEW_SIGNIN;
     int prev_view = g_view;
     /* A modal covers the window; it is not about the profile beside it. Edit
@@ -17441,7 +18842,10 @@ static void modal_enter(oc_win *hwnd, int *flag) {
      * comes back under it: put away here, since close_overlays() leaves it. */
     if (opener == &g_pc_open) { g_pc_open = 0; pc_fields_hide(); }
     g_modal_entering = 1;
+    /* The jump calendar opened over a thread is about that thread: it stays. */
+    g_modal_keep_thread = (flag == &g_jc_open) && g_jc_parent;
     close_overlays();
+    g_modal_keep_thread = 0;
     g_modal_entering = 0;
     if (opener && g_n_modal_stack < (int)(sizeof g_modal_stack / sizeof g_modal_stack[0]))
         g_modal_stack[g_n_modal_stack++] = opener;
@@ -17489,6 +18893,9 @@ static void modal_finish(int save) {
     if (g_pick_open && picker_floats()) picker_close(NULL);
     if (g_status_edit) field_show(g_status_edit, 0);
     for (int k = 0; k < 2; k++) if (g_sr_edit[k]) field_show(g_sr_edit[k], 0);
+    if (g_jc_edit) field_show(g_jc_edit, 0);
+    if (g_wsm_q) field_show(g_wsm_q, 0);
+    if (g_wsu_edit) field_show(g_wsu_edit, 0);
     pc_fields_hide();
     int te_was = g_te_open;
     const oc_modal_spec *s = modal_current();
@@ -17496,11 +18903,20 @@ static void modal_finish(int save) {
      * spec->commit so the action can take the window handle. */
     if (g_form_open) { form_collect(save); g_form_open = 0; }
     if (save && g_confirm_open) { g_confirm_open = 0; confirm_run(g_main); }
+    /* A long paste not made a snippet is pasted as it would have been (REQ-226). */
+    if (!save && g_confirm_open && g_confirm_act == CONF_SNIPPET_PASTE && g_snip_paste) {
+        char *t = g_snip_paste; g_snip_paste = NULL;
+        ed_paste_text(t);
+        free(t);
+    }
     if (save) { if (s->commit) s->commit(); }
     else      { if (s->restore) s->restore(); }
     g_prefs_open = g_keys_open = g_about_open = g_wsmgr_open = g_notify_open = g_browse_open = 0;
     g_confirm_open = g_sessions_open = g_status_open = g_sch_open = g_sr_open = g_pc_open = 0;
+    g_jc_open = 0;
+    g_wsu_open = 0;
     g_te_open = 0;
+    g_sv_open = 0;
     if (te_was) te_closed();
     g_modal_closed_by = save ? "save" : "cancel";
     if (g_view == VIEW_SIGNIN) layout_signin(g_main);   /* its fields, back */
@@ -17512,7 +18928,10 @@ static void modal_finish(int save) {
     if (g_n_modal_stack > 0) {
         int *back = g_modal_stack[--g_n_modal_stack];
         *back = 1;
-        if (back == &g_wsmgr_open) sw_book_load();
+        if (back == &g_wsmgr_open) {
+            sw_book_load();
+            if (g_wsm_q) { field_show(g_wsm_q, 1); focus_set(g_wsm_q); }
+        }
     }
     if (bc_no) bc_unconfirmed();
 }
@@ -17737,6 +19156,9 @@ static void layout_natives(oc_win *hwnd) {
     /* The range card's fields, as the status field: the card owns them. */
     for (int k = 0; k < 2; k++)
         if (g_sr_edit[k]) field_show(g_sr_edit[k], g_sr_open && g_sr_erect[k].right > g_sr_erect[k].left);
+    if (g_jc_edit) field_show(g_jc_edit, g_jc_open && g_jc_erect.right > g_jc_erect.left);
+    if (g_wsm_q) field_show(g_wsm_q, g_wsmgr_open && g_wsm_qbox.right > g_wsm_qbox.left);
+    if (g_wsu_edit) field_show(g_wsu_edit, g_wsu_open && g_wsu_erect.right > g_wsu_erect.left);
     /* The poll composer's: a row past the last is hidden, as is a row that
      * cannot change once the poll has votes (it takes no keyboard then). */
     if (g_pc_q) field_show(g_pc_q, g_pc_open && g_pc_qrect.right > g_pc_qrect.left);
@@ -17844,7 +19266,7 @@ static int shell_visible(void) {
  * before it keep their places. */
 /* adds Custom emoji (REQ-072), the one tab a member is shown too: the
  * catalogue is everyone's, and its creator may delete an emoji they added. */
-enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_EMOJI, ADM_COUNT };
+enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_EMOJI, ADM_USAGE, ADM_BLOCKS, ADM_PFIELDS, ADM_COUNT };
 static int g_adm_tab;
 static rectf g_adm_tabs[ADM_COUNT];
 
@@ -17859,7 +19281,9 @@ static void admin_select(int t) {
     else if (t == ADM_INVITES)  oc_client_list_invites(g_client);
     else if (t == ADM_GROUPS)  { g_grp_sel = 0; oc_client_list_groups(g_client); }
     else if (t == ADM_ALERTS)   oc_client_srvalerts_list(g_client);
-    else if (t == ADM_AUDIT)   { oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); }
+    else if (t == ADM_AUDIT)   { g_audit_focus = -1; oc_client_toggle_audit(g_client, 1); oc_client_audit_query(g_client, 0); }
+    else if (t == ADM_USAGE)    oc_client_usage(g_client, g_usage_days);
+    else if (t == ADM_BLOCKS)   oc_client_list_blocks(g_client);
 }
 
 /* The picker's Manage link: Admin > Custom emoji, which a member is shown too. */
@@ -18201,6 +19625,7 @@ static int emoji_admin_rows(const oc_model *m, const oc_custom_emoji **out, int 
 
 static void draw_emoji_admin(gfx *rt, const oc_model *m, rectf body) {
     g_n_emojirows = 0;
+    g_n_emojiren = 0;
     float y = body.top + 8;
     g_emoji_search_box = rf(body.left + 20, y, body.right - 20, y + SEARCH_BOX_H);
     search_box_draw(rt, g_emoji_search_box, OC_COL_INPUT);
@@ -18238,10 +19663,34 @@ static void draw_emoji_admin(gfx *rt, const oc_model *m, rectf body) {
         snprintf(nm, sizeof nm, ":%s:", e->name);
         draw_text(rt, nm, g_ui, rf(tx, yy + 2, body.right - 130, yy + 22), OC_COL_TEXT);
         const char *by = oc_model_user_name((oc_model *)m, e->created_by);
-        char sub[160];
-        snprintf(sub, sizeof sub, "Added by %s", (by && by[0]) ? by : "someone no longer here");
-        draw_text(rt, sub, g_meta, rf(tx, yy + 20, body.right - 130, yy + 40), OC_COL_FAINT);
+        /* Who added it and when, and the old names it still answers to. */
+        char sub[400], when[40] = "", was[200] = "";
+        if (e->created_at) {
+            time_t t = (time_t)(e->created_at / 1000);
+            struct tm lt;
+            if (oc_localtime_r(&t, &lt)) strftime(when, sizeof when, " on %d %b %Y", &lt);
+        }
+        for (uint8_t k = 0; k < e->n_aliases; k++) {
+            size_t u = strlen(was);
+            snprintf(was + u, sizeof was - u, "%s:%s:", k ? " " : " \xC2\xB7 was ", e->aliases[k]);
+        }
+        snprintf(sub, sizeof sub, "Added by %s%s%s", (by && by[0]) ? by : "someone no longer here", when, was);
+        float lim = body.right - (emoji_admin_can_delete(m, e) ? 220 : 130);
+        draw_text(rt, sub, g_meta, rf(tx, yy + 20, lim, yy + 40), OC_COL_FAINT);
         if (emoji_admin_can_delete(m, e)) {
+            /* Rename, beside Delete and by the same rule. */
+            rectf rb = rf(body.right - 212, yy + 8, body.right - 124, yy + 34);
+            int rhot = in_rect(rb, g_mouse_x, g_mouse_y);
+            fill_round(rt, rb, OC_R_CONTROL, rhot ? OC_COL_HOVER : OC_COL_INPUT);
+            stroke_round(rt, rb, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+            g_meta->align = ST_ALIGN_CENTER;
+            draw_text(rt, "Rename", g_meta, rb, OC_COL_TEXT);
+            g_meta->align = ST_ALIGN_LEFT;
+            if (g_n_emojiren < (int)(sizeof g_emojiren / sizeof g_emojiren[0])) {
+                g_emojiren[g_n_emojiren].r = rb;
+                snprintf(g_emojiren[g_n_emojiren].name, sizeof g_emojiren[0].name, "%s", e->name);
+                g_n_emojiren++;
+            }
             rectf b = rf(body.right - 116, yy + 8, body.right - 20, yy + 34);
             int hot = in_rect(b, g_mouse_x, g_mouse_y);
             fill_round(rt, b, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
@@ -18261,7 +19710,142 @@ static void draw_emoji_admin(gfx *rt, const oc_model *m, rectf body) {
     ovl_end(rt, body);
 }
 
+/* Admin > Profile fields: the workspace's own fields on everyone's profile
+ * (department, location, manager), in order. Add one; rename it, move it up or
+ * down, or delete it with every value people gave it. Live: the rows are the
+ * model's, which every PROFILE_FIELDS push replaces. */
+enum { PFA_RENAME = 1, PFA_UP, PFA_DOWN, PFA_DELETE };
+static struct { rectf r; uint64_t id; int act; } g_pfacts[OC_MAX_PROFILE_FIELDS * 4];
+static int g_n_pfacts;
+static rectf g_pf_new_btn;
+
+static void pf_btn(gfx *rt, rectf b, const char *label, int danger, uint64_t id, int act) {
+    int hot = in_rect(b, g_mouse_x, g_mouse_y);
+    fill_round(rt, b, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+    stroke_round(rt, b, OC_R_CONTROL, danger ? OC_COL_DANGER : OC_COL_BORDER, 1.0f);
+    g_meta->align = ST_ALIGN_CENTER;
+    draw_text(rt, label, g_meta, b, danger ? OC_COL_DANGER : OC_COL_TEXT);
+    g_meta->align = ST_ALIGN_LEFT;
+    if (g_n_pfacts < (int)(sizeof g_pfacts / sizeof g_pfacts[0])) {
+        g_pfacts[g_n_pfacts].r = b; g_pfacts[g_n_pfacts].id = id; g_pfacts[g_n_pfacts].act = act;
+        g_n_pfacts++;
+    }
+}
+
+static void draw_pfields_admin(gfx *rt, const oc_model *m, rectf body) {
+    g_n_pfacts = 0;
+    float y = body.top + 12;
+    draw_text(rt, "Fields every profile shows, beside name, title and pronouns. People fill in "
+                  "their own. At most 20.", g_meta_w,
+              rf(body.left + 20, y, body.right - 160, y + 40), OC_COL_MUTED);
+    g_pf_new_btn = rf(0, 0, 0, 0);
+    if (m->n_pfields < OC_MAX_PROFILE_FIELDS) {
+        g_pf_new_btn = rf(body.right - 140, y, body.right - 20, y + 30);
+        fill_round(rt, g_pf_new_btn, OC_R_CONTROL, OC_COL_ACCENT);
+        g_ui->align = ST_ALIGN_CENTER;
+        draw_text(rt, "New field", g_ui, g_pf_new_btn, 0xFFFFFF);
+        g_ui->align = ST_ALIGN_LEFT;
+    }
+    y += 48;
+    if (!m->n_pfields) {
+        overlay_empty(rt, rf(body.left, y, body.right, body.bottom), "No profile fields yet.");
+        return;
+    }
+    float rowh = UIS(44);
+    for (uint8_t k = 0; k < m->n_pfields && y + rowh <= body.bottom; k++) {
+        const oc_pfield *f = &m->pfields[k];
+        draw_text(rt, f->label, g_ui, rf(body.left + 20, y + 2, body.right - 380, y + 22), OC_COL_TEXT);
+        draw_text(rt, f->kind == OC_PROFILE_FIELD_LINK ? "Link" : "Text", g_meta,
+                  rf(body.left + 20, y + 20, body.right - 380, y + 40), OC_COL_FAINT);
+        float bx = body.right - 20;
+        rectf del = rf(bx - 80, y + 8, bx, y + 34);           bx = del.left - 8;
+        rectf dn  = rf(bx - 60, y + 8, bx, y + 34);           bx = dn.left - 8;
+        rectf up  = rf(bx - 50, y + 8, bx, y + 34);           bx = up.left - 8;
+        rectf rn  = rf(bx - 80, y + 8, bx, y + 34);
+        pf_btn(rt, rn, "Rename", 0, f->id, PFA_RENAME);
+        if (k > 0)                  pf_btn(rt, up, "Up", 0, f->id, PFA_UP);
+        if (k + 1 < m->n_pfields)   pf_btn(rt, dn, "Down", 0, f->id, PFA_DOWN);
+        pf_btn(rt, del, "Delete", 1, f->id, PFA_DELETE);
+        fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
+        y += rowh;
+    }
+}
+
+/* Swap field `id` with its neighbour above (dir -1) or below (+1): each takes
+ * the other's position, two renames that keep their labels. */
+static void pf_move(const oc_model *m, uint64_t id, int dir) {
+    for (uint8_t k = 0; k < m->n_pfields; k++) {
+        if (m->pfields[k].id != id) continue;
+        int o = (int)k + dir;
+        if (o < 0 || o >= m->n_pfields) return;
+        const oc_pfield *a = &m->pfields[k], *b = &m->pfields[o];
+        uint16_t pa = a->position, pb = b->position;
+        /* Equal positions (both made with the same number) are split, so the
+         * order the list shows is the order that is stored. */
+        if (pa == pb) pb = (uint16_t)(dir < 0 ? pa - 1 : pa + 1);
+        if (pb == 0) { pb = 1; pa = 2; }
+        oc_client_set_profile_field(g_client, a->id, OC_PROFILE_FIELD_SET, a->kind, pb, a->label);
+        oc_client_set_profile_field(g_client, b->id, OC_PROFILE_FIELD_SET, b->kind, pa, b->label);
+        return;
+    }
+}
+
+static int pfields_click(oc_win *hwnd, const oc_model *m, int x, int y) {
+    if (!g_client) return 0;
+    if (in_rect(g_pf_new_btn, x, y)) {
+        oc_field f[2] = {
+            { FF_TEXT,   "Label", "What the field is called, such as Department or Location.", "" },
+            { FF_CHOICE, "Kind",  "Text|Link", "0" },
+        };
+        if (form_dialog(hwnd, "New profile field", f, 2) && f[0].value[0])
+            oc_client_set_profile_field(g_client, 0, OC_PROFILE_FIELD_SET,
+                                        atoi(f[1].value) == 1 ? OC_PROFILE_FIELD_LINK : OC_PROFILE_FIELD_TEXT,
+                                        0, f[0].value);
+        return 1;
+    }
+    for (int i = 0; i < g_n_pfacts; i++) {
+        if (!in_rect(g_pfacts[i].r, x, y)) continue;
+        uint64_t id = g_pfacts[i].id;
+        const oc_pfield *pf = NULL;
+        for (uint8_t k = 0; k < m->n_pfields; k++) if (m->pfields[k].id == id) pf = &m->pfields[k];
+        if (!pf) return 1;
+        switch (g_pfacts[i].act) {
+        case PFA_RENAME: {
+            oc_field f[1] = { { FF_TEXT, "Label", "", "" } };
+            snprintf(f[0].value, sizeof f[0].value, "%s", pf->label);
+            uint8_t kind = pf->kind;
+            if (form_dialog(hwnd, "Rename profile field", f, 1) && f[0].value[0])
+                oc_client_set_profile_field(g_client, id, OC_PROFILE_FIELD_SET, kind, 0, f[0].value);
+            break;
+        }
+        case PFA_UP:   pf_move(m, id, -1); break;
+        case PFA_DOWN: pf_move(m, id, +1); break;
+        case PFA_DELETE: {
+            char body[240];
+            snprintf(body, sizeof body, "%.64s goes from every profile, with what everyone wrote in it.", pf->label);
+            confirm_open(hwnd, CONF_PFIELD_DELETE, id, "Delete profile field?", body, "Delete");
+            break;
+        }
+        }
+        return 1;
+    }
+    return 0;
+}
+
 /* Ask before deleting `name`: the messages that used it keep the shortcode. */
+/* Rename `name` (REQ-072): the old name keeps showing the image. */
+static void emoji_rename_ask(oc_win *hwnd, const char *name) {
+    if (!g_client || !name || !name[0]) return;
+    static char hint[160];
+    snprintf(hint, sizeof hint, "Letters, digits, _ - and +. Messages that used :%s: keep showing it.", name);
+    oc_field f[1] = { { FF_TEXT, "New name", hint, "" } };
+    snprintf(f[0].value, sizeof f[0].value, "%s", name);
+    char old[48];
+    snprintf(old, sizeof old, "%s", name);   /* the row's buffer is repainted under the form */
+    if (form_dialog(hwnd, "Rename custom emoji", f, 1) && f[0].value[0] && strcmp(f[0].value, old))
+        oc_client_rename_emoji(g_client, old, f[0].value[0] == ':' ? f[0].value + 1 : f[0].value);
+}
+
 static void emoji_delete_ask(oc_win *hwnd, const char *name) {
     char title[80], body[200];
     snprintf(g_confirm_emoji, sizeof g_confirm_emoji, "%s", name);
@@ -18285,6 +19869,9 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
         { "Groups",    OC_ICON_USER },
         { "Alerts",    OC_ICON_ALERT },
         { "Custom emoji", OC_ICON_SMILE },
+        { "Usage",     OC_ICON_USER },
+        { "Blocks",    OC_ICON_USER },
+        { "Profile fields", OC_ICON_USER },
     };
     float tx = reg.left + 16, ty = reg.top + HEADER_H;
     int admin = self_role(m) >= OC_ROLE_ADMIN;
@@ -18312,7 +19899,10 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
     if (g_adm_tab == ADM_STORAGE)     draw_storage(rt, m, body, 1);
     else if (g_adm_tab == ADM_INVITES) draw_invites(rt, m, body);
     else if (g_adm_tab == ADM_GROUPS)  draw_groups(rt, m, body);
+    else if (g_adm_tab == ADM_PFIELDS) draw_pfields_admin(rt, m, body);
     else if (g_adm_tab == ADM_ALERTS)  draw_alerts_admin(rt, m, body);
+    else if (g_adm_tab == ADM_USAGE)   draw_usage(rt, m, body);
+    else if (g_adm_tab == ADM_BLOCKS)  draw_blocks_admin(rt, m, body);
     else                              draw_audit(rt, m, body, 1);
 }
 
@@ -18784,7 +20374,7 @@ static void draw_activity_list(gfx *rt, const oc_model *m, float h) {
         const oc_channel *ch = oc_model_channel((oc_model *)m, a->channel_id);
         int icon = a->kind == OC_ACT_MENTION ? OC_ICON_AT
                  : a->kind == OC_ACT_REACTION ? OC_ICON_SMILE
-                 : a->kind == OC_ACT_UNREAD ? OC_ICON_BELL : OC_ICON_DMS;
+                 : (a->kind == OC_ACT_UNREAD || a->kind == OC_ACT_REMINDER) ? OC_ICON_BELL : OC_ICON_DMS;
         draw_lucide(rt, icon, rf(row.left + 46, y + 25, row.left + 60, y + 39), OC_COL_FAINT);
         char whereline[128];
         /* A DM has no name, so "in a conversation" would be the whole answer for
@@ -18794,7 +20384,8 @@ static void draw_activity_list(gfx *rt, const oc_model *m, float h) {
         snprintf(whereline, sizeof whereline, "%s in %s%s",
                  a->kind == OC_ACT_MENTION ? "Mention" :
                  a->kind == OC_ACT_REACTION ? "Reaction" :
-                 a->kind == OC_ACT_UNREAD ? "Unread" : "Thread",
+                 a->kind == OC_ACT_UNREAD ? "Unread" :
+                 a->kind == OC_ACT_REMINDER ? "Reminder" : "Thread",
                  (ch && ch->name && ch->name[0]) ? "#" : (peer && peer[0]) ? "@" : "",
                  (ch && ch->name && ch->name[0]) ? ch->name
                                                  : (peer && peer[0]) ? peer : "a conversation");
@@ -19520,14 +21111,16 @@ static void field_draw(gfx *rt, field *f, rectf box, uint32_t ink) {
  * modal covers the window. A press outside every field returns the keyboard
  * to the window, as clicking a native window did. */
 static int fields_mouse(int kind, float x, float y) {
-    field *modal[24]; int nm = 0;
+    field *modal[24 + FORM_MAX_FIELDS]; int nm = 0;
     if (g_status_edit) modal[nm++] = g_status_edit;
     for (int k = 0; k < 2; k++) if (g_sr_edit[k]) modal[nm++] = g_sr_edit[k];
     if (g_pc_q) modal[nm++] = g_pc_q;
     if (g_pc_time) modal[nm++] = g_pc_time;
+    if (g_wsm_q) modal[nm++] = g_wsm_q;
+    if (g_wsu_edit) modal[nm++] = g_wsu_edit;
     if (g_te_open) modal[nm++] = &g_te_field;
     for (int i = 0; i < OC_POLL_MAX_OPTIONS; i++) if (g_pc_opt[i]) modal[nm++] = g_pc_opt[i];
-    for (int i = 0; i < FORM_MAX_FIELDS && nm < 24; i++) if (g_form_edit[i]) modal[nm++] = g_form_edit[i];
+    for (int i = 0; i < FORM_MAX_FIELDS && nm < 24 + FORM_MAX_FIELDS; i++) if (g_form_edit[i]) modal[nm++] = g_form_edit[i];
     field *shell[9] = { g_pal_edit, g_pick_edit, g_srch, g_find, g_ffind, g_dir_edit, g_si_e_ws, g_si_e_user, g_efind };
     if (kind == 1 || kind == 2) {
         /* A drag or a release belongs to the field that took the press. */
@@ -19571,6 +21164,28 @@ static float g_tgt_qx, g_tgt_qy;            /* where the query's text starts */
 static int   g_tgt_top;                     /* first visible match, for the wheel */
 static rectf g_tgt_list;                    /* the floating list, for hit-testing */
 static rectf g_tgt_chip_r[TGT_CHIPS_MAX];   /* each chip's whole rect, wrapped */
+/* A chip's words: #channel, or @person -- and, for a person out of office
+ * (REQ-122), until when, so who will not answer is seen as they are picked. */
+static void tgt_chip_label(int i, char *out, size_t cap) {
+    const oc_model *m = model();
+    const oc_member *u = (!g_tgt_chip[i].is_channel && m)
+                       ? oc_model_ooo_active(m, g_tgt_chip[i].id, (uint64_t)time(NULL) * 1000u) : NULL;
+    char ol[96] = "";
+    if (u) oc_model_ooo_label(u, ol, sizeof ol);
+    /* The same words as everywhere else: "Out of office until 3 Dec". */
+    snprintf(out, cap, "%s%s%s%s", g_tgt_chip[i].is_channel ? "#" : "@", g_tgt_chip[i].name,
+             ol[0] ? " \xC2\xB7 " : "", ol);
+}
+/* The first person among the new message's chips who is out of office now,
+ * for the composer's notice (REQ-122). */
+static const oc_member *tgt_ooo_member(const oc_model *m, uint64_t now) {
+    for (int i = 0; m && i < g_n_tgt_chip; i++) {
+        if (g_tgt_chip[i].is_channel || g_tgt_chip[i].id == m->user_id) continue;
+        const oc_member *u = oc_model_ooo_active(m, g_tgt_chip[i].id, now);
+        if (u) return u;
+    }
+    return NULL;
+}
 static oc_target g_tgt[TGT_MAX];
 static int   g_n_tgt, g_tgt_sel;
 static rectf g_tgt_rows[TGT_MAX], g_tgt_chip_x[TGT_CHIPS_MAX], g_tgt_box;
@@ -19762,9 +21377,8 @@ static float tgt_draw(gfx *rt, rectf box, int focused) {
     float x = x0, y = box.top + ipad;
     int rows = 1;
     for (int i = 0; i < g_n_tgt_chip; i++) {
-        char label[96];
-        snprintf(label, sizeof label, "%s%s", g_tgt_chip[i].is_channel ? "#" : "@",
-                 g_tgt_chip[i].name);
+        char label[128];
+        tgt_chip_label(i, label, sizeof label);
         float w = text_width(label, g_meta) + UIS(9) * 2 + UIS(16);
         if (w > right - x0) w = right - x0;                 /* a very long name */
         if (x > x0 && x + w > right) { x = x0; y += rowh + UIS(4); rows++; }
@@ -19787,9 +21401,8 @@ static float tgt_draw(gfx *rt, rectf box, int focused) {
               OC_INK_ON(TH_MUTED, TH_INPUT));
 
     for (int i = 0; i < g_n_tgt_chip; i++) {
-        char label[96];
-        snprintf(label, sizeof label, "%s%s", g_tgt_chip[i].is_channel ? "#" : "@",
-                 g_tgt_chip[i].name);
+        char label[128];
+        tgt_chip_label(i, label, sizeof label);
         rectf chip = g_tgt_chip_r[i];
         rectf close = rf(chip.right - UIS(9) - UIS(16), chip.top, chip.right - UIS(9), chip.bottom);
         int hot = in_rect(close, g_mouse_x, g_mouse_y);
@@ -20364,6 +21977,7 @@ static void newmsg_send_at(oc_win *hwnd, uint64_t at) {
         composer_hint("This message is too long to send. Make a table smaller, or split it in two.", 1);
         return;
     }
+    if (ed_refuse_open_spoiler(b)) { free(b); return; }
     /* Into a channel or a DM that exists, checked as its own composer's send
      * is (bc_gate, REQ-221): held, the text stays in the pane with its
      * recipients. */
@@ -20636,8 +22250,18 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
                              oc_model_dnd_of(m, u->user_id));
         /* Title, or the custom status when there is one — Slack shows the status
          * in its place, because it is the more current of the two. */
-        char sub[160];
+        char sub[320];
         if (u->disabled) snprintf(sub, sizeof sub, "Removed \xE2\x80\x94 right-click to bring them back");
+        else if (oc_model_ooo_active(m, u->user_id, wall_ms())) {
+            /* Out of office, with the custom status beside it, not in its
+             * place: the two are separate, and both are said (REQ-122). */
+            char ol[96];
+            oc_model_ooo_label(u, ol, sizeof ol);
+            if (u->status_text[0] || u->status_emoji[0])
+                snprintf(sub, sizeof sub, "%s  \xC2\xB7  %s%s%s", ol, u->status_emoji,
+                         u->status_emoji[0] && u->status_text[0] ? "  " : "", u->status_text);
+            else snprintf(sub, sizeof sub, "%s", ol);
+        }
         else if (u->status_text[0])
             snprintf(sub, sizeof sub, "%s%s%s", u->status_emoji,
                      u->status_emoji[0] ? "  " : "", u->status_text);
@@ -20811,8 +22435,61 @@ static float draw_e2e_strip(gfx *rt, const oc_model *m, float x0, float w, float
     return y - top;
 }
 
+/* Where the call view's conversation panel starts, for a window `W` wide, or 0
+ * when it is not shown: folded away, no conversation selected for it, or no
+ * room beside the call. Drawn and laid out (layout_composer) from this alone. */
+static float call_chat_left(float W) {
+    const oc_model *m = model();
+    if (g_view != VIEW_CALL || g_call_chat_hidden || !m || !g_call_view_ch || g_sel != g_call_view_ch ||
+        g_cpick_ch == g_call_view_ch || !oc_model_channel((oc_model *)m, g_call_view_ch))
+        return 0;
+    float avail = W - (RAIL_W + SIDEBAR_W);
+    float pw = avail * 0.36f;
+    if (pw < UIS(300)) pw = UIS(300);
+    if (pw > UIS(440)) pw = UIS(440);
+    if (avail - pw < UIS(420)) return 0;       /* the call itself needs the room */
+    return W - pw;
+}
+
+/* The ring round someone speaking: not the green of the presence dot, which on
+ * a face that is also online read as nothing changing. */
+#define CALL_SPEAKING OC_COL_ACCENT
+
+/* Under a conversation's header while it has a call: who is in it and for how
+ * long, with Join (Open once you are in it), and Decline when you were asked.
+ * The way into a call is where the conversation is, not only a numbered phone in
+ * the header. Returns its height. */
+static float draw_call_banner(gfx *rt, const oc_model *m, float x0, float w, float top) {
+    g_call_banner_on = 0;
+    if (!m || !g_sel || dm_index_view()) return 0;
+    const oc_call_view *v = oc_model_call_in(m, g_sel);
+    int in = call_here(m) && m->call.channel_id == g_sel;
+    if (!v && !in) return 0;
+    g_call_banner_on = 1;
+    if (in) v = &m->call;
+    char names[200] = "", head[260], sub[120], dur[16];
+    for (int i = 0; i < v->n_parts && i < 4; i++) {
+        const char *n = oc_model_user_name(m, v->parts[i]);
+        size_t at = strlen(names);
+        snprintf(names + at, sizeof names - at, "%s%s", i ? ", " : "",
+                 v->parts[i] == m->user_id ? "you" : (n && n[0]) ? n : "someone");
+    }
+    if (v->n_parts > 4) {
+        size_t at = strlen(names);
+        snprintf(names + at, sizeof names - at, " and %d more", v->n_parts - 4);
+    }
+    call_duration(v->started_at, dur, sizeof dur);
+    snprintf(head, sizeof head, "%s %s in a call", names[0] ? names : "Someone", v->n_parts == 1 && !in ? "is" : "are");
+    int invited = !in && oc_model_call_invited(v, m->user_id);
+    snprintf(sub, sizeof sub, "%s%s", dur, invited ? " · You were asked to join" : "");
+    return e2e_notice(rt, x0, w, top, OC_COL_ONLINE, head, sub,
+                      in ? "Open" : "Join", CC_BANNER_JOIN, "call.banner.join",
+                      invited ? "Decline" : NULL, CC_BANNER_DECLINE, "call.banner.decline");
+}
+
 static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
-    g_n_call_btns = 0;
+    /* The buttons are the frame's (call_rects_reset): the sidebar's Calls rows
+     * drawn before this keep theirs. */
     g_share_stage = rf(0, 0, 0, 0);
     char lbl[96], sub[200];
     call_conv_label(m, g_call_view_ch, lbl, sizeof lbl);
@@ -20835,6 +22512,14 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     }
     rectf body = view_header(rt, reg, lbl, sub);
     if (g_cpick_ch == g_call_view_ch) { draw_call_picker(rt, m, body); return; }
+    /* The conversation beside the call: shown by default, folded away here. */
+    if (oc_model_channel((oc_model *)m, g_call_view_ch)) {
+        const char *cl = g_call_chat_hidden ? "Show conversation" : "Hide conversation";
+        float hh = body.top - reg.top, cw = call_button_w(cl, OC_ICON_MESSAGE);
+        rectf cb = rf(reg.right - 24 - cw, reg.top + (hh - UIS(32)) / 2, reg.right - 24, reg.top + (hh + UIS(32)) / 2);
+        call_button(rt, cb, OC_ICON_MESSAGE, cl, !g_call_chat_hidden, 0);
+        call_btn_add(cb, CC_CHAT, "call.chat", cl);
+    }
 
     /* A refusal, said in words rather than as a code, for a few seconds from
      * when it ARRIVED -- not from when this view was next drawn, or an old one
@@ -20869,10 +22554,15 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
                                                 ban.top + UIS(40)), OC_COL_ONLINE);
         char yl[200];
         snprintf(yl, sizeof yl, "You're sharing %s", g_share_name[0] ? g_share_name : "your screen");
-        draw_text(rt, yl, g_ui_b, rf(ban.left + UIS(50), ban.top + UIS(6), ban.right - 12, ban.top + UIS(30)),
+        /* Stop sharing, on the banner that says you are. */
+        float sw = call_button_w("Stop sharing", OC_ICON_SCREEN_SHARE_OFF);
+        rectf sb = rf(ban.right - UIS(12) - sw, ban.top + UIS(10), ban.right - UIS(12), ban.bottom - UIS(10));
+        call_button(rt, sb, OC_ICON_SCREEN_SHARE_OFF, "Stop sharing", 0, 1);
+        call_btn_add(sb, CC_SHARE_STOP, "call.share.banner.stop", "Stop sharing");
+        draw_text(rt, yl, g_ui_b, rf(ban.left + UIS(50), ban.top + UIS(6), sb.left - 12, ban.top + UIS(30)),
                   OC_COL_TEXT);
-        draw_text(rt, "Everyone in the call can see it. Stop sharing when you are done.", g_meta,
-                  rf(ban.left + UIS(50), ban.top + UIS(28), ban.right - 12, ban.bottom - 4), OC_COL_MUTED);
+        draw_text(rt, "Everyone in the call can see it.", g_meta,
+                  rf(ban.left + UIS(50), ban.top + UIS(28), sb.left - 12, ban.bottom - 4), OC_COL_MUTED);
         gy += UIS(66);
     }
     if (other) {
@@ -20894,36 +22584,66 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
         float strip = UIS(52);
         rectf stage = rf(body.left + 24, ty + th + 8, body.right - 24, body.bottom - UIS(176) - strip);
         if (stage.bottom > stage.top + UIS(60)) draw_share_stage(rt, stage);
-        float av = UIS(40), ax = body.left + 24, ay = stage.bottom + 8;
-        for (int i = 0; i < np && ax + av < body.right - 24; i++) {
+        /* Who is in it, under the picture: a face and a name each, with the
+         * speaking ring, so a viewer still sees who is talking. */
+        float av = UIS(32), ax = body.left + 24, ay = stage.bottom + 10;
+        for (int i = 0; i < np; i++) {
             uint64_t uid = people[i];
             const oc_call_peer_stats *ps = NULL;
             for (int k = 0; k < st.n_peers; k++) if (st.peers[k].user_id == uid) ps = &st.peers[k];
             int me = uid == m->user_id;
-            rectf avr = rf(ax, ay, ax + av, ay + av);
             const char *nm = oc_model_user_name(m, uid);
+            char name[80];
+            snprintf(name, sizeof name, "%s%s", (nm && nm[0]) ? nm : "someone", me ? " (you)" : "");
+            float nw = text_width(name, g_meta);
+            if (nw > UIS(140)) nw = UIS(140);
+            if (ax + av + UIS(8) + nw > body.right - 24) break;
+            rectf avr = rf(ax, ay, ax + av, ay + av);
             draw_user_avatar(rt, m, uid, (nm && nm[0]) ? nm : "?", avr, g_ui_b);
             if (me ? st.speaking : ps && ps->speaking)
                 stroke_round(rt, rf(avr.left - 3, avr.top - 3, avr.right + 3, avr.bottom + 3),
-                             avatar_corner(avr) + 3, OC_COL_ONLINE, 2.5f);
+                             avatar_corner(avr) + 3, CALL_SPEAKING, 2.5f);
             if (me ? st.muted && !st.ptt : ps && ps->muted) {
                 rectf mb = rf(avr.right - UIS(12), avr.bottom - UIS(12), avr.right + UIS(4), avr.bottom + UIS(4));
                 fill_round(rt, mb, UIS(8), OC_COL_DANGER);
                 draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 2, mb.top + 2, mb.right - 2, mb.bottom - 2), 0xFFFFFF);
             }
-            ax += av + UIS(12);
+            draw_text(rt, name, g_meta, rf(avr.right + UIS(8), ay, avr.right + UIS(8) + nw, ay + av), OC_COL_TEXT);
+            ax = avr.right + UIS(8) + nw + UIS(18);
         }
         np = 0;                                  /* no cards */
     }
 
     /* The people: a card each, with a ring while they speak and a mark when
-     * they say they are muted. */
-    int cols = (int)((body.right - body.left - 48 + gap) / (cardw + gap));
-    if (cols < 1) cols = 1;
+     * they say they are muted -- sized to fill the stage between the header and
+     * the controls, rather than small cards in a corner of it. The arrangement
+     * of columns that gives the largest card wins. */
+    float stage_w = body.right - 24 - gx, stage_h = body.bottom - UIS(176) - gy;
+    int cols = 1;
+    if (np > 0 && stage_w > 0 && stage_h > 0) {
+        float best = 0;
+        for (int c = 1; c <= np; c++) {
+            int rows = (np + c - 1) / c;
+            float cw = (stage_w - gap * (float)(c - 1)) / (float)c;
+            float chh = (stage_h - gap * (float)(rows - 1)) / (float)rows;
+            float w = cw < chh * 1.25f ? cw : chh * 1.25f;        /* five wide to four high */
+            if (w > best) { best = w; cols = c; }
+        }
+        if (best > UIS(140)) {
+            cardw = best > UIS(420) ? UIS(420) : best;
+            cardh = cardw / 1.25f;
+        }
+        /* Centred in the stage. */
+        int rows = (np + cols - 1) / cols;
+        float used_w = cardw * (float)cols + gap * (float)(cols - 1);
+        float used_h = cardh * (float)rows + gap * (float)(rows - 1);
+        if (used_w < stage_w) gx += (stage_w - used_w) / 2;
+        if (used_h < stage_h) gy += (stage_h - used_h) / 2;
+    }
     for (int i = 0; i < np; i++) {
         uint64_t uid = people[i];
         float cx = gx + (float)(i % cols) * (cardw + gap), cy = gy + (float)(i / cols) * (cardh + gap);
-        if (cy + cardh > body.bottom - UIS(176)) break;
+        if (cy + cardh > body.bottom - UIS(176) + 1) break;
         rectf card = rf(cx, cy, cx + cardw, cy + cardh);
         fill_round(rt, card, OC_R_CONTROL, OC_COL_BASE);
         stroke_round(rt, card, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
@@ -20932,12 +22652,18 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
         int me = uid == m->user_id;
         int speaking = me ? st.speaking : ps && ps->speaking;
         int muted = me ? st.muted && !st.ptt : ps && ps->muted;
-        float av = UIS(60.0f), ax = (card.left + card.right - av) / 2, ay = card.top + UIS(12);
+        /* The face grows with the card, keeping room under it for the name and
+         * the volume. */
+        float av = (cardh - UIS(70)) * 0.8f;
+        if (av < UIS(60.0f)) av = UIS(60.0f);
+        if (av > UIS(160.0f)) av = UIS(160.0f);
+        float ax = (card.left + card.right - av) / 2, ay = card.top + (cardh - av - UIS(58)) / 2;
+        if (ay < card.top + UIS(12)) ay = card.top + UIS(12);
         rectf avr = rf(ax, ay, ax + av, ay + av);
         const char *nm = oc_model_user_name(m, uid);
         draw_user_avatar(rt, m, uid, (nm && nm[0]) ? nm : "?", avr, g_ui_b);
         if (speaking) stroke_round(rt, rf(avr.left - 4, avr.top - 4, avr.right + 4, avr.bottom + 4),
-                                   avatar_corner(avr) + 4, OC_COL_ONLINE, 3.0f);
+                                   avatar_corner(avr) + 4, CALL_SPEAKING, 3.0f);
         if (muted) {
             rectf mb = rf(avr.right - UIS(14), avr.bottom - UIS(14), avr.right + UIS(6), avr.bottom + UIS(6));
             fill_round(rt, mb, UIS(10), OC_COL_DANGER);
@@ -20963,8 +22689,12 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
         if (in && !me && g_call_engine && i < 40) {
             float gain = oc_call_engine_volume(g_call_engine, uid);
             float by = card.bottom - UIS(26);
+            /* The value as well as the bar: 100% is as they sent it. */
+            char pct[16];
+            snprintf(pct, sizeof pct, "%d%%", (int)(gain * 100 + 0.5f));
+            float pw = text_width("200%", g_meta) + UIS(6);
             rectf dn = rf(card.left + 10, by, card.left + 30, by + UIS(20));
-            rectf up = rf(card.right - 30, by, card.right - 10, by + UIS(20));
+            rectf up = rf(card.right - 30 - pw, by, card.right - 10 - pw, by + UIS(20));
             rectf bar = rf(dn.right + 6, by + UIS(8), up.left - 6, by + UIS(12));
             fill_round(rt, bar, 2, OC_COL_INPUT);
             fill_round(rt, rf(bar.left, bar.top, bar.left + (bar.right - bar.left) * gain / 2.0f, bar.bottom), 2,
@@ -20972,6 +22702,8 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
             g_meta->align = ST_ALIGN_CENTER;
             draw_text(rt, "\u2212", g_meta, dn, OC_COL_MUTED);
             draw_text(rt, "+", g_meta, up, OC_COL_MUTED);
+            g_meta->align = ST_ALIGN_RIGHT;
+            draw_text(rt, pct, g_meta, rf(up.right, by, card.right - 10, by + UIS(20)), OC_COL_MUTED);
             g_meta->align = ST_ALIGN_LEFT;
             char aid[40], an[96];
             snprintf(aid, sizeof aid, "call.volume.%llu.down", (unsigned long long)uid);
@@ -21029,53 +22761,33 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
         }
         return;
     }
-    /* Two rows, so nothing overlaps at any width: the devices above -- each with
-     * what it is, the microphone with a live level -- and the actions below,
-     * Mute and Invite at the left, Leave and End at the right. */
+    /* One bar: Mute, Share screen, Invite, Settings and Leave, in that order;
+     * End for everyone -- the starter's alone -- apart at the far end, so a hand
+     * reaching for Leave does not find it, and asked before it acts. */
     int muted = st.muted;
-    char mic[160], spk[160];
-    snprintf(mic, sizeof mic, "%s", "Default microphone");
-    for (int i = 0; i < g_call_nmics; i++) if (oc_hash32(g_call_mics[i].id) == g_call_mic_h) snprintf(mic, sizeof mic, "%s", g_call_mics[i].name);
-    snprintf(spk, sizeof spk, "%s", "Default speaker");
-    for (int i = 0; i < g_call_nspks; i++) if (oc_hash32(g_call_spks[i].id) == g_call_spk_h) snprintf(spk, sizeof spk, "%s", g_call_spks[i].name);
-    const char *nsl = g_call_ns ? "Noise suppression: on" : "Noise suppression: off";
     float row1 = by - bh - UIS(10);
-    if (g_toast_floor > row1 - UIS(30)) g_toast_floor = row1 - UIS(30);   /* ...the devices and their hint */
-    float nsw = call_button_w(nsl, -1);
-    float avail = body.right - 24 - x - nsw - 20;
-    float dw = avail / 2 > UIS(260) ? UIS(260) : avail / 2;
-    if (dw < UIS(120)) dw = UIS(120);
-    b = rf(x, row1, x + dw, row1 + bh);
-    call_button(rt, b, OC_ICON_MIC, mic, 0, 0);
-    {
-        float lv = (float)st.mic_level / 32767.0f;
-        fill(rt, rf(b.left + 10, b.bottom - 5, b.left + 10 + (b.right - b.left - 20) * lv, b.bottom - 3),
-             st.speaking ? OC_COL_ONLINE : OC_COL_MUTED);
+    if (g_toast_floor > row1 - UIS(30)) g_toast_floor = row1 - UIS(30);   /* ...the bar's hint */
+    float rx = body.right - 24;
+    rectf endb = rf(0, 0, 0, 0);
+    if (m->call.starter == m->user_id) {
+        endb = rf(rx - call_button_w("End for everyone", -1), by, rx, by + bh);
+        rx = endb.left - UIS(40);                /* a gap, not a neighbour */
     }
-    char mn[200]; snprintf(mn, sizeof mn, "Microphone: %s", mic);
-    call_btn_add(b, CC_MICMENU, "call.mic", mn);
-    b = rf(b.right + 10, row1, b.right + 10 + dw, row1 + bh);
-    call_button(rt, b, OC_ICON_VOLUME, spk, 0, 0);
-    snprintf(mn, sizeof mn, "Speaker: %s", spk);
-    call_btn_add(b, CC_SPKMENU, "call.speaker", mn);
-    b = rf(b.right + 10, row1, b.right + 10 + nsw, row1 + bh);
-    call_button(rt, b, -1, nsl, g_call_ns, 0);
-    call_btn_add(b, CC_NS, "call.noise", nsl);
 
     b = rf(x, by, x + call_button_w(muted ? "Unmute" : "Mute", OC_ICON_MIC), by + bh);
     call_button(rt, b, muted ? OC_ICON_MIC_OFF : OC_ICON_MIC, muted ? "Unmute" : "Mute", muted, 0);
+    {   /* The microphone's level, on Mute: what you are sending, where you would stop it. */
+        float lv = muted ? 0 : (float)st.mic_level / 32767.0f;
+        fill(rt, rf(b.left + 10, b.bottom - 5, b.left + 10 + (b.right - b.left - 20) * lv, b.bottom - 3),
+             st.speaking ? CALL_SPEAKING : OC_COL_MUTED);
+    }
     call_btn_add(b, CC_MUTE, "call.mute", muted ? "Microphone: muted" : "Microphone: on");
+    g_call_mute_btn = b;
     x = b.right + 10;
-    b = rf(x, by, x + call_button_w("Invite", OC_ICON_USER_PLUS), by + bh);
-    call_button(rt, b, OC_ICON_USER_PLUS, "Invite", 0, 0);
-    call_btn_add(b, CC_INVITE, "call.invite", "Invite");
-    x = b.right + 10;
-    /* Leave and End at the far right, End only for the one who may; Share
-     * between, shortened to fit what is left rather than running under them. */
-    float rx = body.right - 24;
     {
-        float right = rx - call_button_w("Leave", OC_ICON_PHONE_OFF) - 10;
-        if (m->call.starter == m->user_id) right -= call_button_w("End for everyone", -1) + 10;
+        /* Share, shortened to fit what is left rather than running under the rest. */
+        float right = rx - call_button_w("Invite", OC_ICON_USER_PLUS) - call_button_w("Settings", OC_ICON_SETTINGS)
+                    - call_button_w("Leave", OC_ICON_PHONE_OFF) - 30;
         const char *shl = g_share_on ? "Stop sharing" : "Share screen";
         const char *name = shl;
         if (x + call_button_w(shl, OC_ICON_SCREEN_SHARE) > right) shl = g_share_on ? "Stop" : "Share";
@@ -21084,24 +22796,75 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
         b = rf(x, by, x + w, by + bh);
         call_button(rt, b, g_share_on ? OC_ICON_SCREEN_SHARE_OFF : OC_ICON_SCREEN_SHARE, shl, g_share_on, 0);
         call_btn_add(b, g_share_on ? CC_SHARE_STOP : CC_SHARE, g_share_on ? "call.share.stop" : "call.share", name);
+        x = b.right + 10;
     }
-    if (m->call.starter == m->user_id) {
-        b = rf(rx - call_button_w("End for everyone", -1), by, rx, by + bh);
-        call_button(rt, b, -1, "End for everyone", 0, 2);
-        call_btn_add(b, CC_END, "call.end", "End for everyone");
-        rx = b.left - 10;
-    }
-    b = rf(rx - call_button_w("Leave", OC_ICON_PHONE_OFF), by, rx, by + bh);
+    b = rf(x, by, x + call_button_w("Invite", OC_ICON_USER_PLUS), by + bh);
+    call_button(rt, b, OC_ICON_USER_PLUS, "Invite", 0, 0);
+    call_btn_add(b, CC_INVITE, "call.invite", "Invite");
+    x = b.right + 10;
+    b = rf(x, by, x + call_button_w("Settings", OC_ICON_SETTINGS), by + bh);
+    call_button(rt, b, OC_ICON_SETTINGS, "Settings", g_call_settings, 0);
+    call_btn_add(b, CC_SETTINGS, "call.settings", g_call_settings ? "Settings: open" : "Settings");
+    rectf setb = b;
+    x = b.right + 10;
+    b = rf(x, by, x + call_button_w("Leave", OC_ICON_PHONE_OFF), by + bh);
     call_button(rt, b, OC_ICON_PHONE_OFF, "Leave", 0, 1);
     call_btn_add(b, CC_LEAVE, "call.leave", "Leave");
+    if (endb.right > endb.left) {
+        call_button(rt, endb, -1, "End for everyone", 0, 2);
+        call_btn_add(endb, CC_END, "call.end", "End for everyone");
+    }
+
+    /* Settings: the microphone and speaker, the microphone's level and noise
+     * suppression, in a panel over the stage above the bar. */
+    if (g_call_settings) {
+        char mic[160], spk[160];
+        snprintf(mic, sizeof mic, "%s", "Default microphone");
+        for (int i = 0; i < g_call_nmics; i++) if (oc_hash32(g_call_mics[i].id) == g_call_mic_h) snprintf(mic, sizeof mic, "%s", g_call_mics[i].name);
+        snprintf(spk, sizeof spk, "%s", "Default speaker");
+        for (int i = 0; i < g_call_nspks; i++) if (oc_hash32(g_call_spks[i].id) == g_call_spk_h) snprintf(spk, sizeof spk, "%s", g_call_spks[i].name);
+        const char *nsl = g_call_ns ? "Noise suppression: on" : "Noise suppression: off";
+        float pw = UIS(360), ph = bh * 3 + UIS(10) * 2 + UIS(52);
+        float px = setb.left;
+        if (px + pw > body.right - 24) px = body.right - 24 - pw;
+        if (px < body.left + 24) px = body.left + 24;
+        rectf panel = rf(px, by - UIS(10) - ph, px + pw, by - UIS(10));
+        fill_round(rt, rf(panel.left + 1, panel.top + 2, panel.right + 1, panel.bottom + 2), OC_R_CONTROL, OC_COL_RAIL);
+        fill_round(rt, panel, OC_R_CONTROL, OC_COL_BASE);
+        stroke_round(rt, panel, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        draw_text(rt, "Call settings", g_ui_b, rf(panel.left + UIS(14), panel.top + UIS(8), panel.right - 12,
+                                                  panel.top + UIS(32)), OC_COL_TEXT);
+        float yy = panel.top + UIS(40), w = pw - UIS(28);
+        b = rf(panel.left + UIS(14), yy, panel.left + UIS(14) + w, yy + bh);
+        call_button(rt, b, OC_ICON_MIC, mic, 0, 0);
+        {
+            float lv = (float)st.mic_level / 32767.0f;
+            fill(rt, rf(b.left + 10, b.bottom - 5, b.left + 10 + (b.right - b.left - 20) * lv, b.bottom - 3),
+                 st.speaking ? CALL_SPEAKING : OC_COL_MUTED);
+        }
+        char mn[200]; snprintf(mn, sizeof mn, "Microphone: %s", mic);
+        call_btn_add(b, CC_MICMENU, "call.mic", mn);
+        yy += bh + UIS(10);
+        b = rf(panel.left + UIS(14), yy, panel.left + UIS(14) + w, yy + bh);
+        call_button(rt, b, OC_ICON_VOLUME, spk, 0, 0);
+        snprintf(mn, sizeof mn, "Speaker: %s", spk);
+        call_btn_add(b, CC_SPKMENU, "call.speaker", mn);
+        yy += bh + UIS(10);
+        b = rf(panel.left + UIS(14), yy, panel.left + UIS(14) + call_button_w(nsl, -1), yy + bh);
+        call_button(rt, b, -1, nsl, g_call_ns, 0);
+        call_btn_add(b, CC_NS, "call.noise", nsl);
+        if (g_toast_floor > panel.top - UIS(8)) g_toast_floor = panel.top - UIS(8);
+    }
+    /* The usual hint, whatever route the audio takes: the route is the call's
+     * business, and how to talk is the person's. */
     const char *hint = st.mic_error ? "The microphone could not be opened: you can listen, but not be heard."
                      : st.speaker_error ? "The speaker could not be opened."
                      : now_ms() < g_share_err_until ? "Sharing stopped: what was shared went away, or Windows refused it."
-                     : st.transport ? "This network blocks the call's own route, so its audio is going through the server connection."
                      : muted ? "Muted. Hold Ctrl+Shift+Space to talk; Ctrl+Shift+M to unmute."
                      : "Ctrl+Shift+M mutes. Hold Ctrl+Shift+Space to talk while muted.";
-    draw_text(rt, hint, g_meta, rf(body.left + 24, row1 - UIS(26), body.right - 24, row1 - 4),
-              st.mic_error || st.speaker_error || st.share_error ? OC_COL_DANGER : OC_COL_FAINT);
+    if (!g_call_settings)
+        draw_text(rt, hint, g_meta, rf(body.left + 24, row1 + bh - UIS(26), body.right - 24, row1 + bh - 4),
+                  st.mic_error || st.speaker_error || st.share_error ? OC_COL_DANGER : OC_COL_FAINT);
 }
 
 /* The member picker (REQ-301/302): who a start asks when the conversation has
@@ -21534,6 +23297,7 @@ static void draw_later(gfx *rt, const oc_model *m, rectf reg) {
     }
     ovl_use(OVL_LATER);
     float y = ovl_begin(rt, body, (float)shown_total * rowh + 16);
+    g_n_remhits = 0;
     for (size_t i = 0; i < m->n_saved; i++) {
         const oc_saved_view *sv = &m->saved[i];
         if (g_later_chan && sv->channel_id != g_later_chan) continue;
@@ -21564,7 +23328,27 @@ static void draw_later(gfx *rt, const oc_model *m, rectf reg) {
         stroke_round(rt, rm, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
         g_meta->align = ST_ALIGN_CENTER;
         draw_text(rt, "Remove", g_meta, rm, OC_COL_MUTED);
+        /* Its reminder (REQ-283): when, or the offer of one. */
+        char rlbl[48] = "Remind me";
+        if (sv->remind_at) {
+            time_t rt_s = (time_t)(sv->remind_at / 1000);
+            struct tm rtv;
+            if (oc_localtime_r(&rt_s, &rtv)) strftime(rlbl, sizeof rlbl, "%a %H:%M", &rtv);
+        }
+        float rw = text_width(rlbl, g_meta) + 36;
+        rectf rr = rf(rm.left - 8 - rw, y + 14, rm.left - 8, y + 38);
+        stroke_round(rt, rr, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        draw_lucide(rt, OC_ICON_BELL, rf(rr.left + 8, y + 19, rr.left + 22, y + 33),
+                    sv->remind_at ? OC_COL_ACCENT : OC_COL_MUTED);
+        draw_text(rt, rlbl, g_meta, rf(rr.left + 18, rr.top, rr.right, rr.bottom),
+                  sv->remind_at ? OC_COL_TEXT : OC_COL_MUTED);
         g_meta->align = ST_ALIGN_LEFT;
+        if (g_n_remhits < (int)(sizeof g_remhits / sizeof g_remhits[0])) {
+            g_remhits[g_n_remhits].r = rr;
+            g_remhits[g_n_remhits].mid = sv->message_id;
+            g_remhits[g_n_remhits].cid = sv->channel_id;
+            g_remhits[g_n_remhits++].at = sv->remind_at;
+        }
 
         if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
             g_listrows[g_n_listrows].row = row;
@@ -21674,6 +23458,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
         float th = dm_index0 ? 0 : draw_tabbar(rt, m, main_x, main_w);
         float bh = draw_banner(rt, m, main_x, main_w, th);  /* pushes the transcript down */
         bh += draw_e2e_strip(rt, m, main_x, main_w, HEADER_H + th + bh);   /* and so does this */
+        bh += draw_call_banner(rt, m, main_x, main_w, HEADER_H + th + bh); /* ...and a call going on in it */
         g_toast_area_l = main_x; g_toast_area_r = main_x + main_w;
         g_toast_area_t = HEADER_H + th + bh;
         {
@@ -21747,12 +23532,27 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
                 draw_sidebar(rt, m, H);
                 draw_directory(rt, m, rf(RAIL_W + SIDEBAR_W, 0, W, H));
                 break;
-            case VIEW_CALL:
+            case VIEW_CALL: {
                 /* The Home sidebar stays, like Threads: the Calls row you came
-                 * from is in it (REQ-303). */
+                 * from is in it (REQ-303). The conversation sits on the right,
+                 * its messages and its composer, unless folded away. */
                 draw_sidebar(rt, m, H);
-                draw_call_view(rt, m, rf(RAIL_W + SIDEBAR_W, 0, W, H));
+                float px = call_chat_left(W);
+                draw_call_view(rt, m, rf(RAIL_W + SIDEBAR_W, 0, px > 0 ? px : W, H));
+                if (px > 0) {
+                    fill(rt, rf(px, 0, W, H), OC_COL_BASE);
+                    fill(rt, rf(px, 0, px + 1, H), OC_COL_BORDER);
+                    char lbl[96];
+                    call_conv_label(m, g_call_view_ch, lbl, sizeof lbl);
+                    fill(rt, rf(px + 1, 0, W, HEADER_H), OC_COL_HEADER);
+                    draw_text(rt, lbl, g_ui_b, rf(px + 20, 0, W - 20, HEADER_H), OC_COL_TEXT);
+                    fill(rt, rf(px + 1, HEADER_H - 1, W, HEADER_H), OC_COL_BORDER);
+                    draw_transcript(rt, m, rf(px + 1, HEADER_H, W, H - g_composer_h));
+                    draw_composer(rt, px + 1, W - px - 1, H);
+                    draw_autocomplete(rt, px + 1, W - px - 1, H);
+                }
                 break;
+            }
             case VIEW_THREADS:
                 /* Same shape as Drafts: the Home sidebar stays, because this is a
                  * destination reached from a row in it. */
@@ -21774,6 +23574,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
     }
     draw_pastechoice(rt, W, H);   /* the paste chooser floats over the field it pastes into */
     if (!modal_open()) time_tip_draw(rt, W);   /* a time token's full date, over what it is in */
+    if (!modal_open()) call_tips_draw(rt, m, W);   /* what a call's Mute and the header's phone do */
     if (!modal_open()) replier_tip_draw(rt, W);   /* a thread replier's name */
     if (!si_over) draw_modal(rt, m, W, H);  /* your-account surfaces, over a dimmed shell */
     draw_video_overlay(rt, m, W, H);   /* the recording card and the player; menus float above */
@@ -21832,6 +23633,9 @@ static void paint(oc_win *hwnd) {
     if (m) oc_model_set_clock12((oc_model *)m, !g_pref_time24);
     g_n_splhits = 0;
     g_n_morehits = 0;
+    g_n_sephits = 0;
+    g_n_snip_hits = 0;
+    g_n_todohits = 0;
     render_scene(rt, m, W, H);
     if (!g_caret_placed) ed_caret_kill();   /* no field drew a caret this frame */
     /* Boxes placed against chrome the scene just measured, so they can only be
@@ -21988,7 +23792,7 @@ static void ed_invalidate_layout(void) {
 
 static void ed_hidden_build(void) {
     static char u8[ED_MAX * 3 + 1];
-    oc_rt_span sp[OC_RT_MAX];
+    oc_rt_span *sp = NULL;
     size_t n, i;
     int bytes;
     g_ed_hidden_valid = 1;
@@ -22004,8 +23808,12 @@ static void ed_hidden_build(void) {
     bytes = to_u8n(g_ed, g_ed_len, u8, (int)sizeof u8 - 1);
     if (bytes <= 0) return;
     u8[bytes] = 0;
-    n = oc_rt_scan(u8, (size_t)bytes, sp, OC_RT_MAX);
-    if (n > OC_RT_MAX) n = OC_RT_MAX;
+    /* Every span, however many: read at a fixed 128, a draft's delimiters
+     * past its 42nd spoiler or so stayed in view, and the caret stepped over
+     * them as text (MARKDOWN.md §1d, "however many spoilers the draft holds"). */
+    n = oc_rt_scan(u8, (size_t)bytes, NULL, 0);
+    if (!n || !(sp = malloc(n * sizeof *sp))) return;
+    n = oc_rt_scan(u8, (size_t)bytes, sp, n);
     for (i = 0; i < n; i++) {
         int at, len, k;
         /* Only INLINE delimiters vanish. A list marker or a quote's `> ` is the
@@ -22028,6 +23836,7 @@ static void ed_hidden_build(void) {
         if (at < 0 || len <= 0) continue;
         for (k = at; k < at + len && k < g_ed_len; k++) g_ed_hidden[k] = kind;
     }
+    free(sp);
 }
 
 static void ed_delete_range(int a, int b);   /* fwd */
@@ -22109,84 +23918,85 @@ static int ed_is_space(oc_wch c);   /* fwd */
 static void ed_insert_n(const oc_wch *s, int n);   /* fwd */
 static int ed_spoiler_edit(int p, int so, int sn) {
     static char u8[ED_MAX * 3 + 1];
-    static oc_wch out[ED_MAX + 1];
-    oc_rt_spoiler sv[64];
+    static oc_wch out[ED_MAX + 32];
+    static const oc_wch OPEN[] = { u'`', u'`', u'`', u's', u'p', u'o', u'i', u'l', u'e', u'r', u'\n' };
     int bytes = to_u8n(g_ed_prev, g_ed_prev_len, u8, (int)sizeof u8 - 1);
     if (bytes <= 0) return 0;
-    size_t nv = oc_rt_spoilers(u8, (size_t)bytes, sv, 64);
-    if (nv > 64) nv = 64;
-    for (size_t k = 0; k < nv; k++) {
+    /* Every spoiler in the draft, however many: past a bound one used to come
+     * apart in the open. */
+    size_t nv = oc_rt_spoilers(u8, (size_t)bytes, NULL, 0);
+    oc_rt_spoiler *sv = nv ? malloc(nv * sizeof *sv) : NULL;
+    if (!sv) return 0;
+    nv = oc_rt_spoilers(u8, (size_t)bytes, sv, nv);
+    int dealt = 0;
+    for (size_t k = 0; k < nv && !dealt; k++) {
         if (sv[k].block || sv[k].cell) continue;
         int os = to_w_count(u8, (int)sv[k].start), oe = to_w_count(u8, (int)(sv[k].start + sv[k].len));
         if (p < os + 2 || so > oe - 2) continue;
         int ne = oe + (sn - so), nl = 0;
         for (int i = p; i < sn; i++) if (g_ed[i] == u'\n') nl = 1;
         if (!nl) {
+            /* Plain text shows the markup, which the writer edits as they like. */
+            if (!g_pref_richtext) break;
             int text = 0;
             for (int i = os + 2; i < ne - 2; i++) if (!ed_is_space(g_ed[i])) text = 1;
-            if (g_ed_hidden[os] || !text) return 0;
+            if (g_ed_hidden[os] || !text) break;
             memcpy(g_ed, g_ed_prev, (size_t)(g_ed_prev_len + 1) * sizeof(oc_wch));
             g_ed_len = g_ed_prev_len;
             g_ed_caret = g_ed_anchor = p;
             ed_invalidate_layout();
-            return 1;
+            dealt = 1;
+            break;
         }
-        /* Rebuilt line by line, each with text in its own delimiters. */
-        int o = 0, caret = -1, at = os + 2, fits = 1, first = 1;
-        while (at <= ne - 2 && fits) {
-            int le = at, m = at, text = 0;
-            while (le < ne - 2 && g_ed[le] != u'\n') le++;
-            if (!first) {
-                for (;;) {
-                    int q = m;
-                    while (q < le && g_ed[q] >= u'0' && g_ed[q] <= u'9') q++;
-                    if (q > m && q + 1 < le && g_ed[q] == u'.' && g_ed[q + 1] == u' ') m = q + 2;
-                    else if (m + 1 < le && (g_ed[m] == u'>' || g_ed[m] == u'-') && g_ed[m + 1] == u' ') m += 2;
-                    else break;
-                }
-            }
-            for (int i = m; i < le; i++) if (!ed_is_space(g_ed[i])) text = 1;
-            if (o + (le - at) + 5 > ED_MAX) { fits = 0; break; }
-            for (int i = at; i < m; i++) out[o++] = g_ed[i];
-            if (text) { out[o++] = u'>'; out[o++] = u'!'; }
-            if (g_ed_caret >= m && g_ed_caret <= le) caret = o + (g_ed_caret - m);
-            for (int i = m; i < le; i++) out[o++] = g_ed[i];
-            if (text) { out[o++] = u'!'; out[o++] = u'<'; }
-            if (le < ne - 2) out[o++] = u'\n';
-            first = 0;
-            at = le + 1;
-        }
-        if (fits && g_ed_len - (ne - os) + o <= ED_MAX) {
+        /* A line break inside one, in either mode: the spoiler stays whole, as a
+         * block (MARKDOWN.md §1d), its fences on lines of their own, so what it
+         * hides goes on hiding all of it. */
+        int lead = os > 0 && g_ed[os - 1] != u'\n', tail = ne < g_ed_len && g_ed[ne] != u'\n';
+        int body = (ne - 2) - (os + 2), o = 0, caret = -1;
+        if (body < 0) body = 0;
+        if (g_ed_len - (ne - os) + lead + 11 + body + 4 + tail <= ED_MAX) {
+            if (lead) out[o++] = u'\n';
+            memcpy(out + o, OPEN, sizeof OPEN); o += 11;
+            if (g_ed_caret >= os + 2 && g_ed_caret <= ne - 2) caret = o + (g_ed_caret - (os + 2));
+            memcpy(out + o, g_ed + os + 2, (size_t)body * sizeof(oc_wch)); o += body;
+            out[o++] = u'\n'; out[o++] = u'`'; out[o++] = u'`'; out[o++] = u'`';
+            if (tail) out[o++] = u'\n';
             ed_delete_range(os, ne);
             g_ed_caret = g_ed_anchor = os;
             ed_insert_n(out, o);
             if (caret >= 0) g_ed_caret = g_ed_anchor = os + caret;
-            g_ed_hidden_valid = 0;
-            ed_hidden_build();
-            g_ed_caret = g_ed_anchor = ed_canon(g_ed_caret);
-        } else {                       /* no room to split it: the edit is not made */
+            if (g_pref_richtext) {
+                g_ed_hidden_valid = 0;
+                ed_hidden_build();
+                g_ed_caret = g_ed_anchor = ed_canon(g_ed_caret);
+            }
+        } else {                       /* no room for the fences: the edit is not made */
             memcpy(g_ed, g_ed_prev, (size_t)(g_ed_prev_len + 1) * sizeof(oc_wch));
             g_ed_len = g_ed_prev_len;
             g_ed_caret = g_ed_anchor = p;
             ed_invalidate_layout();
         }
-        return 1;
+        dealt = 1;
     }
-    return 0;
+    free(sv);
+    return dealt;
 }
 
 static void ed_repair_orphans(void) {
     int p = 0, so, sn, i, drop[64], n = 0, caret = g_ed_caret, anchor = g_ed_anchor;
-    /* Plain text hides nothing, so there is nothing that can stop being hidden.
-     * Belt as well as braces: ed_mode_changed() re-baselines the snapshot, and
-     * this makes the pass inert in the mode it has no business running in. */
-    if (!g_pref_richtext) return;
     if (g_ed_prev_len <= 0) return;
     while (p < g_ed_prev_len && p < g_ed_len && g_ed_prev[p] == g_ed[p]) p++;
     so = g_ed_prev_len; sn = g_ed_len;
     while (so > p && sn > p && g_ed_prev[so - 1] == g_ed[sn - 1]) { so--; sn--; }
-    if (!g_ed_hidden_valid) ed_hidden_build();
+    if (g_pref_richtext && !g_ed_hidden_valid) ed_hidden_build();
+    /* A line break inside a spoiler, in either mode: it would otherwise go out
+     * as an unclosed `>!` and a stray `!<`, in the open. */
     if (ed_spoiler_edit(p, so, sn)) return;
+    /* Plain text hides nothing else, so there is nothing that can stop being
+     * hidden. Belt as well as braces: ed_mode_changed() re-baselines the
+     * snapshot, and this makes the rest inert in the mode it has no business
+     * running in. */
+    if (!g_pref_richtext) return;
     /* Untouched head, then untouched tail at its new offset. Anything inside the
      * edit itself is the user's own typing and is never second-guessed. */
     /* Not a spoiler's `>!` or `!<`, whatever broke it: without them what it hid
@@ -22240,6 +24050,26 @@ static void ed_mode_changed(void) {
     ed_invalidate_layout();
     ed_hidden_build();
     ed_remember();
+}
+
+/* A body about to be sent that opens a spoiler and never closes it would show
+ * what its writer meant to hide (MARKDOWN.md §1d): it is not sent, and the caret
+ * goes to where the spoiler opens. Returns 1 when it refused `b`. */
+static int ed_refuse_open_spoiler(const char *b) {
+    size_t at = b ? oc_rt_open_spoiler(b, strlen(b)) : (size_t)-1;
+    if (at == (size_t)-1) return 0;
+    /* The offset is in the Markdown sent; it is the field's own only when no
+     * table card stands for more text than its one character. */
+    if (!ed_has_tab()) {
+        int w = to_w_count(b, (int)at);
+        if (w >= 0 && w <= g_ed_len) {
+            g_ed_caret = g_ed_anchor = w;
+            ed_invalidate_layout();
+        }
+    }
+    composer_hint("This spoiler is never closed, so it would be sent readable. "
+                  "Add !< where it ends, or write \\>! for the characters themselves.", 1);
+    return 1;
 }
 
 /* One step left/right, crossing any invisible run in the same keypress —
@@ -23767,6 +25597,30 @@ static void draw_pastechoice(gfx *rt, float W, float H) {
     }
 }
 
+/* Ask for a snippet's title and language, then post `text` as one into the
+ * open conversation, where a file would go. */
+static void snippet_compose(oc_win *hwnd, const char *text) {
+    if (!g_client || !g_sel || !text || !text[0]) return;
+    size_t n = strlen(text);
+    if (n > OC_SNIPPET_MAX_SIZE) { fb_failed("A snippet can be at most 1 MB."); return; }
+    oc_field f[2] = {
+        { FF_TEXT,   "Title", "What it is, for the card and for search.", "" },
+        { FF_CHOICE, "Language", "Plain text|C|Python|JavaScript|Shell|JSON|YAML|SQL|Go", "0" },
+    };
+    /* A first line that is short names it well enough to start from. */
+    const char *nl = strchr(text, '\n');
+    size_t fl = nl ? (size_t)(nl - text) : n;
+    if (fl > 0 && fl <= 60) { memcpy(f[0].value, text, fl); f[0].value[fl] = '\0'; }
+    else snprintf(f[0].value, sizeof f[0].value, "Snippet");
+    if (!form_dialog(hwnd, "Create snippet", f, 2)) return;
+    if (!f[0].value[0]) snprintf(f[0].value, sizeof f[0].value, "Snippet");
+    int lang = atoi(f[1].value);
+    if (lang < 0 || lang >= OC_LANG_COUNT) lang = OC_LANG_NONE;
+    if (oc_client_post_snippet(g_client, g_sel, 0, f[0].value, oc_lex_name(lang), text))
+        fb_confirm("Posting the snippet\xE2\x80\xA6");
+    else fb_failed("The snippet could not be posted.");
+}
+
 static void ed_clip_paste(oc_win *hwnd) {
     pastechoice_close();
     if (clip_paste_attach(hwnd)) return;
@@ -23775,6 +25629,18 @@ static void ed_clip_paste(oc_win *hwnd) {
         /* Cells from a sheet ask first. */
         oc_table *t = oc_table_from_tsv(src, strlen(src));
         if (t) pastechoice_open(src, t);
+        else if (g_sel && oc_snippet_offer(src, strlen(src))) {
+            /* Long enough to read better as a snippet (REQ-226): asked first. */
+            free(g_snip_paste);
+            g_snip_paste = strdup(src);
+            int lines = 1;
+            for (const char *q = src; *q; q++) if (*q == '\n' && q[1]) lines++;
+            char body[200];
+            snprintf(body, sizeof body,
+                     "That is %d lines. As a snippet it shows its first few lines, opens whole "
+                     "with its colours, and stays searchable.", lines);
+            confirm_open(hwnd, CONF_SNIPPET_PASTE, 0, "Make it a snippet?", body, "Make a snippet");
+        }
         else ed_paste_text(src);
     }
     SDL_free(src);
@@ -24402,6 +26268,7 @@ static void layout_composer(oc_win *hwnd);     /* fwd */
  * popover and repaint. One place, so no key handler can forget a step. */
 static void ed_changed(oc_win *hwnd) {
     g_cmp_hint[0] = '\0';                 /* an edit answers the hint */
+    g_ooo_note_dirty = 1;                 /* and may mention someone away */
     /* The typing indicator used to ride EN_CHANGE from the RichEdit. This is that
      * notification's replacement, and the rate limit is the same 2s. */
     uint32_t now = (uint32_t)now_ms();
@@ -24409,7 +26276,11 @@ static void ed_changed(oc_win *hwnd) {
         /* Not from the New message pane: its text is for somebody who is not in
          * the channel g_sel names, and they would see you typing into theirs. */
         if (g_view != VIEW_NEWMSG) {
-            oc_client_typing(g_client, g_sel);
+            /* In a thread when the box replies in one (composer_send), so it
+             * shows in that thread's pane and not in the main scroll (REQ-121). */
+            const oc_model *tm = model();
+            if (tm && tm->thread_open) oc_client_typing(g_client, tm->thread_channel, tm->thread_parent);
+            else oc_client_typing(g_client, g_sel, 0);
             g_last_typing = now;
         }
     }
@@ -25163,11 +27034,15 @@ enum {
     AT_CTABLE,        /* payload: a composer card's slot * 2, + 1 for its Remove (else its Edit) */
     AT_PASTECHOICE,   /* payload: the paste chooser's choice (PCH_*) */
     AT_EMOJIDEL,      /* payload: Admin > Custom emoji's Delete hit-box index */
+    AT_EMOJIREN,      /* payload: its Rename hit-box index (REQ-072) */
     AT_EMOJIFIND,     /* Admin > Custom emoji's search box */
     AT_PICKMANAGE,    /* the emoji picker's Manage link */
     AT_PREVIEW,       /* the composer's Preview / Edit */
     AT_SPOILER,       /* payload: index into g_splhits -- reveal or cover it */
-    AT_MORE           /* payload: index into g_morehits -- open that cut message */
+    AT_MORE,          /* payload: index into g_morehits -- open that cut message */
+    AT_THRDATE,       /* the thread pane's Jump to date */
+    AT_RXSHOW,        /* payload: index into g_rx_show_hits -- show that muted person's reaction */
+    AT_JUMPCAL        /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the jump-to-date calendar */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -25434,7 +27309,8 @@ static void a11y_publish_scene(const oc_model *m) {
 
     /* Admin's tabs, and Alerts' Acknowledge buttons, named for what they act on. */
     if (g_view == VIEW_ADMIN) {
-        static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts", "emoji" };
+        static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts", "emoji", "usage", "blocks",
+                                                       "profile-fields" };
         int admin = self_role(m) >= OC_ROLE_ADMIN;
         for (int t = 0; t < ADM_COUNT && n < OC_ACC_MAX; t++) {
             if (!admin && t != ADM_EMOJI) continue;
@@ -25464,6 +27340,12 @@ static void a11y_publish_scene(const oc_model *m) {
                 snprintf(nm, sizeof nm, "Delete :%s:", g_emojirows[i].name);
                 acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_emojirows[i].r, ATOK(AT_EMOJIDEL, (uint64_t)i));
             }
+            for (int i = 0; i < g_n_emojiren && n < OC_ACC_MAX; i++) {
+                char aid[OC_ACC_AID_MAX], nm[64];
+                snprintf(aid, sizeof aid, "admin.emoji.%s.rename", g_emojiren[i].name);
+                snprintf(nm, sizeof nm, "Rename :%s:", g_emojiren[i].name);
+                acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_emojiren[i].r, ATOK(AT_EMOJIREN, (uint64_t)i));
+            }
         }
     }
 
@@ -25482,8 +27364,15 @@ static void a11y_publish_scene(const oc_model *m) {
     for (int i = 0; i < g_n_morehits && n < OC_ACC_MAX; i++) {
         char aid[OC_ACC_AID_MAX];
         snprintf(aid, sizeof aid, "message.%llu.expand", (unsigned long long)g_morehits[i].mid);
-        acc_push(items, &n, OC_ACC_BUTTON, aid, g_morehits[i].kind == 1 ? "Show message" : "Show more",
+        acc_push(items, &n, OC_ACC_BUTTON, aid, g_morehits[i].kind == 2 ? "Show more" : "Show message",
                  g_morehits[i].r, ATOK(AT_MORE, (uint64_t)i));
+    }
+    /* The thread pane's Jump to date, while that pane is up. */
+    {
+        const oc_model *tm = model();
+        if (tm && tm->thread_open && !modal_open() && g_thr_date_btn.right > g_thr_date_btn.left && n < OC_ACC_MAX)
+            acc_push(items, &n, OC_ACC_BUTTON, "thread.jumpdate", "Jump to date in this thread",
+                     g_thr_date_btn, ATOK(AT_THRDATE, 0));
     }
 
     /* The notices: each toast's action and close, named by what they act on, so
@@ -25818,6 +27707,14 @@ static void a11y_publish_scene(const oc_model *m) {
                  g_rxn_chip[i].mine ? "yours: press to take it back" : "press to react");
         acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_rxn_chip[i].r, ATOK(AT_REACTCHIP, (uint64_t)i));
     }
+    /* A muted person's folded reactions there, each its own Show (SET_USER_MUTE). */
+    const oc_model *rxa = model();
+    for (int i = 0; rxa && rxa->reactlist_open && i < g_n_rx_show_hits && n < OC_ACC_MAX; i++) {
+        char aid[OC_ACC_AID_MAX];
+        snprintf(aid, sizeof aid, "reactors.show.%d", i);
+        acc_push(items, &n, OC_ACC_BUTTON, aid, "Show this reaction from a muted person",
+                 g_rx_show_hits[i].r, ATOK(AT_RXSHOW, (uint64_t)i));
+    }
     /* Each poll's options (REQ-225), named by what they say, how many chose
      * them and whether you did; and its "See who voted". By identity -- the
      * message and the option -- never by where the row happens to be. */
@@ -26051,6 +27948,20 @@ modal_items:
                 acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_sr_days[i].r, ATOK(AT_SUMCAL, (uint64_t)ymd));
             }
         }
+        /* The jump-to-date calendar: ids from the date, as the range card's are. */
+        if (g_jc_open) {
+            acc_push(items, &n, OC_ACC_BUTTON, "jumpcal.prev", "Previous month", g_jc_prev, ATOK(AT_JUMPCAL, 1));
+            if (g_jc_next.right > g_jc_next.left)
+                acc_push(items, &n, OC_ACC_BUTTON, "jumpcal.next", "Next month", g_jc_next, ATOK(AT_JUMPCAL, 2));
+            for (int i = 0; i < g_n_jc_days && n < OC_ACC_MAX; i++) {
+                if (!g_jc_days[i].on) continue;
+                char aid[OC_ACC_AID_MAX], nm[48];
+                int ymd = g_jc_days[i].y * 10000 + (g_jc_days[i].m + 1) * 100 + g_jc_days[i].d;
+                snprintf(aid, sizeof aid, "jumpcal.day.%d", ymd);
+                snprintf(nm, sizeof nm, "%s %d", SCH_MONTHS[g_jc_days[i].m], g_jc_days[i].d);
+                acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_jc_days[i].r, ATOK(AT_JUMPCAL, (uint64_t)ymd));
+            }
+        }
         /* The table editor (MARKDOWN.md §6): the column count, the header
          * row, each column's alignment and remove, each row's remove, the add
          * buttons and every cell drawn, named by row and column. */
@@ -26259,6 +28170,7 @@ static void sched_at(oc_win *hwnd, uint64_t at) {
         composer_hint("This message is too long to send. Make a table smaller, or split it in two.", 1);
         return;
     }
+    if (ed_refuse_open_spoiler(b)) { free(b); return; }
     /* Into the thread when the composer is replying in one, exactly as a send
      * would be (composer_send): the root rides the schedule, and the daemon posts
      * it as a reply when it fires. */
@@ -26337,6 +28249,7 @@ static void composer_send(void) {
      * so the body is measured against the daemon's limit here, where the text
      * is still in the box to be shortened. */
     char *b = ed_md_all();
+    if (ed_refuse_open_spoiler(b)) { free(b); return; }
     /* What is left of the typed emoticons -- the last one, with no space after
      * it -- is converted as it goes. */
     if (b) {
@@ -26547,6 +28460,11 @@ static float members_w(float client_w_dip) {
 }
 
 static int main_is_conversation(void) {
+    /* The call view's side panel is the call's conversation, typed into. */
+    if (g_view == VIEW_CALL) {
+        irect rc; client_rect(g_main, &rc);
+        return call_chat_left(DIPF(rc.right)) > 0;
+    }
     if (!transcript_shell()) return 0;
     const oc_model *m = model();
     /* A middle-column surface that is not a conversation: search results, the
@@ -26606,6 +28524,8 @@ static void layout_composer(oc_win *hwnd) {
     rc.right = (int32_t)DIPF(rc.right); rc.bottom = (int32_t)DIPF(rc.bottom);
     float members = members_w((float)rc.right);
     float main_x = RAIL_W + SIDEBAR_W;
+    /* In a call, the conversation's panel on the right holds the composer. */
+    if (g_view == VIEW_CALL) { main_x = call_chat_left((float)rc.right) + 1; members = 0; }
     /* Inside the composer box, between the attach (+) and send buttons. */
     float bx0 = main_x + 20, bx1 = (rc.right - members) - 20;
     /* The SAME call draw_composer makes, so the rect ed_hit tests against is the
@@ -26763,6 +28683,7 @@ static void palette_close(oc_win *hwnd) {
     /* Dismissing the picker cancels the forward. Leaving g_fwd_mid set would turn
      * the NEXT palette open — a plain jump-to — into a silent forward. */
     if (g_fwd_mid && !g_pal_accepting) { g_fwd_mid = g_fwd_cid = 0; }
+    if (g_move_mid && !g_pal_accepting) { g_move_mid = g_move_cid = 0; }
     g_pal_open = 0; g_pal_sel = 0;
     if (g_pal_edit) field_show(g_pal_edit, 0);
     ed_focus(g_main);
@@ -26784,6 +28705,7 @@ static void palette_open(oc_win *hwnd) {
  * form, and the palette must not still be on screen behind it. */
 static int  permalink_follow(oc_win *hwnd, const char *text);   /* fwd */
 static void forward_send(oc_win *hwnd, uint64_t to_cid);        /* fwd */
+static void move_pick(oc_win *hwnd, uint64_t to_cid);           /* fwd */
 
 static void palette_accept(oc_win *hwnd) {
     g_pal_accepting = 1;
@@ -26811,6 +28733,12 @@ static void palette_accept(oc_win *hwnd) {
     if (g_fwd_mid) {
         if (cid) forward_send(hwnd, cid);
         else     { g_fwd_mid = g_fwd_cid = 0; fb_confirm("Forward cancelled."); }
+        g_pal_accepting = 0;
+        return;
+    }
+    if (g_move_mid) {
+        if (cid) move_pick(hwnd, cid);
+        else     { g_move_mid = g_move_cid = 0; fb_confirm("Move cancelled."); }
         g_pal_accepting = 0;
         return;
     }
@@ -28798,6 +30726,8 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
         mi_item(106, "Forward");
         mi_item(105, "Copy link");
         mi_item(104, "Save for later");
+        /* Reminders (REQ-283): on a saved message, which this saves. */
+        if (!msg->deleted) mi_item(114, (msg->saved && msg->remind_at) ? "Reminder\xE2\x80\xA6" : "Remind me\xE2\x80\xA6");
     }
     mi_item(20,  "Copy text");
     /* Spoilers (MARKDOWN.md §1d), from the keyboard: Ctrl+Up to the message,
@@ -28821,6 +30751,22 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
         mi_item(109, "Copy table");
     }
     int own = (msg->author_id == m->user_id);
+    /* Mute the author, for me alone: someone else, never the workspace itself. */
+    if (!own && msg->author_id && !oc_model_is_workspace_sender(m, msg->author_id)) {
+        char lbl[120];
+        const char *an = oc_model_user_name((oc_model *)m, msg->author_id);
+        snprintf(lbl, sizeof lbl, "%s %s", oc_model_is_muted_user(m, msg->author_id) ? "Unmute" : "Mute",
+                 an && an[0] ? an : "this person");
+        mi_item(121, lbl);
+    }
+    /* Block the author, for me alone: someone else, never the workspace itself. */
+    if (!own && msg->author_id && !oc_model_is_workspace_sender(m, msg->author_id)) {
+        char lbl[120];
+        const char *an = oc_model_user_name((oc_model *)m, msg->author_id);
+        snprintf(lbl, sizeof lbl, "%s %s", oc_model_is_blocked(m, msg->author_id) ? "Unblock" : "Block",
+                 an && an[0] ? an : "this person");
+        mi_item(122, lbl);
+    }
     int canmod = own || self_role(m) >= OC_ROLE_ADMIN;
     /* The workspace's windows (REQ-051/052): an author's own message stops
      * offering Edit or Delete once the daemon would refuse it; a moderator's
@@ -28828,9 +30774,13 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
     int may_edit = own && oc_model_may_change_own(m, msg->server_time, 1, wall_ms());
     int may_del = own ? oc_model_may_change_own(m, msg->server_time, 0, wall_ms()) : canmod;
     if ((may_edit || may_del || (own && msg->poll)) && !msg->deleted && !locked) mi_sep();
-    if (may_edit && !msg->deleted && !locked) mi_item(21, "Edit");
+    if (may_edit && !msg->deleted && !locked && !msg->todo) mi_item(21, "Edit");   /* a list is not edited */
     if (own && msg->poll && !msg->deleted && !locked) mi_item(108, "Edit poll");   /* REQ-225 */
     if (may_del && !msg->deleted && !locked) mi_item_d(22, "Delete");
+    /* Move (REQ-053): an author's own, or anything for an admin or owner, out
+     * of a channel -- a direct conversation's messages stay where they were said. */
+    if (canmod && !msg->deleted && !e2e && !locked && c && c->kind != OC_CHANNEL_KIND_DM && !c->archived)
+        mi_item(113, "Move…");
 
     g_menu = MENU_MSG; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 248;
     g_menu_target = mid; g_menu_target2 = chan;
@@ -28866,11 +30816,113 @@ static void thumb_menu_run(oc_win *hwnd, int cmd) {
 }
 
 static void member_menu_run(oc_win *hwnd, int cmd);    /* fwd */
+static void audit_menu_run(oc_win *hwnd, int cmd);     /* fwd */
 static void channel_menu_run(oc_win *hwnd, int cmd);   /* fwd */
+
+/* The reader's local time `days` days from today at hh:mm, in ms; 0 if the
+ * clock cannot be read. */
+static uint64_t local_at(int days, int hh, int mm) {
+    time_t now = time(NULL);
+    struct tm tv;
+    if (!oc_localtime_r(&now, &tv)) return 0;
+    tv.tm_mday += days; tv.tm_hour = hh; tv.tm_min = mm; tv.tm_sec = 0; tv.tm_isdst = -1;
+    time_t t = mktime(&tv);
+    return t == (time_t)-1 ? 0 : (uint64_t)t * 1000u;
+}
+
+/* "14:30" today (tomorrow once it has passed), or "2026-05-03 14:30": the
+ * moment, or 0 for neither. */
+static uint64_t parse_when(const char *s) {
+    int y, mo, d, hh, mm;
+    if (sscanf(s, "%d-%d-%d %d:%d", &y, &mo, &d, &hh, &mm) == 5) {
+        if (mo < 1 || mo > 12 || d < 1 || d > 31 || hh < 0 || hh > 23 || mm < 0 || mm > 59) return 0;
+        struct tm t = {0};
+        t.tm_year = y - 1900; t.tm_mon = mo - 1; t.tm_mday = d; t.tm_hour = hh; t.tm_min = mm; t.tm_isdst = -1;
+        time_t r = mktime(&t);
+        return r == (time_t)-1 ? 0 : (uint64_t)r * 1000u;
+    }
+    if (sscanf(s, "%d:%d", &hh, &mm) == 2 && hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+        uint64_t at = local_at(0, hh, mm);
+        if (at && at <= (uint64_t)time(NULL) * 1000u) at = local_at(1, hh, mm);
+        return at;
+    }
+    return 0;
+}
+
+/* "Remind me…" (REQ-283): the usual moments, any other, and a clear when one
+ * is set. A menu of its own about the same message. */
+static void remind_menu_open(oc_win *hwnd, uint64_t mid, uint64_t chan, float x, float y, uint64_t current) {
+    g_n_mi = 0;
+    if (current) {
+        char when[64], lbl[96];
+        time_t t = (time_t)(current / 1000);
+        struct tm tv;
+        if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%a %d %b, %H:%M", &tv);
+        else snprintf(when, sizeof when, "set");
+        snprintf(lbl, sizeof lbl, "REMINDER: %s", when);
+        mi_section(lbl);
+    } else mi_section("REMIND ME");
+    mi_item(115, "In 20 minutes");
+    mi_item(116, "In 1 hour");
+    mi_item(117, "Tomorrow at 9:00");
+    mi_item(118, "Next Monday at 9:00");
+    mi_item(119, "At a time\xE2\x80\xA6");
+    if (current) mi_item_d(120, "Clear reminder");
+    g_menu = MENU_MSG; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 240;
+    g_menu_target = mid; g_menu_target2 = chan;
+    g_menu_x = x; g_menu_y = y;
+    irect rc; client_rect(hwnd, &rc);
+    float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
+    float H = DIPF(rc.bottom), W = DIPF(rc.right);
+    if (g_menu_y + h > H - 8) g_menu_y = H - 8 - h;
+    if (g_menu_y < 8) g_menu_y = 8;
+    if (g_menu_x + g_menu_w > W - 8) g_menu_x = W - 8 - g_menu_w;
+    invalidate();
+}
+
+/* Set a reminder and say when, in the reader's words. */
+static void remind_set(uint64_t mid, uint64_t at) {
+    if (!g_client || !mid || !at) return;
+    oc_client_set_reminder(g_client, mid, at);
+    char when[64], note[96];
+    time_t t = (time_t)(at / 1000);
+    struct tm tv;
+    if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%a %d %b at %H:%M", &tv);
+    else snprintf(when, sizeof when, "then");
+    snprintf(note, sizeof note, "Saved. You'll be reminded %s.", when);
+    fb_confirm(note);
+}
 
 static void msg_menu_run(oc_win *hwnd, int cmd) {
     const oc_model *m = model();
     if (!m || !cmd) return;
+    /* The reminder menu's choices need only the message's id: it may be a
+     * saved one that is not loaded. */
+    if (cmd >= 115 && cmd <= 120) {
+        uint64_t rid = g_menu_target;
+        uint64_t now = (uint64_t)time(NULL) * 1000u;
+        if (cmd == 115) remind_set(rid, now + 20u * 60u * 1000u);
+        else if (cmd == 116) remind_set(rid, now + 60u * 60u * 1000u);
+        else if (cmd == 117) remind_set(rid, local_at(1, 9, 0));
+        else if (cmd == 118) {
+            time_t tn = time(NULL); struct tm tv;
+            int wd = oc_localtime_r(&tn, &tv) ? tv.tm_wday : 1;
+            int ahead = (8 - wd) % 7; if (ahead == 0) ahead = 7;   /* Monday is 1 */
+            remind_set(rid, local_at(ahead, 9, 0));
+        } else if (cmd == 119) {
+            oc_field f[1] = { { FF_TEXT, "When",
+                                "As 14:30 (today, or tomorrow once it has passed), or 2026-05-03 14:30.", "" } };
+            if (form_dialog(hwnd, "Remind me", f, 1) && f[0].value[0]) {
+                uint64_t at = parse_when(f[0].value);
+                if (at > now) remind_set(rid, at);
+                else fb_failed("That is not a time to come. Try 14:30 or 2026-05-03 14:30.");
+            }
+        } else if (cmd == 120 && g_client) {
+            oc_client_set_reminder(g_client, rid, 0);
+            fb_confirm("Reminder cleared. The message stays saved.");
+        }
+        return;
+    }
     uint64_t mid = g_menu_target, chan = g_menu_target2;
     const oc_channel *c = oc_model_channel((oc_model *)m, chan);
     const oc_msg *msg = find_msg(c, mid);
@@ -28882,7 +30934,11 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
     if (cmd == 7) {
         picker_open(hwnd, mid);
     } else if (cmd == 20) {
-        copy_to_clipboard(hwnd, msg->body ? msg->body : "");
+        /* What a covered spoiler hides stays covered (MARKDOWN.md §1d), in a
+         * message and in a /me action alike. */
+        const char *t = msg->body ? msg->body : "";
+        char *cv = copy_covered(mid, t, 0, 0, strlen(t));
+        if (cv) { copy_to_clipboard(hwnd, cv); free(cv); }
     } else if (cmd == 109) {
         copy_table(hwnd, msg, g_menu_tab);
     } else if (cmd == 110) {
@@ -28896,6 +30952,16 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
     } else if (cmd == 112) {
         msg_expand(mid, 0);
         if (g_client) oc_client_set_collapsed(g_client, mid, 1);
+    } else if (cmd == 121) {
+        int on = !oc_model_is_muted_user(m, msg->author_id);
+        if (g_client) oc_client_set_user_mute(g_client, msg->author_id, on);
+        fb_confirm(on ? "Muted. Their messages stay folded away and no longer notify you."
+                      : "Unmuted.");
+    } else if (cmd == 122) {
+        int on = !oc_model_is_blocked(m, msg->author_id);
+        if (g_client) oc_client_set_block(g_client, msg->author_id, on);
+        fb_confirm(on ? "Blocked. They can't start a conversation with you, and you won't get their direct messages."
+                      : "Unblocked.");
     } else if (cmd == 21) {
         composer_begin_edit(msg);
     } else if (cmd == 108) {
@@ -28955,11 +31021,18 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
          * with a filter, so a forward needs no picker of its own. */
         g_fwd_mid = mid; g_fwd_cid = chan;
         palette_open(hwnd);
+    } else if (cmd == 113) {
+        /* The palette picks where it goes, as for a forward (REQ-053). */
+        g_fwd_mid = g_fwd_cid = 0;
+        g_move_mid = mid; g_move_cid = chan;
+        palette_open(hwnd);
     } else if (cmd == 104) {
         /* Private, so there is no "unsave" state to reflect here — the Later view
          * is where you remove one. */
         oc_client_save_item(g_client, mid, OC_SAVE_ADD);
         fb_confirm("Saved to Later.");
+    } else if (cmd == 114) {
+        remind_menu_open(hwnd, mid, chan, g_menu_x, g_menu_y, msg->saved ? msg->remind_at : 0);
     } else if (cmd == 103) {
         oc_client_pin(g_client, chan, mid, msg->pinned ? OC_PIN_REMOVE : OC_PIN_ADD);
     } else if (cmd >= 30 && cmd - 30 < msg->n_attach) {
@@ -28990,6 +31063,8 @@ static void show_member_menu(oc_win *hwnd, const oc_model *m, uint64_t uid, floa
     g_n_mi = 0;
     mi_item(2, "View profile");
     if (!self) mi_item(1, "Message");
+    if (!self) mi_item(18, oc_model_is_muted_user(m, uid) ? "Unmute" : "Mute");
+    if (!self) mi_item(19, oc_model_is_blocked(m, uid) ? "Unblock" : "Block");
     /* Out of the open channel (REQ-309), as the pane's row offers -- or, for
      * someone a group keeps in, why not, as Leave does for yourself. */
     uint64_t chan = 0;
@@ -29073,6 +31148,21 @@ static void member_menu_run(oc_win *hwnd, int cmd) {
         oc_client_reset_credential(g_client, uid, cmd == 16);
         break;
     case 14: if (g_menu_target2) oc_client_channel_kick(g_client, g_menu_target2, uid); break;
+    case 18: {   /* mute or unmute them, for me alone */
+        const oc_model *m = model();
+        int on = !(m && oc_model_is_muted_user(m, uid));
+        if (g_client) oc_client_set_user_mute(g_client, uid, on);
+        fb_confirm(on ? "Muted. Their messages stay folded away and no longer notify you." : "Unmuted.");
+        break;
+    }
+    case 19: {   /* block or unblock them, for me alone */
+        const oc_model *m = model();
+        int on = !(m && oc_model_is_blocked(m, uid));
+        if (g_client) oc_client_set_block(g_client, uid, on);
+        fb_confirm(on ? "Blocked. They can't start a conversation with you, and you won't get their direct messages."
+                      : "Unblocked.");
+        break;
+    }
     default: break;
     }
 }
@@ -29143,7 +31233,8 @@ static int files_click(oc_win *hwnd, int x, int y) {
         if ((size_t)g_filerows[i].ix >= fm->n_files) continue;
         const oc_file_view *f = &fm->files[g_filerows[i].ix];
         if (in_rect(g_filerows[i].dl, (float)x, (float)y)) {
-            oc_attachment at = { f->id, {0}, {0}, f->size, f->reclaimed, f->media_kind, f->duration_ms, 0, 0, 0 };
+            oc_attachment at = { f->id, {0}, {0}, f->size, f->reclaimed, f->media_kind, f->duration_ms, 0, 0, 0,
+                                 {0}, {0} };
             snprintf(at.filename, sizeof at.filename, "%s", f->filename);
             snprintf(at.mime, sizeof at.mime, "%s", f->mime);
             download_attachment(hwnd, &at);
@@ -29176,35 +31267,51 @@ static int files_click(oc_win *hwnd, int x, int y) {
  * Copying a link and HISTORY_AROUND both existed; PASTING one did nothing, so a
  * link was write-only. This is the other half.
  *
- * `openchime://<host>/c/<channel_id>/m/<message_id>`. The ids are the durable
- * reference (ARCH-96 chose them over names precisely because a channel can be
- * renamed), so the host is only used to check you are pointed at the right
- * workspace — following a link into a workspace you are not signed in to is not
- * something to do silently, and it is recorded as unbuilt rather than half-done.
+ * `openchime://<host>/c/<channel_id>/m/<message_id>`, and an email's
+ * `openchime://w/<audience>/c/<channel>[/m/<message>][/t/<thread>]`
+ * (client/core/permalink.h). The ids are the durable reference (ARCH-96 chose
+ * them over names precisely because a channel can be renamed). The host form's
+ * host is only used to check you are pointed at the right workspace. The email
+ * form names the workspace by its audience id and opens only one this device is
+ * signed into or remembers: following a link never connects to a server the
+ * link names.
  */
-static int permalink_parse(const char *text, char *host, size_t hostcap,
-                           uint64_t *chan, uint64_t *msg) {
-    const char *p = text;
-    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-    if (strncmp(p, "openchime://", 12) != 0) return 0;
-    p += 12;
-    size_t hn = 0;
-    while (*p && *p != '/' && hn + 1 < hostcap) host[hn++] = *p++;
-    host[hn] = 0;
-    if (strncmp(p, "/c/", 3) != 0) return 0;
-    p += 3;
-    char *end = NULL;
-    *chan = strtoull(p, &end, 10);
-    if (!end || end == p) return 0;
-    /* A CHANNEL-ONLY link is legal: "/c/7" means open the conversation, with no
-     * message to jump to. A notification points at one of these -- it is about a
-     * conversation having something new, not about a particular line -- and
-     * without this form it would need a second, parallel way of saying where to
-     * go. */
-    if (strncmp(end, "/m/", 3) != 0) { *msg = 0; return *chan ? 1 : 0; }
-    p = end + 3;
-    *msg = strtoull(p, &end, 10);
-    return (*chan && *msg) ? 1 : 0;
+
+/* The move's destination is chosen (REQ-053). A move into a private channel
+ * can put the message in front of fewer people than read it now, so that is
+ * said, in words, before anything is sent; into a public one it simply goes. */
+static void move_send(uint64_t mid, uint64_t to) {
+    if (!g_client || !mid || !to) return;
+    const oc_model *m = model();
+    const oc_channel *dst = m ? oc_model_channel((oc_model *)m, to) : NULL;
+    oc_client_move_message(g_client, mid, to, 0, 1);
+    char note[160];
+    snprintf(note, sizeof note, "Moved to #%s.", (dst && dst->name && dst->name[0]) ? dst->name : "channel");
+    fb_confirm(note);
+    invalidate();
+}
+
+static void move_pick(oc_win *hwnd, uint64_t to_cid) {
+    const oc_model *m = model();
+    if (!m || !g_client || !g_move_mid || !to_cid) return;
+    const oc_channel *src = oc_model_channel((oc_model *)m, g_move_cid);
+    const oc_channel *dst = oc_model_channel((oc_model *)m, to_cid);
+    uint64_t mid = g_move_mid;
+    g_move_mid = g_move_cid = 0;   /* the palette's next opening is a plain one */
+    if (!dst) return;
+    g_move_to = to_cid;
+    if (!dst->is_public) {
+        const oc_msg *msg = find_msg(src, mid);
+        char body[400];
+        snprintf(body, sizeof body,
+                 "#%s is private. Only its members will be able to read this %s, "
+                 "and people in #%s who are not members of #%s will no longer see it.",
+                 dst->name ? dst->name : "", (msg && msg->reply_count) ? "thread" : "message",
+                 (src && src->name) ? src->name : "", dst->name ? dst->name : "");
+        confirm_open(hwnd, CONF_MESSAGE_MOVE, mid, "Move to a private channel?", body, "Move");
+        return;
+    }
+    move_send(mid, to_cid);
 }
 
 /* Send `mid` on to another conversation as a structured reference (REQ-057,
@@ -29242,31 +31349,10 @@ static void forward_send(oc_win *hwnd, uint64_t to_cid) {
     invalidate();
 }
 
-/* Follow one. Returns 0 with a toast when it cannot, rather than failing quietly:
- * a link that does nothing is indistinguishable from a broken app. */
-static int permalink_follow(oc_win *hwnd, const char *text) {
-    char host[256]; uint64_t chan = 0, mid = 0;
-    if (!permalink_parse(text, host, sizeof host, &chan, &mid)) return 0;
-    if (!g_client) { fb_failed("Sign in to open a link."); return 1; }
-    /* A different workspace is a real case and we do not guess: switching would
-     * drop what you are reading, and we may not even hold that workspace. */
-    char self[288];
-    if (g_port && g_port != OC_DEFAULT_PORT) oc_hostport(g_host, g_port, self, sizeof self);
-    else snprintf(self, sizeof self, strchr(g_host, ':') ? "[%s]" : "%s", g_host);
-    /* Compared against the same string the copy path builds, so the two halves
-     * cannot disagree about whether a port is part of the identity. A bare host is
-     * accepted too: a link written before the port was included is still ours. */
-    if (host[0] && self[0] && SDL_strcasecmp(host, self) != 0 && SDL_strcasecmp(host, g_host) != 0) {
-        char msg[256];
-        snprintf(msg, sizeof msg, "That link is for %s. Switch workspace first.", host);
-        fb_failed(msg);
-        return 1;
-    }
-    const oc_model *m = model();
-    if (!m || !oc_model_channel((oc_model *)m, chan)) {
-        fb_failed("That conversation is not one you can see.");
-        return 1;
-    }
+/* Open conversation `chan` and, where `mid` is not 0, the message `mid` in it:
+ * what a link and an audit entry's Go to do. The caller has checked the
+ * conversation is one the person can see. */
+static void open_conversation_at(oc_win *hwnd, uint64_t chan, uint64_t mid) {
     g_view = VIEW_HOME;
     close_overlays();
     select_channel(chan);
@@ -29283,6 +31369,68 @@ static int permalink_follow(oc_win *hwnd, const char *text) {
     select_tab(TAB_MESSAGES);
     layout_composer(hwnd);
     invalidate();
+}
+
+/* Follow one. Returns 0 with a toast when it cannot, rather than failing quietly:
+ * a link that does nothing is indistinguishable from a broken app. */
+static int permalink_follow(oc_win *hwnd, const char *text) {
+    oc_permalink pl;
+    if (!oc_permalink_parse(text, &pl)) return 0;
+    /* A thread's link opens at its root, which is in the conversation's own
+     * scroll; a reply's line is reached from there. */
+    uint64_t chan = pl.channel, mid = pl.thread ? pl.thread : pl.message;
+    if (pl.kind == OC_PERMALINK_AUDIENCE) {
+        /* The workspace the link means, by its audience: this one, or another
+         * this device knows, which is switched to and the link followed there
+         * once it is ready -- never a server the link itself could name. */
+        const oc_model *cm = g_client ? model() : NULL;
+        const char *here = cm ? oc_model_workspace_audience(cm) : "";
+        if (!here[0] || strcmp(here, pl.where) != 0) {
+            char ws[256] = "";
+            const char *sp = store_path();
+            oc_store *st = sp ? oc_store_open(sp) : NULL;
+            int found = 0;
+            if (st) {
+                oc_store_set_secret(st, g_secret);
+                found = oc_store_workspace_by_audience(st, pl.where, ws, sizeof ws);
+                oc_store_close(st);
+            }
+            const char *active = g_ws_active >= 0 ? g_wss[g_ws_active].ws : "";
+            if (!found) {
+                fb_failed("This link is for a workspace you're not signed into");
+                return 1;
+            }
+            if (strcmp(ws, active) != 0) {
+                snprintf(g_pending_url, sizeof g_pending_url, "%s", text);
+                switch_workspace(hwnd, ws, "");
+                return 1;
+            }
+        }
+        if (!g_client) { fb_failed("Sign in to open a link."); return 1; }
+    } else {
+        char *host = pl.where;
+        if (!g_client) { fb_failed("Sign in to open a link."); return 1; }
+        /* A different workspace is a real case and we do not guess: switching would
+         * drop what you are reading, and we may not even hold that workspace. */
+        char self[288];
+        if (g_port && g_port != OC_DEFAULT_PORT) oc_hostport(g_host, g_port, self, sizeof self);
+        else snprintf(self, sizeof self, strchr(g_host, ':') ? "[%s]" : "%s", g_host);
+        /* Compared against the same string the copy path builds, so the two halves
+         * cannot disagree about whether a port is part of the identity. A bare host is
+         * accepted too: a link written before the port was included is still ours. */
+        if (host[0] && self[0] && SDL_strcasecmp(host, self) != 0 && SDL_strcasecmp(host, g_host) != 0) {
+            char msg[256];
+            snprintf(msg, sizeof msg, "That link is for %s. Switch workspace first.", host);
+            fb_failed(msg);
+            return 1;
+        }
+    }
+    const oc_model *m = model();
+    if (!m || !oc_model_channel((oc_model *)m, chan)) {
+        fb_failed("That conversation is not one you can see.");
+        return 1;
+    }
+    open_conversation_at(hwnd, chan, mid);
     return 1;
 }
 
@@ -29296,6 +31444,7 @@ static void menu_run_kind(oc_win *hwnd, int kind, int cmd) {
     else if (kind == MENU_SUMMARIZE) sum_menu_run(hwnd, cmd);
     else if (kind == MENU_MSG)     msg_menu_run(hwnd, cmd);
     else if (kind == MENU_MEMBER)  member_menu_run(hwnd, cmd);
+    else if (kind == MENU_AUDIT)   audit_menu_run(hwnd, cmd);
     else if (kind == MENU_CHANNEL) channel_menu_run(hwnd, cmd);
     else if (kind == MENU_THUMB)   thumb_menu_run(hwnd, cmd);
     else                           menu_dispatch(hwnd, cmd);
@@ -29325,7 +31474,7 @@ static void wsmgr_ask_forget(oc_win *hwnd, int row) {
 /* One row's button, pressed -- by a click or by an invoke through the tree. */
 static void wsmgr_act(oc_win *hwnd, int row, int act) {
     if (row < 0 || row >= g_n_sw) return;
-    g_wsmgr_focus = row;
+    g_wsmgr_focus = wsmgr_row_of(row);
     char ws[256], user[80];
     snprintf(ws, sizeof ws, "%s", g_sw[row].ws);
     snprintf(user, sizeof user, "%s", g_sw[row].user);
@@ -29348,32 +31497,73 @@ static void wsmgr_act(oc_win *hwnd, int row, int act) {
 }
 
 /* The Workspaces dialog's keys: the arrows, Page Up/Down, Home and End move a row
- * focus that the paint keeps in view, and Delete asks to remove that row. Enter
- * and Esc stay the frame's. Returns 1 when the key was the list's. */
+ * focus that the paint keeps in view, Enter opens that row's workspace (or signs
+ * in to it), and Delete asks to remove it. With no row chosen, Enter and Esc stay
+ * the frame's. Returns 1 when the key was the list's. Rows are the filtered,
+ * ordered view (wsmgr_view). */
 static int wsmgr_key(oc_win *hwnd, int vk) {
-    if (!g_wsmgr_open || g_n_sw <= 0) return 0;
+    if (!g_wsmgr_open) return 0;
+    wsmgr_view();
+    if (g_n_swv <= 0) return 0;
     float rowh = UIS(54), visible = g_wsmgr_list.bottom - g_wsmgr_list.top;
     int page = rowh > 0 ? (int)(visible / rowh) : 1;
     if (page < 1) page = 1;
     int at = g_wsmgr_focus;
+    if (at >= g_n_swv) at = g_n_swv - 1;
     switch (vk) {
     case OCK_DOWN:  at = at < 0 ? 0 : at + 1; break;
     case OCK_UP:    at = at < 0 ? 0 : at - 1; break;
     case OCK_NEXT:  at = at < 0 ? 0 : at + page; break;
     case OCK_PRIOR: at = at < 0 ? 0 : at - page; break;
     case OCK_HOME:  at = 0; break;
-    case OCK_END:   at = g_n_sw - 1; break;
+    case OCK_END:   at = g_n_swv - 1; break;
+    case OCK_RETURN:
+        if (at < 0) return 0;
+        wsmgr_act(hwnd, g_swv[at], WSM_GO);
+        return 1;
     case OCK_DELETE:
         if (at < 0) return 0;
-        wsmgr_ask_forget(hwnd, at);
+        wsmgr_ask_forget(hwnd, g_swv[at]);
         return 1;
     default: return 0;
     }
     if (at < 0) at = 0;
-    if (at >= g_n_sw) at = g_n_sw - 1;
+    if (at >= g_n_swv) at = g_n_swv - 1;
     g_wsmgr_focus = at;
     g_wsmgr_reveal = 1;
     return 1;
+}
+
+/* The filter box's keys. Typing filters; Up, Down, Page Up and Page Down move
+ * through the rows without leaving the box; Enter opens the row chosen, or the
+ * first that matches once something is typed; Delete at the end of the text,
+ * where it would delete nothing, removes the row chosen. Esc is the frame's. */
+static int wsm_q_key(field *f, int key, int ctrl, int shift) {
+    (void)ctrl; (void)shift;
+    if (!g_wsmgr_open) return 0;
+    switch (key) {
+    case OCK_UP: case OCK_DOWN: case OCK_PRIOR: case OCK_NEXT:
+        return wsmgr_key(g_main, key);
+    case OCK_RETURN:
+        wsmgr_view();
+        if (g_wsmgr_focus < 0 && f->buf[0] && g_n_swv > 0) g_wsmgr_focus = 0;
+        return wsmgr_key(g_main, key);
+    case OCK_DELETE:
+        if (f->caret < f->len || f->anchor != f->caret) return 0;
+        return wsmgr_key(g_main, key);
+    }
+    return 0;
+}
+/* A new filter is a new list: from its top, with no row chosen. */
+/* Typing in the Workspaces dialog filters, wherever the keyboard was in it: a
+ * key typed with no field focused (after a click on a row) goes to the box. */
+static void wsm_claim_text(void) {
+    if (!g_focus && g_wsmgr_open && g_wsm_q && g_wsm_q->visible) focus_set(g_wsm_q);
+}
+static void wsm_q_changed(field *f) {
+    (void)f;
+    g_wsmgr_focus = -1;
+    if (g_wsmgr_open) g_ovl_scroll = 0;
 }
 
 /* Admin > Custom emoji's keys while no field has them, on the Workspaces
@@ -29437,6 +31627,59 @@ static int on_click(oc_win *hwnd, int x, int y) {
     if (!modal_open())
         for (int i = 0; i < g_n_morehits; i++)
             if (in_rect(g_morehits[i].r, (float)x, (float)y)) { msg_open_cut(g_morehits[i].mid, g_morehits[i].kind); return 1; }
+    /* A date divider offers the jump to another date. */
+    if (!modal_open() && !g_menu && g_sel)
+        for (int i = 0; i < g_n_sephits; i++)
+            if (in_rect(g_sephits[i].r, (float)x, (float)y)) {
+                jump_menu_open(hwnd, g_sel, 0, (float)x - 110, (float)y + 8);
+                invalidate();
+                return 1;
+            }
+    /* A snippet's card opens it whole (REQ-226). */
+    if (!modal_open() && !g_menu)
+        for (int i = 0; i < g_n_snip_hits; i++)
+            if (in_rect(g_snip_hits[i].r, (float)x, (float)y)) {
+                const oc_model *sm = model();
+                const oc_attachment *sa = NULL;
+                for (size_t ci = 0; sm && !sa && ci < sm->n_channels; ci++)
+                    for (size_t k = 0; !sa && k < sm->channels[ci].n_msgs; k++) {
+                        const oc_msg *mm = &sm->channels[ci].msgs[k];
+                        if (mm->message_id != g_snip_hits[i].mid) continue;
+                        for (int q = 0; q < mm->n_attach; q++)
+                            if (mm->attach[q].id == g_snip_hits[i].aid) sa = &mm->attach[q];
+                    }
+                for (size_t k = 0; sm && !sa && k < sm->n_thread_msgs; k++)
+                    for (int q = 0; q < sm->thread_msgs[k].n_attach; q++)
+                        if (sm->thread_msgs[k].attach[q].id == g_snip_hits[i].aid) sa = &sm->thread_msgs[k].attach[q];
+                if (sa) { snippet_view_open(hwnd, sa); invalidate(); return 1; }
+            }
+    /* A to-do list: a task's box marks it, "Add a task" and Rename ask first. */
+    if (!modal_open() && !g_menu && g_client)
+        for (int i = 0; i < g_n_todohits; i++) {
+            if (!in_rect(g_todohits[i].r, (float)x, (float)y)) continue;
+            uint64_t mid = g_todohits[i].mid, cid = g_todohits[i].cid;
+            int task = g_todohits[i].task;
+            const oc_model *tm = model();
+            const oc_msg *msg = tm ? find_msg(oc_model_channel((oc_model *)tm, cid), mid) : NULL;
+            for (size_t k = 0; tm && !msg && k < tm->n_thread_msgs; k++)
+                if (tm->thread_msgs[k].message_id == mid) msg = &tm->thread_msgs[k];
+            if (!msg || !msg->todo) return 1;
+            if (task >= 0 && task < msg->todo->total) {
+                oc_client_todo_mark(g_client, cid, mid, (uint16_t)task, !msg->todo->tasks[task].done);
+            } else if (task == -1) {
+                oc_field f[2] = { { FF_TEXT, "Task", "Its name, unique in the list.", "" },
+                                  { FF_TEXT, "Description", "Optional.", "" } };
+                if (form_dialog(hwnd, "Add a task", f, 2) && f[0].value[0])
+                    oc_client_todo_add(g_client, cid, mid, f[0].value, f[1].value);
+            } else if (task == -2) {
+                oc_field f[1] = { { FF_TEXT, "Title", "", "" } };
+                snprintf(f[0].value, sizeof f[0].value, "%s", msg->todo->title ? msg->todo->title : "");
+                if (form_dialog(hwnd, "Rename list", f, 1) && f[0].value[0])
+                    oc_client_todo_rename(g_client, cid, mid, f[0].value);
+            }
+            invalidate();
+            return 1;
+        }
     /* Toasts are painted above everything, a dialog included, so they are
      * hit-tested above everything too -- a toast over the composer or a
      * dialog's card would otherwise pass on a click it appears to own. */
@@ -29478,6 +31721,13 @@ static int on_click(oc_win *hwnd, int x, int y) {
             if (g_dm_compose) { g_dm_compose = 0; pick_clear(); }
             else              close_overlays();
             layout_composer(hwnd);
+            invalidate();
+            return 1;
+        }
+        /* The thread pane's Jump to date: the choices, for this thread. */
+        if (!g_dm_compose && pm && pm->thread_open && !modal_open() && in_rect(g_thr_date_btn, x, y)) {
+            jump_menu_open(hwnd, pm->thread_channel, pm->thread_parent,
+                           g_thr_date_btn.right - 200, g_thr_date_btn.bottom + 4);
             invalidate();
             return 1;
         }
@@ -29655,6 +31905,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
         }
         if (g_sch_open && sched_custom_click(hwnd, x, y)) return 1;
         if (g_sr_open && sumrange_click(hwnd, x, y)) return 1;
+        if (g_jc_open && jumpcal_click(hwnd, x, y)) return 1;
         if (g_pc_open && poll_compose_click(hwnd, x, y)) return 1;
         if (g_te_open && te_click(hwnd, x, y)) return 1;
         if (g_notify_open) {
@@ -29814,6 +32065,117 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 } else fb_confirm(n ? "Priority people saved." : "Priority people cleared.");
                 return 1;
             }
+            /* Muted people, by display name: a name taken off is unmuted, a name
+             * added is muted, each one at a time, as the daemon takes them. */
+            if (in_rect(g_notify_mute_btn, x, y)) {
+                const oc_model *km = model();
+                oc_field f[1] = { { FF_TEXT, "Muted people",
+                                    "Separate with commas. Take a name off to hear from them again.", "" } };
+                if (km) for (uint16_t i = 0; i < km->n_muted_users; i++) {
+                    const char *nm = oc_model_user_name((oc_model *)km, km->muted_users[i]);
+                    if (!nm || !nm[0]) continue;
+                    if (f[0].value[0]) strncat(f[0].value, ", ", sizeof f[0].value - strlen(f[0].value) - 1);
+                    strncat(f[0].value, nm, sizeof f[0].value - strlen(f[0].value) - 1);
+                }
+                if (!form_dialog(hwnd, "Muted people", f, 1)) return 1;
+                static uint64_t keep[OC_MAX_MUTED_USERS];
+                uint16_t nk = 0;
+                char missing[128] = "";
+                for (char *p2 = f[0].value; *p2 && nk < OC_MAX_MUTED_USERS; ) {
+                    while (*p2 == ' ' || *p2 == ',') p2++;
+                    char *e = strchr(p2, ',');
+                    size_t len = e ? (size_t)(e - p2) : strlen(p2);
+                    while (len && p2[len - 1] == ' ') len--;
+                    if (len) {
+                        char nm[80];
+                        if (len > sizeof nm - 1) len = sizeof nm - 1;
+                        memcpy(nm, p2, len); nm[len] = '\0';
+                        uint64_t uid = km ? oc_model_user_id(km, nm) : 0;
+                        if (uid) keep[nk++] = uid;
+                        else if (strlen(missing) + len + 2 < sizeof missing) {
+                            if (missing[0]) strncat(missing, ", ", sizeof missing - strlen(missing) - 1);
+                            strncat(missing, nm, sizeof missing - strlen(missing) - 1);
+                        }
+                    }
+                    if (!e) break;
+                    p2 = e + 1;
+                }
+                if (km) {
+                    for (uint16_t i = 0; i < km->n_muted_users; i++) {
+                        int still = 0;
+                        for (uint16_t k = 0; k < nk; k++) if (keep[k] == km->muted_users[i]) still = 1;
+                        if (!still) oc_client_set_user_mute(g_client, km->muted_users[i], 0);
+                    }
+                    for (uint16_t k = 0; k < nk; k++)
+                        if (!oc_model_is_muted_user(km, keep[k])) oc_client_set_user_mute(g_client, keep[k], 1);
+                }
+                if (missing[0]) {
+                    char msg[160];
+                    snprintf(msg, sizeof msg, "No such person: %s", missing);
+                    fb_failed(msg);
+                } else fb_confirm(nk ? "Muted people saved." : "Nobody is muted now.");
+                return 1;
+            }
+            /* Who may start a new direct conversation with me. */
+            if (in_rect(g_notify_dmpriv_btn, x, y)) {
+                const oc_model *km = model();
+                int nobody = !(km && km->dm_privacy == OC_DM_PRIVACY_NOBODY);
+                oc_client_set_dm_privacy(g_client, nobody);
+                fb_confirm(nobody ? "No one can start a new direct conversation with you now."
+                                  : "Anyone can start a direct conversation with you again.");
+                return 1;
+            }
+            /* Blocked people, by display name: a name taken off is unblocked, a
+             * name added is blocked, one at a time, as the daemon takes them. */
+            if (in_rect(g_notify_block_btn, x, y)) {
+                const oc_model *km = model();
+                oc_field f[1] = { { FF_TEXT, "Blocked people",
+                                    "Separate with commas. Take a name off to unblock them.", "" } };
+                if (km) for (uint16_t i = 0; i < km->n_blocks; i++) {
+                    const char *nm = oc_model_user_name((oc_model *)km, km->blocks[i]);
+                    if (!nm || !nm[0]) continue;
+                    if (f[0].value[0]) strncat(f[0].value, ", ", sizeof f[0].value - strlen(f[0].value) - 1);
+                    strncat(f[0].value, nm, sizeof f[0].value - strlen(f[0].value) - 1);
+                }
+                if (!form_dialog(hwnd, "Blocked people", f, 1)) return 1;
+                static uint64_t keep[OC_MAX_BLOCKS];
+                uint16_t nk = 0;
+                char missing[128] = "";
+                for (char *p2 = f[0].value; *p2 && nk < OC_MAX_BLOCKS; ) {
+                    while (*p2 == ' ' || *p2 == ',') p2++;
+                    char *e = strchr(p2, ',');
+                    size_t len = e ? (size_t)(e - p2) : strlen(p2);
+                    while (len && p2[len - 1] == ' ') len--;
+                    if (len) {
+                        char nm[80];
+                        if (len > sizeof nm - 1) len = sizeof nm - 1;
+                        memcpy(nm, p2, len); nm[len] = '\0';
+                        uint64_t uid = km ? oc_model_user_id(km, nm) : 0;
+                        if (uid) keep[nk++] = uid;
+                        else if (strlen(missing) + len + 2 < sizeof missing) {
+                            if (missing[0]) strncat(missing, ", ", sizeof missing - strlen(missing) - 1);
+                            strncat(missing, nm, sizeof missing - strlen(missing) - 1);
+                        }
+                    }
+                    if (!e) break;
+                    p2 = e + 1;
+                }
+                if (km) {
+                    for (uint16_t i = 0; i < km->n_blocks; i++) {
+                        int still = 0;
+                        for (uint16_t k = 0; k < nk; k++) if (keep[k] == km->blocks[i]) still = 1;
+                        if (!still) oc_client_set_block(g_client, km->blocks[i], 0);
+                    }
+                    for (uint16_t k = 0; k < nk; k++)
+                        if (!oc_model_is_blocked(km, keep[k])) oc_client_set_block(g_client, keep[k], 1);
+                }
+                if (missing[0]) {
+                    char msg[160];
+                    snprintf(msg, sizeof msg, "No such person: %s", missing);
+                    fb_failed(msg);
+                } else fb_confirm(nk ? "Blocked people saved." : "Nobody is blocked now.");
+                return 1;
+            }
             for (int i = 0; i < g_n_notify_hits; i++)
                 if (in_rect(g_notify_hits[i].r, x, y)) {
                     if (g_notify_hits[i].cid == 0)      /* REQ-134: the global default */
@@ -29832,6 +32194,30 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 menu_dispatch(hwnd, g_selfcard_btn[i].cmd);
                 return 1;
             }
+    if (g_profile_uid && in_rect(g_prof_mute_btn, x, y)) {
+        const oc_model *pm = model();
+        int on = !(pm && oc_model_is_muted_user(pm, g_profile_uid));
+        if (g_client) oc_client_set_user_mute(g_client, g_profile_uid, on);
+        fb_confirm(on ? "Muted. Their messages stay folded away and no longer notify you." : "Unmuted.");
+        invalidate();
+        return 1;
+    }
+    if (g_profile_uid && in_rect(g_prof_block_btn, x, y)) {
+        const oc_model *pm = model();
+        int on = !(pm && oc_model_is_blocked(pm, g_profile_uid));
+        if (g_client) oc_client_set_block(g_client, g_profile_uid, on);
+        fb_confirm(on ? "Blocked. They can't start a conversation with you, and you won't get their direct messages."
+                      : "Unblocked.");
+        invalidate();
+        return 1;
+    }
+    /* A link a workspace field holds: shown as its address, so opened at once. */
+    if (g_profile_uid && model())
+        for (int i = 0; i < g_n_prof_link; i++)
+            if (in_rect(g_prof_link[i].r, x, y)) {
+                link_open(oc_model_profile_value(model(), g_profile_uid, g_prof_link[i].field_id));
+                return 1;
+            }
     if (g_profile_uid && in_rect(g_prof_dm_btn, x, y)) {
         uint64_t uid = g_profile_uid;
         close_overlays();
@@ -29844,6 +32230,11 @@ static int on_click(oc_win *hwnd, int x, int y) {
         rp_pop();
         open_dm_go(uid);
         return 1;
+    }
+    /* What's new: an item's link, or the card's own, opens in the browser. */
+    if (g_about_open && g_whatsnew) {
+        for (int i = 0; i < g_n_wn_links; i++)
+            if (in_rect(g_wn_links[i].r, x, y) && g_wn_links[i].url[0]) { signin_open_url(g_wn_links[i].url); return 1; }
     }
     if (g_wsmgr_open) {
         for (int i = 0; i < g_n_wsmgr_hits; i++) {
@@ -29871,6 +32262,12 @@ static int on_click(oc_win *hwnd, int x, int y) {
     if (g_view == VIEW_ADMIN && g_adm_tab == ADM_EMOJI)
         for (int i = 0; i < g_n_emojirows; i++)
             if (in_rect(g_emojirows[i].r, x, y)) { emoji_delete_ask(hwnd, g_emojirows[i].name); return 1; }
+    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_PFIELDS && model() && self_role(model()) >= OC_ROLE_ADMIN &&
+        pfields_click(hwnd, model(), x, y))
+        return 1;
+    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_EMOJI)
+        for (int i = 0; i < g_n_emojiren; i++)
+            if (in_rect(g_emojiren[i].r, x, y)) { emoji_rename_ask(hwnd, g_emojiren[i].name); return 1; }
     if (g_view == VIEW_ADMIN && g_adm_tab == ADM_INVITES)
         for (int i = 0; i < g_n_invrows; i++)
             if (in_rect(g_invrows[i].r, x, y)) {
@@ -30231,6 +32628,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
     if (g_view == VIEW_ADMIN)
         for (int i = 0; i < ADM_COUNT; i++)
             if (in_rect(g_adm_tabs[i], x, y)) { admin_select(i); return 1; }
+    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_USAGE && usage_click(x, y)) return 1;
     /* The Files view has no sidebar, so its clicks must be served before the
      * transcript-only guard below. */
     if (g_view == VIEW_FILES && files_click(hwnd, x, y)) return 1;
@@ -30331,6 +32729,14 @@ static int on_click(oc_win *hwnd, int x, int y) {
             if (in_rect(g_lchan_rows[i], x, y)) {
                 uint64_t want = (i == 0) ? 0 : g_lchan[i - 1].id;
                 if (want != g_later_chan) { g_later_chan = want; g_ovl_scroll = 0; }
+                return 1;
+            }
+    /* A Later row's reminder: its menu (REQ-283). */
+    if (g_view == VIEW_LATER)
+        for (int i = 0; i < g_n_remhits; i++)
+            if (in_rect(g_remhits[i].r, x, y)) {
+                remind_menu_open(hwnd, g_remhits[i].mid, g_remhits[i].cid,
+                                 g_remhits[i].r.left, g_remhits[i].r.bottom + 4, g_remhits[i].at);
                 return 1;
             }
     /* Later rows: the action button first, then the row itself. */
@@ -30526,6 +32932,13 @@ static int on_click(oc_win *hwnd, int x, int y) {
             }
             return 1;
         }
+    }
+    /* A muted person's reaction in the who-reacted pane: Show, this one (SET_USER_MUTE). */
+    {
+        const oc_model *rxm = model();
+        if (rxm && rxm->reactlist_open && !modal_open())
+            for (int i = 0; i < g_n_rx_show_hits; i++)
+                if (in_rect(g_rx_show_hits[i].r, x, y)) { rx_reveal(i); invalidate(); return 1; }
     }
     /* The replies row under a thread's parent opens the thread (REQ-060).
      * Tested before the message rows, which cover the same pixels. */
@@ -31184,6 +33597,9 @@ static int link_under(int x, int y, char *out, size_t cap) {
 static void link_open(const char *url) {
     if (!url || !url[0]) return;
     g_confirm_url[0] = 0;
+    /* An OpenChime permalink is followed here, in the app, and never handed to
+     * the system: it names a message, not a page (MARKDOWN.md §4, ARCH-96). */
+    if (!SDL_strncasecmp(url, "openchime://", 12)) { permalink_follow(g_main, url); return; }
     if (SDL_strncasecmp(url, "http://", 7) && SDL_strncasecmp(url, "https://", 8)) return;
     SDL_OpenURL(url);
 }
@@ -31194,6 +33610,9 @@ static void link_open(const char *url) {
  * bare address needs none of this -- it is its own label. */
 static void link_open_labelled(oc_win *hwnd, const char *url) {
     if (!url || !url[0]) return;
+    /* A labelled permalink goes nowhere outside the app, and following one
+     * checks the workspace and what the reader may see, so it asks nothing. */
+    if (!SDL_strncasecmp(url, "openchime://", 12)) { permalink_follow(hwnd, url); return; }
     if (SDL_strncasecmp(url, "http://", 7) && SDL_strncasecmp(url, "https://", 8)) return;
     snprintf(g_confirm_url, sizeof g_confirm_url, "%s", url);
     const char *h = strstr(url, "://");
@@ -31292,13 +33711,12 @@ static void copy_selection(oc_win *hwnd) {
      * byte positions cut every selection after a non-ASCII character short,
      * and a table -- one unit of a selection, copied as its Markdown -- is
      * where "×" and emoji turn up. Each end is kept off a continuation byte. */
-    size_t cap = 0;
-    for (long gi = lo; gi <= hi; gi++) cap += strlen(body_text(&c->msgs[gi])) + 2;
-    char *u8 = malloc(cap + 1);
-    if (!u8) return;
+    /* Each message's part with its covered spoilers covered (copy_covered). */
+    char *u8 = NULL;
     size_t bl = 0;
     for (long gi = lo; gi <= hi; gi++) {
-        const char *b = body_text(&c->msgs[gi]);
+        const oc_msg *gm = &c->msgs[gi];
+        const char *b = body_text(gm);
         size_t n = strlen(b);
         size_t s = (gi == lo) ? lop : 0;
         size_t e = (gi == hi) ? hip : n;
@@ -31306,18 +33724,118 @@ static void copy_selection(oc_win *hwnd) {
         if (s > e) s = e;
         while (s > 0 && ((unsigned char)b[s] & 0xC0) == 0x80) s--;
         while (e < n && ((unsigned char)b[e] & 0xC0) == 0x80) e++;
+        char *part = copy_covered(gm->message_id, b, body_lead(gm), s, e);
+        if (!part) { free(u8); return; }
+        size_t pl = strlen(part);
+        char *g = realloc(u8, bl + pl + 3);
+        if (!g) { free(part); free(u8); return; }
+        u8 = g;
         if (gi > lo) { u8[bl++] = '\r'; u8[bl++] = '\n'; }
-        memcpy(u8 + bl, b + s, e - s);
-        bl += e - s;
+        memcpy(u8 + bl, part, pl);
+        bl += pl;
+        u8[bl] = '\0';
+        free(part);
     }
-    u8[bl] = '\0';
-    if (bl) copy_to_clipboard(hwnd, u8);
+    if (u8 && bl) copy_to_clipboard(hwnd, u8);
     free(u8);
 }
 
 /* The Drafts row's context menu (on_rclick) and what it acts on. */
 enum { DRAFT_CMD_OPEN = 2600, DRAFT_CMD_DELETE = 2601 };
 static uint64_t g_dmenu_cid, g_dmenu_root;
+
+/* ---- an audit entry's menu (REQ-251) ----------------------------------------
+ *
+ * Where the entry leads, and the filters it suggests. Each item is offered only
+ * when it can work: the actor is someone this workspace still has, the channel
+ * is one the reader can see, a message entry names its message and its channel
+ * (entries written before the daemon kept the channel name none), and a filter
+ * is not the one already set. */
+enum { AUDIT_CMD_MEMBER = 1, AUDIT_CMD_CHANNEL, AUDIT_CMD_MESSAGE,
+       AUDIT_CMD_BY_ACTOR, AUDIT_CMD_BY_ACTION };
+
+static int audit_is_message(const oc_audit_view *a) { return !strncmp(a->action, "message.", 8); }
+
+/* The menu for entry `idx` of the page, at (x, y). 0 when it offers nothing. */
+static int audit_menu_open(oc_win *hwnd, const oc_model *m, int idx, float x, float y) {
+    if (!m || idx < 0 || (size_t)idx >= m->n_audit) return 0;
+    g_audit_menu = m->audit[idx];
+    const oc_audit_view *a = &g_audit_menu;
+    int seen = a->channel_id && oc_model_channel((oc_model *)m, a->channel_id);
+    const char *who = a->actor_id ? oc_model_user_name(m, a->actor_id) : NULL;
+    g_n_mi = 0;
+    mi_section("AUDIT ENTRY");
+    if (who && who[0] && !oc_model_is_workspace_sender(m, a->actor_id))
+        mi_item(AUDIT_CMD_MEMBER, "Open member");
+    if (seen) mi_item(AUDIT_CMD_CHANNEL, "Go to channel");
+    if (seen && audit_is_message(a) && a->target_id) mi_item(AUDIT_CMD_MESSAGE, "Go to message");
+    if (a->actor_id && m->audit_actor != a->actor_id) mi_item(AUDIT_CMD_BY_ACTOR, "Filter by this actor");
+    if (a->action[0] && strcmp(m->audit_action, a->action) != 0)
+        mi_item(AUDIT_CMD_BY_ACTION, "Filter by this action");
+    if (g_n_mi <= 1) { g_n_mi = 0; return 0; }
+    g_menu = MENU_AUDIT; g_menu_headerblock = 0; g_menu_hover = -1;
+    g_menu_w = UIS(220);
+    g_menu_x = x; g_menu_y = y;
+    float mh = 12; for (int k = 0; k < g_n_mi; k++) mh += menu_item_h(g_mi[k].kind);
+    irect rc; client_rect(hwnd, &rc);
+    float H = DIPF(rc.bottom), W = DIPF(rc.right);
+    if (g_menu_y + mh > H - 8) g_menu_y = H - 8 - mh;
+    if (g_menu_x + g_menu_w > W - 8) g_menu_x = W - 8 - g_menu_w;
+    invalidate();
+    return 1;
+}
+
+static void audit_menu_run(oc_win *hwnd, int cmd) {
+    const oc_model *m = model();
+    const oc_audit_view *a = &g_audit_menu;
+    if (!m || !g_client) return;
+    switch (cmd) {
+    case AUDIT_CMD_MEMBER:
+        g_view = VIEW_HOME; close_overlays();
+        profile_open(a->actor_id);
+        break;
+    case AUDIT_CMD_CHANNEL:
+    case AUDIT_CMD_MESSAGE:
+        if (!a->channel_id || !oc_model_channel((oc_model *)m, a->channel_id)) {
+            fb_failed("That conversation is not one you can see.");
+            break;
+        }
+        open_conversation_at(hwnd, a->channel_id, cmd == AUDIT_CMD_MESSAGE ? a->target_id : 0);
+        break;
+    case AUDIT_CMD_BY_ACTOR:
+        snprintf(g_audit_actor_name, sizeof g_audit_actor_name, "%s", a->actor_name);
+        oc_client_audit_filter(g_client, m->audit_family, a->actor_id, m->audit_action);
+        g_ovl_scroll = 0; g_audit_focus = -1;
+        break;
+    case AUDIT_CMD_BY_ACTION:
+        oc_client_audit_filter(g_client, m->audit_family, m->audit_actor, a->action);
+        g_ovl_scroll = 0; g_audit_focus = -1;
+        break;
+    }
+    invalidate();
+}
+
+/* The audit pane's keys while the keyboard is in no field: Up, Down, Home and
+ * End move a row focus the paint keeps in view; Shift+F10 or the Menu key then
+ * opens that row's menu (kb_context_menu). Returns 1 when the key was the pane's. */
+static int audit_key(oc_win *hwnd, int vk) {
+    (void)hwnd;
+    const oc_model *m = model();
+    if (!m || !m->audit_open || m->n_audit == 0 || g_ed_focus || g_menu || modal_open()) return 0;
+    int n = (int)m->n_audit, at = g_audit_focus;
+    switch (vk) {
+    case OCK_DOWN: at = at < 0 ? 0 : at + 1; break;
+    case OCK_UP:   at = at < 0 ? 0 : at - 1; break;
+    case OCK_HOME: at = 0; break;
+    case OCK_END:  at = n - 1; break;
+    default: return 0;
+    }
+    if (at < 0) at = 0;
+    if (at >= n) at = n - 1;
+    g_audit_focus = at;
+    g_audit_reveal = 1;
+    return 1;
+}
 
 static void on_rclick(oc_win *hwnd, int x, int y) {
     const oc_model *m = model();
@@ -31359,6 +33877,14 @@ static void on_rclick(oc_win *hwnd, int x, int y) {
             }
         return;
     }
+    /* An audit entry's row: where it leads, and the filters it suggests. */
+    if (m->audit_open)
+        for (int i = 0; i < g_n_audit_rowhits; i++)
+            if (in_rect(g_audit_rowhits[i].row, (float)x, (float)y)) {
+                g_audit_focus = g_audit_rowhits[i].idx;
+                audit_menu_open(hwnd, m, g_audit_rowhits[i].idx, (float)x, (float)y);
+                return;
+            }
     /* Members pane first (it overlaps the right edge). */
     for (int i = 0; i < g_n_memrows; i++)
         if (in_rect(g_memrows[i].r, (float)x, (float)y)) {
@@ -31772,7 +34298,7 @@ static int ws_find(const char *ws) {
  * tick loop's "other workspaces" pass, and to the unread badge. */
 static void ws_register(void) {
     int slot = ws_find(g_cur_ws);
-    if (slot < 0 && g_n_wss < WS_MAX) {
+    if (slot < 0 && g_n_wss < WS_OPEN_MAX) {
         slot = g_n_wss++;
         memset(&g_wss[slot], 0, sizeof g_wss[slot]);
         snprintf(g_wss[slot].ws, sizeof g_wss[slot].ws, "%s", g_cur_ws);
@@ -31842,16 +34368,287 @@ static void ws_forget_begin(const char *ws) {
  * Remove all): each as Remove takes one, background ones first, the one on
  * screen last, since that one is forgotten once its sign-out lands. By address,
  * from a copy: each removal reloads the list. */
-static void ws_forget_all(void) {
-    char ws[16][256];
-    int n = 0, cur = -1;
-    for (int i = 0; i < g_n_sw && n < 16; i++) {
-        int slot = ws_find(g_sw[i].ws);
-        if (slot >= 0 && slot == g_ws_active && g_wss[slot].client) cur = n;
-        snprintf(ws[n++], sizeof ws[0], "%s", g_sw[i].ws);
+static void ws_forget_list(char (*ws)[256], int n) {
+    int cur = -1;
+    for (int i = 0; i < n; i++) {
+        int slot = ws_find(ws[i]);
+        if (slot >= 0 && slot == g_ws_active && g_wss[slot].client) cur = i;
     }
     for (int i = 0; i < n; i++) if (i != cur) ws_forget_begin(ws[i]);
     if (cur >= 0) ws_forget_begin(ws[cur]);
+}
+
+static void ws_forget_all(void) {
+    if (g_n_sw <= 0) return;
+    char (*ws)[256] = malloc((size_t)g_n_sw * sizeof *ws);
+    if (!ws) return;
+    for (int i = 0; i < g_n_sw; i++) snprintf(ws[i], sizeof ws[0], "%s", g_sw[i].ws);
+    ws_forget_list(ws, g_n_sw);
+    free(ws);
+}
+
+/* The set a bulk removal's confirmation named (g_wsx), each as Remove takes one. */
+static void ws_forget_set(void) {
+    ws_forget_list(g_wsx, g_n_wsx);
+    free(g_wsx); g_wsx = NULL; g_n_wsx = 0;
+}
+
+/* Room for `n` addresses in g_wsx, emptied. 0 when there is none. */
+static int wsx_reset(int n) {
+    free(g_wsx); g_wsx = NULL; g_n_wsx = 0;
+    if (n <= 0) return 1;
+    g_wsx = malloc((size_t)n * sizeof *g_wsx);
+    return g_wsx != NULL;
+}
+
+/* Ask about the set in g_wsx, saying how many and naming each one. `why` is
+ * what they have in common, between commas: ", not used since 3 May 2026,". */
+static void wsx_ask(oc_win *hwnd, const char *why) {
+    char names[1500];
+    size_t at = 0;
+    int cur = 0;
+    names[0] = '\0';
+    for (int k = 0; k < g_n_wsx; k++) {
+        const char *nm = g_wsx[k];
+        for (int i = 0; i < g_n_sw; i++)
+            if (!strcmp(g_sw[i].ws, g_wsx[k])) { if (g_sw[i].label[0]) nm = g_sw[i].label; break; }
+        int slot = ws_find(g_wsx[k]);
+        if (slot >= 0 && slot == g_ws_active && g_wss[slot].client) cur = 1;
+        /* Each name, while there is room for it and for the count of the rest. */
+        size_t room = sizeof names - at;
+        int w = room > 40 ? snprintf(names + at, room - 40, "%s%s", k ? ", " : "", nm) : -1;
+        if (w < 0 || (size_t)w >= room - 40) {
+            names[at] = '\0';
+            snprintf(names + at, sizeof names - at, " and %d more", g_n_wsx - k);
+            break;
+        }
+        at += (size_t)w;
+    }
+    char title[80], ok[32], body[2048];
+    if (g_n_wsx == 1) {
+        snprintf(title, sizeof title, "Remove 1 workspace?");
+        snprintf(ok, sizeof ok, "Remove");
+    } else {
+        snprintf(title, sizeof title, "Remove %d workspaces?", g_n_wsx);
+        snprintf(ok, sizeof ok, "Remove %d", g_n_wsx);
+    }
+    snprintf(body, sizeof body,
+             "Remove %s%s from this device?\n\n%s.\n\n"
+             "Each one's saved sign-in is deleted. You can add any of them again by "
+             "entering its address.%s",
+             g_n_wsx == 1 ? "this workspace" : "these workspaces", why, names,
+             cur ? "\n\nYou are signed in to one of them; this signs you out first." : "");
+    confirm_open(hwnd, CONF_WS_FORGET_SET, 0, title, body, ok);
+}
+
+/* ---- Remove unused: the day ------------------------------------------------ */
+
+/* The day typed, as its local midnight; 0 with g_wsu_err saying why when it
+ * is not one. */
+static uint64_t wsu_day(void) {
+    g_wsu_err = NULL;
+    const char *t = g_wsu_edit ? g_wsu_edit->buf : "";
+    if (!t[0]) { g_wsu_err = "Enter a day first."; return 0; }
+    uint64_t day = parse_day(t);
+    if (!day) { g_wsu_err = "That is not a date OpenChime can read. Try 2026-05-03."; return 0; }
+    if (day > (uint64_t)time(NULL) * 1000) { g_wsu_err = "That day has not happened yet."; return 0; }
+    return day;
+}
+
+/* How many remembered workspaces were last used before `day`. */
+static int wsu_count(uint64_t day) {
+    int n = 0;
+    for (int i = 0; i < g_n_sw; i++) if (g_sw[i].last_used < day) n++;
+    return n;
+}
+
+static int wsu_key(field *f, int key, int ctrl, int shift) {
+    (void)f; (void)ctrl; (void)shift;
+    if (!g_wsu_open) return 0;
+    if (key == OCK_RETURN) { menu_dispatch(g_main, WSM_CMD_UNUSED_GO); return 1; }
+    return 0;
+}
+static void wsu_changed(field *f) { (void)f; g_wsu_err = NULL; invalidate(); }
+
+/* Remove unused, from the Workspaces dialog: it comes back to that dialog. */
+static void wsu_open(oc_win *hwnd) {
+    static field fld;
+    if (!g_wsu_edit) {
+        field_init(&fld, "Date (ex. 2026-05-03, or 3 May)", 0, 0);
+        fld.key = wsu_key; fld.changed = wsu_changed; fld.maxlen = 47;
+        g_wsu_edit = &fld;
+    }
+    field_set(g_wsu_edit, "");
+    g_wsu_err = NULL;
+    modal_enter(hwnd, &g_wsu_open);
+    field_show(g_wsu_edit, 1);
+    focus_set(g_wsu_edit);
+}
+
+static void draw_wsunused(gfx *rt, rectf body) {
+    float x0 = body.left + UIS(4.0f), x1 = body.right - UIS(4.0f), y = body.top + UIS(2.0f);
+    draw_text(rt, "Not used since", g_meta, rf(x0 + UIS(2.0f), y, x1, y + SR_LABEL_H), OC_COL_MUTED);
+    y += SR_LABEL_H;
+    rectf b = rf(x0, y, x1, y + SR_FIELD_H);
+    int focused = g_wsu_edit && g_focus == g_wsu_edit;
+    fill_round(rt, b, OC_R_CONTROL, OC_COL_INPUT);
+    stroke_round(rt, b, OC_R_CONTROL, focused ? OC_COL_ACCENT : OC_COL_BORDER, focused ? 2.0f : 1.0f);
+    float ih = UIS(16.0f), iy = (b.top + b.bottom) / 2 - ih / 2;
+    draw_lucide(rt, OC_ICON_CALENDAR, rf(b.left + UIS(11.0f), iy, b.left + UIS(11.0f) + ih, iy + ih), OC_COL_MUTED);
+    g_wsu_erect = rf(b.left + UIS(34.0f), b.top, b.right, b.bottom);
+    if (g_wsu_edit) field_draw(rt, g_wsu_edit, rf(g_wsu_erect.left + 2, b.top, b.right - 10, b.bottom), OC_COL_TEXT);
+    y = b.bottom + UIS(10.0f);
+    rectf line = rf(x0 + UIS(2.0f), y, x1, body.bottom);
+    if (g_wsu_err) { draw_text(rt, g_wsu_err, g_meta_w, line, OC_COL_DANGER); return; }
+    char t[160];
+    uint64_t day = g_wsu_edit && g_wsu_edit->buf[0] ? parse_day(g_wsu_edit->buf) : 0;
+    if (day) snprintf(t, sizeof t, "%d of the %d remembered workspaces were last used before that day.",
+                      wsu_count(day), g_n_sw);
+    else     snprintf(t, sizeof t, "Every workspace last used before that day is removed, once you confirm.");
+    draw_text(rt, t, g_meta_w, line, OC_COL_MUTED);
+}
+
+/* Continue: the workspaces last used before the day, to be confirmed. */
+static void wsu_continue(oc_win *hwnd) {
+    if (!g_wsu_open) return;
+    uint64_t day = wsu_day();
+    if (!day) { invalidate(); return; }
+    sw_book_load();
+    int n = wsu_count(day);
+    if (n == 0) { g_wsu_err = "No remembered workspace was last used before that day."; invalidate(); return; }
+    if (!wsx_reset(n)) return;
+    for (int i = 0; i < g_n_sw; i++)
+        if (g_sw[i].last_used < day) snprintf(g_wsx[g_n_wsx++], sizeof g_wsx[0], "%s", g_sw[i].ws);
+    char why[96] = ", not used since that day,";
+    time_t tt = (time_t)(day / 1000); struct tm tv;
+    if (oc_localtime_r(&tt, &tv)) {
+        char d[48];
+        strftime(d, sizeof d, "%B %Y", &tv);
+        snprintf(why, sizeof why, ", not used since %d %s,", tv.tm_mday, d);
+    }
+    /* This dialog gives way to the confirmation, which goes back to the
+     * Workspaces dialog under it. */
+    g_wsu_open = 0;
+    if (g_wsu_edit) field_show(g_wsu_edit, 0);
+    focus_set(NULL);
+    wsx_ask(hwnd, why);
+}
+
+/* ---- Remove unreachable: who answers ----------------------------------------
+ *
+ * Each remembered workspace not connected now is asked how it signs people in
+ * (oc_net_probe_ex, as the sign-in card asks), off the UI thread, a few at a
+ * time. One that has not answered within WSP_WAIT_MS of being asked is
+ * unreachable. The workers are joined once they have all finished; until then
+ * the button stays grey. */
+#define WSP_WORKERS 6
+#define WSP_WAIT_MS 5000
+enum { WSP_WAITING, WSP_ASKING, WSP_ANSWERED, WSP_SILENT };
+typedef struct { char ws[256]; unsigned char fp[32]; int have_fp; uint64_t asked; int state; } wsp_item;
+static struct {
+    oc_mutex_t  mu;
+    int         mu_ready;
+    wsp_item   *it;
+    int         n, next;
+    oc_thread_t th[WSP_WORKERS];
+    int         n_th, n_ended;
+    int         judged;             /* the UI has had its answer */
+} g_wsp;
+
+static int wsp_busy(void) { return g_wsp.n_th > 0; }
+
+static void *wsp_worker(void *arg) {
+    (void)arg;
+    oc_cert_seen *seen = malloc(sizeof *seen);
+    oc_signin_source src[4];
+    for (;;) {
+        wsp_item item;
+        oc_mutex_lock(&g_wsp.mu);
+        int k = g_wsp.next < g_wsp.n ? g_wsp.next++ : -1;
+        if (k >= 0) {
+            g_wsp.it[k].state = WSP_ASKING;
+            g_wsp.it[k].asked = now_ms();
+            item = g_wsp.it[k];
+        }
+        oc_mutex_unlock(&g_wsp.mu);
+        if (k < 0) break;
+        int answered = 0;
+        oc_endpoint ep;
+        if (seen && oc_resolve(item.ws, oc_default_suffix(), &ep) == OC_RESOLVE_OK)
+            answered = oc_net_probe_ex(ep.domain, ep.host, ep.port, item.have_fp ? item.fp : NULL,
+                                       src, 4, seen) != OC_PROBE_UNREACHABLE;
+        oc_mutex_lock(&g_wsp.mu);
+        /* Too late is no answer: the UI has judged it already. */
+        if (g_wsp.it[k].state == WSP_ASKING) g_wsp.it[k].state = answered ? WSP_ANSWERED : WSP_SILENT;
+        oc_mutex_unlock(&g_wsp.mu);
+    }
+    free(seen);
+    oc_mutex_lock(&g_wsp.mu);
+    g_wsp.n_ended++;
+    oc_mutex_unlock(&g_wsp.mu);
+    return NULL;
+}
+
+/* Remove unreachable, pressed. */
+static void wsp_start(void) {
+    if (wsp_busy()) return;
+    sw_book_load();
+    if (!g_wsp.mu_ready) { oc_mutex_init(&g_wsp.mu); g_wsp.mu_ready = 1; }
+    free(g_wsp.it); g_wsp.it = NULL; g_wsp.n = 0; g_wsp.next = 0;
+    g_wsp.n_ended = 0; g_wsp.judged = 0;
+    if (g_n_sw > 0) g_wsp.it = calloc((size_t)g_n_sw, sizeof *g_wsp.it);
+    if (g_n_sw > 0 && !g_wsp.it) return;
+    for (int i = 0; i < g_n_sw; i++) {
+        /* One connected now has answered. */
+        int slot = ws_find(g_sw[i].ws);
+        oc_client *c = slot < 0 ? NULL : slot == g_ws_active && g_client ? g_client : g_wss[slot].client;
+        const oc_model *wm = c ? oc_client_model(c) : NULL;
+        if (wm && wm->connected) continue;
+        wsp_item *it = &g_wsp.it[g_wsp.n++];
+        snprintf(it->ws, sizeof it->ws, "%s", g_sw[i].ws);
+        it->have_fp = trust_load(it->ws, it->fp);
+    }
+    if (g_wsp.n == 0) { fb_confirm("Every remembered workspace is connected."); return; }
+    int want = g_wsp.n < WSP_WORKERS ? g_wsp.n : WSP_WORKERS;
+    for (int t = 0; t < want; t++) {
+        if (oc_thread_create(&g_wsp.th[g_wsp.n_th], wsp_worker, NULL) != 0) break;
+        g_wsp.n_th++;
+    }
+    if (g_wsp.n_th == 0) fb_failed("The workspaces could not be checked.");
+    invalidate();
+}
+
+/* Every one has answered or run out of time: the unreachable, to be confirmed,
+ * if the Workspaces dialog is still the one open. */
+static void wsp_judge(oc_win *hwnd) {
+    int n = 0;
+    for (int k = 0; k < g_wsp.n; k++) if (g_wsp.it[k].state == WSP_SILENT) n++;
+    if (!g_wsmgr_open) return;
+    if (n == 0) { fb_confirm("Every remembered workspace answered."); return; }
+    if (!wsx_reset(n)) return;
+    for (int k = 0; k < g_wsp.n; k++)
+        if (g_wsp.it[k].state == WSP_SILENT) snprintf(g_wsx[g_n_wsx++], sizeof g_wsx[0], "%s", g_wsp.it[k].ws);
+    wsx_ask(hwnd, ", which did not answer within 5 seconds,");
+}
+
+static void wsp_tick(oc_win *hwnd) {
+    if (!wsp_busy()) return;
+    uint64_t now = now_ms();
+    int open = 0;
+    oc_mutex_lock(&g_wsp.mu);
+    for (int k = 0; k < g_wsp.n; k++) {
+        wsp_item *it = &g_wsp.it[k];
+        if (it->state == WSP_ASKING && now - it->asked >= WSP_WAIT_MS) it->state = WSP_SILENT;
+        if (it->state == WSP_WAITING || it->state == WSP_ASKING) open++;
+    }
+    int ended = g_wsp.n_ended;
+    oc_mutex_unlock(&g_wsp.mu);
+    if (!open && !g_wsp.judged) { g_wsp.judged = 1; wsp_judge(hwnd); invalidate(); }
+    if (ended == g_wsp.n_th) {
+        for (int t = 0; t < g_wsp.n_th; t++) oc_thread_join(g_wsp.th[t]);
+        g_wsp.n_th = 0;
+        invalidate();
+    }
 }
 
 static void ws_forget(const char *ws) {
@@ -31939,13 +34736,19 @@ static void ws_load(int i) {
 }
 
 /* Collect the remembered workspaces, so boot can connect them all. */
-typedef struct { char ws[WS_MAX][256]; int n; } ws_book;
+typedef struct { char (*ws)[256]; int n, cap; } ws_book;
 
 static void boot_book_cb(void *ctx, const char *workspace, const char *label,
                          const char *username, uint64_t last) {
     (void)label; (void)username; (void)last;
     ws_book *b = ctx;
-    if (!workspace || !workspace[0] || b->n >= WS_MAX) return;
+    if (!workspace || !workspace[0]) return;
+    if (b->n == b->cap) {
+        int cap = b->cap ? b->cap * 2 : 16;
+        char (*ws)[256] = realloc(b->ws, (size_t)cap * sizeof *ws);
+        if (!ws) return;
+        b->ws = ws; b->cap = cap;
+    }
     snprintf(b->ws[b->n++], 256, "%s", workspace);
 }
 
@@ -31954,7 +34757,8 @@ static void boot_book_cb(void *ctx, const char *workspace, const char *label,
  * command-line path that meant a window created hidden and never shown -- a live
  * process, no window, no error, indistinguishable from a client that failed to
  * start at all. */
-/* How many clients connect_start has started this process. Observable by the
+/* How many clients this process has started: connect_start, and the sign-in
+ * card's attempts (signin_start, and the web client's resumed one). Observable by the
  * harness (tools/gui/startup.sh, via test_dump): a startup given a workspace
  * starts exactly one, and a second is the defect where two net threads shared a
  * workspace, each authenticating, with the first orphaned. */
@@ -31999,12 +34803,12 @@ static void boot_other_workspaces(const char *skip) {
     oc_store *s = sp ? oc_store_open(sp) : NULL;
     if (!s) return;
     oc_store_set_secret(s, g_secret);
-    ws_book b; b.n = 0;
+    ws_book b = { NULL, 0, 0 };
     oc_store_workspace_each(s, boot_book_cb, &b);
     oc_store_close(s);
 
     int keep = g_ws_active;      /* -1 when nothing is up yet; ws_load handles it */
-    for (int i = 0; i < b.n && g_n_wss < WS_MAX; i++) {
+    for (int i = 0; i < b.n && g_n_wss < WS_OPEN_MAX; i++) {
         if (skip && strcmp(b.ws[i], skip) == 0) continue;
         if (ws_find(b.ws[i]) >= 0) continue;
         if (!have_stored_token(b.ws[i])) continue;
@@ -32012,6 +34816,7 @@ static void boot_other_workspaces(const char *skip) {
         g_client = NULL; g_sel = 0; g_scroll = 0; g_post_auth = 0; g_n_backfilled = 0;
         connect_start(b.ws[i], "");
     }
+    free(b.ws);
     /* Back to the one the user last used: the extras are background. */
     ws_save_active();
     if (keep >= 0) ws_load(keep);
@@ -32274,6 +35079,7 @@ static void signin_start(oc_win *hwnd, const char *source_id, const char *invite
         invalidate();
         return;
     }
+    g_clients_started++;
     g_si_browser = 1;
     g_si_opened_seq = 0;
     g_si_connecting = 1;
@@ -32324,6 +35130,7 @@ static void signin_resume(oc_win *hwnd, const char *ws, const char *token) {
                                                 g_si_remember, g_si_fp);
     oc_signin_wipe(verifier, sizeof verifier);
     if (!g_si_client) { snprintf(g_si_err, sizeof g_si_err, "could not start the client"); invalidate(); return; }
+    g_clients_started++;
     g_si_browser = 0;
     g_si_opened_seq = 0;
     g_si_connecting = 1;
@@ -32535,6 +35342,7 @@ static int form_dialog(oc_win *owner, const char *title, oc_field *f, int n) {
      * fields — the same class of bug as a predicate whose default is a real
      * answer. */
     g_form_sel_field = -1; g_form_sel_scroll = 0;
+    g_form_scroll = 0; g_form_scroll_max = 0; g_form_scroll_focus = -1;
     memset(g_form_lines, 0, sizeof g_form_lines);
     modal_enter(owner, &g_form_open);      /* paints once, so the rects exist */
     layout_natives(owner);
@@ -32770,14 +35578,20 @@ static void switch_workspace(oc_win *hwnd, const char *ws, const char *cred) {
 
 static void sw_book_cb(void *ctx, const char *workspace, const char *label,
                        const char *username, uint64_t last) {
-    (void)ctx; (void)last;
-    if (g_n_sw >= (int)(sizeof g_sw / sizeof g_sw[0])) return;
+    (void)ctx;
+    if (g_n_sw == g_cap_sw) {
+        int cap = g_cap_sw ? g_cap_sw * 2 : 16;
+        sw_entry *sw = realloc(g_sw, (size_t)cap * sizeof *sw);
+        if (!sw) return;
+        g_sw = sw; g_cap_sw = cap;
+    }
     snprintf(g_sw[g_n_sw].ws, sizeof g_sw[g_n_sw].ws, "%s", workspace ? workspace : "");
     snprintf(g_sw[g_n_sw].label, sizeof g_sw[g_n_sw].label, "%s",
              (label && label[0]) ? label : (workspace ? workspace : "?"));
     /* Kept so a signed-out workspace can go straight to its password. */
     snprintf(g_sw[g_n_sw].user, sizeof g_sw[g_n_sw].user, "%s", username ? username : "");
     g_sw[g_n_sw].current = (g_client != NULL && strcmp(g_sw[g_n_sw].ws, g_cur_ws) == 0);
+    g_sw[g_n_sw].last_used = last;
     g_n_sw++;
 }
 
@@ -32824,6 +35638,7 @@ static void open_ws_menu(oc_win *hwnd) {
     mi_item(73, "Mark all as read");
     mi_item(72, "Keyboard shortcuts");
     mi_item(89, "About OpenChime");
+    mi_item(ABOUT_CMD_WHATSNEW, "What's new");
     if (admin) { mi_section("TOOLS & SETTINGS"); mi_item(60, "Storage usage"); mi_item(61, "Audit log");
                  mi_item(87, "Groups"); }
     mi_sep();
@@ -32883,6 +35698,58 @@ static uint32_t minutes_until_local(int hh, int mm, int force_tomorrow) {
     return (uint32_t)delta;
 }
 
+/* "2026-12-03" as local midnight, in ms; 0 when it is not a date. */
+static uint64_t ooo_parse_day(const char *s) {
+    int y = 0, mo = 0, d = 0;
+    char tail = 0;
+    if (!s || sscanf(s, "%d-%d-%d%c", &y, &mo, &d, &tail) != 3) return 0;
+    if (y < 2000 || y > 2200 || mo < 1 || mo > 12 || d < 1 || d > 31) return 0;
+    struct tm tm;
+    memset(&tm, 0, sizeof tm);
+    tm.tm_year = y - 1900; tm.tm_mon = mo - 1; tm.tm_mday = d; tm.tm_isdst = -1;
+    time_t t = mktime(&tm);
+    if (t == (time_t)-1 || tm.tm_mday != d) return 0;   /* 31 February is not a day */
+    return (uint64_t)t * 1000u;
+}
+
+static void ooo_format_day(uint64_t ms, char *out, size_t cap) {
+    time_t t = (time_t)(ms / 1000);
+    struct tm lt;
+    if (!ms || !oc_localtime_r(&t, &lt)) { out[0] = '\0'; return; }
+    snprintf(out, cap, "%04d-%02d-%02d", lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday);
+}
+
+/* Out of office (REQ-122): from a day (empty for now) until a day, which is the
+ * day they are back, and a message for whoever writes to them. Asked again,
+ * the field in red, until the days make sense. */
+static void ooo_dialog(oc_win *hwnd) {
+    const oc_model *m = model();
+    if (!m || !g_client) return;
+    oc_field f[3] = {
+        { FF_TEXT, "From",     "A day as 2026-12-01, or empty for now.", "" },
+        { FF_TEXT, "Back on",  "The day you are back, as 2026-12-15. Out of office ends that morning. Both days empty clears it.", "" },
+        { FF_TEXT, "Message",  "Shown to anyone who writes to you or mentions you. Optional.", "" },
+    };
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == m->user_id && m->users[i].ooo_end > wall_ms()) {
+            if (m->users[i].ooo_start > wall_ms()) ooo_format_day(m->users[i].ooo_start, f[0].value, sizeof f[0].value);
+            ooo_format_day(m->users[i].ooo_end, f[1].value, sizeof f[1].value);
+            snprintf(f[2].value, sizeof f[2].value, "%s", m->users[i].ooo_message);
+        }
+    for (;;) {
+        if (!form_dialog(hwnd, "Out of office", f, 3)) return;
+        /* Both days left empty: no absence, now or to come. */
+        if (!f[0].value[0] && !f[1].value[0]) { oc_client_set_out_of_office(g_client, 0, 0, ""); return; }
+        uint64_t start = f[0].value[0] ? ooo_parse_day(f[0].value) : wall_ms();
+        uint64_t end = ooo_parse_day(f[1].value);
+        if (f[0].value[0] && !start) { g_form_err_field = 0; continue; }
+        if (!end || end <= start || end <= wall_ms()) { g_form_err_field = 1; continue; }
+        if (strlen(f[2].value) > OC_OOO_MESSAGE_MAX) { g_form_err_field = 2; continue; }
+        oc_client_set_out_of_office(g_client, start, end, f[2].value);
+        return;
+    }
+}
+
 static void open_profile_menu(oc_win *hwnd) {
     /* The reference's profile popover, item for item (its shape, not a copy):
      * identity header, an input-look status row, ONE away/active toggle worded
@@ -32896,6 +35763,33 @@ static void open_profile_menu(oc_win *hwnd) {
     g_n_mi = 0;
     mi_userheader();
     mi_statusrow(51);
+    /* Out of office (REQ-122), beside the status rather than in it: set, or
+     * when set, its end and the way to clear it. */
+    {
+        static char ool[96];
+        const oc_member *me = pm ? oc_model_ooo_active(pm, pm->user_id, wall_ms()) : NULL;
+        /* One set to start later is cleared the same way, before it starts. */
+        const oc_member *later = NULL;
+        for (size_t i = 0; pm && !me && i < pm->n_users; i++)
+            if (pm->users[i].user_id == pm->user_id && pm->users[i].ooo_end > wall_ms() &&
+                pm->users[i].ooo_start > wall_ms())
+                later = &pm->users[i];
+        if (me) {
+            oc_model_ooo_label(me, ool, sizeof ool);
+            mi_item(66, ool);
+            mi_item(67, "Clear out of office");
+        } else if (later) {
+            time_t ts = (time_t)(later->ooo_start / 1000);
+            struct tm lt;
+            char from[32] = "";
+            if (oc_localtime_r(&ts, &lt)) strftime(from, sizeof from, "%d %b", &lt);
+            snprintf(ool, sizeof ool, "Out of office from %s\xE2\x80\xA6", from[0] == '0' ? from + 1 : from);
+            mi_item(66, ool);
+            mi_item(67, "Clear out of office");
+        } else {
+            mi_item(66, "Set out of office\xE2\x80\xA6");
+        }
+    }
     mi_item(pres == OC_PRESENCE_ONLINE ? 11 : 10,
             pres == OC_PRESENCE_ONLINE ? "Set yourself as away"
                                        : "Set yourself as active");
@@ -32929,6 +35823,8 @@ static void open_new_menu(oc_win *hwnd) {
     mi_item(6, "New direct message");
     mi_item(83, "New group message");   /* REQ-056 */
     if (poll_offered(model())) mi_item(90, "New poll");   /* REQ-225 */
+    if (g_sel) mi_item(96, "New snippet");               /* REQ-226 */
+    if (poll_offered(model())) mi_item(97, "New to-do list");
     mi_item(7, "Upload a file");
     mi_sep();
     mi_item(4, "Search messages");
@@ -33166,10 +36062,16 @@ static void open_switcher(oc_win *hwnd) {
     sw_book_load();
     g_n_mi = 0;
     mi_section("WORKSPACES");
+    /* The menu holds a few more than sixteen rows, and Add and Manage come
+     * after the list: the signed-in workspaces always, and the rest up to
+     * sixteen rows. Manage workspaces lists every one. */
+    int shown = 0;
     for (int i = 0; i < g_n_sw; i++) {
         /* Say which are actually connected and what is waiting in them — the
          * point of holding N clients is that you can see it without switching. */
         int slot = ws_find(g_sw[i].ws);
+        if (!(slot >= 0 && g_wss[slot].client) && shown >= 16) continue;
+        shown++;
         int unread = 0;
         if (slot >= 0 && g_wss[slot].client) {
             const oc_model *wm = oc_client_model(g_wss[slot].client);
@@ -33270,6 +36172,8 @@ static void call_claim(void) {
 static void call_open_view(oc_win *hwnd, uint64_t ch) {
     close_overlays();
     g_call_view_ch = ch;
+    /* The conversation beside the call is the call's own (call_chat_left). */
+    if (ch && g_sel != ch && oc_model_channel((oc_model *)model(), ch)) select_channel(ch);
     g_view = VIEW_CALL;
     layout_composer(hwnd);
     invalidate();
@@ -33338,10 +36242,27 @@ static void call_start_here(oc_win *hwnd, uint64_t ch) {
     int n = call_candidates(m, c, cand, CC_MAX_PICK);
     int room = (m->call_max ? m->call_max : 10) - 1;
     if (n > room) { call_pick_open(hwnd, ch, 0, cand, n, room); return; }
+    /* A channel with more than one other member asks first, naming how many it
+     * will ring: a press on the header's phone is easy to make by mistake, and
+     * a call rings everyone in it. A DM rings who you are already talking to. */
+    if (c->kind != OC_CHANNEL_KIND_DM && n > 1 && !g_call_start_ok) {
+        char lbl[96], body[200];
+        call_conv_label(m, ch, lbl, sizeof lbl);
+        snprintf(body, sizeof body, "This rings %d people in %s and asks them to join.", n, lbl);
+        confirm_open(hwnd, CONF_CALL_START, ch, "Start a call?", body, "Start the call");
+        return;
+    }
     call_take_microphone(hwnd);
     call_claim();
     oc_client_call_start(g_client, ch, cand, n);
     call_open_view(hwnd, ch);
+}
+
+/* The start's confirmation said yes: the start it asked about goes on. */
+static void call_start_confirmed(oc_win *hwnd, uint64_t ch) {
+    g_call_start_ok = 1;
+    call_start_here(hwnd, ch);
+    g_call_start_ok = 0;
 }
 
 /* The pane's text for a conversation it opened (BCS_OPENED), held and then
@@ -33685,13 +36606,36 @@ static void call_cmd(oc_win *hwnd, int cmd) {
         if (in || call_back_here(m)) oc_client_call_leave(g_client, m->call.channel_id);
         break;
     case CC_END:
-        if (in) oc_client_call_end(g_client, m->call.channel_id);
-        break;
+        /* Asked first: it ends the call for everyone in it. */
+        if (in) confirm_open(hwnd, CONF_CALL_END, m->call.channel_id, "End the call for everyone?",
+                             "Everyone in it is taken out of the call, not only you.", "End for everyone");
+        return;
     case CC_JOIN:
         if (g_call_view_ch) call_start_here(hwnd, g_call_view_ch);
         break;
     case CC_DECLINE:
         if (g_call_view_ch) oc_client_call_decline(g_client, g_call_view_ch);
+        break;
+    case CC_BANNER_JOIN:
+        /* The conversation's banner: into its call, or to it when you are in. */
+        if (!g_sel) break;
+        if (in && m->call.channel_id == g_sel) call_open_view(hwnd, g_sel);
+        else call_start_here(hwnd, g_sel);
+        break;
+    case CC_BANNER_DECLINE:
+        if (g_sel) oc_client_call_decline(g_client, g_sel);
+        break;
+    case CC_SETTINGS:
+        g_call_settings = !g_call_settings;
+        if (g_call_settings) call_devices_refresh();
+        break;
+    case CC_CHAT:
+        g_call_chat_hidden = !g_call_chat_hidden;
+        layout_composer(hwnd);
+        break;
+    case CC_CALLBACK:
+        /* A missed call's Call back: a new call in the conversation it was in. */
+        if (g_sel) call_start_here(hwnd, g_sel);
         break;
     case CC_INVITE: {
         if (!in) break;
@@ -33784,6 +36728,15 @@ static void call_cmd(oc_win *hwnd, int cmd) {
         } else if (cmd >= CC_ROW0 && cmd < CC_ROW0 + 8) {
             int i = cmd - CC_ROW0;
             if (i < g_n_call_rows) call_open_view(hwnd, g_call_rows[i].ch);
+            break;
+        } else if (cmd >= CC_ROWJOIN0 && cmd < CC_ROWJOIN0 + 8) {
+            /* A Calls row's own Join: into it, or Open when already in it. */
+            int i = cmd - CC_ROWJOIN0;
+            if (i < g_n_call_rows) {
+                uint64_t ch = g_call_rows[i].ch;
+                if (in && m->call.channel_id == ch) call_open_view(hwnd, ch);
+                else call_join_here(hwnd, ch);
+            }
             break;
         } else if (cmd >= CC_PICK0 && cmd < CC_PICK0 + CC_MAX_PICK) {
             int i = cmd - CC_PICK0;
@@ -34064,6 +37017,40 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         }
         break;
     case 90: poll_compose_open(hwnd, g_sel, 0); break;   /* REQ-225 */
+    case 96: {   /* REQ-226: what is in the message box, as a snippet */
+        char *t = ed_md_all();
+        if (!g_sel) fb_failed("Open a conversation first.");
+        else if (!t || !t[0]) fb_failed("Write or paste the snippet's text in the message box first.");
+        else { snippet_compose(hwnd, t); ed_clear(); }
+        free(t);
+        break; }
+    case 97: {   /* a to-do list: its title and tasks, sent as the "/todo" message that makes it */
+        if (!g_client || !g_sel) { fb_failed("Open a conversation first."); break; }
+        oc_field f[2] = {
+            { FF_TEXT, "Title", "What the list is for.", "" },
+            { FF_MULTILINE, "Tasks", "One a line, in order. \"name: description\" gives one a description.", "" },
+        };
+        if (!form_dialog(hwnd, "New to-do list", f, 2) || !f[0].value[0]) break;
+        size_t cap = strlen(f[0].value) + strlen(f[1].value) * 2 + 32;
+        char *body = malloc(cap);
+        if (!body) break;
+        size_t k = (size_t)snprintf(body, cap, "/todo %s", f[0].value);
+        for (const char *q = f[1].value; *q; ) {
+            const char *e = strchr(q, '\n');
+            size_t n = e ? (size_t)(e - q) : strlen(q);
+            const char *t = q; size_t tn = n;   /* a line typed as "- name" is the task "name" */
+            while (tn && (*t == ' ' || *t == '\t')) { t++; tn--; }
+            if (tn && (*t == '-' || *t == '*')) { t++; tn--; }
+            if (tn && !oc_todo_blank(t, tn)) k += (size_t)snprintf(body + k, cap - k, "\n- %.*s", (int)tn, t);
+            q += n + (e ? 1 : 0);
+        }
+        oc_todo_parsed tp;
+        int pr = oc_todo_parse(body, k, &tp);
+        if (pr == OC_TODO_DUP) fb_failed("Two tasks have the same name.");
+        else if (pr != OC_TODO_OK) fb_failed("A title or a task is too long, or there are more than 200 tasks.");
+        else oc_client_send(g_client, g_sel, body);
+        free(body);
+        break; }
     case 91:     /* the poll composer's Post poll / Save */
         if (g_pc_open && poll_compose_submit()) g_modal_closed_by = "save";
         break;
@@ -34201,6 +37188,12 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
     case 51:     /* the status dialog — bespoke modal, see status_open */
         status_open(hwnd);
         break;
+    case 66:     /* out of office (REQ-122): dates and a message */
+        ooo_dialog(hwnd);
+        break;
+    case 67:
+        if (g_client) oc_client_set_out_of_office(g_client, 0, 0, "");
+        break;
     case 34:     /* deactivate your own account (REQ-033), said before it happens */
         confirm_open(hwnd, CONF_DEACTIVATE_SELF, 0, "Deactivate your account?",
                      "You will be signed out on every device, and you will not be able to sign in. "
@@ -34216,6 +37209,22 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         const oc_model *m65 = model();
         if (m65) { g_view = VIEW_HOME; profile_open(m65->user_id); }
         break; }
+    case 311:   /* the jump-to-date calendar's Jump: the day picked, where it was opened */
+        if (!g_jc_open) break;
+        if (!g_jc_d) {
+            if (!g_jc_err)
+                g_jc_err = g_jc_edit && g_jc_edit->buf[0] ? "That is not a date OpenChime can read. Try 2026-05-03."
+                                                          : "Pick a day first.";
+            invalidate();
+            break;
+        }
+        {
+            uint64_t cid = g_jc_cid, parent = g_jc_parent, day = sch_ms(g_jc_y, g_jc_m, g_jc_d, 0);
+            modal_finish(0);
+            g_modal_closed_by = "save";
+            date_jump(cid, parent, day);
+        }
+        break;
     case 310:   /* the custom range card's Summarize (REQ-310) */
         if (!g_sr_open) break;
         {
@@ -34303,6 +37312,24 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
                 had_name = pm2->users[i].name;
                 break;
             }
+        /* Then the workspace's own fields (department, location...), in its
+         * order, each with what I gave it. Copied out of the model: the form
+         * pumps the loop, and the model may change under it. */
+        static char pf_lbl[OC_MAX_PROFILE_FIELDS][OC_PROFILE_FIELD_LABEL_MAX + 1];
+        static char pf_had[OC_MAX_PROFILE_FIELDS][OC_PROFILE_FIELD_VALUE_MAX + 1];
+        uint64_t pf_ids[OC_MAX_PROFILE_FIELDS];
+        int nbuilt = nfields, npf = 0;
+        if (pm2) for (uint8_t k = 0; k < pm2->n_pfields && nfields < FORM_MAX_FIELDS; k++) {
+            const oc_pfield *pf = &pm2->pfields[k];
+            snprintf(pf_lbl[npf], sizeof pf_lbl[npf], "%s", pf->label);
+            snprintf(pf_had[npf], sizeof pf_had[npf], "%s", oc_model_profile_value(pm2, pm2->user_id, pf->id));
+            pf_ids[npf] = pf->id;
+            f[nfields].kind  = FF_TEXT;
+            f[nfields].label = pf_lbl[npf];
+            f[nfields].hint  = pf->kind == OC_PROFILE_FIELD_LINK ? "A link, starting https://" : "";
+            snprintf(f[nfields].value, sizeof f[nfields].value, "%s", pf_had[npf]);
+            nfields++; npf++;
+        }
         /* The photo sits beside the fields rather than behind a separate action:
          * one screen owns identity, and identity includes the picture. Not armed
          * over a form that is already open — that one would inherit the column. */
@@ -34314,8 +37341,8 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         }
         /* Hear each voice as it is picked, rather than choosing a name blind and
          * finding out on every message afterwards. */
-        g_form_on_pick = nfields == 7 ? profile_voice_picked : NULL;
-        if (nfields == 7) {
+        g_form_on_pick = nbuilt == 7 ? profile_voice_picked : NULL;
+        if (nbuilt == 7) {
             g_form_action_field = 6;
             g_form_action_label = "Play";
             g_form_action_busy_label = "Playing\u2026";
@@ -34334,8 +37361,13 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         /* An empty voice keeps whatever is set, which is exactly what
          * "Automatic" means to the daemon: it picks, once, and that choice then
          * shows here as the voice it chose. */
-        const char *voice = nfields == 7 ? voice_id_at(model(), atoi(f[6].value)) : "";
+        const char *voice = nbuilt == 7 ? voice_id_at(model(), atoi(f[6].value)) : "";
         oc_client_set_profile(g_client, f[0].value, f[2].value, f[3].value, f[4].value, tz, voice);
+        /* The workspace's fields are one value each on the wire: only those that
+         * changed are sent, each answered by my whole profile. */
+        for (int k = 0; k < npf; k++)
+            if (strcmp(f[nbuilt + k].value, pf_had[k]))
+                oc_client_set_profile_field_value(g_client, pf_ids[k], f[nbuilt + k].value);
         /* The display name is its own op on the wire (SET_DISPLAY_NAME), so the
          * one screen makes two calls — and only when it CHANGED, because a
          * rename fans a PROFILE_UPDATED to every connection in the workspace and
@@ -34382,7 +37414,8 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
     case 40: invite_people(hwnd, OC_ROLE_MEMBER); break;
     case 41: invite_people(hwnd, OC_ROLE_ADMIN);  break;
     case 60: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_storage(g_client, 1); oc_client_storage_status(g_client); break;
-    case 61: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_audit(g_client, 1); oc_client_audit_query(g_client, 0); break;
+    case 61: g_view = VIEW_HOME; close_overlays(); g_audit_focus = -1;   /* a fresh opening: no row chosen */
+        oc_client_toggle_audit(g_client, 1); oc_client_audit_query(g_client, 0); break;
     case 87:   /* Admin > Groups (REQ-307) */
         close_overlays();
         g_view = VIEW_ADMIN; layout_composer(hwnd);
@@ -34430,7 +37463,24 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         break; }
     case 71: oc_client_list_notify_prefs(g_client); modal_enter(hwnd, &g_notify_open); break;   /* */
     case 72: modal_enter(hwnd, &g_keys_open); break;   /* */
-    case 89: modal_enter(hwnd, &g_about_open); break;
+    case 89: g_whatsnew = 0; modal_enter(hwnd, &g_about_open); break;
+    case ABOUT_CMD_WHATSNEW:
+        /* This build's notes, asked of the control plane by its build id; a
+         * source build is not a release and is not asked about. */
+        g_whatsnew = 1;
+        if (!oc_releasenotes_askable(OC_BUILD_ID)) g_wn_state = WN_NOTRELEASE;
+        else { g_wn_state = WN_LOADING; oc_plat_releasenotes_start(OC_BUILD_ID); }
+        if (!g_about_open) modal_enter(hwnd, &g_about_open);
+        invalidate();
+        break;
+    case WN_CMD_OPEN: {
+        char url[200];
+        snprintf(url, sizeof url, "%s%s", OC_RN_PAGE_URL, OC_BUILD_ID);
+        signin_open_url(oc_releasenotes_askable(OC_BUILD_ID) ? url : OC_RN_INDEX_URL);
+        break; }
+    case WSM_CMD_UNUSED:    wsu_open(hwnd); break;
+    case WSM_CMD_UNUSED_GO: wsu_continue(hwnd); break;
+    case WSM_CMD_UNREACH:   wsp_start(); break;
     case WSM_CMD_REMOVE_ALL: {
         if (g_n_sw <= 0) break;
         char what[48], body[320];
@@ -34448,6 +37498,18 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         about_text(model(), t, sizeof t);
         copy_to_clipboard(hwnd, t);
         fb_confirm("Copied");
+        break; }
+    case SV_CMD_COPY: {                /* a snippet's whole text (REQ-226) */
+        const char *t = snip_text(g_sv_aid, NULL);
+        if (t) { copy_to_clipboard(hwnd, t); fb_confirm("Snippet copied."); }
+        else fb_failed("The snippet has not loaded yet.");
+        break; }
+    case SV_CMD_SAVE: {                /* ...or its file, as any download */
+        oc_attachment a; memset(&a, 0, sizeof a);
+        a.id = g_sv_aid;
+        snprintf(a.filename, sizeof a.filename, "%s", g_sv_file);
+        snprintf(a.mime, sizeof a.mime, "text/plain");
+        download_attachment(hwnd, &a);
         break; }
     /* "Add a workspace…" drops the current session and goes to the same sign-in
      * view the app starts on — one sign-in implementation, not two. */
@@ -34517,7 +37579,11 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         /* A fresh opening starts at the top with no row chosen; coming BACK to it
          * from a confirmation keeps both (modal_finish). */
         sw_book_load(); g_wsmgr_focus = -1; g_ovl_kind = 0;
-        modal_enter(hwnd, &g_wsmgr_open); break;
+        if (g_wsm_q) field_set(g_wsm_q, "");
+        modal_enter(hwnd, &g_wsmgr_open);
+        /* The keyboard starts in the filter box: typing filters at once. */
+        if (g_wsm_q) { field_show(g_wsm_q, 1); focus_set(g_wsm_q); }
+        break;
     default:
         /* Section Filter/Sort (see SEC_CMD). */
         /* The range covers the custom sections too (numbered from
@@ -34559,6 +37625,120 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
     invalidate();
 }
 
+/* Jump to a date: the four common ones as single choices, and any date on a
+ * calendar. Run through the channel menu (41..45), as it is about one
+ * conversation; `parent` is the thread in it to search, 0 for the main scroll. */
+static void jump_menu_open(oc_win *hwnd, uint64_t cid, uint64_t parent, float x, float y) {
+    if (!cid) return;
+    g_n_mi = 0;
+    mi_section("JUMP TO");
+    mi_item(41, "Today");
+    mi_item(42, "Yesterday");
+    mi_item(43, "Last week");
+    mi_item(44, "Last month");
+    mi_item(45, "A date\xE2\x80\xA6");
+    g_menu = MENU_CHANNEL; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 200;
+    g_menu_target = cid; g_menu_target2 = parent;
+    g_menu_x = x; g_menu_y = y;
+    irect rc; client_rect(hwnd, &rc);
+    float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
+    float H = DIPF(rc.bottom), W = DIPF(rc.right);
+    if (g_menu_y + h > H - 8) g_menu_y = H - 8 - h;
+    if (g_menu_y < 8) g_menu_y = 8;
+    if (g_menu_x + g_menu_w > W - 8) g_menu_x = W - 8 - g_menu_w;
+    if (g_menu_x < 8) g_menu_x = 8;
+    invalidate();
+}
+
+/* The reader's local midnight `days_back` days before today, in ms. */
+static uint64_t local_day_start(int days_back) {
+    time_t now = time(NULL);
+    struct tm tv;
+    if (!oc_localtime_r(&now, &tv)) return 0;
+    tv.tm_mday -= days_back;
+    tv.tm_hour = tv.tm_min = tv.tm_sec = 0;
+    tv.tm_isdst = -1;
+    time_t t = mktime(&tv);
+    return t == (time_t)-1 ? 0 : (uint64_t)t * 1000u;
+}
+
+/* "2026-05-03", "3 May" or "May 3 2026": the local midnight of that day, or 0. */
+static uint64_t parse_day(const char *s) {
+    static const char *const MON[12] = { "jan", "feb", "mar", "apr", "may", "jun",
+                                         "jul", "aug", "sep", "oct", "nov", "dec" };
+    int y = 0, mo = 0, d = 0;
+    char w[16] = "";
+    time_t now = time(NULL);
+    struct tm tv;
+    if (!oc_localtime_r(&now, &tv)) return 0;
+    if (sscanf(s, "%d-%d-%d", &y, &mo, &d) == 3) {
+        /* ISO */
+    } else if (sscanf(s, "%d %15s %d", &d, w, &y) >= 2 || sscanf(s, "%15s %d %d", w, &d, &y) >= 2) {
+        mo = 0;
+        for (int i = 0; i < 12; i++)
+            if (!SDL_strncasecmp(w, MON[i], 3)) { mo = i + 1; break; }
+        if (!y) y = tv.tm_year + 1900;
+    } else return 0;
+    if (mo < 1 || mo > 12 || d < 1 || d > 31 || y < 1970 || y > 9999) return 0;
+    struct tm t = {0};
+    t.tm_year = y - 1900; t.tm_mon = mo - 1; t.tm_mday = d; t.tm_isdst = -1;
+    time_t r = mktime(&t);
+    if (r == (time_t)-1 || t.tm_mday != d) return 0;   /* 31 April and the like */
+    return (uint64_t)r * 1000u;
+}
+
+/* Ask where `day_ms` falls in conversation `cid`, or in its thread `parent`
+ * (0 for the main scroll); the tick opens the answer. */
+static void date_jump(uint64_t cid, uint64_t parent, uint64_t day_ms) {
+    if (!g_client || !cid || !day_ms) return;
+    g_date_cid = cid; g_date_parent = parent; g_date_day = day_ms;
+    oc_client_find_at_time(g_client, cid, parent, day_ms);
+}
+
+/* The daemon has answered a jump to a date: open the conversation at that
+ * message, as a permalink does, or scroll the open thread to that reply, and
+ * say so when it is not on the day asked. */
+static void date_jump_land(oc_win *hwnd, const oc_model *m) {
+    if (!m || m->found_seq == g_found_seen) return;
+    g_found_seen = m->found_seq;
+    if (!g_date_cid || m->found_channel != g_date_cid || m->found_parent != g_date_parent) return;
+    uint64_t cid = g_date_cid, parent = g_date_parent, day = g_date_day;
+    g_date_cid = g_date_parent = g_date_day = 0;
+    if (parent) {
+        /* In the thread, which must still be the one open: its pane scrolls to
+         * the reply and flashes it, as the transcript does a message. */
+        if (!m->thread_open || m->thread_channel != cid || m->thread_parent != parent) return;
+        if (!m->found_mid) { fb_failed("There are no replies here yet."); return; }
+        g_thr_jump_mid = m->found_mid;
+        g_thr_jump_deadline = now_ms() + 4000;
+    } else {
+        if (!m->found_mid) { fb_failed("There are no messages here yet."); return; }
+        g_view = VIEW_HOME;
+        close_overlays();
+        if (g_sel != cid) select_channel(cid);
+        g_jump_mid = m->found_mid;
+        g_jump_deadline = now_ms() + 4000;
+        hist_jump(cid, m->found_mid);
+        select_tab(TAB_MESSAGES);
+        layout_composer(hwnd);
+    }
+    if (!same_day(m->found_time, day)) {
+        char asked[32], got[32], note[120];
+        time_t ta = (time_t)(day / 1000), tg = (time_t)(m->found_time / 1000);
+        struct tm va, vg;
+        if (oc_localtime_r(&ta, &va) && oc_localtime_r(&tg, &vg)) {
+            /* %d, not %e: the Windows runtime has no %e. */
+            strftime(asked, sizeof asked, "%d %B", &va);
+            strftime(got, sizeof got, "%d %B", &vg);
+            snprintf(note, sizeof note, "No messages on %s; showing the %s, %s.",
+                     asked[0] == '0' ? asked + 1 : asked, m->found_exact ? "next" : "last before it",
+                     got[0] == '0' ? got + 1 : got);
+            fb_confirm(note);
+        }
+    }
+    invalidate();
+}
+
 static void show_channel_menu(oc_win *hwnd, const oc_model *m, uint64_t cid, float cx, float cy) {
     const oc_channel *c = oc_model_channel((oc_model *)m, cid);
     if (!c) return;
@@ -34570,6 +37750,7 @@ static void show_channel_menu(oc_win *hwnd, const oc_model *m, uint64_t cid, flo
                                                       : "Add to Starred");
         mi_item(31, c->muted ? "Unmute" : "Mute");
         mi_item(2, "Mark as read");
+        mi_item(40, "Jump to date");
         if (oc_model_summarize_available(m)) mi_item(23, "Summarize");   /* REQ-310 */
         /* Notification levels FLATTENED out of a submenu, with the current
          * one ticked — the same reasoning as the member role: the useful part of a
@@ -34585,6 +37766,12 @@ static void show_channel_menu(oc_win *hwnd, const oc_model *m, uint64_t cid, flo
         snprintf(lbl, sizeof lbl, "%sNothing",
                  c->notify_level == OC_NOTIFY_NONE ? "\xE2\x9C\x93 " : "    ");
         mi_item(22, lbl);
+        /* Every thread in it followed (REQ-282), ticked when on. Not in an
+         * encrypted DM, whose replies the daemon cannot weigh. */
+        if (!c->e2e) {
+            snprintf(lbl, sizeof lbl, "%sFollow all threads", c->follow_threads ? "\xE2\x9C\x93 " : "    ");
+            mi_item(24, lbl);
+        }
         if (c->kind != OC_CHANNEL_KIND_DM) {
             mi_sep();
             /* both frames had always existed on the wire and reached no
@@ -34659,6 +37846,17 @@ static void kb_row_move(oc_win *hwnd, int d) {
 static void kb_context_menu(oc_win *hwnd) {
     const oc_model *m = model();
     if (!m) return;
+    /* The audit row the keyboard is on: its menu, where a right-click opens it. */
+    if (m->audit_open && g_audit_focus >= 0) {
+        for (int i = 0; i < g_n_audit_rowhits; i++)
+            if (g_audit_rowhits[i].idx == g_audit_focus) {
+                if (audit_menu_open(hwnd, m, g_audit_focus, g_audit_rowhits[i].row.left + UIS(60),
+                                    g_audit_rowhits[i].row.top + UIS(20)))
+                    menu_move(1);
+                return;
+            }
+        return;
+    }
     if (g_kb_mid) {
         for (int i = 0; i < g_n_msgrows; i++)
             if (g_msgrows[i].mid == g_kb_mid) {
@@ -34688,6 +37886,12 @@ static void channel_menu_run(oc_win *hwnd, int cmd) {
     case 31: {                                 /* */
         const oc_channel *mc = oc_model_channel((oc_model *)m, cid);
         oc_client_set_mute(g_client, cid, mc && mc->muted ? 0 : 1);
+        break; }
+    case 24: {   /* every thread in it followed, or not (REQ-282) */
+        const oc_channel *mc = oc_model_channel((oc_model *)m, cid);
+        int on = !(mc && mc->follow_threads);
+        oc_client_channel_thread_follow(g_client, cid, (uint8_t)on);
+        fb_confirm(on ? "Following every thread here." : "No longer following every thread here.");
         break; }
     case 30:                                   /* */
         if (oc_sidebar_toggle_star(&g_sb, cid)) sidebar_opts_save();
@@ -34721,6 +37925,14 @@ static void channel_menu_run(oc_win *hwnd, int cmd) {
     case 21: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_MENTIONS); break;
     case 22: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_NONE); break;
     case 23: sum_menu_open(rf(g_menu_x, g_menu_y - 4, g_menu_x + 220, g_menu_y - 4), cid); break;
+    case 40: jump_menu_open(hwnd, cid, 0, g_menu_x, g_menu_y); break;
+    /* g_menu_target2: the thread the jump menu was opened for, 0 for the
+     * conversation's main scroll. */
+    case 41: date_jump(cid, g_menu_target2, local_day_start(0)); break;
+    case 42: date_jump(cid, g_menu_target2, local_day_start(1)); break;
+    case 43: date_jump(cid, g_menu_target2, local_day_start(7)); break;
+    case 44: date_jump(cid, g_menu_target2, local_day_start(30)); break;
+    case 45: jumpcal_open(hwnd, cid, g_menu_target2); break;
     default:
         if (cmd >= 300 && cmd < 300 + (int)OC_SB_CUSTOM_MAX) {
             if (oc_sidebar_assign(&g_sb, cid, cmd - 300)) sidebar_opts_save();
@@ -34935,7 +38147,8 @@ static void *devlist_thread(void *arg) {
 /* The open confirmation, and which one: the harness answers some of them
  * (tools/gui/drive.sh trust_dev_cert, lib.sh sign_in_card), signed in or not. */
 static void test_dump_confirm(FILE *f) {
-    fprintf(f, "confirm open=%d act=%d url=\"%s\" emoji=\"%s\"\n", g_confirm_open, g_confirm_act, g_confirm_url, g_confirm_emoji);
+    fprintf(f, "confirm open=%d act=%d url=\"%s\" emoji=\"%s\" title=\"%s\"\n", g_confirm_open, g_confirm_act,
+            g_confirm_url, g_confirm_emoji, g_confirm_title);
 }
 
 /* THE TREE ITSELF, one line per element, so a check outside the client
@@ -34965,10 +38178,15 @@ static void test_dump(const char *path) {
          * dump without them left every Windows script stuck at launch. */
         fprintf(f, "no model\nview=%d wsbook=%d dpi=%u\nsignin step=%d browser=%d connecting=%d err=%s\n",
                 g_view, ws_book_count(), g_dpi, g_si_step, g_si_browser, g_si_connecting, g_si_err);
-        if (g_si_client) {
-            const oc_model *sm = oc_client_model(g_si_client);
-            if (sm) fprintf(f, "signin last_error=%s signin_url=%.120s\n", sm->last_error, sm->signin_url);
-        }
+        const oc_model *sm = g_si_client ? oc_client_model(g_si_client) : NULL;
+        if (sm) fprintf(f, "signin last_error=%s signin_url=%.120s\n", sm->last_error, sm->signin_url);
+        /* The two lines a signed-in dump has that say how a start went, here
+         * too: a start that never signed in is the case they are most needed
+         * for (tools/gui/startup.sh). The error is the sign-in attempt's. */
+        fprintf(f, "startup visible=%d started=%d si_ws=\"%s\" si_err=\"%s\"\n",
+                win_visible(g_main), g_clients_started, g_si_ws, g_si_err);
+        fprintf(f, "error_seq=%u last_error=\"%s\"\n",
+                sm ? (unsigned)sm->error_seq : 0u, sm ? sm->last_error : "");
         fprintf(f, "cursor kind=%s\n", cursor_kind_name());
         test_dump_confirm(f);
         test_dump_a11y(f);
@@ -35138,6 +38356,41 @@ static void test_dump(const char *path) {
                 fprintf(f, "    pollopt msg=%llu i=%u label=\"%s\" count=%u mine=%d r=%.0f,%.0f,%.0f,%.0f\n",
                         (unsigned long long)mid, (unsigned)o, pv->labels[o], (unsigned)pv->counts[o],
                         (pv->mine >> o) & 1, r.left, r.top, r.right, r.bottom);
+            }
+        }
+    }
+    /* To-do lists in the open conversation: what the daemon said, and where
+     * each part is drawn -- a task's box, "Add a task" and Rename, each r= where
+     * to press, 0,0,0,0 when it is not drawn -- and whether the body shows. */
+    {
+        const oc_channel *dc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+        if (dc) for (size_t i = 0; i < dc->n_msgs; i++) {
+            const oc_todo_view *tv = dc->msgs[i].deleted ? NULL : dc->msgs[i].todo;
+            if (!tv) continue;
+            uint64_t mid = dc->msgs[i].message_id;
+            rectf add = rf(0, 0, 0, 0), ren = rf(0, 0, 0, 0);
+            unsigned done = 0;
+            for (int k = 0; k < g_n_todohits; k++) {
+                if (g_todohits[k].mid != mid) continue;
+                if (g_todohits[k].task == -1) add = g_todohits[k].r;
+                if (g_todohits[k].task == -2) ren = g_todohits[k].r;
+            }
+            for (uint16_t t = 0; t < tv->total && t < tv->cap; t++) done += tv->tasks[t].done != 0;
+            fprintf(f, "  todo msg=%llu author=%llu total=%u done=%u body=%d add=%.0f,%.0f,%.0f,%.0f "
+                       "rename=%.0f,%.0f,%.0f,%.0f title=\"%s\"\n",
+                    (unsigned long long)mid, (unsigned long long)tv->author_id, (unsigned)tv->total, done,
+                    msg_has_body(&dc->msgs[i]), add.left, add.top, add.right, add.bottom,
+                    ren.left, ren.top, ren.right, ren.bottom, tv->title ? tv->title : "");
+            for (uint16_t t = 0; t < tv->total && t < tv->cap; t++) {
+                const oc_todo_task_view *tk = &tv->tasks[t];
+                rectf r = rf(0, 0, 0, 0);
+                for (int k = 0; k < g_n_todohits; k++)
+                    if (g_todohits[k].mid == mid && g_todohits[k].task == (int)t) r = g_todohits[k].r;
+                const char *by = tk->done_by ? oc_model_user_name((oc_model *)m, tk->done_by) : "";
+                fprintf(f, "    todotask msg=%llu i=%u done=%d by=%llu byname=\"%s\" r=%.0f,%.0f,%.0f,%.0f "
+                           "name=\"%s\" desc=\"%s\"\n",
+                        (unsigned long long)mid, (unsigned)t, tk->done != 0, (unsigned long long)tk->done_by,
+                        by ? by : "", r.left, r.top, r.right, r.bottom, tk->name ? tk->name : "", tk->desc ? tk->desc : "");
             }
         }
     }
@@ -35328,6 +38581,28 @@ static void test_dump(const char *path) {
                     }
             fprintf(f, "callevents n=%zu last_ch=%llu last=\"%s\"\n", ne, (unsigned long long)lch, lb);
         }
+        /* The call's interface as a person meets it: the conversation's banner,
+         * the call view's side panel and settings, what the header's phone and
+         * Mute say on hover, and a missed call read from this reader's side. */
+        {
+            irect crc; client_rect(g_main, &crc);
+            const char *said = "";
+            char saidb[160];
+            for (size_t ci = 0; ci < m->n_channels; ci++) {
+                const oc_channel *ch = &m->channels[ci];
+                if (ch->channel_id != g_sel) continue;
+                for (size_t mi = 0; mi < ch->n_msgs; mi++)
+                    if (ch->msgs[mi].kind == OC_MSG_KIND_CALL) {
+                        const char *wn = oc_model_user_name(m, ch->msgs[mi].author_id);
+                        if (ch->msgs[mi].author_id == m->user_id) snprintf(saidb, sizeof saidb, "Nobody joined your call");
+                        else snprintf(saidb, sizeof saidb, "You missed a call from %s", (wn && wn[0]) ? wn : "someone");
+                        said = saidb;
+                    }
+            }
+            fprintf(f, "callui banner=%d chat=%d chat_x=%.0f settings=%d hdrtip=\"%s\" mutetip=\"%s\" missed=\"%s\"\n",
+                    g_call_banner_on, call_chat_left(DIPF(crc.right)) > 0, call_chat_left(DIPF(crc.right)),
+                    g_call_settings, call_hdr_words(m), call_mute_words(), said);
+        }
         /* The member picker, when a start or an invitation has more people than
          * the call has room for: who is offered, in order, and who is ticked. */
         if (g_cpick_ch) {
@@ -35408,6 +38683,20 @@ static void test_dump(const char *path) {
                 g_preview_wait_ms, g_form_action_busy);
     }
     fprintf(f, "view=%d si_overlay=%d wsmgr=%d wsbook=%d\n", g_view, g_si_overlay, g_wsmgr_open, ws_book_count());
+    /* The Workspaces dialog's rows as they are listed: the filter's text, how
+     * many it admits of how many remembered, then each in order. */
+    fprintf(f, "wsunused open=%d err=\"%s\"\n", g_wsu_open, g_wsu_err ? g_wsu_err : "");
+    if (g_wsmgr_open) {
+        wsmgr_view();
+        fprintf(f, "wsmgr rows=%d of=%d focus=%d checking=%d filter=\"%s\"\n", g_n_swv, g_n_sw,
+                g_wsmgr_focus, wsp_busy(), g_wsm_q ? g_wsm_q->buf : "");
+        for (int v = 0; v < g_n_swv; v++) {
+            int i = g_swv[v];
+            char addr[300]; sw_addr(i, addr, sizeof addr);
+            fprintf(f, "  wsrow %d live=%d last=%llu addr=%s user=%s ws=%s\n", v, sw_live(i),
+                    (unsigned long long)g_sw[i].last_used, addr, g_sw[i].user[0] ? g_sw[i].user : "-", g_sw[i].ws);
+        }
+    }
     /* How the client started (tools/gui/startup.sh). `visible` is whether the
      * window is on screen at all -- a client that started and showed nothing
      * looked, from here, exactly like one that never started. `started` counts
@@ -35473,6 +38762,23 @@ static void test_dump(const char *path) {
                     ? oc_model_user_name((oc_model *)m, g_memrows[i].uid) : "",
                 g_memrows[i].rm.left, g_memrows[i].rm.top, g_memrows[i].rm.right, g_memrows[i].rm.bottom,
                 g_memrows[i].via);
+    {   /* The audit pane: its filters, the row the keyboard is on, and each row
+         * drawn with what it names and where it is (DIPs, as `rclick` takes). */
+        const oc_model *am = model();
+        if (am && am->audit_open) {
+            fprintf(f, "audit open=1 n=%zu focus=%d family=%d actor=%llu action=\"%s\"\n", am->n_audit,
+                    g_audit_focus, am->audit_family, (unsigned long long)am->audit_actor, am->audit_action);
+            for (int i = 0; i < g_n_audit_rowhits; i++) {
+                int k = g_audit_rowhits[i].idx;
+                if (k < 0 || (size_t)k >= am->n_audit) continue;
+                const oc_audit_view *a = &am->audit[k];
+                rectf r = g_audit_rowhits[i].row;
+                fprintf(f, "  auditrow %d actor=%llu channel=%llu target=%llu action=%s rect=%.0f,%.0f,%.0f,%.0f\n", k,
+                        (unsigned long long)a->actor_id, (unsigned long long)a->channel_id,
+                        (unsigned long long)a->target_id, a->action, r.left, r.top, r.right, r.bottom);
+            }
+        }
+    }
     fprintf(f, "menu=%d more=%d lightbox=%llu\n", g_menu, g_more_open,
             (unsigned long long)g_lightbox);
     /* The summary (REQ-310): the pane's state, what it drew, and the range card. */
@@ -35550,9 +38856,12 @@ static void test_dump(const char *path) {
             (unsigned long long)g_profile_uid, g_rp_mode,
             g_prof_dm_btn.left, g_prof_dm_btn.top, g_prof_dm_btn.right, g_prof_dm_btn.bottom);
     {
-        char ed8[1024] = "";
-        oc_wch edw[512];
-        int n = ed_get(edw, 512);
+        /* The whole draft, however long: a check that reads past its first few
+         * hundred characters (a draft of 66 spoilers) found nothing there. */
+        static char ed8[ED_MAX * 3 + 1];
+        ed8[0] = '\0';
+        static oc_wch edw[ED_MAX + 1];
+        int n = ed_get(edw, ED_MAX + 1);
         if (n > 0) to_u8(edw, ed8, sizeof ed8);
         {   /* The caret's own rect, so "is the caret on the text line" is a
              * question the harness can ask. It could not, which is how a caret
@@ -35662,12 +38971,20 @@ static void test_dump(const char *path) {
             g_modal_card.right, g_modal_card.bottom,
             g_modal_close_btn.left, g_modal_close_btn.top,
             g_modal_close_btn.right, g_modal_close_btn.bottom, g_n_modal_btns);
-    fprintf(f, "modal=%s theme=%d time24=%d members=%d daysep=%d notify=%d\n",
+    fprintf(f, "modal=%s picker=%d theme=%d time24=%d members=%d daysep=%d notify=%d\n",
             g_prefs_open ? "prefs" : g_keys_open ? "keys" : g_about_open ? "about" :
             g_wsmgr_open ? "wsmgr" : g_notify_open ? "notify" :
             g_browse_open ? "browse" : g_confirm_open ? "confirm" :
             g_sessions_open ? "sessions" : g_form_open ? "form" : "none",
+            oc_plat_picker_open(),
             oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep, g_pref_notify);
+    {   /* What's new: its card's state, the release, and how many items it lists. */
+        static const char *const WN[] = { "none", "loading", "shown", "notrelease", "failed" };
+        int items = 0;
+        for (int s = 0; g_wn_state == WN_SHOWN && s < g_wn.n_sections; s++) items += g_wn.sections[s].n_items;
+        fprintf(f, "whatsnew=%s open=%d release=%d items=%d\n", WN[g_wn_state], g_about_open && g_whatsnew,
+                g_wn_state == WN_SHOWN ? g_wn.release : 0, items);
+    }
     /* The form's shape and its values, so a driven form is checkable: a
      * screenshot of a field proves only that it is there. */
     fprintf(f, "paneclose=%.0f,%.0f,%.0f,%.0f\n", g_pane_close.left, g_pane_close.top,
@@ -35851,6 +39168,7 @@ static void test_dump(const char *path) {
             { "srch",  g_srch,      g_srch_box },
             { "files", g_ffind,     g_file_search_box },
             { "emoji", g_efind,     g_emoji_search_box },
+            { "wsmgr", g_wsm_q,     g_wsm_qbox },
             { "people", g_dir_edit, g_dir_search_box },
             { "pal",   g_pal_edit,  g_pal_box },
             { "pick",  g_pick_edit, g_pick_box },
@@ -36238,6 +39556,26 @@ static void test_dump(const char *path) {
         fprintf(f, " %s:%d@%.0f,%.0f,%.0f,%.0f", g_hrx[i].emoji, g_hrx[i].mine,
                 g_hrx[i].r.left, g_hrx[i].r.top, g_hrx[i].r.right, g_hrx[i].r.bottom);
     fprintf(f, "\n");
+    /* Jump to a date: what is asked, the daemon's last answer, and the message
+     * the transcript is still to scroll to (0 once it has); the date dividers
+     * on screen, each its day's first time. */
+    {
+        const oc_model *dm = model();
+        fprintf(f, "datejump pending=%llu found=%llu exact=%d sel=%llu jump=%llu seps=%d parent=%llu thrjump=%llu cal=%d\n",
+                (unsigned long long)g_date_cid,
+                (unsigned long long)(dm ? dm->found_mid : 0), dm ? dm->found_exact : 0,
+                (unsigned long long)g_sel, (unsigned long long)g_jump_mid, g_n_sephits,
+                (unsigned long long)g_date_parent, (unsigned long long)g_thr_jump_mid, g_jc_open);
+    }
+    /* Snippets (REQ-226): each card drawn, whether its text is here, and the
+     * viewer -- open, on which, and how many coloured spans it holds. */
+    for (int i = 0; i < g_n_snip_hits; i++)
+        fprintf(f, "snipcard aid=%llu mid=%llu loaded=%d rect=%.0f,%.0f,%.0f,%.0f\n",
+                (unsigned long long)g_snip_hits[i].aid, (unsigned long long)g_snip_hits[i].mid,
+                snip_text(g_snip_hits[i].aid, NULL) != NULL,
+                g_snip_hits[i].r.left, g_snip_hits[i].r.top, g_snip_hits[i].r.right, g_snip_hits[i].r.bottom);
+    fprintf(f, "snipview open=%d aid=%llu lang=%d spans=%zu\n", g_sv_open,
+            (unsigned long long)g_sv_aid, g_sv_lang, g_sv_ntoks);
     /* Where the KEYBOARD is, and what an open menu is highlighting: both had to
      * be readable for the keyboard route to the context menu to be testable at
      * all (REQ-264). */
@@ -36409,6 +39747,10 @@ static void test_dump(const char *path) {
 }
 
 /* Poll <OPENCHIME_DEV_DIR>/cmd for one command per tick; write <dir>/ack. */
+static void test_poll(oc_win *hwnd);
+/* The hook alone, from inside a native dialog's modal loop (oc_plat_set_modal_tick). */
+static void test_modal_tick(void) { test_poll(g_main); }
+
 static void test_poll(oc_win *hwnd) {
     if (!g_test_dir[0]) return;
     char cmdpath[600]; snprintf(cmdpath, sizeof cmdpath, "%s\\cmd", g_test_dir);
@@ -36606,15 +39948,52 @@ static void test_poll(oc_win *hwnd) {
         if (g_dir_edit) { field_set(g_dir_edit, arg); test_ack("ok"); }
         else test_ack("err");
     } else if (!strcmp(verb, "attach")) {
-        /* Into the upload tray, as picking the file would: the dialog cannot be
-         * driven, the tray can. */
+        /* Into the upload tray, as picking the file would, without the dialog. */
         int had = g_n_ftray;
         ftray_add(hwnd, arg);
         test_ack(g_n_ftray > had ? "ok" : "err");
+    } else if (!strcmp(verb, "picker")) {
+        /* "cancel" | "pick <path>": answer the real file dialog the composer's
+         * "+" opened, as a person would, so what it returns goes through the
+         * same path as theirs. The hook is answered while the dialog is up
+         * because the dialog's modal loop runs it (test_modal_tick). "none"
+         * when no dialog is open. */
+        if (!oc_plat_picker_open()) test_ack("none");
+        else if (!strcmp(arg, "cancel")) test_ack(oc_plat_picker_answer(NULL) ? "ok" : "err");
+        else if (!strncmp(arg, "pick ", 5) && arg[5]) test_ack(oc_plat_picker_answer(arg + 5) ? "ok" : "err");
+        else test_ack("err");
     } else if (!strcmp(verb, "upload")) {
         /* Bypass the file dialog so an attachment can be posted from the harness. */
         if (g_client && g_sel && arg[0]) { oc_client_upload(g_client, g_sel, arg); test_ack("ok"); }
         else test_ack("err");
+    } else if (!strcmp(verb, "jumpdate")) {
+        /* "<date>": jump the open conversation to that day, as the calendar's
+         * field does with the same words typed; in the open thread when one is,
+         * as Ctrl+Shift+J does. */
+        uint64_t day = parse_day(arg);
+        const oc_model *jm = model();
+        uint64_t parent = jm && jm->thread_open && jm->thread_channel == g_sel ? jm->thread_parent : 0;
+        if (g_sel && day) { date_jump(g_sel, parent, day); test_ack("ok"); }
+        else test_ack("err");
+    } else if (!strcmp(verb, "snippet")) {
+        /* "<title>|<language>|<text>", \n for a newline: a snippet into the
+         * open conversation, as Create snippet posts one (REQ-226). */
+        char t[OC_SNIPPET_TITLE_MAX + 1] = "", l[OC_SNIPPET_LANG_MAX + 1] = "";
+        const char *a = strchr(arg, '|'), *b = a ? strchr(a + 1, '|') : NULL;
+        if (!a || !b || !g_client || !g_sel) { test_ack("err"); }
+        else {
+            snprintf(t, sizeof t, "%.*s", (int)(a - arg), arg);
+            snprintf(l, sizeof l, "%.*s", (int)(b - a - 1), a + 1);
+            char *body = malloc(strlen(b) + 1);
+            size_t k = 0;
+            for (const char *q = b + 1; body && *q; q++) {
+                if (q[0] == '\\' && q[1] == 'n') { body[k++] = '\n'; q++; }
+                else body[k++] = *q;
+            }
+            if (body) body[k] = '\0';
+            test_ack(body && oc_client_post_snippet(g_client, g_sel, 0, t, l, body) ? "ok" : "err");
+            free(body);
+        }
     } else if (!strcmp(verb, "palette")) {
         palette_open(hwnd);
         if (arg[0] && g_pal_edit) field_set(g_pal_edit, arg);
@@ -36680,7 +40059,8 @@ static void test_poll(oc_win *hwnd) {
         test_ack(ok ? "ok" : "err");
     } else if (!strcmp(verb, "call")) {
         /* Calls through the calls the controls make (REQ-150, REQ-301-305):
-         *   call start [ch] | join [ch] | open [ch] | leave | end | decline [ch]
+         *   call start [ch] | join [ch] | open [ch] | leave | end | end-press | decline [ch]
+         *   call banner-join | banner-decline | settings | chat | callback | row-join <i>
          *   call mute | unmute | ptt-down | ptt-up | ns on|off
          *   call invite <uid> [uid...] | volume <uid> <percent> | pick-go
          *   call share <device id or name> | share pick | share stop | share full | share actual */
@@ -36694,7 +40074,18 @@ static void test_poll(oc_win *hwnd) {
         else if (!strcmp(sc, "join"))     call_join_here(hwnd, ch);
         else if (!strcmp(sc, "open"))     call_open_view(hwnd, ch);
         else if (!strcmp(sc, "leave"))    call_cmd(hwnd, CC_LEAVE);
-        else if (!strcmp(sc, "end"))      call_cmd(hwnd, CC_END);
+        /* `end` is the request End for everyone's confirmation makes, so a
+         * script can see the daemon's answer to it; `end-press` presses the
+         * button, which asks first (answered with Enter or Esc). */
+        else if (!strcmp(sc, "end"))      { ok = call_here(cm); if (ok) oc_client_call_end(g_client, cm->call.channel_id); }
+        else if (!strcmp(sc, "end-press")) call_cmd(hwnd, CC_END);
+        /* The interface's other presses, each as its button makes it. */
+        else if (!strcmp(sc, "banner-join"))    call_cmd(hwnd, CC_BANNER_JOIN);
+        else if (!strcmp(sc, "banner-decline")) call_cmd(hwnd, CC_BANNER_DECLINE);
+        else if (!strcmp(sc, "settings"))       call_cmd(hwnd, CC_SETTINGS);
+        else if (!strcmp(sc, "chat"))           call_cmd(hwnd, CC_CHAT);
+        else if (!strcmp(sc, "callback"))       call_cmd(hwnd, CC_CALLBACK);
+        else if (!strcmp(sc, "row-join"))       { int i = atoi(rest); ok = i >= 0 && i < g_n_call_rows; if (ok) call_cmd(hwnd, CC_ROWJOIN0 + i); }
         else if (!strcmp(sc, "decline"))  oc_client_call_decline(g_client, ch);
         else if (!strcmp(sc, "pick-go"))  call_cmd(hwnd, CC_PICK_GO);
         else if (!strcmp(sc, "mute") || !strcmp(sc, "unmute")) {
@@ -36797,15 +40188,18 @@ static void test_poll(oc_win *hwnd) {
         ws_forget_begin(arg);
         test_ack("ok");
     } else if (!strcmp(verb, "wsbook")) {
-        /* "<workspace> <user>" — a book entry with no sign-in behind it, so the
-         * Workspaces dialog can be given more rows than fit. */
+        /* "<workspace> <user> [<days>]" — a book entry with no sign-in behind it,
+         * so the Workspaces dialog can be given more rows than fit; last used
+         * <days> ago, now when not given. */
         char ws[256] = "", user[80] = "";
-        sscanf(arg, "%255s %79s", ws, user);
+        int days = 0;
+        sscanf(arg, "%255s %79s %d", ws, user, &days);
+        if (days < 0) days = 0;
         const char *sp = store_path();
         oc_store *st = (sp && ws[0]) ? oc_store_open(sp) : NULL;
         if (st) {
             oc_store_set_secret(st, g_secret);
-            oc_store_workspace_remember(st, ws, NULL, user, (uint64_t)time(NULL) * 1000);
+            oc_store_workspace_remember(st, ws, NULL, user, ((uint64_t)time(NULL) - (uint64_t)days * 86400) * 1000);
             oc_store_close(st);
             test_ack("ok");
         } else test_ack("err");
@@ -36864,7 +40258,14 @@ static void test_poll(oc_win *hwnd) {
         /* About OpenChime; the ack is the text Copy puts on the clipboard. */
         char t[256];
         about_text(model(), t, sizeof t);
+        g_whatsnew = 0;
         modal_enter(hwnd, &g_about_open); test_ack(t);
+    } else if (!strcmp(verb, "whatsnew")) {
+        /* What's new, as its menu item opens it; "open" presses its "Open on
+         * openchime.io", whose address goes where every URL the hook opens goes. */
+        if (!strcmp(arg, "open")) menu_dispatch(hwnd, WN_CMD_OPEN);
+        else menu_dispatch(hwnd, ABOUT_CMD_WHATSNEW);
+        test_ack("ok");
     } else if (!strcmp(verb, "open")) {
         /* `open <cmd>` -- `menu`, acked FIRST, as `clickform` is: a command that
          * opens a dialog runs its nested loop inside the dispatch, and the verbs
@@ -37365,7 +40766,7 @@ static void test_poll(oc_win *hwnd) {
         const oc_msg *em = NULL;
         for (size_t i = ec ? ec->n_msgs : 0; i > 0 && !em; i--) {
             const oc_msg *c = &ec->msgs[i - 1];
-            if (c->deleted || c->author_id != m->user_id || c->poll) continue;
+            if (c->deleted || c->author_id != m->user_id || c->poll || c->todo) continue;   /* a list is not edited */
             if (!mid || c->message_id == mid) em = c;
         }
         if (em) { composer_begin_edit(em); invalidate(); test_ack("ok"); } else test_ack("err");
@@ -37850,6 +41251,9 @@ static void fields_create(void) {
     ffind.changed = ffind_changed; ffind.maxlen = 63; g_ffind = &ffind;
     field_init(&efind, "Search custom emoji", 0, 0);
     efind.key = efind_key; efind.changed = efind_changed; efind.maxlen = 47; g_efind = &efind;
+    static field wsmq;
+    field_init(&wsmq, "Filter by name or address", 0, 0);
+    wsmq.key = wsm_q_key; wsmq.changed = wsm_q_changed; wsmq.maxlen = 79; g_wsm_q = &wsmq;
     field_init(&dir, "Search people", 0, 0);
     dir.changed = dir_changed; dir.maxlen = 79; g_dir_edit = &dir;
     field_init(&srch, "Search messages", 0, 0);
@@ -37886,6 +41290,7 @@ static int on_tick(oc_win *hwnd) {
                     oc_client_tick(g_wss[wi].client);
             /* And the sign-in attempt, which is not in a slot yet. */
             if (g_si_client) oc_client_tick(g_si_client);
+            wsp_tick(hwnd);
             /* The toolbar tooltip's dwell: nothing repaints while the pointer
              * rests, so the tick fires the one paint that reveals it. */
             if (g_fmt_hover >= 0 && !g_fmt_tip_shown &&
@@ -37942,6 +41347,7 @@ static int on_tick(oc_win *hwnd) {
             nt_tick();               /* the notification window expires on this tick too */
             call_tick(hwnd);         /* a start waiting on a member list */
             bc_tick();               /* and a broadcast send (REQ-221) */
+            whatsnew_tick();         /* What's new: the release notes, once they are in */
             pdm_tick(hwnd);          /* private DMs: invitations, arrivals, endings */
             /* The call view's duration, levels and speaking rings move without
              * any event to repaint on. */
@@ -37950,6 +41356,22 @@ static int on_tick(oc_win *hwnd) {
              * something to follow it into: selecting a channel before the model
              * knows any is a no-op that looks like the link failing. */
             const oc_model *pm = model();
+            /* Keep the workspace's audience beside its book entry, so an email
+             * link naming it finds it later even while it is not the one open. */
+            if (pm && pm->authed && g_ws_active >= 0) {
+                oc_ws_slot *ws = &g_wss[g_ws_active];
+                const char *aud = oc_model_workspace_audience(pm);
+                if (strcmp(ws->aud, aud) != 0) {
+                    const char *sp = store_path();
+                    oc_store *st = sp ? oc_store_open(sp) : NULL;
+                    if (st) {
+                        oc_store_set_secret(st, g_secret);
+                        oc_store_workspace_note_audience(st, ws->ws, aud);
+                        oc_store_close(st);
+                    }
+                    snprintf(ws->aud, sizeof ws->aud, "%s", aud);
+                }
+            }
             if (g_pending_url[0] && pm && pm->authed && pm->n_channels) {
                 char u[512]; snprintf(u, sizeof u, "%s", g_pending_url);
                 g_pending_url[0] = '\0';
@@ -38027,6 +41449,19 @@ static int on_tick(oc_win *hwnd) {
             remember_tick(m);
             if (m) groups_roster_tick(m);
             osn_withdraw_read();
+            /* The muted list changed (MUTED_USERS): repaint, so their messages fold
+             * or open, and ask the daemon for the channel list again, whose unread
+             * counts are its to redo. The first list, at sign-in, asks nothing. */
+            {
+                static uint32_t seen_muted;
+                static oc_client *muted_for;
+                if (muted_for != g_client) { muted_for = g_client; seen_muted = m ? m->muted_seq : 0; }
+                if (m && m->muted_seq != seen_muted) {
+                    if (seen_muted && g_client) oc_client_list_channels(g_client);
+                    seen_muted = m->muted_seq;
+                    invalidate();
+                }
+            }
             /* The daemon's alerts (REQ-263): repaint on any change, and fetch the
              * list again when the counts move while it is on screen. */
             {
@@ -38442,6 +41877,10 @@ static int on_tick(oc_win *hwnd) {
                 uint8_t *fd = oc_model_take_attachment((oc_model *)m, &fid, &flen);
                 if (fd && vm_take_bytes(fid, fd, flen)) {
                     invalidate();   /* a video, now owned by the cache */
+                } else if (fd && fid == g_snip_pending) {
+                    snip_store(fid, fd, flen);   /* a snippet's text (REQ-226) */
+                    g_snip_pending = 0;
+                    invalidate();
                 } else if (fd) {
                     thumb_decode(fid, fd, flen);
                     free(fd);
@@ -38461,6 +41900,12 @@ static int on_tick(oc_win *hwnd) {
             if (g_thumb_pending && m->xfer_phase == 0 && m->xfer_tag && m->xfer_tag != g_thumb_pending &&
                 m->xfer_done < m->xfer_total)
                 g_thumb_deadline = now_ms() + 8000;
+            if (g_snip_pending && now_ms() > g_snip_deadline) {   /* a snippet that never came */
+                if (g_n_snip_failed < (int)(sizeof g_snip_failed / sizeof g_snip_failed[0]))
+                    g_snip_failed[g_n_snip_failed++] = g_snip_pending;
+                g_snip_pending = 0;
+                invalidate();
+            }
             if (g_thumb_pending && now_ms() > g_thumb_deadline) {
                 if (g_n_thumb_missing < THUMB_CACHE) g_thumb_missing[g_n_thumb_missing++] = g_thumb_pending;
                 g_thumb_pending = 0;
@@ -38499,6 +41944,24 @@ static int on_tick(oc_win *hwnd) {
                 }
             }
             if (!g_jump_mid) g_jump_fetched = 0;
+            date_jump_land(hwnd, m);
+            /* A reply the thread pane never drew (closed, or another thread
+             * opened) is given up rather than flashed later out of nowhere. */
+            if (g_thr_jump_mid && (now_ms() > g_thr_jump_deadline || !m->thread_open)) g_thr_jump_mid = 0;
+            /* A reminder come due (REQ-283): said once, naming where it is. */
+            {
+                static uint32_t rem_seen;
+                if (m->reminder_seq != rem_seen) {
+                    rem_seen = m->reminder_seq;
+                    const oc_channel *rc = oc_model_channel((oc_model *)m, m->reminder_channel);
+                    char note[160];
+                    if (rc && rc->kind != OC_CHANNEL_KIND_DM && rc->name && rc->name[0])
+                        snprintf(note, sizeof note, "Reminder: a message you saved in #%s.", rc->name);
+                    else
+                        snprintf(note, sizeof note, "Reminder: a message you saved. It is in Activity.");
+                    fb_confirm(note);
+                }
+            }
             hist_track();
             /* The settings bucket arrives a beat after auth; fold it in once. */
             if (g_sb_settings_pending && oc_model_setting(m, SB_SETTING_KEY)) {
@@ -38709,6 +42172,13 @@ static int on_wheel(oc_win *hwnd, int px_x, int px_y, float units, int notches) 
         if (g_form_sel_field >= 0) {
             g_form_sel_scroll -= (units > 0) ? 3 : -3;
             if (g_form_sel_scroll < 0) g_form_sel_scroll = 0;
+            invalidate();
+            return 0;
+        }
+        /* A form taller than its card -- Edit profile with a workspace's own
+         * fields -- scrolls its rows; draw_form keeps the offset in range. */
+        if (g_form_open && g_form_scroll_max > 0) {
+            g_form_scroll -= dy;
             invalidate();
             return 0;
         }
@@ -39296,6 +42766,7 @@ static int on_key_down(oc_win *hwnd, int wp) {
         if (wp == OCK_ESCAPE && g_more_open) { g_more_open = 0; invalidate(); return 0; }
         if (wp == OCK_ESCAPE && g_has_sel) { g_has_sel = 0; invalidate(); return 0; }
         if (emoji_admin_key(hwnd, wp)) { invalidate(); return 0; }
+        if (audit_key(hwnd, wp)) { invalidate(); return 0; }
         /* The composer LAST among the specific cases and before the shell's
          * fall-through: the overlays above own Esc while they are open, and the
          * field owns every other key while it has focus. The field is not a
@@ -39482,6 +42953,10 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
             if (g_view == VIEW_ADMIN && g_adm_tab == ADM_EMOJI && (int)arg < g_n_emojirows)
                 emoji_delete_ask(hwnd, g_emojirows[arg].name);
             break;
+        case AT_EMOJIREN:
+            if (g_view == VIEW_ADMIN && g_adm_tab == ADM_EMOJI && (int)arg < g_n_emojiren)
+                emoji_rename_ask(hwnd, g_emojiren[arg].name);
+            break;
         case AT_EMOJIFIND:
             if (g_efind && g_efind->visible) focus_set(g_efind);
             break;
@@ -39530,6 +43005,27 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
             if (g_status_open && (int)arg < 5) {
                 g_status_clear = (int)arg;
                 invalidate();
+            }
+            break;
+        case AT_RXSHOW:
+            rx_reveal((int)arg);
+            invalidate();
+            break;
+        case AT_THRDATE: {
+            const oc_model *tm = model();
+            if (tm && tm->thread_open)
+                jump_menu_open(hwnd, tm->thread_channel, tm->thread_parent,
+                               g_thr_date_btn.right - 200, g_thr_date_btn.bottom + 4);
+            break;
+        }
+        case AT_JUMPCAL:
+            /* The same path a click takes, at the control's recorded centre. */
+            if (g_jc_open) {
+                rectf r = arg == 1 ? g_jc_prev : arg == 2 ? g_jc_next : rf(0, 0, 0, 0);
+                for (int i = 0; arg > 2 && i < g_n_jc_days; i++)
+                    if ((uint64_t)(g_jc_days[i].y * 10000 + (g_jc_days[i].m + 1) * 100 + g_jc_days[i].d) == arg)
+                        r = g_jc_days[i].r;
+                if (r.right > r.left) jumpcal_click(hwnd, (int)((r.left + r.right) / 2), (int)((r.top + r.bottom) / 2));
             }
             break;
         case AT_SUMCAL:
@@ -39943,6 +43439,7 @@ static void handle_event(const SDL_Event *e) {
     }
     case SDL_EVENT_TEXT_INPUT: {
         if (g_claimed_text) { g_claimed_text = 0; return; }
+        wsm_claim_text();
         if (g_focus) { field_text_input(g_focus, e->text.text); return; }
         oc_wch w[64];
         int n = to_w(e->text.text, w, 64);
@@ -40049,6 +43546,7 @@ static void synth_wheel(oc_win *hwnd, int x_dip, int y_dip, int delta) {
     on_wheel(hwnd, PX(x_dip), PX(y_dip), (float)delta / 120.0f, delta / 120);
 }
 static void synth_char(oc_win *hwnd, oc_wch ch) {
+    wsm_claim_text();
     if (g_focus) {
         char u8[8]; oc_wch w[2] = { ch, 0 };
         to_u8(w, u8, sizeof u8);
@@ -40068,6 +43566,9 @@ int main(int argc, char *argv[]) {
      * file command channel. Any other client has no hook to enable. */
     { const char *td = oc_env_dev("OPENCHIME_DEV_DIR");
       if (td) snprintf(g_test_dir, sizeof g_test_dir, "%s", td); }
+    /* While a native file dialog holds the thread in its own loop, the hook
+     * still answers (the picker verb drives that dialog). */
+    if (g_test_dir[0]) oc_plat_set_modal_tick(test_modal_tick);
 
     /* AFTER the test dir is known, because that is where a report belongs when
      * the harness is driving -- and reporting the last run has to happen before
@@ -40093,6 +43594,11 @@ int main(int argc, char *argv[]) {
         if (oc_plat_handoff("url", argv[1])) return 0;
         snprintf(g_pending_url, sizeof g_pending_url, "%s", argv[1]);
     }
+    /* `--open <url>` anywhere after: the web client's ?open= (WEB.md), a link
+     * followed once the page has signed in, as one given first is. */
+    for (int i = 1; i + 1 < argc; i++)
+        if (!strcmp(argv[i], "--open") && !strncmp(argv[i + 1], OC_URL_SCHEME "://", sizeof OC_URL_SCHEME + 1))
+            snprintf(g_pending_url, sizeof g_pending_url, "%s", argv[i + 1]);
     /* A browser sign-in's result (oc_plat_signin_result): the web client,
      * served again after the daemon's sign-in page sent the person back with
      * the token. The workspace is the one the page was served for (argv[1])

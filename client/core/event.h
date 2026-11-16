@@ -46,6 +46,21 @@ typedef struct {
     uint8_t  evict_enabled, under_pressure;
 } oc_storage_view;
 
+/* The workspace's usage (REQ-043), carried on OC_EV_USAGE and kept in the model
+ * for the console's Usage tab. Owner/admin only. A channel with an empty name is
+ * a private one the reader is not in: shown as "private channel". */
+typedef struct {
+    uint16_t       days, n_days, n_weeks, n_channels;
+    oc_usage_day   day[OC_USAGE_MAX_DAYS];     /* oldest first */
+    oc_usage_week  week[OC_USAGE_MAX_WEEKS];   /* oldest first */
+    struct {
+        uint64_t id;
+        uint32_t messages;
+        uint8_t  is_private;
+        char     name[128];
+    } channel[OC_USAGE_TOP_CHANNELS];          /* busiest first */
+} oc_usage_view;
+
 /* One audit entry as the frontend sees it (REQ-251). Fixed-size strings: a page
  * is bounded and short-lived, so this avoids per-entry heap churn. */
 typedef struct {
@@ -58,6 +73,7 @@ typedef struct {
     char     detail[96];
     uint8_t  family;    /* 1 admin, 2 account, 3 security, 4 moderation */
     uint8_t  outcome;   /* 1 ok, 0 denied/failed */
+    uint64_t channel_id; /* the channel it happened in; 0 none */
 } oc_audit_view;
 
 /* One of the daemon's critical failures as an owner or admin sees it (REQ-263). */
@@ -108,6 +124,19 @@ typedef struct {
     char     labels[OC_POLL_MAX_OPTIONS][OC_POLL_OPTION_MAX + 1];
     uint32_t counts[OC_POLL_MAX_OPTIONS];
 } oc_poll_view;
+/* A to-do list as the daemon last told it: its author, title and every task,
+ * in order. Strings heap; oc_todo_view_free releases it all. On an event it is
+ * one TODO frame's range: tasks[0, todo_n) are tasks [todo_first, ...) of
+ * `total`. */
+typedef struct { char *name, *desc; uint8_t done; uint64_t done_by, done_at_ms; } oc_todo_task_view;
+typedef struct {
+    uint64_t author_id;
+    char    *title;
+    uint16_t total;
+    uint16_t cap;                /* entries in `tasks` */
+    oc_todo_task_view *tasks;
+} oc_todo_view;
+void oc_todo_view_free(oc_todo_view *t);
 
 /* net thread -> UI thread */
 enum {
@@ -122,7 +151,7 @@ enum {
                             * replaced one trusted before */
     OC_EV_SIGNED_OUT,      /* the session was refused and there is nothing to fall back on:
                             * the person has to sign in again, and the thread has stopped */
-    OC_EV_WORKSPACE_INFO,  /* a WORKSPACE_INFO: status=deployment_mode, count=max_users, body=name, ws_mode, size=max_video_size */
+    OC_EV_WORKSPACE_INFO,  /* a WORKSPACE_INFO: status=deployment_mode, count=max_users, body=name, ws_mode, size=max_video_size, ws_audience */
     OC_EV_MESSAGE,         /* a BROADCAST: channel/author/message_id/time + body */
     OC_EV_CHANNEL,         /* a CHANNEL_LIST entry / CHANNEL_INFO: channel_id + name(body)
                               + status, plus topic (author_name) and archived (REQ-034/035) */
@@ -142,6 +171,9 @@ enum {
     OC_EV_READ_RECEIPTS,   /* READ_RECEIPTS: status = 1 if I share my read receipts (REQ-090) */
     OC_EV_SCHEDULE,        /* a SCHEDULE frame: the recurring allowed-hours schedule (REQ-136) */
     OC_EV_ALERT_PREFS,     /* an ALERT_PREFS frame: my keywords + priority people (REQ-135) */
+    OC_EV_MUTED_USERS,     /* a MUTED_USERS frame: everyone I have muted, in `ids`/`n_ids` */
+    OC_EV_BLOCKS,          /* a BLOCKS frame: whom I block (`ids`/`n_ids`), my DM privacy in `status` */
+    OC_EV_BLOCK_LIST,      /* a BLOCK_LIST: per block, blocker, blocked and since, three to an entry in `ids` */
     OC_EV_THREAD_SUMMARY,  /* one aggregated thread (REQ-062): a list entry AND the push */
     OC_EV_THREADS_END,     /* the thread list's terminator */
     OC_EV_NOTIFY_PREF,     /* a NOTIFY_PREFS entry: channel_id + level(op) */
@@ -183,6 +215,7 @@ enum {
     OC_EV_PROFILE,         /* a PROFILE_UPDATED: user_id + body=display_name (own = the change ack) */
     OC_EV_READ_CURSOR,     /* a READ_CURSOR: user_id read up to message_id in channel_id (seen-by) */
     OC_EV_STORAGE,         /* a STORAGE_STATUS: usage + policy report (REQ-214) */
+    OC_EV_USAGE,           /* a USAGE: the workspace's usage figures (REQ-043): `usage` */
     OC_EV_AUDIT_BEGIN,     /* an AUDIT_PAGE starts: clears the model's page */
     OC_EV_AUDIT,           /* one audit entry (REQ-251) */
     OC_EV_SRVALERTS,       /* an ALERTS_SUMMARY (REQ-263): count = unacknowledged, srvalert_current */
@@ -201,6 +234,11 @@ enum {
     OC_EV_FILES_END,       /* the files list is complete: channel_id + count */
     OC_EV_SAVED_UPDATED,   /* a message was saved/unsaved: message_id + op (REQ-231) */
     OC_EV_COLLAPSED,       /* a message folded away (op 1) or opened (op 0) for me: message_id + op */
+    OC_EV_FOUND_AT_TIME,   /* the message at a time (jump to a date): channel_id, parent_id,
+                              message_id (0 none), server_time, op = 1 at or after the time */
+    OC_EV_MESSAGE_MOVED,   /* a MESSAGE_MOVED (REQ-053): message_id, channel_id = where it was,
+                              to_channel, parent_id = the thread it went into (0 a top
+                              level), count = how many moved */
     OC_EV_SAVED_MSG,       /* one saved item (streamed) */
     OC_EV_SAVED_END,       /* the saved list is complete: count */
     /* Drafts (REQ-223). One draft — a list entry AND the device-sync push, which
@@ -235,6 +273,7 @@ enum {
     /* A poll's definition and tallies (REQ-225): channel_id + message_id, the
      * poll in `poll`. After the message it belongs to, live or replayed. */
     OC_EV_POLL,
+    OC_EV_TODO,            /* a to-do list's state: channel_id, message_id, todo (one range) */
     /* One row of a who-voted answer: message_id, user_id, `poll_option`. */
     OC_EV_POLL_VOTERS,
     /* Read-aloud (REQ-291-295, ARCH-111). TTS_INFO replaces what the client knows
@@ -327,8 +366,16 @@ enum {
      * `channel_id` is the DM's channel, `user_id` the other person, `pdm_kind`
      * what happened, `pdm_safety` the safety number, `pdm_reason` why it ended.
      * What is said in it comes as in any DM (OC_EV_MESSAGE and the rest). */
-    OC_EV_PDM
+    OC_EV_PDM,
+    /* PROFILE_FIELDS: the workspace's own profile fields, `pfs[0..n_pfs)`
+     * with `text` the label, in position order. */
+    OC_EV_PROFILE_FIELDS
 };
+
+/* A workspace profile field (OC_EV_PROFILE_FIELDS: `text` the label), or a
+ * person's value for one (OC_EV_PROFILE_INFO: `id` the field, `text` the value). */
+typedef struct { uint64_t id; uint8_t kind; uint16_t position;
+                 char text[OC_PROFILE_FIELD_VALUE_MAX + 1]; } oc_ev_pf;
 
 /* What OC_EV_PDM reports, in its pdm_kind. The DM's id is `channel_id`, the other
  * person `user_id`. */
@@ -348,12 +395,15 @@ typedef struct {
     uint64_t author_id;
     uint64_t message_id;
     uint64_t parent_id;    /* THREAD_REPLY: the parent message this replies to */
+    uint64_t to_channel;   /* MESSAGE_MOVED: the channel it went to */
+    uint64_t remind_at;    /* SAVED_UPDATED, SAVED_MSG: the reminder (REQ-283), 0 for none */
     uint64_t server_time;
     uint8_t  status;       /* PRESENCE: online/away/offline; CHANNEL: joined flag */
     uint8_t  is_public;    /* CHANNEL: 1 public, 0 private/DM */
     oc_storage_view storage;  /* OC_EV_STORAGE */
     oc_audit_view   audit;    /* OC_EV_AUDIT */
     oc_srvalert_view *srvalert; /* heap; OC_EV_SRVALERT */
+    oc_usage_view   *usage;     /* heap; OC_EV_USAGE */
     uint32_t        srvalert_current; /* OC_EV_SRVALERTS: how many still hold */
     uint8_t  op;           /* REACTION: add/remove */
     uint32_t count;        /* REACTION: running aggregate count for the emoji */
@@ -390,6 +440,7 @@ typedef struct {
     char     emoji[40];    /* REACTION: the emoji */
     char     author_name[64]; /* MESSAGE: author display name ("" = fall back to id) */
     char    *body;         /* heap; MESSAGE/ERROR/CHANNEL(name) only, else NULL */
+    char     ws_audience[132]; /* WORKSPACE_INFO: the workspace's audience id, "" when not enrolled */
     /* One aggregated thread (REQ-062). `count`/`op` carry the reply and unread
      * counts, `pinned_at` the last reply's time — reusing the generic fields the
      * way every other list event here does. */
@@ -445,6 +496,9 @@ typedef struct {
     oc_call_view *call;   /* heap; the CALL_* events */
     oc_group_view *group; /* heap; OC_EV_GROUP */
     oc_poll_view *poll;   /* heap; OC_EV_POLL */
+    oc_todo_view *todo;   /* heap; OC_EV_TODO: one frame's range of a list */
+    uint16_t todo_first;
+    uint8_t  todo_n;
     uint8_t  poll_option; /* POLL_VOTERS */
     uint64_t groups[OC_MAX_CHANNEL_GROUPS];   /* CHANNEL_GROUPS */
     uint16_t n_groups;
@@ -463,6 +517,16 @@ typedef struct {
     uint8_t  err_kind;               /* ERROR: OC_CERR_* */
     uint16_t err_code;               /* ERROR: the daemon's OC_ERR_* it answers, 0 if none */
     int64_t  rank;                   /* SEARCH_RESULT: the row's relevance (protocol.h, oc_search) */
+    oc_ev_pf *pfs;                   /* heap; PROFILE_FIELDS, and PROFILE_INFO's values */
+    uint8_t   n_pfs;
+    /* USER and PROFILE_INFO: out of office (REQ-122), as stored. */
+    uint64_t ooo_start, ooo_end;
+    char     ooo_message[OC_OOO_MESSAGE_MAX + 1];
+    /* CHANNEL from CHANNEL_INFO (REQ-036b): the creator, and the managers in
+     * `ids`/`n_ids`; `ch_managers_known` says this event carries them, since a
+     * CHANNEL_LIST entry does not. */
+    uint8_t  ch_managers_known;
+    uint64_t ch_creator;
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);
@@ -492,6 +556,10 @@ enum {
                               op = OC_CHUP_*, body = the new topic or name (REQ-034/035/036) */
     OC_CMD_SAVE_ITEM,      /* save/unsave `message_id`: op = add/remove (REQ-231) */
     OC_CMD_SET_COLLAPSED,  /* fold `message_id` away for me (op 1) or open it (op 0) */
+    OC_CMD_FIND_AT_TIME,   /* the message at `server_time` (ms) in `channel_id`, in the thread
+                              `message_id` or its main scroll (0) */
+    OC_CMD_MOVE_MESSAGE,   /* move `message_id` to `channel_id`, into thread `parent_id`
+                              (0 its top level); op 1 leaves a line where it was (REQ-053) */
     OC_CMD_LIST_SAVED,     /* my saved items */
     OC_CMD_LIST_ACTIVITY,  /* what involved me — or what I have not read: op = OC_ACTF_* (REQ-139) */
     OC_CMD_HISTORY_AROUND, /* the messages around `message_id` in `channel_id` (REQ-232) */
@@ -505,8 +573,13 @@ enum {
     OC_CMD_SET_SCHEDULE,    /* the recurring schedule (REQ-136), carried in cmd->sched */
     OC_CMD_SET_KEYWORDS,    /* replace my keyword list (REQ-135), carried in cmd->list */
     OC_CMD_SET_PRIORITY,    /* replace my priority-people list (REQ-135) */
+    OC_CMD_SET_USER_MUTE,   /* mute or unmute one person, for me (mute_user_id, op) */
+    OC_CMD_SET_BLOCK,       /* block or unblock one person (block_user_id, op) */
+    OC_CMD_SET_DM_PRIVACY,  /* who may start a new DM with me (op) */
+    OC_CMD_LIST_BLOCKS,     /* owner/admin: every block in the workspace */
     OC_CMD_LIST_THREADS,    /* threads I am in (REQ-062): op = filter */
     OC_CMD_THREAD_FOLLOW,   /* follow/unfollow: channel_id + message_id = root, op = on */
+    OC_CMD_CHANNEL_THREAD_FOLLOW,   /* every thread in channel_id: op = on (REQ-282) */
     OC_CMD_MARK_THREAD_READ,/* its replies are read: message_id = root, server_time = up to */
     OC_CMD_LIST_NOTIFY_PREFS, /* request all notification settings (DND + per-channel) */
     OC_CMD_SET_SETTING,     /* upsert a synced client setting: body=key, body2=value (empty value deletes) */
@@ -529,6 +602,7 @@ enum {
     OC_CMD_MARK_ALL_READ,   /* MARK_ALL_READ: every membership, in one frame; no fields */
     OC_CMD_GET_CHANNEL_DESCRIPTION, /* ask for `channel_id`'s description (REQ-034) */
     OC_CMD_STORAGE_STATUS,  /* ask for the storage usage report (owner/admin) */
+    OC_CMD_USAGE,           /* ask for the usage figures over `usage_days` days (owner/admin) */
     OC_CMD_SRVALERTS_LIST,  /* ask for the daemon's critical failures (owner/admin) */
     OC_CMD_RESTORE,         /* take a delete back: channel_id, message_id (REQ-052) */
     OC_CMD_SRVALERT_ACK,    /* acknowledge one: message_id = its id, 0 = every one */
@@ -565,6 +639,7 @@ enum {
     OC_CMD_OPEN_GROUP_DM,        /* REQ-056: gids[0..n_gids) */
     OC_CMD_ADD_EMOJI,            /* REQ-072: body = name, message_id = attachment */
     OC_CMD_DELETE_EMOJI,         /* REQ-072: body = name */
+    OC_CMD_RENAME_EMOJI,         /* REQ-072: body = name, body2 = the new name */
     OC_CMD_LIST_EMOJI,
     OC_CMD_UPLOAD,          /* upload+post a file to `channel_id`: body = local path */
     OC_CMD_DOWNLOAD,        /* download an attachment: message_id = attachment_id, body = dest path */
@@ -578,6 +653,10 @@ enum {
      * MP4, blob2 = the poster JPEG, media_*.
      * Uploads both, sends ATTACH_MEDIA_SET, then SEND or SEND_REPLY. */
     OC_CMD_POST_VIDEO,
+    /* Post a snippet (REQ-226): blob = its text (owned), body2 = title, body3 =
+     * language, channel_id, message_id = a thread root or 0. Uploaded as
+     * text/plain, marked OC_MEDIA_SNIPPET, then posted, as a video message. */
+    OC_CMD_POST_SNIPPET,
     /* Post files as ONE message (REQ-140): paths = the local files (or, with
      * mem, the names of in-memory items), body = the
      * text (may be empty), message_id = a thread root or 0. Uploads each in
@@ -626,6 +705,10 @@ enum {
      * withdraw. LIST_POLL_VOTERS: who picked what on `message_id`. */
     OC_CMD_POST_POLL,
     OC_CMD_VOTE,
+    /* To-do lists, each about `message_id` in `channel_id`: a task added
+     * (body = name, body2 = description), marked (uses = the task, op = done),
+     * or the list renamed (body = the title). */
+    OC_CMD_TODO_ADD, OC_CMD_TODO_MARK, OC_CMD_TODO_RENAME,
     OC_CMD_LIST_POLL_VOTERS,
     OC_CMD_EDIT_POLL,      /* the author's poll `message_id`: poll_opts/poll_flags/poll_close_at_ms, all of it */
     /* Encrypted DMs (client/core/pdm.h), a range of their own; what is said in
@@ -635,6 +718,15 @@ enum {
     OC_CMD_PDM_DECLINE,
     OC_CMD_PDM_CLOSE,
     OC_CMD_PDM_TRUST,      /* go on with the other device's changed key */
+    /* The workspace's own profile fields. SET_PROFILE_FIELD: message_id = the
+     * field (0 adds), op = OC_PROFILE_FIELD_SET/DELETE, scope = kind, uses =
+     * position, body = label. SET_PROFILE_FIELD_VALUE: message_id = the
+     * field, body = my value ("" clears it). */
+    OC_CMD_SET_PROFILE_FIELD,
+    OC_CMD_SET_PROFILE_FIELD_VALUE,
+    /* Out of office (REQ-122): start_ms/end_ms, body = the message; an end of
+     * 0 clears it. */
+    OC_CMD_SET_OUT_OF_OFFICE,
     OC_CMD_QUIT
 };
 
@@ -699,6 +791,14 @@ typedef struct {
     /* SEARCH: the order is `op` (OC_SEARCH_*), the cursor `message_id` and, by
      * relevance, this rank beside it. */
     int64_t  rank;
+    uint64_t parent_id;    /* MOVE_MESSAGE: the destination thread, 0 its top level */
+    /* USAGE: over how many UTC days (1..OC_USAGE_MAX_DAYS). */
+    uint16_t usage_days;
+    /* SET_USER_MUTE: the person; `op` 1 mutes, 0 unmutes. */
+    uint64_t mute_user_id;
+    /* SET_BLOCK: the person, `op` 1 blocks and 0 unblocks; SET_DM_PRIVACY: `op`
+     * is the value (OC_DM_PRIVACY_*). */
+    uint64_t block_user_id;
 } oc_cmd;
 
 oc_cmd *oc_cmd_new(int type);

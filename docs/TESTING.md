@@ -1487,6 +1487,35 @@ The loop's own turn is the figure to compare.
 - The memory table reports **requested vs connected** and divides by the
   connections that actually established.
 
+### Speech models' memory
+
+Read-aloud and voice input each load a model on first use and release it after
+five idle minutes (`OC_TTS_IDLE_SECS`, `OC_STT_IDLE_SECS`). While one is loaded it
+is most of the daemon's memory. Measured on a 256 MB Fly machine (about 210 MB
+usable once the kernel takes its share), on the full build's daemon, sampling
+`VmRSS` every 0.2 s; summaries are off by default and were not loaded:
+
+| What the daemon did | Peak RSS | Free on the machine at the worst | Time |
+|---|---|---|---|
+| Idle | 23 MB | | |
+| Read aloud a 138-character message | 145 MB | 33 MB | 12.7 s |
+| Read aloud three full 120-character pieces | 168 MB | 23 MB | 100 s for 20 s of speech |
+| Heard a 5 s segment | 147 MB | 22 MB | 1.1 s |
+| Heard a 20 s segment, in one piece | 156 MB | 3 MB | 40 s |
+| Heard a 30 s segment, in one piece | 162 MB | 3 MB | 413 s |
+
+Both models are mapped from their files and used in place (`daemon/tts_data.c`,
+`session.use_ort_model_bytes_directly`), so under pressure the kernel drops their
+pages and reads them back rather than killing the daemon: memory stays under the
+machine's, and the time goes instead. Nothing was killed in these runs. The
+recognizer's working memory grows with what it hears at once, which is why the
+long segments left nothing free; the daemon now hears a segment longer than
+`OC_STT_WINDOW_SECS` (6 s) in windows of at most that, each cut at the quietest
+moment within `OC_STT_CUT_SEARCH_MS` of its limit (`daemon/stt_worker.c`), so a
+30 s segment holds no more at once than a 6 s one; the windowed figures are
+not yet measured on the 256 MB machine. Read-aloud already renders a message in
+pieces of at most 120 characters (`OC_TTS_SEGMENT_CHARS`).
+
 ---
 
 ## 6. Running the daemon by hand
@@ -2070,8 +2099,17 @@ nothing; Esc closes the view. Run on both platforms, `--web` included.
 ## Reading the uploads harness
 
 `tools/gui/uploads.sh` drives the Win32 message box's upload tray (REQ-140)
-against its own fixture daemon (port 9630). It attaches files through the
-`attach` verb — the file dialog cannot be driven, the tray can — and asserts
+against its own fixture daemon (port 9630). On the Windows client it first
+drives the real file dialog: `clickform` on "+" opens the system's Open dialog,
+whose modal loop holds the client's thread, and the hook still answers because a
+thread timer that loop dispatches runs it (`oc_plat_set_modal_tick`; the dump's
+`modal=` line says `picker=1` while the dialog is up). The `picker` verb answers
+the dialog as a person would: `picker cancel` presses its Cancel, and `picker
+pick <path>` puts the path in its file name box and presses OK, so the file
+comes back through the same call a person's pick does; with no dialog open
+either acks `none`. It asserts that Cancel adds nothing and a picked file comes
+back as a chip. Then it attaches files through the `attach` verb, into the tray
+without the dialog, and asserts
 that they wait as chips, an image with its picture, each chip's button published
 to assistive technology, with nothing uploaded; that a chip's × takes it out;
 that Send posts what is left and the text as ONE message and the tray empties;
@@ -2153,7 +2191,13 @@ there and a call's audio is UDP. It asserts the start and bob's invitation (his
 Calls section and a notification), both in the call hearing each other with
 every packet decrypting once the keys are in, noise suppression taking a steady
 hum out, bob muted and seen muted, push to talk, a per-person volume, only the
-starter ending, the missed-call line, and screen sharing — alice shares the
+starter ending and End for everyone asking first (Esc keeps the call, Enter ends
+it), the Calls section gone with no call, the call's banner in #general with Join
+and Decline and bob joining from it, the Calls row's own Join, the header phone's
+and Mute's tooltip words, the conversation beside the call view (a message sent
+from it reaching alice, folded away and back) and its Settings panel, the
+missed-call line read from bob's side with Call back starting a call, and screen
+sharing — alice shares the
 synthetic screen (`OPENCHIME_DEV_CAPTURE=synthetic`), bob's view shows it with
 readable, rising frame numbers, full screen and Esc, actual size, the
 accessibility names, bob taking over and stopping. It reads the dump's `call` line — `in=
@@ -2161,8 +2205,11 @@ parts= epoch= sent= keepalives= tx_epoch= self= slot=` — its `call.peer` lines
 `packets= lost= level= keyed= muted= undecryptable= volume=` — its `share` line —
 `sharer= on= state= bar= view_frames= tex= px_fno= full= actual=`, `px_fno` being
 the synthetic screen's frame number read from the decoded pixels — and `calls[n]`
-and `callevents`. The `call` verb drives it: `call start|join|open|leave|end|decline
-[ch]`, `call mute|unmute|ptt-down|ptt-up`, `call ns on|off`, `call invite <uid...>`,
+and `callevents`, and its `callui` line — `banner= chat= settings= hdrtip= mutetip=
+missed=`. The `call` verb drives it: `call start|join|open|leave|end|decline
+[ch]` (`end` is the request End for everyone's confirmation makes; `end-press` presses
+the button, which asks), `call banner-join|banner-decline|settings|chat|callback|row-join
+<i>`, `call mute|unmute|ptt-down|ptt-up`, `call ns on|off`, `call invite <uid...>`,
 `call volume <uid> <percent>`, `call share <device id or name>|pick|stop|full|actual`.
 Not in CI, for the smoke's reason.
 
@@ -2330,3 +2377,30 @@ text on the two lines under it — the shape a real message produces, since the
 run sends one through `notify_deliver` rather than calling the balloon directly.
 A disconnected session is what the blank case is for and is not a failure of the
 client: the first two runs of this script hit exactly that.
+
+## Reading the jump-to-date harness
+
+`tools/gui/jumpdate.sh` sends a few messages into a fresh channel and jumps to
+them by date through the test hook's `jumpdate <date>` verb, which runs the
+same path as typing that date into the calendar of "Jump to date", in the open
+thread when one is. It reads the dump's
+`datejump` line: `pending` is the conversation still waiting for the daemon's
+answer (0 once it has come), `found` and `exact` are that answer, `jump` is the
+message the transcript has still to scroll to (0 once it is on it), and `seps`
+counts the date dividers drawn, each of which offers the jump when clicked.
+`parent` is the thread a pending jump is in (0 for the main scroll), `thrjump`
+the reply the thread pane has still to scroll to, and `cal` whether the
+calendar card is open.
+Today's date lands on today's first message, exact; a date after the newest
+lands on the newest, not exact, with a notice saying so.
+
+## Reading the snippets harness
+
+`tools/gui/snippets.sh` posts a snippet through the test hook's
+`snippet <title>|<language>|<text>` verb (`\n` for a newline), which is the
+path Create snippet takes. It reads the dump's `snipcard` lines, one per card
+drawn, with `loaded` 1 once its text has been fetched and `rect` the card to
+click, and the `snipview` line: `open`, the snippet it is on, the language
+(lexer.h's number) and `spans`, the coloured runs the lexer found. A card that
+loads, a click that opens the viewer, Python coloured into several spans, and
+Esc closing it make a pass.

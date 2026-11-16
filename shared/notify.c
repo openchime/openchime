@@ -26,11 +26,12 @@ int oc_notify_quiet(int mode, int base_start, int base_end,
     return !oc_notify_in_window(base_start, base_end, local_min);
 }
 
-int oc_notify_decide(int own, int muted, int vip, unsigned level,
+int oc_notify_decide(int own, int muted, int muted_author, int vip, unsigned level,
                      int mentioned, int keyword_hit, int thread_reply,
                      int quiet, int paused) {
     if (own) return 0;              /* your own words, or the workspace's notice, are not news */
     if (muted) return 0;            /* mute is absolute: nothing pierces it (REQ-137) */
+    if (muted_author) return 0;     /* nor does a person you muted, even a priority one */
     if (vip) return 1;              /* a priority person pierces all of the below (REQ-135) */
     if (quiet || paused) return 0;  /* the schedule and the pause (REQ-136, REQ-278) */
     if (level == OC_NOTIFY_ALL) return 1;

@@ -4,6 +4,7 @@
  * queue, the eventfd, opening only when needed and closing when idle. The real
  * model is exercised by the build job (openchimed --stt-hear). */
 #include "check.h"
+#include "config.h"
 #include "stt_mentions.h"
 #include "stt_moonshine.h"
 #include "stt_worker.h"
@@ -218,10 +219,97 @@ static void test_worker(void) {
     if (failures == failures_before) printf("  recognition worker ok\n");
 }
 
+/* ---- long segments, heard in windows ---- */
+
+/* An engine that records each piece it is handed and answers by its own count:
+ * "w1", "w2", ...; the piece numbered `win_blank` answers only spaces, and the
+ * one numbered `win_fail` fails. */
+static size_t win_len[64], win_off[64], win_calls;
+static int win_fail, win_blank;
+static const int16_t *win_base;
+static int win_hear(void *e, const int16_t *pcm, size_t n, char **text, char *err, size_t cap) {
+    (void)e;
+    if (win_calls < 64) { win_len[win_calls] = n; win_off[win_calls] = (size_t)(pcm - win_base); }
+    win_calls++;
+    if ((int)win_calls == win_fail) { snprintf(err, cap, "%s", STUB_REASON); return -1; }
+    char buf[16];
+    if ((int)win_calls == win_blank) snprintf(buf, sizeof buf, "  ");
+    else snprintf(buf, sizeof buf, " w%zu ", win_calls);
+    *text = strdup(buf);
+    return *text ? 0 : -1;
+}
+static const oc_stt_engine WIN = { .version = "stub-win", .lang = "en-US", .hear = win_hear };
+
+/* `secs` of loud signal with 100 ms of silence starting at each of `quiet`. */
+static int16_t *speech(double secs, const double *quiet, int nquiet, size_t *n) {
+    *n = (size_t)(secs * 16000);
+    int16_t *p = malloc(*n * sizeof *p);
+    if (!p) return NULL;
+    for (size_t i = 0; i < *n; i++) p[i] = (int16_t)((i & 1) ? 12000 : -12000);
+    for (int q = 0; q < nquiet; q++)
+        for (size_t i = (size_t)(quiet[q] * 16000); i < (size_t)((quiet[q] + 0.1) * 16000) && i < *n; i++) p[i] = 0;
+    return p;
+}
+
+static void test_windows(void) {
+    int failures_before = failures;
+    const size_t max = (size_t)OC_STT_WINDOW_SECS * 16000, search = (size_t)OC_STT_CUT_SEARCH_MS * 16;
+    char err[160], *text = NULL;
+
+    /* A window ends in the quiet, short of the limit, never past it. */
+    const double one_gap[] = { 5.0 };
+    size_t n;
+    int16_t *p = speech(30, one_gap, 1, &n);
+    CHECK(p != NULL);
+    size_t cut = p ? oc_stt_window(p, n, max, search) : 0;
+    CHECK(cut >= 80000 && cut <= 81600);                          /* inside 5.0-5.1 s */
+    CHECK(p && oc_stt_window(p, 50000, max, search) == 50000);   /* fits: all of it */
+    free(p);
+
+    /* No quiet in reach: the window is cut at a 20 ms step no later than the limit. */
+    p = speech(30, NULL, 0, &n);
+    cut = p ? oc_stt_window(p, n, max, search) : 0;
+    CHECK(cut > max - search && cut <= max);
+    free(p);
+
+    /* 30 s of speech with a pause every five and a half seconds: every piece is at
+     * most the window, the pieces cover the clip once in order, and the words come
+     * back joined by one space; a piece that hears only spaces adds nothing. */
+    const double gaps[] = { 5.5, 11.0, 16.5, 22.0, 27.5 };
+    p = speech(30, gaps, 5, &n);
+    win_base = p; win_calls = 0; win_fail = 0; win_blank = 3;
+    err[0] = '\0';
+    CHECK(p && oc_stt_hear_windowed(&WIN, NULL, p, n, &text, err, sizeof err) == 0);
+    CHECK(win_calls == 6);
+    size_t covered = 0;
+    for (size_t i = 0; i < win_calls && i < 64; i++) {
+        CHECK(win_len[i] > 0 && win_len[i] <= max);
+        CHECK(win_off[i] == covered);
+        covered += win_len[i];
+    }
+    CHECK(covered == n);
+    CHECK(text && strcmp(text, "w1 w2 w4 w5 w6") == 0);
+    free(text); text = NULL;
+
+    /* A segment that fits is heard in one piece, as the engine said it. */
+    win_calls = 0; win_blank = 0;
+    CHECK(p && oc_stt_hear_windowed(&WIN, NULL, p, max, &text, err, sizeof err) == 0);
+    CHECK(win_calls == 1 && text && strcmp(text, " w1 ") == 0);
+    free(text); text = NULL;
+
+    /* A window that fails fails the segment, with its reason. */
+    win_calls = 0; win_fail = 2; err[0] = '\0';
+    CHECK(p && oc_stt_hear_windowed(&WIN, NULL, p, n, &text, err, sizeof err) == -1);
+    CHECK(text == NULL && strstr(err, STUB_REASON) && win_calls == 2);
+    free(p);
+    if (failures == failures_before) printf("  long segments heard in windows ok\n");
+}
+
 int run_stt_tests(void) {
-    printf("test_stt: tokenizer, token ceiling, spoken mentions, recognition worker order, full queue, eventfd, lazy open, idle close\n");
+    printf("test_stt: tokenizer, token ceiling, spoken mentions, recognition worker order, full queue, eventfd, lazy open, idle close, long segments in windows\n");
     test_tokens();
     test_mentions();
     test_worker();
+    test_windows();
     return failures;
 }

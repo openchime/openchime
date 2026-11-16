@@ -54,7 +54,11 @@ check "alice hears bob's tone" waitfor a 20 a_hears_b
 check "bob hears alice's tone" waitfor b 20 b_hears_a
 lost_a="$(peer a lost)"; late_a="$(peer a late)"
 say "  alice from bob: packets=$(peer a packets) level=$(peer a level) lost=$lost_a late=$late_a"
+"$PAIR" a call open $CH >/dev/null
 "$PAIR" a shot callstcp_incall >/dev/null
+# The route is the call's business: the view gives the usual hint, and says
+# nothing of the network blocking the call's own route.
+check "the call view says nothing of a blocked route" bash -c "! grep -q 'blocks the call' /tmp/oc-calls-dump-a.txt"
 "$PAIR" a call leave >/dev/null
 "$PAIR" b call leave >/dev/null
 

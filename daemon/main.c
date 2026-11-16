@@ -134,6 +134,8 @@ typedef struct {
     const char     *ticket;               /* a managed claim still to make, or NULL */
     pthread_t       claim;
     int             claiming;
+    pthread_t       addr;                 /* the address report (AUTH.md §3.6) */
+    int             reporting;
     oc_push        *push;
     oc_invite_mail *invite_mail;
     /* The CA-issued certificate (TLS.md, "Certificates"): its worker, the TLS
@@ -204,6 +206,9 @@ static void start_certs(services *f) {
 
 static void start_services(services *f) {
     const oc_config *cfg = f->cfg;
+    /* The address proof (AUTH.md §3.6): central's check of the address this
+     * workspace reports is answered with the enrollment key, once it is active. */
+    oc_netloop_set_enrollment(f->audience, f->privkey);
     /* Push (ARCH-85): on with OPENCHIME_PUSH=on, at the connection's origin, or
      * at OPENCHIME_PUSH_URL. It signs with the enrollment key and delivers
      * offline mobile notifications; off unless this box turns push on. */
@@ -271,11 +276,66 @@ static void *claim_thread(void *arg) {
     return NULL;
 }
 
+/* How long a self-hosted box keeps trying to have central record its address,
+ * and the longest wait between tries: central checks a workspace's address once
+ * a minute at most. */
+#define OC_ADDRESS_REPORT_SECS 900
+#define OC_ADDRESS_RETRY_MAX   60
+
+/* The address a self-hosted workspace answers at, reported to central once it
+ * serves (AUTH.md §3.6), so central can mail its invitations and open it from a
+ * link. Central records it only after the server there signs a nonce with this
+ * workspace's key (/enroll-proof). Tried again while central cannot be reached,
+ * asks to wait, or could not check the address; stopped on any other answer. A
+ * managed box reports none: its address is central's own. */
+static void *address_thread(void *arg) {
+    services *f = arg;
+    const oc_config *cfg = f->cfg;
+    char addr[300], body[340];
+    if (oc_enroll_address(cfg->workspace_address,
+                          cfg->tls_src.source == OC_TLS_SRC_ACME ? cfg->tls_src.names : NULL,
+                          cfg->proto_port, addr, sizeof addr) != 0) {
+        fprintf(stderr, "openchimed: no DNS name to report to central; invitations are shared by copying them\n");
+        return NULL;
+    }
+    snprintf(body, sizeof body, "{\"address\":\"%s\"}", addr);
+    oc_machine_http *h = oc_machine_http_open(cfg->enroll.url);
+    if (!h) { fprintf(stderr, "openchimed: could not report the address to central\n"); return NULL; }
+    time_t deadline = time(NULL) + OC_ADDRESS_REPORT_SECS;
+    unsigned pause = 5;
+    while (!g_stop) {
+        int status = 0;
+        int rc = oc_machine_http_post(h, OC_ADDRESS_REPORT_PATH, f->audience, f->privkey, body, &status);
+        if (rc == 0 && status == 200) {
+            fprintf(stderr, "openchimed: central recorded this workspace's address (%s)\n", addr);
+            break;
+        }
+        int again = rc != 0 || status == 422 || status == 429 || status >= 500;
+        if (!again) {
+            fprintf(stderr, "openchimed: central refused this workspace's address (%s): HTTP %d\n", addr, status);
+            break;
+        }
+        if (time(NULL) >= deadline) {
+            fprintf(stderr, "openchimed: central could not record this workspace's address (%s); "
+                            "retrying on next boot\n", addr);
+            break;
+        }
+        if (nap(pause)) break;
+        if (pause < OC_ADDRESS_RETRY_MAX) pause = pause * 2 > OC_ADDRESS_RETRY_MAX ? OC_ADDRESS_RETRY_MAX : pause * 2;
+    }
+    oc_machine_http_close(h);
+    return NULL;
+}
+
 /* The net loop's ready hook: the listener takes connections, so a certificate
- * can be validated through it, and a claim made. */
+ * can be validated through it, a claim made, and the address checked. */
 static void on_serving(void *ctx) {
     services *f = ctx;
     start_certs(f);
+    if (f->active && !f->reporting && !(f->cfg->enroll.ticket && *f->cfg->enroll.ticket)) {
+        if (pthread_create(&f->addr, NULL, address_thread, f) == 0) f->reporting = 1;
+        else fprintf(stderr, "openchimed: could not start the address report\n");
+    }
     if (!f->ticket || f->claiming) return;
     if (pthread_create(&f->claim, NULL, claim_thread, f) == 0) f->claiming = 1;
     else fprintf(stderr, "openchimed: could not start the enrollment claim\n");
@@ -898,6 +958,8 @@ int main(int argc, char **argv) {
      * with the rest. */
     g_stop = 1;
     if (svc.claiming) pthread_join(svc.claim, NULL);
+    if (svc.reporting) pthread_join(svc.addr, NULL);
+    oc_netloop_set_enrollment(NULL, NULL);
     oc_certs_stop(svc.certs);
     oc_tls_state_free(&svc.kept);
     oc_netloop_set_push(NULL);

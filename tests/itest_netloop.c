@@ -5,6 +5,7 @@
  * thread and drives it with blocking TLS clients. */
 
 #include "netloop.h"
+#include "enroll.h"        /* the address proof (AUTH.md §3.6) */
 #include "webapp.h"
 #include "webpages.h"     /* the pages' markers and error kinds */
 #include "pwpolicy.h"     /* OC_PW_RULE_TEXT, said beside a new password */
@@ -37,6 +38,9 @@
 #include "jwt.h"           /* oc_base64url_encode */
 #include "wa_fixture.h"    /* a passkey, as a browser's authenticator answers */
 #include <mbedtls/base64.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
 
 #include <arpa/inet.h>
 #include <math.h>
@@ -354,6 +358,7 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
             hdr->msg_type != OC_MSG_GROUP_INFO &&      /* the groups, unasked after a sign-in's */
             hdr->msg_type != OC_MSG_GROUPS_END &&      /*   user list (REQ-307) */
             hdr->msg_type != OC_MSG_ALERTS_SUMMARY &&  /* an owner's or admin's, at sign-in (REQ-263) */
+            hdr->msg_type != OC_MSG_PROFILE_FIELDS &&  /* the workspace's own, at sign-in and on a change */
             /* Every live message frame is followed by its ACTION (REQ-058,
              * ARCH-115); the action verticals read them with read_frame_raw. */
             hdr->msg_type != OC_MSG_ACTION)
@@ -477,6 +482,12 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
         if (oc_decode_alerts_summary(&p, &sm) != OC_OK) return -1;
         g_auth_alerts = sm;
     }
+    /* Then the workspace's own profile fields, always, empty when it has none. */
+    if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_PROFILE_FIELDS) return -1;
+    {
+        oc_profile_field pf[OC_MAX_PROFILE_FIELDS]; uint8_t npf = 0;
+        if (oc_decode_profile_fields(&p, pf, &npf) != OC_OK) return -1;
+    }
     return 0;
 }
 
@@ -596,6 +607,53 @@ static int send_frame(client *c, const uint8_t *buf, size_t len) {
  * invitee, both members then exchange a BROADCAST, and a third user never sees
  * the private channel in LIST_CHANNELS. */
 static int read_type(client *c, uint16_t type, oc_header *hdr, oc_rbuf *p);   /* below */
+
+/* A channel's managers over the wire (REQ-036b): the creator is named in the
+ * channel's state, and a grant reaches the channel's other members as a
+ * CHANNEL_INFO naming the new manager. */
+static void test_channel_managers_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    uint8_t buf[256]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_channel cch = { oc_slice_str("mgr-room"), 1 };
+    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cch) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    static oc_channel_info info;
+    CHECK(oc_decode_channel_info(&p, &info) == OC_OK);
+    CHECK(info.creator_id == ua && info.n_managers == 1 && info.managers[0] == ua);
+    uint64_t cid = info.channel_id;
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_channel_ref jr = { cid };
+    CHECK(oc_encode_join_channel(&w, OC_PROTOCOL_VERSION, &jr) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+
+    /* alice names bob: her ack and his push both name him. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_channel_member_op mo = { cid, ub };
+    CHECK(oc_encode_channel_add_manager(&w, OC_PROTOCOL_VERSION, &mo) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    CHECK(oc_decode_channel_info(&p, &info) == OC_OK && info.channel_id == cid && info.n_managers == 2);
+    CHECK(read_type(&b, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    CHECK(oc_decode_channel_info(&p, &info) == OC_OK && info.channel_id == cid);
+    int named = 0;
+    for (uint16_t i = 0; i < info.n_managers; i++) if (info.managers[i] == ub) named = 1;
+    CHECK(named);
+
+    client_close(&a);
+    client_close(&b);
+}
 
 static void test_channels_vertical(int port, const uint8_t *pin) {
     client a, b, cc;
@@ -1198,6 +1256,142 @@ static void test_poll_vertical(int port, const uint8_t *pin) {
     client_close(&b2);
 }
 
+/* Whether wire string `s` is `t`. */
+static int todo_is(oc_slice s, const char *t) {
+    return s.len == strlen(t) && (s.len == 0 || memcmp(s.ptr, t, s.len) == 0);
+}
+
+/* A TODO frame from `c`, skipping others, decoded into *out (static: a frame
+ * holds up to OC_TODO_CHUNK tasks). 0 when the next TODO is `mid`'s. */
+static int read_todo(client *c, uint64_t mid, oc_todo_msg *out) {
+    oc_header hdr; oc_rbuf p;
+    if (read_type(c, OC_MSG_TODO, &hdr, &p) != 0 || oc_decode_todo(&p, out) != OC_OK) return -1;
+    return out->message_id == mid ? 0 : -1;
+}
+
+/* Send a to-do change from `c`: TODO_ADD (name, desc), TODO_MARK (task, done)
+ * or TODO_RENAME (name). */
+static int send_todo(client *c, uint16_t type, uint64_t mid, const char *name, const char *desc,
+                     uint16_t task, uint8_t done) {
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_result r;
+    if (type == OC_MSG_TODO_ADD) {
+        oc_todo_add m = { 1, mid, oc_slice_str(name), oc_slice_str(desc ? desc : "") };
+        r = oc_encode_todo_add(&w, OC_PROTOCOL_VERSION, &m);
+    } else if (type == OC_MSG_TODO_MARK) {
+        oc_todo_mark m = { 1, mid, task, done };
+        r = oc_encode_todo_mark(&w, OC_PROTOCOL_VERSION, &m);
+    } else {
+        oc_todo_rename m = { 1, mid, oc_slice_str(name) };
+        r = oc_encode_todo_rename(&w, OC_PROTOCOL_VERSION, &m);
+    }
+    return r == OC_OK ? send_frame(c, buf, w.len) : -1;
+}
+
+/* To-do lists over the wire: a "/todo" message reaches every reader with its
+ * list after its ACTION; each change reaches them all live; a refusal goes to
+ * its sender alone; an edit is refused; and a backfill carries the list as it
+ * stands. */
+static void test_todo_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    uint8_t buf[512]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+    static oc_todo_msg tm;
+
+    /* alice sends a "/todo" body: bob gets the BROADCAST as written, its
+     * ACTION, then the TODO, nothing done. */
+    const char *body = "/todo Launch\n- Write the notes: for the release\n- Tag it";
+    oc_send s; memset(&s, 0, sizeof s);
+    s.channel_id = 1; memset(s.idem, 0x9A, OC_IDEM_SIZE);
+    s.body = oc_slice_str(body);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_SEND_ACK, &hdr, &p) == 0);
+    CHECK(read_type(&b, OC_MSG_BROADCAST, &hdr, &p) == 0);
+    oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+    uint64_t list = bc.message_id;
+    CHECK(bc.body.len == strlen(body) && memcmp(bc.body.ptr, body, bc.body.len) == 0);
+    CHECK(next_is_action(&b, list, 0, 0));
+    CHECK(read_todo(&b, list, &tm) == 0);
+    CHECK(tm.author_id == ua && tm.total == 2 && tm.first == 0 && tm.n == 2 && todo_is(tm.title, "Launch"));
+    CHECK(todo_is(tm.tasks[0].name, "Write the notes") && todo_is(tm.tasks[0].description, "for the release"));
+    CHECK(todo_is(tm.tasks[1].name, "Tag it") && !tm.tasks[1].done);
+    CHECK(read_todo(&a, list, &tm) == 0);
+
+    /* bob marks Tag it done: both get the list, saying bob did. */
+    CHECK(send_todo(&b, OC_MSG_TODO_MARK, list, NULL, NULL, 1, 1) == 0);
+    CHECK(read_todo(&a, list, &tm) == 0 && tm.tasks[1].done && tm.tasks[1].done_by == ub && tm.tasks[1].done_at_ms);
+    CHECK(read_todo(&b, list, &tm) == 0 && tm.tasks[1].done_by == ub);
+
+    /* alice marks it done too, as if at once: nothing changes, bob still
+     * marked it, and both are told so. */
+    CHECK(send_todo(&a, OC_MSG_TODO_MARK, list, NULL, NULL, 1, 1) == 0);
+    CHECK(read_todo(&b, list, &tm) == 0 && tm.tasks[1].done && tm.tasks[1].done_by == ub);
+    CHECK(read_todo(&a, list, &tm) == 0);
+
+    /* bob adds a task: at the end, for both. A name the list has: refused,
+     * to bob alone, the message id the context. */
+    CHECK(send_todo(&b, OC_MSG_TODO_ADD, list, "Book the room", "the big one", 0, 0) == 0);
+    CHECK(read_todo(&a, list, &tm) == 0 && tm.total == 3 && todo_is(tm.tasks[2].name, "Book the room"));
+    CHECK(read_todo(&b, list, &tm) == 0 && tm.total == 3);
+    CHECK(send_todo(&b, OC_MSG_TODO_ADD, list, "Tag it", "", 0, 0) == 0);
+    CHECK(read_type(&b, OC_MSG_ERROR, &hdr, &p) == 0);
+    oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_TODO_DUPLICATE);
+    CHECK(er.context.len == 8);
+
+    /* Only alice renames it. */
+    CHECK(send_todo(&b, OC_MSG_TODO_RENAME, list, "Mine now", NULL, 0, 0) == 0);
+    CHECK(read_type(&b, OC_MSG_ERROR, &hdr, &p) == 0);
+    CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_FORBIDDEN);
+    CHECK(send_todo(&a, OC_MSG_TODO_RENAME, list, "Launch day", NULL, 0, 0) == 0);
+    CHECK(read_todo(&b, list, &tm) == 0 && todo_is(tm.title, "Launch day") && tm.total == 3);
+    CHECK(read_todo(&a, list, &tm) == 0);
+
+    /* Not edited. */
+    oc_edit ed; memset(&ed, 0, sizeof ed);
+    ed.channel_id = 1; ed.message_id = list; ed.body = oc_slice_str("/todo Something else");
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_edit(&w, OC_PROTOCOL_VERSION, &ed) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_ERROR, &hdr, &p) == 0);
+    CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_TODO_NO_EDIT);
+
+    /* bob again, on a second connection: the backfill carries the list as it
+     * stands -- renamed, three tasks, Tag it done by bob. */
+    client b2;
+    CHECK(client_open(&b2, port, pin) == 0);
+    CHECK(do_handshake(&b2) == 0);
+    uint64_t ub2 = 0;
+    CHECK(do_auth(&b2, "bob", "pw-bob", &ub2) == 0 && ub2 == ub);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_cursor cur = { 1, 0 };
+    oc_backfill_request req = { 1, &cur };
+    CHECK(oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &req) == OC_OK);
+    CHECK(send_frame(&b2, buf, w.len) == 0);
+    int saw = 0;
+    for (int i = 0; i < 3000; i++) {
+        CHECK(read_frame_raw(&b2, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_TODO) {
+            CHECK(oc_decode_todo(&p, &tm) == OC_OK);
+            if (tm.message_id == list)
+                saw = todo_is(tm.title, "Launch day") && tm.total == 3 && tm.n == 3
+                      && tm.tasks[1].done && tm.tasks[1].done_by == ub && !tm.tasks[0].done;
+        } else if (hdr.msg_type == OC_MSG_BACKFILL_DONE) break;
+    }
+    CHECK(saw == 1);
+
+    client_close(&a);
+    client_close(&b);
+    client_close(&b2);
+}
+
 /* Presence + typing over the wire (REQ-120/121): a connecting user is announced
  * online (and gets a snapshot of who's online), an away change propagates, a
  * typing signal reaches other channel members, and a disconnect announces
@@ -1326,12 +1520,22 @@ static void test_presence_typing(int port, const uint8_t *pin) {
 
     /* bob types in the shared channel -> alice (a member) gets TYPING_UPDATE. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_typing ty = { 1 };
+    oc_typing ty = { 1, 0 };
     CHECK(oc_encode_typing(&w, OC_PROTOCOL_VERSION, &ty) == OC_OK);
     CHECK(send_frame(&b, buf, w.len) == 0);
     CHECK(read_frame_raw(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_TYPING_UPDATE);
     oc_typing_update tu; CHECK(oc_decode_typing_update(&p, &tu) == OC_OK);
-    CHECK(tu.channel_id == 1 && tu.user_id == ub);
+    CHECK(tu.channel_id == 1 && tu.user_id == ub && tu.thread_root == 0);   /* the main scroll */
+
+    /* ...and in a thread: the root comes through as sent (REQ-121). The rate
+     * limit allows this second one well inside its window. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_typing tth = { 1, 777 };
+    CHECK(oc_encode_typing(&w, OC_PROTOCOL_VERSION, &tth) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_frame_raw(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_TYPING_UPDATE);
+    CHECK(oc_decode_typing_update(&p, &tu) == OC_OK);
+    CHECK(tu.channel_id == 1 && tu.user_id == ub && tu.thread_root == 777);
 
     /* alice disconnects -> bob sees her offline. */
     client_close(&a);
@@ -1583,7 +1787,7 @@ static void test_upload_abandoned(int port, const uint8_t *pin) {
 
         oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
         oc_upload_begin ub = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("gone.bin"),
-                               oc_slice_str("application/octet-stream"), total };
+                               oc_slice_str("application/octet-stream"), total, 0 };
         memcpy(ub.idem, idem, OC_IDEM_SIZE);
         CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) == OC_OK);
         CHECK(send_frame(&a, fbuf, w.len) == 0);
@@ -1626,7 +1830,7 @@ static void test_upload_abandoned(int port, const uint8_t *pin) {
         uint8_t idem2[OC_IDEM_SIZE]; memset(idem2, 0xD9, sizeof idem2);
         oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
         oc_upload_begin ub2 = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("after.bin"),
-                                oc_slice_str("application/octet-stream"), small };
+                                oc_slice_str("application/octet-stream"), small, 0 };
         memcpy(ub2.idem, idem2, OC_IDEM_SIZE);
         CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub2) == OC_OK);
         CHECK(send_frame(&b, fbuf, w.len) == 0);
@@ -1658,6 +1862,32 @@ static void test_upload_abandoned(int port, const uint8_t *pin) {
  * upload's -- and the second upload streams, finishes and downloads under its
  * own attachment: its name, its size. Taken for the second's, the upload would
  * be streaming into the first's row, promised 1000 bytes, and 3000 are refused. */
+/* A snippet's text (REQ-226) is held to its cap at UPLOAD_BEGIN, before a byte
+ * of it is sent: one byte over is refused there, while the same size declared
+ * as an ordinary file is taken (protocol 44's `media_kind`). */
+static void test_snippet_upload_cap(int port, const uint8_t *pin) {
+    client a;
+    uint64_t ua = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    uint8_t buf[512]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+    oc_upload_begin big = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("big.txt"), oc_slice_str("text/plain"),
+                            OC_SNIPPET_MAX_SIZE + 1, OC_MEDIA_SNIPPET };
+    memset(big.idem, 0x5C, OC_IDEM_SIZE);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &big) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+    oc_error e;
+    CHECK(oc_decode_error(&p, &e) == OC_OK && e.code == OC_ERR_ATTACHMENT_TOO_LARGE && e.fatal == 0);
+    /* The same size as a file is an ordinary upload. */
+    oc_upload_begin file = big;
+    file.media_kind = 0;
+    memset(file.idem, 0x5D, OC_IDEM_SIZE);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &file) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_READY);
+    client_close(&a);
+}
+
 static void test_upload_restarted(int port, const uint8_t *pin, oc_dbwriter *dbw) {
     client a;
     uint64_t ua = 0;
@@ -1669,14 +1899,14 @@ static void test_upload_restarted(int port, const uint8_t *pin, oc_dbwriter *dbw
     oc_header hdr; oc_rbuf p; oc_wbuf w;
 
     oc_dbwriter_hold(dbw, OC_DBW_HOLD_ALL);
-    oc_upload_begin first = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("first.bin"), oc_slice_str("application/octet-stream"), 1000 };
+    oc_upload_begin first = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("first.bin"), oc_slice_str("application/octet-stream"), 1000, 0 };
     memset(first.idem, 0xA1, OC_IDEM_SIZE);
     oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
     CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &first) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
     oc_transfer_cancel tc = { 0 };
     oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
     CHECK(oc_encode_transfer_cancel(&w, OC_PROTOCOL_VERSION, &tc) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
-    oc_upload_begin second = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("second.bin"), oc_slice_str("application/octet-stream"), 3000 };
+    oc_upload_begin second = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("second.bin"), oc_slice_str("application/octet-stream"), 3000, 0 };
     memset(second.idem, 0xB2, OC_IDEM_SIZE);
     oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
     CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &second) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
@@ -2651,6 +2881,60 @@ static void test_collapsed_sync(int port, const uint8_t *pin) {
     }
     CHECK(!heard);
     client_close(&other); client_close(&a2); client_close(&a1);
+}
+
+/* A message moved (REQ-053) is told to the readers of both channels, each of
+ * them once: here Sid's message goes from the open channel to a private one of
+ * Alice's, so Sid hears it leave and Alice, in both, hears it one time. (Not
+ * Bob: the admin test has removed him by now.) */
+static void test_move_message_live(int port, const uint8_t *pin) {
+    client a, b;
+    uint64_t ua = 0, ub = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "sid", "pw-sid", &ub) == 0);
+    uint8_t buf[256]; oc_wbuf w; oc_header h; oc_rbuf p;
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_channel cch = { oc_slice_str("move-room"), 0 };
+    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cch) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &h, &p) == 0);
+    oc_channel_info info; CHECK(oc_decode_channel_info(&p, &info) == OC_OK);
+    uint64_t room = info.channel_id;
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send sd = {0}; sd.channel_id = 1; memset(sd.idem, 0x7A, OC_IDEM_SIZE);
+    sd.body = oc_slice_str("this belongs in move-room");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_SEND_ACK, &h, &p) == 0);
+    oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK);
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_move_message mm = { ack.message_id, room, 0, 1 };
+    CHECK(oc_encode_move_message(&w, OC_PROTOCOL_VERSION, &mm) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    oc_message_moved got;
+    CHECK(read_type(&a, OC_MSG_MESSAGE_MOVED, &h, &p) == 0 && oc_decode_message_moved(&p, &got) == OC_OK);
+    CHECK(got.message_id == ack.message_id && got.from_channel == 1 && got.to_channel == room &&
+          got.to_parent == 0 && got.count == 1);
+    CHECK(read_type(&b, OC_MSG_MESSAGE_MOVED, &h, &p) == 0 && oc_decode_message_moved(&p, &got) == OC_OK);
+    CHECK(got.message_id == ack.message_id && got.to_channel == room);
+    /* Alice heard it once: her next frames, up to the answer to a question
+     * asked now, hold no second one. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_list_saved(&w, OC_PROTOCOL_VERSION) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    int again = 0;
+    for (;;) {
+        if (read_frame(&a, &h, &p) != 0) break;
+        if (h.msg_type == OC_MSG_MESSAGE_MOVED) again = 1;
+        if (h.msg_type == OC_MSG_SAVED) break;
+    }
+    CHECK(!again);
+    /* Sid may not move it back: it is in a channel he cannot post in. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_move_message back = { ack.message_id, 1, 0, 0 };
+    CHECK(oc_encode_move_message(&w, OC_PROTOCOL_VERSION, &back) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_ERROR, &h, &p) == 0);
+    oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_UNKNOWN_MESSAGE);
+    client_close(&b); client_close(&a);
 }
 
 /* One device signed out on its own (REQ-182): its connection closes, the list
@@ -4953,6 +5237,73 @@ static void test_summaries(void) {
     db_unlink("itest_sum.db");
 }
 
+/* One POST of `body` to /enroll-proof over a non-oc/1 connection; the answer
+ * whole into `resp`. */
+static void proof_post(int port, const uint8_t *pin, const char *body, char *resp, size_t cap) {
+    client h;
+    resp[0] = '\0';
+    CHECK(http_client_open(&h, port, pin) == 0);
+    char req[512];
+    int rn = snprintf(req, sizeof req,
+        "POST /enroll-proof HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        "Content-Length: %zu\r\nConnection: close\r\n\r\n%s", strlen(body), body);
+    CHECK(write_all(&h.conn, (const uint8_t *)req, (size_t)rn) == 0);
+    http_read_response(&h, resp, cap);
+    client_close(&h);
+}
+
+/* Central's check of the address a workspace reported (AUTH.md §3.6): refused
+ * until the binding is active, then the nonce is signed with the enrollment key
+ * under the address proof's prefix -- verified here as central verifies it -- and
+ * a nonce of any other shape is refused. */
+static void test_address_proof_route(int port, const uint8_t *pin) {
+    const char *nonce = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+    char body[128], resp[2048];
+    snprintf(body, sizeof body, "{\"nonce\":\"%s\"}", nonce);
+
+    oc_netloop_set_enrollment(NULL, NULL);
+    proof_post(port, pin, body, resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 404", 12) == 0);
+
+    static char pk[1024], aud[128];
+    CHECK(oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0);
+    oc_netloop_set_enrollment(aud, pk);
+
+    proof_post(port, pin, body, resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 200", 12) == 0);
+    const char *json = strstr(resp, "\r\n\r\n");
+    char sig_b64[256] = "";
+    if (json) {
+        oc_json d;
+        if (oc_json_parse(&d, json + 4, strlen(json + 4)) == 0) {
+            CHECK(oc_json_get_str(&d, 0, "signature", sig_b64, sizeof sig_b64) == 0);
+            oc_json_free(&d);
+        }
+    }
+    CHECK(sig_b64[0] != '\0');
+
+    mbedtls_entropy_context ent; mbedtls_ctr_drbg_context rng; mbedtls_pk_context key;
+    mbedtls_entropy_init(&ent); mbedtls_ctr_drbg_init(&rng); mbedtls_pk_init(&key);
+    CHECK(mbedtls_ctr_drbg_seed(&rng, mbedtls_entropy_func, &ent, (const unsigned char *)"proof", 5) == 0);
+    CHECK(mbedtls_pk_parse_key(&key, (const unsigned char *)pk, strlen(pk) + 1, NULL, 0,
+                               mbedtls_ctr_drbg_random, &rng) == 0);
+    uint8_t sig[128]; size_t siglen = 0;
+    CHECK(mbedtls_base64_decode(sig, sizeof sig, &siglen, (const unsigned char *)sig_b64, strlen(sig_b64)) == 0);
+    char msg[256];
+    int mn = snprintf(msg, sizeof msg, "openchime-address-proof-v1|%s|%s", aud, nonce);
+    uint8_t hash[32];
+    mbedtls_sha256((const unsigned char *)msg, (size_t)mn, hash, 0);
+    CHECK(mbedtls_pk_verify(&key, MBEDTLS_MD_SHA256, hash, sizeof hash, sig, siglen) == 0);
+    mbedtls_pk_free(&key); mbedtls_ctr_drbg_free(&rng); mbedtls_entropy_free(&ent);
+
+    proof_post(port, pin, "{\"nonce\":\"short\"}", resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 400", 12) == 0);
+    proof_post(port, pin, "not json", resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 400", 12) == 0);
+
+    oc_netloop_set_enrollment(NULL, NULL);
+}
+
 /* Incoming webhooks over the wire (REQ-170, ARCH-32/54): a client mints a
  * per-channel token; a separate non-oc/1 (HTTP) TLS connection POSTs JSON to
  * /webhook/<token>; the channel member receives the message as a BROADCAST and
@@ -5079,7 +5430,8 @@ static void test_webhook_vertical(int port, const uint8_t *pin) {
  * channel level or DND on one connection pushes a fresh NOTIFY_PREFS snapshot to
  * all of the same user's connections. */
 /* One request answers with ALL of a user's notification state, in a fixed order:
- * NOTIFY_PREFS, then the pause, the schedule and the alert lists (REQ-135/136/278).
+ * NOTIFY_PREFS, then the pause, the schedule, the alert lists (REQ-135/136/278),
+ * whom I have muted and whom I block.
  * A test that read only the first would pass while three frames piled up in the
  * stream and desynchronised everything after it — which is exactly what happened. */
 static void read_notify_tail(client *c) {
@@ -5092,6 +5444,12 @@ static void read_notify_tail(client *c) {
     CHECK(read_frame(c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ALERT_PREFS);
     { oc_slice t[OC_MAX_KEYWORDS]; uint8_t nt = 0; uint64_t pe[OC_MAX_PRIORITY]; uint8_t np = 0;
       CHECK(oc_decode_alert_prefs(&p, t, OC_MAX_KEYWORDS, &nt, pe, OC_MAX_PRIORITY, &np) == OC_OK); }
+    CHECK(read_frame(c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_MUTED_USERS);
+    { uint64_t ids[OC_MAX_MUTED_USERS]; uint16_t n = 0;
+      CHECK(oc_decode_muted_users(&p, ids, &n) == OC_OK); }
+    CHECK(read_frame(c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BLOCKS);
+    { uint64_t ids[OC_MAX_BLOCKS]; uint16_t n = 0; uint8_t priv = 0;
+      CHECK(oc_decode_blocks(&p, &priv, ids, &n) == OC_OK); }
 }
 
 static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
@@ -5583,7 +5941,7 @@ static void test_pdm_relay(int port, const uint8_t *pin) {
     /* No file in it. */
     {
         uint8_t fbuf[256]; oc_wbuf w; oc_wbuf_init(&w, fbuf, sizeof fbuf);
-        oc_upload_begin ub = { id, {0}, oc_slice_str("x.bin"), oc_slice_str("application/octet-stream"), 10 };
+        oc_upload_begin ub = { id, {0}, oc_slice_str("x.bin"), oc_slice_str("application/octet-stream"), 10, 0 };
         memset(ub.idem, 0x55, OC_IDEM_SIZE);
         CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
         CHECK(read_error(&a, &code) == 0 && code == OC_ERR_FORBIDDEN);
@@ -6507,6 +6865,74 @@ static void test_dm_vertical(int port, const uint8_t *pin) {
     client_close(&c);
 }
 
+/* A block over the wire: carol blocks bob, who shares a DM with her. His
+ * OPEN_DM is refused with DM_REFUSED, and what he still writes into the DM is
+ * acknowledged to him but never reaches her connection. */
+static void test_block_vertical(int port, const uint8_t *pin) {
+    client b, c;
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(client_open(&c, port, pin) == 0);
+    CHECK(do_handshake(&b) == 0);
+    CHECK(do_handshake(&c) == 0);
+    uint64_t ub = 0, uc = 0;
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
+
+    uint8_t buf[256]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+
+    /* carol opens a DM with bob; bob is pushed it. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_open_dm od = { ub };
+    CHECK(oc_encode_open_dm(&w, OC_PROTOCOL_VERSION, &od) == OC_OK);
+    CHECK(send_frame(&c, buf, w.len) == 0);
+    CHECK(read_frame(&c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+    uint64_t dm = ci.channel_id;
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+
+    /* carol blocks bob: BLOCKS comes back to her, naming him. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_block sb = { ub, 1 };
+    CHECK(oc_encode_set_block(&w, OC_PROTOCOL_VERSION, &sb) == OC_OK);
+    CHECK(send_frame(&c, buf, w.len) == 0);
+    CHECK(read_frame(&c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BLOCKS);
+    uint64_t ids[OC_MAX_BLOCKS]; uint8_t priv = 9; uint16_t n = 0;
+    CHECK(oc_decode_blocks(&p, &priv, ids, &n) == OC_OK);
+    CHECK(n == 1 && ids[0] == ub && priv == OC_DM_PRIVACY_ANYONE);
+
+    /* bob cannot open the DM again. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_open_dm back = { uc };
+    CHECK(oc_encode_open_dm(&w, OC_PROTOCOL_VERSION, &back) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+    oc_error e; CHECK(oc_decode_error(&p, &e) == OC_OK);
+    CHECK(e.code == OC_ERR_DM_REFUSED && e.fatal == 0);
+
+    /* bob writes into the DM: his ACK and own BROADCAST arrive... */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0}; s.channel_id = dm; memset(s.idem, 0x7B, OC_IDEM_SIZE);
+    s.body = oc_slice_str("are you there");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    int got_ack = 0;
+    for (int i = 0; i < 2; i++) {
+        CHECK(read_frame(&b, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) got_ack = 1;
+    }
+    CHECK(got_ack);
+    /* ...and carol's next frame is the answer to her unblock, not his message. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_block un = { ub, 0 };
+    CHECK(oc_encode_set_block(&w, OC_PROTOCOL_VERSION, &un) == OC_OK);
+    CHECK(send_frame(&c, buf, w.len) == 0);
+    CHECK(read_frame(&c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BLOCKS);
+    CHECK(oc_decode_blocks(&p, &priv, ids, &n) == OC_OK && n == 0);
+
+    client_close(&b);
+    client_close(&c);
+}
+
 /* Tenant admin ops over the wire (REQ-033): an owner mints an invite, a fresh
  * client redeems it to create + authenticate an account, the owner promotes that
  * user (SET_ROLE pushes USER_UPDATED to them), lists users, and removes a member
@@ -6859,7 +7285,10 @@ static size_t raw_send_frame(uint8_t *buf, uint64_t channel, const uint8_t idem[
     size_t n = 8;
     for (int i = 7; i >= 0; i--) buf[n++] = (uint8_t)(channel >> (i * 8));
     memcpy(buf + n, idem, OC_IDEM_SIZE); n += OC_IDEM_SIZE;
-    if (parent) for (int i = 7; i >= 0; i--) buf[n++] = (uint8_t)(parent >> (i * 8));
+    if (parent) {
+        for (int i = 7; i >= 0; i--) buf[n++] = (uint8_t)(parent >> (i * 8));
+        buf[n++] = 0;                                      /* SEND_REPLY's also_channel */
+    }
     buf[n++] = (uint8_t)(body_len >> 24); buf[n++] = (uint8_t)(body_len >> 16);
     buf[n++] = (uint8_t)(body_len >> 8);  buf[n++] = (uint8_t)body_len;
     memset(buf + n, 'x', body_len); n += body_len;
@@ -6964,7 +7393,7 @@ static void test_fanout_limits(int port, const uint8_t *pin) {
     /* Typing: ten in a burst, three reach the other member. */
     for (int i = 0; i < 10; i++) {
         oc_wbuf_init(&w, buf, sizeof buf);
-        oc_typing ty = { 1 };
+        oc_typing ty = { 1, 0 };
         CHECK(oc_encode_typing(&w, OC_PROTOCOL_VERSION, &ty) == OC_OK);
         CHECK(send_frame(&b, buf, w.len) == 0);
     }
@@ -7017,7 +7446,7 @@ static void test_fanout_limits(int port, const uint8_t *pin) {
      * past their limit they cost the daemon nothing but the read. */
     {
         oc_wbuf_init(&w, buf, sizeof buf);
-        oc_typing ty = { 1 };
+        oc_typing ty = { 1, 0 };
         CHECK(oc_encode_typing(&w, OC_PROTOCOL_VERSION, &ty) == OC_OK);
         size_t one = w.len, total = 2u << 20, n = total / one;
         uint8_t *burst = malloc(n * one);
@@ -8241,6 +8670,97 @@ static void test_proxy_header(void) {
     db_unlink("itest_proxy.db");
 }
 
+/* The allowed networks (REQ-192): a client outside OPENCHIME_ALLOWED_NETWORKS is
+ * closed before TLS, whether it reaches the port directly or through a trusted
+ * forwarder, and counted; the health port answers everyone. Each case is a loop
+ * of its own, started with the setting it is about. */
+static int allowed_loop(struct loop_arg *a, pthread_t *th, oc_tls_server *srv, oc_dbwriter **dbw,
+                        const char *nets, const char *trusted, int health) {
+    if (nets) setenv("OPENCHIME_ALLOWED_NETWORKS", nets, 1); else unsetenv("OPENCHIME_ALLOWED_NETWORKS");
+    if (trusted) setenv("OPENCHIME_TRUSTED_PROXIES", trusted, 1); else unsetenv("OPENCHIME_TRUSTED_PROXIES");
+    db_unlink("itest_allowed.db");
+    *dbw = oc_dbwriter_start(tpath("itest_allowed.db"));
+    if (*dbw) oc_dbwriter_set_pw_mem(*dbw, 2048);
+    if (health) oc_netloop_set_health_port(0);
+    int port = *dbw ? start_loop(a, th, srv, *dbw, health) : 0;
+    if (health) oc_netloop_set_health_port(-1);
+    return port;
+}
+
+static void allowed_loop_end(struct loop_arg *a, pthread_t th, oc_dbwriter *dbw, int port) {
+    if (port) stop_loop(a, th);
+    if (dbw) oc_dbwriter_stop(dbw);
+    db_unlink("itest_allowed.db");
+    unsetenv("OPENCHIME_ALLOWED_NETWORKS");
+    unsetenv("OPENCHIME_TRUSTED_PROXIES");
+}
+
+static void test_allowed_networks(void) {
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
+    struct loop_arg arg2;
+    pthread_t th2;
+    oc_dbwriter *dbw2 = NULL;
+    client a;
+
+    /* Loopback outside the list: the TLS port closes it, counted; the health
+     * port, which is never restricted, still answers it. */
+    uint64_t before = oc_netloop_refused_networks();
+    int port = allowed_loop(&arg2, &th2, &srv2, &dbw2, "203.0.113.0/24, 2001:db8::/32", NULL, 1);
+    int hport = __atomic_load_n(&arg2.view.health_port, __ATOMIC_ACQUIRE);
+    CHECK(port != 0 && hport != 0);
+    int refused = client_open(&a, port, pin2);
+    CHECK(refused != 0);
+    if (refused == 0) client_close(&a);
+    CHECK(oc_netloop_refused_networks() == before + 1);
+    static char resp[4096];
+    CHECK(hport && plain_exchange(hport, "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof resp) > 0 &&
+          strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0);
+    allowed_loop_end(&arg2, th2, dbw2, port);
+
+    /* Loopback inside the list: served as ever. */
+    port = allowed_loop(&arg2, &th2, &srv2, &dbw2, "127.0.0.0/8,::1", NULL, 0);
+    CHECK(port != 0);
+    CHECK(client_open(&a, port, pin2) == 0 && do_handshake(&a) == 0);
+    client_close(&a);
+    allowed_loop_end(&arg2, th2, dbw2, port);
+
+    /* Through a trusted forwarder the client its header names is judged, still
+     * before TLS: 203.0.113.7 is in, 198.51.100.7 is out, and a LOCAL header
+     * (the forwarder's own probe) is judged by the forwarder, here outside. */
+    static const uint8_t SIG[12] = { 0x0D,0x0A,0x0D,0x0A,0x00,0x0D,0x0A,0x51,0x55,0x49,0x54,0x0A };
+    uint8_t in[28], out[28], local[16];
+    memcpy(in, SIG, 12); in[12] = 0x21; in[13] = 0x11; in[14] = 0; in[15] = 12;
+    memset(in + 16, 0, 12);
+    in[16] = 203; in[17] = 0; in[18] = 113; in[19] = 7;
+    memcpy(out, in, sizeof out); out[16] = 198; out[17] = 51; out[18] = 100;
+    memcpy(local, SIG, 12); local[12] = 0x20; local[13] = 0x00; local[14] = 0; local[15] = 0;
+    before = oc_netloop_refused_networks();
+    port = allowed_loop(&arg2, &th2, &srv2, &dbw2, "203.0.113.0/24", "127.0.0.0/8", 0);
+    CHECK(port != 0);
+    CHECK(client_open_with(&a, port, pin2, in, sizeof in) == 0 && do_handshake(&a) == 0);
+    client_close(&a);
+    refused = client_open_with(&a, port, pin2, out, sizeof out);
+    CHECK(refused != 0);
+    if (refused == 0) client_close(&a);
+    refused = client_open_with(&a, port, pin2, local, sizeof local);
+    CHECK(refused != 0);
+    if (refused == 0) client_close(&a);
+    CHECK(oc_netloop_refused_networks() == before + 2);
+    allowed_loop_end(&arg2, th2, dbw2, port);
+
+    /* Unset: everyone, as every other test here already shows; once more, so the
+     * case is named. */
+    port = allowed_loop(&arg2, &th2, &srv2, &dbw2, NULL, NULL, 0);
+    CHECK(port != 0);
+    CHECK(client_open(&a, port, pin2) == 0 && do_handshake(&a) == 0);
+    client_close(&a);
+    allowed_loop_end(&arg2, th2, dbw2, port);
+    oc_tls_server_free(&srv2);
+}
+
 int run_netloop_tests(void) {
     printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, dm, drafts across two devices, load, rate-limit, out-cap, throttle, admin, logout\n");
 
@@ -8336,11 +8856,14 @@ int run_netloop_tests(void) {
         test_unexpected_msg_type(arg.port, pin);
         test_edit_delete_vertical(arg.port, pin);
         test_channels_vertical(arg.port, pin);
+        test_channel_managers_vertical(arg.port, pin);
         test_threads_vertical(arg.port, pin);
         test_thread_meta_vertical(arg.port, pin);
         test_action_vertical(arg.port, pin);
         test_poll_vertical(arg.port, pin);
+        test_todo_vertical(arg.port, pin);
         test_dm_vertical(arg.port, pin);
+        test_block_vertical(arg.port, pin);
         test_drafts_vertical(arg.port, pin);
         test_presence_typing(arg.port, pin);
         test_fanout_limits(arg.port, pin);
@@ -8352,7 +8875,9 @@ int run_netloop_tests(void) {
         test_voice_input_rate(arg.port, pin);
         test_upload_abandoned(arg.port, pin);
         test_upload_restarted(arg.port, pin, dbw);
+        test_snippet_upload_cap(arg.port, pin);
         test_webhook_vertical(arg.port, pin);
+        test_address_proof_route(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
         /* The call group: a held seat goes quickly for every one of them, and
          * the knob is put back after the group, whatever it found. */
@@ -8386,11 +8911,13 @@ int run_netloop_tests(void) {
         test_revoke_one_session(arg.port, pin);
         test_get_profile(arg.port, pin);
         test_collapsed_sync(arg.port, pin);
+        test_move_message_live(arg.port, pin);
         test_groups_vertical(arg.port, pin);
         test_groups_unasked(arg.port, pin);
         test_http_stack();
         test_auth_begin();
         test_proxy_header();
+        test_allowed_networks();
     }
 
     if (up) stop_loop(&arg, th);

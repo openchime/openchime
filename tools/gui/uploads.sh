@@ -7,6 +7,9 @@
 # Files wait in the box as chips until Send, which posts them with the text as
 # one message. It asserts that
 #
+#   - in the Windows client, the real file dialog "+" opens is driven: the hook
+#     answers while it is open (dump `picker=1`), Cancel closes it adding
+#     nothing, and a file picked in it comes back as a chip;
 #   - attached files appear as chips, an image with its picture, each one's
 #     button published to assistive technology, and nothing is uploaded yet;
 #   - a chip's x takes it out, before anything has moved;
@@ -73,6 +76,39 @@ for _ in $(seq 1 80); do snap; grep -q 'authed=1' "$D" && break; sleep 0.25; don
 make_png "$LIN_DIR/up-picture.png"
 printf 'the notes\n' > "$LIN_DIR/up-notes.txt"
 head -c 300000 /dev/urandom > "$LIN_DIR/up-data.bin"
+if [ "$PLAT" = win32 ]; then   # the browser's picker is the page's, not a dialog on the client's thread
+say "== the file dialog, driven: cancelled, then a file picked"
+# "+" opens the system's own Open dialog, whose modal loop holds the client's
+# thread; the hook is answered from inside it all the same. The click is
+# acked before it is made (clickform), since the dialog does not return.
+plus() {  # click the composer's "+", by the rect it publishes, in scene units
+  local line dpi l t r b
+  snap
+  line="$(grep -m1 '^a11yitem composer.attach ' "$D")"
+  dpi="$(sed -n 's/.* dpi=\([0-9]*\).*/\1/p' "$D" | head -1)"
+  read -r _ _ l t r b <<<"$line"
+  [ -n "${b:-}" ] && [ "${dpi:-0}" -gt 0 ] || return 1
+  "$DRIVE" clickform "$(( (l + r) * 48 / dpi ))" "$(( (t + b) * 48 / dpi ))" >/dev/null
+}
+picker_is() { snap; grep -q "^modal=[^ ]* picker=$1 " "$D"; }
+no_dialog() { [ "$("$DRIVE" picker cancel 2>/dev/null)" = "ack: none" ]; }
+empty_tray() { [ "$(tray here)" = 0 ]; }
+check "with no dialog open, the picker verb changes nothing" no_dialog
+check "\"+\" opens the file dialog" plus
+check "the hook answers while it is open, and the dump says so" waitfor 10 picker_is 1
+check "a screenshot is taken with it open" "$DRIVE" shot uploads_picker
+"$DRIVE" picker cancel >/dev/null
+check "cancelled, it closes" waitfor 10 picker_is 0
+check "...and adds nothing" empty_tray
+check "\"+\" opens it again" plus
+waitfor 10 picker_is 1
+"$DRIVE" picker pick "$(cpath up-notes.txt)" >/dev/null
+picked() { [ "$(tray here)" = 1 ] && [ "$(chip 0 name)" = up-notes.txt ]; }
+check "a file picked in it comes back as a chip" waitfor 10 picked
+check "...and the dialog is gone" picker_is 0
+click_x 0
+waitfor 5 empty_tray
+fi
 for f in up-picture.png up-notes.txt up-data.bin; do "$DRIVE" attach "$(cpath $f)" >/dev/null; done
 three() { [ "$(tray here)" = 3 ] && [ "$(tray height)" != 0 ]; }
 check "three chips, and the box grew to hold them" waitfor 5 three

@@ -1,7 +1,7 @@
 /* Harness: the HTTP request parser (daemon/http.c), as a connection's first
  * bytes reach it. The head, then head and body; on a parsed request, the
- * header values the static routes read. Every field is a view into the input,
- * and the head and body lie inside it. */
+ * header values the static routes read and the webhook payload's text. Every
+ * field is a view into the input, and the head and body lie inside it. */
 
 #include "fuzz.h"
 #include "http.h"
@@ -39,9 +39,13 @@ int oc_fuzz_http(const uint8_t *data, size_t len) {
         fields(buf, len, &r);
         inside(buf, len, r.body, r.body_len);
         if (r.body_len > 4096) OC_FUZZ_BROKEN(H, "a body over the limit");
-        const char *text;
-        size_t tl;
-        if (oc_http_webhook_text(&r, &text, &tl)) inside(buf, len, text, tl);
+        /* The webhook payload reader (ARCH-71): what it composes stays within
+         * the room it is given, and is a C string of the length it says. */
+        char text[512];
+        size_t tl = 0;
+        int got = oc_http_webhook_payload(&r, text, sizeof text, &tl);
+        if (tl >= sizeof text) OC_FUZZ_BROKEN(H, "webhook text past its room");
+        if (got && (tl == 0 || strlen(text) != tl)) OC_FUZZ_BROKEN(H, "webhook text not the length it says");
         if (r.inm) (void)oc_http_etag_listed(r.inm, r.inm_len, "\"abc\"");
     }
     (void)oc_http_accepts_gzip(buf, len);

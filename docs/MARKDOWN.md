@@ -125,6 +125,13 @@ moving the keyboard onto its message, shows all of it with the zone used:
 "Friday 30 October 2026, 20:30 (UTC+05:30)". The terminal client shows the
 short form in place of the token.
 
+This holds wherever a token is: in body text, in a table's cell (in the
+desktop client's grid, and in a table past those it draws as grids, which
+shows as text), and in a `/me` action's line, whether its spoilers are covered
+or shown. A covered spoiler stays covered, the token in it with it. Each takes
+the reader's zone and clock, and, in the desktop client, the hover and focus
+tip; when the clock setting or the day changes, each shows the new form.
+
 Only a real date and time are a token: `<time:2026-02-30T10:00Z>`, an hour past
 23, a missing `Z` or an offset in its place leave the text as typed. Inside
 code it is literal. The composer's **Insert a time** picks a date and time in
@@ -201,10 +208,15 @@ the reading is the one that shows less:
 - A spoiler that does not close at all, or spans a line break, hides nothing;
   it is literal text, like any unclosed delimiter (§2). The block form is what
   hides several lines.
-- **In the composer,** a line break typed or pasted inside one splits it, so each
-  line stays hidden: `>!ab|cd!<` becomes `>!ab!<` and `>!cd!<`. An edit inside one
-  that would stop it being one, such as a `\` before its `!<`, is refused, and no
-  edit silently takes its delimiters away.
+- **In the composer,** a line break typed or pasted inside one keeps it whole:
+  it becomes the block form, its fences on lines of their own, in the rich and
+  the plain-text composer alike and however many spoilers the draft holds, so
+  `>!ab|cd!<` becomes a ```` ```spoiler ```` block hiding `ab` and `cd`. In the
+  rich composer an edit inside one that would stop it being one, such as a `\`
+  before its `!<`, is refused, and no edit silently takes its delimiters away. A
+  draft that still opens a spoiler with `>!` and never closes it is not sent, in
+  either client: the composer says so and points to where it opens. To send the
+  characters themselves, write `\>!`.
 
 Each client draws a spoiler **covered** — a block the size of what it hides,
 saying "Spoiler" or "Spoiler: Label" — until the reader reveals it with a click,
@@ -233,6 +245,22 @@ and not read, so what its cells hide does not come up. Read aloud, a spoiler is
 the daemon fetches and stores no link card for an address inside a spoiler,
 whose card would show under the message, even with a fetch in flight when an edit
 wraps it.
+
+**What a spoiler hides goes nowhere else.**
+
+- **Copying** a selection across a covered spoiler, Copy text on a message, and
+  Copy text on a `/me` action put its covered form on the clipboard, `[spoiler]`
+  or `[spoiler: Label]`, as an excerpt shows it. One this reader has revealed is
+  copied as written. Copy table keeps a covered cell covered, as above.
+- **It notifies nobody.** A mention inside one (`@name`, `<@U…>`, a group,
+  `@here`, `@channel`, `@everyone`) is no mention: it stores no mention row,
+  notifies nobody and is not counted as one by any client. A word on someone's
+  keyword list inside one raises no alert. The same mention or word outside the
+  spoiler, in the same message, still does.
+- **It is not searchable, for anyone, its author included.** The search index
+  holds each message without the text its spoilers hide (`oc_rt_unspoiled`;
+  SCHEMA.md §3bk), so a word that appears only inside one finds nothing and a
+  guess cannot be confirmed; a word outside it still finds the message.
 
 The parser reports `OC_RT_SPOILER` (inline) or `OC_RT_SPOILER_BLOCK` over the
 hidden text, with `OC_RT_DELIM` spans over the `>!` and `!<`, the opening line and
@@ -389,10 +417,17 @@ trustworthy part: a frontend shows it on hover and asks before opening a
 labelled link, naming its host and the full address (§6). A bare address needs
 no such step; it is its own label.
 
-**Only `http` and `https`.** A link span is what a frontend hands to the
-operating system, so this list is the set of things a message can ask a reader's
-machine to open. `file://`, `javascript:`, `mailto:` and anything else stay
-ordinary text. The restriction lives in the shared parser rather than in each
+**Only `http` and `https`, and OpenChime's own permalinks.** A link span is
+what a frontend hands to the operating system, so this list is the set of things
+a message can ask a reader's machine to open. `file://`, `javascript:`,
+`mailto:` and anything else stay ordinary text. The one exception is a
+permalink, `openchime://<host>/c/<channel>` or `.../c/<channel>/m/<message>`
+(the host may be empty, meaning this workspace), bare or as a labelled link's
+address: it is never handed to the system. The client follows it itself, as it
+follows one pasted into the palette, checking the workspace and what the reader
+may see; a labelled one asks nothing first, since it can go nowhere outside the
+app. Only that exact shape is one (`oc_url_permalink_len`), and the daemon never
+fetches it for a preview. The line a move leaves behind is written this way. The restriction lives in the shared parser rather than in each
 frontend, which is what stops two clients answering a security question
 differently — the same argument ARCH-89 makes for the mention scanner.
 

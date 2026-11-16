@@ -9,6 +9,7 @@
 
 #include "check.h"
 #include "url.h"
+#include "permalink.h"   /* both forms of an openchime:// link */
 
 /* oc_url_len over a C string at offset `at`, expecting `want` bytes. */
 static int len_at(const char *s, size_t at) {
@@ -49,6 +50,33 @@ static int test_extent(void) {
     CHECK(len_at("file:///etc/passwd", 0) == 0);
     CHECK(len_at("javascript:alert(1)", 0) == 0);
     CHECK(len_at("mailto:a@b.com", 0) == 0);
+
+    /* An OpenChime permalink is not a web address: oc_url_len and the
+     * extractor (what the daemon would fetch) leave it alone... */
+    CHECK(len_at("openchime://ws.example/c/3/m/4", 0) == 0);
+    {
+        oc_url_span sp[2];
+        const char *t = "see openchime:///c/3/m/4 and https://a.com";
+        CHECK(oc_url_extract(t, strlen(t), sp, 2) == 1);
+    }
+    /* ...and oc_url_permalink_len takes exactly its shape, host or none. */
+    {
+        static const struct { const char *s; size_t i, want; } P[] = {
+            { "openchime:///c/3/m/4", 0, 20 },
+            { "openchime://ws.example:8443/c/3", 0, 31 },
+            { "go openchime:///c/3/m/4.", 3, 20 },            /* the full stop is the sentence's */
+            { "(openchime:///c/3/m/4)", 1, 20 },
+            { "OpenChime:///C/3", 0, 0 },                      /* the path is exact */
+            { "openchime:///c/", 0, 0 },
+            { "openchime:///c/3/x", 0, 0 },
+            { "openchime://h/c/3?x=1", 0, 17 },                /* a "?" ends the sentence, not the link */
+            { "openchime://h/../c/3", 0, 0 },
+            { "xopenchime:///c/3", 1, 0 },                      /* not at a boundary */
+            { "javascript:openchime:///c/3", 11, 0 },
+        };
+        for (size_t k = 0; k < sizeof P / sizeof P[0]; k++)
+            CHECK(oc_url_permalink_len(P[k].s, strlen(P[k].s), P[k].i) == P[k].want);
+    }
 
     /* The opening boundary: start, whitespace, opening bracket, or a run of
      * formatting delimiters looked through to one of those — never a word. */
@@ -170,6 +198,36 @@ static int test_authority(void) {
     return failures;
 }
 
+/* Both forms of an openchime:// link (CLIENT.md "Links"): a copied permalink
+ * names its workspace by host, an email's by audience id, with a thread beside
+ * the message; anything else is not a link to follow. */
+static int test_permalink_forms(void) {
+    int failures = 0;
+    oc_permalink pl;
+    CHECK(oc_permalink_parse("openchime://chat.acme.example/c/7/m/42", &pl));
+    CHECK(pl.kind == OC_PERMALINK_HOST && !strcmp(pl.where, "chat.acme.example"));
+    CHECK(pl.channel == 7 && pl.message == 42 && pl.thread == 0);
+    CHECK(oc_permalink_parse("  openchime://chat.acme.example:8443/c/7", &pl));
+    CHECK(!strcmp(pl.where, "chat.acme.example:8443") && pl.channel == 7 && pl.message == 0);
+
+    CHECK(oc_permalink_parse("openchime://w/ws_AbC-12_xyz/c/7", &pl));
+    CHECK(pl.kind == OC_PERMALINK_AUDIENCE && !strcmp(pl.where, "ws_AbC-12_xyz"));
+    CHECK(pl.channel == 7 && pl.message == 0 && pl.thread == 0);
+    CHECK(oc_permalink_parse("openchime://w/ws_AbC-12_xyz/c/7/m/42/t/40", &pl));
+    CHECK(pl.channel == 7 && pl.message == 42 && pl.thread == 40);
+    CHECK(oc_permalink_parse("openchime://w/ws_AbC-12_xyz/c/7/t/40", &pl));
+    CHECK(pl.message == 0 && pl.thread == 40);
+
+    CHECK(!oc_permalink_parse("https://chat.acme.example/c/7", &pl));
+    CHECK(!oc_permalink_parse("openchime://chat.acme.example/c/0", &pl));
+    CHECK(!oc_permalink_parse("openchime://chat.acme.example/m/42", &pl));
+    CHECK(!oc_permalink_parse("openchime://w/acme/c/7", &pl));           /* not an audience id */
+    CHECK(!oc_permalink_parse("openchime://w/ws_a.b.c/c/7", &pl));       /* a host is not one */
+    CHECK(!oc_permalink_parse("openchime://w/ws_AbC-12_xyz/c/7/m/x", &pl));
+    CHECK(!oc_permalink_parse("openchime://w/ws_AbC-12_xyz/c/7/extra", &pl));
+    return failures;
+}
+
 int run_url_tests(void) {
     int failures = 0;
     printf("url: authority\n");
@@ -178,5 +236,7 @@ int run_url_tests(void) {
     failures += test_extent();
     printf("url: extract\n");
     failures += test_extract();
+    printf("url: openchime:// links\n");
+    failures += test_permalink_forms();
     return failures;
 }

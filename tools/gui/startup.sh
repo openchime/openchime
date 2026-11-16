@@ -43,8 +43,21 @@ fi
 rm -rf "$OC_TEST_DIR"
 
 snap() { "$DRIVE" dump startup >/dev/null 2>&1; cat "$LIN_DIR/startup.txt" 2>/dev/null; }
-key_of() { printf '%s' "$1" | grep -o "\b$2=[^ ]*" | head -1 | cut -d= -f2; }
-quoted_of() { printf '%s' "$1" | grep -o "\b$2=\"[^\"]*\"" | head -1 | sed "s/^$2=\"//; s/\"\$//"; }
+# A key is read from the one dump line that owns it, picked by how that line
+# begins: other lines carry keys of the same name (the table editor's
+# `view=0,0,0,0` comes before the client's own `view=`), so a search of the
+# whole dump reads whichever comes first.
+#   line_key  <dump> <line prefix> <key>     e.g. line_key "$d" 'startup ' started
+#   line_quoted <dump> <line prefix> <key>   the same, for a "quoted" value
+line_of() { printf '%s\n' "$1" | grep -m1 "^$2"; }
+line_key() { line_of "$1" "$2" | grep -o "\b$3=[^ ]*" | head -1 | cut -d= -f2; }
+line_quoted() { line_of "$1" "$2" | grep -o "\b$3=\"[^\"]*\"" | head -1 | sed "s/^$3=\"//; s/\"\$//"; }
+# The lines this script reads, and the keys each one owns.
+view_of()    { line_key "$1" 'view=' "$2"; }           # view, wsmgr
+startup_of() { line_key "$1" 'startup ' "$2"; }        # visible, started
+authed_of()  { line_key "$1" 'authed=' authed; }
+si_of()      { line_quoted "$1" 'startup ' "$2"; }     # si_ws, si_err
+error_of()   { line_quoted "$1" 'error_seq=' last_error; }
 
 # Wait up to ~10 s for `pred` (a shell function over $d, the dump) to hold.
 wait_for() {
@@ -57,6 +70,11 @@ wait_for() {
   return 1
 }
 
+# Launched with a workspace, the window is created hidden and shown once its
+# placement arrives, or 1.5 s on: a check of `visible` waits for it as the other
+# checks wait, and a window that never shows still fails.
+shown() { [ "$(startup_of "$d" visible)" = "1" ]; }
+
 launch() {   # launch <workspace> <credential>
   OC_TEST_NO_BUILD=1 "$DRIVE" launch "$1" "$2" >/dev/null 2>&1
 }
@@ -68,14 +86,14 @@ make -C "$HERE" windows >/dev/null 2>&1 || { say "  FAIL gui build"; exit 1; }
 # --- 1. a workspace that resolves, with a credential ---------------------------
 say "1. a reachable workspace"
 launch "$("$DRIVE" devaddr)" "alice:pw"
-signed_in() { [ "$(key_of "$d" authed)" = "1" ]; }
+signed_in() { [ "$(authed_of "$d")" = "1" ]; }
 if wait_for signed_in; then ok "signs in"; else fail "never signed in"; fi
-[ "$(key_of "$d" visible)" = "1" ] && ok "window is visible" || fail "window is not visible"
-[ "$(key_of "$d" started)" = "1" ] && ok "exactly one client started" \
-  || fail "started $(key_of "$d" started) clients, not 1: two net threads on one workspace"
-[ "$(key_of "$d" view)" != "$VIEW_SIGNIN" ] && ok "shows the workspace, not the sign-in view" \
+wait_for shown && ok "window is visible" || fail "window is not visible"
+[ "$(startup_of "$d" started)" = "1" ] && ok "exactly one client started" \
+  || fail "started $(startup_of "$d" started) clients, not 1: two net threads on one workspace"
+[ "$(view_of "$d" view)" != "$VIEW_SIGNIN" ] && ok "shows the workspace, not the sign-in view" \
   || fail "landed on the sign-in view"
-[ "$(key_of "$d" wsmgr)" = "0" ] && ok "does not also open the switcher" \
+[ "$(view_of "$d" wsmgr)" = "0" ] && ok "does not also open the switcher" \
   || fail "opened the workspace switcher as well"
 
 # --- 2. a workspace that does not resolve --------------------------------------
@@ -83,38 +101,41 @@ if wait_for signed_in; then ok "signs in"; else fail "never signed in"; fi
 # on every machine, online or not.
 say "2. a workspace that does not resolve"
 launch "nosuch.invalid" "alice:pw"
-on_signin() { [ "$(key_of "$d" view)" = "$VIEW_SIGNIN" ]; }
-if wait_for on_signin; then ok "lands on the sign-in view"; else fail "never reached the sign-in view (view=$(key_of "$d" view))"; fi
-[ "$(key_of "$d" visible)" = "1" ] && ok "window is visible" \
+on_signin() { [ "$(view_of "$d" view)" = "$VIEW_SIGNIN" ]; }
+if wait_for on_signin; then ok "lands on the sign-in view"; else fail "never reached the sign-in view (view=$(view_of "$d" view))"; fi
+wait_for shown && ok "window is visible" \
   || fail "window is NOT visible: a live process showing nothing"
-[ "$(quoted_of "$d" si_ws)" = "nosuch.invalid" ] && ok "keeps the workspace it was given" \
-  || fail "sign-in view shows workspace '$(quoted_of "$d" si_ws)'"
-case "$(quoted_of "$d" si_err)" in
-  *"not found"*) ok "says why: $(quoted_of "$d" si_err)" ;;
-  *) fail "gives no reason (si_err='$(quoted_of "$d" si_err)')" ;;
+[ "$(si_of "$d" si_ws)" = "nosuch.invalid" ] && ok "keeps the workspace it was given" \
+  || fail "sign-in view shows workspace '$(si_of "$d" si_ws)'"
+case "$(si_of "$d" si_err)" in
+  *"not found"*) ok "says why: $(si_of "$d" si_err)" ;;
+  *) fail "gives no reason (si_err='$(si_of "$d" si_err)')" ;;
 esac
 
 # --- 3. a workspace that is not a workspace ------------------------------------
 say "3. a malformed workspace"
 launch ":$OC_TEST_PORT" "alice:pw"
 if wait_for on_signin; then ok "lands on the sign-in view"; else fail "never reached the sign-in view"; fi
-[ "$(key_of "$d" visible)" = "1" ] && ok "window is visible" || fail "window is not visible"
-case "$(quoted_of "$d" si_err)" in
-  *"invalid workspace"*) ok "says why: $(quoted_of "$d" si_err)" ;;
-  *) fail "gives no reason (si_err='$(quoted_of "$d" si_err)')" ;;
+wait_for shown && ok "window is visible" || fail "window is not visible"
+case "$(si_of "$d" si_err)" in
+  *"invalid workspace"*) ok "says why: $(si_of "$d" si_err)" ;;
+  *) fail "gives no reason (si_err='$(si_of "$d" si_err)')" ;;
 esac
 
 # --- 4. a workspace that resolves but where nothing is listening ---------------
-# Resolving succeeds, so this is not a sign-in failure: the client starts and its
-# net thread reports that it cannot connect, and keeps retrying. What must hold
-# is that the window shows, one client runs, and the reason is said.
+# Resolving succeeds, so this is not an address the client refuses. The sign-in
+# card asks the workspace how it signs people in before it starts a client, and
+# nothing answers: it says why on the card and starts none. A client that did
+# start would say why itself (last_error). What must hold is that the window
+# shows, the reason is said, and never more than one client runs.
 say "4. a workspace nothing answers at"
 launch "127.0.0.1:1" "alice:pw"
-has_error() { [ -n "$(quoted_of "$d" last_error)" ]; }
-if wait_for has_error; then ok "says why: $(quoted_of "$d" last_error)"; else fail "gives no reason it cannot connect"; fi
-[ "$(key_of "$d" visible)" = "1" ] && ok "window is visible" || fail "window is not visible"
-[ "$(key_of "$d" started)" = "1" ] && ok "exactly one client started" \
-  || fail "started $(key_of "$d" started) clients, not 1"
+reason_of() { local r; r="$(si_of "$1" si_err)"; [ -n "$r" ] || r="$(error_of "$1")"; printf '%s' "$r"; }
+has_reason() { [ -n "$(reason_of "$d")" ]; }
+if wait_for has_reason; then ok "says why: $(reason_of "$d")"; else fail "gives no reason it cannot connect"; fi
+wait_for shown && ok "window is visible" || fail "window is not visible"
+[ "$(startup_of "$d" started)" -le 1 ] 2>/dev/null && ok "no more than one client started ($(startup_of "$d" started))" \
+  || fail "started $(startup_of "$d" started) clients, more than 1"
 
 "$DRIVE" kill >/dev/null 2>&1
 kill_dev_daemon >/dev/null 2>&1

@@ -18,6 +18,7 @@
 #include "richtext.h"
 
 #include "url.h"   /* shared/: the address rules the daemon must agree with */
+#include "mention.h"   /* oc_keyword_match, which oc_rt_keyword_match keeps out of spoilers */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -172,7 +173,8 @@ static size_t code_span_len(rt_ctx *c, size_t i, size_t e) {
  * impossible rather than merely unlikely. url_len below is the thin adapter
  * onto it. */
 static size_t url_len(rt_ctx *c, size_t i, size_t e) {
-    return oc_url_len(c->b, e, i);
+    size_t L = oc_url_len(c->b, e, i);
+    return L ? L : oc_url_permalink_len(c->b, e, i);   /* and an OpenChime permalink */
 }
 
 /* A labelled link `[label](https://address)` opening at `i` and ending before
@@ -910,6 +912,114 @@ char *oc_rt_spoilers_covered(const char *body, size_t len) {
     return out;
 }
 
+/* Every spoiler in `body`, however many: a malloc'd list in *out, or NULL with
+ * none (or no memory, which *nomem says). */
+static size_t all_spoilers(const char *body, size_t len, oc_rt_spoiler **out, int *nomem) {
+    size_t n = oc_rt_spoilers(body, len, NULL, 0);
+    *out = NULL;
+    if (nomem) *nomem = 0;
+    if (!n) return 0;
+    *out = malloc(n * sizeof **out);
+    if (!*out) { if (nomem) *nomem = 1; return 0; }
+    return oc_rt_spoilers(body, len, *out, n);
+}
+
+size_t oc_rt_unspoiled(const char *body, size_t len, char *out, size_t cap) {
+    oc_rt_spoiler *sp;
+    size_t n, i = 0, o = 0;
+    int nomem;
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    if (!body) return 0;
+    n = all_spoilers(body, len, &sp, &nomem);
+    /* Short of memory, nothing rather than something hidden. */
+    if (nomem) return 0;
+    for (size_t k = 0; k <= n && o + 1 < cap; k++) {
+        size_t upto = k < n ? sp[k].hidden : len, m = upto > i ? upto - i : 0;
+        if (m > cap - 1 - o) m = cap - 1 - o;
+        memcpy(out + o, body + i, m);
+        o += m;
+        if (k < n) i = sp[k].hidden + sp[k].hidden_len;
+    }
+    free(sp);
+    /* Never end inside a character. */
+    {
+        size_t j = o, want;
+        unsigned char lead;
+        while (j > 0 && ((unsigned char)out[j - 1] & 0xC0) == 0x80) j--;
+        if (j > 0) {
+            lead = (unsigned char)out[j - 1];
+            want = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+            if (o - (j - 1) < want) o = j - 1;
+        }
+    }
+    out[o] = '\0';
+    return o;
+}
+
+int oc_rt_in_spoiler(const char *body, size_t len, size_t offset) {
+    oc_rt_spoiler *sp;
+    size_t n;
+    int in = 0, nomem;
+    if (!body || offset >= len) return 0;
+    n = all_spoilers(body, len, &sp, &nomem);
+    if (nomem) return 1;   /* cannot tell: treat as hidden, the side that shows less */
+    for (size_t k = 0; k < n && !in; k++)
+        in = offset >= sp[k].hidden && offset < sp[k].hidden + sp[k].hidden_len;
+    free(sp);
+    return in;
+}
+
+size_t oc_rt_open_spoiler(const char *body, size_t len) {
+    oc_rt_spoiler *sv = NULL;
+    oc_rt_span *sp = NULL;
+    size_t nsv, ns, at = RT_NONE;
+    int nomem;
+    if (!body || len < 2 || !memchr(body, '>', len)) return RT_NONE;
+    nsv = all_spoilers(body, len, &sv, &nomem);
+    if (nomem) return RT_NONE;
+    ns = oc_rt_scan(body, len, NULL, 0);
+    if (ns) {
+        sp = malloc(ns * sizeof *sp);
+        if (!sp) { free(sv); return RT_NONE; }
+        ns = oc_rt_scan(body, len, sp, ns);
+    }
+    for (size_t i = 0; i + 1 < len && at == RT_NONE; i++) {
+        int skip = 0;
+        if (body[i] != '>' || body[i + 1] != '!') continue;
+        if (i && body[i - 1] == '\\') continue;                 /* written literally */
+        for (size_t k = 0; k < nsv && !skip; k++)
+            skip = i >= sv[k].start && i < sv[k].start + sv[k].len;
+        for (size_t k = 0; k < ns && !skip; k++)
+            skip = (sp[k].style & (OC_RT_CODE | OC_RT_CODEBLOCK)) &&
+                   i >= sp[k].start && i < sp[k].start + sp[k].len;
+        if (!skip) at = i;
+    }
+    free(sp);
+    free(sv);
+    return at;
+}
+
+int oc_rt_keyword_match(const char *body, size_t len, const char *term,
+                        size_t *span_start, size_t *span_len) {
+    size_t from = 0, at = 0, n = 0;
+    if (!body || !term) return 0;
+    while (from < len && oc_keyword_match(body + from, len - from, term, &at, &n)) {
+        /* A match at the start of what is left: the byte before it decides the
+         * boundary oc_keyword_match could not see. */
+        unsigned char left = from && at == 0 ? (unsigned char)body[from - 1] : ' ';
+        int wordish = (left >= 'a' && left <= 'z') || (left >= 'A' && left <= 'Z') ||
+                      (left >= '0' && left <= '9') || left == '_';
+        if (!wordish && !oc_rt_in_spoiler(body, len, from + at)) {
+            if (span_start) *span_start = from + at;
+            if (span_len)   *span_len = n;
+            return 1;
+        }
+        from += at + 1;
+    }
+    return 0;
+}
+
 size_t oc_rt_visible_urls(const char *body, size_t len, oc_url_span *out, size_t max) {
     oc_url_span all[64];
     size_t n = oc_url_extract(body, len, all, 64), nh, w = 0;
@@ -1031,37 +1141,97 @@ size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, 
     return o;
 }
 
+/* Append the time tokens among `n` spans to the growing list *tk (count *nt,
+ * room *cap). 0 on no memory. */
+static int time_spans_add(const oc_rt_span *sp, size_t n, oc_rt_span **tk, size_t *nt, size_t *cap) {
+    for (size_t k = 0; k < n; k++) {
+        if (sp[k].style != OC_RT_TIME) continue;
+        if (*nt == *cap) {
+            size_t c = *cap ? *cap * 2 : 16;
+            oc_rt_span *g = realloc(*tk, c * sizeof *g);
+            if (!g) return 0;
+            *tk = g; *cap = c;
+        }
+        (*tk)[(*nt)++] = sp[k];
+    }
+    return 1;
+}
+
+/* The time tokens in `body`'s table cells, which oc_rt_scan reports a table
+ * round as one span, appended to *tk. 0 on no memory. */
+static int cell_time_spans(const char *body, size_t len, oc_rt_span **tk, size_t *nt, size_t *cap) {
+    size_t ntab = oc_rt_tables(body, len, NULL, 0);
+    oc_rt_table *t;
+    int ok = 1;
+    if (!ntab) return 1;
+    t = malloc(ntab * sizeof *t);
+    if (!t) return 0;
+    ntab = oc_rt_tables(body, len, t, ntab);
+    for (size_t q = 0; q < ntab && ok; q++) {
+        oc_rt_rowit it;
+        oc_rt_cell cells[OC_RT_TABLE_MAX_COLS];
+        uint32_t row;
+        oc_rt_rows_begin(&it, body, len, &t[q]);
+        while (ok && oc_rt_row_next(&it, cells, &row)) {
+            for (uint8_t c = 0; c < t[q].cols && ok; c++) {
+                size_t n;
+                oc_rt_span *cs;
+                if (!cells[c].len || !memchr(body + cells[c].start, '<', cells[c].len)) continue;
+                n = oc_rt_scan_cell(body, cells[c].start, cells[c].len, NULL, 0);
+                if (!n) continue;
+                cs = malloc(n * sizeof *cs);
+                if (!cs) { ok = 0; break; }
+                n = oc_rt_scan_cell(body, cells[c].start, cells[c].len, cs, n);
+                ok = time_spans_add(cs, n, tk, nt, cap);
+                free(cs);
+            }
+        }
+    }
+    free(t);
+    return ok;
+}
+
 char *oc_rt_local_times(const char *body, size_t len, const oc_rt_clock *clock) {
-    oc_rt_span sps[OC_RT_MAX], *sp = sps;
-    size_t ns, k, i = 0, o = 0, cap;
+    oc_rt_span *sp = NULL, *tk = NULL;
+    size_t ns, nt = 0, tcap = 0, k, i = 0, o = 0, cap;
     char *out;
     if (!body || !memchr(body, '<', len)) return NULL;
-    ns = oc_rt_scan(body, len, sps, OC_RT_MAX);
-    if (ns > OC_RT_MAX) {
-        /* Every token, however many spans there are; short of memory, those
-         * in the first OC_RT_MAX, and the rest as typed. */
-        oc_rt_span *all = malloc(ns * sizeof *all);
-        if (all) { sp = all; ns = oc_rt_scan(body, len, sp, ns); }
-        else ns = OC_RT_MAX;
+    /* Every token, however many spans there are, those in a table's cells too
+     * (MARKDOWN.md §1c); short of memory, the body as typed. */
+    ns = oc_rt_scan(body, len, NULL, 0);
+    if (ns) {
+        sp = malloc(ns * sizeof *sp);
+        if (!sp) return NULL;
+        ns = oc_rt_scan(body, len, sp, ns);
     }
-    for (k = 0; k < ns && sp[k].style != OC_RT_TIME; k++) {}
-    if (k == ns) { if (sp != sps) free(sp); return NULL; }
+    if (!time_spans_add(sp, ns, &tk, &nt, &tcap) || !cell_time_spans(body, len, &tk, &nt, &tcap)) {
+        free(sp); free(tk); return NULL;
+    }
+    free(sp);
+    if (!nt) { free(tk); return NULL; }
+    /* In the order they are in the body: those in cells came after the rest. */
+    for (k = 1; k < nt; k++) {
+        oc_rt_span x = tk[k];
+        size_t q = k;
+        while (q > 0 && tk[q - 1].start > x.start) { tk[q] = tk[q - 1]; q--; }
+        tk[q] = x;
+    }
     /* A token is at least 24 bytes and its text at most 40: room for each to grow. */
-    cap = len + ns * 48 + 1;
+    cap = len + nt * 48 + 1;
     out = malloc(cap);
-    if (!out) { if (sp != sps) free(sp); return NULL; }
-    for (k = 0; k < ns; k++) {
+    if (!out) { free(tk); return NULL; }
+    for (k = 0; k < nt; k++) {
         int64_t ms;
-        if (sp[k].style != OC_RT_TIME || !oc_rt_time_value(body, len, &sp[k], &ms)) continue;
-        memcpy(out + o, body + i, sp[k].start - i);
-        o += sp[k].start - i;
+        if (tk[k].start < i || !oc_rt_time_value(body, len, &tk[k], &ms)) continue;
+        memcpy(out + o, body + i, tk[k].start - i);
+        o += tk[k].start - i;
         o += oc_rt_time_text(ms, clock, OC_RT_TIME_SHORT, out + o, cap - o);
-        i = sp[k].start + sp[k].len;
+        i = tk[k].start + tk[k].len;
     }
     memcpy(out + o, body + i, len - i);
     o += len - i;
     out[o] = '\0';
-    if (sp != sps) free(sp);
+    free(tk);
     return out;
 }
 
@@ -1080,7 +1250,214 @@ int oc_rt_target(const char *body, size_t len, const oc_rt_span *span,
     o = span->start + span->len + 2;                  /* past "](" */
     if (o > len || body[o - 2] != ']' || body[o - 1] != '(') return 0;
     L = oc_url_len(body, len, o);
+    if (!L) L = oc_url_permalink_len(body, len, o);
     if (!L) return 0;
     *off = o; *tlen = L;
     return 1;
+}
+
+/* --- the snippet lexer (lexer.h, REQ-226) --------------------------------- */
+
+#include "lexer.h"
+
+typedef struct {
+    const char *name, *label;
+    const char *line1;                /* a line comment ("" none) */
+    const char *bopen, *bclose;       /* a block comment ("" none) */
+    const char *quotes;               /* the characters a string opens with */
+    int         triple;               /* Python's """ and ''' */
+    int         nocase;               /* SQL's keywords in any case */
+    int         hash_word;            /* '#' starts a comment only at a word's start */
+    const char *const *kw;
+} lex_lang;
+
+static const char *const KW_C[] = { "auto","break","case","char","const","continue","default","do",
+    "double","else","enum","extern","float","for","goto","if","inline","int","long","register",
+    "restrict","return","short","signed","sizeof","static","struct","switch","typedef","union",
+    "unsigned","void","volatile","while","bool","true","false","NULL","#include","#define",
+    "#if","#ifdef","#ifndef","#endif","#else","#elif","#pragma", NULL };
+static const char *const KW_PY[] = { "False","None","True","and","as","assert","async","await",
+    "break","class","continue","def","del","elif","else","except","finally","for","from","global",
+    "if","import","in","is","lambda","nonlocal","not","or","pass","raise","return","try","while",
+    "with","yield","self", NULL };
+static const char *const KW_JS[] = { "await","break","case","catch","class","const","continue",
+    "debugger","default","delete","do","else","export","extends","false","finally","for","function",
+    "if","import","in","instanceof","let","new","null","of","return","super","switch","this","throw",
+    "true","try","typeof","undefined","var","void","while","with","yield","async","static", NULL };
+static const char *const KW_SH[] = { "if","then","else","elif","fi","case","esac","for","while",
+    "until","do","done","in","function","return","exit","export","local","readonly","set","unset",
+    "echo","cd","source","true","false", NULL };
+static const char *const KW_JSON[] = { "true","false","null", NULL };
+static const char *const KW_YAML[] = { "true","false","null","yes","no","on","off", NULL };
+static const char *const KW_SQL[] = { "select","from","where","insert","into","values","update",
+    "set","delete","create","table","index","view","drop","alter","add","column","primary","key",
+    "foreign","references","join","left","right","inner","outer","on","and","or","not","null","is",
+    "in","as","order","by","group","having","limit","offset","union","all","distinct","case","when",
+    "then","else","end","exists","begin","commit","rollback","with","default","unique","like", NULL };
+static const char *const KW_GO[] = { "break","case","chan","const","continue","default","defer",
+    "else","fallthrough","for","func","go","goto","if","import","interface","map","package","range",
+    "return","select","struct","switch","type","var","true","false","nil","iota", NULL };
+
+static const lex_lang LEX_LANGS[OC_LANG_COUNT] = {
+    [OC_LANG_NONE]   = { "",           "Plain text", "",   "",   "",   "",     0, 0, 0, NULL },
+    [OC_LANG_C]      = { "c",          "C",          "//", "/*", "*/", "\"'",  0, 0, 0, KW_C },
+    [OC_LANG_PYTHON] = { "python",     "Python",     "#",  "",   "",   "\"'",  1, 0, 0, KW_PY },
+    [OC_LANG_JS]     = { "javascript", "JavaScript", "//", "/*", "*/", "\"'`", 0, 0, 0, KW_JS },
+    [OC_LANG_SHELL]  = { "shell",      "Shell",      "#",  "",   "",   "\"'",  0, 0, 1, KW_SH },
+    [OC_LANG_JSON]   = { "json",       "JSON",       "",   "",   "",   "\"",   0, 0, 0, KW_JSON },
+    [OC_LANG_YAML]   = { "yaml",       "YAML",       "#",  "",   "",   "\"'",  0, 0, 1, KW_YAML },
+    [OC_LANG_SQL]    = { "sql",        "SQL",        "--", "/*", "*/", "'\"",  0, 1, 0, KW_SQL },
+    [OC_LANG_GO]     = { "go",         "Go",         "//", "/*", "*/", "\"'`", 0, 0, 0, KW_GO },
+};
+
+static int lex_ieq(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        char x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = (char)(y - 'A' + 'a');
+        if (x != y) return 0;
+    }
+    return *a == *b;
+}
+
+int oc_lex_language(const char *name) {
+    static const struct { const char *alias; int lang; } AL[] = {
+        { "h", OC_LANG_C }, { "py", OC_LANG_PYTHON }, { "python3", OC_LANG_PYTHON },
+        { "js", OC_LANG_JS }, { "ts", OC_LANG_JS }, { "typescript", OC_LANG_JS },
+        { "sh", OC_LANG_SHELL }, { "bash", OC_LANG_SHELL }, { "zsh", OC_LANG_SHELL },
+        { "yml", OC_LANG_YAML }, { "golang", OC_LANG_GO },
+    };
+    if (!name || !name[0]) return OC_LANG_NONE;
+    for (int i = 1; i < OC_LANG_COUNT; i++) if (lex_ieq(name, LEX_LANGS[i].name)) return i;
+    for (size_t i = 0; i < sizeof AL / sizeof AL[0]; i++) if (lex_ieq(name, AL[i].alias)) return AL[i].lang;
+    return OC_LANG_NONE;
+}
+
+const char *oc_lex_name(int lang)  { return (lang > 0 && lang < OC_LANG_COUNT) ? LEX_LANGS[lang].name : ""; }
+const char *oc_lex_label(int lang) { return LEX_LANGS[(lang > 0 && lang < OC_LANG_COUNT) ? lang : 0].label; }
+
+static int lex_word(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+           (unsigned char)c >= 0x80;
+}
+static int lex_at(const char *s, size_t n, size_t i, const char *m) {
+    size_t k = strlen(m);
+    return k && i + k <= n && memcmp(s + i, m, k) == 0;
+}
+
+size_t oc_lex(int lang, const char *s, size_t n, oc_lex_tok *out, size_t cap) {
+    if (lang <= 0 || lang >= OC_LANG_COUNT || !s || !out || !cap) return 0;
+    const lex_lang *L = &LEX_LANGS[lang];
+    size_t nt = 0, i = 0;
+#define LEX_EMIT(st, ln, kd) do { if (nt == cap) return nt; \
+        out[nt].start = (uint32_t)(st); out[nt].len = (uint32_t)(ln); out[nt].kind = (uint8_t)(kd); nt++; } while (0)
+    while (i < n) {
+        char c = s[i];
+        int word_start = i == 0 || !lex_word(s[i - 1]);
+        if (lex_at(s, n, i, L->bopen)) {                       /* a block comment */
+            size_t j = i + strlen(L->bopen);
+            while (j < n && !lex_at(s, n, j, L->bclose)) j++;
+            j = j < n ? j + strlen(L->bclose) : n;
+            LEX_EMIT(i, j - i, OC_LEX_COMMENT); i = j; continue;
+        }
+        if (lex_at(s, n, i, L->line1) &&                       /* a line comment */
+            !(L->hash_word && i > 0 && s[i - 1] != ' ' && s[i - 1] != '\t' && s[i - 1] != '\n')) {
+            size_t j = i;
+            while (j < n && s[j] != '\n') j++;
+            LEX_EMIT(i, j - i, OC_LEX_COMMENT); i = j; continue;
+        }
+        if (c && strchr(L->quotes, c)) {                       /* a string */
+            size_t j;
+            if (L->triple && i + 2 < n && s[i + 1] == c && s[i + 2] == c) {
+                j = i + 3;
+                while (j + 2 < n && !(s[j] == c && s[j + 1] == c && s[j + 2] == c)) j++;
+                j = j + 2 < n ? j + 3 : n;
+            } else {
+                j = i + 1;
+                while (j < n && s[j] != c) {
+                    if (s[j] == '\\' && c != '`' && j + 1 < n) j++;
+                    else if (s[j] == '\n' && c != '`') break;   /* unclosed: to the line's end */
+                    j++;
+                }
+                if (j < n && s[j] == c) j++;
+            }
+            LEX_EMIT(i, j - i, OC_LEX_STRING); i = j; continue;
+        }
+        /* A number: a digit that does not continue a word; JSON's may be signed. */
+        if (word_start && ((c >= '0' && c <= '9') ||
+                           (c == '-' && lang == OC_LANG_JSON && i + 1 < n && s[i + 1] >= '0' && s[i + 1] <= '9'))) {
+            size_t j = i + 1;
+            while (j < n && (lex_word(s[j]) || s[j] == '.' ||
+                             ((s[j] == '+' || s[j] == '-') && (s[j - 1] == 'e' || s[j - 1] == 'E')))) j++;
+            LEX_EMIT(i, j - i, OC_LEX_NUMBER); i = j; continue;
+        }
+        /* A word, coloured when it is a keyword. A C directive's '#' is part of it. */
+        if (word_start && (lex_word(c) || (c == '#' && lang == OC_LANG_C))) {
+            size_t j = i + 1;
+            while (j < n && lex_word(s[j])) j++;
+            char w[24];
+            size_t wl = j - i;
+            if (L->kw && wl < sizeof w) {
+                memcpy(w, s + i, wl); w[wl] = '\0';
+                for (const char *const *k = L->kw; *k; k++)
+                    if (L->nocase ? lex_ieq(w, *k) : strcmp(w, *k) == 0) { LEX_EMIT(i, wl, OC_LEX_KEYWORD); break; }
+            }
+            i = j; continue;
+        }
+        i++;
+    }
+#undef LEX_EMIT
+    return nt;
+}
+
+/* --- to-do lists (todo.h) -------------------------------------------------- */
+
+#include "todo.h"
+
+int oc_todo_blank(const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) if (s[i] != ' ' && s[i] != '\t' && s[i] != '\r') return 0;
+    return 1;
+}
+
+/* [a, b) trimmed of spaces, tabs and a CR. */
+static oc_todo_span todo_trim(const char *s, size_t a, size_t b) {
+    while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r')) a++;
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r')) b--;
+    oc_todo_span sp = { (uint32_t)a, (uint32_t)(b - a) };
+    return sp;
+}
+
+int oc_todo_parse(const char *body, size_t n, oc_todo_parsed *out) {
+    if (!body || !out || n < 5 || memcmp(body, "/todo", 5) != 0) return OC_TODO_NONE;
+    if (n > 5 && body[5] != ' ' && body[5] != '\t' && body[5] != '\n' && body[5] != '\r') return OC_TODO_NONE;
+    memset(out, 0, sizeof *out);
+    size_t e = 5;
+    while (e < n && body[e] != '\n') e++;
+    out->title = todo_trim(body, 5, e);
+    if (out->title.len == 0 || out->title.len > OC_TODO_TITLE_MAX) return OC_TODO_BAD;
+    size_t i = e < n ? e + 1 : n;
+    while (i < n) {
+        size_t le = i;
+        while (le < n && body[le] != '\n') le++;
+        oc_todo_span line = todo_trim(body, i, le);
+        size_t a = line.off, b = line.off + line.len;
+        if (a < b && (body[a] == '-' || body[a] == '*')) { line = todo_trim(body, a + 1, b); a = line.off; }
+        if (line.len) {
+            if (out->n_tasks == OC_TODO_MAX_TASKS) return OC_TODO_BAD;
+            size_t colon = a;
+            while (colon + 1 < b && !(body[colon] == ':' && body[colon + 1] == ' ')) colon++;
+            oc_todo_span nm, ds = { 0, 0 };
+            if (colon + 1 < b) { nm = todo_trim(body, a, colon); ds = todo_trim(body, colon + 2, b); }
+            else nm = todo_trim(body, a, b);
+            if (nm.len == 0 || nm.len > OC_TODO_NAME_MAX || ds.len > OC_TODO_DESC_MAX) return OC_TODO_BAD;
+            for (uint16_t k = 0; k < out->n_tasks; k++)
+                if (out->name[k].len == nm.len && memcmp(body + out->name[k].off, body + nm.off, nm.len) == 0)
+                    return OC_TODO_DUP;
+            out->name[out->n_tasks] = nm;
+            out->desc[out->n_tasks] = ds;
+            out->n_tasks++;
+        }
+        i = le + 1;
+    }
+    return OC_TODO_OK;
 }

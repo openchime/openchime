@@ -14,6 +14,7 @@
 #include "store.h"       /* to assert the persisted token/pin */
 #include "resolve.h"     /* workspace resolution (REQ-010/011) */
 #include "wellknown.h"   /* the optional `.well-known` half of REQ-010 */
+#include "releasenotes.h" /* What's new: the release notes for a build */
 #include "complete.h"    /* who the New message pane may address (REQ-229) */
 
 #include "netloop.h"
@@ -440,6 +441,39 @@ static int caps_fold(oc_model *m, const char *names) {
     oc_model_apply(m, &e);
     free(e.body);
     return oc_model_tts_available(m);
+}
+
+/* A renamed custom emoji (REQ-072): the catalogue's old names resolve to the
+ * same image, so a message body or a reaction naming `:shipit:` still shows it
+ * after the emoji is called `:liftoff:`. Both go through oc_model_custom_emoji,
+ * the one lookup every surface uses for a shortcode. */
+static void emoji_ev(oc_model *m, const char *name, uint64_t aid, const char *aliases) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_EMOJI; e.message_id = aid; e.user_id = 2; e.created_at = 7;
+    e.body = strdup(name);
+    e.topic = aliases ? strdup(aliases) : NULL;
+    oc_model_apply(m, &e);
+    free(e.body); free(e.topic);
+}
+
+static void test_emoji_aliases(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev b; memset(&b, 0, sizeof b); b.type = OC_EV_EMOJI_BEGIN; oc_model_apply(&m, &b);
+    emoji_ev(&m, "liftoff", 11, "shipit launch");
+    emoji_ev(&m, "party", 12, NULL);
+    CHECK(m.n_cemoji == 2 && m.cemoji[0].n_aliases == 2 && m.cemoji[0].created_at == 7);
+    /* The name, and each old name, show the same image; another emoji's do not. */
+    CHECK(oc_model_custom_emoji(&m, "liftoff") == 11);
+    CHECK(oc_model_custom_emoji(&m, "shipit") == 11);   /* a message body's :shipit: */
+    CHECK(oc_model_custom_emoji(&m, "launch") == 11);   /* a reaction stored as :launch: */
+    CHECK(oc_model_custom_emoji(&m, "party") == 12);
+    CHECK(oc_model_custom_emoji(&m, "nothing") == 0);
+    /* A new catalogue replaces the old: a deleted emoji's old names go with it. */
+    oc_model_apply(&m, &b);
+    emoji_ev(&m, "party", 12, NULL);
+    CHECK(oc_model_custom_emoji(&m, "shipit") == 0);
+    oc_model_free(&m);
 }
 
 static void test_capabilities(void) {
@@ -1365,6 +1399,81 @@ static void test_group_dm_title(void) {
     oc_model_free(&m);
 }
 
+/* Out of office (REQ-122): in force from its start to just before its end,
+ * decided from the times, so it ends with nothing sent; and the composer's
+ * notice names the other person of a DM, or someone mentioned, while it holds. */
+static void ooo_user(oc_model *m, uint64_t uid, const char *name, uint64_t start, uint64_t end, const char *msg) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = uid; e.body = strdup(name);
+    e.ooo_start = start; e.ooo_end = end;
+    snprintf(e.ooo_message, sizeof e.ooo_message, "%s", msg);
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+static void test_out_of_office(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    ooo_user(&m, 1, "alice", 1000, 9000, "me, away");
+    ooo_user(&m, 2, "bob", 1000, 5000, "Back Monday");
+    ooo_user(&m, 3, "carol", 0, 0, "");
+
+    /* The boundaries: start counts, end does not. */
+    CHECK(oc_model_ooo_active(&m, 2, 999) == NULL);
+    CHECK(oc_model_ooo_active(&m, 2, 1000) != NULL);
+    CHECK(oc_model_ooo_active(&m, 2, 4999) != NULL);
+    CHECK(oc_model_ooo_active(&m, 2, 5000) == NULL);
+    CHECK(oc_model_ooo_active(&m, 3, 2000) == NULL);   /* none set */
+    CHECK(oc_model_ooo_active(&m, 99, 2000) == NULL);  /* nobody */
+    {
+        const oc_member *b = oc_model_ooo_active(&m, 2, 2000);
+        CHECK(b && strcmp(b->ooo_message, "Back Monday") == 0);
+        char lbl[96];
+        oc_model_ooo_label(b, lbl, sizeof lbl);
+        /* contract: the plan's own words, which both frontends show and cut at "until " */
+        CHECK(strncmp(lbl, "Out of office until ", 20) == 0);
+    }
+
+    /* A DM with bob, a DM with carol, and a channel. */
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 30; e.status = 1; e.op = OC_CHANNEL_KIND_DM; e.user_id = 2;
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 31; e.status = 1; e.op = OC_CHANNEL_KIND_DM; e.user_id = 3;
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 32; e.status = 1; e.op = OC_CHANNEL_KIND; e.is_public = 1;
+    e.body = strdup("general");
+    oc_model_apply(&m, &e);
+    free(e.body);
+
+    /* Writing to bob in your DM: said while he is away, not after. */
+    const oc_member *u = oc_model_ooo_for_compose(&m, 30, "", 2000);
+    CHECK(u && u->user_id == 2);
+    CHECK(oc_model_ooo_for_compose(&m, 30, "", 5000) == NULL);
+    /* Carol is in; a channel with no mention says nothing. */
+    CHECK(oc_model_ooo_for_compose(&m, 31, "hello", 2000) == NULL);
+    CHECK(oc_model_ooo_for_compose(&m, 32, "hello all", 2000) == NULL);
+    /* Mentioning bob, by name in any case or by id, anywhere. */
+    u = oc_model_ooo_for_compose(&m, 32, "can @Bob look at this", 2000);
+    CHECK(u && u->user_id == 2);
+    u = oc_model_ooo_for_compose(&m, 31, "ask <@U2> about it", 2000);
+    CHECK(u && u->user_id == 2);
+    /* Not a broadcast, not someone in, and never me. */
+    CHECK(oc_model_ooo_for_compose(&m, 32, "@here @carol", 2000) == NULL);
+    CHECK(oc_model_ooo_for_compose(&m, 32, "@alice note to self", 2000) == NULL);
+    /* An address is not a mention. */
+    CHECK(oc_model_ooo_for_compose(&m, 32, "mail bob@example.com", 2000) == NULL);
+
+    /* Cleared by a later row with no end. */
+    ooo_user(&m, 2, "bob", 0, 0, "");
+    CHECK(oc_model_ooo_active(&m, 2, 2000) == NULL);
+    CHECK(oc_model_ooo_for_compose(&m, 30, "", 2000) == NULL);
+    oc_model_free(&m);
+}
+
 /* A channel that appears AFTER the settings sync starts at the user's global
  * default (REQ-134), not at whatever zeroed memory means.
  *
@@ -1903,6 +2012,35 @@ static void test_broadcast_mentions_me(void) {
     oc_model_free(&m);
 }
 
+/* A mention or a keyword inside a spoiler counts for nothing; the same outside
+ * it, in the same message, still does (MARKDOWN.md §1d). */
+static void test_spoiler_mentions_me(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("ada"); oc_model_apply(&m, &e);
+    const char *hid[] = { "guess >!@ada!< now", "guess >!<@U1>!< now", ">!@channel!< standup",
+                          "```spoiler\n@ada and @everyone\n```" };
+    for (size_t i = 0; i < sizeof hid / sizeof hid[0]; i++) {
+        CHECK(oc_model_mentions_me(&m, hid[i], strlen(hid[i])) == 0);
+        CHECK(oc_model_mentions_me_in(&m, 1, hid[i], strlen(hid[i])) == 0);
+    }
+    const char *seen = ">!@ada!< and @ada";
+    CHECK(oc_model_mentions_me(&m, seen, strlen(seen)) == 1);
+    CHECK(oc_model_mentions_me_in(&m, 0, seen, strlen(seen)) == 1);
+    const char *bc = ">!@ada!< and @channel";
+    CHECK(oc_model_mentions_me(&m, bc, strlen(bc)) == 1);         /* any broadcast, as before */
+    CHECK(oc_model_mentions_me_in(&m, 1, bc, strlen(bc)) == 1);
+    CHECK(oc_model_mentions_me_in(&m, 0, bc, strlen(bc)) == 0);
+
+    snprintf(m.kw_terms[0], sizeof m.kw_terms[0], "%s", "deploy");
+    m.n_kw_terms = 1;
+    size_t at = 0, n = 0;
+    CHECK(oc_model_keyword_hit(&m, "only >!deploy!<", 15, &at, &n) == 0);
+    CHECK(oc_model_keyword_hit(&m, ">!deploy!< and deploy", 21, &at, &n) == 1 && at == 15 && n == 6);
+    oc_model_free(&m);
+}
+
 /* The id form (<@U42>) mentions the reader whose id it is, whatever its label,
  * and shows as the roster's name (REQ-221, ARCH-89). */
 static void test_id_mentions(void) {
@@ -1958,6 +2096,41 @@ static int bc_counts(oc_model *m, uint64_t mid) {
     const oc_msg *x = bc_find(m, mid);
     return x && x->body && oc_model_mentions_me_in(m, x->broadcast_stored, x->body, strlen(x->body));
 }
+/* A muted person (MUTED_USERS): the list folds into the model, and their
+ * messages -- a mention of me included -- count as unread for nothing here,
+ * while the same from someone else still does. Unmuting puts them back. */
+static void test_muted_people_model(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("ada"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 40; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("room"); oc_model_apply(&m, &e);
+
+    /* bob muted: the event carries the whole list, and the model takes it. */
+    uint32_t seq0 = m.muted_seq;
+    memset(&e, 0, sizeof e); e.type = OC_EV_MUTED_USERS;
+    e.ids = calloc(1, sizeof *e.ids); e.ids[0] = 2; e.n_ids = 1;
+    oc_model_apply(&m, &e);
+    free(e.ids);
+    CHECK(oc_model_is_muted_user(&m, 2) && !oc_model_is_muted_user(&m, 1) && m.muted_seq != seq0);
+
+    bc_message(&m, 200, "hello there", 0);
+    bc_message(&m, 201, "@ada look at this", 0);
+    const oc_channel *c = oc_model_channel(&m, 40);
+    CHECK(c && c->unread == 0 && c->priority_unread == 0);
+
+    /* Unmuted: the next message from bob counts again, the mention as priority. */
+    memset(&e, 0, sizeof e); e.type = OC_EV_MUTED_USERS; e.ids = NULL; e.n_ids = 0;
+    oc_model_apply(&m, &e);
+    CHECK(!oc_model_is_muted_user(&m, 2));
+    bc_message(&m, 202, "@ada again", 0);
+    c = oc_model_channel(&m, 40);
+    CHECK(c && c->unread == 1 && c->priority_unread == 1);
+    oc_model_free(&m);
+}
+
 static void test_broadcast_stored_model(void) {
     oc_model m; oc_model_init(&m);
     m.user_id = 1;
@@ -2735,6 +2908,64 @@ static void test_sidebar(void) {
  * where the distinction lives: a document that is absent, or served by something
  * that is not a workspace, is "no metadata"; one that is present and wrong is a
  * failure with its own name. */
+/* What's new: the control plane's notes for a build, read from its answer --
+ * every refusal leaving nothing half-read. */
+static void test_releasenotes(void) {
+    static oc_releasenotes rn;
+    const char *ok =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+        "{\"release\":16,\"build_id\":\"abc1234\",\"published_at\":\"2026-11-11T09:30:00+00:00\","
+        "\"sections\":[{\"title\":\"New\",\"items\":[{\"title\":\"Calls show how they work\","
+        "\"url\":\"https://openchime.io/docs/calls\"},{\"title\":\"Caf\\u00e9 \\\"quoted\\\"\","
+        "\"url\":\"javascript:alert(1)\"}]},{\"title\":\"Fixed\",\"items\":[{\"title\":\"A fix\",\"url\":\"\"}]}]}";
+    CHECK(oc_releasenotes_read_response(ok, strlen(ok), &rn) == OC_RN_OK);
+    CHECK(rn.release == 16 && rn.n_sections == 2);
+    /* contract: the date as published, the titles as the control plane wrote them */
+    CHECK(strcmp(rn.date, "2026-11-11") == 0);
+    CHECK(rn.sections[0].n_items == 2 && rn.sections[1].n_items == 1);
+    /* contract: the control plane's section and item titles, unescaped */
+    CHECK(strcmp(rn.sections[0].title, "New") == 0 && strcmp(rn.sections[0].items[1].title, "Caf\xC3\xA9 \"quoted\"") == 0);
+    CHECK(strncmp(rn.sections[0].items[0].url, "https://", 8) == 0);
+    CHECK(rn.sections[0].items[1].url[0] == '\0');                 /* not https: no link */
+
+    const char *nf = "HTTP/1.1 404 Not Found\r\n\r\n{\"error\":\"not found\"}";
+    CHECK(oc_releasenotes_read_response(nf, strlen(nf), &rn) == OC_RN_NOT_RELEASE && rn.n_sections == 0);
+    const char *err = "HTTP/1.1 500 Internal\r\n\r\noops";
+    CHECK(oc_releasenotes_read_response(err, strlen(err), &rn) == OC_RN_FAILED);
+    const char *cut = "HTTP/1.1 200 OK\r\n\r\n{\"release\":16,\"sections\":[{\"title\":\"New\",\"it";
+    CHECK(oc_releasenotes_read_response(cut, strlen(cut), &rn) == OC_RN_FAILED && rn.n_sections == 0);
+    const char *wrong = "HTTP/1.1 200 OK\r\n\r\n{\"release\":\"sixteen\",\"sections\":[]}";
+    CHECK(oc_releasenotes_read_response(wrong, strlen(wrong), &rn) == OC_RN_FAILED);
+    const char *noheads = "HTTP/1.1 200 OK\r\nContent-Type: application/json";
+    CHECK(oc_releasenotes_read_response(noheads, strlen(noheads), &rn) == OC_RN_FAILED);
+    CHECK(oc_releasenotes_read_response("garbage", 7, &rn) == OC_RN_FAILED);
+    /* More items than the room holds: refused, never read past the room. */
+    {
+        static char big[64 * 1024];
+        int o = snprintf(big, sizeof big, "{\"release\":3,\"sections\":[{\"title\":\"New\",\"items\":[");
+        for (int i = 0; i < OC_RN_ITEMS + 5; i++)
+            o += snprintf(big + o, sizeof big - (size_t)o, "%s{\"title\":\"t%d\"}", i ? "," : "", i);
+        o += snprintf(big + o, sizeof big - (size_t)o, "]}]}");
+        CHECK(oc_releasenotes_read(200, big, (size_t)o, &rn) == OC_RN_FAILED && rn.n_sections == 0);
+    }
+    /* A title past its room: refused rather than cut. */
+    {
+        static char longt[OC_RN_TEXT + 200];
+        int o = snprintf(longt, sizeof longt, "{\"release\":3,\"sections\":[{\"title\":\"");
+        memset(longt + o, 'a', OC_RN_TEXT + 10);
+        o += OC_RN_TEXT + 10;
+        o += snprintf(longt + o, sizeof longt - (size_t)o, "\",\"items\":[]}]}");
+        CHECK(oc_releasenotes_read(200, longt, (size_t)o, &rn) == OC_RN_FAILED);
+    }
+    /* A browser's answer: status and body apart. */
+    const char *body = "{\"release\":2,\"sections\":[]}";
+    CHECK(oc_releasenotes_read(200, body, strlen(body), &rn) == OC_RN_OK && rn.release == 2 && rn.n_sections == 0);
+    CHECK(oc_releasenotes_read(0, "", 0, &rn) == OC_RN_FAILED);
+    /* Which builds are asked about: never a source build. */
+    CHECK(!oc_releasenotes_askable("dev") && !oc_releasenotes_askable("") && !oc_releasenotes_askable("a/b"));
+    CHECK(oc_releasenotes_askable("abc1234"));
+}
+
 static void test_wellknown_parse(void) {
     oc_wellknown wk;
 
@@ -3156,6 +3387,42 @@ static void test_store_no_persistence_without_keyring(void) {
     oc_store_close(s);
 }
 
+/* The audience id kept beside a book entry (WORKSPACE_INFO): an email link finds
+ * the workspace it means among those this device knows, and no other. */
+static void test_workspace_audience(void) {
+    mock_reset();
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open(tpath("itest_core_audience"));
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &sec);
+    char ws[256];
+
+    /* Not kept for a workspace the book does not have. */
+    oc_store_workspace_note_audience(s, "acme:443", "ws_acme000000");
+    CHECK(!oc_store_workspace_by_audience(s, "ws_acme000000", ws, sizeof ws));
+
+    oc_store_workspace_remember(s, "acme:443",   "acme.example.com",   "dana", 1000);
+    oc_store_workspace_remember(s, "globex:443", "globex.example.com", "dana", 2000);
+    oc_store_workspace_note_audience(s, "acme:443", "ws_acme000000");
+    oc_store_workspace_note_audience(s, "globex:443", "ws_globex0000");
+    CHECK(oc_store_workspace_by_audience(s, "ws_acme000000", ws, sizeof ws) && !strcmp(ws, "acme:443"));
+    CHECK(oc_store_workspace_by_audience(s, "ws_globex0000", ws, sizeof ws) && !strcmp(ws, "globex:443"));
+    CHECK(!oc_store_workspace_by_audience(s, "ws_initech000", ws, sizeof ws));
+
+    /* Re-signing in keeps it; clearing it ("" -- the workspace left the services)
+     * stops the link finding it. */
+    oc_store_workspace_remember(s, "acme:443", NULL, NULL, 3000);
+    CHECK(oc_store_workspace_by_audience(s, "ws_acme000000", ws, sizeof ws) && !strcmp(ws, "acme:443"));
+    oc_store_workspace_note_audience(s, "acme:443", "");
+    CHECK(!oc_store_workspace_by_audience(s, "ws_acme000000", ws, sizeof ws));
+
+    /* Forgetting the workspace forgets its audience with it. */
+    oc_store_workspace_forget(s, "globex:443");
+    CHECK(!oc_store_workspace_by_audience(s, "ws_globex0000", ws, sizeof ws));
+    oc_store_close(s);
+}
+
 static void test_workspace_book(void) {
     /* The book IS the credential store's contents now (one entry per workspace),
      * so it needs the keyring attached from the start. */
@@ -3294,7 +3561,7 @@ static void test_store_legacy_entry(void) {
 
     /* The next write of anything upgrades the entry in place, keeping the rest. */
     oc_store_save_pin(s, "acme:443", pin);
-    CHECK(mock_len_of("acme:443") > (size_t)V1_BLOB && mock_ver_of("acme:443") == 4);
+    CHECK(mock_len_of("acme:443") > (size_t)V1_BLOB && mock_ver_of("acme:443") == 5);
     CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1 && tok[0] == 1);
     memset(&b, 0, sizeof b);
     oc_store_workspace_each(s, book_cb, &b);
@@ -3581,6 +3848,22 @@ static void test_thread_notices(void) {
         oc_model_close_thread(&m);
         feed_reply(&m, 1, 2, 1, "live after a closed thread");
         CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 1);
+        oc_model_free(&m);
+    }
+    {   /* Every thread in the conversation followed (REQ-282): the daemon's
+         * participation byte carries it, so a thread never written in toasts,
+         * and the conversation's mute still silences it, as the push does. */
+        oc_model m; notice_fixture(&m);
+        oc_channel *c = oc_model_channel(&m, 10);
+        CHECK(c != NULL);
+        if (c) {
+            c->follow_threads = 1;
+            feed_reply(&m, 1, 2, 1, "a thread never written in");
+            CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 1);
+            c->muted = 1;
+            feed_reply(&m, 2, 2, 1, "and muted");
+            CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 0);
+        }
         oc_model_free(&m);
     }
     {   /* Taking DRAINS: a reply is considered once, whatever the verdict, or a
@@ -4011,6 +4294,12 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     oc_client_call_share(a, 1, 1);
     CHECK(CALL_WAIT(3000, ma->call.sharer == ua && mb->call.sharer == ua));
     CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 2; })));
+    /* Ten frames, with no gap of six seconds. This once counted ten frames
+     * within six seconds of the start, and failed once that way on a loaded
+     * machine: a real-time source at 5 fps needs two seconds for ten frames
+     * after an encoder that can be slow to start, so the window measured the
+     * machine, not the share. Nothing was lost; a first keyframe that is lost
+     * is asked for again (tests/test_share_media.c, test_first_keyframe_lost). */
     CHECK(share_frames(a, b, c, eb, &wb, 10, 6000));
     CHECK(wb.f.width == 1280 && wb.f.height == 800 && wb.rising && wb.bad == 0);
     oc_call_engine_stats(ea, &st);
@@ -4625,7 +4914,7 @@ static void test_device_key(void) {
     CHECK(oc_x25519_public(sk, pkc) == 0 && memcmp(pkc, pk, 32) == 0);
     CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1);
     CHECK(memcmp(sk, sk2, 32) == 0 && memcmp(pk, pk2, 32) == 0);
-    CHECK(mock_ver_of("acme:443") == 4);
+    CHECK(mock_ver_of("acme:443") == 5);
 
     /* The people of private DMs (PRIVATE-DM.md §5): the first key is remembered,
      * the same is known, a different one is reported and changes nothing until
@@ -5776,7 +6065,7 @@ static void test_browser_signin(void) {
  * it unpaired; an ACTION for something not held stands on its own. */
 static size_t frame_of_broadcast(uint8_t *buf, size_t cap, uint64_t mid, const char *body, int with_file) {
     oc_wbuf w; oc_wbuf_init(&w, buf, cap);
-    oc_broadcast b = { mid, 1, 42, 1000, OC_MSG_KIND_MESSAGE, oc_slice_str(body), 0, {{0}}, {0}, 0 };
+    oc_broadcast b = { mid, 1, 42, 1000, OC_MSG_KIND_MESSAGE, oc_slice_str(body), 0, {{0}}, {0}, 0, 0 };
     if (with_file) {
         b.n_attach = 1;
         b.attach[0].id = 9;
@@ -5855,6 +6144,23 @@ static void test_thread_meta_live(void) {
 
     oc_net_frames_free(f);
     oc_model_free(&m);
+}
+
+/* A paste is offered as a snippet (REQ-226) past 40 lines or 4 KiB, and not
+ * past 1 MiB, which no snippet can hold. A trailing newline is not a line. */
+static void test_snippet_offer(void) {
+    static char buf[OC_SNIPPET_MAX_SIZE + 2];
+    size_t n = 0;
+    for (int i = 0; i < 40; i++) n += (size_t)snprintf(buf + n, sizeof buf - n, "line %d\n", i);
+    CHECK(!oc_snippet_offer(buf, n));                      /* 40 lines, the last newline-ended */
+    n += (size_t)snprintf(buf + n, sizeof buf - n, "one more");
+    CHECK(oc_snippet_offer(buf, n));                       /* 41 */
+    memset(buf, 'a', 4096);
+    CHECK(!oc_snippet_offer(buf, 4096));
+    CHECK(oc_snippet_offer(buf, 4097));                    /* one line, but long */
+    memset(buf, 'a', sizeof buf);
+    CHECK(!oc_snippet_offer(buf, OC_SNIPPET_MAX_SIZE + 1));
+    CHECK(!oc_snippet_offer(NULL, 0) && !oc_snippet_offer("", 0));
 }
 
 static void test_action_pairing(void) {
@@ -5955,6 +6261,7 @@ int run_client_core_tests(void) {
     }
 
     test_group_dm_title();
+    test_snippet_offer();
     test_action_pairing();
     test_groups_model();
     test_chanmem_overlap();
@@ -5974,8 +6281,10 @@ int run_client_core_tests(void) {
     test_broadcast_check_dm();
     test_broadcast_mentions_me();
     test_id_mentions();
+    test_spoiler_mentions_me();
     test_thread_meta_live();
     test_broadcast_stored_model();
+    test_muted_people_model();
     test_workspace_sender_model();
     test_time_preview();
     test_spoiler_preview();
@@ -5986,6 +6295,7 @@ int run_client_core_tests(void) {
     test_thread_notices();
     test_unread_counts_what_notifies();
     test_capabilities();
+    test_emoji_aliases();
     test_server_build();
     test_deployment_name();
     test_invitation_text();
@@ -5998,6 +6308,7 @@ int run_client_core_tests(void) {
     test_resolve();
     test_resolve_literals();
     test_wellknown_parse();
+    test_releasenotes();
     test_last_error();
     test_xfer_table();
     test_workspace_key();
@@ -6007,6 +6318,7 @@ int run_client_core_tests(void) {
     test_secret_routing();
     test_store_no_persistence_without_keyring();
     test_workspace_book();
+    test_workspace_audience();
     test_session_owner();
     test_store_legacy_entry();
     test_device_key();
@@ -6224,9 +6536,14 @@ int run_client_core_tests(void) {
         /* erik signals typing in channel 1; dana sees erik (and only erik) typing
          * (the server relays to other members, so dana's own view excludes her). */
         uint64_t erik_id = oc_client_model(b)->user_id;
-        oc_client_typing(b, 1);
+        oc_client_typing(b, 1, 0);
         uint64_t typers[4];
-        CHECK(WAIT_FOR(a, oc_model_typing(m, 1, m->user_id, typers, 4) == 1));
+        CHECK(WAIT_FOR(a, oc_model_typing(m, 1, 0, m->user_id, typers, 4) == 1));
+        CHECK(typers[0] == erik_id);
+        /* In a thread (REQ-121): shown there, and no longer in the main scroll. */
+        oc_client_typing(b, 1, 4242);
+        CHECK(WAIT_FOR(a, oc_model_typing(m, 1, 4242, m->user_id, typers, 4) == 1 &&
+                          oc_model_typing(m, 1, 0, m->user_id, typers + 1, 3) == 0));
         CHECK(typers[0] == erik_id);
 
         /* erik reacts to dana's message: both see the aggregate (count 1), erik
@@ -7422,6 +7739,7 @@ int run_client_core_tests(void) {
     test_big_channel_list();
     test_published_fingerprint();
     test_cert_trust();
+    test_out_of_office();
     test_local_browser();
     test_device_client();
     oc_test_rmtree(g_dir);

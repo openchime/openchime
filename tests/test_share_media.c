@@ -223,6 +223,23 @@ static void test_pli_when_unrecoverable(void) {
     sim_free(&s);
 }
 
+static void test_first_keyframe_lost(void) {
+    /* The share's first keyframe lost whole on the way, and every resend of it:
+     * a viewer cannot show a delta without it, so it asks for a keyframe,
+     * gets one, and from there shows ten frames and more in a row, each what was
+     * sent. On the simulated clock the picture starts once the sharer may send
+     * another keyframe (one a second at most) and the request is in. */
+    sim s; sim_init(&s, 6);
+    s.drop_frame = 0; s.drop_frame_all = 1;
+    seen v;
+    run(&s, 60, 3000, &v);
+    CHECK(s.rx.plis >= 1 && s.tx.plis >= 1 && s.tx.keyframes >= 2);
+    CHECK(v.bad == 0 && v.order == 0 && v.after_skip_not_key == 0);
+    CHECK(v.got >= 10 && v.have_last && v.last == 59);
+    CHECK(v.first_at <= OC_SHARE_KEY_MIN_MS + OC_SHARE_PLI_MS);
+    sim_free(&s);
+}
+
 static void test_late_joiner(void) {
     /* The viewer arrives after 3 seconds of deltas: its first poll asks for a
      * keyframe, and it is watching within a second and a half. */
@@ -404,11 +421,12 @@ static void test_vp9_through_loss(void) {
 }
 
 int run_share_media_tests(void) {
-    printf("test_share_media: fragments, loss + NACK, whole frame lost, PLI, late joiner, rate, size, malformed, VP9 through loss\n");
+    printf("test_share_media: fragments, loss + NACK, whole frame lost, PLI, first keyframe lost, late joiner, rate, size, malformed, VP9 through loss\n");
     test_fragments_clean();
     test_loss_recovered();
     test_whole_frame_lost();
     test_pli_when_unrecoverable();
+    test_first_keyframe_lost();
     test_late_joiner();
     test_rate_control();
     test_size_and_hash();

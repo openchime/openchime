@@ -41,6 +41,7 @@ static void msg_free(oc_msg *m) {
                       free(m->forward); m->forward = NULL; }
     free(m->body); free(m->reactions); free(m->attach);
     free(m->poll); m->poll = NULL;
+    oc_todo_view_free(m->todo); m->todo = NULL;
     msg_clear_unfurls(m);
 }
 
@@ -81,6 +82,38 @@ static void msg_tombstone(oc_msg *msg) {
     memset(&msg->action, 0, sizeof msg->action);   /* no body, no action (REQ-058) */
     free(msg->poll);   /* nor a question to vote on: the daemon drops it too (REQ-225) */
     msg->poll = NULL;
+    oc_todo_view_free(msg->todo);   /* nor a list: a restore sends it back */
+    msg->todo = NULL;
+}
+
+/* Fold one TODO frame's range into a message's list. The range from 0 starts
+ * the list afresh -- every task's slot, the title and author -- so a list is
+ * always exactly what the daemon last sent, never a mix. */
+static void msg_set_todo(oc_msg *msg, const oc_ev *e) {
+    const oc_todo_view *v = e->todo;
+    if (msg->deleted || !v) return;
+    if (e->todo_first == 0 || !msg->todo || msg->todo->total != v->total) {
+        oc_todo_view *n = calloc(1, sizeof *n);
+        if (!n) return;
+        n->tasks = calloc(v->total ? v->total : 1, sizeof *n->tasks);
+        if (!n->tasks) { free(n); return; }
+        n->cap = v->total;
+        n->total = v->total;
+        oc_todo_view_free(msg->todo);
+        msg->todo = n;
+    }
+    oc_todo_view *t = msg->todo;
+    t->author_id = v->author_id;
+    free(t->title);
+    t->title = strdup(v->title ? v->title : "");
+    for (uint8_t i = 0; i < e->todo_n; i++) {
+        uint32_t at = (uint32_t)e->todo_first + i;
+        if (at >= t->cap) break;
+        free(t->tasks[at].name); free(t->tasks[at].desc);
+        t->tasks[at] = v->tasks[i];
+        t->tasks[at].name = strdup(v->tasks[i].name ? v->tasks[i].name : "");
+        t->tasks[at].desc = strdup(v->tasks[i].desc ? v->tasks[i].desc : "");
+    }
 }
 
 /* Set a message's action from what the daemon sent (REQ-058, ARCH-115): an
@@ -116,6 +149,7 @@ static void msg_untombstone(oc_msg *msg, const char *body) {
 static void msg_set_saved(oc_msg *msg, const oc_ev *e) {
     msg->saved    = (e->op == 1);
     msg->saved_at = (e->op == 1) ? e->pinned_at : 0;   /* the ev's timestamp slot */
+    msg->remind_at = (e->op == 1) ? e->remind_at : 0;  /* REQ-283 */
 }
 
 static void msg_set_pinned(oc_msg *msg, const oc_ev *e) {
@@ -469,6 +503,7 @@ void oc_model_free(oc_model *m) {
     free(m->threads);
     free(m->files);
     free(m->users);
+    free(m->pfvals);
     free(m->webhooks);
     free(m->settings);
     free(m->audit);
@@ -700,6 +735,77 @@ int oc_model_is_workspace_sender(const oc_model *m, uint64_t user_id) {
     return m && user_id && user_id == m->ws_sender;
 }
 
+const char *oc_model_profile_value(const oc_model *m, uint64_t user_id, uint64_t field_id) {
+    for (size_t i = 0; m && i < m->n_pfvals; i++)
+        if (m->pfvals[i].user_id == user_id && m->pfvals[i].field_id == field_id) return m->pfvals[i].value;
+    return "";
+}
+
+static int ci_eq(const char *a, const char *b) {
+    for (; *a && *b; a++, b++)
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+    return *a == *b;
+}
+
+const oc_member *oc_model_ooo_active(const oc_model *m, uint64_t user_id, uint64_t now_ms) {
+    if (!m || !user_id) return NULL;
+    for (size_t i = 0; i < m->n_users; i++) {
+        const oc_member *u = &m->users[i];
+        if (u->user_id != user_id) continue;
+        return (u->ooo_end && u->ooo_start <= now_ms && now_ms < u->ooo_end) ? u : NULL;
+    }
+    return NULL;
+}
+
+const oc_member *oc_model_ooo_for_compose(const oc_model *m, uint64_t channel_id,
+                                          const char *draft, uint64_t now_ms) {
+    if (!m) return NULL;
+    /* The other person of a one-to-one DM. */
+    for (size_t i = 0; i < m->n_channels; i++) {
+        const oc_channel *c = &m->channels[i];
+        if (c->channel_id != channel_id) continue;
+        if (c->kind == OC_CHANNEL_KIND_DM && c->peer_id && c->peer_id != m->user_id) {
+            const oc_member *u = oc_model_ooo_active(m, c->peer_id, now_ms);
+            if (u) return u;
+        }
+        break;
+    }
+    /* Anyone mentioned, by id or by the name the roster shows. */
+    if (!draft || !draft[0]) return NULL;
+    oc_mention ms[OC_MENTION_MAX];
+    size_t n = oc_mention_scan(draft, strlen(draft), ms, OC_MENTION_MAX);
+    if (n > OC_MENTION_MAX) n = OC_MENTION_MAX;
+    for (size_t k = 0; k < n; k++) {
+        if (ms[k].kind != OC_MENTION_USER) continue;
+        for (size_t i = 0; i < m->n_users; i++) {
+            const oc_member *u = &m->users[i];
+            if (u->user_id == m->user_id) continue;
+            int hit = ms[k].user_id ? ms[k].user_id == u->user_id
+                                    : (ci_eq(ms[k].name, u->name) || ci_eq(ms[k].name, u->label));
+            if (hit && oc_model_ooo_active(m, u->user_id, now_ms)) return u;
+        }
+    }
+    return NULL;
+}
+
+void oc_model_ooo_label(const oc_member *mem, char *out, size_t cap) {
+    if (!out || !cap) return;
+    out[0] = '\0';
+    if (!mem || !mem->ooo_end) return;
+    static const char *MON[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    /* The last moment it holds, so an end at midnight reads as the day before. */
+    time_t t = (time_t)((mem->ooo_end - 1) / 1000);
+    time_t nowt = time(NULL);
+    struct tm lt, nt;
+    oc_localtime_r(&t, &lt);
+    oc_localtime_r(&nowt, &nt);
+    if (lt.tm_year == nt.tm_year)
+        snprintf(out, cap, "Out of office until %d %s", lt.tm_mday, MON[lt.tm_mon]);
+    else
+        snprintf(out, cap, "Out of office until %d %s %d", lt.tm_mday, MON[lt.tm_mon], lt.tm_year + 1900);
+}
+
 int oc_model_user_disabled(const oc_model *m, uint64_t user_id) {
     for (size_t i = 0; i < m->n_users; i++)
         if (m->users[i].user_id == user_id) return m->users[i].disabled;
@@ -708,6 +814,10 @@ int oc_model_user_disabled(const oc_model *m, uint64_t user_id) {
 
 uint8_t     oc_model_deployment_mode(const oc_model *m) { return m->deployment_mode; }
 uint32_t    oc_model_max_users(const oc_model *m)       { return m->max_users; }
+const char *oc_model_workspace_audience(const oc_model *m) {
+    return m ? m->workspace_audience : "";
+}
+
 const char *oc_model_workspace_name(const oc_model *m)  { return m->workspace_name; }
 const char *oc_model_server_build(const oc_model *m)    { return m->server_build; }
 
@@ -845,6 +955,15 @@ const oc_poll_view *oc_model_poll(const oc_model *m, uint64_t channel_id, uint64
         if (c->msgs[i].message_id == message_id) return c->msgs[i].poll;
     for (size_t i = 0; i < m->n_thread_msgs; i++)
         if (m->thread_msgs[i].message_id == message_id) return m->thread_msgs[i].poll;
+    return NULL;
+}
+
+const oc_todo_view *oc_model_todo(const oc_model *m, uint64_t channel_id, uint64_t message_id) {
+    const oc_channel *c = oc_model_channel((oc_model *)m, channel_id);
+    for (size_t i = 0; c && i < c->n_msgs; i++)
+        if (c->msgs[i].message_id == message_id) return c->msgs[i].deleted ? NULL : c->msgs[i].todo;
+    for (size_t i = 0; i < m->n_thread_msgs; i++)
+        if (m->thread_msgs[i].message_id == message_id) return m->thread_msgs[i].deleted ? NULL : m->thread_msgs[i].todo;
     return NULL;
 }
 
@@ -1394,6 +1513,11 @@ static void msg_add_attach(oc_msg *msg, const oc_ev *e) {
     a->duration_ms = e->duration_ms;
     a->width = e->media_w; a->height = e->media_h;
     a->poster_id = e->poster_id;
+    /* A snippet's (REQ-226): the title in the spare heap slot, the language in
+     * the short one. */
+    snprintf(a->title, sizeof a->title, "%s", (e->media_kind == OC_MEDIA_SNIPPET && e->topic) ? e->topic : "");
+    snprintf(a->language, sizeof a->language, "%.*s", (int)(sizeof a->language - 1),
+             e->media_kind == OC_MEDIA_SNIPPET ? e->emoji : "");
 }
 
 /* Attach an attachment to the message with `message_id`, searching every channel
@@ -1451,7 +1575,10 @@ static void attach_to_msg(oc_model *m, const oc_ev *e) {
 }
 
 /* Record that `user_id` is typing in `channel_id` now, pruning stale marks. */
-static void typing_touch(oc_model *m, uint64_t channel_id, uint64_t user_id) {
+/* A typing mark: who, where, and in which thread (0 the main scroll, REQ-121).
+ * One mark per person per conversation -- someone types in one place at a time,
+ * so a mark from them elsewhere in it moves it there. */
+static void typing_touch(oc_model *m, uint64_t channel_id, uint64_t user_id, uint64_t thread_root) {
     long long now = (long long)time(NULL);
     size_t w = 0, found = (size_t)-1;
     for (size_t i = 0; i < m->n_typing; i++) {
@@ -1460,7 +1587,7 @@ static void typing_touch(oc_model *m, uint64_t channel_id, uint64_t user_id) {
         m->typing[w++] = m->typing[i];
     }
     m->n_typing = w;
-    if (found != (size_t)-1) { m->typing[found].seen = now; return; }
+    if (found != (size_t)-1) { m->typing[found].seen = now; m->typing[found].thread_root = thread_root; return; }
     if (m->n_typing == m->cap_typing) {
         size_t cap = m->cap_typing ? m->cap_typing * 2 : 8;
         oc_typing_row *nt = realloc(m->typing, cap * sizeof *nt);
@@ -1469,16 +1596,18 @@ static void typing_touch(oc_model *m, uint64_t channel_id, uint64_t user_id) {
     }
     m->typing[m->n_typing].channel_id = channel_id;
     m->typing[m->n_typing].user_id = user_id;
+    m->typing[m->n_typing].thread_root = thread_root;
     m->typing[m->n_typing].seen = now;
     m->n_typing++;
 }
 
-size_t oc_model_typing(const oc_model *m, uint64_t channel_id, uint64_t exclude,
+size_t oc_model_typing(const oc_model *m, uint64_t channel_id, uint64_t thread_root, uint64_t exclude,
                        uint64_t *out, size_t cap) {
     long long now = (long long)time(NULL);
     size_t n = 0;
     for (size_t i = 0; i < m->n_typing && n < cap; i++) {
         if (m->typing[i].channel_id != channel_id) continue;
+        if (m->typing[i].thread_root != thread_root) continue;   /* that thread, or the main scroll */
         if (m->typing[i].user_id == exclude) continue;
         if (now - m->typing[i].seen > OC_TYPING_TIMEOUT) continue;
         out[n++] = m->typing[i].user_id;
@@ -1504,6 +1633,12 @@ const oc_group_view *oc_model_group_by_handle(const oc_model *m, const char *han
     for (size_t i = 0; m && handle && i < m->n_groups; i++)
         if (handle_eq(m->groups[i]->handle, handle)) return m->groups[i];
     return NULL;
+}
+
+int oc_model_is_channel_manager(const oc_channel *c, uint64_t user_id) {
+    for (uint16_t i = 0; c && user_id && i < c->n_managers; i++)
+        if (c->managers[i] == user_id) return 1;
+    return 0;
 }
 
 int oc_model_in_group(const oc_group_view *g, uint64_t user_id) {
@@ -1547,6 +1682,8 @@ int oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_stored,
     if (n > OC_MENTION_MAX) n = OC_MENTION_MAX;
     const char *me = oc_model_user_name(m, m->user_id);
     for (size_t i = 0; i < n; i++) {
+        /* A mention inside a spoiler notifies nobody (MARKDOWN.md §1d). */
+        if (oc_rt_in_spoiler(body, len, mm[i].start)) continue;
         if (mm[i].kind != OC_MENTION_USER) { bc = 1; continue; }
         /* The id form (<@U42>) names whoever the id is; its label is no name. */
         if (mm[i].user_id) { if (m->user_id && mm[i].user_id == m->user_id) return 1; continue; }
@@ -1560,11 +1697,9 @@ int oc_model_mentions_me_in(const oc_model *m, uint8_t broadcast_stored,
 
 int oc_model_mentions_me(const oc_model *m, const char *body, size_t len) {
     if (!m || !body) return 0;
-    if (oc_mention_targets(body, len, oc_model_user_name(m, m->user_id), m->user_id)) return 1;
-    for (size_t i = 0; i < m->n_groups; i++)
-        if (oc_model_in_group(m->groups[i], m->user_id) && oc_mention_targets(body, len, m->groups[i]->handle, 0))
-            return 1;
-    return 0;
+    /* Any broadcast counts here, as oc_mention_targets counts one; what is in a
+     * spoiler counts for nothing (MARKDOWN.md §1d). */
+    return oc_model_mentions_me_in(m, 1, body, len);
 }
 
 /* The roster's name for an id-form mention, or NULL for an id it lacks. */
@@ -1669,7 +1804,8 @@ void oc_model_set_read_marker(oc_model *m, uint64_t channel_id, uint64_t message
         }
         int vip = oc_model_is_priority(m, msg->author_id);
         if (oc_notify_decide(msg->author_id == m->user_id || oc_model_is_workspace_sender(m, msg->author_id),
-                             c->muted, vip, c->notify_level, men, kw, 0, 0, 0)) {
+                             c->muted, oc_model_is_muted_user(m, msg->author_id), vip, c->notify_level,
+                             men, kw, 0, 0, 0)) {
             n++;
             if (men || kw || vip) pri++;
         }
@@ -1790,7 +1926,7 @@ int oc_model_keyword_hit(const oc_model *m, const char *body, size_t len,
                          size_t *span_start, size_t *span_len) {
     if (!m || !body || !len) return 0;
     for (uint8_t i = 0; i < m->n_kw_terms; i++)
-        if (oc_keyword_match(body, len, m->kw_terms[i], span_start, span_len)) return 1;
+        if (oc_rt_keyword_match(body, len, m->kw_terms[i], span_start, span_len)) return 1;
     return 0;
 }
 
@@ -1798,6 +1934,20 @@ int oc_model_is_priority(const oc_model *m, uint64_t user_id) {
     if (!m || !user_id) return 0;
     for (uint8_t i = 0; i < m->n_pri_people; i++)
         if (m->pri_people[i] == user_id) return 1;
+    return 0;
+}
+
+int oc_model_is_muted_user(const oc_model *m, uint64_t user_id) {
+    if (!m || !user_id) return 0;
+    for (uint16_t i = 0; i < m->n_muted_users; i++)
+        if (m->muted_users[i] == user_id) return 1;
+    return 0;
+}
+
+int oc_model_is_blocked(const oc_model *m, uint64_t user_id) {
+    if (!m || !user_id) return 0;
+    for (uint16_t i = 0; i < m->n_blocks; i++)
+        if (m->blocks[i] == user_id) return 1;
     return 0;
 }
 
@@ -1831,7 +1981,8 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
         /* thread_reply is 0: this watches a channel's main scroll, and a thread
          * reply is deliberately not in it (REQ-060), so it never sees one.
          * Replies are answered by oc_model_thread_notify_take instead. */
-        if (!oc_notify_decide(oc_model_is_workspace_sender(m, msg->author_id), c->muted, is_vip,
+        if (!oc_notify_decide(oc_model_is_workspace_sender(m, msg->author_id), c->muted,
+                              oc_model_is_muted_user(m, msg->author_id), is_vip,
                               c->notify_level, men, kw, 0, quiet, paused)) continue;
 
         pick = msg;                      /* ascending ids: the newest wins */
@@ -1890,7 +2041,7 @@ size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
          * else is ours to supply, and mute, the schedule and the pause still
          * silence it — participation satisfies the mentions LEVEL, it does not
          * step around it. */
-        if (!oc_notify_decide(0, c->muted, is_vip, c->notify_level,
+        if (!oc_notify_decide(0, c->muted, oc_model_is_muted_user(m, n->author_id), is_vip, c->notify_level,
                               n->mentioned, n->keyword_hit, 1, quiet, paused)) continue;
         if (out && kept < max) out[kept++] = *n;
     }
@@ -1922,8 +2073,8 @@ size_t oc_model_call_notify_take(oc_model *m, int quiet, int paused,
         if (!v || v->call_id != n->call_id || !oc_model_call_invited(v, m->user_id)) continue;
         int muted = c ? c->muted : 0;
         unsigned level = c ? c->notify_level : OC_NOTIFY_ALL;
-        if (!oc_notify_decide(0, muted, oc_model_is_priority(m, n->starter), level,
-                              1, 0, 0, quiet, paused)) continue;
+        if (!oc_notify_decide(0, muted, oc_model_is_muted_user(m, n->starter), oc_model_is_priority(m, n->starter),
+                              level, 1, 0, 0, quiet, paused)) continue;
         if (out && kept < max) out[kept++] = *n;
     }
     m->n_call_notices = 0;
@@ -1974,6 +2125,29 @@ static void set_status(oc_model *m, const char *s) {
     snprintf(m->status, sizeof m->status, "%s", s ? s : "");
 }
 
+uint64_t oc_model_reminder(const oc_model *m, uint64_t message_id) {
+    if (!m || !message_id) return 0;
+    for (size_t ci = 0; ci < m->n_channels; ci++)
+        for (size_t i = 0; i < m->channels[ci].n_msgs; i++)
+            if (m->channels[ci].msgs[i].message_id == message_id)
+                return m->channels[ci].msgs[i].saved ? m->channels[ci].msgs[i].remind_at : 0;
+    for (size_t i = 0; i < m->n_thread_msgs; i++)
+        if (m->thread_msgs[i].message_id == message_id)
+            return m->thread_msgs[i].saved ? m->thread_msgs[i].remind_at : 0;
+    for (size_t i = 0; i < m->n_saved; i++)
+        if (m->saved[i].message_id == message_id) return m->saved[i].remind_at;
+    return 0;
+}
+
+int oc_snippet_offer(const char *text, size_t len) {
+    if (!text || len == 0 || len > OC_SNIPPET_MAX_SIZE) return 0;
+    if (len > OC_SNIPPET_PASTE_BYTES) return 1;
+    size_t lines = 1;
+    for (size_t i = 0; i < len; i++)
+        if (text[i] == '\n' && i + 1 < len && ++lines > OC_SNIPPET_PASTE_LINES) return 1;
+    return 0;
+}
+
 void oc_model_apply(oc_model *m, oc_ev *e) {
     switch (e->type) {
     case OC_EV_CONNECTED:
@@ -2014,6 +2188,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->workspace_mode = e->ws_mode;
         m->max_video_size = e->size;
         snprintf(m->workspace_name, sizeof m->workspace_name, "%s", e->body ? e->body : "");
+        snprintf(m->workspace_audience, sizeof m->workspace_audience, "%s", e->ws_audience);
         /* SERVER_BUILD follows on this connection; a daemon too old to send it
          * leaves the field empty rather than showing the last daemon's build. */
         m->server_build[0] = '\0';
@@ -2054,6 +2229,13 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             }
             free(c->topic);
             c->topic = (e->topic && e->topic[0]) ? strdup(e->topic) : NULL;
+            if (e->ch_managers_known) {
+                c->creator_id = e->ch_creator;
+                c->n_managers = 0;
+                for (size_t k = 0; k < e->n_ids && k < OC_MAX_CHANNEL_MANAGERS; k++)
+                    c->managers[c->n_managers++] = e->ids[k];
+                c->managers_known = 1;
+            }
         }
         break;
     }
@@ -2108,7 +2290,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             int vip = oc_model_is_priority(m, e->author_id);
             if (e->message_id > c->read_marker &&
                 oc_notify_decide(e->author_id == m->user_id || oc_model_is_workspace_sender(m, e->author_id),
-                                 c->muted, vip, c->notify_level, men, kw, 0, 0, 0)) {
+                                 c->muted, oc_model_is_muted_user(m, e->author_id), vip, c->notify_level,
+                                 men, kw, 0, 0, 0)) {
                 c->unread++;
                 if (men || kw || vip) c->priority_unread++;   /* the badge's count, not its dot */
             }
@@ -2222,6 +2405,33 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->n_pri_people = e->n_pri_people;
         for (uint8_t i = 0; i < e->n_pri_people; i++) m->pri_people[i] = e->pri_people[i];
         break;
+    case OC_EV_MUTED_USERS: {
+        /* The whole list, as the daemon holds it. Live counting uses it from
+         * now on; the counts already standing are the daemon's to redo, which
+         * oc_client_set_user_mute asks for with the channel list. */
+        size_t n = e->n_ids < OC_MAX_MUTED_USERS ? e->n_ids : OC_MAX_MUTED_USERS;
+        for (size_t i = 0; i < n; i++) m->muted_users[i] = e->ids[i];
+        m->n_muted_users = (uint16_t)n;
+        m->muted_seq++;
+        break;
+    }
+    case OC_EV_BLOCKS: {
+        size_t n = e->n_ids < OC_MAX_BLOCKS ? e->n_ids : OC_MAX_BLOCKS;
+        for (size_t i = 0; i < n; i++) m->blocks[i] = e->ids[i];
+        m->n_blocks = (uint16_t)n;
+        m->dm_privacy = e->status == OC_DM_PRIVACY_NOBODY ? OC_DM_PRIVACY_NOBODY : OC_DM_PRIVACY_ANYONE;
+        m->blocks_seq++;
+        break;
+    }
+    case OC_EV_BLOCK_LIST: {
+        size_t n = e->n_ids / 3;
+        if (n > OC_BLOCK_LIST_MAX) n = OC_BLOCK_LIST_MAX;
+        for (size_t i = 0; i < n; i++)
+            m->block_list[i] = (oc_block_entry){ e->ids[3 * i], e->ids[3 * i + 1], e->ids[3 * i + 2] };
+        m->n_block_list = (uint16_t)n;
+        m->block_list_have = 1;
+        break;
+    }
     case OC_EV_READ_RECEIPTS:
         m->share_receipts = e->status ? 1 : 0;
         break;
@@ -2233,7 +2443,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                      e->server_time != 0);
         break;
     case OC_EV_TYPING:
-        typing_touch(m, e->channel_id, e->user_id);
+        typing_touch(m, e->channel_id, e->user_id, e->parent_id);
         break;
     case OC_EV_CHAN_MEMBER: {
         /* Only for the roster currently being loaded — a late frame from a
@@ -2310,6 +2520,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         sv->message_id = e->message_id; sv->channel_id = e->channel_id;
         sv->author_id  = e->author_id;  sv->server_time = e->server_time;
         sv->saved_at   = e->pinned_at;
+        sv->remind_at  = e->remind_at;   /* REQ-283 */
         sv->body = e->body ? strdup(e->body) : NULL;
         sv->action = e->action;   /* REQ-058 */
         snprintf(sv->attach_name, sizeof sv->attach_name, "%s", e->author_name);
@@ -2388,9 +2599,52 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
 #undef FOLD_FIELD
         mem->status_expires = e->server_time;
         mem->avatar_id      = e->message_id;
+        mem->ooo_start      = e->ooo_start;
+        mem->ooo_end        = e->ooo_end;
+        snprintf(mem->ooo_message, sizeof mem->ooo_message, "%s", e->ooo_message);
         if (e->op) mem->role = e->op;
         user_relabel(mem);
+        /* Their values for the workspace's fields: the frame carries all of
+         * them, so theirs are replaced whole. */
+        {
+            size_t keep = 0;
+            for (size_t i = 0; i < m->n_pfvals; i++)
+                if (m->pfvals[i].user_id != e->user_id) m->pfvals[keep++] = m->pfvals[i];
+            m->n_pfvals = keep;
+            for (uint8_t i = 0; i < e->n_pfs; i++) {
+                if (m->n_pfvals == m->cap_pfvals) {
+                    size_t nc = m->cap_pfvals ? m->cap_pfvals * 2 : 32;
+                    oc_pfvalue *g = realloc(m->pfvals, nc * sizeof *g);
+                    if (!g) break;
+                    m->pfvals = g; m->cap_pfvals = nc;
+                }
+                oc_pfvalue *v = &m->pfvals[m->n_pfvals++];
+                v->user_id = e->user_id;
+                v->field_id = e->pfs[i].id;
+                snprintf(v->value, sizeof v->value, "%s", e->pfs[i].text);
+            }
+        }
         if (e->user_id == m->user_id) m->self_profile_seq++;
+        break;
+    }
+    case OC_EV_PROFILE_FIELDS: {
+        m->n_pfields = 0;
+        for (uint8_t i = 0; i < e->n_pfs && m->n_pfields < OC_MAX_PROFILE_FIELDS; i++) {
+            oc_pfield *f = &m->pfields[m->n_pfields++];
+            f->id = e->pfs[i].id;
+            f->kind = e->pfs[i].kind;
+            f->position = e->pfs[i].position;
+            snprintf(f->label, sizeof f->label, "%.*s", (int)OC_PROFILE_FIELD_LABEL_MAX, e->pfs[i].text);
+        }
+        /* A value for a field that is gone goes with it. */
+        size_t keep = 0;
+        for (size_t i = 0; i < m->n_pfvals; i++) {
+            int known = 0;
+            for (uint8_t k = 0; k < m->n_pfields; k++) if (m->pfields[k].id == m->pfvals[i].field_id) known = 1;
+            if (known) m->pfvals[keep++] = m->pfvals[i];
+        }
+        m->n_pfvals = keep;
+        m->pfields_seq++;
         break;
     }
     case OC_EV_INVITE_ROW: {
@@ -2422,6 +2676,13 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 m->n_invites--;
                 break;
             }
+        break;
+    case OC_EV_FOUND_AT_TIME:
+        /* Where a jump to a date lands: the frontend opens it as a permalink. */
+        m->found_channel = e->channel_id; m->found_parent = e->parent_id;
+        m->found_mid = e->message_id; m->found_time = e->server_time;
+        m->found_exact = e->op;
+        m->found_seq++;
         break;
     case OC_EV_COLLAPSED:
         /* Mine on every device: the message itself, wherever it is held. */
@@ -2458,8 +2719,20 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                     m->n_saved--;
                     break;
                 }
+        /* A reminder set, changed or cleared (REQ-283) on any device. */
+        if (e->op == 1)
+            for (size_t i = 0; i < m->n_saved; i++)
+                if (m->saved[i].message_id == e->message_id) { m->saved[i].remind_at = e->remind_at; break; }
         break;
     case OC_EV_ACTIVITY: {
+        /* A reminder that comes due while connected arrives as one entry, not
+         * as part of a list: the frontend is told, once (REQ-283). */
+        if (e->status == OC_ACT_REMINDER && !(m->activity_open && m->activity_loading)) {
+            m->reminder_mid = e->message_id;
+            m->reminder_channel = e->channel_id;
+            m->reminder_seq++;
+            break;
+        }
         if (!m->activity_open || !m->activity_loading) break;
         if (m->n_activity == m->cap_activity) {
             size_t nc = m->cap_activity ? m->cap_activity * 2 : 32;
@@ -2651,6 +2924,15 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             if (m->thread_msgs[i].message_id == e->message_id) { msg_set_poll(&m->thread_msgs[i], e->poll); break; }
         break;
     }
+    case OC_EV_TODO: {
+        /* A to-do list, wherever its message is held, as a poll is. */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        for (size_t i = 0; c && i < c->n_msgs; i++)
+            if (c->msgs[i].message_id == e->message_id) { msg_set_todo(&c->msgs[i], e); break; }
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id) { msg_set_todo(&m->thread_msgs[i], e); break; }
+        break;
+    }
     case OC_EV_POLL_VOTERS:
         if (m->voterlist_open && e->message_id == m->voterlist_message) {
             if (m->n_voters == m->cap_voters) {
@@ -2761,6 +3043,45 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             }
         break;
     }
+    case OC_EV_MESSAGE_MOVED: {
+        /* Gone from where it was (REQ-053): out of the channel's scroll, or out
+         * of the open thread with its root counting one fewer. A thread moved
+         * whole takes the open thread's view with it. */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        for (size_t i = 0; c && i < c->n_msgs; i++)
+            if (c->msgs[i].message_id == e->message_id) {
+                msg_free(&c->msgs[i]);
+                memmove(&c->msgs[i], &c->msgs[i + 1], (c->n_msgs - i - 1) * sizeof *c->msgs);
+                c->n_msgs--;
+                break;
+            }
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id && m->thread_parent != e->message_id) {
+                msg_free(&m->thread_msgs[i]);
+                memmove(&m->thread_msgs[i], &m->thread_msgs[i + 1],
+                        (m->n_thread_msgs - i - 1) * sizeof *m->thread_msgs);
+                m->n_thread_msgs--;
+                for (size_t k = 0; c && k < c->n_msgs; k++)
+                    if (c->msgs[k].message_id == m->thread_parent) {
+                        if (c->msgs[k].reply_count) c->msgs[k].reply_count--;
+                        break;
+                    }
+                break;
+            }
+        if (m->thread_open && m->thread_parent == e->message_id) m->thread_channel = e->to_channel;
+        /* Where it went: read back as any other rows, if this client holds that
+         * conversation at all. */
+        oc_channel *d = oc_model_channel(m, e->to_channel);
+        if (e->parent_id) {
+            for (size_t k = 0; d && k < d->n_msgs; k++)
+                if (d->msgs[k].message_id == e->parent_id) { d->msgs[k].reply_count++; break; }
+            if (m->thread_open && m->thread_parent == e->parent_id) m->moved_fetch_thread = 1;
+        } else if (d && d->n_msgs) {
+            m->moved_fetch_channel = e->to_channel;
+            m->moved_fetch_message = e->message_id;
+        }
+        break;
+    }
     case OC_EV_RESTORE: {
         /* Back over its tombstone, in both lists it may be in; its files follow
          * as ATTACH events and fold on as for any message. */
@@ -2791,9 +3112,11 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             notice_push(m, e);
             /* The Threads view's unread is server-supplied and refreshed only by
              * a list (REQ-062), so move it here too: the badge should follow the
-             * toast, not wait for the next LIST_THREADS. */
-            for (size_t i = 0; i < m->n_threads; i++)
-                if (m->threads[i].root_id == e->parent_id) { m->threads[i].unread++; break; }
+             * toast, not wait for the next LIST_THREADS. A muted person's reply
+             * is no badge, as the daemon's count leaves it out (REQ-284). */
+            if (!oc_model_is_muted_user(m, e->author_id))
+                for (size_t i = 0; i < m->n_threads; i++)
+                    if (m->threads[i].root_id == e->parent_id) { m->threads[i].unread++; break; }
         }
         if (m->thread_open && e->parent_id == m->thread_parent) {
             size_t before = m->n_thread_msgs;
@@ -2838,7 +3161,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     case OC_EV_NOTIFY_PREF: {
         oc_channel *c = oc_model_channel(m, e->channel_id);
-        if (c) { c->notify_level = e->op; c->muted = e->status; }
+        /* `participant` carries follow_threads here (REQ-282): in every thread. */
+        if (c) { c->notify_level = e->op; c->muted = e->status; c->follow_threads = e->participant; }
         break;
     }
     case OC_EV_GROUP:
@@ -2889,6 +3213,14 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         snprintf(ce->name, sizeof ce->name, "%s", e->body ? e->body : "");
         ce->attachment_id = e->message_id;
         ce->created_by = e->user_id;
+        ce->created_at = e->created_at;
+        /* The old names, space-separated by the net thread. */
+        for (const char *a = e->topic; a && *a && ce->n_aliases < OC_MAX_EMOJI_ALIASES; ) {
+            size_t n = strcspn(a, " ");
+            if (n) snprintf(ce->aliases[ce->n_aliases++], sizeof ce->aliases[0], "%.*s", (int)n, a);
+            a += n;
+            while (*a == ' ') a++;
+        }
         break;
     }
     case OC_EV_SETTINGS_BEGIN:
@@ -2973,6 +3305,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->storage = e->storage;
         m->storage_have = 1;
         set_status(m, "storage report updated");
+        break;
+    case OC_EV_USAGE:
+        if (!e->usage) break;
+        m->usage = *e->usage;
+        m->usage_have = 1;
+        set_status(m, "usage figures updated");
         break;
     case OC_EV_PROFILE:
         /* A display-name change (REQ-020): update the roster entry's name in place
@@ -3064,6 +3402,9 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 snprintf(m->users[i].full_name, sizeof m->users[i].full_name, "%s", e->pf_full_name);
                 snprintf(m->users[i].pronouns, sizeof m->users[i].pronouns, "%s", e->pf_pronouns);
                 snprintf(m->users[i].voice_id, sizeof m->users[i].voice_id, "%s", e->pf_voice);
+                m->users[i].ooo_start = e->ooo_start;
+                m->users[i].ooo_end = e->ooo_end;
+                snprintf(m->users[i].ooo_message, sizeof m->users[i].ooo_message, "%s", e->ooo_message);
                 break;
             }
         break;
@@ -3591,6 +3932,10 @@ uint64_t oc_model_custom_emoji(const oc_model *m, const char *name) {
     if (!m || !name || !name[0]) return 0;
     for (size_t i = 0; i < m->n_cemoji; i++)
         if (strcmp(m->cemoji[i].name, name) == 0) return m->cemoji[i].attachment_id;
+    /* An old name a rename kept still shows the image (REQ-072). */
+    for (size_t i = 0; i < m->n_cemoji; i++)
+        for (uint8_t k = 0; k < m->cemoji[i].n_aliases; k++)
+            if (strcmp(m->cemoji[i].aliases[k], name) == 0) return m->cemoji[i].attachment_id;
     return 0;
 }
 

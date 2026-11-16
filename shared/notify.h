@@ -37,7 +37,10 @@ int oc_notify_quiet(int mode, int base_start, int base_end,
  * product means (REQ-134, REQ-135, REQ-137):
  *
  *   your own message never notifies; a muted conversation never notifies, and
- *   nothing pierces mute; a priority person pierces everything else — the
+ *   nothing pierces mute; nor does a message, reply, reaction or mention from a
+ *   person the reader muted (`muted_author`), even one who is also a priority
+ *   person, because a muted person is a WHO the reader has said no to; a
+ *   priority person pierces everything else — the
  *   level, the schedule, the pause — because those say WHEN and a priority
  *   person is a WHO; then the schedule (REQ-136) and the pause (REQ-278)
  *   silence the rest; then the level: ALL passes, NONE passes nothing, and
@@ -67,7 +70,7 @@ int oc_notify_quiet(int mode, int base_start, int base_end,
  * `own` is the reader's own message, or the workspace's: a notice from its own
  * sender (USER_LIST `flags`). Neither is news, so neither notifies or counts
  * as unread. */
-int oc_notify_decide(int own, int muted, int vip, unsigned level,
+int oc_notify_decide(int own, int muted, int muted_author, int vip, unsigned level,
                      int mentioned, int keyword_hit, int thread_reply,
                      int quiet, int paused);
 

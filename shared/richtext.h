@@ -250,6 +250,30 @@ size_t oc_rt_spoilers(const char *body, size_t len, oc_rt_spoiler *out, size_t m
  * string, or NULL when there is none (or no memory). */
 char *oc_rt_spoilers_covered(const char *body, size_t len);
 
+/* `body` with the text each spoiler hides removed, and every other byte kept: its
+ * delimiters, a block's opening line with its label, and all that is outside one.
+ * What the daemon indexes for search, so a word that is only hidden finds nothing
+ * (MARKDOWN.md §1d). Every spoiler, however many. At most `cap` bytes with the
+ * NUL, cut at a UTF-8 boundary; returns the length written, and 0 (an empty
+ * string) on no memory rather than give hidden text away. */
+size_t oc_rt_unspoiled(const char *body, size_t len, char *out, size_t cap);
+
+/* Whether byte `offset` of `body` is text a spoiler hides; every spoiler, however
+ * many. On no memory it answers 1, the reading that shows less. */
+int oc_rt_in_spoiler(const char *body, size_t len, size_t offset);
+
+/* Where `body` opens a spoiler it does not close: the offset of the first `>!`
+ * that is neither part of a spoiler, nor in code, nor escaped (`\>!`), or
+ * (size_t)-1 when there is none. A composer refuses to send such a body, which
+ * would show what its writer meant to hide (MARKDOWN.md §1d). */
+size_t oc_rt_open_spoiler(const char *body, size_t len);
+
+/* oc_keyword_match, skipping each match that is text a spoiler hides: the first
+ * match of `term` that a reader sees. A keyword inside a spoiler alerts nobody,
+ * and the same word outside it still does (MARKDOWN.md §1d). */
+int oc_rt_keyword_match(const char *body, size_t len, const char *term,
+                        size_t *span_start, size_t *span_len);
+
 /* The addresses in `body` that are not in a spoiler, in order, up to `max`: what
  * the daemon may fetch and show a card for, since a card would show under the
  * message what the spoiler hides (MARKDOWN.md §1d). Looks at the first 64
@@ -275,9 +299,10 @@ size_t oc_rt_plain_excerpt(const char *body, size_t len, char *out, size_t cap);
 size_t oc_rt_flatten_at(const char *body, size_t len, const oc_rt_clock *clock, char *out, size_t cap);
 
 /* Only the time tokens of `body` replaced by their short text for `clock`,
- * every other byte kept, tables included: a body as a frontend that shows the
- * source shows it (the terminal client, MARKDOWN.md §5). Returns a malloc'd
- * string, or NULL when there is no token (show `body` as it is) or no memory. */
+ * those in a table's cells too, and every other byte kept, a table's pipes,
+ * alignment row and `<br>` included: a body as a frontend that shows the source
+ * shows it (the terminal client, MARKDOWN.md §5). Returns a malloc'd string, or
+ * NULL when there is no token (show `body` as it is) or no memory. */
 char *oc_rt_local_times(const char *body, size_t len, const oc_rt_clock *clock);
 
 /* oc_rt_flatten_at for no reader: time tokens in UTC, spoilers hidden. */

@@ -35,7 +35,11 @@ typedef struct { char key[65]; char value[513]; } oc_setting;
 /* Custom emoji (REQ-072): the workspace catalogue, replaced wholesale by each
  * EMOJI_LIST — a partial catalogue means a shortcode that renders on one client and
  * not another. The image is an attachment id, which is what a frontend fetches. */
-typedef struct { char name[48]; uint64_t attachment_id; uint64_t created_by; } oc_custom_emoji;
+typedef struct { char name[48]; uint64_t attachment_id; uint64_t created_by;
+                 /* When it was added, and the old names a rename kept: each
+                  * still shows this image (REQ-072). */
+                 uint64_t created_at;
+                 char aliases[OC_MAX_EMOJI_ALIASES][48]; uint8_t n_aliases; } oc_custom_emoji;
 
 /* One member's read cursor in a channel (REQ-090 seen-by). */
 typedef struct { uint64_t user_id; uint64_t message_id; } oc_read_cursor_view;
@@ -57,6 +61,10 @@ typedef struct {
     uint32_t duration_ms;
     uint16_t width, height;
     uint64_t poster_id;
+    /* A snippet (REQ-226): media_kind OC_MEDIA_SNIPPET, its title and its
+     * language (lexer.h's name, "" for plain); its text is the download. */
+    char     title[OC_SNIPPET_TITLE_MAX + 1];
+    char     language[OC_SNIPPET_LANG_MAX + 1];
 } oc_attachment;
 
 /* One link preview under a message (REQ-222, ARCH-105): the daemon's fetched
@@ -114,6 +122,7 @@ typedef struct {
      * replayed after a reconnect so a bookmark survives a reload. */
     uint8_t      saved;
     uint64_t     saved_at;
+    uint64_t     remind_at;   /* its reminder (REQ-283), 0 for none; with saved */
     /* Folded away by THIS user (SET_COLLAPSED): theirs on every device, from
      * COLLAPSED_UPDATED, live and replayed. Shows its author, time and first
      * line until it is opened again. */
@@ -136,6 +145,10 @@ typedef struct {
     /* The poll (REQ-225), NULL unless this message is one: its body is the
      * question. Set and updated only by what the daemon sends. */
     oc_poll_view   *poll;
+    /* The to-do list, NULL unless this message is one: its title, tasks and
+     * who marked each done, as the daemon last said. A frontend shows it in
+     * place of the "/todo" body. */
+    oc_todo_view   *todo;
 } oc_msg;
 
 /* How many live thread replies can be waiting for the toast pass at once. The
@@ -246,6 +259,9 @@ typedef struct {
      * unread badge, so a conversation can be quiet but still countable, or
      * countable but silent. */
     uint8_t  muted;
+    /* Every thread in it followed (REQ-282): a reply anywhere in it counts as a
+     * reply in a thread this reader is in, unless that thread is unfollowed. */
+    uint8_t  follow_threads;
     /* Per-member read cursors (REQ-090 seen-by): the highest message id each
      * member has read in this channel. Advance-only; drives "seen by …". */
     oc_read_cursor_view *readers;
@@ -254,6 +270,12 @@ typedef struct {
      * them. From CHANNEL_GROUPS; a deleted group is taken out here too. */
     uint64_t groups[OC_MAX_CHANNEL_GROUPS];
     uint16_t n_groups;
+    /* Who made it (0 unknown) and who runs it (REQ-036b), from CHANNEL_INFO;
+     * `managers_known` once one has said. */
+    uint64_t creator_id;
+    uint64_t managers[OC_MAX_CHANNEL_MANAGERS];
+    uint16_t n_managers;
+    uint8_t  managers_known;
 } oc_channel;
 
 /* `dnd` is a SECOND AXIS beside status, not a status value (REQ-122): a person
@@ -294,10 +316,20 @@ typedef struct {
      * the person who opened the card, not every roster fan-out. Empty until a
      * card is fetched, which is what "not on the roster" means here. */
     char     phone[40];
+    /* Out of office (REQ-122), as stored: in force while start <= now < end
+     * (oc_model_ooo_active), so it goes at its end with nothing sent. */
+    uint64_t ooo_start, ooo_end;
+    char     ooo_message[OC_OOO_MESSAGE_MAX + 1];
 } oc_member;
 
+/* A workspace's own profile field, and one person's value for one. */
+typedef struct { uint64_t id; uint8_t kind; uint16_t position;
+                 char label[OC_PROFILE_FIELD_LABEL_MAX + 1]; } oc_pfield;
+typedef struct { uint64_t user_id, field_id; char value[OC_PROFILE_FIELD_VALUE_MAX + 1]; } oc_pfvalue;
+
 /* An ephemeral "user is typing in channel" mark, expiring on a timeout. */
-typedef struct { uint64_t channel_id; uint64_t user_id; long long seen; } oc_typing_row;
+/* `thread_root`: the thread they type in, 0 for the main scroll (REQ-121). */
+typedef struct { uint64_t channel_id; uint64_t user_id; long long seen; uint64_t thread_root; } oc_typing_row;
 
 /* One full-text search hit (REQ-080). */
 typedef struct { uint64_t message_id, channel_id, author_id, server_time; char *snippet;
@@ -353,6 +385,7 @@ typedef struct {
     char    *body;                 /* heap */
     char     attach_name[128];
     uint8_t  action;               /* body is an action's text (REQ-058) */
+    uint64_t remind_at;            /* its reminder (REQ-283), 0 for none */
 } oc_saved_view;
 
 /* One draft (REQ-223, ARCH-101). Keyed by the conversation, not by time: there
@@ -420,6 +453,7 @@ typedef struct {
     uint8_t  workspace_mode;          /* OC_WS_MODE_*: a public demo says so (AUTH.md §8.12) */
     uint32_t max_users;               /* 0 = unlimited */
     char     workspace_name[64];      /* "" ⇒ frontend derives from the host subdomain */
+    char     workspace_audience[132]; /* its audience id with OpenChime's services; "" ⇒ not enrolled */
     char     server_build[48];        /* the daemon's build id (SERVER_BUILD); "" from a daemon that does not say */
 
     /* Read-aloud (REQ-291-295, ARCH-111), from TTS_INFO after auth and replaced
@@ -512,6 +546,24 @@ typedef struct {
      * (oc_client_tick), in the channel the reaction named. */
     uint8_t   reactlist_resend;
     uint64_t  reactlist_resend_channel;
+    /* The last answer to a jump to a date (oc_client_find_at_time): found_seq
+     * moves on each one, so a frontend acts on it once. found_mid 0 means the
+     * conversation has no messages; found_exact 0 that it is the last before
+     * the time asked, none being later. */
+    uint32_t  found_seq;
+    uint64_t  found_channel, found_parent, found_mid, found_time;
+    uint8_t   found_exact;
+    /* A message moved into a conversation this client holds (REQ-053): the
+     * rows are read back there (oc_client_tick) as any others are -- around
+     * the message at a top level, or the open thread again. */
+    uint64_t  moved_fetch_channel, moved_fetch_message;
+    uint8_t   moved_fetch_thread;
+    /* A reminder come due while connected (REQ-283): reminder_seq moves on with
+     * each, so a frontend tells the person once; the message and its
+     * conversation. Reminders known on saved items are on each message
+     * (oc_msg.remind_at) and saved row; oc_model_reminder finds one. */
+    uint32_t  reminder_seq;
+    uint64_t  reminder_mid, reminder_channel;
     oc_reactor_row *reactors;
     size_t    n_reactors, cap_reactors;
     /* The open "who voted" view (REQ-225), on the who-reacted pattern: the
@@ -639,6 +691,14 @@ typedef struct {
      * form that asked for it (oc_client_get_profile) waits for this to move
      * before it shows the fields, the phone among them. */
     uint32_t  self_profile_seq;
+    /* The workspace's own profile fields (PROFILE_FIELDS), in position order;
+     * `pfields_seq` moves on every change. Each person's values, from the
+     * PROFILE_INFO that carried them (heap, one row per person and field). */
+    oc_pfield pfields[OC_MAX_PROFILE_FIELDS];
+    uint8_t   n_pfields;
+    uint32_t  pfields_seq;
+    oc_pfvalue *pfvals;
+    size_t    n_pfvals, cap_pfvals;
     uint16_t  allow_start_min, allow_end_min;
     oc_schedule_day sched_days[OC_SCHEDULE_DAYS];
     uint8_t   n_sched_days;
@@ -649,6 +709,22 @@ typedef struct {
     uint8_t   n_kw_terms;
     uint64_t  pri_people[OC_MAX_PRIORITY];
     uint8_t   n_pri_people;
+    /* The people I have muted (MUTED_USERS), as the daemon last said: their
+     * messages notify me nowhere, count as unread for nobody here, and show
+     * folded away until revealed, which is each frontend's own view state. */
+    uint64_t  muted_users[OC_MAX_MUTED_USERS];
+    uint16_t  n_muted_users;
+    uint32_t  muted_seq;          /* moves with every change */
+    /* Whom I block and who may start a DM with me (BLOCKS), as the daemon last
+     * said; `blocks_seq` moves with every change. `block_list` is the
+     * workspace's blocks, an admin's, once asked (BLOCK_LIST). */
+    uint64_t  blocks[OC_MAX_BLOCKS];
+    uint16_t  n_blocks;
+    uint8_t   dm_privacy;
+    uint32_t  blocks_seq;
+    oc_block_entry block_list[OC_BLOCK_LIST_MAX];
+    uint16_t  n_block_list;
+    uint8_t   block_list_have;
     /* REQ-278: when the manual PAUSE ends, 0 for none. Distinct from the window
      * above in type as well as in name — one instant against a daily range. */
     uint64_t  snooze_until_ms;
@@ -706,6 +782,11 @@ typedef struct {
     oc_storage_view storage;
     uint8_t   storage_have;
     uint8_t   storage_open;
+
+    /* Usage figures (REQ-043), owner/admin only: the last USAGE answered, kept
+     * for the console's Usage tab; `usage_have` once one has come. */
+    oc_usage_view usage;
+    uint8_t   usage_have;
 
     /* The daemon's critical failures (REQ-263), owner/admin only. `srvalerts_have`
      * once a summary has come -- which only an owner's or admin's sign-in
@@ -855,6 +936,13 @@ void oc_model_free(oc_model *m);
 /* Fold one net event into the model. Takes ownership of `e->body` (moves it into
  * the model and clears it); the caller still frees the event struct itself. */
 void oc_model_apply(oc_model *m, oc_ev *e);
+/* The reminder this person has on a message (REQ-283), as the model holds it
+ * -- on the loaded message or the Saved list -- or 0. */
+uint64_t oc_model_reminder(const oc_model *m, uint64_t message_id);
+/* Whether pasted text is long enough to offer as a snippet (REQ-226): more
+ * than OC_SNIPPET_PASTE_LINES lines or OC_SNIPPET_PASTE_BYTES bytes. A paste
+ * past OC_SNIPPET_MAX_SIZE is not offered: it cannot be one. */
+int oc_snippet_offer(const char *text, size_t len);
 
 /* Find a channel by id, or NULL. */
 oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id);
@@ -869,6 +957,8 @@ const oc_group_view *oc_model_group(const oc_model *m, uint64_t group_id);
 int oc_model_only_via_group(const oc_model *m, uint64_t channel_id, uint64_t user_id);
 const oc_group_view *oc_model_group_by_handle(const oc_model *m, const char *handle);
 int      oc_model_in_group(const oc_group_view *g, uint64_t user_id);
+/* Is `user_id` a manager of channel `c` (REQ-036b), as its last CHANNEL_INFO said? */
+int      oc_model_is_channel_manager(const oc_channel *c, uint64_t user_id);
 uint64_t oc_model_via_group(const oc_model *m, uint64_t channel_id, uint64_t user_id);
 /* `body` as it is shown: each id-form mention (<@U42>) as '@' and the roster's
  * name for the id, an id the roster lacks as written (oc_mention_display).
@@ -1228,6 +1318,10 @@ int oc_model_keyword_hit(const oc_model *m, const char *body, size_t len,
                          size_t *span_start, size_t *span_len);
 /* Is `user_id` one of my priority people? */
 int oc_model_is_priority(const oc_model *m, uint64_t user_id);
+/* Have I muted `user_id`? */
+int oc_model_is_muted_user(const oc_model *m, uint64_t user_id);
+/* Do I block `user_id`? */
+int oc_model_is_blocked(const oc_model *m, uint64_t user_id);
 
 /* Which of a channel's NEW messages should interrupt me, if any?
  *
@@ -1304,6 +1398,21 @@ const char *oc_model_user_name(const oc_model *m, uint64_t user_id);
 /* Whether `user_id` is the workspace's own sender, not a person: its messages
  * are the workspace's, and it is offered nowhere a person is. */
 int oc_model_is_workspace_sender(const oc_model *m, uint64_t user_id);
+/* `user_id`'s value for the workspace profile field `field_id`, as their last
+ * PROFILE_INFO carried it; "" when they gave none or no card has been fetched. */
+const char *oc_model_profile_value(const oc_model *m, uint64_t user_id, uint64_t field_id);
+/* Is `user_id` out of office at `now_ms` (start <= now < end)? Their member
+ * row, or NULL when they are not. */
+const oc_member *oc_model_ooo_active(const oc_model *m, uint64_t user_id, uint64_t now_ms);
+/* Who a message being written in `channel_id` would reach that is out of office
+ * at `now_ms`: the other person of a DM, or anyone `draft` mentions by name or
+ * id (not @here and the like, and never me). The first such person, or NULL;
+ * a composer says so before sending. */
+const oc_member *oc_model_ooo_for_compose(const oc_model *m, uint64_t channel_id,
+                                          const char *draft, uint64_t now_ms);
+/* "Out of office until <date>" for `mem`, the date in the reader's local
+ * time ("until 3 Dec"; with the year when it is not this one). */
+void oc_model_ooo_label(const oc_member *mem, char *out, size_t cap);
 /* 1 when the user has been removed from the workspace (REQ-033): shown as
  * deactivated, their avatar dimmed. */
 int         oc_model_user_disabled(const oc_model *m, uint64_t user_id);
@@ -1348,6 +1457,9 @@ size_t oc_model_reset_text(const oc_model *m, const char *address, const char *l
  * "managed". workspace_name is "" until a name is configured. */
 uint8_t     oc_model_deployment_mode(const oc_model *m);
 const char *oc_model_deployment_name(const oc_model *m);
+/* The workspace's audience id (WORKSPACE_INFO): what an email link names it by
+ * (CLIENT.md, "Links"). "" when it is not enrolled. */
+const char *oc_model_workspace_audience(const oc_model *m);
 const char *oc_model_workspace_name(const oc_model *m);
 uint32_t    oc_model_max_users(const oc_model *m);
 /* The daemon's build id (SERVER_BUILD), "" until it says -- a daemon older than
@@ -1366,6 +1478,8 @@ void            oc_model_voterlist_begin(oc_model *m, uint64_t message_id);
 void            oc_model_close_voterlist(oc_model *m);
 /* A message's poll, by id, in `channel_id` or the open thread; NULL if none. */
 const oc_poll_view *oc_model_poll(const oc_model *m, uint64_t channel_id, uint64_t message_id);
+/* A message's to-do list, by id, in `channel_id` or the open thread; NULL if none. */
+const oc_todo_view *oc_model_todo(const oc_model *m, uint64_t channel_id, uint64_t message_id);
 /* Read-aloud is offered: the "tts" capability. */
 uint8_t         oc_model_tts_available(const oc_model *m);
 /* Voice input is offered on this connection (the "stt" capability). */
@@ -1399,9 +1513,10 @@ uint64_t oc_model_listen_take_audio(oc_model *m, uint8_t **mp4, size_t *len);
  * last chosen is worth hearing. */
 int      oc_model_preview_take_audio(oc_model *m, uint8_t **mp4, size_t *len);
 
-/* User ids currently typing in `channel_id` (last seen within the timeout),
- * excluding `exclude` (typically self). Fills `out` up to `cap`; returns count. */
-size_t oc_model_typing(const oc_model *m, uint64_t channel_id, uint64_t exclude,
+/* User ids currently typing in `channel_id` (last seen within the timeout), in
+ * the thread `thread_root` -- 0 for the main scroll (REQ-121) -- excluding
+ * `exclude` (typically self). Fills `out` up to `cap`; returns count. */
+size_t oc_model_typing(const oc_model *m, uint64_t channel_id, uint64_t thread_root, uint64_t exclude,
                        uint64_t *out, size_t cap);
 
 #endif /* OC_MODEL_H */

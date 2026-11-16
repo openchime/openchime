@@ -158,9 +158,11 @@ void oc_client_react(oc_client *c, uint64_t channel_id, uint64_t message_id,
 void oc_client_edit(oc_client *c, uint64_t channel_id, uint64_t message_id, const char *body);
 void oc_client_delete(oc_client *c, uint64_t channel_id, uint64_t message_id);
 
-/* Signal "I am typing" in `channel_id`. The frontend calls this (throttled) as
- * the user composes; the server relays a TYPING_UPDATE to other members. */
-void oc_client_typing(oc_client *c, uint64_t channel_id);
+/* Signal "I am typing" in `channel_id`, in the thread `thread_root` the composer
+ * is replying in, or 0 for the main scroll (REQ-121). The frontend calls this
+ * (throttled) as the user composes; the server relays a TYPING_UPDATE to other
+ * members. */
+void oc_client_typing(oc_client *c, uint64_t channel_id, uint64_t thread_root);
 
 /* Open a thread on `parent_id` (requests its replies), post a reply to it, or
  * close the thread view. Replies stream into the model's thread buffer. */
@@ -261,11 +263,26 @@ void oc_client_get_channel_description(oc_client *c, uint64_t channel_id);
  * file or an activity item needs to reach something outside the loaded window.
  * Arrives as an ordinary backfill replay. */
 void oc_client_history_around(oc_client *c, uint64_t channel_id, uint64_t message_id, uint16_t limit);
+/* Jump to a date: ask for the message at `at_ms` in a conversation (parent_id
+ * 0) or one thread of it. The answer lands in the model's found_* fields
+ * (found_seq moves on); the frontend opens it as a permalink, with
+ * oc_client_history_around. */
+void oc_client_find_at_time(oc_client *c, uint64_t channel_id, uint64_t parent_id, uint64_t at_ms);
 
 void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op);
+/* Remind me of a message at `at_ms` (REQ-283), saving it if it is not; 0
+ * clears the reminder and leaves it saved. Every device of mine is told
+ * (SAVED_UPDATED); when it comes due the model's reminder_seq moves on. */
+void oc_client_set_reminder(oc_client *c, uint64_t message_id, uint64_t at_ms);
 /* Fold a message away for me on every device (on 1), or open it again (on 0).
  * The model's msg->collapsed follows when the daemon answers. */
 void oc_client_set_collapsed(oc_client *c, uint64_t message_id, int on);
+/* Move a message (REQ-053): to `dest_channel`'s top level, or into the thread
+ * `dest_parent` there. A thread root moves with its replies. `leave_marker`
+ * leaves a line where it was. Both channels' readers are told (MESSAGE_MOVED);
+ * a refusal comes back as an error carrying the message id. */
+void oc_client_move_message(oc_client *c, uint64_t message_id, uint64_t dest_channel,
+                            uint64_t dest_parent, int leave_marker);
 void oc_client_list_saved(oc_client *c);
 void oc_client_close_saved(oc_client *c);
 
@@ -299,6 +316,15 @@ int  oc_client_post_poll(oc_client *c, uint64_t channel_id, uint64_t parent_id, 
                          const char *const *options, uint8_t n, uint8_t flags, uint64_t close_at_ms);
 /* Vote: `picks` is the whole selection, option indexes; n 0 withdraws it. */
 void oc_client_vote(oc_client *c, uint64_t channel_id, uint64_t message_id, const uint8_t *picks, uint8_t n);
+/* To-do lists (todo.h): a message whose body is "/todo <title>" and a task per
+ * line is one; these work it. The daemon answers with the list's new state to
+ * the whole conversation (the model's msg->todo), or an error. Marking states
+ * the result wanted, so marks made at once by two people agree. Only the
+ * list's author may rename it. */
+void oc_client_todo_add(oc_client *c, uint64_t channel_id, uint64_t message_id,
+                        const char *name, const char *description);
+void oc_client_todo_mark(oc_client *c, uint64_t channel_id, uint64_t message_id, uint16_t task, int done);
+void oc_client_todo_rename(oc_client *c, uint64_t channel_id, uint64_t message_id, const char *title);
 /* Who voted (refused by the daemon for an anonymous poll): fills the model's
  * voterlist, as the who-reacted list is filled. */
 void oc_client_list_poll_voters(oc_client *c, uint64_t channel_id, uint64_t message_id);
@@ -325,6 +351,18 @@ void oc_client_set_schedule(oc_client *c, uint8_t mode, int16_t tz_offset_min,
 /* REQ-135: replace my keyword list / my priority people, wholesale. */
 void oc_client_set_keywords(oc_client *c, const char terms[][OC_KEYWORD_MAX], uint8_t n);
 void oc_client_set_priority(oc_client *c, const uint64_t *people, uint8_t n);
+/* Mute (`on`) or unmute one person, for me alone: their messages stop notifying
+ * me and counting as unread, on every device. The answer comes back as the whole
+ * list (the model's `muted_users`); a frontend asks for the channel list again
+ * when it does, so the daemon's unread counts follow. */
+void oc_client_set_user_mute(oc_client *c, uint64_t user_id, int on);
+/* Block (`on`) or unblock one person, for me alone; never told to them. The
+ * answer is the whole list (the model's `blocks`). */
+void oc_client_set_block(oc_client *c, uint64_t user_id, int on);
+/* Who may start a new direct conversation with me: anyone (0) or nobody (1). */
+void oc_client_set_dm_privacy(oc_client *c, int nobody);
+/* Owner/admin: every block in the workspace, into the model's `block_list`. */
+void oc_client_list_blocks(oc_client *c);
 /* REQ-278: pause notifications for `minutes` from now; 0 ends the pause. */
 void oc_client_set_snooze(oc_client *c, uint32_t minutes);
 /* Share my read receipts, or stop (REQ-090). Mine only: I still see the
@@ -333,6 +371,9 @@ void oc_client_set_read_receipts(oc_client *c, int share);
 /* REQ-062: threads I am in, and the two acts the view offers. */
 void oc_client_list_threads(oc_client *c, uint8_t filter);
 void oc_client_thread_follow(oc_client *c, uint64_t channel_id, uint64_t root_id, uint8_t on);
+/* Follow every thread in a conversation, or stop (REQ-282). The answer is the
+ * whole NOTIFY_PREFS snapshot, which updates each channel's follow_threads. */
+void oc_client_channel_thread_follow(oc_client *c, uint64_t channel_id, uint8_t on);
 void oc_client_mark_thread_read(oc_client *c, uint64_t root_id, uint64_t up_to);
 void oc_client_list_notify_prefs(oc_client *c);
 void oc_client_toggle_prefs(oc_client *c, int open);
@@ -365,6 +406,9 @@ void oc_client_list_settings(oc_client *c);
  * member). The answer folds into the model as `storage`/`storage_have`. Toggle
  * the overlay is frontend view state. */
 void oc_client_storage_status(oc_client *c);
+/* The workspace's usage over the last `days` UTC days (REQ-043; owner/admin
+ * only, 1..OC_USAGE_MAX_DAYS): into the model's `usage`, `usage_have`. */
+void oc_client_usage(oc_client *c, unsigned days);
 /* The daemon's critical failures (REQ-263), owner/admin only: ask for the list
  * (into the model's `srvalerts`), or acknowledge one -- `id` 0 for every one --
  * after which the list is asked for again. */
@@ -467,6 +511,9 @@ void oc_client_channel_group(oc_client *c, uint64_t channel_id, uint64_t group_i
 void oc_client_list_emoji(oc_client *c);
 void oc_client_add_emoji(oc_client *c, const char *name, uint64_t attachment_id);
 void oc_client_delete_emoji(oc_client *c, const char *name);
+/* Rename a custom emoji (REQ-072); the old name keeps showing it, as an alias.
+ * Whoever may delete it may. The catalogue comes back as EMOJI_LIST. */
+void oc_client_rename_emoji(oc_client *c, const char *name, const char *new_name);
 /* Upload an image and register it as `name` in one step. */
 void oc_client_upload_emoji(oc_client *c, uint64_t channel_id, const char *name, const char *path);
 /* Custom status (REQ-241/122) and profile fields (REQ-240). Empty status text clears
@@ -483,6 +530,17 @@ void oc_client_set_profile(oc_client *c, const char *full_name, const char *titl
 /* A member's whole profile, `user_id` 0 for mine; it arrives as PROFILE_INFO
  * (the model's users[], and for mine the phone too). */
 void oc_client_get_profile(oc_client *c, uint64_t user_id);
+/* An owner or admin adds (`field_id` 0), renames or moves (`position` not 0),
+ * or deletes (`op` OC_PROFILE_FIELD_DELETE) one of the workspace's own profile
+ * fields, `kind` OC_PROFILE_FIELD_TEXT or _LINK. Everyone is told PROFILE_FIELDS. */
+void oc_client_set_profile_field(oc_client *c, uint64_t field_id, int op, int kind,
+                                 uint16_t position, const char *label);
+/* My value for one profile field, "" to clear it; it comes back as PROFILE_INFO. */
+void oc_client_set_profile_field_value(oc_client *c, uint64_t field_id, const char *value);
+/* My out of office (REQ-122), from `start_ms` until `end_ms`, with a message
+ * ("" for none); `end_ms` 0 clears it. Comes back as PROFILE_INFO, and to
+ * everyone as my roster row. */
+void oc_client_set_out_of_office(oc_client *c, uint64_t start_ms, uint64_t end_ms, const char *message);
 /* Set only my read-aloud voice (REQ-292). SET_PROFILE replaces every field,
  * so the core fetches my whole profile first and sends it back with the voice
  * changed: nothing else, the phone included, is touched. */
@@ -596,6 +654,12 @@ uint64_t oc_client_post_video(oc_client *c, uint64_t channel_id, uint64_t thread
                               uint8_t *video, size_t video_len, uint8_t *poster, size_t poster_len,
                               uint32_t duration_ms, uint16_t width, uint16_t height,
                               const char *caption);
+/* Post a snippet (REQ-226): `text` (copied; at most OC_SNIPPET_MAX_SIZE) as a
+ * text/plain attachment with a title and a language (lexer.h names; "" for
+ * none), into the channel or the thread `thread_root`. Returns the job's tag,
+ * or 0 if nothing was queued. */
+uint64_t oc_client_post_snippet(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                                const char *title, const char *language, const char *text);
 /* Fetch a video message into memory for playing (REQ-165): like
  * oc_client_fetch_attachment, under the attachment ceiling rather than the
  * inline one, with progress. Returns the tag (the attachment id). */

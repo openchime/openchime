@@ -124,6 +124,106 @@ static uintattr_t nick_color(uint64_t uid) {
 /* The width-correct draw primitives (tk_cp_width/tk_text/tk_fill) now live in
  * tuikit as tk_cp_width/tk_text/tk_fill; panels/frames as tk_panel/tk_box. */
 
+/* ---- snippets (REQ-226) ------------------------------------------------------
+ * A snippet's text is its attachment's bytes, fetched one at a time for what is
+ * shown and kept here, a few at once. The main loop hands the fetched bytes in
+ * (tui_snip_take); `o` on a message opens its snippet whole. */
+#include "lexer.h"
+enum { TUI_SNIPS = 8 };
+static struct { uint64_t id; char *text; size_t len; } g_tsnip[TUI_SNIPS];
+static int      g_tsnip_next;
+static uint64_t g_tsnip_pending, g_tsnip_lost[16];
+static time_t   g_tsnip_since;
+static int      g_n_tsnip_lost;
+static oc_client *g_tsnip_cl;   /* the client the fetches go through */
+
+static const char *tui_snip_text(uint64_t id, size_t *len) {
+    for (int i = 0; i < TUI_SNIPS; i++)
+        if (g_tsnip[i].id == id && g_tsnip[i].text) { *len = g_tsnip[i].len; return g_tsnip[i].text; }
+    return NULL;
+}
+static void tui_snip_want(uint64_t id) {
+    if (!g_tsnip_cl || g_tsnip_pending) return;
+    for (int i = 0; i < g_n_tsnip_lost; i++) if (g_tsnip_lost[i] == id) return;
+    g_tsnip_pending = id;
+    g_tsnip_since = time(NULL);
+    oc_client_fetch_attachment(g_tsnip_cl, id);
+}
+/* Fetched bytes: kept when they are the snippet asked for. Takes `d`. Returns
+ * 1 when it took them. */
+static int tui_snip_take(uint64_t id, uint8_t *d, size_t n) {
+    if (!id || id != g_tsnip_pending) return 0;
+    g_tsnip_pending = 0;
+    char *t = malloc(n + 1);
+    if (t) { if (n) memcpy(t, d, n); t[n] = '\0'; }
+    free(d);
+    if (!t) return 1;
+    int s = g_tsnip_next; g_tsnip_next = (g_tsnip_next + 1) % TUI_SNIPS;
+    free(g_tsnip[s].text);
+    g_tsnip[s].id = id; g_tsnip[s].text = t; g_tsnip[s].len = n;
+    return 1;
+}
+static uintattr_t tui_lex_color(uint8_t kind) {
+    return kind == OC_LEX_KEYWORD ? (TB_BLUE | TB_BOLD) : kind == OC_LEX_STRING ? TB_GREEN
+         : kind == OC_LEX_COMMENT ? (TB_BLACK | TB_BOLD) : kind == OC_LEX_NUMBER ? TB_YELLOW : TB_DEFAULT;
+}
+
+/* The snippet viewer: the whole text, coloured, from line `top`, over the
+ * screen; its title and the keys on the first row. Returns the line count. */
+static int tui_snip_view_draw(uint64_t id, const char *title, int lang, int top) {
+    int W = tb_width(), H = tb_height();
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) tb_set_cell(x, y, ' ', TB_DEFAULT, TB_DEFAULT);
+    char head[256];
+    snprintf(head, sizeof head, " %s \xc2\xb7 %s    j/k scroll, space page, q close", title, oc_lex_label(lang));
+    tk_text(0, 0, W, head, TB_BOLD, TB_DEFAULT);
+    size_t n = 0;
+    const char *s = tui_snip_text(id, &n);
+    if (!s) { tk_text(1, 2, W, "loading\xe2\x80\xa6", TB_DEFAULT, TB_DEFAULT); return 0; }
+    static oc_lex_tok toks[8192];
+    size_t nt = oc_lex(lang, s, n, toks, sizeof toks / sizeof toks[0]);
+    int line = 0, row = 2;
+    size_t i = 0, t = 0;
+    while (i <= n) {
+        size_t e = i; while (e < n && s[e] != '\n') e++;
+        if (line >= top && row < H) {
+            char num[16]; snprintf(num, sizeof num, "%5d ", line + 1);
+            int x = tk_text(0, row, W, num, TB_BLACK | TB_BOLD, TB_DEFAULT);
+            size_t p = i;
+            while (p < e && x < W) {
+                while (t < nt && toks[t].start + toks[t].len <= p) t++;
+                size_t q; uint8_t kind = OC_LEX_PLAIN;
+                if (t < nt && toks[t].start <= p) { q = toks[t].start + toks[t].len; kind = toks[t].kind; }
+                else q = (t < nt && toks[t].start < e) ? toks[t].start : e;
+                if (q > e) q = e;
+                if (q <= p) q = p + 1;
+                char seg[512]; size_t k = 0;
+                for (size_t r = p; r < q && k + 5 < sizeof seg; r++) {
+                    if (s[r] == '\t') { memcpy(seg + k, "    ", 4); k += 4; }
+                    else if (s[r] != '\r') seg[k++] = s[r];
+                }
+                seg[k] = '\0';
+                x = tk_text(x, row, W, seg, tui_lex_color(kind), TB_DEFAULT);
+                p = q;
+            }
+            row++;
+        } else {
+            while (t < nt && toks[t].start + toks[t].len <= e) t++;
+        }
+        line++;
+        if (e >= n) break;
+        i = e + 1;
+    }
+    return line;
+}
+
+/* A fetch that never came back is not asked for again. */
+static void tui_snip_tick(void) {
+    if (g_tsnip_pending && time(NULL) - g_tsnip_since > 10) {
+        if (g_n_tsnip_lost < 16) g_tsnip_lost[g_n_tsnip_lost++] = g_tsnip_pending;
+        g_tsnip_pending = 0;
+    }
+}
+
 /* ---- a rebuilt-each-frame list of wrapped display rows for the message pane -- */
 
 typedef struct { char *s; uintattr_t fg; int mi; } row_t;   /* mi = message index (-1 = none) */
@@ -333,11 +433,21 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
             else snprintf(who, sizeof who, "user%llu", (unsigned long long)m->author_id);
         }
         char said[1024];
-        /* Its spoilers read as their words, or, shown, as written (§1d). */
-        if (spoilers_shown(m->message_id) && has_spoilers(m->body + m->action.start))
-            snprintf(said, sizeof said, "%s %s", who, m->body + m->action.start);
-        else
-            oc_model_line(NULL, m->author_id, who, 1, m->body + m->action.start, said, sizeof said);
+        /* Its time tokens read in this reader's zone and clock, as a body's do
+         * (§1c); its spoilers read as their words, or, shown, as written (§1d). */
+        oc_rt_clock ak;
+        oc_model_clock(NULL, (int64_t)time(NULL) * 1000, &ak);
+        ak.time24 = !(g_cfg && !g_cfg->time_24h);
+        const char *atext = m->body + m->action.start;
+        if (spoilers_shown(m->message_id) && has_spoilers(atext)) {
+            char *loc = oc_rt_local_times(atext, strlen(atext), &ak);
+            snprintf(said, sizeof said, "%s %s", who, loc ? loc : atext);
+            free(loc);
+        } else {
+            size_t wl = (size_t)snprintf(said, sizeof said, "%s ", who);
+            if (wl >= sizeof said) wl = sizeof said - 1;
+            oc_rt_flatten_at(atext, strlen(atext), &ak, said + wl, sizeof said - wl);
+        }
         char *al = malloc(strlen(stamp) + strlen(said) + 16);
         if (al) {
             sprintf(al, "%s  * %s%s", stamp, said, m->edited ? " (edited)" : "");
@@ -359,6 +469,15 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
             for (size_t k = rstart; k < r->n; k++) r->v[k].mi = mi;
             return;
         }
+        /* A person this reader muted: one line saying so, its body, files and
+         * reactions folded away until `m` shows this one message. */
+        if (oc_model_is_muted_user(mdl, m->author_id) && !tui_expanded(m->message_id)) {
+            static const char MUTED[] = "    Message from a muted person (m to show)";
+            char *d = malloc(sizeof MUTED);
+            if (d) { strcpy(d, MUTED); rows_push(r, d, TB_BLACK | TB_BOLD); }
+            for (size_t k = rstart; k < r->n; k++) r->v[k].mi = mi;
+            return;
+        }
         /* The source as written (MARKDOWN.md §5), except a spoiler, covered
          * until it is shown (§1d), a time token, which is shown as its
          * time here: the token itself reads in UTC (§1c), and an id-form
@@ -373,7 +492,9 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
         const char *shown = loc ? loc : src;
         char *named = oc_model_mention_display(mdl, shown, strlen(shown));
         size_t body_first = r->n;
-        wrap_push(r, named ? named : shown, TB_DEFAULT, width, 4);
+        /* A to-do list is drawn as its list, below; the "/todo" text that
+         * made it is what a client without one shows. */
+        if (!m->todo) wrap_push(r, named ? named : shown, TB_DEFAULT, width, 4);
         free(named);
         free(loc);
         free(cov);
@@ -402,6 +523,33 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
             snprintf(al, sizeof al, "    \xf0\x9f\x93\x8e %s (no longer available)",
                      a->filename[0] ? a->filename : "file");
             acol = TB_BLACK | TB_BOLD;
+        } else if (a->media_kind == OC_MEDIA_SNIPPET) {
+            /* A snippet (REQ-226): its title and language, then its first
+             * lines once fetched; o opens it whole. */
+            snprintf(al, sizeof al, "    [snippet] %s \xc2\xb7 %s  (o to open)",
+                     a->title[0] ? a->title : a->filename, oc_lex_label(oc_lex_language(a->language)));
+            char *own = strdup(al);
+            if (own) rows_push(r, own, acol);
+            size_t sl = 0;
+            const char *st = tui_snip_text(a->id, &sl);
+            if (!st) {
+                tui_snip_want(a->id);
+                char *ld = strdup("      loading\xe2\x80\xa6");
+                if (ld) rows_push(r, ld, TB_BLACK | TB_BOLD);
+                continue;
+            }
+            size_t p = 0;
+            for (int ln = 0; ln < 3 && p < sl; ln++) {
+                size_t e = p; while (e < sl && st[e] != '\n') e++;
+                char lb[200]; size_t k = 0;
+                lb[k++] = ' '; lb[k++] = ' '; lb[k++] = ' '; lb[k++] = ' '; lb[k++] = ' '; lb[k++] = ' ';
+                for (size_t q = p; q < e && k + 5 < sizeof lb; q++) lb[k++] = st[q] == '\t' ? ' ' : st[q];
+                lb[k] = '\0';
+                char *ol = strdup(lb);
+                if (ol) rows_push(r, ol, TB_DEFAULT);
+                p = e + 1;
+            }
+            continue;
         } else if (a->media_kind == OC_MEDIA_VIDEO_MESSAGE) {
             /* A video message (REQ-165). A terminal plays nothing (ARCH-75): say
              * what it is and how long, and keep the download. */
@@ -454,6 +602,40 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
         char *fr = malloc(strlen(fl) + 1);
         if (fr) { strcpy(fr, fl); rows_push(r, fr, TB_DEFAULT); }
     }
+    /* A to-do list: its title, then a task to a line -- "[x]" when done, its
+     * number, name and description, and who marked it done -- then how many
+     * are done and the keys that work it. */
+    if (m->todo && !m->deleted) {
+        const oc_todo_view *tv = m->todo;
+        char *tl = malloc(OC_TODO_TITLE_MAX + 16);
+        if (tl) {
+            snprintf(tl, OC_TODO_TITLE_MAX + 16, "    To-do: %s", tv->title ? tv->title : "");
+            wrap_push(r, tl, TB_CYAN | TB_BOLD, width, 10);
+            free(tl);
+        }
+        unsigned done = 0;
+        size_t cap = OC_TODO_NAME_MAX + OC_TODO_DESC_MAX + 160;
+        char *kl = malloc(cap);
+        for (uint16_t k = 0; kl && k < tv->total && k < tv->cap; k++) {
+            const oc_todo_task_view *tk = &tv->tasks[k];
+            size_t p = (size_t)snprintf(kl, cap, "    %s %u. %s", tk->done ? "[x]" : "[ ]", (unsigned)k + 1u,
+                                        tk->name ? tk->name : "");
+            if (p < cap && tk->desc && tk->desc[0])
+                p += (size_t)snprintf(kl + p, cap - p, " \xe2\x80\x94 %s", tk->desc);
+            if (tk->done) {
+                done++;
+                const char *who = tk->done_by ? oc_model_user_name(mdl, tk->done_by) : NULL;
+                if (p < cap) snprintf(kl + p, cap - p, "  (done by %s)", (who && who[0]) ? who : "someone");
+            }
+            wrap_push(r, kl, tk->done ? TB_CYAN : TB_DEFAULT, width, 10);
+        }
+        free(kl);
+        char fl[160];
+        snprintf(fl, sizeof fl, "    %u of %u done  (D marks a task; Enter adds one%s)", done, (unsigned)tv->total,
+                 tv->author_id == me ? " or renames the list" : "");
+        char *fr = malloc(strlen(fl) + 1);
+        if (fr) { strcpy(fr, fl); rows_push(r, fr, TB_DEFAULT); }
+    }
     if (m->n_reactions) {
         char rl[256]; size_t p = 0;
         p += (size_t)snprintf(rl, sizeof rl, "    ");
@@ -467,6 +649,18 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
         }
         char *rr = malloc(p + 1);
         if (rr) { memcpy(rr, rl, p); rr[p] = '\0'; rows_push(r, rr, TB_MAGENTA); }
+    }
+    if (m->saved && m->remind_at && !m->deleted) {
+        /* Its reminder (REQ-283), as the desktop client's Saved view shows it:
+         * when it is set for, or that it went off. */
+        time_t rt = (time_t)(m->remind_at / 1000);
+        struct tm rv; char when[48] = "set";
+        if (oc_localtime_r(&rt, &rv)) strftime(when, sizeof when, "%a %d %b at %H:%M", &rv);
+        char rl[96];
+        snprintf(rl, sizeof rl, "    \xe2\x8f\xb0 Reminder %s %s",
+                 (uint64_t)time(NULL) * 1000u >= m->remind_at ? "was" : "for", when);
+        char *rr = strdup(rl);
+        if (rr) rows_push(r, rr, TB_YELLOW);
     }
     if (show_replies && m->reply_count > 0) {
         /* "N replies: Ana, Ben, Cy" -- the most recent repliers, newest first
@@ -570,7 +764,15 @@ static void e2e_status(oc_model *m, const oc_channel *c, char *out, size_t cap, 
                  "decline (Ctrl+K).", who);
 }
 
-/* Build the rows for the open thread: the parent (found in `ch`) then replies. */
+/* The reply a jump to a date found in the open thread (its index in
+ * thread_msgs, and that thread's root): marked and kept in view until the
+ * reader scrolls or the thread changes. -1 for none. */
+static int      g_thread_mark = -1;
+static uint64_t g_thread_mark_root;
+
+/* Build the rows for the open thread: the parent (found in `ch`) then replies.
+ * Each reply's rows are tagged with its index in thread_msgs, so the marked
+ * one can be found; the parent's are not. */
 static void build_thread_rows(rows_t *r, const oc_model *m, const oc_channel *ch,
                               uint64_t me, int width) {
     if (ch) for (size_t i = 0; i < ch->n_msgs; i++)
@@ -579,7 +781,7 @@ static void build_thread_rows(rows_t *r, const oc_model *m, const oc_channel *ch
             break;
         }
     for (size_t i = 0; i < m->n_thread_msgs; i++)
-        append_msg_rows(r, m, &m->thread_msgs[i], me, width, ch, 0, -1);
+        append_msg_rows(r, m, &m->thread_msgs[i], me, width, ch, 0, (int)i);
 }
 
 /* ---- rendering ------------------------------------------------------------- */
@@ -657,8 +859,13 @@ static void build_roster_rows(rows_t *r, const oc_model *m, int width) {
                                                    : "\xe2\x97\x8b";   /* ○ */
         const char *role = u->role == OC_ROLE_OWNER ? "  (owner)"
                          : u->role == OC_ROLE_ADMIN ? "  (admin)" : "";
-        snprintf(line, sizeof line, "%s %s%s%s", dot, u->name[0] ? u->name : "?",
-                 role, u->disabled ? "  (deactivated)" : "");
+        char oo[100] = "";
+        if (oc_model_ooo_active(m, u->user_id, (uint64_t)time(NULL) * 1000u)) {
+            char ol[96]; oc_model_ooo_label(u, ol, sizeof ol);
+            snprintf(oo, sizeof oo, "  (%s)", ol);
+        }
+        snprintf(line, sizeof line, "%s %s%s%s%s", dot, u->name[0] ? u->name : "?",
+                 role, u->disabled ? "  (deactivated)" : "", oo);
         uintattr_t col = pr == OC_PRESENCE_ONLINE ? TB_GREEN
                        : pr == OC_PRESENCE_AWAY   ? TB_YELLOW : TB_DEFAULT;
         char *rr = malloc(strlen(line) + 1);
@@ -668,6 +875,35 @@ static void build_roster_rows(rows_t *r, const oc_model *m, int width) {
 
 /* Build the rows for the "who reacted" overlay: each reactor as "<emoji> name",
  * grouped in the emoji-then-user order the server returns. */
+/* A muted person's reactions in the reactions list (SET_USER_MUTE): folded to
+ * "Reaction from a muted person", each shown on its own with the digit beside
+ * it, and remembered for as long as the client runs. */
+static struct { uint64_t mid, uid; char emoji[40]; } g_rxt_shown[64];
+static int g_n_rxt_shown;
+static int rxt_revealed(uint64_t mid, uint64_t uid, const char *emoji) {
+    for (int i = 0; i < g_n_rxt_shown; i++)
+        if (g_rxt_shown[i].mid == mid && g_rxt_shown[i].uid == uid && !strcmp(g_rxt_shown[i].emoji, emoji)) return 1;
+    return 0;
+}
+static int rxt_folded(const oc_model *m, const oc_reactor_row *rr) {
+    return oc_model_is_muted_user(m, rr->user_id) && !rxt_revealed(m->reactlist_message, rr->user_id, rr->emoji);
+}
+/* Show the `nth` folded reaction (1-based), as listed; 0 if there is none. */
+static int rxt_reveal_nth(const oc_model *m, int nth) {
+    int k = 0;
+    for (size_t i = 0; i < m->n_reactors; i++) {
+        const oc_reactor_row *rr = &m->reactors[i];
+        if (!rxt_folded(m, rr) || ++k != nth) continue;
+        int at = g_n_rxt_shown < (int)(sizeof g_rxt_shown / sizeof g_rxt_shown[0]) ? g_n_rxt_shown++
+                                                                                  : (int)(sizeof g_rxt_shown / sizeof g_rxt_shown[0]) - 1;
+        g_rxt_shown[at].mid = m->reactlist_message;
+        g_rxt_shown[at].uid = rr->user_id;
+        snprintf(g_rxt_shown[at].emoji, sizeof g_rxt_shown[at].emoji, "%s", rr->emoji);
+        return 1;
+    }
+    return 0;
+}
+
 static void build_reactlist_rows(rows_t *r, const oc_model *m, int width) {
     (void)width;
     char line[160];
@@ -675,14 +911,23 @@ static void build_reactlist_rows(rows_t *r, const oc_model *m, int width) {
              m->n_reactors == 1 ? "" : "s");
     char *h = malloc(strlen(line) + 1);
     if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+    int folded = 0;
     for (size_t i = 0; i < m->n_reactors; i++) {
         const oc_reactor_row *rr = &m->reactors[i];
-        const char *nm = oc_model_user_name(m, rr->user_id);
-        if (nm[0]) snprintf(line, sizeof line, "%s  %s", rr->emoji, nm);
-        else       snprintf(line, sizeof line, "%s  user%llu", rr->emoji,
-                            (unsigned long long)rr->user_id);
+        uintattr_t fg = TB_DEFAULT;
+        if (rxt_folded(m, rr)) {
+            /* The digit shows this one, with the message box empty. */
+            if (++folded <= 9) snprintf(line, sizeof line, "%s  Reaction from a muted person (%d to show)", rr->emoji, folded);
+            else               snprintf(line, sizeof line, "%s  Reaction from a muted person", rr->emoji);
+            fg = TB_BLACK | TB_BOLD;              /* as a muted person's message folds */
+        } else {
+            const char *nm = oc_model_user_name(m, rr->user_id);
+            if (nm[0]) snprintf(line, sizeof line, "%s  %s", rr->emoji, nm);
+            else       snprintf(line, sizeof line, "%s  user%llu", rr->emoji,
+                                (unsigned long long)rr->user_id);
+        }
         char *rw = malloc(strlen(line) + 1);
-        if (rw) { strcpy(rw, line); rows_push(r, rw, TB_DEFAULT); }
+        if (rw) { strcpy(rw, line); rows_push(r, rw, fg); }
     }
 }
 
@@ -952,7 +1197,7 @@ static void draw_help(int W, int H) {
         { "Members",    "n  new DM · Enter for message / role / remove" },
         { "New DM",     "type to find a person · Space end-to-end encrypted · Enter opens" },
         { "Encrypted",  "Ctrl+K: accept or decline, trust a new key, end or forget it" },
-        { "Messages",   "t thread · r react · e edit · x delete · v spoilers · c collapse · m more" },
+        { "Messages",   "t thread · r react · e edit · x delete · v spoilers · c collapse · m more · D mark a to-do" },
         { "Search",     "Ctrl+O newest first · oldest first · best match first" },
         { NULL, NULL },
         { NULL, "Everything else" },
@@ -996,27 +1241,80 @@ static void draw_help(int W, int H) {
     }
 }
 
-/* The /profile modal (REQ-020): your identity + how to change it. Drawn over the
+/* "2026-12-15 Back on Monday": that day's local midnight in ms, `*rest` the
+ * words after it; 0 when it does not start with a day. */
+static uint64_t ooo_day_ms(const char *v, const char **rest) {
+    int y = 0, mo = 0, d = 0, used = 0;
+    if (sscanf(v, "%d-%d-%d%n", &y, &mo, &d, &used) != 3) return 0;
+    if (y < 2000 || y > 2200 || mo < 1 || mo > 12 || d < 1 || d > 31) return 0;
+    if (v[used] && v[used] != ' ') return 0;
+    struct tm tm;
+    memset(&tm, 0, sizeof tm);
+    tm.tm_year = y - 1900; tm.tm_mon = mo - 1; tm.tm_mday = d; tm.tm_isdst = -1;
+    time_t t = mktime(&tm);
+    if (t == (time_t)-1 || tm.tm_mday != d) return 0;
+    const char *r = v + used;
+    while (*r == ' ') r++;
+    *rest = r;
+    return (uint64_t)t * 1000u;
+}
+
+/* The key that edits the workspace field at `i` on one's own profile: 1-9,
+ * then a-k; and back. */
+static int pf_key(int i) { return i < 9 ? '1' + i : 'a' + (i - 9); }
+static int pf_index(uint32_t ch) {
+    if (ch >= '1' && ch <= '9') return (int)(ch - '1');
+    if (ch >= 'a' && ch <= 'k') return 9 + (int)(ch - 'a');
+    return -1;
+}
+
+/* The /profile modal (REQ-020): a person's identity -- yours with how to change
+ * it -- and the workspace's own fields with what they gave each. Drawn over the
  * presented frame like the palette/picker, so it self-presents. */
-static void draw_profile(const oc_model *m, int W, int H) {
-    const char *me = m->user_id ? oc_model_user_name(m, m->user_id) : "";
+static void draw_profile(const oc_model *m, uint64_t uid, int W, int H) {
+    if (!uid) uid = m->user_id;
+    int self = uid == m->user_id;
+    const char *me = uid ? oc_model_user_name(m, uid) : "";
     uint8_t role = OC_ROLE_MEMBER;
+    const oc_member *pm = NULL;
     for (size_t i = 0; i < m->n_users; i++)
-        if (m->users[i].user_id == m->user_id) { role = m->users[i].role; break; }
-    uint8_t pr = oc_model_presence_of(m, m->user_id);
+        if (m->users[i].user_id == uid) { role = m->users[i].role; pm = &m->users[i]; break; }
+    uint8_t pr = oc_model_presence_of(m, uid);
     const char *rn = role == OC_ROLE_OWNER ? "owner" : role == OC_ROLE_ADMIN ? "admin" : "member";
     const char *pn = pr == OC_PRESENCE_ONLINE ? "online" : pr == OC_PRESENCE_AWAY ? "away" : "offline";
     const tk_theme *th = tk_theme_active();
     char idbuf[32];
-    snprintf(idbuf, sizeof idbuf, "%llu", (unsigned long long)m->user_id);
-    struct { const char *label, *value; } R[] = {
-        { "Name",     me[0] ? me : "(unknown)" },
-        { "User ID",  idbuf },
-        { "Role",     rn },
-        { "Presence", pn },
-    };
-    int n = (int)(sizeof R / sizeof R[0]);
-    const char *hint = "Change your name or password from the action menu (Ctrl+K).";
+    snprintf(idbuf, sizeof idbuf, "%llu", (unsigned long long)uid);
+    struct { const char *label, *value; } R[4 + 2 + 2 + OC_MAX_PROFILE_FIELDS];
+    static char lbl[OC_MAX_PROFILE_FIELDS][OC_PROFILE_FIELD_LABEL_MAX + 8];
+    int n = 0;
+    R[n].label = "Name";     R[n++].value = me[0] ? me : "(unknown)";
+    R[n].label = "User ID";  R[n++].value = idbuf;
+    R[n].label = "Role";     R[n++].value = rn;
+    R[n].label = "Presence"; R[n++].value = pn;
+    if (pm && pm->title[0])    { R[n].label = "Title";    R[n++].value = pm->title; }
+    if (pm && pm->pronouns[0]) { R[n].label = "Pronouns"; R[n++].value = pm->pronouns; }
+    /* Out of office (REQ-122), while it is in force, and its message. */
+    char oo[96];
+    const oc_member *om = oc_model_ooo_active(m, uid, (uint64_t)time(NULL) * 1000u);
+    if (om) {
+        oc_model_ooo_label(om, oo, sizeof oo);
+        R[n].label = "Away"; R[n++].value = oo;
+        if (om->ooo_message[0]) { R[n].label = "Message"; R[n++].value = om->ooo_message; }
+    }
+    /* The workspace's fields, in its order; on your own, each with the key
+     * that fills it in. A link is its address, as the reader sees it. */
+    for (uint8_t k = 0; k < m->n_pfields; k++) {
+        const char *v = oc_model_profile_value(m, uid, m->pfields[k].id);
+        if (!self && !v[0]) continue;
+        if (self) snprintf(lbl[k], sizeof lbl[k], "%c %s", pf_key(k), m->pfields[k].label);
+        else      snprintf(lbl[k], sizeof lbl[k], "%s", m->pfields[k].label);
+        R[n].label = lbl[k];
+        R[n++].value = v[0] ? v : "-";
+    }
+    const char *hint = !self ? "Esc closes."
+                     : m->n_pfields ? "A key above fills in that field. Name, password and out of office: the action menu (Ctrl+K)."
+                                    : "Change your name, password or out of office from the action menu (Ctrl+K).";
 
     int labelw = 0, cw = tk_str_width(hint);
     for (int i = 0; i < n; i++) { int w = tk_str_width(R[i].label); if (w > labelw) labelw = w; }
@@ -1052,6 +1350,7 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_DM, ACT_ROLE_ADMIN, ACT_ROLE_MEMBER, ACT_REMOVE,
        /* channel menu */
        ACT_OPEN, ACT_JOIN, ACT_NOTIFY_ALL, ACT_NOTIFY_MENTIONS, ACT_NOTIFY_NONE, ACT_WEBHOOK_CREATE,
+       ACT_FOLLOW_THREADS,
        /* global action launcher (Ctrl-K) — replaces the remaining slash commands */
        ACT_NEWCHAN, ACT_NEWDM, ACT_SEARCH, ACT_NICK, ACT_AWAY, ACT_ONLINE, ACT_DND, ACT_PASSWD, ACT_RECEIPTS,
        ACT_PREFS, ACT_WEBHOOKS, ACT_LEAVE, ACT_INVITE, ACT_PROFILE, ACT_UPLOAD,
@@ -1074,6 +1373,24 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_DEACTIVATE,
        /* typed emoticons become emoji (compose.emoticons) */
        ACT_EMOTICONS,
+       /* open a conversation at a date, typed; or the open thread's replies */
+       ACT_JUMP_DATE, ACT_JUMP_DATE_THREAD,
+       /* move a message to another channel (REQ-053) */
+       ACT_MOVE,
+       /* a reminder on a message, which saves it (REQ-283): the choices, as
+        * the desktop client's reminder menu has them, and a time typed */
+       ACT_REMIND, ACT_REMIND_20M, ACT_REMIND_1H, ACT_REMIND_TOMORROW, ACT_REMIND_MONDAY,
+       ACT_REMIND_AT, ACT_REMIND_CLEAR,
+       /* blocks and DM privacy: block or unblock a person, who may start a DM
+        * with me, my blocked people (each an Unblock), and an admin's list */
+       ACT_BLOCK, ACT_UNBLOCK, ACT_DMPRIV, ACT_BLOCKED, ACT_BLOCKS_ADMIN,
+       ACT_UNBLOCK0, ACT_UNBLOCK_LAST = ACT_UNBLOCK0 + 27,
+       /* a member's profile, the workspace's own fields with it */
+       ACT_PROFILE_OF,
+       /* out of office (REQ-122): set or clear */
+       ACT_OOO,
+       /* a to-do list: mark a task, add one, or (its author) rename it */
+       ACT_TODO_MARK, ACT_TODO_ADD, ACT_TODO_RENAME,
        ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
@@ -1086,8 +1403,12 @@ static void menu_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
  * your vote: Tacos" when it is yours. The labels live here, not in the
  * model, which may move while the menu is open. */
 static char g_vote_labels[OC_POLL_MAX_OPTIONS][OC_POLL_OPTION_MAX + 32];
-static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int has_attach, const oc_poll_view *poll, int spoilers, int collapsed) {
+/* `block`: 0 no Block item (my own message, or the workspace's), 1 Block the
+ * author, 2 Unblock them. */
+static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int has_attach, const oc_poll_view *poll, int spoilers, int collapsed, int block, int reminded) {
     g_nmenu = 0;
+    if (block) g_menu[g_nmenu++] = (menuitem){ block == 2 ? "Unblock the author" : "Block the author",
+                                               block == 2 ? ACT_UNBLOCK : ACT_BLOCK };
     if (!deleted) g_menu[g_nmenu++] = (menuitem){ collapsed ? "Expand" : "Collapse", collapsed ? ACT_EXPAND : ACT_COLLAPSE };
     if (spoilers && !deleted)
         g_menu[g_nmenu++] = (menuitem){ spoilers > 1 ? "Hide spoilers" : "Show spoilers", ACT_SPOILERS };
@@ -1108,14 +1429,99 @@ static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int 
     if (may_del)  g_menu[g_nmenu++] = (menuitem){ "Delete",          ACT_DELETE };
     g_menu[g_nmenu++] = (menuitem){ "Who reacted", ACT_REACTORS };
     g_menu[g_nmenu++] = (menuitem){ "Mark unread from here", ACT_UNREAD };
+    if (!deleted && g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+        g_menu[g_nmenu++] = (menuitem){ reminded ? "Reminder (change or clear)..." : "Remind me...", ACT_REMIND };
+}
+
+/* "Remind me..." (REQ-283): in 20 minutes, in 1 hour, tomorrow at 9:00, next
+ * Monday at 9:00, or a time typed, and Clear when one is set -- the desktop
+ * client's reminder menu, item for item. */
+static void menu_build_remind(int reminded) {
+    g_nmenu = 0;
+    g_menu[g_nmenu++] = (menuitem){ "In 20 minutes",       ACT_REMIND_20M };
+    g_menu[g_nmenu++] = (menuitem){ "In 1 hour",           ACT_REMIND_1H };
+    g_menu[g_nmenu++] = (menuitem){ "Tomorrow at 9:00",    ACT_REMIND_TOMORROW };
+    g_menu[g_nmenu++] = (menuitem){ "Next Monday at 9:00", ACT_REMIND_MONDAY };
+    g_menu[g_nmenu++] = (menuitem){ "At a time...",        ACT_REMIND_AT };
+    if (reminded) g_menu[g_nmenu++] = (menuitem){ "Clear reminder", ACT_REMIND_CLEAR };
+}
+
+/* `days` from today at `hh`:`mm`, local time, in ms; 0 when it cannot be had. */
+static uint64_t tui_local_at(int days, int hh, int mm) {
+    time_t now = time(NULL);
+    struct tm q;
+    if (!oc_localtime_r(&now, &q)) return 0;
+    q.tm_mday += days; q.tm_hour = hh; q.tm_min = mm; q.tm_sec = 0; q.tm_isdst = -1;
+    time_t r = mktime(&q);
+    return r == (time_t)-1 ? 0 : (uint64_t)r * 1000u;
+}
+
+/* Set message `mid`'s reminder to `at` (0 clears it) and say so on the status
+ * line, in the reader's words. */
+static void tui_remind_set(oc_client *cl, uint64_t mid, uint64_t at) {
+    oc_client_set_reminder(cl, mid, at);
+    if (at) {
+        time_t ts = (time_t)(at / 1000); struct tm tv; char w[40] = "then";
+        if (oc_localtime_r(&ts, &tv)) strftime(w, sizeof w, "%a %d %b at %H:%M", &tv);
+        snprintf(g_closed_note, sizeof g_closed_note, "Saved. You'll be reminded %s.", w);
+    } else snprintf(g_closed_note, sizeof g_closed_note, "Reminder cleared. The message stays saved.");
+}
+
+/* The next Monday at 9:00: a week on when today is Monday. */
+static uint64_t tui_next_monday_9(void) {
+    time_t now = time(NULL);
+    struct tm t;
+    int wd = oc_localtime_r(&now, &t) ? t.tm_wday : 1;
+    int ahead = (8 - wd) % 7;                    /* Monday is 1 */
+    if (ahead == 0) ahead = 7;
+    return tui_local_at(ahead, 9, 0);
+}
+
+/* A reminder typed (REQ-283): "20m", "1h", "tomorrow" (09:00), "monday" (the
+ * next, 09:00), "14:30" (today, or tomorrow once past), "2026-05-03 14:30", or
+ * "clear" (returns 1, *at 0).
+ * The moment in ms into *at; 0 when it is none of them. */
+static int tui_parse_remind(const char *s, uint64_t *at) {
+    time_t now = time(NULL);
+    struct tm t;
+    int n, y, mo, d, hh, mm;
+    char unit = 0;
+    *at = 0;
+    while (*s == ' ') s++;
+    if (!strncmp(s, "clear", 5)) return 1;
+    if (!oc_localtime_r(&now, &t)) return 0;
+    if (sscanf(s, "%d%c", &n, &unit) == 2 && n > 0 && (unit == 'm' || unit == 'h') && !strchr(s, ':')) {
+        *at = ((uint64_t)now + (uint64_t)n * (unit == 'm' ? 60u : 3600u)) * 1000u;
+        return 1;
+    }
+    struct tm q = t;
+    q.tm_sec = 0; q.tm_isdst = -1;
+    if (!strncmp(s, "tomorrow", 8)) { q.tm_mday += 1; q.tm_hour = 9; q.tm_min = 0; }
+    else if (!strncmp(s, "monday", 6) || !strncmp(s, "next monday", 11)) {
+        *at = tui_next_monday_9();
+        return *at != 0;
+    }
+    else if (sscanf(s, "%d-%d-%d %d:%d", &y, &mo, &d, &hh, &mm) == 5) {
+        if (mo < 1 || mo > 12 || d < 1 || d > 31 || hh > 23 || mm > 59 || hh < 0 || mm < 0) return 0;
+        q.tm_year = y - 1900; q.tm_mon = mo - 1; q.tm_mday = d; q.tm_hour = hh; q.tm_min = mm;
+    } else if (sscanf(s, "%d:%d", &hh, &mm) == 2 && hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+        q.tm_hour = hh; q.tm_min = mm;
+        if (mktime(&q) <= now) { q = t; q.tm_sec = 0; q.tm_isdst = -1; q.tm_mday += 1; q.tm_hour = hh; q.tm_min = mm; }
+    } else return 0;
+    time_t r = mktime(&q);
+    if (r == (time_t)-1 || r <= now) return 0;
+    *at = (uint64_t)r * 1000u;
+    return 1;
 }
 /* The conversation marked unread (REQ-235) and still in focus: the loop's
  * keep-it-read step leaves it alone until focus moves, or it would read it again
  * on the next frame. */
 static uint64_t g_hold_unread;
-static void menu_build_member(int is_self) {
+static void menu_build_member(int is_self, int blocked) {
     g_nmenu = 0;
     if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Message",     ACT_DM };
+    if (!is_self) g_menu[g_nmenu++] = (menuitem){ blocked ? "Unblock" : "Block", blocked ? ACT_UNBLOCK : ACT_BLOCK };
+    g_menu[g_nmenu++] = (menuitem){ "Profile",     ACT_PROFILE_OF };
     g_menu[g_nmenu++] = (menuitem){ "Make admin",  ACT_ROLE_ADMIN };
     g_menu[g_nmenu++] = (menuitem){ "Make member", ACT_ROLE_MEMBER };
     if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Remove",      ACT_REMOVE };
@@ -1138,8 +1544,40 @@ static uint8_t e2e_state(const oc_model *m, const oc_channel *c) {
     const oc_pdm_view *v = c && !c->forgotten ? oc_model_pdm((oc_model *)m, c->channel_id) : NULL;
     return v ? v->state : 0;
 }
-/* `e2e`: the channel is an encrypted DM, whose session is in `state`. */
-static void menu_build_channel(int joined, int summarize, int e2e, uint8_t state) {
+/* A typed date for "Jump to date": "today", "yesterday", "2026-05-03", or
+ * "3 may" (this year); the reader's local midnight that day, in ms, or 0. */
+static int ci_prefix(const char *s, const char *p, size_t n) {   /* case-blind, the first n */
+    for (size_t i = 0; i < n; i++) {
+        int a = tolower((unsigned char)s[i]), b = tolower((unsigned char)p[i]);
+        if (a != b) return 0;
+        if (!a) return 1;
+    }
+    return 1;
+}
+static uint64_t tui_parse_day(const char *s) {
+    static const char *const MON[12] = { "jan", "feb", "mar", "apr", "may", "jun",
+                                         "jul", "aug", "sep", "oct", "nov", "dec" };
+    time_t now = time(NULL);
+    struct tm t;
+    if (!oc_localtime_r(&now, &t)) return 0;
+    int y = t.tm_year + 1900, mo = 0, d = 0;
+    char w[16] = "";
+    if (ci_prefix(s, "today", 6)) { mo = t.tm_mon + 1; d = t.tm_mday; }
+    else if (ci_prefix(s, "yesterday", 10)) { mo = t.tm_mon + 1; d = t.tm_mday - 1; }
+    else if (sscanf(s, "%d-%d-%d", &y, &mo, &d) == 3) { /* ISO */ }
+    else if (sscanf(s, "%d %15s %d", &d, w, &y) >= 2 || sscanf(s, "%15s %d %d", w, &d, &y) >= 2) {
+        for (int i = 0; i < 12; i++) if (ci_prefix(w, MON[i], 3)) { mo = i + 1; break; }
+    } else return 0;
+    if (mo < 1 || mo > 12 || d > 31 || y < 1970 || y > 9999) return 0;
+    struct tm q = {0};
+    q.tm_year = y - 1900; q.tm_mon = mo - 1; q.tm_mday = d; q.tm_isdst = -1;   /* day 0 is the day before the 1st */
+    time_t r = mktime(&q);
+    return r == (time_t)-1 ? 0 : (uint64_t)r * 1000u;
+}
+/* `e2e`: the channel is an encrypted DM, whose session is in `state`.
+ * `in_thread`: one of its threads is open, so its replies can be jumped in. */
+static void menu_build_channel(int joined, int summarize, int e2e, uint8_t state, int follow_threads,
+                               int in_thread) {
     g_nmenu = 0;
     if (!joined) g_menu[g_nmenu++] = (menuitem){ "Join",              ACT_JOIN };
     g_menu[g_nmenu++] = (menuitem){ "Open",                ACT_OPEN };
@@ -1149,9 +1587,14 @@ static void menu_build_channel(int joined, int summarize, int e2e, uint8_t state
         for (int i = 0; i < k; i++) g_menu[g_nmenu++] = (menuitem){ it[i].label, it[i].id };
     }
     if (summarize && !e2e) g_menu[g_nmenu++] = (menuitem){ "Summarize",   ACT_SUMMARIZE };
+    if (joined) g_menu[g_nmenu++] = (menuitem){ "Jump to date",   ACT_JUMP_DATE };
+    if (joined && in_thread) g_menu[g_nmenu++] = (menuitem){ "Jump to date in the open thread", ACT_JUMP_DATE_THREAD };
     g_menu[g_nmenu++] = (menuitem){ "Notify: all",         ACT_NOTIFY_ALL };
     g_menu[g_nmenu++] = (menuitem){ "Notify: mentions",    ACT_NOTIFY_MENTIONS };
     g_menu[g_nmenu++] = (menuitem){ "Notify: none",        ACT_NOTIFY_NONE };
+    /* Every thread in it followed (REQ-282); not in an encrypted DM. */
+    if (!e2e) g_menu[g_nmenu++] = (menuitem){ follow_threads ? "Stop following all threads" : "Follow all threads",
+                                              ACT_FOLLOW_THREADS };
     g_menu[g_nmenu++] = (menuitem){ "Webhooks",            ACT_WEBHOOKS };
     g_menu[g_nmenu++] = (menuitem){ "Create webhook",      ACT_WEBHOOK_CREATE };
     if (joined)  g_menu[g_nmenu++] = (menuitem){ "Leave",  ACT_LEAVE };
@@ -1172,11 +1615,15 @@ static const tk_pal_item g_launcher_items[] = {
     { "You",     "Change password",     NULL, NULL, ACT_PASSWD },
     { "You",     "Two-step sign-in",    NULL, NULL, ACT_SECURITY },
     { "You",     "Do not disturb",      NULL, NULL, ACT_DND },
+    { "You",     "Out of office",       NULL, NULL, ACT_OOO },
     { "You",     "Share my read receipts (on/off)", NULL, NULL, ACT_RECEIPTS },
     { "You",     "Your profile",        NULL, NULL, ACT_PROFILE },
     { "You",     "Read-aloud voice",    NULL, NULL, ACT_VOICES },
     { "You",     "Deactivate account",  NULL, NULL, ACT_DEACTIVATE },
+    { "You",     "Blocked people",      NULL, NULL, ACT_BLOCKED },
+    { "You",     "Who can start a DM with you (anyone/nobody)", NULL, NULL, ACT_DMPRIV },
     { "Admin",   "Invite a user",       NULL, NULL, ACT_INVITE },
+    { "Admin",   "Blocks",              NULL, NULL, ACT_BLOCKS_ADMIN },
     { "Admin",   "Storage usage",       NULL, NULL, ACT_STORAGE },
     { "Admin",   "Audit log",           NULL, NULL, ACT_AUDIT },
     { "Admin",   "Daemon alerts",       NULL, NULL, ACT_ALERTS },
@@ -1613,7 +2060,11 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     else if (fc && fc->kind == OC_CHANNEL_KIND_DM) {
         /* An encrypted DM is the same title behind a lock. */
         const char *pn = oc_model_user_name(m, fc->peer_id);
-        snprintf(mt, sizeof mt, "%s@%s", fc->e2e ? "\xf0\x9f\x94\x92 " : "", pn[0] ? pn : "dm");
+        /* And until when they are out of office (REQ-122), where they are. */
+        char oo[sizeof " \xc2\xb7 " - 1 + 96] = "";   /* the separator and the label */
+        const oc_member *om = oc_model_ooo_active(m, fc->peer_id, (uint64_t)time(NULL) * 1000u);
+        if (om) { char ol[96]; oc_model_ooo_label(om, ol, sizeof ol); snprintf(oo, sizeof oo, " \xc2\xb7 %s", ol); }
+        snprintf(mt, sizeof mt, "%s@%s%s", fc->e2e ? "\xf0\x9f\x94\x92 " : "", pn[0] ? pn : "dm", oo);
     } else if (fc && !fc->is_public)
         snprintf(mt, sizeof mt, "\xf0\x9f\x94\x92 %s", fc->name ? fc->name : "…");  /* 🔒 private */
     else if (fc)                 snprintf(mt, sizeof mt, "#%s", fc->name ? fc->name : "…");
@@ -1658,7 +2109,16 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             else if (m->thread_open)    build_thread_rows(&rows, m, fc, m->user_id, iw);
             else                        build_rows(&rows, m, fc, m->user_id, iw);
             int total = (int)rows.n, end;
-            if (panel == 2 && normal && msg_sel >= 0) {   /* keep the selection visible */
+            /* The reply a jump to a date found, in the thread it was found in. */
+            int thr_mark = (m->thread_open && g_thread_mark >= 0 && g_thread_mark_root == m->thread_parent)
+                         ? g_thread_mark : -1;
+            if (thr_mark >= 0) {                          /* keep the found reply visible */
+                int last = -1;
+                for (int i = 0; i < total; i++) if (rows.v[i].mi == thr_mark) last = i;
+                end = (last < 0) ? total : last + 1;
+                if (end < ih) end = ih;
+                if (end > total) end = total;
+            } else if (panel == 2 && normal && msg_sel >= 0) {   /* keep the selection visible */
                 int last = -1;
                 for (int i = 0; i < total; i++) if (rows.v[i].mi == msg_sel) last = i;
                 end = (last < 0) ? total : last + 1;
@@ -1673,7 +2133,8 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             if (start < 0) start = 0;
             int y = iy + (ih - (end - start));
             for (int i = start; i < end; i++, y++) {
-                int selrow = (panel == 2 && normal && rows.v[i].mi >= 0 && rows.v[i].mi == msg_sel);
+                int selrow = (panel == 2 && normal && rows.v[i].mi >= 0 && rows.v[i].mi == msg_sel) ||
+                             (thr_mark >= 0 && rows.v[i].mi == thr_mark);
                 uintattr_t bg = selrow ? th->sel_bg : th->bg;
                 if (selrow) tk_fill(y, ix, ix + iw, bg);
                 tk_text(ix, y, ix + iw, rows.v[i].s, selrow ? (th->sel_fg | TB_BOLD) : rows.v[i].fg, bg);
@@ -1696,7 +2157,14 @@ static void render(oc_client *cl, size_t focus, const char *composer,
                            : u->disabled ? th->muted
                            : p == OC_PRESENCE_ONLINE ? th->presence_on : p == OC_PRESENCE_AWAY ? th->presence_away : th->fg;
             const char *role = u->role == OC_ROLE_OWNER ? " *" : u->role == OC_ROLE_ADMIN ? " +" : "";
-            char line[80]; snprintf(line, sizeof line, "%s %s%s", d, u->name[0] ? u->name : "?", role);
+            /* Out of office (REQ-122): "Out of office until 3 Dec" after the
+             * name, the words every other place uses. */
+            char oo[112] = "";
+            if (oc_model_ooo_active(m, u->user_id, (uint64_t)time(NULL) * 1000u)) {
+                char ol[96]; oc_model_ooo_label(u, ol, sizeof ol);
+                snprintf(oo, sizeof oo, " (%s)", ol);
+            }
+            char line[288]; snprintf(line, sizeof line, "%s %s%s%s", d, u->name[0] ? u->name : "?", role, oo);
             if (sel) tk_fill((int)iy, mx + 1, mx + mem_w - 1, bg);
             tk_text(mx + 1, (int)iy, mx + mem_w - 1, line, col, bg);
         }
@@ -1753,8 +2221,27 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             snprintf(line, sizeof line, "   \xe2\x9c\xa6 %s \xc2\xb7 Ctrl+K to open", t);
             sx = tk_text(sx, H - 3, W, line, th->accent, TB_DEFAULT);
         }
+        /* Before sending (REQ-122): the other person of this DM, or someone the
+         * text mentions, is out of office -- until when, and what they said. */
         if (fc) {
-            uint64_t tp[8]; size_t nt = oc_model_typing(m, fc->channel_id, m->user_id, tp, 8);
+            const oc_member *ou = oc_model_ooo_for_compose(m, fc->channel_id, composer,
+                                                           (uint64_t)time(NULL) * 1000u);
+            if (ou) {
+                char ol[96], on[OC_OOO_MESSAGE_MAX + 200];
+                oc_model_ooo_label(ou, ol, sizeof ol);
+                const char *until = strstr(ol, "until ");
+                snprintf(on, sizeof on, "   %s is out of office %s%s%s", ou->name[0] ? ou->name : "they",
+                         until ? until : "", ou->ooo_message[0] ? ": " : "", ou->ooo_message);
+                sx = tk_text(sx, H - 3, W, on, TB_YELLOW, TB_DEFAULT);
+            }
+        }
+        if (fc) {
+            /* Where this person is writing: the open thread, whose replies the
+             * composer sends, or the main scroll (REQ-121). */
+            uint64_t tp[8];
+            size_t nt = m->thread_open
+                ? oc_model_typing(m, m->thread_channel, m->thread_parent, m->user_id, tp, 8)
+                : oc_model_typing(m, fc->channel_id, 0, m->user_id, tp, 8);
             if (nt) {
                 char tl[140];
                 if (nt == 1) snprintf(tl, sizeof tl, "  ✎ %s is typing…", name_for(fc, tp[0]));
@@ -1862,6 +2349,48 @@ static void draw_storage(const oc_model *m, int W, int H) {
     tb_present();
 }
 
+
+/* My blocked people as menu items, each "Unblock <name>". */
+static char g_unblock_labels[28][96];
+static void menu_build_blocked(const oc_model *m) {
+    g_nmenu = 0;
+    for (uint16_t i = 0; i < m->n_blocks && g_nmenu < 28; i++) {
+        const char *nm = oc_model_user_name((oc_model *)m, m->blocks[i]);
+        snprintf(g_unblock_labels[g_nmenu], sizeof g_unblock_labels[g_nmenu], "Unblock %s",
+                 nm && nm[0] ? nm : "someone");
+        g_menu[g_nmenu] = (menuitem){ g_unblock_labels[g_nmenu], ACT_UNBLOCK0 + g_nmenu };
+        g_nmenu++;
+    }
+}
+
+/* The workspace's blocks, for an owner or admin: who blocks whom, and since. */
+static void draw_blocks(const oc_model *m, int W, int H) {
+    const tk_theme *th = tk_theme_active();
+    if (!m->block_list_have || !m->n_block_list) {
+        const char *e = !m->block_list_have ? "No list yet: owner/admin only." : "Nobody has blocked anyone.";
+        tk_rect r = modal_frame(W, H, tk_str_width(e), 1, "Blocks  ·  Esc closes");
+        tk_text(r.x, r.y, r.x + r.w, e, th->muted, th->bg);
+        tb_present();
+        return;
+    }
+    static char L[OC_BLOCK_LIST_MAX][160];
+    int n = 0, cw = 0;
+    for (uint16_t i = 0; i < m->n_block_list && n < (int)OC_BLOCK_LIST_MAX; i++, n++) {
+        const oc_block_entry *b = &m->block_list[i];
+        const char *a = oc_model_user_name((oc_model *)m, b->blocker_id);
+        const char *t = oc_model_user_name((oc_model *)m, b->blocked_id);
+        time_t since = (time_t)(b->since_ms / 1000);
+        char day[32] = "";
+        const struct tm *tm = gmtime(&since);   /* the UI thread's alone */
+        if (tm) strftime(day, sizeof day, "%Y-%m-%d", tm);
+        snprintf(L[n], sizeof L[n], "%s blocks %s  since %s", a && a[0] ? a : "someone", t && t[0] ? t : "someone", day);
+        int w = tk_str_width(L[n]);
+        if (w > cw) cw = w;
+    }
+    tk_rect r = modal_frame(W, H, cw, n, "Blocks  ·  Esc closes");
+    for (int i = 0; i < n && i < r.h; i++) tk_text(r.x, r.y + i, r.x + r.w, L[i], th->fg, th->bg);
+    tb_present();
+}
 
 /* The /audit overlay (REQ-251): administrative and security-relevant actions,
  * newest first. Owner/admin only — a member's request is refused server-side.
@@ -3200,15 +3729,31 @@ int main(int argc, char **argv) {
     int scroll = 0;
     int switcher_open = 0, wsel = 0;          /* workspace switcher (Ctrl+W) */
     int storage_open = 0;                     /* /storage overlay (REQ-214) */
+    int blocks_open = 0;                      /* an admin's list of blocks */
     int audit_open = 0;                       /* /audit overlay (REQ-251) */
     int alerts_open = 0, asel = 0;            /* the daemon's critical failures (REQ-263) */
     int summary_ui = 0, ssel = 0;             /* the open summary's overlay (REQ-310) */
     uint64_t jump_mid = 0;                    /* a summary item's message, being found */
     time_t jump_since = 0;
     int jump_asked = 0;
+    /* Jump to a date: the conversation, the thread in it (0 for the main
+     * scroll) and the local midnight asked for, until the daemon's answer (the
+     * model's found_seq past found_seen) arrives. date_thread: the prompt open
+     * is for the open thread's replies. */
+    uint64_t date_cid = 0, date_parent = 0, date_day = 0;
+    int date_thread = 0;
+    uint32_t found_seen = 0;
     int help_open = 0;
     int profile_open = 0;                     /* /profile identity modal */
+    uint64_t profile_uid = 0;                 /* whose: 0 for mine */
+    uint64_t prompt_pf = 0;                   /* the workspace field PROMPT_PFVALUE fills */
     int deactivate_ask = 0;                   /* "Deactivate account": y/N before it is sent */
+    /* The snippet open over the screen (REQ-226): which, its title and
+     * language, and the first line shown. */
+    uint64_t sv_id = 0; int sv_top = 0, sv_lang = 0, sv_lines = 0;
+    /* A snippet's title, or its file name when it has none: room for either. */
+    char sv_title[sizeof ((oc_attachment *)0)->filename > sizeof ((oc_attachment *)0)->title
+                  ? sizeof ((oc_attachment *)0)->filename : sizeof ((oc_attachment *)0)->title] = "";
     int ac_idx = 0;                           /* autocomplete cycle index */
     int panel = 0;                            /* 0 composer · 1 channels · 2 messages · 3 members */
     int msg_sel = -1, mem_sel = 0;            /* selection within the messages / members panel */
@@ -3231,7 +3776,14 @@ int main(int argc, char **argv) {
     /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
      * /nick with a discoverable text prompt. */
     enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_NICK, PROMPT_UPLOAD,
-           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE };
+           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE, PROMPT_DATE, PROMPT_MOVE, PROMPT_REMIND, PROMPT_PFVALUE, PROMPT_OOO,
+           PROMPT_TODO_MARK, PROMPT_TODO_ADD, PROMPT_TODO_RENAME };
+    /* A move into a private channel (REQ-053): y/N, naming who will no longer
+     * see it, before it is sent. */
+    uint64_t move_ask_mid = 0, move_ask_to = 0;
+    char move_ask_text[400] = "";
+    uint32_t reminder_seen = 0;               /* the model's reminder_seq, told (REQ-283) */
+    const char *ooo_err = NULL;               /* why the out-of-office prompt asks again */
     int await_invite = 0;   /* open the roster on the invitation once it is made */
     /* The invite prompt's explanation, which names the provider, and what was
      * wrong with the last answer ("" when nothing was). */
@@ -3258,12 +3810,24 @@ int main(int argc, char **argv) {
         }
         for (int i = 0; i < g_nws; i++) {
             oc_client_tick(g_ws[i].cl);
+            /* Fetched bytes: a snippet's text (REQ-226); nothing else here asks. */
+            {
+                uint64_t fid = 0; size_t flen = 0; uint8_t *fd;
+                while ((fd = oc_model_take_attachment((oc_model *)oc_client_model(g_ws[i].cl), &fid, &flen)))
+                    if (!tui_snip_take(fid, fd, flen)) free(fd);
+            }
             /* Each session pulls its own synced settings bucket once per
              * authenticated connection (a reconnect re-pulls). */
             const oc_model *wm = oc_client_model(g_ws[i].cl);
             if (!wm->connected) g_ws[i].settings_req = 0;
             else if (wm->authed && !g_ws[i].settings_req) {
                 oc_client_list_settings(g_ws[i].cl);
+                /* And the notification state, which carries whom this person
+                 * has muted: their messages show folded away here too. */
+                oc_client_list_notify_prefs(g_ws[i].cl);
+                /* And the notification state, which carries whom this person
+                 * blocks and who may start a DM with them. */
+                oc_client_list_notify_prefs(g_ws[i].cl);
                 g_ws[i].settings_req = 1;
             }
         }
@@ -3343,6 +3907,60 @@ int main(int argc, char **argv) {
             if (focus >= m->n_channels) focus = m->n_channels ? m->n_channels - 1 : 0;
         }
 
+        /* A jump to a date answered: open that conversation at the message, as
+         * a summary item's is, and say so when it is not on the day asked. */
+        /* The thread the mark was in is gone, or another is open: no mark. */
+        if (g_thread_mark >= 0 && (!m->thread_open || m->thread_parent != g_thread_mark_root)) g_thread_mark = -1;
+        if (date_cid && m->found_seq != found_seen) {
+            found_seen = m->found_seq;
+            if (m->found_channel == date_cid && m->found_parent == date_parent) {
+                size_t idx = m->n_channels;
+                for (size_t k = 0; k < m->n_channels; k++) if (m->channels[k].channel_id == date_cid) idx = k;
+                int landed = 0;
+                if (date_parent) {
+                    /* In the open thread: the reply is marked and kept in view. */
+                    if (!m->found_mid) snprintf(g_closed_note, sizeof g_closed_note, "There are no replies here yet.");
+                    else if (m->thread_open && m->thread_channel == date_cid && m->thread_parent == date_parent) {
+                        for (size_t k = 0; k < m->n_thread_msgs; k++)
+                            if (m->thread_msgs[k].message_id == m->found_mid) {
+                                g_thread_mark = (int)k; g_thread_mark_root = date_parent; scroll = 0; landed = 1;
+                            }
+                        if (!landed) snprintf(g_closed_note, sizeof g_closed_note, "That reply is not loaded in this thread.");
+                    }
+                } else if (!m->found_mid) snprintf(g_closed_note, sizeof g_closed_note, "There are no messages here yet.");
+                else if (idx < m->n_channels) {
+                    focus = idx; scroll = 0; msg_sel = -1; last_focus_cid = date_cid; g_hold_unread = 0;
+                    jump_mid = m->found_mid; jump_asked = 0; jump_since = time(NULL);
+                    landed = 1;
+                }
+                if (landed) {
+                    time_t ta = (time_t)(date_day / 1000), tg = (time_t)(m->found_time / 1000);
+                    struct tm va, vg;
+                    if (oc_localtime_r(&ta, &va) && oc_localtime_r(&tg, &vg) &&
+                        (va.tm_year != vg.tm_year || va.tm_yday != vg.tm_yday)) {
+                        char a[24], g[24];
+                        strftime(a, sizeof a, "%d %B", &va);
+                        strftime(g, sizeof g, "%d %B", &vg);
+                        snprintf(g_closed_note, sizeof g_closed_note, "No %s on %s; showing the %s, %s.",
+                                 date_parent ? "replies" : "messages",
+                                 a[0] == '0' ? a + 1 : a, m->found_exact ? "next" : "last before it",
+                                 g[0] == '0' ? g + 1 : g);
+                    }
+                }
+                date_cid = date_parent = date_day = 0;
+            }
+        }
+        /* A reminder come due (REQ-283): said once, on the status line. */
+        if (m->reminder_seq != reminder_seen) {
+            reminder_seen = m->reminder_seq;
+            const oc_channel *rc = oc_model_channel((oc_model *)m, m->reminder_channel);
+            if (rc && rc->kind != OC_CHANNEL_KIND_DM && rc->name && rc->name[0])
+                snprintf(g_closed_note, sizeof g_closed_note, "Reminder: a message you saved in #%s.", rc->name);
+            else
+                snprintf(g_closed_note, sizeof g_closed_note, "Reminder: a message you saved.");
+        }
+        g_tsnip_cl = cl;
+        tui_snip_tick();
         /* Lazy backfill + keep the focused channel marked read. */
         if (focus < m->n_channels) {
             uint64_t cid = m->channels[focus].channel_id;
@@ -3371,11 +3989,16 @@ int main(int argc, char **argv) {
          * buffer, then a single tb_present() below diffs it to the screen. (Two
          * presents per frame — base then overlay — flicker the overlay.) */
         render(cl, focus, composer, clen, scroll, help_open, ac_idx, panel, msg_sel, mem_sel, editing);
+        if (sv_id) {
+            if (!tui_snip_text(sv_id, &(size_t){0})) tui_snip_want(sv_id);
+            sv_lines = tui_snip_view_draw(sv_id, sv_title, sv_lang, sv_top);
+        }
         if (deactivate_ask)
             tk_modal_confirm(tb_width(), tb_height(),
                              "Deactivate your account? You will be signed out everywhere and "
                              "cannot sign in; an owner or admin can bring it back. The only "
                              "owner must make another first. [y/N]");
+        if (move_ask_mid) tk_modal_confirm(tb_width(), tb_height(), move_ask_text);
         if (action_open) {
             int mh = g_nmenu + 3; if (mh > tb_height() - 2) mh = tb_height() - 2;
             /* As wide as its longest item (a summary's line is long), within
@@ -3398,6 +4021,12 @@ int main(int argc, char **argv) {
             if (invite_err[0]) tk_text(in.x, in.y + 1, in.x + in.w, invite_err, TB_RED | TB_BOLD, pth->bg);
             tk_text(in.x, in.y + 2, in.x + in.w, invite_note, pth->muted, pth->bg);
             tk_text(in.x, in.y + 3, in.x + in.w, invite_note2, pth->muted, pth->bg);
+        } else if (prompt_kind == PROMPT_OOO) {
+            /* The input, and what was wrong with the last answer. */
+            const tk_theme *pth = tk_theme_active();
+            tk_rect in = tk_modal_begin(tb_width(), tb_height(), 76, 4, prompt_title);
+            tk_input_draw(&prompt_input, (tk_rect){ in.x, in.y, in.w, 1 }, 1);
+            if (ooo_err) tk_text(in.x, in.y + 1, in.x + in.w, ooo_err, TB_RED | TB_BOLD, pth->bg);
         } else if (prompt_kind) {
             tk_rect in = tk_modal_begin(tb_width(), tb_height(), 46, 3, prompt_title);
             tk_input_draw(&prompt_input, (tk_rect){ in.x, in.y, in.w, 1 }, 1);
@@ -3405,9 +4034,10 @@ int main(int argc, char **argv) {
         if (launcher_open) tk_palette_draw(&launcher, tb_width(), tb_height());
         if (dmpick_open) tk_palette_draw(&dmpick, tb_width(), tb_height());
         if (picker_open) draw_picker(eq, esel);
-        if (profile_open) draw_profile(oc_client_model(cl), tb_width(), tb_height());
+        if (profile_open) draw_profile(oc_client_model(cl), profile_uid, tb_width(), tb_height());
         if (switcher_open) draw_switcher(wsel);
         if (storage_open) draw_storage(oc_client_model(cl), tb_width(), tb_height());
+        if (blocks_open) draw_blocks(oc_client_model(cl), tb_width(), tb_height());
         if (audit_open) draw_audit(oc_client_model(cl), tb_width(), tb_height());
         if (alerts_open) draw_alerts(oc_client_model(cl), tb_width(), tb_height(), asel);
         if (summary_ui && oc_client_model(cl)->summary_open) draw_summary(oc_client_model(cl), tb_width(), tb_height(), ssel);
@@ -3418,6 +4048,11 @@ int main(int argc, char **argv) {
         int rc = tb_peek_event(&ev, 30);
         if (rc != TB_OK) continue;               /* timeout: loop to re-tick + redraw */
         if (ev.type == TB_EVENT_RESIZE) continue;
+        /* Scrolling lets go of a reply a jump to a date marked in the thread. */
+        if ((ev.type == TB_EVENT_MOUSE && (ev.key == TB_KEY_MOUSE_WHEEL_UP || ev.key == TB_KEY_MOUSE_WHEEL_DOWN)) ||
+            (ev.type == TB_EVENT_KEY && (ev.key == TB_KEY_ARROW_UP || ev.key == TB_KEY_ARROW_DOWN ||
+                                         ev.key == TB_KEY_PGUP || ev.key == TB_KEY_PGDN)))
+            g_thread_mark = -1;
         if (ev.type == TB_EVENT_MOUSE) {       /* wheel scrolls; click focuses a channel/member */
             if (ev.key == TB_KEY_MOUSE_WHEEL_UP) scroll += 3;
             else if (ev.key == TB_KEY_MOUSE_WHEEL_DOWN) { scroll -= 3; if (scroll < 0) scroll = 0; }
@@ -3475,6 +4110,14 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* In the reactions list, with the message box empty, a digit shows that
+         * folded reaction from a muted person, the one numbered so (SET_USER_MUTE). */
+        {
+            const oc_model *rxm = oc_client_model(cl);
+            if (rxm->reactlist_open && clen == 0 && !prompt_kind && !action_open && !launcher_open &&
+                !picker_open && !help_open && ev.ch >= '1' && ev.ch <= '9' && rxt_reveal_nth(rxm, (int)(ev.ch - '0')))
+                continue;
+        }
         /* Ctrl+O on open results: the next order, and the search again in it --
          * a page in one order is no cursor in another. */
         if (ev.key == TB_KEY_CTRL_O && oc_client_model(cl)->search_open && !prompt_kind) {
@@ -3600,9 +4243,32 @@ int main(int argc, char **argv) {
             else storage_open = 0;
             continue;
         }
+        if (sv_id) {                           /* the snippet viewer (REQ-226) */
+            int page = tb_height() - 3; if (page < 1) page = 1;
+            if (ev.ch == 'q' || ev.key == TB_KEY_ESC) sv_id = 0;
+            else if (ev.ch == 'j' || ev.key == TB_KEY_ARROW_DOWN) sv_top++;
+            else if (ev.ch == 'k' || ev.key == TB_KEY_ARROW_UP) sv_top--;
+            else if (ev.ch == ' ' || ev.key == TB_KEY_PGDN) sv_top += page;
+            else if (ev.key == TB_KEY_PGUP) sv_top -= page;
+            else if (ev.ch == 'g') sv_top = 0;
+            else if (ev.ch == 'G') sv_top = sv_lines - page;
+            if (sv_top > sv_lines - page) sv_top = sv_lines - page;
+            if (sv_top < 0) sv_top = 0;
+            continue;
+        }
+        if (blocks_open) {                     /* the blocks overlay: any key closes */
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else blocks_open = 0;
+            continue;
+        }
         if (deactivate_ask) {                  /* y deactivates; anything else keeps the account */
             deactivate_ask = 0;
             if (ev.ch == 'y' || ev.ch == 'Y') oc_client_deactivate_self(cl);
+            continue;
+        }
+        if (move_ask_mid) {                    /* y moves it; anything else leaves it */
+            if (ev.ch == 'y' || ev.ch == 'Y') oc_client_move_message(cl, move_ask_mid, move_ask_to, 0, 1);
+            move_ask_mid = move_ask_to = 0;
             continue;
         }
         if (help_open) {                       /* help overlay: any key closes it */
@@ -3611,8 +4277,21 @@ int main(int argc, char **argv) {
             continue;
         }
         if (profile_open) {                    /* profile modal: any key closes it */
-            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
-            else profile_open = 0;
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) { running = 0; continue; }
+            /* On my own, a field's key fills it in instead. */
+            const oc_model *qm = oc_client_model(cl);
+            int k = (!profile_uid || profile_uid == qm->user_id) ? pf_index(ev.ch) : -1;
+            if (k >= 0 && k < qm->n_pfields) {
+                static char ptitle[OC_PROFILE_FIELD_LABEL_MAX + 40];
+                const oc_pfield *pf = &qm->pfields[k];
+                prompt_pf = pf->id;
+                snprintf(ptitle, sizeof ptitle, "%s%s", pf->label,
+                         pf->kind == OC_PROFILE_FIELD_LINK ? " (a link, https://...; empty clears)" : " (empty clears)");
+                prompt_kind = PROMPT_PFVALUE; prompt_title = ptitle;
+                tk_input_init(&prompt_input, 0, "");
+                tk_input_set(&prompt_input, oc_model_profile_value(qm, qm->user_id, pf->id));
+            }
+            profile_open = 0;
             continue;
         }
         if (prompt_kind) {                     /* text prompt dialog (tuikit) */
@@ -3626,6 +4305,101 @@ int main(int argc, char **argv) {
                 else if (k == PROMPT_SEARCH  && *v) oc_client_search(cl, v, g_search_sort);
                 else if (k == PROMPT_NICK    && *v) oc_client_set_display_name(cl, v);
                 else if (k == PROMPT_WEBHOOK && *v) oc_client_create_webhook(cl, act_cid, v);
+                else if (k == PROMPT_DATE && *v) {
+                    uint64_t day = tui_parse_day(v);
+                    /* In the thread only while it is still the one open here. */
+                    const oc_model *dm = oc_client_model(cl);
+                    uint64_t parent = date_thread && dm->thread_open && dm->thread_channel == act_cid
+                                    ? dm->thread_parent : 0;
+                    if (date_thread && !parent)
+                        snprintf(g_closed_note, sizeof g_closed_note, "That thread is no longer open.");
+                    else if (day) {
+                        date_cid = act_cid; date_parent = parent; date_day = day;
+                        oc_client_find_at_time(cl, act_cid, parent, day);
+                    }
+                    else snprintf(g_closed_note, sizeof g_closed_note, "Not a date: try 2026-05-03, today or yesterday.");
+                }
+                else if (k == PROMPT_MOVE && *v) {
+                    /* The destination by name, with or without its '#': another
+                     * channel, not a direct conversation (REQ-053). */
+                    const oc_model *mv = oc_client_model(cl);
+                    const char *nm = v[0] == '#' ? v + 1 : v;
+                    const oc_channel *src = oc_model_channel((oc_model *)mv, act_cid), *dst = NULL;
+                    for (size_t q = 0; q < mv->n_channels; q++)
+                        if (mv->channels[q].kind != OC_CHANNEL_KIND_DM && mv->channels[q].name &&
+                            !strcmp(mv->channels[q].name, nm)) { dst = &mv->channels[q]; break; }
+                    if (!dst || dst->channel_id == act_cid) {
+                        snprintf(g_closed_note, sizeof g_closed_note, "No other channel is called #%s.", nm);
+                    } else if (!dst->is_public) {
+                        snprintf(move_ask_text, sizeof move_ask_text,
+                                 "Move it to #%s? It is private: only its members will be able to "
+                                 "read it, and people in #%s who are not will no longer see it. [y/N]",
+                                 dst->name, (src && src->name) ? src->name : "");
+                        move_ask_mid = act_mid; move_ask_to = dst->channel_id;
+                    } else {
+                        oc_client_move_message(cl, act_mid, dst->channel_id, 0, 1);
+                    }
+                }
+                else if (k == PROMPT_TODO_MARK && *v) {
+                    /* A task by its number, from 1: marked the other way from
+                     * how it stands. The daemon takes the state wanted. */
+                    const oc_todo_view *tv = oc_model_todo(oc_client_model(cl), act_cid, act_mid);
+                    char *end = NULL;
+                    unsigned long n = strtoul(v, &end, 10);
+                    if (!tv) snprintf(g_closed_note, sizeof g_closed_note, "That list is no longer here.");
+                    else if (!end || *end || n < 1 || n > tv->total || n > tv->cap)
+                        snprintf(g_closed_note, sizeof g_closed_note, "The list has no task %s.", v);
+                    else oc_client_todo_mark(cl, act_cid, act_mid, (uint16_t)(n - 1), !tv->tasks[n - 1].done);
+                }
+                else if (k == PROMPT_TODO_ADD && *v) {
+                    /* "name: description", as a line of a "/todo" body. */
+                    char *line = strdup(v);
+                    if (line) {
+                        char *sep = strstr(line, ": ");
+                        if (sep) { *sep = '\0'; oc_client_todo_add(cl, act_cid, act_mid, line, sep + 2); }
+                        else oc_client_todo_add(cl, act_cid, act_mid, line, "");
+                        free(line);
+                    }
+                }
+                else if (k == PROMPT_TODO_RENAME && *v) oc_client_todo_rename(cl, act_cid, act_mid, v);
+                else if (k == PROMPT_REMIND && *v) {
+                    uint64_t at = 0;
+                    if (!tui_parse_remind(v, &at))
+                        snprintf(g_closed_note, sizeof g_closed_note, "Not a time to come: try 20m, 1h, tomorrow, monday, 14:30 or clear.");
+                    else tui_remind_set(cl, act_mid, at);
+                }
+                else if (k == PROMPT_PFVALUE) {
+                    /* Then the profile again, showing what was saved. */
+                    oc_client_set_profile_field_value(cl, prompt_pf, v);
+                    profile_uid = 0; profile_open = 1;
+                }
+                else if (k == PROMPT_OOO) {
+                    /* "off" clears, now or one set to start later; otherwise
+                     * the day it starts (left out: now), the day back -- it
+                     * holds until that morning -- and the rest is the message.
+                     * Wrong: asked again. */
+                    uint64_t now_ms = (uint64_t)time(NULL) * 1000u;
+                    uint64_t first = 0, second = 0, start = now_ms, back = 0;
+                    const char *msg = "", *rest2 = "";
+                    if (strcmp(v, "off") == 0) oc_client_set_out_of_office(cl, 0, 0, "");
+                    else if ((first = ooo_day_ms(v, &msg)) == 0) {
+                        prompt_kind = PROMPT_OOO;
+                        ooo_err = "Start with a day, as 2026-12-15 (or two: from, then back).";
+                    } else {
+                        if ((second = ooo_day_ms(msg, &rest2)) != 0) { start = first; back = second; msg = rest2; }
+                        else back = first;
+                        if (back <= now_ms || back <= start) {
+                            prompt_kind = PROMPT_OOO;
+                            ooo_err = second ? "The day back has to come after the day it starts, and be still to come."
+                                             : "That is not a day still to come, as 2026-12-15.";
+                        } else if (strlen(msg) > OC_OOO_MESSAGE_MAX) {
+                            prompt_kind = PROMPT_OOO;
+                            ooo_err = "The message can be at most 280 bytes.";
+                        } else {
+                            oc_client_set_out_of_office(cl, start, back, msg);
+                        }
+                    }
+                }
                 else if (k == PROMPT_INVITE) {
                     /* An address where the workspace signs people in through a
                      * provider; blank for a token, where it has password accounts.
@@ -3707,6 +4481,12 @@ int main(int argc, char **argv) {
                 if      (id == ACT_NEWCHAN) { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
                 else if (id == ACT_NEWDM)   { dmp_open(&dmpick, oc_client_model(cl)); dmpick_open = 1; }
                 else if (e2e_act(cl, id, act_cid, &focus)) {}
+                else if (id == ACT_OOO) {
+                    ooo_err = NULL;
+                    prompt_kind = PROMPT_OOO;
+                    prompt_title = "Out of office: [from YYYY-MM-DD] back YYYY-MM-DD, then a message; 'off' clears";
+                    tk_input_init(&prompt_input, 0, "e.g. 2026-12-08 2026-12-15 Back on Monday");
+                }
                 else if (id == ACT_SEARCH)  { prompt_kind = PROMPT_SEARCH; prompt_title = "Search messages"; tk_input_init(&prompt_input, 0, "query"); }
                 else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
                 else if (id == ACT_UPLOAD)  { prompt_kind = PROMPT_UPLOAD; prompt_title = "Upload a file"; tk_input_init(&prompt_input, 0, "path"); }
@@ -3734,11 +4514,20 @@ int main(int argc, char **argv) {
                         tk_input_init(&prompt_input, 0, oc_model_offers_browser(oc_client_model(cl)) ? "name@example.com" : "");
                     } else await_invite = 1;
                 }
-                else if (id == ACT_PROFILE) profile_open = 1;
+                else if (id == ACT_PROFILE) { oc_client_get_profile(cl, 0); profile_uid = 0; profile_open = 1; }
                 else if (id == ACT_DEACTIVATE) deactivate_ask = 1;
                 else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
                 else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
                 else if (id == ACT_ALERTS)  { oc_client_srvalerts_list(cl); alerts_open = 1; asel = 0; }
+                else if (id == ACT_BLOCKS_ADMIN) { oc_client_list_blocks(cl); blocks_open = 1; }
+                else if (id == ACT_DMPRIV)
+                    oc_client_set_dm_privacy(cl, oc_client_model(cl)->dm_privacy != OC_DM_PRIVACY_NOBODY);
+                else if (id == ACT_BLOCKED) {
+                    menu_build_blocked(oc_client_model(cl));
+                    action_menu.sel = action_menu.top = 0;
+                    act_title = "Blocked people";
+                    action_open = 1; tk_list_reset_filter(&action_menu);
+                }
                 else if (id == ACT_WORKSPACES) { sw_build(); wsel = (g_active < g_nsw) ? g_active : 0; switcher_open = 1; }
                 else if (id == ACT_HELP)    help_open = 1;
                 else if (id == ACT_EMOTICONS)
@@ -3830,14 +4619,56 @@ int main(int argc, char **argv) {
                         g_hold_unread = act_cid;
                     }
                     else if (id == ACT_DELETE)      oc_client_delete(cl, act_cid, act_mid);
+                    else if (id == ACT_TODO_MARK) { prompt_kind = PROMPT_TODO_MARK; prompt_title = "Mark task (its number)"; tk_input_init(&prompt_input, 0, "number"); }
+                    else if (id == ACT_TODO_ADD) { prompt_kind = PROMPT_TODO_ADD; prompt_title = "Add a task (name, or name: description)"; tk_input_init(&prompt_input, 0, "task"); }
+                    else if (id == ACT_TODO_RENAME) { prompt_kind = PROMPT_TODO_RENAME; prompt_title = "Rename the list"; tk_input_init(&prompt_input, 0, "title"); }
+                    else if (id == ACT_MOVE) { prompt_kind = PROMPT_MOVE; prompt_title = "Move to channel (name)"; tk_input_init(&prompt_input, 0, "#channel"); }
+                    else if (id == ACT_REMIND) {
+                        /* The choices, then: Clear among them when one is set. */
+                        int reminded = 0;
+                        const oc_channel *rc = focused_channel(oc_client_model(cl), act_cid);
+                        if (rc) for (size_t k = 0; k < rc->n_msgs; k++)
+                            if (rc->msgs[k].message_id == act_mid) { reminded = rc->msgs[k].saved && rc->msgs[k].remind_at; break; }
+                        menu_build_remind(reminded);
+                        act_title = reminded ? "Reminder" : "Remind me";
+                        action_open = 1; tk_list_reset_filter(&action_menu);
+                    }
+                    else if (id == ACT_REMIND_20M)      tui_remind_set(cl, act_mid, ((uint64_t)time(NULL) + 20u * 60u) * 1000u);
+                    else if (id == ACT_REMIND_1H)       tui_remind_set(cl, act_mid, ((uint64_t)time(NULL) + 60u * 60u) * 1000u);
+                    else if (id == ACT_REMIND_TOMORROW) { uint64_t t9 = tui_local_at(1, 9, 0); if (t9) tui_remind_set(cl, act_mid, t9); }
+                    else if (id == ACT_REMIND_MONDAY)   { uint64_t m9 = tui_next_monday_9(); if (m9) tui_remind_set(cl, act_mid, m9); }
+                    else if (id == ACT_REMIND_CLEAR)    tui_remind_set(cl, act_mid, 0);
+                    else if (id == ACT_REMIND_AT) { prompt_kind = PROMPT_REMIND; prompt_title = "Remind me at (14:30, 2026-05-03 14:30, tomorrow, monday, 20m, 1h)"; tk_input_init(&prompt_input, 0, "when"); }
                     else if (id == ACT_DM) {
                         oc_client_open_dm(cl, act_uid, 0);
                         g_dm_asked = act_uid; g_dm_asked_e2e = 0;
                         panel = 0;
                     }
+                    else if (id == ACT_BLOCK)       { if (act_uid) oc_client_set_block(cl, act_uid, 1); }
+                    else if (id == ACT_UNBLOCK)     { if (act_uid) oc_client_set_block(cl, act_uid, 0); }
+                    else if (id >= ACT_UNBLOCK0 && id <= ACT_UNBLOCK_LAST) {
+                        const oc_model *bm = oc_client_model(cl);
+                        int k = id - ACT_UNBLOCK0;
+                        if (k < bm->n_blocks) oc_client_set_block(cl, bm->blocks[k], 0);
+                    }
+                    else if (id == ACT_DMPRIV)
+                        oc_client_set_dm_privacy(cl, oc_client_model(cl)->dm_privacy != OC_DM_PRIVACY_NOBODY);
+                    else if (id == ACT_BLOCKS_ADMIN) { oc_client_list_blocks(cl); blocks_open = 1; }
+                    else if (id == ACT_BLOCKED) {
+                        menu_build_blocked(oc_client_model(cl));
+                        action_menu.sel = action_menu.top = 0;
+                        act_title = "Blocked people";
+                        action_open = 1; tk_list_reset_filter(&action_menu);
+                    }
                     else if (id == ACT_ROLE_ADMIN)  oc_client_set_role(cl, act_uid, OC_ROLE_ADMIN);
                     else if (id == ACT_ROLE_MEMBER) oc_client_set_role(cl, act_uid, OC_ROLE_MEMBER);
                     else if (id == ACT_REMOVE)      oc_client_remove_user(cl, act_uid);
+                    else if (id == ACT_PROFILE_OF) {
+                        /* Their whole profile, which is what carries the
+                         * workspace's fields; shown as it lands. */
+                        oc_client_get_profile(cl, act_uid);
+                        profile_uid = act_uid; profile_open = 1;
+                    }
                     else if (id == ACT_REACT)       { picker_open = 1; eq[0] = '\0'; eqlen = 0; esel = 0; picker_cid = act_cid; picker_mid = act_mid; }
                     else if (id == ACT_EDIT) {
                         const oc_channel *ec = focused_channel(oc_client_model(cl), act_cid);
@@ -3863,10 +4694,21 @@ int main(int argc, char **argv) {
                     /* channel menu actions */
                     else if (id == ACT_OPEN)  panel = 0;
                     else if (id == ACT_JOIN)  { oc_client_join_channel(cl, act_cid); panel = 0; }
+                    else if (id == ACT_JUMP_DATE || id == ACT_JUMP_DATE_THREAD) {
+                        date_thread = id == ACT_JUMP_DATE_THREAD;
+                        prompt_kind = PROMPT_DATE;
+                        prompt_title = date_thread ? "Jump to date in the thread (2026-05-03, 3 May, today)"
+                                                   : "Jump to date (2026-05-03, 3 May, today)";
+                        tk_input_init(&prompt_input, 0, "date");
+                    }
                     else if (id == ACT_WEBHOOK_CREATE) { prompt_kind = PROMPT_WEBHOOK; prompt_title = "Create webhook (label)"; tk_input_init(&prompt_input, 0, "label"); }
                     else if (id == ACT_NOTIFY_ALL)      oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_ALL);
                     else if (id == ACT_NOTIFY_MENTIONS) oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_MENTIONS);
                     else if (id == ACT_NOTIFY_NONE)     oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_NONE);
+                    else if (id == ACT_FOLLOW_THREADS) {
+                        const oc_channel *fc = oc_model_channel((oc_model *)oc_client_model(cl), act_cid);
+                        oc_client_channel_thread_follow(cl, act_cid, (uint8_t)!(fc && fc->follow_threads));
+                    }
                     /* global launcher actions */
                     else if (id == ACT_NEWCHAN) { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
                     else if (id == ACT_NEWDM)   { dmp_open(&dmpick, oc_client_model(cl)); dmpick_open = 1; }
@@ -3887,7 +4729,7 @@ int main(int argc, char **argv) {
                             tk_input_init(&prompt_input, 0, oc_model_offers_browser(oc_client_model(cl)) ? "name@example.com" : "");
                         } else await_invite = 1;
                     }
-                    else if (id == ACT_PROFILE) profile_open = 1;
+                    else if (id == ACT_PROFILE) { oc_client_get_profile(cl, 0); profile_uid = 0; profile_open = 1; }
                     else if (id == ACT_DEACTIVATE) deactivate_ask = 1;
                     else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
                     else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
@@ -4033,7 +4875,9 @@ int main(int argc, char **argv) {
                         sidebar_opts_save(cl);
                     } else if (focus < mm->n_channels) {                     /* channel action menu */
                         const oc_channel *mc = &mm->channels[focus];
-                        menu_build_channel(mc->joined, oc_model_summarize_available(mm), mc->e2e, e2e_state(mm, mc));
+                        menu_build_channel(mc->joined, oc_model_summarize_available(mm), mc->e2e, e2e_state(mm, mc),
+                                           mc->follow_threads,
+                                           mm->thread_open && mm->thread_channel == mc->channel_id);
                         act_cid = mm->channels[focus].channel_id; act_uid = 0; act_mid = 0; act_title = "Channel";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
@@ -4046,7 +4890,7 @@ int main(int argc, char **argv) {
                 else if (ev.key == TB_KEY_ENTER && mem_sel < (int)mm->n_users) {
                     /* discoverable member action menu (Message / role / remove) */
                     uint64_t uid = mm->users[mem_sel].user_id;
-                    menu_build_member(uid == mm->user_id);
+                    menu_build_member(uid == mm->user_id, oc_model_is_blocked(mm, uid));
                     act_uid = uid; act_cid = 0; act_mid = 0; act_title = "Member";
                     action_open = 1; tk_list_reset_filter(&action_menu);
                 }
@@ -4067,20 +4911,60 @@ int main(int argc, char **argv) {
                     /* The workspace's windows (REQ-051/052): past them the
                      * daemon refuses an author's own edit or delete. */
                     uint64_t now = (uint64_t)time(NULL) * 1000u;
-                    int may_edit = own && oc_model_may_change_own(mm, sel->server_time, 1, now);
+                    int may_edit = own && !sel->todo && oc_model_may_change_own(mm, sel->server_time, 1, now);   /* a list is not edited */
                     int may_del = own && oc_model_may_change_own(mm, sel->server_time, 0, now);
                     int has_attach = 0;
                     for (uint8_t ak = 0; ak < sel->n_attach; ak++)
                         if (!sel->attach[ak].reclaimed) { has_attach = 1; break; }
                     if (ev.key == TB_KEY_ENTER) {   /* open the discoverable action menu */
+                        /* Block the author: someone else, never the workspace itself. */
+                        int blk = 0;
+                        if (sel->author_id && sel->author_id != mm->user_id &&
+                            !oc_model_is_workspace_sender(mm, sel->author_id))
+                            blk = oc_model_is_blocked(mm, sel->author_id) ? 2 : 1;
                         menu_build_msg(own, may_edit, may_del, sel->deleted || locked, has_attach && !ch->e2e, sel->poll,   /* no files in an encrypted DM */
-                                       has_spoilers(sel->body) ? 1 + spoilers_shown(mid) : 0, sel->collapsed);
+                                       has_spoilers(sel->body) ? 1 + spoilers_shown(mid) : 0, sel->collapsed, blk,
+                                       sel->saved && sel->remind_at);
+                        /* Move (REQ-053): one's own, or anything for an admin or
+                         * owner, out of a channel that is not archived. */
+                        uint8_t role = OC_ROLE_MEMBER;
+                        for (size_t u = 0; u < mm->n_users; u++)
+                            if (mm->users[u].user_id == mm->user_id) { role = mm->users[u].role; break; }
+                        if (!sel->deleted && !ch->e2e && ch->kind != OC_CHANNEL_KIND_DM && !ch->archived &&
+                            (sel->author_id == mm->user_id || role >= OC_ROLE_ADMIN) &&
+                            g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+                            g_menu[g_nmenu++] = (menuitem){ "Move to another channel", ACT_MOVE };
+                        /* A to-do list: anyone who reads it marks and adds;
+                         * its author renames it. Not in an archived channel. */
+                        if (sel->todo && !sel->deleted && !locked && !ch->archived) {
+                            if (g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+                                g_menu[g_nmenu++] = (menuitem){ "Mark a task done or not done...", ACT_TODO_MARK };
+                            if (sel->todo->total < OC_TODO_MAX_TASKS && g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+                                g_menu[g_nmenu++] = (menuitem){ "Add a task...", ACT_TODO_ADD };
+                            if (sel->todo->author_id == mm->user_id && g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+                                g_menu[g_nmenu++] = (menuitem){ "Rename the list...", ACT_TODO_RENAME };
+                        }
 
-                        act_cid = cid; act_mid = mid; act_uid = 0; act_title = "Message";
+                        act_cid = cid; act_mid = mid; act_uid = sel->author_id; act_title = "Message";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
                     else if (ev.ch == 't' && !locked) oc_client_open_thread(cl, cid, mid);
+                    else if (ev.ch == 'D' && sel->todo && !sel->deleted && !locked && !ch->archived) {
+                        act_cid = cid; act_mid = mid;   /* mark a task of this list */
+                        prompt_kind = PROMPT_TODO_MARK; prompt_title = "Mark task (its number)";
+                        tk_input_init(&prompt_input, 0, "number");
+                    }
                     else if (ev.ch == 'v' && has_spoilers(sel->body)) spoilers_toggle(mid);
+                    else if (ev.ch == 'o' && !sel->deleted) {   /* open its snippet whole (REQ-226) */
+                        for (uint8_t ak = 0; ak < sel->n_attach; ak++)
+                            if (sel->attach[ak].media_kind == OC_MEDIA_SNIPPET && !sel->attach[ak].reclaimed) {
+                                sv_id = sel->attach[ak].id; sv_top = 0;
+                                sv_lang = oc_lex_language(sel->attach[ak].language);
+                                snprintf(sv_title, sizeof sv_title, "%s",
+                                         sel->attach[ak].title[0] ? sel->attach[ak].title : sel->attach[ak].filename);
+                                break;
+                            }
+                    }
                     else if (ev.ch == 'c' && !sel->deleted) {   /* fold or unfold, on every device */
                         tui_expand(mid, sel->collapsed);
                         oc_client_set_collapsed(cl, mid, !sel->collapsed);
@@ -4114,6 +4998,17 @@ int main(int argc, char **argv) {
             if (editing) { editing = 0; composer[0] = '\0'; clen = 0; }
             else { panel = 2; if (focus < nch) msg_sel = m->channels[focus].n_msgs ? (int)m->channels[focus].n_msgs - 1 : -1; }
         } else if (ev.key == TB_KEY_ENTER) {
+            /* A spoiler opened and never closed would go out readable
+             * (MARKDOWN.md §1d): the text stays here, and the note says where. */
+            size_t open_at = clen > 0 ? oc_rt_open_spoiler(composer, clen) : (size_t)-1;
+            if (open_at != (size_t)-1) {
+                size_t chars = 1;
+                for (size_t q = 0; q < open_at; q++) if (((unsigned char)composer[q] & 0xC0) != 0x80) chars++;
+                snprintf(g_bc_note, sizeof g_bc_note,
+                         "The spoiler at character %zu is never closed: add !< where it ends, or write \\>!",
+                         chars);
+                continue;
+            }
             if (editing) {                     /* apply the edit (or cancel if emptied) */
                 if (clen > 0 && focus < nch) oc_client_edit(cl, m->channels[focus].channel_id, editing, composer);
                 editing = 0; clen = 0; composer[0] = '\0'; scroll = 0;
@@ -4216,7 +5111,9 @@ int main(int argc, char **argv) {
             /* Signal typing while composing a message (not a /command), throttled. */
             time_t now = time(NULL);
             if (focus < nch && composer[0] != '/' && now - last_typing >= 3) {
-                oc_client_typing(cl, oc_client_model(cl)->channels[focus].channel_id);
+                const oc_model *tm = oc_client_model(cl);
+                if (tm->thread_open) oc_client_typing(cl, tm->thread_channel, tm->thread_parent);
+                else                 oc_client_typing(cl, tm->channels[focus].channel_id, 0);
                 last_typing = now;
             }
         }

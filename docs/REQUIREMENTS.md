@@ -301,7 +301,8 @@ where one exists.
   line cannot hold. Any member may set it, on the same reasoning; it is up to
   1,000 bytes, may run to several lines, and is shown in the channel's About. It
   is readable by exactly the people who may read the channel (ARCH-93).
-- **REQ-035.** A channel has been **archivable** by an owner or admin: an
+- **REQ-035.** A channel has been **archivable** by an owner or admin, or by one
+  of the channel's managers (REQ-036b): an
   archived channel has become read-only and hidden from the default channel list
   while its history remained searchable and retrievable (REQ-031/080), and it has
   been restorable. Archiving (reversible) is distinct from deletion, which is not
@@ -321,10 +322,22 @@ where one exists.
   private, which flipping it back does not undo. The client confirms that in those
   words, and the daemon audits the two as distinct actions so an audit reader can see
   which way it went without opening the row.
-- **REQ-036.** A channel has been **renamable** by an owner/admin, the rename applying everywhere the
+- **REQ-036.** A channel has been **renamable** by an owner/admin, or by one of the
+  channel's managers (REQ-036b), the rename applying everywhere the
   channel is shown without breaking membership, history, or permalinks (REQ-232).
   The name is distinct from the topic (REQ-034). A rename keeps the channel id
   and is refused on a name already taken (ARCH-93).
+- **REQ-036b.** A channel has had **managers**: members who run it. The person who
+  created a channel has been its first manager; any of its managers, an admin or
+  an owner has been able to name another member of the channel a manager, and to
+  take the role from any manager, the creator included. Managers are peers: none
+  outranks another. Leaving the channel, or being removed from it, has ended the
+  role, and rejoining has not restored it. A channel has been able to have no
+  managers — every channel made before the role existed starts with none — and
+  its owners and admins have managed it then as always. A manager has renamed,
+  archived and unarchived the channel (REQ-035/036); its visibility (REQ-036a)
+  has stayed with owners and admins, and its topic, description, membership and
+  webhooks with every member, as before (ARCH-134).
 - **REQ-037.** A deployment has been able to admit **guest accounts** — users
   restricted to one channel (single-channel guest) or an explicit set
   (multi-channel guest) rather than the whole tenant — created and scoped by an
@@ -548,7 +561,9 @@ where one exists.
   aggregating every thread they participate in or follow across channels, with
   unread reply counts — so keeping up with threads has not required revisiting
   each parent channel. A reply has optionally also been **posted to the channel's
-  main scroll** rather than only the thread.
+  main scroll** rather than only the thread: one message, stored once with a flag
+  and never copied, shown in both places, counted once in the channel's unread
+  and notifying once (PROTOCOL.md §5.10, SCHEMA.md §3bk).
 - **REQ-282.** A user has been able to **follow every thread in a chosen channel
   or DM** — a per-conversation setting distinct from following one thread
   (REQ-062) — so that every new thread started there, and every reply within it,
@@ -586,6 +601,13 @@ where one exists.
   is additive and cheap); **deleting** is the creator or an admin, because deletion
   breaks every message that used the shortcode. The TUI shows the shortcode, as this
   requirement always said it would.
+  **Rename** is allowed to whoever may delete it, and breaks nothing: the old name
+  becomes an **alias** resolving to the same image, so every message and reaction
+  that used it still shows it, aliases already pointing at the old name follow to
+  the new one, and an alias holds its name against a new emoji. Deleting an emoji
+  deletes its aliases. An emoji keeps at most 8 old names and a workspace 256, which
+  keeps the whole catalogue in one frame; past that a rename is refused and the
+  emoji can be added again under the new name.
 - **REQ-073.** A user has had **one-click quick reactions** — a small,
   per-user-configurable set of frequently-used emoji offered inline on a message
   as a shortcut over the full picker (REQ-070/265). The set has been a per-user
@@ -1094,12 +1116,18 @@ where one exists.
   surfaced as an activity-feed entry and a notification instead of a synthetic
   message from a fake user.
 
-  **Storage and delivery.** Storage is small — saved items
-  (ARCH-95, migration 0025) already hold (user, message) and want only a
-  `remind_at_ms` beside the existing stamp — and **delivery has a precedent**: the
-  daemon already runs a bounded periodic maintenance pass off the net loop's tick
-  (ARCH-78), which is the natural place for a due-reminder sweep and means no new
-  scheduler, thread, or timer subsystem.
+  **Storage and delivery, as built.** A reminder is a saved item with a time
+  (migration 0072: `remind_at_ms` and `reminded_at_ms` on `saved_items`), set
+  through `SAVE_ITEM` and told to the owner's devices in `SAVED_UPDATED`; a
+  reminder on an unsaved message saves it. It fires once, within the
+  scheduled-message tick of its time (fifteen seconds, the tick scheduled
+  messages already use, not the five-minute maintenance pass): an activity entry
+  of its own kind, sent live to the owner's connections, and a push held back by
+  a mute, quiet hours or a pause like any other. Clearing it, unsaving, or
+  deleting the message removes it. The desktop client offers "Remind me…" on a
+  message and in Saved (in 20 minutes, in 1 hour, tomorrow at 9:00, next Monday
+  at 9:00, or a chosen time); the terminal client offers the same choices in
+  its message menu, with the chosen time typed.
 - **REQ-284.** What the **unread badge counts** has been defined
   rather than left implicit: a conversation's badge has counted the messages that
   **would have notified** the user under their settings (REQ-130/134/135/137) —
@@ -1733,7 +1761,10 @@ where one exists.
   network** — an IP allowlist / CIDR restriction enforced at connection accept,
   refusing a connection from outside the permitted ranges before authentication —
   for organizations requiring network-level access control. The default has been
-  unrestricted.
+  unrestricted. Delivered as `OPENCHIME_ALLOWED_NETWORKS` (CONFIG.md): the TLS
+  port closes a client outside it before TLS, judging a proxied client by the
+  address its trusted forwarder names; the health port is never restricted
+  (ARCH-22, ARCH-25).
 
 ---
 

@@ -36,6 +36,15 @@ void oc_push_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
  * can raise a call-style notification. Fire-and-forget; a no-op if p is NULL. */
 void oc_push_notify_call(oc_push *p, uint64_t channel_id, uint64_t inviter, uint64_t invitee);
 
+/* Enqueue a reminder come due (REQ-283): to `user_id` alone, decided as a call
+ * invitation is -- a mute, the schedule and a pause silence it -- with
+ * "kind":"reminder" in the contentless payload. Never mail. A no-op if p is NULL. */
+void oc_push_notify_reminder(oc_push *p, uint64_t channel_id, uint64_t user_id);
+
+/* oc_push_build_body_kind's `kind`: 0 a message, these the others. */
+#define OC_PUSH_KIND_CALL     1
+#define OC_PUSH_KIND_REMINDER 2
+
 void oc_push_stop(oc_push *p);
 
 /* One signed request to central, for the emitters beside this one (the
@@ -94,8 +103,8 @@ int oc_push_sign(const char *privkey_pem, const char *method, const char *path, 
 /* Build the contentless notify JSON body from targets. Returns 0 on success. */
 int oc_push_build_body(uint64_t channel_id, const oc_push_target *targets, int n,
                        char *out, size_t cap);
-/* The same with `call` set: each notification also says "kind":"call". Still no
- * names and no content. */
+/* The same with `call` set: each notification also says "kind":"call", or
+ * "kind":"reminder" for OC_PUSH_KIND_REMINDER. Still no names and no content. */
 int oc_push_build_body_kind(uint64_t channel_id, int call, const oc_push_target *targets, int n,
                             char *out, size_t cap);
 

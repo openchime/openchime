@@ -4,8 +4,10 @@
  */
 
 #include "migrate.h"
+#include "richtext.h"   /* oc_rt_unspoiled: what the search index holds */
 
 #include <stddef.h>
+#include <stdlib.h>
 
 /* --- Embedded migrations ------------------------------------------------ */
 
@@ -1262,6 +1264,18 @@ static const char MIGRATION_0070[] =
     "  PRIMARY KEY (user_id, message_id)"
     ");";
 
+static const char MIGRATION_0073[] =
+    /* A thread reply also posted to the channel's main scroll (REQ-062): one
+     * row, flagged, never copied. The main scroll's queries take
+     * `parent_id IS NULL OR also_channel=1`. Every row before this reads 0. */
+    "ALTER TABLE messages ADD COLUMN also_channel INTEGER NOT NULL DEFAULT 0;";
+
+static const char MIGRATION_0074[] =
+    /* Follow every thread in a conversation (REQ-282): a per-person,
+     * per-conversation preference beside the level and mute. Every row before
+     * this reads 0. */
+    "ALTER TABLE notification_prefs ADD COLUMN follow_threads INTEGER NOT NULL DEFAULT 0;";
+
 static const char MIGRATION_0071[] =
     /* What kind of principal a user row is. Every row so far is a person
      * ('human'). A web visitor ('visitor') is a row with subject
@@ -1271,6 +1285,193 @@ static const char MIGRATION_0071[] =
      * without rebuilding users. */
     "ALTER TABLE users ADD COLUMN kind TEXT NOT NULL DEFAULT 'human' "
     "  CHECK (kind IN ('human','agent','bot','visitor'));";
+
+static const char MIGRATION_0072[] =
+    /* Search leaves out what a spoiler hides, for everyone, its author too
+     * (MARKDOWN.md §1d): the index holds oc_unspoiled(body), the body with each
+     * spoiler's hidden text removed, so a word that appears only inside one finds
+     * nothing and a guess cannot be confirmed. The triggers index that instead of
+     * the body; an FTS5 'delete' must be given what was indexed, so it is given
+     * the same. Then each existing message that may hold a spoiler is indexed
+     * again: its entry was the whole body, which is what its 'delete' is given.
+     * A body without one is unchanged by oc_unspoiled, so the cheap test that
+     * picks them may pick too many but never too few. */
+    "DROP TRIGGER messages_fts_ai;"
+    "DROP TRIGGER messages_fts_ad;"
+    "DROP TRIGGER messages_fts_au;"
+    "CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages"
+    "  WHEN (SELECT e2e FROM channels WHERE id=new.channel_id) IS NOT 1 BEGIN"
+    "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, oc_unspoiled(new.body));"
+    "END;"
+    "CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages"
+    "  WHEN (SELECT e2e FROM channels WHERE id=old.channel_id) IS NOT 1 BEGIN"
+    "  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, oc_unspoiled(old.body));"
+    "END;"
+    "CREATE TRIGGER messages_fts_au AFTER UPDATE ON messages"
+    "  WHEN (SELECT e2e FROM channels WHERE id=new.channel_id) IS NOT 1 BEGIN"
+    "  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, oc_unspoiled(old.body));"
+    "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, oc_unspoiled(new.body));"
+    "END;"
+    "CREATE TEMP TABLE spoiler_reindex AS"
+    "  SELECT m.id, m.body FROM messages m"
+    "   WHERE m.body IS NOT NULL"
+    "     AND (instr(m.body, '>!') > 0 OR instr(m.body, '```spoiler') > 0)"
+    "     AND (SELECT e2e FROM channels WHERE id=m.channel_id) IS NOT 1;"
+    "INSERT INTO messages_fts(messages_fts, rowid, body)"
+    "  SELECT 'delete', id, body FROM spoiler_reindex;"
+    "INSERT INTO messages_fts(rowid, body)"
+    "  SELECT id, oc_unspoiled(body) FROM spoiler_reindex;"
+    "DROP TABLE spoiler_reindex;";
+
+static const char MIGRATION_0075[] =
+    /* Reminders on saved items (REQ-283): when to remind, and when it fired, so
+     * it fires once. Setting a new time clears reminded_at_ms; clearing the
+     * reminder clears both. The index holds only reminders still to fire, which
+     * is what the scheduled tick reads. */
+    "ALTER TABLE saved_items ADD COLUMN remind_at_ms INTEGER;"
+    "ALTER TABLE saved_items ADD COLUMN reminded_at_ms INTEGER;"
+    "CREATE INDEX idx_saved_remind ON saved_items(remind_at_ms) "
+    "  WHERE remind_at_ms IS NOT NULL AND reminded_at_ms IS NULL;";
+
+static const char MIGRATION_0076[] =
+    /* Usage (REQ-043): the days a member was active, one row a member a day,
+     * `day` being days since the epoch in UTC. A row is added the first time in
+     * a day the member signs in or uses a session; it holds nothing they wrote,
+     * and is all the daily and weekly active-member figures need. */
+    "CREATE TABLE user_active_days ("
+    "  user_id INTEGER NOT NULL REFERENCES users(id),"
+    "  day     INTEGER NOT NULL,"
+    "  PRIMARY KEY (user_id, day)"
+    ") WITHOUT ROWID;"
+    "CREATE INDEX user_active_days_day ON user_active_days(day);";
+
+static const char MIGRATION_0077[] =
+    /* Muted people: whom each person has chosen to stop hearing from. Their
+     * messages, replies, reactions and mentions notify that person nowhere and
+     * count as unread for them nowhere; the muted person is told nothing. A set
+     * per person, as priority_people (0035) is, the other list about WHO. */
+    "CREATE TABLE muted_users ("
+    "  user_id       INTEGER NOT NULL REFERENCES users(id),"
+    "  muted_id      INTEGER NOT NULL REFERENCES users(id),"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  PRIMARY KEY (user_id, muted_id)"
+    ") WITHOUT ROWID;";
+
+static const char MIGRATION_0078[] =
+    /* Snippets (REQ-226): an attachment of media kind 2, with a title and an
+     * optional language beside a video's facts, and an index of its title and
+     * first 64 KiB, keyed on the attachment, for search. The index row goes
+     * when the message is deleted or the bytes are reclaimed. */
+    "ALTER TABLE attachment_media ADD COLUMN title TEXT;"
+    "ALTER TABLE attachment_media ADD COLUMN language TEXT;"
+    "CREATE VIRTUAL TABLE snippets_fts USING fts5(title, body);";
+
+static const char MIGRATION_0079[] =
+    /* Blocks and DM privacy. A block is the blocker's alone: the blocked person
+     * cannot start a direct conversation with them, and what the blocked person
+     * still sends into one they share is kept for its other members but
+     * withheld from the blocker -- recorded per message, so lifting the block
+     * brings back nothing that was withheld. `dm_privacy` 'nobody' refuses every
+     * new direct conversation naming that person. */
+    "CREATE TABLE blocks ("
+    "  user_id       INTEGER NOT NULL REFERENCES users(id),"
+    "  blocked_id    INTEGER NOT NULL REFERENCES users(id),"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  PRIMARY KEY (user_id, blocked_id)"
+    ") WITHOUT ROWID;"
+    "CREATE TABLE withheld_messages ("
+    "  user_id    INTEGER NOT NULL REFERENCES users(id),"
+    "  message_id INTEGER NOT NULL REFERENCES messages(id),"
+    "  PRIMARY KEY (user_id, message_id)"
+    ") WITHOUT ROWID;"
+    "ALTER TABLE users ADD COLUMN dm_privacy TEXT NOT NULL DEFAULT 'anyone' "
+    "  CHECK (dm_privacy IN ('anyone','nobody'));";
+
+static const char MIGRATION_0080[] =
+    /* A workspace's own profile fields -- department, location, manager --
+     * defined by its owners and admins, at most 20, each plain text or a link;
+     * and each person's value for each, at most 200 bytes. A field's values go
+     * with it when it is deleted. */
+    "CREATE TABLE profile_fields ("
+    "  id            INTEGER PRIMARY KEY,"
+    "  label         TEXT NOT NULL,"
+    "  kind          TEXT NOT NULL CHECK (kind IN ('text','link')),"
+    "  position      INTEGER NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL"
+    ");"
+    "CREATE TABLE profile_field_values ("
+    "  user_id  INTEGER NOT NULL REFERENCES users(id),"
+    "  field_id INTEGER NOT NULL REFERENCES profile_fields(id),"
+    "  value    TEXT NOT NULL,"
+    "  PRIMARY KEY (user_id, field_id)"
+    ") WITHOUT ROWID;";
+
+static const char MIGRATION_0081[] =
+    /* Out of office: a span and a message, apart from the custom status. Stored
+     * as given; whether it is in force (start <= now < end) is decided by
+     * whoever reads it, so nothing has to fire when it ends. */
+    "ALTER TABLE users ADD COLUMN ooo_start_ms INTEGER NOT NULL DEFAULT 0;"
+    "ALTER TABLE users ADD COLUMN ooo_end_ms INTEGER NOT NULL DEFAULT 0;"
+    "ALTER TABLE users ADD COLUMN ooo_message TEXT NOT NULL DEFAULT '';";
+
+static const char MIGRATION_0082[] =
+    /* A channel's creator (NULL for every channel made before this, and for a
+     * DM), and its managers: members who may rename, archive and unarchive it,
+     * beside the workspace's owners and admins. The creator is the first; any
+     * manager, admin or owner names and removes others. Leaving the channel ends
+     * the role. A channel may have none. */
+    "ALTER TABLE channels ADD COLUMN created_by INTEGER REFERENCES users(id);"
+    "CREATE TABLE channel_managers ("
+    "  channel_id    INTEGER NOT NULL REFERENCES channels(id),"
+    "  user_id       INTEGER NOT NULL REFERENCES users(id),"
+    "  granted_by    INTEGER REFERENCES users(id),"
+    "  granted_at_ms INTEGER NOT NULL,"
+    "  PRIMARY KEY (channel_id, user_id)"
+    ") WITHOUT ROWID;";
+
+static const char MIGRATION_0083[] =
+    /* A custom emoji's old names (REQ-072). A rename keeps the old shortcode as
+     * an alias of the same image, so the messages and reactions that used it
+     * still show it; an alias holds its name against a new emoji. Aliases
+     * follow their emoji through a later rename and go with it on a delete. */
+    "CREATE TABLE custom_emoji_aliases ("
+    "  alias TEXT PRIMARY KEY,"
+    "  name  TEXT NOT NULL REFERENCES custom_emoji(name) ON UPDATE CASCADE ON DELETE CASCADE"
+    ");"
+    "CREATE INDEX custom_emoji_aliases_name ON custom_emoji_aliases(name);";
+
+/* 0084: the conversation an audit entry happened in (REQ-251), so a reader can
+ * go to it: the channel for a channel's changes, and the channel a moderated
+ * message is in. NULL for the rest, and for every entry written before. */
+static const char MIGRATION_0084[] =
+    "ALTER TABLE audit_log ADD COLUMN channel_id INTEGER;";
+
+static const char MIGRATION_0085[] =
+    /* To-do lists in messages: a list beside the message whose "/todo" body
+     * made it, and its tasks in the order they were added. A task is named by
+     * its place, which never changes. The rows stay when the message is
+     * deleted -- every read requires a message that stands -- so a restore
+     * brings the list back as it was. Both tables reference messages(id)
+     * directly, as the poll tables do, so a channel's purge can clear them in
+     * any order. */
+    "CREATE TABLE todo_lists ("
+    "  message_id    INTEGER PRIMARY KEY REFERENCES messages(id),"
+    "  channel_id    INTEGER NOT NULL REFERENCES channels(id),"
+    "  author_id     INTEGER NOT NULL REFERENCES users(id),"
+    "  title         TEXT    NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL"
+    ");"
+    "CREATE TABLE todo_tasks ("
+    "  message_id    INTEGER NOT NULL REFERENCES messages(id),"
+    "  idx           INTEGER NOT NULL,"
+    "  name          TEXT    NOT NULL,"
+    "  description   TEXT    NOT NULL DEFAULT '',"
+    "  done          INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0,1)),"
+    "  done_by       INTEGER REFERENCES users(id),"
+    "  done_at_ms    INTEGER,"
+    "  PRIMARY KEY (message_id, idx),"
+    "  UNIQUE (message_id, name)"
+    ");";
 
 static const char MIGRATION_0056[] =
     /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
@@ -1631,6 +1832,20 @@ const oc_migration OC_MIGRATIONS[] = {
     { 69, MIGRATION_0069 },
     { 70, MIGRATION_0070 },
     { 71, MIGRATION_0071 },
+    { 72, MIGRATION_0072 },
+    { 73, MIGRATION_0073 },
+    { 74, MIGRATION_0074 },
+    { 75, MIGRATION_0075 },
+    { 76, MIGRATION_0076 },
+    { 77, MIGRATION_0077 },
+    { 78, MIGRATION_0078 },
+    { 79, MIGRATION_0079 },
+    { 80, MIGRATION_0080 },
+    { 81, MIGRATION_0081 },
+    { 82, MIGRATION_0082 },
+    { 83, MIGRATION_0083 },
+    { 84, MIGRATION_0084 },
+    { 85, MIGRATION_0085 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 
@@ -1680,8 +1895,55 @@ static int identity_attached(sqlite3 *db) {
     return found;
 }
 
+/* oc_unspoiled(body): the body with what its spoilers hide removed (oc_rt_unspoiled),
+ * NULL for NULL. Its result is as long as the body at most. */
+static void sql_unspoiled(sqlite3_context *cx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    const char *t = (const char *)sqlite3_value_text(argv[0]);
+    int n = sqlite3_value_bytes(argv[0]);
+    if (!t) { sqlite3_result_null(cx); return; }
+    char *out = malloc((size_t)n + 1);
+    if (!out) { sqlite3_result_error_nomem(cx); return; }
+    size_t w = oc_rt_unspoiled(t, (size_t)n, out, (size_t)n + 1);
+    sqlite3_result_text(cx, out, (int)w, free);
+}
+
+/* Every excerpt the daemon sends -- a channel's preview, a thread's, an
+ * activity row's, a search hit's -- is made by oc_rt_plain_excerpt, so what a
+ * spoiler hides is never in one (MARKDOWN.md §1d). They are built in SQL, so
+ * the helper is a function there: oc_excerpt(text, bytes), and
+ * oc_has_spoiler(text) for where FTS's snippet() would otherwise cut a window. */
+static void sql_excerpt(sqlite3_context *cx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    const char *t = (const char *)sqlite3_value_text(argv[0]);
+    int n = sqlite3_value_bytes(argv[0]);
+    sqlite3_int64 cap = sqlite3_value_int64(argv[1]);
+    if (!t) { sqlite3_result_null(cx); return; }
+    if (cap <= 0 || cap > 65536) cap = 65536;
+    char *out = malloc((size_t)cap + 1);
+    if (!out) { sqlite3_result_error_nomem(cx); return; }
+    size_t w = oc_rt_plain_excerpt(t, (size_t)n, out, (size_t)cap + 1);
+    sqlite3_result_text(cx, out, (int)w, free);
+}
+static void sql_has_spoiler(sqlite3_context *cx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    const char *t = (const char *)sqlite3_value_text(argv[0]);
+    int n = sqlite3_value_bytes(argv[0]);
+    sqlite3_result_int(cx, t && oc_rt_spoilers(t, (size_t)n, NULL, 0) > 0);
+}
+
+/* All three, on every connection that registers them: the daemon's own and a
+ * test's alike, so a query or trigger that runs on one runs on the other. */
+void oc_migrate_functions(sqlite3 *db) {
+    sqlite3_create_function(db, "oc_unspoiled", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS,
+                            NULL, sql_unspoiled, NULL, NULL);
+    sqlite3_create_function(db, "oc_excerpt", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_excerpt, NULL, NULL);
+    sqlite3_create_function(db, "oc_has_spoiler", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_has_spoiler, NULL, NULL);
+}
+
 int oc_migrate(sqlite3 *db, const oc_migration *set, int n, char **errmsg) {
     if (errmsg) *errmsg = NULL;
+    oc_migrate_functions(db);
 
     int rc = sqlite3_exec(db,
         "CREATE TABLE IF NOT EXISTS schema_version ("

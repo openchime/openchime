@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include "richtext.h"   /* oc_rt_plain_excerpt: excerpts hide spoilers */
 #include "action.h"       /* what makes a message an action (ARCH-115) */
+#include "todo.h"         /* what makes a message a to-do list */
 #include "mention.h"      /* the shared @mention scanner (ARCH-89) */
 #include "speakable.h"    /* what read-aloud says for a body (ARCH-111) */
 #include "voice_pick.h"   /* a default read-aloud voice (REQ-292) */
@@ -161,15 +162,15 @@ static uint64_t dbw_now_ms(void) {
  *
  * `detail` must never carry the secret involved (ARCH-79): that a password
  * changed, never the password. */
-static void audit_log(sqlite3 *db, int family, const char *action,
-                      uint64_t actor_id, const char *actor_name,
-                      uint64_t target_id, const char *target,
-                      int outcome, const char *detail) {
+static void audit_log_in(sqlite3 *db, int family, const char *action,
+                         uint64_t actor_id, const char *actor_name, uint64_t channel_id,
+                         uint64_t target_id, const char *target,
+                         int outcome, const char *detail) {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
             "INSERT INTO audit_log(at_ms, family, action, actor_id, actor_name,"
-            " target_id, target, outcome, detail) "
-            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);", -1, &st, NULL) != SQLITE_OK) return;
+            " target_id, target, outcome, detail, channel_id) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);", -1, &st, NULL) != SQLITE_OK) return;
     sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
     sqlite3_bind_int(st, 2, family);
     sqlite3_bind_text(st, 3, action, -1, SQLITE_TRANSIENT);
@@ -184,8 +185,18 @@ static void audit_log(sqlite3 *db, int family, const char *action,
     sqlite3_bind_int(st, 8, outcome ? 1 : 0);
     if (detail) sqlite3_bind_text(st, 9, detail, -1, SQLITE_TRANSIENT);
     else        sqlite3_bind_null(st, 9);
+    if (channel_id) sqlite3_bind_int64(st, 10, (sqlite3_int64)channel_id);
+    else            sqlite3_bind_null(st, 10);
     sqlite3_step(st);
     sqlite3_finalize(st);
+}
+
+/* An entry that happened in no conversation. */
+static void audit_log(sqlite3 *db, int family, const char *action,
+                      uint64_t actor_id, const char *actor_name,
+                      uint64_t target_id, const char *target,
+                      int outcome, const char *detail) {
+    audit_log_in(db, family, action, actor_id, actor_name, 0, target_id, target, outcome, detail);
 }
 
 /* Resolve a user's display name for denormalizing into an entry, so the log
@@ -212,6 +223,16 @@ static void audit_actor(sqlite3 *db, int family, const char *action,
                         int outcome, const char *detail) {
     char *nm = audit_name_of(db, actor_id);
     audit_log(db, family, action, actor_id, nm, target_id, target, outcome, detail);
+    free(nm);
+}
+
+/* ...for an entry in channel `channel_id`: a change to the channel, or to a
+ * message or member in it, which a reader can then go to. */
+static void audit_actor_in(sqlite3 *db, int family, const char *action, uint64_t actor_id,
+                           uint64_t channel_id, uint64_t target_id, const char *target,
+                           int outcome, const char *detail) {
+    char *nm = audit_name_of(db, actor_id);
+    audit_log_in(db, family, action, actor_id, nm, channel_id, target_id, target, outcome, detail);
     free(nm);
 }
 
@@ -283,6 +304,8 @@ static void job_free(oc_job *j) {
     free(j->pri_people);
     free(j->sched_days);
     free(j->alert_key); free(j->alert_message);
+    free(j->snip_title); free(j->snip_lang); free(j->snip_text);
+    free(j->todo_name); free(j->todo_desc);
     free(j->token);
     free(j->proof);
     free(j->email);
@@ -333,7 +356,9 @@ static void job_free(oc_job *j) {
 
 /* Free the heap metadata of an attachment list (filename/mime per entry). */
 static void free_attach_meta(oc_attach_meta *a, size_t n) {
-    for (size_t i = 0; i < n; i++) { free(a[i].filename); free(a[i].mime); }
+    for (size_t i = 0; i < n; i++) {
+        free(a[i].filename); free(a[i].mime); free(a[i].title); free(a[i].language);
+    }
 }
 
 /* Reaction aggregates for a replayed window (REQ-070/071). A BROADCAST has no
@@ -366,7 +391,11 @@ static void fill_replay_reactions(sqlite3 *db, oc_dbres *r, uint64_t for_user) {
                 /* Prefer the requesting user's own id so the client can mark
                  * the chip as theirs; MIN() just picks a stable stand-in. */
                 "  COALESCE(MAX(CASE WHEN user_id=?2 THEN user_id END), MIN(user_id)) "
-                "FROM reactions WHERE message_id=?1 GROUP BY emoji ORDER BY emoji;",
+                /* Not the people this user has muted (SET_USER_MUTE): their reactions
+                 * are no part of the chips, as REACTION_UPDATED leaves them out. */
+                "FROM reactions WHERE message_id=?1 "
+                "  AND user_id NOT IN (SELECT muted_id FROM muted_users WHERE user_id=?2) "
+                "GROUP BY emoji ORDER BY emoji;",
                 -1, &st, NULL) != SQLITE_OK) break;
         sqlite3_bind_int64(st, 1, (sqlite3_int64)r->replay[i].message_id);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)for_user);
@@ -696,9 +725,126 @@ static void append_poll(sqlite3 *db, oc_dbres *r, uint64_t mid, uint64_t channel
 }
 
 /* Polls for a replayed window, each with the asker's own selection (REQ-225). */
+/* The reader's reminders on the saved rows of a replay (REQ-283), so the
+ * SAVED_UPDATED it turns into carries them rather than reading as none. */
+static void fill_replay_reminders(sqlite3 *db, oc_dbres *r, uint64_t viewer) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT COALESCE(remind_at_ms,0) FROM saved_items WHERE user_id=?1 AND message_id=?2;",
+                           -1, &st, NULL) != SQLITE_OK) return;
+    for (size_t i = 0; i < r->n_replay; i++) {
+        if (!r->replay[i].saved) continue;
+        sqlite3_reset(st);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)viewer);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)r->replay[i].message_id);
+        if (sqlite3_step(st) == SQLITE_ROW) r->replay[i].remind_at = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+}
+
 static void fill_replay_polls(sqlite3 *db, oc_dbres *r, uint64_t viewer) {
     for (size_t i = 0; i < r->n_replay; i++)
         append_poll(db, r, r->replay[i].message_id, r->replay[i].channel_id, viewer);
+}
+
+/* --- To-do lists (todo.h) -------------------------------------------------- */
+
+/* Whether body `b` makes a to-do list, and if it is one the daemon refuses, why:
+ * 0 for an ordinary message or a good list (*is_list set for the latter), else
+ * the error to answer the send with. */
+static uint16_t todo_check(const uint8_t *b, size_t n, oc_todo_parsed *tp, int *is_list) {
+    *is_list = 0;
+    int k = oc_todo_parse((const char *)b, n, tp);
+    if (k == OC_TODO_NONE) return 0;
+    if (k == OC_TODO_DUP) return OC_ERR_TODO_DUPLICATE;
+    if (k != OC_TODO_OK) return OC_ERR_TODO_INVALID;
+    *is_list = 1;
+    return 0;
+}
+
+/* The list body `b` makes, beside message `mid`, in the caller's transaction. */
+static void store_todo(sqlite3 *db, uint64_t mid, uint64_t channel_id, uint64_t author,
+                       const uint8_t *b, const oc_todo_parsed *tp, uint64_t ts) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO todo_lists(message_id, channel_id, author_id, title, created_at_ms) "
+            "VALUES(?1, ?2, ?3, ?4, ?5);", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)channel_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)author);
+    sqlite3_bind_text (st, 4, (const char *)b + tp->title.off, (int)tp->title.len, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)ts);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO todo_tasks(message_id, idx, name, description) VALUES(?1, ?2, ?3, ?4);",
+            -1, &st, NULL) != SQLITE_OK) return;
+    for (uint16_t i = 0; i < tp->n_tasks; i++) {
+        sqlite3_reset(st);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+        sqlite3_bind_int  (st, 2, i);
+        sqlite3_bind_text (st, 3, (const char *)b + tp->name[i].off, (int)tp->name[i].len, SQLITE_STATIC);
+        sqlite3_bind_text (st, 4, (const char *)b + tp->desc[i].off, (int)tp->desc[i].len, SQLITE_STATIC);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+}
+
+/* Append message `mid`'s list -- its whole state, read back from the tables --
+ * if it has one and the message stands: one entry per OC_TODO_CHUNK tasks. One
+ * function for the send, every change and every replay, as append_poll is. */
+static void append_todo(sqlite3 *db, oc_dbres *r, uint64_t mid) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT t.channel_id, t.author_id, t.title, (SELECT COUNT(*) FROM todo_tasks k WHERE k.message_id=t.message_id) "
+            "  FROM todo_lists t JOIN messages m ON m.id = t.message_id "
+            " WHERE t.message_id=?1 AND m.deleted_at_ms IS NULL;", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+    if (sqlite3_step(st) != SQLITE_ROW) { sqlite3_finalize(st); return; }
+    uint64_t ch = (uint64_t)sqlite3_column_int64(st, 0), au = (uint64_t)sqlite3_column_int64(st, 1);
+    const char *tt = (const char *)sqlite3_column_text(st, 2);
+    char *title = strdup(tt ? tt : "");
+    int total = sqlite3_column_int(st, 3);
+    sqlite3_finalize(st);
+    if (!title) return;
+    if (total > (int)OC_TODO_MAX_TASKS) total = (int)OC_TODO_MAX_TASKS;
+    size_t chunks = total ? ((size_t)total + OC_TODO_CHUNK - 1) / OC_TODO_CHUNK : 1;
+    struct oc_replay_todo *g = realloc(r->rtodo, (r->n_rtodo + chunks) * sizeof *g);
+    if (!g) { free(title); return; }
+    r->rtodo = g;
+    size_t base = r->n_rtodo;
+    for (size_t c = 0; c < chunks; c++) {
+        struct oc_replay_todo *e = &g[base + c];
+        memset(e, 0, sizeof *e);
+        e->message_id = mid; e->channel_id = ch; e->author_id = au;
+        e->title = c == 0 ? title : strdup(title);
+        e->total = (uint16_t)total;
+        e->first = (uint16_t)(c * OC_TODO_CHUNK);
+    }
+    r->n_rtodo += chunks;
+    if (sqlite3_prepare_v2(db,
+            "SELECT idx, name, description, done, COALESCE(done_by,0), COALESCE(done_at_ms,0) "
+            "  FROM todo_tasks WHERE message_id=?1 ORDER BY idx LIMIT ?2;", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+    sqlite3_bind_int  (st, 2, total);
+    int i = 0;
+    while (i < total && sqlite3_step(st) == SQLITE_ROW) {
+        struct oc_replay_todo *e = &g[base + (size_t)i / OC_TODO_CHUNK];
+        const char *nm = (const char *)sqlite3_column_text(st, 1);
+        const char *ds = (const char *)sqlite3_column_text(st, 2);
+        e->tasks[e->n].name = strdup(nm ? nm : "");
+        e->tasks[e->n].desc = strdup(ds ? ds : "");
+        e->tasks[e->n].done = (uint8_t)(sqlite3_column_int(st, 3) != 0);
+        e->tasks[e->n].done_by = (uint64_t)sqlite3_column_int64(st, 4);
+        e->tasks[e->n].done_at_ms = (uint64_t)sqlite3_column_int64(st, 5);
+        e->n++;
+        i++;
+    }
+    sqlite3_finalize(st);
+}
+
+/* Lists for a replayed window. */
+static void fill_replay_todos(sqlite3 *db, oc_dbres *r) {
+    for (size_t i = 0; i < r->n_replay; i++) append_todo(db, r, r->replay[i].message_id);
 }
 
 static void group_row_free(oc_group_row *g);
@@ -707,12 +853,25 @@ void oc_job_free(oc_job *j) { job_free(j); }
 
 void oc_dbres_free(oc_dbres *r) {
     if (!r) return;
+    free(r->dest_members);
+    free(r->usage);
+    free(r->mu_ids);
+    free(r->bl_ids);
+    free(r->blk_entries);
     free(r->alert_rows);
+    /* The emoji catalogue (REQ-072): each name, and each old name. */
+    for (size_t i = 0; i < r->n_elist; i++) {
+        free(r->elist[i].name);
+        for (uint8_t k = 0; k < r->elist[i].n_aliases; k++) free(r->elist[i].aliases[k]);
+    }
+    free(r->elist);
     free(r->body);
     free(r->pk_creds);
     /* 53's profile strings, alongside every other heap field. */
     free(r->st_emoji); free(r->st_text); free(r->pf_title); free(r->pf_tz);
     free(r->pf_full_name); free(r->pf_pronouns); free(r->pf_phone); free(r->pf_voice_id);
+    free(r->pfd); free(r->pfv);
+    free(r->pf_ooo_message);
     free(r->tts_text); free(r->tts_blob_key);
     free(r->sum_body); free(r->sum_version); free(r->sum_places); free(r->sum_notices);
     for (size_t i = 0; i < r->n_stt_names; i++) free(r->stt_names[i]);
@@ -740,6 +899,11 @@ void oc_dbres_free(oc_dbres *r) {
     for (size_t i = 0; i < r->n_rpoll; i++)
         for (uint8_t k = 0; k < r->rpoll[i].n_options; k++) free(r->rpoll[i].labels[k]);
     free(r->rpoll);
+    for (size_t i = 0; i < r->n_rtodo; i++) {
+        free(r->rtodo[i].title);
+        for (uint8_t k = 0; k < r->rtodo[i].n; k++) { free(r->rtodo[i].tasks[k].name); free(r->rtodo[i].tasks[k].desc); }
+    }
+    free(r->rtodo);
     free(r->pvoters);
     free(r->unf_url);
     free(r->unf_title);
@@ -758,6 +922,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->flist);
     free(r->ch_name);
     free(r->ch_topic);
+    free(r->ch_managers);
     for (size_t i = 0; i < r->n_groups; i++) group_row_free(&r->groups[i]);
     free(r->groups);
     for (size_t i = 0; i < r->n_mchan; i++) { free(r->mchan[i].name); free(r->mchan[i].topic); free(r->mchan[i].members); }
@@ -770,9 +935,12 @@ void oc_dbres_free(oc_dbres *r) {
         free(r->ulist[i].title); free(r->ulist[i].timezone);
         free(r->ulist[i].status_emoji); free(r->ulist[i].status_text);
         free(r->ulist[i].full_name); free(r->ulist[i].pronouns); free(r->ulist[i].voice_id);
+        free(r->ulist[i].ooo_message);
     }
     free(r->ulist);
     free(r->emoji);
+    free(r->react_adj_user);
+    free(r->react_adj_minus);
     for (size_t i = 0; i < r->n_rlist; i++) free(r->rlist[i].emoji);
     free(r->rlist);
     for (size_t i = 0; i < r->n_thread; i++) { free(r->thread[i].body); free(r->thread[i].author_name); free_attach_meta(r->thread[i].attach, r->thread[i].n_attach); }
@@ -1132,6 +1300,18 @@ static int credential_current(sqlite3 *db, uint64_t uid, uint64_t version, uint8
 
 /* Mint a session: random 32-byte token to the caller, only its SHA-256 stored
  * (AUTH.md §4). Returns 0 and fills token/expiry, or -1. */
+/* A member was active today (REQ-043's usage figures): one row a member a UTC
+ * day, written the first time and ignored after. */
+static void mark_active_day(sqlite3 *db, uint64_t user_id) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO user_active_days(user_id, day) VALUES(?, ?);",
+                           -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)(dbw_now_ms() / 86400000ull));
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
 /* `out_session_id` (optional) reports the row created, so a SESSION_LIST can mark
  * which entry is the connection asking (REQ-182). */
 static int mint_session(sqlite3 *db, uint64_t user_id,
@@ -1156,6 +1336,7 @@ static int mint_session(sqlite3 *db, uint64_t user_id,
         *out_session_id = (uint64_t)sqlite3_last_insert_rowid(db);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) return -1;
+    mark_active_day(db, user_id);   /* signing in is using the workspace today */
 
     memcpy(token_out, token, sizeof token);
     if (expiry_out) *expiry_out = expiry;
@@ -1206,6 +1387,7 @@ static uint64_t lookup_session(sqlite3 *db, const uint8_t *token, size_t tlen,
     sqlite3_bind_blob(st, 2, hash, sizeof hash, SQLITE_STATIC);
     sqlite3_step(st);
     sqlite3_finalize(st);
+    mark_active_day(db, uid);       /* and so is coming back to a session */
 
     if (role_out) *role_out = role;
     if (expiry_out) *expiry_out = exp;
@@ -1281,6 +1463,8 @@ static void notices_on_auth(sqlite3 *db, uint64_t uid, oc_dbres *r) {
     }
     sqlite3_finalize(st);
 }
+
+static void load_profile_fields(sqlite3 *db, oc_dbres *r);   /* with the profile, below */
 
 static void alerts_on_auth(sqlite3 *db, oc_dbres *r) {
     if (!oc_role_can_manage_members(r->role)) return;
@@ -1990,6 +2174,7 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
     r->session_id = sess_id;   /* REQ-182: which row this connection is using */
     alerts_on_auth(db, r);
     notices_on_auth(db, uid, r);
+    load_profile_fields(db, r);   /* the workspace's own fields, told at sign-in */
     /* Do-not-disturb rides along, BOTH halves: the net thread keeps the FACT in
      * memory so presence fan-out can carry it, and it has no database of its
      * own. The pause is an instant (REQ-278); the schedule is a rule the net
@@ -2596,6 +2781,19 @@ static oc_dbres *process_sessions_seen(sqlite3 *db, const oc_job *j) {
         sqlite3_reset(st);
     }
     sqlite3_finalize(st);
+    /* Each one's member was active today (REQ-043): the net loop sends this at
+     * least once in every UTC day a connection is used. */
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO user_active_days(user_id, day) "
+                               "SELECT user_id, ? FROM sessions WHERE id=?;", -1, &st, NULL) == SQLITE_OK) {
+        for (uint16_t i = 0; i < j->n_grp_uids; i++) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)(now / 86400000ull));
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)j->grp_uids[i]);
+            sqlite3_step(st);
+            sqlite3_reset(st);
+        }
+        sqlite3_finalize(st);
+    }
     return NULL;
 }
 
@@ -2825,7 +3023,8 @@ static void user_rows(sqlite3 *db, uint64_t only, oc_dbres *r) {
         "SELECT id, role, disabled, COALESCE(email,''), COALESCE(display_name,''), "
         "       COALESCE(avatar_attachment_id,0), COALESCE(title,''), COALESCE(timezone,''), "
         "       COALESCE(status_emoji,''), COALESCE(status_text,''), status_expires_ms, "
-        "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(voice_id,''), is_system "
+        "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(voice_id,''), is_system, "
+        "       ooo_start_ms, ooo_end_ms, ooo_message "
         "FROM users WHERE (?1 = 0 AND kind <> 'visitor') OR id = ?1 ORDER BY id;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)only);
     size_t cap = 8, n = 0;
@@ -2855,6 +3054,9 @@ static void user_rows(sqlite3 *db, uint64_t only, oc_dbres *r) {
         arr[n].pronouns     = strdup((const char *)sqlite3_column_text(st, 12));
         arr[n].voice_id     = strdup((const char *)sqlite3_column_text(st, 13));
         arr[n].flags        = sqlite3_column_int(st, 14) ? OC_USER_SYSTEM : 0;
+        arr[n].ooo_start    = (uint64_t)sqlite3_column_int64(st, 15);
+        arr[n].ooo_end      = (uint64_t)sqlite3_column_int64(st, 16);
+        arr[n].ooo_message  = strdup((const char *)sqlite3_column_text(st, 17));
         n++;
     }
     sqlite3_finalize(st);
@@ -3583,6 +3785,9 @@ static int is_member(sqlite3 *db, uint64_t channel_id, uint64_t user_id) {
     return found;
 }
 
+static void withhold_from_blockers(sqlite3 *db, uint64_t channel_id, uint64_t author, uint64_t mid,
+                                   oc_dbres *r);   /* below, with the blocks */
+
 /* Collect the channel's member user ids into r->members. */
 static void load_members(sqlite3 *db, uint64_t channel_id, oc_dbres *r) {
     sqlite3_stmt *st = NULL;
@@ -3752,6 +3957,13 @@ static int membership_sync(sqlite3 *db, uint64_t channel_id, uint64_t user_id, i
     }
     if (!want && exists) {
         sqlite3_prepare_v2(db, "DELETE FROM channel_members WHERE channel_id=? AND user_id=?;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+        /* Out of the channel is out of its management too (REQ-036b), and
+         * coming back does not bring the role back. */
+        sqlite3_prepare_v2(db, "DELETE FROM channel_managers WHERE channel_id=? AND user_id=?;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
         sqlite3_step(st);
@@ -4190,8 +4402,8 @@ static oc_dbres *process_channel_group(sqlite3 *db, const oc_job *j, int add) {
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
     free(users);
     if (changed)
-        audit_actor(db, OC_AUDIT_ADMIN, add ? "channel.group.add" : "channel.group.remove", j->user_id, 0,
-                    NULL, 1, NULL);
+        audit_actor_in(db, OC_AUDIT_ADMIN, add ? "channel.group.add" : "channel.group.remove", j->user_id,
+                       j->channel_id, 0, NULL, 1, NULL);
     r->type = OC_RES_CHANNEL_INFO;
     load_channel_info(db, j->channel_id, j->user_id, r);
     fill_briefs(db, r);
@@ -4261,7 +4473,7 @@ static void load_message_attachments(sqlite3 *db, uint64_t mid, oc_attach_meta *
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "SELECT a.id, a.filename, a.mime, a.size, a.reclaimed_at_ms, "
-        "       m.kind, m.duration_ms, m.width, m.height, m.poster_id "
+        "       m.kind, m.duration_ms, m.width, m.height, m.poster_id, m.title, m.language "
         "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id "
         " WHERE a.message_id=? ORDER BY a.id LIMIT ?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
@@ -4283,6 +4495,10 @@ static void load_message_attachments(sqlite3 *db, uint64_t mid, oc_attach_meta *
         a->width       = (uint16_t)sqlite3_column_int(st, 7);
         a->height      = (uint16_t)sqlite3_column_int(st, 8);
         a->poster_id   = (uint64_t)sqlite3_column_int64(st, 9);
+        /* A snippet's title and language (REQ-226). */
+        const unsigned char *tt = sqlite3_column_text(st, 10), *lg = sqlite3_column_text(st, 11);
+        a->title    = (a->media_kind == OC_MEDIA_SNIPPET && tt) ? strdup((const char *)tt) : NULL;
+        a->language = (a->media_kind == OC_MEDIA_SNIPPET && lg) ? strdup((const char *)lg) : NULL;
     }
     sqlite3_finalize(st);
 }
@@ -4400,8 +4616,9 @@ static void store_keyword_hits(sqlite3 *db, uint64_t mid, uint64_t channel_id,
         uint64_t uid = (uint64_t)sqlite3_column_int64(q, 0);
         const unsigned char *term = sqlite3_column_text(q, 1);
         size_t st_off = 0, st_len = 0;
-        if (!term || !oc_keyword_match((const char *)body, body_len,
-                                       (const char *)term, &st_off, &st_len)) continue;
+        /* A keyword inside a spoiler alerts nobody (MARKDOWN.md §1d). */
+        if (!term || !oc_rt_keyword_match((const char *)body, body_len,
+                                          (const char *)term, &st_off, &st_len)) continue;
         sqlite3_reset(ins);
         sqlite3_bind_int64(ins, 1, (sqlite3_int64)mid);
         sqlite3_bind_int64(ins, 2, (sqlite3_int64)channel_id);
@@ -4465,6 +4682,14 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
     oc_mention m[OC_MENTION_MAX];
     size_t n = oc_mention_scan((const char *)body, body_len, m, OC_MENTION_MAX);
     if (n > OC_MENTION_MAX) n = OC_MENTION_MAX;   /* the rest are ignored, not an error */
+    /* A mention inside a spoiler notifies nobody (MARKDOWN.md §1d): it gets no
+     * row, of any kind, broadcasts and groups included. */
+    {
+        size_t k = 0;
+        for (size_t i = 0; i < n; i++)
+            if (!oc_rt_in_spoiler((const char *)body, body_len, m[i].start)) m[k++] = m[i];
+        n = k;
+    }
 
     sqlite3_stmt *ins = NULL;
     if (sqlite3_prepare_v2(db,
@@ -4845,6 +5070,14 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     uint64_t ts = dbw_now_ms();
     /* A poll (REQ-225): its options are checked here, where it is stored. */
     if (j->n_poll_opts && !poll_valid(j, ts)) { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_INVALID_POLL; return r; }
+    /* A "/todo" body makes a to-do list, checked here against its limits. An
+     * encrypted DM's body is not the daemon's to read, and a poll is a poll. */
+    oc_todo_parsed tp;
+    int is_todo = 0;
+    if (!r->ch_e2e && !j->n_poll_opts) {
+        uint16_t te = todo_check(j->body, j->body_len, &tp, &is_todo);
+        if (te) { r->type = OC_RES_SEND_ERR; r->err_code = te; return r; }
+    }
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
 
     sqlite3_prepare_v2(db,
@@ -4891,6 +5124,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     store_forward(db, mid, j);
     store_action(db, mid);   /* REQ-058 */
     if (j->n_poll_opts) store_poll(db, mid, j->channel_id, j, ts);   /* REQ-225 */
+    if (is_todo) store_todo(db, mid, j->channel_id, j->user_id, j->body, &tp, ts);
 
     /* The draft this message came from is gone (REQ-223, ARCH-101), in the same
      * transaction as the send. Server-side rather than a client courtesy: a
@@ -4914,9 +5148,11 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     append_action(db, r, mid, j->channel_id, 1);
     /* The poll, read back as the forward is, for the frame after the ACTION. */
     if (j->n_poll_opts) append_poll(db, r, mid, j->channel_id, 0);
+    if (is_todo) append_todo(db, r, mid);   /* and the list, after it */
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
     r->broadcast_stored = broadcast_stored(db, mid);
     load_members(db, j->channel_id, r);
+    withhold_from_blockers(db, j->channel_id, j->user_id, mid, r);   /* in a DM, not to whoever blocks the author */
     return r;
 }
 
@@ -4973,6 +5209,17 @@ static oc_dbres *process_edit(sqlite3 *db, const oc_job *j) {
     uint64_t author = 0; int deleted = 0;
     if (!message_lookup(db, j->channel_id, j->message_id, &author, &deleted) || deleted) {
         r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r;
+    }
+    {   /* A to-do list's message is not edited: its title is renamed and its
+         * tasks added, and the body that made them stays as it was written. */
+        sqlite3_stmt *tq = NULL;
+        int is_todo = 0;
+        if (sqlite3_prepare_v2(db, "SELECT 1 FROM todo_lists WHERE message_id=?1;", -1, &tq, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(tq, 1, (sqlite3_int64)j->message_id);
+            is_todo = sqlite3_step(tq) == SQLITE_ROW;
+            sqlite3_finalize(tq);
+        }
+        if (is_todo) { r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_TODO_NO_EDIT; return r; }
     }
     if (author != j->user_id) {   /* no moderator edit — author only (REQ-032) */
         r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
@@ -5208,8 +5455,8 @@ static oc_dbres *process_restore(oc_dbwriter *w, const oc_job *j) {
     /* The action comes back with the body that made it (REQ-058). */
     store_action(db, j->message_id);
     if (author != j->user_id)
-        audit_actor(db, OC_AUDIT_MODERATION, "message.restore", j->user_id, j->message_id, NULL, 1,
-                    "moderator delete undone");
+        audit_actor_in(db, OC_AUDIT_MODERATION, "message.restore", j->user_id, j->channel_id,
+                       j->message_id, NULL, 1, "moderator delete undone");
     r->type = OC_RES_RESTORE_OK;
     r->author_id = author;
     r->body = (uint8_t *)body;
@@ -5221,6 +5468,7 @@ static oc_dbres *process_restore(oc_dbwriter *w, const oc_job *j) {
     sqlite3_finalize(st);
     load_message_attachments(db, j->message_id, r->attach, &r->n_attach);
     append_action(db, r, j->message_id, j->channel_id, 1);
+    append_todo(db, r, j->message_id);   /* its list, as it stood when deleted */
     load_members(db, j->channel_id, r);
     return r;
 }
@@ -5273,7 +5521,11 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
      * (ARCH-78) — so the bytes are reclaimed by a path that is already written
      * and tested, on its own schedule, off the writer thread. What matters for
      * correctness is that they leave the message immediately: a tombstone that
-     * still lists a file is offering something it no longer has. */
+     * still lists a file is offering something it no longer has. A snippet's
+     * words leave the search index with it (REQ-226). */
+    sqlite3_prepare_v2(db, "DELETE FROM snippets_fts WHERE rowid IN "
+                           "(SELECT id FROM attachments WHERE message_id=?);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_prepare_v2(db, "UPDATE attachments SET message_id=NULL WHERE message_id=?;",
                        -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
@@ -5281,6 +5533,13 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
     /* A tombstone has nothing to pin to either (REQ-052/230). Dropped before the
      * reactions so the order matches the table dependencies. */
     sqlite3_prepare_v2(db, "DELETE FROM pins WHERE message_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
+
+    /* Nor anything to be reminded of (REQ-283): the reminders go now, so a
+     * restore does not bring one back to fire late. The saved rows stay hidden
+     * behind the tombstone, as they always have, for a restore to show again. */
+    sqlite3_prepare_v2(db, "UPDATE saved_items SET remind_at_ms=NULL, reminded_at_ms=NULL WHERE message_id=?;",
+                       -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
 
     /* A tombstone has no links to preview either (REQ-052/222). */
@@ -5303,8 +5562,8 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
      * own message is ordinary use and would drown the log (REQ-032 already
      * distinguishes the two via deleted_by). */
     if (author != j->user_id)
-        audit_actor(db, OC_AUDIT_MODERATION, "message.delete", j->user_id,
-                    j->message_id, NULL, 1, "moderator delete");
+        audit_actor_in(db, OC_AUDIT_MODERATION, "message.delete", j->user_id, j->channel_id,
+                       j->message_id, NULL, 1, "moderator delete");
 
     r->type = OC_RES_DELETE_OK;
     r->author_id = author;
@@ -5335,7 +5594,7 @@ static int load_channel_info(sqlite3 *db, uint64_t channel_id, uint64_t actor, o
     sqlite3_stmt *st = NULL;
     int found = 0;
     sqlite3_prepare_v2(db,
-        "SELECT kind, name, is_public, created_at_ms, topic, archived_at_ms, e2e "
+        "SELECT kind, name, is_public, created_at_ms, topic, archived_at_ms, e2e, COALESCE(created_by,0) "
         "  FROM channels WHERE id=?;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
@@ -5350,10 +5609,22 @@ static int load_channel_info(sqlite3 *db, uint64_t channel_id, uint64_t actor, o
         r->ch_topic      = (tp && tp[0]) ? strdup((const char *)tp) : NULL;
         r->ch_archived   = (uint8_t)(sqlite3_column_type(st, 5) != SQLITE_NULL);
         r->ch_e2e        = (uint8_t)(sqlite3_column_int(st, 6) != 0);
+        r->ch_creator    = (uint64_t)sqlite3_column_int64(st, 7);
         r->channel_id    = channel_id;
         found = 1;
     }
     sqlite3_finalize(st);
+    /* Its managers (REQ-036b), in the order they were named. */
+    free(r->ch_managers); r->ch_managers = NULL; r->n_ch_managers = 0;
+    if (found && (r->ch_managers = calloc(OC_MAX_CHANNEL_MANAGERS, sizeof *r->ch_managers)) != NULL) {
+        sqlite3_prepare_v2(db, "SELECT user_id FROM channel_managers WHERE channel_id=?1 "
+                               "ORDER BY granted_at_ms, user_id LIMIT ?2;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        sqlite3_bind_int(st, 2, (int)OC_MAX_CHANNEL_MANAGERS);
+        while (r->n_ch_managers < OC_MAX_CHANNEL_MANAGERS && sqlite3_step(st) == SQLITE_ROW)
+            r->ch_managers[r->n_ch_managers++] = (uint64_t)sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+    }
     if (found) r->ch_joined = (uint8_t)(is_member(db, channel_id, actor) ? 1 : 0);
     if (found) r->n_ch_groups = channel_group_ids(db, channel_id, r->ch_groups, OC_MAX_CHANNEL_GROUPS);
     /* A DM with more than two participants is a GROUP DM (REQ-056) — the same
@@ -5392,6 +5663,86 @@ static void channel_change_notice(sqlite3 *db, const oc_job *j, const char *what
     char *who = audit_name_of(db, j->user_id);
     notice_channel(db, j->channel_id, "@%s %s", who ? who : "someone", what);
     free(who);
+}
+
+/* Is `user_id` a manager of `channel_id` (REQ-036b)? */
+static int is_channel_manager(sqlite3 *db, uint64_t channel_id, uint64_t user_id) {
+    sqlite3_stmt *st = NULL;
+    int yes = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM channel_managers WHERE channel_id=?1 AND user_id=?2;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
+        yes = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return yes;
+}
+
+/* Grant (`grant` 1) or revoke a channel's manager role (REQ-036b, ARCH-134):
+ * by a manager of the channel, an admin or an owner; granted only to a member,
+ * revoked from anyone holding it. Holding it already, or not holding it, is a
+ * success that changes nothing. Told to every member as CHANNEL_INFO. */
+static oc_dbres *process_channel_manager(sqlite3 *db, const oc_job *j, int grant) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+    sqlite3_stmt *st = NULL;
+    int exists = 0, is_dm = 0;
+    sqlite3_prepare_v2(db, "SELECT kind='dm' FROM channels WHERE id=?1;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    if (sqlite3_step(st) == SQLITE_ROW) { exists = 1; is_dm = sqlite3_column_int(st, 0); }
+    sqlite3_finalize(st);
+    if (!exists) { r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    if (is_dm)   { r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INVALID_CHANNEL; return r; }
+    uint8_t role = OC_ROLE_MEMBER;
+    user_role(db, j->user_id, &role);
+    if (!oc_role_can_moderate(role) && !is_channel_manager(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    uint64_t who = j->target_user_id;
+    int changed = 0;
+    if (grant) {
+        if (!who || !is_member(db, j->channel_id, who)) {
+            r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+        }
+        if (!is_channel_manager(db, j->channel_id, who)) {
+            int n = 0;
+            sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM channel_managers WHERE channel_id=?1;", -1, &st, NULL);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+            if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+            sqlite3_finalize(st);
+            if (n >= (int)OC_MAX_CHANNEL_MANAGERS) {
+                r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INVALID_CHANNEL; return r;
+            }
+            sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO channel_managers(channel_id, user_id, granted_by, granted_at_ms) "
+                                   "VALUES(?1, ?2, ?3, ?4);", -1, &st, NULL);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)who);
+            sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+            sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+            changed = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+            sqlite3_finalize(st);
+        }
+    } else {
+        sqlite3_prepare_v2(db, "DELETE FROM channel_managers WHERE channel_id=?1 AND user_id=?2;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)who);
+        changed = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+        sqlite3_finalize(st);
+    }
+    if (changed) {
+        char cid[24];
+        snprintf(cid, sizeof cid, "%llu", (unsigned long long)j->channel_id);
+        audit_actor_in(db, OC_AUDIT_ADMIN, grant ? "channel.manager.grant" : "channel.manager.revoke",
+                       j->user_id, j->channel_id, who, cid, 1, NULL);
+    }
+    r->type = OC_RES_CHANNEL_INFO;
+    load_channel_info(db, j->channel_id, j->user_id, r);
+    r->ch_fanout = 1;              /* every member's view of who runs it */
+    load_members(db, j->channel_id, r);
+    return r;
 }
 
 static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
@@ -5436,7 +5787,7 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         else      sqlite3_bind_null(st, 1);          /* "" clears the topic */
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
         sqlite3_step(st); sqlite3_finalize(st);
-        audit_actor(db, OC_AUDIT_ADMIN, "channel.topic", j->user_id, 0, NULL, 1, NULL);
+        audit_actor_in(db, OC_AUDIT_ADMIN, "channel.topic", j->user_id, j->channel_id, 0, NULL, 1, NULL);
     } else if (j->chup_op == OC_CHUP_DESCRIPTION) {
         /* Any member, on the topic's reasoning (ARCH-93): it is visible to
          * everyone in the channel and a wrong one is corrected in seconds. */
@@ -5448,7 +5799,7 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         else      sqlite3_bind_null(st, 1);          /* "" clears it */
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
         sqlite3_step(st); sqlite3_finalize(st);
-        audit_actor(db, OC_AUDIT_ADMIN, "channel.description", j->user_id, 0, NULL, 1, NULL);
+        audit_actor_in(db, OC_AUDIT_ADMIN, "channel.description", j->user_id, j->channel_id, 0, NULL, 1, NULL);
         channel_change_notice(db, j, vlen ? "changed this channel's description." : "cleared this channel's description.");
         /* Announced on its own frame, not CHANNEL_INFO: the text does not ride
          * the channel-state frame, so a sidebar has nothing to redraw -- only a
@@ -5462,7 +5813,8 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         load_members(db, j->channel_id, r);
         return r;
     } else if (j->chup_op == OC_CHUP_RENAME) {
-        if (!oc_role_can_moderate(role)) {
+        /* An owner or admin, or a manager of this channel (REQ-036b). */
+        if (!oc_role_can_moderate(role) && !is_channel_manager(db, j->channel_id, j->user_id)) {
             r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
         }
         if (vlen == 0 || vlen > OC_MAX_CHANNEL_NAME) {
@@ -5485,7 +5837,7 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         sqlite3_step(st); sqlite3_finalize(st);
         /* The id is untouched, so membership, history and cursors all follow the
          * rename for free — nothing durable was ever keyed on the name. */
-        audit_actor(db, OC_AUDIT_ADMIN, "channel.rename", j->user_id, 0, j->ch_name, 1, NULL);
+        audit_actor_in(db, OC_AUDIT_ADMIN, "channel.rename", j->user_id, j->channel_id, 0, j->ch_name, 1, NULL);
         {
             char what[OC_MAX_CHANNEL_NAME + 48];
             snprintf(what, sizeof what, "renamed this channel to #%.*s.", (int)vlen, j->ch_name);
@@ -5519,11 +5871,11 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         /* Audited as two distinct actions rather than one "visibility changed": going
          * public is a disclosure of everything said in there while it was private, and
          * an audit reader should not have to open the row to see which way it went. */
-        audit_actor(db, OC_AUDIT_ADMIN, pub ? "channel.public" : "channel.private",
-                    j->user_id, 0, NULL, 1, NULL);
+        audit_actor_in(db, OC_AUDIT_ADMIN, pub ? "channel.public" : "channel.private",
+                       j->user_id, j->channel_id, 0, NULL, 1, NULL);
         channel_change_notice(db, j, pub ? "made this channel public." : "made this channel private.");
     } else if (j->chup_op == OC_CHUP_ARCHIVE || j->chup_op == OC_CHUP_UNARCHIVE) {
-        if (!oc_role_can_moderate(role)) {
+        if (!oc_role_can_moderate(role) && !is_channel_manager(db, j->channel_id, j->user_id)) {
             r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
         }
         int on = (j->chup_op == OC_CHUP_ARCHIVE);
@@ -5532,8 +5884,8 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         else    sqlite3_bind_null(st, 1);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
         sqlite3_step(st); sqlite3_finalize(st);
-        audit_actor(db, OC_AUDIT_ADMIN, on ? "channel.archive" : "channel.unarchive",
-                    j->user_id, 0, NULL, 1, NULL);
+        audit_actor_in(db, OC_AUDIT_ADMIN, on ? "channel.archive" : "channel.unarchive",
+                       j->user_id, j->channel_id, 0, NULL, 1, NULL);
         channel_change_notice(db, j, on ? "archived this channel." : "unarchived this channel.");
     } else {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INVALID_CHANNEL; return r;
@@ -5571,11 +5923,12 @@ static oc_dbres *process_create_channel(sqlite3 *db, const oc_job *j) {
     }
 
     sqlite3_prepare_v2(db,
-        "INSERT INTO channels(kind,name,is_public,created_at_ms) VALUES('channel',?,?,?);",
+        "INSERT INTO channels(kind,name,is_public,created_at_ms,created_by) VALUES('channel',?,?,?,?);",
         -1, &st, NULL);
     sqlite3_bind_text(st, 1, j->ch_name, (int)nlen, SQLITE_STATIC);
     sqlite3_bind_int64(st, 2, j->ch_is_public ? 1 : 0);
     sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
@@ -5583,6 +5936,14 @@ static oc_dbres *process_create_channel(sqlite3 *db, const oc_job *j) {
     }
     uint64_t cid = (uint64_t)sqlite3_last_insert_rowid(db);
     add_membership(db, cid, j->user_id);
+    /* Its creator is its first manager (REQ-036b). */
+    sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO channel_managers(channel_id, user_id, granted_by, granted_at_ms) "
+                           "VALUES(?1, ?2, ?2, ?3);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)cid);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
     /* A new public channel, said where the workspace is told to say it. */
     if (j->ch_is_public) {
         char *who = audit_name_of(db, j->user_id);
@@ -5614,14 +5975,15 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         /* Newest top-level message, and how many the user has not acked (REQ-090)
          * — so a cache-less client can sort and badge the sidebar immediately. */
         "  (SELECT COALESCE(MAX(x.created_at_ms),0) FROM messages x "
-        "     WHERE x.channel_id=c.id AND x.parent_id IS NULL), "
+        "     WHERE x.channel_id=c.id AND (x.parent_id IS NULL OR x.also_channel=1)), "
         /* A badge counts what WOULD HAVE NOTIFIED, with the schedule and the
          * pause left out: those govern when to interrupt you, not whether a
          * message mattered, so a night of quiet hours still leaves a count in
          * the morning. Everything else is the evaluator's — mute silences
          * absolutely, a priority person pierces the level, and MENTIONS is
          * satisfied by a mention or a keyword hit. Thread replies are not here
-         * by construction (parent_id IS NULL); they badge the Threads view.
+         * -- they badge the Threads view -- unless also posted to the channel
+         * (REQ-062), when they count here once, as a top-level message does.
          *
          * This is oc_notify_decide reduced for quiet=0, paused=0 and written as
          * SQL, because a badge is a COUNT over a channel's backlog rather than a
@@ -5629,7 +5991,7 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
          * is what stops it drifting: every state it can express is compared
          * against the evaluator's own answer. */
         "  (SELECT COUNT(*) FROM messages x "
-        "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.author_id<>?1 "
+        "     WHERE x.channel_id=c.id AND (x.parent_id IS NULL OR x.also_channel=1) AND x.author_id<>?1 "
         /* The workspace's notices are no one's unread (oc_notify_decide's `own`). */
         "       AND x.author_id NOT IN (SELECT su.id FROM users su WHERE su.is_system=1) "
         "       AND x.deleted_at_ms IS NULL "
@@ -5637,6 +5999,11 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         "                             WHERE dc.user_id=?1 AND dc.channel_id=c.id),0) "
         "       AND COALESCE((SELECT np.muted FROM notification_prefs np "
         "                      WHERE np.user_id=?1 AND np.channel_id=c.id),0) = 0 "
+        /* Nor is a person the reader muted (`muted_author`), whoever else they are. */
+        "       AND NOT EXISTS(SELECT 1 FROM muted_users mu "
+        "                       WHERE mu.user_id=?1 AND mu.muted_id=x.author_id) "
+        /* Nor what a block withheld from them, which they never receive. */
+        "       AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?1 AND wm.message_id=x.id) "
         "       AND ( EXISTS(SELECT 1 FROM priority_people pp "
         "                     WHERE pp.user_id=?1 AND pp.person_id=x.author_id) "
         "          OR COALESCE((SELECT np.level FROM notification_prefs np "
@@ -5658,13 +6025,13 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
          * activity, and the row below it usually is. An action's preview is its
          * action text, flagged, so the client reads "<author> <text>" (REQ-058). */
         "  (SELECT oc_excerpt(substr(CASE WHEN (SELECT e2e FROM channels WHERE id=x.channel_id)=1 THEN '' ELSE COALESCE(x.body,'') END,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=x.id),0)),?2) FROM messages x "
-        "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.deleted_at_ms IS NULL "
+        "     WHERE x.channel_id=c.id AND (x.parent_id IS NULL OR x.also_channel=1) AND x.deleted_at_ms IS NULL "
         "     ORDER BY x.id DESC LIMIT 1), "
         "  COALESCE((SELECT x.author_id FROM messages x "
-        "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.deleted_at_ms IS NULL "
+        "     WHERE x.channel_id=c.id AND (x.parent_id IS NULL OR x.also_channel=1) AND x.deleted_at_ms IS NULL "
         "     ORDER BY x.id DESC LIMIT 1),0), "
         "  COALESCE((SELECT EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=x.id) FROM messages x "
-        "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.deleted_at_ms IS NULL "
+        "     WHERE x.channel_id=c.id AND (x.parent_id IS NULL OR x.also_channel=1) AND x.deleted_at_ms IS NULL "
         "     ORDER BY x.id DESC LIMIT 1),0), "
         "  c.e2e "
         "FROM channels c WHERE "
@@ -5855,8 +6222,8 @@ static oc_dbres *process_remove_channel(sqlite3 *db, const oc_job *j) {
     if (membership_sync(db, j->channel_id, j->target_user_id, 0) < 0) {
         /* REQ-251's moderation family names this explicitly: removing a member
          * from a channel, alongside a moderator deleting another user's message. */
-        audit_actor(db, OC_AUDIT_MODERATION, "channel.member.remove", j->user_id,
-                    j->target_user_id, NULL, 1, NULL);
+        audit_actor_in(db, OC_AUDIT_MODERATION, "channel.member.remove", j->user_id, j->channel_id,
+                       j->target_user_id, NULL, 1, NULL);
         note_change(db, r, j->channel_id, j->target_user_id, 0);   /* they are told */
     }
 
@@ -5873,6 +6240,158 @@ static oc_dbres *process_remove_channel(sqlite3 *db, const oc_job *j) {
  * Replies CHANNEL_INFO (kind=DM), pushed to the peer (not for a self-DM).
  * Messaging/backfill/search then work through the normal membership path. */
 static oc_dbres *process_open_e2e_dm(sqlite3 *db, const oc_job *j);
+/* --- Blocks and DM privacy ---------------------------------------------------
+ * A block is its blocker's alone. The blocked person cannot start a direct
+ * conversation with the blocker, and what they still send into one the two share
+ * is kept for its other members but withheld from the blocker: a row in
+ * withheld_messages per message, so lifting the block brings none of it back.
+ * DM privacy 'nobody' refuses every new direct conversation naming that person.
+ * Both refusals are the same OC_ERR_DM_REFUSED, which says neither. Channels are
+ * untouched: there, muting a person is the tool. */
+static int is_blocked(sqlite3 *db, uint64_t blocker, uint64_t who) {
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM blocks WHERE user_id=?1 AND blocked_id=?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)blocker);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)who);
+        found = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+static int dm_closed(sqlite3 *db, uint64_t uid) {
+    sqlite3_stmt *st = NULL;
+    int closed = 0;
+    if (sqlite3_prepare_v2(db, "SELECT dm_privacy='nobody' FROM users WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+        closed = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return closed;
+}
+
+/* A message `author` just wrote in `channel_id`: when that is a direct
+ * conversation, every member who blocks the author is taken out of the fan-out
+ * in r->members, and the message is recorded as withheld from them. */
+static void withhold_from_blockers(sqlite3 *db, uint64_t channel_id, uint64_t author, uint64_t mid, oc_dbres *r) {
+    sqlite3_stmt *st = NULL;
+    int dm = 0;
+    if (sqlite3_prepare_v2(db, "SELECT kind='dm' FROM channels WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        dm = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (!dm || !r->members) return;
+    size_t keep = 0;
+    for (size_t i = 0; i < r->n_members; i++) {
+        uint64_t m = r->members[i];
+        if (m != author && is_blocked(db, m, author)) {
+            st = NULL;
+            if (sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO withheld_messages(user_id, message_id) VALUES(?1, ?2);",
+                                   -1, &st, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(st, 1, (sqlite3_int64)m);
+                sqlite3_bind_int64(st, 2, (sqlite3_int64)mid);
+                sqlite3_step(st);
+            }
+            sqlite3_finalize(st);
+            continue;
+        }
+        r->members[keep++] = m;
+    }
+    r->n_members = keep;
+}
+
+/* Whom `uid` blocks and their DM privacy, as BLOCKS carries them. */
+static void fill_blocks(sqlite3 *db, uint64_t uid, oc_dbres *r) {
+    sqlite3_stmt *st = NULL;
+    r->bl_ids = calloc(OC_MAX_BLOCKS, sizeof *r->bl_ids);
+    if (!r->bl_ids) return;
+    sqlite3_prepare_v2(db, "SELECT blocked_id FROM blocks WHERE user_id=?1 ORDER BY blocked_id;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    while (r->bl_n < OC_MAX_BLOCKS && sqlite3_step(st) == SQLITE_ROW)
+        r->bl_ids[r->bl_n++] = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    r->bl_privacy = dm_closed(db, uid) ? OC_DM_PRIVACY_NOBODY : OC_DM_PRIVACY_ANYONE;
+    r->bl_have = 1;
+}
+
+/* Block or unblock one person (SET_BLOCK), audited in the moderation family.
+ * Yourself, nobody, the workspace's own sender or no one at all is ignored. */
+static oc_dbres *process_set_block(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_BLOCKS;
+    r->user_id = j->user_id;
+    uint64_t who = j->target_user_id;
+    if (who && who != j->user_id) {
+        sqlite3_stmt *st = NULL;
+        if (j->block_on)
+            sqlite3_prepare_v2(db,
+                "INSERT OR IGNORE INTO blocks(user_id, blocked_id, created_at_ms) "
+                "SELECT ?1, ?2, ?3 WHERE EXISTS(SELECT 1 FROM users WHERE id=?2 AND is_system=0);", -1, &st, NULL);
+        else
+            sqlite3_prepare_v2(db, "DELETE FROM blocks WHERE user_id=?1 AND blocked_id=?2;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)who);
+        if (j->block_on) sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        int changed = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+        sqlite3_finalize(st);
+        if (changed)
+            audit_actor(db, OC_AUDIT_MODERATION, j->block_on ? "block.place" : "block.lift",
+                        j->user_id, who, NULL, 1, NULL);
+    }
+    fill_blocks(db, j->user_id, r);
+    return r;
+}
+
+static oc_dbres *process_set_dm_privacy(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_BLOCKS;
+    r->user_id = j->user_id;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE users SET dm_privacy=?2 WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_text(st, 2, j->dm_privacy == OC_DM_PRIVACY_NOBODY ? "nobody" : "anyone", -1, SQLITE_STATIC);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    fill_blocks(db, j->user_id, r);
+    return r;
+}
+
+/* Every block in the workspace, for an owner or admin (LIST_BLOCKS), newest
+ * first. Authorized on the CURRENT role. */
+static oc_dbres *process_list_blocks(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_BLOCK_LIST;
+    uint8_t role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &role) || !oc_role_can_manage_members(role)) {
+        r->type = OC_RES_BLOCK_LIST_ERR;
+        r->err_code = OC_ERR_FORBIDDEN;
+        return r;
+    }
+    r->blk_entries = calloc(OC_BLOCK_LIST_MAX, sizeof *r->blk_entries);
+    if (!r->blk_entries) { r->type = OC_RES_BLOCK_LIST_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT user_id, blocked_id, created_at_ms FROM blocks ORDER BY created_at_ms DESC LIMIT ?1;",
+                       -1, &st, NULL);
+    sqlite3_bind_int(st, 1, (int)OC_BLOCK_LIST_MAX);
+    while (r->n_blk < OC_BLOCK_LIST_MAX && sqlite3_step(st) == SQLITE_ROW) {
+        oc_block_entry *e = &r->blk_entries[r->n_blk++];
+        e->blocker_id = (uint64_t)sqlite3_column_int64(st, 0);
+        e->blocked_id = (uint64_t)sqlite3_column_int64(st, 1);
+        e->since_ms   = (uint64_t)sqlite3_column_int64(st, 2);
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
 static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
     if (j->e2e) return process_open_e2e_dm(db, j);
     oc_dbres *r = calloc(1, sizeof *r);
@@ -5891,6 +6410,11 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
      * unknown target is, so nothing says a visitor is there. */
     if (user_is_visitor(db, self) || user_is_visitor(db, other)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    /* Blocked by them: no conversation, new or old, is opened, and the answer
+     * says no more than a closed door does. */
+    if (!self_dm && is_blocked(db, other, self)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_DM_REFUSED; return r;
     }
 
     /* A DM's IDENTITY is its participant set, stored as `dm_key` under a unique
@@ -5921,6 +6445,11 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
      * them is refused, as an unknown user is. */
     if (cid == 0 && !self_dm && user_disabled(db, other)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    /* Taking no new direct conversations: refused, the same way; one that
+     * already exists stands. */
+    if (cid == 0 && !self_dm && dm_closed(db, other)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_DM_REFUSED; return r;
     }
 
     if (cid == 0) {
@@ -5967,6 +6496,9 @@ static oc_dbres *process_open_e2e_dm(sqlite3 *db, const oc_job *j) {
     uint8_t trole = OC_ROLE_MEMBER;
     if (!other || other == self || !user_role(db, other, &trole) || user_disabled(db, other) ||
         user_is_visitor(db, self) || user_is_visitor(db, other)) return r;
+    /* Always a new conversation: refused, as plainly as any other, to someone
+     * the peer blocks or when the peer takes no new ones. */
+    if (is_blocked(db, other, self) || dm_closed(db, other)) return r;
     char key[96];
     snprintf(key, sizeof key, "e:%llu,%llu:%llu.%llu",
              (unsigned long long)(self < other ? self : other), (unsigned long long)(self < other ? other : self),
@@ -6113,22 +6645,57 @@ static int emoji_name_ok(const char *n, char *out, size_t cap) {
     return at > 0;
 }
 
+/* Is `name` an old name some emoji keeps? */
+static int emoji_alias_taken(sqlite3 *db, const char *name) {
+    sqlite3_stmt *st = NULL;
+    int yes = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM custom_emoji_aliases WHERE alias=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+        yes = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return yes;
+}
+
+static int64_t emoji_count(sqlite3 *db, const char *sql, const char *arg) {
+    sqlite3_stmt *st = NULL;
+    int64_t n = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        if (arg) sqlite3_bind_text(st, 1, arg, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
 static void build_emoji_list(sqlite3 *db, oc_dbres *r) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT name, attachment_id, created_by FROM custom_emoji ORDER BY name LIMIT ?;",
+        "SELECT name, attachment_id, created_by, created_at_ms FROM custom_emoji ORDER BY name LIMIT ?;",
         -1, &st, NULL);
     sqlite3_bind_int(st, 1, (int)OC_MAX_CUSTOM_EMOJI);
     size_t cap = 16, n = 0;
     oc_emoji_row *arr = malloc(cap * sizeof *arr);
     while (arr && sqlite3_step(st) == SQLITE_ROW) {
         if (n == cap) { cap *= 2; oc_emoji_row *g = realloc(arr, cap * sizeof *arr); if (!g) break; arr = g; }
+        memset(&arr[n], 0, sizeof arr[n]);
         arr[n].name          = strdup((const char *)sqlite3_column_text(st, 0));
         arr[n].attachment_id = (uint64_t)sqlite3_column_int64(st, 1);
         arr[n].created_by    = (uint64_t)sqlite3_column_int64(st, 2);
+        arr[n].created_at    = (uint64_t)sqlite3_column_int64(st, 3);
         n++;
     }
     sqlite3_finalize(st);
+    /* Each one's old names, oldest first (REQ-072). */
+    for (size_t i = 0; i < n; i++) {
+        if (sqlite3_prepare_v2(db, "SELECT alias FROM custom_emoji_aliases WHERE name=?1 ORDER BY rowid LIMIT ?2;",
+                               -1, &st, NULL) != SQLITE_OK) break;
+        sqlite3_bind_text(st, 1, arr[i].name ? arr[i].name : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, (int)OC_MAX_EMOJI_ALIASES);
+        while (arr[i].n_aliases < OC_MAX_EMOJI_ALIASES && sqlite3_step(st) == SQLITE_ROW)
+            arr[i].aliases[arr[i].n_aliases++] = strdup((const char *)sqlite3_column_text(st, 0));
+        sqlite3_finalize(st);
+    }
     r->elist = arr;
     r->n_elist = n;
     r->type = OC_RES_EMOJI_LIST;
@@ -6176,9 +6743,14 @@ static oc_dbres *process_add_emoji(sqlite3 *db, const oc_job *j) {
     if (!ok) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_UNKNOWN_ATTACHMENT; return r; }
 
     sqlite3_stmt *st = NULL;
+    /* An old name an emoji keeps (REQ-072) is taken: it already shows that
+     * emoji's image in the messages that used it. */
+    if (emoji_alias_taken(db, name)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_CHANNEL_EXISTS; return r;
+    }
     /* INSERT, not upsert: silently replacing an existing emoji changes what every
-     * message already containing that shortcode means. Renaming is delete then add,
-     * which is a decision somebody makes on purpose. */
+     * message already containing that shortcode means. A rename keeps the old
+     * name as an alias (RENAME_EMOJI). */
     sqlite3_prepare_v2(db,
         "INSERT INTO custom_emoji(name, attachment_id, created_by, created_at_ms) "
         "VALUES(?1, ?2, ?3, ?4);", -1, &st, NULL);
@@ -6210,6 +6782,16 @@ static oc_dbres *process_delete_emoji(sqlite3 *db, const oc_job *j) {
     uint8_t role = OC_ROLE_MEMBER;
     user_role(db, j->user_id, &role);
     sqlite3_stmt *st = NULL;
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_prepare_v2(db,
+        "DELETE FROM custom_emoji_aliases WHERE name IN "
+        "  (SELECT name FROM custom_emoji WHERE name=?1 AND (?2 = 1 OR created_by=?3));",
+        -1, &st, NULL);
+    sqlite3_bind_text (st, 1, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int  (st, 2, role >= OC_ROLE_ADMIN ? 1 : 0);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
     sqlite3_prepare_v2(db,
         "DELETE FROM custom_emoji WHERE name=?1 AND (?2 = 1 OR created_by=?3);",
         -1, &st, NULL);
@@ -6219,10 +6801,68 @@ static oc_dbres *process_delete_emoji(sqlite3 *db, const oc_job *j) {
     sqlite3_step(st);
     sqlite3_finalize(st);
     if (sqlite3_changes(db) == 0) {
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
         r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
     build_emoji_list(db, r);
     r->ch_fanout = 1;
+    return r;
+}
+
+/* Rename a custom emoji (REQ-072): whoever may delete it. The old name becomes
+ * an alias of the same image, and the aliases it had follow it, so nothing that
+ * used any of them breaks. A name an emoji or an alias holds is taken. */
+static oc_dbres *process_rename_emoji(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+    char from[OC_EMOJI_NAME_MAX], to[OC_EMOJI_NAME_MAX];
+    if (!emoji_name_ok(j->ch_name, from, sizeof from) || !emoji_name_ok(j->pf_name, to, sizeof to)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_MALFORMED_FRAME; return r;
+    }
+    uint8_t role = OC_ROLE_MEMBER;
+    user_role(db, j->user_id, &role);
+    sqlite3_stmt *st = NULL;
+    int may = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM custom_emoji WHERE name=?1 AND (?2 = 1 OR created_by=?3);",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text (st, 1, from, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int  (st, 2, role >= OC_ROLE_ADMIN ? 1 : 0);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+        may = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    if (!may) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
+    if (strcmp(from, to) == 0) { build_emoji_list(db, r); return r; }   /* nothing to do */
+    if (emoji_count(db, "SELECT COUNT(*) FROM custom_emoji WHERE name=?1;", to) || emoji_alias_taken(db, to)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_CHANNEL_EXISTS; return r;
+    }
+    if (emoji_count(db, "SELECT COUNT(*) FROM custom_emoji_aliases WHERE name=?1;", from) + 1 > OC_MAX_EMOJI_ALIASES ||
+        emoji_count(db, "SELECT COUNT(*) FROM custom_emoji_aliases;", NULL) + 1 > OC_MAX_EMOJI_ALIASES_TOTAL) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_EMOJI_ALIAS_LIMIT; return r;
+    }
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    int ok = 1;
+    static const char *const sql[] = {
+        "UPDATE custom_emoji SET name=?2 WHERE name=?1;",
+        /* The cascade already moved them; said again so it holds without it. */
+        "UPDATE custom_emoji_aliases SET name=?2 WHERE name=?1;",
+        "INSERT INTO custom_emoji_aliases(alias, name) VALUES(?1, ?2);",
+    };
+    for (size_t i = 0; ok && i < sizeof sql / sizeof sql[0]; i++) {
+        st = NULL;
+        if (sqlite3_prepare_v2(db, sql[i], -1, &st, NULL) != SQLITE_OK) { ok = 0; break; }
+        sqlite3_bind_text(st, 1, from, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, to, -1, SQLITE_TRANSIENT);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    sqlite3_exec(db, ok ? "COMMIT;" : "ROLLBACK;", NULL, NULL, NULL);
+    if (!ok) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    build_emoji_list(db, r);
+    r->ch_fanout = 1;          /* every picker and every message follows the name */
     return r;
 }
 
@@ -6264,6 +6904,10 @@ static oc_dbres *process_open_group_dm(sqlite3 *db, const oc_job *j) {
         if (!user_role(db, u, &role) || user_disabled(db, u) || user_is_visitor(db, u)) {
             r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
         }
+        /* Anyone named who blocks the caller: refused, as a 1:1 is. */
+        if (is_blocked(db, u, j->user_id)) {
+            r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_DM_REFUSED; return r;
+        }
         ids[n++] = u;
     }
     /* Three is the floor: two participants is a 1:1 DM and must reuse that path, or
@@ -6286,6 +6930,12 @@ static oc_dbres *process_open_group_dm(sqlite3 *db, const oc_job *j) {
     if (sqlite3_step(st) == SQLITE_ROW) cid = (uint64_t)sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
 
+    /* A new one naming anyone who takes no new direct conversations is refused. */
+    if (cid == 0)
+        for (int i = 0; i < n; i++)
+            if (ids[i] != j->user_id && dm_closed(db, ids[i])) {
+                r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_DM_REFUSED; return r;
+            }
     if (cid == 0) {
         sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
         sqlite3_prepare_v2(db,
@@ -6522,11 +7172,13 @@ static oc_dbres *process_list_files(sqlite3 *db, const oc_job *j) {
           "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id "
           " WHERE a.channel_id=?1 AND a.message_id IS NOT NULL "
           "   AND (a.created_at_ms, a.id) < (?3, ?4) "
+          "   AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?5 AND wm.message_id=a.message_id) "
           " ORDER BY a.created_at_ms DESC, a.id DESC LIMIT ?2;"
         : "SELECT a.id, a.channel_id, a.message_id, a.uploader_id, a.size, "
           "       a.created_at_ms, a.reclaimed_at_ms, a.filename, a.mime, m.kind, m.duration_ms "
           "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id "
           " WHERE a.channel_id=?1 AND a.message_id IS NOT NULL "
+          "   AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?5 AND wm.message_id=a.message_id) "
           " ORDER BY a.created_at_ms DESC, a.id DESC LIMIT ?2;")
         : (paged
         ? "SELECT a.id, a.channel_id, a.message_id, a.uploader_id, a.size, "
@@ -6535,16 +7187,20 @@ static oc_dbres *process_list_files(sqlite3 *db, const oc_job *j) {
           " WHERE a.message_id IS NOT NULL AND a.channel_id IN "
           "       (SELECT channel_id FROM channel_members WHERE user_id=?1) "
           "   AND (a.created_at_ms, a.id) < (?3, ?4) "
+          "   AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?5 AND wm.message_id=a.message_id) "
           " ORDER BY a.created_at_ms DESC, a.id DESC LIMIT ?2;"
         : "SELECT a.id, a.channel_id, a.message_id, a.uploader_id, a.size, "
           "       a.created_at_ms, a.reclaimed_at_ms, a.filename, a.mime, m.kind, m.duration_ms "
           "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id "
           " WHERE a.message_id IS NOT NULL AND a.channel_id IN "
           "       (SELECT channel_id FROM channel_members WHERE user_id=?1) "
+          "   AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?5 AND wm.message_id=a.message_id) "
           " ORDER BY a.created_at_ms DESC, a.id DESC LIMIT ?2;");
     sqlite3_prepare_v2(db, sql, -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)(j->channel_id ? j->channel_id : j->user_id));
     sqlite3_bind_int64(st, 2, (sqlite3_int64)(page + 1));
+    /* The asker: a file on a message a block withheld from them is not theirs to list. */
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)j->user_id);
     if (paged) {
         sqlite3_bind_int64(st, 3, (sqlite3_int64)j->files_before_ms);
         sqlite3_bind_int64(st, 4, (sqlite3_int64)j->files_before_id);
@@ -6586,6 +7242,7 @@ static oc_dbres *process_save_item(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
+    r->user_id = j->user_id;   /* told to every connection of theirs */
     r->message_id = j->message_id;
     r->save_op = j->save_op;
 
@@ -6612,6 +7269,17 @@ static oc_dbres *process_save_item(sqlite3 *db, const oc_job *j) {
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
         sqlite3_bind_int64(st, 3, (sqlite3_int64)now);
         sqlite3_step(st); sqlite3_finalize(st);
+        /* The reminder (REQ-283) is what this ADD says it is: a time sets it
+         * afresh, to fire once more; 0 clears it. The frame is the item's whole
+         * state, so a client re-saving one sends the reminder it holds. */
+        sqlite3_prepare_v2(db,
+            "UPDATE saved_items SET remind_at_ms=NULLIF(?3,0), reminded_at_ms=NULL "
+            " WHERE user_id=?1 AND message_id=?2;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->remind_at_ms);
+        sqlite3_step(st); sqlite3_finalize(st);
+        r->remind_at = j->remind_at_ms;
         /* Report the ORIGINAL save time, so a re-save does not appear to move the
          * item to the top of a list ordered by when you saved it. */
         sqlite3_prepare_v2(db, "SELECT created_at_ms FROM saved_items WHERE user_id=? AND message_id=?;",
@@ -6634,6 +7302,186 @@ static oc_dbres *process_save_item(sqlite3 *db, const oc_job *j) {
 /* Fold a message away for its reader, or open it again (PROTOCOL.md
  * SET_COLLAPSED): a message in a channel they are a member of, not a tombstone.
  * The answer is for every connection of theirs. Write. */
+/* Whether `channel_id` is a direct conversation: nothing moves into or out of
+ * one, since its readers never chose to share it with a channel. */
+static int channel_is_dm(sqlite3 *db, uint64_t channel_id) {
+    sqlite3_stmt *st = NULL;
+    int yes = 0;
+    if (sqlite3_prepare_v2(db, "SELECT kind='dm' FROM channels WHERE id=?1;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+    if (sqlite3_step(st) == SQLITE_ROW) yes = sqlite3_column_int(st, 0) != 0;
+    sqlite3_finalize(st);
+    return yes;
+}
+
+/* Move a message (REQ-053): a top-level message, or a thread with all of its
+ * replies, to another channel's top level; a message with no replies into a
+ * thread; a reply out to a top level. The ids, authors, times, edits,
+ * reactions, attachments and pins stay; the rows that name a message's
+ * channel besides `messages` follow it, in one transaction. An owner or admin
+ * moves anything, an author their own, and the mover must be able to post in
+ * the destination. A line is left where it was unless the mover said not to.
+ *
+ * The result is MESSAGE_MOVED for both channels' members; each client reads
+ * the moved rows back as it reads any others, so what a reader is shown is
+ * keyed on the reader (saved, collapsed) and not on the mover. */
+static oc_dbres *process_move_message(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->message_id = j->message_id;
+    r->type = OC_RES_MOVE_ERR;
+
+    uint64_t src = 0, author = 0, parent = 0;
+    int deleted = 0, found = 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT channel_id, author_id, deleted_at_ms, COALESCE(parent_id,0) FROM messages WHERE id=?1;",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            src     = (uint64_t)sqlite3_column_int64(st, 0);
+            author  = (uint64_t)sqlite3_column_int64(st, 1);
+            deleted = sqlite3_column_type(st, 2) != SQLITE_NULL;
+            parent  = (uint64_t)sqlite3_column_int64(st, 3);
+            found = 1;
+        }
+        sqlite3_finalize(st);
+    }
+    r->channel_id = src;
+    if (!found || deleted || !channel_read_access(db, src, j->user_id)) {
+        r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r;
+    }
+    uint8_t role = 0;
+    int can = author == j->user_id ||
+              (user_role(db, j->user_id, &role) && (role == OC_ROLE_ADMIN || role == OC_ROLE_OWNER));
+    if (!can) { r->err_code = OC_ERR_FORBIDDEN; return r; }
+    if (channel_is_archived(db, src)) { r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
+    uint8_t dest_public = 0;
+    if (!channel_exists(db, j->channel_id, &dest_public)) { r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    if (channel_is_e2e(db, src) || channel_is_e2e(db, j->channel_id) ||
+        channel_is_dm(db, src) || channel_is_dm(db, j->channel_id)) {
+        r->err_code = OC_ERR_CANNOT_MOVE; return r;
+    }
+
+    uint32_t replies = 0; uint64_t last = 0;
+    thread_stats(db, j->message_id, &replies, &last);
+    if (j->parent_id) {
+        /* Into a thread: a top-level, living message in the destination, and
+         * never one's own thread. A root with replies cannot become a reply --
+         * there is no thread inside a thread. */
+        uint64_t pa = 0; int pd = 0;
+        if (j->parent_id == j->message_id || replies > 0) { r->err_code = OC_ERR_CANNOT_MOVE; return r; }
+        if (!message_lookup(db, j->channel_id, j->parent_id, &pa, &pd) || pd) {
+            r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r;
+        }
+        uint64_t pp = 0;
+        if (sqlite3_prepare_v2(db, "SELECT COALESCE(parent_id,0) FROM messages WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->parent_id);
+            if (sqlite3_step(st) == SQLITE_ROW) pp = (uint64_t)sqlite3_column_int64(st, 0);
+            sqlite3_finalize(st);
+        }
+        if (pp) { r->err_code = OC_ERR_CANNOT_MOVE; return r; }
+    }
+    if (src == j->channel_id && parent == j->parent_id) { r->err_code = OC_ERR_CANNOT_MOVE; return r; }
+    /* Last, as it is the one check that writes: a public destination joins the
+     * mover, as a send there would. */
+    int acc = channel_post_access(db, j->channel_id, j->user_id);
+    if (acc == CH_ARCHIVED) { r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
+    if (acc != CH_OK)       { r->err_code = OC_ERR_FORBIDDEN; return r; }
+
+    sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+    /* The moved set: the message and, when it is a root, its replies. */
+    sqlite3_exec(db, "CREATE TEMP TABLE IF NOT EXISTS move_set(id INTEGER PRIMARY KEY); DELETE FROM move_set;",
+                 NULL, NULL, NULL);
+    int ok = 1;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO temp.move_set(id) SELECT id FROM messages WHERE id=?1 OR (?2 AND parent_id=?1);",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        sqlite3_bind_int(st, 2, parent == 0);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    } else ok = 0;
+    static const char *const follow[] = {
+        "UPDATE messages SET channel_id=?1 WHERE id IN (SELECT id FROM temp.move_set);",
+        "UPDATE mentions SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE pins SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE attachments SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE unfurls SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE polls SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE todo_lists SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE actions SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE thread_follows SET channel_id=?1 WHERE root_id IN (SELECT id FROM temp.move_set);",
+        "UPDATE sent_messages SET channel_id=?1 WHERE message_id IN (SELECT id FROM temp.move_set);",
+    };
+    for (size_t i = 0; ok && i < sizeof follow / sizeof follow[0]; i++) {
+        if (sqlite3_prepare_v2(db, follow[i], -1, &st, NULL) != SQLITE_OK) { ok = 0; break; }
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    if (ok && sqlite3_prepare_v2(db, "UPDATE messages SET parent_id=NULLIF(?2,0) WHERE id=?1;",
+                                 -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->parent_id);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    uint32_t count = 0;
+    if (ok && sqlite3_prepare_v2(db, "SELECT id FROM temp.move_set;", -1, &st, NULL) == SQLITE_OK) {
+        /* A summary that read it there no longer describes that channel. */
+        while (sqlite3_step(st) == SQLITE_ROW) { sum_purge_msg(db, (uint64_t)sqlite3_column_int64(st, 0)); count++; }
+        sqlite3_finalize(st);
+    }
+    if (!ok) {
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        r->err_code = OC_ERR_INTERNAL; return r;
+    }
+
+    char detail[96];
+    snprintf(detail, sizeof detail, "from %llu to %llu, %u message%s",
+             (unsigned long long)src, (unsigned long long)j->channel_id, count, count == 1 ? "" : "s");
+    /* In the channel it was moved to, where it now is. */
+    audit_actor_in(db, OC_AUDIT_MODERATION, "message.move", j->user_id, j->channel_id, j->message_id,
+                   NULL, 1, detail);
+    if (j->move_marker) {
+        char *who = audit_name_of(db, j->user_id);
+        char *dn = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT name FROM channels WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0))
+                dn = strdup((const char *)sqlite3_column_text(st, 0));
+            sqlite3_finalize(st);
+        }
+        char line[OC_MAX_BODY_SIZE < 512 ? OC_MAX_BODY_SIZE : 512];
+        /* The words name where it went and link to it there: a permalink with no
+         * host is this workspace's, which a client follows in the app (ARCH-96). */
+        int len = snprintf(line, sizeof line, "%s moved [%s](openchime:///c/%llu/m/%llu) to #%s.",
+                           who ? who : "Someone", count > 1 ? "a thread" : "a message",
+                           (unsigned long long)j->channel_id, (unsigned long long)j->message_id,
+                           dn ? dn : "another channel");
+        if (len > 0) notice_post(db, src, line, (size_t)len < sizeof line ? (size_t)len : sizeof line - 1);
+        free(who); free(dn);
+    }
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+
+    r->type = OC_RES_MESSAGE_MOVED;
+    r->user_id = j->user_id;
+    r->move_to = j->channel_id;
+    r->parent_id = j->parent_id;
+    r->reply_count = count;
+    load_members(db, src, r);
+    {
+        oc_dbres d; memset(&d, 0, sizeof d);
+        load_members(db, j->channel_id, &d);
+        r->dest_members = d.members;
+        r->n_dest_members = d.n_members;
+    }
+    return r;
+}
+
 static oc_dbres *process_set_collapsed(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -6676,7 +7524,8 @@ static oc_dbres *process_list_saved(sqlite3 *db, const oc_job *j) {
         /* An action travels as its action text, flagged (REQ-058). */
         "SELECT s.message_id, m.channel_id, m.author_id, m.created_at_ms, s.created_at_ms, substr(m.body,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0)), "
         "       (SELECT a.filename FROM attachments a WHERE a.message_id = m.id ORDER BY a.id LIMIT 1), "
-        "       EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) "
+        "       EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id), "
+        "       COALESCE(s.remind_at_ms, 0) "
         "  FROM saved_items s JOIN messages m ON m.id = s.message_id "
         " WHERE s.user_id=?1 AND m.deleted_at_ms IS NULL "
         /* Still gated on membership: leaving a channel should not keep leaking
@@ -6700,6 +7549,7 @@ static oc_dbres *process_list_saved(sqlite3 *db, const oc_job *j) {
         arr[n].body = b ? strdup((const char *)b) : NULL;
         arr[n].attach_name = an ? strdup((const char *)an) : NULL;
         arr[n].action = (uint8_t)(sqlite3_column_int(st, 7) != 0);
+        arr[n].remind_at = (uint64_t)sqlite3_column_int64(st, 8);
         n++;
     }
     sqlite3_finalize(st);
@@ -6758,6 +7608,9 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
             "   AND m.author_id NOT IN (SELECT su.id FROM users su WHERE su.is_system=1) "
             "   AND m.id > COALESCE(dc.message_id, 0) "
             "   AND COALESCE(np.muted, 0) = 0 "
+            /* Nor from a person I muted: their messages are unread for nobody here. */
+            "   AND NOT EXISTS(SELECT 1 FROM muted_users mu WHERE mu.user_id = ?1 AND mu.muted_id = m.author_id) "
+            "   AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id = ?1 AND wm.message_id = m.id) "
             "   AND ( ?4 = 1 "
             "         OR (?4 = 2 AND c.kind = 'dm') "
             "         OR (?4 = 3 AND c.kind <> 'dm' "
@@ -6834,7 +7687,22 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
          * the notice in message_id, its scope as text, its status as action --- */
         "  SELECT 4, sn.id, sn.channel_id, 0, sn.made_at_ms, CAST(sn.scope AS TEXT), sn.status "
         "    FROM summary_notices sn WHERE sn.user_id = ?1 "
-        ") ORDER BY at DESC LIMIT ?3;";
+        "  UNION ALL "
+        /* --- my reminders that fired (REQ-283): the message, at the moment it
+         * fired, by its author; gone with the reminder or the save --- */
+        "  SELECT 5, s.message_id, m.channel_id, m.author_id, s.reminded_at_ms, "
+        "         oc_excerpt(substr(COALESCE(m.body,''),1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0)),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) "
+        "    FROM saved_items s JOIN messages m ON m.id = s.message_id "
+        "   WHERE s.user_id = ?1 AND s.reminded_at_ms IS NOT NULL AND m.deleted_at_ms IS NULL "
+        "     AND EXISTS(SELECT 1 FROM channel_members cm "
+        "                 WHERE cm.channel_id = m.channel_id AND cm.user_id = ?1) "
+        /* A person I muted mentions, reacts and replies to nobody's feed of mine;
+         * my own reminders stay, whoever wrote the message they are on. */
+        /* What a block withheld from me -- a mention, a reply -- is not mine to see. */
+        ") act_all WHERE (kind = 5 OR actor_id NOT IN (SELECT mu.muted_id FROM muted_users mu WHERE mu.user_id = ?1)) "
+        "  AND NOT EXISTS(SELECT 1 FROM withheld_messages wm "
+        "                  WHERE wm.user_id = ?1 AND wm.message_id = act_all.message_id) "
+        "  ORDER BY at DESC LIMIT ?3;";
 
     sqlite3_prepare_v2(db, SQL, -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
@@ -6981,10 +7849,13 @@ static oc_dbres *process_list_pins(sqlite3 *db, const oc_job *j) {
         /* An action travels as its action text, flagged (REQ-058). */
         "       EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) "
         "  FROM pins p JOIN messages m ON m.id = p.message_id "
-        " WHERE p.channel_id=? AND m.deleted_at_ms IS NULL "
-        " ORDER BY p.created_at_ms DESC LIMIT ?;", -1, &st, NULL);
+        " WHERE p.channel_id=?1 AND m.deleted_at_ms IS NULL "
+        /* Not a message a block withheld from the asker. */
+        "   AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?3 AND wm.message_id=m.id) "
+        " ORDER BY p.created_at_ms DESC LIMIT ?2;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)OC_MAX_PINS);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
 
     oc_pin_row *arr = calloc(OC_MAX_PINS, sizeof *arr);
     size_t n = 0;
@@ -7064,6 +7935,33 @@ static oc_dbres *process_react(sqlite3 *db, const oc_job *j) {
     r->react_op = j->react_op;
     r->react_count = count;
     load_members(db, j->channel_id, r);
+    /* Whoever has muted someone who reacted with this emoji is sent the count
+     * without them (SET_USER_MUTE): a muted person's reactions stay out of the chips
+     * they see, as their messages stay out of the badges. */
+    if (sqlite3_prepare_v2(db,
+            "SELECT mu.user_id, COUNT(*) FROM reactions rx "
+            "  JOIN muted_users mu ON mu.muted_id = rx.user_id "
+            " WHERE rx.message_id=?1 AND rx.emoji=?2 GROUP BY mu.user_id;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        sqlite3_bind_text(st, 2, j->emoji, (int)elen, SQLITE_STATIC);
+        size_t cap = 0;
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            if (r->n_react_adj == cap) {
+                size_t nc = cap ? cap * 2 : 4;
+                uint64_t *u = realloc(r->react_adj_user, nc * sizeof *u);
+                if (!u) break;
+                r->react_adj_user = u;
+                uint64_t *k = realloc(r->react_adj_minus, nc * sizeof *k);
+                if (!k) break;
+                r->react_adj_minus = k;
+                cap = nc;
+            }
+            r->react_adj_user[r->n_react_adj] = (uint64_t)sqlite3_column_int64(st, 0);
+            r->react_adj_minus[r->n_react_adj] = (uint64_t)sqlite3_column_int64(st, 1);
+            r->n_react_adj++;
+        }
+        sqlite3_finalize(st);
+    }
     return r;
 }
 
@@ -7352,7 +8250,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     /* Idempotent replay: a known (channel, token) re-acks the original id. */
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT s.message_id, m.created_at_ms, m.parent_id FROM sent_messages s "
+        "SELECT s.message_id, m.created_at_ms, m.parent_id, m.also_channel FROM sent_messages s "
         "JOIN messages m ON m.id = s.message_id "
         "WHERE s.channel_id=? AND s.idempotency_token=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
@@ -7362,6 +8260,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
         r->message_id = (uint64_t)sqlite3_column_int64(st, 0);
         r->server_time = (uint64_t)sqlite3_column_int64(st, 1);
         r->parent_id = (uint64_t)sqlite3_column_int64(st, 2);
+        r->also_channel = (uint8_t)sqlite3_column_int(st, 3);
         r->duplicate = 1;
         sqlite3_finalize(st);
         return r;
@@ -7391,15 +8290,24 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
 
     uint64_t ts = dbw_now_ms();
     if (j->n_poll_opts && !poll_valid(j, ts)) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_INVALID_POLL; return r; }
+    oc_todo_parsed tp;   /* a reply can be a to-do list, as a channel message can */
+    int is_todo = 0;
+    if (!r->ch_e2e && !j->n_poll_opts) {
+        uint16_t te = todo_check(j->body, j->body_len, &tp, &is_todo);
+        if (te) { r->type = OC_RES_REPLY_ERR; r->err_code = te; return r; }
+    }
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    /* Also to the channel (REQ-062): one row, flagged, never a copy -- the main
+     * scroll's queries take a flagged reply as they take a top-level message. */
     sqlite3_prepare_v2(db,
-        "INSERT INTO messages(channel_id, author_id, body, created_at_ms, parent_id) "
-        "VALUES(?, ?, ?, ?, ?);", -1, &st, NULL);
+        "INSERT INTO messages(channel_id, author_id, body, created_at_ms, parent_id, also_channel) "
+        "VALUES(?, ?, ?, ?, ?, ?);", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
     sqlite3_bind_blob(st, 3, j->body, (int)j->body_len, SQLITE_STATIC);
     sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
     sqlite3_bind_int64(st, 5, (sqlite3_int64)root);
+    sqlite3_bind_int(st, 6, j->also_channel ? 1 : 0);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
@@ -7444,6 +8352,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     drop_draft(db, j->user_id, j->channel_id, j->parent_id);
     store_action(db, mid);   /* a reply can be an action too (REQ-058) */
     if (j->n_poll_opts) store_poll(db, mid, j->channel_id, j, ts);   /* and a poll (REQ-225) */
+    if (is_todo) store_todo(db, mid, j->channel_id, j->user_id, j->body, &tp, ts);
 
     sum_purge_msg(db, mid);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
@@ -7456,14 +8365,128 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     r->server_time = ts;
     r->parent_id = root;
     r->reply_count = count;
+    r->also_channel = j->also_channel ? 1 : 0;
     append_action(db, r, mid, j->channel_id, 1);   /* always: the client pairs them (ARCH-115) */
     if (j->n_poll_opts) append_poll(db, r, mid, j->channel_id, 0);
+    if (is_todo) append_todo(db, r, mid);
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
     r->broadcast_stored = broadcast_stored(db, mid);
     load_members(db, j->channel_id, r);
+    withhold_from_blockers(db, j->channel_id, j->user_id, mid, r);   /* in a DM, not to whoever blocks the author */
     /* Asked AFTER the reply is committed, so the author of the reply being
      * fanned out counts as a participant on the strength of it. */
     load_thread_participation(db, root, r);
+    return r;
+}
+
+/* --- working a to-do list -------------------------------------------------- *
+ * Anyone who can read the message adds a task or marks one; only its author
+ * renames the list. Nothing changes in an archived channel. Each answers the
+ * whole list to the conversation, so every reader converges on the daemon's
+ * state, whatever order changes arrive in. */
+
+/* The checks every change makes: the message stands in the channel named, has
+ * a list, and the asker may read it there, which is not archived. 0 when it
+ * may go ahead, filling *list_author; else the error. */
+static uint16_t todo_target(sqlite3 *db, const oc_job *j, uint64_t *list_author, uint16_t *count) {
+    uint64_t author = 0; int deleted = 0;
+    if (!message_lookup(db, j->channel_id, j->message_id, &author, &deleted) || deleted)
+        return OC_ERR_UNKNOWN_MESSAGE;
+    if (!channel_read_access(db, j->channel_id, j->user_id)) return OC_ERR_UNKNOWN_MESSAGE;
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT author_id, (SELECT COUNT(*) FROM todo_tasks k WHERE k.message_id=t.message_id) "
+            "  FROM todo_lists t WHERE message_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            *list_author = (uint64_t)sqlite3_column_int64(st, 0);
+            *count = (uint16_t)sqlite3_column_int(st, 1);
+            found = 1;
+        }
+        sqlite3_finalize(st);
+    }
+    if (!found) return OC_ERR_UNKNOWN_MESSAGE;
+    if (channel_is_archived(db, j->channel_id) || e2e_closed(db, j->channel_id)) return OC_ERR_CHANNEL_ARCHIVED;
+    return 0;
+}
+
+/* A string as a list keeps it: spaces and tabs off both ends. */
+static size_t todo_trimmed(const char *s, size_t *start) {
+    size_t a = 0, b = s ? strlen(s) : 0;
+    while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n')) a++;
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n')) b--;
+    *start = a;
+    return b - a;
+}
+
+static oc_dbres *process_todo(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+    r->message_id = j->message_id;
+    r->type = OC_RES_TODO_ERR;
+    uint64_t list_author = 0;
+    uint16_t count = 0;
+    uint16_t err = todo_target(db, j, &list_author, &count);
+    if (err) { r->err_code = err; return r; }
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (j->type == OC_JOB_TODO_ADD) {
+        size_t na, da, nl = todo_trimmed(j->todo_name, &na), dl = todo_trimmed(j->todo_desc, &da);
+        if (nl == 0 || nl > OC_TODO_NAME_MAX || dl > OC_TODO_DESC_MAX) { r->err_code = OC_ERR_TODO_INVALID; return r; }
+        if (count >= OC_TODO_MAX_TASKS) { r->err_code = OC_ERR_TODO_FULL; return r; }
+        int dup = 0;
+        if (sqlite3_prepare_v2(db, "SELECT 1 FROM todo_tasks WHERE message_id=?1 AND name=?2;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+            sqlite3_bind_text (st, 2, j->todo_name + na, (int)nl, SQLITE_STATIC);
+            dup = sqlite3_step(st) == SQLITE_ROW;
+            sqlite3_finalize(st);
+        }
+        if (dup) { r->err_code = OC_ERR_TODO_DUPLICATE; return r; }
+        if (sqlite3_prepare_v2(db,
+                "INSERT INTO todo_tasks(message_id, idx, name, description) "
+                "VALUES(?1, (SELECT COUNT(*) FROM todo_tasks WHERE message_id=?1), ?2, ?3);",
+                -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+            sqlite3_bind_text (st, 2, j->todo_name + na, (int)nl, SQLITE_STATIC);
+            sqlite3_bind_text (st, 3, j->todo_desc ? j->todo_desc + da : "", (int)dl, SQLITE_STATIC);
+            ok = sqlite3_step(st) == SQLITE_DONE;
+            sqlite3_finalize(st);
+        }
+    } else if (j->type == OC_JOB_TODO_MARK) {
+        if (j->todo_task >= count) { r->err_code = OC_ERR_TODO_INVALID; return r; }
+        /* The state wanted, not a toggle: already there, nothing changes --
+         * not even who marked it -- so concurrent marks agree. */
+        if (sqlite3_prepare_v2(db,
+                "UPDATE todo_tasks SET done=?3, done_by=CASE WHEN ?3 THEN ?4 END, "
+                "  done_at_ms=CASE WHEN ?3 THEN ?5 END "
+                " WHERE message_id=?1 AND idx=?2 AND done<>?3;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+            sqlite3_bind_int  (st, 2, j->todo_task);
+            sqlite3_bind_int  (st, 3, j->todo_done ? 1 : 0);
+            sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
+            sqlite3_bind_int64(st, 5, (sqlite3_int64)dbw_now_ms());
+            ok = sqlite3_step(st) == SQLITE_DONE;
+            sqlite3_finalize(st);
+        }
+    } else {   /* OC_JOB_TODO_RENAME */
+        if (list_author != j->user_id) { r->err_code = OC_ERR_FORBIDDEN; return r; }
+        size_t ta, tl = todo_trimmed(j->todo_name, &ta);
+        if (tl == 0 || tl > OC_TODO_TITLE_MAX) { r->err_code = OC_ERR_TODO_INVALID; return r; }
+        if (sqlite3_prepare_v2(db, "UPDATE todo_lists SET title=?2 WHERE message_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+            sqlite3_bind_text (st, 2, j->todo_name + ta, (int)tl, SQLITE_STATIC);
+            ok = sqlite3_step(st) == SQLITE_DONE;
+            sqlite3_finalize(st);
+        }
+    }
+    if (!ok) { r->err_code = OC_ERR_INTERNAL; return r; }
+    r->type = OC_RES_TODO;
+    r->user_id = j->user_id;
+    append_todo(db, r, j->message_id);
+    load_members(db, j->channel_id, r);
     return r;
 }
 
@@ -7488,9 +8511,13 @@ static oc_dbres *process_list_thread(sqlite3 *db, const oc_job *j) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "SELECT id, author_id, created_at_ms, body FROM messages "
-        "WHERE parent_id=? ORDER BY id LIMIT ?;", -1, &st, NULL);
+        "WHERE parent_id=?1 "
+        /* Not a reply a block withheld from this reader, as backfill leaves it out. */
+        "  AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?3 AND wm.message_id=messages.id) "
+        "ORDER BY id LIMIT ?2;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->parent_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)OC_BACKFILL_MAX);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
     size_t cap = 8, n = 0;
     oc_replay_msg *arr = malloc(cap * sizeof *arr);
     while (arr && sqlite3_step(st) == SQLITE_ROW) {
@@ -7514,6 +8541,7 @@ static oc_dbres *process_list_thread(sqlite3 *db, const oc_job *j) {
     r->truncated = (n >= OC_BACKFILL_MAX);
     for (size_t i = 0; i < n; i++) append_action(db, r, arr[i].message_id, j->channel_id, 0);   /* REQ-058 */
     for (size_t i = 0; i < n; i++) append_poll(db, r, arr[i].message_id, j->channel_id, j->user_id);   /* REQ-225 */
+    for (size_t i = 0; i < n; i++) append_todo(db, r, arr[i].message_id);
     return r;
 }
 
@@ -7613,7 +8641,9 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
         /* A call event (REQ-304) is history, not something anyone said. */
         "  AND m.kind = 0 AND c.e2e = 0 "
         "  AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members cm "
-        "       WHERE cm.channel_id=m.channel_id AND cm.user_id=?2)) ",
+        "       WHERE cm.channel_id=m.channel_id AND cm.user_id=?2)) "
+        /* Not what a block withheld from the searcher: search is no way round it. */
+        "  AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?2 AND wm.message_id=m.id) ",
         /* A snippet is a window on the body that could open or close inside
          * a spoiler (MARKDOWN.md §1d): a body with one is excerpted whole,
          * through the helper, instead. */
@@ -7724,9 +8754,54 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
         n++;
     }
     sqlite3_finalize(st);
+    /* Snippets (REQ-226): a title or the first OC_SNIPPET_INDEX_MAX bytes of
+     * one find the message carrying it, read under the same gate. They join
+     * the first page of a plain text search, newest first, after the message
+     * hits and without repeating one; a filtered or later page is the
+     * messages' alone, since those filters and cursors are the messages'. */
+    if (arr && have_text && !have_filter && !j->message_id && n < lim &&
+        sqlite3_prepare_v2(db,
+            "SELECT m.id, m.channel_id, m.author_id, m.created_at_ms, md.title "
+            "  FROM snippets_fts s JOIN attachments a ON a.id = s.rowid "
+            "  JOIN attachment_media md ON md.attachment_id = a.id "
+            "  JOIN messages m ON m.id = a.message_id "
+            "  JOIN channels c ON c.id = m.channel_id "
+            " WHERE snippets_fts MATCH ?1 AND m.deleted_at_ms IS NULL AND a.reclaimed_at_ms = 0 "
+            "   AND c.e2e = 0 "
+            "   AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members cm "
+            "        WHERE cm.channel_id=m.channel_id AND cm.user_id=?2)) "
+            "   AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?2 AND wm.message_id=m.id) "
+            " ORDER BY m.id DESC LIMIT ?3;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, fts, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)lim);
+        while (n < lim && sqlite3_step(st) == SQLITE_ROW) {
+            uint64_t id = (uint64_t)sqlite3_column_int64(st, 0);
+            int dup = 0;
+            for (size_t q = 0; q < n && !dup; q++) dup = arr[q].message_id == id;
+            if (dup) continue;
+            if (n == cap) { cap *= 2; oc_replay_msg *g = realloc(arr, cap * sizeof *arr); if (!g) break; arr = g; }
+            oc_replay_msg *m = &arr[n];
+            memset(m, 0, sizeof *m);
+            m->message_id  = id;
+            m->channel_id  = (uint64_t)sqlite3_column_int64(st, 1);
+            m->author_id   = (uint64_t)sqlite3_column_int64(st, 2);
+            m->server_time = (uint64_t)sqlite3_column_int64(st, 3);
+            const char *tt = (const char *)sqlite3_column_text(st, 4);
+            char line[OC_SNIPPET_TITLE_MAX + 16];
+            int ll = snprintf(line, sizeof line, "Snippet: %s", tt ? tt : "");
+            if (ll > 0) {
+                m->body = malloc((size_t)ll);
+                if (m->body) { memcpy(m->body, line, (size_t)ll); m->body_len = (size_t)ll; }
+            }
+            n++;
+        }
+        sqlite3_finalize(st);
+    }
     r->search = arr;
     r->n_search = n;
     r->truncated = (n >= lim);   /* filled the requested limit -> maybe more */
+    for (size_t i = 0; i < n; i++) append_todo(db, r, arr[i].message_id);   /* each list as it stands */
     return r;
 }
 
@@ -8003,7 +9078,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             sqlite3_stmt *cst = NULL;
             if (sqlite3_prepare_v2(db,
                     "SELECT COALESCE(MIN(id),0) FROM "
-                    "  (SELECT id FROM messages WHERE channel_id=? AND parent_id IS NULL "
+                    "  (SELECT id FROM messages WHERE channel_id=? AND (parent_id IS NULL OR also_channel=1) "
                     "   ORDER BY id DESC LIMIT ?);", -1, &cst, NULL) == SQLITE_OK) {
                 sqlite3_bind_int64(cst, 1, (sqlite3_int64)ch);
                 sqlite3_bind_int64(cst, 2, (sqlite3_int64)OC_BACKFILL_TAIL);
@@ -8034,7 +9109,9 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
              * the REQUESTING user because a saved item is private (REQ-231). */
             "  COALESCE(s.created_at_ms,0), m.kind, "
             /* And whether this user folded it away, for the same reason. */
-            "  EXISTS(SELECT 1 FROM collapsed_messages cm WHERE cm.message_id = m.id AND cm.user_id = ?4) "
+            "  EXISTS(SELECT 1 FROM collapsed_messages cm WHERE cm.message_id = m.id AND cm.user_id = ?4), "
+            /* A reply also posted to the channel is here with its thread (REQ-062). */
+            "  COALESCE(m.parent_id,0) "
             "FROM messages m LEFT JOIN users u ON u.id = m.author_id "
             "                LEFT JOIN pins  p ON p.message_id = m.id "
             "                LEFT JOIN saved_items s ON s.message_id = m.id AND s.user_id = ?4 "
@@ -8043,7 +9120,9 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
              * to 5, 6 and 7 — the binds still succeeded, the query saw NULLs, and
              * backfill returned nothing. 36 tests caught it; reading would not
              * have. */
-            "WHERE m.channel_id=?1 AND m.id>?2 AND m.parent_id IS NULL "
+            "WHERE m.channel_id=?1 AND m.id>?2 AND (m.parent_id IS NULL OR m.also_channel=1) "
+            /* Not what was withheld from this reader by a block, ever. */
+            "  AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?4 AND wm.message_id=m.id) "
             "ORDER BY m.id LIMIT ?3;", -1, &st, NULL);
         sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)ch);
@@ -8079,6 +9158,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             m->kind      = (uint8_t)sqlite3_column_int(st, 10);
             m->broadcast_stored = broadcast_stored(db, m->message_id);
             m->collapsed = (uint8_t)sqlite3_column_int(st, 11);
+            m->parent_id = (uint64_t)sqlite3_column_int64(st, 12);
             /* Re-attach the message's linked attachments so a reconnecting client
              * sees them inline, not just live members (REQ-140). */
             load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
@@ -8099,6 +9179,8 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
     fill_replay_forwards(db, r);
     fill_replay_actions(db, r);
     fill_replay_polls(db, r, j->user_id);   /* REQ-225 */
+    fill_replay_reminders(db, r, j->user_id);   /* REQ-283 */
+    fill_replay_todos(db, r);
     return r;
 }
 
@@ -8109,13 +9191,72 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
  *
  * `truncated` here means "there is more above this page", which is what lets a
  * client stop asking at the top of the channel instead of retrying forever. */
+/* Jump to a date: the first message at or after `find_at_ms` in a conversation's
+ * main scroll, or in one thread of it; the last before it when none is later
+ * (found_exact 0); none at all, message_id 0. Read under the gate history uses,
+ * so it finds nothing a reader could not scroll to. */
+static oc_dbres *process_find_at_time(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint8_t pub = 0;
+    if (!channel_exists(db, j->channel_id, &pub)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r;
+    }
+    if (!channel_read_access(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    r->type = OC_RES_FOUND_AT_TIME;
+    r->channel_id = j->channel_id;
+    r->parent_id = j->parent_id;
+    /* A thread is its root and its replies: the root is where it begins. */
+    static const char *const q[2][2] = {
+        { "SELECT id, created_at_ms FROM messages WHERE channel_id=?1 AND parent_id IS NULL "
+          "AND created_at_ms>=?2 ORDER BY created_at_ms, id LIMIT 1;",
+          "SELECT id, created_at_ms FROM messages WHERE channel_id=?1 AND parent_id IS NULL "
+          "AND created_at_ms<?2 ORDER BY created_at_ms DESC, id DESC LIMIT 1;" },
+        { "SELECT id, created_at_ms FROM messages WHERE channel_id=?1 AND (id=?3 OR parent_id=?3) "
+          "AND created_at_ms>=?2 ORDER BY created_at_ms, id LIMIT 1;",
+          "SELECT id, created_at_ms FROM messages WHERE channel_id=?1 AND (id=?3 OR parent_id=?3) "
+          "AND created_at_ms<?2 ORDER BY created_at_ms DESC, id DESC LIMIT 1;" },
+    };
+    int th = j->parent_id != 0;
+    for (int k = 0; k < 2 && !r->message_id; k++) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, q[th][k], -1, &st, NULL) != SQLITE_OK) break;
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->find_at_ms);
+        if (th) sqlite3_bind_int64(st, 3, (sqlite3_int64)j->parent_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            r->message_id  = (uint64_t)sqlite3_column_int64(st, 0);
+            r->server_time = (uint64_t)sqlite3_column_int64(st, 1);
+            r->found_exact = (uint8_t)(k == 0);
+        }
+        sqlite3_finalize(st);
+    }
+    return r;
+}
+
 static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     r->type = OC_RES_BACKFILL_OK;
     r->channel_id = j->channel_id;
-    if (!channel_read_access(db, j->channel_id, j->user_id)) return r;
+    /* A link names the channel a message was in when it was copied; a moved
+     * message (REQ-053) is read where it is now, for a reader who may. */
+    uint64_t chan = j->channel_id;
+    if (j->hist_around && j->message_id) {
+        sqlite3_stmt *ls = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT channel_id FROM messages WHERE id=?1;", -1, &ls, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(ls, 1, (sqlite3_int64)j->message_id);
+            if (sqlite3_step(ls) == SQLITE_ROW) chan = (uint64_t)sqlite3_column_int64(ls, 0);
+            sqlite3_finalize(ls);
+        }
+        if (chan != j->channel_id && channel_read_access(db, chan, j->user_id)) r->channel_id = chan;
+        else chan = j->channel_id;
+    }
+    if (!channel_read_access(db, chan, j->user_id)) return r;
 
     uint16_t lim = j->search_limit;
     if (lim == 0 || lim > OC_BACKFILL_TAIL) lim = OC_BACKFILL_TAIL;
@@ -8151,31 +9292,35 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     "         COALESCE(p.created_at_ms,0) AS pinned_at," \
     "         COALESCE(s.created_at_ms,0) AS saved_at," \
     "         m.kind AS kind," \
-    "         EXISTS(SELECT 1 FROM collapsed_messages cm WHERE cm.message_id = m.id AND cm.user_id = ?4) AS collapsed" \
+    "         EXISTS(SELECT 1 FROM collapsed_messages cm WHERE cm.message_id = m.id AND cm.user_id = ?4) AS collapsed," \
+    "         COALESCE(m.parent_id,0) AS parent_id" \
     "    FROM messages m LEFT JOIN users u ON u.id = m.author_id" \
     "                    LEFT JOIN pins p ON p.message_id = m.id" \
     "                    LEFT JOIN saved_items s ON s.message_id = m.id AND s.user_id = ?4"
+    /* What a block withheld from this reader stays out of every page of it. */
+#define OC_HIST_NOT_WITHHELD \
+    " AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id = ?4 AND wm.message_id = m.id)"
 
     const char *sql = j->hist_around
         ? "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name,"
-          "       pinned_by, pinned_at, saved_at, kind, collapsed FROM ("
+          "       pinned_by, pinned_at, saved_at, kind, collapsed, parent_id FROM ("
           "  SELECT * FROM (" OC_HIST_COLS
-          "   WHERE m.channel_id=?1 AND m.parent_id IS NULL AND m.id<=?2"
+          "   WHERE m.channel_id=?1 AND (m.parent_id IS NULL OR m.also_channel=1) AND m.id<=?2" OC_HIST_NOT_WITHHELD
           "   ORDER BY m.id DESC LIMIT ?3)"
           "  UNION ALL"
           "  SELECT * FROM (" OC_HIST_COLS
-          "   WHERE m.channel_id=?1 AND m.parent_id IS NULL AND m.id>?2"
+          "   WHERE m.channel_id=?1 AND (m.parent_id IS NULL OR m.also_channel=1) AND m.id>?2" OC_HIST_NOT_WITHHELD
           "   ORDER BY m.id ASC LIMIT ?3)"
           ") ORDER BY id;"
         : "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name,"
-          "       pinned_by, pinned_at, saved_at, kind, collapsed FROM ("
+          "       pinned_by, pinned_at, saved_at, kind, collapsed, parent_id FROM ("
           OC_HIST_COLS
-          "   WHERE m.channel_id=?1 AND m.id<?2 AND m.parent_id IS NULL"
+          "   WHERE m.channel_id=?1 AND m.id<?2 AND (m.parent_id IS NULL OR m.also_channel=1)" OC_HIST_NOT_WITHHELD
           "   ORDER BY m.id DESC LIMIT ?3"
           ") ORDER BY id;";
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK)
         return r;
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)chan);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)before);
     sqlite3_bind_int64(st, 3, (sqlite3_int64)lim);
     /* Numbered explicitly, like the backfill query: an anonymous marker takes
@@ -8195,7 +9340,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
         oc_replay_msg *m = &arr[n];
         memset(m, 0, sizeof *m);
         m->message_id  = (uint64_t)sqlite3_column_int64(st, 0);
-        m->channel_id  = j->channel_id;
+        m->channel_id  = chan;
         m->author_id   = (uint64_t)sqlite3_column_int64(st, 1);
         m->server_time = (uint64_t)sqlite3_column_int64(st, 2);
         const void *b = sqlite3_column_blob(st, 3);
@@ -8215,6 +9360,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
         m->kind      = (uint8_t)sqlite3_column_int(st, 10);
         m->broadcast_stored = broadcast_stored(db, m->message_id);
         m->collapsed = (uint8_t)sqlite3_column_int(st, 11);
+        m->parent_id = (uint64_t)sqlite3_column_int64(st, 12);
         load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
         n++;
     }
@@ -8227,8 +9373,8 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
         sqlite3_stmt *mt = NULL;
         if (sqlite3_prepare_v2(db,
                 "SELECT EXISTS(SELECT 1 FROM messages WHERE channel_id=?1 AND id<?2 "
-                "AND parent_id IS NULL);", -1, &mt, NULL) == SQLITE_OK) {
-            sqlite3_bind_int64(mt, 1, (sqlite3_int64)j->channel_id);
+                "AND (parent_id IS NULL OR also_channel=1));", -1, &mt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(mt, 1, (sqlite3_int64)chan);
             sqlite3_bind_int64(mt, 2, (sqlite3_int64)arr[0].message_id);
             if (sqlite3_step(mt) == SQLITE_ROW)
                 r->truncated = (uint8_t)sqlite3_column_int(mt, 0);
@@ -8244,6 +9390,8 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     fill_replay_forwards(db, r);
     fill_replay_actions(db, r);
     fill_replay_polls(db, r, j->user_id);   /* REQ-225 */
+    fill_replay_reminders(db, r, j->user_id);   /* REQ-283 */
+    fill_replay_todos(db, r);
     return r;
 }
 
@@ -8277,6 +9425,7 @@ static oc_dbres *process_typing(sqlite3 *db, const oc_job *j) {
     r->type = OC_RES_TYPING;
     r->channel_id = j->channel_id;
     r->author_id = j->user_id;   /* the user who is typing */
+    r->parent_id = j->parent_id; /* ...and in which thread, 0 the main scroll (REQ-121) */
     if (channel_read_access(db, j->channel_id, j->user_id)) {
         load_members(db, j->channel_id, r);
         /* A visitor is told nobody is typing (SCHEMA.md §3bj): the relay lists
@@ -8511,12 +9660,96 @@ static oc_dbres *process_attach_finalize(sqlite3 *db, const oc_job *j) {
  * channel read gate on the attachment's own channel (process_attach_lookup), and
  * the two share a channel by construction, so no exception to that gate is
  * needed. Write. */
+/* Whether `n` bytes at `s` are whole UTF-8 with no NUL: what goes into the
+ * text index has to be text. */
+static int utf8_whole(const char *s, size_t n) {
+    const unsigned char *u = (const unsigned char *)s;
+    size_t i = 0;
+    while (i < n) {
+        unsigned c = u[i];
+        size_t k = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
+        if (c == 0 || k == 0 || i + k > n) return 0;
+        uint32_t cp = k == 1 ? c : k == 2 ? (c & 0x1F) : k == 3 ? (c & 0x0F) : (c & 0x07);
+        for (size_t q = 1; q < k; q++) {
+            if ((u[i + q] & 0xC0) != 0x80) return 0;
+            cp = (cp << 6) | (u[i + q] & 0x3F);
+        }
+        /* Overlong forms, surrogates and past the last code point. */
+        if ((k == 2 && cp < 0x80) || (k == 3 && cp < 0x800) || (k == 4 && cp < 0x10000) ||
+            (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF) return 0;
+        i += k;
+    }
+    return 1;
+}
+
 static oc_dbres *process_attach_media_set(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     r->attachment_id = j->attachment_id;
     r->type = OC_RES_MEDIA_ERR;
+
+    if (j->media_kind == OC_MEDIA_SNIPPET) {
+        /* A snippet (REQ-226): the caller's finished, unlinked text/plain
+         * upload, at most OC_SNIPPET_MAX_SIZE, with a title. Its title and the
+         * first bytes of its text go into snippets_fts, so a search finds the
+         * message carrying it; the row goes when the attachment does. */
+        if (!j->snip_title || !j->snip_title[0] || !j->snip_lang || !j->snip_text ||
+            !utf8_whole(j->snip_title, strlen(j->snip_title)) ||
+            !utf8_whole(j->snip_text, j->snip_text_len)) {
+            r->err_code = OC_ERR_MEDIA_INVALID; return r;
+        }
+        for (const char *q = j->snip_lang; *q; q++)
+            if (!((*q >= 'a' && *q <= 'z') || (*q >= '0' && *q <= '9') || *q == '+' || *q == '#' || *q == '-')) {
+                r->err_code = OC_ERR_MEDIA_INVALID; return r;
+            }
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db,
+            "SELECT uploader_id, message_id, sha256 IS NOT NULL, reclaimed_at_ms, mime, size "
+            "  FROM attachments WHERE id=?;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+        int found = sqlite3_step(st) == SQLITE_ROW;
+        uint64_t up = found ? (uint64_t)sqlite3_column_int64(st, 0) : 0;
+        int linked  = found && sqlite3_column_type(st, 1) != SQLITE_NULL;
+        int final   = found && sqlite3_column_int(st, 2);
+        int gone    = found && sqlite3_column_int64(st, 3) != 0;
+        const unsigned char *mm = found ? sqlite3_column_text(st, 4) : NULL;
+        int plain   = mm && strcmp((const char *)mm, "text/plain") == 0;
+        uint64_t sz = found ? (uint64_t)sqlite3_column_int64(st, 5) : 0;
+        sqlite3_finalize(st);
+        if (!found || up != j->user_id || !final || gone) { r->err_code = OC_ERR_UNKNOWN_ATTACHMENT; return r; }
+        if (linked || !plain) { r->err_code = OC_ERR_MEDIA_INVALID; return r; }
+        if (sz > OC_SNIPPET_MAX_SIZE) { r->err_code = OC_ERR_MEDIA_TOO_LARGE; return r; }
+        sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+        int ok = 1;
+        sqlite3_prepare_v2(db,
+            "INSERT INTO attachment_media(attachment_id, kind, duration_ms, width, height, poster_id, "
+            "  created_at_ms, title, language) VALUES(?1, ?2, 0, 0, 0, NULL, ?3, ?4, ?5) "
+            "ON CONFLICT(attachment_id) DO UPDATE SET kind=?2, title=?4, language=?5;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+        sqlite3_bind_int  (st, 2, (int)OC_MEDIA_SNIPPET);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        sqlite3_bind_text (st, 4, j->snip_title, -1, SQLITE_STATIC);
+        sqlite3_bind_text (st, 5, j->snip_lang, -1, SQLITE_STATIC);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+        if (ok) {
+            sqlite3_prepare_v2(db, "DELETE FROM snippets_fts WHERE rowid=?1;", -1, &st, NULL);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+            sqlite3_step(st); sqlite3_finalize(st);
+            sqlite3_prepare_v2(db, "INSERT INTO snippets_fts(rowid, title, body) VALUES(?1, ?2, ?3);",
+                               -1, &st, NULL);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+            sqlite3_bind_text (st, 2, j->snip_title, -1, SQLITE_STATIC);
+            sqlite3_bind_text (st, 3, j->snip_text, (int)j->snip_text_len, SQLITE_STATIC);
+            ok = sqlite3_step(st) == SQLITE_DONE;
+            sqlite3_finalize(st);
+        }
+        sqlite3_exec(db, ok ? "COMMIT;" : "ROLLBACK;", NULL, NULL, NULL);
+        if (!ok) { r->err_code = OC_ERR_INTERNAL; return r; }
+        r->type = OC_RES_MEDIA_OK;
+        return r;
+    }
 
     if (j->media_kind != OC_MEDIA_VIDEO_MESSAGE ||
         j->media_duration_ms == 0 || j->media_duration_ms > OC_MEDIA_MAX_DURATION_MS ||
@@ -8862,7 +10095,7 @@ static void build_notify_prefs(sqlite3 *db, uint64_t user_id, oc_dbres *r) {
     sqlite3_finalize(st);
 
     sqlite3_prepare_v2(db,
-        "SELECT channel_id, level, muted FROM notification_prefs WHERE user_id=? "
+        "SELECT channel_id, level, muted, follow_threads FROM notification_prefs WHERE user_id=? "
         "ORDER BY channel_id LIMIT ?;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
@@ -8874,6 +10107,7 @@ static void build_notify_prefs(sqlite3 *db, uint64_t user_id, oc_dbres *r) {
         r->nprefs[r->n_nprefs].channel_id = (uint64_t)sqlite3_column_int64(st, 0);
         r->nprefs[r->n_nprefs].level = (uint8_t)sqlite3_column_int(st, 1);
         r->nprefs[r->n_nprefs].muted = (uint8_t)sqlite3_column_int(st, 2);
+        r->nprefs[r->n_nprefs].follow_threads = (uint8_t)sqlite3_column_int(st, 3);
         r->n_nprefs++;
     }
     sqlite3_finalize(st);
@@ -8958,6 +10192,34 @@ static oc_dbres *process_set_mute(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Follow every thread in a conversation, or stop (REQ-282). The same upsert
+ * discipline as mute's: one column touched, the level and mute left as they
+ * were. Answers with the whole snapshot, which the net thread sends to each of
+ * the user's connections. */
+static oc_dbres *process_set_channel_thread_follow(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    if (!channel_read_access(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; r->user_id = j->user_id; return r;
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO notification_prefs(user_id, channel_id, level, follow_threads) "
+        "VALUES(?1, ?2, (SELECT notify_default FROM users WHERE id=?1), ?3) "
+        "ON CONFLICT(user_id, channel_id) DO UPDATE SET follow_threads=excluded.follow_threads;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int  (st, 3, j->follow_on ? 1 : 0);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_INTERNAL;
+                             r->user_id = j->user_id; return r; }
+    build_notify_prefs(db, j->user_id, r);
+    return r;
+}
+
 /* Mark unread (REQ-235): set the read cursor DELIBERATELY, including
  * backwards, which the ack path must never do.
  *
@@ -9006,6 +10268,51 @@ static oc_dbres *process_set_read_cursor(sqlite3 *db, const oc_job *j) {
  * has to stop being true whether or not you are online.
  */
 
+/* The workspace's own profile fields, in position order, onto `r`: the
+ * PROFILE_FIELDS a change answers, or the sign-in that tells them. */
+static void load_profile_fields(sqlite3 *db, oc_dbres *r) {
+    r->pfd = calloc(OC_MAX_PROFILE_FIELDS, sizeof *r->pfd);
+    if (!r->pfd) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT id, kind='link', position, label FROM profile_fields "
+                               "ORDER BY position, id LIMIT ?1;", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int(st, 1, (int)OC_MAX_PROFILE_FIELDS);
+    while (r->n_pfd < OC_MAX_PROFILE_FIELDS && sqlite3_step(st) == SQLITE_ROW) {
+        struct oc_pfd_row *f = &r->pfd[r->n_pfd++];
+        f->id       = (uint64_t)sqlite3_column_int64(st, 0);
+        f->kind     = sqlite3_column_int(st, 1) ? OC_PROFILE_FIELD_LINK : OC_PROFILE_FIELD_TEXT;
+        f->position = (uint16_t)sqlite3_column_int(st, 2);
+        const unsigned char *l = sqlite3_column_text(st, 3);
+        snprintf(f->label, sizeof f->label, "%s", l ? (const char *)l : "");
+    }
+    sqlite3_finalize(st);
+}
+
+static void fill_profile_fields(sqlite3 *db, oc_dbres *r) {
+    r->type = OC_RES_PROFILE_FIELDS;
+    load_profile_fields(db, r);
+}
+
+/* `uid`'s values for the workspace's profile fields, in the fields' order. */
+static void load_profile_values(sqlite3 *db, uint64_t uid, oc_dbres *r) {
+    r->pfv = calloc(OC_MAX_PROFILE_FIELDS, sizeof *r->pfv);
+    if (!r->pfv) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT v.field_id, v.value FROM profile_field_values v "
+            "  JOIN profile_fields f ON f.id = v.field_id "
+            " WHERE v.user_id = ?1 ORDER BY f.position, f.id LIMIT ?2;", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    sqlite3_bind_int(st, 2, (int)OC_MAX_PROFILE_FIELDS);
+    while (r->n_pfv < OC_MAX_PROFILE_FIELDS && sqlite3_step(st) == SQLITE_ROW) {
+        struct oc_pfv_row *v = &r->pfv[r->n_pfv++];
+        v->field_id = (uint64_t)sqlite3_column_int64(st, 0);
+        const unsigned char *t = sqlite3_column_text(st, 1);
+        snprintf(v->value, sizeof v->value, "%s", t ? (const char *)t : "");
+    }
+    sqlite3_finalize(st);
+}
+
 /* Fill a PROFILE_INFO result for `uid`. Expired status reads as absent: the row is
  * left alone (a lazy sweep beats a timer thread) and every reader applies the same
  * rule, so nobody sees a stale status even before it is cleaned up. */
@@ -9018,7 +10325,7 @@ static void build_profile(sqlite3 *db, uint64_t uid, oc_dbres *r) {
         "       COALESCE(status_text,''), status_expires_ms, COALESCE(title,''), "
         "       COALESCE(timezone,''), COALESCE(avatar_attachment_id,0), role, "
         "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(phone,''), "
-        "       COALESCE(voice_id,'') "
+        "       COALESCE(voice_id,''), ooo_start_ms, ooo_end_ms, ooo_message "
         "  FROM users WHERE id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
     if (sqlite3_step(st) == SQLITE_ROW) {
@@ -9054,8 +10361,13 @@ static void build_profile(sqlite3 *db, uint64_t uid, oc_dbres *r) {
         r->pf_phone     = strdup(ph ? (const char *)ph : "");
         const unsigned char *vc = sqlite3_column_text(st, 12);
         r->pf_voice_id  = strdup(vc ? (const char *)vc : "");
+        r->pf_ooo_start = (uint64_t)sqlite3_column_int64(st, 13);
+        r->pf_ooo_end   = (uint64_t)sqlite3_column_int64(st, 14);
+        const unsigned char *om = sqlite3_column_text(st, 15);
+        r->pf_ooo_message = strdup(om ? (const char *)om : "");
     }
     sqlite3_finalize(st);
+    load_profile_values(db, uid, r);
 }
 
 static oc_dbres *process_set_status(sqlite3 *db, const oc_job *j) {
@@ -9182,32 +10494,42 @@ static oc_dbres *process_set_avatar(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-/* Every excerpt the daemon sends -- a channel's preview, a thread's, an
- * activity row's, a search hit's -- is made by oc_rt_plain_excerpt, so what a
- * spoiler hides is never in one (MARKDOWN.md §1d). They are built in SQL, so
- * the helper is a function there: oc_excerpt(text, bytes), and
- * oc_has_spoiler(text) for where FTS's snippet() would otherwise cut a window. */
-static void sql_excerpt(sqlite3_context *cx, int argc, sqlite3_value **argv) {
-    (void)argc;
-    const char *t = (const char *)sqlite3_value_text(argv[0]);
-    int n = sqlite3_value_bytes(argv[0]);
-    sqlite3_int64 cap = sqlite3_value_int64(argv[1]);
-    if (!t) { sqlite3_result_null(cx); return; }
-    if (cap <= 0 || cap > 65536) cap = 65536;
-    char *out = malloc((size_t)cap + 1);
-    if (!out) { sqlite3_result_error_nomem(cx); return; }
-    size_t w = oc_rt_plain_excerpt(t, (size_t)n, out, (size_t)cap + 1);
-    sqlite3_result_text(cx, out, (int)w, free);
-}
-static void sql_has_spoiler(sqlite3_context *cx, int argc, sqlite3_value **argv) {
-    (void)argc;
-    const char *t = (const char *)sqlite3_value_text(argv[0]);
-    int n = sqlite3_value_bytes(argv[0]);
-    sqlite3_result_int(cx, t && oc_rt_spoilers(t, (size_t)n, NULL, 0) > 0);
-}
+/* The SQL functions every connection needs: oc_excerpt and oc_has_spoiler,
+ * which the excerpts are built with, and oc_unspoiled, which the search
+ * index's triggers call. One set, in migrate.c, so a test's own connection
+ * registers exactly what the daemon's do. */
 static void sql_functions(sqlite3 *db) {
-    sqlite3_create_function(db, "oc_excerpt", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_excerpt, NULL, NULL);
-    sqlite3_create_function(db, "oc_has_spoiler", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_has_spoiler, NULL, NULL);
+    oc_migrate_functions(db);
+}
+
+/* Out of office (REQ-122). Stored as given; an end of 0 or already past clears
+ * all three. The answer is the person's whole profile to their connections,
+ * and their roster row to everyone, whose marks and composer notices follow. */
+static oc_dbres *process_set_out_of_office(sqlite3 *db, const oc_job *j) {
+    const char *msg = j->pf_name ? j->pf_name : "";
+    size_t n = strlen(msg);
+    uint64_t now = dbw_now_ms();
+    int clear = j->ooo_end == 0 || j->ooo_end <= now;
+    if (!clear && (j->ooo_end <= j->ooo_start || n > OC_OOO_MESSAGE_MAX))
+        return profile_err(j, OC_ERR_INVALID_OUT_OF_OFFICE);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE users SET ooo_start_ms=?1, ooo_end_ms=?2, ooo_message=?3 WHERE id=?4;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, clear ? 0 : (sqlite3_int64)j->ooo_start);
+        sqlite3_bind_int64(st, 2, clear ? 0 : (sqlite3_int64)j->ooo_end);
+        sqlite3_bind_text (st, 3, clear ? "" : msg, clear ? 0 : (int)n, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    build_profile(db, j->user_id, r);
+    r->pf_fanout = 1;
+    user_rows(db, j->user_id, r);
+    r->joined = r->n_ulist != 0;   /* the row, to everyone signed in */
+    return r;
 }
 
 static oc_dbres *process_get_profile(sqlite3 *db, const oc_job *j) {
@@ -9220,6 +10542,118 @@ static oc_dbres *process_get_profile(sqlite3 *db, const oc_job *j) {
     uint64_t whose = j->message_id ? j->message_id : j->user_id;
     build_profile(db, whose, r);
     if (whose != j->user_id) { free(r->pf_phone); r->pf_phone = NULL; }
+    return r;
+}
+
+/* ---- the workspace's own profile fields (SCHEMA.md §3bs) ---------------------
+ *
+ * Defined by an owner or admin, at most OC_MAX_PROFILE_FIELDS, each text or a
+ * link; each person fills their own. A value is never more than 200 bytes, and a
+ * link's starts https:// so a card never offers a script or a local file. */
+
+static int pf_text_ok(const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) if ((unsigned char)s[i] < 0x20 || s[i] == 0x7f) return 0;
+    return 1;
+}
+
+static oc_dbres *process_set_profile_field(sqlite3 *db, const oc_job *j) {
+    uint8_t role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &role) || !oc_role_can_manage_members(role))
+        return profile_err(j, OC_ERR_FORBIDDEN);
+    uint64_t id = j->message_id;
+    const char *label = j->pf_name ? j->pf_name : "";
+    size_t n = strlen(label);
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (j->pfd_op == OC_PROFILE_FIELD_DELETE) {
+        if (!id) return profile_err(j, OC_ERR_INVALID_PROFILE_FIELD);
+        sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+        if (sqlite3_prepare_v2(db, "DELETE FROM profile_field_values WHERE field_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st); st = NULL;
+        if (sqlite3_prepare_v2(db, "DELETE FROM profile_fields WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+            ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+        }
+        sqlite3_finalize(st);
+        sqlite3_exec(db, ok ? "COMMIT;" : "ROLLBACK;", NULL, NULL, NULL);
+        if (!ok) return profile_err(j, OC_ERR_INVALID_PROFILE_FIELD);
+        audit_actor(db, OC_AUDIT_ADMIN, "profile_field.delete", j->user_id, 0, NULL, 1, NULL);
+    } else {
+        if (j->pfd_op != OC_PROFILE_FIELD_SET || n == 0 || n > OC_PROFILE_FIELD_LABEL_MAX ||
+            !pf_text_ok(label, n) || j->pfd_kind > OC_PROFILE_FIELD_LINK)
+            return profile_err(j, OC_ERR_INVALID_PROFILE_FIELD);
+        if (id == 0) {
+            /* A new one, within the cap, last unless a place is asked for. */
+            if (sqlite3_prepare_v2(db,
+                    "INSERT INTO profile_fields(label, kind, position, created_at_ms) "
+                    "SELECT ?1, ?2, CASE WHEN ?3 > 0 THEN ?3 "
+                    "                    ELSE (SELECT COALESCE(MAX(position), 0) + 1 FROM profile_fields) END, ?4 "
+                    " WHERE (SELECT COUNT(*) FROM profile_fields) < ?5;", -1, &st, NULL) == SQLITE_OK) {
+                sqlite3_bind_text (st, 1, label, (int)n, SQLITE_TRANSIENT);
+                sqlite3_bind_text (st, 2, j->pfd_kind == OC_PROFILE_FIELD_LINK ? "link" : "text", -1, SQLITE_STATIC);
+                sqlite3_bind_int  (st, 3, (int)j->pfd_position);
+                sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+                sqlite3_bind_int  (st, 5, (int)OC_MAX_PROFILE_FIELDS);
+                ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+            }
+        } else {
+            /* A rename, and a move when a place is given. The kind stays what it
+             * was made: values already given were checked against it. */
+            if (sqlite3_prepare_v2(db,
+                    "UPDATE profile_fields SET label=?1, "
+                    "       position=CASE WHEN ?2 > 0 THEN ?2 ELSE position END WHERE id=?3;",
+                    -1, &st, NULL) == SQLITE_OK) {
+                sqlite3_bind_text (st, 1, label, (int)n, SQLITE_TRANSIENT);
+                sqlite3_bind_int  (st, 2, (int)j->pfd_position);
+                sqlite3_bind_int64(st, 3, (sqlite3_int64)id);
+                ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+            }
+        }
+        sqlite3_finalize(st);
+        if (!ok) return profile_err(j, OC_ERR_INVALID_PROFILE_FIELD);
+        audit_actor(db, OC_AUDIT_ADMIN, "profile_field.set", j->user_id, 0, NULL, 1, NULL);
+    }
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+    fill_profile_fields(db, r);
+    r->ch_fanout = 1;   /* every client's cards and editors change with it */
+    return r;
+}
+
+static oc_dbres *process_set_profile_field_value(sqlite3 *db, const oc_job *j) {
+    const char *v = j->pf_name ? j->pf_name : "";
+    size_t n = strlen(v);
+    sqlite3_stmt *st = NULL;
+    int kind = -1;
+    if (sqlite3_prepare_v2(db, "SELECT kind='link' FROM profile_fields WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        if (sqlite3_step(st) == SQLITE_ROW) kind = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st); st = NULL;
+    if (kind < 0 || n > OC_PROFILE_FIELD_VALUE_MAX || !pf_text_ok(v, n) ||
+        (kind == 1 && n && (strncmp(v, "https://", 8) != 0 || n == 8 || strpbrk(v, " <>\"'`"))))
+        return profile_err(j, OC_ERR_INVALID_PROFILE_FIELD);
+    if (n == 0)
+        sqlite3_prepare_v2(db, "DELETE FROM profile_field_values WHERE user_id=?1 AND field_id=?2;", -1, &st, NULL);
+    else
+        sqlite3_prepare_v2(db,
+            "INSERT INTO profile_field_values(user_id, field_id, value) VALUES(?1, ?2, ?3) "
+            "ON CONFLICT(user_id, field_id) DO UPDATE SET value=excluded.value;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
+    if (n) sqlite3_bind_text(st, 3, v, (int)n, SQLITE_TRANSIENT);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    build_profile(db, j->user_id, r);
+    r->pf_fanout = 1;   /* every device of theirs, as SET_PROFILE */
     return r;
 }
 
@@ -9335,9 +10769,14 @@ static oc_dbres *process_list_threads(sqlite3 *db, const oc_job *j) {
         "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL) AS last_at, "
         "       (SELECT COUNT(*) FROM messages x "
         "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL) AS replies, "
+        /* A muted person's replies are no badge (REQ-284), nor what a block
+         * withheld from me, as in the channel's unread; the same tests in
+         * build_thread_one below. */
         "       (SELECT COUNT(*) FROM messages x "
         "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL "
         "           AND x.author_id <> ?1 "
+        "           AND NOT EXISTS(SELECT 1 FROM muted_users mu WHERE mu.user_id = ?1 AND mu.muted_id = x.author_id) "
+        "           AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id = ?1 AND wm.message_id = x.id) "
         "           AND x.id > COALESCE((SELECT tr.last_read_reply_id FROM thread_reads tr "
         "                                 WHERE tr.user_id = ?1 AND tr.root_id = r.id), 0)) AS unread, "
         "       COALESCE((SELECT tf.state FROM thread_follows tf "
@@ -9385,6 +10824,8 @@ static void build_thread_one(sqlite3 *db, uint64_t uid, uint64_t root_id, oc_dbr
         "       (SELECT COUNT(*) FROM messages x "
         "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL "
         "           AND x.author_id <> ?1 "
+        "           AND NOT EXISTS(SELECT 1 FROM muted_users mu WHERE mu.user_id = ?1 AND mu.muted_id = x.author_id) "
+        "           AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id = ?1 AND wm.message_id = x.id) "
         "           AND x.id > COALESCE((SELECT tr.last_read_reply_id FROM thread_reads tr "
         "                                 WHERE tr.user_id = ?1 AND tr.root_id = r.id), 0)), "
         "       COALESCE((SELECT tf.state FROM thread_follows tf "
@@ -9552,6 +10993,50 @@ static oc_dbres *process_set_schedule(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* The people `uid` has muted, as MUTED_USERS carries them: read with the alert
+ * preferences, so a sign-in tells the client both lists about WHO at once. */
+static void fill_muted_users(sqlite3 *db, uint64_t uid, oc_dbres *r) {
+    sqlite3_stmt *st = NULL;
+    r->mu_ids = calloc(OC_MAX_MUTED_USERS, sizeof *r->mu_ids);
+    if (!r->mu_ids) return;
+    sqlite3_prepare_v2(db, "SELECT muted_id FROM muted_users WHERE user_id=? ORDER BY muted_id;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    while (r->mu_n < OC_MAX_MUTED_USERS && sqlite3_step(st) == SQLITE_ROW)
+        r->mu_ids[r->mu_n++] = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    r->mu_have = 1;
+}
+
+/* Mute or unmute one person, for the asker alone (SET_USER_MUTE). Muting
+ * yourself, the workspace's own sender or nobody is refused by doing nothing;
+ * the muted person is told nothing. Answered with the whole list, to every
+ * connection of the asker. */
+static oc_dbres *process_set_user_mute(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_MUTED_USERS;
+    r->user_id = j->user_id;
+    uint64_t who = j->target_user_id;
+    if (who && who != j->user_id) {
+        sqlite3_stmt *st = NULL;
+        if (j->mute_on)
+            sqlite3_prepare_v2(db,
+                "INSERT OR IGNORE INTO muted_users(user_id, muted_id, created_at_ms) "
+                "SELECT ?1, ?2, ?3 WHERE EXISTS(SELECT 1 FROM users WHERE id=?2 AND is_system=0);",
+                -1, &st, NULL);
+        else
+            sqlite3_prepare_v2(db, "DELETE FROM muted_users WHERE user_id=?1 AND muted_id=?2;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)who);
+        if (j->mute_on) sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    fill_muted_users(db, j->user_id, r);
+    return r;
+}
+
 /* My keywords and my priority people (REQ-135). Read together because they are
  * one idea in the product — "what reaches me regardless of level" — and a client
  * that showed one without the other would be showing half a setting. */
@@ -9573,6 +11058,8 @@ static void fill_alert_prefs(sqlite3 *db, uint64_t uid, oc_dbres *r) {
     while (r->al_people && r->al_n_people < OC_MAX_PRIORITY && sqlite3_step(st) == SQLITE_ROW)
         r->al_people[r->al_n_people++] = (uint64_t)sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
+    fill_muted_users(db, uid, r);
+    fill_blocks(db, uid, r);   /* whom I block, and who may start a DM with me */
 }
 
 static void build_alert_prefs(sqlite3 *db, uint64_t uid, oc_dbres *r) {
@@ -10177,6 +11664,56 @@ static oc_dbres *process_update_scheduled(sqlite3 *db, const oc_job *j) {
  * One at a time because the result IS the send: the netloop raises another job
  * as soon as one fires (see maybe_fire_scheduled), so a backlog drains at queue
  * speed rather than one per tick. */
+/* Reminders come due (REQ-283): every saved item whose time has passed and
+ * that has not fired, still the owner's to read, is marked fired and answered
+ * as one OC_RES_REMINDER_DUE each, for the owner's connections and push. Run on
+ * the scheduled-message tick, so a reminder lands within that tick of its
+ * time. A batch at a time; the rest on the next tick. */
+static oc_dbres *process_fire_reminders(sqlite3 *db, const oc_job *j) {
+    (void)j;
+    uint64_t now = dbw_now_ms();
+    oc_dbres *head = NULL, **tail = &head;
+    sqlite3_stmt *st = NULL;
+    sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+    if (sqlite3_prepare_v2(db,
+            "SELECT s.user_id, s.message_id, m.channel_id, s.created_at_ms, s.remind_at_ms "
+            "  FROM saved_items s JOIN messages m ON m.id = s.message_id "
+            " WHERE s.remind_at_ms IS NOT NULL AND s.reminded_at_ms IS NULL AND s.remind_at_ms <= ?1 "
+            "   AND m.deleted_at_ms IS NULL "
+            "   AND EXISTS(SELECT 1 FROM channel_members cm "
+            "               WHERE cm.channel_id = m.channel_id AND cm.user_id = s.user_id) "
+            " ORDER BY s.remind_at_ms LIMIT 64;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)now);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            oc_dbres *r = calloc(1, sizeof *r);
+            if (!r) break;
+            r->type = OC_RES_REMINDER_DUE;
+            r->user_id    = (uint64_t)sqlite3_column_int64(st, 0);
+            r->message_id = (uint64_t)sqlite3_column_int64(st, 1);
+            r->channel_id = (uint64_t)sqlite3_column_int64(st, 2);
+            r->saved_at   = (uint64_t)sqlite3_column_int64(st, 3);
+            r->remind_at  = (uint64_t)sqlite3_column_int64(st, 4);
+            r->server_time = now;
+            *tail = r; tail = &r->next;
+        }
+        sqlite3_finalize(st);
+    }
+    for (oc_dbres *r = head; r; r = r->next) {
+        if (sqlite3_prepare_v2(db, "UPDATE saved_items SET reminded_at_ms=?3 WHERE user_id=?1 AND message_id=?2;",
+                               -1, &st, NULL) != SQLITE_OK) break;
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)r->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)r->message_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)now);
+        sqlite3_step(st); sqlite3_finalize(st);
+    }
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    if (!head) {                                /* nothing due: a benign no-op */
+        head = calloc(1, sizeof *head);
+        if (head) head->type = OC_RES_REMINDER_DUE;
+    }
+    return head;
+}
+
 static oc_dbres *process_fire_scheduled(sqlite3 *db, const oc_job *j) {
     (void)j;
     uint64_t id = 0, uid = 0, cid = 0, root = 0;
@@ -10750,6 +12287,7 @@ static oc_dbres *process_tts_voice_set(sqlite3 *db, const oc_job *j) {
  * thread, so a heavy search/backfill can't stall message sends or auth. */
 static oc_dbres *process_storage_status(sqlite3 *db, const oc_job *j);
 static oc_dbres *process_audit_query(sqlite3 *db, const oc_job *j);
+static oc_dbres *process_usage(sqlite3 *db, const oc_job *j);
 
 static int is_read_job(int type) {
     return type == OC_JOB_BACKFILL || type == OC_JOB_HISTORY || type == OC_JOB_SEARCH ||
@@ -10767,7 +12305,7 @@ static int is_read_job(int type) {
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
            type == OC_JOB_CALL_AUTH ||
            type == OC_JOB_STORAGE_STATUS || type == OC_JOB_ALERTS_LIST ||
-           type == OC_JOB_AUDIT_QUERY ||
+           type == OC_JOB_AUDIT_QUERY || type == OC_JOB_USAGE || type == OC_JOB_LIST_BLOCKS ||
            type == OC_JOB_TTS_LOOKUP || type == OC_JOB_TTS_PREVIEW ||
            type == OC_JOB_STT_PREP || type == OC_JOB_LIST_GROUPS ||
            type == OC_JOB_SUMMARY_LOOKUP || type == OC_JOB_LIST_POLL_VOTERS;
@@ -10796,6 +12334,8 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_STORAGE_STATUS) return process_storage_status(rdb, j);
     if (j->type == OC_JOB_ALERTS_LIST)    return process_alerts_list(rdb, j);
     if (j->type == OC_JOB_AUDIT_QUERY)    return process_audit_query(rdb, j);
+    if (j->type == OC_JOB_USAGE)          return process_usage(rdb, j);
+    if (j->type == OC_JOB_LIST_BLOCKS)    return process_list_blocks(rdb, j);
     if (j->type == OC_JOB_TTS_LOOKUP)     return process_tts_lookup(rdb, j);
     if (j->type == OC_JOB_TTS_PREVIEW)    return process_tts_preview(rdb, j);
     if (j->type == OC_JOB_STT_PREP)       return process_stt_prep(rdb, j);
@@ -11308,6 +12848,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_OPEN_GROUP_DM) return process_open_group_dm(w->db, j);
     if (j->type == OC_JOB_ADD_EMOJI)      return process_add_emoji(w->db, j);
     if (j->type == OC_JOB_DELETE_EMOJI)   return process_delete_emoji(w->db, j);
+    if (j->type == OC_JOB_RENAME_EMOJI)   return process_rename_emoji(w->db, j);
     if (j->type == OC_JOB_CREATE_GROUP)   return process_create_group(w->db, j);
     if (j->type == OC_JOB_UPDATE_GROUP)   return process_update_group(w->db, j);
     if (j->type == OC_JOB_DELETE_GROUP)   return process_delete_group(w->db, j);
@@ -11317,6 +12858,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_CHANNEL_REMOVE_GROUP) return process_channel_group(w->db, j, 0);
     if (j->type == OC_JOB_INVITE_USER)    return process_invite_user(w, j);
     if (j->type == OC_JOB_FIRE_SCHEDULED)    return process_fire_scheduled(w->db, j);
+    if (j->type == OC_JOB_FIRE_REMINDERS)    return process_fire_reminders(w->db, j);
     if (j->type == OC_JOB_SCHEDULE)          return process_schedule(w->db, j);
     if (j->type == OC_JOB_LIST_SCHEDULED)    return process_list_scheduled(w->db, j);
     if (j->type == OC_JOB_CANCEL_SCHEDULED)  return process_cancel_scheduled(w->db, j);
@@ -11330,8 +12872,14 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_EDIT_POLL)      return process_edit_poll(w->db, j);
     if (j->type == OC_JOB_PIN)            return process_pin(w->db, j);
     if (j->type == OC_JOB_UPDATE_CHANNEL) return process_update_channel(w->db, j);
+    if (j->type == OC_JOB_CHANNEL_ADD_MANAGER)    return process_channel_manager(w->db, j, 1);
+    if (j->type == OC_JOB_CHANNEL_REMOVE_MANAGER) return process_channel_manager(w->db, j, 0);
     if (j->type == OC_JOB_SAVE_ITEM)      return process_save_item(w->db, j);
     if (j->type == OC_JOB_SET_COLLAPSED)  return process_set_collapsed(w->db, j);
+    if (j->type == OC_JOB_FIND_AT_TIME)   return process_find_at_time(w->db, j);
+    if (j->type == OC_JOB_MOVE_MESSAGE)   return process_move_message(w->db, j);
+    if (j->type == OC_JOB_TODO_ADD || j->type == OC_JOB_TODO_MARK || j->type == OC_JOB_TODO_RENAME)
+        return process_todo(w->db, j);
     /* On the WRITER because it stamps the seen watermark; the read half would
      * otherwise be a reader job with a write in it. */
     if (j->type == OC_JOB_LIST_ACTIVITY)  return process_list_activity(w->db, j);
@@ -11360,10 +12908,14 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_CALL_EVENT)      return process_call_event(w->db, j);
     if (j->type == OC_JOB_DELETE_WEBHOOK)  return process_delete_webhook(w->db, j);
     if (j->type == OC_JOB_SET_NOTIFY_PREF) return process_set_notify_pref(w->db, j);
+    if (j->type == OC_JOB_SET_CHANNEL_THREAD_FOLLOW) return process_set_channel_thread_follow(w->db, j);
     if (j->type == OC_JOB_SET_MUTE)        return process_set_mute(w->db, j);
     if (j->type == OC_JOB_SET_NOTIFY_DEFAULT) return process_set_notify_default(w->db, j);
     if (j->type == OC_JOB_SET_STATUS)      return process_set_status(w->db, j);
     if (j->type == OC_JOB_SET_PROFILE)     return process_set_profile(w->db, j);
+    if (j->type == OC_JOB_SET_PROFILE_FIELD)       return process_set_profile_field(w->db, j);
+    if (j->type == OC_JOB_SET_PROFILE_FIELD_VALUE) return process_set_profile_field_value(w->db, j);
+    if (j->type == OC_JOB_SET_OUT_OF_OFFICE) return process_set_out_of_office(w->db, j);
     if (j->type == OC_JOB_SET_EMAIL)       return process_set_email(w->db, j);
     if (j->type == OC_JOB_SET_AVATAR)      return process_set_avatar(w->db, j);
     if (j->type == OC_JOB_DEACTIVATE_SELF) return process_deactivate_self(w->db, j);
@@ -11374,6 +12926,9 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_SCHEDULE)    return process_set_schedule(w->db, j);
     if (j->type == OC_JOB_SET_KEYWORDS)    return process_set_keywords(w->db, j);
     if (j->type == OC_JOB_SET_PRIORITY)    return process_set_priority(w->db, j);
+    if (j->type == OC_JOB_SET_USER_MUTE)   return process_set_user_mute(w->db, j);
+    if (j->type == OC_JOB_SET_BLOCK)       return process_set_block(w->db, j);
+    if (j->type == OC_JOB_SET_DM_PRIVACY)  return process_set_dm_privacy(w->db, j);
     if (j->type == OC_JOB_SET_SNOOZE)      return process_set_snooze(w->db, j);
     if (j->type == OC_JOB_SET_TZ_OFFSET)   return process_set_tz_offset(w->db, j);
     if (j->type == OC_JOB_READ_RECEIPTS)   return process_read_receipts(w->db, j);
@@ -11441,6 +12996,137 @@ static oc_dbres *process_storage_status(sqlite3 *db, const oc_job *j) {
 
 
 
+/* Days since the epoch from a civil date, and back (H. Hinnant's algorithms),
+ * for the ISO weeks of the usage figures. */
+static int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+static int64_t year_of_day(int64_t z) {
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    const unsigned m = mp < 10 ? mp + 3 : mp - 9;
+    return (int64_t)yoe + era * 400 + (m <= 2);
+}
+
+/* The ISO week a day falls in, as yyyyww, and the Monday it starts on: the week
+ * belongs to the year its Thursday is in (ISO 8601). Day 0, 1970-01-01, was a
+ * Thursday. */
+uint32_t oc_usage_iso_week(uint32_t day, uint32_t *monday) {
+    int64_t d = (int64_t)day;
+    int64_t wd = ((d + 3) % 7 + 7) % 7;              /* Monday 0 .. Sunday 6 */
+    int64_t thu = d - wd + 3;
+    int64_t y = year_of_day(thu);
+    int64_t week = (thu - days_from_civil(y, 1, 1)) / 7 + 1;
+    if (monday) *monday = (uint32_t)(d - wd);
+    return (uint32_t)(y * 100 + week);
+}
+
+/* The workspace's usage for an owner or admin (REQ-043): active members per day
+ * and per ISO week, messages posted per day (the workspace's own messages and
+ * the call events the daemon writes not counted), and the ten busiest channels -- all counted, nothing anyone wrote
+ * read. A private channel's name goes only to someone who is in it. Authorized
+ * on the CURRENT role, like the storage report. */
+static oc_dbres *process_usage(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_USAGE;
+    r->conn_id = j->conn_id;
+    uint8_t role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &role) || !oc_role_can_manage_members(role)) {
+        r->type = OC_RES_USAGE_ERR;
+        r->err_code = OC_ERR_FORBIDDEN;
+        return r;
+    }
+    oc_usage_report *u = calloc(1, sizeof *u);
+    if (!u) { r->type = OC_RES_USAGE_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    r->usage = u;
+    uint16_t days = j->usage_days;
+    if (days < 1) days = 1;
+    if (days > OC_USAGE_MAX_DAYS) days = OC_USAGE_MAX_DAYS;
+    const uint32_t today = (uint32_t)(dbw_now_ms() / 86400000ull);
+    const uint32_t first = today - (uint32_t)days + 1;
+    u->days = days;
+    u->n_days = days;
+    for (uint16_t i = 0; i < days; i++) u->day[i].day = first + i;
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT day, COUNT(*) FROM user_active_days WHERE day BETWEEN ?1 AND ?2 GROUP BY day;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, first);
+        sqlite3_bind_int64(st, 2, today);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            int64_t d = sqlite3_column_int64(st, 0);
+            if (d >= first && d <= today) u->day[d - first].active = (uint32_t)sqlite3_column_int64(st, 1);
+        }
+        sqlite3_finalize(st);
+    }
+    st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT m.created_at_ms / 86400000, COUNT(*) FROM messages m JOIN users u ON u.id = m.author_id"
+            " WHERE m.created_at_ms >= ?1 AND m.created_at_ms < ?2 AND u.is_system = 0 AND m.kind = 0"
+            " GROUP BY m.created_at_ms / 86400000;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)first * 86400000);
+        sqlite3_bind_int64(st, 2, ((sqlite3_int64)today + 1) * 86400000);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            int64_t d = sqlite3_column_int64(st, 0);
+            if (d >= first && d <= today) u->day[d - first].messages = (uint32_t)sqlite3_column_int64(st, 1);
+        }
+        sqlite3_finalize(st);
+    }
+    /* Each ISO week the period touches, its members counted once, over the days
+     * of it inside the period. */
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(DISTINCT user_id) FROM user_active_days WHERE day BETWEEN ?1 AND ?2;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        uint32_t d = first;
+        while (d <= today && u->n_weeks < OC_USAGE_MAX_WEEKS) {
+            uint32_t monday = 0, wk = oc_usage_iso_week(d, &monday);
+            uint32_t end = monday + 6 < today ? monday + 6 : today;
+            sqlite3_bind_int64(st, 1, d);
+            sqlite3_bind_int64(st, 2, end);
+            uint32_t n = sqlite3_step(st) == SQLITE_ROW ? (uint32_t)sqlite3_column_int64(st, 0) : 0;
+            sqlite3_reset(st);
+            u->week[u->n_weeks++] = (oc_usage_week){ wk, n };
+            d = end + 1;
+        }
+        sqlite3_finalize(st);
+    }
+    /* The busiest channels: channels only, never a DM, by messages in the period. */
+    st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT c.id, COALESCE(c.name, ''), c.is_public, COUNT(*) AS n,"
+            "  EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.user_id = ?3)"
+            " FROM messages m JOIN channels c ON c.id = m.channel_id JOIN users u ON u.id = m.author_id"
+            " WHERE c.kind = 'channel' AND m.created_at_ms >= ?1 AND m.created_at_ms < ?2 AND u.is_system = 0"
+            "   AND m.kind = 0"
+            " GROUP BY c.id ORDER BY n DESC, c.id LIMIT ?4;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)first * 86400000);
+        sqlite3_bind_int64(st, 2, ((sqlite3_int64)today + 1) * 86400000);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int(st, 4, OC_USAGE_TOP_CHANNELS);
+        while (sqlite3_step(st) == SQLITE_ROW && u->n_channels < OC_USAGE_TOP_CHANNELS) {
+            uint16_t k = u->n_channels++;
+            int is_public = sqlite3_column_int(st, 2), member = sqlite3_column_int(st, 4);
+            u->ch_id[k] = (uint64_t)sqlite3_column_int64(st, 0);
+            u->ch_messages[k] = (uint32_t)sqlite3_column_int64(st, 3);
+            u->ch_private[k] = (uint8_t)!is_public;
+            if (is_public || member)
+                snprintf(u->ch_name[k], sizeof u->ch_name[k], "%s", (const char *)sqlite3_column_text(st, 1));
+        }
+        sqlite3_finalize(st);
+    }
+    return r;
+}
+
 /* Read a page of the audit log, newest first (REQ-251). Paging is by
  * `audit_before_ms` rather than an offset so a page boundary stays stable while
  * new entries arrive. Authorization is on the CURRENT role, like the storage
@@ -11466,7 +13152,7 @@ static oc_dbres *process_audit_query(sqlite3 *db, const oc_job *j) {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
             "SELECT at_ms, family, action, actor_id, actor_name, target_id, target,"
-            " outcome, detail FROM audit_log "
+            " outcome, detail, channel_id FROM audit_log "
             "WHERE (?1 = 0 OR at_ms < ?1) AND (?3 = 0 OR family = ?3) AND (?4 = 0 OR actor_id = ?4)"
             "  AND (?5 = '' OR action = ?5) "
             "ORDER BY at_ms DESC, id DESC LIMIT ?2;",
@@ -11492,6 +13178,7 @@ static oc_dbres *process_audit_query(sqlite3 *db, const oc_job *j) {
         v = (const char *)sqlite3_column_text(st, 6); a->target     = v ? strdup(v) : NULL;
         a->outcome   = (uint8_t)sqlite3_column_int(st, 7);
         v = (const char *)sqlite3_column_text(st, 8); a->detail     = v ? strdup(v) : NULL;
+        a->channel_id = (uint64_t)sqlite3_column_int64(st, 9);   /* NULL reads 0 */
         r->n_audit++;
     }
     sqlite3_finalize(st);
@@ -11545,6 +13232,12 @@ static int reclaim_add(sqlite3 *db, oc_dbres *r, size_t cap,
     int done = (sqlite3_step(st) == SQLITE_DONE) && sqlite3_changes(db) > 0;
     sqlite3_finalize(st);
     if (!done) { free(dup); return 0; }          /* someone else got there first */
+    /* A snippet whose bytes go is no longer anything to find (REQ-226). */
+    if (sqlite3_prepare_v2(db, "DELETE FROM snippets_fts WHERE rowid=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)aid);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
     r->reclaim[r->n_reclaim].storage_key = dup;
     r->reclaim[r->n_reclaim].attachment_id = aid;
     r->n_reclaim++;

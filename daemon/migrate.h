@@ -25,13 +25,23 @@ extern const int OC_MIGRATIONS_COUNT;
 /* Highest applied migration version, or 0 if the database has none. */
 int oc_schema_version(sqlite3 *db);
 
+/* Register the SQL functions the daemon's queries and the schema call, on `db`:
+ * oc_unspoiled(body), the body with what its spoilers hide removed, which the
+ * full-text index's triggers index (SCHEMA.md §3d); oc_excerpt(text, bytes) and
+ * oc_has_spoiler(text), which every excerpt is built with (MARKDOWN.md §1d).
+ * Every connection that writes `messages` or reads an excerpt needs them, or it
+ * fails with "no such function"; the daemon registers them on each of its
+ * connections, a test on its own, and oc_migrate on the connection it is given. */
+void oc_migrate_functions(sqlite3 *db);
+
 /* Apply every migration in `set` (ascending `version`, `n` entries) whose
  * version exceeds the current schema version, each inside its own transaction.
  * Returns SQLITE_OK on success. On failure returns the SQLite error code, sets
  * *errmsg (caller frees with sqlite3_free) if non-NULL, and leaves the database
  * at the last successfully-applied version — the partially-applied migration is
  * rolled back, so a restart resumes cleanly from that point. Attaches an
- * in-memory `ident` (oc_migrate_attach_identity) if none is attached yet. */
+ * in-memory `ident` (oc_migrate_attach_identity) if none is attached yet, and
+ * registers oc_migrate_functions. */
 int oc_migrate(sqlite3 *db, const oc_migration *set, int n, char **errmsg);
 
 /* Returned by oc_migrate_default for a database whose schema version is above

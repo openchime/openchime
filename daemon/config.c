@@ -131,6 +131,18 @@ int cfg_parse_trusted_proxies(oc_config *c, const cfg_row *r, const char *name, 
     return 0;
 }
 
+int cfg_parse_allowed_networks(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap) {
+    (void)r;
+    /* The same list as the trusted proxies, read by the same parser: read wrongly
+     * it would refuse everyone, or let in the networks it was meant to keep out. */
+    char why[160];
+    oc_trusted_proxies *t = oc_trusted_proxies_parse(v, why, sizeof why);
+    if (!t) return fail(err, errcap, name, v, why);
+    oc_trusted_proxies_free(t);
+    c->allowed_networks = v;
+    return 0;
+}
+
 int cfg_parse_token_prefix(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap) {
     (void)r;
     size_t n = strlen(v);

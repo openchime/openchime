@@ -269,8 +269,10 @@ int run_storage_tests(void) {
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(DBPATH, &db) == SQLITE_OK);
     sqlite3_busy_timeout(db, 5000);
-    sqlite3_exec(db, "INSERT OR IGNORE INTO messages(id, channel_id, author_id, body, created_at_ms) "
-                     "VALUES(1, 1, 1, 'm', 1);", NULL, NULL, NULL);
+    /* Checked: the search index's trigger runs on this write, and a connection
+     * without the daemon's SQL functions used to fail it without a word. */
+    CHECK(sqlite3_exec(db, "INSERT OR IGNORE INTO messages(id, channel_id, author_id, body, created_at_ms) "
+                           "VALUES(1, 1, 1, 'm', 1);", NULL, NULL, NULL) == SQLITE_OK);
 
     /* Real wall-clock ms: the writer stamps reclamations with its own clock, so
      * ages have to be expressed against the same one. */

@@ -33,7 +33,9 @@
  *
  * Participation is DERIVED, never stored: you are in a thread if you wrote its
  * root or a live reply to it. `thread_follows` carries only overrides — state 1
- * an explicit follow of one you never wrote in, state 0 an explicit unfollow.
+ * an explicit follow of one you never wrote in, state 0 an explicit unfollow --
+ * and `notification_prefs.follow_threads` follows every thread in a
+ * conversation at once (REQ-282).
  * The UNFOLLOW is an outer guard rather than an arm of the OR, because it
  * OUTRANKS having replied: that is the whole meaning of "turn off replies", and
  * it is the rule a plain OR silently loses.
@@ -57,7 +59,14 @@
     "                  AND rpx.deleted_at_ms IS NULL) "                         \
     "     OR EXISTS(SELECT 1 FROM thread_follows tfy "                          \
     "                WHERE tfy.user_id = " usr " AND tfy.root_id = " root " "   \
-    "                  AND tfy.state = 1) ) )"
+    "                  AND tfy.state = 1) "                                     \
+    /* Every thread in the conversation, followed (REQ-282): the per-thread     \
+     * unfollow above still outranks it for its thread, and mute, which the    \
+     * decision weighs, outranks both. */                                      \
+    "     OR EXISTS(SELECT 1 FROM messages rcx "                                \
+    "                JOIN notification_prefs npx "                              \
+    "                  ON npx.channel_id = rcx.channel_id AND npx.user_id = " usr " " \
+    "                WHERE rcx.id = " root " AND npx.follow_threads = 1) ) )"
 
 /* --- Jobs (net thread -> writer) ---------------------------------------- */
 
@@ -295,7 +304,52 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_DEACTIVATE_SELF = 148,   /* a person deactivates their own account */
        /* Fold a message away for its reader, or open it (message_id, save_op
         * 1 or 0): a per-person set, told to all of their connections. */
-       OC_JOB_SET_COLLAPSED = 149 };
+       OC_JOB_SET_COLLAPSED = 149,
+       /* Follow every thread in a conversation, or stop (REQ-282): channel_id
+        * and follow_on; answered with the NOTIFY_PREFS snapshot. */
+       OC_JOB_SET_CHANNEL_THREAD_FOLLOW = 150,
+       /* MOVE_MESSAGE (REQ-053). Answered OC_RES_MESSAGE_MOVED to both
+        * channels, or OC_RES_MOVE_ERR to the mover. */
+       OC_JOB_MOVE_MESSAGE = 151,
+       /* FIND_AT_TIME: the message at `find_at_ms` in channel_id, in the
+        * thread parent_id or its main scroll (0). A read. */
+       OC_JOB_FIND_AT_TIME = 152,
+       /* USAGE_REQ (REQ-043): the workspace's usage over the last usage_days
+        * UTC days, for an owner or admin. Answered OC_RES_USAGE, or
+        * OC_RES_USAGE_ERR (FORBIDDEN, INVALID). Read-only. */
+       OC_JOB_USAGE = 153,
+       /* SET_USER_MUTE: mute (mute_on 1) or unmute target_user_id for user_id
+        * alone. Answered OC_RES_MUTED_USERS to every connection of user_id. */
+       OC_JOB_SET_USER_MUTE = 154,
+       /* Blocks and DM privacy. SET_BLOCK blocks (block_on 1) or unblocks
+        * target_user_id for user_id; SET_DM_PRIVACY sets user_id's dm_privacy
+        * (OC_DM_PRIVACY_*). Both answered OC_RES_BLOCKS to every connection of
+        * user_id. LIST_BLOCKS (owner/admin, read-only) answered
+        * OC_RES_BLOCK_LIST, or OC_RES_BLOCK_LIST_ERR. */
+       OC_JOB_SET_BLOCK = 155, OC_JOB_LIST_BLOCKS = 156, OC_JOB_SET_DM_PRIVACY = 157,
+       /* The workspace's own profile fields. SET_PROFILE_FIELD: message_id the
+        * field (0 adds), pfd_op/pfd_kind/pfd_position, pf_name the label;
+        * owner or admin; answered OC_RES_PROFILE_FIELDS. SET_PROFILE_FIELD_VALUE:
+        * message_id the field, pf_name the value, for user_id; answered
+        * PROFILE_INFO. The definitions also ride AUTH_OK (pfd). */
+       OC_JOB_SET_PROFILE_FIELD = 158, OC_JOB_SET_PROFILE_FIELD_VALUE = 159,
+       /* Reminders come due (REQ-283), on the scheduled-message tick: each
+        * fires once, answered as one OC_RES_REMINDER_DUE apiece. Write. */
+       OC_JOB_FIRE_REMINDERS = 160,
+       /* Out of office (REQ-122): ooo_start/ooo_end, pf_name the message; an
+        * end of 0 or past clears it. Answered PROFILE_INFO to the person's
+        * connections, with their roster row (ulist, `joined`) for everyone. */
+       OC_JOB_SET_OUT_OF_OFFICE = 240,
+       /* A channel's managers (REQ-036b): channel_id, target_user_id; a
+        * manager, admin or owner. Answered CHANNEL_INFO, to every member. */
+       OC_JOB_CHANNEL_ADD_MANAGER = 241, OC_JOB_CHANNEL_REMOVE_MANAGER = 242,
+       /* Rename a custom emoji (REQ-072): ch_name the name, pf_name the new
+        * one. Answered EMOJI_LIST, to everyone. */
+       OC_JOB_RENAME_EMOJI = 243,
+       /* To-do lists: a task added (todo_name, todo_desc), marked (todo_task,
+        * todo_done), or the list renamed by its author (todo_name). Writes;
+        * answered OC_RES_TODO to the conversation, or OC_RES_TODO_ERR. */
+       OC_JOB_TODO_ADD = 161, OC_JOB_TODO_MARK = 162, OC_JOB_TODO_RENAME = 163 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -466,8 +520,14 @@ typedef struct oc_job {
     /* UPDATE_CHANNEL (channel_id above): op + the new topic/name in ch_name. */
     uint8_t        chup_op;
 
-    /* SAVE_ITEM (message_id above): add/remove. */
+    /* SAVE_ITEM (message_id above): add/remove, and with add the reminder
+     * (REQ-283), 0 for none. */
     uint8_t        save_op;
+    uint64_t       remind_at_ms;
+    /* TODO_ADD / TODO_MARK / TODO_RENAME (channel_id, message_id above). */
+    char          *todo_name, *todo_desc;   /* heap */
+    uint16_t       todo_task;
+    uint8_t        todo_done;
     /* SET_WEBHOOK_STATE's desired state. Its own field rather than reusing
      * one of the *_op flags above: a reader should not have to know that "save_op"
      * secretly means "disabled" for a different job type. */
@@ -482,6 +542,17 @@ typedef struct oc_job {
 
     /* HISTORY: 0 pages backwards from message_id, 1 fetches AROUND it (ARCH-96). */
     uint8_t        hist_around;
+    uint64_t       find_at_ms;  /* FIND_AT_TIME: the moment asked for */
+
+    /* USAGE: how many UTC days, today included (1..OC_USAGE_MAX_DAYS). */
+    uint16_t       usage_days;
+
+    /* SET_USER_MUTE: 1 mutes target_user_id, 0 unmutes. */
+    uint8_t        mute_on;
+
+    /* SET_BLOCK: 1 blocks target_user_id, 0 unblocks. SET_DM_PRIVACY: the value. */
+    uint8_t        block_on;
+    uint8_t        dm_privacy;
 
     /* SEARCH: query text is carried in body/body_len; this bounds the result.
      * `search_sort` is OC_SEARCH_*, and `search_cursor_rank` the relevance
@@ -498,6 +569,10 @@ typedef struct oc_job {
     uint64_t       channel_id;
     uint64_t       message_id; /* target message for EDIT / DELETE */
     uint64_t       parent_id;  /* thread parent for SEND_REPLY / LIST_THREAD */
+    uint8_t        also_channel; /* SEND_REPLY: also to the channel's main scroll (REQ-062) */
+    /* MOVE_MESSAGE (REQ-053): message_id, channel_id the destination, parent_id
+     * the destination thread (0 its top level), and whether to leave a line. */
+    uint8_t        move_marker;
     uint64_t       sched_at_ms; /* SCHEDULE / UPDATE_SCHEDULED: when to send */
     uint8_t        act_filter;  /* LIST_ACTIVITY: OC_ACTF_* (REQ-139) */
     char          *recipients;  /* SET_DRAFT with no channel (REQ-229); heap */
@@ -561,6 +636,11 @@ typedef struct oc_job {
     uint32_t       media_duration_ms;
     uint16_t       media_width, media_height;
     uint64_t       media_poster_id;
+    /* ...or, for a snippet (REQ-226), its title, language and the first bytes
+     * of its text for search. All heap. */
+    char          *snip_title, *snip_lang;
+    char          *snip_text;
+    size_t         snip_text_len;
 
     /* Synced client settings. SET uses client_type + key + value (empty value
      * deletes); LIST uses client_type only. */
@@ -616,6 +696,10 @@ typedef struct oc_job {
     uint64_t       sum_notice;
     char          *sum_version;
     struct oc_sum_batch *sum_batch;
+    /* SET_PROFILE_FIELD: OC_PROFILE_FIELD_SET/DELETE, the kind, the position. */
+    uint8_t        pfd_op, pfd_kind;
+    uint16_t       pfd_position;
+    uint64_t       ooo_start, ooo_end;   /* SET_OUT_OF_OFFICE */
 } oc_job;
 
 /* CALL_AUTH's question: a join (perhaps starting, with invitations) or an
@@ -769,6 +853,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* The author changed a poll: rpoll[0] for the conversation, nobody's
         * selection in it. */
        OC_RES_POLL_EDITED = 120,
+       /* A to-do list changed: rtodo is its state, for the conversation's
+        * members; or refused, OC_RES_TODO_ERR, to the asker with message_id. */
+       OC_RES_TODO = 136, OC_RES_TODO_ERR = 137,
        /* A notice the workspace's own sender posted (its welcome, a member
         * joined, a channel made or changed, a person added or given a role):
         * the SEND-shaped fields and `members`, broadcast as an ordinary
@@ -782,7 +869,45 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_ROSTER_ROW = 123,
        /* A message folded or opened (message_id, save_op): to every
         * connection of user_id. */
-       OC_RES_COLLAPSED = 124 };
+       OC_RES_COLLAPSED = 124,
+       /* A message, or a thread, moved (REQ-053): MESSAGE_MOVED to both
+        * channels' members, and the moved rows to the destination's. */
+       OC_RES_MESSAGE_MOVED = 125, OC_RES_MOVE_ERR = 126,
+       /* FOUND_AT_TIME to the asker: channel_id, parent_id, message_id (0 for
+        * none), server_time, and found_exact. */
+       OC_RES_FOUND_AT_TIME = 127,
+       /* The usage figures (`usage`) to the asker, or why not (err_code). */
+       OC_RES_USAGE = 128, OC_RES_USAGE_ERR = 129,
+       /* Everyone user_id has muted (mu_ids), to every connection of theirs. */
+       OC_RES_MUTED_USERS = 130,
+       /* Whom user_id blocks (bl_ids) and their dm_privacy (bl_privacy), to every
+        * connection of theirs; the workspace's blocks (blk_entries) to an admin,
+        * or why not (err_code). */
+       OC_RES_BLOCKS = 131, OC_RES_BLOCK_LIST = 132, OC_RES_BLOCK_LIST_ERR = 133,
+       /* The workspace's profile fields (pfd): to conn_id, or to everyone
+        * signed in when they changed (ch_fanout). */
+       OC_RES_PROFILE_FIELDS = 134,
+       /* A reminder fired: user_id's, on message_id in channel_id, at
+        * server_time; saved_at and remind_at the item's. To that person's
+        * connections and their devices' push. A chain, one per reminder; an
+        * empty one (user_id 0) when none was due. */
+       OC_RES_REMINDER_DUE = 135 };
+
+/* The usage figures (REQ-043), as USAGE carries them; the channels' names are
+ * held here, since the frame only points at them. */
+typedef struct oc_usage_report {
+    uint16_t         days, n_days, n_weeks, n_channels;
+    oc_usage_day     day[OC_USAGE_MAX_DAYS];
+    oc_usage_week    week[OC_USAGE_MAX_WEEKS];
+    uint64_t         ch_id[OC_USAGE_TOP_CHANNELS];
+    uint32_t         ch_messages[OC_USAGE_TOP_CHANNELS];
+    uint8_t          ch_private[OC_USAGE_TOP_CHANNELS];
+    char             ch_name[OC_USAGE_TOP_CHANNELS][128];
+} oc_usage_report;
+
+/* The ISO week `day` (days since the epoch, UTC) falls in, as yyyyww, and the
+ * day its Monday is (`monday`, optional). */
+uint32_t oc_usage_iso_week(uint32_t day, uint32_t *monday);
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -824,6 +949,9 @@ typedef struct oc_emoji_row {
     char    *name;          /* heap; lowercase, no colons */
     uint64_t attachment_id;
     uint64_t created_by;
+    uint64_t created_at;
+    char    *aliases[OC_MAX_EMOJI_ALIASES];   /* heap; its old names */
+    uint8_t  n_aliases;
 } oc_emoji_row;
 
 /* One saved message (REQ-231). Carries its body for the same reason a pin does:
@@ -832,6 +960,7 @@ typedef struct {
     uint64_t message_id, channel_id, author_id, created_at, saved_at;
     char    *body, *attach_name;   /* heap */
     uint8_t  action;               /* body is the action text (REQ-058) */
+    uint64_t remind_at;            /* its reminder (REQ-283), 0 for none */
 } oc_saved_row;
 
 /* One activity item (REQ-139). `text` is the message body for a mention or a
@@ -899,7 +1028,7 @@ typedef struct {
 } oc_channel_row;
 
 /* One row in a NOTIFY_PREFS result (REQ-130): a channel and its level. */
-typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; } oc_notify_pref_row;
+typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; uint8_t follow_threads; } oc_notify_pref_row;
 
 /* One row in a CLIENT_SETTINGS result: a synced key/value. */
 typedef struct { char *key; char *value; } oc_client_setting_row;
@@ -935,6 +1064,7 @@ typedef struct oc_audit_row {
     char    *detail;       /* heap; never carries the secret involved */
     uint8_t  family;
     uint8_t  outcome;      /* 1 ok, 0 denied/failed */
+    uint64_t channel_id;   /* the channel it happened in; 0 none, or written before 0084 */
 } oc_audit_row;
 
 /* One row in a READ_CURSOR result: a member's read position in the channel. */
@@ -972,6 +1102,9 @@ typedef struct {
      * one for the same author, so the roster carries it like a name decoration. */
     char    *voice_id;      /* heap; may be "" */
     uint8_t  flags;         /* OC_USER_SYSTEM: the workspace's own sender */
+    /* Out of office (REQ-122), as stored: the reader decides whether it is in force. */
+    uint64_t ooo_start, ooo_end;
+    char    *ooo_message;   /* heap; may be "" */
 } oc_user_row;
 
 /* One message to replay on reconnect (rendered as a BROADCAST by the net thread),
@@ -990,6 +1123,7 @@ typedef struct {
     uint32_t duration_ms;
     uint16_t width, height;
     uint64_t poster_id;
+    char    *title, *language;   /* heap; a snippet's (REQ-226), else NULL */
 } oc_attach_meta;
 
 typedef struct {
@@ -1015,6 +1149,7 @@ typedef struct {
      * into a SAVED_UPDATED, exactly as pins do above. */
     uint8_t  saved;
     uint64_t saved_at;
+    uint64_t remind_at;   /* the saved item's reminder (REQ-283), 0 for none */
     /* Folded away by the REQUESTING user, likewise private to them: the net
      * thread replays it as a COLLAPSED_UPDATED down this connection. */
     uint8_t  collapsed;
@@ -1022,6 +1157,9 @@ typedef struct {
     /* Replays and THREAD: its send stored a broadcast mention row (REQ-221),
      * whatever the body says now; the byte BROADCAST and THREAD_REPLY carry. */
     uint8_t  broadcast_stored;
+    /* Replays: a thread reply also posted to the channel (REQ-062) is in the
+     * main scroll with its thread's root here; 0 for a top-level message. */
+    uint64_t parent_id;
     /* SEARCH only: the snippet in `body` is cut from an action's text
      * (REQ-058). A replay carries actions on their own frames instead. */
     uint8_t  action;
@@ -1058,6 +1196,17 @@ typedef struct oc_dbres {
     uint64_t       session_expiry;                    /* ms since epoch */
     uint8_t        session_token[OC_SESSION_TOKEN_LEN];
     int            has_session_token;                 /* 0 on session re-auth */
+
+    /* FOUND_AT_TIME: 1 when message_id is at or after the time asked, 0 when
+     * it is the last before it. */
+    uint8_t        found_exact;
+    /* MESSAGE_MOVED (REQ-053): where it went -- channel_id is where it was,
+     * parent_id the thread it went into (0 the top level), reply_count how many
+     * moved -- and the destination's members, besides `members`, the source's.
+     * The moved rows ride `replay`. */
+    uint64_t       move_to;
+    uint64_t      *dest_members;   /* heap */
+    size_t         n_dest_members;
 
     /* SEND_OK */
     uint64_t       message_id;
@@ -1141,6 +1290,15 @@ typedef struct oc_dbres {
                             uint32_t counts[OC_POLL_MAX_OPTIONS]; }
                   *rpoll;
     size_t         n_rpoll;
+    /* To-do lists: each entry one TODO frame, tasks [first, first + n) of
+     * `total`; a list past OC_TODO_CHUNK tasks is several entries in order.
+     * Strings heap. */
+    struct oc_replay_todo { uint64_t message_id, channel_id, author_id;
+                            char *title; uint16_t total, first; uint8_t n;
+                            struct { char *name, *desc; uint8_t done; uint64_t done_by, done_at_ms; }
+                                tasks[OC_TODO_CHUNK]; }
+                  *rtodo;
+    size_t         n_rtodo;
     /* POLL_VOTERS: who picked which option, ordered by option then user. */
     oc_poll_voter *pvoters;
     size_t         n_pvoters;
@@ -1177,6 +1335,11 @@ typedef struct oc_dbres {
     /* CHANNEL_INFO: the channel's groups (REQ-309), sent beside it. */
     uint64_t       ch_groups[OC_MAX_CHANNEL_GROUPS];
     uint16_t       n_ch_groups;
+    /* CHANNEL_INFO: who made the channel (0 unknown) and its managers
+     * (REQ-036b), heap, at most OC_MAX_CHANNEL_MANAGERS. */
+    uint64_t       ch_creator;
+    uint64_t      *ch_managers;
+    uint16_t       n_ch_managers;
 
     /* User groups (REQ-307-309): the groups a LIST or a change carries, and who
      * gained or lost which channel by a change (heap arrays). */
@@ -1213,6 +1376,13 @@ typedef struct oc_dbres {
     char           *emoji;          /* heap; REACTION_OK */
     uint8_t         react_op;
     uint64_t        react_count;
+    /* REACTION_OK: the members who have muted someone who reacted with this
+     * emoji (SET_USER_MUTE), each with how many of those reactions to leave out of
+     * the count they are sent, so a muted person's reactions are no part of
+     * a chip they see. Parallel heap arrays. */
+    uint64_t       *react_adj_user;
+    uint64_t       *react_adj_minus;
+    size_t          n_react_adj;
     oc_reaction_row *rlist;         /* heap array; REACTIONS */
     size_t           n_rlist;
 
@@ -1241,6 +1411,7 @@ typedef struct oc_dbres {
     /* Saved items + activity (REQ-231/139). */
     uint8_t          save_op;
     uint64_t         saved_at;
+    uint64_t         remind_at;     /* SAVED_OK and REMINDER_DUE: the reminder, 0 for none */
     oc_saved_row    *slist;
     size_t           n_slist;
     oc_activity_row *alist;
@@ -1252,6 +1423,7 @@ typedef struct oc_dbres {
      * THREAD carries the reply list. */
     uint64_t        parent_id;
     uint32_t        reply_count;
+    uint8_t         also_channel;   /* REPLY_OK: the reply is also in the channel (REQ-062) */
     /* The parent's thread as it now stands, for the live THREAD_META a posted
      * or deleted reply sends (REQ-060). A DELETE_OK of a top-level message
      * leaves parent_id 0 and sends none. */
@@ -1312,6 +1484,19 @@ typedef struct oc_dbres {
     uint8_t             al_n_terms;
     uint64_t           *al_people;     /* heap */
     uint8_t             al_n_people;
+    /* OC_RES_MUTED_USERS, and with the alert preferences at sign-in: everyone
+     * user_id has muted. `mu_have` once read, so an empty list is still sent. */
+    uint64_t           *mu_ids;        /* heap */
+    uint16_t            mu_n;
+    uint8_t             mu_have;
+    /* OC_RES_BLOCKS, and with the alert preferences: whom user_id blocks and who
+     * may start a DM with them. `bl_have` once read, so an empty list is sent. */
+    uint64_t           *bl_ids;        /* heap */
+    uint16_t            bl_n;
+    uint8_t             bl_privacy, bl_have;
+    /* OC_RES_BLOCK_LIST: every block in the workspace, for an admin. */
+    oc_block_entry     *blk_entries;   /* heap */
+    uint16_t            n_blk;
     /* OC_RES_SNOOZE, and carried on AUTH_OK so the net thread can seed its
      * in-memory copy without a second round trip. Already expiry-checked. */
     uint64_t            snooze_until_ms;
@@ -1337,6 +1522,9 @@ typedef struct oc_dbres {
      * the pairing a reader relies on. */
     char                   *st_emoji, *st_text, *pf_title, *pf_tz;
     char                   *pf_full_name, *pf_pronouns, *pf_phone, *pf_voice_id;
+    /* Out of office (REQ-122), as stored. */
+    uint64_t                pf_ooo_start, pf_ooo_end;
+    char                   *pf_ooo_message;
     /* The profile was just changed by its owner (SET_PROFILE, SET_EMAIL): it
      * goes to every one of their connections, not only the one that saved it,
      * so their other devices show it too (REQ-240). */
@@ -1375,6 +1563,7 @@ typedef struct oc_dbres {
     /* Audit page (REQ-251). `audit` is a heap array of rows, newest first. */
     struct oc_audit_row    *audit;
     size_t                  n_audit;
+    struct oc_usage_report *usage;   /* OC_RES_USAGE; heap */
 
     /* PROFILE_UPDATED: the (possibly unchanged) display name to broadcast; the
      * subject user is `user_id` above. */
@@ -1440,6 +1629,14 @@ typedef struct oc_dbres {
     struct oc_sum_notice_row { uint64_t id, channel_id, start_ms, end_ms, made_at_ms; uint8_t scope, status; }
                            *sum_notices;
     size_t                  n_sum_notices;
+    /* OC_RES_PROFILE_FIELDS and AUTH_OK: the definitions, in position order. On
+     * OC_RES_PROFILE_INFO: the person's values. Heap, at most
+     * OC_MAX_PROFILE_FIELDS each. */
+    struct oc_pfd_row { uint64_t id; uint8_t kind; uint16_t position;
+                        char label[OC_PROFILE_FIELD_LABEL_MAX + 1]; } *pfd;
+    size_t                  n_pfd;
+    struct oc_pfv_row { uint64_t field_id; char value[OC_PROFILE_FIELD_VALUE_MAX + 1]; } *pfv;
+    size_t                  n_pfv;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;
