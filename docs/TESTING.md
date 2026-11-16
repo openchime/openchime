@@ -138,9 +138,8 @@ harnesses in the full suite (§2.2b, "Fuzzing"). A concurrency load test
 ### Prerequisites
 
 **`make build` and `make test`** (Linux, x86-64 or arm64): a C compiler
-(`cc`), `make`, `curl` and `bzip2` (the pinned mbedTLS tarball), `nasm`
-(libvpx's assembly), `xz` (the pinned llvm-mingw for the Windows clients) and
-`python3`. The vendored libraries and the toolchain build themselves on first
+(`cc`), `make`, `nasm` (libvpx's assembly), `curl` and `xz` (the pinned
+llvm-mingw for the Windows clients) and `python3`. The vendored libraries and the toolchain build themselves on first
 use (`scripts/build/*.sh`, `mk/toolchains.mk`); no ONNX Runtime, llama.cpp or
 Emscripten is needed. actionlint is fetched once into
 `~/.cache/openchime/`. Four things are checked only where present, and a

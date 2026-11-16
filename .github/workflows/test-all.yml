@@ -154,9 +154,8 @@ jobs:
         run: |
           # scripts/build/apt.sh: the mirror rewritten, each apt-get bounded
           # and retried, so a stall fails the step instead of holding the job.
-          # bzip2 for the vendored mbedTLS tarball that `make` builds via
-          # scripts/build/mbedtls.sh; nasm for libvpx's assembly
-          # (scripts/build/libvpx.sh); xz-utils for the toolchain tarballs. gdb
+          # nasm for libvpx's assembly (scripts/build/libvpx.sh); xz-utils for
+          # the toolchain tarballs. gdb
           # so that a test binary that crashes prints every thread's stack
           # (tests/main.c). cmake, curl, git and python3 are on the image.
           # libclang-rt-18-dev for libFuzzer and the sanitizer runtimes of the
@@ -212,8 +211,8 @@ jobs:
         name: Restore mbedTLS
         uses: actions/cache/restore@v6
         with:
-          path: &mbedtls-path third_party/mbedtls-3.6.2
-          key: &mbedtls-key mbedtls-3.6.2-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh') }}
+          path: &mbedtls-path third_party/mbedtls-3.6.7
+          key: &mbedtls-key mbedtls-3.6.7-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh') }}
       - id: c-libvpx
         name: Restore libvpx
         uses: actions/cache/restore@v6
@@ -243,7 +242,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: &wasm-mbedtls-path build/wasm/mbedtls
-          key: &wasm-mbedtls-key wasm-mbedtls-3.6.2-emsdk6.0.13-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/mbedtls.sh') }}
+          key: &wasm-mbedtls-key wasm-mbedtls-3.6.7-emsdk6.0.13-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/mbedtls.sh') }}
       - id: c-wasm-sdl3
         name: Restore SDL3 for wasm
         uses: actions/cache/restore@v6

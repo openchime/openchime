@@ -274,7 +274,7 @@ jobs:
           set -euo pipefail
           # scripts/build/apt.sh: the mirror rewritten, each apt-get bounded
           # and retried, so a stall fails the step instead of holding the job.
-          # bzip2 for the mbedTLS tarball; nasm for libvpx's assembly; xz-utils
+          # nasm for libvpx's assembly; xz-utils
           # for the toolchain tarballs; rpm supplies rpmbuild; nsis and
           # python3-pefile for the Windows installer and its check; buildah for
           # the images; gnupg to sign the build. apt.sh fetches only what the
@@ -340,8 +340,8 @@ jobs:
         name: Restore the amd64 release's mbedTLS
         uses: actions/cache/restore@v6
         with:
-          path: &mbedtls-amd64-path third_party/mbedtls-3.6.2
-          key: &mbedtls-amd64-key mbedtls-3.6.2-release-amd64-zig0.17.1-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
+          path: &mbedtls-amd64-path third_party/mbedtls-3.6.7
+          key: &mbedtls-amd64-key mbedtls-3.6.7-release-amd64-zig0.17.1-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
       - id: c-opus-amd64
         name: Restore the amd64 release's opus
         uses: actions/cache/restore@v6
@@ -417,7 +417,7 @@ jobs:
           name="openchimed-build-${BUILD_ID}-${PLATFORM}"
           mkdir -p "tree/$name"
           cp -r "$DIST/openchimed" "$DIST/tts" "$DIST/stt" "$DIST/web" "tree/$name/"
-          packaging/licenses.sh third_party/mbedtls-3.6.2 > "tree/$name/copyright"
+          packaging/licenses.sh third_party/mbedtls-3.6.7 > "tree/$name/copyright"
           mkdir -p "candidate/$PLATFORM"
           tar -C tree --sort=name --owner=0 --group=0 --numeric-owner --mtime="@0" \
             -czf "candidate/$PLATFORM/$name.tar.gz" "$name"
@@ -434,7 +434,7 @@ jobs:
       # runs (the render, the install) runs for amd64 alone. It writes its data
       # manifests with a featureless HOST daemon, built with the runner's gcc
       # (mk/daemon.mk), which links the host's mbedTLS from
-      # third_party/mbedtls-3.6.2 -- where the amd64 release's zig-built copy
+      # third_party/mbedtls-3.6.7 -- where the amd64 release's zig-built copy
       # is now. So the amd64 release's own libraries are set aside first, and
       # the gcc-built host mbedTLS restored in their place, from the cache
       # test-all.yml saves under the same key: the arm64 build then sees
@@ -444,7 +444,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/amd64"
-          for d in mbedtls-3.6.2 onnxruntime-1.30.0 llamacpp-0.5.0; do
+          for d in mbedtls-3.6.7 onnxruntime-1.30.0 llamacpp-0.5.0; do
             if [ -e "third_party/$d" ]; then mv "third_party/$d" "$RUNNER_TEMP/amd64/"; fi
           done
       - id: c-tts-arm64
@@ -457,8 +457,8 @@ jobs:
         name: Restore the arm64 release's mbedTLS
         uses: actions/cache/restore@v6
         with:
-          path: &mbedtls-arm64-path third_party/mbedtls-3.6.2-aarch64
-          key: &mbedtls-arm64-key mbedtls-3.6.2-release-arm64-zig0.17.1-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
+          path: &mbedtls-arm64-path third_party/mbedtls-3.6.7-aarch64
+          key: &mbedtls-arm64-key mbedtls-3.6.7-release-arm64-zig0.17.1-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
       - id: c-opus-arm64
         name: Restore the arm64 release's opus
         uses: actions/cache/restore@v6
@@ -469,8 +469,8 @@ jobs:
         name: Restore the host's mbedTLS
         uses: actions/cache/restore@v6
         with:
-          path: &mbedtls-host-path third_party/mbedtls-3.6.2
-          key: &mbedtls-host-key mbedtls-3.6.2-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh') }}
+          path: &mbedtls-host-path third_party/mbedtls-3.6.7
+          key: &mbedtls-host-key mbedtls-3.6.7-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh') }}
       - id: build-arm64
         name: make build-all PART=packages (arm64)
         env:
@@ -524,7 +524,7 @@ jobs:
           name="openchimed-build-${BUILD_ID}-${PLATFORM}"
           mkdir -p "tree/$name"
           cp -r "$DIST/openchimed" "$DIST/tts" "$DIST/stt" "$DIST/web" "tree/$name/"
-          packaging/licenses.sh third_party/mbedtls-3.6.2 > "tree/$name/copyright"
+          packaging/licenses.sh third_party/mbedtls-3.6.7 > "tree/$name/copyright"
           mkdir -p "candidate/$PLATFORM"
           tar -C tree --sort=name --owner=0 --group=0 --numeric-owner --mtime="@0" \
             -czf "candidate/$PLATFORM/$name.tar.gz" "$name"
@@ -642,8 +642,8 @@ jobs:
         name: Restore mbedTLS for Windows
         uses: actions/cache/restore@v6
         with:
-          path: &win-mbedtls-path third_party/mbedtls-3.6.2-win
-          key: &win-mbedtls-key mbedtls-3.6.2-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/mbedtls_windows.sh', 'scripts/build/llvm_mingw.sh') }}
+          path: &win-mbedtls-path third_party/mbedtls-3.6.7-win
+          key: &win-mbedtls-key mbedtls-3.6.7-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/mbedtls_windows.sh', 'scripts/build/llvm_mingw.sh') }}
       - id: c-win-libvpx
         name: Restore libvpx for Windows
         uses: actions/cache/restore@v6

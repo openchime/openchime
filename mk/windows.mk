@@ -2,7 +2,7 @@
 # (ARCH-80) and the TUI (ARCH-81). The toolchain is llvm-mingw (clang, lld,
 # LLVM's binutils, current mingw-w64 headers), fetched pinned on first use
 # (mk/toolchains.mk); the x86_64-w64-mingw32-* names below are its wrappers.
-# Both clients use the Windows mbedTLS (third_party/mbedtls-3.6.2-win, built
+# Both clients use the Windows mbedTLS (third_party/mbedtls-3.6.7-win, built
 # by its rule below). No sqlite: a client embeds no database engine (ARCH-88).
 WINCC      ?= $(MINGW_CC)
 WINDRES    ?= $(dir $(MINGW_CC))x86_64-w64-mingw32-windres
@@ -23,7 +23,7 @@ WIN_BUILD_NUM  := $(if $(OC_BUILD_NUM),$(OC_BUILD_NUM),0)
 WIN_BUILD_ID   := $(if $(OC_BUILD_ID),$(OC_BUILD_ID),dev)
 WIN_RES_SRC    := client/shared/res/version_info.rc
 WINDRES_ARGS   := -I client/shared/res --define OC_BUILD_NUM=$(WIN_BUILD_NUM) --define OC_BUILD_ID_TOKEN=$(WIN_BUILD_ID)
-MBEDTLS_WIN    := third_party/mbedtls-3.6.2-win
+MBEDTLS_WIN    := third_party/mbedtls-3.6.7-win
 WIN_MBEDLIBS   := $(MBEDTLS_WIN)/library/libmbedtls.a \
                   $(MBEDTLS_WIN)/library/libmbedx509.a \
                   $(MBEDTLS_WIN)/library/libmbedcrypto.a

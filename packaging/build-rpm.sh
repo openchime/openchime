@@ -20,7 +20,7 @@ case "$ARCH" in
 esac
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MBEDTLS_DIR="${MBEDTLS_DIR:-${root}/third_party/mbedtls-3.6.2}"
+MBEDTLS_DIR="${MBEDTLS_DIR:-${root}/third_party/mbedtls-3.6.7}"
 
 [ -x "$BINARY" ] || { echo "build-rpm.sh: $BINARY is not an executable" >&2; exit 1; }
 command -v rpmbuild >/dev/null || { echo "build-rpm.sh: rpmbuild not found" >&2; exit 1; }

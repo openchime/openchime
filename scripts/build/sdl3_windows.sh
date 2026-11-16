@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Cross-build the pinned SDL3 (static, Windows) with mingw-w64 into
 # third_party/sdl3-<ver>-win/ — the "fetched at build" vendoring class
-# (docs/VENDORS.md §2), same shape as scripts/build/mbedtls_windows.sh: SHA-256-pinned
-# tarball, gitignored output, reproduced by this script. SDL's own build is
+# (docs/VENDORS.md §2): SHA-256-pinned tarball, gitignored output, reproduced
+# by this script. SDL's own build is
 # CMake; invoking it here is the same arrangement as invoking mbedTLS's make —
 # the dependency's build system stays the dependency's business, and this
 # tree's stays make.

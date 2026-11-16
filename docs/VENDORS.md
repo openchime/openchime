@@ -27,7 +27,7 @@ Library Exception), and every one of these is compatible with the AGPL.
 ## 1. Vendored source — committed under `third_party/`
 
 Libraries committed directly to the repo, from single headers to whole release
-tarballs (libvpx, opus, speexdsp), so local and
+tarballs (libvpx, opus, speexdsp, Mbed TLS), so local and
 CI builds share byte-identical sources with zero transitive dependencies
 (ARCH-75). "Pinning" = the file is frozen in git; bumping means replacing it.
 
@@ -48,6 +48,7 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **speexdsp** | 1.2.1 | The acoustic echo canceller (`speex_echo_state`), behind the processor seam (AUDIO.md §3.3) | Client media library (`client/core/media/processor.c`) — voice input (ARCH-112) and the audio client; never the daemon | https://www.speex.org | BSD-3-Clause |
 | **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) and the audio client (ARCH-73); the daemon, to encode read-aloud (ARCH-111) | https://opus-codec.org | BSD-3-Clause |
 | **libvpx** | 1.17.0 | VP9 encode and decode | Client media library — video messages (ARCH-110) and screenshare (ARCH-87) | https://chromium.googlesource.com/webm/libvpx | BSD-3-Clause (with a separate patent grant) |
+| **Mbed TLS** | 3.6.7 | TLS transport (client + daemon), certificate verification, ACME's JWS, CSRs and challenge certificates, SHA-256, ES256 verify; calls' end-to-end encryption — X25519, HKDF, AES-GCM, CTR-DRBG for HPKE and SFrame (ARCH-113) | Daemon + client (`shared/tls.c`, `shared/e2e_*.c`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 **OR** GPL-2.0-or-later (dual; we use it under Apache-2.0) |
 
 **speexdsp** is committed in `third_party/speexdsp/` as Xiph's 1.2.1 release
 tarball, unmodified, its `COPYING` with it. `scripts/build/speexdsp.sh` builds
@@ -77,6 +78,23 @@ which the Win32 link therefore pulls in statically. **The daemon links no
 libvpx**: it stores a video message as opaque bytes (ARCH-110). BSD-3-Clause,
 whose binary-redistribution clause wants the notice carried with a shipped
 client.
+
+**Mbed TLS** is committed in `third_party/mbedtls/` as the 3.6.7 release
+tarball (the 3.6 LTS line), unmodified, its `LICENSE` with it (the tarball was
+checked against the SHA-256 upstream publishes beside the release,
+`a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6`). Upstream's
+make builds in place, so each script builds a copy and the committed tree is
+only read: `scripts/build/mbedtls.sh` into `third_party/mbedtls-3.6.7/` (with
+`OC_ARCH`, another architecture's), `scripts/build/mbedtls_windows.sh` into
+`third_party/mbedtls-3.6.7-win/` (both gitignored), and
+`scripts/build/mbedtls_wasm.sh` into `build/wasm/mbedtls`; nothing is
+downloaded. Built as **static** libs (`libmbedtls/libmbedx509/libmbedcrypto.a`),
+the native copy with **`MBEDTLS_THREADING`** enabled — the client runs a TLS
+network thread per connection and the tests drive several TLS clients
+concurrently, which races without it (see docs/TLS.md). A bump replaces the tree
+and the version in the three scripts, `mk/sources.mk` and `mk/windows.mk`;
+`make test` refuses a tree and a build that disagree
+(`scripts/test/fast/vendored.sh`).
 
 **Why the daemon compiles SQLite in rather than linking the host's (ARCH-20; no
 client links SQLite at all, ARCH-88).**
@@ -140,9 +158,9 @@ verbatim from the notice in `jsmn.h`, which is where upstream keeps it), and the
 its header). miniaudio's implementation is compiled in exactly one translation
 unit, `audio_ma.c`, with only device I/O enabled. `.gitignore` ignores
 `third_party/*` and whitelists the committed paths: `jsmn/`, `termbox2/`,
-`picohttpparser/`, `utf8proc/`, `argon2/`, `pwlist/`, `qrcodegen/`, `miniaudio/`, `stb/`, `sqlite-3.53.4/`, `libfvad/`, `ca-roots/`, `speexdsp/`, `opus/`, `libvpx/` and `lucide/`
+`picohttpparser/`, `utf8proc/`, `argon2/`, `pwlist/`, `qrcodegen/`, `miniaudio/`, `stb/`, `sqlite-3.53.4/`, `libfvad/`, `ca-roots/`, `speexdsp/`, `opus/`, `libvpx/`, `mbedtls/` and `lucide/`
 (see below). Everything else under
-`third_party/` — the fetched mbedTLS trees among it — stays ignored.
+`third_party/` — the build directories and what the build fetches — stays ignored.
 
 ## 2. Fetched at build time — `scripts/build/*.sh` (gitignored output)
 
@@ -167,7 +185,6 @@ has moved.
 
 | Package | Version | Purpose | Used by | Source | License |
 |---------|---------|---------|---------|--------|---------|
-| **Mbed TLS** | 3.6.2 | TLS transport (client + daemon), certificate verification, ACME's JWS, CSRs and challenge certificates, SHA-256, ES256 verify; calls' end-to-end encryption — X25519, HKDF, AES-GCM, CTR-DRBG for HPKE and SFrame (ARCH-113) | Daemon + client (`shared/tls.c`, `shared/e2e_*.c`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 **OR** GPL-2.0-or-later (dual; we use it under Apache-2.0) |
 | **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx) | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
 | **ONNX Runtime** | 1.30.0 | Neural network inference for the read-aloud voice model and the voice-input recognizer, built from source **minimal and static** (only the models' operators and types, `.ort` format only, no exceptions) | Daemon (read-aloud ARCH-111, voice input ARCH-112) | https://github.com/microsoft/onnxruntime | MIT (its compiled-in components — abseil, flatbuffers, protobuf-lite, ONNX, cpuinfo, Eigen — are permissive and listed in its ThirdPartyNotices) |
 | **llama.cpp** (with ggml) | 0.5.0 | Running the summary model, built from source **CPU only and static** (no OpenMP, no tools, no network code) | Daemon (summaries ARCH-116) | https://github.com/ggml-org/llama.cpp | MIT |
@@ -177,23 +194,9 @@ has moved.
 | **libc++** (LLVM, zig's bundled copy) | zig 0.17.1's | The C++ runtime ONNX Runtime and llama.cpp are compiled against in a release build, linked statically | Daemon (release build, with read-aloud, voice input or summaries) | https://github.com/llvm/llvm-project | Apache-2.0 WITH LLVM-exception (no notice required in binary form) |
 | **CMUdict** | commit `74790861` | Source of ttskit's pronunciation data, which is generated from it and **committed** (`ttskit/data/en-US/`, its notice in `ttskit/data/CMUDICT-LICENSE`) | Daemon (read-aloud) | https://github.com/cmusphinx/cmudict | BSD-style (two clauses) |
 
-Fetched + built by `scripts/build/mbedtls.sh` from the official GitHub release
-tarball into `third_party/mbedtls-3.6.2/` (gitignored). Version pinned by
-`MBEDTLS_VERSION` (default `3.6.2`). Built as **static** libs
-(`libmbedtls/libmbedx509/libmbedcrypto.a`) with **`MBEDTLS_THREADING`** enabled —
-the client runs a TLS network thread per connection and the tests drive several
-TLS clients concurrently, which races without it (see docs/TLS.md).
-**The tarball is checksum-verified before it is unpacked.** Both fetch scripts
-carry the known-good SHA-256 for the pinned version — the value upstream
-publishes in the `mbedtls-<version>-sha256sum.txt` asset beside the release — and
-refuse a mismatch, deleting the bad file rather than extracting it. Bumping
-`MBEDTLS_VERSION` without supplying a matching sum is **refused**, not fetched
-unverified: the script prints the `curl` that retrieves the upstream sum and
-exits. Override for a new version with `MBEDTLS_SHA256=<sum>`.
-
-**SDL3** follows the identical arrangement one script over:
-`scripts/build/sdl3_windows.sh` fetches the pinned release tarball
-(SHA-256-verified, refuses an unpinned bump), cross-builds a **static-only**
+**SDL3**: `scripts/build/sdl3_windows.sh` fetches the pinned release tarball
+(SHA-256-verified before it is unpacked; a bump without a matching sum is
+refused), cross-builds a **static-only**
 `libSDL3.a` with llvm-mingw into `third_party/sdl3-3.4.14-win/` (gitignored), and
 `make build` links it. SDL's own build is CMake; the script invoking
 it is the same arrangement as invoking mbedTLS's make — the dependency's build
@@ -261,8 +264,8 @@ dependency, built the same way:
 llama.cpp's MIT notice travels with every package through `packaging/licenses.sh`.
 
 **The web client** (`make build/web/openchime.js`) builds its own copies with Emscripten into
-`build/wasm/` (gitignored): `scripts/build/mbedtls_wasm.sh` from the fetched
-mbedTLS tree, `scripts/build/sdl3_wasm.sh` from the same pinned, SHA-256-verified
+`build/wasm/` (gitignored): `scripts/build/mbedtls_wasm.sh` from the committed
+mbedTLS (`third_party/mbedtls/`), `scripts/build/sdl3_wasm.sh` from the same pinned, SHA-256-verified
 SDL3 release, and `scripts/build/media_wasm.sh` for libvpx, libopus and speexdsp from
 `third_party/libvpx/`, `third_party/opus/` and `third_party/speexdsp/`.
 
@@ -359,7 +362,7 @@ The Windows GUI is the portable application (`client/gui/app/`, ARCH-80) over
 | Item | Version | Note | License |
 |------|---------|------|---------|
 | `scripts/build/llvm_mingw.sh`, `third_party/llvm-mingw-20261020` | 20261020 | The toolchain itself (clang, lld, LLVM binutils, mingw-w64 headers and CRT, UCRT), fetched by make | Apache-2.0 with LLVM exception |
-| `scripts/build/mbedtls_windows.sh`, `third_party/mbedtls-3.6.2-win` | 3.6.2 | Windows cross-compile; used by `make build` | Apache-2.0 |
+| `scripts/build/mbedtls_windows.sh`, `third_party/mbedtls-3.6.7-win` | 3.6.7 | Windows cross-compile; used by `make build` | Apache-2.0 |
 | `scripts/build/sdl3_windows.sh`, `third_party/sdl3-3.4.14-win` | 3.4.14 | Windows cross-compile (static, CMake invoked by the script); used by `make build` | zlib |
 | `scripts/build/libvpx.sh windows`, `third_party/libvpx-1.17.0-win` | 1.17.0 | Windows cross-compile (static, nasm); used by `make build` | BSD-3-Clause |
 | `scripts/build/opus.sh windows`, `third_party/opus-1.6.1-win` | 1.6.1 | Windows cross-compile (static); used by `make build` | BSD-3-Clause |

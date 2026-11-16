@@ -4,9 +4,8 @@
 # This is the channel for everyone apt and dnf do not reach: Arch, Alpine (glibc
 # variants), NixOS, SUSE, and -- the case that actually motivated it -- an
 # air-gapped operator. ARCH-20 tells an operator wanting zero
-# dependency on the project to "build from source", but the source build runs
-# scripts/build/mbedtls.sh, which downloads mbedTLS from GitHub. So the
-# advertised offline path was not offline. This tarball is.
+# dependency on the project to "build from source"; this tarball is the same
+# binary for one who has no compiler on the box, or wants no build.
 #
 #   build-tarball.sh <version> <arch> <binary> [outdir]
 set -euo pipefail
@@ -17,7 +16,7 @@ BINARY="${3:?missing path to the built openchimed}"
 OUTDIR="${4:-dist}"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MBEDTLS_DIR="${MBEDTLS_DIR:-${root}/third_party/mbedtls-3.6.2}"
+MBEDTLS_DIR="${MBEDTLS_DIR:-${root}/third_party/mbedtls-3.6.7}"
 
 [ -x "$BINARY" ] || { echo "build-tarball.sh: $BINARY is not an executable" >&2; exit 1; }
 

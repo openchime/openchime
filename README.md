@@ -203,9 +203,8 @@ make test       # the fast suite, before every push (docs/TESTING.md)
 make run TTS=1 STT=1 SUM=1 WEB=1   # every feature: read-aloud, voice input, summaries, the web client
 ```
 
-Requires a C toolchain, Python 3, bzip2, and curl with network access on the
-first build: SQLite is in `third_party/`, and mbedTLS is fetched pinned and
-checksummed by `scripts/build/mbedtls.sh` (a `.tar.bz2`); both are built once.
+Requires a C toolchain, Python 3, and curl with network access on the first
+build: SQLite and mbedTLS are in `third_party/`, and both are built once.
 Python 3 generates the sources the daemon embeds (its web page and password
 list). `make build` also cross-builds the Windows clients with the pinned
 llvm-mingw it fetches (`mk/toolchains.mk`); nasm builds libvpx's x86 assembly.
