@@ -22,7 +22,8 @@
 #     carries the mark is named and stopped, wherever it moved itself (a new
 #     session included), and the run fails. Interrupted with Ctrl-C or a TERM,
 #     the command's process group and whatever else carries the mark are
-#     stopped.
+#     stopped. One marked process is not the command's and is left alone: the
+#     container runtime's pause process (below).
 #
 # Otherwise it exits with the command's own status (130 on INT, 143 on TERM).
 # Only processes carrying this run's mark are ever counted or stopped: a
@@ -52,6 +53,25 @@ mark="OC_CLEAN_RUN=$id"
 # grep over /proc: another user's environment cannot be read and is skipped.
 marked() {
   grep -lzxF -- "$mark" /proc/[0-9]*/environ 2>/dev/null | cut -d/ -f3 | sort -n
+}
+
+# The container runtime's pause process is the one marked process that is not
+# the command's to end. Rootless podman starts it (catatonit -P) with its
+# first command, to hold the user's namespace for every podman command after
+# it, and leaves it running; started inside a run, it carries the run's mark.
+# It is never counted and never stopped.
+pause_process() {  # <pid>: whether that is what it is
+  local -a argv=()
+  mapfile -d '' -t argv 2>/dev/null < "/proc/$1/cmdline" || return 1
+  [ "${#argv[@]}" = 2 ] && [ "${argv[0]##*/}" = catatonit ] && [ "${argv[1]}" = -P ]
+}
+
+# The marked processes that are the command's: all but that one.
+ours() {
+  local pid
+  for pid in $(marked); do
+    pause_process "$pid" || echo "$pid"
+  done
 }
 
 # The compile commands running now: marked processes that are a compiler or an
@@ -110,10 +130,10 @@ cleanup() {
   local left pid
   if [ "$interrupted" = 0 ] && [ ! -s "$caught" ]; then
     # The command ended by itself: what it started should have ended too. A
-    # moment for a process that is on its way out, then whatever still carries
-    # the mark was left running.
+    # moment for a process that is on its way out, then whatever of the
+    # command's still carries the mark was left running.
     for _ in $(seq 1 20); do
-      left="$(marked)"
+      left="$(ours)"
       [ -z "$left" ] && break
       sleep 0.1
     done
@@ -137,7 +157,7 @@ cleanup() {
     done
     kill -KILL -- "-$child" 2>/dev/null
   fi
-  stop_pids "$(marked | tr '\n' ' ')"
+  stop_pids "$(ours | tr '\n' ' ')"
 }
 
 on_signal() { interrupted=1; status="$1"; cleanup; exit "$1"; }

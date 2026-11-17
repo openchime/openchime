@@ -8,12 +8,14 @@
 #   2. two compilers at once fail the run and are named and stopped, and a
 #      compiler that starts another (cc and its cc1) does not;
 #   3. a process left running when the command ends fails the run and is
-#      named and stopped, one that took a session of its own included;
+#      named and stopped, one that took a session of its own included; the
+#      container runtime's pause process (catatonit -P) is not the command's,
+#      and is neither counted nor stopped;
 #   4. a second run waits for the first to end, and says so.
 # The stubs are `sleep` under a compiler's name (exec -a): the watch knows a
 # process by its command line, as it would a real cc.
 #
-# Needs: flock, setsid, pgrep.
+# Needs: flock, setsid, pgrep, mkfifo.
 # Run by: scripts/test/fast/source.sh (make test; make test-all).
 . "$(dirname "$0")/../lib/common.sh"
 need flock "util-linux"
@@ -65,6 +67,26 @@ if pgrep -f 'sleep 30[.]17[34]' > /dev/null; then
     no "a process left running was not stopped"
     pkill -f 'sleep 30[.]17[34]' || true
 fi
+# The container runtime's pause process, left by a run, is not the run's. The
+# stand-in is a shell under that name, waiting on a pipe nothing writes to.
+mkfifo "$tmp/pipe"
+"$run" bash -c 'setsid bash -c "echo \$\$ > \"\$2\"; exec -a catatonit bash -P <> \"\$1\"" _ "$1" "$2" & exit 0' _ "$tmp/pipe" "$tmp/pause.pid" > /dev/null 2> "$tmp/pause.err" ||
+    no "a run that left the container runtime's pause process failed: $(tr '\n' ' ' < "$tmp/pause.err")"
+pause="$(cat "$tmp/pause.pid" 2>/dev/null || true)"
+if [ -n "$pause" ] && kill -0 "$pause" 2>/dev/null; then
+    kill "$pause" 2>/dev/null || true
+else
+    no "the container runtime's pause process was stopped"
+fi
+# Only that: the same name doing anything else is the command's.
+if "$run" bash -c '(exec -a catatonit sleep 30.175) & exit 0' > /dev/null 2> "$tmp/init.err"; then
+    no "a run that left catatonit running, not as the pause process, passed"
+fi
+grep -q "sleep 30.175" "$tmp/init.err" || no "the failure does not name the catatonit left running"
+if pgrep -f 'sleep 30[.]175' > /dev/null; then
+    no "the catatonit left running was not stopped"
+    pkill -f 'sleep 30[.]175' || true
+fi
 
 # 4. One run at a time.
 : > "$tmp/order"
@@ -78,4 +100,4 @@ order="$(tr '\n' ' ' < "$tmp/order")"
 grep -q "waiting" "$tmp/second.err" || no "the second run did not say it was waiting"
 
 [ "$bad" = 0 ] || exit 1
-ok "the status comes back, two compiles at once and a process left running fail the run, one run at a time"
+ok "the status comes back, two compiles at once and a process left running fail the run, the runtime's pause process does not, one run at a time"

@@ -206,7 +206,11 @@ build is measured.
   itself, and fails the run; interrupted, it stops the command's process group
   and whatever else carries the mark. A process without the mark is never
   counted or stopped: a compile or a daemon you started yourself is not the
-  run's.
+  run's. Nor is one marked process: the container runtime's pause process
+  (`catatonit -P`), which rootless podman starts with its first command, to
+  hold the user's namespace for every podman command after it, and leaves
+  running. Started inside a run (the image tests are the first to use podman),
+  it carries the mark, and is neither counted nor stopped.
 
 `scripts/test/fast/clean_run.sh` tests the wrapper with stub commands, in both
 suites. What is not held: threads inside one process (a suite's own, a
