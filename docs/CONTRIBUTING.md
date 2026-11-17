@@ -289,7 +289,7 @@ binaries, numbered N, to apt, dnf, the container registries and the GitHub
 release (the tarballs and the Windows installer), appends a `Release N`
 snapshot to `main`, closes the issues it shipped, those of the
 documentation it carries included, removes the workflow label each one
-carries (from one closed already too; its type and `parked` stay), and sends the list of them, each as filed,
+carries, `parked` included (from one closed already too; only its type stays), and sends the list of them, each as filed,
 to the control plane for the release notes (`release-candidate.yml`,
 `release.yml`; its `finish` job sends to the
 address the `CONTROL_PLANE_URL` repository variable names). Each release-candidate, release and

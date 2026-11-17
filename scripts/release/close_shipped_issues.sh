@@ -21,9 +21,9 @@
 # there; ISSUES_REPO overrides the repository).
 #
 # A shipped issue is no longer in review or waiting for a release, so its
-# workflow label goes when it closes, and from one that is closed already; its
-# type and `parked` stay. A label that cannot be removed is a warning, and the
-# issue is closed all the same.
+# workflow label goes when it closes, and from one that is closed already,
+# `parked` included; only its type stays. A label that cannot be removed is a
+# warning, and the issue is closed all the same.
 #
 # NOTHING HERE FAILS THE RELEASE. By the time this runs the packages are live, and
 # an API hiccup must not brand a good release failed -- every path warns and exits 0.
@@ -64,8 +64,8 @@ fi
 
 oc_repo="${ISSUES_REPO:-openchime/openchime}"
 token="${GH_TOKEN:-}"
-# The workflow labels (docs/CONTRIBUTING.md); type labels and parked stay.
-workflow_labels='in-review|pending-deployment|in-progress|ready|needs-grooming'
+# The workflow labels (docs/CONTRIBUTING.md), parked among them; type labels stay.
+workflow_labels='in-review|pending-deployment|in-progress|ready|needs-grooming|parked'
 
 echo "closing issues shipped in $what ($(printf '%s\n' "$issues" | wc -l) issues)"
 while read -r num; do

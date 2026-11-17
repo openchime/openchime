@@ -5,7 +5,7 @@
 # request's squash suffix not mistaken for one, plus the issue of the
 # documentation the Release N snapshot carried; close_shipped_issues.sh would
 # close the open ones of that list, and would remove each workflow label an
-# issue of it carries, closed already or not, leaving its type and `parked`;
+# issue of it carries, closed already or not, `parked` included, leaving its type;
 # and send_notes.sh --dry-run, with the tracker replaced by a fixture, prints
 # the payload the control plane takes, its types following the labels.
 #
@@ -81,8 +81,8 @@ dry=$(run env PATH="$tmp:$PATH" "$root/scripts/release/close_shipped_issues.sh" 
 got=$(sed -n 's/^would close //p' <<<"$dry" | tr '\n' ' ')
 [ "$got" = "${p}-2 ${p}-3 " ] || fail "close_shipped_issues would close '$got', not the two open issues"
 got=$(sed -n 's/^would remove //p' <<<"$dry" | tr '\n' ',')
-[ "$got" = "in-review from ${p}-2,pending-deployment from ${p}-4," ] \
-  || fail "close_shipped_issues would remove '$got': the workflow label of each issue that carries one, and no type or parked"
+[ "$got" = "in-review from ${p}-2,parked from ${p}-4,pending-deployment from ${p}-4," ] \
+  || fail "close_shipped_issues would remove '$got': each workflow label an issue carries, parked included, and no type"
 
 payload=$(run env GH="$tmp/gh" "$root/scripts/release/send_notes.sh" 2 abc1234 --dry-run 2>/dev/null)
 shape=$(jq -c '[.release, .build_id, (.published_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$")),
