@@ -3561,11 +3561,82 @@ static void test_store_legacy_entry(void) {
 
     /* The next write of anything upgrades the entry in place, keeping the rest. */
     oc_store_save_pin(s, "acme:443", pin);
-    CHECK(mock_len_of("acme:443") > (size_t)V1_BLOB && mock_ver_of("acme:443") == 5);
+    CHECK(mock_len_of("acme:443") > (size_t)V1_BLOB && mock_ver_of("acme:443") == OC_STORE_ENTRY_VERSION);
     CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1 && tok[0] == 1);
     memset(&b, 0, sizeof b);
     oc_store_workspace_each(s, book_cb, &b);
     CHECK(b.n == 1 && strcmp(b.user[0], "dana") == 0);
+    oc_store_close(s);
+}
+
+/* A version 4 entry -- what every install holds that has not run a client since
+ * the audience was added -- is read with all it held, has no audience, and is
+ * upgraded in place by the next write, keeping the rest. Built from the layout
+ * store.c documents, as the version 1 case is, so the bytes are the old
+ * client's and not this one's. */
+static void test_store_v4_entry(void) {
+    mock_reset();
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open("ignored");
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &sec);
+
+    /* Version 4: [ver][flags][expiry][token 32][pin 32][last_used][label 128][user 128]
+     * [owner 128][device key 32][peers 16 x (user id u64, fingerprint 16)].
+     * Version 5 appends the audience, 132 bytes. */
+    enum { V4_LABEL = 128, V4_USER = 128, V4_OWNER = 128, V4_PEERS = 16, V4_PEER = 8 + OC_STORE_PEER_FP,
+           V4_AUD = 132,
+           V4_HEAD = 2 + 8 + OC_SESSION_TOKEN_LEN + OC_TLS_FINGERPRINT_LEN + 8,
+           V4_DEVKEY = V4_HEAD + V4_LABEL + V4_USER + V4_OWNER,
+           V4_PEER0 = V4_DEVKEY + OC_X25519_LEN,
+           V4_BLOB = V4_PEER0 + V4_PEERS * V4_PEER };
+    uint8_t v4[V4_BLOB];
+    memset(v4, 0, sizeof v4);
+    v4[0] = 4;
+    v4[1] = 1 | 2 | 4 | 8 | 16 | 32;                    /* token, pin, book, owner, device key, peers */
+    for (unsigned i = 0; i < OC_SESSION_TOKEN_LEN; i++) v4[10 + i] = (uint8_t)(i + 1);
+    for (unsigned i = 0; i < OC_TLS_FINGERPRINT_LEN; i++)
+        v4[10 + OC_SESSION_TOKEN_LEN + i] = (uint8_t)(0x40 + i);
+    char *lbl = (char *)(v4 + V4_HEAD);
+    snprintf(lbl, V4_LABEL, "%s", "acme.example.com");
+    snprintf(lbl + V4_LABEL, V4_USER, "%s", "dana");
+    snprintf(lbl + V4_LABEL + V4_USER, V4_OWNER, "%s", "dana");
+    uint8_t sk[OC_X25519_LEN], pk[OC_X25519_LEN];
+    for (unsigned i = 0; i < OC_X25519_LEN; i++) sk[i] = (uint8_t)(0x11 + i);
+    memcpy(v4 + V4_DEVKEY, sk, sizeof sk);
+    CHECK(oc_x25519_public(sk, pk) == 0);
+    uint8_t fp[OC_STORE_PEER_FP];
+    memset(fp, 0x5a, sizeof fp);
+    v4[V4_PEER0] = 77;                                   /* user id 77, little-endian */
+    memcpy(v4 + V4_PEER0 + 8, fp, sizeof fp);
+    CHECK(mock_put(NULL, "acme:443", v4, sizeof v4) == 1);
+
+    /* Everything it held is read... */
+    uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN], sk2[OC_X25519_LEN], pk2[OC_X25519_LEN];
+    char who[128], ws[64];
+    CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1 && tok[0] == 1 && tok[OC_SESSION_TOKEN_LEN - 1] == OC_SESSION_TOKEN_LEN);
+    CHECK(oc_store_load_pin(s, "acme:443", pin) == 1 && pin[0] == 0x40);
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 1 && strcmp(who, "dana") == 0);
+    CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1 && memcmp(sk2, sk, sizeof sk) == 0 && memcmp(pk2, pk, sizeof pk) == 0);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, fp) == 1);
+    /* ...reading wrote nothing, and it has no audience. */
+    CHECK(mock_len_of("acme:443") == (size_t)V4_BLOB && mock_ver_of("acme:443") == 4);
+    CHECK(oc_store_workspace_by_audience(s, "ws_acme000000", ws, sizeof ws) == 0);
+
+    /* The next write upgrades it in place to the current version and length... */
+    oc_store_workspace_note_audience(s, "acme:443", "ws_acme000000");
+    CHECK(mock_len_of("acme:443") == (size_t)(V4_BLOB + V4_AUD) && mock_ver_of("acme:443") == OC_STORE_ENTRY_VERSION);
+    CHECK(oc_store_workspace_by_audience(s, "ws_acme000000", ws, sizeof ws) == 1 && strcmp(ws, "acme:443") == 0);
+    /* ...keeping all the rest. */
+    CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1 && tok[0] == 1);
+    CHECK(oc_store_load_pin(s, "acme:443", pin) == 1 && pin[0] == 0x40);
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 1 && strcmp(who, "dana") == 0);
+    CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1 && memcmp(sk2, sk, sizeof sk) == 0);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, fp) == 1);
+    struct book_capture b; memset(&b, 0, sizeof b);
+    oc_store_workspace_each(s, book_cb, &b);
+    CHECK(b.n == 1 && strcmp(b.label[0], "acme.example.com") == 0 && strcmp(b.user[0], "dana") == 0);
     oc_store_close(s);
 }
 
@@ -4914,7 +4985,7 @@ static void test_device_key(void) {
     CHECK(oc_x25519_public(sk, pkc) == 0 && memcmp(pkc, pk, 32) == 0);
     CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1);
     CHECK(memcmp(sk, sk2, 32) == 0 && memcmp(pk, pk2, 32) == 0);
-    CHECK(mock_ver_of("acme:443") == 5);
+    CHECK(mock_ver_of("acme:443") == OC_STORE_ENTRY_VERSION);
 
     /* The people of private DMs (PRIVATE-DM.md §5): the first key is remembered,
      * the same is known, a different one is reported and changes nothing until
@@ -6321,6 +6392,7 @@ int run_client_core_tests(void) {
     test_workspace_audience();
     test_session_owner();
     test_store_legacy_entry();
+    test_store_v4_entry();
     test_device_key();
 
     /* The daemon opens its blob store at netloop startup; point it at a build-local
