@@ -9,11 +9,9 @@ openchimed
 # committed — the published copies live in the published package repository
 # (ARCH-20).
 dist/
-# Ignore vendored third_party contents (mbedTLS is fetched by scripts/build/*.sh)
-# — but keep the single-file libraries that have no fetch script and so must live
-# in the repo: jsmn (JSON), termbox2 + utf8proc (the TUI cell grid + Unicode
-# width, ARCH-75). (Ignore the *contents* with /* rather than the directory, so
-# re-inclusion below is possible.)
+# Ignore what is built or fetched into third_party/ (scripts/build/*.sh), and
+# keep the sources committed there (docs/VENDORS.md §1). (Ignore the *contents*
+# with /* rather than the directory, so re-inclusion below is possible.)
 /third_party/*
 !/third_party/jsmn/
 !/third_party/picohttpparser/
@@ -31,6 +29,7 @@ dist/
 !/third_party/speexdsp/
 !/third_party/opus/
 !/third_party/libvpx/
+!/third_party/mbedtls/
 *.o
 *.db
 *.db-shm

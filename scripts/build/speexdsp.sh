@@ -10,6 +10,10 @@
 # out of the microphone for voice input (ARCH-112, docs/AUDIO.md §6). The daemon
 # never links it. scripts/build/media_wasm.sh builds the same sources for the web.
 set -euo pipefail
+# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# is given a literal one on its own command line, and no -j of a calling make
+# reaches it through the environment.
+unset MAKEFLAGS MFLAGS
 NO_AUTOTOOLS="ACLOCAL=: AUTOCONF=: AUTOMAKE=: AUTOHEADER=:"
 
 TARGET="${1:-native}"
@@ -41,7 +45,7 @@ if [ ! -f "${DEST}/lib/libspeexdsp.a" ]; then
     # The tarball's generated files are older than the sources a checkout
     # writes beside them, so make would regenerate them with automake, which
     # nothing here needs or installs: the regeneration commands are no-ops.
-    make -j"$(nproc)" $NO_AUTOTOOLS >/dev/null
+    make -j1 $NO_AUTOTOOLS >/dev/null
     make install $NO_AUTOTOOLS >/dev/null
   )
 fi

@@ -80,7 +80,7 @@ THIRD-PARTY COMPONENTS
 openchimed links the components below. Each is used under the licence reproduced
 in full here, as those licences require.
 
-  Mbed TLS 3.6.2   Apache-2.0   TLS transport, TOFU certificate handling,
+  Mbed TLS 3.6.7   Apache-2.0   TLS transport, TOFU certificate handling,
                                 SHA-256, ES256 verification
   Argon2           CC0-1.0 or   password hashing (the reference
     20190702       Apache-2.0   implementation)
@@ -137,7 +137,7 @@ fi
 # the AGPL requires it to travel with the work.
 emit "openchimed -- GNU Affero General Public License v3.0 or later" "${root}/LICENSE"
 
-emit "Mbed TLS 3.6.2 -- Apache License 2.0" "${MBEDTLS_DIR}/LICENSE"
+emit "Mbed TLS 3.6.7 -- Apache License 2.0" "${MBEDTLS_DIR}/LICENSE"
 emit "Argon2 (reference implementation) -- CC0 1.0 or Apache License 2.0" "${root}/third_party/argon2/LICENSE"
 emit "utf8proc -- MIT License, with the Unicode data licence" "${root}/third_party/utf8proc/LICENSE.md"
 emit "SecLists (the common-password list) -- MIT License" "${root}/third_party/pwlist/LICENSE"

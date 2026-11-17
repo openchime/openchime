@@ -2,8 +2,8 @@
 # scripts/test/fast/suites.sh
 #
 # The fast suites, before every push: build/tests running the suites SUITES[]
-# marks FAST (tests/main.c, `build/tests --list fast`), as many at once as
-# there are CPUs. The suites marked FULL, too slow for the fast suite's
+# marks FAST (tests/main.c, `build/tests --list fast`), one after another in
+# one process. The suites marked FULL, too slow for the fast suite's
 # budget, run in the full suite with every other (scripts/test/full/suites.sh).
 # Timing verdicts are judged (tests/check.h).
 #
@@ -13,5 +13,7 @@
 have build/tests "make test builds it"
 export OC_TEST_ONLY
 OC_TEST_ONLY=$(suites fast ./build/tests)
-export OC_TEST_JOBS="${OC_TEST_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+# One after another, in one process, whatever the environment says
+# (docs/TESTING.md, "One build at a time").
+export OC_TEST_JOBS=1
 exec ./build/tests

@@ -9,6 +9,10 @@
 # The codec is the client's alone (ARCH-87, ARCH-110): the daemon never links it.
 # scripts/build/media_wasm.sh builds the same sources for the web.
 set -euo pipefail
+# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# is given a literal one on its own command line, and no -j of a calling make
+# reaches it through the environment.
+unset MAKEFLAGS MFLAGS
 
 TARGET="${1:-native}"
 # The version committed in third_party/libvpx; the build directories carry it.
@@ -45,7 +49,7 @@ if [ ! -f "${DEST}/lib/libvpx.a" ]; then
       --disable-vp8 --enable-vp9 --enable-realtime-only \
       --disable-examples --disable-tools --disable-docs --disable-unit-tests \
       --disable-shared --enable-static --enable-pic ${OC_ARCH:+--disable-runtime-cpu-detect} $([ "${OC_ARCH:-}" = aarch64 ] || echo --as=nasm) >/dev/null
-    make -j"$(nproc)" >/dev/null
+    make -j1 >/dev/null
     make install >/dev/null
   )
 fi

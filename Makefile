@@ -14,7 +14,9 @@
 # harnesses, the public demo -- is OPENCHIME_MODE when it runs (CONFIG.md).
 #
 # `make build` and `make test` build exactly one configuration, whatever was
-# asked before, and run every compile at once (-j, one job per CPU). Anything
+# asked before. Every build compiles one file at a time, whatever -j it is
+# given, and only one build runs on a machine at a time (below, and
+# docs/TESTING.md, "One build at a time"). Anything
 # else is built by its path, and takes the switches below: `make openchimed
 # TTS=1` (the daemon with read-aloud), `make build/openchime-tui` (the Linux
 # TUI), `make build/web/openchime.js` (the web client). The daemon's switches
@@ -36,7 +38,36 @@
 # mk/, one file per concern; scripts/test/fast/make_targets.sh keeps the typed
 # targets (the list above and PUBLIC/INTERNAL) in step, not this tool list.
 PUBLIC   := build test build-all test-all run clean distclean
-INTERNAL := daemon fast-build fast-test build-dir linux windows web check-release-cc FORCE build-all-plain build-all-threads build-all-packages build-all-image build-all-windows test-all-plain test-all-threads test-all-packages test-all-image test-all-windows
+INTERNAL := daemon fast-build fast-test build-dir linux windows web check-release-cc FORCE build-all-plain build-all-threads build-all-packages build-all-image build-all-windows test-all-plain test-all-threads test-all-packages test-all-image test-all-windows clean-run run-build
+
+# --- One build at a time (docs/TESTING.md, "One build at a time") --------------
+# One recipe at a time, in this make and every make it starts, whatever -j or
+# MAKEFLAGS a caller gives: a count in a variable is a count a command line
+# overrides, and this is not one. The vendored libraries' builds are their
+# scripts' to hold (scripts/build/*.sh pass a literal -j1).
+.NOTPARALLEL:
+# Emscripten compiles its own system libraries on first use, several at once
+# unless told: one, for every emcc this make and its scripts run.
+export EMCC_CORES := 1
+
+# Whatever goals were asked for are made inside ONE run of
+# scripts/test/lib/clean_run.sh: it takes the machine's build lock, fails the
+# run if two compiles ever run at once, and leaves nothing the run started
+# running. So a build by path (make openchimed TTS=1, the `make daemon` a
+# harness runs) is held to the same rules as make build and make test. A make
+# started inside a run (OC_CLEAN_RUN is the run's mark, in the environment)
+# does not start another, and a dry run (make -n) takes no lock and runs
+# nothing. `make run` builds inside the run and starts the daemon after it has
+# ended, so a daemon left serving does not hold the lock.
+OC_DRY_RUN := $(findstring n,$(firstword -$(MAKEFLAGS)))
+ifeq ($(OC_CLEAN_RUN)$(OC_DRY_RUN),)
+OC_GOALS := $(filter-out clean-run,$(or $(MAKECMDGOALS),build))
+.PHONY: $(OC_GOALS) clean-run
+$(OC_GOALS): clean-run ; @:
+clean-run:
+	+@scripts/test/lib/clean_run.sh $(MAKE) --no-print-directory $(patsubst run,run-build,$(OC_GOALS))
+	$(if $(filter run,$(OC_GOALS)),+@OC_CLEAN_RUN=ended $(MAKE) --no-print-directory run)
+else
 .PHONY: $(PUBLIC) $(INTERNAL)
 
 CC ?= cc
@@ -160,15 +191,11 @@ include mk/full.mk
 # One configuration, whatever was asked or remembered: the daemon with no
 # speech, summaries or web client, and the Windows clients; the Linux TUI is
 # the full build's. A make of its own, with the switches on its command line
-# and REMEMBER=0, so build/.features is neither read nor rewritten, and with
-# BUILD_JOBS compiles at once unless the caller already chose (-j). A fixed
-# number, not one per CPU: compiles use memory the whole time they run, and one
-# per CPU on a machine with a memory limit runs past it and is throttled, for
-# no gain, since the Windows app.c, compiled alone, is most of the time. The
-# test suites' own side-by-side count is TEST_JOBS, a different thing.
-BUILD_JOBS ?= 4
-FAST_MAKE = $(MAKE) --no-print-directory REMEMBER=0 TTS=0 STT=0 SUM=0 WEB=0 \
-            $(if $(filter -j%,$(MAKEFLAGS)),,-j$(BUILD_JOBS))
+# and REMEMBER=0, so build/.features is neither read nor rewritten. It compiles
+# one file at a time, as every build here does (.NOTPARALLEL, at the top):
+# compiles use memory the whole time they run, and several at once on a machine
+# with a memory limit run past it.
+FAST_MAKE = $(MAKE) --no-print-directory REMEMBER=0 TTS=0 STT=0 SUM=0 WEB=0
 # A switch given to them is not taken, and they say so.
 FAST_IGNORED = $(strip $(foreach v,TTS STT SUM WEB,$(if $(filter command line,$(origin $(v))),$(v))))
 build test:
@@ -204,7 +231,8 @@ LEAN_PROBE := sh -c 'cg=$$(sed -n "s/^0:://p" /proc/self/cgroup); \
 	[ "$$(cat /sys/fs/cgroup$$cg/memory.max 2>/dev/null)" = 268435456 ] && \
 	[ "$$(cat /sys/fs/cgroup$$cg/memory.swap.max 2>/dev/null)" = 0 ] && \
 	[ "$$(cat /sys/fs/cgroup$$cg/cpu.max 2>/dev/null)" = "100000 100000" ]'
-run: daemon $(TUI_BIN)
+run-build: daemon $(TUI_BIN)
+run: run-build
 	@mkdir -p /tmp/openchime-dev
 	@if [ "$(LEAN)" = 1 ] && ! $(LEAN_SCOPE) $(LEAN_PROBE) >/dev/null 2>&1; then \
 	   echo "make run LEAN=1: cannot create a systemd user scope here (no systemd, no user session, or cgroup v2 delegation of the memory and cpu controllers missing)." >&2; \
@@ -227,3 +255,5 @@ clean:
 distclean:
 	rm -f $(BIN)
 	rm -rf build
+
+endif   # the goals, inside a run of scripts/test/lib/clean_run.sh (the top of this file)

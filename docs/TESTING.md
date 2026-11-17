@@ -15,8 +15,9 @@ process (CONTRIBUTING.md):
 | **fast** | `make build`, `make test` | locally, before every push; the pre-push hook refuses a tree `make test` has not passed on | a push, and so a pull request |
 | **full** | `make build-all`, `make test-all` | in CI, once per release-candidate, on the staging tip it cuts (`release-candidate.yml`) | the `release-N-rcK` tag |
 
-**The fast suite has a budget of two minutes**, `make build` and `make test`
-from `make clean` on a developer's machine; a suite that pushes it past them
+**The fast suite takes about four minutes**, `make build` and `make test`
+from `make clean` on a developer's machine, one compile and one suite at a time
+("One build at a time", below); a suite that pushes it well past that
 moves to the full suite. **The full suite is a superset of the fast one.** No
 test runs on a pull request (`pr-policy.yml` runs policy checks: the title,
 the attribution scan, the issue references), in a release or in a promotion.
@@ -44,7 +45,7 @@ and `pr-policy` still checks it. Once merged, `promote.yml` can put it on
   release lists, closes and sends as shipped;
 - actionlint on the workflows (`scripts/test/fast/actionlint.sh`, fetched
   pinned on first use);
-- the suites `tests/main.c` marks `FAST`, side by side (§2.4), timing judged;
+- the suites `tests/main.c` marks `FAST`, one after another (§2.4), timing judged;
 - on a pass, the tree it passed on, recorded for the pre-push hook.
 
 **The full suite** (`make test-all`, `scripts/test/full/`), on what `make
@@ -138,9 +139,8 @@ harnesses in the full suite (§2.2b, "Fuzzing"). A concurrency load test
 ### Prerequisites
 
 **`make build` and `make test`** (Linux, x86-64 or arm64): a C compiler
-(`cc`), `make`, `curl` and `bzip2` (the pinned mbedTLS tarball), `nasm`
-(libvpx's assembly), `xz` (the pinned llvm-mingw for the Windows clients) and
-`python3`. The vendored libraries and the toolchain build themselves on first
+(`cc`), `make`, `nasm` (libvpx's assembly), `curl` and `xz` (the pinned
+llvm-mingw for the Windows clients) and `python3`. The vendored libraries and the toolchain build themselves on first
 use (`scripts/build/*.sh`, `mk/toolchains.mk`); no ONNX Runtime, llama.cpp or
 Emscripten is needed. actionlint is fetched once into
 `~/.cache/openchime/`. Four things are checked only where present, and a
@@ -173,6 +173,51 @@ build` builds the client. `screenrec.sh` also needs `ffmpeg`, and `voice.sh`
 a daemon built with `TTS=1 STT=1`.
 
 **TUI script** (`tools/demo/tui.sh`): `tmux` and `curl`.
+
+### One build at a time
+
+Three rules hold for every build and every test run, on every machine, CI
+included. They are enforced, not only configured: a limit kept in a setting is
+a limit something on a command line overrides, and nobody sees it until the
+build is measured.
+
+- **One build at a time.** The `Makefile` runs whatever goals were asked for
+  inside one run of `scripts/test/lib/clean_run.sh`, which first takes an
+  exclusive lock on `/tmp/openchime-build.lock`. A second run, from this
+  checkout or any other, says it is waiting and starts when the first ends.
+  That is every goal: `make build`, `make test`, the full suite's parts, and a
+  build by path (`make openchimed TTS=1`, the `make daemon` a harness under
+  `tools/` runs). A make started inside a run does not start another; a dry
+  run (`make -n`) takes no lock; `make run` builds inside the run and starts
+  the daemon after it has ended.
+- **One compile and one suite at a time.** The `Makefile` is `.NOTPARALLEL`:
+  one recipe at a time whatever `-j` or `MAKEFLAGS` it is given. Every script
+  under `scripts/build/` gives the library it builds a literal `-j1` (or
+  `--parallel 1`) and clears a calling make's flags, and Emscripten is told one
+  core (`EMCC_CORES=1`). There is no job-count variable to set. The suites run
+  one after another, in one process: both `suites.sh` set `OC_TEST_JOBS=1`.
+  `clean_run.sh` checks it while the build runs: everything the run starts
+  carries the run's mark in its environment (`OC_CLEAN_RUN`), and if two
+  compiler or assembler processes carrying it run at once, neither started by
+  the other, it names both, stops the run, and fails it. A compiler and what
+  it starts itself count as one.
+- **Nothing left running.** When the command ends, `clean_run.sh` names and
+  stops any process that still carries the run's mark, wherever it moved
+  itself, and fails the run; interrupted, it stops the command's process group
+  and whatever else carries the mark. A process without the mark is never
+  counted or stopped: a compile or a daemon you started yourself is not the
+  run's. Nor is one marked process: the container runtime's pause process
+  (`catatonit -P`), which rootless podman starts with its first command, to
+  hold the user's namespace for every podman command after it, and leaves
+  running. Started inside a run (the image tests are the first to use podman),
+  it carries the mark, and is neither counted nor stopped.
+
+`scripts/test/fast/clean_run.sh` tests the wrapper with stub commands, in both
+suites. What is not held: threads inside one process (a suite's own, a
+compiler's, a linker's); the compiles one compiler command starts itself
+(`zig cc`, on its first use for a target, compiles its own startup files
+several at once, and takes no job count); and what the manual harnesses under
+`tools/` start besides the `make` they run.
 
 ---
 
@@ -508,8 +553,8 @@ paying for unrelated suites per attempt:
   than passing empty;
 - `OC_TEST_REPEAT=20` runs the selection that many times.
 
-Unset, nothing changes. Run directly (`./build/tests`, where `OC_TEST_JOBS`
-defaults to 1) or with `OC_TEST_JOBS=1` (§2.4), a repeated suite runs **in one process**, so a suite that
+Unset, nothing changes. The suites run **in one process** (§2.4), a repeated
+suite with the rest, so a suite that
 leaves a fixture switched must put it back or the second round fails somewhere
 that has nothing to do with the cause: a suite that swaps the loop's call relay
 socket, as `itest_netloop`'s routed-call test does, must hand it back, or the next
@@ -755,17 +800,21 @@ failure, so the output is captured first (`grep -q … <<<"$out"`, or a file).
 ### 2.4 Which suites run where
 
 Each suite's row in `SUITES[]` (`tests/main.c`) says where it runs (§2.1).
-The fast suite runs the suites marked `FAST` side by side: as many at once as
-there are CPUs, each in a process of its own (`OC_TEST_JOBS`, `tests/main.c`),
-its output printed whole when it ends. It ends by printing each suite's time,
-slowest first. The suites are nearly all waiting -- on timers, sockets,
-real-time audio and video -- so the run takes about as long as the slowest
-suite it runs. The suites marked `FULL` (the network loop, the client core,
-the database writer and media, chosen by those times) run in the full suite
-only; a suite that pushes the fast suite past its budget (§1) is marked
-`FULL`. `OC_TEST_JOBS=1` runs the suites one after another in one process.
+The fast suite runs the suites marked `FAST` one after another, in one process
+(`scripts/test/fast/suites.sh` sets `OC_TEST_JOBS=1`; "One build at a time",
+§1). It ends by printing each suite's time, slowest first; the run takes the
+sum of them, about a minute for the fast list. The suites marked `FULL` (the
+network loop, the client core, the database writer and media, chosen by those
+times) run in the full suite only; a suite that pushes the fast suite well
+past its time (§1) is marked `FULL`. `tests/main.c` can still run suites side
+by side, each in a process of its own (`OC_TEST_JOBS=N`), for a person hunting
+something by hand; neither suite does.
 
-Side by side, suites must not share anything outside their process: each
+In one process, a suite puts back whatever it changes there -- the
+environment, a test knob, a signal handler -- because the next suite inherits
+it: a suite that clears the settings it loaded, the mode the run was given
+among them, fails a check in a later suite that has nothing to do with it.
+And suites must not share anything outside the process: each
 suite's files are in its own `oc_test_mkdtemp` directory, and a suite that
 listens takes its port from the kernel — it binds port 0 and reads the port
 back (`getsockname`; for the in-process daemon, `oc_netloop_run_ex` on port 0
@@ -781,7 +830,7 @@ Passwords a test sets on the pages must pass the policy (AUTH.md §2): fifteen
 characters or more, not common, not built on the username.
 
 The full suite runs every suite once: the suites that start no thread
-plainly, side by side as the fast suite does (`PART=plain`), and then, on the
+plainly, one after another as the fast suite does (`PART=plain`), and then, on the
 same machine, the suites marked `THREADS` under ThreadSanitizer
 (`PART=threads`):
 

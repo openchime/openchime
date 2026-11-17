@@ -20,7 +20,7 @@ BINARY="${3:?missing path to the built openchimed}"
 OUTDIR="${4:-dist}"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MBEDTLS_DIR="${MBEDTLS_DIR:-${root}/third_party/mbedtls-3.6.2}"
+MBEDTLS_DIR="${MBEDTLS_DIR:-${root}/third_party/mbedtls-3.6.7}"
 
 [ -x "$BINARY" ] || { echo "build-deb.sh: $BINARY is not an executable" >&2; exit 1; }
 case "$ARCH" in amd64|arm64) ;; *) echo "build-deb.sh: unsupported arch $ARCH" >&2; exit 1 ;; esac

@@ -50,9 +50,11 @@ jobs:
   test:
     name: full suite
     runs-on: ubuntu-24.04
-    # A warm run takes about 35 minutes; a cold cache builds the vendored
-    # libraries and ONNX Runtime first, about 70.
-    timeout-minutes: 80
+    # With both of the runner's CPUs compiling, a warm run took about 35
+    # minutes and a cold cache, which builds the vendored libraries and ONNX
+    # Runtime first, about 70. One file at a time, on one CPU, is allowed twice
+    # that.
+    timeout-minutes: 160
     outputs:
       build_id: ${{ steps.id.outputs.build_id }}
       run_number: ${{ steps.id.outputs.run_number }}
@@ -145,18 +147,16 @@ jobs:
           fi
 
       # --- The tools and the caches, once for both parts ---------------------
-      # Every CPU the runner has, for every make below and the makes they
-      # start (the Makefile is safe under -j; locally nothing changes).
-      - name: Use every CPU for make
-        run: echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
+      # No MAKEFLAGS: every build compiles one file at a time here as anywhere
+      # (docs/TESTING.md, "One build at a time"), so the timeouts below are twice
+      # what they were when the runner's two CPUs both compiled.
       - name: Install build deps
         timeout-minutes: 20
         run: |
           # scripts/build/apt.sh: the mirror rewritten, each apt-get bounded
           # and retried, so a stall fails the step instead of holding the job.
-          # bzip2 for the vendored mbedTLS tarball that `make` builds via
-          # scripts/build/mbedtls.sh; nasm for libvpx's assembly
-          # (scripts/build/libvpx.sh); xz-utils for the toolchain tarballs. gdb
+          # nasm for libvpx's assembly (scripts/build/libvpx.sh); xz-utils for
+          # the toolchain tarballs. gdb
           # so that a test binary that crashes prints every thread's stack
           # (tests/main.c). cmake, curl, git and python3 are on the image.
           # libclang-rt-18-dev for libFuzzer and the sanitizer runtimes of the
@@ -212,8 +212,8 @@ jobs:
         name: Restore mbedTLS
         uses: actions/cache/restore@v6
         with:
-          path: &mbedtls-path third_party/mbedtls-3.6.2
-          key: &mbedtls-key mbedtls-3.6.2-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh') }}
+          path: &mbedtls-path third_party/mbedtls-3.6.7
+          key: &mbedtls-key mbedtls-3.6.7-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh') }}
       - id: c-libvpx
         name: Restore libvpx
         uses: actions/cache/restore@v6
@@ -243,7 +243,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: &wasm-mbedtls-path build/wasm/mbedtls
-          key: &wasm-mbedtls-key wasm-mbedtls-3.6.2-emsdk6.0.13-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/mbedtls.sh') }}
+          key: &wasm-mbedtls-key wasm-mbedtls-3.6.7-emsdk6.0.13-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/mbedtls.sh') }}
       - id: c-wasm-sdl3
         name: Restore SDL3 for wasm
         uses: actions/cache/restore@v6
@@ -284,7 +284,7 @@ jobs:
       # Built under the release's build id, so the web client built here is the
       # one stage packages (WEB_PREBUILT, mk/web.mk): it is built once.
       - name: make build-all PART=plain
-        timeout-minutes: 60
+        timeout-minutes: 120
         env:
           OC_BUILD_ID: ${{ steps.id.outputs.build_id }}
         run: make build-all PART=plain
@@ -370,7 +370,7 @@ jobs:
           path: *wasm-speexdsp-path
           key: *wasm-speexdsp-key
       - name: make test-all PART=plain
-        timeout-minutes: 45
+        timeout-minutes: 90
         env:
           CHROME: /usr/bin/google-chrome
         run: make test-all PART=plain
@@ -384,8 +384,8 @@ jobs:
       # between our threads fails it (tests/tsan.supp). The test binary needs
       # no Emscripten, and links the vendored libraries the plain part built.
       - name: make build-all PART=threads
-        timeout-minutes: 20
+        timeout-minutes: 40
         run: make build-all PART=threads
       - name: make test-all PART=threads
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: make test-all PART=threads

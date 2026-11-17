@@ -9,10 +9,16 @@
 # nothing to wasm, so it builds the generic C paths with wasm SIMD left to the
 # compiler. Threads are kept: the encoder's row threads run as Web Workers.
 set -euo pipefail
+# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# is given a literal one on its own command line, and no -j of a calling make
+# reaches it through the environment.
+unset MAKEFLAGS MFLAGS
+# Emscripten compiles its own system libraries on first use, several at once
+# unless told: one.
+export EMCC_CORES=1
 cd "$(dirname "$0")/../.."
 command -v emcc >/dev/null || { echo "build_media_wasm: emcc not on PATH (make fetches it: mk/toolchains.mk)" >&2; exit 1; }
 mkdir -p build/wasm
-J="$(nproc)"
 # opus and speexdsp ship generated autotools files older than the sources a
 # checkout writes beside them, so make would regenerate them with automake,
 # which nothing here needs or installs: the regeneration commands are no-ops,
@@ -27,7 +33,7 @@ if [ ! -f "$OUT/lib/libopus.a" ]; then
     emconfigure "$OLDPWD/third_party/opus/configure" --host=wasm32-unknown-emscripten \
       --prefix="$(cd .. && pwd)" --disable-shared --enable-static --disable-doc --disable-extra-programs \
       --disable-intrinsics --disable-rtcd --disable-stack-protector CFLAGS="-O2 -pthread" >/dev/null
-    emmake make -j"$J" $NO_AUTOTOOLS >/dev/null && emmake make install $NO_AUTOTOOLS >/dev/null )
+    emmake make -j1 $NO_AUTOTOOLS >/dev/null && emmake make install $NO_AUTOTOOLS >/dev/null )
 fi
 
 OUT=build/wasm/speexdsp
@@ -38,7 +44,7 @@ if [ ! -f "$OUT/lib/libspeexdsp.a" ]; then
     emconfigure "$OLDPWD/third_party/speexdsp/configure" --host=wasm32-unknown-emscripten \
       --prefix="$(cd .. && pwd)" --disable-shared --enable-static --disable-examples \
       --disable-sse --disable-neon CFLAGS="-O2 -pthread" >/dev/null
-    emmake make -j"$J" $NO_AUTOTOOLS >/dev/null && emmake make install $NO_AUTOTOOLS >/dev/null )
+    emmake make -j1 $NO_AUTOTOOLS >/dev/null && emmake make install $NO_AUTOTOOLS >/dev/null )
 fi
 
 OUT=build/wasm/libvpx
@@ -53,6 +59,6 @@ if [ ! -f "$OUT/lib/libvpx.a" ]; then
       --disable-examples --disable-tools --disable-docs --disable-unit-tests \
       --disable-shared --enable-static --enable-pic \
       --extra-cflags="-O2 -pthread" >/dev/null
-    emmake make -j"$J" >/dev/null && emmake make install >/dev/null )
+    emmake make -j1 >/dev/null && emmake make install >/dev/null )
 fi
 echo "build_media_wasm: built build/wasm/{opus,speexdsp,libvpx}"

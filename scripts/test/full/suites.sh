@@ -2,8 +2,8 @@
 # scripts/test/full/suites.sh
 #
 # The full suite's plain pass (`build/tests --list plain`): every suite whose
-# code starts no thread, the slow ones included, and media, as many at once as
-# there are CPUs, with every timing verdict judged (tests/check.h). The suites
+# code starts no thread, the slow ones included, and media, one after another
+# in one process, with every timing verdict judged (tests/check.h). The suites
 # that start threads run once, under ThreadSanitizer (full/tsan.sh), which does
 # not judge speed and skips timer tests (TIMER_ONLY, tests/check.h). The suites
 # marked WALK in SUITES[] (tests/main.c) -- the network loop, the client core,
@@ -17,5 +17,7 @@
 have build/tests "make build-all PART=plain builds it"
 export OC_TEST_ONLY
 OC_TEST_ONLY=$(suites plain ./build/tests)
-export OC_TEST_JOBS="${OC_TEST_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+# One after another, in one process, whatever the environment says
+# (docs/TESTING.md, "One build at a time").
+export OC_TEST_JOBS=1
 exec ./build/tests

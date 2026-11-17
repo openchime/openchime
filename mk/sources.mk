@@ -48,10 +48,11 @@ $(1)/gen/%.o: $(GEN_DIR)/%.c $(3) | $(4)
 	$(5)$$($(2)) -MMD -MP -c $$< -o $$@
 endef
 
-# Vendored, pinned mbedTLS (scripts/build/mbedtls.sh) -- one version across local
+# Vendored mbedTLS, committed in third_party/mbedtls and built by
+# scripts/build/mbedtls.sh into the directory below -- one version across local
 # builds, CI, the release, and the container image. Link order matters for static
 # archives: tls -> x509 -> crypto.
-MBEDTLS_DIR  := third_party/mbedtls-3.6.2$(ARCH_SUFFIX)
+MBEDTLS_DIR  := third_party/mbedtls-3.6.7$(ARCH_SUFFIX)
 MBEDTLS_INC  := $(MBEDTLS_DIR)/include
 MBEDTLS_A    := $(MBEDTLS_DIR)/library/libmbedtls.a
 MBEDTLS_LIBS := $(MBEDTLS_DIR)/library/libmbedtls.a \
