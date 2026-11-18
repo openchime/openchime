@@ -67,10 +67,30 @@ volume for each, with its value as a percentage. The conversation's messages and
 are in a panel on the right, open by default and folded away with **Hide conversation**; a
 message sent there goes to the conversation. The controls are one bar: **Mute** (with the
 microphone's level on it, and a tooltip saying "You are currently muted" or "You are
-currently not muted", and Ctrl+Shift+M), **Share screen**, **Invite**, **Settings** and
-**Leave**; **End for everyone**, for the starter alone, sits apart at the far end and asks
-for confirmation before it ends the call. **Settings** opens a panel holding the
-**microphone** and **speaker** pickers, the microphone's level and **Noise suppression**.
+currently not muted", and Ctrl+Shift+M), **Camera**, **Share screen**, **Invite**,
+**Settings** and **Leave**; **End for everyone**, for the starter alone, sits apart at the
+far end and asks for confirmation before it ends the call. Where the bar is short, Camera,
+then Share, then Invite and Settings show their icons alone, and End for everyone says
+"End"; each keeps its full name for a screen reader. **Settings** opens a panel holding the
+**microphone**, **speaker** and **camera** pickers, the microphone's level and **Noise
+suppression**.
+
+**Cameras** (REQ-160, §7). **Camera** turns yours on and off; while it is on the button is
+filled and says **Stop camera**. Your own card shows it at once, mirrored as a mirror shows
+a face, and the others see it once the roster marks it on. A card with its camera on shows
+the picture, filling the card and cropped to it, with the name and the volume on a band
+across its foot, the speaking ring round the card and the mute mark in its corner; with it
+off, the card is the face it always was. A camera the system blocks, that is missing, or
+that another app holds is said in the words the video recorder uses ("Windows is blocking
+camera access for OpenChime.", "No camera was found.", "The camera is in use by another
+app."), on the bar's hint line and as a notice, and the camera stays off. **Speaker view**,
+beside Hide conversation, shows whoever is speaking large, staying until someone else
+speaks, and everyone else in a strip of tiles under them; **Grid view** goes back; the
+choice is remembered with the preferences. Under a shared screen the strip is tiles too,
+each a camera or a face. The view takes only the cameras it draws — every card in the grid,
+the large one and the strip's tiles otherwise, none while another view is on screen — and
+tells the relay when that changes (`CALL_VIDEO_SUB`, §7.4). The controls are `call.camera`, `call.camera.picker` and
+`call.layout` to a screen reader and the harness, as every call control is.
 Above the bar is the push-to-talk hint, whatever route the audio takes. Before joining the
 view shows who is in the call and **Join** (and **Decline** for an invitation).
 
@@ -93,8 +113,9 @@ what is shared. §6 is the design.
 (push to talk) — voice input's chord; in a call the call owns the microphone, so the two
 never compete. **Ctrl+Shift+S** shares your screen, or stops sharing it.
 
-**Devices and noise suppression** are remembered with the other preferences: the devices
-by a hash of their ids, so another machine, which has other ids, uses its own defaults.
+**Devices, noise suppression and the layout** are remembered with the other preferences:
+the microphone, the speaker and the camera by a hash of their ids, so another machine,
+which has other ids, uses its own defaults.
 
 **Invitation toasts** carry **Join** and **Decline**, and the call sound.
 
@@ -530,7 +551,8 @@ PROTOCOL.md §5.17 has the frames:
   picture, which would contain itself. Someone else starting to share stops yours
   and says so.
 - **Watching**: the share takes the call view's stage, fitted, under "Alice is
-  sharing their screen", with the people as a row of faces beneath it.
+  sharing their screen", with the people as a row of tiles beneath it — each their
+  camera, or their face (§2).
   **Full screen** covers the window (Esc returns); **Actual size** shows it one
   pixel to one pixel, scrolled with the wheel (Shift for across).
 - **Elsewhere**: the in-call strip says "Alice is sharing", the Calls section's
@@ -574,8 +596,8 @@ cross into `client/core` and are encoded there, so the wire is the same everywhe
 Each person in a call may turn their camera on, and the others see it, each on their own
 tile (REQ-160, ARCH-86). A camera is the share's transport (§6.5) on its own packet type
 and stream, with its own rate bounds, its own encoder settings, a ladder of sizes and
-frame rates, a subscription the relay honours, and lip sync. The call view's tiles,
-layouts and camera controls are the frontend's; this section is what they stand on.
+frame rates, a subscription the relay honours, and lip sync. The call view's cards,
+layouts and camera controls (§2) stand on it.
 
 ### 7.1 What is sent
 
@@ -692,6 +714,10 @@ less as views take fewer: a speaker layout of the speaker and a strip of four ta
 - `tests/itest_netloop.c`: `CALL_CAMERA` marking the roster in the same epoch, and a
   leave, a disconnect and a rejoin clearing it; someone outside the call refused;
   `CALL_VIDEO_SUB` only from a participant, and the relay honouring it.
+- `tools/gui/camera.sh`: two clients, Win32 or web — the camera button and picker,
+  each card showing the other's camera with rising frame numbers and your own mirrored,
+  the grid and the speaker layout, the subscription following the cards drawn, a camera
+  turned off back to a face, and a camera the system refuses said as such (TESTING.md).
 - `tests/test_client_core.c`: through the real daemon and relay with a tap — two people
   turn their synthetic cameras on and each decodes the other's rising frame numbers; the
   tap sees only SFrame behind the camera's stream tag; one shares a screen with the

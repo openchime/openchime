@@ -4891,6 +4891,9 @@ enum { CC_MUTE = 2100, CC_LEAVE, CC_END, CC_JOIN, CC_DECLINE, CC_INVITE, CC_NS,
        CC_MIC0 = 2200, CC_SPK0 = 2220, CC_CONV0 = 2240, CC_VOLDN0 = 2300, CC_VOLUP0 = 2340,
        CC_ROW0 = 2380, CC_PICK0 = 2420,
        CC_SHARE = 2500, CC_SHARE_STOP, CC_SHARE_FULL, CC_SHARE_ACTUAL, CC_SRC0 = 2520,
+       /* Cameras (REQ-160): the button, its picker, the grid or the speaker, and
+        * the cameras the picker lists. */
+       CC_CAMERA = 2544, CC_CAMMENU, CC_LAYOUT, CC_CAM0 = 2484,
        CC_LAST = 2549 };
 #define CC_MAX_DEV   16
 #define CC_MAX_CONV  40
@@ -4958,6 +4961,32 @@ static uint32_t g_share_seq, g_share_fno;
 static oc_frame g_share_frame;
 static uint8_t *g_share_px;
 static size_t   g_share_pxcap;
+
+/* Cameras in the call (REQ-160, CALLS.md §7): this device's, and the picture of
+ * each person's. A picture is drawn where the person's card is -- or, in the
+ * speaker layout and under a share, their large card or their tile in the strip
+ * -- and the view takes only the cameras it draws (call_cam_subscribe). */
+typedef struct { uint64_t uid; gfx_tex *tex; int tw, th; uint32_t seq; oc_frame f; int fno, mirror; } cam_pic_t;
+static cam_pic_t g_cam_pics[OC_MAX_CALL_PARTICIPANTS];
+static uint8_t *g_cam_px;
+static size_t   g_cam_pxcap;
+static int      g_cam_on;                /* this device's camera: turned on and not stopped */
+static uint32_t g_cam_h;                 /* the chosen camera, by a hash of its id (prefs j:) */
+static int      g_call_layout;           /* 0 the grid, 1 the speaker large (prefs l:) */
+static uint64_t g_call_speaker;          /* who the speaker layout shows large */
+/* What this frame drew, for the subscription and the test dump: each person's
+ * card or tile, whether it showed their camera, and whether it was the large one. */
+static struct { uint64_t uid; rectf r; int cam, big, fno; } g_cam_drawn[OC_MAX_CALL_PARTICIPANTS];
+static int      g_n_cam_drawn;
+static oc_capture_device g_cams[CC_MAX_DEV];   /* the cameras the picker lists */
+static int      g_ncams;
+static int      g_cam_err;               /* why the camera last stopped, an OC_CAP_*, 0 none */
+static uint64_t g_cam_err_until;         /* say so until then */
+/* Whose cameras the view last asked for, in which call: sent again only when
+ * what it draws changes. */
+static uint64_t g_cam_sub_call;
+static int      g_cam_sub_all = 1, g_cam_sub_n;
+static uint64_t g_cam_sub[OC_MAX_CALL_PARTICIPANTS];
 static uint64_t g_share_seen;            /* the sharer last told about */
 static rectf    g_share_stage;
 static oc_win   g_sharebar, g_shareborder;
@@ -4982,6 +5011,7 @@ static void call_rects_reset(void) {
     g_call_mute_btn = rf(0, 0, 0, 0);
     g_call_banner_on = 0;
     g_share_stage = rf(0, 0, 0, 0);
+    g_n_cam_drawn = 0;
 }
 
 static int call_btn_add(rectf r, int cmd, const char *aid, const char *name) {
@@ -5065,6 +5095,125 @@ static void draw_share_stage(gfx *rt, rectf box) {
     gfx_clip_push(rt, gr(box));
     gfx_tex_draw(rt, g_share_tex, gr(rf(x, y, x + dw, y + dh)), 0.0f, 1.0f);
     gfx_clip_pop(rt);
+}
+
+/* The ring round someone speaking: not the green of the presence dot, which on
+ * a face that is also online read as nothing changing. */
+#define CALL_SPEAKING OC_COL_ACCENT
+
+/* ---- cameras: each person's picture -------------------------------------------------- */
+
+static void cam_pic_drop(cam_pic_t *p) {
+    if (p->tex) gfx_tex_destroy(p->tex);
+    oc_frame_free(&p->f);
+    memset(p, 0, sizeof *p);
+}
+
+static int g_cam_pics_held;               /* a picture of someone has been kept */
+
+static void cam_pics_clear(void) {
+    for (int i = 0; i < (int)OC_MAX_CALL_PARTICIPANTS; i++) cam_pic_drop(&g_cam_pics[i]);
+    g_cam_pics_held = 0;
+}
+
+/* The newest picture of `uid`'s camera, uploaded when it changed; NULL when
+ * there is none. This device's own is its preview, mirrored, as a mirror shows
+ * a face: the engine hands it over as captured, which is what the others see. */
+static cam_pic_t *cam_pic(uint64_t uid, int mirror) {
+    if (!g_gfx || !g_call_engine || !uid) return NULL;
+    cam_pic_t *p = NULL, *free_slot = NULL;
+    for (int i = 0; i < (int)OC_MAX_CALL_PARTICIPANTS && !p; i++) {
+        if (g_cam_pics[i].uid == uid) p = &g_cam_pics[i];
+        else if (!g_cam_pics[i].uid && !free_slot) free_slot = &g_cam_pics[i];
+    }
+    if (!p) { if (!free_slot) return NULL; p = free_slot; p->uid = uid; g_cam_pics_held = 1; }
+    int r = oc_call_engine_camera_frame(g_call_engine, uid, &p->f, &p->seq);
+    if (r < 0) { uint32_t seq = p->seq; cam_pic_drop(p); p->uid = uid; p->seq = seq; return NULL; }
+    if (r > 0) {
+        int w = p->f.width, h = p->f.height;
+        size_t want = (size_t)w * (size_t)h * 4u;
+        if (g_cam_pxcap < want) {
+            uint8_t *nb = realloc(g_cam_px, want);
+            if (!nb) return p->tex ? p : NULL;
+            g_cam_px = nb; g_cam_pxcap = want;
+        }
+        oc_i420_to_bgra(&p->f, g_cam_px, w * 4);
+        if (mirror)
+            for (int y = 0; y < h; y++) {
+                uint32_t *row = (uint32_t *)(g_cam_px + (size_t)y * (size_t)w * 4u);
+                for (int a = 0, b = w - 1; a < b; a++, b--) { uint32_t t = row[a]; row[a] = row[b]; row[b] = t; }
+            }
+        if (p->tex) gfx_tex_destroy(p->tex);
+        p->tex = gfx_tex_create_text(g_gfx, g_cam_px, w * 4, w, h);
+        p->tw = p->tex ? w : 0; p->th = p->tex ? h : 0;
+        p->fno = oc_capture_synthetic_frame_number(&p->f);
+        p->mirror = mirror;
+    }
+    return p->tex ? p : NULL;
+}
+
+/* Whether `uid`'s camera is on in the call this client is in: the roster says
+ * so of the others, and this device knows its own. */
+static int cam_is_on(const oc_model *m, uint64_t uid) {
+    if (uid == m->user_id) return g_cam_on;
+    for (int i = 0; i < m->call.n_parts; i++) if (m->call.parts[i] == uid) return m->call.camera[i];
+    return 0;
+}
+
+/* The picture of `uid`, cover-fitted and cropped to `box` with its corners
+ * rounded; 1 if there was one to draw. Noted as drawn either way, so the view
+ * takes the cameras of the people it shows. */
+static int draw_cam(gfx *rt, const oc_model *m, uint64_t uid, rectf box, int big) {
+    int me = uid == m->user_id;
+    cam_pic_t *p = call_here(m) && cam_is_on(m, uid) ? cam_pic(uid, me) : NULL;
+    if (g_n_cam_drawn < (int)OC_MAX_CALL_PARTICIPANTS) {
+        g_cam_drawn[g_n_cam_drawn].uid = uid;
+        g_cam_drawn[g_n_cam_drawn].r = box;
+        g_cam_drawn[g_n_cam_drawn].cam = p != NULL;
+        g_cam_drawn[g_n_cam_drawn].big = big;
+        g_cam_drawn[g_n_cam_drawn].fno = p ? p->fno : -1;
+        g_n_cam_drawn++;
+    }
+    if (!p) return 0;
+    float bw = box.right - box.left, bh = box.bottom - box.top;
+    float sc = bw / (float)p->tw;
+    if (bh / (float)p->th > sc) sc = bh / (float)p->th;      /* cover: the overflow is cropped */
+    float dw = (float)p->tw * sc, dh = (float)p->th * sc;
+    rectf map = rf(box.left + (bw - dw) / 2, box.top + (bh - dh) / 2, box.left + (bw + dw) / 2, box.top + (bh + dh) / 2);
+    gfx_tex_draw_shaped(rt, p->tex, gr(box), OC_R_CONTROL, gr(map), 1.0f);
+    return 1;
+}
+
+/* A person in the strip -- under a share, or beside the speaker -- in a tile of
+ * their own: their camera when it is on, their face when it is not, their name,
+ * and the ring while they speak. */
+static void draw_call_tile(gfx *rt, const oc_model *m, const oc_call_stats *st, uint64_t uid, rectf t) {
+    const oc_call_peer_stats *ps = NULL;
+    for (int k = 0; k < st->n_peers; k++) if (st->peers[k].user_id == uid) ps = &st->peers[k];
+    int me = uid == m->user_id;
+    const char *nm = oc_model_user_name(m, uid);
+    fill_round(rt, t, OC_R_CONTROL, OC_COL_BASE);
+    stroke_round(rt, t, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+    int cam = draw_cam(rt, m, uid, t, 0);
+    if (!cam) {
+        float av = (t.bottom - t.top) * 0.5f;
+        rectf avr = rf((t.left + t.right - av) / 2, t.top + UIS(8), (t.left + t.right + av) / 2, t.top + UIS(8) + av);
+        draw_user_avatar(rt, m, uid, (nm && nm[0]) ? nm : "?", avr, g_ui_b);
+    }
+    char name[80];
+    snprintf(name, sizeof name, "%s%s", (nm && nm[0]) ? nm : "someone", me ? " (you)" : "");
+    rectf band = rf(t.left, t.bottom - UIS(22), t.right, t.bottom);
+    if (cam) fill_round_a(rt, band, OC_R_CONTROL, 0x000000, 0.45f);
+    g_meta->align = ST_ALIGN_CENTER;
+    draw_text(rt, name, g_meta, rf(band.left + 4, band.top, band.right - 4, band.bottom), cam ? 0xFFFFFF : OC_COL_TEXT);
+    g_meta->align = ST_ALIGN_LEFT;
+    if (me ? st->speaking : ps && ps->speaking)
+        stroke_round(rt, rf(t.left - 2, t.top - 2, t.right + 2, t.bottom + 2), OC_R_CONTROL + 2, CALL_SPEAKING, 2.5f);
+    if (me ? st->muted && !st->ptt : ps && ps->muted) {
+        rectf mb = rf(t.right - UIS(20), t.top + UIS(4), t.right - UIS(4), t.top + UIS(20));
+        fill_round(rt, mb, UIS(8), OC_COL_DANGER);
+        draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 2, mb.top + 2, mb.right - 2, mb.bottom - 2), 0xFFFFFF);
+    }
 }
 
 static uint64_t wall_ms(void) { return (uint64_t)time(NULL) * 1000u; }
@@ -22451,9 +22600,6 @@ static float call_chat_left(float W) {
     return W - pw;
 }
 
-/* The ring round someone speaking: not the green of the presence dot, which on
- * a face that is also online read as nothing changing. */
-#define CALL_SPEAKING OC_COL_ACCENT
 
 /* Under a conversation's header while it has a call: who is in it and for how
  * long, with Join (Open once you are in it), and Decline when you were asked.
@@ -22487,6 +22633,103 @@ static float draw_call_banner(gfx *rt, const oc_model *m, float x0, float w, flo
                       invited ? "Decline" : NULL, CC_BANNER_DECLINE, "call.banner.decline");
 }
 
+/* One person's card in the call view: their camera when it is on (REQ-160),
+ * otherwise their face; their name, the ring while they speak, the mark when
+ * they are muted, and -- for someone else, in the call -- their volume. `i` is
+ * their place in the roster; `big` says it is the speaker layout's large one. */
+static void draw_call_card(gfx *rt, const oc_model *m, const oc_call_stats *st, uint64_t uid, int i,
+                           rectf card, int in, int back, int big) {
+    float cardh = card.bottom - card.top;
+    fill_round(rt, card, OC_R_CONTROL, OC_COL_BASE);
+    stroke_round(rt, card, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+    const oc_call_peer_stats *ps = NULL;
+    for (int k = 0; k < st->n_peers; k++) if (st->peers[k].user_id == uid) ps = &st->peers[k];
+    int me = uid == m->user_id;
+    int speaking = me ? st->speaking : ps && ps->speaking;
+    int muted = me ? st->muted && !st->ptt : ps && ps->muted;
+    const char *nm = oc_model_user_name(m, uid);
+    char name[80];
+    snprintf(name, sizeof name, "%s%s", (nm && nm[0]) ? nm : "someone", me ? " (you)" : "");
+    if (draw_cam(rt, m, uid, card, big)) {
+        /* The picture fills the card; the name and the volume sit on a band
+         * across its foot, the ring goes round the card, the mute mark in its
+         * corner. */
+        float band_h = in && !me && g_call_engine ? UIS(56) : UIS(32);
+        fill_round_a(rt, rf(card.left, card.bottom - band_h, card.right, card.bottom), OC_R_CONTROL, 0x000000, 0.45f);
+        g_ui->align = ST_ALIGN_CENTER;
+        draw_text(rt, name, g_ui, rf(card.left + 8, card.bottom - band_h + 4, card.right - 8, card.bottom - band_h + UIS(26)),
+                  0xFFFFFF);
+        g_ui->align = ST_ALIGN_LEFT;
+        if (speaking) stroke_round(rt, rf(card.left - 3, card.top - 3, card.right + 3, card.bottom + 3),
+                                   OC_R_CONTROL + 3, CALL_SPEAKING, 3.0f);
+        if (muted) {
+            rectf mb = rf(card.right - UIS(28), card.top + UIS(8), card.right - UIS(8), card.top + UIS(28));
+            fill_round(rt, mb, UIS(10), OC_COL_DANGER);
+            draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 3, mb.top + 3, mb.right - 3, mb.bottom - 3), 0xFFFFFF);
+        }
+    } else {
+        /* The face grows with the card, keeping room under it for the name and
+         * the volume. */
+        float av = (cardh - UIS(70)) * 0.8f;
+        if (av < UIS(60.0f)) av = UIS(60.0f);
+        if (av > UIS(160.0f)) av = UIS(160.0f);
+        float ax = (card.left + card.right - av) / 2, ay = card.top + (cardh - av - UIS(58)) / 2;
+        if (ay < card.top + UIS(12)) ay = card.top + UIS(12);
+        rectf avr = rf(ax, ay, ax + av, ay + av);
+        draw_user_avatar(rt, m, uid, (nm && nm[0]) ? nm : "?", avr, g_ui_b);
+        if (speaking) stroke_round(rt, rf(avr.left - 4, avr.top - 4, avr.right + 4, avr.bottom + 4),
+                                   avatar_corner(avr) + 4, CALL_SPEAKING, 3.0f);
+        if (muted) {
+            rectf mb = rf(avr.right - UIS(14), avr.bottom - UIS(14), avr.right + UIS(6), avr.bottom + UIS(6));
+            fill_round(rt, mb, UIS(10), OC_COL_DANGER);
+            draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 3, mb.top + 3, mb.right - 3, mb.bottom - 3), 0xFFFFFF);
+        }
+        g_ui->align = ST_ALIGN_CENTER;
+        draw_text(rt, name, g_ui, rf(card.left + 8, ay + av + 6, card.right - 8, ay + av + UIS(28)), OC_COL_TEXT);
+        g_ui->align = ST_ALIGN_LEFT;
+    }
+    /* Their connection went; their seat is held for a few seconds while they
+     * get back in (PROTOCOL.md §5.17). */
+    int away = in && i < m->call.n_parts && m->call.away[i];
+    if (back || away) fill_round_a(rt, card, OC_R_CONTROL, OC_COL_BASE, 0.6f);   /* not heard while out */
+    if (away) {
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, "Reconnecting…", g_meta,
+                  rf(card.left + 8, card.bottom - UIS(28), card.right - 8, card.bottom - UIS(8)), OC_COL_MUTED);
+        g_meta->align = ST_ALIGN_LEFT;
+        return;   /* no volume for someone not here */
+    }
+    /* Their volume, for this listener: - bar + (REQ-150). */
+    if (in && !me && g_call_engine && i < 40) {
+        float gain = oc_call_engine_volume(g_call_engine, uid);
+        float by = card.bottom - UIS(26);
+        /* The value as well as the bar: 100% is as they sent it. */
+        char pct[16];
+        snprintf(pct, sizeof pct, "%d%%", (int)(gain * 100 + 0.5f));
+        float pw = text_width("200%", g_meta) + UIS(6);
+        rectf dn = rf(card.left + 10, by, card.left + 30, by + UIS(20));
+        rectf up = rf(card.right - 30 - pw, by, card.right - 10 - pw, by + UIS(20));
+        rectf bar = rf(dn.right + 6, by + UIS(8), up.left - 6, by + UIS(12));
+        fill_round(rt, bar, 2, OC_COL_INPUT);
+        fill_round(rt, rf(bar.left, bar.top, bar.left + (bar.right - bar.left) * gain / 2.0f, bar.bottom), 2,
+                   gain == 0 ? OC_COL_DANGER : OC_COL_ACCENT);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, "−", g_meta, dn, OC_COL_MUTED);
+        draw_text(rt, "+", g_meta, up, OC_COL_MUTED);
+        g_meta->align = ST_ALIGN_RIGHT;
+        draw_text(rt, pct, g_meta, rf(up.right, by, card.right - 10, by + UIS(20)), OC_COL_MUTED);
+        g_meta->align = ST_ALIGN_LEFT;
+        char aid[40], an[96];
+        snprintf(aid, sizeof aid, "call.volume.%llu.down", (unsigned long long)uid);
+        snprintf(an, sizeof an, "Quieter: %s, %d%%", (nm && nm[0]) ? nm : "someone", (int)(gain * 100 + 0.5f));
+        call_btn_add(dn, CC_VOLDN0 + i, aid, an);
+        snprintf(aid, sizeof aid, "call.volume.%llu.up", (unsigned long long)uid);
+        snprintf(an, sizeof an, "Louder: %s, %d%%", (nm && nm[0]) ? nm : "someone", (int)(gain * 100 + 0.5f));
+        call_btn_add(up, CC_VOLUP0 + i, aid, an);
+    }
+}
+
+static const char *cam_error_text(int err);   /* fwd: cameras, with the call actions */
 static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     /* The buttons are the frame's (call_rects_reset): the sidebar's Calls rows
      * drawn before this keep theirs. */
@@ -22519,6 +22762,15 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
         rectf cb = rf(reg.right - 24 - cw, reg.top + (hh - UIS(32)) / 2, reg.right - 24, reg.top + (hh + UIS(32)) / 2);
         call_button(rt, cb, OC_ICON_MESSAGE, cl, !g_call_chat_hidden, 0);
         call_btn_add(cb, CC_CHAT, "call.chat", cl);
+        /* The grid, or the speaker large (REQ-160): one click between them. */
+        if (call_here(m) && m->call.channel_id == g_call_view_ch) {
+            const char *ll = g_call_layout ? "Grid view" : "Speaker view";
+            float lw = call_button_w(ll, -1);
+            rectf lb = rf(cb.left - 10 - lw, cb.top, cb.left - 10, cb.bottom);
+            call_button(rt, lb, -1, ll, 0, 0);
+            call_btn_add(lb, CC_LAYOUT, "call.layout", g_call_layout ? "Layout: speaker. Switch to the grid"
+                                                                      : "Layout: grid. Switch to the speaker");
+        }
     }
 
     /* A refusal, said in words rather than as a code, for a few seconds from
@@ -22581,37 +22833,43 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
         call_btn_add(fb, CC_SHARE_FULL, "call.share.fullscreen", "Full screen");
         call_button(rt, ab, -1, al, g_share_actual, 0);
         call_btn_add(ab, CC_SHARE_ACTUAL, "call.share.actualsize", al);
-        float strip = UIS(52);
+        float tile_h = UIS(96), tile_w = tile_h * 4 / 3, strip = tile_h + UIS(10);
         rectf stage = rf(body.left + 24, ty + th + 8, body.right - 24, body.bottom - UIS(176) - strip);
         if (stage.bottom > stage.top + UIS(60)) draw_share_stage(rt, stage);
-        /* Who is in it, under the picture: a face and a name each, with the
-         * speaking ring, so a viewer still sees who is talking. */
-        float av = UIS(32), ax = body.left + 24, ay = stage.bottom + 10;
+        /* Who is in it, under the picture: a tile each -- their camera when it is
+         * on, their face when it is not -- with their name and the speaking ring,
+         * so a viewer still sees who is talking (REQ-160, REQ-161). */
+        float ax = body.left + 24, ay = stage.bottom + 10;
         for (int i = 0; i < np; i++) {
-            uint64_t uid = people[i];
-            const oc_call_peer_stats *ps = NULL;
-            for (int k = 0; k < st.n_peers; k++) if (st.peers[k].user_id == uid) ps = &st.peers[k];
-            int me = uid == m->user_id;
-            const char *nm = oc_model_user_name(m, uid);
-            char name[80];
-            snprintf(name, sizeof name, "%s%s", (nm && nm[0]) ? nm : "someone", me ? " (you)" : "");
-            float nw = text_width(name, g_meta);
-            if (nw > UIS(140)) nw = UIS(140);
-            if (ax + av + UIS(8) + nw > body.right - 24) break;
-            rectf avr = rf(ax, ay, ax + av, ay + av);
-            draw_user_avatar(rt, m, uid, (nm && nm[0]) ? nm : "?", avr, g_ui_b);
-            if (me ? st.speaking : ps && ps->speaking)
-                stroke_round(rt, rf(avr.left - 3, avr.top - 3, avr.right + 3, avr.bottom + 3),
-                             avatar_corner(avr) + 3, CALL_SPEAKING, 2.5f);
-            if (me ? st.muted && !st.ptt : ps && ps->muted) {
-                rectf mb = rf(avr.right - UIS(12), avr.bottom - UIS(12), avr.right + UIS(4), avr.bottom + UIS(4));
-                fill_round(rt, mb, UIS(8), OC_COL_DANGER);
-                draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 2, mb.top + 2, mb.right - 2, mb.bottom - 2), 0xFFFFFF);
-            }
-            draw_text(rt, name, g_meta, rf(avr.right + UIS(8), ay, avr.right + UIS(8) + nw, ay + av), OC_COL_TEXT);
-            ax = avr.right + UIS(8) + nw + UIS(18);
+            if (ax + tile_w > body.right - 24) break;
+            draw_call_tile(rt, m, &st, people[i], rf(ax, ay, ax + tile_w, ay + tile_h));
+            ax += tile_w + UIS(10);
         }
         np = 0;                                  /* no cards */
+    }
+
+    /* The speaker layout (REQ-160): whoever is speaking large, the rest in a
+     * strip under them -- as the stage is under a share. The one shown large
+     * stays until someone else speaks. */
+    if (in && g_call_layout == 1 && np >= 2) {
+        int have = 0;
+        for (int i = 0; i < np; i++) if (people[i] == g_call_speaker && people[i] != m->user_id) have = 1;
+        for (int k = 0; k < st.n_peers; k++)
+            if (st.peers[k].speaking) { g_call_speaker = st.peers[k].user_id; have = 1; break; }
+        if (!have) for (int i = 0; i < np && !have; i++) if (people[i] != m->user_id) { g_call_speaker = people[i]; have = 1; }
+        float th = UIS(96), tw = th * 4 / 3, bottom = body.bottom - UIS(176);
+        rectf big = rf(body.left + 24, gy, body.right - 24, bottom - th - UIS(12));
+        int bi = 0;
+        for (int i = 0; i < np; i++) if (people[i] == g_call_speaker) bi = i;
+        if (big.bottom > big.top + UIS(80)) draw_call_card(rt, m, &st, people[bi], bi, big, in, back, 1);
+        float tx = body.left + 24, ty = bottom - th;
+        for (int i = 0; i < np; i++) {
+            if (i == bi) continue;
+            if (tx + tw > body.right - 24) break;
+            draw_call_tile(rt, m, &st, people[i], rf(tx, ty, tx + tw, ty + th));
+            tx += tw + UIS(10);
+        }
+        np = 0;                                  /* no grid */
     }
 
     /* The people: a card each, with a ring while they speak and a mark when
@@ -22641,78 +22899,9 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
         if (used_h < stage_h) gy += (stage_h - used_h) / 2;
     }
     for (int i = 0; i < np; i++) {
-        uint64_t uid = people[i];
         float cx = gx + (float)(i % cols) * (cardw + gap), cy = gy + (float)(i / cols) * (cardh + gap);
         if (cy + cardh > body.bottom - UIS(176) + 1) break;
-        rectf card = rf(cx, cy, cx + cardw, cy + cardh);
-        fill_round(rt, card, OC_R_CONTROL, OC_COL_BASE);
-        stroke_round(rt, card, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-        const oc_call_peer_stats *ps = NULL;
-        for (int k = 0; k < st.n_peers; k++) if (st.peers[k].user_id == uid) ps = &st.peers[k];
-        int me = uid == m->user_id;
-        int speaking = me ? st.speaking : ps && ps->speaking;
-        int muted = me ? st.muted && !st.ptt : ps && ps->muted;
-        /* The face grows with the card, keeping room under it for the name and
-         * the volume. */
-        float av = (cardh - UIS(70)) * 0.8f;
-        if (av < UIS(60.0f)) av = UIS(60.0f);
-        if (av > UIS(160.0f)) av = UIS(160.0f);
-        float ax = (card.left + card.right - av) / 2, ay = card.top + (cardh - av - UIS(58)) / 2;
-        if (ay < card.top + UIS(12)) ay = card.top + UIS(12);
-        rectf avr = rf(ax, ay, ax + av, ay + av);
-        const char *nm = oc_model_user_name(m, uid);
-        draw_user_avatar(rt, m, uid, (nm && nm[0]) ? nm : "?", avr, g_ui_b);
-        if (speaking) stroke_round(rt, rf(avr.left - 4, avr.top - 4, avr.right + 4, avr.bottom + 4),
-                                   avatar_corner(avr) + 4, CALL_SPEAKING, 3.0f);
-        if (muted) {
-            rectf mb = rf(avr.right - UIS(14), avr.bottom - UIS(14), avr.right + UIS(6), avr.bottom + UIS(6));
-            fill_round(rt, mb, UIS(10), OC_COL_DANGER);
-            draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 3, mb.top + 3, mb.right - 3, mb.bottom - 3), 0xFFFFFF);
-        }
-        char name[80];
-        snprintf(name, sizeof name, "%s%s", (nm && nm[0]) ? nm : "someone", me ? " (you)" : "");
-        g_ui->align = ST_ALIGN_CENTER;
-        draw_text(rt, name, g_ui, rf(card.left + 8, ay + av + 6, card.right - 8, ay + av + UIS(28)), OC_COL_TEXT);
-        g_ui->align = ST_ALIGN_LEFT;
-        /* Their connection went; their seat is held for a few seconds while
-         * they get back in (PROTOCOL.md §5.17). */
-        int away = in && i < m->call.n_parts && m->call.away[i];
-        if (back || away) fill_round_a(rt, card, OC_R_CONTROL, OC_COL_BASE, 0.6f);   /* not heard while out */
-        if (away) {
-            g_meta->align = ST_ALIGN_CENTER;
-            draw_text(rt, "Reconnecting\u2026", g_meta,
-                      rf(card.left + 8, card.bottom - UIS(28), card.right - 8, card.bottom - UIS(8)), OC_COL_MUTED);
-            g_meta->align = ST_ALIGN_LEFT;
-            continue;   /* no volume for someone not here */
-        }
-        /* Their volume, for this listener: - bar + (REQ-150). */
-        if (in && !me && g_call_engine && i < 40) {
-            float gain = oc_call_engine_volume(g_call_engine, uid);
-            float by = card.bottom - UIS(26);
-            /* The value as well as the bar: 100% is as they sent it. */
-            char pct[16];
-            snprintf(pct, sizeof pct, "%d%%", (int)(gain * 100 + 0.5f));
-            float pw = text_width("200%", g_meta) + UIS(6);
-            rectf dn = rf(card.left + 10, by, card.left + 30, by + UIS(20));
-            rectf up = rf(card.right - 30 - pw, by, card.right - 10 - pw, by + UIS(20));
-            rectf bar = rf(dn.right + 6, by + UIS(8), up.left - 6, by + UIS(12));
-            fill_round(rt, bar, 2, OC_COL_INPUT);
-            fill_round(rt, rf(bar.left, bar.top, bar.left + (bar.right - bar.left) * gain / 2.0f, bar.bottom), 2,
-                       gain == 0 ? OC_COL_DANGER : OC_COL_ACCENT);
-            g_meta->align = ST_ALIGN_CENTER;
-            draw_text(rt, "\u2212", g_meta, dn, OC_COL_MUTED);
-            draw_text(rt, "+", g_meta, up, OC_COL_MUTED);
-            g_meta->align = ST_ALIGN_RIGHT;
-            draw_text(rt, pct, g_meta, rf(up.right, by, card.right - 10, by + UIS(20)), OC_COL_MUTED);
-            g_meta->align = ST_ALIGN_LEFT;
-            char aid[40], an[96];
-            snprintf(aid, sizeof aid, "call.volume.%llu.down", (unsigned long long)uid);
-            snprintf(an, sizeof an, "Quieter: %s, %d%%", (nm && nm[0]) ? nm : "someone", (int)(gain * 100 + 0.5f));
-            call_btn_add(dn, CC_VOLDN0 + i, aid, an);
-            snprintf(aid, sizeof aid, "call.volume.%llu.up", (unsigned long long)uid);
-            snprintf(an, sizeof an, "Louder: %s, %d%%", (nm && nm[0]) ? nm : "someone", (int)(gain * 100 + 0.5f));
-            call_btn_add(up, CC_VOLUP0 + i, aid, an);
-        }
+        draw_call_card(rt, m, &st, people[i], i, rf(cx, cy, cx + cardw, cy + cardh), in, back, 0);
     }
     /* Who has been asked and has not come. */
     const oc_call_view *iv = in ? &m->call : v;
@@ -22784,26 +22973,43 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     call_btn_add(b, CC_MUTE, "call.mute", muted ? "Microphone: muted" : "Microphone: on");
     g_call_mute_btn = b;
     x = b.right + 10;
+    /* What follows Mute, shortened from the left to fit before End for
+     * everyone rather than running under it: the camera's label first, then
+     * Share's, then Invite's and Settings' -- each keeps its icon and its name
+     * for a screen reader. Leave always says what it does. */
+    float icon_w = UIS(46);
+    float leave_w = call_button_w("Leave", OC_ICON_PHONE_OFF);
+    float inv_w = call_button_w("Invite", OC_ICON_USER_PLUS), set_w = call_button_w("Settings", OC_ICON_SETTINGS);
+    int short_tail = x + icon_w + 10 + icon_w + 10 + inv_w + 10 + set_w + 10 + leave_w > rx;
+    if (short_tail) inv_w = set_w = icon_w;
+    float tail = inv_w + 10 + set_w + 10 + leave_w + 10;
+    {   /* The camera (REQ-160): on and off, filled while it is on. */
+        const char *cl = g_cam_on ? "Stop camera" : "Camera";
+        float w = call_button_w(cl, OC_ICON_VIDEO);
+        if (x + w + 10 + icon_w + 10 + tail > rx) { cl = ""; w = icon_w; }
+        b = rf(x, by, x + w, by + bh);
+        call_button(rt, b, OC_ICON_VIDEO, cl, g_cam_on, 0);
+        call_btn_add(b, CC_CAMERA, "call.camera", g_cam_on ? "Camera: on" : "Camera: off");
+        x = b.right + 10;
+    }
     {
-        /* Share, shortened to fit what is left rather than running under the rest. */
-        float right = rx - call_button_w("Invite", OC_ICON_USER_PLUS) - call_button_w("Settings", OC_ICON_SETTINGS)
-                    - call_button_w("Leave", OC_ICON_PHONE_OFF) - 30;
+        float right = rx - tail;
         const char *shl = g_share_on ? "Stop sharing" : "Share screen";
         const char *name = shl;
         if (x + call_button_w(shl, OC_ICON_SCREEN_SHARE) > right) shl = g_share_on ? "Stop" : "Share";
         float w = call_button_w(shl, OC_ICON_SCREEN_SHARE);
-        if (x + w > right) { shl = ""; w = UIS(46); }
+        if (x + w > right) { shl = ""; w = icon_w; }
         b = rf(x, by, x + w, by + bh);
         call_button(rt, b, g_share_on ? OC_ICON_SCREEN_SHARE_OFF : OC_ICON_SCREEN_SHARE, shl, g_share_on, 0);
         call_btn_add(b, g_share_on ? CC_SHARE_STOP : CC_SHARE, g_share_on ? "call.share.stop" : "call.share", name);
         x = b.right + 10;
     }
-    b = rf(x, by, x + call_button_w("Invite", OC_ICON_USER_PLUS), by + bh);
-    call_button(rt, b, OC_ICON_USER_PLUS, "Invite", 0, 0);
+    b = rf(x, by, x + inv_w, by + bh);
+    call_button(rt, b, OC_ICON_USER_PLUS, short_tail ? "" : "Invite", 0, 0);
     call_btn_add(b, CC_INVITE, "call.invite", "Invite");
     x = b.right + 10;
-    b = rf(x, by, x + call_button_w("Settings", OC_ICON_SETTINGS), by + bh);
-    call_button(rt, b, OC_ICON_SETTINGS, "Settings", g_call_settings, 0);
+    b = rf(x, by, x + set_w, by + bh);
+    call_button(rt, b, OC_ICON_SETTINGS, short_tail ? "" : "Settings", g_call_settings, 0);
     call_btn_add(b, CC_SETTINGS, "call.settings", g_call_settings ? "Settings: open" : "Settings");
     rectf setb = b;
     x = b.right + 10;
@@ -22811,7 +23017,10 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     call_button(rt, b, OC_ICON_PHONE_OFF, "Leave", 0, 1);
     call_btn_add(b, CC_LEAVE, "call.leave", "Leave");
     if (endb.right > endb.left) {
-        call_button(rt, endb, -1, "End for everyone", 0, 2);
+        /* Still short: End says only that, keeping a gap from Leave. */
+        const char *el = "End for everyone";
+        if (b.right + UIS(16) > endb.left) { el = "End"; endb.left = endb.right - call_button_w(el, -1); }
+        call_button(rt, endb, -1, el, 0, 2);
         call_btn_add(endb, CC_END, "call.end", "End for everyone");
     }
 
@@ -22824,7 +23033,10 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
         snprintf(spk, sizeof spk, "%s", "Default speaker");
         for (int i = 0; i < g_call_nspks; i++) if (oc_hash32(g_call_spks[i].id) == g_call_spk_h) snprintf(spk, sizeof spk, "%s", g_call_spks[i].name);
         const char *nsl = g_call_ns ? "Noise suppression: on" : "Noise suppression: off";
-        float pw = UIS(360), ph = bh * 3 + UIS(10) * 2 + UIS(52);
+        char cam[160];
+        snprintf(cam, sizeof cam, "%s", g_ncams ? g_cams[0].name : "No camera");
+        for (int i = 0; i < g_ncams; i++) if (oc_hash32(g_cams[i].id) == g_cam_h) snprintf(cam, sizeof cam, "%s", g_cams[i].name);
+        float pw = UIS(360), ph = bh * 4 + UIS(10) * 3 + UIS(52);
         float px = setb.left;
         if (px + pw > body.right - 24) px = body.right - 24 - pw;
         if (px < body.left + 24) px = body.left + 24;
@@ -22850,6 +23062,11 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
         snprintf(mn, sizeof mn, "Speaker: %s", spk);
         call_btn_add(b, CC_SPKMENU, "call.speaker", mn);
         yy += bh + UIS(10);
+        b = rf(panel.left + UIS(14), yy, panel.left + UIS(14) + w, yy + bh);
+        call_button(rt, b, OC_ICON_VIDEO, cam, 0, 0);
+        snprintf(mn, sizeof mn, "Camera: %s", cam);
+        call_btn_add(b, CC_CAMMENU, "call.camera.picker", mn);
+        yy += bh + UIS(10);
         b = rf(panel.left + UIS(14), yy, panel.left + UIS(14) + call_button_w(nsl, -1), yy + bh);
         call_button(rt, b, -1, nsl, g_call_ns, 0);
         call_btn_add(b, CC_NS, "call.noise", nsl);
@@ -22860,11 +23077,13 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     const char *hint = st.mic_error ? "The microphone could not be opened: you can listen, but not be heard."
                      : st.speaker_error ? "The speaker could not be opened."
                      : now_ms() < g_share_err_until ? "Sharing stopped: what was shared went away, or Windows refused it."
+                     : now_ms() < g_cam_err_until ? cam_error_text(g_cam_err)
                      : muted ? "Muted. Hold Ctrl+Shift+Space to talk; Ctrl+Shift+M to unmute."
                      : "Ctrl+Shift+M mutes. Hold Ctrl+Shift+Space to talk while muted.";
     if (!g_call_settings)
         draw_text(rt, hint, g_meta, rf(body.left + 24, row1 + bh - UIS(26), body.right - 24, row1 + bh - 4),
-                  st.mic_error || st.speaker_error || st.share_error ? OC_COL_DANGER : OC_COL_FAINT);
+                  st.mic_error || st.speaker_error || st.share_error || now_ms() < g_cam_err_until
+                  ? OC_COL_DANGER : OC_COL_FAINT);
 }
 
 /* The member picker (REQ-301/302): who a start asks when the conversation has
@@ -35879,6 +36098,9 @@ static void prefs_save(void) {
         at = strlen(enc);
         snprintf(enc + at, sizeof enc - at, ";z:%d;o:%u;p:%u;e:%d", g_call_ns, g_call_mic_h, g_call_spk_h,
                  g_pref_toastpos);
+        /* ...and the camera, by its id's hash too, and the grid or the speaker. */
+        at = strlen(enc);
+        snprintf(enc + at, sizeof enc - at, ";j:%u;l:%d", g_cam_h, g_call_layout);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
     oc_client_set_setting(g_client, EMOTICONS_SETTING_KEY, g_pref_emoticons ? "on" : "off");
@@ -35926,6 +36148,8 @@ static void prefs_load(const oc_model *m) {
             else if (k == 'e') g_pref_toastpos = (val < 0 || val > 2) ? TOASTPOS_BOTTOM_CENTRE : val;
             else if (k == 'o') g_call_mic_h = (uint32_t)strtoul(p + 2, NULL, 10);
             else if (k == 'p') g_call_spk_h = (uint32_t)strtoul(p + 2, NULL, 10);
+            else if (k == 'j') g_cam_h = (uint32_t)strtoul(p + 2, NULL, 10);
+            else if (k == 'l') g_call_layout = val ? 1 : 0;
             else if (k == 'q') {
                 size_t n2 = 0;
                 for (const char *q = p + 2; *q && *q != ';' && n2 + 1 < sizeof g_quick_names; q++)
@@ -36123,6 +36347,106 @@ static void call_devices_refresh(void) {
     if (g_call_nmics < 0) g_call_nmics = 0;
     g_call_nspks = oc_audio_list(0, g_call_spks, CC_MAX_DEV);
     if (g_call_nspks < 0) g_call_nspks = 0;
+    g_ncams = oc_capture_list(g_cams, CC_MAX_DEV);
+    if (g_ncams < 0) g_ncams = 0;
+}
+
+/* The camera a remembered hash names, if this machine has it; else the default. */
+static const char *cam_dev_id(void) {
+    for (int i = 0; g_cam_h && i < g_ncams; i++) if (oc_hash32(g_cams[i].id) == g_cam_h) return g_cams[i].id;
+    return NULL;
+}
+
+/* Why the camera could not be used, as the video recorder says it (REQ-166). */
+static const char *cam_error_text(int err) {
+    static char why[160];
+    switch (err) {
+    case OC_CAP_DENIED:
+        snprintf(why, sizeof why, "%s is blocking camera access for OpenChime.", oc_plat_privacy_name()); return why;
+    case OC_CAP_NODEVICE: return "No camera was found.";
+    case OC_CAP_BUSY:     return "The camera is in use by another app.";
+    default:              return "The camera could not be opened.";
+    }
+}
+
+/* Turn this device's camera on or off in the call (REQ-160): the engine opens
+ * it -- its picture is the preview at once -- and the daemon is told, whose
+ * roster marking it on is when it goes out. */
+static void cam_set(int on) {
+    const oc_model *m = model();
+    if (!call_here(m) || !g_call_engine || on == g_cam_on) return;
+    if (on) {
+        call_devices_refresh();
+        int w, h, fps;
+        oc_plat_camera_limits(&w, &h, &fps);
+        if (oc_call_engine_camera_start(g_call_engine, cam_dev_id(), w, h, fps) != 0) {
+            fb_failed("The camera could not start.");
+            return;
+        }
+        g_cam_on = 1;
+        g_cam_err = 0;
+        g_cam_err_until = 0;
+        oc_client_call_camera(g_client, m->call.channel_id, 1);
+        oc_a11y_announce("Camera on");
+    } else {
+        oc_call_engine_camera_stop(g_call_engine);
+        g_cam_on = 0;
+        oc_client_call_camera(g_client, m->call.channel_id, 0);
+        oc_a11y_announce("Camera off");
+    }
+}
+
+/* Once a tick: the camera stopping by itself -- refused, unplugged, or the call
+ * gone or rejoined, which turns it off -- and whose cameras to take: those of
+ * the people the view drew last, sent when that changes (REQ-160). */
+static void cam_tick(void) {
+    const oc_model *m = model();
+    int in = call_here(m);
+    if (g_cam_on) {
+        oc_call_stats st;
+        memset(&st, 0, sizeof st);
+        if (g_call_engine) oc_call_engine_stats(g_call_engine, &st);
+        if (!in || st.camera_state == 0) {
+            g_cam_on = 0;
+            if (in) oc_client_call_camera(g_client, m->call.channel_id, 0);
+            if (in && st.camera_error) {
+                g_cam_err = st.camera_error;
+                g_cam_err_until = now_ms() + 8000;
+                fb_failed(cam_error_text(st.camera_error));
+            }
+        }
+    }
+    if (!in) { g_cam_sub_call = 0; return; }
+    /* A new call starts at every camera, in the daemon and the engine alike. */
+    if (g_cam_sub_call != m->call.call_id) { g_cam_sub_call = m->call.call_id; g_cam_sub_all = 1; g_cam_sub_n = 0; }
+    uint64_t want[OC_MAX_CALL_PARTICIPANTS];
+    int n = 0;
+    for (int i = 0; i < g_n_cam_drawn && n < (int)OC_MAX_CALL_PARTICIPANTS; i++) {
+        uint64_t u = g_cam_drawn[i].uid;
+        int dup = u == m->user_id;
+        for (int k = 0; k < n && !dup; k++) if (want[k] == u) dup = 1;
+        if (!dup) want[n++] = u;
+    }
+    /* Everyone else drawn is every camera there is. */
+    int all = n == m->call.n_parts - 1 && n > 0;
+    for (int i = 0; all && i < m->call.n_parts; i++) {
+        uint64_t u = m->call.parts[i];
+        int found = u == m->user_id;
+        for (int k = 0; k < n && !found; k++) if (want[k] == u) found = 1;
+        if (!found) all = 0;
+    }
+    int same = all ? g_cam_sub_all : !g_cam_sub_all && n == g_cam_sub_n;
+    for (int k = 0; same && !all && k < n; k++) {
+        int found = 0;
+        for (int j = 0; j < g_cam_sub_n && !found; j++) if (g_cam_sub[j] == want[k]) found = 1;
+        if (!found) same = 0;
+    }
+    if (same) return;
+    g_cam_sub_all = all;
+    g_cam_sub_n = all ? 0 : n;
+    if (!all) memcpy(g_cam_sub, want, (size_t)n * sizeof want[0]);
+    if (g_call_engine) oc_call_engine_camera_subscribe(g_call_engine, all, want, all ? 0 : n);
+    oc_client_call_video_sub(g_client, m->call.channel_id, all, want, all ? 0 : n);
 }
 
 /* The device a remembered hash names, if this machine has it; else the default. */
@@ -36399,6 +36723,9 @@ static void call_tick(oc_win *hwnd) {
         }
     }
     if (m) share_tick(hwnd);
+    if (m) cam_tick();
+    /* Out of the call, no picture of anyone is kept. */
+    if (!call_here(m) && g_cam_pics_held) cam_pics_clear();
 }
 
 static void call_open_device_menu(oc_win *hwnd, int speakers) {
@@ -36420,6 +36747,31 @@ static void call_open_device_menu(oc_win *hwnd, int speakers) {
     rectf field = rf(0, 0, 0, 0);
     for (int i = 0; i < g_n_call_btns; i++)
         if (g_call_btns[i].cmd == (speakers ? CC_SPKMENU : CC_MICMENU)) field = g_call_btns[i].r;
+    g_menu = MENU_SECTION; g_menu_headerblock = 0; g_menu_hover = -1;
+    g_menu_w = UIS(300);
+    float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
+    g_menu_x = field.left;
+    g_menu_y = field.top - 4 - h;             /* the controls sit at the bottom: open upward */
+    if (g_menu_y < 8) g_menu_y = 8;
+    invalidate();
+}
+
+/* The camera picker (REQ-160): the cameras there are, the chosen one ticked. */
+static void call_open_camera_menu(void) {
+    call_devices_refresh();
+    g_n_mi = 0;
+    mi_section("CAMERA");
+    char lbl[300];
+    int any = 0;
+    for (int i = 0; i < g_ncams; i++) if (oc_hash32(g_cams[i].id) == g_cam_h) any = 1;
+    if (!g_ncams) mi_item(-1, "No camera was found");
+    for (int i = 0; i < g_ncams && i < CC_MAX_DEV; i++) {
+        int on = any ? oc_hash32(g_cams[i].id) == g_cam_h : i == 0;
+        snprintf(lbl, sizeof lbl, "%s%s", on ? "\xE2\x9C\x93 " : "    ", g_cams[i].name);
+        mi_item(CC_CAM0 + i, lbl);
+    }
+    rectf field = rf(0, 0, 0, 0);
+    for (int i = 0; i < g_n_call_btns; i++) if (g_call_btns[i].cmd == CC_CAMMENU) field = g_call_btns[i].r;
     g_menu = MENU_SECTION; g_menu_headerblock = 0; g_menu_hover = -1;
     g_menu_w = UIS(300);
     float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
@@ -36702,10 +37054,27 @@ static void call_cmd(oc_win *hwnd, int cmd) {
         g_share_actual = !g_share_actual;
         g_share_sx = g_share_sy = 0;
         break;
+    case CC_CAMERA:
+        cam_set(!g_cam_on);
+        break;
+    case CC_CAMMENU: call_open_camera_menu(); return;
+    case CC_LAYOUT:
+        g_call_layout = !g_call_layout;
+        oc_a11y_announce(g_call_layout ? "Speaker view" : "Grid view");
+        call_prefs_changed();
+        break;
     default:
         if (cmd >= CC_SRC0 && cmd < CC_SRC0 + CC_MAX_SRC) {
             int i = cmd - CC_SRC0;
             if (in && !g_share_on && i < g_share_nsrcs) share_begin(hwnd, g_share_srcs[i].id, g_share_srcs[i].name);
+            break;
+        }
+        if (cmd >= CC_CAM0 && cmd < CC_CAM0 + CC_MAX_DEV) {
+            /* Another camera: remembered, and the one in use now if it is on. */
+            int i = cmd - CC_CAM0;
+            if (i < g_ncams) g_cam_h = oc_hash32(g_cams[i].id);
+            if (g_cam_on) { cam_set(0); cam_set(1); }
+            call_prefs_changed();
             break;
         }
         if (cmd >= CC_MIC0 && cmd < CC_MIC0 + CC_MAX_DEV) {
@@ -38567,6 +38936,32 @@ static void test_dump(const char *path) {
                     g_share_stage.left, g_share_stage.top, g_share_stage.right, g_share_stage.bottom,
                     g_sharebar.sdl != NULL, g_sharebar_excluded, g_shareborder.sdl != NULL && win_visible(&g_shareborder));
         }
+        /* Cameras (REQ-160): this device's, the layout, whose cameras the view
+         * takes, each card or tile the call view drew -- whether it showed a
+         * camera, and the synthetic camera's frame number read from it -- and
+         * each other person's camera as the engine receives it. */
+        {
+            char subs[OC_MAX_CALL_PARTICIPANTS * 21 + 1] = "";
+            for (int i = 0; i < g_cam_sub_n; i++) {
+                size_t at = strlen(subs);
+                snprintf(subs + at, sizeof subs - at, "%s%llu", i ? "," : "", (unsigned long long)g_cam_sub[i]);
+            }
+            fprintf(f, "camera on=%d state=%d err=%d shown_err=%d w=%d h=%d fps=%d kbps=%d step=%d frames=%u"
+                       " cams=%d chosen=%u layout=%s speaker=%llu sub_all=%d subs=%s drawn=%d\n",
+                    g_cam_on, cs.camera_state, cs.camera_error, now_ms() < g_cam_err_until ? g_cam_err : 0,
+                    cs.camera_width, cs.camera_height, cs.camera_fps, cs.camera_kbps, cs.camera_step,
+                    cs.camera_frames, g_ncams, g_cam_h, g_call_layout ? "speaker" : "grid",
+                    (unsigned long long)g_call_speaker, g_cam_sub_all, subs[0] ? subs : "-", g_n_cam_drawn);
+            for (int i = 0; i < g_n_cam_drawn; i++)
+                fprintf(f, "camera.tile uid=%llu cam=%d big=%d fno=%d rect=%.0f,%.0f,%.0f,%.0f\n",
+                        (unsigned long long)g_cam_drawn[i].uid, g_cam_drawn[i].cam, g_cam_drawn[i].big,
+                        g_cam_drawn[i].fno, g_cam_drawn[i].r.left, g_cam_drawn[i].r.top,
+                        g_cam_drawn[i].r.right, g_cam_drawn[i].r.bottom);
+            for (int i = 0; i < cs.n_peers; i++)
+                fprintf(f, "camera.peer uid=%llu on=%d subscribed=%d frames=%u dropped=%u w=%d h=%d\n",
+                        (unsigned long long)cs.peers[i].user_id, cs.peers[i].camera_on, cs.peers[i].camera_subscribed,
+                        cs.peers[i].cam_frames, cs.peers[i].cam_dropped, cs.peers[i].cam_width, cs.peers[i].cam_height);
+        }
         /* Missed calls, as the transcripts hold them (REQ-304). */
         {
             size_t ne = 0;
@@ -40063,7 +40458,8 @@ static void test_poll(oc_win *hwnd) {
          *   call banner-join | banner-decline | settings | chat | callback | row-join <i>
          *   call mute | unmute | ptt-down | ptt-up | ns on|off
          *   call invite <uid> [uid...] | volume <uid> <percent> | pick-go
-         *   call share <device id or name> | share pick | share stop | share full | share actual */
+         *   call share <device id or name> | share pick | share stop | share full | share actual
+         *   call camera on | off | pick | <device id or name> | layout grid | speaker */
         char sc[32] = "", rest[256] = "";
         sscanf(arg, "%31s %255[^\n]", sc, rest);
         const oc_model *cm = model();
@@ -40117,6 +40513,26 @@ static void test_poll(oc_win *hwnd) {
                     if (!strcmp(g_share_srcs[i].id, rest) || !strcmp(g_share_srcs[i].name, rest)) k = i;
                 ok = k >= 0 && !g_share_on && share_begin(hwnd, g_share_srcs[k].id, g_share_srcs[k].name);
             }
+        }
+        else if (!strcmp(sc, "camera")) {
+            /* The button, the picker, or a camera by id or name from it. */
+            if (!strcmp(rest, "on") || !strcmp(rest, "off")) {
+                ok = call_here(cm);
+                if (ok && g_cam_on != !strcmp(rest, "on")) call_cmd(hwnd, CC_CAMERA);
+            } else if (!strcmp(rest, "pick")) {
+                ok = call_here(cm);
+                call_cmd(hwnd, CC_CAMMENU);
+            } else {
+                call_devices_refresh();
+                int k = -1;
+                for (int i = 0; i < g_ncams; i++) if (!strcmp(g_cams[i].id, rest) || !strcmp(g_cams[i].name, rest)) k = i;
+                ok = k >= 0;
+                if (ok) call_cmd(hwnd, CC_CAM0 + k);
+            }
+        }
+        else if (!strcmp(sc, "layout")) {
+            ok = !strcmp(rest, "grid") || !strcmp(rest, "speaker");
+            if (ok && g_call_layout != !strcmp(rest, "speaker")) call_cmd(hwnd, CC_LAYOUT);
         }
         else if (!strcmp(sc, "volume")) {
             unsigned long long uid = 0; int pct = 100;

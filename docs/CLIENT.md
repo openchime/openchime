@@ -257,7 +257,13 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   it does not. Someone else whose connection went (`call.away`, from the roster's
   `AWAY` flag) has a greyed tile reading "Reconnecting…" until they are back or
   their seat goes. In the call view, toasts stand above the call's controls and
-  the line of who is invited, not on them. The audio is the
+  the line of who is invited, not on them. Cameras (REQ-160) are
+  `oc_client_call_camera` and `oc_client_call_video_sub`, with whose are on in the
+  model's `call.camera`; the GUI turns its own on and off through the engine
+  (`oc_call_engine_camera_start`/`_stop`, within `oc_plat_camera_limits`), draws
+  each card's picture from `oc_call_engine_camera_frame` -- its own preview
+  mirrored at upload -- and, once a tick, tells the engine and the daemon whose
+  cameras it drew, when that changed (CALLS.md §2, §7). The audio is the
   engine's (`client/core/call/`, linked by the GUI (Win32 and web) and the tests),
   plugged in with `oc_client_set_call_media` behind the `oc_call_media` seam, so
   the TUI links no codec. See [CALLS.md](./CALLS.md) and [AUDIO.md](./AUDIO.md).

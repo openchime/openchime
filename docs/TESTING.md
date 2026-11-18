@@ -2262,6 +2262,24 @@ the button, which asks), `call banner-join|banner-decline|settings|chat|callback
 `call volume <uid> <percent>`, `call share <device id or name>|pick|stop|full|actual`.
 Not in CI, for the smoke's reason.
 
+`tools/gui/camera.sh` runs the same kind of pair (port 9676) with the synthetic
+camera (`OPENCHIME_DEV_CAPTURE=synthetic`) for cameras in calls (REQ-160): the
+call view's `call.camera` and Settings' `call.camera.picker`; alice's own card
+showing her camera at once and the roster marking it on; each card showing the
+other's camera, its frame numbers rising, at 640x480; the grid, then the speaker
+layout with bob large and alice in the strip, and one click back; no card drawn
+and no camera taken away from the call view, and both back on returning; bob's
+camera off showing his face; and, on a pair started with
+`OPENCHIME_DEV_CAPTURE=denied`, turning the camera on saying it is blocked in the
+video recorder's words. It reads the dump's `camera` line — `on= state= err=
+shown_err= w= h= fps= kbps= step= frames= cams= chosen= layout= speaker= sub_all=
+subs= drawn=` — its `camera.tile` lines, one per card or tile drawn — `uid= cam=
+big= fno= rect=`, `fno` the synthetic camera's frame number read from the picture
+— and its `camera.peer` lines, the engine's view of each other camera — `on=
+subscribed= frames= dropped= w= h=`. The `call` verb drives it: `call camera
+on|off|pick|<device id or name>`, `call layout grid|speaker`. Not in CI, for the
+smoke's reason.
+
 `tools/gui/calls_tcp.sh` is the same pair (port 9670) with UDP that goes
 nowhere: the daemon advertises the relay at a port nothing answers on
 (`OC_TEST_ADVERTISE_PORT`, which `tools/gui/pair.sh` passes as
