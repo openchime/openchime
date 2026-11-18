@@ -1,8 +1,13 @@
-/* Screen sharing's packet logic (REQ-161, ARCH-86/87, docs/CALLS.md §6.4-§6.6): what
- * the call engine does with a share's frames between the encoder and SFrame, and
- * between SFrame and the decoder. No sockets, no threads, no codec -- the engine
- * owns those -- so every rule here can be driven by a test with a simulated
- * network.
+/* A call's video packet logic -- a shared screen's (REQ-161, ARCH-86/87, docs/CALLS.md
+ * §6.4-§6.6) and each camera's (REQ-160, CALLS.md §7): what the call engine does with
+ * their frames between the encoder and SFrame, and between SFrame and the
+ * decoder. No sockets, no threads, no codec -- the engine owns those -- so every
+ * rule here can be driven by a test with a simulated network.
+ *
+ * The share and the cameras are the same transport on two packet types: a
+ * camera's fragments are type 4 where a share's are type 2, its control packets
+ * carry OC_CTL_CAMERA in their kind, and its rate has its own floor and
+ * ceiling. A sender has one of each; a receiver one per sender of each.
  *
  * A call packet's plaintext starts with its type (OC_CALLPKT_*). A share's frame
  * is split into fragments of at most OC_SHARE_FRAG bytes, each its own packet:
@@ -31,10 +36,14 @@ enum {
     OC_CALLPKT_AUDIO   = 0,   /* frame(u32) ‖ opus */
     OC_CALLPKT_STATE   = 1,   /* flags(u8): bit 0 muted */
     OC_CALLPKT_VIDEO   = 2,   /* a fragment of a shared screen's frame */
-    OC_CALLPKT_CONTROL = 3,   /* a viewer to the sharer */
+    OC_CALLPKT_CONTROL = 3,   /* a viewer to the sharer, or to a camera's sender */
+    OC_CALLPKT_CAMERA  = 4,   /* a fragment of a camera's frame: as a share's */
 };
 
+/* A control packet's kind; with OC_CTL_CAMERA it is about the target's camera,
+ * without, about its shared screen. */
 enum { OC_SHARE_NACK = 1, OC_SHARE_PLI = 2, OC_SHARE_REPORT = 3 };
+#define OC_CTL_CAMERA 0x10
 
 #define OC_SHARE_FRAG        1100u   /* bytes of a frame per packet */
 #define OC_SHARE_VIDEO_HDR   14u
@@ -57,6 +66,14 @@ enum { OC_SHARE_NACK = 1, OC_SHARE_PLI = 2, OC_SHARE_REPORT = 3 };
 #define OC_SHARE_JOIN_MS     250     /* a new viewer waits this long for a keyframe before asking */
 #define OC_SHARE_REPORT_MS   500
 
+/* A camera (REQ-160): at most 600 kbit/s, whatever the receivers could take. */
+#define OC_CAM_KBPS_MAX      600
+#define OC_CAM_KBPS_MIN      60
+#define OC_CAM_KBPS_START    400
+#define OC_CAM_STEP_UP_MS    3000    /* a step back up waits this long since the last step */
+#define OC_CAM_LATE_MS       200     /* a frame later than this behind its sender's voice is dropped */
+#define OC_CAM_HOLD_MS       300     /* and one held for the voice longer than this is shown anyway */
+#define OC_CAM_PREFIX        4       /* a camera frame's bytes: aframe(u32) ‖ VP9 */
 /* Where a packet goes: the engine seals and sends it. */
 typedef void (*oc_share_emit)(void *ctx, const uint8_t *pt, size_t len);
 
@@ -76,6 +93,8 @@ typedef struct { uint64_t user; int loss_permille; int64_t at_ms; } oc_share_vie
 
 typedef struct {
     uint64_t        self;          /* the sharer's user id: control naming anyone else is ignored */
+    uint8_t         pkt;           /* OC_CALLPKT_VIDEO or OC_CALLPKT_CAMERA */
+    int             kbps_min, kbps_max, kbps_start;
     uint32_t        next_frame;
     oc_share_sent  *hist;          /* OC_SHARE_HISTORY, heap */
     int             hist_at;
@@ -91,6 +110,8 @@ typedef struct {
 } oc_share_tx;
 
 int  oc_share_tx_init(oc_share_tx *t, uint64_t self);
+/* The same for a camera: type 4 packets, camera control, its own rate bounds. */
+int  oc_share_tx_init_camera(oc_share_tx *t, uint64_t self);
 void oc_share_tx_free(oc_share_tx *t);
 /* Frame numbers carry on across shares, so a viewer can tell an old share's
  * stragglers from a new one's; a new share starts with a keyframe. */
@@ -130,6 +151,7 @@ typedef struct {
 
 typedef struct {
     uint64_t      sharer;        /* whose frames these are; the engine resets on a change */
+    uint8_t       pkt;           /* OC_CALLPKT_VIDEO or OC_CALLPKT_CAMERA */
     int           started;       /* a keyframe has been had */
     int           need_key;
     uint32_t      next_frame;    /* the next frame to decode */
@@ -144,6 +166,8 @@ typedef struct {
 } oc_share_rx;
 
 void oc_share_rx_init(oc_share_rx *r, uint64_t sharer);
+/* A receiver of `sender`'s camera. */
+void oc_share_rx_init_camera(oc_share_rx *r, uint64_t sender);
 void oc_share_rx_free(oc_share_rx *r);
 /* A video fragment (the plaintext after its type byte). 0 kept, -1 malformed or
  * not wanted. */
@@ -159,10 +183,13 @@ void oc_share_rx_poll(oc_share_rx *r, int64_t now_ms, oc_share_emit emit, void *
 /* The decoder failed: nothing more can be decoded until a keyframe. */
 void oc_share_rx_need_key(oc_share_rx *r);
 
-/* Control packets, whole (type byte first); return their length. */
-size_t oc_share_ctl_pli(uint8_t *out, uint64_t target);
-size_t oc_share_ctl_report(uint8_t *out, uint64_t target, int loss_permille, uint32_t kbps);
-size_t oc_share_ctl_nack(uint8_t *out, uint64_t target, uint32_t frame, const uint16_t *frags, int n);
+/* Control packets, whole (type byte first), about `pkt`'s stream of `target` --
+ * OC_CALLPKT_VIDEO its share, OC_CALLPKT_CAMERA its camera; return their length. */
+size_t oc_share_ctl_pli(uint8_t *out, int pkt, uint64_t target);
+size_t oc_share_ctl_report(uint8_t *out, int pkt, uint64_t target, int loss_permille, uint32_t kbps);
+size_t oc_share_ctl_nack(uint8_t *out, int pkt, uint64_t target, uint32_t frame, const uint16_t *frags, int n);
+/* Which stream a control packet (the plaintext after its type byte) is about. */
+int    oc_share_ctl_pkt(const uint8_t *body, size_t len);
 
 /* ---- what to send -------------------------------------------------------------- */
 
@@ -173,5 +200,37 @@ uint64_t oc_share_frame_hash(const uint8_t *const plane[3], const int stride[3],
  * bitrate is low (below 600 kbps, back above 1000). `small` carries the state.
  * Even dimensions. */
 void oc_share_pick_size(int src_w, int src_h, int kbps, int *small, int *w, int *h);
+
+/* ---- a camera -------------------------------------------------------------------- */
+
+/* What a camera sends, a step at a time as the rate falls: 640×480, 320×240 and
+ * 160×120 at 30 fps, then 160×120 at 15 and at 7 -- the size first, then the frame
+ * rate. A step down is taken as soon as the rate is below what the step needs; a
+ * step up once the rate covers the step above and OC_CAM_STEP_UP_MS have passed
+ * since the last step. Each size is a box the source is fitted into. */
+#define OC_CAM_STEPS 5
+typedef struct { int step; int64_t changed_ms; } oc_cam_ladder;
+void oc_cam_ladder_init(oc_cam_ladder *l, int64_t now_ms);
+/* The step for `kbps` now, and what it sends: the source (src_w×src_h) fitted
+ * inside the step's box and the platform's (max_w×max_h, 0 for none), even
+ * dimensions, at the step's frame rate or max_fps, whichever is lower. Returns
+ * the step. */
+int  oc_cam_ladder_pick(oc_cam_ladder *l, int kbps, int64_t now_ms, int src_w, int src_h,
+                        int max_w, int max_h, int max_fps, int *w, int *h, int *fps);
+
+/* A camera frame's bytes: the sender's audio frame number at capture, then the
+ * VP9 frame. `out` has room for OC_CAM_PREFIX + n. */
+size_t oc_cam_frame_put(uint8_t *out, uint32_t aframe, const uint8_t *vp9, size_t n);
+/* 0 with the parts, or -1 if too short. */
+int    oc_cam_frame_get(const uint8_t *in, size_t n, uint32_t *aframe, const uint8_t **vp9, size_t *vn);
+
+/* Lip sync: a decoded camera frame captured at the sender's audio frame
+ * `aframe`, against what of the sender's voice is playing here -- `played` its
+ * last frame played, `voice` nonzero while it is playing at all. Shown once the
+ * voice has reached it; held while it is ahead, up to OC_CAM_HOLD_MS (`held_ms`
+ * so far); dropped when the voice is more than OC_CAM_LATE_MS past it. With no
+ * voice playing there is nothing to keep it to, and it is shown. */
+enum { OC_CAM_SHOW = 0, OC_CAM_HOLD = 1, OC_CAM_DROP = 2 };
+int  oc_cam_sync(uint32_t aframe, int voice, uint32_t played, int64_t held_ms);
 
 #endif

@@ -3526,6 +3526,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         memcpy(m->call.parts, e->call->parts, e->call->n_parts * sizeof e->call->parts[0]);
         memcpy(m->call.slots, e->call->slots, e->call->n_parts * sizeof e->call->slots[0]);
         memcpy(m->call.away, e->call->away, e->call->n_parts * sizeof e->call->away[0]);
+        memcpy(m->call.camera, e->call->camera, e->call->n_parts * sizeof e->call->camera[0]);
         break;
     case OC_EV_CALL_LEFT:
         if ((m->in_call || m->call_rejoining) && m->call.channel_id == e->channel_id) {

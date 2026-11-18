@@ -1,4 +1,5 @@
-/* Screen sharing's packet logic — see oc_share.h and docs/CALLS.md §6.4-§6.6. */
+/* A call's video packet logic, a share's and a camera's — see oc_share.h and
+ * docs/CALLS.md §6.4-§6.6, §7. */
 #include "oc_share.h"
 
 #include <stdlib.h>
@@ -13,17 +14,22 @@ static uint64_t get64(const uint8_t *p) { return ((uint64_t)get32(p) << 32) | ge
 
 /* ---- control packets ------------------------------------------------------------ */
 
-static size_t ctl_head(uint8_t *out, uint64_t target, int kind) {
+static size_t ctl_head(uint8_t *out, int pkt, uint64_t target, int kind) {
     out[0] = OC_CALLPKT_CONTROL;
     put64(out + 1, target);
-    out[9] = (uint8_t)kind;
+    out[9] = (uint8_t)(kind | (pkt == OC_CALLPKT_CAMERA ? OC_CTL_CAMERA : 0));
     return 10;
 }
 
-size_t oc_share_ctl_pli(uint8_t *out, uint64_t target) { return ctl_head(out, target, OC_SHARE_PLI); }
+int oc_share_ctl_pkt(const uint8_t *body, size_t len) {
+    if (len < 9) return -1;
+    return body[8] & OC_CTL_CAMERA ? OC_CALLPKT_CAMERA : OC_CALLPKT_VIDEO;
+}
 
-size_t oc_share_ctl_report(uint8_t *out, uint64_t target, int loss_permille, uint32_t kbps) {
-    size_t n = ctl_head(out, target, OC_SHARE_REPORT);
+size_t oc_share_ctl_pli(uint8_t *out, int pkt, uint64_t target) { return ctl_head(out, pkt, target, OC_SHARE_PLI); }
+
+size_t oc_share_ctl_report(uint8_t *out, int pkt, uint64_t target, int loss_permille, uint32_t kbps) {
+    size_t n = ctl_head(out, pkt, target, OC_SHARE_REPORT);
     if (loss_permille < 0) loss_permille = 0;
     if (loss_permille > 1000) loss_permille = 1000;
     put16(out + n, (uint32_t)loss_permille);
@@ -31,8 +37,8 @@ size_t oc_share_ctl_report(uint8_t *out, uint64_t target, int loss_permille, uin
     return n + 6;
 }
 
-size_t oc_share_ctl_nack(uint8_t *out, uint64_t target, uint32_t frame, const uint16_t *frags, int n) {
-    size_t len = ctl_head(out, target, OC_SHARE_NACK);
+size_t oc_share_ctl_nack(uint8_t *out, int pkt, uint64_t target, uint32_t frame, const uint16_t *frags, int n) {
+    size_t len = ctl_head(out, pkt, target, OC_SHARE_NACK);
     if (n < 0) n = 0;
     if (n > 64) n = 64;
     put32(out + len, frame);
@@ -44,12 +50,22 @@ size_t oc_share_ctl_nack(uint8_t *out, uint64_t target, uint32_t frame, const ui
 
 /* ---- the sharer ------------------------------------------------------------------ */
 
-int oc_share_tx_init(oc_share_tx *t, uint64_t self) {
+static int tx_init(oc_share_tx *t, uint64_t self, uint8_t pkt, int lo, int hi, int start) {
     memset(t, 0, sizeof *t);
     t->self = self;
+    t->pkt = pkt;
+    t->kbps_min = lo; t->kbps_max = hi; t->kbps_start = start;
     t->hist = calloc(OC_SHARE_HISTORY, sizeof *t->hist);
-    t->kbps = OC_SHARE_KBPS_START;
+    t->kbps = start;
     return t->hist ? 0 : -1;
+}
+
+int oc_share_tx_init(oc_share_tx *t, uint64_t self) {
+    return tx_init(t, self, OC_CALLPKT_VIDEO, OC_SHARE_KBPS_MIN, OC_SHARE_KBPS_MAX, OC_SHARE_KBPS_START);
+}
+
+int oc_share_tx_init_camera(oc_share_tx *t, uint64_t self) {
+    return tx_init(t, self, OC_CALLPKT_CAMERA, OC_CAM_KBPS_MIN, OC_CAM_KBPS_MAX, OC_CAM_KBPS_START);
 }
 
 void oc_share_tx_free(oc_share_tx *t) {
@@ -59,7 +75,7 @@ void oc_share_tx_free(oc_share_tx *t) {
 
 void oc_share_tx_restart(oc_share_tx *t, int64_t now_ms) {
     for (int i = 0; i < OC_SHARE_HISTORY; i++) t->hist[i].len = 0;
-    t->kbps = OC_SHARE_KBPS_START;
+    t->kbps = t->kbps_start;
     t->rate_at_ms = now_ms;
     t->cut_at_ms = 0;
     t->key_at_ms = 0;
@@ -82,7 +98,7 @@ int oc_share_tx_frame(oc_share_tx *t, const uint8_t *data, size_t len, int keyfr
         oc_share_sent *s = &t->hist[t->hist_at];
         t->hist_at = (t->hist_at + 1) % OC_SHARE_HISTORY;
         uint8_t *p = s->pt;
-        p[0] = OC_CALLPKT_VIDEO;
+        p[0] = t->pkt;
         put32(p + 1, frame);
         put16(p + 5, (uint32_t)i);
         put16(p + 7, (uint32_t)nfrags);
@@ -116,8 +132,8 @@ static void resend(oc_share_tx *t, uint32_t frame, int frag, int64_t now_ms, oc_
 
 void oc_share_tx_control(oc_share_tx *t, uint64_t from, const uint8_t *body, size_t len,
                          int64_t now_ms, oc_share_emit emit, void *ctx) {
-    if (len < 9 || get64(body) != t->self) return;
-    int kind = body[8];
+    if (len < 9 || get64(body) != t->self || oc_share_ctl_pkt(body, len) != t->pkt) return;
+    int kind = body[8] & ~OC_CTL_CAMERA;
     body += 9; len -= 9;
     if (kind == OC_SHARE_NACK) {
         if (len < 6) return;
@@ -149,7 +165,7 @@ void oc_share_tx_control(oc_share_tx *t, uint64_t from, const uint8_t *body, siz
          * anyone loses more than 2%. */
         if (loss > 50 && now_ms - t->cut_at_ms >= 1000) {
             t->kbps /= 2;
-            if (t->kbps < OC_SHARE_KBPS_MIN) t->kbps = OC_SHARE_KBPS_MIN;
+            if (t->kbps < t->kbps_min) t->kbps = t->kbps_min;
             t->cut_at_ms = t->rate_at_ms = now_ms;
         } else if (loss > 20) {
             t->rate_at_ms = now_ms;
@@ -166,7 +182,7 @@ int oc_share_tx_want_keyframe(oc_share_tx *t, int64_t now_ms) {
 int oc_share_tx_kbps(oc_share_tx *t, int64_t now_ms) {
     if (now_ms - t->rate_at_ms >= 1000) {
         t->kbps += t->kbps / 10 + 1;
-        if (t->kbps > OC_SHARE_KBPS_MAX) t->kbps = OC_SHARE_KBPS_MAX;
+        if (t->kbps > t->kbps_max) t->kbps = t->kbps_max;
         t->rate_at_ms = now_ms;
     }
     return t->kbps;
@@ -181,8 +197,14 @@ void oc_share_tx_forget(oc_share_tx *t, uint64_t user) {
 void oc_share_rx_init(oc_share_rx *r, uint64_t sharer) {
     memset(r, 0, sizeof *r);
     r->sharer = sharer;
+    r->pkt = OC_CALLPKT_VIDEO;
     r->handed = -1;
     r->born_ms = -1;
+}
+
+void oc_share_rx_init_camera(oc_share_rx *r, uint64_t sender) {
+    oc_share_rx_init(r, sender);
+    r->pkt = OC_CALLPKT_CAMERA;
 }
 
 static void slot_drop(oc_share_slot *s) {
@@ -308,19 +330,19 @@ void oc_share_rx_poll(oc_share_rx *r, int64_t now_ms, oc_share_emit emit, void *
         s->nacks++;
         s->nacked_ms = now_ms;
         r->nacks++;
-        if (!s->nfrags) { emit(ctx, pkt, oc_share_ctl_nack(pkt, r->sharer, s->frame, NULL, 0)); continue; }
+        if (!s->nfrags) { emit(ctx, pkt, oc_share_ctl_nack(pkt, r->pkt, r->sharer, s->frame, NULL, 0)); continue; }
         uint16_t miss[64];
         int n = 0, sent = 0;
         for (uint32_t f = 0; f < s->nfrags; f++) {
             if (s->got[f / 8] & (1u << (f % 8))) continue;
             miss[n++] = (uint16_t)f;
             if (n == 64) {
-                if (++sent > 4) { n = 0; emit(ctx, pkt, oc_share_ctl_nack(pkt, r->sharer, s->frame, NULL, 0)); break; }
-                emit(ctx, pkt, oc_share_ctl_nack(pkt, r->sharer, s->frame, miss, n));
+                if (++sent > 4) { n = 0; emit(ctx, pkt, oc_share_ctl_nack(pkt, r->pkt, r->sharer, s->frame, NULL, 0)); break; }
+                emit(ctx, pkt, oc_share_ctl_nack(pkt, r->pkt, r->sharer, s->frame, miss, n));
                 n = 0;
             }
         }
-        if (n) emit(ctx, pkt, oc_share_ctl_nack(pkt, r->sharer, s->frame, miss, n));
+        if (n) emit(ctx, pkt, oc_share_ctl_nack(pkt, r->pkt, r->sharer, s->frame, miss, n));
     }
     /* A frame the next one depends on that has not come in time is given up:
      * nothing after it decodes until a keyframe. */
@@ -342,7 +364,7 @@ void oc_share_rx_poll(oc_share_rx *r, int64_t now_ms, oc_share_emit emit, void *
                 now_ms - s->first_ms < OC_SHARE_GIVEUP_MS) coming = 1;
         }
         if (!coming && (!r->pli_any || now_ms - r->pli_ms >= OC_SHARE_PLI_MS)) {
-            emit(ctx, pkt, oc_share_ctl_pli(pkt, r->sharer));
+            emit(ctx, pkt, oc_share_ctl_pli(pkt, r->pkt, r->sharer));
             r->pli_ms = now_ms;
             r->pli_any = 1;
             r->plis++;
@@ -381,4 +403,68 @@ void oc_share_pick_size(int src_w, int src_h, int kbps, int *small, int *w, int 
         *w = fw & ~1;
         *h = fh & ~1;
     }
+}
+
+/* ---- a camera ---------------------------------------------------------------------- */
+
+static const struct { int box_w, box_h, fps, need_kbps; } STEPS[OC_CAM_STEPS] = {
+    { 640, 480, 30, 400 },
+    { 320, 240, 30, 200 },
+    { 160, 120, 30, 120 },
+    { 160, 120, 15, 80 },
+    { 160, 120,  7, 0 },
+};
+
+void oc_cam_ladder_init(oc_cam_ladder *l, int64_t now_ms) {
+    l->step = 0;
+    l->changed_ms = now_ms;
+}
+
+/* `w`×`h` fitted inside box_w×box_h, keeping its shape; even, at least 2. */
+static void fit_box(int w, int h, int box_w, int box_h, int *ow, int *oh) {
+    if (w <= 0 || h <= 0) { w = box_w; h = box_h; }
+    int fw = w, fh = h;
+    if (fw > box_w) { fh = (int)((int64_t)fh * box_w / fw); fw = box_w; }
+    if (fh > box_h) { fw = (int)((int64_t)fw * box_h / fh); fh = box_h; }
+    fw &= ~1; fh &= ~1;
+    *ow = fw < 2 ? 2 : fw;
+    *oh = fh < 2 ? 2 : fh;
+}
+
+int oc_cam_ladder_pick(oc_cam_ladder *l, int kbps, int64_t now_ms, int src_w, int src_h,
+                       int max_w, int max_h, int max_fps, int *w, int *h, int *fps) {
+    /* Down as far as the rate needs, at once; up one step, after a quiet while. */
+    int moved = 0;
+    while (l->step < OC_CAM_STEPS - 1 && kbps < STEPS[l->step].need_kbps) { l->step++; moved = 1; }
+    if (!moved && l->step > 0 && kbps >= STEPS[l->step - 1].need_kbps &&
+        now_ms - l->changed_ms >= OC_CAM_STEP_UP_MS) { l->step--; moved = 1; }
+    if (moved) l->changed_ms = now_ms;
+    int bw = STEPS[l->step].box_w, bh = STEPS[l->step].box_h;
+    if (max_w > 0 && max_w < bw) bw = max_w;
+    if (max_h > 0 && max_h < bh) bh = max_h;
+    fit_box(src_w, src_h, bw, bh, w, h);
+    *fps = STEPS[l->step].fps;
+    if (max_fps > 0 && max_fps < *fps) *fps = max_fps;
+    return l->step;
+}
+
+size_t oc_cam_frame_put(uint8_t *out, uint32_t aframe, const uint8_t *vp9, size_t n) {
+    put32(out, aframe);
+    memcpy(out + OC_CAM_PREFIX, vp9, n);
+    return OC_CAM_PREFIX + n;
+}
+
+int oc_cam_frame_get(const uint8_t *in, size_t n, uint32_t *aframe, const uint8_t **vp9, size_t *vn) {
+    if (n <= OC_CAM_PREFIX) return -1;
+    *aframe = get32(in);
+    *vp9 = in + OC_CAM_PREFIX;
+    *vn = n - OC_CAM_PREFIX;
+    return 0;
+}
+
+int oc_cam_sync(uint32_t aframe, int voice, uint32_t played, int64_t held_ms) {
+    if (!voice) return OC_CAM_SHOW;
+    int32_t ahead = (int32_t)(aframe - played);          /* in 20 ms frames */
+    if (ahead > 0) return held_ms >= OC_CAM_HOLD_MS ? OC_CAM_SHOW : OC_CAM_HOLD;
+    return -ahead * 20 > OC_CAM_LATE_MS ? OC_CAM_DROP : OC_CAM_SHOW;
 }

@@ -98,6 +98,7 @@ typedef struct {
     uint64_t parts[OC_MAX_CALL_PARTICIPANTS];
     uint8_t  slots[OC_MAX_CALL_PARTICIPANTS];
     uint8_t  away[OC_MAX_CALL_PARTICIPANTS];   /* connection gone, seat held (OC_CALL_PART_AWAY) */
+    uint8_t  camera[OC_MAX_CALL_PARTICIPANTS]; /* camera on (OC_CALL_PART_CAMERA, REQ-160) */
     uint64_t invited[OC_MAX_CALL_INVITES];
     uint64_t sharer;      /* who is sharing a screen, 0 for nobody (REQ-161) */
 } oc_call_view;
@@ -676,13 +677,17 @@ enum {
     /* Calls (REQ-150, REQ-301-305), all on `channel_id`. JOIN starts or joins,
      * inviting `uids` when it starts; INVITE asks `uids`; LEAVE, DECLINE and END
      * (the starter's) carry nothing else; SHARE starts (op 1) or stops (op 0)
-     * sharing a screen (REQ-161). */
+     * sharing a screen (REQ-161); CAMERA turns the camera on (op 1) or off
+     * (op 0), and VIDEO_SUB says whose cameras to receive -- every one (op 1),
+     * or uids[0..n_uids) (REQ-160). */
     OC_CMD_CALL_JOIN,
     OC_CMD_CALL_INVITE,
     OC_CMD_CALL_LEAVE,
     OC_CMD_CALL_DECLINE,
     OC_CMD_CALL_END,
     OC_CMD_CALL_SHARE,
+    OC_CMD_CALL_CAMERA,
+    OC_CMD_CALL_VIDEO_SUB,
     /* User groups (REQ-307-309). CREATE/UPDATE: body = handle, body2 = name,
      * body3 = description, message_id = the group (UPDATE); DELETE: message_id;
      * ADD/REMOVE_MEMBERS: message_id + uids; CHANNEL_ADD/REMOVE_GROUP:

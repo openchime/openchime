@@ -1260,25 +1260,37 @@ where one exists.
   and the network have carried audio only the participants' devices could
   decrypt, with keys that change on every join and leave (ARCH-113).
 
-### 6.3 Video — camera video excluded; screenshare and video messages admitted
+### 6.3 Video — camera video and screenshare in calls, and video messages
 
-*Design: [CALLS.md](./CALLS.md) §6 (screenshare), [VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md)
-(video messages).*
+*Design: [CALLS.md](./CALLS.md) §7 (cameras) and §6 (screenshare),
+[VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md) (video messages).*
 
-- **REQ-160.** *(Excluded by decision)* **Camera video** calling, and video streaming or playback beyond
-  generic file-attachment handling (REQ-140), have not been supported. This is a
-  deliberate scope exclusion. **Scoped by ARCH-86:** the exclusion covers *camera* video
-  and general playback; **screenshare** is admitted separately as REQ-161, whose
-  content profile (mostly static, low frame rate, a single sender) is
-  fundamentally cheaper and whose use case is concrete. **Scoped again by
-  ARCH-110:** a **recorded video message** — made, posted and played back in the
-  client (REQ-162–166) — is admitted too, because it needs no real-time path at
-  all: it is a file, an attachment and a message. Camera video *calling* stays
-  excluded. The exclusion is narrowed, not repealed.
+- **REQ-160.** A participant in a call has been able to **turn their camera on
+  and off**, and the others have seen it, each person with their own picture.
+  A camera has ridden the call's relay inside its end-to-end encryption, as the
+  audio and a shared screen do (ARCH-86, ARCH-113), in the call's one codec,
+  VP9 (ARCH-87), at most **640×480 at 30 frames a second and 600 kbit/s per
+  sender** — less where a platform's encoder cannot keep up (15 frames a second
+  in a browser). On a weak connection the picture has got **smaller first, then
+  less frequent**, and come back a step at a time once the connection has. Each
+  participant has received only the cameras it shows, a subscription the relay
+  has honoured, and a receiver that takes nobody's camera has not held its
+  sender's rate down. A picture has been shown **with its sender's voice** (lip
+  sync). The roster has said whose cameras are on; a camera has gone off when its
+  owner left, lost the connection or rejoined, and been released at once when
+  turned off. The relay has read which stream a packet belongs to — audio, a
+  share, a camera — and nothing more, so the server has seen who sends video and
+  never what. A **text-only frontend has been permanently exempt** (ARCH-75).
+  Video streaming or playback beyond generic file-attachment handling (REQ-140)
+  has not been supported, apart from **recorded video messages** (REQ-162–166,
+  ARCH-110), which need no real-time path: each is a file, an attachment and a
+  message. *Camera video in calls was first excluded (ARCH-86), when screenshare
+  alone was admitted for its cheaper content profile; that exclusion is
+  reversed.*
 - **REQ-161.** A participant in a call has been able to **share a screen or
   window** to the other participants, view-only, one sharer at a time: starting
   a share takes over from whoever was sharing. Screenshare has ridden the
-  existing server-relay media path unchanged (ARCH-73/86): the relay forwards the
+  existing server-relay media path on a stream of its own (ARCH-73/86): the relay forwards the
   encoded payload opaquely exactly as it forwards Opus, inside the call's
   end-to-end encryption, so no server-side codec has existed and no transcoding
   has been possible. Consequently **all clients have spoken one mandatory codec —
@@ -1289,9 +1301,9 @@ where one exists.
   every call, with no switch to turn it off. The sharer has seen that they are
   sharing and a way to stop, and a frame around what is shared; the viewers have
   seen it fitted, full screen or at actual size. Remote control, recording the
-  share, the computer's sound, drawing on a share, simultaneous sharers, and
-  camera video have all been out of scope of a call (REQ-160); a *recorded*
-  screen is a video message (REQ-162). A **text-only frontend has been
+  share, the computer's sound, drawing on a share and simultaneous sharers have
+  all been out of scope of a call; a camera beside a share is REQ-160, and a
+  *recorded* screen is a video message (REQ-162). A **text-only frontend has been
   permanently exempt** (ARCH-75 — the TUI renders no graphics). [CALLS.md](./CALLS.md) §6
   is the design.
 - **REQ-162.** A user has been able to **record a video message and
@@ -2606,7 +2618,7 @@ choose — which makes each one a per-frontend *obligation*.*
 
 *Features present in the reference products (Slack, Pumble) that OpenChime
 deliberately does not implement, recorded so each omission is on the record rather
-than merely absent — the same intent as REQ-160's camera-video exclusion. Several are reachable by a third party through
+than merely absent. Several are reachable by a third party through
 the app platform (REQ-172) or webhooks (REQ-170/173) without being a first-party
 feature.*
 

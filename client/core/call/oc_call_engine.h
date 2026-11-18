@@ -69,6 +69,30 @@ void  oc_call_engine_share_stop(oc_call_engine *e);
  * the share has gone, so the frontend stops showing it. */
 int   oc_call_engine_share_frame(oc_call_engine *e, oc_frame *dst, uint32_t *seq, uint32_t *frame_no);
 
+/* Send this device's camera (REQ-160, CALLS.md §7): `device_id` from
+ * oc_capture_list (NULL or "" for the default), at most max_w×max_h and max_fps
+ * (0: 640×480 at 30, also the most) -- the platform's ceiling
+ * (oc_plat_camera_limits). The camera opens now, and its picture is the preview
+ * at once (oc_call_engine_camera_frame for this device); frames go out once the
+ * roster marks this device's camera on, so the frontend also sends
+ * oc_client_call_camera(c, channel, 1). 0, or -1 when not in a call. */
+int   oc_call_engine_camera_start(oc_call_engine *e, const char *device_id, int max_w, int max_h, int max_fps);
+/* Stop sending it and release the camera at once; the frontend also sends
+ * oc_client_call_camera(c, channel, 0). */
+void  oc_call_engine_camera_stop(oc_call_engine *e);
+/* Whose cameras this device takes: every one, or the `n` named -- what the view
+ * shows. The frontend also sends oc_client_call_video_sub with the same, which
+ * is what stops the relay sending the rest; this stops the engine asking for
+ * them and holding their rate down. Every one at the start of a call. */
+void  oc_call_engine_camera_subscribe(oc_call_engine *e, int all, const uint64_t *users, int n);
+/* The newest picture of `user`'s camera -- or, for this device's own user (or
+ * 0), the camera as captured, unmirrored -- copied into `dst` (allocated or
+ * resized here; oc_frame_free it) when newer than `*seq`: 1 with `*seq` updated;
+ * 0 if nothing new; -1 once there is no picture any more (the camera went off),
+ * so the frontend shows the placeholder. Each frame is shown when its sender's
+ * voice reaches it (lip sync). */
+int   oc_call_engine_camera_frame(oc_call_engine *e, uint64_t user, oc_frame *dst, uint32_t *seq);
+
 /* What is happening, for the call view and the test harness. */
 typedef struct {
     uint64_t user_id;
@@ -78,6 +102,13 @@ typedef struct {
     int      level;             /* peak of the last frame played, 0-32767 */
     int      keyed;             /* a key for this person's current epoch is held */
     uint32_t packets, lost, late, fec, plc, undecryptable;
+    /* Their camera. */
+    int      camera_on;         /* the roster marks it on */
+    int      camera_subscribed; /* this device takes it */
+    int      cam_width, cam_height;     /* as last shown */
+    /* Shown; dropped, too late for the voice; of those shown, how many waited
+     * for it; the decoder's failures; the requests sent. */
+    uint32_t cam_frames, cam_dropped, cam_held, cam_errors, cam_nacks, cam_plis;
 } oc_call_peer_stats;
 
 typedef struct {
@@ -106,6 +137,13 @@ typedef struct {
     uint32_t share_frames, share_keyframes, share_resent, share_nacks, share_plis, share_reports;
     int      view_width, view_height;   /* someone else's share, as decoded */
     uint32_t view_frames, view_frame_no, view_nacks, view_plis, view_skipped, view_errors;
+
+    /* This device's camera. */
+    int      camera_state;      /* 0 off, 1 waiting for the roster, 2 sending */
+    int      camera_error;      /* OC_CAP_* from the camera, 0 fine */
+    int      camera_width, camera_height, camera_fps, camera_fps_target, camera_step, camera_kbps;
+    uint32_t camera_frames, camera_keyframes, camera_resent, camera_reports;
+    int      subscribed_all;    /* this device takes every camera */
 } oc_call_stats;
 
 void oc_call_engine_stats(oc_call_engine *e, oc_call_stats *out);

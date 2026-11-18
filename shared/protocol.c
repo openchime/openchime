@@ -2368,6 +2368,7 @@ oc_result oc_encode_call_share(oc_wbuf *w, uint16_t version, const oc_call_share
 oc_result oc_encode_call_media_up(oc_wbuf *w, uint16_t version, const oc_call_media_pkt *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_MEDIA);
     oc_w_u16(w, m->seq);
+    oc_w_u8(w, m->stream);
     oc_w_bytes(w, m->ct);
     return oc_frame_end(w, off);
 }
@@ -2376,7 +2377,23 @@ oc_result oc_encode_call_media_down(oc_wbuf *w, uint16_t version, const oc_call_
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_MEDIA);
     oc_w_u64(w, m->sender);
     oc_w_u16(w, m->seq);
+    oc_w_u8(w, m->stream);
     oc_w_bytes(w, m->ct);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_camera(oc_wbuf *w, uint16_t version, const oc_call_camera *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_CAMERA);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u8(w, m->on);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_video_sub(oc_wbuf *w, uint16_t version, const oc_call_video_sub *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_VIDEO_SUB);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u8(w, m->all);
+    w_u64s(w, m->count, m->users);
     return oc_frame_end(w, off);
 }
 
@@ -2532,6 +2549,7 @@ oc_result oc_decode_call_share(oc_rbuf *p, oc_call_share *m) {
 oc_result oc_decode_call_media_up(oc_rbuf *p, oc_call_media_pkt *m) {
     m->sender = 0;
     m->seq = oc_r_u16(p);
+    m->stream = oc_r_u8(p);
     m->ct = oc_r_bytes(p);
     return r_done(p);
 }
@@ -2539,7 +2557,23 @@ oc_result oc_decode_call_media_up(oc_rbuf *p, oc_call_media_pkt *m) {
 oc_result oc_decode_call_media_down(oc_rbuf *p, oc_call_media_pkt *m) {
     m->sender = oc_r_u64(p);
     m->seq = oc_r_u16(p);
+    m->stream = oc_r_u8(p);
     m->ct = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_camera(oc_rbuf *p, oc_call_camera *m) {
+    m->channel_id = oc_r_u64(p);
+    m->on = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_video_sub(oc_rbuf *p, oc_call_video_sub *m, uint64_t *users, uint16_t cap) {
+    m->channel_id = oc_r_u64(p);
+    m->all = oc_r_u8(p);
+    m->count = 0;
+    m->users = users;
+    r_u64s(p, &m->count, users, cap);
     return r_done(p);
 }
 

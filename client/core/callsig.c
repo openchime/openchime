@@ -25,13 +25,14 @@ void oc_callsig_destroy(oc_callsig *cs) {
  * when full, and wake the connection thread to write it. Any thread; never
  * blocks on the connection. The wake is called under the queue's lock, so one
  * cleared by oc_callsig_set_wake is never called after. */
-static int tcp_enqueue(void *sctx, uint16_t seq, const uint8_t *ct, size_t len) {
+static int tcp_enqueue(void *sctx, uint16_t seq, uint8_t stream, const uint8_t *ct, size_t len) {
     oc_callsig *cs = sctx;
     if (len > OC_CALLSIG_TCPMAX) return -1;
     oc_mutex_lock(&cs->tq_mu);
     if (cs->tq_n == OC_CALLSIG_TCPQ) { cs->tq_head = (cs->tq_head + 1) % OC_CALLSIG_TCPQ; cs->tq_n--; }
     int k = (cs->tq_head + cs->tq_n) % OC_CALLSIG_TCPQ;
     cs->tq[k].seq = seq;
+    cs->tq[k].stream = stream;
     cs->tq[k].len = (uint16_t)len;
     if (len) memcpy(cs->tq[k].ct, ct, len);
     cs->tq_n++;
@@ -51,9 +52,11 @@ int oc_callsig_pump(oc_callsig *cs, oc_callsig_write write, void *wctx) {
     for (;;) {
         uint8_t ct[OC_CALLSIG_TCPMAX];
         uint16_t seq, len;
+        uint8_t stream;
         oc_mutex_lock(&cs->tq_mu);
         if (!cs->tq_n) { oc_mutex_unlock(&cs->tq_mu); break; }
         seq = cs->tq[cs->tq_head].seq;
+        stream = cs->tq[cs->tq_head].stream;
         len = cs->tq[cs->tq_head].len;
         memcpy(ct, cs->tq[cs->tq_head].ct, len);
         cs->tq_head = (cs->tq_head + 1) % OC_CALLSIG_TCPQ;
@@ -61,7 +64,7 @@ int oc_callsig_pump(oc_callsig *cs, oc_callsig_write write, void *wctx) {
         oc_mutex_unlock(&cs->tq_mu);
         uint8_t buf[OC_CALLSIG_TCPMAX + 32];
         oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-        oc_call_media_pkt m = { 0, seq, { ct, len } };
+        oc_call_media_pkt m = { 0, seq, { ct, len }, stream };
         if (oc_encode_call_media_up(&w, OC_PROTOCOL_VERSION, &m) == OC_OK) write(wctx, buf, w.len);
     }
     return 0;
@@ -104,6 +107,7 @@ static void push_view(oc_queue *to_ui, int type, const oc_callsig *cs, uint64_t 
         v->parts[i] = cs->parts[i].user_id;
         v->slots[i] = cs->parts[i].slot;
         v->away[i] = (cs->parts[i].flags & OC_CALL_PART_AWAY) != 0;
+        v->camera[i] = (cs->parts[i].flags & OC_CALL_PART_CAMERA) != 0;
     }
     oc_queue_push(to_ui, e);
 }
@@ -336,6 +340,16 @@ int oc_callsig_command(oc_callsig *cs, const oc_cmd *c, oc_store *store, const c
         rc = oc_encode_call_share(&w, OC_PROTOCOL_VERSION, &sh);
         break;
     }
+    case OC_CMD_CALL_CAMERA: {
+        oc_call_camera cm = { c->channel_id, c->op ? 1 : 0 };
+        rc = oc_encode_call_camera(&w, OC_PROTOCOL_VERSION, &cm);
+        break;
+    }
+    case OC_CMD_CALL_VIDEO_SUB: {
+        oc_call_video_sub vs = { c->channel_id, c->op ? 1 : 0, c->op ? 0 : c->n_uids, c->uids };
+        rc = oc_encode_call_video_sub(&w, OC_PROTOCOL_VERSION, &vs);
+        break;
+    }
     default:
         return -1;
     }
@@ -398,7 +412,7 @@ int oc_callsig_frame(oc_callsig *cs, uint16_t type, oc_rbuf *p, const char *host
         if (oc_decode_call_media_down(p, &m) != OC_OK) return -1;
         oc_mutex_lock(&cs->mu);
         if (cs->in_call && cs->media && cs->media->rx_tcp)
-            cs->media->rx_tcp(cs->mctx, m.sender, m.seq, m.ct.ptr, m.ct.len);
+            cs->media->rx_tcp(cs->mctx, m.sender, m.seq, m.stream, m.ct.ptr, m.ct.len);
         oc_mutex_unlock(&cs->mu);
         return 1;
     }
@@ -418,12 +432,16 @@ int oc_callsig_frame(oc_callsig *cs, uint16_t type, oc_rbuf *p, const char *host
          * back in. */
         if (!still && elsewhere) { leave_local(cs, to_ui); return 1; }
         if (!still) { rejoin_begin(cs, to_ui, 1); rejoin_send(cs, write, wctx, to_ui); return 1; }
+        /* A roster in the same epoch says only that someone's camera went on
+         * or off (REQ-160): nobody came or went, so the keys stand -- a second
+         * key under one KID would be one nobody installs. */
+        int new_epoch = ro.epoch != cs->epoch;
         cs->epoch = ro.epoch;
         cs->n = ro.count;
         memcpy(cs->parts, parts, ro.count * sizeof parts[0]);
         push_view(to_ui, OC_EV_CALL_ROSTER, cs, 0, 0);
         media_roster(cs);
-        rekey(cs, write, wctx);
+        if (new_epoch) rekey(cs, write, wctx);
         return 1;
     }
     case OC_MSG_CALL_KEY_FOR: {

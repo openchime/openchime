@@ -38,6 +38,10 @@ typedef struct participant {
     struct in_pktinfo  local4;
     int      local_known;
     uint64_t last_seen_ms;
+    int      camera;                 /* its camera stream is relayed (oc_relay_set_camera) */
+    int      sub_all;                /* it receives every camera... */
+    int      n_subs;                 /* ...or these users' */
+    uint64_t subs[OC_MAX_CALL_PARTICIPANTS];
 } participant;
 
 struct oc_relay {
@@ -185,6 +189,9 @@ int oc_relay_authorize(oc_relay *r, uint64_t call_id, uint64_t user_id, uint64_t
     p->user_id = user_id;
     p->conn_id = conn_id;
     p->last_seen_ms = r->now_ms();
+    p->camera = 0;
+    p->sub_all = 1;
+    p->n_subs = 0;
     if (call_link(r, p) != 0) { drop(r, p); return -1; }
     if (conn_id) oc_idmap_put(&r->by_conn, conn_id, p);   /* one call per connection */
     return 0;
@@ -243,16 +250,28 @@ static void prepare(const oc_relay *r, const participant *to, struct msghdr *mh,
     }
 }
 
+/* Whether `e` takes the camera of `user`. */
+static int wants_camera(const participant *e, uint64_t user) {
+    if (e->sub_all) return 1;
+    for (int i = 0; i < e->n_subs; i++) if (e->subs[i] == user) return 1;
+    return 0;
+}
+
 /* Relay `me`'s packet to the rest of its call, each by its own transport: one
  * sendmmsg for those on UDP, the hook for those on the connection. A keepalive
  * (no payload) is answered to its sender alone: it is how a client learns the
- * relay can hear it, and the others have no use for it. */
-static void forward(oc_relay *r, participant *me, uint16_t seq, const uint8_t *payload, size_t plen) {
-    if (plen > OC_AUDIO_MAX_PACKET - OC_AUDIO_S2C_HDR) return;
-    /* The forwarded datagram: sender_user_id + seq + payload. */
+ * relay can hear it, and the others have no use for it. A camera's packet goes
+ * only while that camera is on, and only to those who take it. */
+static void forward(oc_relay *r, participant *me, uint16_t seq, uint8_t stream,
+                    const uint8_t *payload, size_t plen) {
+    if (plen > OC_AUDIO_MAX_PACKET - OC_AUDIO_S2C_HDR || stream >= OC_CALL_STREAMS) return;
+    int camera = stream == OC_CALL_STREAM_CAMERA;
+    if (plen && camera && !me->camera) return;
+    /* The forwarded datagram: sender_user_id + seq + stream + payload. */
     uint8_t out[OC_AUDIO_MAX_PACKET];
     wr_u64(out, me->user_id);
     out[8] = (uint8_t)(seq >> 8); out[9] = (uint8_t)seq;
+    out[10] = stream;
     memcpy(out + OC_AUDIO_S2C_HDR, payload, plen);
     size_t olen = OC_AUDIO_S2C_HDR + plen;
 
@@ -263,8 +282,9 @@ static void forward(oc_relay *r, participant *me, uint16_t seq, const uint8_t *p
     for (participant *e = plen ? oc_idmap_get(&r->by_call, me->call_id) : me;
          e && k < OC_MAX_CALL_PARTICIPANTS; e = plen ? e->c_next : NULL) {
         if (plen && e == me) continue;
+        if (plen && camera && !wants_camera(e, me->user_id)) continue;
         if (e->tcp) {
-            if (r->hooks.tcp_send) r->hooks.tcp_send(r->ctx, e->conn_id, me->user_id, seq, payload, plen);
+            if (r->hooks.tcp_send) r->hooks.tcp_send(r->ctx, e->conn_id, me->user_id, seq, stream, payload, plen);
             continue;
         }
         if (!e->addr_known) continue;
@@ -279,12 +299,29 @@ static void forward(oc_relay *r, participant *me, uint16_t seq, const uint8_t *p
     }
 }
 
-int oc_relay_from_tcp(oc_relay *r, uint64_t conn_id, uint16_t seq, const uint8_t *ct, size_t len) {
+int oc_relay_from_tcp(oc_relay *r, uint64_t conn_id, uint16_t seq, uint8_t stream,
+                      const uint8_t *ct, size_t len) {
     participant *me = r && conn_id ? oc_idmap_get(&r->by_conn, conn_id) : NULL;
     if (!me) return -1;
     me->tcp = 1;
     me->last_seen_ms = r->now_ms();
-    forward(r, me, seq, ct, len);
+    forward(r, me, seq, stream, ct, len);
+    return 0;
+}
+
+int oc_relay_set_camera(oc_relay *r, uint64_t conn_id, int on) {
+    participant *p = r && conn_id ? oc_idmap_get(&r->by_conn, conn_id) : NULL;
+    if (!p) return -1;
+    p->camera = on ? 1 : 0;
+    return 0;
+}
+
+int oc_relay_subscribe(oc_relay *r, uint64_t conn_id, int all, const uint64_t *users, int n) {
+    participant *p = r && conn_id ? oc_idmap_get(&r->by_conn, conn_id) : NULL;
+    if (!p || n < 0 || n > (int)OC_MAX_CALL_PARTICIPANTS || (n && !users)) return -1;
+    p->sub_all = all ? 1 : 0;
+    p->n_subs = all ? 0 : n;
+    if (!all && n) memcpy(p->subs, users, (size_t)n * sizeof *users);
     return 0;
 }
 
@@ -306,7 +343,7 @@ static int relay_one(oc_relay *r) {
     r->received++;
     socklen_t sl = mh.msg_namelen;
 
-    if (!r->token_len || (size_t)n < r->token_len + 2) return 1;
+    if (!r->token_len || (size_t)n < r->token_len + 3) return 1;   /* token, seq, stream */
     participant *me = find_token(r, pkt, r->token_len);   /* the token leads the packet */
     if (!me) return 1;                                     /* unknown or revoked */
     /* The address is bound on first use and never re-learned. The token is not a
@@ -339,7 +376,7 @@ static int relay_one(oc_relay *r) {
 
     me->tcp = 0;
     const uint8_t *seq = pkt + me->token_len;
-    forward(r, me, (uint16_t)((seq[0] << 8) | seq[1]), seq + 2, (size_t)n - me->token_len - 2);
+    forward(r, me, (uint16_t)((seq[0] << 8) | seq[1]), seq[2], seq + 3, (size_t)n - me->token_len - 3);
     return 1;
 }
 

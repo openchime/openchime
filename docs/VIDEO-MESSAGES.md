@@ -9,8 +9,8 @@ REQ-162–166), PROTOCOL.md (§5.14a), SCHEMA.md (migration 0041) and
 
 A video message is **a file, not a stream.** Nothing here involves a call, the
 audio relay or any real-time path; screenshare in a call is a different design
-([CALLS.md](./CALLS.md) §6), and a recorded screen is a video message like any other. Camera video *calling* stays excluded (REQ-160), and so
-does an audio-only clip (REQ-273).
+([CALLS.md](./CALLS.md) §6), and a recorded screen is a video message like any other. A camera in a call is a stream, not a file
+(CALLS.md §7, REQ-160); an audio-only clip stays excluded (REQ-273).
 
 ---
 

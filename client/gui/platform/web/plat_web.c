@@ -161,6 +161,7 @@ void oc_plat_frame_shown(void) {
 }
 const char *oc_plat_mic_settings_name(void) { return "the browser's site settings"; }
 void oc_plat_share_limits(int *max_w, int *max_h) { *max_w = 960; *max_h = 540; }
+void oc_plat_camera_limits(int *max_w, int *max_h, int *max_fps) { *max_w = 640; *max_h = 480; *max_fps = 15; }
 const char *oc_plat_privacy_name(void) { return "The browser"; }
 /* A page cannot open the browser's site settings; the address bar's icon is where they are. */
 int oc_plat_has_privacy_settings(void) { return 0; }

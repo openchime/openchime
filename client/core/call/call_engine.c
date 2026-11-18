@@ -49,7 +49,7 @@
 #define TOKEN_MAX    32
 #define SPEAK_LEVEL  900       /* peak above which a frame is someone talking */
 #define SPEAK_HOLD   300
-#define S2C_HDR      10        /* sender(u64) seq(u16): the relay's framing (AUDIO.md §1.1) */
+#define S2C_HDR      11        /* sender(u64) seq(u16) stream(u8): the relay's framing (AUDIO.md §1.1) */
 /* A sender's STATE packet (OC_CALLPKT_STATE) -- one byte, bit 0 muted -- goes
  * every second while muted, inside the encryption, so the others can show it
  * and the daemon cannot see it. */
@@ -57,8 +57,10 @@
 
 /* The largest packet there is -- a shared screen's fragment, sealed, behind the
  * longest token -- fits, or send_raw would drop every one of them. */
-_Static_assert(TOKEN_MAX + 2 + OC_SFRAME_OVERHEAD + OC_SHARE_MAX_PT <= PACKET_MAX,
+_Static_assert(TOKEN_MAX + 3 + OC_SFRAME_OVERHEAD + OC_SHARE_MAX_PT <= PACKET_MAX,
                "a share fragment must fit one relay packet");
+_Static_assert(S2C_HDR + OC_SFRAME_OVERHEAD + OC_SHARE_MAX_PT <= PACKET_MAX,
+               "a share fragment must fit one forwarded packet");
 
 static void nap(int ms) {
 #ifdef _WIN32
@@ -84,7 +86,45 @@ typedef struct {
     uint32_t    packets, lost, undecryptable;
     uint32_t    rep_packets, rep_lost;   /* at the last share REPORT */
     uint64_t    video_bytes;
+    uint32_t    cam_rep_packets, cam_rep_lost;   /* at the last camera REPORT */
+    uint64_t    cam_bytes;
 } peer;
+
+/* Someone else's camera, received (REQ-160, CALLS.md §7). The receiving half is
+ * share_mu's; the decoder and the frame held for lip sync are the view thread's
+ * own; what is shown is view_mu's (cam_view). */
+typedef struct {
+    int         used;
+    uint64_t    user;
+    int         on;                 /* the roster marks its camera on */
+    oc_share_rx rx;
+    uint32_t    gen;                /* up when it goes on or off: its decoder starts over */
+    int64_t     report_ms;
+    uint32_t    frames, dropped, held, errors;
+} cam_rx;
+
+/* A camera frame received whole and in order, waiting for its sender's voice
+ * before it is decoded and shown (lip sync). Kept encoded: a few kilobytes
+ * where a picture would be hundreds. */
+#define CAM_QUEUE 16                /* over 500 ms at 30 fps: past the longest wait */
+typedef struct { uint32_t aframe; int64_t since; uint8_t *data; size_t len, cap; } cam_pending;
+
+/* What the view thread holds of one camera between frames. */
+typedef struct {
+    uint64_t    user;
+    uint32_t    gen;
+    oc_vp9dec  *dec;
+    cam_pending q[CAM_QUEUE];       /* in order, oldest at q_head */
+    int         q_head, q_n;
+} cam_dec;
+
+/* A camera's newest picture, for the frontend. */
+typedef struct {
+    uint64_t    user;
+    oc_frame    f;
+    uint32_t    seq;
+    int         width, height;
+} cam_pic;
 
 typedef struct {
     int              used;
@@ -140,7 +180,7 @@ struct oc_call_engine {
     /* The connection transport: how to hand a packet to it (NULL when the
      * daemon offers none), whether sending goes that way now, and when the
      * relay was last heard over UDP. */
-    int       (*tcp_send)(void *sctx, uint16_t seq, const uint8_t *ct, size_t len);
+    int       (*tcp_send)(void *sctx, uint16_t seq, uint8_t stream, const uint8_t *ct, size_t len);
     void       *tcp_ctx;
     atomic_int  on_tcp;
     atomic_int  path_lost;   /* UDP worked, then went quiet for udp_lost_ms */
@@ -170,6 +210,31 @@ struct oc_call_engine {
     oc_mutex_t  view_mu;
     oc_frame    view;
     uint32_t    view_seq, view_frame_no;
+
+    /* This device's camera (REQ-160, CALLS.md §7), guarded by share_mu as the
+     * share is: it goes once the roster marks it on. */
+    int         cam_want;          /* this device asked to send its camera */
+    int         cam_confirmed;     /* ...and the roster marks it on */
+    int         cam_error;         /* OC_CAP_* opening or reading the camera */
+    char        cam_dev[256];
+    int         cam_max_w, cam_max_h, cam_max_fps;
+    int         cam_thread;        /* th_cam was started and not yet joined */
+    atomic_int  cam_stop;
+    oc_thread_t th_cam;
+    oc_share_tx ctx;               /* this device's camera, sent */
+    int         cam_w, cam_h, cam_fps, cam_fps_now, cam_step;
+    /* Everyone else's, and whose this device takes (oc_call_engine_camera_subscribe). */
+    cam_rx      cams[MAX_PEERS];
+    int         sub_all, n_subs;
+    uint64_t    subs[MAX_PEERS];
+    /* The audio frame being captured and its time, for stamping camera frames. */
+    atomic_uint mic_frame;
+    atomic_llong mic_pts_us;
+    /* view_mu: this device's own camera as captured (the preview), and the
+     * others' newest pictures. */
+    oc_frame    self_view;
+    uint32_t    self_seq;
+    cam_pic     cam_view[MAX_PEERS];
 };
 
 /* --- the seam ------------------------------------------------------------------ */
@@ -181,8 +246,8 @@ static void m_tx_key(void *ctx, uint32_t epoch, uint8_t slot, const uint8_t key[
 static void m_rx_key(void *ctx, uint64_t user, uint8_t slot, uint32_t epoch, const uint8_t key[OC_CALL_KEY_LEN]);
 static void m_stop(void *ctx);
 static void m_sharer(void *ctx, uint64_t user);
-static void m_tcp(void *ctx, int (*send)(void *, uint16_t, const uint8_t *, size_t), void *sctx);
-static void m_rx_tcp(void *ctx, uint64_t sender, uint16_t seq, const uint8_t *ct, size_t len);
+static void m_tcp(void *ctx, int (*send)(void *, uint16_t, uint8_t, const uint8_t *, size_t), void *sctx);
+static void m_rx_tcp(void *ctx, uint64_t sender, uint16_t seq, uint8_t stream, const uint8_t *ct, size_t len);
 
 static int m_lost(void *ctx);
 
@@ -198,33 +263,36 @@ static uint64_t kid_of(uint32_t epoch, uint8_t slot) { return ((uint64_t)epoch <
 static void send_udp(oc_call_engine *e, const uint8_t *payload, size_t len) {
     if (e->sock < 0) return;                     /* no UDP at all: the call is on TCP */
     uint8_t pkt[PACKET_MAX];
-    if (e->token_len + 2 + len > sizeof pkt) return;
+    if (e->token_len + 3 + len > sizeof pkt) return;
     memcpy(pkt, e->token, e->token_len);
     pkt[e->token_len] = (uint8_t)(e->seq >> 8);
     pkt[e->token_len + 1] = (uint8_t)e->seq;
+    pkt[e->token_len + 2] = OC_CALL_STREAM_AUDIO;
     e->seq++;
-    if (len) memcpy(pkt + e->token_len + 2, payload, len);
-    sendto(e->sock, (const char *)pkt, (int)(e->token_len + 2 + len), 0,
+    if (len) memcpy(pkt + e->token_len + 3, payload, len);
+    sendto(e->sock, (const char *)pkt, (int)(e->token_len + 3 + len), 0,
            (const struct sockaddr *)&e->relay, e->relay_len);
 }
 
-/* One packet to the relay, by the transport in use. Called with mu held: the
- * sequence number and last_send are the call's, shared by every sender. */
-static void send_raw(oc_call_engine *e, const uint8_t *payload, size_t len) {
+/* One packet to the relay on `stream`, by the transport in use. Called with mu
+ * held: the sequence number and last_send are the call's, shared by every
+ * sender. */
+static void send_raw(oc_call_engine *e, uint8_t stream, const uint8_t *payload, size_t len) {
     if (atomic_load(&e->on_tcp) && e->tcp_send) {
-        e->tcp_send(e->tcp_ctx, e->seq++, payload, len);
+        e->tcp_send(e->tcp_ctx, e->seq++, stream, payload, len);
         e->last_send = now_ms();
         return;
     }
     if (e->sock < 0) return;
     uint8_t pkt[PACKET_MAX];
-    if (e->token_len + 2 + len > sizeof pkt) return;
+    if (e->token_len + 3 + len > sizeof pkt) return;
     memcpy(pkt, e->token, e->token_len);
     pkt[e->token_len] = (uint8_t)(e->seq >> 8);
     pkt[e->token_len + 1] = (uint8_t)e->seq;
+    pkt[e->token_len + 2] = stream;
     e->seq++;
-    if (len) memcpy(pkt + e->token_len + 2, payload, len);
-    sendto(e->sock, (const char *)pkt, (int)(e->token_len + 2 + len), 0,
+    if (len) memcpy(pkt + e->token_len + 3, payload, len);
+    sendto(e->sock, (const char *)pkt, (int)(e->token_len + 3 + len), 0,
            (const struct sockaddr *)&e->relay, e->relay_len);
     e->last_send = now_ms();
 }
@@ -233,16 +301,17 @@ static void send_raw(oc_call_engine *e, const uint8_t *payload, size_t len) {
  * sender is still there, and an empty packet says nothing to anyone. */
 static void send_keepalive(oc_call_engine *e) {
     oc_mutex_lock(&e->mu);
-    send_raw(e, NULL, 0);
+    send_raw(e, OC_CALL_STREAM_AUDIO, NULL, 0);
     oc_mutex_unlock(&e->mu);
     e->last_ka = now_ms();
     atomic_fetch_add(&e->keepalives, 1);
 }
 
-/* One packet's plaintext -- its type first -- sealed under the sending key. One
- * counter for every type: it restarts with every key, and a key is never reused
- * (CALLS.md §5.4). */
-static int send_pt(oc_call_engine *e, const uint8_t *pt, size_t n) {
+/* One packet's plaintext -- its type first -- sealed under the sending key, with
+ * the stream it goes on authenticated as the metadata, so the relay, which reads
+ * it in the clear, cannot relabel it. One counter for every type and stream: it
+ * restarts with every key, and a key is never reused (CALLS.md §5.4). */
+static int send_on(oc_call_engine *e, uint8_t stream, const uint8_t *pt, size_t n) {
     uint8_t ct[PACKET_MAX];
     size_t ctlen = 0;
     oc_mutex_lock(&e->mu);
@@ -255,11 +324,22 @@ static int send_pt(oc_call_engine *e, const uint8_t *pt, size_t n) {
         memset(&e->tx_next, 0, sizeof e->tx_next);
     }
     int ok = e->tx.ready && (e->sock >= 0 || atomic_load(&e->on_tcp)) &&
-             oc_sframe_encrypt(&e->tx, e->tx_ctr, NULL, 0, pt, n, ct, sizeof ct, &ctlen) == 0;
+             oc_sframe_encrypt(&e->tx, e->tx_ctr, &stream, 1, pt, n, ct, sizeof ct, &ctlen) == 0;
     if (ok) e->tx_ctr++;
-    if (ok) send_raw(e, ct, ctlen);
+    if (ok) send_raw(e, stream, ct, ctlen);
     oc_mutex_unlock(&e->mu);
     return ok;
+}
+
+/* The stream a plaintext goes on: a shared screen's fragments on the share's,
+ * everything else -- audio, state, the viewers' control packets -- on audio. */
+static uint8_t stream_of(uint8_t type) {
+    return type == OC_CALLPKT_VIDEO ? OC_CALL_STREAM_SHARE :
+           type == OC_CALLPKT_CAMERA ? OC_CALL_STREAM_CAMERA : OC_CALL_STREAM_AUDIO;
+}
+
+static int send_pt(oc_call_engine *e, const uint8_t *pt, size_t n) {
+    return send_on(e, stream_of(pt[0]), pt, n);
 }
 
 /* One Opus frame: type ‖ frame number ‖ packet. */
@@ -287,6 +367,12 @@ static peer *peer_of(oc_call_engine *e, uint64_t user) {
     return NULL;
 }
 
+/* Someone's camera; share_mu held. */
+static cam_rx *cam_of(oc_call_engine *e, uint64_t user) {
+    for (int i = 0; i < MAX_PEERS; i++) if (e->cams[i].used && e->cams[i].user == user) return &e->cams[i];
+    return NULL;
+}
+
 static rxkey *rxkey_of(oc_call_engine *e, uint64_t kid) {
     for (int i = 0; i < MAX_RXKEYS; i++) if (e->rx[i].used && e->rx[i].kid == kid) return &e->rx[i];
     return NULL;
@@ -301,6 +387,7 @@ static void on_packet(oc_call_engine *e, const uint8_t *pkt, size_t n) {
     if (n <= S2C_HDR) return;               /* a keep-alive, or nothing */
     uint64_t sender = 0;
     for (int i = 0; i < 8; i++) sender = (sender << 8) | pkt[i];
+    uint8_t stream = pkt[10];
     const uint8_t *ct = pkt + S2C_HDR;
     size_t ctlen = n - S2C_HDR;
     uint64_t kid, ctr;
@@ -319,7 +406,14 @@ static void on_packet(oc_call_engine *e, const uint8_t *pkt, size_t n) {
     uint8_t pt[PACKET_MAX];
     size_t ptlen = 0;
     uint64_t got_ctr = 0;
-    if (oc_sframe_decrypt(&k->key, NULL, 0, ct, ctlen, pt, sizeof pt, &ptlen, &got_ctr) != 0 || ptlen < 2) {
+    if (oc_sframe_decrypt(&k->key, &stream, 1, ct, ctlen, pt, sizeof pt, &ptlen, &got_ctr) != 0 || ptlen < 2) {
+        p->undecryptable++;
+        oc_mutex_unlock(&e->mu);
+        return;
+    }
+    if (stream_of(pt[0]) != stream) {
+        /* Authentic, but on another stream than its type's: a sender's camera
+         * would pass the receivers' subscriptions on the audio stream. */
         p->undecryptable++;
         oc_mutex_unlock(&e->mu);
         return;
@@ -344,6 +438,8 @@ static void on_packet(oc_call_engine *e, const uint8_t *pkt, size_t n) {
         oc_jb_put(&p->jb, frame, pt + 5, ptlen - 5, now_ms());
     } else if (pt[0] == OC_CALLPKT_VIDEO) {
         p->video_bytes += ptlen;
+    } else if (pt[0] == OC_CALLPKT_CAMERA) {
+        p->cam_bytes += ptlen;
     }
     oc_mutex_unlock(&e->mu);
     /* A share's packets are handled outside mu: share_mu comes first. */
@@ -351,10 +447,18 @@ static void on_packet(oc_call_engine *e, const uint8_t *pkt, size_t n) {
         oc_mutex_lock(&e->share_mu);
         if (sender == e->sharer && sender != e->self_user) oc_share_rx_put(&e->srx, pt + 1, ptlen - 1, now_ms());
         oc_mutex_unlock(&e->share_mu);
+    } else if (pt[0] == OC_CALLPKT_CAMERA) {
+        oc_mutex_lock(&e->share_mu);
+        cam_rx *c = cam_of(e, sender);
+        if (c && c->on) oc_share_rx_put(&c->rx, pt + 1, ptlen - 1, now_ms());
+        oc_mutex_unlock(&e->share_mu);
     } else if (pt[0] == OC_CALLPKT_CONTROL) {
         oc_mutex_lock(&e->share_mu);
-        if (e->share_confirmed && e->sharer == e->self_user)
+        if (oc_share_ctl_pkt(pt + 1, ptlen - 1) == OC_CALLPKT_CAMERA) {
+            if (e->cam_confirmed) oc_share_tx_control(&e->ctx, sender, pt + 1, ptlen - 1, now_ms(), share_emit, e);
+        } else if (e->share_confirmed && e->sharer == e->self_user) {
             oc_share_tx_control(&e->stx, sender, pt + 1, ptlen - 1, now_ms(), share_emit, e);
+        }
         oc_mutex_unlock(&e->share_mu);
     }
 }
@@ -513,6 +617,9 @@ static void *capture_main(void *arg) {
         int lvl = peak(frame, FRAME);
         atomic_store(&e->mic_level, lvl);
         uint32_t f = frame_no++;
+        /* What a camera frame captured now is stamped with (lip sync). */
+        atomic_store(&e->mic_pts_us, frame_pts);
+        atomic_store(&e->mic_frame, f);
         int open = !atomic_load(&e->muted) || atomic_load(&e->ptt);
         atomic_store(&e->speaking, open && lvl > SPEAK_LEVEL);
         if (!open) {
@@ -730,6 +837,159 @@ static void share_join(oc_call_engine *e) {
     atomic_store(&e->share_stop, 0);
 }
 
+/* --- sending this device's camera: capture -> ladder -> VP9 -> fragments ----------- */
+
+typedef struct { oc_call_engine *e; int w, h; uint32_t aframe; uint8_t *buf; size_t cap; } cam_ctx;
+
+static void cam_packet(void *ctx, const oc_packet *pk) {
+    cam_ctx *cc = ctx;
+    oc_call_engine *e = cc->e;
+    if (OC_CAM_PREFIX + pk->len > cc->cap) {
+        uint8_t *nb = realloc(cc->buf, OC_CAM_PREFIX + pk->len);
+        if (!nb) return;
+        cc->buf = nb; cc->cap = OC_CAM_PREFIX + pk->len;
+    }
+    size_t n = oc_cam_frame_put(cc->buf, cc->aframe, pk->data, pk->len);
+    oc_mutex_lock(&e->share_mu);
+    oc_share_tx_frame(&e->ctx, cc->buf, n, pk->keyframe, cc->w, cc->h, now_ms(), share_emit, e);
+    oc_mutex_unlock(&e->share_mu);
+}
+
+/* The audio frame this device was capturing at `pts_us`: the number its voice
+ * carries, so a receiver can show the picture with the voice (lip sync). */
+static uint32_t aframe_at(oc_call_engine *e, int64_t pts_us) {
+    int64_t mic_pts = atomic_load(&e->mic_pts_us);
+    uint32_t f = atomic_load(&e->mic_frame);
+    if (!mic_pts) return f;
+    int64_t d = pts_us - mic_pts;
+    return f + (uint32_t)(int32_t)(d >= 0 ? d / 20000 : -((-d + 19999) / 20000));
+}
+
+static void self_view_set(oc_call_engine *e, const oc_frame *f) {
+    oc_mutex_lock(&e->view_mu);
+    if (!f) {
+        oc_frame_free(&e->self_view);
+        memset(&e->self_view, 0, sizeof e->self_view);
+    } else {
+        if (e->self_view.width != f->width || e->self_view.height != f->height) {
+            oc_frame_free(&e->self_view);
+            if (oc_frame_alloc(&e->self_view, f->width, f->height) != 0) memset(&e->self_view, 0, sizeof e->self_view);
+        }
+        if (e->self_view.width) oc_frame_copy(&e->self_view, f);
+    }
+    e->self_seq++;
+    oc_mutex_unlock(&e->view_mu);
+}
+
+static void *cam_main(void *arg) {
+    oc_call_engine *e = arg;
+    oc_mutex_lock(&e->share_mu);
+    char dev[256];
+    snprintf(dev, sizeof dev, "%s", e->cam_dev);
+    int mw = e->cam_max_w, mh = e->cam_max_h, mfps = e->cam_max_fps;
+    oc_mutex_unlock(&e->share_mu);
+    int err = 0;
+    oc_capture *cap = oc_capture_open(dev[0] ? dev : NULL, mw, mh, mfps, &err);
+    if (cap && (err = oc_capture_start(cap)) != OC_CAP_OK) { oc_capture_close(cap); cap = NULL; }
+    if (!cap) {
+        oc_mutex_lock(&e->share_mu);
+        e->cam_error = err ? err : OC_CAP_FAILED;
+        e->cam_want = 0;
+        oc_mutex_unlock(&e->share_mu);
+        return NULL;
+    }
+    oc_vp9enc *enc = NULL;
+    oc_frame scaled = { 0 };
+    cam_ctx cc = { e, 0, 0, 0, NULL, 0 };
+    oc_cam_ladder ladder;
+    oc_cam_ladder_init(&ladder, now_ms());
+    int was_confirmed = 0, sent_in_sec = 0;
+    int64_t last_sent = 0, sec_at = now_ms();
+    while (!atomic_load(&e->cam_stop) && !atomic_load(&e->stop)) {
+        oc_frame f;
+        int rc = oc_capture_next(cap, &f, 100);
+        if (rc < 0) {
+            oc_mutex_lock(&e->share_mu);
+            e->cam_error = rc;
+            oc_mutex_unlock(&e->share_mu);
+            break;
+        }
+        int64_t t = now_ms();
+        if (t - sec_at >= 1000) {
+            oc_mutex_lock(&e->share_mu);
+            e->cam_fps_now = sent_in_sec;
+            oc_mutex_unlock(&e->share_mu);
+            sent_in_sec = 0;
+            sec_at = t;
+        }
+        if (rc == 0) continue;
+        self_view_set(e, &f);                         /* the preview, whatever goes out */
+        oc_mutex_lock(&e->share_mu);
+        int confirmed = e->cam_confirmed;
+        if (confirmed && !was_confirmed) { oc_share_tx_restart(&e->ctx, t); oc_cam_ladder_init(&ladder, t); }
+        int want_key = confirmed && oc_share_tx_want_keyframe(&e->ctx, t);
+        int kbps = confirmed ? oc_share_tx_kbps(&e->ctx, t) : OC_CAM_KBPS_START;
+        oc_mutex_unlock(&e->share_mu);
+        if (!confirmed) { was_confirmed = 0; continue; }   /* the roster does not mark it on yet */
+        int w, h, fps;
+        int step = oc_cam_ladder_pick(&ladder, kbps, t, f.width, f.height, mw, mh, mfps, &w, &h, &fps);
+        /* The step's frame rate: a frame no sooner than its interval allows,
+         * less a few ms for the capture's own timing. */
+        if (was_confirmed && !want_key && t - last_sent < 1000 / fps - 5) continue;
+        if (!enc || w != cc.w || h != cc.h) {
+            oc_vp9enc_close(enc);
+            oc_frame_free(&scaled);
+            enc = oc_vp9enc_open_camera(w, h, 30, (unsigned)kbps);
+            if (!enc || ((w != f.width || h != f.height) && oc_frame_alloc(&scaled, w, h) != 0)) {
+                oc_vp9enc_close(enc);
+                enc = NULL;
+                oc_mutex_lock(&e->share_mu);
+                e->cam_error = OC_CAP_FAILED;
+                oc_mutex_unlock(&e->share_mu);
+                break;
+            }
+            cc.w = w; cc.h = h;
+            want_key = 1;
+        }
+        oc_mutex_lock(&e->share_mu);
+        e->cam_w = w; e->cam_h = h; e->cam_fps = fps; e->cam_step = step;
+        oc_mutex_unlock(&e->share_mu);
+        const oc_frame *in = &f;
+        if (w != f.width || h != f.height) {
+            oc_i420_fit(&f, &scaled);
+            scaled.pts_us = f.pts_us;
+            in = &scaled;
+        }
+        cc.aframe = aframe_at(e, f.pts_us);
+        oc_vp9enc_set_bitrate(enc, (unsigned)kbps);
+        if (oc_vp9enc_encode(enc, in, want_key, cam_packet, &cc) != 0) break;
+        was_confirmed = 1;
+        last_sent = t;
+        sent_in_sec++;
+    }
+    oc_vp9enc_close(enc);
+    oc_frame_free(&scaled);
+    free(cc.buf);
+    oc_capture_close(cap);                            /* the camera is released at once */
+    self_view_set(e, NULL);
+    oc_mutex_lock(&e->share_mu);
+    e->cam_fps_now = 0;
+    oc_mutex_unlock(&e->share_mu);
+    return NULL;
+}
+
+/* Join the camera thread, if there is one. Not with share_mu held. */
+static void cam_join(oc_call_engine *e) {
+    oc_mutex_lock(&e->share_mu);
+    int running = e->cam_thread;
+    e->cam_thread = 0;
+    oc_mutex_unlock(&e->share_mu);
+    if (!running) return;
+    atomic_store(&e->cam_stop, 1);
+    oc_thread_join(e->th_cam);
+    atomic_store(&e->cam_stop, 0);
+}
+
 /* --- watching someone's share: fragments -> frames -> VP9 -> the frontend ---------- */
 
 static void view_clear(oc_call_engine *e) {
@@ -740,15 +1000,179 @@ static void view_clear(oc_call_engine *e) {
     oc_mutex_unlock(&e->view_mu);
 }
 
+/* --- watching the others' cameras: fragments -> frames -> VP9 -> lip sync ---------- */
+
+/* Whether this device takes `user`'s camera; share_mu held. */
+static int subscribed(const oc_call_engine *e, uint64_t user) {
+    if (e->sub_all) return 1;
+    for (int i = 0; i < e->n_subs; i++) if (e->subs[i] == user) return 1;
+    return 0;
+}
+
+/* Publish `f` as `user`'s newest picture in slot `i`, or (f NULL) say it is gone. */
+static void cam_publish(oc_call_engine *e, int i, uint64_t user, const oc_frame *f) {
+    oc_mutex_lock(&e->view_mu);
+    cam_pic *v = &e->cam_view[i];
+    if (v->user != user || !f) {
+        oc_frame_free(&v->f);
+        memset(&v->f, 0, sizeof v->f);
+        v->width = v->height = 0;
+    }
+    v->user = user;
+    if (f) {
+        if (v->f.width != f->width || v->f.height != f->height) {
+            oc_frame_free(&v->f);
+            if (oc_frame_alloc(&v->f, f->width, f->height) != 0) memset(&v->f, 0, sizeof v->f);
+        }
+        if (v->f.width) { oc_frame_copy(&v->f, f); v->width = f->width; v->height = f->height; }
+    }
+    v->seq++;
+    oc_mutex_unlock(&e->view_mu);
+}
+
+/* What of `user`'s voice is playing here: nonzero while it is, with the last
+ * frame played. */
+static int voice_of(oc_call_engine *e, uint64_t user, uint32_t *played) {
+    oc_mutex_lock(&e->mu);
+    peer *p = peer_of(e, user);
+    int voice = p && p->jb.started && !p->jb.idle;
+    *played = p ? p->jb.play - 1 : 0;
+    oc_mutex_unlock(&e->mu);
+    return voice;
+}
+
+static void cam_dec_reset(cam_dec *d) {
+    if (d->dec) oc_vp9dec_close(d->dec);
+    for (int i = 0; i < CAM_QUEUE; i++) free(d->q[i].data);
+    memset(d, 0, sizeof *d);
+}
+
+/* Decode the oldest waiting frame, and show it unless `show` is 0 -- a frame too
+ * late to show is still decoded, for the frames after it. 1 shown, 0 not, -1 the
+ * decoder failed. */
+static int cam_take(oc_call_engine *e, int i, cam_dec *d, int show) {
+    cam_pending *f = &d->q[d->q_head];
+    d->q_head = (d->q_head + 1) % CAM_QUEUE;
+    d->q_n--;
+    const uint8_t *vp9; size_t vn; uint32_t aframe;
+    if (oc_cam_frame_get(f->data, f->len, &aframe, &vp9, &vn) != 0) return -1;
+    if (!d->dec && !(d->dec = oc_vp9dec_open())) return -1;
+    oc_frame out;
+    int rc = oc_vp9dec_decode(d->dec, vp9, vn, 0, &out);
+    if (rc < 0) return -1;
+    if (rc == 0 && show) { cam_publish(e, i, d->user, &out); return 1; }
+    return 0;
+}
+
+/* One camera's turn in the view thread: ask for what is missing, report, queue
+ * what has come in order, and decode and show each frame when its sender's voice
+ * reaches it. Called and returns without share_mu. */
+static void cam_view_one(oc_call_engine *e, int i, cam_dec *d, int64_t t) {
+    oc_mutex_lock(&e->share_mu);
+    cam_rx *c = &e->cams[i];
+    int live = c->used && c->on && subscribed(e, c->user);
+    if (!live || d->user != c->user || d->gen != c->gen) {
+        int had = d->dec != NULL || d->q_n;
+        uint64_t was = d->user;
+        cam_dec_reset(d);
+        if (live) { d->user = c->user; d->gen = c->gen; }
+        oc_mutex_unlock(&e->share_mu);
+        if (had && !live) cam_publish(e, i, was, NULL);
+        if (!live) return;
+        oc_mutex_lock(&e->share_mu);
+    }
+    uint64_t user = c->user;
+    oc_share_rx_poll(&c->rx, t, share_emit, e);
+    if (t - c->report_ms >= OC_SHARE_REPORT_MS) {
+        /* Loss over every type this sender sends, by its SFrame counter, and the
+         * camera's own bytes. */
+        int permille = 0;
+        uint32_t kbps = 0;
+        int64_t span = c->report_ms ? t - c->report_ms : OC_SHARE_REPORT_MS;
+        oc_mutex_lock(&e->mu);
+        peer *p = peer_of(e, user);
+        if (p) {
+            uint32_t got = p->packets - p->cam_rep_packets, lost = p->lost - p->cam_rep_lost;
+            permille = got + lost ? (int)(lost * 1000u / (got + lost)) : 0;
+            kbps = (uint32_t)(p->cam_bytes * 8 / (uint64_t)(span > 0 ? span : 1));
+            p->cam_rep_packets = p->packets;
+            p->cam_rep_lost = p->lost;
+            p->cam_bytes = 0;
+        }
+        oc_mutex_unlock(&e->mu);
+        uint8_t pkt[OC_SHARE_CTL_MAX];
+        if (p) share_emit(e, pkt, oc_share_ctl_report(pkt, OC_CALLPKT_CAMERA, user, permille, kbps));
+        c->report_ms = t;
+    }
+    uint32_t gen = c->gen;
+    int shown = 0, dropped = 0, held = 0, failed = 0;
+    for (;;) {
+        const uint8_t *data; size_t len; int key, w, h; uint32_t fno;
+        if (!oc_share_rx_next(&c->rx, &data, &len, &key, &w, &h, &fno)) break;
+        uint32_t aframe; const uint8_t *vp9; size_t vn;
+        if (oc_cam_frame_get(data, len, &aframe, &vp9, &vn) != 0) { failed = 1; break; }
+        oc_mutex_unlock(&e->share_mu);
+        /* Full: the oldest goes now, shown, to make room. */
+        if (d->q_n == CAM_QUEUE) {
+            int r = cam_take(e, i, d, 1);
+            if (r < 0) failed = 1; else shown += r;
+        }
+        oc_mutex_lock(&e->share_mu);
+        if (failed || gen != c->gen) break;
+        cam_pending *f = &d->q[(d->q_head + d->q_n) % CAM_QUEUE];
+        if (len > f->cap) {
+            uint8_t *nb = realloc(f->data, len);
+            if (!nb) break;
+            f->data = nb; f->cap = len;
+        }
+        memcpy(f->data, data, len);
+        f->len = len;
+        f->aframe = aframe;
+        f->since = t;
+        d->q_n++;
+    }
+    oc_mutex_unlock(&e->share_mu);
+    /* Show what the voice has reached, oldest first; a frame ahead of it waits,
+     * and those after it with it. */
+    uint32_t played = 0;
+    int voice = d->q_n ? voice_of(e, user, &played) : 0;
+    while (d->q_n && !failed) {
+        cam_pending *f = &d->q[d->q_head];
+        int what = oc_cam_sync(f->aframe, voice, played, t - f->since);
+        if (what == OC_CAM_HOLD) break;
+        int waited = t > f->since;
+        int r = cam_take(e, i, d, what == OC_CAM_SHOW);
+        if (r < 0) failed = 1;
+        else if (r) { shown++; held += waited; }
+        else dropped++;
+    }
+    oc_mutex_lock(&e->share_mu);
+    if (gen == c->gen) {
+        c->frames += (uint32_t)shown;
+        c->dropped += (uint32_t)dropped;
+        c->held += (uint32_t)held;
+        if (failed) {
+            c->errors++;
+            oc_share_rx_need_key(&c->rx);
+            /* What waits depends on what failed: nothing of it decodes now. */
+            while (d->q_n) { d->q_head = (d->q_head + 1) % CAM_QUEUE; d->q_n--; }
+            if (d->dec) { oc_vp9dec_close(d->dec); d->dec = NULL; }
+        }
+    }
+    oc_mutex_unlock(&e->share_mu);
+}
+
 static void *view_main(void *arg) {
     oc_call_engine *e = arg;
     oc_vp9dec *dec = NULL;
     uint32_t gen = 0;
     uint8_t *buf = NULL;
     size_t cap = 0;
+    cam_dec *cd = calloc(MAX_PEERS, sizeof *cd);
     while (!atomic_load(&e->stop)) {
         nap(5);
         int64_t t = now_ms();
+        for (int i = 0; cd && i < MAX_PEERS; i++) cam_view_one(e, i, &cd[i], t);
         oc_mutex_lock(&e->share_mu);
         uint64_t sharer = e->sharer;
         if (!sharer || sharer == e->self_user) {
@@ -776,7 +1200,7 @@ static void *view_main(void *arg) {
             }
             oc_mutex_unlock(&e->mu);
             uint8_t pkt[OC_SHARE_CTL_MAX];
-            if (p) share_emit(e, pkt, oc_share_ctl_report(pkt, sharer, permille, kbps));
+            if (p) share_emit(e, pkt, oc_share_ctl_report(pkt, OC_CALLPKT_VIDEO, sharer, permille, kbps));
             e->report_ms = t;
         }
         for (;;) {
@@ -812,6 +1236,8 @@ static void *view_main(void *arg) {
         oc_mutex_unlock(&e->share_mu);
     }
     if (dec) oc_vp9dec_close(dec);
+    for (int i = 0; cd && i < MAX_PEERS; i++) cam_dec_reset(&cd[i]);
+    free(cd);
     free(buf);
     return NULL;
 }
@@ -845,6 +1271,7 @@ static void m_sharer(void *ctx, uint64_t user) {
 
 static void stop_threads(oc_call_engine *e) {
     share_join(e);          /* even between calls: a share started as one ended */
+    cam_join(e);            /* and a camera */
     if (!e->active) return;
     atomic_store(&e->stop, 1);
     oc_thread_join(e->th_io);
@@ -880,8 +1307,24 @@ static void forget_share(oc_call_engine *e) {
     oc_share_rx_init(&e->srx, 0);
     e->rx_gen++;
     e->share_fps_now = 0;
+    /* And the cameras: this device's is off -- a rejoin or a new call starts
+     * with it off, as the daemon's roster does -- and nobody else's is had. */
+    e->cam_want = e->cam_confirmed = 0;
+    e->cam_fps_now = 0;
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (e->cams[i].used) oc_share_rx_free(&e->cams[i].rx);
+        memset(&e->cams[i], 0, sizeof e->cams[i]);
+    }
+    e->sub_all = 1;
+    e->n_subs = 0;
     oc_mutex_unlock(&e->share_mu);
     view_clear(e);
+    oc_mutex_lock(&e->view_mu);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        oc_frame_free(&e->cam_view[i].f);
+        memset(&e->cam_view[i], 0, sizeof e->cam_view[i]);
+    }
+    oc_mutex_unlock(&e->view_mu);
 }
 
 static int m_start(void *ctx, const char *host, uint16_t port, const uint8_t *token, size_t token_len,
@@ -924,6 +1367,7 @@ static int m_start(void *ctx, const char *host, uint16_t port, const uint8_t *to
     e->slot = self_slot;
     oc_mutex_lock(&e->share_mu);
     e->stx.self = self_user;
+    e->ctx.self = self_user;
     oc_mutex_unlock(&e->share_mu);
     e->seq = 0;
     e->last_send = 0;
@@ -952,7 +1396,7 @@ static int m_start(void *ctx, const char *host, uint16_t port, const uint8_t *to
     return 0;
 }
 
-static void m_tcp(void *ctx, int (*send)(void *, uint16_t, const uint8_t *, size_t), void *sctx) {
+static void m_tcp(void *ctx, int (*send)(void *, uint16_t, uint8_t, const uint8_t *, size_t), void *sctx) {
     oc_call_engine *e = ctx;
     oc_mutex_lock(&e->mu);
     e->tcp_send = send;
@@ -961,12 +1405,13 @@ static void m_tcp(void *ctx, int (*send)(void *, uint16_t, const uint8_t *, size
 }
 
 /* A packet the relay sent by the connection: the same bytes a datagram carries. */
-static void m_rx_tcp(void *ctx, uint64_t sender, uint16_t seq, const uint8_t *ct, size_t len) {
+static void m_rx_tcp(void *ctx, uint64_t sender, uint16_t seq, uint8_t stream, const uint8_t *ct, size_t len) {
     oc_call_engine *e = ctx;
     uint8_t pkt[PACKET_MAX + S2C_HDR];
     if (len + S2C_HDR > sizeof pkt) return;
     for (int i = 0; i < 8; i++) pkt[i] = (uint8_t)(sender >> (56 - 8 * i));
     pkt[8] = (uint8_t)(seq >> 8); pkt[9] = (uint8_t)seq;
+    pkt[10] = stream;
     if (len) memcpy(pkt + S2C_HDR, ct, len);
     on_packet(e, pkt, S2C_HDR + len);
 }
@@ -1011,9 +1456,41 @@ static void m_roster(void *ctx, uint32_t epoch, const oc_call_part *parts, int n
         p->slot = parts[k].slot;
     }
     oc_mutex_unlock(&e->mu);
-    /* Whoever left no longer holds a share's bitrate down. */
+    /* Whoever left no longer holds a share's or a camera's bitrate down. The
+     * roster marks whose cameras are on: one that goes on is received from its
+     * next keyframe, one that goes off is gone. This device's own goes out once
+     * the roster marks it. */
     oc_mutex_lock(&e->share_mu);
-    for (int i = 0; i < n_gone; i++) oc_share_tx_forget(&e->stx, gone[i]);
+    for (int i = 0; i < n_gone; i++) { oc_share_tx_forget(&e->stx, gone[i]); oc_share_tx_forget(&e->ctx, gone[i]); }
+    for (int i = 0; i < MAX_PEERS; i++) {
+        cam_rx *c = &e->cams[i];
+        if (!c->used) continue;
+        int here = 0;
+        for (int k = 0; k < n; k++) if (parts[k].user_id == c->user) here = 1;
+        if (here) continue;
+        oc_share_rx_free(&c->rx);
+        memset(c, 0, sizeof *c);
+    }
+    for (int k = 0; k < n; k++) {
+        int on = (parts[k].flags & OC_CALL_PART_CAMERA) != 0;
+        if (parts[k].user_id == e->self_user) { e->cam_confirmed = e->cam_want && on; continue; }
+        cam_rx *c = cam_of(e, parts[k].user_id);
+        if (!c) {
+            for (int i = 0; i < MAX_PEERS && !c; i++) if (!e->cams[i].used) c = &e->cams[i];
+            if (!c) continue;
+            memset(c, 0, sizeof *c);
+            c->used = 1;
+            c->user = parts[k].user_id;
+            oc_share_rx_init_camera(&c->rx, c->user);
+        }
+        if (c->on != on) {
+            c->on = on;
+            oc_share_rx_free(&c->rx);
+            oc_share_rx_init_camera(&c->rx, c->user);
+            c->gen++;
+            c->report_ms = 0;
+        }
+    }
     oc_mutex_unlock(&e->share_mu);
 }
 
@@ -1107,7 +1584,9 @@ oc_call_engine *oc_call_engine_new(const oc_call_engine_opts *o) {
     oc_mutex_init(&e->share_mu);
     oc_mutex_init(&e->view_mu);
     oc_share_rx_init(&e->srx, 0);
-    if (oc_share_tx_init(&e->stx, 0) != 0) {
+    e->sub_all = 1;
+    if (oc_share_tx_init(&e->stx, 0) != 0 || oc_share_tx_init_camera(&e->ctx, 0) != 0) {
+        oc_share_tx_free(&e->stx);
         oc_mutex_destroy(&e->view_mu); oc_mutex_destroy(&e->share_mu); oc_mutex_destroy(&e->mu);
         free(e);
         return NULL;
@@ -1119,9 +1598,13 @@ void oc_call_engine_free(oc_call_engine *e) {
     if (!e) return;
     m_stop(e);
     share_join(e);
+    cam_join(e);
     oc_share_tx_free(&e->stx);
+    oc_share_tx_free(&e->ctx);
     oc_share_rx_free(&e->srx);
     oc_frame_free(&e->view);
+    oc_frame_free(&e->self_view);
+    for (int i = 0; i < MAX_PEERS; i++) oc_frame_free(&e->cam_view[i].f);
     oc_mutex_destroy(&e->view_mu);
     oc_mutex_destroy(&e->share_mu);
     oc_mutex_destroy(&e->mu);
@@ -1170,6 +1653,73 @@ int oc_call_engine_share_frame(oc_call_engine *e, oc_frame *dst, uint32_t *seq, 
     } else if (!e->view.width && *seq != e->view_seq) {
         *seq = e->view_seq;
         rc = -1;                                     /* nothing to show any more */
+    }
+    oc_mutex_unlock(&e->view_mu);
+    return rc;
+}
+
+int oc_call_engine_camera_start(oc_call_engine *e, const char *device_id, int max_w, int max_h, int max_fps) {
+    cam_join(e);
+    oc_mutex_lock(&e->share_mu);
+    if (!e->active) { oc_mutex_unlock(&e->share_mu); return -1; }
+    snprintf(e->cam_dev, sizeof e->cam_dev, "%s", device_id ? device_id : "");
+    e->cam_max_w = max_w > 0 && max_w < 640 ? max_w : 640;
+    e->cam_max_h = max_h > 0 && max_h < 480 ? max_h : 480;
+    e->cam_max_fps = max_fps > 0 && max_fps < 30 ? max_fps : 30;
+    e->cam_want = 1;
+    e->cam_error = 0;
+    e->cam_w = e->cam_h = e->cam_fps = 0;
+    e->cam_step = 0;
+    /* A roster already marking it on (turned off and on again quickly) counts. */
+    e->cam_confirmed = 0;
+    atomic_store(&e->cam_stop, 0);
+    int rc = oc_thread_create(&e->th_cam, cam_main, e);
+    if (rc == 0) e->cam_thread = 1;
+    else e->cam_want = 0;
+    oc_mutex_unlock(&e->share_mu);
+    return rc == 0 ? 0 : -1;
+}
+
+void oc_call_engine_camera_stop(oc_call_engine *e) {
+    cam_join(e);
+    oc_mutex_lock(&e->share_mu);
+    e->cam_want = e->cam_confirmed = 0;
+    oc_mutex_unlock(&e->share_mu);
+    self_view_set(e, NULL);
+}
+
+void oc_call_engine_camera_subscribe(oc_call_engine *e, int all, const uint64_t *users, int n) {
+    oc_mutex_lock(&e->share_mu);
+    e->sub_all = all ? 1 : 0;
+    e->n_subs = 0;
+    for (int i = 0; !all && users && i < n && i < MAX_PEERS; i++) e->subs[e->n_subs++] = users[i];
+    oc_mutex_unlock(&e->share_mu);
+}
+
+int oc_call_engine_camera_frame(oc_call_engine *e, uint64_t user, oc_frame *dst, uint32_t *seq) {
+    oc_mutex_lock(&e->view_mu);
+    const oc_frame *src = NULL;
+    uint32_t s = 0;
+    int known = 0;
+    if (user == e->self_user || !user) {
+        src = &e->self_view; s = e->self_seq; known = 1;
+    } else {
+        for (int i = 0; i < MAX_PEERS; i++)
+            if (e->cam_view[i].user == user) { src = &e->cam_view[i].f; s = e->cam_view[i].seq; known = 1; break; }
+    }
+    int rc = 0;
+    if (known && *seq != s) {
+        if (src->width) {
+            if (dst->width != src->width || dst->height != src->height) {
+                oc_frame_free(dst);
+                if (oc_frame_alloc(dst, src->width, src->height) != 0) { oc_mutex_unlock(&e->view_mu); return 0; }
+            }
+            oc_frame_copy(dst, src);
+            rc = 1;
+        } else {
+            rc = -1;                                  /* no picture any more */
+        }
+        *seq = s;
     }
     oc_mutex_unlock(&e->view_mu);
     return rc;
@@ -1270,10 +1820,41 @@ void oc_call_engine_stats(oc_call_engine *e, oc_call_stats *out) {
     out->view_plis = e->srx.plis;
     out->view_skipped = e->srx.skipped;
     out->view_errors = e->view_errors;
+    out->camera_state = !e->cam_want ? 0 : e->cam_confirmed ? 2 : 1;
+    out->camera_error = e->cam_error;
+    out->camera_width = e->cam_w;
+    out->camera_height = e->cam_h;
+    out->camera_fps = e->cam_fps_now;
+    out->camera_fps_target = e->cam_fps;
+    out->camera_step = e->cam_step;
+    out->camera_kbps = e->ctx.kbps;
+    out->camera_frames = e->ctx.frames;
+    out->camera_keyframes = e->ctx.keyframes;
+    out->camera_resent = e->ctx.resent;
+    out->camera_reports = e->ctx.reports;
+    out->subscribed_all = e->sub_all;
+    for (int k = 0; k < out->n_peers; k++) {
+        cam_rx *c = cam_of(e, out->peers[k].user_id);
+        if (!c) continue;
+        out->peers[k].camera_on = c->on;
+        out->peers[k].camera_subscribed = subscribed(e, c->user);
+        out->peers[k].cam_frames = c->frames;
+        out->peers[k].cam_dropped = c->dropped;
+        out->peers[k].cam_held = c->held;
+        out->peers[k].cam_errors = c->errors;
+        out->peers[k].cam_nacks = c->rx.nacks;
+        out->peers[k].cam_plis = c->rx.plis;
+    }
     oc_mutex_unlock(&e->share_mu);
     oc_mutex_lock(&e->view_mu);
     out->view_width = e->view.width;
     out->view_height = e->view.height;
     out->view_frame_no = e->view_frame_no;
+    for (int k = 0; k < out->n_peers; k++)
+        for (int i = 0; i < MAX_PEERS; i++)
+            if (e->cam_view[i].user == out->peers[k].user_id) {
+                out->peers[k].cam_width = e->cam_view[i].width;
+                out->peers[k].cam_height = e->cam_view[i].height;
+            }
     oc_mutex_unlock(&e->view_mu);
 }

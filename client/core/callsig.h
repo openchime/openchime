@@ -51,13 +51,13 @@ typedef struct {
     uint8_t codecs;
     /* The connection transport (PROTOCOL.md §5.17), for when UDP cannot reach
      * the relay. Before start, the core hands the engine `send` -- which queues
-     * one packet ({seq, ciphertext}) to go out as CALL_MEDIA, from any thread,
+     * one packet ({seq, stream, ciphertext}) to go out as CALL_MEDIA, from any thread,
      * never blocking -- or NULL when the daemon offers no such transport. The
      * core hands the engine every CALL_MEDIA that comes back through `rx_tcp`.
      * Either may be NULL in an engine that has no use for them. */
-    void (*tcp)(void *ctx, int (*send)(void *sctx, uint16_t seq, const uint8_t *ct, size_t len),
+    void (*tcp)(void *ctx, int (*send)(void *sctx, uint16_t seq, uint8_t stream, const uint8_t *ct, size_t len),
                 void *sctx);
-    void (*rx_tcp)(void *ctx, uint64_t sender, uint16_t seq, const uint8_t *ct, size_t len);
+    void (*rx_tcp)(void *ctx, uint64_t sender, uint16_t seq, uint8_t stream, const uint8_t *ct, size_t len);
     /* Nonzero once UDP that worked has gone quiet (AUDIO.md §4): the path has
      * most likely moved to an address the relay will not take for this token,
      * and the core rejoins for a fresh one. NULL in an engine that cannot tell. */
@@ -98,7 +98,7 @@ typedef struct {
 
     int      tcp_ok;               /* the daemon offers calls-tcp (CAPABILITIES) */
     oc_mutex_t tq_mu;              /* guards the queue: filled by the engine's threads */
-    struct { uint16_t seq, len; uint8_t ct[OC_CALLSIG_TCPMAX]; } tq[OC_CALLSIG_TCPQ];
+    struct { uint16_t seq, len; uint8_t stream; uint8_t ct[OC_CALLSIG_TCPMAX]; } tq[OC_CALLSIG_TCPQ];
     int      tq_head, tq_n;
     void   (*wake)(void *wctx);    /* ends the connection thread's wait: a packet is queued */
     void    *wake_ctx;

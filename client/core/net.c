@@ -3628,7 +3628,7 @@ static int run_connection(oc_net *n, int reconnecting,
                     continue;
                 }
             }
-            if (c->type >= OC_CMD_CALL_JOIN && c->type <= OC_CMD_CALL_SHARE) {
+            if (c->type >= OC_CMD_CALL_JOIN && c->type <= OC_CMD_CALL_VIDEO_SUB) {
                 (void)oc_callsig_command(&n->calls, c, cs ? cs->store : NULL, cs ? cs->workspace : NULL,
                                          ctx_write, &ctx, n->to_ui);
                 oc_cmd_free(c);

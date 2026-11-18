@@ -14,6 +14,11 @@
  * the table (ARCH-22). Each forwarded packet goes to the call's other
  * participants in one sendmmsg.
  *
+ * Every packet names its stream (audio.h). A camera's packets go only while the
+ * net loop says that participant's camera is on, and only to those whose
+ * subscription takes them: every camera, until a participant names whose it
+ * wants (CALL_VIDEO_SUB). Audio and a shared screen go to everyone.
+ *
  * A participant whose network passes no UDP sends and receives over its
  * connection instead (CALL_MEDIA, PROTOCOL.md §5.17): the loop hands such a
  * packet to oc_relay_from_tcp, and the relay hands packets for such a
@@ -39,7 +44,7 @@ typedef struct {
     /* A packet for a participant on the connection transport: `sender`'s
      * `seq` and ciphertext, for the loop to write as CALL_MEDIA to connection
      * `conn_id`, or to drop if that connection is backed up. */
-    void (*tcp_send)(void *ctx, uint64_t conn_id, uint64_t sender, uint16_t seq,
+    void (*tcp_send)(void *ctx, uint64_t conn_id, uint64_t sender, uint16_t seq, uint8_t stream,
                      const uint8_t *ct, size_t len);
 } oc_relay_hooks;
 
@@ -61,7 +66,19 @@ int  oc_relay_authorize(oc_relay *r, uint64_t call_id, uint64_t user_id, uint64_
 /* A packet connection `conn_id` sent as CALL_MEDIA: relayed as a UDP one from
  * that participant would be, and the participant is now on the connection
  * transport. 0, or -1 if the connection is no participant. */
-int  oc_relay_from_tcp(oc_relay *r, uint64_t conn_id, uint16_t seq, const uint8_t *ct, size_t len);
+int  oc_relay_from_tcp(oc_relay *r, uint64_t conn_id, uint16_t seq, uint8_t stream,
+                       const uint8_t *ct, size_t len);
+
+/* The camera of the participant on connection `conn_id` is on (1) or off (0):
+ * its camera stream is relayed only while on. A participant starts with it off,
+ * and authorizing a token again turns it off. 0, or -1 if the connection is no
+ * participant. */
+int  oc_relay_set_camera(oc_relay *r, uint64_t conn_id, int on);
+/* Whose cameras the participant on connection `conn_id` receives: every one
+ * (`all`), or the `n` users named (at most OC_MAX_CALL_PARTICIPANTS). A
+ * participant starts with every one. 0, or -1 if the connection is no
+ * participant or `n` is too many. */
+int  oc_relay_subscribe(oc_relay *r, uint64_t conn_id, int all, const uint64_t *users, int n);
 void oc_relay_revoke(oc_relay *r, const uint8_t *token, size_t len);
 
 /* Relay up to `max_packets` waiting datagrams. 1 if it stopped at that bound

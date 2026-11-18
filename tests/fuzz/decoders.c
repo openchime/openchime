@@ -111,6 +111,9 @@ void oc_fuzz_decode_all(const uint8_t *buf, size_t len, oc_fuzz_bad_fn bad) {
     oc_call_share csh; D(oc_decode_call_share(&p, &csh));
     oc_call_media_pkt cmu; D(oc_decode_call_media_up(&p, &cmu));
     oc_call_media_pkt cmd; D(oc_decode_call_media_down(&p, &cmd));
+    oc_call_camera ccam; D(oc_decode_call_camera(&p, &ccam));
+    { oc_call_video_sub cvs; uint64_t vu[4]; oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_call_video_sub(&p, &cvs, vu, 4); if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_call_video_sub"); }
     oc_list_files lfz; D(oc_decode_list_files(&p, &lfz));
     oc_file_entry fez; D(oc_decode_file_entry(&p, &fez));
     oc_files fsz;      D(oc_decode_files(&p, &fsz));

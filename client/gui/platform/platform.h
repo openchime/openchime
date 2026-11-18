@@ -85,6 +85,9 @@ const char *oc_plat_mic_settings_name(void);
  * max_w x max_h: 1920x1080 on a desktop; a browser's wasm encoder keeps to
  * 960x540. */
 void  oc_plat_share_limits(int *max_w, int *max_h);
+/* The most a camera is sent at in a call (REQ-160): max_w x max_h at max_fps --
+ * 640x480 at 30 on a desktop; a browser's wasm encoder keeps to 15 fps. */
+void  oc_plat_camera_limits(int *max_w, int *max_h, int *max_fps);
 /* The platform as the one that grants or blocks a device, for messages
  * ("Windows is blocking camera access", "The browser ..."). */
 const char *oc_plat_privacy_name(void);

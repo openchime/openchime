@@ -215,9 +215,11 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 46** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 47** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
-> 46 appended `channel_id` to each `AUDIT_PAGE` entry, the channel the entry
+> 47 put `stream` in `CALL_MEDIA`, as in the relay's datagrams, gave a call
+> participant's flags `CAMERA`, and added `CALL_CAMERA` and `CALL_VIDEO_SUB`
+> (REQ-160, §5.17). Version 46 appended `channel_id` to each `AUDIT_PAGE` entry, the channel the entry
 > happened in (REQ-251). Version 45 appended `audience` to `WORKSPACE_INFO`
 > (CLIENT.md, "Links"). Version
 > 44 appended `media_kind` to `UPLOAD_BEGIN`, so a snippet's text past its cap is
@@ -3101,7 +3103,7 @@ conversation; after `MESSAGE_RESTORED` for a restored list; replayed by backfill
 list, so every one carries the list's current state. Adding these frames needed
 no protocol-version bump.
 
-### 5.17 Calls (REQ-150-152, REQ-161, REQ-301-305, ARCH-73, ARCH-86/87, ARCH-113)
+### 5.17 Calls (REQ-150-152, REQ-160, REQ-161, REQ-301-305, ARCH-73, ARCH-86/87, ARCH-113)
 
 Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media flows over UDP to
 the daemon's relay, which runs in its event loop and is handed each
@@ -3112,7 +3114,7 @@ are **ephemeral net-thread state** (like presence, ARCH-67): no DB rows, and a
 daemon restart ends them. [CALLS.md](./CALLS.md) is the design, including the
 end-to-end encryption this section carries the keys for.
 
-`CALL_JOIN`, `CALL_INVITE`, `CALL_SHARE` and `CALL_KEY` together are limited to
+`CALL_JOIN`, `CALL_INVITE`, `CALL_SHARE`, `CALL_KEY`, `CALL_CAMERA` and `CALL_VIDEO_SUB` together are limited to
 60 per 10 seconds per connection; one past the limit is refused with a non-fatal
 `SEND_RATE_LIMITED`. `CALL_LEAVE`, `CALL_DECLINE` and `CALL_END` are not limited:
 each changes the caller's own state once, and refusing one would strand them in
@@ -3147,19 +3149,29 @@ u64, udp_port: u16, token: bytes, slot: u8, epoch: u32, starter: u64,
 started_at: u64, n: u16, n × participant }`, where a participant is `{ user_id:
 u64, slot: u8, device_key: 32 bytes, codecs: u8, flags: u8 }` — `flags` bit 0
 (`AWAY`) marking one whose connection went and whose seat is held for its rejoin
-(below) — the joiner's private media endpoint
+(below), bit 1 (`CAMERA`) one whose camera is on (`CALL_CAMERA`) — the joiner's private media endpoint
 (the relay's `udp_port` and a bearer `token`), its slot, and the call as
 it stands. The token is opaque to the client and 16 to 32 bytes long: 16 random
 bytes behind the daemon's `OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX`, if one is set, and
 `udp_port` is `OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT` where that is set (AUDIO.md §4).
 The client then speaks UDP directly to the relay at the host it connected to,
-over IPv4 when the host has an IPv4 address and over IPv6 when that is all it has: `token ‖ seq(u16) ‖ payload` to it, `sender_user_id(u64) ‖ seq(u16) ‖
-payload` from it (`daemon/audio.h`). Every non-empty payload is an SFrame
-ciphertext (CALLS.md §5.4); an empty one is a keep-alive.
+over IPv4 when the host has an IPv4 address and over IPv6 when that is all it has: `token ‖ seq(u16) ‖ stream(u8) ‖ payload` to it, `sender_user_id(u64) ‖ seq(u16) ‖
+stream(u8) ‖ payload` from it (`daemon/audio.h`). Every non-empty payload is an SFrame
+ciphertext (CALLS.md §5.4); an empty one is a keep-alive. `stream` says which of
+the sender's streams the packet is on — `0` audio (with its mute state and the
+viewers' and watchers' control packets), `1` a shared screen, `2` a camera — in
+the clear, so the relay can act on it, and authenticated as the SFrame
+metadata, so the relay cannot change it unnoticed. A packet naming any other
+stream, or too short to name one, is dropped. The relay forwards a camera's
+packets only while its sender's camera is on, and only to the participants
+whose subscription takes it (`CALL_VIDEO_SUB`); audio and a share go to
+everyone.
 
 **`CALL_ROSTER` (S → C, to the other participants), `0x00A3`** `{ channel_id:
 u64, call_id: u64, epoch: u32, n: u16, n × participant }` — on every join and
-leave, and when a participant's connection goes (it is then marked `AWAY`). A
+leave, and when a participant's connection goes (it is then marked `AWAY`), each
+in a new epoch; and, to every participant, when a camera goes on or off, in the
+same epoch — nobody came or went, so nobody rekeys. A
 device that finds its own slot gone from the roster is out of the call: its user
 moved to another device if the roster names its user elsewhere, else the relay
 swept it.
@@ -3228,6 +3240,9 @@ the grace the seat is dropped as a leave would be. A call whose participants all
 lose their connection at once is therefore still there when they come back. A
 sharer that disconnects stops sharing at once.
 
+A participant whose connection goes, who leaves or who rejoins has its camera
+off; a rejoin turns it on again with `CALL_CAMERA`.
+
 A client rejoins by itself (CALLS.md §4); a rejoin is an ordinary `CALL_JOIN`,
 and a client closing on purpose sends `CALL_LEAVE` first so no seat is held for
 it.
@@ -3248,8 +3263,8 @@ connection is authenticated and in one call):
 
 | Direction | Payload |
 |---|---|
-| C → S | `{ seq: u16, ct: bytes }` |
-| S → C | `{ sender: u64, seq: u16, ct: bytes }` |
+| C → S | `{ seq: u16, stream: u8, ct: bytes }` |
+| S → C | `{ sender: u64, seq: u16, stream: u8, ct: bytes }` |
 
 A participant is on whichever transport its latest packet came by — a
 `CALL_MEDIA` puts it on the connection, a datagram puts it back on UDP — and the
@@ -3261,10 +3276,23 @@ is dropped, and the loss is recovered as UDP loss is (FEC and concealment for
 audio, resends and keyframes for a share). A client probes UDP first, and falls
 back when the relay does not answer (AUDIO.md §4).
 
-**Screen sharing on the wire (ARCH-86/87)** rides the same relay and SFrame
-packets unchanged; the codec is a **wire contract** — `codecs` above, VP9
-mandatory, a new bit for a successor. Fragments, NACKs, keyframe requests and
-rate reports travel inside the encryption ([CALLS.md](./CALLS.md) §5.4, §6).
+**`CALL_CAMERA` (C → S), `0x00AC`** `{ channel_id: u64, on: u8 }` — turn this
+participant's camera on (`on = 1`) or off in the call (REQ-160). The relay
+carries its camera stream only while it is on, and a change is a `CALL_ROSTER`
+to every participant, marking it `CAMERA`, in the same epoch. Not a participant:
+`ERROR NOT_IN_CALL`.
+
+**`CALL_VIDEO_SUB` (C → S), `0x00AD`** `{ channel_id: u64, all: u8, n: u16,
+n × { user_id: u64 } }` — whose cameras the relay sends this participant: every
+one (`all = 1`, and nobody named), or the `n` named (at most 32; more is
+malformed). A participant starts at every one, and at every one again on a
+rejoin; a view sends what it shows. Not a participant: `ERROR NOT_IN_CALL`.
+
+**Video on the wire (ARCH-86/87)** — a shared screen and the cameras — rides the
+same relay and SFrame packets, on their own streams; the codec is a **wire
+contract** — `codecs` above, VP9 mandatory, a new bit for a successor.
+Fragments, NACKs, keyframe requests and rate reports travel inside the
+encryption ([CALLS.md](./CALLS.md) §5.4, §6, §7).
 
 ### 5.18 Push device tokens (REQ-132/133, ARCH-85)
 
@@ -3624,7 +3652,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3027` | `STT_UNAVAILABLE`     | voice input | no   | Voice input is off, too many segments are waiting or more than 60 arrived in a minute, the queue is full, or recognition failed (§5.14c, REQ-300). |
 | `3028` | `CALL_FULL`           | calls      | no    | A join, a start's invitations or a `CALL_INVITE` would put the call past the cap (§5.17, REQ-305). |
 | `3029` | `NOT_CALL_STARTER`    | calls      | no    | `CALL_END` from someone other than the call's starter (§5.17). |
-| `3030` | `NOT_IN_CALL`         | calls      | no    | No call in that conversation, or the sender is not in it (`CALL_INVITE`, `CALL_END`, `CALL_KEY`, `CALL_SHARE`). |
+| `3030` | `NOT_IN_CALL`         | calls      | no    | No call in that conversation, or the sender is not in it (`CALL_INVITE`, `CALL_END`, `CALL_KEY`, `CALL_SHARE`, `CALL_CAMERA`, `CALL_VIDEO_SUB`). |
 | `3031` | `INVITE_UNREDEEMABLE` | admin      | no    | `INVITE_USER` carried an email where no sign-in source could ever spend an invite bound to one: the deployment offers no provider sign-in, neither the relay nor a direct connection (§5.8). |
 | `3032` | `GROUP_HANDLE_TAKEN`  | groups     | no    | A group, a person or a broadcast word already answers to that `@name`: a create, an update, or a rename (`SET_DISPLAY_NAME`) (§5.16k). |
 | `3033` | `UNKNOWN_GROUP`       | groups     | no    | No such group. |
@@ -3821,6 +3849,8 @@ this table cannot silently gain a shared value.
 | `0x00A9` | `CALL_KEY_FOR` | S → C | one sealed media key, from its sender |
 | `0x00AA` | `CALL_SHARE` | C → S | start or stop sharing a screen in the call; a start takes over (REQ-161) |
 | `0x00AB` | `CALL_MEDIA` | both | call media over the connection when UDP cannot reach the relay (`calls-tcp`) |
+| `0x00AC` | `CALL_CAMERA` | C → S | turn this participant's camera on or off in the call (REQ-160) |
+| `0x00AD` | `CALL_VIDEO_SUB` | C → S | whose cameras the relay sends this participant (REQ-160) |
 | `0x00B0` | `REGISTER_DEVICE_TOKEN` | C → S | register a mobile push token (REQ-132) |
 | `0x00B1` | `UNREGISTER_DEVICE_TOKEN` | C → S | drop a push token (logout / token change) |
 | `0x00B2` | `DEVICE_TOKEN_ACK` | S → C | register/unregister acknowledged |

@@ -83,26 +83,35 @@ static void db_unlink(const char *name) {
     snprintf(p, sizeof p, "%s-shm", tpath(name)); unlink(p);
 }
 
-/* token + seq(u16 BE) + payload -> the relay. */
-static void udp_send_audio_n(int fd, const struct sockaddr_in *to, const uint8_t *tok, size_t tlen,
-                             uint16_t seq, const char *payload) {
+/* token + seq(u16 BE) + stream(u8) + payload -> the relay. */
+static void udp_send_stream(int fd, const struct sockaddr_in *to, const uint8_t *tok, size_t tlen,
+                            uint16_t seq, uint8_t stream, const char *payload) {
     uint8_t pkt[128]; size_t pl = payload ? strlen(payload) : 0;
     memcpy(pkt, tok, tlen);
     pkt[tlen] = (uint8_t)(seq >> 8); pkt[tlen + 1] = (uint8_t)seq;
-    if (pl) memcpy(pkt + tlen + 2, payload, pl);
-    sendto(fd, pkt, tlen + 2 + pl, 0, (const struct sockaddr *)to, sizeof *to);
+    pkt[tlen + 2] = stream;
+    if (pl) memcpy(pkt + tlen + 3, payload, pl);
+    sendto(fd, pkt, tlen + 3 + pl, 0, (const struct sockaddr *)to, sizeof *to);
+}
+/* ...on the audio stream. */
+static void udp_send_audio_n(int fd, const struct sockaddr_in *to, const uint8_t *tok, size_t tlen,
+                             uint16_t seq, const char *payload) {
+    udp_send_stream(fd, to, tok, tlen, seq, OC_CALL_STREAM_AUDIO, payload);
 }
 static void udp_send_audio(int fd, const struct sockaddr_in *to, const uint8_t *tok,
                            uint16_t seq, const char *payload) {
     udp_send_audio_n(fd, to, tok, OC_AUDIO_TOKEN_RAND, seq, payload);
 }
-/* Receive a forwarded datagram: sender(u64) seq(u16) payload. -1 on timeout. */
+/* The stream of the last datagram udp_recv_audio took. */
+static uint8_t g_udp_stream;
+/* Receive a forwarded datagram: sender(u64) seq(u16) stream(u8) payload. -1 on timeout. */
 static int udp_recv_audio(int fd, uint64_t *sender, uint16_t *seq, char *out, size_t cap) {
     uint8_t pkt[256];
     ssize_t n = recv(fd, pkt, sizeof pkt, 0);
     if (n < (ssize_t)OC_AUDIO_S2C_HDR) return -1;
     uint64_t s = 0; for (int i = 0; i < 8; i++) s = (s << 8) | pkt[i];
     *sender = s; *seq = (uint16_t)((pkt[8] << 8) | pkt[9]);
+    g_udp_stream = pkt[10];
     size_t pl = (size_t)n - OC_AUDIO_S2C_HDR; if (pl > cap) pl = cap;
     memcpy(out, pkt + OC_AUDIO_S2C_HDR, pl);
     return (int)pl;
@@ -6232,6 +6241,137 @@ static int wait_sharer(client *c, uint64_t call_id, uint64_t sharer, oc_call_sta
     return -1;
 }
 
+static int call_camera(client *c, uint64_t ch, int on) {
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_call_camera m = { ch, (uint8_t)on };
+    if (oc_encode_call_camera(&w, OC_PROTOCOL_VERSION, &m) != OC_OK) return -1;
+    return send_frame(c, buf, w.len);
+}
+
+static int call_video_sub(client *c, uint64_t ch, int all, const uint64_t *users, uint16_t n) {
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_call_video_sub m = { ch, (uint8_t)all, n, users };
+    if (oc_encode_call_video_sub(&w, OC_PROTOCOL_VERSION, &m) != OC_OK) return -1;
+    return send_frame(c, buf, w.len);
+}
+
+/* The next CALL_ROSTER: its epoch, and whether `user` is in it with the camera
+ * flag (1), without (0), or not in it (-1). -2 if none comes. */
+static int roster_camera(client *c, uint64_t user, uint32_t *epoch, int *away) {
+    oc_header hdr; oc_rbuf p; oc_call_part parts[32]; oc_call_roster ro;
+    if (read_type(c, OC_MSG_CALL_ROSTER, &hdr, &p) != 0 || oc_decode_call_roster(&p, &ro, parts, 32) != OC_OK) return -2;
+    if (epoch) *epoch = ro.epoch;
+    for (uint16_t i = 0; i < ro.count; i++)
+        if (parts[i].user_id == user) {
+            if (away) *away = (parts[i].flags & OC_CALL_PART_AWAY) != 0;
+            return (parts[i].flags & OC_CALL_PART_CAMERA) != 0;
+        }
+    return -1;
+}
+
+/* Cameras' signalling and relaying (REQ-160): someone outside the call refused
+ * both frames; a camera's packets relayed only while it is on; CALL_CAMERA
+ * marking the roster for everyone in the same epoch; a subscription to nobody,
+ * then to the sender, honoured by the relay while audio still flows; and a
+ * rejoin and a disconnect turning the camera off. */
+static void test_call_camera(int port, const uint8_t *pin, uint16_t audio_port) {
+    client a, b, c;
+    CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
+    CHECK(client_open(&b, port, pin) == 0); CHECK(do_handshake(&b) == 0);
+    CHECK(client_open(&c, port, pin) == 0); CHECK(do_handshake(&c) == 0);
+    uint64_t ua = 0, ub = 0, uc = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
+    const uint64_t ch = OC_DEFAULT_CHANNEL;
+    oc_header hdr; oc_rbuf p; oc_call_part parts[32]; oc_call_joined jd;
+    uint16_t code = 0;
+    uint8_t atok[OC_AUDIO_TOKEN_RAND], btok[OC_AUDIO_TOKEN_RAND];
+
+    CHECK(call_join(&a, ch, 0xA1, NULL, 0) == 0);
+    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_RAND);
+    memcpy(atok, jd.token.ptr, OC_AUDIO_TOKEN_RAND);
+    CHECK(call_join(&b, ch, 0xB2, NULL, 0) == 0);
+    CHECK(read_type(&b, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_RAND);
+    memcpy(btok, jd.token.ptr, OC_AUDIO_TOKEN_RAND);
+    uint32_t epoch = jd.epoch, e2 = 0;
+    for (uint16_t i = 0; i < jd.count; i++) CHECK(!(parts[i].flags & OC_CALL_PART_CAMERA));
+    CHECK(roster_camera(&a, ub, NULL, NULL) == 0);           /* alice hears bob joined */
+
+    /* carol is not in the call: neither frame is hers to send. */
+    CHECK(call_camera(&c, ch, 1) == 0);
+    CHECK(read_error(&c, &code) == 0 && code == OC_ERR_NOT_IN_CALL);
+    CHECK(call_video_sub(&c, ch, 1, NULL, 0) == 0);
+    CHECK(read_error(&c, &code) == 0 && code == OC_ERR_NOT_IN_CALL);
+
+    struct sockaddr_in relay; memset(&relay, 0, sizeof relay);
+    relay.sin_family = AF_INET; relay.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    relay.sin_port = htons(audio_port);
+    int sa = mk_udp_client(), sb = mk_udp_client();
+    uint64_t sender; uint16_t seq; char body[64];
+    udp_send_audio(sb, &relay, btok, 0, NULL);
+    CHECK(udp_recv_audio(sb, &sender, &seq, body, sizeof body) >= 0);
+    udp_send_audio(sa, &relay, atok, 0, NULL);
+    CHECK(udp_recv_audio(sa, &sender, &seq, body, sizeof body) >= 0);
+
+    /* Off: alice's camera packet goes nowhere; what bob has first is her voice. */
+    udp_send_stream(sa, &relay, atok, OC_AUDIO_TOKEN_RAND, 1, OC_CALL_STREAM_CAMERA, "face0");
+    udp_send_audio(sa, &relay, atok, 2, "voice");
+    CHECK(udp_recv_audio(sb, &sender, &seq, body, sizeof body) == 5 && seq == 2 && g_udp_stream == OC_CALL_STREAM_AUDIO);
+
+    /* On: both are told, in the same epoch, and bob has her camera. */
+    CHECK(call_camera(&a, ch, 1) == 0);
+    CHECK(roster_camera(&b, ua, &e2, NULL) == 1 && e2 == epoch);
+    CHECK(roster_camera(&a, ua, &e2, NULL) == 1 && e2 == epoch);
+    udp_send_stream(sa, &relay, atok, OC_AUDIO_TOKEN_RAND, 3, OC_CALL_STREAM_CAMERA, "face1");
+    CHECK(udp_recv_audio(sb, &sender, &seq, body, sizeof body) == 5 && sender == ua && seq == 3 &&
+          g_udp_stream == OC_CALL_STREAM_CAMERA && memcmp(body, "face1", 5) == 0);
+
+    /* bob takes nobody's camera. His own camera going on after it is the sign
+     * the daemon has his subscription: it handles his frames in order. Then
+     * alice's camera does not reach him, and her voice does. */
+    CHECK(call_video_sub(&b, ch, 0, NULL, 0) == 0);
+    CHECK(call_camera(&b, ch, 1) == 0);
+    CHECK(roster_camera(&b, ub, NULL, NULL) == 1);
+    CHECK(roster_camera(&a, ub, NULL, NULL) == 1);
+    udp_send_stream(sa, &relay, atok, OC_AUDIO_TOKEN_RAND, 4, OC_CALL_STREAM_CAMERA, "face2");
+    udp_send_audio(sa, &relay, atok, 5, "words");
+    CHECK(udp_recv_audio(sb, &sender, &seq, body, sizeof body) == 5 && seq == 5 && g_udp_stream == OC_CALL_STREAM_AUDIO);
+    /* ...and alice, who takes every camera, has bob's. */
+    udp_send_stream(sb, &relay, btok, OC_AUDIO_TOKEN_RAND, 6, OC_CALL_STREAM_CAMERA, "bobface");
+    CHECK(udp_recv_audio(sa, &sender, &seq, body, sizeof body) == 7 && sender == ub && g_udp_stream == OC_CALL_STREAM_CAMERA);
+
+    /* bob takes alice's again, by name. */
+    CHECK(call_video_sub(&b, ch, 0, &ua, 1) == 0);
+    CHECK(call_camera(&b, ch, 0) == 0);
+    CHECK(roster_camera(&b, ub, NULL, NULL) == 0);
+    CHECK(roster_camera(&a, ub, NULL, NULL) == 0);
+    udp_send_stream(sa, &relay, atok, OC_AUDIO_TOKEN_RAND, 7, OC_CALL_STREAM_CAMERA, "face3");
+    CHECK(udp_recv_audio(sb, &sender, &seq, body, sizeof body) == 5 && seq == 7 && g_udp_stream == OC_CALL_STREAM_CAMERA);
+
+    /* alice rejoins: a new epoch, and her camera off. */
+    CHECK(call_join(&a, ch, 0xA1, NULL, 0) == 0);
+    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.epoch > epoch);
+    for (uint16_t i = 0; i < jd.count; i++) CHECK(!(parts[i].flags & OC_CALL_PART_CAMERA));
+    CHECK(roster_camera(&b, ua, &e2, NULL) == 0 && e2 == jd.epoch);
+
+    /* bob turns his on and drops his connection: his seat is held, and his
+     * camera is off. */
+    CHECK(call_camera(&b, ch, 1) == 0);
+    CHECK(roster_camera(&a, ub, NULL, NULL) == 1);
+    client_close(&b);
+    int away = 0;
+    CHECK(roster_camera(&a, ub, NULL, &away) == 0 && away);
+
+    CHECK(call_simple(&a, OC_MSG_CALL_END, ch) == 0);
+    close(sa); close(sb);
+    client_close(&c);
+    client_close(&a);
+}
+
 /* Screen sharing's signalling (REQ-161): each participant's codecs on the
  * roster; a share named on CALL_STATE; a start taking over from the sharer; a
  * stop from someone not sharing changing nothing; a sharer who leaves or
@@ -6514,7 +6654,7 @@ static int read_frame_or_quiet(client *c, oc_header *hdr, oc_rbuf *p);
 /* CALL_MEDIA up: `payload` NULL for a keepalive. */
 static int tcp_media_up(client *c, uint16_t seq, const char *payload) {
     uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_call_media_pkt m = { 0, seq, { (const uint8_t *)payload, payload ? strlen(payload) : 0 } };
+    oc_call_media_pkt m = { 0, seq, { (const uint8_t *)payload, payload ? strlen(payload) : 0 }, OC_CALL_STREAM_AUDIO };
     if (oc_encode_call_media_up(&w, OC_PROTOCOL_VERSION, &m) != OC_OK) return -1;
     return send_frame(c, buf, w.len);
 }
@@ -8890,6 +9030,7 @@ int run_netloop_tests(void) {
         test_display_name_limits(arg.port, pin);
         test_call_state_audience(arg.port, pin);
         test_call_share(arg.port, pin);
+        test_call_camera(arg.port, pin, audio_port);
         test_call_udp_vertical(arg.port, pin, audio_port);
         test_call_rejoin_grace(arg.port, pin);
         oc_netloop_set_call_grace_ms(300);   /* rejoin_grace sets its own */

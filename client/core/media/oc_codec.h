@@ -1,6 +1,7 @@
 /* Thin wrappers over libvpx (VP9) and libopus for video messages (ARCH-110,
- * docs/VIDEO-MESSAGES.md §4). The settings live here and nowhere else, so the
- * recorder and the player never touch a library API directly. */
+ * docs/VIDEO-MESSAGES.md §4) and calls (CALLS.md §6-§7). The settings live here
+ * and nowhere else, so the recorder, the player and the call engine never touch
+ * a library API directly. */
 #ifndef OC_CODEC_H
 #define OC_CODEC_H
 
@@ -24,6 +25,11 @@ oc_vp9enc *oc_vp9enc_open_screen(int width, int height, int fps);
  * duration is the time since the one before -- and keyframes only when asked
  * for, since the call's loss recovery decides when one is needed. */
 oc_vp9enc *oc_vp9enc_open_share(int width, int height, unsigned kbps);
+/* For a camera in a call (REQ-160): tuned for motion and faces, not a screen, at
+ * `kbps` and up to `fps`, error resilient, each frame's duration the time since
+ * the one before -- the call's rate control lowers the frame rate -- and
+ * keyframes only when asked for, as a share's. */
+oc_vp9enc *oc_vp9enc_open_camera(int width, int height, int fps, unsigned kbps);
 /* Change the bitrate of an open encoder, from the next frame. 0, or -1. */
 int        oc_vp9enc_set_bitrate(oc_vp9enc *e, unsigned kbps);
 /* The bitrate (kbit/s) oc_vp9enc_open picks for a resolution. */
