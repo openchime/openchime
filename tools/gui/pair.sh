@@ -57,14 +57,18 @@ drive() {  # drive <lin-dir> <win-dir> <cmd...>
   [ "$ack" != TIMEOUT ]
 }
 
+. "$HERE/tools/gui/lock.sh"
+
 case "${1:-}" in
 up)
+  gui_lock                  # held to this process's end; a script's run holds it already
   mkdir -p "$DEV" "$LIN_A" "$LIN_B"
   make -C "$HERE" daemon >/dev/null || { echo "daemon build FAILED" >&2; exit 1; }
   make -C "$HERE" windows >/dev/null || { echo "gui build FAILED" >&2; exit 1; }
   : > "$PIDS"
 
   if ! (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then
+    rm -f "$DEV/daemon.pid"
     # No send cap (OPENCHIME_DEV_SEND_RATE=0): a fixture seeds back to back.
     env OPENCHIME_DATA_DIR="$DEV/data" \
         OPENCHIME_PORT="$PORT" OPENCHIME_HEALTH_PORT=0 \
@@ -74,11 +78,16 @@ up)
         OPENCHIME_DEV_SEND_RATE=0 \
         ${OC_TEST_ADVERTISE_PORT:+OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT="$OC_TEST_ADVERTISE_PORT"} \
         OPENCHIME_MANAGED_MAX_USERS=100 \
-        setsid "$HERE/openchimed" > "$DEV/daemon.log" 2>&1 < /dev/null &
+        setsid sh -c 'echo $$ > "$1"; exec "$2"' _ "$DEV/daemon.pid" "$HERE/openchimed" \
+          > "$DEV/daemon.log" 2>&1 < /dev/null &
     disown
-    for _ in $(seq 1 40); do
-      (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null && { exec 3<&- 3>&-; break; }
-      sleep 0.25
+    # Until it listens, or is gone -- its log says why. Its pid is the one the
+    # shell that became it wrote down: setsid may fork, so $! need not be it.
+    until [ -s "$DEV/daemon.pid" ]; do sleep 0.02; done
+    dpid="$(cat "$DEV/daemon.pid")"
+    until (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; do
+      kill -0 "$dpid" 2>/dev/null || { echo "pair: the daemon exited: $(tail -3 "$DEV/daemon.log")" >&2; exit 1; }
+      sleep 0.05
     done
     echo "daemon up on :$PORT"
   else
@@ -86,6 +95,7 @@ up)
   fi
 
   # Each client gets its OWN test dir, so the two command channels never cross.
+  failed=0                             # a client that did not sign in fails `up`
   for who in a b; do
     case $who in
       a) user=alice; wdir=$WIN_A; ldir=$LIN_A; host=$HOST ;;
@@ -129,41 +139,43 @@ up)
     disown
     # The person signs in: the card's Sign in, then the daemon's page
     # (tools/gui/lib.sh; the daemon is on loopback, so no certificate question).
-    sleep 2
-    sign_in_card drive "$ldir" "$wdir" -- "$ldir" "$user" pw || echo "warning: $user's sign-in" >&2
+    # No pause first: the card's first command waits for the client to answer.
+    sign_in_card drive "$ldir" "$wdir" -- "$ldir" "$user" pw "$host:$PORT" ||
+      { echo "warning: $user's sign-in" >&2; failed=1; }
 
     # WAIT FOR THIS ONE TO AUTHENTICATE before starting the next. The token is
     # written to the keyring a second or two AFTER auth, and the next client's
     # delete has to happen after that write or it deletes nothing. Sleeping a
     # guess raced -- and lost, in both directions depending on the machine.
+    # Not when the sign-in already failed. Until it says so, or says why not,
+    # or stops answering -- what it shows decides, not a count of looks.
     ok=0
-    for _ in $(seq 1 40); do
-      if drive "$ldir" "$wdir" dump settle 2>/dev/null | grep -q 'authed=1'; then ok=1; break; fi
-      sleep 0.5
-    done
-    [ "$ok" = 1 ] || echo "warning: $user did not authenticate" >&2
+    if [ "$failed" = 0 ]; then
+      while :; do
+        st="$(drive "$ldir" "$wdir" dump settle 2>/dev/null)" || break
+        grep -q 'authed=1' <<<"$st" && { ok=1; break; }
+        grep -qE '^signin .*last_error=[^ ]' <<<"$st" && break
+        sleep 0.1
+      done
+      [ "$ok" = 1 ] || { echo "warning: $user did not authenticate" >&2; failed=1; }
+    fi
   done
-  sleep 2
-  # Record the pair so `down` stops these and nothing else.
-  powershell.exe -NoProfile -Command \
-    "Get-Process openchime -EA SilentlyContinue | Sort-Object StartTime | Select-Object -Last 2 -ExpandProperty Id" \
+  # Record the pair so `down` stops these and nothing else, and put them side
+  # by side -- the whole point of a pair -- in one PowerShell, not three: each
+  # start of it costs a second or more. Positioned from the shell rather than
+  # through a verb: the client's `move` is a mouse move, and nothing in the app
+  # needs to move its own window.
+  powershell.exe -NoProfile -Command "
+    \$sig='[DllImport(\"user32.dll\")] public static extern bool MoveWindow(IntPtr h,int x,int y,int w,int t,bool r);'
+    \$t=Add-Type -MemberDefinition \$sig -Name W -Namespace N -PassThru
+    \$ps=@(Get-Process openchime -EA SilentlyContinue | Sort-Object StartTime | Select-Object -Last 2)
+    \$x=40; foreach (\$p in \$ps) { \$t::MoveWindow(\$p.MainWindowHandle, \$x, 60, 900, 760, \$true) | Out-Null; \$x+=940 }
+    \$ps | ForEach-Object { \$_.Id }" \
     2>/dev/null | tr -d '\r' | grep -E '^[0-9]+$' > "$PIDS" || true
-  # Side by side, so both are visible at once — the whole point of a pair.
-  # Positioned from the shell rather than through a verb: the client's `move`
-  # is a mouse move, and there is no window-move verb (nor should there be —
-  # nothing in the app needs to move its own window).
-  { read -r pa; read -r pb; } < "$PIDS" || true
-  for pair in "${pa:-} 40" "${pb:-} 980"; do
-    set -- $pair
-    [ -n "${2:-}" ] || continue   # no pid recorded: only the x is left
-    powershell.exe -NoProfile -Command "
-      \$sig='[DllImport(\"user32.dll\")] public static extern bool MoveWindow(IntPtr h,int x,int y,int w,int t,bool r);'
-      \$t=Add-Type -MemberDefinition \$sig -Name W -Namespace N -PassThru
-      \$p=Get-Process -Id $1 -EA SilentlyContinue
-      if (\$p) { \$t::MoveWindow(\$p.MainWindowHandle, $2, 60, 900, 760, \$true) | Out-Null }" \
-      >/dev/null 2>&1 || true
-  done
   echo "alice + bob up on :$PORT  (pids: $(tr '\n' ' ' < "$PIDS"))"
+  # Up, but not both signed in: the pids are recorded, so `down` still stops
+  # them, and a script stops on its fixture instead of failing its features.
+  [ "$failed" = 0 ] || { echo "pair: a client did not sign in" >&2; exit 1; }
   ;;
 a) shift; drive "$LIN_A" "$WIN_A" "$@" ;;
 b) shift; drive "$LIN_B" "$WIN_B" "$@" ;;
@@ -171,14 +183,21 @@ down)
   # Only what `up` started. Through the app's own quit so the run ends CLEAN and
   # leaves no post-mortem: closing the window merely hides it now (REQ-138), so
   # CloseMainWindow would time out and force-kill every time.
-  drive "$LIN_A" "$WIN_A" close quit >/dev/null 2>&1 || true
-  drive "$LIN_B" "$WIN_B" close quit >/dev/null 2>&1 || true
-  sleep 2
-  if [ -f "$PIDS" ]; then
-    while read -r p; do
-      [ -n "$p" ] && powershell.exe -NoProfile -Command \
-        "Get-Process -Id $p -EA SilentlyContinue | Stop-Process -Force" >/dev/null 2>&1 || true
-    done < "$PIDS"
+  # Only to a client that is running: one that is not never answers, and each
+  # unanswered command waits out the channel's ack window.
+  if [ -s "$PIDS" ]; then
+    ids="$(grep -E '^[0-9]+$' "$PIDS" | paste -sd, -)"
+    live=""
+    [ -n "$ids" ] && live="$(powershell.exe -NoProfile -Command \
+      "Get-Process -Id $ids -EA SilentlyContinue | Where-Object Name -eq 'openchime' | ForEach-Object { \$_.Id }" \
+      2>/dev/null | tr -d '\r')"
+    { read -r pa; read -r pb; } < "$PIDS" || true
+    grep -qx "${pa:-x}" <<<"$live" && { drive "$LIN_A" "$WIN_A" close quit >/dev/null 2>&1 || true; }
+    grep -qx "${pb:-x}" <<<"$live" && { drive "$LIN_B" "$WIN_B" close quit >/dev/null 2>&1 || true; }
+    # Whatever did not quit is stopped.
+    [ -n "$live" ] && powershell.exe -NoProfile -Command \
+      "Get-Process -Id $(paste -sd, - <<<"$live") -EA SilentlyContinue | Stop-Process -Force" >/dev/null 2>&1 || true
+    : > "$PIDS"
   fi
   # The daemon by its ENVIRONMENT: the port is not on its command line, so a
   # pattern over the command line matched nothing and every `up` after the

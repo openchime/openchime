@@ -1757,6 +1757,32 @@ CONFIG.md "Mode"), and any build will do.
 | `OC_TEST_HEALTH_PORT`, `OC_TEST_WEB_PORT` | 8080, 8551 | The fixture daemon's health port; the fixture daemon's port in `tools/gui/web_signin.sh` (the Win32 browser sign-in). |
 | `OC_TEST_KEEP_DB`, `OC_TEST_WAIT_MS` | 0, the script's | The smoke keeps the database; a longer wait for a slow machine. |
 | `GUI_DRIVE_OUT` | `/tmp/ocshot` (`/tmp/ocshot-web` in `web_signin.sh`) | Where `shot`/`dump` copies land on the Linux side. |
+| `OC_TEST_GUI_LOCK`, `OC_TEST_GUI_LOCKED` | `/tmp/openchime-gui.lock`, unset | The machine-wide lock below; set once it is held, so nested scripts do not wait on themselves. |
+
+**One GUI run on this machine at a time.** The scripts share one Windows
+desktop, its clients and its saved development sign-ins, from whatever checkout
+they run: a second run's `drive.sh kill` stops the first's clients, and two
+sign-ins at once slow each other. So `tools/gui/run.sh`, every script through
+`tools/gui/lib.sh`, and `pair.sh up` take one lock (`tools/gui/lock.sh`,
+`flock` on `OC_TEST_GUI_LOCK`) before they touch any of it and hold it to their
+end; a run that finds it taken says `gui_lock: another GUI run is going` and
+waits for it.
+
+**A pair comes up or says why not.** `pair.sh up` waits on what it can see --
+the daemon listening (or its process gone, with its log's last lines), each
+client answering, its card's sign-in, `authed=1` -- and never on a clock or a
+count of looks. The Win32 sign-in sets the card's workspace itself (`siws`)
+before step 1, so what is submitted is what was meant, and submits step 1 again
+when it comes back with an error, up to five times. A client that stops
+answering, or whose sign-in shows an error, fails `up` with `pair: a client did
+not sign in`, after its pids are recorded so `down` still stops them; a script's
+`"$PAIR" up || { say "pair did not come up"; exit 1; }` then reports its
+fixture, not its features. `down` sends `quit` only to a client that is
+running. The web pair launches both pages at once.
+
+**`devenv OPENCHIME_DEV_<NAME> <value>`** changes one development input in the
+running client (development mode, those names only), so a script tests a
+refused camera, say, in the pair it has rather than starting another.
 
 The suite's own share the prefix: `OC_TEST_ONLY`, `OC_TEST_EXCEPT`,
 `OC_TEST_REPEAT`, `OC_TEST_JOBS` (`tests/main.c`) and `OC_TEST_TIMING`
@@ -2269,9 +2295,10 @@ showing her camera at once and the roster marking it on; each card showing the
 other's camera, its frame numbers rising, at 640x480; the grid, then the speaker
 layout with bob large and alice in the strip, and one click back; no card drawn
 and no camera taken away from the call view, and both back on returning; bob's
-camera off showing his face; and, on a pair started with
-`OPENCHIME_DEV_CAPTURE=denied`, turning the camera on saying it is blocked in the
-video recorder's words. It reads the dump's `camera` line — `on= state= err=
+camera off showing his face; and, in the same pair after `devenv
+OPENCHIME_DEV_CAPTURE denied`, turning the camera on saying it is blocked in the
+video recorder's words. It runs in about 15 seconds on either client, most of
+it the pair coming up. It reads the dump's `camera` line — `on= state= err=
 shown_err= w= h= fps= kbps= step= frames= cams= chosen= layout= speaker= sub_all=
 subs= drawn=` — its `camera.tile` lines, one per card or tile drawn — `uid= cam=
 big= fno= rect=`, `fno` the synthetic camera's frame number read from the picture

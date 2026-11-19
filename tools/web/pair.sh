@@ -24,17 +24,34 @@ up)
   mkdir -p "$DEV"
   # The daemon once (the first launch starts it), then the pages; a tone of
   # its own for each client's synthetic microphone, as tools/gui/pair.sh gives them.
-  OC_TEST_WHO=a OPENCHIME_DEV_TONE="${OC_TEST_TONE_A:-}" "$DRIVE" launch "$HOST:$PORT" alice:pw >/dev/null
-  OC_TEST_WHO=b OPENCHIME_DEV_TONE="${OC_TEST_TONE_B:-}" OC_TEST_NO_DAEMON=1 OC_TEST_NO_BUILD=1 "$DRIVE" launch "$HOST:$PORT" bob:pw >/dev/null
+  # Both pages at once: a page has no keyring to share, unlike a Windows
+  # client. Bob's starts once alice's launch has the daemon listening.
+  OC_TEST_WHO=a OPENCHIME_DEV_TONE="${OC_TEST_TONE_A:-}" "$DRIVE" launch "$HOST:$PORT" alice:pw >/dev/null &
+  la=$!
+  until (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; do
+    kill -0 "$la" 2>/dev/null || break       # alice's launch ended without a daemon: it says why
+    sleep 0.05
+  done
+  OC_TEST_WHO=b OPENCHIME_DEV_TONE="${OC_TEST_TONE_B:-}" OC_TEST_NO_DAEMON=1 OC_TEST_NO_BUILD=1 "$DRIVE" launch "$HOST:$PORT" bob:pw >/dev/null &
+  lb=$!
+  failed=0
+  wait "$la" || { echo "warning: alice's page did not launch" >&2; failed=1; }
+  wait "$lb" || { echo "warning: bob's page did not launch" >&2; failed=1; }
+  # Each signed in -- until it says so, says why not, or stops answering: what
+  # it shows decides, not a count of looks.
   for who in a b; do
+    [ "$failed" = 0 ] || break
     ok=0
-    for _ in $(seq 1 60); do
-      if OC_TEST_WHO=$who "$DRIVE" dump settle 2>/dev/null | grep -q 'authed=1'; then ok=1; break; fi
-      sleep 0.5
+    while :; do
+      st="$(OC_TEST_WHO=$who "$DRIVE" dump settle 2>/dev/null)" || break
+      grep -q 'authed=1' <<<"$st" && { ok=1; break; }
+      grep -qE '^signin .*last_error=[^ ]' <<<"$st" && break
+      sleep 0.1
     done
-    [ "$ok" = 1 ] || echo "warning: $who did not authenticate" >&2
+    [ "$ok" = 1 ] || { echo "warning: $who did not authenticate" >&2; failed=1; }
   done
   echo "alice + bob up on :$PORT (web)"
+  [ "$failed" = 0 ] || { echo "pair: a client did not sign in" >&2; exit 1; }
   ;;
 a) shift; OC_TEST_WHO=a "$DRIVE" "$@" ;;
 b) shift; OC_TEST_WHO=b "$DRIVE" "$@" ;;

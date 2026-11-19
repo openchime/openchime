@@ -41559,6 +41559,19 @@ static void test_poll(oc_win *hwnd) {
                  : !strcmp(verb, "siuser") ? g_si_e_user : g_si_e_pass;
         if (e) { field_set(e, arg); test_ack("ok"); }
         else test_ack("err");
+    } else if (!strcmp(verb, "devenv")) {
+        /* `devenv OPENCHIME_DEV_<NAME> <value>`: one development input changed
+         * in the running client -- a camera refused, say -- so a script tests
+         * it without starting another. Development mode and those names only. */
+        char name[64] = "", val[200] = "";
+        int ok = sscanf(arg, "%63s %199s", name, val) >= 1 && oc_env_is_dev() &&
+                 !strncmp(name, "OPENCHIME_DEV_", 14);
+#ifdef _WIN32
+        if (ok) ok = _putenv_s(name, val) == 0;
+#else
+        if (ok) ok = (val[0] ? setenv(name, val, 1) : unsetenv(name)) == 0;
+#endif
+        test_ack(ok ? "ok" : "err");
     } else if (!strcmp(verb, "siadv")) {
         signin_set_advanced(hwnd, !g_si_advanced); test_ack("ok");
     } else if (!strcmp(verb, "sisubmit")) {

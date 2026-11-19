@@ -15,6 +15,8 @@
 # are skipped by name.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+. "$HERE/tools/gui/lock.sh"
+gui_lock                  # one GUI run on this machine at a time
 ALL="smoke startup composer mentions drafts links keymenu members newmsg shortcuts chords reactions polls tables groups files uploads voice screenrec search_boxes calls calls_tcp camera balloon pdm workspaces navhistory permalink_w cursor emoji_admin preview timetoken spoiler collapse lightbox jumpdate whatsnew snippets admin_rows todos"
 WEB_OK="smoke mentions reactions voice screenrec uploads files calls calls_tcp camera search_boxes pdm chords polls tables workspaces navhistory cursor emoji_admin preview timetoken spoiler collapse lightbox todos"
 plat=win32

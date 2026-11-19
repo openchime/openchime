@@ -13,6 +13,8 @@ for old in $(env | grep -oE '^OC_(DEV|PAIR|DRIVE|GUI|WEB|SMOKE)_[A-Z_]+' | sort 
   echo "lib.sh: $old is not read any more; the harness's variables are OC_TEST_* (TESTING.md, \"Driving the Win32 GUI\")" >&2
   exit 2
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lock.sh"
+gui_lock
 PLAT="${OC_TEST_PLATFORM:-}"
 if [ -z "$PLAT" ]; then
   if [ -n "${OC_TEST_DRIVE:-}${OC_TEST_PAIR:-}" ]; then PLAT=web; else PLAT=win32; fi
@@ -39,19 +41,32 @@ PAIR="${OC_TEST_PAIR:-$PAIR}"
 # the redirect back to the client's callback. The web client is its own
 # browser (OPENCHIME_DEV_SIGNIN, tools/web/drive.sh) and needs none of this.
 #   play_browser <lin-dir> <user> <password>   # waits for the URL, signs in
-#   sign_in_card <drive...> -- <lin-dir> <user> <password>
+#   sign_in_card <drive...> -- <lin-dir> <user> <password> [workspace]
 #       drives the card as the person would: Sign in (step 1 resolves and
 #       probes the workspace), Trust and connect where the daemon's certificate
 #       is asked about, Sign in again (step 2), then the page the browser is
 #       played against. Each press once, from the card's own state in the dump,
 #       so nothing is pressed twice -- a second press while the browser is
-#       awaited cancels the sign-in.
+#       awaited cancels the sign-in. With a workspace, the card's field is set
+#       to it before step 1 is submitted, so what is submitted is what was
+#       meant, not whatever the field holds; and step 1 coming back with an
+#       error is submitted again at once, up to five times. It fails as soon as
+#       the client stops answering, not after a time: no verdict here is the
+#       clock's.
 sign_in_card() {
   local drv=(); while [ "$1" != "--" ]; do drv+=("$1"); shift; done; shift
-  local ldir="$1" user="$2" pass="$3" i S step br cn sent1=0 sent2=0 line dpi l t r b
-  for i in $(seq 1 200); do
-    "${drv[@]}" dump sign_in_card >/dev/null 2>&1 || true
+  local ldir="$1" user="$2" pass="$3" ws="${4:-}" i S step br cn sent1=0 sent2=0 line dpi l t r b err tries=0
+  # Until an outcome: signed in, the page played, step 1 refused five times,
+  # the client silent, or its card the same fifty looks running -- stuck, by
+  # what it shows, not by a clock.
+  local same=0 last=""
+  while :; do
+    "${drv[@]}" dump sign_in_card >/dev/null 2>&1 ||
+      { echo "sign_in_card: the client does not answer" >&2; return 1; }
     S="$(cat "$ldir/sign_in_card.txt" 2>/dev/null || true)"
+    local now; now="$(grep -E '^signin |^startup|^confirm' <<<"$S")"
+    if [ "$now" = "$last" ]; then same=$((same + 1)); else same=0; last="$now"; fi
+    [ "$same" -ge 50 ] && break
     # Signed in, and not merely in another workspace with this one's card over
     # it (a stored session elsewhere is authed=1 too).
     grep -q '^authed=1' <<<"$S" && ! grep -qE 'si_overlay=1|^view=100 ' <<<"$S" && return 0
@@ -69,7 +84,17 @@ sign_in_card() {
       play_browser "$ldir" "$user" "$pass"; return $?
     fi
     if [ "$cn" = 1 ]; then sleep 0.2; continue; fi
-    if [ "$step" = 1 ] && [ "$sent1" = 0 ]; then sent1=1; "${drv[@]}" sisubmit >/dev/null 2>&1 || true; sleep 0.3; continue; fi
+    # Step 1 refused (unreachable, say): again, a second later, a few times.
+    err="$(grep -o 'si_err="[^"]*"' <<<"$S" | head -1)"
+    if [ "$step" = 1 ] && [ "$sent1" = 1 ] && [ -n "$ws" ] && [ "$err" != 'si_err=""' ] && [ -n "$err" ] &&
+       [ "$tries" -lt 5 ]; then
+      tries=$((tries + 1)); sent1=0; continue
+    fi
+    if [ "$step" = 1 ] && [ "$sent1" = 0 ]; then
+      sent1=1
+      [ -n "$ws" ] && { "${drv[@]}" siws "$ws" >/dev/null 2>&1 || true; }
+      "${drv[@]}" sisubmit >/dev/null 2>&1 || true; sleep 0.3; continue
+    fi
     if [ "$step" = 2 ] && [ "$sent2" = 0 ]; then sent2=1; rm -f "$ldir/signin_url.txt"; "${drv[@]}" sisubmit >/dev/null 2>&1 || true; sleep 0.3; continue; fi
     sleep 0.2
   done
@@ -77,11 +102,9 @@ sign_in_card() {
   return 1
 }
 play_browser() {
-  local ldir="$1" user="$2" pass="$3" url="" i
-  for i in $(seq 1 150); do
-    [ -s "$ldir/signin_url.txt" ] && { url="$(tr -d '\r\n' < "$ldir/signin_url.txt")"; break; }
-    sleep 0.1
-  done
+  local ldir="$1" user="$2" pass="$3" url=""
+  # sign_in_card calls this once the client has published the URL.
+  [ -s "$ldir/signin_url.txt" ] && url="$(tr -d '\r\n' < "$ldir/signin_url.txt")"
   [ -n "$url" ] || { echo "play_browser: the client published no sign-in URL in $ldir" >&2; return 1; }
   rm -f "$ldir/signin_url.txt"
   local base="${url%%\?*}"; base="${base%/*}"

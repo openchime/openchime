@@ -19,8 +19,9 @@
 #   - away from the call view nothing is drawn and no camera is taken; back,
 #     the view takes the cameras of the cards it draws again;
 #   - bob turns his off: his card on alice's view is his face again;
-#   - with the camera refused (OPENCHIME_DEV_CAPTURE=denied), turning it on
-#     says so, in the words the video recorder uses, and leaves it off.
+#   - with the camera refused (devenv OPENCHIME_DEV_CAPTURE denied, in the
+#     same pair), turning it on says so, in the words the video recorder uses,
+#     and leaves it off.
 #
 # Its own daemon on its own port, wiped each run. The clients reach it at the
 # WSL machine's address, not 127.0.0.1: WSL forwards only TCP there, and a
@@ -150,21 +151,18 @@ check "his card on alice's view is his face again" waitfor a 10 b_off
 "$PAIR" a call camera off >/dev/null
 a_off() { [ "$(field a 'camera ' on)" = 0 ] && [ "$(field a 'camera ' state)" = 0 ] && [ "$(tile a "$ua" cam)" = 0 ]; }
 check "alice turns hers off: off, and her own card her face" waitfor a 10 a_off
-"$PAIR" a call end >/dev/null
 
 say "== a camera the system refuses"
-"$PAIR" down >/dev/null 2>&1
-rm -rf "$OC_TEST_DIR"
-OPENCHIME_DEV_CAPTURE=denied "$PAIR" up >/dev/null 2>&1 || { say "pair did not come up"; exit 1; }
-"$PAIR" a call start $CH >/dev/null
-waitfor a 10 a_in >/dev/null
-"$PAIR" a call open $CH >/dev/null
+# The same pair: the client is told its camera is refused from here on
+# (devenv, development mode only), rather than a second pair being started.
+"$PAIR" a devenv OPENCHIME_DEV_CAPTURE denied >/dev/null
 "$PAIR" a call camera on >/dev/null
 refused() { [ "$(field a 'camera ' on)" = 0 ] && [ "$(field a 'camera ' shown_err)" = -1 ]; }
 check "turning it on says the camera is blocked, and it stays off" waitfor a 10 refused
 told() { grep -q 'blocking camera access for OpenChime' /tmp/oc-camera-dump-a.txt; }
 check "...in the video recorder's words" told
 "$PAIR" a shot camera_denied >/dev/null
+"$PAIR" a devenv OPENCHIME_DEV_CAPTURE synthetic >/dev/null
 "$PAIR" a call end >/dev/null
 
 say ""
