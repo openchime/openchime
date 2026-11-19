@@ -43,7 +43,7 @@ or broken is not a document — it is the
 | [AUTH.md](docs/AUTH.md) | The two authentication modes — local Argon2id accounts and OIDC brokered by a central relay — and the daemon-issued session both converge on. |
 | [TLS.md](docs/TLS.md) | How the daemon terminates TLS and how a client trusts it: trust-on-first-use certificate pinning against a self-signed cert, with no CA anywhere on the client-facing path. |
 | [CONFIG.md](docs/CONFIG.md) | Every environment variable the daemon reads, with its default and meaning. There is no configuration file. |
-| [TESTING.md](docs/TESTING.md) | The two test suites -- the fast one before every push, the full one once per release-candidate -- and what each runs, the measured capacity benchmark, and the GUI's harnesses, the boot check first among them. |
+| [TESTING.md](docs/TESTING.md) | The two test suites -- the fast one before every push, the full one once per release-candidate -- and what each runs, and the measured capacity benchmark. The GUI and browser tests, run by hand, are [tools/gui/README.md](tools/gui/README.md). |
 | [MARKDOWN.md](docs/MARKDOWN.md) | The message-formatting dialect — a Slack-compatible subset plus real lists — where it is parsed, and the places it deliberately differs. |
 | [CALLS.md](docs/CALLS.md) | Calls: the Calls section, starting, inviting, ending and missed calls, the call view, and the end-to-end encryption — device keys, per-sender keys sealed with HPKE, packets in SFrame — with what it does and does not guarantee; and screen sharing in calls — the codec as a wire contract, fragments, NACKs and keyframe requests inside the encryption, rate control, and the Windows surfaces. |
 | [AUDIO.md](docs/AUDIO.md) | A call's audio: the relay that never decodes, the client engine — echo cancellation, noise suppression, Opus with FEC and DTX, the adaptive jitter buffer, the mixer — and the ERLE harness that measures the canceller. |
@@ -298,9 +298,10 @@ toolbar (REQ-220/ARCH-100), drafts, scheduled send, the notification schedule
 with keywords and priority people, cross-channel threads, the People directory
 and link-unfurl cards all run end to end with their daemon halves.
 
-**The GUI smoke.** `tools/gui/smoke.sh` asks whether the client boots and
-runs, in about ten seconds, by hand before pushing a client change (TESTING.md
-"Reading the GUI smoke"). See [TESTING.md](docs/TESTING.md).
+**The GUI smoke.** `tools/gui/run.sh smoke` asks whether the client boots and
+runs, on Windows and in the browser, by hand before pushing a client change;
+it is one of the GUI and browser tests, which no suite runs. See
+[tools/gui/README.md](tools/gui/README.md), "Reading the GUI smoke".
 
 Every desktop shares one portable self-rendered application layer over SDL3 and
 sdltext, with a thin native shim per platform (ARCH-80), so Linux and macOS are

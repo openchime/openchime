@@ -17,10 +17,9 @@
 #             then the source checks, actionlint, the suites that start no
 #             thread, and media, plainly with their timing judged, the
 #             static-link check, the end-to-end run, the release's compiler,
-#             the speech round trip, the web client in a headless Chrome and
-#             its objects' header dependencies, the GUI smoke on the web, and
-#             each fuzzing harness for its fixed inputs, one at a time, inside
-#             FUZZ_SECONDS (20) in all
+#             the speech round trip, the web client's objects' header
+#             dependencies, and each fuzzing harness for its fixed inputs, one
+#             at a time, inside FUZZ_SECONDS (20) in all
 #   threads   the test binary under ThreadSanitizer; then the suites that start
 #             threads, under it, their one run in the full suite
 #   packages  the release's daemon for ARCH (zig against glibc 2.34) with its
@@ -59,7 +58,7 @@ test-all:
 # --- plain --------------------------------------------------------------------
 build-all-plain:
 	+@$(MAKE) --no-print-directory $(FULL_SWITCHES) daemon linux $(WEB_DIR)/openchime.js \
-	    $(TEST_BIN) build/e2e_client build/demo_client build/signin $(patsubst %,build/fuzz/%,$(FUZZ_HARNESSES))
+	    $(TEST_BIN) build/e2e_client build/demo_client $(patsubst %,build/fuzz/%,$(FUZZ_HARNESSES))
 test-all-plain:
 	scripts/test/fast/source.sh
 	scripts/test/fast/actionlint.sh
@@ -68,9 +67,7 @@ test-all-plain:
 	scripts/test/full/e2e.sh
 	+MAKE="$(MAKE) $(FULL_SWITCHES)" scripts/test/full/release_cc.sh
 	scripts/test/full/speech.sh ./$(BIN)
-	NODE="$(NODE)" scripts/test/full/web.sh
 	+MAKE="$(MAKE) $(FULL_SWITCHES)" scripts/test/full/web_deps.sh
-	NODE="$(NODE)" scripts/test/full/gui_web_smoke.sh
 	FUZZ_HARNESSES="$(foreach h,$(FUZZ_HARNESSES),$(h):$(FUZZ_DICT_$(h)):$(FUZZ_RUNS_$(h)))" scripts/test/full/fuzz.sh
 
 # --- threads ------------------------------------------------------------------

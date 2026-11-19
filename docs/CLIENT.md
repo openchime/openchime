@@ -671,10 +671,10 @@ surfaces every engine feature, and a feature is surfaced there first.
 Accessibility (REQ-269) is a UIA provider over the self-drawn UI, a real system
 caret and UIA events (**ARCH-99**), with an `AutomationId` and an
 `InvokePattern` on every actionable element (**REQ-290**), verified from outside
-the process by `tools/gui/uia_probe.ps1`. The recording and sharing bars are
+the process by `tools/gui/harness/win32/uia_probe.ps1`. The recording and sharing bars are
 windows of their own, so each is served as its own small tree (`recbar`,
 `sharebar`: the line as Text, the buttons invokable), read and pressed by
-`tools/gui/uia_recbar.ps1`. Rich text and its toolbar
+`tools/gui/harness/win32/uia_recbar.ps1`. Rich text and its toolbar
 (**REQ-220**, ARCH-100) are a shared parser in `shared/richtext.c` plus sdltext
 byte ranges. Each platform has its own screen capture for sharing in calls; the
 codec and the transport are in the core (REQ-161, [CALLS.md](./CALLS.md) §6).
@@ -922,7 +922,7 @@ native trees.
 
 The rules and the surfaces of the portable GUI (§3, Windows and the web) that a
 change to it has to keep. How it is driven and checked is
-[TESTING.md](./TESTING.md) ("Driving the Win32 GUI", "Seeing the whole window",
+[tools/gui/README.md](../tools/gui/README.md) ("Driving the Win32 GUI", "Seeing the whole window",
 "Reading the GUI smoke").
 
 ### The text fields are drawn (every platform)
@@ -1030,7 +1030,7 @@ focus.
 - **Shortcuts are suppressed while a modal is open** — a modal owns the window, and
   opening a second surface behind it would leave two things claiming the screen.
   Esc and Enter reach it through `modal_key`.
-- Test with `tools/gui/drive.sh key ctrl+k` (also `alt+shift+up`, `ctrl+slash`, `esc`).
+- Test with `tools/gui/harness/win32/drive.sh key ctrl+k` (also `alt+shift+up`, `ctrl+slash`, `esc`).
   The verb says which modifiers it holds (`g_synth_mods`, which `mod_down` reads
   in place of the keyboard's state), because the shortcuts read the modifiers;
   posting a bare key proves nothing.
@@ -1147,7 +1147,7 @@ screen, since nothing about the field says that it scrolls. A channel's descript
 **Text gets the height its glyphs need, not a round number.** A rect written as
 `y + 80` is three lines at 100% and not two at the largest text size on a scaled
 display, and the difference is a sentence losing its last word inside a box every
-rect-based check calls correct — which is what `clipped=` (TESTING.md) exists to
+rect-based check calls correct — which is what `clipped=` (tools/gui/README.md) exists to
 catch. `text_rect()` measures instead. A field that must stay ONE line, like the
 composer's cue, takes a non-wrapping format so it ends in an ellipsis rather than
 wrapping into a second line there is no room for, and its rect is the format's
@@ -1283,7 +1283,8 @@ release number is a label on a build and is not in either binary, so the build
 is what is shown. **Copy** puts the whole as one line on the clipboard --
 `OpenChime client <build> (win32), server <build>, protocol <n>` -- for pasting
 into a report; the harness's `about` verb opens the dialog and answers that
-line, which the full suite checks (TESTING.md §3.4).
+line, which the web client's GUI test checks in the browser (tools/gui/README.md,
+"Reading the web client harness").
 
 ### What's new: this build's release notes
 
@@ -1307,7 +1308,7 @@ build ("dev") is never asked about -- and a fetch that fails or times out says
 to open is written where every URL the hook opens is (`signin_url.txt`), and the
 dump's `whatsnew=` line gives the card's state (`loading`, `shown`,
 `notrelease`, `failed`), the release and how many items it lists
-(`tools/gui/whatsnew.sh`).
+(`tools/gui/features/whatsnew.sh`).
 
 ### What the window says, and where (REQ-263)
 

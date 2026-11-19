@@ -159,7 +159,7 @@ void *oc_plat_tray_notify_handle(unsigned *tray_id);
  * many, 0 when cancelled or when the platform has no picker. */
 int   oc_plat_pick_files(SDL_Window *owner, const char *filter, int multi, char *out, size_t cap);
 /* What runs while a native file dialog's own modal loop holds the thread, so the
- * test hook still answers (TESTING.md, "Driving the Win32 GUI"); NULL for
+ * test hook still answers (tools/gui/README.md, "Driving the Win32 GUI"); NULL for
  * nothing. Only that: the rest of the client waits for the dialog as before. */
 void  oc_plat_set_modal_tick(void (*fn)(void));
 /* 1 while the file picker is open. */

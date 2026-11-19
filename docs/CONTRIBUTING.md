@@ -116,8 +116,9 @@ test** (TESTING.md): the fast one, `make build` and `make test`, here, before
 every push; and the full one, `make build-all` and `make test-all`, in CI,
 once per release-candidate. Each refuses to run on the other side.
 
-**Before pushing a GUI change, run `tools/gui/smoke.sh`** (TESTING.md
-"Reading the GUI smoke").
+**Before pushing a GUI change, run `tools/gui/run.sh smoke`**, and the
+feature's own test where the change touches one (tools/gui/README.md). No
+suite runs them.
 
 ## Commits
 
@@ -250,8 +251,8 @@ policy warns). Then the full suite's code tests, in the same job:
   starts no thread, and `media`, with its timing judged; the static-link
   check; the daemon started and driven over TLS with the e2e client; every
   Linux translation unit through the release's clang under `-Werror`; the
-  speech round trip; the web client in a headless Chrome and the GUI smoke on
-  the web (TESTING.md §3.4); the fuzzing pass.
+  speech round trip; the web client's header dependencies (TESTING.md §3.4);
+  the fuzzing pass.
 - **then PART=threads** — the suites that start threads, under
   ThreadSanitizer, their one run (TESTING.md §2.4).
 

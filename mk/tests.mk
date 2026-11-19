@@ -134,7 +134,8 @@ build/bench_load: tests/bench_load.c tests/testsignin.c $(SHARED_SRC) $(wildcard
 	    tests/bench_load.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -lpthread -o $@
 # The sign-in helper as a command, for the shell scripts: prints the token and
 # the verifier a client presents on AUTH, and presents one (`present`) for a
-# script that played the browser itself (scripts/test/full/web.sh).
+# script that played the browser itself (the browser checks of the daemon's
+# pages, run by hand, outside both suites).
 build/signin: tests/testsignin_main.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build-dir
 	$(CC) $(CFLAGS) -O0 -g -Ishared -Itests -I$(MBEDTLS_INC) \
 	    tests/testsignin_main.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@

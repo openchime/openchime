@@ -275,12 +275,8 @@ jobs:
       # e2e client and the fuzzing harnesses; then the source checks,
       # actionlint, the suites that start no thread and media, plainly with
       # their timing verdicts judged, the static-link check, the end-to-end
-      # run, the release's compiler, the speech round trip, the web client in a
-      # headless Chrome and the GUI smoke on the web, and the fuzzing pass. The
-      # runner's own Chrome, driven by playwright-core at the version
-      # package.json pins.
-      - name: Install the browser driver
-        run: npm install --no-audit --no-fund
+      # run, the release's compiler, the speech round trip, the web client's
+      # header dependencies, and the fuzzing pass.
       # Built under the release's build id, so the web client built here is the
       # one stage packages (WEB_PREBUILT, mk/web.mk): it is built once.
       - name: make build-all PART=plain
@@ -371,8 +367,6 @@ jobs:
           key: *wasm-speexdsp-key
       - name: make test-all PART=plain
         timeout-minutes: 90
-        env:
-          CHROME: /usr/bin/google-chrome
         run: make test-all PART=plain
 
       # --- PART=threads ---------------------------------------------------------

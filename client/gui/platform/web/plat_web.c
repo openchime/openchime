@@ -101,7 +101,7 @@ int   oc_plat_nav_go(int delta) {
 }
 /* The page goes to the daemon's sign-in page itself; it comes back to /app/
  * with the token (oc_plat_signin_result). In development mode, with
- * OPENCHIME_DEV_SIGNIN=user:password set (TESTING.md) is its own harness: it
+ * OPENCHIME_DEV_SIGNIN=user:password set (tools/gui/README.md) is its own harness: it
  * posts the page's form as the person would type it -- same origin, so the
  * browser sends the Origin the page requires -- and follows the page's 303
  * back here with the token. The product path, with the typing done. */

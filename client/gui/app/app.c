@@ -34978,7 +34978,7 @@ static void boot_book_cb(void *ctx, const char *workspace, const char *label,
  * start at all. */
 /* How many clients this process has started: connect_start, and the sign-in
  * card's attempts (signin_start, and the web client's resumed one). Observable by the
- * harness (tools/gui/startup.sh, via test_dump): a startup given a workspace
+ * harness (tools/gui/features/startup.sh, via test_dump): a startup given a workspace
  * starts exactly one, and a second is the defect where two net threads shared a
  * workspace, each authenticating, with the first orphaned. */
 static int g_clients_started;
@@ -38514,7 +38514,7 @@ static void *devlist_thread(void *arg) {
 }
 
 /* The open confirmation, and which one: the harness answers some of them
- * (tools/gui/drive.sh trust_dev_cert, lib.sh sign_in_card), signed in or not. */
+ * (tools/gui/harness/win32/drive.sh trust_dev_cert, lib.sh sign_in_card), signed in or not. */
 static void test_dump_confirm(FILE *f) {
     fprintf(f, "confirm open=%d act=%d url=\"%s\" emoji=\"%s\" title=\"%s\"\n", g_confirm_open, g_confirm_act,
             g_confirm_url, g_confirm_emoji, g_confirm_title);
@@ -38551,7 +38551,7 @@ static void test_dump(const char *path) {
         if (sm) fprintf(f, "signin last_error=%s signin_url=%.120s\n", sm->last_error, sm->signin_url);
         /* The two lines a signed-in dump has that say how a start went, here
          * too: a start that never signed in is the case they are most needed
-         * for (tools/gui/startup.sh). The error is the sign-in attempt's. */
+         * for (tools/gui/features/startup.sh). The error is the sign-in attempt's. */
         fprintf(f, "startup visible=%d started=%d si_ws=\"%s\" si_err=\"%s\"\n",
                 win_visible(g_main), g_clients_started, g_si_ws, g_si_err);
         fprintf(f, "error_seq=%u last_error=\"%s\"\n",
@@ -38581,7 +38581,7 @@ static void test_dump(const char *path) {
      * a person, and 500 names is not read by anyone. */
     /* The accessibility surface (ARCH-99). `avail` is whether the UIA entry
      * points resolved at all; `items` is what the last paint described. Neither
-     * proves a client can SEE the tree — tools/gui/uia_probe.ps1 does that, from
+     * proves a client can SEE the tree — tools/gui/harness/win32/uia_probe.ps1 does that, from
      * outside the process — but a zero here localises the failure to this side. */
     fprintf(f, "unres seq=%u n=%u can_add=%u priv=%u names=\"%s\"\n",
             m->unresolved.seq, (unsigned)m->unresolved.n_peers,
@@ -39092,7 +39092,7 @@ static void test_dump(const char *path) {
                     (unsigned long long)g_sw[i].last_used, addr, g_sw[i].user[0] ? g_sw[i].user : "-", g_sw[i].ws);
         }
     }
-    /* How the client started (tools/gui/startup.sh). `visible` is whether the
+    /* How the client started (tools/gui/features/startup.sh). `visible` is whether the
      * window is on screen at all -- a client that started and showed nothing
      * looked, from here, exactly like one that never started. `started` counts
      * clients connect_start began, and `si_err` is the reason the sign-in view
@@ -39572,7 +39572,7 @@ static void test_dump(const char *path) {
             if (!sb[i].w) { fprintf(f, "searchbox %s made=0\n", sb[i].name); continue; }
             rectf er = sb[i].w->box;
             /* The fields are drawn with the UI format: its face and size are
-             * what the harness compares across the boxes (tools/gui/search_boxes.sh). */
+             * what the harness compares across the boxes (tools/gui/features/search_boxes.sh). */
             fprintf(f, "searchbox %s made=1 vis=%d uifont=1 lf=%d face=\"%s\" lh=%d "
                        "edit=%d,%d,%d,%d box=%d,%d,%d,%d text=\"%s\"\n",
                     sb[i].name, sb[i].w->visible ? 1 : 0, PX(UIS(FONT_UI * g_text_scale)), ui_family(), PX(UIS(18.0f)),

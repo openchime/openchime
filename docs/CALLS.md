@@ -321,7 +321,7 @@ cover: tampering, a wrong key or another sender, another info or aad, low-order 
 replay window. The client end-to-end test, which runs the switches between epochs, (`test_client_core.c`) taps the relay and checks it sees only
 ciphertext, and that after a participant leaves every packet is under an epoch it was
 never given a key for; and a shared screen crosses it as SFrame too (§6.9).
-`tools/gui/calls.sh` runs two Win32 clients (two web clients with `OC_TEST_PLATFORM=web`) in a call and checks each receives the other's
+`tools/gui/features/calls.sh` runs two Win32 clients (two web clients with `OC_TEST_PLATFORM=web`) in a call and checks each receives the other's
 packets, every one decrypting once the keys are in.
 
 ## 6. Screen sharing
@@ -587,7 +587,7 @@ cross into `client/core` and are encoded there, so the wire is the same everywhe
   costs NACKs and resends, not the picture; faye joins late and has a picture
   within seconds; erik takes over, which stops dana's; erik stops and the picture
   goes.
-- `tools/gui/calls.sh`: two Win32 clients, or two web clients — alice shares, bob's view shows her
+- `tools/gui/features/calls.sh`: two Win32 clients, or two web clients — alice shares, bob's view shows her
   screen with readable, rising frame numbers; full screen, Esc, actual size; the
   accessibility names; bob takes over; bob stops.
 
@@ -714,7 +714,7 @@ less as views take fewer: a speaker layout of the speaker and a strip of four ta
 - `tests/itest_netloop.c`: `CALL_CAMERA` marking the roster in the same epoch, and a
   leave, a disconnect and a rejoin clearing it; someone outside the call refused;
   `CALL_VIDEO_SUB` only from a participant, and the relay honouring it.
-- `tools/gui/camera.sh`: two clients, Win32 or web — the camera button and picker,
+- `tools/gui/features/camera.sh`: two clients, Win32 or web — the camera button and picker,
   each card showing the other's camera with rising frame numbers and your own mirrored,
   the grid and the speaker layout, the subscription following the cards drawn, a camera
   turned off back to a face, and a camera the system refuses said as such (TESTING.md).

@@ -361,7 +361,7 @@ player is the one place bytes reach a file, and only one the user chose.
   Keys: Space, ← and → by 5 s, ↑ and ↓ for volume, M, Esc.
 - **Elsewhere:** a VID badge and a Video filter in the Files view; "🎥 Video
   message (m:ss)" in the sidebar and the notification when there is no caption.
-- **Harness:** `tools/gui/drive.sh vm open|record|stop|discard|retake|send|play|mute|close|seek <ms>`,
+- **Harness:** `tools/gui/harness/win32/drive.sh vm open|record|stop|discard|retake|send|play|mute|close|seek <ms>`,
   `vm source camera|<id>`, `vm corner br|bl|tr|tl`, `vm sound on|off`, `vm nocam on|off`;
   a `vm=` line with the phase, the take, the player and the buttons in `dump`, a
   `vmsrc` line with the choices, whether the card is aside, the bar and its
@@ -389,5 +389,5 @@ player is the one place bytes reach a file, and only one the user chose.
 | `make test` — screen recording | a frame view and the camera box's geometry in every corner; the screen front end delivering 30 fps from a screen that changes five times a second, all one size, fitted; a synthetic screen recorded with the camera boxed into each corner, found there by colour in a decoded frame and absent from the opposite corner; a window with no camera and no box; the window going away mid-take (kept) and before the first frame (refused as gone); the capture refused; the computer's sound mixed with the microphone, and — the microphone hearing only the echo — present once, not twice |
 | `make test` — canceller | the ERLE harness at 48 kHz on the 16 kHz band, on the same rooms as voice input's (§4.2) |
 | Win32 harness (synthetic camera) | record, review, send; a second client shows the card and plays it; the Files view and previews; the denied path; the cap |
-| Win32 harness, `tools/gui/screenrec.sh` | real Windows.Graphics.Capture with a synthetic camera and sound: screens and windows listed; the box in the chosen corner of the preview; the card stepping aside for the recording bar, which is kept out of the capture and read and pressed through UI Automation; Stop ending the take at the fitted size; the file the daemon stores being VP9 and Opus at that size, with the microphone and the computer's sound in it; a window closed mid-take keeping what came before |
+| Win32 harness, `tools/gui/features/screenrec.sh` | real Windows.Graphics.Capture with a synthetic camera and sound: screens and windows listed; the box in the chosen corner of the preview; the card stepping aside for the recording bar, which is kept out of the capture and read and pressed through UI Automation; Stop ending the take at the fitted size; the file the daemon stores being VP9 and Opus at that size, with the microphone and the computer's sound in it; a window closed mid-take keeping what came before |
 | By hand, once | a real camera and microphone: permission prompts, switching devices, a full five-minute recording, CPU use; a narrated screen recording with the camera in each corner, watched back |
