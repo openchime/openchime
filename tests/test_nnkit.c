@@ -575,6 +575,314 @@ static int matvec_u8_case(int k, int n) {
     return ok;
 }
 
+/* ---- the summary model's kernels ---------------------------------------------
+ * The quantised products against a naive version written from ggml's block
+ * layouts, exactly; the float kernels against double within a tolerance. */
+
+static uint16_t rnd_f16(float lo, float hi) { return nn_f32_to_f16(rnd_f(lo, hi)); }
+
+/* A random Q4_K or Q6_K block: any bytes are a block, given finite scales. */
+static void rnd_block(nn_wtype t, uint8_t *b) {
+    if (t == NN_W_Q4K) {
+        uint16_t d = rnd_f16(0.0005f, 0.01f), dm = rnd_f16(0.0f, 0.01f);
+        b[0] = (uint8_t)d; b[1] = (uint8_t)(d >> 8); b[2] = (uint8_t)dm; b[3] = (uint8_t)(dm >> 8);
+        for (int i = 4; i < NN_Q4K_BYTES; i++) b[i] = (uint8_t)rnd();
+    } else {
+        for (int i = 0; i < 208; i++) b[i] = (uint8_t)rnd();
+        uint16_t d = rnd_f16(0.0005f, 0.01f);
+        b[208] = (uint8_t)d; b[209] = (uint8_t)(d >> 8);
+    }
+}
+
+/* ggml's dequantisation, written from its reference code, as integers: value e
+ * is d * sc[e] * q[e] - dmin * mn[e]. */
+static void naive_unpack(nn_wtype t, const uint8_t *b, int *q, int *sc, int *mn, float *d, float *dmin) {
+    if (t == NN_W_Q4K) {
+        *d = nn_f16_to_f32((uint16_t)(b[0] | b[1] << 8));
+        *dmin = nn_f16_to_f32((uint16_t)(b[2] | b[3] << 8));
+        const uint8_t *s = b + 4, *qs = b + 16;
+        for (int j = 0; j < 8; j++) {
+            int scj, mj;
+            if (j < 4) { scj = s[j] & 63; mj = s[j + 4] & 63; }
+            else { scj = (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4); mj = (s[j + 4] >> 4) | ((s[j] >> 6) << 4); }
+            for (int l = 0; l < 32; l++) {
+                int e = 32 * j + l;
+                q[e] = j % 2 ? qs[32 * (j / 2) + l] >> 4 : qs[32 * (j / 2) + l] & 0xF;
+                sc[e] = scj;
+                mn[e] = mj;
+            }
+        }
+    } else {
+        *d = nn_f16_to_f32((uint16_t)(b[208] | b[209] << 8));
+        *dmin = 0;
+        const uint8_t *ql = b, *qh = b + 128;
+        const int8_t *s = (const int8_t *)(b + 192);
+        for (int n = 0; n < 2; n++)
+            for (int l = 0; l < 32; l++) {
+                int base = 128 * n, is = 8 * n + l / 16;
+                const uint8_t *L = ql + 64 * n, *H = qh + 32 * n;
+                q[base + l]      = ((L[l] & 0xF) | ((H[l] & 3) << 4)) - 32;
+                q[base + l + 32] = ((L[l + 32] & 0xF) | (((H[l] >> 2) & 3) << 4)) - 32;
+                q[base + l + 64] = ((L[l] >> 4) | (((H[l] >> 4) & 3) << 4)) - 32;
+                q[base + l + 96] = ((L[l + 32] >> 4) | (((H[l] >> 6) & 3) << 4)) - 32;
+                sc[base + l] = s[is]; sc[base + l + 32] = s[is + 2];
+                sc[base + l + 64] = s[is + 4]; sc[base + l + 96] = s[is + 6];
+            }
+        for (int e = 0; e < NN_QK; e++) mn[e] = 0;
+    }
+}
+
+static int f16_checks(void) {
+    int ok = 1;
+    for (uint32_t h = 0; h < 65536; h++) {
+        if ((h & 0x7c00) == 0x7c00 && (h & 0x3ff)) continue;          /* NaN */
+        if (nn_f32_to_f16(nn_f16_to_f32((uint16_t)h)) != h) { ok = 0; printf("    f16 %04x\n", h); break; }
+    }
+    /* Ties to even: 1 + 2^-11 is halfway between 1 and the next half. */
+    ok &= nn_f32_to_f16(1.0f + 0x1p-11f) == 0x3c00 && nn_f32_to_f16(1.0f + 3 * 0x1p-11f) == 0x3c02;
+    ok &= nn_f32_to_f16(70000.0f) == 0x7c00 && nn_f32_to_f16(0x1p-25f) == 0 && nn_f32_to_f16(0x1p-24f) == 1;
+    return ok;
+}
+
+/* The quantised product, exactly: the same integers and the same float steps. */
+static int kmatmul_case(nn_wtype t, int m, int n, int k) {
+    int nb = k / NN_QK, ok = 1;
+    size_t rb = nn_row_bytes(t, k);
+    uint8_t *w = malloc((size_t)n * rb);
+    float *x = malloc((size_t)m * k * sizeof *x), *y = malloc((size_t)m * n * sizeof *y),
+          *row = malloc((size_t)k * sizeof *row);
+    void *scr = malloc(nn_matmul_w_scratch(t, k, m));
+    for (int c = 0; c < n; c++)
+        for (int b = 0; b < nb; b++) rnd_block(t, w + (size_t)c * rb + (size_t)b * (t == NN_W_Q4K ? NN_Q4K_BYTES : NN_Q6K_BYTES));
+    for (int i = 0; i < m * k; i++) x[i] = rnd_f(-3, 3);
+    x[5] = 0;                                         /* and one all-zero block */
+    if (m > 1 && k >= 512) for (int i = 0; i < NN_QK; i++) x[(size_t)k + NN_QK + i] = 0;
+    nn_matmul_w(t, w, n, k, x, m, (size_t)k, y, (size_t)n, scr);
+    int q[NN_QK], sc[NN_QK], mn[NN_QK];
+    for (int r = 0; r < m && ok; r++)
+        for (int c = 0; c < n && ok; c++) {
+            float acc = 0;
+            for (int b = 0; b < nb; b++) {
+                const float *v = x + (size_t)r * k + b * NN_QK;
+                float amax = 0;
+                for (int i = 0; i < NN_QK; i++) amax = fmaxf(amax, fabsf(v[i]));
+                float ad = amax / 127.0f;
+                int8_t a[NN_QK];
+                for (int i = 0; i < NN_QK; i++) a[i] = amax == 0 ? 0 : (int8_t)nearbyintf(v[i] * (127.0f / amax));
+                if (amax == 0) ad = 0;
+                float d, dmin;
+                naive_unpack(t, w + (size_t)c * rb + (size_t)b * (t == NN_W_Q4K ? NN_Q4K_BYTES : NN_Q6K_BYTES), q, sc, mn, &d, &dmin);
+                long is = 0, im = 0;
+                for (int e = 0; e < NN_QK; e++) { is += (long)sc[e] * q[e] * a[e]; im += (long)mn[e] * a[e]; }
+                acc += d * ad * (float)is - dmin * ad * (float)im;
+            }
+            if (acc != y[(size_t)r * n + c]) { ok = 0; printf("    k%d [%d][%d] %.9g / %.9g\n", t, r, c, (double)y[(size_t)r * n + c], (double)acc); }
+        }
+    /* The dequantised row is the same values. */
+    for (int c = 0; c < n && ok; c++) {
+        nn_dequant_row(t, w, k, c, row);
+        for (int b = 0; b < nb && ok; b++) {
+            float d, dmin;
+            naive_unpack(t, w + (size_t)c * rb + (size_t)b * (t == NN_W_Q4K ? NN_Q4K_BYTES : NN_Q6K_BYTES), q, sc, mn, &d, &dmin);
+            for (int e = 0; e < NN_QK; e++)
+                if (row[b * NN_QK + e] != d * (float)sc[e] * (float)q[e] - dmin * (float)mn[e]) { ok = 0; break; }
+        }
+    }
+    free(w); free(x); free(y); free(row); free(scr);
+    return ok;
+}
+
+static int fmatmul_case(nn_wtype t, int m, int n, int k) {
+    size_t rb = nn_row_bytes(t, k);
+    uint8_t *w = malloc((size_t)n * rb);
+    float *x = malloc((size_t)m * k * sizeof *x), *y = malloc((size_t)m * n * sizeof *y),
+          *wf = malloc((size_t)n * k * sizeof *wf);
+    void *scr = malloc(nn_matmul_w_scratch(t, k, m));
+    for (int i = 0; i < n * k; i++) {
+        float f = rnd_f(-1, 1);
+        if (t == NN_W_BF16) {
+            union { float f; uint32_t u; } v = { .f = f };
+            uint16_t h = (uint16_t)(v.u >> 16);
+            w[2 * i] = (uint8_t)h; w[2 * i + 1] = (uint8_t)(h >> 8);
+            wf[i] = nn_bf16_to_f32(h);
+        } else { memcpy(w + 4 * (size_t)i, &f, 4); wf[i] = f; }
+    }
+    for (int i = 0; i < m * k; i++) x[i] = rnd_f(-1, 1);
+    nn_matmul_w(t, w, n, k, x, m, (size_t)k, y, (size_t)n, scr);
+    int ok = 1;
+    for (int r = 0; r < m; r++)
+        for (int c = 0; c < n; c++) {
+            double s = 0;
+            for (int i = 0; i < k; i++) s += (double)x[(size_t)r * k + i] * wf[(size_t)c * k + i];
+            if (fabs(s - y[(size_t)r * n + c]) > 1e-4 * (1 + fabs(s))) ok = 0;
+        }
+    free(w); free(x); free(y); free(wf); free(scr);
+    return ok;
+}
+
+static int lm_elementwise_checks(void) {
+    int ok = 1;
+    float x[3 * 300], g[300], y[3 * 300];
+    for (int i = 0; i < 900; i++) x[i] = y[i] = rnd_f(-4, 4);
+    for (int i = 0; i < 300; i++) g[i] = rnd_f(0.5f, 1.5f);
+    nn_rmsnorm(y, 3, 290, 300, g, 1e-6f);
+    for (int r = 0; r < 3; r++) {
+        double ss = 0;
+        for (int i = 0; i < 290; i++) ss += (double)x[r * 300 + i] * x[r * 300 + i];
+        double sc = 1 / sqrt(ss / 290 + 1e-6);
+        for (int i = 0; i < 290; i++) if (fabs(x[r * 300 + i] * sc * g[i] - y[r * 300 + i]) > 1e-5) ok = 0;
+        for (int i = 290; i < 300; i++) if (y[r * 300 + i] != x[r * 300 + i]) ok = 0;
+    }
+    for (int i = 0; i < 900; i++) y[i] = x[i];
+    nn_l2norm(y, 3, 128, 300, 1e-6f);
+    for (int r = 0; r < 3; r++) {
+        double ss = 0;
+        for (int i = 0; i < 128; i++) ss += (double)x[r * 300 + i] * x[r * 300 + i];
+        for (int i = 0; i < 128; i++) if (fabs(x[r * 300 + i] / sqrt(ss) - y[r * 300 + i]) > 1e-6) ok = 0;
+    }
+    float z[8] = { 0 };
+    nn_l2norm(z, 1, 8, 8, 1e-6f);                    /* all zero stays zero */
+    for (int i = 0; i < 8; i++) ok &= z[i] == 0;
+    for (int i = 0; i < 300; i++) y[i] = x[i];
+    nn_mul_sigmoid(y, x + 300, 300);
+    for (int i = 0; i < 300; i++) if (fabs(x[i] / (1 + exp(-(double)x[300 + i])) - y[i]) > 1e-5) ok = 0;
+    for (int i = 0; i < 300; i++) y[i] = x[i];
+    nn_mul_silu(y, x + 300, 300);
+    for (int i = 0; i < 300; i++) {
+        double s = x[300 + i] / (1 + exp(-(double)x[300 + i]));
+        if (fabs(x[i] * s - y[i]) > 1e-4) ok = 0;
+    }
+    /* Rotary positions: pairs i and i + rot/2, the rest untouched. */
+    float h[16], h0[16], inv[4] = { 1.0f, 0.1f, 0.01f, 0.001f };
+    for (int i = 0; i < 16; i++) h[i] = h0[i] = rnd_f(-1, 1);
+    nn_rope_half(h, 8, inv, 37.0f);
+    for (int i = 0; i < 4; i++) {
+        double f = 37.0 * inv[i];
+        if (fabs(h0[i] * cos(f) - h0[i + 4] * sin(f) - h[i]) > 1e-5 ||
+            fabs(h0[i + 4] * cos(f) + h0[i] * sin(f) - h[i + 4]) > 1e-5) ok = 0;
+    }
+    for (int i = 8; i < 16; i++) ok &= h[i] == h0[i];
+    return ok;
+}
+
+/* The causal convolution: against the naive sum, and run in pieces the same
+ * bits as in one call (the state carried). */
+static int conv_causal_case(int t, int c, int k) {
+    float *x = malloc((size_t)t * c * sizeof *x), *y = malloc((size_t)t * c * sizeof *y),
+          *y2 = malloc((size_t)t * c * sizeof *y2), *w = malloc((size_t)k * c * sizeof *w),
+          *st = malloc((size_t)k * c * sizeof *st), *st0 = malloc((size_t)k * c * sizeof *st0),
+          *st2 = malloc((size_t)k * c * sizeof *st2);
+    for (int i = 0; i < t * c; i++) x[i] = rnd_f(-1, 1);
+    for (int i = 0; i < k * c; i++) w[i] = rnd_f(-1, 1);
+    for (int i = 0; i < (k - 1) * c; i++) st[i] = st0[i] = st2[i] = rnd_f(-1, 1);
+    nn_conv_causal(x, t, c, (size_t)c, st, k, w, y, (size_t)c);
+    int ok = 1;
+    for (int i = 0; i < t; i++)
+        for (int ch = 0; ch < c; ch++) {
+            double s = 0;
+            for (int j = 0; j < k; j++) {
+                int at = i + j - (k - 1);
+                s += (double)w[j * c + ch] * (at < 0 ? st0[(k - 1 + at) * c + ch] : x[at * c + ch]);
+            }
+            if (fabs(s - y[i * c + ch]) > 1e-5) ok = 0;
+        }
+    for (int i = 0; i < (k - 1) * c; i++) {
+        int at = t - (k - 1) + i / c;
+        float want = at < 0 ? st0[(k - 1 + at) * c + i % c] : x[at * c + i % c];
+        if (st[i] != want) ok = 0;
+    }
+    int a = t / 3;                                    /* in two pieces, and in place */
+    memcpy(y2, x, (size_t)t * c * sizeof *y2);
+    nn_conv_causal(y2, a, c, (size_t)c, st2, k, w, y2, (size_t)c);
+    nn_conv_causal(y2 + (size_t)a * c, t - a, c, (size_t)c, st2, k, w, y2 + (size_t)a * c, (size_t)c);
+    ok &= memcmp(y, y2, (size_t)t * c * sizeof *y) == 0 && memcmp(st, st2, (size_t)(k - 1) * c * sizeof *st) == 0;
+    free(x); free(y); free(y2); free(w); free(st); free(st0); free(st2);
+    return ok;
+}
+
+/* The gated delta rule: against the rule in double, and one step at a time the
+ * same bits as all steps in one call. */
+static int delta_case(int t, int hk, int hv, int dk, int dv) {
+    size_t ldq = (size_t)hk * dk, ldv = (size_t)hv * dv, ns = (size_t)hv * dk * dv;
+    float *q = malloc((size_t)t * ldq * sizeof *q), *k = malloc((size_t)t * ldq * sizeof *k),
+          *v = malloc((size_t)t * ldv * sizeof *v), *g = malloc((size_t)t * hv * sizeof *g),
+          *be = malloc((size_t)t * hv * sizeof *be), *o = malloc((size_t)t * ldv * sizeof *o),
+          *o2 = malloc((size_t)t * ldv * sizeof *o2), *S = calloc(ns, sizeof *S), *S2 = calloc(ns, sizeof *S2),
+          *qk = malloc((size_t)t * 2 * ldq * sizeof *qk);
+    double *D = calloc(ns, sizeof *D);
+    for (size_t i = 0; i < (size_t)t * ldq; i++) { q[i] = rnd_f(-0.3f, 0.3f); k[i] = rnd_f(-0.3f, 0.3f); }
+    for (size_t i = 0; i < (size_t)t * ldv; i++) v[i] = rnd_f(-1, 1);
+    for (int i = 0; i < t * hv; i++) { g[i] = rnd_f(-1, 0); be[i] = rnd_f(0, 1); }
+    /* q and k side by side in one row, as the model has them */
+    for (int s = 0; s < t; s++) {
+        memcpy(qk + (size_t)s * 2 * ldq, q + (size_t)s * ldq, ldq * sizeof *q);
+        memcpy(qk + (size_t)s * 2 * ldq + ldq, k + (size_t)s * ldq, ldq * sizeof *k);
+    }
+    float qs = 1.0f / sqrtf((float)dk);
+    nn_gated_delta(qk, qk + ldq, 2 * ldq, v, ldv, g, be, t, hk, hv, dk, dv, qs, S, o, ldv);
+    int ok = 1, per = hv / hk;
+    for (int s = 0; s < t; s++)
+        for (int h = 0; h < hv; h++) {
+            const float *qh = q + (size_t)s * ldq + (size_t)(h / per) * dk, *kh = k + (size_t)s * ldq + (size_t)(h / per) * dk;
+            double *M = D + (size_t)h * dk * dv, dec = exp((double)g[s * hv + h]), u[64];
+            for (int i = 0; i < dk * dv; i++) M[i] *= dec;
+            for (int j = 0; j < dv; j++) {
+                double kv = 0;
+                for (int i = 0; i < dk; i++) kv += M[i * dv + j] * kh[i];
+                u[j] = (v[(size_t)s * ldv + (size_t)h * dv + j] - kv) * be[s * hv + h];
+            }
+            for (int i = 0; i < dk; i++) for (int j = 0; j < dv; j++) M[i * dv + j] += kh[i] * u[j];
+            for (int j = 0; j < dv; j++) {
+                double r = 0;
+                for (int i = 0; i < dk; i++) r += M[i * dv + j] * qh[i] * qs;
+                if (fabs(r - o[(size_t)s * ldv + (size_t)h * dv + j]) > 1e-4) ok = 0;
+            }
+        }
+    for (int s = 0; s < t; s++)
+        nn_gated_delta(qk + (size_t)s * 2 * ldq, qk + (size_t)s * 2 * ldq + ldq, 2 * ldq, v + (size_t)s * ldv, ldv,
+                       g + (size_t)s * hv, be + (size_t)s * hv, 1, hk, hv, dk, dv, qs, S2, o2 + (size_t)s * ldv, ldv);
+    ok &= memcmp(o, o2, (size_t)t * ldv * sizeof *o) == 0 && memcmp(S, S2, ns * sizeof *S) == 0;
+    free(q); free(k); free(v); free(g); free(be); free(o); free(o2); free(S); free(S2); free(qk); free(D);
+    return ok;
+}
+
+/* Attention over the 8-bit cache, against double over the cache's own values. */
+static int attend_q8_case(int n, int dh) {
+    int nb = dh / NN_Q8_0;
+    nn_q8_0 *k = malloc((size_t)n * nb * sizeof *k), *v = malloc((size_t)n * nb * sizeof *v);
+    float *row = malloc((size_t)dh * sizeof *row), q[256], out[256], *scr = malloc((size_t)n * sizeof *scr);
+    double sc[512];
+    for (int j = 0; j < n; j++) {
+        for (int i = 0; i < dh; i++) row[i] = rnd_f(-2, 2);
+        nn_q8_0_quantize(row, dh, k + (size_t)j * nb);
+        for (int i = 0; i < dh; i++) row[i] = rnd_f(-2, 2);
+        nn_q8_0_quantize(row, dh, v + (size_t)j * nb);
+    }
+    for (int i = 0; i < dh; i++) q[i] = rnd_f(-1, 1);
+    float scale = 1.0f / sqrtf((float)dh);
+    nn_attend_q8(q, k, v, (size_t)nb, n, dh, scale, out, scr);
+    double mx = -1e300, sum = 0;
+    for (int j = 0; j < n; j++) {
+        double s = 0;
+        for (int i = 0; i < dh; i++) s += (double)q[i] * k[(size_t)j * nb + i / 32].d * k[(size_t)j * nb + i / 32].q[i % 32];
+        sc[j] = s * scale;
+        if (sc[j] > mx) mx = sc[j];
+    }
+    for (int j = 0; j < n; j++) { sc[j] = exp(sc[j] - mx); sum += sc[j]; }
+    int ok = 1;
+    for (int i = 0; i < dh; i++) {
+        double o = 0;
+        for (int j = 0; j < n; j++) o += sc[j] / sum * v[(size_t)j * nb + i / 32].d * v[(size_t)j * nb + i / 32].q[i % 32];
+        if (fabs(o - out[i]) > 1e-4) ok = 0;
+    }
+    /* The quantised cache holds each value to within half a step. */
+    for (int i = 0; i < dh; i++) row[i] = rnd_f(-2, 2);
+    nn_q8_0_quantize(row, dh, k);
+    for (int i = 0; i < dh; i++) if (fabs(row[i] - k[i / 32].d * k[i / 32].q[i % 32]) > k[i / 32].d * 0.5001) ok = 0;
+    free(k); free(v); free(row); free(scr);
+    return ok;
+}
+
 int run_nnkit_tests(void) {
     printf("test_nnkit: the kernels against naive versions\n");
     CHECK(dql_checks());
@@ -619,5 +927,22 @@ int run_nnkit_tests(void) {
     CHECK(attend_case(3, 0, 1, 8, 8));
     CHECK(matvec_u8_case(320, 50));
     CHECK(matvec_u8_case(37, 9));
+    /* The summary model's: both block types at the model's widths, one row and
+     * several; the float types; its layers' kernels. */
+    CHECK(f16_checks());
+    CHECK(kmatmul_case(NN_W_Q4K, 1, 5, 256));
+    CHECK(kmatmul_case(NN_W_Q4K, 4, 7, 2048));
+    CHECK(kmatmul_case(NN_W_Q6K, 1, 3, 512));
+    CHECK(kmatmul_case(NN_W_Q6K, 3, 6, 1536));
+    CHECK(fmatmul_case(NN_W_BF16, 3, 5, 300));
+    CHECK(fmatmul_case(NN_W_F32, 2, 4, 37));
+    CHECK(lm_elementwise_checks());
+    CHECK(conv_causal_case(9, 40, 4));
+    CHECK(conv_causal_case(2, 16, 4));
+    CHECK(conv_causal_case(7, 8, 1));
+    CHECK(delta_case(6, 2, 2, 16, 8));
+    CHECK(delta_case(5, 2, 4, 8, 16));
+    CHECK(attend_q8_case(1, 64));
+    CHECK(attend_q8_case(37, 256));
     return failures;
 }

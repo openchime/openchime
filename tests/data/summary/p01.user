@@ -1,0 +1,38 @@
+Messages from #support, oldest first. Indented lines are replies in a thread.
+
+[1] Rosa Lindqvist: Morning all. Ticket 4471 is back: the customer at Harbor Freightways says invoices over 10,000 still show the old tax rate.
+  [2] Tomas Okafor: I shipped the fix for that on Tuesday. Which build are they on?
+  [3] Rosa Lindqvist: They sent a screenshot, it says 3.18.2.
+  [4] Tomas Okafor: The fix is in 3.18.4. They need to update, nothing else to do.
+  [5] Rosa Lindqvist: I'll tell them and close it once they confirm.
+[6] Priya Raman: Heads up, the login page took 9 seconds to load for about twenty minutes this morning. It's back to normal now.
+[7] Dev Malhotra: That was the certificate renewal. The load balancer kept the old one in its cache until I restarted it at 08:40.
+[8] Priya Raman: Can we make sure the restart happens on its own next time? I don't want to find out from customers again.
+[9] Dev Malhotra: I'll add it to the renewal script by Friday.
+[10] Rosa Lindqvist: New one: a user in the Lisbon office can't attach PDFs larger than 25 MB.
+  [11] Tomas Okafor: The limit is 25 MB on the free plan and 100 MB on business. What plan are they on?
+  [12] Rosa Lindqvist: Business, since March.
+  [13] Tomas Okafor: Then the plan change didn't reach the storage service. Send me the account id and I'll fix it by hand.
+  [14] Rosa Lindqvist: Sent in a direct message. Account 88213.
+  [15] Tomas Okafor: Done, they can attach up to 100 MB now. I opened ticket 4489 to find out why the change didn't sync.
+[16] Aiko Tanaka: Does anyone know if we still support Windows 7 for the desktop app? A school district is asking.
+[17] Priya Raman: We dropped it in version 3.0, two years ago. The last build that runs there is 2.9.7 and it gets no security fixes.
+[18] Aiko Tanaka: Thanks, I'll tell them they need Windows 10 or later.
+[19] Dev Malhotra: The nightly backup took 3 hours 12 minutes last night instead of the usual 50 minutes.
+[20] Dev Malhotra: The new audit table is 40 GB and it isn't excluded from the full dump. I'll exclude it and back it up weekly instead.
+[21] Priya Raman: Agreed, weekly is fine for audit data. Please write it down in the runbook.
+[22] Rosa Lindqvist: Customer at Brightwell Clinic asked whether we can export all their messages as CSV. Is that something we offer?
+  [23] Aiko Tanaka: Only as JSON from the admin page. CSV is on the roadmap for the second quarter.
+  [24] Rosa Lindqvist: Okay. Can I promise them a date?
+  [25] Priya Raman: No date yet, please don't promise one. Say it's planned.
+[26] Tomas Okafor: Reminder: I'm on leave from the 14th to the 21st. Aiko is covering billing tickets.
+[27] Aiko Tanaka: Yes, send billing ones my way that week.
+[28] Rosa Lindqvist: Ticket 4492: two-factor codes arrive five minutes late for users on one mobile carrier in Chile.
+[29] Dev Malhotra: Our SMS provider shows delays on that route too. I've asked them; no answer yet.
+[30] Rosa Lindqvist: Should we tell affected users to switch to the authenticator app in the meantime?
+[31] Priya Raman: Yes, and add the workaround to the status page.
+
+Write notes on these lines: at most 4, the most important first. Each note is one line in exactly this form:
+- [line number] kind | topic | what happened
+
+kind is event, decision, action or question. topic names what the note is about in 2 to 5 words, and notes about the same thing share it. what happened is one or two sentences saying who did what, with the particulars the lines give. Put what is about the same thing into one note, citing the lines it comes from (at most 3), each line number in square brackets, as [12] or [12][15]. Leave out greetings and small talk.

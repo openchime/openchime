@@ -45,16 +45,6 @@ $(OPUS_A): $(TOOLCHAIN_DEPS)
 $(SPEEXDSP_A): $(TOOLCHAIN_DEPS)
 	scripts/build/speexdsp.sh native
 
-# --- Summaries: llama.cpp (ARCH-116) ------------------------------------------
-# Built from pinned source as one static archive. The model itself is DATA,
-# fetched on first use when an operator turns summaries on, never shipped.
-LLAMA_DIR := third_party/llamacpp-0.5.0$(ARCH_SUFFIX)
-LLAMA_A   := $(LLAMA_DIR)/lib/libllamacpp.a
-$(LLAMA_A): scripts/build/llamacpp.sh $(TOOLCHAIN_DEPS)
-	@echo "openchime: building llama.cpp for summaries (a few minutes, once; make SUM=0 skips it)"
-	scripts/build/llamacpp.sh
-	@touch -c $@   # the script leaves a current build alone
-
 # The common-password list (third_party/pwlist), compiled in (daemon/pwpolicy.c).
 $(PWLIST_RES): third_party/pwlist/common.txt scripts/build/pw_common.py
 	@mkdir -p $(dir $@)

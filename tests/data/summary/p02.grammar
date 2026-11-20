@@ -1,0 +1,10 @@
+root ::= ov topic{0,2} attn?
+ov ::= "Overview: " cites " " [^\n]{3,480} "\n"
+topic ::= "## " title "\n" cites " " [^\n]{3,640} "\n" det{0,3}
+det ::= "- " cites " " [^\n]{3,320} "\n"
+attn ::= "Needs attention:\n" aitem{1,5}
+aitem ::= "- " cites " " ("action" | "question") ": " [^\n]{3,320} "\n"
+title ::= [^\n#;]{2,60}
+cites ::= cite cite? cite?
+cite ::= "[" id "]"
+id ::= "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "10" | "11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22" | "23" | "24" | "25" | "26" | "27" | "28"

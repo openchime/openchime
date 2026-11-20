@@ -187,12 +187,6 @@ jobs:
       # change to one script rebuilds that library alone. The host's mbedTLS
       # is the same build release-candidate.yml's `stage` restores for the
       # arm64 build's host daemon, under the same key.
-      - id: c-llamacpp
-        name: Restore llama.cpp
-        uses: actions/cache/restore@v6
-        with:
-          path: &llamacpp-path third_party/llamacpp-0.5.0
-          key: &llamacpp-key llamacpp-0.5.0-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/llamacpp.sh') }}
       - id: c-mbedtls
         name: Restore mbedTLS
         uses: actions/cache/restore@v6
@@ -284,12 +278,6 @@ jobs:
         with:
           path: *toolchains-path
           key: *toolchains-key
-      - name: Save llama.cpp
-        if: steps.c-llamacpp.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: *llamacpp-path
-          key: *llamacpp-key
       - name: Save mbedTLS
         if: steps.c-mbedtls.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6

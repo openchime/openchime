@@ -1,0 +1,32 @@
+# Synthetic: written for the tests, about no real people or company.
+Rosa Lindqvist: Morning all. Ticket 4471 is back: the customer at Harbor Freightways says invoices over 10,000 still show the old tax rate.
+  Tomas Okafor: I shipped the fix for that on Tuesday. Which build are they on?
+  Rosa Lindqvist: They sent a screenshot, it says 3.18.2.
+  Tomas Okafor: The fix is in 3.18.4. They need to update, nothing else to do.
+  Rosa Lindqvist: I'll tell them and close it once they confirm.
+Priya Raman: Heads up, the login page took 9 seconds to load for about twenty minutes this morning. It's back to normal now.
+Dev Malhotra: That was the certificate renewal. The load balancer kept the old one in its cache until I restarted it at 08:40.
+Priya Raman: Can we make sure the restart happens on its own next time? I don't want to find out from customers again.
+Dev Malhotra: I'll add it to the renewal script by Friday.
+Rosa Lindqvist: New one: a user in the Lisbon office can't attach PDFs larger than 25 MB.
+  Tomas Okafor: The limit is 25 MB on the free plan and 100 MB on business. What plan are they on?
+  Rosa Lindqvist: Business, since March.
+  Tomas Okafor: Then the plan change didn't reach the storage service. Send me the account id and I'll fix it by hand.
+  Rosa Lindqvist: Sent in a direct message. Account 88213.
+  Tomas Okafor: Done, they can attach up to 100 MB now. I opened ticket 4489 to find out why the change didn't sync.
+Aiko Tanaka: Does anyone know if we still support Windows 7 for the desktop app? A school district is asking.
+Priya Raman: We dropped it in version 3.0, two years ago. The last build that runs there is 2.9.7 and it gets no security fixes.
+Aiko Tanaka: Thanks, I'll tell them they need Windows 10 or later.
+Dev Malhotra: The nightly backup took 3 hours 12 minutes last night instead of the usual 50 minutes.
+Dev Malhotra: The new audit table is 40 GB and it isn't excluded from the full dump. I'll exclude it and back it up weekly instead.
+Priya Raman: Agreed, weekly is fine for audit data. Please write it down in the runbook.
+Rosa Lindqvist: Customer at Brightwell Clinic asked whether we can export all their messages as CSV. Is that something we offer?
+  Aiko Tanaka: Only as JSON from the admin page. CSV is on the roadmap for the second quarter.
+  Rosa Lindqvist: Okay. Can I promise them a date?
+  Priya Raman: No date yet, please don't promise one. Say it's planned.
+Tomas Okafor: Reminder: I'm on leave from the 14th to the 21st. Aiko is covering billing tickets.
+Aiko Tanaka: Yes, send billing ones my way that week.
+Rosa Lindqvist: Ticket 4492: two-factor codes arrive five minutes late for users on one mobile carrier in Chile.
+Dev Malhotra: Our SMS provider shows delays on that route too. I've asked them; no answer yet.
+Rosa Lindqvist: Should we tell affected users to switch to the authenticator app in the meantime?
+Priya Raman: Yes, and add the workaround to the status page.

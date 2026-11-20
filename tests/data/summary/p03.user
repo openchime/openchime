@@ -1,0 +1,5 @@
+This is 45 words:
+
+[3] The migration ran on the staging copy in 47 minutes and should take about 70 on production data, so the team split it: the index rebuild runs the day before at 18:00 while users are still on 1.9, leaving about 25 minutes of downtime.
+
+Rewrite it in at most 20 words. Keep every name, number and fact that fits, and add nothing.

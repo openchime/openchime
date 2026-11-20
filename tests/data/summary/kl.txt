@@ -1,0 +1,182 @@
+You take notes on a team's chat for someone catching up on it. You write only what the lines you are given say.
+Messages from #ops, oldest first. Indented lines are replies in a thread.
+
+[1] Hana Kowalski: The disk on db-replica-3 is at 91 percent. It was 78 percent last week.
+  [2] Omar Haddad: The slow query log is the culprit, it's 120 GB. Logging was left at debug after the incident on the 2nd.
+  [3] Hana Kowalski: Can you set it back to warning and rotate the old logs?
+  [4] Omar Haddad: Done. Disk is at 64 percent now.
+[5] Ines Moreau: We're getting about 300 errors an hour from the image resizer since the last deploy.
+[6] Ines Moreau: They're all for WebP files with transparency. The new library version doesn't handle the alpha channel.
+[7] Omar Haddad: Should we roll back the resizer only, or the whole deploy?
+[8] Hana Kowalski: Only the resizer, the rest of the deploy has the billing fix we need.
+[9] Ines Moreau: Rolled back the resizer to 4.2.1. Errors stopped at 11:05.
+[10] Kwame Asante: I'd like to move the staging cluster to the cheaper instance type. It would save about 1,800 a month.
+  [11] Hana Kowalski: What happens to the load tests? They run on staging.
+  [12] Kwame Asante: They would take about 30 percent longer. I think that's acceptable.
+  [13] Ines Moreau: Fine by me as long as the nightly run still finishes before 06:00.
+  [14] Kwame Asante: It would finish around 04:30. I'll make the change on Monday.
+[15] Omar Haddad: Certificates for the three regional domains expire on the 28th. Renewal is automatic but I'd like someone to watch it.
+[16] Hana Kowalski: I'll check on the 27th.
+[17] Ines Moreau: The status page didn't update during yesterday's outage. People only saw it on social media.
+[18] Omar Haddad: The status page update depends on the same queue that was down. That's a design problem.
+[19] Kwame Asante: We could post updates from a separate small server in another region.
+[20] Hana Kowalski: Let's do that. Kwame, can you estimate the work?
+[21] Kwame Asante: About three days. I'll start after the instance change.
+[22] Ines Moreau: Postmortem for yesterday is drafted. Root cause: a config change to the queue's memory limit was applied to all regions at once.
+[23] Omar Haddad: We need staged rollouts for config, not just for code.
+[24] Hana Kowalski: Agreed. Let's discuss the process at Thursday's ops meeting.
+[25] Ines Moreau: Who owns the postmortem action items?
+[26] Hana Kowalski: Omar for staged config rollouts, Kwame for the status page, me for alert thresholds.
+[27] Omar Haddad: Is anyone else seeing the dashboard graphs lag by ten minutes?
+  [28] Kwame Asante: Yes, since this morning. The metrics collector is behind.
+  [29] Omar Haddad: It's backed up on one partition. I restarted it and it's catching up.
+  [30] Kwame Asante: Graphs are current again.
+[31] Ines Moreau: Reminder that the on-call rotation changes on Monday. I'm primary next week, Kwame secondary.
+[32] Hana Kowalski: Budget question: do we renew the log search contract at 24,000 a year or move to the open-source stack?
+[33] Omar Haddad: The open-source stack would need about two weeks of setup and some ongoing care.
+[34] Kwame Asante: The contract renews on the 15th of next month, so we have time to decide.
+[35] Hana Kowalski: Let's get numbers for both and decide by the 5th.
+
+Write notes on these lines: at most 4, the most important first. Each note is one line in exactly this form:
+- [line number] kind | topic | what happened
+
+kind is event, decision, action or question. topic names what the note is about in 2 to 5 words, and notes about the same thing share it. what happened is one or two sentences saying who did what, with the particulars the lines give. Put what is about the same thing into one note, citing the lines it comes from (at most 3), each line number in square brackets, as [12] or [12][15]. Leave out greetings and small talk.
+
+Messages from #ops, oldest first. Indented lines are replies in a thread.
+
+[1] Hana Kowalski: The disk on db-replica-3 is at 91 percent. It was 78 percent last week.
+  [2] Omar Haddad: The slow query log is the culprit, it's 120 GB. Logging was left at debug after the incident on the 2nd.
+  [3] Hana Kowalski: Can you set it back to warning and rotate the old logs?
+  [4] Omar Haddad: Done. Disk is at 64 percent now.
+[5] Ines Moreau: We're getting about 300 errors an hour from the image resizer since the last deploy.
+[6] Ines Moreau: They're all for WebP files with transparency. The new library version doesn't handle the alpha channel.
+[7] Omar Haddad: Should we roll back the resizer only, or the whole deploy?
+[8] Hana Kowalski: Only the resizer, the rest of the deploy has the billing fix we need.
+[9] Ines Moreau: Rolled back the resizer to 4.2.1. Errors stopped at 11:05.
+[10] Kwame Asante: I'd like to move the staging cluster to the cheaper instance type. It would save about 1,800 a month.
+  [11] Hana Kowalski: What happens to the load tests? They run on staging.
+  [12] Kwame Asante: They would take about 30 percent longer. I think that's acceptable.
+  [13] Ines Moreau: Fine by me as long as the nightly run still finishes before 06:00.
+  [14] Kwame Asante: It would finish around 04:30. I'll make the change on Monday.
+[15] Omar Haddad: Certificates for the three regional domains expire on the 28th. Renewal is automatic but I'd like someone to watch it.
+[16] Hana Kowalski: I'll check on the 27th.
+[17] Ines Moreau: The status page didn't update during yesterday's outage. People only saw it on social media.
+[18] Omar Haddad: The status page update depends on the same queue that was down. That's a design problem.
+[19] Kwame Asante: We could post updates from a separate small server in another region.
+[20] Hana Kowalski: Let's do that. Kwame, can you estimate the work?
+[21] Kwame Asante: About three days. I'll start after the instance change.
+[22] Ines Moreau: Postmortem for yesterday is drafted. Root cause: a config change to the queue's memory limit was applied to all regions at once.
+[23] Omar Haddad: We need staged rollouts for config, not just for code.
+[24] Hana Kowalski: Agreed. Let's discuss the process at Thursday's ops meeting.
+[25] Ines Moreau: Who owns the postmortem action items?
+[26] Hana Kowalski: Omar for staged config rollouts, Kwame for the status page, me for alert thresholds.
+[27] Omar Haddad: Is anyone else seeing the dashboard graphs lag by ten minutes?
+  [28] Kwame Asante: Yes, since this morning. The metrics collector is behind.
+  [29] Omar Haddad: It's backed up on one partition. I restarted it and it's catching up.
+  [30] Kwame Asante: Graphs are current again.
+[31] Ines Moreau: Reminder that the on-call rotation changes on Monday. I'm primary next week, Kwame secondary.
+[32] Hana Kowalski: Budget question: do we renew the log search contract at 24,000 a year or move to the open-source stack?
+[33] Omar Haddad: The open-source stack would need about two weeks of setup and some ongoing care.
+[34] Kwame Asante: The contract renews on the 15th of next month, so we have time to decide.
+[35] Hana Kowalski: Let's get numbers for both and decide by the 5th.
+
+Summarize these lines for someone catching up, in exactly this form:
+
+Overview: [line number] <the most important outcome or change>
+## <what a topic is about>
+[line number] <what happened in it, and where it stands now>
+- [line number] <one detail: who did or said what>
+Needs attention:
+- [line number] action: <who has to do what, and by when if it was said>
+- [line number] question: <a question that was asked and not answered>
+
+Write 0 to 2 topics, the most important first, each titled in 2 to 6 words, with what happened in it in one to three sentences and 0 to 3 details of one sentence each. The overview is one sentence. Write "Needs attention" only for actions and unanswered questions, at most 5, one sentence each, and leave it out when there are none. Every line starts with the numbers of the lines it comes from, at most 3, each in square brackets, as [12] or [12][15]. Write only what the lines say, with their particulars, and name a person only for what their own lines say. Do not comment on, interpret or characterize what happened.
+
+Messages from #planning, oldest first. Indented lines are replies in a thread.
+
+[1] Yusuf Demir: Planning for the next quarter. We have room for three large projects and a few small ones.
+[2] Clara Jensen: My vote is search first. It's the top complaint in every customer survey since last spring.
+[3] Mateo Alvarez: Search is big though. The last estimate was eight weeks for two people.
+[4] Clara Jensen: Even so. Half of the support tickets about finding old messages would go away.
+[5] Yusuf Demir: Let's put search on the list. What else?
+[6] Nadia Petrova: Offline mode for the mobile app. Field teams in construction and shipping keep asking for it.
+  [7] Mateo Alvarez: How offline? Reading only, or writing too?
+  [8] Nadia Petrova: Reading first. Writing can come later, it needs conflict handling.
+  [9] Mateo Alvarez: Reading only is maybe four weeks.
+[10] Yusuf Demir: That's a good size. Offline reading goes on the list.
+[11] Oliver Grant: We should also pay down some debt. The notification service is still on the old framework and every change takes twice as long.
+[12] Clara Jensen: Is that a large project or a small one?
+[13] Oliver Grant: Large. Six weeks to move it properly, with tests.
+[14] Yusuf Demir: So search, offline reading and the notification service. That fills the three large slots.
+[15] Nadia Petrova: For small ones: dark mode on the web app, and fixing the time zones in exported reports.
+[16] Mateo Alvarez: The time zone bug affects every customer with teams in more than one country. It should be first.
+[17] Clara Jensen: Agreed. Dark mode is nice but nobody is blocked by it.
+[18] Yusuf Demir: Who leads search?
+  [19] Clara Jensen: I can, with Mateo.
+  [20] Mateo Alvarez: Yes, but I can only start in the second week, I'm finishing the billing changes.
+  [21] Yusuf Demir: That's fine. Search starts in week two.
+[22] Oliver Grant: I'll lead the notification service move. I'd like one more person for the last two weeks.
+[23] Nadia Petrova: I can join for those two weeks after offline reading is done.
+[24] Yusuf Demir: Good. Nadia leads offline reading, then helps Oliver.
+[25] Clara Jensen: Do we have design time for search? The results page needs a new layout.
+[26] Yusuf Demir: Design has about 40 percent of one person for us. Search gets most of it.
+[27] Mateo Alvarez: What about the customer who asked for single sign-on with their own provider?
+[28] Yusuf Demir: That's a sales request for one account. Let's look at it again when a second customer asks.
+[29] Oliver Grant: Can we agree to review progress every two weeks?
+[30] Yusuf Demir: Yes, every other Tuesday at 14:00. I'll send the invite.
+[31] Nadia Petrova: One risk: the app store review for offline mode might take longer because of the new storage permission.
+[32] Yusuf Demir: Let's submit a test build early, in week three, to find out.
+[33] Clara Jensen: I'll write the plan up and share it by Friday.
+
+Write notes on these lines: at most 4, the most important first. Each note is one line in exactly this form:
+- [line number] kind | topic | what happened
+
+kind is event, decision, action or question. topic names what the note is about in 2 to 5 words, and notes about the same thing share it. what happened is one or two sentences saying who did what, with the particulars the lines give. Put what is about the same thing into one note, citing the lines it comes from (at most 3), each line number in square brackets, as [12] or [12][15]. Leave out greetings and small talk.
+
+Messages from #planning, oldest first. Indented lines are replies in a thread.
+
+[1] Yusuf Demir: Planning for the next quarter. We have room for three large projects and a few small ones.
+[2] Clara Jensen: My vote is search first. It's the top complaint in every customer survey since last spring.
+[3] Mateo Alvarez: Search is big though. The last estimate was eight weeks for two people.
+[4] Clara Jensen: Even so. Half of the support tickets about finding old messages would go away.
+[5] Yusuf Demir: Let's put search on the list. What else?
+[6] Nadia Petrova: Offline mode for the mobile app. Field teams in construction and shipping keep asking for it.
+  [7] Mateo Alvarez: How offline? Reading only, or writing too?
+  [8] Nadia Petrova: Reading first. Writing can come later, it needs conflict handling.
+  [9] Mateo Alvarez: Reading only is maybe four weeks.
+[10] Yusuf Demir: That's a good size. Offline reading goes on the list.
+[11] Oliver Grant: We should also pay down some debt. The notification service is still on the old framework and every change takes twice as long.
+[12] Clara Jensen: Is that a large project or a small one?
+[13] Oliver Grant: Large. Six weeks to move it properly, with tests.
+[14] Yusuf Demir: So search, offline reading and the notification service. That fills the three large slots.
+[15] Nadia Petrova: For small ones: dark mode on the web app, and fixing the time zones in exported reports.
+[16] Mateo Alvarez: The time zone bug affects every customer with teams in more than one country. It should be first.
+[17] Clara Jensen: Agreed. Dark mode is nice but nobody is blocked by it.
+[18] Yusuf Demir: Who leads search?
+  [19] Clara Jensen: I can, with Mateo.
+  [20] Mateo Alvarez: Yes, but I can only start in the second week, I'm finishing the billing changes.
+  [21] Yusuf Demir: That's fine. Search starts in week two.
+[22] Oliver Grant: I'll lead the notification service move. I'd like one more person for the last two weeks.
+[23] Nadia Petrova: I can join for those two weeks after offline reading is done.
+[24] Yusuf Demir: Good. Nadia leads offline reading, then helps Oliver.
+[25] Clara Jensen: Do we have design time for search? The results page needs a new layout.
+[26] Yusuf Demir: Design has about 40 percent of one person for us. Search gets most of it.
+[27] Mateo Alvarez: What about the customer who asked for single sign-on with their own provider?
+[28] Yusuf Demir: That's a sales request for one account. Let's look at it again when a second customer asks.
+[29] Oliver Grant: Can we agree to review progress every two weeks?
+[30] Yusuf Demir: Yes, every other Tuesday at 14:00. I'll send the invite.
+[31] Nadia Petrova: One risk: the app store review for offline mode might take longer because of the new storage permission.
+[32] Yusuf Demir: Let's submit a test build early, in week three, to find out.
+[33] Clara Jensen: I'll write the plan up and share it by Friday.
+
+Summarize these lines for someone catching up, in exactly this form:
+
+Overview: [line number] <the most important outcome or change>
+## <what a topic is about>
+[line number] <what happened in it, and where it stands now>
+- [line number] <one detail: who did or said what>
+Needs attention:
+- [line number] action: <who has to do what, and by when if it was said>
+- [line number] question: <a question that was asked and not answered>
+
+Write 0 to 2 topics, the most important first, each titled in 2 to 6 words, with what happened in it in one to three sentences and 0 to 3 details of one sentence each. The overview is one sentence. Write "Needs attention" only for actions and unanswered questions, at most 5, one sentence each, and leave it out when there are none. Every line starts with the numbers of the lines it comes from, at most 3, each in square brackets, as [12] or [12][15]. Write only what the lines say, with their particulars, and name a person only for what their own lines say. Do not comment on, interpret or characterize what happened.

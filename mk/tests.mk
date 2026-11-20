@@ -8,12 +8,12 @@
 # one process (scripts/test/fast/suites.sh sets OC_TEST_JOBS=1; docs/TESTING.md,
 # "One build at a time"). The binary
 # always carries read-aloud's and voice input's test paths (stub engines) and
-# never needs llama.cpp or Emscripten, whatever the switches say.
-TEST_INC  := $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) $(STTKIT_INC) -DOC_TTS -DOC_STT \
+# never needs Emscripten, whatever the switches say.
+TEST_INC  := $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) $(STTKIT_INC) $(SUMKIT_INC) -DOC_TTS -DOC_STT \
              -Itests -Iclient/gui/app -Iclient/gui/platform -Iclient/shared -Ituikit -Ithird_party/qrcodegen
 # Sorted: the daemon and the text layout both carry utf8proc, compiled once.
 TEST_ALL_SRC := $(sort $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) \
-                $(TTSKIT_SRC) $(NNKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC))
+                $(TTSKIT_SRC) $(NNKIT_SRC) $(SUMKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC))
 # One object per source, in a tree of its own (mk/sources.mk, "Objects"),
 # compiled with the flags the binary always had; the link takes them in the
 # sorted order above, then SQLite and Argon2 (the daemon's own objects) and the
@@ -52,7 +52,7 @@ $(TSAN_BIN): $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | b
 
 # --- The release's compiler (CI) ----------------------------------------------
 # The daemon's sources through the RELEASE's compiler, with the release's flags,
-# stopping short of the link (the release links a llama.cpp built by the same
+# stopping short of the link (the release links libraries built by the same
 # compiler, which CI does not build): real objects, under build/relcc, since
 # some warnings are raised only while generating code, one rule per object so
 # that `make -j` compiles them all at once. A newer clang refuses things CI's
@@ -150,6 +150,11 @@ build/s3_smoke: tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_cache.c d
 STT_CHECK_SRC := $(STTKIT_SRC) $(NNKIT_SRC) sttkit/stt_check.c
 build/stt_check: $(STT_CHECK_SRC) $(STTKIT_HDRS) $(NNKIT_HDRS) | build-dir
 	$(CC) $(CFLAGS) $(KIT_CFLAGS) $(STTKIT_INC) $(STT_CHECK_SRC) -lm -o $@
+# sumkit's check (docs/SUMKIT.md): the model against its references, its
+# quantisation measured, timed.
+SUM_CHECK_SRC := $(SUMKIT_SRC) $(NNKIT_SRC) $(UTF8PROC) sumkit/sum_check.c
+build/sum_check: $(SUM_CHECK_SRC) $(SUMKIT_HDRS) $(NNKIT_HDRS) | build-dir
+	$(CC) $(CFLAGS) $(KIT_CFLAGS) $(SUMKIT_INC) -Ithird_party/utf8proc -DUTF8PROC_STATIC $(SUM_CHECK_SRC) -lm -o $@
 # ttskit's data tool (docs/TTSKIT.md). `say` turns IPA into the voice model's
 # tokens with the daemon's token function, as the daemon does.
 TTS_PACK_SRC := $(TTSKIT_SRC) $(NNKIT_SRC) ttskit/tts_pack.c daemon/tts_voice_tokens.c

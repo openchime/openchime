@@ -214,8 +214,9 @@ asked before, with a job per CPU.
 
 Anything else is built by its path. `TTS` (read-aloud) and `STT` (voice
 input) need nothing more: their models run in C inside the daemon and their
-data is committed. `SUM` and `WEB` need CMake, a C++17 compiler, git and xz
-besides, and the build fetches its own pinned Emscripten. `make run` builds the daemon with the data
+data is committed. `SUM` needs nothing more either: its model runs in C
+too, and the daemon fetches and converts it on first start. `WEB` needs CMake,
+a C++17 compiler, git and xz besides, and the build fetches its own pinned Emscripten. `make run` builds the daemon with the data
 read-aloud and voice input need beside it, and the Linux TUI, and starts it
 (below); `make openchimed` builds the daemon alone. The switches are
 remembered in `build/.features`, so a later `make openchimed` or `make run`

@@ -9,7 +9,7 @@ SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c 
               shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c shared/action.c \
               shared/oc_mp4.c shared/e2e_hpke.c shared/e2e_sframe.c shared/noise_xx.c shared/ratchet.c \
               third_party/ca-roots/ca_roots.c
-DAEMON_SRC := daemon/main.c daemon/config.c daemon/config_table.c daemon/pwpolicy.c daemon/demolimits.c third_party/utf8proc/utf8proc.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/webapp.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c daemon/tts_data.c daemon/voice_pack.c daemon/recognizer_pack.c
+DAEMON_SRC := daemon/main.c daemon/config.c daemon/config_table.c daemon/pwpolicy.c daemon/demolimits.c third_party/utf8proc/utf8proc.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/webapp.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c daemon/tts_data.c daemon/voice_pack.c daemon/recognizer_pack.c daemon/summary_pack.c
 # Where generated sources and the objects go. A build of its own -- the host
 # daemon a cross build writes its manifests with (mk/daemon.mk) -- passes its
 # own of both, so two builds at once never write each other's files.
@@ -35,7 +35,8 @@ oc_objs = $(foreach s,$(2),$(if $(filter $(GEN_DIR)/%,$(s)),$(patsubst $(GEN_DIR
 # The two rules of a tree, with the compile command in the variable named by
 # $(2), the prerequisites a change of which recompiles in $(3), and what must
 # exist first (the vendored libraries' headers) in $(4); $(5) is @ for a tree
-# that compiles quietly. A source of nnkit, ttskit or sttkit also gets KIT_CFLAGS. Every object
+# that compiles quietly. A source of nnkit, ttskit, sttkit or sumkit, and the
+# summary model's converter (whose bytes are pinned), also gets KIT_CFLAGS. Every object
 # writes its own header dependencies beside it (-MMD -MP), read back by the
 # -include of the tree's .d files: a header edit recompiles the objects that
 # include it, and only those.
@@ -43,7 +44,7 @@ oc_objs = $(foreach s,$(2),$(if $(filter $(GEN_DIR)/%,$(s)),$(patsubst $(GEN_DIR
 define oc_obj_rules
 $(1)/%.o: %.c $(3) | $(4)
 	@mkdir -p $$(dir $$@)
-	$(5)$$($(2)) $$(if $$(filter nnkit/% ttskit/% sttkit/%,$$<),$$(KIT_CFLAGS)) -MMD -MP -c $$< -o $$@
+	$(5)$$($(2)) $$(if $$(filter nnkit/% ttskit/% sttkit/% sumkit/% daemon/summary_pack.c,$$<),$$(KIT_CFLAGS)) -MMD -MP -c $$< -o $$@
 $(1)/gen/%.o: $(GEN_DIR)/%.c $(3) | $(4)
 	@mkdir -p $$(dir $$@)
 	$(5)$$($(2)) -MMD -MP -c $$< -o $$@
@@ -176,6 +177,15 @@ KIT_CFLAGS := -ffp-contract=off
 STTKIT_SRC := $(filter-out sttkit/stt_check.c,$(wildcard sttkit/*.c))
 STTKIT_INC := -Isttkit $(NNKIT_INC)
 STTKIT_HDRS := $(wildcard sttkit/*.h)
+
+# --- sumkit (the summary inference engine, ARCH-116) ------------------------
+# The summary model in plain C over nnkit, its data one memory-mapped file,
+# summary.bin, made by the daemon from Qwen's published files (--summary-pack,
+# daemon/summary_pack.c). sum_check runs it against its references, measures
+# its quantisation and times it. See docs/SUMKIT.md.
+SUMKIT_SRC  := $(filter-out sumkit/sum_check.c,$(wildcard sumkit/*.c))
+SUMKIT_INC  := -Isumkit $(NNKIT_INC)
+SUMKIT_HDRS := $(wildcard sumkit/*.h)
 
 # --- ttskit (read-aloud pronunciation, ARCH-111) -----------------------------
 # English text to the IPA a voice model reads: a CMUdict-derived dictionary and a

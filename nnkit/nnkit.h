@@ -229,4 +229,105 @@ int  nn_argmax(const float *x, int n);
 void nn_matvec_u8(const float *restrict x, int k, const uint8_t *restrict e, int zp, float scale, int n,
                   float *restrict out);
 
+
+/* ---- for the summary model (sumkit) -----------------------------------------
+ * A decoder-only language model: its matrices are stored row by row, one row
+ * per output, in one of four weight types. The two quantised ones are blocks of
+ * 256 values whose bytes are ggml's Q4_K and Q6_K blocks, so a
+ * file's tensors can be read by either:
+ *
+ *   NN_W_Q4K  144 bytes: f16 d, f16 dmin, scales[12] (eight 6-bit scales and
+ *             eight 6-bit mins, packed as ggml packs them), qs[128] (256 4-bit
+ *             values). Sub-block s (32 values) is d * sc[s] * q - dmin * m[s];
+ *             its values are the low nibbles of qs[32 (s/2) ..] when s is even,
+ *             the high nibbles when odd.
+ *   NN_W_Q6K  210 bytes: ql[128], qh[64], int8 scales[16], f16 d. Value e is
+ *             d * scales[e / 16] * (q - 32), q 6 bits from ql and qh as ggml
+ *             lays them out.
+ *   NN_W_BF16 two bytes a value, bfloat16 (the unquantised model).
+ *   NN_W_F32  four bytes a value.
+ *
+ * Activations multiplied by a quantised matrix are first quantised themselves,
+ * in blocks of 256 (nn_q8k: one scale, 8-bit values, sums of each 32). Within a
+ * block the products are summed exactly in int32, sub-block scales included;
+ * only the block's two integers are turned to float, and the blocks are added
+ * in order. So the result does not depend on how the compiler vectorises. */
+#define NN_QK 256                       /* values in a quantised block */
+typedef enum { NN_W_F32 = 0, NN_W_BF16 = 1, NN_W_Q4K = 2, NN_W_Q6K = 3 } nn_wtype;
+#define NN_Q4K_BYTES 144
+#define NN_Q6K_BYTES 210
+typedef struct {
+    float  d;                           /* value = d * q */
+    int8_t q[NN_QK];
+    int16_t bsum[NN_QK / 32];           /* sum of each 32 q */
+} nn_q8k;
+
+/* IEEE half and bfloat16 to and from float (to: round to nearest, ties to even). */
+float    nn_f16_to_f32(uint16_t h);
+uint16_t nn_f32_to_f16(float f);
+static inline float nn_bf16_to_f32(uint16_t h) {
+    union { uint32_t u; float f; } v;
+    v.u = (uint32_t)h << 16;
+    return v.f;
+}
+/* Bytes of one row of k values of type t (k a multiple of NN_QK when quantised). */
+size_t nn_row_bytes(nn_wtype t, int k);
+/* Row r of a matrix of type t, k values a row, to floats. */
+void nn_dequant_row(nn_wtype t, const void *w, int k, int r, float *out);
+/* x (k values, k a multiple of NN_QK) into k / NN_QK blocks: per block d =
+ * max|x| / 127, q = x / d rounded half to even (all 0 when the block is). */
+void nn_q8k_quantize(const float *restrict x, int k, nn_q8k *restrict out);
+/* y[r][c] = sum_i x[r][i] * W[c][i] for r < m, c < n: W n rows of k values of
+ * type t, x's rows `ldx` apart, y's `ldy`. Quantised W multiplies x quantised
+ * by nn_q8k_quantize; float W multiplies x as it is, in 16 partial sums. Each
+ * weight row is read once for all m rows. scratch: nn_matmul_w_scratch(t, k, m)
+ * bytes. */
+size_t nn_matmul_w_scratch(nn_wtype t, int k, int m);
+void nn_matmul_w(nn_wtype t, const void *w, int n, int k, const float *x, int m, size_t ldx, float *y,
+                 size_t ldy, void *scratch);
+
+/* RMS norm of each of `rows` rows of n values, rows `ld` apart, in place:
+ * x * g / sqrt(mean(x^2) + eps), the sum of squares in 16 partial sums. */
+void nn_rmsnorm(float *x, int rows, int n, int ld, const float *g, float eps);
+/* L2 norm of each row, in place: x / max(sqrt(sum x^2), eps) (ggml's l2_norm). */
+void nn_l2norm(float *x, int rows, int n, int ld, float eps);
+/* x *= sigmoid(g), n values (the sigmoid as nn_logistic). */
+void nn_mul_sigmoid(float *restrict x, const float *restrict g, size_t n);
+/* x *= silu(g), n values (the gated norm's gate). */
+void nn_mul_silu(float *restrict x, const float *restrict g, size_t n);
+
+/* The causal depthwise convolution over time of the summary model's linear
+ * attention, with its carried state: the input is the k - 1 rows of `state`
+ * followed by the t rows of x (c channels, rows `ldx` apart); y[i][ch] =
+ * sum_j in[i + j][ch] * w[j][ch] for j < k; then state holds the input's last
+ * k - 1 rows. w is [k][c]; y's rows `ldy` apart (may be x when ldy == ldx). */
+void nn_conv_causal(const float *x, int t, int c, size_t ldx, float *state, int k, const float *w, float *y,
+                    size_t ldy);
+
+/* The gated delta rule over t steps of the summary model's linear attention,
+ * hv value heads of dv values over hk key heads of dk values (value head h reads
+ * key head h / (hv / hk)). Per step and value head, with S the head's dk x dv
+ * state: S *= exp(g); u = v - S^T k; S += k (beta u)^T; o = S^T q * qscale.
+ * q and k rows hold hk heads, v and o rows hv heads (rows `ldq`, `ldv`, `ldo`
+ * apart, k beside q at the same stride); g and beta have hv values a step.
+ * state is hv x dk x dv floats, carried from call to call. */
+void nn_gated_delta(const float *q, const float *k, size_t ldq, const float *v, size_t ldv, const float *g,
+                    const float *beta, int t, int hk, int hv, int dk, int dv, float qscale, float *state,
+                    float *o, size_t ldo);
+
+/* Rotary positions on the first `rot` values of a head, paired half with half
+ * (value i with value i + rot / 2), in place: f = pos * inv_freq[i]. */
+void nn_rope_half(float *x, int rot, const float *inv_freq, float pos);
+
+/* The attention cache at 8 bits: each row of dh values (dh a multiple of 32) is
+ * dh / 32 blocks of a float scale and 32 int8 values (d = max|x| / 127). */
+#define NN_Q8_0 32
+typedef struct { float d; int8_t q[NN_Q8_0]; } nn_q8_0;
+void nn_q8_0_quantize(const float *restrict x, int n, nn_q8_0 *restrict out);
+/* One query of dh values against keys 0..n-1 and their values, each a row of
+ * dh / 32 nn_q8_0 blocks (rows `ld` blocks apart): out = softmax(scale q . k) v,
+ * the softmax in float with expf. scratch: n floats. */
+void nn_attend_q8(const float *q, const nn_q8_0 *k, const nn_q8_0 *v, size_t ld, int n, int dh, float scale,
+                  float *out, float *scratch);
+
 #endif

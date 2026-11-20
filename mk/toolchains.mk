@@ -39,7 +39,6 @@ $(CC_WRAP) $(CXX_WRAP) &: $(ZIG) scripts/release/zig_cc.sh | build-dir
 	@printf '#!/bin/sh\nexec %s/scripts/release/zig_cc.sh c++ %s -- "$$@"\n' "$(CURDIR)" "$(TARGET)" > $(CXX_WRAP)
 	@chmod +x $(CC_WRAP) $(CXX_WRAP)
 TOOLCHAIN_DEPS := $(CC_WRAP) $(CXX_WRAP)
-TTS_CXXLIB     := -lc++
 # Stripped at the link: the release ships no symbols, and the host's strip
 # cannot read another architecture's ELF.
 override LDFLAGS += -Wl,--strip-all

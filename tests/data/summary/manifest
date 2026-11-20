@@ -1,0 +1,8 @@
+# The summary model, unquantised, as the reference runs it (tests/manual/summary_ref.c).
+# <name> <prompt tokens> <answer steps>, then kl_tokens, kl_chunk, kl_unsloth_q4_k_m
+p01 1137 32
+p02 1044 32
+p03 143 32
+kl_tokens 4427
+kl_chunk 512
+kl_unsloth_q4_k_m 0.020438

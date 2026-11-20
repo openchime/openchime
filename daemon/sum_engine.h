@@ -2,7 +2,7 @@
  * OpenChime — the model a summary is written by (ARCH-116, docs/SUMMARIES.md).
  *
  * One table of functions, as read-aloud has (tts_render.h): the daemon runs the
- * local model through it (sum_llama.c, llama.cpp linked in), and the tests run a
+ * local model through it (sum_sumkit.c, sumkit linked in), and the tests run a
  * stub. An engine answers one prompt at a time, on one thread: the summary
  * worker is its only caller.
  */
@@ -67,9 +67,10 @@ typedef struct oc_sum_engine {
     int   remote;               /* the model runs elsewhere: this machine's load does not hold it */
 } oc_sum_engine;
 
-/* The local engine over the GGUF file at `path` (borrowed), with a context of
- * `n_ctx` tokens, on one thread. Exists only in a daemon built with SUM=1. */
-const oc_sum_engine *oc_sum_llama_engine(const char *path, const char *version, int n_ctx);
+/* The local engine, sumkit, over summary.bin at `path` (borrowed), with a
+ * context of `n_ctx` tokens, on one thread. Exists only in a daemon built with
+ * SUM=1. */
+const oc_sum_engine *oc_sum_local_engine(const char *path, const char *version, int n_ctx);
 
 /* The hosted engine: each answer is one request to the chat-completions
  * endpoint under `url` (an OpenAI-style API; https, or http to a loopback

@@ -13,12 +13,6 @@
 # (driven by a stub engine), the tokenizer and the model's wrapper (ttskit is in
 # every test build) -- everything but the engine table and --tts-say (tts.c).
 TTS_TEST_SRC := daemon/tts_render.c daemon/tts_worker.c daemon/tts_voice.c daemon/tts_voice_tokens.c
-# llama.cpp (summaries) is C++: its standard library and runtime support are
-# linked in statically, not required of the host. That is GCC's libstdc++ by
-# default; the release, which compiles everything with zig, passes
-# TTS_CXXLIB=-lc++ for zig's bundled libc++ (the library it was compiled
-# against there). Read-aloud and voice input are plain C.
-TTS_CXXLIB ?= -static-libstdc++ -static-libgcc -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -ldl
 ifeq ($(TTS),1)
 TTS_SRC   := daemon/tts.c daemon/tts_render.c daemon/tts_worker.c daemon/tts_voice.c daemon/tts_voice_tokens.c $(TTSKIT_SRC) $(NNKIT_SRC)
 TTS_DEPS  := $(OPUS_A) $(wildcard ttskit/*.h) $(NNKIT_HDRS)
@@ -47,17 +41,21 @@ STT_FLAGS := -DOC_STT $(STTKIT_INC)
 endif
 
 # --- Summaries (ARCH-116) -----------------------------------------------------
-# llama.cpp runs the summary model inside openchimed on one thread. Everything
+# sumkit runs the summary model inside openchimed on one thread. Everything
 # else of summaries -- the pieces, prompts, checks, storage and worker -- is
 # plain C in DAEMON_SRC, so `make test` drives it with a stub model. Without
 # SUM, summaries are never available locally (OPENCHIME_SUMMARY=cloud:… still is).
 ifeq ($(SUM),1)
-SUM_SRC   := daemon/sum_llama.c
-SUM_DEPS  := $(LLAMA_A)
-SUM_FLAGS := -DOC_SUM -I$(LLAMA_DIR)/include
-SUM_LIBS  := $(LLAMA_A)
-SUM_CXX   := $(TTS_CXXLIB) -lm
+SUM_SRC   := daemon/sum_sumkit.c
+SUM_DEPS  := $(SUMKIT_HDRS)
+SUM_FLAGS := -DOC_SUM
 endif
+
+# sumkit and the converter that writes its file are in every build, as the
+# other models' converters are: `openchimed --summary-pack` makes summary.bin
+# whether or not the engine runs it here. nnkit comes with read-aloud or voice
+# input when either is built in, and on its own otherwise.
+SUMKIT_DAEMON_SRC := $(SUMKIT_SRC) $(if $(filter 1,$(TTS) $(STT)),,$(NNKIT_SRC))
 
 # One object per source (mk/sources.mk, "Objects"), compiled with exactly the
 # flags the daemon always had, and linked in the sources' order. Every object
@@ -68,13 +66,13 @@ endif
 # the two models' data files are written in their formats (--voice-pack,
 # daemon/voice_pack.c; --recognizer-pack, daemon/recognizer_pack.c) whether or
 # not read-aloud or voice input is compiled in.
-DAEMON_CC   = $(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTSKIT_INC) $(STTKIT_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS)
-DAEMON_OBJS := $(call oc_objs,$(OBJ_DIR)/daemon,$(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC))
+DAEMON_CC   = $(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTSKIT_INC) $(STTKIT_INC) $(SUMKIT_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS)
+DAEMON_OBJS := $(call oc_objs,$(OBJ_DIR)/daemon,$(SRC) $(TTS_SRC) $(STT_SRC) $(SUMKIT_DAEMON_SRC) $(SUM_SRC))
 $(eval $(call oc_obj_rules,$(OBJ_DIR)/daemon,DAEMON_CC,$(CC_STAMP) $(FEATURES_STAMP) $(BUILD_ID_STAMP) $(TOOLCHAIN_DEPS),$(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS)))
 -include $(DAEMON_OBJS:.o=.d)
 $(BIN): $(DAEMON_OBJS) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP) $(FEATURES_STAMP) $(TOOLCHAIN_DEPS)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -o $@ $(DAEMON_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(SUM_LIBS) $(SUM_CXX) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(DAEMON_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(LDFLAGS)
 
 # The data directories, and their manifests written by the daemon just built --
 # so the version they name is exactly the version compiled in. Rebuilt whenever
@@ -83,7 +81,7 @@ $(BIN): $(DAEMON_OBJS) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(SQLITE
 # writes them. It is built with NO features: the manifest names each model's
 # version, a constant of the sources, over hashes of the data, and neither
 # needs an engine linked in -- so the arm64 build does not compile the host's
-# llama.cpp for a binary that only writes two files. Its
+# summary engine for a binary that only writes two files. Its
 # switches on its command line and nothing remembered (REMEMBER=0) and its own
 # binary path, so a developer's remembered features and host daemon are left
 # as they were; and its own generated sources, objects,

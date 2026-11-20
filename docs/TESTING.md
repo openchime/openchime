@@ -141,8 +141,8 @@ harnesses in the full suite (§2.2b, "Fuzzing"). A concurrency load test
 **`make build` and `make test`** (Linux, x86-64 or arm64): a C compiler
 (`cc`), `make`, `nasm` (libvpx's assembly), `curl` and `xz` (the pinned
 llvm-mingw for the Windows clients) and `python3`. The vendored libraries and the toolchain build themselves on first
-use (`scripts/build/*.sh`, `mk/toolchains.mk`); no llama.cpp or
-Emscripten is needed. actionlint is fetched once into
+use (`scripts/build/*.sh`, `mk/toolchains.mk`); no Emscripten is
+needed. actionlint is fetched once into
 `~/.cache/openchime/`. Four things are checked only where present, and a
 missing one is a `SKIP` (a failure where `CI` is set): `ffprobe` (package
 `ffmpeg`, the media suite's recording check, a full-suite suite), an IPv6
@@ -152,8 +152,8 @@ pending (`test_sock`'s connect bound, skipped when the kernel answers every
 SYN). `gdb` is optional and makes a crash print every thread's stack.
 
 **`make build-all` and `make test-all`** run in CI only and refuse anywhere
-else. What they need is installed by the workflows: `cmake` 3.28+ and a C++17
-compiler for the speech and summary builds, `setarch` for the
+else. What they need is installed by the workflows: `cmake` 3.28+ for SDL3's own
+builds, `setarch` for the
 ThreadSanitizer part, a clang with libFuzzer for the fuzzing harnesses,
 `ffmpeg`, and for the release's artifacts
 `podman`, `buildah`, `rpm`, `cpio`, `nsis`, `python3-pefile`, and clang and

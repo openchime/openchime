@@ -1,0 +1,29 @@
+# Synthetic: written for the tests, about no real people or company.
+Marta Silva: Launch check-in. We're still aiming for the 2.0 release on Thursday the 9th.
+Jonas Becker: The migration ran on the staging copy in 47 minutes. On production data it should be about 70.
+Marta Silva: 70 minutes of downtime is too long. Can we run it in two parts?
+  Jonas Becker: Yes. The index rebuild can run before the switch while users are still on 1.9. That leaves about 25 minutes of downtime.
+  Marta Silva: Let's do that. Please update the plan.
+  Jonas Becker: Updated. The index part starts at 18:00 the day before.
+Lena Hoffmann: Marketing needs the final screenshots by Monday for the announcement post.
+Felix Nguyen: The new dashboard still has the old icons. I'll replace them tomorrow and send screenshots on Monday morning.
+Lena Hoffmann: Monday morning works, the post goes out Thursday at 10:00.
+Sam Adeyemi: Security review found one issue: the export endpoint doesn't check the workspace on the file id.
+Sam Adeyemi: A user who guesses an id could download another workspace's export. Severity high.
+Marta Silva: That has to be fixed before we launch. Who can take it?
+  Jonas Becker: I can, it's a two-line check plus a test. I'll have a pull request today.
+  Sam Adeyemi: I'll review it as soon as it's up.
+  Jonas Becker: Pull request is up, number 2214.
+  Sam Adeyemi: Reviewed and approved, merged at 16:20.
+Felix Nguyen: Question for everyone: do we keep the old dashboard available for a while, or switch everyone at once?
+Lena Hoffmann: Customers asked for a way back last time.
+Marta Silva: We keep the old one for 30 days behind a setting, then remove it. Felix, can you add the setting?
+Felix Nguyen: Yes, I'll have it by Wednesday.
+Jonas Becker: Load test results: 2,400 requests a second at p99 of 180 ms. The target was 2,000 at 250 ms.
+Marta Silva: Good, that's well inside the target.
+Sam Adeyemi: Who is on call during the launch window?
+Marta Silva: Jonas and me from 18:00 to midnight, Sam after that.
+Lena Hoffmann: Do we have a rollback plan written down anywhere?
+Jonas Becker: Not yet. I'll write it tonight and link it here.
+Felix Nguyen: The mobile apps need a store review. Apple usually takes two days, so I submitted today.
+Marta Silva: Thanks Felix. Final go or no-go meeting is Wednesday at 15:00.

@@ -11,8 +11,8 @@
 # own kind of wrong. utf8proc and qrcodegen are in both, the daemon normalizing
 # passwords with one and drawing the setup page's QR code with the other.
 # Read-aloud (ARCH-111), voice input (ARCH-112) and summaries are in the
-# release's daemon, and with them the voice model, Opus, CMUdict-derived data,
-# the recognizer and llama.cpp; for a daemon built without one, run this with
+# release's daemon, and with them the voice model, Opus, CMUdict-derived data
+# and the recognizer; for a daemon built without one, run this with
 # TTS=0, STT=0 or SUM=0.
 #
 # Litestream (Apache-2.0) is not here for the same reason: it is a separate
@@ -121,10 +121,9 @@ fi
 if [ "$SUM" = 1 ]; then
   header <<'HEADER'
 
-and, for summaries (built into the binary):
-
-  llama.cpp 0.5.0      MIT          the summary model's inference engine
-    (with ggml)                     (the model is fetched on first use)
+and, for summaries: no third-party code. The model (Qwen3.5 2B, Apache-2.0)
+  is not in the package: it is fetched from Qwen and converted on first use,
+  and its licence is kept beside it.
 HEADER
 fi
 
@@ -150,9 +149,4 @@ if [ "$TTS" = 1 ]; then
 fi
 if [ "$STT" = 1 ]; then
   emit "The recognizer -- MIT License" "${root}/sttkit/data/RECOGNIZER-LICENSE"
-fi
-# The summary model's engine (ARCH-116). The model itself is not in the package:
-# it is fetched on first use, with its own licence (Apache-2.0).
-if [ "$SUM" = 1 ]; then
-  emit "llama.cpp 0.5.0 (with ggml) -- MIT License" "${root}/third_party/llamacpp-0.5.0${OC_ARCH:+-$OC_ARCH}/LICENSE"
 fi

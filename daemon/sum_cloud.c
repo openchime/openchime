@@ -13,7 +13,7 @@
  * before it answers spends the answer's tokens on that: the API says so in the
  * usage it reports (`completion_tokens_details.reasoning_tokens`, OpenAI's
  * shape) or by answering nothing. Such a model is asked again with each of the
- * fields APIs have for turning that off (OpenAI's, OpenRouter's, llama.cpp's
+ * fields APIs have for turning that off (OpenAI's, OpenRouter's, local servers'
  * and vLLM's, in turn), and the first the API honours is sent with every
  * request from then on. None is tied to a model's name: what the server
  * answers decides. A model that cannot be told not to reason leaves summaries
@@ -63,7 +63,7 @@ typedef struct {
 static const char *const QUIET[] = {
     "\"reasoning_effort\":\"none\"",                      /* OpenAI's */
     "\"reasoning\":{\"enabled\":false}",                  /* OpenRouter's */
-    "\"chat_template_kwargs\":{\"enable_thinking\":false}", /* llama.cpp's and vLLM's */
+    "\"chat_template_kwargs\":{\"enable_thinking\":false}", /* local servers' and vLLM's */
 };
 #define N_QUIET ((int)(sizeof QUIET / sizeof QUIET[0]))
 
@@ -207,7 +207,7 @@ static int request(cloud_engine *e, const char *system, const char *user, int ma
             st->prompt_tokens = (uint32_t)num(&d, oc_json_get(&d, usage, "prompt_tokens"));
             st->output_tokens = (uint32_t)num(&d, oc_json_get(&d, usage, "completion_tokens"));
         }
-        /* llama.cpp's server says where its time went. */
+        /* a local server says where its time went. */
         if (tm >= 0) {
             st->read_ms = (uint32_t)num(&d, oc_json_get(&d, tm, "prompt_ms"));
             st->write_ms = (uint32_t)num(&d, oc_json_get(&d, tm, "predicted_ms"));
