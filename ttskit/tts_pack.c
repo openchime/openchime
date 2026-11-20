@@ -229,17 +229,17 @@ static double now_s(void) {
 /* One layer, `count` times over rows for a fixture of n tokens and f frames: seconds. */
 static double bench_layer_run(const bench_layer *L, int n, int f) {
     int tin = bench_rows(L->in, n, f), tout = bench_rows(L->out, n, f), reps = L->count;
-    int cp = VOICE_ROUND(L->cin, VOICE_CPAD);
+    int cp = NN_ROUND(L->cin, NN_CPAD);
     double spent = 0;
     switch (L->kind) {
     case B_CONV: case B_MATMUL: {
         int k = L->kind == B_CONV ? L->k : 1, stride = L->kind == B_CONV ? L->stride : 1;
         int dil = L->kind == B_CONV ? L->dil : 1, pad = (k - 1) * dil / 2;
         int rows = (tout - 1) * stride + (k - 1) * dil + 1, real = rows - 2 * pad;
-        size_t wn = (size_t)VOICE_ROUND(L->cout, 4) * k * cp;
+        size_t wn = (size_t)NN_ROUND(L->cout, 4) * k * cp;
         float *x = xmalloc(sizeof(float) * (size_t)real * L->cin), *y = xmalloc(sizeof(float) * (size_t)tout * L->cout);
         float *bias = xmalloc(sizeof(float) * (size_t)L->cout);
-        int16_t *q = calloc((size_t)rows * cp, sizeof *q), *wbuf = xmalloc(sizeof(int16_t) * VOICE_WBUF(k, cp));
+        int16_t *q = calloc((size_t)rows * cp, sizeof *q), *wbuf = xmalloc(sizeof(int16_t) * NN_WBUF(k, cp));
         int32_t *acc = xmalloc(sizeof(int32_t) * (size_t)tout * L->cout);
         uint8_t *w = xmalloc(wn * (size_t)reps);
         if (!q) { fprintf(stderr, "tts_pack: out of memory\n"); exit(1); }
@@ -248,26 +248,26 @@ static double bench_layer_run(const bench_layer *L, int n, int f) {
         fill_b(w, wn * (size_t)reps);
         double t0 = now_s();
         for (int r = 0; r < reps; r++) {
-            voice_qparam qp;
-            voice_quantize(x, real, L->cin, L->cin, q + (size_t)pad * cp, cp, &qp);
+            nn_qparam qp;
+            nn_quantize(x, real, L->cin, L->cin, q + (size_t)pad * cp, cp, &qp);
             if (L->kind == B_CONV)
-                voice_conv_q(q, tout, stride, dil, k, cp, w + wn * r, 131, L->cout, acc, L->cout, wbuf);
+                nn_conv_q(q, tout, stride, dil, k, cp, w + wn * r, 131, L->cout, acc, L->cout, wbuf);
             else
-                voice_matmul_q(q, tout, cp, (const int8_t *)(w + wn * r), 0, L->cout, acc, L->cout, wbuf);
-            voice_dequant(acc, tout, L->cout, L->cout, qp.scale * 0.01f, bias, y, L->cout);
+                nn_matmul_q(q, tout, cp, (const int8_t *)(w + wn * r), 0, L->cout, acc, L->cout, wbuf);
+            nn_dequant(acc, tout, L->cout, L->cout, qp.scale * 0.01f, bias, y, L->cout);
         }
         spent = now_s() - t0;
         free(x); free(y); free(bias); free(q); free(wbuf); free(acc); free(w);
         break;
     }
     case B_MATMUL_F: {
-        int np = VOICE_ROUND(L->cout, 8);
+        int np = NN_ROUND(L->cout, 8);
         float *x = xmalloc(sizeof(float) * (size_t)tin * L->cin), *w = xmalloc(sizeof(float) * (size_t)L->cin * np);
         float *y = xmalloc(sizeof(float) * (size_t)tout * L->cout);
         fill_f(x, (size_t)tin * L->cin, 1.0f);
         fill_f(w, (size_t)L->cin * np, 0.1f);
         double t0 = now_s();
-        for (int r = 0; r < reps; r++) voice_matmul_f(x, (size_t)L->cin, tin, L->cin, w, L->cout, NULL, y, (size_t)L->cout);
+        for (int r = 0; r < reps; r++) nn_matmul_f(x, (size_t)L->cin, tin, L->cin, w, L->cout, NULL, y, (size_t)L->cout);
         spent = now_s() - t0;
         free(x); free(w); free(y);
         break;
@@ -277,14 +277,14 @@ static double bench_layer_run(const bench_layer *L, int n, int f) {
         float *x = xmalloc(sizeof(float) * (size_t)tin * L->cin), *y = xmalloc(sizeof(float) * (size_t)tin * 2 * H);
         int8_t *w = xmalloc((size_t)2 * G * cp * reps), *rw = xmalloc((size_t)2 * G * H * reps);
         float *b = xmalloc(sizeof(float) * 2 * 2 * G);
-        void *scratch = xmalloc(voice_lstm_scratch(tin, cp, H));
+        void *scratch = xmalloc(nn_lstm_scratch(tin, cp, H));
         fill_f(x, (size_t)tin * L->cin, 1.0f);
         fill_b(w, (size_t)2 * G * cp * reps);
         fill_b(rw, (size_t)2 * G * H * reps);
         fill_f(b, (size_t)4 * G, 0.1f);
         double t0 = now_s();
         for (int r = 0; r < reps; r++) {
-            voice_lstm l = { .in_pad = cp, .hidden = H };
+            nn_lstm l = { .in_pad = cp, .hidden = H };
             for (int d = 0; d < 2; d++) {
                 l.w[d] = w + ((size_t)r * 2 + d) * G * cp;
                 l.r[d] = rw + ((size_t)r * 2 + d) * G * H;
@@ -292,7 +292,7 @@ static double bench_layer_run(const bench_layer *L, int n, int f) {
                 l.wscale[d] = l.rscale[d] = 0.004f;
                 l.wzp[d] = l.rzp[d] = 0;
             }
-            voice_lstm_run(&l, 2, x, tin, L->cin, L->cin, y, 2 * H, scratch);
+            nn_lstm_run(&l, 2, x, tin, L->cin, L->cin, y, 2 * H, scratch);
         }
         spent = now_s() - t0;
         free(x); free(y); free(w); free(rw); free(b); free(scratch);
@@ -305,7 +305,7 @@ static double bench_layer_run(const bench_layer *L, int n, int f) {
         fill_f(q, sz * 3, 1.0f);
         double t0 = now_s();
         for (int r = 0; r < reps; r++)
-            voice_attention(q, q + sz, q + 2 * sz, L->cin, tin, 12, dh, sqrtf(1.0f / sqrtf((float)dh)), NULL, q + 3 * sz,
+            nn_attention(q, q + sz, q + 2 * sz, L->cin, tin, 12, dh, sqrtf(1.0f / sqrtf((float)dh)), NULL, q + 3 * sz,
                             L->cin, s);
         spent = now_s() - t0;
         free(q); free(s);
@@ -319,17 +319,17 @@ static double bench_layer_run(const bench_layer *L, int n, int f) {
         for (int c = 0; c < L->cin; c++) { g[c] = 1.0f + 0.1f * (float)(c % 7); b[c] = 1.0f / g[c]; }
         double t0 = now_s();
         for (int r = 0; r < reps; r++) {
-            if (L->kind == B_LN) voice_layernorm(x, tin, L->cin, L->cin, g, b, 1e-5f);
-            else if (L->kind == B_IN) voice_instnorm(x, tin, L->cin, L->cin, g, b, 1e-5f);
-            else if (L->kind == B_SNAKE) voice_snake(x, tin, L->cin, L->cin, g, b);
-            else voice_leaky_relu(x, sz, 0.2f);
+            if (L->kind == B_LN) nn_layernorm(x, tin, L->cin, L->cin, g, b, 1e-5f);
+            else if (L->kind == B_IN) nn_instnorm(x, tin, L->cin, L->cin, g, b, 1e-5f);
+            else if (L->kind == B_SNAKE) nn_snake(x, tin, L->cin, L->cin, g, b);
+            else nn_leaky_relu(x, sz, 0.2f);
         }
         spent = now_s() - t0;
         free(x); free(g); free(b);
         break;
     }
     case B_CONVT: {
-        int mt = L->k / L->stride, np = VOICE_ROUND(L->cout, 8);
+        int mt = L->k / L->stride, np = NN_ROUND(L->cout, 8);
         float *x = calloc((size_t)(tin + 2 * mt) * L->cin, sizeof(float));
         float *w = xmalloc(sizeof(float) * (size_t)L->k * L->cin * np * reps);
         float *bias = xmalloc(sizeof(float) * (size_t)L->cout), *y = xmalloc(sizeof(float) * (size_t)tout * L->cout);
@@ -339,7 +339,7 @@ static double bench_layer_run(const bench_layer *L, int n, int f) {
         fill_f(bias, (size_t)L->cout, 0.1f);
         double t0 = now_s();
         for (int r = 0; r < reps; r++)
-            voice_convt(x, tin, L->cin, L->k, L->stride, L->dil, w + (size_t)r * L->k * L->cin * np, bias, L->cout,
+            nn_convt(x, tin, L->cin, L->k, L->stride, L->dil, w + (size_t)r * L->k * L->cin * np, bias, L->cout,
                         tout, y, L->cout);
         spent = now_s() - t0;
         free(x); free(w); free(bias); free(y);
@@ -352,7 +352,7 @@ static double bench_layer_run(const bench_layer *L, int n, int f) {
         fill_f(w, (size_t)L->k * L->cin, 0.5f);
         fill_f(bias, (size_t)L->cin, 0.1f);
         double t0 = now_s();
-        for (int r = 0; r < reps; r++) voice_convt_dw(x, tin, L->cin, L->cin, L->k, L->stride, 1, w, bias, tout, y, L->cin);
+        for (int r = 0; r < reps; r++) nn_convt_dw(x, tin, L->cin, L->cin, L->k, L->stride, 1, w, bias, tout, y, L->cin);
         spent = now_s() - t0;
         free(x); free(w); free(bias); free(y);
         break;
@@ -366,7 +366,7 @@ static double bench_layer_run(const bench_layer *L, int n, int f) {
         fill_f(wr, (size_t)bins * L->k, 0.1f);
         fill_f(wi, (size_t)bins * L->k, 0.1f);
         double t0 = now_s();
-        for (int r = 0; r < reps; r++) voice_istft(spec, tin, 24, bins, wr, wi, L->k, L->stride, 10, out, full);
+        for (int r = 0; r < reps; r++) nn_istft(spec, tin, 24, bins, wr, wi, L->k, L->stride, 10, out, full);
         spent = now_s() - t0;
         free(spec); free(wr); free(wi); free(out); free(full);
         break;

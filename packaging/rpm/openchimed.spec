@@ -40,8 +40,7 @@ Summary:        OpenChime chat daemon
 # installs (packaging/licenses.sh) is the full list. RPM expects one field, so
 # every licence is named: mbedTLS, Argon2 (CC0-1.0 or Apache-2.0, taken as
 # Apache-2.0) and the voice model (Apache-2.0); jsmn, QR Code generator,
-# utf8proc, SecLists, picohttpparser, ONNX Runtime, Moonshine and llama.cpp
-# (MIT); the CMUdict-derived pronunciation data (BSD, two clauses); Opus (BSD,
+# utf8proc, SecLists, picohttpparser, the recognizer and llama.cpp (MIT); the CMUdict-derived pronunciation data (BSD, two clauses); Opus (BSD,
 # three clauses); Mozilla's CA roots (MPL-2.0); and SQLite (public domain,
 # SPDX "blessing").
 License:        AGPL-3.0-or-later AND Apache-2.0 AND MIT AND BSD-2-Clause AND BSD-3-Clause AND MPL-2.0 AND blessing

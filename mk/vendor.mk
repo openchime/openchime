@@ -45,25 +45,6 @@ $(OPUS_A): $(TOOLCHAIN_DEPS)
 $(SPEEXDSP_A): $(TOOLCHAIN_DEPS)
 	scripts/build/speexdsp.sh native
 
-# --- Voice input: ONNX Runtime and the recognizer (ARCH-112) -----------------
-# A minimal ONNX Runtime built from source as one static archive, for voice
-# input. The recognizer's files are DATA, fetched as published at pinned
-# SHA-256s into build/. `make clean` keeps the downloads. (Read-aloud needs
-# neither: its model runs in ttskit and its data is in ttskit/data/.)
-ORT_DIR := third_party/onnxruntime-1.30.0$(ARCH_SUFFIX)
-ORT_A   := $(ORT_DIR)/lib/libonnxruntime.a
-$(ORT_A): daemon/ort.ops.config $(TOOLCHAIN_DEPS)
-	@echo "openchime: building ONNX Runtime from source for voice input (about 20 minutes, once; make STT=0 skips it)"
-	scripts/build/onnxruntime.sh
-	@touch -c $@   # the script leaves a current build alone
-# A cross build runs the host's protoc, which the script builds on its own
-# when the host has none: protoc alone, from the same pinned sources, a few
-# minutes rather than the host's whole archive (scripts/build/onnxruntime.sh).
-build/moonshine/.done: scripts/build/moonshine.sh
-	@echo "openchime: fetching the Moonshine recognizer (once)"
-	scripts/build/moonshine.sh
-	@touch -c $@
-
 # --- Summaries: llama.cpp (ARCH-116) ------------------------------------------
 # Built from pinned source as one static archive. The model itself is DATA,
 # fetched on first use when an operator turns summaries on, never shipped.
@@ -73,12 +54,6 @@ $(LLAMA_A): scripts/build/llamacpp.sh $(TOOLCHAIN_DEPS)
 	@echo "openchime: building llama.cpp for summaries (a few minutes, once; make SUM=0 skips it)"
 	scripts/build/llamacpp.sh
 	@touch -c $@   # the script leaves a current build alone
-# Never at the same time as ONNX Runtime, when both are built: each is a large
-# C++ build using every CPU, and together, on a cold cache, they can run a
-# small machine (2 CPUs, 7 GB) out of memory.
-ifeq ($(STT),1)
-$(LLAMA_A): | $(ORT_A)
-endif
 
 # The common-password list (third_party/pwlist), compiled in (daemon/pwpolicy.c).
 $(PWLIST_RES): third_party/pwlist/common.txt scripts/build/pw_common.py

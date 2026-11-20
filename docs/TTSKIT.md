@@ -172,8 +172,8 @@ and 256 on the same 3,009 at eighteen times; 32 takes about 1.7 ms a word.
 ## 5b. Sounds to audio: the voice model
 
 The phonemes are spoken by a neural voice model run inside ttskit, in plain C
-(`ttskit/voice_model.c` the forward pass, `ttskit/voice_ops.c` its kernels, `ttskit/voice.c`
-its data file). Where the model comes from, its licence and how its data file is made are
+(`ttskit/voice_model.c` the forward pass, `ttskit/voice.c` its data file; its kernels are
+nnkit's, `nnkit/nn_ops.c`, shared with voice input's recognizer, STTKIT.md). Where the model comes from, its licence and how its data file is made are
 in [VENDORS.md](./VENDORS.md); here it is **the voice model**.
 
 **What it is.** A StyleTTS 2-style model: a text side that decides how long each sound
@@ -214,9 +214,9 @@ are the daemon's (`daemon/tts_voice.c`, READ-ALOUD.md §4), not ttskit's.
 
 **Plain C, one thread.** No intrinsics, no SIMD headers, no threads and no library: the
 kernels are ordinary loops over blocks of 16 or 64 values, written so GCC's and clang's
-auto-vectorisers turn them into vector code at `-O2`. Every ttskit object is compiled with
+auto-vectorisers turn them into vector code at `-O2`. Every ttskit and nnkit object is compiled with
 `-ffp-contract=off`, so the compiler never fuses a multiply and an add behind the source's
-back; where the arithmetic needs a fused multiply-add it is spelled out (`voice_fma`, exact
+back; where the arithmetic needs a fused multiply-add it is spelled out (`nn_fma`, exact
 in double, settled by `fmaf` only on an exact tie). The samples are then the order the
 source writes, the same on x86-64 and arm64 whatever the compiler. Measured on one core of
 an i5-1335U, a render takes 0.81× its length in time built with GCC (`tts_pack bench`),
@@ -530,11 +530,11 @@ as above.
 - the C guesser against Phonetisaurus's decoder on all 3,010 reference words (at least 999
   in 1,000 identical; all but one are);
 - truncated files, a wrong magic and a newer version, each refused on load with a reason;
-- the voice model's kernels — the 8-bit quantisation, the integer matrix product and
-  convolution, the LSTM, layer and instance norms, attention, the transposed convolutions,
-  the float matrix product, the activations and the inverse STFT — each against a naive
-  version of the operator's definition on random inputs, and the duration rounding and the
-  alignment of tokens to frames;
+- the duration rounding and the alignment of tokens to frames (the kernels the model runs
+  on — the 8-bit quantisation, the integer matrix product and convolution, the LSTM, layer
+  and instance norms, attention, the transposed convolutions, the float matrix product, the
+  activations and the inverse STFT — are tested in `tests/test_nnkit.c`, each against a
+  naive version of the operator's definition on random inputs);
 - `voice.bin`: a small file built byte by byte loads and says what was written, and one with
   a wrong magic, a later version or a wrong length is refused; the converter, on a small
   model and voices built in the upstream formats, puts each tensor where its kernel reads it,

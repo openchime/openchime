@@ -1,10 +1,11 @@
 /*
- * OpenChime — where read-aloud's data lives, and whether it is the data this
- * daemon was built for (REQ-295, ARCH-111, READ-ALOUD.md §4).
+ * OpenChime — where read-aloud's and voice input's data live, and whether it is
+ * the data this daemon was built for (REQ-295, ARCH-111, ARCH-112,
+ * READ-ALOUD.md §4).
  *
- * The voice model, its voices and ttskit's pronunciation data are files beside
- * the daemon rather than bytes inside it. Nothing here needs ONNX Runtime, so the
- * tests link it directly.
+ * The voice model, its voices and ttskit's pronunciation data, and the
+ * recognizer, are files beside the daemon rather than bytes inside it. Nothing
+ * here runs a model, so the tests link it directly.
  */
 #ifndef OC_TTS_DATA_H
 #define OC_TTS_DATA_H

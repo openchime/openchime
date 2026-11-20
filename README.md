@@ -49,8 +49,9 @@ or broken is not a document — it is the
 | [AUDIO.md](docs/AUDIO.md) | A call's audio: the relay that never decodes, the client engine — echo cancellation, noise suppression, Opus with FEC and DTX, the adaptive jitter buffer, the mixer — and the ERLE harness that measures the canceller. |
 | [VIDEO-MESSAGES.md](docs/VIDEO-MESSAGES.md) | Recorded video messages: the capture interface and its platform backends, VP9 and Opus in a restricted MP4, the recorder and player, how a message travels as an attachment, consent, and the tests that prove it. |
 | [READ-ALOUD.md](docs/READ-ALOUD.md) | Read-aloud: a channel spoken in each author's voice — rendered once by the daemon from a voice model installed beside it, cached, and played by the clients. |
-| [VOICE-INPUT.md](docs/VOICE-INPUT.md) | Voice input for the graphical clients: push to talk into the composer, or free talk the daemon posts as you speak — cut at pauses in the client, echo-cancelled, recognized by the daemon with Moonshine Tiny Streaming. |
+| [VOICE-INPUT.md](docs/VOICE-INPUT.md) | Voice input for the graphical clients: push to talk into the composer, or free talk the daemon posts as you speak — cut at pauses in the client, echo-cancelled, recognized by the daemon with a small recognizer run in its own plain C (sttkit). |
 | [TTSKIT.md](docs/TTSKIT.md) | ttskit, read-aloud's GPL-free speech library: text to the phonemes a voice model reads, the voice model itself run in plain C, their data files, and how to rebuild them. |
+| [STTKIT.md](docs/STTKIT.md) | sttkit, voice input's recognizer run in plain C on the kernels it shares with ttskit: the model, its arithmetic, its data file, and how to rebuild it. |
 | [SUMMARIES.md](docs/SUMMARIES.md) | Channel and DM summaries, made on the box by a small model or by a hosted API you name (REQ-310, ARCH-116). |
 | [PRIVATE-DM.md](docs/PRIVATE-DM.md) | Encrypted DMs: direct messages end-to-end encrypted between one device of each person. |
 | [WEB.md](docs/WEB.md) | The web client: the graphical client compiled to WebAssembly and served by the daemon at `/app/`. |
@@ -211,11 +212,10 @@ llvm-mingw it fetches (`mk/toolchains.mk`); nasm builds libvpx's x86 assembly.
 `make build` and `make test` always build the one configuration, whatever was
 asked before, with a job per CPU.
 
-Anything else is built by its path. `TTS` (read-aloud) needs nothing more:
-its voice model runs in C inside the daemon and its data is committed. The
-other switches (`STT`, `SUM`, `WEB`) need CMake, a C++17 compiler, git and xz
-besides; the build fetches its own pinned Emscripten, and the first build with
-`STT` compiles ONNX Runtime (about 20 minutes). `make run` builds the daemon with the data
+Anything else is built by its path. `TTS` (read-aloud) and `STT` (voice
+input) need nothing more: their models run in C inside the daemon and their
+data is committed. `SUM` and `WEB` need CMake, a C++17 compiler, git and xz
+besides, and the build fetches its own pinned Emscripten. `make run` builds the daemon with the data
 read-aloud and voice input need beside it, and the Linux TUI, and starts it
 (below); `make openchimed` builds the daemon alone. The switches are
 remembered in `build/.features`, so a later `make openchimed` or `make run`

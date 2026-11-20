@@ -58,8 +58,8 @@ left off because it deletes the near-end voice in double-talk.
 as speech or not; its first 200 ms are ignored while it settles. A segment opens on
 60 ms of speech with 300 ms of pre-roll so the first syllable survives, closes after
 700 ms of quiet, is dropped if it holds under 400 ms of speech, and is cut at a
-200 ms pause before the daemon's cap — **30 s** by default, the limit Moonshine
-recommends — or at the cap if there is none. In push to talk the release ends the
+200 ms pause before the daemon's cap — **30 s** by default, the limit the recognizer's
+authors recommend — or at the cap if there is none. In push to talk the release ends the
 segment; the detector drops only a press holding under 160 ms of speech, and cuts
 inside the cap.
 
@@ -87,46 +87,47 @@ in the client and a lossy input to the recognizer).
 
 ## 6. Recognition in the daemon
 
-**Moonshine Tiny Streaming, English (MIT)** — the smallest reliable model that runs on
-ONNX Runtime. Figures are the authors' (their repository, 2026-08-24):
+**The recognizer** — the smallest reliable English model we found (its source, licence
+and how its data file is made are in VENDORS.md). Figures are its authors' (their
+repository, 2026-08-24):
 
-| | Moonshine Tiny Streaming | Whisper Tiny |
+| | The recognizer | Whisper Tiny |
 |---|---|---|
 | Parameters | 34 million | 39 million |
 | Open ASR Leaderboard average WER | 12.00% | 12.81% |
 | LibriSpeech test-clean WER, shipped int8 model | 4.83% | — |
 | Latency, Linux x86 (authors' benchmark) | 69 ms | 1,141 ms |
 
-Compute follows the length of the audio, where Whisper always encodes 30 seconds. The
-published files are int8-quantized `.ort` — `frontend.model.ort`,
-`frontend.weights.ort`, `encoder.ort`, `adapter.ort`, `cross_kv.ort`,
-`decoder_kv.ort`, `tokenizer.bin`, `streaming_config.json`, about 45 MB — fetched at
-pinned SHA-256s by `scripts/build/moonshine.sh` from Moonshine's dated CDN directory
-(`quantized_26_08_21`). They load as published in the daemon's ONNX Runtime 1.30.0.
+Compute follows the length of the audio, where Whisper always encodes 30 seconds. It is an
+encoder-decoder transformer with int8 weights, run by **sttkit in plain C** on nnkit's
+kernels (STTKIT.md): one committed file, `sttkit/data/recognizer.bin` (about 40 MB), made
+from the published files by `openchimed --recognizer-pack`. Nothing is downloaded or built
+for it outside the tree.
 
-**Measured on the daemon** (x86-64, one core): the model loads in 0.08 s on the first
-segment; recognition takes 0.09–0.12× the length of the speech; peak memory is about
-175 MB for a short sentence, 190 MB for six seconds and 360 MB for twenty. An idle
-daemon holds 0.1 MB more with voice input built in than without it.
+**Measured on the daemon** (x86-64, one core, i5-1335U): the model maps in no measurable
+time on the first segment; recognition takes about 0.25× the length of the speech
+(`stt_check bench`: 0.16–0.29× over the reference fixtures); one utterance of six seconds
+peaks at about 52 MB resident, 40 MB of it the mapped `recognizer.bin`, which the kernel
+may drop. An idle daemon holds 0.1 MB more with voice input built in than without it.
 
 **Long segments are heard in windows.** The working memory grows with what the model
-hears at once, and on a 256 MB machine a 20 s segment left 3 MB free and a 30 s one took
-413 s, the kernel re-reading the model from disk (TESTING.md, "Speech models' memory").
+hears at once: when the recognizer ran on ONNX Runtime, on a 256 MB machine a 20 s segment
+left 3 MB free and a 30 s one took 413 s, the kernel re-reading the model from disk
+(TESTING.md, "Speech models' memory"). sttkit needs far less, but the windows stay: they
+bound the work and memory of one pass whatever the segment.
 So a segment longer than `OC_STT_WINDOW_SECS` (6 s) is heard in windows of at most that,
 each ending at the quietest 20 ms within `OC_STT_CUT_SEARCH_MS` (1.5 s) of its limit, and
 the windows' words are joined with one space (`oc_stt_hear_windowed`,
 `daemon/stt_worker.c`). The daemon's worker and `openchimed --stt-hear` hear the same way.
 
-- **In C, on ONNX Runtime's minimal static build**, which only voice input links
-  (read-aloud's voice model runs in ttskit without it, TTSKIT.md §5b): the daemon runs
-  the graph chain through ONNX Runtime's C API. The operator config
-  (`daemon/ort.ops.config`) still holds the voice model's operators from when read-aloud
-  ran on it, until it is trimmed to Moonshine's. `tokenizer.bin` is read in place; decoding
-  stops at the end token or at Moonshine's tokens-per-second ceiling, its guard
-  against a decoder repeating itself.
+- **In C, in sttkit** (STTKIT.md), with read-aloud's kernels (nnkit, shared with
+  ttskit): no inference library, one thread, no intrinsics. Its arithmetic is the
+  published graphs' as ONNX Runtime computed them, to the bit, so it hears what the
+  model was measured to hear (STTKIT.md §4). Decoding stops at the end token or at the
+  model's tokens-per-second ceiling, its guard against a decoder repeating itself.
 - **A worker of its own** beside the render worker: a bounded queue, an eventfd back
-  to the net loop, one intra-op thread, the session opened on first use and released
-  when idle. The loop only copies a segment's bytes as they arrive; the worker puts
+  to the net loop, one thread, the model opened on first use and released when
+  idle. The loop only copies a segment's bytes as they arrive; the worker puts
   the little-endian samples in host order before hearing them.
 - **Its own data directory and manifest** — `/usr/share/openchime/stt`, else
   `stt/` beside the executable — so missing data

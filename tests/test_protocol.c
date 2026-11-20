@@ -2969,11 +2969,11 @@ static void test_tts_frames(void) {
         CHECK(oc_decode_voice_preview_get(&p, &out) == OC_OK && slice_eq_str(out.voice_id, "expr-voice-5-f"));
     }
     {
-        oc_stt_info in = { oc_slice_str("moonshine-tiny-streaming-en/quantized_26_08_21"), oc_slice_str("en-US"), 30000 };
+        oc_stt_info in = { oc_slice_str("en-US/recognizer/1"), oc_slice_str("en-US"), 30000 };
         ROUNDTRIP(oc_encode_stt_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_STT_INFO, h, p);
         oc_stt_info out;
         CHECK(oc_decode_stt_info(&p, &out) == OC_OK);
-        CHECK(slice_eq_str(out.model_version, "moonshine-tiny-streaming-en/quantized_26_08_21"));
+        CHECK(slice_eq_str(out.model_version, "en-US/recognizer/1"));
         CHECK(slice_eq_str(out.lang, "en-US") && out.max_segment_ms == 30000);
     }
     {

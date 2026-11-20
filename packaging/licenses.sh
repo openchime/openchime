@@ -12,8 +12,8 @@
 # passwords with one and drawing the setup page's QR code with the other.
 # Read-aloud (ARCH-111), voice input (ARCH-112) and summaries are in the
 # release's daemon, and with them the voice model, Opus, CMUdict-derived data,
-# ONNX Runtime, Moonshine and llama.cpp; for a daemon built without one, run
-# this with TTS=0, STT=0 or SUM=0.
+# the recognizer and llama.cpp; for a daemon built without one, run this with
+# TTS=0, STT=0 or SUM=0.
 #
 # Litestream (Apache-2.0) is not here for the same reason: it is a separate
 # program, in the container image only, never linked into openchimed nor in
@@ -113,11 +113,8 @@ if [ "$STT" = 1 ]; then
 
 and, for voice input (built into the binary, its data in stt/):
 
-  ONNX Runtime 1.30.0  MIT          neural network inference, built minimal and
-                                    static, with the notices of the components
-                                    compiled into it
-  Moonshine Tiny       MIT          the speech recognizer's model and tokenizer,
-    Streaming (en)                  shipped as data in stt/
+  The recognizer       MIT          voice input's speech recognition model and
+                                    tokenizer, shipped as data in stt/
 HEADER
 fi
 
@@ -146,19 +143,13 @@ emit "QR Code generator 1.8.0 -- MIT License" "${root}/third_party/qrcodegen/LIC
 emit "Mozilla CA roots -- Mozilla Public License 2.0" "${root}/third_party/ca-roots/LICENSE"
 emit "SQLite 3.53.4 -- Public Domain" "${root}/third_party/sqlite-3.53.4/LICENSE"
 
-if [ "$STT" = 1 ]; then
-  # The architecture's own copy (OC_ARCH, as the build scripts take it): a
-  # cross build has no host archive to read from, and the texts are the same.
-  emit "ONNX Runtime 1.30.0 -- MIT License" "${root}/third_party/onnxruntime-1.30.0${OC_ARCH:+-$OC_ARCH}/LICENSE"
-  emit "ONNX Runtime 1.30.0 -- third-party notices" "${root}/third_party/onnxruntime-1.30.0${OC_ARCH:+-$OC_ARCH}/ThirdPartyNotices.txt"
-fi
 if [ "$TTS" = 1 ]; then
   emit "The voice model -- Apache License 2.0" "${root}/ttskit/data/VOICE-LICENSE"
   emit "Opus 1.6.1 -- BSD 3-Clause License" "${root}/third_party/opus/COPYING"
   emit "CMU Pronouncing Dictionary -- BSD-style licence" "${root}/ttskit/data/CMUDICT-LICENSE"
 fi
 if [ "$STT" = 1 ]; then
-  emit "Moonshine Tiny Streaming -- MIT License" "${root}/build/moonshine/LICENSE"
+  emit "The recognizer -- MIT License" "${root}/sttkit/data/RECOGNIZER-LICENSE"
 fi
 # The summary model's engine (ARCH-116). The model itself is not in the package:
 # it is fetched on first use, with its own licence (Apache-2.0).

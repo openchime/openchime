@@ -51,9 +51,8 @@ jobs:
     name: full suite
     runs-on: ubuntu-24.04
     # With both of the runner's CPUs compiling, a warm run took about 35
-    # minutes and a cold cache, which builds the vendored libraries and ONNX
-    # Runtime first, about 70. One file at a time, on one CPU, is allowed twice
-    # that.
+    # minutes and a cold cache, which builds the vendored libraries first,
+    # longer. One file at a time, on one CPU, is allowed twice that.
     timeout-minutes: 160
     outputs:
       build_id: ${{ steps.id.outputs.build_id }}
@@ -181,19 +180,6 @@ jobs:
             third_party/zig-0.17.1
             third_party/emsdk-6.0.13
           key: &toolchains-key toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
-      # Voice input's engine and model (ARCH-112): ONNX Runtime built minimal
-      # and static from source (about 20 minutes), and the recognizer's files.
-      # Read-aloud needs neither: its model and data are in the tree. Both are
-      # pure functions of the files in the key, so a hit skips the build and a
-      # change to any of them rebuilds. The timeout allows for a miss.
-      - id: c-tts
-        name: Restore the speech engine and models
-        uses: actions/cache/restore@v6
-        with:
-          path: &tts-path |
-            third_party/onnxruntime-1.30.0
-            build/moonshine
-          key: &tts-key tts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build/onnxruntime.sh', 'daemon/ort.ops.config', 'scripts/build/moonshine.sh') }}
       # The vendored native libraries, one cache each: each script builds only
       # what is missing, so a hit skips the download and the build. Each is
       # keyed by its version, its own script, which pins the version and the
@@ -298,12 +284,6 @@ jobs:
         with:
           path: *toolchains-path
           key: *toolchains-key
-      - name: Save the speech engine and models
-        if: steps.c-tts.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: *tts-path
-          key: *tts-key
       - name: Save llama.cpp
         if: steps.c-llamacpp.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6

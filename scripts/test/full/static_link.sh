@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # scripts/test/full/static_link.sh [binary]
 #
-# The daemon links only the C runtime dynamically. ONNX Runtime, llama.cpp,
-# their C++ runtime, mbedTLS, libopus and SQLite are inside the binary, so
+# The daemon links only the C runtime dynamically. llama.cpp, its C++
+# runtime, mbedTLS, libopus and SQLite are inside the binary, so
 # anything else here is a dependency that crept back in.
 #
 # Needs: ldd; the binary (default openchimed).

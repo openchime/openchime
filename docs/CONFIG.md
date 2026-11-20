@@ -189,7 +189,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_S3` | *(unset)* | Attachments in S3, with `blobs/` under the data directory as their disk cache (ARCH-70): `s3://KEY:SECRET@host[:port]/bucket[/prefix][?region=…]`, or `http+s3://` for a plaintext endpoint; percent-encode `/`, `+` and `@` in the key and secret. Uploads are accepted onto the disk and sent to S3 in the background, retried until it takes them; the cache keeps to half the free space above the low-space point. A prefix puts the keys under it, so several daemons can share a bucket. Unset: local disk. |
 | `OPENCHIME_S3_FILE` | *(unset)* | `OPENCHIME_S3`'s value, read from this file instead (mode 0600; a trailing newline is ignored), so the key and secret are not in the environment. Set one or the other, not both. |
 | `OPENCHIME_TTS` | `on` | Read-aloud (ARCH-111), in a build that carries it. While it reads aloud the daemon holds up to 170 MB, against about 25 MB idle (TESTING.md, "Speech models' memory"); off saves that. `on` or `off`. |
-| `OPENCHIME_STT` | `on` | Voice input (ARCH-112), in a build that carries it. While it hears a segment the daemon holds about 150 MB, against about 25 MB idle (TESTING.md, "Speech models' memory"); off saves that. `on` or `off`. |
+| `OPENCHIME_STT` | `on` | Voice input (ARCH-112), in a build that carries it. While it hears a segment the daemon holds about 55 MB, 40 MB of it the mapped model, against about 25 MB idle (TESTING.md, "Speech models' memory"); off saves that. `on` or `off`. |
 | `OPENCHIME_SUMMARY` | `off` | Summaries (REQ-310): `off`, `local` (the model runs inside the daemon, fetched on first start), or `cloud:<url>,<model>` (a hosted API's base URL and the model there). |
 | `OPENCHIME_SUMMARY_API_KEY` | *(empty)* | The hosted API's key, for `cloud`. |
 | `OPENCHIME_ENROLL_URL` | *(unset)* | Connects this box to the OpenChime services at this origin (ARCH-84); each service is then turned on by its own setting. https, or http to loopback for a test. Prints an `oce1.` code to the log on first run. |
@@ -513,6 +513,8 @@ accepts, and any other stops it with exit status 2.
 | `--tts-say VOICE TEXT OUT` | Renders TEXT in VOICE to OUT with the built-in model — a WAV when OUT ends `.wav`, otherwise an MP4 — then exits. Only in a build with read-aloud. |
 | `--tts-manifest DIR` | Writes the manifest for the read-aloud data in DIR, then exits. In every build, with read-aloud or not. |
 | `--voice-pack MODEL.onnx VOICES.npz OUT` | Converts the upstream voice model and its voices into `voice.bin` at OUT, the same bytes on every run (VENDORS.md has the pinned inputs; TTSKIT.md §6 the format), then exits. In every build, with read-aloud or not. |
+| `--recognizer-pack DIR OUT` | Converts the upstream recognizer's published files in DIR into `recognizer.bin` at OUT, the same bytes on every run (VENDORS.md has the pinned inputs; STTKIT.md §5 the format), then exits. In every build, with voice input or not. |
+| `--recognizer-pack --list DIR` | Prints every graph of the upstream recognizer's published files in DIR — inputs, outputs, constants and nodes — then exits. In every build. |
 | `--stt-hear IN.wav` | Prints the text recognized in a 16-bit mono WAV, then exits. Only in a build with voice input. |
 | `--stt-manifest DIR` | Writes the manifest for the recognizer data in DIR, then exits. In every build, with voice input or not. |
 

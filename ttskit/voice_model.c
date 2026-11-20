@@ -5,7 +5,7 @@
  * durations and the alignment of tokens to frames; its back half is the decoder,
  * the generator's harmonic source and the generator. voice.bin's names
  * (daemon/voice_pack.c) for the weights; the kernels and their layouts in
- * voice_ops.c.
+ * nnkit/nn_ops.c.
  *
  * The arithmetic is the graph's, in the order ONNX Runtime computes it with its
  * graph optimisations on, to the bit, as far as the inverse STFT at the very
@@ -20,7 +20,7 @@
  * comes out at 25 dB. So every step is the bits ONNX Runtime computes: its
  * quantisation, its integer products (exact), the scale and bias in its order,
  * its LayerNormalization, SkipLayerNormalization, InstanceNormalization,
- * softmax, FastGelu, sigmoid, tanh, sin and atan (voice_ops.c), its float
+ * softmax, FastGelu, sigmoid, tanh, sin and atan (nnkit/nn_ops.c), its float
  * products (fused multiply-adds in its order) and its vectorised ReduceSum. The
  * harmonic source's phase is exact for a third reason: it is a running sum of
  * the pitch, so any difference there grows along the sentence.
@@ -125,22 +125,22 @@ static int qs_need(qscratch *s, size_t qn, size_t accn, size_t wbn) {
 static int qlinear(qscratch *s, const voice_tensor *w, const float *bias, const float *x, int m, int k, int ldx,
                    int n, float *y, int ldy) {
     int kp = w->dims[1];
-    if (w->dims[0] < n || kp < k || kp % VOICE_CPAD) return -1;
-    if (qs_need(s, (size_t)m * kp, (size_t)m * n, VOICE_WBUF(1, kp)) != 0) return -1;
-    voice_qparam qp;
-    voice_quantize(x, m, k, ldx, s->q, kp, &qp);
-    voice_matmul_q(s->q, m, kp, (const int8_t *)w->data, w->zero_point, n, s->acc, n, s->wbuf);
-    voice_dequant(s->acc, m, n, n, qp.scale * w->scale, bias, y, ldy);
+    if (w->dims[0] < n || kp < k || kp % NN_CPAD) return -1;
+    if (qs_need(s, (size_t)m * kp, (size_t)m * n, NN_WBUF(1, kp)) != 0) return -1;
+    nn_qparam qp;
+    nn_quantize(x, m, k, ldx, s->q, kp, &qp);
+    nn_matmul_q(s->q, m, kp, (const int8_t *)w->data, w->zero_point, n, s->acc, n, s->wbuf);
+    nn_dequant(s->acc, m, n, n, qp.scale * w->scale, bias, y, ldy);
     return 0;
 }
 
 /* The same quantised input against several weights (q, k and v share one
  * DynamicQuantizeLinear). */
-static int qlinear_q(qscratch *s, int kp, const voice_qparam *qp, const voice_tensor *w, const float *bias, int m,
+static int qlinear_q(qscratch *s, int kp, const nn_qparam *qp, const voice_tensor *w, const float *bias, int m,
                      int n, float *y, int ldy) {
     if (w->dims[0] < n || w->dims[1] != kp) return -1;
-    voice_matmul_q(s->q, m, kp, (const int8_t *)w->data, w->zero_point, n, s->acc, n, s->wbuf);
-    voice_dequant(s->acc, m, n, n, qp->scale * w->scale, bias, y, ldy);
+    nn_matmul_q(s->q, m, kp, (const int8_t *)w->data, w->zero_point, n, s->acc, n, s->wbuf);
+    nn_dequant(s->acc, m, n, n, qp->scale * w->scale, bias, y, ldy);
     return 0;
 }
 
@@ -151,16 +151,16 @@ static int qlinear_q(qscratch *s, int kp, const voice_qparam *qp, const voice_te
 static int qconv_ex(qscratch *s, const voice_tensor *w, const float *bias, const float *x, int t, int cin, int ldx,
                     int stride, int dil, int pad, int t_out, int cout, float *y, int ldy) {
     int k = w->dims[1], cp = w->dims[2];
-    if (w->dims[0] < cout || cp < cin || cp % VOICE_CPAD || (size_t)k * cp > 32768 || t_out < 1) return -1;
+    if (w->dims[0] < cout || cp < cin || cp % NN_CPAD || (size_t)k * cp > 32768 || t_out < 1) return -1;
     size_t need = (size_t)(t_out - 1) * stride + (size_t)(k - 1) * dil + 1, rows = (size_t)t + 2 * pad;
     if (rows < need) rows = need;
-    if (qs_need(s, rows * cp, (size_t)t_out * cout, VOICE_WBUF(k, cp)) != 0) return -1;
-    voice_qparam qp;
+    if (qs_need(s, rows * cp, (size_t)t_out * cout, NN_WBUF(k, cp)) != 0) return -1;
+    nn_qparam qp;
     memset(s->q, 0, sizeof *s->q * (size_t)pad * cp);
-    voice_quantize(x, t, cin, ldx, s->q + (size_t)pad * cp, cp, &qp);
+    nn_quantize(x, t, cin, ldx, s->q + (size_t)pad * cp, cp, &qp);
     memset(s->q + ((size_t)pad + t) * cp, 0, sizeof *s->q * (rows - pad - t) * cp);
-    voice_conv_q(s->q, t_out, stride, dil, k, cp, w->data, w->zero_point, cout, s->acc, cout, s->wbuf);
-    voice_dequant(s->acc, t_out, cout, cout, qp.scale * w->scale, bias, y, ldy);
+    nn_conv_q(s->q, t_out, stride, dil, k, cp, w->data, w->zero_point, cout, s->acc, cout, s->wbuf);
+    nn_dequant(s->acc, t_out, cout, cout, qp.scale * w->scale, bias, y, ldy);
     return 0;
 }
 
@@ -173,10 +173,10 @@ static int qconv(qscratch *s, const voice_tensor *w, const float *bias, const fl
 
 /* A DynamicQuantizeLSTM's weights, both directions, from voice.bin: <base>.fwd.*
  * and <base>.bwd.* */
-static int get_lstm(wctx *w, const char *base, int in, voice_lstm *l) {
+static int get_lstm(wctx *w, const char *base, int in, nn_lstm *l) {
     memset(l, 0, sizeof *l);
     l->hidden = LH;
-    l->in_pad = VOICE_ROUND(in, VOICE_CPAD);
+    l->in_pad = NN_ROUND(in, NN_CPAD);
     static const char *dir[2] = { "fwd", "bwd" };
     for (int d = 0; d < 2; d++) {
         char name[VOICE_NAME_MAX];
@@ -198,10 +198,10 @@ static int get_lstm(wctx *w, const char *base, int in, voice_lstm *l) {
 }
 
 /* A bidirectional LSTM over t rows of `in` (ldx apart) into t rows of 2 * LH. */
-static int lstm(const voice_lstm *l, const float *x, int t, int in, int ldx, float *y) {
-    void *scratch = malloc(voice_lstm_scratch(t, l->in_pad, l->hidden));
+static int lstm(const nn_lstm *l, const float *x, int t, int in, int ldx, float *y) {
+    void *scratch = malloc(nn_lstm_scratch(t, l->in_pad, l->hidden));
     if (!scratch) return -1;
-    voice_lstm_run(l, 2, x, t, in, ldx, y, 2 * LH, scratch);
+    nn_lstm_run(l, 2, x, t, in, ldx, y, 2 * LH, scratch);
     free(scratch);
     return 0;
 }
@@ -268,27 +268,27 @@ static int context(qscratch *s, wctx *w, const int *ids, int T, float *out /* T 
     for (int t = 0; t < T; t++)
         for (int c = 0; c < CTX_E; c++)
             e[(size_t)t * CTX_E + c] = (tok[(size_t)ids[t] * CTX_E + c] + typ[c]) + pos[(size_t)t * CTX_E + c];
-    voice_layernorm(e, T, CTX_E, CTX_E, eg, eb, ee[0]);
+    nn_layernorm(e, T, CTX_E, CTX_E, eg, eb, ee[0]);
     if (qlinear(s, win, bin, e, T, CTX_E, CTX_E, CTX_H, x, CTX_H) != 0) goto out;
 
     float scale = sqrtf(1.0f / sqrtf((float)dh));
     for (int pass = 0; pass < CTX_LAYERS; pass++) {
         int kp = wq->dims[1];
-        voice_qparam qp;
-        if (qs_need(s, (size_t)T * kp, (size_t)T * CTX_H, VOICE_WBUF(1, kp)) != 0) goto out;
-        voice_quantize(x, T, CTX_H, CTX_H, s->q, kp, &qp);
+        nn_qparam qp;
+        if (qs_need(s, (size_t)T * kp, (size_t)T * CTX_H, NN_WBUF(1, kp)) != 0) goto out;
+        nn_quantize(x, T, CTX_H, CTX_H, s->q, kp, &qp);
         if (qlinear_q(s, kp, &qp, wq, bq, T, CTX_H, q, CTX_H) != 0 || qlinear_q(s, kp, &qp, wk, bk, T, CTX_H, k, CTX_H) != 0 ||
             qlinear_q(s, kp, &qp, wv, bv, T, CTX_H, v, CTX_H) != 0)
             goto out;
         /* The mask adds 0 to every score: one sequence, no padding. */
-        voice_attention(q, k, v, CTX_H, T, CTX_HEADS, dh, scale, NULL, a, CTX_H, sc);
+        nn_attention(q, k, v, CTX_H, T, CTX_HEADS, dh, scale, NULL, a, CTX_H, sc);
         if (qlinear(s, wo, bo, a, T, CTX_H, CTX_H, CTX_H, q, CTX_H) != 0) goto out;
         for (size_t i = 0; i < th; i++) a[i] = x[i] + q[i];
-        voice_layernorm(a, T, CTX_H, CTX_H, g1, b1, e1[0]);
+        nn_layernorm(a, T, CTX_H, CTX_H, g1, b1, e1[0]);
         if (qlinear(s, wf, bf, a, T, CTX_H, CTX_H, CTX_FF, ff, CTX_FF) != 0) goto out;
-        voice_gelu(ff, (size_t)T * CTX_FF);
+        nn_gelu(ff, (size_t)T * CTX_FF);
         if (qlinear(s, wf2, bf2, ff, T, CTX_FF, CTX_FF, CTX_H, x, CTX_H) != 0) goto out;
-        voice_skip_layernorm(x, a, T, CTX_H, CTX_H, CTX_H, g2, b2, e2[0]);
+        nn_skip_layernorm(x, a, T, CTX_H, CTX_H, CTX_H, g2, b2, e2[0]);
     }
     if (qlinear(s, wout, bout, x, T, CTX_H, CTX_H, D, out, D) != 0) goto out;
     rc = 0;
@@ -302,7 +302,7 @@ out:
 /* d (T x DS): three LSTMs, each followed by an AdaLayerNorm, over the context
  * encoder's output with the style appended to every row. */
 static int duration_encoder(qscratch *s, wctx *w, const float *ctx, int T, const float *sty, float *d) {
-    voice_lstm l[3];
+    nn_lstm l[3];
     char name[VOICE_NAME_MAX];
     const float *eps = wgetf(w, "norm.eps", 1);
     for (int i = 0; i < 3; i++) {
@@ -321,7 +321,7 @@ static int duration_encoder(qscratch *s, wctx *w, const float *ctx, int T, const
         float gamma[D], beta[D];
         snprintf(name, sizeof name, "pro.enc.%d.ada", i);
         if (lstm(&l[i], d, T, DS, DS, h) != 0 || ada(s, w, name, sty, D, gamma, beta) != 0) goto out;
-        voice_layernorm(h, T, D, D, NULL, NULL, eps[0]);
+        nn_layernorm(h, T, D, D, NULL, NULL, eps[0]);
         affine(h, T, D, D, gamma, beta);
         for (int t = 0; t < T; t++) memcpy(d + (size_t)t * DS, h + (size_t)t * D, sizeof(float) * D);
     }
@@ -339,7 +339,7 @@ static float round_even(float v) {
 
 /* Per token: round(sum of sigmoid(proj(lstm(d)))) / speed), at least 1. */
 static int durations(wctx *w, const float *d, int T, float speed, float *raw, int *dur) {
-    voice_lstm l;
+    nn_lstm l;
     if (get_lstm(w, "pro.dur.lstm", DS, &l) != 0) return -1;
     voice_tensor pw;
     const float *pb = wgetf(w, "pro.dur.proj.b", DUR_BINS);
@@ -351,12 +351,12 @@ static int durations(wctx *w, const float *d, int T, float speed, float *raw, in
     float *h = malloc(sizeof(float) * (size_t)T * D), *p = malloc(sizeof(float) * (size_t)T * DUR_BINS);
     int rc = -1;
     if (!h || !p || lstm(&l, d, T, DS, DS, h) != 0) goto out;
-    voice_matmul_fma(h, T, D, D, (const float *)pw.data, DUR_BINS, pw.dims[1], p, DUR_BINS);
+    nn_matmul_fma(h, T, D, D, (const float *)pw.data, DUR_BINS, pw.dims[1], p, DUR_BINS);
     for (int t = 0; t < T; t++)
         for (int b = 0; b < DUR_BINS; b++) p[(size_t)t * DUR_BINS + b] = pb[b] + p[(size_t)t * DUR_BINS + b];
-    voice_logistic(p, (size_t)T * DUR_BINS);
+    nn_logistic(p, (size_t)T * DUR_BINS);
     for (int t = 0; t < T; t++) {
-        raw[t] = voice_reduce_sum(p + (size_t)t * DUR_BINS, DUR_BINS, (size_t)t * DUR_BINS) / speed;
+        raw[t] = nn_reduce_sum(p + (size_t)t * DUR_BINS, DUR_BINS, (size_t)t * DUR_BINS) / speed;
         dur[t] = voice_round_duration(raw[t]);
     }
     rc = 0;
@@ -404,7 +404,7 @@ static int text_encoder(qscratch *s, wctx *w, const int *ids, int T, float *out 
         snprintf(name, sizeof name, "txt.cnn.%d.ln.eps", i);
         le[i] = wgetf(w, name, 1);
     }
-    voice_lstm l;
+    nn_lstm l;
     if (get_lstm(w, "txt.lstm", D, &l) != 0 || w->missing) return -1;
     float *x = malloc(sizeof(float) * (size_t)T * D * 2);
     if (!x) return -1;
@@ -413,8 +413,8 @@ static int text_encoder(qscratch *s, wctx *w, const int *ids, int T, float *out 
     for (int t = 0; t < T; t++) memcpy(x + (size_t)t * D, emb + (size_t)ids[t] * D, sizeof(float) * D);
     for (int i = 0; i < 3; i++) {
         if (cw[i].dims[1] != TXT_K || qconv(s, &cw[i], cb[i], x, T, D, D, D, y, D) != 0) goto out;
-        voice_layernorm(y, T, D, D, lg[i], lb[i], le[i][0]);
-        voice_leaky_relu(y, (size_t)T * D, 0.2f);
+        nn_layernorm(y, T, D, D, lg[i], lb[i], le[i][0]);
+        nn_leaky_relu(y, (size_t)T * D, 0.2f);
         memcpy(x, y, sizeof(float) * (size_t)T * D);
     }
     if (lstm(&l, x, T, D, D, out) != 0) goto out;
@@ -472,20 +472,20 @@ static int adain_block(qscratch *s, wctx *w, const char *base, const float *sty,
     memcpy(r, x, sizeof(float) * (size_t)t * cin);
     snprintf(name, sizeof name, "%s.ada1", base);
     if (ada(s, w, name, sty, cin, g, be) != 0) goto out;
-    voice_instnorm(r, t, cin, cin, NULL, NULL, eps[0]);
+    nn_instnorm(r, t, cin, cin, NULL, NULL, eps[0]);
     affine(r, t, cin, cin, g, be);
-    voice_leaky_relu(r, (size_t)t * cin, 0.2f);
+    nn_leaky_relu(r, (size_t)t * cin, 0.2f);
     if (up) {
         /* Depthwise ConvTranspose: kernel 3, stride 2, padding 1, output padding 1. */
-        voice_convt_dw(r, t, cin, cin, 3, 2, 1, pw, pb, to, h, cin);
+        nn_convt_dw(r, t, cin, cin, 3, 2, 1, pw, pb, to, h, cin);
         memcpy(r, h, sizeof(float) * (size_t)to * cin);
     }
     if (qconv(s, &c1, b1, r, to, cin, cin, cout, h, cout) != 0) goto out;
     snprintf(name, sizeof name, "%s.ada2", base);
     if (ada(s, w, name, sty, cout, g, be) != 0) goto out;
-    voice_instnorm(h, to, cout, cout, NULL, NULL, eps[0]);
+    nn_instnorm(h, to, cout, cout, NULL, NULL, eps[0]);
     affine(h, to, cout, cout, g, be);
-    voice_leaky_relu(h, (size_t)to * cout, 0.2f);
+    nn_leaky_relu(h, (size_t)to * cout, 0.2f);
     if (qconv(s, &c2, b2, h, to, cout, cout, cout, r, cout) != 0) goto out;
     /* The shortcut: [nearest upsample], [1x1 conv without bias]; the sum over sqrt 2. */
     if (up) {
@@ -582,7 +582,7 @@ int voice_front_run(const voice *v, const int *ids, int T, const float *style, f
      * frame are the token's row, exactly. */
     voice_expand(f->txt, D, D, ft, F, f->asr, D);
     voice_expand(d, DS, DS, ft, F, en, DS);
-    voice_lstm l;
+    nn_lstm l;
     if (get_lstm(&w, "pro.lstm", DS, &l) != 0 || lstm(&l, en, F, DS, DS, sh) != 0) goto fail;
     if (curve(&s, &w, "f0", sh, F, sty, f->f0) != 0 || curve(&s, &w, "n", sh, F, sty, f->n) != 0) goto fail;
     rc = 0;
@@ -809,18 +809,18 @@ int voice_source(const voice *v, const float *f0, int frames, int noise, uint64_
         resize_at((int)l, (float)SRC_UP, n2, &a, &b, &w1, &w2);
         for (int h = 0; h < SRC_HARM; h++)
             ph[h] = resize9(cum[(size_t)a * SRC_HARM + h], cum[(size_t)b * SRC_HARM + h], w1, w2, h == SRC_HARM - 1);
-        voice_sin(ph, sn, SRC_HARM);
+        nn_sin(ph, sn, SRC_HARM);
         float uv = f0[l / SRC_UP] > SRC_VOICED ? 1.0f : 0.0f;
         float amp = uv * SRC_NOISE_V + ((1.0f - uv) * SRC_AMP) / 3.0f;
         float m = 0;
         for (int h = 0; h < SRC_HARM; h++) {
             float nz = noise ? amp * voice_rng_normal(&rng) : 0.0f;
             if (noise_out) noise_out[l * SRC_HARM + h] = nz;
-            m = voice_fma((sn[h] * SRC_AMP) * uv + nz, lwv[h * lw.dims[1]], m);
+            m = nn_fma((sn[h] * SRC_AMP) * uv + nz, lwv[h * lw.dims[1]], m);
         }
         sig[STFT_N / 2 + l] = lb[0] + m;
     }
-    voice_tanh(sig + STFT_N / 2, L);
+    nn_tanh(sig + STFT_N / 2, L);
     for (int i = 0; i < STFT_N / 2; i++) {
         sig[i] = sig[STFT_N / 2];
         sig[STFT_N / 2 + L + i] = sig[STFT_N / 2 + L - 1];
@@ -828,15 +828,15 @@ int voice_source(const voice *v, const float *f0, int frames, int noise, uint64_
     /* The forward STFT (two strided convolutions with fixed bases), then each
      * bin's magnitude and phase as the graph computes them. */
     float *re = spec, *im = spec + (size_t)T * STFT_BINS;
-    voice_matmul_fma(sig, T, STFT_N, STFT_HOP, (const float *)sre.data, STFT_BINS, sre.dims[1], re, STFT_BINS);
-    voice_matmul_fma(sig, T, STFT_N, STFT_HOP, (const float *)sim.data, STFT_BINS, sim.dims[1], im, STFT_BINS);
+    nn_matmul_fma(sig, T, STFT_N, STFT_HOP, (const float *)sre.data, STFT_BINS, sre.dims[1], re, STFT_BINS);
+    nn_matmul_fma(sig, T, STFT_N, STFT_HOP, (const float *)sim.data, STFT_BINS, sim.dims[1], im, STFT_BINS);
     /* The quotients im / re bin by bin (the graph's channel-major order, which
      * decides which few its atan leaves to the C library), their atan, then
      * the quadrant from the signs. */
     float *q = sig, *at = sig + (size_t)T * STFT_BINS;
     for (int k = 0; k < STFT_BINS; k++)
         for (int t = 0; t < T; t++) q[(size_t)k * T + t] = im[(size_t)t * STFT_BINS + k] / re[(size_t)t * STFT_BINS + k];
-    voice_atan(q, at, (size_t)T * STFT_BINS);
+    nn_atan(q, at, (size_t)T * STFT_BINS);
     for (int t = 0; t < T; t++)
         for (int k = 0; k < STFT_BINS; k++) {
             float r = re[(size_t)t * STFT_BINS + k], i = im[(size_t)t * STFT_BINS + k], a = at[(size_t)k * T + t];
@@ -885,15 +885,15 @@ static int gen_block(qscratch *s, wctx *w, const char *base, const float *sty, f
         memcpy(a, x, sizeof(float) * (size_t)t * c);
         snprintf(name, sizeof name, "%s.ada1.%d", base, j);
         if (ada(s, w, name, sty, c, g, be) != 0) goto out;
-        voice_instnorm(a, t, c, c, NULL, NULL, eps[0]);
+        nn_instnorm(a, t, c, c, NULL, NULL, eps[0]);
         affine(a, t, c, c, g, be);
-        voice_snake(a, t, c, c, al1, in1);
+        nn_snake(a, t, c, c, al1, in1);
         if (qconv_ex(s, &c1, b1, a, t, c, c, 1, DIL[j], (k - 1) * DIL[j] / 2, t, c, b, c) != 0) goto out;
         snprintf(name, sizeof name, "%s.ada2.%d", base, j);
         if (ada(s, w, name, sty, c, g, be) != 0) goto out;
-        voice_instnorm(b, t, c, c, NULL, NULL, eps[0]);
+        nn_instnorm(b, t, c, c, NULL, NULL, eps[0]);
         affine(b, t, c, c, g, be);
-        voice_snake(b, t, c, c, al2, in2);
+        nn_snake(b, t, c, c, al2, in2);
         if (qconv_ex(s, &c2, b2, b, t, c, c, 1, 1, (c2.dims[1] - 1) / 2, t, c, a, c) != 0) goto out;
         for (size_t i = 0; i < (size_t)t * c; i++) x[i] = a[i] + x[i];
     }
@@ -932,8 +932,8 @@ static int gen_up(wctx *w, int i, const float *x, int t, int cin, int t_out, int
     float *p = calloc((size_t)(t + 2 * mt) * cin, sizeof(float));
     if (!p) return -1;
     memcpy(p + (size_t)(mt - 1) * cin, x, sizeof(float) * (size_t)t * cin);
-    voice_leaky_relu(p + (size_t)(mt - 1) * cin, (size_t)t * cin, 0.1f);
-    voice_convt(p, t, cin, k, st, pad, (const float *)wt.data, bias, cout, t_out, y, ldy);
+    nn_leaky_relu(p + (size_t)(mt - 1) * cin, (size_t)t * cin, 0.1f);
+    nn_convt(p, t, cin, k, st, pad, (const float *)wt.data, bias, cout, t_out, y, ldy);
     free(p);
     return 0;
 }
@@ -982,9 +982,9 @@ int voice_generate(const voice *v, const float *dec, const float *har, int frame
 
     /* The output convolution to 11 log-magnitudes and 11 phase inputs, and the
      * inverse STFT, trimmed to 600 samples per frame. */
-    voice_leaky_relu(x, (size_t)T1 * GEN_W1, 0.01f);
+    nn_leaky_relu(x, (size_t)T1 * GEN_W1, 0.01f);
     if (qconv(&s, &post, pb, x, T1, GEN_W1, GEN_W1, HAR, a, HAR) != 0) goto out;
-    voice_istft(a, T1, HAR, STFT_BINS, ir, ii, STFT_N, STFT_HOP, STFT_N / 2, pcm, full);
+    nn_istft(a, T1, HAR, STFT_BINS, ir, ii, STFT_N, STFT_HOP, STFT_N / 2, pcm, full);
     rc = 0;
 out:
     if (rc != 0) {

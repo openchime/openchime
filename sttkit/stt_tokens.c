@@ -1,19 +1,11 @@
-/* Moonshine's tokenizer, decoding only (stt_moonshine.h). No ONNX Runtime. */
-#include "stt_moonshine.h"
+/* The recognizer's tokenizer, decoding only (sttkit.h). */
+#include "sttkit.h"
 
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
-const char *const MOONSHINE_FILE_NAMES[MOONSHINE_FILES] = {
-    "frontend.model.ort", "frontend.weights.ort", "encoder.ort", "adapter.ort",
-    "cross_kv.ort",       "decoder_kv.ort",       "tokenizer.bin", "streaming_config.json",
-};
-
-/* tokenizer.bin is one record per token id, in order: a length byte, or two
- * when the first has its top bit set (len = second * 128 + first - 128), then
- * that many bytes. A zero length is an unused id. */
-int moonshine_tokens_load(moonshine_tokens *t, const uint8_t *data, size_t len) {
+int stt_tokens_load(stt_tokens *t, const uint8_t *data, size_t len) {
     memset(t, 0, sizeof *t);
     uint32_t count = 0;
     for (size_t off = 0; off < len; count++) {
@@ -28,12 +20,12 @@ int moonshine_tokens_load(moonshine_tokens *t, const uint8_t *data, size_t len) 
     if (!count) return -1;
     t->bytes = malloc(count * sizeof *t->bytes);
     t->len = malloc(count * sizeof *t->len);
-    if (!t->bytes || !t->len) { moonshine_tokens_free(t); return -1; }
+    if (!t->bytes || !t->len) { stt_tokens_free(t); return -1; }
     size_t off = 0;
     for (uint32_t i = 0; i < count; i++) {
         size_t n = data[off++];
         if (n >= 128) n = (size_t)data[off++] * 128 + n - 128;
-        if (n > 0xFFFF) { moonshine_tokens_free(t); return -1; }
+        if (n > 0xFFFF) { stt_tokens_free(t); return -1; }
         t->bytes[i] = data + off;
         t->len[i] = (uint16_t)n;
         off += n;
@@ -42,13 +34,13 @@ int moonshine_tokens_load(moonshine_tokens *t, const uint8_t *data, size_t len) 
     return 0;
 }
 
-void moonshine_tokens_free(moonshine_tokens *t) {
+void stt_tokens_free(stt_tokens *t) {
     free(t->bytes);
     free(t->len);
     memset(t, 0, sizeof *t);
 }
 
-long moonshine_detok(const moonshine_tokens *t, const int64_t *ids, size_t n, char *out, size_t cap) {
+long stt_detok(const stt_tokens *t, const int64_t *ids, size_t n, char *out, size_t cap) {
     if (!t->count || !cap) return -1;
     static const char MARK[] = "\xE2\x96\x81"; /* U+2581, the word marker */
     size_t w = 0;
@@ -85,8 +77,8 @@ long moonshine_detok(const moonshine_tokens *t, const int64_t *ids, size_t n, ch
     return (long)w;
 }
 
-size_t moonshine_max_tokens(size_t samples) {
-    double seconds = (double)samples / MOONSHINE_RATE;
-    size_t n = (size_t)ceil(seconds * MOONSHINE_TOKENS_PER_SECOND);
-    return n > MOONSHINE_MAX_TOKENS ? MOONSHINE_MAX_TOKENS : n;
+size_t stt_max_tokens(size_t samples) {
+    double seconds = (double)samples / STT_RATE;
+    size_t n = (size_t)ceil(seconds * STT_TOKENS_PER_SECOND);
+    return n > STT_MAX_TOKENS ? STT_MAX_TOKENS : n;
 }

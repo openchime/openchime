@@ -4,12 +4,12 @@
 #   scripts/release/zig_cc.sh cc|c++ TARGET [FLAG...] -- compiler arguments
 #
 # The release build (make RELEASE=1, and every cross build) compiles everything
-# with this as CC/CXX, ONNX Runtime included (ARCH-111). Everything
-# passes through untouched except -march on arm64, which zig does not accept:
-# ONNX Runtime and KleidiAI ask for instruction sets as -march=armv8.2-a+fp16,
-# and zig takes the same request as -mcpu=generic+v8_2a+fullfp16 (plus the
-# original, for the assembler). Unrecognised, the flag is an error ("unknown
-# CPU"), and ONNX Runtime refuses to configure.
+# with this as CC/CXX, the vendored C++ libraries included. Everything passes
+# through untouched except -march on arm64, which zig does not accept: a
+# library's build that asks for instruction sets as -march=armv8.2-a+fp16 gets
+# the same request as -mcpu=generic+v8_2a+fullfp16 (plus the original, for the
+# assembler). Unrecognised, the flag is an error ("unknown CPU"), and such a
+# build refuses to configure.
 set -eu
 
 tool="$1"

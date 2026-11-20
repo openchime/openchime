@@ -101,7 +101,7 @@ const cfg_row OC_CFG[] = {
            "`OPENCHIME_S3`'s value, read from this file instead (mode 0600; a trailing newline is ignored), so the key and secret are not in the environment. Set one or the other, not both.",
            cfg_parse_s3_file, 0),
     BOOL("OPENCHIME_TTS", CFG_OPERATOR, G_FLAG, "on", "Read-aloud (ARCH-111), in a build that carries it. While it reads aloud the daemon holds up to 170 MB, against about 25 MB idle (TESTING.md, \"Speech models' memory\"); off saves that.", tts.enabled),
-    BOOL("OPENCHIME_STT", CFG_OPERATOR, G_FLAG, "on", "Voice input (ARCH-112), in a build that carries it. While it hears a segment the daemon holds about 150 MB, against about 25 MB idle (TESTING.md, \"Speech models' memory\"); off saves that.", stt.enabled),
+    BOOL("OPENCHIME_STT", CFG_OPERATOR, G_FLAG, "on", "Voice input (ARCH-112), in a build that carries it. While it hears a segment the daemon holds about 55 MB, 40 MB of it the mapped model, against about 25 MB idle (TESTING.md, \"Speech models' memory\"); off saves that.", stt.enabled),
     CUSTOM("OPENCHIME_SUMMARY", CFG_OPERATOR, G_FLAG, "off",
            "Summaries (REQ-310): `off`, `local` (the model runs inside the daemon, fetched on first start), or `cloud:<url>,<model>` (a hosted API's base URL and the model there).",
            cfg_parse_summary, 0),

@@ -2,7 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "stt.h"
 
-#include "stt_moonshine.h"
+#include "sttkit.h"
 #include "stt_render.h"
 #include "stt_worker.h"
 #include "tts_data.h"
@@ -33,52 +33,47 @@ int oc_stt_data_ready(char *err, size_t errcap) {
 /* ---- the engine ------------------------------------------------------------------ */
 
 typedef struct {
-    moonshine  *model;
-    oc_tts_map  files[MOONSHINE_FILES];   /* consumed in place: they outlive the model */
-} moonshine_engine;
+    recognizer *model;
+    oc_tts_map  file;            /* recognizer.bin, used in place: it outlives the model */
+} rec_engine;
 
 static void engine_close(void *engine) {
-    moonshine_engine *e = engine;
+    rec_engine *e = engine;
     if (!e) return;
-    moonshine_close(e->model);
-    for (int i = 0; i < MOONSHINE_FILES; i++) oc_tts_map_close(&e->files[i]);
+    recognizer_close(e->model);
+    oc_tts_map_close(&e->file);
     free(e);
 }
 
 static void *engine_open(void *ctx, char *err, size_t errcap) {
     (void)ctx;
     if (!g_data_dir[0]) { snprintf(err, errcap, "no recognizer data"); return NULL; }
-    moonshine_engine *e = calloc(1, sizeof *e);
+    rec_engine *e = calloc(1, sizeof *e);
     if (!e) { snprintf(err, errcap, "out of memory"); return NULL; }
-    moonshine_blob blobs[MOONSHINE_FILES];
-    for (int i = 0; i < MOONSHINE_FILES; i++) {
-        char path[1024];
-        snprintf(path, sizeof path, "%s/%s", g_data_dir, MOONSHINE_FILE_NAMES[i]);
-        if (oc_tts_map_open(path, &e->files[i]) != 0) {
-            snprintf(err, errcap, "cannot map %s", path);
-            engine_close(e);
-            return NULL;
-        }
-        blobs[i].data = e->files[i].p;
-        blobs[i].len = e->files[i].n;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/recognizer.bin", g_data_dir);
+    if (oc_tts_map_open(path, &e->file) != 0) {
+        snprintf(err, errcap, "cannot map %s", path);
+        engine_close(e);
+        return NULL;
     }
     char why[256] = "";
-    e->model = moonshine_open(blobs, why, sizeof why);
+    e->model = recognizer_open_mem(e->file.p, e->file.n, why, sizeof why);
     if (!e->model) { snprintf(err, errcap, "recognizer: %s", why); engine_close(e); return NULL; }
     return e;
 }
 
 static int engine_hear(void *engine, const int16_t *pcm, size_t samples, char **text, char *err, size_t errcap) {
-    moonshine_engine *e = engine;
+    rec_engine *e = engine;
     float *f = malloc((samples ? samples : 1) * sizeof(float));
     if (!f) { snprintf(err, errcap, "out of memory"); return -1; }
     for (size_t i = 0; i < samples; i++) f[i] = (float)pcm[i] / 32768.0f;
-    int rc = moonshine_hear(e->model, f, samples, text, err, errcap);
+    int rc = recognizer_hear(e->model, f, samples, text, err, errcap);
     free(f);
     return rc;
 }
 
-static const oc_stt_engine MOONSHINE_ENGINE = {
+static const oc_stt_engine RECOGNIZER_ENGINE = {
     .version = OC_STT_MODEL_VERSION,
     .lang = OC_STT_LANG,
     .ctx = NULL,
@@ -88,7 +83,7 @@ static const oc_stt_engine MOONSHINE_ENGINE = {
 };
 
 const oc_stt_engine *oc_stt_engine_for(const char *lang) {
-    if (lang && *lang && strcmp(lang, MOONSHINE_ENGINE.lang) == 0) return &MOONSHINE_ENGINE;
+    if (lang && *lang && strcmp(lang, RECOGNIZER_ENGINE.lang) == 0) return &RECOGNIZER_ENGINE;
     return NULL;
 }
 
@@ -142,10 +137,10 @@ static int16_t *read_wav_16k(const char *path, size_t *out_n, char *err, size_t 
     }
     if (!rate || !data) { free(b); snprintf(err, cap, "%s: no format or data", path); return NULL; }
     size_t in_n = data_len / 2;
-    size_t n = (size_t)((double)in_n * MOONSHINE_RATE / rate);
+    size_t n = (size_t)((double)in_n * STT_RATE / rate);
     int16_t *out = malloc((n ? n : 1) * sizeof *out);
     if (!out) { free(b); snprintf(err, cap, "out of memory"); return NULL; }
-    double ratio = (double)rate / MOONSHINE_RATE, cutoff = ratio > 1 ? 1.0 / ratio : 1.0;
+    double ratio = (double)rate / STT_RATE, cutoff = ratio > 1 ? 1.0 / ratio : 1.0;
     const int taps = 16;
     for (size_t i = 0; i < n; i++) {
         double x = (double)i * ratio, acc = 0, wsum = 0;
@@ -178,12 +173,12 @@ int oc_stt_hear(const char *path) {
     double t1 = now_s();
     char *text = NULL;
     err[0] = '\0';
-    int rc = oc_stt_hear_windowed(&MOONSHINE_ENGINE, engine, pcm, n, &text, err, sizeof err);   /* as the daemon hears */
+    int rc = oc_stt_hear_windowed(&RECOGNIZER_ENGINE, engine, pcm, n, &text, err, sizeof err);   /* as the daemon hears */
     double t2 = now_s();
     engine_close(engine);
     free(pcm);
     if (rc != 0) { fprintf(stderr, "openchimed: %s\n", err); return 1; }
-    double secs = (double)n / MOONSHINE_RATE;
+    double secs = (double)n / STT_RATE;
     printf("%s\n", text);
     fprintf(stderr, "openchimed: model loaded in %.2f s; %.1f s of audio heard in %.2f s (%.2fx real time)\n",
             t1 - t0, secs, t2 - t1, secs > 0 ? (t2 - t1) / secs : 0.0);

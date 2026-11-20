@@ -2,11 +2,11 @@
  * OpenChime — voice-input recognition built into the daemon (REQ-296–300,
  * ARCH-112, docs/VOICE-INPUT.md §6).
  *
- * The Moonshine engine (stt_render.h). The code is in the binary; the model's
- * graphs and tokenizer are files in a data directory of their own, mapped when
- * the engine opens, so missing recognizer data turns voice input off without
- * touching read-aloud. Compiled only into a daemon built with voice input
- * (make STT=1, the default).
+ * The recognizer engine (stt_render.h), run by sttkit in plain C
+ * (docs/STTKIT.md). The code is in the binary; the model is one file,
+ * recognizer.bin, in a data directory of its own, mapped when the engine opens,
+ * so missing recognizer data turns voice input off without touching
+ * read-aloud. Compiled only into a daemon built with voice input (make STT=1).
  */
 #ifndef OC_STT_H
 #define OC_STT_H
@@ -16,10 +16,10 @@
 /* The language this daemon hears. */
 #define OC_STT_LANG "en-US"
 
-/* The model and the published files together, as the manifest and STT_INFO
- * name them. The files are pinned by SHA-256 in scripts/build/moonshine.sh;
- * change them and change this. */
-#define OC_STT_MODEL_VERSION OC_STT_LANG "/moonshine-tiny-streaming/quantized_26_08_21"
+/* The model, as the manifest and STT_INFO name it. recognizer.bin is made from
+ * the published files docs/VENDORS.md pins; a different model, or a different
+ * forward pass that hears differently, changes this. */
+#define OC_STT_MODEL_VERSION OC_STT_LANG "/recognizer/1"
 
 #define OC_STT_DATA_SYSTEM_DIR "/usr/share/openchime/stt"
 

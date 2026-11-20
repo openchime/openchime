@@ -1,4 +1,4 @@
-/* The voice model's compute kernels (tts_priv.h has the contracts and layouts).
+/* The neural network kernels (nnkit.h has the contracts and layouts).
  *
  * Written for GCC's and clang's auto-vectorisers at the build's -O2, where GCC
  * only vectorises a loop whose trip count is a known multiple of the vector
@@ -11,14 +11,14 @@
  * several sums. The 8-bit weights are widened to int16, four rows at a time,
  * into a small scratch reused across every time step; the file keeps them at
  * 8 bits. Float reductions use 16 partial sums, an order fixed by the source. */
-#include "tts_priv.h"
+#include "nnkit.h"
 
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define QB 64      /* integer dot products: block length */
-#define QT 16      /* ... and the tail step (rows are multiples of VOICE_CPAD) */
+#define QT 16      /* ... and the tail step (rows are multiples of NN_CPAD) */
 #define FL 16      /* float lanes */
 
 static inline int imin(int a, int b) { return a < b ? a : b; }
@@ -37,9 +37,9 @@ static inline float rint_even(float v) {
  * the same steps on the same constants, so the results are the same bits.
  *
  * The array versions run 16 values at a time with each fused multiply-add done
- * in double (exact products, so one rounding to double, as voice_fma) and any
+ * in double (exact products, so one rounding to double, as nn_fma) and any
  * step that lands halfway between two floats noted; a block with one is done
- * again a value at a time with voice_fma. Both give the fused results; the
+ * again a value at a time with nn_fma. Both give the fused results; the
  * first vectorises. */
 
 /* Sigmoid: x clamped to +-18, then p(x) / q(x) + 0.5, clamped to [0, 1]. */
@@ -107,7 +107,7 @@ static inline float rint_even(float v) {
         (out) = p_ * sc_;                                                         \
     } while (0)
 
-#define FMA(a, b, c) voice_fma(a, b, c)
+#define FMA(a, b, c) nn_fma(a, b, c)
 static float logistic1(float v) { float r; LOGISTIC_STEPS(v, r); return r; }
 static float tanh1(float v) { float r; TANH_STEPS(v, r); return r; }
 static float exp1(float v) { float r; EXP_STEPS(v, r); return r; }
@@ -117,7 +117,7 @@ static float exp1(float v) { float r; EXP_STEPS(v, r); return r; }
 #define AL 16
 
 /* o = a b + c per lane, each one fused multiply-add done in double; a halfway
- * landing (see voice_fma) noted in *bad. */
+ * landing (see nn_fma) noted in *bad. */
 static inline void fma16(const float *a, const float *b, const float *c, float *o, uint32_t *bad) {
     double s[AL];
     uint64_t u[AL];
@@ -210,7 +210,7 @@ static uint32_t exp16(const float *x, float *y) {
 }
 
 /* In place over n values: 16 at a time, a block with a halfway landing (or the
- * last, short one) one value at a time with voice_fma. */
+ * last, short one) one value at a time with nn_fma. */
 #define ARRAY_ACT(name, sixteen, one)                                             \
     void name(float *x, size_t n) {                                               \
         for (size_t i = 0; i < n; i += AL) {                                      \
@@ -221,23 +221,23 @@ static uint32_t exp16(const float *x, float *y) {
             memcpy(x + i, y, sizeof(float) * m);                                  \
         }                                                                         \
     }
-ARRAY_ACT(voice_logistic, logistic16, logistic1)
-ARRAY_ACT(voice_tanh, tanh16, tanh1)
+ARRAY_ACT(nn_logistic, logistic16, logistic1)
+ARRAY_ACT(nn_tanh, tanh16, tanh1)
 static ARRAY_ACT(exp_array, exp16, exp1)
 
 /* FastGelu, as ONNX Runtime fuses the graph's tanh form: x (0.0356774 x^2 +
  * 0.7978846), its tanh, then 0.5 x (t + 1). */
-void voice_gelu(float *x, size_t n) {
+void nn_gelu(float *x, size_t n) {
     float t[AL];
     for (size_t i = 0; i < n; i += AL) {
         size_t m = n - i < AL ? n - i : AL;
         for (size_t l = 0; l < m; l++) t[l] = x[i + l] * (0.035677408136300125f * x[i + l] * x[i + l] + 0.7978845608028654f);
-        voice_tanh(t, m);
+        nn_tanh(t, m);
         for (size_t l = 0; l < m; l++) x[i + l] = 0.5f * x[i + l] * (t[l] + 1.0f);
     }
 }
 
-void voice_dql_params(float min, float max, voice_qparam *qp) {
+void nn_dql_params(float min, float max, nn_qparam *qp) {
     if (min > 0) min = 0;
     if (max < 0) max = 0;
     if (max == min) {
@@ -283,10 +283,10 @@ static inline float qoff(float v, float scale, float lo, float hi) {
     return rint_even(v);
 }
 
-void voice_dql_u8(const float *restrict x, size_t n, uint8_t *restrict q, voice_qparam *qp) {
+void nn_dql_u8(const float *restrict x, size_t n, uint8_t *restrict q, nn_qparam *qp) {
     float mn, mx;
     minmax(x, n, &mn, &mx);
-    voice_dql_params(mn, mx, qp);
+    nn_dql_params(mn, mx, qp);
     if (qp->scale == 0) {
         memset(q, 0, n);
         return;
@@ -299,8 +299,8 @@ void voice_dql_u8(const float *restrict x, size_t n, uint8_t *restrict q, voice_
     for (; i < n; i++) q[i] = (uint8_t)((int)qoff(x[i], s, lo, hi) + zp);
 }
 
-void voice_quantize(const float *restrict x, int rows, int cols, int ldx, int16_t *restrict q, int ldq,
-                    voice_qparam *qp) {
+void nn_quantize(const float *restrict x, int rows, int cols, int ldx, int16_t *restrict q, int ldq,
+                    nn_qparam *qp) {
     float mn = 0, mx = 0;
     for (int r = 0; r < rows; r++) {
         float a, b;
@@ -308,7 +308,7 @@ void voice_quantize(const float *restrict x, int rows, int cols, int ldx, int16_
         if (r == 0 || a < mn) mn = a;
         if (r == 0 || b > mx) mx = b;
     }
-    voice_dql_params(mn, mx, qp);
+    nn_dql_params(mn, mx, qp);
     float s = qp->scale, lo = (float)-qp->zp, hi = (float)(255 - qp->zp);
     for (int r = 0; r < rows; r++) {
         const float *xr = x + (size_t)r * ldx;
@@ -476,7 +476,7 @@ static void qblock(const int16_t *restrict x, size_t xstep, size_t tstep, int ta
     }
 }
 
-void voice_conv_q(const int16_t *restrict x, int t_out, int stride, int dil, int k, int cin,
+void nn_conv_q(const int16_t *restrict x, int t_out, int stride, int dil, int k, int cin,
                   const uint8_t *restrict w, int wzp, int cout, int32_t *restrict y, int ldy,
                   int16_t *restrict wbuf) {
     /* Undilated, a step's k input rows are one contiguous run of k * cin values. */
@@ -488,7 +488,7 @@ void voice_conv_q(const int16_t *restrict x, int t_out, int stride, int dil, int
     }
 }
 
-void voice_matmul_q(const int16_t *restrict a, int m, int k, const int8_t *restrict b, int bzp, int n,
+void nn_matmul_q(const int16_t *restrict a, int m, int k, const int8_t *restrict b, int bzp, int n,
                     int32_t *restrict y, int ldy, int16_t *restrict wbuf) {
     for (int c = 0; c < n; c += 4) {
         widen_s8(wbuf, b + (size_t)c * k, bzp, 4 * (size_t)k);
@@ -496,7 +496,7 @@ void voice_matmul_q(const int16_t *restrict a, int m, int k, const int8_t *restr
     }
 }
 
-void voice_dequant(const int32_t *restrict acc, int rows, int cols, int lda, float scale,
+void nn_dequant(const int32_t *restrict acc, int rows, int cols, int lda, float scale,
                    const float *restrict bias, float *restrict y, int ldy) {
     for (int r = 0; r < rows; r++) {
         const int32_t *a = acc + (size_t)r * lda;
@@ -534,7 +534,7 @@ static size_t lstm_layout(int t, int in_pad, int hidden, uint8_t *base, lstm_par
     TAKE(qx, int16_t, (size_t)t * in_pad);
     TAKE(r16, int16_t, g * hidden);
     TAKE(qh, int16_t, hidden);
-    TAKE(wbuf, int16_t, VOICE_WBUF(1, in_pad > hidden ? in_pad : hidden));
+    TAKE(wbuf, int16_t, NN_WBUF(1, in_pad > hidden ? in_pad : hidden));
     TAKE(acc, int32_t, (size_t)t * g);
     TAKE(hacc, int32_t, g);
     TAKE(gx, float, (size_t)t * g);
@@ -545,40 +545,40 @@ static size_t lstm_layout(int t, int in_pad, int hidden, uint8_t *base, lstm_par
     return off;
 }
 
-size_t voice_lstm_scratch(int t, int in_pad, int hidden) { return lstm_layout(t, in_pad, hidden, NULL, NULL) + 64; }
+size_t nn_lstm_scratch(int t, int in_pad, int hidden) { return lstm_layout(t, in_pad, hidden, NULL, NULL) + 64; }
 
-void voice_lstm_run(const voice_lstm *l, int dirs, const float *x, int t, int in, int ldx, float *y, int ldy,
+void nn_lstm_run(const nn_lstm *l, int dirs, const float *x, int t, int in, int ldx, float *y, int ldy,
                     void *scratch) {
     int H = l->hidden, G = 4 * H;
     lstm_parts p;
     uint8_t *base = (uint8_t *)scratch;
     base += (64 - ((uintptr_t)base & 63)) & 63;
     lstm_layout(t, l->in_pad, H, base, &p);
-    voice_qparam xq;
-    voice_quantize(x, t, in, ldx, p.qx, l->in_pad, &xq);
+    nn_qparam xq;
+    nn_quantize(x, t, in, ldx, p.qx, l->in_pad, &xq);
     for (int d = 0; d < dirs; d++) {
         /* The input projection of every step at once. */
-        voice_matmul_q(p.qx, t, l->in_pad, l->w[d], l->wzp[d], G, p.acc, G, p.wbuf);
-        voice_dequant(p.acc, t, G, G, xq.scale * l->wscale[d], NULL, p.gx, G);
+        nn_matmul_q(p.qx, t, l->in_pad, l->w[d], l->wzp[d], G, p.acc, G, p.wbuf);
+        nn_dequant(p.acc, t, G, G, xq.scale * l->wscale[d], NULL, p.gx, G);
         widen_s8(p.r16, l->r[d], l->rzp[d], (size_t)G * H);
         for (int i = 0; i < G; i++) p.bias[i] = l->b[d][i] + l->b[d][G + i];
         memset(p.h, 0, sizeof(float) * (size_t)H);
         memset(p.c, 0, sizeof(float) * (size_t)H);
         for (int s = 0; s < t; s++) {
             int step = d == 0 ? s : t - 1 - s;
-            voice_qparam hq;
-            voice_quantize(p.h, 1, H, H, p.qh, H, &hq);
+            nn_qparam hq;
+            nn_quantize(p.h, 1, H, H, p.qh, H, &hq);
             for (int co = 0; co < G; co += 4)
                 qblock(p.qh, 0, 0, 1, H, 1, p.r16 + (size_t)co * H, 4, p.hacc + co, G);
             float *g = p.gx + (size_t)step * G, m = hq.scale * l->rscale[d];
             for (int i = 0; i < G; i++) g[i] = (float)p.hacc[i] * m + g[i];
             for (int i = 0; i < G; i++) g[i] = g[i] + p.bias[i];
             float *out = y + (size_t)step * ldy + (size_t)d * H;
-            voice_logistic(g, (size_t)3 * H);                 /* i, o, f */
-            voice_tanh(g + 3 * H, (size_t)H);                 /* the cell input */
+            nn_logistic(g, (size_t)3 * H);                 /* i, o, f */
+            nn_tanh(g + 3 * H, (size_t)H);                 /* the cell input */
             for (int j = 0; j < H; j++) p.c[j] = p.c[j] * g[2 * H + j] + g[j] * g[3 * H + j];
             memcpy(p.h, p.c, sizeof(float) * (size_t)H);
-            voice_tanh(p.h, (size_t)H);
+            nn_tanh(p.h, (size_t)H);
             for (int j = 0; j < H; j++) out[j] = p.h[j] = p.h[j] * g[H + j];
         }
     }
@@ -589,7 +589,7 @@ void voice_lstm_run(const voice_lstm *l, int dirs, const float *x, int t, int in
 /* ONNX Runtime's LayerNormalization: the mean from a double sum; the variance
  * from squared deviations accumulated by fused multiply-adds in 8 lanes, the
  * lanes added in halves; y = fma((x - mean) * inv, g, b). */
-void voice_layernorm(float *x, int rows, int cols, int ld, const float *g, const float *b, float eps) {
+void nn_layernorm(float *x, int rows, int cols, int ld, const float *g, const float *b, float eps) {
     for (int r = 0; r < rows; r++) {
         float *xr = x + (size_t)r * ld;
         double s = 0;
@@ -599,26 +599,26 @@ void voice_layernorm(float *x, int rows, int cols, int ld, const float *g, const
         for (; c + 8 <= cols; c += 8)
             for (int l = 0; l < 8; l++) {
                 float d = xr[c + l] - mean;
-                acc[l] = voice_fma(d, d, acc[l]);
+                acc[l] = nn_fma(d, d, acc[l]);
             }
         for (int l = 0; l < 4; l++) acc[l] += acc[l + 4];
         for (int l = 0; l < 2; l++) acc[l] += acc[l + 2];
         float q = acc[0] + acc[1];
         for (; c < cols; c++) {
             float d = xr[c] - mean;
-            q = voice_fma(d, d, q);
+            q = nn_fma(d, d, q);
         }
         float inv = 1.0f / sqrtf(q / (float)cols + eps);
         for (c = 0; c < cols; c++) {
             float v = (xr[c] - mean) * inv;
-            xr[c] = g ? voice_fma(v, g[c], b ? b[c] : 0.0f) : v;
+            xr[c] = g ? nn_fma(v, g[c], b ? b[c] : 0.0f) : v;
         }
     }
 }
 
 /* ONNX Runtime's SkipLayerNormalization: v = x + skip, then Welford's running
  * mean and sum of squares in float, y = (v - mean) / sqrt(m2 / n + eps) * g + b. */
-void voice_skip_layernorm(float *x, const float *skip, int rows, int cols, int ld, int lds, const float *g,
+void nn_skip_layernorm(float *x, const float *skip, int rows, int cols, int ld, int lds, const float *g,
                           const float *b, float eps) {
     for (int r = 0; r < rows; r++) {
         float *xr = x + (size_t)r * ld;
@@ -668,7 +668,7 @@ static float eigen_sum(const float *a, int n, int as) {
     return r;
 }
 
-float voice_reduce_sum(const float *a, int n, size_t start) { return eigen_sum(a, n, (int)((4 - start % 4) % 4)); }
+float nn_reduce_sum(const float *a, int n, size_t start) { return eigen_sum(a, n, (int)((4 - start % 4) % 4)); }
 
 /* eigen_sum over the rows of time-major data, for the channels ch0, ch0 + cs,
  * ... below c at once (each one's t values rows `ld` apart, its vectors starting
@@ -737,7 +737,7 @@ static void eigen_sum_rows(const float *x, int t, int c, int ld, int ch0, int cs
  * y = x k + (b - mean k). Here on time-major rows, a pass over the rows for each
  * sum: the channels fall into at most four classes by (c * t) mod 4, which
  * repeats every 4 / gcd(t, 4) channels. */
-void voice_instnorm(float *x, int t, int c, int ld, const float *g, const float *b, float eps) {
+void nn_instnorm(float *x, int t, int c, int ld, const float *g, const float *b, float eps) {
     float *mem = malloc(sizeof(float) * (size_t)c * 12);
     if (!mem) return;
     float *mean = mem, *k = mem + c, *sh = mem + 2 * (size_t)c, *lanes = mem + 4 * (size_t)c;
@@ -762,7 +762,7 @@ void voice_instnorm(float *x, int t, int c, int ld, const float *g, const float 
 /* ONNX Runtime's softmax: the exponentials of x - max summed in 8 lanes (the
  * last, partial vector into the same lanes), the lanes added in adjacent
  * pairs, and each exponential multiplied by 1 / sum. */
-void voice_softmax(float *x, int n) {
+void nn_softmax(float *x, int n) {
     float mx = x[0];
     for (int i = 1; i < n; i++) mx = x[i] > mx ? x[i] : mx;
     float acc[8] = { 0 }, nm = -mx;
@@ -778,9 +778,9 @@ void voice_softmax(float *x, int n) {
 /* y[c] = sum_i a[i] * b[i * ldb + c] for c < n, as ONNX Runtime's float matrix
  * product forms each output: a chain of fused multiply-adds from 0 over each
  * block of 256 of i, the blocks' results added in turn. Sixteen chains at once,
- * in double (exact products, one rounding per step, as voice_fma), noting any
+ * in double (exact products, one rounding per step, as nn_fma), noting any
  * step that lands halfway between two floats; a block with one is done again
- * with voice_fma. */
+ * with nn_fma. */
 #define FMA_LANES 16
 static void vecmat_fma(const float *restrict a, int k, const float *restrict b, size_t ldb, int n,
                        float *restrict y) {
@@ -807,7 +807,7 @@ static void vecmat_fma(const float *restrict a, int k, const float *restrict b, 
             if (nc < FMA_LANES || bad)
                 for (int l = 0; l < nc; l++) {
                     float c = 0;
-                    for (int i = k0; i < k1; i++) c = voice_fma(a[i], b[(size_t)i * ldb + c0 + l], c);
+                    for (int i = k0; i < k1; i++) c = nn_fma(a[i], b[(size_t)i * ldb + c0 + l], c);
                     acc[l] = c;
                 }
             for (int l = 0; l < nc; l++) out[l] = k0 ? acc[l] + out[l] : acc[l];
@@ -821,7 +821,7 @@ static void vecmat_fma(const float *restrict a, int k, const float *restrict b, 
  * test is folded into one word per block: a step whose low 29 bits are
  * 0x10000000 makes (bits ^ 0x10000000) - 1 wrap, setting the top bit of the OR
  * of them all; such a block, and a tile at the edges, is done again output by
- * output with voice_fma. Without it a step lands on the float that rounding the
+ * output with nn_fma. Without it a step lands on the float that rounding the
  * double sum gives, which is the fused result unless that sum was itself
  * rounded onto a halfway point (with f16 weights that needs one addend 2^18
  * times the other and 28 particular bits: never seen in the 10.6 billion steps
@@ -874,7 +874,7 @@ static void fma_tiles(const float *x, int m, int k, size_t ldx, const float *w, 
                         for (int l = 0; l < nc; l++) {
                             float c = 0;
                             const float *xr = x + (size_t)(r0 + u) * ldx;
-                            for (int i = k0; i < k1; i++) c = voice_fma(xr[i], w[(size_t)i * ldw + c0 + l], c);
+                            for (int i = k0; i < k1; i++) c = nn_fma(xr[i], w[(size_t)i * ldw + c0 + l], c);
                             acc[u][l] = c;
                         }
                 for (int u = 0; u < nr; u++)
@@ -885,16 +885,16 @@ static void fma_tiles(const float *x, int m, int k, size_t ldx, const float *w, 
     }
 }
 
-void voice_matmul_fma_kb(const float *x, int m, int k, size_t ldx, const float *w, int n, size_t ldw, float *y,
+void nn_matmul_fma_kb(const float *x, int m, int k, size_t ldx, const float *w, int n, size_t ldw, float *y,
                          size_t ldy, int kb) {
     fma_tiles(x, m, k, ldx, w, n, ldw, y, ldy, kb, 1);
 }
 
-void voice_matmul_fma(const float *x, int m, int k, int ldx, const float *w, int n, int ldw, float *y, int ldy) {
-    voice_matmul_fma_kb(x, m, k, (size_t)ldx, w, n, (size_t)ldw, y, (size_t)ldy, 256);
+void nn_matmul_fma(const float *x, int m, int k, int ldx, const float *w, int n, int ldw, float *y, int ldy) {
+    nn_matmul_fma_kb(x, m, k, (size_t)ldx, w, n, (size_t)ldw, y, (size_t)ldy, 256);
 }
 
-void voice_attention(const float *q, const float *k, const float *v, int ld, int n, int heads, int dh,
+void nn_attention(const float *q, const float *k, const float *v, int ld, int n, int heads, int dh,
                      float scale, const float *mask, float *out, int ldo, float *scratch) {
     float *kt = scratch + n, *qs = kt + (size_t)n * dh;
     for (int h = 0; h < heads; h++) {
@@ -906,7 +906,7 @@ void voice_attention(const float *q, const float *k, const float *v, int ld, int
             vecmat_fma(qs, dh, kt, (size_t)n, n, scratch);
             if (mask)
                 for (int j = 0; j < n; j++) scratch[j] += mask[j];
-            voice_softmax(scratch, n);
+            nn_softmax(scratch, n);
             vecmat_fma(scratch, n, v + c0, (size_t)ld, dh, out + (size_t)i * ldo + c0);
         }
     }
@@ -917,9 +917,9 @@ void voice_attention(const float *q, const float *k, const float *v, int ld, int
 #define FR 8      /* float GEMM tile: 8 rows by 8 columns */
 #define FC 8
 
-void voice_matmul_f(const float *restrict x, size_t xstep, int m, int k, const float *restrict w, int n,
+void nn_matmul_f(const float *restrict x, size_t xstep, int m, int k, const float *restrict w, int n,
                     const float *restrict bias, float *restrict y, size_t ystep) {
-    int npad = VOICE_ROUND(n, FC);
+    int npad = NN_ROUND(n, FC);
     for (int nb = 0; nb < npad; nb += FC) {
         int nv = imin(FC, n - nb);
         int r = 0;
@@ -959,9 +959,9 @@ void voice_matmul_f(const float *restrict x, size_t xstep, int m, int k, const f
  * read transposed; fma_tiles without the halfway test); then each output is
  * the sum of its taps' products in tap order (its col2im onto zeros), then the
  * bias. */
-void voice_convt(const float *x, int t, int cin, int k, int s, int pad_begin, const float *w, const float *bias,
+void nn_convt(const float *x, int t, int cin, int k, int s, int pad_begin, const float *w, const float *bias,
                  int cout, int t_out, float *y, int ldy) {
-    int mt = k / s, npad = VOICE_ROUND(cout, FC);
+    int mt = k / s, npad = NN_ROUND(cout, FC);
     const float *xv = x + (size_t)(mt - 1) * cin;
     float *col = malloc(sizeof(float) * (size_t)t * cout);
     if (!col) return;
@@ -984,7 +984,7 @@ void voice_convt(const float *x, int t, int cin, int k, int s, int pad_begin, co
     free(col);
 }
 
-void voice_convt_dw(const float *restrict x, int t, int c, int ld, int k, int s, int pad_begin,
+void nn_convt_dw(const float *restrict x, int t, int c, int ld, int k, int s, int pad_begin,
                     const float *restrict w, const float *restrict bias, int t_out, float *restrict y, int ldy) {
     for (int o = 0; o < t_out; o++) {
         float *yr = y + (size_t)o * ldy;
@@ -1009,7 +1009,7 @@ void voice_convt_dw(const float *restrict x, int t, int c, int ld, int k, int s,
 
 /* As the sum of the positive and the scaled negative part: a select with
  * arithmetic in one arm is not vectorised by GCC at -O2. */
-void voice_leaky_relu(float *x, size_t n, float alpha) {
+void nn_leaky_relu(float *x, size_t n, float alpha) {
     size_t i = 0;
     for (; i + FL <= n; i += FL)
         for (int l = 0; l < FL; l++) {
@@ -1105,7 +1105,7 @@ static void sin_fix(const float *x, float *y, size_t n) {
         if (fabsf(x[l]) >= SIN_HUGE) y[l] = sin1(x[l]);
 }
 
-void voice_sin(const float *restrict x, float *restrict y, size_t n) {
+void nn_sin(const float *restrict x, float *restrict y, size_t n) {
     size_t i = 0;
     for (; i + FL <= n; i += FL)
         if (sin16(x + i, y + i)) sin_fix(x + i, y + i, FL);
@@ -1133,13 +1133,13 @@ static inline float atan_rat(float x) {
     return u2f(f2u(v) ^ (f2u(x) & 0x80000000u));
 }
 
-void voice_atan(const float *restrict x, float *restrict y, size_t n) {
+void nn_atan(const float *restrict x, float *restrict y, size_t n) {
     size_t body = n / 4 * 4;
     for (size_t i = 0; i < body; i++) y[i] = atan_rat(x[i]);
     for (size_t i = body; i < n; i++) y[i] = atanf(x[i]);
 }
 
-void voice_snake(float *restrict x, int t, int c, int ld, const float *restrict alpha,
+void nn_snake(float *restrict x, int t, int c, int ld, const float *restrict alpha,
                  const float *restrict inv_alpha) {
     for (int r = 0; r < t; r++) {
         float *restrict xr = x + (size_t)r * ld;
@@ -1160,7 +1160,7 @@ void voice_snake(float *restrict x, int t, int c, int ld, const float *restrict 
 /* ---- inverse STFT ----------------------------------------------------------------- */
 
 #define ISTFT_MAXBINS 64        /* bins <= this */
-void voice_istft(const float *spec, int t, int ld, int bins, const float *wr, const float *wi, int nfft, int hop,
+void nn_istft(const float *spec, int t, int ld, int bins, const float *wr, const float *wi, int nfft, int hop,
                  int trim, float *out, float *full) {
     size_t len = (size_t)(t - 1) * hop + nfft;
     memset(full, 0, sizeof(float) * len);
@@ -1183,4 +1183,186 @@ void voice_istft(const float *spec, int t, int ld, int bins, const float *wr, co
         }
     }
     memcpy(out, full + trim, sizeof(float) * (len - 2 * (size_t)trim));
+}
+
+/* ---- for the recognizer ---------------------------------------------------------- */
+
+void nn_matmul_qc(const int16_t *restrict a, int m, int k, const uint8_t *restrict b, const uint8_t *restrict bzp,
+                  int n, int32_t *restrict y, int ldy, int16_t *restrict wbuf) {
+    for (int c = 0; c < n; c += 4) {
+        for (int r = 0; r < 4; r++) widen_u8(wbuf + (size_t)r * k, b + (size_t)(c + r) * k, bzp[c + r], (size_t)k);
+        qblock(a, (size_t)k, 0, 1, k, m, wbuf, 4, y + c, ldy);
+    }
+}
+
+void nn_dequant_qc(const int32_t *restrict acc, int rows, int cols, int lda, float ascale,
+                   const float *restrict bscale, const float *restrict bias, float *restrict y, int ldy) {
+    for (int r = 0; r < rows; r++) {
+        const int32_t *a = acc + (size_t)r * lda;
+        float *o = y + (size_t)r * ldy;
+        for (int c = 0; c < cols; c++) {
+            float mult = ascale * bscale[c];
+            float v = (float)a[c] * mult;
+            o[c] = bias ? v + bias[c] : v;
+        }
+    }
+}
+
+void nn_silu(float *x, size_t n) {
+    float t[64];
+    for (size_t i = 0; i < n; i += 64) {
+        size_t m = n - i < 64 ? n - i : 64;
+        memcpy(t, x + i, m * sizeof *t);
+        nn_logistic(t, m);
+        for (size_t l = 0; l < m; l++) x[i + l] = x[i + l] * t[l];
+    }
+}
+
+/* erf(x) as ONNX Runtime computes it (its MlasErfKernel, the same bits): odd,
+ * |x| clamped to 3.925; below 0.921875 an odd polynomial in |x|, above it
+ * 1 - exp(-p(|x|)) with its own exp; every multiply-add fused. */
+static float erf1(float v) {
+    uint32_t vu, sign;
+    memcpy(&vu, &v, 4);
+    sign = vu & 0x80000000u;
+    float a = fabsf(v);
+    a = a < 3.925f ? a : 3.925f;
+    float y;
+    if (!(a > 0.921875f)) {
+        float sq = a * a, p = -5.99104969e-4f;
+        p = nn_fma(p, sq, 4.99339588e-3f);
+        p = nn_fma(p, sq, -2.67667342e-2f);
+        p = nn_fma(p, sq, 1.12818025e-1f);
+        p = nn_fma(p, sq, -3.76124859e-1f);
+        p = nn_fma(p, sq, 1.28379151e-1f);
+        y = nn_fma(p, a, a);
+    } else {
+        float p = 1.72948930e-5f;
+        p = nn_fma(p, a, -3.83208680e-4f);
+        p = nn_fma(p, a, 3.88393435e-3f);
+        p = nn_fma(p, a, -2.42545605e-2f);
+        p = nn_fma(p, a, 1.06777847e-1f);
+        p = nn_fma(p, a, 6.34846687e-1f);
+        p = nn_fma(p, a, 1.28717512e-1f);
+        p = -nn_fma(p, a, a);
+        p = p < -88.3762626647949f ? -88.3762626647949f : p;
+        float r = nn_fma(1.44269504088896341f, p, 12582912.0f) - 12582912.0f;
+        float f = nn_fma(r, -6.93145752e-1f, p);
+        f = nn_fma(r, -1.42860677e-6f, f);
+        float e = 1.38319808e-3f;
+        e = nn_fma(e, f, 8.37550033e-3f);
+        e = nn_fma(e, f, 4.16689515e-2f);
+        e = nn_fma(e, f, 1.66664466e-1f);
+        e = nn_fma(e, f, 4.99999851e-1f);
+        e = nn_fma(e, f, 1.0f);
+        e = nn_fma(e, f, 1.0f);
+        uint32_t pu = (uint32_t)((int32_t)r + 127) << 23;
+        float p2;
+        memcpy(&p2, &pu, 4);
+        y = 1.0f - e * p2;
+    }
+    uint32_t yu;
+    memcpy(&yu, &y, 4);
+    yu |= sign;
+    memcpy(&y, &yu, 4);
+    return y;
+}
+
+void nn_gelu_erf(float *x, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        float v = x[i], e = erf1(v / 1.41421353816986083984375f);
+        float h = 0.5f * (e + 1.0f);
+        x[i] = v * h;
+    }
+}
+
+void nn_rope_pairs(float *x, int rot, const float *inv_freq, float pos) {
+    for (int i = 0; i < rot / 2; i++) {
+        float f = pos * inv_freq[i], c = cosf(f), s = sinf(f);
+        float a = x[2 * i], b = x[2 * i + 1];
+        float ac = a * c, bs = b * s, bc = b * c, as = a * s;
+        x[2 * i] = ac - bs;
+        x[2 * i + 1] = bc + as;
+    }
+}
+
+static float dot(const float *restrict a, const float *restrict b, int n) {
+    float acc[FL] = { 0 };
+    int i = 0;
+    for (; i + FL <= n; i += FL)
+        for (int l = 0; l < FL; l++) acc[l] += a[i + l] * b[i + l];
+    float s = 0;
+    for (int l = 0; l < FL; l++) s += acc[l];
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+
+void nn_attend(const float *q, const float *k, int ldk, const float *v, int ldv, int lo, int hi, int dh, float scale,
+               float *out, float *scratch) {
+    int n = hi - lo;
+    for (int d = 0; d < dh; d++) out[d] = 0;
+    if (n <= 0) return;
+    for (int j = 0; j < n; j++) scratch[j] = dot(q, k + (size_t)(lo + j) * ldk, dh) * scale;
+    nn_softmax(scratch, n);
+    for (int j = 0; j < n; j++) {
+        const float *vr = v + (size_t)(lo + j) * ldv;
+        float p = scratch[j];
+        for (int d = 0; d < dh; d++) out[d] += p * vr[d];
+    }
+}
+
+/* A chain of fused multiply-adds from 0 over n products, as the float matrix
+ * product computes one output: in double, each step rounded to float, with
+ * the rare step that lands exactly halfway done again with nn_fma. */
+static float fma_chain(const float *restrict a, const float *restrict b, int n) {
+    float acc = 0;
+    uint32_t bad = 0;
+    for (int i = 0; i < n; i++) {
+        double sv = (double)a[i] * (double)b[i] + (double)acc;
+        uint64_t u;
+        memcpy(&u, &sv, sizeof u);
+        bad |= ((uint32_t)u & 0x1FFFFFFFu) == 0x10000000u;
+        acc = (float)sv;
+    }
+    if (bad) {
+        acc = 0;
+        for (int i = 0; i < n; i++) acc = nn_fma(a[i], b[i], acc);
+    }
+    return acc;
+}
+
+void nn_attend_exact(const float *q, const float *k, int ldk, const float *v, int ldv, int n, int lo, int hi,
+                     int dh, float scale, int add, float *out, float *scratch) {
+    for (int j = 0; j < n; j++) {
+        float s = fma_chain(q, k + (size_t)j * ldk, dh) * scale;
+        int in = j >= lo && j < hi;
+        scratch[j] = add ? s + (in ? 0.0f : -INFINITY) : (in ? s : -INFINITY);
+    }
+    nn_softmax(scratch, n);
+    vecmat_fma(scratch, n, v, (size_t)ldv, dh, out);
+}
+
+int nn_argmax(const float *x, int n) {
+    int best = 0;
+    for (int i = 1; i < n; i++)
+        if (x[i] > x[best]) best = i;
+    return best;
+}
+
+void nn_matvec_u8(const float *restrict x, int k, const uint8_t *restrict e, int zp, float scale, int n,
+                  float *restrict out) {
+    float w[FL];
+    for (int r = 0; r < n; r++) {
+        const uint8_t *row = e + (size_t)r * k;
+        float acc[FL] = { 0 };
+        int i = 0;
+        for (; i + FL <= k; i += FL) {
+            for (int l = 0; l < FL; l++) w[l] = (float)(row[i + l] - zp) * scale;
+            for (int l = 0; l < FL; l++) acc[l] += x[i + l] * w[l];
+        }
+        float s = 0;
+        for (int l = 0; l < FL; l++) s += acc[l];
+        for (; i < k; i++) s += x[i] * ((float)(row[i] - zp) * scale);
+        out[r] = s;
+    }
 }

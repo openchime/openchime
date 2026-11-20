@@ -139,7 +139,7 @@ harnesses in the full suite (§2.2b, "Fuzzing"). A concurrency load test
 **`make build` and `make test`** (Linux, x86-64 or arm64): a C compiler
 (`cc`), `make`, `nasm` (libvpx's assembly), `curl` and `xz` (the pinned
 llvm-mingw for the Windows clients) and `python3`. The vendored libraries and the toolchain build themselves on first
-use (`scripts/build/*.sh`, `mk/toolchains.mk`); no ONNX Runtime, llama.cpp or
+use (`scripts/build/*.sh`, `mk/toolchains.mk`); no llama.cpp or
 Emscripten is needed. actionlint is fetched once into
 `~/.cache/openchime/`. Four things are checked only where present, and a
 missing one is a `SKIP` (a failure where `CI` is set): `ffprobe` (package
@@ -345,9 +345,11 @@ framework.
   with the microphone hearing only its echo, present once. The canceller that does
   it is measured in the ERLE harness (`tests/test_voice.c`) at 48 kHz on the same
   rooms as voice input's.
+- **The speech kernels** (nnkit, TTSKIT.md §5b, STTKIT.md §4) — `tests/test_nnkit.c`,
+  in the fast suite: each kernel read-aloud's and voice input's models run on
+  against a naive version of its operator on random inputs.
 - **Read-aloud's voice** (ARCH-111, TTSKIT.md §9) — `tests/test_ttskit.c`, in
-  the fast suite: each of the voice model's kernels against a naive version of
-  its operator on random inputs, the duration rounding and the token-to-frame
+  the fast suite: the duration rounding and the token-to-frame
   alignment, `voice.bin`'s loader on a file built byte by byte (a wrong magic,
   version or length refused), its converter on a small model built in the
   upstream formats, and the committed `ttskit/data/voice.bin` loading with every
@@ -360,12 +362,23 @@ framework.
   their token ids and ONNX Runtime's raw output with the noise on and off, and a
   `manifest` — were made once by `tests/manual/voice_ref.c` against ONNX
   Runtime's prebuilt release (VENDORS.md) and are committed; no suite runs that
-  program, and nothing a suite builds links ONNX Runtime for read-aloud.
+  program, and nothing a suite builds links ONNX Runtime.
 - **Voice input** (ARCH-112) — `tests/test_voice.c`: the segmenter over
   synthetic voiced sound with known pauses (free talk, the cap, push to talk) and
   the ERLE harness (AUDIO.md §6.4: converged, 100 ppm drift, double-talk);
-  `tests/test_stt.c`: the tokenizer, spoken mentions and the recognition worker
-  against a stub engine (order, a full queue, idle release, the token ceiling);
+  `tests/test_stt.c`: spoken mentions and the recognition worker against a stub
+  engine (order, a full queue, idle release); `tests/test_sttkit.c`, in the fast
+  suite: the tokenizer and the token ceiling, `recognizer.bin`'s loader on a file
+  built from the format's description (a wrong magic, version, length or shape, or
+  a missing tensor, refused), the committed file loading, and the converter
+  refusing what is not the published model; `recognizer_parity` in the same file,
+  a `FULL` suite: every fixture in `tests/data/recognizer/` heard from the
+  committed `recognizer.bin` gives the reference's token ids, with its encoder
+  output and first decoding step's logits within 30 dB SNR of ONNX Runtime's
+  (measured: the encoder output identical, the logits 129–137 dB). The fixtures —
+  seven utterances spoken by read-aloud's voice and silence, with ONNX Runtime's
+  tokens, encoder output and first logits — were made once by
+  `tests/manual/recognizer_ref.c` (VENDORS.md) and are committed;
   `tests/test_protocol.c` round-trips the `STT_*` frames; `itest_netloop` drives
   the daemon's vertical — the capability and cap at auth; push to talk answered to
   the speaker only; free talk posted through the send path, in order, idempotently,
@@ -1513,12 +1526,13 @@ usable once the kernel takes its share), on the full build's daemon, sampling
 | Heard a 20 s segment, in one piece | 156 MB | 3 MB | 40 s |
 | Heard a 30 s segment, in one piece | 162 MB | 3 MB | 413 s |
 
-The read-aloud rows were measured when the voice model ran on ONNX Runtime; it now
-runs in ttskit, where one render peaks at about 156 MB resident on a laptop core,
-about 86 MB of it the model's mapped pages (READ-ALOUD.md §4), not yet measured on the
-256 MB machine. Both models are mapped from their files and used in place
-(`daemon/tts_data.c`; ttskit reads `voice.bin`'s pages where they lie, voice input's
-ONNX Runtime with `session.use_ort_model_bytes_directly`), so under pressure the kernel drops their
+These rows were measured when both models ran on ONNX Runtime. They now run in plain
+C: in ttskit one render peaks at about 156 MB resident on a laptop core, about 86 MB of
+it the model's mapped pages (READ-ALOUD.md §4), and in sttkit hearing a 6 s segment
+peaks at about 53 MB, 40 MB of it the recognizer's mapped pages (VOICE-INPUT.md §6);
+neither yet measured on the 256 MB machine. Both models are mapped from their files and
+used in place (`daemon/tts_data.c`; ttskit and sttkit read `voice.bin`'s and
+`recognizer.bin`'s pages where they lie), so under pressure the kernel drops their
 pages and reads them back rather than killing the daemon: memory stays under the
 machine's, and the time goes instead. Nothing was killed in these runs. The
 recognizer's working memory grows with what it hears at once, which is why the
