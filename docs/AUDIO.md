@@ -9,8 +9,8 @@ and CLIENT.md.
 
 **This document is audio only.** **Screenshare is [CALLS.md](./CALLS.md) §6**
 (REQ-161, ARCH-86/87) — it rides this same call, relay, and UDP path, and
-builds on the media transport, jitter buffer and device layer of §§2–4. Camera
-video remains out of scope (REQ-160).
+builds on the media transport, jitter buffer and device layer of §§2–4, and so
+do the cameras (CALLS.md §7, REQ-160).
 
 **Two halves.** The daemon's signaling, its ephemeral call state and
 the UDP relay, which runs in the daemon's event loop (`daemon/relay.c`); the client's signaling and keys
@@ -41,9 +41,12 @@ opaque payloads** rather than mixing them. The media framing makes this visible
 (`daemon/audio.h`):
 
 ```
-client → relay :  token ‖ seq(u16 BE) ‖ payload
-relay  → client :  sender_user_id(u64 BE) ‖ seq(u16 BE) ‖ payload
+client → relay :  token ‖ seq(u16 BE) ‖ stream(u8) ‖ payload
+relay  → client :  sender_user_id(u64 BE) ‖ seq(u16 BE) ‖ stream(u8) ‖ payload
 ```
+
+`stream` is audio, a share or a camera: the one thing about a packet the relay
+reads, so it sends a camera only to those who take it (CALLS.md §5.4, §7).
 
 The payload is an SFrame ciphertext (CALLS.md §5.4) — a typed plaintext: the
 Opus frame and its frame number, a mute state, or a shared screen's fragments and
@@ -220,8 +223,8 @@ swaps the devices for a tone source and a real-time sink, so both run in
 `make test` on a machine with no sound hardware; with it, `OPENCHIME_DEV_MIC=<wav>`
 makes the synthetic microphone speak a recording, and `OPENCHIME_DEV_AUDIO=mic-denied`
 refuses the microphone as the operating system refuses a blocked one — which is how
-`tools/gui/voice.sh` drives voice input — and `OPENCHIME_DEV_TONE` changes the
-synthetic microphone's tone, which is how `tools/gui/calls.sh` tells two clients
+`tools/gui/features/voice.sh` drives voice input — and `OPENCHIME_DEV_TONE` changes the
+synthetic microphone's tone, which is how `tools/gui/features/calls.sh` tells two clients
 apart.
 
 **Voice input opens it too** (ARCH-112, [VOICE-INPUT.md](./VOICE-INPUT.md)), at
@@ -279,7 +282,7 @@ speaking is judged by level. Opus encodes it: VoIP mode,
 loss the others' packets show, and **DTX**, so a packet of two bytes or fewer —
 silence the encoder need not have sent — is not sent. What is sent is the audio
 type, the frame number and the Opus packet, encrypted as one SFrame (CALLS.md §5.4), behind
-`token ‖ seq` to the relay. A muted client sends no audio, only, once a second,
+`token ‖ seq ‖ stream` to the relay. A muted client sends no audio, only, once a second,
 an encrypted packet saying it is muted; and every client sends an empty
 **keep-alive** at least every 5 s, so the relay's 20 s silence sweep takes only
 the vanished and never someone quiet. The relay answers a keep-alive to its sender alone,
@@ -489,7 +492,7 @@ speech, which is the failure the harness exists to catch.
 
 **After the canceller, the preprocessor.** A call runs speexdsp's preprocessor on
 the cancelled frame: noise suppression and automatic gain, after cancellation so
-the far end's echo is gone before the gain can lift it. It is what makes a steady hum disappear — `tools/gui/calls.sh` checks that
+the far end's echo is gone before the gain can lift it. It is what makes a steady hum disappear — `tools/gui/features/calls.sh` checks that
 with a test tone, which to it is a hum — and why the call view offers it as a
 switch.
 

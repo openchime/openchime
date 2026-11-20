@@ -85,6 +85,9 @@ const char *oc_plat_mic_settings_name(void);
  * max_w x max_h: 1920x1080 on a desktop; a browser's wasm encoder keeps to
  * 960x540. */
 void  oc_plat_share_limits(int *max_w, int *max_h);
+/* The most a camera is sent at in a call (REQ-160): max_w x max_h at max_fps --
+ * 640x480 at 30 on a desktop; a browser's wasm encoder keeps to 15 fps. */
+void  oc_plat_camera_limits(int *max_w, int *max_h, int *max_fps);
 /* The platform as the one that grants or blocks a device, for messages
  * ("Windows is blocking camera access", "The browser ..."). */
 const char *oc_plat_privacy_name(void);
@@ -156,7 +159,7 @@ void *oc_plat_tray_notify_handle(unsigned *tray_id);
  * many, 0 when cancelled or when the platform has no picker. */
 int   oc_plat_pick_files(SDL_Window *owner, const char *filter, int multi, char *out, size_t cap);
 /* What runs while a native file dialog's own modal loop holds the thread, so the
- * test hook still answers (TESTING.md, "Driving the Win32 GUI"); NULL for
+ * test hook still answers (tools/gui/README.md, "Driving the Win32 GUI"); NULL for
  * nothing. Only that: the rest of the client waits for the dialog as before. */
 void  oc_plat_set_modal_tick(void (*fn)(void));
 /* 1 while the file picker is open. */

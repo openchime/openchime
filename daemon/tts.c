@@ -5,7 +5,7 @@
 #include "speakable.h"
 #include "tts_data.h"
 #include "config.h"
-#include "tts_kitten.h"
+#include "tts_voice.h"
 #include "tts_render.h"
 #include "ttskit.h"
 
@@ -19,9 +19,9 @@
 
 typedef struct {
     tts       *pron;
-    kitten    *model;
-    oc_tts_map ort, voices, lexicon, guesses;   /* consumed in place: they outlive both */
-} kitten_engine;
+    tts_voice *model;
+    oc_tts_map voice, lexicon, guesses;   /* consumed in place: they outlive both */
+} voice_engine;
 
 /* The data directory oc_tts_data_ready chose and checked; the engine opens from
  * it. Set once at startup, before the render worker exists. */
@@ -47,12 +47,11 @@ static int map_data(const char *name, oc_tts_map *m, char *err, size_t errcap) {
 }
 
 static void engine_close(void *engine) {
-    kitten_engine *k = engine;
+    voice_engine *k = engine;
     if (!k) return;
-    kitten_close(k->model);
+    tts_voice_close(k->model);
     tts_free(k->pron);
-    oc_tts_map_close(&k->ort);
-    oc_tts_map_close(&k->voices);
+    oc_tts_map_close(&k->voice);
     oc_tts_map_close(&k->lexicon);
     oc_tts_map_close(&k->guesses);
     free(k);
@@ -61,27 +60,27 @@ static void engine_close(void *engine) {
 static void *engine_open(void *ctx, char *err, size_t errcap) {
     (void)ctx;
     if (!g_data_dir[0]) { snprintf(err, errcap, "no voice data"); return NULL; }
-    kitten_engine *k = calloc(1, sizeof *k);
+    voice_engine *k = calloc(1, sizeof *k);
     if (!k) { snprintf(err, errcap, "out of memory"); return NULL; }
     /* Mapped, not read: pages come in as inference touches them and the kernel
      * can drop them again, exactly as it did when these bytes were inside the
      * binary. Moving them out changed where they live, not what they cost. */
-    if (map_data(OC_TTS_DATA_FILES[0], &k->ort, err, errcap) || map_data(OC_TTS_DATA_FILES[1], &k->voices, err, errcap) ||
-        map_data(OC_TTS_DATA_FILES[2], &k->lexicon, err, errcap) || map_data(OC_TTS_DATA_FILES[3], &k->guesses, err, errcap)) {
+    if (map_data(OC_TTS_DATA_FILES[0], &k->voice, err, errcap) || map_data(OC_TTS_DATA_FILES[1], &k->lexicon, err, errcap) ||
+        map_data(OC_TTS_DATA_FILES[2], &k->guesses, err, errcap)) {
         engine_close(k);
         return NULL;
     }
     char why[256] = "";
     k->pron = tts_load_mem(k->lexicon.p, k->lexicon.n, k->guesses.p, k->guesses.n, OC_TTS_LANG, why, sizeof why);
     if (!k->pron) { snprintf(err, errcap, "pronunciation data: %s", why); engine_close(k); return NULL; }
-    k->model = kitten_open(k->ort.p, k->ort.n, k->voices.p, k->voices.n, why, sizeof why);
+    k->model = tts_voice_open(k->voice.p, k->voice.n, why, sizeof why);
     if (!k->model) { snprintf(err, errcap, "voice model: %s", why); engine_close(k); return NULL; }
     return k;
 }
 
 static int engine_say(void *engine, const char *segment, int voice, float **pcm, size_t *samples,
                       char *err, size_t errcap) {
-    kitten_engine *k = engine;
+    voice_engine *k = engine;
     *pcm = NULL;
     *samples = 0;
     char ipa[4 * OC_TTS_SEGMENT_CHARS + 1024];
@@ -91,24 +90,24 @@ static int engine_say(void *engine, const char *segment, int voice, float **pcm,
     size_t chars = 0;
     for (const unsigned char *p = (const unsigned char *)segment; *p; p++)
         if ((*p & 0xC0) != 0x80) chars++;
-    return kitten_say(k->model, ipa, chars, voice, pcm, samples, err, errcap) == 0 ? 0 : -1;
+    return tts_voice_say(k->model, ipa, chars, voice, pcm, samples, err, errcap) == 0 ? 0 : -1;
 }
 
 /* The names a person sees, from the model's own voice aliases. */
-static const char *VOICE_LABELS[KITTEN_VOICES] = {
+static const char *VOICE_LABELS[TTS_VOICE_COUNT] = {
     "Jasper", "Bella", "Bruno", "Luna", "Hugo", "Rosie", "Leo", "Kiki",
 };
 
-static const char *engine_voice_id(int voice) { return kitten_voice_name(voice); }
+static const char *engine_voice_id(int voice) { return tts_voice_name(voice); }
 static const char *engine_voice_label(int voice) {
-    return voice >= 0 && voice < KITTEN_VOICES ? VOICE_LABELS[voice] : NULL;
+    return voice >= 0 && voice < TTS_VOICE_COUNT ? VOICE_LABELS[voice] : NULL;
 }
 
-static const oc_tts_engine KITTEN_ENGINE = {
+static const oc_tts_engine VOICE_ENGINE = {
     .version = OC_TTS_MODEL_VERSION,
     .lang = OC_TTS_LANG,
-    .rate = KITTEN_RATE,
-    .voices = KITTEN_VOICES,
+    .rate = TTS_VOICE_RATE,
+    .voices = TTS_VOICE_COUNT,
     .ctx = NULL,
     .voice_id = engine_voice_id,
     .voice_label = engine_voice_label,
@@ -121,7 +120,7 @@ static const oc_tts_engine KITTEN_ENGINE = {
 const oc_tts_engine *oc_tts_engine_for(const char *lang) {
     /* Asked by name even with one row, so that adding the second is adding a row
      * rather than finding every caller that assumed there was only ever one. */
-    if (lang && *lang && strcmp(lang, KITTEN_ENGINE.lang) == 0) return &KITTEN_ENGINE;
+    if (lang && *lang && strcmp(lang, VOICE_ENGINE.lang) == 0) return &VOICE_ENGINE;
     return NULL;
 }
 
@@ -141,7 +140,7 @@ static int say_wav(void *engine, const char *text, int voice, const char *path, 
     FILE *f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "openchimed: cannot write %s\n", path); return 1; }
     fwrite("RIFF\0\0\0\0WAVEfmt ", 1, 16, f);
-    wr32(f, 16); wr16(f, 1); wr16(f, 1); wr32(f, KITTEN_RATE); wr32(f, KITTEN_RATE * 2); wr16(f, 2); wr16(f, 16);
+    wr32(f, 16); wr16(f, 1); wr16(f, 1); wr32(f, TTS_VOICE_RATE); wr32(f, TTS_VOICE_RATE * 2); wr16(f, 2); wr16(f, 16);
     fwrite("data\0\0\0\0", 1, 8, f);
     size_t starts[256], lens[256], total = 0;
     int segs = oc_speakable_segments(text, strlen(text), OC_TTS_SEGMENT_CHARS, starts, lens, 256);
@@ -159,15 +158,15 @@ static int say_wav(void *engine, const char *text, int voice, const char *path, 
     }
     fseek(f, 4, SEEK_SET); wr32(f, (uint32_t)(36 + total * 2));
     fseek(f, 40, SEEK_SET); wr32(f, (uint32_t)(total * 2));
-    *secs = (double)total / KITTEN_RATE;
+    *secs = (double)total / TTS_VOICE_RATE;
     return fclose(f) == 0 && total ? 0 : 1;
 }
 
 int oc_tts_say(const char *voice_name, const char *text, const char *path) {
-    int voice = kitten_voice_index(voice_name);
+    int voice = tts_voice_index(voice_name);
     if (voice < 0) {
         fprintf(stderr, "openchimed: no voice '%s'; voices:", voice_name);
-        for (int i = 0; i < KITTEN_VOICES; i++) fprintf(stderr, " %s", kitten_voice_name(i));
+        for (int i = 0; i < TTS_VOICE_COUNT; i++) fprintf(stderr, " %s", tts_voice_name(i));
         fprintf(stderr, "\n");
         return 2;
     }
@@ -185,7 +184,7 @@ int oc_tts_say(const char *voice_name, const char *text, const char *path) {
         uint8_t *mp4;
         size_t len;
         uint32_t ms;
-        oc_tts_status st = oc_tts_render(&KITTEN_ENGINE, engine, text, voice, &mp4, &len, &ms, err, sizeof err);
+        oc_tts_status st = oc_tts_render(&VOICE_ENGINE, engine, text, voice, &mp4, &len, &ms, err, sizeof err);
         rc = 1;
         if (st == OC_TTS_NOTHING) fprintf(stderr, "openchimed: nothing to say\n");
         else if (st != OC_TTS_OK) fprintf(stderr, "openchimed: %s\n", err);

@@ -3,9 +3,13 @@
  * or refused, never silently replaced; unset, the system directory wins over the
  * one beside the executable; and a manifest check refuses a directory from
  * another build, an altered or missing file, a required file left unlisted, a
- * malformed line and a path that would leave the directory. */
+ * malformed line and a path that would leave the directory; and the files a
+ * read-aloud build ships (OC_TTS_DATA_FILES) are the voice model's data, its
+ * licence and the pronunciation data, each in the tree under ttskit/data/, from
+ * where tts/manifest copies them (mk/daemon.mk). */
 #include "check.h"
 #include "testenv.h"
+#include "tts.h"
 #include "tts_data.h"
 
 #include <stdio.h>
@@ -49,11 +53,11 @@ int run_tts_data_tests(void) {
     snprintf(data, sizeof data, "%s/data", root);
     snprintf(sub, sizeof sub, "%s/data/en-US", root);
     mkdir(data, 0700); mkdir(sub, 0700);
-    snprintf(a, sizeof a, "%s/model.ort", data);
+    snprintf(a, sizeof a, "%s/voice.bin", data);
     snprintf(b, sizeof b, "%s/en-US/lexicon.bin", data);
     put(a, "model bytes");
     put(b, "lexicon bytes");
-    const char *const files[] = { "model.ort", "en-US/lexicon.bin", NULL };
+    const char *const files[] = { "voice.bin", "en-US/lexicon.bin", NULL };
     CHECK(oc_tts_data_write_manifest(data, "en-US/test-1", files, err, sizeof err) == 0);
 
     /* The directory it was written for verifies. */
@@ -65,9 +69,9 @@ int run_tts_data_tests(void) {
 
     /* A required file the manifest does not list is refused: a manifest over half
      * the data would otherwise vouch for the whole. */
-    const char *const more[] = { "model.ort", "en-US/lexicon.bin", "voices.npz", NULL };
+    const char *const more[] = { "voice.bin", "en-US/lexicon.bin", "VOICE-LICENSE", NULL };
     err[0] = '\0';
-    CHECK(oc_tts_data_verify(data, "en-US/test-1", more, err, sizeof err) == -1 && contains(err, "does not list voices.npz"));
+    CHECK(oc_tts_data_verify(data, "en-US/test-1", more, err, sizeof err) == -1 && contains(err, "does not list VOICE-LICENSE"));
 
     /* An altered file is refused. */
     put(b, "lexicon bytes, edited");
@@ -102,6 +106,35 @@ int run_tts_data_tests(void) {
     oc_tts_map_close(&m);
     char gone[256]; snprintf(gone, sizeof gone, "%s/nope", root);
     CHECK(oc_tts_map_open(gone, &m) == -1);
+
+    /* What a read-aloud build ships: the voice model's data and its licence, and
+     * the pronunciation data, all from the tree's ttskit/data/. */
+    static const char *const SHIPPED[] = { "voice.bin", "en-US/lexicon.bin", "en-US/guesses.bin", "VOICE-LICENSE" };
+    size_t nfiles = 0;
+    while (OC_TTS_DATA_FILES[nfiles]) nfiles++;
+    CHECK(nfiles == sizeof SHIPPED / sizeof SHIPPED[0]);
+    for (size_t i = 0; i < nfiles && i < sizeof SHIPPED / sizeof SHIPPED[0]; i++) {
+        CHECK(strcmp(OC_TTS_DATA_FILES[i], SHIPPED[i]) == 0);
+        char rel[128], tree[1024];
+        snprintf(rel, sizeof rel, "ttskit/data/%s", OC_TTS_DATA_FILES[i]);
+        CHECK(access(oc_test_tree_path(rel, tree, sizeof tree), R_OK) == 0);
+    }
+    /* A directory of exactly those verifies against a manifest over them; one
+     * without the licence does not. */
+    char ship[256], shipsub[256], f[400];
+    snprintf(ship, sizeof ship, "%s/ship", root);
+    snprintf(shipsub, sizeof shipsub, "%s/ship/en-US", root);
+    mkdir(ship, 0700); mkdir(shipsub, 0700);
+    for (size_t i = 0; i < nfiles; i++) {
+        snprintf(f, sizeof f, "%s/%s", ship, OC_TTS_DATA_FILES[i]);
+        put(f, OC_TTS_DATA_FILES[i]);
+    }
+    CHECK(oc_tts_data_write_manifest(ship, OC_TTS_MODEL_VERSION, OC_TTS_DATA_FILES, err, sizeof err) == 0);
+    CHECK(oc_tts_data_verify(ship, OC_TTS_MODEL_VERSION, OC_TTS_DATA_FILES, err, sizeof err) == 0);
+    snprintf(f, sizeof f, "%s/VOICE-LICENSE", ship);
+    unlink(f);
+    err[0] = '\0';
+    CHECK(oc_tts_data_verify(ship, OC_TTS_MODEL_VERSION, OC_TTS_DATA_FILES, err, sizeof err) == -1 && contains(err, "missing"));
 
     oc_test_rmtree(root);
     CHECK(access(root, F_OK) != 0);

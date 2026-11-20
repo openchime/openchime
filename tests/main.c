@@ -83,12 +83,16 @@ int run_sock_tests(void);
 int run_speakable_tests(void);
 int run_action_tests(void);
 int run_ttskit_tests(void);
+int run_nnkit_tests(void);
+int run_sttkit_tests(void);
+int run_recognizer_parity_tests(void);
 int run_tts_worker_tests(void);
 int run_summary_tests(void);
 int run_voice_pick_tests(void);
 int run_tts_data_tests(void);
 int run_stt_tests(void);
 int run_voice_tests(void);
+int run_voice_parity_tests(void);
 int run_unfurl_tests(void);
 int run_sdltext_map_tests(void);
 int run_sdltext_unicode_tests(void);
@@ -261,10 +265,9 @@ static void print_times(void) {
  *            ThreadSanitizer, and only there; PLAIN, it does not, and the
  *            full suite runs it plainly. Checked at run time, not trusted
  *            (thread_unlisted, below). TIMED is THREADS and plainly as well,
- *            for a FULL suite whose speed verdicts (CHECK_SPEED) or timer
- *            tests (TIMER_ONLY), which the sanitizer does not run, would
- *            otherwise be judged nowhere: a FAST suite's are judged by the
- *            fast suite. WALK starts threads too, but the full suite runs it
+ *            for a FULL suite whose timer tests (TIMER_ONLY), which the
+ *            sanitizer does not run, would otherwise be judged nowhere: a
+ *            FAST suite's are judged by the fast suite. WALK starts threads too, but the full suite runs it
  *            plainly and not under ThreadSanitizer: an end-to-end walk of the
  *            daemon or the client, or real-time media, whose sanitizer run
  *            would cost minutes against the pass's 30 seconds; the suites that
@@ -332,13 +335,17 @@ static const struct suite {
     S(run_sock_tests,            FAST, PLAIN),
     S(run_speakable_tests,       FAST, PLAIN),
     S(run_action_tests,          FAST, PLAIN),
+    S(run_nnkit_tests,           FAST, PLAIN),
     S(run_ttskit_tests,          FAST, PLAIN),
     S(run_tts_worker_tests,      FAST, THREADS),
     S(run_summary_tests,         FAST, WALK),
     S(run_voice_pick_tests,      FAST, PLAIN),
     S(run_tts_data_tests,        FAST, PLAIN),
+    S(run_sttkit_tests,          FAST, PLAIN),
     S(run_stt_tests,             FAST, THREADS),
     S(run_voice_tests,           FAST, PLAIN),
+    S(run_voice_parity_tests,    FULL, PLAIN),
+    S(run_recognizer_parity_tests, FULL, PLAIN),
     S(run_unfurl_tests,          FAST, PLAIN),
     S(run_sdltext_map_tests,     FAST, PLAIN),
     S(run_sdltext_unicode_tests, FAST, PLAIN),
@@ -527,8 +534,6 @@ int main(int argc, char **argv) {
     if (g_ran == 0) { printf("\nFAILED: the selection names no suite\n"); return 1; }
     print_times();
     g_skips += oc_test_skips;   /* the suites run in this process */
-    const char *timing = getenv("OC_TEST_TIMING");
-    if (timing && strcmp(timing, "0") == 0) printf("\ntiming-dependent checks not judged (OC_TEST_TIMING=0)\n");
     if (g_skips) printf("\n%d check(s) skipped: see the SKIP lines above (in CI each is a failure)\n", g_skips);
     if (total == 0) { printf("\nOK: all suites passed\n"); return 0; }
     printf("\nFAILED: %d check(s) across all suites\n", total);

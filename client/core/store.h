@@ -25,6 +25,12 @@
 
 typedef struct oc_store oc_store;
 
+/* The version of the credential entry this client writes (store.c, "credential
+ * blob"). An entry of an older version is read, and upgraded to this one by the
+ * next write; one of a newer version is not read. Public so the tests compare
+ * against it, and so move with the next version rather than pinning this one. */
+#define OC_STORE_ENTRY_VERSION 5
+
 /* Create a store handle. `path` is vestigial — nothing is written to disk — and
  * only distinguishes "persistence on" from NULL ("off", which the sign-in
  * screen's Remember-me uses). NULL on failure. */

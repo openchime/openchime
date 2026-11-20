@@ -22,6 +22,22 @@ typedef struct {
 /* A monotonic clock in microseconds. Video frames and microphone buffers are
  * stamped from it, so neither device's own timestamps have to be trusted. */
 int64_t oc_media_clock_us(void);
+/* Wait until the clock reads `at_us` or later, for at most `max_ms` of real
+ * time: 1 when it does, 0 when the wait ran out first. What the media threads
+ * wait on, so that a clock a test holds holds them too. */
+int     oc_media_clock_wait_until(int64_t at_us, int max_ms);
+
+/* A test's clock. oc_media_clock_hold() stops it where it reads; from then on
+ * it moves only by oc_media_clock_advance_us(), a step at a time, and the
+ * media threads, which wait on it, with it. Unheld, an advance puts the clock
+ * `us` further ahead at once, as if that much time had passed. 0 puts back the
+ * system's clock, unheld, which is for when nothing that reads it is running.
+ * oc_media_clock_waiting() is how many threads are waiting on the held clock
+ * for a time still to come: the work they had for the time it reads is done.
+ * Any thread. */
+void    oc_media_clock_hold(void);
+void    oc_media_clock_advance_us(int64_t us);
+int     oc_media_clock_waiting(void);
 
 /* An I420 frame whose planes live in one allocation (stride == plane width).
  * Returns 0 on success; the frame is zeroed on failure. */

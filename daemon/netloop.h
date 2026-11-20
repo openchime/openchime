@@ -96,6 +96,13 @@ void oc_netloop_set_unauthed_ms(uint64_t ms);
 #define OC_SESSION_SEEN_MS (60u * 60u * 1000u)
 void oc_netloop_set_seen_ms(uint64_t ms);
 
+/* A test's clock: from now on the loop's clock reads `ms` further ahead of the
+ * system's, as if that much time had passed at once -- a window closing, a
+ * code's life running out -- without a test sitting it out. 0 puts it back,
+ * which is for when no loop runs (a clock going back is not one the loop
+ * expects). Any thread. */
+void oc_netloop_advance_clock_ms(uint64_t ms);
+
 /* The names a passkey may be made for (AUTH.md §8.6): the workspace's own,
  * comma-separated, when its certificate is one a CA vouches for -- never a
  * self-signed daemon's, nor the loopback tunnel's. NULL or "": none. Before

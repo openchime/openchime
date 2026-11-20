@@ -8,12 +8,12 @@
 # one process (scripts/test/fast/suites.sh sets OC_TEST_JOBS=1; docs/TESTING.md,
 # "One build at a time"). The binary
 # always carries read-aloud's and voice input's test paths (stub engines) and
-# never needs ONNX Runtime, llama.cpp or Emscripten, whatever the switches say.
-TEST_INC  := $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT \
+# never needs llama.cpp or Emscripten, whatever the switches say.
+TEST_INC  := $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) $(STTKIT_INC) -DOC_TTS -DOC_STT \
              -Itests -Iclient/gui/app -Iclient/gui/platform -Iclient/shared -Ituikit -Ithird_party/qrcodegen
 # Sorted: the daemon and the text layout both carry utf8proc, compiled once.
 TEST_ALL_SRC := $(sort $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) \
-                $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC))
+                $(TTSKIT_SRC) $(NNKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC))
 # One object per source, in a tree of its own (mk/sources.mk, "Objects"),
 # compiled with the flags the binary always had; the link takes them in the
 # sorted order above, then SQLite and Argon2 (the daemon's own objects) and the
@@ -52,7 +52,7 @@ $(TSAN_BIN): $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | b
 
 # --- The release's compiler (CI) ----------------------------------------------
 # The daemon's sources through the RELEASE's compiler, with the release's flags,
-# stopping short of the link (the release links an ONNX Runtime built by the same
+# stopping short of the link (the release links a llama.cpp built by the same
 # compiler, which CI does not build): real objects, under build/relcc, since
 # some warnings are raised only while generating code, one rule per object so
 # that `make -j` compiles them all at once. A newer clang refuses things CI's
@@ -64,7 +64,7 @@ $(TSAN_BIN): $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | b
 # makes any warning clang raises and gcc does not fatal.
 RELEASE_CC ?= $(ZIG) cc -target x86_64-linux-gnu.2.34
 RELEASE_CC_TEST_SRC := $(TEST_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) \
-                       $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC)
+                       $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(NNKIT_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC)
 # The release compiler as a file, like $(CC_STAMP): a different one recompiles.
 RELCC_DIR   := build/relcc
 RELCC_STAMP := $(RELCC_DIR)/.cc
@@ -134,7 +134,8 @@ build/bench_load: tests/bench_load.c tests/testsignin.c $(SHARED_SRC) $(wildcard
 	    tests/bench_load.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -lpthread -o $@
 # The sign-in helper as a command, for the shell scripts: prints the token and
 # the verifier a client presents on AUTH, and presents one (`present`) for a
-# script that played the browser itself (scripts/test/full/web.sh).
+# script that played the browser itself (the browser checks of the daemon's
+# pages, run by hand, outside both suites).
 build/signin: tests/testsignin_main.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build-dir
 	$(CC) $(CFLAGS) -O0 -g -Ishared -Itests -I$(MBEDTLS_INC) \
 	    tests/testsignin_main.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
@@ -145,6 +146,12 @@ build/s3_smoke: tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_cache.c d
 	    daemon/config.c daemon/config_table.c daemon/proxyproto.c shared/url.c shared/tls.c \
 	    third_party/ca-roots/ca_roots.c $(MBEDTLS_LIBS) -lpthread -o $@
 	@echo "built $@ -- needs OPENCHIME_S3 to run"
-# ttskit's data tool (docs/TTSKIT.md).
-build/tts_pack: $(TTSKIT_SRC) ttskit/tts_pack.c $(wildcard ttskit/*.h) | build-dir
-	$(CC) $(CFLAGS) $(TTSKIT_INC) $(TTSKIT_SRC) ttskit/tts_pack.c -lm -o $@
+# sttkit's check (docs/STTKIT.md): the recognizer against its references, timed.
+STT_CHECK_SRC := $(STTKIT_SRC) $(NNKIT_SRC) sttkit/stt_check.c
+build/stt_check: $(STT_CHECK_SRC) $(STTKIT_HDRS) $(NNKIT_HDRS) | build-dir
+	$(CC) $(CFLAGS) $(KIT_CFLAGS) $(STTKIT_INC) $(STT_CHECK_SRC) -lm -o $@
+# ttskit's data tool (docs/TTSKIT.md). `say` turns IPA into the voice model's
+# tokens with the daemon's token function, as the daemon does.
+TTS_PACK_SRC := $(TTSKIT_SRC) $(NNKIT_SRC) ttskit/tts_pack.c daemon/tts_voice_tokens.c
+build/tts_pack: $(TTS_PACK_SRC) $(wildcard ttskit/*.h) $(NNKIT_HDRS) daemon/tts_voice.h | build-dir
+	$(CC) $(CFLAGS) $(KIT_CFLAGS) $(TTSKIT_INC) -Idaemon $(TTS_PACK_SRC) -lm -o $@

@@ -101,7 +101,7 @@ int   oc_plat_nav_go(int delta) {
 }
 /* The page goes to the daemon's sign-in page itself; it comes back to /app/
  * with the token (oc_plat_signin_result). In development mode, with
- * OPENCHIME_DEV_SIGNIN=user:password set (TESTING.md) is its own harness: it
+ * OPENCHIME_DEV_SIGNIN=user:password set (tools/gui/README.md) is its own harness: it
  * posts the page's form as the person would type it -- same origin, so the
  * browser sends the Origin the page requires -- and follows the page's 303
  * back here with the token. The product path, with the typing done. */
@@ -161,6 +161,7 @@ void oc_plat_frame_shown(void) {
 }
 const char *oc_plat_mic_settings_name(void) { return "the browser's site settings"; }
 void oc_plat_share_limits(int *max_w, int *max_h) { *max_w = 960; *max_h = 540; }
+void oc_plat_camera_limits(int *max_w, int *max_h, int *max_fps) { *max_w = 640; *max_h = 480; *max_fps = 15; }
 const char *oc_plat_privacy_name(void) { return "The browser"; }
 /* A page cannot open the browser's site settings; the address bar's icon is where they are. */
 int oc_plat_has_privacy_settings(void) { return 0; }

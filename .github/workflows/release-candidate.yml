@@ -102,9 +102,8 @@ jobs:
     needs: test
     runs-on: ubuntu-24.04
     # With both of the runner's CPUs compiling, a warm run took about 15
-    # minutes and a cold speech cache, which compiles ONNX Runtime, about 25
-    # more for each architecture. One file at a time, on one CPU, is allowed
-    # twice that.
+    # minutes and a cold llama.cpp cache a few more for each architecture.
+    # One file at a time, on one CPU, is allowed twice that.
     timeout-minutes: 150
     environment: release
     permissions:
@@ -308,27 +307,21 @@ jobs:
           name: web-client
           path: prebuilt/web
       # --- The amd64 daemon and its packages ----------------------------------------
-      # Read-aloud's engine and model (ARCH-111), built by make with the same
-      # toolchain and glibc target as the daemon: ONNX Runtime compiled from
-      # source as one minimal static archive, per architecture; the voice model
-      # converted; and voice input's recognizer files, fetched as published
-      # (ARCH-112). Functions of the files in the key, so a hit skips about 25
-      # minutes and a change rebuilds. One cache per architecture, both with
+      # The summaries engine (ARCH-116), llama.cpp, built by make with the same
+      # toolchain and glibc target as the daemon. Read-aloud's and voice
+      # input's models run in the tree's own C, their data in the tree
+      # (ARCH-111, ARCH-112). A function of the files in the key, so a hit skips
+      # the build and a change rebuilds. One cache per architecture, both with
       # the same path list (a cache's path list is part of its version): what
       # an architecture never builds is simply absent from what it saves.
       - id: c-tts-amd64
-        name: Restore the amd64 speech engine and models
+        name: Restore the amd64 summaries engine
         uses: actions/cache/restore@v6
         with:
           path: &tts-release-path |
-            third_party/onnxruntime-1.30.0
-            third_party/onnxruntime-1.30.0-aarch64
-            third_party/onnxruntime-1.30.0-build/out/MinSizeRel/_deps/protobuf-build/protoc*
             third_party/llamacpp-0.5.0
             third_party/llamacpp-0.5.0-aarch64
-            build/kitten
-            build/moonshine
-          key: &tts-amd64-key tts-release-amd64-zig0.17.1-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+          key: &tts-amd64-key tts-release-amd64-zig0.17.1-${{ hashFiles('scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh') }}
       # mbedTLS and libopus as the release builds them: with zig's clang
       # against glibc 2.34 for the binary that ships. CI's copies are
       # gcc-built for the host and cannot stand in, so these have caches of
@@ -365,11 +358,10 @@ jobs:
           DIST: dist/linux-amd64
         run: make build-all PART=packages ARCH=x86_64 DIST="$DIST" PKG_VERSION="$VERSION" OC_BUILD_ID="$BUILD_ID"
       # Saved as soon as the build has run, whether or not the job goes on to
-      # pass: every run that failed downstream of the engine build used to
-      # pay the twenty minutes again. The scripts leave a half-made archive or
-      # model in a .new directory, never under these paths, so what is saved
-      # is whole.
-      - name: Save the amd64 speech engine and models
+      # pass, so a run that failed downstream of the engine build does not pay
+      # for it again. The script leaves a half-made archive in a .new
+      # directory, never under these paths, so what is saved is whole.
+      - name: Save the amd64 summaries engine
         if: always() && steps.build-amd64.outcome != 'skipped' && steps.c-tts-amd64.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
@@ -438,21 +430,21 @@ jobs:
       # is now. So the amd64 release's own libraries are set aside first, and
       # the gcc-built host mbedTLS restored in their place, from the cache
       # test-all.yml saves under the same key: the arm64 build then sees
-      # exactly what it saw on a runner of its own, and the arm64 speech cache
+      # exactly what it saw on a runner of its own, and the arm64 summaries cache
       # saves only what is its own.
       - name: Set the amd64 release's libraries aside
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/amd64"
-          for d in mbedtls-3.6.7 onnxruntime-1.30.0 llamacpp-0.5.0; do
+          for d in mbedtls-3.6.7 llamacpp-0.5.0; do
             if [ -e "third_party/$d" ]; then mv "third_party/$d" "$RUNNER_TEMP/amd64/"; fi
           done
       - id: c-tts-arm64
-        name: Restore the arm64 speech engine and models
+        name: Restore the arm64 summaries engine
         uses: actions/cache/restore@v6
         with:
           path: *tts-release-path
-          key: &tts-arm64-key tts-release-arm64-zig0.17.1-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+          key: &tts-arm64-key tts-release-arm64-zig0.17.1-${{ hashFiles('scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh') }}
       - id: c-mbedtls-arm64
         name: Restore the arm64 release's mbedTLS
         uses: actions/cache/restore@v6
@@ -480,7 +472,7 @@ jobs:
           # licence file assembled outside make (packaging/licenses.sh).
           OC_ARCH: aarch64
         run: make build-all PART=packages ARCH=aarch64 DIST="$DIST" PKG_VERSION="$VERSION" OC_BUILD_ID="$BUILD_ID" MANIFEST_HOST_BIN="$PWD/dist/linux-amd64/openchimed"
-      - name: Save the arm64 speech engine and models
+      - name: Save the arm64 summaries engine
         if: always() && steps.build-arm64.outcome != 'skipped' && steps.c-tts-arm64.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:

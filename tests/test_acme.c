@@ -401,7 +401,7 @@ static struct {
     char     ari_last_id[200], order_replaces[200];
     /* Orders: fail every one; and when each came. */
     int      order_fail, n_orders;
-    uint64_t order_ms[32];                  /* wall clock: the domain ARI's window is in */
+    uint64_t order_ms[32];                  /* the worker's clock (clock_ms): the domain ARI's window is in */
     uint64_t order_mono[32];                /* monotonic: for the intervals between them */
 } g_fake;
 
@@ -411,6 +411,30 @@ static struct {
 static uint64_t wall_ms(void) {
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* The clock the worker reads, and the fake CA with it: the wall clock, or,
+ * when a test sets it, a time the test moves (0: the wall clock). Each read by
+ * the worker is counted, so a test can wait until the worker has looked at the
+ * time it was given. */
+static uint64_t g_test_clock_ms;
+static int g_clock_reads;
+static uint64_t clock_ms(void) {
+    uint64_t t = __atomic_load_n(&g_test_clock_ms, __ATOMIC_ACQUIRE);
+    return t ? t : wall_ms();
+}
+static uint64_t worker_clock(void *ctx) {
+    (void)ctx;
+    __atomic_add_fetch(&g_clock_reads, 1, __ATOMIC_ACQ_REL);
+    return clock_ms();
+}
+/* Set the clock to `t` and wait until the worker has looked at it and done
+ * what it would at that time: two reads after it is set, so the pass that
+ * read it has ended. */
+static int clock_to(uint64_t t) {
+    __atomic_store_n(&g_test_clock_ms, t, __ATOMIC_RELEASE);
+    int r0 = __atomic_load_n(&g_clock_reads, __ATOMIC_ACQUIRE);
+    return WAIT_UNTIL(__atomic_load_n(&g_clock_reads, __ATOMIC_ACQUIRE) >= r0 + 2, 10000);
 }
 
 static void rfc3339(uint64_t ms, char *out, size_t cap) {
@@ -591,7 +615,7 @@ static void acme_request(int fd, const char *method, const char *path, const cha
     if (!strncmp(path, "/renewal-info/", 14) && g_fake.ari) {
         pthread_mutex_lock(&g_fake.mu);
         snprintf(g_fake.ari_last_id, sizeof g_fake.ari_last_id, "%s", path + 14);
-        uint64_t now = wall_ms(), st = g_fake.ari_start_ms, en = g_fake.ari_end_ms;
+        uint64_t now = clock_ms(), st = g_fake.ari_start_ms, en = g_fake.ari_end_ms;
         if (g_fake.ari_open_once && g_fake.ari_asked == 0) { st = now - 60000; en = now + 60000; }
         g_fake.ari_asked++;
         int ra = g_fake.ari_retry_s;
@@ -623,7 +647,7 @@ static void acme_request(int fd, const char *method, const char *path, const cha
     if (!strcmp(path, "/order")) {
         pthread_mutex_lock(&g_fake.mu);
         if (g_fake.n_orders < 32) {
-            g_fake.order_ms[g_fake.n_orders] = wall_ms();
+            g_fake.order_ms[g_fake.n_orders] = clock_ms();
             g_fake.order_mono[g_fake.n_orders] = oc_test_mono_ms();
         }
         g_fake.n_orders++;
@@ -996,6 +1020,7 @@ static oc_certs *worker_on(const char *dir, int life_s) {
     o.account_key_pem = g_kept_key; o.account_url = g_kept_url;
     o.store_cert = keep_first; o.retry_ms = 200; o.poll_ms = 20; o.check_ms = 100; o.ari_check_ms = 100;
     o.alert = record_alert;
+    o.now_ms = worker_clock;
     alerts_reset();
     pthread_mutex_lock(&g_fake.mu);
     g_fake.n_orders = 0;                                          /* this worker's orders, from the first */
@@ -1053,26 +1078,37 @@ static void test_worker_ari(void) {
 
     /* Later: a two-second life would renew within 1.3 s; the CA's window,
      * three seconds on, holds it -- the second order comes inside the window
-     * the CA gave, which is the clock ARI's times are in. Waiting for that
-     * window is a timer's test: the ordinary build only. */
-    if (OC_UNDER_TSAN) { g_fake.ari = 0; g_ca_backdate_s = 60; return; }
+     * the CA gave, which is the clock ARI's times are in. That clock is the
+     * test's: held short of the window, then moved through it a step at a
+     * time, each step looked at by the worker before the next. */
+    uint64_t t0 = wall_ms();
+    __atomic_store_n(&g_test_clock_ms, t0, __ATOMIC_RELEASE);
     pthread_mutex_lock(&g_fake.mu);
     g_fake.ari_open_once = 0; g_fake.ari_asked = 0;
-    g_fake.ari_start_ms = wall_ms() + 3000; g_fake.ari_end_ms = g_fake.ari_start_ms + 400;
+    g_fake.ari_start_ms = t0 + 3000; g_fake.ari_end_ms = g_fake.ari_start_ms + 400;
+    uint64_t start = g_fake.ari_start_ms, end = g_fake.ari_end_ms;
     pthread_mutex_unlock(&g_fake.mu);
     w = worker_on(dir, 2);
     CHECK(w != NULL);
-    if (!w) return;
+    if (!w) { __atomic_store_n(&g_test_clock_ms, 0, __ATOMIC_RELEASE); return; }
     CHECK(WAIT_UNTIL(obtained(w) >= 1, 10000));
-    CHECK(WAIT_UNTIL(obtained(w) >= 2, 20000));
+    CHECK(WAIT_UNTIL(fake_int(&g_fake.ari_asked) >= 1, 10000));   /* the CA's window is the worker's */
+    /* Past its own window (1.2 s on), a moment short of the CA's: held. */
+    CHECK(clock_to(start - 1));
+    CHECK(fake_int(&g_fake.n_orders) == 1);
+    /* Through the CA's window, a step at a time: renewed at the first step at
+     * or past the moment drawn from it. */
+    for (uint64_t t = start; t <= end && fake_int(&g_fake.n_orders) < 2; t += 100) CHECK(clock_to(t));
+    CHECK(WAIT_UNTIL(obtained(w) >= 2, 10000));
     oc_certs_stop(w);
+    __atomic_store_n(&g_test_clock_ms, 0, __ATOMIC_RELEASE);
     pthread_mutex_lock(&g_fake.mu);
     int orders = g_fake.n_orders;
-    uint64_t second = g_fake.order_ms[1], start = g_fake.ari_start_ms, end = g_fake.ari_end_ms;
+    uint64_t second = g_fake.order_ms[1];
     int ari_asked = g_fake.ari_asked;
     pthread_mutex_unlock(&g_fake.mu);
     CHECK(orders >= 2 && second >= start);                        /* held until the window opened */
-    CHECK_SPEED(orders >= 2 && second <= end + 2000);             /* and renewed in it, not long after */
+    CHECK(orders >= 2 && second <= end);                          /* and renewed in it */
     CHECK(ari_asked >= 1);
     /* A certificate within a week of expiry, not renewed, is raised -- once for
      * its day, not at every look -- and its renewal clears it. */

@@ -30,6 +30,8 @@
 #include "tls.h"
 #include "totp.h"
 #include "tts_data.h"   /* the beside-the-binary data lookup: speech data and the web client's wasm */
+#include "voice_pack.h"  /* --voice-pack: the voice model's data file */
+#include "recognizer_pack.h"  /* --recognizer-pack: the recognizer's data file */
 #include "webapp.h"
 /* The engines' headers come in whether or not the engines do: the data
  * manifests below name each model's version, and a daemon built with
@@ -459,6 +461,17 @@ int main(int argc, char **argv) {
         return oc_tts_data_write_manifest_cli(argv[2], OC_TTS_MODEL_VERSION, OC_TTS_DATA_FILES);
     if (argc == 3 && strcmp(argv[1], "--stt-manifest") == 0)
         return oc_tts_data_write_manifest_cli(argv[2], OC_STT_MODEL_VERSION, OC_STT_DATA_FILES);
+    /* The voice model's data file (voice_pack.h), from the model as it is
+     * published: in every build, read-aloud or not, since it reads and writes
+     * files and runs no model. */
+    if (argc >= 2 && strcmp(argv[1], "--voice-pack") == 0) {
+        if (argc != 5) { fprintf(stderr, "usage: openchimed --voice-pack MODEL.onnx VOICES.npz OUT\n"); return 2; }
+        return oc_voice_pack_cli(argv[2], argv[3], argv[4]);
+    }
+    /* The recognizer's data file (recognizer_pack.h), from the model as it is
+     * published, and the listing of its graphs: in every build, voice input or
+     * not, for the same reason. */
+    if (argc >= 2 && strcmp(argv[1], "--recognizer-pack") == 0) return oc_recognizer_pack_cli(argc, argv);
     /* The registry's views (config.h): the reference CONFIG.md carries, the
      * packaged environment file, and a check of this environment -- or of a
      * file, applied over it -- through the same loader the daemon starts with. */

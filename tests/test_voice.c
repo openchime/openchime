@@ -7,10 +7,20 @@
  *   - the ERLE harness AUDIO.md §6.4 specifies, run against the speexdsp
  *     processor: a far-end signal through a synthetic room into the microphone,
  *     echo return loss enhancement measured in dB, re-convergence under clock
- *     drift, and near-end speech surviving double-talk. */
+ *     drift, and near-end speech surviving double-talk.
+ *
+ * And, as the FULL suite voice_parity (run_voice_parity_tests), read-aloud's
+ * voice model against its references (tests/data/voice, made by
+ * tests/manual/voice_ref.c with ONNX Runtime): with the model's noise off, each
+ * fixture renders with the reference's sample count and at least 40 dB SNR
+ * against the noise-off reference; with it on, the noise the pitch source adds
+ * has the variance the model's operators specify, within 10%. It reads the
+ * committed ttskit/data/voice.bin, and fails, saying so, where that is missing. */
 #include "check.h"
 #include "oc_processor.h"
 #include "oc_segmenter.h"
+#include "testenv.h"
+#include "tts_priv.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -320,5 +330,125 @@ int run_voice_tests(void) {
     printf("test_voice: segmenter (free talk, the cap, push to talk), ERLE harness (converged, 100 ppm drift, double-talk)\n");
     test_segmenter();
     test_erle();
+    return failures;
+}
+
+/* ---- read-aloud's voice model against ONNX Runtime -------------------------- */
+
+#define PARITY_DB 40.0        /* noise off: SNR against the reference */
+#define NOISE_TOL 0.10        /* noise on: the noise's variance, relative */
+
+/* A whole little-endian file of `n` elements of `size` bytes (n 0: any), or NULL. */
+static void *read_all(const char *path, size_t size, size_t *n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    void *p = NULL;
+    long len = fseek(f, 0, SEEK_END) == 0 ? ftell(f) : -1;
+    if (len > 0 && len % (long)size == 0 && (!*n || (size_t)len == *n * size) && fseek(f, 0, SEEK_SET) == 0 &&
+        (p = malloc((size_t)len)) && fread(p, 1, (size_t)len, f) != (size_t)len) {
+        free(p);
+        p = NULL;
+    }
+    fclose(f);
+    if (p) *n = (size_t)len / size;
+    return p;
+}
+
+/* One fixture: the noise-off render against its reference, and the noise. */
+static void parity_fixture(const voice *v, const char *dir, const char *name, const char *vid, int row, float speed,
+                           int tokens, const char *ids_file, const char *quiet_file, long quiet_samples) {
+    char path[1024], err[256] = "";
+    size_t nid = (size_t)tokens, nref = (size_t)quiet_samples, n = 0;
+    long long *ids64 = read_all(oc_test_path(path, sizeof path, dir, ids_file), 8, &nid);
+    float *ref = read_all(oc_test_path(path, sizeof path, dir, quiet_file), 4, &nref);
+    int *ids = malloc(sizeof(int) * (size_t)(tokens > 0 ? tokens : 1));
+    float style[VOICE_STYLE_DIM];
+    CHECK(ids64 && ref && ids && tokens > 0);
+    CHECK(voice_style(v, vid, (size_t)row, style) == 0);
+    if (!ids64 || !ref || !ids || tokens <= 0) goto out;
+    for (int i = 0; i < tokens; i++) ids[i] = (int)ids64[i];
+
+    float *pcm = voice_say(v, ids, tokens, style, speed, 0, 0, &n, err, sizeof err);
+    CHECK(pcm != NULL);
+    CHECK(n == nref);
+    double snr = -999;
+    if (pcm && n == nref) {
+        double s = 0, e = 0;
+        for (size_t i = 0; i < n; i++) {
+            double d = (double)pcm[i] - ref[i];
+            s += (double)ref[i] * ref[i];
+            e += d * d;
+        }
+        snr = e > 0 ? 10 * log10(s / e) : 999;
+    }
+    CHECK(snr >= PARITY_DB);
+    free(pcm);
+
+    /* The noise the source adds for this input, against 0.003 where voiced and
+     * 0.1 / 3 where not (the model's standard deviations). */
+    voice_front f;
+    double got = 0, want = 0;
+    if (voice_front_run(v, ids, tokens, style, speed, &f, err, sizeof err) == 0) {
+        size_t L = (size_t)f.frames * VOICE_FRAME;
+        float *har = malloc(sizeof(float) * (120 * (size_t)f.frames + 1) * 22), *nz = malloc(sizeof(float) * L * 9);
+        if (har && nz && voice_source(v, f.f0, f.frames, 1, 1, har, nz, err, sizeof err) == 0) {
+            double sum = 0, sq = 0;
+            for (size_t l = 0; l < L; l++) {
+                double a = f.f0[l / 300] > 10.0f ? 0.003 : 0.1 / 3.0;
+                want += 9 * a * a;
+                for (int h = 0; h < 9; h++) {
+                    sum += nz[l * 9 + h];
+                    sq += (double)nz[l * 9 + h] * nz[l * 9 + h];
+                }
+            }
+            double cnt = (double)L * 9;
+            got = sq / cnt - (sum / cnt) * (sum / cnt);
+            want /= cnt;
+        }
+        free(har); free(nz);
+        voice_front_free(&f);
+    }
+    CHECK(want > 0 && fabs(got / want - 1.0) <= NOISE_TOL);
+    printf("  %-14s %zu samples (reference %zu), %.2f dB; noise variance %.4g, the model's %.4g\n", name, n, nref, snr,
+           got, want);
+out:
+    free(ids64); free(ref); free(ids);
+}
+
+int run_voice_parity_tests(void) {
+    printf("test_voice: voice_parity -- the voice model against ONNX Runtime's renders, noise off and on\n");
+    char bin[1024], dir[1024], path[1024], line[1024], err[256] = "";
+    oc_test_tree_path("ttskit/data/voice.bin", bin, sizeof bin);
+    oc_test_tree_path("tests/data/voice", dir, sizeof dir);
+    voice *v = voice_open(bin, err, sizeof err);
+    if (!v) {
+        printf("  FAIL %s:%d  no voice data to check: %s (%s)\n", __FILE__, __LINE__, bin, err);
+        return failures + 1;
+    }
+    FILE *m = fopen(oc_test_path(path, sizeof path, dir, "manifest"), "r");
+    CHECK(m != NULL);
+    int fixtures = 0;
+    char name[64] = "", vid[32], ids_file[64];
+    int row = 0, tokens = 0, have = 0;
+    float speed = 0;
+    while (m && fgets(line, sizeof line, m)) {
+        char qname[64], quiet[64];
+        long qs, samples;
+        if (!strncmp(line, "#quiet ", 7)) {
+            if (have && sscanf(line, "#quiet %63s %63s %ld", qname, quiet, &qs) == 3 && !strcmp(qname, name)) {
+                parity_fixture(v, dir, name, vid, row, speed, tokens, ids_file, quiet, qs);
+                fixtures++;
+            }
+            have = 0;
+            continue;
+        }
+        if (line[0] == '#') continue;
+        CHECK(!have);                              /* every fixture has its noise-off reference */
+        have = sscanf(line, "%63s %31s %d %f %d %63s %ld", name, vid, &row, &speed, &tokens, ids_file, &samples) == 7;
+    }
+    CHECK(!have);
+    CHECK(fixtures >= 6);
+    if (m) fclose(m);
+    voice_close(v);
     return failures;
 }

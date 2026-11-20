@@ -1,12 +1,10 @@
 /* Tests for voice input's daemon half that need no model (ARCH-112,
- * docs/VOICE-INPUT.md §6): Moonshine's tokenizer decoding, the token ceiling,
- * spoken mentions, and the recognition worker with a stub engine -- order, a full
- * queue, the eventfd, opening only when needed and closing when idle. The real
- * model is exercised by the build job (openchimed --stt-hear). */
+ * docs/VOICE-INPUT.md §6): spoken mentions, and the recognition worker with a
+ * stub engine -- order, a full queue, the eventfd, opening only when needed and
+ * closing when idle. The recognizer itself is tests/test_sttkit.c's. */
 #include "check.h"
 #include "config.h"
 #include "stt_mentions.h"
-#include "stt_moonshine.h"
 #include "stt_worker.h"
 
 #include <poll.h>
@@ -16,61 +14,6 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-
-/* ---- the tokenizer ---- */
-
-static size_t put_token(uint8_t *out, const char *s) {
-    size_t n = strlen(s), w = 0;
-    if (n < 128) out[w++] = (uint8_t)n;
-    else { out[w++] = (uint8_t)(n % 128 + 128); out[w++] = (uint8_t)(n / 128); }
-    memcpy(out + w, s, n);
-    return w + n;
-}
-
-static void test_tokens(void) {
-    int failures_before = failures;
-    uint8_t table[1024];
-    size_t n = 0;
-    n += put_token(table + n, "<unk>");                 /* 0 */
-    n += put_token(table + n, "<s>");                   /* 1 */
-    n += put_token(table + n, "</s>");                  /* 2 */
-    n += put_token(table + n, "\xE2\x96\x81Send");      /* 3 */
-    n += put_token(table + n, "\xE2\x96\x81the");       /* 4 */
-    n += put_token(table + n, "\xE2\x96\x81rep");       /* 5 */
-    n += put_token(table + n, "ort.");                  /* 6 */
-    table[n++] = 0;                                     /* 7: unused id */
-    n += put_token(table + n, "\xE2\x96\x81" "caf\xC3\xA9"); /* 8 */
-    char long_tok[200];
-    memset(long_tok, 'x', sizeof long_tok - 1);
-    long_tok[sizeof long_tok - 1] = 0;
-    n += put_token(table + n, long_tok);                /* 9: a two-byte length */
-
-    moonshine_tokens t;
-    CHECK(moonshine_tokens_load(&t, table, n) == 0);
-    CHECK(t.count == 10 && t.len[7] == 0 && t.len[9] == 199);
-
-    char out[512];
-    int64_t ids[] = { 1, 3, 4, 5, 6, 2 };
-    CHECK(moonshine_detok(&t, ids, 6, out, sizeof out) == (long)strlen("Send the report."));   /* contract: the decoded length */
-    CHECK(strcmp(out, "Send the report.") == 0);        /* contract: the text as decoded; specials skipped, marker is a space, trimmed */
-    int64_t odd[] = { 3, 7, 999, -1, 8 };
-    moonshine_detok(&t, odd, 5, out, sizeof out);
-    CHECK(strcmp(out, "Send caf\xC3\xA9") == 0);        /* contract: the text as decoded; unused and out-of-range ids skipped */
-    /* A cap that splits a character never leaves half of it. */
-    moonshine_detok(&t, odd, 5, out, 10);
-    CHECK(strcmp(out, "Send caf") == 0);   /* contract: the text as decoded, exact */
-
-    /* A truncated table is refused, not read past. */
-    moonshine_tokens bad;
-    CHECK(moonshine_tokens_load(&bad, table, 5) != 0);
-    moonshine_tokens_free(&t);
-
-    /* The ceiling: 6.5 tokens a second of audio, at most 256. */
-    CHECK(moonshine_max_tokens(16000) == 7);
-    CHECK(moonshine_max_tokens(8000) == 4);
-    CHECK(moonshine_max_tokens(16000 * 60) == 256);
-    if (failures == failures_before) printf("  tokenizer ok\n");
-}
 
 /* ---- spoken mentions ---- */
 
@@ -307,7 +250,6 @@ static void test_windows(void) {
 
 int run_stt_tests(void) {
     printf("test_stt: tokenizer, token ceiling, spoken mentions, recognition worker order, full queue, eventfd, lazy open, idle close, long segments in windows\n");
-    test_tokens();
     test_mentions();
     test_worker();
     test_windows();

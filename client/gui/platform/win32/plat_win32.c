@@ -267,6 +267,7 @@ static HWND msgwnd(void) {
 
 void oc_plat_text_input_area(SDL_Window *w, const SDL_Rect *r) { SDL_SetTextInputArea(w, r, 0); }
 void oc_plat_share_limits(int *max_w, int *max_h) { *max_w = 1920; *max_h = 1080; }
+void oc_plat_camera_limits(int *max_w, int *max_h, int *max_fps) { *max_w = 640; *max_h = 480; *max_fps = 30; }
 const char *oc_plat_mic_settings_name(void) { return "Windows privacy settings"; }
 const char *oc_plat_privacy_name(void) { return "Windows"; }
 int oc_plat_has_privacy_settings(void) { return 1; }

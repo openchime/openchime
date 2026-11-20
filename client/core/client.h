@@ -600,6 +600,13 @@ void oc_client_call_invite(oc_client *c, uint64_t channel_id, const uint64_t *ui
  * The daemon's CALL_STATE names the sharer; the media engine sends once it is
  * this device. */
 void oc_client_call_share(oc_client *c, uint64_t channel_id, int on);
+/* Turn this device's camera on or off in the call (REQ-160). The roster marks
+ * whose cameras are on (oc_call_view.camera); the media engine sends once it
+ * marks this device's. */
+void oc_client_call_camera(oc_client *c, uint64_t channel_id, int on);
+/* Whose cameras the relay sends this client: every one (`all`), or the `n`
+ * users named -- what the call view shows (REQ-160). */
+void oc_client_call_video_sub(oc_client *c, uint64_t channel_id, int all, const uint64_t *users, int n);
 /* Where the audio goes (callsig.h): a frontend that does calls plugs in its
  * media engine before offering them. NULL removes it; on return nothing is
  * calling into the old one. */

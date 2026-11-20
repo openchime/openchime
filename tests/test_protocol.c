@@ -2165,17 +2165,50 @@ static void test_call_frames(void) {
     {
         /* CALL_MEDIA both ways: up carries no sender, down carries the relay's. */
         static const uint8_t ct[] = { 1, 2, 3, 4, 5, 6, 7 };
-        oc_call_media_pkt in = { 0, 0xBEEF, { ct, sizeof ct } };
+        oc_call_media_pkt in = { 0, 0xBEEF, { ct, sizeof ct }, OC_CALL_STREAM_CAMERA };
         ROUNDTRIP(oc_encode_call_media_up(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_MEDIA, h, p);
         oc_call_media_pkt out;
         CHECK(oc_decode_call_media_up(&p, &out) == OC_OK && out.sender == 0 && out.seq == 0xBEEF);
+        CHECK(out.stream == OC_CALL_STREAM_CAMERA);
         CHECK(out.ct.len == sizeof ct && memcmp(out.ct.ptr, ct, sizeof ct) == 0);
     }
     {
-        oc_call_media_pkt in = { 42, 7, { NULL, 0 } };   /* a keepalive */
+        oc_call_media_pkt in = { 42, 7, { NULL, 0 }, OC_CALL_STREAM_AUDIO };   /* a keepalive */
         ROUNDTRIP(oc_encode_call_media_down(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_MEDIA, h, p);
         oc_call_media_pkt out;
         CHECK(oc_decode_call_media_down(&p, &out) == OC_OK && out.sender == 42 && out.seq == 7 && out.ct.len == 0);
+        CHECK(out.stream == OC_CALL_STREAM_AUDIO);
+    }
+    {
+        static const uint8_t ct[] = { 9, 8 };
+        oc_call_media_pkt in = { 42, 8, { ct, sizeof ct }, OC_CALL_STREAM_SHARE };
+        ROUNDTRIP(oc_encode_call_media_down(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_MEDIA, h, p);
+        oc_call_media_pkt out;
+        CHECK(oc_decode_call_media_down(&p, &out) == OC_OK && out.stream == OC_CALL_STREAM_SHARE && out.ct.len == 2);
+    }
+    {
+        oc_call_camera in = { 7, 1 };
+        ROUNDTRIP(oc_encode_call_camera(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_CAMERA, h, p);
+        oc_call_camera out;
+        CHECK(oc_decode_call_camera(&p, &out) == OC_OK && out.channel_id == 7 && out.on == 1);
+    }
+    {
+        /* Whose cameras: every one, or those named -- and more than the cap is
+         * malformed rather than cut short. */
+        static const uint64_t who[3] = { 11, 12, 13 };
+        oc_call_video_sub in = { 7, 0, 3, who };
+        ROUNDTRIP(oc_encode_call_video_sub(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_VIDEO_SUB, h, p);
+        oc_call_video_sub out; uint64_t users[OC_MAX_CALL_PARTICIPANTS];
+        oc_rbuf keep = p;
+        CHECK(oc_decode_call_video_sub(&p, &out, users, OC_MAX_CALL_PARTICIPANTS) == OC_OK);
+        CHECK(out.channel_id == 7 && !out.all && out.count == 3 && out.users[0] == 11 && out.users[2] == 13);
+        CHECK(oc_decode_call_video_sub(&keep, &out, users, 2) == OC_E_MALFORMED);
+    }
+    {
+        oc_call_video_sub all = { 7, 1, 0, NULL };
+        oc_call_video_sub out; uint64_t users[OC_MAX_CALL_PARTICIPANTS];
+        ROUNDTRIP(oc_encode_call_video_sub(&w, OC_PROTOCOL_VERSION, &all), OC_MSG_CALL_VIDEO_SUB, h, p);
+        CHECK(oc_decode_call_video_sub(&p, &out, users, OC_MAX_CALL_PARTICIPANTS) == OC_OK && out.all && out.count == 0);
     }
 }
 
@@ -2828,7 +2861,7 @@ static void test_tts_frames(void) {
     {
         oc_tts_info in;
         memset(&in, 0, sizeof in);
-        in.model_version = oc_slice_str("kitten-mini-0.8/ttskit-1/rate-1.2");
+        in.model_version = oc_slice_str("voice-1/ttskit-1/rate-1.2");
         /* Three voices, with language tags of DIFFERENT lengths: the language
          * sits inside the repeated voice list, so a field appended in the wrong
          * place, or read as a fixed width, round-trips the first voice and
@@ -2849,7 +2882,7 @@ static void test_tts_frames(void) {
         oc_tts_info out;
         CHECK(oc_decode_tts_info(&p, &out) == OC_OK);
         CHECK(out.count == 3);
-        CHECK(slice_eq_str(out.model_version, "kitten-mini-0.8/ttskit-1/rate-1.2"));
+        CHECK(slice_eq_str(out.model_version, "voice-1/ttskit-1/rate-1.2"));
         CHECK(slice_eq_str(out.voices[0].lang, "en-US"));
         CHECK(slice_eq_str(out.voices[1].id, "expr-voice-5-f"));
         CHECK(slice_eq_str(out.voices[1].label, "Kiki"));
@@ -2936,11 +2969,11 @@ static void test_tts_frames(void) {
         CHECK(oc_decode_voice_preview_get(&p, &out) == OC_OK && slice_eq_str(out.voice_id, "expr-voice-5-f"));
     }
     {
-        oc_stt_info in = { oc_slice_str("moonshine-tiny-streaming-en/quantized_26_08_21"), oc_slice_str("en-US"), 30000 };
+        oc_stt_info in = { oc_slice_str("en-US/recognizer/1"), oc_slice_str("en-US"), 30000 };
         ROUNDTRIP(oc_encode_stt_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_STT_INFO, h, p);
         oc_stt_info out;
         CHECK(oc_decode_stt_info(&p, &out) == OC_OK);
-        CHECK(slice_eq_str(out.model_version, "moonshine-tiny-streaming-en/quantized_26_08_21"));
+        CHECK(slice_eq_str(out.model_version, "en-US/recognizer/1"));
         CHECK(slice_eq_str(out.lang, "en-US") && out.max_segment_ms == 30000);
     }
     {

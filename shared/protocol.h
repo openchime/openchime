@@ -253,8 +253,13 @@
  * 46: each AUDIT_PAGE entry carries `channel_id` (u64, 0 for none), the channel
  * the entry happened in: a channel's own changes, and a moderated message or
  * member in it, so a reader can go there (REQ-251). A field appended to a
- * repeated entry. */
-#define OC_PROTOCOL_VERSION 46u
+ * repeated entry.
+ *
+ * 47: camera video in calls (REQ-160). CALL_MEDIA carries `stream` (u8) after
+ * `seq` both ways, as the relay's datagrams now do; a participant's flags byte
+ * gains OC_CALL_PART_CAMERA; CALL_CAMERA and CALL_VIDEO_SUB (0x00AC, 0x00AD) are
+ * new. A field inserted in a fixed layout. */
+#define OC_PROTOCOL_VERSION 47u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -472,6 +477,8 @@ typedef enum {
     OC_MSG_CALL_KEY_FOR     = 0x00A9, /* S->C, one sealed media key, from its sender */
     OC_MSG_CALL_SHARE       = 0x00AA, /* C->S, start or stop sharing a screen in the call (REQ-161) */
     OC_MSG_CALL_MEDIA       = 0x00AB, /* both ways: a media packet over the connection, when UDP cannot reach the relay */
+    OC_MSG_CALL_CAMERA      = 0x00AC, /* C->S, turn this participant's camera on or off in the call (REQ-160) */
+    OC_MSG_CALL_VIDEO_SUB   = 0x00AD, /* C->S, whose cameras the relay sends this participant (REQ-160) */
     OC_MSG_REGISTER_DEVICE_TOKEN   = 0x00B0, /* C->S, register a mobile push token (REQ-132) */
     OC_MSG_UNREGISTER_DEVICE_TOKEN = 0x00B1, /* C->S, drop a push token (logout / token change) */
     OC_MSG_DEVICE_TOKEN_ACK        = 0x00B2, /* S->C, register/unregister acknowledged */
@@ -1834,6 +1841,17 @@ typedef struct { uint64_t user_id; uint8_t slot; uint8_t device_key[OC_CALL_DEVI
 /* oc_call_part.flags: its connection went and its seat is held for a rejoin
  * (PROTOCOL.md §5.17) -- in the roster, receiving nothing, until it is back. */
 #define OC_CALL_PART_AWAY 0x01u
+/* ...and its camera is on (CALL_CAMERA): the others show its picture, and the
+ * relay forwards its camera stream (REQ-160). */
+#define OC_CALL_PART_CAMERA 0x02u
+/* The stream a call packet belongs to, in the clear in front of its ciphertext
+ * and authenticated as the SFrame metadata (CALLS.md §5.4): the relay reads it
+ * to decide who gets a camera's packets, and cannot change it unnoticed.
+ * Audio carries the state and control packets too. */
+#define OC_CALL_STREAM_AUDIO  0u
+#define OC_CALL_STREAM_SHARE  1u
+#define OC_CALL_STREAM_CAMERA 2u
+#define OC_CALL_STREAMS       3u
 /* The video codecs a participant can decode, as bits (ARCH-87). VP9 is the one
  * every client has; a later codec is a new bit, chosen only when everyone has it. */
 #define OC_CALL_CODEC_VP9 0x01u
@@ -1859,12 +1877,18 @@ typedef struct { uint64_t channel_id; uint64_t call_id; uint64_t starter; uint64
 /* Start (on = 1) or stop sharing a screen. One sharer at a time: a start takes
  * over from whoever was sharing (REQ-161). */
 typedef struct { uint64_t channel_id; uint8_t on; } oc_call_share;
+/* Turn this participant's camera on (1) or off (0); the roster carries it as
+ * OC_CALL_PART_CAMERA (REQ-160). */
+typedef struct { uint64_t channel_id; uint8_t on; } oc_call_camera;
+/* Whose cameras the relay sends this participant: every one (`all` = 1, and
+ * `users` empty), or the `count` named. A join starts at every one. */
+typedef struct { uint64_t channel_id; uint8_t all; uint16_t count; const uint64_t *users; } oc_call_video_sub;
 /* CALL_MEDIA (PROTOCOL.md §5.17): the relay's UDP datagram, carried over the
- * connection instead. Client to server it is {seq, ct} -- no token: the
+ * connection instead. Client to server it is {seq, stream, ct} -- no token: the
  * connection is authenticated and in one call -- and server to client
- * {sender, seq, ct}, the fields the relay puts in front of a UDP one. An empty
- * `ct` is a keepalive, answered to its sender alone. */
-typedef struct { uint64_t sender; uint16_t seq; oc_slice ct; } oc_call_media_pkt;
+ * {sender, seq, stream, ct}, the fields the relay puts in front of a UDP one.
+ * An empty `ct` is a keepalive, answered to its sender alone. */
+typedef struct { uint64_t sender; uint16_t seq; oc_slice ct; uint8_t stream; } oc_call_media_pkt;
 /* A media key sealed to each recipient (HPKE enc ‖ ciphertext, opaque to the
  * daemon). */
 typedef struct { uint64_t recipient; oc_slice sealed; } oc_call_key_entry;
@@ -2390,6 +2414,8 @@ oc_result oc_encode_pdm_end(oc_wbuf *w, uint16_t version, const oc_pdm_end *m);
 oc_result oc_encode_call_share(oc_wbuf *w, uint16_t version, const oc_call_share *m);
 oc_result oc_encode_call_media_up(oc_wbuf *w, uint16_t version, const oc_call_media_pkt *m);
 oc_result oc_encode_call_media_down(oc_wbuf *w, uint16_t version, const oc_call_media_pkt *m);
+oc_result oc_encode_call_camera(oc_wbuf *w, uint16_t version, const oc_call_camera *m);
+oc_result oc_encode_call_video_sub(oc_wbuf *w, uint16_t version, const oc_call_video_sub *m);
 oc_result oc_encode_upload_begin(oc_wbuf *w, uint16_t version, const oc_upload_begin *m);
 oc_result oc_encode_upload_ready(oc_wbuf *w, uint16_t version, const oc_upload_ready *m);
 oc_result oc_encode_upload_chunk(oc_wbuf *w, uint16_t version, const oc_upload_chunk *m);
@@ -2619,6 +2645,9 @@ oc_result oc_decode_pdm_end(oc_rbuf *p, oc_pdm_end *m);
 oc_result oc_decode_call_share(oc_rbuf *p, oc_call_share *m);
 oc_result oc_decode_call_media_up(oc_rbuf *p, oc_call_media_pkt *m);
 oc_result oc_decode_call_media_down(oc_rbuf *p, oc_call_media_pkt *m);
+oc_result oc_decode_call_camera(oc_rbuf *p, oc_call_camera *m);
+/* `users` has room for `cap`; more is malformed. */
+oc_result oc_decode_call_video_sub(oc_rbuf *p, oc_call_video_sub *m, uint64_t *users, uint16_t cap);
 oc_result oc_decode_upload_begin(oc_rbuf *p, oc_upload_begin *m);
 oc_result oc_decode_upload_ready(oc_rbuf *p, oc_upload_ready *m);
 oc_result oc_decode_upload_chunk(oc_rbuf *p, oc_upload_chunk *m);

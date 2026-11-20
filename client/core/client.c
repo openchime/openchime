@@ -412,6 +412,26 @@ void oc_client_call_share(oc_client *c, uint64_t channel_id, int on) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_call_camera(oc_client *c, uint64_t channel_id, int on) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_CAMERA);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->op = (uint8_t)(on ? 1 : 0);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_call_video_sub(oc_client *c, uint64_t channel_id, int all, const uint64_t *users, int n) {
+    if (!c || n < 0) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_VIDEO_SUB);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->op = (uint8_t)(all ? 1 : 0);
+    if (n > (int)OC_MAX_CALL_INVITES) n = (int)OC_MAX_CALL_INVITES;
+    for (int i = 0; !all && users && i < n; i++) cmd->uids[cmd->n_uids++] = users[i];
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_call_invite(oc_client *c, uint64_t channel_id, const uint64_t *uids, int n) {
     if (n > 0) call_cmd(c, OC_CMD_CALL_INVITE, channel_id, uids, n);
 }

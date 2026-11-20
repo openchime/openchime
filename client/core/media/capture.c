@@ -101,6 +101,7 @@ static int screen_next(oc_capture *c, oc_frame *f, int timeout_ms) {
     for (;;) {
         int64_t until = c->have_last ? c->due_us - now : (end - now);
         int slice = until > 0 ? (int)((until + 999) / 1000) : 0;
+        int64_t before = now;
         oc_frame nf;
         int rc = c->b->next(c->impl, &nf, slice);
         if (rc < 0) return rc;
@@ -114,6 +115,9 @@ static int screen_next(oc_capture *c, oc_frame *f, int timeout_ms) {
             c->have_last = 1;
         }
         now = oc_media_clock_us();
+        /* Nothing, and the clock has not moved while the backend waited: it is
+         * held (oc_media_clock_hold), and the caller looks again. */
+        if (rc == 0 && now == before && slice > 0) return 0;
         if (c->have_last && now >= c->due_us) {
             /* Stamped at the time it was due, as the synthetic camera stamps its
              * frames, not when a late reader took it: stamped "now", a reader a
@@ -234,11 +238,10 @@ static void syn_draw(syn *s) {
 static int syn_next(void *impl, oc_frame *f, int timeout_ms) {
     syn *s = impl;
     if (!s->running) return OC_CAP_FAILED;
-    int64_t now = oc_media_clock_us(), wait = s->next_us - now;
-    if (wait > (int64_t)timeout_ms * 1000) { sleep_us((int64_t)timeout_ms * 1000); return 0; }
-    sleep_us(wait);
+    if (!oc_media_clock_wait_until(s->next_us, timeout_ms)) return 0;
     syn_draw(s);
     int64_t period = 1000000 / s->fps;
+    int64_t now;
     /* A stalled consumer does not get a burst of catch-up frames: once a whole
      * frame's time has gone by unread, those frames were never taken, as a
      * camera's are not, and the next is taken now. */
@@ -365,9 +368,7 @@ static int scr_next(void *impl, oc_frame *f, int timeout_ms) {
     if (!s->running) return OC_CAP_FAILED;
     int64_t now = oc_media_clock_us();
     if (atomic_load(&scr_gone_now) || (s->gone_at_us && now >= s->gone_at_us)) { oc_capture_set_detail("the test screen went away"); return OC_CAP_GONE; }
-    int64_t wait = s->next_us - now;
-    if (wait > (int64_t)timeout_ms * 1000) { sleep_us((int64_t)timeout_ms * 1000); return 0; }
-    sleep_us(wait);
+    if (!oc_media_clock_wait_until(s->next_us, timeout_ms)) return 0;
     scr_draw(s);
     oc_i420_fit(&s->page, &s->out);
     s->out.pts_us = oc_media_clock_us();

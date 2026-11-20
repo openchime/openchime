@@ -1,0 +1,9 @@
+# Voice input's recognizer as ONNX Runtime 1.30.0 runs it (tests/manual/recognizer_ref.c).
+# <name> <samples> <frames> <tokens> <ids> <text...>
+greeting-m 54400 172 11 7197,7250,29892,14332,29889,450,2048,338,7933,1449,29889 Good morning, everyone. The build is green again.
+numbers-f 72400 228 16 2191,300,592,472,2211,25020,373,323,1041,3250,297,5716,1023,6893,3023,29889 Meet me at three fifteen on Tuesday in room two hundred four.
+names-m 55200 176 12 26579,8289,3761,304,3638,278,12616,368,3461,304,27390,29889 Ask Priya to send the quarterly report to Marcus.
+question-f 48000 152 9 1815,591,4337,278,6507,304,28728,17724,29973 Can we move the release to Friday afternoon?
+long-f 101600 320 18 1932,278,18209,8341,267,29892,1423,278,10748,322,1400,263,3273,15837,297,278,8242,29889 When the deployment finishes, check the logs and post a short summary in the channel.
+rushed-m 70400 220 29 6439,29892,540,29915,29879,937,278,848,4978,297,278,16165,441,310,278,4482,29899,5721,424,470,3203,694,29899,1491,264,424,322,2186,29899 Oh, he's first the data distribution in the cohort of the low-distant or least no-subenant and final-
+silence 24000 76 0 - 

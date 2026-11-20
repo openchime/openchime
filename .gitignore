@@ -38,7 +38,7 @@ dist/
 .playwright-mcp/
 __pycache__/
 /stt/
-# The web harness's Playwright library (package.json), installed by tools/web/drive.sh.
+# The web harness's Playwright library (package.json), installed by tools/gui/harness/web/drive.sh.
 node_modules/
 package-lock.json
 

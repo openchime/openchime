@@ -1112,9 +1112,11 @@ static int csum_run(void *h, const char *system, const char *user, const char *g
                     oc_sum_gate_fn gate, void *gctx, char **out, oc_sum_run_stats *st, char *err, size_t cap) {
     (void)h; (void)system; (void)user; (void)max_out; (void)err; (void)cap;
     __atomic_add_fetch(&core_sum_calls, 1, __ATOMIC_RELAXED);
+    /* A busy model: it holds until the test lets it go or its gate says stop,
+     * looking at the gate as a real model does between steps. */
     while (__atomic_load_n(&core_sum_hold, __ATOMIC_ACQUIRE)) {
         if (gate && gate(gctx)) return -1;
-        oc_test_let_time_pass(5);   /* a busy model: time goes by while it holds */
+        (void)WAIT_UNTIL(!__atomic_load_n(&core_sum_hold, __ATOMIC_ACQUIRE), 5);
     }
     if (st) memset(st, 0, sizeof *st);
     *out = strdup(grammar && strstr(grammar, "note ::=")   /* contract: the summarizer's grammar rule name */
@@ -3561,11 +3563,82 @@ static void test_store_legacy_entry(void) {
 
     /* The next write of anything upgrades the entry in place, keeping the rest. */
     oc_store_save_pin(s, "acme:443", pin);
-    CHECK(mock_len_of("acme:443") > (size_t)V1_BLOB && mock_ver_of("acme:443") == 5);
+    CHECK(mock_len_of("acme:443") > (size_t)V1_BLOB && mock_ver_of("acme:443") == OC_STORE_ENTRY_VERSION);
     CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1 && tok[0] == 1);
     memset(&b, 0, sizeof b);
     oc_store_workspace_each(s, book_cb, &b);
     CHECK(b.n == 1 && strcmp(b.user[0], "dana") == 0);
+    oc_store_close(s);
+}
+
+/* A version 4 entry -- what every install holds that has not run a client since
+ * the audience was added -- is read with all it held, has no audience, and is
+ * upgraded in place by the next write, keeping the rest. Built from the layout
+ * store.c documents, as the version 1 case is, so the bytes are the old
+ * client's and not this one's. */
+static void test_store_v4_entry(void) {
+    mock_reset();
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open("ignored");
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &sec);
+
+    /* Version 4: [ver][flags][expiry][token 32][pin 32][last_used][label 128][user 128]
+     * [owner 128][device key 32][peers 16 x (user id u64, fingerprint 16)].
+     * Version 5 appends the audience, 132 bytes. */
+    enum { V4_LABEL = 128, V4_USER = 128, V4_OWNER = 128, V4_PEERS = 16, V4_PEER = 8 + OC_STORE_PEER_FP,
+           V4_AUD = 132,
+           V4_HEAD = 2 + 8 + OC_SESSION_TOKEN_LEN + OC_TLS_FINGERPRINT_LEN + 8,
+           V4_DEVKEY = V4_HEAD + V4_LABEL + V4_USER + V4_OWNER,
+           V4_PEER0 = V4_DEVKEY + OC_X25519_LEN,
+           V4_BLOB = V4_PEER0 + V4_PEERS * V4_PEER };
+    uint8_t v4[V4_BLOB];
+    memset(v4, 0, sizeof v4);
+    v4[0] = 4;
+    v4[1] = 1 | 2 | 4 | 8 | 16 | 32;                    /* token, pin, book, owner, device key, peers */
+    for (unsigned i = 0; i < OC_SESSION_TOKEN_LEN; i++) v4[10 + i] = (uint8_t)(i + 1);
+    for (unsigned i = 0; i < OC_TLS_FINGERPRINT_LEN; i++)
+        v4[10 + OC_SESSION_TOKEN_LEN + i] = (uint8_t)(0x40 + i);
+    char *lbl = (char *)(v4 + V4_HEAD);
+    snprintf(lbl, V4_LABEL, "%s", "acme.example.com");
+    snprintf(lbl + V4_LABEL, V4_USER, "%s", "dana");
+    snprintf(lbl + V4_LABEL + V4_USER, V4_OWNER, "%s", "dana");
+    uint8_t sk[OC_X25519_LEN], pk[OC_X25519_LEN];
+    for (unsigned i = 0; i < OC_X25519_LEN; i++) sk[i] = (uint8_t)(0x11 + i);
+    memcpy(v4 + V4_DEVKEY, sk, sizeof sk);
+    CHECK(oc_x25519_public(sk, pk) == 0);
+    uint8_t fp[OC_STORE_PEER_FP];
+    memset(fp, 0x5a, sizeof fp);
+    v4[V4_PEER0] = 77;                                   /* user id 77, little-endian */
+    memcpy(v4 + V4_PEER0 + 8, fp, sizeof fp);
+    CHECK(mock_put(NULL, "acme:443", v4, sizeof v4) == 1);
+
+    /* Everything it held is read... */
+    uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN], sk2[OC_X25519_LEN], pk2[OC_X25519_LEN];
+    char who[128], ws[64];
+    CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1 && tok[0] == 1 && tok[OC_SESSION_TOKEN_LEN - 1] == OC_SESSION_TOKEN_LEN);
+    CHECK(oc_store_load_pin(s, "acme:443", pin) == 1 && pin[0] == 0x40);
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 1 && strcmp(who, "dana") == 0);
+    CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1 && memcmp(sk2, sk, sizeof sk) == 0 && memcmp(pk2, pk, sizeof pk) == 0);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, fp) == 1);
+    /* ...reading wrote nothing, and it has no audience. */
+    CHECK(mock_len_of("acme:443") == (size_t)V4_BLOB && mock_ver_of("acme:443") == 4);
+    CHECK(oc_store_workspace_by_audience(s, "ws_acme000000", ws, sizeof ws) == 0);
+
+    /* The next write upgrades it in place to the current version and length... */
+    oc_store_workspace_note_audience(s, "acme:443", "ws_acme000000");
+    CHECK(mock_len_of("acme:443") == (size_t)(V4_BLOB + V4_AUD) && mock_ver_of("acme:443") == OC_STORE_ENTRY_VERSION);
+    CHECK(oc_store_workspace_by_audience(s, "ws_acme000000", ws, sizeof ws) == 1 && strcmp(ws, "acme:443") == 0);
+    /* ...keeping all the rest. */
+    CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1 && tok[0] == 1);
+    CHECK(oc_store_load_pin(s, "acme:443", pin) == 1 && pin[0] == 0x40);
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 1 && strcmp(who, "dana") == 0);
+    CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1 && memcmp(sk2, sk, sizeof sk) == 0);
+    CHECK(oc_store_peer_check(s, "acme:443", 77, fp) == 1);
+    struct book_capture b; memset(&b, 0, sizeof b);
+    oc_store_workspace_each(s, book_cb, &b);
+    CHECK(b.n == 1 && strcmp(b.label[0], "acme.example.com") == 0 && strcmp(b.user[0], "dana") == 0);
     oc_store_close(s);
 }
 
@@ -4107,6 +4180,8 @@ static struct {
     tap_pkt  seen[TAP_KEEP];                 /* client -> relay payloads that carried audio */
     int      n_seen, bad_header;
     int      big;                            /* payloads over 1000 bytes: a shared screen's */
+    int      cam;                            /* payloads on a camera's stream */
+    volatile int relabel;                    /* audio packets put on the share's stream on the way */
     volatile int drop_pm;                    /* client -> relay packets lost, per mille */
     volatile int block;                      /* every packet lost, both ways: UDP is blocked */
     volatile int rebind;                     /* every client's path moves: new source ports */
@@ -4156,20 +4231,23 @@ static void *tap_thread(void *p) {
                     g_tap.n_cl++;
                 }
                 if (k < g_tap.n_cl) {
-                    /* token(16) seq(2) payload: record what the payload looks like. */
-                    if (n > 18) {
+                    /* token(16) seq(2) stream(1) payload: record what the payload looks like. */
+                    if (n > 19) {
                         uint64_t kid, ctr; size_t hl;
                         pthread_mutex_lock(&g_tap.mu);
-                        if (oc_sframe_header_decode(buf + 18, (size_t)n - 18, &kid, &ctr, &hl) != 0) g_tap.bad_header++;
-                        else if (g_tap.n_seen < TAP_KEEP && (size_t)n > 18 + hl)
-                            g_tap.seen[g_tap.n_seen++] = (tap_pkt){ kid, buf[18 + hl], (size_t)n - 18, mono_ms() };
+                        if (oc_sframe_header_decode(buf + 19, (size_t)n - 19, &kid, &ctr, &hl) != 0) g_tap.bad_header++;
+                        else if (g_tap.n_seen < TAP_KEEP && (size_t)n > 19 + hl)
+                            g_tap.seen[g_tap.n_seen++] = (tap_pkt){ kid, buf[19 + hl], (size_t)n - 19, mono_ms() };
                         if (n > 1000) g_tap.big++;
+                        if (buf[18] == OC_CALL_STREAM_CAMERA) g_tap.cam++;
+                        if (__atomic_load_n(&g_tap.relabel, __ATOMIC_ACQUIRE) && buf[18] == OC_CALL_STREAM_AUDIO)
+                            buf[18] = OC_CALL_STREAM_SHARE;
                         pthread_mutex_unlock(&g_tap.mu);
                     }
                     if (__atomic_load_n(&g_tap.block, __ATOMIC_ACQUIRE)) continue;
                     g_tap.rng = g_tap.rng * 1664525u + 1013904223u;
                     int drop = __atomic_load_n(&g_tap.drop_pm, __ATOMIC_ACQUIRE);
-                    if (n > 18 && drop && (int)((g_tap.rng >> 8) % 1000) < drop) continue;
+                    if (n > 19 && drop && (int)((g_tap.rng >> 8) % 1000) < drop) continue;
                     sendto(g_tap.cl[k].up, buf, (size_t)n, 0, (struct sockaddr *)&relay, sizeof relay);
                 }
             }
@@ -4367,12 +4445,163 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     unsetenv("OPENCHIME_DEV_CAPTURE");
 }
 
+/* Whether the model marks `user`'s camera on in the call. */
+static int cam_flag(const oc_model *m, uint64_t user) {
+    for (int i = 0; i < m->call.n_parts; i++) if (m->call.parts[i] == user) return m->call.camera[i];
+    return 0;
+}
+
+/* The newest picture of `user`'s camera on `e`, and whether the synthetic
+ * camera's frame numbers kept rising. */
+static void cam_watch(oc_call_engine *e, uint64_t user, view_watch *w) {
+    int r = oc_call_engine_camera_frame(e, user, &w->f, &w->seq);
+    if (r < 0) { w->gone = 1; return; }
+    if (r == 0) return;
+    w->gone = 0;
+    int n = oc_capture_synthetic_frame_number(&w->f);
+    if (n < 0) w->bad++;
+    else { if (n < w->last) w->rising = 0; w->last = n; }
+    w->frames++;
+}
+
+/* Wait for `want` pictures of `user`'s camera, with no gap longer than `stall_ms`. */
+static int cam_frames(oc_client *a, oc_client *b, oc_call_engine *e, uint64_t user,
+                      view_watch *w, int want, uint64_t stall_ms) {
+    int seen = w->frames;
+    uint64_t end = oc_test_deadline(stall_ms);
+    for (;;) {
+        oc_client_tick(a); oc_client_tick(b);
+        cam_watch(e, user, w);
+        if (w->frames >= want) return 1;
+        if (w->frames > seen) { seen = w->frames; end = oc_test_deadline(stall_ms); }
+        if (!oc_test_pause(end)) return 0;
+    }
+}
+
+static const oc_call_peer_stats *peer_stats(const oc_call_stats *st, uint64_t user) {
+    for (int i = 0; i < st->n_peers; i++) if (st->peers[i].user_id == user) return &st->peers[i];
+    return NULL;
+}
+
+/* Cameras in the call (REQ-160), through the real daemon and relay with the tap
+ * between: dana's camera is her preview at once and goes out once the roster
+ * marks it; erik sees it at 640x480, the frames in order, and dana sees his; the
+ * tap sees only SFrame on the camera's stream; dana shares her screen with her
+ * camera on and erik has both; erik taking nobody's camera stops getting it but
+ * still hears her; dana turning hers off takes her picture away. */
+static void test_camera_e2e(oc_client *a, oc_client *b, oc_call_engine *ea, oc_call_engine *eb) {
+    oc_client *c = NULL;   /* CALL_WAIT ticks the clients there are */
+    const oc_model *ma = oc_client_model(a), *mb = oc_client_model(b);
+    uint64_t ua = ma->user_id, ub = mb->user_id;
+    oc_call_stats st;
+    setenv("OPENCHIME_DEV_CAPTURE", "synthetic", 1);
+    view_watch self = { .last = -1, .rising = 1 }, wb = { .last = -1, .rising = 1 },
+               wa = { .last = -1, .rising = 1 }, ws = { .last = -1, .rising = 1 };
+    pthread_mutex_lock(&g_tap.mu);
+    int cam0 = g_tap.cam, bad0 = g_tap.bad_header;
+    pthread_mutex_unlock(&g_tap.mu);
+
+    /* dana's camera: her preview at once, waiting for the roster. */
+    CHECK(oc_call_engine_camera_start(ea, "synthetic", 640, 480, 30) == 0);
+    CHECK(cam_frames(a, b, ea, ua, &self, 3, 3000) && self.f.width == 640 && self.f.height == 480);
+    oc_call_engine_stats(ea, &st);
+    CHECK(st.camera_state == 1 && st.camera_frames == 0);
+    oc_client_call_camera(a, 1, 1);
+    CHECK(CALL_WAIT(3000, cam_flag(ma, ua) && cam_flag(mb, ua)));
+    CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.camera_state == 2; })));
+
+    /* erik sees her, at her size, in order -- and she sees him. */
+    CHECK(cam_frames(a, b, eb, ua, &wb, 15, 6000));
+    CHECK(wb.f.width == 640 && wb.f.height == 480 && wb.rising && wb.bad == 0);
+    CHECK(oc_call_engine_camera_start(eb, "synthetic", 640, 480, 30) == 0);
+    oc_client_call_camera(b, 1, 1);
+    CHECK(CALL_WAIT(3000, cam_flag(ma, ub)));
+    CHECK(cam_frames(a, b, ea, ub, &wa, 10, 6000));
+    CHECK(wa.rising && wa.bad == 0);
+    oc_call_engine_stats(ea, &st);
+    oc_call_stats sb; oc_call_engine_stats(eb, &sb);
+    const oc_call_peer_stats *pd = peer_stats(&sb, ua);
+    printf("  cameras: erik has %d of dana's at %dx%d, dana sends %dx%d at %d fps, %d kbps, step %d; "
+           "erik held %u and dropped %u for her voice\n", wb.frames, wb.f.width, wb.f.height, st.camera_width,
+           st.camera_height, st.camera_fps, st.camera_kbps, st.camera_step, pd ? pd->cam_held : 0, pd ? pd->cam_dropped : 0);
+    CHECK(st.camera_kbps <= 600 && pd && pd->camera_on && pd->camera_subscribed);
+    /* Lip sync keeps the picture with the voice; it does not throw it away. */
+    CHECK(pd && pd->cam_dropped * 10 <= pd->cam_frames);
+    pthread_mutex_lock(&g_tap.mu);
+    int cams = g_tap.cam - cam0, bad = g_tap.bad_header - bad0;
+    pthread_mutex_unlock(&g_tap.mu);
+    CHECK(cams > 20 && bad == 0);                             /* on the camera's stream, as SFrame */
+
+    /* dana shares her screen with her camera on: erik has both. */
+    CHECK(oc_call_engine_share_start(ea, "screen:synthetic", 1280, 800) == 0);
+    oc_client_call_share(a, 1, 1);
+    CHECK(CALL_WAIT(3000, mb->call.sharer == ua));
+    CHECK(share_frames(a, b, c, eb, &ws, 5, 6000) && ws.f.width == 1280 && ws.rising && ws.bad == 0);
+    int had = wb.frames;
+    CHECK(cam_frames(a, b, eb, ua, &wb, had + 10, 6000) && wb.rising && wb.bad == 0);
+    oc_call_engine_share_stop(ea);
+    oc_client_call_share(a, 1, 0);
+    CHECK(CALL_WAIT(3000, mb->call.sharer == 0));
+
+    /* erik takes nobody's camera: hers stops coming, her voice does not. */
+    oc_call_engine_camera_subscribe(eb, 0, NULL, 0);
+    oc_client_call_video_sub(b, 1, 0, NULL, 0);
+    CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(eb, &sb); pd = peer_stats(&sb, ua); pd && !pd->camera_subscribed; })));
+    uint64_t settle = mono_ms() + 1000;
+    CALL_WAIT(1500, mono_ms() >= settle);                     /* what was on its way has landed */
+    oc_call_engine_stats(eb, &sb); pd = peer_stats(&sb, ua);
+    uint32_t frames0 = pd ? pd->cam_frames : 0, packets0 = pd ? pd->packets : 0;
+    oc_call_engine_stats(ea, &st);
+    uint32_t reports0 = st.camera_reports;
+    pthread_mutex_lock(&g_tap.mu);
+    int tap0 = g_tap.cam;
+    pthread_mutex_unlock(&g_tap.mu);
+    settle = mono_ms() + 1500;
+    CALL_WAIT(2000, mono_ms() >= settle);
+    oc_call_engine_stats(eb, &sb); pd = peer_stats(&sb, ua);
+    pthread_mutex_lock(&g_tap.mu);
+    int tap1 = g_tap.cam;
+    pthread_mutex_unlock(&g_tap.mu);
+    CHECK(pd && pd->cam_frames == frames0 && pd->packets > packets0 + 20);
+    CHECK(tap1 > tap0);                                       /* dana still sends: it is the relay that holds it back */
+    /* ...and erik, taking nothing of hers, no longer reports on it: he cannot
+     * hold her rate down. */
+    oc_call_engine_stats(ea, &st);
+    CHECK(st.camera_reports == reports0);
+
+    /* A packet put on another stream on the way does not open: the stream is
+     * authenticated. Here dana's voice relabelled as a share's. */
+    uint32_t undec0 = pd ? pd->undecryptable : 0;
+    __atomic_store_n(&g_tap.relabel, 1, __ATOMIC_RELEASE);
+    CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(eb, &sb); pd = peer_stats(&sb, ua); pd && pd->undecryptable > undec0 + 10; })));
+    __atomic_store_n(&g_tap.relabel, 0, __ATOMIC_RELEASE);
+    /* ...and back to every camera: hers comes again. */
+    oc_call_engine_camera_subscribe(eb, 1, NULL, 0);
+    oc_client_call_video_sub(b, 1, 1, NULL, 0);
+    had = wb.frames;
+    CHECK(cam_frames(a, b, eb, ua, &wb, had + 5, 6000));
+
+    /* dana turns hers off: the roster says so, and erik's picture of her goes. */
+    oc_call_engine_camera_stop(ea);
+    oc_client_call_camera(a, 1, 0);
+    CHECK(CALL_WAIT(3000, !cam_flag(mb, ua)));
+    CHECK(CALL_WAIT(3000, ({ cam_watch(eb, ua, &wb); wb.gone; })));
+    CHECK(CALL_WAIT(3000, ({ cam_watch(ea, ua, &self); self.gone; })));   /* and her preview */
+    oc_call_engine_stats(ea, &st);
+    CHECK(st.camera_state == 0);
+    oc_call_engine_camera_stop(eb);
+    oc_client_call_camera(b, 1, 0);
+    CHECK(CALL_WAIT(3000, !cam_flag(ma, ub)));
+    oc_frame_free(&self.f); oc_frame_free(&wa.f); oc_frame_free(&wb.f); oc_frame_free(&ws.f);
+    unsetenv("OPENCHIME_DEV_CAPTURE");
+}
+
 /* The call engine's relay address: IPv4 first, IPv6 when that is all there is
  * (AUDIO.md §4). And with no UDP at all, a call goes by the connection instead
  * of not at all -- it used to leave. */
 static int tcp_fallback_calls;
-static int count_tcp(void *ctx, uint16_t seq, const uint8_t *ct, size_t len) {
-    (void)ctx; (void)seq; (void)ct; (void)len;
+static int count_tcp(void *ctx, uint16_t seq, uint8_t stream, const uint8_t *ct, size_t len) {
+    (void)ctx; (void)seq; (void)stream; (void)ct; (void)len;
     __atomic_add_fetch(&tcp_fallback_calls, 1, __ATOMIC_RELAXED);
     return 0;
 }
@@ -4633,6 +4862,7 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     oc_call_engine_set_volume(ea, ub, 1.0f);
 
     test_share_e2e(a, b, c, ea, eb, ec);
+    test_camera_e2e(a, b, ea, eb);
 
     /* erik may not end it; dana, who started it, may -- for everyone. */
     uint32_t errs = mb->call_error_seq;
@@ -4914,7 +5144,7 @@ static void test_device_key(void) {
     CHECK(oc_x25519_public(sk, pkc) == 0 && memcmp(pkc, pk, 32) == 0);
     CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1);
     CHECK(memcmp(sk, sk2, 32) == 0 && memcmp(pk, pk2, 32) == 0);
-    CHECK(mock_ver_of("acme:443") == 5);
+    CHECK(mock_ver_of("acme:443") == OC_STORE_ENTRY_VERSION);
 
     /* The people of private DMs (PRIVATE-DM.md §5): the first key is remembered,
      * the same is known, a different one is reported and changes nothing until
@@ -6321,6 +6551,7 @@ int run_client_core_tests(void) {
     test_workspace_audience();
     test_session_owner();
     test_store_legacy_entry();
+    test_store_v4_entry();
     test_device_key();
 
     /* The daemon opens its blob store at netloop startup; point it at a build-local

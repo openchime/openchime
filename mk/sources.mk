@@ -9,7 +9,7 @@ SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c 
               shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c shared/action.c \
               shared/oc_mp4.c shared/e2e_hpke.c shared/e2e_sframe.c shared/noise_xx.c shared/ratchet.c \
               third_party/ca-roots/ca_roots.c
-DAEMON_SRC := daemon/main.c daemon/config.c daemon/config_table.c daemon/pwpolicy.c daemon/demolimits.c third_party/utf8proc/utf8proc.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/webapp.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c daemon/tts_data.c
+DAEMON_SRC := daemon/main.c daemon/config.c daemon/config_table.c daemon/pwpolicy.c daemon/demolimits.c third_party/utf8proc/utf8proc.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/webapp.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c daemon/tts_data.c daemon/voice_pack.c daemon/recognizer_pack.c
 # Where generated sources and the objects go. A build of its own -- the host
 # daemon a cross build writes its manifests with (mk/daemon.mk) -- passes its
 # own of both, so two builds at once never write each other's files.
@@ -35,14 +35,15 @@ oc_objs = $(foreach s,$(2),$(if $(filter $(GEN_DIR)/%,$(s)),$(patsubst $(GEN_DIR
 # The two rules of a tree, with the compile command in the variable named by
 # $(2), the prerequisites a change of which recompiles in $(3), and what must
 # exist first (the vendored libraries' headers) in $(4); $(5) is @ for a tree
-# that compiles quietly. Every object writes its own header dependencies
-# beside it (-MMD -MP), read back by the -include of the tree's .d files: a
-# header edit recompiles the objects that include it, and only those.
+# that compiles quietly. A source of nnkit, ttskit or sttkit also gets KIT_CFLAGS. Every object
+# writes its own header dependencies beside it (-MMD -MP), read back by the
+# -include of the tree's .d files: a header edit recompiles the objects that
+# include it, and only those.
 #   $(eval $(call oc_obj_rules,<tree>,<COMMAND_VAR>,<prerequisites>,<order-only>[,@]))
 define oc_obj_rules
 $(1)/%.o: %.c $(3) | $(4)
 	@mkdir -p $$(dir $$@)
-	$(5)$$($(2)) -MMD -MP -c $$< -o $$@
+	$(5)$$($(2)) $$(if $$(filter nnkit/% ttskit/% sttkit/%,$$<),$$(KIT_CFLAGS)) -MMD -MP -c $$< -o $$@
 $(1)/gen/%.o: $(GEN_DIR)/%.c $(3) | $(4)
 	@mkdir -p $$(dir $$@)
 	$(5)$$($(2)) -MMD -MP -c $$< -o $$@
@@ -154,6 +155,28 @@ CALL_SRC  := $(wildcard client/core/call/*.c)
 CALL_HDRS := $(wildcard client/core/call/*.h)
 CALL_INC  := -Iclient/core/call
 
+# --- nnkit (the neural network kernels ttskit and sttkit share) ---------------
+# Plain C, no dependencies: the kernels read-aloud's voice model and voice
+# input's recognizer run on. Linked wherever either kit is. See docs/TTSKIT.md
+# §5b and docs/STTKIT.md.
+NNKIT_SRC := $(wildcard nnkit/*.c)
+NNKIT_INC := -Innkit
+NNKIT_HDRS := $(wildcard nnkit/*.h)
+# Added to every nnkit, ttskit and sttkit object, in every tree (oc_obj_rules)
+# and in the kits' tools: no multiply and add fused into one rounding behind the
+# source's back -- clang does it by default, GCC in its GNU modes -- so the
+# models' float arithmetic is the order written, and x86-64 and arm64 give the
+# same results.
+KIT_CFLAGS := -ffp-contract=off
+
+# --- sttkit (voice input's recognizer, ARCH-112) ----------------------------
+# 16 kHz speech to text: the recognizer in plain C over nnkit, its model one
+# committed, memory-mapped file in sttkit/data. stt_check runs it against its
+# references and times it. See docs/STTKIT.md.
+STTKIT_SRC := $(filter-out sttkit/stt_check.c,$(wildcard sttkit/*.c))
+STTKIT_INC := -Isttkit $(NNKIT_INC)
+STTKIT_HDRS := $(wildcard sttkit/*.h)
+
 # --- ttskit (read-aloud pronunciation, ARCH-111) -----------------------------
 # English text to the IPA a voice model reads: a CMUdict-derived dictionary and a
 # trained guesser, both committed as memory-mapped data in ttskit/data. Pure C, no
@@ -161,7 +184,7 @@ CALL_INC  := -Iclient/core/call
 # builds the data files (scripts/build/ttskit_data.sh) and says words with them.
 # See docs/TTSKIT.md.
 TTSKIT_SRC := $(filter-out ttskit/tts_pack.c,$(wildcard ttskit/*.c))
-TTSKIT_INC := -Ittskit
+TTSKIT_INC := -Ittskit $(NNKIT_INC)
 
 # --- sdltext (portable text layer) --------------------------------------------
 # One text API for every graphical client: layout, measurement, hit-testing,

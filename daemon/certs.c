@@ -246,7 +246,7 @@ static void *worker(void *p) {
     if (c->not_after_ms) hold(c, c->o.chain_pem, c->issued_ms, c->not_after_ms);
     for (;;) {
         if (__atomic_load_n(&c->stop, __ATOMIC_ACQUIRE)) break;
-        uint64_t now = now_ms();
+        uint64_t now = c->o.now_ms ? c->o.now_ms(c->o.ctx) : now_ms();
         /* Close to expiry and still not renewed: renewal has been failing for
          * weeks by now, and the certificate will stop working. */
         pthread_mutex_lock(&c->mu);

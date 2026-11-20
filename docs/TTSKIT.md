@@ -1,25 +1,27 @@
-# ttskit — pronunciation for read-aloud
+# ttskit — pronunciation and the voice for read-aloud
 
 `ttskit` is an in-tree C library that turns English text into the phonemes a neural voice
-model reads. It is the front half of read-aloud (ARCH-111, [READ-ALOUD.md](./READ-ALOUD.md)):
-the daemon cleans a message, hands the words to ttskit, and feeds ttskit's phonemes to the
-voice model. It has no dependencies, no copyleft anywhere in it or its data, and reads its
-data where it lies — a memory-mapped file, or bytes the caller has already mapped — rather
-than loading it.
+model reads, and runs that voice model to turn the phonemes into audio. It is read-aloud's
+speech (ARCH-111, [READ-ALOUD.md](./READ-ALOUD.md)): the daemon cleans a message, hands the
+words to ttskit, maps ttskit's phonemes to the model's token ids, and has ttskit render
+them in the author's voice. It has no dependencies, no copyleft anywhere in it or its data,
+and reads its data where it lies — a memory-mapped file, or bytes the caller has already
+mapped — rather than loading it.
 
 This document covers the whole chain: why ttskit exists (§1), where it sits (§2), how text
-becomes sounds (§3–§5), the data files (§6), the API with examples (§7), rebuilding the data
-from sources (§8), the tests (§9) and what it does not do (§10).
+becomes sounds (§3–§5), how sounds become audio (§5b), the data files (§6), the API with
+examples (§7), rebuilding the data from sources (§8), the tests (§9) and what it does not
+do (§10).
 
 ## 1. Why it exists
 
-A voice model such as Kitten does not read letters. It was trained on **phonemes** — the
+A neural voice model does not read letters. It was trained on **phonemes** — the
 sounds of the words, written in IPA — so something has to decide that "migration" is
 `maɪɡɹˈeɪʃən` and that "3:15" is "three fifteen". That step is called **G2P**,
 grapheme-to-phoneme: letters (graphemes) in, sounds (phonemes) out.
 
 Every ready-made English G2P used with these models is **espeak-ng**, which is GPL-3.0.
-Kitten's own Python package calls it, Piper links it, and sherpa-onnx compiles it into its
+The voice model's own Python package calls it, Piper links it, and sherpa-onnx compiles it into its
 library, so none of them can ship in OpenChime. ttskit does the same job with parts whose
 licences allow it:
 
@@ -43,11 +45,11 @@ rendered speech before ttskit was adopted.
 | 3 | Each word looked up in the dictionary | `ttskit/tts_lexicon.c`, `ttskit/data/en-US/lexicon.bin` | ours; data from CMUdict |
 | 4 | Words not in it guessed; short capitals spelled | `ttskit/tts_guess.c`, `ttskit/data/en-US/guesses.bin` | ours; model trained on the data above |
 | 5 | Function words in their unstressed forms, words joined with pause marks | `ttskit/tts_text.c` | ours |
-| 6 | IPA characters mapped to the model's token ids | `daemon/tts_kitten_tokens.c`, Kitten's symbol table | ours; table from Kitten (Apache-2.0) |
-| 7 | Token ids and a voice's style vector to 24 kHz audio | `daemon/tts_kitten.c`, Kitten mini through a minimal static ONNX Runtime | Apache-2.0 / MIT |
+| 6 | IPA characters mapped to the model's token ids | `daemon/tts_voice_tokens.c`, the model's symbol table | ours; table from the voice model (Apache-2.0) |
+| 7 | Token ids and a voice's style vector to 24 kHz audio | `daemon/tts_voice.c`, the voice model run by ttskit (`ttskit/voice*.c`, `ttskit/data/voice.bin`) | ours; model Apache-2.0 |
 | 8 | Audio encoded and stored | the daemon's render worker, libopus and `oc_mp4` | BSD-3 / ours |
 
-ttskit is steps 2–5. It is linked by the daemon and by the tests, and by nothing that
+ttskit is steps 2–5 and 7. It is linked by the daemon and by the tests, and by nothing that
 ships to clients.
 
 Tools used only to *build* the data — Phonetisaurus (BSD-3) and the OpenFst (Apache-2.0) and
@@ -167,29 +169,118 @@ on 3,009. The one difference, "doman", has two paths whose scores are equal to t
 of the stored floats. A beam of 16 agrees on 99.8%, 64 on the same 3,009 at twice the time,
 and 256 on the same 3,009 at eighteen times; 32 takes about 1.7 ms a word.
 
+## 5b. Sounds to audio: the voice model
+
+The phonemes are spoken by a neural voice model run inside ttskit, in plain C
+(`ttskit/voice_model.c` the forward pass, `ttskit/voice.c` its data file; its kernels are
+nnkit's, `nnkit/nn_ops.c`, shared with voice input's recognizer, STTKIT.md). Where the model comes from, its licence and how its data file is made are
+in [VENDORS.md](./VENDORS.md); here it is **the voice model**.
+
+**What it is.** A StyleTTS 2-style model: a text side that decides how long each sound
+lasts and how pitch and loudness move, and a waveform side that turns that into samples.
+A sentence goes through it like this:
+
+1. **Token ids.** The daemon maps ttskit's IPA to the model's 178 symbols
+   (`daemon/tts_voice_tokens.c`), wrapped in the pad token and an end marker.
+2. **A voice's style row.** Each of the eight voices is a table of 400 rows of 256 floats;
+   the row is the sentence's length in characters, capped at the last. Its first half
+   conditions the decoder and generator, its second half the prosody predictor.
+3. **The context encoder,** a transformer whose one layer (12 heads, width 768) is applied
+   12 times, reads the tokens. **The prosody predictor** (bidirectional LSTMs with
+   style-conditioned layer norms between them) gives each token a duration: the sum of 50
+   sigmoids, divided by the speed and rounded to whole frames of 25 ms. The tokens are then
+   **aligned** to frames, each token's row repeated for its frames.
+4. **The text encoder** (an embedding, three convolutions and an LSTM) is expanded to the
+   same frames, and the predictor's residual blocks draw the **pitch (F0) and energy**
+   curves at two values a frame.
+5. **The decoder** (residual blocks with style-conditioned instance norms, AdaIN) combines
+   the text, pitch and energy into 512 channels at two rows a frame.
+6. **The generator** builds a **harmonic source** from the pitch — nine harmonics as sine
+   waves, with noise mixed in (below), through a linear layer and tanh, and its short-time
+   Fourier transform — then upsamples the decoder's output by 10 and 6 with transposed
+   convolutions, adds the source at each rate, and runs residual blocks with Snake
+   activations. A last convolution gives 11 log-magnitudes and 11 phases per hop of 5
+   samples, and an **inverse STFT** (20-point) makes the waveform: 600 samples a frame,
+   24 kHz mono.
+
+The model is quantised as it ships: matrix products have int8 weights and convolutions
+uint8, each run on 8-bit activations quantised from their own range as they arrive, with
+exact integer sums; LSTMs are int8; the rest is float, and its half-precision weights are
+widened to float when `voice.bin` is made, not as they are read.
+
+**The output is raw.** `voice_say` returns what the model writes. The 20 Hz high pass that
+takes out its offset, the trim of the noise it appends after the words and the 10 ms fade
+are the daemon's (`daemon/tts_voice.c`, READ-ALOUD.md §4), not ttskit's.
+
+**Plain C, one thread.** No intrinsics, no SIMD headers, no threads and no library: the
+kernels are ordinary loops over blocks of 16 or 64 values, written so GCC's and clang's
+auto-vectorisers turn them into vector code at `-O2`. Every ttskit and nnkit object is compiled with
+`-ffp-contract=off`, so the compiler never fuses a multiply and an add behind the source's
+back; where the arithmetic needs a fused multiply-add it is spelled out (`nn_fma`, exact
+in double, settled by `fmaf` only on an exact tie). The samples are then the order the
+source writes, the same on x86-64 and arm64 whatever the compiler. Measured on one core of
+an i5-1335U, a render takes 0.81× its length in time built with GCC (`tts_pack bench`),
+0.83–0.87× through `openchimed --tts-say`, and about 0.99× in a release build compiled with
+zig's clang. One render peaks at about 156 MB resident, about 86 MB of it `voice.bin`'s
+mapped pages, which the kernel may drop.
+
+**The same numbers as the reference.** The forward pass does the arithmetic of the
+model's graph in the order ONNX Runtime computes it, to the bit, up to the inverse STFT at
+the very end: its quantisation and rounding, its integer products, its scale and bias in
+its order, its norms, softmax, GELU, sigmoid, tanh, sin and atan approximations, its fused
+multiply-adds and its vectorised sums. Anything less is not enough, for three reasons. A
+token's frame count is a rounded sum, and the reference sentences come within 0.003 of a
+rounding boundary, so an error nothing else would show moves a frame. From the decoder on
+every convolution quantises its input with a scale taken from that input, so a last-bit
+difference that moves one value across a rounding step changes a whole quantisation step,
+and through the generator's residual blocks such steps multiply — a 1e-7 difference after
+its first upsampling comes out at 25 dB. And the harmonic source's phase is a running sum
+of the pitch, so any difference there grows along the sentence. With the noise off on both
+sides, ttskit's renders of the reference sentences have a signal-to-noise ratio of 136–141 dB
+against ONNX Runtime's (the test requires 40 dB, §9).
+
+**The noise and its seed.** The model mixes random noise into its harmonic source: normal
+noise on every sample of every harmonic, of standard deviation 0.003 where the pitch is
+voiced (above 10 Hz) and 0.1/3 where it is not, and a uniform random starting phase for
+harmonics 2 to 9. ttskit draws both from its own generator, SplitMix64 (`voice_rng`), with
+normal values by the Box–Muller transform in double: `noise` 1 with a `seed`, and the same
+seed gives the same audio, every time and on every machine. `noise` 0 leaves both out,
+which is how parity is checked: the reference's two random operators cannot be reproduced,
+and two of ONNX Runtime's own renders of one input agree to only 17–20 dB. The daemon
+renders with the noise on and one fixed seed, `TTS_VOICE_SEED` (1, `daemon/tts_voice.h`),
+so a message rendered again sounds the same as the first time; the seed is part of the
+model version renders are cached under.
+
 ## 6. The data files
 
-Both files live in `ttskit/data/en-US/` and are committed — a directory per language, so adding one is adding a directory rather than renaming files. `openchimed` maps the copies in its
-read-aloud data directory and opens them with `tts_load_mem`; `tts_load` maps them from a directory
-itself (the tests and `tts_pack`). Either way nothing is copied: a lookup is a binary
-search over a sorted table and reads only the pages it passes through; the kernel pages
-them in on demand, shares them between processes and can drop them under pressure.
-Nothing is parsed at load and no copy of the dictionary or the model is made on the heap —
-opening both costs a few kilobytes of heap (the guesser's token index).
+All three files are committed. The pronunciation data, `lexicon.bin` and `guesses.bin`,
+lives in `ttskit/data/en-US/` — a directory per language, so adding one is adding a
+directory rather than renaming files; the voice model's, `voice.bin`, in `ttskit/data/`
+beside its licence. `openchimed` maps the copies in its read-aloud data directory and opens
+them with `tts_load_mem` and `voice_open_mem`; `tts_load` and `voice_open` map them from a
+path themselves (the tests and `tts_pack`). Either way nothing is copied: a lookup is a
+binary search over a sorted table and reads only the pages it passes through, and a
+render reads the weights where they lie; the kernel pages them in on demand, shares them
+between processes and can drop them under pressure. Nothing is parsed at load and no copy
+of the dictionary or the model is made on the heap — opening the pronunciation data costs a
+few kilobytes of heap (the guesser's token index), and opening `voice.bin` reads its
+header and index and checks every entry against the file.
 
 | File | Size | gzipped | Contents |
 |---|---|---|---|
 | `lexicon.bin` | 3.8 MB | 1.2 MB | 126,052 words and their IPA, tagged `en-US` |
 | `guesses.bin` | 16.6 MB | 7.3 MB | the order-6 joint n-gram model, tagged `en-US` |
 | `../CMUDICT-LICENSE` (in `ttskit/data/`) | | | CMUdict's notice, which the derived data carries |
+| `../voice.bin` (in `ttskit/data/`) | 86.9 MB | 61.2 MB | the voice model: 441 tensors (274 float, 93 int8, 74 uint8) and the eight voices' style tables |
+| `../VOICE-LICENSE` (in `ttskit/data/`) | | | the voice model's licence (Apache-2.0), as its authors publish it |
 
 Measured resident memory: a process that only spells is 1.5 MB; looking words up in the
 dictionary adds about 1 MB of mapped pages; guessing an unknown word touches more of the
 model, and a sentence with two guessed words peaks at 14 MB — all of it file-backed pages the
 kernel may reclaim, not memory ttskit allocated.
 
-All integers are little-endian. Both formats carry a magic and a version; a file with the wrong
-magic, a different version, or sizes that do not add up to the file's length is refused.
+All integers are little-endian. All three formats carry a magic and a version; a file with the
+wrong magic, a different version, or sizes that do not add up to the file's length is refused.
 
 **`lexicon.bin`**
 
@@ -215,6 +306,56 @@ order k  count[k] x (2k+8) { u16 id[k], f32 log10 prob, f32 log10 backoff }  sor
 
 A token's letters and phonemes are stored as the ARPA model writes them with the `|`
 separators removed and `_` (no phoneme) as the empty string.
+
+**`voice.bin`**
+
+```
+header   128 bytes   "OCTTSVC1"  u32 version=1  u32 count  u32 header_size=128  u32 entry_size=96
+                     u64 data_off  u64 file_size
+                     u8 sha256[32] of the upstream model file  u8 sha256[32] of its voices file
+                     zeros to 128
+index    count x 96  { char name[48]  (NUL-terminated, NUL-padded)
+                       u32 dtype  (1 f32, 2 uint8, 3 int8: ONNX's codes)  u32 ndim (1..4)
+                       u32 dims[4]  (unused 0)  u64 offset  u64 bytes
+                       f32 scale  i32 zero_point  (a quantised tensor's; 0 and 0 otherwise) }
+                     sorted by the name's bytes
+data     from data_off, the index's end rounded up to 64: each tensor at a multiple of 64 from
+         the file's start, in index order, zeros between; the file ends with the last tensor
+```
+
+Every tensor starts 64-byte aligned, so the kernels read it in place; bytes a caller lends
+must start 64-byte aligned too, as a mapping does. On opening, each entry is checked: a name
+empty, unterminated, out of order or repeated, an unknown type, a rank outside 1..4, a size
+that is not its shape's, or data outside the file or out of line, refuses the file.
+
+The weights are stored in the layout the kernels run fastest on, not the model's
+(`ttskit/tts_priv.h`, "Weight layouts"): quantised rows padded to a multiple of 16 channels
+with the zero point, matrices transposed to one row per output, transposed convolutions
+split by phase, half-precision weights widened to float. The arithmetic constants of the
+graph (0.5, √2, the sample rate) are the forward pass's code, and norms whose scale is 1 and
+bias 0 are left out.
+
+**Names.** A tensor is named `<part>.<module>.<what>`, in ttskit's terms rather than the
+upstream graph's (`daemon/voice_pack.c` has the full table):
+
+| Part | What | Modules |
+|---|---|---|
+| `ctx` | the context encoder | `emb.tok`, `emb.pos`, `emb.type`, `emb.ln`; `in`; `layer.*` (the one layer: `q`, `k`, `v`, `o`, `ln1`, `ffn`, `ffn_out`, `ln2`); `out` |
+| `pro` | the prosody predictor | `enc.N.lstm`, `enc.N.ada`; `dur.lstm`, `dur.proj`; `lstm`; `f0.N`, `n.N`, `f0.proj`, `n.proj` |
+| `txt` | the text encoder | `emb`, `cnn.N.conv`, `cnn.N.ln`, `lstm` |
+| `dec` | the decoder | `f0`, `n` (the curves' stride-2 convolutions), `asr`, `enc`, `dec.N` |
+| `gen` | the generator | `src.harm`, `src.lin` (the harmonic source); `stft.re`, `stft.im`; `noise.N`, `nres.N`, `res.N`; `up.N`; `post`; `istft.re`, `istft.im` |
+| `voice` | a voice | `voice.<id>`: its style table, 400 rows of 256 (`voice.expr-voice-2-m` …) |
+| `norm` | | `norm.eps`: the epsilon of every norm without an affine part |
+
+A residual block has `conv1`, `conv2`, `ada1` and `ada2` (the style projections of its two
+adaptive norms), `skip` (the 1×1 shortcut, where the width changes) and `pool` (the
+depthwise transposed convolution that doubles its length, where it upsamples). A generator
+block has `c1.J` and `c2.J`, `ada1.J` and `ada2.J`, and its Snake activations' `alpha1.J`,
+`alpha2.J`, `inv1.J` and `inv2.J`. The last part says what the tensor is: `w` a weight (a
+quantised one's scale and zero point in its entry), `b` a bias, `g` a layer norm's gain,
+`eps` its epsilon; an LSTM's are `fwd.*` and `bwd.*`, each with `w` (input), `r`
+(recurrent) and `b`.
 
 ## 7. Using it
 
@@ -249,6 +390,37 @@ tts_free(t);
 
 A `tts` is read-only after loading and can be shared by threads.
 
+**Speaking.** The voice model takes token ids, which the daemon makes from the IPA
+(`tts_voice_tokens` in `daemon/tts_voice_tokens.c`):
+
+```c
+char err[256];
+voice *v = voice_open("ttskit/data/voice.bin", err, sizeof err);
+if (!v) { fprintf(stderr, "voice: %s\n", err); return 1; }
+
+float style[VOICE_STYLE_DIM];
+voice_style(v, "expr-voice-2-f", 25, style);          /* row 25: a 25-character sentence */
+
+size_t n;
+float *pcm = voice_say(v, ids, tokens, style, 1.2f, 1, 1, &n, err, sizeof err);
+/* n samples at VOICE_RATE (24 kHz), the raw waveform; NULL with a reason on failure */
+free(pcm);
+voice_close(v);
+```
+
+| Call | Does |
+|---|---|
+| `voice_open(path, err, cap)` | maps `voice.bin` and checks its header and every index entry (§6); NULL with the reason for a file that is not `voice.bin` of this version, is cut short, or has an entry that points outside it or out of line. |
+| `voice_open_mem(bytes, len, err, cap)` | the same over bytes the caller lends, which must start 64-byte aligned and outlive the handle; nothing is copied. |
+| `voice_close(v)` | unmaps (or lets go of lent bytes). |
+| `voice_style(v, id, row, style)` | row `row` of voice `id`'s style table into 256 floats (past the last row, the last); -1 for a voice the file does not have. |
+| `voice_say(v, ids, tokens, style, speed, noise, seed, &samples, err, cap)` | renders the token ids (0..177) at `speed` (1 the model's own rate, larger faster), with the noise on from `seed` or off (§5b): a malloc'd array of floats, the raw waveform, which the caller frees. NULL with the reason for a token out of range, more than 512 tokens, damaged data or no memory. |
+| `voice_tensor_get`, `voice_tensor_count`, `voice_tensor_at` | a tensor by name, or all of them in index order, for tools and tests. |
+
+A `voice` is read-only after opening; `voice_say` allocates its working memory per call and
+frees it before returning, so one handle can serve several threads, each rendering on its
+own. The daemon renders on one.
+
 **From the command line,** `make build/tts_pack` builds a small tool that uses the same code:
 
 ```
@@ -261,6 +433,21 @@ readme      ɹiːədm             guessed
 $ build/tts_pack text ttskit/data/en-US "It's 5 o'clock"
 ˈɪts fˈaɪv əklˈɑːk
 ```
+
+With the voice model, `DIR` is laid out as the daemon's data directory: `voice.bin` at its
+top and the pronunciation data in `en-US/` (`ttskit/data` in the tree, `tts/` beside a built
+daemon). The fixtures are the reference renderings (§9):
+
+```
+build/tts_pack say ttskit/data VOICE TEXT out.wav    # the model's own output, noise on, as a WAV
+build/tts_pack parity ttskit/data tests/data/voice    # §9's parity, as a table
+build/tts_pack bench ttskit/data tests/data/voice     # the real-time factor and peak memory
+build/tts_pack bench tests/data/voice                 # the kernels alone, timed on the model's shapes
+```
+
+`say` writes the model's raw output, before read-aloud's high pass and tail trim;
+`openchimed --tts-say VOICE TEXT OUT.wav` in a read-aloud build speaks exactly as read-aloud
+does, those included (READ-ALOUD.md §4).
 
 ## 8. Building the data from sources
 
@@ -318,6 +505,18 @@ new reference), and listen to rendered speech before committing — a changed ta
 how every message sounds. The model version is what renders are cached under, so changing
 it makes existing renders again rather than mixing them; it does not change by itself.
 
+**`voice.bin`** is not made by this script. It is converted from the upstream model's two
+files by the daemon, `openchimed --voice-pack <model.onnx> <voices.npz> <out>`
+(`daemon/voice_pack.c`), in any build, with or without read-aloud. The converter reads the
+ONNX file and the stored zip itself, with no library; takes each tensor it expects by its
+place in the graph, checking its type, shape and the settings of the operator that uses it;
+refuses inputs whose tensors are not the ones it expects, naming the first; and writes the
+same bytes on every run and machine. [VENDORS.md](./VENDORS.md) gives the pinned inputs, the
+commands and the SHA-256 the result must have. After converting a different model, update
+the `voice-` part of `OC_TTS_MODEL_VERSION` in `daemon/tts.h` (the first eight hex digits of
+the new file's SHA-256), remake the references (`tests/manual/voice_ref.c`, §9) and listen,
+as above.
+
 ## 9. Tests
 
 `tests/test_ttskit.c`, in `make test`:
@@ -330,7 +529,34 @@ it makes existing renders again rather than mixing them; it does not change by i
 - both data files against their SHA-256 pins;
 - the C guesser against Phonetisaurus's decoder on all 3,010 reference words (at least 999
   in 1,000 identical; all but one are);
-- truncated files, a wrong magic and a newer version, each refused on load with a reason.
+- truncated files, a wrong magic and a newer version, each refused on load with a reason;
+- the duration rounding and the alignment of tokens to frames (the kernels the model runs
+  on — the 8-bit quantisation, the integer matrix product and convolution, the LSTM, layer
+  and instance norms, attention, the transposed convolutions, the float matrix product, the
+  activations and the inverse STFT — are tested in `tests/test_nnkit.c`, each against a
+  naive version of the operator's definition on random inputs);
+- `voice.bin`: a small file built byte by byte loads and says what was written, and one with
+  a wrong magic, a later version or a wrong length is refused; the converter, on a small
+  model and voices built in the upstream formats, puts each tensor where its kernel reads it,
+  and refuses a model or voices that differ from what it expects, naming the difference;
+- the committed `ttskit/data/voice.bin` loads and holds every voice the daemon names, and a
+  copy damaged in its magic, version, length or an entry's offset is refused.
+
+**Against the reference,** the full suite's `voice_parity` (`tests/test_voice.c`, `FULL` in
+`tests/main.c`) renders each fixture in `tests/data/voice/` — six sentences, in
+`expr-voice-2-m` and `expr-voice-2-f`, with numbers, punctuation and a long one — from the
+committed `voice.bin`. With the noise off, each has the reference's sample count and at least
+40 dB SNR against ONNX Runtime's noise-off rendering (measured: 136–141 dB); with it on, the
+variance of the noise the harmonic source adds is within 10% of what the model's operators
+specify for the same input. `build/tts_pack parity ttskit/data tests/data/voice` prints the
+same as a table.
+
+The references were made once by `tests/manual/voice_ref.c`, which runs the upstream model
+file with ONNX Runtime 1.30.0's prebuilt release on one thread (VENDORS.md has the files),
+and are committed: per fixture the token ids (`.ids`), the raw output with the noise on
+(`.f32`) and with the model's two random operators replaced by zeros (`.quiet.f32`), and one
+`manifest` with the voice, style row, speed, sample counts and the SNR between two noisy
+runs, kept as a record (17–20 dB). No suite runs that program; rerun it only to remake them.
 
 ## 10. Limits
 
@@ -342,3 +568,13 @@ it makes existing renders again rather than mixing them; it does not change by i
 - **Mixed letters and digits** ("r2d2", "v2") are read as the letters around the digits.
 - **No secondary stress, no sentence intonation marks:** the voice model supplies the melody
   from punctuation.
+- **One voice model, fixed:** its eight voices, 24 kHz, at most 512 tokens a call (the
+  daemon renders a sentence of at most 120 characters at a time). A different model is a
+  new converter table and forward pass, not a setting.
+- **One thread, and only just faster than real time** in a release build (about 0.99×,
+  §5b), so a message takes about as long to render as to hear. No threads in the kernels,
+  by choice: renders are cached, and the render worker is one thread.
+- **No streaming:** a sentence is rendered whole before any of it is returned.
+- **Bit-exact only with the noise off,** and only to the inverse STFT's last roundings: with
+  the noise on, ttskit's generator is not ONNX Runtime's, so a render matches the
+  reference's sound, not its samples.

@@ -19,15 +19,19 @@
 #define OC_AUDIO_TOKEN_MAX    (OC_AUDIO_PREFIX_MAX + OC_AUDIO_TOKEN_RAND)
 
 /* UDP wire format.
- *   client -> relay : token seq(u16 BE) payload...
- *   relay -> client : sender_user_id(u64 BE) seq(u16 BE) payload...
+ *   client -> relay : token seq(u16 BE) stream(u8) payload...
+ *   relay -> client : sender_user_id(u64 BE) seq(u16 BE) stream(u8) payload...
+ * `stream` is OC_CALL_STREAM_* (protocol.h): in the clear, so the relay can send
+ * a camera's packets only to those who want them, and authenticated by the
+ * SFrame encryption as its metadata, so the relay cannot relabel one (CALLS.md
+ * §5.4). A packet naming no stream there is is dropped.
  * A client sends an initial packet (empty payload allowed) so the relay learns
  * its UDP source address before anyone speaks to it. An empty payload -- a
  * keepalive -- is answered to its sender alone, which is how a client learns the
  * relay can hear it. The relay answers each participant from the address that
  * participant's packets arrived at, which on a host with several is not the one
  * the kernel would pick. */
-#define OC_AUDIO_S2C_HDR   (8u + 2u)                   /* sender id + seq */
+#define OC_AUDIO_S2C_HDR   (8u + 2u + 1u)              /* sender id + seq + stream */
 /* One UDP datagram. 1,300 bytes: below what common UDP edges carry
  * (AUDIO.md §4). */
 #define OC_AUDIO_MAX_PACKET 1300u

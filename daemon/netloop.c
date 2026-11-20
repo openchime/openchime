@@ -530,10 +530,17 @@ static void xfer_submit(oc_dbwriter *dbw, const conn_xfer *x, oc_job *j) {
 }
 static int xfer_current(const conn_xfer *x, const oc_dbres *r) { return r->gen == x->gen; }
 
+static uint64_t g_clock_ahead_ms;   /* a test's advance of the loop's clock (netloop.h) */
+void oc_netloop_advance_clock_ms(uint64_t ms) {
+    if (ms) __atomic_add_fetch(&g_clock_ahead_ms, ms, __ATOMIC_RELAXED);
+    else    __atomic_store_n(&g_clock_ahead_ms, 0, __ATOMIC_RELAXED);
+}
+
 static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u +
+           __atomic_load_n(&g_clock_ahead_ms, __ATOMIC_RELAXED);
 }
 
 /* --- Turn statistics (netloop.h) ------------------------------------------ */
@@ -1172,6 +1179,7 @@ typedef struct {
     uint8_t  codecs;               /* the video codecs it can decode (ARCH-87) */
     uint64_t detached_ms;          /* when its connection went (conn_id is then 0):
                                     * its seat is held for a rejoin; 0 while attached */
+    uint8_t  camera;               /* its camera is on (CALL_CAMERA, REQ-160) */
 } call_part;
 typedef struct {
     uint64_t  channel_id;          /* 0 marks a free slot */
@@ -1467,14 +1475,14 @@ static void relay_gone(void *ctx, const uint8_t *token, size_t len) {
  * the audio's FEC and concealment, and a screen share's resend and keyframe
  * requests (AUDIO.md §4, CALLS.md §6.5). */
 #define OC_MEDIA_SOFT (256u * 1024u)
-static void relay_tcp_send(void *ctx, uint64_t conn_id, uint64_t sender, uint16_t seq,
+static void relay_tcp_send(void *ctx, uint64_t conn_id, uint64_t sender, uint16_t seq, uint8_t stream,
                            const uint8_t *ct, size_t len) {
     relay_ctx *rc = ctx;
     conn *c = find_by_id(rc->conns, conn_id);
     if (!c || pending_out(c) >= OC_MEDIA_SOFT) return;
     uint8_t buf[OC_AUDIO_MAX_PACKET + 64];
     oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_call_media_pkt m = { sender, seq, { ct, len } };
+    oc_call_media_pkt m = { sender, seq, { ct, len }, stream };
     if (oc_encode_call_media_down(&w, OC_PROTOCOL_VERSION, &m) != OC_OK) return;
     if (out_append(c, buf, w.len) == 0) flush_out(c);
 }
@@ -1861,7 +1869,8 @@ static void call_fill_parts(const call_t *c, oc_call_part *out) {
         out[k].slot = c->parts[k].slot;
         memcpy(out[k].device_key, c->parts[k].device_key, OC_CALL_DEVICE_KEY_LEN);
         out[k].codecs = c->parts[k].codecs;
-        out[k].flags = c->parts[k].detached_ms ? OC_CALL_PART_AWAY : 0;
+        out[k].flags = (uint8_t)((c->parts[k].detached_ms ? OC_CALL_PART_AWAY : 0) |
+                                 (c->parts[k].camera ? OC_CALL_PART_CAMERA : 0));
     }
 }
 
@@ -1959,6 +1968,7 @@ static void call_conn_closed(int ep, conn **conns, uint64_t conn_id) {
     int was_sharer = c->sharer_conn == conn_id;
     if (was_sharer) c->sharer_conn = 0;
     pt->conn_id = 0;
+    pt->camera = 0;                  /* a rejoin turns it on again if it wants */
     pt->detached_ms = now_ms();
     if (!pt->detached_ms) pt->detached_ms = 1;
     c->epoch++;
@@ -4424,7 +4434,8 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             continue;
         }
         if ((hdr.msg_type == OC_MSG_CALL_JOIN || hdr.msg_type == OC_MSG_CALL_INVITE ||
-             hdr.msg_type == OC_MSG_CALL_SHARE || hdr.msg_type == OC_MSG_CALL_KEY) &&
+             hdr.msg_type == OC_MSG_CALL_SHARE || hdr.msg_type == OC_MSG_CALL_KEY ||
+             hdr.msg_type == OC_MSG_CALL_CAMERA || hdr.msg_type == OC_MSG_CALL_VIDEO_SUB) &&
             !win_ok(&c->call_rl, OC_CALL_RATE_MAX, OC_CALL_RATE_MS)) {
             if (reject_rate(c, 0, "call signalling rate exceeded") != 0) return -1;
             continue;
@@ -4506,7 +4517,42 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
              * sender's call, and a call is capped. */
             oc_call_media_pkt cm;
             if (oc_decode_call_media_up(&p, &cm) != OC_OK) return -1;
-            if (g_relay) oc_relay_from_tcp(g_relay, c->conn_id, cm.seq, cm.ct.ptr, cm.ct.len);
+            if (g_relay) oc_relay_from_tcp(g_relay, c->conn_id, cm.seq, cm.stream, cm.ct.ptr, cm.ct.len);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CALL_CAMERA) {
+            /* Turn a camera on or off (REQ-160): the relay carries its stream
+             * only while on, and the others learn it from the roster, which
+             * keeps its epoch -- nobody joined or left, so nobody rekeys. */
+            oc_call_camera cam;
+            if (oc_decode_call_camera(&p, &cam) != OC_OK) return -1;
+            int idx;
+            call_t *cc = call_of_conn(c->conn_id, &idx);
+            if (!cc || cc->channel_id != cam.channel_id) {
+                send_call_error(ep, c, OC_ERR_NOT_IN_CALL, "not in this call");
+                continue;
+            }
+            uint8_t on = cam.on ? 1 : 0;
+            if (g_relay) oc_relay_set_camera(g_relay, c->conn_id, on);
+            if (cc->parts[idx].camera != on) {
+                cc->parts[idx].camera = on;
+                call_send_roster(ep, conns, cc, 0, 0);
+            }
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CALL_VIDEO_SUB) {
+            /* Whose cameras the relay sends this participant (REQ-160): a view
+             * asks only for the pictures it shows. */
+            oc_call_video_sub vs;
+            uint64_t who[OC_MAX_CALL_PARTICIPANTS];
+            if (oc_decode_call_video_sub(&p, &vs, who, OC_MAX_CALL_PARTICIPANTS) != OC_OK) return -1;
+            int idx;
+            call_t *cc = call_of_conn(c->conn_id, &idx);
+            if (!cc || cc->channel_id != vs.channel_id) {
+                send_call_error(ep, c, OC_ERR_NOT_IN_CALL, "not in this call");
+                continue;
+            }
+            if (g_relay) oc_relay_subscribe(g_relay, c->conn_id, vs.all, vs.users, vs.count);
             continue;
         }
         if (hdr.msg_type == OC_MSG_CALL_SHARE) {

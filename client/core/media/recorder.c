@@ -110,6 +110,7 @@ struct oc_recorder {
     /* recording (encode thread; status fields under mu) */
     int64_t       t0_us;                   /* the first recorded frame's capture time */
     uint32_t      elapsed_ms;
+    uint32_t      frames;                  /* frames taken into the recording */
     int           stepped_down;
     int           has_audio;
     oc_rec_result result;
@@ -432,7 +433,7 @@ static void *encode_main(void *arg) {
                     if (small.plane[0]) { oc_i420_scale(&work, &small); in = &small; }
                     if (oc_vp9enc_encode(ve, in, 0, emit_video, &e) != 0) goto fail;
                 }
-                oc_mutex_lock(&r->mu); r->elapsed_ms = elapsed; oc_mutex_unlock(&r->mu);
+                oc_mutex_lock(&r->mu); r->elapsed_ms = elapsed; r->frames++; oc_mutex_unlock(&r->mu);
             }
             r->last_video_us = work.pts_us;
             pump(r, oe, &e, acc, &acc_n, 0);
@@ -619,6 +620,7 @@ int oc_recorder_start(oc_recorder *r) {
         r->stop_requested = 0;
         r->q_len = 0;
         r->elapsed_ms = 0;
+        r->frames = 0;
         oc_cond_signal(&r->cv);
     }
     oc_mutex_unlock(&r->mu);
@@ -636,6 +638,7 @@ void oc_recorder_status(oc_recorder *r, oc_rec_status *st) {
     oc_mutex_lock(&r->mu);
     st->state = r->state;
     st->elapsed_ms = r->elapsed_ms;
+    st->frames = r->frames;
     st->cap_ms = r->cap_ms;
     st->level = r->mic ? oc_audio_level(r->mic) : 0;
     st->has_audio = r->has_audio;

@@ -147,10 +147,17 @@ static void fill_schedule(sqlite3 *db, uint64_t uid, oc_dbres *r);      /* fwd �
 static void fill_alert_prefs(sqlite3 *db, uint64_t uid, oc_dbres *r);   /* fwd — REQ-135 */
 static void build_schedule(sqlite3 *db, uint64_t uid, oc_dbres *r);     /* fwd — REQ-136 */
 
+static uint64_t g_dbw_clock_ahead_ms;   /* a test's advance of the writer's clock (dbwriter.h) */
+void oc_dbwriter_advance_clock_ms(uint64_t ms) {
+    if (ms) __atomic_add_fetch(&g_dbw_clock_ahead_ms, ms, __ATOMIC_RELAXED);
+    else    __atomic_store_n(&g_dbw_clock_ahead_ms, 0, __ATOMIC_RELAXED);
+}
+
 static uint64_t dbw_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u +
+           __atomic_load_n(&g_dbw_clock_ahead_ms, __ATOMIC_RELAXED);
 }
 
 /* --- audit log (REQ-251, ARCH-79) ----------------------------------------- */

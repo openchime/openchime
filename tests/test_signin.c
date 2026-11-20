@@ -62,9 +62,17 @@ static void *browser_thread(void *arg) {
 }
 
 static atomic_int g_cancel;
-/* The person presses cancel a moment into the wait: time passing is what is
- * modelled; the outcome asserted is the wait's answer, CANCELLED, either way. */
-static void *cancel_thread(void *arg) { (void)arg; oc_test_let_time_pass(150); g_cancel = 1; return NULL; }
+/* The person presses cancel while the wait is under way. That it is under way
+ * is seen, not assumed: a stray request to its port is answered only by the
+ * wait itself (the listener only queues it), so once its answer is back the
+ * wait is running, and only then is cancel pressed. */
+struct canceller { int port; char answer[64]; };
+static void *cancel_thread(void *arg) {
+    struct canceller *c = arg;
+    http_get(c->port, "GET / HTTP/1.1\r\n\r\n", c->answer, sizeof c->answer);
+    g_cancel = 1;
+    return NULL;
+}
 
 /* --- the tunnel ------------------------------------------------------------ */
 
@@ -415,14 +423,20 @@ int run_signin_tests(void) {
         /* Nobody comes: it gives up. */
         char q[32];
         CHECK(oc_loopback_wait(a, 300, NULL, q, sizeof q) == OC_LOOPBACK_TIMEOUT);
-        /* The person presses cancel. */
+        /* The person presses cancel, while it waits. */
         g_cancel = 0;
+        struct canceller cn;
+        memset(&cn, 0, sizeof cn);
+        CHECK(strncmp(u2, "http://127.0.0.1:", 17) == 0);
+        cn.port = atoi(u2 + 17);
         pthread_t th;
-        CHECK(pthread_create(&th, NULL, cancel_thread, NULL) == 0);
+        CHECK(pthread_create(&th, NULL, cancel_thread, &cn) == 0);
         CHECK(oc_loopback_wait(b, 5000, &g_cancel, q, sizeof q) == OC_LOOPBACK_CANCELLED);
-        pthread_join(th, NULL);
         oc_loopback_close(a);
-        oc_loopback_close(b);
+        oc_loopback_close(b);   /* before the join: a stray request never answered ends here */
+        pthread_join(th, NULL);
+        CHECK(strncmp(cn.answer, "HTTP/1.1 404", 12) == 0);   /* the wait answered it before it was cancelled */
+        CHECK(q[0] == '\0');                                   /* and took no callback */
         /* A buffer too small for the redirect is refused, not truncated. */
         char tiny[8];
         CHECK(oc_loopback_open(tiny, sizeof tiny) == NULL);

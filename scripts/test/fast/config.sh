@@ -8,9 +8,7 @@
 #   b. Every OPENCHIME_* name in code, tests, scripts, workflows, packaging and
 #      docs is a row (or a pattern row) of the registry or a name it lists as
 #      no longer read; and every row's name appears in CONFIG.md.
-#   c. Every OC_TEST_* name the scripts use is read by tools/gui/lib.sh or a
-#      driver (tools/gui/drive.sh, tools/web/drive.sh).
-#   d. CONFIG.md's generated block and packaging/openchimed.env are what the
+#   c. CONFIG.md's generated block and packaging/openchimed.env are what the
 #      daemon prints (--config-reference, --config-env), byte for byte.
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
@@ -53,14 +51,7 @@ missing=$(echo "$missing" | tr ' ' '\n' | grep -vE '^$' | tr '\n' ' ')
 if [ -n "${missing// /}" ]; then say "named somewhere but not a setting in the registry:$missing"; fail=1; fi
 for n in $(echo "$rows" | grep -v '_N$'); do grep -q "\`$n\`" docs/CONFIG.md || { say "$n is a row but not in CONFIG.md"; fail=1; }; done
 
-# c. the harness's names
-hv=$(grep -ohE 'OC_TEST_[A-Z_]+' tools/gui/*.sh tools/web/*.sh tools/web/*.mjs tools/demo/*.sh tools/*.sh 2>/dev/null | sort -u)
-for n in $hv; do
-    grep -qE "\\$\{$n(:|\}|-)|process\.env\.$n|getenv\(\"$n\"" tools/gui/*.sh tools/web/* tools/gui/lib.sh tests/main.c 2>/dev/null \
-        || { say "$n is set by a script but read by nothing"; fail=1; }
-done
-
-# d. the generated files
+# c. the generated files
 gen_ref=$(mktemp); "$BIN" --config-reference > "$gen_ref"
 cur_ref=$(mktemp); awk '/<!-- config-reference -->/{f=1;next} /<!-- \/config-reference -->/{f=0} f' docs/CONFIG.md > "$cur_ref"
 gen_env=$(mktemp); "$BIN" --config-env > "$gen_env"

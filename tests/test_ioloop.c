@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -133,6 +134,12 @@ typedef struct { tclient *c; int done; } hs_arg;
 static void *hs_thread(void *p) { hs_arg *a = p; a->done = tclient_handshake(a->c) == 0 ? 1 : -1; return NULL; }
 
 /* Connect a client, accept it here, hand the socket over and wait for OPENED. */
+/* Bytes waiting in a socket's receive queue, not yet read by its owner. */
+static int unread_bytes(int fd) {
+    int n = 0;
+    return ioctl(fd, FIONREAD, &n) == 0 ? n : -1;
+}
+
 static int open_conn(oc_ioloop *io, int lfd, uint16_t port, uint64_t id, tclient *c,
                      const char **alpn, int *fd_out, int *http_out) {
     if (tclient_open(c, port, alpn) != 0) return -1;
@@ -419,10 +426,9 @@ int run_ioloop_tests(void) {
         for (size_t off = 0; off < rl; off += 7) {
             size_t n = rl - off < 7 ? rl - off : 7;
             CHECK(twrite(&w, (const uint8_t *)req + off, n) == 0);
-            /* A moment between pieces, so that each tends to arrive alone, as
-             * a slow sender's do: what is checked is the whole request,
-             * reported once, however the pieces fell. */
-            oc_test_let_time_pass(2);
+            /* Each piece arrives alone, as a slow sender's do: the next is
+             * sent once the I/O thread has taken this one off its socket. */
+            CHECK(WAIT_UNTIL(unread_bytes(wfd) == 0, 3000));
         }
         oc_io_event *e = wait_kind(io, OC_IO_HTTP_REQ, 3000);
         CHECK(e && e->conn_id == 21 && e->is_json);

@@ -389,6 +389,8 @@ int main(int argc, char **argv) {
     { static oc_call_share m; FRAME("call_share", oc_encode_call_share(&w, V, &m)); }
     { static oc_call_media_pkt m; FRAME("call_media_up", oc_encode_call_media_up(&w, V, &m)); }
     { static oc_call_media_pkt m; FRAME("call_media_down", oc_encode_call_media_down(&w, V, &m)); }
+    { static oc_call_camera m; FRAME("call_camera", oc_encode_call_camera(&w, V, &m)); }
+    { static oc_call_video_sub m; FRAME("call_video_sub", oc_encode_call_video_sub(&w, V, &m)); }
     { static oc_upload_begin m; FRAME("upload_begin", oc_encode_upload_begin(&w, V, &m)); }
     { static oc_upload_ready m; FRAME("upload_ready", oc_encode_upload_ready(&w, V, &m)); }
     { static oc_upload_chunk m; FRAME("upload_chunk", oc_encode_upload_chunk(&w, V, &m)); }

@@ -67,6 +67,81 @@ size_t tts_normalize(const char *text, char *out, size_t cap);
  * written, 0 if nothing was pronounceable. */
 size_t tts_text(tts *t, const char *text, char *ipa, size_t cap);
 
+/* ---- the voice model's data: voice.bin ------------------------------------
+ *
+ * Every tensor the voice model's forward pass reads, already in the precision
+ * and layout its kernels run fastest on (tts_priv.h, "Weight layouts"), and the
+ * voices' style tables. Made from the upstream model by `openchimed
+ * --voice-pack` (daemon/voice_pack.c, which documents the tensor names); mapped,
+ * never copied.
+ *
+ * header (128 bytes)  magic "OCTTSVC1", u32 version, u32 count, u32 header size
+ *                     (128), u32 entry size (96), u64 data offset, u64 file size,
+ *                     u8 sha256 of the model[32], u8 sha256 of the voices[32],
+ *                     zeros to 128
+ * index               count x { char name[48] (NUL-terminated, NUL-padded),
+ *                     u32 dtype, u32 ndim, u32 dims[4] (unused 0), u64 offset,
+ *                     u64 bytes, f32 scale, i32 zero point }, sorted by name bytes
+ * data                from the data offset (the index's end rounded up to 64),
+ *                     each tensor at a multiple of 64 from the file's start, in
+ *                     index order, zeros between; the file ends with the last
+ * All integers little-endian. A quantised tensor's scale and zero point are its
+ * entry's; every other tensor has 0 and 0 there. */
+#define VOICE_MAGIC     "OCTTSVC1"
+#define VOICE_VERSION   1u
+#define VOICE_HEADER    128u
+#define VOICE_ENTRY     96u
+#define VOICE_NAME_MAX  48         /* name bytes, the NUL included */
+#define VOICE_ALIGN     64
+#define VOICE_MAX_DIMS  4
+/* Element types: f32, uint8, int8 (ONNX's codes for the same). */
+enum { VOICE_F32 = 1, VOICE_U8 = 2, VOICE_I8 = 3 };
+
+typedef struct voice voice;
+typedef struct {
+    const char *name;
+    int         dtype, ndim, dims[VOICE_MAX_DIMS];
+    const void *data;                  /* in the mapping: 64-byte aligned */
+    size_t      bytes;
+    float       scale;
+    int         zero_point;
+} voice_tensor;
+
+/* Map `path`, or use `len` bytes the caller lends (nothing is copied: they must
+ * outlive the handle, and start 64-byte aligned). NULL on failure, with the
+ * reason in `err`: a file that is not voice.bin of this version, is cut short or
+ * has an index that points outside it or out of line is refused. */
+voice *voice_open(const char *path, char *err, size_t errcap);
+voice *voice_open_mem(const void *bytes, size_t len, char *err, size_t errcap);
+void   voice_close(voice *v);
+/* The tensor called `name`: 1 with `t` filled, 0 if there is none. */
+int    voice_tensor_get(const voice *v, const char *name, voice_tensor *t);
+/* The tensors in index order, for tools and tests. */
+size_t voice_tensor_count(const voice *v);
+int    voice_tensor_at(const voice *v, size_t i, voice_tensor *t);
+
+/* ---- speaking with it -------------------------------------------------------
+ *
+ * The model reads token ids (0..177, from the IPA tts_text writes), a style row
+ * (256 floats) and a speaking rate, and writes 24 kHz mono audio: 600 samples
+ * for every frame it gives the sentence. One thread, plain C. */
+#define VOICE_RATE       24000      /* samples per second */
+#define VOICE_STYLE_ROWS 400        /* rows of a voice's style table */
+#define VOICE_STYLE_DIM  256        /* floats in a style row */
+
+/* Row `row` of voice `id`'s style table ("expr-voice-2-m" ...; past the last row,
+ * the last), into style[VOICE_STYLE_DIM]. 0, or -1 if the data has no such voice. */
+int    voice_style(const voice *v, const char *id, size_t row, float *style);
+/* Render `tokens` token ids with a style row at `speed` (1 is the model's own
+ * rate; larger is faster). The model mixes random noise into its pitch source:
+ * `noise` 1 does that, drawing from a generator seeded with `seed` (the same
+ * seed, the same audio), 0 leaves it out (the parity tests' setting). Returns
+ * the raw waveform -- no high pass, trim or fade -- as a malloc'd array of
+ * *samples floats the caller frees; NULL with the reason in `err` (a token out
+ * of range, too many tokens or frames, damaged data, no memory). */
+float *voice_say(const voice *v, const int *ids, int tokens, const float *style, float speed, int noise,
+                 unsigned long long seed, size_t *samples, char *err, size_t errcap);
+
 /* ---- building the data (used by tts_pack and the tests) ------------------ */
 
 /* One CMUdict ARPAbet pronunciation ("M AY0 G R EY1 SH AH0 N") to IPA. With

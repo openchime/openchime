@@ -62,8 +62,9 @@ text fields are drawn by the application on every platform (CLIENT.md, "The
 text fields are drawn"), so the sign-in field, the search boxes and a form's
 fields are the same code here. Signed in with a password, it
 shows the workspace: the sidebar, a channel's transcript with mentions, the
-member pane, the composer; `scripts/test/full/web.sh` checks that through the client's
-own test hook (the model dumped, a screenshot taken) in a headless Chromium.
+member pane, the composer; the GUI smoke (`tools/gui/run.sh --web smoke`) checks that
+through the client's own test hook (the model dumped, a screenshot taken) in a
+headless Chromium.
 
 **The browser platform** (`client/gui/platform/web/`), what a page can do of
 the contract: images decode through `createImageBitmap` and a 2D canvas, read
@@ -183,8 +184,8 @@ installed. Outside a secure context, or if Web Crypto fails, the page starts
 the client as `openchime --signin <host:port> --invite <hex>` and the sign-in
 begins as any other. The clients offer the link in the
 invitation text where the daemon's pages open directly
-(`oc_client_pages_direct`); `scripts/test/lib/web/invite.mjs` proves it from a cold
-browser.
+(`oc_client_pages_direct`); `tools/gui/harness/web/invite.mjs` proves it from a cold
+browser (`tools/gui/run.sh web_pages`).
 
 **Media in the browser.** The same media, voice and call code the desktop
 links (`client/core/media`, `voice`, `call`: VP9 through libvpx, Opus,
@@ -218,8 +219,8 @@ the media clock. One context per device rate; where the browser gave a
 context another rate (Safari for a microphone), a speexdsp resampler runs in
 the callback. A browser that cannot start the worklet falls back to a
 `ScriptProcessorNode` on the page's thread (1024 frames of latency), and the
-console says which ran (`oc-web: audio worklet`); `scripts/test/full/web.sh` requires
-the worklet (TESTING.md §3.4). The device lists come from a cache the page keeps
+console says which ran (`oc-web: audio worklet`); `tools/gui/features/web_client.sh`
+requires the worklet (tools/gui/README.md, "Reading the web client harness"). The device lists come from a cache the page keeps
 (`devices_web.c`), so any thread can ask; the labels appear once a device
 has been allowed, as the browser decides.
 
@@ -235,7 +236,7 @@ with each right-to-left run measured and drawn with the canvas's direction
 set and a line's runs placed in visual order, and alignment following the
 paragraph's reading direction as DirectWrite's does. Tested on the host
 (`tests/test_sdltext_unicode.c`) and in the browser through the client's
-`sttest` verb, which `scripts/test/full/web.sh` runs.
+`sttest` verb, which `tools/gui/features/web_client.sh` runs.
 
 **The input method.** A browser's IME composes into an element, so the
 platform keeps a hidden `<input>` at the caret (`oc_plat_text_input_area`,
@@ -243,7 +244,8 @@ the contract's one line for it; Win32 answers with SDL's text input area)
 and hands its composition to SDL's own events -- `SDL_EVENT_TEXT_EDITING`
 while composing, `SDL_EVENT_TEXT_INPUT` at the commit -- so the composer
 shows the composition underlined and takes the result as it does from a
-desktop IME. `scripts/test/full/web.sh` plays a Japanese composition into it.
+desktop IME. `tools/gui/features/web_client.sh` plays a Japanese composition into
+it, through the web driver's `ime` verb.
 
 Rough edges: fonts are the browser's, so layouts are near-identical to
 Windows, not pixel-identical, and the harness compares state, not pixels. The picker and the clipboard need a
@@ -291,7 +293,8 @@ native trees in `third_party/`. The page takes the workspace in its query
 (`host` and `port`, or `ws`, for a page served from elsewhere than the
 daemon; they become the application's `--signin`) and, on a page in
 development mode, with `hook=1`, the client's test hook on the page's
-filesystem (`ocHook('verb')`, `ocShot()`), which is what the test drives. The
-client's checks (`scripts/test/full/web.sh`) run in the full suite, in CI
-(TESTING.md §3.4); they need Chrome: the one `CHROME` names, else the
-installed `google-chrome` on `PATH`.
+filesystem (`ocHook('verb')`, `ocShot()`), which is what the tests drive. The
+client's checks in a browser are the GUI and browser tests (`tools/gui/run.sh
+--web`, tools/gui/README.md), run by hand and in neither suite (TESTING.md
+§3.4); they need Chrome: the one `CHROME` names, else the installed
+`google-chrome` on `PATH`.

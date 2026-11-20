@@ -18,7 +18,7 @@ cd "$(dirname "$0")/../../.."
 # Not the calling make's flags or variables: this asks a fresh one. And not the
 # tree's remembered switches either: make remakes an included makefile even
 # under -n, so a dry run with TTS=1 would rewrite build/.features and the next
-# `make openchimed` would build ONNX Runtime. REMEMBER=0 reads and writes none.
+# `make openchimed` would build the speech features. REMEMBER=0 reads and writes none.
 unset MAKEFLAGS MFLAGS MAKELEVEL
 mbedtls=$(make -s -p -n -f Makefile REMEMBER=0 FORCE 2>/dev/null | sed -n 's/^MBEDTLS_DIR := //p' | head -1)
 [ -n "$mbedtls" ] || { echo "notices: could not read MBEDTLS_DIR from the Makefile" >&2; exit 1; }

@@ -34,12 +34,10 @@ static int failures OC_UNUSED = 0;
         }                                                                    \
     } while (0)
 
-/* A limit on how fast code runs -- wall-clock time, or one timing against
- * another -- is asserted in the ordinary build, where it measures the code. Under
- * ThreadSanitizer, which slows code five to fifteen times and unevenly, it would
- * measure the sanitizer, so it is not: the code still runs there, for the races
- * the sanitizer is for. A timeout that must fire, checked with a wide margin,
- * is not a speed limit and stays a CHECK. */
+/* Under ThreadSanitizer, which slows code five to fifteen times and unevenly. A
+ * verdict never depends on how fast code runs, here or anywhere: a test asserts
+ * the mechanism (the work done, a count, a bound), on a clock it injects and
+ * moves, or by waiting on an outcome it can observe (docs/TESTING.md §2.3). */
 #if defined(__SANITIZE_THREAD__)
 #define OC_UNDER_TSAN 1
 #elif defined(__has_feature)
@@ -50,29 +48,6 @@ static int failures OC_UNUSED = 0;
 #ifndef OC_UNDER_TSAN
 #define OC_UNDER_TSAN 0
 #endif
-
-/* A verdict that races the wall clock -- work that must land inside a short
- * real-time window, or a count that depends on where a window's edge falls --
- * can fail on a loaded machine with nothing wrong. Both suites assert it;
- * OC_TEST_TIMING=0 leaves it unjudged, an escape hatch for a machine too
- * loaded to judge it. The code around it still runs everywhere, under
- * ThreadSanitizer too. A speed limit is such a
- * verdict as well. Each one is to be made deterministic -- an injected clock,
- * an explicit sweep, a wait on the outcome -- and become a CHECK again. */
-static inline int oc_test_timing(void) {
-    const char *v = getenv("OC_TEST_TIMING");
-    return !(v && v[0] == '0' && v[1] == '\0');
-}
-
-#define CHECK_TIMING(cond)                                                   \
-    do {                                                                     \
-        if (oc_test_timing()) CHECK(cond);                                   \
-    } while (0)
-
-#define CHECK_SPEED(cond)                                                    \
-    do {                                                                     \
-        if (!OC_UNDER_TSAN) CHECK_TIMING(cond);                              \
-    } while (0)
 
 /* How long to wait for work to be done -- frames encoded and decoded, say --
  * before calling it not done. Not a speed limit: what is checked is that it is
@@ -128,14 +103,6 @@ static inline int oc_test_pause(uint64_t deadline) {
     struct timespec ts = { 0, (long)(step * 1000000u) };
     nanosleep(&ts, NULL);
     return 1;
-}
-
-/* Time itself passing, where the behaviour under test is about elapsed time
- * (a timestamp that must move on, a window that must close) and there is no
- * event to wait for. Never a stand-in for waiting on work: that is WAIT_UNTIL. */
-static inline void oc_test_let_time_pass(uint64_t ms) {
-    uint64_t end = oc_test_mono_ms() + ms;
-    while (oc_test_pause(end)) {}
 }
 
 /* Poll `cond` until it holds or WAIT_MS(ms) pass; the value is whether it held.

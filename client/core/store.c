@@ -40,7 +40,7 @@ static uint64_t get_u64(const uint8_t *p) {
  * but it is integrity-sensitive — rewriting a pin is how a MITM gets accepted
  * (ARCH-10) — so it belongs beside the credential, not in a file anyone can
  * edit. The book fields ride along so the credential IS the book entry. */
-#define SEC_VER    5
+#define SEC_VER    OC_STORE_ENTRY_VERSION   /* store.h */
 #define SEC_LABEL  128
 #define SEC_USER   128
 #define SEC_OWNER  128

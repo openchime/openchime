@@ -4,6 +4,7 @@
 
 #include "ttskit.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -87,5 +88,85 @@ void tts_seterr(char *err, size_t cap, const char *fmt, ...);
 static inline uint32_t tts_rd32(const uint8_t *p) {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
+
+/* ---- voice.bin (voice.c; the format is in ttskit.h) ------------------------- */
+struct voice { tts_map map; uint32_t count; const uint8_t *index; };
+/* As tts_lexicon_open: `mem`, if not NULL, supplies the bytes instead of mapping
+ * `path` (which then only names them in messages). 0, TTS_OPEN_ABSENT, or -1
+ * with the reason the data is refused. */
+int  voice_map_open(const char *path, const tts_map *mem, voice *v, char *err, size_t errcap);
+void voice_map_close(voice *v);
+
+/* ---- the kernels: nnkit/nnkit.h ------------------------------------------- */
+#include "nnkit.h"
+
+/* ---- the voice model's forward pass, its first half (voice_model.c) --------------
+ * From token ids (0..177), a voice's style row (256 floats: the first 128 the
+ * decoder's, the second 128 the prosody predictor's) and the speed, what the
+ * decoder reads: the text encoder's states expanded to one row per frame, and
+ * the pitch (F0) and energy (N) curves at two values per frame. A frame is 600
+ * samples of the 24 kHz output. Every array is the struct's own (malloc'd);
+ * time-major, rows of 512. */
+#define VOICE_MAX_FRAMES (1 << 20)
+typedef struct {
+    int    tokens, frames;   /* T; F = the sum of dur */
+    int   *dur;              /* T: frames per token, each at least 1 */
+    float *dur_raw;          /* T: the sum of the duration bins over the speed, before rounding */
+    float *ctx;              /* T x 512: the context encoder's output */
+    float *txt;              /* T x 512: the text encoder's output */
+    float *asr;              /* F x 512: txt expanded, row f the token frame f belongs to */
+    float *f0, *n;           /* 2F each: the pitch and energy curves */
+} voice_front;
+/* 0, or -1 with the reason in err (a token out of range, a tensor missing from
+ * the data, too many frames, no memory); f is then empty. */
+int  voice_front_run(const voice *v, const int *ids, int tokens, const float *style, float speed, voice_front *f,
+                     char *err, size_t errcap);
+void voice_front_free(voice_front *f);
+/* The duration rule: round half to even, then at least 1. */
+int  voice_round_duration(float raw);
+/* The alignment: frame_token[f] = the token frame f belongs to, frames in token
+ * order, dur[t] of them for token t. Returns the frame count, or -1 if it would
+ * pass cap. */
+int  voice_align(const int *dur, int tokens, int *frame_token, int cap);
+/* y's row f = x's row frame_token[f] (c values; rows ldx and ldy apart): the
+ * graph's product with the 0/1 alignment matrix, which has one 1 per frame. */
+void voice_expand(const float *x, int ldx, int c, const int *frame_token, int frames, float *y, int ldy);
+
+/* ---- the voice model's forward pass, its second half (voice_model.c) -------------
+ * From the front half to the raw waveform, in three parts that voice_say runs in
+ * turn and the tests and tools can run alone. Each reads the style row's first
+ * 128 values; each returns 0, or -1 with the reason in err. F is the frame count. */
+#define VOICE_FRAME 600          /* output samples per frame */
+/* The decoder: the expanded text states, F0 and N through its five residual
+ * blocks to out, 2F rows of 512. */
+int  voice_decode(const voice *v, const voice_front *f, const float *style, float *out, char *err, size_t errcap);
+
+/* The noise generator: SplitMix64 (Steele, Lea and Flood's mixer of a Weyl
+ * sequence), one 64-bit state, seeded with the seed as it is; uniform floats
+ * from its top 24 bits; normal ones by Box-Muller, in pairs, from two of its
+ * 53-bit uniforms in double. Repeatable for a seed; the normals go through the C
+ * library's log, sin and cos, so their last bits may differ between libraries. */
+typedef struct { uint64_t state; int have; float spare; } voice_rng;
+uint64_t voice_rng_next(voice_rng *r);
+float    voice_rng_uniform(voice_rng *r);       /* [0, 1) */
+float    voice_rng_normal(voice_rng *r);        /* mean 0, variance 1 */
+
+/* The harmonic source: from the pitch curve (2F values), the sum of nine
+ * harmonics of the pitch (where it is above 10 Hz, silence elsewhere) through a
+ * linear layer and tanh, sampled at 24 kHz, and its STFT (n_fft 20, hop 5):
+ * har, 120F + 1 rows of 11 magnitudes then 11 phases. The phases' arithmetic
+ * is ONNX Runtime's to the bit, since its running sum carries any difference
+ * into every later sample. With noise on (the model's own behaviour), the
+ * random operators it replaces draw from voice_rng seeded with `seed`: each
+ * sample and harmonic gets normal noise of standard deviation 0.003 where
+ * voiced and 0.1 / 3 where not, and harmonics 2..9 a uniform initial phase on
+ * the first sample (which the graph's resampling never reads); off, both are 0.
+ * noise_out, if not NULL, receives the normal noise as added (600F rows of 9). */
+int  voice_source(const voice *v, const float *f0, int frames, int noise, uint64_t seed, float *har, float *noise_out,
+                  char *err, size_t errcap);
+/* The generator: the decoder's output (2F rows of 512) and the source's
+ * spectrum to 600F samples of the raw waveform (no high pass, no trim). */
+int  voice_generate(const voice *v, const float *dec, const float *har, int frames, const float *style, float *pcm,
+                    char *err, size_t errcap);
 
 #endif

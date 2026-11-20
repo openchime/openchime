@@ -998,7 +998,9 @@ static int q_run(void *h, const char *system, const char *user, const char *gram
             snprintf(err, cap, "stopped");
             return -1;
         }
-        oc_test_let_time_pass(2);   /* a model at work: each step takes a moment */
+        /* A model at work, asking its gate between steps: the next step comes
+         * when the test lets it go, or a moment on, to ask again. */
+        (void)WAIT_UNTIL(!__atomic_load_n(&g_q_hold, __ATOMIC_ACQUIRE), 2);
     }
     /* contract: the grammar's rules (GBNF) say which answer is asked for */
     *out = strdup(grammar && strstr(grammar, "note ::=") ? "- [1] decision | plans | They agreed.\n"

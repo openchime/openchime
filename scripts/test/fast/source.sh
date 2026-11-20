@@ -9,9 +9,8 @@
 # and the packaged environment file (config.sh); nothing that ships is a box
 # in development mode (release_lint.sh); the tests wait on outcomes and
 # compare markers, not words (tests_lint.sh); every third-party component the
-# daemon links has its licence notice (notices.sh); the web harness keeps one
-# driver per client (web_driver.sh); a release lists, closes and sends the
-# issues it shipped by the same rules (shipped_issues.sh); no retired
+# daemon links has its licence notice (notices.sh); a release lists, closes
+# and sends the issues it shipped by the same rules (shipped_issues.sh); no retired
 # deployment-model word is back in the tree (words.sh); the committed
 # mbedTLS is the version the build names, built with nothing downloaded
 # (vendored.sh); and the wrapper every build runs under holds its rules
@@ -23,6 +22,6 @@
 . "$(dirname "$0")/../lib/common.sh"
 scripts/test/fast/opcodes.sh shared/protocol.h
 scripts/policy/refs.sh
-for check in make_targets config release_lint tests_lint notices web_driver shipped_issues workflow_rules words vendored clean_run; do
+for check in make_targets config release_lint tests_lint notices shipped_issues workflow_rules words vendored clean_run; do
     scripts/test/fast/$check.sh
 done

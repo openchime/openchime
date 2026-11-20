@@ -59,6 +59,8 @@ ICONS = [
     ("CALENDAR", "calendar"),
     ("CHEVRON_DOWN","chevron-down"),
     ("CHEVRON_UP","chevron-up"),
+    ("PERSON_ADD","person-add"),
+    ("GROUP_ADD","group-add"),
 ]
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SVGDIR = os.path.join(ROOT, "third_party", "lucide", "icons")

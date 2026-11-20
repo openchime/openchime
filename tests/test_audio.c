@@ -45,19 +45,31 @@ static int mk_client(void) {
     return fd;
 }
 
-/* token + seq + payload -> relay; `to` NULL on a connected socket. */
-static void udp_send_n(int fd, const struct sockaddr *to, socklen_t tolen, const uint8_t *tok,
-                       size_t tlen, uint16_t seq, const char *payload) {
+/* token + seq + stream + payload -> relay; `to` NULL on a connected socket. */
+static void udp_send_s(int fd, const struct sockaddr *to, socklen_t tolen, const uint8_t *tok,
+                       size_t tlen, uint16_t seq, uint8_t stream, const char *payload) {
     uint8_t pkt[128]; size_t pl = payload ? strlen(payload) : 0;
     memcpy(pkt, tok, tlen);
     pkt[tlen] = (uint8_t)(seq >> 8); pkt[tlen + 1] = (uint8_t)seq;
-    if (pl) memcpy(pkt + tlen + 2, payload, pl);
-    sendto(fd, pkt, tlen + 2 + pl, 0, to, to ? tolen : 0);
+    pkt[tlen + 2] = stream;
+    if (pl) memcpy(pkt + tlen + 3, payload, pl);
+    sendto(fd, pkt, tlen + 3 + pl, 0, to, to ? tolen : 0);
+}
+static void udp_send_n(int fd, const struct sockaddr *to, socklen_t tolen, const uint8_t *tok,
+                       size_t tlen, uint16_t seq, const char *payload) {
+    udp_send_s(fd, to, tolen, tok, tlen, seq, OC_CALL_STREAM_AUDIO, payload);
 }
 static void udp_send(int fd, const struct sockaddr_in *to, const uint8_t *tok, uint16_t seq,
                      const char *payload) {
     udp_send_n(fd, (const struct sockaddr *)to, sizeof *to, tok, OC_AUDIO_TOKEN_RAND, seq, payload);
 }
+static void udp_send_on(int fd, const struct sockaddr_in *to, const uint8_t *tok, uint16_t seq,
+                        uint8_t stream, const char *payload) {
+    udp_send_s(fd, (const struct sockaddr *)to, sizeof *to, tok, OC_AUDIO_TOKEN_RAND, seq, stream, payload);
+}
+
+/* The stream of the last datagram udp_recv took. */
+static uint8_t g_last_stream;
 
 /* One forwarded datagram: payload length, or -1 on timeout. */
 static int udp_recv(int fd, uint64_t *sender, uint16_t *seq, char *out, size_t cap) {
@@ -66,6 +78,7 @@ static int udp_recv(int fd, uint64_t *sender, uint16_t *seq, char *out, size_t c
     if (n < (ssize_t)OC_AUDIO_S2C_HDR) return -1;
     *sender = rd_u64(pkt);
     *seq = (uint16_t)((pkt[8] << 8) | pkt[9]);
+    g_last_stream = pkt[10];
     size_t pl = (size_t)n - OC_AUDIO_S2C_HDR;
     if (pl > cap) pl = cap;
     memcpy(out, pkt + OC_AUDIO_S2C_HDR, pl);
@@ -86,17 +99,18 @@ static void on_gone(void *ctx, const uint8_t *token, size_t len) {
 }
 
 /* The last packet the relay handed back for a participant on the connection. */
-static struct { uint64_t conn, sender; uint16_t seq; uint8_t ct[64]; size_t len; int n; } g_tcp;
-static void on_tcp(void *ctx, uint64_t conn_id, uint64_t sender, uint16_t seq,
+static struct { uint64_t conn, sender; uint16_t seq; uint8_t stream; uint8_t ct[64]; size_t len; int n; } g_tcp;
+static void on_tcp(void *ctx, uint64_t conn_id, uint64_t sender, uint16_t seq, uint8_t stream,
                    const uint8_t *ct, size_t len) {
     (void)ctx;
-    g_tcp.conn = conn_id; g_tcp.sender = sender; g_tcp.seq = seq;
+    g_tcp.conn = conn_id; g_tcp.sender = sender; g_tcp.seq = seq; g_tcp.stream = stream;
     g_tcp.len = len < sizeof g_tcp.ct ? len : sizeof g_tcp.ct;
     memcpy(g_tcp.ct, ct, g_tcp.len);
     g_tcp.n++;
 }
 
 static int addressing_tests(void);
+static int stream_tests(void);
 
 /* The relay's clock for this suite: it moves only when a test moves it, so who
  * the silence sweep drops is decided here and not by the scheduler. */
@@ -220,7 +234,7 @@ int run_audio_tests(void) {
         uint8_t tE[16]; memset(tE, 0xE5, 16);
         CHECK(oc_relay_authorize(r, 100, 5, 77, tE, 16) == 0);
         drain(cA); drain(cB); drain(cD);
-        CHECK(oc_relay_from_tcp(r, 77, 5, (const uint8_t *)"tcp-hi", 6) == 0);
+        CHECK(oc_relay_from_tcp(r, 77, 5, OC_CALL_STREAM_AUDIO, (const uint8_t *)"tcp-hi", 6) == 0);
         nb = udp_recv(cB, &sender, &seq, body, sizeof body);
         CHECK(nb == 6 && sender == 5 && seq == 5 && memcmp(body, "tcp-hi", 6) == 0);
         CHECK(udp_recv(cA, &sender, &seq, body, sizeof body) == 6 && sender == 5);
@@ -231,10 +245,10 @@ int run_audio_tests(void) {
         CHECK(g_tcp.len == 6 && memcmp(g_tcp.ct, "to-tcp", 6) == 0);
         drain(cB); drain(cD);
         g_tcp.n = 0;
-        CHECK(oc_relay_from_tcp(r, 77, 6, NULL, 0) == 0);   /* a keepalive */
+        CHECK(oc_relay_from_tcp(r, 77, 6, OC_CALL_STREAM_AUDIO, NULL, 0) == 0);   /* a keepalive */
         CHECK(g_tcp.n == 1 && g_tcp.conn == 77 && g_tcp.sender == 5 && g_tcp.len == 0);
         CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == -1);
-        CHECK(oc_relay_from_tcp(r, 78, 1, (const uint8_t *)"x", 1) == -1);   /* no such participant */
+        CHECK(oc_relay_from_tcp(r, 78, 1, OC_CALL_STREAM_AUDIO, (const uint8_t *)"x", 1) == -1);   /* no such participant */
         int cE = mk_client();
         udp_send(cE, &relay_addr, tE, 7, NULL);
         pump(r, udp);
@@ -270,7 +284,130 @@ int run_audio_tests(void) {
 
     oc_relay_close(r);
     close(cA); close(cB); close(cC); close(cD); close(udp);
-    return addressing_tests();
+    addressing_tests();
+    return stream_tests();
+}
+
+/* Streams (REQ-160, CALLS.md §5.4): audio and a shared screen go to everyone; a
+ * camera's packets go only while its camera is on and only to those whose
+ * subscription takes them, over UDP and the connection alike; the stream is
+ * passed on as it came; a packet naming no stream there is, or too short to name
+ * one, is dropped; and authorizing a token again turns its camera off and its
+ * subscription back to every camera. */
+static int stream_tests(void) {
+    printf("test_audio: relay streams -- the tag passed on, cameras by flag and subscription, bad tags dropped\n");
+    int udp = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in ra; memset(&ra, 0, sizeof ra);
+    ra.sin_family = AF_INET; ra.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(udp, (struct sockaddr *)&ra, sizeof ra) == 0);
+    socklen_t sl = sizeof ra; getsockname(udp, (struct sockaddr *)&ra, &sl);
+    oc_relay_hooks hooks = { on_gone, on_tcp };
+    oc_relay *r = oc_relay_open(udp, &hooks, NULL);
+    CHECK(r != NULL);
+    if (!r) { close(udp); return failures; }
+
+    /* A (user 1), B (2) and C (3) on UDP, D (4) on the connection: one call. */
+    uint8_t tA[16], tB[16], tC[16], tD[16];
+    memset(tA, 0x1A, 16); memset(tB, 0x2B, 16); memset(tC, 0x3C, 16); memset(tD, 0x4D, 16);
+    CHECK(oc_relay_authorize(r, 500, 1, 101, tA, 16) == 0);
+    CHECK(oc_relay_authorize(r, 500, 2, 102, tB, 16) == 0);
+    CHECK(oc_relay_authorize(r, 500, 3, 103, tC, 16) == 0);
+    CHECK(oc_relay_authorize(r, 500, 4, 104, tD, 16) == 0);
+    int cA = mk_client(), cB = mk_client(), cC = mk_client();
+    int cl[3] = { cA, cB, cC }; const uint8_t *tk[3] = { tA, tB, tC };
+    for (int i = 0; i < 3; i++) { udp_send(cl[i], &ra, tk[i], 0, NULL); pump(r, udp); drain(cl[i]); }
+    CHECK(oc_relay_from_tcp(r, 104, 0, OC_CALL_STREAM_AUDIO, NULL, 0) == 0);   /* D is on the connection */
+    uint64_t sender; uint16_t seq; char body[64];
+
+    /* A shares: everyone has it, tagged as the share's. */
+    g_tcp.n = 0;
+    udp_send_on(cA, &ra, tA, 1, OC_CALL_STREAM_SHARE, "screen");
+    pump(r, udp);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == 6 && sender == 1 && g_last_stream == OC_CALL_STREAM_SHARE);
+    CHECK(udp_recv(cC, &sender, &seq, body, sizeof body) == 6 && g_last_stream == OC_CALL_STREAM_SHARE);
+    CHECK(g_tcp.n == 1 && g_tcp.stream == OC_CALL_STREAM_SHARE && g_tcp.len == 6);
+
+    /* A's camera, off: nobody has it. */
+    g_tcp.n = 0;
+    udp_send_on(cA, &ra, tA, 2, OC_CALL_STREAM_CAMERA, "face");
+    pump(r, udp);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == -1);
+    CHECK(udp_recv(cC, &sender, &seq, body, sizeof body) == -1);
+    CHECK(g_tcp.n == 0);
+
+    /* On: everyone has it, by their own transport, tagged as a camera's. */
+    CHECK(oc_relay_set_camera(r, 101, 1) == 0);
+    CHECK(oc_relay_set_camera(r, 999, 1) == -1);              /* no such participant */
+    udp_send_on(cA, &ra, tA, 3, OC_CALL_STREAM_CAMERA, "face");
+    pump(r, udp);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == 4 && sender == 1 && g_last_stream == OC_CALL_STREAM_CAMERA);
+    CHECK(udp_recv(cC, &sender, &seq, body, sizeof body) == 4 && g_last_stream == OC_CALL_STREAM_CAMERA);
+    CHECK(g_tcp.n == 1 && g_tcp.stream == OC_CALL_STREAM_CAMERA && memcmp(g_tcp.ct, "face", 4) == 0);
+
+    /* B takes nobody's camera, C only user 9's, D only A's: only D has it -- and
+     * B and C still have A's voice. */
+    CHECK(oc_relay_subscribe(r, 102, 0, NULL, 0) == 0);
+    static const uint64_t nine = 9, one = 1;
+    CHECK(oc_relay_subscribe(r, 103, 0, &nine, 1) == 0);
+    CHECK(oc_relay_subscribe(r, 104, 0, &one, 1) == 0);
+    CHECK(oc_relay_subscribe(r, 104, 0, &one, (int)OC_MAX_CALL_PARTICIPANTS + 1) == -1);
+    g_tcp.n = 0;
+    udp_send_on(cA, &ra, tA, 4, OC_CALL_STREAM_CAMERA, "face");
+    pump(r, udp);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == -1);
+    CHECK(udp_recv(cC, &sender, &seq, body, sizeof body) == -1);
+    CHECK(g_tcp.n == 1 && g_tcp.sender == 1 && g_tcp.stream == OC_CALL_STREAM_CAMERA);
+    udp_send(cA, &ra, tA, 5, "voice");
+    pump(r, udp);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == 5 && g_last_stream == OC_CALL_STREAM_AUDIO);
+    CHECK(udp_recv(cC, &sender, &seq, body, sizeof body) == 5);
+
+    /* D's camera, over the connection, on: B takes no camera, C not D's, A every one. */
+    CHECK(oc_relay_set_camera(r, 104, 1) == 0);
+    CHECK(oc_relay_from_tcp(r, 104, 6, OC_CALL_STREAM_CAMERA, (const uint8_t *)"d-face", 6) == 0);
+    CHECK(udp_recv(cA, &sender, &seq, body, sizeof body) == 6 && sender == 4 && g_last_stream == OC_CALL_STREAM_CAMERA);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == -1);
+    CHECK(udp_recv(cC, &sender, &seq, body, sizeof body) == -1);
+
+    /* Back to every camera: B has A's again. */
+    CHECK(oc_relay_subscribe(r, 102, 1, NULL, 0) == 0);
+    udp_send_on(cA, &ra, tA, 7, OC_CALL_STREAM_CAMERA, "face");
+    pump(r, udp);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == 4 && g_last_stream == OC_CALL_STREAM_CAMERA);
+    drain(cC);
+
+    /* A stream that does not exist, and a packet too short to name one, are dropped. */
+    udp_send_on(cA, &ra, tA, 8, OC_CALL_STREAMS, "what");
+    pump(r, udp);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == -1);
+    { uint8_t shorty[18]; memcpy(shorty, tA, 16); shorty[16] = 0; shorty[17] = 9;
+      sendto(cA, shorty, sizeof shorty, 0, (const struct sockaddr *)&ra, sizeof ra); }
+    pump(r, udp);
+    CHECK(udp_recv(cA, &sender, &seq, body, sizeof body) == -1);   /* not even an echo */
+    CHECK(oc_relay_from_tcp(r, 104, 9, OC_CALL_STREAMS, (const uint8_t *)"x", 1) == 0);
+    CHECK(udp_recv(cA, &sender, &seq, body, sizeof body) == -1);
+
+    /* Off again: nobody has it. Then A authorized again (a rejoin) starts with the
+     * camera off, and B's subscription to nobody is gone with B's re-authorizing. */
+    CHECK(oc_relay_set_camera(r, 101, 0) == 0);
+    udp_send_on(cA, &ra, tA, 10, OC_CALL_STREAM_CAMERA, "face");
+    pump(r, udp);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == -1);
+    CHECK(oc_relay_set_camera(r, 101, 1) == 0);
+    CHECK(oc_relay_subscribe(r, 102, 0, NULL, 0) == 0);
+    CHECK(oc_relay_authorize(r, 500, 1, 101, tA, 16) == 0);
+    CHECK(oc_relay_authorize(r, 500, 2, 102, tB, 16) == 0);
+    udp_send_on(cA, &ra, tA, 11, OC_CALL_STREAM_CAMERA, "face");
+    pump(r, udp);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == -1);
+    CHECK(oc_relay_set_camera(r, 101, 1) == 0);
+    udp_send_on(cA, &ra, tA, 12, OC_CALL_STREAM_CAMERA, "face");
+    pump(r, udp);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == 4);
+
+    oc_relay_close(r);
+    close(cA); close(cB); close(cC); close(udp);
+    return failures;
 }
 
 /* A client socket connected to `to`: the kernel then delivers only datagrams

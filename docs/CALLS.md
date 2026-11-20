@@ -2,9 +2,10 @@
 
 How people talk to each other by voice: how a call is started, found, joined and ended,
 what the Calls section shows, and how the audio is encrypted end to end so that neither
-the daemon nor its relay can hear it, and how a screen is shared in a call (§6). Cross-referenced from ARCHITECTURE.md (ARCH-73,
-ARCH-113), REQUIREMENTS.md (§6.2, REQ-150–152, REQ-301–306), PROTOCOL.md (§5.17)
-and AUDIO.md (the media engine and echo cancellation).
+the daemon nor its relay can hear it, how a screen is shared in a call (§6), and how
+people see each other's cameras (§7). Cross-referenced from ARCHITECTURE.md (ARCH-73,
+ARCH-86, ARCH-113), REQUIREMENTS.md (§6.2, §6.3, REQ-150–152, REQ-160, REQ-301–306),
+PROTOCOL.md (§5.17) and AUDIO.md (the media engine and echo cancellation).
 
 The client is the Win32 GUI, and the same application in a browser (WEB.md), which has no
 UDP and carries a call over its connection (§4); the TUI has no calls.
@@ -66,10 +67,30 @@ volume for each, with its value as a percentage. The conversation's messages and
 are in a panel on the right, open by default and folded away with **Hide conversation**; a
 message sent there goes to the conversation. The controls are one bar: **Mute** (with the
 microphone's level on it, and a tooltip saying "You are currently muted" or "You are
-currently not muted", and Ctrl+Shift+M), **Share screen**, **Invite**, **Settings** and
-**Leave**; **End for everyone**, for the starter alone, sits apart at the far end and asks
-for confirmation before it ends the call. **Settings** opens a panel holding the
-**microphone** and **speaker** pickers, the microphone's level and **Noise suppression**.
+currently not muted", and Ctrl+Shift+M), **Camera**, **Share screen**, **Invite**,
+**Settings** and **Leave**; **End for everyone**, for the starter alone, sits apart at the
+far end and asks for confirmation before it ends the call. Where the bar is short, Camera,
+then Share, then Invite and Settings show their icons alone, and End for everyone says
+"End"; each keeps its full name for a screen reader. **Settings** opens a panel holding the
+**microphone**, **speaker** and **camera** pickers, the microphone's level and **Noise
+suppression**.
+
+**Cameras** (REQ-160, §7). **Camera** turns yours on and off; while it is on the button is
+filled and says **Stop camera**. Your own card shows it at once, mirrored as a mirror shows
+a face, and the others see it once the roster marks it on. A card with its camera on shows
+the picture, filling the card and cropped to it, with the name and the volume on a band
+across its foot, the speaking ring round the card and the mute mark in its corner; with it
+off, the card is the face it always was. A camera the system blocks, that is missing, or
+that another app holds is said in the words the video recorder uses ("Windows is blocking
+camera access for OpenChime.", "No camera was found.", "The camera is in use by another
+app."), on the bar's hint line and as a notice, and the camera stays off. **Speaker view**,
+beside Hide conversation, shows whoever is speaking large, staying until someone else
+speaks, and everyone else in a strip of tiles under them; **Grid view** goes back; the
+choice is remembered with the preferences. Under a shared screen the strip is tiles too,
+each a camera or a face. The view takes only the cameras it draws — every card in the grid,
+the large one and the strip's tiles otherwise, none while another view is on screen — and
+tells the relay when that changes (`CALL_VIDEO_SUB`, §7.4). The controls are `call.camera`, `call.camera.picker` and
+`call.layout` to a screen reader and the harness, as every call control is.
 Above the bar is the push-to-talk hint, whatever route the audio takes. Before joining the
 view shows who is in the call and **Join** (and **Decline** for an invitation).
 
@@ -92,8 +113,9 @@ what is shared. §6 is the design.
 (push to talk) — voice input's chord; in a call the call owns the microphone, so the two
 never compete. **Ctrl+Shift+S** shares your screen, or stops sharing it.
 
-**Devices and noise suppression** are remembered with the other preferences: the devices
-by a hash of their ids, so another machine, which has other ids, uses its own defaults.
+**Devices, noise suppression and the layout** are remembered with the other preferences:
+the microphone, the speaker and the camera by a hash of their ids, so another machine,
+which has other ids, uses its own defaults.
 
 **Invitation toasts** carry **Join** and **Decline**, and the call sound.
 
@@ -123,6 +145,10 @@ PROTOCOL.md §5.17 has the frames. In short:
   `CALL_ROSTER` to the others: the participants and the epoch, on every change.
 - `CALL_INVITE`, `CALL_DECLINE`, `CALL_END` (the starter only), `CALL_LEAVE`.
 - `CALL_SHARE {channel, on}` — start or stop sharing a screen; one sharer at a time.
+- `CALL_CAMERA {channel, on}` — turn this participant's camera on or off; the roster
+  marks whose are on (§7.5).
+- `CALL_VIDEO_SUB {channel, all, users}` — whose cameras the relay sends this
+  participant (§7.4).
 - `CALL_STATE {channel, call, starter, started, participants, invited, sharer, ended}` to every
   member of the conversation, every invitee and every participant on every change, and at
   sign-in for each call there is: what the Calls section lists.
@@ -227,7 +253,8 @@ encryption, with the header as AAD, of a plaintext whose first byte is its **typ
 | 0 audio | the frame number (u32) and the Opus packet |
 | 1 state | one byte: bit 0 muted |
 | 2 video | a fragment of a shared screen's frame (§6.5.2) |
-| 3 control | a viewer's NACK, keyframe request or report, to the sharer (§6.5.3) |
+| 3 control | a viewer's NACK, keyframe request or report, to the sharer (§6.5.3), or a watcher's to a camera's sender (§7.3) |
+| 4 camera | a fragment of a camera's frame (§7.2) |
 
 Every type is sealed under the same key with the same counter, so the counter never
 repeats however the types interleave.
@@ -240,17 +267,24 @@ repeats however the types interleave.
   nonce) pair is never reused (RFC 9605 §4.4.1).
 - The SFrame key and salt are derived from the base key as RFC 9605 §4.4.2 says.
 
-The relay's own framing is unchanged: `token ‖ seq ‖ payload` in, `sender ‖ seq ‖ payload`
-out, with the SFrame ciphertext as the payload. Its 16-bit `seq` is unauthenticated and not
-used: the jitter buffer orders by the frame number inside the encryption, and loss is
-counted from the authenticated CTR.
+The relay's framing is `token ‖ seq ‖ stream ‖ payload` in, `sender ‖ seq ‖ stream ‖
+payload` out, with the SFrame ciphertext as the payload. Its 16-bit `seq` is
+unauthenticated and not used: the jitter buffer orders by the frame number inside the
+encryption, and loss is counted from the authenticated CTR. **`stream`** says which of
+the sender's streams a packet is on — 0 audio (types 0, 1 and 3), 1 a shared screen
+(type 2), 2 a camera (type 4) — in the clear, because the relay acts on it: it sends a
+camera's packets only while that camera is on and only to those who take it (§7.4). It
+is the SFrame **metadata**, authenticated with the header, so a relay that relabelled a
+packet would have it dropped by every receiver; and a receiver drops a packet whose type
+is not its stream's, so a camera cannot ride the audio stream past the subscriptions.
 
 A receiver drops a packet whose KID it has no key for, whose authentication fails, or whose
 CTR is older than a **1024-packet window** or already seen in it (replay).
 
 ### 5.5 What it guarantees
 
-- The daemon, the relay and the network cannot decrypt any audio, or any shared screen.
+- The daemon, the relay and the network cannot decrypt any audio, any shared screen, or
+  any camera.
 - A packet altered or replayed on the way is dropped.
 - **Someone who leaves** cannot decrypt what is said after they leave — past the 1 s grace
   in which the others still use the previous epoch's key (and the relay stops forwarding
@@ -272,7 +306,8 @@ CTR is older than a **1024-packet window** or already seen in it (replay).
   between the daemon and the devices — the network, the relay, a copy of its memory or
   database — but not against a daemon that has been altered to attack its own users.
 - **Metadata is visible to the server**: who is in which call, when, and the timing and
-  sizes of their packets.
+  sizes of their packets — and which stream each packet is on, so who is sharing a
+  screen and whose camera is sending, though never what is in either (§7.4).
 - **Within a call**, every participant holds every sender's key, so a participant could
   forge audio in another's name (RFC 9605 §9.5). The KID is bound to a slot, and the
   receiver checks that it agrees with the sender the relay names, which stops a forgery
@@ -286,7 +321,7 @@ cover: tampering, a wrong key or another sender, another info or aad, low-order 
 replay window. The client end-to-end test, which runs the switches between epochs, (`test_client_core.c`) taps the relay and checks it sees only
 ciphertext, and that after a participant leaves every packet is under an epoch it was
 never given a key for; and a shared screen crosses it as SFrame too (§6.9).
-`tools/gui/calls.sh` runs two Win32 clients (two web clients with `OC_TEST_PLATFORM=web`) in a call and checks each receives the other's
+`tools/gui/features/calls.sh` runs two Win32 clients (two web clients with `OC_TEST_PLATFORM=web`) in a call and checks each receives the other's
 packets, every one decrypting once the keys are in.
 
 ## 6. Screen sharing
@@ -294,9 +329,9 @@ packets, every one decrypting once the keys are in.
 What screen sharing is and is not, why it rides the call relay unchanged, the
 codec, and the transport built on top of it — fragments, loss recovery and rate
 control. Cross-referenced from ARCHITECTURE.md (ARCH-86, ARCH-87) and
-REQUIREMENTS.md (§6.3, REQ-160/161). Camera video calling remains excluded by
-REQ-160 and nothing here reverses that (§6.2). Recorded **video messages** are a
-separate design with no real-time path: [VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md).
+REQUIREMENTS.md (§6.3, REQ-161). Cameras use the same transport and are §7. Recorded
+**video messages** are a separate design with no real-time path:
+[VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md).
 
 ### 6.1 Why it is in scope at all
 
@@ -305,11 +340,11 @@ justification: showing someone an error, a diff, a design, or a spreadsheet.
 Both reference products ship it — Slack in huddles, Pumble in its paid
 tiers. It buys **parity, not differentiation**.
 
-### 6.2 Scope — screenshare is not video calling
+### 6.2 Scope
 
 | In scope | Out of scope |
 |---|---|
-| One participant shares a screen or window; the others view it | Camera / webcam video (REQ-160 stands) |
+| One participant shares a screen or window; the others view it | A camera — that is §7, and may run beside a share |
 | View-only for the viewers | Remote control of the sharer's machine |
 | Screen audio is **not** captured; voice rides the call's audio | Recording the share |
 | **One sharer at a time**; starting a share takes over from whoever was sharing | Simultaneous shares / picture-in-picture grids |
@@ -321,9 +356,9 @@ cost is the bitrate ceiling (§6.6).
 ### 6.3 It rides the existing relay unchanged
 
 **The relay never decodes anything.** It forwards opaque payloads tagged with the
-sender (`daemon/audio.h`), and a share's packets relay exactly as audio's do. So
-screenshare needs **no server-side codec and no change to the relay's framing or
-forwarding** (ARCH-86); the daemon stays free of libvpx as it is of libopus. A
+sender (`daemon/audio.h`), and a share's packets relay exactly as audio's do, on the
+share's stream (§5.4). So screenshare needs **no server-side codec** (ARCH-86); the
+daemon stays free of libvpx as it is of libopus. A
 participant whose network passes no UDP sends and receives the share over its
 connection, as its audio (`CALL_MEDIA`, AUDIO.md §4), and nothing about the share
 changes: a packet the daemon drops rather than let a backed-up connection grow is
@@ -516,7 +551,8 @@ PROTOCOL.md §5.17 has the frames:
   picture, which would contain itself. Someone else starting to share stops yours
   and says so.
 - **Watching**: the share takes the call view's stage, fitted, under "Alice is
-  sharing their screen", with the people as a row of faces beneath it.
+  sharing their screen", with the people as a row of tiles beneath it — each their
+  camera, or their face (§2).
   **Full screen** covers the window (Esc returns); **Actual size** shows it one
   pixel to one pixel, scrolled with the wheel (Shift for across).
 - **Elsewhere**: the in-call strip says "Alice is sharing", the Calls section's
@@ -551,6 +587,140 @@ cross into `client/core` and are encoded there, so the wire is the same everywhe
   costs NACKs and resends, not the picture; faye joins late and has a picture
   within seconds; erik takes over, which stops dana's; erik stops and the picture
   goes.
-- `tools/gui/calls.sh`: two Win32 clients, or two web clients — alice shares, bob's view shows her
+- `tools/gui/features/calls.sh`: two Win32 clients, or two web clients — alice shares, bob's view shows her
   screen with readable, rising frame numbers; full screen, Esc, actual size; the
   accessibility names; bob takes over; bob stops.
+
+## 7. Camera video
+
+Each person in a call may turn their camera on, and the others see it, each on their own
+tile (REQ-160, ARCH-86). A camera is the share's transport (§6.5) on its own packet type
+and stream, with its own rate bounds, its own encoder settings, a ladder of sizes and
+frame rates, a subscription the relay honours, and lip sync. The call view's cards,
+layouts and camera controls (§2) stand on it.
+
+### 7.1 What is sent
+
+- **At most 640×480 at 30 fps and 600 kbit/s per sender** (`OC_CAM_KBPS_MAX`), whatever
+  the receivers could take, and at most what the platform's encoder can keep up with
+  (`oc_plat_camera_limits`: 640×480 at 30 on Windows, at 15 in a browser).
+- **VP9 without screen tuning** (`oc_vp9enc_open_camera`): realtime CBR at the rate
+  control's bitrate, error resilient, each frame's duration taken from its timestamp,
+  and keyframes only when asked for or every ten seconds (§6.5.3).
+- **The ladder** (`oc_cam_ladder_pick`, `client/core/call/share.c`). As the rate falls
+  the picture gets smaller first, then less frequent:
+
+  | Step | Fitted inside | Frame rate | Taken while the rate is at least |
+  |---|---|---|---|
+  | 0 | 640×480 | 30 | 400 kbit/s |
+  | 1 | 320×240 | 30 | 200 |
+  | 2 | 160×120 | 30 | 120 |
+  | 3 | 160×120 | 15 | 80 |
+  | 4 | 160×120 | 7 | — |
+
+  A step down is taken at once, as many as the rate needs; a step up, one at a time,
+  once the rate covers the step above and **3 s** have passed since the last step, so a
+  rate between two steps holds where it is. A camera's own shape is kept inside each
+  box (a 16:9 camera sends 640×360). A change of size reopens the encoder with a
+  keyframe; a change of frame rate only spaces the frames out.
+- **The rate** is the share's rule (§6.5.4) with the camera's bounds: from 400 kbit/s,
+  halved when any watcher loses more than 5%, held while anyone loses more than 2%,
+  grown by a tenth a second otherwise, between 60 and 600.
+
+### 7.2 Packets
+
+A camera's frame is `aframe(u32) ‖ VP9 frame`: the sender's **audio frame number** when
+the picture was captured (§7.6), then the encoded frame. It is split exactly as a
+share's frame is (§6.5.2) into packets of **type 4**, with the same 14-byte header, on
+the **camera stream**. A sender has one camera; frame numbers carry on while it stays on.
+
+### 7.3 Loss recovery and reports
+
+As a share's (§6.5.3–§6.5.4), per sender: each watcher reassembles that sender's camera
+in order, asks for missing fragments, asks for a keyframe when a frame cannot be
+recovered or it starts watching, and reports loss and bitrate every 500 ms. Its control
+packets are type 3 with **`OC_CTL_CAMERA`** in the kind, so a camera's NACK or PLI never
+reaches the sender's share, nor a share's its camera.
+
+### 7.4 Subscriptions
+
+A participant takes **every camera** until it says otherwise: `CALL_VIDEO_SUB` names the
+cameras it shows (or every one again), the relay sends it a camera's packets only if it
+takes that camera, and its engine (`oc_call_engine_camera_subscribe`) watches only those
+— so a watcher that takes nobody's camera sends no report for it and does not hold its
+rate down. Audio and a share go to everyone regardless. The relay reads only the stream
+tag (§5.4) to do this; it cannot see a picture, and a packet it relabelled would not
+open.
+
+### 7.5 Signaling
+
+- `CALL_CAMERA {channel, on}` turns a participant's camera on or off. The relay carries
+  its camera stream only while it is on, and every participant gets a `CALL_ROSTER`
+  marking it (`CAMERA`, flags bit 1) **in the same epoch**: nobody came or went, so
+  nobody rekeys — a client rekeys only on a new epoch.
+- A participant who leaves, loses the connection or rejoins has its camera off, as a
+  sharer stops sharing; turning it on again is another `CALL_CAMERA`.
+- A sender's frames go out only once the roster marks its camera on; until then the
+  camera is open and is the preview.
+
+### 7.6 Lip sync
+
+The receiver plays a sender's voice through its jitter buffer (AUDIO.md §4), 40–240 ms
+behind, and the picture would otherwise run ahead of it. So a decoded camera frame is
+shown when that sender's voice playing here has reached its `aframe`
+(`oc_cam_sync`):
+
+- **ahead** of the voice: held, up to **300 ms**, then shown anyway — the voice may have
+  stalled. Frames wait in order and encoded, up to sixteen, and are decoded as they
+  are shown, so waiting costs a few kilobytes a frame, not a picture;
+- **behind** it by more than **200 ms**: dropped;
+- otherwise, and whenever no voice is playing (muted, silent, no microphone): shown.
+
+The sender stamps `aframe` from the audio frame being captured and its time on the same
+monotonic clock the camera's frames carry, so a picture and the words said with it carry
+the same number.
+
+### 7.7 The engine
+
+Beside the share's threads (§6.5.6), in `client/core/call/call_engine.c`:
+
+- a **camera thread** while this device's camera is on: capture → preview → ladder → fit
+  → encode → fragments → sealed and sent. `oc_call_engine_camera_start` opens the camera
+  (so a refusal is known at once, as `camera_error`) and its picture is the preview at
+  once; the frontend sends `CALL_CAMERA` on; frames go once the roster marks it.
+  `oc_call_engine_camera_stop` releases the camera at once.
+- the **view thread** also watches every camera that is on and taken: reassembly, NACKs,
+  reports, decode, lip sync, and the newest picture per person for the frontend
+  (`oc_call_engine_camera_frame`, which for this device's own user gives the preview,
+  unmirrored).
+
+### 7.8 Bandwidth
+
+Each camera is at most 600 kbit/s, so the relay's egress for cameras is at most
+`0.6 Mbit/s × N × (N−1)` with everyone taking everyone — 54 Mbit/s for ten people — and
+less as views take fewer: a speaker layout of the speaker and a strip of four takes five.
+
+### 7.9 Tests
+
+- `tests/test_share_media.c`: a camera's stream over the simulated network at 5% loss;
+  its packets and control kept apart from a share's; its rate's bounds; the ladder down
+  and back up, its quiet period, the source's shape and the platform's ceiling; lip
+  sync's hold, show and drop, across the frame number's wrap; and the synthetic camera
+  through the camera's encoder.
+- `tests/test_audio.c`: the relay passing the stream tag on; a camera's packets only
+  while its camera is on and only to those who take it, over UDP and the connection;
+  a stream that does not exist dropped; a re-authorized token starting with its camera
+  off and every camera taken.
+- `tests/itest_netloop.c`: `CALL_CAMERA` marking the roster in the same epoch, and a
+  leave, a disconnect and a rejoin clearing it; someone outside the call refused;
+  `CALL_VIDEO_SUB` only from a participant, and the relay honouring it.
+- `tools/gui/features/camera.sh`: two clients, Win32 or web — the camera button and picker,
+  each card showing the other's camera with rising frame numbers and your own mirrored,
+  the grid and the speaker layout, the subscription following the cards drawn, a camera
+  turned off back to a face, and a camera the system refuses said as such (TESTING.md).
+- `tests/test_client_core.c`: through the real daemon and relay with a tap — two people
+  turn their synthetic cameras on and each decodes the other's rising frame numbers; the
+  tap sees only SFrame behind the camera's stream tag; one shares a screen with the
+  camera on and the other decodes both; one taking nobody's camera stops getting it but
+  still hears, and no longer reports on it; a packet relabelled with another stream on
+  the way does not open; a camera turned off stops its packets and its picture.

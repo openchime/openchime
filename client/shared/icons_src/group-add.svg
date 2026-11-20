@@ -1,0 +1,15 @@
+<!-- Hand-authored for OpenChime, not from Lucide — kept out of third_party so
+     the ISC attribution there stays accurate. Lucide conventions: 24x24 box,
+     2px stroke, round caps/joins. A person with a second behind them and a +
+     in the top-right corner: Add group, in the members pane. Drawn as a pair
+     with person-add, whose + is in the same place. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+     fill="none" stroke="currentColor" stroke-width="2"
+     stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="8" cy="11" r="3.5" />
+  <path d="M1.5 22v-.5a4 4 0 0 1 4-4h5a4 4 0 0 1 4 4v.5" />
+  <path d="M15 8.3a3.2 3.2 0 0 1 0 6.4" />
+  <path d="M22.5 22v-.5a4 4 0 0 0-3-3.87" />
+  <path d="M20 1.5v5" />
+  <path d="M17.5 4h5" />
+</svg>
