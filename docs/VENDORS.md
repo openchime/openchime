@@ -213,14 +213,25 @@ notice, in every package that carries read-aloud.
 
 Its source, pinned:
 
-| File | From | SHA-256 |
-|---|---|---|
-| `kitten_tts_mini_v0_8.onnx` | https://huggingface.co/KittenML/kitten-tts-mini-0.8, revision `c02725660cea441db4c383af69f1f26f5cd00947` | `0f5bbae4fc4800c98dbc544a87ecfa79510de2fb8222db30d12e5bfe9177df91` |
-| `voices.npz` | the same repository and revision | `40ad2638952b77b7b2f30127e2608e169fc69dd256b53bd8aaa3409a33193c42` |
-| `LICENSE` | https://github.com/KittenML/KittenTTS, commit `be5758500b731b8fc674acc62ea480d3022b7ebe` | `787aa312b93eee80b636f35652469df29efdb7582239d6a9c088467555a3c7fd` |
+| File | From | Archived in | SHA-256 |
+|---|---|---|---|
+| `kitten_tts_mini_v0_8.onnx` | https://huggingface.co/KittenML/kitten-tts-mini-0.8, revision `c02725660cea441db4c383af69f1f26f5cd00947` | `voice-src.part*.gz` | `0f5bbae4fc4800c98dbc544a87ecfa79510de2fb8222db30d12e5bfe9177df91` |
+| `voices.npz` | the same repository and revision | `voice-src.part*.gz` | `40ad2638952b77b7b2f30127e2608e169fc69dd256b53bd8aaa3409a33193c42` |
+| `LICENSE` | https://github.com/KittenML/KittenTTS, commit `be5758500b731b8fc674acc62ea480d3022b7ebe` | `voice-src.part*.gz` | `787aa312b93eee80b636f35652469df29efdb7582239d6a9c088467555a3c7fd` |
 
 **Recreating `voice.bin` byte for byte.** `openchimed --voice-pack` is in every build of the
-daemon, with read-aloud or without; from the repository folder:
+daemon, with read-aloud or without. From the archive (below, *The archive*), from the
+repository folder:
+
+```
+make openchimed
+scripts/build/speech_sources.sh fetch build/speech-src
+./openchimed --voice-pack build/speech-src/voice-src/kitten_tts_mini_v0_8.onnx build/speech-src/voice-src/voices.npz build/voice.bin
+cmp build/voice.bin ttskit/data/voice.bin
+cmp build/speech-src/voice-src/LICENSE ttskit/data/VOICE-LICENSE
+```
+
+Or from the upstream URLs:
 
 ```
 make openchimed
@@ -254,9 +265,10 @@ were made by `tests/manual/voice_ref.c` with ONNX Runtime 1.30.0's **prebuilt** 
 (`onnxruntime-linux-x64-1.30.0.tgz`, SHA-256
 `a5ed5a3cac51fbb2e90da632ae43d19212faaa20e76484e62bcb7c23ddb3b3fd`;
 `onnxruntime-linux-aarch64-1.30.0.tgz`,
-`e16a27a8ed330bbc698df7330b0cf56e722f354e3bcc92118682c74ef3c3e3da`; from ONNX Runtime's GitHub
-releases) and the files above. It is run by hand, its outputs committed; nothing in the
-build or the suites links ONNX Runtime for read-aloud.
+`e16a27a8ed330bbc698df7330b0cf56e722f354e3bcc92118682c74ef3c3e3da`) and the files above.
+Neither tarball is published any more; the x64 release is in the archive (below), and no
+arm64 copy is held. It is run by hand, its outputs committed; nothing in the build or the
+suites links ONNX Runtime for read-aloud.
 
 **Voice input's recognizer** (ARCH-112) is **Moonshine Tiny Streaming (English)**, published
 by Moonshine AI under MIT. sttkit runs it in plain C (STTKIT.md §3–§4); nothing of it is
@@ -269,20 +281,31 @@ that carries voice input.
 Its source, pinned — the files as published in a dated CDN directory that is never
 overwritten, already quantized to int8, and the licence at a pinned commit:
 
-| File | From | SHA-256 |
-|---|---|---|
-| `frontend.model.ort` | https://download.moonshine.ai/model/tiny-streaming-en/quantized_26_08_21/ | `5121b561417b638afce0c6c31b760e37c93cf97f80d9b0031aad1fe7b6f25d61` |
-| `frontend.weights.ort` | the same directory | `217da24ac6f522ebf02da8ef288e77d1ac68d50d4a6821433182e4fbf4204bbd` |
-| `encoder.ort` | the same directory | `a8414e1a5dedf9f2093d7680601dd8a9b0433e7020260eafe0e370ead91134ca` |
-| `adapter.ort` | the same directory | `22ecc949e146c49667fda28d102d4e30749a107dc88a396292aa8f277ef1347c` |
-| `cross_kv.ort` | the same directory | `143a36667b8d05fd9d04e8c337b7ee121f37ef299aea6b3d82bdb3d3401950b4` |
-| `decoder_kv.ort` | the same directory | `8852553f312adb6c9aa4d17418015049b30f412209ee569d336548c0044627de` |
-| `tokenizer.bin` | the same directory | `6884b35fd6377d4c4d32336a0bc152f36b64d1e45b6503683cdc238250a8472d` |
-| `streaming_config.json` | the same directory | `74fe5ddebd63b17caf59e8a3b18c17547ff7bce1642050edbb1c3962674f8950` |
-| `LICENSE` | https://github.com/moonshine-ai/moonshine, commit `234f60faa0eb388b01cdf7e60aca232af37aefda` | `fa7d1174dd8af6a7cd280be20b80d10095ed4c19b5b20b61a7715c3ad790dc5f` |
+| File | From | Archived in | SHA-256 |
+|---|---|---|---|
+| `frontend.model.ort` | https://download.moonshine.ai/model/tiny-streaming-en/quantized_26_08_21/ | `recognizer-src.part*.gz` | `5121b561417b638afce0c6c31b760e37c93cf97f80d9b0031aad1fe7b6f25d61` |
+| `frontend.weights.ort` | the same directory | `recognizer-src.part*.gz` | `217da24ac6f522ebf02da8ef288e77d1ac68d50d4a6821433182e4fbf4204bbd` |
+| `encoder.ort` | the same directory | `recognizer-src.part*.gz` | `a8414e1a5dedf9f2093d7680601dd8a9b0433e7020260eafe0e370ead91134ca` |
+| `adapter.ort` | the same directory | `recognizer-src.part*.gz` | `22ecc949e146c49667fda28d102d4e30749a107dc88a396292aa8f277ef1347c` |
+| `cross_kv.ort` | the same directory | `recognizer-src.part*.gz` | `143a36667b8d05fd9d04e8c337b7ee121f37ef299aea6b3d82bdb3d3401950b4` |
+| `decoder_kv.ort` | the same directory | `recognizer-src.part*.gz` | `8852553f312adb6c9aa4d17418015049b30f412209ee569d336548c0044627de` |
+| `tokenizer.bin` | the same directory | `recognizer-src.part*.gz` | `6884b35fd6377d4c4d32336a0bc152f36b64d1e45b6503683cdc238250a8472d` |
+| `streaming_config.json` | the same directory | `recognizer-src.part*.gz` | `74fe5ddebd63b17caf59e8a3b18c17547ff7bce1642050edbb1c3962674f8950` |
+| `LICENSE` | https://github.com/moonshine-ai/moonshine, commit `234f60faa0eb388b01cdf7e60aca232af37aefda` | `recognizer-src.part*.gz` | `fa7d1174dd8af6a7cd280be20b80d10095ed4c19b5b20b61a7715c3ad790dc5f` |
 
 **Recreating `recognizer.bin` byte for byte.** `openchimed --recognizer-pack` is in every build
-of the daemon, with voice input or without; from the repository folder:
+of the daemon, with voice input or without. From the archive (below), from the repository
+folder:
+
+```
+make openchimed
+scripts/build/speech_sources.sh fetch build/speech-src
+./openchimed --recognizer-pack build/speech-src/recognizer-src build/recognizer.bin
+cmp build/recognizer.bin sttkit/data/recognizer.bin
+cmp build/speech-src/recognizer-src/LICENSE sttkit/data/RECOGNIZER-LICENSE
+```
+
+Or from the upstream URLs:
 
 ```
 make openchimed
@@ -322,6 +345,25 @@ model or revision is a change to OpenChime (STTKIT.md §7), not a rebuild.
 `tests/manual/recognizer_ref.c` with the same prebuilt ONNX Runtime 1.30.0 release as the voice
 model's, and the files above. It is run by hand, its outputs committed; nothing in the build or
 the suites links ONNX Runtime.
+
+**The archive.** Every file above, and ONNX Runtime 1.30.0's prebuilt x64 release, is kept as an
+attachment of the project's public tracker, so the speech data and its references can be remade
+when an upstream URL is gone. The two source bundles are split under the attachment size limit.
+
+| Attachment | Holds | SHA-256 |
+|---|---|---|
+| [`voice-src.part0.gz`](https://github.com/user-attachments/files/35148170/voice-src.part0.gz), [`.part1.gz`](https://github.com/user-attachments/files/35148174/voice-src.part1.gz), [`.part2.gz`](https://github.com/user-attachments/files/35148175/voice-src.part2.gz) | `voice-src.tar.gz`, joined: the voice model's three files above | the joined bundle `27758cb22f0969cf5440a5f48dd4e158b98963c62446707b49562f08dd0cf5e1` |
+| [`recognizer-src.part0.gz`](https://github.com/user-attachments/files/35148176/recognizer-src.part0.gz), [`.part1.gz`](https://github.com/user-attachments/files/35148172/recognizer-src.part1.gz) | `recognizer-src.tar.gz`, joined: the recognizer's nine files above | the joined bundle `33c6a2062d7f01009942eaf2021d83318ff26258bdb0ebe08a1de8a4079c31c9` |
+| [`onnxruntime-linux-x64-1.30.0-prebuilt.tar.gz`](https://github.com/user-attachments/files/35148173/onnxruntime-linux-x64-1.30.0-prebuilt.tar.gz) | ONNX Runtime 1.30.0's x64 release, unpacked and packed again, file for file (its `VERSION_NUMBER` and `GIT_COMMIT_ID` name the release); not the original tarball, so its SHA-256 is its own | `d3186ee2c508b0ed7cda17ddf3f278c7c93bd38577fe551a443b1032d40524d6` |
+| [`SHA256SUMS-archive.txt`](https://github.com/user-attachments/files/35148169/SHA256SUMS-archive.txt), [`SHA256SUMS-inputs.txt`](https://github.com/user-attachments/files/35148171/SHA256SUMS-inputs.txt) | the SHA-256 of every attachment and bundle, and of every file inside the two bundles (the ones the tables above record) | `b06b80e8…`, `f748d001…` |
+
+`scripts/build/speech_sources.sh fetch DIR` downloads the eight, joins the bundles, checks each
+against `scripts/build/speech_sources.sha256`, unpacks `DIR/voice-src`, `DIR/recognizer-src` and
+`DIR/onnxruntime-linux-x64-1.30.0`, and checks every source file against `SHA256SUMS-inputs.txt`;
+a file that does not match stops it, named. `scripts/build/speech_sources.sh check DIR` repeats the
+checks on a copy, with no network. It is a maintainer's tool: nothing in the build, the suites or
+CI fetches from the archive. No arm64 copy of ONNX Runtime 1.30.0 is held; the references are
+architecture-independent data and are made on x64.
 
 **The summary model's engine** (ARCH-116) is llama.cpp, the one C++ dependency,
 built from pinned source:

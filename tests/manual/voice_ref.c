@@ -6,18 +6,17 @@
  * this purpose. Its outputs are committed; rerun it only to remake them, and then
  * commit what it writes.
  *
- * Build and run from the repository folder, with the upstream model file and its
- * voices.npz fetched as docs/VENDORS.md says (at its pinned URLs and SHA-256s),
- * and ONNX Runtime 1.30.0's prebuilt release for this machine
- * (onnxruntime-linux-<x64|aarch64>-1.30.0.tgz from its GitHub releases)
- * unpacked into PRE:
+ * Build and run from the repository folder, x64 only, with the upstream model
+ * file, its voices.npz and ONNX Runtime 1.30.0's prebuilt release fetched from
+ * the archive and checked (docs/VENDORS.md, "The archive"):
  *
- *     PRE=third_party/onnxruntime-1.30.0-prebuilt
- *     cc -std=c99 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -I"$PRE/include" -Ittskit -Idaemon \
+ *     scripts/build/speech_sources.sh fetch build/speech-src
+ *     PRE=build/speech-src/onnxruntime-linux-x64-1.30.0
+ *     cc -std=c99 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -I"$PRE/include" -Ittskit -Innkit -Idaemon \
  *        tests/manual/voice_ref.c daemon/tts_voice_tokens.c \
- *        $(find ttskit -maxdepth 1 -name '*.c' ! -name tts_pack.c) \
+ *        $(find ttskit nnkit -maxdepth 1 -name '*.c' ! -name tts_pack.c) \
  *        -L"$PRE/lib" -lonnxruntime -Wl,-rpath,"$PWD/$PRE/lib" -lm -o build/voice_ref
- *     build/voice_ref <the upstream model file> <voices.npz> \
+ *     build/voice_ref build/speech-src/voice-src/<the model file> build/speech-src/voice-src/voices.npz \
  *        ttskit/data/en-US tests/data/voice
  * (or with --dump first, below).
  *

@@ -41,8 +41,10 @@ and `pr-policy` still checks it. Once merged, `promote.yml` can put it on
   Makefile's targets are the ones its header names; the configuration
   registry is the one source of every `OPENCHIME_*` name; nothing that ships
   runs in development mode; the tests' own rules (§2.3a); every linked
-  component has its licence notice; and what a release lists, closes and
-  sends as shipped;
+  component has its licence notice; what a release lists, closes and
+  sends as shipped; and the speech data's archive tool checking, joining and
+  unpacking a stand-in archive offline, refusing a changed file by name
+  (`scripts/test/fast/speech_sources.sh`);
 - actionlint on the workflows (`scripts/test/fast/actionlint.sh`, fetched
   pinned on first use);
 - the suites `tests/main.c` marks `FAST`, one after another (§2.4), timing judged;

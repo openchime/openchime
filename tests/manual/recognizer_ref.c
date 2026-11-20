@@ -7,17 +7,18 @@
  * links. Its outputs are committed; rerun it only to remake them, and then
  * commit what it writes.
  *
- * Build and run from the repository folder, with the published files fetched as
- * docs/VENDORS.md says (at its pinned URLs and SHA-256s) into a folder SRC, and
- * ONNX Runtime 1.30.0's prebuilt release for this machine
- * (onnxruntime-linux-<x64|aarch64>-1.30.0.tgz) unpacked into PRE:
+ * Build and run from the repository folder, x64 only, with the published files
+ * and ONNX Runtime 1.30.0's prebuilt release fetched from the archive and checked
+ * (docs/VENDORS.md, "The archive"):
  *
- *     PRE=third_party/onnxruntime-1.30.0-prebuilt
+ *     scripts/build/speech_sources.sh fetch build/speech-src
+ *     SRC=build/speech-src/recognizer-src
+ *     PRE=build/speech-src/onnxruntime-linux-x64-1.30.0
  *     cc -std=c99 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -ffp-contract=off -I"$PRE/include" \
  *        -Ittskit -Innkit -Isttkit -Idaemon tests/manual/recognizer_ref.c daemon/tts_voice_tokens.c \
  *        $(find ttskit nnkit -maxdepth 1 -name '*.c' ! -name tts_pack.c) sttkit/stt_tokens.c \
  *        -L"$PRE/lib" -lonnxruntime -Wl,-rpath,"$PWD/$PRE/lib" -lm -o build/recognizer_ref
- *     build/recognizer_ref SRC ttskit/data tests/data/recognizer
+ *     build/recognizer_ref "$SRC" ttskit/data tests/data/recognizer
  *
  * Each fixture is speech the read-aloud voice renders as the daemon renders it
  * (ttskit's text, the daemon's token function, the style row for the text's
